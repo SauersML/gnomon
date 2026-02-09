@@ -721,6 +721,33 @@ def summarize(df: pd.DataFrame, sweep_df: pd.DataFrame, out_dir: Path) -> None:
     fig.savefig(out_dir / "fig3_added_harm_correlates.png", dpi=220)
     plt.close(fig)
 
+    # Single-curve summary analogous to rigorous fig3 (no n_causal stratification).
+    harm_rows = []
+    for g in sorted(paired["divergence_gens"].unique()):
+        vals = paired.loc[paired["divergence_gens"] == g, "added_harm_alltags"].dropna().values
+        if len(vals) == 0:
+            continue
+        m, l, h = mean_ci(vals)
+        harm_rows.append((g, m, l, h))
+
+    if harm_rows:
+        xs = [r[0] for r in harm_rows]
+        ms = [r[1] for r in harm_rows]
+        lo = [r[2] for r in harm_rows]
+        hi = [r[3] for r in harm_rows]
+
+        fig, ax = plt.subplots(1, 1, figsize=(7.2, 4.8), constrained_layout=True)
+        ax.plot(xs, ms, "o-", color="#2ca02c", linewidth=2.2, markersize=6)
+        ax.fill_between(xs, lo, hi, color="#2ca02c", alpha=0.12)
+        ax.axhline(0.0, color="gray", ls=":")
+        ax.set_xscale("symlog", linthresh=20)
+        ax.set_xlabel("Divergence generations")
+        ax.set_ylabel("Added bottleneck harm\n(divergence ratio - bottleneck ratio)")
+        ax.set_title("Bottleneck added harm across divergence")
+        ax.grid(True)
+        fig.savefig(out_dir / "fig3_bottleneck_added_harm.png", dpi=220)
+        plt.close(fig)
+
     fig, ax = plt.subplots(1, 1, figsize=(7.8, 4.8), constrained_layout=True)
     for sc, color in [("divergence", "#1f77b4"), ("bottleneck", "#d62728")]:
         vals = (
