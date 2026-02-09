@@ -364,7 +364,8 @@ def one_run(
     }
 
     sweep_rows: List[Dict[str, float]] = []
-    strengths = [0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
+    # Conservative sweep: avoid extreme resampling weights that collapse ESS.
+    strengths = [0.0, 0.25, 0.5, 0.75, 1.0, 1.5]
     strengths_run = 0
     strengths_skipped_unstable = 0
 
@@ -620,6 +621,8 @@ def summarize(df: pd.DataFrame, sweep_df: pd.DataFrame, out_dir: Path) -> None:
 
     fig, ax = plt.subplots(1, 1, figsize=(12.5, 5.0), constrained_layout=True)
     max_gen = 0
+    y_lo_vals: List[float] = []
+    y_hi_vals: List[float] = []
     for sc, color in [("divergence", "#1f77b4"), ("bottleneck", "#d62728")]:
         z = df[df["scenario"] == sc]
         gens_sorted = sorted(z["divergence_gens"].unique())
@@ -639,17 +642,24 @@ def summarize(df: pd.DataFrame, sweep_df: pd.DataFrame, out_dir: Path) -> None:
             continue
         ax.plot(xs, ms, "o-", color=color, linewidth=2.2, markersize=6, label=sc)
         ax.fill_between(xs, lo, hi, color=color, alpha=0.12)
+        y_lo_vals.append(float(np.nanmin(np.asarray(lo, dtype=float))))
+        y_hi_vals.append(float(np.nanmax(np.asarray(hi, dtype=float))))
     ax.axhline(1.0, color="gray", ls=":")
     ax.set_xscale("symlog", linthresh=20)
     if max_gen > 0:
         ticks = sorted(df["divergence_gens"].unique())
         ax.set_xlim(left=0, right=max(1.0, float(max_gen) * 1.1))
         ax.set_xticks(ticks)
+    if y_lo_vals and y_hi_vals:
+        y_min = float(np.nanmin(np.asarray(y_lo_vals, dtype=float)))
+        y_max = float(np.nanmax(np.asarray(y_hi_vals, dtype=float)))
+        y_span = y_max - y_min
+        y_pad = 0.06 * y_span if y_span > 1e-12 else max(1e-6, abs(y_min) * 0.03)
+        ax.set_ylim(y_min - y_pad, y_max + y_pad)
     ax.set_title("Transfer performance using unified marker panel")
     ax.set_xlabel("Population split age (generations)")
     ax.set_ylabel("Transfer ratio\n(target population R^2 / same-ancestry holdout R^2)")
     ax.grid(True)
-    ax.set_ylim(bottom=0.15)
     ax.legend(frameon=False, fontsize=8, ncol=2)
     fig.savefig(out_dir / "fig1_transfer_by_scenario.png", dpi=220)
     plt.close(fig)
@@ -931,13 +941,13 @@ def parse_args() -> argparse.Namespace:
     ap_run.add_argument(
         "--min-resample-ess-frac",
         type=float,
-        default=0.25,
+        default=0.6,
         help="Skip sweep strengths when ESS < max(min_resample_ess_count, min_resample_ess_frac * n).",
     )
     ap_run.add_argument(
         "--min-resample-ess-count",
         type=int,
-        default=100,
+        default=300,
         help="Absolute ESS floor used by the heterozygosity resampling stability gate.",
     )
 
