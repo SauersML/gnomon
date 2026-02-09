@@ -1,5 +1,6 @@
 import Mathlib.Tactic
 import Mathlib.Analysis.Calculus.Deriv.Basic
+import Mathlib.Analysis.Calculus.Deriv.Mul
 import Mathlib.Analysis.Calculus.Deriv.Inv
 import Mathlib.Analysis.Convex.Strict
 import Mathlib.Analysis.Convex.Jensen
@@ -2274,7 +2275,7 @@ theorem penalty_quadratic_tendsto_proof {ι : Type*} [Fintype ι] [DecidableEq �
     h_tendsto
 
 
-set_option maxHeartbeats 1000000
+set_option maxHeartbeats 10000000
 /-- Fit a Gaussian identity-link GAM by minimizing the penalized least squares loss
     over the parameter space, using Weierstrass (coercive + continuous). -/
 noncomputable def fit (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
@@ -4434,7 +4435,7 @@ lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n →
     p = orthogonalProjection K y := by
   sorry
 
-set_option maxHeartbeats 2000000 in
+set_option maxHeartbeats 10000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
     PROVIDED the model class is flexible enough to capture the transformation.
 
@@ -6741,7 +6742,7 @@ lemma optimal_coefficients_for_additive_dgp_proven
           · simp +decide [ mul_assoc, MeasureTheory.integral_const_mul, MeasureTheory.integral_mul_const, hP0, hC0, h_integral_prod ];
             exact Or.inr ( by simpa only [ mul_comm ] using h_integral_prod.trans ( by simp +decide [ hP0, hC0 ] ) );
           · exact hP_int.mul_const _;
-          · convert hP2_int.mul_const ( model.γₘ₀ ⟨ 0, by norm_num ⟩ ) using 2 ; ring;
+          · convert hP2_int.mul_const ( model.γₘ₀ ⟨ 0, by norm_num ⟩ ) using 2 ; ring_nf;
             rfl;
         · simpa only [ sq ] using hP2_int;
         · exact MeasureTheory.Integrable.const_mul ( by simpa only [ mul_comm ] using hPC_int ) _;
