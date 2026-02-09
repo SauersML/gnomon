@@ -341,12 +341,12 @@ def one_run(cfg: Config, min_tags: int) -> Tuple[Dict[str, float], List[Dict[str
     sweep_rows: List[Dict[str, float]] = []
     strengths = [0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
 
-    X_train_all = sim.X[np.ix_(train0, all_tags)].astype(float)
-    X_test_all = sim.X[np.ix_(test0, all_tags)].astype(float)
-    X_target_all = sim.X[np.ix_(pop1, all_tags)].astype(float)
-    X_train_all_i = sim.X[np.ix_(train0, all_tags)].astype(np.int8)
-    X_test_all_i = sim.X[np.ix_(test0, all_tags)].astype(np.int8)
-    X_target_all_i = sim.X[np.ix_(pop1, all_tags)].astype(np.int8)
+    X_train_all = sim.X[np.ix_(train0, tags)].astype(float)
+    X_test_all = sim.X[np.ix_(test0, tags)].astype(float)
+    X_target_all = sim.X[np.ix_(pop1, tags)].astype(float)
+    X_train_all_i = sim.X[np.ix_(train0, tags)].astype(np.int8)
+    X_test_all_i = sim.X[np.ix_(test0, tags)].astype(np.int8)
+    X_target_all_i = sim.X[np.ix_(pop1, tags)].astype(np.int8)
     rng_sweep = np.random.default_rng(cfg.seed + 900)
 
     baseline_heterozygosity_training = _mean_heterozygosity_from_matrix(X_train_all_i)
