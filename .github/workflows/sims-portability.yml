@@ -2,15 +2,6 @@ name: Sims (Gen0 + Bottleneck)
 
 on:
   workflow_dispatch:
-    inputs:
-      profile:
-        description: "Run profile"
-        required: true
-        default: "full"
-        type: choice
-        options:
-          - quick
-          - full
   schedule:
     - cron: "30 7 * * *"
 
@@ -21,7 +12,7 @@ env:
   OPENBLAS_NUM_THREADS: "2"
   VECLIB_MAXIMUM_THREADS: "2"
   NUMEXPR_NUM_THREADS: "2"
-  SIM_PROFILE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.profile || 'quick' }}
+  SIM_PROFILE: "full"
 
 jobs:
   gen0_chunks:
@@ -31,10 +22,10 @@ jobs:
       fail-fast: false
       matrix:
         chunk:
-          - { name: "a", seed_start_quick: 1, seed_end_quick: 2, seed_start_full: 1, seed_end_full: 8 }
-          - { name: "b", seed_start_quick: 3, seed_end_quick: 4, seed_start_full: 9, seed_end_full: 16 }
-          - { name: "c", seed_start_quick: 5, seed_end_quick: 6, seed_start_full: 17, seed_end_full: 24 }
-          - { name: "d", seed_start_quick: 7, seed_end_quick: 8, seed_start_full: 25, seed_end_full: 32 }
+          - { name: "a", seed_start: 1, seed_end: 8 }
+          - { name: "b", seed_start: 9, seed_end: 16 }
+          - { name: "c", seed_start: 17, seed_end: 24 }
+          - { name: "d", seed_start: 25, seed_end: 32 }
     steps:
       - uses: actions/checkout@v4
 
@@ -48,21 +39,12 @@ jobs:
             CPU_CORES=1
           fi
           echo "workers=$CPU_CORES" >> "$GITHUB_OUTPUT"
-          if [ "${SIM_PROFILE}" = "full" ]; then
-            echo "seed_start=${{ matrix.chunk.seed_start_full }}" >> "$GITHUB_OUTPUT"
-            echo "seed_end=${{ matrix.chunk.seed_end_full }}" >> "$GITHUB_OUTPUT"
-            echo "n_ind=2200" >> "$GITHUB_OUTPUT"
-            echo "seq_len=5000000" >> "$GITHUB_OUTPUT"
-            echo "n_causal=5000" >> "$GITHUB_OUTPUT"
-            echo "n_pca=2000" >> "$GITHUB_OUTPUT"
-          else
-            echo "seed_start=${{ matrix.chunk.seed_start_quick }}" >> "$GITHUB_OUTPUT"
-            echo "seed_end=${{ matrix.chunk.seed_end_quick }}" >> "$GITHUB_OUTPUT"
-            echo "n_ind=1000" >> "$GITHUB_OUTPUT"
-            echo "seq_len=2000000" >> "$GITHUB_OUTPUT"
-            echo "n_causal=1200" >> "$GITHUB_OUTPUT"
-            echo "n_pca=700" >> "$GITHUB_OUTPUT"
-          fi
+          echo "seed_start=${{ matrix.chunk.seed_start }}" >> "$GITHUB_OUTPUT"
+          echo "seed_end=${{ matrix.chunk.seed_end }}" >> "$GITHUB_OUTPUT"
+          echo "n_ind=2200" >> "$GITHUB_OUTPUT"
+          echo "seq_len=5000000" >> "$GITHUB_OUTPUT"
+          echo "n_causal=5000" >> "$GITHUB_OUTPUT"
+          echo "n_pca=2000" >> "$GITHUB_OUTPUT"
 
       - name: Restore Gen0 simulation cache
         id: gen0_cache_restore
@@ -271,9 +253,9 @@ jobs:
       matrix:
         scenario: [divergence, bottleneck]
         gens:
-          - { name: "g0to200", quick: "0,20,50,100,200", full: "0,20,50,100,200" }
-          - { name: "g500to1000", quick: "500,1000", full: "500,1000" }
-          - { name: "g2000to5000", quick: "2000,5000", full: "2000,5000" }
+          - { name: "g0to200", values: "0,20,50,100,200" }
+          - { name: "g500to1000", values: "500,1000" }
+          - { name: "g2000to5000", values: "2000,5000" }
     steps:
       - uses: actions/checkout@v4
 
@@ -287,25 +269,14 @@ jobs:
             CPU_CORES=1
           fi
           echo "workers=$CPU_CORES" >> "$GITHUB_OUTPUT"
-          if [ "${SIM_PROFILE}" = "full" ]; then
-            echo "seeds=1,2,3,4,5,6,7,8,9,10" >> "$GITHUB_OUTPUT"
-            echo "gens=${{ matrix.gens.full }}" >> "$GITHUB_OUTPUT"
-            echo "seeds_key=1_2_3_4_5_6_7_8_9_10" >> "$GITHUB_OUTPUT"
-            echo "gens_key=$(echo '${{ matrix.gens.full }}' | tr ',' '_')" >> "$GITHUB_OUTPUT"
-            echo "n_per_pop=2000" >> "$GITHUB_OUTPUT"
-            echo "seq_len=5000000" >> "$GITHUB_OUTPUT"
-            echo "n_causal=400" >> "$GITHUB_OUTPUT"
-            echo "min_tags=80" >> "$GITHUB_OUTPUT"
-          else
-            echo "seeds=1,2,3,4" >> "$GITHUB_OUTPUT"
-            echo "gens=${{ matrix.gens.quick }}" >> "$GITHUB_OUTPUT"
-            echo "seeds_key=1_2_3_4" >> "$GITHUB_OUTPUT"
-            echo "gens_key=$(echo '${{ matrix.gens.quick }}' | tr ',' '_')" >> "$GITHUB_OUTPUT"
-            echo "n_per_pop=900" >> "$GITHUB_OUTPUT"
-            echo "seq_len=2500000" >> "$GITHUB_OUTPUT"
-            echo "n_causal=220" >> "$GITHUB_OUTPUT"
-            echo "min_tags=45" >> "$GITHUB_OUTPUT"
-          fi
+          echo "seeds=1,2,3,4,5,6,7,8,9,10" >> "$GITHUB_OUTPUT"
+          echo "gens=${{ matrix.gens.values }}" >> "$GITHUB_OUTPUT"
+          echo "seeds_key=1_2_3_4_5_6_7_8_9_10" >> "$GITHUB_OUTPUT"
+          echo "gens_key=$(echo '${{ matrix.gens.values }}' | tr ',' '_')" >> "$GITHUB_OUTPUT"
+          echo "n_per_pop=2000" >> "$GITHUB_OUTPUT"
+          echo "seq_len=5000000" >> "$GITHUB_OUTPUT"
+          echo "n_causal=400" >> "$GITHUB_OUTPUT"
+          echo "min_tags=80" >> "$GITHUB_OUTPUT"
 
       - name: Restore bottleneck simulation cache
         id: bottleneck_cache_restore
