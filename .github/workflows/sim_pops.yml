@@ -113,8 +113,47 @@ jobs:
       SIM_CACHE_VERSION: v3
     strategy:
       matrix:
-        sim_name: [confounding, portability]
-        seed: [1, 2, 3, 4, 5]
+        include:
+          - sim_name: confounding
+            seed: 1
+          - sim_name: confounding
+            seed: 2
+          - sim_name: confounding
+            seed: 3
+          - sim_name: confounding
+            seed: 4
+          - sim_name: confounding
+            seed: 5
+          - sim_name: portability
+            seed: 1
+          - sim_name: portability
+            seed: 2
+          - sim_name: portability
+            seed: 3
+          - sim_name: portability
+            seed: 4
+          - sim_name: portability
+            seed: 5
+          - sim_name: portability
+            seed: 6
+          - sim_name: portability
+            seed: 7
+          - sim_name: portability
+            seed: 8
+          - sim_name: portability
+            seed: 9
+          - sim_name: portability
+            seed: 10
+          - sim_name: portability
+            seed: 11
+          - sim_name: portability
+            seed: 12
+          - sim_name: portability
+            seed: 13
+          - sim_name: portability
+            seed: 14
+          - sim_name: portability
+            seed: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -246,8 +285,47 @@ jobs:
       fail-fast: false # Let other methods finish if one fails
       matrix:
         method: ${{ fromJSON(github.event_name == 'workflow_dispatch' && github.event.inputs.methods || '["BayesR"]') }}
-        sim_name: [confounding, portability]
-        seed: [1, 2, 3, 4, 5]
+        include:
+          - sim_name: confounding
+            seed: 1
+          - sim_name: confounding
+            seed: 2
+          - sim_name: confounding
+            seed: 3
+          - sim_name: confounding
+            seed: 4
+          - sim_name: confounding
+            seed: 5
+          - sim_name: portability
+            seed: 1
+          - sim_name: portability
+            seed: 2
+          - sim_name: portability
+            seed: 3
+          - sim_name: portability
+            seed: 4
+          - sim_name: portability
+            seed: 5
+          - sim_name: portability
+            seed: 6
+          - sim_name: portability
+            seed: 7
+          - sim_name: portability
+            seed: 8
+          - sim_name: portability
+            seed: 9
+          - sim_name: portability
+            seed: 10
+          - sim_name: portability
+            seed: 11
+          - sim_name: portability
+            seed: 12
+          - sim_name: portability
+            seed: 13
+          - sim_name: portability
+            seed: 14
+          - sim_name: portability
+            seed: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -357,8 +435,47 @@ jobs:
     runs-on: ubuntu-22.04
     strategy:
       matrix:
-        sim_name: [confounding, portability]
-        seed: [1, 2, 3, 4, 5]
+        include:
+          - sim_name: confounding
+            seed: 1
+          - sim_name: confounding
+            seed: 2
+          - sim_name: confounding
+            seed: 3
+          - sim_name: confounding
+            seed: 4
+          - sim_name: confounding
+            seed: 5
+          - sim_name: portability
+            seed: 1
+          - sim_name: portability
+            seed: 2
+          - sim_name: portability
+            seed: 3
+          - sim_name: portability
+            seed: 4
+          - sim_name: portability
+            seed: 5
+          - sim_name: portability
+            seed: 6
+          - sim_name: portability
+            seed: 7
+          - sim_name: portability
+            seed: 8
+          - sim_name: portability
+            seed: 9
+          - sim_name: portability
+            seed: 10
+          - sim_name: portability
+            seed: 11
+          - sim_name: portability
+            seed: 12
+          - sim_name: portability
+            seed: 13
+          - sim_name: portability
+            seed: 14
+          - sim_name: portability
+            seed: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -461,6 +578,9 @@ jobs:
           path: |
             ${{ matrix.sim_name }}_s${{ matrix.seed }}_metrics.csv
             ${{ matrix.sim_name }}_s${{ matrix.seed }}_comparison_*.png
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}_significance_tests.csv
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}_probabilities.csv
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}_probability_summary.csv
           if-no-files-found: warn
 
       - name: Save tool cache
@@ -545,14 +665,47 @@ jobs:
           # Ensure generate_summary.py is robust to missing files if some jobs failed
           python sims/generate_summary.py
 
+      - name: Build combined results zip
+        run: |
+          set -euo pipefail
+          mkdir -p bundle
+          for f in \
+            summary.md \
+            all_methods_metrics.tsv \
+            all_methods_pvalues.png \
+            confounding_metrics.csv \
+            portability_metrics.csv \
+            confounding_significance_tests.csv \
+            portability_significance_tests.csv \
+            confounding_probabilities.csv \
+            portability_probabilities.csv \
+            confounding_probability_summary.csv \
+            portability_probability_summary.csv \
+            confounding_comparison_roc.png \
+            confounding_comparison_calibration.png \
+            confounding_comparison_auc.png \
+            confounding_comparison_brier.png \
+            portability_comparison_roc.png \
+            portability_comparison_calibration.png \
+            portability_comparison_auc.png \
+            portability_comparison_brier.png \
+            portability_eur_minus_non_eur_gap_proper_test_all_pvals.png \
+            portability_eur_minus_non_eur_proper_per_seed.csv \
+            portability_eur_minus_non_eur_proper_summary.csv \
+            portability_test_group_counts.csv
+          do
+            if [ -f "$f" ]; then
+              cp "$f" bundle/
+            fi
+          done
+          (cd bundle && zip -r ../stdpopsim-chr22-results.zip .)
+
       - name: Upload summary as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: consolidated-summary
+          name: stdpopsim-chr22-results
           path: |
-            summary.md
-            all_methods_metrics.tsv
-            all_methods_pvalues.png
+            stdpopsim-chr22-results.zip
 
       - name: Save tool cache
         if: ${{ always() && steps.tools-cache.outputs.cache-hit != 'true' }}
