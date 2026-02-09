@@ -416,6 +416,7 @@ def one_run(
                     "scenario": cfg.scenario,
                     "divergence_gens": cfg.gens,
                     "seed": cfg.seed,
+                    "bottleneck_frac": float(cfg.bottleneck_frac),
                     "intervention": "decrease_target_heterozygosity",
                     "resample_strength": strength,
                     "baseline_heterozygosity_training": baseline_heterozygosity_training,
@@ -476,6 +477,7 @@ def one_run(
                     "scenario": cfg.scenario,
                     "divergence_gens": cfg.gens,
                     "seed": cfg.seed,
+                    "bottleneck_frac": float(cfg.bottleneck_frac),
                     "intervention": "increase_training_heterozygosity",
                     "resample_strength": strength,
                     "baseline_heterozygosity_training": baseline_heterozygosity_training,
@@ -624,6 +626,8 @@ def run_strength_chunk(args: argparse.Namespace) -> Tuple[Path, Path]:
     sweep_df = pd.DataFrame(sweep_rows)
     sweep_path = sweep_dir / f"{chunk_name}_strength_sweep.csv"
     if len(sweep_df) > 0:
+        if "bottleneck_frac" not in sweep_df.columns:
+            sweep_df["bottleneck_frac"] = np.nan
         sweep_df = sweep_df.sort_values(["bottleneck_frac", "seed", "resample_strength"]).reset_index(drop=True)
     sweep_df.to_csv(sweep_path, index=False)
     return path, sweep_path
