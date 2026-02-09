@@ -339,7 +339,7 @@ def one_run(cfg: Config, min_tags: int) -> Tuple[Dict[str, float], List[Dict[str
     }
 
     sweep_rows: List[Dict[str, float]] = []
-    strengths = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0]
+    strengths = [0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
 
     X_train_all = sim.X[np.ix_(train0, all_tags)].astype(float)
     X_test_all = sim.X[np.ix_(test0, all_tags)].astype(float)
@@ -348,6 +348,9 @@ def one_run(cfg: Config, min_tags: int) -> Tuple[Dict[str, float], List[Dict[str
     X_test_all_i = sim.X[np.ix_(test0, all_tags)].astype(np.int8)
     X_target_all_i = sim.X[np.ix_(pop1, all_tags)].astype(np.int8)
     rng_sweep = np.random.default_rng(cfg.seed + 900)
+
+    baseline_heterozygosity_training = _mean_heterozygosity_from_matrix(X_train_all_i)
+    baseline_heterozygosity_target = _mean_heterozygosity_from_matrix(X_target_all_i)
 
     # Divergence scenario: lower target heterozygosity across a broad range.
     if cfg.scenario == "divergence":
@@ -373,6 +376,8 @@ def one_run(cfg: Config, min_tags: int) -> Tuple[Dict[str, float], List[Dict[str
                     "seed": cfg.seed,
                     "intervention": "decrease_target_heterozygosity",
                     "resample_strength": strength,
+                    "baseline_heterozygosity_training": baseline_heterozygosity_training,
+                    "baseline_heterozygosity_target": baseline_heterozygosity_target,
                     "mean_heterozygosity_training": _mean_heterozygosity_from_matrix(X_train_all_i),
                     "mean_heterozygosity_target": _mean_heterozygosity_from_matrix(X_target_new_i),
                     "heterozygosity_shift_target_minus_training": _mean_heterozygosity_from_matrix(X_target_new_i) - _mean_heterozygosity_from_matrix(X_train_all_i),
@@ -411,6 +416,8 @@ def one_run(cfg: Config, min_tags: int) -> Tuple[Dict[str, float], List[Dict[str
                     "seed": cfg.seed,
                     "intervention": "increase_training_heterozygosity",
                     "resample_strength": strength,
+                    "baseline_heterozygosity_training": baseline_heterozygosity_training,
+                    "baseline_heterozygosity_target": baseline_heterozygosity_target,
                     "mean_heterozygosity_training": _mean_heterozygosity_from_matrix(X_train_new_i),
                     "mean_heterozygosity_target": _mean_heterozygosity_from_matrix(X_target_all_i),
                     "heterozygosity_shift_target_minus_training": _mean_heterozygosity_from_matrix(X_target_all_i) - _mean_heterozygosity_from_matrix(X_train_new_i),
@@ -677,6 +684,8 @@ def summarize(df: pd.DataFrame, sweep_df: pd.DataFrame, out_dir: Path) -> None:
         sweep_df.to_csv(out_dir / "bottleneck_heterozygosity_sweep_results.csv", index=False)
 
         fig, ax = plt.subplots(1, 1, figsize=(8.5, 5.0), constrained_layout=True)
+        het_lo = 0.125
+        het_hi = 0.40
         for (sc, intervention), color, marker in [
             (("divergence", "decrease_target_heterozygosity"), "#1f77b4", "o"),
             (("bottleneck", "increase_training_heterozygosity"), "#d62728", "s"),
@@ -684,41 +693,30 @@ def summarize(df: pd.DataFrame, sweep_df: pd.DataFrame, out_dir: Path) -> None:
             z = sweep_df[(sweep_df["scenario"] == sc) & (sweep_df["intervention"] == intervention)]
             if len(z) == 0:
                 continue
-            grp = (
-                z.groupby("resample_strength", as_index=False)
-                .agg(
+            if intervention == "increase_training_heterozygosity":
+                z = z[z["mean_heterozygosity_training"] >= z["baseline_heterozygosity_training"]]
+                z = z[(z["mean_heterozygosity_training"] >= het_lo) & (z["mean_heterozygosity_training"] <= het_hi)]
+                grp = z.groupby("resample_strength", as_index=False).agg(
+                    mean_heterozygosity=("mean_heterozygosity_training", "mean"),
+                    transfer_ratio_mean=("transfer_ratio", "mean"),
+                    transfer_ratio_sd=("transfer_ratio", "std"),
+                    n=("transfer_ratio", "count"),
+                    ld_abs_change_mean=("ld_absolute_change", "mean"),
+                )
+            else:
+                z = z[z["mean_heterozygosity_target"] <= z["baseline_heterozygosity_target"]]
+                z = z[(z["mean_heterozygosity_target"] >= het_lo) & (z["mean_heterozygosity_target"] <= het_hi)]
+                grp = z.groupby("resample_strength", as_index=False).agg(
                     mean_heterozygosity=("mean_heterozygosity_target", "mean"),
                     transfer_ratio_mean=("transfer_ratio", "mean"),
                     transfer_ratio_sd=("transfer_ratio", "std"),
                     n=("transfer_ratio", "count"),
                     ld_abs_change_mean=("ld_absolute_change", "mean"),
                 )
-                .sort_values("mean_heterozygosity")
-            )
-            if intervention == "increase_training_heterozygosity":
-                grp = (
-                    z.groupby("resample_strength", as_index=False)
-                    .agg(
-                        mean_heterozygosity=("mean_heterozygosity_training", "mean"),
-                        transfer_ratio_mean=("transfer_ratio", "mean"),
-                        transfer_ratio_sd=("transfer_ratio", "std"),
-                        n=("transfer_ratio", "count"),
-                        ld_abs_change_mean=("ld_absolute_change", "mean"),
-                    )
-                    .sort_values("mean_heterozygosity")
-                )
-            else:
-                grp = (
-                    z.groupby("resample_strength", as_index=False)
-                    .agg(
-                        mean_heterozygosity=("mean_heterozygosity_target", "mean"),
-                        transfer_ratio_mean=("transfer_ratio", "mean"),
-                        transfer_ratio_sd=("transfer_ratio", "std"),
-                        n=("transfer_ratio", "count"),
-                        ld_abs_change_mean=("ld_absolute_change", "mean"),
-                    )
-                    .sort_values("mean_heterozygosity")
-                )
+
+            if len(grp) == 0:
+                continue
+            grp = grp.sort_values("mean_heterozygosity")
 
             sem = grp["transfer_ratio_sd"].fillna(0.0) / np.sqrt(np.maximum(grp["n"], 1))
             lo = grp["transfer_ratio_mean"] - 1.96 * sem
@@ -739,9 +737,10 @@ def summarize(df: pd.DataFrame, sweep_df: pd.DataFrame, out_dir: Path) -> None:
             )
             ax.fill_between(grp["mean_heterozygosity"], lo, hi, color=color, alpha=0.12)
         ax.axhline(1.0, color="gray", ls=":")
+        ax.set_xlim(het_lo, het_hi)
         ax.set_xlabel("Mean heterozygosity of manipulated population")
         ax.set_ylabel("Transfer ratio\n(target population R^2 / same-ancestry holdout R^2)")
-        ax.set_title("Heterozygosity-manipulation sweep with linkage structure preserved")
+        ax.set_title("Heterozygosity-manipulation sweep (0.125 to 0.40)")
         ax.grid(True)
         ax.legend(frameon=False, fontsize=8)
         fig.savefig(out_dir / "fig5_heterozygosity_manipulation_sweep.png", dpi=220)
