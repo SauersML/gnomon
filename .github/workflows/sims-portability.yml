@@ -276,7 +276,7 @@ jobs:
           echo "n_per_pop=2000" >> "$GITHUB_OUTPUT"
           echo "seq_len=5000000" >> "$GITHUB_OUTPUT"
           echo "n_causal=400" >> "$GITHUB_OUTPUT"
-          echo "min_tags=80" >> "$GITHUB_OUTPUT"
+          echo "n_array_sites=2000" >> "$GITHUB_OUTPUT"
 
       - name: Restore bottleneck simulation cache
         id: bottleneck_cache_restore
@@ -285,7 +285,7 @@ jobs:
           path: |
             sims/results_bottleneck_ld_mechanism/chunks/${{ matrix.scenario }}_${{ matrix.gens.name }}.csv
             sims/results_bottleneck_ld_mechanism/hetero_sweeps/${{ matrix.scenario }}_${{ matrix.gens.name }}_hetero_sweep.csv
-          key: bottleneck-sim-${{ runner.os }}-${{ env.SIM_PROFILE }}-${{ matrix.scenario }}-${{ matrix.gens.name }}-${{ steps.bottleneck_params.outputs.seeds_key }}-${{ steps.bottleneck_params.outputs.gens_key }}-${{ steps.bottleneck_params.outputs.n_per_pop }}-${{ steps.bottleneck_params.outputs.seq_len }}-${{ steps.bottleneck_params.outputs.n_causal }}-${{ steps.bottleneck_params.outputs.min_tags }}-${{ hashFiles('sims/bottleneck_ld_mechanism.py', 'sims/sim_two_pop.py', 'sims/requirements.txt') }}
+          key: bottleneck-sim-${{ runner.os }}-${{ env.SIM_PROFILE }}-${{ matrix.scenario }}-${{ matrix.gens.name }}-${{ steps.bottleneck_params.outputs.seeds_key }}-${{ steps.bottleneck_params.outputs.gens_key }}-${{ steps.bottleneck_params.outputs.n_per_pop }}-${{ steps.bottleneck_params.outputs.seq_len }}-${{ steps.bottleneck_params.outputs.n_causal }}-${{ steps.bottleneck_params.outputs.n_array_sites }}-${{ hashFiles('sims/bottleneck_ld_mechanism.py', 'sims/sim_two_pop.py', 'sims/requirements.txt') }}
 
       - name: Set up Python
         if: steps.bottleneck_cache_restore.outputs.cache-hit != 'true'
@@ -310,7 +310,7 @@ jobs:
           N_PER_POP="${{ steps.bottleneck_params.outputs.n_per_pop }}"
           SEQ_LEN="${{ steps.bottleneck_params.outputs.seq_len }}"
           N_CAUSAL="${{ steps.bottleneck_params.outputs.n_causal }}"
-          MIN_TAGS="${{ steps.bottleneck_params.outputs.min_tags }}"
+          N_ARRAY_SITES="${{ steps.bottleneck_params.outputs.n_array_sites }}"
           WORKERS="${{ steps.bottleneck_params.outputs.workers }}"
 
           # Avoid nested thread oversubscription when using process workers.
@@ -331,7 +331,7 @@ jobs:
             --n-per-pop "$N_PER_POP" \
             --seq-len "$SEQ_LEN" \
             --n-causal "$N_CAUSAL" \
-            --min-tags "$MIN_TAGS" \
+            --n-array-sites "$N_ARRAY_SITES" \
             --out-dir "$CHUNK_DIR" \
             --chunk-name "${{ matrix.scenario }}_${{ matrix.gens.name }}"
 

@@ -173,16 +173,19 @@ def build_marginal_prs(
     return prs, betas
 
 
-def select_tag_panel(sim: Sim, seed: int, min_tags: int) -> np.ndarray:
-    rng = np.random.default_rng(seed + 200)
-    all_idx = np.arange(sim.X.shape[1])
-    noncausal = np.setdiff1d(all_idx, sim.causal_idx, assume_unique=False)
-    eligible = noncausal[sim.maf[noncausal] >= 0.01]
-    if len(eligible) < min_tags:
-        raise RuntimeError(f"Insufficient tag variants: n={len(eligible)}")
-    if len(eligible) > 5000:
-        eligible = np.sort(rng.choice(eligible, size=5000, replace=False))
-    return np.sort(eligible.astype(int))
+def select_tag_panel(sim: Sim, n_array_sites: int) -> np.ndarray:
+    n_total = int(sim.X.shape[1])
+    if n_total < n_array_sites:
+        raise RuntimeError(
+            f"Insufficient variants for array-like panel: requested {n_array_sites}, available {n_total}"
+        )
+    step = max(1, n_total // n_array_sites)
+    tags = np.arange(0, n_total, step, dtype=int)[:n_array_sites]
+    if len(tags) != n_array_sites:
+        raise RuntimeError(
+            f"Array-like marker panel selection failed: requested {n_array_sites}, selected {len(tags)}"
+        )
+    return tags
 
 
 def ld_destroyed_matrix(X: np.ndarray, score_idx: np.ndarray, tags: np.ndarray, seed: int) -> np.ndarray:
@@ -259,14 +262,14 @@ def _ld_corr_change(X_before: np.ndarray, X_after: np.ndarray) -> float:
     return float(np.mean(d))
 
 
-def one_run(cfg: Config, min_tags: int) -> Tuple[Dict[str, float], List[Dict[str, float]]]:
+def one_run(cfg: Config, n_array_sites: int) -> Tuple[Dict[str, float], List[Dict[str, float]]]:
     sim = simulate(cfg)
 
     pop0 = np.where(sim.pop_idx == 0)[0]
     pop1 = np.where(sim.pop_idx == 1)[0]
     train0, test0 = split_pop0(pop0, cfg.seed)
 
-    tags = select_tag_panel(sim, cfg.seed, min_tags=min_tags)
+    tags = select_tag_panel(sim, n_array_sites=n_array_sites)
     prs_all_0, b_all = build_marginal_prs(sim.X, sim.g_true, train0, test0, tags, use_score_stats=False)
     prs_all_1, _ = build_marginal_prs(sim.X, sim.g_true, train0, pop1, tags, use_score_stats=False)
     prs_all_1_het, _ = build_marginal_prs(sim.X, sim.g_true, train0, pop1, tags, use_score_stats=True)
@@ -458,7 +461,7 @@ def run_chunk(args: argparse.Namespace) -> Tuple[Path, Path]:
     rows: List[Dict[str, float]] = []
     sweep_rows: List[Dict[str, float]] = []
     with cf.ProcessPoolExecutor(max_workers=args.workers) as ex:
-        futs = [ex.submit(one_run, cfg, args.min_tags) for cfg in cfgs]
+        futs = [ex.submit(one_run, cfg, args.n_array_sites) for cfg in cfgs]
         for fut in cf.as_completed(futs):
             base_row, sweep_part = fut.result()
             rows.append(base_row)
@@ -817,7 +820,7 @@ def parse_args() -> argparse.Namespace:
     ap_run.add_argument("--n-per-pop", type=int, default=2000)
     ap_run.add_argument("--seq-len", type=int, default=5_000_000)
     ap_run.add_argument("--n-causal", type=int, default=400)
-    ap_run.add_argument("--min-tags", type=int, default=80)
+    ap_run.add_argument("--n-array-sites", type=int, default=2000)
 
     ap_merge = sub.add_parser("summarize")
     ap_merge.add_argument("--glob", type=str, default="sims/results_bottleneck_ld_mechanism/chunks/*.csv")
