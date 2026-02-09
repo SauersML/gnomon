@@ -59,18 +59,32 @@ jobs:
           cache: 'pip'
 
       - name: Set up R
+        id: setup-r
         if: steps.tools-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
         uses: r-lib/actions/setup-r@v2
         with:
           r-version: "4.4.2"
 
+      - name: Fallback install R (if setup-r timed out)
+        if: steps.tools-cache.outputs.cache-hit != 'true' && steps.setup-r.outcome != 'success'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends r-base
+
       - name: Install base dependencies
         if: steps.tools-cache.outputs.cache-hit != 'true'
         run: |
+          set -euo pipefail
           pip install uv
           uv pip install --system -r sims/requirements.txt
           uv pip install --system rpy2
-          Rscript -e 'install.packages("mgcv", repos="https://cloud.r-project.org")'
+          for i in 1 2 3; do
+            Rscript -e 'install.packages("mgcv", repos="https://cloud.r-project.org")' && break
+            echo "mgcv install attempt $i failed; retrying..."
+            sleep $((i*10))
+          done
 
       - name: Install Plink2
         if: steps.tools-cache.outputs.cache-hit != 'true'
@@ -216,9 +230,24 @@ jobs:
       - name: Run Simulation ${{ matrix.sim_name }}
         if: steps.sim-cache.outputs.cache-hit != 'true'
         run: |
-          set -e
+          set -euo pipefail
           echo "Running Simulation ${{ matrix.sim_name }} (seed=${{ matrix.seed }})..."
-          python sims/sim_pops.py ${{ matrix.sim_name }} ${{ matrix.seed }}
+          prefix="${{ matrix.sim_name }}_s${{ matrix.seed }}"
+          ok=0
+          for attempt in 1 2 3; do
+            echo "Simulation attempt ${attempt}/3 for ${prefix}"
+            rm -f "${prefix}.trees" "${prefix}.vcf" "${prefix}.cm"
+            if python sims/sim_pops.py ${{ matrix.sim_name }} ${{ matrix.seed }} --force; then
+              ok=1
+              break
+            fi
+            echo "Simulation attempt ${attempt} failed for ${prefix}"
+            sleep $((attempt*20))
+          done
+          if [ "$ok" -ne 1 ]; then
+            echo "Simulation failed after 3 attempts for ${prefix}"
+            exit 1
+          fi
 
           # sim_pops.py now deletes .trees and .vcf automatically on success
           # Verify they are gone to save space
@@ -494,9 +523,18 @@ jobs:
           key: tools-${{ runner.os }}-${{ env.TOOL_CACHE_VERSION }}
 
       - name: Set up R for GAM
+        id: setup-r-evaluate
+        continue-on-error: true
         uses: r-lib/actions/setup-r@v2
         with:
           r-version: '4.4.2'
+
+      - name: Fallback install R for GAM (evaluate)
+        if: steps.setup-r-evaluate.outcome != 'success'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends r-base
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -513,7 +551,12 @@ jobs:
 
       - name: Install R GAM package
         run: |
-          Rscript -e 'install.packages("mgcv", repos="https://cloud.r-project.org")'
+          set -euo pipefail
+          for i in 1 2 3; do
+            Rscript -e 'install.packages("mgcv", repos="https://cloud.r-project.org")' && break
+            echo "mgcv install attempt $i failed; retrying..."
+            sleep $((i*10))
+          done
 
       - name: Download Simulation Data
         uses: actions/download-artifact@v4
@@ -757,9 +800,18 @@ jobs:
           cache: "pip"
 
       - name: Set up R for GAM
+        id: setup-r-two-pop
+        continue-on-error: true
         uses: r-lib/actions/setup-r@v2
         with:
           r-version: "4.4.2"
+
+      - name: Fallback install R for GAM (two-pop)
+        if: steps.setup-r-two-pop.outcome != 'success'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends r-base
 
       - name: Install Python Dependencies
         run: |
@@ -769,7 +821,12 @@ jobs:
 
       - name: Install R GAM package
         run: |
-          Rscript -e 'install.packages("mgcv", repos="https://cloud.r-project.org")'
+          set -euo pipefail
+          for i in 1 2 3; do
+            Rscript -e 'install.packages("mgcv", repos="https://cloud.r-project.org")' && break
+            echo "mgcv install attempt $i failed; retrying..."
+            sleep $((i*10))
+          done
 
       - name: Install Plink2
         run: |
