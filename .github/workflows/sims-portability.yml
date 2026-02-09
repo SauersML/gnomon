@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       bottleneck_strength_only:
-        description: "Run only bottleneck-strength portability sim (10/20/50/70/100%)"
+        description: "Run only bottleneck-strength portability sim (0.5/1/5/10/20/50/70/100%)"
         type: boolean
         default: false
         required: false
@@ -423,6 +423,7 @@ jobs:
       fail-fast: false
       matrix:
         frac_chunk:
+          - { name: "f0p5_1_5", values: "0.005,0.01,0.05" }
           - { name: "f10_20", values: "0.1,0.2" }
           - { name: "f50_70", values: "0.5,0.7" }
           - { name: "f100", values: "1.0" }
@@ -707,7 +708,7 @@ jobs:
           lines = []
           lines.append("# Bottleneck-strength portability summary")
           lines.append("")
-          lines.append("Fixed setup: divergence=300 generations; bottleneck sizes=10%,20%,50%,70%,100%")
+          lines.append("Fixed setup: divergence=300 generations; bottleneck sizes=0.5%,1%,5%,10%,20%,50%,70%,100%")
           lines.append("")
           lines.append("| Bottleneck size | Transfer ratio mean | 95% CI |")
           lines.append("|---|---:|---|")

@@ -1263,7 +1263,11 @@ def parse_args() -> argparse.Namespace:
 
     ap_run_strength = sub.add_parser("run-strength-chunk")
     ap_run_strength.add_argument("--gens", type=int, default=300)
-    ap_run_strength.add_argument("--bottleneck-fracs", type=str, default="0.1,0.2,0.5,0.7,1.0")
+    ap_run_strength.add_argument(
+        "--bottleneck-fracs",
+        type=str,
+        default="0.005,0.01,0.05,0.1,0.2,0.5,0.7,1.0",
+    )
     ap_run_strength.add_argument("--seeds", type=str, default="1,2,3,4,5,6,7,8,9,10")
     ap_run_strength.add_argument("--chunk-name", type=str, default="")
     ap_run_strength.add_argument("--out-dir", type=str, default="sims/results_bottleneck_strength/chunks")
