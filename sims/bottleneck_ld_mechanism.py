@@ -24,11 +24,6 @@ from sim_pops import _diploid_index_pairs, _solve_intercept_for_prevalence
 from sim_two_pop import _build_demography_bottleneck, _build_demography_divergence
 
 
-NEAR_MAX_BP = 5_000
-FAR_MIN_BP = 50_000
-FAR_MAX_BP = 250_000
-
-
 @dataclass(frozen=True)
 class Config:
     scenario: str
@@ -187,43 +182,16 @@ def build_marginal_prs(
     return prs, betas
 
 
-def match_near_far_tags(sim: Sim, seed: int, min_tags: int) -> Tuple[np.ndarray, np.ndarray]:
+def select_tag_panel(sim: Sim, seed: int, min_tags: int) -> np.ndarray:
     rng = np.random.default_rng(seed + 200)
-
     all_idx = np.arange(sim.X.shape[1])
     noncausal = np.setdiff1d(all_idx, sim.causal_idx, assume_unique=False)
-
-    near = []
-    far = []
-
-    nc_pos = sim.pos[noncausal]
-
-    for c in sim.causal_idx:
-        cp = sim.pos[c]
-        d = np.abs(nc_pos - cp)
-
-        near_pool = noncausal[d <= NEAR_MAX_BP]
-        far_pool = noncausal[(d >= FAR_MIN_BP) & (d <= FAR_MAX_BP)]
-        if len(near_pool) == 0 or len(far_pool) == 0:
-            continue
-
-        # MAF match near/far per-causal to reduce heterozygosity confounding
-        cm = sim.maf[c]
-        near_choice = near_pool[np.argmin(np.abs(sim.maf[near_pool] - cm))]
-        far_choice = far_pool[np.argmin(np.abs(sim.maf[far_pool] - cm))]
-
-        near.append(int(near_choice))
-        far.append(int(far_choice))
-
-    near = np.array(sorted(set(near)), dtype=int)
-    far = np.array(sorted(set(far)), dtype=int)
-    n = min(len(near), len(far))
-    if n < min_tags:
-        raise RuntimeError(f"Insufficient matched tags: near={len(near)} far={len(far)}")
-
-    near_sel = np.sort(rng.choice(near, size=n, replace=False))
-    far_sel = np.sort(rng.choice(far, size=n, replace=False))
-    return near_sel, far_sel
+    eligible = noncausal[sim.maf[noncausal] >= 0.01]
+    if len(eligible) < min_tags:
+        raise RuntimeError(f"Insufficient tag variants: n={len(eligible)}")
+    if len(eligible) > 5000:
+        eligible = np.sort(rng.choice(eligible, size=5000, replace=False))
+    return np.sort(eligible.astype(int))
 
 
 def ld_destroyed_matrix(X: np.ndarray, score_idx: np.ndarray, tags: np.ndarray, seed: int) -> np.ndarray:
@@ -307,101 +275,67 @@ def one_run(cfg: Config, min_tags: int) -> Tuple[Dict[str, float], List[Dict[str
     pop1 = np.where(sim.pop_idx == 1)[0]
     train0, test0 = split_pop0(pop0, cfg.seed)
 
-    near_tags, far_tags = match_near_far_tags(sim, cfg.seed, min_tags=min_tags)
-    all_tags = np.sort(np.unique(np.concatenate([near_tags, far_tags]))).astype(int)
+    tags = select_tag_panel(sim, cfg.seed, min_tags=min_tags)
+    prs_all_0, b_all = build_marginal_prs(sim.X, sim.g_true, train0, test0, tags, use_score_stats=False)
+    prs_all_1, _ = build_marginal_prs(sim.X, sim.g_true, train0, pop1, tags, use_score_stats=False)
+    prs_all_1_het, _ = build_marginal_prs(sim.X, sim.g_true, train0, pop1, tags, use_score_stats=True)
 
-    prs_near_0, b_near = build_marginal_prs(sim.X, sim.g_true, train0, test0, near_tags, use_score_stats=False)
-    prs_near_1, _ = build_marginal_prs(sim.X, sim.g_true, train0, pop1, near_tags, use_score_stats=False)
-
-    prs_far_0, b_far = build_marginal_prs(sim.X, sim.g_true, train0, test0, far_tags, use_score_stats=False)
-    prs_far_1, _ = build_marginal_prs(sim.X, sim.g_true, train0, pop1, far_tags, use_score_stats=False)
-    prs_all_0, b_all = build_marginal_prs(sim.X, sim.g_true, train0, test0, all_tags, use_score_stats=False)
-    prs_all_1, _ = build_marginal_prs(sim.X, sim.g_true, train0, pop1, all_tags, use_score_stats=False)
-
-    prs_far_1_het, _ = build_marginal_prs(sim.X, sim.g_true, train0, pop1, far_tags, use_score_stats=True)
-
-    # LD destruction: preserve marginal distribution but scramble LD at target.
-    Xt = sim.X[np.ix_(train0, far_tags)].astype(float)
+    # LD destruction: preserve per-marker distribution but scramble marker relationships in target.
+    Xt = sim.X[np.ix_(train0, tags)].astype(float)
     mu_t = Xt.mean(axis=0)
     sd_t = Xt.std(axis=0)
     sd_t[sd_t == 0] = 1.0
-    Xld = ld_destroyed_matrix(sim.X, pop1, far_tags, cfg.seed)
-    prs_far_1_ld = ((Xld - mu_t) / sd_t) @ b_far
+    Xld = ld_destroyed_matrix(sim.X, pop1, tags, cfg.seed)
+    prs_all_1_ld = ((Xld - mu_t) / sd_t) @ b_all
 
     rng = np.random.default_rng(cfg.seed + 500)
     g_perm = sim.g_true.copy()
     g_perm[train0] = rng.permutation(g_perm[train0])
-    prs_null_0, _ = build_marginal_prs(sim.X, g_perm, train0, test0, far_tags, use_score_stats=False)
-    prs_null_1, _ = build_marginal_prs(sim.X, g_perm, train0, pop1, far_tags, use_score_stats=False)
+    prs_null_0, _ = build_marginal_prs(sim.X, g_perm, train0, test0, tags, use_score_stats=False)
+    prs_null_1, _ = build_marginal_prs(sim.X, g_perm, train0, pop1, tags, use_score_stats=False)
 
-    # Compare marginal betas trained in pop0 vs pop1 (same panel)
+    # Compare marginal betas trained in pop0 vs pop1 on the same tag panel.
     pop1_train = pop1[:len(train0)] if len(pop1) >= len(train0) else pop1
-    _, b_far_pop1 = build_marginal_prs(sim.X, sim.g_true, pop1_train, pop1_train, far_tags, use_score_stats=False)
-    _, b_all_pop1 = build_marginal_prs(sim.X, sim.g_true, pop1_train, pop1_train, all_tags, use_score_stats=False)
-    beta_corr_far = (
-        float(np.corrcoef(b_far, b_far_pop1)[0, 1])
-        if np.std(b_far) > 1e-12 and np.std(b_far_pop1) > 1e-12
-        else np.nan
-    )
+    _, b_all_pop1 = build_marginal_prs(sim.X, sim.g_true, pop1_train, pop1_train, tags, use_score_stats=False)
     beta_corr_all = (
         float(np.corrcoef(b_all, b_all_pop1)[0, 1])
         if np.std(b_all) > 1e-12 and np.std(b_all_pop1) > 1e-12
         else np.nan
     )
 
-    p0_far = sim.X[np.ix_(train0, far_tags)].mean(axis=0) / 2.0
-    p1_far = sim.X[np.ix_(pop1, far_tags)].mean(axis=0) / 2.0
-    h0_far = float(np.mean(2 * p0_far * (1 - p0_far)))
-    h1_far = float(np.mean(2 * p1_far * (1 - p1_far)))
-    p0_all = sim.X[np.ix_(train0, all_tags)].mean(axis=0) / 2.0
-    p1_all = sim.X[np.ix_(pop1, all_tags)].mean(axis=0) / 2.0
+    p0_all = sim.X[np.ix_(train0, tags)].mean(axis=0) / 2.0
+    p1_all = sim.X[np.ix_(pop1, tags)].mean(axis=0) / 2.0
     h0_all = float(np.mean(2 * p0_all * (1 - p0_all)))
     h1_all = float(np.mean(2 * p1_all * (1 - p1_all)))
 
-    r2_near_0 = safe_r2(prs_near_0, sim.g_true[test0])
-    r2_near_1 = safe_r2(prs_near_1, sim.g_true[pop1])
-    r2_far_0 = safe_r2(prs_far_0, sim.g_true[test0])
-    r2_far_1 = safe_r2(prs_far_1, sim.g_true[pop1])
     r2_all_0 = safe_r2(prs_all_0, sim.g_true[test0])
     r2_all_1 = safe_r2(prs_all_1, sim.g_true[pop1])
-    r2_far_1_het = safe_r2(prs_far_1_het, sim.g_true[pop1])
-    r2_far_1_ld = safe_r2(prs_far_1_ld, sim.g_true[pop1])
+    r2_all_1_het = safe_r2(prs_all_1_het, sim.g_true[pop1])
+    r2_all_1_ld = safe_r2(prs_all_1_ld, sim.g_true[pop1])
 
-    ratio_near = r2_near_1 / r2_near_0 if r2_near_0 > 1e-8 else np.nan
-    ratio_far = r2_far_1 / r2_far_0 if r2_far_0 > 1e-8 else np.nan
     ratio_all = r2_all_1 / r2_all_0 if r2_all_0 > 1e-8 else np.nan
-    ratio_far_het = r2_far_1_het / r2_far_0 if r2_far_0 > 1e-8 else np.nan
-    ratio_far_ld = r2_far_1_ld / r2_far_0 if r2_far_0 > 1e-8 else np.nan
+    ratio_all_het = r2_all_1_het / r2_all_0 if r2_all_0 > 1e-8 else np.nan
+    ratio_all_ld = r2_all_1_ld / r2_all_0 if r2_all_0 > 1e-8 else np.nan
 
     base_row = {
         "scenario": cfg.scenario,
         "divergence_gens": cfg.gens,
         "seed": cfg.seed,
-        "n_near_tags": len(near_tags),
-        "n_far_tags": len(far_tags),
-        "r2_near_training_holdout": r2_near_0,
-        "r2_near_target_population": r2_near_1,
-        "ratio_near": ratio_near,
-        "r2_distant_training_holdout": r2_far_0,
-        "r2_distant_target_population": r2_far_1,
-        "ratio_far": ratio_far,
+        "n_tags": len(tags),
         "r2_alltags_training_holdout": r2_all_0,
         "r2_alltags_target_population": r2_all_1,
         "ratio_alltags": ratio_all,
-        "r2_distant_target_standardized_by_target": r2_far_1_het,
-        "ratio_far_het": ratio_far_het,
-        "r2_distant_target_with_destroyed_linkage": r2_far_1_ld,
-        "ratio_far_ld_destroy": ratio_far_ld,
-        "delta_near_minus_far": ratio_near - ratio_far if np.isfinite(ratio_near) and np.isfinite(ratio_far) else np.nan,
-        "delta_het_minus_baseline": ratio_far_het - ratio_far if np.isfinite(ratio_far_het) and np.isfinite(ratio_far) else np.nan,
-        "delta_lddestroy_minus_baseline": ratio_far_ld - ratio_far if np.isfinite(ratio_far_ld) and np.isfinite(ratio_far) else np.nan,
+        "r2_alltags_target_standardized_by_target": r2_all_1_het,
+        "ratio_alltags_het": ratio_all_het,
+        "r2_alltags_target_with_destroyed_linkage": r2_all_1_ld,
+        "ratio_alltags_ld_destroy": ratio_all_ld,
+        "delta_het_minus_baseline": ratio_all_het - ratio_all if np.isfinite(ratio_all_het) and np.isfinite(ratio_all) else np.nan,
+        "delta_lddestroy_minus_baseline": ratio_all_ld - ratio_all if np.isfinite(ratio_all_ld) and np.isfinite(ratio_all) else np.nan,
         "r2_null_training_holdout": safe_r2(prs_null_0, sim.g_true[test0]),
         "r2_null_target_population": safe_r2(prs_null_1, sim.g_true[pop1]),
-        "beta_corr_distant_training_vs_target": beta_corr_far,
         "beta_corr_alltags_training_vs_target": beta_corr_all,
-        "delta_heterozygosity_distant_target_minus_training": h1_far - h0_far,
         "delta_heterozygosity_alltags_target_minus_training": h1_all - h0_all,
-        "mean_abs_maf_diff_far": float(np.mean(np.abs(p1_far - p0_far))),
+        "mean_abs_maf_diff_alltags": float(np.mean(np.abs(p1_all - p0_all))),
     }
 
     sweep_rows: List[Dict[str, float]] = []
@@ -549,11 +483,10 @@ def summarize(df: pd.DataFrame, sweep_df: pd.DataFrame, out_dir: Path) -> None:
 
     summary = df.groupby(["scenario", "divergence_gens"]).agg(
         n=("seed", "count"),
-        ratio_near_mean=("ratio_near", "mean"),
-        ratio_far_mean=("ratio_far", "mean"),
-        ratio_far_het_mean=("ratio_far_het", "mean"),
-        ratio_far_ld_destroy_mean=("ratio_far_ld_destroy", "mean"),
-        beta_corr_far_mean=("beta_corr_distant_training_vs_target", "mean"),
+        ratio_alltags_mean=("ratio_alltags", "mean"),
+        ratio_alltags_het_mean=("ratio_alltags_het", "mean"),
+        ratio_alltags_ld_destroy_mean=("ratio_alltags_ld_destroy", "mean"),
+        beta_corr_alltags_mean=("beta_corr_alltags_training_vs_target", "mean"),
     ).reset_index()
     summary.to_csv(out_dir / "bottleneck_ld_mechanism_summary.csv", index=False)
 
@@ -588,12 +521,9 @@ def summarize(df: pd.DataFrame, sweep_df: pd.DataFrame, out_dir: Path) -> None:
     if len(tmp2) > 3 and np.std(tmp2["added_harm_alltags"]) > 1e-12 and np.std(tmp2["hetero_shift_delta"]) > 1e-12:
         corr_het = float(np.corrcoef(tmp2["added_harm_alltags"], tmp2["hetero_shift_delta"])[0, 1])
 
-    # Tests for requested claims
-    d_nf = df["delta_near_minus_far"].dropna().values
+    # Tests for intervention effects on the unified tag panel.
     d_het = df["delta_het_minus_baseline"].dropna().values
     d_ld = df["delta_lddestroy_minus_baseline"].dropna().values
-
-    t_nf = ttest_1samp(d_nf, 0.0, nan_policy="omit")
     t_het = ttest_1samp(d_het, 0.0, nan_policy="omit")
     t_ld = ttest_1samp(d_ld, 0.0, nan_policy="omit")
 
@@ -618,38 +548,33 @@ def summarize(df: pd.DataFrame, sweep_df: pd.DataFrame, out_dir: Path) -> None:
         gens_sorted = sorted(z["divergence_gens"].unique())
         if gens_sorted:
             max_gen = max(max_gen, int(max(gens_sorted)))
-        for metric, style, tag_label in [
-            ("ratio_near", "o-", "near tags (within 5,000 base pairs)"),
-            ("ratio_far", "s--", "distant tags (50,000 to 250,000 base pairs)"),
-        ]:
-            xs, ms, lo, hi = [], [], [], []
-            for g in gens_sorted:
-                vals = z[z["divergence_gens"] == g][metric].dropna().values
-                if len(vals) == 0:
-                    continue
-                m, l, h = mean_ci(vals)
-                xs.append(g)
-                ms.append(m)
-                lo.append(l)
-                hi.append(h)
-            if not xs:
+        xs, ms, lo, hi = [], [], [], []
+        for g in gens_sorted:
+            vals = z[z["divergence_gens"] == g]["ratio_alltags"].dropna().values
+            if len(vals) == 0:
                 continue
-            label = f"{sc}, {tag_label}"
-            ax.plot(xs, ms, style, color=color, linewidth=2.2, markersize=6, label=label)
-            ax.fill_between(xs, lo, hi, color=color, alpha=0.12 if metric == "ratio_near" else 0.08)
+            m, l, h = mean_ci(vals)
+            xs.append(g)
+            ms.append(m)
+            lo.append(l)
+            hi.append(h)
+        if not xs:
+            continue
+        ax.plot(xs, ms, "o-", color=color, linewidth=2.2, markersize=6, label=sc)
+        ax.fill_between(xs, lo, hi, color=color, alpha=0.12)
     ax.axhline(1.0, color="gray", ls=":")
     ax.set_xscale("symlog", linthresh=20)
     if max_gen > 0:
         ticks = sorted(df["divergence_gens"].unique())
         ax.set_xlim(left=0, right=max(1.0, float(max_gen) * 1.1))
         ax.set_xticks(ticks)
-    ax.set_title("Nearby vs distant marker-tag transfer")
+    ax.set_title("Transfer performance using unified marker panel")
     ax.set_xlabel("Population split age (generations)")
     ax.set_ylabel("Transfer ratio\n(target population R^2 / same-ancestry holdout R^2)")
     ax.grid(True)
     ax.set_ylim(bottom=0.15)
     ax.legend(frameon=False, fontsize=8, ncol=2)
-    fig.savefig(out_dir / "fig1_near_vs_far.png", dpi=220)
+    fig.savefig(out_dir / "fig1_transfer_by_scenario.png", dpi=220)
     plt.close(fig)
 
     fig, ax = plt.subplots(1, 1, figsize=(12.5, 5.0), constrained_layout=True)
@@ -660,9 +585,9 @@ def summarize(df: pd.DataFrame, sweep_df: pd.DataFrame, out_dir: Path) -> None:
         if gens_sorted:
             max_gen = max(max_gen, int(max(gens_sorted)))
         for metric, style, label in [
-            ("ratio_far", "o-", "baseline"),
-            ("ratio_far_het", "s--", "target standardized by target distribution"),
-            ("ratio_far_ld_destroy", "d:", "target linkage structure destroyed"),
+            ("ratio_alltags", "o-", "baseline"),
+            ("ratio_alltags_het", "s--", "target standardized by target distribution"),
+            ("ratio_alltags_ld_destroy", "d:", "target linkage structure destroyed"),
         ]:
             xs, ms, lo, hi = [], [], [], []
             for g in gens_sorted:
@@ -685,9 +610,9 @@ def summarize(df: pd.DataFrame, sweep_df: pd.DataFrame, out_dir: Path) -> None:
         ticks = sorted(df["divergence_gens"].unique())
         ax.set_xlim(left=0, right=max(1.0, float(max_gen) * 1.1))
         ax.set_xticks(ticks)
-    ax.set_title("Intervention comparison for distant marker tags")
+    ax.set_title("Intervention comparison for unified marker panel")
     ax.set_xlabel("Population split age (generations)")
-    ax.set_ylabel("Transfer ratio for distant marker tags\n(target population R^2 / same-ancestry holdout R^2)")
+    ax.set_ylabel("Transfer ratio\n(target population R^2 / same-ancestry holdout R^2)")
     ax.grid(True)
     ax.set_ylim(bottom=-0.05)
     ax.legend(frameon=False, fontsize=8, ncol=2)
@@ -822,23 +747,12 @@ def summarize(df: pd.DataFrame, sweep_df: pd.DataFrame, out_dir: Path) -> None:
         fig.savefig(out_dir / "fig5_heterozygosity_manipulation_sweep.png", dpi=220)
         plt.close(fig)
 
-    m_nf, l_nf, u_nf = mean_ci(d_nf)
     m_het, l_het, u_het = mean_ci(d_het)
     m_ld, l_ld, u_ld = mean_ci(d_ld)
     tests = pd.DataFrame([
         {
             "test_id": "H1",
-            "contrast": "near_ratio_minus_far_ratio_ne_0",
-            "estimate_mean": m_nf,
-            "estimate_ci_lo": l_nf,
-            "estimate_ci_hi": u_nf,
-            "t_stat": float(t_nf.statistic),
-            "p_value": float(t_nf.pvalue),
-            "p_value_type": "two-sided",
-        },
-        {
-            "test_id": "H2",
-            "contrast": "heterozygosity_normalized_far_minus_baseline_far_ne_0",
+            "contrast": "heterozygosity_normalized_alltags_minus_baseline_alltags_ne_0",
             "estimate_mean": m_het,
             "estimate_ci_lo": l_het,
             "estimate_ci_hi": u_het,
@@ -847,8 +761,8 @@ def summarize(df: pd.DataFrame, sweep_df: pd.DataFrame, out_dir: Path) -> None:
             "p_value_type": "two-sided",
         },
         {
-            "test_id": "H3",
-            "contrast": "ld_destroyed_far_minus_baseline_far_ne_0",
+            "test_id": "H2",
+            "contrast": "ld_destroyed_alltags_minus_baseline_alltags_ne_0",
             "estimate_mean": m_ld,
             "estimate_ci_lo": l_ld,
             "estimate_ci_hi": u_ld,

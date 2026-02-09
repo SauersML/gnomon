@@ -427,7 +427,7 @@ jobs:
             sims/results_bottleneck_ld_mechanism/bottleneck_hypothesis_tests.csv
             sims/results_bottleneck_ld_mechanism/bottleneck_diagnostics.csv
             sims/results_bottleneck_ld_mechanism/bottleneck_heterozygosity_sweep_results.csv
-            sims/results_bottleneck_ld_mechanism/fig1_near_vs_far.png
+            sims/results_bottleneck_ld_mechanism/fig1_transfer_by_scenario.png
             sims/results_bottleneck_ld_mechanism/fig2_ld_vs_hetero_interventions.png
             sims/results_bottleneck_ld_mechanism/fig3_added_harm_correlates.png
             sims/results_bottleneck_ld_mechanism/fig4_heterozygosity_distributions.png
