@@ -175,6 +175,14 @@ jobs:
           set -euo pipefail
           echo "Disk before cleanup:"
           df -h
+          if [ -d /home/runner/actions-runner/cached/_diag ]; then
+            echo "Cleaning runner diag logs..."
+            find /home/runner/actions-runner/cached/_diag -type f -name "*.log*" -delete || true
+          fi
+          if [ -d /home/runner/actions-runner/cached/_work/_temp ]; then
+            echo "Cleaning runner temp workspace..."
+            find /home/runner/actions-runner/cached/_work/_temp -mindepth 1 -maxdepth 1 -exec rm -rf {} + || true
+          fi
           sudo rm -rf /usr/share/dotnet || true
           sudo rm -rf /opt/ghc || true
           sudo rm -rf /usr/local/lib/android || true
@@ -221,6 +229,8 @@ jobs:
           set -euo pipefail
           echo "Running Simulation ${{ matrix.sim_name }} (seed=${{ matrix.seed }})..."
           prefix="${{ matrix.sim_name }}_s${{ matrix.seed }}"
+          echo "Disk before simulation:"
+          df -h
           ok=0
           for attempt in 1 2 3; do
             echo "Simulation attempt ${attempt}/3 for ${prefix}"
@@ -230,6 +240,9 @@ jobs:
               break
             fi
             echo "Simulation attempt ${attempt} failed for ${prefix}"
+            echo "Debug disk usage after failed attempt:"
+            df -h || true
+            du -sh ./* 2>/dev/null | sort -h | tail -n 30 || true
             sleep $((attempt*20))
           done
           if [ "$ok" -ne 1 ]; then
@@ -255,10 +268,12 @@ jobs:
           set -euo pipefail
           prefix="${{ matrix.sim_name }}_s${{ matrix.seed }}"
           rm -f "${prefix}.bed" "${prefix}.bim" "${prefix}.fam"
+          rm -f "${prefix}_sites.npz" "${prefix}_pcs.png"
           echo "Disk after cleanup:"
           df -h
 
       - name: Upload Simulation Data (Artifact Stream A)
+        if: ${{ always() }}
         id: upload-sim-data-primary
         continue-on-error: true
         uses: actions/upload-artifact@v4
@@ -267,19 +282,48 @@ jobs:
           path: |
             ${{ matrix.sim_name }}_s${{ matrix.seed }}_work/
             ${{ matrix.sim_name }}_s${{ matrix.seed }}.tsv
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 1
 
       - name: Retry upload simulation data
-        if: steps.upload-sim-data-primary.outcome != 'success'
+        if: ${{ always() && steps.upload-sim-data-primary.outcome != 'success' }}
         uses: actions/upload-artifact@v4
         with:
           name: sim-data-${{ matrix.sim_name }}-s${{ matrix.seed }}
           path: |
             ${{ matrix.sim_name }}_s${{ matrix.seed }}_work/
             ${{ matrix.sim_name }}_s${{ matrix.seed }}.tsv
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 1
+
+      - name: Upload simulate diagnostics
+        if: ${{ always() }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          {
+            echo "sim_name=${{ matrix.sim_name }}"
+            echo "seed=${{ matrix.seed }}"
+            echo "date_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo ""
+            echo "== disk =="
+            df -h
+            echo ""
+            echo "== top files in workspace =="
+            du -sh ./* 2>/dev/null | sort -h | tail -n 40
+            echo ""
+            echo "== runner diag dir =="
+            ls -lah /home/runner/actions-runner/cached/_diag 2>/dev/null || true
+          } > "simulate_${{ matrix.sim_name }}_s${{ matrix.seed }}_debug.txt"
+
+      - name: Upload simulate diagnostics artifact
+        if: ${{ always() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: sim-debug-${{ matrix.sim_name }}-s${{ matrix.seed }}
+          path: simulate_${{ matrix.sim_name }}_s${{ matrix.seed }}_debug.txt
+          if-no-files-found: warn
 
       - name: Save tool cache
         if: ${{ always() && steps.tools-cache.outputs.cache-hit != 'true' }}
