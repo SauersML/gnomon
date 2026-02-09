@@ -201,6 +201,52 @@ def _mean_heterozygosity_from_matrix(X: np.ndarray) -> float:
     return float(np.mean(2.0 * p * (1.0 - p)))
 
 
+def _heterozygosity_resample_probs(
+    X: np.ndarray, strength: float, increase: bool
+) -> np.ndarray:
+    X = np.asarray(X, dtype=np.int8)
+    n = X.shape[0]
+    if n == 0:
+        return np.zeros(0, dtype=float)
+    if strength <= 0.0:
+        return np.full(n, 1.0 / n, dtype=float)
+
+    h = np.mean(X == 1, axis=1).astype(float)
+    sd = float(np.std(h))
+    if sd <= 1e-12:
+        return np.full(n, 1.0 / n, dtype=float)
+
+    z = (h - float(np.mean(h))) / sd
+    logits = strength * z if increase else -strength * z
+    logits = logits - float(np.max(logits))
+    w = np.exp(logits)
+    return w / float(np.sum(w))
+
+
+def _effective_sample_size(probs: np.ndarray) -> float:
+    probs = np.asarray(probs, dtype=float)
+    if probs.size == 0:
+        return 0.0
+    denom = float(np.sum(probs ** 2))
+    if denom <= 0.0:
+        return 0.0
+    return float(1.0 / denom)
+
+
+def _resample_stability(
+    X: np.ndarray,
+    strength: float,
+    increase: bool,
+    min_ess_frac: float,
+    min_ess_count: int,
+) -> Tuple[bool, float, float]:
+    probs = _heterozygosity_resample_probs(X, strength, increase)
+    n = probs.size
+    ess = _effective_sample_size(probs)
+    min_ess_required = max(float(min_ess_count), float(min_ess_frac) * float(n))
+    return ess >= min_ess_required, ess, min_ess_required
+
+
 def _heterozygosity_biased_resample(
     X: np.ndarray, strength: float, increase: bool, rng: np.random.Generator
 ) -> np.ndarray:
@@ -208,21 +254,7 @@ def _heterozygosity_biased_resample(
     n = X.shape[0]
     if n == 0:
         return X.copy()
-    if strength <= 0.0:
-        idx = rng.choice(n, size=n, replace=True)
-        return X[idx].copy()
-
-    h = np.mean(X == 1, axis=1).astype(float)
-    sd = float(np.std(h))
-    if sd <= 1e-12:
-        idx = rng.choice(n, size=n, replace=True)
-        return X[idx].copy()
-
-    z = (h - float(np.mean(h))) / sd
-    logits = strength * z if increase else -strength * z
-    logits = logits - float(np.max(logits))
-    w = np.exp(logits)
-    probs = w / float(np.sum(w))
+    probs = _heterozygosity_resample_probs(X, strength, increase)
     idx = rng.choice(n, size=n, replace=True, p=probs)
     return X[idx].copy()
 
@@ -262,7 +294,12 @@ def _ld_corr_change(X_before: np.ndarray, X_after: np.ndarray) -> float:
     return float(np.mean(d))
 
 
-def one_run(cfg: Config, n_array_sites: int) -> Tuple[Dict[str, float], List[Dict[str, float]]]:
+def one_run(
+    cfg: Config,
+    n_array_sites: int,
+    min_resample_ess_frac: float,
+    min_resample_ess_count: int,
+) -> Tuple[Dict[str, float], List[Dict[str, float]]]:
     sim = simulate(cfg)
 
     pop0 = np.where(sim.pop_idx == 0)[0]
@@ -272,7 +309,6 @@ def one_run(cfg: Config, n_array_sites: int) -> Tuple[Dict[str, float], List[Dic
     tags = select_tag_panel(sim, n_array_sites=n_array_sites)
     prs_all_0, b_all = build_marginal_prs(sim.X, sim.g_true, train0, test0, tags, use_score_stats=False)
     prs_all_1, _ = build_marginal_prs(sim.X, sim.g_true, train0, pop1, tags, use_score_stats=False)
-    prs_all_1_het, _ = build_marginal_prs(sim.X, sim.g_true, train0, pop1, tags, use_score_stats=True)
 
     # LD destruction: preserve per-marker distribution but scramble marker relationships in target.
     Xt = sim.X[np.ix_(train0, tags)].astype(float)
@@ -304,11 +340,9 @@ def one_run(cfg: Config, n_array_sites: int) -> Tuple[Dict[str, float], List[Dic
 
     r2_all_0 = safe_r2(prs_all_0, sim.g_true[test0])
     r2_all_1 = safe_r2(prs_all_1, sim.g_true[pop1])
-    r2_all_1_het = safe_r2(prs_all_1_het, sim.g_true[pop1])
     r2_all_1_ld = safe_r2(prs_all_1_ld, sim.g_true[pop1])
 
     ratio_all = r2_all_1 / r2_all_0 if r2_all_0 > 1e-8 else np.nan
-    ratio_all_het = r2_all_1_het / r2_all_0 if r2_all_0 > 1e-8 else np.nan
     ratio_all_ld = r2_all_1_ld / r2_all_0 if r2_all_0 > 1e-8 else np.nan
 
     base_row = {
@@ -319,11 +353,8 @@ def one_run(cfg: Config, n_array_sites: int) -> Tuple[Dict[str, float], List[Dic
         "r2_alltags_training_holdout": r2_all_0,
         "r2_alltags_target_population": r2_all_1,
         "ratio_alltags": ratio_all,
-        "r2_alltags_target_standardized_by_target": r2_all_1_het,
-        "ratio_alltags_het": ratio_all_het,
         "r2_alltags_target_with_destroyed_linkage": r2_all_1_ld,
         "ratio_alltags_ld_destroy": ratio_all_ld,
-        "delta_het_minus_baseline": ratio_all_het - ratio_all if np.isfinite(ratio_all_het) and np.isfinite(ratio_all) else np.nan,
         "delta_lddestroy_minus_baseline": ratio_all_ld - ratio_all if np.isfinite(ratio_all_ld) and np.isfinite(ratio_all) else np.nan,
         "r2_null_training_holdout": safe_r2(prs_null_0, sim.g_true[test0]),
         "r2_null_target_population": safe_r2(prs_null_1, sim.g_true[pop1]),
@@ -334,6 +365,8 @@ def one_run(cfg: Config, n_array_sites: int) -> Tuple[Dict[str, float], List[Dic
 
     sweep_rows: List[Dict[str, float]] = []
     strengths = [0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
+    strengths_run = 0
+    strengths_skipped_unstable = 0
 
     X_train_all = sim.X[np.ix_(train0, tags)].astype(float)
     X_test_all = sim.X[np.ix_(test0, tags)].astype(float)
@@ -358,11 +391,22 @@ def one_run(cfg: Config, n_array_sites: int) -> Tuple[Dict[str, float], List[Dic
         r2_holdout = safe_r2(((X_test_all - mu_t) / sd_t) @ b, sim.g_true[test0])
 
         for strength in strengths:
+            stable, ess_target, min_ess_target = _resample_stability(
+                X_target_all_i,
+                strength,
+                increase=False,
+                min_ess_frac=min_resample_ess_frac,
+                min_ess_count=min_resample_ess_count,
+            )
+            if not stable:
+                strengths_skipped_unstable += 1
+                continue
             X_target_new_i = _heterozygosity_biased_resample(X_target_all_i, strength, increase=False, rng=rng_sweep)
             X_target_new = X_target_new_i.astype(float)
             prs_target = ((X_target_new - mu_t) / sd_t) @ b
             r2_target = safe_r2(prs_target, sim.g_true[pop1])
             ratio = r2_target / r2_holdout if r2_holdout > 1e-8 else np.nan
+            strengths_run += 1
             sweep_rows.append(
                 {
                     "scenario": cfg.scenario,
@@ -379,12 +423,31 @@ def one_run(cfg: Config, n_array_sites: int) -> Tuple[Dict[str, float], List[Dic
                     "r2_target_population": r2_target,
                     "transfer_ratio": ratio,
                     "ld_absolute_change": _ld_corr_change(X_target_all_i.astype(float), X_target_new),
+                    "resample_ess_target": ess_target,
+                    "resample_min_ess_required": min_ess_target,
                 }
             )
 
     # Bottleneck scenario: raise training heterozygosity across a broad range.
     if cfg.scenario == "bottleneck":
         for strength in strengths:
+            stable_train, ess_train, min_ess_train = _resample_stability(
+                X_train_all_i,
+                strength,
+                increase=True,
+                min_ess_frac=min_resample_ess_frac,
+                min_ess_count=min_resample_ess_count,
+            )
+            stable_test, ess_test, min_ess_test = _resample_stability(
+                X_test_all_i,
+                strength,
+                increase=True,
+                min_ess_frac=min_resample_ess_frac,
+                min_ess_count=min_resample_ess_count,
+            )
+            if not (stable_train and stable_test):
+                strengths_skipped_unstable += 1
+                continue
             X_train_new_i = _heterozygosity_biased_resample(X_train_all_i, strength, increase=True, rng=rng_sweep)
             X_test_new_i = _heterozygosity_biased_resample(X_test_all_i, strength, increase=True, rng=rng_sweep)
             X_train_new = X_train_new_i.astype(float)
@@ -402,6 +465,7 @@ def one_run(cfg: Config, n_array_sites: int) -> Tuple[Dict[str, float], List[Dic
             r2_holdout = safe_r2(prs_holdout, sim.g_true[test0])
             r2_target = safe_r2(prs_target, sim.g_true[pop1])
             ratio = r2_target / r2_holdout if r2_holdout > 1e-8 else np.nan
+            strengths_run += 1
 
             sweep_rows.append(
                 {
@@ -419,9 +483,16 @@ def one_run(cfg: Config, n_array_sites: int) -> Tuple[Dict[str, float], List[Dic
                     "r2_target_population": r2_target,
                     "transfer_ratio": ratio,
                     "ld_absolute_change": _ld_corr_change(X_train_all_i.astype(float), X_train_new),
+                    "resample_ess_training": ess_train,
+                    "resample_ess_holdout": ess_test,
+                    "resample_min_ess_required_training": min_ess_train,
+                    "resample_min_ess_required_holdout": min_ess_test,
                 }
             )
 
+    base_row["sweep_strengths_considered"] = float(len(strengths))
+    base_row["sweep_strengths_run"] = float(strengths_run)
+    base_row["sweep_strengths_skipped_unstable"] = float(strengths_skipped_unstable)
     return base_row, sweep_rows
 
 
@@ -461,7 +532,16 @@ def run_chunk(args: argparse.Namespace) -> Tuple[Path, Path]:
     rows: List[Dict[str, float]] = []
     sweep_rows: List[Dict[str, float]] = []
     with cf.ProcessPoolExecutor(max_workers=args.workers) as ex:
-        futs = [ex.submit(one_run, cfg, args.n_array_sites) for cfg in cfgs]
+        futs = [
+            ex.submit(
+                one_run,
+                cfg,
+                args.n_array_sites,
+                args.min_resample_ess_frac,
+                args.min_resample_ess_count,
+            )
+            for cfg in cfgs
+        ]
         for fut in cf.as_completed(futs):
             base_row, sweep_part = fut.result()
             rows.append(base_row)
@@ -484,7 +564,6 @@ def summarize(df: pd.DataFrame, sweep_df: pd.DataFrame, out_dir: Path) -> None:
     summary = df.groupby(["scenario", "divergence_gens"]).agg(
         n=("seed", "count"),
         ratio_alltags_mean=("ratio_alltags", "mean"),
-        ratio_alltags_het_mean=("ratio_alltags_het", "mean"),
         ratio_alltags_ld_destroy_mean=("ratio_alltags_ld_destroy", "mean"),
         beta_corr_alltags_mean=("beta_corr_alltags_training_vs_target", "mean"),
     ).reset_index()
@@ -522,9 +601,7 @@ def summarize(df: pd.DataFrame, sweep_df: pd.DataFrame, out_dir: Path) -> None:
         corr_het = float(np.corrcoef(tmp2["added_harm_alltags"], tmp2["hetero_shift_delta"])[0, 1])
 
     # Tests for intervention effects on the unified tag panel.
-    d_het = df["delta_het_minus_baseline"].dropna().values
     d_ld = df["delta_lddestroy_minus_baseline"].dropna().values
-    t_het = ttest_1samp(d_het, 0.0, nan_policy="omit")
     t_ld = ttest_1samp(d_ld, 0.0, nan_policy="omit")
 
     null0 = df["r2_null_training_holdout"].mean()
@@ -586,7 +663,6 @@ def summarize(df: pd.DataFrame, sweep_df: pd.DataFrame, out_dir: Path) -> None:
             max_gen = max(max_gen, int(max(gens_sorted)))
         for metric, style, label in [
             ("ratio_alltags", "o-", "baseline"),
-            ("ratio_alltags_het", "s--", "target standardized by target distribution"),
             ("ratio_alltags_ld_destroy", "d:", "target linkage structure destroyed"),
         ]:
             xs, ms, lo, hi = [], [], [], []
@@ -677,8 +753,10 @@ def summarize(df: pd.DataFrame, sweep_df: pd.DataFrame, out_dir: Path) -> None:
         sweep_df.to_csv(out_dir / "bottleneck_heterozygosity_sweep_results.csv", index=False)
 
         fig, ax = plt.subplots(1, 1, figsize=(8.5, 5.0), constrained_layout=True)
-        het_lo = 0.125
-        het_hi = 0.40
+        x_lo_vals: List[float] = []
+        x_hi_vals: List[float] = []
+        y_lo_vals: List[float] = []
+        y_hi_vals: List[float] = []
         for (sc, intervention), color, marker in [
             (("divergence", "decrease_target_heterozygosity"), "#1f77b4", "o"),
             (("bottleneck", "increase_training_heterozygosity"), "#d62728", "s"),
@@ -688,7 +766,6 @@ def summarize(df: pd.DataFrame, sweep_df: pd.DataFrame, out_dir: Path) -> None:
                 continue
             if intervention == "increase_training_heterozygosity":
                 z = z[z["mean_heterozygosity_training"] >= z["baseline_heterozygosity_training"]]
-                z = z[(z["mean_heterozygosity_training"] >= het_lo) & (z["mean_heterozygosity_training"] <= het_hi)]
                 grp = z.groupby("resample_strength", as_index=False).agg(
                     mean_heterozygosity=("mean_heterozygosity_training", "mean"),
                     transfer_ratio_mean=("transfer_ratio", "mean"),
@@ -697,7 +774,6 @@ def summarize(df: pd.DataFrame, sweep_df: pd.DataFrame, out_dir: Path) -> None:
                 )
             else:
                 z = z[z["mean_heterozygosity_target"] <= z["baseline_heterozygosity_target"]]
-                z = z[(z["mean_heterozygosity_target"] >= het_lo) & (z["mean_heterozygosity_target"] <= het_hi)]
                 grp = z.groupby("resample_strength", as_index=False).agg(
                     mean_heterozygosity=("mean_heterozygosity_target", "mean"),
                     transfer_ratio_mean=("transfer_ratio", "mean"),
@@ -727,29 +803,33 @@ def summarize(df: pd.DataFrame, sweep_df: pd.DataFrame, out_dir: Path) -> None:
                 label=label,
             )
             ax.fill_between(grp["mean_heterozygosity"], lo, hi, color=color, alpha=0.12)
+            x_lo_vals.append(float(np.nanmin(grp["mean_heterozygosity"].values)))
+            x_hi_vals.append(float(np.nanmax(grp["mean_heterozygosity"].values)))
+            y_lo_vals.append(float(np.nanmin(lo.values)))
+            y_hi_vals.append(float(np.nanmax(hi.values)))
         ax.axhline(1.0, color="gray", ls=":")
-        ax.set_xlim(het_lo, het_hi)
+        if x_lo_vals and x_hi_vals:
+            x_min = float(np.nanmin(np.asarray(x_lo_vals, dtype=float)))
+            x_max = float(np.nanmax(np.asarray(x_hi_vals, dtype=float)))
+            x_span = x_max - x_min
+            x_pad = 0.03 * x_span if x_span > 1e-12 else max(1e-6, abs(x_min) * 0.03)
+            ax.set_xlim(x_min - x_pad, x_max + x_pad)
+        if y_lo_vals and y_hi_vals:
+            y_min = float(np.nanmin(np.asarray(y_lo_vals, dtype=float)))
+            y_max = float(np.nanmax(np.asarray(y_hi_vals, dtype=float)))
+            y_span = y_max - y_min
+            y_pad = 0.06 * y_span if y_span > 1e-12 else max(1e-6, abs(y_min) * 0.03)
+            ax.set_ylim(y_min - y_pad, y_max + y_pad)
         ax.set_xlabel("Mean heterozygosity of manipulated population")
         ax.set_ylabel("Transfer ratio\n(target population R^2 / same-ancestry holdout R^2)")
-        ax.set_title("Heterozygosity-manipulation sweep (0.125 to 0.40)")
+        ax.set_title("Heterozygosity-manipulation sweep")
         ax.grid(True)
         ax.legend(frameon=False, fontsize=8)
         fig.savefig(out_dir / "fig5_heterozygosity_manipulation_sweep.png", dpi=220)
         plt.close(fig)
 
-    m_het, l_het, u_het = mean_ci(d_het)
     m_ld, l_ld, u_ld = mean_ci(d_ld)
     tests = pd.DataFrame([
-        {
-            "test_id": "H1",
-            "contrast": "heterozygosity_normalized_alltags_minus_baseline_alltags_ne_0",
-            "estimate_mean": m_het,
-            "estimate_ci_lo": l_het,
-            "estimate_ci_hi": u_het,
-            "t_stat": float(t_het.statistic),
-            "p_value": float(t_het.pvalue),
-            "p_value_type": "two-sided",
-        },
         {
             "test_id": "H2",
             "contrast": "ld_destroyed_alltags_minus_baseline_alltags_ne_0",
@@ -821,6 +901,18 @@ def parse_args() -> argparse.Namespace:
     ap_run.add_argument("--seq-len", type=int, default=5_000_000)
     ap_run.add_argument("--n-causal", type=int, default=400)
     ap_run.add_argument("--n-array-sites", type=int, default=2000)
+    ap_run.add_argument(
+        "--min-resample-ess-frac",
+        type=float,
+        default=0.25,
+        help="Skip sweep strengths when ESS < max(min_resample_ess_count, min_resample_ess_frac * n).",
+    )
+    ap_run.add_argument(
+        "--min-resample-ess-count",
+        type=int,
+        default=100,
+        help="Absolute ESS floor used by the heterozygosity resampling stability gate.",
+    )
 
     ap_merge = sub.add_parser("summarize")
     ap_merge.add_argument("--glob", type=str, default="sims/results_bottleneck_ld_mechanism/chunks/*.csv")
