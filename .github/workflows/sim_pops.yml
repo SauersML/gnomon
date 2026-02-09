@@ -255,6 +255,22 @@ jobs:
           python sims/split_data.py ${{ matrix.sim_name }}_s${{ matrix.seed }}
 
       - name: Upload Simulation Data (Artifact Stream A)
+        id: upload-sim-data-primary
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: sim-data-${{ matrix.sim_name }}-s${{ matrix.seed }}
+          path: |
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}_work/
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}.tsv
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}.bed
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}.bim
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}.fam
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Retry upload simulation data
+        if: steps.upload-sim-data-primary.outcome != 'success'
         uses: actions/upload-artifact@v4
         with:
           name: sim-data-${{ matrix.sim_name }}-s${{ matrix.seed }}
@@ -412,6 +428,16 @@ jobs:
           key: score-${{ runner.os }}-${{ matrix.sim_name }}-s${{ matrix.seed }}-${{ matrix.method }}-${{ hashFiles('sims/train_model.py', 'sims/plink_utils.py', 'sims/methods/**', 'sims/metrics.py') }}
 
       - name: Upload Scores
+        id: upload-scores-primary
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-scores-${{ matrix.sim_name }}-s${{ matrix.seed }}-${{ matrix.method }}
+          path: ${{ matrix.sim_name }}_s${{ matrix.seed }}_work/*.sscore
+          if-no-files-found: error
+
+      - name: Retry upload scores
+        if: steps.upload-scores-primary.outcome != 'success'
         uses: actions/upload-artifact@v4
         with:
           name: model-scores-${{ matrix.sim_name }}-s${{ matrix.seed }}-${{ matrix.method }}
@@ -592,6 +618,21 @@ jobs:
           key: eval-${{ runner.os }}-${{ matrix.sim_name }}-s${{ matrix.seed }}-${{ hashFiles('sims/evaluate.py', 'sims/metrics.py', 'sims/methods/**') }}
 
       - name: Upload Results (Stream B)
+        id: upload-results-primary
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: sim-results-${{ matrix.sim_name }}-s${{ matrix.seed }}
+          path: |
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}_metrics.csv
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}_comparison_*.png
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}_significance_tests.csv
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}_probabilities.csv
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}_probability_summary.csv
+          if-no-files-found: warn
+
+      - name: Retry upload results
+        if: steps.upload-results-primary.outcome != 'success'
         uses: actions/upload-artifact@v4
         with:
           name: sim-results-${{ matrix.sim_name }}-s${{ matrix.seed }}
@@ -721,6 +762,16 @@ jobs:
           (cd bundle && zip -r ../stdpopsim-chr22-results.zip .)
 
       - name: Upload summary as artifact
+        id: upload-summary-primary
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: stdpopsim-chr22-results
+          path: |
+            stdpopsim-chr22-results.zip
+
+      - name: Retry upload summary artifact
+        if: steps.upload-summary-primary.outcome != 'success'
         uses: actions/upload-artifact@v4
         with:
           name: stdpopsim-chr22-results
@@ -897,6 +948,21 @@ jobs:
           key: two-pop-${{ runner.os }}-${{ matrix.sim_name }}-g${{ matrix.divergence_gens }}-s${{ matrix.seed }}-${{ hashFiles('sims/sim_two_pop.py', 'sims/split_data.py', 'sims/train_model.py', 'sims/evaluate.py', 'sims/methods/**', 'sims/metrics.py') }}
 
       - name: Upload artifacts
+        id: upload-two-pop-primary
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: two-pop-${{ matrix.sim_name }}-g${{ matrix.divergence_gens }}-s${{ matrix.seed }}
+          path: |
+            ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_s${{ matrix.seed }}_metrics.csv
+            ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_s${{ matrix.seed }}_comparison_roc.png
+            ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_s${{ matrix.seed }}_comparison_calibration.png
+            ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_s${{ matrix.seed }}_comparison_auc.png
+            ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_s${{ matrix.seed }}_pcs.png
+          if-no-files-found: error
+
+      - name: Retry upload two-pop artifacts
+        if: steps.upload-two-pop-primary.outcome != 'success'
         uses: actions/upload-artifact@v4
         with:
           name: two-pop-${{ matrix.sim_name }}-g${{ matrix.divergence_gens }}-s${{ matrix.seed }}
@@ -955,6 +1021,20 @@ jobs:
           python sims/plot_two_pop_pcs_grid.py
 
       - name: Upload AUC plot
+        id: upload-auc-plot-primary
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: two-pop-auc-plot
+          path: |
+            divergence_bottleneck_auc.csv
+            divergence_bottleneck_auc.png
+            divergence_bottleneck_auc_*.png
+            two_pop_pcs_mega.png
+          if-no-files-found: error
+
+      - name: Retry upload AUC plot
+        if: steps.upload-auc-plot-primary.outcome != 'success'
         uses: actions/upload-artifact@v4
         with:
           name: two-pop-auc-plot
