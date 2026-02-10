@@ -1,11 +1,13 @@
 import Mathlib.Tactic
 import Mathlib.Analysis.Calculus.Deriv.Basic
+import Mathlib.Analysis.Calculus.Deriv.Mul
 import Mathlib.Analysis.Calculus.Deriv.Inv
 import Mathlib.Analysis.Convex.Strict
 import Mathlib.Analysis.Convex.Jensen
 import Mathlib.Analysis.Convex.SpecificFunctions.Basic
 import Mathlib.Analysis.InnerProductSpace.Basic
 import Mathlib.Analysis.InnerProductSpace.PiL2
+import Mathlib.Analysis.Normed.Lp.PiLp
 import Mathlib.Analysis.InnerProductSpace.Projection.Basic
 import Mathlib.Analysis.InnerProductSpace.Projection.FiniteDimensional
 import Mathlib.Analysis.InnerProductSpace.Projection.Minimal
@@ -4425,14 +4427,52 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
 
 /-- Orthogonal projection onto a finite-dimensional subspace. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  0  -- Placeholder; proper implementation would use Mathlib's orthogonalProjection
+  let iso := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K' : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map iso.symm
+  let p' := Submodule.orthogonalProjection K' (iso.symm y)
+  iso p'
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
     iff p minimizes distance to y among all points in K. -/
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
-    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist y p ≤ dist y w) :
+    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, l2norm_sq (y - p) ≤ l2norm_sq (y - w)) :
     p = orthogonalProjection K y := by
-  sorry
+  let iso := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K' : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map iso.symm
+  let y' := iso.symm y
+  let p' := iso.symm p
+
+  have h_mem' : p' ∈ K' := by
+    simp [K', p', iso]
+    use p
+    simp [h_mem]
+
+  have h_min' : ∀ w' ∈ K', dist y' p' ≤ dist y' w' := by
+    intro w' hw'
+    rcases (Submodule.mem_map.1 hw') with ⟨w, hw, rfl⟩
+    specialize h_min w hw
+    have h_norm_eq : ∀ a b, dist (iso.symm a) (iso.symm b) ^ 2 = l2norm_sq (a - b) := by
+      intro a b
+      simp [iso, l2norm_sq, dist_eq_norm, WithLp.equiv_symm_pi_apply]
+      rw [← Real.sqrt_eq_rpow, Real.sq_sqrt (by apply Finset.sum_nonneg; intro i _; apply sq_nonneg)]
+      congr; ext i
+      simp [PiLp.norm_eq_of_nat, Real.norm_eq_abs, sq_abs]
+    rw [← sq_le_sq, h_norm_eq, h_norm_eq]
+    · exact h_min
+    · apply dist_nonneg
+    · apply dist_nonneg
+
+  have h_eq' : p' = Submodule.orthogonalProjection K' y' := by
+    apply Eq.symm
+    apply eq_orthogonalProjection_of_dist_eq (K := K') (x := y') (v := ⟨p', h_mem'⟩)
+    · exact h_mem'
+    · intro w' hw'
+      specialize h_min' w' hw'
+      exact h_min'
+
+  simp [orthogonalProjection, iso, p'] at h_eq' ⊢
+  rw [← h_eq']
+  simp
 
 set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
@@ -5943,83 +5983,94 @@ lemma sigmoid_strictConcaveOn_Ici : StrictConcaveOn ℝ (Set.Ici 0) sigmoid := b
     1. Proving sigmoid is strictly concave on (0, ∞) and convex on (-∞, 0)
     2. Measure-theoretic integration showing E[f(X)] < f(E[X]) for concave f -/
 theorem jensen_sigmoid_positive (μ : ℝ) (hμ : μ > 0) :
-    ∃ E_sigmoid : ℝ, E_sigmoid < sigmoid μ := by
-  -- Construct a 2-point distribution X with mean μ: P(X=0)=0.5, P(X=2μ)=0.5
-  -- E[sigmoid(X)] = 0.5 * sigmoid(0) + 0.5 * sigmoid(2μ)
-  let E_sigmoid := 0.5 * sigmoid 0 + 0.5 * sigmoid (2 * μ)
-  use E_sigmoid
+    ∃ (X : Bool → ℝ) (P : Measure Bool) (_ : IsProbabilityMeasure P),
+      Integrable X P ∧ (∫ ω, X ω ∂P = μ) ∧ (∫ ω, sigmoid (X ω) ∂P < sigmoid μ) := by
+  let P : Measure Bool := (Measure.sum (fun _ => (0.5 : ENNReal)))
+  haveI : IsProbabilityMeasure P := ⟨by simp [P, Measure.sum, Finset.sum_bool]⟩
+  let X : Bool → ℝ := fun b => if b then 2 * μ else 0
 
-  -- Prove 0.5 * sigmoid(0) + 0.5 * sigmoid(2μ) < sigmoid(μ)
-  -- sigmoid(0) = 0.5, so term is 0.25
-  dsimp [E_sigmoid]
-  rw [sigmoid_zero]
-  norm_num
+  have h_int : Integrable X P := integrable_of_fintype _ P
 
-  -- Let y = exp(-μ). Since μ > 0, we have 0 < y < 1.
-  let y := Real.exp (-μ)
-  have hy_pos : 0 < y := Real.exp_pos (-μ)
-  have hy_lt_one : y < 1 := by rw [Real.exp_lt_one_iff]; linarith
+  have h_mean : ∫ ω, X ω ∂P = μ := by
+    simp [X, P, Measure.integral_fintype, Measure.sum, Finset.sum_bool]
+    norm_num
+    ring
 
-  -- Express sigmoid values in terms of y
-  have h_sig_mu : sigmoid μ = 1 / (1 + y) := by unfold sigmoid; rfl
-  have h_sig_2mu : sigmoid (2 * μ) = 1 / (1 + y^2) := by
-    unfold sigmoid
-    have : Real.exp (-(2 * μ)) = y^2 := by
-      simp [y]
-      have : -(2 * μ) = -μ + -μ := by ring
-      rw [this, Real.exp_add, ← pow_two]
-    rw [this]
+  have h_ineq : ∫ ω, sigmoid (X ω) ∂P < sigmoid μ := by
+    simp [X, P, Measure.integral_fintype, Measure.sum, Finset.sum_bool]
+    norm_num
+    -- 0.5 * sigmoid(0) + 0.5 * sigmoid(2*mu) < sigmoid(mu)
+    rw [sigmoid_zero]
+    norm_num
+    -- Inequality: 0.25 + 0.5 * sigmoid(2*mu) < sigmoid(mu)
 
-  rw [h_sig_mu, h_sig_2mu]
+    let y := Real.exp (-μ)
+    have hy_lt_one : y < 1 := by rw [Real.exp_lt_one_iff]; linarith
 
-  -- Inequality: 1/4 + 1/(2(1+y^2)) < 1/(1+y)
-  -- Equivalent to (y-1)^3 < 0 which is true for y < 1
-  have h_poly : (y^2 + 3) * (1 + y) - 4 * (1 + y^2) = (y - 1)^3 := by ring
-  have h_cube_neg : (y - 1)^3 < 0 := by
-    have h_neg : y - 1 < 0 := by linarith
-    have : (y - 1)^3 = (y - 1) * (y - 1)^2 := by ring
-    rw [this]
-    apply mul_neg_of_neg_of_pos h_neg
-    apply pow_two_pos_of_ne_zero
+    have h_sig_mu : sigmoid μ = 1 / (1 + y) := by unfold sigmoid; rfl
+    have h_sig_2mu : sigmoid (2 * μ) = 1 / (1 + y^2) := by
+      unfold sigmoid
+      have : Real.exp (-(2 * μ)) = y^2 := by
+        simp [y]
+        have : -(2 * μ) = -μ + -μ := by ring
+        rw [this, Real.exp_add, ← pow_two]
+      rw [this]
+
+    rw [h_sig_mu, h_sig_2mu]
+
+    have h_poly : (y^2 + 3) * (1 + y) - 4 * (1 + y^2) = (y - 1)^3 := by ring
+    have h_cube_neg : (y - 1)^3 < 0 := by
+      have h_neg : y - 1 < 0 := by linarith
+      apply pow_odd_neg h_neg
+
+    rw [← h_poly] at h_cube_neg
+    field_simp
     linarith
 
-  rw [← h_poly] at h_cube_neg
-  field_simp
-  linarith
+  exact ⟨X, P, inferInstance, h_int, h_mean, h_ineq⟩
 
 theorem jensen_sigmoid_negative (μ : ℝ) (hμ : μ < 0) :
-    ∃ E_sigmoid : ℝ, E_sigmoid > sigmoid μ := by
-  -- Construct a 2-point distribution X with mean μ: P(X=0)=0.5, P(X=2μ)=0.5
-  let E_sigmoid := 0.5 * sigmoid 0 + 0.5 * sigmoid (2 * μ)
-  use E_sigmoid
+    ∃ (X : Bool → ℝ) (P : Measure Bool) (_ : IsProbabilityMeasure P),
+      Integrable X P ∧ (∫ ω, X ω ∂P = μ) ∧ (∫ ω, sigmoid (X ω) ∂P > sigmoid μ) := by
+  let P : Measure Bool := (Measure.sum (fun _ => (0.5 : ENNReal)))
+  haveI : IsProbabilityMeasure P := ⟨by simp [P, Measure.sum, Finset.sum_bool]⟩
+  let X : Bool → ℝ := fun b => if b then 2 * μ else 0
 
-  dsimp [E_sigmoid]
-  rw [sigmoid_zero]
-  norm_num
+  have h_int : Integrable X P := integrable_of_fintype _ P
 
-  -- Let y = exp(-μ). Since μ < 0, we have y > 1.
-  let y := Real.exp (-μ)
-  have hy_gt_one : 1 < y := by rw [Real.one_lt_exp_iff]; linarith
+  have h_mean : ∫ ω, X ω ∂P = μ := by
+    simp [X, P, Measure.integral_fintype, Measure.sum, Finset.sum_bool]
+    norm_num
+    ring
 
-  have h_sig_mu : sigmoid μ = 1 / (1 + y) := by unfold sigmoid; rfl
-  have h_sig_2mu : sigmoid (2 * μ) = 1 / (1 + y^2) := by
-    unfold sigmoid
-    have : Real.exp (-(2 * μ)) = y^2 := by
-      simp [y]
-      have : -(2 * μ) = -μ + -μ := by ring
-      rw [this, Real.exp_add, ← pow_two]
-    rw [this]
+  have h_ineq : ∫ ω, sigmoid (X ω) ∂P > sigmoid μ := by
+    simp [X, P, Measure.integral_fintype, Measure.sum, Finset.sum_bool]
+    norm_num
+    rw [sigmoid_zero]
+    norm_num
 
-  rw [h_sig_mu, h_sig_2mu]
+    let y := Real.exp (-μ)
+    have hy_gt_one : 1 < y := by rw [Real.one_lt_exp_iff]; linarith
 
-  -- Inequality: 1/4 + 1/(2(1+y^2)) > 1/(1+y)
-  -- Equivalent to (y-1)^3 > 0 which is true for y > 1
-  have h_poly : (y^2 + 3) * (1 + y) - 4 * (1 + y^2) = (y - 1)^3 := by ring
-  have h_cube_pos : 0 < (y - 1)^3 := pow_pos (by linarith) 3
+    have h_sig_mu : sigmoid μ = 1 / (1 + y) := by unfold sigmoid; rfl
+    have h_sig_2mu : sigmoid (2 * μ) = 1 / (1 + y^2) := by
+      unfold sigmoid
+      have : Real.exp (-(2 * μ)) = y^2 := by
+        simp [y]
+        have : -(2 * μ) = -μ + -μ := by ring
+        rw [this, Real.exp_add, ← pow_two]
+      rw [this]
 
-  rw [← h_poly] at h_cube_pos
-  field_simp
-  linarith
+    rw [h_sig_mu, h_sig_2mu]
+
+    have h_poly : (y^2 + 3) * (1 + y) - 4 * (1 + y^2) = (y - 1)^3 := by ring
+    have h_cube_pos : 0 < (y - 1)^3 := pow_pos (by linarith) 3
+
+    rw [← h_poly] at h_cube_pos
+    field_simp
+    linarith
+
+  exact ⟨X, P, inferInstance, h_int, h_mean, h_ineq⟩
 
 
 /-- Calibration Shrinkage (Via Jensen's Inequality):
@@ -6103,8 +6154,9 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
               have h_jacobi : ∀ σ : Equiv.Perm m, deriv (fun rho => ∏ i : m, M rho ((σ : m → m) i) i) rho = ∑ i : m, (∏ j ∈ Finset.univ.erase i, M rho ((σ : m → m) j) j) * deriv (fun rho => M rho ((σ : m → m) i) i) rho := by
                 intro σ
                 have h_prod_rule : ∀ (f : m → ℝ → ℝ), (∀ i, DifferentiableAt ℝ (f i) rho) → deriv (fun rho => ∏ i, f i rho) rho = ∑ i, (∏ j ∈ Finset.univ.erase i, f j rho) * deriv (f i) rho := by
-                  -- exact?
-                  admit
+                  intro f hf
+                  convert deriv_finset_prod (by simp [hf]) using 1
+                  simp
                 apply h_prod_rule
                 intro i
                 exact DifferentiableAt.comp rho ( differentiableAt_pi.1 ( differentiableAt_pi.1 hM_diff _ ) _ ) differentiableAt_id
@@ -6114,8 +6166,9 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
                   have h_diff : ∀ i : m, DifferentiableAt ℝ (fun rho => M rho ((σ : m → m) i) i) rho := by
                     intro i
                     exact DifferentiableAt.comp rho ( differentiableAt_pi.1 ( differentiableAt_pi.1 hM_diff _ ) _ ) differentiableAt_id
-                  -- exact?
-                  admit
+                  apply DifferentiableAt.finset_prod
+                  intro i _
+                  exact h_diff i
                 norm_num [ h_diff ]
               simpa only [ h_jacobi ] using h_deriv_sum
             simp +decide only [h_jacobi, Finset.mul_sum _ _ _]
