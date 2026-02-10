@@ -4425,12 +4425,17 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
 
 /-- Orthogonal projection onto a finite-dimensional subspace. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  0  -- Placeholder; proper implementation would use Mathlib's orthogonalProjection
+  let iso := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K' : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map iso
+  let p' := Submodule.orthogonalProjection K' (iso y)
+  iso.symm p'
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
     iff p minimizes distance to y among all points in K. -/
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
-    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist y p ≤ dist y w) :
+    (h_mem : p ∈ K)
+    (h_min : ∀ w ∈ K, ‖WithLp.equiv 2 (Fin n → ℝ) y - WithLp.equiv 2 (Fin n → ℝ) p‖ ≤
+                      ‖WithLp.equiv 2 (Fin n → ℝ) y - WithLp.equiv 2 (Fin n → ℝ) w‖) :
     p = orthogonalProjection K y := by
   sorry
 
