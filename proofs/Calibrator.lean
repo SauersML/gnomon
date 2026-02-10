@@ -4425,14 +4425,52 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
 
 /-- Orthogonal projection onto a finite-dimensional subspace. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  0  -- Placeholder; proper implementation would use Mathlib's orthogonalProjection
+  let iso := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K' : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map iso
+  let p' := Submodule.orthogonalProjection K' (iso y)
+  iso.symm p'
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
     iff p minimizes distance to y among all points in K. -/
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
-    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist y p ≤ dist y w) :
+    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, l2norm_sq (y - p) ≤ l2norm_sq (y - w)) :
     p = orthogonalProjection K y := by
-  sorry
+  let iso := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K' := K.map iso
+  let y' := iso y
+  let p' := iso p
+
+  have h_mem' : p' ∈ K' := by
+    rw [Submodule.mem_map]
+    use p, h_mem
+    simp [p', iso]
+
+  have h_min' : ∀ w' ∈ K', dist y' p' ≤ dist y' w' := by
+    intro w' hw'
+    rcases (Submodule.mem_map.mp hw') with ⟨w, hw, rfl⟩
+    specialize h_min w hw
+    simp only [iso, WithLp.linearEquiv_apply, WithLp.equiv_apply]
+    have h_eq : ∀ a b : Fin n → ℝ, dist (WithLp.equiv 2 (Fin n → ℝ) a) (WithLp.equiv 2 (Fin n → ℝ) b) = Real.sqrt (l2norm_sq (a - b)) := by
+      intro a b
+      rw [PiLp.dist_eq_of_L2]
+      congr 1
+      simp [l2norm_sq]
+      apply Finset.sum_congr rfl
+      intro i _
+      rw [norm_eq_abs, sq_abs]
+      rfl
+    rw [h_eq y p, h_eq y w]
+    apply Real.sqrt_le_sqrt
+    exact h_min
+
+  have h_proj : p' = Submodule.orthogonalProjection K' y' := by
+    symm
+    apply orthogonalProjection_is_minimizer
+    · exact h_mem'
+    · exact h_min'
+
+  apply iso.injective
+  simp [orthogonalProjection, iso, p', y', K', h_proj]
 
 set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
@@ -4474,7 +4512,72 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   ∀ (i : Fin n),
       linearPredictor model (data.p i) (data.c i) =
       linearPredictor model_prime (data'.p i) (data'.c i) := by
-  sorry
+  let X := designMatrix data pgsBasis splineBasis
+  let X' := designMatrix data' pgsBasis splineBasis
+
+  let pred : Fin n → ℝ := fun i => linearPredictor model (data.p i) (data.c i)
+  let pred' : Fin n → ℝ := fun i => linearPredictor model_prime (data'.p i) (data'.c i)
+
+  have h_proj : pred = orthogonalProjection (LinearMap.range (Matrix.toLin' X)) data.y := by
+    apply orthogonalProjection_eq_of_dist_le
+    · rw [linearPredictor_eq_designMatrix_mulVec data pgsBasis splineBasis model ⟨rfl, rfl, rfl, rfl⟩]
+      simp only [Matrix.toLin'_apply]
+      apply LinearMap.mem_range_self
+    · intro w hw
+      obtain ⟨b, hb⟩ := LinearMap.mem_range.mp hw
+      rw [Matrix.toLin'_apply] at hb
+      rw [← hb]
+      let m_w := unpackParams pgsBasis splineBasis b
+      have h_opt := fit_minimizes_loss p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank m_w ⟨rfl, rfl, rfl, rfl⟩
+      have h_loss_eq : ∀ m : PhenotypeInformedGAM p k sp, InModelClass m pgsBasis splineBasis →
+          empiricalLoss m data 0 = (1 / n) * l2norm_sq (data.y - (designMatrix data pgsBasis splineBasis).mulVec (packParams m)) := by
+        intro m hm
+        simp [empiricalLoss, h_lambda_zero, l2norm_sq]
+        congr 1
+        refine Finset.sum_congr rfl ?_
+        intro i _
+        simp [pointwiseNLL, hm.dist_gaussian]
+        congr 1
+        rw [linearPredictor_eq_designMatrix_mulVec _ _ _ m hm]
+        rfl
+      rw [h_loss_eq model ⟨rfl, rfl, rfl, rfl⟩] at h_opt
+      rw [h_loss_eq m_w ⟨rfl, rfl, rfl, rfl⟩] at h_opt
+      rw [linearPredictor_eq_designMatrix_mulVec _ _ _ model ⟨rfl, rfl, rfl, rfl⟩]
+      have hn_pos : 0 < (1 : ℝ) / n := one_div_pos.mpr (by exact_mod_cast h_n_pos)
+      nlinarith [h_opt]
+
+  have h_proj' : pred' = orthogonalProjection (LinearMap.range (Matrix.toLin' X')) data'.y := by
+    apply orthogonalProjection_eq_of_dist_le
+    · rw [linearPredictor_eq_designMatrix_mulVec data' pgsBasis splineBasis model_prime ⟨rfl, rfl, rfl, rfl⟩]
+      simp only [Matrix.toLin'_apply]
+      apply LinearMap.mem_range_self
+    · intro w hw
+      obtain ⟨b, hb⟩ := LinearMap.mem_range.mp hw
+      rw [Matrix.toLin'_apply] at hb
+      rw [← hb]
+      let m_w := unpackParams pgsBasis splineBasis b
+      have h_opt := fit_minimizes_loss p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg
+                    (by rw [← rank_eq_of_range_eq X X' h_range_eq]; exact h_rank) m_w ⟨rfl, rfl, rfl, rfl⟩
+      have h_loss_eq : ∀ m : PhenotypeInformedGAM p k sp, InModelClass m pgsBasis splineBasis →
+          empiricalLoss m data' 0 = (1 / n) * l2norm_sq (data'.y - (designMatrix data' pgsBasis splineBasis).mulVec (packParams m)) := by
+        intro m hm
+        simp [empiricalLoss, h_lambda_zero, l2norm_sq]
+        congr 1
+        refine Finset.sum_congr rfl ?_
+        intro i _
+        simp [pointwiseNLL, hm.dist_gaussian]
+        congr 1
+        rw [linearPredictor_eq_designMatrix_mulVec _ _ _ m hm]
+        rfl
+      rw [h_loss_eq model_prime ⟨rfl, rfl, rfl, rfl⟩] at h_opt
+      rw [h_loss_eq m_w ⟨rfl, rfl, rfl, rfl⟩] at h_opt
+      rw [linearPredictor_eq_designMatrix_mulVec _ _ _ model_prime ⟨rfl, rfl, rfl, rfl⟩]
+      have hn_pos : 0 < (1 : ℝ) / n := one_div_pos.mpr (by exact_mod_cast h_n_pos)
+      nlinarith [h_opt]
+
+  intro i
+  rw [h_proj, h_proj', h_range_eq]
+  rfl
 
 noncomputable def dist_to_support {k : ℕ} (c : Fin k → ℝ) (supp : Set (Fin k → ℝ)) : ℝ :=
   Metric.infDist c supp
