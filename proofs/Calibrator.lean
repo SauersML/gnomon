@@ -4425,14 +4425,88 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
 
 /-- Orthogonal projection onto a finite-dimensional subspace. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  0  -- Placeholder; proper implementation would use Mathlib's orthogonalProjection
+  let iso := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K' : Submodule ℝ (WithLp 2 (Fin n → ℝ)) := K.map iso
+  let p' := Submodule.orthogonalProjection K' (iso y)
+  iso.symm p'
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
     iff p minimizes distance to y among all points in K. -/
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
-    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist y p ≤ dist y w) :
+    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, l2norm_sq (y - p) ≤ l2norm_sq (y - w)) :
     p = orthogonalProjection K y := by
-  sorry
+  dsimp [orthogonalProjection]
+  let iso := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K' : Submodule ℝ (WithLp 2 (Fin n → ℝ)) := K.map iso
+  let y' := iso y
+  let p' := iso p
+  have h_mem' : p' ∈ K' := Submodule.mem_map_of_mem h_mem
+  have h_norm_map : ∀ v, l2norm_sq v = ‖iso v‖^2 := by
+    intro v
+    dsimp [l2norm_sq]
+    rw [PiLp.norm_eq_of_nat 2 (by norm_num) (iso v)]
+    rw [← Real.rpow_mul]
+    · norm_num
+      congr
+      ext i
+      simp
+      exact sq_abs (v i)
+    · apply Finset.sum_nonneg
+      intro i _
+      apply sq_nonneg
+
+  have h_min' : ∀ w' ∈ K', ‖y' - p'‖ ≤ ‖y' - w'‖ := by
+    intro w' hw'
+    obtain ⟨w, hw, hw_eq⟩ := Submodule.mem_map.mp hw'
+    rw [← hw_eq]
+    specialize h_min w hw
+    have h_norm_y_p : l2norm_sq (y - p) = ‖y' - p'‖^2 := by
+      rw [h_norm_map]
+      congr
+      simp [y', p']
+    have h_norm_y_w : l2norm_sq (y - w) = ‖iso y - iso w‖^2 := by
+      rw [h_norm_map]
+      congr
+    rw [h_norm_y_p, h_norm_y_w] at h_min
+    apply Real.le_sqrt_of_sq_le
+    rw [Real.sqrt_sq (norm_nonneg _), Real.sqrt_sq (norm_nonneg _)]
+    exact h_min
+
+  let proj' := Submodule.orthogonalProjection K' y'
+  have h_proj_min : ∀ w' ∈ K', ‖y' - proj'‖ ≤ ‖y' - w'‖ := by
+    intro w' hw'
+    have h_ortho : ⟪y' - proj', w' - proj'⟫ = 0 :=
+      Submodule.inner_orthogonalProjection_eq_zero_of_left_mem_orthogonal K'
+        (y' - proj')
+        (Submodule.orthogonalProjection_mem_subspace_orthogonalComplement K' y')
+        (Submodule.sub_mem K' hw' (Submodule.orthogonalProjection_mem K' y'))
+    have h_sq : ‖y' - w'‖^2 = ‖(y' - proj') - (w' - proj')‖^2 := by ring_nf
+    rw [norm_sub_sq_real, h_ortho] at h_sq
+    simp only [mul_zero, sub_zero] at h_sq
+    have h_ge : ‖y' - w'‖^2 ≥ ‖y' - proj'‖^2 := by
+      rw [h_sq]
+      apply le_add_of_nonneg_right
+      apply sq_nonneg
+    apply Real.le_sqrt_of_sq_le
+    rw [Real.sqrt_sq (norm_nonneg _), Real.sqrt_sq (norm_nonneg _)]
+    exact h_ge
+
+  have h_eq_dist : ‖y' - p'‖ = ‖y' - proj'‖ := by
+    apply le_antisymm
+    · apply h_min'
+      exact Submodule.orthogonalProjection_mem K' y'
+    · apply h_proj_min
+      exact h_mem'
+
+  have h_unique : p' = proj' := by
+    apply StrictConvex.eq_of_dist_eq_dist (InnerProductSpace.strictConvex ℝ)
+    · exact Submodule.convex K'
+    · exact h_mem'
+    · exact Submodule.orthogonalProjection_mem K' y'
+    · rw [dist_eq_norm, dist_eq_norm, h_eq_dist]
+
+  apply iso.injective
+  exact h_unique
 
 set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
