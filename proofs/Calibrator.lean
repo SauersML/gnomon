@@ -4425,14 +4425,70 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
 
 /-- Orthogonal projection onto a finite-dimensional subspace. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  0  -- Placeholder; proper implementation would use Mathlib's orthogonalProjection
+  let iso := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K' : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map iso
+  let p_K := Submodule.orthogonalProjection K' (iso y)
+  iso.symm (p_K : EuclideanSpace ℝ (Fin n))
+
+lemma l2norm_sq_eq_norm_sq {n : ℕ} (v : Fin n → ℝ) :
+    l2norm_sq v = ‖WithLp.equiv 2 (Fin n → ℝ) v‖^2 := by
+  simp [l2norm_sq, EuclideanSpace.norm_eq, PiLp.norm_eq_of_nat 2]
+  rw [Real.sqrt_eq_rpow, ←Real.rpow_nat_cast 2]
+  have h_sum_nonneg : 0 ≤ ∑ i : Fin n, ‖v i‖ ^ 2 := by
+    apply Finset.sum_nonneg; intro i _; apply sq_nonneg
+  rw [←Real.rpow_mul h_sum_nonneg]
+  norm_num
+  apply Finset.sum_congr rfl
+  intro i _
+  simp [Real.norm_eq_abs, sq_abs]
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
-    iff p minimizes distance to y among all points in K. -/
+    iff p minimizes squared L2 distance to y among all points in K. -/
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
-    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist y p ≤ dist y w) :
+    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, l2norm_sq (y - p) ≤ l2norm_sq (y - w)) :
     p = orthogonalProjection K y := by
-  sorry
+  let iso := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K' : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map iso
+  let y' := iso y
+  let p' := iso p
+
+  -- Transfer hypotheses to EuclideanSpace
+  have h_mem' : p' ∈ K' := by
+    rw [Submodule.mem_map]
+    use p, h_mem
+    simp [iso, p']
+
+  have h_min' : ∀ w' ∈ K', dist y' p' ≤ dist y' w' := by
+    intro w' hw'
+    rw [Submodule.mem_map] at hw'
+    rcases hw' with ⟨w, hw, rfl⟩
+    have h := h_min w hw
+    let w' := iso w
+
+    -- dist y' w' = ‖iso (y - w)‖
+    have h_dist_sq : ∀ a b : Fin n → ℝ, dist (iso a) (iso b) ^ 2 = l2norm_sq (a - b) := by
+       intro a b
+       rw [dist_eq_norm, ←map_sub]
+       rw [l2norm_sq_eq_norm_sq]
+
+    rw [←h_dist_sq y p, ←h_dist_sq y w] at h
+    rw [sq_le_sq] at h
+    exact h
+
+  -- Use uniqueness of orthogonal projection in Hilbert space
+  let proj := Submodule.orthogonalProjection K' y'
+  have h_proj_min : ∀ w' ∈ K', dist y' proj ≤ dist y' w' :=
+     Submodule.orthogonalProjection_is_minimizer K' y'
+
+  have h_eq : p' = proj := by
+    apply eq_of_dist_eq_dist (Submodule.convex K') (InnerProductSpace.strictConvex) h_mem' (Submodule.orthogonalProjection_mem _)
+    have h1 := h_min' proj (Submodule.orthogonalProjection_mem _)
+    have h2 := h_proj_min p' h_mem'
+    exact le_antisymm h1 h2
+
+  -- Map back
+  apply iso.injective
+  simp [orthogonalProjection, iso, K', h_eq]
 
 set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
