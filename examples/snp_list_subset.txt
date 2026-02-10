@@ -335,7 +335,7 @@ paths = snp_callrate_lists(
 paths
 ```
 
-23andMe v4:
+23andMe v4 (Illumina HTS iSelect HD chip):
 https://raw.githubusercontent.com/psbaltar/rawDNA2vcf/master/filter/23andme_v4.tsv
 
 Illumina HumanHap550 v3 BeadChip:
@@ -347,3 +347,26 @@ https://hgdownload.soe.ucsc.edu/goldenPath/hg19/database/snpArrayIllumina550.txt
 Illumina OmniExpress (Infinium OmniExpress-24 v1.4):
 https://support.illumina.com/content/dam/illumina-support/documents/downloads/productfiles/humanomniexpress-24/v1-4/InfiniumOmniExpress-24v1-4_A1_csv.zip
 
+Affymetrix Axiom UK Biobank array:
+https://biobank.ndph.ox.ac.uk/ukb/ukb/docs/Array_UKB_34.zip
+
+Illumina Omni family:
+https://webdata.illumina.com/downloads/productfiles/infinium-omni5-4/v1-2/infinium-omni5-4-v1-2-a2-manifest-file-csv.zip
+
+Illumina’s OmniExpress-24 v1.4:
+https://support.illumina.com/content/dam/illumina-support/documents/downloads/productfiles/humanomniexpress-24/v1-4/InfiniumOmniExpress-24v1-4_A1_csv.zip
+
+Illumina HumanHap550 (possibly Quad+):
+https://www.chg.ox.ac.uk/~wrayner/strand/BDCHP-1X10-HUMANHAP550_11218540_C-b37-strand.zip
+
+Affymetrix GeneChip SNP 5.0:
+https://sec-assets.thermofisher.com/TFS-Assets/LSG/Support-Files/GenomeWideSNP_5-na35-annot-csv.zip
+
+Infinium DNA Analysis BeadChip (Global Screening Array v4.0, Build 38):
+https://support.illumina.com/content/dam/illumina-support/documents/documentation/chemistry_documentation/infinium_assays/infinium-gsa-with-gcra/GSA-48v4-0_20085471_D2.csv
+
+Genome-Wide DNA Analysis BeadChips:
+https://support.illumina.com/content/dam/illumina-support/documents/downloads/productfiles/global-screening-array-24/v3-0/GSA-24v3-0-A2-manifest-file-csv.zip
+
+Affymetrix GeneChip SNP 6.0:
+https://hgdownload.soe.ucsc.edu/goldenPath/hg19/database/snpArrayAffy6.txt.gz
