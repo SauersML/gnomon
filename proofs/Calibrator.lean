@@ -4425,14 +4425,63 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
 
 /-- Orthogonal projection onto a finite-dimensional subspace. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  0  -- Placeholder; proper implementation would use Mathlib's orthogonalProjection
+  let iso := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let y' := iso y
+  let K' : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map iso
+  let p' := Submodule.orthogonalProjection K' y'
+  iso.symm p'
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
     iff p minimizes distance to y among all points in K. -/
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
-    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist y p ≤ dist y w) :
+    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, l2norm_sq (y - p) ≤ l2norm_sq (y - w)) :
     p = orthogonalProjection K y := by
-  sorry
+  let iso := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let y' := iso y
+  let K' : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map iso
+  let p' := iso p
+
+  have h_mem' : p' ∈ K' := by
+    simp [K', p', iso]
+    use p, h_mem
+    rfl
+
+  let proj' := Submodule.orthogonalProjection K' y'
+
+  have h_norm_sq : ∀ v : Fin n → ℝ, l2norm_sq v = dist (iso v) 0 ^ 2 := by
+    intro v
+    simp [l2norm_sq, dist_eq_norm]
+    have h_norm : ‖iso v‖ = Real.sqrt (∑ i, ‖v i‖^2) := by
+      sorry
+    rw [h_norm, Real.sq_sqrt]
+    · apply Finset.sum_congr rfl
+      intro i _
+      simp only [Real.norm_eq_abs, sq_abs]
+    · apply Finset.sum_nonneg
+      intro i _
+      apply sq_nonneg
+
+  have h_iso_sub : ∀ a b, iso (a - b) = iso a - iso b := by
+    intro a b
+    simp [iso]
+
+  have h_dist_le : ∀ w' ∈ K', dist y' p' ≤ dist y' w' := by
+    intro w' hw'
+    obtain ⟨w, hw, rfl⟩ := (Submodule.mem_map).mp hw'
+    specialize h_min w hw
+    rw [h_norm_sq (y - p), h_norm_sq (y - w)] at h_min
+    rw [h_iso_sub y p, h_iso_sub y w] at h_min
+    simp only [dist_eq_norm, sub_zero] at h_min
+    simp only [dist_eq_norm]
+    exact Real.sqrt_le_sqrt h_min
+
+  have h_unique : p' = proj' := by
+    sorry
+
+  simp [orthogonalProjection, iso]
+  apply iso.injective
+  rw [h_unique]
+  rfl
 
 set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
@@ -4474,7 +4523,60 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   ∀ (i : Fin n),
       linearPredictor model (data.p i) (data.c i) =
       linearPredictor model_prime (data'.p i) (data'.c i) := by
-  sorry
+  let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
+  let model := fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
+  let model_prime := fit p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
+      let X := designMatrix data pgsBasis splineBasis
+      let X' := designMatrix data' pgsBasis splineBasis
+      have h_rank_eq : X.rank = X'.rank := by
+        exact rank_eq_of_range_eq X X' h_range_eq
+      rw [← h_rank_eq]
+      exact h_rank
+  )
+
+  let X := designMatrix data pgsBasis splineBasis
+  let X' := designMatrix data' pgsBasis splineBasis
+  let K := LinearMap.range (Matrix.toLin' X)
+  let K' := LinearMap.range (Matrix.toLin' X')
+  have hK : K = K' := h_range_eq
+
+  let pred_vec := fun i => linearPredictor model (data.p i) (data.c i)
+  let pred_vec' := fun i => linearPredictor model_prime (data'.p i) (data'.c i)
+
+  have h_pred_eq_Xbeta : pred_vec = X.mulVec (packParams model) := by
+    ext i
+    simp [pred_vec]
+    rw [linearPredictor_eq_designMatrix_mulVec data pgsBasis splineBasis model (by constructor <;> rfl)]
+
+  have h_pred_prime_eq_Xprime_beta : pred_vec' = X'.mulVec (packParams model_prime) := by
+    ext i
+    simp [pred_vec']
+    rw [linearPredictor_eq_designMatrix_mulVec data' pgsBasis splineBasis model_prime (by constructor <;> rfl)]
+
+  have h_mem_K : pred_vec ∈ K := by
+    rw [h_pred_eq_Xbeta]
+    use packParams model
+    rw [Matrix.toLin'_apply]
+
+  have h_mem_K' : pred_vec' ∈ K' := by
+    rw [h_pred_prime_eq_Xprime_beta]
+    use packParams model_prime
+    rw [Matrix.toLin'_apply]
+
+  have h_min : ∀ w ∈ K, l2norm_sq (data.y - pred_vec) ≤ l2norm_sq (data.y - w) := by
+    sorry
+
+  have h_min' : ∀ w ∈ K', l2norm_sq (data.y - pred_vec') ≤ l2norm_sq (data.y - w) := by
+    sorry
+
+  have h_pred_is_proj : pred_vec = orthogonalProjection K data.y :=
+    orthogonalProjection_eq_of_dist_le K data.y pred_vec h_mem_K h_min
+
+  have h_pred_prime_is_proj : pred_vec' = orthogonalProjection K' data.y :=
+    orthogonalProjection_eq_of_dist_le K' data.y pred_vec' h_mem_K' h_min'
+
+  rw [hK] at h_pred_is_proj
+  rw [h_pred_is_proj, h_pred_prime_is_proj]
 
 noncomputable def dist_to_support {k : ℕ} (c : Fin k → ℝ) (supp : Set (Fin k → ℝ)) : ℝ :=
   Metric.infDist c supp
@@ -6595,8 +6697,8 @@ lemma optimal_slope_eq_covariance_of_normalized_p_proven
   rw [h_sub] at h_orth_P
   rw [integral_sub] at h_orth_P
   · rw [integral_sub] at h_orth_P
-    · rw [integral_mul_left, hP0] at h_orth_P
-      rw [integral_mul_left, hP2] at h_orth_P
+    · rw [MeasureTheory.integral_const_mul, hP0] at h_orth_P
+      rw [MeasureTheory.integral_const_mul, hP2] at h_orth_P
       simp at h_orth_P
       linarith
     · exact hYP
@@ -6741,7 +6843,7 @@ lemma optimal_coefficients_for_additive_dgp_proven
           · simp +decide [ mul_assoc, MeasureTheory.integral_const_mul, MeasureTheory.integral_mul_const, hP0, hC0, h_integral_prod ];
             exact Or.inr ( by simpa only [ mul_comm ] using h_integral_prod.trans ( by simp +decide [ hP0, hC0 ] ) );
           · exact hP_int.mul_const _;
-          · convert hP2_int.mul_const ( model.γₘ₀ ⟨ 0, by norm_num ⟩ ) using 2 ; ring;
+          · convert hP2_int.mul_const ( model.γₘ₀ ⟨ 0, by norm_num ⟩ ) using 2 ; ring_nf;
             rfl;
         · simpa only [ sq ] using hP2_int;
         · exact MeasureTheory.Integrable.const_mul ( by simpa only [ mul_comm ] using hPC_int ) _;
