@@ -4425,14 +4425,72 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
 
 /-- Orthogonal projection onto a finite-dimensional subspace. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  0  -- Placeholder; proper implementation would use Mathlib's orthogonalProjection
+  let iso := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K' := K.map iso
+  let p' := Submodule.orthogonalProjection K' (iso y)
+  iso.symm p'
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
     iff p minimizes distance to y among all points in K. -/
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
-    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist y p ≤ dist y w) :
+    (h_mem : p ∈ K)
+    (h_min : ∀ w ∈ K, l2norm_sq (y - p) ≤ l2norm_sq (y - w)) :
     p = orthogonalProjection K y := by
-  sorry
+  let iso := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K' := K.map iso
+  let y' := iso y
+  let p' := iso p
+  have h_mem' : p' ∈ K' := by
+    simp only [K', p', iso, Submodule.mem_map, Set.mem_image, LinearEquiv.coe_coe]
+    exact ⟨p, h_mem, rfl⟩
+
+  -- The projection q' in K' minimizes distance
+  let q' := Submodule.orthogonalProjection K' y'
+  have h_proj_min : ∀ w' ∈ K', dist y' q' ≤ dist y' w' :=
+    Submodule.orthogonalProjection_is_minimizer K' y'
+
+  -- Translate hypothesis to K'
+  have h_hyp_min : ∀ w' ∈ K', dist y' p' ≤ dist y' w' := by
+    intro w' hw'
+    -- w' is in K' so w' = iso w for some w ∈ K
+    obtain ⟨w, hw, rfl⟩ := (Submodule.mem_map (f := iso)).mp hw'
+    specialize h_min w hw
+    -- l2norm_sq (y - p) = dist (iso y) (iso p) ^ 2
+    have h_norm_p : l2norm_sq (y - p) = dist y' p' ^ 2 := by
+      simp only [l2norm_sq, dist_eq_norm, y', p']
+      -- Need to show sum (y i - p i)^2 = ‖iso (y - p)‖^2
+      -- WithLp 2 norm is defined as L2 norm.
+      have h_eq : ‖iso (y - p)‖ = Real.sqrt (∑ i, ‖(y - p) i‖^2) := by
+        rw [PiLp.norm_eq_of_nat 2]
+        rfl
+      rw [h_eq, Real.sq_sqrt]
+      · congr; ext i; simp only [Pi.sub_apply, Real.norm_eq_abs, sq_abs]
+      · apply Finset.sum_nonneg; intro i _; exact sq_nonneg _
+
+    have h_norm_w : l2norm_sq (y - w) = dist y' (iso w) ^ 2 := by
+      simp only [l2norm_sq, dist_eq_norm, y', iso]
+      -- Same logic
+      have h_eq : ‖iso (y - w)‖ = Real.sqrt (∑ i, ‖(y - w) i‖^2) := by
+        rw [PiLp.norm_eq_of_nat 2]
+        rfl
+      rw [h_eq, Real.sq_sqrt]
+      · congr; ext i; simp only [Pi.sub_apply, Real.norm_eq_abs, sq_abs]
+      · apply Finset.sum_nonneg; intro i _; exact sq_nonneg _
+
+    rw [h_norm_p, h_norm_w] at h_min
+    -- a^2 ≤ b^2 implies a ≤ b for non-negative
+    nlinarith [dist_nonneg (x := y') (y := p'), dist_nonneg (x := y') (y := iso w)]
+
+  -- Uniqueness of minimizer in Hilbert space
+  have h_unique : p' = q' := by
+    have h_eq_dist : dist y' p' = dist y' q' := le_antisymm (h_hyp_min q' (Submodule.orthogonalProjection_mem_subspace_eq_self K')) (h_proj_min p' h_mem')
+    refine StrictConvex.eq_of_dist_eq_dist ?_ h_mem' (Submodule.orthogonalProjection_mem_subspace_eq_self K') h_eq_dist
+    exact InnerProductSpace.strictConvex
+
+  simp [orthogonalProjection]
+  apply iso.injective
+  simp only [LinearEquiv.apply_symm_apply]
+  exact h_unique
 
 set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
