@@ -4425,14 +4425,60 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
 
 /-- Orthogonal projection onto a finite-dimensional subspace. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  0  -- Placeholder; proper implementation would use Mathlib's orthogonalProjection
+  let iso := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let y_l2 := iso.symm y
+  let K_l2 := K.map iso.symm
+  let p_l2 := Submodule.orthogonalProjection K_l2 y_l2
+  iso p_l2
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
     iff p minimizes distance to y among all points in K. -/
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
-    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist y p ≤ dist y w) :
+    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, l2norm_sq (y - p) ≤ l2norm_sq (y - w)) :
     p = orthogonalProjection K y := by
-  sorry
+  let iso := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let y_l2 := iso.symm y
+  let p_l2 := iso.symm p
+  let K_l2 := K.map iso.symm
+
+  have h_mem_l2 : p_l2 ∈ K_l2 := by
+    apply Submodule.mem_map_of_mem
+    exact h_mem
+
+  have h_norm_eq : ∀ v, l2norm_sq v = ‖iso.symm v‖^2 := by
+    intro v
+    simp only [l2norm_sq, WithLp.linearEquiv_symm_apply, PiLp.norm_eq_of_nat 2]
+    have h_pow : (2 : ℝ) ≠ 0 := by norm_num
+    rw [Real.sqrt_eq_rpow, ← Real.rpow_mul (by apply Finset.sum_nonneg; intro i _; simp),
+      inv_mul_cancel h_pow, Real.rpow_one]
+    apply Finset.sum_congr rfl
+    intro i _
+    rw [sq_abs]
+    rfl
+
+  have h_min_l2 : ∀ w_l2 ∈ K_l2, ‖y_l2 - p_l2‖ ≤ ‖y_l2 - w_l2‖ := by
+    intro w_l2 hw_l2
+    obtain ⟨w, hw, hw_eq⟩ := Submodule.mem_map.mp hw_l2
+    -- hw_eq : iso.symm w = w_l2
+    rw [← hw_eq]
+    specialize h_min w hw
+    rw [← LinearEquiv.map_sub, ← LinearEquiv.map_sub]
+    rw [← h_norm_eq, ← h_norm_eq]
+    exact h_min
+
+  have h_unique : (p_l2 : WithLp 2 (Fin n → ℝ)) = Submodule.orthogonalProjection K_l2 y_l2 := by
+    apply eq_of_dist_eq_dist
+    · exact (Submodule.orthogonalProjection K_l2 y_l2).2
+    · exact h_mem_l2
+    · apply orthogonalProjection_is_minimizer
+    · intro z hz
+      rw [dist_eq_norm, dist_eq_norm]
+      exact h_min_l2 z hz
+
+  rw [orthogonalProjection]
+  apply iso.symm.injective
+  simp only [LinearEquiv.symm_apply_apply]
+  exact h_unique
 
 set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
