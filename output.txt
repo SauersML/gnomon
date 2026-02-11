@@ -1,0 +1,4 @@
+proofs/CheckNames.lean:8:7: error(lean.unknownIdentifier): Unknown constant `Submodule.orthogonalProjection_is_minimizer`
+proofs/CheckNames.lean:9:7: error(lean.unknownIdentifier): Unknown constant `InnerProductSpace.strictConvex`
+proofs/CheckNames.lean:10:7: error(lean.unknownIdentifier): Unknown constant `StrictConvex.eq_of_dist_eq_dist`
+1
