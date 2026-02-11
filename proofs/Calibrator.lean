@@ -1,5 +1,7 @@
 import Mathlib.Tactic
 import Mathlib.Analysis.Calculus.Deriv.Basic
+import Mathlib.Analysis.Calculus.Deriv.Add
+import Mathlib.Analysis.Calculus.Deriv.Mul
 import Mathlib.Analysis.Calculus.Deriv.Inv
 import Mathlib.Analysis.Convex.Strict
 import Mathlib.Analysis.Convex.Jensen
@@ -4425,14 +4427,63 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
 
 /-- Orthogonal projection onto a finite-dimensional subspace. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  0  -- Placeholder; proper implementation would use Mathlib's orthogonalProjection
+  let iso := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K' : Submodule ℝ (WithLp 2 (Fin n → ℝ)) := K.map iso.symm
+  let y' : WithLp 2 (Fin n → ℝ) := iso.symm y
+  let proj' := Submodule.orthogonalProjection K' y'
+  iso (proj' : WithLp 2 (Fin n → ℝ))
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
-    iff p minimizes distance to y among all points in K. -/
+    iff p minimizes l2norm_sq distance to y among all points in K. -/
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
-    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist y p ≤ dist y w) :
+    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, l2norm_sq (y - p) ≤ l2norm_sq (y - w)) :
     p = orthogonalProjection K y := by
-  sorry
+  let iso := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K' : Submodule ℝ (WithLp 2 (Fin n → ℝ)) := K.map iso.symm
+  let y' : WithLp 2 (Fin n → ℝ) := iso.symm y
+  let p' : WithLp 2 (Fin n → ℝ) := iso.symm p
+
+  -- Verify p' ∈ K'
+  have h_mem' : p' ∈ K' := by
+    apply Submodule.mem_map_of_mem
+    exact h_mem
+
+  -- Verify p' is minimizer in K'
+  have h_min' : ∀ w' ∈ K', dist y' p' ≤ dist y' w' := by
+    intro w' hw'
+    obtain ⟨w, hw, rfl⟩ := Submodule.mem_map.mp hw'
+    specialize h_min w hw
+    -- l2norm_sq (y - w) = ‖iso.symm (y - w)‖^2 = ‖y' - w'‖^2 = (dist y' w')^2
+    have h_norm_eq : ∀ v : Fin n → ℝ, l2norm_sq v = ‖iso.symm v‖^2 := by
+      intro v
+      simp only [l2norm_sq]
+      rw [PiLp.norm_eq_of_nat 2 (by norm_num)]
+      rw [Real.sqrt_eq_rpow, Real.rpow_two]
+      apply Finset.sum_congr rfl
+      intro i _
+      simp only [Real.norm_eq_abs, sq_abs]
+      rw [Real.rpow_two]
+      simp only [Real.sq_sqrt (Finset.sum_nonneg fun i _ => sq_nonneg _)]
+
+    rw [h_norm_eq (y - p), h_norm_eq (y - w)] at h_min
+    have h_dist_sq : (dist y' p')^2 ≤ (dist y' w')^2 := by
+       simp only [dist_eq_norm]
+       rw [map_sub, map_sub] at h_min
+       exact h_min
+
+    rwa [Real.sqrt_le_sqrt_iff (sq_nonneg _) (sq_nonneg _), Real.sqrt_sq (dist_nonneg _ _), Real.sqrt_sq (dist_nonneg _ _)] at h_dist_sq
+
+  -- Uniqueness of projection
+  have h_eq' : p' = Submodule.orthogonalProjection K' y' := by
+     apply Eq.symm
+     apply Submodule.orthogonalProjection_eq_of_dist_le
+     · exact h_mem'
+     · exact h_min'
+
+  -- Map back
+  dsimp [orthogonalProjection]
+  rw [← h_eq']
+  simp
 
 set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
@@ -6103,8 +6154,9 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
               have h_jacobi : ∀ σ : Equiv.Perm m, deriv (fun rho => ∏ i : m, M rho ((σ : m → m) i) i) rho = ∑ i : m, (∏ j ∈ Finset.univ.erase i, M rho ((σ : m → m) j) j) * deriv (fun rho => M rho ((σ : m → m) i) i) rho := by
                 intro σ
                 have h_prod_rule : ∀ (f : m → ℝ → ℝ), (∀ i, DifferentiableAt ℝ (f i) rho) → deriv (fun rho => ∏ i, f i rho) rho = ∑ i, (∏ j ∈ Finset.univ.erase i, f j rho) * deriv (f i) rho := by
-                  -- exact?
-                  admit
+                  intro f hf
+                  convert deriv_finset_prod (fun i _ => hf i)
+                  simp
                 apply h_prod_rule
                 intro i
                 exact DifferentiableAt.comp rho ( differentiableAt_pi.1 ( differentiableAt_pi.1 hM_diff _ ) _ ) differentiableAt_id
@@ -6114,8 +6166,9 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
                   have h_diff : ∀ i : m, DifferentiableAt ℝ (fun rho => M rho ((σ : m → m) i) i) rho := by
                     intro i
                     exact DifferentiableAt.comp rho ( differentiableAt_pi.1 ( differentiableAt_pi.1 hM_diff _ ) _ ) differentiableAt_id
-                  -- exact?
-                  admit
+                  apply DifferentiableAt.finset_prod
+                  intro i _
+                  exact h_diff i
                 norm_num [ h_diff ]
               simpa only [ h_jacobi ] using h_deriv_sum
             simp +decide only [h_jacobi, Finset.mul_sum _ _ _]
