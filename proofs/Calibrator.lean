@@ -4423,16 +4423,64 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
   rw [← h_at_1]
   rfl
 
-/-- Orthogonal projection onto a finite-dimensional subspace. -/
+/-- Orthogonal projection onto a finite-dimensional subspace.
+    Uses L2 geometry via `WithLp 2`. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  0  -- Placeholder; proper implementation would use Mathlib's orthogonalProjection
+  let y_L2 := WithLp.equiv 2 (Fin n → ℝ) y
+  let K_L2 : Submodule ℝ (WithLp 2 (Fin n → ℝ)) := K.map (WithLp.linearEquiv 2 ℝ (Fin n → ℝ))
+  let p_L2 := Submodule.orthogonalProjection K_L2 y_L2
+  (WithLp.equiv 2 (Fin n → ℝ)).symm p_L2
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
-    iff p minimizes distance to y among all points in K. -/
+    iff p minimizes L2 distance to y among all points in K. -/
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
-    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist y p ≤ dist y w) :
+    (h_mem : p ∈ K)
+    (h_min : ∀ w ∈ K, dist (WithLp.equiv 2 (Fin n → ℝ) y) (WithLp.equiv 2 (Fin n → ℝ) p) ≤
+                      dist (WithLp.equiv 2 (Fin n → ℝ) y) (WithLp.equiv 2 (Fin n → ℝ) w)) :
     p = orthogonalProjection K y := by
-  sorry
+  let E := WithLp 2 (Fin n → ℝ)
+  let y_L2 : E := WithLp.equiv 2 (Fin n → ℝ) y
+  let p_L2 : E := WithLp.equiv 2 (Fin n → ℝ) p
+  let K_L2 : Submodule ℝ E := K.map (WithLp.linearEquiv 2 ℝ (Fin n → ℝ))
+
+  have h_mem_L2 : p_L2 ∈ K_L2 := by
+    simp only [p_L2, K_L2]
+    apply Submodule.mem_map_of_mem
+    exact h_mem
+
+  have h_min_L2 : ∀ w_L2 ∈ K_L2, ‖y_L2 - p_L2‖ ≤ ‖y_L2 - w_L2‖ := by
+    intro w_L2 hw
+    obtain ⟨w, hw_mem, hw_eq⟩ := Submodule.mem_map.mp hw
+    rw [← hw_eq]
+    have : w_L2 = WithLp.equiv 2 (Fin n → ℝ) w := by rw [← hw_eq]; rfl
+    rw [this]
+    specialize h_min w hw_mem
+    simp only [dist_eq_norm] at h_min
+    exact h_min
+
+  have h_inf : ‖y_L2 - p_L2‖ = ⨅ w : K_L2, ‖y_L2 - w‖ := by
+    apply le_antisymm
+    · apply le_ciInf
+      intro w
+      exact h_min_L2 w w.2
+    · apply ciInf_le
+      use 0
+      rintro x ⟨z, rfl⟩
+      exact norm_nonneg _
+
+  have h_ortho : ∀ w ∈ K_L2, inner (y_L2 - p_L2) w = (0 : ℝ) := by
+    rw [← Submodule.norm_eq_iInf_iff_inner_eq_zero h_mem_L2]
+    exact h_inf
+
+  have h_eq_L2 : p_L2 = Submodule.starProjection K_L2 y_L2 := by
+    apply Submodule.eq_starProjection_of_mem_of_inner_eq_zero h_mem_L2 h_ortho
+
+  -- starProjection is coerced orthogonalProjection
+  have h_eq_L2' : p_L2 = (Submodule.orthogonalProjection K_L2 y_L2 : E) := by
+    rw [h_eq_L2]
+    rfl
+
+  simp only [orthogonalProjection, p_L2, y_L2, K_L2, h_eq_L2']
 
 set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
