@@ -4425,14 +4425,77 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
 
 /-- Orthogonal projection onto a finite-dimensional subspace. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  0  -- Placeholder; proper implementation would use Mathlib's orthogonalProjection
+  let equiv := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K_E : Submodule ℝ (WithLp 2 (Fin n → ℝ)) := K.map equiv.symm
+  let p_E := Submodule.orthogonalProjection K_E (equiv.symm y)
+  equiv p_E
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
-    iff p minimizes distance to y among all points in K. -/
+    iff p minimizes L2 distance to y among all points in K. -/
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
-    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist y p ≤ dist y w) :
+    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, l2norm_sq (y - p) ≤ l2norm_sq (y - w)) :
     p = orthogonalProjection K y := by
-  sorry
+  let equiv := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let y_E := equiv.symm y
+  let p_E := equiv.symm p
+  let K_E := K.map equiv.symm
+
+  have h_mem_E : p_E ∈ K_E := by
+    simp [K_E, p_E]
+    apply Submodule.mem_map_of_mem h_mem
+
+  have h_norm_eq : ∀ v : Fin n → ℝ, l2norm_sq v = ‖equiv.symm v‖^2 := by
+    intro v
+    simp only [l2norm_sq]
+    rw [PiLp.norm_eq_of_nat 2]
+    have h_nonneg : 0 ≤ ∑ i : Fin n, ‖v i‖ ^ 2 := Finset.sum_nonneg (fun _ _ => sq_nonneg _)
+    rw [Real.sq_rpow h_nonneg]
+    have h_two_ne_zero : (2 : ℝ) ≠ 0 := two_ne_zero
+    rw [div_self h_two_ne_zero, Real.rpow_one]
+    congr
+    ext i
+    simp only [Real.norm_eq_abs, sq_abs]
+
+  -- This transforms the minimization condition to Euclidean space
+  have h_min_E : ∀ w_E ∈ K_E, ‖y_E - p_E‖^2 ≤ ‖y_E - w_E‖^2 := by
+    intro w_E hw_E
+    obtain ⟨w, hw, rfl⟩ := Submodule.mem_map.mp hw_E
+    specialize h_min w hw
+    rw [h_norm_eq (y - p), h_norm_eq (y - w)] at h_min
+    simp only [equiv, LinearEquiv.map_sub] at h_min
+    exact h_min
+
+  have h_eq_E : p_E = K_E.subtype (Submodule.orthogonalProjection K_E y_E) := by
+    apply Submodule.eq_orthogonalProjection_of_mem_of_inner_eq_zero h_mem_E
+    intro w_E hw_E
+
+    -- Variational argument
+    let f := fun (t : ℝ) => ‖y_E - (p_E + t • w_E)‖^2
+    have h_f_min : ∀ t, f 0 ≤ f t := by
+      intro t
+      apply h_min_E
+      apply K_E.add_mem h_mem_E (K_E.smul_mem t hw_E)
+
+    have h_expand : ∀ t, f t = ‖y_E - p_E‖^2 - 2 * t * real_inner (y_E - p_E) w_E + t^2 * ‖w_E‖^2 := by
+      intro t
+      simp only [f]
+      -- Expand ||(y - p) - tw||^2
+      rw [sub_add_eq_sub_sub]
+      rw [norm_sub_pow_two]
+      simp only [real_inner_smul_right, norm_smul, Real.norm_eq_abs, sq_abs, mul_pow]
+      ring
+
+    have h_quad : ∀ t, (-2 * real_inner (y_E - p_E) w_E) * t + ‖w_E‖^2 * t^2 ≥ 0 := by
+      intro t
+      have := h_f_min t
+      rw [h_expand t, h_expand 0] at this
+      simp at this
+      exact this
+
+    apply linear_coeff_zero_of_quadratic_nonneg _ (‖w_E‖^2) h_quad
+
+  rw [← h_eq_E]
+  simp [orthogonalProjection, equiv]
 
 set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
