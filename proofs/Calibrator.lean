@@ -1,5 +1,7 @@
 import Mathlib.Tactic
 import Mathlib.Analysis.Calculus.Deriv.Basic
+import Mathlib.Analysis.Calculus.Deriv.Prod
+import Mathlib.Analysis.Calculus.Deriv.Mul
 import Mathlib.Analysis.Calculus.Deriv.Inv
 import Mathlib.Analysis.Convex.Strict
 import Mathlib.Analysis.Convex.Jensen
@@ -4425,14 +4427,52 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
 
 /-- Orthogonal projection onto a finite-dimensional subspace. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  0  -- Placeholder; proper implementation would use Mathlib's orthogonalProjection
+  let iso := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K_l2 : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map iso.symm
+  let y_l2 : EuclideanSpace ℝ (Fin n) := iso.symm y
+  let proj_l2 := Submodule.orthogonalProjection K_l2 y_l2
+  iso proj_l2
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
     iff p minimizes distance to y among all points in K. -/
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
-    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist y p ≤ dist y w) :
+    (h_mem : p ∈ K)
+    (h_min : ∀ w ∈ K, dist ((WithLp.linearEquiv 2 ℝ (Fin n → ℝ)).symm y) ((WithLp.linearEquiv 2 ℝ (Fin n → ℝ)).symm p)
+                    ≤ dist ((WithLp.linearEquiv 2 ℝ (Fin n → ℝ)).symm y) ((WithLp.linearEquiv 2 ℝ (Fin n → ℝ)).symm w)) :
     p = orthogonalProjection K y := by
-  sorry
+  let iso := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K_l2 : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map iso.symm
+  let y_l2 : EuclideanSpace ℝ (Fin n) := iso.symm y
+  let p_l2 : EuclideanSpace ℝ (Fin n) := iso.symm p
+
+  have h_mem_l2 : p_l2 ∈ K_l2 := by
+    simp [K_l2, p_l2, iso]; use p; exact ⟨h_mem, rfl⟩
+
+  have h_min_l2 : ∀ w_l2 ∈ K_l2, dist y_l2 p_l2 ≤ dist y_l2 w_l2 := by
+    intro w_l2 hw_l2
+    rcases (Submodule.mem_map.mp hw_l2) with ⟨w, hw, rfl⟩
+    exact h_min w hw
+
+  have h_eq_l2 : p_l2 = Submodule.orthogonalProjection K_l2 y_l2 := by
+    -- Uniqueness of minimizer in strictly convex space (EuclideanSpace)
+    -- We know orthogonalProjection minimizes distance
+    let proj := Submodule.orthogonalProjection K_l2 y_l2
+    have h_proj_mem : proj ∈ K_l2 := Submodule.orthogonalProjection_mem K_l2 y_l2
+    have h_proj_min : ∀ w ∈ K_l2, dist y_l2 proj ≤ dist y_l2 w :=
+      Submodule.orthogonalProjection_is_minimizer K_l2 y_l2
+    have h_dist_eq : dist y_l2 p_l2 = dist y_l2 proj := by
+      apply le_antisymm
+      · exact h_min_l2 proj h_proj_mem
+      · exact h_proj_min p_l2 h_mem_l2
+    -- In a strictly convex space, the projection is unique
+    -- EuclideanSpace is a Hilbert space, thus strictly convex
+    refine (eq_of_dist_eq_of_dist_le_of_convex_of_strictConvex
+      (Submodule.convex K_l2) (StrictConvex.strictConvex _) h_mem_l2 h_proj_mem h_dist_eq (h_proj_min p_l2 h_mem_l2)).symm
+
+  unfold orthogonalProjection
+  -- p = iso (proj)
+  rw [← h_eq_l2]
+  simp [iso]
 
 set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
@@ -6103,19 +6143,19 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
               have h_jacobi : ∀ σ : Equiv.Perm m, deriv (fun rho => ∏ i : m, M rho ((σ : m → m) i) i) rho = ∑ i : m, (∏ j ∈ Finset.univ.erase i, M rho ((σ : m → m) j) j) * deriv (fun rho => M rho ((σ : m → m) i) i) rho := by
                 intro σ
                 have h_prod_rule : ∀ (f : m → ℝ → ℝ), (∀ i, DifferentiableAt ℝ (f i) rho) → deriv (fun rho => ∏ i, f i rho) rho = ∑ i, (∏ j ∈ Finset.univ.erase i, f j rho) * deriv (f i) rho := by
-                  -- exact?
-                  admit
+                  intro f h_diff
+                  convert deriv_finset_prod Finset.univ f rho (fun i _ => h_diff i)
+                  simp
                 apply h_prod_rule
                 intro i
                 exact DifferentiableAt.comp rho ( differentiableAt_pi.1 ( differentiableAt_pi.1 hM_diff _ ) _ ) differentiableAt_id
               have h_deriv_sum : deriv (fun rho => ∑ σ : Equiv.Perm m, (↑(↑((Equiv.Perm.sign : Equiv.Perm m → ℤˣ) σ) : ℤ) : ℝ) * ∏ i : m, M rho ((σ : m → m) i) i) rho = ∑ σ : Equiv.Perm m, (↑(↑((Equiv.Perm.sign : Equiv.Perm m → ℤˣ) σ) : ℤ) : ℝ) * deriv (fun rho => ∏ i : m, M rho ((σ : m → m) i) i) rho := by
                 have h_diff : ∀ σ : Equiv.Perm m, DifferentiableAt ℝ (fun rho => ∏ i : m, M rho ((σ : m → m) i) i) rho := by
                   intro σ
-                  have h_diff : ∀ i : m, DifferentiableAt ℝ (fun rho => M rho ((σ : m → m) i) i) rho := by
+                  have h_diff_i : ∀ i : m, DifferentiableAt ℝ (fun rho => M rho ((σ : m → m) i) i) rho := by
                     intro i
                     exact DifferentiableAt.comp rho ( differentiableAt_pi.1 ( differentiableAt_pi.1 hM_diff _ ) _ ) differentiableAt_id
-                  -- exact?
-                  admit
+                  exact DifferentiableAt.finset_prod (fun i _ => h_diff_i i)
                 norm_num [ h_diff ]
               simpa only [ h_jacobi ] using h_deriv_sum
             simp +decide only [h_jacobi, Finset.mul_sum _ _ _]
