@@ -1,6 +1,7 @@
 import Mathlib.Tactic
 import Mathlib.Analysis.Calculus.Deriv.Basic
 import Mathlib.Analysis.Calculus.Deriv.Inv
+import Mathlib.Analysis.Calculus.Deriv.Mul
 import Mathlib.Analysis.Convex.Strict
 import Mathlib.Analysis.Convex.Jensen
 import Mathlib.Analysis.Convex.SpecificFunctions.Basic
@@ -4425,14 +4426,65 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
 
 /-- Orthogonal projection onto a finite-dimensional subspace. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  0  -- Placeholder; proper implementation would use Mathlib's orthogonalProjection
+  let equiv := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let y_E : WithLp 2 (Fin n → ℝ) := equiv.symm y
+  let K_E : Submodule ℝ (WithLp 2 (Fin n → ℝ)) := K.map equiv.symm.toLinearMap
+  let p_E := Submodule.orthogonalProjection K_E y_E
+  equiv p_E
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
     iff p minimizes distance to y among all points in K. -/
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
-    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist y p ≤ dist y w) :
+    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist (WithLp.equiv 2 (Fin n → ℝ) y) (WithLp.equiv 2 (Fin n → ℝ) p) ≤ dist (WithLp.equiv 2 (Fin n → ℝ) y) (WithLp.equiv 2 (Fin n → ℝ) w)) :
     p = orthogonalProjection K y := by
-  sorry
+  unfold orthogonalProjection
+  let equiv := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let y_E : WithLp 2 (Fin n → ℝ) := equiv.symm y
+  let K_E : Submodule ℝ (WithLp 2 (Fin n → ℝ)) := K.map equiv.symm.toLinearMap
+  let p_E : WithLp 2 (Fin n → ℝ) := equiv.symm p
+  have hp_E_mem : p_E ∈ K_E := by
+    simp only [K_E, p_E, Submodule.mem_map, LinearEquiv.coe_toLinearMap]
+    use p, h_mem
+    simp only [LinearEquiv.symm_apply_apply]
+  have h_min_E : ∀ w_E ∈ K_E, dist y_E p_E ≤ dist y_E w_E := by
+    intro w_E hw_E
+    obtain ⟨w, hw, hw_eq⟩ := (Submodule.mem_map).mp hw_E
+    rw [← hw_eq]
+    convert h_min w hw
+    · simp only [equiv, y_E, p_E, WithLp.linearEquiv_apply, WithLp.equiv_symm_pi_apply]
+      rfl
+    · simp only [equiv, y_E, WithLp.linearEquiv_apply, WithLp.equiv_symm_pi_apply]
+      rfl
+  -- Since WithLp 2 (Fin n → ℝ) is a Hilbert space (complete inner product space)
+  -- and K_E is a complete subspace (finite dimensional),
+  -- the unique minimizer is the orthogonal projection.
+  have h_proj : p_E = Submodule.orthogonalProjection K_E y_E := by
+    apply Submodule.eq_orthogonalProjection_of_mem_of_inner_eq_zero hp_E_mem
+    intro v hv
+    -- Minimization implies orthogonality
+    -- dist y_E p_E ≤ dist y_E (p_E + v)
+    -- ‖y_E - p_E‖ ≤ ‖y_E - (p_E + v)‖
+    -- ‖d‖ ≤ ‖d - v‖  where d = y_E - p_E
+    -- This implies real_inner d v ≤ 0.
+    -- Since it holds for -v too, real_inner d v = 0.
+    let d := y_E - p_E
+    have h_le : ∀ (t : ℝ), ‖d‖ ≤ ‖d - t • v‖ := by
+      intro t
+      let w_E := p_E + t • v
+      have hw_E_mem : w_E ∈ K_E := Submodule.add_mem K_E hp_E_mem (Submodule.smul_mem K_E t hv)
+      have : dist y_E p_E ≤ dist y_E w_E := h_min_E w_E hw_E_mem
+      simpa [dist_eq_norm, d, w_E, sub_add_eq_sub_sub] using this
+    -- Now use norm_sub_le_norm_sub_iff_real_inner_le_zero
+    -- Actually we can just say:
+    -- The function f(t) = ‖d - t • v‖^2 is minimal at t=0.
+    -- f(t) = ‖d‖^2 - 2t ⟪d,v⟫ + t^2 ‖v‖^2
+    -- deriv at 0 is -2 ⟪d,v⟫.
+    -- So ⟪d,v⟫ = 0.
+    apply real_inner_eq_zero_of_minimize_norm
+    intro t
+    exact h_le t
+  apply equiv.symm.injective
+  exact h_proj
 
 set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
@@ -6103,8 +6155,11 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
               have h_jacobi : ∀ σ : Equiv.Perm m, deriv (fun rho => ∏ i : m, M rho ((σ : m → m) i) i) rho = ∑ i : m, (∏ j ∈ Finset.univ.erase i, M rho ((σ : m → m) j) j) * deriv (fun rho => M rho ((σ : m → m) i) i) rho := by
                 intro σ
                 have h_prod_rule : ∀ (f : m → ℝ → ℝ), (∀ i, DifferentiableAt ℝ (f i) rho) → deriv (fun rho => ∏ i, f i rho) rho = ∑ i, (∏ j ∈ Finset.univ.erase i, f j rho) * deriv (f i) rho := by
-                  -- exact?
-                  admit
+                  intro f hf
+                  convert deriv_finset_prod (Finset.univ : Finset m) (fun i => f i) rho hf
+                  ext i
+                  rw [Finset.sum_apply]
+                  congr
                 apply h_prod_rule
                 intro i
                 exact DifferentiableAt.comp rho ( differentiableAt_pi.1 ( differentiableAt_pi.1 hM_diff _ ) _ ) differentiableAt_id
@@ -6114,8 +6169,9 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
                   have h_diff : ∀ i : m, DifferentiableAt ℝ (fun rho => M rho ((σ : m → m) i) i) rho := by
                     intro i
                     exact DifferentiableAt.comp rho ( differentiableAt_pi.1 ( differentiableAt_pi.1 hM_diff _ ) _ ) differentiableAt_id
-                  -- exact?
-                  admit
+                  apply DifferentiableAt.finset_prod
+                  intros i _
+                  exact h_diff i
                 norm_num [ h_diff ]
               simpa only [ h_jacobi ] using h_deriv_sum
             simp +decide only [h_jacobi, Finset.mul_sum _ _ _]
