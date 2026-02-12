@@ -1,5 +1,6 @@
 import Mathlib.Tactic
 import Mathlib.Analysis.Calculus.Deriv.Basic
+import Mathlib.Analysis.Calculus.Deriv.Mul
 import Mathlib.Analysis.Calculus.Deriv.Inv
 import Mathlib.Analysis.Convex.Strict
 import Mathlib.Analysis.Convex.Jensen
@@ -4220,7 +4221,11 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
           (1 - γ) * ((scaling_func pc.2 - 1) * pc.1^2) - ((scaling_func pc.2 - 1) * base pc.2) * pc.1 := by
         intro pc
         dsimp [dgp, dgpMultiplicativeBias]
-        rw [h_diff_form]
+        -- Expand linearPredictor
+        have h_pred : linearPredictor model_norm pc.1 pc.2 = base pc.2 + γ * pc.1 := by
+          rw [h_norm_decomp, h_norm_slope]
+          rfl
+        rw [h_pred]
         ring
 
       simp_rw [h_integrand]
@@ -4569,25 +4574,56 @@ lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n →
     intro w' hw'
     rw [Submodule.mem_map] at hw'
     rcases hw' with ⟨w, hw, rfl⟩
-    -- The hypothesis h_min refers to dist (iso.symm p) (iso.symm y)
-    -- Which is dist p' y'
-    -- We want to use h_min for w
     specialize h_min w hw
-    -- dist is symmetric
-    rw [dist_comm y' p']
-    rw [dist_comm y' (iso.symm w)]
-    convert h_min using 0
+    have h_symm : (WithLp.equiv 2 (Fin n → ℝ)).symm = iso.symm := rfl
+    rw [h_symm] at h_min
+    have h_dist_comm : dist y' p' = dist (iso.symm p) (iso.symm y) := by
+      rw [dist_comm]
+      rfl
+    rw [h_dist_comm]
+    convert h_min using 1
+    rw [dist_comm]
+    rfl
 
-  -- Apply the standard theorem for orthogonal projection in Hilbert space
-  -- We rely on the fact that `WithLp 2 (Fin n → ℝ)` is an `InnerProductSpace`.
-  -- Mathlib provides `InnerProductSpace.ofCore` for `PiLp` but we need to ensure instance is found.
-  -- The imports include `Mathlib.Analysis.InnerProductSpace.PiL2`.
-  have h_eq' := Submodule.eq_orthogonalProjection_of_mem_of_min_dist K' y' p' h_mem' h_min'
+  -- Use variational characterization to prove p' is the orthogonal projection
+  have h_orth : ∀ v ∈ K', real_inner (y' - p') v = 0 := by
+    intro v hv
+    -- Consider f(ε) = ||y' - (p' + εv)||^2
+    -- p' + εv ∈ K' since K' is a subspace
+    have h_mem_eps : ∀ ε : ℝ, p' + ε • v ∈ K' := fun ε => K'.add_mem h_mem' (K'.smul_mem ε hv)
+    have h_min_eps : ∀ ε : ℝ, dist y' p' ≤ dist y' (p' + ε • v) := fun ε => h_min' (p' + ε • v) (h_mem_eps ε)
+
+    have h_norm_sq : ∀ ε : ℝ, ‖y' - p' - ε • v‖^2 = ‖y' - p'‖^2 - 2 * ε * real_inner (y' - p') v + ε^2 * ‖v‖^2 := by
+      intro ε
+      rw [norm_sub_sq_real, inner_smul_right]
+      ring
+
+    -- The distance inequality implies norm inequality
+    have h_quad : ∀ ε : ℝ, ‖y' - p'‖^2 ≤ ‖y' - p' - ε • v‖^2 := by
+      intro ε
+      simp only [dist_eq_norm] at h_min_eps
+      have h := h_min_eps ε
+      exact sq_le_sq' (norm_nonneg _) (norm_nonneg _) h
+
+    -- Substitute expansion
+    have h_quad' : ∀ ε : ℝ, -2 * real_inner (y' - p') v * ε + ‖v‖^2 * ε^2 ≥ 0 := by
+      intro ε
+      specialize h_quad ε
+      rw [h_norm_sq] at h_quad
+      linarith
+
+    -- Use the helper lemma
+    exact linear_coeff_zero_of_quadratic_nonneg (-2 * real_inner (y' - p') v) (‖v‖^2) h_quad' |>
+          (fun h => by linarith)
+
+  -- Uniqueness of orthogonal projection
+  have h_unique : p' = Submodule.orthogonalProjection K' y' :=
+    Submodule.eq_orthogonalProjection_of_mem_of_inner_eq_zero h_mem' h_orth
 
   -- Map back to the original space
   unfold orthogonalProjection
   dsimp
-  rw [← h_eq']
+  rw [← h_unique]
   simp
 
 set_option maxHeartbeats 2000000 in
@@ -6260,8 +6296,9 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
                 intro σ
                 have h_prod_rule : ∀ (f : m → ℝ → ℝ), (∀ i, DifferentiableAt ℝ (f i) rho) → deriv (fun rho => ∏ i, f i rho) rho = ∑ i, (∏ j ∈ Finset.univ.erase i, f j rho) * deriv (f i) rho := by
                   intro f hf
-                  convert deriv_finset_prod Finset.univ f (fun i _ => hf i)
-                  simp
+                  rw [deriv_finset_prod]
+                  · rfl
+                  · exact fun i _ => hf i
                 apply h_prod_rule
                 intro i
                 exact DifferentiableAt.comp rho ( differentiableAt_pi.1 ( differentiableAt_pi.1 hM_diff _ ) _ ) differentiableAt_id
@@ -6271,9 +6308,7 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
                   have h_diff : ∀ i : m, DifferentiableAt ℝ (fun rho => M rho ((σ : m → m) i) i) rho := by
                     intro i
                     exact DifferentiableAt.comp rho ( differentiableAt_pi.1 ( differentiableAt_pi.1 hM_diff _ ) _ ) differentiableAt_id
-                  apply DifferentiableAt.finset_prod
-                  intro i _
-                  exact h_diff i
+                  exact DifferentiableAt.finset_prod (fun i _ => h_diff i)
                 norm_num [ h_diff ]
               simpa only [ h_jacobi ] using h_deriv_sum
             simp +decide only [h_jacobi, Finset.mul_sum _ _ _]

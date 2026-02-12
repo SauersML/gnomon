@@ -1,0 +1,3 @@
+import Mathlib.Analysis.InnerProductSpace.Projection
+open InnerProductSpace
+#check Submodule.orthogonalProjection_is_minimizer
