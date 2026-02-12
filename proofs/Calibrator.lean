@@ -4425,14 +4425,45 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
 
 /-- Orthogonal projection onto a finite-dimensional subspace. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  0  -- Placeholder; proper implementation would use Mathlib's orthogonalProjection
+  let iso := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K' := K.map iso.symm
+  let y' := iso.symm y
+  iso (Submodule.orthogonalProjection K' y' : WithLp 2 ℝ (Fin n → ℝ))
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
     iff p minimizes distance to y among all points in K. -/
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
-    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist y p ≤ dist y w) :
+    (h_mem : p ∈ K)
+    (h_min : ∀ w ∈ K, dist ((WithLp.linearEquiv 2 ℝ (Fin n → ℝ)).symm y) ((WithLp.linearEquiv 2 ℝ (Fin n → ℝ)).symm p) ≤
+                       dist ((WithLp.linearEquiv 2 ℝ (Fin n → ℝ)).symm y) ((WithLp.linearEquiv 2 ℝ (Fin n → ℝ)).symm w)) :
     p = orthogonalProjection K y := by
-  sorry
+  let iso := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K' := K.map iso.symm
+  let y' := iso.symm y
+  let p' := iso.symm p
+
+  have h_mem' : p' ∈ K' := by
+    rw [Submodule.mem_map]
+    use p, h_mem
+    simp only [p', iso, LinearEquiv.symm_apply_apply]
+
+  have h_min' : ∀ w' ∈ K', dist y' p' ≤ dist y' w' := by
+    intro w' hw'
+    rcases (Submodule.mem_map).mp hw' with ⟨w, hw, rfl⟩
+    have h := h_min w hw
+    simp only [iso, y', p'] at *
+    exact h
+
+  have h_eq' : p' = Submodule.orthogonalProjection K' y' := by
+    apply Eq.symm
+    apply Submodule.orthogonalProjection_eq_of_dist_le
+    · exact h_mem'
+    · exact h_min'
+
+  rw [orthogonalProjection]
+  simp only [iso, y', K']
+  rw [← h_eq']
+  simp only [LinearEquiv.apply_symm_apply]
 
 set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
@@ -4474,7 +4505,205 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   ∀ (i : Fin n),
       linearPredictor model (data.p i) (data.c i) =
       linearPredictor model_prime (data'.p i) (data'.c i) := by
-  sorry
+  classical
+  intro i
+  let X := designMatrix data pgsBasis splineBasis
+  let X' := designMatrix data' pgsBasis splineBasis
+  let y_vec := data.y
+
+  -- Show model is InModelClass
+  have h_model_in_class : InModelClass model pgsBasis splineBasis := by
+    unfold model fit unpackParams
+    constructor <;> rfl
+
+  have h_model_prime_in_class : InModelClass model_prime pgsBasis splineBasis := by
+    unfold model_prime fit unpackParams
+    constructor <;> rfl
+
+  -- Predictors as vectors
+  let v := X.mulVec (packParams model)
+  let v' := X'.mulVec (packParams model_prime)
+
+  have hv_eq : linearPredictor model (data.p i) (data.c i) = v i := by
+    rw [linearPredictor_eq_designMatrix_mulVec data pgsBasis splineBasis model h_model_in_class]
+
+  have hv'_eq : linearPredictor model_prime (data'.p i) (data'.c i) = v' i := by
+    rw [linearPredictor_eq_designMatrix_mulVec data' pgsBasis splineBasis model_prime h_model_prime_in_class]
+
+  rw [hv_eq, hv'_eq]
+
+  -- Subspaces
+  let K := LinearMap.range (Matrix.toLin' X)
+  let K' := LinearMap.range (Matrix.toLin' X')
+  have hK_eq : K = K' := h_range_eq
+
+  -- Helper: l2norm_sq matches dist^2
+  let iso := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  have h_dist_sq : ∀ a b : Fin n → ℝ, (dist (iso.symm a) (iso.symm b))^2 = l2norm_sq (a - b) := by
+    intro a b
+    unfold l2norm_sq
+    have h_norm : ‖iso.symm (a - b)‖^2 = Finset.univ.sum (fun i => (a i - b i)^2) := by
+      -- This relies on WithLp norm definition.
+      -- WithLp 2 (Fin n -> R) is EuclideanSpace.
+      -- The norm squared is the sum of squares.
+      -- We can use PiLp.norm_sq_eq_of_L2
+      simp only [iso, LinearEquiv.symm_apply_apply]
+      rw [PiLp.norm_sq_eq_of_L2]
+      simp [Real.norm_eq_abs, sq_abs, sub_eq_add_neg, Pi.sub_apply]
+      rfl
+    rw [dist_eq_norm, ← LinearEquiv.map_sub, h_norm]
+    simp [Pi.sub_apply]
+
+  -- Projection property for model
+  have h_proj : v = orthogonalProjection K y_vec := by
+    apply Eq.symm
+    apply orthogonalProjection_eq_of_dist_le
+    · -- v ∈ K
+      simp [K, v, Matrix.toLin'_apply]
+      use (packParams model)
+      rfl
+    · -- v minimizes distance
+      intro w hw
+      simp [K, Matrix.toLin'_apply] at hw
+      rcases hw with ⟨beta, hbeta⟩
+      rw [← hbeta]
+      -- Construct a model 'm' corresponding to 'beta'
+      let m := unpackParams pgsBasis splineBasis beta
+      have hm_in_class : InModelClass m pgsBasis splineBasis := by
+        unfold unpackParams
+        constructor <;> rfl
+
+      -- Use fit_minimizes_loss
+      have h_opt := fit_minimizes_loss p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank m hm_in_class
+
+      -- Expand empiricalLoss with lambda=0
+      unfold empiricalLoss at h_opt
+      rw [h_lambda_zero] at h_opt
+      simp only [mul_zero, add_zero] at h_opt
+
+      -- Rewrite sums as l2norm_sq
+      have h_loss_model : (∑ i, pointwiseNLL model.dist (data.y i) (linearPredictor model (data.p i) (data.c i))) =
+                          l2norm_sq (y_vec - v) := by
+         unfold pointwiseNLL l2norm_sq
+         have h_dist : model.dist = .Gaussian := h_model_in_class.dist_gaussian
+         simp [h_dist]
+         refine Finset.sum_congr rfl ?_
+         intro j _
+         rw [linearPredictor_eq_designMatrix_mulVec data pgsBasis splineBasis model h_model_in_class]
+         simp [v, y_vec]
+         ring
+
+      have h_loss_m : (∑ i, pointwiseNLL m.dist (data.y i) (linearPredictor m (data.p i) (data.c i))) =
+                      l2norm_sq (y_vec - X.mulVec beta) := by
+         unfold pointwiseNLL l2norm_sq
+         have h_dist : m.dist = .Gaussian := hm_in_class.dist_gaussian
+         simp [h_dist]
+         refine Finset.sum_congr rfl ?_
+         intro j _
+         rw [linearPredictor_eq_designMatrix_mulVec data pgsBasis splineBasis m hm_in_class]
+         simp [m, unpack_pack_eq, unpackParams, packParams, y_vec]
+         -- unpackParams (packParams) is identity? No, packParams m is beta.
+         -- unpackParams basis beta = m.
+         -- packParams m = beta.
+         have h_pack : packParams m = beta := by
+            funext x
+            cases x <;> rfl
+         rw [h_pack]
+         ring
+
+      rw [h_loss_model, h_loss_m] at h_opt
+
+      -- Reduce h_opt to dist inequality
+      rw [← h_dist_sq, ← h_dist_sq] at h_opt
+      -- 1/n * dist^2 <= 1/n * dist^2
+      -- n > 0 => 1/n > 0
+      have hn_inv_pos : (1 / (n : ℝ)) > 0 := by
+        apply one_div_pos.mpr
+        exact_mod_cast h_n_pos
+
+      have h_dist_le : (dist (iso.symm y_vec) (iso.symm v))^2 ≤ (dist (iso.symm y_vec) (iso.symm (X.mulVec beta)))^2 := by
+        nlinarith
+
+      apply nonneg_le_nonneg_of_sq_le_sq
+      · exact dist_nonneg
+      · exact h_dist_le
+
+  -- Similar for model_prime
+  have h_proj' : v' = orthogonalProjection K' y_vec := by
+    apply Eq.symm
+    apply orthogonalProjection_eq_of_dist_le
+    · -- v' ∈ K'
+      simp [K', v', Matrix.toLin'_apply]
+      use (packParams model_prime)
+      rfl
+    · -- v' minimizes distance
+      intro w hw
+      simp [K', Matrix.toLin'_apply] at hw
+      rcases hw with ⟨beta, hbeta⟩
+      rw [← hbeta]
+      let m := unpackParams pgsBasis splineBasis beta
+      have hm_in_class : InModelClass m pgsBasis splineBasis := by
+        unfold unpackParams
+        constructor <;> rfl
+
+      -- We need to check the rank condition for fit on data'.
+      -- The theorem constructs model_prime using a proof of rank.
+      -- The fit function for model_prime is called with h_rank_eq which proves the rank is sufficient.
+      -- So fit_minimizes_loss applies.
+
+      have h_rank' : X'.rank = Fintype.card (ParamIx p k sp) := by
+        rw [← rank_eq_of_range_eq X X' h_range_eq]
+        exact h_rank
+
+      have h_opt := fit_minimizes_loss p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank' m hm_in_class
+
+      unfold empiricalLoss at h_opt
+      rw [h_lambda_zero] at h_opt
+      simp only [mul_zero, add_zero] at h_opt
+
+      have h_loss_model : (∑ i, pointwiseNLL model_prime.dist (data'.y i) (linearPredictor model_prime (data'.p i) (data'.c i))) =
+                          l2norm_sq (y_vec - v') := by
+         unfold pointwiseNLL l2norm_sq
+         have h_dist : model_prime.dist = .Gaussian := h_model_prime_in_class.dist_gaussian
+         simp [h_dist]
+         refine Finset.sum_congr rfl ?_
+         intro j _
+         rw [linearPredictor_eq_designMatrix_mulVec data' pgsBasis splineBasis model_prime h_model_prime_in_class]
+         simp [v', y_vec]
+         -- data'.y = data.y = y_vec
+         ring
+
+      have h_loss_m : (∑ i, pointwiseNLL m.dist (data'.y i) (linearPredictor m (data'.p i) (data'.c i))) =
+                      l2norm_sq (y_vec - X'.mulVec beta) := by
+         unfold pointwiseNLL l2norm_sq
+         have h_dist : m.dist = .Gaussian := hm_in_class.dist_gaussian
+         simp [h_dist]
+         refine Finset.sum_congr rfl ?_
+         intro j _
+         rw [linearPredictor_eq_designMatrix_mulVec data' pgsBasis splineBasis m hm_in_class]
+         simp [m, unpack_pack_eq, unpackParams, packParams, y_vec]
+         have h_pack : packParams m = beta := by
+            funext x
+            cases x <;> rfl
+         rw [h_pack]
+         ring
+
+      rw [h_loss_model, h_loss_m] at h_opt
+
+      rw [← h_dist_sq, ← h_dist_sq] at h_opt
+      have hn_inv_pos : (1 / (n : ℝ)) > 0 := by
+        apply one_div_pos.mpr
+        exact_mod_cast h_n_pos
+
+      have h_dist_le : (dist (iso.symm y_vec) (iso.symm v'))^2 ≤ (dist (iso.symm y_vec) (iso.symm (X'.mulVec beta)))^2 := by
+        nlinarith
+
+      apply nonneg_le_nonneg_of_sq_le_sq
+      · exact dist_nonneg
+      · exact h_dist_le
+
+  -- Conclusion
+  rw [h_proj, h_proj', hK_eq]
 
 noncomputable def dist_to_support {k : ℕ} (c : Fin k → ℝ) (supp : Set (Fin k → ℝ)) : ℝ :=
   Metric.infDist c supp
