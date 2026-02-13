@@ -171,7 +171,7 @@ class BayesR:
         print("BayesR training complete.")
         return out_file
 
-    def predict(self, bfile_test, effect_file, out_prefix):
+    def predict(self, bfile_test, effect_file, out_prefix, freq_file=None):
         """
         Score test data using PLINK2 and BayesR effects.
         """
@@ -286,6 +286,8 @@ class BayesR:
             "--score", score_file, "1", "2", "3",
             "--out", out_prefix
         ]
+        if freq_file is not None:
+            cmd.extend(["--read-freq", str(freq_file)])
         
         print(f"Running Scoring: {' '.join(cmd)}")
         result = subprocess.run(cmd, capture_output=True, text=True)
