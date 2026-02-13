@@ -4425,14 +4425,46 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
 
 /-- Orthogonal projection onto a finite-dimensional subspace. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  0  -- Placeholder; proper implementation would use Mathlib's orthogonalProjection
+  let equiv := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K' : Submodule ℝ (WithLp 2 (Fin n → ℝ)) := K.map equiv.symm
+  let y' := equiv.symm y
+  equiv (Submodule.orthogonalProjection K' y')
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
-    iff p minimizes distance to y among all points in K. -/
+    iff p minimizes L2 distance to y among all points in K. -/
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
-    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist y p ≤ dist y w) :
+    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, l2norm_sq (y - p) ≤ l2norm_sq (y - w)) :
     p = orthogonalProjection K y := by
-  sorry
+  let equiv := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K' : Submodule ℝ (WithLp 2 (Fin n → ℝ)) := K.map equiv.symm
+  let y' := equiv.symm y
+  let p' := equiv.symm p
+
+  have h_mem' : p' ∈ K' := by
+    simp only [K', equiv, p', Submodule.mem_map, LinearEquiv.coe_coe]
+    use p
+    simp [h_mem]
+
+  have h_norm_eq : ∀ v : Fin n → ℝ, l2norm_sq v = ‖equiv.symm v‖^2 := by
+    intro v
+    unfold l2norm_sq
+    rw [PiLp.norm_sq_eq_of_L2]
+    rfl
+
+  have h_min' : ∀ w' ∈ K', dist y' p' ≤ dist y' w' := by
+    intro w' hw'
+    obtain ⟨w, hw, rfl⟩ := (Submodule.mem_map).mp hw'
+    specialize h_min w hw
+    rw [h_norm_eq (y - p), h_norm_eq (y - w)] at h_min
+    rw [dist_eq_norm, dist_eq_norm]
+    simp only [map_sub] at *
+    apply Nonneg.le_of_sq_le_sq (norm_nonneg _) h_min
+
+  have h_eq' : p' = Submodule.orthogonalProjection K' y' :=
+    Eq.symm (Submodule.eq_orthogonalProjection_of_dist_le K' y' p' h_mem' h_min')
+
+  apply equiv.symm.injective
+  simp [h_eq', orthogonalProjection]
 
 set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
