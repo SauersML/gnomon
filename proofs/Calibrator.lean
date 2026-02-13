@@ -4423,16 +4423,56 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
   rw [← h_at_1]
   rfl
 
-/-- Orthogonal projection onto a finite-dimensional subspace. -/
+/-- Orthogonal projection onto a finite-dimensional subspace.
+    We map to `WithLp 2` to use Hilbert space projection, then map back. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  0  -- Placeholder; proper implementation would use Mathlib's orthogonalProjection
+  let equiv := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K_E : Submodule ℝ (WithLp 2 (Fin n → ℝ)) := K.map equiv.symm
+  let y_E : WithLp 2 (Fin n → ℝ) := equiv.symm y
+  let proj_E : WithLp 2 (Fin n → ℝ) := Submodule.orthogonalProjection K_E y_E
+  equiv proj_E
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
-    iff p minimizes distance to y among all points in K. -/
+    iff p minimizes L2 distance to y among all points in K. -/
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
-    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist y p ≤ dist y w) :
+    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, l2norm_sq (y - p) ≤ l2norm_sq (y - w)) :
     p = orthogonalProjection K y := by
-  sorry
+  let equiv := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K_E : Submodule ℝ (WithLp 2 (Fin n → ℝ)) := K.map equiv.symm
+  let y_E : WithLp 2 (Fin n → ℝ) := equiv.symm y
+  let p_E : WithLp 2 (Fin n → ℝ) := equiv.symm p
+
+  -- 1. Transform membership condition
+  have h_mem_E : p_E ∈ K_E := by
+    rw [Submodule.mem_map]
+    use p, h_mem
+    simp [p_E]
+
+  -- 2. Transform minimization condition
+  have h_norm_eq : ∀ v : Fin n → ℝ, l2norm_sq v = ‖equiv.symm v‖^2 := by
+    intro v
+    unfold l2norm_sq
+    rw [PiLp.norm_sq_eq_of_L2]
+    congr; ext i
+    rw [Real.norm_eq_abs, sq_abs]
+
+  have h_min_E : ∀ w_E ∈ K_E, dist y_E p_E ≤ dist y_E w_E := by
+    intro w_E hw_E
+    obtain ⟨w, hw, hw_eq⟩ := Submodule.mem_map.mp hw_E
+    rw [← hw_eq]
+    specialize h_min w hw
+    rw [h_norm_eq (y - p), h_norm_eq (y - w)] at h_min
+    simp only [dist_eq_norm]
+    rw [← LinearEquiv.map_sub, ← LinearEquiv.map_sub] at h_min
+    apply Real.le_of_sq_le_sq_nonneg (norm_nonneg _) h_min
+
+  -- 3. Use uniqueness of orthogonal projection in Hilbert space
+  have h_proj_eq := Submodule.eq_orthogonalProjection_of_mem_of_min_dist K_E y_E p_E h_mem_E h_min_E
+
+  -- 4. Map back
+  dsimp [orthogonalProjection]
+  rw [← h_proj_eq]
+  simp [p_E]
 
 set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
