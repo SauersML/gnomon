@@ -27,6 +27,31 @@ python3 /Users/user/gnomon/sims/figure1_msprime_portability.py --out /Users/user
 python3 /Users/user/gnomon/sims/figure2_stdpopsim_confounding.py --out /Users/user/gnomon/sims/results_figure2_local
 ```
 
+## HPC Orchestrator
+
+Use the single entrypoint:
+
+```bash
+python3 /Users/user/gnomon/sims/main.py setup --install-tools-with-conda
+python3 /Users/user/gnomon/sims/main.py run --full-cohort --figure both --work-root /dev/shm/gnomon_sims_work --out-root /path/to/persistent/results --jobs 32 --clear-ramdisk-after
+```
+
+### RAM disk vs main disk
+
+- Put on RAM disk / fast scratch (`--work-root`):
+  - Per-seed/per-generation `*_work/` directories
+  - PLINK split files (`train.*`, `test.*`, `ref.afreq`)
+  - BayesR intermediate files (`bayesr*`, `*.score`, `*.sscore`)
+- Keep on persistent main disk (`--out-root`):
+  - Final summary TSVs and PNG figures
+  - Optional intermediates only when debugging (`--keep-intermediates`)
+
+### Clearing RAM disk
+
+```bash
+python3 /Users/user/gnomon/sims/main.py clean-ramdisk --work-root /dev/shm/gnomon_sims_work
+```
+
 ## Outputs
 
 Figure 1 output directory includes:

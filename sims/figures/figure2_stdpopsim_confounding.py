@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -140,17 +141,17 @@ def _true_ancestry_proportions(ts, a_idx: np.ndarray, b_idx: np.ndarray, pop_loo
     return afr, eur, asia
 
 
-def _simulate(seed: int, pgs_effects: np.ndarray, out_dir: Path) -> pd.DataFrame:
+def _simulate(seed: int, pgs_effects: np.ndarray, out_dir: Path, n_train_eur: int, n_test_per_pop: int) -> pd.DataFrame:
     species = stdpopsim.get_species("HomSap")
     model = species.get_demographic_model("AmericanAdmixture_4B18")
     contig = species.get_contig("chr22", genetic_map="HapMapII_GRCh38", mutation_rate=model.mutation_rate)
     engine = stdpopsim.get_engine("msprime")
 
     samples = {
-        "AFR": N_TEST_PER_POP,
-        "EUR": N_TRAIN_EUR + N_TEST_PER_POP,
-        "ASIA": N_TEST_PER_POP,
-        "ADMIX": N_TEST_PER_POP,
+        "AFR": n_test_per_pop,
+        "EUR": n_train_eur + n_test_per_pop,
+        "ASIA": n_test_per_pop,
+        "ADMIX": n_test_per_pop,
     }
 
     ts = engine.simulate(
@@ -183,8 +184,8 @@ def _simulate(seed: int, pgs_effects: np.ndarray, out_dir: Path) -> pd.DataFrame
 
     rows = []
     eur_idx = np.where(pop_label == "EUR")[0]
-    eur_train = eur_idx[:N_TRAIN_EUR]
-    eur_test = eur_idx[N_TRAIN_EUR:N_TRAIN_EUR + N_TEST_PER_POP]
+    eur_train = eur_idx[:n_train_eur]
+    eur_test = eur_idx[n_train_eur:n_train_eur + n_test_per_pop]
 
     eur_train_set = set(eur_train.tolist())
     eur_test_set = set(eur_test.tolist())
@@ -274,6 +275,15 @@ def _run_bayesr_and_predict(df: pd.DataFrame, prefix: str, out_dir: Path) -> tup
     return train_scores, test_scores
 
 
+def _cleanup_seed_artifacts(prefix: Path, seed_work_dir: Path) -> None:
+    for ext in (".bed", ".bim", ".fam", ".log", ".tsv", ".vcf"):
+        p = Path(f"{prefix}{ext}")
+        if p.exists():
+            p.unlink(missing_ok=True)
+    if seed_work_dir.exists():
+        shutil.rmtree(seed_work_dir, ignore_errors=True)
+
+
 def _method_preds(train_df: pd.DataFrame, test_df: pd.DataFrame, train_prs: np.ndarray, test_prs: np.ndarray) -> dict[str, np.ndarray]:
     out: dict[str, np.ndarray] = {}
 
@@ -300,23 +310,10 @@ def _method_preds(train_df: pd.DataFrame, test_df: pd.DataFrame, train_prs: np.n
         method.fit(P_train, PC_train, y_train)
         out[name] = method.predict_proba(P_test, PC_test)
 
-    gam_attempts = [
-        dict(n_pcs=2, k_pgs=4, k_pc=4, use_ti=False),
-        dict(n_pcs=1, k_pgs=4, k_pc=4, use_ti=False),
-        dict(n_pcs=1, k_pgs=3, k_pc=3, use_ti=False),
-    ]
-    last_gam_error = None
-    for cfg in gam_attempts:
-        try:
-            gm = GAMMethod(**cfg)
-            gm.fit(P_train, PC_train, y_train)
-            out["gam"] = gm.predict_proba(P_test, PC_test)
-            last_gam_error = None
-            break
-        except Exception as e:
-            last_gam_error = e
-    if last_gam_error is not None:
-        raise RuntimeError(f"mgcv GAM failed for all tiny-sample configs: {last_gam_error}")
+    # Fixed GAM specification for reproducibility.
+    gm = GAMMethod(n_pcs=2, k_pgs=4, k_pc=4, use_ti=False)
+    gm.fit(P_train, PC_train, y_train)
+    out["gam"] = gm.predict_proba(P_test, PC_test)
 
     return out
 
@@ -420,10 +417,16 @@ def main() -> None:
     parser.add_argument("--out", default="sims/results_figure2_local")
     parser.add_argument("--seed", type=int, default=99173)
     parser.add_argument("--cache", default="sims/.cache")
+    parser.add_argument("--n-train-eur", type=int, default=N_TRAIN_EUR)
+    parser.add_argument("--n-test-per-pop", type=int, default=N_TEST_PER_POP)
+    parser.add_argument("--work-root", default=None, help="Directory for heavy transient work files (e.g., RAM disk).")
+    parser.add_argument("--keep-intermediates", action="store_true", help="Keep PLINK/GCTB intermediate files.")
     args = parser.parse_args()
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
+    work_root = Path(args.work_root) if args.work_root else out_dir
+    work_root.mkdir(parents=True, exist_ok=True)
 
     score_path = ensure_pgs003725(Path(args.cache))
     pgs_effects = load_pgs003725_effects(score_path, chr_filter="22")
@@ -432,20 +435,17 @@ def main() -> None:
     prefix = None
     train_scores = None
     test_scores = None
-    last_err = None
-    max_retries = 8
-    for r in range(max_retries):
-        seed = int(args.seed + r * 10_000)
-        try:
-            df = _simulate(seed, pgs_effects, out_dir)
-            prefix = str(out_dir / f"fig2_s{seed}")
-            train_scores, test_scores = _run_bayesr_and_predict(df, prefix, out_dir / f"work_s{seed}")
-            last_err = None
-            break
-        except Exception as e:
-            last_err = e
-    if last_err is not None:
-        raise RuntimeError(f"Figure2 failed after {max_retries} retries: {last_err}")
+    seed = int(args.seed)
+    df = _simulate(
+        seed,
+        pgs_effects,
+        out_dir,
+        n_train_eur=int(args.n_train_eur),
+        n_test_per_pop=int(args.n_test_per_pop),
+    )
+    prefix = str(out_dir / f"fig2_s{seed}")
+    seed_work = work_root / f"work_s{seed}"
+    train_scores, test_scores = _run_bayesr_and_predict(df, prefix, seed_work)
 
     train_df = df[df["group"] == "EUR_train"].copy()
     test_df = df[df["group"].str.endswith("_test")].copy()
@@ -471,6 +471,9 @@ def main() -> None:
     _plot_main(res, out_dir)
     _plot_prs_distribution(test_df, test_scores["PRS"].to_numpy(dtype=float), out_dir)
     _plot_pcs(df, out_dir)
+
+    if not args.keep_intermediates:
+        _cleanup_seed_artifacts(prefix=Path(prefix), seed_work_dir=seed_work)
 
 
 if __name__ == "__main__":

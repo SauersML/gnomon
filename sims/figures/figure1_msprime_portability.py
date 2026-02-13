@@ -109,7 +109,15 @@ def _build_demography(split_gens: int) -> msprime.Demography:
     return dem
 
 
-def _simulate_for_generation(gens: int, seed: int, pgs_effects: np.ndarray, out_dir: Path) -> pd.DataFrame:
+def _simulate_for_generation(
+    gens: int,
+    seed: int,
+    pgs_effects: np.ndarray,
+    out_dir: Path,
+    n_afr: int,
+    n_ooa_train: int,
+    n_ooa_test: int,
+) -> pd.DataFrame:
     prefix = f"fig1_g{gens}_s{seed}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -117,7 +125,7 @@ def _simulate_for_generation(gens: int, seed: int, pgs_effects: np.ndarray, out_
     dem = _build_demography(gens)
 
     ts = msprime.sim_ancestry(
-        samples={"afr": N_AFR, "ooa": N_OOA_TRAIN + N_OOA_TEST},
+        samples={"afr": n_afr, "ooa": n_ooa_train + n_ooa_test},
         demography=dem,
         recombination_rate=recomb_map,
         ploidy=2,
@@ -137,11 +145,11 @@ def _simulate_for_generation(gens: int, seed: int, pgs_effects: np.ndarray, out_
 
     ooa_idx = np.where(pop == "OOA")[0]
     afr_idx = np.where(pop == "AFR")[0]
-    if len(ooa_idx) < (N_OOA_TRAIN + N_OOA_TEST) or len(afr_idx) < N_AFR:
+    if len(ooa_idx) < (n_ooa_train + n_ooa_test) or len(afr_idx) < n_afr:
         raise RuntimeError("Unexpected sample counts after simulation")
 
-    ooa_train_idx = ooa_idx[:N_OOA_TRAIN]
-    ooa_test_idx = ooa_idx[N_OOA_TRAIN:N_OOA_TRAIN + N_OOA_TEST]
+    ooa_train_idx = ooa_idx[:n_ooa_train]
+    ooa_test_idx = ooa_idx[n_ooa_train:n_ooa_train + n_ooa_test]
 
     pca_sites = sample_site_ids_for_maf(ts, a_idx, b_idx, n_sites=2000, maf_min=0.05, seed=seed + 7)
     pcs = pcs_from_sites(ts, a_idx, b_idx, pca_sites, seed=seed + 11, n_components=N_PCS)
@@ -245,6 +253,16 @@ def _prepare_bayesr_files(df: pd.DataFrame, prefix: str, work_dir: Path) -> tupl
     )
 
 
+def _cleanup_generation_artifacts(prefix: Path, work_dir: Path) -> None:
+    # Keep only final aggregated figure outputs in the top-level output directory.
+    for ext in (".bed", ".bim", ".fam", ".log", ".tsv", ".vcf"):
+        p = Path(f"{prefix}{ext}")
+        if p.exists():
+            p.unlink(missing_ok=True)
+    if work_dir.exists():
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
 def _fit_and_predict_methods(train_df: pd.DataFrame, test_df: pd.DataFrame, train_prs: np.ndarray, test_prs: np.ndarray) -> dict[str, np.ndarray]:
     out: dict[str, np.ndarray] = {}
 
@@ -271,23 +289,10 @@ def _fit_and_predict_methods(train_df: pd.DataFrame, test_df: pd.DataFrame, trai
         method.fit(P_train, PC_train, y_train)
         out[name] = method.predict_proba(P_test, PC_test)
 
-    gam_attempts = [
-        dict(n_pcs=2, k_pgs=4, k_pc=4, use_ti=False),
-        dict(n_pcs=1, k_pgs=4, k_pc=4, use_ti=False),
-        dict(n_pcs=1, k_pgs=3, k_pc=3, use_ti=False),
-    ]
-    last_gam_error = None
-    for cfg in gam_attempts:
-        try:
-            gm = GAMMethod(**cfg)
-            gm.fit(P_train, PC_train, y_train)
-            out["gam"] = gm.predict_proba(P_test, PC_test)
-            last_gam_error = None
-            break
-        except Exception as e:
-            last_gam_error = e
-    if last_gam_error is not None:
-        raise RuntimeError(f"mgcv GAM failed for all tiny-sample configs: {last_gam_error}")
+    # Fixed GAM specification for reproducibility.
+    gm = GAMMethod(n_pcs=2, k_pgs=4, k_pc=4, use_ti=False)
+    gm.fit(P_train, PC_train, y_train)
+    out["gam"] = gm.predict_proba(P_test, PC_test)
 
     return out
 
@@ -423,10 +428,17 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=90210)
     parser.add_argument("--gens", nargs="*", type=int, default=DIVERGENCE_GENS)
     parser.add_argument("--cache", default="sims/.cache")
+    parser.add_argument("--n-afr", type=int, default=N_AFR)
+    parser.add_argument("--n-ooa-train", type=int, default=N_OOA_TRAIN)
+    parser.add_argument("--n-ooa-test", type=int, default=N_OOA_TEST)
+    parser.add_argument("--work-root", default=None, help="Directory for heavy transient work files (e.g., RAM disk).")
+    parser.add_argument("--keep-intermediates", action="store_true", help="Keep per-generation PLINK/GCTB intermediate files.")
     args = parser.parse_args()
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
+    work_root = Path(args.work_root) if args.work_root else out_dir
+    work_root.mkdir(parents=True, exist_ok=True)
 
     score_path = ensure_pgs003725(Path(args.cache))
     pgs_effects = load_pgs003725_effects(score_path, chr_filter="22")
@@ -447,25 +459,23 @@ def main() -> None:
         freq_file = None
         train_scores = None
         test_scores = None
-        max_retries = 8
-        last_err = None
-        for r in range(max_retries):
-            seed = base_seed + r * 10_000
-            try:
-                df = _simulate_for_generation(g, seed, pgs_effects, out_dir)
-                prefix = str(out_dir / f"fig1_g{g}_s{seed}")
-                work = out_dir / f"fig1_g{g}_s{seed}_work"
-                train_prefix, test_prefix, train_phen, freq_file = _prepare_bayesr_files(df, prefix, work)
-                br = BayesR()
-                eff_file = br.fit(train_prefix, train_phen, str(work / "bayesr"), covar_file=str(work / "train.covar"))
-                test_scores = br.predict(test_prefix, eff_file, str(work / "bayesr_test"), freq_file=freq_file)
-                train_scores = br.predict(train_prefix, eff_file, str(work / "bayesr_train"), freq_file=freq_file)
-                last_err = None
-                break
-            except Exception as e:
-                last_err = e
-        if last_err is not None:
-            raise RuntimeError(f"Figure1 failed for gens={g} after {max_retries} retries: {last_err}")
+        seed = base_seed
+        df = _simulate_for_generation(
+            g,
+            seed,
+            pgs_effects,
+            out_dir,
+            n_afr=int(args.n_afr),
+            n_ooa_train=int(args.n_ooa_train),
+            n_ooa_test=int(args.n_ooa_test),
+        )
+        prefix = str(out_dir / f"fig1_g{g}_s{seed}")
+        work = work_root / f"fig1_g{g}_s{seed}_work"
+        train_prefix, test_prefix, train_phen, freq_file = _prepare_bayesr_files(df, prefix, work)
+        br = BayesR()
+        eff_file = br.fit(train_prefix, train_phen, str(work / "bayesr"), covar_file=str(work / "train.covar"))
+        test_scores = br.predict(test_prefix, eff_file, str(work / "bayesr_test"), freq_file=freq_file)
+        train_scores = br.predict(train_prefix, eff_file, str(work / "bayesr_train"), freq_file=freq_file)
 
         train_df = df[df["group"] == "OOA_train"].copy()
         test_df = df[df["group"].isin(["OOA_test", "AFR_test"])].copy()
@@ -496,6 +506,9 @@ def main() -> None:
             })
         for _, row in df.iterrows():
             pc_rows.append({"gens": int(g), "group": row["group"], "pc1": float(row["pc1"]), "pc2": float(row["pc2"])})
+
+        if not args.keep_intermediates:
+            _cleanup_generation_artifacts(prefix=Path(prefix), work_dir=Path(work))
 
     res_df = pd.DataFrame(results).sort_values(["method", "gens"]) 
     res_df.to_csv(out_dir / "figure1_auc_ratio.tsv", sep="\t", index=False)

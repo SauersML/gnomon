@@ -9,10 +9,17 @@ import pandas as pd
 import numpy as np
 
 class BayesR:
-    def __init__(self, gctb_path="gctb"):
+    def __init__(self, gctb_path="gctb", threads: int | None = None):
         self.gctb_path = gctb_path
         self.max_snps = 300_000
         self.thin_seed = 42
+        env_threads = os.environ.get("GCTB_THREADS")
+        if threads is None and env_threads is not None:
+            try:
+                threads = int(env_threads)
+            except Exception:
+                threads = None
+        self.threads = int(threads) if threads is not None else 4
 
     def _gctb_diagnostics(self) -> str:
         exe_path = shutil.which(self.gctb_path) or self.gctb_path
@@ -110,7 +117,7 @@ class BayesR:
             "--covar", covar_file,
             "--chain-length", "10000",
             "--burn-in", "2000",
-            "--thread", "4",
+            "--thread", str(self.threads),
             "--out", out_prefix
         ]
 
