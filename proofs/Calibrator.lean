@@ -4423,16 +4423,82 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
   rw [← h_at_1]
   rfl
 
+/-- Linear equivalence between `Fin n → ℝ` and `EuclideanSpace ℝ (Fin n)`. -/
+noncomputable def toEuclidean {n : ℕ} : (Fin n → ℝ) ≃ₗ[ℝ] EuclideanSpace ℝ (Fin n) :=
+  WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+
 /-- Orthogonal projection onto a finite-dimensional subspace. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  0  -- Placeholder; proper implementation would use Mathlib's orthogonalProjection
+  let K_euc := K.map toEuclidean
+  let y_euc := toEuclidean y
+  let proj_euc := Submodule.orthogonalProjection K_euc y_euc
+  toEuclidean.symm (proj_euc : EuclideanSpace ℝ (Fin n))
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
-    iff p minimizes distance to y among all points in K. -/
-lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
-    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist y p ≤ dist y w) :
+    iff p minimizes distance to y among all points in K (in the Euclidean metric). -/
+lemma orthogonalProjection_eq_of_L2_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
+    (h_mem : p ∈ K)
+    (h_min : ∀ w ∈ K, dist (toEuclidean y) (toEuclidean p) ≤ dist (toEuclidean y) (toEuclidean w)) :
     p = orthogonalProjection K y := by
-  sorry
+  let K_euc := K.map toEuclidean
+  let y_euc := toEuclidean y
+  let p_euc := toEuclidean p
+
+  have h_mem_euc : p_euc ∈ K_euc := by
+    simp [K_euc, p_euc, toEuclidean]
+    use p
+    exact ⟨h_mem, rfl⟩
+
+  have h_min_euc : ∀ w_euc ∈ K_euc, dist y_euc p_euc ≤ dist y_euc w_euc := by
+    intro w_euc hw_euc
+    obtain ⟨w, hw_mem, hw_eq⟩ := (Submodule.mem_map).mp hw_euc
+    rw [← hw_eq]
+    exact h_min w hw_mem
+
+  -- This direction is true: if p minimizes distance in a complete subspace of an inner product space,
+  -- it is the orthogonal projection.
+  -- We use the characterization via orthogonality.
+  have h_orth : y_euc - p_euc ∈ K_eucᗮ := by
+    intro w_euc hw_euc
+    -- We need to show inner (y - p, w) = 0.
+    -- We can use the variational argument (linear_coeff_zero_of_quadratic_nonneg).
+    have h_quad : ∀ ε : ℝ, ‖(y_euc - p_euc) - ε • w_euc‖^2 ≥ ‖y_euc - p_euc‖^2 := by
+      intro ε
+      let w_eps := p_euc + ε • w_euc
+      have hw_eps_mem : w_eps ∈ K_euc := K_euc.add_mem h_mem_euc (K_euc.smul_mem ε hw_euc)
+      have h_le := h_min_euc w_eps hw_eps_mem
+      -- dist y p = ‖y - p‖
+      rw [dist_eq_norm] at h_le ⊢
+      have h_eq : y_euc - w_eps = (y_euc - p_euc) - ε • w_euc := by
+        simp [w_eps]; abel
+      rw [← h_eq]
+      exact h_le
+
+    -- Expand ‖(y-p) - εw‖² = ‖y-p‖² - 2ε Re⟪y-p, w⟫ + ε²‖w‖²
+    -- Then use linear_coeff_zero_of_quadratic_nonneg.
+    have h_quad_expand : ∀ ε : ℝ, -2 * ε * inner (y_euc - p_euc) w_euc + ε^2 * ‖w_euc‖^2 ≥ 0 := by
+      intro ε
+      have h_norm_sq : ‖(y_euc - p_euc) - ε • w_euc‖^2 = ‖y_euc - p_euc‖^2 - 2 * inner (y_euc - p_euc) (ε • w_euc) + ‖ε • w_euc‖^2 :=
+        norm_sub_sq_real (y_euc - p_euc) (ε • w_euc)
+      rw [inner_smul_right, norm_smul, Real.norm_eq_abs, sq_abs, mul_pow] at h_norm_sq
+      have h_ge := h_quad ε
+      rw [h_norm_sq] at h_ge
+      linarith
+
+    have h_inner_eq_zero := linear_coeff_zero_of_quadratic_nonneg (-2 * inner (y_euc - p_euc) w_euc) (‖w_euc‖^2) h_quad_expand
+    linarith
+
+  have h_eq_proj : p_euc = Submodule.orthogonalProjection K_euc y_euc := by
+    symm
+    apply Submodule.eq_orthogonalProjection_of_mem_of_inner_eq_zero h_mem_euc h_orth
+
+  -- Map back
+  have h_eq : p = orthogonalProjection K y := by
+    simp [orthogonalProjection, toEuclidean]
+    apply (LinearEquiv.injective toEuclidean)
+    simp [p_euc, h_eq_proj]
+
+  exact h_eq
 
 set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
