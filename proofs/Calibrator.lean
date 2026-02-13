@@ -4425,14 +4425,79 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
 
 /-- Orthogonal projection onto a finite-dimensional subspace. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  0  -- Placeholder; proper implementation would use Mathlib's orthogonalProjection
+  let equiv := @WithLp.linearEquiv 2 ℝ ((Fin n) → ℝ) _ _ _
+  let equiv_symm := LinearEquiv.symm equiv
+  let K_L2 : Submodule ℝ (WithLp 2 ((Fin n) → ℝ)) := K.map equiv_symm
+  let y_L2 : WithLp 2 ((Fin n) → ℝ) := equiv_symm y
+  let p_L2 := Submodule.orthogonalProjection K_L2 y_L2
+  equiv p_L2.1
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
     iff p minimizes distance to y among all points in K. -/
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
-    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist y p ≤ dist y w) :
+    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, l2norm_sq (y - p) ≤ l2norm_sq (y - w)) :
     p = orthogonalProjection K y := by
-  sorry
+  let equiv := @WithLp.linearEquiv 2 ℝ ((Fin n) → ℝ) _ _ _
+  let equiv_symm := LinearEquiv.symm equiv
+  let K_L2 : Submodule ℝ (WithLp 2 ((Fin n) → ℝ)) := K.map equiv_symm
+  let y_L2 : WithLp 2 ((Fin n) → ℝ) := equiv_symm y
+  let p_L2 : WithLp 2 ((Fin n) → ℝ) := equiv_symm p
+
+  -- Transfer mem
+  have h_mem_L2 : p_L2 ∈ K_L2 := by
+    simp [K_L2, p_L2, equiv, equiv_symm]
+    use p
+    simp [h_mem]
+
+  -- Transfer minimization
+  have h_min_L2 : ∀ w_L2 ∈ K_L2, dist y_L2 p_L2 ≤ dist y_L2 w_L2 := by
+    intro w_L2 hw_L2
+    let w := equiv w_L2
+    have hw : w ∈ K := by
+      simp [K_L2, equiv, equiv_symm] at hw_L2
+      rcases hw_L2 with ⟨x, hx, hxw⟩
+      rw [← hxw]
+      simp
+      exact hx
+    specialize h_min w hw
+    -- relate l2norm_sq to dist^2
+    -- l2norm_sq (y - p) = dist (equiv_symm y) (equiv_symm p) ^ 2
+    have h_sq_dist : ∀ a b : Fin n → ℝ, l2norm_sq (a - b) = (dist (equiv_symm a) (equiv_symm b)) ^ 2 := by
+      intro a b
+      rw [dist_eq_norm, sq]
+      -- norm in WithLp 2 is L2 norm.
+      -- l2norm_sq is sum of squares.
+      rw [PiLp.norm_sq_eq_of_L2]
+      unfold l2norm_sq
+      congr
+      ext i
+      simp
+      -- WithLp.equiv maps via id, so components are same
+      rfl
+    rw [h_sq_dist y p, h_sq_dist y w] at h_min
+    apply nonneg_le_nonneg_of_sq_le_sq (dist_nonneg) h_min
+
+  -- Apply orthogonal projection property in L2 space
+  have h_eq_L2 : p_L2 = Submodule.orthogonalProjection K_L2 y_L2 := by
+    apply Submodule.eq_orthogonalProjection_of_dist_le
+    exact h_mem_L2
+    exact h_min_L2
+
+  -- Transfer back
+  dsimp [orthogonalProjection]
+  -- We need to show equiv (equiv_symm p) = equiv (orthogonalProjection ...).1
+  -- h_eq_L2 says equiv_symm p = orthogonalProjection ...
+  -- So RHS is equiv (equiv_symm p).1? No.
+  -- orthogonalProjection returns a subtype element.
+  -- h_eq_L2 is an equality of subtype elements? No, p_L2 is in WithLp.
+  -- Wait, Submodule.orthogonalProjection returns element of K_L2.
+  -- But usually it is coerced to E if type is E.
+  -- `p_L2` type is `WithLp 2 ...`.
+  -- `Submodule.orthogonalProjection` returns `K_L2`.
+  -- So `h_eq_L2` compares `p_L2` with `(Submodule.orthogonalProjection ... : WithLp 2 ...)`?
+  -- Yes, via coercion.
+  rw [← h_eq_L2]
+  simp [equiv, equiv_symm]
 
 set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
@@ -6595,8 +6660,8 @@ lemma optimal_slope_eq_covariance_of_normalized_p_proven
   rw [h_sub] at h_orth_P
   rw [integral_sub] at h_orth_P
   · rw [integral_sub] at h_orth_P
-    · rw [integral_mul_left, hP0] at h_orth_P
-      rw [integral_mul_left, hP2] at h_orth_P
+    · rw [integral_const_mul, hP0] at h_orth_P
+      rw [integral_const_mul, hP2] at h_orth_P
       simp at h_orth_P
       linarith
     · exact hYP
@@ -6741,8 +6806,11 @@ lemma optimal_coefficients_for_additive_dgp_proven
           · simp +decide [ mul_assoc, MeasureTheory.integral_const_mul, MeasureTheory.integral_mul_const, hP0, hC0, h_integral_prod ];
             exact Or.inr ( by simpa only [ mul_comm ] using h_integral_prod.trans ( by simp +decide [ hP0, hC0 ] ) );
           · exact hP_int.mul_const _;
-          · convert hP2_int.mul_const ( model.γₘ₀ ⟨ 0, by norm_num ⟩ ) using 2 ; ring;
-            rfl;
+          · refine (hP2_int.mul_const (model.γₘ₀ 0)).congr ?_
+            apply ae_of_all
+            intro x
+            simp
+            ring
         · simpa only [ sq ] using hP2_int;
         · exact MeasureTheory.Integrable.const_mul ( by simpa only [ mul_comm ] using hPC_int ) _;
         · refine' MeasureTheory.Integrable.add _ _;
