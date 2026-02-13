@@ -311,7 +311,7 @@ def _method_preds(train_df: pd.DataFrame, test_df: pd.DataFrame, train_prs: np.n
         out[name] = method.predict_proba(P_test, PC_test)
 
     # Fixed GAM specification for reproducibility.
-    gm = GAMMethod(n_pcs=2, k_pgs=4, k_pc=4, use_ti=False)
+    gm = GAMMethod(n_pcs=3, k_pgs=4, k_pc=4, use_ti=False)
     gm.fit(P_train, PC_train, y_train)
     out["gam"] = gm.predict_proba(P_test, PC_test)
 

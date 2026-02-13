@@ -42,10 +42,6 @@ def _jobs() -> int:
     return max(1, int(os.environ.get("SIMS_JOBS", max(1, (os.cpu_count() or 8) // 2))))
 
 
-def _install_tools_with_conda() -> bool:
-    return os.environ.get("SIMS_INSTALL_TOOLS_WITH_CONDA", "0").strip().lower() in {"1", "true", "yes"}
-
-
 def _keep_intermediates() -> bool:
     return os.environ.get("SIMS_KEEP_INTERMEDIATES", "0").strip().lower() in {"1", "true", "yes"}
 
@@ -93,20 +89,23 @@ def setup_env() -> None:
         ]
     )
 
-    if _exists("Rscript"):
-        _run(
-            [
-                "Rscript",
-                "-e",
-                'if (!requireNamespace("mgcv", quietly=TRUE)) install.packages("mgcv", repos="https://cloud.r-project.org")',
-            ]
-        )
-    else:
-        raise RuntimeError("Rscript not found. mgcv is required and must be installed.")
+    mamba = shutil.which("micromamba") or shutil.which("mamba") or shutil.which("conda")
+
+    if not _exists("Rscript"):
+        if not mamba:
+            raise RuntimeError("Rscript not found and no conda/mamba executable was found on PATH.")
+        _run([mamba, "install", "-y", "-c", "conda-forge", "r-base", "r-mgcv"])
+
+    _run(
+        [
+            "Rscript",
+            "-e",
+            'if (!requireNamespace("mgcv", quietly=TRUE)) install.packages("mgcv", repos="https://cloud.r-project.org")',
+        ]
+    )
 
     if not (_exists("plink2") and _exists("gctb")):
-        mamba = shutil.which("micromamba") or shutil.which("mamba") or shutil.which("conda")
-        if mamba and _install_tools_with_conda():
+        if mamba:
             _run(
                 [
                     mamba,
@@ -124,8 +123,8 @@ def setup_env() -> None:
             )
         else:
             raise RuntimeError(
-                "plink2 and/or gctb missing. Install them, or set SIMS_INSTALL_TOOLS_WITH_CONDA=1 "
-                "with a conda/mamba executable on PATH."
+                "plink2 and/or gctb missing and no conda/mamba executable was found on PATH. "
+                "Install micromamba/mamba/conda or preinstall plink2 and gctb."
             )
 
     for tool in ["python3", "plink2", "gctb", "Rscript"]:
