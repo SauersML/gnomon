@@ -4425,14 +4425,63 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
 
 /-- Orthogonal projection onto a finite-dimensional subspace. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  0  -- Placeholder; proper implementation would use Mathlib's orthogonalProjection
+  let L := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K' : Submodule ℝ (WithLp 2 (Fin n → ℝ)) := K.map (LinearEquiv.symm L)
+  let y' : WithLp 2 (Fin n → ℝ) := LinearEquiv.symm L y
+  let p' := Submodule.orthogonalProjection K' y'
+  L p'.val
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
     iff p minimizes distance to y among all points in K. -/
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
-    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist y p ≤ dist y w) :
+    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, l2norm_sq (y - p) ≤ l2norm_sq (y - w)) :
     p = orthogonalProjection K y := by
-  sorry
+  let L := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K' : Submodule ℝ (WithLp 2 (Fin n → ℝ)) := K.map (LinearEquiv.symm L)
+  let y' : WithLp 2 (Fin n → ℝ) := LinearEquiv.symm L y
+  let p' : WithLp 2 (Fin n → ℝ) := LinearEquiv.symm L p
+
+  have h_mem' : p' ∈ K' := by
+    rw [Submodule.mem_map]
+    refine ⟨p, h_mem, rfl⟩
+
+  have h_min' : ∀ w' ∈ K', dist y' p' ≤ dist y' w' := by
+    intro w' hw'_in
+    let w := L w'
+    have hw : w ∈ K := by
+      rw [Submodule.mem_map] at hw'_in
+      obtain ⟨x, hx, hx_eq⟩ := hw'_in
+      rw [← hx_eq]
+      simp
+      exact hx
+
+    have h_ineq := h_min w hw
+
+    have h_norm_sq : ∀ a b : Fin n → ℝ, l2norm_sq (a - b) = (dist (LinearEquiv.symm L a) (LinearEquiv.symm L b))^2 := by
+      intro a b
+      rw [dist_eq_norm]
+      rw [← _root_.map_sub (LinearEquiv.symm L)]
+      let v := LinearEquiv.symm L (a - b)
+      rw [sq, ← PiLp.norm_sq_eq_of_L2]
+      congr
+      ext i
+      simp [l2norm_sq, v]
+      rfl
+
+    rw [h_norm_sq, h_norm_sq] at h_ineq
+    refine (mul_self_le_mul_self_iff (dist_nonneg) (dist_nonneg)).mp h_ineq
+
+  let p'_sub : K' := ⟨p', h_mem'⟩
+  have h_eq' : p'_sub = Submodule.orthogonalProjection K' y' := by
+    apply Submodule.eq_orthogonalProjection_of_dist_le
+    intro z
+    exact h_min' z.val z.2
+
+  rw [orthogonalProjection]
+  have h_val_eq : (Submodule.orthogonalProjection K' y').val = p' := by
+    rw [← h_eq']
+  rw [h_val_eq]
+  simp
 
 set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
