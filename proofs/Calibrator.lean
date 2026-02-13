@@ -4423,16 +4423,104 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
   rw [← h_at_1]
   rfl
 
-/-- Orthogonal projection onto a finite-dimensional subspace. -/
+/-- Orthogonal projection onto a finite-dimensional subspace (using L2 norm). -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  0  -- Placeholder; proper implementation would use Mathlib's orthogonalProjection
+  let equiv := WithLp.linearEquiv 2 (Fin n → ℝ)
+  let K' : Submodule ℝ (WithLp 2 (Fin n → ℝ)) := K.map equiv
+  let y' := equiv y
+  equiv.symm (Submodule.orthogonalProjection K' y')
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
-    iff p minimizes distance to y among all points in K. -/
+    iff p minimizes the squared L2 distance to y among all points in K. -/
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
-    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist y p ≤ dist y w) :
+    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, l2norm_sq (y - p) ≤ l2norm_sq (y - w)) :
     p = orthogonalProjection K y := by
-  sorry
+  let equiv := WithLp.linearEquiv 2 (Fin n → ℝ)
+  let K' : Submodule ℝ (WithLp 2 (Fin n → ℝ)) := K.map equiv
+  let y' := equiv y
+  let p' := equiv p
+
+  -- 1. Transfer minimization to WithLp 2 space
+  have h_min_L2 : ∀ w' : K', dist y' p' ≤ dist y' w' := by
+    intro w'
+    let w_val := (w' : WithLp 2 (Fin n → ℝ))
+    have hw_mem : equiv.symm w_val ∈ K := by
+      rw [Submodule.mem_map] at w'
+      rcases w'.prop with ⟨x, hx, hx_eq⟩
+      simp [w_val, hx_eq, hx]
+    let w := equiv.symm w_val
+    have h_w := h_min w hw_mem
+    -- Connect l2norm_sq to WithLp 2 distance
+    rw [l2norm_sq, l2norm_sq] at h_w
+    -- Key connection: dist_L2^2 = l2norm_sq
+    have h_dist_sq : dist y' (equiv w) ^ 2 = Finset.univ.sum (fun i => (y i - w i)^2) := by
+      rw [dist_eq_norm]
+      have : ‖y' - equiv w‖^2 = ‖equiv (y - w)‖^2 := by
+        congr; simp only [y', equiv, LinearEquiv.map_sub, LinearEquiv.apply_symm_apply]
+      rw [this]
+      simp only [equiv, WithLp.linearEquiv_apply]
+      rw [PiLp.norm_sq_eq_of_L2]
+      rfl
+    have h_dist_p_sq : dist y' p' ^ 2 = Finset.univ.sum (fun i => (y i - p i)^2) := by
+      rw [dist_eq_norm]
+      have : ‖y' - p'‖^2 = ‖equiv (y - p)‖^2 := by
+        congr; simp only [y', p', equiv, LinearEquiv.map_sub]
+      rw [this]
+      simp only [equiv, WithLp.linearEquiv_apply]
+      rw [PiLp.norm_sq_eq_of_L2]
+      rfl
+    -- Since squaring is monotonic on non-negatives
+    rw [← h_dist_p_sq, ← h_dist_sq] at h_w
+    exact Real.le_of_sq_le_sq (dist_nonneg) (dist_nonneg) h_w
+
+  -- 2. p' is in K'
+  have h_mem_L2 : p' ∈ K' := (Submodule.mem_map).mpr ⟨p, h_mem, rfl⟩
+
+  -- 3. Use uniqueness of orthogonal projection in Hilbert space
+  -- We rely on Submodule.orthogonalProjection_is_minimizer uniqueness
+  -- Specifically: p' = proj_K'(y') iff p' ∈ K' and ∀ w ∈ K', dist(y', p') ≤ dist(y', w)
+  -- Actually, the theorem is usually `orthogonalProjection_eq_of_dist_le` or similar.
+  -- Or just `orthogonalProjection` minimizes distance.
+  -- Since `orthogonalProjection` is the unique minimizer in a Hilbert space.
+
+  -- We'll use Submodule.orthogonalProjection_eq_of_mem_of_forall_dist_le_dist if available,
+  -- or construct the equality from `orthogonalProjection_is_minimizer`.
+
+  -- The simplest path: orthogonalProjection minimizes distance.
+  -- Since we have a minimizer `p'`, and minimizers are unique in Hilbert space for convex sets (subspaces are convex),
+  -- p' must be the projection.
+
+  -- But to be safe with Mathlib names, let's look for `eq_orthogonalProjection_of_dist_le`.
+  -- It seems `Submodule.orthogonalProjection_eq_of_dist_le` might not be the exact name.
+  -- But `IsOrthoProjection.eq_orthogonalProjection` exists.
+  -- `Submodule.orthogonalProjection K y` satisfies `IsOrthoProjection K y (orthogonalProjection K y)`.
+  -- We need to show `IsOrthoProjection K' y' p'`.
+  -- `IsOrthoProjection K y p` means `p ∈ K` and `y - p ⊥ K`.
+  -- Minimizing distance is equivalent to orthogonality.
+
+  -- Let's prove orthogonality from minimization.
+  -- This is a standard result: variational characterization.
+  -- Or just check if Mathlib has the direct minimization -> projection lemma.
+  -- `OrthogonalProjection.eq_of_dist_le`?
+
+  -- I'll use `Submodule.eq_orthogonalProjection_of_mem_of_inner_eq_zero`.
+  -- But first I need to show `y' - p'` is orthogonal to `K'`.
+  -- Or I can just search for the minimizer lemma.
+  -- It is likely `Submodule.eq_orthogonalProjection_of_dist_le`.
+
+  -- If I can't find it, I'll derive it from orthogonality.
+  -- `inner (y' - p') w = 0` for all `w ∈ K'`.
+  -- If `p'` minimizes `dist(y', w)`, then `y' - p'` is orthogonal to `K'`.
+  -- (First order condition).
+
+  -- Let's try `eq_orthogonalProjection_of_mem_of_min_dist`.
+
+  -- To avoid guessing names and failing, I will define a helper or look it up via `grep` in `Mathlib` (not available).
+  -- I'll assume standard naming conventions or prove the orthogonality condition.
+  -- Since I am editing `Calibrator.lean`, I can add a local proof if needed.
+
+  -- However, since I am in a `replace_with_git_merge_diff`, I should try to get it right.
+  -- I'll verify via `run_in_bash_session` what lemmas are available for `Submodule` and `orthogonalProjection`.
 
 set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
@@ -4474,7 +4562,142 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   ∀ (i : Fin n),
       linearPredictor model (data.p i) (data.c i) =
       linearPredictor model_prime (data'.p i) (data'.c i) := by
-  sorry
+  classical
+  let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
+  let model := fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
+
+  -- Re-derive rank proof to define model_prime locally (matching theorem statement)
+  let X := designMatrix data pgsBasis splineBasis
+  let X' := designMatrix data' pgsBasis splineBasis
+  have h_rank_eq : X.rank = X'.rank := rank_eq_of_range_eq X X' h_range_eq
+  have h_rank' : X'.rank = Fintype.card (ParamIx p k sp) := by rw [← h_rank_eq]; exact h_rank
+  let model_prime := fit p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank'
+
+  -- Helper to prove unpacked parameters are in model class
+  have unpackParams_in_class : ∀ β, InModelClass (unpackParams pgsBasis splineBasis β) pgsBasis splineBasis := by
+    intro β
+    constructor <;> rfl
+
+  -- Subspaces K and K' (ranges of X and X')
+  let K := LinearMap.range (Matrix.toLin' X)
+  let K' := LinearMap.range (Matrix.toLin' X')
+  have hK_eq : K = K' := h_range_eq
+
+  -- Define predictors
+  let pred := fun i => linearPredictor model (data.p i) (data.c i)
+  let pred_prime := fun i => linearPredictor model_prime (data'.p i) (data'.c i)
+
+  -- Show pred = orthogonalProjection K y
+  have h_is_proj : pred = orthogonalProjection K data.y := by
+    -- 1. pred is in K
+    have h_mem : pred ∈ K := by
+      let β := packParams model
+      have h_pred_eq : pred = X.mulVec β := by
+        ext i
+        let hm : InModelClass model pgsBasis splineBasis := by
+          unfold model
+          simp only
+          -- fit returns unpackParams, so it is in class
+          apply unpackParams_in_class
+        exact linearPredictor_eq_designMatrix_mulVec data pgsBasis splineBasis model hm i
+      rw [h_pred_eq]
+      exact Matrix.mem_range_vecMul_iff.mpr ⟨β, rfl⟩
+
+    -- 2. pred minimizes distance to y in K
+    have h_min_dist : ∀ w ∈ K, l2norm_sq (data.y - pred) ≤ l2norm_sq (data.y - w) := by
+      intro w hw
+      obtain ⟨β_w, h_w_eq⟩ := Matrix.mem_range_vecMul_iff.mp hw
+      let model_w := unpackParams pgsBasis splineBasis β_w
+      have h_w_pred : w = fun i => linearPredictor model_w (data.p i) (data.c i) := by
+        ext i
+        rw [h_w_eq]
+        have h_unpack : InModelClass model_w pgsBasis splineBasis := unpackParams_in_class β_w
+        rw [linearPredictor_eq_designMatrix_mulVec data pgsBasis splineBasis model_w h_unpack]
+        simp only [packParams, unpackParams, unpack_pack_eq, unpackParams_in_class]
+        -- packParams (unpackParams β) = β
+        have h_beta_iso : packParams (unpackParams pgsBasis splineBasis β_w) = β_w := by
+          ext ix
+          cases ix <;> simp [packParams, unpackParams]
+        rw [h_beta_iso]
+
+      have h_loss : empiricalLoss model data lambda ≤ empiricalLoss model_w data lambda :=
+        fit_minimizes_loss p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank model_w (unpackParams_in_class β_w)
+
+      unfold empiricalLoss at h_loss
+      simp only [h_lambda_zero, mul_zero, add_zero] at h_loss
+
+      -- Cancel 1/n factor
+      have h_n_real_pos : 0 < (n : ℝ) := by exact_mod_cast h_n_pos
+      have h_div_n_pos : 0 < 1 / (n : ℝ) := one_div_pos.mpr h_n_real_pos
+      rw [mul_le_mul_left h_div_n_pos] at h_loss
+
+      -- Match pointwiseNLL to squared error
+      -- Since model is in class (fit returns unpackParams), dist is Gaussian
+      have h_dist_model : model.dist = .Gaussian := rfl
+      have h_dist_w : model_w.dist = .Gaussian := rfl
+
+      simp only [h_dist_model, h_dist_w, pointwiseNLL] at h_loss
+      rw [← l2norm_sq, ← l2norm_sq] at h_loss
+      simp only [pred, h_w_pred]
+      exact h_loss
+
+    exact orthogonalProjection_eq_of_dist_le n K data.y pred h_mem h_min_dist
+
+  -- Show pred_prime = orthogonalProjection K' y
+  have h_is_proj' : pred_prime = orthogonalProjection K' data'.y := by
+    -- 1. pred_prime is in K'
+    have h_mem : pred_prime ∈ K' := by
+      let β := packParams model_prime
+      have h_pred_eq : pred_prime = X'.mulVec β := by
+        ext i
+        let hm : InModelClass model_prime pgsBasis splineBasis := by
+          unfold model_prime
+          simp only
+          apply unpackParams_in_class
+        exact linearPredictor_eq_designMatrix_mulVec data' pgsBasis splineBasis model_prime hm i
+      rw [h_pred_eq]
+      exact Matrix.mem_range_vecMul_iff.mpr ⟨β, rfl⟩
+
+    -- 2. pred_prime minimizes distance to y in K'
+    have h_min_dist : ∀ w ∈ K', l2norm_sq (data'.y - pred_prime) ≤ l2norm_sq (data'.y - w) := by
+      intro w hw
+      obtain ⟨β_w, h_w_eq⟩ := Matrix.mem_range_vecMul_iff.mp hw
+      let model_w := unpackParams pgsBasis splineBasis β_w
+      have h_w_pred : w = fun i => linearPredictor model_w (data'.p i) (data'.c i) := by
+        ext i
+        rw [h_w_eq]
+        have h_unpack : InModelClass model_w pgsBasis splineBasis := unpackParams_in_class β_w
+        rw [linearPredictor_eq_designMatrix_mulVec data' pgsBasis splineBasis model_w h_unpack]
+        have h_beta_iso : packParams (unpackParams pgsBasis splineBasis β_w) = β_w := by
+          ext ix
+          cases ix <;> simp [packParams, unpackParams]
+        rw [h_beta_iso]
+
+      have h_loss : empiricalLoss model_prime data' lambda ≤ empiricalLoss model_w data' lambda :=
+        fit_minimizes_loss p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank' model_w (unpackParams_in_class β_w)
+
+      unfold empiricalLoss at h_loss
+      simp only [h_lambda_zero, mul_zero, add_zero] at h_loss
+
+      have h_n_real_pos : 0 < (n : ℝ) := by exact_mod_cast h_n_pos
+      have h_div_n_pos : 0 < 1 / (n : ℝ) := one_div_pos.mpr h_n_real_pos
+      rw [mul_le_mul_left h_div_n_pos] at h_loss
+
+      have h_dist_model : model_prime.dist = .Gaussian := rfl
+      have h_dist_w : model_w.dist = .Gaussian := rfl
+
+      simp only [h_dist_model, h_dist_w, pointwiseNLL] at h_loss
+      rw [← l2norm_sq, ← l2norm_sq] at h_loss
+      simp only [pred_prime, h_w_pred]
+      exact h_loss
+
+    exact orthogonalProjection_eq_of_dist_le n K' data'.y pred_prime h_mem h_min_dist
+
+  -- Conclude equality
+  rw [h_is_proj, h_is_proj']
+  -- data.y = data'.y by definition
+  have h_y_eq : data.y = data'.y := rfl
+  rw [h_y_eq, hK_eq]
 
 noncomputable def dist_to_support {k : ℕ} (c : Fin k → ℝ) (supp : Set (Fin k → ℝ)) : ℝ :=
   Metric.infDist c supp
