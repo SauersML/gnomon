@@ -4423,16 +4423,50 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
   rw [← h_at_1]
   rfl
 
+/-- Convert to Euclidean space (L2 structure). -/
+noncomputable def toEuclidean {n : ℕ} (v : Fin n → ℝ) : EuclideanSpace ℝ (Fin n) :=
+  (WithLp.linearEquiv 2 ℝ (Fin n → ℝ)).symm v
+
+/-- Convert from Euclidean space. -/
+noncomputable def fromEuclidean {n : ℕ} (v : EuclideanSpace ℝ (Fin n)) : Fin n → ℝ :=
+  WithLp.linearEquiv 2 ℝ (Fin n → ℝ) v
+
 /-- Orthogonal projection onto a finite-dimensional subspace. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  0  -- Placeholder; proper implementation would use Mathlib's orthogonalProjection
+  let equiv := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K_L2 : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map equiv.symm
+  let y_L2 := equiv.symm y
+  let proj_L2 := Submodule.orthogonalProjection K_L2 y_L2
+  fromEuclidean (proj_L2 : EuclideanSpace ℝ (Fin n))
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
     iff p minimizes distance to y among all points in K. -/
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
-    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist y p ≤ dist y w) :
+    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist (toEuclidean y) (toEuclidean p) ≤ dist (toEuclidean y) (toEuclidean w)) :
     p = orthogonalProjection K y := by
-  sorry
+  let equiv := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K_L2 : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map equiv.symm
+  let y_L2 := equiv.symm y
+  let p_L2 := equiv.symm p
+  have h_mem_L2 : p_L2 ∈ K_L2 := by
+    rw [Submodule.mem_map]
+    refine ⟨p, h_mem, rfl⟩
+  have h_min_L2 : ∀ w_L2 ∈ K_L2, dist y_L2 p_L2 ≤ dist y_L2 w_L2 := by
+    intro w_L2 hw_L2
+    rw [Submodule.mem_map] at hw_L2
+    obtain ⟨w, hw, rfl⟩ := hw_L2
+    specialize h_min w hw
+    simp [y_L2, p_L2, toEuclidean] at *
+    exact h_min
+  have h_eq_L2 : p_L2 = Submodule.orthogonalProjection K_L2 y_L2 := by
+    apply Eq.symm
+    -- Uniqueness of orthogonal projection as distance minimizer in a Hilbert space
+    -- Ideally: apply Submodule.eq_orthogonalProjection_of_dist_le
+    sorry
+  rw [orthogonalProjection]
+  simp only [fromEuclidean]
+  rw [← h_eq_L2]
+  exact equiv.apply_symm_apply p
 
 set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
