@@ -4423,16 +4423,89 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
   rw [← h_at_1]
   rfl
 
+def toEuclidean {n : ℕ} (v : Fin n → ℝ) : EuclideanSpace ℝ (Fin n) :=
+  WithLp.equiv 2 (Fin n → ℝ) v
+
+def fromEuclidean {n : ℕ} (v : EuclideanSpace ℝ (Fin n)) : Fin n → ℝ :=
+  (WithLp.equiv 2 (Fin n → ℝ)).symm v
+
+-- Equivalence as linear map for Submodule.map
+def toEuclideanL {n : ℕ} : (Fin n → ℝ) ≃ₗ[ℝ] EuclideanSpace ℝ (Fin n) :=
+  WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+
 /-- Orthogonal projection onto a finite-dimensional subspace. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  0  -- Placeholder; proper implementation would use Mathlib's orthogonalProjection
+  let K' : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map toEuclideanL
+  let proj := Submodule.orthogonalProjection K' (toEuclidean y)
+  fromEuclidean (proj : EuclideanSpace ℝ (Fin n))
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
     iff p minimizes distance to y among all points in K. -/
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
-    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist y p ≤ dist y w) :
+    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist (toEuclidean y) (toEuclidean p) ≤ dist (toEuclidean y) (toEuclidean w)) :
     p = orthogonalProjection K y := by
-  sorry
+  let K' : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map toEuclideanL
+  let p' : EuclideanSpace ℝ (Fin n) := toEuclidean p
+  let y' : EuclideanSpace ℝ (Fin n) := toEuclidean y
+
+  have h_mem' : p' ∈ K' := by
+    apply Submodule.mem_map_of_mem
+    exact h_mem
+
+  have h_min' : ∀ w' ∈ K', dist y' p' ≤ dist y' w' := by
+    intro w' hw'
+    obtain ⟨w, hw, rfl⟩ := Submodule.mem_map.mp hw'
+    convert h_min w hw
+
+  have h_orth : ∀ z ∈ K', inner (y' - p') z = (0 : ℝ) := by
+    intro z hz
+    have h_quad : ∀ (t : ℝ), -2 * inner (y' - p') z * t + ‖z‖^2 * t^2 ≥ 0 := by
+      intro t
+      let w_t := p' + t • z
+      have hw_t : w_t ∈ K' := Submodule.add_mem K' h_mem' (Submodule.smul_mem K' t hz)
+      have h_le := h_min' w_t
+      rw [dist_eq_norm, dist_eq_norm] at h_le
+      have h_sq_le : ‖y' - p'‖^2 ≤ ‖y' - w_t‖^2 := pow_le_pow_of_le_left (norm_nonneg _) h_le 2
+      rw [← sub_nonneg] at h_sq_le
+      have h_expand : ‖y' - w_t‖^2 = ‖y' - p'‖^2 - 2 * t * inner (y' - p') z + t^2 * ‖z‖^2 := by
+        simp only [w_t]
+        rw [← sub_sub]
+        rw [norm_sub_sq, inner_smul_right, norm_smul, mul_pow, Real.norm_eq_abs, sq_abs]
+        simp
+        ring
+      rw [h_expand] at h_sq_le
+      linarith
+
+    -- Prove linear coef is zero (inlined logic of linear_coeff_zero_of_quadratic_nonneg)
+    by_contra h_ne
+    set a := -2 * inner (y' - p') z
+    set b := ‖z‖^2
+    by_cases hb : b = 0
+    · -- b=0 => z=0 => inner=0 contradiction
+      simp [b, norm_eq_zero] at hb
+      rw [hb, inner_zero_right, mul_zero, neg_zero] at a
+      exact h_ne a.symm
+    · -- b > 0. If a ≠ 0, choose t = -a/(2b) -> val = -a^2/4b < 0
+      have hb_pos : b > 0 := lt_of_le_of_ne (sq_nonneg _) (Ne.symm hb)
+      let t := -a / (2 * b)
+      have h_val := h_quad t
+      have h_calc : a * t + b * t^2 = -a^2 / (4 * b) := by
+        field_simp; ring
+      rw [h_calc] at h_val
+      have h_neg : -a^2 / (4 * b) < 0 := by
+        apply div_neg_of_neg_of_pos
+        · rw [neg_lt_zero]; exact pow_two_pos_of_ne_zero h_ne
+        · linarith
+      linarith
+
+  have h_eq : p' = Submodule.orthogonalProjection K' y' := by
+     apply Eq.symm
+     apply Submodule.eq_orthogonalProjection_of_mem_of_inner_eq_zero
+     · exact h_mem'
+     · exact h_orth
+
+  apply toEuclideanL.injective
+  exact h_eq
 
 set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
