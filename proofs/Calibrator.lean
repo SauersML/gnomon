@@ -4423,16 +4423,77 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
   rw [← h_at_1]
   rfl
 
-/-- Orthogonal projection onto a finite-dimensional subspace. -/
+/-- Helper: conversion to L2 space (EuclideanSpace). -/
+noncomputable def toEuclidean {n : ℕ} (v : Fin n → ℝ) : EuclideanSpace ℝ (Fin n) :=
+  (WithLp.linearEquiv 2 ℝ (Fin n → ℝ)).symm v
+
+/-- Helper: conversion from L2 space. -/
+noncomputable def fromEuclidean {n : ℕ} (v : EuclideanSpace ℝ (Fin n)) : Fin n → ℝ :=
+  (WithLp.linearEquiv 2 ℝ (Fin n → ℝ)) v
+
+/-- Orthogonal projection onto a finite-dimensional subspace (L2 geometry).
+    This maps the problem to EuclideanSpace, projects, and maps back. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  0  -- Placeholder; proper implementation would use Mathlib's orthogonalProjection
+  let equiv := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K_E : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map equiv.symm.toLinearMap
+  let y_E : EuclideanSpace ℝ (Fin n) := toEuclidean y
+  -- Project onto K_E (which is complete since finite dimensional)
+  let p_E := Submodule.orthogonalProjection K_E y_E
+  fromEuclidean p_E
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
-    iff p minimizes distance to y among all points in K. -/
+    iff p minimizes L2 distance to y among all points in K. -/
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
-    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist y p ≤ dist y w) :
+    (h_mem : p ∈ K)
+    (h_min : ∀ w ∈ K, dist (toEuclidean y) (toEuclidean p) ≤ dist (toEuclidean y) (toEuclidean w)) :
     p = orthogonalProjection K y := by
-  sorry
+  let equiv := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K_E := K.map equiv.symm.toLinearMap
+  let y_E := toEuclidean y
+  let p_E := toEuclidean p
+
+  have h_mem_E : p_E ∈ K_E := by
+    simp [K_E, p_E, toEuclidean]
+    use p, h_mem
+    simp
+
+  have h_min_E : ∀ w_E ∈ K_E, dist y_E p_E ≤ dist y_E w_E := by
+    intro w_E hw_E
+    obtain ⟨w, hw, rfl⟩ := (Submodule.mem_map _ _).mp hw_E
+    specialize h_min w hw
+    exact h_min
+
+  -- Variational Argument: show <y_E - p_E, w_E> = 0 for all w_E in K_E
+  have h_orth : ∀ w_E ∈ K_E, inner (y_E - p_E) w_E = (0 : ℝ) := by
+    intro w_E hw_E
+    apply linear_coeff_zero_of_quadratic_nonneg (-2 * inner (y_E - p_E) w_E) (inner w_E w_E)
+    intro t
+    let diff := dist y_E (p_E + t • w_E) ^ 2 - dist y_E p_E ^ 2
+    have h_nonneg : 0 ≤ diff := by
+      have h_in_K : p_E + t • w_E ∈ K_E := K_E.add_mem h_mem_E (K_E.smul_mem t hw_E)
+      have h_dist_le := h_min_E (p_E + t • w_E) h_in_K
+      nlinarith [dist_nonneg]
+    have h_expand : diff = (-2 * inner (y_E - p_E) w_E) * t + (inner w_E w_E) * t^2 := by
+      simp only [dist_eq_norm, norm_sub_rev, norm_sq_eq_inner]
+      rw [inner_sub_right, inner_sub_left, inner_sub_left]
+      simp [inner_smul_left, inner_smul_right, real_inner_comm]
+      ring
+    rw [← h_expand]
+    exact h_nonneg
+
+  -- Since y_E - p_E is orthogonal to K_E, p_E is the orthogonal projection
+  have h_eq_E : (Submodule.orthogonalProjection K_E y_E : EuclideanSpace ℝ (Fin n)) = p_E := by
+    symm
+    rw [← Submodule.eq_orthogonalProjection_of_mem_of_inner_eq_zero h_mem_E h_orth]
+    rfl
+
+  -- Map back to original space
+  have h_eq : p = orthogonalProjection K y := by
+    unfold orthogonalProjection
+    simp [fromEuclidean, toEuclidean]
+    rw [h_eq_E]
+    simp
+  exact h_eq
 
 set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
