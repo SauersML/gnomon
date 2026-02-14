@@ -4423,16 +4423,56 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
   rw [← h_at_1]
   rfl
 
+noncomputable def fromEuclidean {n : ℕ} : EuclideanSpace ℝ (Fin n) ≃ₗ[ℝ] (Fin n → ℝ) :=
+  WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+
+noncomputable def toEuclidean {n : ℕ} : (Fin n → ℝ) ≃ₗ[ℝ] EuclideanSpace ℝ (Fin n) :=
+  fromEuclidean.symm
+
 /-- Orthogonal projection onto a finite-dimensional subspace. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  0  -- Placeholder; proper implementation would use Mathlib's orthogonalProjection
+  fromEuclidean ((Submodule.orthogonalProjection (K.map (toEuclidean (n := n)).toLinearMap) (toEuclidean y)).1)
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
-    iff p minimizes distance to y among all points in K. -/
+    iff p minimizes L2 distance to y among all points in K. -/
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
-    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist y p ≤ dist y w) :
+    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist (toEuclidean y) (toEuclidean p) ≤ dist (toEuclidean y) (toEuclidean w)) :
     p = orthogonalProjection K y := by
-  sorry
+  let E := EuclideanSpace ℝ (Fin n)
+  let y' := toEuclidean y
+  let p' := toEuclidean p
+  let f : (Fin n → ℝ) →ₗ[ℝ] E := (toEuclidean (n := n)).toLinearMap
+  let K' : Submodule ℝ E := K.map f
+
+  -- Rewrite hypothesis in terms of E
+  have h_min' : ∀ w' ∈ K', dist y' p' ≤ dist y' w' := by
+    intro w' hw'
+    rcases (Submodule.mem_map).mp hw' with ⟨w, hw, rfl⟩
+    convert h_min w hw
+    rfl
+
+  have hp'_mem : p' ∈ K' := Submodule.mem_map_of_mem h_mem
+
+  have h_orth : ∀ w' ∈ K', @inner ℝ _ _ (y' - p') w' = (0 : ℝ) := by
+    intro w' hw'
+    have h_quad : ∀ ε : ℝ, ‖w'‖^2 * ε^2 + (-2 * @inner ℝ _ _ (y' - p') w') * ε ≥ 0 := by
+      intro ε
+      let v' := p' + ε • w'
+      have hv' : v' ∈ K' := Submodule.add_mem K' hp'_mem (Submodule.smul_mem K' ε hw')
+      have h_le := h_min' v' hv'
+      rw [dist_eq_norm, dist_eq_norm] at h_le
+      have h_sq_le : ‖y' - p'‖^2 ≤ ‖y' - v'‖^2 := sq_le_sq' (norm_nonneg _) h_le
+      rw [show y' - v' = (y' - p') - ε • w' by simp [v']; abel] at h_sq_le
+      rw [norm_sub_sq_real] at h_sq_le
+      simp only [inner_smul_right, IsROrC.conj_to_real, norm_smul, Real.norm_eq_abs, mul_pow] at h_sq_le
+      rw [sq_abs] at h_sq_le
+      nlinarith
+    exact linear_coeff_zero_of_quadratic_nonneg _ _ h_quad
+
+  apply toEuclidean.injective
+  rw [orthogonalProjection]
+  simp only [fromEuclidean, LinearEquiv.symm_apply_apply]
+  exact Submodule.eq_orthogonalProjection_of_mem_of_inner_eq_zero hp'_mem h_orth
 
 set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
@@ -6595,8 +6635,8 @@ lemma optimal_slope_eq_covariance_of_normalized_p_proven
   rw [h_sub] at h_orth_P
   rw [integral_sub] at h_orth_P
   · rw [integral_sub] at h_orth_P
-    · rw [integral_mul_left, hP0] at h_orth_P
-      rw [integral_mul_left, hP2] at h_orth_P
+    · rw [integral_const_mul, hP0] at h_orth_P
+      rw [integral_const_mul, hP2] at h_orth_P
       simp at h_orth_P
       linarith
     · exact hYP
@@ -6748,8 +6788,13 @@ lemma optimal_coefficients_for_additive_dgp_proven
         · refine' MeasureTheory.Integrable.add _ _;
           · simpa only [ sq ] using hP2_int;
           · exact MeasureTheory.Integrable.const_mul ( by simpa only [ mul_comm ] using hPC_int ) _;
-        · ring_nf;
-          exact MeasureTheory.Integrable.add ( hP_int.mul_const _ ) ( hP2_int.mul_const _ );
+        · let f := fun (pc : ℝ × (Fin 1 → ℝ)) => model.γ₀₀ * pc.1 + model.γₘ₀ 0 * pc.1^2
+          have hf : Integrable f dgp.jointMeasure :=
+             (hP_int.const_mul model.γ₀₀).add (hP2_int.const_mul (model.γₘ₀ 0))
+          convert hf using 1
+          funext x
+          dsimp [f]
+          ring
       have h_linear_coeff : (∫ pc : ℝ × (Fin 1 → ℝ), dgp.trueExpectation pc.1 pc.2 - (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1) ∂dgp.jointMeasure) = 0 := by
         convert rawOptimal_implies_orthogonality_gen_proven model dgp h_opt h_linear hY_int hP_int hP2_int hYP_int h_resid_sq_int |>.1 using 1;
       rw [ MeasureTheory.integral_sub ] at h_linear_coeff;
