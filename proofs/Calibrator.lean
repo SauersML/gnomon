@@ -4423,16 +4423,49 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
   rw [← h_at_1]
   rfl
 
+/-- Equivalence between EuclideanSpace and function space. -/
+noncomputable def fromEuclidean {n : ℕ} : EuclideanSpace ℝ (Fin n) ≃ₗ[ℝ] (Fin n → ℝ) :=
+  WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+
+/-- Equivalence from function space to EuclideanSpace. -/
+noncomputable def toEuclidean {n : ℕ} : (Fin n → ℝ) ≃ₗ[ℝ] EuclideanSpace ℝ (Fin n) :=
+  fromEuclidean.symm
+
 /-- Orthogonal projection onto a finite-dimensional subspace. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  0  -- Placeholder; proper implementation would use Mathlib's orthogonalProjection
+  let K_E : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map toEuclidean
+  let y_E : EuclideanSpace ℝ (Fin n) := toEuclidean y
+  let p_E : EuclideanSpace ℝ (Fin n) := Submodule.orthogonalProjection K_E y_E
+  fromEuclidean p_E
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
-    iff p minimizes distance to y among all points in K. -/
+    iff p minimizes L2 distance to y among all points in K. -/
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
-    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist y p ≤ dist y w) :
+    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist (toEuclidean y) (toEuclidean p) ≤ dist (toEuclidean y) (toEuclidean w)) :
     p = orthogonalProjection K y := by
-  sorry
+  let y_E := toEuclidean y
+  let K_E : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map toEuclidean
+  have h_mem_E : toEuclidean p ∈ K_E := Submodule.mem_map_of_mem h_mem
+  have h_min_E : ∀ w_E ∈ K_E, dist y_E (toEuclidean p) ≤ dist y_E w_E := by
+    intro w_E hw_E
+    obtain ⟨w, hw, hw_eq⟩ := (Submodule.mem_map (f := toEuclidean)).mp hw_E
+    rw [← hw_eq]
+    exact h_min w hw
+
+  -- Use Mathlib's result in EuclideanSpace
+  have h_eq_E : toEuclidean p = Submodule.orthogonalProjection K_E y_E := by
+    apply Eq.symm
+    apply Submodule.eq_orthogonalProjection_of_mem_of_min_dist
+    · exact h_mem_E
+    · exact h_min_E
+
+  -- Map back
+  have h_p_eq : p = fromEuclidean (Submodule.orthogonalProjection K_E y_E) := by
+    rw [← h_eq_E]
+    unfold fromEuclidean toEuclidean
+    simp
+
+  exact h_p_eq
 
 set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
