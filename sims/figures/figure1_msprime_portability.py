@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import math
 import os
 import shutil
@@ -15,8 +16,8 @@ from scipy.stats import gaussian_kde
 from scipy.special import expit as sigmoid
 from sklearn.preprocessing import StandardScaler
 
-# Avoid noisy rpy2 API-mode import warnings on this environment.
-os.environ.setdefault("RPY2_CFFI_MODE", "ABI")
+# mgcv path is required; prefer rpy2 API mode.
+os.environ.setdefault("RPY2_CFFI_MODE", "API")
 
 THIS_DIR = Path(__file__).resolve().parent
 SIMS_DIR = THIS_DIR.parent
@@ -97,6 +98,76 @@ def _style_axes(ax) -> None:
     ax.set_axisbelow(True)
 
 
+def _default_total_threads() -> int:
+    for key in ("SLURM_CPUS_PER_TASK", "SLURM_CPUS_ON_NODE", "OMP_NUM_THREADS"):
+        val = os.environ.get(key)
+        if val:
+            try:
+                return max(1, int(val))
+            except Exception:
+                pass
+    return max(1, int(os.cpu_count() or 1))
+
+
+def _detect_total_mem_mb() -> int | None:
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    kb = int(line.split()[1])
+                    return max(1, kb // 1024)
+    except Exception:
+        return None
+    return None
+
+
+def _default_work_root(out_dir: Path) -> Path:
+    for base in (Path("/dev/shm"), Path("/tmp")):
+        if base.exists():
+            return (base / "gnomon_sims_work" / "figure1").resolve()
+    return out_dir / "work"
+
+
+def _truncate_ratemap(rate_map: msprime.RateMap, bp_cap: int | None) -> msprime.RateMap:
+    if bp_cap is None:
+        return rate_map
+    cap = int(bp_cap)
+    if cap <= 0:
+        raise ValueError("bp_cap must be positive")
+    pos = np.asarray(rate_map.position, dtype=float)
+    rates = np.asarray(rate_map.rate, dtype=float)
+    if cap >= int(pos[-1]):
+        return rate_map
+    i = int(np.searchsorted(pos, float(cap), side="right") - 1)
+    i = max(0, min(i, len(rates) - 1))
+    new_pos = np.concatenate([pos[: i + 1], np.asarray([float(cap)])])
+    new_rates = rates[: i + 1]
+    return msprime.RateMap(position=new_pos, rate=new_rates)
+
+
+def _resource_plan(n_tasks: int) -> tuple[int, int, int | None]:
+    total_threads = _default_total_threads()
+    total_mem_mb = _detect_total_mem_mb()
+    usable_mem_mb = int(0.85 * total_mem_mb) if total_mem_mb is not None else None
+    max_jobs = max(1, min(int(n_tasks), total_threads))
+
+    best = None
+    for jobs in range(1, max_jobs + 1):
+        threads_per_job = max(1, total_threads // jobs)
+        mem_per_job_mb = None if usable_mem_mb is None else max(2048, usable_mem_mb // jobs)
+        # Favor more parallel tasks, but cap per-task thread benefit around 8.
+        score = jobs * min(threads_per_job, 8)
+        if threads_per_job < 2:
+            score -= 0.25
+        cand = (score, jobs, threads_per_job, mem_per_job_mb)
+        if best is None or cand > best:
+            best = cand
+
+    assert best is not None
+    _, jobs, threads_per_job, mem_per_job_mb = best
+    return int(jobs), int(threads_per_job), mem_per_job_mb
+
+
 def _build_demography(split_gens: int) -> msprime.Demography:
     dem = msprime.Demography()
     dem.add_population(name="afr", initial_size=10_000)
@@ -117,11 +188,18 @@ def _simulate_for_generation(
     n_afr: int,
     n_ooa_train: int,
     n_ooa_test: int,
+    plink_threads: int,
+    plink_memory_mb: int | None,
+    msprime_model: str,
+    mut_rate: float,
+    pca_n_sites: int,
+    causal_max_sites: int,
+    bp_cap: int | None,
 ) -> pd.DataFrame:
     prefix = f"fig1_g{gens}_s{seed}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    recomb_map = get_chr22_recomb_map()
+    recomb_map = _truncate_ratemap(get_chr22_recomb_map(), bp_cap=bp_cap)
     dem = _build_demography(gens)
 
     ts = msprime.sim_ancestry(
@@ -130,11 +208,11 @@ def _simulate_for_generation(
         recombination_rate=recomb_map,
         ploidy=2,
         random_seed=seed,
-        model="dtwf",
+        model=msprime_model,
     )
     ts = msprime.sim_mutations(
         ts,
-        rate=1e-8,
+        rate=mut_rate,
         random_seed=seed + 1,
         discrete_genome=True,
     )
@@ -151,10 +229,17 @@ def _simulate_for_generation(
     ooa_train_idx = ooa_idx[:n_ooa_train]
     ooa_test_idx = ooa_idx[n_ooa_train:n_ooa_train + n_ooa_test]
 
-    pca_sites = sample_site_ids_for_maf(ts, a_idx, b_idx, n_sites=2000, maf_min=0.05, seed=seed + 7)
+    pca_sites = sample_site_ids_for_maf(ts, a_idx, b_idx, n_sites=pca_n_sites, maf_min=0.05, seed=seed + 7)
     pcs = pcs_from_sites(ts, a_idx, b_idx, pca_sites, seed=seed + 11, n_components=N_PCS)
 
-    causal_sites = sample_site_ids_for_maf(ts, a_idx, b_idx, n_sites=min(5000, int(ts.num_sites)), maf_min=0.01, seed=seed + 17)
+    causal_sites = sample_site_ids_for_maf(
+        ts,
+        a_idx,
+        b_idx,
+        n_sites=min(causal_max_sites, int(ts.num_sites)),
+        maf_min=0.01,
+        seed=seed + 17,
+    )
     G_true = genetic_risk_from_real_pgs_effect_distribution(
         ts,
         a_idx,
@@ -201,14 +286,26 @@ def _simulate_for_generation(
     with open(vcf_path, "w") as f:
         names = [f"ind_{i+1}" for i in range(ts.num_individuals)]
         ts.write_vcf(f, individual_names=names, position_transform=lambda x: np.asarray(x) + 1)
-    run_plink_conversion(str(vcf_path), str(out_dir / prefix), cm_map_path=None)
+    run_plink_conversion(
+        str(vcf_path),
+        str(out_dir / prefix),
+        cm_map_path=None,
+        threads=plink_threads,
+        memory_mb=plink_memory_mb,
+    )
     vcf_path.unlink(missing_ok=True)
 
     df.to_csv(out_dir / f"{prefix}.tsv", sep="\t", index=False)
     return df
 
 
-def _prepare_bayesr_files(df: pd.DataFrame, prefix: str, work_dir: Path) -> tuple[str, str, str, str]:
+def _prepare_bayesr_files(
+    df: pd.DataFrame,
+    prefix: str,
+    work_dir: Path,
+    plink_threads: int,
+    plink_memory_mb: int | None,
+) -> tuple[str, str, str, str]:
     work_dir.mkdir(parents=True, exist_ok=True)
 
     fam = pd.read_csv(f"{prefix}.fam", sep=r"\s+", header=None, names=["FID", "IID", "PID", "MID", "SEX", "PHENO"], dtype=str)
@@ -225,9 +322,12 @@ def _prepare_bayesr_files(df: pd.DataFrame, prefix: str, work_dir: Path) -> tupl
     plink = shutil.which("plink2") or "plink2"
 
     import subprocess
-    subprocess.run([plink, "--bfile", prefix, "--freq", "--out", str(work_dir / "ref")], check=True)
-    subprocess.run([plink, "--bfile", prefix, "--keep", str(train_keep), "--make-bed", "--out", str(work_dir / "train")], check=True)
-    subprocess.run([plink, "--bfile", prefix, "--keep", str(test_keep), "--make-bed", "--out", str(work_dir / "test")], check=True)
+    common = ["--threads", str(plink_threads)]
+    if plink_memory_mb is not None and plink_memory_mb > 0:
+        common.extend(["--memory", str(plink_memory_mb)])
+    subprocess.run([plink, "--bfile", prefix, "--freq", *common, "--out", str(work_dir / "ref")], check=True)
+    subprocess.run([plink, "--bfile", prefix, "--keep", str(train_keep), "--make-bed", *common, "--out", str(work_dir / "train")], check=True)
+    subprocess.run([plink, "--bfile", prefix, "--keep", str(test_keep), "--make-bed", *common, "--out", str(work_dir / "test")], check=True)
 
     train_df = df[df["IID"].isin(train_ids)].copy()
     test_df = df[df["IID"].isin(test_ids)].copy()
@@ -289,7 +389,6 @@ def _fit_and_predict_methods(train_df: pd.DataFrame, test_df: pd.DataFrame, trai
         method.fit(P_train, PC_train, y_train)
         out[name] = method.predict_proba(P_test, PC_test)
 
-    # Fixed GAM specification for reproducibility.
     gm = GAMMethod(n_pcs=3, k_pgs=4, k_pc=4, use_ti=False)
     gm.fit(P_train, PC_train, y_train)
     out["gam"] = gm.predict_proba(P_test, PC_test)
@@ -422,6 +521,113 @@ def _plot_pc_grid(pc_rows: list[dict[str, object]], out_dir: Path) -> None:
     plt.close(fig)
 
 
+def _run_generation_task(task: dict[str, object]) -> dict[str, object]:
+    g = int(task["g"])
+    seed = int(task["seed"])
+    out_dir = Path(str(task["out_dir"]))
+    work_root = Path(str(task["work_root"]))
+    n_afr = int(task["n_afr"])
+    n_ooa_train = int(task["n_ooa_train"])
+    n_ooa_test = int(task["n_ooa_test"])
+    threads_per_job = int(task["threads_per_job"])
+    memory_mb_per_job = task["memory_mb_per_job"]
+    keep_intermediates = bool(task["keep_intermediates"])
+    msprime_model = str(task["msprime_model"])
+    mut_rate = float(task["mut_rate"])
+    pca_n_sites = int(task["pca_n_sites"])
+    causal_max_sites = int(task["causal_max_sites"])
+    bp_cap = task["bp_cap"]
+    pgs_effects = np.asarray(task["pgs_effects"], dtype=float)
+
+    for k in ("OMP_NUM_THREADS", "GCTB_THREADS"):
+        os.environ[k] = str(threads_per_job)
+    if memory_mb_per_job is not None:
+        os.environ["PLINK_MEMORY_MB"] = str(int(memory_mb_per_job))
+
+    df = _simulate_for_generation(
+        g,
+        seed,
+        pgs_effects,
+        out_dir,
+        n_afr=n_afr,
+        n_ooa_train=n_ooa_train,
+        n_ooa_test=n_ooa_test,
+        plink_threads=threads_per_job,
+        plink_memory_mb=memory_mb_per_job,
+        msprime_model=msprime_model,
+        mut_rate=mut_rate,
+        pca_n_sites=pca_n_sites,
+        causal_max_sites=causal_max_sites,
+        bp_cap=(int(bp_cap) if bp_cap is not None else None),
+    )
+    prefix = str(out_dir / f"fig1_g{g}_s{seed}")
+    work = work_root / f"fig1_g{g}_s{seed}_work"
+    train_prefix, test_prefix, train_phen, freq_file = _prepare_bayesr_files(
+        df,
+        prefix,
+        work,
+        plink_threads=threads_per_job,
+        plink_memory_mb=memory_mb_per_job,
+    )
+    br = BayesR(threads=threads_per_job, plink_memory_mb=memory_mb_per_job)
+    eff_file = br.fit(train_prefix, train_phen, str(work / "bayesr"), covar_file=str(work / "train.covar"))
+    test_scores = br.predict(test_prefix, eff_file, str(work / "bayesr_test"), freq_file=freq_file)
+    train_scores = br.predict(train_prefix, eff_file, str(work / "bayesr_train"), freq_file=freq_file)
+
+    train_df = df[df["group"] == "OOA_train"].copy()
+    test_df = df[df["group"].isin(["OOA_test", "AFR_test"])].copy()
+
+    train_df = train_df.set_index("IID").loc[train_scores["IID"].astype(str)].reset_index()
+    test_df = test_df.set_index("IID").loc[test_scores["IID"].astype(str)].reset_index()
+
+    pred = _fit_and_predict_methods(
+        train_df,
+        test_df,
+        train_scores["PRS"].to_numpy(dtype=float),
+        test_scores["PRS"].to_numpy(dtype=float),
+    )
+
+    result_rows = []
+    for method, y_prob in pred.items():
+        o = test_df["group"] == "OOA_test"
+        a = test_df["group"] == "AFR_test"
+        auc_o = _auc(test_df.loc[o, "y"].to_numpy(), y_prob[o.to_numpy()])
+        auc_a = _auc(test_df.loc[a, "y"].to_numpy(), y_prob[a.to_numpy()])
+        ratio = float(auc_o / auc_a) if np.isfinite(auc_o) and np.isfinite(auc_a) and auc_a > 0 else np.nan
+        result_rows.append({"gens": int(g), "seed": int(seed), "method": method, "auc_ooa": auc_o, "auc_afr": auc_a, "auc_ratio": ratio})
+
+    prs_df = test_df[["IID", "group"]].copy()
+    prs_df["IID"] = prs_df["IID"].astype(str)
+    prs_df = prs_df.merge(
+        test_scores[["IID", "PRS"]].assign(IID=test_scores["IID"].astype(str)),
+        on="IID",
+        how="left",
+    )
+    prs_df.insert(0, "gens", int(g))
+    prs_df = prs_df.rename(columns={"PRS": "prs"})
+
+    pc_df = df[["group", "pc1", "pc2"]].copy()
+    pc_df.insert(0, "gens", int(g))
+
+    res_path = out_dir / f"fig1_g{g}_s{seed}.results.tsv"
+    prs_path = out_dir / f"fig1_g{g}_s{seed}.prs.tsv"
+    pc_path = out_dir / f"fig1_g{g}_s{seed}.pc.tsv"
+    pd.DataFrame(result_rows).to_csv(res_path, sep="\t", index=False)
+    prs_df.to_csv(prs_path, sep="\t", index=False)
+    pc_df.to_csv(pc_path, sep="\t", index=False)
+
+    if not keep_intermediates:
+        _cleanup_generation_artifacts(prefix=Path(prefix), work_dir=Path(work))
+
+    return {
+        "gens": int(g),
+        "seed": int(seed),
+        "res_path": str(res_path),
+        "prs_path": str(prs_path),
+        "pc_path": str(pc_path),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", default="sims/results_figure1_local", help="Output directory")
@@ -431,92 +637,78 @@ def main() -> None:
     parser.add_argument("--n-afr", type=int, default=N_AFR)
     parser.add_argument("--n-ooa-train", type=int, default=N_OOA_TRAIN)
     parser.add_argument("--n-ooa-test", type=int, default=N_OOA_TEST)
+    parser.add_argument(
+        "--msprime-model",
+        choices=["dtwf", "hudson"],
+        default="hudson",
+        help="msprime ancestry model (hudson is usually faster).",
+    )
+    parser.add_argument("--mut-rate", type=float, default=1e-8)
+    parser.add_argument("--pca-sites", type=int, default=2000)
+    parser.add_argument("--causal-sites", type=int, default=5000)
+    parser.add_argument("--bp-cap", type=int, default=None)
     parser.add_argument("--work-root", default=None, help="Directory for heavy transient work files (e.g., RAM disk).")
     parser.add_argument("--keep-intermediates", action="store_true", help="Keep per-generation PLINK/GCTB intermediate files.")
     args = parser.parse_args()
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
-    work_root = Path(args.work_root) if args.work_root else out_dir
+    work_root = Path(args.work_root) if args.work_root else _default_work_root(out_dir)
     work_root.mkdir(parents=True, exist_ok=True)
+    print("Figure1 GAM backend: mgcv")
 
     score_path = ensure_pgs003725(Path(args.cache))
     pgs_effects = load_pgs003725_effects(score_path, chr_filter="22")
+    # Prewarm stdpopsim chr22 map once in the parent process to avoid
+    # concurrent cache initialization races across workers.
+    _ = get_chr22_recomb_map()
+    jobs, threads_per_job, memory_mb_per_job = _resource_plan(n_tasks=len(args.gens))
+    print(
+        f"Figure1 resources: jobs={jobs} threads_per_job={threads_per_job} "
+        f"memory_mb_per_job={memory_mb_per_job}"
+    )
 
-    results = []
-    prs_rows: list[dict[str, object]] = []
-    pc_rows: list[dict[str, object]] = []
-
+    tasks = []
     for i, g in enumerate(args.gens):
-        base_seed = args.seed + i * 101
-        seed = None
-        df = None
-        prefix = None
-        work = None
-        train_prefix = None
-        test_prefix = None
-        train_phen = None
-        freq_file = None
-        train_scores = None
-        test_scores = None
-        seed = base_seed
-        df = _simulate_for_generation(
-            g,
-            seed,
-            pgs_effects,
-            out_dir,
-            n_afr=int(args.n_afr),
-            n_ooa_train=int(args.n_ooa_train),
-            n_ooa_test=int(args.n_ooa_test),
-        )
-        prefix = str(out_dir / f"fig1_g{g}_s{seed}")
-        work = work_root / f"fig1_g{g}_s{seed}_work"
-        train_prefix, test_prefix, train_phen, freq_file = _prepare_bayesr_files(df, prefix, work)
-        br = BayesR()
-        eff_file = br.fit(train_prefix, train_phen, str(work / "bayesr"), covar_file=str(work / "train.covar"))
-        test_scores = br.predict(test_prefix, eff_file, str(work / "bayesr_test"), freq_file=freq_file)
-        train_scores = br.predict(train_prefix, eff_file, str(work / "bayesr_train"), freq_file=freq_file)
-
-        train_df = df[df["group"] == "OOA_train"].copy()
-        test_df = df[df["group"].isin(["OOA_test", "AFR_test"])].copy()
-
-        train_df = train_df.set_index("IID").loc[train_scores["IID"].astype(str)].reset_index()
-        test_df = test_df.set_index("IID").loc[test_scores["IID"].astype(str)].reset_index()
-
-        pred = _fit_and_predict_methods(
-            train_df,
-            test_df,
-            train_scores["PRS"].to_numpy(dtype=float),
-            test_scores["PRS"].to_numpy(dtype=float),
+        tasks.append(
+            {
+                "g": int(g),
+                "seed": int(args.seed + i * 101),
+                "out_dir": str(out_dir),
+                "work_root": str(work_root),
+                "n_afr": int(args.n_afr),
+                "n_ooa_train": int(args.n_ooa_train),
+                "n_ooa_test": int(args.n_ooa_test),
+                "threads_per_job": int(threads_per_job),
+                "memory_mb_per_job": memory_mb_per_job,
+                "keep_intermediates": bool(args.keep_intermediates),
+                "msprime_model": str(args.msprime_model),
+                "mut_rate": float(args.mut_rate),
+                "pca_n_sites": int(args.pca_sites),
+                "causal_max_sites": int(args.causal_sites),
+                "bp_cap": args.bp_cap,
+                "pgs_effects": pgs_effects,
+            }
         )
 
-        for method, y_prob in pred.items():
-            o = test_df["group"] == "OOA_test"
-            a = test_df["group"] == "AFR_test"
-            auc_o = _auc(test_df.loc[o, "y"].to_numpy(), y_prob[o.to_numpy()])
-            auc_a = _auc(test_df.loc[a, "y"].to_numpy(), y_prob[a.to_numpy()])
-            ratio = float(auc_o / auc_a) if np.isfinite(auc_o) and np.isfinite(auc_a) and auc_a > 0 else np.nan
-            results.append({"gens": int(g), "seed": int(seed), "method": method, "auc_ooa": auc_o, "auc_afr": auc_a, "auc_ratio": ratio})
+    done = []
+    with concurrent.futures.ProcessPoolExecutor(max_workers=jobs) as ex:
+        futs = [ex.submit(_run_generation_task, t) for t in tasks]
+        for fut in concurrent.futures.as_completed(futs):
+            rec = fut.result()
+            done.append(rec)
+            print(f"Completed generation g={rec['gens']} seed={rec['seed']}")
 
-        for _, row in test_df.iterrows():
-            prs_rows.append({
-                "gens": int(g),
-                "group": row["group"],
-                "prs": float(test_scores.loc[test_scores["IID"].astype(str) == row["IID"], "PRS"].iloc[0]),
-            })
-        for _, row in df.iterrows():
-            pc_rows.append({"gens": int(g), "group": row["group"], "pc1": float(row["pc1"]), "pc2": float(row["pc2"])})
-
-        if not args.keep_intermediates:
-            _cleanup_generation_artifacts(prefix=Path(prefix), work_dir=Path(work))
-
-    res_df = pd.DataFrame(results).sort_values(["method", "gens"]) 
+    done = sorted(done, key=lambda x: int(x["gens"]))
+    res_df = pd.concat([pd.read_csv(str(r["res_path"]), sep="\t") for r in done], ignore_index=True).sort_values(["method", "gens"])
+    prs_df = pd.concat([pd.read_csv(str(r["prs_path"]), sep="\t") for r in done], ignore_index=True)
+    pc_df = pd.concat([pd.read_csv(str(r["pc_path"]), sep="\t") for r in done], ignore_index=True)
     res_df.to_csv(out_dir / "figure1_auc_ratio.tsv", sep="\t", index=False)
 
     _plot_main(res_df, out_dir)
     _plot_demography(out_dir)
-    _plot_prs_grid(prs_rows, out_dir)
-    _plot_pc_grid(pc_rows, out_dir)
+    _plot_prs_grid(prs_df.to_dict("records"), out_dir)
+    _plot_pc_grid(pc_df.to_dict("records"), out_dir)
 
 
 if __name__ == "__main__":

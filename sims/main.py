@@ -21,10 +21,27 @@ def _exists(cmd: str) -> bool:
     return shutil.which(cmd) is not None
 
 
+def _assert_mgcv_available(env: dict[str, str]) -> None:
+    # Hard requirement: GAM must run with R mgcv via rpy2.
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os; "
+                "os.environ.setdefault('RPY2_CFFI_MODE', 'API'); "
+                "import rpy2.robjects as ro; "
+                "from rpy2.robjects.packages import importr; "
+                "importr('mgcv'); "
+                "print('mgcv backend OK')"
+            ),
+        ],
+        check=True,
+        env=env,
+    )
+
+
 def _default_work_root() -> Path:
-    env_val = os.environ.get("SIMS_WORK_ROOT")
-    if env_val:
-        return Path(env_val).resolve()
     for p in [Path("/dev/shm"), Path("/tmp")]:
         if p.exists():
             return (p / "gnomon_sims_work").resolve()
@@ -32,22 +49,19 @@ def _default_work_root() -> Path:
 
 
 def _default_out_root() -> Path:
-    env_val = os.environ.get("SIMS_OUT_ROOT")
-    if env_val:
-        return Path(env_val).resolve()
     return (REPO_ROOT / "sims" / "results_hpc").resolve()
 
 
 def _jobs() -> int:
-    return max(1, int(os.environ.get("SIMS_JOBS", max(1, (os.cpu_count() or 8) // 2))))
+    return max(1, int(os.cpu_count() or 8))
 
 
 def _keep_intermediates() -> bool:
-    return os.environ.get("SIMS_KEEP_INTERMEDIATES", "0").strip().lower() in {"1", "true", "yes"}
+    return False
 
 
 def _clear_ramdisk_after() -> bool:
-    return os.environ.get("SIMS_CLEAR_RAMDISK_AFTER", "0").strip().lower() in {"1", "true", "yes"}
+    return False
 
 
 def _cohort_sizes(small: bool) -> dict[str, int]:
@@ -175,6 +189,8 @@ def _run_fig2(env: dict[str, str], out_root: Path, work_root: Path, small: bool)
         str(sizes["fig2_n_train_eur"]),
         "--n-test-per-pop",
         str(sizes["fig2_n_test_per_pop"]),
+        "--threads",
+        str(_jobs()),
     ]
     if _keep_intermediates():
         cmd.append("--keep-intermediates")
@@ -190,12 +206,10 @@ def run_pipeline(figure: str, small: bool) -> None:
 
     jobs = _jobs()
     env = os.environ.copy()
-    env.setdefault("RPY2_CFFI_MODE", "ABI")
+    env.setdefault("RPY2_CFFI_MODE", "API")
     env.setdefault("OMP_NUM_THREADS", str(jobs))
-    env.setdefault("OPENBLAS_NUM_THREADS", str(jobs))
-    env.setdefault("MKL_NUM_THREADS", str(jobs))
-    env.setdefault("NUMEXPR_NUM_THREADS", str(jobs))
     env.setdefault("GCTB_THREADS", str(jobs))
+    _assert_mgcv_available(env)
 
     run_fig1 = figure in ("1", "both")
     run_fig2 = figure in ("2", "both")

@@ -8,7 +8,13 @@ import tempfile
 from pathlib import Path
 import re
 
-def run_plink_conversion(vcf_path: str, out_prefix: str, cm_map_path: str = None) -> None:
+def run_plink_conversion(
+    vcf_path: str,
+    out_prefix: str,
+    cm_map_path: str = None,
+    threads: int | None = None,
+    memory_mb: int | None = None,
+) -> None:
     """
     Convert VCF to PLINK binary format (.bed/.bim/.fam).
     Uses plink2.
@@ -30,6 +36,10 @@ def run_plink_conversion(vcf_path: str, out_prefix: str, cm_map_path: str = None
             "--out", out_prefix,
             "--silent"
         ]
+        if threads is not None and int(threads) > 0:
+            cmd.extend(["--threads", str(int(threads))])
+        if memory_mb is not None and int(memory_mb) > 0:
+            cmd.extend(["--memory", str(int(memory_mb))])
         print(f"Running PLINK conversion: {' '.join(cmd)}")
         return subprocess.run(cmd, capture_output=True, text=True)
 

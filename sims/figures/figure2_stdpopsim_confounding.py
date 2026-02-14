@@ -15,8 +15,8 @@ from scipy.stats import gaussian_kde
 from scipy.special import expit as sigmoid
 from sklearn.preprocessing import StandardScaler
 
-# Avoid noisy rpy2 API-mode import warnings on this environment.
-os.environ.setdefault("RPY2_CFFI_MODE", "ABI")
+# mgcv path is required; prefer rpy2 API mode.
+os.environ.setdefault("RPY2_CFFI_MODE", "API")
 
 THIS_DIR = Path(__file__).resolve().parent
 SIMS_DIR = THIS_DIR.parent
@@ -97,6 +97,36 @@ def _style_axes(ax, y_grid: bool = True) -> None:
     ax.set_axisbelow(True)
 
 
+def _default_total_threads() -> int:
+    for key in ("SLURM_CPUS_PER_TASK", "SLURM_CPUS_ON_NODE", "OMP_NUM_THREADS"):
+        val = os.environ.get(key)
+        if val:
+            try:
+                return max(1, int(val))
+            except Exception:
+                pass
+    return max(1, int(os.cpu_count() or 1))
+
+
+def _detect_total_mem_mb() -> int | None:
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    kb = int(line.split()[1])
+                    return max(1, kb // 1024)
+    except Exception:
+        return None
+    return None
+
+
+def _default_work_root(out_dir: Path) -> Path:
+    for base in (Path("/dev/shm"), Path("/tmp")):
+        if base.exists():
+            return (base / "gnomon_sims_work" / "figure2").resolve()
+    return out_dir / "work"
+
+
 def _true_ancestry_proportions(ts, a_idx: np.ndarray, b_idx: np.ndarray, pop_lookup: dict[int, str]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     sample_nodes = ts.samples()
     n_hap = len(sample_nodes)
@@ -141,10 +171,31 @@ def _true_ancestry_proportions(ts, a_idx: np.ndarray, b_idx: np.ndarray, pop_loo
     return afr, eur, asia
 
 
-def _simulate(seed: int, pgs_effects: np.ndarray, out_dir: Path, n_train_eur: int, n_test_per_pop: int) -> pd.DataFrame:
+def _simulate(
+    seed: int,
+    pgs_effects: np.ndarray,
+    out_dir: Path,
+    n_train_eur: int,
+    n_test_per_pop: int,
+    plink_threads: int,
+    plink_memory_mb: int | None,
+    msprime_model: str,
+    pca_n_sites: int,
+    causal_max_sites: int,
+    bp_cap: int | None,
+) -> pd.DataFrame:
     species = stdpopsim.get_species("HomSap")
     model = species.get_demographic_model("AmericanAdmixture_4B18")
-    contig = species.get_contig("chr22", genetic_map="HapMapII_GRCh38", mutation_rate=model.mutation_rate)
+    if bp_cap is not None:
+        # For short debug runs, switch to a generic capped contig.
+        contig = species.get_contig(
+            chromosome=None,
+            length=int(bp_cap),
+            mutation_rate=model.mutation_rate,
+            recombination_rate=1e-8,
+        )
+    else:
+        contig = species.get_contig("chr22", genetic_map="HapMapII_GRCh38", mutation_rate=model.mutation_rate)
     engine = stdpopsim.get_engine("msprime")
 
     samples = {
@@ -154,24 +205,28 @@ def _simulate(seed: int, pgs_effects: np.ndarray, out_dir: Path, n_train_eur: in
         "ADMIX": n_test_per_pop,
     }
 
-    ts = engine.simulate(
-        model,
-        contig,
-        samples,
-        seed=seed,
-        msprime_model="dtwf",
-        msprime_change_model=[(50, "hudson")],
-        record_migrations=True,
-    )
+    simulate_kwargs = {
+        "seed": seed,
+        "msprime_model": msprime_model,
+        "record_migrations": True,
+    }
+    ts = engine.simulate(model, contig, samples, **simulate_kwargs)
 
     a_idx, b_idx, pop_idx, ts_ind_id = diploid_index_pairs(ts)
     pop_lookup = pop_names_from_ts(ts)
     pop_label = np.array([pop_lookup.get(int(p), f"pop_{int(p)}") for p in pop_idx], dtype=object)
 
-    pca_sites = sample_site_ids_for_maf(ts, a_idx, b_idx, n_sites=2000, maf_min=0.05, seed=seed + 11)
+    pca_sites = sample_site_ids_for_maf(ts, a_idx, b_idx, n_sites=pca_n_sites, maf_min=0.05, seed=seed + 11)
     pcs = pcs_from_sites(ts, a_idx, b_idx, pca_sites, seed=seed + 13, n_components=N_PCS)
 
-    causal_sites = sample_site_ids_for_maf(ts, a_idx, b_idx, n_sites=min(5000, int(ts.num_sites)), maf_min=0.01, seed=seed + 17)
+    causal_sites = sample_site_ids_for_maf(
+        ts,
+        a_idx,
+        b_idx,
+        n_sites=min(causal_max_sites, int(ts.num_sites)),
+        maf_min=0.01,
+        seed=seed + 17,
+    )
     G_true = genetic_risk_from_real_pgs_effect_distribution(ts, a_idx, b_idx, causal_sites, pgs_effects, seed=seed + 19)
 
     rng = np.random.default_rng(seed + 23)
@@ -227,14 +282,27 @@ def _simulate(seed: int, pgs_effects: np.ndarray, out_dir: Path, n_train_eur: in
     with open(vcf, "w") as f:
         names = [f"ind_{i+1}" for i in range(ts.num_individuals)]
         ts.write_vcf(f, individual_names=names, position_transform=lambda x: np.asarray(x) + 1)
-    run_plink_conversion(str(vcf), str(prefix), cm_map_path=None)
+    run_plink_conversion(
+        str(vcf),
+        str(prefix),
+        cm_map_path=None,
+        threads=plink_threads,
+        memory_mb=plink_memory_mb,
+    )
     vcf.unlink(missing_ok=True)
 
     df.to_csv(prefix.with_suffix(".tsv"), sep="\t", index=False)
     return df
 
 
-def _run_bayesr_and_predict(df: pd.DataFrame, prefix: str, out_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
+def _run_bayesr_and_predict(
+    df: pd.DataFrame,
+    prefix: str,
+    out_dir: Path,
+    plink_threads: int,
+    plink_memory_mb: int | None,
+    bayesr_threads: int,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     import shutil
     import subprocess
 
@@ -251,9 +319,12 @@ def _run_bayesr_and_predict(df: pd.DataFrame, prefix: str, out_dir: Path) -> tup
     pd.DataFrame({"FID": [iid_to_fid[i] for i in test_ids], "IID": test_ids}).to_csv(work / "test.keep", sep="\t", header=False, index=False)
 
     plink = shutil.which("plink2") or "plink2"
-    subprocess.run([plink, "--bfile", prefix, "--freq", "--out", str(work / "ref")], check=True)
-    subprocess.run([plink, "--bfile", prefix, "--keep", str(work / "train.keep"), "--make-bed", "--out", str(work / "train")], check=True)
-    subprocess.run([plink, "--bfile", prefix, "--keep", str(work / "test.keep"), "--make-bed", "--out", str(work / "test")], check=True)
+    common = ["--threads", str(plink_threads)]
+    if plink_memory_mb is not None and plink_memory_mb > 0:
+        common.extend(["--memory", str(plink_memory_mb)])
+    subprocess.run([plink, "--bfile", prefix, "--freq", *common, "--out", str(work / "ref")], check=True)
+    subprocess.run([plink, "--bfile", prefix, "--keep", str(work / "train.keep"), "--make-bed", *common, "--out", str(work / "train")], check=True)
+    subprocess.run([plink, "--bfile", prefix, "--keep", str(work / "test.keep"), "--make-bed", *common, "--out", str(work / "test")], check=True)
 
     train_df = df[df["IID"].isin(train_ids)].copy()
     pd.DataFrame({
@@ -268,7 +339,7 @@ def _run_bayesr_and_predict(df: pd.DataFrame, prefix: str, out_dir: Path) -> tup
         **{f"pc{i+1}": train_df[f"pc{i+1}"].to_numpy() for i in range(N_PCS)},
     }).to_csv(work / "train.covar", sep=" ", header=False, index=False)
 
-    br = BayesR()
+    br = BayesR(threads=bayesr_threads, plink_memory_mb=plink_memory_mb)
     eff = br.fit(str(work / "train"), str(work / "train.phen"), str(work / "bayesr"), covar_file=str(work / "train.covar"))
     train_scores = br.predict(str(work / "train"), eff, str(work / "bayesr_train"), freq_file=str(work / "ref.afreq"))
     test_scores = br.predict(str(work / "test"), eff, str(work / "bayesr_test"), freq_file=str(work / "ref.afreq"))
@@ -310,7 +381,6 @@ def _method_preds(train_df: pd.DataFrame, test_df: pd.DataFrame, train_prs: np.n
         method.fit(P_train, PC_train, y_train)
         out[name] = method.predict_proba(P_test, PC_test)
 
-    # Fixed GAM specification for reproducibility.
     gm = GAMMethod(n_pcs=3, k_pgs=4, k_pc=4, use_ti=False)
     gm.fit(P_train, PC_train, y_train)
     out["gam"] = gm.predict_proba(P_test, PC_test)
@@ -419,14 +489,37 @@ def main() -> None:
     parser.add_argument("--cache", default="sims/.cache")
     parser.add_argument("--n-train-eur", type=int, default=N_TRAIN_EUR)
     parser.add_argument("--n-test-per-pop", type=int, default=N_TEST_PER_POP)
+    parser.add_argument(
+        "--msprime-model",
+        choices=["dtwf", "hudson"],
+        default="hudson",
+        help="msprime ancestry model (hudson is usually faster).",
+    )
+    parser.add_argument("--pca-sites", type=int, default=2000)
+    parser.add_argument("--causal-sites", type=int, default=5000)
+    parser.add_argument("--bp-cap", type=int, default=None)
+    parser.add_argument("--threads", type=int, default=None, help="Thread count for PLINK/BayesR. Default uses node allocation.")
+    parser.add_argument("--memory-mb", type=int, default=None, help="PLINK memory limit (MB). Default auto-sizes from node RAM.")
     parser.add_argument("--work-root", default=None, help="Directory for heavy transient work files (e.g., RAM disk).")
     parser.add_argument("--keep-intermediates", action="store_true", help="Keep PLINK/GCTB intermediate files.")
     args = parser.parse_args()
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
-    work_root = Path(args.work_root) if args.work_root else out_dir
+    work_root = Path(args.work_root) if args.work_root else _default_work_root(out_dir)
     work_root.mkdir(parents=True, exist_ok=True)
+    print("Figure2 GAM backend: mgcv")
+    threads = max(1, int(args.threads)) if args.threads is not None else _default_total_threads()
+    if args.memory_mb is not None:
+        memory_mb = max(512, int(args.memory_mb))
+    else:
+        total_mb = _detect_total_mem_mb()
+        memory_mb = max(2048, int(0.85 * total_mb)) if total_mb is not None else None
+    print(f"Figure2 resources: threads={threads} memory_mb={memory_mb}")
+    for k in ("OMP_NUM_THREADS", "GCTB_THREADS"):
+        os.environ[k] = str(threads)
+    if memory_mb is not None:
+        os.environ["PLINK_MEMORY_MB"] = str(memory_mb)
 
     score_path = ensure_pgs003725(Path(args.cache))
     pgs_effects = load_pgs003725_effects(score_path, chr_filter="22")
@@ -442,10 +535,23 @@ def main() -> None:
         out_dir,
         n_train_eur=int(args.n_train_eur),
         n_test_per_pop=int(args.n_test_per_pop),
+        plink_threads=threads,
+        plink_memory_mb=memory_mb,
+        msprime_model=str(args.msprime_model),
+        pca_n_sites=int(args.pca_sites),
+        causal_max_sites=int(args.causal_sites),
+        bp_cap=args.bp_cap,
     )
     prefix = str(out_dir / f"fig2_s{seed}")
     seed_work = work_root / f"work_s{seed}"
-    train_scores, test_scores = _run_bayesr_and_predict(df, prefix, seed_work)
+    train_scores, test_scores = _run_bayesr_and_predict(
+        df,
+        prefix,
+        seed_work,
+        plink_threads=threads,
+        plink_memory_mb=memory_mb,
+        bayesr_threads=threads,
+    )
 
     train_df = df[df["group"] == "EUR_train"].copy()
     test_df = df[df["group"].str.endswith("_test")].copy()
