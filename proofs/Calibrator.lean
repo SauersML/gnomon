@@ -1,6 +1,7 @@
 import Mathlib.Tactic
 import Mathlib.Analysis.Calculus.Deriv.Basic
 import Mathlib.Analysis.Calculus.Deriv.Inv
+import Mathlib.Analysis.Calculus.Deriv.Prod
 import Mathlib.Analysis.Convex.Strict
 import Mathlib.Analysis.Convex.Jensen
 import Mathlib.Analysis.Convex.SpecificFunctions.Basic
@@ -4423,16 +4424,77 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
   rw [← h_at_1]
   rfl
 
-/-- Orthogonal projection onto a finite-dimensional subspace. -/
+/-- Convert a function `Fin n → ℝ` to `EuclideanSpace ℝ (Fin n)` (L2 space). -/
+def toEuclidean {n : ℕ} (v : Fin n → ℝ) : EuclideanSpace ℝ (Fin n) :=
+  WithLp.linearEquiv 2 ℝ (Fin n → ℝ) v
+
+/-- Convert `EuclideanSpace ℝ (Fin n)` back to `Fin n → ℝ`. -/
+def fromEuclidean {n : ℕ} (v : EuclideanSpace ℝ (Fin n)) : Fin n → ℝ :=
+  (WithLp.linearEquiv 2 ℝ (Fin n → ℝ)).symm v
+
+/-- Orthogonal projection onto a finite-dimensional subspace.
+    We map the problem to `EuclideanSpace` (L2 geometry), project there, and map back. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  0  -- Placeholder; proper implementation would use Mathlib's orthogonalProjection
+  let equiv := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K_E : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map equiv
+  let y_E := toEuclidean y
+  let proj_E := Submodule.orthogonalProjection K_E y_E
+  fromEuclidean proj_E.val
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
     iff p minimizes distance to y among all points in K. -/
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
-    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist y p ≤ dist y w) :
+    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist (toEuclidean y) (toEuclidean p) ≤ dist (toEuclidean y) (toEuclidean w)) :
     p = orthogonalProjection K y := by
-  sorry
+  let equiv := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K_E : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map equiv
+  let y_E := toEuclidean y
+  let p_E := toEuclidean p
+  have h_mem_E : p_E ∈ K_E := Submodule.mem_map_of_mem h_mem
+
+  -- Variational proof: min distance => orthogonality
+  have h_orth : ∀ v_E ∈ K_E, ⟪y_E - p_E, v_E⟫_ℝ = 0 := by
+    intro v_E hv_E
+    -- Consider quadratic perturbation p_E + ε * v_E
+    have h_quad : ∀ ε : ℝ, ⟪y_E - (p_E + ε • v_E), y_E - (p_E + ε • v_E)⟫_ℝ ≥ ⟪y_E - p_E, y_E - p_E⟫_ℝ := by
+      intro ε
+      let w_E := p_E + ε • v_E
+      have hw_mem : w_E ∈ K_E := Submodule.add_mem K_E h_mem_E (Submodule.smul_mem K_E ε hv_E)
+      -- Map back to K to use h_min
+      rcases Submodule.mem_map.mp hw_mem with ⟨w, hw, rfl⟩
+      have h_dist := h_min w hw
+      simp only [toEuclidean, equiv] at h_dist ⊢
+      rw [dist_eq_norm, dist_eq_norm] at h_dist
+      rw [real_inner_self_eq_norm_sq, real_inner_self_eq_norm_sq]
+      gcongr
+      exact h_dist
+
+    -- Expand inner product: ||y - p - εv||^2 = ||y-p||^2 - 2ε<y-p, v> + ε^2||v||^2
+    have h_expand : ∀ ε : ℝ, ⟪y_E - (p_E + ε • v_E), y_E - (p_E + ε • v_E)⟫_ℝ =
+        ⟪y_E - p_E, y_E - p_E⟫_ℝ - 2 * ε * ⟪y_E - p_E, v_E⟫_ℝ + ε^2 * ⟪v_E, v_E⟫_ℝ := by
+      intro ε
+      simp only [sub_add_eq_sub_sub, inner_sub_left, inner_sub_right, inner_smul_left, inner_smul_right, real_inner_comm]
+      ring
+
+    -- h_quad implies -2 * ε * ⟪...⟫ + ε^2 * ... >= 0 for all ε
+    have h_le : ∀ ε : ℝ, (-2 * ⟪y_E - p_E, v_E⟫_ℝ) * ε + ⟪v_E, v_E⟫_ℝ * ε^2 ≥ 0 := by
+      intro ε
+      have h := h_quad ε
+      rw [h_expand] at h
+      linarith
+
+    -- Use lemma linear_coeff_zero_of_quadratic_nonneg
+    have h_coeff := linear_coeff_zero_of_quadratic_nonneg (-2 * ⟪y_E - p_E, v_E⟫_ℝ) ⟪v_E, v_E⟫_ℝ h_le
+    linarith
+
+  -- This implies p_E is the orthogonal projection
+  have h_proj := Submodule.eq_orthogonalProjection_of_mem_of_inner_eq_zero h_mem_E h_orth
+
+  -- Unfold orthogonalProjection
+  unfold orthogonalProjection
+  dsimp
+  rw [h_proj]
+  simp [fromEuclidean, toEuclidean]
 
 set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
@@ -6103,8 +6165,10 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
               have h_jacobi : ∀ σ : Equiv.Perm m, deriv (fun rho => ∏ i : m, M rho ((σ : m → m) i) i) rho = ∑ i : m, (∏ j ∈ Finset.univ.erase i, M rho ((σ : m → m) j) j) * deriv (fun rho => M rho ((σ : m → m) i) i) rho := by
                 intro σ
                 have h_prod_rule : ∀ (f : m → ℝ → ℝ), (∀ i, DifferentiableAt ℝ (f i) rho) → deriv (fun rho => ∏ i, f i rho) rho = ∑ i, (∏ j ∈ Finset.univ.erase i, f j rho) * deriv (f i) rho := by
-                  -- exact?
-                  admit
+                  intro f h_diff
+                  have h_diff' : ∀ i ∈ Finset.univ, DifferentiableAt ℝ (f i) rho := fun i _ => h_diff i
+                  convert deriv_finset_prod h_diff'
+                  simp
                 apply h_prod_rule
                 intro i
                 exact DifferentiableAt.comp rho ( differentiableAt_pi.1 ( differentiableAt_pi.1 hM_diff _ ) _ ) differentiableAt_id
@@ -6114,8 +6178,7 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
                   have h_diff : ∀ i : m, DifferentiableAt ℝ (fun rho => M rho ((σ : m → m) i) i) rho := by
                     intro i
                     exact DifferentiableAt.comp rho ( differentiableAt_pi.1 ( differentiableAt_pi.1 hM_diff _ ) _ ) differentiableAt_id
-                  -- exact?
-                  admit
+                  exact DifferentiableAt.finset_prod (fun i (_ : i ∈ Finset.univ) => h_diff i)
                 norm_num [ h_diff ]
               simpa only [ h_jacobi ] using h_deriv_sum
             simp +decide only [h_jacobi, Finset.mul_sum _ _ _]
