@@ -20,6 +20,7 @@ import Mathlib.Data.Matrix.Basic
 import Mathlib.LinearAlgebra.Matrix.DotProduct
 import Mathlib.Topology.MetricSpace.Lipschitz
 import Mathlib.Data.NNReal.Basic
+import Mathlib.Data.ENNReal.Basic
 import Mathlib.Topology.Compactness.Compact
 import Mathlib.Data.Matrix.Reflection
 import Mathlib.Data.Matrix.Mul
@@ -4423,14 +4424,22 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
   rw [← h_at_1]
   rfl
 
+/-- Linear equivalence between EuclideanSpace ℝ (Fin n) and Fin n → ℝ. -/
+noncomputable def fromEuclidean {n : ℕ} : EuclideanSpace ℝ (Fin n) ≃ₗ[ℝ] (Fin n → ℝ) :=
+  WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+
+/-- Inverse linear equivalence. -/
+noncomputable def toEuclidean {n : ℕ} : (Fin n → ℝ) ≃ₗ[ℝ] EuclideanSpace ℝ (Fin n) :=
+  fromEuclidean.symm
+
 /-- Orthogonal projection onto a finite-dimensional subspace. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  0  -- Placeholder; proper implementation would use Mathlib's orthogonalProjection
+  fromEuclidean ((K.map toEuclidean).starProjection (toEuclidean y))
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
     iff p minimizes distance to y among all points in K. -/
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
-    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist y p ≤ dist y w) :
+    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist (toEuclidean y) (toEuclidean p) ≤ dist (toEuclidean y) (toEuclidean w)) :
     p = orthogonalProjection K y := by
   sorry
 
