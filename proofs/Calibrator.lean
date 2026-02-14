@@ -4423,16 +4423,34 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
   rw [← h_at_1]
   rfl
 
+noncomputable def toEuclidean {n : ℕ} (v : Fin n → ℝ) : EuclideanSpace ℝ (Fin n) :=
+  WithLp.linearEquiv 2 ℝ (Fin n → ℝ) v
+
+noncomputable def fromEuclidean {n : ℕ} (v : EuclideanSpace ℝ (Fin n)) : Fin n → ℝ :=
+  (WithLp.linearEquiv 2 ℝ (Fin n → ℝ)).symm v
+
 /-- Orthogonal projection onto a finite-dimensional subspace. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  0  -- Placeholder; proper implementation would use Mathlib's orthogonalProjection
+  fromEuclidean (InnerProductSpace.orthogonalProjection (K.map (WithLp.linearEquiv 2 ℝ (Fin n → ℝ))) (toEuclidean y))
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
     iff p minimizes distance to y among all points in K. -/
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
-    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist y p ≤ dist y w) :
+    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist (toEuclidean y) (toEuclidean p) ≤ dist (toEuclidean y) (toEuclidean w)) :
     p = orthogonalProjection K y := by
-  sorry
+  let equiv := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K' := K.map equiv
+  have hp' : equiv p ∈ K' := Submodule.mem_map_of_mem h_mem
+  have h_min' : ∀ w' ∈ K', dist (toEuclidean y) (equiv p) ≤ dist (toEuclidean y) w' := by
+    intro w' hw'
+    obtain ⟨w, hw, rfl⟩ := Submodule.mem_map.mp hw'
+    exact h_min w hw
+  have h_eq : equiv p = InnerProductSpace.orthogonalProjection K' (toEuclidean y) := by
+    symm
+    apply eq_orthogonalProjection_of_mem_of_dist_le hp' h_min'
+  apply equiv.injective
+  simp [orthogonalProjection, fromEuclidean]
+  exact h_eq
 
 set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
