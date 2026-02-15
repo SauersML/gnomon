@@ -4423,14 +4423,25 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
   rw [← h_at_1]
   rfl
 
+/-- Map from standard vector to Euclidean space (L2 metric). -/
+noncomputable def toEuclidean {n : ℕ} (v : Fin n → ℝ) : EuclideanSpace ℝ (Fin n) :=
+  (WithLp.linearEquiv 2 ℝ (Fin n → ℝ)).symm v
+
+/-- Map from Euclidean space to standard vector. -/
+noncomputable def fromEuclidean {n : ℕ} (v : EuclideanSpace ℝ (Fin n)) : Fin n → ℝ :=
+  (WithLp.linearEquiv 2 ℝ (Fin n → ℝ)) v
+
 /-- Orthogonal projection onto a finite-dimensional subspace. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  0  -- Placeholder; proper implementation would use Mathlib's orthogonalProjection
+  let K_E : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map (WithLp.linearEquiv 2 ℝ (Fin n → ℝ)).symm
+  let y_E := toEuclidean y
+  let proj_E := Submodule.orthogonalProjection K_E y_E
+  fromEuclidean (proj_E : EuclideanSpace ℝ (Fin n))
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
     iff p minimizes distance to y among all points in K. -/
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
-    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist y p ≤ dist y w) :
+    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist (toEuclidean y) (toEuclidean p) ≤ dist (toEuclidean y) (toEuclidean w)) :
     p = orthogonalProjection K y := by
   sorry
 
@@ -4474,7 +4485,124 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   ∀ (i : Fin n),
       linearPredictor model (data.p i) (data.c i) =
       linearPredictor model_prime (data'.p i) (data'.c i) := by
-  sorry
+  let X := designMatrix data pgsBasis splineBasis
+  let X' := designMatrix data' pgsBasis splineBasis
+  let K := LinearMap.range (Matrix.toLin' X)
+  let K' := LinearMap.range (Matrix.toLin' X')
+  have hK_eq : K = K' := h_range_eq
+
+  let pred := fun i => linearPredictor model (data.p i) (data.c i)
+  let pred' := fun i => linearPredictor model_prime (data'.p i) (data'.c i)
+
+  have h_pred_in_K : toEuclidean pred ∈ K.map (WithLp.linearEquiv 2 ℝ (Fin n → ℝ)).symm := by
+    have h_eq : pred = X.mulVec (packParams model) := by
+      ext i; exact linearPredictor_eq_designMatrix_mulVec data pgsBasis splineBasis model ⟨rfl, rfl, rfl, rfl⟩ i
+    rw [h_eq]
+    simp only [toEuclidean, Submodule.mem_map, LinearMap.mem_range, Matrix.toLin'_apply]
+    use packParams model
+    exact (WithLp.linearEquiv 2 ℝ (Fin n → ℝ)).symm_apply_apply _
+
+  have h_pred'_in_K' : toEuclidean pred' ∈ K'.map (WithLp.linearEquiv 2 ℝ (Fin n → ℝ)).symm := by
+    have h_eq : pred' = X'.mulVec (packParams model_prime) := by
+      ext i; exact linearPredictor_eq_designMatrix_mulVec data' pgsBasis splineBasis model_prime ⟨rfl, rfl, rfl, rfl⟩ i
+    rw [h_eq]
+    simp only [toEuclidean, Submodule.mem_map, LinearMap.mem_range, Matrix.toLin'_apply]
+    use packParams model_prime
+    exact (WithLp.linearEquiv 2 ℝ (Fin n → ℝ)).symm_apply_apply _
+
+  have h_min : ∀ w ∈ K, dist (toEuclidean data.y) (toEuclidean pred) ≤ dist (toEuclidean data.y) (toEuclidean w) := by
+    intro w hw
+    obtain ⟨beta, hbeta⟩ := (LinearMap.mem_range (f := Matrix.toLin' X)).mp hw
+    let m := unpackParams pgsBasis splineBasis beta
+    have hm : InModelClass m pgsBasis splineBasis := ⟨rfl, rfl, rfl, rfl⟩
+    have h_loss := fit_minimizes_loss p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank m hm
+    rw [h_lambda_zero] at h_loss
+    unfold empiricalLoss at h_loss
+    simp only [add_zero, zero_mul, mul_zero] at h_loss
+    have h_dist_sq : ∀ (m : PhenotypeInformedGAM p k sp) (hm : InModelClass m pgsBasis splineBasis),
+        (1 / (n : ℝ)) * (∑ i : Fin n, pointwiseNLL m.dist (data.y i) (linearPredictor m (data.p i) (data.c i))) =
+        (1 / (n : ℝ)) * (dist (toEuclidean data.y) (toEuclidean (fun i => linearPredictor m (data.p i) (data.c i))))^2 := by
+      intro m' hm'
+      simp only [pointwiseNLL, hm'.dist_gaussian]
+      rw [dist_eq_norm, toEuclidean, ← map_sub, norm_pow_two_real]
+      congr 1
+      simp only [WithLp.linearEquiv_symm_apply, PiLp.norm_sq_eq_of_L2, Real.norm_eq_abs, sq_abs]
+      rfl
+    rw [h_dist_sq model ⟨rfl, rfl, rfl, rfl⟩, h_dist_sq m hm] at h_loss
+    have hn_pos : 0 < (1 / (n : ℝ)) := one_div_pos.mpr (Nat.cast_pos.mpr h_n_pos)
+    rw [mul_le_mul_left hn_pos, sq_le_sq] at h_loss
+    have h_w : (fun i => linearPredictor m (data.p i) (data.c i)) = w := by
+      ext i
+      rw [linearPredictor_eq_designMatrix_mulVec data pgsBasis splineBasis m hm]
+      simp [unpack_pack_eq, Matrix.toLin'_apply, hbeta]
+      have h_pack : packParams m = beta := by
+        ext x; cases x <;> rfl
+      rw [h_pack]
+      rfl
+    rw [h_w] at h_loss
+    rw [abs_of_nonneg dist_nonneg, abs_of_nonneg dist_nonneg] at h_loss
+    exact h_loss
+
+  have h_min' : ∀ w ∈ K', dist (toEuclidean data'.y) (toEuclidean pred') ≤ dist (toEuclidean data'.y) (toEuclidean w) := by
+    intro w hw
+    obtain ⟨beta, hbeta⟩ := (LinearMap.mem_range (f := Matrix.toLin' X')).mp hw
+    let m := unpackParams pgsBasis splineBasis beta
+    have hm : InModelClass m pgsBasis splineBasis := ⟨rfl, rfl, rfl, rfl⟩
+    let h_rank' : Matrix.rank (designMatrix data' pgsBasis splineBasis) = Fintype.card (ParamIx p k sp) := by
+      let X := designMatrix data pgsBasis splineBasis
+      let X' := designMatrix data' pgsBasis splineBasis
+      have h_rank_eq : X.rank = X'.rank := rank_eq_of_range_eq X X' h_range_eq
+      rw [← h_rank_eq]
+      exact h_rank
+    have h_loss := fit_minimizes_loss p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank' m hm
+    rw [h_lambda_zero] at h_loss
+    unfold empiricalLoss at h_loss
+    simp only [add_zero, zero_mul, mul_zero] at h_loss
+    have h_dist_sq : ∀ (m : PhenotypeInformedGAM p k sp) (hm : InModelClass m pgsBasis splineBasis),
+        (1 / (n : ℝ)) * (∑ i : Fin n, pointwiseNLL m.dist (data'.y i) (linearPredictor m (data'.p i) (data'.c i))) =
+        (1 / (n : ℝ)) * (dist (toEuclidean data'.y) (toEuclidean (fun i => linearPredictor m (data'.p i) (data'.c i))))^2 := by
+      intro m' hm'
+      simp only [pointwiseNLL, hm'.dist_gaussian]
+      rw [dist_eq_norm, toEuclidean, ← map_sub, norm_pow_two_real]
+      congr 1
+      simp only [WithLp.linearEquiv_symm_apply, PiLp.norm_sq_eq_of_L2, Real.norm_eq_abs, sq_abs]
+      rfl
+    rw [h_dist_sq model_prime ⟨rfl, rfl, rfl, rfl⟩, h_dist_sq m hm] at h_loss
+    have hn_pos : 0 < (1 / (n : ℝ)) := one_div_pos.mpr (Nat.cast_pos.mpr h_n_pos)
+    rw [mul_le_mul_left hn_pos, sq_le_sq] at h_loss
+    have h_w : (fun i => linearPredictor m (data'.p i) (data'.c i)) = w := by
+      ext i
+      rw [linearPredictor_eq_designMatrix_mulVec data' pgsBasis splineBasis m hm]
+      simp [unpack_pack_eq, Matrix.toLin'_apply, hbeta]
+      have h_pack : packParams m = beta := by
+        ext x; cases x <;> rfl
+      rw [h_pack]
+      rfl
+    rw [h_w] at h_loss
+    rw [abs_of_nonneg dist_nonneg, abs_of_nonneg dist_nonneg] at h_loss
+    exact h_loss
+
+  -- Use orthogonalProjection_eq_of_dist_le
+  have h_pred_proj : pred = orthogonalProjection K data.y := by
+    apply orthogonalProjection_eq_of_dist_le
+    · rw [← Submodule.mem_map (f := (WithLp.linearEquiv 2 ℝ (Fin n → ℝ)).symm)] at h_pred_in_K
+      exact h_pred_in_K -- Wait, definition of orthogonalProjection handles K, not K_E
+      -- orthogonalProjection_eq_of_dist_le takes p in K.
+      -- h_pred_in_K proves toEuclidean pred \in K_E.
+      -- This is equivalent to pred \in K.
+      -- Correct.
+    · intro w hw
+      -- h_min uses toEuclidean w which is in K_E
+      -- The lemma expects w in K.
+      exact h_min w hw
+
+  have h_pred'_proj : pred' = orthogonalProjection K' data'.y := by
+    apply orthogonalProjection_eq_of_dist_le
+    · rw [← Submodule.mem_map] at h_pred'_in_K'; exact h_pred'_in_K'
+    · intro w hw; exact h_min' w hw
+
+  rw [h_pred_proj, h_pred'_proj, hK_eq]
+  rfl
 
 noncomputable def dist_to_support {k : ℕ} (c : Fin k → ℝ) (supp : Set (Fin k → ℝ)) : ℝ :=
   Metric.infDist c supp
