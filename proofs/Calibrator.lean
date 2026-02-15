@@ -6622,25 +6622,6 @@ For a raw score model, the spline terms are zero, so the linear predictor is jus
 -/
 open Calibrator
 
-lemma evalSmooth_eq_zero_of_raw_gen_proven {k sp : ℕ} [Fintype (Fin k)] [Fintype (Fin sp)]
-    {model : PhenotypeInformedGAM 1 k sp} (h_raw : IsRawScoreModel model)
-    (l : Fin k) (c_val : ℝ) :
-    evalSmooth model.pcSplineBasis (model.f₀ₗ l) c_val = 0 := by
-      exact evalSmooth_eq_zero_of_raw_gen h_raw l c_val
-
-lemma evalSmooth_interaction_eq_zero_of_raw_gen_proven {k sp : ℕ} [Fintype (Fin k)] [Fintype (Fin sp)]
-    {model : PhenotypeInformedGAM 1 k sp} (h_raw : IsRawScoreModel model)
-    (m : Fin 1) (l : Fin k) (c_val : ℝ) :
-    evalSmooth model.pcSplineBasis (model.fₘₗ m l) c_val = 0 := by
-      exact evalSmooth_interaction_eq_zero_of_raw_gen h_raw m l c_val
-
-lemma linearPredictor_eq_affine_of_raw_gen_proven {k sp : ℕ} [Fintype (Fin k)] [Fintype (Fin sp)]
-    (model_raw : PhenotypeInformedGAM 1 k sp)
-    (h_raw : IsRawScoreModel model_raw)
-    (h_lin : model_raw.pgsBasis.B ⟨1, by norm_num⟩ = id) :
-    ∀ p c, linearPredictor model_raw p c =
-      model_raw.γ₀₀ + model_raw.γₘ₀ 0 * p := by
-        exact fun p c => linearPredictor_eq_affine_of_raw_gen model_raw h_raw h_lin p c
 
 /-
 Bayes-optimality in the raw class implies the residual is orthogonal to 1 and P.
