@@ -6,6 +6,8 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from datetime import datetime
+import zipfile
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIG1_SCRIPT = REPO_ROOT / "sims" / "figure1_msprime_portability.py"
@@ -56,6 +58,32 @@ def _jobs() -> int:
     return max(1, int(os.cpu_count() or 8))
 
 
+def _apply_thread_env(env: dict[str, str], threads: int) -> None:
+    t = str(max(1, int(threads)))
+    for k in (
+        "OMP_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "BLIS_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "GCTB_THREADS",
+    ):
+        env[k] = t
+
+
+def _detect_total_mem_mb() -> int | None:
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    kb = int(line.split()[1])
+                    return max(1, kb // 1024)
+    except Exception:
+        return None
+    return None
+
+
 def _keep_intermediates() -> bool:
     return False
 
@@ -67,11 +95,11 @@ def _clear_ramdisk_after() -> bool:
 def _cohort_sizes(small: bool) -> dict[str, int]:
     if small:
         return {
-            "fig1_n_afr": 100,
-            "fig1_n_ooa_train": 100,
-            "fig1_n_ooa_test": 100,
-            "fig2_n_train_eur": 120,
-            "fig2_n_test_per_pop": 30,
+            "fig1_n_afr": 300,
+            "fig1_n_ooa_train": 300,
+            "fig1_n_ooa_test": 300,
+            "fig2_n_train_eur": 600,
+            "fig2_n_test_per_pop": 150,
         }
     return {
         "fig1_n_afr": 10000,
@@ -96,6 +124,8 @@ def setup_env() -> None:
             "scipy",
             "scikit-learn",
             "matplotlib",
+            "demes",
+            "demesdraw",
             "msprime",
             "stdpopsim",
             "rpy2",
@@ -145,7 +175,14 @@ def setup_env() -> None:
         print(f"tool {tool}:", shutil.which(tool) or "MISSING")
 
 
-def _run_fig1(env: dict[str, str], out_root: Path, work_root: Path, small: bool) -> None:
+def _run_fig1(
+    env: dict[str, str],
+    out_root: Path,
+    work_root: Path,
+    small: bool,
+    total_threads: int,
+    total_memory_mb: int | None,
+) -> None:
     sizes = _cohort_sizes(small)
     out = out_root / "figure1"
     out.mkdir(parents=True, exist_ok=True)
@@ -165,13 +202,26 @@ def _run_fig1(env: dict[str, str], out_root: Path, work_root: Path, small: bool)
         str(sizes["fig1_n_ooa_train"]),
         "--n-ooa-test",
         str(sizes["fig1_n_ooa_test"]),
+        "--total-threads",
+        str(max(1, int(total_threads))),
     ]
+    if total_memory_mb is not None:
+        cmd.extend(["--memory-mb-total", str(max(1024, int(total_memory_mb)))])
+    if small:
+        cmd.extend(["--gens", "5", "20", "100", "500", "2000"])
     if _keep_intermediates():
         cmd.append("--keep-intermediates")
     _run(cmd, env=env)
 
 
-def _run_fig2(env: dict[str, str], out_root: Path, work_root: Path, small: bool) -> None:
+def _run_fig2(
+    env: dict[str, str],
+    out_root: Path,
+    work_root: Path,
+    small: bool,
+    total_threads: int,
+    total_memory_mb: int | None,
+) -> None:
     sizes = _cohort_sizes(small)
     out = out_root / "figure2"
     out.mkdir(parents=True, exist_ok=True)
@@ -190,11 +240,65 @@ def _run_fig2(env: dict[str, str], out_root: Path, work_root: Path, small: bool)
         "--n-test-per-pop",
         str(sizes["fig2_n_test_per_pop"]),
         "--threads",
-        str(_jobs()),
+        str(max(1, int(total_threads))),
     ]
+    if total_memory_mb is not None:
+        cmd.extend(["--memory-mb", str(max(1024, int(total_memory_mb)))])
     if _keep_intermediates():
         cmd.append("--keep-intermediates")
     _run(cmd, env=env)
+
+
+def _resource_split(run_fig1: bool, run_fig2: bool) -> dict[str, int | None]:
+    total_threads = _jobs()
+    total_mem_mb = _detect_total_mem_mb()
+    usable_mem_mb = int(0.90 * total_mem_mb) if total_mem_mb is not None else None
+
+    if run_fig1 and run_fig2:
+        fig1_threads = max(1, int(round(total_threads * 0.75)))
+        fig2_threads = max(1, total_threads - fig1_threads)
+        if total_threads >= 8 and fig2_threads < 4:
+            fig2_threads = 4
+            fig1_threads = max(1, total_threads - fig2_threads)
+        if usable_mem_mb is not None:
+            fig1_mem = max(4096, int(round(usable_mem_mb * 0.70)))
+            fig2_mem = max(2048, usable_mem_mb - fig1_mem)
+        else:
+            fig1_mem = None
+            fig2_mem = None
+    elif run_fig1:
+        fig1_threads, fig2_threads = total_threads, 0
+        fig1_mem, fig2_mem = usable_mem_mb, None
+    elif run_fig2:
+        fig1_threads, fig2_threads = 0, total_threads
+        fig1_mem, fig2_mem = None, usable_mem_mb
+    else:
+        fig1_threads = fig2_threads = 0
+        fig1_mem = fig2_mem = None
+
+    return {
+        "total_threads": total_threads,
+        "fig1_threads": fig1_threads,
+        "fig2_threads": fig2_threads,
+        "fig1_mem_mb": fig1_mem,
+        "fig2_mem_mb": fig2_mem,
+    }
+
+
+def _zip_png_outputs(out_root: Path) -> Path | None:
+    pngs: list[Path] = []
+    for d in (out_root / "figure1", out_root / "figure2"):
+        if d.exists():
+            pngs.extend(sorted(d.glob("*.png")))
+    if not pngs:
+        return None
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    zip_path = out_root / f"figures_{ts}.zip"
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for p in pngs:
+            zf.write(p, arcname=p.name)
+    return zip_path
 
 
 def run_pipeline(figure: str, small: bool) -> None:
@@ -207,27 +311,110 @@ def run_pipeline(figure: str, small: bool) -> None:
     jobs = _jobs()
     env = os.environ.copy()
     env.setdefault("RPY2_CFFI_MODE", "API")
-    env.setdefault("OMP_NUM_THREADS", str(jobs))
-    env.setdefault("GCTB_THREADS", str(jobs))
+    _apply_thread_env(env, jobs)
     _assert_mgcv_available(env)
 
     run_fig1 = figure in ("1", "both")
     run_fig2 = figure in ("2", "both")
+    split = _resource_split(run_fig1=run_fig1, run_fig2=run_fig2)
 
-    # Deterministic orchestration: fixed execution order.
-    if run_fig1:
-        _run_fig1(env, out_root, work_root, small)
-    if run_fig2:
-        _run_fig2(env, out_root, work_root, small)
+    print(
+        "Resource plan:",
+        f"total_threads={split['total_threads']}",
+        f"fig1_threads={split['fig1_threads']}",
+        f"fig2_threads={split['fig2_threads']}",
+        f"fig1_mem_mb={split['fig1_mem_mb']}",
+        f"fig2_mem_mb={split['fig2_mem_mb']}",
+    )
+
+    # Run both figures concurrently when requested.
+    if run_fig1 and run_fig2:
+        fig1_env = env.copy()
+        _apply_thread_env(fig1_env, int(split["fig1_threads"]))
+        fig2_env = env.copy()
+        _apply_thread_env(fig2_env, int(split["fig2_threads"]))
+
+        p1 = subprocess.Popen(
+            [
+                sys.executable,
+                str(FIG1_SCRIPT),
+                "--out",
+                str(out_root / "figure1"),
+                "--work-root",
+                str(work_root / "figure1"),
+                "--n-afr",
+                str(_cohort_sizes(small)["fig1_n_afr"]),
+                "--n-ooa-train",
+                str(_cohort_sizes(small)["fig1_n_ooa_train"]),
+                "--n-ooa-test",
+                str(_cohort_sizes(small)["fig1_n_ooa_test"]),
+                "--total-threads",
+                str(split["fig1_threads"]),
+                *([] if split["fig1_mem_mb"] is None else ["--memory-mb-total", str(split["fig1_mem_mb"])]),
+                *(["--gens", "5", "20", "100", "500", "2000"] if small else []),
+                *(["--keep-intermediates"] if _keep_intermediates() else []),
+            ],
+            env=fig1_env,
+        )
+        p2 = subprocess.Popen(
+            [
+                sys.executable,
+                str(FIG2_SCRIPT),
+                "--out",
+                str(out_root / "figure2"),
+                "--work-root",
+                str(work_root / "figure2"),
+                "--n-train-eur",
+                str(_cohort_sizes(small)["fig2_n_train_eur"]),
+                "--n-test-per-pop",
+                str(_cohort_sizes(small)["fig2_n_test_per_pop"]),
+                "--threads",
+                str(split["fig2_threads"]),
+                *([] if split["fig2_mem_mb"] is None else ["--memory-mb", str(split["fig2_mem_mb"])]),
+                *(["--keep-intermediates"] if _keep_intermediates() else []),
+            ],
+            env=fig2_env,
+        )
+
+        rc1 = p1.wait()
+        rc2 = p2.wait()
+        if rc1 != 0 or rc2 != 0:
+            raise subprocess.CalledProcessError(
+                rc1 if rc1 != 0 else rc2,
+                "parallel figure run",
+            )
+    else:
+        if run_fig1:
+            _run_fig1(
+                env,
+                out_root,
+                work_root,
+                small,
+                total_threads=int(split["fig1_threads"]),
+                total_memory_mb=split["fig1_mem_mb"],
+            )
+        if run_fig2:
+            _run_fig2(
+                env,
+                out_root,
+                work_root,
+                small,
+                total_threads=int(split["fig2_threads"]),
+                total_memory_mb=split["fig2_mem_mb"],
+            )
 
     if _clear_ramdisk_after() and work_root.exists():
         shutil.rmtree(work_root, ignore_errors=True)
+
+    zip_path = _zip_png_outputs(out_root)
 
     print("Done. Outputs:")
     if run_fig1:
         print(" -", out_root / "figure1")
     if run_fig2:
         print(" -", out_root / "figure2")
+    if zip_path is not None:
+        print(" -", zip_path)
 
 
 def clean_ramdisk() -> None:

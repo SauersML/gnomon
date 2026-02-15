@@ -97,6 +97,20 @@ def _style_axes(ax, y_grid: bool = True) -> None:
     ax.set_axisbelow(True)
 
 
+def _set_runtime_thread_env(threads: int) -> None:
+    t = str(max(1, int(threads)))
+    for k in (
+        "OMP_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "BLIS_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "GCTB_THREADS",
+    ):
+        os.environ[k] = t
+
+
 def _default_total_threads() -> int:
     for key in ("SLURM_CPUS_PER_TASK", "SLURM_CPUS_ON_NODE", "OMP_NUM_THREADS"):
         val = os.environ.get(key)
@@ -381,7 +395,7 @@ def _method_preds(train_df: pd.DataFrame, test_df: pd.DataFrame, train_prs: np.n
         method.fit(P_train, PC_train, y_train)
         out[name] = method.predict_proba(P_test, PC_test)
 
-    gm = GAMMethod(n_pcs=3, k_pgs=4, k_pc=4, use_ti=False)
+    gm = GAMMethod(n_pcs=3, k_pgs=4, k_pc=4, k_interaction=3, use_ti=True)
     gm.fit(P_train, PC_train, y_train)
     out["gam"] = gm.predict_proba(P_test, PC_test)
 
@@ -516,8 +530,7 @@ def main() -> None:
         total_mb = _detect_total_mem_mb()
         memory_mb = max(2048, int(0.85 * total_mb)) if total_mb is not None else None
     print(f"Figure2 resources: threads={threads} memory_mb={memory_mb}")
-    for k in ("OMP_NUM_THREADS", "GCTB_THREADS"):
-        os.environ[k] = str(threads)
+    _set_runtime_thread_env(threads)
     if memory_mb is not None:
         os.environ["PLINK_MEMORY_MB"] = str(memory_mb)
 

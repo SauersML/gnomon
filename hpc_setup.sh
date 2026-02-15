@@ -10,6 +10,7 @@ PIP_USER_BIN="$HOME/.local/bin"
 
 export PATH="$USER_BIN:$PIP_USER_BIN:$PATH"
 export RPY2_CFFI_MODE="${RPY2_CFFI_MODE:-API}"
+export PYTHONUNBUFFERED=1
 
 log() { printf '[hpc_setup] %s\n' "$*"; }
 
@@ -61,15 +62,29 @@ ensure_python() {
     "$PYTHON_BIN" -m ensurepip --upgrade
   fi
 
+  # Fast path: skip pip work when all required imports already resolve.
+  if "$PYTHON_BIN" - <<'PY' >/dev/null 2>&1
+import importlib
+mods = [
+    "numpy", "pandas", "scipy", "sklearn", "matplotlib",
+    "msprime", "stdpopsim", "tskit",
+    "seaborn", "tabulate", "h5py", "statsmodels",
+    "demes", "demesdraw", "rpy2",
+]
+for m in mods:
+    importlib.import_module(m)
+PY
+  then
+    log "Python dependencies already installed; skipping pip install"
+    return
+  fi
+
   log "Installing Python dependencies"
   "$PYTHON_BIN" -m pip install --user --upgrade 'pip<25' setuptools wheel
   "$PYTHON_BIN" -m pip install --user \
     "numpy<2" "pandas<3" scipy scikit-learn matplotlib \
     "msprime==1.3.4" "stdpopsim==0.3.0" "tskit<1" \
-    pgscatalog-calc seaborn tabulate h5py statsmodels
-
-  # mgcv is required by sims methods; rpy2 must be importable.
-  "$PYTHON_BIN" -m pip install --user rpy2
+    pgscatalog-calc seaborn tabulate h5py statsmodels demes demesdraw rpy2
 }
 
 ensure_r_mgcv() {
@@ -142,7 +157,7 @@ run_main() {
   fi
 
   log "Running sims/main.py ${main_args[*]}"
-  exec "$PYTHON_BIN" "$SIMS_DIR/main.py" "${main_args[@]}"
+  exec "$PYTHON_BIN" -u "$SIMS_DIR/main.py" "${main_args[@]}"
 }
 
 main() {

@@ -98,6 +98,20 @@ def _style_axes(ax) -> None:
     ax.set_axisbelow(True)
 
 
+def _set_runtime_thread_env(threads: int) -> None:
+    t = str(max(1, int(threads)))
+    for k in (
+        "OMP_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "BLIS_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "GCTB_THREADS",
+    ):
+        os.environ[k] = t
+
+
 def _default_total_threads() -> int:
     for key in ("SLURM_CPUS_PER_TASK", "SLURM_CPUS_ON_NODE", "OMP_NUM_THREADS"):
         val = os.environ.get(key)
@@ -145,9 +159,21 @@ def _truncate_ratemap(rate_map: msprime.RateMap, bp_cap: int | None) -> msprime.
     return msprime.RateMap(position=new_pos, rate=new_rates)
 
 
-def _resource_plan(n_tasks: int) -> tuple[int, int, int | None]:
-    total_threads = _default_total_threads()
-    total_mem_mb = _detect_total_mem_mb()
+def _resource_plan(
+    n_tasks: int,
+    total_threads_override: int | None = None,
+    total_mem_mb_override: int | None = None,
+) -> tuple[int, int, int | None]:
+    total_threads = (
+        max(1, int(total_threads_override))
+        if total_threads_override is not None
+        else _default_total_threads()
+    )
+    total_mem_mb = (
+        max(1024, int(total_mem_mb_override))
+        if total_mem_mb_override is not None
+        else _detect_total_mem_mb()
+    )
     usable_mem_mb = int(0.85 * total_mem_mb) if total_mem_mb is not None else None
     max_jobs = max(1, min(int(n_tasks), total_threads))
 
@@ -389,7 +415,7 @@ def _fit_and_predict_methods(train_df: pd.DataFrame, test_df: pd.DataFrame, trai
         method.fit(P_train, PC_train, y_train)
         out[name] = method.predict_proba(P_test, PC_test)
 
-    gm = GAMMethod(n_pcs=3, k_pgs=4, k_pc=4, use_ti=False)
+    gm = GAMMethod(n_pcs=3, k_pgs=4, k_pc=4, k_interaction=3, use_ti=True)
     gm.fit(P_train, PC_train, y_train)
     out["gam"] = gm.predict_proba(P_test, PC_test)
 
@@ -435,18 +461,33 @@ def _plot_main(df: pd.DataFrame, out_dir: Path) -> None:
     plt.close()
 
 
-def _plot_demography(out_dir: Path) -> None:
+def _plot_demography(out_dir: Path, split_gens: int) -> None:
     _apply_plot_style()
-    fig, ax = plt.subplots(figsize=(8, 4.5))
-    ax.plot([0, 0], [0, 1], color=CB["black"], linewidth=2.1)
-    ax.plot([0, 1], [1, 1.8], color=CB["blue"], linewidth=2.2)
-    ax.plot([0, 1], [1, 0.2], color=CB["orange"], linewidth=2.2)
-    ax.text(1.02, 1.8, "AFR-like (Ne=10k)", va="center")
-    ax.text(1.02, 0.2, "OoA-like (Ne 2k -> 10k)", va="center")
-    ax.text(-0.02, 1.02, "Split", ha="right", va="bottom")
-    ax.set_xlim(-0.1, 1.6)
-    ax.set_ylim(-0.1, 2.0)
-    ax.axis("off")
+    import demes
+    import demesdraw
+
+    b = demes.Builder(time_units="generations")
+    b.add_deme(
+        "ancestral",
+        epochs=[dict(start_size=10_000, end_size=10_000, end_time=float(split_gens))],
+    )
+    b.add_deme(
+        "AFR_like",
+        ancestors=["ancestral"],
+        start_time=float(split_gens),
+        epochs=[dict(start_size=10_000, end_size=10_000, end_time=0)],
+    )
+    b.add_deme(
+        "OoA_like",
+        ancestors=["ancestral"],
+        start_time=float(split_gens),
+        epochs=[dict(start_size=2_000, end_size=10_000, end_time=0)],
+    )
+    graph = b.resolve()
+
+    fig, ax = plt.subplots(figsize=(8.2, 4.8))
+    demesdraw.tubes(graph, ax=ax, labels="xticks-mid")
+    ax.set_title(f"Figure 1 Demography Schematic (split = {int(split_gens)} generations)")
     fig.tight_layout()
     fig.savefig(out_dir / "figure1_demography.png", dpi=240)
     plt.close(fig)
@@ -539,8 +580,7 @@ def _run_generation_task(task: dict[str, object]) -> dict[str, object]:
     bp_cap = task["bp_cap"]
     pgs_effects = np.asarray(task["pgs_effects"], dtype=float)
 
-    for k in ("OMP_NUM_THREADS", "GCTB_THREADS"):
-        os.environ[k] = str(threads_per_job)
+    _set_runtime_thread_env(threads_per_job)
     if memory_mb_per_job is not None:
         os.environ["PLINK_MEMORY_MB"] = str(int(memory_mb_per_job))
 
@@ -647,6 +687,18 @@ def main() -> None:
     parser.add_argument("--pca-sites", type=int, default=2000)
     parser.add_argument("--causal-sites", type=int, default=5000)
     parser.add_argument("--bp-cap", type=int, default=None)
+    parser.add_argument(
+        "--total-threads",
+        type=int,
+        default=None,
+        help="Total thread budget for Figure 1 auto-planner.",
+    )
+    parser.add_argument(
+        "--memory-mb-total",
+        type=int,
+        default=None,
+        help="Total memory budget (MB) for Figure 1 auto-planner.",
+    )
     parser.add_argument("--work-root", default=None, help="Directory for heavy transient work files (e.g., RAM disk).")
     parser.add_argument("--keep-intermediates", action="store_true", help="Keep per-generation PLINK/GCTB intermediate files.")
     args = parser.parse_args()
@@ -662,7 +714,12 @@ def main() -> None:
     # Prewarm stdpopsim chr22 map once in the parent process to avoid
     # concurrent cache initialization races across workers.
     _ = get_chr22_recomb_map()
-    jobs, threads_per_job, memory_mb_per_job = _resource_plan(n_tasks=len(args.gens))
+    jobs, threads_per_job, memory_mb_per_job = _resource_plan(
+        n_tasks=len(args.gens),
+        total_threads_override=args.total_threads,
+        total_mem_mb_override=args.memory_mb_total,
+    )
+    _set_runtime_thread_env(threads_per_job)
     print(
         f"Figure1 resources: jobs={jobs} threads_per_job={threads_per_job} "
         f"memory_mb_per_job={memory_mb_per_job}"
@@ -706,7 +763,7 @@ def main() -> None:
     res_df.to_csv(out_dir / "figure1_auc_ratio.tsv", sep="\t", index=False)
 
     _plot_main(res_df, out_dir)
-    _plot_demography(out_dir)
+    _plot_demography(out_dir, split_gens=int(sorted(args.gens)[len(args.gens) // 2]))
     _plot_prs_grid(prs_df.to_dict("records"), out_dir)
     _plot_pc_grid(pc_df.to_dict("records"), out_dir)
 
