@@ -4423,16 +4423,76 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
   rw [← h_at_1]
   rfl
 
+section ProjectionFix
+set_option maxHeartbeats 10000000
+
 /-- Orthogonal projection onto a finite-dimensional subspace. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  0  -- Placeholder; proper implementation would use Mathlib's orthogonalProjection
+  let equiv := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K_E : Submodule ℝ (WithLp 2 (Fin n → ℝ)) := K.map (equiv.symm : (Fin n → ℝ) →ₗ[ℝ] WithLp 2 (Fin n → ℝ))
+  let y_E : WithLp 2 (Fin n → ℝ) := equiv.symm y
+  let proj_E := Submodule.orthogonalProjection K_E y_E
+  equiv proj_E
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
-    iff p minimizes distance to y among all points in K. -/
+    iff p minimizes L2 distance to y among all points in K. -/
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
-    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist y p ≤ dist y w) :
+    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, l2norm_sq (y - p) ≤ l2norm_sq (y - w)) :
     p = orthogonalProjection K y := by
-  sorry
+  let equiv := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K_E : Submodule ℝ (WithLp 2 (Fin n → ℝ)) := K.map (equiv.symm : (Fin n → ℝ) →ₗ[ℝ] WithLp 2 (Fin n → ℝ))
+  let y_E : WithLp 2 (Fin n → ℝ) := equiv.symm y
+  let p_E : WithLp 2 (Fin n → ℝ) := equiv.symm p
+
+  haveI : Fact ((1 : ℝ) ≤ 2) := Fact.mk (by norm_num)
+
+  -- Transport to EuclideanSpace logic
+  have h_mem_E : p_E ∈ K_E := by
+    rw [Submodule.mem_map]
+    exact ⟨p, h_mem, rfl⟩
+
+  -- Relate l2norm_sq to dist^2 in WithLp
+  have h_norm_eq : ∀ u, l2norm_sq u = ‖equiv.symm u‖ ^ 2 := by
+    intro u
+    simp only [l2norm_sq, PiLp.norm_sq_eq_of_L2]
+
+  -- Translate minimization condition
+  have h_min_E : ∀ w_E ∈ K_E, ‖y_E - p_E‖ ≤ ‖y_E - w_E‖ := by
+    intro w_E hw_E
+    obtain ⟨w, hw, rfl⟩ := (Submodule.mem_map).mp hw_E
+    specialize h_min w hw
+    rw [h_norm_eq (y - p), h_norm_eq (y - w)] at h_min
+    have h_sub : ∀ a b, equiv.symm (a - b) = equiv.symm a - equiv.symm b := map_sub equiv.symm
+    rw [h_sub y p, h_sub y w] at h_min
+    rw [sq_le_sq, abs_of_nonneg (norm_nonneg _), abs_of_nonneg (norm_nonneg _)] at h_min
+    exact h_min
+
+  -- Apply orthogonality characterization in EuclideanSpace
+  have h_ortho : ∀ w_E ∈ K_E, ⟪y_E - p_E, w_E⟫_ℝ = 0 := by
+    rw [← Submodule.norm_eq_iInf_iff_inner_eq_zero K_E h_mem_E]
+    apply le_antisymm
+    · apply le_ciInf
+      intro w_E
+      exact h_min_E w_E (Subtype.coe_prop w_E)
+    · apply ciInf_le
+      · use 0
+        intro _ ⟨x, hx⟩
+        rw [← hx]
+        exact norm_nonneg _
+      · use p_E, h_mem_E
+
+  have h_proj : p_E = K_E.orthogonalProjection y_E := by
+    rw [Submodule.coe_orthogonalProjection_apply]
+    apply Eq.symm
+    apply Submodule.eq_starProjection_of_mem_of_inner_eq_zero h_mem_E h_ortho
+
+  -- Map back
+  rw [orthogonalProjection]
+  dsimp
+  rw [← h_proj]
+  exact equiv.apply_symm_apply p
+
+end ProjectionFix
 
 set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
@@ -6741,7 +6801,7 @@ lemma optimal_coefficients_for_additive_dgp_proven
           · simp +decide [ mul_assoc, MeasureTheory.integral_const_mul, MeasureTheory.integral_mul_const, hP0, hC0, h_integral_prod ];
             exact Or.inr ( by simpa only [ mul_comm ] using h_integral_prod.trans ( by simp +decide [ hP0, hC0 ] ) );
           · exact hP_int.mul_const _;
-          · convert hP2_int.mul_const ( model.γₘ₀ ⟨ 0, by norm_num ⟩ ) using 2 ; ring;
+          · convert hP2_int.mul_const ( model.γₘ₀ ⟨ 0, by norm_num ⟩ ) using 2 ; try ring_nf;
             rfl;
         · simpa only [ sq ] using hP2_int;
         · exact MeasureTheory.Integrable.const_mul ( by simpa only [ mul_comm ] using hPC_int ) _;
