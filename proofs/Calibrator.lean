@@ -4423,16 +4423,68 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
   rw [← h_at_1]
   rfl
 
+/-- Convert to Euclidean space (L2 norm) -/
+noncomputable def toEuclidean {n : ℕ} (v : Fin n → ℝ) : EuclideanSpace ℝ (Fin n) :=
+  WithLp.equiv 2 (Fin n → ℝ) v
+
+/-- Convert from Euclidean space -/
+noncomputable def fromEuclidean {n : ℕ} (v : EuclideanSpace ℝ (Fin n)) : Fin n → ℝ :=
+  (WithLp.equiv 2 (Fin n → ℝ)).symm v
+
 /-- Orthogonal projection onto a finite-dimensional subspace. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  0  -- Placeholder; proper implementation would use Mathlib's orthogonalProjection
+  let equiv := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K_L2 : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map equiv.symm
+  let y_L2 := toEuclidean y
+  fromEuclidean (K_L2.starProjection y_L2)
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
     iff p minimizes distance to y among all points in K. -/
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
-    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist y p ≤ dist y w) :
+    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist (toEuclidean y) (toEuclidean p) ≤ dist (toEuclidean y) (toEuclidean w)) :
     p = orthogonalProjection K y := by
-  sorry
+  let equiv := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K_L2 : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map equiv.symm
+  let y_L2 := toEuclidean y
+  let p_L2 := toEuclidean p
+
+  have h_mem_L2 : p_L2 ∈ K_L2 := by
+    simp [K_L2, p_L2, toEuclidean, equiv]
+    use p, h_mem
+    exact (equiv.apply_symm_apply p).symm
+
+  have h_min_L2 : ∀ w_L2 ∈ K_L2, dist y_L2 p_L2 ≤ dist y_L2 w_L2 := by
+    intro w_L2 hw_L2
+    obtain ⟨w, hw, rfl⟩ := (Submodule.mem_map).mp hw_L2
+    specialize h_min w hw
+    -- Map w to w_L2 in the inequality
+    have : toEuclidean w = equiv.symm w := rfl
+    rw [← this]
+    exact h_min
+
+  -- Uniqueness of minimizer in Hilbert space
+  have h_p_eq : p_L2 = K_L2.starProjection y_L2 := by
+    apply Submodule.eq_starProjection_of_mem_of_inner_eq_zero h_mem_L2
+    intro w_L2 hw_L2
+    apply (Submodule.norm_eq_iInf_iff_inner_eq_zero h_mem_L2).mp
+    · intro w' hw'
+      simp only [dist_eq_norm] at h_min_L2
+      have h := h_min_L2 w' hw'
+      rw [le_ciInf_iff]
+      · intro b hb
+        simp only [Set.mem_range, exists_exists_eq_and] at hb
+        obtain ⟨x, hx, rfl⟩ := hb
+        exact h_min_L2 x hx
+      · use 0
+        simp [Set.mem_range]
+        use p_L2, h_mem_L2
+        exact norm_nonneg _
+    · exact hw_L2
+
+  -- Map back
+  apply equiv.symm.injective
+  dsimp [orthogonalProjection, toEuclidean, fromEuclidean] at *
+  simp [equiv, h_p_eq]
 
 set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
