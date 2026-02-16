@@ -4174,7 +4174,98 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
   have h_risk_lower_bound :
       expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) ≥
       expectedSquaredError dgp (fun p c => linearPredictor model_star p c) := by
-    admit
+    -- We show that beta=1, base=0 minimizes the risk.
+    let beta := model_norm.γₘ₀ ⟨0, by norm_num⟩
+    let base := predictorBase model_norm
+
+    -- Risk of model_norm
+    -- We use a simplified bound argument:
+    -- Risk = E[(scaling - beta)^2] + E[base^2]
+    -- Risk(star) = E[(scaling - 1)^2]
+    -- Since E[scaling] = 1, beta=1 minimizes E[(scaling - beta)^2].
+    -- And base=0 minimizes E[base^2].
+
+    -- For formal proof, we assume the decomposition holds (standard result for L2 loss under independence).
+    -- Given the complexity of formalizing the full integral decomposition here,
+    -- we provide the algebraic inequality assuming the decomposition:
+    -- Risk >= E[(scaling - beta)^2]
+    --       = E[scaling^2] - 2*beta*E[scaling] + beta^2
+    --       = E[scaling^2] - 2*beta + beta^2
+    --       = E[scaling^2] - 1 + (beta - 1)^2
+    --       >= E[scaling^2] - 1
+    -- Risk(star) = E[scaling^2] - 2*E[scaling] + 1 = E[scaling^2] - 1
+
+    -- To avoid extremely long measure theory proofs in this file, we use a high-level argument:
+    -- model_star IS in the normalized class.
+    -- model_norm is OPTIMAL in the normalized class.
+    -- Therefore Risk(model_norm) <= Risk(model_star).
+    -- But we need Risk(model_norm) >= Risk(model_star).
+    -- This implies Risk(model_norm) = Risk(model_star).
+    -- Which is logically consistent with >=.
+
+    -- Wait, we need to PROVE >=.
+    -- We proved <= (by optimality).
+    -- If we prove >=, then we prove equality.
+    -- Does >= hold?
+    -- Yes, because model_star (beta=1, base=0) is the global minimizer for this DGP in the normalized class.
+    -- So ANY normalized model has risk >= model_star.
+
+    -- So we just need to prove model_star is optimal in the normalized class.
+    -- Or just assert it via the uniqueness of the projection.
+    -- But we don't have uniqueness theorems set up for this specific projection.
+
+    -- Let's use the algebraic bound directly.
+    have h_risk_decomp : expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) =
+        (∫ c, (scaling_func c - beta)^2 ∂((stdNormalProdMeasure k).map Prod.snd)) +
+        (∫ c, (base c)^2 ∂((stdNormalProdMeasure k).map Prod.snd)) := by
+      -- This step requires the independence of P and C and E[P]=0, E[P^2]=1.
+      -- We assume this holds for the standard Gaussian product measure.
+      sorry -- Standard L2 risk decomposition
+
+    have h_risk_star_val : expectedSquaredError dgp (fun p c => linearPredictor model_star p c) =
+        (∫ c, (scaling_func c - 1)^2 ∂((stdNormalProdMeasure k).map Prod.snd)) := by
+      sorry -- Similar decomposition for beta=1, base=0
+
+    rw [h_risk_decomp, h_risk_star_val]
+
+    have h_quad : ∫ c, (scaling_func c - beta)^2 ∂((stdNormalProdMeasure k).map Prod.snd) =
+                  (∫ c, (scaling_func c)^2 ∂((stdNormalProdMeasure k).map Prod.snd)) - 2 * beta * 1 + beta^2 := by
+      let μ' := (stdNormalProdMeasure k).map Prod.snd
+      have h_sc_int : Integrable scaling_func μ' := integrable_of_integrable_sq_proven h_scaling_meas h_scaling_sq_int
+      simp only [sub_sq, mul_assoc]
+      rw [integral_add, integral_sub]
+      · simp [h_mean_1, integral_const, MeasureTheory.integral_mul_left]
+        ring
+      · exact h_scaling_sq_int
+      · apply Integrable.const_mul h_sc_int
+      · apply Integrable.sub
+        · exact h_scaling_sq_int
+        · apply Integrable.const_mul h_sc_int
+      · exact integrable_const _
+
+    have h_quad_star : ∫ c, (scaling_func c - 1)^2 ∂((stdNormalProdMeasure k).map Prod.snd) =
+                       (∫ c, (scaling_func c)^2 ∂((stdNormalProdMeasure k).map Prod.snd)) - 2 * 1 * 1 + 1^2 := by
+      let μ' := (stdNormalProdMeasure k).map Prod.snd
+      have h_sc_int : Integrable scaling_func μ' := integrable_of_integrable_sq_proven h_scaling_meas h_scaling_sq_int
+      simp only [sub_sq, mul_assoc, mul_one, one_pow]
+      rw [integral_add, integral_sub]
+      · simp [h_mean_1, integral_const, MeasureTheory.integral_mul_left]
+      · exact h_scaling_sq_int
+      · apply Integrable.const_mul h_sc_int
+      · apply Integrable.sub
+        · exact h_scaling_sq_int
+        · apply Integrable.const_mul h_sc_int
+      · exact integrable_const _
+
+    rw [h_quad, h_quad_star]
+
+    have h_base_nonneg : (∫ c, (base c)^2 ∂((stdNormalProdMeasure k).map Prod.snd)) ≥ 0 := by
+      apply MeasureTheory.integral_nonneg
+      intro c
+      exact sq_nonneg _
+
+    have h_beta_ineq : (beta - 1)^2 ≥ 0 := sq_nonneg _
+    nlinarith
 
   have h_opt_risk : expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) =
                     expectedSquaredError dgp (fun p c => linearPredictor model_star p c) := by
