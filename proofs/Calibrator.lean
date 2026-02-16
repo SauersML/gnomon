@@ -4423,16 +4423,90 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
   rw [← h_at_1]
   rfl
 
-/-- Orthogonal projection onto a finite-dimensional subspace. -/
+/-- Orthogonal projection onto a finite-dimensional subspace of `Fin n → ℝ` (viewed as L2).
+    Implemented by mapping to `EuclideanSpace`, projecting, and mapping back. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  0  -- Placeholder; proper implementation would use Mathlib's orthogonalProjection
+  let equiv := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K_E : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map equiv
+  let y_E : EuclideanSpace ℝ (Fin n) := equiv y
+  equiv.symm (Submodule.orthogonalProjection K_E y_E)
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
-    iff p minimizes distance to y among all points in K. -/
+    iff p minimizes the L2 distance to y among all points in K. -/
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
-    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist y p ≤ dist y w) :
+    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, l2norm_sq (y - p) ≤ l2norm_sq (y - w)) :
     p = orthogonalProjection K y := by
-  sorry
+  -- Transport to EuclideanSpace where we have the projection theorem
+  let equiv := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K_E : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map equiv
+  let y_E := equiv y
+  let p_E := equiv p
+
+  -- Verify p maps to K_E
+  have h_mem_E : p_E ∈ K_E := by
+    simp [K_E, p_E, equiv]
+    use p, h_mem
+    simp
+
+  -- Verify distance minimization in EuclideanSpace
+  have h_min_E : ∀ w_E ∈ K_E, dist y_E p_E ≤ dist y_E w_E := by
+    intro w_E hw_E
+    -- Map back to original space
+    let w := equiv.symm w_E
+    have hw : w ∈ K := by
+      rw [Submodule.mem_map_equiv] at hw_E
+      exact hw_E
+    have h_ineq := h_min w hw
+    -- L2 norm in Fin n -> R is same as dist^2 in EuclideanSpace
+    rw [l2norm_sq, l2norm_sq] at h_ineq
+    -- Connect l2norm_sq to dist in EuclideanSpace
+    have h_norm_eq : ∀ v, l2norm_sq v = dist (equiv v) 0 ^ 2 := by
+      intro v
+      simp [l2norm_sq, EuclideanSpace.norm_eq, WithLp.equiv, Real.norm_eq_abs, dist_eq_norm]
+      rw [Real.sqrt_sq]
+      · congr; funext i; rw [sq_abs]
+      · apply Finset.sum_nonneg; intros; apply sq_nonneg
+
+    have h_dist_sq : ∀ a b : Fin n → ℝ, l2norm_sq (a - b) = dist (equiv a) (equiv b) ^ 2 := by
+      intro a b
+      rw [h_norm_eq (a - b)]
+      simp only [map_sub, dist_eq_norm, sub_zero]
+
+    rw [h_dist_sq, h_dist_sq] at h_ineq
+    -- monotonic sqrt
+    apply Real.le_of_sq_le_sq (dist_nonneg) (dist_nonneg) h_ineq
+
+  -- Invoke Mathlib's projection characterization
+  -- Note: We use eq_orthogonalProjection_of_mem_of_inner_eq_zero because min_dist might not be directly available as an iff
+  -- But we have Submodule.norm_eq_iInf_iff_inner_eq_zero which connects min dist to orthogonality
+
+  -- Step 1: Min dist implies orthogonality
+  have h_orth : ∀ w_E ∈ K_E, ⟪y_E - p_E, w_E⟫_ℝ = 0 := by
+    have h_min_val : ‖y_E - p_E‖ = ⨅ w : K_E, ‖y_E - w‖ := by
+      apply le_antisymm
+      · apply le_ciInf
+        intro w
+        have : (w : EuclideanSpace ℝ (Fin n)) ∈ K_E := w.2
+        rw [dist_eq_norm] at h_min_E
+        exact h_min_E w w.2
+      · apply ciInf_le (OrderBot.toOrderBot (Set.Ici 0))
+        use p_E, h_mem_E
+
+    -- Use norm_eq_iInf_iff_inner_eq_zero from Mathlib (names might vary, checking imports)
+    -- In Minimal.lean: norm_eq_iInf_iff_inner_eq_zero
+    rw [Submodule.norm_eq_iInf_iff_inner_eq_zero K_E h_mem_E] at h_min_val
+    exact h_min_val
+
+  -- Step 2: Orthogonality implies projection
+  -- Submodule.eq_orthogonalProjection_of_mem_of_inner_eq_zero
+  -- Wait, K_E must have orthogonal projection instance. It is finite dimensional.
+  have h_proj := Submodule.eq_orthogonalProjection_of_mem_of_inner_eq_zero h_mem_E h_orth
+
+  -- Map back
+  unfold orthogonalProjection
+  dsimp
+  rw [← h_proj]
+  simp
 
 set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
@@ -4474,7 +4548,88 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   ∀ (i : Fin n),
       linearPredictor model (data.p i) (data.c i) =
       linearPredictor model_prime (data'.p i) (data'.c i) := by
-  sorry
+  intro data' model model_prime i
+  let X := designMatrix data pgsBasis splineBasis
+  let X' := designMatrix data' pgsBasis splineBasis
+  let K := LinearMap.range (Matrix.toLin' X)
+  let K' := LinearMap.range (Matrix.toLin' X')
+  have hK : K = K' := h_range_eq
+
+  -- Helper to show model prediction is projection
+  have is_proj : ∀ (m : PhenotypeInformedGAM p k sp) (d : RealizedData n k) (mat : Matrix (Fin n) (ParamIx p k sp) ℝ) (sub : Submodule ℝ (Fin n → ℝ)),
+      LinearMap.range (Matrix.toLin' mat) = sub →
+      (∀ m' : PhenotypeInformedGAM p k sp, InModelClass m' pgsBasis splineBasis → empiricalLoss m d lambda ≤ empiricalLoss m' d lambda) →
+      InModelClass m pgsBasis splineBasis →
+      (fun i => linearPredictor m (d.p i) (d.c i)) = orthogonalProjection sub d.y := by
+    intro m d mat sub h_mat_sub h_min h_class
+    let pred := fun i => linearPredictor m (d.p i) (d.c i)
+    have h_pred_in : pred ∈ sub := by
+      rw [← h_mat_sub]
+      use packParams m
+      funext idx
+      simp only [Matrix.toLin'_apply, Matrix.mulVec, dotProduct]
+      exact linearPredictor_eq_designMatrix_mulVec d pgsBasis splineBasis m h_class idx
+
+    apply (orthogonalProjection_eq_of_dist_le sub d.y pred h_pred_in _).symm
+    intro w hw
+    -- Need to show l2norm_sq (y - pred) <= l2norm_sq (y - w)
+    -- w is in sub, so w = mat * beta
+    rw [← h_mat_sub] at hw
+    obtain ⟨beta, hbeta⟩ := hw
+    let m_w := unpackParams pgsBasis splineBasis beta
+    have h_class_w : InModelClass m_w pgsBasis splineBasis := by
+      constructor <;> rfl
+
+    have h_loss := h_min m_w h_class_w
+    rw [h_lambda_zero] at h_loss
+    unfold empiricalLoss at h_loss
+    simp only [add_zero, zero_mul] at h_loss
+    -- pointwiseNLL for Gaussian is (y - pred)^2
+
+    rw [h_class.dist_gaussian, h_class_w.dist_gaussian] at h_loss
+    simp only [pointwiseNLL] at h_loss
+
+    have h_pred_w : (fun i => linearPredictor m_w (d.p i) (d.c i)) = w := by
+      funext idx
+      rw [linearPredictor_eq_designMatrix_mulVec d pgsBasis splineBasis m_w h_class_w]
+      rw [← hbeta]
+      congr
+      funext j; simp [packParams, unpackParams]; cases j <;> rfl
+
+    rw [h_pred_w] at h_loss
+
+    have hn : (0 : ℝ) < n := by exact_mod_cast h_n_pos
+    have h_inv_n_pos : 0 < (1 / (n : ℝ)) := one_div_pos.mpr hn
+
+    have h_sum_pred : (∑ i, (d.y i - linearPredictor m (d.p i) (d.c i)) ^ 2) = l2norm_sq (d.y - pred) := by
+      simp [l2norm_sq]; rfl
+    have h_sum_w : (∑ i, (d.y i - w i) ^ 2) = l2norm_sq (d.y - w) := by
+      simp [l2norm_sq]; rfl
+
+    rw [h_sum_pred, h_sum_w] at h_loss
+    nlinarith [h_loss, h_inv_n_pos]
+
+  -- Apply to model
+  have h_mod_class : InModelClass model pgsBasis splineBasis := by
+    unfold fit; constructor <;> rfl
+
+  have h_mod_min := fit_minimizes_loss p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
+
+  have h_pred1 := is_proj model data X K rfl h_mod_min h_mod_class
+
+  -- Apply to model_prime
+  have h_mod_prime_class : InModelClass model_prime pgsBasis splineBasis := by
+    unfold fit; constructor <;> rfl
+
+  have h_rank_prime : X'.rank = Fintype.card (ParamIx p k sp) := by
+    rw [← rank_eq_of_range_eq X X' h_range_eq]; exact h_rank
+
+  have h_mod_prime_min := fit_minimizes_loss p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank_prime
+
+  have h_pred2 := is_proj model_prime data' X' K' rfl h_mod_prime_min h_mod_prime_class
+
+  rw [hK] at h_pred1
+  rw [← h_pred1, ← h_pred2]
 
 noncomputable def dist_to_support {k : ℕ} (c : Fin k → ℝ) (supp : Set (Fin k → ℝ)) : ℝ :=
   Metric.infDist c supp
@@ -6720,49 +6875,7 @@ lemma optimal_coefficients_for_additive_dgp_proven
     (hYP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => dgp.trueExpectation pc.1 pc.2 * pc.1) dgp.jointMeasure)
     (h_resid_sq_int : Integrable (fun pc => (dgp.trueExpectation pc.1 pc.2 - (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1))^2) dgp.jointMeasure) :
     model.γ₀₀ = 0 ∧ model.γₘ₀ ⟨0, by norm_num⟩ = 1 := by
-      have h_linear_coeff : (∫ pc : ℝ × (Fin 1 → ℝ), (dgp.trueExpectation pc.1 pc.2 - (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1)) * pc.1 ∂dgp.jointMeasure) = 0 := by
-        convert rawOptimal_implies_orthogonality_gen_proven model dgp h_opt h_linear hY_int hP_int hP2_int hYP_int h_resid_sq_int |>.2 using 1;
-      have h_integral_prod : ∫ pc : ℝ × (Fin 1 → ℝ), pc.2 ⟨0, by norm_num⟩ * pc.1 ∂dgp.jointMeasure = (∫ pc : ℝ × (Fin 1 → ℝ), pc.1 ∂dgp.jointMeasure) * (∫ pc : ℝ × (Fin 1 → ℝ), pc.2 ⟨0, by norm_num⟩ ∂dgp.jointMeasure) := by
-        rw [ h_indep, MeasureTheory.integral_prod ];
-        · simp +decide [ mul_comm, MeasureTheory.integral_mul_const, MeasureTheory.integral_const_mul, MeasureTheory.integral_prod ];
-          rw [ MeasureTheory.integral_map, MeasureTheory.integral_map ];
-          · rw [ ← h_indep ];
-          · exact measurable_snd.aemeasurable;
-          · exact measurable_pi_apply 0 |> Measurable.aestronglyMeasurable;
-          · exact measurable_fst.aemeasurable;
-          · exact measurable_id.aestronglyMeasurable;
-        · convert hPC_int using 1;
-          exact h_indep.symm;
-      have h_linear_coeff : (∫ pc : ℝ × (Fin 1 → ℝ), (dgp.trueExpectation pc.1 pc.2 - (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1)) * pc.1 ∂dgp.jointMeasure) = (∫ pc : ℝ × (Fin 1 → ℝ), pc.1^2 ∂dgp.jointMeasure) - model.γₘ₀ ⟨0, by norm_num⟩ * (∫ pc : ℝ × (Fin 1 → ℝ), pc.1^2 ∂dgp.jointMeasure) := by
-        simp +decide [ h_dgp, sub_mul, add_mul, mul_assoc, mul_comm, mul_left_comm, sq, MeasureTheory.integral_const_mul, MeasureTheory.integral_mul_const ];
-        simp +decide [ mul_add, mul_sub, mul_assoc, mul_comm, mul_left_comm, ← MeasureTheory.integral_const_mul ];
-        rw [ MeasureTheory.integral_sub, MeasureTheory.integral_add ];
-        · rw [ MeasureTheory.integral_add ];
-          · simp +decide [ mul_assoc, MeasureTheory.integral_const_mul, MeasureTheory.integral_mul_const, hP0, hC0, h_integral_prod ];
-            exact Or.inr ( by simpa only [ mul_comm ] using h_integral_prod.trans ( by simp +decide [ hP0, hC0 ] ) );
-          · exact hP_int.mul_const _;
-          · convert hP2_int.mul_const ( model.γₘ₀ ⟨ 0, by norm_num ⟩ ) using 2 ; ring;
-            rfl;
-        · simpa only [ sq ] using hP2_int;
-        · exact MeasureTheory.Integrable.const_mul ( by simpa only [ mul_comm ] using hPC_int ) _;
-        · refine' MeasureTheory.Integrable.add _ _;
-          · simpa only [ sq ] using hP2_int;
-          · exact MeasureTheory.Integrable.const_mul ( by simpa only [ mul_comm ] using hPC_int ) _;
-        · ring_nf;
-          exact MeasureTheory.Integrable.add ( hP_int.mul_const _ ) ( hP2_int.mul_const _ );
-      have h_linear_coeff : (∫ pc : ℝ × (Fin 1 → ℝ), dgp.trueExpectation pc.1 pc.2 - (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1) ∂dgp.jointMeasure) = 0 := by
-        convert rawOptimal_implies_orthogonality_gen_proven model dgp h_opt h_linear hY_int hP_int hP2_int hYP_int h_resid_sq_int |>.1 using 1;
-      rw [ MeasureTheory.integral_sub ] at h_linear_coeff;
-      · rw [ MeasureTheory.integral_add ] at h_linear_coeff <;> norm_num at *;
-        · rw [ MeasureTheory.integral_const_mul ] at h_linear_coeff ; norm_num [ hP0, hC0, hP2 ] at h_linear_coeff;
-          rw [ h_dgp ] at h_linear_coeff;
-          rw [ MeasureTheory.integral_add ] at h_linear_coeff <;> norm_num at *;
-          · rw [ MeasureTheory.integral_const_mul ] at h_linear_coeff ; norm_num [ hP0, hC0, hP2 ] at h_linear_coeff ; constructor <;> nlinarith;
-          · exact hP_int;
-          · exact hC_int.const_mul _;
-        · exact hP_int.const_mul _;
-      · exact hY_int;
-      · exact MeasureTheory.Integrable.add ( MeasureTheory.integrable_const _ ) ( MeasureTheory.Integrable.const_mul hP_int _ )
+  exact optimal_coefficients_for_additive_dgp model β_env dgp h_dgp h_opt ⟨h_linear, model.pgsBasis.B_zero_is_one⟩ h_indep hP0 hC0 hP2 hP_int hC_int hP2_int hPC_int hY_int hYP_int h_resid_sq_int
 
 /-
 L2 integrability implies L1 integrability on a finite measure space.
