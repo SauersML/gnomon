@@ -123,6 +123,7 @@ def setup_env() -> None:
             "pandas",
             "scipy",
             "scikit-learn",
+            "numba",
             "matplotlib",
             "demes",
             "demesdraw",

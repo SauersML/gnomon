@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import os
+import time
 import shutil
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -11,6 +13,10 @@ import numpy as np
 import pandas as pd
 import stdpopsim
 import tskit
+try:
+    import numba as nb
+except Exception:
+    nb = None
 from scipy.stats import gaussian_kde
 from scipy.special import expit as sigmoid
 from sklearn.preprocessing import StandardScaler
@@ -67,6 +73,61 @@ CB = {
     "purple": "#CC79A7",
     "black": "#111111",
 }
+
+
+def _log(msg: str) -> None:
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] {msg}", flush=True)
+
+
+def _rss_gb() -> float:
+    try:
+        import resource
+
+        rss = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        # Linux ru_maxrss is KiB; macOS/BSD is bytes.
+        if rss > 10_000_000:
+            return rss / (1024.0 ** 3)
+        return rss / (1024.0 ** 2)
+    except Exception:
+        return float("nan")
+
+
+def _stage_done(prefix: str, stage: str, started_at: float, extra: str = "") -> None:
+    elapsed = time.perf_counter() - started_at
+    tail = f" {extra}" if extra else ""
+    _log(f"[{prefix}] {stage} done in {elapsed:.1f}s (rss_gb={_rss_gb():.2f}){tail}")
+
+
+if nb is not None:
+    @nb.njit(cache=True)
+    def _accumulate_link_edges_numba(
+        child_idx: np.ndarray,
+        parent_src: np.ndarray,
+        span: np.ndarray,
+        hap_to_dip: np.ndarray,
+        out_dip: np.ndarray,
+    ) -> None:
+        for i in range(child_idx.shape[0]):
+            c = int(child_idx[i])
+            s = int(parent_src[i])
+            if c >= 0 and s >= 0:
+                d = int(hap_to_dip[c])
+                if d >= 0:
+                    out_dip[d, s] += 0.5 * span[i]
+else:
+    def _accumulate_link_edges_numba(
+        child_idx: np.ndarray,
+        parent_src: np.ndarray,
+        span: np.ndarray,
+        hap_to_dip: np.ndarray,
+        out_dip: np.ndarray,
+    ) -> None:
+        valid = (child_idx >= 0) & (parent_src >= 0)
+        if np.any(valid):
+            dip_idx = hap_to_dip[child_idx[valid]]
+            w = 0.5 * span[valid]
+            np.add.at(out_dip, (dip_idx, parent_src[valid]), w)
 
 
 def _apply_plot_style() -> None:
@@ -141,47 +202,135 @@ def _default_work_root(out_dir: Path) -> Path:
     return out_dir / "work"
 
 
-def _true_ancestry_proportions(ts, a_idx: np.ndarray, b_idx: np.ndarray, pop_lookup: dict[int, str]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _true_ancestry_proportions(
+    ts,
+    a_idx: np.ndarray,
+    b_idx: np.ndarray,
+    pop_lookup: dict[int, str],
+    ancestry_census_time: float,
+    log_prefix: str | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _source_index_from_pop_name(name: str) -> int:
+        u = str(name).upper()
+        if "AFR" in u:
+            return 0
+        if "EUR" in u:
+            return 1
+        if "ASIA" in u or "EAS" in u:
+            return 2
+        return -1
+
     sample_nodes = ts.samples()
     n_hap = len(sample_nodes)
+    n_dip = int(a_idx.shape[0])
     src_names = ["AFR", "EUR", "ASIA"]
-    src_to_col = {name: j for j, name in enumerate(src_names)}
-    acc = np.zeros((n_hap, len(src_names)), dtype=np.float64)
+    src_to_col = {name: i for i, name in enumerate(src_names)}
+    dip_acc = np.zeros((n_dip, len(src_names)), dtype=np.float64)
     total_len = float(ts.sequence_length)
+    sample_nodes_arr = np.asarray(sample_nodes, dtype=np.int32)
+    n_nodes = int(ts.num_nodes)
+    sample_lookup = np.full(n_nodes, -1, dtype=np.int64)
+    sample_lookup[sample_nodes_arr.astype(np.int64)] = np.arange(n_hap, dtype=np.int64)
+    hap_to_dip = np.full(n_hap, -1, dtype=np.int64)
+    dip_ids = np.arange(n_dip, dtype=np.int64)
+    hap_to_dip[np.asarray(a_idx, dtype=np.int64)] = dip_ids
+    hap_to_dip[np.asarray(b_idx, dtype=np.int64)] = dip_ids
 
-    for tree in ts.trees():
-        left, right = tree.interval
-        seg_len = float(right - left)
-        if seg_len <= 0:
-            continue
-        for h in range(n_hap):
-            u = int(sample_nodes[h])
-            src = None
-            while u != tskit.NULL:
-                pname = pop_lookup.get(int(ts.node(u).population), "")
-                if pname in src_to_col:
-                    src = pname
-                    break
-                u = tree.parent(u)
-            if src is not None:
-                acc[h, src_to_col[src]] += seg_len
+    node_pop = np.asarray(ts.tables.nodes.population, dtype=np.int32)
+    node_time = np.asarray(ts.tables.nodes.time, dtype=np.float64)
+    max_pop = max(pop_lookup.keys()) if len(pop_lookup) > 0 else -1
+    pop_to_src = np.full(max_pop + 1, -1, dtype=np.int8) if max_pop >= 0 else np.full(0, -1, dtype=np.int8)
+    for pop_id, pop_name in pop_lookup.items():
+        src_idx = _source_index_from_pop_name(str(pop_name))
+        if src_idx >= 0 and int(pop_id) >= 0:
+            pop_to_src[int(pop_id)] = int(src_idx)
+    node_src_from_pop = np.full(n_nodes, -1, dtype=np.int8)
+    if pop_to_src.size > 0:
+        ok = (node_pop >= 0) & (node_pop < pop_to_src.shape[0])
+        node_src_from_pop[ok] = pop_to_src[node_pop[ok]]
 
-    dip = (acc[a_idx] + acc[b_idx]) / 2.0
+    candidate_mask = (node_time > 0.0) & (node_src_from_pop >= 0)
+    candidate_times = node_time[candidate_mask]
+    if candidate_times.size == 0:
+        prefix = log_prefix if log_prefix is not None else "fig2"
+        _log(f"[{prefix}] WARNING: no source-labeled ancestor nodes found; ancestry proportions set to 0.0")
+        return np.zeros(n_dip, dtype=np.float64), np.zeros(n_dip, dtype=np.float64), np.zeros(n_dip, dtype=np.float64)
+
+    # Use the requested census time; if unavailable, use nearest available source-node time.
+    uniq_times = np.unique(candidate_times)
+    requested = float(ancestry_census_time)
+    near_idx = int(np.argmin(np.abs(uniq_times - requested)))
+    selected_time = float(uniq_times[near_idx])
+    exact_match = bool(np.any(np.isclose(candidate_times, requested, rtol=0.0, atol=1e-9)))
+    if (not exact_match) and log_prefix:
+        _log(
+            f"[{log_prefix}] Requested census_time={requested:.6f} not present; "
+            f"using nearest available census_time={selected_time:.6f}"
+        )
+
+    anc_mask = np.isclose(node_time, selected_time, rtol=0.0, atol=1e-9) & (node_src_from_pop >= 0)
+    anc_nodes = np.nonzero(anc_mask)[0].astype(np.int32, copy=False)
+    if anc_nodes.size == 0:
+        prefix = log_prefix if log_prefix is not None else "fig2"
+        _log(
+            f"[{prefix}] WARNING: no ancestors found at selected census_time={selected_time:.6f}; "
+            "ancestry proportions set to 0.0"
+        )
+        return np.zeros(n_dip, dtype=np.float64), np.zeros(n_dip, dtype=np.float64), np.zeros(n_dip, dtype=np.float64)
+
+    # Only census-time ancestors are valid ancestry sources for attribution.
+    node_src = np.full(n_nodes, -1, dtype=np.int8)
+    node_src[anc_nodes.astype(np.int64)] = node_src_from_pop[anc_nodes.astype(np.int64)]
+
+    if log_prefix:
+        _log(
+            f"[{log_prefix}] ancestry proportions via link_ancestors "
+            f"(haplotypes={n_hap}, diploids={n_dip}, trees={int(getattr(ts, 'num_trees', 0))}, "
+            f"census_time={selected_time:.6f}, ancestors={anc_nodes.size})"
+        )
+        _log(f"[{log_prefix}] numba enabled for edge accumulation={nb is not None}")
+
+    t0 = time.perf_counter()
+    edges = ts.link_ancestors(sample_nodes_arr, anc_nodes)
+    parents = np.asarray(edges.parent, dtype=np.int64)
+    children = np.asarray(edges.child, dtype=np.int64)
+    left = np.asarray(edges.left, dtype=np.float64)
+    right = np.asarray(edges.right, dtype=np.float64)
+    span = right - left
+    child_idx = sample_lookup[children]
+    parent_src = node_src[parents]
+    _accumulate_link_edges_numba(child_idx, parent_src, span, hap_to_dip, dip_acc)
+    valid = (child_idx >= 0) & (parent_src >= 0)
+    if log_prefix:
+        _stage_done(
+            log_prefix,
+            "link_ancestors combined",
+            t0,
+            extra=f"(edges={len(edges)}, matched_edges={int(np.count_nonzero(valid))})",
+        )
+
     denom = np.where(total_len > 0, total_len, 1.0)
-    props = dip / denom
+    props = dip_acc / denom
     afr = props[:, src_to_col["AFR"]]
     eur = props[:, src_to_col["EUR"]]
     asia = props[:, src_to_col["ASIA"]]
     s = afr + eur + asia
     bad = s <= 0
     if np.any(bad):
-        afr[bad] = 1.0 / 3.0
-        eur[bad] = 1.0 / 3.0
-        asia[bad] = 1.0 / 3.0
-        s = afr + eur + asia
-    afr /= s
-    eur /= s
-    asia /= s
+        n_bad = int(np.count_nonzero(bad))
+        prefix = log_prefix if log_prefix is not None else "fig2"
+        _log(
+            f"[{prefix}] WARNING: unresolved ancestry for {n_bad} diploids "
+            "(no AFR/EUR/ASIA source found on traced paths); leaving proportions as 0.0"
+        )
+        afr[bad] = 0.0
+        eur[bad] = 0.0
+        asia[bad] = 0.0
+    good = ~bad
+    if np.any(good):
+        afr[good] /= s[good]
+        eur[good] /= s[good]
+        asia[good] /= s[good]
     return afr, eur, asia
 
 
@@ -197,7 +346,17 @@ def _simulate(
     pca_n_sites: int,
     causal_max_sites: int,
     bp_cap: int | None,
+    ancestry_census_time: float,
 ) -> pd.DataFrame:
+    run_id = f"fig2_s{seed}"
+    run_t0 = time.perf_counter()
+    _log(
+        f"[{run_id}] Simulation start "
+        f"(model={msprime_model}, n_train_eur={n_train_eur}, n_test_per_pop={n_test_per_pop}, "
+        f"bp_cap={bp_cap}, ancestry_census_time={ancestry_census_time})"
+    )
+    _log(f"[{run_id}] Loading stdpopsim species/model")
+    t0 = time.perf_counter()
     species = stdpopsim.get_species("HomSap")
     model = species.get_demographic_model("AmericanAdmixture_4B18")
     if bp_cap is not None:
@@ -211,6 +370,7 @@ def _simulate(
     else:
         contig = species.get_contig("chr22", genetic_map="HapMapII_GRCh38", mutation_rate=model.mutation_rate)
     engine = stdpopsim.get_engine("msprime")
+    _stage_done(run_id, "stdpopsim setup", t0, extra=f"(sequence_length={int(contig.length)})")
 
     samples = {
         "AFR": n_test_per_pop,
@@ -224,15 +384,34 @@ def _simulate(
         "msprime_model": msprime_model,
         "record_migrations": True,
     }
+    _log(f"[{run_id}] Running stdpopsim/msprime simulate")
+    t0 = time.perf_counter()
     ts = engine.simulate(model, contig, samples, **simulate_kwargs)
+    _stage_done(
+        run_id,
+        "stdpopsim simulate",
+        t0,
+        extra=f"(nodes={ts.num_nodes}, edges={ts.num_edges}, sites={ts.num_sites}, trees={ts.num_trees})",
+    )
 
+    _log(f"[{run_id}] Extracting diploid sample mappings")
+    t0 = time.perf_counter()
     a_idx, b_idx, pop_idx, ts_ind_id = diploid_index_pairs(ts)
     pop_lookup = pop_names_from_ts(ts)
     pop_label = np.array([pop_lookup.get(int(p), f"pop_{int(p)}") for p in pop_idx], dtype=object)
+    _stage_done(run_id, "sample mapping", t0, extra=f"(diploids={len(pop_label)}, haploids={len(ts.samples())})")
 
+    _log(f"[{run_id}] Sampling PCA sites (n={pca_n_sites}, maf_min=0.05)")
+    t0 = time.perf_counter()
     pca_sites = sample_site_ids_for_maf(ts, a_idx, b_idx, n_sites=pca_n_sites, maf_min=0.05, seed=seed + 11)
+    _stage_done(run_id, "sample PCA sites", t0, extra=f"(selected={len(pca_sites)})")
+    _log(f"[{run_id}] Computing PCs (n_components={N_PCS})")
+    t0 = time.perf_counter()
     pcs = pcs_from_sites(ts, a_idx, b_idx, pca_sites, seed=seed + 13, n_components=N_PCS)
+    _stage_done(run_id, "compute PCs", t0)
 
+    _log(f"[{run_id}] Sampling causal sites (max_n={causal_max_sites}, maf_min=0.01)")
+    t0 = time.perf_counter()
     causal_sites = sample_site_ids_for_maf(
         ts,
         a_idx,
@@ -241,15 +420,32 @@ def _simulate(
         maf_min=0.01,
         seed=seed + 17,
     )
+    _stage_done(run_id, "sample causal sites", t0, extra=f"(selected={len(causal_sites)})")
+    _log(f"[{run_id}] Building genetic risk from causal sites (n={len(causal_sites)})")
+    t0 = time.perf_counter()
     G_true = genetic_risk_from_real_pgs_effect_distribution(ts, a_idx, b_idx, causal_sites, pgs_effects, seed=seed + 19)
+    _stage_done(run_id, "build genetic risk", t0)
 
+    _log(f"[{run_id}] Computing true ancestry proportions")
     rng = np.random.default_rng(seed + 23)
-    afr_prop, eur_prop, asia_prop = _true_ancestry_proportions(ts, a_idx, b_idx, pop_lookup)
+    t0 = time.perf_counter()
+    afr_prop, eur_prop, asia_prop = _true_ancestry_proportions(
+        ts,
+        a_idx,
+        b_idx,
+        pop_lookup,
+        ancestry_census_time=ancestry_census_time,
+        log_prefix=run_id,
+    )
+    _stage_done(run_id, "ancestry proportions", t0)
 
+    _log(f"[{run_id}] Sampling phenotypes from liability model")
+    t0 = time.perf_counter()
     env = 0.8 * afr_prop + 0.3 * asia_prop + 0.1 * eur_prop
     eta = 0.75 * G_true + env
     b0 = solve_intercept_for_prevalence(0.10, eta)
     y = rng.binomial(1, sigmoid(b0 + eta)).astype(np.int32)
+    _stage_done(run_id, "sample phenotypes", t0)
 
     rows = []
     eur_idx = np.where(pop_label == "EUR")[0]
@@ -289,13 +485,21 @@ def _simulate(
             row[f"pc{k+1}"] = float(pcs[i, k])
         rows.append(row)
 
+    _log(f"[{run_id}] Building dataframe (n_rows={len(rows)})")
+    t0 = time.perf_counter()
     df = pd.DataFrame(rows)
+    _stage_done(run_id, "dataframe build", t0)
 
     prefix = out_dir / f"fig2_s{seed}"
     vcf = prefix.with_suffix(".vcf")
+    _log(f"[{run_id}] Writing VCF to {vcf}")
+    t0 = time.perf_counter()
     with open(vcf, "w") as f:
         names = [f"ind_{i+1}" for i in range(ts.num_individuals)]
         ts.write_vcf(f, individual_names=names, position_transform=lambda x: np.asarray(x) + 1)
+    _stage_done(run_id, "write VCF", t0)
+    _log(f"[{run_id}] Converting VCF to PLINK")
+    t0 = time.perf_counter()
     run_plink_conversion(
         str(vcf),
         str(prefix),
@@ -303,9 +507,14 @@ def _simulate(
         threads=plink_threads,
         memory_mb=plink_memory_mb,
     )
+    _stage_done(run_id, "PLINK conversion", t0)
     vcf.unlink(missing_ok=True)
 
+    _log(f"[{run_id}] Writing simulation table to {prefix.with_suffix('.tsv')}")
+    t0 = time.perf_counter()
     df.to_csv(prefix.with_suffix(".tsv"), sep="\t", index=False)
+    _stage_done(run_id, "write simulation table", t0)
+    _stage_done(run_id, "simulation stage total", run_t0)
     return df
 
 
@@ -320,9 +529,13 @@ def _run_bayesr_and_predict(
     import shutil
     import subprocess
 
+    run_id = Path(prefix).name
+    run_t0 = time.perf_counter()
+    _log(f"[{run_id}] Preparing BayesR files in {out_dir}")
     work = out_dir / "work"
     work.mkdir(parents=True, exist_ok=True)
 
+    t0 = time.perf_counter()
     fam = pd.read_csv(f"{prefix}.fam", sep=r"\s+", header=None, names=["FID", "IID", "PID", "MID", "SEX", "PHENO"], dtype=str)
     iid_to_fid = dict(zip(fam["IID"], fam["FID"]))
 
@@ -331,16 +544,27 @@ def _run_bayesr_and_predict(
 
     pd.DataFrame({"FID": [iid_to_fid[i] for i in train_ids], "IID": train_ids}).to_csv(work / "train.keep", sep="\t", header=False, index=False)
     pd.DataFrame({"FID": [iid_to_fid[i] for i in test_ids], "IID": test_ids}).to_csv(work / "test.keep", sep="\t", header=False, index=False)
+    _stage_done(run_id, "BayesR file prep", t0, extra=f"(n_train={len(train_ids)}, n_test={len(test_ids)})")
 
     plink = shutil.which("plink2") or "plink2"
     common = ["--threads", str(plink_threads)]
     if plink_memory_mb is not None and plink_memory_mb > 0:
         common.extend(["--memory", str(plink_memory_mb)])
+    _log(f"[{run_id}] Running plink2 --freq")
+    t0 = time.perf_counter()
     subprocess.run([plink, "--bfile", prefix, "--freq", *common, "--out", str(work / "ref")], check=True)
+    _stage_done(run_id, "plink2 --freq", t0)
+    _log(f"[{run_id}] Running plink2 train split")
+    t0 = time.perf_counter()
     subprocess.run([plink, "--bfile", prefix, "--keep", str(work / "train.keep"), "--make-bed", *common, "--out", str(work / "train")], check=True)
+    _stage_done(run_id, "plink2 train split", t0)
+    _log(f"[{run_id}] Running plink2 test split")
+    t0 = time.perf_counter()
     subprocess.run([plink, "--bfile", prefix, "--keep", str(work / "test.keep"), "--make-bed", *common, "--out", str(work / "test")], check=True)
+    _stage_done(run_id, "plink2 test split", t0)
 
     train_df = df[df["IID"].isin(train_ids)].copy()
+    t0 = time.perf_counter()
     pd.DataFrame({
         "FID": [iid_to_fid[i] for i in train_df["IID"].astype(str)],
         "IID": train_df["IID"].astype(str),
@@ -352,15 +576,27 @@ def _run_bayesr_and_predict(
         "IID": train_df["IID"].astype(str),
         **{f"pc{i+1}": train_df[f"pc{i+1}"].to_numpy() for i in range(N_PCS)},
     }).to_csv(work / "train.covar", sep=" ", header=False, index=False)
+    _stage_done(run_id, "write BayesR phenotype/covariate files", t0)
 
     br = BayesR(threads=bayesr_threads, plink_memory_mb=plink_memory_mb)
+    _log(f"[{run_id}] BayesR fit starting")
+    t0 = time.perf_counter()
     eff = br.fit(str(work / "train"), str(work / "train.phen"), str(work / "bayesr"), covar_file=str(work / "train.covar"))
+    _stage_done(run_id, "BayesR fit", t0)
+    _log(f"[{run_id}] BayesR scoring train")
+    t0 = time.perf_counter()
     train_scores = br.predict(str(work / "train"), eff, str(work / "bayesr_train"), freq_file=str(work / "ref.afreq"))
+    _stage_done(run_id, "BayesR score train", t0)
+    _log(f"[{run_id}] BayesR scoring test")
+    t0 = time.perf_counter()
     test_scores = br.predict(str(work / "test"), eff, str(work / "bayesr_test"), freq_file=str(work / "ref.afreq"))
+    _stage_done(run_id, "BayesR score test", t0)
+    _stage_done(run_id, "BayesR/predict stage total", run_t0)
     return train_scores, test_scores
 
 
 def _cleanup_seed_artifacts(prefix: Path, seed_work_dir: Path) -> None:
+    _log(f"[{prefix.name}] Cleaning seed artifacts")
     for ext in (".bed", ".bim", ".fam", ".log", ".tsv", ".vcf"):
         p = Path(f"{prefix}{ext}")
         if p.exists():
@@ -512,6 +748,12 @@ def main() -> None:
     parser.add_argument("--pca-sites", type=int, default=2000)
     parser.add_argument("--causal-sites", type=int, default=5000)
     parser.add_argument("--bp-cap", type=int, default=None)
+    parser.add_argument(
+        "--ancestry-census-time",
+        type=float,
+        default=100.0,
+        help="Census time (generations ago) used to define ancestry source nodes.",
+    )
     parser.add_argument("--threads", type=int, default=None, help="Thread count for PLINK/BayesR. Default uses node allocation.")
     parser.add_argument("--memory-mb", type=int, default=None, help="PLINK memory limit (MB). Default auto-sizes from node RAM.")
     parser.add_argument("--work-root", default=None, help="Directory for heavy transient work files (e.g., RAM disk).")
@@ -522,19 +764,20 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     work_root = Path(args.work_root) if args.work_root else _default_work_root(out_dir)
     work_root.mkdir(parents=True, exist_ok=True)
-    print("Figure2 GAM backend: mgcv")
+    _log("Figure2 GAM backend: mgcv")
     threads = max(1, int(args.threads)) if args.threads is not None else _default_total_threads()
     if args.memory_mb is not None:
         memory_mb = max(512, int(args.memory_mb))
     else:
         total_mb = _detect_total_mem_mb()
         memory_mb = max(2048, int(0.85 * total_mb)) if total_mb is not None else None
-    print(f"Figure2 resources: threads={threads} memory_mb={memory_mb}")
+    _log(f"Figure2 resources: threads={threads} memory_mb={memory_mb}")
     _set_runtime_thread_env(threads)
     if memory_mb is not None:
         os.environ["PLINK_MEMORY_MB"] = str(memory_mb)
 
     score_path = ensure_pgs003725(Path(args.cache))
+    _log(f"Figure2 loading PGS effects from cache={args.cache}")
     pgs_effects = load_pgs003725_effects(score_path, chr_filter="22")
 
     df = None
@@ -542,6 +785,7 @@ def main() -> None:
     train_scores = None
     test_scores = None
     seed = int(args.seed)
+    _log(f"[fig2_s{seed}] Starting full Figure2 pipeline")
     df = _simulate(
         seed,
         pgs_effects,
@@ -554,9 +798,11 @@ def main() -> None:
         pca_n_sites=int(args.pca_sites),
         causal_max_sites=int(args.causal_sites),
         bp_cap=args.bp_cap,
+        ancestry_census_time=float(args.ancestry_census_time),
     )
     prefix = str(out_dir / f"fig2_s{seed}")
     seed_work = work_root / f"work_s{seed}"
+    _log(f"[fig2_s{seed}] Starting BayesR/prediction stage")
     train_scores, test_scores = _run_bayesr_and_predict(
         df,
         prefix,
@@ -577,6 +823,7 @@ def main() -> None:
         train_scores["PRS"].to_numpy(dtype=float),
         test_scores["PRS"].to_numpy(dtype=float),
     )
+    _log(f"[fig2_s{seed}] Method fitting/prediction complete")
 
     rows = []
     for method, y_prob in preds.items():
@@ -586,13 +833,16 @@ def main() -> None:
 
     res = pd.DataFrame(rows)
     res.to_csv(out_dir / "figure2_auc_by_method_population.tsv", sep="\t", index=False)
+    _log("[fig2] Wrote figure2_auc_by_method_population.tsv")
 
+    _log("[fig2] Plotting outputs")
     _plot_main(res, out_dir)
     _plot_prs_distribution(test_df, test_scores["PRS"].to_numpy(dtype=float), out_dir)
     _plot_pcs(df, out_dir)
 
     if not args.keep_intermediates:
         _cleanup_seed_artifacts(prefix=Path(prefix), seed_work_dir=seed_work)
+    _log("[fig2] Figure2 run complete")
 
 
 if __name__ == "__main__":
