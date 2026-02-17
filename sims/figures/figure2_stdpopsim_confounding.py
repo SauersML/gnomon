@@ -113,6 +113,13 @@ def _stage_mark(prefix: str, step: int, total: int, label: str) -> None:
     _log(f"[{prefix}] stage {step}/{total} ({pct:.1f}%): {label}")
 
 
+def _ancestry_mark(prefix: str | None, pct: float, label: str) -> None:
+    if prefix is None:
+        return
+    p = min(100.0, max(0.0, float(pct)))
+    _log(f"[{prefix}] ancestry step progress: {p:.1f}% - {label}")
+
+
 def _create_shared_array(arr: np.ndarray) -> tuple[shared_memory.SharedMemory, dict[str, object]]:
     shm = shared_memory.SharedMemory(create=True, size=arr.nbytes)
     view = np.ndarray(arr.shape, dtype=arr.dtype, buffer=shm.buf)
@@ -354,8 +361,10 @@ def _true_ancestry_proportions(
             f"census_time={selected_time:.6f}, ancestors={anc_nodes.size})"
         )
         _log(f"[{log_prefix}] numba enabled for edge accumulation={nb is not None}")
+    _ancestry_mark(log_prefix, 0.0, "starting ancestry computation")
 
     t0 = time.perf_counter()
+    _ancestry_mark(log_prefix, 5.0, "running link_ancestors")
     # Compatibility: some tskit builds expose link_ancestors only on TableCollection.
     if hasattr(ts, "link_ancestors"):
         edges = ts.link_ancestors(sample_nodes_arr, anc_nodes)
@@ -366,6 +375,7 @@ def _true_ancestry_proportions(
             "link_ancestors is unavailable on this tskit build "
             "(missing both TreeSequence.link_ancestors and TableCollection.link_ancestors)"
         )
+    _ancestry_mark(log_prefix, 20.0, f"link_ancestors complete (edges={len(edges)})")
     parents = np.asarray(edges.parent, dtype=np.int64)
     children = np.asarray(edges.child, dtype=np.int64)
     left = np.asarray(edges.left, dtype=np.float64)
@@ -404,6 +414,7 @@ def _true_ancestry_proportions(
                         f"[{log_prefix}] link_ancestors accumulation progress: "
                         f"edges={stop}/{n_edges} ({pct:.1f}%)"
                     )
+                    _ancestry_mark(log_prefix, 20.0 + 75.0 * (float(stop) / float(max(1, n_edges))), "accumulating edge chunks")
                     last_log_t = now_t
         valid = (child_idx >= 0) & (parent_src >= 0)
         matched_edges = int(np.count_nonzero(valid))
@@ -441,6 +452,7 @@ def _true_ancestry_proportions(
                                 f"[{log_prefix}] link_ancestors accumulation progress: "
                                 f"edges={done_edges}/{n_edges} ({pct:.1f}%)"
                             )
+                            _ancestry_mark(log_prefix, 20.0 + 75.0 * (float(done_edges) / float(max(1, n_edges))), "accumulating edge chunks (parallel)")
                             last_log_t = now_t
         finally:
             for shm in shms:
@@ -460,6 +472,7 @@ def _true_ancestry_proportions(
             t0,
             extra=f"(edges={len(edges)}, matched_edges={matched_edges})",
         )
+    _ancestry_mark(log_prefix, 95.0, "normalizing ancestry proportions")
 
     denom = np.where(total_len > 0, total_len, 1.0)
     props = dip_acc / denom
@@ -483,6 +496,7 @@ def _true_ancestry_proportions(
         afr[good] /= s[good]
         eur[good] /= s[good]
         asia[good] /= s[good]
+    _ancestry_mark(log_prefix, 100.0, "ancestry proportions ready")
     return afr, eur, asia
 
 
