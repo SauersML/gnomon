@@ -293,7 +293,16 @@ def _true_ancestry_proportions(
         _log(f"[{log_prefix}] numba enabled for edge accumulation={nb is not None}")
 
     t0 = time.perf_counter()
-    edges = ts.link_ancestors(sample_nodes_arr, anc_nodes)
+    # Compatibility: some tskit builds expose link_ancestors only on TableCollection.
+    if hasattr(ts, "link_ancestors"):
+        edges = ts.link_ancestors(sample_nodes_arr, anc_nodes)
+    elif hasattr(ts, "tables") and hasattr(ts.tables, "link_ancestors"):
+        edges = ts.tables.link_ancestors(sample_nodes_arr, anc_nodes)
+    else:
+        raise RuntimeError(
+            "link_ancestors is unavailable on this tskit build "
+            "(missing both TreeSequence.link_ancestors and TableCollection.link_ancestors)"
+        )
     parents = np.asarray(edges.parent, dtype=np.int64)
     children = np.asarray(edges.child, dtype=np.int64)
     left = np.asarray(edges.left, dtype=np.float64)
