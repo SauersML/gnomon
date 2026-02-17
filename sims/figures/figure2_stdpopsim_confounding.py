@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
+import multiprocessing as mp
 import os
 import time
 import shutil
 import sys
 from datetime import datetime
+from multiprocessing import shared_memory
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -76,6 +79,10 @@ CB = {
     "black": "#111111",
 }
 
+_LINK_SHARED: dict[str, np.ndarray] = {}
+_LINK_SHARED_HANDLES: list[shared_memory.SharedMemory] = []
+_LINK_N_DIP = 0
+
 
 def _log(msg: str) -> None:
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -99,6 +106,56 @@ def _stage_done(prefix: str, stage: str, started_at: float, extra: str = "") -> 
     elapsed = time.perf_counter() - started_at
     tail = f" {extra}" if extra else ""
     _log(f"[{prefix}] {stage} done in {elapsed:.1f}s (rss_gb={_rss_gb():.2f}){tail}")
+
+
+def _create_shared_array(arr: np.ndarray) -> tuple[shared_memory.SharedMemory, dict[str, object]]:
+    shm = shared_memory.SharedMemory(create=True, size=arr.nbytes)
+    view = np.ndarray(arr.shape, dtype=arr.dtype, buffer=shm.buf)
+    view[...] = arr
+    meta = {"name": shm.name, "shape": arr.shape, "dtype": arr.dtype.str}
+    return shm, meta
+
+
+def _init_link_worker(
+    child_meta: dict[str, object],
+    parent_meta: dict[str, object],
+    span_meta: dict[str, object],
+    hap_meta: dict[str, object],
+    n_dip: int,
+) -> None:
+    global _LINK_SHARED
+    global _LINK_SHARED_HANDLES
+    global _LINK_N_DIP
+
+    _LINK_SHARED_HANDLES = []
+    _LINK_SHARED = {}
+    for key, meta in (
+        ("child_idx", child_meta),
+        ("parent_src", parent_meta),
+        ("span", span_meta),
+        ("hap_to_dip", hap_meta),
+    ):
+        shm = shared_memory.SharedMemory(name=str(meta["name"]))
+        arr = np.ndarray(tuple(meta["shape"]), dtype=np.dtype(str(meta["dtype"])), buffer=shm.buf)
+        _LINK_SHARED_HANDLES.append(shm)
+        _LINK_SHARED[key] = arr
+    _LINK_N_DIP = int(n_dip)
+
+
+def _link_chunk_worker(start: int, stop: int) -> tuple[np.ndarray, int, int]:
+    child = _LINK_SHARED["child_idx"][start:stop]
+    parent = _LINK_SHARED["parent_src"][start:stop]
+    span = _LINK_SHARED["span"][start:stop]
+    hap_to_dip = _LINK_SHARED["hap_to_dip"]
+
+    valid = (child >= 0) & (parent >= 0)
+    out = np.zeros((_LINK_N_DIP, 3), dtype=np.float64)
+    if np.any(valid):
+        dip_idx = hap_to_dip[child[valid]]
+        src_idx = parent[valid].astype(np.int64, copy=False)
+        weights = 0.5 * span[valid]
+        np.add.at(out, (dip_idx, src_idx), weights)
+    return out, int(stop - start), int(np.count_nonzero(valid))
 
 
 if nb is not None:
@@ -210,6 +267,7 @@ def _true_ancestry_proportions(
     b_idx: np.ndarray,
     pop_lookup: dict[int, str],
     ancestry_census_time: float,
+    ancestry_threads: int,
     log_prefix: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     def _source_index_from_pop_name(name: str) -> int:
@@ -311,33 +369,91 @@ def _true_ancestry_proportions(
     child_idx = sample_lookup[children]
     parent_src = node_src[parents]
     n_edges = int(len(edges))
-    chunk_size = 2_000_000
-    last_log_t = time.perf_counter()
-    for start in range(0, n_edges, chunk_size):
-        stop = min(n_edges, start + chunk_size)
-        _accumulate_link_edges_numba(
-            child_idx[start:stop],
-            parent_src[start:stop],
-            span[start:stop],
-            hap_to_dip,
-            dip_acc,
+    worker_target = max(1, int(0.8 * max(1, int(ancestry_threads))))
+    workers = min(worker_target, n_edges) if n_edges > 0 else 1
+    if log_prefix is not None:
+        _log(
+            f"[{log_prefix}] link_ancestors accumulation mode="
+            f"{'parallel' if workers > 1 else 'serial'} workers={workers} "
+            f"(threads={ancestry_threads}, edges={n_edges})"
         )
-        if log_prefix is not None:
-            now_t = time.perf_counter()
-            if (stop == n_edges) or (now_t - last_log_t >= 20.0):
-                pct = 100.0 * float(stop) / float(max(1, n_edges))
-                _log(
-                    f"[{log_prefix}] link_ancestors accumulation progress: "
-                    f"edges={stop}/{n_edges} ({pct:.1f}%)"
-                )
-                last_log_t = now_t
-    valid = (child_idx >= 0) & (parent_src >= 0)
+
+    matched_edges = 0
+    if workers <= 1 or n_edges < 1_000_000:
+        chunk_size = 2_000_000
+        last_log_t = time.perf_counter()
+        for start in range(0, n_edges, chunk_size):
+            stop = min(n_edges, start + chunk_size)
+            _accumulate_link_edges_numba(
+                child_idx[start:stop],
+                parent_src[start:stop],
+                span[start:stop],
+                hap_to_dip,
+                dip_acc,
+            )
+            if log_prefix is not None:
+                now_t = time.perf_counter()
+                if (stop == n_edges) or (now_t - last_log_t >= 20.0):
+                    pct = 100.0 * float(stop) / float(max(1, n_edges))
+                    _log(
+                        f"[{log_prefix}] link_ancestors accumulation progress: "
+                        f"edges={stop}/{n_edges} ({pct:.1f}%)"
+                    )
+                    last_log_t = now_t
+        valid = (child_idx >= 0) & (parent_src >= 0)
+        matched_edges = int(np.count_nonzero(valid))
+    else:
+        split_points = np.linspace(0, n_edges, num=workers + 1, dtype=np.int64)
+        tasks = [(int(split_points[i]), int(split_points[i + 1])) for i in range(workers) if int(split_points[i + 1]) > int(split_points[i])]
+        shms: list[shared_memory.SharedMemory] = []
+        try:
+            child_shm, child_meta = _create_shared_array(np.asarray(child_idx, dtype=np.int64))
+            parent_shm, parent_meta = _create_shared_array(np.asarray(parent_src, dtype=np.int8))
+            span_shm, span_meta = _create_shared_array(np.asarray(span, dtype=np.float64))
+            hap_shm, hap_meta = _create_shared_array(np.asarray(hap_to_dip, dtype=np.int64))
+            shms.extend([child_shm, parent_shm, span_shm, hap_shm])
+
+            ctx = mp.get_context("fork") if "fork" in mp.get_all_start_methods() else mp.get_context()
+            done_edges = 0
+            last_log_t = time.perf_counter()
+            with concurrent.futures.ProcessPoolExecutor(
+                max_workers=len(tasks),
+                mp_context=ctx,
+                initializer=_init_link_worker,
+                initargs=(child_meta, parent_meta, span_meta, hap_meta, int(n_dip)),
+            ) as ex:
+                futs = [ex.submit(_link_chunk_worker, start, stop) for (start, stop) in tasks]
+                for fut in concurrent.futures.as_completed(futs):
+                    part, processed, matched = fut.result()
+                    dip_acc += part
+                    done_edges += int(processed)
+                    matched_edges += int(matched)
+                    if log_prefix is not None:
+                        now_t = time.perf_counter()
+                        if (done_edges == n_edges) or (now_t - last_log_t >= 20.0):
+                            pct = 100.0 * float(done_edges) / float(max(1, n_edges))
+                            _log(
+                                f"[{log_prefix}] link_ancestors accumulation progress: "
+                                f"edges={done_edges}/{n_edges} ({pct:.1f}%)"
+                            )
+                            last_log_t = now_t
+        finally:
+            for shm in shms:
+                try:
+                    shm.close()
+                except Exception:
+                    pass
+                try:
+                    shm.unlink()
+                except Exception:
+                    pass
+
     if log_prefix:
         _stage_done(
             log_prefix,
             "link_ancestors combined",
             t0,
-            extra=f"(edges={len(edges)}, matched_edges={int(np.count_nonzero(valid))})",
+            extra=f"(edges={len(edges)}, matched_edges={matched_edges})",
         )
 
     denom = np.where(total_len > 0, total_len, 1.0)
@@ -378,6 +494,7 @@ def _simulate(
     causal_max_sites: int,
     bp_cap: int | None,
     ancestry_census_time: float,
+    ancestry_threads: int,
 ) -> pd.DataFrame:
     run_id = f"fig2_s{seed}"
     run_t0 = time.perf_counter()
@@ -501,6 +618,7 @@ def _simulate(
         b_idx,
         pop_lookup,
         ancestry_census_time=ancestry_census_time,
+        ancestry_threads=ancestry_threads,
         log_prefix=run_id,
     )
     _stage_done(run_id, "ancestry proportions", t0)
@@ -944,6 +1062,7 @@ def main() -> None:
             causal_max_sites=int(args.causal_sites),
             bp_cap=args.bp_cap,
             ancestry_census_time=float(args.ancestry_census_time),
+            ancestry_threads=threads,
         )
     seed_work = work_root / f"work_s{seed}"
     _log(f"[fig2_s{seed}] Starting PRS/prediction stage")
