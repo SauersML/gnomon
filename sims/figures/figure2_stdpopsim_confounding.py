@@ -108,6 +108,11 @@ def _stage_done(prefix: str, stage: str, started_at: float, extra: str = "") -> 
     _log(f"[{prefix}] {stage} done in {elapsed:.1f}s (rss_gb={_rss_gb():.2f}){tail}")
 
 
+def _stage_mark(prefix: str, step: int, total: int, label: str) -> None:
+    pct = 100.0 * float(step) / float(max(1, total))
+    _log(f"[{prefix}] stage {step}/{total} ({pct:.1f}%): {label}")
+
+
 def _create_shared_array(arr: np.ndarray) -> tuple[shared_memory.SharedMemory, dict[str, object]]:
     shm = shared_memory.SharedMemory(create=True, size=arr.nbytes)
     view = np.ndarray(arr.shape, dtype=arr.dtype, buffer=shm.buf)
@@ -497,12 +502,14 @@ def _simulate(
     ancestry_threads: int,
 ) -> pd.DataFrame:
     run_id = f"fig2_s{seed}"
+    total_steps = 14
     run_t0 = time.perf_counter()
     _log(
         f"[{run_id}] Simulation start "
         f"(model={msprime_model}, n_train_eur={n_train_eur}, n_test_per_pop={n_test_per_pop}, "
         f"bp_cap={bp_cap}, ancestry_census_time={ancestry_census_time})"
     )
+    _stage_mark(run_id, 1, total_steps, "stdpopsim setup")
     _log(f"[{run_id}] Loading stdpopsim species/model")
     t0 = time.perf_counter()
     species = stdpopsim.get_species("HomSap")
@@ -532,6 +539,7 @@ def _simulate(
         "msprime_model": msprime_model,
         "record_migrations": True,
     }
+    _stage_mark(run_id, 2, total_steps, "stdpopsim/msprime simulate")
     _log(f"[{run_id}] Running stdpopsim/msprime simulate")
     t0 = time.perf_counter()
     ts = engine.simulate(model, contig, samples, **simulate_kwargs)
@@ -542,6 +550,7 @@ def _simulate(
         extra=f"(nodes={ts.num_nodes}, edges={ts.num_edges}, sites={ts.num_sites}, trees={ts.num_trees})",
     )
 
+    _stage_mark(run_id, 3, total_steps, "diploid sample mapping")
     _log(f"[{run_id}] Extracting diploid sample mappings")
     t0 = time.perf_counter()
     a_idx, b_idx, pop_idx, ts_ind_id = diploid_index_pairs(ts)
@@ -549,6 +558,7 @@ def _simulate(
     pop_label = np.array([pop_lookup.get(int(p), f"pop_{int(p)}") for p in pop_idx], dtype=object)
     _stage_done(run_id, "sample mapping", t0, extra=f"(diploids={len(pop_label)}, haploids={len(ts.samples())})")
 
+    _stage_mark(run_id, 4, total_steps, "sample PCA sites")
     _log(f"[{run_id}] Sampling PCA sites (n={pca_n_sites}, maf_min=0.05)")
     t0 = time.perf_counter()
     pca_sites = sample_site_ids_for_maf(
@@ -562,11 +572,13 @@ def _simulate(
         progress_label=f"{run_id} pca_site_scan",
     )
     _stage_done(run_id, "sample PCA sites", t0, extra=f"(selected={len(pca_sites)})")
+    _stage_mark(run_id, 5, total_steps, "compute PCs")
     _log(f"[{run_id}] Computing PCs (n_components={N_PCS})")
     t0 = time.perf_counter()
     pcs = pcs_from_sites(ts, a_idx, b_idx, pca_sites, seed=seed + 13, n_components=N_PCS)
     _stage_done(run_id, "compute PCs", t0)
 
+    _stage_mark(run_id, 6, total_steps, "sample causal sites")
     _log(f"[{run_id}] Sampling causal sites (max_n={causal_max_sites}, maf_min=0.01)")
     t0 = time.perf_counter()
     causal_sites = sample_site_ids_for_maf(
@@ -580,6 +592,7 @@ def _simulate(
         progress_label=f"{run_id} causal_site_scan",
     )
     _stage_done(run_id, "sample causal sites", t0, extra=f"(selected={len(causal_sites)})")
+    _stage_mark(run_id, 7, total_steps, "build genetic risk")
     _log(f"[{run_id}] Building genetic risk from causal sites (n={len(causal_sites)})")
     t0 = time.perf_counter()
     G_true = genetic_risk_from_real_pgs_effect_distribution(
@@ -593,6 +606,7 @@ def _simulate(
         progress_label=f"{run_id} genetic_risk",
     )
     _stage_done(run_id, "build genetic risk", t0)
+    _stage_mark(run_id, 8, total_steps, "true-effect diagnostics")
     ts_sites, causal_overlap, het_by_pop, causal_pos_1based = summarize_true_effect_site_diagnostics(
         ts,
         a_idx,
@@ -609,6 +623,7 @@ def _simulate(
     )
     _log(f"[{run_id}] Mean heterozygosity at true-effect sites by pop: {het_bits}")
 
+    _stage_mark(run_id, 9, total_steps, "ancestry proportions")
     _log(f"[{run_id}] Computing true ancestry proportions")
     rng = np.random.default_rng(seed + 23)
     t0 = time.perf_counter()
@@ -623,6 +638,7 @@ def _simulate(
     )
     _stage_done(run_id, "ancestry proportions", t0)
 
+    _stage_mark(run_id, 10, total_steps, "sample phenotypes")
     _log(f"[{run_id}] Sampling phenotypes from liability model")
     t0 = time.perf_counter()
     env = 0.8 * afr_prop + 0.3 * asia_prop + 0.1 * eur_prop
@@ -669,6 +685,7 @@ def _simulate(
             row[f"pc{k+1}"] = float(pcs[i, k])
         rows.append(row)
 
+    _stage_mark(run_id, 11, total_steps, "build dataframe")
     _log(f"[{run_id}] Building dataframe (n_rows={len(rows)})")
     t0 = time.perf_counter()
     df = pd.DataFrame(rows)
@@ -676,12 +693,14 @@ def _simulate(
 
     prefix = out_dir / f"fig2_s{seed}"
     vcf = prefix.with_suffix(".vcf")
+    _stage_mark(run_id, 12, total_steps, "write VCF")
     _log(f"[{run_id}] Writing VCF to {vcf}")
     t0 = time.perf_counter()
     with open(vcf, "w") as f:
         names = [f"ind_{i+1}" for i in range(ts.num_individuals)]
         ts.write_vcf(f, individual_names=names, position_transform=lambda x: np.asarray(x) + 1)
     _stage_done(run_id, "write VCF", t0)
+    _stage_mark(run_id, 13, total_steps, "VCF->PLINK conversion")
     _log(f"[{run_id}] Converting VCF to PLINK")
     t0 = time.perf_counter()
     run_plink_conversion(
@@ -710,6 +729,7 @@ def _simulate(
     )
     vcf.unlink(missing_ok=True)
 
+    _stage_mark(run_id, 14, total_steps, "write simulation table")
     _log(f"[{run_id}] Writing simulation table to {prefix.with_suffix('.tsv')}")
     t0 = time.perf_counter()
     df.to_csv(prefix.with_suffix(".tsv"), sep="\t", index=False)
@@ -731,7 +751,9 @@ def _run_prs_and_predict(
     import subprocess
 
     run_id = Path(prefix).name
+    total_steps = 8 if use_bayesr else 6
     run_t0 = time.perf_counter()
+    _stage_mark(run_id, 1, total_steps, "prepare PRS files")
     _log(f"[{run_id}] Preparing PRS files in {out_dir}")
     work = out_dir / "work"
     work.mkdir(parents=True, exist_ok=True)
@@ -751,14 +773,17 @@ def _run_prs_and_predict(
     common = ["--threads", str(plink_threads)]
     if plink_memory_mb is not None and plink_memory_mb > 0:
         common.extend(["--memory", str(plink_memory_mb)])
+    _stage_mark(run_id, 2, total_steps, "plink2 --freq")
     _log(f"[{run_id}] Running plink2 --freq")
     t0 = time.perf_counter()
     subprocess.run([plink, "--bfile", prefix, "--freq", *common, "--out", str(work / "ref")], check=True)
     _stage_done(run_id, "plink2 --freq", t0)
+    _stage_mark(run_id, 3, total_steps, "plink2 train split")
     _log(f"[{run_id}] Running plink2 train split")
     t0 = time.perf_counter()
     subprocess.run([plink, "--bfile", prefix, "--keep", str(work / "train.keep"), "--make-bed", *common, "--out", str(work / "train")], check=True)
     _stage_done(run_id, "plink2 train split", t0)
+    _stage_mark(run_id, 4, total_steps, "plink2 test split")
     _log(f"[{run_id}] Running plink2 test split")
     t0 = time.perf_counter()
     subprocess.run([plink, "--bfile", prefix, "--keep", str(work / "test.keep"), "--make-bed", *common, "--out", str(work / "test")], check=True)
@@ -781,21 +806,26 @@ def _run_prs_and_predict(
 
     if use_bayesr:
         br = BayesR(threads=bayesr_threads, plink_memory_mb=plink_memory_mb)
+        _stage_mark(run_id, 5, total_steps, "BayesR fit")
         _log(f"[{run_id}] BayesR fit starting")
         t0 = time.perf_counter()
         eff = br.fit(str(work / "train"), str(work / "train.phen"), str(work / "bayesr"), covar_file=str(work / "train.covar"))
         _stage_done(run_id, "BayesR fit", t0)
+        _stage_mark(run_id, 6, total_steps, "BayesR score train")
         _log(f"[{run_id}] BayesR scoring train")
         t0 = time.perf_counter()
         train_scores = br.predict(str(work / "train"), eff, str(work / "bayesr_train"), freq_file=str(work / "ref.afreq"))
         _stage_done(run_id, "BayesR score train", t0)
+        _stage_mark(run_id, 7, total_steps, "BayesR score test")
         _log(f"[{run_id}] BayesR scoring test")
         t0 = time.perf_counter()
         test_scores = br.predict(str(work / "test"), eff, str(work / "bayesr_test"), freq_file=str(work / "ref.afreq"))
         _stage_done(run_id, "BayesR score test", t0)
+        _stage_mark(run_id, 8, total_steps, "BayesR stage complete")
         _stage_done(run_id, "BayesR/predict stage total", run_t0)
         return train_scores, test_scores, None
     else:
+        _stage_mark(run_id, 5, total_steps, "P+T fit/score")
         _log(f"[{run_id}] P+T fit/scoring starting")
         t0 = time.perf_counter()
         pt = PPlusT(threads=plink_threads, plink_memory_mb=plink_memory_mb)
@@ -808,6 +838,7 @@ def _run_prs_and_predict(
             out_prefix=str(work / "pt"),
         )
         _stage_done(run_id, "P+T fit/score", t0)
+        _stage_mark(run_id, 6, total_steps, "P+T stage complete")
         _stage_done(run_id, "P+T/predict stage total", run_t0)
         return train_scores, test_scores, pt_meta
 
