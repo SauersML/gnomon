@@ -1,5 +1,6 @@
 import Mathlib.Tactic
 import Mathlib.Analysis.Calculus.Deriv.Basic
+import Mathlib.Analysis.Calculus.Deriv.Mul
 import Mathlib.Analysis.Calculus.Deriv.Inv
 import Mathlib.Analysis.Convex.Strict
 import Mathlib.Analysis.Convex.Jensen
@@ -4425,14 +4426,47 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
 
 /-- Orthogonal projection onto a finite-dimensional subspace. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  0  -- Placeholder; proper implementation would use Mathlib's orthogonalProjection
+  let equiv := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K_E : Submodule ℝ (WithLp 2 (Fin n → ℝ)) := K.map (equiv : (Fin n → ℝ) →ₗ[ℝ] WithLp 2 (Fin n → ℝ))
+  let y_E : WithLp 2 (Fin n → ℝ) := equiv y
+  equiv.symm (_root_.Submodule.orthogonalProjection K_E y_E)
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
-    iff p minimizes distance to y among all points in K. -/
+    iff p minimizes L2 distance (sum of squares) to y among all points in K. -/
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
-    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist y p ≤ dist y w) :
+    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, l2norm_sq (y - p) ≤ l2norm_sq (y - w)) :
     p = orthogonalProjection K y := by
-  sorry
+  let equiv := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K_E : Submodule ℝ (WithLp 2 (Fin n → ℝ)) := K.map (equiv : (Fin n → ℝ) →ₗ[ℝ] WithLp 2 (Fin n → ℝ))
+  let y_E : WithLp 2 (Fin n → ℝ) := equiv y
+  let p_E : WithLp 2 (Fin n → ℝ) := equiv p
+
+  have h_mem_E : p_E ∈ K_E := Submodule.mem_map_of_mem h_mem
+
+  have h_min_E : ∀ w_E ∈ K_E, ‖y_E - p_E‖ ≤ ‖y_E - w_E‖ := by
+    intro w_E hw_E
+    obtain ⟨w, hw, rfl⟩ := Submodule.mem_map.mp hw_E
+    specialize h_min w hw
+    have h_norm_sq : ∀ x : Fin n → ℝ, l2norm_sq x = ‖equiv x‖^2 := by
+      intro x
+      simp only [l2norm_sq, Real.norm_eq_abs, sq_abs, PiLp.norm_sq_eq_of_L2]
+      rfl
+    rw [h_norm_sq (y - p), h_norm_sq (y - w)] at h_min
+    rw [← LinearEquiv.map_sub, ← LinearEquiv.map_sub] at h_min
+    simp only [equiv, y_E, p_E] at h_min ⊢
+    rw [sq_le_sq] at h_min
+    · exact h_min
+    · exact norm_nonneg _
+    · exact norm_nonneg _
+
+  have h_proj : p_E = _root_.Submodule.orthogonalProjection K_E y_E := by
+    apply _root_.Submodule.eq_orthogonalProjection_of_mem_of_min_dist
+    · exact h_mem_E
+    · exact h_min_E
+
+  apply_fun equiv
+  simp only [LinearEquiv.apply_symm_apply]
+  exact h_proj
 
 set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
@@ -4450,6 +4484,16 @@ lemma rank_eq_of_range_eq {n m : Type} [Fintype n] [Fintype m] [DecidableEq n] [
   rw [Matrix.rank_eq_finrank_range_toLin B (Pi.basisFun ℝ n) (Pi.basisFun ℝ m)]
   change Module.finrank ℝ (LinearMap.range (Matrix.toLin' A)) = Module.finrank ℝ (LinearMap.range (Matrix.toLin' B))
   rw [h]
+
+lemma fit_in_class {p k sp n : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)]
+    (data : RealizedData n k) (lambda : ℝ)
+    (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp)
+    (h_n_pos : n > 0)
+    (h_lambda_nonneg : 0 ≤ lambda)
+    (h_rank : Matrix.rank (designMatrix data pgsBasis splineBasis) = Fintype.card (ParamIx p k sp)) :
+    InModelClass (fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank) pgsBasis splineBasis := by
+  unfold fit unpackParams
+  exact { basis_match := rfl, spline_match := rfl, link_identity := rfl, dist_gaussian := rfl }
 
 theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ} [Fintype (Fin n)] [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)]
     (A : Matrix (Fin k) (Fin k) ℝ) (_hA : IsUnit A.det) (b : Fin k → ℝ)
@@ -4474,7 +4518,101 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   ∀ (i : Fin n),
       linearPredictor model (data.p i) (data.c i) =
       linearPredictor model_prime (data'.p i) (data'.c i) := by
-  sorry
+  intro i
+  let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
+  let X := designMatrix data pgsBasis splineBasis
+  let X' := designMatrix data' pgsBasis splineBasis
+  let K := LinearMap.range (Matrix.toLin' X)
+  let K' := LinearMap.range (Matrix.toLin' X')
+  let y_vec := data.y
+
+  have h_K_eq_K' : K = K' := h_range_eq
+
+  let pred := fun i => linearPredictor model (data.p i) (data.c i)
+  let pred' := fun i => linearPredictor model_prime (data'.p i) (data'.c i)
+
+  have h_pred_in_K : pred ∈ K := by
+    have h_in : InModelClass model pgsBasis splineBasis := fit_in_class data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
+    have h_eq := linearPredictor_eq_designMatrix_mulVec data pgsBasis splineBasis model h_in
+    let β := packParams model
+    have h_vec : pred = X.mulVec β := by funext i; exact h_eq i
+    rw [h_vec]
+    use β
+    rfl
+
+  have h_rank' : Matrix.rank (designMatrix data' pgsBasis splineBasis) = Fintype.card (ParamIx p k sp) := by
+    let X := designMatrix data pgsBasis splineBasis
+    let X' := designMatrix data' pgsBasis splineBasis
+    have h_rank_eq : X.rank = X'.rank := by
+      exact rank_eq_of_range_eq X X' h_range_eq
+    rw [← h_rank_eq]
+    exact h_rank
+
+  have h_pred'_in_K' : pred' ∈ K' := by
+    have h_in : InModelClass model_prime pgsBasis splineBasis := fit_in_class data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank'
+    have h_eq := linearPredictor_eq_designMatrix_mulVec data' pgsBasis splineBasis model_prime h_in
+    let β' := packParams model_prime
+    have h_vec : pred' = X'.mulVec β' := by funext i; exact h_eq i
+    rw [h_vec]
+    use β'
+    rfl
+
+  have h_pred_min : ∀ w ∈ K, l2norm_sq (y_vec - pred) ≤ l2norm_sq (y_vec - w) := by
+    intro w hw
+    obtain ⟨β, hβ⟩ := hw
+    let m := unpackParams pgsBasis splineBasis β
+    have hm_class : InModelClass m pgsBasis splineBasis := by
+      unfold unpackParams
+      exact { basis_match := rfl, spline_match := rfl, link_identity := rfl, dist_gaussian := rfl }
+    have h_pred_m : ∀ i, linearPredictor m (data.p i) (data.c i) = w i := by
+      have h := linearPredictor_eq_designMatrix_mulVec data pgsBasis splineBasis m hm_class
+      rw [unpack_pack_eq m pgsBasis splineBasis hm_class] at h
+      intro i
+      rw [h i, hβ]
+
+    have h_loss_le := fit_minimizes_loss p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank m hm_class
+    rw [h_lambda_zero] at h_loss_le
+    unfold empiricalLoss pointwiseNLL at h_loss_le
+    simp only [hm_class.dist_gaussian, add_zero, zero_mul] at h_loss_le
+    have h_n_pos_real : (0 : ℝ) < n := by exact_mod_cast h_n_pos
+    have h_inv_n_pos : 0 < (1 / (n : ℝ)) := one_div_pos.mpr h_n_pos_real
+    rw [mul_le_mul_left h_inv_n_pos] at h_loss_le
+    convert h_loss_le
+    · unfold l2norm_sq; congr; ext i; congr; exact (pred i).symm
+    · unfold l2norm_sq; congr; ext i; congr; rw [h_pred_m i]
+
+  have h_pred'_min : ∀ w ∈ K', l2norm_sq (y_vec - pred') ≤ l2norm_sq (y_vec - w) := by
+    intro w hw
+    obtain ⟨β, hβ⟩ := hw
+    let m := unpackParams pgsBasis splineBasis β
+    have hm_class : InModelClass m pgsBasis splineBasis := by
+      unfold unpackParams
+      exact { basis_match := rfl, spline_match := rfl, link_identity := rfl, dist_gaussian := rfl }
+    have h_pred_m : ∀ i, linearPredictor m (data'.p i) (data'.c i) = w i := by
+      have h := linearPredictor_eq_designMatrix_mulVec data' pgsBasis splineBasis m hm_class
+      rw [unpack_pack_eq m pgsBasis splineBasis hm_class] at h
+      intro i
+      rw [h i, hβ]
+
+    have h_loss_le := fit_minimizes_loss p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank' m hm_class
+    rw [h_lambda_zero] at h_loss_le
+    unfold empiricalLoss pointwiseNLL at h_loss_le
+    simp only [hm_class.dist_gaussian, add_zero, zero_mul] at h_loss_le
+    have h_n_pos_real : (0 : ℝ) < n := by exact_mod_cast h_n_pos
+    have h_inv_n_pos : 0 < (1 / (n : ℝ)) := one_div_pos.mpr h_n_pos_real
+    rw [mul_le_mul_left h_inv_n_pos] at h_loss_le
+    convert h_loss_le
+    · unfold l2norm_sq; congr; ext i; congr; exact (pred' i).symm
+    · unfold l2norm_sq; congr; ext i; congr; rw [h_pred_m i]
+
+  -- Use uniqueness of orthogonal projection
+  have h_pred_eq : pred = orthogonalProjection K y_vec := by
+    apply orthogonalProjection_eq_of_dist_le n K y_vec pred h_pred_in_K h_pred_min
+
+  have h_pred'_eq : pred' = orthogonalProjection K' y_vec := by
+    apply orthogonalProjection_eq_of_dist_le n K' y_vec pred' h_pred'_in_K' h_pred'_min
+
+  rw [h_pred_eq, h_pred'_eq, h_K_eq_K']
 
 noncomputable def dist_to_support {k : ℕ} (c : Fin k → ℝ) (supp : Set (Fin k → ℝ)) : ℝ :=
   Metric.infDist c supp
@@ -6103,8 +6241,8 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
               have h_jacobi : ∀ σ : Equiv.Perm m, deriv (fun rho => ∏ i : m, M rho ((σ : m → m) i) i) rho = ∑ i : m, (∏ j ∈ Finset.univ.erase i, M rho ((σ : m → m) j) j) * deriv (fun rho => M rho ((σ : m → m) i) i) rho := by
                 intro σ
                 have h_prod_rule : ∀ (f : m → ℝ → ℝ), (∀ i, DifferentiableAt ℝ (f i) rho) → deriv (fun rho => ∏ i, f i rho) rho = ∑ i, (∏ j ∈ Finset.univ.erase i, f j rho) * deriv (f i) rho := by
-                  -- exact?
-                  admit
+                  intro f hf
+                  exact deriv_finset_prod (fun i _ => hf i)
                 apply h_prod_rule
                 intro i
                 exact DifferentiableAt.comp rho ( differentiableAt_pi.1 ( differentiableAt_pi.1 hM_diff _ ) _ ) differentiableAt_id
@@ -6114,8 +6252,7 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
                   have h_diff : ∀ i : m, DifferentiableAt ℝ (fun rho => M rho ((σ : m → m) i) i) rho := by
                     intro i
                     exact DifferentiableAt.comp rho ( differentiableAt_pi.1 ( differentiableAt_pi.1 hM_diff _ ) _ ) differentiableAt_id
-                  -- exact?
-                  admit
+                  exact DifferentiableAt.finset_prod (fun i _ => h_diff i)
                 norm_num [ h_diff ]
               simpa only [ h_jacobi ] using h_deriv_sum
             simp +decide only [h_jacobi, Finset.mul_sum _ _ _]
