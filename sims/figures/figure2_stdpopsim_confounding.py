@@ -310,7 +310,27 @@ def _true_ancestry_proportions(
     span = right - left
     child_idx = sample_lookup[children]
     parent_src = node_src[parents]
-    _accumulate_link_edges_numba(child_idx, parent_src, span, hap_to_dip, dip_acc)
+    n_edges = int(len(edges))
+    chunk_size = 2_000_000
+    last_log_t = time.perf_counter()
+    for start in range(0, n_edges, chunk_size):
+        stop = min(n_edges, start + chunk_size)
+        _accumulate_link_edges_numba(
+            child_idx[start:stop],
+            parent_src[start:stop],
+            span[start:stop],
+            hap_to_dip,
+            dip_acc,
+        )
+        if log_prefix is not None:
+            now_t = time.perf_counter()
+            if (stop == n_edges) or (now_t - last_log_t >= 20.0):
+                pct = 100.0 * float(stop) / float(max(1, n_edges))
+                _log(
+                    f"[{log_prefix}] link_ancestors accumulation progress: "
+                    f"edges={stop}/{n_edges} ({pct:.1f}%)"
+                )
+                last_log_t = now_t
     valid = (child_idx >= 0) & (parent_src >= 0)
     if log_prefix:
         _stage_done(
@@ -414,7 +434,16 @@ def _simulate(
 
     _log(f"[{run_id}] Sampling PCA sites (n={pca_n_sites}, maf_min=0.05)")
     t0 = time.perf_counter()
-    pca_sites = sample_site_ids_for_maf(ts, a_idx, b_idx, n_sites=pca_n_sites, maf_min=0.05, seed=seed + 11)
+    pca_sites = sample_site_ids_for_maf(
+        ts,
+        a_idx,
+        b_idx,
+        n_sites=pca_n_sites,
+        maf_min=0.05,
+        seed=seed + 11,
+        log_fn=_log,
+        progress_label=f"{run_id} pca_site_scan",
+    )
     _stage_done(run_id, "sample PCA sites", t0, extra=f"(selected={len(pca_sites)})")
     _log(f"[{run_id}] Computing PCs (n_components={N_PCS})")
     t0 = time.perf_counter()
@@ -430,14 +459,31 @@ def _simulate(
         n_sites=min(causal_max_sites, int(ts.num_sites)),
         maf_min=0.01,
         seed=seed + 17,
+        log_fn=_log,
+        progress_label=f"{run_id} causal_site_scan",
     )
     _stage_done(run_id, "sample causal sites", t0, extra=f"(selected={len(causal_sites)})")
     _log(f"[{run_id}] Building genetic risk from causal sites (n={len(causal_sites)})")
     t0 = time.perf_counter()
-    G_true = genetic_risk_from_real_pgs_effect_distribution(ts, a_idx, b_idx, causal_sites, pgs_effects, seed=seed + 19)
+    G_true = genetic_risk_from_real_pgs_effect_distribution(
+        ts,
+        a_idx,
+        b_idx,
+        causal_sites,
+        pgs_effects,
+        seed=seed + 19,
+        log_fn=_log,
+        progress_label=f"{run_id} genetic_risk",
+    )
     _stage_done(run_id, "build genetic risk", t0)
     ts_sites, causal_overlap, het_by_pop, causal_pos_1based = summarize_true_effect_site_diagnostics(
-        ts, a_idx, b_idx, pop_label, causal_sites
+        ts,
+        a_idx,
+        b_idx,
+        pop_label,
+        causal_sites,
+        log_fn=_log,
+        progress_label=f"{run_id} true_effect_diagnostics",
     )
     het_bits = ", ".join(f"{k}={v:.4f}" for k, v in sorted(het_by_pop.items()))
     _log(

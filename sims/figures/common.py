@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import gzip
-import math
+import time
 import urllib.request
 from pathlib import Path
+from typing import Callable
 from typing import Iterable, Sequence
 
 import numpy as np
@@ -108,13 +109,32 @@ def sample_site_ids_for_maf(
     n_sites: int,
     maf_min: float,
     seed: int,
+    log_fn: Callable[[str], None] | None = None,
+    progress_label: str | None = None,
+    progress_every_variants: int = 50000,
+    progress_every_seconds: float = 20.0,
 ) -> list[int]:
     rng = np.random.default_rng(seed)
     reservoir: list[int] = []
     seen = 0
     denom = 2.0 * float(a_idx.shape[0])
+    total_sites = int(getattr(ts, "num_sites", 0))
+    last_log_t = time.perf_counter()
+    every_n = max(1, int(progress_every_variants))
+    every_s = float(progress_every_seconds)
 
-    for var in ts.variants():
+    if log_fn is not None:
+        label = progress_label or "site scan"
+        log_fn(
+            f"[{label}] start: target_sites={n_sites}, maf_min={maf_min}, "
+            + (
+                f"total_sites={total_sites}, progress_every={every_n} variants/{every_s:.0f}s"
+                if total_sites > 0
+                else f"progress_every={every_n} variants/{every_s:.0f}s"
+            )
+        )
+
+    for idx, var in enumerate(ts.variants(), start=1):
         alleles = getattr(var, "alleles", None)
         if alleles is not None and len(alleles) != 2:
             continue
@@ -132,9 +152,23 @@ def sample_site_ids_for_maf(
             j = int(rng.integers(0, seen))
             if j < n_sites:
                 reservoir[j] = sid
+        if log_fn is not None:
+            now_t = time.perf_counter()
+            if (idx % every_n == 0) or (every_s > 0 and (now_t - last_log_t) >= every_s):
+                pct = f"{(100.0 * idx / total_sites):.1f}%" if total_sites > 0 else "n/a"
+                label = progress_label or "site scan"
+                log_fn(
+                    f"[{label}] progress: processed={idx}"
+                    + (f"/{total_sites}" if total_sites > 0 else "")
+                    + f" ({pct}), passing_maf={seen}, reservoir={len(reservoir)}"
+                )
+                last_log_t = now_t
 
     if not reservoir:
         raise RuntimeError("No sites passed MAF filter")
+    if log_fn is not None:
+        label = progress_label or "site scan"
+        log_fn(f"[{label}] complete: selected={len(reservoir)} from passing_maf={seen}")
     return reservoir
 
 
@@ -179,6 +213,9 @@ def genetic_risk_from_real_pgs_effect_distribution(
     causal_site_ids: list[int],
     real_effects: np.ndarray,
     seed: int,
+    log_fn: Callable[[str], None] | None = None,
+    progress_label: str | None = None,
+    progress_every_variants: int = 50000,
 ) -> np.ndarray:
     rng = np.random.default_rng(seed)
     draw = rng.choice(real_effects, size=len(causal_site_ids), replace=True).astype(np.float64)
@@ -190,15 +227,41 @@ def genetic_risk_from_real_pgs_effect_distribution(
     beta_by_site = {int(s): float(b) for s, b in zip(causal_site_ids, betas)}
     G = np.zeros(a_idx.shape[0], dtype=np.float64)
 
-    for var in ts.variants():
+    total_sites = int(getattr(ts, "num_sites", 0))
+    used = 0
+    last_log_t = time.perf_counter()
+    every_n = max(1, int(progress_every_variants))
+    if log_fn is not None:
+        label = progress_label or "risk build"
+        log_fn(
+            f"[{label}] start: causal_sites={len(causal_site_ids)}, "
+            + (f"total_sites={total_sites}, " if total_sites > 0 else "")
+            + f"progress_every={every_n} variants/20s"
+        )
+    for idx, var in enumerate(ts.variants(), start=1):
         b = beta_by_site.get(int(var.site.id))
         if b is None:
             continue
         g = (var.genotypes == 1).astype(np.int8, copy=False)
         dos = (g[a_idx] + g[b_idx]).astype(np.float64, copy=False)
         G += b * dos
+        used += 1
+        if log_fn is not None:
+            now_t = time.perf_counter()
+            if (idx % every_n == 0) or (now_t - last_log_t >= 20.0):
+                pct = f"{(100.0 * idx / total_sites):.1f}%" if total_sites > 0 else "n/a"
+                label = progress_label or "risk build"
+                log_fn(
+                    f"[{label}] progress: processed={idx}"
+                    + (f"/{total_sites}" if total_sites > 0 else "")
+                    + f" ({pct}), matched_causal={used}/{len(causal_site_ids)}"
+                )
+                last_log_t = now_t
 
     G = StandardScaler(with_mean=True, with_std=True).fit_transform(G.reshape(-1, 1)).ravel()
+    if log_fn is not None:
+        label = progress_label or "risk build"
+        log_fn(f"[{label}] complete: matched_causal={used}/{len(causal_site_ids)}")
     return G.astype(np.float64)
 
 
@@ -238,6 +301,10 @@ def summarize_true_effect_site_diagnostics(
     b_idx: np.ndarray,
     pop_labels: np.ndarray,
     causal_site_ids: list[int],
+    log_fn: Callable[[str], None] | None = None,
+    progress_label: str | None = None,
+    progress_every_variants: int = 50000,
+    progress_every_seconds: float = 20.0,
 ) -> tuple[int, int, dict[str, float], set[int]]:
     """
     Summarize overlap and heterozygosity diagnostics for true-effect (causal) sites.
@@ -257,11 +324,32 @@ def summarize_true_effect_site_diagnostics(
     pop_het_n = {p: 0 for p in pop_names}
     overlap_true_effect_sites = 0
     causal_pos_1based: set[int] = set()
+    seen = 0
+    every_n = max(1, int(progress_every_variants))
+    every_s = float(progress_every_seconds)
+    last_log_t = time.perf_counter()
+    if log_fn is not None:
+        label = progress_label or "true effect diagnostics"
+        log_fn(
+            f"[{label}] start: causal_sites={len(causal_set)}, total_sites={total_sites_in_ts}, "
+            f"progress_every={every_n} variants/{every_s:.0f}s"
+        )
 
-    for var in ts.variants():
+    for idx, var in enumerate(ts.variants(), start=1):
         sid = int(var.site.id)
         if sid not in causal_set:
+            if log_fn is not None:
+                now_t = time.perf_counter()
+                if (idx % every_n == 0) or (every_s > 0 and (now_t - last_log_t) >= every_s):
+                    pct = f"{(100.0 * idx / total_sites_in_ts):.1f}%" if total_sites_in_ts > 0 else "n/a"
+                    label = progress_label or "true effect diagnostics"
+                    log_fn(
+                        f"[{label}] progress: processed={idx}/{total_sites_in_ts} ({pct}), "
+                        f"matched_causal={seen}"
+                    )
+                    last_log_t = now_t
             continue
+        seen += 1
         overlap_true_effect_sites += 1
         causal_pos_1based.add(int(var.site.position) + 1)
         alleles = getattr(var, "alleles", None)
@@ -277,10 +365,27 @@ def summarize_true_effect_site_diagnostics(
                 continue
             pop_het_sum[p] += float(np.mean(het[mask]))
             pop_het_n[p] += 1
+        if log_fn is not None:
+            now_t = time.perf_counter()
+            if (idx % every_n == 0) or (every_s > 0 and (now_t - last_log_t) >= every_s):
+                pct = f"{(100.0 * idx / total_sites_in_ts):.1f}%" if total_sites_in_ts > 0 else "n/a"
+                label = progress_label or "true effect diagnostics"
+                log_fn(
+                    f"[{label}] progress: processed={idx}/{total_sites_in_ts} ({pct}), "
+                    f"matched_causal={seen}"
+                )
+                last_log_t = now_t
 
     mean_het_by_pop: dict[str, float] = {}
     for p in pop_names:
         n = pop_het_n[p]
         mean_het_by_pop[p] = float(pop_het_sum[p] / n) if n > 0 else float("nan")
+
+    if log_fn is not None:
+        label = progress_label or "true effect diagnostics"
+        log_fn(
+            f"[{label}] complete: matched_causal={seen}, "
+            f"overlap_true_effect_sites={overlap_true_effect_sites}"
+        )
 
     return total_sites_in_ts, overlap_true_effect_sites, mean_het_by_pop, causal_pos_1based

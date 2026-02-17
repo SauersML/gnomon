@@ -15,7 +15,7 @@ FIG2_SCRIPT = REPO_ROOT / "sims" / "figure2_stdpopsim_confounding.py"
 
 
 def _run(cmd: list[str], env: dict[str, str] | None = None) -> None:
-    print("+", " ".join(cmd))
+    print("+", " ".join(cmd), flush=True)
     subprocess.run(cmd, check=True, env=env)
 
 
@@ -334,6 +334,7 @@ def run_pipeline(figure: str, small: bool, use_existing: bool = False, use_exist
     jobs = _jobs()
     env = os.environ.copy()
     env.setdefault("RPY2_CFFI_MODE", "API")
+    env.setdefault("PYTHONUNBUFFERED", "1")
     _apply_thread_env(env, jobs)
     _assert_mgcv_available(env)
 

@@ -275,7 +275,16 @@ def _simulate_for_generation(
     ooa_test_idx = ooa_idx[n_ooa_train:n_ooa_train + n_ooa_test]
 
     _log(f"[{prefix}] Sampling PCA sites (n={pca_n_sites}, maf_min=0.05)")
-    pca_sites = sample_site_ids_for_maf(ts, a_idx, b_idx, n_sites=pca_n_sites, maf_min=0.05, seed=seed + 7)
+    pca_sites = sample_site_ids_for_maf(
+        ts,
+        a_idx,
+        b_idx,
+        n_sites=pca_n_sites,
+        maf_min=0.05,
+        seed=seed + 7,
+        log_fn=_log,
+        progress_label=f"{prefix} pca_site_scan",
+    )
     _log(f"[{prefix}] Computing PCs (n_components={N_PCS})")
     pcs = pcs_from_sites(ts, a_idx, b_idx, pca_sites, seed=seed + 11, n_components=N_PCS)
 
@@ -287,6 +296,8 @@ def _simulate_for_generation(
         n_sites=min(causal_max_sites, int(ts.num_sites)),
         maf_min=0.01,
         seed=seed + 17,
+        log_fn=_log,
+        progress_label=f"{prefix} causal_site_scan",
     )
     _log(f"[{prefix}] Building genetic risk from causal sites (n={len(causal_sites)})")
     G_true = genetic_risk_from_real_pgs_effect_distribution(
@@ -296,9 +307,17 @@ def _simulate_for_generation(
         causal_sites,
         pgs_effects,
         seed=seed + 19,
+        log_fn=_log,
+        progress_label=f"{prefix} genetic_risk",
     )
     ts_sites, causal_overlap, het_by_pop, causal_pos_1based = summarize_true_effect_site_diagnostics(
-        ts, a_idx, b_idx, pop, causal_sites
+        ts,
+        a_idx,
+        b_idx,
+        pop,
+        causal_sites,
+        log_fn=_log,
+        progress_label=f"{prefix} true_effect_diagnostics",
     )
     het_bits = ", ".join(f"{k}={v:.4f}" for k, v in sorted(het_by_pop.items()))
     _log(
