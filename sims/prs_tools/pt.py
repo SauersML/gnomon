@@ -237,7 +237,9 @@ class PPlusT:
                 names=["CHR", "ID", "CM", "POS", "A1", "A2"],
                 dtype={"ID": str, "A1": str},
             )
-            bim = bim[bim["ID"].isin(keep_ids)].copy()
+            # If LD-pruned IDs are not available yet, use all BIM variants.
+            if keep_ids is not None:
+                bim = bim[bim["ID"].isin(keep_ids)].copy()
             if bim.empty:
                 raise RuntimeError("P+T fallback failed: no variants available in training .bim")
             bim = bim.head(max(1, self.fallback_top_k)).copy()
