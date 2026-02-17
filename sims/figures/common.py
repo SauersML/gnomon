@@ -194,8 +194,12 @@ def sample_two_site_sets_for_maf(
     """
     rng_pca = np.random.default_rng(pca_seed)
     rng_causal = np.random.default_rng(causal_seed)
-    pca_res: list[int] = []
-    causal_res: list[int] = []
+    pca_cap = max(1, int(pca_n_sites))
+    causal_cap = max(1, int(causal_n_sites))
+    pca_res = np.empty(pca_cap, dtype=np.int32)
+    causal_res = np.empty(causal_cap, dtype=np.int32)
+    pca_fill = 0
+    causal_fill = 0
     pca_seen = 0
     causal_seen = 0
     denom = 2.0 * float(a_idx.shape[0])
@@ -223,20 +227,22 @@ def sample_two_site_sets_for_maf(
 
         if maf >= pca_maf_min:
             pca_seen += 1
-            if len(pca_res) < pca_n_sites:
-                pca_res.append(sid)
+            if pca_fill < pca_cap:
+                pca_res[pca_fill] = sid
+                pca_fill += 1
             else:
                 j = int(rng_pca.integers(0, pca_seen))
-                if j < pca_n_sites:
+                if j < pca_cap:
                     pca_res[j] = sid
 
         if maf >= causal_maf_min:
             causal_seen += 1
-            if len(causal_res) < causal_n_sites:
-                causal_res.append(sid)
+            if causal_fill < causal_cap:
+                causal_res[causal_fill] = sid
+                causal_fill += 1
             else:
                 j = int(rng_causal.integers(0, causal_seen))
-                if j < causal_n_sites:
+                if j < causal_cap:
                     causal_res[j] = sid
 
         if log_fn is not None:
@@ -247,22 +253,25 @@ def sample_two_site_sets_for_maf(
                 log_fn(
                     f"[{label}] progress: processed={idx}"
                     + (f"/{total_sites}" if total_sites > 0 else "")
-                    + f" ({pct}), pca_pass={pca_seen}, pca_res={len(pca_res)}, "
-                    f"causal_pass={causal_seen}, causal_res={len(causal_res)}"
+                    + f" ({pct}), pca_pass={pca_seen}, pca_res={pca_fill}, "
+                    f"causal_pass={causal_seen}, causal_res={causal_fill}"
                 )
                 last_log_t = now_t
 
-    if not pca_res:
+    if pca_fill == 0:
         raise RuntimeError("No sites passed PCA MAF filter")
-    if not causal_res:
+    if causal_fill == 0:
         raise RuntimeError("No sites passed causal MAF filter")
     if log_fn is not None:
         label = progress_label or "dual site scan"
         log_fn(
-            f"[{label}] complete: pca_selected={len(pca_res)} from pass={pca_seen}; "
-            f"causal_selected={len(causal_res)} from pass={causal_seen}"
+            f"[{label}] complete: pca_selected={pca_fill} from pass={pca_seen}; "
+            f"causal_selected={causal_fill} from pass={causal_seen}"
         )
-    return pca_res, causal_res
+    return (
+        pca_res[:pca_fill].astype(np.int64, copy=False).tolist(),
+        causal_res[:causal_fill].astype(np.int64, copy=False).tolist(),
+    )
 
 
 def pcs_from_sites(
@@ -321,8 +330,11 @@ def compute_pcs_risk_and_diagnostics(
     - standardized genetic risk (G_true) for selected causal sites
     - causal overlap/heterozygosity diagnostics
     """
-    n_ind = a_idx.shape[0]
-    pca_map = {int(sid): j for j, sid in enumerate(pca_site_ids)}
+    n_ind = int(a_idx.shape[0])
+    total_sites = int(ts.num_sites)
+    pca_col_by_site = np.full(total_sites, -1, dtype=np.int32)
+    for j, sid in enumerate(pca_site_ids):
+        pca_col_by_site[int(sid)] = int(j)
     X = np.empty((n_ind, len(pca_site_ids)), dtype=np.float32)
     pca_filled = 0
 
@@ -332,18 +344,26 @@ def compute_pcs_risk_and_diagnostics(
     sd = float(np.std(betas))
     if sd > 0:
         betas = betas / sd
-    beta_by_site = {int(s): float(b) for s, b in zip(causal_site_ids, betas)}
-    causal_set = set(int(s) for s in causal_site_ids)
+    beta_by_site = np.zeros(total_sites, dtype=np.float64)
+    causal_mask_by_site = np.zeros(total_sites, dtype=np.bool_)
+    for s, b in zip(causal_site_ids, betas):
+        sid = int(s)
+        beta_by_site[sid] = float(b)
+        causal_mask_by_site[sid] = True
+    beta_mask_by_site = beta_by_site != 0.0
     G = np.zeros(n_ind, dtype=np.float64)
 
-    total_sites = int(ts.num_sites)
     overlap_true_effect_sites = 0
     causal_pos_1based: set[int] = set()
-    pop_labels = np.asarray(pop_labels, dtype=object)
-    pop_names = [str(x) for x in pd.unique(pop_labels)]
-    pop_index = {p: np.where(pop_labels == p)[0] for p in pop_names}
-    pop_het_sum = {p: 0.0 for p in pop_names}
-    pop_het_n = {p: 0 for p in pop_names}
+    pop_labels_obj = np.asarray(pop_labels, dtype=object)
+    pop_names = [str(x) for x in pd.unique(pop_labels_obj)]
+    pop_to_code = {p: i for i, p in enumerate(pop_names)}
+    pop_codes = np.array([pop_to_code[str(p)] for p in pop_labels_obj], dtype=np.int32)
+    n_pop = len(pop_names)
+    pop_counts = np.bincount(pop_codes, minlength=n_pop).astype(np.float64)
+    pop_has_samples = pop_counts > 0
+    pop_het_sum = np.zeros(n_pop, dtype=np.float64)
+    pop_het_n = np.zeros(n_pop, dtype=np.int64)
 
     last_log_t = time.perf_counter()
     every_n = max(1, int(progress_every_variants))
@@ -357,10 +377,10 @@ def compute_pcs_risk_and_diagnostics(
 
     for idx, var in enumerate(ts.variants(), start=1):
         sid = int(var.site.id)
-        pca_col = pca_map.get(sid)
-        beta = beta_by_site.get(sid)
-        needs_diag = sid in causal_set
-        if pca_col is None and beta is None and not needs_diag:
+        pca_col = int(pca_col_by_site[sid])
+        beta_present = bool(beta_mask_by_site[sid])
+        needs_diag = bool(causal_mask_by_site[sid])
+        if pca_col < 0 and (not beta_present) and (not needs_diag):
             if log_fn is not None:
                 now_t = time.perf_counter()
                 if (idx % every_n == 0) or (every_s > 0 and (now_t - last_log_t) >= every_s):
@@ -380,23 +400,21 @@ def compute_pcs_risk_and_diagnostics(
         g = (var.genotypes == 1).astype(np.int8, copy=False)
         dos = g[a_idx] + g[b_idx]
 
-        if pca_col is not None:
+        if pca_col >= 0:
             X[:, pca_col] = dos.astype(np.float32, copy=False)
             pca_filled += 1
 
-        if beta is not None:
-            G += float(beta) * dos.astype(np.float64, copy=False)
+        if beta_present:
+            G += float(beta_by_site[sid]) * dos.astype(np.float64, copy=False)
 
         if needs_diag:
             overlap_true_effect_sites += 1
             causal_pos_1based.add(int(var.site.position) + 1)
             het = (dos == 1)
-            for p in pop_names:
-                idxs = pop_index[p]
-                if idxs.size == 0:
-                    continue
-                pop_het_sum[p] += float(np.mean(het[idxs]))
-                pop_het_n[p] += 1
+            het_sum = np.bincount(pop_codes, weights=het.astype(np.float64, copy=False), minlength=n_pop)
+            het_mean = np.divide(het_sum, pop_counts, out=np.zeros_like(het_sum), where=pop_has_samples)
+            pop_het_sum += het_mean
+            pop_het_n += pop_has_samples.astype(np.int64, copy=False)
 
         if log_fn is not None:
             now_t = time.perf_counter()
@@ -419,10 +437,9 @@ def compute_pcs_risk_and_diagnostics(
     pcs = StandardScaler(with_mean=True, with_std=True).fit_transform(pcs)
 
     G = StandardScaler(with_mean=True, with_std=True).fit_transform(G.reshape(-1, 1)).ravel()
-    mean_het_by_pop = {
-        p: (float(pop_het_sum[p] / pop_het_n[p]) if pop_het_n[p] > 0 else float("nan"))
-        for p in pop_names
-    }
+    mean_het_by_pop = {}
+    for i, p in enumerate(pop_names):
+        mean_het_by_pop[p] = float(pop_het_sum[i] / pop_het_n[i]) if pop_het_n[i] > 0 else float("nan")
     if log_fn is not None:
         label = progress_label or "feature build"
         log_fn(
