@@ -38,7 +38,9 @@ try:
         load_pgs003725_effects,
         diploid_index_pairs,
         sample_site_ids_for_maf,
+        sample_two_site_sets_for_maf,
         pcs_from_sites,
+        compute_pcs_risk_and_diagnostics,
         genetic_risk_from_real_pgs_effect_distribution,
         solve_intercept_for_prevalence,
         pop_names_from_ts,
@@ -50,7 +52,9 @@ except ImportError:
     load_pgs003725_effects,
     diploid_index_pairs,
     sample_site_ids_for_maf,
+    sample_two_site_sets_for_maf,
     pcs_from_sites,
+    compute_pcs_risk_and_diagnostics,
     genetic_risk_from_real_pgs_effect_distribution,
     solve_intercept_for_prevalence,
     pop_names_from_ts,
@@ -572,64 +576,49 @@ def _simulate(
     pop_label = np.array([pop_lookup.get(int(p), f"pop_{int(p)}") for p in pop_idx], dtype=object)
     _stage_done(run_id, "sample mapping", t0, extra=f"(diploids={len(pop_label)}, haploids={len(ts.samples())})")
 
-    _stage_mark(run_id, 4, total_steps, "sample PCA sites")
-    _log(f"[{run_id}] Sampling PCA sites (n={pca_n_sites}, maf_min=0.05)")
+    _stage_mark(run_id, 4, total_steps, "sample PCA + causal sites")
+    _log(f"[{run_id}] Sampling PCA+causal sites in one pass")
     t0 = time.perf_counter()
-    pca_sites = sample_site_ids_for_maf(
+    pca_sites, causal_sites = sample_two_site_sets_for_maf(
         ts,
         a_idx,
         b_idx,
-        n_sites=pca_n_sites,
-        maf_min=0.05,
-        seed=seed + 11,
+        pca_n_sites=pca_n_sites,
+        pca_maf_min=0.05,
+        pca_seed=seed + 11,
+        causal_n_sites=min(causal_max_sites, int(ts.num_sites)),
+        causal_maf_min=0.01,
+        causal_seed=seed + 17,
         log_fn=_log,
-        progress_label=f"{run_id} pca_site_scan",
+        progress_label=f"{run_id} site_scan",
     )
-    _stage_done(run_id, "sample PCA sites", t0, extra=f"(selected={len(pca_sites)})")
+    _stage_done(
+        run_id,
+        "sample PCA+causal sites",
+        t0,
+        extra=f"(pca_selected={len(pca_sites)}, causal_selected={len(causal_sites)})",
+    )
     _stage_mark(run_id, 5, total_steps, "compute PCs")
-    _log(f"[{run_id}] Computing PCs (n_components={N_PCS})")
+    _log(f"[{run_id}] Computing PCs + risk + diagnostics in one pass")
     t0 = time.perf_counter()
-    pcs = pcs_from_sites(ts, a_idx, b_idx, pca_sites, seed=seed + 13, n_components=N_PCS)
-    _stage_done(run_id, "compute PCs", t0)
-
-    _stage_mark(run_id, 6, total_steps, "sample causal sites")
-    _log(f"[{run_id}] Sampling causal sites (max_n={causal_max_sites}, maf_min=0.01)")
-    t0 = time.perf_counter()
-    causal_sites = sample_site_ids_for_maf(
-        ts,
-        a_idx,
-        b_idx,
-        n_sites=min(causal_max_sites, int(ts.num_sites)),
-        maf_min=0.01,
-        seed=seed + 17,
-        log_fn=_log,
-        progress_label=f"{run_id} causal_site_scan",
-    )
-    _stage_done(run_id, "sample causal sites", t0, extra=f"(selected={len(causal_sites)})")
-    _stage_mark(run_id, 7, total_steps, "build genetic risk")
-    _log(f"[{run_id}] Building genetic risk from causal sites (n={len(causal_sites)})")
-    t0 = time.perf_counter()
-    G_true = genetic_risk_from_real_pgs_effect_distribution(
-        ts,
-        a_idx,
-        b_idx,
-        causal_sites,
-        pgs_effects,
-        seed=seed + 19,
-        log_fn=_log,
-        progress_label=f"{run_id} genetic_risk",
-    )
-    _stage_done(run_id, "build genetic risk", t0)
-    _stage_mark(run_id, 8, total_steps, "true-effect diagnostics")
-    ts_sites, causal_overlap, het_by_pop, causal_pos_1based = summarize_true_effect_site_diagnostics(
+    pcs, G_true, ts_sites, causal_overlap, het_by_pop, causal_pos_1based = compute_pcs_risk_and_diagnostics(
         ts,
         a_idx,
         b_idx,
         pop_label,
-        causal_sites,
+        pca_site_ids=pca_sites,
+        n_pcs=N_PCS,
+        pca_seed=seed + 13,
+        causal_site_ids=causal_sites,
+        real_effects=pgs_effects,
+        causal_seed=seed + 19,
         log_fn=_log,
-        progress_label=f"{run_id} true_effect_diagnostics",
+        progress_label=f"{run_id} feature_build",
     )
+    _stage_done(run_id, "compute PCs+risk+diagnostics", t0)
+    _stage_mark(run_id, 6, total_steps, "feature extraction complete")
+    _stage_mark(run_id, 7, total_steps, "true-effect diagnostics")
+    _stage_mark(run_id, 8, total_steps, "ready for ancestry")
     het_bits = ", ".join(f"{k}={v:.4f}" for k, v in sorted(het_by_pop.items()))
     _log(
         f"[{run_id}] Variant diagnostics: ts_sites={ts_sites}, "

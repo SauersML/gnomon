@@ -31,7 +31,9 @@ try:
         load_pgs003725_effects,
         diploid_index_pairs,
         sample_site_ids_for_maf,
+        sample_two_site_sets_for_maf,
         pcs_from_sites,
+        compute_pcs_risk_and_diagnostics,
         genetic_risk_from_real_pgs_effect_distribution,
         solve_intercept_for_prevalence,
         get_chr22_recomb_map,
@@ -43,7 +45,9 @@ except ImportError:
     load_pgs003725_effects,
     diploid_index_pairs,
     sample_site_ids_for_maf,
+    sample_two_site_sets_for_maf,
     pcs_from_sites,
+    compute_pcs_risk_and_diagnostics,
     genetic_risk_from_real_pgs_effect_distribution,
     solve_intercept_for_prevalence,
     get_chr22_recomb_map,
@@ -274,50 +278,34 @@ def _simulate_for_generation(
     ooa_train_idx = ooa_idx[:n_ooa_train]
     ooa_test_idx = ooa_idx[n_ooa_train:n_ooa_train + n_ooa_test]
 
-    _log(f"[{prefix}] Sampling PCA sites (n={pca_n_sites}, maf_min=0.05)")
-    pca_sites = sample_site_ids_for_maf(
+    _log(f"[{prefix}] Sampling PCA+causal sites in one pass")
+    pca_sites, causal_sites = sample_two_site_sets_for_maf(
         ts,
         a_idx,
         b_idx,
-        n_sites=pca_n_sites,
-        maf_min=0.05,
-        seed=seed + 7,
+        pca_n_sites=pca_n_sites,
+        pca_maf_min=0.05,
+        pca_seed=seed + 7,
+        causal_n_sites=min(causal_max_sites, int(ts.num_sites)),
+        causal_maf_min=0.01,
+        causal_seed=seed + 17,
         log_fn=_log,
-        progress_label=f"{prefix} pca_site_scan",
+        progress_label=f"{prefix} site_scan",
     )
-    _log(f"[{prefix}] Computing PCs (n_components={N_PCS})")
-    pcs = pcs_from_sites(ts, a_idx, b_idx, pca_sites, seed=seed + 11, n_components=N_PCS)
-
-    _log(f"[{prefix}] Sampling causal sites (max_n={causal_max_sites}, maf_min=0.01)")
-    causal_sites = sample_site_ids_for_maf(
-        ts,
-        a_idx,
-        b_idx,
-        n_sites=min(causal_max_sites, int(ts.num_sites)),
-        maf_min=0.01,
-        seed=seed + 17,
-        log_fn=_log,
-        progress_label=f"{prefix} causal_site_scan",
-    )
-    _log(f"[{prefix}] Building genetic risk from causal sites (n={len(causal_sites)})")
-    G_true = genetic_risk_from_real_pgs_effect_distribution(
-        ts,
-        a_idx,
-        b_idx,
-        causal_sites,
-        pgs_effects,
-        seed=seed + 19,
-        log_fn=_log,
-        progress_label=f"{prefix} genetic_risk",
-    )
-    ts_sites, causal_overlap, het_by_pop, causal_pos_1based = summarize_true_effect_site_diagnostics(
+    _log(f"[{prefix}] Computing PCs+risk+diagnostics in one pass")
+    pcs, G_true, ts_sites, causal_overlap, het_by_pop, causal_pos_1based = compute_pcs_risk_and_diagnostics(
         ts,
         a_idx,
         b_idx,
         pop,
-        causal_sites,
+        pca_site_ids=pca_sites,
+        n_pcs=N_PCS,
+        pca_seed=seed + 11,
+        causal_site_ids=causal_sites,
+        real_effects=pgs_effects,
+        causal_seed=seed + 19,
         log_fn=_log,
-        progress_label=f"{prefix} true_effect_diagnostics",
+        progress_label=f"{prefix} feature_build",
     )
     het_bits = ", ".join(f"{k}={v:.4f}" for k, v in sorted(het_by_pop.items()))
     _log(
