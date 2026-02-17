@@ -230,3 +230,57 @@ def pop_names_from_ts(ts) -> dict[int, str]:
             name = md.get("name")
         out[p.id] = str(name) if name else f"pop_{p.id}"
     return out
+
+
+def summarize_true_effect_site_diagnostics(
+    ts,
+    a_idx: np.ndarray,
+    b_idx: np.ndarray,
+    pop_labels: np.ndarray,
+    causal_site_ids: list[int],
+) -> tuple[int, int, dict[str, float], set[int]]:
+    """
+    Summarize overlap and heterozygosity diagnostics for true-effect (causal) sites.
+
+    Returns:
+      total_sites_in_ts: number of variant sites in the simulated sample.
+      overlap_true_effect_sites: number of causal site IDs present in this ts.
+      mean_het_by_pop: per-population mean heterozygosity across overlapping causal sites.
+      causal_pos_1based: set of 1-based positions for overlapping causal sites.
+    """
+    total_sites_in_ts = int(ts.num_sites)
+    causal_set = set(int(s) for s in causal_site_ids)
+    pop_labels = np.asarray(pop_labels, dtype=object)
+    pop_names = [str(x) for x in pd.unique(pop_labels)]
+    pop_masks = {p: (pop_labels == p) for p in pop_names}
+    pop_het_sum = {p: 0.0 for p in pop_names}
+    pop_het_n = {p: 0 for p in pop_names}
+    overlap_true_effect_sites = 0
+    causal_pos_1based: set[int] = set()
+
+    for var in ts.variants():
+        sid = int(var.site.id)
+        if sid not in causal_set:
+            continue
+        overlap_true_effect_sites += 1
+        causal_pos_1based.add(int(var.site.position) + 1)
+        alleles = getattr(var, "alleles", None)
+        if alleles is not None and len(alleles) != 2:
+            continue
+        g = (var.genotypes == 1).astype(np.int8, copy=False)
+        dos = g[a_idx] + g[b_idx]
+        het = (dos == 1)
+        for p in pop_names:
+            mask = pop_masks[p]
+            n = int(np.count_nonzero(mask))
+            if n == 0:
+                continue
+            pop_het_sum[p] += float(np.mean(het[mask]))
+            pop_het_n[p] += 1
+
+    mean_het_by_pop: dict[str, float] = {}
+    for p in pop_names:
+        n = pop_het_n[p]
+        mean_het_by_pop[p] = float(pop_het_sum[p] / n) if n > 0 else float("nan")
+
+    return total_sites_in_ts, overlap_true_effect_sites, mean_het_by_pop, causal_pos_1based

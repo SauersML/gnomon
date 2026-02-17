@@ -39,6 +39,7 @@ try:
         genetic_risk_from_real_pgs_effect_distribution,
         solve_intercept_for_prevalence,
         pop_names_from_ts,
+        summarize_true_effect_site_diagnostics,
     )
 except ImportError:
     from common import (
@@ -50,13 +51,14 @@ except ImportError:
     genetic_risk_from_real_pgs_effect_distribution,
     solve_intercept_for_prevalence,
     pop_names_from_ts,
+    summarize_true_effect_site_diagnostics,
     )
 from methods.raw_pgs import RawPGSMethod
 from methods.linear_interaction import LinearInteractionMethod
 from methods.normalization import NormalizationMethod
 from methods.gam_mgcv import GAMMethod
 from plink_utils import run_plink_conversion
-from prs_tools import BayesR
+from prs_tools import BayesR, PPlusT
 
 
 # Requested scale-down by 100.
@@ -425,6 +427,15 @@ def _simulate(
     t0 = time.perf_counter()
     G_true = genetic_risk_from_real_pgs_effect_distribution(ts, a_idx, b_idx, causal_sites, pgs_effects, seed=seed + 19)
     _stage_done(run_id, "build genetic risk", t0)
+    ts_sites, causal_overlap, het_by_pop, causal_pos_1based = summarize_true_effect_site_diagnostics(
+        ts, a_idx, b_idx, pop_label, causal_sites
+    )
+    het_bits = ", ".join(f"{k}={v:.4f}" for k, v in sorted(het_by_pop.items()))
+    _log(
+        f"[{run_id}] Variant diagnostics: ts_sites={ts_sites}, "
+        f"true_effect_sites={len(causal_sites)}, overlap={causal_overlap}"
+    )
+    _log(f"[{run_id}] Mean heterozygosity at true-effect sites by pop: {het_bits}")
 
     _log(f"[{run_id}] Computing true ancestry proportions")
     rng = np.random.default_rng(seed + 23)
@@ -508,6 +519,22 @@ def _simulate(
         memory_mb=plink_memory_mb,
     )
     _stage_done(run_id, "PLINK conversion", t0)
+    bim_path = prefix.with_suffix(".bim")
+    bim_n_variants = sum(1 for _ in open(bim_path, "r", encoding="utf-8", errors="replace"))
+    bim_pos = set()
+    with open(bim_path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) >= 4:
+                try:
+                    bim_pos.add(int(parts[3]))
+                except ValueError:
+                    pass
+    overlap_bim_true_effect = len(bim_pos & causal_pos_1based)
+    _log(
+        f"[{run_id}] Sample-variant diagnostics: "
+        f"bim_variants={bim_n_variants}, overlap_true_effect_positions={overlap_bim_true_effect}"
+    )
     vcf.unlink(missing_ok=True)
 
     _log(f"[{run_id}] Writing simulation table to {prefix.with_suffix('.tsv')}")
@@ -518,20 +545,21 @@ def _simulate(
     return df
 
 
-def _run_bayesr_and_predict(
+def _run_prs_and_predict(
     df: pd.DataFrame,
     prefix: str,
     out_dir: Path,
     plink_threads: int,
     plink_memory_mb: int | None,
     bayesr_threads: int,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+    use_bayesr: bool,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, object] | None]:
     import shutil
     import subprocess
 
     run_id = Path(prefix).name
     run_t0 = time.perf_counter()
-    _log(f"[{run_id}] Preparing BayesR files in {out_dir}")
+    _log(f"[{run_id}] Preparing PRS files in {out_dir}")
     work = out_dir / "work"
     work.mkdir(parents=True, exist_ok=True)
 
@@ -544,7 +572,7 @@ def _run_bayesr_and_predict(
 
     pd.DataFrame({"FID": [iid_to_fid[i] for i in train_ids], "IID": train_ids}).to_csv(work / "train.keep", sep="\t", header=False, index=False)
     pd.DataFrame({"FID": [iid_to_fid[i] for i in test_ids], "IID": test_ids}).to_csv(work / "test.keep", sep="\t", header=False, index=False)
-    _stage_done(run_id, "BayesR file prep", t0, extra=f"(n_train={len(train_ids)}, n_test={len(test_ids)})")
+    _stage_done(run_id, "PRS file prep", t0, extra=f"(n_train={len(train_ids)}, n_test={len(test_ids)})")
 
     plink = shutil.which("plink2") or "plink2"
     common = ["--threads", str(plink_threads)]
@@ -576,23 +604,39 @@ def _run_bayesr_and_predict(
         "IID": train_df["IID"].astype(str),
         **{f"pc{i+1}": train_df[f"pc{i+1}"].to_numpy() for i in range(N_PCS)},
     }).to_csv(work / "train.covar", sep=" ", header=False, index=False)
-    _stage_done(run_id, "write BayesR phenotype/covariate files", t0)
+    _stage_done(run_id, "write PRS phenotype/covariate files", t0)
 
-    br = BayesR(threads=bayesr_threads, plink_memory_mb=plink_memory_mb)
-    _log(f"[{run_id}] BayesR fit starting")
-    t0 = time.perf_counter()
-    eff = br.fit(str(work / "train"), str(work / "train.phen"), str(work / "bayesr"), covar_file=str(work / "train.covar"))
-    _stage_done(run_id, "BayesR fit", t0)
-    _log(f"[{run_id}] BayesR scoring train")
-    t0 = time.perf_counter()
-    train_scores = br.predict(str(work / "train"), eff, str(work / "bayesr_train"), freq_file=str(work / "ref.afreq"))
-    _stage_done(run_id, "BayesR score train", t0)
-    _log(f"[{run_id}] BayesR scoring test")
-    t0 = time.perf_counter()
-    test_scores = br.predict(str(work / "test"), eff, str(work / "bayesr_test"), freq_file=str(work / "ref.afreq"))
-    _stage_done(run_id, "BayesR score test", t0)
-    _stage_done(run_id, "BayesR/predict stage total", run_t0)
-    return train_scores, test_scores
+    if use_bayesr:
+        br = BayesR(threads=bayesr_threads, plink_memory_mb=plink_memory_mb)
+        _log(f"[{run_id}] BayesR fit starting")
+        t0 = time.perf_counter()
+        eff = br.fit(str(work / "train"), str(work / "train.phen"), str(work / "bayesr"), covar_file=str(work / "train.covar"))
+        _stage_done(run_id, "BayesR fit", t0)
+        _log(f"[{run_id}] BayesR scoring train")
+        t0 = time.perf_counter()
+        train_scores = br.predict(str(work / "train"), eff, str(work / "bayesr_train"), freq_file=str(work / "ref.afreq"))
+        _stage_done(run_id, "BayesR score train", t0)
+        _log(f"[{run_id}] BayesR scoring test")
+        t0 = time.perf_counter()
+        test_scores = br.predict(str(work / "test"), eff, str(work / "bayesr_test"), freq_file=str(work / "ref.afreq"))
+        _stage_done(run_id, "BayesR score test", t0)
+        _stage_done(run_id, "BayesR/predict stage total", run_t0)
+        return train_scores, test_scores, None
+    else:
+        _log(f"[{run_id}] P+T fit/scoring starting")
+        t0 = time.perf_counter()
+        pt = PPlusT(threads=plink_threads, plink_memory_mb=plink_memory_mb)
+        train_scores, test_scores, pt_meta = pt.fit_and_predict(
+            bfile_train=str(work / "train"),
+            bfile_test=str(work / "test"),
+            pheno_file=str(work / "train.phen"),
+            covar_file=str(work / "train.covar"),
+            freq_file=str(work / "ref.afreq"),
+            out_prefix=str(work / "pt"),
+        )
+        _stage_done(run_id, "P+T fit/score", t0)
+        _stage_done(run_id, "P+T/predict stage total", run_t0)
+        return train_scores, test_scores, pt_meta
 
 
 def _cleanup_seed_artifacts(prefix: Path, seed_work_dir: Path) -> None:
@@ -732,6 +776,36 @@ def _plot_pcs(df: pd.DataFrame, out_dir: Path) -> None:
     plt.close(fig)
 
 
+def _log_results_table(title: str, df: pd.DataFrame) -> None:
+    if df.empty:
+        _log(f"{title}: <empty>")
+        return
+    txt = df.to_string(index=False, justify="left")
+    _log(f"{title}\n{txt}")
+
+
+def _plot_pt_train_accuracy(metrics_df: pd.DataFrame, out_path: Path) -> None:
+    if metrics_df.empty:
+        return
+    _apply_plot_style()
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    ax.plot(
+        metrics_df["p_threshold"].to_numpy(dtype=float),
+        metrics_df["train_accuracy"].to_numpy(dtype=float),
+        marker="o",
+        linewidth=2,
+        color=CB["blue"],
+    )
+    ax.set_xscale("log")
+    ax.set_xlabel("P+T p-value threshold")
+    ax.set_ylabel("Train accuracy")
+    ax.set_title("Figure2 P+T train accuracy across thresholds")
+    _style_axes(ax, y_grid=True)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=240)
+    plt.close(fig)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", default="sims/results_figure2_local")
@@ -754,10 +828,12 @@ def main() -> None:
         default=100.0,
         help="Census time (generations ago) used to define ancestry source nodes.",
     )
-    parser.add_argument("--threads", type=int, default=None, help="Thread count for PLINK/BayesR. Default uses node allocation.")
+    parser.add_argument("--threads", type=int, default=None, help="Thread count for PLINK/PRS. Default uses node allocation.")
     parser.add_argument("--memory-mb", type=int, default=None, help="PLINK memory limit (MB). Default auto-sizes from node RAM.")
     parser.add_argument("--work-root", default=None, help="Directory for heavy transient work files (e.g., RAM disk).")
     parser.add_argument("--keep-intermediates", action="store_true", help="Keep PLINK/GCTB intermediate files.")
+    parser.add_argument("--bayesr", action="store_true", help="Use BayesR backend (default is fast P+T).")
+    parser.add_argument("--use-existing", action="store_true", help="Reuse existing fig2_s* PLINK/TSV files; skip simulation.")
     args = parser.parse_args()
 
     out_dir = Path(args.out)
@@ -765,6 +841,7 @@ def main() -> None:
     work_root = Path(args.work_root) if args.work_root else _default_work_root(out_dir)
     work_root.mkdir(parents=True, exist_ok=True)
     _log("Figure2 GAM backend: mgcv")
+    _log(f"Figure2 PRS backend: {'BayesR' if args.bayesr else 'P+T'}")
     threads = max(1, int(args.threads)) if args.threads is not None else _default_total_threads()
     if args.memory_mb is not None:
         memory_mb = max(512, int(args.memory_mb))
@@ -786,31 +863,51 @@ def main() -> None:
     test_scores = None
     seed = int(args.seed)
     _log(f"[fig2_s{seed}] Starting full Figure2 pipeline")
-    df = _simulate(
-        seed,
-        pgs_effects,
-        out_dir,
-        n_train_eur=int(args.n_train_eur),
-        n_test_per_pop=int(args.n_test_per_pop),
-        plink_threads=threads,
-        plink_memory_mb=memory_mb,
-        msprime_model=str(args.msprime_model),
-        pca_n_sites=int(args.pca_sites),
-        causal_max_sites=int(args.causal_sites),
-        bp_cap=args.bp_cap,
-        ancestry_census_time=float(args.ancestry_census_time),
-    )
     prefix = str(out_dir / f"fig2_s{seed}")
+    sim_tsv = out_dir / f"fig2_s{seed}.tsv"
+    if args.use_existing:
+        needed = [Path(f"{prefix}.bed"), Path(f"{prefix}.bim"), Path(f"{prefix}.fam"), sim_tsv]
+        miss = [str(p) for p in needed if not p.exists()]
+        if miss:
+            raise FileNotFoundError(f"[fig2_s{seed}] --use-existing requested, but missing files: {miss}")
+        _log(f"[fig2_s{seed}] Reusing existing simulation/PLINK files")
+        df = pd.read_csv(sim_tsv, sep="\t")
+    else:
+        df = _simulate(
+            seed,
+            pgs_effects,
+            out_dir,
+            n_train_eur=int(args.n_train_eur),
+            n_test_per_pop=int(args.n_test_per_pop),
+            plink_threads=threads,
+            plink_memory_mb=memory_mb,
+            msprime_model=str(args.msprime_model),
+            pca_n_sites=int(args.pca_sites),
+            causal_max_sites=int(args.causal_sites),
+            bp_cap=args.bp_cap,
+            ancestry_census_time=float(args.ancestry_census_time),
+        )
     seed_work = work_root / f"work_s{seed}"
-    _log(f"[fig2_s{seed}] Starting BayesR/prediction stage")
-    train_scores, test_scores = _run_bayesr_and_predict(
+    _log(f"[fig2_s{seed}] Starting PRS/prediction stage")
+    train_scores, test_scores, pt_meta = _run_prs_and_predict(
         df,
         prefix,
         seed_work,
         plink_threads=threads,
         plink_memory_mb=memory_mb,
         bayesr_threads=threads,
+        use_bayesr=bool(args.bayesr),
     )
+    if pt_meta is not None:
+        pt_metrics = pt_meta["threshold_metrics"].copy()
+        pt_metrics["seed"] = int(seed)
+        pt_metrics["is_selected"] = pt_metrics["p_threshold"] == float(pt_meta["best_p_threshold"])
+        pt_metrics.to_csv(out_dir / "figure2_pt_thresholds.tsv", sep="\t", index=False)
+        _plot_pt_train_accuracy(pt_metrics.sort_values("p_threshold"), out_dir / "figure2_pt_train_accuracy.png")
+        _log(
+            f"[fig2_s{seed}] P+T selected p={float(pt_meta['best_p_threshold']):g} "
+            f"(train_accuracy={float(pt_meta['best_train_accuracy']):.4f}, n_snps={int(pt_meta['best_n_snps'])})"
+        )
 
     train_df = df[df["group"] == "EUR_train"].copy()
     test_df = df[df["group"].str.endswith("_test")].copy()
@@ -826,22 +923,74 @@ def main() -> None:
     _log(f"[fig2_s{seed}] Method fitting/prediction complete")
 
     rows = []
+    test_prs = test_scores["PRS"].to_numpy(dtype=float)
     for method, y_prob in preds.items():
         for pop in ["EUR", "AFR", "ASIA", "ADMIX"]:
             mask = test_df["pop_label"] == pop
-            rows.append({"method": method, "population": pop, "auc": _auc(test_df.loc[mask, "y"].to_numpy(), y_prob[mask.to_numpy()])})
+            y_pop = test_df.loc[mask, "y"].to_numpy()
+            p_pop = np.asarray(y_prob, dtype=float)[mask.to_numpy()]
+            prs_pop = test_prs[mask.to_numpy()]
+            g_pop = test_df.loc[mask, "G_true"].to_numpy(dtype=float)
+            rows.append(
+                {
+                    "method": method,
+                    "population": pop,
+                    "n_train": int(len(train_df)),
+                    "n_test_total": int(len(test_df)),
+                    "n": int(mask.sum()),
+                    "prevalence": float(np.mean(y_pop)) if y_pop.size > 0 else np.nan,
+                    "auc": _auc(y_pop, p_pop),
+                    "mean_prs": float(np.mean(prs_pop)) if prs_pop.size > 0 else np.nan,
+                    "sd_prs": float(np.std(prs_pop, ddof=1)) if prs_pop.size > 1 else np.nan,
+                    "mean_g_true": float(np.mean(g_pop)) if g_pop.size > 0 else np.nan,
+                    "mean_y_prob": float(np.mean(p_pop)) if p_pop.size > 0 else np.nan,
+                }
+            )
 
     res = pd.DataFrame(rows)
     res.to_csv(out_dir / "figure2_auc_by_method_population.tsv", sep="\t", index=False)
     _log("[fig2] Wrote figure2_auc_by_method_population.tsv")
+    _log_results_table(
+        "[fig2] AUC/statistics by method and population",
+        res.sort_values(["method", "population"]).reset_index(drop=True),
+    )
+    pred_rows = []
+    for method, y_prob in preds.items():
+        part = test_df[
+            [
+                "IID",
+                "group",
+                "pop_label",
+                "y",
+                "G_true",
+                "afr_prop",
+                "eur_prop",
+                "asia_prop",
+                "pc1",
+                "pc2",
+                "pc3",
+                "pc4",
+                "pc5",
+                "seed",
+            ]
+        ].copy()
+        part["method"] = method
+        part["prs"] = test_prs
+        part["y_prob"] = np.asarray(y_prob, dtype=float)
+        pred_rows.append(part)
+    pred_df = pd.concat(pred_rows, ignore_index=True)
+    pred_df.to_csv(out_dir / "figure2_test_predictions.tsv", sep="\t", index=False)
+    _log("[fig2] Wrote figure2_test_predictions.tsv")
 
     _log("[fig2] Plotting outputs")
     _plot_main(res, out_dir)
     _plot_prs_distribution(test_df, test_scores["PRS"].to_numpy(dtype=float), out_dir)
     _plot_pcs(df, out_dir)
 
-    if not args.keep_intermediates:
+    if not args.keep_intermediates and not args.use_existing:
         _cleanup_seed_artifacts(prefix=Path(prefix), seed_work_dir=seed_work)
+    elif not args.keep_intermediates and args.use_existing:
+        shutil.rmtree(seed_work, ignore_errors=True)
     _log("[fig2] Figure2 run complete")
 
 

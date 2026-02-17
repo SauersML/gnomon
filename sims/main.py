@@ -183,6 +183,7 @@ def _run_fig1(
     small: bool,
     total_threads: int,
     total_memory_mb: int | None,
+    use_existing: bool,
 ) -> None:
     sizes = _cohort_sizes(small)
     out = out_root / "figure1"
@@ -210,6 +211,8 @@ def _run_fig1(
         cmd.extend(["--memory-mb-total", str(max(1024, int(total_memory_mb)))])
     if small:
         cmd.extend(["--gens", "5", "20", "100", "500", "2000"])
+    if use_existing:
+        cmd.append("--use-existing")
     if _keep_intermediates():
         cmd.append("--keep-intermediates")
     _run(cmd, env=env)
@@ -222,6 +225,7 @@ def _run_fig2(
     small: bool,
     total_threads: int,
     total_memory_mb: int | None,
+    use_existing: bool,
 ) -> None:
     sizes = _cohort_sizes(small)
     out = out_root / "figure2"
@@ -245,6 +249,8 @@ def _run_fig2(
     ]
     if total_memory_mb is not None:
         cmd.extend(["--memory-mb", str(max(1024, int(total_memory_mb)))])
+    if use_existing:
+        cmd.append("--use-existing")
     if _keep_intermediates():
         cmd.append("--keep-intermediates")
     _run(cmd, env=env)
@@ -302,7 +308,7 @@ def _zip_png_outputs(out_root: Path) -> Path | None:
     return zip_path
 
 
-def run_pipeline(figure: str, small: bool) -> None:
+def run_pipeline(figure: str, small: bool, use_existing: bool = False) -> None:
     out_root = _default_out_root()
     out_root.mkdir(parents=True, exist_ok=True)
 
@@ -353,6 +359,7 @@ def run_pipeline(figure: str, small: bool) -> None:
                 str(split["fig1_threads"]),
                 *([] if split["fig1_mem_mb"] is None else ["--memory-mb-total", str(split["fig1_mem_mb"])]),
                 *(["--gens", "5", "20", "100", "500", "2000"] if small else []),
+                *(["--use-existing"] if use_existing else []),
                 *(["--keep-intermediates"] if _keep_intermediates() else []),
             ],
             env=fig1_env,
@@ -372,6 +379,7 @@ def run_pipeline(figure: str, small: bool) -> None:
                 "--threads",
                 str(split["fig2_threads"]),
                 *([] if split["fig2_mem_mb"] is None else ["--memory-mb", str(split["fig2_mem_mb"])]),
+                *(["--use-existing"] if use_existing else []),
                 *(["--keep-intermediates"] if _keep_intermediates() else []),
             ],
             env=fig2_env,
@@ -393,6 +401,7 @@ def run_pipeline(figure: str, small: bool) -> None:
                 small,
                 total_threads=int(split["fig1_threads"]),
                 total_memory_mb=split["fig1_mem_mb"],
+                use_existing=use_existing,
             )
         if run_fig2:
             _run_fig2(
@@ -402,6 +411,7 @@ def run_pipeline(figure: str, small: bool) -> None:
                 small,
                 total_threads=int(split["fig2_threads"]),
                 total_memory_mb=split["fig2_mem_mb"],
+                use_existing=use_existing,
             )
 
     if _clear_ramdisk_after() and work_root.exists():
@@ -434,10 +444,12 @@ def build_parser() -> argparse.ArgumentParser:
     ps = sub.add_parser("setup", help="Install dependencies, then run")
     ps.add_argument("--small", action="store_true", help="Use smaller debug cohorts")
     ps.add_argument("--figure", choices=["1", "2", "both"], default="both")
+    ps.add_argument("--use-existing", action="store_true", help="Reuse existing per-seed PLINK/TSV files and skip simulation.")
 
     pr = sub.add_parser("run", help="Run simulations")
     pr.add_argument("--small", action="store_true", help="Use smaller debug cohorts")
     pr.add_argument("--figure", choices=["1", "2", "both"], default="both")
+    pr.add_argument("--use-existing", action="store_true", help="Reuse existing per-seed PLINK/TSV files and skip simulation.")
 
     sub.add_parser("clean-ramdisk", help="Delete transient work directory")
     return p
@@ -455,11 +467,11 @@ def main() -> None:
 
     if args.cmd == "setup":
         setup_env()
-        run_pipeline(figure=args.figure, small=bool(args.small))
+        run_pipeline(figure=args.figure, small=bool(args.small), use_existing=bool(args.use_existing))
         return
 
     if args.cmd == "run":
-        run_pipeline(figure=args.figure, small=bool(args.small))
+        run_pipeline(figure=args.figure, small=bool(args.small), use_existing=bool(args.use_existing))
         return
 
     if args.cmd == "clean-ramdisk":
