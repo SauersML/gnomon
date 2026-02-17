@@ -665,6 +665,8 @@ def _run_generation_task(task: dict[str, object]) -> dict[str, object]:
     bp_cap = task["bp_cap"]
     pgs_effects = np.asarray(task["pgs_effects"], dtype=float)
     use_existing = bool(task.get("use_existing", False))
+    use_existing_dir_raw = task.get("use_existing_dir")
+    use_existing_dir = Path(str(use_existing_dir_raw)) if use_existing_dir_raw is not None else None
     _log(f"[fig1_g{g}_s{seed}] Task started")
 
     _set_runtime_thread_env(threads_per_job)
@@ -673,15 +675,17 @@ def _run_generation_task(task: dict[str, object]) -> dict[str, object]:
     _log(f"[fig1_g{g}_s{seed}] Runtime resources set (threads={threads_per_job}, memory_mb={memory_mb_per_job})")
 
     prefix = str(out_dir / f"fig1_g{g}_s{seed}")
-    sim_tsv = out_dir / f"fig1_g{g}_s{seed}.tsv"
+    source_base = use_existing_dir if use_existing_dir is not None else out_dir
+    source_prefix = source_base / f"fig1_g{g}_s{seed}"
+    sim_tsv = source_base / f"fig1_g{g}_s{seed}.tsv"
     if use_existing:
-        needed = [Path(f"{prefix}.bed"), Path(f"{prefix}.bim"), Path(f"{prefix}.fam"), sim_tsv]
+        needed = [Path(f"{source_prefix}.bed"), Path(f"{source_prefix}.bim"), Path(f"{source_prefix}.fam"), sim_tsv]
         miss = [str(p) for p in needed if not p.exists()]
         if miss:
             raise FileNotFoundError(
                 f"[fig1_g{g}_s{seed}] --use-existing requested, but missing files: {miss}"
             )
-        _log(f"[fig1_g{g}_s{seed}] Reusing existing simulation/PLINK files")
+        _log(f"[fig1_g{g}_s{seed}] Reusing existing simulation/PLINK files from {source_base}")
         df = pd.read_csv(sim_tsv, sep="\t")
     else:
         df = _simulate_for_generation(
@@ -703,7 +707,7 @@ def _run_generation_task(task: dict[str, object]) -> dict[str, object]:
     work = work_root / f"fig1_g{g}_s{seed}_work"
     train_prefix, test_prefix, train_phen, freq_file = _prepare_bayesr_files(
         df,
-        prefix,
+        str(source_prefix),
         work,
         plink_threads=threads_per_job,
         plink_memory_mb=memory_mb_per_job,
@@ -864,6 +868,7 @@ def main() -> None:
     parser.add_argument("--keep-intermediates", action="store_true", help="Keep per-generation PLINK/GCTB intermediate files.")
     parser.add_argument("--bayesr", action="store_true", help="Use BayesR backend (default is fast P+T).")
     parser.add_argument("--use-existing", action="store_true", help="Reuse existing fig1_g*_s* PLINK/TSV files; skip simulation.")
+    parser.add_argument("--use-existing-dir", default=None, help="Directory containing existing fig1_g*_s* PLINK/TSV files.")
     args = parser.parse_args()
 
     out_dir = Path(args.out)
@@ -911,6 +916,7 @@ def main() -> None:
                 "pgs_effects": pgs_effects,
                 "use_bayesr": bool(args.bayesr),
                 "use_existing": bool(args.use_existing),
+                "use_existing_dir": args.use_existing_dir,
             }
         )
     _log(f"Figure1 queued {len(tasks)} generation tasks")

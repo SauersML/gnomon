@@ -834,6 +834,7 @@ def main() -> None:
     parser.add_argument("--keep-intermediates", action="store_true", help="Keep PLINK/GCTB intermediate files.")
     parser.add_argument("--bayesr", action="store_true", help="Use BayesR backend (default is fast P+T).")
     parser.add_argument("--use-existing", action="store_true", help="Reuse existing fig2_s* PLINK/TSV files; skip simulation.")
+    parser.add_argument("--use-existing-dir", default=None, help="Directory containing existing fig2_s* PLINK/TSV files.")
     args = parser.parse_args()
 
     out_dir = Path(args.out)
@@ -864,13 +865,15 @@ def main() -> None:
     seed = int(args.seed)
     _log(f"[fig2_s{seed}] Starting full Figure2 pipeline")
     prefix = str(out_dir / f"fig2_s{seed}")
-    sim_tsv = out_dir / f"fig2_s{seed}.tsv"
+    source_base = Path(args.use_existing_dir) if args.use_existing_dir else out_dir
+    source_prefix = str(source_base / f"fig2_s{seed}")
+    sim_tsv = source_base / f"fig2_s{seed}.tsv"
     if args.use_existing:
-        needed = [Path(f"{prefix}.bed"), Path(f"{prefix}.bim"), Path(f"{prefix}.fam"), sim_tsv]
+        needed = [Path(f"{source_prefix}.bed"), Path(f"{source_prefix}.bim"), Path(f"{source_prefix}.fam"), sim_tsv]
         miss = [str(p) for p in needed if not p.exists()]
         if miss:
             raise FileNotFoundError(f"[fig2_s{seed}] --use-existing requested, but missing files: {miss}")
-        _log(f"[fig2_s{seed}] Reusing existing simulation/PLINK files")
+        _log(f"[fig2_s{seed}] Reusing existing simulation/PLINK files from {source_base}")
         df = pd.read_csv(sim_tsv, sep="\t")
     else:
         df = _simulate(
@@ -891,7 +894,7 @@ def main() -> None:
     _log(f"[fig2_s{seed}] Starting PRS/prediction stage")
     train_scores, test_scores, pt_meta = _run_prs_and_predict(
         df,
-        prefix,
+        source_prefix,
         seed_work,
         plink_threads=threads,
         plink_memory_mb=memory_mb,
