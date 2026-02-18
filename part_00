@@ -1,0 +1,2000 @@
+import Mathlib.Tactic
+import Mathlib.Analysis.Calculus.Deriv.Basic
+import Mathlib.Analysis.Calculus.Deriv.Inv
+import Mathlib.Analysis.Convex.Strict
+import Mathlib.Analysis.Convex.Jensen
+import Mathlib.Analysis.Convex.SpecificFunctions.Basic
+import Mathlib.Analysis.InnerProductSpace.Basic
+import Mathlib.Analysis.InnerProductSpace.PiL2
+import Mathlib.Analysis.InnerProductSpace.Projection.Basic
+import Mathlib.Analysis.InnerProductSpace.Projection.FiniteDimensional
+import Mathlib.Analysis.InnerProductSpace.Projection.Minimal
+import Mathlib.Analysis.InnerProductSpace.Projection.Reflection
+import Mathlib.Analysis.InnerProductSpace.Projection.Submodule
+import Mathlib.Analysis.SpecialFunctions.Log.Basic
+import Mathlib.Data.Fin.Basic
+import Mathlib.LinearAlgebra.Matrix.Rank
+import Mathlib.LinearAlgebra.Matrix.PosDef
+import Mathlib.LinearAlgebra.Matrix.ToLin
+import Mathlib.Data.Matrix.Basic
+import Mathlib.LinearAlgebra.Matrix.DotProduct
+import Mathlib.Topology.MetricSpace.Lipschitz
+import Mathlib.Data.NNReal.Basic
+import Mathlib.Topology.Compactness.Compact
+import Mathlib.Data.Matrix.Reflection
+import Mathlib.Data.Matrix.Mul
+import Mathlib.LinearAlgebra.Matrix.Trace
+import Mathlib.MeasureTheory.Function.L2Space
+import Mathlib.MeasureTheory.Constructions.Pi
+import Mathlib.MeasureTheory.Integral.Prod
+import Mathlib.Probability.ConditionalExpectation
+import Mathlib.Probability.ConditionalProbability
+import Mathlib.Probability.Distributions.Gaussian.Real
+import Mathlib.Data.NNReal.Basic
+
+import Mathlib.LinearAlgebra.Matrix.Determinant.Basic
+import Mathlib.LinearAlgebra.Matrix.NonsingularInverse
+import Mathlib.Probability.Independence.Basic
+import Mathlib.Analysis.SpecialFunctions.ExpDeriv
+import Mathlib.Analysis.Convex.Deriv
+import Mathlib.Analysis.Convex.Integral
+import Mathlib.Probability.Independence.Integration
+import Mathlib.Probability.Moments.Variance
+import Mathlib.Probability.Notation
+import Mathlib.MeasureTheory.Constructions.BorelSpace.Basic
+import Mathlib.Topology.Algebra.Module.FiniteDimension
+import Mathlib.Topology.Order.Compact
+import Mathlib.Topology.MetricSpace.HausdorffDistance
+import Mathlib.Topology.MetricSpace.ProperSpace
+import Mathlib.Topology.MetricSpace.Lipschitz
+import Mathlib.MeasureTheory.Measure.OpenPos
+import Mathlib.Analysis.SpecialFunctions.Pow.Real
+import Mathlib.Algebra.Polynomial.Basic
+import Mathlib.Algebra.Polynomial.Eval.Defs
+import Mathlib.Algebra.Polynomial.Roots
+
+open scoped InnerProductSpace
+open InnerProductSpace
+
+open MeasureTheory
+
+namespace Calibrator
+
+/-!
+=================================================================
+## Part 0: Gaussian Measure Integrability
+=================================================================
+
+For any natural number n, the function x^n is integrable with respect to the
+standard Gaussian measure. This is foundational for all L² projection arguments.
+-/
+
+/-- The standard Gaussian measure μ = N(0,1). -/
+noncomputable def stdGaussianMeasure : MeasureTheory.Measure Real := ProbabilityTheory.gaussianReal 0 1
+
+/-- Polynomial function x^n. -/
+def poly_n (n : Nat) (x : Real) : Real := x ^ n
+
+/-- For any natural number n, x^n is integrable with respect to the standard Gaussian measure.
+    This follows from the finiteness of Gaussian moments. -/
+theorem integrable_poly_n (n : Nat) : MeasureTheory.Integrable (poly_n n) stdGaussianMeasure := by
+  have h_gauss_integral : ∀ n : ℕ, MeasureTheory.IntegrableOn (fun x : ℝ => x^n * Real.exp (-x^2 / 2)) (Set.univ : Set ℝ) := by
+    intro n
+    have := @integrable_rpow_mul_exp_neg_mul_sq
+    simpa [ div_eq_inv_mul ] using @this ( 1 / 2 ) ( by norm_num ) n ( by linarith )
+  unfold poly_n
+  unfold stdGaussianMeasure
+  simp_all +decide [ mul_comm, ProbabilityTheory.gaussianReal ]
+  refine' MeasureTheory.Integrable.mono' _ _ _
+  refine' fun x => |x ^ n|
+  · refine' MeasureTheory.Integrable.abs _
+    rw [ MeasureTheory.integrable_withDensity_iff ]
+    · convert h_gauss_integral n |> fun h => h.div_const ( Real.sqrt ( 2 * Real.pi ) ) using 2 ; norm_num [ ProbabilityTheory.gaussianPDF ] ; ring
+      norm_num [ ProbabilityTheory.gaussianPDFReal ] ; ring
+      rw [ ENNReal.toReal_ofReal ( Real.exp_nonneg _ ) ]
+    · fun_prop
+    · simp [ProbabilityTheory.gaussianPDF]
+  · exact Continuous.aestronglyMeasurable ( by continuity )
+  · exact Filter.Eventually.of_forall fun x => Real.norm_eq_abs _ ▸ le_rfl
+
+/-- x^2 is integrable with respect to the standard Gaussian measure. -/
+theorem integrable_sq_gaussian : MeasureTheory.Integrable (fun x => x ^ 2) stdGaussianMeasure := by
+  apply integrable_poly_n 2
+
+/-- x is integrable with respect to the standard Gaussian measure. -/
+theorem integrable_id_gaussian : MeasureTheory.Integrable (fun x => x) stdGaussianMeasure := by
+  have h := integrable_poly_n 1
+  unfold poly_n at h
+  simp only [pow_one] at h
+  exact h
+
+/-- x^4 is integrable with respect to the standard Gaussian measure (useful for variance calculations). -/
+theorem integrable_pow4_gaussian : MeasureTheory.Integrable (fun x => x ^ 4) stdGaussianMeasure := by
+  apply integrable_poly_n 4
+
+/-- If f is integrable on μ and g is integrable on ν, then f(x) * g(y) is integrable on μ.prod ν.
+    This is essential for Fubini-type arguments on product measures. -/
+theorem integrable_prod_mul {X Y : Type*} [MeasurableSpace X] [MeasurableSpace Y]
+    {μ : Measure X} {ν : Measure Y} [SigmaFinite μ] [SigmaFinite ν]
+    (f : X → ℝ) (g : Y → ℝ) (hf : Integrable f μ) (hg : Integrable g ν) :
+    Integrable (fun p : X × Y => f p.1 * g p.2) (μ.prod ν) := by
+  exact hf.prod_mul hg
+
+/-!
+=================================================================
+## Part 1: Definitions
+=================================================================
+-/
+
+variable {Ω : Type*} [MeasureSpace Ω] {ℙ : Measure Ω} [IsProbabilityMeasure ℙ]
+
+def Phenotype := Ω → ℝ
+def PGS := Ω → ℝ
+def PC (k : ℕ) := Ω → (Fin k → ℝ)
+
+structure RealizedData (n k : ℕ) where
+  y : Fin n → ℝ
+  p : Fin n → ℝ
+  c : Fin n → (Fin k → ℝ)
+
+noncomputable def stdNormalProdMeasure (k : ℕ) [Fintype (Fin k)] : Measure (ℝ × (Fin k → ℝ)) :=
+  (ProbabilityTheory.gaussianReal 0 1).prod (Measure.pi (fun (_ : Fin k) => ProbabilityTheory.gaussianReal 0 1))
+
+instance stdNormalProdMeasure_is_prob {k : ℕ} [Fintype (Fin k)] : IsProbabilityMeasure (stdNormalProdMeasure k) := by
+  unfold stdNormalProdMeasure
+  infer_instance
+
+structure PGSBasis (p : ℕ) where
+  B : Fin (p + 1) → (ℝ → ℝ)
+  B_zero_is_one : B 0 = fun _ => 1
+
+structure SplineBasis (n : ℕ) where
+  b : Fin n → (ℝ → ℝ)
+
+def linearPGSBasis : PGSBasis 1 where
+  B := fun m => if h : m = 0 then (fun _ => 1) else (fun p_val => p_val)
+  B_zero_is_one := by simp
+
+def polynomialSplineBasis (num_basis_funcs : ℕ) : SplineBasis num_basis_funcs where
+  b := fun i x => x ^ (i.val + 1)
+
+def SmoothFunction (n : ℕ) := Fin n → ℝ
+
+def evalSmooth {n : ℕ} [Fintype (Fin n)] (s : SplineBasis n) (coeffs : SmoothFunction n) (x : ℝ) : ℝ :=
+  ∑ i : Fin n, coeffs i * s.b i x
+
+inductive LinkFunction | logit | identity
+inductive DistributionFamily | Bernoulli | Gaussian
+
+structure PhenotypeInformedGAM (p k sp : ℕ) where
+  pgsBasis : PGSBasis p
+  pcSplineBasis : SplineBasis sp
+  γ₀₀ : ℝ
+  γₘ₀ : Fin p → ℝ
+  f₀ₗ : Fin k → SmoothFunction sp
+  fₘₗ : Fin p → Fin k → SmoothFunction sp
+  link : LinkFunction
+  dist : DistributionFamily
+
+noncomputable def linearPredictor {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (model : PhenotypeInformedGAM p k sp) (pgs_val : ℝ) (pc_val : Fin k → ℝ) : ℝ :=
+  let baseline_effect := model.γ₀₀ + ∑ l, evalSmooth model.pcSplineBasis (model.f₀ₗ l) (pc_val l)
+  let pgs_related_effects := ∑ m : Fin p,
+    let pgs_basis_val := model.pgsBasis.B ⟨m.val + 1, by linarith [m.isLt]⟩ pgs_val
+    let pgs_coeff := model.γₘ₀ m + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ m l) (pc_val l)
+    pgs_coeff * pgs_basis_val
+  baseline_effect + pgs_related_effects
+
+/-! ### Predictor Decomposition for p=1 Models
+
+For models with a single PGS basis function (p=1), we can decompose the linear predictor
+into `base(c) + slope(c) * p`, which is the natural form for L² projection / normal equations.
+This decomposition is the gateway to proving shrinkage_effect and raw_score_bias theorems. -/
+
+/-- The intercept term of the predictor (not multiplied by p).
+    For a p=1 model: base(c) = γ₀₀ + Σₗ evalSmooth(f₀ₗ[l], c[l]) -/
+noncomputable def predictorBase {k sp : ℕ} [Fintype (Fin k)] [Fintype (Fin sp)]
+    (model : PhenotypeInformedGAM 1 k sp) (pc_val : Fin k → ℝ) : ℝ :=
+  model.γ₀₀ + ∑ l, evalSmooth model.pcSplineBasis (model.f₀ₗ l) (pc_val l)
+
+/-- The slope coefficient in front of p.
+    For a p=1 model with linear PGS basis: slope(c) = γₘ₀[0] + Σₗ evalSmooth(fₘₗ[0,l], c[l]) -/
+noncomputable def predictorSlope {k sp : ℕ} [Fintype (Fin k)] [Fintype (Fin sp)]
+    (model : PhenotypeInformedGAM 1 k sp) (pc_val : Fin k → ℝ) : ℝ :=
+  model.γₘ₀ 0 + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ 0 l) (pc_val l)
+
+/-- Helper: sum over Fin 1 collapses to the single term. -/
+lemma Fin1_sum_eq {α : Type*} [AddCommMonoid α] (f : Fin 1 → α) :
+    ∑ m : Fin 1, f m = f 0 := by
+  simp
+
+/-- **Predictor Decomposition Lemma**: For a p=1 model with linear PGS basis (B[1] = id),
+    the linear predictor decomposes as: linearPredictor(p, c) = base(c) + slope(c) * p.
+
+    This is the key lemma that reduces the GAM structure to a 2-parameter linear form in p,
+    enabling L² projection / normal equations analysis. -/
+theorem linearPredictor_decomp {k sp : ℕ} [Fintype (Fin k)] [Fintype (Fin sp)]
+    (model : PhenotypeInformedGAM 1 k sp)
+    (h_linear_basis : model.pgsBasis.B ⟨1, by norm_num⟩ = id) :
+  ∀ pgs_val pc_val, linearPredictor model pgs_val pc_val =
+    predictorBase model pc_val + predictorSlope model pc_val * pgs_val := by
+  classical
+  intro pgs_val pc_val
+  unfold linearPredictor predictorBase predictorSlope
+  -- Expand the `let`s and rewrite the `Fin 1` sum to the single `m = 0` term.
+  dsimp
+  have hsum :
+      (∑ m : Fin 1,
+          let pgs_basis_val := model.pgsBasis.B ⟨m.val + 1, by linarith [m.isLt]⟩ pgs_val
+          let pgs_coeff :=
+            model.γₘ₀ m + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ m l) (pc_val l)
+          pgs_coeff * pgs_basis_val) =
+        (let m0 : Fin 1 := 0
+         let pgs_basis_val := model.pgsBasis.B ⟨m0.val + 1, by linarith [m0.isLt]⟩ pgs_val
+         let pgs_coeff :=
+           model.γₘ₀ m0 + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ m0 l) (pc_val l)
+         pgs_coeff * pgs_basis_val) := by
+    simp
+  rw [hsum]
+  -- Simplify the remaining `let`s, then use the linear-basis hypothesis to rewrite the basis evaluation.
+  dsimp
+  have hB : model.pgsBasis.B (1 : Fin 2) pgs_val = pgs_val := by
+    have hidx1 : (1 : Fin 2) = ⟨1, by norm_num⟩ := by
+      ext; simp
+    rw [hidx1, h_linear_basis]
+    rfl
+  -- Replace `B[1] p` by `p`; the remaining goal is definitional.
+  rw [hB]
+
+
+noncomputable def predict {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (model : PhenotypeInformedGAM p k sp) (pgs_val : ℝ) (pc_val : Fin k → ℝ) : ℝ :=
+  let η := linearPredictor model pgs_val pc_val
+  match model.link with
+  | .logit => 1 / (1 + Real.exp (-η))
+  | .identity => η
+
+structure DataGeneratingProcess (k : ℕ) where
+  trueExpectation : ℝ → (Fin k → ℝ) → ℝ
+  jointMeasure : Measure (ℝ × (Fin k → ℝ))
+  is_prob : IsProbabilityMeasure jointMeasure := by infer_instance
+
+instance dgp_is_prob {k : ℕ} (dgp : DataGeneratingProcess k) : IsProbabilityMeasure dgp.jointMeasure := dgp.is_prob
+
+noncomputable def pointwiseNLL (dist : DistributionFamily) (y_obs : ℝ) (η : ℝ) : ℝ :=
+  match dist with
+  | .Gaussian => (y_obs - η)^2
+  | .Bernoulli => Real.log (1 + Real.exp η) - y_obs * η
+
+noncomputable def empiricalLoss {p k sp n : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)] (model : PhenotypeInformedGAM p k sp) (data : RealizedData n k) (lambda : ℝ) : ℝ :=
+  (1 / (n : ℝ)) * (∑ i, pointwiseNLL model.dist (data.y i) (linearPredictor model (data.p i) (data.c i)))
+  + lambda * ((∑ l, ∑ j, (model.f₀ₗ l j)^2) + (∑ m, ∑ l, ∑ j, (model.fₘₗ m l j)^2))
+
+def IsIdentifiable {p k sp n : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)] (m : PhenotypeInformedGAM p k sp) (data : RealizedData n k) : Prop :=
+  (∀ l, (∑ i, evalSmooth m.pcSplineBasis (m.f₀ₗ l) (data.c i l)) = 0) ∧
+  (∀ mIdx l, (∑ i, evalSmooth m.pcSplineBasis (m.fₘₗ mIdx l) (data.c i l)) = 0)
+
+
+structure IsRawScoreModel {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (m : PhenotypeInformedGAM p k sp) : Prop where
+  f₀ₗ_zero : ∀ (l : Fin k) (s : Fin sp), m.f₀ₗ l s = 0
+  fₘₗ_zero : ∀ (i : Fin p) (l : Fin k) (s : Fin sp), m.fₘₗ i l s = 0
+
+structure IsNormalizedScoreModel {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (m : PhenotypeInformedGAM p k sp) : Prop where
+  fₘₗ_zero : ∀ (i : Fin p) (l : Fin k) (s : Fin sp), m.fₘₗ i l s = 0
+
+noncomputable def fitRaw (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)]
+    (data : RealizedData n k) (lambda : ℝ)
+    (h_fitRaw_exists :
+      ∃ (m : PhenotypeInformedGAM p k sp),
+        IsRawScoreModel m ∧
+        ∀ (m' : PhenotypeInformedGAM p k sp), IsRawScoreModel m' →
+          empiricalLoss m data lambda ≤ empiricalLoss m' data lambda) : PhenotypeInformedGAM p k sp :=
+  Classical.choose h_fitRaw_exists
+
+theorem fitRaw_minimizes_loss (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)]
+    (data : RealizedData n k) (lambda : ℝ)
+    (h_fitRaw_exists :
+      ∃ (m : PhenotypeInformedGAM p k sp),
+        IsRawScoreModel m ∧
+        ∀ (m' : PhenotypeInformedGAM p k sp), IsRawScoreModel m' →
+          empiricalLoss m data lambda ≤ empiricalLoss m' data lambda) :
+  IsRawScoreModel (fitRaw p k sp n data lambda h_fitRaw_exists) ∧
+  ∀ (m : PhenotypeInformedGAM p k sp) (_h_m : IsRawScoreModel m),
+    empiricalLoss (fitRaw p k sp n data lambda h_fitRaw_exists) data lambda ≤ empiricalLoss m data lambda := by
+  have h := Classical.choose_spec h_fitRaw_exists
+  exact ⟨h.1, fun m hm => h.2 m hm⟩
+
+noncomputable def fitNormalized (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)]
+    (data : RealizedData n k) (lambda : ℝ)
+    (h_fitNormalized_exists :
+      ∃ (m : PhenotypeInformedGAM p k sp),
+        IsNormalizedScoreModel m ∧
+        ∀ (m' : PhenotypeInformedGAM p k sp), IsNormalizedScoreModel m' →
+          empiricalLoss m data lambda ≤ empiricalLoss m' data lambda) : PhenotypeInformedGAM p k sp :=
+  Classical.choose h_fitNormalized_exists
+
+theorem fitNormalized_minimizes_loss (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)]
+    (data : RealizedData n k) (lambda : ℝ)
+    (h_fitNormalized_exists :
+      ∃ (m : PhenotypeInformedGAM p k sp),
+        IsNormalizedScoreModel m ∧
+        ∀ (m' : PhenotypeInformedGAM p k sp), IsNormalizedScoreModel m' →
+          empiricalLoss m data lambda ≤ empiricalLoss m' data lambda) :
+  IsNormalizedScoreModel (fitNormalized p k sp n data lambda h_fitNormalized_exists) ∧
+  ∀ (m : PhenotypeInformedGAM p k sp) (_h_m : IsNormalizedScoreModel m),
+    empiricalLoss (fitNormalized p k sp n data lambda h_fitNormalized_exists) data lambda ≤ empiricalLoss m data lambda := by
+  have h := Classical.choose_spec h_fitNormalized_exists
+  exact ⟨h.1, fun m hm => h.2 m hm⟩
+
+/-!
+=================================================================
+## Part 2: Fully Formalized Theorems and Proofs
+=================================================================
+-/
+
+
+/-- **Lemma**: Moments of the standard Gaussian distribution are integrable.
+    Specifically, x^n is integrable w.r.t N(0,1). -/
+lemma gaussian_moments_integrable (n : ℕ) :
+    Integrable (fun x : ℝ => x ^ n) (ProbabilityTheory.gaussianReal 0 1) := by
+  simpa [poly_n, stdGaussianMeasure] using (integrable_poly_n n)
+
+
+section AllClaims
+
+variable {p k sp n : ℕ}
+
+/-! ### Example Scenario DGPs (Specific Instantiations)
+
+The following are **example instantiations** of `dgpAdditiveBias` with specific β values
+from simulation studies. For general proofs, use `dgpAdditiveBias` with arbitrary β. -/
+
+/-- **EXAMPLE**: Scenario 1 - Gene-environment interaction model.
+    Phenotype = P × (1 + 0.1 × ΣC). NOT an additive bias model. -/
+noncomputable def dgpScenario1_example (k : ℕ) [Fintype (Fin k)] : DataGeneratingProcess k := {
+  trueExpectation := fun p pc => p * (1 + 0.1 * (∑ l, pc l)),
+  jointMeasure := stdNormalProdMeasure k
+}
+
+/-- **EXAMPLE**: Scenario 3 - Positive confounding with β = 0.5.
+    This is `dgpAdditiveBias k 0.5`. -/
+noncomputable def dgpScenario3_example (k : ℕ) [Fintype (Fin k)] : DataGeneratingProcess k := {
+  trueExpectation := fun p pc => p + (0.5 * (∑ l, pc l)),
+  jointMeasure := stdNormalProdMeasure k
+}
+
+/-- **EXAMPLE**: Scenario 4 - Negative confounding with β = -0.8.
+    This is `dgpAdditiveBias k (-0.8)`. -/
+noncomputable def dgpScenario4_example (k : ℕ) [Fintype (Fin k)] : DataGeneratingProcess k := {
+  trueExpectation := fun p pc => p - (0.8 * (∑ l, pc l)),
+  jointMeasure := stdNormalProdMeasure k
+}
+
+/-! ### Generalized DGP and L² Projection Framework
+
+The following definitions support a cleaner, more general proof approach:
+- Instead of hardcoding constants like 0.8, we parameterize by β_env
+- We view least-squares optimization as orthogonal projection in L²
+- This unifies Scenario 3 (β > 0) and Scenario 4 (β < 0) -/
+
+/-- General DGP where phenotype is P + β_env * Σ C.
+    This generalizes Scenario 3 (β > 0) and Scenario 4 (β < 0).
+
+    The key insight: the raw model (span{1, P}) cannot capture the β_env * C term,
+    so the projection leaves a residual of exactly β_env * C. -/
+noncomputable def dgpAdditiveBias (k : ℕ) [Fintype (Fin k)] (β_env : ℝ) : DataGeneratingProcess k := {
+  trueExpectation := fun p pc => p + β_env * (∑ l, pc l),
+  jointMeasure := stdNormalProdMeasure k
+}
+
+/-- Scenario 3 example is dgpAdditiveBias with β = 0.5. -/
+lemma dgpScenario3_example_eq_additiveBias (k : ℕ) [Fintype (Fin k)] :
+    dgpScenario3_example k = dgpAdditiveBias k 0.5 := by
+  unfold dgpScenario3_example dgpAdditiveBias
+  rfl
+
+/-- Scenario 4 example is dgpAdditiveBias with β = -0.8. -/
+lemma dgpScenario4_example_eq_additiveBias (k : ℕ) [Fintype (Fin k)] :
+    dgpScenario4_example k = dgpAdditiveBias k (-0.8) := by
+  unfold dgpScenario4_example dgpAdditiveBias
+  simp only [neg_mul, sub_eq_add_neg]
+
+def hasInteraction {k : ℕ} [Fintype (Fin k)] (f : ℝ → (Fin k → ℝ) → ℝ) : Prop :=
+  ∃ (p₁ p₂ : ℝ) (c₁ c₂ : Fin k → ℝ), p₁ ≠ p₂ ∧ c₁ ≠ c₂ ∧
+    (f p₂ c₁ - f p₁ c₁) / (p₂ - p₁) ≠ (f p₂ c₂ - f p₁ c₂) / (p₂ - p₁)
+
+theorem scenarios_are_distinct (k : ℕ) (hk_pos : 0 < k) :
+  hasInteraction (dgpScenario1_example k).trueExpectation ∧
+  ¬ hasInteraction (dgpScenario3_example k).trueExpectation ∧
+  ¬ hasInteraction (dgpScenario4_example k).trueExpectation := by
+  constructor
+  · -- Case 1: dgpScenario1_example has interaction
+    unfold hasInteraction
+    -- We provide witnesses for p₁, p₂, c₁, and c₂.
+    -- p₁ and p₂ are real numbers. c₁ and c₂ are functions from Fin k to ℝ.
+    use 0, 1, (fun _ => 0), (fun i => if i = ⟨0, hk_pos⟩ then 1 else 0)
+    constructor; · norm_num -- Proves p₁ ≠ p₂
+    constructor
+    · -- Proves c₁ ≠ c₂ for any k > 0, including k=1
+      intro h_eq
+      -- If the functions are equal, they must be equal at the point ⟨0, hk_pos⟩.
+      -- We use `congr_fun` to apply this equality.
+      have := congr_fun h_eq ⟨0, hk_pos⟩
+      -- This simplifies to 0 = 1, a contradiction.
+      simp at this
+    · -- Proves the inequality
+      unfold dgpScenario1_example; dsimp
+      have h_sum_c2 : (∑ (l : Fin k), if l = ⟨0, hk_pos⟩ then 1 else 0) = 1 := by
+        -- The sum is 1 because the term is 1 only at i = ⟨0, hk_pos⟩ and 0 otherwise.
+        simp [Finset.sum_ite_eq', Finset.mem_univ]
+      -- Substitute the sum and simplify the expression
+      simp [Finset.sum_const_zero]; norm_num
+  · constructor
+    · -- Case 2: dgpScenario3_example has no interaction
+      intro h; rcases h with ⟨p₁, p₂, c₁, c₂, hp_neq, _, h_neq⟩
+      unfold dgpScenario3_example at h_neq
+      -- The terms with c₁ and c₂ cancel out, making the slope independent of c.
+      simp only [add_sub_add_right_eq_sub] at h_neq
+      -- This leads to 1 ≠ 1, a contradiction.
+      contradiction
+    · -- Case 3: dgpScenario4_example has no interaction
+      intro h; rcases h with ⟨p₁, p₂, c₁, c₂, hp_neq, _, h_neq⟩
+      unfold dgpScenario4_example at h_neq
+      -- Similarly, the terms with c₁ and c₂ cancel out.
+      simp only [sub_sub_sub_cancel_right] at h_neq
+      -- This leads to 1 ≠ 1, a contradiction.
+      contradiction
+
+theorem necessity_of_phenotype_data :
+  ∃ (dgp_A dgp_B : DataGeneratingProcess 1),
+    dgp_A.jointMeasure = dgp_B.jointMeasure ∧ hasInteraction dgp_A.trueExpectation ∧ ¬ hasInteraction dgp_B.trueExpectation := by
+  use dgpScenario1_example 1, dgpScenario4_example 1
+  constructor; rfl
+  have h_distinct := scenarios_are_distinct 1 (by norm_num)
+  exact ⟨h_distinct.left, h_distinct.right.right⟩
+
+/-! ### Population Structure: Drift and LD Decay (Abstract Form)
+
+These statements avoid tying the math to a specific demographic model (e.g., admixture).
+They capture the two essential mechanisms:
+1) drift can change genic variance across PC space
+2) LD decay reduces tagging efficiency with genetic distance
+-/
+
+structure DriftPhysics (k : ℕ) where
+  /-- Genic variance as a function of ancestry coordinates. -/
+  genic_variance : (Fin k → ℝ) → ℝ
+  /-- Tagging efficiency (squared correlation between score and causal liability). -/
+  tagging_efficiency : (Fin k → ℝ) → ℝ
+
+def optimalSlopeDrift {k : ℕ} (phys : DriftPhysics k) (c : Fin k → ℝ) : ℝ :=
+  phys.tagging_efficiency c
+
+theorem drift_implies_attenuation {k : ℕ} [Fintype (Fin k)]
+    (phys : DriftPhysics k) (c_near c_far : Fin k → ℝ)
+    (h_decay : phys.tagging_efficiency c_far < phys.tagging_efficiency c_near) :
+    optimalSlopeDrift phys c_far < optimalSlopeDrift phys c_near := by
+  simpa [optimalSlopeDrift] using h_decay
+
+/-! ### Linear Noise ⇒ Nonlinear Optimal Slope
+
+If error variance increases linearly with ancestry distance, the optimal slope
+is a reciprocal (hyperbolic) function. No linear function can match it everywhere
+unless the noise slope is zero. -/
+
+noncomputable def optimalSlopeLinearNoise (sigma_g_sq base_error slope_error c : ℝ) : ℝ :=
+  sigma_g_sq / (sigma_g_sq + base_error + slope_error * c)
+
+theorem linear_noise_implies_nonlinear_slope
+    (sigma_g_sq base_error slope_error : ℝ)
+    (h_g_pos : 0 < sigma_g_sq)
+    (hB_pos : 0 < sigma_g_sq + base_error)
+    (hB1_pos : 0 < sigma_g_sq + base_error + slope_error)
+    (hB2_pos : 0 < sigma_g_sq + base_error + 2 * slope_error)
+    (h_slope_ne : slope_error ≠ 0) :
+    ∀ (beta0 beta1 : ℝ),
+      (fun c => beta0 + beta1 * c) ≠
+        (fun c => optimalSlopeLinearNoise sigma_g_sq base_error slope_error c) := by
+  intro beta0 beta1 h_eq
+  have h0 := congr_fun h_eq 0
+  have h1 := congr_fun h_eq 1
+  have h2 := congr_fun h_eq 2
+  dsimp [optimalSlopeLinearNoise] at h0 h1 h2
+
+  -- Simplify the equations
+  simp only [mul_zero, add_zero, zero_mul, mul_one] at h0 h1
+  have h2 : beta0 + 2 * beta1 = sigma_g_sq / (sigma_g_sq + base_error + slope_error * 2) := by
+    convert h2 using 1
+    ring
+
+  -- Define abbreviations to simplify algebra
+  set K := sigma_g_sq
+  set A := sigma_g_sq + base_error
+  set S := slope_error
+
+  -- Non-zero denominators
+  have h_ne_K : K ≠ 0 := ne_of_gt h_g_pos
+  have h_ne_A : A ≠ 0 := ne_of_gt hB_pos
+  have h_ne_AS : A + S ≠ 0 := ne_of_gt hB1_pos
+  have h_ne_A2S : A + 2 * S ≠ 0 := ne_of_gt hB2_pos
+
+  -- Rewrite hypotheses in terms of K, A, S
+  have h0' : beta0 * A = K := by
+    rw [h0]
+    field_simp [h_ne_A]
+  have h1' : (beta0 + beta1) * (A + S) = K := by
+    rw [h1]
+    field_simp [h_ne_AS]
+
+  have h_denom2 : sigma_g_sq + base_error + slope_error * 2 = A + 2 * S := by ring
+  rw [h_denom2] at h2
+
+  have h2' : (beta0 + 2 * beta1) * (A + 2 * S) = K := by
+    rw [h2]
+    field_simp [h_ne_A2S]
+
+  -- Derived equations for 1/K * beta terms
+  have h_inv0 : 1 / A = beta0 / K := by
+    field_simp [h_ne_K, h_ne_A]
+    rw [← h0']
+    field_simp [h_ne_K, h_ne_A]
+  have h_inv1 : 1 / (A + S) = (beta0 + beta1) / K := by
+    field_simp [h_ne_K, h_ne_AS]
+    rw [← h1']
+    field_simp [h_ne_K, h_ne_AS]
+  have h_inv2 : 1 / (A + 2 * S) = (beta0 + 2 * beta1) / K := by
+    field_simp [h_ne_K, h_ne_A2S]
+    rw [← h2']
+    field_simp [h_ne_K, h_ne_A2S]
+
+  -- Check the identity: 1/(A) + 1/(A+2S) = 2/(A+S)
+  have h_identity : 1 / A + 1 / (A + 2 * S) = 2 / (A + S) := by
+    rw [h_inv0, h_inv2, div_eq_mul_one_div 2 (A + S), h_inv1]
+    ring
+
+  have h_S_zero : S = 0 := by
+    field_simp [h_ne_A, h_ne_A2S, h_ne_AS] at h_identity
+    nlinarith [h_identity]
+
+  contradiction
+
+/-! ### Generalized Population Structure (No Admixture Assumption)
+
+We model population structure via an ancestry-indexed LD environment Σ(C),
+and decompose genetic variance into genic (diagonal) and covariance (off-diagonal)
+components. This captures admixture, divergence, and drift uniformly. -/
+
+structure GeneticArchitecture (k : ℕ) where
+  /-- Genic variance (as if loci were independent). -/
+  V_genic : (Fin k → ℝ) → ℝ
+  /-- Structural covariance / LD contribution. -/
+  V_cov : (Fin k → ℝ) → ℝ
+  /-- Selection effect (positive = divergent, negative = stabilizing). -/
+  selection_effect : (Fin k → ℝ) → ℝ
+
+noncomputable def totalVariance {k : ℕ} (arch : GeneticArchitecture k) (c : Fin k → ℝ) : ℝ :=
+  arch.V_genic c + arch.V_cov c
+
+noncomputable def optimalSlopeFromVariance {k : ℕ} (arch : GeneticArchitecture k) (c : Fin k → ℝ) : ℝ :=
+  (totalVariance arch c) / (arch.V_genic c)
+
+theorem directionalLD_nonzero_implies_slope_ne_one {k : ℕ} [Fintype (Fin k)]
+    (arch : GeneticArchitecture k) (c : Fin k → ℝ)
+    (h_genic_pos : arch.V_genic c ≠ 0)
+    (h_cov_ne : arch.V_cov c ≠ 0) :
+    optimalSlopeFromVariance arch c ≠ 1 := by
+  unfold optimalSlopeFromVariance totalVariance
+  intro h
+  rw [add_div, div_self h_genic_pos] at h
+  have : arch.V_cov c / arch.V_genic c = 0 := by linarith
+  simp [div_eq_zero_iff, h_genic_pos] at this
+  contradiction
+
+theorem selection_variation_implies_nonlinear_slope {k : ℕ} [Fintype (Fin k)]
+    (arch : GeneticArchitecture k) (c₁ c₂ : Fin k → ℝ)
+    (h_genic_pos₁ : arch.V_genic c₁ ≠ 0)
+    (h_genic_pos₂ : arch.V_genic c₂ ≠ 0)
+    (h_link : ∀ c, arch.selection_effect c = arch.V_cov c / arch.V_genic c)
+    (h_sel_var : arch.selection_effect c₁ ≠ arch.selection_effect c₂) :
+    optimalSlopeFromVariance arch c₁ ≠ optimalSlopeFromVariance arch c₂ := by
+  unfold optimalSlopeFromVariance totalVariance
+  rw [add_div, div_self h_genic_pos₁, add_div, div_self h_genic_pos₂]
+  rw [← h_link c₁, ← h_link c₂]
+  intro h
+  simp at h
+  contradiction
+
+/-! ### LD Decay Theorem (Signal-to-Noise)
+
+Genetic distance increases error variance, so the optimal slope decays hyperbolically.
+This is the general statement used for divergence and admixture alike. -/
+
+theorem ld_decay_implies_nonlinear_calibration
+    (sigma_g_sq base_error slope_error : ℝ)
+    (h_g_pos : 0 < sigma_g_sq)
+    (h_base : 0 ≤ base_error)
+    (h_slope_pos : 0 ≤ slope_error)
+    (h_slope_ne : slope_error ≠ 0) :
+    ∀ (beta0 beta1 : ℝ),
+      (fun c => beta0 + beta1 * c) ≠
+        (fun c => optimalSlopeLinearNoise sigma_g_sq base_error slope_error c) := by
+  apply linear_noise_implies_nonlinear_slope sigma_g_sq base_error slope_error
+  · exact h_g_pos
+  · apply add_pos_of_pos_of_nonneg h_g_pos h_base
+  · apply add_pos_of_pos_of_nonneg
+    · apply add_pos_of_pos_of_nonneg h_g_pos h_base
+    · exact h_slope_pos
+  · apply add_pos_of_pos_of_nonneg
+    · apply add_pos_of_pos_of_nonneg h_g_pos h_base
+    · apply mul_nonneg zero_le_two h_slope_pos
+  · exact h_slope_ne
+
+/-! ### Normalization Failure under Directional LD
+
+Normalization forces Var(P|C)=1, which removes the LD covariance term. -/
+
+theorem normalization_erases_heritability {k : ℕ} [Fintype (Fin k)]
+    (arch : GeneticArchitecture k) (c : Fin k → ℝ)
+    (h_genic_pos : arch.V_genic c > 0)
+    (h_cov_pos : arch.V_cov c > 0) :
+    optimalSlopeFromVariance arch c > 1 := by
+  unfold optimalSlopeFromVariance totalVariance
+  rw [add_div, div_self (ne_of_gt h_genic_pos)]
+  rw [gt_iff_lt, lt_add_iff_pos_right]
+  apply div_pos h_cov_pos h_genic_pos
+
+/-! ### Neutral Score Drift (Artifactual Mean Shift in P)
+
+The score drifts with ancestry while true liability does not.
+The calibrator must subtract the drift term (PC main effects). -/
+
+structure NeutralScoreDrift (k : ℕ) where
+  /-- True genetic liability (ancestry-invariant in this mechanism). -/
+  true_liability : ℝ
+  /-- Artifactual drift in the observed score. -/
+  drift_artifact : (Fin k → ℝ) → ℝ
+
+def driftedScore {k : ℕ} (mech : NeutralScoreDrift k) (c : Fin k → ℝ) : ℝ :=
+  mech.true_liability + mech.drift_artifact c
+
+theorem neutral_drift_implies_additive_correction {k : ℕ} [Fintype (Fin k)]
+    (mech : NeutralScoreDrift k) :
+    ∀ c : Fin k → ℝ, driftedScore mech c - mech.drift_artifact c = mech.true_liability := by
+  intro c
+  simp [driftedScore]
+
+/-! ### Biological Mechanisms → Statistical DGPs
+
+These lightweight structures capture the causal story and map it into the
+statistical DGPs used in the main proofs. -/
+
+structure DifferentialTagging (k : ℕ) where
+  /-- Tagging efficiency as a function of ancestry (LD decay). -/
+  tagging_efficiency : (Fin k → ℝ) → ℝ
+
+noncomputable def taggingDGP {k : ℕ} [Fintype (Fin k)] (mech : DifferentialTagging k) : DataGeneratingProcess k := {
+  trueExpectation := fun p c => mech.tagging_efficiency c * p
+  jointMeasure := stdNormalProdMeasure k
+}
+
+structure StratifiedEnvironment (k : ℕ) where
+  /-- Additive environmental bias correlated with ancestry. -/
+  beta_env : ℝ
+
+noncomputable def stratifiedDGP {k : ℕ} [Fintype (Fin k)] (mech : StratifiedEnvironment k) : DataGeneratingProcess k :=
+  dgpAdditiveBias k mech.beta_env
+
+structure BiologicalGxE (k : ℕ) where
+  /-- Multiplicative environmental scaling of genetic effect. -/
+  scaling : (Fin k → ℝ) → ℝ
+
+noncomputable def gxeDGP {k : ℕ} [Fintype (Fin k)] (mech : BiologicalGxE k) : DataGeneratingProcess k := {
+  trueExpectation := fun p c => mech.scaling c * p
+  jointMeasure := stdNormalProdMeasure k
+}
+
+inductive BiologicalMechanism (k : ℕ)
+  | taggingDecay (m : DifferentialTagging k)
+  | stratifiedEnv (m : StratifiedEnvironment k)
+  | gxe (m : BiologicalGxE k)
+
+noncomputable def realize_mechanism {k : ℕ} [Fintype (Fin k)] : BiologicalMechanism k → DataGeneratingProcess k
+  | .taggingDecay m => taggingDGP m
+  | .stratifiedEnv m => stratifiedDGP m
+  | .gxe m => gxeDGP m
+
+theorem confounding_preserves_ranking {k : ℕ} [Fintype (Fin k)]
+    (β_env : ℝ) (p1 p2 : ℝ) (c : Fin k → ℝ) (h_le : p1 ≤ p2) :
+    p1 + β_env * (∑ l, c l) ≤ p2 + β_env * (∑ l, c l) := by
+  linarith
+
+/-! ### Biological → Statistical Bridges (Sketches)
+
+These statements connect biological mechanisms to statistical DGPs and to the
+need for nonlinear calibration. Proofs are sketched; fill in with measure-theory
+and L² projection lemmas. -/
+
+structure LDDecayMechanism (k : ℕ) where
+  /-- Genetic distance proxy (e.g., PC-distance from training centroid). -/
+  distance : (Fin k → ℝ) → ℝ
+  /-- Tagging efficiency ρ² decreases with distance. -/
+  tagging_efficiency : ℝ → ℝ
+
+def decaySlope {k : ℕ} (mech : LDDecayMechanism k) (c : Fin k → ℝ) : ℝ :=
+  mech.tagging_efficiency (mech.distance c)
+
+theorem ld_decay_implies_shrinkage {k : ℕ} [Fintype (Fin k)]
+    (mech : LDDecayMechanism k) (c_near c_far : Fin k → ℝ)
+    (h_dist : mech.distance c_near < mech.distance c_far)
+    (h_mono : StrictAnti (mech.tagging_efficiency)) :
+    decaySlope mech c_far < decaySlope mech c_near := by
+  unfold decaySlope
+  exact h_mono h_dist
+
+theorem ld_decay_implies_nonlinear_calibration_sketch {k : ℕ} [Fintype (Fin k)]
+    (mech : LDDecayMechanism k)
+    (h_nonlin : ¬ ∃ a b, ∀ d ∈ Set.range mech.distance, mech.tagging_efficiency d = a + b * d) :
+    ∀ (beta0 beta1 : ℝ),
+      (fun c => beta0 + beta1 * mech.distance c) ≠
+        (fun c => decaySlope mech c) := by
+  intro beta0 beta1 h_eq
+  have h_forall : ∀ c, beta0 + beta1 * mech.distance c = mech.tagging_efficiency (mech.distance c) :=
+    fun c => congr_fun h_eq c
+
+  -- This contradicts h_nonlin
+  apply h_nonlin
+  use beta0, beta1
+  intro d hd
+  obtain ⟨c, hc⟩ := hd
+  rw [← hc, h_forall c]
+
+theorem optimal_slope_trace_variance {k : ℕ} [Fintype (Fin k)]
+    (arch : GeneticArchitecture k) (c : Fin k → ℝ)
+    (h_genic_pos : arch.V_genic c ≠ 0) :
+    optimalSlopeFromVariance arch c =
+      1 + (arch.V_cov c) / (arch.V_genic c) := by
+  unfold optimalSlopeFromVariance totalVariance
+  rw [add_div, div_self h_genic_pos]
+
+theorem normalization_suboptimal_under_ld {k : ℕ} [Fintype (Fin k)]
+    (arch : GeneticArchitecture k) (c : Fin k → ℝ)
+    (h_genic_pos : arch.V_genic c ≠ 0)
+    (h_cov_ne : arch.V_cov c ≠ 0) :
+    optimalSlopeFromVariance arch c ≠ 1 := by
+  exact directionalLD_nonzero_implies_slope_ne_one arch c h_genic_pos h_cov_ne
+
+noncomputable def expectedSquaredError {k : ℕ} [Fintype (Fin k)] (dgp : DataGeneratingProcess k) (f : ℝ → (Fin k → ℝ) → ℝ) : ℝ :=
+  ∫ pc, (dgp.trueExpectation pc.1 pc.2 - f pc.1 pc.2)^2 ∂dgp.jointMeasure
+
+/-- Bayes-optimal in the full GAM class (quantifies over all models). -/
+def IsBayesOptimalInClass {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (dgp : DataGeneratingProcess k) (model : PhenotypeInformedGAM p k sp) : Prop :=
+  ∀ (m : PhenotypeInformedGAM p k sp), expectedSquaredError dgp (fun p c => linearPredictor model p c) ≤
+        expectedSquaredError dgp (fun p c => linearPredictor m p c)
+
+/-- Bayes-optimal among raw score models only (L² projection onto {1, P} subspace).
+    This is the correct predicate for Scenario 4, where the raw class cannot represent
+    the true PC main effect. -/
+structure IsBayesOptimalInRawClass {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
+    (dgp : DataGeneratingProcess k) (model : PhenotypeInformedGAM p k sp) : Prop where
+  is_raw : IsRawScoreModel model
+  is_optimal : ∀ (m : PhenotypeInformedGAM p k sp), IsRawScoreModel m →
+    expectedSquaredError dgp (fun p c => linearPredictor model p c) ≤
+    expectedSquaredError dgp (fun p c => linearPredictor m p c)
+
+/-- Bayes-optimal among normalized score models only (L² projection onto additive subspace). -/
+structure IsBayesOptimalInNormalizedClass {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
+    (dgp : DataGeneratingProcess k) (model : PhenotypeInformedGAM p k sp) : Prop where
+  is_normalized : IsNormalizedScoreModel model
+  is_optimal : ∀ (m : PhenotypeInformedGAM p k sp), IsNormalizedScoreModel m →
+    expectedSquaredError dgp (fun p c => linearPredictor model p c) ≤
+    expectedSquaredError dgp (fun p c => linearPredictor m p c)
+
+/-! ### L² Projection Framework
+
+**Key Insight**: Bayes-optimal prediction = orthogonal projection in L²(μ).
+
+Instead of expanding integrals and deriving normal equations by hand, we work in the
+Hilbert space L²(μ) where:
+- Inner product: ⟪f, g⟫ = ∫ f·g dμ = E[fg]
+- Norm: ‖f‖² = E[f²]
+- Projection onto W gives the closest element to Y in W
+
+For raw models, W = span{1, P}, and Bayes-optimality means:
+  Ŷ = orthogonalProjection W Y
+
+This gives orthogonality of residual FOR FREE via mathlib's
+`orthogonalProjection_inner_eq_zero`:
+  ∀ w ∈ W, ⟪Y - Ŷ, w⟫ = 0
+
+-/
+
+/-- The space of square-integrable functions on the probability space.
+    This is the Hilbert space where we do orthogonal projection. -/
+abbrev L2Space (μ : Measure (ℝ × (Fin 1 → ℝ))) := Lp ℝ 2 μ
+
+/-- Feature function: constant 1 (for intercept). -/
+def featureOne (_μ : Measure (ℝ × (Fin 1 → ℝ))) : (ℝ × (Fin 1 → ℝ)) → ℝ :=
+  fun _ => 1
+
+/-- Feature function: P (the PGS value). -/
+def featureP (_μ : Measure (ℝ × (Fin 1 → ℝ))) : (ℝ × (Fin 1 → ℝ)) → ℝ :=
+  fun pc => pc.1
+
+/-- Feature function: C (the first PC value). -/
+def featureC (_μ : Measure (ℝ × (Fin 1 → ℝ))) : (ℝ × (Fin 1 → ℝ)) → ℝ :=
+  fun pc => pc.2 ⟨0, by norm_num⟩
+
+/-- **Helper Lemma**: Under product measure (independence), E[P·C] = E[P]·E[C] = 0.
+    Uses Fubini (integral_prod_mul) to factor the expectation. -/
+lemma integral_mul_fst_snd_eq_zero
+    (μ : Measure (ℝ × (Fin 1 → ℝ))) [IsProbabilityMeasure μ]
+    (h_indep : μ = (μ.map Prod.fst).prod (μ.map Prod.snd))
+    (hP0 : ∫ pc, pc.1 ∂μ = 0)
+    (hC0 : ∫ pc, pc.2 ⟨0, by norm_num⟩ ∂μ = 0) :
+    ∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂μ = 0 := by
+  classical
+  set μP : Measure ℝ := μ.map Prod.fst
+  set μC : Measure (Fin 1 → ℝ) := μ.map Prod.snd
+  haveI : IsProbabilityMeasure μP :=
+    Measure.isProbabilityMeasure_map (μ := μ) (f := Prod.fst) (by
+      simpa using measurable_fst.aemeasurable)
+  haveI : IsProbabilityMeasure μC :=
+    Measure.isProbabilityMeasure_map (μ := μ) (f := Prod.snd) (by
+      simpa using measurable_snd.aemeasurable)
+  have hP0' : (∫ p, p ∂μP) = 0 := by
+    have hP0_prod : (∫ pc, pc.1 ∂(μP.prod μC)) = 0 := by
+      have h := hP0
+      rw [h_indep] at h
+      simpa [μP, μC] using h
+    have hfst :
+        (∫ pc, pc.1 ∂(μP.prod μC)) = (μC.real Set.univ) • (∫ p, p ∂μP) := by
+      simpa using (MeasureTheory.integral_fun_fst (μ := μP) (ν := μC) (f := fun p : ℝ => p))
+    have hμC : μC.real Set.univ = (1 : ℝ) := by
+      simp
+    have : (μC.real Set.univ) • (∫ p, p ∂μP) = 0 := hfst.symm.trans hP0_prod
+    simpa [hμC] using this
+  have hC0' : (∫ c, c ⟨0, by norm_num⟩ ∂μC) = 0 := by
+    have hC0_prod : (∫ pc, pc.2 ⟨0, by norm_num⟩ ∂(μP.prod μC)) = 0 := by
+      have h := hC0
+      rw [h_indep] at h
+      simpa [μP, μC] using h
+    have hsnd :
+        (∫ pc, pc.2 ⟨0, by norm_num⟩ ∂(μP.prod μC)) =
+          (μP.real Set.univ) • (∫ c, c ⟨0, by norm_num⟩ ∂μC) := by
+      simpa using
+        (MeasureTheory.integral_fun_snd (μ := μP) (ν := μC)
+          (f := fun c : (Fin 1 → ℝ) => c ⟨0, by norm_num⟩))
+    have hμP : μP.real Set.univ = (1 : ℝ) := by
+      simp
+    have : (μP.real Set.univ) • (∫ c, c ⟨0, by norm_num⟩ ∂μC) = 0 := hsnd.symm.trans hC0_prod
+    simpa [hμP] using this
+  rw [h_indep]
+  simpa [μP, μC, hP0', hC0'] using
+    (MeasureTheory.integral_prod_mul (μ := μP) (ν := μC) (f := fun p : ℝ => p)
+      (g := fun c : (Fin 1 → ℝ) => c ⟨0, by norm_num⟩))
+
+/-- **Core Lemma**: Under independence + zero-mean, {1, P, C} form an orthogonal set in L².
+    This is because:
+    - ⟪1, P⟫ = E[P] = 0
+    - ⟪1, C⟫ = E[C] = 0
+    - ⟪P, C⟫ = E[PC] = E[P]E[C] = 0 (by independence) -/
+lemma orthogonal_features
+    (μ : Measure (ℝ × (Fin 1 → ℝ))) [IsProbabilityMeasure μ]
+    (h_indep : μ = (μ.map Prod.fst).prod (μ.map Prod.snd))
+    (hP0 : ∫ pc, pc.1 ∂μ = 0)
+    (hC0 : ∫ pc, pc.2 ⟨0, by norm_num⟩ ∂μ = 0) :
+    (∫ pc, 1 * pc.1 ∂μ = 0) ∧
+    (∫ pc, 1 * pc.2 ⟨0, by norm_num⟩ ∂μ = 0) ∧
+    (∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂μ = 0) := by
+  refine ⟨?_, ?_, ?_⟩
+  · simp only [one_mul]; exact hP0
+  · simp only [one_mul]; exact hC0
+  · exact integral_mul_fst_snd_eq_zero μ h_indep hP0 hC0
+
+/-! ### L² Orthogonality Characterization (Classical Derivation) -/
+
+/-- If a quadratic `a*ε + b*ε²` is non-negative for all `ε`, then `a = 0`.
+    This is a key lemma for proving gradient conditions at optima.
+
+    The proof considers two cases:
+    - If b = 0: a linear function a*ε can't be ≥ 0 for all ε unless a = 0
+    - If b ≠ 0: the quadratic either opens upward (b > 0) with negative minimum,
+      or opens downward (b < 0) and becomes negative for large |ε| -/
+lemma linear_coeff_zero_of_quadratic_nonneg (a b : ℝ)
+    (h : ∀ ε : ℝ, a * ε + b * ε^2 ≥ 0) : a = 0 := by
+  by_contra ha_ne
+  by_cases hb : b = 0
+  · -- Case b = 0: then a*ε ≥ 0 for all ε, impossible if a ≠ 0
+    by_cases ha_pos : 0 < a
+    · have h_neg1 := h (-1)
+      simp only [hb, zero_mul, add_zero, mul_neg, mul_one] at h_neg1
+      linarith
+    · push_neg at ha_pos
+      have ha_neg : a < 0 := lt_of_le_of_ne ha_pos ha_ne
+      have h_1 := h 1
+      simp only [hb, zero_mul, add_zero, mul_one] at h_1
+      linarith
+  · -- Case b ≠ 0: consider the vertex of the parabola
+    by_cases hb_pos : 0 < b
+    · -- b > 0: minimum at ε = -a/(2b) gives value -a²/(4b) < 0
+      let ε := -a / (2 * b)
+      have hε := h ε
+      have ha_sq_pos : 0 < a^2 := sq_pos_of_ne_zero ha_ne
+      have eval : a * ε + b * ε^2 = -a^2 / (4 * b) := by
+        simp only [ε]; field_simp; ring
+      rw [eval] at hε
+      have : -a^2 / (4 * b) < 0 := by
+        apply div_neg_of_neg_of_pos
+        · linarith
+        · linarith
+      linarith
+    · -- b < 0: quadratic opens downward, eventually negative
+      push_neg at hb_pos
+      have hb_neg : b < 0 := lt_of_le_of_ne hb_pos hb
+      let ε := -2 * a / b
+      have hε := h ε
+      have ha_sq_pos : 0 < a^2 := sq_pos_of_ne_zero ha_ne
+      have eval : a * ε + b * ε^2 = 2 * a^2 / b := by
+        simp only [ε]; field_simp; ring
+      rw [eval] at hε
+      have : 2 * a^2 / b < 0 := by
+        apply div_neg_of_pos_of_neg
+        · linarith
+        · exact hb_neg
+      linarith
+
+/-- **Standalone Lemma**: Optimal coefficients for Raw Model on Additive DGP.
+    Given Y = P + β*C, independence, and standardized moments:
+    The raw model (projecting onto span{1, P}) has coefficients a=0, b=1.
+
+    This isolates the algebraic result from the larger theorems. -/
+lemma optimal_coeffs_raw_additive_standalone
+    (a b β_env : ℝ)
+    (h_orth_1 : a + b * 0 = 0 + β_env * 0) -- derived from E[resid] = 0
+    (h_orth_P : a * 0 + b * 1 = 1 + β_env * 0) -- derived from E[resid*P] = 0
+    : a = 0 ∧ b = 1 := by
+  have ha : a = 0 := by
+    linarith
+  have hb : b = 1 := by
+    linarith
+  exact ⟨ha, hb⟩
+
+/-- First normal equation: optimality implies a = E[Y] (when E[P] = 0).
+    This is the orthogonality condition ⟪residual, 1⟫ = 0. -/
+lemma optimal_intercept_eq_mean_of_zero_mean_p
+    (μ : Measure (ℝ × (Fin 1 → ℝ))) [IsProbabilityMeasure μ]
+    (Y : (ℝ × (Fin 1 → ℝ)) → ℝ) (a b : ℝ)
+    (hY : Integrable Y μ)
+    (hP : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1) μ)
+    (hP0 : ∫ pc, pc.1 ∂μ = 0)
+    (h_orth_1 : ∫ pc, (Y pc - (a + b * pc.1)) ∂μ = 0) :
+    a = ∫ pc, Y pc ∂μ := by
+  have hLin : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => a + b * pc.1) μ := by
+    have ha : Integrable (fun _ : ℝ × (Fin 1 → ℝ) => a) μ := by
+      simp
+    have hb : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => b * pc.1) μ := hP.const_mul b
+    simpa using ha.add hb
+  have h0 :
+      (∫ pc, Y pc ∂μ) - (∫ pc, (a + b * pc.1) ∂μ) = 0 := by
+    simpa [MeasureTheory.integral_sub hY hLin] using h_orth_1
+  have hLinInt : (∫ pc, (a + b * pc.1) ∂μ) = a := by
+    -- `E[a + bP] = a * E[1] + b * E[P] = a + b * 0 = a`
+    have ha : Integrable (fun _ : ℝ × (Fin 1 → ℝ) => a) μ := by
+      simp
+    have hb : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => b * pc.1) μ := hP.const_mul b
+    calc
+      (∫ pc, (a + b * pc.1) ∂μ) = (∫ pc, (a : ℝ) ∂μ) + ∫ pc, b * pc.1 ∂μ := by
+        simpa using (MeasureTheory.integral_add ha hb)
+      _ = a + b * (∫ pc, pc.1 ∂μ) := by
+        simp [MeasureTheory.integral_const, MeasureTheory.integral_const_mul]
+      _ = a := by simp [hP0]
+  -- Rearrangement: `E[Y] - a = 0`.
+  linarith [h0, hLinInt]
+
+/-- Second normal equation: optimality implies b = E[YP] (when E[P] = 0, E[P²] = 1).
+    This is the orthogonality condition ⟪residual, P⟫ = 0. -/
+lemma optimal_slope_eq_covariance_of_normalized_p
+    (μ : Measure (ℝ × (Fin 1 → ℝ))) [IsProbabilityMeasure μ]
+    (Y : (ℝ × (Fin 1 → ℝ)) → ℝ) (a b : ℝ)
+    (_hY : Integrable Y μ)
+    (hP : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1) μ)
+    (hYP : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => Y pc * pc.1) μ)
+    (hP2i : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1 ^ 2) μ)
+    (hP0 : ∫ pc, pc.1 ∂μ = 0)
+    (hP2 : ∫ pc, pc.1^2 ∂μ = 1)
+    (h_orth_P : ∫ pc, (Y pc - (a + b * pc.1)) * pc.1 ∂μ = 0) :
+    b = ∫ pc, Y pc * pc.1 ∂μ := by
+  have hLin : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => a + b * pc.1) μ := by
+    have ha : Integrable (fun _ : ℝ × (Fin 1 → ℝ) => a) μ := by
+      simp
+    have hb : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => b * pc.1) μ := hP.const_mul b
+    simpa using ha.add hb
+  have hLinP : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => (a + b * pc.1) * pc.1) μ := by
+    -- Integrable because it's a linear combination of `pc.1` and `pc.1^2`.
+    -- `(a + bP) * P = a*P + b*P^2`
+    have h1 : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => a * pc.1) μ := hP.const_mul a
+    have h2 : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => b * (pc.1 ^ 2)) μ := hP2i.const_mul b
+    -- rewrite and use `integrable_congr` to match `h1.add h2`
+    refine (h1.add h2).congr ?_
+    filter_upwards with pc
+    ring_nf
+    simp
+  have h0 :
+      (∫ pc, Y pc * pc.1 ∂μ) - (∫ pc, (a + b * pc.1) * pc.1 ∂μ) = 0 := by
+    -- Expand the orthogonality condition using integral linearity.
+    have hSub : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => Y pc * pc.1 - (a + b * pc.1) * pc.1) μ := by
+      exact hYP.sub hLinP
+    -- `(Y - (a+bP))*P = YP - (a+bP)P`
+    have hEq :
+        (fun pc : ℝ × (Fin 1 → ℝ) => (Y pc - (a + b * pc.1)) * pc.1) =
+          (fun pc : ℝ × (Fin 1 → ℝ) => Y pc * pc.1 - (a + b * pc.1) * pc.1) := by
+      funext pc
+      ring_nf
+    -- Use the rewritten integrand.
+    have hOrth' : ∫ pc, (Y pc * pc.1 - (a + b * pc.1) * pc.1) ∂μ = 0 := by
+      simpa [hEq] using h_orth_P
+    simpa [MeasureTheory.integral_sub hYP hLinP] using hOrth'
+  have hLinPInt : (∫ pc, (a + b * pc.1) * pc.1 ∂μ) = b := by
+    -- `E[(a+bP)P] = a*E[P] + b*E[P^2] = 0 + b*1 = b`
+    have h1 : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => a * pc.1) μ := hP.const_mul a
+    have h2 : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => b * (pc.1 ^ 2)) μ := hP2i.const_mul b
+    have hsum : (∫ pc, (a + b * pc.1) * pc.1 ∂μ) = (∫ pc, a * pc.1 + b * (pc.1 ^ 2) ∂μ) := by
+      refine MeasureTheory.integral_congr_ae ?_
+      filter_upwards with pc
+      ring_nf
+    rw [hsum]
+    calc
+      (∫ pc, a * pc.1 + b * (pc.1 ^ 2) ∂μ) =
+          (∫ pc, a * pc.1 ∂μ) + ∫ pc, b * (pc.1 ^ 2) ∂μ := by
+            simpa using (MeasureTheory.integral_add h1 h2)
+      _ = a * (∫ pc, pc.1 ∂μ) + b * (∫ pc, pc.1 ^ 2 ∂μ) := by
+            simp [MeasureTheory.integral_const_mul]
+      _ = b := by simp [hP0, hP2]
+  -- Rearrangement: `E[YP] - b = 0`.
+  linarith [h0, hLinPInt]
+
+
+/-- Helper lemma: For a raw score model, the PC main effect spline term is always zero. (Generalized) -/
+lemma evalSmooth_eq_zero_of_raw_gen {k sp : ℕ} [Fintype (Fin k)] [Fintype (Fin sp)]
+    {model : PhenotypeInformedGAM 1 k sp} (h_raw : IsRawScoreModel model)
+    (l : Fin k) (c_val : ℝ) :
+    evalSmooth model.pcSplineBasis (model.f₀ₗ l) c_val = 0 := by
+  unfold evalSmooth
+  simp [h_raw.f₀ₗ_zero l]
+
+/-- Helper lemma: For a raw score model, the PGS-PC interaction spline term is always zero. (Generalized) -/
+lemma evalSmooth_interaction_eq_zero_of_raw_gen {k sp : ℕ} [Fintype (Fin k)] [Fintype (Fin sp)]
+    {model : PhenotypeInformedGAM 1 k sp} (h_raw : IsRawScoreModel model)
+    (m : Fin 1) (l : Fin k) (c_val : ℝ) :
+    evalSmooth model.pcSplineBasis (model.fₘₗ m l) c_val = 0 := by
+  unfold evalSmooth
+  simp [h_raw.fₘₗ_zero m l]
+
+/-- Helper lemma: For a raw score model, the PC main effect spline term is always zero. -/
+lemma evalSmooth_eq_zero_of_raw {model : PhenotypeInformedGAM 1 1 1} (h_raw : IsRawScoreModel model)
+    (l : Fin 1) (c_val : ℝ) :
+    evalSmooth model.pcSplineBasis (model.f₀ₗ l) c_val = 0 := by
+  unfold evalSmooth
+  simp [h_raw.f₀ₗ_zero l]
+
+/-- Helper lemma: For a raw score model, the PGS-PC interaction spline term is always zero. -/
+lemma evalSmooth_interaction_eq_zero_of_raw {model : PhenotypeInformedGAM 1 1 1} (h_raw : IsRawScoreModel model)
+    (m : Fin 1) (l : Fin 1) (c_val : ℝ) :
+    evalSmooth model.pcSplineBasis (model.fₘₗ m l) c_val = 0 := by
+  unfold evalSmooth
+  simp [h_raw.fₘₗ_zero m l]
+
+/-- **Lemma A (Generalized)**: For a raw model (all spline terms zero) with linear PGS basis,
+    the linear predictor simplifies to an affine function: a + b*p. -/
+lemma linearPredictor_eq_affine_of_raw_gen {k sp : ℕ} [Fintype (Fin k)] [Fintype (Fin sp)]
+    (model_raw : PhenotypeInformedGAM 1 k sp)
+    (h_raw : IsRawScoreModel model_raw)
+    (h_lin : model_raw.pgsBasis.B 1 = id) :
+    ∀ p c, linearPredictor model_raw p c =
+      model_raw.γ₀₀ + model_raw.γₘ₀ 0 * p := by
+  intros p_val c_val
+
+  have h_decomp := linearPredictor_decomp model_raw h_lin p_val c_val
+  rw [h_decomp]
+
+  have h_base : predictorBase model_raw c_val = model_raw.γ₀₀ := by
+    unfold predictorBase
+    simp [evalSmooth_eq_zero_of_raw_gen h_raw]
+
+  have h_slope : predictorSlope model_raw c_val = model_raw.γₘ₀ 0 := by
+    unfold predictorSlope
+    simp [evalSmooth_interaction_eq_zero_of_raw_gen h_raw]
+
+  rw [h_base, h_slope]
+
+/-- The key bridge: IsBayesOptimalInRawClass implies the orthogonality conditions. (Generalized) -/
+lemma rawOptimal_implies_orthogonality_gen {k sp : ℕ} [Fintype (Fin k)] [Fintype (Fin sp)]
+    (model : PhenotypeInformedGAM 1 k sp) (dgp : DataGeneratingProcess k)
+    (h_opt : IsBayesOptimalInRawClass dgp model)
+    (h_linear : model.pgsBasis.B 1 = id)
+    (hY_int : Integrable (fun pc => dgp.trueExpectation pc.1 pc.2) dgp.jointMeasure)
+    (hP_int : Integrable (fun pc => pc.1) dgp.jointMeasure)
+    (hP2_int : Integrable (fun pc => pc.1 ^ 2) dgp.jointMeasure)
+    (hYP_int : Integrable (fun pc => dgp.trueExpectation pc.1 pc.2 * pc.1) dgp.jointMeasure)
+    (h_resid_sq_int : Integrable (fun pc => (dgp.trueExpectation pc.1 pc.2 - (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1))^2) dgp.jointMeasure) :
+    let a := model.γ₀₀
+    let b := model.γₘ₀ ⟨0, by norm_num⟩
+    (∫ pc, (dgp.trueExpectation pc.1 pc.2 - (a + b * pc.1)) ∂dgp.jointMeasure = 0) ∧
+    (∫ pc, (dgp.trueExpectation pc.1 pc.2 - (a + b * pc.1)) * pc.1 ∂dgp.jointMeasure = 0) := by
+
+  set a := model.γ₀₀ with ha_def
+  set b := model.γₘ₀ ⟨0, by norm_num⟩ with hb_def
+  set μ := dgp.jointMeasure with hμ_def
+  set Y := dgp.trueExpectation with hY_def
+
+  set residual : ℝ × (Fin k → ℝ) → ℝ := fun pc => Y pc.1 pc.2 - (a + b * pc.1) with hres_def
+  constructor
+  · have h1 : ∫ pc, residual pc ∂μ = 0 := by
+      have h_quad : ∀ ε : ℝ, (-2 * ∫ pc, residual pc ∂μ) * ε + 1 * ε^2 ≥ 0 := by
+        intro ε
+        have h_expand : (-2 * ∫ pc, residual pc ∂μ) * ε + 1 * ε^2 =
+            ε^2 - 2 * ε * ∫ pc, residual pc ∂μ := by ring
+        rw [h_expand]
+        let model' : PhenotypeInformedGAM 1 k sp := { model with γ₀₀ := model.γ₀₀ + ε }
+        have h_raw' : IsRawScoreModel model' := {
+          f₀ₗ_zero := h_opt.is_raw.f₀ₗ_zero,
+          fₘₗ_zero := h_opt.is_raw.fₘₗ_zero
+        }
+        have h_opt_ineq := h_opt.is_optimal model' h_raw'
+        have h_pred_diff : ∀ p_val (c_val : Fin k → ℝ),
+            linearPredictor model' p_val c_val = linearPredictor model p_val c_val + ε := by
+          intro p_val c_val
+          unfold linearPredictor
+          simp only [model']
+          ring
+        unfold expectedSquaredError at h_opt_ineq
+        have h_resid_int : Integrable residual μ := by
+          unfold residual
+          simp only [hY_def, ha_def, hb_def, hμ_def]
+          apply Integrable.sub hY_int
+          apply Integrable.add (integrable_const a)
+          exact hP_int.const_mul b
+
+        have h_pred_model : ∀ p_val (c_val : Fin k → ℝ),
+            linearPredictor model p_val c_val = a + b * p_val := by
+          intro p_val c_val
+          exact linearPredictor_eq_affine_of_raw_gen model h_opt.is_raw h_linear p_val c_val
+
+        have h_pred_model' : ∀ p_val (c_val : Fin k → ℝ),
+            linearPredictor model' p_val c_val = a + b * p_val + ε := by
+          intro p_val c_val
+          have h := h_pred_diff p_val c_val
+          rw [h_pred_model] at h
+          linarith
+
+        have h_resid_shift : ∀ pc : ℝ × (Fin k → ℝ),
+            Y pc.1 pc.2 - linearPredictor model' pc.1 pc.2 = residual pc - ε := by
+          intro pc
+          simp only [hres_def, hY_def, h_pred_model' pc.1 pc.2]
+          ring
+
+        have h_ineq : ∫ pc, residual pc ^ 2 ∂μ ≤ ∫ pc, (residual pc - ε) ^ 2 ∂μ := by
+          have hLHS : ∫ pc, (Y pc.1 pc.2 - linearPredictor model pc.1 pc.2) ^ 2 ∂μ =
+              ∫ pc, residual pc ^ 2 ∂μ := by
+            congr 1; ext pc
+            simp only [hres_def, hY_def, h_pred_model pc.1 pc.2]
+          have hRHS : ∫ pc, (Y pc.1 pc.2 - linearPredictor model' pc.1 pc.2) ^ 2 ∂μ =
+              ∫ pc, (residual pc - ε) ^ 2 ∂μ := by
+            congr 1; ext pc; exact congrArg (· ^ 2) (h_resid_shift pc)
+          rw [← hLHS, ← hRHS]
+          exact h_opt_ineq
+
+        have h_expand : ∫ pc, (residual pc - ε) ^ 2 ∂μ =
+            ∫ pc, residual pc ^ 2 ∂μ - 2 * ε * ∫ pc, residual pc ∂μ + ε ^ 2 := by
+          have h_resid_sq_int' : Integrable (fun pc => residual pc ^ 2) μ := by
+            simp only [hμ_def, hres_def, hY_def, ha_def, hb_def]; exact h_resid_sq_int
+          have h_cross_int : Integrable (fun pc => residual pc) μ := h_resid_int
+          have heq : ∀ pc, (residual pc - ε) ^ 2 = residual pc ^ 2 - 2 * ε * residual pc + ε ^ 2 := by
+            intro pc; ring
+          calc ∫ pc, (residual pc - ε) ^ 2 ∂μ
+              = ∫ pc, residual pc ^ 2 - 2 * ε * residual pc + ε ^ 2 ∂μ := by
+                congr 1; funext pc; exact heq pc
+            _ = ∫ pc, residual pc ^ 2 ∂μ - 2 * ε * ∫ pc, residual pc ∂μ + ε ^ 2 := by
+                have h1 : Integrable (fun pc => residual pc ^ 2 - 2 * ε * residual pc) μ :=
+                  h_resid_sq_int'.sub (h_cross_int.const_mul (2 * ε))
+                have h2 : Integrable (fun _ : ℝ × (Fin k → ℝ) => ε ^ 2) μ := integrable_const _
+                rw [integral_add h1 h2, integral_sub h_resid_sq_int' (h_cross_int.const_mul (2 * ε))]
+                simp [MeasureTheory.integral_const, MeasureTheory.integral_const_mul]
+
+        rw [h_expand] at h_ineq
+        linarith
+      have h_coeff := linear_coeff_zero_of_quadratic_nonneg
+        (-2 * ∫ pc, residual pc ∂μ) 1 h_quad
+      linarith
+    simpa [hres_def] using h1
+
+  · have h2 : ∫ pc, residual pc * pc.1 ∂μ = 0 := by
+      have h_quad : ∀ ε : ℝ, (-2 * ∫ pc, residual pc * pc.1 ∂μ) * ε +
+          (∫ pc, pc.1^2 ∂μ) * ε^2 ≥ 0 := by
+        intro ε
+        have h_expand : (-2 * ∫ pc, residual pc * pc.1 ∂μ) * ε + (∫ pc, pc.1^2 ∂μ) * ε^2 =
+            (∫ pc, pc.1^2 ∂μ) * ε^2 - 2 * ε * ∫ pc, residual pc * pc.1 ∂μ := by ring
+        rw [h_expand]
+        let model' : PhenotypeInformedGAM 1 k sp := {
+          pgsBasis := model.pgsBasis,
+          pcSplineBasis := model.pcSplineBasis,
+          γ₀₀ := model.γ₀₀,
+          γₘ₀ := fun m => model.γₘ₀ m + ε,
+          f₀ₗ := model.f₀ₗ,
+          fₘₗ := model.fₘₗ,
+          link := model.link,
+          dist := model.dist
+        }
+        have h_raw' : IsRawScoreModel model' := {
+          f₀ₗ_zero := h_opt.is_raw.f₀ₗ_zero,
+          fₘₗ_zero := h_opt.is_raw.fₘₗ_zero
+        }
+        have h_opt_ineq := h_opt.is_optimal model' h_raw'
+        have h_resid_int : Integrable residual μ := by
+          simp only [hres_def, hY_def, ha_def, hb_def, hμ_def]
+          apply Integrable.sub hY_int
+          apply Integrable.add (integrable_const a)
+          exact hP_int.const_mul b
+
+        have h_resid_P_int : Integrable (fun pc => residual pc * pc.1) μ := by
+          simp only [hres_def, hY_def, ha_def, hb_def, hμ_def]
+          have h1 : Integrable (fun pc : ℝ × (Fin k → ℝ) => dgp.trueExpectation pc.1 pc.2 * pc.1) μ := hYP_int
+          have h2 : Integrable (fun pc : ℝ × (Fin k → ℝ) => a * pc.1) μ := hP_int.const_mul a
+          have h3 : Integrable (fun pc : ℝ × (Fin k → ℝ) => b * pc.1 ^ 2) μ := hP2_int.const_mul b
+          have heq : ∀ pc : ℝ × (Fin k → ℝ),
+              (dgp.trueExpectation pc.1 pc.2 - (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1)) * pc.1 =
+              dgp.trueExpectation pc.1 pc.2 * pc.1 - a * pc.1 - b * pc.1 ^ 2 := by
+            intro pc; ring
+          exact ((h1.sub h2).sub h3).congr (ae_of_all _ (fun pc => (heq pc).symm))
+
+        have h_resid_sq_int' : Integrable (fun pc => residual pc ^ 2) μ := by
+          simp only [hμ_def, hres_def, hY_def, ha_def, hb_def]
+          exact h_resid_sq_int
+
+        have h_pred_model : ∀ p_val (c_val : Fin k → ℝ),
+            linearPredictor model p_val c_val = a + b * p_val := by
+          intro p_val c_val
+          exact linearPredictor_eq_affine_of_raw_gen model h_opt.is_raw h_linear p_val c_val
+
+        have h_pred_model' : ∀ p_val (c_val : Fin k → ℝ),
+            linearPredictor model' p_val c_val = a + (b + ε) * p_val := by
+          intro p_val c_val
+          have h := linearPredictor_eq_affine_of_raw_gen model' h_raw' h_linear p_val c_val
+          simp only [model', ha_def, hb_def] at h
+          convert h using 2 <;> ring
+
+        have h_expand_full : ∫ pc, (residual pc - ε * pc.1) ^ 2 ∂μ =
+            ∫ pc, residual pc ^ 2 ∂μ - 2 * ε * ∫ pc, residual pc * pc.1 ∂μ + ε ^ 2 * ∫ pc, pc.1 ^ 2 ∂μ := by
+          have heq : ∀ pc, (residual pc - ε * pc.1) ^ 2 =
+              residual pc ^ 2 - 2 * ε * residual pc * pc.1 + ε ^ 2 * pc.1 ^ 2 := by
+            intro pc; ring
+          calc ∫ pc, (residual pc - ε * pc.1) ^ 2 ∂μ
+              = ∫ pc, residual pc ^ 2 - 2 * ε * residual pc * pc.1 + ε ^ 2 * pc.1 ^ 2 ∂μ := by
+                congr 1; funext pc; exact heq pc
+            _ = ∫ pc, residual pc ^ 2 ∂μ - 2 * ε * ∫ pc, residual pc * pc.1 ∂μ +
+                ε ^ 2 * ∫ pc, pc.1 ^ 2 ∂μ := by
+                have h1 : Integrable (fun pc => residual pc ^ 2) μ := h_resid_sq_int'
+                have h2 : Integrable (fun pc => 2 * ε * residual pc * pc.1) μ := by
+                  have h := h_resid_P_int.const_mul (2 * ε)
+                  refine h.congr (ae_of_all _ ?_)
+                  intro pc; ring
+                have h3 : Integrable (fun pc => ε ^ 2 * pc.1 ^ 2) μ := hP2_int.const_mul (ε ^ 2)
+                have hsum_eq : ∀ pc, residual pc ^ 2 - 2 * ε * residual pc * pc.1 + ε ^ 2 * pc.1 ^ 2 =
+                    (residual pc ^ 2 - 2 * ε * residual pc * pc.1) + ε ^ 2 * pc.1 ^ 2 := by
+                  intro pc; ring
+                calc ∫ pc, residual pc ^ 2 - 2 * ε * residual pc * pc.1 + ε ^ 2 * pc.1 ^ 2 ∂μ
+                    = ∫ pc, (residual pc ^ 2 - 2 * ε * residual pc * pc.1) + ε ^ 2 * pc.1 ^ 2 ∂μ := by
+                      rfl
+                  _ = ∫ pc, residual pc ^ 2 - 2 * ε * residual pc * pc.1 ∂μ + ∫ pc, ε ^ 2 * pc.1 ^ 2 ∂μ := by
+                      exact integral_add (h1.sub h2) h3
+                  _ = (∫ pc, residual pc ^ 2 ∂μ - ∫ pc, 2 * ε * residual pc * pc.1 ∂μ) +
+                      ε ^ 2 * ∫ pc, pc.1 ^ 2 ∂μ := by
+                      rw [integral_sub h1 h2, integral_const_mul]
+                  _ = ∫ pc, residual pc ^ 2 ∂μ - 2 * ε * ∫ pc, residual pc * pc.1 ∂μ +
+                      ε ^ 2 * ∫ pc, pc.1 ^ 2 ∂μ := by
+                      have hcm : ∫ pc, 2 * ε * residual pc * pc.1 ∂μ = 2 * ε * ∫ pc, residual pc * pc.1 ∂μ := by
+                        have heq' : ∀ pc, 2 * ε * residual pc * pc.1 = 2 * ε * (residual pc * pc.1) := by
+                          intro pc; ring
+                        calc ∫ pc, 2 * ε * residual pc * pc.1 ∂μ
+                            = ∫ pc, 2 * ε * (residual pc * pc.1) ∂μ := by congr 1; funext pc; exact heq' pc
+                          _ = 2 * ε * ∫ pc, residual pc * pc.1 ∂μ := integral_const_mul _ _
+                      rw [hcm]
+
+        have h_ineq : ∫ pc, residual pc ^ 2 ∂μ ≤ ∫ pc, (residual pc - ε * pc.1) ^ 2 ∂μ := by
+          have hLHS : ∫ pc, (Y pc.1 pc.2 - linearPredictor model pc.1 pc.2) ^ 2 ∂μ =
+              ∫ pc, residual pc ^ 2 ∂μ := by
+            congr 1; ext pc
+            simp only [hres_def, hY_def, h_pred_model pc.1 pc.2]
+          have hRHS : ∫ pc, (Y pc.1 pc.2 - linearPredictor model' pc.1 pc.2) ^ 2 ∂μ =
+              ∫ pc, (residual pc - ε * pc.1) ^ 2 ∂μ := by
+            congr 1; ext pc
+            simp only [hres_def, hY_def, h_pred_model' pc.1 pc.2]
+            ring
+          rw [← hLHS, ← hRHS]
+          exact h_opt_ineq
+
+        rw [h_expand_full] at h_ineq
+        linarith
+      have h_coeff := linear_coeff_zero_of_quadratic_nonneg
+        (-2 * ∫ pc, residual pc * pc.1 ∂μ) (∫ pc, pc.1^2 ∂μ) h_quad
+      linarith
+    simpa [hres_def] using h2
+
+/-- **Lemma A**: For a raw model (all spline terms zero) with linear PGS basis,
+    the linear predictor simplifies to an affine function: a + b*p.
+    This is the key structural simplification.
+
+    Proof uses linearPredictor_decomp then shows base and slope simplify for raw models. -/
+lemma linearPredictor_eq_affine_of_raw
+    (model_raw : PhenotypeInformedGAM 1 1 1)
+    (h_raw : IsRawScoreModel model_raw)
+    (h_lin : model_raw.pgsBasis.B 1 = id ∧ model_raw.pgsBasis.B 0 = fun _ => 1) :
+    ∀ p c, linearPredictor model_raw p c =
+      model_raw.γ₀₀ + model_raw.γₘ₀ 0 * p := by
+  intros p_val c_val
+
+  -- Step 1: Use linearPredictor_decomp to get base + slope * p form
+  have h_decomp := linearPredictor_decomp model_raw h_lin.1 p_val c_val
+  rw [h_decomp]
+
+  -- Step 2: Show base reduces to γ₀₀ for raw model
+  have h_base : predictorBase model_raw c_val = model_raw.γ₀₀ := by
+    unfold predictorBase
+    simp [evalSmooth_eq_zero_of_raw h_raw]
+
+  -- Step 3: Show slope reduces to γₘ₀[0] for raw model
+  have h_slope : predictorSlope model_raw c_val = model_raw.γₘ₀ 0 := by
+    unfold predictorSlope
+    simp [evalSmooth_interaction_eq_zero_of_raw h_raw]
+
+  rw [h_base, h_slope]
+
+/-- The key bridge: IsBayesOptimalInRawClass implies the orthogonality conditions.
+
+    **Variational Proof (Fundamental Theorem of Least Squares)**:
+    If Ŷ minimizes E[(Y - Ŷ)²] over the class of affine functions of P,
+    then for any perturbation direction v ∈ span{1, P}, the directional derivative
+    of the loss at Ŷ in direction v must be zero.
+
+    Define L(ε) = E[(Y - (Ŷ + ε·v))²]
+                = E[(Y - Ŷ)²] - 2ε·E[(Y - Ŷ)·v] + ε²·E[v²]
+
+    For L(ε) ≥ L(0) for all ε (by optimality), the linear coefficient must vanish:
+        E[(Y - Ŷ)·v] = 0
+
+    Taking v = 1 gives: E[Y - Ŷ] = 0 (first normal equation)
+    Taking v = P gives: E[(Y - Ŷ)·P] = 0 (second normal equation)
+
+    **FUTURE**:
+    - Unify empirical and theoretical loss via measure theory: treat both as L²(μ)
+      for different measures μ (population vs empirical 1/n Σδᵢ)
+    - Abstract the parameter space to any [InnerProductSpace ℝ P], not just ParamIx
+    - Use LinearMap instead of Matrix for cleaner kernel/image reasoning -/
+lemma rawOptimal_implies_orthogonality
+    (model : PhenotypeInformedGAM 1 1 1) (dgp : DataGeneratingProcess 1)
+    (h_opt : IsBayesOptimalInRawClass dgp model)
+    (h_linear : model.pgsBasis.B 1 = id ∧ model.pgsBasis.B 0 = fun _ => 1)
+    (hY_int : Integrable (fun pc => dgp.trueExpectation pc.1 pc.2) dgp.jointMeasure)
+    (hP_int : Integrable (fun pc => pc.1) dgp.jointMeasure)
+    (hP2_int : Integrable (fun pc => pc.1 ^ 2) dgp.jointMeasure)
+    (hYP_int : Integrable (fun pc => dgp.trueExpectation pc.1 pc.2 * pc.1) dgp.jointMeasure)
+    (h_resid_sq_int : Integrable (fun pc =>
+      (dgp.trueExpectation pc.1 pc.2 -
+        (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1)) ^ 2) dgp.jointMeasure) :
+    (∫ pc, (dgp.trueExpectation pc.1 pc.2 -
+        (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1)) ∂dgp.jointMeasure = 0) ∧
+    (∫ pc, (dgp.trueExpectation pc.1 pc.2 -
+        (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1)) * pc.1 ∂dgp.jointMeasure = 0) := by
+  exact rawOptimal_implies_orthogonality_gen model dgp h_opt h_linear.1 hY_int hP_int hP2_int hYP_int h_resid_sq_int
+
+/-- Combine the normal equations to get the optimal coefficients for additive bias DGP.
+
+    **Proof Strategy (Orthogonality Principle)**:
+    The Bayes-optimal predictor Ŷ = a + b*P in the raw class satisfies
+    the normal equations (orthogonality with basis vectors 1 and P):
+      ⟨Y - Ŷ, 1⟩ = 0  ⟹  E[Y] = a + b*E[P] = a  (since E[P] = 0)
+      ⟨Y - Ŷ, P⟩ = 0  ⟹  E[YP] = a*E[P] + b*E[P²] = b  (since E[P]=0, E[P²]=1)
+
+    For Y = P + β*C:
+      E[Y] = E[P] + β*E[C] = 0 + β*0 = 0  ⟹  a = 0
+      E[YP] = E[P²] + β*E[PC] = 1 + β*0 = 1  ⟹  b = 1
+-/
+lemma optimal_coefficients_for_additive_dgp
+    (model : PhenotypeInformedGAM 1 1 1) (β_env : ℝ)
+    (dgp : DataGeneratingProcess 1)
+    (h_dgp : dgp.trueExpectation = fun p c => p + β_env * c ⟨0, by norm_num⟩)
+    (h_opt : IsBayesOptimalInRawClass dgp model)
+    (h_linear : model.pgsBasis.B 1 = id ∧ model.pgsBasis.B 0 = fun _ => 1)
+    (h_indep : dgp.jointMeasure = (dgp.jointMeasure.map Prod.fst).prod (dgp.jointMeasure.map Prod.snd))
+    (hP0 : ∫ pc, pc.1 ∂dgp.jointMeasure = 0)
+    (hC0 : ∫ pc, pc.2 ⟨0, by norm_num⟩ ∂dgp.jointMeasure = 0)
+    (hP2 : ∫ pc, pc.1^2 ∂dgp.jointMeasure = 1)
+    -- Integrability hypotheses
+    (hP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1) dgp.jointMeasure)
+    (hC_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.2 ⟨0, by norm_num⟩) dgp.jointMeasure)
+    (hP2_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1 ^ 2) dgp.jointMeasure)
+    (hPC_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.2 ⟨0, by norm_num⟩ * pc.1) dgp.jointMeasure)
+    (hY_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => dgp.trueExpectation pc.1 pc.2) dgp.jointMeasure)
+    (hYP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => dgp.trueExpectation pc.1 pc.2 * pc.1) dgp.jointMeasure)
+    (h_resid_sq_int : Integrable (fun pc => (dgp.trueExpectation pc.1 pc.2 - (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1))^2) dgp.jointMeasure) :
+    model.γ₀₀ = 0 ∧ model.γₘ₀ ⟨0, by norm_num⟩ = 1 := by
+  -- Step 1: Get the orthogonality conditions from optimality
+  have h_orth := rawOptimal_implies_orthogonality model dgp h_opt h_linear hY_int hP_int hP2_int hYP_int h_resid_sq_int
+  set a := model.γ₀₀ with ha_def
+  set b := model.γₘ₀ ⟨0, by norm_num⟩ with hb_def
+  obtain ⟨h_orth1, h_orthP⟩ := h_orth
+
+  -- Step 2: Compute E[PC] = 0 using independence
+  have hPC0 : ∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂dgp.jointMeasure = 0 :=
+    integral_mul_fst_snd_eq_zero dgp.jointMeasure h_indep hP0 hC0
+
+  -- Step 3: Compute E[Y] where Y = P + β*C
+  -- E[Y] = E[P] + β*E[C] = 0 + β*0 = 0
+  have hY_mean : ∫ pc, dgp.trueExpectation pc.1 pc.2 ∂dgp.jointMeasure = 0 := by
+    -- E[P + β*C] = E[P] + β*E[C] = 0 + β*0 by hP0 and hC0
+    simp only [h_dgp]
+    -- Goal: ∫ pc, pc.1 + β_env * pc.2 ⟨0, _⟩ ∂μ = 0
+    calc ∫ pc, pc.1 + β_env * pc.2 ⟨0, by norm_num⟩ ∂dgp.jointMeasure
+        = (∫ pc, pc.1 ∂dgp.jointMeasure) + β_env * (∫ pc, pc.2 ⟨0, by norm_num⟩ ∂dgp.jointMeasure) := by
+          rw [integral_add hP_int (hC_int.const_mul β_env)]
+          rw [integral_const_mul]
+        _ = 0 + β_env * 0 := by rw [hP0, hC0]
+        _ = 0 := by ring
+
+  -- Step 4: Compute E[YP] where Y = P + β*C
+  -- E[YP] = E[P²] + β*E[PC] = 1 + β*0 = 1
+  have hYP : ∫ pc, dgp.trueExpectation pc.1 pc.2 * pc.1 ∂dgp.jointMeasure = 1 := by
+    simp only [h_dgp]
+    have hP2_int' : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1 ^ 2) dgp.jointMeasure := hP2_int
+    have hPC_int' : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.2 ⟨0, by norm_num⟩ * pc.1) dgp.jointMeasure := hPC_int
+    have heq : ∀ pc : ℝ × (Fin 1 → ℝ), (pc.1 + β_env * pc.2 ⟨0, by norm_num⟩) * pc.1
+                                      = pc.1 ^ 2 + β_env * (pc.2 ⟨0, by norm_num⟩ * pc.1) := by
+      intro pc; ring
+    calc ∫ pc, (pc.1 + β_env * pc.2 ⟨0, by norm_num⟩) * pc.1 ∂dgp.jointMeasure
+        = ∫ pc, pc.1 ^ 2 + β_env * (pc.2 ⟨0, by norm_num⟩ * pc.1) ∂dgp.jointMeasure := by
+          congr 1; ext pc; exact heq pc
+        _ = (∫ pc, pc.1 ^ 2 ∂dgp.jointMeasure) + β_env * (∫ pc, pc.2 ⟨0, by norm_num⟩ * pc.1 ∂dgp.jointMeasure) := by
+          rw [integral_add hP2_int (hPC_int.const_mul β_env)]
+          rw [integral_const_mul]
+        _ = 1 + β_env * 0 := by
+          rw [hP2]
+          have hPC_comm : ∫ pc, pc.2 ⟨0, by norm_num⟩ * pc.1 ∂dgp.jointMeasure
+                        = ∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂dgp.jointMeasure := by
+            congr 1; ext pc; ring
+          rw [hPC_comm, hPC0]
+        _ = 1 := by ring
+
+  -- Step 5: Apply the normal equations to extract a and b
+  have ha : a = 0 := by
+    have h_expand : ∫ pc, (dgp.trueExpectation pc.1 pc.2 - (a + b * pc.1)) ∂dgp.jointMeasure
+                  = (∫ pc, dgp.trueExpectation pc.1 pc.2 ∂dgp.jointMeasure) - a - b * (∫ pc, pc.1 ∂dgp.jointMeasure) := by
+      have hY_int' : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => dgp.trueExpectation pc.1 pc.2) dgp.jointMeasure := hY_int
+      have hP_int' : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1) dgp.jointMeasure := hP_int
+      have hConst_int : Integrable (fun _ : ℝ × (Fin 1 → ℝ) => a) dgp.jointMeasure := by
+        simp
+      have hLin_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => a + b * pc.1) dgp.jointMeasure := by
+        exact hConst_int.add (hP_int.const_mul b)
+      calc ∫ pc, dgp.trueExpectation pc.1 pc.2 - (a + b * pc.1) ∂dgp.jointMeasure
+          = (∫ pc, dgp.trueExpectation pc.1 pc.2 ∂dgp.jointMeasure) - (∫ pc, a + b * pc.1 ∂dgp.jointMeasure) := by
+            rw [integral_sub hY_int hLin_int]
+          _ = (∫ pc, dgp.trueExpectation pc.1 pc.2 ∂dgp.jointMeasure) - (a + b * (∫ pc, pc.1 ∂dgp.jointMeasure)) := by
+            congr 1
+            calc ∫ pc, a + b * pc.1 ∂dgp.jointMeasure
+                = (∫ pc, (a : ℝ) ∂dgp.jointMeasure) + (∫ pc, b * pc.1 ∂dgp.jointMeasure) := by
+                  exact integral_add hConst_int (hP_int.const_mul b)
+                _ = a + b * (∫ pc, pc.1 ∂dgp.jointMeasure) := by
+                  simp [integral_const, MeasureTheory.integral_const_mul]
+          _ = (∫ pc, dgp.trueExpectation pc.1 pc.2 ∂dgp.jointMeasure) - a - b * (∫ pc, pc.1 ∂dgp.jointMeasure) := by ring
+    rw [h_expand, hY_mean, hP0] at h_orth1
+    linarith
+
+  have hb : b = 1 := by
+    have h_expand : ∫ pc, (dgp.trueExpectation pc.1 pc.2 - (a + b * pc.1)) * pc.1 ∂dgp.jointMeasure
+                  = (∫ pc, dgp.trueExpectation pc.1 pc.2 * pc.1 ∂dgp.jointMeasure)
+                    - a * (∫ pc, pc.1 ∂dgp.jointMeasure)
+                    - b * (∫ pc, pc.1^2 ∂dgp.jointMeasure) := by
+      have hYP_int' : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => dgp.trueExpectation pc.1 pc.2 * pc.1) dgp.jointMeasure := hYP_int
+      have hP_int' : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1) dgp.jointMeasure := hP_int
+      have hP2_int' : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1^2) dgp.jointMeasure := hP2_int
+      have hLinP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => (a + b * pc.1) * pc.1) dgp.jointMeasure := by
+        have h1 : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => a * pc.1) dgp.jointMeasure := hP_int.const_mul a
+        have h2 : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => b * pc.1^2) dgp.jointMeasure := hP2_int.const_mul b
+        have heq_ae : ∀ᵐ pc ∂dgp.jointMeasure, a * pc.1 + b * pc.1^2 = (a + b * pc.1) * pc.1 := by
+          filter_upwards with pc
+          ring
+        exact (h1.add h2).congr heq_ae
+      calc ∫ pc, (dgp.trueExpectation pc.1 pc.2 - (a + b * pc.1)) * pc.1 ∂dgp.jointMeasure
+          = ∫ pc, dgp.trueExpectation pc.1 pc.2 * pc.1 - (a + b * pc.1) * pc.1 ∂dgp.jointMeasure := by
+            congr 1; ext pc; ring
+          _ = (∫ pc, dgp.trueExpectation pc.1 pc.2 * pc.1 ∂dgp.jointMeasure) - (∫ pc, (a + b * pc.1) * pc.1 ∂dgp.jointMeasure) := by
+            rw [integral_sub hYP_int hLinP_int]
+          _ = (∫ pc, dgp.trueExpectation pc.1 pc.2 * pc.1 ∂dgp.jointMeasure)
+              - (a * (∫ pc, pc.1 ∂dgp.jointMeasure) + b * (∫ pc, pc.1^2 ∂dgp.jointMeasure)) := by
+            congr 1
+            have h1 : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => a * pc.1) dgp.jointMeasure := hP_int.const_mul a
+            have h2 : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => b * pc.1^2) dgp.jointMeasure := hP2_int.const_mul b
+            calc ∫ pc, (a + b * pc.1) * pc.1 ∂dgp.jointMeasure
+                = ∫ pc, a * pc.1 + b * pc.1^2 ∂dgp.jointMeasure := by
+                  congr 1; ext pc; ring
+                _ = (∫ pc, a * pc.1 ∂dgp.jointMeasure) + (∫ pc, b * pc.1^2 ∂dgp.jointMeasure) := by
+                  exact integral_add h1 h2
+                _ = a * (∫ pc, pc.1 ∂dgp.jointMeasure) + b * (∫ pc, pc.1^2 ∂dgp.jointMeasure) := by
+                  simp [MeasureTheory.integral_const_mul]
+          _ = (∫ pc, dgp.trueExpectation pc.1 pc.2 * pc.1 ∂dgp.jointMeasure)
+              - a * (∫ pc, pc.1 ∂dgp.jointMeasure) - b * (∫ pc, pc.1^2 ∂dgp.jointMeasure) := by ring
+    rw [h_expand, hYP, hP0, hP2, ha] at h_orthP
+    linarith
+
+  exact ⟨ha, hb⟩
+
+
+lemma polynomial_spline_coeffs_unique {n : ℕ} [Fintype (Fin n)] (coeffs : Fin n → ℝ) :
+    (∀ x, (∑ i, coeffs i * x ^ (i.val + 1)) = 0) → ∀ i, coeffs i = 0 := by
+  intro h_zero i
+  let p : Polynomial ℝ := ∑ i, Polynomial.monomial (i.val + 1) (coeffs i)
+  have h_eval : ∀ x, p.eval x = 0 := by
+    intro x
+    simp [p, Polynomial.eval_finset_sum, Polynomial.eval_monomial, h_zero x]
+  have h_p_zero : p = 0 := by
+    apply Polynomial.funext
+    intro x
+    simpa using h_eval x
+  have h_coeff : p.coeff (i.val + 1) = 0 := by
+    simpa [h_p_zero]
+  have h_coeff' : p.coeff (i.val + 1) = coeffs i := by
+    classical
+    have h_sum :
+        Finset.sum Finset.univ (fun j => if (j.val + 1) = (i.val + 1) then coeffs j else 0) =
+          if (i.val + 1) = (i.val + 1) then coeffs i else 0 := by
+      refine Finset.sum_eq_single i ?_ ?_
+      · intro j _ h_ne
+        have h_ne' : (j.val + 1) ≠ (i.val + 1) := by
+          intro h
+          apply h_ne
+          apply Fin.eq_of_val_eq
+          exact (Nat.succ_inj).1 h
+        have h_zero : (if (j.val + 1) = (i.val + 1) then coeffs j else 0) = 0 := by
+          by_cases hji : (j.val + 1) = (i.val + 1)
+          · exact (h_ne' hji).elim
+          · exact if_neg hji
+        exact h_zero
+      · intro h_not_mem
+        exfalso; exact h_not_mem (Finset.mem_univ i)
+    have h_sum' :
+        Finset.sum Finset.univ (fun j => if (j.val + 1) = (i.val + 1) then coeffs j else 0) = coeffs i := by
+      simpa using h_sum
+    simpa [p, Polynomial.coeff_sum, Polynomial.coeff_monomial] using h_sum'
+  exact by
+    simpa [h_coeff'] using h_coeff
+
+
+theorem l2_projection_of_additive_is_additive (k sp : ℕ) [Fintype (Fin k)] [Fintype (Fin sp)] {f : ℝ → ℝ} {g : Fin k → ℝ → ℝ} {dgp : DataGeneratingProcess k}
+  (h_true_fn : dgp.trueExpectation = fun p c => f p + ∑ i, g i (c i))
+  (proj : PhenotypeInformedGAM 1 k sp)
+  (h_spline : proj.pcSplineBasis = polynomialSplineBasis sp)
+  (h_pgs : proj.pgsBasis = linearPGSBasis)
+  (h_fit : ∀ p c, linearPredictor proj p c = dgp.trueExpectation p c) :
+  IsNormalizedScoreModel proj := by
+  -- Use decomposition
+  have h_lin : proj.pgsBasis.B 1 = id := by rw [h_pgs]; rfl
+  have h_pred : ∀ p c, linearPredictor proj p c = predictorBase proj c + predictorSlope proj c * p :=
+    linearPredictor_decomp proj h_lin
+
+  -- Show slope is constant
+  have h_slope_const : ∀ c1 c2, predictorSlope proj c1 = predictorSlope proj c2 := by
+    intros c1 c2
+    have h1 : predictorBase proj c1 + predictorSlope proj c1 = f 1 + ∑ i, g i (c1 i) := by
+      have h_fit1 : linearPredictor proj 1 c1 = f 1 + ∑ i, g i (c1 i) := by
+        simpa [h_fit, h_true_fn]
+      have h_pred1 : linearPredictor proj 1 c1 = predictorBase proj c1 + predictorSlope proj c1 := by
+        simpa [h_pred]
+      simpa [h_pred1] using h_fit1
+    have h0 : predictorBase proj c1 = f 0 + ∑ i, g i (c1 i) := by
+      have h_fit0 : linearPredictor proj 0 c1 = f 0 + ∑ i, g i (c1 i) := by
+        simpa [h_fit, h_true_fn]
+      have h_pred0 : linearPredictor proj 0 c1 = predictorBase proj c1 := by
+        simpa [h_pred]
+      simpa [h_pred0] using h_fit0
+    have hs1 : predictorSlope proj c1 = (f 1 - f 0) := by
+      linarith
+
+    have h1' : predictorBase proj c2 + predictorSlope proj c2 = f 1 + ∑ i, g i (c2 i) := by
+      have h_fit1 : linearPredictor proj 1 c2 = f 1 + ∑ i, g i (c2 i) := by
+        simpa [h_fit, h_true_fn]
+      have h_pred1 : linearPredictor proj 1 c2 = predictorBase proj c2 + predictorSlope proj c2 := by
+        simpa [h_pred]
+      simpa [h_pred1] using h_fit1
+    have h0' : predictorBase proj c2 = f 0 + ∑ i, g i (c2 i) := by
+      have h_fit0 : linearPredictor proj 0 c2 = f 0 + ∑ i, g i (c2 i) := by
+        simpa [h_fit, h_true_fn]
+      have h_pred0 : linearPredictor proj 0 c2 = predictorBase proj c2 := by
+        simpa [h_pred]
+      simpa [h_pred0] using h_fit0
+    have hs2 : predictorSlope proj c2 = (f 1 - f 0) := by
+      linarith
+    rw [hs1, hs2]
+
+  unfold predictorSlope at h_slope_const
+
+  constructor
+  intro i l s
+  have hi : i = 0 := by apply Subsingleton.elim
+  subst hi
+
+  have h_S_zero_at_zero : ∀ l, evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 l) 0 = 0 := by
+    intro l
+    rw [h_spline]
+    simp [evalSmooth, polynomialSplineBasis]
+
+  have h_Sl_zero : ∀ x, ∑ s, (proj.fₘₗ 0 l) s * x ^ (s.val + 1) = 0 := by
+    intro x
+    let c : Fin k → ℝ := fun j => if j = l then x else 0
+    have h_eq := h_slope_const c (fun _ => 0)
+    have h_sum_c' : ∑ j, evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 j) (c j) = evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 l) (c l) := by
+      classical
+      have h_sum_c'' :
+          (Finset.sum (s:=Finset.univ)
+            (f:=fun j => evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 j) (c j)) : ℝ) =
+            evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 l) (c l) := by
+        refine (Finset.sum_eq_single (s:=Finset.univ)
+          (f:=fun j => evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 j) (c j)) l ?_ ?_)
+        · intro j _ h_ne
+          have h_cj : c j = 0 := by simp [c, h_ne]
+          simp [h_cj, h_S_zero_at_zero]
+        · intro h_not_mem
+          exfalso; exact h_not_mem (Finset.mem_univ l)
+      simpa using h_sum_c''
+    have h_sum_c : ∑ j, evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 j) (c j) = evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 l) x := by
+      simpa [c] using h_sum_c'
+    have h_sum_0 : ∑ j, evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 j) 0 = 0 := by
+      classical
+      have h_sum_0' :
+          (Finset.sum (s:=Finset.univ)
+            (f:=fun j => evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 j) 0) : ℝ) = 0 := by
+        refine (Finset.sum_eq_zero (s:=Finset.univ)
+          (f:=fun j => evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 j) 0) ?_)
+        intro j _
+        simpa using h_S_zero_at_zero j
+      simpa using h_sum_0'
+    have h_eq' : evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 l) x = 0 := by
+      have h_eq' := congrArg (fun t => t - proj.γₘ₀ 0) h_eq
+      calc
+        evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 l) x
+            = ∑ j, evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 j) (c j) := by
+              symm; exact h_sum_c
+        _ = ∑ j, evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 j) 0 := by
+              simpa using h_eq'
+        _ = 0 := h_sum_0
+    have h_eq'' : ∑ s, (proj.fₘₗ 0 l) s * x ^ (s.val + 1) = 0 := by
+      simpa [h_spline, evalSmooth, polynomialSplineBasis] using h_eq'
+    exact h_eq''
+
+  have h_poly := polynomial_spline_coeffs_unique (proj.fₘₗ 0 l) h_Sl_zero s
+  exact h_poly
+
+
+theorem independence_implies_no_interaction (k sp : ℕ) [Fintype (Fin k)] [Fintype (Fin sp)] (dgp : DataGeneratingProcess k)
+    (h_additive : ∃ (f : ℝ → ℝ) (g : Fin k → ℝ → ℝ), dgp.trueExpectation = fun p c => f p + ∑ i, g i (c i))
+    (m : PhenotypeInformedGAM 1 k sp)
+    (h_spline : m.pcSplineBasis = polynomialSplineBasis sp)
+    (h_pgs : m.pgsBasis = linearPGSBasis)
+    (h_fit : ∀ p c, linearPredictor m p c = dgp.trueExpectation p c) :
+    IsNormalizedScoreModel m := by
+  rcases h_additive with ⟨f, g, h_fn_struct⟩
+  exact l2_projection_of_additive_is_additive k sp h_fn_struct m h_spline h_pgs h_fit
+
+structure DGPWithEnvironment (k : ℕ) where
+  to_dgp : DataGeneratingProcess k
+  environmentalEffect : (Fin k → ℝ) → ℝ
+  trueGeneticEffect : ℝ → ℝ
+  is_additive_causal : to_dgp.trueExpectation = fun p c => trueGeneticEffect p + environmentalEffect c
+
+theorem prediction_causality_tradeoff_linear_case [Fact (p = 1)] (sp : ℕ) [Fintype (Fin sp)]
+    (dgp_env : DGPWithEnvironment 1)
+    (h_gen : dgp_env.trueGeneticEffect = fun p => 2 * p)
+    (h_env : dgp_env.environmentalEffect = fun c => 3 * (c ⟨0, by norm_num⟩))
+    (h_confounding : ∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂dgp_env.to_dgp.jointMeasure ≠ 0)
+    (model : PhenotypeInformedGAM 1 1 sp)
+    (h_opt : IsBayesOptimalInRawClass dgp_env.to_dgp model)
+    (h_pgs_basis_linear : model.pgsBasis.B 1 = id ∧ model.pgsBasis.B 0 = fun _ => 1)
+    (hP0 : ∫ pc, pc.1 ∂dgp_env.to_dgp.jointMeasure = 0)
+    (_hC0 : ∫ pc, pc.2 ⟨0, by norm_num⟩ ∂dgp_env.to_dgp.jointMeasure = 0)
+    (hP2 : ∫ pc, pc.1^2 ∂dgp_env.to_dgp.jointMeasure = 1)
+    (hP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1) dgp_env.to_dgp.jointMeasure)
+    (hC_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.2 ⟨0, by norm_num⟩) dgp_env.to_dgp.jointMeasure)
+    (hP2_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1 ^ 2) dgp_env.to_dgp.jointMeasure)
+    (hPC_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1 * pc.2 ⟨0, by norm_num⟩) dgp_env.to_dgp.jointMeasure)
+    (hY_int : Integrable (fun pc => dgp_env.to_dgp.trueExpectation pc.1 pc.2) dgp_env.to_dgp.jointMeasure)
+    (hYP_int : Integrable (fun pc => dgp_env.to_dgp.trueExpectation pc.1 pc.2 * pc.1) dgp_env.to_dgp.jointMeasure)
+    (h_resid_sq_int : Integrable (fun pc => (dgp_env.to_dgp.trueExpectation pc.1 pc.2 - (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1))^2) dgp_env.to_dgp.jointMeasure) :
+    model.γₘ₀ ⟨0, by norm_num⟩ ≠ 2 := by
+  -- The true DGP is Y = 2P + 3C.
+  have h_Y_def : dgp_env.to_dgp.trueExpectation = fun p c => 2 * p + 3 * c ⟨0, by norm_num⟩ := by
+    rw [dgp_env.is_additive_causal, h_gen, h_env]
+
+  -- Step 1: Use optimality to get the normal equations.
+  let model_1_1_sp := model
+  have h_orth := rawOptimal_implies_orthogonality_gen model_1_1_sp dgp_env.to_dgp h_opt h_pgs_basis_linear.1 hY_int hP_int hP2_int hYP_int h_resid_sq_int
+  set a := model.γ₀₀ with ha_def
+  set b := model.γₘ₀ ⟨0, by norm_num⟩ with hb_def
+  obtain ⟨h_orth_1, h_orth_P⟩ := h_orth
+
+  -- Step 2: Use the normal equations to solve for the coefficient `b`.
+  have hb : b = ∫ pc, dgp_env.to_dgp.trueExpectation pc.1 pc.2 * pc.1 ∂dgp_env.to_dgp.jointMeasure := by
+    exact optimal_slope_eq_covariance_of_normalized_p dgp_env.to_dgp.jointMeasure (fun pc => dgp_env.to_dgp.trueExpectation pc.1 pc.2) a b hY_int hP_int hYP_int hP2_int hP0 hP2 h_orth_P
+
+  -- Step 3: Calculate E[Y*P] for this DGP.
+  -- E[Y*P] = E[(2P + 3C)P] = 2*E[P^2] + 3*E[PC] = 2 + 3*E[PC].
+  have h_E_YP : ∫ pc, dgp_env.to_dgp.trueExpectation pc.1 pc.2 * pc.1 ∂dgp_env.to_dgp.jointMeasure = 2 + 3 * ∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂dgp_env.to_dgp.jointMeasure := by
+    rw [h_Y_def]
+    have h_expand: (fun (pc : ℝ × (Fin 1 → ℝ)) => (2 * pc.1 + 3 * pc.2 ⟨0, by norm_num⟩) * pc.1) = (fun (pc : ℝ × (Fin 1 → ℝ)) => 2 * pc.1^2 + 3 * (pc.1 * pc.2 ⟨0, by norm_num⟩)) := by
+      funext pc; ring
+    rw [h_expand]
+    have h2P2_int := hP2_int.const_mul 2
+    have h3PC_int := hPC_int.const_mul 3
+    rw [integral_add h2P2_int h3PC_int, integral_const_mul, integral_const_mul, hP2]
+    ring
+
+  -- Step 4: Combine the results to show b ≠ 2.
+  -- We have b = E[YP] = 2 + 3*E[PC]. The goal is b ≠ 2, which is true iff E[PC] ≠ 0.
+  intro h_b_eq_2
+  rw [hb, h_E_YP] at h_b_eq_2
+  have h_E_PC_zero : ∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂dgp_env.to_dgp.jointMeasure = 0 := by
+    linarith
+  -- This contradicts the `h_confounding` hypothesis.
+  exact h_confounding h_E_PC_zero
+
+def total_params (p k sp : ℕ) : ℕ := 1 + p + k*sp + p*k*sp
+
+/-! ### Parameter Vectorization Infrastructure
+
+To prove identifiability, we vectorize the GAM parameters into a single vector β ∈ ℝ^d,
+then show the loss is a strictly convex quadratic in β.
+
+**Key insight**: Define a structured index type `ParamIx` to avoid Fin arithmetic hell.
+Then define packParams/unpackParams through this structured type. -/
+
+/-- Structured parameter index type.
+    This avoids painful Fin arithmetic by giving semantic meaning to each parameter block. -/
+inductive ParamIx (p k sp : ℕ)
+  | intercept                         -- γ₀₀: 1 parameter
+  | pgsCoeff (m : Fin p)              -- γₘ₀: p parameters
+  | pcSpline (l : Fin k) (j : Fin sp) -- f₀ₗ: k*sp parameters
+  | interaction (m : Fin p) (l : Fin k) (j : Fin sp) -- fₘₗ: p*k*sp parameters
+  deriving DecidableEq
+
+abbrev ParamIxSum (p k sp : ℕ) :=
+  Sum Unit (Sum (Fin p) (Sum (Fin k × Fin sp) (Fin p × Fin k × Fin sp)))
+
+def ParamIx.equivSum (p k sp : ℕ) : ParamIx p k sp ≃ ParamIxSum p k sp where
+  toFun
+    | .intercept => Sum.inl ()
+    | .pgsCoeff m => Sum.inr (Sum.inl m)
+    | .pcSpline l j => Sum.inr (Sum.inr (Sum.inl (l, j)))
+    | .interaction m l j => Sum.inr (Sum.inr (Sum.inr (m, l, j)))
+  invFun
+    | Sum.inl _ => .intercept
+    | Sum.inr (Sum.inl m) => .pgsCoeff m
+    | Sum.inr (Sum.inr (Sum.inl (l, j))) => .pcSpline l j
+    | Sum.inr (Sum.inr (Sum.inr (m, l, j))) => .interaction m l j
+  left_inv := by
+    intro x
+    cases x <;> rfl
+  right_inv := by
+    intro x
+    cases x with
+    | inl u =>
+      cases u
+      rfl
+    | inr x =>
+      cases x with
+      | inl m =>
+        rfl
+      | inr x =>
+        cases x with
+        | inl lj =>
+          rcases lj with ⟨l, j⟩
+          rfl
+        | inr mlj =>
+          rcases mlj with ⟨m, l, j⟩
+          rfl
+
+instance (p k sp : ℕ) : Fintype (ParamIx p k sp) :=
+  Fintype.ofEquiv (ParamIxSum p k sp) (ParamIx.equivSum p k sp).symm
+
+lemma ParamIx_card (p k sp : ℕ) : Fintype.card (ParamIx p k sp) = total_params p k sp := by
+  classical
+  -- `simp` computes the card but leaves some reassociation/`mul_assoc` goals.
+  simpa [ParamIxSum, total_params, Nat.add_assoc, Nat.add_left_comm, Nat.add_comm, Nat.mul_assoc] using
+    (Fintype.card_congr (ParamIx.equivSum p k sp))
+
+/-- Parameter vector type: flattens all GAM coefficients into a single vector. -/
+abbrev ParamVec (p k sp : ℕ) := ParamIx p k sp → ℝ
+
+/-- Model class restriction: same basis, same link, same distribution.
+    Without this, the same predictor can be represented with different parameters. -/
+structure InModelClass {p k sp : ℕ} (m : PhenotypeInformedGAM p k sp)
+    (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp) : Prop where
+  basis_match : m.pgsBasis = pgsBasis
+  spline_match : m.pcSplineBasis = splineBasis
+  link_identity : m.link = .identity
+  dist_gaussian : m.dist = .Gaussian
+
+/-- Pack GAM parameters into a vector using the structured ParamIx.
+    Each coefficient is placed at its corresponding flat index. -/
+noncomputable def packParams {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
+    (m : PhenotypeInformedGAM p k sp) : ParamVec p k sp :=
+  fun j =>
+    match j with
+    | .intercept => m.γ₀₀
+    | .pgsCoeff m0 => m.γₘ₀ m0
+    | .pcSpline l s => m.f₀ₗ l s
+    | .interaction m0 l s => m.fₘₗ m0 l s
+
+/-- Unpack a vector into GAM parameters (inverse of packParams). -/
+noncomputable def unpackParams {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
+    (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp)
+    (β : ParamVec p k sp) : PhenotypeInformedGAM p k sp :=
+  { pgsBasis := pgsBasis
+    pcSplineBasis := splineBasis
+    γ₀₀ := β .intercept
+    γₘ₀ := fun m => β (.pgsCoeff m)
+    f₀ₗ := fun l j => β (.pcSpline l j)
+    fₘₗ := fun m l j => β (.interaction m l j)
+    link := .identity
+    dist := .Gaussian }
+
+/-- Pack and unpack are inverses within the model class. -/
+lemma unpack_pack_eq {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
+    (m : PhenotypeInformedGAM p k sp) (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp)
+    (hm : InModelClass m pgsBasis splineBasis) :
+    unpackParams pgsBasis splineBasis (packParams m) = m := by
+  cases m with
+  | mk m_pgsBasis m_splineBasis m_γ00 m_γm0 m_f0l m_fml m_link m_dist =>
+    rcases hm with ⟨hbasis, hspline, hlink, hdist⟩
+    cases hbasis
+    cases hspline
+    cases hlink
+    cases hdist
+    rfl
+
+/-- The design matrix for the penalized GAM.
+    This corresponds to the construction in `basis.rs` and `construction.rs`.
+
+    Block structure (columns indexed by ParamIx):
+    - intercept: constant 1
+    - pgsCoeff m: B_{m+1}(pgs_i)
+    - pcSpline l j: splineBasis.B[j](c_i[l])
+    - interaction m l j: B_{m+1}(pgs_i) * splineBasis.B[j](c_i[l])
+
+    Uses structured indices for clean column dispatch. -/
+noncomputable def designMatrix {n p k sp : ℕ} [Fintype (Fin n)] [Fintype (Fin p)]
+    [Fintype (Fin k)] [Fintype (Fin sp)]
+    (data : RealizedData n k) (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp)
+    : Matrix (Fin n) (ParamIx p k sp) ℝ :=
+  Matrix.of fun i j =>
+    match j with
+    | .intercept => 1
+    | .pgsCoeff m =>
+        pgsBasis.B ⟨m.val + 1, by simpa using (Nat.succ_lt_succ m.isLt)⟩ (data.p i)
+    | .pcSpline l s => splineBasis.b s (data.c i l)
+    | .interaction m l s =>
+        pgsBasis.B ⟨m.val + 1, by simpa using (Nat.succ_lt_succ m.isLt)⟩ (data.p i) *
+          splineBasis.b s (data.c i l)
+
+/-- **Key Lemma**: Linear predictor equals design matrix times parameter vector.
+    This is the bridge between the GAM structure and linear algebra.
+
+    Proof strategy: Both sides compute the same sum over parameter blocks:
+    - γ₀₀ * 1 (intercept)
+    - Σ_m γₘ₀ * B_{m+1}(pgs) (PGS main effects)
+    - Σ_l Σ_j f₀ₗ[l,j] * spline_j(c[l]) (PC main effects)
+    - Σ_m Σ_l Σ_j fₘₗ[m,l,j] * B_{m+1}(pgs) * spline_j(c[l]) (interactions)
+
+    The key is that packParams and designMatrix are defined consistently via ParamIx. -/
+lemma linearPredictor_eq_designMatrix_mulVec {n p k sp : ℕ}
+    [Fintype (Fin n)] [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
+    (data : RealizedData n k) (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp)
+    (m : PhenotypeInformedGAM p k sp) (hm : InModelClass m pgsBasis splineBasis) :
+    ∀ i : Fin n, linearPredictor m (data.p i) (data.c i) =
+      (designMatrix data pgsBasis splineBasis).mulVec (packParams m) i := by
+  classical
+  intro i
+  rcases hm with ⟨h_pgs, h_spline, _, _⟩
+  subst h_pgs
+  subst h_spline
+  -- Rewrite the RHS sum over ParamIx into explicit blocks.
+  have hsum_paramix :
+      (∑ x : ParamIx p k sp,
+          (match x with
+            | ParamIx.intercept => m.γ₀₀
+            | ParamIx.pgsCoeff m0 => m.γₘ₀ m0
+            | ParamIx.pcSpline l s => m.f₀ₗ l s
+            | ParamIx.interaction m0 l s => m.fₘₗ m0 l s) *
+          match x with
+          | ParamIx.intercept => 1
+          | ParamIx.pgsCoeff m_1 => m.pgsBasis.B ⟨m_1.val + 1, by simpa using (Nat.succ_lt_succ m_1.isLt)⟩ (data.p i)
+          | ParamIx.pcSpline l s => m.pcSplineBasis.b s (data.c i l)
+          | ParamIx.interaction m_1 l s =>
+              m.pgsBasis.B ⟨m_1.val + 1, by simpa using (Nat.succ_lt_succ m_1.isLt)⟩ (data.p i) *
+                m.pcSplineBasis.b s (data.c i l)) =
+      m.γ₀₀
+      + (∑ mIdx, m.pgsBasis.B
+          ⟨mIdx.val + 1, by simpa using (Nat.succ_lt_succ mIdx.isLt)⟩ (data.p i) * m.γₘ₀ mIdx
+        + (∑ lj : Fin k × Fin sp,
+            m.pcSplineBasis.b lj.2 (data.c i lj.1) * m.f₀ₗ lj.1 lj.2
+          + ∑ mlj : Fin p × Fin k × Fin sp,
+              m.pgsBasis.B
+                ⟨mlj.1.val + 1, by simpa using (Nat.succ_lt_succ mlj.1.isLt)⟩ (data.p i) *
+                (m.pcSplineBasis.b mlj.2.2 (data.c i mlj.2.1) * m.fₘₗ mlj.1 mlj.2.1 mlj.2.2))) := by
+    -- Convert the sum over ParamIx using the equivalence to a sum type, then split.
+    let g : ParamIxSum p k sp → ℝ
+      | Sum.inl _ => m.γ₀₀
+      | Sum.inr (Sum.inl mIdx) =>
+          m.pgsBasis.B
+            ⟨mIdx.val + 1, by simpa using (Nat.succ_lt_succ mIdx.isLt)⟩ (data.p i) * m.γₘ₀ mIdx
+      | Sum.inr (Sum.inr (Sum.inl (l, j))) =>
+          m.pcSplineBasis.b j (data.c i l) * m.f₀ₗ l j
+      | Sum.inr (Sum.inr (Sum.inr (mIdx, l, j))) =>
+          m.pgsBasis.B
+            ⟨mIdx.val + 1, by simpa using (Nat.succ_lt_succ mIdx.isLt)⟩ (data.p i) *
+            (m.pcSplineBasis.b j (data.c i l) * m.fₘₗ mIdx l j)
+    have hsum' :
+        (∑ x : ParamIx p k sp,
+            (match x with
+              | ParamIx.intercept => m.γ₀₀
+              | ParamIx.pgsCoeff m0 => m.γₘ₀ m0
+              | ParamIx.pcSpline l s => m.f₀ₗ l s
+              | ParamIx.interaction m0 l s => m.fₘₗ m0 l s) *
+            match x with
+            | ParamIx.intercept => 1
+            | ParamIx.pgsCoeff m_1 => m.pgsBasis.B ⟨m_1.val + 1, by simpa using (Nat.succ_lt_succ m_1.isLt)⟩ (data.p i)
+            | ParamIx.pcSpline l s => m.pcSplineBasis.b s (data.c i l)
+            | ParamIx.interaction m_1 l s =>
+                m.pgsBasis.B ⟨m_1.val + 1, by simpa using (Nat.succ_lt_succ m_1.isLt)⟩ (data.p i) *
+                  m.pcSplineBasis.b s (data.c i l)) =
+          ∑ x : ParamIxSum p k sp, g x := by
+      refine (Fintype.sum_equiv (ParamIx.equivSum p k sp) _ g ?_)
+      intro x
+      cases x <;> simp [g, ParamIx.equivSum, mul_assoc, mul_left_comm, mul_comm]
+    -- Split the sum over the nested Sum type.
+    simpa [ParamIxSum, g] using hsum'
+  -- Expand linearPredictor and match sums (convert double sums to pair sums).
+  have hsum_pc :
+      (∑ l, ∑ j, m.pcSplineBasis.b j (data.c i l) * m.f₀ₗ l j) =
+        ∑ lj : Fin k × Fin sp, m.pcSplineBasis.b lj.2 (data.c i lj.1) * m.f₀ₗ lj.1 lj.2 := by
+    classical
+    simpa using
+      (Finset.sum_product (s := Finset.univ) (t := Finset.univ)
+        (f := fun lj => m.pcSplineBasis.b lj.2 (data.c i lj.1) * m.f₀ₗ lj.1 lj.2)).symm
+  have hsum_int :
+      (∑ mIdx, ∑ l, ∑ j,
+          m.pgsBasis.B
+            ⟨mIdx.val + 1, by simpa using (Nat.succ_lt_succ mIdx.isLt)⟩ (data.p i) *
+            (m.pcSplineBasis.b j (data.c i l) * m.fₘₗ mIdx l j)) =
+        ∑ mlj : Fin p × Fin k × Fin sp,
+          m.pgsBasis.B
+            ⟨mlj.1.val + 1, by simpa using (Nat.succ_lt_succ mlj.1.isLt)⟩ (data.p i) *
+            (m.pcSplineBasis.b mlj.2.2 (data.c i mlj.2.1) * m.fₘₗ mlj.1 mlj.2.1 mlj.2.2) := by
+    classical
+    -- First convert the inner (l, j) sums into a sum over pairs.
+    have hsum_inner :
+        (∑ mIdx, ∑ l, ∑ j,
+            m.pgsBasis.B
+              ⟨mIdx.val + 1, by simpa using (Nat.succ_lt_succ mIdx.isLt)⟩ (data.p i) *
+              (m.pcSplineBasis.b j (data.c i l) * m.fₘₗ mIdx l j)) =
+          ∑ mIdx, ∑ lj : Fin k × Fin sp,
+            m.pgsBasis.B
+              ⟨mIdx.val + 1, by simpa using (Nat.succ_lt_succ mIdx.isLt)⟩ (data.p i) *
+              (m.pcSplineBasis.b lj.2 (data.c i lj.1) * m.fₘₗ mIdx lj.1 lj.2) := by
+      refine Finset.sum_congr rfl ?_
+      intro mIdx _
+      simpa using
+        (Finset.sum_product (s := Finset.univ) (t := Finset.univ)
+          (f := fun lj =>
+            m.pgsBasis.B
+              ⟨mIdx.val + 1, by simpa using (Nat.succ_lt_succ mIdx.isLt)⟩ (data.p i) *
+              (m.pcSplineBasis.b lj.2 (data.c i lj.1) * m.fₘₗ mIdx lj.1 lj.2))).symm
+    -- Then combine mIdx with (l, j) into a single product sum.
+    calc
+      (∑ mIdx, ∑ l, ∑ j,
+          m.pgsBasis.B
+            ⟨mIdx.val + 1, by simpa using (Nat.succ_lt_succ mIdx.isLt)⟩ (data.p i) *
