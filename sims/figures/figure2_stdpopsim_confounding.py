@@ -854,7 +854,8 @@ def _run_prs_and_predict(
 
 def _cleanup_seed_artifacts(prefix: Path, seed_work_dir: Path) -> None:
     _log(f"[{prefix.name}] Cleaning seed artifacts")
-    for ext in (".bed", ".bim", ".fam", ".log", ".tsv", ".vcf"):
+    # Keep .bed/.bim/.fam/.tsv for later --use-existing reuse.
+    for ext in (".log", ".vcf"):
         p = Path(f"{prefix}{ext}")
         if p.exists():
             p.unlink(missing_ok=True)
