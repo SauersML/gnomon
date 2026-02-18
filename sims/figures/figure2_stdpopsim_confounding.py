@@ -7,6 +7,7 @@ import os
 import time
 import shutil
 import sys
+import tempfile
 from datetime import datetime
 from multiprocessing import shared_memory
 from pathlib import Path
@@ -519,6 +520,7 @@ def _simulate(
     ancestry_census_time: float,
     ancestry_threads: int,
 ) -> pd.DataFrame:
+    out_dir.mkdir(parents=True, exist_ok=True)
     run_id = f"fig2_s{seed}"
     total_steps = 14
     run_t0 = time.perf_counter()
@@ -695,7 +697,8 @@ def _simulate(
     _stage_done(run_id, "dataframe build", t0)
 
     prefix = out_dir / f"fig2_s{seed}"
-    vcf = prefix.with_suffix(".vcf")
+    vcf_tmp_dir = Path(tempfile.mkdtemp(prefix=f"{run_id}_vcf_"))
+    vcf = vcf_tmp_dir / f"{run_id}.vcf"
     _stage_mark(run_id, 12, total_steps, "write VCF")
     _log(f"[{run_id}] Writing VCF to {vcf}")
     t0 = time.perf_counter()
@@ -706,13 +709,17 @@ def _simulate(
     _stage_mark(run_id, 13, total_steps, "VCF->PLINK conversion")
     _log(f"[{run_id}] Converting VCF to PLINK")
     t0 = time.perf_counter()
-    run_plink_conversion(
-        str(vcf),
-        str(prefix),
-        cm_map_path=None,
-        threads=plink_threads,
-        memory_mb=plink_memory_mb,
-    )
+    try:
+        run_plink_conversion(
+            str(vcf),
+            str(prefix),
+            cm_map_path=None,
+            threads=plink_threads,
+            memory_mb=plink_memory_mb,
+        )
+    finally:
+        vcf.unlink(missing_ok=True)
+        shutil.rmtree(vcf_tmp_dir, ignore_errors=True)
     _stage_done(run_id, "PLINK conversion", t0)
     bim_path = prefix.with_suffix(".bim")
     bim_n_variants = sum(1 for _ in open(bim_path, "r", encoding="utf-8", errors="replace"))
@@ -730,11 +737,10 @@ def _simulate(
         f"[{run_id}] Sample-variant diagnostics: "
         f"bim_variants={bim_n_variants}, overlap_true_effect_positions={overlap_bim_true_effect}"
     )
-    vcf.unlink(missing_ok=True)
-
     _stage_mark(run_id, 14, total_steps, "write simulation table")
     _log(f"[{run_id}] Writing simulation table to {prefix.with_suffix('.tsv')}")
     t0 = time.perf_counter()
+    out_dir.mkdir(parents=True, exist_ok=True)
     df.to_csv(prefix.with_suffix(".tsv"), sep="\t", index=False)
     _stage_done(run_id, "write simulation table", t0)
     _stage_done(run_id, "simulation stage total", run_t0)
@@ -1158,6 +1164,7 @@ def main() -> None:
                 }
             )
 
+    out_dir.mkdir(parents=True, exist_ok=True)
     res = pd.DataFrame(rows)
     res.to_csv(out_dir / "figure2_auc_by_method_population.tsv", sep="\t", index=False)
     _log("[fig2] Wrote figure2_auc_by_method_population.tsv")
@@ -1190,6 +1197,7 @@ def main() -> None:
         part["y_prob"] = np.asarray(y_prob, dtype=float)
         pred_rows.append(part)
     pred_df = pd.concat(pred_rows, ignore_index=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
     pred_df.to_csv(out_dir / "figure2_test_predictions.tsv", sep="\t", index=False)
     _log("[fig2] Wrote figure2_test_predictions.tsv")
 
