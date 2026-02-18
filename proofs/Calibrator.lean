@@ -1,5 +1,6 @@
 import Mathlib.Tactic
 import Mathlib.Analysis.Calculus.Deriv.Basic
+import Mathlib.Analysis.Calculus.Deriv.Mul
 import Mathlib.Analysis.Calculus.Deriv.Inv
 import Mathlib.Analysis.Convex.Strict
 import Mathlib.Analysis.Convex.Jensen
@@ -4425,14 +4426,42 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
 
 /-- Orthogonal projection onto a finite-dimensional subspace. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  0  -- Placeholder; proper implementation would use Mathlib's orthogonalProjection
+  let equiv := WithLp.linearEquiv 2 ℝ (fun _ : Fin n => ℝ)
+  let K_E := K.map equiv
+  let p_E := Submodule.orthogonalProjection K_E (equiv y)
+  equiv.symm p_E.1
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
     iff p minimizes distance to y among all points in K. -/
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
-    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist y p ≤ dist y w) :
+    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, l2norm_sq (y - p) ≤ l2norm_sq (y - w)) :
     p = orthogonalProjection K y := by
-  sorry
+  let equiv := WithLp.linearEquiv 2 ℝ (fun _ : Fin n => ℝ)
+  let K_E := K.map equiv
+  let y_E := equiv y
+  let p_E := equiv p
+  have h_mem_E : p_E ∈ K_E := Submodule.mem_map_of_mem h_mem
+  have h_norm_eq : ∀ v, l2norm_sq v = ‖equiv v‖^2 := by
+    intro v
+    simp only [l2norm_sq, PiLp.norm_sq_eq_of_L2]
+    rfl
+  have h_dist_le : ∀ w_E ∈ K_E, dist y_E p_E ≤ dist y_E w_E := by
+    intro w_E hw_E
+    obtain ⟨w, hw, rfl⟩ := Submodule.mem_map.mp hw_E
+    specialize h_min w hw
+    rw [h_norm_eq, h_norm_eq] at h_min
+    rw [← LinearEquiv.map_sub, ← LinearEquiv.map_sub] at h_min
+    rw [dist_eq_norm, dist_eq_norm, sq_le_sq] at h_min
+    exact h_min
+    exact norm_nonneg _
+    exact norm_nonneg _
+  have h_proj : p_E = Submodule.orthogonalProjection K_E y_E := by
+    symm; apply Submodule.orthogonalProjection_eq_of_dist_le h_mem_E
+    intro u hu; exact h_dist_le u hu
+  apply_fun equiv.symm at h_proj
+  simp only [LinearEquiv.symm_apply_apply] at h_proj
+  rw [orthogonalProjection]
+  exact h_proj
 
 set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
@@ -6103,8 +6132,8 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
               have h_jacobi : ∀ σ : Equiv.Perm m, deriv (fun rho => ∏ i : m, M rho ((σ : m → m) i) i) rho = ∑ i : m, (∏ j ∈ Finset.univ.erase i, M rho ((σ : m → m) j) j) * deriv (fun rho => M rho ((σ : m → m) i) i) rho := by
                 intro σ
                 have h_prod_rule : ∀ (f : m → ℝ → ℝ), (∀ i, DifferentiableAt ℝ (f i) rho) → deriv (fun rho => ∏ i, f i rho) rho = ∑ i, (∏ j ∈ Finset.univ.erase i, f j rho) * deriv (f i) rho := by
-                  -- exact?
-                  admit
+                  intro f hf
+                  rw [deriv_finset_prod (fun i _ => hf i)]
                 apply h_prod_rule
                 intro i
                 exact DifferentiableAt.comp rho ( differentiableAt_pi.1 ( differentiableAt_pi.1 hM_diff _ ) _ ) differentiableAt_id
