@@ -1,6 +1,7 @@
 import Mathlib.Tactic
 import Mathlib.Analysis.Calculus.Deriv.Basic
 import Mathlib.Analysis.Calculus.Deriv.Inv
+import Mathlib.Analysis.Calculus.Deriv.Mul
 import Mathlib.Analysis.Convex.Strict
 import Mathlib.Analysis.Convex.Jensen
 import Mathlib.Analysis.Convex.SpecificFunctions.Basic
@@ -4425,14 +4426,46 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
 
 /-- Orthogonal projection onto a finite-dimensional subspace. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  0  -- Placeholder; proper implementation would use Mathlib's orthogonalProjection
+  let equiv := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K_E : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map equiv.symm
+  let y_E : EuclideanSpace ℝ (Fin n) := equiv.symm y
+  let p_E := InnerProductSpace.orthogonalProjection K_E y_E
+  equiv p_E
+
+lemma l2norm_sq_eq_norm_sq {n : ℕ} (v : Fin n → ℝ) :
+    l2norm_sq v = ‖(WithLp.linearEquiv 2 ℝ (Fin n → ℝ)).symm v‖^2 := by
+  simp [l2norm_sq, PiLp.norm_sq_eq_of_L2]
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
-    iff p minimizes distance to y among all points in K. -/
+    iff p minimizes L2 distance to y among all points in K. -/
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
-    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist y p ≤ dist y w) :
+    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, l2norm_sq (y - p) ≤ l2norm_sq (y - w)) :
     p = orthogonalProjection K y := by
-  sorry
+  let equiv := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K_E : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map equiv.symm
+  let y_E : EuclideanSpace ℝ (Fin n) := equiv.symm y
+  let p_E : EuclideanSpace ℝ (Fin n) := equiv.symm p
+
+  have h_min_E : ∀ w_E ∈ K_E, ‖y_E - p_E‖^2 ≤ ‖y_E - w_E‖^2 := by
+    intro w_E hw_E
+    obtain ⟨w, hw, rfl⟩ := (Submodule.mem_map).mp hw_E
+    specialize h_min w hw
+    simp only [l2norm_sq_eq_norm_sq] at h_min
+    rw [← map_sub, ← map_sub] at h_min
+    exact h_min
+
+  have h_proj : p_E = InnerProductSpace.orthogonalProjection K_E y_E := by
+     apply InnerProductSpace.orthogonalProjection_eq_of_dist_le
+     · exact (Submodule.mem_map).mpr ⟨p, h_mem, rfl⟩
+     · intro w_E hw_E
+       rw [dist_eq_norm, dist_eq_norm]
+       rw [← sq_le_sq, abs_of_nonneg (norm_nonneg _), abs_of_nonneg (norm_nonneg _)]
+       exact h_min_E w_E hw_E
+
+  unfold orthogonalProjection
+  dsimp
+  apply equiv.symm.injective
+  exact h_proj
 
 set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
@@ -6103,8 +6136,9 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
               have h_jacobi : ∀ σ : Equiv.Perm m, deriv (fun rho => ∏ i : m, M rho ((σ : m → m) i) i) rho = ∑ i : m, (∏ j ∈ Finset.univ.erase i, M rho ((σ : m → m) j) j) * deriv (fun rho => M rho ((σ : m → m) i) i) rho := by
                 intro σ
                 have h_prod_rule : ∀ (f : m → ℝ → ℝ), (∀ i, DifferentiableAt ℝ (f i) rho) → deriv (fun rho => ∏ i, f i rho) rho = ∑ i, (∏ j ∈ Finset.univ.erase i, f j rho) * deriv (f i) rho := by
-                  -- exact?
-                  admit
+                  intro f h_diff
+                  rw [deriv_finset_prod]
+                  exact h_diff
                 apply h_prod_rule
                 intro i
                 exact DifferentiableAt.comp rho ( differentiableAt_pi.1 ( differentiableAt_pi.1 hM_diff _ ) _ ) differentiableAt_id
@@ -6114,8 +6148,7 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
                   have h_diff : ∀ i : m, DifferentiableAt ℝ (fun rho => M rho ((σ : m → m) i) i) rho := by
                     intro i
                     exact DifferentiableAt.comp rho ( differentiableAt_pi.1 ( differentiableAt_pi.1 hM_diff _ ) _ ) differentiableAt_id
-                  -- exact?
-                  admit
+                  exact DifferentiableAt.finset_prod h_diff
                 norm_num [ h_diff ]
               simpa only [ h_jacobi ] using h_deriv_sum
             simp +decide only [h_jacobi, Finset.mul_sum _ _ _]
