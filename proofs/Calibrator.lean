@@ -2063,6 +2063,11 @@ def dotProduct' {ι : Type*} [Fintype ι] (u v : ι → ℝ) : ℝ :=
 def l2norm_sq {ι : Type*} [Fintype ι] (v : ι → ℝ) : ℝ :=
   Finset.univ.sum (fun i => v i ^ 2)
 
+lemma l2norm_sq_eq_norm_sq {ι : Type*} [Fintype ι] (v : ι → ℝ) :
+    l2norm_sq v = ‖(WithLp.linearEquiv 2 ℝ (ι → ℝ) v)‖^2 := by
+  rw [real_inner_self_eq_norm_sq, PiLp.inner_apply]
+  simp [l2norm_sq]
+
 /-- XᵀX is positive definite when X has full column rank.
     This is the algebraic foundation for uniqueness of least squares.
 
@@ -4425,14 +4430,75 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
 
 /-- Orthogonal projection onto a finite-dimensional subspace. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  0  -- Placeholder; proper implementation would use Mathlib's orthogonalProjection
+  let equiv := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K_E : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map equiv
+  haveI : FiniteDimensional ℝ (EuclideanSpace ℝ (Fin n)) := by infer_instance
+  haveI : CompleteSpace K_E := FiniteDimensional.complete _
+  let proj := Submodule.orthogonalProjection K_E (equiv y)
+  equiv.symm proj
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
     iff p minimizes distance to y among all points in K. -/
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
-    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist y p ≤ dist y w) :
+    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, l2norm_sq (y - p) ≤ l2norm_sq (y - w)) :
     p = orthogonalProjection K y := by
-  sorry
+  let equiv := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K_E : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map equiv
+  haveI : FiniteDimensional ℝ (EuclideanSpace ℝ (Fin n)) := by infer_instance
+  haveI : CompleteSpace K_E := FiniteDimensional.complete _
+  let y_E := equiv y
+  let p_E := equiv p
+
+  have hp_E_mem : p_E ∈ K_E := by
+    simp [K_E, p_E, h_mem]
+
+  have h_min_E : ∀ w_E ∈ K_E, ‖y_E - p_E‖ ≤ ‖y_E - w_E‖ := by
+    intro w_E hw_E
+    obtain ⟨w, hw, rfl⟩ := (Submodule.mem_map _ _ _).mp hw_E
+    specialize h_min w hw
+    rw [l2norm_sq_eq_norm_sq (y - p), l2norm_sq_eq_norm_sq (y - w)] at h_min
+    simp only [map_sub] at h_min
+    rw [sq_le_sq] at h_min
+    exact h_min (norm_nonneg _) (norm_nonneg _)
+
+  have h_orth : ∀ w_E ∈ K_E, ⟪y_E - p_E, w_E⟫_ℝ = 0 := by
+    intro w_E hw_E
+    by_contra h_nz
+    have hw_nz : w_E ≠ 0 := by
+      intro h
+      rw [h, inner_zero_right] at h_nz
+      contradiction
+    let t : ℝ := ⟪y_E - p_E, w_E⟫_ℝ / ‖w_E‖^2
+    let w'_E := p_E + t • w_E
+    have hw'_E : w'_E ∈ K_E := K_E.add_mem hp_E_mem (K_E.smul_mem t hw_E)
+    have h_lt : ‖y_E - w'_E‖^2 < ‖y_E - p_E‖^2 := by
+      rw [norm_sub_sq_real, norm_sub_sq_real]
+      simp only [w'_E]
+      have h_inner : ⟪y_E - p_E, t • w_E⟫_ℝ = t * ⟪y_E - p_E, w_E⟫_ℝ := inner_smul_right _ _ _
+      have h_norm_sq : ‖t • w_E‖^2 = t^2 * ‖w_E‖^2 := by
+        rw [norm_smul, mul_pow, Real.norm_eq_abs, sq_abs]
+      rw [sub_add_eq_sub_sub, norm_sub_sq_real]
+      rw [h_inner, h_norm_sq]
+      dsimp [t]
+      have h_norm_sq_pos : 0 < ‖w_E‖^2 := by
+        rw [sq_pos_iff]
+        exact norm_ne_zero_iff.mpr hw_nz
+      have h_dot_sq_pos : 0 < ⟪y_E - p_E, w_E⟫_ℝ^2 := sq_pos_of_ne_zero h_nz
+      field_simp [h_norm_sq_pos.ne.symm]
+      ring_nf
+      simp only [pow_two] at h_norm_sq_pos h_dot_sq_pos ⊢
+      nlinarith
+    have h_le := h_min_E w'_E hw'_E
+    rw [← sq_le_sq] at h_le
+    linarith [h_le, norm_nonneg (y_E - w'_E), norm_nonneg (y_E - p_E)]
+
+  have h_eq : p_E = Submodule.orthogonalProjection K_E y_E := by
+    apply Eq.symm
+    apply Submodule.eq_orthogonalProjection_of_mem_of_inner_eq_zero hp_E_mem
+    exact h_orth
+
+  apply equiv.injective
+  simp [orthogonalProjection, h_eq]
 
 set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
