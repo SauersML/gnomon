@@ -1856,6 +1856,18 @@ lemma unpack_pack_eq {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype
     cases hdist
     rfl
 
+lemma pack_unpack_eq {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
+    (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp)
+    (beta : ParamVec p k sp) :
+    packParams (unpackParams pgsBasis splineBasis beta) = beta := by
+  ext j
+  cases j <;> simp [packParams, unpackParams]
+
+lemma unpackParams_in_class {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
+    (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp) (b : ParamVec p k sp) :
+    InModelClass (unpackParams pgsBasis splineBasis b) pgsBasis splineBasis := by
+  constructor <;> rfl
+
 /-- The design matrix for the penalized GAM.
     This corresponds to the construction in `basis.rs` and `construction.rs`.
 
@@ -2062,6 +2074,14 @@ def dotProduct' {ι : Type*} [Fintype ι] (u v : ι → ℝ) : ℝ :=
 /-- Squared L2 norm for functions on a finite index type. -/
 def l2norm_sq {ι : Type*} [Fintype ι] (v : ι → ℝ) : ℝ :=
   Finset.univ.sum (fun i => v i ^ 2)
+
+lemma l2norm_sq_eq_norm_sq {n : ℕ} (x : Fin n → ℝ) :
+    l2norm_sq x = ‖(WithLp.equiv 2 (Fin n → ℝ)).symm x‖ ^ 2 := by
+  simp only [l2norm_sq, Real.norm_eq_abs, sq_abs]
+  have h_norm := PiLp.norm_sq_eq_of_L2 (β := fun _ : Fin n => ℝ) ((WithLp.equiv 2 (Fin n → ℝ)).symm x)
+  simp [Real.norm_eq_abs] at h_norm
+  rw [← h_norm]
+  rfl
 
 /-- XᵀX is positive definite when X has full column rank.
     This is the algebraic foundation for uniqueness of least squares.
@@ -4425,12 +4445,20 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
 
 /-- Orthogonal projection onto a finite-dimensional subspace. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  0  -- Placeholder; proper implementation would use Mathlib's orthogonalProjection
+  let iso_add := WithLp.equiv 2 (Fin n → ℝ)
+  let iso : WithLp 2 (Fin n → ℝ) ≃ₗ[ℝ] (Fin n → ℝ) := {
+    iso_add with
+    map_add' := fun x y => rfl
+    map_smul' := fun c x => rfl
+  }
+  let K' : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map iso.symm
+  let y' : EuclideanSpace ℝ (Fin n) := iso.symm y
+  iso (Submodule.orthogonalProjection K' y')
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
     iff p minimizes distance to y among all points in K. -/
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
-    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist y p ≤ dist y w) :
+    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, l2norm_sq (y - p) ≤ l2norm_sq (y - w)) :
     p = orthogonalProjection K y := by
   sorry
 
