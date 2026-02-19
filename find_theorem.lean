@@ -1,0 +1,7 @@
+import Mathlib.Analysis.InnerProductSpace.Projection
+import Mathlib.Analysis.InnerProductSpace.PiL2
+
+open InnerProductSpace
+
+#check eq_orthogonalProjection_of_dist_le
+#check Submodule.eq_orthogonalProjection_of_dist_le
