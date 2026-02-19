@@ -2063,6 +2063,10 @@ def dotProduct' {ι : Type*} [Fintype ι] (u v : ι → ℝ) : ℝ :=
 def l2norm_sq {ι : Type*} [Fintype ι] (v : ι → ℝ) : ℝ :=
   Finset.univ.sum (fun i => v i ^ 2)
 
+lemma l2norm_sq_eq_norm_sq {ι : Type*} [Fintype ι] (v : ι → ℝ) :
+    l2norm_sq v = ‖(WithLp.linearEquiv 2 ℝ (ι → ℝ) v)‖^2 := by
+  sorry
+
 /-- XᵀX is positive definite when X has full column rank.
     This is the algebraic foundation for uniqueness of least squares.
 
@@ -4425,12 +4429,17 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
 
 /-- Orthogonal projection onto a finite-dimensional subspace. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  0  -- Placeholder; proper implementation would use Mathlib's orthogonalProjection
+  let equiv := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K_E : Submodule ℝ (WithLp 2 (Fin n → ℝ)) := K.map equiv
+  haveI : FiniteDimensional ℝ (WithLp 2 (Fin n → ℝ)) := inferInstance
+  haveI : CompleteSpace K_E := FiniteDimensional.complete ℝ K_E
+  let p_E := Submodule.orthogonalProjection K_E (equiv y)
+  equiv.symm p_E.val
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
     iff p minimizes distance to y among all points in K. -/
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
-    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist y p ≤ dist y w) :
+    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, l2norm_sq (y - p) ≤ l2norm_sq (y - w)) :
     p = orthogonalProjection K y := by
   sorry
 
