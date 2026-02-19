@@ -2063,6 +2063,15 @@ def dotProduct' {ι : Type*} [Fintype ι] (u v : ι → ℝ) : ℝ :=
 def l2norm_sq {ι : Type*} [Fintype ι] (v : ι → ℝ) : ℝ :=
   Finset.univ.sum (fun i => v i ^ 2)
 
+lemma l2norm_sq_eq_norm_sq {ι : Type*} [Fintype ι] (v : ι → ℝ) :
+    l2norm_sq v = ‖WithLp.equiv 2 (ι → ℝ) v‖ ^ 2 := by
+  rw [PiLp.norm_eq_of_L2]
+  rw [Real.sq_sqrt]
+  · simp [l2norm_sq]
+  · apply Finset.sum_nonneg
+    intro i _
+    apply sq_nonneg
+
 /-- XᵀX is positive definite when X has full column rank.
     This is the algebraic foundation for uniqueness of least squares.
 
@@ -4425,14 +4434,76 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
 
 /-- Orthogonal projection onto a finite-dimensional subspace. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  0  -- Placeholder; proper implementation would use Mathlib's orthogonalProjection
+  let equiv := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K_E : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map equiv
+  haveI : FiniteDimensional ℝ (EuclideanSpace ℝ (Fin n)) := by infer_instance
+  haveI : CompleteSpace K_E := FiniteDimensional.complete _
+  let proj := Submodule.orthogonalProjection K_E (equiv y)
+  equiv.symm proj
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
     iff p minimizes distance to y among all points in K. -/
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
-    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist y p ≤ dist y w) :
+    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, l2norm_sq (y - p) ≤ l2norm_sq (y - w)) :
     p = orthogonalProjection K y := by
-  sorry
+  let equiv := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K_E : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map equiv
+  haveI : FiniteDimensional ℝ (EuclideanSpace ℝ (Fin n)) := by infer_instance
+  haveI : CompleteSpace K_E := FiniteDimensional.complete _
+
+  let p' := equiv p
+  let y' := equiv y
+
+  have hp' : p' ∈ K_E := by
+    rw [Submodule.mem_map]
+    use p
+    exact ⟨h_mem, rfl⟩
+
+  have h_min' : ∀ w' ∈ K_E, ‖y' - p'‖ ≤ ‖y' - w'‖ := by
+    intro w' hw'
+    obtain ⟨w, hw, rfl⟩ := (Submodule.mem_map _ _).mp hw'
+    specialize h_min w hw
+    rw [l2norm_sq_eq_norm_sq, l2norm_sq_eq_norm_sq] at h_min
+    simp only [equiv, y', p']
+    rw [← LinearEquiv.map_sub, ← LinearEquiv.map_sub] at h_min
+    rw [sq_le_sq] at h_min
+    exact h_min (norm_nonneg _) (norm_nonneg _)
+
+  have h_orth : p' = Submodule.orthogonalProjection K_E y' := by
+    let P := Submodule.orthogonalProjection K_E y'
+    have hP_min := Submodule.orthogonalProjection_is_norm_minimizer K_E y'
+    have hP_mem := Submodule.orthogonalProjection_mem K_E y'
+    have h_eq_dist : ‖y' - p'‖ = ‖y' - P‖ := le_antisymm (h_min' P hP_mem) (hP_min p' hp')
+
+    have h_par := parallelogram_law (y' - p') (y' - P)
+    rw [h_eq_dist] at h_par
+    have h_id : (y' - p') + (y' - P) = 2 • (y' - (2:ℝ)⁻¹ • (p' + P)) := by
+      simp; module
+    rw [h_id, norm_smul, Real.norm_two] at h_par
+    rw [pow_two, two_mul, ← pow_two] at h_par
+    have h_mid : ‖y' - (2:ℝ)⁻¹ • (p' + P)‖ ^ 2 ≥ ‖y' - P‖ ^ 2 := by
+      let m := (2:ℝ)⁻¹ • (p' + P)
+      have hm : m ∈ K_E := Submodule.smul_mem K_E _ (Submodule.add_mem K_E hp' hP_mem)
+      have := hP_min m hm
+      apply pow_le_pow_left (norm_nonneg _) this 2
+    have h_le : 4 * ‖y' - (2:ℝ)⁻¹ • (p' + P)‖ ^ 2 + ‖(y' - p') - (y' - P)‖ ^ 2 ≤ 4 * ‖y' - P‖ ^ 2 + ‖(y' - p') - (y' - P)‖ ^ 2 := by
+      linarith
+    rw [h_par] at h_le
+    have h_sub : (y' - p') - (y' - P) = P - p' := by simp
+    rw [h_sub] at h_le
+    have h_norm_sq_nonneg : 0 ≤ ‖P - p'‖ ^ 2 := sq_nonneg _
+    have h_zero : ‖P - p'‖ ^ 2 = 0 := by
+      linarith
+    have h_zero' : ‖P - p'‖ = 0 := by
+      rw [sq_eq_zero_iff] at h_zero
+      exact h_zero
+    rw [norm_eq_zero, sub_eq_zero] at h_zero'
+    exact h_zero'.symm
+
+  unfold orthogonalProjection
+  apply equiv.injective
+  simp only [LinearEquiv.apply_symm_apply]
+  exact h_orth
 
 set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
