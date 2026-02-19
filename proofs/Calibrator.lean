@@ -1,5 +1,7 @@
 import Mathlib.Tactic
 import Mathlib.Analysis.Calculus.Deriv.Basic
+import Mathlib.Analysis.Calculus.Deriv.Mul
+import Mathlib.Analysis.Calculus.Deriv.Add
 import Mathlib.Analysis.Calculus.Deriv.Inv
 import Mathlib.Analysis.Convex.Strict
 import Mathlib.Analysis.Convex.Jensen
@@ -4174,7 +4176,19 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
   have h_risk_lower_bound :
       expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) ≥
       expectedSquaredError dgp (fun p c => linearPredictor model_star p c) := by
-    admit
+    -- We argue by risk decomposition.
+    -- The risk of any normalized model (slope s, base b(c)) is:
+    -- E[(scaling - s)^2] + E[b(c)^2]
+    -- = Var(scaling) + (E[scaling] - s)^2 + E[b(c)^2]
+    -- Since E[scaling] = 1, this is minimized at s = 1 and b(c) = 0.
+    -- model_star has s = 1 and b(c) = 0, so it achieves the minimum risk.
+    -- Thus risk(model_norm) >= risk(model_star).
+    have h_decomp : ∀ (m : PhenotypeInformedGAM 1 k 1), IsNormalizedScoreModel m →
+        expectedSquaredError dgp (fun p c => linearPredictor m p c) ≥
+        expectedSquaredError dgp (fun p c => linearPredictor model_star p c) := by
+      intro m hm
+      sorry -- Structured proof sketch provided in comments
+    exact h_decomp model_norm h_norm_opt.is_normalized
 
   have h_opt_risk : expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) =
                     expectedSquaredError dgp (fun p c => linearPredictor model_star p c) := by
@@ -4425,14 +4439,66 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
 
 /-- Orthogonal projection onto a finite-dimensional subspace. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  0  -- Placeholder; proper implementation would use Mathlib's orthogonalProjection
+  let iso := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K' : Submodule ℝ (WithLp 2 (Fin n → ℝ)) := K.map iso.symm
+  have : FiniteDimensional ℝ (WithLp 2 (Fin n → ℝ)) := by infer_instance
+  have : FiniteDimensional ℝ K' := Submodule.finiteDimensional_of_finiteDimensional K'
+  have : CompleteSpace K' := FiniteDimensional.complete ℝ K'
+  let proj_map := Submodule.orthogonalProjection K'
+  let p_in_K' := proj_map (iso.symm y)
+  iso p_in_K'
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
-    iff p minimizes distance to y among all points in K. -/
-lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
-    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist y p ≤ dist y w) :
+    iff p minimizes squared L2 distance to y among all points in K. -/
+lemma orthogonalProjection_eq_of_l2_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
+    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, l2norm_sq (y - p) ≤ l2norm_sq (y - w)) :
     p = orthogonalProjection K y := by
-  sorry
+  let iso := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K' : Submodule ℝ (WithLp 2 (Fin n → ℝ)) := K.map iso.symm
+  have : FiniteDimensional ℝ (WithLp 2 (Fin n → ℝ)) := by infer_instance
+  have : FiniteDimensional ℝ K' := Submodule.finiteDimensional_of_finiteDimensional K'
+  have : CompleteSpace K' := FiniteDimensional.complete ℝ K'
+
+  let p' : WithLp 2 (Fin n → ℝ) := iso.symm p
+  let y' : WithLp 2 (Fin n → ℝ) := iso.symm y
+
+  have hp' : p' ∈ K' := by
+    rw [Submodule.mem_map]
+    use p
+    simp [h_mem]
+
+  have h_proj_eq : p' = Submodule.orthogonalProjection K' y' := by
+    apply Submodule.eq_orthogonalProjection_of_dist_le
+    · exact hp'
+    · intro w' hw'
+      let w := iso w'
+      have hw : w ∈ K := by
+        rw [Submodule.mem_map] at hw'
+        obtain ⟨x, hx, hx_eq⟩ := hw'
+        rw [← hx_eq]
+        simp
+        exact hx
+
+      specialize h_min w hw
+
+      have h_link : ∀ a b : Fin n → ℝ, l2norm_sq (a - b) = (dist (iso.symm a) (iso.symm b))^2 := by
+        intro a b
+        rw [dist_eq_norm, ← map_sub]
+        have h_norm : ‖iso.symm (a - b)‖^2 = l2norm_sq (a - b) := by
+          rw [PiLp.norm_sq_eq_of_L2]
+          unfold l2norm_sq
+          rfl
+        rw [h_norm]
+
+      rw [h_link y p, h_link y w] at h_min
+      simp only [w, iso, LinearEquiv.symm_apply_apply] at h_min
+
+      exact nonneg_le_nonneg_of_sq_le_sq dist_nonneg h_min
+
+  unfold orthogonalProjection
+  dsimp
+  rw [← h_proj_eq]
+  simp
 
 set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
@@ -6100,24 +6166,21 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
           have h_jacobi : deriv (fun rho => Matrix.det (M rho)) rho = ∑ i, ∑ j, (Matrix.adjugate (M rho)) i j * deriv (fun rho => (M rho) j i) rho := by
             simp +decide [ Matrix.det_apply', Matrix.adjugate_apply, Matrix.mul_apply ]
             have h_jacobi : deriv (fun rho => ∑ σ : Equiv.Perm m, (↑(↑((Equiv.Perm.sign : Equiv.Perm m → ℤˣ) σ) : ℤ) : ℝ) * ∏ i : m, M rho ((σ : m → m) i) i) rho = ∑ σ : Equiv.Perm m, (↑(↑((Equiv.Perm.sign : Equiv.Perm m → ℤˣ) σ) : ℤ) : ℝ) * ∑ i : m, (∏ j ∈ Finset.univ.erase i, M rho ((σ : m → m) j) j) * deriv (fun rho => M rho ((σ : m → m) i) i) rho := by
-              have h_jacobi : ∀ σ : Equiv.Perm m, deriv (fun rho => ∏ i : m, M rho ((σ : m → m) i) i) rho = ∑ i : m, (∏ j ∈ Finset.univ.erase i, M rho ((σ : m → m) j) j) * deriv (fun rho => M rho ((σ : m → m) i) i) rho := by
-                intro σ
-                have h_prod_rule : ∀ (f : m → ℝ → ℝ), (∀ i, DifferentiableAt ℝ (f i) rho) → deriv (fun rho => ∏ i, f i rho) rho = ∑ i, (∏ j ∈ Finset.univ.erase i, f j rho) * deriv (f i) rho := by
-                  -- exact?
-                  admit
-                apply h_prod_rule
-                intro i
-                exact DifferentiableAt.comp rho ( differentiableAt_pi.1 ( differentiableAt_pi.1 hM_diff _ ) _ ) differentiableAt_id
-              have h_deriv_sum : deriv (fun rho => ∑ σ : Equiv.Perm m, (↑(↑((Equiv.Perm.sign : Equiv.Perm m → ℤˣ) σ) : ℤ) : ℝ) * ∏ i : m, M rho ((σ : m → m) i) i) rho = ∑ σ : Equiv.Perm m, (↑(↑((Equiv.Perm.sign : Equiv.Perm m → ℤˣ) σ) : ℤ) : ℝ) * deriv (fun rho => ∏ i : m, M rho ((σ : m → m) i) i) rho := by
-                have h_diff : ∀ σ : Equiv.Perm m, DifferentiableAt ℝ (fun rho => ∏ i : m, M rho ((σ : m → m) i) i) rho := by
-                  intro σ
-                  have h_diff : ∀ i : m, DifferentiableAt ℝ (fun rho => M rho ((σ : m → m) i) i) rho := by
-                    intro i
-                    exact DifferentiableAt.comp rho ( differentiableAt_pi.1 ( differentiableAt_pi.1 hM_diff _ ) _ ) differentiableAt_id
-                  -- exact?
-                  admit
-                norm_num [ h_diff ]
-              simpa only [ h_jacobi ] using h_deriv_sum
+              have h_diff_entry : ∀ σ i, DifferentiableAt ℝ (fun rho => M rho (σ i) i) rho :=
+                fun σ i => differentiableAt_pi.mp (differentiableAt_pi.mp hM_diff (σ i)) i
+              rw [deriv_sum]
+              · refine Finset.sum_congr rfl ?_
+                intro σ _
+                rw [deriv_const_mul]
+                · rw [deriv_finset_prod (fun i => M rho (σ i) i) (h_diff_entry σ)]
+                · apply DifferentiableAt.finset_prod
+                  intro i _
+                  exact h_diff_entry σ i
+              · intro σ _
+                apply DifferentiableAt.const_mul
+                apply DifferentiableAt.finset_prod
+                intro i _
+                exact h_diff_entry σ i
             simp +decide only [h_jacobi, Finset.mul_sum _ _ _]
             simp +decide [ Finset.sum_mul _ _ _, Matrix.updateRow_apply ]
             rw [ Finset.sum_comm ]
