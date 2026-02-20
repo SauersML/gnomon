@@ -4425,7 +4425,7 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
   rw [← h_at_1]
   rfl
 
-/-- Orthogonal projection onto a finite-dimensional subspace. -/
+/-- Orthogonal projection onto a finite-dimensional subspace (L2). -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
   let iso := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
   let K' : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map iso
