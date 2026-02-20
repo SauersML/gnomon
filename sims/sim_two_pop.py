@@ -69,14 +69,17 @@ def _build_demography_bottleneck(split_time: int, ne: int, bottle_ne: int) -> ms
     dem.add_population(name="ancestral", initial_size=ne)
     dem.add_population_split(time=split_time, derived=["pop0", "pop1"], ancestral="ancestral")
 
-    # Bottleneck starts shortly after split, with fixed maximum duration to keep
-    # bottleneck severity comparable across different split-time scenarios.
+    # Fixed-strength bottleneck: constant severity (bottle_ne), starts immediately
+    # after divergence, and lasts 100 generations in forward time.
+    # In backward-time coordinates this is [split_time - 1, split_time - 101].
     if split_time > 0:
+        target_duration = 100
         start = max(1, split_time - 1)
-        duration = min(200, max(5, split_time - 2))
-        end = max(0, start - duration)
+        max_available_duration = max(1, start - 1)
+        duration = min(target_duration, max_available_duration)
+        end = max(1, start - duration)
         if end >= start:
-            end = max(0, start - 1)
+            end = max(1, start - 1)
         dem.add_population_parameters_change(time=start, population="pop0", initial_size=bottle_ne)
         dem.add_population_parameters_change(time=end, population="pop0", initial_size=ne)
     # msprime requires events to be time-sorted; our inserts can be out of order.

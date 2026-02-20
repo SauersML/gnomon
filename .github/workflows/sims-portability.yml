@@ -2,6 +2,12 @@ name: Sims (Gen0 + Bottleneck)
 
 on:
   workflow_dispatch:
+    inputs:
+      bottleneck_strength_only:
+        description: "Run only bottleneck-strength portability sim (0.5/1/5/10/20/50/70/100%)"
+        type: boolean
+        default: false
+        required: false
   schedule:
     - cron: "30 7 * * *"
 
@@ -16,6 +22,7 @@ env:
 
 jobs:
   gen0_chunks:
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.bottleneck_strength_only != 'true' }}
     name: "Gen0 chunk ${{ matrix.chunk.name }}"
     runs-on: ubuntu-22.04
     strategy:
@@ -185,6 +192,7 @@ jobs:
           retention-days: 7
 
   gen0_summarize:
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.bottleneck_strength_only != 'true' }}
     name: "Gen0 summarize"
     runs-on: ubuntu-22.04
     needs: gen0_chunks
@@ -246,6 +254,7 @@ jobs:
           retention-days: 14
 
   bottleneck_chunks:
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.bottleneck_strength_only != 'true' }}
     name: "Bottleneck chunk ${{ matrix.scenario }}-${{ matrix.gens.name }}"
     runs-on: ubuntu-22.04
     strategy:
@@ -355,6 +364,7 @@ jobs:
           retention-days: 7
 
   bottleneck_summarize:
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.bottleneck_strength_only != 'true' }}
     name: "Bottleneck summarize"
     runs-on: ubuntu-22.04
     needs: bottleneck_chunks
@@ -406,10 +416,171 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  ui_summary:
+  bottleneck_strength_chunks:
+    name: "Bottleneck strength chunk ${{ matrix.frac_chunk.name }}"
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        frac_chunk:
+          - { name: "f0p5_1_5", values: "0.005,0.01,0.05" }
+          - { name: "f10_20", values: "0.1,0.2" }
+          - { name: "f50_70", values: "0.5,0.7" }
+          - { name: "f100", values: "1.0" }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Define bottleneck strength simulation parameters
+        id: strength_params
+        shell: bash
+        run: |
+          set -euo pipefail
+          CPU_CORES="$(nproc)"
+          if [ -z "$CPU_CORES" ] || [ "$CPU_CORES" -lt 1 ]; then
+            CPU_CORES=1
+          fi
+          echo "workers=$CPU_CORES" >> "$GITHUB_OUTPUT"
+          echo "seeds=1,2,3,4,5,6,7,8,9,10" >> "$GITHUB_OUTPUT"
+          echo "gens=300" >> "$GITHUB_OUTPUT"
+          echo "fracs=${{ matrix.frac_chunk.values }}" >> "$GITHUB_OUTPUT"
+          echo "seeds_key=1_2_3_4_5_6_7_8_9_10" >> "$GITHUB_OUTPUT"
+          echo "fracs_key=$(echo '${{ matrix.frac_chunk.values }}' | tr ',.' '__')" >> "$GITHUB_OUTPUT"
+          echo "n_per_pop=2000" >> "$GITHUB_OUTPUT"
+          echo "seq_len=5000000" >> "$GITHUB_OUTPUT"
+          echo "n_causal=400" >> "$GITHUB_OUTPUT"
+          echo "n_array_sites=2000" >> "$GITHUB_OUTPUT"
+
+      - name: Restore bottleneck strength cache
+        id: strength_cache_restore
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            sims/results_bottleneck_strength/chunks/strength_${{ matrix.frac_chunk.name }}.csv
+            sims/results_bottleneck_strength/strength_sweeps/strength_${{ matrix.frac_chunk.name }}_strength_sweep.csv
+          key: bottleneck-strength-sim-${{ runner.os }}-${{ env.SIM_PROFILE }}-g300-${{ steps.strength_params.outputs.seeds_key }}-${{ steps.strength_params.outputs.fracs_key }}-${{ steps.strength_params.outputs.n_per_pop }}-${{ steps.strength_params.outputs.seq_len }}-${{ steps.strength_params.outputs.n_causal }}-${{ steps.strength_params.outputs.n_array_sites }}-${{ hashFiles('sims/bottleneck_ld_mechanism.py', 'sims/sim_two_pop.py', 'sims/requirements.txt') }}
+
+      - name: Set up Python
+        if: steps.strength_cache_restore.outputs.cache-hit != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        if: steps.strength_cache_restore.outputs.cache-hit != 'true'
+        run: |
+          pip install uv
+          uv pip install --system -r sims/requirements.txt
+
+      - name: Run bottleneck strength mechanism chunk
+        if: steps.strength_cache_restore.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+
+          SEEDS="${{ steps.strength_params.outputs.seeds }}"
+          GENS="${{ steps.strength_params.outputs.gens }}"
+          FRACS="${{ steps.strength_params.outputs.fracs }}"
+          N_PER_POP="${{ steps.strength_params.outputs.n_per_pop }}"
+          SEQ_LEN="${{ steps.strength_params.outputs.seq_len }}"
+          N_CAUSAL="${{ steps.strength_params.outputs.n_causal }}"
+          N_ARRAY_SITES="${{ steps.strength_params.outputs.n_array_sites }}"
+          WORKERS="${{ steps.strength_params.outputs.workers }}"
+
+          export OMP_NUM_THREADS=1
+          export MKL_NUM_THREADS=1
+          export OPENBLAS_NUM_THREADS=1
+          export VECLIB_MAXIMUM_THREADS=1
+          export NUMEXPR_NUM_THREADS=1
+
+          CHUNK_DIR="sims/results_bottleneck_strength/chunks"
+          mkdir -p "$CHUNK_DIR"
+
+          python sims/bottleneck_ld_mechanism.py run-strength-chunk \
+            --gens "$GENS" \
+            --bottleneck-fracs "$FRACS" \
+            --seeds "$SEEDS" \
+            --workers "$WORKERS" \
+            --n-per-pop "$N_PER_POP" \
+            --seq-len "$SEQ_LEN" \
+            --n-causal "$N_CAUSAL" \
+            --n-array-sites "$N_ARRAY_SITES" \
+            --out-dir "$CHUNK_DIR" \
+            --chunk-name "strength_${{ matrix.frac_chunk.name }}"
+
+      - name: Save bottleneck strength cache
+        if: steps.strength_cache_restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            sims/results_bottleneck_strength/chunks/strength_${{ matrix.frac_chunk.name }}.csv
+            sims/results_bottleneck_strength/strength_sweeps/strength_${{ matrix.frac_chunk.name }}_strength_sweep.csv
+          key: ${{ steps.strength_cache_restore.outputs.cache-primary-key }}
+
+      - name: Upload bottleneck strength chunk artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bottleneck-strength-chunk-${{ matrix.frac_chunk.name }}
+          path: |
+            sims/results_bottleneck_strength/chunks/strength_${{ matrix.frac_chunk.name }}.csv
+            sims/results_bottleneck_strength/strength_sweeps/strength_${{ matrix.frac_chunk.name }}_strength_sweep.csv
+          if-no-files-found: error
+          retention-days: 7
+
+  bottleneck_strength_summarize:
+    name: "Bottleneck strength summarize"
+    runs-on: ubuntu-22.04
+    needs: bottleneck_strength_chunks
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install uv
+          uv pip install --system -r sims/requirements.txt
+
+      - name: Download bottleneck strength chunk artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bottleneck-strength-chunk-*
+          path: artifacts/bottleneck-strength-chunks
+          merge-multiple: true
+
+      - name: Summarize bottleneck strength analysis
+        run: |
+          set -euo pipefail
+          python sims/bottleneck_ld_mechanism.py summarize-strength \
+            --glob "artifacts/bottleneck-strength-chunks/**/chunks/*.csv" \
+            --sweep-glob "artifacts/bottleneck-strength-chunks/**/strength_sweeps/*_strength_sweep.csv" \
+            --out-dir sims/results_bottleneck_strength
+
+      - name: Upload bottleneck strength report artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bottleneck-strength-report
+          path: |
+            sims/results_bottleneck_strength/bottleneck_strength_portability_results.csv
+            sims/results_bottleneck_strength/bottleneck_strength_portability_summary.csv
+            sims/results_bottleneck_strength/bottleneck_strength_sweep_results.csv
+            sims/results_bottleneck_strength/fig_strength_transfer_ratio.png
+            sims/results_bottleneck_strength/fig_strength_target_vs_holdout_r2.png
+            sims/results_bottleneck_strength/fig_strength_beta_correlation.png
+            sims/results_bottleneck_strength/fig_strength_heterozygosity_shift.png
+            sims/results_bottleneck_strength/fig_strength_ld_destroy_delta.png
+            sims/results_bottleneck_strength/fig_strength_heterozygosity_sweep.png
+          if-no-files-found: error
+          retention-days: 14
+
+  ui_summary_default:
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.bottleneck_strength_only != 'true' }}
     name: "Workflow summary"
     runs-on: ubuntu-22.04
-    needs: [gen0_summarize, bottleneck_summarize]
+    needs: [gen0_summarize, bottleneck_summarize, bottleneck_strength_summarize]
     steps:
       - name: Download Gen0 artifact
         uses: actions/download-artifact@v4
@@ -423,6 +594,12 @@ jobs:
           name: bottleneck-report
           path: artifacts/bottleneck
 
+      - name: Download bottleneck strength artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: bottleneck-strength-report
+          path: artifacts/bottleneck-strength
+
       - name: Write GitHub UI summary
         run: |
           python - <<'PY'
@@ -433,6 +610,7 @@ jobs:
           gtests = Path("artifacts/gen0/gen0_hypothesis_tests.csv")
           btests = Path("artifacts/bottleneck/bottleneck_hypothesis_tests.csv")
           bdiag = Path("artifacts/bottleneck/bottleneck_diagnostics.csv")
+          strength = Path("artifacts/bottleneck-strength/bottleneck_strength_portability_summary.csv")
 
           def read_csv(path):
               with open(path, newline="") as f:
@@ -441,6 +619,7 @@ jobs:
           g = read_csv(gtests)
           b = read_csv(btests)
           d = read_csv(bdiag)
+          s = read_csv(strength)
 
           dmap = {r["metric"]: r for r in d}
 
@@ -484,7 +663,63 @@ jobs:
               lines.append(f"| `{key}` | {float(r['value']):.4f} | {ci} |")
 
           lines.append("")
-          lines.append("Artifacts: `gen0-report`, `bottleneck-report`")
+          lines.append("## Bottleneck-strength portability (300 generations)")
+          lines.append("")
+          lines.append("| Bottleneck size | Transfer ratio mean | 95% CI |")
+          lines.append("|---|---:|---|")
+          for r in s:
+              if r["metric"] != "ratio_alltags":
+                  continue
+              lines.append(
+                  f"| {int(round(float(r['bottleneck_pct'])))}% | {float(r['mean']):.4f} | [{float(r['ci_lo']):.4f}, {float(r['ci_hi']):.4f}] |"
+              )
+
+          lines.append("")
+          lines.append("Artifacts: `gen0-report`, `bottleneck-report`, `bottleneck-strength-report`")
+          out.write_text("\n".join(lines))
+          print(out.read_text())
+          PY
+          cat summary.md >> "$GITHUB_STEP_SUMMARY"
+
+  ui_summary_strength_only:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.bottleneck_strength_only == 'true' }}
+    name: "Workflow summary (bottleneck strength only)"
+    runs-on: ubuntu-22.04
+    needs: bottleneck_strength_summarize
+    steps:
+      - name: Download bottleneck strength artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: bottleneck-strength-report
+          path: artifacts/bottleneck-strength
+
+      - name: Write GitHub UI summary
+        run: |
+          python - <<'PY'
+          import csv
+          from pathlib import Path
+
+          out = Path("summary.md")
+          strength = Path("artifacts/bottleneck-strength/bottleneck_strength_portability_summary.csv")
+
+          with open(strength, newline="") as f:
+              rows = list(csv.DictReader(f))
+
+          lines = []
+          lines.append("# Bottleneck-strength portability summary")
+          lines.append("")
+          lines.append("Fixed setup: divergence=300 generations; bottleneck sizes=0.5%,1%,5%,10%,20%,50%,70%,100%")
+          lines.append("")
+          lines.append("| Bottleneck size | Transfer ratio mean | 95% CI |")
+          lines.append("|---|---:|---|")
+          for r in rows:
+              if r["metric"] != "ratio_alltags":
+                  continue
+              lines.append(
+                  f"| {int(round(float(r['bottleneck_pct'])))}% | {float(r['mean']):.4f} | [{float(r['ci_lo']):.4f}, {float(r['ci_hi']):.4f}] |"
+              )
+          lines.append("")
+          lines.append("Artifact: `bottleneck-strength-report`")
           out.write_text("\n".join(lines))
           print(out.read_text())
           PY
