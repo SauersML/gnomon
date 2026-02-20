@@ -111,14 +111,14 @@ impl<'a> SpoolPlan<'a> {
 /// # Arguments
 /// * `source`: A shared, thread-safe handle to the underlying .bed byte source.
 /// * `prep_result`: The "computation blueprint" that dictates which variants to read.
-/// * `sparse_tx`: The channel sender for variants destined for the sparse path.
+/// * `sparse_tx`: Optional channel sender for variants destined for the sparse path.
 /// * `dense_tx`: The channel sender for variants destined for the dense path.
 /// * `buffer_pool`: A shared pool of reusable byte buffers to eliminate allocation overhead.
 /// * `path_decider`: A closure that takes a variant's data and returns the `ComputePath`.
 pub fn producer_thread<'a, F>(
     source: Arc<dyn ByteRangeSource>,
     prep_result: Arc<PreparationResult>,
-    sparse_tx: Sender<Result<WorkItem, PipelineError>>,
+    sparse_tx: Option<Sender<Result<WorkItem, PipelineError>>>,
     dense_tx: Sender<Result<WorkItem, PipelineError>>,
     buffer_pool: Arc<ArrayQueue<Vec<u8>>>,
     variants_processed_count: Arc<AtomicU64>,
@@ -127,6 +127,13 @@ pub fn producer_thread<'a, F>(
 ) where
     F: Fn(&[u8]) -> ComputePath,
 {
+    let send_error = |err: PipelineError| {
+        if let Some(tx) = sparse_tx.as_ref() {
+            let _ = tx.send(Err(err.clone()));
+        }
+        let _ = dense_tx.send(Err(err));
+    };
+
     let bytes_per_variant = prep_result.bytes_per_variant as usize;
     let bytes_per_variant_u64 = prep_result.bytes_per_variant;
     let mut local_variants_processed: u64 = 0;
@@ -152,20 +159,17 @@ pub fn producer_thread<'a, F>(
                         "Fatal: Attempted to read past the end of the .bed source for variant at BIM row {}. The file may be truncated or inconsistent with the .bim file.",
                         bim_row_idx.0
                     ));
-                    let _ = sparse_tx.send(Err(err.clone()));
-                    let _ = dense_tx.send(Err(err));
+                    send_error(err);
                     break;
                 }
 
                 if let Err(err) = source.read_at(offset, buffer.as_mut_slice()) {
-                    let _ = sparse_tx.send(Err(err.clone()));
-                    let _ = dense_tx.send(Err(err));
+                    send_error(err);
                     break;
                 }
 
                 if let Err(err) = sp.write_variant(i, bim_row_idx, &buffer) {
-                    let _ = sparse_tx.send(Err(err.clone()));
-                    let _ = dense_tx.send(Err(err));
+                    send_error(err);
                     break;
                 }
 
@@ -179,7 +183,7 @@ pub fn producer_thread<'a, F>(
                 let tx = if path == ComputePath::Pivot {
                     &dense_tx
                 } else {
-                    &sparse_tx
+                    sparse_tx.as_ref().unwrap_or(&dense_tx)
                 };
 
                 if tx.send(Ok(work_item)).is_err() {
@@ -213,14 +217,12 @@ pub fn producer_thread<'a, F>(
                         "Fatal: Attempted to read past the end of the .bed source for variant at BIM row {}. The file may be truncated or inconsistent with the .bim file.",
                         bim_row_idx.0
                     ));
-                    let _ = sparse_tx.send(Err(err.clone()));
-                    let _ = dense_tx.send(Err(err));
+                    send_error(err);
                     break;
                 }
 
                 if let Err(err) = source.read_at(offset, buffer.as_mut_slice()) {
-                    let _ = sparse_tx.send(Err(err.clone()));
-                    let _ = dense_tx.send(Err(err));
+                    send_error(err);
                     break;
                 }
 
@@ -234,7 +236,7 @@ pub fn producer_thread<'a, F>(
                 let tx = if path == ComputePath::Pivot {
                     &dense_tx
                 } else {
-                    &sparse_tx
+                    sparse_tx.as_ref().unwrap_or(&dense_tx)
                 };
 
                 if tx.send(Ok(work_item)).is_err() {
@@ -262,7 +264,7 @@ pub fn multi_file_producer_thread<'a, F>(
     prep_result: Arc<PreparationResult>,
     boundaries: &[FilesetBoundary],
     bed_sources: &[BedSource],
-    sparse_tx: Sender<Result<WorkItem, PipelineError>>,
+    sparse_tx: Option<Sender<Result<WorkItem, PipelineError>>>,
     dense_tx: Sender<Result<WorkItem, PipelineError>>,
     buffer_pool: Arc<ArrayQueue<Vec<u8>>>,
     variants_processed_count: Arc<AtomicU64>,
@@ -271,6 +273,13 @@ pub fn multi_file_producer_thread<'a, F>(
 ) where
     F: Fn(&[u8]) -> ComputePath,
 {
+    let send_error = |err: PipelineError| {
+        if let Some(tx) = sparse_tx.as_ref() {
+            let _ = tx.send(Err(err.clone()));
+        }
+        let _ = dense_tx.send(Err(err));
+    };
+
     let mut current_fileset_idx: usize = 0;
     let bytes_per_variant = prep_result.bytes_per_variant;
     let mut local_variants_processed: u64 = 0;
@@ -309,8 +318,7 @@ pub fn multi_file_producer_thread<'a, F>(
                         boundaries[current_fileset_idx].bed_path.display(),
                         global_bim_row_index.0
                     ));
-                    let _ = sparse_tx.send(Err(err.clone()));
-                    let _ = dense_tx.send(Err(err));
+                    send_error(err);
                     return;
                 }
 
@@ -324,14 +332,12 @@ pub fn multi_file_producer_thread<'a, F>(
                 buffer.resize(bytes_per_variant as usize, 0);
 
                 if let Err(err) = current_source.read_at(offset, buffer.as_mut_slice()) {
-                    let _ = sparse_tx.send(Err(err.clone()));
-                    let _ = dense_tx.send(Err(err));
+                    send_error(err);
                     return;
                 }
 
                 if let Err(err) = sp.write_variant(i, global_bim_row_index, &buffer) {
-                    let _ = sparse_tx.send(Err(err.clone()));
-                    let _ = dense_tx.send(Err(err));
+                    send_error(err);
                     return;
                 }
 
@@ -344,7 +350,7 @@ pub fn multi_file_producer_thread<'a, F>(
                 let tx = if path == ComputePath::Pivot {
                     &dense_tx
                 } else {
-                    &sparse_tx
+                    sparse_tx.as_ref().unwrap_or(&dense_tx)
                 };
                 if tx.send(Ok(work_item)).is_err() {
                     break;
@@ -381,8 +387,7 @@ pub fn multi_file_producer_thread<'a, F>(
                         boundaries[current_fileset_idx].bed_path.display(),
                         global_bim_row_index.0
                     ));
-                    let _ = sparse_tx.send(Err(err.clone()));
-                    let _ = dense_tx.send(Err(err));
+                    send_error(err);
                     return;
                 }
 
@@ -396,8 +401,7 @@ pub fn multi_file_producer_thread<'a, F>(
                 buffer.resize(bytes_per_variant as usize, 0);
 
                 if let Err(err) = current_source.read_at(offset, buffer.as_mut_slice()) {
-                    let _ = sparse_tx.send(Err(err.clone()));
-                    let _ = dense_tx.send(Err(err));
+                    send_error(err);
                     return;
                 }
 
@@ -410,7 +414,7 @@ pub fn multi_file_producer_thread<'a, F>(
                 let tx = if path == ComputePath::Pivot {
                     &dense_tx
                 } else {
-                    &sparse_tx
+                    sparse_tx.as_ref().unwrap_or(&dense_tx)
                 };
                 if tx.send(Ok(work_item)).is_err() {
                     break;
