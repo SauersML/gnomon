@@ -4437,7 +4437,66 @@ noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → �
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
     (h_mem : p ∈ K) (h_min : ∀ w ∈ K, l2norm_sq (y - p) ≤ l2norm_sq (y - w)) :
     p = orthogonalProjection K y := by
-  sorry
+  let iso := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K' : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map iso
+  let y' := iso y
+  let p' := iso p
+
+  -- Show p' ∈ K'
+  have hp' : p' ∈ K' := Submodule.mem_map_of_mem h_mem
+
+  -- Show p' minimizes distance in EuclideanSpace
+  have h_min' : ∀ w' ∈ K', ‖y' - p'‖^2 ≤ ‖y' - w'‖^2 := by
+    intro w' hw'
+    obtain ⟨w, hw, rfl⟩ := Submodule.mem_map.mp hw'
+    specialize h_min w hw
+    have h_norm : ∀ v, l2norm_sq v = ‖iso v‖^2 := by
+      intro v
+      simp [l2norm_sq, WithLp.equiv, PiLp.norm_sq_eq_of_L2]
+    rw [h_norm, h_norm] at h_min
+    rw [iso.map_sub, iso.map_sub] at h_min
+    exact h_min
+
+  -- Use variational argument
+  have h_orth : ∀ v' ∈ K', ⟪y' - p', v'⟫_ℝ = 0 := by
+    intro v' hv'
+    apply linear_coeff_zero_of_quadratic_nonneg_final (-2 * ⟪y' - p', v'⟫_ℝ) (‖v'‖^2)
+    intro ε
+    specialize h_min' (p' + ε • v') (Submodule.add_mem K' hp' (Submodule.smul_mem K' ε hv'))
+    have h_expand : ‖y' - (p' + ε • v')‖^2 = ‖y' - p'‖^2 - 2 * ε * ⟪y' - p', v'⟫_ℝ + ε^2 * ‖v'‖^2 := by
+      rw [sub_add_eq_sub_sub]
+      rw [norm_sub_sq_real]
+      ring
+    rw [h_expand] at h_min'
+    linarith
+
+  -- Use uniqueness of orthogonal projection
+  have h_proj : p' = Submodule.orthogonalProjection K' y' := by
+    let P := Submodule.orthogonalProjection K' y'
+    have h_P_mem : P ∈ K' := Submodule.orthogonalProjection_mem P
+    have h_P_orth : ∀ v' ∈ K', ⟪y' - P, v'⟫_ℝ = 0 := by
+      intro v' hv'
+      -- Use property of orthogonal projection
+      have h_orth_P := Submodule.inner_right_of_mem_orthogonal v' hv' (y' - P) (Submodule.orthogonalProjection_mem_subspace_orthogonal_complement K' y')
+      exact h_orth_P
+
+    let diff := P - p'
+    have h_diff_mem : diff ∈ K' := Submodule.sub_mem K' h_P_mem hp'
+
+    have h_inner_diff : ⟪diff, diff⟫_ℝ = 0 := by
+      have h_decomp : diff = (y' - p') - (y' - P) := by simp [diff]
+      rw [h_decomp, inner_sub_left]
+      rw [h_orth diff h_diff_mem]
+      rw [h_P_orth diff h_diff_mem]
+      simp
+
+    have h_diff_zero : diff = 0 := norm_eq_zero.mp (by rw [real_inner_self_eq_norm_sq, h_inner_diff]; rfl)
+    rw [sub_eq_zero] at h_diff_zero
+    exact h_diff_zero
+
+  dsimp [orthogonalProjection]
+  rw [← h_proj]
+  simp
 
 set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
