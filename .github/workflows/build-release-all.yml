@@ -77,6 +77,12 @@ jobs:
           toolchain: nightly-2025-12-13
           targets: ${{ matrix.target }}
 
+      - name: Install NVIDIA CUDA Toolkit
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: Jimver/cuda-toolkit@v0.2.21
+        with:
+          cuda: '12.4.1'
+
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
         with:
