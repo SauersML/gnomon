@@ -4557,7 +4557,7 @@ lemma rank_eq_of_range_eq {n m : Type} [Fintype n] [Fintype m] [DecidableEq n] [
   change Module.finrank ℝ (LinearMap.range (Matrix.toLin' A)) = Module.finrank ℝ (LinearMap.range (Matrix.toLin' B))
   rw [h]
 
-theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ} [Fintype (Fin n)] [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)]
+theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
     (A : Matrix (Fin k) (Fin k) ℝ) (_hA : IsUnit A.det) (b : Fin k → ℝ)
     (data : RealizedData n k) (lambda : ℝ)
     (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp)
@@ -4580,7 +4580,178 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   ∀ (i : Fin n),
       linearPredictor model (data.p i) (data.c i) =
       linearPredictor model_prime (data'.p i) (data'.c i) := by
-  sorry
+  intro data' model model_prime i
+  -- Define X and X' explicitly for use in the proof
+  let X := designMatrix data pgsBasis splineBasis
+  let X' := designMatrix data' pgsBasis splineBasis
+
+  -- Define the column spaces (submodules of Fin n → ℝ)
+  let K := LinearMap.range (Matrix.toLin' X)
+  let K' := LinearMap.range (Matrix.toLin' X')
+
+  -- Predictions vectors
+  let pred := fun i => linearPredictor model (data.p i) (data.c i)
+  let pred' := fun i => linearPredictor model_prime (data'.p i) (data'.c i)
+
+  -- Show pred ∈ K
+  have h_pred_in_K : pred ∈ K := by
+    -- fit returns a model in the class
+    have h_in_class : InModelClass model pgsBasis splineBasis := by
+      -- fit creates a model via unpackParams, so it is in class
+      exact unpackParams_in_class pgsBasis splineBasis _
+
+    -- linearPredictor equals designMatrix * params
+    have h_eq : pred = X.mulVec (packParams model) := by
+      funext i
+      exact linearPredictor_eq_designMatrix_mulVec data pgsBasis splineBasis model h_in_class i
+
+    -- X.mulVec v is in range(X.toLin')
+    rw [h_eq]
+    use (packParams model)
+    rfl
+
+  -- Show pred minimizes distance in K
+  have h_pred_min : ∀ w ∈ K, l2norm_sq (data.y - pred) ≤ l2norm_sq (data.y - w) := by
+    intro w hw
+    -- w is in range(X), so w = X * beta for some beta
+    obtain ⟨beta, h_beta⟩ := hw
+
+    -- Construct a model m corresponding to beta
+    let m := unpackParams pgsBasis splineBasis beta
+    have h_m_class : InModelClass m pgsBasis splineBasis := unpackParams_in_class pgsBasis splineBasis beta
+
+    -- fit_minimizes_loss says empiricalLoss(model) ≤ empiricalLoss(m)
+    have h_loss : empiricalLoss model data 0 ≤ empiricalLoss m data 0 := by
+      convert fit_minimizes_loss p k sp n data 0 pgsBasis splineBasis h_n_pos (le_refl 0) h_rank m h_m_class
+
+    -- Simplify empiricalLoss with lambda=0
+    have h_loss_eq : ∀ m', InModelClass m' pgsBasis splineBasis →
+      empiricalLoss m' data 0 = (1 / n : ℝ) * l2norm_sq (data.y - (fun i => linearPredictor m' (data.p i) (data.c i))) := by
+        intro m' hm'
+        unfold empiricalLoss
+        simp [h_lambda_zero]
+        -- pointwiseNLL for Gaussian is (y - pred)^2
+        have h_nll : ∀ i, pointwiseNLL m'.dist (data.y i) (linearPredictor m' (data.p i) (data.c i)) =
+            (data.y i - linearPredictor m' (data.p i) (data.c i))^2 := by
+          intro i
+          rcases hm' with ⟨_, _, _, h_dist⟩
+          simp [pointwiseNLL, h_dist]
+        simp [h_nll, l2norm_sq]
+
+    -- Apply simplification. Note: we change fit ... to model because model IS fit ...
+    -- and rewrite uses the type of h_loss_eq which matches model structure.
+    change empiricalLoss model data 0 ≤ empiricalLoss m data 0 at h_loss
+    have h_in_class : InModelClass model pgsBasis splineBasis := unpackParams_in_class pgsBasis splineBasis _
+    rw [h_loss_eq model h_in_class, h_loss_eq m h_m_class] at h_loss
+
+    -- 1/n > 0, so we can cancel it
+    have h_n_inv_pos : (1 / n : ℝ) > 0 := by
+        have hn : (0 : ℝ) < (n : ℝ) := by exact_mod_cast h_n_pos
+        exact one_div_pos.mpr hn
+
+    rw [mul_le_mul_iff_of_pos_left h_n_inv_pos] at h_loss
+
+    -- pred corresponds to model, w corresponds to m
+    have h_pred_m : (fun i => linearPredictor m (data.p i) (data.c i)) = w := by
+      funext i
+      rw [linearPredictor_eq_designMatrix_mulVec data pgsBasis splineBasis m h_m_class i]
+      -- packParams (unpackParams ... beta) j = beta j.
+      have h_pack : packParams m = beta := by
+        ext j
+        cases j <;> rfl -- simplified
+      rw [h_pack]
+      rw [← h_beta]
+      rfl
+
+    rw [h_pred_m] at h_loss
+    exact h_loss
+
+  -- Uniqueness of projection
+  have h_pred_proj : pred = orthogonalProjection K data.y :=
+    orthogonalProjection_eq_of_dist_le K data.y pred h_pred_in_K h_pred_min
+
+  -- Same for pred' and K'
+  -- Note: data'.y = data.y
+
+  have h_pred'_in_K' : pred' ∈ K' := by
+     have h_in_class' : InModelClass model_prime pgsBasis splineBasis := by
+       exact unpackParams_in_class pgsBasis splineBasis _
+     have h_eq' : pred' = X'.mulVec (packParams model_prime) := by
+       funext i
+       exact linearPredictor_eq_designMatrix_mulVec data' pgsBasis splineBasis model_prime h_in_class' i
+     rw [h_eq']
+     use (packParams model_prime)
+     rfl
+
+  have h_pred'_min : ∀ w ∈ K', l2norm_sq (data.y - pred') ≤ l2norm_sq (data.y - w) := by
+    intro w hw
+    obtain ⟨beta, h_beta⟩ := hw
+    let m := unpackParams pgsBasis splineBasis beta
+    have h_m_class : InModelClass m pgsBasis splineBasis := unpackParams_in_class pgsBasis splineBasis beta
+
+    -- fit_minimizes_loss for model_prime
+    have h_rank' : X'.rank = Fintype.card (ParamIx p k sp) := by
+      rw [← rank_eq_of_range_eq X X' h_range_eq]
+      exact h_rank
+
+    have h_loss : empiricalLoss model_prime data' 0 ≤ empiricalLoss m data' 0 := by
+      convert fit_minimizes_loss p k sp n data' 0 pgsBasis splineBasis h_n_pos (le_refl 0) h_rank' m h_m_class
+
+    have h_loss_eq : ∀ m', InModelClass m' pgsBasis splineBasis →
+      empiricalLoss m' data' 0 = (1 / n : ℝ) * l2norm_sq (data'.y - (fun i => linearPredictor m' (data'.p i) (data'.c i))) := by
+        intro m' hm'
+        unfold empiricalLoss
+        simp [h_lambda_zero]
+        have h_nll : ∀ i, pointwiseNLL m'.dist (data'.y i) (linearPredictor m' (data'.p i) (data'.c i)) =
+            (data'.y i - linearPredictor m' (data'.p i) (data'.c i))^2 := by
+          intro i
+          rcases hm' with ⟨_, _, _, h_dist⟩
+          simp [pointwiseNLL, h_dist]
+        simp [h_nll, l2norm_sq]
+
+    change empiricalLoss model_prime data' 0 ≤ empiricalLoss m data' 0 at h_loss
+    have h_in_class' : InModelClass model_prime pgsBasis splineBasis := unpackParams_in_class pgsBasis splineBasis _
+    rw [h_loss_eq model_prime h_in_class', h_loss_eq m h_m_class] at h_loss
+
+    have h_n_inv_pos : (1 / n : ℝ) > 0 := by
+        have hn : (0 : ℝ) < (n : ℝ) := by exact_mod_cast h_n_pos
+        exact one_div_pos.mpr hn
+    rw [mul_le_mul_iff_of_pos_left h_n_inv_pos] at h_loss
+
+    have h_pred_m : (fun i => linearPredictor m (data'.p i) (data'.c i)) = w := by
+      funext i
+      rw [linearPredictor_eq_designMatrix_mulVec data' pgsBasis splineBasis m h_m_class i]
+      have h_pack : packParams m = beta := by
+        ext j; cases j <;> rfl
+      rw [h_pack]
+      rw [← h_beta]
+      rfl
+
+    -- data'.y = data.y
+    have h_y_eq : data'.y = data.y := rfl
+    rw [h_y_eq] at h_loss
+
+    rw [h_pred_m] at h_loss
+    exact h_loss
+
+  have h_pred'_proj : pred' = orthogonalProjection K' data.y :=
+    orthogonalProjection_eq_of_dist_le K' data.y pred' h_pred'_in_K' h_pred'_min
+
+  -- Equality
+  have h_preds_eq : pred = pred' := by
+    change pred = orthogonalProjection K data.y at h_pred_proj
+    change pred' = orthogonalProjection K' data.y at h_pred'_proj
+
+    -- h_range_eq gives equality of the ranges (after definition expansion)
+    have h_K_eq : K = K' := by
+       exact h_range_eq
+
+    rw [h_K_eq] at h_pred_proj
+    rw [← h_pred_proj] at h_pred'_proj
+    exact h_pred'_proj.symm
+
+  change pred i = pred' i
+  apply congr_fun h_preds_eq
 
 noncomputable def dist_to_support {k : ℕ} (c : Fin k → ℝ) (supp : Set (Fin k → ℝ)) : ℝ :=
   Metric.infDist c supp
