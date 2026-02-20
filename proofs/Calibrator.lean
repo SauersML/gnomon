@@ -4515,11 +4515,26 @@ lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n →
     dsimp [a] at h_a_zero
     linarith
 
-  have h_eq_E : p_E = ↑(Submodule.orthogonalProjection K_E y_E) := by
-    symm
-    apply Submodule.eq_orthogonalProjection_of_mem_of_inner_eq_zero h_mem_E
-    intro w hw
-    exact h_orth w hw
+  let P_y := Submodule.orthogonalProjection K_E y_E
+  have h_orth_P : y_E - (P_y : EuclideanSpace ℝ (Fin n)) ∈ K_E.orthogonal :=
+    Submodule.sub_orthogonalProjection_mem_orthogonal y_E
+  have h_mem_P : (P_y : EuclideanSpace ℝ (Fin n)) ∈ K_E := P_y.2
+  have h_diff_mem : (P_y : EuclideanSpace ℝ (Fin n)) - p_E ∈ K_E :=
+    Submodule.sub_mem K_E h_mem_P h_mem_E
+  have h_orth_mem : y_E - p_E ∈ K_E.orthogonal := by
+    rw [Submodule.mem_orthogonal]
+    intro v hv
+    simpa [real_inner_comm] using h_orth v hv
+  have h_diff_orth : (P_y : EuclideanSpace ℝ (Fin n)) - p_E ∈ K_E.orthogonal := by
+    have h_eq : (P_y : EuclideanSpace ℝ (Fin n)) - p_E = (y_E - p_E) - (y_E - P_y) := by
+      abel
+    rw [h_eq]
+    exact Submodule.sub_mem K_E.orthogonal h_orth_mem h_orth_P
+  have h_eq_0 : (P_y : EuclideanSpace ℝ (Fin n)) - p_E = 0 := by
+    rw [← Submodule.mem_bot (R := ℝ), ← Submodule.inf_orthogonal_eq_bot K_E]
+    exact Submodule.mem_inf.mpr ⟨h_diff_mem, h_diff_orth⟩
+  have h_eq_E : p_E = (P_y : EuclideanSpace ℝ (Fin n)) := by
+    exact (sub_eq_zero.mp h_eq_0).symm
 
   apply iso.injective
   rw [orthogonalProjection]
