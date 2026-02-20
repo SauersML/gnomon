@@ -6,6 +6,7 @@ import math
 import os
 import shutil
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -30,10 +31,13 @@ try:
         load_pgs003725_effects,
         diploid_index_pairs,
         sample_site_ids_for_maf,
+        sample_two_site_sets_for_maf,
         pcs_from_sites,
+        compute_pcs_risk_and_diagnostics,
         genetic_risk_from_real_pgs_effect_distribution,
         solve_intercept_for_prevalence,
         get_chr22_recomb_map,
+        summarize_true_effect_site_diagnostics,
     )
 except ImportError:
     from common import (
@@ -41,17 +45,20 @@ except ImportError:
     load_pgs003725_effects,
     diploid_index_pairs,
     sample_site_ids_for_maf,
+    sample_two_site_sets_for_maf,
     pcs_from_sites,
+    compute_pcs_risk_and_diagnostics,
     genetic_risk_from_real_pgs_effect_distribution,
     solve_intercept_for_prevalence,
     get_chr22_recomb_map,
+    summarize_true_effect_site_diagnostics,
     )
 from methods.raw_pgs import RawPGSMethod
 from methods.linear_interaction import LinearInteractionMethod
 from methods.normalization import NormalizationMethod
 from methods.gam_mgcv import GAMMethod
 from plink_utils import run_plink_conversion
-from prs_tools import BayesR
+from prs_tools import BayesR, PPlusT
 
 
 DIVERGENCE_GENS = [5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000]
@@ -71,6 +78,11 @@ CB = {
     "purple": "#CC79A7",
     "black": "#111111",
 }
+
+
+def _log(msg: str) -> None:
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] {msg}", flush=True)
 
 
 def _apply_plot_style() -> None:
@@ -223,11 +235,18 @@ def _simulate_for_generation(
     bp_cap: int | None,
 ) -> pd.DataFrame:
     prefix = f"fig1_g{gens}_s{seed}"
+    _log(
+        f"[{prefix}] Start generation simulation "
+        f"(model={msprime_model}, n_afr={n_afr}, n_ooa_train={n_ooa_train}, n_ooa_test={n_ooa_test})"
+    )
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    _log(f"[{prefix}] Loading/truncating recombination map (bp_cap={bp_cap})")
     recomb_map = _truncate_ratemap(get_chr22_recomb_map(), bp_cap=bp_cap)
+    _log(f"[{prefix}] Building demography for split_gens={gens}")
     dem = _build_demography(gens)
 
+    _log(f"[{prefix}] Running msprime.sim_ancestry")
     ts = msprime.sim_ancestry(
         samples={"afr": n_afr, "ooa": n_ooa_train + n_ooa_test},
         demography=dem,
@@ -236,13 +255,17 @@ def _simulate_for_generation(
         random_seed=seed,
         model=msprime_model,
     )
+    _log(f"[{prefix}] Ancestry complete (nodes={ts.num_nodes}, edges={ts.num_edges}, trees={ts.num_trees})")
+    _log(f"[{prefix}] Running msprime.sim_mutations (mut_rate={mut_rate})")
     ts = msprime.sim_mutations(
         ts,
         rate=mut_rate,
         random_seed=seed + 1,
         discrete_genome=True,
     )
+    _log(f"[{prefix}] Mutations complete (sites={ts.num_sites})")
 
+    _log(f"[{prefix}] Extracting diploid sample mappings")
     a_idx, b_idx, pop_idx, ts_ind_id = diploid_index_pairs(ts)
     pop_map = {0: "AFR", 1: "OOA"}
     pop = np.array([pop_map.get(int(x), "UNK") for x in pop_idx], dtype=object)
@@ -255,26 +278,43 @@ def _simulate_for_generation(
     ooa_train_idx = ooa_idx[:n_ooa_train]
     ooa_test_idx = ooa_idx[n_ooa_train:n_ooa_train + n_ooa_test]
 
-    pca_sites = sample_site_ids_for_maf(ts, a_idx, b_idx, n_sites=pca_n_sites, maf_min=0.05, seed=seed + 7)
-    pcs = pcs_from_sites(ts, a_idx, b_idx, pca_sites, seed=seed + 11, n_components=N_PCS)
-
-    causal_sites = sample_site_ids_for_maf(
+    _log(f"[{prefix}] Sampling PCA+causal sites in one pass")
+    pca_sites, causal_sites = sample_two_site_sets_for_maf(
         ts,
         a_idx,
         b_idx,
-        n_sites=min(causal_max_sites, int(ts.num_sites)),
-        maf_min=0.01,
-        seed=seed + 17,
+        pca_n_sites=pca_n_sites,
+        pca_maf_min=0.05,
+        pca_seed=seed + 7,
+        causal_n_sites=min(causal_max_sites, int(ts.num_sites)),
+        causal_maf_min=0.01,
+        causal_seed=seed + 17,
+        log_fn=_log,
+        progress_label=f"{prefix} site_scan",
     )
-    G_true = genetic_risk_from_real_pgs_effect_distribution(
+    _log(f"[{prefix}] Computing PCs+risk+diagnostics in one pass")
+    pcs, G_true, ts_sites, causal_overlap, het_by_pop, causal_pos_1based = compute_pcs_risk_and_diagnostics(
         ts,
         a_idx,
         b_idx,
-        causal_sites,
-        pgs_effects,
-        seed=seed + 19,
+        pop,
+        pca_site_ids=pca_sites,
+        n_pcs=N_PCS,
+        pca_seed=seed + 11,
+        causal_site_ids=causal_sites,
+        real_effects=pgs_effects,
+        causal_seed=seed + 19,
+        log_fn=_log,
+        progress_label=f"{prefix} feature_build",
     )
+    het_bits = ", ".join(f"{k}={v:.4f}" for k, v in sorted(het_by_pop.items()))
+    _log(
+        f"[{prefix}] Variant diagnostics: ts_sites={ts_sites}, "
+        f"true_effect_sites={len(causal_sites)}, overlap={causal_overlap}"
+    )
+    _log(f"[{prefix}] Mean heterozygosity at true-effect sites by pop: {het_bits}")
 
+    _log(f"[{prefix}] Sampling phenotypes from liability model")
     b0 = solve_intercept_for_prevalence(0.10, G_true)
     p = sigmoid(b0 + G_true)
     rng = np.random.default_rng(seed + 23)
@@ -305,13 +345,16 @@ def _simulate_for_generation(
             row[f"pc{k+1}"] = float(pcs[i, k])
         rows.append(row)
 
+    _log(f"[{prefix}] Building dataframe (n_rows={len(rows)})")
     df = pd.DataFrame(rows)
 
-    # Write VCF + PLINK files for BayesR.
+    # Write VCF + PLINK files for downstream PRS training/scoring.
     vcf_path = out_dir / f"{prefix}.vcf"
+    _log(f"[{prefix}] Writing VCF to {vcf_path}")
     with open(vcf_path, "w") as f:
         names = [f"ind_{i+1}" for i in range(ts.num_individuals)]
         ts.write_vcf(f, individual_names=names, position_transform=lambda x: np.asarray(x) + 1)
+    _log(f"[{prefix}] Converting VCF to PLINK")
     run_plink_conversion(
         str(vcf_path),
         str(out_dir / prefix),
@@ -319,9 +362,27 @@ def _simulate_for_generation(
         threads=plink_threads,
         memory_mb=plink_memory_mb,
     )
+    bim_path = out_dir / f"{prefix}.bim"
+    bim_n_variants = sum(1 for _ in open(bim_path, "r", encoding="utf-8", errors="replace"))
+    bim_pos = set()
+    with open(bim_path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) >= 4:
+                try:
+                    bim_pos.add(int(parts[3]))
+                except ValueError:
+                    pass
+    overlap_bim_true_effect = len(bim_pos & causal_pos_1based)
+    _log(
+        f"[{prefix}] PLINK conversion complete "
+        f"(bim_variants={bim_n_variants}, overlap_true_effect_positions={overlap_bim_true_effect})"
+    )
     vcf_path.unlink(missing_ok=True)
 
+    _log(f"[{prefix}] Writing simulation table to {out_dir / f'{prefix}.tsv'}")
     df.to_csv(out_dir / f"{prefix}.tsv", sep="\t", index=False)
+    _log(f"[{prefix}] Generation simulation complete")
     return df
 
 
@@ -332,6 +393,7 @@ def _prepare_bayesr_files(
     plink_threads: int,
     plink_memory_mb: int | None,
 ) -> tuple[str, str, str, str]:
+    _log(f"[{Path(prefix).name}] Preparing PRS input files in {work_dir}")
     work_dir.mkdir(parents=True, exist_ok=True)
 
     fam = pd.read_csv(f"{prefix}.fam", sep=r"\s+", header=None, names=["FID", "IID", "PID", "MID", "SEX", "PHENO"], dtype=str)
@@ -351,8 +413,11 @@ def _prepare_bayesr_files(
     common = ["--threads", str(plink_threads)]
     if plink_memory_mb is not None and plink_memory_mb > 0:
         common.extend(["--memory", str(plink_memory_mb)])
+    _log(f"[{Path(prefix).name}] Running plink2 --freq")
     subprocess.run([plink, "--bfile", prefix, "--freq", *common, "--out", str(work_dir / "ref")], check=True)
+    _log(f"[{Path(prefix).name}] Running plink2 train split")
     subprocess.run([plink, "--bfile", prefix, "--keep", str(train_keep), "--make-bed", *common, "--out", str(work_dir / "train")], check=True)
+    _log(f"[{Path(prefix).name}] Running plink2 test split")
     subprocess.run([plink, "--bfile", prefix, "--keep", str(test_keep), "--make-bed", *common, "--out", str(work_dir / "test")], check=True)
 
     train_df = df[df["IID"].isin(train_ids)].copy()
@@ -381,6 +446,7 @@ def _prepare_bayesr_files(
 
 def _cleanup_generation_artifacts(prefix: Path, work_dir: Path) -> None:
     # Keep only final aggregated figure outputs in the top-level output directory.
+    _log(f"[{prefix.name}] Cleaning generation artifacts")
     for ext in (".bed", ".bim", ".fam", ".log", ".tsv", ".vcf"):
         p = Path(f"{prefix}{ext}")
         if p.exists():
@@ -562,6 +628,32 @@ def _plot_pc_grid(pc_rows: list[dict[str, object]], out_dir: Path) -> None:
     plt.close(fig)
 
 
+def _log_results_table(title: str, df: pd.DataFrame) -> None:
+    if df.empty:
+        _log(f"{title}: <empty>")
+        return
+    txt = df.to_string(index=False, justify="left")
+    _log(f"{title}\n{txt}")
+
+
+def _plot_pt_train_accuracy(metrics_df: pd.DataFrame, out_path: Path, title: str) -> None:
+    if metrics_df.empty:
+        return
+    _apply_plot_style()
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    x = metrics_df["p_threshold"].to_numpy(dtype=float)
+    y = metrics_df["train_accuracy"].to_numpy(dtype=float)
+    ax.plot(x, y, marker="o", linewidth=2, color=CB["blue"])
+    ax.set_xscale("log")
+    ax.set_xlabel("P+T p-value threshold")
+    ax.set_ylabel("Train accuracy")
+    ax.set_title(title)
+    _style_axes(ax)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=240)
+    plt.close(fig)
+
+
 def _run_generation_task(task: dict[str, object]) -> dict[str, object]:
     g = int(task["g"])
     seed = int(task["seed"])
@@ -579,40 +671,86 @@ def _run_generation_task(task: dict[str, object]) -> dict[str, object]:
     causal_max_sites = int(task["causal_max_sites"])
     bp_cap = task["bp_cap"]
     pgs_effects = np.asarray(task["pgs_effects"], dtype=float)
+    use_existing = bool(task.get("use_existing", False))
+    use_existing_dir_raw = task.get("use_existing_dir")
+    use_existing_dir = Path(str(use_existing_dir_raw)) if use_existing_dir_raw is not None else None
+    _log(f"[fig1_g{g}_s{seed}] Task started")
 
     _set_runtime_thread_env(threads_per_job)
     if memory_mb_per_job is not None:
         os.environ["PLINK_MEMORY_MB"] = str(int(memory_mb_per_job))
+    _log(f"[fig1_g{g}_s{seed}] Runtime resources set (threads={threads_per_job}, memory_mb={memory_mb_per_job})")
 
-    df = _simulate_for_generation(
-        g,
-        seed,
-        pgs_effects,
-        out_dir,
-        n_afr=n_afr,
-        n_ooa_train=n_ooa_train,
-        n_ooa_test=n_ooa_test,
-        plink_threads=threads_per_job,
-        plink_memory_mb=memory_mb_per_job,
-        msprime_model=msprime_model,
-        mut_rate=mut_rate,
-        pca_n_sites=pca_n_sites,
-        causal_max_sites=causal_max_sites,
-        bp_cap=(int(bp_cap) if bp_cap is not None else None),
-    )
     prefix = str(out_dir / f"fig1_g{g}_s{seed}")
+    source_base = use_existing_dir if use_existing_dir is not None else out_dir
+    source_prefix = source_base / f"fig1_g{g}_s{seed}"
+    sim_tsv = source_base / f"fig1_g{g}_s{seed}.tsv"
+    if use_existing:
+        needed = [Path(f"{source_prefix}.bed"), Path(f"{source_prefix}.bim"), Path(f"{source_prefix}.fam"), sim_tsv]
+        miss = [str(p) for p in needed if not p.exists()]
+        if miss:
+            raise FileNotFoundError(
+                f"[fig1_g{g}_s{seed}] --use-existing requested, but missing files: {miss}"
+            )
+        _log(f"[fig1_g{g}_s{seed}] Reusing existing simulation/PLINK files from {source_base}")
+        df = pd.read_csv(sim_tsv, sep="\t")
+    else:
+        df = _simulate_for_generation(
+            g,
+            seed,
+            pgs_effects,
+            out_dir,
+            n_afr=n_afr,
+            n_ooa_train=n_ooa_train,
+            n_ooa_test=n_ooa_test,
+            plink_threads=threads_per_job,
+            plink_memory_mb=memory_mb_per_job,
+            msprime_model=msprime_model,
+            mut_rate=mut_rate,
+            pca_n_sites=pca_n_sites,
+            causal_max_sites=causal_max_sites,
+            bp_cap=(int(bp_cap) if bp_cap is not None else None),
+        )
     work = work_root / f"fig1_g{g}_s{seed}_work"
     train_prefix, test_prefix, train_phen, freq_file = _prepare_bayesr_files(
         df,
-        prefix,
+        str(source_prefix),
         work,
         plink_threads=threads_per_job,
         plink_memory_mb=memory_mb_per_job,
     )
-    br = BayesR(threads=threads_per_job, plink_memory_mb=memory_mb_per_job)
-    eff_file = br.fit(train_prefix, train_phen, str(work / "bayesr"), covar_file=str(work / "train.covar"))
-    test_scores = br.predict(test_prefix, eff_file, str(work / "bayesr_test"), freq_file=freq_file)
-    train_scores = br.predict(train_prefix, eff_file, str(work / "bayesr_train"), freq_file=freq_file)
+    use_bayesr = bool(task.get("use_bayesr", False))
+    if use_bayesr:
+        _log(f"[fig1_g{g}_s{seed}] BayesR fit starting")
+        br = BayesR(threads=threads_per_job, plink_memory_mb=memory_mb_per_job)
+        eff_file = br.fit(train_prefix, train_phen, str(work / "bayesr"), covar_file=str(work / "train.covar"))
+        _log(f"[fig1_g{g}_s{seed}] BayesR fit complete; scoring test/train")
+        test_scores = br.predict(test_prefix, eff_file, str(work / "bayesr_test"), freq_file=freq_file)
+        train_scores = br.predict(train_prefix, eff_file, str(work / "bayesr_train"), freq_file=freq_file)
+    else:
+        _log(f"[fig1_g{g}_s{seed}] P+T fit/scoring starting")
+        pt = PPlusT(threads=threads_per_job, plink_memory_mb=memory_mb_per_job)
+        train_scores, test_scores, pt_meta = pt.fit_and_predict(
+            bfile_train=train_prefix,
+            bfile_test=test_prefix,
+            pheno_file=train_phen,
+            covar_file=str(work / "train.covar"),
+            freq_file=freq_file,
+            out_prefix=str(work / "pt"),
+        )
+        pt_metrics_df = pt_meta["threshold_metrics"].copy()
+        pt_metrics_df.insert(0, "gens", int(g))
+        pt_metrics_df.insert(1, "seed", int(seed))
+        pt_metrics_df["is_selected"] = pt_metrics_df["p_threshold"] == float(pt_meta["best_p_threshold"])
+        pt_tsv_path = out_dir / f"fig1_g{g}_s{seed}.pt_thresholds.tsv"
+        pt_plot_path = out_dir / f"fig1_g{g}_s{seed}.pt_train_accuracy.png"
+        pt_metrics_df.to_csv(pt_tsv_path, sep="\t", index=False)
+        _plot_pt_train_accuracy(pt_metrics_df, pt_plot_path, title=f"fig1 g={g} seed={seed} train accuracy")
+        _log(
+            f"[fig1_g{g}_s{seed}] P+T selected p={float(pt_meta['best_p_threshold']):g} "
+            f"(train_accuracy={float(pt_meta['best_train_accuracy']):.4f}, n_snps={int(pt_meta['best_n_snps'])})"
+        )
+        _log(f"[fig1_g{g}_s{seed}] P+T fit/scoring complete")
 
     train_df = df[df["group"] == "OOA_train"].copy()
     test_df = df[df["group"].isin(["OOA_test", "AFR_test"])].copy()
@@ -626,6 +764,8 @@ def _run_generation_task(task: dict[str, object]) -> dict[str, object]:
         train_scores["PRS"].to_numpy(dtype=float),
         test_scores["PRS"].to_numpy(dtype=float),
     )
+    _log(f"[fig1_g{g}_s{seed}] Method fitting/prediction complete")
+    test_prs = test_scores["PRS"].to_numpy(dtype=float)
 
     result_rows = []
     for method, y_prob in pred.items():
@@ -634,7 +774,20 @@ def _run_generation_task(task: dict[str, object]) -> dict[str, object]:
         auc_o = _auc(test_df.loc[o, "y"].to_numpy(), y_prob[o.to_numpy()])
         auc_a = _auc(test_df.loc[a, "y"].to_numpy(), y_prob[a.to_numpy()])
         ratio = float(auc_o / auc_a) if np.isfinite(auc_o) and np.isfinite(auc_a) and auc_a > 0 else np.nan
-        result_rows.append({"gens": int(g), "seed": int(seed), "method": method, "auc_ooa": auc_o, "auc_afr": auc_a, "auc_ratio": ratio})
+        result_rows.append(
+            {
+                "gens": int(g),
+                "seed": int(seed),
+                "method": method,
+                "n_train": int(len(train_df)),
+                "n_test_total": int(len(test_df)),
+                "n_test_ooa": int(np.count_nonzero(o.to_numpy())),
+                "n_test_afr": int(np.count_nonzero(a.to_numpy())),
+                "auc_ooa": auc_o,
+                "auc_afr": auc_a,
+                "auc_ratio": ratio,
+            }
+        )
 
     prs_df = test_df[["IID", "group"]].copy()
     prs_df["IID"] = prs_df["IID"].astype(str)
@@ -649,15 +802,32 @@ def _run_generation_task(task: dict[str, object]) -> dict[str, object]:
     pc_df = df[["group", "pc1", "pc2"]].copy()
     pc_df.insert(0, "gens", int(g))
 
+    pred_rows = []
+    for method, y_prob in pred.items():
+        part = test_df[["IID", "group", "pop_label", "y", "G_true", "pc1", "pc2", "pc3", "pc4", "pc5"]].copy()
+        part.insert(0, "seed", int(seed))
+        part.insert(0, "gens", int(g))
+        part["method"] = method
+        part["prs"] = test_prs
+        part["y_prob"] = np.asarray(y_prob, dtype=float)
+        pred_rows.append(part)
+    pred_df = pd.concat(pred_rows, ignore_index=True)
+
     res_path = out_dir / f"fig1_g{g}_s{seed}.results.tsv"
     prs_path = out_dir / f"fig1_g{g}_s{seed}.prs.tsv"
     pc_path = out_dir / f"fig1_g{g}_s{seed}.pc.tsv"
+    pred_path = out_dir / f"fig1_g{g}_s{seed}.predictions.tsv"
     pd.DataFrame(result_rows).to_csv(res_path, sep="\t", index=False)
     prs_df.to_csv(prs_path, sep="\t", index=False)
     pc_df.to_csv(pc_path, sep="\t", index=False)
+    pred_df.to_csv(pred_path, sep="\t", index=False)
+    _log(f"[fig1_g{g}_s{seed}] Wrote per-generation outputs")
 
-    if not keep_intermediates:
+    if not keep_intermediates and not use_existing:
         _cleanup_generation_artifacts(prefix=Path(prefix), work_dir=Path(work))
+    elif not keep_intermediates and use_existing:
+        shutil.rmtree(Path(work), ignore_errors=True)
+    _log(f"[fig1_g{g}_s{seed}] Task complete")
 
     return {
         "gens": int(g),
@@ -665,6 +835,8 @@ def _run_generation_task(task: dict[str, object]) -> dict[str, object]:
         "res_path": str(res_path),
         "prs_path": str(prs_path),
         "pc_path": str(pc_path),
+        "pred_path": str(pred_path),
+        "pt_thresholds_path": str(pt_tsv_path) if not use_bayesr else "",
     }
 
 
@@ -701,13 +873,17 @@ def main() -> None:
     )
     parser.add_argument("--work-root", default=None, help="Directory for heavy transient work files (e.g., RAM disk).")
     parser.add_argument("--keep-intermediates", action="store_true", help="Keep per-generation PLINK/GCTB intermediate files.")
+    parser.add_argument("--bayesr", action="store_true", help="Use BayesR backend (default is fast P+T).")
+    parser.add_argument("--use-existing", action="store_true", help="Reuse existing fig1_g*_s* PLINK/TSV files; skip simulation.")
+    parser.add_argument("--use-existing-dir", default=None, help="Directory containing existing fig1_g*_s* PLINK/TSV files.")
     args = parser.parse_args()
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     work_root = Path(args.work_root) if args.work_root else _default_work_root(out_dir)
     work_root.mkdir(parents=True, exist_ok=True)
-    print("Figure1 GAM backend: mgcv")
+    _log("Figure1 GAM backend: mgcv")
+    _log(f"Figure1 PRS backend: {'BayesR' if args.bayesr else 'P+T'}")
 
     score_path = ensure_pgs003725(Path(args.cache))
     pgs_effects = load_pgs003725_effects(score_path, chr_filter="22")
@@ -720,7 +896,7 @@ def main() -> None:
         total_mem_mb_override=args.memory_mb_total,
     )
     _set_runtime_thread_env(threads_per_job)
-    print(
+    _log(
         f"Figure1 resources: jobs={jobs} threads_per_job={threads_per_job} "
         f"memory_mb_per_job={memory_mb_per_job}"
     )
@@ -745,8 +921,12 @@ def main() -> None:
                 "causal_max_sites": int(args.causal_sites),
                 "bp_cap": args.bp_cap,
                 "pgs_effects": pgs_effects,
+                "use_bayesr": bool(args.bayesr),
+                "use_existing": bool(args.use_existing),
+                "use_existing_dir": args.use_existing_dir,
             }
         )
+    _log(f"Figure1 queued {len(tasks)} generation tasks")
 
     done = []
     with concurrent.futures.ProcessPoolExecutor(max_workers=jobs) as ex:
@@ -754,18 +934,68 @@ def main() -> None:
         for fut in concurrent.futures.as_completed(futs):
             rec = fut.result()
             done.append(rec)
-            print(f"Completed generation g={rec['gens']} seed={rec['seed']}")
+            _log(f"Completed generation g={rec['gens']} seed={rec['seed']}")
 
     done = sorted(done, key=lambda x: int(x["gens"]))
     res_df = pd.concat([pd.read_csv(str(r["res_path"]), sep="\t") for r in done], ignore_index=True).sort_values(["method", "gens"])
     prs_df = pd.concat([pd.read_csv(str(r["prs_path"]), sep="\t") for r in done], ignore_index=True)
     pc_df = pd.concat([pd.read_csv(str(r["pc_path"]), sep="\t") for r in done], ignore_index=True)
+    pred_df = pd.concat([pd.read_csv(str(r["pred_path"]), sep="\t") for r in done], ignore_index=True)
     res_df.to_csv(out_dir / "figure1_auc_ratio.tsv", sep="\t", index=False)
+    pred_df.to_csv(out_dir / "figure1_predictions.tsv", sep="\t", index=False)
+    pt_paths = [str(r.get("pt_thresholds_path", "")) for r in done if str(r.get("pt_thresholds_path", ""))]
+    if pt_paths:
+        pt_all = pd.concat([pd.read_csv(p, sep="\t") for p in pt_paths], ignore_index=True)
+        pt_all.to_csv(out_dir / "figure1_pt_thresholds.tsv", sep="\t", index=False)
+        _apply_plot_style()
+        fig, ax = plt.subplots(figsize=(9, 5.5))
+        for g in sorted(pt_all["gens"].unique()):
+            sub = pt_all[pt_all["gens"] == g].sort_values("p_threshold")
+            ax.plot(
+                sub["p_threshold"].to_numpy(dtype=float),
+                sub["train_accuracy"].to_numpy(dtype=float),
+                marker="o",
+                linewidth=1.8,
+                label=f"g={int(g)}",
+            )
+        ax.set_xscale("log")
+        ax.set_xlabel("P+T p-value threshold")
+        ax.set_ylabel("Train accuracy")
+        ax.set_title("Figure1 P+T train accuracy across thresholds")
+        ax.legend(frameon=False, ncol=2)
+        _style_axes(ax)
+        fig.tight_layout()
+        fig.savefig(out_dir / "figure1_pt_train_accuracy_by_generation.png", dpi=240)
+        plt.close(fig)
+    detailed = (
+        pred_df.groupby(["gens", "method", "group"], as_index=False)
+        .agg(
+            n=("y", "size"),
+            prevalence=("y", "mean"),
+            mean_prs=("prs", "mean"),
+            sd_prs=("prs", "std"),
+            mean_g_true=("G_true", "mean"),
+            mean_y_prob=("y_prob", "mean"),
+        )
+        .sort_values(["gens", "method", "group"])
+    )
+    detailed.to_csv(out_dir / "figure1_detailed_metrics.tsv", sep="\t", index=False)
+    _log("Figure1 wrote aggregated results table")
+    _log_results_table(
+        "[fig1] AUC ratio results (gens/method)",
+        res_df.sort_values(["gens", "method"]).reset_index(drop=True),
+    )
+    _log_results_table(
+        "[fig1] Detailed grouped stats",
+        detailed.sort_values(["gens", "method", "group"]).reset_index(drop=True),
+    )
 
+    _log("Figure1 plotting outputs")
     _plot_main(res_df, out_dir)
     _plot_demography(out_dir, split_gens=int(sorted(args.gens)[len(args.gens) // 2]))
     _plot_prs_grid(prs_df.to_dict("records"), out_dir)
     _plot_pc_grid(pc_df.to_dict("records"), out_dir)
+    _log("Figure1 run complete")
 
 
 if __name__ == "__main__":

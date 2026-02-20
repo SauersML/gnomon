@@ -53,6 +53,14 @@ pub const BUILTIN_MODELS: &[BuiltinModel] = &[
         components: 20,
         variants: 1_900_000,
     },
+    BuiltinModel {
+        name: "hwe_1kg_hgdp_intersection",
+        url: "https://github.com/SauersML/gnomon/releases/download/models-v1/hwe_1kg_hgdp_intersection.json.zst",
+        sha256: "", // Will be populated after first training run
+        build: "GRCh38",
+        components: 20,
+        variants: 56_331,
+    },
 ];
 
 /// Error type for built-in model operations.
@@ -252,5 +260,6 @@ mod tests {
         assert!(names.contains(&"hwe_1kg_hgdp_gsa_v2"));
         assert!(names.contains(&"hwe_1kg_hgdp_gsa_v3"));
         assert!(names.contains(&"hwe_1kg_hgdp_gda_v1")); // GDA is still available via release
+        assert!(names.contains(&"hwe_1kg_hgdp_intersection"));
     }
 }
