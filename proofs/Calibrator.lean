@@ -331,6 +331,18 @@ theorem fitNormalized_minimizes_loss (p k sp n : ℕ) [Fintype (Fin p)] [Fintype
 =================================================================
 -/
 
+/-
+L2 integrability implies L1 integrability on a finite measure space.
+-/
+open MeasureTheory
+
+lemma integrable_of_integrable_sq_proven {α : Type*} [MeasureSpace α] {μ : Measure α} [IsFiniteMeasure μ]
+    {f : α → ℝ} (hf_meas : AEStronglyMeasurable f μ)
+    (hf_sq : Integrable (fun x => (f x)^2) μ) :
+    Integrable f μ := by
+      refine' MeasureTheory.Integrable.mono' _ _ _;
+      exacts [ fun x => f x ^ 2 + 1, by exact MeasureTheory.Integrable.add hf_sq ( MeasureTheory.integrable_const _ ), hf_meas, Filter.Eventually.of_forall fun x => by rw [ Real.norm_eq_abs, abs_le ] ; constructor <;> nlinarith ]
+
 
 /-- **Lemma**: Moments of the standard Gaussian distribution are integrable.
     Specifically, x^n is integrable w.r.t N(0,1). -/
@@ -4102,6 +4114,39 @@ theorem optimal_recovers_truth_of_capable {p k sp : ℕ} [Fintype (Fin p)] [Fint
     Assumption: E[scaling(C)] = 1 (centered scaling).
     Then the additive projection of scaling(C)*P is 1*P.
     The residual is (scaling(C) - 1)*P. -/
+lemma memLp_finset_sum {ι : Type*} {p : ℝ≥0∞} {μ : Measure (ℝ × (Fin k → ℝ))} [Fintype ι]
+    {f : ι → (ℝ × (Fin k → ℝ)) → ℝ} (hf : ∀ i, MemLp (f i) p μ) :
+    MemLp (fun x => ∑ i, f i x) p μ := by
+  classical
+  let s := Finset.univ (α := ι)
+  have h_sum : (fun x => ∑ i, f i x) = (fun x => ∑ i in s, f i x) := by simp
+  rw [h_sum]
+  apply Finset.induction_on s
+  · simp
+    exact MemLp.zero
+  · intro a s _ ih
+    simp
+    apply MemLp.add (hf a) ih
+
+lemma memLp_finset_sum' {ι α E : Type*} [Fintype ι] [MeasurableSpace α] {μ : Measure α}
+    [NormedAddCommGroup E] {p : ℝ≥0∞} {f : ι → α → E} (hf : ∀ i, MemLp (f i) p μ) :
+    MemLp (fun x => ∑ i, f i x) p μ := by
+  classical
+  let s := Finset.univ (α := ι)
+  have h_sum : (fun x => ∑ i, f i x) = (fun x => ∑ i in s, f i x) := by simp
+  rw [h_sum]
+  apply Finset.induction_on s
+  · simp
+    exact MemLp.zero
+  · intro a s _ ih
+    simp
+    apply MemLp.add (hf a) ih
+
+lemma integrable_finset_sum_sq {ι α : Type*} [Fintype ι] [MeasurableSpace α] {μ : Measure α}
+    {f : ι → α → ℝ} (hf : ∀ i, MemLp (f i) 2 μ) :
+    Integrable (fun x => (∑ i, f i x)^2) μ :=
+  (memLp_finset_sum' hf).integrable_sq
+
 theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (Fin k)]
     (scaling_func : (Fin k → ℝ) → ℝ)
     (h_scaling_meas : AEStronglyMeasurable scaling_func ((stdNormalProdMeasure k).map Prod.snd))
@@ -4259,13 +4304,44 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
 
     -- We need to show base_fn is square integrable.
     have h_base_sq_int : Integrable (fun c => (base_fn c)^2) μC := by
-      -- base_fn is a finite sum of spline basis functions (and a constant).
-      -- Each basis function is in L2 (by h_spline_memLp and lifting to product measure).
-      -- The subspace of L2 functions is closed under addition and scalar multiplication.
-      -- Therefore base_fn is in L2, so its square is integrable.
-      have h_memLp : MemLp base_fn 2 μC := by
-        sorry -- Standard result: sum of L2 functions is L2.
-      exact h_memLp.integrable_sq
+      unfold base_fn predictorBase
+      have h_const : MemLp (fun _ => model_norm.γ₀₀) 2 μC := by
+        refine memLp_const _
+        -- Measure is probability, so finite
+        exact measure_lt_top _ _
+
+      have h_sum_l : MemLp (fun c => ∑ l, evalSmooth model_norm.pcSplineBasis (model_norm.f₀ₗ l) (c l)) 2 μC := by
+        apply memLp_finset_sum'
+        intro l
+        unfold evalSmooth
+        apply memLp_finset_sum'
+        intro s
+        apply MemLp.const_mul
+        -- Lift 1D L2 to Product Measure L2
+        have h_lift : MemLp (fun c : Fin k → ℝ => model_norm.pcSplineBasis.b s (c l)) 2 μC := by
+          -- The marginal distribution of c_l is standard Gaussian.
+          -- Since b_s is L2(Gaussian), its composition with projection is L2(Product).
+          have h_marginal : Measure.map (fun c => c l) μC = ProbabilityTheory.gaussianReal 0 1 := by
+            -- Unfold μC to show it is the Pi measure
+            have h_muC : μC = Measure.pi (fun (_ : Fin k) => ProbabilityTheory.gaussianReal 0 1) := by
+              unfold stdNormalProdMeasure
+              rw [Measure.map_snd_prod]
+              simp only [MeasureTheory.IsProbabilityMeasure.measure_univ, one_smul]
+            rw [h_muC]
+            rw [Measure.pi_map_eval]
+            -- Use IsProbabilityMeasure to simplify the scalar coefficient
+            simp [MeasureTheory.measure_univ]
+          have h1D := h_spline_memLp s
+          rw [← h_marginal] at h1D
+          -- Composition with measurable projection preserves L2 if we map the measure back?
+          -- Actually MemLp f p (map g μ) <-> MemLp (f ∘ g) p μ
+          rw [memLp_map_iff] at h1D
+          · exact h1D
+          · exact measurable_pi_apply l
+          · exact measurable_snd.aemeasurable
+        exact h_lift
+
+      apply (h_const.add h_sum_l).integrable_sq
 
     -- Apply decomposition to model_norm
     have h_risk_norm : expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) =
@@ -4332,8 +4408,6 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
   exact h_risk_star
 
 
-/-- Under a multiplicative bias DGP where E[Y|P,C] = scaling_func(C) * P,
-    the Bayes-optimal PGS coefficient at ancestry c recovers scaling_func(c) exactly.
 
     **Changed from approximate (≈ 0.01) to exact equality**.
     The approximate version was unprovable from the given hypotheses. -/
@@ -6838,13 +6912,6 @@ lemma optimal_intercept_eq_mean_of_zero_mean_p_proven
     (Y : (ℝ × (Fin 1 → ℝ)) → ℝ) (a b : ℝ)
     (hY : Integrable Y μ)
     (hP : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1) μ)
-    (hP0 : ∫ pc, pc.1 ∂μ = 0)
-    (h_orth_1 : ∫ pc, (Y pc - (a + b * pc.1)) ∂μ = 0) :
-    a = ∫ pc, Y pc ∂μ := by
-      exact optimal_intercept_eq_mean_of_zero_mean_p μ Y a b hY hP hP0 h_orth_1
-
-/-
-The optimal slope is the covariance of Y and P when P is normalized (mean 0, variance 1).
 -/
 open Calibrator
 
