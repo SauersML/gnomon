@@ -25,11 +25,11 @@ jobs:
         uses: dtolnay/rust-toolchain@nightly
 
       - name: Cargo build (release)
-        run: cargo +nightly build --release
+        run: cargo +nightly-2025-12-13 build --release
 
       - name: Run selected test
         env:
           TEST_NAME: ${{ inputs.test_name }}
         run: |
           echo "Running test: $TEST_NAME"
-          cargo +nightly test --release "$TEST_NAME"
+          cargo +nightly-2025-12-13 test --release "$TEST_NAME"

@@ -62,7 +62,7 @@ jobs:
             ${{ runner.os }}-cargo-build-nightly-
 
       - name: Cargo fetch (prepopulate deps cache)
-        run: cargo +nightly fetch
+        run: cargo +nightly-2025-12-13 fetch
 
       - name: Install cargo-nextest
         run: |
@@ -72,5 +72,5 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo +nightly nextest run --profile ci --release \
+          cargo +nightly-2025-12-13 nextest run --profile ci --release \
             --filter-expr "${{ matrix.filter_expr }}"
