@@ -5434,6 +5434,13 @@ theorem constraint_projection_correctness
   rw [h4, h3]
   simp only [Matrix.transpose_zero]
 
+/-- Pack and unpack are inverses. -/
+lemma packParams_unpackParams_eq {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
+    (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp) (β : ParamVec p k sp) :
+    packParams (unpackParams pgsBasis splineBasis β) = β := by
+  ext i
+  cases i <;> simp [packParams, unpackParams]
+
 /-- The constrained basis preserves the column space spanned by valid coefficients. -/
 theorem constrained_basis_spans_subspace
     (B : Matrix (Fin n) (Fin m) ℝ)
