@@ -1,8 +1,9 @@
 use std::collections::HashSet;
 use std::fs::{self, File};
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use infer_sex::{
     Chromosome, GenomeBuild, InferenceConfig, InferenceError, InferenceResult, InferredSex,
     PlatformDefinition, SexInferenceAccumulator, VariantInfo,
@@ -125,6 +126,62 @@ const SEX_TSV_HEADER: &str = concat!(
     "X_NonPAR_Valid\tX_NonPAR_Het\tY_NonPAR_Valid\tY_PAR_Valid",
 );
 
+enum TermsProgress {
+    Terminal(ProgressBar),
+    Plain { last_percent: u64 },
+}
+
+impl TermsProgress {
+    fn new(total_variants: usize) -> Self {
+        let total = total_variants as u64;
+        if std::io::stderr().is_terminal() {
+            let pb =
+                ProgressBar::with_draw_target(Some(total), ProgressDrawTarget::stderr_with_hz(20));
+            let style = ProgressStyle::with_template(
+                "{msg} [{bar:40.cyan/blue}] {pos:>7}/{len:7} ({percent:>3}%)",
+            )
+            .expect("progress template should be valid")
+            .progress_chars("█▉▊▋▌▍▎▏  ");
+            pb.set_style(style);
+            pb.set_message("Inferring sex terms");
+            Self::Terminal(pb)
+        } else {
+            eprintln!("Inferring sex terms: 0% complete...");
+            Self::Plain { last_percent: 0 }
+        }
+    }
+
+    fn update(&mut self, processed: usize, total_variants: usize) {
+        let total = total_variants.max(1) as u64;
+        let processed_u64 = processed as u64;
+        let percent = ((processed_u64.saturating_mul(100)) / total).min(100);
+        match self {
+            Self::Terminal(pb) => pb.set_position(processed_u64.min(total)),
+            Self::Plain { last_percent } => {
+                if percent > *last_percent {
+                    *last_percent = percent;
+                    eprintln!("Inferring sex terms: {percent}% complete...");
+                }
+            }
+        }
+    }
+
+    fn finish(self, total_variants: usize) {
+        let total = total_variants as u64;
+        match self {
+            Self::Terminal(pb) => {
+                pb.set_position(total);
+                pb.finish_with_message("Inferring sex terms: complete");
+            }
+            Self::Plain { last_percent } => {
+                if last_percent < 100 {
+                    eprintln!("Inferring sex terms: 100% complete.");
+                }
+            }
+        }
+    }
+}
+
 pub fn infer_sex_to_tsv(
     genotype_path: &Path,
     force_build: Option<GenomeBuild>,
@@ -174,9 +231,10 @@ fn collect_inference(
     let block_capacity = 256usize;
     let mut storage = vec![f64::NAN; block_capacity * n_samples];
     let mut processed = 0usize;
+    let mut progress = TermsProgress::new(total_variants);
 
     while processed < total_variants {
-        eprintln!("{}% complete...", { (processed / total_variants) * 100 });
+        progress.update(processed, total_variants);
         let capacity = block_capacity.min(total_variants - processed);
         let slice_len = capacity * n_samples;
         let filled = block_source.next_block_into(capacity, &mut storage[..slice_len])?;
@@ -216,6 +274,7 @@ fn collect_inference(
 
         processed += filled;
     }
+    progress.finish(total_variants);
 
     if processed < total_variants {
         return Err(SexInferenceError::VariantUnderflow {
@@ -250,9 +309,10 @@ fn write_results(
     build: GenomeBuild,
 ) -> Result<(), SexInferenceError> {
     if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
-        }
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
 
     let file = File::create(path)?;
     let mut writer = BufWriter::new(file);

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures as cf
 import math
 import os
 import subprocess
@@ -130,6 +131,19 @@ def mean_ci(x: np.ndarray) -> Tuple[float, float, float]:
     return m, m - z * se, m + z * se
 
 
+def format_p(p: float) -> str:
+    if np.isnan(p):
+        return "p=n/a"
+    if p < 1e-4:
+        return "p<1e-4"
+    return f"p={p:.3g}"
+
+
+def add_bracket(ax: plt.Axes, x1: float, x2: float, y: float, h: float, label: str) -> None:
+    ax.plot([x1, x1, x2, x2], [y, y + h, y + h, y], color="black", linewidth=1.0)
+    ax.text((x1 + x2) / 2.0, y + h, label, ha="center", va="bottom", fontsize=8)
+
+
 def simulate_seed(cfg: Config, seed: int) -> Dict[str, np.ndarray]:
     ts = msprime.sim_ancestry(
         samples=[msprime.SampleSet(cfg.n_ind, ploidy=2)],
@@ -138,7 +152,7 @@ def simulate_seed(cfg: Config, seed: int) -> Dict[str, np.ndarray]:
         ploidy=2,
         population_size=cfg.ne,
         random_seed=seed,
-        model="hudson",
+        model="dtwf",
     )
     ts = msprime.sim_mutations(ts, rate=cfg.mut, random_seed=seed + 1)
 
@@ -244,36 +258,52 @@ def calibrated_auc_with_optional_orth(prs: np.ndarray, pcs: np.ndarray, g: np.nd
     return out
 
 
-def run(cfg: Config, seeds: List[int], out_dir: Path, include_bayesr: bool, bayesr_max_seeds: int) -> pd.DataFrame:
+def _run_seed(cfg: Config, seed: int, include_bayesr_for_seed: bool) -> List[Dict[str, float]]:
     rows: List[Dict[str, float]] = []
 
-    for seed in seeds:
-        sim = simulate_seed(cfg, seed)
+    sim = simulate_seed(cfg, seed)
+    y = sim["y_test"]
+    g = sim["g_test"]
+    pcs = sim["pcs_test"]
+
+    weak_orig = calibrated_auc_with_optional_orth(sim["prs_weak"], pcs, g, y, orth=False)
+    weak_orth = calibrated_auc_with_optional_orth(sim["prs_weak"], pcs, g, y, orth=True)
+    strong_orig = calibrated_auc_with_optional_orth(sim["prs_strong"], pcs, g, y, orth=False)
+
+    rows.append({"seed": seed, "condition": "weak_original", **weak_orig})
+    rows.append({"seed": seed, "condition": "weak_orthogonalized", **weak_orth})
+    rows.append({"seed": seed, "condition": "strong_original", **strong_orig})
+
+    if include_bayesr_for_seed:
+        sim = simulate_bayesr_seed(seed)
         y = sim["y_test"]
         g = sim["g_test"]
         pcs = sim["pcs_test"]
+        prs = sim["prs_bayesr"]
 
-        weak_orig = calibrated_auc_with_optional_orth(sim["prs_weak"], pcs, g, y, orth=False)
-        weak_orth = calibrated_auc_with_optional_orth(sim["prs_weak"], pcs, g, y, orth=True)
-        strong_orig = calibrated_auc_with_optional_orth(sim["prs_strong"], pcs, g, y, orth=False)
+        bayesr_orig = calibrated_auc_with_optional_orth(prs, pcs, g, y, orth=False)
+        bayesr_orth = calibrated_auc_with_optional_orth(prs, pcs, g, y, orth=True)
 
-        rows.append({"seed": seed, "condition": "weak_original", **weak_orig})
-        rows.append({"seed": seed, "condition": "weak_orthogonalized", **weak_orth})
-        rows.append({"seed": seed, "condition": "strong_original", **strong_orig})
+        rows.append({"seed": seed, "condition": "bayesr_original", **bayesr_orig})
+        rows.append({"seed": seed, "condition": "bayesr_orthogonalized", **bayesr_orth})
+    return rows
 
-    if include_bayesr:
-        for seed in seeds[:bayesr_max_seeds]:
-            sim = simulate_bayesr_seed(seed)
-            y = sim["y_test"]
-            g = sim["g_test"]
-            pcs = sim["pcs_test"]
-            prs = sim["prs_bayesr"]
 
-            bayesr_orig = calibrated_auc_with_optional_orth(prs, pcs, g, y, orth=False)
-            bayesr_orth = calibrated_auc_with_optional_orth(prs, pcs, g, y, orth=True)
+def run(cfg: Config, seeds: List[int], out_dir: Path, include_bayesr: bool, bayesr_max_seeds: int, workers: int) -> pd.DataFrame:
+    rows: List[Dict[str, float]] = []
+    bayesr_seed_set = set(seeds[:bayesr_max_seeds]) if include_bayesr else set()
 
-            rows.append({"seed": seed, "condition": "bayesr_original", **bayesr_orig})
-            rows.append({"seed": seed, "condition": "bayesr_orthogonalized", **bayesr_orth})
+    if workers <= 1:
+        for seed in seeds:
+            rows.extend(_run_seed(cfg, seed, seed in bayesr_seed_set))
+    else:
+        with cf.ProcessPoolExecutor(max_workers=workers) as ex:
+            futs = [
+                ex.submit(_run_seed, cfg, seed, seed in bayesr_seed_set)
+                for seed in seeds
+            ]
+            for fut in cf.as_completed(futs):
+                rows.extend(fut.result())
 
     df = pd.DataFrame(rows)
     df["gap_additive_minus_raw"] = df["auc_additive"] - df["auc_raw"]
@@ -284,7 +314,7 @@ def run(cfg: Config, seeds: List[int], out_dir: Path, include_bayesr: bool, baye
     return df
 
 
-def make_plots(df: pd.DataFrame, out_dir: Path) -> None:
+def make_plots(df: pd.DataFrame, out_dir: Path, pvals: Dict[str, float]) -> None:
     plt.rcParams.update({
         "figure.dpi": 180,
         "axes.facecolor": "#fafafa",
@@ -303,11 +333,11 @@ def make_plots(df: pd.DataFrame, out_dir: Path) -> None:
         "strong_original",
     ]
     labels = {
-        "weak_original": "Weak polygenic risk score + original principal components",
-        "weak_orthogonalized": "Weak polygenic risk score + orthogonalized principal components",
-        "bayesr_original": "BayesR polygenic risk score + original principal components",
-        "bayesr_orthogonalized": "BayesR polygenic risk score + orthogonalized principal components",
-        "strong_original": "Strong polygenic risk score + original principal components",
+        "weak_original": "Weak PGS + original principal components",
+        "weak_orthogonalized": "Weak PGS + orthogonalized principal components",
+        "bayesr_original": "BayesR PGS + original principal components",
+        "bayesr_orthogonalized": "BayesR PGS + orthogonalized principal components",
+        "strong_original": "Strong PGS + original principal components",
     }
     colors = {
         "weak_original": "#1f77b4",
@@ -321,6 +351,7 @@ def make_plots(df: pd.DataFrame, out_dir: Path) -> None:
 
     ax = axes[0]
     present_order = [c for c in order if c in set(df["condition"])]
+    xpos = {c: i for i, c in enumerate(present_order)}
     for i, cond in enumerate(present_order):
         sub = df[df["condition"] == cond]
         x = np.full(len(sub), i, dtype=float)
@@ -331,9 +362,24 @@ def make_plots(df: pd.DataFrame, out_dir: Path) -> None:
     ax.axhline(0, color="gray", ls=":")
     ax.set_xticks(list(range(len(present_order))))
     ax.set_xticklabels([labels[c] for c in present_order], rotation=15, ha="right")
-    ax.set_ylabel("Difference in area under the receiver operating characteristic curve (additive model minus raw score model)")
-    ax.set_title("Generation zero result: gain from adding principal components")
+    ax.set_ylabel("AUC gain from adding PCs")
     ax.grid(True)
+
+    yvals = df["gap_additive_minus_raw"].to_numpy(dtype=float)
+    ytop = float(np.nanmax(yvals)) if len(yvals) else 0.1
+    yrange = max(0.12, float(np.nanmax(yvals) - np.nanmin(yvals)) if len(yvals) else 0.12)
+    y_step = 0.11 * yrange
+
+    bracket_level = 0
+    for test_id, c1, c2 in [
+        ("H2", "weak_original", "weak_orthogonalized"),
+        ("H6", "bayesr_original", "bayesr_orthogonalized"),
+    ]:
+        if c1 in xpos and c2 in xpos and test_id in pvals:
+            y = ytop + 0.7 * y_step + bracket_level * y_step
+            add_bracket(ax, xpos[c1], xpos[c2], y=y, h=0.22 * y_step, label=format_p(pvals[test_id]))
+            bracket_level += 1
+    ax.set_ylim(top=ytop + (1.8 + bracket_level) * y_step)
 
     ax = axes[1]
     coupling_order = [
@@ -355,6 +401,7 @@ def make_plots(df: pd.DataFrame, out_dir: Path) -> None:
         "weak_orthogonalized": "#ff7f0e",
     }
     present_coupling = [c for c in coupling_order if c in set(df["condition"])]
+    xpos_c = {c: i for i, c in enumerate(present_coupling)}
     for i, cond in enumerate(present_coupling):
         sub = df[df["condition"] == cond]
         x = np.full(len(sub), i, dtype=float)
@@ -372,9 +419,23 @@ def make_plots(df: pd.DataFrame, out_dir: Path) -> None:
         ax.errorbar([i], [m], yerr=[[m - lo], [hi - m]], fmt="o", color="black", capsize=4, linewidth=1.3)
     ax.set_xticks(list(range(len(present_coupling))))
     ax.set_xticklabels([coupling_labels[c] for c in present_coupling], rotation=15, ha="right")
-    ax.set_ylabel("Proportion of variance in true genetic liability explained by principal components on validation set")
-    ax.set_title("Coupling between principal components and true genetic liability")
+    ax.set_ylabel("R^2 between true genetic liability and PCs")
     ax.grid(True)
+
+    y2 = df[df["condition"].isin(present_coupling)]["r2_pc_g_val"].to_numpy(dtype=float)
+    y2_top = float(np.nanmax(y2)) if len(y2) else 0.1
+    y2_range = max(0.08, float(np.nanmax(y2) - np.nanmin(y2)) if len(y2) else 0.08)
+    y2_step = 0.14 * y2_range
+    blevel = 0
+    for test_id, c1, c2 in [
+        ("H7", "bayesr_original", "bayesr_orthogonalized"),
+        ("H4", "weak_original", "weak_orthogonalized"),
+    ]:
+        if c1 in xpos_c and c2 in xpos_c and test_id in pvals:
+            y = y2_top + 0.45 * y2_step + blevel * y2_step
+            add_bracket(ax, xpos_c[c1], xpos_c[c2], y=y, h=0.24 * y2_step, label=format_p(pvals[test_id]))
+            blevel += 1
+    ax.set_ylim(top=y2_top + (1.8 + blevel) * y2_step)
 
     fig.tight_layout()
     fig.savefig(out_dir / "fig_gen0_orthogonalization.png", dpi=220)
@@ -438,8 +499,6 @@ def summarize(df: pd.DataFrame, out_dir: Path) -> None:
     m2, l2, u2 = mean_ci(g2)
     m3, l3, u3 = mean_ci(g3)
 
-    make_plots(df, out_dir)
-
     tests = pd.DataFrame([
         {
             "test_id": "H1",
@@ -493,6 +552,10 @@ def summarize(df: pd.DataFrame, out_dir: Path) -> None:
         tb2 = ttest_rel(g_bro, g_broh, nan_policy="omit")
         pb2 = _p_one_sided_from_ttest(float(tb2.pvalue), float(tb2.statistic), "greater")
         mb, lb, ub = mean_ci(g_bro)
+        r2_bro = bro["r2_pc_g_val"].values
+        r2_broh = broh["r2_pc_g_val"].values
+        tb3 = ttest_rel(r2_bro, r2_broh, nan_policy="omit")
+        pb3 = _p_one_sided_from_ttest(float(tb3.pvalue), float(tb3.statistic), "greater")
         tests = pd.concat(
             [
                 tests,
@@ -517,11 +580,23 @@ def summarize(df: pd.DataFrame, out_dir: Path) -> None:
                         "p_value": pb2,
                         "p_value_type": "one-sided",
                     },
+                    {
+                        "test_id": "H7",
+                        "contrast": "r2_pcg_bayesr_original_gt_r2_pcg_bayesr_orthogonalized",
+                        "estimate_mean": float(np.mean(r2_bro - r2_broh)),
+                        "estimate_ci_lo": np.nan,
+                        "estimate_ci_hi": np.nan,
+                        "t_stat": float(tb3.statistic),
+                        "p_value": pb3,
+                        "p_value_type": "one-sided",
+                    },
                 ]),
             ],
             ignore_index=True,
         )
     tests.to_csv(out_dir / "gen0_hypothesis_tests.csv", index=False)
+    pval_map = {str(r["test_id"]): float(r["p_value"]) for _, r in tests.iterrows()}
+    make_plots(df, out_dir, pval_map)
 
 
 def parse_args() -> argparse.Namespace:
@@ -537,6 +612,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--input-csv", type=Path, default=None)
     ap.add_argument("--include-bayesr", action="store_true")
     ap.add_argument("--bayesr-max-seeds", type=int, default=32)
+    ap.add_argument("--workers", type=int, default=1)
     return ap.parse_args()
 
 
@@ -572,6 +648,7 @@ def main() -> None:
         out_dir,
         include_bayesr=args.include_bayesr,
         bayesr_max_seeds=max(1, args.bayesr_max_seeds),
+        workers=max(1, args.workers),
     )
     summarize(df, out_dir)
     print(f"Done: {out_dir}")

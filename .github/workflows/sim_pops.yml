@@ -11,6 +11,11 @@ on:
         description: "Enable GAM-gnomon calibration (true/false)"
         required: false
         default: "false"
+      portability_only:
+        description: "Run only portability simulation/analysis (skip confounding and two-pop jobs)"
+        required: false
+        type: boolean
+        default: false
   schedule:
     - cron: "0 7 * * *"
 
@@ -35,7 +40,14 @@ jobs:
   tool_cache:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout (primary)
+        id: checkout-primary
+        continue-on-error: true
+        uses: actions/checkout@v4
+
+      - name: Checkout (retry)
+        if: steps.checkout-primary.outcome != 'success'
+        uses: actions/checkout@v4
 
       - name: Restore tool cache
         id: tools-cache
@@ -44,9 +56,6 @@ jobs:
           path: |
             ~/.cache/uv
             ~/.cache/pip
-            ~/.cache/stdpopsim
-            ~/.cache/R
-            ~/.local/lib/R
             /usr/local/bin/plink2
             /usr/local/bin/gctb
           key: tools-${{ runner.os }}-${{ env.TOOL_CACHE_VERSION }}
@@ -58,19 +67,25 @@ jobs:
           python-version: "3.11"
           cache: 'pip'
 
-      - name: Set up R
+      - name: Install R (apt)
         if: steps.tools-cache.outputs.cache-hit != 'true'
-        uses: r-lib/actions/setup-r@v2
-        with:
-          r-version: "4.4.2"
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends r-base
 
       - name: Install base dependencies
         if: steps.tools-cache.outputs.cache-hit != 'true'
         run: |
+          set -euo pipefail
           pip install uv
           uv pip install --system -r sims/requirements.txt
           uv pip install --system rpy2
-          Rscript -e 'install.packages("mgcv", repos="https://cloud.r-project.org")'
+          for i in 1 2 3; do
+            Rscript -e 'install.packages("mgcv", repos="https://cloud.r-project.org")' && break
+            echo "mgcv install attempt $i failed; retrying..."
+            sleep $((i*10))
+          done
 
       - name: Install Plink2
         if: steps.tools-cache.outputs.cache-hit != 'true'
@@ -96,9 +111,6 @@ jobs:
           path: |
             ~/.cache/uv
             ~/.cache/pip
-            ~/.cache/stdpopsim
-            ~/.cache/R
-            ~/.local/lib/R
             /usr/local/bin/plink2
             /usr/local/bin/gctb
           key: tools-${{ runner.os }}-${{ env.TOOL_CACHE_VERSION }}
@@ -112,11 +124,54 @@ jobs:
     env:
       SIM_CACHE_VERSION: v3
     strategy:
+      fail-fast: false
       matrix:
-        sim_name: [confounding, portability]
-        seed: [1, 2, 3, 4, 5]
+        sim_name: ${{ fromJSON(github.event_name == 'workflow_dispatch' && github.event.inputs.portability_only == 'true' && '["portability"]' || '["confounding","portability"]') }}
+        seed: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        exclude:
+          - sim_name: confounding
+            seed: 6
+          - sim_name: confounding
+            seed: 7
+          - sim_name: confounding
+            seed: 8
+          - sim_name: confounding
+            seed: 9
+          - sim_name: confounding
+            seed: 10
+          - sim_name: confounding
+            seed: 11
+          - sim_name: confounding
+            seed: 12
+          - sim_name: confounding
+            seed: 13
+          - sim_name: confounding
+            seed: 14
+          - sim_name: confounding
+            seed: 15
     steps:
       - uses: actions/checkout@v4
+
+      - name: Reclaim disk space
+        run: |
+          set -euo pipefail
+          echo "Disk before cleanup:"
+          df -h
+          if [ -d /home/runner/actions-runner/cached/_diag ]; then
+            echo "Cleaning runner diag logs..."
+            find /home/runner/actions-runner/cached/_diag -type f -name "*.log*" -delete || true
+          fi
+          if [ -d /home/runner/actions-runner/cached/_work/_temp ]; then
+            echo "Cleaning runner temp workspace..."
+            find /home/runner/actions-runner/cached/_work/_temp -mindepth 1 -maxdepth 1 -exec rm -rf {} + || true
+          fi
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo apt-get clean || true
+          echo "Disk after cleanup:"
+          df -h
 
       - name: Restore tool cache
         id: tools-cache
@@ -125,9 +180,6 @@ jobs:
           path: |
             ~/.cache/uv
             ~/.cache/pip
-            ~/.cache/stdpopsim
-            ~/.cache/R
-            ~/.local/lib/R
             /usr/local/bin/plink2
             /usr/local/bin/gctb
           key: tools-${{ runner.os }}-${{ env.TOOL_CACHE_VERSION }}
@@ -135,26 +187,6 @@ jobs:
       - name: Show git revision
         run: |
           git rev-parse HEAD
-
-      - name: Restore simulation cache
-        id: sim-cache
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            ${{ matrix.sim_name }}_s${{ matrix.seed }}_work/
-            ${{ matrix.sim_name }}_s${{ matrix.seed }}.tsv
-            ${{ matrix.sim_name }}_s${{ matrix.seed }}.bed
-            ${{ matrix.sim_name }}_s${{ matrix.seed }}.bim
-            ${{ matrix.sim_name }}_s${{ matrix.seed }}.fam
-            ${{ matrix.sim_name }}_s${{ matrix.seed }}_sites.npz
-            ${{ matrix.sim_name }}_s${{ matrix.seed }}_pcs.png
-          key: sim-${{ runner.os }}-${{ matrix.sim_name }}-s${{ matrix.seed }}-${{ env.SIM_CACHE_VERSION }}-${{ hashFiles('sims/sim_pops.py', 'sims/split_data.py', 'sims/plink_utils.py') }}
-          restore-keys: |
-            sim-${{ runner.os }}-${{ matrix.sim_name }}-s${{ matrix.seed }}-${{ env.SIM_CACHE_VERSION }}-
-
-      - name: Cache status
-        run: |
-          echo "sim cache-hit=${{ steps.sim-cache.outputs.cache-hit }} for ${{ matrix.sim_name }}"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -175,11 +207,50 @@ jobs:
           rm plink2.zip
 
       - name: Run Simulation ${{ matrix.sim_name }}
-        if: steps.sim-cache.outputs.cache-hit != 'true'
         run: |
-          set -e
+          set -euo pipefail
           echo "Running Simulation ${{ matrix.sim_name }} (seed=${{ matrix.seed }})..."
-          python sims/sim_pops.py ${{ matrix.sim_name }} ${{ matrix.seed }}
+          prefix="${{ matrix.sim_name }}_s${{ matrix.seed }}"
+          echo "Disk before simulation:"
+          df -h
+
+          # Heartbeat diagnostics while simulation is running.
+          # Keep output lightweight to avoid log bloat while still surfacing
+          # impending disk exhaustion before an abrupt runner crash.
+          _diag_heartbeat() {
+            while true; do
+              echo "---- heartbeat $(date -u +%Y-%m-%dT%H:%M:%SZ) ${prefix} ----"
+              df -h / /home || true
+              du -sh . 2>/dev/null || true
+              find . -maxdepth 2 -type f -exec ls -lh {} + 2>/dev/null | sort -k5 -h | tail -n 12 || true
+              sleep 120
+            done
+          }
+
+          ok=0
+          for attempt in 1 2 3; do
+            echo "Simulation attempt ${attempt}/3 for ${prefix}"
+            rm -f "${prefix}.trees" "${prefix}.vcf" "${prefix}.cm"
+            _diag_heartbeat &
+            HB_PID=$!
+            if python sims/sim_pops.py ${{ matrix.sim_name }} ${{ matrix.seed }} --force; then
+              kill "$HB_PID" 2>/dev/null || true
+              wait "$HB_PID" 2>/dev/null || true
+              ok=1
+              break
+            fi
+            kill "$HB_PID" 2>/dev/null || true
+            wait "$HB_PID" 2>/dev/null || true
+            echo "Simulation attempt ${attempt} failed for ${prefix}"
+            echo "Debug disk usage after failed attempt:"
+            df -h || true
+            du -sh ./* 2>/dev/null | sort -h | tail -n 30 || true
+            sleep $((attempt*20))
+          done
+          if [ "$ok" -ne 1 ]; then
+            echo "Simulation failed after 3 attempts for ${prefix}"
+            exit 1
+          fi
 
           # sim_pops.py now deletes .trees and .vcf automatically on success
           # Verify they are gone to save space
@@ -189,38 +260,72 @@ jobs:
           fi
 
       - name: Split Data (Train/Test)
-        if: steps.sim-cache.outputs.cache-hit != 'true'
         run: |
           set -e
           echo "Splitting Data for ${{ matrix.sim_name }} (seed=${{ matrix.seed }})..."
           python sims/split_data.py ${{ matrix.sim_name }}_s${{ matrix.seed }}
 
-      - name: Save simulation cache
-        if: ${{ always() && steps.sim-cache.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            ${{ matrix.sim_name }}_s${{ matrix.seed }}_work/
-            ${{ matrix.sim_name }}_s${{ matrix.seed }}.tsv
-            ${{ matrix.sim_name }}_s${{ matrix.seed }}.bed
-            ${{ matrix.sim_name }}_s${{ matrix.seed }}.bim
-            ${{ matrix.sim_name }}_s${{ matrix.seed }}.fam
-            ${{ matrix.sim_name }}_s${{ matrix.seed }}_sites.npz
-            ${{ matrix.sim_name }}_s${{ matrix.seed }}_pcs.png
-          key: sim-${{ runner.os }}-${{ matrix.sim_name }}-s${{ matrix.seed }}-${{ env.SIM_CACHE_VERSION }}-${{ hashFiles('sims/sim_pops.py', 'sims/split_data.py', 'sims/plink_utils.py') }}
+      - name: Remove large source PLINK files (keep split train/test only)
+        run: |
+          set -euo pipefail
+          prefix="${{ matrix.sim_name }}_s${{ matrix.seed }}"
+          rm -f "${prefix}.bed" "${prefix}.bim" "${prefix}.fam"
+          rm -f "${prefix}_sites.npz" "${prefix}_pcs.png"
+          echo "Disk after cleanup:"
+          df -h
 
       - name: Upload Simulation Data (Artifact Stream A)
+        if: ${{ always() }}
+        id: upload-sim-data-primary
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: sim-data-${{ matrix.sim_name }}-s${{ matrix.seed }}
           path: |
             ${{ matrix.sim_name }}_s${{ matrix.seed }}_work/
             ${{ matrix.sim_name }}_s${{ matrix.seed }}.tsv
-            ${{ matrix.sim_name }}_s${{ matrix.seed }}.bed
-            ${{ matrix.sim_name }}_s${{ matrix.seed }}.bim
-            ${{ matrix.sim_name }}_s${{ matrix.seed }}.fam
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 1
+
+      - name: Retry upload simulation data
+        if: ${{ always() && steps.upload-sim-data-primary.outcome != 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: sim-data-${{ matrix.sim_name }}-s${{ matrix.seed }}
+          path: |
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}_work/
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}.tsv
+          if-no-files-found: warn
+          retention-days: 1
+
+      - name: Upload simulate diagnostics
+        if: ${{ always() }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          {
+            echo "sim_name=${{ matrix.sim_name }}"
+            echo "seed=${{ matrix.seed }}"
+            echo "date_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo ""
+            echo "== disk =="
+            df -h
+            echo ""
+            echo "== top files in workspace =="
+            du -sh ./* 2>/dev/null | sort -h | tail -n 40
+            echo ""
+            echo "== runner diag dir =="
+            ls -lah /home/runner/actions-runner/cached/_diag 2>/dev/null || true
+          } > "simulate_${{ matrix.sim_name }}_s${{ matrix.seed }}_debug.txt"
+
+      - name: Upload simulate diagnostics artifact
+        if: ${{ always() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: sim-debug-${{ matrix.sim_name }}-s${{ matrix.seed }}
+          path: simulate_${{ matrix.sim_name }}_s${{ matrix.seed }}_debug.txt
+          if-no-files-found: warn
 
       - name: Save tool cache
         if: ${{ always() && steps.tools-cache.outputs.cache-hit != 'true' }}
@@ -229,9 +334,6 @@ jobs:
           path: |
             ~/.cache/uv
             ~/.cache/pip
-            ~/.cache/stdpopsim
-            ~/.cache/R
-            ~/.local/lib/R
             /usr/local/bin/plink2
             /usr/local/bin/gctb
           key: tools-${{ runner.os }}-${{ env.TOOL_CACHE_VERSION }}
@@ -246,8 +348,29 @@ jobs:
       fail-fast: false # Let other methods finish if one fails
       matrix:
         method: ${{ fromJSON(github.event_name == 'workflow_dispatch' && github.event.inputs.methods || '["BayesR"]') }}
-        sim_name: [confounding, portability]
-        seed: [1, 2, 3, 4, 5]
+        sim_name: ${{ fromJSON(github.event_name == 'workflow_dispatch' && github.event.inputs.portability_only == 'true' && '["portability"]' || '["confounding","portability"]') }}
+        seed: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        exclude:
+          - sim_name: confounding
+            seed: 6
+          - sim_name: confounding
+            seed: 7
+          - sim_name: confounding
+            seed: 8
+          - sim_name: confounding
+            seed: 9
+          - sim_name: confounding
+            seed: 10
+          - sim_name: confounding
+            seed: 11
+          - sim_name: confounding
+            seed: 12
+          - sim_name: confounding
+            seed: 13
+          - sim_name: confounding
+            seed: 14
+          - sim_name: confounding
+            seed: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -258,9 +381,6 @@ jobs:
           path: |
             ~/.cache/uv
             ~/.cache/pip
-            ~/.cache/stdpopsim
-            ~/.cache/R
-            ~/.local/lib/R
             /usr/local/bin/plink2
             /usr/local/bin/gctb
           key: tools-${{ runner.os }}-${{ env.TOOL_CACHE_VERSION }}
@@ -328,6 +448,16 @@ jobs:
           key: score-${{ runner.os }}-${{ matrix.sim_name }}-s${{ matrix.seed }}-${{ matrix.method }}-${{ hashFiles('sims/train_model.py', 'sims/plink_utils.py', 'sims/methods/**', 'sims/metrics.py') }}
 
       - name: Upload Scores
+        id: upload-scores-primary
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-scores-${{ matrix.sim_name }}-s${{ matrix.seed }}-${{ matrix.method }}
+          path: ${{ matrix.sim_name }}_s${{ matrix.seed }}_work/*.sscore
+          if-no-files-found: error
+
+      - name: Retry upload scores
+        if: steps.upload-scores-primary.outcome != 'success'
         uses: actions/upload-artifact@v4
         with:
           name: model-scores-${{ matrix.sim_name }}-s${{ matrix.seed }}-${{ matrix.method }}
@@ -341,9 +471,6 @@ jobs:
           path: |
             ~/.cache/uv
             ~/.cache/pip
-            ~/.cache/stdpopsim
-            ~/.cache/R
-            ~/.local/lib/R
             /usr/local/bin/plink2
             /usr/local/bin/gctb
           key: tools-${{ runner.os }}-${{ env.TOOL_CACHE_VERSION }}
@@ -356,9 +483,31 @@ jobs:
     if: ${{ always() && needs.simulate.result == 'success' }}
     runs-on: ubuntu-22.04
     strategy:
+      fail-fast: false
       matrix:
-        sim_name: [confounding, portability]
-        seed: [1, 2, 3, 4, 5]
+        sim_name: ${{ fromJSON(github.event_name == 'workflow_dispatch' && github.event.inputs.portability_only == 'true' && '["portability"]' || '["confounding","portability"]') }}
+        seed: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        exclude:
+          - sim_name: confounding
+            seed: 6
+          - sim_name: confounding
+            seed: 7
+          - sim_name: confounding
+            seed: 8
+          - sim_name: confounding
+            seed: 9
+          - sim_name: confounding
+            seed: 10
+          - sim_name: confounding
+            seed: 11
+          - sim_name: confounding
+            seed: 12
+          - sim_name: confounding
+            seed: 13
+          - sim_name: confounding
+            seed: 14
+          - sim_name: confounding
+            seed: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -369,17 +518,15 @@ jobs:
           path: |
             ~/.cache/uv
             ~/.cache/pip
-            ~/.cache/stdpopsim
-            ~/.cache/R
-            ~/.local/lib/R
             /usr/local/bin/plink2
             /usr/local/bin/gctb
           key: tools-${{ runner.os }}-${{ env.TOOL_CACHE_VERSION }}
 
-      - name: Set up R for GAM
-        uses: r-lib/actions/setup-r@v2
-        with:
-          r-version: '4.4.2'
+      - name: Install R for GAM (apt)
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends r-base
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -396,7 +543,12 @@ jobs:
 
       - name: Install R GAM package
         run: |
-          Rscript -e 'install.packages("mgcv", repos="https://cloud.r-project.org")'
+          set -euo pipefail
+          for i in 1 2 3; do
+            Rscript -e 'install.packages("mgcv", repos="https://cloud.r-project.org")' && break
+            echo "mgcv install attempt $i failed; retrying..."
+            sleep $((i*10))
+          done
 
       - name: Download Simulation Data
         uses: actions/download-artifact@v4
@@ -455,12 +607,30 @@ jobs:
           key: eval-${{ runner.os }}-${{ matrix.sim_name }}-s${{ matrix.seed }}-${{ hashFiles('sims/evaluate.py', 'sims/metrics.py', 'sims/methods/**') }}
 
       - name: Upload Results (Stream B)
+        id: upload-results-primary
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: sim-results-${{ matrix.sim_name }}-s${{ matrix.seed }}
           path: |
             ${{ matrix.sim_name }}_s${{ matrix.seed }}_metrics.csv
             ${{ matrix.sim_name }}_s${{ matrix.seed }}_comparison_*.png
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}_significance_tests.csv
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}_probabilities.csv
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}_probability_summary.csv
+          if-no-files-found: warn
+
+      - name: Retry upload results
+        if: steps.upload-results-primary.outcome != 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sim-results-${{ matrix.sim_name }}-s${{ matrix.seed }}
+          path: |
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}_metrics.csv
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}_comparison_*.png
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}_significance_tests.csv
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}_probabilities.csv
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}_probability_summary.csv
           if-no-files-found: warn
 
       - name: Save tool cache
@@ -470,9 +640,6 @@ jobs:
           path: |
             ~/.cache/uv
             ~/.cache/pip
-            ~/.cache/stdpopsim
-            ~/.cache/R
-            ~/.local/lib/R
             /usr/local/bin/plink2
             /usr/local/bin/gctb
           key: tools-${{ runner.os }}-${{ env.TOOL_CACHE_VERSION }}
@@ -494,9 +661,6 @@ jobs:
           path: |
             ~/.cache/uv
             ~/.cache/pip
-            ~/.cache/stdpopsim
-            ~/.cache/R
-            ~/.local/lib/R
             /usr/local/bin/plink2
             /usr/local/bin/gctb
           key: tools-${{ runner.os }}-${{ env.TOOL_CACHE_VERSION }}
@@ -545,14 +709,61 @@ jobs:
           # Ensure generate_summary.py is robust to missing files if some jobs failed
           python sims/generate_summary.py
 
+      - name: Build combined results zip
+        run: |
+          set -euo pipefail
+          mkdir -p bundle
+          for f in \
+            summary.md \
+            all_methods_metrics.tsv \
+            all_methods_pvalues.png \
+            confounding_metrics.csv \
+            portability_metrics.csv \
+            confounding_significance_tests.csv \
+            portability_significance_tests.csv \
+            confounding_probabilities.csv \
+            portability_probabilities.csv \
+            confounding_probability_summary.csv \
+            portability_probability_summary.csv \
+            confounding_comparison_roc.png \
+            confounding_comparison_calibration.png \
+            confounding_comparison_auc.png \
+            confounding_comparison_brier.png \
+            portability_comparison_roc.png \
+            portability_comparison_calibration.png \
+            portability_comparison_auc.png \
+            portability_comparison_brier.png \
+            portability_eur_minus_non_eur_gap_proper_test_all_pvals.png \
+            portability_eur_minus_non_eur_proper_per_seed.csv \
+            portability_eur_minus_non_eur_proper_summary.csv \
+            portability_test_group_counts.csv \
+            portability_auc_by_ancestry_95ci.png \
+            portability_auc_by_ancestry_95ci_hierarchical.png \
+            portability_auc_by_ancestry_95ci_hierarchical.csv \
+            portability_auc_by_ancestry_hierarchical_per_seed.csv
+          do
+            if [ -f "$f" ]; then
+              cp "$f" bundle/
+            fi
+          done
+          (cd bundle && zip -r ../stdpopsim-chr22-results.zip .)
+
       - name: Upload summary as artifact
+        id: upload-summary-primary
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
-          name: consolidated-summary
+          name: stdpopsim-chr22-results
           path: |
-            summary.md
-            all_methods_metrics.tsv
-            all_methods_pvalues.png
+            stdpopsim-chr22-results.zip
+
+      - name: Retry upload summary artifact
+        if: steps.upload-summary-primary.outcome != 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: stdpopsim-chr22-results
+          path: |
+            stdpopsim-chr22-results.zip
 
       - name: Save tool cache
         if: ${{ always() && steps.tools-cache.outputs.cache-hit != 'true' }}
@@ -561,9 +772,6 @@ jobs:
           path: |
             ~/.cache/uv
             ~/.cache/pip
-            ~/.cache/stdpopsim
-            ~/.cache/R
-            ~/.local/lib/R
             /usr/local/bin/plink2
             /usr/local/bin/gctb
           key: tools-${{ runner.os }}-${{ env.TOOL_CACHE_VERSION }}
@@ -573,6 +781,7 @@ jobs:
   # ------------------------------------------------------------------
   two_pop_simulate_train_eval:
     needs: tool_cache
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.portability_only != 'true' }}
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
@@ -583,6 +792,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Reclaim disk space
+        run: |
+          set -euo pipefail
+          echo "Disk before cleanup:"
+          df -h
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo apt-get clean || true
+          echo "Disk after cleanup:"
+          df -h
+
       - name: Restore tool cache
         id: tools-cache
         uses: actions/cache/restore@v4
@@ -590,9 +812,6 @@ jobs:
           path: |
             ~/.cache/uv
             ~/.cache/pip
-            ~/.cache/stdpopsim
-            ~/.cache/R
-            ~/.local/lib/R
             /usr/local/bin/plink2
             /usr/local/bin/gctb
           key: tools-${{ runner.os }}-${{ env.TOOL_CACHE_VERSION }}
@@ -603,10 +822,11 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Set up R for GAM
-        uses: r-lib/actions/setup-r@v2
-        with:
-          r-version: "4.4.2"
+      - name: Install R for GAM (apt)
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends r-base
 
       - name: Install Python Dependencies
         run: |
@@ -616,7 +836,12 @@ jobs:
 
       - name: Install R GAM package
         run: |
-          Rscript -e 'install.packages("mgcv", repos="https://cloud.r-project.org")'
+          set -euo pipefail
+          for i in 1 2 3; do
+            Rscript -e 'install.packages("mgcv", repos="https://cloud.r-project.org")' && break
+            echo "mgcv install attempt $i failed; retrying..."
+            sleep $((i*10))
+          done
 
       - name: Install Plink2
         run: |
@@ -697,6 +922,21 @@ jobs:
           key: two-pop-${{ runner.os }}-${{ matrix.sim_name }}-g${{ matrix.divergence_gens }}-s${{ matrix.seed }}-${{ hashFiles('sims/sim_two_pop.py', 'sims/split_data.py', 'sims/train_model.py', 'sims/evaluate.py', 'sims/methods/**', 'sims/metrics.py') }}
 
       - name: Upload artifacts
+        id: upload-two-pop-primary
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: two-pop-${{ matrix.sim_name }}-g${{ matrix.divergence_gens }}-s${{ matrix.seed }}
+          path: |
+            ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_s${{ matrix.seed }}_metrics.csv
+            ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_s${{ matrix.seed }}_comparison_roc.png
+            ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_s${{ matrix.seed }}_comparison_calibration.png
+            ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_s${{ matrix.seed }}_comparison_auc.png
+            ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_s${{ matrix.seed }}_pcs.png
+          if-no-files-found: error
+
+      - name: Retry upload two-pop artifacts
+        if: steps.upload-two-pop-primary.outcome != 'success'
         uses: actions/upload-artifact@v4
         with:
           name: two-pop-${{ matrix.sim_name }}-g${{ matrix.divergence_gens }}-s${{ matrix.seed }}
@@ -715,15 +955,13 @@ jobs:
           path: |
             ~/.cache/uv
             ~/.cache/pip
-            ~/.cache/stdpopsim
-            ~/.cache/R
-            ~/.local/lib/R
             /usr/local/bin/plink2
             /usr/local/bin/gctb
           key: tools-${{ runner.os }}-${{ env.TOOL_CACHE_VERSION }}
 
   two_pop_plot_auc:
     needs: [tool_cache, two_pop_simulate_train_eval]
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.portability_only != 'true' }}
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -755,6 +993,20 @@ jobs:
           python sims/plot_two_pop_pcs_grid.py
 
       - name: Upload AUC plot
+        id: upload-auc-plot-primary
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: two-pop-auc-plot
+          path: |
+            divergence_bottleneck_auc.csv
+            divergence_bottleneck_auc.png
+            divergence_bottleneck_auc_*.png
+            two_pop_pcs_mega.png
+          if-no-files-found: error
+
+      - name: Retry upload AUC plot
+        if: steps.upload-auc-plot-primary.outcome != 'success'
         uses: actions/upload-artifact@v4
         with:
           name: two-pop-auc-plot

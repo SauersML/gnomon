@@ -3,14 +3,11 @@ name: Sims (Gen0 + Bottleneck)
 on:
   workflow_dispatch:
     inputs:
-      profile:
-        description: "Run profile"
-        required: true
-        default: "full"
-        type: choice
-        options:
-          - quick
-          - full
+      bottleneck_strength_only:
+        description: "Run only bottleneck-strength portability sim (0.5/1/5/10/20/50/70/100%)"
+        type: boolean
+        default: false
+        required: false
   schedule:
     - cron: "30 7 * * *"
 
@@ -21,20 +18,21 @@ env:
   OPENBLAS_NUM_THREADS: "2"
   VECLIB_MAXIMUM_THREADS: "2"
   NUMEXPR_NUM_THREADS: "2"
-  SIM_PROFILE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.profile || 'quick' }}
+  SIM_PROFILE: "full"
 
 jobs:
   gen0_chunks:
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.bottleneck_strength_only != 'true' }}
     name: "Gen0 chunk ${{ matrix.chunk.name }}"
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
         chunk:
-          - { name: "a", seed_start_quick: 1, seed_end_quick: 2, seed_start_full: 1, seed_end_full: 8 }
-          - { name: "b", seed_start_quick: 3, seed_end_quick: 4, seed_start_full: 9, seed_end_full: 16 }
-          - { name: "c", seed_start_quick: 5, seed_end_quick: 6, seed_start_full: 17, seed_end_full: 24 }
-          - { name: "d", seed_start_quick: 7, seed_end_quick: 8, seed_start_full: 25, seed_end_full: 32 }
+          - { name: "a", seed_start: 1, seed_end: 8 }
+          - { name: "b", seed_start: 9, seed_end: 16 }
+          - { name: "c", seed_start: 17, seed_end: 24 }
+          - { name: "d", seed_start: 25, seed_end: 32 }
     steps:
       - uses: actions/checkout@v4
 
@@ -43,21 +41,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [ "${SIM_PROFILE}" = "full" ]; then
-            echo "seed_start=${{ matrix.chunk.seed_start_full }}" >> "$GITHUB_OUTPUT"
-            echo "seed_end=${{ matrix.chunk.seed_end_full }}" >> "$GITHUB_OUTPUT"
-            echo "n_ind=2200" >> "$GITHUB_OUTPUT"
-            echo "seq_len=5000000" >> "$GITHUB_OUTPUT"
-            echo "n_causal=5000" >> "$GITHUB_OUTPUT"
-            echo "n_pca=2000" >> "$GITHUB_OUTPUT"
-          else
-            echo "seed_start=${{ matrix.chunk.seed_start_quick }}" >> "$GITHUB_OUTPUT"
-            echo "seed_end=${{ matrix.chunk.seed_end_quick }}" >> "$GITHUB_OUTPUT"
-            echo "n_ind=1000" >> "$GITHUB_OUTPUT"
-            echo "seq_len=2000000" >> "$GITHUB_OUTPUT"
-            echo "n_causal=1200" >> "$GITHUB_OUTPUT"
-            echo "n_pca=700" >> "$GITHUB_OUTPUT"
+          CPU_CORES="$(nproc)"
+          if [ -z "$CPU_CORES" ] || [ "$CPU_CORES" -lt 1 ]; then
+            CPU_CORES=1
           fi
+          echo "workers=$CPU_CORES" >> "$GITHUB_OUTPUT"
+          echo "seed_start=${{ matrix.chunk.seed_start }}" >> "$GITHUB_OUTPUT"
+          echo "seed_end=${{ matrix.chunk.seed_end }}" >> "$GITHUB_OUTPUT"
+          echo "n_ind=2200" >> "$GITHUB_OUTPUT"
+          echo "seq_len=5000000" >> "$GITHUB_OUTPUT"
+          echo "n_causal=5000" >> "$GITHUB_OUTPUT"
+          echo "n_pca=2000" >> "$GITHUB_OUTPUT"
 
       - name: Restore Gen0 simulation cache
         id: gen0_cache_restore
@@ -65,6 +59,38 @@ jobs:
         with:
           path: sims/results_gen0/chunks/gen0_chunk_${{ matrix.chunk.name }}.csv
           key: gen0-sim-${{ runner.os }}-${{ env.SIM_PROFILE }}-${{ matrix.chunk.name }}-${{ steps.gen0_params.outputs.seed_start }}-${{ steps.gen0_params.outputs.seed_end }}-${{ steps.gen0_params.outputs.n_ind }}-${{ steps.gen0_params.outputs.seq_len }}-${{ steps.gen0_params.outputs.n_causal }}-${{ steps.gen0_params.outputs.n_pca }}-${{ hashFiles('sims/gen0_orthogonalization.py', 'sims/sim_two_pop.py', 'sims/split_data.py', 'sims/train_model.py', 'sims/requirements.txt') }}
+
+      - name: Restore Gen0 BayesR intermediate cache
+        if: steps.gen0_cache_restore.outputs.cache-hit != 'true'
+        id: gen0_bayesr_cache_restore
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            divergence_g0_s*.tsv
+            divergence_g0_s*.bed
+            divergence_g0_s*.bim
+            divergence_g0_s*.fam
+            divergence_g0_s*_sites.npz
+            divergence_g0_s*_pcs.png
+            divergence_g0_s*_work/**
+          key: gen0-bayesr-${{ runner.os }}-${{ matrix.chunk.name }}-${{ steps.gen0_params.outputs.seed_start }}-${{ steps.gen0_params.outputs.seed_end }}-plink2_20260110-gctb_2_03beta-${{ hashFiles('sims/sim_two_pop.py', 'sims/split_data.py', 'sims/train_model.py', 'sims/plink_utils.py', 'sims/requirements.txt') }}
+
+      - name: Check Gen0 BayesR cache completeness
+        if: steps.gen0_cache_restore.outputs.cache-hit != 'true'
+        id: gen0_bayesr_ready
+        shell: bash
+        run: |
+          set -euo pipefail
+          SEED_START="${{ steps.gen0_params.outputs.seed_start }}"
+          SEED_END="${{ steps.gen0_params.outputs.seed_end }}"
+          READY=true
+          for s in $(seq "$SEED_START" "$SEED_END"); do
+            if [ ! -f "divergence_g0_s${s}.tsv" ] || [ ! -f "divergence_g0_s${s}_work/BayesR.sscore" ]; then
+              READY=false
+              break
+            fi
+          done
+          echo "ready=$READY" >> "$GITHUB_OUTPUT"
 
       - name: Set up Python
         if: steps.gen0_cache_restore.outputs.cache-hit != 'true'
@@ -80,7 +106,7 @@ jobs:
           uv pip install --system -r sims/requirements.txt
 
       - name: Install Plink2
-        if: steps.gen0_cache_restore.outputs.cache-hit != 'true'
+        if: steps.gen0_cache_restore.outputs.cache-hit != 'true' && steps.gen0_bayesr_ready.outputs.ready != 'true'
         run: |
           set -euo pipefail
           wget -q https://s3.amazonaws.com/plink2-assets/plink2_linux_avx2_20260110.zip -O plink2.zip
@@ -89,7 +115,7 @@ jobs:
           rm -f plink2.zip
 
       - name: Install GCTB
-        if: steps.gen0_cache_restore.outputs.cache-hit != 'true'
+        if: steps.gen0_cache_restore.outputs.cache-hit != 'true' && steps.gen0_bayesr_ready.outputs.ready != 'true'
         run: |
           set -euo pipefail
           wget -q https://cnsgenomics.com/software/gctb/download/gctb_2.03beta_Linux.zip -O gctb.zip
@@ -109,7 +135,15 @@ jobs:
           SEQ_LEN="${{ steps.gen0_params.outputs.seq_len }}"
           N_CAUSAL="${{ steps.gen0_params.outputs.n_causal }}"
           N_PCA="${{ steps.gen0_params.outputs.n_pca }}"
+          WORKERS="${{ steps.gen0_params.outputs.workers }}"
           BAYESR_MAX=$((SEED_END - SEED_START + 1))
+
+          # Avoid nested thread oversubscription when using process workers.
+          export OMP_NUM_THREADS=1
+          export MKL_NUM_THREADS=1
+          export OPENBLAS_NUM_THREADS=1
+          export VECLIB_MAXIMUM_THREADS=1
+          export NUMEXPR_NUM_THREADS=1
 
           OUT_DIR="sims/results_gen0/chunks"
           mkdir -p "$OUT_DIR"
@@ -123,6 +157,7 @@ jobs:
             --n-pca-sites "$N_PCA" \
             --include-bayesr \
             --bayesr-max-seeds "$BAYESR_MAX" \
+            --workers "$WORKERS" \
             --out-dir "$OUT_DIR/chunk_${{ matrix.chunk.name }}"
 
           cp "$OUT_DIR/chunk_${{ matrix.chunk.name }}/gen0_orthogonalization_results.csv" "$OUT_DIR/gen0_chunk_${{ matrix.chunk.name }}.csv"
@@ -134,6 +169,20 @@ jobs:
           path: sims/results_gen0/chunks/gen0_chunk_${{ matrix.chunk.name }}.csv
           key: ${{ steps.gen0_cache_restore.outputs.cache-primary-key }}
 
+      - name: Save Gen0 BayesR intermediate cache
+        if: steps.gen0_cache_restore.outputs.cache-hit != 'true' && steps.gen0_bayesr_cache_restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            divergence_g0_s*.tsv
+            divergence_g0_s*.bed
+            divergence_g0_s*.bim
+            divergence_g0_s*.fam
+            divergence_g0_s*_sites.npz
+            divergence_g0_s*_pcs.png
+            divergence_g0_s*_work/**
+          key: ${{ steps.gen0_bayesr_cache_restore.outputs.cache-primary-key }}
+
       - name: Upload Gen0 chunk artifact
         uses: actions/upload-artifact@v4
         with:
@@ -143,6 +192,7 @@ jobs:
           retention-days: 7
 
   gen0_summarize:
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.bottleneck_strength_only != 'true' }}
     name: "Gen0 summarize"
     runs-on: ubuntu-22.04
     needs: gen0_chunks
@@ -204,6 +254,7 @@ jobs:
           retention-days: 14
 
   bottleneck_chunks:
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.bottleneck_strength_only != 'true' }}
     name: "Bottleneck chunk ${{ matrix.scenario }}-${{ matrix.gens.name }}"
     runs-on: ubuntu-22.04
     strategy:
@@ -211,9 +262,9 @@ jobs:
       matrix:
         scenario: [divergence, bottleneck]
         gens:
-          - { name: "g0to200", quick: "0,20,50,100,200", full: "0,20,50,100,200" }
-          - { name: "g500to1000", quick: "500,1000", full: "500,1000" }
-          - { name: "g2000to5000", quick: "2000,5000", full: "2000,5000" }
+          - { name: "g0to200", values: "0,20,50,100,200" }
+          - { name: "g500to1000", values: "500,1000" }
+          - { name: "g2000to5000", values: "2000,5000" }
     steps:
       - uses: actions/checkout@v4
 
@@ -222,30 +273,28 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [ "${SIM_PROFILE}" = "full" ]; then
-            echo "seeds=1,2,3,4,5,6,7,8,9,10" >> "$GITHUB_OUTPUT"
-            echo "gens=${{ matrix.gens.full }}" >> "$GITHUB_OUTPUT"
-            echo "n_per_pop=2000" >> "$GITHUB_OUTPUT"
-            echo "seq_len=5000000" >> "$GITHUB_OUTPUT"
-            echo "n_causal=400" >> "$GITHUB_OUTPUT"
-            echo "min_tags=80" >> "$GITHUB_OUTPUT"
-            echo "workers=4" >> "$GITHUB_OUTPUT"
-          else
-            echo "seeds=1,2,3,4" >> "$GITHUB_OUTPUT"
-            echo "gens=${{ matrix.gens.quick }}" >> "$GITHUB_OUTPUT"
-            echo "n_per_pop=900" >> "$GITHUB_OUTPUT"
-            echo "seq_len=2500000" >> "$GITHUB_OUTPUT"
-            echo "n_causal=220" >> "$GITHUB_OUTPUT"
-            echo "min_tags=45" >> "$GITHUB_OUTPUT"
-            echo "workers=3" >> "$GITHUB_OUTPUT"
+          CPU_CORES="$(nproc)"
+          if [ -z "$CPU_CORES" ] || [ "$CPU_CORES" -lt 1 ]; then
+            CPU_CORES=1
           fi
+          echo "workers=$CPU_CORES" >> "$GITHUB_OUTPUT"
+          echo "seeds=1,2,3,4,5,6,7,8,9,10" >> "$GITHUB_OUTPUT"
+          echo "gens=${{ matrix.gens.values }}" >> "$GITHUB_OUTPUT"
+          echo "seeds_key=1_2_3_4_5_6_7_8_9_10" >> "$GITHUB_OUTPUT"
+          echo "gens_key=$(echo '${{ matrix.gens.values }}' | tr ',' '_')" >> "$GITHUB_OUTPUT"
+          echo "n_per_pop=2000" >> "$GITHUB_OUTPUT"
+          echo "seq_len=5000000" >> "$GITHUB_OUTPUT"
+          echo "n_causal=400" >> "$GITHUB_OUTPUT"
+          echo "n_array_sites=2000" >> "$GITHUB_OUTPUT"
 
       - name: Restore bottleneck simulation cache
         id: bottleneck_cache_restore
         uses: actions/cache/restore@v4
         with:
-          path: sims/results_bottleneck_ld_mechanism/chunks/${{ matrix.scenario }}_${{ matrix.gens.name }}.csv
-          key: bottleneck-sim-${{ runner.os }}-${{ env.SIM_PROFILE }}-${{ matrix.scenario }}-${{ matrix.gens.name }}-${{ steps.bottleneck_params.outputs.seeds }}-${{ steps.bottleneck_params.outputs.gens }}-${{ steps.bottleneck_params.outputs.n_per_pop }}-${{ steps.bottleneck_params.outputs.seq_len }}-${{ steps.bottleneck_params.outputs.n_causal }}-${{ steps.bottleneck_params.outputs.min_tags }}-${{ hashFiles('sims/bottleneck_ld_mechanism.py', 'sims/requirements.txt') }}
+          path: |
+            sims/results_bottleneck_ld_mechanism/chunks/${{ matrix.scenario }}_${{ matrix.gens.name }}.csv
+            sims/results_bottleneck_ld_mechanism/hetero_sweeps/${{ matrix.scenario }}_${{ matrix.gens.name }}_hetero_sweep.csv
+          key: bottleneck-sim-${{ runner.os }}-${{ env.SIM_PROFILE }}-${{ matrix.scenario }}-${{ matrix.gens.name }}-${{ steps.bottleneck_params.outputs.seeds_key }}-${{ steps.bottleneck_params.outputs.gens_key }}-${{ steps.bottleneck_params.outputs.n_per_pop }}-${{ steps.bottleneck_params.outputs.seq_len }}-${{ steps.bottleneck_params.outputs.n_causal }}-${{ steps.bottleneck_params.outputs.n_array_sites }}-${{ hashFiles('sims/bottleneck_ld_mechanism.py', 'sims/sim_two_pop.py', 'sims/requirements.txt') }}
 
       - name: Set up Python
         if: steps.bottleneck_cache_restore.outputs.cache-hit != 'true'
@@ -270,8 +319,15 @@ jobs:
           N_PER_POP="${{ steps.bottleneck_params.outputs.n_per_pop }}"
           SEQ_LEN="${{ steps.bottleneck_params.outputs.seq_len }}"
           N_CAUSAL="${{ steps.bottleneck_params.outputs.n_causal }}"
-          MIN_TAGS="${{ steps.bottleneck_params.outputs.min_tags }}"
+          N_ARRAY_SITES="${{ steps.bottleneck_params.outputs.n_array_sites }}"
           WORKERS="${{ steps.bottleneck_params.outputs.workers }}"
+
+          # Avoid nested thread oversubscription when using process workers.
+          export OMP_NUM_THREADS=1
+          export MKL_NUM_THREADS=1
+          export OPENBLAS_NUM_THREADS=1
+          export VECLIB_MAXIMUM_THREADS=1
+          export NUMEXPR_NUM_THREADS=1
 
           CHUNK_DIR="sims/results_bottleneck_ld_mechanism/chunks"
           mkdir -p "$CHUNK_DIR"
@@ -284,7 +340,7 @@ jobs:
             --n-per-pop "$N_PER_POP" \
             --seq-len "$SEQ_LEN" \
             --n-causal "$N_CAUSAL" \
-            --min-tags "$MIN_TAGS" \
+            --n-array-sites "$N_ARRAY_SITES" \
             --out-dir "$CHUNK_DIR" \
             --chunk-name "${{ matrix.scenario }}_${{ matrix.gens.name }}"
 
@@ -292,18 +348,23 @@ jobs:
         if: steps.bottleneck_cache_restore.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
-          path: sims/results_bottleneck_ld_mechanism/chunks/${{ matrix.scenario }}_${{ matrix.gens.name }}.csv
+          path: |
+            sims/results_bottleneck_ld_mechanism/chunks/${{ matrix.scenario }}_${{ matrix.gens.name }}.csv
+            sims/results_bottleneck_ld_mechanism/hetero_sweeps/${{ matrix.scenario }}_${{ matrix.gens.name }}_hetero_sweep.csv
           key: ${{ steps.bottleneck_cache_restore.outputs.cache-primary-key }}
 
       - name: Upload bottleneck chunk artifact
         uses: actions/upload-artifact@v4
         with:
           name: bottleneck-chunk-${{ matrix.scenario }}-${{ matrix.gens.name }}
-          path: sims/results_bottleneck_ld_mechanism/chunks/${{ matrix.scenario }}_${{ matrix.gens.name }}.csv
+          path: |
+            sims/results_bottleneck_ld_mechanism/chunks/${{ matrix.scenario }}_${{ matrix.gens.name }}.csv
+            sims/results_bottleneck_ld_mechanism/hetero_sweeps/${{ matrix.scenario }}_${{ matrix.gens.name }}_hetero_sweep.csv
           if-no-files-found: error
           retention-days: 7
 
   bottleneck_summarize:
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.bottleneck_strength_only != 'true' }}
     name: "Bottleneck summarize"
     runs-on: ubuntu-22.04
     needs: bottleneck_chunks
@@ -325,14 +386,15 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           pattern: bottleneck-chunk-*
-          path: sims/results_bottleneck_ld_mechanism/chunks
+          path: artifacts/bottleneck-chunks
           merge-multiple: true
 
       - name: Summarize bottleneck mechanism analysis
         run: |
           set -euo pipefail
           python sims/bottleneck_ld_mechanism.py summarize \
-            --glob "sims/results_bottleneck_ld_mechanism/chunks/*.csv" \
+            --glob "artifacts/bottleneck-chunks/**/chunks/*.csv" \
+            --sweep-glob "artifacts/bottleneck-chunks/**/hetero_sweeps/*_hetero_sweep.csv" \
             --out-dir sims/results_bottleneck_ld_mechanism
 
       - name: Upload bottleneck report artifacts
@@ -345,16 +407,180 @@ jobs:
             sims/results_bottleneck_ld_mechanism/bottleneck_paired_deltas.csv
             sims/results_bottleneck_ld_mechanism/bottleneck_hypothesis_tests.csv
             sims/results_bottleneck_ld_mechanism/bottleneck_diagnostics.csv
-            sims/results_bottleneck_ld_mechanism/fig1_near_vs_far.png
+            sims/results_bottleneck_ld_mechanism/bottleneck_heterozygosity_sweep_results.csv
+            sims/results_bottleneck_ld_mechanism/fig1_transfer_by_scenario.png
             sims/results_bottleneck_ld_mechanism/fig2_ld_vs_hetero_interventions.png
             sims/results_bottleneck_ld_mechanism/fig3_added_harm_correlates.png
+            sims/results_bottleneck_ld_mechanism/fig4_heterozygosity_distributions.png
+            sims/results_bottleneck_ld_mechanism/fig5_heterozygosity_manipulation_sweep.png
           if-no-files-found: error
           retention-days: 14
 
-  ui_summary:
+  bottleneck_strength_chunks:
+    name: "Bottleneck strength chunk ${{ matrix.frac_chunk.name }}"
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        frac_chunk:
+          - { name: "f0p5_1_5", values: "0.005,0.01,0.05" }
+          - { name: "f10_20", values: "0.1,0.2" }
+          - { name: "f50_70", values: "0.5,0.7" }
+          - { name: "f100", values: "1.0" }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Define bottleneck strength simulation parameters
+        id: strength_params
+        shell: bash
+        run: |
+          set -euo pipefail
+          CPU_CORES="$(nproc)"
+          if [ -z "$CPU_CORES" ] || [ "$CPU_CORES" -lt 1 ]; then
+            CPU_CORES=1
+          fi
+          echo "workers=$CPU_CORES" >> "$GITHUB_OUTPUT"
+          echo "seeds=1,2,3,4,5,6,7,8,9,10" >> "$GITHUB_OUTPUT"
+          echo "gens=300" >> "$GITHUB_OUTPUT"
+          echo "fracs=${{ matrix.frac_chunk.values }}" >> "$GITHUB_OUTPUT"
+          echo "seeds_key=1_2_3_4_5_6_7_8_9_10" >> "$GITHUB_OUTPUT"
+          echo "fracs_key=$(echo '${{ matrix.frac_chunk.values }}' | tr ',.' '__')" >> "$GITHUB_OUTPUT"
+          echo "n_per_pop=2000" >> "$GITHUB_OUTPUT"
+          echo "seq_len=5000000" >> "$GITHUB_OUTPUT"
+          echo "n_causal=400" >> "$GITHUB_OUTPUT"
+          echo "n_array_sites=2000" >> "$GITHUB_OUTPUT"
+
+      - name: Restore bottleneck strength cache
+        id: strength_cache_restore
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            sims/results_bottleneck_strength/chunks/strength_${{ matrix.frac_chunk.name }}.csv
+            sims/results_bottleneck_strength/strength_sweeps/strength_${{ matrix.frac_chunk.name }}_strength_sweep.csv
+          key: bottleneck-strength-sim-${{ runner.os }}-${{ env.SIM_PROFILE }}-g300-${{ steps.strength_params.outputs.seeds_key }}-${{ steps.strength_params.outputs.fracs_key }}-${{ steps.strength_params.outputs.n_per_pop }}-${{ steps.strength_params.outputs.seq_len }}-${{ steps.strength_params.outputs.n_causal }}-${{ steps.strength_params.outputs.n_array_sites }}-${{ hashFiles('sims/bottleneck_ld_mechanism.py', 'sims/sim_two_pop.py', 'sims/requirements.txt') }}
+
+      - name: Set up Python
+        if: steps.strength_cache_restore.outputs.cache-hit != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        if: steps.strength_cache_restore.outputs.cache-hit != 'true'
+        run: |
+          pip install uv
+          uv pip install --system -r sims/requirements.txt
+
+      - name: Run bottleneck strength mechanism chunk
+        if: steps.strength_cache_restore.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+
+          SEEDS="${{ steps.strength_params.outputs.seeds }}"
+          GENS="${{ steps.strength_params.outputs.gens }}"
+          FRACS="${{ steps.strength_params.outputs.fracs }}"
+          N_PER_POP="${{ steps.strength_params.outputs.n_per_pop }}"
+          SEQ_LEN="${{ steps.strength_params.outputs.seq_len }}"
+          N_CAUSAL="${{ steps.strength_params.outputs.n_causal }}"
+          N_ARRAY_SITES="${{ steps.strength_params.outputs.n_array_sites }}"
+          WORKERS="${{ steps.strength_params.outputs.workers }}"
+
+          export OMP_NUM_THREADS=1
+          export MKL_NUM_THREADS=1
+          export OPENBLAS_NUM_THREADS=1
+          export VECLIB_MAXIMUM_THREADS=1
+          export NUMEXPR_NUM_THREADS=1
+
+          CHUNK_DIR="sims/results_bottleneck_strength/chunks"
+          mkdir -p "$CHUNK_DIR"
+
+          python sims/bottleneck_ld_mechanism.py run-strength-chunk \
+            --gens "$GENS" \
+            --bottleneck-fracs "$FRACS" \
+            --seeds "$SEEDS" \
+            --workers "$WORKERS" \
+            --n-per-pop "$N_PER_POP" \
+            --seq-len "$SEQ_LEN" \
+            --n-causal "$N_CAUSAL" \
+            --n-array-sites "$N_ARRAY_SITES" \
+            --out-dir "$CHUNK_DIR" \
+            --chunk-name "strength_${{ matrix.frac_chunk.name }}"
+
+      - name: Save bottleneck strength cache
+        if: steps.strength_cache_restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            sims/results_bottleneck_strength/chunks/strength_${{ matrix.frac_chunk.name }}.csv
+            sims/results_bottleneck_strength/strength_sweeps/strength_${{ matrix.frac_chunk.name }}_strength_sweep.csv
+          key: ${{ steps.strength_cache_restore.outputs.cache-primary-key }}
+
+      - name: Upload bottleneck strength chunk artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bottleneck-strength-chunk-${{ matrix.frac_chunk.name }}
+          path: |
+            sims/results_bottleneck_strength/chunks/strength_${{ matrix.frac_chunk.name }}.csv
+            sims/results_bottleneck_strength/strength_sweeps/strength_${{ matrix.frac_chunk.name }}_strength_sweep.csv
+          if-no-files-found: error
+          retention-days: 7
+
+  bottleneck_strength_summarize:
+    name: "Bottleneck strength summarize"
+    runs-on: ubuntu-22.04
+    needs: bottleneck_strength_chunks
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install uv
+          uv pip install --system -r sims/requirements.txt
+
+      - name: Download bottleneck strength chunk artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bottleneck-strength-chunk-*
+          path: artifacts/bottleneck-strength-chunks
+          merge-multiple: true
+
+      - name: Summarize bottleneck strength analysis
+        run: |
+          set -euo pipefail
+          python sims/bottleneck_ld_mechanism.py summarize-strength \
+            --glob "artifacts/bottleneck-strength-chunks/**/chunks/*.csv" \
+            --sweep-glob "artifacts/bottleneck-strength-chunks/**/strength_sweeps/*_strength_sweep.csv" \
+            --out-dir sims/results_bottleneck_strength
+
+      - name: Upload bottleneck strength report artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bottleneck-strength-report
+          path: |
+            sims/results_bottleneck_strength/bottleneck_strength_portability_results.csv
+            sims/results_bottleneck_strength/bottleneck_strength_portability_summary.csv
+            sims/results_bottleneck_strength/bottleneck_strength_sweep_results.csv
+            sims/results_bottleneck_strength/fig_strength_transfer_ratio.png
+            sims/results_bottleneck_strength/fig_strength_target_vs_holdout_r2.png
+            sims/results_bottleneck_strength/fig_strength_beta_correlation.png
+            sims/results_bottleneck_strength/fig_strength_heterozygosity_shift.png
+            sims/results_bottleneck_strength/fig_strength_ld_destroy_delta.png
+            sims/results_bottleneck_strength/fig_strength_heterozygosity_sweep.png
+          if-no-files-found: error
+          retention-days: 14
+
+  ui_summary_default:
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.bottleneck_strength_only != 'true' }}
     name: "Workflow summary"
     runs-on: ubuntu-22.04
-    needs: [gen0_summarize, bottleneck_summarize]
+    needs: [gen0_summarize, bottleneck_summarize, bottleneck_strength_summarize]
     steps:
       - name: Download Gen0 artifact
         uses: actions/download-artifact@v4
@@ -368,6 +594,12 @@ jobs:
           name: bottleneck-report
           path: artifacts/bottleneck
 
+      - name: Download bottleneck strength artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: bottleneck-strength-report
+          path: artifacts/bottleneck-strength
+
       - name: Write GitHub UI summary
         run: |
           python - <<'PY'
@@ -378,6 +610,7 @@ jobs:
           gtests = Path("artifacts/gen0/gen0_hypothesis_tests.csv")
           btests = Path("artifacts/bottleneck/bottleneck_hypothesis_tests.csv")
           bdiag = Path("artifacts/bottleneck/bottleneck_diagnostics.csv")
+          strength = Path("artifacts/bottleneck-strength/bottleneck_strength_portability_summary.csv")
 
           def read_csv(path):
               with open(path, newline="") as f:
@@ -386,6 +619,7 @@ jobs:
           g = read_csv(gtests)
           b = read_csv(btests)
           d = read_csv(bdiag)
+          s = read_csv(strength)
 
           dmap = {r["metric"]: r for r in d}
 
@@ -429,8 +663,64 @@ jobs:
               lines.append(f"| `{key}` | {float(r['value']):.4f} | {ci} |")
 
           lines.append("")
-          lines.append("Artifacts: `gen0-report`, `bottleneck-report`")
-          out.write_text("\\n".join(lines))
+          lines.append("## Bottleneck-strength portability (300 generations)")
+          lines.append("")
+          lines.append("| Bottleneck size | Transfer ratio mean | 95% CI |")
+          lines.append("|---|---:|---|")
+          for r in s:
+              if r["metric"] != "ratio_alltags":
+                  continue
+              lines.append(
+                  f"| {int(round(float(r['bottleneck_pct'])))}% | {float(r['mean']):.4f} | [{float(r['ci_lo']):.4f}, {float(r['ci_hi']):.4f}] |"
+              )
+
+          lines.append("")
+          lines.append("Artifacts: `gen0-report`, `bottleneck-report`, `bottleneck-strength-report`")
+          out.write_text("\n".join(lines))
+          print(out.read_text())
+          PY
+          cat summary.md >> "$GITHUB_STEP_SUMMARY"
+
+  ui_summary_strength_only:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.bottleneck_strength_only == 'true' }}
+    name: "Workflow summary (bottleneck strength only)"
+    runs-on: ubuntu-22.04
+    needs: bottleneck_strength_summarize
+    steps:
+      - name: Download bottleneck strength artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: bottleneck-strength-report
+          path: artifacts/bottleneck-strength
+
+      - name: Write GitHub UI summary
+        run: |
+          python - <<'PY'
+          import csv
+          from pathlib import Path
+
+          out = Path("summary.md")
+          strength = Path("artifacts/bottleneck-strength/bottleneck_strength_portability_summary.csv")
+
+          with open(strength, newline="") as f:
+              rows = list(csv.DictReader(f))
+
+          lines = []
+          lines.append("# Bottleneck-strength portability summary")
+          lines.append("")
+          lines.append("Fixed setup: divergence=300 generations; bottleneck sizes=0.5%,1%,5%,10%,20%,50%,70%,100%")
+          lines.append("")
+          lines.append("| Bottleneck size | Transfer ratio mean | 95% CI |")
+          lines.append("|---|---:|---|")
+          for r in rows:
+              if r["metric"] != "ratio_alltags":
+                  continue
+              lines.append(
+                  f"| {int(round(float(r['bottleneck_pct'])))}% | {float(r['mean']):.4f} | [{float(r['ci_lo']):.4f}, {float(r['ci_hi']):.4f}] |"
+              )
+          lines.append("")
+          lines.append("Artifact: `bottleneck-strength-report`")
+          out.write_text("\n".join(lines))
           print(out.read_text())
           PY
           cat summary.md >> "$GITHUB_STEP_SUMMARY"

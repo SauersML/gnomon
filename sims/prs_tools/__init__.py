@@ -2,4 +2,5 @@
 PRS Tool wrappers package.
 """
 from .bayesr import BayesR
-__all__ = ['BayesR']
+from .pt import PPlusT
+__all__ = ['BayesR', 'PPlusT']

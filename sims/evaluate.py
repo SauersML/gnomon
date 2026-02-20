@@ -9,6 +9,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_curve
 from scipy import stats
 from itertools import combinations
 import multiprocessing as mp
@@ -19,7 +20,6 @@ sys.path.append(str(Path(__file__).parent))
 from methods import (
     RawPGSMethod,
     GAMMethod,
-    GnomonGAMMethod,
     LinearInteractionMethod,
     NormalizationMethod,
 )
@@ -87,7 +87,6 @@ def load_scores(work_dir, methods):
 
 def plot_roc_curves(methods_results, sim_label):
     """Plot ROC curves."""
-    from sklearn.metrics import roc_curve
     _apply_plot_style()
     fig, ax = plt.subplots(figsize=(9, 7))
     colors = plt.cm.tab10(np.linspace(0, 1, max(1, len(methods_results))))
@@ -473,6 +472,53 @@ def compute_significance_tests(methods_results, sim_label):
     df.to_csv(f'{sim_label}_significance_tests.csv', index=False)
     return df
 
+
+def write_probability_outputs(methods_results, sim_label):
+    """
+    Persist per-individual probabilities for downstream seed aggregation.
+    """
+    long_rows = []
+    for method_name, result in methods_results.items():
+        iids = result.get("iid", [])
+        pops = result.get("pop_label", [])
+        y_true = result["y_true"]
+        y_pred = result["y_pred"]
+        for iid, pop, y_val, p_val in zip(iids, pops, y_true, y_pred):
+            long_rows.append(
+                {
+                    "Method": method_name,
+                    "IID": str(iid),
+                    "pop_label": str(pop),
+                    "y_true": int(y_val),
+                    "y_prob": float(p_val),
+                }
+            )
+
+    if not long_rows:
+        return
+
+    probs_df = pd.DataFrame(long_rows)
+    probs_df.to_csv(f"{sim_label}_probabilities.csv", index=False)
+
+    summary = (
+        probs_df.groupby(["Method", "pop_label"], as_index=False)
+        .agg(
+            n=("IID", "count"),
+            observed_prevalence=("y_true", "mean"),
+            mean_predicted_probability=("y_prob", "mean"),
+            auc=("y_prob", lambda s: np.nan),
+        )
+    )
+    for method_name in summary["Method"].unique():
+        method_mask = probs_df["Method"] == method_name
+        method_df = probs_df.loc[method_mask]
+        try:
+            auc_val = fast_auc(method_df["y_true"].to_numpy(), method_df["y_prob"].to_numpy())
+        except Exception:
+            auc_val = np.nan
+        summary.loc[summary["Method"] == method_name, "auc"] = auc_val
+    summary.to_csv(f"{sim_label}_probability_summary.csv", index=False)
+
 def main():
     import argparse
 
@@ -551,19 +597,10 @@ def main():
         NormalizationMethod(n_pcs=5),
         GAMMethod(n_pcs=5, k_pgs=10, k_pc=10, use_ti=True),
     ]
-    if args.enable_gnomon:
-        try:
-            calibration_methods.append(
-                GnomonGAMMethod(n_pcs=5, pgs_knots=10, pc_knots=10, no_calibration=True)
-            )
-        except FileNotFoundError as e:
-            print(f"Skipping Gnomon GAM: {e}")
 
     def _method_label(method) -> str:
         if isinstance(method, GAMMethod):
             return "GAM-mgcv"
-        if isinstance(method, GnomonGAMMethod):
-            return "GAM-gnomon"
         if isinstance(method, RawPGSMethod):
             return "Raw"
         if isinstance(method, LinearInteractionMethod):
@@ -603,7 +640,9 @@ def main():
                 results[name] = {
                     'y_true': y_test[idx_val],
                     'y_pred': y_prob,
-                    'metrics': metrics
+                    'metrics': metrics,
+                    'iid': analysis_df.index.to_numpy()[idx_val],
+                    'pop_label': pop_test[idx_val],
                 }
             except Exception as e:
                 print(f"  Failed to evaluate {name}: {e}")
@@ -626,6 +665,7 @@ def main():
     plot_auc_summary(results, df_significance, sim_prefix)
     plot_brier_summary(results, df_significance, sim_prefix)
     df_metrics = create_metrics_table(results, sim_prefix)
+    write_probability_outputs(results, sim_prefix)
     print(df_metrics.to_string(index=False))
 
     print("\nEvaluation Complete.")
