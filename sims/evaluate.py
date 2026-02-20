@@ -20,7 +20,6 @@ sys.path.append(str(Path(__file__).parent))
 from methods import (
     RawPGSMethod,
     GAMMethod,
-    GnomonGAMMethod,
     LinearInteractionMethod,
     NormalizationMethod,
 )
@@ -598,19 +597,10 @@ def main():
         NormalizationMethod(n_pcs=5),
         GAMMethod(n_pcs=5, k_pgs=10, k_pc=10, use_ti=True),
     ]
-    if args.enable_gnomon:
-        try:
-            calibration_methods.append(
-                GnomonGAMMethod(n_pcs=5, pgs_knots=10, pc_knots=10, no_calibration=True)
-            )
-        except FileNotFoundError as e:
-            print(f"Skipping Gnomon GAM: {e}")
 
     def _method_label(method) -> str:
         if isinstance(method, GAMMethod):
             return "GAM-mgcv"
-        if isinstance(method, GnomonGAMMethod):
-            return "GAM-gnomon"
         if isinstance(method, RawPGSMethod):
             return "Raw"
         if isinstance(method, LinearInteractionMethod):
