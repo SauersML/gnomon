@@ -21,6 +21,7 @@ import Mathlib.Data.Matrix.Basic
 import Mathlib.LinearAlgebra.Matrix.DotProduct
 import Mathlib.Topology.MetricSpace.Lipschitz
 import Mathlib.Data.NNReal.Basic
+import Mathlib.Data.ENNReal.Basic
 import Mathlib.Topology.Compactness.Compact
 import Mathlib.Data.Matrix.Reflection
 import Mathlib.Data.Matrix.Mul
