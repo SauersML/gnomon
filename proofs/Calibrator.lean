@@ -4440,7 +4440,71 @@ noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → �
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
     (h_mem : p ∈ K) (h_min : ∀ w ∈ K, l2norm_sq (y - p) ≤ l2norm_sq (y - w)) :
     p = orthogonalProjection K y := by
-  sorry
+  let iso : (Fin n → ℝ) ≃ₗ[ℝ] EuclideanSpace ℝ (Fin n) := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K_E : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map iso
+  let y_E : EuclideanSpace ℝ (Fin n) := iso y
+  let p_E : EuclideanSpace ℝ (Fin n) := iso p
+
+  have h_mem_E : p_E ∈ K_E := by
+    refine ⟨p, h_mem, ?_⟩
+    simp [p_E]
+
+  have h_norm_eq : ∀ v, l2norm_sq v = ‖iso v‖^2 := by
+    intro v
+    simp only [l2norm_sq, EuclideanSpace.norm_eq, Real.norm_eq_abs, sq_abs]
+    rw [Real.sq_sqrt]
+    · rfl
+    · apply Finset.sum_nonneg
+      intro i _
+      exact sq_nonneg (v i)
+
+  have h_orth : ∀ v ∈ K_E, ⟪y_E - p_E, v⟫_ℝ = 0 := by
+    intro v hv
+    have h_min_E : ∀ w_E ∈ K_E, ‖y_E - p_E‖^2 ≤ ‖y_E - w_E‖^2 := by
+      intro w_E hw_E
+      rw [Submodule.mem_map] at hw_E
+      obtain ⟨w, hw, hw_eq⟩ := hw_E
+      rw [← hw_eq]
+      specialize h_min w hw
+      rw [h_norm_eq, h_norm_eq] at h_min
+      simpa [y_E, p_E, map_sub] using h_min
+
+    let a := -2 * ⟪y_E - p_E, v⟫_ℝ
+    let b := ‖v‖^2
+    have h_ineq : ∀ t, a * t + b * t^2 ≥ 0 := by
+      intro t
+      have h_mem_v : p_E + t • v ∈ K_E := K_E.add_mem h_mem_E (K_E.smul_mem t hv)
+      specialize h_min_E (p_E + t • v) h_mem_v
+      have h_exp :
+          ‖y_E - (p_E + t • v)‖^2 =
+          ‖y_E - p_E‖^2 - 2 * t * ⟪y_E - p_E, v⟫_ℝ + t^2 * ‖v‖^2 := by
+        rw [sub_add_eq_sub_sub, norm_sub_sq_real]
+        simp only [inner_smul_right, real_inner_comm, norm_smul, Real.norm_eq_abs]
+        rw [mul_pow, sq_abs]
+        ring
+      rw [h_exp] at h_min_E
+      have h_cancel :
+          ‖y_E - p_E‖^2 + (a * t + b * t^2) =
+          ‖y_E - p_E‖^2 - 2 * t * ⟪y_E - p_E, v⟫_ℝ + t^2 * ‖v‖^2 := by
+        dsimp [a, b]
+        ring
+      rw [← h_cancel] at h_min_E
+      linarith
+
+    have h_a_zero := linear_coeff_zero_of_quadratic_nonneg a b h_ineq
+    dsimp [a] at h_a_zero
+    linarith
+
+  have h_eq_E : p_E = ↑(Submodule.orthogonalProjection K_E y_E) := by
+    symm
+    apply Submodule.eq_orthogonalProjection_of_mem_of_inner_eq_zero h_mem_E
+    intro w hw
+    exact h_orth w hw
+
+  apply iso.injective
+  rw [orthogonalProjection]
+  simp only [iso.symm_apply_apply]
+  exact h_eq_E
 set_option maxHeartbeats 10000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
     PROVIDED the model class is flexible enough to capture the transformation.
