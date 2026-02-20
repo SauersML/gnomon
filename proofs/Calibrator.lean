@@ -4580,7 +4580,98 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   ∀ (i : Fin n),
       linearPredictor model (data.p i) (data.c i) =
       linearPredictor model_prime (data'.p i) (data'.c i) := by
-  sorry
+  intro data_prime model model_prime i
+  classical
+  let X := designMatrix data pgsBasis splineBasis
+  let X' := designMatrix data_prime pgsBasis splineBasis
+
+  -- 1. Model class validity
+  have h_class : InModelClass model pgsBasis splineBasis := by
+    unfold model fit
+    apply unpackParams_in_class
+  have h_class' : InModelClass model_prime pgsBasis splineBasis := by
+    unfold model_prime fit
+    apply unpackParams_in_class
+
+  -- 2. Link predictions to design matrix
+  have h_pred : ∀ i, linearPredictor model (data.p i) (data.c i) = (X.mulVec (packParams model)) i :=
+    linearPredictor_eq_designMatrix_mulVec data pgsBasis splineBasis model h_class
+  have h_pred' : ∀ i, linearPredictor model_prime (data_prime.p i) (data_prime.c i) = (X'.mulVec (packParams model_prime)) i :=
+    linearPredictor_eq_designMatrix_mulVec data_prime pgsBasis splineBasis model_prime h_class'
+
+  -- 3. Loss function simplification with lambda = 0
+  have h_loss_eq : ∀ (m : PhenotypeInformedGAM p k sp) (hm : InModelClass m pgsBasis splineBasis) (d : RealizedData n k),
+      empiricalLoss m d 0 = (1 / n) * l2norm_sq (d.y - (designMatrix d pgsBasis splineBasis).mulVec (packParams m)) := by
+    intro m hm d
+    unfold empiricalLoss pointwiseNLL l2norm_sq
+    simp only [hm.dist_gaussian, zero_mul, add_zero]
+    congr 1
+    refine Finset.sum_congr rfl ?_
+    intro i _
+    rw [linearPredictor_eq_designMatrix_mulVec d pgsBasis splineBasis m hm i]
+    rfl
+
+  -- 4. Optimality implies distance minimization
+  have h_min := fit_minimizes_loss p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank model h_class
+  have h_rank_prime : X'.rank = Fintype.card (ParamIx p k sp) := by
+    have h_rank_eq : X.rank = X'.rank := rank_eq_of_range_eq X X' h_range_eq
+    rw [← h_rank_eq]
+    exact h_rank
+  have h_min' := fit_minimizes_loss p k sp n data_prime lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank_prime model_prime h_class'
+
+  rw [h_lambda_zero] at h_min h_min'
+
+  -- 5. Map to orthogonal projection
+  let RangeX := LinearMap.range (Matrix.toLin' X)
+  let RangeX' := LinearMap.range (Matrix.toLin' X')
+
+  have h_proj : (X.mulVec (packParams model)) = orthogonalProjection RangeX data.y := by
+    apply orthogonalProjection_eq_of_dist_le
+    · -- Show X * beta in RangeX
+      apply LinearMap.mem_range.2
+      use (packParams model)
+      rfl
+    · -- Show optimality
+      intro w hw
+      obtain ⟨beta_w, hbeta_w⟩ := LinearMap.mem_range.1 hw
+      let m_w := unpackParams pgsBasis splineBasis beta_w
+      have h_class_w : InModelClass m_w pgsBasis splineBasis := unpackParams_in_class pgsBasis splineBasis beta_w
+      specialize h_min m_w h_class_w
+      rw [h_loss_eq model h_class data, h_loss_eq m_w h_class_w data] at h_min
+      rw [← hbeta_w]
+      have h_pack : packParams m_w = beta_w := by
+        unfold m_w unpackParams packParams
+        ext x; cases x <;> rfl
+      rw [h_pack] at h_min
+      exact (mul_le_mul_left (one_div_pos.mpr (Nat.cast_pos.mpr h_n_pos))).mp h_min
+
+  have h_proj' : (X'.mulVec (packParams model_prime)) = orthogonalProjection RangeX' data.y := by
+    apply orthogonalProjection_eq_of_dist_le
+    · apply LinearMap.mem_range.2
+      use (packParams model_prime)
+      rfl
+    · intro w hw
+      obtain ⟨beta_w, hbeta_w⟩ := LinearMap.mem_range.1 hw
+      let m_w := unpackParams pgsBasis splineBasis beta_w
+      have h_class_w : InModelClass m_w pgsBasis splineBasis := unpackParams_in_class pgsBasis splineBasis beta_w
+      specialize h_min' m_w h_class_w
+      rw [h_loss_eq model_prime h_class' data_prime, h_loss_eq m_w h_class_w data_prime] at h_min'
+      rw [← hbeta_w]
+      have h_pack : packParams m_w = beta_w := by
+        unfold m_w unpackParams packParams
+        ext x; cases x <;> rfl
+      rw [h_pack] at h_min'
+      exact (mul_le_mul_left (one_div_pos.mpr (Nat.cast_pos.mpr h_n_pos))).mp h_min'
+
+  -- 6. Conclusion
+  have h_ranges_eq : RangeX = RangeX' := by
+    dsimp [RangeX, RangeX']
+    exact h_range_eq
+  rw [h_ranges_eq] at h_proj
+  rw [h_pred i, h_pred' i]
+  have h_eq_vec : X.mulVec (packParams model) = X'.mulVec (packParams model_prime) := by
+    rw [h_proj, h_proj']
+  exact congr_fun h_eq_vec i
 
 noncomputable def dist_to_support {k : ℕ} (c : Fin k → ℝ) (supp : Set (Fin k → ℝ)) : ℝ :=
   Metric.infDist c supp
