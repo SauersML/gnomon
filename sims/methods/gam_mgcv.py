@@ -116,7 +116,7 @@ class GAMMethod(PGSMethod):
             formula_str = f'y ~ te(P, {pc_vars}, k=c({k_dims}), bs=c({bs_types}))'
         
         return formula_str
-    
+
     def fit(self, P: np.ndarray, PC: np.ndarray, y: np.ndarray) -> 'GAMMethod':
         """
         Fit GAM using R's mgcv with proper tensor product structure.
@@ -131,22 +131,20 @@ class GAMMethod(PGSMethod):
         for i in range(n_pcs_actual):
             data_dict[f'PC{i+1}'] = PC[:, i].astype(float)
         
-        # Build formula
-        formula_str = self._build_formula(n_pcs_actual)
-        
         # Convert to R data frame
         with localconverter(ro.default_converter + pandas2ri.converter + numpy2ri.converter):
             r_df = ro.DataFrame(data_dict)
-        
-        # Fit GAM with REML smoothing selection
+
+        # Build formula
+        formula_str = self._build_formula(n_pcs_actual)
         formula = ro.Formula(formula_str)
         self.r_model = self.mgcv.gam(
             formula,
             data=r_df,
             family=self.stats.binomial(),
-            method=self.method,  # REML for smoothing parameter selection
+            method=self.method,
         )
-        
+
         self.is_fitted = True
         self._formula_str = formula_str
         return self

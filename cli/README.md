@@ -26,7 +26,7 @@ Usage: `gnomon fit <GENOTYPE_PATH> --components <N> [--list <PATH>] [--ld [--sit
 ### `project`
 Project samples into an existing HWE PCA space.
 
-Usage: `gnomon project <GENOTYPE_PATH>`
+Usage: `gnomon project <GENOTYPE_PATH> [--model <MODEL_NAME>]`
 
 ### `train`
 Train a generalized additive model used for calibration and saves it to `model.toml`.
