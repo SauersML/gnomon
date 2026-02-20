@@ -14,15 +14,16 @@ use cudarc::driver::{
     LaunchConfig, PinnedHostSlice, PushKernelArg,
 };
 use cudarc::nvrtc::compile_ptx;
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use memmap2::{Mmap, MmapOptions};
 use rayon::prelude::*;
 use std::env;
 use std::fs::{self, File};
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -32,7 +33,24 @@ const SPOOL_BUFFER_SIZE: usize = 8 * 1024 * 1024;
 const MIN_GPU_WORK: usize = 100_000;
 const MIN_MEGA_BATCH_VARIANTS: usize = 256;
 const MAX_MEGA_BATCH_VARIANTS: usize = 4096;
-const PINNED_RING_SIZE: usize = 2;
+
+fn create_progress_bar(len: u64, message: &str) -> ProgressBar {
+    let draw_target = if std::io::stderr().is_terminal() {
+        ProgressDrawTarget::stderr_with_hz(20)
+    } else {
+        ProgressDrawTarget::hidden()
+    };
+    let pb = ProgressBar::with_draw_target(Some(len), draw_target);
+    pb.set_style(
+        ProgressStyle::with_template(
+            "\n> [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}",
+        )
+        .unwrap()
+        .progress_chars("█▉▊▋▌▍▎▏  "),
+    );
+    pb.set_message(message.to_string());
+    pb
+}
 
 const CUDA_KERNELS: &str = r#"
 extern "C" __global__ void unpack_plink(
@@ -72,15 +90,17 @@ extern "C" __global__ void unpack_plink(
     missing[idx] = m;
 }
 
-extern "C" __global__ void build_weights(
+extern "C" __global__ void build_batch_mats(
     const float* weights,
     const unsigned char* flips,
-    int base_variant,
+    const float* count_weights,
+    const unsigned int* reconciled_indices,
     int batch_variants,
     int stride,
     int num_scores,
     float* out_effective,
-    float* out_missing_corr
+    float* out_missing_corr,
+    float* out_count
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = batch_variants * num_scores;
@@ -88,10 +108,12 @@ extern "C" __global__ void build_weights(
 
     int v = idx / num_scores;
     int s = idx % num_scores;
-    int src = (base_variant + v) * stride + s;
+    unsigned int reconciled = reconciled_indices[v];
+    int src = (int)reconciled * stride + s;
 
     float w = weights[src];
     unsigned char f = flips[src];
+    out_count[idx] = count_weights[src];
     if (f == 1u) {
         out_effective[idx] = -w;
         out_missing_corr[idx] = -2.0f * w;
@@ -99,27 +121,6 @@ extern "C" __global__ void build_weights(
         out_effective[idx] = w;
         out_missing_corr[idx] = 0.0f;
     }
-}
-
-extern "C" __global__ void baseline_reduce(
-    const float* weights,
-    const unsigned char* flips,
-    int num_variants,
-    int stride,
-    int num_scores,
-    float* out_baseline
-) {
-    int s = blockIdx.x * blockDim.x + threadIdx.x;
-    if (s >= num_scores) return;
-
-    float acc = 0.0f;
-    for (int v = 0; v < num_variants; ++v) {
-        int idx = v * stride + s;
-        if (flips[idx] == 1u) {
-            acc += 2.0f * weights[idx];
-        }
-    }
-    out_baseline[s] = acc;
 }
 "#;
 
@@ -148,12 +149,13 @@ struct CudaRuntime {
     stream: Arc<CudaStream>,
     blas: CudaBlas,
     unpack_kernel: CudaFunction,
-    build_weights_kernel: CudaFunction,
+    build_batch_mats_kernel: CudaFunction,
     full_weights: CudaSlice<f32>,
     full_flips: CudaSlice<u8>,
+    full_count_weights: CudaSlice<f32>,
     output_map: CudaSlice<u32>,
     mega_batch_variants: usize,
-    pinned_ring: Vec<PinnedHostSlice<u8>>,
+    pinned_staging: PinnedHostSlice<u8>,
 }
 
 pub fn try_run_cuda(
@@ -198,8 +200,10 @@ impl CudaRuntime {
         let (free_mem, _) = cudarc::driver::result::mem_get_info()
             .map_err(|e| format!("Failed to query device memory: {e:?}"))?;
 
+        let count_weights_len = prep.num_reconciled_variants * prep.stride();
         let static_bytes = prep.weights_matrix().len() * std::mem::size_of::<f32>()
             + prep.flip_mask_matrix().len() * std::mem::size_of::<u8>()
+            + count_weights_len * std::mem::size_of::<f32>()
             + prep.output_idx_to_fam_idx.len() * std::mem::size_of::<u32>();
 
         let result_size = prep.num_people_to_score * prep.score_names.len();
@@ -214,7 +218,7 @@ impl CudaRuntime {
             let required = static_bytes
                 + constant_batch_bytes
                 + per_variant_bytes * mega
-                + mega * prep.bytes_per_variant as usize * PINNED_RING_SIZE;
+                + mega * prep.bytes_per_variant as usize;
             if required <= budget {
                 break;
             }
@@ -235,6 +239,17 @@ impl CudaRuntime {
             .memcpy_stod(&prep.output_idx_to_fam_idx)
             .map_err(|e| format!("Failed to upload output index map: {e:?}"))?;
 
+        let mut host_count_weights = vec![0.0f32; count_weights_len];
+        for (variant_idx, score_cols) in prep.variant_to_scores_map.iter().enumerate() {
+            let row_off = variant_idx * prep.stride();
+            for score_idx in score_cols {
+                host_count_weights[row_off + score_idx.0] = 1.0;
+            }
+        }
+        let full_count_weights = stream
+            .memcpy_stod(&host_count_weights)
+            .map_err(|e| format!("Failed to upload full count-weight matrix: {e:?}"))?;
+
         let ptx = compile_ptx(CUDA_KERNELS).map_err(|e| format!("NVRTC compile failed: {e:?}"))?;
         let module = ctx
             .load_module(ptx)
@@ -243,17 +258,13 @@ impl CudaRuntime {
         let unpack_kernel = module
             .load_function("unpack_plink")
             .map_err(|e| format!("Failed to load unpack_plink kernel: {e:?}"))?;
-        let build_weights_kernel = module
-            .load_function("build_weights")
-            .map_err(|e| format!("Failed to load build_weights kernel: {e:?}"))?;
+        let build_batch_mats_kernel = module
+            .load_function("build_batch_mats")
+            .map_err(|e| format!("Failed to load build_batch_mats kernel: {e:?}"))?;
 
-        let mut pinned_ring = Vec::with_capacity(PINNED_RING_SIZE);
         let max_packed = mega * prep.bytes_per_variant as usize;
-        for _ in 0..PINNED_RING_SIZE {
-            let pinned = unsafe { ctx.alloc_pinned::<u8>(max_packed) }
-                .map_err(|e| format!("Failed to allocate pinned host buffer: {e:?}"))?;
-            pinned_ring.push(pinned);
-        }
+        let pinned_staging = unsafe { ctx.alloc_pinned::<u8>(max_packed) }
+            .map_err(|e| format!("Failed to allocate pinned host buffer: {e:?}"))?;
 
         let blas = CudaBlas::new(stream.clone())
             .map_err(|e| format!("Failed to initialize cuBLAS: {e:?}"))?;
@@ -263,12 +274,13 @@ impl CudaRuntime {
             stream,
             blas,
             unpack_kernel,
-            build_weights_kernel,
+            build_batch_mats_kernel,
             full_weights,
             full_flips,
+            full_count_weights,
             output_map,
             mega_batch_variants: mega,
-            pinned_ring,
+            pinned_staging,
         })
     }
 }
@@ -282,8 +294,41 @@ fn run_single_file_cuda(
     let bed_source = io::open_bed_source(bed_path)?;
     let shared_source = bed_source.byte_source();
 
-    let (_sparse_rx, sparse_tx, dense_rx, dense_tx, buffer_pool, variants_processed_count) =
+    let (sparse_rx, sparse_tx, dense_rx, dense_tx, buffer_pool, variants_processed_count) =
         create_dense_only_pipeline_channels(context);
+    let total_variants = prep_result.num_reconciled_variants as u64;
+    let pb = create_progress_bar(total_variants, "Computing scores (CUDA)...");
+
+    let sparse_drain_handle = {
+        let pool = Arc::clone(&buffer_pool);
+        thread::spawn(move || {
+            while let Ok(message) = sparse_rx.recv() {
+                match message {
+                    Ok(mut work_item) => {
+                        work_item.data.clear();
+                        let _ = pool.push(work_item.data);
+                    }
+                    Err(_) => break,
+                }
+            }
+        })
+    };
+    let (progress_done, progress_handle) = {
+        let counter = Arc::clone(&variants_processed_count);
+        let pb_clone = pb.clone();
+        let done = Arc::new(AtomicBool::new(false));
+        let done_for_thread = Arc::clone(&done);
+        let join = thread::spawn(move || {
+            while !done_for_thread.load(Ordering::Relaxed)
+                && counter.load(Ordering::Relaxed) < total_variants
+            {
+                pb_clone.set_position(counter.load(Ordering::Relaxed));
+                thread::sleep(Duration::from_millis(200));
+            }
+            pb_clone.set_position(counter.load(Ordering::Relaxed));
+        });
+        (done, join)
+    };
 
     let has_complex = !prep_result.complex_rules.is_empty();
     let is_remote = bed_source.mmap().is_none();
@@ -323,44 +368,52 @@ fn run_single_file_cuda(
     }
 
     let mut local_spool = spool_state.take();
-    let producer_handle = thread::spawn({
-        let source = Arc::clone(&shared_source);
-        let prep = Arc::clone(&context.prep_result);
-        let pool = Arc::clone(&buffer_pool);
-        let counter = Arc::clone(&variants_processed_count);
-        move || -> Result<Option<SpoolState>, PipelineError> {
-            let spool_plan = if should_spool {
-                let state = local_spool
-                    .as_mut()
-                    .expect("spool state missing despite spooling enabled");
-                Some(create_spool_plan(prep.as_ref(), state)?)
-            } else {
-                None
-            };
-            io::producer_thread(
-                Arc::clone(&source),
-                Arc::clone(&prep),
-                sparse_tx,
-                dense_tx,
-                pool,
-                counter,
-                |_| ComputePath::Pivot,
-                spool_plan,
-            );
-            Ok(local_spool)
-        }
-    });
+    let (mut final_scores, mut final_counts, mut spool_state) = thread::scope(|s| {
+        let producer_handle = s.spawn({
+            let source = Arc::clone(&shared_source);
+            let prep = Arc::clone(&context.prep_result);
+            let pool = Arc::clone(&buffer_pool);
+            let counter = Arc::clone(&variants_processed_count);
+            move || -> Result<Option<SpoolState>, PipelineError> {
+                let spool_plan = if should_spool {
+                    let state = local_spool
+                        .as_mut()
+                        .expect("spool state missing despite spooling enabled");
+                    Some(create_spool_plan(prep.as_ref(), state)?)
+                } else {
+                    None
+                };
+                io::producer_thread(
+                    Arc::clone(&source),
+                    Arc::clone(&prep),
+                    sparse_tx,
+                    dense_tx,
+                    pool,
+                    counter,
+                    |_| ComputePath::Pivot,
+                    spool_plan,
+                );
+                Ok(local_spool)
+            }
+        });
 
-    let (mut final_scores, mut final_counts) = process_dense_stream_cuda(
-        dense_rx,
-        prep_result,
-        &mut runtime,
-        Arc::clone(&buffer_pool),
-    )?;
-
-    let mut spool_state = producer_handle
-        .join()
-        .map_err(|_| PipelineError::Producer("CUDA producer thread panicked".to_string()))??;
+        let compute_result = process_dense_stream_cuda(
+            dense_rx,
+            prep_result,
+            &mut runtime,
+            Arc::clone(&buffer_pool),
+        );
+        let spool_result = producer_handle
+            .join()
+            .map_err(|_| PipelineError::Producer("CUDA producer thread panicked".to_string()))?;
+        let (scores, counts) = compute_result?;
+        let spool = spool_result?;
+        Ok::<_, PipelineError>((scores, counts, spool))
+    })?;
+    progress_done.store(true, Ordering::Relaxed);
+    let _ = sparse_drain_handle.join();
+    let _ = progress_handle.join();
+    pb.finish_with_message("Computation complete.");
 
     if !prep_result.complex_rules.is_empty() {
         if should_spool {
@@ -446,8 +499,41 @@ fn run_multi_file_cuda(
     let any_remote = bed_sources.iter().any(|s| s.mmap().is_none());
     let shared_sources = Arc::new(bed_sources);
 
-    let (_sparse_rx, sparse_tx, dense_rx, dense_tx, buffer_pool, variants_processed_count) =
+    let (sparse_rx, sparse_tx, dense_rx, dense_tx, buffer_pool, variants_processed_count) =
         create_dense_only_pipeline_channels(context);
+    let total_variants = prep_result.num_reconciled_variants as u64;
+    let pb = create_progress_bar(total_variants, "Computing scores (CUDA)...");
+
+    let sparse_drain_handle = {
+        let pool = Arc::clone(&buffer_pool);
+        thread::spawn(move || {
+            while let Ok(message) = sparse_rx.recv() {
+                match message {
+                    Ok(mut work_item) => {
+                        work_item.data.clear();
+                        let _ = pool.push(work_item.data);
+                    }
+                    Err(_) => break,
+                }
+            }
+        })
+    };
+    let (progress_done, progress_handle) = {
+        let counter = Arc::clone(&variants_processed_count);
+        let pb_clone = pb.clone();
+        let done = Arc::new(AtomicBool::new(false));
+        let done_for_thread = Arc::clone(&done);
+        let join = thread::spawn(move || {
+            while !done_for_thread.load(Ordering::Relaxed)
+                && counter.load(Ordering::Relaxed) < total_variants
+            {
+                pb_clone.set_position(counter.load(Ordering::Relaxed));
+                thread::sleep(Duration::from_millis(200));
+            }
+            pb_clone.set_position(counter.load(Ordering::Relaxed));
+        });
+        (done, join)
+    };
 
     let has_complex = !prep_result.complex_rules.is_empty();
     let should_spool = has_complex && any_remote;
@@ -486,46 +572,54 @@ fn run_multi_file_cuda(
     }
 
     let mut local_spool = spool_state.take();
-    let producer_handle = thread::spawn({
-        let prep = Arc::clone(&context.prep_result);
-        let pool = Arc::clone(&buffer_pool);
-        let counter = Arc::clone(&variants_processed_count);
-        let sources = Arc::clone(&shared_sources);
-        let boundaries_owned = boundaries.to_vec();
-        move || -> Result<Option<SpoolState>, PipelineError> {
-            let spool_plan = if should_spool {
-                let state = local_spool
-                    .as_mut()
-                    .expect("spool state missing despite spooling enabled");
-                Some(create_spool_plan(prep.as_ref(), state)?)
-            } else {
-                None
-            };
-            io::multi_file_producer_thread(
-                Arc::clone(&prep),
-                &boundaries_owned,
-                sources.as_ref(),
-                sparse_tx,
-                dense_tx,
-                pool,
-                counter,
-                |_| ComputePath::Pivot,
-                spool_plan,
-            );
-            Ok(local_spool)
-        }
-    });
+    let (mut final_scores, mut final_counts, mut spool_state) = thread::scope(|s| {
+        let producer_handle = s.spawn({
+            let prep = Arc::clone(&context.prep_result);
+            let pool = Arc::clone(&buffer_pool);
+            let counter = Arc::clone(&variants_processed_count);
+            let sources = Arc::clone(&shared_sources);
+            let boundaries_owned = boundaries.to_vec();
+            move || -> Result<Option<SpoolState>, PipelineError> {
+                let spool_plan = if should_spool {
+                    let state = local_spool
+                        .as_mut()
+                        .expect("spool state missing despite spooling enabled");
+                    Some(create_spool_plan(prep.as_ref(), state)?)
+                } else {
+                    None
+                };
+                io::multi_file_producer_thread(
+                    Arc::clone(&prep),
+                    &boundaries_owned,
+                    sources.as_ref(),
+                    sparse_tx,
+                    dense_tx,
+                    pool,
+                    counter,
+                    |_| ComputePath::Pivot,
+                    spool_plan,
+                );
+                Ok(local_spool)
+            }
+        });
 
-    let (mut final_scores, mut final_counts) = process_dense_stream_cuda(
-        dense_rx,
-        prep_result,
-        &mut runtime,
-        Arc::clone(&buffer_pool),
-    )?;
-
-    let mut spool_state = producer_handle
-        .join()
-        .map_err(|_| PipelineError::Producer("CUDA producer thread panicked".to_string()))??;
+        let compute_result = process_dense_stream_cuda(
+            dense_rx,
+            prep_result,
+            &mut runtime,
+            Arc::clone(&buffer_pool),
+        );
+        let spool_result = producer_handle
+            .join()
+            .map_err(|_| PipelineError::Producer("CUDA producer thread panicked".to_string()))?;
+        let (scores, counts) = compute_result?;
+        let spool = spool_result?;
+        Ok::<_, PipelineError>((scores, counts, spool))
+    })?;
+    progress_done.store(true, Ordering::Relaxed);
+    let _ = sparse_drain_handle.join();
+    let _ = progress_handle.join();
+    pb.finish_with_message("Computation complete.");
 
     if !prep_result.complex_rules.is_empty() {
         if should_spool {
@@ -611,7 +705,7 @@ fn create_dense_only_pipeline_channels(
     Arc<ArrayQueue<Vec<u8>>>,
     Arc<AtomicU64>,
 ) {
-    let (sparse_tx, sparse_rx) = bounded::<Result<WorkItem, PipelineError>>(1);
+    let (sparse_tx, sparse_rx) = bounded::<Result<WorkItem, PipelineError>>(8192);
     let (dense_tx, dense_rx) = bounded::<Result<WorkItem, PipelineError>>(DENSE_CHANNEL_BOUND);
 
     let buffer_pool = Arc::new(ArrayQueue::new(BUFFER_POOL_SIZE));
@@ -683,25 +777,30 @@ fn process_dense_stream_cuda(
         .stream
         .alloc_zeros::<f32>(mega * num_scores)
         .map_err(map_driver_err("Failed to allocate count-weight buffer"))?;
-    let mut d_out_scores_acc = runtime
+    let mut d_reconciled_indices = runtime
+        .stream
+        .alloc_zeros::<u32>(mega)
+        .map_err(map_driver_err("Failed to allocate reconciled-index buffer"))?;
+    let mut d_out_scores = runtime
         .stream
         .alloc_zeros::<f32>(result_size)
-        .map_err(map_driver_err("Failed to allocate accumulated score buffer"))?;
-    let mut d_out_corr_acc = runtime
+        .map_err(map_driver_err("Failed to allocate score output buffer"))?;
+    let mut d_out_corr = runtime
         .stream
         .alloc_zeros::<f32>(result_size)
         .map_err(map_driver_err(
-            "Failed to allocate accumulated correction buffer",
+            "Failed to allocate correction output buffer",
         ))?;
     let mut d_out_counts = runtime
         .stream
         .alloc_zeros::<f32>(result_size)
         .map_err(map_driver_err("Failed to allocate output count buffer"))?;
 
+    let mut host_out_scores = vec![0f32; result_size];
+    let mut host_out_corr = vec![0f32; result_size];
     let mut host_out_counts = vec![0f32; result_size];
 
     let mut batch: Vec<WorkItem> = Vec::with_capacity(mega);
-    let mut ring_idx = 0usize;
 
     loop {
         batch.clear();
@@ -725,11 +824,8 @@ fn process_dense_stream_cuda(
 
         let mut reconciled_indices = Vec::with_capacity(batch_len);
         let packed_len = batch_len * bytes_per_variant;
-        let ring_len = runtime.pinned_ring.len();
-        let slot = ring_idx % ring_len;
-        let pinned = &mut runtime.pinned_ring[slot];
-        ring_idx += 1;
-        let pinned_slice = pinned
+        let pinned_slice = runtime
+            .pinned_staging
             .as_mut_slice()
             .map_err(map_driver_err("Failed to map pinned host slice"))?;
         let mut guards: Vec<BufferGuard<'_>> = Vec::with_capacity(batch_len);
@@ -745,22 +841,6 @@ fn process_dense_stream_cuda(
             });
         }
 
-        let base_variant = reconciled_indices[0].0 as usize;
-        for (offset, idx) in reconciled_indices.iter().enumerate() {
-            if idx.0 as usize != base_variant + offset {
-                return Err(PipelineError::Compute(
-                    "CUDA dense backend requires contiguous reconciled variant batches".to_string(),
-                ));
-            }
-        }
-
-        let mut h_count_w = vec![0f32; batch_len * num_scores];
-        for (local_variant, reconciled_idx) in reconciled_indices.iter().enumerate() {
-            for score_idx in &prep_result.variant_to_scores_map[reconciled_idx.0 as usize] {
-                h_count_w[local_variant * num_scores + score_idx.0] = 1.0;
-            }
-        }
-
         {
             let mut d_packed_view: CudaViewMut<'_, u8> = d_packed.slice_mut(0..packed_len);
             runtime
@@ -769,12 +849,15 @@ fn process_dense_stream_cuda(
                 .map_err(map_driver_err("Failed to copy packed batch to device"))?;
         }
 
+        let host_reconciled_indices: Vec<u32> = reconciled_indices.iter().map(|v| v.0).collect();
         {
-            let mut d_count_w_view = d_count_w.slice_mut(0..batch_len * num_scores);
+            let mut d_reconciled_view = d_reconciled_indices.slice_mut(0..batch_len);
             runtime
                 .stream
-                .memcpy_htod(&h_count_w, &mut d_count_w_view)
-                .map_err(map_driver_err("Failed to upload count weights"))?;
+                .memcpy_htod(&host_reconciled_indices, &mut d_reconciled_view)
+                .map_err(map_driver_err(
+                    "Failed to upload reconciled variant indices",
+                ))?;
         }
 
         let unpack_elems = num_people * batch_len;
@@ -797,17 +880,19 @@ fn process_dense_stream_cuda(
         unsafe {
             runtime
                 .stream
-                .launch_builder(&runtime.build_weights_kernel)
+                .launch_builder(&runtime.build_batch_mats_kernel)
                 .arg(&runtime.full_weights)
                 .arg(&runtime.full_flips)
-                .arg(&(base_variant as i32))
+                .arg(&runtime.full_count_weights)
+                .arg(&d_reconciled_indices.slice(0..batch_len))
                 .arg(&(batch_len as i32))
                 .arg(&(prep_result.stride() as i32))
                 .arg(&(num_scores as i32))
                 .arg(&mut d_w_eff.slice_mut(0..weights_elems))
                 .arg(&mut d_w_corr.slice_mut(0..weights_elems))
+                .arg(&mut d_count_w.slice_mut(0..weights_elems))
                 .launch(LaunchConfig::for_num_elems(weights_elems as u32))
-                .map_err(map_driver_err("Failed to launch build_weights kernel"))?;
+                .map_err(map_driver_err("Failed to launch build_batch_mats kernel"))?;
         }
 
         run_row_major_gemm(
@@ -817,8 +902,8 @@ fn process_dense_stream_cuda(
             num_scores,
             &d_dosage.slice(0..unpack_elems),
             &d_w_eff.slice(0..weights_elems),
-            &mut d_out_scores_acc,
-            1.0f32,
+            &mut d_out_scores,
+            0.0f32,
         )?;
 
         run_row_major_gemm(
@@ -828,8 +913,8 @@ fn process_dense_stream_cuda(
             num_scores,
             &d_missing.slice(0..unpack_elems),
             &d_w_corr.slice(0..weights_elems),
-            &mut d_out_corr_acc,
-            1.0f32,
+            &mut d_out_corr,
+            0.0f32,
         )?;
 
         run_row_major_gemm(
@@ -844,11 +929,22 @@ fn process_dense_stream_cuda(
         )?;
         runtime
             .stream
+            .memcpy_dtoh(&d_out_scores, &mut host_out_scores)
+            .map_err(map_driver_err("Failed to copy score output from device"))?;
+        runtime
+            .stream
+            .memcpy_dtoh(&d_out_corr, &mut host_out_corr)
+            .map_err(map_driver_err(
+                "Failed to copy correction output from device",
+            ))?;
+        runtime
+            .stream
             .memcpy_dtoh(&d_out_counts, &mut host_out_counts)
             .map_err(map_driver_err("Failed to copy count output from device"))?;
 
         for i in 0..result_size {
-            final_counts[i] += host_out_counts[i] as u32;
+            final_scores[i] += host_out_scores[i] as f64 + host_out_corr[i] as f64;
+            final_counts[i] += host_out_counts[i].round() as u32;
         }
 
         drop(guards);
@@ -858,24 +954,6 @@ fn process_dense_stream_cuda(
         .stream
         .synchronize()
         .map_err(map_driver_err("Failed to synchronize CUDA stream"))?;
-
-    let mut host_scores_acc = vec![0f32; result_size];
-    let mut host_corr_acc = vec![0f32; result_size];
-    runtime
-        .stream
-        .memcpy_dtoh(&d_out_scores_acc, &mut host_scores_acc)
-        .map_err(map_driver_err(
-            "Failed to copy accumulated score output from device",
-        ))?;
-    runtime
-        .stream
-        .memcpy_dtoh(&d_out_corr_acc, &mut host_corr_acc)
-        .map_err(map_driver_err(
-            "Failed to copy accumulated correction output from device",
-        ))?;
-    for i in 0..result_size {
-        final_scores[i] += host_scores_acc[i] as f64 + host_corr_acc[i] as f64;
-    }
 
     Ok((final_scores, final_counts))
 }
