@@ -23,7 +23,6 @@ struct ScoreRunOutput {
 }
 
 #[test]
-#[ignore = "opt-in: run with `cargo test --test score -- --ignored`"]
 fn cpu_fallback_handles_messy_inputs_and_writes_scores() -> Result<(), Box<dyn Error>> {
     let tmp = tempdir()?;
     let prefix = tmp.path().join("messy_cohort");
@@ -63,7 +62,6 @@ fn cpu_fallback_handles_messy_inputs_and_writes_scores() -> Result<(), Box<dyn E
 }
 
 #[test]
-#[ignore = "opt-in: run with `cargo test --test score -- --ignored`"]
 fn gpu_and_cpu_outputs_match_for_shared_scores_when_cuda_available() -> Result<(), Box<dyn Error>> {
     let tmp = tempdir()?;
     let prefix = tmp.path().join("gpu_compare_cohort");
@@ -159,7 +157,6 @@ fn gpu_and_cpu_outputs_match_for_shared_scores_when_cuda_available() -> Result<(
 }
 
 #[test]
-#[ignore = "opt-in: run with `cargo test --test score -- --ignored`"]
 fn gpu_and_cpu_outputs_match_for_multifile_score_directory() -> Result<(), Box<dyn Error>> {
     let tmp = tempdir()?;
     let prefix = tmp.path().join("gpu_multifile_cohort");
@@ -257,7 +254,6 @@ fn gpu_and_cpu_outputs_match_for_multifile_score_directory() -> Result<(), Box<d
 }
 
 #[test]
-#[ignore = "opt-in: run with `cargo test --test score -- --ignored`"]
 fn five_samples_multichrom_partial_overlap_and_split_sites() -> Result<(), Box<dyn Error>> {
     let tmp = tempdir()?;
     let prefix = tmp.path().join("five_sample_multichrom");
@@ -390,7 +386,6 @@ fn forty_genomes_hundred_scores_microarray_density_with_multiallelic() -> Result
 }
 
 #[test]
-#[ignore = "opt-in heavy test: 50k samples fixture"]
 fn fifty_thousand_samples_small_genome_varied_variants() -> Result<(), Box<dyn Error>> {
     let tmp = tempdir()?;
     let prefix = tmp.path().join("cohort_50k_small_genome");
