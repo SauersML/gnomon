@@ -749,7 +749,7 @@ enum Commands {
         genotype_path: PathBuf,
 
         /// Use a built-in pre-trained model (downloads from GitHub if needed)
-        /// Available models: hwe_1kg_hgdp_gsa_v2, hwe_1kg_hgdp_gsa_v3, hwe_1kg_hgdp_gda_v1
+        /// Available models: hwe_1kg_hgdp_gsa_v2, hwe_1kg_hgdp_gsa_v3, hwe_1kg_hgdp_gda_v1, hwe_1kg_hgdp_intersection
         #[arg(long, value_name = "MODEL_NAME")]
         model: Option<String>,
     },

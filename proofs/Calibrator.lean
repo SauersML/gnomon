@@ -1,5 +1,6 @@
 import Mathlib.Tactic
 import Mathlib.Analysis.Calculus.Deriv.Basic
+import Mathlib.Analysis.Calculus.Deriv.Mul
 import Mathlib.Analysis.Calculus.Deriv.Inv
 import Mathlib.Analysis.Convex.Strict
 import Mathlib.Analysis.Convex.Jensen
@@ -53,6 +54,8 @@ import Mathlib.Analysis.SpecialFunctions.Pow.Real
 import Mathlib.Algebra.Polynomial.Basic
 import Mathlib.Algebra.Polynomial.Eval.Defs
 import Mathlib.Algebra.Polynomial.Roots
+import Mathlib.Analysis.Calculus.Deriv.Mul
+import Mathlib.Analysis.Calculus.Deriv.Add
 
 open scoped InnerProductSpace
 open InnerProductSpace
@@ -2275,7 +2278,7 @@ theorem penalty_quadratic_tendsto_proof {ι : Type*} [Fintype ι] [DecidableEq �
     h_tendsto
 
 
-set_option maxHeartbeats 1000000
+set_option maxHeartbeats 10000000
 /-- Fit a Gaussian identity-link GAM by minimizing the penalized least squares loss
     over the parameter space, using Weierstrass (coercive + continuous). -/
 noncomputable def fit (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
@@ -4118,7 +4121,8 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
     (model_oracle : PhenotypeInformedGAM 1 k 1)
     (h_oracle_opt : IsBayesOptimalInClass (dgpMultiplicativeBias scaling_func) model_oracle)
     (h_capable : ∃ (m : PhenotypeInformedGAM 1 k 1),
-      ∀ p_val c_val, linearPredictor m p_val c_val = (dgpMultiplicativeBias scaling_func).trueExpectation p_val c_val) :
+      ∀ p_val c_val, linearPredictor m p_val c_val = (dgpMultiplicativeBias scaling_func).trueExpectation p_val c_val)
+    (h_scaling_mean : ∫ c, scaling_func c ∂(Measure.pi (fun (_ : Fin k) => ProbabilityTheory.gaussianReal 0 1)) = 1) :
   let dgp := dgpMultiplicativeBias scaling_func
   expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) -
   expectedSquaredError dgp (fun p c => linearPredictor model_oracle p c)
@@ -4424,26 +4428,20 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
   rw [← h_at_1]
   rfl
 
-/-- Linear equivalence between EuclideanSpace ℝ (Fin n) and Fin n → ℝ. -/
-noncomputable def fromEuclidean {n : ℕ} : EuclideanSpace ℝ (Fin n) ≃ₗ[ℝ] (Fin n → ℝ) :=
-  WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
-
-/-- Inverse linear equivalence. -/
-noncomputable def toEuclidean {n : ℕ} : (Fin n → ℝ) ≃ₗ[ℝ] EuclideanSpace ℝ (Fin n) :=
-  fromEuclidean.symm
-
-/-- Orthogonal projection onto a finite-dimensional subspace. -/
+/-- Orthogonal projection onto a finite-dimensional subspace (L2). -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  fromEuclidean ((K.map toEuclidean).starProjection (toEuclidean y))
+  let iso := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K' : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map iso
+  let p' := Submodule.orthogonalProjection K' (iso y)
+  iso.symm (p' : EuclideanSpace ℝ (Fin n))
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
-    iff p minimizes distance to y among all points in K. -/
+    iff p minimizes L2 distance to y among all points in K. -/
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
-    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist (toEuclidean y) (toEuclidean p) ≤ dist (toEuclidean y) (toEuclidean w)) :
+    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, l2norm_sq (y - p) ≤ l2norm_sq (y - w)) :
     p = orthogonalProjection K y := by
   sorry
-
-set_option maxHeartbeats 2000000 in
+set_option maxHeartbeats 10000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
     PROVIDED the model class is flexible enough to capture the transformation.
 
@@ -6112,8 +6110,9 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
               have h_jacobi : ∀ σ : Equiv.Perm m, deriv (fun rho => ∏ i : m, M rho ((σ : m → m) i) i) rho = ∑ i : m, (∏ j ∈ Finset.univ.erase i, M rho ((σ : m → m) j) j) * deriv (fun rho => M rho ((σ : m → m) i) i) rho := by
                 intro σ
                 have h_prod_rule : ∀ (f : m → ℝ → ℝ), (∀ i, DifferentiableAt ℝ (f i) rho) → deriv (fun rho => ∏ i, f i rho) rho = ∑ i, (∏ j ∈ Finset.univ.erase i, f j rho) * deriv (f i) rho := by
-                  -- exact?
-                  admit
+                  intro f hf
+                  convert deriv_finset_prod (u := Finset.univ) (f := f) (x := rho) (fun i _ => hf i)
+                  simp
                 apply h_prod_rule
                 intro i
                 exact DifferentiableAt.comp rho ( differentiableAt_pi.1 ( differentiableAt_pi.1 hM_diff _ ) _ ) differentiableAt_id
@@ -6123,8 +6122,8 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
                   have h_diff : ∀ i : m, DifferentiableAt ℝ (fun rho => M rho ((σ : m → m) i) i) rho := by
                     intro i
                     exact DifferentiableAt.comp rho ( differentiableAt_pi.1 ( differentiableAt_pi.1 hM_diff _ ) _ ) differentiableAt_id
-                  -- exact?
-                  admit
+                  convert DifferentiableAt.finset_prod (u := Finset.univ) (f := fun i rho => M rho ((σ : m → m) i) i) (x := rho) (fun i _ => h_diff i)
+                  simp
                 norm_num [ h_diff ]
               simpa only [ h_jacobi ] using h_deriv_sum
             simp +decide only [h_jacobi, Finset.mul_sum _ _ _]
@@ -6750,7 +6749,7 @@ lemma optimal_coefficients_for_additive_dgp_proven
           · simp +decide [ mul_assoc, MeasureTheory.integral_const_mul, MeasureTheory.integral_mul_const, hP0, hC0, h_integral_prod ];
             exact Or.inr ( by simpa only [ mul_comm ] using h_integral_prod.trans ( by simp +decide [ hP0, hC0 ] ) );
           · exact hP_int.mul_const _;
-          · convert hP2_int.mul_const ( model.γₘ₀ ⟨ 0, by norm_num ⟩ ) using 2 ; ring;
+          · convert hP2_int.mul_const ( model.γₘ₀ ⟨ 0, by norm_num ⟩ ) using 2 ; ring_nf;
             rfl;
         · simpa only [ sq ] using hP2_int;
         · exact MeasureTheory.Integrable.const_mul ( by simpa only [ mul_comm ] using hPC_int ) _;
