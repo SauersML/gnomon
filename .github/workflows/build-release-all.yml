@@ -74,6 +74,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
         with:
+          toolchain: nightly-2025-12-13
           targets: ${{ matrix.target }}
 
       - name: Cache dependencies
@@ -94,7 +95,7 @@ jobs:
           GNOMON_SKIP_LINT_CHECKS: "1"
           # Embed release tag in binary for version command
           GNOMON_RELEASE_TAG: "auto-${{ github.run_id }}-${{ github.run_number }}"
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo +nightly build --release --target ${{ matrix.target }}
 
 
       - name: Package (Unix)
