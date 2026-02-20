@@ -4423,84 +4423,88 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
   rw [← h_at_1]
   rfl
 
+set_option maxHeartbeats 10000000
+
 /-- Orthogonal projection onto a finite-dimensional subspace. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  let iso := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let iso := (WithLp.linearEquiv 2 ℝ (Fin n → ℝ)).symm
   let K' : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map iso
   let y' : EuclideanSpace ℝ (Fin n) := iso y
-  iso.symm (K'.starProjection y')
+  let p' := K'.starProjection y'
+  (WithLp.linearEquiv 2 ℝ (Fin n → ℝ)) p'
 
-set_option maxHeartbeats 10000000 in
 /-- A point p in subspace K equals the orthogonal projection of y onto K
     iff p minimizes distance to y among all points in K. -/
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
     (h_mem : p ∈ K)
     (h_min : ∀ w ∈ K, l2norm_sq (y - p) ≤ l2norm_sq (y - w)) :
     p = orthogonalProjection K y := by
-  let iso := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
-  let K' : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map iso
-  let y' : EuclideanSpace ℝ (Fin n) := iso y
-  let p' : EuclideanSpace ℝ (Fin n) := iso p
+  let iso_to_Lp := (WithLp.linearEquiv 2 ℝ (Fin n → ℝ)).symm
+  let iso_from_Lp := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+
+  let K' : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map iso_to_Lp
+  let y' : EuclideanSpace ℝ (Fin n) := iso_to_Lp y
+  let p' : EuclideanSpace ℝ (Fin n) := iso_to_Lp p
 
   have h_mem' : p' ∈ K' := Submodule.mem_map_of_mem h_mem
 
-  have h_norm : ∀ v, l2norm_sq v = ‖iso v‖^2 := by
+  -- Proof that l2norm_sq matches Euclidean norm squared
+  have h_norm : ∀ v : Fin n → ℝ, l2norm_sq v = ‖iso_to_Lp v‖^2 := by
     intro v
+    have h := PiLp.norm_sq_eq_of_L2 (fun _ : Fin n => ℝ) (iso_to_Lp v)
+    rw [h]
     unfold l2norm_sq
-    rw [PiLp.norm_eq_of_nat 2]
-    simp only [Real.sqrt_eq_rpow, one_div]
-    rw [Real.sq_sqrt]
-    · refine Finset.sum_congr rfl ?_
-      intro i _
-      simp only [norm_eq_abs, sq_abs]
-    · apply Finset.sum_nonneg; intro i _; apply sq_nonneg
+    congr
+    ext i
+    change v i ^ 2 = ‖WithLp.toLp 2 v i‖ ^ 2
+    rw [PiLp.toLp_apply]
+    simp only [Real.norm_eq_abs, sq_abs]
 
-  have h_min' : ∀ w' ∈ K', dist y' p' ≤ dist y' w' := by
+  have h_min' : ∀ w' ∈ K', ‖y' - p'‖ ≤ ‖y' - w'‖ := by
     intro w' hw'
     rcases (Submodule.mem_map.mp hw') with ⟨w, hw, rfl⟩
     specialize h_min w hw
     rw [h_norm (y - p), h_norm (y - w)] at h_min
-    simp only [map_sub] at h_min
-    rw [dist_eq_norm, dist_eq_norm]
-    exact Real.sqrt_le_sqrt h_min
+    have h_sub_p : iso_to_Lp (y - p) = y' - p' := map_sub iso_to_Lp y p
+    have h_sub_w : iso_to_Lp (y - w) = y' - iso_to_Lp w := map_sub iso_to_Lp y w
+    rw [h_sub_p, h_sub_w] at h_min
+    rw [sq_le_sq] at h_min
+    simp only [norm_nonneg, abs_of_nonneg] at h_min
+    exact h_min
 
-  have h_eq' : p' = K'.starProjection y' := by
-    let proj := K'.starProjection y'
-    have h_proj_mem : proj ∈ K' := Submodule.coe_mem (Submodule.orthogonalProjection K' y')
-    have h_proj_orth : y' - proj ∈ K'ᗮ := Submodule.sub_starProjection_mem_orthogonal y'
+  -- Now use unique minimizer property in Hilbert space
+  let p_star := K'.starProjection y'
 
-    have h_min_eq : ‖y' - p'‖ = ⨅ w : (↑K' : Set (EuclideanSpace ℝ (Fin n))), ‖y' - w‖ := by
-      apply le_antisymm
-      · apply le_ciInf
-        intro w
-        exact h_min' w w.2
-      · apply ciInf_le
-        · refine ⟨0, ?_⟩; intro _ ⟨_, h, _⟩; subst h; exact norm_nonneg _
-        · use p', h_mem'
+  have h_p_orth : ∀ w' ∈ K', ⟪y' - p', w'⟫_ℝ = 0 := by
+    rw [← Submodule.norm_eq_iInf_iff_real_inner_eq_zero K' h_mem']
+    apply le_antisymm
+    · apply le_ciInf; intro w'; exact h_min' w' w'.2
+    · apply ciInf_le; use 0; refine ⟨_, ?_⟩; intro _ ⟨_, h, _⟩; subst h; exact norm_nonneg _
+      use p', h_mem'
 
-    have h_p_orth : ∀ w ∈ K', ⟪y' - p', w⟫_ℝ = 0 := by
-      rw [← Submodule.norm_eq_iInf_iff_real_inner_eq_zero K' h_mem']
-      exact h_min_eq
+  have h_star_orth : ∀ w' ∈ K', ⟪y' - p_star, w'⟫_ℝ = 0 := by
+    intro w' hw'
+    exact Submodule.starProjection_inner_eq_zero K' y' w' hw'
 
-    have h_sub : ⟪proj - p', proj - p'⟫_ℝ = 0 := by
-      have : proj - p' = (y' - p') - (y' - proj) := by module
-      rw [this, inner_sub_left]
-      have h_diff_mem : proj - p' ∈ K' := K'.sub_mem h_proj_mem h_mem'
-      rw [h_p_orth _ h_diff_mem]
-      have h_orth_symm : ∀ u v, u ∈ K'ᗮ → v ∈ K' → ⟪u, v⟫_ℝ = 0 := by
-        intro u v hu hv
-        exact Submodule.mem_orthogonal_iff.mp hu v hv
-      rw [h_orth_symm _ _ h_proj_orth h_diff_mem]
-      sub_zero
-      rfl
+  -- Uniqueness proof
+  have h_eq : p' = p_star := by
+    let diff := p' - p_star
+    have h_diff_mem : diff ∈ K' := Submodule.sub_mem K' h_mem' (K'.starProjection_mem y')
+    have h_inner_diff : ⟪diff, diff⟫_ℝ = ⟪p' - p_star, diff⟫_ℝ := rfl
+    have : p' - p_star = (p' - y') + (y' - p_star) := by abel
+    rw [this, inner_add_left] at h_inner_diff
+    have term1 : ⟪p' - y', diff⟫_ℝ = 0 := by
+      rw [← neg_sub, inner_neg_left]
+      rw [h_p_orth diff h_diff_mem]
+      exact neg_zero
+    have term2 : ⟪y' - p_star, diff⟫_ℝ = 0 := h_star_orth diff h_diff_mem
+    rw [term1, term2, add_zero] at h_inner_diff
+    exact real_inner_self_eq_zero.mp h_inner_diff
 
-    rw [real_inner_self_eq_norm_sq_eq_zero] at h_sub
-    rw [sub_eq_zero] at h_sub
-    exact h_sub.symm
-
+  -- Translate back
   dsimp [orthogonalProjection]
-  rw [← h_eq']
-  simp [iso]
+  rw [← h_eq]
+  simp [iso_from_Lp, iso_to_Lp]
 
 set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
