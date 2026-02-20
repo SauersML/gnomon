@@ -199,11 +199,50 @@ jobs:
             map/models/hwe_1kg_hgdp_gda_v1.*
             fit.log
 
+  # Fit on intersection variant list
+  fit-intersection:
+    name: Fit PCA (Intersection)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    needs: prepare-manifests
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install gnomon
+        run: curl -fsSL https://raw.githubusercontent.com/SauersML/gnomon/main/install.sh | bash
+
+      - name: Fit PCA
+        run: |
+          set -euo pipefail
+          mkdir -p map/models
+
+          gnomon fit \
+            gs://gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/ \
+            --list data/snp_intersection_final_hg38_chrpos.txt \
+            --components ${{ env.COMPONENTS }} \
+            --ld \
+            2>&1 | tee fit.log
+
+          mv phased_haplotypes_v2.hwe.json map/models/hwe_1kg_hgdp_intersection.json
+          [ -f phased_haplotypes_v2.hwe_summary.tsv ] && mv phased_haplotypes_v2.hwe_summary.tsv map/models/hwe_1kg_hgdp_intersection_summary.tsv
+
+      - name: Compress model
+        run: zstd -19 --rm map/models/hwe_1kg_hgdp_intersection.json
+
+      - name: Upload model
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-intersection
+          path: |
+            map/models/hwe_1kg_hgdp_intersection.*
+            fit.log
+
   # Upload models to GitHub Release
   upload-models:
     name: Upload models to GitHub Release
     runs-on: ubuntu-22.04
-    needs: [fit-gsa2, fit-gsa3, fit-gda]
+    needs: [fit-gsa2, fit-gsa3, fit-gda, fit-intersection]
     permissions:
       contents: write
     steps:
@@ -238,7 +277,7 @@ jobs:
           RELEASE_TAG="models-v1"
           
           if ! gh release view "$RELEASE_TAG" &>/dev/null; then
-            gh release create "$RELEASE_TAG" --title "PCA Models v1" --notes "Pre-trained HWE-scaled PCA models (GSA v2/v3, GDA v1) trained on gnomAD 1KG+HGDP reference panel (GRCh38)"
+            gh release create "$RELEASE_TAG" --title "PCA Models v1" --notes "Pre-trained HWE-scaled PCA models (GSA v2/v3, GDA v1, intersection) trained on gnomAD 1KG+HGDP reference panel (GRCh38)"
           fi
           
           # Upload each model file (clobber existing)

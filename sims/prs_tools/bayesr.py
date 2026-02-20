@@ -9,10 +9,34 @@ import pandas as pd
 import numpy as np
 
 class BayesR:
-    def __init__(self, gctb_path="gctb"):
+    def __init__(self, gctb_path="gctb", threads: int | None = None, plink_memory_mb: int | None = None):
         self.gctb_path = gctb_path
         self.max_snps = 300_000
         self.thin_seed = 42
+        env_threads = os.environ.get("GCTB_THREADS")
+        if threads is None and env_threads is not None:
+            try:
+                threads = int(env_threads)
+            except Exception:
+                threads = None
+        self.threads = int(threads) if threads is not None else 4
+        env_chain = os.environ.get("GCTB_CHAIN_LENGTH")
+        env_burn = os.environ.get("GCTB_BURN_IN")
+        try:
+            self.chain_length = int(env_chain) if env_chain is not None else 10000
+        except Exception:
+            self.chain_length = 10000
+        try:
+            self.burn_in = int(env_burn) if env_burn is not None else 2000
+        except Exception:
+            self.burn_in = 2000
+        env_mem = os.environ.get("PLINK_MEMORY_MB")
+        if plink_memory_mb is None and env_mem is not None:
+            try:
+                plink_memory_mb = int(env_mem)
+            except Exception:
+                plink_memory_mb = None
+        self.plink_memory_mb = int(plink_memory_mb) if plink_memory_mb is not None else None
 
     def _gctb_diagnostics(self) -> str:
         exe_path = shutil.which(self.gctb_path) or self.gctb_path
@@ -70,8 +94,11 @@ class BayesR:
             "--thin-count", str(self.max_snps),
             "--seed", str(self.thin_seed),
             "--make-bed",
+            "--threads", str(self.threads),
             "--out", thin_prefix,
         ]
+        if self.plink_memory_mb is not None and self.plink_memory_mb > 0:
+            cmd.extend(["--memory", str(self.plink_memory_mb)])
         print(f"Running PLINK2 thinning: {' '.join(cmd)}")
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
@@ -108,9 +135,9 @@ class BayesR:
             "--pheno", pheno_file,
             "--bayes", "R",
             "--covar", covar_file,
-            "--chain-length", "10000",
-            "--burn-in", "2000",
-            "--thread", "4",
+            "--chain-length", str(self.chain_length),
+            "--burn-in", str(self.burn_in),
+            "--thread", str(self.threads),
             "--out", out_prefix
         ]
 
@@ -171,7 +198,7 @@ class BayesR:
         print("BayesR training complete.")
         return out_file
 
-    def predict(self, bfile_test, effect_file, out_prefix):
+    def predict(self, bfile_test, effect_file, out_prefix, freq_file=None):
         """
         Score test data using PLINK2 and BayesR effects.
         """
@@ -284,8 +311,13 @@ class BayesR:
             "plink2",
             "--bfile", bfile_test,
             "--score", score_file, "1", "2", "3",
+            "--threads", str(self.threads),
             "--out", out_prefix
         ]
+        if self.plink_memory_mb is not None and self.plink_memory_mb > 0:
+            cmd.extend(["--memory", str(self.plink_memory_mb)])
+        if freq_file is not None:
+            cmd.extend(["--read-freq", str(freq_file)])
         
         print(f"Running Scoring: {' '.join(cmd)}")
         result = subprocess.run(cmd, capture_output=True, text=True)

@@ -69,14 +69,12 @@ def _build_demography_bottleneck(split_time: int, ne: int, bottle_ne: int) -> ms
     dem.add_population(name="ancestral", initial_size=ne)
     dem.add_population_split(time=split_time, derived=["pop0", "pop1"], ancestral="ancestral")
 
-    # Fixed-strength bottleneck: constant severity (bottle_ne) and target duration,
-    # placed shortly after split in backward time. For very short split times, we
-    # clamp duration to the available post-split interval.
+    # Fixed-strength bottleneck: constant severity (bottle_ne), starts immediately
+    # after divergence, and lasts 100 generations in forward time.
+    # In backward-time coordinates this is [split_time - 1, split_time - 101].
     if split_time > 0:
-        lag_after_split = 5
-        target_duration = 120
-
-        start = max(1, split_time - lag_after_split)
+        target_duration = 100
+        start = max(1, split_time - 1)
         max_available_duration = max(1, start - 1)
         duration = min(target_duration, max_available_duration)
         end = max(1, start - duration)

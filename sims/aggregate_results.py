@@ -509,7 +509,7 @@ def _plot_portability_eur_minus_non_eur_proper(
     ax.axhline(0, color="black", linestyle="--", linewidth=1, alpha=0.65)
     ax.set_xticks(x)
     ax.set_xticklabels(
-        [m.split(" + ", n=1)[1] if " + " in m else m for m in order],
+        [m.split(" + ", 1)[1] if " + " in m else m for m in order],
         rotation=18,
         ha="right",
     )
@@ -667,7 +667,7 @@ def _plot_portability_auc_by_ancestry_hierarchical(
 
     ax.set_xticks(x)
     ax.set_xticklabels(
-        [m.split(" + ", n=1)[1] if " + " in m else m for m in method_order],
+        [m.split(" + ", 1)[1] if " + " in m else m for m in method_order],
         rotation=20,
         ha="right",
     )
