@@ -6298,6 +6298,12 @@ noncomputable def rust_direct_gradient_fn (S_basis : Fin k → Matrix (Fin p) (F
   0.5 * lambda * trace (S⁻¹ * Si)
 
 -- 3. Verification Theorem
+
+/-- Gradient definition for matrix-to-real functions. -/
+def HasGradientAt (f : Matrix (Fin p) (Fin 1) ℝ → ℝ) (g : Matrix (Fin p) (Fin 1) ℝ) (x : Matrix (Fin p) (Fin 1) ℝ) :=
+  ∃ (L : Matrix (Fin p) (Fin 1) ℝ →L[ℝ] ℝ),
+    (∀ h, L h = (g.transpose * h).trace) ∧ HasFDerivAt f L x
+
 theorem laml_gradient_is_exact 
     (log_lik : Matrix (Fin p) (Fin 1) ℝ → ℝ)
     (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ)
@@ -6305,12 +6311,19 @@ theorem laml_gradient_is_exact
     (W : Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin n) (Fin n) ℝ)
     (beta_hat : (Fin k → ℝ) → Matrix (Fin p) (Fin 1) ℝ)
     (grad_op : (Matrix (Fin p) (Fin 1) ℝ → ℝ) → Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin p) (Fin 1) ℝ)
-    (rho : Fin k → ℝ) (i : Fin k) :
+    (rho : Fin k → ℝ) (i : Fin k)
+    (h_opt : HasGradientAt (fun b => L_pen_fn log_lik S_basis rho b) 0 (beta_hat rho))
+    (h_beta_deriv : HasDerivAt (fun r => beta_hat (Function.update rho i r)) (rust_delta_fn S_basis X W beta_hat rho i) (rho i))
+    (h_grad_op : HasGradientAt (fun b => 0.5 * Real.log ((Hessian_fn S_basis X W rho b).det))
+                   (grad_op (fun b_val => 0.5 * Real.log (Matrix.det (Hessian_fn S_basis X W rho b_val))) (beta_hat rho))
+                   (beta_hat rho))
+    (h_S_diff : ∀ j, Differentiable ℝ (fun r => Real.exp r • S_basis j))
+    (h_H_inv : (Hessian_fn S_basis X W rho (beta_hat rho)).det ≠ 0)
+    (h_S_inv : (S_lambda_fn S_basis rho).det ≠ 0) :
   deriv (fun r => LAML_fn log_lik S_basis X W beta_hat (Function.update rho i r)) (rho i) =
   rust_direct_gradient_fn S_basis X W beta_hat log_lik rho i + 
   rust_correction_fn S_basis X W beta_hat grad_op rho i :=
 by
-  -- Verification follows from multivariable chain rule application.
   sorry
 
 end GradientDescentVerification
