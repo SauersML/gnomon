@@ -1,5 +1,6 @@
 import Mathlib.Tactic
 import Mathlib.Analysis.Calculus.Deriv.Basic
+import Mathlib.Analysis.Calculus.Deriv.Mul
 import Mathlib.Analysis.Calculus.Deriv.Inv
 import Mathlib.Analysis.Convex.Strict
 import Mathlib.Analysis.Convex.Jensen
@@ -20,6 +21,7 @@ import Mathlib.Data.Matrix.Basic
 import Mathlib.LinearAlgebra.Matrix.DotProduct
 import Mathlib.Topology.MetricSpace.Lipschitz
 import Mathlib.Data.NNReal.Basic
+import Mathlib.Data.ENNReal.Basic
 import Mathlib.Topology.Compactness.Compact
 import Mathlib.Data.Matrix.Reflection
 import Mathlib.Data.Matrix.Mul
@@ -52,6 +54,8 @@ import Mathlib.Analysis.SpecialFunctions.Pow.Real
 import Mathlib.Algebra.Polynomial.Basic
 import Mathlib.Algebra.Polynomial.Eval.Defs
 import Mathlib.Algebra.Polynomial.Roots
+import Mathlib.Analysis.Calculus.Deriv.Mul
+import Mathlib.Analysis.Calculus.Deriv.Add
 
 open scoped InnerProductSpace
 open InnerProductSpace
@@ -2274,7 +2278,7 @@ theorem penalty_quadratic_tendsto_proof {ι : Type*} [Fintype ι] [DecidableEq �
     h_tendsto
 
 
-set_option maxHeartbeats 1000000
+set_option maxHeartbeats 10000000
 /-- Fit a Gaussian identity-link GAM by minimizing the penalized least squares loss
     over the parameter space, using Weierstrass (coercive + continuous). -/
 noncomputable def fit (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
@@ -4117,7 +4121,8 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
     (model_oracle : PhenotypeInformedGAM 1 k 1)
     (h_oracle_opt : IsBayesOptimalInClass (dgpMultiplicativeBias scaling_func) model_oracle)
     (h_capable : ∃ (m : PhenotypeInformedGAM 1 k 1),
-      ∀ p_val c_val, linearPredictor m p_val c_val = (dgpMultiplicativeBias scaling_func).trueExpectation p_val c_val) :
+      ∀ p_val c_val, linearPredictor m p_val c_val = (dgpMultiplicativeBias scaling_func).trueExpectation p_val c_val)
+    (h_scaling_mean : ∫ c, scaling_func c ∂(Measure.pi (fun (_ : Fin k) => ProbabilityTheory.gaussianReal 0 1)) = 1) :
   let dgp := dgpMultiplicativeBias scaling_func
   expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) -
   expectedSquaredError dgp (fun p c => linearPredictor model_oracle p c)
@@ -4423,36 +4428,35 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
   rw [← h_at_1]
   rfl
 
-/-- Orthogonal projection onto a finite-dimensional subspace. -/
+/-- Orthogonal projection onto a finite-dimensional subspace (L2). -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  let equiv := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
-  let K_E : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map equiv.symm
-  let y_E : EuclideanSpace ℝ (Fin n) := equiv.symm y
-  let proj_E := Submodule.orthogonalProjection K_E y_E
-  equiv proj_E
+  let iso := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K' : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map iso
+  let p' := Submodule.orthogonalProjection K' (iso y)
+  iso.symm (p' : EuclideanSpace ℝ (Fin n))
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
-    iff p minimizes distance to y among all points in K. -/
+    iff p minimizes L2 distance to y among all points in K. -/
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
     (h_mem : p ∈ K) (h_min : ∀ w ∈ K, l2norm_sq (y - p) ≤ l2norm_sq (y - w)) :
     p = orthogonalProjection K y := by
-  let equiv := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
-  let K_E := K.map equiv.symm
-  let y_E := equiv.symm y
-  let p_E := equiv.symm p
+  let iso : (Fin n → ℝ) ≃ₗ[ℝ] EuclideanSpace ℝ (Fin n) := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K_E : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map iso
+  let y_E : EuclideanSpace ℝ (Fin n) := iso y
+  let p_E : EuclideanSpace ℝ (Fin n) := iso p
 
   have h_mem_E : p_E ∈ K_E := by
-    rw [Submodule.mem_map]
-    use p, h_mem
+    refine ⟨p, h_mem, ?_⟩
+    simp [p_E]
 
-  have h_norm_eq : ∀ v, l2norm_sq v = ‖equiv.symm v‖^2 := by
+  have h_norm_eq : ∀ v, l2norm_sq v = ‖iso v‖^2 := by
     intro v
     simp only [l2norm_sq, EuclideanSpace.norm_eq, Real.norm_eq_abs, sq_abs]
     rw [Real.sq_sqrt]
     · rfl
     · apply Finset.sum_nonneg
       intro i _
-      apply sq_nonneg
+      exact sq_nonneg (v i)
 
   have h_orth : ∀ v ∈ K_E, ⟪y_E - p_E, v⟫_ℝ = 0 := by
     intro v hv
@@ -4463,9 +4467,7 @@ lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n →
       rw [← hw_eq]
       specialize h_min w hw
       rw [h_norm_eq, h_norm_eq] at h_min
-      dsimp [y_E, p_E]
-      rw [← map_sub equiv.symm y p, ← map_sub equiv.symm y w]
-      exact h_min
+      simpa [y_E, p_E, map_sub] using h_min
 
     let a := -2 * ⟪y_E - p_E, v⟫_ℝ
     let b := ‖v‖^2
@@ -4473,14 +4475,19 @@ lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n →
       intro t
       have h_mem_v : p_E + t • v ∈ K_E := K_E.add_mem h_mem_E (K_E.smul_mem t hv)
       specialize h_min_E (p_E + t • v) h_mem_v
-      have h_exp : ‖y_E - (p_E + t • v)‖^2 = ‖y_E - p_E‖^2 - 2 * t * ⟪y_E - p_E, v⟫_ℝ + t^2 * ‖v‖^2 := by
+      have h_exp :
+          ‖y_E - (p_E + t • v)‖^2 =
+          ‖y_E - p_E‖^2 - 2 * t * ⟪y_E - p_E, v⟫_ℝ + t^2 * ‖v‖^2 := by
         rw [sub_add_eq_sub_sub, norm_sub_sq_real]
         simp only [inner_smul_right, real_inner_comm, norm_smul, Real.norm_eq_abs]
         rw [mul_pow, sq_abs]
         ring
       rw [h_exp] at h_min_E
-      have h_cancel : ‖y_E - p_E‖^2 + (a * t + b * t^2) = ‖y_E - p_E‖^2 - 2 * t * ⟪y_E - p_E, v⟫_ℝ + t^2 * ‖v‖^2 := by
-        dsimp [a, b]; ring
+      have h_cancel :
+          ‖y_E - p_E‖^2 + (a * t + b * t^2) =
+          ‖y_E - p_E‖^2 - 2 * t * ⟪y_E - p_E, v⟫_ℝ + t^2 * ‖v‖^2 := by
+        dsimp [a, b]
+        ring
       rw [← h_cancel] at h_min_E
       linarith
 
@@ -4494,12 +4501,11 @@ lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n →
     intro w hw
     exact h_orth w hw
 
-  apply equiv.symm.injective
+  apply iso.injective
   rw [orthogonalProjection]
-  simp only [equiv.symm_apply_apply]
+  simp only [iso.symm_apply_apply]
   exact h_eq_E
-
-set_option maxHeartbeats 2000000 in
+set_option maxHeartbeats 10000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
     PROVIDED the model class is flexible enough to capture the transformation.
 
@@ -6168,8 +6174,9 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
               have h_jacobi : ∀ σ : Equiv.Perm m, deriv (fun rho => ∏ i : m, M rho ((σ : m → m) i) i) rho = ∑ i : m, (∏ j ∈ Finset.univ.erase i, M rho ((σ : m → m) j) j) * deriv (fun rho => M rho ((σ : m → m) i) i) rho := by
                 intro σ
                 have h_prod_rule : ∀ (f : m → ℝ → ℝ), (∀ i, DifferentiableAt ℝ (f i) rho) → deriv (fun rho => ∏ i, f i rho) rho = ∑ i, (∏ j ∈ Finset.univ.erase i, f j rho) * deriv (f i) rho := by
-                  -- exact?
-                  admit
+                  intro f hf
+                  convert deriv_finset_prod (u := Finset.univ) (f := f) (x := rho) (fun i _ => hf i)
+                  simp
                 apply h_prod_rule
                 intro i
                 exact DifferentiableAt.comp rho ( differentiableAt_pi.1 ( differentiableAt_pi.1 hM_diff _ ) _ ) differentiableAt_id
@@ -6179,8 +6186,8 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
                   have h_diff : ∀ i : m, DifferentiableAt ℝ (fun rho => M rho ((σ : m → m) i) i) rho := by
                     intro i
                     exact DifferentiableAt.comp rho ( differentiableAt_pi.1 ( differentiableAt_pi.1 hM_diff _ ) _ ) differentiableAt_id
-                  -- exact?
-                  admit
+                  convert DifferentiableAt.finset_prod (u := Finset.univ) (f := fun i rho => M rho ((σ : m → m) i) i) (x := rho) (fun i _ => h_diff i)
+                  simp
                 norm_num [ h_diff ]
               simpa only [ h_jacobi ] using h_deriv_sum
             simp +decide only [h_jacobi, Finset.mul_sum _ _ _]
@@ -6806,7 +6813,7 @@ lemma optimal_coefficients_for_additive_dgp_proven
           · simp +decide [ mul_assoc, MeasureTheory.integral_const_mul, MeasureTheory.integral_mul_const, hP0, hC0, h_integral_prod ];
             exact Or.inr ( by simpa only [ mul_comm ] using h_integral_prod.trans ( by simp +decide [ hP0, hC0 ] ) );
           · exact hP_int.mul_const _;
-          · convert hP2_int.mul_const ( model.γₘ₀ ⟨ 0, by norm_num ⟩ ) using 2 ; ring;
+          · convert hP2_int.mul_const ( model.γₘ₀ ⟨ 0, by norm_num ⟩ ) using 2 ; ring_nf;
             rfl;
         · simpa only [ sq ] using hP2_int;
         · exact MeasureTheory.Integrable.const_mul ( by simpa only [ mul_comm ] using hPC_int ) _;

@@ -5,6 +5,7 @@ import subprocess
 import os
 import shutil
 import tempfile
+import time
 from pathlib import Path
 import re
 
@@ -22,8 +23,19 @@ def run_plink_conversion(
     If cm_map_path is provided (format: BP cM per line), updates the .bim file
     with correct genetic positions.
     """
+    out_parent = Path(out_prefix).parent
+    out_parent.mkdir(parents=True, exist_ok=True)
+
     # Resolve PLINK executable: use PATH or fallback to CI location
     plink_exe = shutil.which("plink2") or "/usr/local/bin/plink2"
+
+    def _wait_for_file(path: str, timeout_s: float = 10.0) -> bool:
+        t0 = time.time()
+        while time.time() - t0 < timeout_s:
+            if os.path.exists(path):
+                return True
+            time.sleep(0.1)
+        return os.path.exists(path)
     
     def _run_plink(vcf_input: str) -> subprocess.CompletedProcess:
         cmd = [
@@ -43,11 +55,20 @@ def run_plink_conversion(
         print(f"Running PLINK conversion: {' '.join(cmd)}")
         return subprocess.run(cmd, capture_output=True, text=True)
 
+    # Wait briefly for potentially network-backed VCF metadata to become visible.
+    if not _wait_for_file(vcf_path, timeout_s=10.0):
+        raise RuntimeError(f"VCF input not found for PLINK conversion: {vcf_path}")
+
     # Fast path: convert directly to avoid duplicating huge VCF files on disk.
     result = _run_plink(vcf_path)
 
     # Fallback: normalize CHROM labels if direct conversion fails.
     if result.returncode != 0:
+        if not os.path.exists(vcf_path):
+            raise RuntimeError(
+                "PLINK direct conversion failed and VCF input disappeared before fallback: "
+                f"{vcf_path}\nPLINK stderr:\n{result.stderr}"
+            )
         print("Direct PLINK conversion failed; retrying with normalized CHROM labels...")
 
         temp_dir = tempfile.mkdtemp(prefix="plink_vcf_")
