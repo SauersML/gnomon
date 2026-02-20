@@ -117,6 +117,10 @@ harness = false
 name = "calibrate"
 path = "calibrate/tests/mod.rs"
 
+[[test]]
+name = "score"
+path = "score/tests/mod.rs"
+
 # Run tests at release optimization level for maximum speed
 [profile.test]
 opt-level = 3            # Same as release - maximum speed for numerical tests
