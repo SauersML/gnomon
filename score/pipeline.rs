@@ -1,5 +1,6 @@
 use crate::score::batch;
 use crate::score::complex::{ComplexVariantResolver, resolve_complex_variants};
+use crate::score::cuda_backend;
 use crate::score::decide::{self, DecisionContext, RunStrategy};
 use crate::score::io;
 use crate::score::types::{
@@ -173,6 +174,10 @@ impl PipelineContext {
 /// This is the primary public entry point. It is synchronous and returns the
 /// final aggregated scores and counts upon successful completion.
 pub fn run(context: &PipelineContext) -> Result<(Vec<f64>, Vec<u32>), PipelineError> {
+    if let Some(result) = cuda_backend::try_run_cuda(context)? {
+        return Ok(result);
+    }
+
     // This match is a zero-cost abstraction. The compiler generates a simple jump
     // to the correct function based on the enum variant, and it's impossible
     // to call the wrong pipeline logic for a given configuration.
@@ -1140,8 +1145,7 @@ fn process_dense_stream(
                     let stride = prep_result.stride();
                     let mut weights_for_batch =
                         Vec::with_capacity(reconciled_indices.len() * stride);
-                    let mut flips_for_batch =
-                        Vec::with_capacity(reconciled_indices.len() * stride);
+                    let mut flips_for_batch = Vec::with_capacity(reconciled_indices.len() * stride);
                     for &reconciled_idx in &reconciled_indices {
                         let src_offset = reconciled_idx.0 as usize * stride;
                         weights_for_batch.extend_from_slice(

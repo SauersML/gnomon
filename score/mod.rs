@@ -1,11 +1,12 @@
 pub mod batch;
 pub mod complex;
+pub mod cuda_backend;
 pub mod decide;
 pub mod download;
+pub mod genotype_convert;
 pub mod io;
 pub mod kernel;
 pub mod pipeline;
 pub mod prepare;
 pub mod reformat;
 pub mod types;
-pub mod genotype_convert;

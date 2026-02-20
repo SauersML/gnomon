@@ -54,6 +54,7 @@ sysinfo = "0.30.12"
 ratatui = "0.30"
 crossterm = "0.28.1"
 burn = { version = "0.19.1", default-features = false }
+cudarc = { version = "0.16.6", default-features = false, features = ["std", "driver", "nvrtc", "cublas", "dynamic-loading", "cuda-12000"] }
 
 # Built-in model download and caching
 ureq = "2.10"
