@@ -6032,6 +6032,12 @@ noncomputable def rust_direct_gradient_fn (S_basis : Fin k → Matrix (Fin p) (F
   0.5 * lambda * trace (S⁻¹ * Si)
 
 -- 3. Verification Theorem
+
+/-- Gradient definition for matrix-to-real functions. -/
+def HasGradientAt (f : Matrix (Fin p) (Fin 1) ℝ → ℝ) (g : Matrix (Fin p) (Fin 1) ℝ) (x : Matrix (Fin p) (Fin 1) ℝ) :=
+  ∃ (L : Matrix (Fin p) (Fin 1) ℝ →L[ℝ] ℝ),
+    (∀ h, L h = (g.transpose * h).trace) ∧ HasFDerivAt f L x
+
 theorem laml_gradient_is_exact 
     (log_lik : Matrix (Fin p) (Fin 1) ℝ → ℝ)
     (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ)
