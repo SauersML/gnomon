@@ -69,12 +69,17 @@ def _build_demography_bottleneck(split_time: int, ne: int, bottle_ne: int) -> ms
     dem.add_population(name="ancestral", initial_size=ne)
     dem.add_population_split(time=split_time, derived=["pop0", "pop1"], ancestral="ancestral")
 
-    # Bottleneck after split (more recent than split), then recover to NE by present.
+    # Fixed-strength bottleneck: constant severity (bottle_ne), starts immediately
+    # after divergence, and lasts 100 generations in forward time.
+    # In backward-time coordinates this is [split_time - 1, split_time - 101].
     if split_time > 0:
-        start = max(1, int(round(split_time * 0.5)))
-        end = max(0, int(round(split_time * 0.1)))
+        target_duration = 100
+        start = max(1, split_time - 1)
+        max_available_duration = max(1, start - 1)
+        duration = min(target_duration, max_available_duration)
+        end = max(1, start - duration)
         if end >= start:
-            end = max(0, start - 1)
+            end = max(1, start - 1)
         dem.add_population_parameters_change(time=start, population="pop0", initial_size=bottle_ne)
         dem.add_population_parameters_change(time=end, population="pop0", initial_size=ne)
     # msprime requires events to be time-sorted; our inserts can be out of order.
@@ -252,7 +257,8 @@ def _simulate_dataset(cfg: TwoPopConfig) -> str:
     print(f"[{sim_prefix}] Writing {vcf_path} (for PLINK conversion) ...")
     individual_names = [f"ind_{i+1}" for i in range(ts.num_individuals)]
     with open(vcf_path, "w") as f:
-        ts.write_vcf(f, individual_names=individual_names)
+        # Ensure VCF positions are 1-based and avoid invalid position 0 records.
+        ts.write_vcf(f, individual_names=individual_names, position_transform=lambda x: np.asarray(x) + 1)
 
     print(f"[{sim_prefix}] Writing {npz_path} (reproducibility: causal + PCA site IDs) ...")
     np.savez_compressed(
