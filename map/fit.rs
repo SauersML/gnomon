@@ -30,7 +30,7 @@ use std::error::Error;
 use std::ops::Range;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::simd::num::SimdFloat;
-use std::simd::{LaneCount, Simd, SupportedLaneCount};
+use std::simd::{Select, Simd};
 use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -1452,10 +1452,7 @@ unsafe fn standardize_column_simd_avx(values: &mut [f64], mean: f64, inv: f64) {
 }
 
 #[inline(always)]
-fn standardize_column_simd_impl<const LANES: usize>(values: &mut [f64], mean: f64, inv: f64)
-where
-    LaneCount<LANES>: SupportedLaneCount,
-{
+fn standardize_column_simd_impl<const LANES: usize>(values: &mut [f64], mean: f64, inv: f64) {
     let mean_simd = Simd::<f64, LANES>::splat(mean);
     let inv_simd = Simd::<f64, LANES>::splat(inv);
     let zero = Simd::<f64, LANES>::splat(0.0);
@@ -1564,9 +1561,7 @@ fn standardize_column_with_mask_simd_impl<const LANES: usize>(
     mask: &mut [f64],
     mean: f64,
     inv: f64,
-) where
-    LaneCount<LANES>: SupportedLaneCount,
-{
+) {
     let mean_simd = Simd::<f64, LANES>::splat(mean);
     let inv_simd = Simd::<f64, LANES>::splat(inv);
     let zero = Simd::<f64, LANES>::splat(0.0);
@@ -1647,10 +1642,7 @@ unsafe fn standardize_column_simd_full_avx(values: &mut [f64], mean: f64, inv: f
 
 #[cfg(test)]
 #[inline(always)]
-fn standardize_column_simd_full_impl<const LANES: usize>(values: &mut [f64], mean: f64, inv: f64)
-where
-    LaneCount<LANES>: SupportedLaneCount,
-{
+fn standardize_column_simd_full_impl<const LANES: usize>(values: &mut [f64], mean: f64, inv: f64) {
     let mean_simd = Simd::<f64, LANES>::splat(mean);
     let inv_simd = Simd::<f64, LANES>::splat(inv);
 
@@ -1712,10 +1704,7 @@ fn sum_and_count_finite(values: &[f64]) -> (f64, usize) {
 }
 
 #[inline(always)]
-fn sum_and_count_finite_impl<const LANES: usize>(values: &[f64]) -> (f64, usize)
-where
-    LaneCount<LANES>: SupportedLaneCount,
-{
+fn sum_and_count_finite_impl<const LANES: usize>(values: &[f64]) -> (f64, usize) {
     let mut sum = 0.0;
     let mut count = 0usize;
     let zero = Simd::<f64, LANES>::splat(0.0);

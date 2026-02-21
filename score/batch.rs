@@ -19,7 +19,7 @@ use crate::score::types::{
 };
 use crossbeam_queue::ArrayQueue;
 use std::error::Error;
-use std::simd::{Simd, cmp::SimdPartialEq, num::SimdUint};
+use std::simd::{Select, Simd, cmp::SimdPartialEq, num::SimdUint};
 
 // --- SIMD & Engine Tuning Parameters ---
 const SIMD_LANES: usize = 8;
