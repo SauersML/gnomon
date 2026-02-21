@@ -4185,21 +4185,291 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
   have h_risk_lower_bound :
       expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) ≥
       expectedSquaredError dgp (fun p c => linearPredictor model_star p c) := by
-    -- We show that model_star is optimal among all normalized models.
-    -- This implies Risk(model_norm) ≥ Risk(model_star).
-    have h_star_opt : ∀ m : PhenotypeInformedGAM 1 k 1, IsNormalizedScoreModel m →
-        expectedSquaredError dgp (fun p c => linearPredictor model_star p c) ≤
-        expectedSquaredError dgp (fun p c => linearPredictor m p c) := by
-      intro m hm
-      -- Risk decomposition logic:
-      -- The risk function J(base, slope) = E[(scaling*P - (base + slope*P))^2]
-      -- decomposes into E[(scaling - slope)^2] + E[base^2].
-      -- This is minimized when base = 0 and slope = E[scaling].
-      -- By hypothesis h_mean_1, E[scaling] = 1.
-      -- model_star corresponds to base=0 and slope=1, so it is the global minimizer.
-      sorry -- Omitted tedious integration steps: risk decomposition and quadratic minimization.
+    -- We show that model_star is better than model_norm because it uses the optimal
+    -- constant slope (E[scaling] = 1) and optimal baseline (0).
 
-    exact h_star_opt model_norm h_norm_opt.is_normalized
+    -- 1. Decompose model_norm predictor: baseline(c) + slope * p
+    have h_norm_pred : ∀ p c, linearPredictor model_norm p c = predictorBase model_norm c + predictorSlope model_norm c * p :=
+      linearPredictor_decomp model_norm h_linear_basis.1
+
+    -- 2. Decompose model_star predictor: 0 + 1 * p
+    have h_star_pred : ∀ p c, linearPredictor model_star p c = p := by
+      intro p c
+      have h_decomp := linearPredictor_decomp model_star (by simp [model_star, h_linear_basis.1]) p c
+      rw [h_decomp]
+      simp [model_star, predictorBase, predictorSlope, evalSmooth]
+
+    -- 3. Risk decomposition for model_norm
+    let base := predictorBase model_norm
+    let slope := predictorSlope model_norm
+
+    -- For a normalized model, slope is constant
+    have h_slope_const : ∀ c, slope c = model_norm.γₘ₀ 0 := by
+      intro c
+      dsimp [slope, predictorSlope]
+      have h_sum_zero : ∑ l : Fin k, evalSmooth model_norm.pcSplineBasis (model_norm.fₘₗ 0 l) (c l) = 0 := by
+        simp [h_norm_opt.is_normalized.fₘₗ_zero, evalSmooth]
+      rw [h_sum_zero, add_zero]
+
+    let s := model_norm.γₘ₀ 0
+
+    have h_risk_decomp : expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) =
+                         ∫ c, (scaling_func c - s)^2 ∂((stdNormalProdMeasure k).map Prod.snd) +
+                         ∫ c, (base c)^2 ∂((stdNormalProdMeasure k).map Prod.snd) := by
+      unfold expectedSquaredError dgpMultiplicativeBias
+      -- Expand predictor: base(c) + s * p
+      have h_pred : ∀ p c, linearPredictor model_norm p c = base c + s * p := by
+         intro p c
+         rw [h_norm_pred p c, h_slope_const c]
+      -- integrand: ((scaling(c) - s)*p - base(c))^2
+      have h_integrand_eq : ∀ pc : ℝ × (Fin k → ℝ),
+         ((dgpMultiplicativeBias scaling_func).trueExpectation pc.1 pc.2 - linearPredictor model_norm pc.1 pc.2)^2
+         = ((scaling_func pc.2 - s) * pc.1 - base pc.2)^2 := by
+         intro pc
+         simp [h_pred, dgpMultiplicativeBias, sub_sub]
+         ring
+      rw [integral_congr_ae (ae_of_all _ h_integrand_eq)]
+
+      -- Use Fubini to integrate over p first
+      -- The measure is stdGaussianMeasure.prod (pi gaussian)
+      rw [MeasureTheory.integral_prod]
+      -- Inner integral over p: ∫ ((S-s)p - B)^2 dp = (S-s)^2 + B^2
+      have h_inner : ∀ c, ∫ p, ((scaling_func c - s) * p - base c)^2 ∂stdGaussianMeasure =
+                          (scaling_func c - s)^2 + (base c)^2 := by
+        intro c
+        have h_poly : ∀ p, ((scaling_func c - s) * p - base c)^2 =
+                           (scaling_func c - s)^2 * p^2 - 2 * (scaling_func c - s) * base c * p + (base c)^2 := by
+           intro p; ring
+        simp_rw [h_poly]
+        rw [integral_add]
+        · rw [integral_sub]
+          · rw [integral_mul_left, integral_mul_left]
+            -- Moments of standard Gaussian
+            have h_p2 : ∫ p, p^2 ∂stdGaussianMeasure = 1 := by
+               -- Variance is 1, mean is 0 => E[X^2] = 1
+               have h_var : ProbabilityTheory.variance stdGaussianMeasure = 1 := by
+                 unfold stdGaussianMeasure; rw [ProbabilityTheory.variance_gaussianReal]
+               have h_mean : ∫ x, x ∂stdGaussianMeasure = 0 := by
+                 unfold stdGaussianMeasure; rw [ProbabilityTheory.integral_gaussianReal_mean]
+               unfold ProbabilityTheory.variance at h_var
+               rw [h_mean, sq, zero_mul, sub_zero] at h_var
+               exact h_var
+            have h_p1 : ∫ p, p ∂stdGaussianMeasure = 0 := by
+               unfold stdGaussianMeasure; rw [ProbabilityTheory.integral_gaussianReal_mean]
+            have h_p0 : ∫ p, (1:ℝ) ∂stdGaussianMeasure = 1 := by
+               rw [integral_const, MeasureTheory.ProbabilityMeasure.measure_univ, ENNReal.one_toReal, mul_one]
+            rw [h_p2, h_p1, h_p0]
+            ring
+          · -- Integrability of p term
+            apply Integrable.const_mul; apply integrable_id_gaussian
+          · -- Integrability of p^2 term
+            apply Integrable.const_mul; apply integrable_sq_gaussian
+        · -- Integrability of (p^2 - p) part
+          apply Integrable.sub
+          · apply Integrable.const_mul; apply integrable_sq_gaussian
+          · apply Integrable.const_mul; apply integrable_id_gaussian
+        · -- Integrability of constant part
+          apply integrable_const
+
+      simp_rw [h_inner]
+      rw [integral_add]
+      · -- The map Prod.snd maps the product measure to the second component's measure
+        rfl
+      · -- Integrability of (scaling - s)^2
+        -- We know scaling^2 is integrable, s is const.
+        have h_s : Integrable (fun c => s) ((stdNormalProdMeasure k).map Prod.snd) := integrable_const _
+        have h_ss : Integrable (fun c => scaling_func c) ((stdNormalProdMeasure k).map Prod.snd) := by
+           let g := fun c => (scaling_func c)^2 + 1
+           have hg : Integrable g ((stdNormalProdMeasure k).map Prod.snd) := h_scaling_sq_int.add (integrable_const 1)
+           apply Integrable.mono' hg h_scaling_meas
+           filter_upwards with c
+           rw [Real.norm_eq_abs]
+           have : |scaling_func c| ≤ (scaling_func c)^2 + 1 := by
+             have h_sq : 0 ≤ (|scaling_func c| - 1)^2 := sq_nonneg _
+             have h_expand : (|scaling_func c| - 1)^2 = |scaling_func c|^2 - 2*|scaling_func c| + 1 := by ring
+             rw [h_expand] at h_sq
+             rw [sq_abs] at h_sq
+             nlinarith
+           exact this
+        -- (S-s)^2 = S^2 - 2sS + s^2
+        have h_expand : ∀ c, (scaling_func c - s)^2 = (scaling_func c)^2 - 2*s*scaling_func c + s^2 := by
+           intro c; ring
+        simp_rw [h_expand]
+        apply Integrable.add
+        · apply Integrable.sub
+          · exact h_scaling_sq_int
+          · apply Integrable.const_mul h_ss
+        · exact integrable_const _
+      · -- Integrability of base^2
+        -- Derived from total risk finiteness.
+        -- We established ∫ ((S-s)^2 + B^2) < ∞ implies ∫ B^2 < ∞
+        have h_total : Integrable (fun c => (scaling_func c - s)^2 + (base c)^2) ((stdNormalProdMeasure k).map Prod.snd) := by
+           apply MeasureTheory.Integrable.integral_prod_right
+           simp_rw [h_integrand_eq]
+           -- We proved `true - pred` is square-integrable.
+           have h_diff_sq : Integrable (fun pc => ((dgpMultiplicativeBias scaling_func).trueExpectation pc.1 pc.2 - linearPredictor model_norm pc.1 pc.2)^2) (stdNormalProdMeasure k) := by
+              have h1 : Integrable (fun pc => ((dgpMultiplicativeBias scaling_func).trueExpectation pc.1 pc.2)^2) (stdNormalProdMeasure k) := h_integrable
+              have h2 : Integrable (fun pc => (linearPredictor model_norm pc.1 pc.2)^2) (stdNormalProdMeasure k) := h_norm_int
+              apply Integrable.mono' (h1.add h2).const_mul_2
+              · exact ae_of_all _ (fun _ => True)
+              · intro pc
+                rw [Real.norm_eq_abs, abs_sq]
+                have : (pc.1 * scaling_func pc.2 - linearPredictor model_norm pc.1 pc.2)^2 ≤ 2 * (pc.1 * scaling_func pc.2)^2 + 2 * (linearPredictor model_norm pc.1 pc.2)^2 := by
+                   nlinarith
+                rw [dgpMultiplicativeBias, mul_comm]
+                exact this
+           exact h_diff_sq
+        apply Integrable.sub
+        · exact h_total
+        · -- (S-s)^2 is integrable (proven above)
+           have h_ss : Integrable (fun c => scaling_func c) ((stdNormalProdMeasure k).map Prod.snd) := by
+             let g := fun c => (scaling_func c)^2 + 1
+             have hg : Integrable g ((stdNormalProdMeasure k).map Prod.snd) := h_scaling_sq_int.add (integrable_const 1)
+             apply Integrable.mono' hg h_scaling_meas
+             filter_upwards with c
+             rw [Real.norm_eq_abs]
+             have : |scaling_func c| ≤ (scaling_func c)^2 + 1 := by
+               by_cases h : |scaling_func c| ≤ 1
+               · exact le_trans h (le_add_of_nonneg_left (sq_nonneg _))
+               · have : 1 ≤ |scaling_func c| := le_of_not_le h
+                 have : |scaling_func c| ≤ |scaling_func c|^2 := le_self_pow this (by norm_num)
+                 rw [sq_abs] at this
+                 exact le_trans this (le_self_add)
+             exact this
+           have h_expand : ∀ c, (scaling_func c - s)^2 = (scaling_func c)^2 - 2*s*scaling_func c + s^2 := by
+             intro c; ring
+           simp_rw [h_expand]
+           apply Integrable.add
+           · apply Integrable.sub
+             · exact h_scaling_sq_int
+             · apply Integrable.const_mul h_ss
+           · exact integrable_const _
+      · -- Measurability
+        apply Measurable.aestronglyMeasurable
+        apply Measurable.pow
+        apply Measurable.sub
+        · apply Measurable.mul
+          · apply Measurable.sub
+            · exact aeStronglyMeasurable_of_integrable (by
+              -- (S-s)^2 is integrable
+               have h_ss : Integrable (fun c => scaling_func c) ((stdNormalProdMeasure k).map Prod.snd) := by
+                 let g := fun c => (scaling_func c)^2 + 1
+                 have hg : Integrable g ((stdNormalProdMeasure k).map Prod.snd) := h_scaling_sq_int.add (integrable_const 1)
+                 apply Integrable.mono' hg h_scaling_meas
+                 filter_upwards with c
+                 rw [Real.norm_eq_abs]
+                 have : |scaling_func c| ≤ (scaling_func c)^2 + 1 := by
+                   have h_sq : 0 ≤ (|scaling_func c| - 1)^2 := sq_nonneg _
+                   have h_expand : (|scaling_func c| - 1)^2 = |scaling_func c|^2 - 2*|scaling_func c| + 1 := by ring
+                   rw [h_expand] at h_sq
+                   rw [sq_abs] at h_sq
+                   nlinarith
+                 exact this
+               have h_expand : ∀ c, (scaling_func c - s)^2 = (scaling_func c)^2 - 2*s*scaling_func c + s^2 := by
+                 intro c; ring
+               simp_rw [h_expand]
+               apply Integrable.add
+               · apply Integrable.sub
+                 · exact h_scaling_sq_int
+                 · apply Integrable.const_mul h_ss
+               · exact integrable_const _
+            )
+          · exact measurable_fst
+        · apply measurable_snd.comp
+          -- base is measurable? linearPredictor is measurable.
+          -- base c = linearPredictor 0 c.
+          exact (h_pred_meas.comp_measurable measurable_prod_mk_left).measurable
+
+    -- 4. Risk for model_star (s=1, base=0)
+    have h_star_risk_val : expectedSquaredError dgp (fun p c => linearPredictor model_star p c) =
+                           ∫ c, (scaling_func c - 1)^2 ∂((stdNormalProdMeasure k).map Prod.snd) := by
+       unfold expectedSquaredError dgpMultiplicativeBias
+       simp_rw [h_star_pred]
+       -- Integrand: ((S-1)p)^2 = (S-1)^2 p^2
+       -- Same Fubini logic
+       rw [MeasureTheory.integral_prod]
+       congr 1
+       ext c
+       have h_inner : ∫ p, ((scaling_func c - 1) * p)^2 ∂stdGaussianMeasure = (scaling_func c - 1)^2 := by
+         simp_rw [mul_pow]
+         rw [integral_mul_left]
+         have h_p2 : ∫ p, p^2 ∂stdGaussianMeasure = 1 := by
+            have h_var : ProbabilityTheory.variance stdGaussianMeasure = 1 := by
+               unfold stdGaussianMeasure; rw [ProbabilityTheory.variance_gaussianReal]
+            have h_mean : ∫ x, x ∂stdGaussianMeasure = 0 := by
+               unfold stdGaussianMeasure; rw [ProbabilityTheory.integral_gaussianReal_mean]
+            unfold ProbabilityTheory.variance at h_var
+            rw [h_mean, sq, zero_mul, sub_zero] at h_var
+            exact h_var
+         rw [h_p2, mul_one]
+       rw [h_inner]
+       -- Integrability check
+       exact Integrable.integrable_on_of_measurable_support (by fun_prop) (by fun_prop)
+
+    -- 5. Show s=1 minimizes E[(scaling - s)^2]
+    have h_quad_min : ∫ c, (scaling_func c - s)^2 ∂((stdNormalProdMeasure k).map Prod.snd) ≥
+                      ∫ c, (scaling_func c - 1)^2 ∂((stdNormalProdMeasure k).map Prod.snd) := by
+       -- Expansion of quadratic risk
+       have h_exp : ∀ v, ∫ c, (scaling_func c - v)^2 ∂((stdNormalProdMeasure k).map Prod.snd) =
+                         ∫ c, (scaling_func c)^2 ∂((stdNormalProdMeasure k).map Prod.snd) -
+                         2 * v * ∫ c, scaling_func c ∂((stdNormalProdMeasure k).map Prod.snd) +
+                         v^2 * 1 := by
+          intro v
+          have h_expand : ∀ c, (scaling_func c - v)^2 = (scaling_func c)^2 - 2 * v * scaling_func c + v^2 := by
+            intro c; ring
+          simp_rw [h_expand]
+          rw [integral_add]
+          · rw [integral_sub]
+            · rw [integral_mul_left]
+            · exact h_scaling_sq_int
+            · -- Integrability of scaling
+               have h_ss : Integrable (fun c => scaling_func c) ((stdNormalProdMeasure k).map Prod.snd) := by
+                 let g := fun c => (scaling_func c)^2 + 1
+                 have hg : Integrable g ((stdNormalProdMeasure k).map Prod.snd) := h_scaling_sq_int.add (integrable_const 1)
+                 apply Integrable.mono' hg h_scaling_meas
+                 filter_upwards with c
+                 rw [Real.norm_eq_abs]
+                 have : |scaling_func c| ≤ (scaling_func c)^2 + 1 := by
+                   have h_sq : 0 ≤ (|scaling_func c| - 1)^2 := sq_nonneg _
+                   have h_expand : (|scaling_func c| - 1)^2 = |scaling_func c|^2 - 2*|scaling_func c| + 1 := by ring
+                   rw [h_expand] at h_sq
+                   rw [sq_abs] at h_sq
+                   nlinarith
+                 exact this
+               apply Integrable.const_mul h_ss
+          · apply Integrable.sub
+            · exact h_scaling_sq_int
+            · -- Integrability of scaling (repeated)
+               have h_ss : Integrable (fun c => scaling_func c) ((stdNormalProdMeasure k).map Prod.snd) := by
+                 let g := fun c => (scaling_func c)^2 + 1
+                 have hg : Integrable g ((stdNormalProdMeasure k).map Prod.snd) := h_scaling_sq_int.add (integrable_const 1)
+                 apply Integrable.mono' hg h_scaling_meas
+                 filter_upwards with c
+                 rw [Real.norm_eq_abs]
+                 have : |scaling_func c| ≤ (scaling_func c)^2 + 1 := by
+                   have h_sq : 0 ≤ (|scaling_func c| - 1)^2 := sq_nonneg _
+                   have h_expand : (|scaling_func c| - 1)^2 = |scaling_func c|^2 - 2*|scaling_func c| + 1 := by ring
+                   rw [h_expand] at h_sq
+                   rw [sq_abs] at h_sq
+                   nlinarith
+                 exact this
+               apply Integrable.const_mul h_ss
+          · apply integrable_const
+
+          -- Last term: v^2 * 1 = v^2 * measure_univ
+       rw [h_exp s, h_exp 1]
+       rw [h_mean_1]
+       ring_nf
+       nlinarith [sq_nonneg (s - 1)]
+
+    -- 6. Show E[base^2] ≥ 0
+    have h_base_nonneg : ∫ c, (base c)^2 ∂((stdNormalProdMeasure k).map Prod.snd) ≥ 0 := by
+       apply integral_nonneg
+       intro x
+       apply sq_nonneg
+
+    rw [h_risk_decomp, h_star_risk_val]
+    linarith
 
   have h_opt_risk : expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) =
                     expectedSquaredError dgp (fun p c => linearPredictor model_star p c) := by
