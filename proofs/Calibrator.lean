@@ -4580,7 +4580,143 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   ∀ (i : Fin n),
       linearPredictor model (data.p i) (data.c i) =
       linearPredictor model_prime (data'.p i) (data'.c i) := by
-  sorry
+  intro data' model model_prime i
+  -- 1. Identify design matrices and column spaces
+  let X := designMatrix data pgsBasis splineBasis
+  let X' := designMatrix data' pgsBasis splineBasis
+  let K := LinearMap.range (Matrix.toLin' X)
+  let K' := LinearMap.range (Matrix.toLin' X')
+
+  -- 2. Predictions are vectors in the column space
+  let pred_vec : Fin n → ℝ := fun i => linearPredictor model (data.p i) (data.c i)
+  let pred_vec' : Fin n → ℝ := fun i => linearPredictor model_prime (data'.p i) (data'.c i)
+
+  have h_model_in_class : InModelClass model pgsBasis splineBasis := by
+    dsimp only [model]
+    unfold fit
+    apply unpackParams_in_class
+
+  have h_model_prime_in_class : InModelClass model_prime pgsBasis splineBasis := by
+    dsimp only [model_prime]
+    unfold fit
+    apply unpackParams_in_class
+
+  have h_pred_in_K : pred_vec ∈ K := by
+    use packParams model
+    ext i
+    exact (linearPredictor_eq_designMatrix_mulVec data pgsBasis splineBasis model h_model_in_class i).symm
+
+  have h_pred_prime_in_K' : pred_vec' ∈ K' := by
+    use packParams model_prime
+    ext i
+    exact (linearPredictor_eq_designMatrix_mulVec data' pgsBasis splineBasis model_prime h_model_prime_in_class i).symm
+
+  have h_pack_unpack : ∀ beta, packParams (unpackParams pgsBasis splineBasis beta) = beta := by
+    intro beta
+    ext x
+    cases x <;> simp [packParams, unpackParams]
+
+  -- 3. Show predictions minimize distance in their respective subspaces
+  have h_min_K : ∀ w ∈ K, l2norm_sq (data.y - pred_vec) ≤ l2norm_sq (data.y - w) := by
+    intro w hw
+    obtain ⟨beta_w, h_beta_w⟩ := hw
+    let model_w := unpackParams pgsBasis splineBasis beta_w
+    have h_model_w_in_class : InModelClass model_w pgsBasis splineBasis :=
+      unpackParams_in_class pgsBasis splineBasis beta_w
+
+    have h_loss_le := fit_minimizes_loss p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank model_w h_model_w_in_class
+
+    unfold empiricalLoss at h_loss_le
+    rw [h_lambda_zero] at h_loss_le
+    simp only [add_zero, mul_le_mul_left (one_div_pos.mpr (Nat.cast_pos.mpr h_n_pos))] at h_loss_le
+
+    have h_sum_pred : (∑ i : Fin n, pointwiseNLL model.dist (data.y i) (linearPredictor model (data.p i) (data.c i))) = l2norm_sq (data.y - pred_vec) := by
+      simp only [pointwiseNLL, DistributionFamily.Gaussian, l2norm_sq, pred_vec, Pi.sub_apply]
+      -- fit creates model with Gaussian dist
+      have h_dist : model.dist = DistributionFamily.Gaussian := by
+        dsimp only [model]
+        unfold fit
+        unfold unpackParams
+        rfl
+      rw [h_dist]
+      simp only [pointwiseNLL]
+      rfl
+
+    have h_sum_w : (∑ i : Fin n, pointwiseNLL model_w.dist (data.y i) (linearPredictor model_w (data.p i) (data.c i))) = l2norm_sq (data.y - w) := by
+      simp only [pointwiseNLL, DistributionFamily.Gaussian, l2norm_sq]
+      -- model_w has Gaussian dist
+      have h_dist : model_w.dist = DistributionFamily.Gaussian := rfl
+      rw [h_dist]
+      simp only [pointwiseNLL]
+      refine Finset.sum_congr rfl ?_
+      intro i _
+      rw [← h_beta_w]
+      rw [linearPredictor_eq_designMatrix_mulVec data pgsBasis splineBasis model_w h_model_w_in_class i]
+      rw [h_pack_unpack]
+      simp [Pi.sub_apply]
+
+    rw [h_sum_pred, h_sum_w] at h_loss_le
+    exact h_loss_le
+
+  have h_min_K' : ∀ w ∈ K', l2norm_sq (data'.y - pred_vec') ≤ l2norm_sq (data'.y - w) := by
+    intro w hw
+    obtain ⟨beta_w, h_beta_w⟩ := hw
+    let model_w := unpackParams pgsBasis splineBasis beta_w
+    have h_model_w_in_class : InModelClass model_w pgsBasis splineBasis :=
+      unpackParams_in_class pgsBasis splineBasis beta_w
+
+    let h_rank_prime : Matrix.rank X' = Fintype.card (ParamIx p k sp) := by
+      rw [← rank_eq_of_range_eq (n:=Fin n) (m:=ParamIx p k sp) X X' h_range_eq]
+      exact h_rank
+
+    have h_loss_le := fit_minimizes_loss p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank_prime model_w h_model_w_in_class
+
+    unfold empiricalLoss at h_loss_le
+    rw [h_lambda_zero] at h_loss_le
+    simp only [add_zero, mul_le_mul_left (one_div_pos.mpr (Nat.cast_pos.mpr h_n_pos))] at h_loss_le
+
+    have h_sum_pred : (∑ i : Fin n, pointwiseNLL model_prime.dist (data'.y i) (linearPredictor model_prime (data'.p i) (data'.c i))) = l2norm_sq (data'.y - pred_vec') := by
+      simp only [pointwiseNLL, DistributionFamily.Gaussian, l2norm_sq, pred_vec', Pi.sub_apply]
+      have h_dist : model_prime.dist = DistributionFamily.Gaussian := by
+        dsimp only [model_prime]
+        unfold fit
+        unfold unpackParams
+        rfl
+      rw [h_dist]
+      simp only [pointwiseNLL]
+      rfl
+
+    have h_sum_w : (∑ i : Fin n, pointwiseNLL model_w.dist (data'.y i) (linearPredictor model_w (data'.p i) (data'.c i))) = l2norm_sq (data'.y - w) := by
+      simp only [pointwiseNLL, DistributionFamily.Gaussian, l2norm_sq]
+      have h_dist : model_w.dist = DistributionFamily.Gaussian := rfl
+      rw [h_dist]
+      simp only [pointwiseNLL]
+      refine Finset.sum_congr rfl ?_
+      intro i _
+      rw [← h_beta_w]
+      rw [linearPredictor_eq_designMatrix_mulVec data' pgsBasis splineBasis model_w h_model_w_in_class i]
+      rw [h_pack_unpack]
+      simp [Pi.sub_apply]
+
+    rw [h_sum_pred, h_sum_w] at h_loss_le
+    exact h_loss_le
+
+  -- 4. Uniqueness of projection implies equality
+  have h_proj : pred_vec = orthogonalProjection K data.y :=
+    orthogonalProjection_eq_of_dist_le K data.y pred_vec h_pred_in_K h_min_K
+
+  have h_proj_prime : pred_vec' = orthogonalProjection K' data'.y :=
+    orthogonalProjection_eq_of_dist_le K' data'.y pred_vec' h_pred_prime_in_K' h_min_K'
+
+  have h_y_eq : data.y = data'.y := rfl
+
+  rw [h_range_eq] at h_proj
+  rw [h_y_eq] at h_proj
+
+  have h_vec_eq : pred_vec = pred_vec' := by
+    rw [h_proj, h_proj_prime]
+
+  exact congr_fun h_vec_eq i
 
 noncomputable def dist_to_support {k : ℕ} (c : Fin k → ℝ) (supp : Set (Fin k → ℝ)) : ℝ :=
   Metric.infDist c supp
