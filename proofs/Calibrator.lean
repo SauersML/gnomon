@@ -1866,6 +1866,13 @@ lemma unpackParams_in_class {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [
     InModelClass (unpackParams pgsBasis splineBasis β) pgsBasis splineBasis := by
   constructor <;> rfl
 
+lemma packParams_unpackParams_eq {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
+    (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp)
+    (β : ParamVec p k sp) :
+    packParams (unpackParams pgsBasis splineBasis β) = β := by
+  ext j
+  cases j <;> simp [packParams, unpackParams]
+
 /-- The design matrix for the penalized GAM.
     This corresponds to the construction in `basis.rs` and `construction.rs`.
 
@@ -4580,7 +4587,150 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   ∀ (i : Fin n),
       linearPredictor model (data.p i) (data.c i) =
       linearPredictor model_prime (data'.p i) (data'.c i) := by
-  sorry
+  intro i
+  -- 1. Unfold linearPredictor to relate it to the parameter vector
+  have h_model_class := unpackParams_in_class (p := p) (k := k) (sp := sp) pgsBasis splineBasis (packParams model)
+  have h_pred_vec : ∀ j, linearPredictor model (data.p j) (data.c j) =
+      (designMatrix data pgsBasis splineBasis).mulVec (packParams model) j := by
+    intro j
+    -- model is fit ... which is unpackParams ...
+    -- We need to show model = unpackParams ... (packParams model) is true definitionally for fit?
+    -- Actually fit returns unpackParams directly.
+    -- And linearPredictor_eq_designMatrix_mulVec takes InModelClass.
+    -- unpackParams satisfies InModelClass.
+    -- However, linearPredictor_eq_designMatrix_mulVec uses `packParams m`.
+    -- `packParams (unpackParams ... beta) = beta` is proven by packParams_unpackParams_eq.
+    -- But here m IS unpackParams. So packParams m = beta.
+    -- So X.mulVec (packParams m) = X.mulVec beta.
+    -- linearPredictor m = X.mulVec beta.
+    -- Wait, fit is `unpackParams ... (choose ...)`.
+    -- So model is `unpackParams ... beta`.
+    -- `packParams model` is `beta`.
+    -- So `linearPredictor model` should be `X * beta` = `X * packParams model`.
+    -- This relies on `unpackParams_in_class`.
+    -- But `fit` returns `unpackParams ...`.
+    -- Is `model` structurally equal to `unpackParams ...`?
+    -- Yes, by definition of `fit`.
+    -- And `InModelClass` holds for any `unpackParams`.
+    apply linearPredictor_eq_designMatrix_mulVec
+    exact unpackParams_in_class _ _ _
+
+  -- 2. Characterize the prediction as the orthogonal projection onto Range(X)
+  let X := designMatrix data pgsBasis splineBasis
+  let y := data.y
+
+  let p_vec := X.mulVec (packParams model)
+
+  -- Helper to show p_vec is the projection
+  have h_proj : p_vec = orthogonalProjection (LinearMap.range (Matrix.toLin' X)) y := by
+    apply orthogonalProjection_eq_of_dist_le
+    · -- p_vec is in Range(X)
+      use (packParams model)
+      rfl
+    · -- p_vec minimizes distance
+      intro w hw
+      -- w is in Range(X), so w = X * v for some v
+      obtain ⟨v, hv⟩ := hw
+      -- We need to show ||y - p_vec||^2 <= ||y - w||^2
+      -- This comes from `fit_minimizes_loss`
+      let m_w := unpackParams pgsBasis splineBasis v
+      have h_loss_le := fit_minimizes_loss p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank m_w (unpackParams_in_class _ _ _)
+
+      -- Expand empiricalLoss with lambda=0
+      unfold empiricalLoss at h_loss_le
+      rw [h_lambda_zero] at h_loss_le
+      simp only [add_zero, zero_mul] at h_loss_le
+
+      -- Simplify loss terms
+      have h_lhs_eq : (∑ j, pointwiseNLL model.dist (data.y j) (linearPredictor model (data.p j) (data.c j))) = l2norm_sq (y - p_vec) := by
+        have h_dist : model.dist = .Gaussian := by
+          have h := unpackParams_in_class (p := p) (k := k) (sp := sp) pgsBasis splineBasis (packParams model)
+          exact h.dist_gaussian
+        simp [pointwiseNLL, h_dist, h_pred_vec, p_vec, l2norm_sq, Pi.sub_apply]
+        rfl
+
+      have h_rhs_eq : (∑ j, pointwiseNLL m_w.dist (data.y j) (linearPredictor m_w (data.p j) (data.c j))) = l2norm_sq (y - w) := by
+        have h_pred_mw : ∀ j, linearPredictor m_w (data.p j) (data.c j) = w j := by
+          intro j
+          rw [linearPredictor_eq_designMatrix_mulVec _ _ _ _ (unpackParams_in_class _ _ _)]
+          rw [packParams_unpackParams_eq]
+          rw [← hv]
+          rfl
+        have h_dist : m_w.dist = .Gaussian := rfl
+        simp [pointwiseNLL, h_dist, h_pred_mw, l2norm_sq, Pi.sub_apply]
+        rfl
+
+      rw [h_lhs_eq, h_rhs_eq] at h_loss_le
+
+      -- Multiply by n (which is positive)
+      have hn : (0 : ℝ) < n := Nat.cast_pos.mpr h_n_pos
+      have hn_inv_pos : 0 < (1 / (n : ℝ)) := one_div_pos.mpr hn
+
+      exact (mul_le_mul_left hn_inv_pos).mp h_loss_le
+
+  -- Same for model_prime
+  let X' := designMatrix data' pgsBasis splineBasis
+  let p_vec' := X'.mulVec (packParams model_prime)
+
+  have h_pred_vec' : ∀ j, linearPredictor model_prime (data'.p j) (data'.c j) =
+      p_vec' j := by
+    intro j
+    apply linearPredictor_eq_designMatrix_mulVec
+    exact unpackParams_in_class _ _ _
+
+  have h_proj' : p_vec' = orthogonalProjection (LinearMap.range (Matrix.toLin' X')) y := by
+    apply orthogonalProjection_eq_of_dist_le
+    · use (packParams model_prime); rfl
+    · intro w hw
+      obtain ⟨v, hv⟩ := hw
+      let m_w := unpackParams pgsBasis splineBasis v
+      have h_loss_le := fit_minimizes_loss p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
+          let X := designMatrix data pgsBasis splineBasis
+          let X' := designMatrix data' pgsBasis splineBasis
+          have h_rank_eq : X.rank = X'.rank := by
+            exact rank_eq_of_range_eq X X' h_range_eq
+          rw [← h_rank_eq]
+          exact h_rank
+      ) m_w (unpackParams_in_class _ _ _)
+
+      unfold empiricalLoss at h_loss_le
+      rw [h_lambda_zero] at h_loss_le
+      simp only [add_zero, zero_mul] at h_loss_le
+
+      have h_lhs_eq : (∑ j, pointwiseNLL model_prime.dist (data'.y j) (linearPredictor model_prime (data'.p j) (data'.c j))) = l2norm_sq (y - p_vec') := by
+        have h_dist : model_prime.dist = .Gaussian := by
+          have h := unpackParams_in_class (p := p) (k := k) (sp := sp) pgsBasis splineBasis (packParams model_prime)
+          exact h.dist_gaussian
+        -- Note: data'.y = data.y = y
+        simp [pointwiseNLL, h_dist, h_pred_vec', p_vec', l2norm_sq, Pi.sub_apply]
+        rfl
+
+      have h_rhs_eq : (∑ j, pointwiseNLL m_w.dist (data'.y j) (linearPredictor m_w (data'.p j) (data'.c j))) = l2norm_sq (y - w) := by
+        have h_pred_mw : ∀ j, linearPredictor m_w (data'.p j) (data'.c j) = w j := by
+          intro j
+          rw [linearPredictor_eq_designMatrix_mulVec _ _ _ _ (unpackParams_in_class _ _ _)]
+          rw [packParams_unpackParams_eq]
+          rw [← hv]
+          rfl
+        have h_dist : m_w.dist = .Gaussian := rfl
+        simp [pointwiseNLL, h_dist, h_pred_mw, l2norm_sq, Pi.sub_apply]
+        rfl
+
+      rw [h_lhs_eq, h_rhs_eq] at h_loss_le
+      have hn : (0 : ℝ) < n := Nat.cast_pos.mpr h_n_pos
+      have hn_inv_pos : 0 < (1 / (n : ℝ)) := one_div_pos.mpr hn
+      exact (mul_le_mul_left hn_inv_pos).mp h_loss_le
+
+  -- 3. Use range equality
+  -- h_range_eq gives Range(X) = Range(X')
+  -- We need to replace X with X' in h_proj or vice versa
+  -- h_proj : p_vec = Proj(Range(X)) y
+  -- h_proj' : p_vec' = Proj(Range(X')) y
+  rw [h_range_eq] at h_proj
+
+  -- 4. Conclude
+  rw [h_pred_vec i, h_pred_vec' i]
+  rw [h_proj, h_proj']
 
 noncomputable def dist_to_support {k : ℕ} (c : Fin k → ℝ) (supp : Set (Fin k → ℝ)) : ℝ :=
   Metric.infDist c supp
