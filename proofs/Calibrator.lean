@@ -1762,6 +1762,13 @@ lemma unpackParams_in_class {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [
     InModelClass (unpackParams pgsBasis splineBasis β) pgsBasis splineBasis := by
   constructor <;> rfl
 
+lemma packParams_unpackParams_eq {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
+    (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp)
+    (β : ParamVec p k sp) :
+    packParams (unpackParams pgsBasis splineBasis β) = β := by
+  ext j
+  cases j <;> simp [packParams, unpackParams]
+
 /-- The design matrix for the penalized GAM.
     This corresponds to the construction in `basis.rs` and `construction.rs`.
 
