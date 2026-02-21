@@ -352,24 +352,10 @@ variable {p k sp n : ℕ}
 The following are **example instantiations** of `dgpAdditiveBias` with specific β values
 from simulation studies. For general proofs, use `dgpAdditiveBias` with arbitrary β. -/
 
-/-- **EXAMPLE**: Scenario 1 - Gene-environment interaction model.
-    Phenotype = P × (1 + 0.1 × ΣC). NOT an additive bias model. -/
-noncomputable def dgpScenario1_example (k : ℕ) [Fintype (Fin k)] : DataGeneratingProcess k := {
-  trueExpectation := fun p pc => p * (1 + 0.1 * (∑ l, pc l)),
-  jointMeasure := stdNormalProdMeasure k
-}
-
-/-- **EXAMPLE**: Scenario 3 - Positive confounding with β = 0.5.
-    This is `dgpAdditiveBias k 0.5`. -/
-noncomputable def dgpScenario3_example (k : ℕ) [Fintype (Fin k)] : DataGeneratingProcess k := {
-  trueExpectation := fun p pc => p + (0.5 * (∑ l, pc l)),
-  jointMeasure := stdNormalProdMeasure k
-}
-
-/-- **EXAMPLE**: Scenario 4 - Negative confounding with β = -0.8.
-    This is `dgpAdditiveBias k (-0.8)`. -/
-noncomputable def dgpScenario4_example (k : ℕ) [Fintype (Fin k)] : DataGeneratingProcess k := {
-  trueExpectation := fun p pc => p - (0.8 * (∑ l, pc l)),
+/-- General interaction-bias DGP:
+    phenotype = P * (1 + β_int * Σ C). -/
+noncomputable def dgpInteractiveBias (k : ℕ) [Fintype (Fin k)] (β_int : ℝ) : DataGeneratingProcess k := {
+  trueExpectation := fun p pc => p * (1 + β_int * (∑ l, pc l)),
   jointMeasure := stdNormalProdMeasure k
 }
 
@@ -390,28 +376,16 @@ noncomputable def dgpAdditiveBias (k : ℕ) [Fintype (Fin k)] (β_env : ℝ) : D
   jointMeasure := stdNormalProdMeasure k
 }
 
-/-- Scenario 3 example is dgpAdditiveBias with β = 0.5. -/
-lemma dgpScenario3_example_eq_additiveBias (k : ℕ) [Fintype (Fin k)] :
-    dgpScenario3_example k = dgpAdditiveBias k 0.5 := by
-  unfold dgpScenario3_example dgpAdditiveBias
-  rfl
-
-/-- Scenario 4 example is dgpAdditiveBias with β = -0.8. -/
-lemma dgpScenario4_example_eq_additiveBias (k : ℕ) [Fintype (Fin k)] :
-    dgpScenario4_example k = dgpAdditiveBias k (-0.8) := by
-  unfold dgpScenario4_example dgpAdditiveBias
-  simp only [neg_mul, sub_eq_add_neg]
-
 def hasInteraction {k : ℕ} [Fintype (Fin k)] (f : ℝ → (Fin k → ℝ) → ℝ) : Prop :=
   ∃ (p₁ p₂ : ℝ) (c₁ c₂ : Fin k → ℝ), p₁ ≠ p₂ ∧ c₁ ≠ c₂ ∧
     (f p₂ c₁ - f p₁ c₁) / (p₂ - p₁) ≠ (f p₂ c₂ - f p₁ c₂) / (p₂ - p₁)
 
 theorem scenarios_are_distinct (k : ℕ) (hk_pos : 0 < k) :
-  hasInteraction (dgpScenario1_example k).trueExpectation ∧
-  ¬ hasInteraction (dgpScenario3_example k).trueExpectation ∧
-  ¬ hasInteraction (dgpScenario4_example k).trueExpectation := by
+  hasInteraction (dgpInteractiveBias k 0.1).trueExpectation ∧
+  ¬ hasInteraction (dgpAdditiveBias k 0.5).trueExpectation ∧
+  ¬ hasInteraction (dgpAdditiveBias k (-0.8)).trueExpectation := by
   constructor
-  · -- Case 1: dgpScenario1_example has interaction
+  · -- Case 1: dgpInteractiveBias with β_int = 0.1 has interaction
     unfold hasInteraction
     -- We provide witnesses for p₁, p₂, c₁, and c₂.
     -- p₁ and p₂ are real numbers. c₁ and c₂ are functions from Fin k to ℝ.
@@ -426,32 +400,32 @@ theorem scenarios_are_distinct (k : ℕ) (hk_pos : 0 < k) :
       -- This simplifies to 0 = 1, a contradiction.
       simp at this
     · -- Proves the inequality
-      unfold dgpScenario1_example; dsimp
+      unfold dgpInteractiveBias; dsimp
       have h_sum_c2 : (∑ (l : Fin k), if l = ⟨0, hk_pos⟩ then 1 else 0) = 1 := by
         -- The sum is 1 because the term is 1 only at i = ⟨0, hk_pos⟩ and 0 otherwise.
         simp [Finset.sum_ite_eq', Finset.mem_univ]
       -- Substitute the sum and simplify the expression
       simp [Finset.sum_const_zero]; norm_num
   · constructor
-    · -- Case 2: dgpScenario3_example has no interaction
+    · -- Case 2: additive-bias DGP with β = 0.5 has no interaction
       intro h; rcases h with ⟨p₁, p₂, c₁, c₂, hp_neq, _, h_neq⟩
-      unfold dgpScenario3_example at h_neq
+      unfold dgpAdditiveBias at h_neq
       -- The terms with c₁ and c₂ cancel out, making the slope independent of c.
       simp only [add_sub_add_right_eq_sub] at h_neq
       -- This leads to 1 ≠ 1, a contradiction.
       contradiction
-    · -- Case 3: dgpScenario4_example has no interaction
+    · -- Case 3: additive-bias DGP with β = -0.8 has no interaction
       intro h; rcases h with ⟨p₁, p₂, c₁, c₂, hp_neq, _, h_neq⟩
-      unfold dgpScenario4_example at h_neq
+      unfold dgpAdditiveBias at h_neq
       -- Similarly, the terms with c₁ and c₂ cancel out.
-      simp only [sub_sub_sub_cancel_right] at h_neq
+      simp only [add_sub_add_right_eq_sub] at h_neq
       -- This leads to 1 ≠ 1, a contradiction.
       contradiction
 
 theorem necessity_of_phenotype_data :
   ∃ (dgp_A dgp_B : DataGeneratingProcess 1),
     dgp_A.jointMeasure = dgp_B.jointMeasure ∧ hasInteraction dgp_A.trueExpectation ∧ ¬ hasInteraction dgp_B.trueExpectation := by
-  use dgpScenario1_example 1, dgpScenario4_example 1
+  use dgpInteractiveBias 1 0.1, dgpAdditiveBias 1 (-0.8)
   constructor; rfl
   have h_distinct := scenarios_are_distinct 1 (by norm_num)
   exact ⟨h_distinct.left, h_distinct.right.right⟩
@@ -1073,20 +1047,6 @@ lemma evalSmooth_interaction_eq_zero_of_raw_gen {k sp : ℕ} [Fintype (Fin k)] [
   unfold evalSmooth
   simp [h_raw.fₘₗ_zero m l]
 
-/-- Helper lemma: For a raw score model, the PC main effect spline term is always zero. -/
-lemma evalSmooth_eq_zero_of_raw {model : PhenotypeInformedGAM 1 1 1} (h_raw : IsRawScoreModel model)
-    (l : Fin 1) (c_val : ℝ) :
-    evalSmooth model.pcSplineBasis (model.f₀ₗ l) c_val = 0 := by
-  unfold evalSmooth
-  simp [h_raw.f₀ₗ_zero l]
-
-/-- Helper lemma: For a raw score model, the PGS-PC interaction spline term is always zero. -/
-lemma evalSmooth_interaction_eq_zero_of_raw {model : PhenotypeInformedGAM 1 1 1} (h_raw : IsRawScoreModel model)
-    (m : Fin 1) (l : Fin 1) (c_val : ℝ) :
-    evalSmooth model.pcSplineBasis (model.fₘₗ m l) c_val = 0 := by
-  unfold evalSmooth
-  simp [h_raw.fₘₗ_zero m l]
-
 /-- **Lemma A (Generalized)**: For a raw model (all spline terms zero) with linear PGS basis,
     the linear predictor simplifies to an affine function: a + b*p. -/
 lemma linearPredictor_eq_affine_of_raw_gen {k sp : ℕ} [Fintype (Fin k)] [Fintype (Fin sp)]
@@ -1323,73 +1283,6 @@ lemma rawOptimal_implies_orthogonality_gen {k sp : ℕ} [Fintype (Fin k)] [Finty
       linarith
     simpa [hres_def] using h2
 
-/-- **Lemma A**: For a raw model (all spline terms zero) with linear PGS basis,
-    the linear predictor simplifies to an affine function: a + b*p.
-    This is the key structural simplification.
-
-    Proof uses linearPredictor_decomp then shows base and slope simplify for raw models. -/
-lemma linearPredictor_eq_affine_of_raw
-    (model_raw : PhenotypeInformedGAM 1 1 1)
-    (h_raw : IsRawScoreModel model_raw)
-    (h_lin : model_raw.pgsBasis.B 1 = id ∧ model_raw.pgsBasis.B 0 = fun _ => 1) :
-    ∀ p c, linearPredictor model_raw p c =
-      model_raw.γ₀₀ + model_raw.γₘ₀ 0 * p := by
-  intros p_val c_val
-
-  -- Step 1: Use linearPredictor_decomp to get base + slope * p form
-  have h_decomp := linearPredictor_decomp model_raw h_lin.1 p_val c_val
-  rw [h_decomp]
-
-  -- Step 2: Show base reduces to γ₀₀ for raw model
-  have h_base : predictorBase model_raw c_val = model_raw.γ₀₀ := by
-    unfold predictorBase
-    simp [evalSmooth_eq_zero_of_raw h_raw]
-
-  -- Step 3: Show slope reduces to γₘ₀[0] for raw model
-  have h_slope : predictorSlope model_raw c_val = model_raw.γₘ₀ 0 := by
-    unfold predictorSlope
-    simp [evalSmooth_interaction_eq_zero_of_raw h_raw]
-
-  rw [h_base, h_slope]
-
-/-- The key bridge: IsBayesOptimalInRawClass implies the orthogonality conditions.
-
-    **Variational Proof (Fundamental Theorem of Least Squares)**:
-    If Ŷ minimizes E[(Y - Ŷ)²] over the class of affine functions of P,
-    then for any perturbation direction v ∈ span{1, P}, the directional derivative
-    of the loss at Ŷ in direction v must be zero.
-
-    Define L(ε) = E[(Y - (Ŷ + ε·v))²]
-                = E[(Y - Ŷ)²] - 2ε·E[(Y - Ŷ)·v] + ε²·E[v²]
-
-    For L(ε) ≥ L(0) for all ε (by optimality), the linear coefficient must vanish:
-        E[(Y - Ŷ)·v] = 0
-
-    Taking v = 1 gives: E[Y - Ŷ] = 0 (first normal equation)
-    Taking v = P gives: E[(Y - Ŷ)·P] = 0 (second normal equation)
-
-    **FUTURE**:
-    - Unify empirical and theoretical loss via measure theory: treat both as L²(μ)
-      for different measures μ (population vs empirical 1/n Σδᵢ)
-    - Abstract the parameter space to any [InnerProductSpace ℝ P], not just ParamIx
-    - Use LinearMap instead of Matrix for cleaner kernel/image reasoning -/
-lemma rawOptimal_implies_orthogonality
-    (model : PhenotypeInformedGAM 1 1 1) (dgp : DataGeneratingProcess 1)
-    (h_opt : IsBayesOptimalInRawClass dgp model)
-    (h_linear : model.pgsBasis.B 1 = id ∧ model.pgsBasis.B 0 = fun _ => 1)
-    (hY_int : Integrable (fun pc => dgp.trueExpectation pc.1 pc.2) dgp.jointMeasure)
-    (hP_int : Integrable (fun pc => pc.1) dgp.jointMeasure)
-    (hP2_int : Integrable (fun pc => pc.1 ^ 2) dgp.jointMeasure)
-    (hYP_int : Integrable (fun pc => dgp.trueExpectation pc.1 pc.2 * pc.1) dgp.jointMeasure)
-    (h_resid_sq_int : Integrable (fun pc =>
-      (dgp.trueExpectation pc.1 pc.2 -
-        (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1)) ^ 2) dgp.jointMeasure) :
-    (∫ pc, (dgp.trueExpectation pc.1 pc.2 -
-        (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1)) ∂dgp.jointMeasure = 0) ∧
-    (∫ pc, (dgp.trueExpectation pc.1 pc.2 -
-        (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1)) * pc.1 ∂dgp.jointMeasure = 0) := by
-  exact rawOptimal_implies_orthogonality_gen model dgp h_opt h_linear.1 hY_int hP_int hP2_int hYP_int h_resid_sq_int
-
 /-- Combine the normal equations to get the optimal coefficients for additive bias DGP.
 
     **Proof Strategy (Orthogonality Principle)**:
@@ -1422,7 +1315,7 @@ lemma optimal_coefficients_for_additive_dgp
     (h_resid_sq_int : Integrable (fun pc => (dgp.trueExpectation pc.1 pc.2 - (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1))^2) dgp.jointMeasure) :
     model.γ₀₀ = 0 ∧ model.γₘ₀ ⟨0, by norm_num⟩ = 1 := by
   -- Step 1: Get the orthogonality conditions from optimality
-  have h_orth := rawOptimal_implies_orthogonality model dgp h_opt h_linear hY_int hP_int hP2_int hYP_int h_resid_sq_int
+  have h_orth := rawOptimal_implies_orthogonality_gen model dgp h_opt h_linear.1 hY_int hP_int hP2_int hYP_int h_resid_sq_int
   set a := model.γ₀₀ with ha_def
   set b := model.γₘ₀ ⟨0, by norm_num⟩ with hb_def
   obtain ⟨h_orth1, h_orthP⟩ := h_orth
@@ -1692,11 +1585,14 @@ structure DGPWithEnvironment (k : ℕ) where
   trueGeneticEffect : ℝ → ℝ
   is_additive_causal : to_dgp.trueExpectation = fun p c => trueGeneticEffect p + environmentalEffect c
 
-theorem prediction_causality_tradeoff_linear_case [Fact (p = 1)] (sp : ℕ) [Fintype (Fin sp)]
+/-- General prediction-vs-causality tradeoff in the raw class.
+    If Y = αP + γC and γ * E[PC] ≠ 0, the Bayes-optimal raw slope differs from α. -/
+theorem prediction_causality_tradeoff_linear_general (sp : ℕ) [Fintype (Fin sp)]
     (dgp_env : DGPWithEnvironment 1)
-    (h_gen : dgp_env.trueGeneticEffect = fun p => 2 * p)
-    (h_env : dgp_env.environmentalEffect = fun c => 3 * (c ⟨0, by norm_num⟩))
-    (h_confounding : ∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂dgp_env.to_dgp.jointMeasure ≠ 0)
+    (α γ : ℝ)
+    (h_gen : dgp_env.trueGeneticEffect = fun p => α * p)
+    (h_env : dgp_env.environmentalEffect = fun c => γ * (c ⟨0, by norm_num⟩))
+    (h_cross_nonzero : γ * (∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂dgp_env.to_dgp.jointMeasure) ≠ 0)
     (model : PhenotypeInformedGAM 1 1 sp)
     (h_opt : IsBayesOptimalInRawClass dgp_env.to_dgp model)
     (h_pgs_basis_linear : model.pgsBasis.B 1 = id ∧ model.pgsBasis.B 0 = fun _ => 1)
@@ -1710,42 +1606,39 @@ theorem prediction_causality_tradeoff_linear_case [Fact (p = 1)] (sp : ℕ) [Fin
     (hY_int : Integrable (fun pc => dgp_env.to_dgp.trueExpectation pc.1 pc.2) dgp_env.to_dgp.jointMeasure)
     (hYP_int : Integrable (fun pc => dgp_env.to_dgp.trueExpectation pc.1 pc.2 * pc.1) dgp_env.to_dgp.jointMeasure)
     (h_resid_sq_int : Integrable (fun pc => (dgp_env.to_dgp.trueExpectation pc.1 pc.2 - (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1))^2) dgp_env.to_dgp.jointMeasure) :
-    model.γₘ₀ ⟨0, by norm_num⟩ ≠ 2 := by
-  -- The true DGP is Y = 2P + 3C.
-  have h_Y_def : dgp_env.to_dgp.trueExpectation = fun p c => 2 * p + 3 * c ⟨0, by norm_num⟩ := by
+    model.γₘ₀ ⟨0, by norm_num⟩ ≠ α := by
+  have h_Y_def : dgp_env.to_dgp.trueExpectation = fun p c => α * p + γ * c ⟨0, by norm_num⟩ := by
     rw [dgp_env.is_additive_causal, h_gen, h_env]
 
-  -- Step 1: Use optimality to get the normal equations.
   let model_1_1_sp := model
   have h_orth := rawOptimal_implies_orthogonality_gen model_1_1_sp dgp_env.to_dgp h_opt h_pgs_basis_linear.1 hY_int hP_int hP2_int hYP_int h_resid_sq_int
   set a := model.γ₀₀ with ha_def
   set b := model.γₘ₀ ⟨0, by norm_num⟩ with hb_def
-  obtain ⟨h_orth_1, h_orth_P⟩ := h_orth
+  obtain ⟨_, h_orth_P⟩ := h_orth
 
-  -- Step 2: Use the normal equations to solve for the coefficient `b`.
   have hb : b = ∫ pc, dgp_env.to_dgp.trueExpectation pc.1 pc.2 * pc.1 ∂dgp_env.to_dgp.jointMeasure := by
     exact optimal_slope_eq_covariance_of_normalized_p dgp_env.to_dgp.jointMeasure (fun pc => dgp_env.to_dgp.trueExpectation pc.1 pc.2) a b hY_int hP_int hYP_int hP2_int hP0 hP2 h_orth_P
 
-  -- Step 3: Calculate E[Y*P] for this DGP.
-  -- E[Y*P] = E[(2P + 3C)P] = 2*E[P^2] + 3*E[PC] = 2 + 3*E[PC].
-  have h_E_YP : ∫ pc, dgp_env.to_dgp.trueExpectation pc.1 pc.2 * pc.1 ∂dgp_env.to_dgp.jointMeasure = 2 + 3 * ∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂dgp_env.to_dgp.jointMeasure := by
+  have h_E_YP :
+      ∫ pc, dgp_env.to_dgp.trueExpectation pc.1 pc.2 * pc.1 ∂dgp_env.to_dgp.jointMeasure
+        = α + γ * ∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂dgp_env.to_dgp.jointMeasure := by
     rw [h_Y_def]
-    have h_expand: (fun (pc : ℝ × (Fin 1 → ℝ)) => (2 * pc.1 + 3 * pc.2 ⟨0, by norm_num⟩) * pc.1) = (fun (pc : ℝ × (Fin 1 → ℝ)) => 2 * pc.1^2 + 3 * (pc.1 * pc.2 ⟨0, by norm_num⟩)) := by
-      funext pc; ring
+    have h_expand :
+        (fun (pc : ℝ × (Fin 1 → ℝ)) => (α * pc.1 + γ * pc.2 ⟨0, by norm_num⟩) * pc.1)
+          = (fun (pc : ℝ × (Fin 1 → ℝ)) => α * pc.1^2 + γ * (pc.1 * pc.2 ⟨0, by norm_num⟩)) := by
+      funext pc
+      ring
     rw [h_expand]
-    have h2P2_int := hP2_int.const_mul 2
-    have h3PC_int := hPC_int.const_mul 3
-    rw [integral_add h2P2_int h3PC_int, integral_const_mul, integral_const_mul, hP2]
+    have hαP2_int := hP2_int.const_mul α
+    have hγPC_int := hPC_int.const_mul γ
+    rw [integral_add hαP2_int hγPC_int, integral_const_mul, integral_const_mul, hP2]
     ring
 
-  -- Step 4: Combine the results to show b ≠ 2.
-  -- We have b = E[YP] = 2 + 3*E[PC]. The goal is b ≠ 2, which is true iff E[PC] ≠ 0.
-  intro h_b_eq_2
-  rw [hb, h_E_YP] at h_b_eq_2
-  have h_E_PC_zero : ∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂dgp_env.to_dgp.jointMeasure = 0 := by
+  intro h_b_eq_α
+  rw [hb, h_E_YP] at h_b_eq_α
+  have h_cross_zero : γ * (∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂dgp_env.to_dgp.jointMeasure) = 0 := by
     linarith
-  -- This contradicts the `h_confounding` hypothesis.
-  exact h_confounding h_E_PC_zero
+  exact h_cross_nonzero h_cross_zero
 
 def total_params (p k sp : ℕ) : ℕ := 1 + p + k*sp + p*k*sp
 
@@ -3846,42 +3739,6 @@ lemma risk_affine_additive
     _ = a^2 + (1 - b)^2 + β^2 * (∫ pc, (pc.2 ⟨0, by norm_num⟩)^2 ∂μ) := by
       rw [hu]; ring
 
-/-- Corollary: Risk formula for Scenario 4 (β = -0.8).
-    This is just `risk_affine_additive` with β = -0.8. -/
-lemma risk_affine_scenario4
-    (μ : Measure (ℝ × (Fin 1 → ℝ))) [IsProbabilityMeasure μ]
-    (h_indep : μ = (μ.map Prod.fst).prod (μ.map Prod.snd))
-    (hP0 : ∫ pc, pc.1 ∂μ = 0)
-    (hC0 : ∫ pc, pc.2 ⟨0, by norm_num⟩ ∂μ = 0)
-    (hP2 : ∫ pc, pc.1^2 ∂μ = 1)
-    (hP_int : Integrable (fun pc => pc.1) μ)
-    (hC_int : Integrable (fun pc => pc.2 ⟨0, by norm_num⟩) μ)
-    (hP2_int : Integrable (fun pc => pc.1^2) μ)
-    (hC2_int : Integrable (fun pc => (pc.2 ⟨0, by norm_num⟩)^2) μ)
-    (hPC_int : Integrable (fun pc => pc.1 * pc.2 ⟨0, by norm_num⟩) μ)
-    (a b : ℝ) :
-    ∫ pc, (pc.1 - 0.8 * pc.2 ⟨0, by norm_num⟩ - (a + b * pc.1))^2 ∂μ =
-      a^2 + (1 - b)^2 + 0.64 * (∫ pc, (pc.2 ⟨0, by norm_num⟩)^2 ∂μ) := by
-  -- p - 0.8*c = p + (-0.8)*c, so this is risk_affine_additive with β = -0.8
-  have hPC0 : ∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂μ = 0 :=
-    integral_mul_fst_snd_eq_zero μ h_indep hP0 hC0
-
-  -- Rewrite to match risk_affine_additive form
-  have h_rewrite : ∀ pc : ℝ × (Fin 1 → ℝ),
-      (pc.1 - 0.8 * pc.2 ⟨0, by norm_num⟩ - (a + b * pc.1)) =
-      (pc.1 + (-0.8) * pc.2 ⟨0, by norm_num⟩ - (a + b * pc.1)) := by
-    intro pc; ring
-
-  simp_rw [h_rewrite]
-
-  -- Apply the general lemma
-  have h_gen := risk_affine_additive μ h_indep hP0 hC0 hPC0 hP2 hP_int hC_int hP2_int hC2_int hPC_int (-0.8) a b
-
-  -- Simplify (-0.8)² = 0.64
-  simp only [neg_mul] at h_gen ⊢
-  convert h_gen using 2
-  ring
-
 /-- **Lemma D**: Uniqueness of minimizer for Scenario 4 risk.
     The affine risk a² + (1-b)² + const is uniquely minimized at a=0, b=1. -/
 lemma affine_risk_minimizer (a b : ℝ) (const : ℝ) (_hconst : const ≥ 0) :
@@ -3930,52 +3787,6 @@ lemma optimal_raw_affine_coefficients
   rw [integral_const_mul]
   ring
 
-/-! ### Main Theorem: Raw Score Bias in Scenario 4 -/
-
-/-- **Raw Score Bias Theorem**: In Scenario 4 (neutral ancestry differences),
-/-- **Raw Score Bias Theorem**: In Scenario 4 (neutral ancestry differences),
-    using a raw score model (ignoring ancestry) produces prediction bias = -0.8 * c. -/
-theorem raw_score_bias_in_scenario4_simplified
-    (model_raw : PhenotypeInformedGAM 1 1 1) (h_raw_struct : IsRawScoreModel model_raw)
-    (h_pgs_basis_linear : model_raw.pgsBasis.B 1 = id ∧ model_raw.pgsBasis.B 0 = fun _ => 1)
-    (dgp4 : DataGeneratingProcess 1) (h_s4 : dgp4.trueExpectation = fun p c => p - (0.8 * c ⟨0, by norm_num⟩))
-    (h_opt_raw : IsBayesOptimalInRawClass dgp4 model_raw)
-    (h_indep : dgp4.jointMeasure = (dgp4.jointMeasure.map Prod.fst).prod (dgp4.jointMeasure.map Prod.snd))
-    (h_means_zero : ∫ pc, pc.1 ∂dgp4.jointMeasure = 0 ∧ ∫ pc, pc.2 ⟨0, by norm_num⟩ ∂dgp4.jointMeasure = 0)
-    (h_var_p_one : ∫ pc, pc.1^2 ∂dgp4.jointMeasure = 1)
-    -- Integrability hypotheses
-    (hP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1) dgp4.jointMeasure)
-    (hC_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.2 ⟨0, by norm_num⟩) dgp4.jointMeasure)
-    (hP2_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1 ^ 2) dgp4.jointMeasure)
-    (hPC_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.2 ⟨0, by norm_num⟩ * pc.1) dgp4.jointMeasure)
-    (hY_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => dgp4.trueExpectation pc.1 pc.2) dgp4.jointMeasure)
-    (hYP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => dgp4.trueExpectation pc.1 pc.2 * pc.1) dgp4.jointMeasure)
-    (h_resid_sq_int : Integrable (fun pc => (dgp4.trueExpectation pc.1 pc.2 - (model_raw.γ₀₀ + model_raw.γₘ₀ ⟨0, by norm_num⟩ * pc.1))^2) dgp4.jointMeasure) :
-  ∀ (p_val : ℝ) (c_val : Fin 1 → ℝ),
-    predictionBias dgp4 (fun p _ => linearPredictor model_raw p c_val) p_val c_val = -0.8 * c_val ⟨0, by norm_num⟩ := by
-  intros p_val c_val
-  
-  -- 1. Raw model structure implies linear form: a + b*p
-  have h_pred_form : ∀ p c, linearPredictor model_raw p c = 
-      (model_raw.γ₀₀) + (model_raw.γₘ₀ 0) * p := by
-    apply linearPredictor_eq_affine_of_raw model_raw h_raw_struct h_pgs_basis_linear
-  
-  -- 2. Optimality implies coefficients minimize the risk.
-  have h_dgp_add : dgp4.trueExpectation = fun p c => p + (-0.8) * c ⟨0, by norm_num⟩ := by
-    simp only [h_s4]
-    funext p c
-    ring
-
-  have h_coeffs : model_raw.γ₀₀ = 0 ∧ model_raw.γₘ₀ 0 = 1 := by
-    exact optimal_coefficients_for_additive_dgp model_raw (-0.8) dgp4 h_dgp_add h_opt_raw h_pgs_basis_linear h_indep h_means_zero.1 h_means_zero.2 h_var_p_one hP_int hC_int hP2_int hPC_int hY_int hYP_int h_resid_sq_int
-
-  rw [h_s4]
-  dsimp
-  rw [h_pred_form p_val c_val]
-  rw [h_coeffs.1, h_coeffs.2]
-  simp
-  ring
-
 /-! ### Generalized Raw Score Bias (L² Projection Approach)
 
 The following theorem generalizes the above to any β_env, using the L² projection framework.
@@ -4019,7 +3830,7 @@ theorem raw_score_bias_general [Fact (p = 1)]
   -- 1. Model form is a + b*p.
   have h_pred_form : ∀ p c, linearPredictor model_raw p c = 
       (model_raw.γ₀₀) + (model_raw.γₘ₀ 0) * p := by
-    apply linearPredictor_eq_affine_of_raw model_raw h_raw_struct h_pgs_basis_linear
+    exact linearPredictor_eq_affine_of_raw_gen model_raw h_raw_struct h_pgs_basis_linear.1
 
   -- 2. Optimal coefficients are a=0, b=1 via L2 projection.
   have h_coeffs : model_raw.γ₀₀ = 0 ∧ model_raw.γₘ₀ 0 = 1 := by
@@ -4032,8 +3843,8 @@ theorem raw_score_bias_general [Fact (p = 1)]
   rw [h_pred_form p_val c_val]
   rw [h_coeffs.1, h_coeffs.2]
   simp
-  ring
 
+/-!
 The previous definition `approxEq a b 0.01` with a hardcoded tolerance was mathematically
 problematic: you cannot prove |a - b| < 0.01 from generic hypotheses.
 
@@ -6034,7 +5845,7 @@ lemma sigmoid_strictConcaveOn_Ici : StrictConcaveOn ℝ (Set.Ici 0) sigmoid := b
     · have h := sigmoid_gt_half hx
       linarith
 
-/-- **Jensen's Gap for Logistic Regression**
+/- **Jensen's Gap for Logistic Regression**
 
     For a random variable η with E[η] = μ and Var(η) = σ² > 0:
     - If μ > 0: E[sigmoid(η)] < sigmoid(μ)  (sigmoid is concave for x > 0)
@@ -6048,86 +5859,6 @@ lemma sigmoid_strictConcaveOn_Ici : StrictConcaveOn ℝ (Set.Ici 0) sigmoid := b
     A full proof requires:
     1. Proving sigmoid is strictly concave on (0, ∞) and convex on (-∞, 0)
     2. Measure-theoretic integration showing E[f(X)] < f(E[X]) for concave f -/
-theorem jensen_sigmoid_positive (μ : ℝ) (hμ : μ > 0) :
-    ∃ E_sigmoid : ℝ, E_sigmoid < sigmoid μ := by
-  -- Construct a 2-point distribution X with mean μ: P(X=0)=0.5, P(X=2μ)=0.5
-  -- E[sigmoid(X)] = 0.5 * sigmoid(0) + 0.5 * sigmoid(2μ)
-  let E_sigmoid := 0.5 * sigmoid 0 + 0.5 * sigmoid (2 * μ)
-  use E_sigmoid
-
-  -- Prove 0.5 * sigmoid(0) + 0.5 * sigmoid(2μ) < sigmoid(μ)
-  -- sigmoid(0) = 0.5, so term is 0.25
-  dsimp [E_sigmoid]
-  rw [sigmoid_zero]
-  norm_num
-
-  -- Let y = exp(-μ). Since μ > 0, we have 0 < y < 1.
-  let y := Real.exp (-μ)
-  have hy_pos : 0 < y := Real.exp_pos (-μ)
-  have hy_lt_one : y < 1 := by rw [Real.exp_lt_one_iff]; linarith
-
-  -- Express sigmoid values in terms of y
-  have h_sig_mu : sigmoid μ = 1 / (1 + y) := by unfold sigmoid; rfl
-  have h_sig_2mu : sigmoid (2 * μ) = 1 / (1 + y^2) := by
-    unfold sigmoid
-    have : Real.exp (-(2 * μ)) = y^2 := by
-      simp [y]
-      have : -(2 * μ) = -μ + -μ := by ring
-      rw [this, Real.exp_add, ← pow_two]
-    rw [this]
-
-  rw [h_sig_mu, h_sig_2mu]
-
-  -- Inequality: 1/4 + 1/(2(1+y^2)) < 1/(1+y)
-  -- Equivalent to (y-1)^3 < 0 which is true for y < 1
-  have h_poly : (y^2 + 3) * (1 + y) - 4 * (1 + y^2) = (y - 1)^3 := by ring
-  have h_cube_neg : (y - 1)^3 < 0 := by
-    have h_neg : y - 1 < 0 := by linarith
-    have : (y - 1)^3 = (y - 1) * (y - 1)^2 := by ring
-    rw [this]
-    apply mul_neg_of_neg_of_pos h_neg
-    apply pow_two_pos_of_ne_zero
-    linarith
-
-  rw [← h_poly] at h_cube_neg
-  field_simp
-  linarith
-
-theorem jensen_sigmoid_negative (μ : ℝ) (hμ : μ < 0) :
-    ∃ E_sigmoid : ℝ, E_sigmoid > sigmoid μ := by
-  -- Construct a 2-point distribution X with mean μ: P(X=0)=0.5, P(X=2μ)=0.5
-  let E_sigmoid := 0.5 * sigmoid 0 + 0.5 * sigmoid (2 * μ)
-  use E_sigmoid
-
-  dsimp [E_sigmoid]
-  rw [sigmoid_zero]
-  norm_num
-
-  -- Let y = exp(-μ). Since μ < 0, we have y > 1.
-  let y := Real.exp (-μ)
-  have hy_gt_one : 1 < y := by rw [Real.one_lt_exp_iff]; linarith
-
-  have h_sig_mu : sigmoid μ = 1 / (1 + y) := by unfold sigmoid; rfl
-  have h_sig_2mu : sigmoid (2 * μ) = 1 / (1 + y^2) := by
-    unfold sigmoid
-    have : Real.exp (-(2 * μ)) = y^2 := by
-      simp [y]
-      have : -(2 * μ) = -μ + -μ := by ring
-      rw [this, Real.exp_add, ← pow_two]
-    rw [this]
-
-  rw [h_sig_mu, h_sig_2mu]
-
-  -- Inequality: 1/4 + 1/(2(1+y^2)) > 1/(1+y)
-  -- Equivalent to (y-1)^3 > 0 which is true for y > 1
-  have h_poly : (y^2 + 3) * (1 + y) - 4 * (1 + y^2) = (y - 1)^3 := by ring
-  have h_cube_pos : 0 < (y - 1)^3 := pow_pos (by linarith) 3
-
-  rw [← h_poly] at h_cube_pos
-  field_simp
-  linarith
-
-
 /-- Calibration Shrinkage (Via Jensen's Inequality):
     The sigmoid function is strictly concave on (0, ∞).
     Therefore, for any random variable X with support in (0, ∞) (and non-degenerate),

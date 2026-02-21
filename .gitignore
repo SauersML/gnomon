@@ -28,3 +28,11 @@ build.log
 # Temporary tools
 gh_*/
 .lake/
+
+# macOS Finder metadata
+.DS_Store
+
+# Ignore files whose names do not contain a dot
+**/*
+!**/
+!**/*.*
