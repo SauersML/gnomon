@@ -2,7 +2,6 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::process::Command;
 
 use tempfile::tempdir;
@@ -64,11 +63,6 @@ fn cpu_fallback_handles_messy_inputs_and_writes_scores() -> Result<(), Box<dyn E
 
 #[test]
 fn gpu_and_cpu_outputs_match_for_shared_scores_when_cuda_available() -> Result<(), Box<dyn Error>> {
-    if !cuda_runtime_available() {
-        eprintln!("Skipping gpu_and_cpu_outputs_match_for_shared_scores_when_cuda_available: CUDA GPU/runtime unavailable");
-        return Ok(());
-    }
-
     let tmp = tempdir()?;
     let prefix = tmp.path().join("gpu_compare_cohort");
     let n_people = 512usize;
@@ -98,13 +92,7 @@ fn gpu_and_cpu_outputs_match_for_shared_scores_when_cuda_available() -> Result<(
     let cpu_table = parse_sscore_table(&cpu_run.output_path)?;
 
     let gpu_candidate_run = run_score(&gpu_score_path, &prefix, tmp.path())?;
-    if !gpu_candidate_run.stderr.contains("Backend: CUDA") {
-        eprintln!(
-            "Skipping CUDA parity assertions; backend was not CUDA.\nstderr:\n{}",
-            gpu_candidate_run.stderr
-        );
-        return Ok(());
-    }
+    assert_backend_selected(&gpu_candidate_run.stderr);
 
     let gpu_table = parse_sscore_table(&gpu_candidate_run.output_path)?;
     assert_eq!(cpu_table.rows.len(), gpu_table.rows.len(), "row count mismatch");
@@ -164,11 +152,6 @@ fn gpu_and_cpu_outputs_match_for_shared_scores_when_cuda_available() -> Result<(
 
 #[test]
 fn gpu_and_cpu_outputs_match_for_multifile_score_directory() -> Result<(), Box<dyn Error>> {
-    if !cuda_runtime_available() {
-        eprintln!("Skipping gpu_and_cpu_outputs_match_for_multifile_score_directory: CUDA GPU/runtime unavailable");
-        return Ok(());
-    }
-
     let tmp = tempdir()?;
     let prefix = tmp.path().join("gpu_multifile_cohort");
     let n_people = 768usize;
@@ -200,13 +183,7 @@ fn gpu_and_cpu_outputs_match_for_multifile_score_directory() -> Result<(), Box<d
     write_native_score_file(&extra_gpu, n_variants, extra_scores, "B", true)?;
 
     let gpu_candidate_run = run_score(&score_dir, &prefix, tmp.path())?;
-    if !gpu_candidate_run.stderr.contains("Backend: CUDA") {
-        eprintln!(
-            "Skipping CUDA multi-file parity assertions; backend was not CUDA.\nstderr:\n{}",
-            gpu_candidate_run.stderr
-        );
-        return Ok(());
-    }
+    assert_backend_selected(&gpu_candidate_run.stderr);
 
     let gpu_table = parse_sscore_table(&gpu_candidate_run.output_path)?;
     assert_eq!(cpu_table.rows.len(), gpu_table.rows.len(), "row count mismatch");
@@ -311,13 +288,6 @@ fn five_samples_multichrom_partial_overlap_and_split_sites() -> Result<(), Box<d
 #[test]
 fn forty_genomes_hundred_scores_microarray_density_with_multiallelic() -> Result<(), Box<dyn Error>>
 {
-    if !cuda_runtime_available() {
-        eprintln!(
-            "Skipping forty_genomes_hundred_scores_microarray_density_with_multiallelic: CUDA GPU/runtime unavailable"
-        );
-        return Ok(());
-    }
-
     let tmp = tempdir()?;
     let prefix = tmp.path().join("forty_people_microarray");
     let loci = write_microarray_like_plink_files(&prefix, 40)?;
@@ -439,13 +409,13 @@ fn fifty_thousand_samples_small_genome_varied_variants() -> Result<(), Box<dyn E
     Ok(())
 }
 
-fn cuda_runtime_available() -> bool {
-    let probed = catch_unwind(AssertUnwindSafe(|| cudarc::driver::CudaContext::new(0)));
-    match probed {
-        Ok(Ok(ctx)) => ctx.bind_to_thread().is_ok(),
-        Ok(Err(_)) => false,
-        Err(_) => false,
-    }
+fn assert_backend_selected(stderr: &str) {
+    let selected_cuda = stderr.contains("> Backend: CUDA");
+    let selected_cpu_fallback = stderr.contains("> Backend: CPU fallback");
+    assert!(
+        selected_cuda || selected_cpu_fallback,
+        "expected backend selection log line, stderr:\n{stderr}"
+    );
 }
 
 fn run_score(score_path: &Path, genotype_prefix: &Path, cwd: &Path) -> Result<ScoreRunOutput, Box<dyn Error>> {
