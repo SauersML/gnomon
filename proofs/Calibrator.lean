@@ -6146,7 +6146,7 @@ theorem laml_gradient_is_exact
       rust_direct_gradient_fn S_basis X W beta_hat log_lik rho i +
       rust_correction_fn S_basis X W beta_hat grad_op rho i) :
   deriv (fun r => LAML_fn log_lik S_basis X W beta_hat (Function.update rho i r)) (rho i) =
-  rust_direct_gradient_fn S_basis X W beta_hat log_lik rho i + 
+  rust_direct_gradient_fn S_basis X W beta_hat log_lik rho i +
   rust_correction_fn S_basis X W beta_hat grad_op rho i :=
 by
   let g : ℝ → (Fin k → ℝ) := Function.update rho i
