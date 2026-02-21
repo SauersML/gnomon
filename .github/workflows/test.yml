@@ -134,13 +134,13 @@ jobs:
       # -------------------- PREWARM EVERYTHING (so artifacts are complete) --------------------
       - name: Cargo fetch (prepopulate deps cache)
         if: needs.detect_changes.outputs.rust == 'true'
-        run: cargo +nightly-2025-12-13 fetch
+        run: cargo +nightly fetch
 
       - name: "Prebuild debug (lib/bin/tests, no-run)"
         if: needs.detect_changes.outputs.rust == 'true'
         run: |
-          cargo +nightly-2025-12-13 build
-          cargo +nightly-2025-12-13 test --no-run
+          cargo +nightly build
+          cargo +nightly test --no-run
 
       - name: Install cargo-nextest
         if: needs.detect_changes.outputs.rust == 'true'
@@ -150,7 +150,7 @@ jobs:
       - name: "Prebuild release tests (nextest no-run)"
         if: needs.detect_changes.outputs.rust == 'true'
         run: |
-          cargo +nightly-2025-12-13 nextest run --profile ci --release --no-run
+          cargo +nightly nextest run --profile ci --release --no-run
 
       - name: Upload debug test build artifacts for full test runs
         if: needs.detect_changes.outputs.rust == 'true'
@@ -164,9 +164,9 @@ jobs:
       - name: Inspect Assembly for Performance Analysis
         if: needs.detect_changes.outputs.rust == 'false'
         run: |
-          cargo +nightly-2025-12-13 install cargo-show-asm --features disasm
+          cargo +nightly install cargo-show-asm --features disasm
           echo "--- Building test harness for inspection ---"
-          cargo +nightly-2025-12-13 test --release --no-run
+          cargo +nightly test --release --no-run
           TEST_HARNESS_PATH=$(find target/release/deps -name "gnomon-*" -type f -executable -print -quit)
           if [[ -z "$TEST_HARNESS_PATH" ]]; then
             echo "::error::Could not find compiled test harness."
@@ -178,13 +178,13 @@ jobs:
           echo "---"
           # `score::batch` now lives under the `score` module, so keep the inspected symbol
           # aligned with the library's public path to avoid false CI failures.
-          cargo +nightly-2025-12-13 asm -C lto=off --profile profiling --lib --intel gnomon::score::batch::process_tile 0
+          cargo +nightly asm -C lto=off --profile profiling --lib --intel gnomon::score::batch::process_tile 0
 
       - name: Build Gnomon binaries (Release and Profiling)
         if: needs.detect_changes.outputs.rust == 'true'
         run: |
-          cargo +nightly-2025-12-13 build --release
-          cargo +nightly-2025-12-13 build --profile profiling
+          cargo +nightly build --release
+          cargo +nightly build --profile profiling
       # ----------------------------------------------------------------------------------------
 
       # -------------------- EXPORT: GATHER ONLY ESSENTIAL METADATA --------------------
@@ -212,10 +212,10 @@ jobs:
             echo "deps_hash=${{ steps.cache_meta.outputs.deps_hash }}"
             echo ""
             echo "--- rustc ---"
-            (rustc +nightly-2025-12-13 -Vv || true)
+            (rustc +nightly -Vv || true)
             echo ""
             echo "--- cargo ---"
-            (cargo +nightly-2025-12-13 -Vv || true)
+            (cargo +nightly -Vv || true)
             echo ""
             echo "--- host uname ---"
             (uname -a || true)
@@ -356,7 +356,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo +nightly-2025-12-13 nextest run --profile ci --release \
+          cargo +nightly nextest run --profile ci --release \
             --filter-expr "${{ matrix.filter_expr }}" \
             2>&1 | tee cargo-test.log
 
@@ -385,7 +385,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo +nightly-2025-12-13 nextest run --profile ci
+          cargo +nightly nextest run --profile ci
 
   python_test_integration:
     needs: build_and_test
@@ -618,7 +618,7 @@ jobs:
 
           if [ -z "$BIN_PATH" ]; then
             echo "Profiling binary missing from artifact; rebuilding with cargo."
-            cargo +nightly-2025-12-13 build --profile profiling
+            cargo +nightly build --profile profiling
             BIN_PATH=$(find_profiling_binary)
           fi
 

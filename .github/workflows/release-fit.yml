@@ -41,13 +41,13 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
         with:
-          toolchain: nightly-2025-12-13
+          toolchain: nightly
 
       - name: Rebuild gnomon (release, native cpu)
         run: |
           set -euxo pipefail
           cargo clean
-          RUSTFLAGS="-C target-cpu=native" cargo +nightly-2025-12-13 build --release --bin gnomon
+          RUSTFLAGS="-C target-cpu=native" cargo +nightly build --release --bin gnomon
 
       - name: Timed gnomon fit run (no --ld)
         run: |
@@ -102,13 +102,13 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
         with:
-          toolchain: nightly-2025-12-13
+          toolchain: nightly
 
       - name: Rebuild gnomon (release, native cpu)
         run: |
           set -euxo pipefail
           cargo clean
-          RUSTFLAGS="-C target-cpu=native" cargo +nightly-2025-12-13 build --release --bin gnomon
+          RUSTFLAGS="-C target-cpu=native" cargo +nightly build --release --bin gnomon
 
       - name: Timed gnomon fit run (--ld)
         run: |
