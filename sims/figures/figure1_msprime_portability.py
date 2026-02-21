@@ -30,28 +30,20 @@ try:
         ensure_pgs003725,
         load_pgs003725_effects,
         diploid_index_pairs,
-        sample_site_ids_for_maf,
         sample_two_site_sets_for_maf,
-        pcs_from_sites,
         compute_pcs_risk_and_diagnostics,
-        genetic_risk_from_real_pgs_effect_distribution,
         solve_intercept_for_prevalence,
         get_chr22_recomb_map,
-        summarize_true_effect_site_diagnostics,
     )
 except ImportError:
     from common import (
     ensure_pgs003725,
     load_pgs003725_effects,
     diploid_index_pairs,
-    sample_site_ids_for_maf,
     sample_two_site_sets_for_maf,
-    pcs_from_sites,
     compute_pcs_risk_and_diagnostics,
-    genetic_risk_from_real_pgs_effect_distribution,
     solve_intercept_for_prevalence,
     get_chr22_recomb_map,
-    summarize_true_effect_site_diagnostics,
     )
 from methods.raw_pgs import RawPGSMethod
 from methods.linear_interaction import LinearInteractionMethod
@@ -422,7 +414,6 @@ def _prepare_bayesr_files(
     subprocess.run([plink, "--bfile", prefix, "--keep", str(test_keep), "--make-bed", *common, "--out", str(work_dir / "test")], check=True)
 
     train_df = df[df["IID"].isin(train_ids)].copy()
-    test_df = df[df["IID"].isin(test_ids)].copy()
 
     pd.DataFrame({
         "FID": [iid_to_fid[i] for i in train_df["IID"].astype(str)],

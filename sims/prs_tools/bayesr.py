@@ -6,7 +6,6 @@ import os
 import shutil
 from pathlib import Path
 import pandas as pd
-import numpy as np
 
 class BayesR:
     def __init__(self, gctb_path="gctb", threads: int | None = None, plink_memory_mb: int | None = None):

@@ -146,17 +146,3 @@ def run_plink_conversion(
                 f"REQUIRED: Failed to update .bim file with genetic map: {e}. "
                 f"Genetic positions are critical for LD-aware methods."
             )
-
-def write_phenotype_file(df, out_path: str) -> None:
-    """
-    Write phenotype file for GCTB/PLINK.
-    Format: FID IID pheno
-    """
-    # Create FID/IID/Pheno dataframe
-    # Assuming individual_id is IID, and we use family_id=individual_id (or 0)
-    pheno_df = df[['individual_id', 'individual_id', 'y']].copy()
-    pheno_df.columns = ['FID', 'IID', 'pheno']
-    
-    # GCTB often expects no header, space separated
-    pheno_df.to_csv(out_path, sep=' ', index=False, header=False)
-    print(f"Written phenotype file: {out_path}")

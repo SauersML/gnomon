@@ -23,7 +23,6 @@ class LinearInteractionMethod(PGSMethod):
         Features: [P, PC₁, PC₂, ..., P×PC₁, P×PC₂, ...]
         """
         P = P.reshape(-1, 1)
-        n_pcs = PC.shape[1]
         
         # Interaction terms: P × each PC
         interactions = P * PC

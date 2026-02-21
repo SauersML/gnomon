@@ -16,7 +16,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import stdpopsim
-import tskit
 try:
     import numba as nb
 except Exception:
@@ -38,28 +37,20 @@ try:
         ensure_pgs003725,
         load_pgs003725_effects,
         diploid_index_pairs,
-        sample_site_ids_for_maf,
         sample_two_site_sets_for_maf,
-        pcs_from_sites,
         compute_pcs_risk_and_diagnostics,
-        genetic_risk_from_real_pgs_effect_distribution,
         solve_intercept_for_prevalence,
         pop_names_from_ts,
-        summarize_true_effect_site_diagnostics,
     )
 except ImportError:
     from common import (
     ensure_pgs003725,
     load_pgs003725_effects,
     diploid_index_pairs,
-    sample_site_ids_for_maf,
     sample_two_site_sets_for_maf,
-    pcs_from_sites,
     compute_pcs_risk_and_diagnostics,
-    genetic_risk_from_real_pgs_effect_distribution,
     solve_intercept_for_prevalence,
     pop_names_from_ts,
-    summarize_true_effect_site_diagnostics,
     )
 from methods.raw_pgs import RawPGSMethod
 from methods.linear_interaction import LinearInteractionMethod
