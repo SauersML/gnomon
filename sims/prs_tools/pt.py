@@ -24,7 +24,6 @@ class PPlusT:
         prune_window_kb: int = 200,
         prune_step: int = 50,
         prune_r2: float = 0.2,
-        fallback_top_k: int = 5000,
         min_selected_snps: int = 50,
         min_prs_sd: float = 1e-8,
     ):
@@ -47,7 +46,6 @@ class PPlusT:
         self.prune_window_kb = int(prune_window_kb)
         self.prune_step = int(prune_step)
         self.prune_r2 = float(prune_r2)
-        self.fallback_top_k = int(fallback_top_k)
         self.min_selected_snps = int(min_selected_snps)
         self.min_prs_sd = float(min_prs_sd)
 
@@ -156,6 +154,18 @@ class PPlusT:
                 "P+T requires a covariate file with PCs for GWAS effect-size estimation. "
                 f"Missing covar_file={covar_file}"
             )
+        pheno = self._read_binary_pheno(pheno_file)
+        y_all = pheno["y"].to_numpy(dtype=float)
+        y_all = y_all[np.isfinite(y_all)]
+        y_int = y_all.astype(int)
+        uniq = np.unique(y_int)
+        counts = {int(k): int(np.sum(y_int == int(k))) for k in uniq.tolist()}
+        print(f"[P+T] phenotype class counts (from {pheno_file}): {counts}")
+        if uniq.size < 2:
+            raise RuntimeError(
+                "P+T training phenotype has only one class; cannot run GWAS. "
+                f"classes={uniq.tolist()} counts={counts} pheno_file={pheno_file}"
+            )
 
         prune_prefix = f"{out_prefix}.prune"
         keep_ids: set[str] | None = None
@@ -198,6 +208,10 @@ class PPlusT:
             bfile_train,
             "--pheno",
             pheno_file,
+            # Our train.phen encodes binary phenotype as 0/1.
+            # Tell PLINK2 to interpret 0 as valid case/control coding
+            # rather than missing phenotype.
+            "--1",
             "--glm",
             "hide-covar",
             "--allow-no-sex",
@@ -206,86 +220,49 @@ class PPlusT:
             glm_prefix,
         ]
         glm_cmd.extend(["--covar", str(covar_file)])
-        fallback_weights: pd.DataFrame | None = None
-        try:
-            self._run(glm_cmd, "GWAS")
-            glm_files = sorted(Path(".").glob(f"{Path(glm_prefix).name}*.glm.*"))
-            if not glm_files:
-                glm_files = sorted(Path(Path(glm_prefix).parent).glob(f"{Path(glm_prefix).name}*.glm.*"))
-            if not glm_files:
-                raise RuntimeError(f"P+T GWAS output not found for prefix={glm_prefix}")
-            glm_path = str(glm_files[0])
-            print(f"[P+T] using GWAS results: {glm_path}")
+        self._run(glm_cmd, "GWAS")
+        glm_files = sorted(Path(".").glob(f"{Path(glm_prefix).name}*.glm.*"))
+        if not glm_files:
+            glm_files = sorted(Path(Path(glm_prefix).parent).glob(f"{Path(glm_prefix).name}*.glm.*"))
+        if not glm_files:
+            raise RuntimeError(f"P+T GWAS output not found for prefix={glm_prefix}")
+        glm_path = str(glm_files[0])
+        print(f"[P+T] using GWAS results: {glm_path}")
 
-            gwas = pd.read_csv(glm_path, sep=r"\s+")
-            if "TEST" in gwas.columns:
-                gwas = gwas[gwas["TEST"].astype(str) == "ADD"].copy()
-            if "P" not in gwas.columns or "ID" not in gwas.columns or "A1" not in gwas.columns:
-                raise RuntimeError(f"P+T GWAS file missing required columns (ID/A1/P): {glm_path}")
-            if "BETA" in gwas.columns:
-                eff = pd.to_numeric(gwas["BETA"], errors="coerce")
-            elif "OR" in gwas.columns:
-                orv = pd.to_numeric(gwas["OR"], errors="coerce")
-                eff = np.log(orv.where(orv > 0))
-            else:
-                raise RuntimeError(f"P+T GWAS file missing BETA/OR effect column: {glm_path}")
+        gwas = pd.read_csv(glm_path, sep=r"\s+")
+        if "TEST" in gwas.columns:
+            gwas = gwas[gwas["TEST"].astype(str) == "ADD"].copy()
+        if "P" not in gwas.columns or "ID" not in gwas.columns or "A1" not in gwas.columns:
+            raise RuntimeError(f"P+T GWAS file missing required columns (ID/A1/P): {glm_path}")
+        if "BETA" in gwas.columns:
+            eff = pd.to_numeric(gwas["BETA"], errors="coerce")
+        elif "OR" in gwas.columns:
+            orv = pd.to_numeric(gwas["OR"], errors="coerce")
+            eff = np.log(orv.where(orv > 0))
+        else:
+            raise RuntimeError(f"P+T GWAS file missing BETA/OR effect column: {glm_path}")
 
-            gwas = pd.DataFrame(
-                {
-                    "ID": gwas["ID"].astype(str),
-                    "A1": gwas["A1"].astype(str),
-                    "P": pd.to_numeric(gwas["P"], errors="coerce"),
-                    "EFF": eff,
-                }
-            ).dropna(subset=["P", "EFF"])
-        except RuntimeError as e:
-            msg = str(e).lower()
-            if "all samples for --glm phenotype" not in msg:
-                raise
-            print("[P+T] GWAS skipped (phenotype has one class in training); using deterministic fallback weights")
-            bim = pd.read_csv(
-                f"{bfile_train}.bim",
-                sep=r"\s+",
-                header=None,
-                names=["CHR", "ID", "CM", "POS", "A1", "A2"],
-                dtype={"ID": str, "A1": str},
-            )
-            # If LD-pruned IDs are not available yet, use all BIM variants.
-            if keep_ids is not None:
-                bim = bim[bim["ID"].isin(keep_ids)].copy()
-            if bim.empty:
-                raise RuntimeError("P+T fallback failed: no variants available in training .bim")
-            bim = bim.head(max(1, self.fallback_top_k)).copy()
-            signs = np.where((np.arange(len(bim)) % 2) == 0, 1.0, -1.0)
-            fallback_weights = pd.DataFrame(
-                {
-                    "ID": bim["ID"].astype(str),
-                    "A1": bim["A1"].astype(str),
-                    "EFF": signs * 1e-6,
-                }
-            )
+        gwas = pd.DataFrame(
+            {
+                "ID": gwas["ID"].astype(str),
+                "A1": gwas["A1"].astype(str),
+                "P": pd.to_numeric(gwas["P"], errors="coerce"),
+                "EFF": eff,
+            }
+        ).dropna(subset=["P", "EFF"])
 
         if keep_ids is None:
             prune_in = Path(f"{prune_prefix}.prune.in")
             if not prune_in.exists():
                 raise RuntimeError(f"P+T missing prune list: {prune_in}")
             keep_ids = set(x.strip() for x in prune_in.read_text(encoding="utf-8", errors="replace").splitlines() if x.strip())
-        if fallback_weights is None:
-            gwas = gwas[gwas["ID"].isin(keep_ids)].copy()
-            gwas = gwas.sort_values("P")
-        else:
-            gwas = None
-
-        pheno = self._read_binary_pheno(pheno_file)
+        gwas = gwas[gwas["ID"].isin(keep_ids)].copy()
+        gwas = gwas.sort_values("P")
         thresholds = sorted(set(float(x) for x in self.p_thresholds))
         records: list[dict[str, object]] = []
         train_scores_by_thr: dict[float, pd.DataFrame] = {}
 
-        if fallback_weights is None:
-            all_w = gwas[["ID", "A1", "EFF", "P"]].copy()
-        else:
-            all_w = fallback_weights.copy()
-            all_w["P"] = 0.0
+        all_w = gwas[["ID", "A1", "EFF", "P"]].copy()
 
         # Single score file + single p-value file, then compute all thresholds with q-score-range in one PLINK pass.
         score_file_all = f"{out_prefix}.all.score"
@@ -363,12 +340,12 @@ class PPlusT:
         best_idx = metrics_rank.sort_values(["train_auc", "train_balanced_accuracy", "train_accuracy", "n_snps"], ascending=[False, False, False, False]).index[0]
         if not np.isfinite(float(metrics_rank.loc[best_idx, "train_auc"])):
             # If all thresholds were filtered, fall back to non-degenerate highest-AUC model.
-            fallback = metrics.copy()
-            fallback.loc[fallback["is_degenerate"].astype(bool), ["train_accuracy", "train_balanced_accuracy", "train_auc"]] = -np.inf
-            fallback["train_accuracy"] = fallback["train_accuracy"].fillna(-np.inf)
-            fallback["train_balanced_accuracy"] = fallback["train_balanced_accuracy"].fillna(-np.inf)
-            fallback["train_auc"] = fallback["train_auc"].fillna(-np.inf)
-            best_idx = fallback.sort_values(["train_auc", "train_balanced_accuracy", "train_accuracy", "n_snps"], ascending=[False, False, False, False]).index[0]
+            rerank = metrics.copy()
+            rerank.loc[rerank["is_degenerate"].astype(bool), ["train_accuracy", "train_balanced_accuracy", "train_auc"]] = -np.inf
+            rerank["train_accuracy"] = rerank["train_accuracy"].fillna(-np.inf)
+            rerank["train_balanced_accuracy"] = rerank["train_balanced_accuracy"].fillna(-np.inf)
+            rerank["train_auc"] = rerank["train_auc"].fillna(-np.inf)
+            best_idx = rerank.sort_values(["train_auc", "train_balanced_accuracy", "train_accuracy", "n_snps"], ascending=[False, False, False, False]).index[0]
         best_thr = float(metrics.loc[best_idx, "p_threshold"])
         print(
             f"[P+T] selected best threshold={best_thr:g} "
@@ -382,12 +359,9 @@ class PPlusT:
         )
 
         best_train_scores = train_scores_by_thr[best_thr]
-        if fallback_weights is None:
-            best_w = all_w[all_w["P"] <= best_thr].copy()
-            if best_w.empty:
-                best_w = all_w.nsmallest(1, "P").copy()
-        else:
-            best_w = all_w.copy()
+        best_w = all_w[all_w["P"] <= best_thr].copy()
+        if best_w.empty:
+            best_w = all_w.nsmallest(1, "P").copy()
         best_score_file = f"{out_prefix}.best.score"
         best_w[["ID", "A1", "EFF"]].to_csv(best_score_file, sep="\t", header=False, index=False)
         test_out = f"{out_prefix}.best.test"
