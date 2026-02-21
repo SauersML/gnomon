@@ -63,6 +63,13 @@ fn cpu_fallback_handles_messy_inputs_and_writes_scores() -> Result<(), Box<dyn E
 
 #[test]
 fn gpu_and_cpu_outputs_match_for_shared_scores_when_cuda_available() -> Result<(), Box<dyn Error>> {
+    if !cuda_driver_present() {
+        eprintln!(
+            "Skipping gpu_and_cpu_outputs_match_for_shared_scores_when_cuda_available: no CUDA driver detected"
+        );
+        return Ok(());
+    }
+
     let tmp = tempdir()?;
     let prefix = tmp.path().join("gpu_compare_cohort");
     let n_people = 512usize;
@@ -152,6 +159,13 @@ fn gpu_and_cpu_outputs_match_for_shared_scores_when_cuda_available() -> Result<(
 
 #[test]
 fn gpu_and_cpu_outputs_match_for_multifile_score_directory() -> Result<(), Box<dyn Error>> {
+    if !cuda_driver_present() {
+        eprintln!(
+            "Skipping gpu_and_cpu_outputs_match_for_multifile_score_directory: no CUDA driver detected"
+        );
+        return Ok(());
+    }
+
     let tmp = tempdir()?;
     let prefix = tmp.path().join("gpu_multifile_cohort");
     let n_people = 768usize;
@@ -288,6 +302,13 @@ fn five_samples_multichrom_partial_overlap_and_split_sites() -> Result<(), Box<d
 #[test]
 fn forty_genomes_hundred_scores_microarray_density_with_multiallelic() -> Result<(), Box<dyn Error>>
 {
+    if !cuda_driver_present() {
+        eprintln!(
+            "Skipping forty_genomes_hundred_scores_microarray_density_with_multiallelic: no CUDA driver detected"
+        );
+        return Ok(());
+    }
+
     let tmp = tempdir()?;
     let prefix = tmp.path().join("forty_people_microarray");
     let loci = write_microarray_like_plink_files(&prefix, 40)?;
@@ -416,6 +437,18 @@ fn assert_backend_selected(stderr: &str) {
         selected_cuda || selected_cpu_fallback,
         "expected backend selection log line, stderr:\n{stderr}"
     );
+}
+
+fn cuda_driver_present() -> bool {
+    if std::path::Path::new("/dev/nvidiactl").exists() {
+        return true;
+    }
+    let probe = Command::new("nvidia-smi")
+        .arg("-L")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    probe
 }
 
 fn run_score(score_path: &Path, genotype_prefix: &Path, cwd: &Path) -> Result<ScoreRunOutput, Box<dyn Error>> {
