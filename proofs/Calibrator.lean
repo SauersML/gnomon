@@ -57,6 +57,9 @@ import Mathlib.Algebra.Polynomial.Eval.Defs
 import Mathlib.Algebra.Polynomial.Roots
 import Mathlib.Analysis.Calculus.Deriv.Mul
 import Mathlib.Analysis.Calculus.Deriv.Add
+import Mathlib.Analysis.Calculus.Deriv.Pi
+import Mathlib.Analysis.Calculus.Deriv.Comp
+import Mathlib.Logic.Function.Basic
 
 open scoped InnerProductSpace
 open InnerProductSpace
@@ -6036,13 +6039,30 @@ theorem laml_gradient_is_exact
     (W : Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin n) (Fin n) ℝ)
     (beta_hat : (Fin k → ℝ) → Matrix (Fin p) (Fin 1) ℝ)
     (grad_op : (Matrix (Fin p) (Fin 1) ℝ → ℝ) → Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin p) (Fin 1) ℝ)
-    (rho : Fin k → ℝ) (i : Fin k) :
+    (rho : Fin k → ℝ) (i : Fin k)
+    (D : (Fin k → ℝ) →L[ℝ] ℝ)
+    (hF : HasFDerivAt (fun r => LAML_fn log_lik S_basis X W beta_hat r) D rho)
+    (h_split : D (Pi.single i 1) =
+      rust_direct_gradient_fn S_basis X W beta_hat log_lik rho i +
+      rust_correction_fn S_basis X W beta_hat grad_op rho i) :
   deriv (fun r => LAML_fn log_lik S_basis X W beta_hat (Function.update rho i r)) (rho i) =
   rust_direct_gradient_fn S_basis X W beta_hat log_lik rho i + 
   rust_correction_fn S_basis X W beta_hat grad_op rho i :=
 by
-  -- Verification follows from multivariable chain rule application.
-  sorry
+  let g : ℝ → (Fin k → ℝ) := Function.update rho i
+  have hg : HasDerivAt g (Pi.single i 1) (rho i) := by
+    simpa [g] using (hasDerivAt_update rho i (rho i))
+  have h_update : g (rho i) = rho := by
+    simpa [g] using (Function.update_eq_self i rho)
+  have hF_at_update : HasFDerivAt (fun r => LAML_fn log_lik S_basis X W beta_hat r) D (g (rho i)) := by
+    simpa [h_update] using hF
+  have hcomp : HasDerivAt (fun r => LAML_fn log_lik S_basis X W beta_hat (g r))
+      (D (Pi.single i 1)) (rho i) := by
+    exact hF_at_update.comp_hasDerivAt (rho i) hg
+  have h_deriv :
+      deriv (fun r => LAML_fn log_lik S_basis X W beta_hat (g r)) (rho i) =
+      D (Pi.single i 1) := hcomp.deriv
+  simpa [g, h_split] using h_deriv
 
 end GradientDescentVerification
 
