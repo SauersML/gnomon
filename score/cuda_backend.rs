@@ -21,6 +21,7 @@ use std::env;
 use std::fs::{self, File};
 use std::io::{BufWriter, IsTerminal, Write};
 use std::num::NonZeroUsize;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
@@ -324,7 +325,7 @@ pub fn try_run_cuda(
         return Ok(None);
     }
 
-    let runtime = match CudaRuntime::new(prep) {
+    let runtime = match init_cuda_runtime_safely(prep) {
         Ok(runtime) => {
             eprintln!("> Backend: CUDA");
             runtime
@@ -341,6 +342,26 @@ pub fn try_run_cuda(
     };
 
     Ok(Some(result))
+}
+
+fn init_cuda_runtime_safely(prep: &PreparationResult) -> Result<CudaRuntime, String> {
+    match catch_unwind(AssertUnwindSafe(|| CudaRuntime::new(prep))) {
+        Ok(runtime) => runtime,
+        Err(payload) => Err(format!(
+            "CUDA runtime initialization panicked ({})",
+            panic_payload_to_string(payload)
+        )),
+    }
+}
+
+fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(msg) = payload.downcast_ref::<&str>() {
+        return (*msg).to_string();
+    }
+    if let Some(msg) = payload.downcast_ref::<String>() {
+        return msg.clone();
+    }
+    "unknown panic payload".to_string()
 }
 
 impl CudaRuntime {
