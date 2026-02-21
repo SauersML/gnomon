@@ -379,25 +379,84 @@ impl CudaRuntime {
         let (free_mem, _) = cudarc::driver::result::mem_get_info()
             .map_err(|e| format!("Failed to query device memory: {e:?}"))?;
 
-        let count_weights_len = prep.num_reconciled_variants * prep.stride();
-        let static_bytes = prep.weights_matrix().len() * std::mem::size_of::<f32>()
-            + prep.flip_mask_matrix().len() * std::mem::size_of::<u8>()
-            + count_weights_len * std::mem::size_of::<u8>()
-            + prep.output_idx_to_fam_idx.len() * std::mem::size_of::<u32>();
+        let count_weights_len = prep
+            .num_reconciled_variants
+            .checked_mul(prep.stride())
+            .ok_or_else(|| "CUDA memory estimate overflow: count_weights_len".to_string())?;
+        let static_bytes = prep
+            .weights_matrix()
+            .len()
+            .checked_mul(std::mem::size_of::<f32>())
+            .and_then(|v| {
+                v.checked_add(
+                    prep.flip_mask_matrix()
+                        .len()
+                        .checked_mul(std::mem::size_of::<u8>())?,
+                )
+            })
+            .and_then(|v| v.checked_add(count_weights_len.checked_mul(std::mem::size_of::<u8>())?))
+            .and_then(|v| {
+                v.checked_add(
+                    prep.output_idx_to_fam_idx
+                        .len()
+                        .checked_mul(std::mem::size_of::<u32>())?,
+                )
+            })
+            .ok_or_else(|| "CUDA memory estimate overflow: static device allocations".to_string())?;
 
-        let result_size = prep.num_people_to_score * prep.score_names.len();
-        let constant_batch_bytes = result_size * std::mem::size_of::<f32>() * 3;
+        let num_people = prep.num_people_to_score;
+        let num_scores = prep.score_names.len();
+        let result_size = num_people
+            .checked_mul(num_scores)
+            .ok_or_else(|| "CUDA memory estimate overflow: result_size".to_string())?;
+        let bytes_per_variant = prep.bytes_per_variant as usize;
+
+        let estimate_required_bytes = |mega: usize| -> Option<usize> {
+            let slot_packed = PIPELINE_SLOTS.checked_mul(mega.checked_mul(bytes_per_variant)?)?;
+            let slot_reconciled =
+                PIPELINE_SLOTS.checked_mul(mega.checked_mul(std::mem::size_of::<u32>())?)?;
+            let slot_outputs = PIPELINE_SLOTS
+                .checked_mul(3)?
+                .checked_mul(result_size.checked_mul(std::mem::size_of::<f32>())?)?;
+
+            let d_dosage = num_people
+                .checked_mul(mega)?
+                .checked_mul(std::mem::size_of::<f32>())?;
+            let d_missing = num_people
+                .checked_mul(mega)?
+                .checked_mul(std::mem::size_of::<f32>())?;
+            let d_w_eff = mega
+                .checked_mul(num_scores)?
+                .checked_mul(std::mem::size_of::<f32>())?;
+            let d_w_corr = mega
+                .checked_mul(num_scores)?
+                .checked_mul(std::mem::size_of::<f32>())?;
+            let d_count_w = mega
+                .checked_mul(num_scores)?
+                .checked_mul(std::mem::size_of::<f32>())?;
+
+            let d_final_scores = result_size.checked_mul(std::mem::size_of::<f64>())?;
+            let d_final_counts = result_size.checked_mul(std::mem::size_of::<f64>())?;
+
+            static_bytes
+                .checked_add(slot_packed)?
+                .checked_add(slot_reconciled)?
+                .checked_add(slot_outputs)?
+                .checked_add(d_dosage)?
+                .checked_add(d_missing)?
+                .checked_add(d_w_eff)?
+                .checked_add(d_w_corr)?
+                .checked_add(d_count_w)?
+                .checked_add(d_final_scores)?
+                .checked_add(d_final_counts)
+        };
 
         let mut mega = MAX_MEGA_BATCH_VARIANTS;
         let budget = (free_mem as f64 * 0.8) as usize;
         while mega > MIN_MEGA_BATCH_VARIANTS {
-            let per_variant_bytes = prep.bytes_per_variant as usize
-                + prep.num_people_to_score * std::mem::size_of::<f32>() * 2
-                + prep.score_names.len() * std::mem::size_of::<f32>() * 3;
-            let required = static_bytes
-                + constant_batch_bytes
-                + per_variant_bytes * mega
-                + mega * prep.bytes_per_variant as usize;
+            let required = estimate_required_bytes(mega).ok_or_else(|| {
+                format!("CUDA memory estimate overflow while evaluating mega-batch={mega}")
+            })?;
             if required <= budget {
                 break;
             }
@@ -799,10 +858,10 @@ fn start_pipeline_support(
         let done_for_logs = Arc::clone(&progress_done);
         let counter_for_logs = Arc::clone(&variants_processed_count);
         Some(thread::spawn(move || {
-            let mut last_reported = u64::MAX;
+            let mut last_reported: Option<u64> = None;
             while !done_for_logs.load(Ordering::Relaxed) {
                 let processed = counter_for_logs.load(Ordering::Relaxed);
-                if processed != last_reported {
+                if last_reported != Some(processed) {
                     let pct = if total_variants == 0 {
                         100.0
                     } else {
@@ -812,7 +871,7 @@ fn start_pipeline_support(
                         "> CUDA progress: {}/{} ({pct:.1}%)",
                         processed, total_variants
                     );
-                    last_reported = processed;
+                    last_reported = Some(processed);
                 }
                 thread::sleep(Duration::from_secs(2));
             }
@@ -1054,8 +1113,6 @@ fn process_dense_stream_cuda(
                     "Failed to upload reconciled variant indices",
                 ))?;
         }
-        drop(guards);
-
         let copy_done_event = runtime
             .copy_stream
             .record_event(None)
@@ -1063,6 +1120,8 @@ fn process_dense_stream_cuda(
         slot_last_copy_done[slot] = Some(runtime.copy_stream.record_event(None).map_err(
             map_driver_err("Failed to record slot copy completion event"),
         )?);
+        drop(guards);
+
         let current = PendingBatch {
             slot,
             shape,

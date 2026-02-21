@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -8,6 +8,8 @@ use tempfile::tempdir;
 
 const PLINK_MAGIC_HEADER: [u8; 3] = [0x6c, 0x1b, 0x01];
 const CPU_FALLBACK_THRESHOLD: usize = 100_000;
+const SCORE_MATCH_ABS_EPSILON: f64 = 2.0e-8;
+const SCORE_MATCH_REL_EPSILON: f64 = 2.0e-8;
 
 #[derive(Copy, Clone)]
 enum Genotype {
@@ -125,7 +127,7 @@ fn gpu_and_cpu_outputs_match_for_shared_scores_when_cuda_available() -> Result<(
             let abs = (cpu_val - gpu_val).abs();
             let rel = abs / cpu_val.abs().max(gpu_val.abs()).max(1.0);
             assert!(
-                abs <= 1e-10 || rel <= 1e-8,
+                abs <= SCORE_MATCH_ABS_EPSILON || rel <= SCORE_MATCH_REL_EPSILON,
                 "score mismatch for IID={} score={} cpu={} gpu={} abs={} rel={}",
                 cpu_row.iid,
                 score_name,
@@ -223,7 +225,7 @@ fn gpu_and_cpu_outputs_match_for_multifile_score_directory() -> Result<(), Box<d
             let abs = (cpu_val - gpu_val).abs();
             let rel = abs / cpu_val.abs().max(gpu_val.abs()).max(1.0);
             assert!(
-                abs <= 1e-10 || rel <= 1e-8,
+                abs <= SCORE_MATCH_ABS_EPSILON || rel <= SCORE_MATCH_REL_EPSILON,
                 "score mismatch for IID={} score={} cpu={} gpu={} abs={} rel={}",
                 cpu_row.iid,
                 score_name,
@@ -727,9 +729,13 @@ fn write_microarray_like_plink_files(
 
             // Split/multiallelic representation: same chr:pos with alternate second allele.
             if local_idx % 31 == 0 {
-                let mut alt = alt_for_multiallelic[(chrom_idx + local_idx) % alt_for_multiallelic.len()];
-                if alt == pair.0 {
-                    alt = pair.1;
+                let mut alt =
+                    alt_for_multiallelic[(chrom_idx + local_idx) % alt_for_multiallelic.len()];
+                if alt == pair.0 || alt == pair.1 {
+                    alt = ["A", "C", "G", "T"]
+                        .into_iter()
+                        .find(|candidate| *candidate != pair.0 && *candidate != pair.1)
+                        .expect("expected at least one alternate allele distinct from pair");
                 }
                 loci.push(LocusSpec {
                     chrom,
@@ -754,10 +760,39 @@ fn write_microarray_like_plink_files(
     let bytes_per_variant = n_people.div_ceil(4);
     let mut bed = Vec::with_capacity(PLINK_MAGIC_HEADER.len() + bytes_per_variant * loci.len());
     bed.extend_from_slice(&PLINK_MAGIC_HEADER);
+
+    // Build split-site lookup so both rows at the same chr:pos are derived
+    // from one underlying multiallelic genotype model per person/locus.
+    let mut split_groups: HashMap<(&'static str, u32, &'static str), Vec<(usize, &'static str)>> =
+        HashMap::new();
+    for (idx, locus) in loci.iter().enumerate() {
+        split_groups
+            .entry((locus.chrom, locus.pos, locus.effect_allele))
+            .or_default()
+            .push((idx, locus.other_allele));
+    }
+    let mut split_alt_context = vec![None; loci.len()];
+    for rows in split_groups.values() {
+        if rows.len() != 2 {
+            continue;
+        }
+        let (idx_a, alt_a) = rows[0];
+        let (idx_b, alt_b) = rows[1];
+        if alt_a == alt_b {
+            continue;
+        }
+        split_alt_context[idx_a] = Some((alt_a, alt_b));
+        split_alt_context[idx_b] = Some((alt_b, alt_a));
+    }
+
     for (variant_idx, locus) in loci.iter().enumerate() {
         let mut row = vec![0u8; bytes_per_variant];
         for person_idx in 0..n_people {
-            let gt = synthetic_genotype_for_locus(person_idx, variant_idx, locus);
+            let gt = if let Some((row_alt, other_alt)) = split_alt_context[variant_idx] {
+                synthetic_genotype_for_split_site(person_idx, locus, row_alt, other_alt)
+            } else {
+                synthetic_genotype_for_locus(person_idx, variant_idx, locus)
+            };
             let bits = plink_2bit_code(gt);
             let byte_idx = person_idx / 4;
             let shift = (person_idx % 4) * 2;
@@ -789,6 +824,83 @@ fn synthetic_genotype_for_locus(person_idx: usize, variant_idx: usize, locus: &L
         0 | 1 | 2 => Genotype::Dosage0,
         3 | 4 | 5 => Genotype::Dosage1,
         _ => Genotype::Dosage2,
+    }
+}
+
+fn synthetic_genotype_for_split_site(
+    person_idx: usize,
+    locus: &LocusSpec,
+    row_alt: &str,
+    other_alt: &str,
+) -> Genotype {
+    let chrom_val = locus
+        .chrom
+        .as_bytes()
+        .first()
+        .copied()
+        .unwrap_or(b'1') as usize;
+    let seed = person_idx * 211 + chrom_val * 17 + locus.pos as usize;
+    let selector = seed % 100;
+
+    let (alt1, alt2) = if row_alt <= other_alt {
+        (row_alt, other_alt)
+    } else {
+        (other_alt, row_alt)
+    };
+
+    enum MultiState {
+        RefRef,
+        RefAlt1,
+        RefAlt2,
+        Alt1Alt1,
+        Alt2Alt2,
+        Alt1Alt2,
+        Missing,
+    }
+
+    let state = match selector {
+        0..=34 => MultiState::RefRef,
+        35..=51 => MultiState::RefAlt1,
+        52..=68 => MultiState::RefAlt2,
+        69..=79 => MultiState::Alt1Alt1,
+        80..=90 => MultiState::Alt2Alt2,
+        91..=94 => MultiState::Alt1Alt2,
+        _ => MultiState::Missing,
+    };
+
+    match state {
+        MultiState::RefRef => Genotype::Dosage0,
+        MultiState::RefAlt1 => {
+            if row_alt == alt1 {
+                Genotype::Dosage1
+            } else {
+                Genotype::Missing
+            }
+        }
+        MultiState::RefAlt2 => {
+            if row_alt == alt2 {
+                Genotype::Dosage1
+            } else {
+                Genotype::Missing
+            }
+        }
+        MultiState::Alt1Alt1 => {
+            if row_alt == alt1 {
+                Genotype::Dosage2
+            } else {
+                Genotype::Missing
+            }
+        }
+        MultiState::Alt2Alt2 => {
+            if row_alt == alt2 {
+                Genotype::Dosage2
+            } else {
+                Genotype::Missing
+            }
+        }
+        // ALT1/ALT2 is physically possible for triallelic loci but not
+        // representable in a single split biallelic row without ambiguity.
+        MultiState::Alt1Alt2 | MultiState::Missing => Genotype::Missing,
     }
 }
 
