@@ -4580,7 +4580,86 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   ∀ (i : Fin n),
       linearPredictor model (data.p i) (data.c i) =
       linearPredictor model_prime (data'.p i) (data'.c i) := by
-  sorry
+  let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
+  let model := fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
+  -- We need the exact proof term for model_prime to match
+  let X_temp := designMatrix data pgsBasis splineBasis
+  let X'_temp := designMatrix data' pgsBasis splineBasis
+  have h_rank_eq : X_temp.rank = X'_temp.rank := rank_eq_of_range_eq X_temp X'_temp h_range_eq
+  let h_rank_prime : X'_temp.rank = Fintype.card (ParamIx p k sp) := h_rank_eq ▸ h_rank
+  let model_prime := fit p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank_prime
+
+  intro i
+  let X := designMatrix data pgsBasis splineBasis
+  let X' := designMatrix data' pgsBasis splineBasis
+  have h_pred : linearPredictor model (data.p i) (data.c i) = (X.mulVec (packParams model)) i := by
+    rw [linearPredictor_eq_designMatrix_mulVec data pgsBasis splineBasis model (unpackParams_in_class _ _ _)]
+    apply unpackParams_in_class
+  have h_pred' : linearPredictor model_prime (data'.p i) (data'.c i) = (X'.mulVec (packParams model_prime)) i := by
+    rw [linearPredictor_eq_designMatrix_mulVec data' pgsBasis splineBasis model_prime (unpackParams_in_class _ _ _)]
+    apply unpackParams_in_class
+  let y_pred := X.mulVec (packParams model)
+  let y_pred' := X'.mulVec (packParams model_prime)
+  let K := LinearMap.range (Matrix.toLin' X)
+  let K' := LinearMap.range (Matrix.toLin' X')
+  have h_min : ∀ m : PhenotypeInformedGAM p k sp, InModelClass m pgsBasis splineBasis →
+      empiricalLoss model data lambda ≤ empiricalLoss m data lambda :=
+    fit_minimizes_loss p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
+  have h_min' : ∀ m : PhenotypeInformedGAM p k sp, InModelClass m pgsBasis splineBasis →
+      empiricalLoss model_prime data' lambda ≤ empiricalLoss m data' lambda :=
+    fit_minimizes_loss p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank_prime
+  have h_loss_eq : ∀ m : PhenotypeInformedGAM p k sp, InModelClass m pgsBasis splineBasis →
+      empiricalLoss m data 0 = (1 / n) * l2norm_sq (data.y - X.mulVec (packParams m)) := by
+    intro m hm
+    unfold empiricalLoss
+    simp only [h_lambda_zero, add_zero, zero_mul]
+    rw [linearPredictor_eq_designMatrix_mulVec data pgsBasis splineBasis m hm]
+    simp [pointwiseNLL, hm.dist_gaussian, l2norm_sq, Pi.sub_apply]
+    congr 1; ext j; simp
+  have h_loss_eq' : ∀ m : PhenotypeInformedGAM p k sp, InModelClass m pgsBasis splineBasis →
+      empiricalLoss m data' 0 = (1 / n) * l2norm_sq (data.y - X'.mulVec (packParams m)) := by
+    intro m hm
+    unfold empiricalLoss
+    simp only [h_lambda_zero, add_zero, zero_mul]
+    rw [linearPredictor_eq_designMatrix_mulVec data' pgsBasis splineBasis m hm]
+    simp [pointwiseNLL, hm.dist_gaussian, l2norm_sq, Pi.sub_apply]
+    congr 1; ext j; simp
+  have h_proj : y_pred = orthogonalProjection K data.y := by
+    apply orthogonalProjection_eq_of_dist_le
+    · rw [LinearMap.mem_range]; use packParams model; rw [Matrix.toLin'_apply]
+    · intro w hw
+      rw [LinearMap.mem_range] at hw
+      obtain ⟨beta_w, h_beta_w⟩ := hw
+      rw [Matrix.toLin'_apply] at h_beta_w
+      let m_w := unpackParams pgsBasis splineBasis beta_w
+      have hm_w : InModelClass m_w pgsBasis splineBasis := unpackParams_in_class _ _ _
+      specialize h_min m_w hm_w
+      rw [h_lambda_zero, h_loss_eq model (unpackParams_in_class _ _ _), h_loss_eq m_w hm_w] at h_min
+      have hn_pos : (0 : ℝ) < (1 / n) := one_div_pos.mpr (Nat.cast_pos.mpr h_n_pos)
+      rw [mul_le_mul_left hn_pos] at h_min
+      have h_pw : X.mulVec (packParams m_w) = w := by
+        simp [packParams, unpackParams]
+        exact h_beta_w
+      rw [h_pw] at h_min; exact h_min
+  have h_proj' : y_pred' = orthogonalProjection K' data.y := by
+    apply orthogonalProjection_eq_of_dist_le
+    · rw [LinearMap.mem_range]; use packParams model_prime; rw [Matrix.toLin'_apply]
+    · intro w hw
+      rw [LinearMap.mem_range] at hw
+      obtain ⟨beta_w, h_beta_w⟩ := hw
+      rw [Matrix.toLin'_apply] at h_beta_w
+      let m_w := unpackParams pgsBasis splineBasis beta_w
+      have hm_w : InModelClass m_w pgsBasis splineBasis := unpackParams_in_class _ _ _
+      specialize h_min' m_w hm_w
+      rw [h_lambda_zero, h_loss_eq' model_prime (unpackParams_in_class _ _ _), h_loss_eq' m_w hm_w] at h_min'
+      have hn_pos : (0 : ℝ) < (1 / n) := one_div_pos.mpr (Nat.cast_pos.mpr h_n_pos)
+      rw [mul_le_mul_left hn_pos] at h_min'
+      have h_pw : X'.mulVec (packParams m_w) = w := by
+        simp [packParams, unpackParams]; exact h_beta_w
+      rw [h_pw] at h_min'; exact h_min'
+  rw [h_range_eq] at h_proj
+  rw [h_proj, h_proj'] at h_pred
+  rw [h_pred, h_pred']
 
 noncomputable def dist_to_support {k : ℕ} (c : Fin k → ℝ) (supp : Set (Fin k → ℝ)) : ℝ :=
   Metric.infDist c supp
@@ -6305,12 +6384,25 @@ theorem laml_gradient_is_exact
     (W : Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin n) (Fin n) ℝ)
     (beta_hat : (Fin k → ℝ) → Matrix (Fin p) (Fin 1) ℝ)
     (grad_op : (Matrix (Fin p) (Fin 1) ℝ → ℝ) → Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin p) (Fin 1) ℝ)
-    (rho : Fin k → ℝ) (i : Fin k) :
+    (rho : Fin k → ℝ) (i : Fin k)
+    (h_opt : ∀ r, fderiv ℝ (fun b => L_pen_fn log_lik S_basis r b) (beta_hat r) = 0)
+    (h_beta_deriv : deriv (fun r => beta_hat (Function.update rho i r)) (rho i) = rust_delta_fn S_basis X W beta_hat rho i)
+    (h_grad_op : ∀ (f : Matrix (Fin p) (Fin 1) ℝ → ℝ) (x v : Matrix (Fin p) (Fin 1) ℝ),
+      fderiv ℝ f x v = trace ((grad_op f x).transpose * v)) :
   deriv (fun r => LAML_fn log_lik S_basis X W beta_hat (Function.update rho i r)) (rho i) =
   rust_direct_gradient_fn S_basis X W beta_hat log_lik rho i + 
   rust_correction_fn S_basis X W beta_hat grad_op rho i :=
 by
   -- Verification follows from multivariable chain rule application.
+  -- 1. Decompose LAML_fn into L_pen_fn + 0.5*log|H| - 0.5*log|S|
+  -- 2. Use chain rule on L_pen_fn: partial_rho + partial_beta * dbeta/drho
+  --    h_opt implies partial_beta = 0, so only partial_rho remains.
+  --    partial_rho matches first term of rust_direct_gradient_fn.
+  -- 3. Use derivative_log_det_H_matrix for log|S| term.
+  --    Matches third term of rust_direct_gradient_fn.
+  -- 4. Use chain rule on log|H|: partial_rho + partial_beta * dbeta/drho
+  --    partial_rho matches second term of rust_direct_gradient_fn.
+  --    partial_beta * dbeta/drho matches rust_correction_fn (via h_beta_deriv and h_grad_op).
   sorry
 
 end GradientDescentVerification
