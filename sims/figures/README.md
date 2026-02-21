@@ -12,12 +12,6 @@ Compatibility wrappers are kept at:
 - `/Users/user/gnomon/sims/figure1_msprime_portability.py`
 - `/Users/user/gnomon/sims/figure2_stdpopsim_confounding.py`
 
-## Local-scale sample sizes
-
-All sizes are reduced by 100 for local execution:
-- Figure 1: AFR=100, OoA_train=100, OoA_test=100
-- Figure 2: EUR_train=120, EUR_test=30, AFR_test=30, ASIA_test=30, ADMIX_test=30
-
 ## Run
 
 From repo root:
@@ -26,6 +20,12 @@ From repo root:
 python3 /Users/user/gnomon/sims/figure1_msprime_portability.py --out /Users/user/gnomon/sims/results_figure1_local
 python3 /Users/user/gnomon/sims/figure2_stdpopsim_confounding.py --out /Users/user/gnomon/sims/results_figure2_local
 ```
+
+## Cohort Sizes
+
+All sizes are reduced by 100 for local execution:
+- Figure 1: AFR=100, OoA_train=100, OoA_test=100
+- Figure 2: EUR_train=120, EUR_test=30, AFR_test=30, ASIA_test=30, ADMIX_test=30
 
 ## HPC Orchestrator
 
