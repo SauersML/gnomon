@@ -1457,11 +1457,11 @@ fn standardize_column_simd_impl_lanes2(values: &mut [f64], mean: f64, inv: f64) 
         let lane = Simd::<f64, 2>::from_array(*chunk);
         let lane_values = lane.to_array();
         let mut result = [0.0; 2];
-        for i in 0..2 {
-            let raw = lane_values[i];
-            if raw.is_finite() {
-                result[i] = (raw - mean) * inv;
-            }
+        if lane_values[0].is_finite() {
+            result[0] = (lane_values[0] - mean) * inv;
+        }
+        if lane_values[1].is_finite() {
+            result[1] = (lane_values[1] - mean) * inv;
         }
         *chunk = result;
     }
@@ -1483,11 +1483,17 @@ fn standardize_column_simd_impl_lanes4(values: &mut [f64], mean: f64, inv: f64) 
         let lane = Simd::<f64, 4>::from_array(*chunk);
         let lane_values = lane.to_array();
         let mut result = [0.0; 4];
-        for i in 0..4 {
-            let raw = lane_values[i];
-            if raw.is_finite() {
-                result[i] = (raw - mean) * inv;
-            }
+        if lane_values[0].is_finite() {
+            result[0] = (lane_values[0] - mean) * inv;
+        }
+        if lane_values[1].is_finite() {
+            result[1] = (lane_values[1] - mean) * inv;
+        }
+        if lane_values[2].is_finite() {
+            result[2] = (lane_values[2] - mean) * inv;
+        }
+        if lane_values[3].is_finite() {
+            result[3] = (lane_values[3] - mean) * inv;
         }
         *chunk = result;
     }
@@ -1599,12 +1605,13 @@ fn standardize_column_with_mask_simd_impl_lanes2(
         let lane_values = lane.to_array();
         let mut result = [0.0; 2];
         let mut mask_values = [0.0; 2];
-        for i in 0..2 {
-            let raw = lane_values[i];
-            if raw.is_finite() {
-                result[i] = (raw - mean) * inv;
-                mask_values[i] = 1.0;
-            }
+        if lane_values[0].is_finite() {
+            result[0] = (lane_values[0] - mean) * inv;
+            mask_values[0] = 1.0;
+        }
+        if lane_values[1].is_finite() {
+            result[1] = (lane_values[1] - mean) * inv;
+            mask_values[1] = 1.0;
         }
         *value_chunk = result;
         *mask_chunk = mask_values;
@@ -1640,12 +1647,21 @@ fn standardize_column_with_mask_simd_impl_lanes4(
         let lane_values = lane.to_array();
         let mut result = [0.0; 4];
         let mut mask_values = [0.0; 4];
-        for i in 0..4 {
-            let raw = lane_values[i];
-            if raw.is_finite() {
-                result[i] = (raw - mean) * inv;
-                mask_values[i] = 1.0;
-            }
+        if lane_values[0].is_finite() {
+            result[0] = (lane_values[0] - mean) * inv;
+            mask_values[0] = 1.0;
+        }
+        if lane_values[1].is_finite() {
+            result[1] = (lane_values[1] - mean) * inv;
+            mask_values[1] = 1.0;
+        }
+        if lane_values[2].is_finite() {
+            result[2] = (lane_values[2] - mean) * inv;
+            mask_values[2] = 1.0;
+        }
+        if lane_values[3].is_finite() {
+            result[3] = (lane_values[3] - mean) * inv;
+            mask_values[3] = 1.0;
         }
         *value_chunk = result;
         *mask_chunk = mask_values;
@@ -1798,11 +1814,13 @@ fn sum_and_count_finite_impl_lanes2(values: &[f64]) -> (f64, usize) {
     for chunk in chunks {
         let lane = Simd::<f64, 2>::from_array(*chunk);
         let lane_values = lane.to_array();
-        for &value in &lane_values {
-            if value.is_finite() {
-                sum += value;
-                count += 1;
-            }
+        if lane_values[0].is_finite() {
+            sum += lane_values[0];
+            count += 1;
+        }
+        if lane_values[1].is_finite() {
+            sum += lane_values[1];
+            count += 1;
         }
     }
 
@@ -1825,11 +1843,21 @@ fn sum_and_count_finite_impl_lanes4(values: &[f64]) -> (f64, usize) {
     for chunk in chunks {
         let lane = Simd::<f64, 4>::from_array(*chunk);
         let lane_values = lane.to_array();
-        for &value in &lane_values {
-            if value.is_finite() {
-                sum += value;
-                count += 1;
-            }
+        if lane_values[0].is_finite() {
+            sum += lane_values[0];
+            count += 1;
+        }
+        if lane_values[1].is_finite() {
+            sum += lane_values[1];
+            count += 1;
+        }
+        if lane_values[2].is_finite() {
+            sum += lane_values[2];
+            count += 1;
+        }
+        if lane_values[3].is_finite() {
+            sum += lane_values[3];
+            count += 1;
         }
     }
 

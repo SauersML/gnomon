@@ -172,7 +172,8 @@ pub fn accumulate_adjustments_for_person(
                     .get_simd_lane_unchecked(matrix_row_idx, i)
                     .cast::<f32>();
                 let sign = one - (two * flip_vec);
-                let adj = sign * (two * weights_vec);
+                let signed_weights = sign * weights_vec;
+                let adj = signed_weights + signed_weights;
                 *accumulator_buffer.get_unchecked_mut(i) += adj;
             }
         }

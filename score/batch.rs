@@ -19,7 +19,7 @@ use crate::score::types::{
 };
 use crossbeam_queue::ArrayQueue;
 use std::error::Error;
-use std::simd::{Simd, num::SimdUint};
+use std::simd::{Simd, cmp::SimdPartialEq, num::SimdUint};
 
 // --- SIMD & Engine Tuning Parameters ---
 const SIMD_LANES: usize = 8;
@@ -325,28 +325,28 @@ pub(crate) fn process_tile_impl<'a>(
             let chunks = dosage_bytes.chunks_exact(32);
             let remainder_start = chunks.len() * 32;
             let mut base_idx = 0usize;
+            let zero_vec = std::simd::Simd::<u8, 32>::splat(0);
 
             for chunk in chunks {
                 // Load 32 bytes into a SIMD vector
                 let vec: std::simd::Simd<u8, 32> = std::simd::Simd::from_slice(chunk);
 
                 // Fast path: if entire chunk is zeros, skip it (common case)
-                let zero_vec = std::simd::Simd::<u8, 32>::splat(0);
                 if vec == zero_vec {
                     base_idx += 32;
                     continue;
                 }
 
-                // Single nonzero mask - 3x faster on ARM than computing 3 separate masks.
-                // We load each byte individually to distinguish 1/2/3.
+                // Process only nonzero lanes using a compact bitmask walk.
+                let nonzero_mask = vec.simd_ne(zero_vec).to_bitmask();
                 let chunk_vals = vec.to_array();
-                for (bit_idx, dosage) in chunk_vals.iter().copied().enumerate() {
-                    if dosage == 0 {
-                        continue;
-                    }
+                let mut m = nonzero_mask;
+                while m != 0 {
+                    let bit_idx = m.trailing_zeros() as usize;
+                    m &= m - 1; // clear lowest set bit
                     let i = base_idx + bit_idx;
 
-                    match dosage {
+                    match chunk_vals[bit_idx] {
                         1 => {
                             g1_indices[g1_count] = i as u16;
                             g1_count += 1;
@@ -506,12 +506,12 @@ fn pivot_tile(
                 let term2 = (two_bit_genotypes & one) + one;
                 let initial_dosages = term1 * term2;
 
-                let two_bit_arr = two_bit_genotypes.to_array();
                 let mut dosage_arr = initial_dosages.to_array();
-                for (lane, value) in dosage_arr.iter_mut().enumerate() {
-                    if two_bit_arr[lane] == 1 {
-                        *value = 3;
-                    }
+                let mut missing_mask = two_bit_genotypes.simd_eq(U8xN::splat(1)).to_bitmask();
+                while missing_mask != 0 {
+                    let lane = missing_mask.trailing_zeros() as usize;
+                    missing_mask &= missing_mask - 1;
+                    dosage_arr[lane] = 3;
                 }
                 dosage_vectors[i] = U8xN::from_array(dosage_arr);
             }
