@@ -1861,6 +1861,16 @@ lemma unpack_pack_eq {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype
     cases hdist
     rfl
 
+lemma packParams_unpackParams_eq {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
+    (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp) (β : ParamVec p k sp) :
+    packParams (unpackParams pgsBasis splineBasis β) = β := by
+  funext j
+  cases j with
+  | intercept => rfl
+  | pgsCoeff m => rfl
+  | pcSpline l s => rfl
+  | interaction m l s => rfl
+
 lemma unpackParams_in_class {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
     (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp) (β : ParamVec p k sp) :
     InModelClass (unpackParams pgsBasis splineBasis β) pgsBasis splineBasis := by
@@ -4557,7 +4567,7 @@ lemma rank_eq_of_range_eq {n m : Type} [Fintype n] [Fintype m] [DecidableEq n] [
   change Module.finrank ℝ (LinearMap.range (Matrix.toLin' A)) = Module.finrank ℝ (LinearMap.range (Matrix.toLin' B))
   rw [h]
 
-theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ} [Fintype (Fin n)] [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)]
+theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
     (A : Matrix (Fin k) (Fin k) ℝ) (_hA : IsUnit A.det) (b : Fin k → ℝ)
     (data : RealizedData n k) (lambda : ℝ)
     (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp)
@@ -4580,7 +4590,156 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   ∀ (i : Fin n),
       linearPredictor model (data.p i) (data.c i) =
       linearPredictor model_prime (data'.p i) (data'.c i) := by
-  sorry
+  intro data_prime model model_prime idx
+  -- 1. Identify the range subspaces
+  let X := designMatrix data pgsBasis splineBasis
+  let X' := designMatrix data_prime pgsBasis splineBasis
+  let K := LinearMap.range (Matrix.toLin' X)
+  let K' := LinearMap.range (Matrix.toLin' X')
+  have hK_eq : K = K' := h_range_eq
+
+  -- 2. Identify the predictions as vectors in these ranges
+  let p_vec := X.mulVec (packParams model)
+  let p_vec' := X'.mulVec (packParams model_prime)
+
+  have h_pred_i : linearPredictor model (data.p idx) (data.c idx) = p_vec idx := by
+    rw [linearPredictor_eq_designMatrix_mulVec data pgsBasis splineBasis model (unpackParams_in_class _ _ _)]
+    rfl
+
+  have h_pred_i' : linearPredictor model_prime (data_prime.p idx) (data_prime.c idx) = p_vec' idx := by
+    rw [linearPredictor_eq_designMatrix_mulVec data_prime pgsBasis splineBasis model_prime (unpackParams_in_class _ _ _)]
+    rfl
+
+  -- 3. Show p_vec and p_vec' are orthogonal projections of y onto K (and K')
+  have h_p_in_K : p_vec ∈ K := by
+    use (packParams model)
+    rfl
+
+  have h_p'_in_K' : p_vec' ∈ K' := by
+    use (packParams model_prime)
+    rfl
+
+  -- Since lambda=0, fit minimizes ||y - Xb||^2 which is equivalent to distance in range
+  have h_min : ∀ w ∈ K, l2norm_sq (data.y - p_vec) ≤ l2norm_sq (data.y - w) := by
+    intro w hw
+    obtain ⟨b, hb⟩ := hw
+    let m_w := unpackParams pgsBasis splineBasis b
+    have h_in_class : InModelClass m_w pgsBasis splineBasis := unpackParams_in_class _ _ _
+    have h_loss_le := fit_minimizes_loss p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank m_w h_in_class
+    rw [h_lambda_zero] at h_loss_le ⊢
+    simp only [empiricalLoss, gaussianPenalizedLoss, add_zero, zero_mul] at h_loss_le
+
+    -- empiricalLoss is (1/n) * l2norm_sq (y - pred)
+    -- We need to show that linearPredictor m_w ... corresponds to w
+    have h_pred_w : ∀ j, linearPredictor m_w (data.p j) (data.c j) = w j := by
+      intro j
+      rw [linearPredictor_eq_designMatrix_mulVec data pgsBasis splineBasis m_w h_in_class]
+      rw [packParams_unpackParams_eq]
+      rw [← hb]
+      rfl
+
+    have h_pred_model : ∀ j, linearPredictor model (data.p j) (data.c j) = p_vec j := by
+      intro j
+      rw [linearPredictor_eq_designMatrix_mulVec data pgsBasis splineBasis model (unpackParams_in_class _ _ _)]
+      rfl
+
+    -- Substitute into loss inequality
+    -- The loss definition uses pointwiseNLL .Gaussian which is (y - pred)^2
+    -- So sum is l2norm_sq
+    unfold empiricalLoss at h_loss_le
+    dsimp at h_loss_le
+
+    have h_loss_model : (∑ i, (data.y i - linearPredictor model (data.p i) (data.c i))^2) = l2norm_sq (data.y - p_vec) := by
+      unfold l2norm_sq
+      refine Finset.sum_congr rfl ?_
+      intro j _
+      rw [h_pred_model j]
+      rfl
+
+    have h_loss_w : (∑ i, (data.y i - linearPredictor m_w (data.p i) (data.c i))^2) = l2norm_sq (data.y - w) := by
+      unfold l2norm_sq
+      refine Finset.sum_congr rfl ?_
+      intro j _
+      rw [h_pred_w j]
+      rfl
+
+    rw [h_loss_model, h_loss_w] at h_loss_le
+    -- (1/n) * A <= (1/n) * B => A <= B since n > 0
+    have hn_pos_real : (0:ℝ) < (n:ℝ) := by exact_mod_cast h_n_pos
+    have h_inv_pos : (0:ℝ) < 1 / (n:ℝ) := one_div_pos.mpr hn_pos_real
+    nlinarith [h_loss_le]
+
+  -- Similar proof for model_prime
+  have h_min' : ∀ w ∈ K', l2norm_sq (data_prime.y - p_vec') ≤ l2norm_sq (data_prime.y - w) := by
+    intro w hw
+    obtain ⟨b, hb⟩ := hw
+    let m_w := unpackParams pgsBasis splineBasis b
+    have h_in_class : InModelClass m_w pgsBasis splineBasis := unpackParams_in_class _ _ _
+    -- fit_minimizes_loss for model_prime
+    -- We need the rank proof used in definition of model_prime, but fit_minimizes_loss takes h_rank as arg
+    let X := designMatrix data pgsBasis splineBasis
+    let X' := designMatrix data_prime pgsBasis splineBasis
+    have h_rank_eq : X.rank = X'.rank := rank_eq_of_range_eq X X' h_range_eq
+    have h_rank' : X'.rank = Fintype.card (ParamIx p k sp) := by rw [← h_rank_eq]; exact h_rank
+
+    have h_loss_le := fit_minimizes_loss p k sp n data_prime lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank' m_w h_in_class
+    rw [h_lambda_zero] at h_loss_le ⊢
+    simp only [empiricalLoss, gaussianPenalizedLoss, add_zero, zero_mul] at h_loss_le
+
+    have h_pred_w : ∀ j, linearPredictor m_w (data_prime.p j) (data_prime.c j) = w j := by
+      intro j
+      rw [linearPredictor_eq_designMatrix_mulVec data_prime pgsBasis splineBasis m_w h_in_class]
+      rw [packParams_unpackParams_eq]
+      rw [← hb]
+      rfl
+
+    have h_pred_model : ∀ j, linearPredictor model_prime (data_prime.p j) (data_prime.c j) = p_vec' j := by
+      intro j
+      rw [linearPredictor_eq_designMatrix_mulVec data_prime pgsBasis splineBasis model_prime (unpackParams_in_class _ _ _)]
+      rfl
+
+    unfold empiricalLoss at h_loss_le
+    dsimp at h_loss_le
+
+    have h_loss_model : (∑ i, (data_prime.y i - linearPredictor model_prime (data_prime.p i) (data_prime.c i))^2) = l2norm_sq (data_prime.y - p_vec') := by
+      unfold l2norm_sq
+      refine Finset.sum_congr rfl ?_
+      intro j _
+      rw [h_pred_model j]
+      rfl
+
+    have h_loss_w : (∑ i, (data_prime.y i - linearPredictor m_w (data_prime.p i) (data_prime.c i))^2) = l2norm_sq (data_prime.y - w) := by
+      unfold l2norm_sq
+      refine Finset.sum_congr rfl ?_
+      intro j _
+      rw [h_pred_w j]
+      rfl
+
+    rw [h_loss_model, h_loss_w] at h_loss_le
+    have hn_pos_real : (0:ℝ) < (n:ℝ) := by exact_mod_cast h_n_pos
+    have h_inv_pos : (0:ℝ) < 1 / (n:ℝ) := one_div_pos.mpr hn_pos_real
+    nlinarith [h_loss_le]
+
+  -- 4. Uniqueness of projection
+  have h_proj : p_vec = orthogonalProjection K data.y :=
+    orthogonalProjection_eq_of_dist_le K data.y p_vec h_p_in_K h_min
+
+  have h_proj' : p_vec' = orthogonalProjection K' data_prime.y :=
+    orthogonalProjection_eq_of_dist_le K' data_prime.y p_vec' h_p'_in_K' h_min'
+
+  -- 5. Equality of projections
+  -- data.y = data_prime.y
+  -- K = K'
+  rw [hK_eq] at h_proj
+
+  -- But data.y and data_prime.y are definitionally equal, so `orthogonalProjection K' data.y` is `orthogonalProjection K' data_prime.y`
+  have h_y_eq : data.y = data_prime.y := rfl
+  rw [h_y_eq] at h_proj
+
+  rw [← h_proj] at h_proj'
+
+  -- 6. Conclusion
+  rw [h_pred_i, h_pred_i', h_proj']
 
 noncomputable def dist_to_support {k : ℕ} (c : Fin k → ℝ) (supp : Set (Fin k → ℝ)) : ℝ :=
   Metric.infDist c supp
