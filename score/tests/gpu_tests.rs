@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::process::Command;
 
 use tempfile::tempdir;
@@ -63,6 +64,11 @@ fn cpu_fallback_handles_messy_inputs_and_writes_scores() -> Result<(), Box<dyn E
 
 #[test]
 fn gpu_and_cpu_outputs_match_for_shared_scores_when_cuda_available() -> Result<(), Box<dyn Error>> {
+    if !cuda_runtime_available() {
+        eprintln!("Skipping gpu_and_cpu_outputs_match_for_shared_scores_when_cuda_available: CUDA GPU/runtime unavailable");
+        return Ok(());
+    }
+
     let tmp = tempdir()?;
     let prefix = tmp.path().join("gpu_compare_cohort");
     let n_people = 512usize;
@@ -158,6 +164,11 @@ fn gpu_and_cpu_outputs_match_for_shared_scores_when_cuda_available() -> Result<(
 
 #[test]
 fn gpu_and_cpu_outputs_match_for_multifile_score_directory() -> Result<(), Box<dyn Error>> {
+    if !cuda_runtime_available() {
+        eprintln!("Skipping gpu_and_cpu_outputs_match_for_multifile_score_directory: CUDA GPU/runtime unavailable");
+        return Ok(());
+    }
+
     let tmp = tempdir()?;
     let prefix = tmp.path().join("gpu_multifile_cohort");
     let n_people = 768usize;
@@ -429,8 +440,10 @@ fn fifty_thousand_samples_small_genome_varied_variants() -> Result<(), Box<dyn E
 }
 
 fn cuda_runtime_available() -> bool {
-    match cudarc::driver::CudaContext::new(0) {
-        Ok(ctx) => ctx.bind_to_thread().is_ok(),
+    let probed = catch_unwind(AssertUnwindSafe(|| cudarc::driver::CudaContext::new(0)));
+    match probed {
+        Ok(Ok(ctx)) => ctx.bind_to_thread().is_ok(),
+        Ok(Err(_)) => false,
         Err(_) => false,
     }
 }
