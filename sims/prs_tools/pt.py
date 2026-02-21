@@ -208,6 +208,8 @@ class PPlusT:
             bfile_train,
             "--pheno",
             pheno_file,
+            "--pheno-col-nums",
+            "3",
             # Our train.phen encodes binary phenotype as 0/1.
             # Tell PLINK2 to interpret 0 as valid case/control coding
             # rather than missing phenotype.
@@ -226,7 +228,13 @@ class PPlusT:
             glm_files = sorted(Path(Path(glm_prefix).parent).glob(f"{Path(glm_prefix).name}*.glm.*"))
         if not glm_files:
             raise RuntimeError(f"P+T GWAS output not found for prefix={glm_prefix}")
-        glm_path = str(glm_files[0])
+        glm_logistic = [p for p in glm_files if ".glm.logistic" in p.name]
+        if not glm_logistic:
+            raise RuntimeError(
+                "P+T GWAS did not produce logistic output for binary phenotype. "
+                f"Found files={[p.name for p in glm_files]}"
+            )
+        glm_path = str(glm_logistic[0])
         print(f"[P+T] using GWAS results: {glm_path}")
 
         gwas = pd.read_csv(glm_path, sep=r"\s+")
