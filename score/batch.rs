@@ -19,7 +19,7 @@ use crate::score::types::{
 };
 use crossbeam_queue::ArrayQueue;
 use std::error::Error;
-use std::simd::{Simd, cmp::SimdPartialEq, num::SimdUint};
+use std::simd::{Simd, num::SimdUint};
 
 // --- SIMD & Engine Tuning Parameters ---
 const SIMD_LANES: usize = 8;
@@ -339,14 +339,14 @@ pub(crate) fn process_tile_impl<'a>(
 
                 // Single nonzero mask - 3x faster on ARM than computing 3 separate masks.
                 // We load each byte individually to distinguish 1/2/3.
-                let nonzero_mask = vec.simd_ne(zero_vec).to_bitmask();
-                let mut m = nonzero_mask;
-                while m != 0 {
-                    let bit_idx = m.trailing_zeros() as usize;
+                let chunk_vals = vec.to_array();
+                for (bit_idx, dosage) in chunk_vals.iter().copied().enumerate() {
+                    if dosage == 0 {
+                        continue;
+                    }
                     let i = base_idx + bit_idx;
 
-                    // Cache-hot load: this byte was just in the SIMD register
-                    match dosage_bytes[i] {
+                    match dosage {
                         1 => {
                             g1_indices[g1_count] = i as u16;
                             g1_count += 1;
@@ -380,7 +380,6 @@ pub(crate) fn process_tile_impl<'a>(
                         }
                         _ => {} // dosage 0 shouldn't be in nonzero mask, but safe
                     }
-                    m &= m - 1; // Clear lowest set bit
                 }
 
                 base_idx += 32;
@@ -507,11 +506,10 @@ fn pivot_tile(
                 let term2 = (two_bit_genotypes & one) + one;
                 let initial_dosages = term1 * term2;
 
-                let missing_mask = two_bit_genotypes.simd_eq(U8xN::splat(1));
+                let two_bit_arr = two_bit_genotypes.to_array();
                 let mut dosage_arr = initial_dosages.to_array();
-                let missing_bits = missing_mask.to_bitmask();
                 for (lane, value) in dosage_arr.iter_mut().enumerate() {
-                    if ((missing_bits >> lane) & 1) != 0 {
+                    if two_bit_arr[lane] == 1 {
                         *value = 3;
                     }
                 }

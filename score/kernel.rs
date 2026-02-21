@@ -9,7 +9,8 @@
 // It functions as a "Virtual Machine" that executes a pre-compiled plan, containing
 // zero scientific logic, branches, or decisions.
 
-use std::simd::{Simd, cmp::SimdPartialEq, f32x8, u8x8};
+use std::simd::{Simd, f32x8};
+use std::simd::num::SimdUint;
 
 // --- Type Aliases for Readability ---
 // These types are part of the public API of the kernel.
@@ -144,24 +145,18 @@ pub fn accumulate_adjustments_for_person(
 
     // --- Loop 1: Dosage=1 Adjustments ---
     let two = SimdVec::splat(2.0);
+    let one = SimdVec::splat(1.0);
     for &matrix_row_idx in g1_indices {
         let matrix_row_idx = matrix_row_idx as usize;
         // This inner loop over score columns is the same performant structure as the original kernel.
         for i in 0..num_accumulator_lanes {
             unsafe {
                 let weights_vec = weights.get_simd_lane_unchecked(matrix_row_idx, i);
-                let flip_mask = flip_flags
+                let flip_vec = flip_flags
                     .get_simd_lane_unchecked(matrix_row_idx, i)
-                    .simd_eq(u8x8::splat(1));
-
-                let mut adj_arr = weights_vec.to_array();
-                let flip_bits = flip_mask.to_bitmask();
-                for (lane, value) in adj_arr.iter_mut().enumerate() {
-                    if ((flip_bits >> lane) & 1) != 0 {
-                        *value = -*value;
-                    }
-                }
-                let adj = SimdVec::from_array(adj_arr);
+                    .cast::<f32>();
+                let sign = one - (two * flip_vec);
+                let adj = sign * weights_vec;
                 *accumulator_buffer.get_unchecked_mut(i) += adj;
             }
         }
@@ -173,18 +168,11 @@ pub fn accumulate_adjustments_for_person(
         for i in 0..num_accumulator_lanes {
             unsafe {
                 let weights_vec = weights.get_simd_lane_unchecked(matrix_row_idx, i);
-                let flip_mask = flip_flags
+                let flip_vec = flip_flags
                     .get_simd_lane_unchecked(matrix_row_idx, i)
-                    .simd_eq(u8x8::splat(1));
-
-                let mut adj_arr = (two * weights_vec).to_array();
-                let flip_bits = flip_mask.to_bitmask();
-                for (lane, value) in adj_arr.iter_mut().enumerate() {
-                    if ((flip_bits >> lane) & 1) != 0 {
-                        *value = -*value;
-                    }
-                }
-                let adj = SimdVec::from_array(adj_arr);
+                    .cast::<f32>();
+                let sign = one - (two * flip_vec);
+                let adj = sign * (two * weights_vec);
                 *accumulator_buffer.get_unchecked_mut(i) += adj;
             }
         }
