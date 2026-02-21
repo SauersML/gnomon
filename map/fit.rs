@@ -30,7 +30,7 @@ use std::error::Error;
 use std::ops::Range;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::simd::num::SimdFloat;
-use std::simd::{Select, Simd};
+use std::simd::Simd;
 use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -1455,15 +1455,20 @@ unsafe fn standardize_column_simd_avx(values: &mut [f64], mean: f64, inv: f64) {
 fn standardize_column_simd_impl_lanes2(values: &mut [f64], mean: f64, inv: f64) {
     let mean_simd = Simd::<f64, 2>::splat(mean);
     let inv_simd = Simd::<f64, 2>::splat(inv);
-    let zero = Simd::<f64, 2>::splat(0.0);
 
     let (chunks, remainder) = values.as_chunks_mut::<2>();
     for chunk in chunks {
         let lane = Simd::<f64, 2>::from_array(*chunk);
         let mask = lane.is_finite();
         let standardized = (lane - mean_simd) * inv_simd;
-        let result = mask.select(standardized, zero);
-        *chunk = result.to_array();
+        let mut result = standardized.to_array();
+        let finite_bits = mask.to_bitmask();
+        for (lane, value) in result.iter_mut().enumerate() {
+            if ((finite_bits >> lane) & 1) == 0 {
+                *value = 0.0;
+            }
+        }
+        *chunk = result;
     }
 
     for value in remainder {
@@ -1480,15 +1485,20 @@ fn standardize_column_simd_impl_lanes2(values: &mut [f64], mean: f64, inv: f64) 
 fn standardize_column_simd_impl_lanes4(values: &mut [f64], mean: f64, inv: f64) {
     let mean_simd = Simd::<f64, 4>::splat(mean);
     let inv_simd = Simd::<f64, 4>::splat(inv);
-    let zero = Simd::<f64, 4>::splat(0.0);
 
     let (chunks, remainder) = values.as_chunks_mut::<4>();
     for chunk in chunks {
         let lane = Simd::<f64, 4>::from_array(*chunk);
         let mask = lane.is_finite();
         let standardized = (lane - mean_simd) * inv_simd;
-        let result = mask.select(standardized, zero);
-        *chunk = result.to_array();
+        let mut result = standardized.to_array();
+        let finite_bits = mask.to_bitmask();
+        for (lane, value) in result.iter_mut().enumerate() {
+            if ((finite_bits >> lane) & 1) == 0 {
+                *value = 0.0;
+            }
+        }
+        *chunk = result;
     }
 
     for value in remainder {
@@ -1589,7 +1599,6 @@ fn standardize_column_with_mask_simd_impl_lanes2(
 ) {
     let mean_simd = Simd::<f64, 2>::splat(mean);
     let inv_simd = Simd::<f64, 2>::splat(inv);
-    let zero = Simd::<f64, 2>::splat(0.0);
     let one = Simd::<f64, 2>::splat(1.0);
 
     let (value_chunks, value_remainder) = values.as_chunks_mut::<2>();
@@ -1602,10 +1611,17 @@ fn standardize_column_with_mask_simd_impl_lanes2(
         let lane = Simd::<f64, 2>::from_array(*value_chunk);
         let finite_mask = lane.is_finite();
         let standardized = (lane - mean_simd) * inv_simd;
-        let result = finite_mask.select(standardized, zero);
-        *value_chunk = result.to_array();
-        let mask_values = finite_mask.select(one, zero);
-        *mask_chunk = mask_values.to_array();
+        let finite_bits = finite_mask.to_bitmask();
+        let mut result = standardized.to_array();
+        let mut mask_values = one.to_array();
+        for lane in 0..2 {
+            if ((finite_bits >> lane) & 1) == 0 {
+                result[lane] = 0.0;
+                mask_values[lane] = 0.0;
+            }
+        }
+        *value_chunk = result;
+        *mask_chunk = mask_values;
     }
 
     for (value, mask_value) in value_remainder.iter_mut().zip(mask_remainder.iter_mut()) {
@@ -1629,7 +1645,6 @@ fn standardize_column_with_mask_simd_impl_lanes4(
 ) {
     let mean_simd = Simd::<f64, 4>::splat(mean);
     let inv_simd = Simd::<f64, 4>::splat(inv);
-    let zero = Simd::<f64, 4>::splat(0.0);
     let one = Simd::<f64, 4>::splat(1.0);
 
     let (value_chunks, value_remainder) = values.as_chunks_mut::<4>();
@@ -1642,10 +1657,17 @@ fn standardize_column_with_mask_simd_impl_lanes4(
         let lane = Simd::<f64, 4>::from_array(*value_chunk);
         let finite_mask = lane.is_finite();
         let standardized = (lane - mean_simd) * inv_simd;
-        let result = finite_mask.select(standardized, zero);
-        *value_chunk = result.to_array();
-        let mask_values = finite_mask.select(one, zero);
-        *mask_chunk = mask_values.to_array();
+        let finite_bits = finite_mask.to_bitmask();
+        let mut result = standardized.to_array();
+        let mut mask_values = one.to_array();
+        for lane in 0..4 {
+            if ((finite_bits >> lane) & 1) == 0 {
+                result[lane] = 0.0;
+                mask_values[lane] = 0.0;
+            }
+        }
+        *value_chunk = result;
+        *mask_chunk = mask_values;
     }
 
     for (value, mask_value) in value_remainder.iter_mut().zip(mask_remainder.iter_mut()) {
@@ -1790,14 +1812,18 @@ fn sum_and_count_finite(values: &[f64]) -> (f64, usize) {
 fn sum_and_count_finite_impl_lanes2(values: &[f64]) -> (f64, usize) {
     let mut sum = 0.0;
     let mut count = 0usize;
-    let zero = Simd::<f64, 2>::splat(0.0);
 
     let (chunks, remainder) = values.as_chunks::<2>();
     for chunk in chunks {
         let lane = Simd::<f64, 2>::from_array(*chunk);
         let mask = lane.is_finite();
-        let finite = mask.select(lane, zero);
-        sum += finite.reduce_sum();
+        let lane_values = lane.to_array();
+        let finite_bits = mask.to_bitmask();
+        for (idx, &value) in lane_values.iter().enumerate() {
+            if ((finite_bits >> idx) & 1) != 0 {
+                sum += value;
+            }
+        }
         count += mask.to_bitmask().count_ones() as usize;
     }
 
@@ -1815,14 +1841,18 @@ fn sum_and_count_finite_impl_lanes2(values: &[f64]) -> (f64, usize) {
 fn sum_and_count_finite_impl_lanes4(values: &[f64]) -> (f64, usize) {
     let mut sum = 0.0;
     let mut count = 0usize;
-    let zero = Simd::<f64, 4>::splat(0.0);
 
     let (chunks, remainder) = values.as_chunks::<4>();
     for chunk in chunks {
         let lane = Simd::<f64, 4>::from_array(*chunk);
         let mask = lane.is_finite();
-        let finite = mask.select(lane, zero);
-        sum += finite.reduce_sum();
+        let lane_values = lane.to_array();
+        let finite_bits = mask.to_bitmask();
+        for (idx, &value) in lane_values.iter().enumerate() {
+            if ((finite_bits >> idx) & 1) != 0 {
+                sum += value;
+            }
+        }
         count += mask.to_bitmask().count_ones() as usize;
     }
 

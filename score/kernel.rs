@@ -9,7 +9,7 @@
 // It functions as a "Virtual Machine" that executes a pre-compiled plan, containing
 // zero scientific logic, branches, or decisions.
 
-use std::simd::{Select, Simd, cmp::SimdPartialEq, f32x8, u8x8};
+use std::simd::{Simd, cmp::SimdPartialEq, f32x8, u8x8};
 
 // --- Type Aliases for Readability ---
 // These types are part of the public API of the kernel.
@@ -154,7 +154,14 @@ pub fn accumulate_adjustments_for_person(
                     .get_simd_lane_unchecked(matrix_row_idx, i)
                     .simd_eq(u8x8::splat(1));
 
-                let adj = flip_mask.cast::<i32>().select(-weights_vec, weights_vec);
+                let mut adj_arr = weights_vec.to_array();
+                let flip_bits = flip_mask.to_bitmask();
+                for (lane, value) in adj_arr.iter_mut().enumerate() {
+                    if ((flip_bits >> lane) & 1) != 0 {
+                        *value = -*value;
+                    }
+                }
+                let adj = SimdVec::from_array(adj_arr);
                 *accumulator_buffer.get_unchecked_mut(i) += adj;
             }
         }
@@ -170,9 +177,14 @@ pub fn accumulate_adjustments_for_person(
                     .get_simd_lane_unchecked(matrix_row_idx, i)
                     .simd_eq(u8x8::splat(1));
 
-                let adj = flip_mask
-                    .cast::<i32>()
-                    .select(-two * weights_vec, two * weights_vec);
+                let mut adj_arr = (two * weights_vec).to_array();
+                let flip_bits = flip_mask.to_bitmask();
+                for (lane, value) in adj_arr.iter_mut().enumerate() {
+                    if ((flip_bits >> lane) & 1) != 0 {
+                        *value = -*value;
+                    }
+                }
+                let adj = SimdVec::from_array(adj_arr);
                 *accumulator_buffer.get_unchecked_mut(i) += adj;
             }
         }

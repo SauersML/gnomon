@@ -19,7 +19,7 @@ use crate::score::types::{
 };
 use crossbeam_queue::ArrayQueue;
 use std::error::Error;
-use std::simd::{Select, Simd, cmp::SimdPartialEq, num::SimdUint};
+use std::simd::{Simd, cmp::SimdPartialEq, num::SimdUint};
 
 // --- SIMD & Engine Tuning Parameters ---
 const SIMD_LANES: usize = 8;
@@ -508,7 +508,14 @@ fn pivot_tile(
                 let initial_dosages = term1 * term2;
 
                 let missing_mask = two_bit_genotypes.simd_eq(U8xN::splat(1));
-                dosage_vectors[i] = missing_mask.select(U8xN::splat(3), initial_dosages);
+                let mut dosage_arr = initial_dosages.to_array();
+                let missing_bits = missing_mask.to_bitmask();
+                for (lane, value) in dosage_arr.iter_mut().enumerate() {
+                    if ((missing_bits >> lane) & 1) != 0 {
+                        *value = 3;
+                    }
+                }
+                dosage_vectors[i] = U8xN::from_array(dosage_arr);
             }
 
             // --- 2. Transpose the 8x8 block ---
