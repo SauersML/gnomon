@@ -42,7 +42,6 @@ class GAMMethod(PGSMethod):
     
     def __init__(
         self,
-        n_pcs: int = 2,
         k_pgs: int = 10,
         k_pc: int = 10,
         k_interaction: int = 5,
@@ -52,8 +51,6 @@ class GAMMethod(PGSMethod):
         """
         Parameters
         ----------
-        n_pcs : int
-            Number of ancestry PCs to include
         k_pgs : int  
             Basis dimension for PGS spline (default 10)
         k_pc : int
@@ -66,8 +63,8 @@ class GAMMethod(PGSMethod):
             If True, use decomposed form s() + ti() for clearer interpretation.
             If False, use single te() tensor product.
         """
-        super().__init__(name=f"GAM (mgcv, {n_pcs} PCs)")
-        self.n_pcs = n_pcs
+        self.n_pcs = 3
+        super().__init__(name=f"GAM (mgcv, {self.n_pcs} PCs)")
         self.k_pgs = k_pgs
         self.k_pc = k_pc
         self.k_interaction = k_interaction
@@ -127,7 +124,11 @@ class GAMMethod(PGSMethod):
         # Prepare data frame for R
         data_dict = {'y': y.astype(float), 'P': P.astype(float)}
         
-        n_pcs_actual = min(self.n_pcs, 5, PC.shape[1])
+        if PC.shape[1] < self.n_pcs:
+            raise RuntimeError(
+                f"GAM requires at least {self.n_pcs} PCs, got {PC.shape[1]}."
+            )
+        n_pcs_actual = self.n_pcs
         for i in range(n_pcs_actual):
             data_dict[f'PC{i+1}'] = PC[:, i].astype(float)
         
@@ -156,7 +157,11 @@ class GAMMethod(PGSMethod):
         
         # Prepare new data
         data_dict = {'P': P.astype(float)}
-        n_pcs_actual = min(self.n_pcs, 5, PC.shape[1])
+        if PC.shape[1] < self.n_pcs:
+            raise RuntimeError(
+                f"GAM requires at least {self.n_pcs} PCs, got {PC.shape[1]}."
+            )
+        n_pcs_actual = self.n_pcs
         for i in range(n_pcs_actual):
             data_dict[f'PC{i+1}'] = PC[:, i].astype(float)
         

@@ -3,7 +3,6 @@ Fast pruning-and-thresholding (P+T) PRS wrapper built on PLINK2.
 """
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -27,19 +26,7 @@ class PPlusT:
         min_selected_snps: int = 50,
         min_prs_sd: float = 1e-8,
     ):
-        env_threads = os.environ.get("GCTB_THREADS")
-        if threads is None and env_threads:
-            try:
-                threads = int(env_threads)
-            except Exception:
-                threads = None
         self.threads = int(threads) if threads is not None else 4
-        env_mem = os.environ.get("PLINK_MEMORY_MB")
-        if plink_memory_mb is None and env_mem:
-            try:
-                plink_memory_mb = int(env_mem)
-            except Exception:
-                plink_memory_mb = None
         self.plink_memory_mb = int(plink_memory_mb) if plink_memory_mb is not None else None
         self.p_threshold = float(p_threshold)
         self.p_thresholds = list(p_thresholds) if p_thresholds is not None else [1e-4, 1e-3, 1e-2, 1e-1, 5e-1]
@@ -72,16 +59,11 @@ class PPlusT:
         iid_col = "IID" if "IID" in df.columns else ("#IID" if "#IID" in df.columns else None)
         if iid_col is None:
             raise RuntimeError(f"P+T .sscore missing IID column: {path}; cols={list(df.columns)}")
-        score_col = None
-        for c in ("SCORE1_AVG", "SCORE1_SUM", "SCORE1", "SCORE"):
-            if c in df.columns:
-                score_col = c
-                break
-        if score_col is None:
-            score_like = [c for c in df.columns if "SCORE" in c.upper()]
-            if not score_like:
-                raise RuntimeError(f"P+T .sscore missing SCORE column: {path}; cols={list(df.columns)}")
-            score_col = score_like[0]
+        score_col = "SCORE1_AVG"
+        if score_col not in df.columns:
+            raise RuntimeError(
+                f"P+T .sscore missing required SCORE1_AVG column: {path}; cols={list(df.columns)}"
+            )
         out = df[[iid_col, score_col]].copy()
         out.columns = ["IID", "PRS"]
         out["IID"] = out["IID"].astype(str)
@@ -90,17 +72,10 @@ class PPlusT:
 
     @staticmethod
     def _find_qscore_output(out_prefix: str, label: str) -> str:
-        cands = [
-            f"{out_prefix}.{label}.sscore",
-            f"{out_prefix}.{label}.profile",
-            f"{out_prefix}.{label}.sscore.zst",
-        ]
-        for p in cands:
-            if Path(p).exists():
-                return p
-        raise RuntimeError(
-            f"P+T q-score-range output not found for label={label}; looked for {cands}"
-        )
+        p = f"{out_prefix}.{label}.sscore"
+        if Path(p).exists():
+            return p
+        raise RuntimeError(f"P+T q-score-range output not found for label={label}; missing {p}")
 
     @staticmethod
     def _read_binary_pheno(path: str) -> pd.DataFrame:
@@ -168,38 +143,21 @@ class PPlusT:
             )
 
         prune_prefix = f"{out_prefix}.prune"
-        keep_ids: set[str] | None = None
-        try:
-            self._run(
-                [
-                    plink,
-                    "--bfile",
-                    bfile_train,
-                    "--indep-pairwise",
-                    str(self.prune_window_kb),
-                    str(self.prune_step),
-                    str(self.prune_r2),
-                    *common,
-                    "--out",
-                    prune_prefix,
-                ],
-                "LD pruning",
-            )
-        except RuntimeError as e:
-            msg = str(e).lower()
-            if "less than 50 samples" in msg:
-                print("[P+T] LD pruning skipped (train n<50); using all variants for thresholding")
-                bim_path = Path(f"{bfile_train}.bim")
-                if not bim_path.exists():
-                    raise
-                keep_ids = set()
-                with open(bim_path, "r", encoding="utf-8", errors="replace") as f:
-                    for line in f:
-                        parts = line.rstrip("\n").split("\t")
-                        if len(parts) >= 2 and parts[1]:
-                            keep_ids.add(parts[1])
-            else:
-                raise
+        self._run(
+            [
+                plink,
+                "--bfile",
+                bfile_train,
+                "--indep-pairwise",
+                str(self.prune_window_kb),
+                str(self.prune_step),
+                str(self.prune_r2),
+                *common,
+                "--out",
+                prune_prefix,
+            ],
+            "LD pruning",
+        )
 
         glm_prefix = f"{out_prefix}.gwas"
         glm_cmd = [
@@ -242,13 +200,9 @@ class PPlusT:
             gwas = gwas[gwas["TEST"].astype(str) == "ADD"].copy()
         if "P" not in gwas.columns or "ID" not in gwas.columns or "A1" not in gwas.columns:
             raise RuntimeError(f"P+T GWAS file missing required columns (ID/A1/P): {glm_path}")
-        if "BETA" in gwas.columns:
-            eff = pd.to_numeric(gwas["BETA"], errors="coerce")
-        elif "OR" in gwas.columns:
-            orv = pd.to_numeric(gwas["OR"], errors="coerce")
-            eff = np.log(orv.where(orv > 0))
-        else:
-            raise RuntimeError(f"P+T GWAS file missing BETA/OR effect column: {glm_path}")
+        if "BETA" not in gwas.columns:
+            raise RuntimeError(f"P+T GWAS file missing required BETA effect column: {glm_path}")
+        eff = pd.to_numeric(gwas["BETA"], errors="coerce")
 
         gwas = pd.DataFrame(
             {
@@ -259,11 +213,10 @@ class PPlusT:
             }
         ).dropna(subset=["P", "EFF"])
 
-        if keep_ids is None:
-            prune_in = Path(f"{prune_prefix}.prune.in")
-            if not prune_in.exists():
-                raise RuntimeError(f"P+T missing prune list: {prune_in}")
-            keep_ids = set(x.strip() for x in prune_in.read_text(encoding="utf-8", errors="replace").splitlines() if x.strip())
+        prune_in = Path(f"{prune_prefix}.prune.in")
+        if not prune_in.exists():
+            raise RuntimeError(f"P+T missing prune list: {prune_in}")
+        keep_ids = set(x.strip() for x in prune_in.read_text(encoding="utf-8", errors="replace").splitlines() if x.strip())
         gwas = gwas[gwas["ID"].isin(keep_ids)].copy()
         gwas = gwas.sort_values("P")
         thresholds = sorted(set(float(x) for x in self.p_thresholds))
@@ -345,15 +298,16 @@ class PPlusT:
         metrics_rank["train_accuracy"] = metrics_rank["train_accuracy"].fillna(-np.inf)
         metrics_rank["train_balanced_accuracy"] = metrics_rank["train_balanced_accuracy"].fillna(-np.inf)
         metrics_rank["train_auc"] = metrics_rank["train_auc"].fillna(-np.inf)
-        best_idx = metrics_rank.sort_values(["train_auc", "train_balanced_accuracy", "train_accuracy", "n_snps"], ascending=[False, False, False, False]).index[0]
+        ranked = metrics_rank.sort_values(
+            ["train_auc", "train_balanced_accuracy", "train_accuracy", "n_snps"],
+            ascending=[False, False, False, False],
+        )
+        best_idx = ranked.index[0]
         if not np.isfinite(float(metrics_rank.loc[best_idx, "train_auc"])):
-            # If all thresholds were filtered, fall back to non-degenerate highest-AUC model.
-            rerank = metrics.copy()
-            rerank.loc[rerank["is_degenerate"].astype(bool), ["train_accuracy", "train_balanced_accuracy", "train_auc"]] = -np.inf
-            rerank["train_accuracy"] = rerank["train_accuracy"].fillna(-np.inf)
-            rerank["train_balanced_accuracy"] = rerank["train_balanced_accuracy"].fillna(-np.inf)
-            rerank["train_auc"] = rerank["train_auc"].fillna(-np.inf)
-            best_idx = rerank.sort_values(["train_auc", "train_balanced_accuracy", "train_accuracy", "n_snps"], ascending=[False, False, False, False]).index[0]
+            raise RuntimeError(
+                "P+T threshold selection failed: all thresholds are invalid "
+                "(degenerate PRS and/or below min_selected_snps)."
+            )
         best_thr = float(metrics.loc[best_idx, "p_threshold"])
         print(
             f"[P+T] selected best threshold={best_thr:g} "
@@ -369,7 +323,7 @@ class PPlusT:
         best_train_scores = train_scores_by_thr[best_thr]
         best_w = all_w[all_w["P"] <= best_thr].copy()
         if best_w.empty:
-            best_w = all_w.nsmallest(1, "P").copy()
+            raise RuntimeError(f"P+T selected threshold {best_thr:g} produced zero SNPs.")
         best_score_file = f"{out_prefix}.best.score"
         best_w[["ID", "A1", "EFF"]].to_csv(best_score_file, sep="\t", header=False, index=False)
         test_out = f"{out_prefix}.best.test"

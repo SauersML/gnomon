@@ -4,37 +4,22 @@ Wrapper for GCTB BayesR.
 import subprocess
 import os
 import shutil
-from pathlib import Path
 import pandas as pd
 
 class BayesR:
-    def __init__(self, gctb_path="gctb", threads: int | None = None, plink_memory_mb: int | None = None):
+    def __init__(
+        self,
+        gctb_path="gctb",
+        threads: int | None = None,
+        plink_memory_mb: int | None = None,
+        chain_length: int = 10000,
+        burn_in: int = 2000,
+    ):
         self.gctb_path = gctb_path
         self.max_snps = 300_000
-        self.thin_seed = 42
-        env_threads = os.environ.get("GCTB_THREADS")
-        if threads is None and env_threads is not None:
-            try:
-                threads = int(env_threads)
-            except Exception:
-                threads = None
         self.threads = int(threads) if threads is not None else 4
-        env_chain = os.environ.get("GCTB_CHAIN_LENGTH")
-        env_burn = os.environ.get("GCTB_BURN_IN")
-        try:
-            self.chain_length = int(env_chain) if env_chain is not None else 10000
-        except Exception:
-            self.chain_length = 10000
-        try:
-            self.burn_in = int(env_burn) if env_burn is not None else 2000
-        except Exception:
-            self.burn_in = 2000
-        env_mem = os.environ.get("PLINK_MEMORY_MB")
-        if plink_memory_mb is None and env_mem is not None:
-            try:
-                plink_memory_mb = int(env_mem)
-            except Exception:
-                plink_memory_mb = None
+        self.chain_length = int(chain_length)
+        self.burn_in = int(burn_in)
         self.plink_memory_mb = int(plink_memory_mb) if plink_memory_mb is not None else None
 
     def _gctb_diagnostics(self) -> str:
@@ -63,53 +48,13 @@ class BayesR:
         except Exception as e:
             raise RuntimeError(f"Failed to count SNPs in {bim_path}: {e}")
 
-    def _resolve_plink2(self) -> str:
-        plink_exe = shutil.which("plink2") or "/usr/local/bin/plink2"
-        if not os.path.exists(plink_exe) and shutil.which("plink2") is None:
-            raise FileNotFoundError(
-                f"plink2 executable not found on PATH and fallback missing at {plink_exe}"
-            )
-        return plink_exe
-
-    def _maybe_thin_bfile(self, bfile_prefix: str, out_prefix: str) -> str:
+    def _assert_supported_snp_count(self, bfile_prefix: str) -> None:
         n_snps = self._count_bim_snps(bfile_prefix)
-        if n_snps <= self.max_snps:
-            print(f"BayesR SNPs={n_snps} (<= {self.max_snps}); no thinning needed.")
-            return bfile_prefix
-
-        thin_prefix = f"{out_prefix}_thin"
-        if Path(f"{thin_prefix}.bed").exists():
-            print(f"BayesR SNPs={n_snps}; using existing thinned bfile={thin_prefix}")
-            return thin_prefix
-
-        print(
-            "BayesR SNPs="
-            f"{n_snps} (> {self.max_snps}); thinning to {self.max_snps} for GCTB memory safety."
-        )
-        plink_exe = self._resolve_plink2()
-        cmd = [
-            plink_exe,
-            "--bfile", bfile_prefix,
-            "--thin-count", str(self.max_snps),
-            "--seed", str(self.thin_seed),
-            "--make-bed",
-            "--threads", str(self.threads),
-            "--out", thin_prefix,
-        ]
-        if self.plink_memory_mb is not None and self.plink_memory_mb > 0:
-            cmd.extend(["--memory", str(self.plink_memory_mb)])
-        print(f"Running PLINK2 thinning: {' '.join(cmd)}")
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            self._safe_write_text(f"{thin_prefix}.plink2.stdout", result.stdout or "")
-            self._safe_write_text(f"{thin_prefix}.plink2.stderr", result.stderr or "")
+        if n_snps > self.max_snps:
             raise RuntimeError(
-                "PLINK2 thinning failed:\n"
-                f"returncode={result.returncode}\n"
-                f"STDERR:\n{result.stderr}\n\n"
-                f"STDOUT:\n{result.stdout}\n"
+                f"BayesR input has {n_snps} SNPs, exceeding hard limit {self.max_snps}. "
+                "Refuse to run implicit thinning; reduce SNP set upstream explicitly."
             )
-        return thin_prefix
         
     def fit(self, bfile_train, pheno_file, out_prefix, covar_file):
         """
@@ -126,11 +71,11 @@ class BayesR:
         if not os.path.exists(covar_file):
             raise FileNotFoundError(f"BayesR covariate file does not exist: {covar_file}")
 
-        bfile_train_eff = self._maybe_thin_bfile(bfile_train, out_prefix)
+        self._assert_supported_snp_count(bfile_train)
 
         cmd = [
             self.gctb_path,
-            "--bfile", bfile_train_eff,
+            "--bfile", bfile_train,
             "--pheno", pheno_file,
             "--bayes", "R",
             "--covar", covar_file,
@@ -161,29 +106,25 @@ class BayesR:
                 if not header.strip():
                      raise RuntimeError(f"GCTB output file {out_file} is empty.")
                 cols = header.strip().split()
-                cols_l = {c.lower() for c in cols}
-                # GCTB versions/flags differ; accept a few common effect-size column names.
-                # GCTB BayesR typically uses A1Effect for the posterior mean effect of allele A1.
-                effect_candidates = ["a1effect", "a1_effect", "effect", "beta", "b", "mean", "bhat"]
-                if not any(c in cols_l for c in effect_candidates):
-                     try:
-                         size = os.path.getsize(out_file)
-                     except Exception:
-                         size = None
-                     preview_lines = []
-                     try:
-                         preview_lines.append(header.rstrip("\n"))
-                         preview_lines.append(f.readline().rstrip("\n"))
-                     except Exception:
-                         pass
-                     raise RuntimeError(
-                         f"GCTB output file {out_file} missing an effect column. "
-                         f"Tried={effect_candidates}. "
-                         f"DetectedColumns={cols}. "
-                         f"FileSizeBytes={size}. "
-                         f"HeaderPreview={preview_lines}. "
-                         f"{self._gctb_diagnostics()}"
-                     )
+                required_cols = {"Name", "A1", "A1Effect"}
+                if not required_cols.issubset(set(cols)):
+                    try:
+                        size = os.path.getsize(out_file)
+                    except Exception:
+                        size = None
+                    preview_lines = []
+                    try:
+                        preview_lines.append(header.rstrip("\n"))
+                        preview_lines.append(f.readline().rstrip("\n"))
+                    except Exception:
+                        pass
+                    raise RuntimeError(
+                        f"GCTB output file {out_file} missing required columns {sorted(required_cols)}. "
+                        f"DetectedColumns={cols}. "
+                        f"FileSizeBytes={size}. "
+                        f"HeaderPreview={preview_lines}. "
+                        f"{self._gctb_diagnostics()}"
+                    )
         except Exception as e:
              self._safe_write_text(f"{out_prefix}.gctb.stdout", result.stdout or "")
              self._safe_write_text(f"{out_prefix}.gctb.stderr", result.stderr or "")
@@ -209,31 +150,18 @@ class BayesR:
         df = pd.read_csv(effect_file, sep=r'\s+')
         # Columns: Id Name Chrom Position A1 A2 PPIP PIP_0.001 ... Effect
 
-        cols_lower = {c.lower(): c for c in df.columns}
-        name_col = cols_lower.get('name') or cols_lower.get('snp') or cols_lower.get('id')
-        a1_col = cols_lower.get('a1') or cols_lower.get('allele1')
-        effect_col = (
-            cols_lower.get('a1effect')
-            or cols_lower.get('a1_effect')
-            or cols_lower.get('effect')
-            or cols_lower.get('beta')
-            or cols_lower.get('b')
-            or cols_lower.get('mean')
-            or cols_lower.get('bhat')
-        )
-
-        if name_col is None or a1_col is None or effect_col is None:
+        required_cols = ("Name", "A1", "A1Effect")
+        if any(c not in df.columns for c in required_cols):
             head_preview = df.head(10).to_string(index=False)
             raise RuntimeError(
-                "Could not identify required columns in BayesR .snpRes. "
-                f"Needed SNP/Name + A1 + Effect. Found columns={list(df.columns)}. "
+                "BayesR .snpRes missing required deterministic columns "
+                f"{required_cols}. Found columns={list(df.columns)}. "
                 f"Head:\n{head_preview}"
             )
 
-        print(
-            "BayesR scoring columns: "
-            f"snp_id={name_col} allele={a1_col} effect={effect_col}"
-        )
+        name_col = "Name"
+        a1_col = "A1"
+        effect_col = "A1Effect"
 
         try:
             total_rows = int(df.shape[0])
@@ -252,12 +180,19 @@ class BayesR:
 
         score_df = df[[name_col, a1_col, effect_col]].copy()
         before_rows = int(score_df.shape[0])
-        score_df = score_df.dropna(subset=[name_col, a1_col, effect_col])
+        if score_df[[name_col, a1_col, effect_col]].isna().any().any():
+            missing_counts = score_df[[name_col, a1_col, effect_col]].isna().sum().to_dict()
+            raise RuntimeError(
+                f"BayesR effect file contains missing values in required columns: {missing_counts}"
+            )
         score_df[name_col] = score_df[name_col].astype(str).str.strip()
         score_df[a1_col] = score_df[a1_col].astype(str).str.strip()
         score_df[effect_col] = pd.to_numeric(score_df[effect_col], errors="coerce")
-        score_df = score_df.dropna(subset=[effect_col])
-        score_df = score_df[(score_df[name_col] != "") & (score_df[a1_col] != "")]
+        if score_df[effect_col].isna().any():
+            bad = int(score_df[effect_col].isna().sum())
+            raise RuntimeError(f"BayesR effect file has {bad} non-numeric A1Effect values.")
+        if (score_df[name_col] == "").any() or (score_df[a1_col] == "").any():
+            raise RuntimeError("BayesR effect file has empty Name/A1 values.")
         after_rows = int(score_df.shape[0])
         print(f"BayesR score rows: before_filter={before_rows} after_filter={after_rows}")
 

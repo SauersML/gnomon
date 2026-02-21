@@ -25,18 +25,7 @@ SIMS_DIR = THIS_DIR.parent
 if str(SIMS_DIR) not in sys.path:
     sys.path.append(str(SIMS_DIR))
 
-try:
-    from .common import (
-        ensure_pgs003725,
-        load_pgs003725_effects,
-        diploid_index_pairs,
-        sample_two_site_sets_for_maf,
-        compute_pcs_risk_and_diagnostics,
-        solve_intercept_for_prevalence,
-        get_chr22_recomb_map,
-    )
-except ImportError:
-    from common import (
+from .common import (
     ensure_pgs003725,
     load_pgs003725_effects,
     diploid_index_pairs,
@@ -44,7 +33,7 @@ except ImportError:
     compute_pcs_risk_and_diagnostics,
     solve_intercept_for_prevalence,
     get_chr22_recomb_map,
-    )
+)
 from methods.raw_pgs import RawPGSMethod
 from methods.linear_interaction import LinearInteractionMethod
 from methods.normalization import NormalizationMethod
@@ -474,7 +463,7 @@ def _fit_and_predict_methods(train_df: pd.DataFrame, test_df: pd.DataFrame, trai
         method.fit(P_train, PC_train, y_train)
         out[name] = method.predict_proba(P_test, PC_test)
 
-    gm = GAMMethod(n_pcs=3, k_pgs=4, k_pc=4, k_interaction=3, use_ti=True)
+    gm = GAMMethod(k_pgs=4, k_pc=4, k_interaction=3, use_ti=True)
     gm.fit(P_train, PC_train, y_train)
     out["gam"] = gm.predict_proba(P_test, PC_test)
 
@@ -726,8 +715,6 @@ def _run_generation_task(task: dict[str, object]) -> dict[str, object]:
     _log(f"[fig1_g{g}_s{seed}] Task started")
 
     _set_runtime_thread_env(threads_per_job)
-    if memory_mb_per_job is not None:
-        os.environ["PLINK_MEMORY_MB"] = str(int(memory_mb_per_job))
     _log(f"[fig1_g{g}_s{seed}] Runtime resources set (threads={threads_per_job}, memory_mb={memory_mb_per_job})")
 
     prefix = str(out_dir / f"fig1_g{g}_s{seed}")

@@ -16,10 +16,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import stdpopsim
-try:
-    import numba as nb
-except Exception:
-    nb = None
+import numba as nb
 from scipy.stats import gaussian_kde
 from scipy.special import expit as sigmoid
 from sklearn.preprocessing import StandardScaler
@@ -32,18 +29,7 @@ SIMS_DIR = THIS_DIR.parent
 if str(SIMS_DIR) not in sys.path:
     sys.path.append(str(SIMS_DIR))
 
-try:
-    from .common import (
-        ensure_pgs003725,
-        load_pgs003725_effects,
-        diploid_index_pairs,
-        sample_two_site_sets_for_maf,
-        compute_pcs_risk_and_diagnostics,
-        solve_intercept_for_prevalence,
-        pop_names_from_ts,
-    )
-except ImportError:
-    from common import (
+from .common import (
     ensure_pgs003725,
     load_pgs003725_effects,
     diploid_index_pairs,
@@ -51,7 +37,7 @@ except ImportError:
     compute_pcs_risk_and_diagnostics,
     solve_intercept_for_prevalence,
     pop_names_from_ts,
-    )
+)
 from methods.raw_pgs import RawPGSMethod
 from methods.linear_interaction import LinearInteractionMethod
 from methods.normalization import NormalizationMethod
@@ -167,35 +153,21 @@ def _link_chunk_worker(start: int, stop: int) -> tuple[np.ndarray, int, int]:
     return out, int(stop - start), int(np.count_nonzero(valid))
 
 
-if nb is not None:
-    @nb.njit(cache=True)
-    def _accumulate_link_edges_numba(
-        child_idx: np.ndarray,
-        parent_src: np.ndarray,
-        span: np.ndarray,
-        hap_to_dip: np.ndarray,
-        out_dip: np.ndarray,
-    ) -> None:
-        for i in range(child_idx.shape[0]):
-            c = int(child_idx[i])
-            s = int(parent_src[i])
-            if c >= 0 and s >= 0:
-                d = int(hap_to_dip[c])
-                if d >= 0:
-                    out_dip[d, s] += 0.5 * span[i]
-else:
-    def _accumulate_link_edges_numba(
-        child_idx: np.ndarray,
-        parent_src: np.ndarray,
-        span: np.ndarray,
-        hap_to_dip: np.ndarray,
-        out_dip: np.ndarray,
-    ) -> None:
-        valid = (child_idx >= 0) & (parent_src >= 0)
-        if np.any(valid):
-            dip_idx = hap_to_dip[child_idx[valid]]
-            w = 0.5 * span[valid]
-            np.add.at(out_dip, (dip_idx, parent_src[valid]), w)
+@nb.njit(cache=True)
+def _accumulate_link_edges_numba(
+    child_idx: np.ndarray,
+    parent_src: np.ndarray,
+    span: np.ndarray,
+    hap_to_dip: np.ndarray,
+    out_dip: np.ndarray,
+) -> None:
+    for i in range(child_idx.shape[0]):
+        c = int(child_idx[i])
+        s = int(parent_src[i])
+        if c >= 0 and s >= 0:
+            d = int(hap_to_dip[c])
+            if d >= 0:
+                out_dip[d, s] += 0.5 * span[i]
 
 
 def _apply_plot_style() -> None:
@@ -321,31 +293,24 @@ def _true_ancestry_proportions(
     candidate_mask = (node_time > 0.0) & (node_src_from_pop >= 0)
     candidate_times = node_time[candidate_mask]
     if candidate_times.size == 0:
-        prefix = log_prefix if log_prefix is not None else "fig2"
-        _log(f"[{prefix}] WARNING: no source-labeled ancestor nodes found; ancestry proportions set to 0.0")
-        return np.zeros(n_dip, dtype=np.float64), np.zeros(n_dip, dtype=np.float64), np.zeros(n_dip, dtype=np.float64)
+        raise RuntimeError("No source-labeled ancestor nodes found; cannot compute ancestry proportions.")
 
-    # Use the requested census time; if unavailable, use nearest available source-node time.
     uniq_times = np.unique(candidate_times)
     requested = float(ancestry_census_time)
-    near_idx = int(np.argmin(np.abs(uniq_times - requested)))
-    selected_time = float(uniq_times[near_idx])
     exact_match = bool(np.any(np.isclose(candidate_times, requested, rtol=0.0, atol=1e-9)))
-    if (not exact_match) and log_prefix:
-        _log(
-            f"[{log_prefix}] Requested census_time={requested:.6f} not present; "
-            f"using nearest available census_time={selected_time:.6f}"
+    if not exact_match:
+        raise RuntimeError(
+            f"Requested ancestry_census_time={requested:.6f} is not present. "
+            f"Available times include: {uniq_times[:20].tolist()} (showing up to 20)."
         )
+    selected_time = requested
 
     anc_mask = np.isclose(node_time, selected_time, rtol=0.0, atol=1e-9) & (node_src_from_pop >= 0)
     anc_nodes = np.nonzero(anc_mask)[0].astype(np.int32, copy=False)
     if anc_nodes.size == 0:
-        prefix = log_prefix if log_prefix is not None else "fig2"
-        _log(
-            f"[{prefix}] WARNING: no ancestors found at selected census_time={selected_time:.6f}; "
-            "ancestry proportions set to 0.0"
+        raise RuntimeError(
+            f"No ancestors found at requested ancestry_census_time={selected_time:.6f}."
         )
-        return np.zeros(n_dip, dtype=np.float64), np.zeros(n_dip, dtype=np.float64), np.zeros(n_dip, dtype=np.float64)
 
     # Only census-time ancestors are valid ancestry sources for attribution.
     node_src = np.full(n_nodes, -1, dtype=np.int8)
@@ -357,21 +322,12 @@ def _true_ancestry_proportions(
             f"(haplotypes={n_hap}, diploids={n_dip}, trees={int(getattr(ts, 'num_trees', 0))}, "
             f"census_time={selected_time:.6f}, ancestors={anc_nodes.size})"
         )
-        _log(f"[{log_prefix}] numba enabled for edge accumulation={nb is not None}")
+        _log(f"[{log_prefix}] numba edge-accumulation enabled")
     _ancestry_mark(log_prefix, 0.0, "starting ancestry computation")
 
     t0 = time.perf_counter()
     _ancestry_mark(log_prefix, 5.0, "running link_ancestors")
-    # Compatibility: some tskit builds expose link_ancestors only on TableCollection.
-    if hasattr(ts, "link_ancestors"):
-        edges = ts.link_ancestors(sample_nodes_arr, anc_nodes)
-    elif hasattr(ts, "tables") and hasattr(ts.tables, "link_ancestors"):
-        edges = ts.tables.link_ancestors(sample_nodes_arr, anc_nodes)
-    else:
-        raise RuntimeError(
-            "link_ancestors is unavailable on this tskit build "
-            "(missing both TreeSequence.link_ancestors and TableCollection.link_ancestors)"
-        )
+    edges = ts.link_ancestors(sample_nodes_arr, anc_nodes)
     _ancestry_mark(log_prefix, 20.0, f"link_ancestors complete (edges={len(edges)})")
     parents = np.asarray(edges.parent, dtype=np.int64)
     children = np.asarray(edges.child, dtype=np.int64)
@@ -883,7 +839,7 @@ def _method_preds(train_df: pd.DataFrame, test_df: pd.DataFrame, train_prs: np.n
         method.fit(P_train, PC_train, y_train)
         out[name] = method.predict_proba(P_test, PC_test)
 
-    gm = GAMMethod(n_pcs=3, k_pgs=4, k_pc=4, k_interaction=3, use_ti=True)
+    gm = GAMMethod(k_pgs=4, k_pc=4, k_interaction=3, use_ti=True)
     gm.fit(P_train, PC_train, y_train)
     out["gam"] = gm.predict_proba(P_test, PC_test)
 
@@ -1111,8 +1067,6 @@ def main() -> None:
         memory_mb = max(2048, int(0.85 * total_mb)) if total_mb is not None else None
     _log(f"Figure2 resources: threads={threads} memory_mb={memory_mb}")
     _set_runtime_thread_env(threads)
-    if memory_mb is not None:
-        os.environ["PLINK_MEMORY_MB"] = str(memory_mb)
 
     score_path = ensure_pgs003725(Path(args.cache))
     _log(f"Figure2 loading PGS effects from cache={args.cache}")

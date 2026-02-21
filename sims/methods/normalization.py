@@ -9,12 +9,7 @@ import numpy as np
 import pandas as pd
 from sklearn.linear_model import LogisticRegression
 from .base import PGSMethod
-
-try:
-    from pgscatalog.calc.lib._ancestry.tools import pgs_adjust
-except Exception as e:  # pragma: no cover - handled at runtime
-    pgs_adjust = None
-    _pgscatalog_import_error = e
+from pgscatalog.calc.lib._ancestry.tools import pgs_adjust
 
 
 class NormalizationMethod(PGSMethod):
@@ -32,10 +27,6 @@ class NormalizationMethod(PGSMethod):
     def _make_df(self, P: np.ndarray, PC: np.ndarray, pop_labels) -> pd.DataFrame:
         if pop_labels is None:
             raise RuntimeError("Normalization requires pop labels to be set.")
-        if pgs_adjust is None:
-            raise RuntimeError(
-                f"pgscatalog-calc is required for normalization: {_pgscatalog_import_error}"
-            )
         pc_cols = {f"PC{i+1}": PC[:, i] for i in range(self.n_pcs)}
         df = pd.DataFrame(pc_cols)
         df["pop"] = pop_labels
@@ -61,7 +52,7 @@ class NormalizationMethod(PGSMethod):
 
         z_col = f"Z_norm2|{self._score_col}"
         if z_col not in target_adj.columns:
-            z_col = f"Z_norm1|{self._score_col}"
+            raise RuntimeError(f"Normalization output missing required column {z_col}")
         z = target_adj[z_col].to_numpy()
         self.model.fit(z.reshape(-1, 1), y)
         self.is_fitted = True
@@ -86,6 +77,6 @@ class NormalizationMethod(PGSMethod):
 
         z_col = f"Z_norm2|{self._score_col}"
         if z_col not in target_adj.columns:
-            z_col = f"Z_norm1|{self._score_col}"
+            raise RuntimeError(f"Normalization output missing required column {z_col}")
         z = target_adj[z_col].to_numpy()
         return self.model.predict_proba(z.reshape(-1, 1))[:, 1]

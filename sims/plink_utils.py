@@ -4,10 +4,8 @@ Helper functions for managing PLINK and external tools integration.
 import subprocess
 import os
 import shutil
-import tempfile
 import time
 from pathlib import Path
-import re
 
 def run_plink_conversion(
     vcf_path: str,
@@ -26,8 +24,9 @@ def run_plink_conversion(
     out_parent = Path(out_prefix).parent
     out_parent.mkdir(parents=True, exist_ok=True)
 
-    # Resolve PLINK executable: use PATH or fallback to CI location
-    plink_exe = shutil.which("plink2") or "/usr/local/bin/plink2"
+    plink_exe = shutil.which("plink2")
+    if plink_exe is None:
+        raise FileNotFoundError("plink2 not found on PATH.")
 
     def _wait_for_file(path: str, timeout_s: float = 10.0) -> bool:
         t0 = time.time()
@@ -59,45 +58,7 @@ def run_plink_conversion(
     if not _wait_for_file(vcf_path, timeout_s=10.0):
         raise RuntimeError(f"VCF input not found for PLINK conversion: {vcf_path}")
 
-    # Fast path: convert directly to avoid duplicating huge VCF files on disk.
     result = _run_plink(vcf_path)
-
-    # Fallback: normalize CHROM labels if direct conversion fails.
-    if result.returncode != 0:
-        if not os.path.exists(vcf_path):
-            raise RuntimeError(
-                "PLINK direct conversion failed and VCF input disappeared before fallback: "
-                f"{vcf_path}\nPLINK stderr:\n{result.stderr}"
-            )
-        print("Direct PLINK conversion failed; retrying with normalized CHROM labels...")
-
-        temp_dir = tempfile.mkdtemp(prefix="plink_vcf_")
-        vcf_numeric = str(Path(temp_dir) / f"{Path(out_prefix).name}_numeric.vcf")
-        chr_prefix_re = re.compile(r"^(chr)([0-9]+|[XYM]|MT)\b", flags=re.IGNORECASE)
-        try:
-            with open(vcf_path, "r", encoding="utf-8") as fin, open(vcf_numeric, "w", encoding="utf-8") as fout:
-                for line in fin:
-                    if line.startswith("#"):
-                        fout.write(line)
-                        continue
-                    parts = line.rstrip("\n").split("\t")
-                    if len(parts) < 2:
-                        fout.write(line)
-                        continue
-                    chrom = parts[0]
-                    m = chr_prefix_re.match(chrom)
-                    if m:
-                        chrom = chrom[len(m.group(1)) :]
-                    parts[0] = chrom
-                    fout.write("\t".join(parts) + "\n")
-            result = _run_plink(vcf_numeric)
-        except Exception as e:
-            raise RuntimeError(f"VCF preprocessing fallback failed: {e}")
-        finally:
-            if os.path.exists(vcf_numeric):
-                os.remove(vcf_numeric)
-            if os.path.isdir(temp_dir):
-                shutil.rmtree(temp_dir, ignore_errors=True)
 
     if result.returncode != 0:
         raise RuntimeError(f"PLINK conversion failed:\n{result.stderr}")

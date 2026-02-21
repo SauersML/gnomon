@@ -5,7 +5,6 @@ import time
 import urllib.request
 from pathlib import Path
 from typing import Callable
-from typing import Sequence
 
 import numpy as np
 import pandas as pd
@@ -30,21 +29,17 @@ def ensure_pgs003725(cache_dir: Path) -> Path:
     return dst
 
 
-def _pick_col(df: pd.DataFrame, candidates: Sequence[str]) -> str:
-    lower_to_real = {c.lower(): c for c in df.columns}
-    for c in candidates:
-        got = lower_to_real.get(c.lower())
-        if got is not None:
-            return got
-    raise RuntimeError(f"Missing required column; tried={candidates}, available={list(df.columns)}")
-
-
 def load_pgs003725_effects(score_path: Path, chr_filter: str = "22") -> np.ndarray:
     with gzip.open(score_path, "rt", encoding="utf-8", errors="replace") as f:
         df = pd.read_csv(f, sep="\t", comment="#")
 
-    chr_col = _pick_col(df, ["hm_chr", "chr_name", "chr", "chromosome"])
-    eff_col = _pick_col(df, ["effect_weight", "effect", "beta", "weight"])
+    chr_col = "hm_chr"
+    eff_col = "effect_weight"
+    missing = [c for c in (chr_col, eff_col) if c not in df.columns]
+    if missing:
+        raise RuntimeError(
+            f"PGS003725 missing required columns {missing}. Available={list(df.columns)}"
+        )
 
     chr_series = df[chr_col].astype(str).str.replace("chr", "", regex=False)
     chr_df = df.loc[chr_series == str(chr_filter)].copy()
@@ -83,16 +78,10 @@ def diploid_index_pairs(ts) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndar
             pop_list.append(p0 if p0 == p1 else p0)
             ind_list.append(ind_id)
 
-    if len(a_list) == 0:
-        if len(sample_nodes) % 2 != 0:
-            raise RuntimeError("Odd number of sample nodes; cannot pair into diploids")
-        for j in range(0, len(sample_nodes), 2):
-            n0 = int(sample_nodes[j])
-            n1 = int(sample_nodes[j + 1])
-            a_list.append(j)
-            b_list.append(j + 1)
-            pop_list.append(int(ts.node(n0).population))
-            ind_list.append(-1)
+    if ts.num_individuals == 0 or len(a_list) == 0:
+        raise RuntimeError(
+            "Tree sequence has no valid diploid individuals; sequential-node pairing fallback is disallowed."
+        )
 
     return (
         np.asarray(a_list, dtype=np.int64),
