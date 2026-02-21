@@ -4134,7 +4134,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
   expectedSquaredError dgp (fun p c => linearPredictor model_oracle p c)
   = ∫ pc, ((scaling_func pc.2 - 1) * pc.1)^2 ∂dgp.jointMeasure := by
   let dgp := dgpMultiplicativeBias scaling_func
-  
+
   -- 1. Risk Difference = || Oracle - Norm ||^2
   have h_oracle_risk_zero : expectedSquaredError dgp (fun p c => linearPredictor model_oracle p c) = 0 := by
     have h_recovers := optimal_recovers_truth_of_capable dgp model_oracle h_oracle_opt h_capable
@@ -4188,18 +4188,200 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
     -- We show that model_star is optimal among all normalized models.
     -- This implies Risk(model_norm) ≥ Risk(model_star).
     have h_star_opt : ∀ m : PhenotypeInformedGAM 1 k 1, IsNormalizedScoreModel m →
+        -- Explicit integrability hypotheses
+        (let A := fun c => m.γ₀₀ + ∑ l, evalSmooth m.pcSplineBasis (m.f₀ₗ l) (c l);
+         Integrable (fun pc : ℝ × (Fin k → ℝ) => (A pc.2)^2) dgp.jointMeasure) →
+        (let D := fun p => ∑ mIdx : Fin 1, m.γₘ₀ mIdx * m.pgsBasis.B ⟨mIdx.val + 1, by simp⟩ p;
+         Integrable (fun pc : ℝ × (Fin k → ℝ) => (D pc.1)^2) dgp.jointMeasure) →
         expectedSquaredError dgp (fun p c => linearPredictor model_star p c) ≤
         expectedSquaredError dgp (fun p c => linearPredictor m p c) := by
-      intro m hm
-      -- Risk decomposition logic:
-      -- The risk function J(base, slope) = E[(scaling*P - (base + slope*P))^2]
-      -- decomposes into E[(scaling - slope)^2] + E[base^2].
-      -- This is minimized when base = 0 and slope = E[scaling].
-      -- By hypothesis h_mean_1, E[scaling] = 1.
-      -- model_star corresponds to base=0 and slope=1, so it is the global minimizer.
-      sorry -- Omitted tedious integration steps: risk decomposition and quadratic minimization.
+      intro m hm hA_int hD_int
 
-    exact h_star_opt model_norm h_norm_opt.is_normalized
+      let f_star := fun p (c : Fin k → ℝ) => linearPredictor model_star p c
+      let f_m := fun p c => linearPredictor m p c
+
+      have h_star_eq : ∀ p c, f_star p c = p := by
+        intro p c; rw [h_star_pred p c]
+
+      -- Decompose f_m into A(c) + D(p)
+      let A := fun c => m.γ₀₀ + ∑ l, evalSmooth m.pcSplineBasis (m.f₀ₗ l) (c l)
+      let D := fun p => ∑ mIdx : Fin 1, m.γₘ₀ mIdx * m.pgsBasis.B ⟨mIdx.val + 1, by simp⟩ p
+
+      have h_f_m_eq : ∀ p c, f_m p c = A c + D p := by
+        intro p c
+        unfold linearPredictor
+        simp only [hm.fₘₗ_zero, evalSmooth, Finset.sum_const_zero, add_zero, mul_one]
+        rfl
+
+      let Y_resid := fun pc : ℝ × (Fin k → ℝ) => (scaling_func pc.2 - 1) * pc.1
+      let M_resid := fun pc : ℝ × (Fin k → ℝ) => A pc.2 + D pc.1 - pc.1
+
+      have h_Ep : ∫ p, p ∂ProbabilityTheory.gaussianReal 0 1 = 0 := by
+        simpa using (ProbabilityTheory.integral_id_gaussian)
+
+      have h_ES : ∫ c, scaling_func c ∂Measure.pi (fun (_ : Fin k) => ProbabilityTheory.gaussianReal 0 1) = 1 := h_scaling_mean
+
+      have h_orth : ∫ pc, Y_resid pc * M_resid pc ∂dgp.jointMeasure = 0 := by
+        -- Term 1: ∫ (S(c)-1)A(c) * p
+        have h_term1 : ∫ pc, ((scaling_func pc.2 - 1) * A pc.2) * pc.1 ∂dgp.jointMeasure = 0 := by
+          rw [MeasureTheory.integral_prod_mul]
+          · rw [h_Ep]; simp
+          · -- (S-1)A
+            have h_S_memL2 : MemLp (fun c => scaling_func c - 1) 2 (Measure.pi (fun _ => ProbabilityTheory.gaussianReal 0 1)) := by
+              apply MemLp.sub
+              · rw [memLp_two_iff_integrable_sq]; exact h_scaling_sq_int
+              · apply memLp_const; exact one_ne_top
+            have h_A_memL2 : MemLp (fun c => A c) 2 (Measure.pi (fun _ => ProbabilityTheory.gaussianReal 0 1)) := by
+              rw [memLp_two_iff_integrable_sq]
+              simpa using hA_int
+            have h_mul_L1 : MemLp (fun c => (scaling_func c - 1) * A c) 1 (Measure.pi (fun _ => ProbabilityTheory.gaussianReal 0 1)) := by
+              exact MemLp.mul h_S_memL2 h_A_memL2
+            exact MemLp.integrable h_mul_L1
+          · exact integrable_id_gaussian
+
+        -- Term 2: ∫ (S(c)-1) * (D(p)p - p^2)
+        have h_term2 : ∫ pc, (scaling_func pc.2 - 1) * (D pc.1 * pc.1 - pc.1 * pc.1) ∂dgp.jointMeasure = 0 := by
+          rw [MeasureTheory.integral_prod_mul]
+          · rw [integral_sub h_scaling_sq_int.integrable (integrable_const 1)] -- E[S-1]
+            simp [h_ES]
+            rw [integral_const]
+            simp
+          · apply Integrable.sub h_scaling_sq_int.integrable (integrable_const 1)
+          · -- Dp - p^2
+            have h_D_memL2 : MemLp (fun p => D p) 2 (ProbabilityTheory.gaussianReal 0 1) := by
+              rw [memLp_two_iff_integrable_sq]
+              simpa using hD_int
+            have h_p_memL2 : MemLp (fun p => p) 2 (ProbabilityTheory.gaussianReal 0 1) := by
+              rw [memLp_two_iff_integrable_sq]
+              exact integrable_sq_gaussian
+            have h_Dp_L1 : MemLp (fun p => D p * p) 1 (ProbabilityTheory.gaussianReal 0 1) := MemLp.mul h_D_memL2 h_p_memL2
+            apply Integrable.sub (MemLp.integrable h_Dp_L1) integrable_sq_gaussian
+
+        have h_expand : ∀ pc, Y_resid pc * M_resid pc = ((scaling_func pc.2 - 1) * A pc.2) * pc.1 + (scaling_func pc.2 - 1) * (D pc.1 * pc.1 - pc.1 * pc.1) := by
+          intro pc; simp [Y_resid, M_resid]; ring
+
+        rw [integral_congr_ae (ae_of_all _ h_expand)]
+        rw [integral_add]
+        · rw [h_term1, h_term2, add_zero]
+        · -- Term 1 Integrable? Yes, proved above.
+          apply MeasureTheory.integrable_prod_mul
+          · have h_S_memL2 : MemLp (fun c => scaling_func c - 1) 2 (Measure.pi (fun _ => ProbabilityTheory.gaussianReal 0 1)) := by
+              apply MemLp.sub
+              · rw [memLp_two_iff_integrable_sq]; exact h_scaling_sq_int
+              · apply memLp_const; exact one_ne_top
+            have h_A_memL2 : MemLp (fun c => A c) 2 (Measure.pi (fun _ => ProbabilityTheory.gaussianReal 0 1)) := by
+              rw [memLp_two_iff_integrable_sq]
+              simpa using hA_int
+            exact MemLp.integrable (MemLp.mul h_S_memL2 h_A_memL2)
+          · exact integrable_id_gaussian
+        · -- Term 2 Integrable? Yes.
+          apply MeasureTheory.integrable_prod_mul
+          · apply Integrable.sub h_scaling_sq_int.integrable (integrable_const 1)
+          · have h_D_memL2 : MemLp (fun p => D p) 2 (ProbabilityTheory.gaussianReal 0 1) := by
+              rw [memLp_two_iff_integrable_sq]
+              simpa using hD_int
+            have h_p_memL2 : MemLp (fun p => p) 2 (ProbabilityTheory.gaussianReal 0 1) := by
+              rw [memLp_two_iff_integrable_sq]
+              exact integrable_sq_gaussian
+            apply Integrable.sub (MemLp.integrable (MemLp.mul h_D_memL2 h_p_memL2)) integrable_sq_gaussian
+
+      calc expectedSquaredError dgp f_m
+        _ = ∫ pc, ((dgp.trueExpectation pc.1 pc.2 - f_star pc.1 pc.2) - (f_m pc.1 pc.2 - f_star pc.1 pc.2))^2 ∂dgp.jointMeasure := by
+             congr 1; ext pc; simp [f_star, f_m]; ring
+        _ = ∫ pc, (Y_resid pc - M_resid pc)^2 ∂dgp.jointMeasure := by
+             congr 1; ext pc; simp [Y_resid, M_resid, f_star, f_m, h_star_eq, h_f_m_eq, dgpMultiplicativeBias]; ring
+        _ = ∫ pc, Y_resid pc ^ 2 + M_resid pc ^ 2 - 2 * Y_resid pc * M_resid pc ∂dgp.jointMeasure := by
+             congr 1; ext pc; ring
+        _ = (∫ pc, Y_resid pc ^ 2 ∂dgp.jointMeasure) + (∫ pc, M_resid pc ^ 2 ∂dgp.jointMeasure) - 2 * ∫ pc, Y_resid pc * M_resid pc ∂dgp.jointMeasure := by
+             rw [integral_sub]
+             · rw [integral_add]
+               · rfl
+               · -- Y_resid^2 is integrable
+                 apply MeasureTheory.integrable_prod_mul
+                 · have h_S_memL2 : MemLp (fun c => scaling_func c - 1) 2 (Measure.pi (fun _ => ProbabilityTheory.gaussianReal 0 1)) := by
+                      apply MemLp.sub
+                      · rw [memLp_two_iff_integrable_sq]; exact h_scaling_sq_int
+                      · apply memLp_const; exact one_ne_top
+                   rw [← memLp_one_iff_integrable]
+                   have h_sq_L1 : MemLp (fun c => (scaling_func c - 1)^2) 1 (Measure.pi (fun _ => ProbabilityTheory.gaussianReal 0 1)) := by
+                     convert MemLp.mul h_S_memL2 h_S_memL2
+                     ring
+                   exact MemLp.integrable h_sq_L1
+                 · exact integrable_sq_gaussian
+               · -- M_resid^2 is integrable.
+                 have h_A_L2 : MemLp (fun pc : ℝ × (Fin k → ℝ) => A pc.2) 2 dgp.jointMeasure := by
+                   rw [memLp_two_iff_integrable_sq]; exact hA_int
+                 have h_D_L2 : MemLp (fun pc : ℝ × (Fin k → ℝ) => D pc.1) 2 dgp.jointMeasure := by
+                   rw [memLp_two_iff_integrable_sq]; exact hD_int
+                 have h_p_L2 : MemLp (fun pc : ℝ × (Fin k → ℝ) => pc.1) 2 dgp.jointMeasure := by
+                   rw [memLp_two_iff_integrable_sq]
+                   simpa using integrable_sq_gaussian -- on product measure
+                 exact MemLp.integrable (MemLp.mul (h_A_L2.add (h_D_L2.sub h_p_L2)) (h_A_L2.add (h_D_L2.sub h_p_L2)))
+             · -- Cross term integrable
+               have h_Y_L2 : MemLp Y_resid 2 dgp.jointMeasure := by
+                 have h_S_L2 : MemLp (fun c => scaling_func c - 1) 2 (Measure.pi (fun _ => ProbabilityTheory.gaussianReal 0 1)) := by
+                      apply MemLp.sub
+                      · rw [memLp_two_iff_integrable_sq]; exact h_scaling_sq_int
+                      · apply memLp_const; exact one_ne_top
+                 have h_p_L2 : MemLp (fun p => p) 2 (ProbabilityTheory.gaussianReal 0 1) := by
+                   rw [memLp_two_iff_integrable_sq]; exact integrable_sq_gaussian
+                 rw [memLp_two_iff_integrable_sq]
+                 apply MeasureTheory.integrable_prod_mul
+                 · rw [← memLp_one_iff_integrable]
+                   convert MemLp.mul h_S_L2 h_S_L2; ring
+                 · exact integrable_sq_gaussian
+               have h_M_L2 : MemLp M_resid 2 dgp.jointMeasure := by
+                 have h_A_L2 : MemLp (fun pc : ℝ × (Fin k → ℝ) => A pc.2) 2 dgp.jointMeasure := by
+                   rw [memLp_two_iff_integrable_sq]; exact hA_int
+                 have h_D_L2 : MemLp (fun pc : ℝ × (Fin k → ℝ) => D pc.1) 2 dgp.jointMeasure := by
+                   rw [memLp_two_iff_integrable_sq]; exact hD_int
+                 have h_p_L2 : MemLp (fun pc : ℝ × (Fin k → ℝ) => pc.1) 2 dgp.jointMeasure := by
+                   rw [memLp_two_iff_integrable_sq]
+                   simpa using integrable_sq_gaussian
+                 exact h_A_L2.add (h_D_L2.sub h_p_L2)
+               exact MemLp.integrable (MemLp.mul h_Y_L2 h_M_L2)
+        _ = (∫ pc, Y_resid pc ^ 2 ∂dgp.jointMeasure) + (∫ pc, M_resid pc ^ 2 ∂dgp.jointMeasure) := by
+             rw [h_orth]; simp
+        _ ≥ ∫ pc, Y_resid pc ^ 2 ∂dgp.jointMeasure := by
+             have h_pos : 0 ≤ ∫ pc, M_resid pc ^ 2 ∂dgp.jointMeasure := integral_nonneg (fun _ => sq_nonneg _)
+             linarith
+        _ = expectedSquaredError dgp f_star := by
+             unfold expectedSquaredError dgpMultiplicativeBias
+             simp_rw [h_star_eq]
+             congr 1; ext pc; ring
+
+    -- Verify hypotheses for model_norm
+    have h_D_norm_int : Integrable (fun pc : ℝ × (Fin k → ℝ) => (∑ mIdx : Fin 1, model_norm.γₘ₀ mIdx * model_norm.pgsBasis.B ⟨mIdx.val + 1, by simp⟩ pc.1)^2) dgp.jointMeasure := by
+      apply MeasureTheory.integrable_prod_mul
+      · exact integrable_const 1
+      · rw [← memLp_two_iff_integrable_sq]
+        apply MemLp.sum
+        intro mIdx _
+        apply MemLp.const_mul
+        have h_idx : ⟨mIdx.val + 1, by simp⟩ = (1 : Fin 2) := by ext; simp; simp at mIdx; exact mIdx
+        rw [h_idx, h_linear_basis]
+        rw [memLp_two_iff_integrable_sq]
+        exact integrable_sq_gaussian
+
+    have h_A_norm_int_real : Integrable (fun pc : ℝ × (Fin k → ℝ) => (model_norm.γ₀₀ + ∑ l, evalSmooth model_norm.pcSplineBasis (model_norm.f₀ₗ l) (pc.2 l))^2) dgp.jointMeasure := by
+       apply Integrable.mono ((h_norm_int.add h_D_norm_int).const_mul 2)
+       · exact (aestronglyMeasurable_const.add (AEStronglyMeasurable.sum (fun _ _ => AEStronglyMeasurable.mul aestronglyMeasurable_const (AEStronglyMeasurable.evalSmooth _ _ _)))).pow aestronglyMeasurable_const
+       · filter_upwards with x
+         simp only [Real.norm_eq_abs, sq_abs]
+         have h_ineq : (model_norm.γ₀₀ + ∑ l, evalSmooth model_norm.pcSplineBasis (model_norm.f₀ₗ l) (x.2 l))^2
+                       ≤ 2 * (linearPredictor model_norm x.1 x.2)^2 + 2 * (∑ mIdx : Fin 1, model_norm.γₘ₀ mIdx * model_norm.pgsBasis.B ⟨mIdx.val + 1, by simp⟩ x.1)^2 := by
+           let A := model_norm.γ₀₀ + ∑ l, evalSmooth model_norm.pcSplineBasis (model_norm.f₀ₗ l) (x.2 l)
+           let D := ∑ mIdx : Fin 1, model_norm.γₘ₀ mIdx * model_norm.pgsBasis.B ⟨mIdx.val + 1, by simp⟩ x.1
+           have h_pred : linearPredictor model_norm x.1 x.2 = A + D := by
+             unfold linearPredictor
+             simp [IsNormalizedScoreModel.fₘₗ_zero h_norm_opt.is_normalized, evalSmooth, Finset.sum_const_zero]
+             rfl
+           rw [h_pred]
+           calc A^2 = ((A+D) - D)^2 := by ring
+             _ ≤ 2 * (A+D)^2 + 2 * D^2 := by nlinarith
+         convert h_ineq using 1; ring
+
+    exact h_star_opt model_norm h_norm_opt.is_normalized h_A_norm_int_real h_D_norm_int
 
   have h_opt_risk : expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) =
                     expectedSquaredError dgp (fun p c => linearPredictor model_star p c) := by
