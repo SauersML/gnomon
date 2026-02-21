@@ -275,8 +275,10 @@ def _simulate_for_generation(
     if len(ooa_idx) < (n_ooa_train + n_ooa_test) or len(afr_idx) < n_afr:
         raise RuntimeError("Unexpected sample counts after simulation")
 
-    ooa_train_idx = ooa_idx[:n_ooa_train]
-    ooa_test_idx = ooa_idx[n_ooa_train:n_ooa_train + n_ooa_test]
+    rng = np.random.default_rng(seed + 23)
+    ooa_perm = rng.permutation(ooa_idx)
+    ooa_train_idx = ooa_perm[:n_ooa_train]
+    ooa_test_idx = ooa_perm[n_ooa_train:n_ooa_train + n_ooa_test]
 
     _log(f"[{prefix}] Sampling PCA+causal sites in one pass")
     pca_sites, causal_sites = sample_two_site_sets_for_maf(
@@ -317,7 +319,6 @@ def _simulate_for_generation(
     _log(f"[{prefix}] Sampling phenotypes from liability model")
     b0 = solve_intercept_for_prevalence(0.10, G_true)
     p = sigmoid(b0 + G_true)
-    rng = np.random.default_rng(seed + 23)
     y = rng.binomial(1, p).astype(np.int32)
 
     rows = []
@@ -458,8 +459,9 @@ def _cleanup_generation_artifacts(prefix: Path, work_dir: Path) -> None:
 def _fit_and_predict_methods(train_df: pd.DataFrame, test_df: pd.DataFrame, train_prs: np.ndarray, test_prs: np.ndarray) -> dict[str, np.ndarray]:
     out: dict[str, np.ndarray] = {}
 
-    P_train = StandardScaler(with_mean=True, with_std=True).fit_transform(train_prs.reshape(-1, 1)).ravel()
-    P_test = StandardScaler(with_mean=True, with_std=True).fit_transform(test_prs.reshape(-1, 1)).ravel()
+    prs_scaler = StandardScaler(with_mean=True, with_std=True)
+    P_train = prs_scaler.fit_transform(train_prs.reshape(-1, 1)).ravel()
+    P_test = prs_scaler.transform(test_prs.reshape(-1, 1)).ravel()
     PC_train = train_df[[f"pc{i+1}" for i in range(N_PCS)]].to_numpy()
     PC_test = test_df[[f"pc{i+1}" for i in range(N_PCS)]].to_numpy()
     y_train = train_df["y"].to_numpy(dtype=np.int32)
@@ -494,6 +496,44 @@ def _auc(y: np.ndarray, p: np.ndarray) -> float:
     if len(np.unique(y)) < 2:
         return np.nan
     return float(roc_auc_score(y, p))
+
+
+def _assert_noncollapsed_prs(labels: np.ndarray, prs: np.ndarray, context: str) -> None:
+    lab = np.asarray(labels, dtype=object)
+    x = np.asarray(prs, dtype=float)
+    if lab.shape[0] != x.shape[0]:
+        raise RuntimeError(f"{context}: label/score length mismatch ({lab.shape[0]} vs {x.shape[0]})")
+    if x.size == 0:
+        raise RuntimeError(f"{context}: empty PRS vector")
+
+    finite = np.isfinite(x)
+    if not np.all(finite):
+        raise RuntimeError(f"{context}: non-finite PRS values detected")
+
+    rows: list[dict[str, object]] = []
+    collapsed: list[str] = []
+    for g in sorted(pd.unique(lab)):
+        mask = lab == g
+        s = x[mask]
+        n = int(s.size)
+        n_unique = int(np.unique(s).size) if n > 0 else 0
+        sd = float(np.std(s, ddof=1)) if n > 1 else float("nan")
+        rows.append({"group": str(g), "n": n, "n_unique_prs": n_unique, "sd_prs": sd})
+        if n > 1 and n_unique <= 1:
+            collapsed.append(str(g))
+
+    overall_unique = int(np.unique(x).size)
+    _log_results_table(
+        f"[{context}] PRS variation by group",
+        pd.DataFrame(rows).sort_values("group").reset_index(drop=True),
+    )
+    _log(f"[{context}] Overall PRS unique values: {overall_unique}")
+
+    if overall_unique <= 1 or collapsed:
+        raise RuntimeError(
+            f"{context}: collapsed PRS detected "
+            f"(overall_unique={overall_unique}, collapsed_groups={collapsed})"
+        )
 
 
 def _plot_main(df: pd.DataFrame, out_dir: Path) -> None:
@@ -642,12 +682,30 @@ def _plot_pt_train_accuracy(metrics_df: pd.DataFrame, out_path: Path, title: str
     _apply_plot_style()
     fig, ax = plt.subplots(figsize=(7, 4.5))
     x = metrics_df["p_threshold"].to_numpy(dtype=float)
-    y = metrics_df["train_accuracy"].to_numpy(dtype=float)
-    ax.plot(x, y, marker="o", linewidth=2, color=CB["blue"])
+    ax.plot(x, metrics_df["train_accuracy"].to_numpy(dtype=float), marker="o", linewidth=2, color=CB["blue"], label="Accuracy")
+    if "train_balanced_accuracy" in metrics_df.columns:
+        ax.plot(
+            x,
+            metrics_df["train_balanced_accuracy"].to_numpy(dtype=float),
+            marker="s",
+            linewidth=2,
+            color=CB["orange"],
+            label="Balanced Accuracy",
+        )
+    if "train_auc" in metrics_df.columns:
+        ax.plot(
+            x,
+            metrics_df["train_auc"].to_numpy(dtype=float),
+            marker="^",
+            linewidth=2,
+            color=CB["green"],
+            label="AUC",
+        )
     ax.set_xscale("log")
     ax.set_xlabel("P+T p-value threshold")
-    ax.set_ylabel("Train accuracy")
+    ax.set_ylabel("Train metric")
     ax.set_title(title)
+    ax.legend(frameon=False, loc="best")
     _style_axes(ax)
     fig.tight_layout()
     fig.savefig(out_path, dpi=240)
@@ -748,7 +806,10 @@ def _run_generation_task(task: dict[str, object]) -> dict[str, object]:
         _plot_pt_train_accuracy(pt_metrics_df, pt_plot_path, title=f"fig1 g={g} seed={seed} train accuracy")
         _log(
             f"[fig1_g{g}_s{seed}] P+T selected p={float(pt_meta['best_p_threshold']):g} "
-            f"(train_accuracy={float(pt_meta['best_train_accuracy']):.4f}, n_snps={int(pt_meta['best_n_snps'])})"
+            f"(train_accuracy={float(pt_meta['best_train_accuracy']):.4f}, "
+            f"train_balanced_accuracy={float(pt_meta.get('best_train_balanced_accuracy', float('nan'))):.4f}, "
+            f"train_auc={float(pt_meta.get('best_train_auc', float('nan'))):.4f}, "
+            f"n_snps={int(pt_meta['best_n_snps'])})"
         )
         _log(f"[fig1_g{g}_s{seed}] P+T fit/scoring complete")
 
@@ -757,6 +818,16 @@ def _run_generation_task(task: dict[str, object]) -> dict[str, object]:
 
     train_df = train_df.set_index("IID").loc[train_scores["IID"].astype(str)].reset_index()
     test_df = test_df.set_index("IID").loc[test_scores["IID"].astype(str)].reset_index()
+    _assert_noncollapsed_prs(
+        train_df["group"].to_numpy(),
+        train_scores["PRS"].to_numpy(dtype=float),
+        context=f"fig1_g{g}_s{seed} train",
+    )
+    _assert_noncollapsed_prs(
+        test_df["group"].to_numpy(),
+        test_scores["PRS"].to_numpy(dtype=float),
+        context=f"fig1_g{g}_s{seed} test",
+    )
 
     pred = _fit_and_predict_methods(
         train_df,
@@ -949,19 +1020,21 @@ def main() -> None:
         pt_all.to_csv(out_dir / "figure1_pt_thresholds.tsv", sep="\t", index=False)
         _apply_plot_style()
         fig, ax = plt.subplots(figsize=(9, 5.5))
+        metric_col = "train_auc" if "train_auc" in pt_all.columns else "train_accuracy"
+        metric_label = "Train AUC" if metric_col == "train_auc" else "Train accuracy"
         for g in sorted(pt_all["gens"].unique()):
             sub = pt_all[pt_all["gens"] == g].sort_values("p_threshold")
             ax.plot(
                 sub["p_threshold"].to_numpy(dtype=float),
-                sub["train_accuracy"].to_numpy(dtype=float),
+                sub[metric_col].to_numpy(dtype=float),
                 marker="o",
                 linewidth=1.8,
                 label=f"g={int(g)}",
             )
         ax.set_xscale("log")
         ax.set_xlabel("P+T p-value threshold")
-        ax.set_ylabel("Train accuracy")
-        ax.set_title("Figure1 P+T train accuracy across thresholds")
+        ax.set_ylabel(metric_label)
+        ax.set_title(f"Figure1 P+T {metric_label.lower()} across thresholds")
         ax.legend(frameon=False, ncol=2)
         _style_axes(ax)
         fig.tight_layout()

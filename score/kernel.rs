@@ -154,7 +154,7 @@ pub fn accumulate_adjustments_for_person(
                     .get_simd_lane_unchecked(matrix_row_idx, i)
                     .simd_eq(u8x8::splat(1));
 
-                let adj = flip_mask.select(-weights_vec, weights_vec);
+                let adj = flip_mask.cast::<i32>().select(-weights_vec, weights_vec);
                 *accumulator_buffer.get_unchecked_mut(i) += adj;
             }
         }
@@ -170,7 +170,9 @@ pub fn accumulate_adjustments_for_person(
                     .get_simd_lane_unchecked(matrix_row_idx, i)
                     .simd_eq(u8x8::splat(1));
 
-                let adj = flip_mask.select(-two * weights_vec, two * weights_vec);
+                let adj = flip_mask
+                    .cast::<i32>()
+                    .select(-two * weights_vec, two * weights_vec);
                 *accumulator_buffer.get_unchecked_mut(i) += adj;
             }
         }

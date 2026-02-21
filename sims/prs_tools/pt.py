@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, roc_auc_score
+from sklearn.metrics import accuracy_score, balanced_accuracy_score, roc_auc_score
 
 
 class PPlusT:
@@ -25,6 +25,8 @@ class PPlusT:
         prune_step: int = 50,
         prune_r2: float = 0.2,
         fallback_top_k: int = 5000,
+        min_selected_snps: int = 50,
+        min_prs_sd: float = 1e-8,
     ):
         env_threads = os.environ.get("GCTB_THREADS")
         if threads is None and env_threads:
@@ -46,6 +48,8 @@ class PPlusT:
         self.prune_step = int(prune_step)
         self.prune_r2 = float(prune_r2)
         self.fallback_top_k = int(fallback_top_k)
+        self.min_selected_snps = int(min_selected_snps)
+        self.min_prs_sd = float(min_prs_sd)
 
     def _plink(self) -> str:
         return shutil.which("plink2") or "plink2"
@@ -108,24 +112,33 @@ class PPlusT:
         return ph[["IID", "y"]].dropna()
 
     @staticmethod
-    def _train_metrics(train_scores: pd.DataFrame, pheno: pd.DataFrame) -> tuple[float, float, int]:
+    def _train_metrics(train_scores: pd.DataFrame, pheno: pd.DataFrame) -> tuple[float, float, float, int]:
         m = pheno.merge(train_scores, on="IID", how="inner")
         m = m.dropna(subset=["y", "PRS"])
         n = int(len(m))
         if n == 0:
-            return float("nan"), float("nan"), 0
+            return float("nan"), float("nan"), float("nan"), 0
         y = m["y"].to_numpy(dtype=int)
         x = m["PRS"].to_numpy(dtype=float).reshape(-1, 1)
         uniq = np.unique(y)
         if uniq.size < 2:
-            return 1.0, float("nan"), n
+            return 1.0, 1.0, float("nan"), n
         lr = LogisticRegression(max_iter=1000, solver="lbfgs")
         lr.fit(x, y)
         p = lr.predict_proba(x)[:, 1]
         yhat = (p >= 0.5).astype(int)
         acc = float(accuracy_score(y, yhat))
+        bacc = float(balanced_accuracy_score(y, yhat))
         auc = float(roc_auc_score(y, p))
-        return acc, auc, n
+        return acc, bacc, auc, n
+
+    @staticmethod
+    def _prs_stats(scores: pd.DataFrame) -> tuple[float, int]:
+        prs = pd.to_numeric(scores["PRS"], errors="coerce").to_numpy(dtype=float)
+        prs = prs[np.isfinite(prs)]
+        if prs.size == 0:
+            return float("nan"), 0
+        return float(np.std(prs)), int(np.unique(prs).size)
 
     def fit_and_predict(
         self,
@@ -322,28 +335,50 @@ class PPlusT:
             n_snps = int(np.count_nonzero(all_w["P"].to_numpy(dtype=float) <= thr))
             if n_snps == 0:
                 n_snps = 1
-            train_acc, train_auc, n_train_used = self._train_metrics(train_scores, pheno)
+            prs_sd, prs_n_unique = self._prs_stats(train_scores)
+            is_degenerate = (not np.isfinite(prs_sd)) or (prs_sd <= self.min_prs_sd) or (prs_n_unique <= 2)
+            train_acc, train_bacc, train_auc, n_train_used = self._train_metrics(train_scores, pheno)
             records.append(
                 {
                     "p_threshold": thr,
                     "n_snps": n_snps,
                     "n_train_used": int(n_train_used),
                     "train_accuracy": train_acc,
+                    "train_balanced_accuracy": train_bacc,
                     "train_auc": train_auc,
+                    "train_prs_sd": prs_sd,
+                    "train_prs_n_unique": prs_n_unique,
+                    "is_degenerate": bool(is_degenerate),
                 }
             )
 
         metrics = pd.DataFrame(records).sort_values("p_threshold").reset_index(drop=True)
         metrics_rank = metrics.copy()
+        # Exclude pathological score distributions and tiny models first.
+        metrics_rank.loc[metrics_rank["is_degenerate"].astype(bool), ["train_accuracy", "train_balanced_accuracy", "train_auc"]] = -np.inf
+        metrics_rank.loc[metrics_rank["n_snps"] < max(1, self.min_selected_snps), ["train_accuracy", "train_balanced_accuracy", "train_auc"]] = -np.inf
         metrics_rank["train_accuracy"] = metrics_rank["train_accuracy"].fillna(-np.inf)
+        metrics_rank["train_balanced_accuracy"] = metrics_rank["train_balanced_accuracy"].fillna(-np.inf)
         metrics_rank["train_auc"] = metrics_rank["train_auc"].fillna(-np.inf)
-        best_idx = metrics_rank.sort_values(["train_accuracy", "train_auc", "n_snps"], ascending=[False, False, False]).index[0]
+        best_idx = metrics_rank.sort_values(["train_auc", "train_balanced_accuracy", "train_accuracy", "n_snps"], ascending=[False, False, False, False]).index[0]
+        if not np.isfinite(float(metrics_rank.loc[best_idx, "train_auc"])):
+            # If all thresholds were filtered, fall back to non-degenerate highest-AUC model.
+            fallback = metrics.copy()
+            fallback.loc[fallback["is_degenerate"].astype(bool), ["train_accuracy", "train_balanced_accuracy", "train_auc"]] = -np.inf
+            fallback["train_accuracy"] = fallback["train_accuracy"].fillna(-np.inf)
+            fallback["train_balanced_accuracy"] = fallback["train_balanced_accuracy"].fillna(-np.inf)
+            fallback["train_auc"] = fallback["train_auc"].fillna(-np.inf)
+            best_idx = fallback.sort_values(["train_auc", "train_balanced_accuracy", "train_accuracy", "n_snps"], ascending=[False, False, False, False]).index[0]
         best_thr = float(metrics.loc[best_idx, "p_threshold"])
         print(
             f"[P+T] selected best threshold={best_thr:g} "
             f"(train_accuracy={metrics.loc[best_idx, 'train_accuracy']}, "
+            f"train_balanced_accuracy={metrics.loc[best_idx, 'train_balanced_accuracy']}, "
             f"train_auc={metrics.loc[best_idx, 'train_auc']}, "
-            f"n_snps={int(metrics.loc[best_idx, 'n_snps'])})"
+            f"n_snps={int(metrics.loc[best_idx, 'n_snps'])}, "
+            f"train_prs_sd={metrics.loc[best_idx, 'train_prs_sd']}, "
+            f"train_prs_n_unique={int(metrics.loc[best_idx, 'train_prs_n_unique'])}, "
+            f"is_degenerate={bool(metrics.loc[best_idx, 'is_degenerate'])})"
         )
 
         best_train_scores = train_scores_by_thr[best_thr]
@@ -365,6 +400,7 @@ class PPlusT:
         meta = {
             "best_p_threshold": best_thr,
             "best_train_accuracy": float(metrics.loc[best_idx, "train_accuracy"]),
+            "best_train_balanced_accuracy": float(metrics.loc[best_idx, "train_balanced_accuracy"]),
             "best_train_auc": float(metrics.loc[best_idx, "train_auc"]),
             "best_n_snps": int(metrics.loc[best_idx, "n_snps"]),
             "threshold_metrics": metrics,

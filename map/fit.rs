@@ -1408,7 +1408,7 @@ fn standardize_column_simd(values: &mut [f64], mean: f64, inv: f64) {
         SimdLaneSelection::Lanes4 => {
             standardize_column_simd_lanes4(values, mean, inv);
         }
-        _ => standardize_column_simd_impl::<2>(values, mean, inv),
+        _ => standardize_column_simd_impl_lanes2(values, mean, inv),
     }
 }
 
@@ -1432,7 +1432,7 @@ fn standardize_column_simd_lanes4(values: &mut [f64], mean: f64, inv: f64) {
         any(target_arch = "aarch64", target_arch = "wasm32")
     ))]
     {
-        standardize_column_simd_impl::<4>(values, mean, inv);
+        standardize_column_simd_impl_lanes4(values, mean, inv);
     }
 }
 
@@ -1448,18 +1448,43 @@ fn standardize_column_simd_lanes4(values: &mut [f64], mean: f64, inv: f64) {
 /// sites guard this by checking `std::arch::is_x86_feature_detected!("avx")` or
 /// by only invoking it in configurations where AVX is guaranteed to be present.
 unsafe fn standardize_column_simd_avx(values: &mut [f64], mean: f64, inv: f64) {
-    standardize_column_simd_impl::<4>(values, mean, inv);
+    standardize_column_simd_impl_lanes4(values, mean, inv);
 }
 
 #[inline(always)]
-fn standardize_column_simd_impl<const LANES: usize>(values: &mut [f64], mean: f64, inv: f64) {
-    let mean_simd = Simd::<f64, LANES>::splat(mean);
-    let inv_simd = Simd::<f64, LANES>::splat(inv);
-    let zero = Simd::<f64, LANES>::splat(0.0);
+fn standardize_column_simd_impl_lanes2(values: &mut [f64], mean: f64, inv: f64) {
+    let mean_simd = Simd::<f64, 2>::splat(mean);
+    let inv_simd = Simd::<f64, 2>::splat(inv);
+    let zero = Simd::<f64, 2>::splat(0.0);
 
-    let (chunks, remainder) = values.as_chunks_mut::<LANES>();
+    let (chunks, remainder) = values.as_chunks_mut::<2>();
     for chunk in chunks {
-        let lane = Simd::<f64, LANES>::from_array(*chunk);
+        let lane = Simd::<f64, 2>::from_array(*chunk);
+        let mask = lane.is_finite();
+        let standardized = (lane - mean_simd) * inv_simd;
+        let result = mask.select(standardized, zero);
+        *chunk = result.to_array();
+    }
+
+    for value in remainder {
+        let raw = *value;
+        *value = if raw.is_finite() {
+            (raw - mean) * inv
+        } else {
+            0.0
+        };
+    }
+}
+
+#[inline(always)]
+fn standardize_column_simd_impl_lanes4(values: &mut [f64], mean: f64, inv: f64) {
+    let mean_simd = Simd::<f64, 4>::splat(mean);
+    let inv_simd = Simd::<f64, 4>::splat(inv);
+    let zero = Simd::<f64, 4>::splat(0.0);
+
+    let (chunks, remainder) = values.as_chunks_mut::<4>();
+    for chunk in chunks {
+        let lane = Simd::<f64, 4>::from_array(*chunk);
         let mask = lane.is_finite();
         let standardized = (lane - mean_simd) * inv_simd;
         let result = mask.select(standardized, zero);
@@ -1503,7 +1528,7 @@ fn standardize_column_with_mask_simd(values: &mut [f64], mask: &mut [f64], mean:
         SimdLaneSelection::Lanes4 => {
             standardize_column_with_mask_simd_lanes4(values, mask, mean, inv);
         }
-        _ => standardize_column_with_mask_simd_impl::<2>(values, mask, mean, inv),
+        _ => standardize_column_with_mask_simd_impl_lanes2(values, mask, mean, inv),
     }
 }
 
@@ -1531,7 +1556,7 @@ fn standardize_column_with_mask_simd_lanes4(
         any(target_arch = "aarch64", target_arch = "wasm32")
     ))]
     {
-        standardize_column_with_mask_simd_impl::<4>(values, mask, mean, inv);
+        standardize_column_with_mask_simd_impl_lanes4(values, mask, mean, inv);
     }
 }
 
@@ -1552,29 +1577,69 @@ unsafe fn standardize_column_with_mask_simd_avx(
     mean: f64,
     inv: f64,
 ) {
-    standardize_column_with_mask_simd_impl::<4>(values, mask, mean, inv);
+    standardize_column_with_mask_simd_impl_lanes4(values, mask, mean, inv);
 }
 
 #[inline(always)]
-fn standardize_column_with_mask_simd_impl<const LANES: usize>(
+fn standardize_column_with_mask_simd_impl_lanes2(
     values: &mut [f64],
     mask: &mut [f64],
     mean: f64,
     inv: f64,
 ) {
-    let mean_simd = Simd::<f64, LANES>::splat(mean);
-    let inv_simd = Simd::<f64, LANES>::splat(inv);
-    let zero = Simd::<f64, LANES>::splat(0.0);
-    let one = Simd::<f64, LANES>::splat(1.0);
+    let mean_simd = Simd::<f64, 2>::splat(mean);
+    let inv_simd = Simd::<f64, 2>::splat(inv);
+    let zero = Simd::<f64, 2>::splat(0.0);
+    let one = Simd::<f64, 2>::splat(1.0);
 
-    let (value_chunks, value_remainder) = values.as_chunks_mut::<LANES>();
-    let (mask_chunks, mask_remainder) = mask.as_chunks_mut::<LANES>();
+    let (value_chunks, value_remainder) = values.as_chunks_mut::<2>();
+    let (mask_chunks, mask_remainder) = mask.as_chunks_mut::<2>();
 
     debug_assert_eq!(value_chunks.len(), mask_chunks.len());
     debug_assert_eq!(value_remainder.len(), mask_remainder.len());
 
     for (value_chunk, mask_chunk) in value_chunks.iter_mut().zip(mask_chunks.iter_mut()) {
-        let lane = Simd::<f64, LANES>::from_array(*value_chunk);
+        let lane = Simd::<f64, 2>::from_array(*value_chunk);
+        let finite_mask = lane.is_finite();
+        let standardized = (lane - mean_simd) * inv_simd;
+        let result = finite_mask.select(standardized, zero);
+        *value_chunk = result.to_array();
+        let mask_values = finite_mask.select(one, zero);
+        *mask_chunk = mask_values.to_array();
+    }
+
+    for (value, mask_value) in value_remainder.iter_mut().zip(mask_remainder.iter_mut()) {
+        let raw = *value;
+        if raw.is_finite() {
+            *mask_value = 1.0;
+            *value = (raw - mean) * inv;
+        } else {
+            *mask_value = 0.0;
+            *value = 0.0;
+        }
+    }
+}
+
+#[inline(always)]
+fn standardize_column_with_mask_simd_impl_lanes4(
+    values: &mut [f64],
+    mask: &mut [f64],
+    mean: f64,
+    inv: f64,
+) {
+    let mean_simd = Simd::<f64, 4>::splat(mean);
+    let inv_simd = Simd::<f64, 4>::splat(inv);
+    let zero = Simd::<f64, 4>::splat(0.0);
+    let one = Simd::<f64, 4>::splat(1.0);
+
+    let (value_chunks, value_remainder) = values.as_chunks_mut::<4>();
+    let (mask_chunks, mask_remainder) = mask.as_chunks_mut::<4>();
+
+    debug_assert_eq!(value_chunks.len(), mask_chunks.len());
+    debug_assert_eq!(value_remainder.len(), mask_remainder.len());
+
+    for (value_chunk, mask_chunk) in value_chunks.iter_mut().zip(mask_chunks.iter_mut()) {
+        let lane = Simd::<f64, 4>::from_array(*value_chunk);
         let finite_mask = lane.is_finite();
         let standardized = (lane - mean_simd) * inv_simd;
         let result = finite_mask.select(standardized, zero);
@@ -1607,7 +1672,7 @@ fn standardize_column_simd_full(values: &mut [f64], mean: f64, inv: f64) {
         SimdLaneSelection::Lanes4 => {
             standardize_column_simd_full_lanes4(values, mean, inv);
         }
-        _ => standardize_column_simd_full_impl::<2>(values, mean, inv),
+        _ => standardize_column_simd_full_impl_lanes2(values, mean, inv),
     }
 }
 
@@ -1626,7 +1691,7 @@ fn standardize_column_simd_full_lanes4(values: &mut [f64], mean: f64, inv: f64) 
         any(target_arch = "aarch64", target_arch = "wasm32")
     ))]
     {
-        standardize_column_simd_full_impl::<4>(values, mean, inv);
+        standardize_column_simd_full_impl_lanes4(values, mean, inv);
     }
 }
 
@@ -1637,18 +1702,36 @@ fn standardize_column_simd_full_lanes4(values: &mut [f64], mean: f64, inv: f64) 
 /// Callers must guarantee AVX availability; runtime dispatch ensures that the
 /// function is only invoked when the CPU advertises the capability.
 unsafe fn standardize_column_simd_full_avx(values: &mut [f64], mean: f64, inv: f64) {
-    standardize_column_simd_full_impl::<4>(values, mean, inv);
+    standardize_column_simd_full_impl_lanes4(values, mean, inv);
 }
 
 #[cfg(test)]
 #[inline(always)]
-fn standardize_column_simd_full_impl<const LANES: usize>(values: &mut [f64], mean: f64, inv: f64) {
-    let mean_simd = Simd::<f64, LANES>::splat(mean);
-    let inv_simd = Simd::<f64, LANES>::splat(inv);
+fn standardize_column_simd_full_impl_lanes2(values: &mut [f64], mean: f64, inv: f64) {
+    let mean_simd = Simd::<f64, 2>::splat(mean);
+    let inv_simd = Simd::<f64, 2>::splat(inv);
 
-    let (chunks, remainder) = values.as_chunks_mut::<LANES>();
+    let (chunks, remainder) = values.as_chunks_mut::<2>();
     for chunk in chunks {
-        let lane = Simd::<f64, LANES>::from_array(*chunk);
+        let lane = Simd::<f64, 2>::from_array(*chunk);
+        let standardized = (lane - mean_simd) * inv_simd;
+        *chunk = standardized.to_array();
+    }
+
+    for value in remainder {
+        *value = (*value - mean) * inv;
+    }
+}
+
+#[cfg(test)]
+#[inline(always)]
+fn standardize_column_simd_full_impl_lanes4(values: &mut [f64], mean: f64, inv: f64) {
+    let mean_simd = Simd::<f64, 4>::splat(mean);
+    let inv_simd = Simd::<f64, 4>::splat(inv);
+
+    let (chunks, remainder) = values.as_chunks_mut::<4>();
+    for chunk in chunks {
+        let lane = Simd::<f64, 4>::from_array(*chunk);
         let standardized = (lane - mean_simd) * inv_simd;
         *chunk = standardized.to_array();
     }
@@ -1683,7 +1766,7 @@ fn sum_and_count_finite(values: &[f64]) -> (f64, usize) {
                 log::debug!(
                     "Using generic four-lane sum_and_count_finite implementation for non-x86 architecture"
                 );
-                sum_and_count_finite_impl::<4>(values)
+                sum_and_count_finite_impl_lanes4(values)
             }
 
             #[cfg(not(any(
@@ -1696,22 +1779,47 @@ fn sum_and_count_finite(values: &[f64]) -> (f64, usize) {
                 log::warn!(
                     "Falling back to two-lane sum_and_count_finite implementation despite four-lane selection"
                 );
-                return sum_and_count_finite_impl::<2>(values);
+                return sum_and_count_finite_impl_lanes2(values);
             }
         }
-        _ => sum_and_count_finite_impl::<2>(values),
+        _ => sum_and_count_finite_impl_lanes2(values),
     }
 }
 
 #[inline(always)]
-fn sum_and_count_finite_impl<const LANES: usize>(values: &[f64]) -> (f64, usize) {
+fn sum_and_count_finite_impl_lanes2(values: &[f64]) -> (f64, usize) {
     let mut sum = 0.0;
     let mut count = 0usize;
-    let zero = Simd::<f64, LANES>::splat(0.0);
+    let zero = Simd::<f64, 2>::splat(0.0);
 
-    let (chunks, remainder) = values.as_chunks::<LANES>();
+    let (chunks, remainder) = values.as_chunks::<2>();
     for chunk in chunks {
-        let lane = Simd::<f64, LANES>::from_array(*chunk);
+        let lane = Simd::<f64, 2>::from_array(*chunk);
+        let mask = lane.is_finite();
+        let finite = mask.select(lane, zero);
+        sum += finite.reduce_sum();
+        count += mask.to_bitmask().count_ones() as usize;
+    }
+
+    for &value in remainder {
+        if value.is_finite() {
+            sum += value;
+            count += 1;
+        }
+    }
+
+    (sum, count)
+}
+
+#[inline(always)]
+fn sum_and_count_finite_impl_lanes4(values: &[f64]) -> (f64, usize) {
+    let mut sum = 0.0;
+    let mut count = 0usize;
+    let zero = Simd::<f64, 4>::splat(0.0);
+
+    let (chunks, remainder) = values.as_chunks::<4>();
+    for chunk in chunks {
+        let lane = Simd::<f64, 4>::from_array(*chunk);
         let mask = lane.is_finite();
         let finite = mask.select(lane, zero);
         sum += finite.reduce_sum();
@@ -1737,7 +1845,7 @@ fn sum_and_count_finite_impl<const LANES: usize>(values: &[f64]) -> (f64, usize)
 /// Callers must ensure AVX is supported by the running CPU. Runtime feature
 /// checks protect all invocations of this function.
 unsafe fn sum_and_count_finite_avx(values: &[f64]) -> (f64, usize) {
-    sum_and_count_finite_impl::<4>(values)
+    sum_and_count_finite_impl_lanes4(values)
 }
 
 #[derive(Clone, Debug)]
