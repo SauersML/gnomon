@@ -13,7 +13,6 @@ use crossbeam_queue::ArrayQueue;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use memmap2::{Mmap, MmapOptions};
 use num_cpus;
-use rand::{RngCore, thread_rng};
 use rayon::prelude::*;
 use std::env;
 use std::error::Error;
@@ -910,8 +909,7 @@ fn unique_spool_filename(stem: &str) -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_else(|_| Duration::from_secs(0));
     let timestamp = now.as_nanos();
-    let mut rng = thread_rng();
-    let random_component: u32 = rng.next_u32();
+    let random_component: u32 = rand::random();
     format!(
         "{}.{}.{}.{}.complex_spool.bin",
         stem, pid, timestamp, random_component

@@ -25,7 +25,7 @@ rayon = "1.11.0"
 crossbeam-queue = "0.3.12"
 tokio = { version = "1.47.1", features = ["rt-multi-thread"] }
 num_cpus = "1.17.0"
-rand = "0.8"
+rand = "0.10.0"
 ryu = "1.0.20"
 crossbeam-channel = "0.5.15"
 natord = "1.0.9"
@@ -96,7 +96,7 @@ unused_imports = "deny"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
-rand = "0.8"
+rand = "0.10.0"
 rand_distr = "0.4.3"
 tempfile = "3.21"
 approx = "0.5"

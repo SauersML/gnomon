@@ -1418,14 +1418,12 @@ fn derive_spool_destination(base_path: &Path) -> (PathBuf, String) {
 }
 
 fn unique_spool_filename(stem: &str) -> String {
-    use rand::{RngCore, thread_rng};
     let pid = process::id();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_else(|_| Duration::from_secs(0));
     let timestamp = now.as_nanos();
-    let mut rng = thread_rng();
-    let random_component: u32 = rng.next_u32();
+    let random_component: u32 = rand::random();
     format!(
         "{}.{}.{}.{}.complex_spool.bin",
         stem, pid, timestamp, random_component

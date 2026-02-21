@@ -28,7 +28,7 @@ use faer::Side;
 use mini_mcmc::generic_hmc::HamiltonianTarget;
 use mini_mcmc::generic_nuts::GenericNUTS;
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, Axis};
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use rand::{RngExt, SeedableRng, rngs::StdRng};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -643,8 +643,8 @@ pub fn run_nuts_sampling(
     let initial_positions: Vec<Array1<f64>> = (0..config.n_chains)
         .map(|_| {
             Array1::from_shape_fn(dim, |_| {
-                let u1: f64 = rng.r#gen::<f64>().max(1e-10); // Prevent ln(0) = -inf
-                let u2: f64 = rng.r#gen();
+                let u1: f64 = rng.random::<f64>().max(1e-10); // Prevent ln(0) = -inf
+                let u2: f64 = rng.random();
                 let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
                 z * 0.1
             })
@@ -880,8 +880,8 @@ mod survival_hmc {
         let initial_positions: Vec<Array1<f64>> = (0..config.n_chains)
             .map(|_| {
                 Array1::from_shape_fn(dim, |_| {
-                    let u1: f64 = rng.r#gen::<f64>().max(1e-10); // Prevent ln(0) = -inf
-                    let u2: f64 = rng.r#gen();
+                    let u1: f64 = rng.random::<f64>().max(1e-10); // Prevent ln(0) = -inf
+                    let u2: f64 = rng.random();
                     let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
                     z * 0.1
                 })
@@ -992,7 +992,7 @@ mod survival_hmc {
             let age_entry = Array1::<f64>::from_shape_fn(n, |_| 40.0 + rng.gen_range(0.0..10.0));
             let age_exit = Array1::<f64>::from_shape_fn(n, |i| age_entry[i] + rng.gen_range(1.0..20.0));
             let event_target = Array1::<u8>::from_shape_fn(n, |_| {
-                if rng.r#gen::<f64>() < 0.3 { 1 } else { 0 }
+                if rand::RngExt::random::<f64>(&mut rng) < 0.3 { 1 } else { 0 }
             });
             let sample_weight = Array1::<f64>::ones(n);
             let event_competing = Array1::<u8>::zeros(n);
@@ -1352,7 +1352,7 @@ pub fn run_joint_nuts_sampling(
     mode_arr.slice_mut(ndarray::s![p_base..]).assign(&mt);
     let mut rng = StdRng::seed_from_u64(config.seed);
     let initial_positions: Vec<Array1<f64>> = (0..config.n_chains).map(|_| Array1::from_shape_fn(dim, |_| {
-        let u1: f64 = rng.r#gen::<f64>().max(1e-10); let u2: f64 = rng.r#gen();
+        let u1: f64 = rng.random::<f64>().max(1e-10); let u2: f64 = rng.random();
         (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos() * 0.1
     })).collect();
     let mut sampler = GenericNUTS::new(target, initial_positions, config.target_accept);
@@ -1749,11 +1749,19 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(999);
 
         // Random design matrix
-        let x_data: Vec<f64> = (0..n_obs * dim).map(|_| rng.r#gen::<f64>() * 2.0 - 1.0).collect();
+        let x_data: Vec<f64> = (0..n_obs * dim)
+            .map(|_| rand::RngExt::random::<f64>(&mut rng) * 2.0 - 1.0)
+            .collect();
         let x = ndarray::Array2::from_shape_vec((n_obs, dim), x_data).unwrap();
         
         // Random binary outcomes
-        let y = ndarray::Array1::from_shape_fn(n_obs, |_| if rng.r#gen::<f64>() > 0.5 { 1.0 } else { 0.0 });
+        let y = ndarray::Array1::from_shape_fn(n_obs, |_| {
+            if rand::RngExt::random::<f64>(&mut rng) > 0.5 {
+                1.0
+            } else {
+                0.0
+            }
+        });
         let weights = ndarray::Array1::ones(n_obs);
         
         // Ridge penalty
@@ -1815,10 +1823,18 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(555);
 
         // Random design matrix
-        let x_data: Vec<f64> = (0..n_obs * dim).map(|_| rng.r#gen::<f64>() * 2.0 - 1.0).collect();
+        let x_data: Vec<f64> = (0..n_obs * dim)
+            .map(|_| rand::RngExt::random::<f64>(&mut rng) * 2.0 - 1.0)
+            .collect();
         let x = ndarray::Array2::from_shape_vec((n_obs, dim), x_data).unwrap();
         
-        let y = ndarray::Array1::from_shape_fn(n_obs, |_| if rng.r#gen::<f64>() > 0.5 { 1.0 } else { 0.0 });
+        let y = ndarray::Array1::from_shape_fn(n_obs, |_| {
+            if rand::RngExt::random::<f64>(&mut rng) > 0.5 {
+                1.0
+            } else {
+                0.0
+            }
+        });
         let weights = ndarray::Array1::ones(n_obs);
         let penalty = ndarray::Array2::from_diag(&ndarray::Array1::from_elem(dim, 0.1));
         let mode = ndarray::Array1::zeros(dim);
@@ -1898,8 +1914,8 @@ mod tests {
         // Generate response: y = X * β + ε, where ε ~ N(0, 1)
         let eta = x.dot(&true_beta);
         let noise: Array1<f64> = Array1::from_shape_fn(n, |_| {
-            let u1: f64 = rng.r#gen::<f64>().max(1e-10); // Prevent ln(0) = -inf
-            let u2: f64 = rng.r#gen();
+            let u1: f64 = rng.random::<f64>().max(1e-10); // Prevent ln(0) = -inf
+            let u2: f64 = rng.random();
             (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
         });
         let y = &eta + &noise;
@@ -2033,7 +2049,11 @@ mod tests {
         let eta = x.dot(&true_beta);
         let y: Array1<f64> = eta.mapv(|e| {
             let p = 1.0 / (1.0 + (-e).exp());
-            if rng.r#gen::<f64>() < p { 1.0 } else { 0.0 }
+            if rand::RngExt::random::<f64>(&mut rng) < p {
+                1.0
+            } else {
+                0.0
+            }
         });
         let weights = Array1::<f64>::ones(n);
 
