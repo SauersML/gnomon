@@ -13,10 +13,11 @@ use cudarc::driver::{
     CudaContext, CudaEvent, CudaFunction, CudaSlice, CudaStream, CudaView, CudaViewMut,
     DriverError, LaunchConfig, PinnedHostSlice, PushKernelArg,
 };
-use cudarc::nvrtc::compile_ptx;
+use cudarc::nvrtc::{Ptx, compile_ptx, result as nvrtc_result, sys as nvrtc_sys};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use memmap2::{Mmap, MmapOptions};
 use rayon::prelude::*;
+use std::ffi::CString;
 use std::env;
 use std::fs::{self, File};
 use std::io::{BufWriter, IsTerminal, Write};
@@ -489,9 +490,25 @@ impl CudaRuntime {
             .map_err(|e| format!("Failed to upload full count-mask matrix: {e:?}"))?;
 
         let ptx = compile_ptx(CUDA_KERNELS).map_err(|e| format!("NVRTC compile failed: {e:?}"))?;
-        let module = ctx
-            .load_module(ptx)
-            .map_err(|e| format!("Failed to load CUDA module: {e:?}"))?;
+        let module = match ctx.load_module(ptx) {
+            Ok(module) => module,
+            Err(load_err) if should_retry_with_cubin(load_err) => {
+                let (cc_major, cc_minor) = ctx
+                    .compute_capability()
+                    .map_err(|e| format!("Failed to query device compute capability: {e:?}"))?;
+                eprintln!(
+                    "> CUDA module load rejected PTX ({:?}); retrying with CUBIN for sm_{}{}.",
+                    load_err.0, cc_major, cc_minor
+                );
+                let cubin = compile_cubin_for_device(cc_major, cc_minor)?;
+                ctx.load_module(Ptx::from_binary(cubin)).map_err(|e| {
+                    format!(
+                        "Failed to load CUDA module after CUBIN fallback (original PTX load error: {load_err:?}): {e:?}"
+                    )
+                })?
+            }
+            Err(e) => return Err(format!("Failed to load CUDA module: {e:?}")),
+        };
 
         let unpack_kernel = module
             .load_function("unpack_plink")
@@ -535,6 +552,64 @@ impl CudaRuntime {
             pinned_reconciled,
         })
     }
+}
+
+fn should_retry_with_cubin(load_err: DriverError) -> bool {
+    matches!(
+        load_err.0,
+        cudarc::driver::sys::CUresult::CUDA_ERROR_UNSUPPORTED_PTX_VERSION
+            | cudarc::driver::sys::CUresult::CUDA_ERROR_INVALID_PTX
+    )
+}
+
+fn compile_cubin_for_device(cc_major: i32, cc_minor: i32) -> Result<Vec<u8>, String> {
+    let arch_flag = format!("--gpu-architecture=sm_{cc_major}{cc_minor}");
+
+    let src = CString::new(CUDA_KERNELS)
+        .map_err(|_| "CUDA kernel source contained interior NUL".to_string())?;
+    let prog = nvrtc_result::create_program(src.as_c_str(), None)
+        .map_err(|e| format!("NVRTC create_program failed for CUBIN fallback: {e:?}"))?;
+
+    let compile_res = unsafe { nvrtc_result::compile_program(prog, &[arch_flag.as_str()]) };
+    if let Err(err) = compile_res {
+        let log = nvrtc_program_log(prog).unwrap_or_else(|| "<no NVRTC log available>".to_string());
+        let _ = unsafe { nvrtc_result::destroy_program(prog) };
+        return Err(format!(
+            "NVRTC CUBIN fallback compile failed ({err:?}) with {arch_flag}: {log}"
+        ));
+    }
+
+    let mut cubin_size: usize = 0;
+    let size_res = unsafe { nvrtc_sys::nvrtcGetCUBINSize(prog, &mut cubin_size as *mut _) };
+    if let Err(e) = size_res.result() {
+        let _ = unsafe { nvrtc_result::destroy_program(prog) };
+        return Err(format!("NVRTC CUBIN fallback get size failed: {e:?}"));
+    }
+
+    let mut cubin_raw: Vec<i8> = vec![0; cubin_size];
+    let cubin_res = unsafe { nvrtc_sys::nvrtcGetCUBIN(prog, cubin_raw.as_mut_ptr()) };
+    if let Err(e) = cubin_res.result() {
+        let _ = unsafe { nvrtc_result::destroy_program(prog) };
+        return Err(format!("NVRTC CUBIN fallback get data failed: {e:?}"));
+    }
+
+    let destroy_res = unsafe { nvrtc_result::destroy_program(prog) };
+    if let Err(e) = destroy_res {
+        return Err(format!(
+            "NVRTC CUBIN fallback destroy_program failed: {e:?}"
+        ));
+    }
+
+    Ok(cubin_raw.into_iter().map(|b| b as u8).collect())
+}
+
+fn nvrtc_program_log(prog: nvrtc_sys::nvrtcProgram) -> Option<String> {
+    let raw = unsafe { nvrtc_result::get_program_log(prog) }.ok()?;
+    let mut bytes: Vec<u8> = raw.into_iter().map(|b| b as u8).collect();
+    if let Some(pos) = bytes.iter().position(|&b| b == 0) {
+        bytes.truncate(pos);
+    }
+    Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 fn run_single_file_cuda(

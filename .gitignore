@@ -60,3 +60,6 @@ gh_*/
 /Cargo.lock
 /confounding.tsv
 /divergence_g20.tsv
+
+# Keep local build/dependency caches out of git status
+/target/
