@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::ffi::OsString;
 use std::fmt::Write as FmtWrite;
-use std::fs::{self, File};
+use std::fs::{self, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Once};
@@ -832,89 +832,154 @@ fn write_scores_to_file(
     missing_counts: &[u32],
     score_regions: Option<&HashMap<String, GenomicRegion>>,
 ) -> io::Result<()> {
-    let file = File::create(path)?;
-    let mut writer = BufWriter::new(file);
+    let output_dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let output_name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Output path '{}' has no file name.", path.display()),
+        )
+    })?;
+
+    let pid = std::process::id();
+    let ts_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+
+    let mut temp_path = None;
+    let mut temp_file = None;
+    for attempt in 0..32u32 {
+        let candidate = output_dir.join(format!(
+            ".{}.{}.{}.tmp",
+            output_name.to_string_lossy(),
+            pid,
+            ts_nanos + attempt as u128
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                temp_path = Some(candidate);
+                temp_file = Some(file);
+                break;
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+
+    let temp_path = temp_path.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "Failed to allocate a unique temporary output file in '{}'.",
+                output_dir.display()
+            ),
+        )
+    })?;
+    let temp_file = temp_file.expect("temporary file must exist when temp path exists");
+
+    let mut writer = BufWriter::new(temp_file);
     let num_scores = score_names.len();
 
-    if let Some(regions) = score_regions {
-        let mut wrote_metadata_header = false;
-        for name in score_names {
-            if let Some(region) = regions.get(name) {
-                if !wrote_metadata_header {
-                    writeln!(writer, "#REGION\tSCORE\tINTERVAL")?;
-                    wrote_metadata_header = true;
+    let write_result = (|| -> io::Result<()> {
+        if let Some(regions) = score_regions {
+            let mut wrote_metadata_header = false;
+            for name in score_names {
+                if let Some(region) = regions.get(name) {
+                    if !wrote_metadata_header {
+                        writeln!(writer, "#REGION\tSCORE\tINTERVAL")?;
+                        wrote_metadata_header = true;
+                    }
+                    writeln!(writer, "#REGION\t{name}\t{region}")?;
                 }
-                writeln!(writer, "#REGION\t{name}\t{region}")?;
             }
         }
-    }
 
-    // Write the new, more descriptive, and correctly tab-separated header.
-    write!(writer, "#IID")?;
-    for name in score_names {
-        write!(writer, "\t{name}_AVG\t{name}_MISSING_PCT")?;
-    }
-    writeln!(writer)?;
-
-    let mut line_buffer = String::with_capacity(
-        person_iids
-            .first()
-            .map_or(128, |s| s.len() + num_scores * 24),
-    );
-    let mut sum_score_chunks = sum_scores.chunks_exact(num_scores);
-    let mut missing_count_chunks = missing_counts.chunks_exact(num_scores);
-    let mut ryu_buffer_score = ryu::Buffer::new();
-    let mut ryu_buffer_missing = ryu::Buffer::new();
-
-    for iid in person_iids {
-        let person_sum_scores = sum_score_chunks.next().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Mismatched number of persons and score rows during final write.",
-            )
-        })?;
-        let person_missing_counts = missing_count_chunks.next().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Mismatched number of persons and missing count rows during final write.",
-            )
-        })?;
-
-        line_buffer.clear();
-        write!(&mut line_buffer, "{iid}").unwrap();
-
-        for i in 0..num_scores {
-            let final_sum_score = person_sum_scores[i];
-            let missing_count = person_missing_counts[i];
-            let total_variants_for_score = score_variant_counts[i];
-
-            // The score is calculated based on the number of non-missing variants.
-            // This behavior matches standard tools when mean-imputation is disabled.
-            let variants_used = total_variants_for_score.saturating_sub(missing_count);
-
-            let avg_score = if variants_used > 0 {
-                final_sum_score / (variants_used as f64)
-            } else {
-                0.0
-            };
-
-            let missing_pct = if total_variants_for_score > 0 {
-                (missing_count as f32 / total_variants_for_score as f32) * 100.0
-            } else {
-                0.0
-            };
-
-            // Write the correctly tab-separated data columns.
-            write!(
-                &mut line_buffer,
-                "\t{}\t{}",
-                ryu_buffer_score.format(avg_score),
-                ryu_buffer_missing.format(missing_pct)
-            )
-            .unwrap();
+        // Write the new, more descriptive, and correctly tab-separated header.
+        write!(writer, "#IID")?;
+        for name in score_names {
+            write!(writer, "\t{name}_AVG\t{name}_MISSING_PCT")?;
         }
-        writeln!(writer, "{line_buffer}")?;
+        writeln!(writer)?;
+
+        let mut line_buffer = String::with_capacity(
+            person_iids
+                .first()
+                .map_or(128, |s| s.len() + num_scores * 24),
+        );
+        let mut sum_score_chunks = sum_scores.chunks_exact(num_scores);
+        let mut missing_count_chunks = missing_counts.chunks_exact(num_scores);
+        let mut ryu_buffer_score = ryu::Buffer::new();
+        let mut ryu_buffer_missing = ryu::Buffer::new();
+
+        for iid in person_iids {
+            let person_sum_scores = sum_score_chunks.next().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Mismatched number of persons and score rows during final write.",
+                )
+            })?;
+            let person_missing_counts = missing_count_chunks.next().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Mismatched number of persons and missing count rows during final write.",
+                )
+            })?;
+
+            line_buffer.clear();
+            write!(&mut line_buffer, "{iid}").unwrap();
+
+            for i in 0..num_scores {
+                let final_sum_score = person_sum_scores[i];
+                let missing_count = person_missing_counts[i];
+                let total_variants_for_score = score_variant_counts[i];
+
+                // The score is calculated based on the number of non-missing variants.
+                // This behavior matches standard tools when mean-imputation is disabled.
+                let variants_used = total_variants_for_score.saturating_sub(missing_count);
+
+                let avg_score = if variants_used > 0 {
+                    final_sum_score / (variants_used as f64)
+                } else {
+                    0.0
+                };
+
+                let missing_pct = if total_variants_for_score > 0 {
+                    (missing_count as f32 / total_variants_for_score as f32) * 100.0
+                } else {
+                    0.0
+                };
+
+                // Write the correctly tab-separated data columns.
+                write!(
+                    &mut line_buffer,
+                    "\t{}\t{}",
+                    ryu_buffer_score.format(avg_score),
+                    ryu_buffer_missing.format(missing_pct)
+                )
+                .unwrap();
+            }
+            writeln!(writer, "{line_buffer}")?;
+        }
+
+        writer.flush()?;
+        let file = writer.into_inner().map_err(io::Error::other)?;
+        file.sync_all()?;
+        Ok(())
+    })();
+
+    if let Err(err) = write_result {
+        let _ = fs::remove_file(&temp_path);
+        return Err(err);
     }
 
-    writer.flush()
+    fs::rename(&temp_path, path).inspect_err(|_| {
+        let _ = fs::remove_file(&temp_path);
+    })
 }
