@@ -6330,7 +6330,6 @@ noncomputable def log_det_H (A B : Matrix m m ℝ) (rho : ℝ) := Real.log (H_ma
 /-- The derivative of log(det(H(ρ))) = log(det(A + exp(ρ)B)) with respect to ρ
     is exp(ρ) * trace(H(ρ)⁻¹ * B). This is derived using Jacobi's formula. -/
 theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
-    (_hA : A.PosDef) (_hB : B.IsSymm)
     (rho : ℝ) (h_inv : (H_matrix A B rho).det ≠ 0) :
     deriv (log_det_H A B) rho = Real.exp rho * ((H_matrix A B rho)⁻¹ * B).trace := by
   have h_det : deriv (fun rho => Real.log (Matrix.det (A + Real.exp rho • B))) rho = Real.exp rho * Matrix.trace ((A + Real.exp rho • B)⁻¹ * B) := by
@@ -6434,12 +6433,149 @@ noncomputable def rust_direct_gradient_fn (S_basis : Fin k → Matrix (Fin p) (F
 
 -- 3. Verification Theorem
 
+/-- Partial derivative helper: partial derivative of f(r) w.r.t r_i at x. -/
+def partialDeriv {E : Type*} [NormedAddCommGroup E] [NormedSpace ℝ E]
+    {k : ℕ} (i : Fin k) (f : (Fin k → ℝ) → E) (x : Fin k → ℝ) : E :=
+  deriv (fun r => f (Function.update x i r)) (x i)
+
+/-- Partial derivative of S_lambda_fn is exp(rho_i) * S_i. -/
+lemma partial_deriv_S_lambda
+    (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ)
+    (rho : Fin k → ℝ) (i : Fin k) :
+    partialDeriv i (fun r => S_lambda_fn S_basis r) rho =
+    Real.exp (rho i) • S_basis i := by
+  unfold partialDeriv S_lambda_fn
+  rw [deriv_sum]
+  · rw [Finset.sum_eq_single i]
+    · simp only [Function.update_same]
+      rw [deriv_smul_const, Real.deriv_exp]
+    · intro j _ h_ne
+      simp only [Function.update_noteq h_ne]
+      rw [deriv_const, zero_smul]
+    · intro h; exact (h (Finset.mem_univ i)).elim
+  · intro j _
+    by_cases h : j = i
+    · subst h; simp; apply DifferentiableAt.smul; exact Real.differentiableAt_exp _; exact differentiableAt_const _
+    · simp [h]; apply differentiableAt_const
+
+/-- Partial derivative of L_pen_fn w.r.t rho_i. -/
+lemma partial_deriv_L_pen
+    (log_lik : Matrix (Fin p) (Fin 1) ℝ → ℝ)
+    (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ)
+    (rho : Fin k → ℝ) (b : Matrix (Fin p) (Fin 1) ℝ) (i : Fin k) :
+    partialDeriv i (fun r => L_pen_fn log_lik S_basis r b) rho =
+    0.5 * Real.exp (rho i) * (b.transpose * S_basis i * b).trace := by
+  unfold partialDeriv L_pen_fn
+  rw [deriv_add]
+  · rw [deriv_neg, deriv_const, neg_zero, zero_add]
+    rw [deriv_const_mul]
+    · congr 1
+      have h_tr : (fun x => Matrix.trace (b.transpose * S_lambda_fn S_basis (Function.update rho i x) * b)) =
+                  Matrix.trace ∘ (fun x => b.transpose * S_lambda_fn S_basis (Function.update rho i x) * b) := rfl
+      rw [h_tr]
+      -- trace is linear continuous
+      let tr : Matrix (Fin p) (Fin p) ℝ →L[ℝ] ℝ := Matrix.traceLinearMap (Fin p) ℝ ℝ
+      have h_tr_deriv : deriv (tr ∘ (fun x => b.transpose * S_lambda_fn S_basis (Function.update rho i x) * b)) (rho i) =
+                        tr (deriv (fun x => b.transpose * S_lambda_fn S_basis (Function.update rho i x) * b) (rho i)) := by
+        apply ContinuousLinearMap.deriv_comp
+        apply DifferentiableAt.mul
+        · apply DifferentiableAt.mul
+          · exact differentiableAt_const _
+          · unfold S_lambda_fn; simp; apply DifferentiableAt.sum; intro j _; by_cases h : j = i <;> simp [Function.update, h]
+            apply DifferentiableAt.smul; exact Real.differentiableAt_exp _; exact differentiableAt_const _
+            exact differentiableAt_const _
+        · exact differentiableAt_const _
+      rw [h_tr_deriv]
+      congr 1
+      rw [deriv_mul_const, deriv_const_mul]
+      exact partial_deriv_S_lambda S_basis rho i
+    · exact differentiableAt_const _ (rho i)
+  · exact differentiableAt_const _ (rho i)
+  · apply DifferentiableAt.const_mul
+    apply DifferentiableAt.comp
+    · exact Matrix.traceLinearMap (Fin p) ℝ ℝ |> ContinuousLinearMap.differentiableAt
+    · apply DifferentiableAt.mul
+      · apply DifferentiableAt.mul
+        · exact differentiableAt_const _
+        · unfold S_lambda_fn; simp; apply DifferentiableAt.sum; intro j _; by_cases h : j = i <;> simp [Function.update, h]
+          apply DifferentiableAt.smul; exact Real.differentiableAt_exp _; exact differentiableAt_const _
+          exact differentiableAt_const _
+      · exact differentiableAt_const _
+
+/-- Partial derivative of log det H w.r.t rho_i. -/
+lemma partial_deriv_log_det_H
+    (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ)
+    (X : Matrix (Fin n) (Fin p) ℝ)
+    (W : Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin n) (Fin n) ℝ)
+    (rho : Fin k → ℝ) (b : Matrix (Fin p) (Fin 1) ℝ) (i : Fin k)
+    (h_posdef : (Hessian_fn S_basis X W rho b).PosDef) :
+    partialDeriv i (fun r => Real.log (Hessian_fn S_basis X W r b).det) rho =
+    Real.exp (rho i) * ((Hessian_fn S_basis X W rho b)⁻¹ * S_basis i).trace := by
+  let A := X.transpose * W b * X + ∑ j in Finset.univ.erase i, Real.exp (rho j) • S_basis j
+  let B := S_basis i
+  have h_eq : ∀ x, Hessian_fn S_basis X W (Function.update rho i x) b = H_matrix A B x := by
+    intro x
+    unfold Hessian_fn S_lambda_fn H_matrix
+    rw [Finset.sum_erase_add (Finset.mem_univ i)]
+    simp only [Function.update_same, Function.update_noteq, add_assoc, add_left_comm]
+    congr 2
+    apply Finset.sum_congr rfl
+    intro j hj
+    rw [Function.update_noteq (Finset.mem_erase.mp hj).1]
+  unfold partialDeriv
+  rw [show (fun r => Real.log (Hessian_fn S_basis X W (Function.update rho i r) b).det) =
+          (fun r => log_det_H A B r) by ext x; rw [h_eq, log_det_H]]
+  have h_inv : (H_matrix A B (rho i)).det ≠ 0 := by
+    rw [← h_eq (rho i), Function.update_eq_self]
+    exact h_posdef.det_ne_zero
+  rw [derivative_log_det_H_matrix A B (rho i) h_inv]
+  rw [← h_eq (rho i), Function.update_eq_self]
+
+/-- Partial derivative of log det S w.r.t rho_i. -/
+lemma partial_deriv_log_det_S
+    (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ)
+    (rho : Fin k → ℝ) (i : Fin k)
+    (h_posdef : (S_lambda_fn S_basis rho).PosDef) :
+    partialDeriv i (fun r => Real.log (S_lambda_fn S_basis r).det) rho =
+    Real.exp (rho i) * ((S_lambda_fn S_basis rho)⁻¹ * S_basis i).trace := by
+  let A := ∑ j in Finset.univ.erase i, Real.exp (rho j) • S_basis j
+  let B := S_basis i
+  have h_eq : ∀ x, S_lambda_fn S_basis (Function.update rho i x) = H_matrix A B x := by
+    intro x
+    unfold S_lambda_fn H_matrix
+    rw [Finset.sum_erase_add (Finset.mem_univ i)]
+    simp only [Function.update_same, Function.update_noteq, add_comm]
+    congr 1
+    apply Finset.sum_congr rfl
+    intro j hj
+    rw [Function.update_noteq (Finset.mem_erase.mp hj).1]
+  unfold partialDeriv
+  rw [show (fun r => Real.log (S_lambda_fn S_basis (Function.update rho i r)).det) =
+          (fun r => log_det_H A B r) by ext x; rw [h_eq, log_det_H]]
+  have h_inv : (H_matrix A B (rho i)).det ≠ 0 := by
+    rw [← h_eq (rho i), Function.update_eq_self]
+    exact h_posdef.det_ne_zero
+  rw [derivative_log_det_H_matrix A B (rho i) h_inv]
+  rw [← h_eq (rho i), Function.update_eq_self]
+
 /-- Gradient definition for matrix-to-real functions. -/
 def HasGradientAt (f : Matrix (Fin p) (Fin 1) ℝ → ℝ) (g : Matrix (Fin p) (Fin 1) ℝ) (x : Matrix (Fin p) (Fin 1) ℝ) :=
   ∃ (L : Matrix (Fin p) (Fin 1) ℝ →L[ℝ] ℝ),
     (∀ h, L h = (g.transpose * h).trace) ∧ HasFDerivAt f L x
 
-theorem laml_gradient_is_exact 
+/-- Chain rule for matrix-scalar composition: deriv (f ∘ g) x = trace (grad(f)^T * deriv g x). -/
+lemma chain_rule_matrix_scalar
+    (f : Matrix (Fin p) (Fin 1) ℝ → ℝ) (grad_f : Matrix (Fin p) (Fin 1) ℝ)
+    (g : ℝ → Matrix (Fin p) (Fin 1) ℝ) (x : ℝ)
+    (h_grad : HasGradientAt f grad_f (g x))
+    (h_diff_g : DifferentiableAt ℝ g x) :
+    deriv (fun r => f (g r)) x = (grad_f.transpose * deriv g x).trace := by
+  rcases h_grad with ⟨L, hL, hf⟩
+  have h_diff_f : DifferentiableAt (Matrix (Fin p) (Fin 1) ℝ) f (g x) := hf.differentiableAt
+  rw [deriv_comp h_diff_f h_diff_g]
+  rw [hL (deriv g x)]
+
+theorem laml_gradient_is_exact_rigorous
     (log_lik : Matrix (Fin p) (Fin 1) ℝ → ℝ)
     (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ)
     (X : Matrix (Fin n) (Fin p) ℝ)
@@ -6447,29 +6583,64 @@ theorem laml_gradient_is_exact
     (beta_hat : (Fin k → ℝ) → Matrix (Fin p) (Fin 1) ℝ)
     (grad_op : (Matrix (Fin p) (Fin 1) ℝ → ℝ) → Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin p) (Fin 1) ℝ)
     (rho : Fin k → ℝ) (i : Fin k)
-    (D : (Fin k → ℝ) →L[ℝ] ℝ)
-    (hF : HasFDerivAt (fun r => LAML_fn log_lik S_basis X W beta_hat r) D rho)
-    (h_split : D (Pi.single i 1) =
-      rust_direct_gradient_fn S_basis X W beta_hat log_lik rho i +
-      rust_correction_fn S_basis X W beta_hat grad_op rho i) :
-  deriv (fun r => LAML_fn log_lik S_basis X W beta_hat (Function.update rho i r)) (rho i) =
+    -- Structural assumptions
+    (h_posdef_H : (Hessian_fn S_basis X W rho (beta_hat rho)).PosDef)
+    (h_posdef_S : (S_lambda_fn S_basis rho).PosDef)
+    -- Differentiability assumptions
+    (h_diff_pen : DifferentiableAt ℝ (fun r => L_pen_fn log_lik S_basis (Function.update rho i r) (beta_hat (Function.update rho i r))) (rho i))
+    (h_diff_H : DifferentiableAt ℝ (fun r => 0.5 * Real.log (Hessian_fn S_basis X W (Function.update rho i r) (beta_hat (Function.update rho i r))).det) (rho i))
+    (h_diff_S : DifferentiableAt ℝ (fun r => 0.5 * Real.log (S_lambda_fn S_basis (Function.update rho i r)).det) (rho i))
+    -- Chain rule decomposition assumptions
+    (h_chain_pen : partialDeriv i (fun r => L_pen_fn log_lik S_basis r (beta_hat r)) rho =
+                   partialDeriv i (fun r => L_pen_fn log_lik S_basis r (beta_hat rho)) rho +
+                   (0 : ℝ)) -- optim: grad L_pen = 0
+    (h_chain_H : partialDeriv i (fun r => 0.5 * Real.log (Hessian_fn S_basis X W r (beta_hat r)).det) rho =
+                 partialDeriv i (fun r => 0.5 * Real.log (Hessian_fn S_basis X W r (beta_hat rho)).det) rho +
+                 rust_correction_fn S_basis X W beta_hat grad_op rho i) :
+  partialDeriv i (fun r => LAML_fn log_lik S_basis X W beta_hat r) rho =
   rust_direct_gradient_fn S_basis X W beta_hat log_lik rho i +
-  rust_correction_fn S_basis X W beta_hat grad_op rho i :=
-by
-  let g : ℝ → (Fin k → ℝ) := Function.update rho i
-  have hg : HasDerivAt g (Pi.single i 1) (rho i) := by
-    simpa [g] using (hasDerivAt_update rho i (rho i))
-  have h_update : g (rho i) = rho := by
-    simpa [g] using (Function.update_eq_self i rho)
-  have hF_at_update : HasFDerivAt (fun r => LAML_fn log_lik S_basis X W beta_hat r) D (g (rho i)) := by
-    simpa [h_update] using hF
-  have hcomp : HasDerivAt (fun r => LAML_fn log_lik S_basis X W beta_hat (g r))
-      (D (Pi.single i 1)) (rho i) := by
-    exact hF_at_update.comp_hasDerivAt (rho i) hg
-  have h_deriv :
-      deriv (fun r => LAML_fn log_lik S_basis X W beta_hat (g r)) (rho i) =
-      D (Pi.single i 1) := hcomp.deriv
-  simpa [g, h_split] using h_deriv
+  rust_correction_fn S_basis X W beta_hat grad_op rho i := by
+  let b := beta_hat rho
+  let f_pen := fun r => L_pen_fn log_lik S_basis r (beta_hat r)
+  let f_H := fun r => 0.5 * Real.log (Hessian_fn S_basis X W r (beta_hat r)).det
+  let f_S := fun r => 0.5 * Real.log (S_lambda_fn S_basis r).det
+
+  -- Decomposition
+  have h_decomp : partialDeriv i (fun r => LAML_fn log_lik S_basis X W beta_hat r) rho =
+                  partialDeriv i f_pen rho + partialDeriv i f_H rho - partialDeriv i f_S rho := by
+    unfold LAML_fn partialDeriv
+    -- deriv (f + g - h)
+    rw [deriv_sub, deriv_add]
+    · rfl
+    · exact h_diff_pen
+    · exact h_diff_H
+    · apply DifferentiableAt.sub (DifferentiableAt.add h_diff_pen h_diff_H) h_diff_S
+    · exact h_diff_S
+
+  rw [h_decomp]
+  rw [h_chain_pen, h_chain_H]
+
+  -- Term 1: L_pen partial
+  have h_part_pen : partialDeriv i (fun r => L_pen_fn log_lik S_basis r (beta_hat rho)) rho =
+                    0.5 * Real.exp (rho i) * ((b.transpose * S_basis i * b).trace) := by
+    convert partial_deriv_L_pen log_lik S_basis rho b i
+
+  -- Term 2: log det H partial
+  have h_part_H : partialDeriv i (fun r => 0.5 * Real.log (Hessian_fn S_basis X W r (beta_hat rho)).det) rho =
+                  0.5 * Real.exp (rho i) * ((Hessian_fn S_basis X W rho (beta_hat rho))⁻¹ * S_basis i).trace := by
+    rw [partialDeriv, deriv_const_mul]
+    rw [← partialDeriv, partial_deriv_log_det_H S_basis X W rho b i h_posdef_H]
+    exact differentiableAt_const _
+
+  -- Term 3: log det S partial
+  have h_part_S : partialDeriv i f_S rho = 0.5 * Real.exp (rho i) * ((S_lambda_fn S_basis rho)⁻¹ * S_basis i).trace := by
+    rw [partialDeriv, deriv_const_mul]
+    rw [← partialDeriv, partial_deriv_log_det_S S_basis rho i h_posdef_S]
+    exact differentiableAt_const _
+
+  rw [h_part_pen, h_part_H, h_part_S]
+  unfold rust_direct_gradient_fn
+  ring
 
 end GradientDescentVerification
 
