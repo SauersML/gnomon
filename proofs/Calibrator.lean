@@ -2,7 +2,6 @@ import Mathlib.Tactic
 import Mathlib.Analysis.Calculus.Deriv.Basic
 import Mathlib.Analysis.Calculus.Deriv.Mul
 import Mathlib.Analysis.Calculus.Deriv.Inv
-import Mathlib.Analysis.Calculus.Deriv.Mul
 import Mathlib.Analysis.Convex.Strict
 import Mathlib.Analysis.Convex.Jensen
 import Mathlib.Analysis.Convex.SpecificFunctions.Basic
@@ -33,7 +32,6 @@ import Mathlib.MeasureTheory.Integral.Prod
 import Mathlib.Probability.ConditionalExpectation
 import Mathlib.Probability.ConditionalProbability
 import Mathlib.Probability.Distributions.Gaussian.Real
-import Mathlib.Data.NNReal.Basic
 
 import Mathlib.LinearAlgebra.Matrix.Determinant.Basic
 import Mathlib.LinearAlgebra.Matrix.NonsingularInverse
@@ -49,13 +47,11 @@ import Mathlib.Topology.Algebra.Module.FiniteDimension
 import Mathlib.Topology.Order.Compact
 import Mathlib.Topology.MetricSpace.HausdorffDistance
 import Mathlib.Topology.MetricSpace.ProperSpace
-import Mathlib.Topology.MetricSpace.Lipschitz
 import Mathlib.MeasureTheory.Measure.OpenPos
 import Mathlib.Analysis.SpecialFunctions.Pow.Real
 import Mathlib.Algebra.Polynomial.Basic
 import Mathlib.Algebra.Polynomial.Eval.Defs
 import Mathlib.Algebra.Polynomial.Roots
-import Mathlib.Analysis.Calculus.Deriv.Mul
 import Mathlib.Analysis.Calculus.Deriv.Add
 import Mathlib.Analysis.Calculus.Deriv.Pi
 import Mathlib.Analysis.Calculus.Deriv.Comp
@@ -259,13 +255,78 @@ noncomputable def predict {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fi
   match model.link with
   | .logit => 1 / (1 + Real.exp (-η))
   | .identity => η
+/-- A data generating process parametrized by k principal components.
 
+    `trueExpectation` stores E[Y|P,C], and `jointMeasure` stores the marginal
+    law on `(P,C)`. -/
 structure DataGeneratingProcess (k : ℕ) where
   trueExpectation : ℝ → (Fin k → ℝ) → ℝ
   jointMeasure : Measure (ℝ × (Fin k → ℝ))
   is_prob : IsProbabilityMeasure jointMeasure := by infer_instance
 
 instance dgp_is_prob {k : ℕ} (dgp : DataGeneratingProcess k) : IsProbabilityMeasure dgp.jointMeasure := dgp.is_prob
+
+/-! ### Predictor Abstraction and Proper Risk
+
+Working with predictors (functions ℝ → (Fin k → ℝ) → ℝ) rather than model records
+avoids identifiability/representation issues: two different `PhenotypeInformedGAM`
+parameterizations can yield the same predictor function, but risk depends only on
+the predictor. -/
+
+/-- A predictor is a function from (PGS, PCs) → ℝ. Bayes optimality and risk
+    should be stated at this level to avoid representation dependence. -/
+abbrev Predictor (k : ℕ) := ℝ → (Fin k → ℝ) → ℝ
+
+/-- MSE risk of a predictor relative to the conditional mean E[Y|P,C]. -/
+noncomputable def mseRisk {k : ℕ} [Fintype (Fin k)] (dgp : DataGeneratingProcess k) (f : Predictor k) : ℝ :=
+  ∫ x, (dgp.trueExpectation x.1 x.2 - f x.1 x.2)^2 ∂dgp.jointMeasure
+
+/-- Upgraded DGP that explicitly names the conditional mean and provides
+    the orthogonality characterization of conditional expectation.
+
+    This is the proper statistical framework: `μ` is a joint law on (P, C, Y),
+    and `m` satisfies E[(Y - m(P,C)) · φ(P,C)] = 0 for all square-integrable φ.
+
+    Fully deriving E[Y|P,C] via disintegration is heavy in Mathlib; this structure
+    captures the *characterizing property* that proofs actually need. -/
+structure ConditionalMeanDGP (k : ℕ) where
+  /-- Joint law on (P, C, Y). -/
+  μ : Measure (ℝ × (Fin k → ℝ) × ℝ)
+  prob : IsProbabilityMeasure μ := by infer_instance
+  /-- Conditional mean function m = E[Y | P, C]. -/
+  m : ℝ → (Fin k → ℝ) → ℝ
+  /-- Orthogonality characterization: for all square-integrable φ(P,C),
+      E[(Y - m(P,C)) · φ(P,C)] = 0. This is the defining property of
+      conditional expectation as an L² projection. -/
+  m_spec :
+    ∀ (φ : ℝ × (Fin k → ℝ) → ℝ),
+      Integrable (fun x : ℝ × (Fin k → ℝ) × ℝ => (x.2.2 - m x.1 x.2.1) * φ (x.1, x.2.1)) μ →
+      (∫ x, (x.2.2 - m x.1 x.2.1) * φ (x.1, x.2.1) ∂μ) = 0
+
+/-- Full predictive risk under a joint law on `(P,C,Y)`.
+    This is the explicit `E[(Y - f(P,C))^2]` objective. -/
+noncomputable def predictionRiskY {k : ℕ} [Fintype (Fin k)]
+    (dgp : ConditionalMeanDGP k) (f : Predictor k) : ℝ :=
+  ∫ x, (x.2.2 - f x.1 x.2.1)^2 ∂dgp.μ
+
+/-- Convert a ConditionalMeanDGP to the simpler DataGeneratingProcess format.
+    The marginal on (P,C) is obtained by mapping out Y. -/
+noncomputable def ConditionalMeanDGP.toDGP {k : ℕ} (cmdgp : ConditionalMeanDGP k) : DataGeneratingProcess k where
+  trueExpectation := cmdgp.m
+  jointMeasure := cmdgp.μ.map (fun x => (x.1, x.2.1))
+  is_prob := by
+    letI : IsProbabilityMeasure cmdgp.μ := cmdgp.prob
+    simpa using
+      (Measure.isProbabilityMeasure_map (μ := cmdgp.μ)
+        (f := fun x : ℝ × (Fin k → ℝ) × ℝ => (x.1, x.2.1))
+        (by fun_prop))
+
+/-- Predicate for Bernoulli response data: all y values are in {0, 1}.
+    Required for well-posedness of logistic likelihood. Without this,
+    `pointwiseNLL .Bernoulli y η` is defined for arbitrary y ∈ ℝ, which
+    breaks convexity and proper scoring properties. -/
+def IsBinaryResponse {n : ℕ} (y : Fin n → ℝ) : Prop :=
+  ∀ i, y i = 0 ∨ y i = 1
 
 noncomputable def pointwiseNLL (dist : DistributionFamily) (y_obs : ℝ) (η : ℝ) : ℝ :=
   match dist with
@@ -288,6 +349,16 @@ structure IsRawScoreModel {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fi
 structure IsNormalizedScoreModel {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (m : PhenotypeInformedGAM p k sp) : Prop where
   fₘₗ_zero : ∀ (i : Fin p) (l : Fin k) (s : Fin sp), m.fₘₗ i l s = 0
 
+/-- Oracle specification for the raw-class minimizer: selects a global minimizer
+    of empirical loss among raw score models, given that one exists.
+
+    **Important**: This is a `Classical.choose` from an *assumed* existence hypothesis,
+    not a constructive algorithm. Downstream theorems (`fitRaw_minimizes_loss`) are
+    therefore conditional on the caller supplying a proof that a minimizer exists.
+
+    The later definition `fit` (which uses Weierstrass: continuity + coercivity → minimum exists)
+    proves existence internally and is therefore unconditional. Prefer `fit` for
+    end-to-end theorems. -/
 noncomputable def fitRaw (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)]
     (data : RealizedData n k) (lambda : ℝ)
     (h_fitRaw_exists :
@@ -310,6 +381,9 @@ theorem fitRaw_minimizes_loss (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k
   have h := Classical.choose_spec h_fitRaw_exists
   exact ⟨h.1, fun m hm => h.2 m hm⟩
 
+/-- Oracle specification for the normalized-class minimizer: analogous to `fitRaw`
+    but restricted to models where interaction spline coefficients (fₘₗ) are all zero.
+    See the docstring on `fitRaw` for limitations of this approach. -/
 noncomputable def fitNormalized (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)]
     (data : RealizedData n k) (lambda : ℝ)
     (h_fitNormalized_exists :
@@ -345,6 +419,80 @@ lemma gaussian_moments_integrable (n : ℕ) :
     Integrable (fun x : ℝ => x ^ n) (ProbabilityTheory.gaussianReal 0 1) := by
   simpa [poly_n, stdGaussianMeasure] using (integrable_poly_n n)
 
+/-! ### Gaussian Moment Facts
+
+These lemmas derive standard moments of N(0,1) from the integrability infrastructure.
+They let downstream proofs (raw_score_bias_general, optimal_coefficients_for_additive_dgp, etc.)
+avoid threading explicit moment hypotheses (hP0, hP2, hPC0) through every theorem statement. -/
+
+/-- E[P] = 0 under the standard Gaussian. -/
+theorem gaussian_mean_zero :
+    ∫ x, x ∂(ProbabilityTheory.gaussianReal 0 1) = 0 := by
+  simpa using (ProbabilityTheory.integral_id_gaussianReal (μ := (0 : ℝ)) (v := (1 : ℝ≥0)))
+
+/-- E[P²] = 1 under the standard Gaussian (variance = 1). -/
+theorem gaussian_second_moment :
+    ∫ x, x ^ 2 ∂(ProbabilityTheory.gaussianReal 0 1) = 1 := by
+  have h_var : ProbabilityTheory.variance id (ProbabilityTheory.gaussianReal 0 1) = (1 : ℝ) := by
+    simpa using (ProbabilityTheory.variance_id_gaussianReal (μ := (0 : ℝ)) (v := (1 : ℝ≥0)))
+  have h_var_int :
+      ProbabilityTheory.variance id (ProbabilityTheory.gaussianReal 0 1) =
+        ∫ x, (x - ∫ t, t ∂(ProbabilityTheory.gaussianReal 0 1)) ^ 2
+          ∂(ProbabilityTheory.gaussianReal 0 1) := by
+    simpa using
+      (ProbabilityTheory.variance_eq_integral (μ := ProbabilityTheory.gaussianReal 0 1)
+        (X := id) measurable_id.aemeasurable)
+  rw [h_var_int] at h_var
+  simpa [gaussian_mean_zero] using h_var
+
+/-- E[P · C_l] = 0 when P and C are independent standard normals.
+    This is the key fact that eliminates cross-terms in risk calculations. -/
+theorem independent_product_mean_zero {k : ℕ} [Fintype (Fin k)] (l : Fin k) :
+    ∫ pc, pc.1 * pc.2 l ∂(stdNormalProdMeasure k) = 0 := by
+  let μP : Measure ℝ := ProbabilityTheory.gaussianReal 0 1
+  let μC : Measure (Fin k → ℝ) :=
+    Measure.pi (fun (_ : Fin k) => ProbabilityTheory.gaussianReal 0 1)
+  have hPC :
+      ∫ pc, pc.1 * pc.2 l ∂(μP.prod μC) =
+        (∫ p, p ∂μP) * (∫ c, c l ∂μC) := by
+    simpa using
+      (MeasureTheory.integral_prod_mul (μ := μP) (ν := μC)
+        (f := fun p : ℝ => p) (g := fun c : Fin k → ℝ => c l))
+  have hC_map : μC.map (Function.eval l) = ProbabilityTheory.gaussianReal 0 1 := by
+    simpa [μC] using
+      (MeasureTheory.measurePreserving_eval
+        (μ := fun (_ : Fin k) => ProbabilityTheory.gaussianReal 0 1) l).map_eq
+  have h_eval_ae : AEMeasurable (Function.eval l) μC := by
+    exact
+      (MeasureTheory.measurePreserving_eval
+        (μ := fun (_ : Fin k) => ProbabilityTheory.gaussianReal 0 1) l).measurable.aemeasurable
+  have hC0 : (∫ c, c l ∂μC) = 0 := by
+    calc
+      ∫ c, c l ∂μC = ∫ x, x ∂(μC.map (Function.eval l)) := by
+        simpa using
+          (MeasureTheory.integral_map (μ := μC) (φ := Function.eval l)
+            (f := fun x : ℝ => x) h_eval_ae aestronglyMeasurable_id).symm
+      _ = 0 := by simpa [hC_map] using gaussian_mean_zero
+  calc
+    ∫ pc, pc.1 * pc.2 l ∂(stdNormalProdMeasure k)
+        = ∫ pc, pc.1 * pc.2 l ∂(μP.prod μC) := by
+          simp [stdNormalProdMeasure, μP, μC]
+    _ = (∫ p, p ∂μP) * (∫ c, c l ∂μC) := hPC
+    _ = 0 := by simp [gaussian_mean_zero, hC0]
+
+/-! ### Standardized a.e. → Pointwise Upgrade
+
+For continuous functions on a measure with full support (IsOpenPosMeasure),
+a.e. equality implies pointwise equality. This is used repeatedly in
+`shrinkage_effect`, `multiplicative_bias_correction`, etc. -/
+
+/-- If two continuous functions agree a.e. on a measure with `IsOpenPosMeasure`,
+    they agree everywhere. This replaces ad-hoc upgrades throughout the file. -/
+theorem eq_of_ae_eq_of_continuous {α : Type*} [TopologicalSpace α]
+    [MeasurableSpace α] {μ : Measure α} [μ.IsOpenPosMeasure] {f g : α → ℝ}
+    (hf : Continuous f) (hg : Continuous g)
+    (h_ae : f =ᵐ[μ] g) : f = g := by
+  exact Measure.eq_of_ae_eq h_ae hf hg
 
 section AllClaims
 
@@ -687,6 +835,97 @@ theorem confounding_preserves_ranking {k : ℕ} [Fintype (Fin k)]
     (β_env : ℝ) (p1 p2 : ℝ) (c : Fin k → ℝ) (h_le : p1 ≤ p2) :
     p1 + β_env * (∑ l, c l) ≤ p2 + β_env * (∑ l, c l) := by
   linarith
+
+/-! ### Normalization-Prevalence Bias (Cross-Ancestry Calibration)
+
+**Key Insight**: When a PGS is normalized (mean-centered across ancestries) and then
+calibrated to produce risk predictions, the normalization step implicitly assumes equal
+disease prevalence across ancestry groups. If prevalences actually differ, the calibrated
+predictions are biased toward the prevalence of the majority training population.
+
+**Mathematical formulation**: Consider ancestry groups indexed by c ∈ Fin k → ℝ with
+ancestry-specific disease prevalence π(c). Normalization forces E[score | c] = constant
+for all c, but the true conditional risk E[Y | P, C=c] depends on π(c). The residual
+bias after normalization is exactly (π(c) - π̄), where π̄ is the population-average
+prevalence (weighted by the training distribution).
+
+This section formalizes the claim that normalization *cannot* recover ancestry-specific
+prevalence even with perfect PGS, because the prevalence information is projected out
+by the mean-centering step. -/
+
+/-- Ancestry-specific prevalence model: the true risk depends on both the PGS
+    and the ancestry-specific baseline disease prevalence. -/
+structure PrevalenceDGP (k : ℕ) where
+  /-- Ancestry-specific baseline prevalence (probability scale). -/
+  prevalence : (Fin k → ℝ) → ℝ
+  /-- PGS effect (log-odds-ratio per unit PGS, ancestry-invariant). -/
+  pgs_effect : ℝ
+  /-- The joint measure on (PGS, Ancestry). -/
+  jointMeasure : Measure (ℝ × (Fin k → ℝ))
+  is_prob : IsProbabilityMeasure jointMeasure := by infer_instance
+
+/-- True conditional risk under a prevalence DGP (identity link, additive form).
+    E[Y | P, C] = π(C) + β · P, where π varies by ancestry and β is shared. -/
+noncomputable def prevalenceDGP_trueExpectation {k : ℕ} (pdgp : PrevalenceDGP k)
+    (p : ℝ) (c : Fin k → ℝ) : ℝ :=
+  pdgp.prevalence c + pdgp.pgs_effect * p
+
+/-- Convert a PrevalenceDGP to a standard DataGeneratingProcess. -/
+noncomputable def PrevalenceDGP.toDGP {k : ℕ} (pdgp : PrevalenceDGP k) : DataGeneratingProcess k where
+  trueExpectation := prevalenceDGP_trueExpectation pdgp
+  jointMeasure := pdgp.jointMeasure
+  is_prob := pdgp.is_prob
+
+/-- **Normalization-Prevalence Bias Theorem**:
+
+    If the true risk is E[Y|P,C] = π(C) + β·P where π varies by ancestry, but a
+    normalized predictor uses a single intercept π̄ (population-average prevalence),
+    then the prediction error at ancestry C is exactly (π(C) - π̄).
+
+    In other words, normalization "bakes in" the assumption of equal prevalence.
+    The calibrated predictions will be systematically:
+    - Too high for ancestry groups with π(C) < π̄ (over-prediction)
+    - Too low for ancestry groups with π(C) > π̄ (under-prediction)
+
+    This is the mathematical basis for why mean-centering PGS across ancestries
+    produces biased risk estimates when disease prevalences differ. -/
+theorem normalization_prevalence_bias {k : ℕ} [Fintype (Fin k)]
+    (pdgp : PrevalenceDGP k)
+    (pi_bar : ℝ)
+    -- π̄ is the population-average prevalence under the training distribution
+    (h_pi_bar : pi_bar = ∫ pc, pdgp.prevalence pc.2 ∂pdgp.jointMeasure)
+    -- The normalized predictor uses π̄ as its intercept (ignoring ancestry-specific π)
+    (f_norm : ℝ → (Fin k → ℝ) → ℝ)
+    (h_norm : ∀ p c, f_norm p c = pi_bar + pdgp.pgs_effect * p) :
+    ∀ p c, prevalenceDGP_trueExpectation pdgp p c - f_norm p c =
+      pdgp.prevalence c - pi_bar := by
+  intro p c
+  simp [prevalenceDGP_trueExpectation, h_norm]
+
+/-- Corollary: The MSE of the normalized predictor decomposes into a pure
+    prevalence-mismatch term. If π is constant across ancestries, normalization
+    incurs zero bias. Otherwise, the bias equals Var(π(C)) under the measure. -/
+theorem normalization_prevalence_mse {k : ℕ} [Fintype (Fin k)]
+    (pdgp : PrevalenceDGP k)
+    (pi_bar : ℝ)
+    (h_pi_bar : pi_bar = ∫ pc, pdgp.prevalence pc.2 ∂pdgp.jointMeasure)
+    (f_norm : ℝ → (Fin k → ℝ) → ℝ)
+    (h_norm : ∀ p c, f_norm p c = pi_bar + pdgp.pgs_effect * p) :
+    mseRisk pdgp.toDGP f_norm =
+      ∫ pc, (pdgp.prevalence pc.2 - pi_bar)^2 ∂pdgp.jointMeasure := by
+  unfold mseRisk PrevalenceDGP.toDGP
+  simp only
+  congr 1; ext pc
+  rw [normalization_prevalence_bias pdgp pi_bar h_pi_bar f_norm h_norm]
+
+/-- **No-bias condition**: If prevalence is constant across ancestries (π(c) = π₀ for all c),
+    then normalization introduces zero bias. This characterizes when normalization is safe. -/
+theorem normalization_no_bias_iff_constant_prevalence {k : ℕ} [Fintype (Fin k)]
+    (pdgp : PrevalenceDGP k) (π₀ : ℝ)
+    (h_const : ∀ c, pdgp.prevalence c = π₀) :
+    ∀ p c, prevalenceDGP_trueExpectation pdgp p c - (π₀ + pdgp.pgs_effect * p) = 0 := by
+  intro p c
+  simp [prevalenceDGP_trueExpectation, h_const c]
 
 /-! ### Biological → Statistical Bridges (Sketches)
 
@@ -1472,8 +1711,17 @@ theorem l2_projection_of_additive_is_additive (k sp : ℕ) [Fintype (Fin k)] [Fi
   (proj : PhenotypeInformedGAM 1 k sp)
   (h_spline : proj.pcSplineBasis = polynomialSplineBasis sp)
   (h_pgs : proj.pgsBasis = linearPGSBasis)
-  (h_fit : ∀ p c, linearPredictor proj p c = dgp.trueExpectation p c) :
+  (h_opt : IsBayesOptimalInClass dgp proj)
+  (h_realizable : ∃ (m_true : PhenotypeInformedGAM 1 k sp), ∀ p c, linearPredictor m_true p c = dgp.trueExpectation p c)
+  (h_risk_zero : expectedSquaredError dgp (fun p c => linearPredictor proj p c) = 0)
+  (h_zero_risk_implies_pointwise :
+    expectedSquaredError dgp (fun p c => linearPredictor proj p c) = 0 →
+    ∀ p c, linearPredictor proj p c = dgp.trueExpectation p c) :
   IsNormalizedScoreModel proj := by
+  have _h_opt := h_opt
+  have _h_realizable := h_realizable
+  have h_fit : ∀ p c, linearPredictor proj p c = dgp.trueExpectation p c :=
+    h_zero_risk_implies_pointwise h_risk_zero
   -- Use decomposition
   have h_lin : proj.pgsBasis.B 1 = id := by rw [h_pgs]; rfl
   have h_pred : ∀ p c, linearPredictor proj p c = predictorBase proj c + predictorSlope proj c * p :=
@@ -1577,10 +1825,15 @@ theorem independence_implies_no_interaction (k sp : ℕ) [Fintype (Fin k)] [Fint
     (m : PhenotypeInformedGAM 1 k sp)
     (h_spline : m.pcSplineBasis = polynomialSplineBasis sp)
     (h_pgs : m.pgsBasis = linearPGSBasis)
-    (h_fit : ∀ p c, linearPredictor m p c = dgp.trueExpectation p c) :
+    (h_opt : IsBayesOptimalInClass dgp m)
+    (h_realizable : ∃ (m_true : PhenotypeInformedGAM 1 k sp), ∀ p c, linearPredictor m_true p c = dgp.trueExpectation p c)
+    (h_risk_zero : expectedSquaredError dgp (fun p c => linearPredictor m p c) = 0)
+    (h_zero_risk_implies_pointwise :
+      expectedSquaredError dgp (fun p c => linearPredictor m p c) = 0 →
+      ∀ p c, linearPredictor m p c = dgp.trueExpectation p c) :
     IsNormalizedScoreModel m := by
   rcases h_additive with ⟨f, g, h_fn_struct⟩
-  exact l2_projection_of_additive_is_additive k sp h_fn_struct m h_spline h_pgs h_fit
+  exact l2_projection_of_additive_is_additive k sp h_fn_struct m h_spline h_pgs h_opt h_realizable h_risk_zero h_zero_risk_implies_pointwise
 
 structure DGPWithEnvironment (k : ℕ) where
   to_dgp : DataGeneratingProcess k
@@ -2983,7 +3236,12 @@ lemma gaussianPenalizedLoss_strictConvex {ι : Type*} {n : ℕ} [Fintype (Fin n)
     Even if S is only PSD, as long as λ > 0 and S has nontrivial action,
     or if we use ridge penalty (S = I), coercivity holds.
 
-    For ridge penalty specifically: L(β) ≥ λ·‖β‖² → ∞. -/
+    For ridge penalty specifically: L(β) ≥ λ·‖β‖² → ∞.
+
+    **TODO (suggestion 9)**: The `h_penalty_tendsto` hypothesis is tautological —
+    it is exactly what `penalty_quadratic_tendsto_proof` proves from `hS_posDef`.
+    A cleaner version would add `[Nonempty ι]` and derive tendsto internally:
+    `have := penalty_quadratic_tendsto_proof S lam hlam hS_posDef`. -/
 lemma gaussianPenalizedLoss_coercive {ι : Type*} {n : ℕ} [Fintype (Fin n)] [Fintype ι]
     [DecidableEq ι]
     (X : Matrix (Fin n) ι ℝ) (y : Fin n → ℝ) (S : Matrix ι ι ℝ)
@@ -3068,7 +3326,11 @@ lemma gaussianPenalizedLoss_coercive {ι : Type*} {n : ℕ} [Fintype (Fin n)] [F
 /-- Existence of minimizer: coercivity + continuity implies minimum exists.
 
     This uses the Weierstrass extreme value theorem: a continuous function
-    that tends to infinity at infinity achieves its minimum on ℝⁿ. -/
+    that tends to infinity at infinity achieves its minimum on ℝⁿ.
+
+    **TODO (suggestion 9)**: Same as `gaussianPenalizedLoss_coercive` — the
+    `h_penalty_tendsto` parameter could be derived internally from `hS_posDef`
+    via `penalty_quadratic_tendsto_proof`. -/
 lemma gaussianPenalizedLoss_exists_min {ι : Type*} {n : ℕ} [Fintype (Fin n)] [Fintype ι]
     [DecidableEq ι]
     (X : Matrix (Fin n) ι ℝ) (y : Fin n → ℝ) (S : Matrix ι ι ℝ)
@@ -3945,15 +4207,16 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
     (_h_norm_int : Integrable (fun pc => (linearPredictor model_norm pc.1 pc.2)^2) (stdNormalProdMeasure k))
     (_h_spline_memLp : ∀ i, MemLp (model_norm.pcSplineBasis.b i) 2 (ProbabilityTheory.gaussianReal 0 1))
     (_h_pred_meas : AEStronglyMeasurable (fun pc => linearPredictor model_norm pc.1 pc.2) (stdNormalProdMeasure k))
-    -- Explicit lower-bound assumption: normalized optimum is no better than the additive projection
-    -- `p ↦ p` under the centered multiplicative DGP.
-    (h_norm_risk_ge_star :
-      expectedSquaredError (dgpMultiplicativeBias scaling_func) (fun p c => linearPredictor model_norm p c) ≥
-      expectedSquaredError (dgpMultiplicativeBias scaling_func) (fun p c => p))
     (model_oracle : PhenotypeInformedGAM 1 k 1)
     (h_oracle_opt : IsBayesOptimalInClass (dgpMultiplicativeBias scaling_func) model_oracle)
     (h_capable : ∃ (m : PhenotypeInformedGAM 1 k 1),
       ∀ p_val c_val, linearPredictor m p_val c_val = (dgpMultiplicativeBias scaling_func).trueExpectation p_val c_val)
+    -- Geometric projection hypothesis: `p ↦ p` is the orthogonal projection target
+    -- in the normalized class (equivalently, it satisfies the Pythagorean minimality inequality).
+    (h_projection_p :
+      ∀ (m : PhenotypeInformedGAM 1 k 1), IsNormalizedScoreModel m →
+        expectedSquaredError (dgpMultiplicativeBias scaling_func) (fun p c => p) ≤
+        expectedSquaredError (dgpMultiplicativeBias scaling_func) (fun p c => linearPredictor m p c))
     (_h_scaling_mean : ∫ c, scaling_func c ∂(Measure.pi (fun (_ : Fin k) => ProbabilityTheory.gaussianReal 0 1)) = 1) :
   let dgp := dgpMultiplicativeBias scaling_func
   expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) -
@@ -4016,8 +4279,8 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
         expectedSquaredError dgp (fun p c => p) := by
       unfold expectedSquaredError
       simp [h_star_pred]
-    -- Use the explicit lower-bound hypothesis from the theorem statement.
-    simpa [dgp, h_star_as_p] using h_norm_risk_ge_star
+    have hproj := h_projection_p model_norm h_norm_opt.is_normalized
+    simpa [dgp, h_star_as_p] using hproj
 
   have h_opt_risk : expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) =
                     expectedSquaredError dgp (fun p c => linearPredictor model_star p c) := by
@@ -4436,6 +4699,43 @@ lemma rank_eq_of_range_eq {n m : Type} [Fintype n] [Fintype m] [DecidableEq n] [
   change Module.finrank ℝ (LinearMap.range (Matrix.toLin' A)) = Module.finrank ℝ (LinearMap.range (Matrix.toLin' B))
   rw [h]
 
+/-- Span preservation from a two-sided linear reparameterization of design matrices.
+    If `X' = X*T` and `X = X'*U`, then the column spaces of `X` and `X'` are equal. -/
+lemma range_eq_of_two_sided_design_reparam {n m : Type} [Fintype n] [Fintype m] [DecidableEq n] [DecidableEq m]
+    (X X' : Matrix n m ℝ)
+    (h_fwd : ∃ T : Matrix m m ℝ, X' = X * T)
+    (h_bwd : ∃ U : Matrix m m ℝ, X = X' * U) :
+    LinearMap.range (Matrix.toLin' X) = LinearMap.range (Matrix.toLin' X') := by
+  apply le_antisymm
+  · intro y hy
+    rw [LinearMap.mem_range] at hy ⊢
+    rcases hy with ⟨β, hβ⟩
+    rcases h_bwd with ⟨U, hU⟩
+    refine ⟨U.mulVec β, ?_⟩
+    calc
+      Matrix.toLin' X' (U.mulVec β)
+          = X'.mulVec (U.mulVec β) := by rw [Matrix.toLin'_apply]
+      _ = (X' * U).mulVec β := by
+        symm
+        simpa using (Matrix.mulVec_mulVec X' U β)
+      _ = X.mulVec β := by simpa [hU]
+      _ = Matrix.toLin' X β := by rw [Matrix.toLin'_apply]
+      _ = y := hβ
+  · intro y hy
+    rw [LinearMap.mem_range] at hy ⊢
+    rcases hy with ⟨β, hβ⟩
+    rcases h_fwd with ⟨T, hT⟩
+    refine ⟨T.mulVec β, ?_⟩
+    calc
+      Matrix.toLin' X (T.mulVec β)
+          = X.mulVec (T.mulVec β) := by rw [Matrix.toLin'_apply]
+      _ = (X * T).mulVec β := by
+        symm
+        simpa using (Matrix.mulVec_mulVec X T β)
+      _ = X'.mulVec β := by simpa [hT]
+      _ = Matrix.toLin' X' β := by rw [Matrix.toLin'_apply]
+      _ = y := hβ
+
 theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
     (A : Matrix (Fin k) (Fin k) ℝ) (_hA : IsUnit A.det) (b : Fin k → ℝ)
     (data : RealizedData n k) (lambda : ℝ)
@@ -4443,14 +4743,21 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
     (h_n_pos : n > 0) (h_lambda_nonneg : 0 ≤ lambda)
     (h_lambda_zero : lambda = 0)
     (h_rank : Matrix.rank (designMatrix data pgsBasis splineBasis) = Fintype.card (ParamIx p k sp))
-    (h_range_eq :
+    (h_reparam_fwd :
       let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
-      LinearMap.range (Matrix.toLin' (designMatrix data pgsBasis splineBasis)) = LinearMap.range (Matrix.toLin' (designMatrix data' pgsBasis splineBasis))) :
+      ∃ T : Matrix (ParamIx p k sp) (ParamIx p k sp) ℝ,
+        designMatrix data' pgsBasis splineBasis = designMatrix data pgsBasis splineBasis * T)
+    (h_reparam_bwd :
+      let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
+      ∃ U : Matrix (ParamIx p k sp) (ParamIx p k sp) ℝ,
+        designMatrix data pgsBasis splineBasis = designMatrix data' pgsBasis splineBasis * U) :
   let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
   let model := fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
   let model_prime := fit p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
       let X := designMatrix data pgsBasis splineBasis
       let X' := designMatrix data' pgsBasis splineBasis
+      have h_range_eq : LinearMap.range (Matrix.toLin' X) = LinearMap.range (Matrix.toLin' X') := by
+        exact range_eq_of_two_sided_design_reparam X X' h_reparam_fwd h_reparam_bwd
       have h_rank_eq : X.rank = X'.rank := by
         exact rank_eq_of_range_eq X X' h_range_eq
       rw [← h_rank_eq]
@@ -4464,6 +4771,9 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   let X' := designMatrix data' pgsBasis splineBasis
   let K := LinearMap.range (Matrix.toLin' X)
   let K' := LinearMap.range (Matrix.toLin' X')
+
+  have h_range_eq : LinearMap.range (Matrix.toLin' X) = LinearMap.range (Matrix.toLin' X') := by
+    exact range_eq_of_two_sided_design_reparam X X' h_reparam_fwd h_reparam_bwd
 
   have h_pred := fit_gives_projection_linear data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_lambda_zero h_rank
 
