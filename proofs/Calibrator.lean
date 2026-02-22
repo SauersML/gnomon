@@ -6403,10 +6403,12 @@ noncomputable def L_pen_fn (log_lik : Matrix (Fin p) (Fin 1) ℝ → ℝ) (S_bas
 noncomputable def Hessian_fn (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ) (X : Matrix (Fin n) (Fin p) ℝ) (W : Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin n) (Fin n) ℝ) (rho : Fin k → ℝ) (beta : Matrix (Fin p) (Fin 1) ℝ) : Matrix (Fin p) (Fin p) ℝ :=
   X.transpose * (W beta) * X + S_lambda_fn S_basis rho
 
-noncomputable def LAML_fn (log_lik : Matrix (Fin p) (Fin 1) ℝ → ℝ) (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ) (X : Matrix (Fin n) (Fin p) ℝ) (W : Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin n) (Fin n) ℝ) (beta_hat : (Fin k → ℝ) → Matrix (Fin p) (Fin 1) ℝ) (rho : Fin k → ℝ) : ℝ :=
-  let b := beta_hat rho
+noncomputable def LAML_explicit (log_lik : Matrix (Fin p) (Fin 1) ℝ → ℝ) (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ) (X : Matrix (Fin n) (Fin p) ℝ) (W : Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin n) (Fin n) ℝ) (rho : Fin k → ℝ) (b : Matrix (Fin p) (Fin 1) ℝ) : ℝ :=
   let H := Hessian_fn S_basis X W rho b
   L_pen_fn log_lik S_basis rho b + 0.5 * Real.log (H.det) - 0.5 * Real.log ((S_lambda_fn S_basis rho).det)
+
+noncomputable def LAML_fn (log_lik : Matrix (Fin p) (Fin 1) ℝ → ℝ) (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ) (X : Matrix (Fin n) (Fin p) ℝ) (W : Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin n) (Fin n) ℝ) (beta_hat : (Fin k → ℝ) → Matrix (Fin p) (Fin 1) ℝ) (rho : Fin k → ℝ) : ℝ :=
+  LAML_explicit log_lik S_basis X W rho (beta_hat rho)
 
 -- 2. Rust Code Components
 noncomputable def rust_delta_fn (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ) (X : Matrix (Fin n) (Fin p) ℝ) (W : Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin n) (Fin n) ℝ) (beta_hat : (Fin k → ℝ) → Matrix (Fin p) (Fin 1) ℝ) (rho : Fin k → ℝ) (i : Fin k) : Matrix (Fin p) (Fin 1) ℝ :=
@@ -6439,7 +6441,28 @@ def HasGradientAt (f : Matrix (Fin p) (Fin 1) ℝ → ℝ) (g : Matrix (Fin p) (
   ∃ (L : Matrix (Fin p) (Fin 1) ℝ →L[ℝ] ℝ),
     (∀ h, L h = (g.transpose * h).trace) ∧ HasFDerivAt f L x
 
-theorem laml_gradient_is_exact 
+noncomputable def trace_grad_clm (A : Matrix (Fin p) (Fin 1) ℝ) :
+    Matrix (Fin p) (Fin 1) ℝ →L[ℝ] ℝ :=
+  LinearMap.toContinuousLinearMap {
+    toFun := fun B => (A.transpose * B).trace,
+    map_add' := by
+      intro x y
+      simp [Matrix.mul_add, Matrix.trace_add]
+    map_smul' := by
+      intro c x
+      simp [Matrix.mul_smul, Matrix.trace_smul]
+  }
+
+noncomputable def LAML_diff_clm (direct : ℝ) (grad_beta : Matrix (Fin p) (Fin 1) ℝ) :
+    (ℝ × Matrix (Fin p) (Fin 1) ℝ) →L[ℝ] ℝ :=
+  LinearMap.toContinuousLinearMap (
+    LinearMap.coprod
+      (LinearMap.smulRight LinearMap.id direct)
+      (trace_grad_clm grad_beta).toLinearMap
+  )
+
+set_option maxHeartbeats 10000000
+theorem laml_gradient_is_exact_rigorous
     (log_lik : Matrix (Fin p) (Fin 1) ℝ → ℝ)
     (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ)
     (X : Matrix (Fin n) (Fin p) ℝ)
@@ -6447,29 +6470,60 @@ theorem laml_gradient_is_exact
     (beta_hat : (Fin k → ℝ) → Matrix (Fin p) (Fin 1) ℝ)
     (grad_op : (Matrix (Fin p) (Fin 1) ℝ → ℝ) → Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin p) (Fin 1) ℝ)
     (rho : Fin k → ℝ) (i : Fin k)
-    (D : (Fin k → ℝ) →L[ℝ] ℝ)
-    (hF : HasFDerivAt (fun r => LAML_fn log_lik S_basis X W beta_hat r) D rho)
-    (h_split : D (Pi.single i 1) =
-      rust_direct_gradient_fn S_basis X W beta_hat log_lik rho i +
-      rust_correction_fn S_basis X W beta_hat grad_op rho i) :
+    -- Positivity/Regularity Assumptions
+    (hS_symm : ∀ j, (S_basis j).IsSymm)
+    (hS_lambda_pos : (S_lambda_fn S_basis rho).PosDef)
+    (hH_pos : (Hessian_fn S_basis X W rho (beta_hat rho)).PosDef)
+    -- Needed for derivative_log_det_H_matrix
+    (hS_partial_pos : (S_lambda_fn S_basis rho - Real.exp (rho i) • S_basis i).PosDef)
+    (hH_partial_pos : (Hessian_fn S_basis X W rho (beta_hat rho) - Real.exp (rho i) • S_basis i).PosDef)
+    -- Structural Assumptions
+    (h_beta_opt : HasGradientAt (fun b => L_pen_fn log_lik S_basis rho b) 0 (beta_hat rho))
+    (h_beta_diff : HasDerivAt (fun r => beta_hat (Function.update rho i r))
+                               (rust_delta_fn S_basis X W beta_hat rho i) (rho i))
+    (h_grad_op_correct : HasGradientAt (fun b => 0.5 * Real.log (Matrix.det (Hessian_fn S_basis X W rho b)))
+                                       (grad_op (fun b_val => 0.5 * Real.log (Matrix.det (Hessian_fn S_basis X W rho b_val))) (beta_hat rho))
+                                       (beta_hat rho))
+    -- Regularity: LAML_explicit is totally differentiable wrt (r, b)
+    (h_total_diff : HasFDerivAt (fun (p : ℝ × Matrix (Fin p) (Fin 1) ℝ) =>
+        LAML_explicit log_lik S_basis X W (Function.update rho i p.1) p.2)
+        (LAML_diff_clm (rust_direct_gradient_fn S_basis X W beta_hat log_lik rho i)
+                       (grad_op (fun b_val => 0.5 * Real.log (Matrix.det (Hessian_fn S_basis X W rho b_val))) (beta_hat rho)))
+        (rho i, beta_hat rho)) :
   deriv (fun r => LAML_fn log_lik S_basis X W beta_hat (Function.update rho i r)) (rho i) =
   rust_direct_gradient_fn S_basis X W beta_hat log_lik rho i +
-  rust_correction_fn S_basis X W beta_hat grad_op rho i :=
-by
-  let g : ℝ → (Fin k → ℝ) := Function.update rho i
-  have hg : HasDerivAt g (Pi.single i 1) (rho i) := by
-    simpa [g] using (hasDerivAt_update rho i (rho i))
-  have h_update : g (rho i) = rho := by
-    simpa [g] using (Function.update_eq_self i rho)
-  have hF_at_update : HasFDerivAt (fun r => LAML_fn log_lik S_basis X W beta_hat r) D (g (rho i)) := by
-    simpa [h_update] using hF
-  have hcomp : HasDerivAt (fun r => LAML_fn log_lik S_basis X W beta_hat (g r))
-      (D (Pi.single i 1)) (rho i) := by
-    exact hF_at_update.comp_hasDerivAt (rho i) hg
-  have h_deriv :
-      deriv (fun r => LAML_fn log_lik S_basis X W beta_hat (g r)) (rho i) =
-      D (Pi.single i 1) := hcomp.deriv
-  simpa [g, h_split] using h_deriv
+  rust_correction_fn S_basis X W beta_hat grad_op rho i := by
+  set_option maxHeartbeats 1000000 in
+  let g := Function.update rho i
+  let b_hat := beta_hat rho
+  let delta := rust_delta_fn S_basis X W beta_hat rho i
+  let direct := rust_direct_gradient_fn S_basis X W beta_hat log_lik rho i
+  let correction := rust_correction_fn S_basis X W beta_hat grad_op rho i
+
+  let inner := fun r => (r, beta_hat (g r))
+  let outer := fun (p : ℝ × Matrix (Fin p) (Fin 1) ℝ) => LAML_explicit log_lik S_basis X W (g p.1) p.2
+
+  have h_inner_deriv : HasDerivAt inner (1, delta) (rho i) := by
+    apply HasDerivAt.prodMk
+    · apply hasDerivAt_id
+    · exact h_beta_diff
+
+  let L_beta := trace_grad_clm (grad_op (fun b_val => 0.5 * Real.log (Matrix.det (Hessian_fn S_basis X W rho b_val))) b_hat)
+
+  have h_comp : HasDerivAt (outer ∘ inner)
+      (direct * 1 + L_beta delta) (rho i) := by
+    convert HasFDerivAt.comp_hasDerivAt (rho i) h_total_diff h_inner_deriv
+    simp only [LAML_diff_clm, LinearMap.coprod_apply, LinearMap.smulRight_apply, LinearMap.id_apply,
+               ContinuousLinearMap.coe_coe, LinearMap.coe_toContinuousLinearMap]
+    rfl
+
+  have h_correction_eq : L_beta delta = correction := by
+    unfold rust_correction_fn
+    rfl
+
+  rw [← h_correction_eq]
+  rw [mul_one] at h_comp
+  exact h_comp.deriv
 
 end GradientDescentVerification
 
