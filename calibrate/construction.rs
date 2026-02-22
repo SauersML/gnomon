@@ -2664,7 +2664,7 @@ mod tests {
     use ndarray::s;
     use ndarray::{Array1, Array2, array};
     use rand::rngs::StdRng;
-    use rand::{Rng, SeedableRng};
+    use rand::{RngExt, SeedableRng};
     use std::collections::HashMap;
 
     /// Maximum absolute difference helper for matrix comparisons.
@@ -2775,7 +2775,7 @@ mod tests {
                     let mut root = Array2::zeros((4, p));
                     for i in 0..root.nrows() {
                         for j in 0..root.ncols() {
-                            root[[i, j]] = scale * rng.gen_range(-1.0..1.0);
+                            root[[i, j]] = scale * rng.random_range(-1.0..1.0);
                         }
                     }
                     root
@@ -2794,7 +2794,7 @@ mod tests {
                     let mut root = Array2::zeros((rank, p));
                     for i in 0..rank {
                         for j in 0..p {
-                            root[[i, j]] = rng.gen_range(-0.5..0.5);
+                            root[[i, j]] = rng.random_range(-0.5..0.5);
                         }
                     }
                     root
@@ -2821,7 +2821,7 @@ mod tests {
                     let mut root = Array2::zeros((rank, p));
                     for i in 0..rank {
                         for j in 0..p {
-                            root[[i, j]] = rng.gen_range(-1.0..1.0);
+                            root[[i, j]] = rng.random_range(-1.0..1.0);
                         }
                     }
                     root
@@ -2871,19 +2871,19 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(seed);
         let mut p = Array1::zeros(n_samples);
         for val in p.iter_mut() {
-            *val = rng.gen_range(-2.5..2.5);
+            *val = rng.random_range(-2.5..2.5);
         }
 
         let mut pcs = Array2::zeros((n_samples, num_pcs));
         for i in 0..n_samples {
             for j in 0..num_pcs {
-                pcs[[i, j]] = rng.gen_range(-2.0..2.0);
+                pcs[[i, j]] = rng.random_range(-2.0..2.0);
             }
         }
 
         let mut eta = Array1::zeros(n_samples);
         for i in 0..n_samples {
-            let mut val = 0.6 * p[i] + rng.gen_range(-0.3..0.3);
+            let mut val = 0.6 * p[i] + rng.random_range(-0.3..0.3);
             for j in 0..num_pcs {
                 let weight = 0.2 + 0.1 * (j as f64);
                 val += weight * pcs[[i, j]];
@@ -2894,7 +2894,7 @@ mod tests {
         let mut y = Array1::zeros(n_samples);
         for i in 0..n_samples {
             let prob = 1.0 / (1.0 + (-eta[i]).exp());
-            y[i] = if rng.gen_range(0.0..1.0) < prob {
+            y[i] = if rng.random_range(0.0..1.0) < prob {
                 1.0
             } else {
                 0.0
@@ -2902,7 +2902,7 @@ mod tests {
         }
 
         let sex = Array1::from_iter((0..n_samples).map(|_| {
-            if rng.gen_range(0.0..1.0) < 0.5 {
+            if rng.random_range(0.0..1.0) < 0.5 {
                 1.0
             } else {
                 0.0
@@ -3000,14 +3000,14 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(12345);
 
         // Generate PGS data (standard normal)
-        let p: Array1<f64> = (0..n_samples).map(|_| rng.gen_range(-2.0..2.0)).collect();
+        let p: Array1<f64> = (0..n_samples).map(|_| rng.random_range(-2.0..2.0)).collect();
 
         // Generate PC data if requested
         let pcs = if num_pcs > 0 {
             let mut pc_data = Array2::zeros((n_samples, num_pcs));
             for i in 0..n_samples {
                 for j in 0..num_pcs {
-                    pc_data[[i, j]] = rng.gen_range(-1.5..1.5);
+                    pc_data[[i, j]] = rng.random_range(-1.5..1.5);
                 }
             }
             pc_data
@@ -3022,7 +3022,7 @@ mod tests {
                 for j in 0..num_pcs {
                     response += 0.3 * pcs[[i, j]];
                 }
-                response + rng.gen_range(-0.1..0.1) // small noise
+                response + rng.random_range(-0.1..0.1) // small noise
             })
             .collect();
 

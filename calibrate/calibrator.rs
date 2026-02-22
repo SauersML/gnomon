@@ -2467,7 +2467,7 @@ mod tests {
     use faer::linalg::solvers::Llt as FaerLlt;
     use ndarray::{Array1, Array2, Axis};
     use rand::prelude::*;
-    use rand_distr::{Bernoulli, Distribution, Normal, Uniform};
+    use rand_distr::{Bernoulli, Distribution, Normal};
     use std::f64::consts::PI;
 
     #[derive(Debug, Clone, Copy)]
@@ -2847,7 +2847,7 @@ mod tests {
     ) -> (Array2<f64>, Array1<f64>, Array1<f64>) {
         let mut rng = match seed {
             Some(s) => StdRng::seed_from_u64(s),
-            None => StdRng::from_entropy(),
+            None => StdRng::from_rng(&mut rand::rng()),
         };
 
         // Generate feature matrix X
@@ -2888,7 +2888,7 @@ mod tests {
     ) -> (Array2<f64>, Array1<f64>, Array1<f64>, Array1<f64>) {
         let mut rng = match seed {
             Some(s) => StdRng::seed_from_u64(s),
-            None => StdRng::from_entropy(),
+            None => StdRng::from_rng(&mut rand::rng()),
         };
 
         // Generate feature matrix X
@@ -2954,7 +2954,7 @@ mod tests {
     ) -> (Array2<f64>, Vec<bool>) {
         let mut rng = match seed {
             Some(s) => StdRng::seed_from_u64(s),
-            None => StdRng::from_entropy(),
+            None => StdRng::from_rng(&mut rand::rng()),
         };
 
         // Generate polygon vertices (convex)
@@ -2964,7 +2964,7 @@ mod tests {
         // Create a regular polygon and add some noise
         for i in 0..n_vertices {
             let angle = 2.0 * PI * (i as f64) / (n_vertices as f64);
-            let radius = 1.0 + 0.2 * Uniform::new(-1.0, 1.0).sample(&mut rng);
+            let radius = 1.0 + 0.2 * rng.random_range(-1.0..1.0);
             let x = radius * angle.cos();
             let y = radius * angle.sin();
             vertices.push((x, y));
@@ -2997,7 +2997,7 @@ mod tests {
             let mut total_weight = 0.0;
 
             for &(vx, vy) in &vertices {
-                let weight = Uniform::new(0.0, 1.0).sample(&mut rng);
+                let weight = rng.random_range(0.0..1.0);
                 x += weight * vx;
                 y += weight * vy;
                 total_weight += weight;
@@ -3016,8 +3016,8 @@ mod tests {
         let mut outside_count = 0;
         while outside_count < n_outside - vertices.len() {
             // Generate points outside the convex hull
-            let angle = Uniform::new(0.0, 2.0 * PI).sample(&mut rng);
-            let radius = Uniform::new(1.5, 3.0).sample(&mut rng); // Outside the unit circle
+            let angle = rng.random_range(0.0..(2.0 * PI));
+            let radius = rng.random_range(1.5..3.0); // Outside the unit circle
             let x = radius * angle.cos();
             let y = radius * angle.sin();
 
@@ -4373,7 +4373,7 @@ mod tests {
             .iter()
             .map(|&p| {
                 let prob = 1.0 / (1.0 + (-p).exp());
-                if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 }
+                if rng.random::<f64>() < prob { 1.0 } else { 0.0 }
             })
             .collect();
         let y = Array1::from_vec(y);
@@ -4720,12 +4720,12 @@ mod tests {
 
         // First two columns are almost identical
         for i in 0..n {
-            let base = rng.r#gen::<f64>() * 2.0 - 1.0;
+            let base = rng.random::<f64>() * 2.0 - 1.0;
             x[[i, 0]] = base;
-            x[[i, 1]] = base + rng.r#gen::<f64>() * 1e-6; // Almost identical
+            x[[i, 1]] = base + rng.random::<f64>() * 1e-6; // Almost identical
 
             for j in 2..p {
-                x[[i, j]] = rng.r#gen::<f64>() * 2.0 - 1.0;
+                x[[i, j]] = rng.random::<f64>() * 2.0 - 1.0;
             }
         }
 
@@ -6021,7 +6021,7 @@ mod tests {
         let se_tiny_range = 1e-9;
         let se = Array1::from_vec(
             (0..n)
-                .map(|_| se_base_value + rng.r#gen::<f64>() * se_tiny_range)
+                .map(|_| se_base_value + rng.random::<f64>() * se_tiny_range)
                 .collect(),
         );
 
@@ -6029,7 +6029,7 @@ mod tests {
         let dist = Array1::from_vec(
             (0..n)
                 .map(|_| {
-                    if rng.r#gen::<f64>() > 0.9 { 0.1 } else { 0.0 } // Mostly zeros with a few positives
+                    if rng.random::<f64>() > 0.9 { 0.1 } else { 0.0 } // Mostly zeros with a few positives
                 })
                 .collect(),
         );
@@ -6159,12 +6159,12 @@ mod tests {
         );
         let test_se = Array1::from_vec(
             (0..n_test)
-                .map(|_| se_base_value + rng.r#gen::<f64>() * se_tiny_range)
+                .map(|_| se_base_value + rng.random::<f64>() * se_tiny_range)
                 .collect(),
         );
         let test_dist = Array1::from_vec(
             (0..n_test)
-                .map(|_| if rng.r#gen::<f64>() > 0.9 { 0.1 } else { 0.0 })
+                .map(|_| if rng.random::<f64>() > 0.9 { 0.1 } else { 0.0 })
                 .collect(),
         );
 
@@ -6855,7 +6855,7 @@ mod tests {
             // Create a random unit vector direction
             let mut d = Array1::<f64>::zeros(rho_hat.len());
             for j in 0..rho_hat.len() {
-                d[j] = rng.r#gen::<f64>() * 2.0 - 1.0;
+                d[j] = rng.random::<f64>() * 2.0 - 1.0;
             }
             // Normalize to unit length
             let norm: f64 = d.iter().map(|&x| x * x).sum::<f64>().sqrt();
@@ -7225,7 +7225,7 @@ mod tests {
                     x[[i, j]] = (i as f64) * 100.0; // Large linear trend
                 } else {
                     // Regular predictors
-                    x[[i, j]] = rng.r#gen::<f64>() * 2.0 - 1.0;
+                    x[[i, j]] = rng.random::<f64>() * 2.0 - 1.0;
                 }
             }
         }
@@ -7747,7 +7747,7 @@ mod tests {
         let mut x = Array2::<f64>::zeros((n, p));
         for i in 0..n {
             for j in 0..p {
-                x[[i, j]] = rng.gen_range(-1.0..1.0);
+                x[[i, j]] = rng.random_range(-1.0..1.0);
             }
         }
 
@@ -7757,7 +7757,7 @@ mod tests {
         let mut y = Array1::<f64>::zeros(n);
         for i in 0..n {
             let p_i = 1.0 / (1.0 + (-xbeta[i]).exp());
-            y[i] = if rng.gen_range(0.0..1.0) < p_i {
+            y[i] = if rng.random_range(0.0..1.0) < p_i {
                 1.0
             } else {
                 0.0

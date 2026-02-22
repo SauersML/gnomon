@@ -2507,7 +2507,7 @@ mod tests {
     use approx::assert_abs_diff_eq;
     use ndarray::{Array1, Array2, arr1, arr2};
     use rand::rngs::StdRng;
-    use rand::{Rng, SeedableRng};
+    use rand::{RngExt, SeedableRng};
     use std::collections::HashMap;
 
     /// Un-pivots the columns of a matrix according to a pivot vector.
@@ -2586,7 +2586,7 @@ mod tests {
                     .iter()
                     .map(|&log_odds| {
                         let prob = 1.0 / (1.0 + (-log_odds as f64).exp());
-                        if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 }
+                        if rng.random::<f64>() < prob { 1.0 } else { 0.0 }
                     })
                     .collect();
                 (Array1::from_vec(y_values), true_log_odds)
@@ -2597,7 +2597,7 @@ mod tests {
                     SignalType::LinearSignal => &p * 1.5 + 0.5, // Different intercept for variety
                 };
                 let noise: Array1<f64> =
-                    Array1::from_shape_fn(n_samples, |_| rng.r#gen::<f64>() - 0.5); // N(0, 1/12)
+                    Array1::from_shape_fn(n_samples, |_| rng.random::<f64>() - 0.5); // N(0, 1/12)
                 let y = &true_mean + &noise;
                 (y, true_mean)
             }
@@ -3378,7 +3378,7 @@ mod tests {
         // Outcome `y`: Pure 50/50 random noise, mathematically independent of `p`.
         // This makes separation impossible and provides maximum stability.
         let y_values: Vec<f64> = (0..n_samples)
-            .map(|_| if rng.r#gen::<f64>() < 0.5 { 1.0 } else { 0.0 })
+            .map(|_| if rng.random::<f64>() < 0.5 { 1.0 } else { 0.0 })
             .collect();
         let y = Array1::from_vec(y_values);
 
@@ -3517,7 +3517,7 @@ mod tests {
             .map(|&p_val| {
                 let log_odds: f64 = -0.5 + 1.5 * p_val;
                 let prob = 1.0 / (1.0 + (-log_odds).exp());
-                if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 }
+                if rng.random::<f64>() < prob { 1.0 } else { 0.0 }
             })
             .collect();
         let y = Array1::from_vec(y_values);
@@ -3813,14 +3813,14 @@ mod tests {
     fn test_pls_normal_equations_hold_unpenalized() {
         use ndarray::{Array1, Array2};
         use rand::rngs::StdRng;
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
 
         // Tall random matrix (well-conditioned-ish)
         let n = 80usize;
         let p = 12usize;
         let mut rng = StdRng::seed_from_u64(12345);
-        let x = Array2::from_shape_fn((n, p), |_| rng.r#gen::<f64>() - 0.5);
-        let z = Array1::from_shape_fn(n, |_| rng.r#gen::<f64>() - 0.5);
+        let x = Array2::from_shape_fn((n, p), |_| rng.random::<f64>() - 0.5);
+        let z = Array1::from_shape_fn(n, |_| rng.random::<f64>() - 0.5);
         let w = Array1::from_elem(n, 1.0);
 
         // No penalty at all
@@ -3870,14 +3870,14 @@ mod tests {
     fn test_step_accepts_wls_for_gaussian() {
         use ndarray::{Array1, Array2};
         use rand::rngs::StdRng;
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
 
         // Random tall problem
         let n = 200usize;
         let p = 10usize;
         let mut rng = StdRng::seed_from_u64(54321);
-        let x = Array2::from_shape_fn((n, p), |_| rng.r#gen::<f64>() - 0.5);
-        let y = Array1::from_shape_fn(n, |_| rng.r#gen::<f64>() - 0.5);
+        let x = Array2::from_shape_fn((n, p), |_| rng.random::<f64>() - 0.5);
+        let y = Array1::from_shape_fn(n, |_| rng.random::<f64>() - 0.5);
         let w = Array1::from_elem(n, 1.0);
 
         // No penalty to keep it pure LS
@@ -3922,16 +3922,16 @@ mod tests {
     fn test_wls_stationarity_old_vs_new_weights_logit() {
         use ndarray::{Array1, Array2};
         use rand::rngs::StdRng;
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
 
         // Modest logit problem
         let n = 400usize;
         let p = 8usize;
         let mut rng = StdRng::seed_from_u64(98765);
-        let x = Array2::from_shape_fn((n, p), |_| rng.r#gen::<f64>() - 0.5);
+        let x = Array2::from_shape_fn((n, p), |_| rng.random::<f64>() - 0.5);
         let eta0 = Array1::zeros(n);
         // y ~ Bernoulli(0.5)
-        let y = Array1::from_shape_fn(n, |_| if rng.r#gen::<f64>() > 0.5 { 1.0 } else { 0.0 });
+        let y = Array1::from_shape_fn(n, |_| if rng.random::<f64>() > 0.5 { 1.0 } else { 0.0 });
         let w_prior = Array1::from_elem(n, 1.0);
 
         // Build IRLS vectors at beta=0

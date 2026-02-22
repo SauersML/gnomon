@@ -8,7 +8,7 @@ mod tests {
     };
     use ndarray::{Array, Array1, Array2, Zip};
     use rand::seq::SliceRandom;
-    use rand::{Rng, SeedableRng, rngs::StdRng};
+    use rand::{RngExt, SeedableRng, rngs::StdRng};
     use rand_distr::{Distribution, Normal};
     use std::f64::consts::PI;
 
@@ -24,7 +24,7 @@ mod tests {
             4.5,
             RHO_BOUND - 1e-9,
         ];
-        values.extend((0..249).map(|_| rng.gen_range((-RHO_BOUND + 1e-6)..(RHO_BOUND - 1e-6))));
+        values.extend((0..249).map(|_| rng.random_range((-RHO_BOUND + 1e-6)..(RHO_BOUND - 1e-6))));
         let rho = Array1::from_vec(values);
         let z = to_z_from_rho(&rho);
         let rho_rt = to_rho_from_z(&z);
@@ -76,8 +76,8 @@ mod tests {
         let n_samples = 1650;
         let mut rng = StdRng::seed_from_u64(42);
 
-        let p = Array1::from_shape_fn(n_samples, |_| rng.gen_range(-2.0..2.0));
-        let pc1_values = Array1::from_shape_fn(n_samples, |_| rng.gen_range(-1.5..1.5));
+        let p = Array1::from_shape_fn(n_samples, |_| rng.random_range(-2.0..2.0));
+        let pc1_values = Array1::from_shape_fn(n_samples, |_| rng.random_range(-1.5..1.5));
         let pcs = pc1_values
             .clone()
             .into_shape_with_order((n_samples, 1))
@@ -85,12 +85,12 @@ mod tests {
 
         let normal = Normal::new(0.0, 0.9).unwrap();
         let intercept_noise = Array1::from_shape_fn(n_samples, |_| normal.sample(&mut rng));
-        let pgs_coeffs = Array1::from_shape_fn(n_samples, |_| rng.gen_range(0.45..1.55));
-        let pc_coeffs = Array1::from_shape_fn(n_samples, |_| rng.gen_range(0.4..1.6));
-        let interaction_coeffs = Array1::from_shape_fn(n_samples, |_| rng.gen_range(0.7..1.8));
-        let response_scales = Array1::from_shape_fn(n_samples, |_| rng.gen_range(0.75..1.35));
-        let pgs_phase_shifts = Array1::from_shape_fn(n_samples, |_| rng.gen_range(-PI..PI));
-        let pc_phase_shifts = Array1::from_shape_fn(n_samples, |_| rng.gen_range(-PI..PI));
+        let pgs_coeffs = Array1::from_shape_fn(n_samples, |_| rng.random_range(0.45..1.55));
+        let pc_coeffs = Array1::from_shape_fn(n_samples, |_| rng.random_range(0.4..1.6));
+        let interaction_coeffs = Array1::from_shape_fn(n_samples, |_| rng.random_range(0.7..1.8));
+        let response_scales = Array1::from_shape_fn(n_samples, |_| rng.random_range(0.75..1.35));
+        let pgs_phase_shifts = Array1::from_shape_fn(n_samples, |_| rng.random_range(-PI..PI));
+        let pc_phase_shifts = Array1::from_shape_fn(n_samples, |_| rng.random_range(-PI..PI));
 
         let y: Array1<f64> = (0..n_samples)
             .map(|i| {
@@ -119,7 +119,7 @@ mod tests {
                         + interaction_coeffs[i] * interaction);
                 let prob = 1.0 / (1.0 + f64::exp(-logit));
                 let prob = prob.clamp(1e-4, 1.0 - 1e-4);
-                if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 }
+                if rng.random::<f64>() < prob { 1.0 } else { 0.0 }
             })
             .collect();
 
@@ -545,8 +545,8 @@ mod tests {
         let n_samples = 5000;
         let mut rng = StdRng::seed_from_u64(42);
 
-        let p = Array1::from_shape_fn(n_samples, |_| rng.gen_range(-2.0..2.0));
-        let pc1_values = Array1::from_shape_fn(n_samples, |_| rng.gen_range(-1.5..1.5));
+        let p = Array1::from_shape_fn(n_samples, |_| rng.random_range(-2.0..2.0));
+        let pc1_values = Array1::from_shape_fn(n_samples, |_| rng.random_range(-1.5..1.5));
         let pcs = pc1_values
             .clone()
             .into_shape_with_order((n_samples, 1))
@@ -569,7 +569,7 @@ mod tests {
                 let prob = 1.0 / (1.0 + f64::exp(-logit));
                 let prob_clamped = prob.clamp(1e-6, 1.0 - 1e-6);
 
-                if rng.gen_range(0.0..1.0) < prob_clamped {
+                if rng.random_range(0.0..1.0) < prob_clamped {
                     1.0
                 } else {
                     0.0
@@ -731,8 +731,8 @@ mod tests {
         let n_train = 300;
         let mut rng = StdRng::seed_from_u64(42);
 
-        let p = Array1::from_shape_fn(n_total, |_| rng.gen_range(-2.0..2.0));
-        let pc1_values = Array1::from_shape_fn(n_total, |_| rng.gen_range(-1.5..1.5));
+        let p = Array1::from_shape_fn(n_total, |_| rng.random_range(-2.0..2.0));
+        let pc1_values = Array1::from_shape_fn(n_total, |_| rng.random_range(-1.5..1.5));
         let pcs = pc1_values
             .clone()
             .into_shape_with_order((n_total, 1))
@@ -758,7 +758,7 @@ mod tests {
 
                 true_probabilities.push(prob_clamped);
 
-                if rng.gen_range(0.0..1.0) < prob_clamped {
+                if rng.random_range(0.0..1.0) < prob_clamped {
                     1.0
                 } else {
                     0.0
@@ -873,8 +873,8 @@ mod tests {
         };
 
         let mut rng = StdRng::seed_from_u64(seed);
-        let p = Array1::from_shape_fn(n, |_| rng.gen_range(-2.0..2.0));
-        let pc1 = Array1::from_shape_fn(n, |_| rng.gen_range(-1.5..1.5));
+        let p = Array1::from_shape_fn(n, |_| rng.random_range(-2.0..2.0));
+        let pc1 = Array1::from_shape_fn(n, |_| rng.random_range(-1.5..1.5));
         let mut pcs = Array2::zeros((n, 1));
         pcs.column_mut(0).assign(&pc1);
         let logits = p.mapv(|v: f64| (0.9_f64 * v).max(-6.0_f64).min(6.0_f64));
@@ -967,8 +967,8 @@ mod tests {
         };
 
         let mut rng = StdRng::seed_from_u64(seed);
-        let p = Array1::from_shape_fn(n, |_| rng.gen_range(-2.0..2.0));
-        let pc1 = Array1::from_shape_fn(n, |_| rng.gen_range(-1.5..1.5));
+        let p = Array1::from_shape_fn(n, |_| rng.random_range(-2.0..2.0));
+        let pc1 = Array1::from_shape_fn(n, |_| rng.random_range(-1.5..1.5));
         let mut pcs = Array2::zeros((n, 1));
         pcs.column_mut(0).assign(&pc1);
         let logits = p.mapv(|v: f64| (0.7_f64 * v).max(-6.0_f64).min(6.0_f64));
@@ -1681,7 +1681,7 @@ mod tests {
         let pc1 = Array1::linspace(-1.5, 1.5, n_samples);
 
         // PC2 is pure noise - has NO effect on the outcome
-        let pc2 = Array1::from_shape_fn(n_samples, |_| rng.gen_range(-1.5..1.5));
+        let pc2 = Array1::from_shape_fn(n_samples, |_| rng.random_range(-1.5..1.5));
 
         // Create PCs matrix
         let mut pcs = Array2::zeros((n_samples, 2));
@@ -1690,10 +1690,10 @@ mod tests {
 
         // Generate outcomes that depend ONLY on PC1 (nonlinear signal)
         let y = pc1.mapv(|x| (std::f64::consts::PI * x).sin())
-            + Array1::from_shape_fn(n_samples, |_| rng.gen_range(-0.05..0.05));
+            + Array1::from_shape_fn(n_samples, |_| rng.random_range(-0.05..0.05));
 
         // Random PGS values
-        let p = Array1::from_shape_fn(n_samples, |_| rng.gen_range(-2.0..2.0));
+        let p = Array1::from_shape_fn(n_samples, |_| rng.random_range(-2.0..2.0));
 
         let data = TrainingData {
             y: y.clone(),
@@ -1798,7 +1798,7 @@ mod tests {
 
         // Both PCs are useful but have different curvature needs
         let pc1 = Array1::linspace(-1.5, 1.5, n_samples);
-        let pc2 = Array1::from_shape_fn(n_samples, |_| rng.gen_range(-1.5..1.5)); // Break symmetry!
+        let pc2 = Array1::from_shape_fn(n_samples, |_| rng.random_range(-1.5..1.5)); // Break symmetry!
 
         // Create PCs matrix
         let mut pcs = Array2::zeros((n_samples, 2));
@@ -1809,10 +1809,10 @@ mod tests {
         // Both contribute to y, but PC1 needs much more wiggle room
         let f1 = pc1.mapv(|x| (2.0 * std::f64::consts::PI * x).sin()); // High frequency sine
         let f2 = pc2.mapv(|x| 0.3 * x * x); // Gentle quadratic
-        let y = &f1 + &f2 + Array1::from_shape_fn(n_samples, |_| rng.gen_range(-0.05..0.05));
+        let y = &f1 + &f2 + Array1::from_shape_fn(n_samples, |_| rng.random_range(-0.05..0.05));
 
         // Random PGS values
-        let p = Array1::from_shape_fn(n_samples, |_| rng.gen_range(-2.0..2.0));
+        let p = Array1::from_shape_fn(n_samples, |_| rng.random_range(-2.0..2.0));
 
         let data = TrainingData {
             y: y.clone(),
@@ -2938,9 +2938,9 @@ mod tests {
         let p = Array1::linspace(-3.0, 3.0, n_samples);
 
         // Create three PCs with different distributions
-        let pc1 = Array1::from_shape_fn(n_samples, |_| rng.r#gen::<f64>() * 2.0 - 1.0);
-        let pc2 = Array1::from_shape_fn(n_samples, |_| rng.r#gen::<f64>() * 2.0 - 1.0);
-        let pc3 = Array1::from_shape_fn(n_samples, |_| rng.r#gen::<f64>() * 2.0 - 1.0);
+        let pc1 = Array1::from_shape_fn(n_samples, |_| rng.random::<f64>() * 2.0 - 1.0);
+        let pc2 = Array1::from_shape_fn(n_samples, |_| rng.random::<f64>() * 2.0 - 1.0);
+        let pc3 = Array1::from_shape_fn(n_samples, |_| rng.random::<f64>() * 2.0 - 1.0);
 
         // Create a PCs matrix
         let mut pcs = Array2::zeros((n_samples, 3));
@@ -3046,7 +3046,7 @@ mod tests {
 
     #[test]
     fn test_cost_function_correctly_penalizes_noise() {
-        use rand::Rng;
+        use rand::RngExt;
         use rand::SeedableRng;
 
         // This test verifies that when fitting a model with both signal and noise terms,
@@ -3064,11 +3064,11 @@ mod tests {
 
         // Create a predictive PC1 variable - add slight randomization for better conditioning
         let pc1 = Array1::from_shape_fn(n_samples, |i| {
-            (i as f64) * 3.0 / (n_samples as f64) - 1.5 + rng.gen_range(-0.01..0.01)
+            (i as f64) * 3.0 / (n_samples as f64) - 1.5 + rng.random_range(-0.01..0.01)
         });
 
         // Create PC2 with no predictive power (pure noise)
-        let pc2 = Array1::from_shape_fn(n_samples, |_| rng.gen_range(-1.0..1.0));
+        let pc2 = Array1::from_shape_fn(n_samples, |_| rng.random_range(-1.0..1.0));
 
         // Assemble the PC matrix
         let mut pcs = Array2::zeros((n_samples, 2));
@@ -3077,7 +3077,7 @@ mod tests {
 
         // Create PGS values with slight randomization
         let p = Array1::from_shape_fn(n_samples, |i| {
-            (i as f64) * 4.0 / (n_samples as f64) - 2.0 + rng.gen_range(-0.01..0.01)
+            (i as f64) * 4.0 / (n_samples as f64) - 2.0 + rng.random_range(-0.01..0.01)
         });
 
         // Generate y values that ONLY depend on PC1 (not PC2)
@@ -3085,7 +3085,7 @@ mod tests {
             let pc1_val = pcs[[i, 0]];
             // Simple linear function of PC1 with small noise for stability
             let signal = 0.2 + 0.5 * pc1_val;
-            let noise = rng.gen_range(-0.05..0.05);
+            let noise = rng.random_range(-0.05..0.05);
             signal + noise
         });
 
@@ -3310,7 +3310,7 @@ mod tests {
     fn test_basic_model_estimation() {
         // --- Setup: Generate more realistic, non-separable data ---
         let n_samples = 100; // A slightly larger sample size for stability
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
 
         let p = Array::linspace(-2.0, 2.0, n_samples);
@@ -3321,7 +3321,7 @@ mod tests {
 
         // Generate the noisy, binary outcomes from the true probabilities
         let y =
-            true_probabilities.mapv(|prob| if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 });
+            true_probabilities.mapv(|prob| if rng.random::<f64>() < prob { 1.0 } else { 0.0 });
 
         let data = TrainingData {
             y: y.clone(),
@@ -3446,7 +3446,7 @@ mod tests {
             let prob = 1.0 / (1.0 + (-logit as f64).exp());
             // Add significant noise to prevent separation
             let noisy_prob = prob * 0.6 + 0.2; // compress to [0.2, 0.8]
-            if rng.r#gen::<f64>() < noisy_prob {
+            if rng.random::<f64>() < noisy_prob {
                 1.0
             } else {
                 0.0
@@ -3586,7 +3586,7 @@ mod tests {
                 + 1.0 * (pgs_val * pc_val * 0.5_f64).tanh();
 
             // Add substantial noise to prevent separation
-            let noise = rng.gen_range(-1.2..1.2);
+            let noise = rng.random_range(-1.2..1.2);
             let logit: f64 = signal + noise;
 
             // Clamp and convert to probability
@@ -3594,7 +3594,7 @@ mod tests {
             let prob = 1.0 / (1.0 + (-clamped_logit).exp());
 
             // Stochastic outcome
-            if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 }
+            if rng.random::<f64>() < prob { 1.0 } else { 0.0 }
         });
 
         let data = TrainingData {
@@ -4182,7 +4182,7 @@ mod tests {
             let mut rng = StdRng::seed_from_u64(42);
 
             // Use random predictor instead of linspace to avoid perfect separation
-            let p = Array1::from_shape_fn(n_samples, |_| rng.gen_range(-2.0..2.0));
+            let p = Array1::from_shape_fn(n_samples, |_| rng.random_range(-2.0..2.0));
             let y = match link_function {
                 LinkFunction::Identity => p.clone(), // y = p
                 LinkFunction::Logit => {
@@ -4320,11 +4320,11 @@ mod tests {
             let n_samples = 600;
 
             // Use random jitter to prevent perfect separation and improve numerical stability
-            let p = Array1::from_shape_fn(n_samples, |_| rng.gen_range(-0.9..0.9));
+            let p = Array1::from_shape_fn(n_samples, |_| rng.random_range(-0.9..0.9));
 
             let y = match link_function {
                 LinkFunction::Identity => {
-                    p.mapv(|x: f64| x.sin() + 0.1 * rng.gen_range(-0.5..0.5))
+                    p.mapv(|x: f64| x.sin() + 0.1 * rng.random_range(-0.5..0.5))
                 }
                 LinkFunction::Logit => {
                     // Use our helper function with controlled parameters to prevent separation
@@ -4565,15 +4565,15 @@ mod tests {
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
 
         // Create two INDEPENDENT predictors
-        let p = Array1::from_shape_fn(n_samples, |_| rng.gen_range(-2.0..2.0));
-        let pcs_vec: Vec<f64> = (0..n_samples).map(|_| rng.gen_range(-1.5..1.5)).collect();
+        let p = Array1::from_shape_fn(n_samples, |_| rng.random_range(-2.0..2.0));
+        let pcs_vec: Vec<f64> = (0..n_samples).map(|_| rng.random_range(-1.5..1.5)).collect();
         let pcs = Array2::from_shape_vec((n_samples, 1), pcs_vec).unwrap();
 
         // Create a simple linear response for Identity link
         let y = Array1::from_shape_fn(n_samples, |i| {
             let p_effect = p[i] * 0.5;
             let pc_effect = pcs[[i, 0]];
-            p_effect + pc_effect + rng.gen_range(-0.1..0.1) // Add noise
+            p_effect + pc_effect + rng.random_range(-0.1..0.1) // Add noise
         });
 
         let data = TrainingData {
@@ -5176,7 +5176,7 @@ fn from(error: EstimationError) -> Self {
 #[cfg(test)]
 mod test_helpers {
 use super::*;
-use rand::Rng;
+use rand::RngExt;
 use rand::rngs::StdRng;
 
 /// Generates a realistic, non-separable binary outcome vector 'y' from a vector of predictors.
@@ -5192,10 +5192,10 @@ pub(super) fn generate_realistic_binary_data(
         / 2.0;
     predictors.mapv(|val| {
         let logit =
-            intercept + steepness * (val - midpoint) + rng.gen_range(-noise_level..noise_level);
+            intercept + steepness * (val - midpoint) + rng.random_range(-noise_level..noise_level);
         let clamped_logit = logit.clamp(-10.0, 10.0);
         let prob = 1.0 / (1.0 + (-clamped_logit).exp());
-        if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 }
+        if rng.random::<f64>() < prob { 1.0 } else { 0.0 }
     })
 }
 
@@ -5204,7 +5204,7 @@ pub(super) fn generate_y_from_logit(logits: &Array1<f64>, rng: &mut StdRng) -> A
     logits.mapv(|logit| {
         let clamped_logit = logit.clamp(-10.0, 10.0);
         let prob = 1.0 / (1.0 + (-clamped_logit).exp());
-        if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 }
+        if rng.random::<f64>() < prob { 1.0 } else { 0.0 }
     })
 }
 }
@@ -5218,7 +5218,7 @@ use crate::calibrate::model::{
     BasisConfig, InteractionPenaltyKind, ModelFamily, PrincipalComponentConfig,
 };
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 #[test]
 fn test_optimizer_makes_progress_from_initial_guess_logit() {
@@ -5239,14 +5239,14 @@ fn run(link_function: LinkFunction) -> Result<(), Box<dyn std::error::Error>> {
     // Signal predictor: PC1 has a clear sine wave signal.
     let pc1 = Array1::linspace(-3.0, 3.0, n_samples);
     // Noise predictor: PGS is random noise, uncorrelated with PC1 and the outcome.
-    let p = Array1::from_shape_fn(n_samples, |_| rng.gen_range(-3.0..3.0));
+    let p = Array1::from_shape_fn(n_samples, |_| rng.random_range(-3.0..3.0));
 
     // The true, underlying, smooth signal the model should find.
     let true_signal = pc1.mapv(|x: f64| (1.5 * x).sin() * 2.0);
 
     let y = match link_function {
         LinkFunction::Logit => {
-            let noise = Array1::from_shape_fn(n_samples, |_| rng.gen_range(-0.2..0.2));
+            let noise = Array1::from_shape_fn(n_samples, |_| rng.random_range(-0.2..0.2));
             // True log-odds = sine wave + noise. Clamp to avoid quasi-separation.
             let true_logits = (&true_signal + &noise).mapv(|v| v.clamp(-8.0, 8.0));
             // Use the shared, robust helper to generate a non-separable binary outcome.
@@ -5254,7 +5254,7 @@ fn run(link_function: LinkFunction) -> Result<(), Box<dyn std::error::Error>> {
         }
         LinkFunction::Identity => {
             // Continuous outcome = sine wave + mild Gaussian noise.
-            let noise = Array1::from_shape_fn(n_samples, |_| rng.gen_range(-0.2..0.2));
+            let noise = Array1::from_shape_fn(n_samples, |_| rng.random_range(-0.2..0.2));
             &true_signal + &noise
         }
     };
@@ -5370,7 +5370,7 @@ use crate::calibrate::model::{
     BasisConfig, InteractionPenaltyKind, LinkFunction, ModelConfig, ModelFamily,
 };
 use ndarray::{Array1, Array2};
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use rand::{RngExt, SeedableRng, rngs::StdRng};
 
 // For any rho (log-lambda), the chain rule requires
 // dC/drho = diag(lambda) * dC/dlambda with lambda = exp(rho).
@@ -5381,9 +5381,9 @@ fn reparam_consistency_rho_vs_lambda_gaussian_identity() {
     // Stage: Build a small, deterministic Gaussian/Identity problem
     let n = 400;
     let mut rng = StdRng::seed_from_u64(12345);
-    let p = Array1::from_shape_fn(n, |_| rng.gen_range(-1.0..1.0));
+    let p = Array1::from_shape_fn(n, |_| rng.random_range(-1.0..1.0));
     let y = p.mapv(|x: f64| 0.4 * (0.5 * x).sin() + 0.1 * x * x)
-        + Array1::from_shape_fn(n, |_| rng.gen_range(-0.01..0.01));
+        + Array1::from_shape_fn(n, |_| rng.random_range(-0.01..0.01));
     let pcs = Array2::zeros((n, 0));
     let data = TrainingData {
         y,
@@ -5442,7 +5442,7 @@ fn reparam_consistency_rho_vs_lambda_gaussian_identity() {
 
     // Stage: Sample a moderate random rho in [-1, 1]
     let k = layout.num_penalties;
-    let rho = Array1::from_shape_fn(k, |_| rng.gen_range(-1.0..1.0));
+    let rho = Array1::from_shape_fn(k, |_| rng.random_range(-1.0..1.0));
     let lambda = rho.mapv(f64::exp);
 
     // Stage: Compute the analytic gradient with respect to rho
@@ -5534,15 +5534,15 @@ use crate::calibrate::model::{
     BasisConfig, InteractionPenaltyKind, ModelFamily, PrincipalComponentConfig,
 };
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 #[test]
 fn test_laml_gradient_matches_finite_difference() {
     // --- Setup: Identical to the original test ---
     let n = 120;
     let mut rng = StdRng::seed_from_u64(123);
-    let p = Array1::from_shape_fn(n, |_| rng.gen_range(-2.0..2.0));
-    let pc1 = Array1::from_shape_fn(n, |_| rng.gen_range(-1.5..1.5));
+    let p = Array1::from_shape_fn(n, |_| rng.random_range(-2.0..2.0));
+    let pc1 = Array1::from_shape_fn(n, |_| rng.random_range(-1.5..1.5));
     let mut pcs = Array2::zeros((n, 1));
     pcs.column_mut(0).assign(&pc1);
     let logits = p.mapv(|v| {
@@ -5665,9 +5665,9 @@ fn test_objective_consistency_raw_vs_stabilized() {
         for j in 0..p {
             // Make columns 0 and 1 highly correlated to create ill-conditioning
             if j == 1 {
-                x[[i, j]] = 0.95 * x[[i, 0]] + 0.05 * rng.gen_range(-1.0..1.0);
+                x[[i, j]] = 0.95 * x[[i, 0]] + 0.05 * rng.random_range(-1.0..1.0);
             } else {
-                x[[i, j]] = rng.gen_range(-1.0..1.0);
+                x[[i, j]] = rng.random_range(-1.0..1.0);
             }
         }
     }
@@ -5679,7 +5679,7 @@ fn test_objective_consistency_raw_vs_stabilized() {
     let mut y = Array1::<f64>::zeros(n);
     for i in 0..n {
         let p_i = 1.0 / (1.0 + (-xbeta_true[i]).exp());
-        y[i] = if rng.gen_range(0.0..1.0) < p_i {
+        y[i] = if rng.random_range(0.0..1.0) < p_i {
             1.0
         } else {
             0.0
@@ -5742,13 +5742,13 @@ fn test_objective_consistency_raw_vs_stabilized() {
 fn test_hmc_integration_runs() {
     use rand::SeedableRng;
     use rand::rngs::StdRng;
-    use rand::Rng;
+    use rand::RngExt;
     use ndarray::Array2;
 
     // 1. Create simple data (N=50)
     let n = 50;
     let mut rng = StdRng::seed_from_u64(42);
-    let p: Array1<f64> = (0..n).map(|_| rng.gen_range(-2.0..2.0)).collect();
+    let p: Array1<f64> = (0..n).map(|_| rng.random_range(-2.0..2.0)).collect();
     let sex: Array1<f64> = (0..n).map(|i| (i % 2) as f64).collect();
     let y: Array1<f64> = (0..n).map(|_| if rng.gen_bool(0.5) { 1.0 } else { 0.0 }).collect(); // Random Y
     let weights = Array1::<f64>::ones(n);
@@ -5825,7 +5825,7 @@ fn test_hmc_integration_runs() {
 fn test_mcmc_end_to_end_with_disk_io() {
     use rand::SeedableRng;
     use rand::rngs::StdRng;
-    use rand::Rng;
+    use rand::RngExt;
     use rand_distr::{Distribution, StudentT};
     use ndarray::Array2;
 
@@ -5859,7 +5859,7 @@ fn test_mcmc_end_to_end_with_disk_io() {
         
         // Binary outcome via logistic
         let prob = 1.0 / (1.0 + (-eta_noisy).exp());
-        let y = if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 };
+        let y = if rng.random::<f64>() < prob { 1.0 } else { 0.0 };
 
         p_train.push(pgs.clamp(-3.0, 3.0)); // Clamp extreme outliers
         sex_train.push(sex);
@@ -5878,7 +5878,7 @@ fn test_mcmc_end_to_end_with_disk_io() {
         let noise: f64 = t_dist.sample(&mut rng) * 0.3;
         let eta_noisy = eta + noise;
         let prob = 1.0 / (1.0 + (-eta_noisy).exp());
-        let y = if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 };
+        let y = if rng.random::<f64>() < prob { 1.0 } else { 0.0 };
 
         p_test.push(pgs.clamp(-3.0, 3.0));
         sex_test.push(sex);
@@ -6063,7 +6063,7 @@ use crate::calibrate::model::{
     BasisConfig, InteractionPenaltyKind, LinkFunction, ModelConfig, ModelFamily,
 };
 use ndarray::{array, Array1, Array2};
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use rand::{RngExt, SeedableRng, rngs::StdRng};
 
 /// Layer 0: Verify the log|A| gradient formula using faer-based Cholesky.
 /// For J(A) = log|A|, we have ∂J/∂A = A^{-T}.
@@ -6181,14 +6181,14 @@ fn test_laml_gradient_logit_no_firth_well_conditioned() {
     let p_basis = 6;
 
     let mut rng = StdRng::seed_from_u64(42);
-    let p_vals: Array1<f64> = (0..n).map(|_| rng.gen_range(-2.0..2.0)).collect();
+    let p_vals: Array1<f64> = (0..n).map(|_| rng.random_range(-2.0..2.0)).collect();
     let sex: Array1<f64> = (0..n).map(|i| (i % 2) as f64).collect();
     let eta_true: Array1<f64> = p_vals.mapv(|p| 0.5 * p);
     let y: Array1<f64> = eta_true
         .iter()
         .map(|&eta| {
             let prob = 1.0 / (1.0 + (-eta).exp());
-            if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 }
+            if rng.random::<f64>() < prob { 1.0 } else { 0.0 }
         })
         .collect();
 
@@ -6258,14 +6258,14 @@ fn test_laml_gradient_logit_with_firth_well_conditioned() {
     let p_basis = 8;
 
     let mut rng = StdRng::seed_from_u64(123);
-    let p_vals: Array1<f64> = (0..n).map(|_| rng.gen_range(-2.0..2.0)).collect();
+    let p_vals: Array1<f64> = (0..n).map(|_| rng.random_range(-2.0..2.0)).collect();
     let sex: Array1<f64> = (0..n).map(|i| (i % 2) as f64).collect();
     let eta_true: Array1<f64> = p_vals.mapv(|p| 0.3 * p);
     let y: Array1<f64> = eta_true
         .iter()
         .map(|&eta| {
             let prob = 1.0 / (1.0 + (-eta).exp());
-            if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 }
+            if rng.random::<f64>() < prob { 1.0 } else { 0.0 }
         })
         .collect();
 
@@ -6347,14 +6347,14 @@ fn stress_test_firth_gradient_vs_conditioning() {
 
     for (n, knots, label) in test_configs {
         let mut rng = StdRng::seed_from_u64(999);
-        let p_vals: Array1<f64> = (0..n).map(|_| rng.gen_range(-2.0..2.0)).collect();
+        let p_vals: Array1<f64> = (0..n).map(|_| rng.random_range(-2.0..2.0)).collect();
         let sex: Array1<f64> = (0..n).map(|i| (i % 2) as f64).collect();
         let eta_true: Array1<f64> = p_vals.mapv(|p| 0.3 * p);
         let y: Array1<f64> = eta_true
             .iter()
             .map(|&eta| {
                 let prob = 1.0 / (1.0 + (-eta).exp());
-                if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 }
+                if rng.random::<f64>() < prob { 1.0 } else { 0.0 }
             })
             .collect();
 
@@ -6444,7 +6444,7 @@ fn test_laml_gradient_exact_formula_ground_truth() {
     for i in 0..n {
         x[[i, 0]] = 1.0; // intercept
         for j in 1..p {
-            x[[i, j]] = rng.gen_range(-1.0..1.0);
+            x[[i, j]] = rng.random_range(-1.0..1.0);
         }
     }
     
@@ -6453,7 +6453,7 @@ fn test_laml_gradient_exact_formula_ground_truth() {
     let eta_true = x.dot(&true_beta);
     let y: Array1<f64> = eta_true.iter().map(|&eta| {
         let prob = 1.0 / (1.0 + (-eta).exp());
-        if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 }
+        if rng.random::<f64>() < prob { 1.0 } else { 0.0 }
     }).collect();
     
     // Simple 2nd-order penalty on all coefficients except intercept
@@ -6698,7 +6698,7 @@ fn test_laml_gradient_firth_exact_formula_ground_truth() {
     for i in 0..n {
         x[[i, 0]] = 1.0; // intercept
         for j in 1..p {
-            x[[i, j]] = rng.gen_range(-1.0..1.0);
+            x[[i, j]] = rng.random_range(-1.0..1.0);
         }
     }
     
@@ -6707,7 +6707,7 @@ fn test_laml_gradient_firth_exact_formula_ground_truth() {
     let eta_true = x.dot(&true_beta);
     let y: Array1<f64> = eta_true.iter().map(|&eta| {
         let prob = 1.0 / (1.0 + (-eta).exp());
-        if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 }
+        if rng.random::<f64>() < prob { 1.0 } else { 0.0 }
     }).collect();
     
     // Penalty on all coefficients except intercept

@@ -9,7 +9,7 @@ use crate::calibrate::model::{
 };
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rand_distr::StandardNormal;
 use std::collections::HashMap;
 
@@ -125,7 +125,7 @@ impl SyntheticDataBuilder {
 
         // Generate sex
         let sex: Array1<f64> =
-            Array1::from_iter((0..n).map(|_| if rng.r#gen::<f64>() < self.male_fraction { 1.0 } else { 0.0 }));
+            Array1::from_iter((0..n).map(|_| if rng.random::<f64>() < self.male_fraction { 1.0 } else { 0.0 }));
 
         // Generate liability based on signal type
         let liability: Array1<f64> = match self.signal_type {
@@ -170,7 +170,7 @@ impl SyntheticDataBuilder {
 
         // Generate sex
         let sex: Array1<f64> =
-            Array1::from_iter((0..n).map(|_| if rng.r#gen::<f64>() < self.male_fraction { 1.0 } else { 0.0 }));
+            Array1::from_iter((0..n).map(|_| if rng.random::<f64>() < self.male_fraction { 1.0 } else { 0.0 }));
 
         // Generate continuous outcome based on signal type
         let signal: Array1<f64> = match self.signal_type {

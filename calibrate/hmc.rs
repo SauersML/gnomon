@@ -982,17 +982,17 @@ mod survival_hmc {
         #[test]
         fn test_survival_gradient_finite_difference() {
             use rand::rngs::StdRng;
-            use rand::{Rng, SeedableRng};
+            use rand::{RngExt, SeedableRng};
 
             // Create a minimal survival setup
             let n = 50;
             let mut rng = StdRng::seed_from_u64(12345);
 
             // Synthetic times and events
-            let age_entry = Array1::<f64>::from_shape_fn(n, |_| 40.0 + rng.gen_range(0.0..10.0));
-            let age_exit = Array1::<f64>::from_shape_fn(n, |i| age_entry[i] + rng.gen_range(1.0..20.0));
+            let age_entry = Array1::<f64>::from_shape_fn(n, |_| 40.0 + rng.random_range(0.0..10.0));
+            let age_exit = Array1::<f64>::from_shape_fn(n, |i| age_entry[i] + rng.random_range(1.0..20.0));
             let event_target = Array1::<u8>::from_shape_fn(n, |_| {
-                if rand::RngExt::random::<f64>(&mut rng) < 0.3 { 1 } else { 0 }
+                if rng.random::<f64>() < 0.3 { 1 } else { 0 }
             });
             let sample_weight = Array1::<f64>::ones(n);
             let event_competing = Array1::<u8>::zeros(n);
@@ -1062,7 +1062,7 @@ mod survival_hmc {
 
             for test_idx in 0..n_test_points {
                 // Random point in whitened space
-                let z = Array1::<f64>::from_shape_fn(dim, |_| rng.gen_range(-0.5..0.5));
+                let z = Array1::<f64>::from_shape_fn(dim, |_| rng.random_range(-0.5..0.5));
 
                 // Compute analytical gradient
                 let analytical_result = posterior.compute_logp_and_grad(&z);
@@ -1742,7 +1742,7 @@ mod tests {
     fn test_nuts_higher_dimension_10d() {
         use rand::SeedableRng;
         use rand::rngs::StdRng;
-        use rand::Rng;
+        use rand::RngExt;
 
         let dim = 10;
         let n_obs = 20;
@@ -1750,13 +1750,13 @@ mod tests {
 
         // Random design matrix
         let x_data: Vec<f64> = (0..n_obs * dim)
-            .map(|_| rand::RngExt::random::<f64>(&mut rng) * 2.0 - 1.0)
+            .map(|_| rng.random::<f64>() * 2.0 - 1.0)
             .collect();
         let x = ndarray::Array2::from_shape_vec((n_obs, dim), x_data).unwrap();
         
         // Random binary outcomes
         let y = ndarray::Array1::from_shape_fn(n_obs, |_| {
-            if rand::RngExt::random::<f64>(&mut rng) > 0.5 {
+            if rng.random::<f64>() > 0.5 {
                 1.0
             } else {
                 0.0
@@ -1816,7 +1816,7 @@ mod tests {
     fn test_nuts_ill_conditioned_hessian() {
         use rand::SeedableRng;
         use rand::rngs::StdRng;
-        use rand::Rng;
+        use rand::RngExt;
 
         let dim = 8;
         let n_obs = 30;
@@ -1824,12 +1824,12 @@ mod tests {
 
         // Random design matrix
         let x_data: Vec<f64> = (0..n_obs * dim)
-            .map(|_| rand::RngExt::random::<f64>(&mut rng) * 2.0 - 1.0)
+            .map(|_| rng.random::<f64>() * 2.0 - 1.0)
             .collect();
         let x = ndarray::Array2::from_shape_vec((n_obs, dim), x_data).unwrap();
         
         let y = ndarray::Array1::from_shape_fn(n_obs, |_| {
-            if rand::RngExt::random::<f64>(&mut rng) > 0.5 {
+            if rng.random::<f64>() > 0.5 {
                 1.0
             } else {
                 0.0
@@ -1893,7 +1893,7 @@ mod tests {
     #[test]
     fn test_gaussian_covariance_recovery() {
         use rand::rngs::StdRng;
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
         use ndarray::arr1;
 
         let mut rng = StdRng::seed_from_u64(42);
@@ -1904,7 +1904,7 @@ mod tests {
         let mut x = Array2::<f64>::ones((n, dim));
         for i in 0..n {
             for j in 1..dim {
-                x[[i, j]] = rng.gen_range(-1.0..1.0);
+                x[[i, j]] = rng.random_range(-1.0..1.0);
             }
         }
 
@@ -2027,7 +2027,7 @@ mod tests {
     #[test]
     fn test_jensen_gap_overconfidence_shrinkage() {
         use rand::rngs::StdRng;
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
         use ndarray::arr1;
 
         let mut rng = StdRng::seed_from_u64(42);
@@ -2038,7 +2038,7 @@ mod tests {
         let mut x = Array2::<f64>::ones((n, dim));
         for i in 0..n {
             for j in 1..dim {
-                x[[i, j]] = rng.gen_range(-1.0..1.0);
+                x[[i, j]] = rng.random_range(-1.0..1.0);
             }
         }
 
@@ -2049,7 +2049,7 @@ mod tests {
         let eta = x.dot(&true_beta);
         let y: Array1<f64> = eta.mapv(|e| {
             let p = 1.0 / (1.0 + (-e).exp());
-            if rand::RngExt::random::<f64>(&mut rng) < p {
+            if rng.random::<f64>() < p {
                 1.0
             } else {
                 0.0

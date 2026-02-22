@@ -8,7 +8,7 @@ use gnomon::calibrate::survival::{
 };
 use ndarray::{Array1, Array2, array};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rand_distr::StandardNormal;
 use std::fs;
 use std::fs::File;

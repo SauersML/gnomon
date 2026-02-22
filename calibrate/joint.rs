@@ -3323,7 +3323,7 @@ pub fn predict_joint_from_base_model(
 mod tests {
     use super::*;
     use rand::rngs::StdRng;
-    use rand::{Rng, SeedableRng};
+    use rand::{RngExt, SeedableRng};
     
     #[test]
     fn test_joint_model_state_creation() {
@@ -3481,25 +3481,25 @@ mod tests {
                 let mut x = Array2::<f64>::zeros((n, p));
                 for i in 0..n {
                     for j in 0..p {
-                        x[[i, j]] = rng.gen_range(-2.0..2.0);
+                        x[[i, j]] = rng.random_range(-2.0..2.0);
                     }
                 }
                 if ill_conditioned && p > 1 {
                     for i in 0..n {
-                        x[[i, 1]] = x[[i, 0]] * (1.0 + 1e-6) + rng.gen_range(-1e-8..1e-8);
+                        x[[i, 1]] = x[[i, 0]] * (1.0 + 1e-6) + rng.random_range(-1e-8..1e-8);
                     }
                 }
 
                 let mut beta_true = Array1::<f64>::zeros(p);
                 for j in 0..p {
-                    beta_true[j] = rng.gen_range(-1.0..1.0);
+                    beta_true[j] = rng.random_range(-1.0..1.0);
                 }
                 let eta = x.dot(&beta_true);
                 let mut y = Array1::<f64>::zeros(n);
                 for i in 0..n {
                     let mu = 1.0 / (1.0 + (-eta[i]).exp());
                     y[i] = if ill_conditioned {
-                        if rng.r#gen::<f64>() < mu { 1.0 } else { 0.0 }
+                        if rng.random::<f64>() < mu { 1.0 } else { 0.0 }
                     } else {
                         mu
                     };

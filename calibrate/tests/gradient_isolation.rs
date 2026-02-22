@@ -13,7 +13,7 @@
 
 use ndarray::{array, Array1, Array2};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 use faer::Side;
 use faer::linalg::solvers::Solve;
@@ -57,7 +57,7 @@ fn generate_logit_data(n: usize, p: usize, seed: u64) -> (Array1<f64>, Array2<f6
     for i in 0..n {
         x[[i, 0]] = 1.0; // intercept
         for j in 1..p {
-            x[[i, j]] = rng.gen_range(-1.0..1.0);
+            x[[i, j]] = rng.random_range(-1.0..1.0);
         }
     }
     
@@ -70,7 +70,7 @@ fn generate_logit_data(n: usize, p: usize, seed: u64) -> (Array1<f64>, Array2<f6
         .iter()
         .map(|&e| {
             let prob = 1.0 / (1.0 + (-e).exp());
-            if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 }
+            if rng.random::<f64>() < prob { 1.0 } else { 0.0 }
         })
         .collect();
     
@@ -87,7 +87,7 @@ fn generate_logit_data_no_intercept(
     let mut x = Array2::<f64>::zeros((n, p));
     for i in 0..n {
         for j in 0..p {
-            x[[i, j]] = rng.gen_range(-1.0..1.0);
+            x[[i, j]] = rng.random_range(-1.0..1.0);
         }
     }
     let true_beta: Array1<f64> = (0..p).map(|j| 0.2 / (1.0 + j as f64)).collect();
@@ -96,7 +96,7 @@ fn generate_logit_data_no_intercept(
         .iter()
         .map(|&e| {
             let prob = 1.0 / (1.0 + (-e).exp());
-            if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 }
+            if rng.random::<f64>() < prob { 1.0 } else { 0.0 }
         })
         .collect();
     let weights = Array1::<f64>::ones(n);
@@ -111,7 +111,7 @@ fn generate_gaussian_data(n: usize, p: usize, seed: u64) -> (Array1<f64>, Array2
     for i in 0..n {
         x[[i, 0]] = 1.0;
         for j in 1..p {
-            x[[i, j]] = rng.gen_range(-1.0..1.0);
+            x[[i, j]] = rng.random_range(-1.0..1.0);
         }
     }
     
@@ -122,7 +122,7 @@ fn generate_gaussian_data(n: usize, p: usize, seed: u64) -> (Array1<f64>, Array2
     let eta = x.dot(&true_beta);
     let y: Array1<f64> = eta
         .iter()
-        .map(|&e| e + rng.gen_range(-0.5..0.5))
+        .map(|&e| e + rng.random_range(-0.5..0.5))
         .collect();
     
     let weights = Array1::<f64>::ones(n);
@@ -133,19 +133,19 @@ fn create_logistic_training_data(n_samples: usize, num_pcs: usize, seed: u64) ->
     let mut rng = StdRng::seed_from_u64(seed);
     let mut p = Array1::zeros(n_samples);
     for val in p.iter_mut() {
-        *val = rng.gen_range(-2.5..2.5);
+        *val = rng.random_range(-2.5..2.5);
     }
 
     let mut pcs = Array2::zeros((n_samples, num_pcs));
     for i in 0..n_samples {
         for j in 0..num_pcs {
-            pcs[[i, j]] = rng.gen_range(-2.0..2.0);
+            pcs[[i, j]] = rng.random_range(-2.0..2.0);
         }
     }
 
     let mut eta = Array1::zeros(n_samples);
     for i in 0..n_samples {
-        let mut val = 0.6 * p[i] + rng.gen_range(-0.3..0.3);
+        let mut val = 0.6 * p[i] + rng.random_range(-0.3..0.3);
         for j in 0..num_pcs {
             let weight = 0.2 + 0.1 * (j as f64);
             val += weight * pcs[[i, j]];
@@ -156,11 +156,11 @@ fn create_logistic_training_data(n_samples: usize, num_pcs: usize, seed: u64) ->
     let mut y = Array1::zeros(n_samples);
     for i in 0..n_samples {
         let prob = 1.0 / (1.0 + (-eta[i]).exp());
-        y[i] = if rng.gen_range(0.0..1.0) < prob { 1.0 } else { 0.0 };
+        y[i] = if rng.random_range(0.0..1.0) < prob { 1.0 } else { 0.0 };
     }
 
     let sex = Array1::from_iter((0..n_samples).map(|_| {
-        if rng.gen_range(0.0..1.0) < 0.5 {
+        if rng.random_range(0.0..1.0) < 0.5 {
             1.0
         } else {
             0.0
@@ -311,7 +311,7 @@ fn design_with_nullspace_suppression(n: usize, p: usize, seed: u64) -> Array2<f6
     let mut z = Array2::<f64>::zeros((n, p));
     for i in 0..n {
         for j in 0..p {
-            z[[i, j]] = rng.gen_range(-1.0..1.0);
+            z[[i, j]] = rng.random_range(-1.0..1.0);
         }
     }
     let mut b = Array2::<f64>::zeros((p, 2));
@@ -741,7 +741,7 @@ fn isolation_concurrent_nullspace_instability() {
     let mut rng = StdRng::seed_from_u64(44);
     let mut y = Array1::<f64>::zeros(n);
     for i in 0..n {
-        y[i] = if rng.r#gen::<f64>() < 0.5 { 0.0 } else { 1.0 };
+        y[i] = if rng.random::<f64>() < 0.5 { 0.0 } else { 1.0 };
     }
     let w = Array1::<f64>::ones(n);
     
