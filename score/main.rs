@@ -95,6 +95,28 @@ pub fn run_gnomon_with_args(
     run_gnomon_impl(args)
 }
 
+fn inline_pgs_output_suffix(score_arg: &str) -> String {
+    let ids: Vec<&str> = score_arg
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|item| item.split('|').next().unwrap_or("").trim())
+        .filter(|id| id.starts_with("PGS"))
+        .collect();
+    let count = ids.len();
+    let hash = fnv1a64_hex8(score_arg.as_bytes());
+    format!("pgs{count}_{hash}")
+}
+
+fn fnv1a64_hex8(bytes: &[u8]) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in bytes {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{:08x}", (hash & 0xffff_ffff) as u32)
+}
+
 /// The primary application logic
 // Function removed to eliminate dead code warnings
 
@@ -122,15 +144,18 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
     )?;
 
     let fileset_prefixes = resolve_filesets(&effective_input_path)?;
+    let score_arg_str = args.score.to_string_lossy().to_string();
 
     // --- Output Naming & Safety Check ---
-    // We derive a suffix from the score path (e.g. "my_scores.txt" -> "my_scores")
-    // and append it to the genotype prefix to create a unique output name.
-    let out_suffix = args
-        .score
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "scores".to_string());
+    // For inline PGS lists, use a compact deterministic suffix to keep output names short.
+    let out_suffix = if !args.score.exists() && score_arg_str.contains("PGS") {
+        inline_pgs_output_suffix(&score_arg_str)
+    } else {
+        args.score
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "scores".to_string())
+    };
 
     {
         let output_prefix = &fileset_prefixes[0];
@@ -173,8 +198,6 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
     // --- Phase 1a: Score File Resolution ---
     // This block resolves the --score argument into a definitive list of files.
     let (resolved_score_files, score_regions_map): (Vec<PathBuf>, HashMap<String, GenomicRegion>) = {
-        let score_arg_str = args.score.to_string_lossy();
-
         if !args.score.exists() && score_arg_str.contains("PGS") {
             let scores_cache_dir = {
                 let p0 = &fileset_prefixes[0];
