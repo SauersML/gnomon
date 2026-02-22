@@ -4850,7 +4850,7 @@ theorem extrapolation_error_bound_lipschitz {n k p sp : ℕ} [Fintype (Fin n)] [
 theorem context_specificity {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (dgp1 dgp2 : DGPWithEnvironment k)
     (h_same_genetics : dgp1.trueGeneticEffect = dgp2.trueGeneticEffect ∧ dgp1.to_dgp.jointMeasure = dgp2.to_dgp.jointMeasure)
     (h_diff_env : dgp1.environmentalEffect ≠ dgp2.environmentalEffect)
-    (model1 : PhenotypeInformedGAM p k sp) (h_opt1 : IsBayesOptimalInClass dgp1.to_dgp model1)
+    (model1 : PhenotypeInformedGAM p k sp) (_h_opt1 : IsBayesOptimalInClass dgp1.to_dgp model1)
     (h_repr :
       IsBayesOptimalInClass dgp2.to_dgp model1 →
         dgp1.to_dgp.trueExpectation = dgp2.to_dgp.trueExpectation) :
@@ -6272,7 +6272,7 @@ lemma sigmoid_strictConcaveOn_Ici : StrictConcaveOn ℝ (Set.Ici 0) sigmoid := b
     ("calibrated probability") is strictly less than the probability at the mean score.
     i.e., The model is "over-confident" if it predicts sigmoid(E[X]).
     The true probability E[sigmoid(X)] is "shrunk" toward 0.5. -/
-  theorem calibration_shrinkage (μ : ℝ) (hμ_pos : μ > 0)
+  theorem calibration_shrinkage (μ : ℝ) (_hμ_pos : μ > 0)
       (X : Ω → ℝ) (P : Measure Ω) [IsProbabilityMeasure P]
       (h_measurable : Measurable X) (h_integrable : Integrable X P)
       (h_mean : ∫ ω, X ω ∂P = μ)
@@ -6403,10 +6403,12 @@ noncomputable def L_pen_fn (log_lik : Matrix (Fin p) (Fin 1) ℝ → ℝ) (S_bas
 noncomputable def Hessian_fn (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ) (X : Matrix (Fin n) (Fin p) ℝ) (W : Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin n) (Fin n) ℝ) (rho : Fin k → ℝ) (beta : Matrix (Fin p) (Fin 1) ℝ) : Matrix (Fin p) (Fin p) ℝ :=
   X.transpose * (W beta) * X + S_lambda_fn S_basis rho
 
+noncomputable def LAML_explicit (log_lik : Matrix (Fin p) (Fin 1) ℝ → ℝ) (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ) (X : Matrix (Fin n) (Fin p) ℝ) (W : Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin n) (Fin n) ℝ) (rho : Fin k → ℝ) (beta : Matrix (Fin p) (Fin 1) ℝ) : ℝ :=
+  let H := Hessian_fn S_basis X W rho beta
+  L_pen_fn log_lik S_basis rho beta + 0.5 * Real.log (H.det) - 0.5 * Real.log ((S_lambda_fn S_basis rho).det)
+
 noncomputable def LAML_fn (log_lik : Matrix (Fin p) (Fin 1) ℝ → ℝ) (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ) (X : Matrix (Fin n) (Fin p) ℝ) (W : Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin n) (Fin n) ℝ) (beta_hat : (Fin k → ℝ) → Matrix (Fin p) (Fin 1) ℝ) (rho : Fin k → ℝ) : ℝ :=
-  let b := beta_hat rho
-  let H := Hessian_fn S_basis X W rho b
-  L_pen_fn log_lik S_basis rho b + 0.5 * Real.log (H.det) - 0.5 * Real.log ((S_lambda_fn S_basis rho).det)
+  LAML_explicit log_lik S_basis X W rho (beta_hat rho)
 
 -- 2. Rust Code Components
 noncomputable def rust_delta_fn (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ) (X : Matrix (Fin n) (Fin p) ℝ) (W : Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin n) (Fin n) ℝ) (beta_hat : (Fin k → ℝ) → Matrix (Fin p) (Fin 1) ℝ) (rho : Fin k → ℝ) (i : Fin k) : Matrix (Fin p) (Fin 1) ℝ :=
@@ -6422,7 +6424,7 @@ noncomputable def rust_correction_fn (S_basis : Fin k → Matrix (Fin p) (Fin p)
   let dV_dbeta := (fun b_val => 0.5 * Real.log (Matrix.det (Hessian_fn S_basis X W rho b_val)))
   trace ((grad_op dV_dbeta b).transpose * delta)
 
-noncomputable def rust_direct_gradient_fn (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ) (X : Matrix (Fin n) (Fin p) ℝ) (W : Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin n) (Fin n) ℝ) (beta_hat : (Fin k → ℝ) → Matrix (Fin p) (Fin 1) ℝ) (log_lik : Matrix (Fin p) (Fin 1) ℝ → ℝ) (rho : Fin k → ℝ) (i : Fin k) : ℝ :=
+noncomputable def rust_direct_gradient_fn (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ) (X : Matrix (Fin n) (Fin p) ℝ) (W : Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin n) (Fin n) ℝ) (beta_hat : (Fin k → ℝ) → Matrix (Fin p) (Fin 1) ℝ) (_log_lik : Matrix (Fin p) (Fin 1) ℝ → ℝ) (rho : Fin k → ℝ) (i : Fin k) : ℝ :=
   let b := beta_hat rho
   let H := Hessian_fn S_basis X W rho b
   let S := S_lambda_fn S_basis rho
@@ -6439,7 +6441,7 @@ def HasGradientAt (f : Matrix (Fin p) (Fin 1) ℝ → ℝ) (g : Matrix (Fin p) (
   ∃ (L : Matrix (Fin p) (Fin 1) ℝ →L[ℝ] ℝ),
     (∀ h, L h = (g.transpose * h).trace) ∧ HasFDerivAt f L x
 
-theorem laml_gradient_is_exact 
+theorem laml_gradient_is_exact_rigorous
     (log_lik : Matrix (Fin p) (Fin 1) ℝ → ℝ)
     (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ)
     (X : Matrix (Fin n) (Fin p) ℝ)
@@ -6447,29 +6449,77 @@ theorem laml_gradient_is_exact
     (beta_hat : (Fin k → ℝ) → Matrix (Fin p) (Fin 1) ℝ)
     (grad_op : (Matrix (Fin p) (Fin 1) ℝ → ℝ) → Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin p) (Fin 1) ℝ)
     (rho : Fin k → ℝ) (i : Fin k)
-    (D : (Fin k → ℝ) →L[ℝ] ℝ)
-    (hF : HasFDerivAt (fun r => LAML_fn log_lik S_basis X W beta_hat r) D rho)
-    (h_split : D (Pi.single i 1) =
-      rust_direct_gradient_fn S_basis X W beta_hat log_lik rho i +
-      rust_correction_fn S_basis X W beta_hat grad_op rho i) :
+    -- Rigorous Hypotheses
+    (h_beta_opt : ∀ r, HasGradientAt (fun b => L_pen_fn log_lik S_basis r b) 0 (beta_hat r))
+    (h_beta_diff : HasDerivAt (fun x => beta_hat (Function.update rho i x))
+                              (rust_delta_fn S_basis X W beta_hat rho i) (rho i))
+    (h_grad_op : ∀ f x, HasGradientAt f (grad_op f x) x)
+    -- Invertibility and smoothness
+    (h_H_posdef : ∀ r b, (Hessian_fn S_basis X W r b).PosDef)
+    (h_S_posdef : ∀ r, (S_lambda_fn S_basis r).PosDef)
+    (h_S_symm : ∀ j, (S_basis j).IsSymm) :
   deriv (fun r => LAML_fn log_lik S_basis X W beta_hat (Function.update rho i r)) (rho i) =
   rust_direct_gradient_fn S_basis X W beta_hat log_lik rho i +
-  rust_correction_fn S_basis X W beta_hat grad_op rho i :=
-by
-  let g : ℝ → (Fin k → ℝ) := Function.update rho i
-  have hg : HasDerivAt g (Pi.single i 1) (rho i) := by
-    simpa [g] using (hasDerivAt_update rho i (rho i))
-  have h_update : g (rho i) = rho := by
-    simpa [g] using (Function.update_eq_self i rho)
-  have hF_at_update : HasFDerivAt (fun r => LAML_fn log_lik S_basis X W beta_hat r) D (g (rho i)) := by
-    simpa [h_update] using hF
-  have hcomp : HasDerivAt (fun r => LAML_fn log_lik S_basis X W beta_hat (g r))
-      (D (Pi.single i 1)) (rho i) := by
-    exact hF_at_update.comp_hasDerivAt (rho i) hg
-  have h_deriv :
-      deriv (fun r => LAML_fn log_lik S_basis X W beta_hat (g r)) (rho i) =
-      D (Pi.single i 1) := hcomp.deriv
-  simpa [g, h_split] using h_deriv
+  rust_correction_fn S_basis X W beta_hat grad_op rho i := by
+  -- Decomposition into three terms:
+  -- f1 = L_pen, f2 = 0.5 * log det H, f3 = -0.5 * log det S
+  let rho_fn (r : ℝ) := Function.update rho i r
+  let b_fn (r : ℝ) := beta_hat (rho_fn r)
+  let f1 (r : ℝ) := L_pen_fn log_lik S_basis (rho_fn r) (b_fn r)
+  let f2 (r : ℝ) := 0.5 * Real.log ((Hessian_fn S_basis X W (rho_fn r) (b_fn r)).det)
+  let f3 (r : ℝ) := -0.5 * Real.log ((S_lambda_fn S_basis (rho_fn r)).det)
+
+  have h_laml_split : ∀ r, LAML_fn log_lik S_basis X W beta_hat (rho_fn r) = f1 r + f2 r + f3 r := by
+    intro r
+    dsimp [LAML_fn, LAML_explicit, f1, f2, f3]
+    ring
+
+  -- Derivatives of each term
+  -- 1. deriv f1: Partial wrt rho (direct) + Partial wrt beta (vanishes by optimality)
+  have h_deriv_f1 : deriv f1 (rho i) = 0.5 * Real.exp (rho i) * trace ((beta_hat rho).transpose * (S_basis i) * (beta_hat rho)) := by
+    -- Expand L_pen_fn: -log_lik(b) + 0.5 * b^T S(rho) b
+    -- deriv = -grad_log_lik * b' + 0.5 * (b'^T S b + b^T S' b + b^T S b')
+    --       = (-grad_log_lik + S b)^T b' + 0.5 * b^T S' b
+    --       = grad_L_pen^T b' + 0.5 * b^T S' b
+    --       = 0 + 0.5 * b^T S' b
+    -- S'(rho) = exp(rho_i) * S_i
+    sorry -- envelope theorem application
+
+  -- 2. deriv f2: Direct term + Correction term
+  have h_deriv_f2 : deriv f2 (rho i) =
+      0.5 * Real.exp (rho i) * trace ((Hessian_fn S_basis X W rho (beta_hat rho))⁻¹ * (S_basis i)) +
+      rust_correction_fn S_basis X W beta_hat grad_op rho i := by
+    -- f2 = 0.5 log det (X^T W(b) X + S(rho))
+    -- deriv = 0.5 trace(H^-1 * (dH/drho + dH/dbeta * b'))
+    --       = 0.5 trace(H^-1 * dH/drho) + 0.5 trace(H^-1 * dH/dbeta * b')
+    -- Term 1: dH/drho = dS/drho = exp(rho_i) S_i
+    --         -> 0.5 * exp * trace(H^-1 S_i)  [Matches direct term part 2]
+    -- Term 2: Chain rule via grad_op
+    -- rust_correction_fn is defined as (grad_b (0.5 log det H))^T * delta
+    -- which is exactly the indirect term.
+    sorry -- chain rule application
+
+  -- 3. deriv f3: Direct term only
+  have h_deriv_f3 : deriv f3 (rho i) = -0.5 * Real.exp (rho i) * trace ((S_lambda_fn S_basis rho)⁻¹ * (S_basis i)) := by
+    -- f3 = -0.5 log det S(rho)
+    -- deriv = -0.5 trace(S^-1 * S')
+    -- S' = exp(rho_i) * S_i
+    -- Use derivative_log_det_H_matrix with A=0 or similar
+    sorry -- reuse derivative_log_det_H_matrix
+
+  have h_eq_fun : (fun r => LAML_fn log_lik S_basis X W beta_hat (Function.update rho i r)) = f1 + f2 + f3 := by
+    funext r
+    exact h_laml_split r
+  rw [h_eq_fun]
+  rw [deriv_add]
+  · rw [deriv_add]
+    · rw [h_deriv_f1, h_deriv_f2, h_deriv_f3]
+      dsimp [rust_direct_gradient_fn]
+      ring
+    · sorry -- f1 diff
+    · sorry -- f2 diff
+  · sorry -- f1+f2 diff
+  · sorry -- f3 diff
 
 end GradientDescentVerification
 
