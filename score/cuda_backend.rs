@@ -326,6 +326,11 @@ pub fn try_run_cuda(
         return Ok(None);
     }
 
+    if !cuda_driver_likely_available() {
+        eprintln!("> Backend: CPU fallback (no CUDA driver/device detected)");
+        return Ok(None);
+    }
+
     let runtime = match init_cuda_runtime_safely(prep) {
         Ok(runtime) => {
             eprintln!("> Backend: CUDA");
@@ -343,6 +348,28 @@ pub fn try_run_cuda(
     };
 
     Ok(Some(result))
+}
+
+fn cuda_driver_likely_available() -> bool {
+    // Respect explicit disabling commonly used in CI/container environments.
+    if let Ok(devices) = env::var("CUDA_VISIBLE_DEVICES") {
+        let v = devices.trim();
+        if v.is_empty() || v == "-1" || v.eq_ignore_ascii_case("none") {
+            return false;
+        }
+    }
+
+    // Fast path on Linux GPU hosts/containers.
+    if cfg!(target_os = "linux") && Path::new("/dev/nvidiactl").exists() {
+        return true;
+    }
+
+    // Portable probe fallback.
+    std::process::Command::new("nvidia-smi")
+        .arg("-L")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 fn init_cuda_runtime_safely(prep: &PreparationResult) -> Result<CudaRuntime, String> {
