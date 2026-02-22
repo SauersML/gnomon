@@ -586,7 +586,7 @@ fn compile_cubin_for_device(cc_major: i32, cc_minor: i32) -> Result<Vec<u8>, Str
         return Err(format!("NVRTC CUBIN fallback get size failed: {e:?}"));
     }
 
-    let mut cubin_raw: Vec<i8> = vec![0; cubin_size];
+    let mut cubin_raw: Vec<std::ffi::c_char> = vec![0; cubin_size];
     let cubin_res = unsafe { nvrtc_sys::nvrtcGetCUBIN(prog, cubin_raw.as_mut_ptr()) };
     if let Err(e) = cubin_res.result() {
         let _ = unsafe { nvrtc_result::destroy_program(prog) };
