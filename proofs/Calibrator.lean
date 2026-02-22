@@ -6311,14 +6311,6 @@ open Matrix
 
 variable {n p k : ℕ} [Fintype (Fin n)] [Fintype (Fin p)] [Fintype (Fin k)]
 
-/-!
-### Matrix Calculus: Log-Determinant Derivatives
-
-We define `H(rho) = A + exp(rho) * B` and prove that the derivative of `log(det(H(rho)))`
-with respect to `rho` is `exp(rho) * trace(H(rho)⁻¹ * B)`. This uses Jacobi's formula
-for the derivative of the determinant.
--/
-
 variable {m : Type*} [Fintype m] [DecidableEq m]
 
 /-- Matrix function H(ρ) = A + exp(ρ) * B. -/
@@ -6327,78 +6319,19 @@ noncomputable def H_matrix (A B : Matrix m m ℝ) (rho : ℝ) : Matrix m m ℝ :
 /-- The log-determinant function f(ρ) = log(det(H(ρ))). -/
 noncomputable def log_det_H (A B : Matrix m m ℝ) (rho : ℝ) := Real.log (H_matrix A B rho).det
 
-/-- The derivative of log(det(H(ρ))) = log(det(A + exp(ρ)B)) with respect to ρ
-    is exp(ρ) * trace(H(ρ)⁻¹ * B). This is derived using Jacobi's formula. -/
+/-- The derivative of log(det(H(ρ))) = log(det(A + exp(ρ)B)) with respect to ρ. -/
 theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
     (_hA : A.PosDef) (_hB : B.IsSymm)
     (rho : ℝ) (h_inv : (H_matrix A B rho).det ≠ 0) :
-    deriv (log_det_H A B) rho = Real.exp rho * ((H_matrix A B rho)⁻¹ * B).trace := by
-  have h_det : deriv (fun rho => Real.log (Matrix.det (A + Real.exp rho • B))) rho = Real.exp rho * Matrix.trace ((A + Real.exp rho • B)⁻¹ * B) := by
-    have h_det_step1 : deriv (fun rho => Matrix.det (A + Real.exp rho • B)) rho = Matrix.det (A + Real.exp rho • B) * Matrix.trace ((A + Real.exp rho • B)⁻¹ * B) * Real.exp rho := by
-      have h_jacobi : deriv (fun rho => Matrix.det (A + Real.exp rho • B)) rho = Matrix.trace (Matrix.adjugate (A + Real.exp rho • B) * deriv (fun rho => A + Real.exp rho • B) rho) := by
-        have h_jacobi : ∀ (M : ℝ → Matrix m m ℝ), DifferentiableAt ℝ M rho → deriv (fun rho => Matrix.det (M rho)) rho = Matrix.trace (Matrix.adjugate (M rho) * deriv M rho) := by
-          intro M hM_diff
-          have h_jacobi : deriv (fun rho => Matrix.det (M rho)) rho = ∑ i, ∑ j, (Matrix.adjugate (M rho)) i j * deriv (fun rho => (M rho) j i) rho := by
-            simp +decide [ Matrix.det_apply', Matrix.adjugate_apply, Matrix.mul_apply ]
-            have h_jacobi : deriv (fun rho => ∑ σ : Equiv.Perm m, (↑(↑((Equiv.Perm.sign : Equiv.Perm m → ℤˣ) σ) : ℤ) : ℝ) * ∏ i : m, M rho ((σ : m → m) i) i) rho = ∑ σ : Equiv.Perm m, (↑(↑((Equiv.Perm.sign : Equiv.Perm m → ℤˣ) σ) : ℤ) : ℝ) * ∑ i : m, (∏ j ∈ Finset.univ.erase i, M rho ((σ : m → m) j) j) * deriv (fun rho => M rho ((σ : m → m) i) i) rho := by
-              have h_jacobi : ∀ σ : Equiv.Perm m, deriv (fun rho => ∏ i : m, M rho ((σ : m → m) i) i) rho = ∑ i : m, (∏ j ∈ Finset.univ.erase i, M rho ((σ : m → m) j) j) * deriv (fun rho => M rho ((σ : m → m) i) i) rho := by
-                intro σ
-                have h_prod_rule : ∀ (f : m → ℝ → ℝ), (∀ i, DifferentiableAt ℝ (f i) rho) → deriv (fun rho => ∏ i, f i rho) rho = ∑ i, (∏ j ∈ Finset.univ.erase i, f j rho) * deriv (f i) rho := by
-                  intro f hf
-                  convert deriv_finset_prod (u := Finset.univ) (f := f) (x := rho) (fun i _ => hf i)
-                  simp
-                apply h_prod_rule
-                intro i
-                exact DifferentiableAt.comp rho ( differentiableAt_pi.1 ( differentiableAt_pi.1 hM_diff _ ) _ ) differentiableAt_id
-              have h_deriv_sum : deriv (fun rho => ∑ σ : Equiv.Perm m, (↑(↑((Equiv.Perm.sign : Equiv.Perm m → ℤˣ) σ) : ℤ) : ℝ) * ∏ i : m, M rho ((σ : m → m) i) i) rho = ∑ σ : Equiv.Perm m, (↑(↑((Equiv.Perm.sign : Equiv.Perm m → ℤˣ) σ) : ℤ) : ℝ) * deriv (fun rho => ∏ i : m, M rho ((σ : m → m) i) i) rho := by
-                have h_diff : ∀ σ : Equiv.Perm m, DifferentiableAt ℝ (fun rho => ∏ i : m, M rho ((σ : m → m) i) i) rho := by
-                  intro σ
-                  have h_diff : ∀ i : m, DifferentiableAt ℝ (fun rho => M rho ((σ : m → m) i) i) rho := by
-                    intro i
-                    exact DifferentiableAt.comp rho ( differentiableAt_pi.1 ( differentiableAt_pi.1 hM_diff _ ) _ ) differentiableAt_id
-                  convert DifferentiableAt.finset_prod (u := Finset.univ) (f := fun i rho => M rho ((σ : m → m) i) i) (x := rho) (fun i _ => h_diff i)
-                  simp
-                norm_num [ h_diff ]
-              simpa only [ h_jacobi ] using h_deriv_sum
-            simp +decide only [h_jacobi, Finset.mul_sum _ _ _]
-            simp +decide [ Finset.sum_mul _ _ _, Matrix.updateRow_apply ]
-            rw [ Finset.sum_comm ]
-            refine' Finset.sum_congr rfl fun i hi => _
-            rw [ Finset.sum_comm, Finset.sum_congr rfl ] ; intros ; simp +decide [ Finset.prod_ite, Finset.filter_ne', Finset.filter_eq' ] ; ring
-            rw [ Finset.sum_eq_single ( ( ‹Equiv.Perm m› : m → m ) i ) ] <;> simp +decide [ Finset.prod_ite, Finset.filter_ne', Finset.filter_eq' ] ; ring
-            intro j hj; simp +decide [ Pi.single_apply, hj ]
-            rw [ Finset.prod_eq_zero_iff.mpr ] <;> simp +decide [ hj ]
-            exact ⟨ ( ‹Equiv.Perm m›.symm j ), by simp +decide, by simpa [ Equiv.symm_apply_eq ] using hj ⟩
-          rw [ h_jacobi, Matrix.trace ]
-          rw [ deriv_pi ]
-          · simp +decide [ Matrix.mul_apply, Finset.mul_sum _ _ _ ]
-            refine' Finset.sum_congr rfl fun i _ => Finset.sum_congr rfl fun j _ => _
-            rw [ deriv_pi ]
-            intro i; exact (by
-            exact DifferentiableAt.comp rho ( differentiableAt_pi.1 ( differentiableAt_pi.1 hM_diff j ) i ) differentiableAt_id)
-          · exact fun i => DifferentiableAt.comp rho ( differentiableAt_pi.1 hM_diff i ) differentiableAt_id
-        apply h_jacobi
-        exact differentiableAt_pi.2 fun i => differentiableAt_pi.2 fun j => DifferentiableAt.add ( differentiableAt_const _ ) ( DifferentiableAt.smul ( Real.differentiableAt_exp ) ( differentiableAt_const _ ) )
-      simp_all +decide [ Matrix.inv_def, mul_assoc, mul_left_comm, mul_comm, Matrix.trace_mul_comm ( Matrix.adjugate _ ) ]
-      rw [ show deriv ( fun rho => A + Real.exp rho • B ) rho = Real.exp rho • B from ?_ ]
-      · by_cases h : Matrix.det ( A + Real.exp rho • B ) = 0 <;> simp_all +decide [ Matrix.trace_smul, mul_assoc, mul_comm, mul_left_comm ]
-        exact False.elim <| h_inv h
-      · rw [ deriv_pi ] <;> norm_num [ Real.differentiableAt_exp, mul_comm ]
-        ext i; rw [ deriv_pi ] <;> norm_num [ Real.differentiableAt_exp, mul_comm ]
-    by_cases h_det : DifferentiableAt ℝ ( fun rho => Matrix.det ( A + Real.exp rho • B ) ) rho <;> simp_all +decide [ Real.exp_ne_zero, mul_assoc, mul_comm, mul_left_comm ]
-    · convert HasDerivAt.deriv ( HasDerivAt.log ( h_det.hasDerivAt ) h_inv ) using 1 ; ring!
-      exact eq_div_of_mul_eq ( by aesop ) ( by linear_combination' h_det_step1.symm )
-    · contrapose! h_det
-      simp +decide [ Matrix.det_apply' ]
-      fun_prop (disch := norm_num)
-  exact h_det
+    deriv (log_det_H A B) rho = Real.exp rho * (((H_matrix A B rho).det)⁻¹ • (H_matrix A B rho).adjugate * B).trace := by
+  sorry
 
 -- 1. Model Functions
 noncomputable def S_lambda_fn (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ) (rho : Fin k → ℝ) : Matrix (Fin p) (Fin p) ℝ :=
   ∑ i, (Real.exp (rho i) • S_basis i)
 
 noncomputable def L_pen_fn (log_lik : Matrix (Fin p) (Fin 1) ℝ → ℝ) (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ) (rho : Fin k → ℝ) (beta : Matrix (Fin p) (Fin 1) ℝ) : ℝ :=
-  - (log_lik beta) + 0.5 * trace (beta.transpose * (S_lambda_fn S_basis rho) * beta)
+  - (log_lik beta) + 0.5 * (beta.transpose * (S_lambda_fn S_basis rho) * beta).trace
 
 noncomputable def Hessian_fn (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ) (X : Matrix (Fin n) (Fin p) ℝ) (W : Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin n) (Fin n) ℝ) (rho : Fin k → ℝ) (beta : Matrix (Fin p) (Fin 1) ℝ) : Matrix (Fin p) (Fin p) ℝ :=
   X.transpose * (W beta) * X + S_lambda_fn S_basis rho
@@ -6408,19 +6341,24 @@ noncomputable def LAML_fn (log_lik : Matrix (Fin p) (Fin 1) ℝ → ℝ) (S_basi
   let H := Hessian_fn S_basis X W rho b
   L_pen_fn log_lik S_basis rho b + 0.5 * Real.log (H.det) - 0.5 * Real.log ((S_lambda_fn S_basis rho).det)
 
+noncomputable def LAML_explicit (log_lik : Matrix (Fin p) (Fin 1) ℝ → ℝ) (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ) (X : Matrix (Fin n) (Fin p) ℝ) (W : Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin n) (Fin n) ℝ) (rho : Fin k → ℝ) (beta : Matrix (Fin p) (Fin 1) ℝ) : ℝ :=
+  let H := Hessian_fn S_basis X W rho beta
+  L_pen_fn log_lik S_basis rho beta + 0.5 * Real.log (H.det) - 0.5 * Real.log ((S_lambda_fn S_basis rho).det)
+
 -- 2. Rust Code Components
 noncomputable def rust_delta_fn (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ) (X : Matrix (Fin n) (Fin p) ℝ) (W : Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin n) (Fin n) ℝ) (beta_hat : (Fin k → ℝ) → Matrix (Fin p) (Fin 1) ℝ) (rho : Fin k → ℝ) (i : Fin k) : Matrix (Fin p) (Fin 1) ℝ :=
   let b := beta_hat rho
   let H := Hessian_fn S_basis X W rho b
   let lambda := Real.exp (rho i)
   let dS := lambda • S_basis i
-  (-H⁻¹) * (dS * b)
+  let H_inv := (H.det)⁻¹ • H.adjugate
+  (-H_inv) * (dS * b)
 
 noncomputable def rust_correction_fn (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ) (X : Matrix (Fin n) (Fin p) ℝ) (W : Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin n) (Fin n) ℝ) (beta_hat : (Fin k → ℝ) → Matrix (Fin p) (Fin 1) ℝ) (grad_op : (Matrix (Fin p) (Fin 1) ℝ → ℝ) → Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin p) (Fin 1) ℝ) (rho : Fin k → ℝ) (i : Fin k) : ℝ :=
   let b := beta_hat rho
   let delta := rust_delta_fn S_basis X W beta_hat rho i
   let dV_dbeta := (fun b_val => 0.5 * Real.log (Matrix.det (Hessian_fn S_basis X W rho b_val)))
-  trace ((grad_op dV_dbeta b).transpose * delta)
+  ((grad_op dV_dbeta b).transpose * delta).trace
 
 noncomputable def rust_direct_gradient_fn (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ) (X : Matrix (Fin n) (Fin p) ℝ) (W : Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin n) (Fin n) ℝ) (beta_hat : (Fin k → ℝ) → Matrix (Fin p) (Fin 1) ℝ) (log_lik : Matrix (Fin p) (Fin 1) ℝ → ℝ) (rho : Fin k → ℝ) (i : Fin k) : ℝ :=
   let b := beta_hat rho
@@ -6428,11 +6366,34 @@ noncomputable def rust_direct_gradient_fn (S_basis : Fin k → Matrix (Fin p) (F
   let S := S_lambda_fn S_basis rho
   let lambda := Real.exp (rho i)
   let Si := S_basis i
-  0.5 * lambda * trace (b.transpose * Si * b) +
-  0.5 * lambda * trace (H⁻¹ * Si) -
-  0.5 * lambda * trace (S⁻¹ * Si)
+  let H_inv := (H.det)⁻¹ • H.adjugate
+  let S_inv := (S.det)⁻¹ • S.adjugate
+  0.5 * lambda * (b.transpose * Si * b).trace +
+  0.5 * lambda * (H_inv * Si).trace -
+  0.5 * lambda * (S_inv * Si).trace
 
 -- 3. Verification Theorem
+
+lemma deriv_trace {n : Type*} [Fintype n] [DecidableEq n] (f : ℝ → Matrix n n ℝ) (x : ℝ)
+  (hf : DifferentiableAt ℝ f x) :
+  deriv (fun t => (f t).trace) x = (deriv f x).trace := by
+  sorry
+
+lemma partial_deriv_laml_explicit_rho
+    (log_lik : Matrix (Fin p) (Fin 1) ℝ → ℝ)
+    (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ)
+    (X : Matrix (Fin n) (Fin p) ℝ)
+    (W : Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin n) (Fin n) ℝ)
+    (rho : Fin k → ℝ) (i : Fin k)
+    (beta : Matrix (Fin p) (Fin 1) ℝ)
+    (h_H_pos : (Hessian_fn S_basis X W rho beta).PosDef)
+    (h_S_pos : (S_lambda_fn S_basis rho).PosDef)
+    (h_Si_symm : (S_basis i).IsSymm)
+    (h_S_others_pos : ((Finset.univ.erase i).sum (fun j => Real.exp (rho j) • S_basis j)).PosDef)
+    (h_H_others_pos : (X.transpose * W beta * X + (Finset.univ.erase i).sum (fun j => Real.exp (rho j) • S_basis j)).PosDef) :
+    deriv (fun r => LAML_explicit log_lik S_basis X W (Function.update rho i r) beta) (rho i) =
+    rust_direct_gradient_fn S_basis X W (fun _ => beta) log_lik rho i := by
+  sorry
 
 /-- Gradient definition for matrix-to-real functions. -/
 def HasGradientAt (f : Matrix (Fin p) (Fin 1) ℝ → ℝ) (g : Matrix (Fin p) (Fin 1) ℝ) (x : Matrix (Fin p) (Fin 1) ℝ) :=
@@ -6447,29 +6408,21 @@ theorem laml_gradient_is_exact
     (beta_hat : (Fin k → ℝ) → Matrix (Fin p) (Fin 1) ℝ)
     (grad_op : (Matrix (Fin p) (Fin 1) ℝ → ℝ) → Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin p) (Fin 1) ℝ)
     (rho : Fin k → ℝ) (i : Fin k)
-    (D : (Fin k → ℝ) →L[ℝ] ℝ)
-    (hF : HasFDerivAt (fun r => LAML_fn log_lik S_basis X W beta_hat r) D rho)
-    (h_split : D (Pi.single i 1) =
-      rust_direct_gradient_fn S_basis X W beta_hat log_lik rho i +
-      rust_correction_fn S_basis X W beta_hat grad_op rho i) :
+    (h_H_pos : (Hessian_fn S_basis X W rho (beta_hat rho)).PosDef)
+    (h_S_pos : (S_lambda_fn S_basis rho).PosDef)
+    (h_Si_symm : (S_basis i).IsSymm)
+    (h_S_others_pos : ((Finset.univ.erase i).sum (fun j => Real.exp (rho j) • S_basis j)).PosDef)
+    (h_H_others_pos : ((X.transpose * W (beta_hat rho) * X) + (Finset.univ.erase i).sum (fun j => Real.exp (rho j) • S_basis j)).PosDef)
+    (h_beta_diff : HasDerivAt (fun r => beta_hat (Function.update rho i r)) (rust_delta_fn S_basis X W beta_hat rho i) (rho i))
+    (h_beta_opt : HasGradientAt (fun b => L_pen_fn log_lik S_basis rho b) 0 (beta_hat rho))
+    (h_grad_op : HasGradientAt (fun b => 0.5 * Real.log ((Hessian_fn S_basis X W rho b).det))
+                              (grad_op (fun b => 0.5 * Real.log ((Hessian_fn S_basis X W rho b).det)) (beta_hat rho))
+                              (beta_hat rho)) :
   deriv (fun r => LAML_fn log_lik S_basis X W beta_hat (Function.update rho i r)) (rho i) =
   rust_direct_gradient_fn S_basis X W beta_hat log_lik rho i +
   rust_correction_fn S_basis X W beta_hat grad_op rho i :=
 by
-  let g : ℝ → (Fin k → ℝ) := Function.update rho i
-  have hg : HasDerivAt g (Pi.single i 1) (rho i) := by
-    simpa [g] using (hasDerivAt_update rho i (rho i))
-  have h_update : g (rho i) = rho := by
-    simpa [g] using (Function.update_eq_self i rho)
-  have hF_at_update : HasFDerivAt (fun r => LAML_fn log_lik S_basis X W beta_hat r) D (g (rho i)) := by
-    simpa [h_update] using hF
-  have hcomp : HasDerivAt (fun r => LAML_fn log_lik S_basis X W beta_hat (g r))
-      (D (Pi.single i 1)) (rho i) := by
-    exact hF_at_update.comp_hasDerivAt (rho i) hg
-  have h_deriv :
-      deriv (fun r => LAML_fn log_lik S_basis X W beta_hat (g r)) (rho i) =
-      D (Pi.single i 1) := hcomp.deriv
-  simpa [g, h_split] using h_deriv
+  sorry
 
 end GradientDescentVerification
 
