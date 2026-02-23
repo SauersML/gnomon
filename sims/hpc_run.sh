@@ -97,6 +97,7 @@ mods = [
     "numpy", "pandas", "scipy", "sklearn", "matplotlib",
     "msprime", "stdpopsim", "tskit",
     "seaborn", "tabulate", "h5py", "statsmodels",
+    "numba",
     "demes", "demesdraw", "rpy2",
 ]
 for m in mods:
@@ -111,6 +112,7 @@ PY
   "$PYTHON_BIN" -m pip install --user --upgrade 'pip<25' setuptools wheel
   "$PYTHON_BIN" -m pip install --user \
     "numpy<2" "pandas<3" scipy scikit-learn matplotlib \
+    numba \
     "msprime==1.3.4" "stdpopsim==0.3.0" "tskit<1" \
     pgscatalog-calc seaborn tabulate h5py statsmodels demes demesdraw rpy2
 }
