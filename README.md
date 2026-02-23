@@ -31,6 +31,7 @@ Installs the latest binary for your platform (macOS/Linux/Windows):
 # macOS / Linux / Windows (Git Bash)
 curl -fsSL https://raw.githubusercontent.com/SauersML/gnomon/main/install.sh | bash
 ```
+The installer bootstraps itself from the latest `main` commit SHA to avoid stale cached script bodies.
 
 ### Build from Source
 To build the latest development version:

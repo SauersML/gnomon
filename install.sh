@@ -35,6 +35,59 @@ log_success() { echo -e "${ICON_CHECK}  $1"; }
 log_error() { echo -e "${ICON_CROSS}  ${RED}$1${RESET}"; }
 log_header() { echo -e "\n${BOLD}${CYAN}=== $1 ===${RESET}\n"; }
 
+# --- 0. Bootstrap Latest Installer Script ---
+# Raw GitHub content for branch refs can be stale due to caches.
+# To avoid running an outdated installer body, resolve main -> commit SHA
+# and execute install.sh at that immutable commit exactly once.
+bootstrap_latest_installer() {
+    if [ -n "${GNOMON_INSTALL_BOOTSTRAPPED:-}" ]; then
+        return 0
+    fi
+
+    local api_url="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/commits/main"
+    local script_sha_url=""
+    local sha=""
+    local response=""
+    local tmp_script=""
+
+    local curl_args=(-fsSL --retry 5 --retry-delay 2 --retry-connrefused --connect-timeout 5 --max-time 20)
+    if [ -n "$GITHUB_TOKEN" ]; then
+        curl_args+=(-H "Authorization: token $GITHUB_TOKEN")
+    elif [ -n "$GH_TOKEN" ]; then
+        curl_args+=(-H "Authorization: token $GH_TOKEN")
+    fi
+
+    response="$(curl "${curl_args[@]}" "$api_url" 2>/dev/null || true)"
+    sha="$(echo "$response" | sed -n 's/^[[:space:]]*"sha":[[:space:]]*"\([0-9a-f]\{40\}\)".*/\1/p' | head -n 1)"
+
+    if [ -z "$sha" ]; then
+        log_info "Could not resolve latest main commit SHA; continuing with current installer body."
+        return 0
+    fi
+
+    script_sha_url="https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/${sha}/install.sh"
+    tmp_script="$(mktemp)"
+    if ! curl "${curl_args[@]}" "$script_sha_url" -o "$tmp_script" 2>/dev/null; then
+        rm -f "$tmp_script"
+        log_info "Could not fetch installer at commit ${sha}; continuing with current installer body."
+        return 0
+    fi
+
+    if ! head -n 1 "$tmp_script" | grep -q '^#!/'; then
+        rm -f "$tmp_script"
+        log_info "Fetched installer looked invalid; continuing with current installer body."
+        return 0
+    fi
+
+    log_info "Refreshing installer from main commit ${sha}."
+    GNOMON_INSTALL_BOOTSTRAPPED=1 bash "$tmp_script" "$@"
+    local rc=$?
+    rm -f "$tmp_script"
+    exit $rc
+}
+
+bootstrap_latest_installer "$@"
+
 # --- 1. Detect Platform ---
 log_header "Detecting Platform"
 
