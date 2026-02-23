@@ -17,7 +17,6 @@ use crate::score::types::{
 };
 use crate::score::types::{OriginalPersonIndex, OutputPersonIndex};
 use ahash::{AHashMap, AHashSet};
-use bumpalo::Bump;
 use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
@@ -40,10 +39,9 @@ const LANE_COUNT: usize = 8;
 /// The primitive, sortable key used for all merge-join operations.
 type VariantKey = (u8, u32);
 
-// --- Zero-Copy Internal Data Structures ---
-// These temporary structs hold string data borrowed from an arena, avoiding
-// allocations in the hot path. Their lifetime `'arena` is tied to the `Bump`
-// arena created at the start of `prepare_for_computation`.
+// --- Internal Data Structures ---
+// These temporary structs hold just enough owned string state for deterministic,
+// streaming reconciliation without retaining genome-scale arena allocations.
 
 #[derive(Clone)]
 struct FilesetPaths {
@@ -54,53 +52,53 @@ struct FilesetPaths {
 
 /// A parsed record from a `.bim` file, holding borrowed string slices.
 #[derive(Debug, Copy, Clone)]
-struct KeyedBimRecord<'arena> {
+struct KeyedBimRecord {
     key: VariantKey,
     bim_row_index: BimRowIndex,
-    allele1: &'arena str,
-    allele2: &'arena str,
+    allele1: String,
+    allele2: String,
 }
 
 /// A parsed record from a score file, holding a borrowed string slice.
 #[derive(Debug, Copy, Clone)]
-struct KeyedScoreRecord<'arena> {
+struct KeyedScoreRecord {
     key: VariantKey,
-    effect_allele: &'arena str,
-    other_allele: &'arena str,
+    effect_allele: String,
+    other_allele: String,
     score_column_index: ScoreColumnIndex,
     weight: f32,
 }
 
 // Manual implementation to handle f32 comparison correctly.
-impl<'arena> PartialEq for KeyedScoreRecord<'arena> {
+impl PartialEq for KeyedScoreRecord {
     fn eq(&self, other: &Self) -> bool {
         self.key == other.key && self.weight.to_bits() == other.weight.to_bits()
     }
 }
-impl<'arena> Eq for KeyedScoreRecord<'arena> {}
+impl Eq for KeyedScoreRecord {}
 
 /// A self-contained item for the merge heap.
 #[derive(Debug, Copy, Clone)]
-struct HeapItem<'arena> {
-    record: KeyedScoreRecord<'arena>,
+struct HeapItem {
+    record: KeyedScoreRecord,
     file_idx: usize,
 }
 
-impl<'arena> PartialEq for HeapItem<'arena> {
+impl PartialEq for HeapItem {
     fn eq(&self, other: &Self) -> bool {
         self.record == other.record
     }
 }
 
-impl<'arena> Eq for HeapItem<'arena> {}
+impl Eq for HeapItem {}
 
-impl<'arena> PartialOrd for HeapItem<'arena> {
+impl PartialOrd for HeapItem {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl<'arena> Ord for HeapItem<'arena> {
+impl Ord for HeapItem {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // We want a min-heap, so we reverse the comparison on the key.
         // Tie-break by file_idx to ensure deterministic order.
@@ -113,12 +111,12 @@ impl<'arena> Ord for HeapItem<'arena> {
 }
 
 /// Manages the state of a single file reader in the KWayMergeIterator.
-struct FileStream<'arena> {
+struct FileStream {
     reader: BufReader<File>,
     /// A buffer for weights and column indices from the current line being processed.
     line_buffer: std::collections::VecDeque<(f32, ScoreColumnIndex)>,
-    /// The key and alleles (borrowed from the arena) for the current buffered line.
-    current_line_info: Option<(VariantKey, &'arena str, &'arena str)>,
+    /// The key and alleles for the current buffered line.
+    current_line_info: Option<(VariantKey, String, String)>,
     // This is a temporary buffer for reading lines from the file before they
     // are allocated into the long-lived arena.
     line_string_buffer: String,
@@ -217,20 +215,18 @@ enum LineReadOutcome {
 }
 
 /// An iterator that merges multiple, sorted score files on the fly.
-struct KWayMergeIterator<'arena> {
-    streams: Vec<FileStream<'arena>>,
-    heap: BinaryHeap<HeapItem<'arena>>,
+struct KWayMergeIterator {
+    streams: Vec<FileStream>,
+    heap: BinaryHeap<HeapItem>,
     file_column_maps: Vec<Vec<ScoreColumnIndex>>,
     // Holds a terminal error. If Some, iteration will stop after yielding the error.
     next_error: Option<PrepError>,
     region_filters: Option<Vec<Option<GenomicRegion>>>,
     region_filter_hits: Option<Vec<bool>>,
-    // A reference to the memory arena for zero-copy string allocations.
-    bump: &'arena Bump,
 }
 
 /// An iterator that streams over one or more `.bim` files.
-struct BimIterator<'a, 'arena> {
+struct BimIterator<'a> {
     filesets: std::slice::Iter<'a, FilesetPaths>,
     current_reader: Option<Box<dyn TextSource + 'a>>,
     global_offset: u64,
@@ -238,15 +234,13 @@ struct BimIterator<'a, 'arena> {
     current_path: PathBuf,
     // A list of the file boundaries, collected on-the-fly during the single iteration pass.
     boundaries: Vec<FilesetBoundary>,
-    // A reference to the memory arena.
-    bump: &'arena Bump,
     total_variants: u64,
 }
 
 /// Enum to represent the outcome of reconciling one score file line.
-enum ReconciliationOutcome<'a, 'arena> {
-    Simple(Vec<&'a KeyedBimRecord<'arena>>),
-    Complex(Vec<&'a KeyedBimRecord<'arena>>),
+enum ReconciliationOutcome<'a> {
+    Simple(Vec<&'a KeyedBimRecord>),
+    Complex(Vec<&'a KeyedBimRecord>),
     NotFound,
 }
 
@@ -424,19 +418,27 @@ fn prepare_for_computation_with_retry(
     let mut bim_iter = bim_iterator.by_ref().peekable();
     let mut score_iter = score_iterator.by_ref().peekable();
 
-    // These data structures will store the results of the merge-join.
-    // Allele strings borrowed from the arena are stored here temporarily.
-    // The tuple is (weight, is_flipped, file_idx).
-    let mut simple_path_data: BTreeMap<
-        BimRowIndex,
-        BTreeMap<ScoreColumnIndex, SimpleScoreAssignment>,
-    > = BTreeMap::new();
-    // For complex rules, the key is the set of BIM contexts. The value is a tuple
-    // containing the canonical chr:pos key for the locus and all score applications.
-    let mut intermediate_complex_rules: BTreeMap<
-        Vec<(BimRowIndex, &str, &str)>,
-        (VariantKey, Vec<(ScoreColumnIndex, f32, &str, &str)>),
-    > = BTreeMap::new();
+    let score_lane_groups = score_names.len().div_ceil(LANE_COUNT);
+    let stride = score_lane_groups.checked_mul(LANE_COUNT).ok_or_else(|| {
+        PrepError::Invariant(format!(
+            "Stride overflow while padding scores: num_scores={}, lane_count={LANE_COUNT}",
+            score_names.len()
+        ))
+    })?;
+    if stride % LANE_COUNT != 0 {
+        return Err(PrepError::Invariant(format!(
+            "Invalid padded stride {stride}: must be divisible by lane count {LANE_COUNT}."
+        )));
+    }
+
+    // Build final artifacts incrementally during Stage 3 to avoid materializing
+    // genome-scale intermediate maps that duplicate the final CSR/rule structures.
+    let mut required_bim_indices: Vec<BimRowIndex> = Vec::new();
+    let mut required_is_complex: Vec<u8> = Vec::new();
+    let mut csr_builder = CsrBuilder::with_capacity(0, 0);
+    let mut baseline_missing_sum_by_score = vec![0.0f64; score_names.len()];
+    let mut score_variant_counts = vec![0u32; score_names.len()];
+    let mut final_complex_rules: Vec<GroupedComplexRule> = Vec::new();
 
     while bim_iter.peek().is_some() && score_iter.peek().is_some() {
         let bim_key = match bim_iter.peek().unwrap() {
@@ -531,6 +533,15 @@ fn prepare_for_computation_with_retry(
                 }
                 diagnostics.total_score_records_processed += score_group.len() as u64;
 
+                let mut simple_for_key: BTreeMap<
+                    BimRowIndex,
+                    BTreeMap<ScoreColumnIndex, SimpleScoreAssignment>,
+                > = BTreeMap::new();
+                let mut complex_for_key: BTreeMap<
+                    Vec<(BimRowIndex, &str, &str)>,
+                    Vec<(ScoreColumnIndex, f32, &str, &str)>,
+                > = BTreeMap::new();
+
                 for score_record in score_group {
                     let outcome = resolve_matches_for_score_line(score_record, &bim_group)?;
 
@@ -539,7 +550,7 @@ fn prepare_for_computation_with_retry(
                             for bim_rec in matches {
                                 let is_flipped = score_record.effect_allele == bim_rec.allele1;
                                 let score_map =
-                                    simple_path_data.entry(bim_rec.bim_row_index).or_default();
+                                    simple_for_key.entry(bim_rec.bim_row_index).or_default();
 
                                 let entry = score_map
                                     .entry(score_record.score_column_index)
@@ -565,19 +576,71 @@ fn prepare_for_computation_with_retry(
                                 score_record.effect_allele,
                                 score_record.other_allele,
                             );
-
-                            // The key for the map is the set of BIM contexts. On first
-                            // encounter, we store the canonical chr:pos key. Then we
-                            // append the score application.
-                            let entry = intermediate_complex_rules
-                                .entry(possible_contexts)
-                                .or_insert_with(|| (key, Vec::new()));
-
-                            // The value is a tuple: (key, scores_vec), so we push to entry.1
-                            entry.1.push(score_info);
+                            complex_for_key.entry(possible_contexts).or_default().push(score_info);
                         }
                         ReconciliationOutcome::NotFound => {}
                     }
+                }
+
+                // Finalize complex rules for this key immediately.
+                let mut key_complex_indices: AHashSet<BimRowIndex> = AHashSet::new();
+                for (contexts, scores) in complex_for_key {
+                    for (bim_idx, _, _) in &contexts {
+                        key_complex_indices.insert(*bim_idx);
+                    }
+
+                    let mut counted_cols: AHashSet<ScoreColumnIndex> = AHashSet::new();
+                    for (score_col_idx, _, _, _) in &scores {
+                        counted_cols.insert(*score_col_idx);
+                    }
+                    for score_col in counted_cols {
+                        score_variant_counts[score_col.0] += 1;
+                    }
+
+                    let chr_str = match key.0 {
+                        23 => "X".to_string(),
+                        24 => "Y".to_string(),
+                        25 => "MT".to_string(),
+                        n => n.to_string(),
+                    };
+
+                    final_complex_rules.push(GroupedComplexRule {
+                        locus_chr_pos: (chr_str, key.1),
+                        possible_contexts: contexts
+                            .into_iter()
+                            .map(|(idx, a1, a2)| (idx, a1.to_string(), a2.to_string()))
+                            .collect(),
+                        score_applications: scores
+                            .into_iter()
+                            .map(|(sc_idx, weight, ea, oa)| ScoreInfo {
+                                effect_allele: ea.to_string(),
+                                other_allele: oa.to_string(),
+                                weight,
+                                score_column_index: sc_idx,
+                            })
+                            .collect(),
+                    });
+                }
+
+                // Emit CSR rows and required variant metadata for this key in sorted order.
+                // This preserves global row ordering while avoiding a global index set.
+                let mut key_required_indices: BTreeSet<BimRowIndex> = BTreeSet::new();
+                key_required_indices.extend(simple_for_key.keys().copied());
+                key_required_indices.extend(key_complex_indices.iter().copied());
+
+                for bim_row_index in key_required_indices {
+                    required_bim_indices.push(bim_row_index);
+                    required_is_complex.push(u8::from(key_complex_indices.contains(&bim_row_index)));
+
+                    if let Some(score_data_map) = simple_for_key.get(&bim_row_index) {
+                        for (&score_col_idx, assignment) in score_data_map.iter() {
+                            csr_builder.push_contribution(score_col_idx, *assignment)?;
+                            baseline_missing_sum_by_score[score_col_idx.0] +=
+                                assignment.missing_correction as f64;
+                            score_variant_counts[score_col_idx.0] += 1;
+                        }
+                    }
+                    csr_builder.finish_variant()?;
                 }
             }
         }
@@ -636,53 +699,10 @@ fn prepare_for_computation_with_retry(
         );
     }
 
-    // --- Stage 4: In-memory processing and matrix construction ---
+    // --- Stage 4: Verifying data and finalizing matrix metadata ---
     eprintln!("> Stage 4: Verifying data and building final matrices...");
 
-    // The "lifetime escape hatch": convert the temporary, borrowed complex rule data
-    // into final, owned `GroupedComplexRule` structs. This is the only place where
-    // we perform bulk copies of the allele strings we collected.
-    let final_complex_rules: Vec<GroupedComplexRule> = intermediate_complex_rules
-        .into_iter()
-        .map(|(contexts, (variant_key, scores))| {
-            // Convert the numeric chromosome key back into a string representation.
-            let chr_str = match variant_key.0 {
-                23 => "X".to_string(),
-                24 => "Y".to_string(),
-                25 => "MT".to_string(),
-                n => n.to_string(),
-            };
-
-            GroupedComplexRule {
-                locus_chr_pos: (chr_str, variant_key.1),
-                possible_contexts: contexts
-                    .into_iter()
-                    .map(|(idx, a1, a2)| (idx, a1.to_string(), a2.to_string()))
-                    .collect(),
-                score_applications: scores
-                    .into_iter()
-                    .map(|(sc_idx, weight, ea, oa)| ScoreInfo {
-                        effect_allele: ea.to_string(),
-                        other_allele: oa.to_string(),
-                        weight,
-                        score_column_index: sc_idx,
-                    })
-                    .collect(),
-            }
-        })
-        .collect();
-
-    let mut all_required_indices: BTreeSet<BimRowIndex> = BTreeSet::new();
-    all_required_indices.extend(simple_path_data.keys());
-    let mut complex_bim_indices: AHashSet<BimRowIndex> = AHashSet::new();
-    for rule in &final_complex_rules {
-        for (bim_idx, _, _) in &rule.possible_contexts {
-            all_required_indices.insert(*bim_idx);
-            complex_bim_indices.insert(*bim_idx);
-        }
-    }
-
-    if all_required_indices.is_empty() {
+    if required_bim_indices.is_empty() {
         match conduct_post_mortem(&fileset_paths, sorted_score_files)? {
             PostMortemAction::Fatal(err) => return Err(err),
             PostMortemAction::SortAndRetry {
@@ -726,42 +746,7 @@ fn prepare_for_computation_with_retry(
         }
     }
 
-    let required_bim_indices: Vec<BimRowIndex> = all_required_indices.into_iter().collect();
     let num_reconciled_variants = required_bim_indices.len();
-    let required_is_complex: Vec<u8> = required_bim_indices
-        .iter()
-        .map(|idx| u8::from(complex_bim_indices.contains(idx)))
-        .collect();
-
-    let score_lane_groups = score_names.len().div_ceil(LANE_COUNT);
-    let stride = score_lane_groups.checked_mul(LANE_COUNT).ok_or_else(|| {
-        PrepError::Invariant(format!(
-            "Stride overflow while padding scores: num_scores={}, lane_count={LANE_COUNT}",
-            score_names.len()
-        ))
-    })?;
-    if stride % LANE_COUNT != 0 {
-        return Err(PrepError::Invariant(format!(
-            "Invalid padded stride {stride}: must be divisible by lane count {LANE_COUNT}."
-        )));
-    }
-    let estimated_nnz: usize = simple_path_data.values().map(|m| m.len()).sum();
-    let mut csr_builder = CsrBuilder::with_capacity(num_reconciled_variants, estimated_nnz);
-
-    let mut baseline_missing_sum_by_score = vec![0.0f64; score_names.len()];
-    let mut score_variant_counts = vec![0u32; score_names.len()];
-
-    for &bim_row_index in &required_bim_indices {
-        if let Some(score_data_map) = simple_path_data.get(&bim_row_index) {
-            for (&score_col_idx, assignment) in score_data_map.iter() {
-                csr_builder.push_contribution(score_col_idx, *assignment)?;
-                baseline_missing_sum_by_score[score_col_idx.0] +=
-                    assignment.missing_correction as f64;
-                score_variant_counts[score_col_idx.0] += 1;
-            }
-        }
-        csr_builder.finish_variant()?;
-    }
 
     let (
         sparse_weights,
@@ -818,15 +803,6 @@ fn prepare_for_computation_with_retry(
             "CSR score column contains out-of-range index for {} scores.",
             score_names.len()
         )));
-    }
-    for rule in &final_complex_rules {
-        let mut counted_cols: AHashSet<ScoreColumnIndex> = AHashSet::new();
-        for score_info in &rule.score_applications {
-            counted_cols.insert(score_info.score_column_index);
-        }
-        for score_col in counted_cols {
-            score_variant_counts[score_col.0] += 1;
-        }
     }
 
     // --- Stage 5: Final assembly ---
