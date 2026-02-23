@@ -176,6 +176,11 @@ pub enum Heuristic {
     /// Infers a heterozygous genotype if conflicting homozygous calls involve alleles
     /// where one is a prefix of the other (e.g. C/C vs CAGA/CAGA -> C/CAGA).
     IndelAnchorBase,
+    /// Final fallback: if both homozygous states conflict (00 and 11), infer a
+    /// heterozygous genotype from the observed homozygous alleles.
+    FallbackOpposingHomozygousAsHet,
+    /// Absolute last fallback: average dosage across all remaining conflicts.
+    FallbackAverageDosageAcrossConflicts,
 }
 
 /// Describes the specific heuristic used to resolve a critical data ambiguity,
@@ -205,12 +210,19 @@ pub enum ResolutionMethod {
     IndelAnchorBase {
         chosen_dosage: f64,
     },
+    FallbackOpposingHomozygousAsHet {
+        chosen_dosage: f64,
+    },
+    FallbackAverageDosageAcrossConflicts {
+        chosen_dosage: f64,
+    },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use memmap2::MmapOptions;
+    use crate::score::types::ScoreColumnIndex;
 
     #[test]
     fn spool_resolver_returns_expected_genotypes() {
@@ -271,6 +283,214 @@ mod tests {
             0b00
         );
     }
+
+    #[test]
+    fn resolver_pipeline_uses_heterozygous_fallback_last() {
+        let score_info = ScoreInfo {
+            effect_allele: "T".to_string(),
+            other_allele: "G".to_string(),
+            weight: 1.0,
+            score_column_index: ScoreColumnIndex(0),
+        };
+        let ctx_a = (BimRowIndex(10), "C".to_string(), "T".to_string());
+        let ctx_b = (BimRowIndex(11), "TA".to_string(), "T".to_string());
+        let conflicting_interpretations = vec![(0b00, &ctx_a), (0b11, &ctx_b)];
+        let context = ResolutionContext {
+            score_info: &score_info,
+            conflicting_interpretations: &conflicting_interpretations,
+        };
+
+        let pipeline = ResolverPipeline::new();
+        let resolution = pipeline
+            .resolve(&context)
+            .expect("fallback heuristic should resolve remaining ambiguity");
+
+        assert_eq!(
+            resolution.method_used,
+            Heuristic::FallbackOpposingHomozygousAsHet
+        );
+        assert!((resolution.chosen_dosage - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn resolver_pipeline_preserves_existing_priority_over_fallback() {
+        let score_info = ScoreInfo {
+            effect_allele: "A".to_string(),
+            other_allele: "G".to_string(),
+            weight: 1.0,
+            score_column_index: ScoreColumnIndex(0),
+        };
+        let exact_ctx = (BimRowIndex(20), "A".to_string(), "G".to_string());
+        let non_exact_ctx = (BimRowIndex(21), "A".to_string(), "T".to_string());
+        let conflicting_interpretations = vec![(0b10, &exact_ctx), (0b11, &non_exact_ctx)];
+        let context = ResolutionContext {
+            score_info: &score_info,
+            conflicting_interpretations: &conflicting_interpretations,
+        };
+
+        let pipeline = ResolverPipeline::new();
+        let resolution = pipeline
+            .resolve(&context)
+            .expect("exact match heuristic should resolve ambiguity first");
+
+        assert_eq!(resolution.method_used, Heuristic::ExactScoreAlleleMatch);
+    }
+
+    #[test]
+    fn fallback_het_requires_both_homozygous_states() {
+        let score_info = ScoreInfo {
+            effect_allele: "A".to_string(),
+            other_allele: "G".to_string(),
+            weight: 1.0,
+            score_column_index: ScoreColumnIndex(0),
+        };
+        let ctx_a = (BimRowIndex(30), "A".to_string(), "C".to_string());
+        let ctx_b = (BimRowIndex(31), "A".to_string(), "T".to_string());
+        let conflicting_interpretations = vec![(0b00, &ctx_a), (0b10, &ctx_b)];
+        let context = ResolutionContext {
+            score_info: &score_info,
+            conflicting_interpretations: &conflicting_interpretations,
+        };
+
+        let resolution = Heuristic::FallbackOpposingHomozygousAsHet.try_resolve(&context);
+        assert!(resolution.is_none());
+    }
+
+    #[test]
+    fn fallback_het_dosage_matches_inferred_allele_pair() {
+        let ctx_a = (BimRowIndex(40), "C".to_string(), "T".to_string());
+        let ctx_b = (BimRowIndex(41), "TA".to_string(), "T".to_string());
+        let conflicting_interpretations = vec![(0b00, &ctx_a), (0b11, &ctx_b)];
+
+        let score_info_zero = ScoreInfo {
+            effect_allele: "G".to_string(),
+            other_allele: "A".to_string(),
+            weight: 1.0,
+            score_column_index: ScoreColumnIndex(0),
+        };
+        let context_zero = ResolutionContext {
+            score_info: &score_info_zero,
+            conflicting_interpretations: &conflicting_interpretations,
+        };
+        let res_zero = Heuristic::FallbackOpposingHomozygousAsHet
+            .try_resolve(&context_zero)
+            .expect("fallback should resolve");
+        assert!((res_zero.chosen_dosage - 0.0).abs() < 1e-9);
+
+        let score_info_one = ScoreInfo {
+            effect_allele: "C".to_string(),
+            other_allele: "A".to_string(),
+            weight: 1.0,
+            score_column_index: ScoreColumnIndex(0),
+        };
+        let context_one = ResolutionContext {
+            score_info: &score_info_one,
+            conflicting_interpretations: &conflicting_interpretations,
+        };
+        let res_one = Heuristic::FallbackOpposingHomozygousAsHet
+            .try_resolve(&context_one)
+            .expect("fallback should resolve");
+        assert!((res_one.chosen_dosage - 1.0).abs() < 1e-9);
+
+        let score_info_t = ScoreInfo {
+            effect_allele: "T".to_string(),
+            other_allele: "A".to_string(),
+            weight: 1.0,
+            score_column_index: ScoreColumnIndex(0),
+        };
+        let context_t = ResolutionContext {
+            score_info: &score_info_t,
+            conflicting_interpretations: &conflicting_interpretations,
+        };
+        let res_t = Heuristic::FallbackOpposingHomozygousAsHet
+            .try_resolve(&context_t)
+            .expect("fallback should resolve");
+        assert!((res_t.chosen_dosage - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fallback_average_dosage_supports_three_plus_conflicts() {
+        let score_info = ScoreInfo {
+            effect_allele: "T".to_string(),
+            other_allele: "A".to_string(),
+            weight: 1.0,
+            score_column_index: ScoreColumnIndex(0),
+        };
+        let c1 = (BimRowIndex(50), "A".to_string(), "T".to_string()); // 00 => 0
+        let c2 = (BimRowIndex(51), "G".to_string(), "T".to_string()); // 10 => 1
+        let c3 = (BimRowIndex(52), "C".to_string(), "T".to_string()); // 11 => 2
+        let conflicting_interpretations = vec![(0b00, &c1), (0b10, &c2), (0b11, &c3)];
+        let context = ResolutionContext {
+            score_info: &score_info,
+            conflicting_interpretations: &conflicting_interpretations,
+        };
+
+        let resolution = Heuristic::FallbackAverageDosageAcrossConflicts
+            .try_resolve(&context)
+            .expect("average fallback should resolve");
+        assert!((resolution.chosen_dosage - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn resolver_pipeline_uses_average_only_as_absolute_last_resort() {
+        let score_info = ScoreInfo {
+            effect_allele: "T".to_string(),
+            other_allele: "A".to_string(),
+            weight: 1.0,
+            score_column_index: ScoreColumnIndex(0),
+        };
+        // 00 + 11 should be consumed by the earlier opposing-homozygous fallback,
+        // not by the average fallback.
+        let c1 = (BimRowIndex(60), "C".to_string(), "T".to_string());
+        let c2 = (BimRowIndex(61), "TA".to_string(), "T".to_string());
+        let conflicting_interpretations = vec![(0b00, &c1), (0b11, &c2)];
+        let context = ResolutionContext {
+            score_info: &score_info,
+            conflicting_interpretations: &conflicting_interpretations,
+        };
+
+        let pipeline = ResolverPipeline::new();
+        let resolution = pipeline
+            .resolve(&context)
+            .expect("pipeline should resolve with prior fallback");
+        assert_eq!(
+            resolution.method_used,
+            Heuristic::FallbackOpposingHomozygousAsHet
+        );
+    }
+
+    #[test]
+    fn fallback_average_dosage_handles_two_conflicts() {
+        let score_info = ScoreInfo {
+            effect_allele: "T".to_string(),
+            other_allele: "A".to_string(),
+            weight: 1.0,
+            score_column_index: ScoreColumnIndex(0),
+        };
+        // Crafted to avoid all earlier heuristics:
+        // - no exact score allele match
+        // - no unambiguous genotype from score allele set
+        // - not a single heterozygous-vs-homozygous tie
+        // - not opposing 00/11 fallback
+        // Dosages are 0 (00 with A/C) and 2 (00 with T/G), average = 1.0.
+        let c1 = (BimRowIndex(70), "A".to_string(), "C".to_string());
+        let c2 = (BimRowIndex(71), "T".to_string(), "G".to_string());
+        let conflicting_interpretations = vec![(0b00, &c1), (0b00, &c2)];
+        let context = ResolutionContext {
+            score_info: &score_info,
+            conflicting_interpretations: &conflicting_interpretations,
+        };
+
+        let pipeline = ResolverPipeline::new();
+        let resolution = pipeline
+            .resolve(&context)
+            .expect("pipeline should resolve with average fallback");
+        assert_eq!(
+            resolution.method_used,
+            Heuristic::FallbackAverageDosageAcrossConflicts
+        );
+        assert!((resolution.chosen_dosage - 1.0).abs() < 1e-9);
+    }
 }
 
 /// A private struct holding the raw data for one conflicting source of evidence.
@@ -326,6 +546,12 @@ impl Heuristic {
             Heuristic::ConsistentDosage => self.resolve_consistent_dosage(context),
             Heuristic::PreferHeterozygous => self.resolve_prefer_het(context),
             Heuristic::IndelAnchorBase => self.resolve_indel_anchor_base(context),
+            Heuristic::FallbackOpposingHomozygousAsHet => {
+                self.resolve_fallback_opposing_homozygous_as_het(context)
+            }
+            Heuristic::FallbackAverageDosageAcrossConflicts => {
+                self.resolve_fallback_average_dosage_across_conflicts(context)
+            }
         }
     }
 
@@ -574,6 +800,83 @@ impl Heuristic {
         })
     }
 
+    /// Heuristic 6: Final fallback for the specific opposing-homozygous pattern.
+    /// If both homozygous states (00 and 11) are observed among conflicting
+    /// interpretations, infer a heterozygous genotype from the observed alleles
+    /// and score dosage from that inferred pair.
+    fn resolve_fallback_opposing_homozygous_as_het(
+        &self,
+        context: &ResolutionContext,
+    ) -> Option<Resolution> {
+        let mut hom_a1_alleles = AHashSet::new();
+        let mut hom_a2_alleles = AHashSet::new();
+
+        for (packed_geno, (_, bim_a1, bim_a2)) in context.conflicting_interpretations {
+            match packed_geno {
+                0b00 => {
+                    hom_a1_alleles.insert(bim_a1.as_str());
+                }
+                0b11 => {
+                    hom_a2_alleles.insert(bim_a2.as_str());
+                }
+                _ => {}
+            }
+        }
+
+        // This fallback applies only when each side points to a single concrete
+        // allele and those alleles disagree (e.g., C/C vs T/T => infer C/T).
+        if hom_a1_alleles.len() != 1 || hom_a2_alleles.len() != 1 {
+            return None;
+        }
+        let allele_from_00 = *hom_a1_alleles.iter().next().unwrap();
+        let allele_from_11 = *hom_a2_alleles.iter().next().unwrap();
+        if allele_from_00 == allele_from_11 {
+            return None;
+        }
+
+        let effect = context.score_info.effect_allele.as_str();
+        let mut inferred_dosage = 0.0;
+        if effect == allele_from_00 {
+            inferred_dosage += 1.0;
+        }
+        if effect == allele_from_11 {
+            inferred_dosage += 1.0;
+        }
+
+        Some(Resolution {
+            chosen_dosage: inferred_dosage,
+            method_used: *self,
+        })
+    }
+
+    /// Heuristic 7: Absolute last resort. Compute dosage for each remaining
+    /// conflicting interpretation and use the arithmetic mean.
+    fn resolve_fallback_average_dosage_across_conflicts(
+        &self,
+        context: &ResolutionContext,
+    ) -> Option<Resolution> {
+        if context.conflicting_interpretations.is_empty() {
+            return None;
+        }
+        let sum: f64 = context
+            .conflicting_interpretations
+            .iter()
+            .map(|(packed_geno, (_, bim_a1, bim_a2))| {
+                Self::calculate_dosage(
+                    *packed_geno,
+                    bim_a1,
+                    bim_a2,
+                    &context.score_info.effect_allele,
+                )
+            })
+            .sum();
+        let avg = sum / context.conflicting_interpretations.len() as f64;
+        Some(Resolution {
+            chosen_dosage: avg,
+            method_used: *self,
+        })
+    }
+
     /// A private helper to compute dosage from raw PLINK bits.
     /// This function is now fully safe and self-contained, returning 0.0 if the
     /// effect allele is not one of the two alleles from the BIM entry.
@@ -638,6 +941,8 @@ impl ResolverPipeline {
             Heuristic::ConsistentDosage,
             Heuristic::IndelAnchorBase,
             Heuristic::PreferHeterozygous,
+            Heuristic::FallbackOpposingHomozygousAsHet,
+            Heuristic::FallbackAverageDosageAcrossConflicts,
         ];
         Self { heuristics }
     }
@@ -838,6 +1143,8 @@ pub fn resolve_complex_variants(
                                                     Heuristic::ConsistentDosage => ResolutionMethod::ConsistentDosage { dosage: resolution.chosen_dosage },
                                                     Heuristic::PreferHeterozygous => ResolutionMethod::PreferHeterozygous { chosen_dosage: resolution.chosen_dosage },
                                                     Heuristic::IndelAnchorBase => ResolutionMethod::IndelAnchorBase { chosen_dosage: resolution.chosen_dosage },
+                                                    Heuristic::FallbackOpposingHomozygousAsHet => ResolutionMethod::FallbackOpposingHomozygousAsHet { chosen_dosage: resolution.chosen_dosage },
+                                                    Heuristic::FallbackAverageDosageAcrossConflicts => ResolutionMethod::FallbackAverageDosageAcrossConflicts { chosen_dosage: resolution.chosen_dosage },
                                                 };
 
                                                 let conflicts = valid_interpretations.iter().map(|(bits, ctx)| ConflictSource {
@@ -1092,6 +1399,8 @@ fn format_critical_integrity_warning(data: &CriticalIntegrityWarningInfo) -> Str
                     _ => false,
                 }
             }
+            ResolutionMethod::FallbackOpposingHomozygousAsHet { .. } => true,
+            ResolutionMethod::FallbackAverageDosageAcrossConflicts { .. } => true,
         }
     };
 
@@ -1174,6 +1483,14 @@ fn format_critical_integrity_warning(data: &CriticalIntegrityWarningInfo) -> Str
         ResolutionMethod::IndelAnchorBase { .. } => {
             method_name = "'Indel Anchor Base' Heuristic";
             write!(rationale, "Conflicting homozygous calls were found for alleles sharing an anchor base (one is a prefix of the other). This implies the array detected both alleles, so a Heterozygous genotype was inferred.").unwrap();
+        }
+        ResolutionMethod::FallbackOpposingHomozygousAsHet { .. } => {
+            method_name = "'Fallback Opposing Homozygous As Het' Heuristic";
+            write!(rationale, "All higher-priority ambiguity rules failed, and conflicting sources contained opposing homozygous states (00 and 11). A synthetic heterozygous genotype was inferred from those alleles, and dosage was computed from that inferred pair.").unwrap();
+        }
+        ResolutionMethod::FallbackAverageDosageAcrossConflicts { chosen_dosage } => {
+            method_name = "'Fallback Average Dosage Across Conflicts' Heuristic";
+            write!(rationale, "All higher-priority ambiguity rules failed. Dosage was computed independently for each conflicting interpretation and averaged as a final fallback (mean dosage = {}).", chosen_dosage).unwrap();
         }
     };
 
