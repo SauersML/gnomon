@@ -6447,29 +6447,92 @@ theorem laml_gradient_is_exact
     (beta_hat : (Fin k → ℝ) → Matrix (Fin p) (Fin 1) ℝ)
     (grad_op : (Matrix (Fin p) (Fin 1) ℝ → ℝ) → Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin p) (Fin 1) ℝ)
     (rho : Fin k → ℝ) (i : Fin k)
-    (D : (Fin k → ℝ) →L[ℝ] ℝ)
-    (hF : HasFDerivAt (fun r => LAML_fn log_lik S_basis X W beta_hat r) D rho)
-    (h_split : D (Pi.single i 1) =
-      rust_direct_gradient_fn S_basis X W beta_hat log_lik rho i +
-      rust_correction_fn S_basis X W beta_hat grad_op rho i) :
+    -- Hypotheses
+    -- 4. Partial derivatives of terms wrt rho i (holding beta fixed)
+    (h_partial_L_pen : deriv (fun r => L_pen_fn log_lik S_basis (Function.update rho i r) (beta_hat rho)) (rho i) =
+                       0.5 * Real.exp (rho i) * trace ((beta_hat rho).transpose * (S_basis i) * (beta_hat rho)))
+    (h_partial_log_det_H : deriv (fun r => 0.5 * Real.log ((Hessian_fn S_basis X W (Function.update rho i r) (beta_hat rho)).det)) (rho i) =
+                           0.5 * Real.exp (rho i) * trace ((Hessian_fn S_basis X W rho (beta_hat rho))⁻¹ * (S_basis i)))
+    (h_partial_log_det_S : deriv (fun r => -0.5 * Real.log ((S_lambda_fn S_basis (Function.update rho i r)).det)) (rho i) =
+                           -0.5 * Real.exp (rho i) * trace ((S_lambda_fn S_basis rho)⁻¹ * (S_basis i)))
+    -- 5. Chain Rule assumptions (total deriv = partial + partial_beta * dbeta)
+    (h_chain_L_pen : deriv (fun r => L_pen_fn log_lik S_basis (Function.update rho i r) (beta_hat (Function.update rho i r))) (rho i) =
+                     deriv (fun r => L_pen_fn log_lik S_basis (Function.update rho i r) (beta_hat rho)) (rho i) +
+                     trace ((0 : Matrix (Fin p) (Fin 1) ℝ).transpose * (rust_delta_fn S_basis X W beta_hat rho i)))
+    (h_chain_log_det_H : deriv (fun r => 0.5 * Real.log ((Hessian_fn S_basis X W (Function.update rho i r) (beta_hat (Function.update rho i r))).det)) (rho i) =
+                         deriv (fun r => 0.5 * Real.log ((Hessian_fn S_basis X W (Function.update rho i r) (beta_hat rho)).det)) (rho i) +
+                         trace ((grad_op (fun b => 0.5 * Real.log (Matrix.det (Hessian_fn S_basis X W rho b))) (beta_hat rho)).transpose *
+                         (rust_delta_fn S_basis X W beta_hat rho i)))
+    -- Differentiability assumptions needed for sum rules
+    (h_diff_L_pen : DifferentiableAt ℝ (fun r => L_pen_fn log_lik S_basis (Function.update rho i r) (beta_hat (Function.update rho i r))) (rho i))
+    (h_diff_log_det_H : DifferentiableAt ℝ (fun r => 0.5 * Real.log ((Hessian_fn S_basis X W (Function.update rho i r) (beta_hat (Function.update rho i r))).det)) (rho i))
+    (h_diff_log_det_S : DifferentiableAt ℝ (fun r => -0.5 * Real.log ((S_lambda_fn S_basis (Function.update rho i r)).det)) (rho i))
+    :
   deriv (fun r => LAML_fn log_lik S_basis X W beta_hat (Function.update rho i r)) (rho i) =
   rust_direct_gradient_fn S_basis X W beta_hat log_lik rho i +
-  rust_correction_fn S_basis X W beta_hat grad_op rho i :=
-by
-  let g : ℝ → (Fin k → ℝ) := Function.update rho i
-  have hg : HasDerivAt g (Pi.single i 1) (rho i) := by
-    simpa [g] using (hasDerivAt_update rho i (rho i))
-  have h_update : g (rho i) = rho := by
-    simpa [g] using (Function.update_eq_self i rho)
-  have hF_at_update : HasFDerivAt (fun r => LAML_fn log_lik S_basis X W beta_hat r) D (g (rho i)) := by
-    simpa [h_update] using hF
-  have hcomp : HasDerivAt (fun r => LAML_fn log_lik S_basis X W beta_hat (g r))
-      (D (Pi.single i 1)) (rho i) := by
-    exact hF_at_update.comp_hasDerivAt (rho i) hg
-  have h_deriv :
-      deriv (fun r => LAML_fn log_lik S_basis X W beta_hat (g r)) (rho i) =
-      D (Pi.single i 1) := hcomp.deriv
-  simpa [g, h_split] using h_deriv
+  rust_correction_fn S_basis X W beta_hat grad_op rho i := by
+
+  -- Unfold LAML_fn to its components and simplify let bindings
+  dsimp [LAML_fn]
+
+  -- Define components for clarity and to help rewrite matching
+  let f1 := fun r => L_pen_fn log_lik S_basis (Function.update rho i r) (beta_hat (Function.update rho i r))
+  let f2 := fun r => 0.5 * Real.log (Hessian_fn S_basis X W (Function.update rho i r) (beta_hat (Function.update rho i r))).det
+  let f3 := fun r => 0.5 * Real.log (S_lambda_fn S_basis (Function.update rho i r)).det
+
+  -- Force the goal to look like (f1 + f2) - f3 to enable deriv_sub/add matching
+  change deriv ((f1 + f2) - f3) (rho i) = _
+
+  -- Apply derivatives
+  rw [deriv_sub, deriv_add]
+
+  -- Substitute the chain rules and partial derivatives
+  -- 1. L_pen term
+  rw [h_chain_L_pen, h_partial_L_pen]
+  simp only [Matrix.transpose_zero, Matrix.zero_mul, Matrix.trace_zero, add_zero]
+
+  -- 2. Log det H term
+  rw [h_chain_log_det_H, h_partial_log_det_H]
+
+  -- 3. Log det S term
+  -- We have - deriv f3.
+  have h_term3 : - deriv f3 (rho i) = -0.5 * Real.exp (rho i) * trace ((S_lambda_fn S_basis rho)⁻¹ * (S_basis i)) := by
+    have h := h_partial_log_det_S
+    have h_reshape : (fun r => -0.5 * Real.log ((S_lambda_fn S_basis (Function.update rho i r)).det)) =
+                     (fun r => - (0.5 * Real.log ((S_lambda_fn S_basis (Function.update rho i r)).det))) := by
+      ext; ring
+    rw [h_reshape] at h
+    have h_neg_deriv : deriv (fun r => - f3 r) (rho i) = - deriv f3 (rho i) := by
+      conv in (-f3 _) => rw [neg_eq_neg_one_mul]
+      rw [deriv_const_mul]
+      · simp
+      · have h_diff_f3 : DifferentiableAt ℝ f3 (rho i) := by
+          convert h_diff_log_det_S.neg using 1
+          ext x
+          dsimp [f3]
+          ring_nf
+        exact h_diff_f3
+    rw [h_neg_deriv] at h
+    exact h
+  rw [sub_eq_add_neg, h_term3]
+
+  -- Unfold Rust definitions to compare
+  dsimp [rust_direct_gradient_fn, rust_correction_fn]
+
+  -- Rearrange terms to match
+  simp only [sub_eq_add_neg]
+  ring
+
+  -- Discharge differentiability goals
+  · exact h_diff_L_pen
+  · exact h_diff_log_det_H
+  · exact h_diff_L_pen.add h_diff_log_det_H
+  · have h_diff_f3 : DifferentiableAt ℝ f3 (rho i) := by
+      convert h_diff_log_det_S.neg using 1
+      ext x
+      dsimp [f3]
+      ring_nf
+    exact h_diff_f3
 
 end GradientDescentVerification
 
