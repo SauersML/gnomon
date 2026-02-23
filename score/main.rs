@@ -404,6 +404,7 @@ fn run_preparation_phase(
     // Track (label, source_path) for duplicate detection
     let mut label_to_path: std::collections::HashMap<String, PathBuf> =
         std::collections::HashMap::new();
+    let mut skip_summaries = Vec::new();
 
     for score_file_path in score_files {
         match reformat::is_gnomon_native_format(score_file_path) {
@@ -452,10 +453,13 @@ fn run_preparation_phase(
                     );
 
                     match reformat::reformat_pgs_file(score_file_path, &new_path) {
-                        Ok(lbl) => {
+                        Ok(outcome) => {
                             eprintln!("> Success: Converted to '{}'.", new_path.display());
+                            if let Some(summary) = outcome.skip_summary {
+                                skip_summaries.push(summary);
+                            }
                             native_score_files.push(new_path.clone());
-                            lbl
+                            outcome.score_label
                         }
                         Err(e) => {
                             return Err(Box::new(e));
@@ -491,6 +495,8 @@ fn run_preparation_phase(
             }
         }
     }
+
+    reformat::emit_overall_skip_summary(&skip_summaries);
 
     // Deduplicate the list to handle cases where a directory scan picks up both
     // a source file (e.g. score.txt) and its converted output (score.gnomon.tsv).

@@ -7,6 +7,7 @@
 use flate2::read::MultiGzDecoder;
 use memmap2::Mmap;
 use rayon::prelude::*;
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::fs::{self, File};
@@ -18,6 +19,131 @@ use std::sync::Mutex;
 // ========================================================================================
 //                                   Public API
 // ========================================================================================
+
+#[derive(Clone, Debug)]
+pub struct ReformatOutcome {
+    pub score_label: String,
+    pub skip_summary: Option<SkipSummary>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SkipSummary {
+    pub input_path: PathBuf,
+    pub total_variant_lines: usize,
+    pub skipped_count: usize,
+    pub kept_count: usize,
+    pub skipped_pct: f64,
+    pub reason_counts: Vec<(String, usize)>,
+    pub examples: Vec<SkipExample>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SkipExample {
+    pub line_number: usize,
+    pub identifier: String,
+    pub reason: String,
+}
+
+pub fn emit_overall_skip_summary(summaries: &[SkipSummary]) {
+    if summaries.is_empty() {
+        return;
+    }
+
+    const MAX_FILES: usize = 8;
+    const MAX_REASON_BUCKETS: usize = 8;
+    const MAX_EXAMPLES: usize = 5;
+
+    let total_variant_lines: usize = summaries.iter().map(|s| s.total_variant_lines).sum();
+    let skipped_count: usize = summaries.iter().map(|s| s.skipped_count).sum();
+    let kept_count = total_variant_lines.saturating_sub(skipped_count);
+    let skipped_pct = if total_variant_lines == 0 {
+        0.0
+    } else {
+        (skipped_count as f64 / total_variant_lines as f64) * 100.0
+    };
+
+    let mut reason_counts: HashMap<String, usize> = HashMap::new();
+    for summary in summaries {
+        for (reason, count) in &summary.reason_counts {
+            *reason_counts.entry(reason.clone()).or_insert(0) += *count;
+        }
+    }
+    let mut reason_counts_sorted: Vec<(String, usize)> = reason_counts.into_iter().collect();
+    reason_counts_sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    let mut file_counts: Vec<(&Path, usize, usize)> = summaries
+        .iter()
+        .map(|s| (s.input_path.as_path(), s.skipped_count, s.total_variant_lines))
+        .collect();
+    file_counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+
+    eprintln!(
+        "> Warning: Skipped {} of {} variant(s) during score normalization ({:.2}% skipped; {} kept) across {} affected score file(s).",
+        skipped_count,
+        total_variant_lines,
+        skipped_pct,
+        kept_count,
+        summaries.len()
+    );
+    eprintln!("> Affected score files (top {MAX_FILES} by skipped count):");
+    for (path, file_skipped, file_total) in file_counts.iter().take(MAX_FILES) {
+        let file_pct = if *file_total == 0 {
+            0.0
+        } else {
+            (*file_skipped as f64 / *file_total as f64) * 100.0
+        };
+        eprintln!(
+            ">   - {}: {} / {} skipped ({:.2}%)",
+            path.display(),
+            file_skipped,
+            file_total,
+            file_pct
+        );
+    }
+    if file_counts.len() > MAX_FILES {
+        eprintln!(
+            ">   - ... {} more affected score file(s) omitted",
+            file_counts.len() - MAX_FILES
+        );
+    }
+
+    eprintln!("> Skip summary (top {MAX_REASON_BUCKETS} reasons):");
+    for (reason, count) in reason_counts_sorted.iter().take(MAX_REASON_BUCKETS) {
+        let pct_of_total = if total_variant_lines == 0 {
+            0.0
+        } else {
+            (*count as f64 / total_variant_lines as f64) * 100.0
+        };
+        eprintln!(">   - {} ({:.2}%): {}", count, pct_of_total, reason);
+    }
+    if reason_counts_sorted.len() > MAX_REASON_BUCKETS {
+        eprintln!(
+            ">   - ... {} more reason bucket(s) omitted",
+            reason_counts_sorted.len() - MAX_REASON_BUCKETS
+        );
+    }
+
+    let examples: Vec<(&Path, &SkipExample)> = summaries
+        .iter()
+        .flat_map(|summary| {
+            summary
+                .examples
+                .iter()
+                .map(move |example| (summary.input_path.as_path(), example))
+        })
+        .take(MAX_EXAMPLES)
+        .collect();
+    eprintln!("> Example skipped variants (first {}):", examples.len());
+    for (path, example) in examples {
+        eprintln!(
+            ">   - {}: line {} [{}]: {}",
+            path.display(),
+            example.line_number,
+            example.identifier,
+            example.reason
+        );
+    }
+}
 
 /// Checks if a file appears to be in the gnomon-native format by inspecting its header.
 pub fn is_gnomon_native_format(path: &Path) -> io::Result<bool> {
@@ -151,7 +277,7 @@ impl From<io::Error> for ReformatError {
 }
 
 /// Reformat a PGS Catalog scoring file into a gnomon-native, sorted TSV.
-pub fn reformat_pgs_file(input_path: &Path, output_path: &Path) -> Result<String, ReformatError> {
+pub fn reformat_pgs_file(input_path: &Path, output_path: &Path) -> Result<ReformatOutcome, ReformatError> {
     // --- Define helper types within the function scope ---
     #[derive(Clone, Copy)]
     enum ParsingStrategy {
@@ -460,6 +586,10 @@ pub fn reformat_pgs_file(input_path: &Path, output_path: &Path) -> Result<String
         .enumerate()
         .map(|(idx, result)| result.map(|line| (total_lines_read + idx + 1, line)))
         .collect::<Result<Vec<_>, _>>()?;
+    let total_variant_lines = data_lines
+        .iter()
+        .filter(|(_, line)| !line.is_empty() && !line.starts_with('#'))
+        .count();
     let skipped_records = Mutex::new(Vec::new());
 
     let mut lines_to_sort = data_lines
@@ -497,22 +627,51 @@ pub fn reformat_pgs_file(input_path: &Path, output_path: &Path) -> Result<String
 
     // --- Report any non-fatal issues to the user ---
     let mut skipped_records = skipped_records.into_inner().unwrap_or_default();
-    if !skipped_records.is_empty() {
+    let skip_summary = if !skipped_records.is_empty() {
         skipped_records.sort_by_key(|record| record.line_number);
-        eprintln!(
-            "> Warning: Skipped {} variant(s) from '{}'. Details:",
-            skipped_records.len(),
-            input_path.display()
-        );
-        for record in skipped_records {
-            eprintln!(
-                ">   - line {} [{}]: {}",
-                record.line_number, record.identifier, record.reason
-            );
+        let skipped_count = skipped_records.len();
+        let kept_count = total_variant_lines.saturating_sub(skipped_count);
+        let skipped_pct = if total_variant_lines == 0 {
+            0.0
+        } else {
+            (skipped_count as f64 / total_variant_lines as f64) * 100.0
+        };
+        let mut reason_counts: HashMap<&str, usize> = HashMap::new();
+        for record in &skipped_records {
+            *reason_counts.entry(record.reason.as_str()).or_insert(0) += 1;
         }
-    }
+        let mut reason_counts_sorted: Vec<(String, usize)> = reason_counts
+            .into_iter()
+            .map(|(reason, count)| (reason.to_string(), count))
+            .collect();
+        reason_counts_sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
-    Ok(score_label)
+        const EXAMPLES_PER_FILE: usize = 8;
+        Some(SkipSummary {
+            input_path: input_path.to_path_buf(),
+            total_variant_lines,
+            skipped_count,
+            kept_count,
+            skipped_pct,
+            reason_counts: reason_counts_sorted,
+            examples: skipped_records
+                .into_iter()
+                .take(EXAMPLES_PER_FILE)
+                .map(|record| SkipExample {
+                    line_number: record.line_number,
+                    identifier: record.identifier,
+                    reason: record.reason,
+                })
+                .collect(),
+        })
+    } else {
+        None
+    };
+
+    Ok(ReformatOutcome {
+        score_label,
+        skip_summary,
+    })
 }
 
 /// Sorts a gnomon-native file that is not guaranteed to be sorted.

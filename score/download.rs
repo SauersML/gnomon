@@ -136,21 +136,31 @@ pub fn resolve_and_download_scores(
         files_to_reformat.len()
     );
 
-    let new_native_paths = files_to_reformat
+    let reformatted = files_to_reformat
         .into_par_iter()
         .map(
-            |(input_path, final_native_path)| -> Result<PathBuf, DownloadError> {
-                reformat::reformat_pgs_file(&input_path, &final_native_path)
+            |(input_path, final_native_path)| -> Result<(PathBuf, Option<reformat::SkipSummary>), DownloadError> {
+                let outcome = reformat::reformat_pgs_file(&input_path, &final_native_path)
                     .map_err(DownloadError::Reformat)?;
 
                 // Clean up the original downloaded file immediately after successful reformatting.
                 fs::remove_file(&input_path)
                     .map_err(|e| DownloadError::Io(e, input_path.clone()))?;
 
-                Ok(final_native_path)
+                Ok((final_native_path, outcome.skip_summary))
             },
         )
-        .collect::<Result<Vec<PathBuf>, _>>()?;
+        .collect::<Result<Vec<(PathBuf, Option<reformat::SkipSummary>)>, _>>()?;
+
+    let mut new_native_paths = Vec::with_capacity(reformatted.len());
+    let mut skip_summaries = Vec::new();
+    for (path, summary) in reformatted {
+        new_native_paths.push(path);
+        if let Some(summary) = summary {
+            skip_summaries.push(summary);
+        }
+    }
+    reformat::emit_overall_skip_summary(&skip_summaries);
 
     eprintln!("> Reformatting complete.");
 
