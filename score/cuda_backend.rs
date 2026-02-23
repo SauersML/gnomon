@@ -1045,16 +1045,22 @@ fn process_dense_stream_cuda(
     buffer_pool: Arc<ArrayQueue<Vec<u8>>>,
 ) -> Result<(Vec<f64>, Vec<u32>), PipelineError> {
     let dims = CudaDims::from_prep(prep_result)?;
+    let result_size = dims.result_size()?;
 
     let baseline = compute_cpu_precise_baseline(prep_result);
-    let mut final_scores = Vec::with_capacity(dims.result_size);
+    let mut final_scores = Vec::with_capacity(result_size);
     for _ in 0..dims.num_people {
         final_scores.extend_from_slice(&baseline);
     }
-    let mut final_counts = vec![0u32; dims.result_size];
+    let mut final_counts = vec![0u32; result_size];
 
     let mega = runtime.mega_batch_variants;
+    let score_tile_size = runtime.score_tile_size.max(MIN_SCORE_TILE_SIZE);
     let max_packed = checked_mul_usize("max_packed", mega, dims.bytes_per_variant)?;
+    let max_weights_tile_elems =
+        checked_mul_usize("max_weights_tile_elems", mega, score_tile_size)?;
+    let max_tile_result_elems =
+        checked_mul_usize("max_tile_result_elems", dims.num_people, score_tile_size)?;
     let mut d_packed_slots: Vec<CudaSlice<u8>> = (0..PIPELINE_SLOTS)
         .map(|_| {
             runtime
@@ -1089,37 +1095,25 @@ fn process_dense_stream_cuda(
         .map_err(map_driver_err("Failed to allocate missing device buffer"))?;
     let mut d_w_eff = runtime
         .compute_stream
-        .alloc_zeros::<f32>(checked_mul_usize(
-            "effective-weight buffer len",
-            mega,
-            dims.num_scores,
-        )?)
+        .alloc_zeros::<f32>(max_weights_tile_elems)
         .map_err(map_driver_err(
             "Failed to allocate effective-weight device buffer",
         ))?;
     let mut d_w_corr = runtime
         .compute_stream
-        .alloc_zeros::<f32>(checked_mul_usize(
-            "missing-correction buffer len",
-            mega,
-            dims.num_scores,
-        )?)
+        .alloc_zeros::<f32>(max_weights_tile_elems)
         .map_err(map_driver_err(
             "Failed to allocate missing-correction weight buffer",
         ))?;
     let mut d_count_w = runtime
         .compute_stream
-        .alloc_zeros::<f32>(checked_mul_usize(
-            "count-weight buffer len",
-            mega,
-            dims.num_scores,
-        )?)
+        .alloc_zeros::<f32>(max_weights_tile_elems)
         .map_err(map_driver_err("Failed to allocate count-weight buffer"))?;
     let mut d_out_scores_slots: Vec<CudaSlice<f32>> = (0..PIPELINE_SLOTS)
         .map(|_| {
             runtime
                 .compute_stream
-                .alloc_zeros::<f32>(dims.result_size)
+                .alloc_zeros::<f32>(max_tile_result_elems)
                 .map_err(map_driver_err("Failed to allocate score output buffer"))
         })
         .collect::<Result<_, _>>()?;
@@ -1127,7 +1121,7 @@ fn process_dense_stream_cuda(
         .map(|_| {
             runtime
                 .compute_stream
-                .alloc_zeros::<f32>(dims.result_size)
+                .alloc_zeros::<f32>(max_tile_result_elems)
                 .map_err(map_driver_err(
                     "Failed to allocate correction output buffer",
                 ))
@@ -1137,21 +1131,13 @@ fn process_dense_stream_cuda(
         .map(|_| {
             runtime
                 .compute_stream
-                .alloc_zeros::<f32>(dims.result_size)
+                .alloc_zeros::<f32>(max_tile_result_elems)
                 .map_err(map_driver_err("Failed to allocate output count buffer"))
         })
         .collect::<Result<_, _>>()?;
-
-    let mut d_final_scores = runtime
-        .compute_stream
-        .clone_htod(&final_scores)
-        .map_err(map_driver_err("Failed to upload baseline scores to device"))?;
-    let mut d_final_counts = runtime
-        .compute_stream
-        .alloc_zeros::<f64>(dims.result_size)
-        .map_err(map_driver_err(
-            "Failed to allocate final count accumulator on device",
-        ))?;
+    let mut host_tile_scores_slots = vec![vec![0.0f32; max_tile_result_elems]; PIPELINE_SLOTS];
+    let mut host_tile_corr_slots = vec![vec![0.0f32; max_tile_result_elems]; PIPELINE_SLOTS];
+    let mut host_tile_counts_slots = vec![vec![0.0f32; max_tile_result_elems]; PIPELINE_SLOTS];
 
     let mut batch: Vec<WorkItem> = Vec::with_capacity(mega);
     let mut pending: Option<PendingBatch> = None;
@@ -1269,8 +1255,11 @@ fn process_dense_stream_cuda(
                 &mut d_out_scores_slots,
                 &mut d_out_corr_slots,
                 &mut d_out_counts_slots,
-                &mut d_final_scores,
-                &mut d_final_counts,
+                &mut host_tile_scores_slots,
+                &mut host_tile_corr_slots,
+                &mut host_tile_counts_slots,
+                &mut final_scores,
+                &mut final_counts,
             )?);
         }
         pending = Some(current);
@@ -1292,8 +1281,11 @@ fn process_dense_stream_cuda(
             &mut d_out_scores_slots,
             &mut d_out_corr_slots,
             &mut d_out_counts_slots,
-            &mut d_final_scores,
-            &mut d_final_counts,
+            &mut host_tile_scores_slots,
+            &mut host_tile_corr_slots,
+            &mut host_tile_counts_slots,
+            &mut final_scores,
+            &mut final_counts,
         )?);
     }
 
@@ -1305,23 +1297,6 @@ fn process_dense_stream_cuda(
         .compute_stream
         .synchronize()
         .map_err(map_driver_err("Failed to synchronize CUDA compute stream"))?;
-
-    let mut final_counts_f64 = vec![0f64; dims.result_size];
-    runtime
-        .compute_stream
-        .memcpy_dtoh(&d_final_scores, &mut final_scores)
-        .map_err(map_driver_err(
-            "Failed to copy final score accumulator from device",
-        ))?;
-    runtime
-        .compute_stream
-        .memcpy_dtoh(&d_final_counts, &mut final_counts_f64)
-        .map_err(map_driver_err(
-            "Failed to copy final count accumulator from device",
-        ))?;
-    for (dst, src) in final_counts.iter_mut().zip(final_counts_f64.into_iter()) {
-        *dst = src.round() as u32;
-    }
 
     Ok((final_scores, final_counts))
 }
@@ -1341,8 +1316,11 @@ fn run_pending_compute_cuda(
     d_out_scores_slots: &mut [CudaSlice<f32>],
     d_out_corr_slots: &mut [CudaSlice<f32>],
     d_out_counts_slots: &mut [CudaSlice<f32>],
-    d_final_scores: &mut CudaSlice<f64>,
-    d_final_counts: &mut CudaSlice<f64>,
+    host_tile_scores_slots: &mut [Vec<f32>],
+    host_tile_corr_slots: &mut [Vec<f32>],
+    host_tile_counts_slots: &mut [Vec<f32>],
+    final_scores: &mut [f64],
+    final_counts: &mut [u32],
 ) -> Result<CudaEvent, PipelineError> {
     runtime
         .compute_stream
@@ -1371,83 +1349,99 @@ fn run_pending_compute_cuda(
             .map_err(map_driver_err("Failed to launch unpack_plink kernel"))?;
     }
 
-    let weights_elems = work.shape.weight_elems()?;
-    let num_scores_i32 = work.shape.dims.num_scores_i32()?;
     let build_launch_elems =
         checked_u32("build_batch_mats kernel launch elements", work.shape.batch_len())?;
-    unsafe {
+    for score_offset in (0..dims.num_scores).step_by(runtime.score_tile_size) {
+        let tile_scores = (dims.num_scores - score_offset).min(runtime.score_tile_size);
+        let tile_scores_i32 = checked_i32("tile_scores", tile_scores)?;
+        let score_offset_i32 = checked_i32("score_offset", score_offset)?;
+        let weights_elems = checked_mul_usize("weights_elems", work.shape.batch_len(), tile_scores)?;
+        let tile_result_elems =
+            checked_mul_usize("tile_result_elems", dims.num_people, tile_scores)?;
+
+        unsafe {
+            runtime
+                .compute_stream
+                .launch_builder(&runtime.build_batch_mats_kernel)
+                .arg(&runtime.sparse_weights)
+                .arg(&runtime.sparse_missing_corrections)
+                .arg(&runtime.sparse_columns)
+                .arg(&runtime.sparse_row_offsets)
+                .arg(&d_reconciled_slots[work.slot].slice(0..work.shape.batch_len()))
+                .arg(&batch_len_i32)
+                .arg(&tile_scores_i32)
+                .arg(&score_offset_i32)
+                .arg(&mut d_w_eff.slice_mut(0..weights_elems))
+                .arg(&mut d_w_corr.slice_mut(0..weights_elems))
+                .arg(&mut d_count_w.slice_mut(0..weights_elems))
+                .launch(LaunchConfig::for_num_elems(build_launch_elems))
+                .map_err(map_driver_err("Failed to launch build_batch_mats kernel"))?;
+        }
+
+        run_row_major_gemm(
+            &runtime.blas,
+            dims.num_people,
+            work.shape.batch_len(),
+            tile_scores,
+            &d_dosage.slice(0..unpack_elems),
+            &d_w_eff.slice(0..weights_elems),
+            &mut d_out_scores_slots[work.slot],
+            0.0f32,
+        )?;
+        run_row_major_gemm(
+            &runtime.blas,
+            dims.num_people,
+            work.shape.batch_len(),
+            tile_scores,
+            &d_missing.slice(0..unpack_elems),
+            &d_w_corr.slice(0..weights_elems),
+            &mut d_out_corr_slots[work.slot],
+            0.0f32,
+        )?;
+        run_row_major_gemm(
+            &runtime.blas,
+            dims.num_people,
+            work.shape.batch_len(),
+            tile_scores,
+            &d_missing.slice(0..unpack_elems),
+            &d_count_w.slice(0..weights_elems),
+            &mut d_out_counts_slots[work.slot],
+            0.0f32,
+        )?;
+
         runtime
             .compute_stream
-            .launch_builder(&runtime.build_batch_mats_kernel)
-            .arg(&runtime.sparse_weights)
-            .arg(&runtime.sparse_missing_corrections)
-            .arg(&runtime.sparse_columns)
-            .arg(&runtime.sparse_row_offsets)
-            .arg(&d_reconciled_slots[work.slot].slice(0..work.shape.batch_len()))
-            .arg(&batch_len_i32)
-            .arg(&num_scores_i32)
-            .arg(&mut d_w_eff.slice_mut(0..weights_elems))
-            .arg(&mut d_w_corr.slice_mut(0..weights_elems))
-            .arg(&mut d_count_w.slice_mut(0..weights_elems))
-            .launch(LaunchConfig::for_num_elems(build_launch_elems))
-            .map_err(map_driver_err("Failed to launch build_batch_mats kernel"))?;
-    }
-
-    run_row_major_gemm(
-        &runtime.blas,
-        dims.num_people,
-        work.shape.batch_len(),
-        dims.num_scores,
-        &d_dosage.slice(0..unpack_elems),
-        &d_w_eff.slice(0..weights_elems),
-        &mut d_out_scores_slots[work.slot],
-        0.0f32,
-    )?;
-    run_row_major_gemm(
-        &runtime.blas,
-        dims.num_people,
-        work.shape.batch_len(),
-        dims.num_scores,
-        &d_missing.slice(0..unpack_elems),
-        &d_w_corr.slice(0..weights_elems),
-        &mut d_out_corr_slots[work.slot],
-        0.0f32,
-    )?;
-    run_row_major_gemm(
-        &runtime.blas,
-        dims.num_people,
-        work.shape.batch_len(),
-        dims.num_scores,
-        &d_missing.slice(0..unpack_elems),
-        &d_count_w.slice(0..weights_elems),
-        &mut d_out_counts_slots[work.slot],
-        0.0f32,
-    )?;
-
-    let result_len_u64 = u64::try_from(dims.result_size).map_err(|_| {
-        PipelineError::Compute(format!(
-            "result_size={} exceeds u64::MAX for accumulation kernel",
-            dims.result_size
-        ))
-    })?;
-    let result_len_u32 = checked_u32(
-        "accumulate_outputs_f64 kernel launch elements",
-        dims.result_size,
-    )?;
-    unsafe {
+            .memcpy_dtoh(
+                &d_out_scores_slots[work.slot].slice(0..tile_result_elems),
+                &mut host_tile_scores_slots[work.slot][..tile_result_elems],
+            )
+            .map_err(map_driver_err("Failed to copy score tile output to host"))?;
         runtime
             .compute_stream
-            .launch_builder(&runtime.accumulate_outputs_kernel)
-            .arg(&d_out_scores_slots[work.slot])
-            .arg(&d_out_corr_slots[work.slot])
-            .arg(&d_out_counts_slots[work.slot])
-            .arg(d_final_scores)
-            .arg(d_final_counts)
-            .arg(&result_len_u64)
-            .launch(LaunchConfig::for_num_elems(result_len_u32))
-            .map_err(map_driver_err(
-                "Failed to launch accumulate_outputs_f64 kernel",
-            ))?;
+            .memcpy_dtoh(
+                &d_out_corr_slots[work.slot].slice(0..tile_result_elems),
+                &mut host_tile_corr_slots[work.slot][..tile_result_elems],
+            )
+            .map_err(map_driver_err("Failed to copy correction tile output to host"))?;
+        runtime
+            .compute_stream
+            .memcpy_dtoh(
+                &d_out_counts_slots[work.slot].slice(0..tile_result_elems),
+                &mut host_tile_counts_slots[work.slot][..tile_result_elems],
+            )
+            .map_err(map_driver_err("Failed to copy count tile output to host"))?;
+
+        for person_idx in 0..dims.num_people {
+            let src_base = person_idx * tile_scores;
+            let dst_base = person_idx * dims.num_scores + score_offset;
+            for j in 0..tile_scores {
+                let src_idx = src_base + j;
+                let dst_idx = dst_base + j;
+                final_scores[dst_idx] += host_tile_scores_slots[work.slot][src_idx] as f64
+                    + host_tile_corr_slots[work.slot][src_idx] as f64;
+                final_counts[dst_idx] += host_tile_counts_slots[work.slot][src_idx].round() as u32;
+            }
+        }
     }
 
     runtime
