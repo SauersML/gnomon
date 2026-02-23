@@ -1444,15 +1444,9 @@ def main() -> None:
     source_base = Path(args.use_existing_dir) if args.use_existing_dir else out_dir
     source_prefix = str(source_base / f"fig2_s{seed}")
     sim_tsv = source_base / f"fig2_s{seed}.tsv"
-    if args.use_existing:
-        needed = [Path(f"{source_prefix}.bed"), Path(f"{source_prefix}.bim"), Path(f"{source_prefix}.fam"), sim_tsv]
-        miss = [str(p) for p in needed if not p.exists()]
-        if miss:
-            raise FileNotFoundError(f"[fig2_s{seed}] --use-existing requested, but missing files: {miss}")
-        _log(f"[fig2_s{seed}] Reusing existing simulation/PLINK files from {source_base}")
-        df = pd.read_csv(sim_tsv, sep="\t")
-    else:
-        df = _simulate(
+
+    def _simulate_current() -> pd.DataFrame:
+        return _simulate(
             seed,
             pgs_effects,
             out_dir,
@@ -1466,18 +1460,66 @@ def main() -> None:
             bp_cap=args.bp_cap,
             ancestry_threads=threads,
         )
-    df = _ensure_calibration_groups(df, seed=seed)
+
+    reused_existing = False
+    if args.use_existing:
+        try:
+            needed = [Path(f"{source_prefix}.bed"), Path(f"{source_prefix}.bim"), Path(f"{source_prefix}.fam"), sim_tsv]
+            miss = [str(p) for p in needed if not p.exists()]
+            if miss:
+                raise FileNotFoundError(f"[fig2_s{seed}] --use-existing requested, but missing files: {miss}")
+            _log(f"[fig2_s{seed}] Reusing existing simulation/PLINK files from {source_base}")
+            df = pd.read_csv(sim_tsv, sep="\t")
+            reused_existing = True
+        except Exception as e:
+            _log(f"[fig2_s{seed}] Existing artifacts unavailable/unreadable; regenerating ({type(e).__name__}: {e})")
+            source_prefix = prefix
+            df = _simulate_current()
+    else:
+        source_prefix = prefix
+        df = _simulate_current()
+    try:
+        df = _ensure_calibration_groups(df, seed=seed)
+    except Exception as e:
+        if args.use_existing and reused_existing:
+            _log(f"[fig2_s{seed}] Existing split invalid; regenerating ({type(e).__name__}: {e})")
+            source_prefix = prefix
+            df = _ensure_calibration_groups(_simulate_current(), seed=seed)
+            reused_existing = False
+        else:
+            raise
+
     seed_work = work_root / f"work_s{seed}"
     _log(f"[fig2_s{seed}] Starting PRS/prediction stage")
-    train_scores, test_scores, pt_meta = _run_prs_and_predict(
-        df,
-        source_prefix,
-        seed_work,
-        plink_threads=threads,
-        plink_memory_mb=memory_mb,
-        bayesr_threads=threads,
-        use_bayesr=bool(args.bayesr),
-    )
+    try:
+        train_scores, test_scores, pt_meta = _run_prs_and_predict(
+            df,
+            source_prefix,
+            seed_work,
+            plink_threads=threads,
+            plink_memory_mb=memory_mb,
+            bayesr_threads=threads,
+            use_bayesr=bool(args.bayesr),
+        )
+    except Exception as e:
+        if args.use_existing and reused_existing:
+            _log(
+                f"[fig2_s{seed}] Existing PLINK/TSV artifacts failed during PRS prep; "
+                f"regenerating and retrying ({type(e).__name__}: {e})"
+            )
+            source_prefix = prefix
+            df = _ensure_calibration_groups(_simulate_current(), seed=seed)
+            train_scores, test_scores, pt_meta = _run_prs_and_predict(
+                df,
+                source_prefix,
+                seed_work,
+                plink_threads=threads,
+                plink_memory_mb=memory_mb,
+                bayesr_threads=threads,
+                use_bayesr=bool(args.bayesr),
+            )
+        else:
+            raise
     if pt_meta is not None:
         pt_metrics = pt_meta["threshold_metrics"].copy()
         pt_metrics["seed"] = int(seed)

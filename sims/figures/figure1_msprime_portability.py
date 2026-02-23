@@ -819,13 +819,10 @@ def _run_generation_task(task: dict[str, object]) -> dict[str, object]:
     run_id = f"fig1_g{g}_s{seed}"
     prefix_path = out_dir / run_id
     prefix = str(prefix_path)
-    if use_existing:
-        source_prefix, sim_tsv = _resolve_existing_source(g, seed, out_dir, use_existing_dir)
-        _log(f"[{run_id}] Reusing existing simulation/PLINK files from {source_prefix.parent}")
-        df = pd.read_csv(sim_tsv, sep="\t")
-    else:
-        source_prefix = prefix_path
-        df = _simulate_for_generation(
+    source_prefix = prefix_path
+
+    def _simulate_and_publish() -> pd.DataFrame:
+        df_local = _simulate_for_generation(
             g,
             seed,
             pgs_effects,
@@ -841,18 +838,50 @@ def _run_generation_task(task: dict[str, object]) -> dict[str, object]:
             causal_max_sites=causal_max_sites,
             bp_cap=(int(bp_cap) if bp_cap is not None else None),
         )
-        # Publish reusable simulation artifacts immediately so downstream failures
-        # do not force re-simulation on restart with --use-existing.
         _publish_reuse_cache(prefix=prefix_path, out_dir=out_dir, run_id=run_id)
+        return df_local
+
+    reused_existing = False
+    if use_existing:
+        try:
+            source_prefix, sim_tsv = _resolve_existing_source(g, seed, out_dir, use_existing_dir)
+            _log(f"[{run_id}] Reusing existing simulation/PLINK files from {source_prefix.parent}")
+            df = pd.read_csv(sim_tsv, sep="\t")
+            reused_existing = True
+        except Exception as e:
+            _log(f"[{run_id}] Existing artifacts unavailable/unreadable; regenerating this generation ({type(e).__name__}: {e})")
+            source_prefix = prefix_path
+            df = _simulate_and_publish()
+    else:
+        source_prefix = prefix_path
+        df = _simulate_and_publish()
     df = _ensure_calibration_groups(df, seed=seed)
     work = work_root / f"fig1_g{g}_s{seed}_work"
-    train_prefix, test_prefix, train_phen, freq_file = _prepare_bayesr_files(
-        df,
-        str(source_prefix),
-        work,
-        plink_threads=threads_per_job,
-        plink_memory_mb=memory_mb_per_job,
-    )
+    try:
+        train_prefix, test_prefix, train_phen, freq_file = _prepare_bayesr_files(
+            df,
+            str(source_prefix),
+            work,
+            plink_threads=threads_per_job,
+            plink_memory_mb=memory_mb_per_job,
+        )
+    except Exception as e:
+        if use_existing and reused_existing:
+            _log(
+                f"[{run_id}] Existing PLINK/TSV artifacts failed during PRS prep; "
+                f"regenerating and retrying ({type(e).__name__}: {e})"
+            )
+            source_prefix = prefix_path
+            df = _ensure_calibration_groups(_simulate_and_publish(), seed=seed)
+            train_prefix, test_prefix, train_phen, freq_file = _prepare_bayesr_files(
+                df,
+                str(source_prefix),
+                work,
+                plink_threads=threads_per_job,
+                plink_memory_mb=memory_mb_per_job,
+            )
+        else:
+            raise
     use_bayesr = bool(task.get("use_bayesr", False))
     if use_bayesr:
         _log(f"[fig1_g{g}_s{seed}] BayesR fit starting")
