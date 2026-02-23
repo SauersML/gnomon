@@ -49,6 +49,11 @@ rustup override set nightly
 cargo build --release
 ```
 
+Or to update existing gnomon repo:
+```
+git fetch origin && git reset --hard origin/main
+```
+
 ```
 # Compute a polygenic score
 ./target/release/gnomon score PGS003725 path/to/genotypes
