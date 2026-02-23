@@ -157,9 +157,10 @@ log_info "Target release asset: ${BOLD}${TARGET_ASSET}${RESET}"
 # --- 2. Find Latest Published Binary Release ---
 log_header "Checking Published Binary Releases"
 
-# Fetch all releases to find the most recent one with binary assets
-# This skips model-only releases (e.g., models-v1) automatically
-API_URL="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases?per_page=100&_=$(date +%s)"
+# Prefer the canonical latest-release endpoint for deterministic selection.
+# Fallback to scanning all releases only if latest is missing this platform asset.
+LATEST_API_URL="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest?_=$(date +%s)"
+RELEASES_API_URL="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases?per_page=100&_=$(date +%s)"
 
 CURL_ARGS=(-sL --retry 5 --retry-delay 2 --retry-connrefused --connect-timeout 5 --max-time 20 -H "Cache-Control: no-cache" -H "Pragma: no-cache")
 if [ -n "$GITHUB_TOKEN" ]; then
@@ -173,16 +174,26 @@ fi
 DOWNLOAD_URL=""
 RELEASE_TAG=""
 log_info "Resolving latest published release with asset ${BOLD}${TARGET_ASSET}${RESET}."
-RESPONSE="$(curl "${CURL_ARGS[@]}" "${API_URL}" || true)"
-DOWNLOAD_URL="$(echo "$RESPONSE" | \
+LATEST_RESPONSE="$(curl "${CURL_ARGS[@]}" "${LATEST_API_URL}" || true)"
+DOWNLOAD_URL="$(echo "$LATEST_RESPONSE" | \
     grep "browser_download_url.*${TARGET_ASSET}" | \
     cut -d '"' -f 4 | \
     head -n 1)"
+RELEASE_TAG="$(echo "$LATEST_RESPONSE" | sed -n 's/^[[:space:]]*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+
+if [ -z "$DOWNLOAD_URL" ]; then
+    log_info "Latest release did not include ${TARGET_ASSET}. Falling back to release scan."
+    RELEASES_RESPONSE="$(curl "${CURL_ARGS[@]}" "${RELEASES_API_URL}" || true)"
+    DOWNLOAD_URL="$(echo "$RELEASES_RESPONSE" | \
+        grep "browser_download_url.*${TARGET_ASSET}" | \
+        cut -d '"' -f 4 | \
+        head -n 1)"
+fi
 
 if [ -z "$DOWNLOAD_URL" ]; then
     log_error "Could not find a download URL for ${TARGET_ASSET} in any release."
     log_error "GitHub API Response Preview:"
-    echo "$RESPONSE" | head -n 20
+    echo "$LATEST_RESPONSE" | head -n 20
     log_error "..."
     log_error "Please check https://github.com/${REPO_OWNER}/${REPO_NAME}/releases manually."
     exit 1
