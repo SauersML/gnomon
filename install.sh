@@ -155,7 +155,7 @@ log_success "Detected: ${BOLD}${OS}/${ARCH}${RESET}"
 log_info "Target release asset: ${BOLD}${TARGET_ASSET}${RESET}"
 
 # --- 2. Find Latest Binary Release ---
-log_header "Checking Latest Binary Release"
+log_header "Checking Published Binary Releases"
 
 # Fetch all releases to find the most recent one with binary assets
 # This skips model-only releases (e.g., models-v1) automatically
@@ -175,6 +175,8 @@ DELAY=5
 DOWNLOAD_URL=""
 RELEASE_TAG=""
 MAIN_SHA=""
+EXPECTED_TAG=""
+USED_FALLBACK=0
 
 MAIN_RESPONSE="$(curl "${CURL_ARGS[@]}" "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/commits/main" || true)"
 MAIN_SHA="$(echo "$MAIN_RESPONSE" | sed -n 's/^[[:space:]]*"sha":[[:space:]]*"\([0-9a-f]\{40\}\)".*/\1/p' | head -n 1)"
@@ -207,6 +209,7 @@ if [ -n "$MAIN_SHA" ]; then
 fi
 
 if [ -z "$DOWNLOAD_URL" ]; then
+    USED_FALLBACK=1
     log_info "Falling back to latest published binary release."
     for ((i=1; i<=MAX_RETRIES; i++)); do
         # Only print "Fetching..." on first attempt or every 5th retry to reduce log noise
@@ -244,7 +247,12 @@ fi
 if [ -z "$RELEASE_TAG" ]; then
     RELEASE_TAG="$(echo "$DOWNLOAD_URL" | sed -n 's#.*/download/\([^/]*\)/.*#\1#p' | head -n 1)"
 fi
-log_success "Found latest binary release."
+if [ "$USED_FALLBACK" -eq 1 ] && [ -n "$EXPECTED_TAG" ]; then
+    log_info "Release for latest main commit (${EXPECTED_TAG}) is not published yet."
+    log_success "Using latest published binary release instead."
+else
+    log_success "Found release for latest main commit."
+fi
 if [ -n "$RELEASE_TAG" ]; then
     log_info "Selected release tag: ${BOLD}${RELEASE_TAG}${RESET}"
 fi
