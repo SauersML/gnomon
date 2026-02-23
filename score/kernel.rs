@@ -15,6 +15,7 @@ use std::simd::f32x8;
 // These types are part of the public API of the kernel.
 pub type SimdVec = f32x8;
 pub const LANE_COUNT: usize = SimdVec::LEN;
+pub const MAX_KERNEL_ACCUMULATOR_LANES: usize = 8;
 
 // ========================================================================================
 //                            Public API & type definitions
@@ -63,23 +64,6 @@ impl<'a> PaddedInterleavedWeights<'a> {
         self.num_scores
     }
 
-    /// Fetches the i-th SIMD vector of data for a given matrix row.
-    ///
-    /// # Safety
-    /// The caller MUST guarantee that `row_idx` is a valid row index for this matrix
-    /// and `lane_idx < self.stride / LANE_COUNT`. This contract is upheld by
-    /// `accumulate_scores_for_person`, whose loops are correctly bounded.
-    #[inline(always)]
-    unsafe fn get_simd_lane_unchecked(&self, row_idx: usize, lane_idx: usize) -> SimdVec {
-        // The offset calculation uses the pre-computed `stride` to correctly
-        // jump between the start of each variant's padded data block.
-        let offset = (row_idx * self.stride) + (lane_idx * LANE_COUNT);
-        // SAFETY: The `unsafe fn` contract guarantees the offset is in-bounds. The
-        // struct's constructor guarantees the data is padded, so reading a full
-        // `LANE_COUNT` of floats is always safe.
-        unsafe { SimdVec::from_slice(self.slice.get_unchecked(offset..offset + LANE_COUNT)) }
-    }
-
     /// Fetches the i-th SIMD vector for a score-window within a row.
     ///
     /// # Safety
@@ -101,66 +85,40 @@ impl<'a> PaddedInterleavedWeights<'a> {
 // ========================================================================================
 //                              The kernel implementation
 // ========================================================================================
-/// Calculates the score *adjustments* for a single person over a mini-batch of variants.
-/// The caller provides a reusable accumulator buffer to avoid per-person allocations.
-/// The internal loop structure is designed to maximize instruction-level parallelism
-/// by processing all score columns for a variant before moving to the next.
+/// Calculates one fixed 64-score chunk of score adjustments for a single person
+/// over a mini-batch of variants.
+///
+/// Returns exactly 8 SIMD lanes (8 * 8 = 64 scores).
 ///
 /// # Safety
 /// The caller must uphold the contract that all indices in `g1_indices` and `g2_indices`
 /// are valid row indices for the `weights` matrix, which represents
 /// a view of a single mini-batch.
 #[inline]
-pub fn accumulate_adjustments_for_person_into(
-    weights: &PaddedInterleavedWeights,
-    g1_indices: &[u16],
-    g2_indices: &[u16],
-    accumulator_buffer: &mut [SimdVec],
-) {
-    accumulate_adjustments_for_person_window_into(
-        weights,
-        g1_indices,
-        g2_indices,
-        0,
-        weights.num_scores(),
-        accumulator_buffer,
-    );
-}
-
-/// Same as `accumulate_adjustments_for_person_into`, but limited to a score window.
-#[inline]
-pub fn accumulate_adjustments_for_person_window_into(
+pub fn accumulate_adjustments_for_person(
     weights: &PaddedInterleavedWeights,
     g1_indices: &[u16],
     g2_indices: &[u16],
     score_start: usize,
-    score_count: usize,
-    accumulator_buffer: &mut [SimdVec],
-) {
+) -> [SimdVec; MAX_KERNEL_ACCUMULATOR_LANES] {
     assert!(
         score_start <= weights.num_scores(),
-        "Invalid score window start {score_start}; total scores={}.",
+        "Invalid chunk start {score_start}; total scores={}.",
         weights.num_scores()
     );
     assert!(
-        score_start + score_count <= weights.num_scores(),
-        "Invalid score window [{score_start}, {}); total scores={}.",
-        score_start + score_count,
-        weights.num_scores()
+        score_start + (MAX_KERNEL_ACCUMULATOR_LANES * LANE_COUNT) <= weights.stride,
+        "Invalid fixed kernel chunk: start={score_start}, requires {} padded scores, stride={}.",
+        MAX_KERNEL_ACCUMULATOR_LANES * LANE_COUNT,
+        weights.stride
     );
-    let num_accumulator_lanes = score_count.div_ceil(LANE_COUNT);
-    assert!(
-        accumulator_buffer.len() >= num_accumulator_lanes,
-        "Accumulator buffer too small: need {num_accumulator_lanes} lanes, got {}.",
-        accumulator_buffer.len()
-    );
-    accumulator_buffer[..num_accumulator_lanes].fill(SimdVec::splat(0.0));
+    let mut accumulator_buffer = [SimdVec::splat(0.0); MAX_KERNEL_ACCUMULATOR_LANES];
 
     // --- Loop 1: Dosage=1 Adjustments ---
     for &matrix_row_idx in g1_indices {
         let matrix_row_idx = matrix_row_idx as usize;
         // This inner loop over score columns is the same performant structure as the original kernel.
-        for i in 0..num_accumulator_lanes {
+        for i in 0..MAX_KERNEL_ACCUMULATOR_LANES {
             unsafe {
                 let weights_vec =
                     weights.get_simd_lane_for_score_window_unchecked(matrix_row_idx, score_start, i);
@@ -172,7 +130,7 @@ pub fn accumulate_adjustments_for_person_window_into(
     // --- Loop 2: Dosage=2 Adjustments ---
     for &matrix_row_idx in g2_indices {
         let matrix_row_idx = matrix_row_idx as usize;
-        for i in 0..num_accumulator_lanes {
+        for i in 0..MAX_KERNEL_ACCUMULATOR_LANES {
             unsafe {
                 let weights_vec =
                     weights.get_simd_lane_for_score_window_unchecked(matrix_row_idx, score_start, i);
@@ -181,4 +139,6 @@ pub fn accumulate_adjustments_for_person_window_into(
             }
         }
     }
+
+    accumulator_buffer
 }

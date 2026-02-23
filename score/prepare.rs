@@ -733,7 +733,18 @@ fn prepare_for_computation_with_retry(
         .map(|idx| u8::from(complex_bim_indices.contains(idx)))
         .collect();
 
-    let stride = score_names.len().div_ceil(LANE_COUNT) * LANE_COUNT;
+    let score_lane_groups = score_names.len().div_ceil(LANE_COUNT);
+    let stride = score_lane_groups.checked_mul(LANE_COUNT).ok_or_else(|| {
+        PrepError::Invariant(format!(
+            "Stride overflow while padding scores: num_scores={}, lane_count={LANE_COUNT}",
+            score_names.len()
+        ))
+    })?;
+    if stride % LANE_COUNT != 0 {
+        return Err(PrepError::Invariant(format!(
+            "Invalid padded stride {stride}: must be divisible by lane count {LANE_COUNT}."
+        )));
+    }
     let estimated_nnz: usize = simple_path_data.values().map(|m| m.len()).sum();
     let mut csr_builder = CsrBuilder::with_capacity(num_reconciled_variants, estimated_nnz);
 

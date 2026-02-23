@@ -388,11 +388,8 @@ fn run_single_file_pipeline(
             let (dense_adjustments, dense_counts) = dense_result?;
             let num_people = prep_result.num_people_to_score;
             let num_scores = prep_result.score_names.len();
-            let mut final_scores = Vec::with_capacity(num_people * num_scores);
-            for _ in 0..num_people {
-                final_scores.extend_from_slice(&master_baseline);
-            }
-            let mut final_counts = vec![0u32; num_people * num_scores];
+            let (mut final_scores, mut final_counts) =
+                initialize_final_output(num_people, num_scores, &master_baseline)?;
             final_counts
                 .par_iter_mut()
                 .zip(sparse_counts)
@@ -707,11 +704,8 @@ fn run_multi_file_pipeline(
             let (dense_adjustments, dense_counts) = dense_result?;
             let num_people = prep_result.num_people_to_score;
             let num_scores = prep_result.score_names.len();
-            let mut final_scores = Vec::with_capacity(num_people * num_scores);
-            for _ in 0..num_people {
-                final_scores.extend_from_slice(&master_baseline);
-            }
-            let mut final_counts = vec![0u32; num_people * num_scores];
+            let (mut final_scores, mut final_counts) =
+                initialize_final_output(num_people, num_scores, &master_baseline)?;
             final_counts
                 .par_iter_mut()
                 .zip(sparse_counts)
@@ -988,6 +982,66 @@ impl<F: FnOnce()> Drop for ScopeGuard<F> {
 
 type ConsumerResult = Result<(Vec<f64>, Vec<u32>), PipelineError>;
 
+#[inline]
+fn checked_result_size(prep_result: &PreparationResult) -> Result<usize, PipelineError> {
+    prep_result
+        .num_people_to_score
+        .checked_mul(prep_result.score_names.len())
+        .ok_or_else(|| {
+            PipelineError::Compute(format!(
+                "Result size overflow: num_people_to_score={} * num_scores={}",
+                prep_result.num_people_to_score,
+                prep_result.score_names.len()
+            ))
+        })
+}
+
+#[inline]
+fn initialize_final_output(
+    num_people: usize,
+    num_scores: usize,
+    baseline: &[f64],
+) -> Result<(Vec<f64>, Vec<u32>), PipelineError> {
+    let result_size = num_people.checked_mul(num_scores).ok_or_else(|| {
+        PipelineError::Compute(format!(
+            "Final output size overflow: num_people={num_people} * num_scores={num_scores}"
+        ))
+    })?;
+    if baseline.len() != num_scores {
+        return Err(PipelineError::Compute(format!(
+            "Baseline length mismatch: baseline={}, num_scores={num_scores}",
+            baseline.len()
+        )));
+    }
+
+    let mut final_scores = Vec::with_capacity(result_size);
+    for _ in 0..num_people {
+        final_scores.extend_from_slice(baseline);
+    }
+    let final_counts = vec![0u32; result_size];
+    Ok((final_scores, final_counts))
+}
+
+#[inline]
+fn choose_consumer_threads(result_size: usize) -> usize {
+    let cpu_cap = num_cpus::get().max(1);
+
+    let bytes_per_accumulator =
+        result_size.saturating_mul(std::mem::size_of::<f64>() + std::mem::size_of::<u32>());
+    if bytes_per_accumulator == 0 {
+        return cpu_cap;
+    }
+
+    // Automatic RAM heuristic for per-thread accumulators.
+    // Each consumer (sparse/dense) gets half of this budget.
+    const TOTAL_ACCUMULATOR_BUDGET_BYTES: usize = 8 * 1024 * 1024 * 1024;
+    let total_budget_bytes = TOTAL_ACCUMULATOR_BUDGET_BYTES;
+    let per_consumer_budget = (total_budget_bytes / 2).max(bytes_per_accumulator);
+    let by_mem = (per_consumer_budget / bytes_per_accumulator).max(1);
+
+    by_mem.min(cpu_cap).max(1)
+}
+
 /// A contention-free consumer for the sparse variant stream, using Rayon's
 /// fold/reduce pattern for maximum parallelism with no locks.
 fn process_sparse_stream(
@@ -996,52 +1050,58 @@ fn process_sparse_stream(
     buffer_pool: Arc<ArrayQueue<Vec<u8>>>,
 ) -> ConsumerResult {
     let prep_result = &context.prep_result;
-    let result_size = prep_result.num_people_to_score * prep_result.score_names.len();
+    let result_size = checked_result_size(prep_result)?;
+    let consumer_threads = choose_consumer_threads(result_size);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(consumer_threads)
+        .build()
+        .map_err(|e| PipelineError::Compute(format!("Failed to build sparse consumer pool: {e}")))?;
 
     // The fold/reduce pattern creates thread-local accumulators for scores and counts.
     // After processing a work item, its data buffer is immediately returned to the
     // shared pool, creating a true, continuous recycling system.
-    let final_result = rx
-        .into_iter() // Convert the channel to a blocking iterator.
-        .par_bridge() // Bridge it to a Rayon parallel iterator.
-        .try_fold(
-            || (vec![0.0f64; result_size], vec![0u32; result_size]), // Each thread gets its own accumulator.
-            |mut acc, work_result| {
-                // The work_item and its buffer are processed within this scope.
-                // The `_guard` ensures the buffer is returned to the pool when this
-                // scope ends, whether by success or by `?` propagating an error.
-                {
-                    let work_item = work_result?;
-                    let guard = BufferGuard {
-                        buffer: Some(work_item.data),
-                        pool: &buffer_pool,
-                    };
+    let final_result = pool.install(|| {
+        rx.into_iter() // Convert the channel to a blocking iterator.
+            .par_bridge() // Bridge it to a Rayon parallel iterator.
+            .try_fold(
+                || (vec![0.0f64; result_size], vec![0u32; result_size]), // Each thread gets its own accumulator.
+                |mut acc, work_result| {
+                    // The work_item and its buffer are processed within this scope.
+                    // The `_guard` ensures the buffer is returned to the pool when this
+                    // scope ends, whether by success or by `?` propagating an error.
+                    {
+                        let work_item = work_result?;
+                        let guard = BufferGuard {
+                            buffer: Some(work_item.data),
+                            pool: &buffer_pool,
+                        };
 
-                    batch::run_variant_major_path(
-                        // The guard holds the buffer, so we borrow it from there.
-                        guard.buffer.as_ref().unwrap(),
-                        prep_result,
-                        &mut acc.0,
-                        &mut acc.1,
-                        work_item.reconciled_variant_index,
-                    )?;
-                }
-                Ok::<_, PipelineError>(acc)
-            },
-        )
-        .try_reduce(
-            || (vec![0.0f64; result_size], vec![0u32; result_size]), // Identity for the reduction.
-            |mut a, b| {
-                // Combine accumulators from two threads in parallel.
-                a.0.par_iter_mut()
-                    .zip(b.0)
-                    .for_each(|(v_a, v_b)| *v_a += v_b);
-                a.1.par_iter_mut()
-                    .zip(b.1)
-                    .for_each(|(v_a, v_b)| *v_a += v_b);
-                Ok(a)
-            },
-        )?;
+                        batch::run_variant_major_path(
+                            // The guard holds the buffer, so we borrow it from there.
+                            guard.buffer.as_ref().unwrap(),
+                            prep_result,
+                            &mut acc.0,
+                            &mut acc.1,
+                            work_item.reconciled_variant_index,
+                        )?;
+                    }
+                    Ok::<_, PipelineError>(acc)
+                },
+            )
+            .try_reduce(
+                || (vec![0.0f64; result_size], vec![0u32; result_size]), // Identity for the reduction.
+                |mut a, b| {
+                    // Combine accumulators from two threads in parallel.
+                    a.0.par_iter_mut()
+                        .zip(b.0)
+                        .for_each(|(v_a, v_b)| *v_a += v_b);
+                    a.1.par_iter_mut()
+                        .zip(b.1)
+                        .for_each(|(v_a, v_b)| *v_a += v_b);
+                    Ok(a)
+                },
+            )
+    })?;
 
     // `try_reduce` returns `Result<(scores, counts), PipelineError>`.
     // The `?` operator has already unwrapped the Result, leaving just the tuple.
@@ -1058,101 +1118,111 @@ fn process_dense_stream(
     buffer_pool: Arc<ArrayQueue<Vec<u8>>>,
 ) -> ConsumerResult {
     let prep_result = &context.prep_result;
-    let result_size = prep_result.num_people_to_score * prep_result.score_names.len();
+    let result_size = checked_result_size(prep_result)?;
+    let consumer_threads = choose_consumer_threads(result_size);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(consumer_threads)
+        .build()
+        .map_err(|e| PipelineError::Compute(format!("Failed to build dense consumer pool: {e}")))?;
 
     // Instantiate our new Send-compatible batching iterator.
     let batch_iterator = ChannelBatcher::new(rx, DENSE_BATCH_SIZE);
 
     // Use the exact same fold/reduce pattern as the sparse stream, but on batches.
-    let final_result = batch_iterator
-        .par_bridge() // This is now possible and correct.
-        .try_fold(
-            || {
-                // Per-thread accumulator initializer
-                (
-                    vec![0.0f64; result_size],
-                    vec![0u32; result_size],
-                    Vec::with_capacity(DENSE_BATCH_SIZE * (prep_result.bytes_per_variant as usize)),
-                )
-            },
-            |mut acc, batch_result| {
-                // The `?` operator handles propagating errors from the channel.
-                let batch = batch_result?;
-                if batch.is_empty() {
-                    return Ok(acc);
-                }
-
-                let reconciled_indices: Vec<ReconciledVariantIndex> =
-                    batch.iter().map(|wi| wi.reconciled_variant_index).collect();
-
-                let concatenated_data = &mut acc.2;
-                concatenated_data.clear();
-
-                {
-                    // BufferGuard ensures all variant data buffers are returned to the pool,
-                    // even if an error occurs during computation.
-                    let guards: Vec<_> = batch
-                        .into_iter()
-                        .map(|wi| {
-                            concatenated_data.extend_from_slice(&wi.data);
-                            BufferGuard {
-                                buffer: Some(wi.data),
-                                pool: &buffer_pool,
-                            }
-                        })
-                        .collect();
-
-                    let stride = prep_result.stride();
-                    let mut weights_for_batch = vec![0.0f32; reconciled_indices.len() * stride];
-                    let mut missing_corrections_for_batch =
-                        vec![0.0f32; reconciled_indices.len() * stride];
-                    let mut canvas = DenseMiniBatchCanvas {
-                        weights: &mut weights_for_batch,
-                        missing_corrections: &mut missing_corrections_for_batch,
-                        stride,
-                    };
-                    for (batch_row_idx, &reconciled_idx) in reconciled_indices.iter().enumerate() {
-                        let variant_view = prep_result.variant_csr_view(reconciled_idx);
-                        for contribution in variant_view.iter() {
-                            let col = contribution.score_column.0;
-                            canvas.set(
-                                batch_row_idx,
-                                col,
-                                contribution.weight,
-                                contribution.missing_correction,
-                            );
-                        }
+    let final_result = pool.install(|| {
+        batch_iterator
+            .par_bridge() // This is now possible and correct.
+            .try_fold(
+                || {
+                    // Per-thread accumulator initializer
+                    (
+                        vec![0.0f64; result_size],
+                        vec![0u32; result_size],
+                        Vec::with_capacity(
+                            DENSE_BATCH_SIZE * (prep_result.bytes_per_variant as usize),
+                        ),
+                    )
+                },
+                |mut acc, batch_result| {
+                    // The `?` operator handles propagating errors from the channel.
+                    let batch = batch_result?;
+                    if batch.is_empty() {
+                        return Ok(acc);
                     }
 
-                    batch::run_person_major_path(
-                        concatenated_data,
-                        &weights_for_batch,
-                        &missing_corrections_for_batch,
-                        &reconciled_indices,
-                        prep_result,
-                        &mut acc.0,
-                        &mut acc.1,
-                        &context.tile_pool,
-                    )?;
+                    let reconciled_indices: Vec<ReconciledVariantIndex> =
+                        batch.iter().map(|wi| wi.reconciled_variant_index).collect();
 
-                    assert!(!guards.is_empty());
-                }
+                    let concatenated_data = &mut acc.2;
+                    concatenated_data.clear();
 
-                Ok::<_, PipelineError>(acc)
-            },
-        )
-        .try_reduce(
-            || (vec![0.0; result_size], vec![0; result_size], Vec::new()),
-            |mut a, b| {
-                a.0.par_iter_mut()
-                    .zip(b.0)
-                    .for_each(|(v_a, v_b)| *v_a += v_b);
-                a.1.par_iter_mut()
-                    .zip(b.1)
-                    .for_each(|(v_a, v_b)| *v_a += v_b);
-                Ok(a)
-            },
-        )?;
+                    {
+                        // BufferGuard ensures all variant data buffers are returned to the pool,
+                        // even if an error occurs during computation.
+                        let guards: Vec<_> = batch
+                            .into_iter()
+                            .map(|wi| {
+                                concatenated_data.extend_from_slice(&wi.data);
+                                BufferGuard {
+                                    buffer: Some(wi.data),
+                                    pool: &buffer_pool,
+                                }
+                            })
+                            .collect();
+
+                        let stride = prep_result.stride();
+                        let mut weights_for_batch = vec![0.0f32; reconciled_indices.len() * stride];
+                        let mut missing_corrections_for_batch =
+                            vec![0.0f32; reconciled_indices.len() * stride];
+                        let mut canvas = DenseMiniBatchCanvas {
+                            weights: &mut weights_for_batch,
+                            missing_corrections: &mut missing_corrections_for_batch,
+                            stride,
+                        };
+                        for (batch_row_idx, &reconciled_idx) in reconciled_indices.iter().enumerate()
+                        {
+                            let variant_view = prep_result.variant_csr_view(reconciled_idx);
+                            for contribution in variant_view.iter() {
+                                let col = contribution.score_column.0;
+                                canvas.set(
+                                    batch_row_idx,
+                                    col,
+                                    contribution.weight,
+                                    contribution.missing_correction,
+                                );
+                            }
+                        }
+
+                        batch::run_person_major_path(
+                            concatenated_data,
+                            &weights_for_batch,
+                            &missing_corrections_for_batch,
+                            &reconciled_indices,
+                            prep_result,
+                            &mut acc.0,
+                            &mut acc.1,
+                            &context.tile_pool,
+                        )?;
+
+                        assert!(!guards.is_empty());
+                    }
+
+                    Ok::<_, PipelineError>(acc)
+                },
+            )
+            .try_reduce(
+                || (vec![0.0; result_size], vec![0; result_size], Vec::new()),
+                |mut a, b| {
+                    a.0.par_iter_mut()
+                        .zip(b.0)
+                        .for_each(|(v_a, v_b)| *v_a += v_b);
+                    a.1.par_iter_mut()
+                        .zip(b.1)
+                        .for_each(|(v_a, v_b)| *v_a += v_b);
+                    Ok(a)
+                },
+            )
+    })?;
 
     // The `?` operator unwrapped the `Result` from the reduction. If the stream was
     // empty, `try_reduce` (on a `TryFold` iterator) returns the identity value, so
