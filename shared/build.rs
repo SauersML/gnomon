@@ -44,7 +44,6 @@ struct DashHeavyCommentCollector {
     file_path: PathBuf,
 }
 
-// A custom collector for #[allow(dead_code)] attribute violations
 struct DeadCodeCollector {
     violations: Vec<String>,
     file_path: PathBuf,
@@ -1238,7 +1237,6 @@ fn main() {
     emit_stage_detail(&previous_code_report);
     all_violations.extend(previous_code_violations);
 
-    // Scan Rust source files for #[allow(dead_code)] attributes
     update_stage("scan allow(dead_code) attributes");
     let dead_code_violations = scan_for_allow_dead_code(&manifest_dir);
     let dead_code_report = format!(
@@ -1938,7 +1936,6 @@ fn scan_for_previous_code_references(manifest_dir: &str) -> Vec<String> {
 }
 
 fn scan_for_allow_dead_code(manifest_dir: &str) -> Vec<String> {
-    // Regex pattern to find #[allow(dead_code)] attributes
     let pattern = r"#\s*\[\s*allow\s*\(\s*dead_code\s*\)\s*\]";
     let mut all_violations = Vec::new();
 

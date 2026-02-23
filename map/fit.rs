@@ -412,7 +412,16 @@ pub struct HardCallPacked<'a> {
 }
 
 impl<'a> HardCallPacked<'a> {
-    fn slice(&self, start: usize, count: usize) -> Option<&'a [u8]> {
+    #[cfg(test)]
+    pub(crate) fn new(data: &'a [u8], bytes_per_variant: usize, n_variants: usize) -> Self {
+        Self {
+            data,
+            bytes_per_variant,
+            n_variants,
+        }
+    }
+
+    pub(crate) fn slice(&self, start: usize, count: usize) -> Option<&'a [u8]> {
         let byte_start = start.checked_mul(self.bytes_per_variant)?;
         let byte_len = count.checked_mul(self.bytes_per_variant)?;
         let byte_end = byte_start.checked_add(byte_len)?;
@@ -420,6 +429,10 @@ impl<'a> HardCallPacked<'a> {
             return None;
         }
         Some(&self.data[byte_start..byte_end])
+    }
+
+    pub(crate) fn n_variants(&self) -> usize {
+        self.n_variants
     }
 }
 
@@ -1039,19 +1052,6 @@ impl HweScaler {
         standardize_block_impl(block, freqs, scales, par);
     }
 
-    pub(crate) fn standardize_block_with_mask(
-        &self,
-        block: MatMut<'_, f64>,
-        variant_range: Range<usize>,
-        presence_out: MatMut<'_, f64>,
-        par: Par,
-    ) {
-        let start = variant_range.start;
-        let end = variant_range.end;
-        let freqs = &self.frequencies[start..end];
-        let scales = &self.scales[start..end];
-        standardize_block_with_mask_from_stats(block, presence_out, freqs, scales, par);
-    }
 }
 
 fn standardize_block_with_mask_from_stats(
@@ -4028,10 +4028,13 @@ where
         );
 
         let variant_range = processed..processed + filled;
-        scaler.standardize_block_with_mask(
+        let freqs = &scaler.allele_frequencies()[variant_range.clone()];
+        let scales = &scaler.variant_scales()[variant_range.clone()];
+        standardize_block_with_mask_from_stats(
             block.as_mut(),
-            variant_range.clone(),
             presence.as_mut(),
+            freqs,
+            scales,
             par,
         );
 
@@ -4876,10 +4879,13 @@ mod tests {
             );
             let mut mask_mat =
                 MatMut::from_column_major_slice_mut(&mut mask, n_samples, observed_variants);
-            scaler.standardize_block_with_mask(
+            let freqs = &scaler.allele_frequencies()[0..observed_variants];
+            let scales = &scaler.variant_scales()[0..observed_variants];
+            standardize_block_with_mask_from_stats(
                 block.as_mut(),
-                0..observed_variants,
                 mask_mat.as_mut(),
+                freqs,
+                scales,
                 Par::Seq,
             );
         }
