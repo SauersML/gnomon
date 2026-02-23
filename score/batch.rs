@@ -9,8 +9,7 @@
 // `spawn_blocking` context. Its sole responsibility is to take a raw, variant-major
 // chunk of genotype data, pivot it into a person-major tile, generate a sparse
 // index of non-zero work, and dispatch it to the kernel. It performs ZERO
-// scientific logic or reconciliation. We don't support over 100 scores.
-// It will panic / overflow if we try.
+// scientific logic or reconciliation.
 
 use crate::score::kernel;
 use crate::score::types::{
@@ -34,6 +33,9 @@ const PERSON_BLOCK_SIZE: usize = 4096;
 /// controls the frequency of flushing the `f32` accumulators to the `f64` master
 /// buffer, which is the primary mechanism for guaranteeing numerical accuracy.
 const KERNEL_MINI_BATCH_SIZE: usize = 256;
+/// Number of scores to process per inner CPU stripe.
+/// Must be a multiple of SIMD lanes so each stripe can read full vectors safely.
+const CPU_SCORE_CHUNK_SIZE: usize = 128;
 
 // ========================================================================================
 //                                   Public API
@@ -69,13 +71,6 @@ pub fn run_person_major_path(
     // on different threads. This avoids thread pool exhaustion and is highly
     // cache-friendly, as each thread works on its own disjoint data blocks.
     let num_scores = prep_result.score_names.len();
-    if num_scores > kernel::MAX_SUPPORTED_SCORES {
-        return Err(Box::from(format!(
-            "Kernel supports at most {} scores, but run requested {}.",
-            kernel::MAX_SUPPORTED_SCORES,
-            num_scores
-        )));
-    }
     let items_per_block = PERSON_BLOCK_SIZE * num_scores;
 
     partial_scores_out
@@ -248,7 +243,9 @@ pub(crate) fn process_tile_impl<'a>(
     }
 
     let stride = prep_result.stride();
-    let num_accumulator_lanes = num_scores.div_ceil(SIMD_LANES);
+    let score_chunk_size = CPU_SCORE_CHUNK_SIZE.max(SIMD_LANES);
+    let max_chunk_lanes = score_chunk_size.div_ceil(SIMD_LANES);
+    let mut kernel_result_buffer = vec![kernel::SimdVec::splat(0.0); max_chunk_lanes];
 
     for variant_mini_batch_start in (0..variants_in_chunk).step_by(KERNEL_MINI_BATCH_SIZE) {
         let mini_batch_size =
@@ -401,25 +398,33 @@ pub(crate) fn process_tile_impl<'a>(
                 }
             }
 
-            // Call kernel with stack slices
-            let kernel_result_buffer = kernel::accumulate_adjustments_for_person(
-                &weights,
-                &g1_indices[..g1_count],
-                &g2_indices[..g2_count],
-            );
-
-            // Accumulate results into output buffer
             let scores_out_slice =
                 &mut block_scores_out[person_idx * num_scores..(person_idx + 1) * num_scores];
-            for i in 0..num_accumulator_lanes {
-                let scores_offset = i * SIMD_LANES;
-                let adjustments_f32x8 = kernel_result_buffer[i];
-                accumulate_simd_lane(
-                    scores_out_slice,
-                    adjustments_f32x8,
-                    scores_offset,
-                    num_scores,
+            for score_chunk_start in (0..num_scores).step_by(score_chunk_size) {
+                let score_chunk_end = (score_chunk_start + score_chunk_size).min(num_scores);
+                let score_chunk_len = score_chunk_end - score_chunk_start;
+                let score_chunk_lanes = score_chunk_len.div_ceil(SIMD_LANES);
+
+                kernel::accumulate_adjustments_for_person_window_into(
+                    &weights,
+                    &g1_indices[..g1_count],
+                    &g2_indices[..g2_count],
+                    score_chunk_start,
+                    score_chunk_len,
+                    &mut kernel_result_buffer[..score_chunk_lanes],
                 );
+
+                let score_chunk_out = &mut scores_out_slice[score_chunk_start..score_chunk_end];
+                for i in 0..score_chunk_lanes {
+                    let scores_offset = i * SIMD_LANES;
+                    let adjustments_f32x8 = kernel_result_buffer[i];
+                    accumulate_simd_lane(
+                        score_chunk_out,
+                        adjustments_f32x8,
+                        scores_offset,
+                        score_chunk_len,
+                    );
+                }
             }
         }
     }

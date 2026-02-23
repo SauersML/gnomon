@@ -35,6 +35,8 @@ const SPOOL_BUFFER_SIZE: usize = 8 * 1024 * 1024;
 const MIN_GPU_WORK: usize = 100_000;
 const MIN_MEGA_BATCH_VARIANTS: usize = 256;
 const MAX_MEGA_BATCH_VARIANTS: usize = 16384;
+const MIN_SCORE_TILE_SIZE: usize = 8;
+const DEFAULT_GPU_SCORE_TILE_SIZE: usize = 256;
 const PIPELINE_SLOTS: usize = 2;
 
 fn create_progress_bar(len: u64, message: &str) -> ProgressBar {
@@ -103,7 +105,8 @@ extern "C" __global__ void build_batch_mats(
     const unsigned long long* sparse_row_offsets,
     const unsigned int* reconciled_indices,
     int batch_variants,
-    int num_scores,
+    int num_scores_tile,
+    int score_offset,
     float* out_effective,
     float* out_missing_corr,
     float* out_count
@@ -114,10 +117,10 @@ extern "C" __global__ void build_batch_mats(
     if (v >= (unsigned long long)batch_variants) return;
 
     unsigned int reconciled = reconciled_indices[v];
-    size_t row_base = (size_t)v * (size_t)num_scores;
+    size_t row_base = (size_t)v * (size_t)num_scores_tile;
 
     // Dense row init for GEMM inputs.
-    for (int s = 0; s < num_scores; ++s) {
+    for (int s = 0; s < num_scores_tile; ++s) {
         size_t dst = row_base + (size_t)s;
         out_effective[dst] = 0.0f;
         out_missing_corr[dst] = 0.0f;
@@ -128,8 +131,10 @@ extern "C" __global__ void build_batch_mats(
     unsigned long long end = sparse_row_offsets[reconciled + 1u];
     for (unsigned long long p = start; p < end; ++p) {
         unsigned int col = sparse_columns[p];
-        if (col >= (unsigned int)num_scores) continue;
-        size_t dst = row_base + (size_t)col;
+        if (col < (unsigned int)score_offset) continue;
+        unsigned int tile_col = col - (unsigned int)score_offset;
+        if (tile_col >= (unsigned int)num_scores_tile) continue;
+        size_t dst = row_base + (size_t)tile_col;
         out_effective[dst] = sparse_weights[p];
         out_missing_corr[dst] = -sparse_missing_corrections[p];
         out_count[dst] = 1.0f;
@@ -188,6 +193,7 @@ struct CudaRuntime {
     sparse_row_offsets: CudaSlice<u64>,
     output_map: CudaSlice<u32>,
     mega_batch_variants: usize,
+    score_tile_size: usize,
     pinned_staging: Vec<PinnedHostSlice<u8>>,
     pinned_reconciled: Vec<PinnedHostSlice<u32>>,
 }
@@ -237,19 +243,16 @@ struct CudaDims {
     num_people: usize,
     num_scores: usize,
     bytes_per_variant: usize,
-    result_size: usize,
 }
 
 impl CudaDims {
     fn from_prep(prep_result: &PreparationResult) -> Result<Self, PipelineError> {
         let num_people = prep_result.num_people_to_score;
         let num_scores = prep_result.score_names.len();
-        let result_size = checked_mul_usize("result_size", num_people, num_scores)?;
         Ok(Self {
             num_people,
             num_scores,
             bytes_per_variant: prep_result.bytes_per_variant as usize,
-            result_size,
         })
     }
 
@@ -268,6 +271,10 @@ impl CudaDims {
         checked_i32("bytes_per_variant", self.bytes_per_variant)
     }
 
+    #[inline]
+    fn result_size(self) -> Result<usize, PipelineError> {
+        checked_mul_usize("result_size", self.num_people, self.num_scores)
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -443,18 +450,22 @@ impl CudaRuntime {
 
         let num_people = prep.num_people_to_score;
         let num_scores = prep.score_names.len();
-        let result_size = num_people
-            .checked_mul(num_scores)
-            .ok_or_else(|| "CUDA memory estimate overflow: result_size".to_string())?;
         let bytes_per_variant = prep.bytes_per_variant as usize;
 
-        let estimate_required_bytes = |mega: usize| -> Option<usize> {
+        let mut score_tile = DEFAULT_GPU_SCORE_TILE_SIZE
+            .min(num_scores.max(MIN_SCORE_TILE_SIZE))
+            .max(MIN_SCORE_TILE_SIZE);
+        // Keep CUDA tile width SIMD-friendly for host-side accumulation loops.
+        score_tile = score_tile.div_ceil(8) * 8;
+
+        let estimate_required_bytes = |mega: usize, tile_scores: usize| -> Option<usize> {
+            let tile_result = num_people.checked_mul(tile_scores)?;
             let slot_packed = PIPELINE_SLOTS.checked_mul(mega.checked_mul(bytes_per_variant)?)?;
             let slot_reconciled =
                 PIPELINE_SLOTS.checked_mul(mega.checked_mul(std::mem::size_of::<u32>())?)?;
             let slot_outputs = PIPELINE_SLOTS
                 .checked_mul(3)?
-                .checked_mul(result_size.checked_mul(std::mem::size_of::<f32>())?)?;
+                .checked_mul(tile_result.checked_mul(std::mem::size_of::<f32>())?)?;
 
             let d_dosage = num_people
                 .checked_mul(mega)?
@@ -463,17 +474,14 @@ impl CudaRuntime {
                 .checked_mul(mega)?
                 .checked_mul(std::mem::size_of::<f32>())?;
             let d_w_eff = mega
-                .checked_mul(num_scores)?
+                .checked_mul(tile_scores)?
                 .checked_mul(std::mem::size_of::<f32>())?;
             let d_w_corr = mega
-                .checked_mul(num_scores)?
+                .checked_mul(tile_scores)?
                 .checked_mul(std::mem::size_of::<f32>())?;
             let d_count_w = mega
-                .checked_mul(num_scores)?
+                .checked_mul(tile_scores)?
                 .checked_mul(std::mem::size_of::<f32>())?;
-
-            let d_final_scores = result_size.checked_mul(std::mem::size_of::<f64>())?;
-            let d_final_counts = result_size.checked_mul(std::mem::size_of::<f64>())?;
 
             static_bytes
                 .checked_add(slot_packed)?
@@ -483,26 +491,33 @@ impl CudaRuntime {
                 .checked_add(d_missing)?
                 .checked_add(d_w_eff)?
                 .checked_add(d_w_corr)?
-                .checked_add(d_count_w)?
-                .checked_add(d_final_scores)?
-                .checked_add(d_final_counts)
+                .checked_add(d_count_w)
         };
 
-        let mut mega = MAX_MEGA_BATCH_VARIANTS;
         let budget = (free_mem as f64 * 0.8) as usize;
-        while mega > MIN_MEGA_BATCH_VARIANTS {
-            let required = estimate_required_bytes(mega).ok_or_else(|| {
-                format!("CUDA memory estimate overflow while evaluating mega-batch={mega}")
-            })?;
-            if required <= budget {
+        let mut selected: Option<(usize, usize)> = None;
+        while score_tile >= MIN_SCORE_TILE_SIZE {
+            let mut mega = MAX_MEGA_BATCH_VARIANTS;
+            while mega >= MIN_MEGA_BATCH_VARIANTS {
+                let required = estimate_required_bytes(mega, score_tile).ok_or_else(|| {
+                    format!(
+                        "CUDA memory estimate overflow while evaluating mega-batch={mega}, score_tile={score_tile}"
+                    )
+                })?;
+                if required <= budget {
+                    selected = Some((mega, score_tile));
+                    break;
+                }
+                mega /= 2;
+            }
+            if selected.is_some() {
                 break;
             }
-            mega /= 2;
+            score_tile /= 2;
         }
 
-        if mega < MIN_MEGA_BATCH_VARIANTS {
-            return Err("Insufficient GPU memory for minimum CUDA mega-batch".to_string());
-        }
+        let (mega, score_tile_size) =
+            selected.ok_or_else(|| "Insufficient GPU memory for minimum CUDA workload".to_string())?;
 
         let sparse_weights = compute_stream
             .clone_htod(prep.sparse_weights())
@@ -581,6 +596,7 @@ impl CudaRuntime {
             sparse_row_offsets,
             output_map,
             mega_batch_variants: mega,
+            score_tile_size,
             pinned_staging,
             pinned_reconciled,
         })

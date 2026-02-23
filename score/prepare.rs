@@ -8,7 +8,6 @@
 // blueprint." It now uses a low-memory, high-throughput streaming merge-join
 // algorithm to handle genome-scale data.
 
-use crate::score::kernel::MAX_SUPPORTED_SCORES;
 use crate::score::io::{TextSource, open_text_source};
 use crate::score::pipeline::PipelineError;
 use crate::score::reformat;
@@ -379,13 +378,6 @@ fn prepare_for_computation_with_retry(
     // --- Stage 2: Global metadata discovery ---
     eprintln!("> Stage 2: Discovering all score columns...");
     let score_names = parse_score_file_headers_only(sorted_score_files)?;
-    if score_names.len() > MAX_SUPPORTED_SCORES {
-        return Err(PrepError::Invariant(format!(
-            "Found {} scores, but the current SIMD kernel supports at most {}.",
-            score_names.len(),
-            MAX_SUPPORTED_SCORES
-        )));
-    }
     let score_name_to_col_index: AHashMap<String, ScoreColumnIndex> = score_names
         .iter()
         .enumerate()

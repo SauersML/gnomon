@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import json
 import multiprocessing as mp
 import os
 import time
@@ -16,6 +17,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import stdpopsim
+import tskit
 import numba as nb
 from scipy.stats import gaussian_kde
 from scipy.special import expit as sigmoid
@@ -242,15 +244,151 @@ def _default_work_root(out_dir: Path) -> Path:
     return out_dir / "work"
 
 
+def _stage8_checkpoint_paths(out_dir: Path, seed: int) -> dict[str, Path]:
+    stem = out_dir / f"fig2_s{int(seed)}.stage8"
+    return {
+        "meta": Path(f"{stem}.meta.json"),
+        "npz": Path(f"{stem}.npz"),
+        "trees": Path(f"{stem}.trees"),
+    }
+
+
+def _write_stage8_checkpoint(
+    out_dir: Path,
+    seed: int,
+    run_id: str,
+    expected_meta: dict[str, object],
+    ts,
+    a_idx: np.ndarray,
+    b_idx: np.ndarray,
+    pop_label: np.ndarray,
+    ts_ind_id: np.ndarray,
+    pcs: np.ndarray,
+    G_true: np.ndarray,
+    causal_pos_1based: set[int],
+    het_by_pop: dict[str, float],
+    ts_sites: int,
+    causal_overlap: int,
+) -> None:
+    paths = _stage8_checkpoint_paths(out_dir, seed)
+    meta = dict(expected_meta)
+    meta.update(
+        {
+            "schema_version": 1,
+            "ts_sites": int(ts_sites),
+            "causal_overlap": int(causal_overlap),
+            "het_by_pop": {str(k): float(v) for k, v in het_by_pop.items()},
+        }
+    )
+
+    tmp_trees = Path(f"{paths['trees']}.tmp")
+    tmp_npz = Path(f"{paths['npz']}.tmp")
+    tmp_meta = Path(f"{paths['meta']}.tmp")
+    _log(f"[{run_id}] Writing stage-8 checkpoint")
+    ts.dump(str(tmp_trees))
+    with open(tmp_npz, "wb") as f_npz:
+        np.savez(
+            f_npz,
+            a_idx=np.asarray(a_idx, dtype=np.int64),
+            b_idx=np.asarray(b_idx, dtype=np.int64),
+            pop_label=np.asarray(pop_label, dtype="U16"),
+            ts_ind_id=np.asarray(ts_ind_id, dtype=np.int64),
+            pcs=np.asarray(pcs, dtype=np.float64),
+            G_true=np.asarray(G_true, dtype=np.float64),
+            causal_pos_1based=np.asarray(sorted(int(x) for x in causal_pos_1based), dtype=np.int64),
+        )
+    with open(tmp_meta, "w", encoding="utf-8") as f:
+        json.dump(meta, f, sort_keys=True)
+
+    tmp_trees.replace(paths["trees"])
+    tmp_npz.replace(paths["npz"])
+    tmp_meta.replace(paths["meta"])
+    _log(f"[{run_id}] Stage-8 checkpoint ready: {paths['meta']}, {paths['npz']}, {paths['trees']}")
+
+
+def _load_stage8_checkpoint(
+    out_dir: Path,
+    seed: int,
+    run_id: str,
+    expected_meta: dict[str, object],
+):
+    paths = _stage8_checkpoint_paths(out_dir, seed)
+    if not (paths["meta"].exists() and paths["npz"].exists() and paths["trees"].exists()):
+        return None
+
+    try:
+        with open(paths["meta"], "r", encoding="utf-8") as f:
+            meta = json.load(f)
+    except Exception as e:
+        _log(f"[{run_id}] Stage-8 checkpoint metadata unreadable; ignoring ({type(e).__name__}: {e})")
+        return None
+
+    for k, v in expected_meta.items():
+        if k not in meta:
+            _log(f"[{run_id}] Stage-8 checkpoint missing key={k}; ignoring")
+            return None
+        if isinstance(v, float):
+            if abs(float(meta[k]) - float(v)) > 1e-9:
+                _log(f"[{run_id}] Stage-8 checkpoint key mismatch for {k}; ignoring")
+                return None
+        else:
+            if meta[k] != v:
+                _log(f"[{run_id}] Stage-8 checkpoint key mismatch for {k}; ignoring")
+                return None
+
+    try:
+        ts = tskit.load(str(paths["trees"]))
+        z = np.load(str(paths["npz"]), allow_pickle=False)
+        a_idx = z["a_idx"].astype(np.int64, copy=False)
+        b_idx = z["b_idx"].astype(np.int64, copy=False)
+        pop_label = z["pop_label"].astype(object, copy=False)
+        ts_ind_id = z["ts_ind_id"].astype(np.int64, copy=False)
+        pcs = z["pcs"].astype(np.float64, copy=False)
+        G_true = z["G_true"].astype(np.float64, copy=False)
+        causal_pos_1based = set(z["causal_pos_1based"].astype(np.int64, copy=False).tolist())
+    except Exception as e:
+        _log(f"[{run_id}] Stage-8 checkpoint payload unreadable; ignoring ({type(e).__name__}: {e})")
+        return None
+
+    het_by_pop = meta.get("het_by_pop", {})
+    ts_sites = int(meta.get("ts_sites", int(ts.num_sites)))
+    causal_overlap = int(meta.get("causal_overlap", len(causal_pos_1based)))
+    _log(f"[{run_id}] Reusing stage-8 checkpoint from disk")
+    return (
+        ts,
+        a_idx,
+        b_idx,
+        pop_label,
+        ts_ind_id,
+        pcs,
+        G_true,
+        ts_sites,
+        causal_overlap,
+        {str(k): float(v) for k, v in het_by_pop.items()},
+        causal_pos_1based,
+    )
+
+
 def _true_ancestry_proportions(
     ts,
     a_idx: np.ndarray,
     b_idx: np.ndarray,
     pop_lookup: dict[int, str],
-    ancestry_census_time: float,
+    census_time: float,
     ancestry_threads: int,
     log_prefix: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _link_ancestors_edges(ts_obj, samples_arr: np.ndarray, ancestors_arr: np.ndarray):
+        if hasattr(ts_obj, "link_ancestors"):
+            return ts_obj.link_ancestors(samples_arr, ancestors_arr)
+        tbl = getattr(ts_obj, "tables", None)
+        if tbl is not None and hasattr(tbl, "link_ancestors"):
+            return tbl.link_ancestors(samples_arr, ancestors_arr)
+        raise RuntimeError(
+            "Neither TreeSequence.link_ancestors nor tables.link_ancestors is available "
+            "in this tskit/msprime build."
+        )
+
     def _source_index_from_pop_name(name: str) -> int:
         u = str(name).upper()
         if "AFR" in u:
@@ -296,11 +434,11 @@ def _true_ancestry_proportions(
         raise RuntimeError("No source-labeled ancestor nodes found; cannot compute ancestry proportions.")
 
     uniq_times = np.unique(candidate_times)
-    requested = float(ancestry_census_time)
+    requested = float(census_time)
     exact_match = bool(np.any(np.isclose(candidate_times, requested, rtol=0.0, atol=1e-9)))
     if not exact_match:
         raise RuntimeError(
-            f"Requested ancestry_census_time={requested:.6f} is not present. "
+            f"Required internal census_time={requested:.6f} is not present. "
             f"Available times include: {uniq_times[:20].tolist()} (showing up to 20)."
         )
     selected_time = requested
@@ -309,7 +447,7 @@ def _true_ancestry_proportions(
     anc_nodes = np.nonzero(anc_mask)[0].astype(np.int32, copy=False)
     if anc_nodes.size == 0:
         raise RuntimeError(
-            f"No ancestors found at requested ancestry_census_time={selected_time:.6f}."
+            f"No ancestors found at required internal census_time={selected_time:.6f}."
         )
 
     # Only census-time ancestors are valid ancestry sources for attribution.
@@ -327,7 +465,7 @@ def _true_ancestry_proportions(
 
     t0 = time.perf_counter()
     _ancestry_mark(log_prefix, 5.0, "running link_ancestors")
-    edges = ts.link_ancestors(sample_nodes_arr, anc_nodes)
+    edges = _link_ancestors_edges(ts, sample_nodes_arr, anc_nodes)
     _ancestry_mark(log_prefix, 20.0, f"link_ancestors complete (edges={len(edges)})")
     parents = np.asarray(edges.parent, dtype=np.int64)
     children = np.asarray(edges.child, dtype=np.int64)
@@ -453,6 +591,43 @@ def _true_ancestry_proportions(
     return afr, eur, asia
 
 
+def _model_defined_census_time(model) -> float:
+    """
+    Choose the three-pop ancestry census time from the model itself.
+    For AmericanAdmixture_4B18, use just after the ADMIX->(AFR,EUR,ASIA)
+    mass-migration event when tracing backward in time.
+    """
+    pop_name_to_id: dict[str, int] = {}
+    for i, p in enumerate(getattr(model, "populations", [])):
+        name = str(getattr(p, "name", f"pop_{i}")).upper()
+        pop_id = int(getattr(p, "id", i))
+        pop_name_to_id[name] = pop_id
+
+    if "ADMIX" not in pop_name_to_id:
+        raise RuntimeError(
+            "Model is missing ADMIX population; cannot derive three-pop ancestry census time."
+        )
+    admix_id = int(pop_name_to_id["ADMIX"])
+
+    admix_source_times: list[float] = []
+    for ev in getattr(model, "events", []):
+        ev_name = type(ev).__name__
+        if ev_name != "MassMigration":
+            continue
+        if int(getattr(ev, "source", -1)) == admix_id:
+            admix_source_times.append(float(getattr(ev, "time")))
+
+    if not admix_source_times:
+        raise RuntimeError(
+            "Could not find ADMIX source mass-migration event in model; "
+            "cannot derive three-pop ancestry census time."
+        )
+
+    tadmix = min(admix_source_times)
+    eps = max(1e-6, 1e-6 * max(1.0, abs(tadmix)))
+    return float(tadmix + eps)
+
+
 def _simulate(
     seed: int,
     pgs_effects: np.ndarray,
@@ -465,7 +640,6 @@ def _simulate(
     pca_n_sites: int,
     causal_max_sites: int,
     bp_cap: int | None,
-    ancestry_census_time: float,
     ancestry_threads: int,
 ) -> pd.DataFrame:
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -475,13 +649,17 @@ def _simulate(
     _log(
         f"[{run_id}] Simulation start "
         f"(model={msprime_model}, n_train_eur={n_train_eur}, n_test_per_pop={n_test_per_pop}, "
-        f"bp_cap={bp_cap}, ancestry_census_time={ancestry_census_time})"
+        f"bp_cap={bp_cap})"
     )
     _stage_mark(run_id, 1, total_steps, "stdpopsim setup")
     _log(f"[{run_id}] Loading stdpopsim species/model")
     t0 = time.perf_counter()
     species = stdpopsim.get_species("HomSap")
     model = species.get_demographic_model("AmericanAdmixture_4B18")
+    census_time = _model_defined_census_time(model.model)
+    model.model.add_census(census_time)
+    model.model.sort_events()
+    _log(f"[{run_id}] Using model-defined ancestry census time: {census_time:.6f} generations ago")
     if bp_cap is not None:
         # For short debug runs, switch to a generic capped contig.
         contig = species.get_contig(
@@ -501,95 +679,173 @@ def _simulate(
         "ASIA": n_test_per_pop,
         "ADMIX": n_test_per_pop,
     }
-
-    simulate_kwargs = {
-        "seed": seed,
-        "msprime_model": msprime_model,
-        "record_migrations": True,
+    expected_ckpt_meta = {
+        "seed": int(seed),
+        "msprime_model": str(msprime_model),
+        "n_train_eur": int(n_train_eur),
+        "n_test_per_pop": int(n_test_per_pop),
+        "pca_n_sites": int(pca_n_sites),
+        "causal_max_sites": int(causal_max_sites),
+        "bp_cap": None if bp_cap is None else int(bp_cap),
+        "sequence_length": int(contig.length),
+        "n_pcs": int(N_PCS),
+        "census_time": float(census_time),
     }
-    _stage_mark(run_id, 2, total_steps, "stdpopsim/msprime simulate")
-    _log(f"[{run_id}] Running stdpopsim/msprime simulate")
-    t0 = time.perf_counter()
-    ts = engine.simulate(model, contig, samples, **simulate_kwargs)
-    _stage_done(
-        run_id,
-        "stdpopsim simulate",
-        t0,
-        extra=f"(nodes={ts.num_nodes}, edges={ts.num_edges}, sites={ts.num_sites}, trees={ts.num_trees})",
-    )
+    ancestry_future: concurrent.futures.Future | None = None
+    ancestry_pool: concurrent.futures.ThreadPoolExecutor | None = None
+    overlap_ancestry_threads = max(1, int(round(float(max(1, int(ancestry_threads))) * 0.35)))
 
-    _stage_mark(run_id, 3, total_steps, "diploid sample mapping")
-    _log(f"[{run_id}] Extracting diploid sample mappings")
-    t0 = time.perf_counter()
-    a_idx, b_idx, pop_idx, ts_ind_id = diploid_index_pairs(ts)
-    pop_lookup = pop_names_from_ts(ts)
-    pop_label = np.array([pop_lookup.get(int(p), f"pop_{int(p)}") for p in pop_idx], dtype=object)
-    _stage_done(run_id, "sample mapping", t0, extra=f"(diploids={len(pop_label)}, haploids={len(ts.samples())})")
+    ckpt = _load_stage8_checkpoint(out_dir, int(seed), run_id, expected_ckpt_meta)
+    if ckpt is not None:
+        (
+            ts,
+            a_idx,
+            b_idx,
+            pop_label,
+            ts_ind_id,
+            pcs,
+            G_true,
+            ts_sites,
+            causal_overlap,
+            het_by_pop,
+            causal_pos_1based,
+        ) = ckpt
+        pop_lookup = pop_names_from_ts(ts)
+        _stage_mark(run_id, 6, total_steps, "feature extraction complete (checkpoint)")
+        _stage_mark(run_id, 7, total_steps, "true-effect diagnostics (checkpoint)")
+        _stage_mark(run_id, 8, total_steps, "ready for ancestry (checkpoint)")
+    else:
+        simulate_kwargs = {
+            "seed": seed,
+            "msprime_model": msprime_model,
+            "record_migrations": True,
+        }
+        _stage_mark(run_id, 2, total_steps, "stdpopsim/msprime simulate")
+        _log(f"[{run_id}] Running stdpopsim/msprime simulate")
+        t0 = time.perf_counter()
+        ts = engine.simulate(model, contig, samples, **simulate_kwargs)
+        _stage_done(
+            run_id,
+            "stdpopsim simulate",
+            t0,
+            extra=f"(nodes={ts.num_nodes}, edges={ts.num_edges}, sites={ts.num_sites}, trees={ts.num_trees})",
+        )
 
-    _stage_mark(run_id, 4, total_steps, "sample PCA + causal sites")
-    _log(f"[{run_id}] Sampling PCA+causal sites in one pass")
-    t0 = time.perf_counter()
-    pca_sites, causal_sites = sample_two_site_sets_for_maf(
-        ts,
-        a_idx,
-        b_idx,
-        pca_n_sites=pca_n_sites,
-        pca_maf_min=0.05,
-        pca_seed=seed + 11,
-        causal_n_sites=min(causal_max_sites, int(ts.num_sites)),
-        causal_maf_min=0.01,
-        causal_seed=seed + 17,
-        log_fn=_log,
-        progress_label=f"{run_id} site_scan",
-    )
-    _stage_done(
-        run_id,
-        "sample PCA+causal sites",
-        t0,
-        extra=f"(pca_selected={len(pca_sites)}, causal_selected={len(causal_sites)})",
-    )
-    _stage_mark(run_id, 5, total_steps, "compute PCs")
-    _log(f"[{run_id}] Computing PCs + risk + diagnostics in one pass")
-    t0 = time.perf_counter()
-    pcs, G_true, ts_sites, causal_overlap, het_by_pop, causal_pos_1based = compute_pcs_risk_and_diagnostics(
-        ts,
-        a_idx,
-        b_idx,
-        pop_label,
-        pca_site_ids=pca_sites,
-        n_pcs=N_PCS,
-        pca_seed=seed + 13,
-        causal_site_ids=causal_sites,
-        real_effects=pgs_effects,
-        causal_seed=seed + 19,
-        log_fn=_log,
-        progress_label=f"{run_id} feature_build",
-    )
-    _stage_done(run_id, "compute PCs+risk+diagnostics", t0)
-    _stage_mark(run_id, 6, total_steps, "feature extraction complete")
-    _stage_mark(run_id, 7, total_steps, "true-effect diagnostics")
-    _stage_mark(run_id, 8, total_steps, "ready for ancestry")
+        _stage_mark(run_id, 3, total_steps, "diploid sample mapping")
+        _log(f"[{run_id}] Extracting diploid sample mappings")
+        t0 = time.perf_counter()
+        a_idx, b_idx, pop_idx, ts_ind_id = diploid_index_pairs(ts)
+        pop_lookup = pop_names_from_ts(ts)
+        pop_label = np.array([pop_lookup.get(int(p), f"pop_{int(p)}") for p in pop_idx], dtype=object)
+        _stage_done(run_id, "sample mapping", t0, extra=f"(diploids={len(pop_label)}, haploids={len(ts.samples())})")
+        _stage_mark(run_id, 9, total_steps, "ancestry proportions (async start)")
+        _log(
+            f"[{run_id}] Starting ancestry proportions in parallel "
+            f"(ancestry_threads={overlap_ancestry_threads})"
+        )
+        ancestry_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        ancestry_future = ancestry_pool.submit(
+            _true_ancestry_proportions,
+            ts,
+            a_idx,
+            b_idx,
+            pop_lookup,
+            census_time,
+            overlap_ancestry_threads,
+            run_id,
+        )
+
+        _stage_mark(run_id, 4, total_steps, "sample PCA + causal sites")
+        _log(f"[{run_id}] Sampling PCA+causal sites in one pass")
+        t0 = time.perf_counter()
+        pca_sites, causal_sites = sample_two_site_sets_for_maf(
+            ts,
+            a_idx,
+            b_idx,
+            pca_n_sites=pca_n_sites,
+            pca_maf_min=0.05,
+            pca_seed=seed + 11,
+            causal_n_sites=min(causal_max_sites, int(ts.num_sites)),
+            causal_maf_min=0.01,
+            causal_seed=seed + 17,
+            log_fn=_log,
+            progress_label=f"{run_id} site_scan",
+        )
+        _stage_done(
+            run_id,
+            "sample PCA+causal sites",
+            t0,
+            extra=f"(pca_selected={len(pca_sites)}, causal_selected={len(causal_sites)})",
+        )
+        _stage_mark(run_id, 5, total_steps, "compute PCs")
+        _log(f"[{run_id}] Computing PCs + risk + diagnostics in one pass")
+        t0 = time.perf_counter()
+        pcs, G_true, ts_sites, causal_overlap, het_by_pop, causal_pos_1based = compute_pcs_risk_and_diagnostics(
+            ts,
+            a_idx,
+            b_idx,
+            pop_label,
+            pca_site_ids=pca_sites,
+            n_pcs=N_PCS,
+            pca_seed=seed + 13,
+            causal_site_ids=causal_sites,
+            real_effects=pgs_effects,
+            causal_seed=seed + 19,
+            log_fn=_log,
+            progress_label=f"{run_id} feature_build",
+        )
+        _stage_done(run_id, "compute PCs+risk+diagnostics", t0)
+        _stage_mark(run_id, 6, total_steps, "feature extraction complete")
+        _stage_mark(run_id, 7, total_steps, "true-effect diagnostics")
+        _stage_mark(run_id, 8, total_steps, "ready for ancestry")
+        _write_stage8_checkpoint(
+            out_dir=out_dir,
+            seed=int(seed),
+            run_id=run_id,
+            expected_meta=expected_ckpt_meta,
+            ts=ts,
+            a_idx=a_idx,
+            b_idx=b_idx,
+            pop_label=pop_label,
+            ts_ind_id=ts_ind_id,
+            pcs=pcs,
+            G_true=G_true,
+            causal_pos_1based=causal_pos_1based,
+            het_by_pop=het_by_pop,
+            ts_sites=int(ts_sites),
+            causal_overlap=int(causal_overlap),
+        )
+
+    true_effect_sites = int(len(causal_pos_1based))
     het_bits = ", ".join(f"{k}={v:.4f}" for k, v in sorted(het_by_pop.items()))
     _log(
         f"[{run_id}] Variant diagnostics: ts_sites={ts_sites}, "
-        f"true_effect_sites={len(causal_sites)}, overlap={causal_overlap}"
+        f"true_effect_sites={true_effect_sites}, overlap={causal_overlap}"
     )
     _log(f"[{run_id}] Mean heterozygosity at true-effect sites by pop: {het_bits}")
 
-    _stage_mark(run_id, 9, total_steps, "ancestry proportions")
-    _log(f"[{run_id}] Computing true ancestry proportions")
     rng = np.random.default_rng(seed + 23)
-    t0 = time.perf_counter()
-    afr_prop, eur_prop, asia_prop = _true_ancestry_proportions(
-        ts,
-        a_idx,
-        b_idx,
-        pop_lookup,
-        ancestry_census_time=ancestry_census_time,
-        ancestry_threads=ancestry_threads,
-        log_prefix=run_id,
-    )
-    _stage_done(run_id, "ancestry proportions", t0)
+    if ancestry_future is not None:
+        _log(f"[{run_id}] Waiting for asynchronous ancestry proportions")
+        t0 = time.perf_counter()
+        afr_prop, eur_prop, asia_prop = ancestry_future.result()
+        _stage_done(run_id, "ancestry proportions (async)", t0)
+        ancestry_pool.shutdown(wait=True)
+        ancestry_pool = None
+    else:
+        _stage_mark(run_id, 9, total_steps, "ancestry proportions")
+        _log(f"[{run_id}] Computing true ancestry proportions")
+        t0 = time.perf_counter()
+        afr_prop, eur_prop, asia_prop = _true_ancestry_proportions(
+            ts,
+            a_idx,
+            b_idx,
+            pop_lookup,
+            census_time=census_time,
+            ancestry_threads=ancestry_threads,
+            log_prefix=run_id,
+        )
+        _stage_done(run_id, "ancestry proportions", t0)
 
     _stage_mark(run_id, 10, total_steps, "sample phenotypes")
     _log(f"[{run_id}] Sampling phenotypes from liability model")
@@ -812,6 +1068,36 @@ def _cleanup_seed_artifacts(prefix: Path, seed_work_dir: Path) -> None:
         shutil.rmtree(seed_work_dir, ignore_errors=True)
 
 
+def _fit_predict_single_method(
+    method_name: str,
+    P_train: np.ndarray,
+    PC_train: np.ndarray,
+    y_train: np.ndarray,
+    P_test: np.ndarray,
+    PC_test: np.ndarray,
+    train_pop_labels: np.ndarray,
+    test_pop_labels: np.ndarray,
+) -> tuple[str, np.ndarray]:
+    if method_name == "raw":
+        method = RawPGSMethod(max_iter=1000)
+        method.fit(P_train, PC_train, y_train)
+        return method_name, method.predict_proba(P_test, PC_test)
+
+    if method_name == "linear":
+        method = LinearInteractionMethod(max_iter=1000)
+        method.fit(P_train, PC_train, y_train)
+        return method_name, method.predict_proba(P_test, PC_test)
+
+    if method_name == "normalized":
+        method = NormalizationMethod(n_pcs=N_PCS, max_iter=1000)
+        method.set_pop_labels(train_pop_labels)
+        method.fit(P_train, PC_train, y_train)
+        method.set_pop_labels(test_pop_labels)
+        return method_name, method.predict_proba(P_test, PC_test)
+
+    raise RuntimeError(f"Unknown method_name={method_name}")
+
+
 def _method_preds(train_df: pd.DataFrame, test_df: pd.DataFrame, train_prs: np.ndarray, test_prs: np.ndarray) -> dict[str, np.ndarray]:
     out: dict[str, np.ndarray] = {}
 
@@ -821,23 +1107,45 @@ def _method_preds(train_df: pd.DataFrame, test_df: pd.DataFrame, train_prs: np.n
     PC_train = train_df[[f"pc{i+1}" for i in range(N_PCS)]].to_numpy()
     PC_test = test_df[[f"pc{i+1}" for i in range(N_PCS)]].to_numpy()
     y_train = train_df["y"].to_numpy(dtype=np.int32)
+    train_pop = train_df["pop_label"].to_numpy(dtype=object)
+    test_pop = test_df["pop_label"].to_numpy(dtype=object)
 
-    methods = [
-        ("raw", RawPGSMethod(max_iter=1000)),
-        ("linear", LinearInteractionMethod(max_iter=1000)),
-        ("normalized", NormalizationMethod(n_pcs=N_PCS, max_iter=1000)),
-    ]
-
-    for name, method in methods:
-        if isinstance(method, NormalizationMethod):
-            method.set_pop_labels(train_df["pop_label"].to_numpy())
-            method.fit(P_train, PC_train, y_train)
-            method.set_pop_labels(test_df["pop_label"].to_numpy())
-            out[name] = method.predict_proba(P_test, PC_test)
-            continue
-
-        method.fit(P_train, PC_train, y_train)
-        out[name] = method.predict_proba(P_test, PC_test)
+    method_names = ["raw", "linear", "normalized"]
+    worker_count = len(method_names)
+    ctx = mp.get_context("fork") if "fork" in mp.get_all_start_methods() else mp.get_context()
+    try:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=worker_count, mp_context=ctx) as ex:
+            futs = [
+                ex.submit(
+                    _fit_predict_single_method,
+                    name,
+                    P_train,
+                    PC_train,
+                    y_train,
+                    P_test,
+                    PC_test,
+                    train_pop,
+                    test_pop,
+                )
+                for name in method_names
+            ]
+            for fut in concurrent.futures.as_completed(futs):
+                name, pred = fut.result()
+                out[name] = np.asarray(pred, dtype=float)
+    except Exception as e:
+        _log(f"[fig2] parallel method fitting failed; falling back to sequential ({type(e).__name__}: {e})")
+        for name in method_names:
+            key, pred = _fit_predict_single_method(
+                name,
+                P_train,
+                PC_train,
+                y_train,
+                P_test,
+                PC_test,
+                train_pop,
+                test_pop,
+            )
+            out[key] = np.asarray(pred, dtype=float)
 
     gm = GAMMethod(k_pgs=4, k_pc=4, k_interaction=3, use_ti=True)
     gm.fit(P_train, PC_train, y_train)
@@ -1038,12 +1346,6 @@ def main() -> None:
     parser.add_argument("--pca-sites", type=int, default=2000)
     parser.add_argument("--causal-sites", type=int, default=5000)
     parser.add_argument("--bp-cap", type=int, default=None)
-    parser.add_argument(
-        "--ancestry-census-time",
-        type=float,
-        default=100.0,
-        help="Census time (generations ago) used to define ancestry source nodes.",
-    )
     parser.add_argument("--threads", type=int, default=None, help="Thread count for PLINK/PRS. Default uses node allocation.")
     parser.add_argument("--memory-mb", type=int, default=None, help="PLINK memory limit (MB). Default auto-sizes from node RAM.")
     parser.add_argument("--work-root", default=None, help="Directory for heavy transient work files (e.g., RAM disk).")
@@ -1102,7 +1404,6 @@ def main() -> None:
             pca_n_sites=int(args.pca_sites),
             causal_max_sites=int(args.causal_sites),
             bp_cap=args.bp_cap,
-            ancestry_census_time=float(args.ancestry_census_time),
             ancestry_threads=threads,
         )
     seed_work = work_root / f"work_s{seed}"
