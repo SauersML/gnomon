@@ -154,7 +154,7 @@ esac
 log_success "Detected: ${BOLD}${OS}/${ARCH}${RESET}"
 log_info "Target release asset: ${BOLD}${TARGET_ASSET}${RESET}"
 
-# --- 2. Find Latest Binary Release ---
+# --- 2. Find Latest Published Binary Release ---
 log_header "Checking Published Binary Releases"
 
 # Fetch all releases to find the most recent one with binary assets
@@ -170,70 +170,14 @@ elif [ -n "$GH_TOKEN" ]; then
     CURL_ARGS+=(-H "Authorization: token $GH_TOKEN")
 fi
 
-MAX_RETRIES=30
-DELAY=5
 DOWNLOAD_URL=""
 RELEASE_TAG=""
-MAIN_SHA=""
-EXPECTED_TAG=""
-USED_FALLBACK=0
-
-MAIN_RESPONSE="$(curl "${CURL_ARGS[@]}" "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/commits/main" || true)"
-MAIN_SHA="$(echo "$MAIN_RESPONSE" | sed -n 's/^[[:space:]]*"sha":[[:space:]]*"\([0-9a-f]\{40\}\)".*/\1/p' | head -n 1)"
-
-if [ -n "$MAIN_SHA" ]; then
-    EXPECTED_TAG="main-${MAIN_SHA}"
-    log_info "Looking for release matching latest main commit: ${BOLD}${EXPECTED_TAG}${RESET}"
-    TAG_URL="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/tags/${EXPECTED_TAG}?_=$(date +%s)"
-
-    for ((i=1; i<=MAX_RETRIES; i++)); do
-        RELEASE_RESPONSE="$(curl "${CURL_ARGS[@]}" "${TAG_URL}" || true)"
-        DOWNLOAD_URL=$(echo "$RELEASE_RESPONSE" | \
-            grep "browser_download_url.*${TARGET_ASSET}" | \
-            cut -d '"' -f 4 | \
-            head -n 1)
-
-        if [ -n "$DOWNLOAD_URL" ]; then
-            RELEASE_TAG="$EXPECTED_TAG"
-            break
-        fi
-
-        if [ $i -eq 1 ] || [ $((i % 5)) -eq 0 ]; then
-            log_info "Release for ${EXPECTED_TAG} not published yet (Attempt $i/$MAX_RETRIES)."
-        fi
-
-        if [ $i -lt $MAX_RETRIES ]; then
-            sleep $DELAY
-        fi
-    done
-fi
-
-if [ -z "$DOWNLOAD_URL" ]; then
-    USED_FALLBACK=1
-    log_info "Falling back to latest published binary release."
-    for ((i=1; i<=MAX_RETRIES; i++)); do
-        # Only print "Fetching..." on first attempt or every 5th retry to reduce log noise
-        if [ $i -eq 1 ] || [ $((i % 5)) -eq 0 ]; then
-            log_info "Fetching releases from GitHub (Attempt $i/$MAX_RETRIES)..."
-        fi
-
-        RESPONSE=$(curl "${CURL_ARGS[@]}" "${API_URL}" || true)
-
-        # Find the first release that contains the target asset
-        DOWNLOAD_URL=$(echo "$RESPONSE" | \
-            grep "browser_download_url.*${TARGET_ASSET}" | \
-            cut -d '"' -f 4 | \
-            head -n 1)
-
-        if [ -n "$DOWNLOAD_URL" ]; then
-            break
-        fi
-
-        if [ $i -lt $MAX_RETRIES ]; then
-            sleep $DELAY
-        fi
-    done
-fi
+log_info "Resolving latest published release with asset ${BOLD}${TARGET_ASSET}${RESET}."
+RESPONSE="$(curl "${CURL_ARGS[@]}" "${API_URL}" || true)"
+DOWNLOAD_URL="$(echo "$RESPONSE" | \
+    grep "browser_download_url.*${TARGET_ASSET}" | \
+    cut -d '"' -f 4 | \
+    head -n 1)"
 
 if [ -z "$DOWNLOAD_URL" ]; then
     log_error "Could not find a download URL for ${TARGET_ASSET} in any release."
@@ -247,12 +191,7 @@ fi
 if [ -z "$RELEASE_TAG" ]; then
     RELEASE_TAG="$(echo "$DOWNLOAD_URL" | sed -n 's#.*/download/\([^/]*\)/.*#\1#p' | head -n 1)"
 fi
-if [ "$USED_FALLBACK" -eq 1 ] && [ -n "$EXPECTED_TAG" ]; then
-    log_info "Release for latest main commit (${EXPECTED_TAG}) is not published yet."
-    log_success "Using latest published binary release instead."
-else
-    log_success "Found release for latest main commit."
-fi
+log_success "Using latest published binary release."
 if [ -n "$RELEASE_TAG" ]; then
     log_info "Selected release tag: ${BOLD}${RELEASE_TAG}${RESET}"
 fi
