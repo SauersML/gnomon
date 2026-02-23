@@ -436,6 +436,58 @@ def _cleanup_generation_artifacts(prefix: Path, work_dir: Path) -> None:
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
+def _reuse_cache_dir(base_dir: Path) -> Path:
+    return base_dir / "_reuse_cache"
+
+
+def _cache_link_or_copy(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_suffix(dst.suffix + ".tmp")
+    tmp.unlink(missing_ok=True)
+    try:
+        os.link(src, tmp)
+    except OSError:
+        shutil.copy2(src, tmp)
+    os.replace(tmp, dst)
+
+
+def _publish_reuse_cache(prefix: Path, out_dir: Path, run_id: str) -> Path:
+    cache_dir = _reuse_cache_dir(out_dir)
+    needed = [Path(f"{prefix}.bed"), Path(f"{prefix}.bim"), Path(f"{prefix}.fam"), Path(f"{prefix}.tsv")]
+    miss = [str(p) for p in needed if not p.exists()]
+    if miss:
+        raise FileNotFoundError(f"[{run_id}] Cannot publish reuse cache; missing files: {miss}")
+    for src in needed:
+        _cache_link_or_copy(src, cache_dir / src.name)
+    _log(f"[{run_id}] Reuse cache updated at {cache_dir}")
+    return cache_dir
+
+
+def _resolve_existing_source(g: int, seed: int, out_dir: Path, use_existing_dir: Path | None) -> tuple[Path, Path]:
+    stem = f"fig1_g{g}_s{seed}"
+    candidates: list[Path] = []
+    if use_existing_dir is not None:
+        candidates.append(use_existing_dir)
+        candidates.append(_reuse_cache_dir(use_existing_dir))
+    candidates.append(_reuse_cache_dir(out_dir))
+    candidates.append(out_dir)
+
+    missing_paths: list[str] = []
+    for base in candidates:
+        prefix = base / stem
+        sim_tsv = base / f"{stem}.tsv"
+        needed = [Path(f"{prefix}.bed"), Path(f"{prefix}.bim"), Path(f"{prefix}.fam"), sim_tsv]
+        if all(p.exists() for p in needed):
+            return prefix, sim_tsv
+        missing_paths.extend(str(p) for p in needed if not p.exists())
+
+    uniq_missing = sorted(set(missing_paths))
+    raise FileNotFoundError(
+        f"[fig1_g{g}_s{seed}] --use-existing requested, but required files were not found "
+        f"in searched locations. Missing candidates include: {uniq_missing}"
+    )
+
+
 def _fit_and_predict_methods(train_df: pd.DataFrame, test_df: pd.DataFrame, train_prs: np.ndarray, test_prs: np.ndarray) -> dict[str, np.ndarray]:
     out: dict[str, np.ndarray] = {}
 
@@ -717,20 +769,15 @@ def _run_generation_task(task: dict[str, object]) -> dict[str, object]:
     _set_runtime_thread_env(threads_per_job)
     _log(f"[fig1_g{g}_s{seed}] Runtime resources set (threads={threads_per_job}, memory_mb={memory_mb_per_job})")
 
-    prefix = str(out_dir / f"fig1_g{g}_s{seed}")
-    source_base = use_existing_dir if use_existing_dir is not None else out_dir
-    source_prefix = source_base / f"fig1_g{g}_s{seed}"
-    sim_tsv = source_base / f"fig1_g{g}_s{seed}.tsv"
+    run_id = f"fig1_g{g}_s{seed}"
+    prefix_path = out_dir / run_id
+    prefix = str(prefix_path)
     if use_existing:
-        needed = [Path(f"{source_prefix}.bed"), Path(f"{source_prefix}.bim"), Path(f"{source_prefix}.fam"), sim_tsv]
-        miss = [str(p) for p in needed if not p.exists()]
-        if miss:
-            raise FileNotFoundError(
-                f"[fig1_g{g}_s{seed}] --use-existing requested, but missing files: {miss}"
-            )
-        _log(f"[fig1_g{g}_s{seed}] Reusing existing simulation/PLINK files from {source_base}")
+        source_prefix, sim_tsv = _resolve_existing_source(g, seed, out_dir, use_existing_dir)
+        _log(f"[{run_id}] Reusing existing simulation/PLINK files from {source_prefix.parent}")
         df = pd.read_csv(sim_tsv, sep="\t")
     else:
+        source_prefix = prefix_path
         df = _simulate_for_generation(
             g,
             seed,
@@ -747,6 +794,9 @@ def _run_generation_task(task: dict[str, object]) -> dict[str, object]:
             causal_max_sites=causal_max_sites,
             bp_cap=(int(bp_cap) if bp_cap is not None else None),
         )
+        # Publish reusable simulation artifacts immediately so downstream failures
+        # do not force re-simulation on restart with --use-existing.
+        _publish_reuse_cache(prefix=prefix_path, out_dir=out_dir, run_id=run_id)
     work = work_root / f"fig1_g{g}_s{seed}_work"
     train_prefix, test_prefix, train_phen, freq_file = _prepare_bayesr_files(
         df,
