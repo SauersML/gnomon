@@ -186,10 +186,10 @@ pub struct PreparationResult {
     pub complex_rules: Vec<GroupedComplexRule>,
     /// A map from a person's original .fam index to their compact output index.
     /// `None` if the person is not in the scored subset.
-    pub person_fam_to_output_idx: Vec<Option<u32>>,
+    pub person_fam_to_output_idx: Vec<Option<OutputPersonIndex>>,
     /// A map from the final, compact output index back to the original .fam file index.
     /// This is a critical optimization for the variant-major path.
-    pub output_idx_to_fam_idx: Vec<u32>,
+    pub output_idx_to_fam_idx: Vec<OriginalPersonIndex>,
     /// The names of the scores being calculated, corresponding to matrix columns.
     pub score_names: Vec<String>,
     /// A vector containing the total number of variants that contribute to each score.
@@ -247,8 +247,8 @@ impl PreparationResult {
         total_variants_in_bim: u64,
         num_reconciled_variants: usize,
         bytes_per_variant: u64,
-        person_fam_to_output_idx: Vec<Option<u32>>,
-        output_idx_to_fam_idx: Vec<u32>,
+        person_fam_to_output_idx: Vec<Option<OutputPersonIndex>>,
+        output_idx_to_fam_idx: Vec<OriginalPersonIndex>,
         required_is_complex: Vec<u8>,
         spool_compact_byte_index: Vec<u32>,
         spool_dense_map: Vec<i32>,
@@ -316,13 +316,32 @@ impl PreparationResult {
     }
 
     #[inline(always)]
-    pub fn sparse_row_range(&self, variant_idx: usize) -> std::ops::Range<usize> {
-        debug_assert!(variant_idx + 1 < self.sparse_row_offsets.len());
-        let start = self.sparse_row_offsets[variant_idx] as usize;
-        let end = self.sparse_row_offsets[variant_idx + 1] as usize;
+    pub fn sparse_row_range(&self, variant_idx: ReconciledVariantIndex) -> std::ops::Range<usize> {
+        let idx = variant_idx.0 as usize;
+        debug_assert!(idx + 1 < self.sparse_row_offsets.len());
+        let start = self.sparse_row_offsets[idx] as usize;
+        let end = self.sparse_row_offsets[idx + 1] as usize;
         debug_assert!(end >= start);
         debug_assert!(end <= self.sparse_weights.len());
         start..end
+    }
+
+    #[inline(always)]
+    pub fn variant_csr_view(&self, reconciled_idx: ReconciledVariantIndex) -> VariantCsrView<'_> {
+        let range = self.sparse_row_range(reconciled_idx);
+        VariantCsrView {
+            score_columns: &self.sparse_score_columns[range.clone()],
+            weights: &self.sparse_weights[range.clone()],
+            missing_corrections: &self.sparse_missing_corrections[range],
+        }
+    }
+
+    #[inline(always)]
+    pub fn original_person_index_for_output(
+        &self,
+        output_idx: OutputPersonIndex,
+    ) -> OriginalPersonIndex {
+        self.output_idx_to_fam_idx[output_idx.0 as usize]
     }
 
     #[inline(always)]
@@ -358,6 +377,11 @@ impl PreparationResult {
 #[repr(transparent)]
 pub struct OriginalPersonIndex(pub u32);
 
+/// An index into the compact, scored output person domain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct OutputPersonIndex(pub u32);
+
 /// An index into the original, full .bim file.
 /// This wraps a u64, which is sufficient for a virtually unlimited number of
 /// variants when merging filesets. This is a zero-cost abstraction.
@@ -375,6 +399,52 @@ pub struct ReconciledVariantIndex(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
 pub struct ScoreColumnIndex(pub usize);
+
+/// An index into the flattened CSR non-zero entry arrays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct CsrEntryIndex(pub usize);
+
+/// One matched non-zero CSR contribution for a variant.
+#[derive(Debug, Clone, Copy)]
+pub struct CsrContribution {
+    pub score_column: ScoreColumnIndex,
+    pub weight: f32,
+    pub missing_correction: f32,
+}
+
+/// A read-only view over one variant's CSR contributions.
+#[derive(Debug, Clone, Copy)]
+pub struct VariantCsrView<'a> {
+    score_columns: &'a [u32],
+    weights: &'a [f32],
+    missing_corrections: &'a [f32],
+}
+
+impl<'a> VariantCsrView<'a> {
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.score_columns.is_empty()
+    }
+
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        self.score_columns.len()
+    }
+
+    #[inline(always)]
+    pub fn iter(&self) -> impl Iterator<Item = CsrContribution> + 'a {
+        self.score_columns
+            .iter()
+            .zip(self.weights)
+            .zip(self.missing_corrections)
+            .map(|((&col_u32, &weight), &missing_correction)| CsrContribution {
+                score_column: ScoreColumnIndex(col_u32 as usize),
+                weight,
+                missing_correction,
+            })
+    }
+}
 
 /// A `#[repr(transparent)]` wrapper for a dosage value.
 ///

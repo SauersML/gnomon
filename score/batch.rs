@@ -14,7 +14,7 @@
 
 use crate::score::kernel;
 use crate::score::types::{
-    EffectAlleleDosage, OriginalPersonIndex, PersonSubset, PreparationResult,
+    EffectAlleleDosage, OriginalPersonIndex, OutputPersonIndex, PreparationResult,
     ReconciledVariantIndex,
 };
 use crossbeam_queue::ArrayQueue;
@@ -69,12 +69,14 @@ pub fn run_person_major_path(
     // on different threads. This avoids thread pool exhaustion and is highly
     // cache-friendly, as each thread works on its own disjoint data blocks.
     let num_scores = prep_result.score_names.len();
+    if num_scores > kernel::MAX_SUPPORTED_SCORES {
+        return Err(Box::from(format!(
+            "Kernel supports at most {} scores, but run requested {}.",
+            kernel::MAX_SUPPORTED_SCORES,
+            num_scores
+        )));
+    }
     let items_per_block = PERSON_BLOCK_SIZE * num_scores;
-
-    let person_indices_to_process = match &prep_result.person_subset {
-        PersonSubset::All => None, // Will generate ranges on the fly.
-        PersonSubset::Indices(indices) => Some(indices),
-    };
 
     partial_scores_out
         .chunks_mut(items_per_block)
@@ -93,20 +95,9 @@ pub fn run_person_major_path(
                 // This temporary Vec holds the original FAM indices for only the people
                 // in the current block. This is a small, fast allocation.
                 let person_indices_in_block: Vec<OriginalPersonIndex> =
-                    if let Some(indices) = person_indices_to_process {
-                        // Case 1: Using a '--keep' file. We take a slice of the pre-sorted
-                        // FAM indices that correspond to our current output block.
-                        indices[person_output_start_idx..person_output_end_idx]
-                            .iter()
-                            .map(|&fam_idx| OriginalPersonIndex(fam_idx))
-                            .collect()
-                    } else {
-                        // Case 2: Scoring all people. The FAM index is the same as the
-                        // output index. We can generate this range on the fly.
-                        (person_output_start_idx as u32..person_output_end_idx as u32)
-                            .map(OriginalPersonIndex)
-                            .collect()
-                    };
+                    prep_result.output_idx_to_fam_idx
+                        [person_output_start_idx..person_output_end_idx]
+                        .to_vec();
 
                 process_block(
                     &person_indices_in_block,
@@ -353,20 +344,17 @@ pub(crate) fn process_tile_impl<'a>(
                         3 => {
                             // Handle missing genotype inline
                             let variant_idx_in_chunk = variant_mini_batch_start + i;
-                            let global_matrix_row_idx = reconciled_variant_indices_for_batch
-                                [variant_idx_in_chunk]
-                                .0 as usize;
-                            let sparse_range = prep_result.sparse_row_range(global_matrix_row_idx);
-                            let sparse_cols =
-                                &prep_result.sparse_score_columns()[sparse_range.clone()];
+                            let reconciled_variant =
+                                reconciled_variant_indices_for_batch[variant_idx_in_chunk];
+                            let variant_view = prep_result.variant_csr_view(reconciled_variant);
                             let weight_row_offset = i * stride;
                             let person_scores_slice = &mut block_scores_out
                                 [person_idx * num_scores..(person_idx + 1) * num_scores];
                             let person_missing_counts_slice = &mut block_missing_counts_out
                                 [person_idx * num_scores..(person_idx + 1) * num_scores];
 
-                            for &score_col_u32 in sparse_cols {
-                                let score_col = score_col_u32 as usize;
+                            for contribution in variant_view.iter() {
+                                let score_col = contribution.score_column.0;
                                 person_missing_counts_slice[score_col] += 1;
                                 person_scores_slice[score_col] -=
                                     missing_corr_chunk[weight_row_offset + score_col] as f64;
@@ -393,18 +381,17 @@ pub(crate) fn process_tile_impl<'a>(
                     }
                     3 => {
                         let variant_idx_in_chunk = variant_mini_batch_start + i;
-                        let global_matrix_row_idx =
-                            reconciled_variant_indices_for_batch[variant_idx_in_chunk].0 as usize;
-                        let sparse_range = prep_result.sparse_row_range(global_matrix_row_idx);
-                        let sparse_cols = &prep_result.sparse_score_columns()[sparse_range];
+                        let reconciled_variant =
+                            reconciled_variant_indices_for_batch[variant_idx_in_chunk];
+                        let variant_view = prep_result.variant_csr_view(reconciled_variant);
                         let weight_row_offset = i * stride;
                         let person_scores_slice = &mut block_scores_out
                             [person_idx * num_scores..(person_idx + 1) * num_scores];
                         let person_missing_counts_slice = &mut block_missing_counts_out
                             [person_idx * num_scores..(person_idx + 1) * num_scores];
 
-                        for &score_col_u32 in sparse_cols {
-                            let score_col = score_col_u32 as usize;
+                        for contribution in variant_view.iter() {
+                            let score_col = contribution.score_column.0;
                             person_missing_counts_slice[score_col] += 1;
                             person_scores_slice[score_col] -=
                                 missing_corr_chunk[weight_row_offset + score_col] as f64;
@@ -626,10 +613,7 @@ pub fn run_variant_major_path(
     reconciled_variant_index: ReconciledVariantIndex,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let num_scores = prep_result.score_names.len();
-    let sparse_range = prep_result.sparse_row_range(reconciled_variant_index.0 as usize);
-    let cols = &prep_result.sparse_score_columns()[sparse_range.clone()];
-    let weights = &prep_result.sparse_weights()[sparse_range.clone()];
-    let missing_corr = &prep_result.sparse_missing_corrections()[sparse_range];
+    let variant_view = prep_result.variant_csr_view(reconciled_variant_index);
 
     // --- Main Compute Loop ---
     // This single loop iterates only over the individuals we need to score.
@@ -643,7 +627,10 @@ pub fn run_variant_major_path(
 
     for out_idx in 0..prep_result.num_people_to_score {
         // Use a pre-computed map to find the original .fam index for this output slot.
-        let original_fam_idx = prep_result.output_idx_to_fam_idx[out_idx] as usize;
+        let output_person_idx = OutputPersonIndex(out_idx as u32);
+        let original_fam_idx = prep_result
+            .original_person_index_for_output(output_person_idx)
+            .0 as usize;
 
         // --- On-the-fly Genotype Decoding with Byte Caching ---
         // Only re-read the byte if we've moved to a new position. This reduces
@@ -666,10 +653,10 @@ pub fn run_variant_major_path(
             // Missing genotype (0b01).
             0b01 => {
                 let scores_offset = out_idx * num_scores;
-                for (&col_u32, &corr) in cols.iter().zip(missing_corr) {
-                    let col = col_u32 as usize;
+                for contribution in variant_view.iter() {
+                    let col = contribution.score_column.0;
                     partial_missing_counts_out[scores_offset + col] += 1;
-                    partial_scores_out[scores_offset + col] -= corr as f64;
+                    partial_scores_out[scores_offset + col] -= contribution.missing_correction as f64;
                 }
             }
 
@@ -677,9 +664,9 @@ pub fn run_variant_major_path(
             0b10 | 0b11 => {
                 let dosage = if packed_val == 0b10 { 1.0 } else { 2.0 };
                 let scores_offset = out_idx * num_scores;
-                for (&col_u32, &weight) in cols.iter().zip(weights) {
-                    let col = col_u32 as usize;
-                    let weight = weight as f64;
+                for contribution in variant_view.iter() {
+                    let col = contribution.score_column.0;
+                    let weight = contribution.weight as f64;
                     let adjustment = weight * dosage;
                     partial_scores_out[scores_offset + col] += adjustment;
                 }
@@ -711,10 +698,14 @@ mod tests {
         let sparse_score_columns = vec![0u32];
         let sparse_row_offsets = vec![0u64, 1u64];
 
-        let output_idx_to_fam_idx: Vec<u32> = (0..num_people as u32).collect();
+        let output_idx_to_fam_idx: Vec<crate::score::types::OriginalPersonIndex> =
+            (0..num_people as u32)
+                .map(crate::score::types::OriginalPersonIndex)
+                .collect();
         let mut person_fam_to_output_idx = vec![None; num_people];
         for (out_idx, fam_idx) in output_idx_to_fam_idx.iter().enumerate() {
-            person_fam_to_output_idx[*fam_idx as usize] = Some(out_idx as u32);
+            person_fam_to_output_idx[fam_idx.0 as usize] =
+                Some(crate::score::types::OutputPersonIndex(out_idx as u32));
         }
 
         PreparationResult::new(

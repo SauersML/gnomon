@@ -34,7 +34,7 @@ const BUFFER_POOL_SIZE: usize = 16384;
 const SPOOL_BUFFER_SIZE: usize = 8 * 1024 * 1024;
 const MIN_GPU_WORK: usize = 100_000;
 const MIN_MEGA_BATCH_VARIANTS: usize = 256;
-const MAX_MEGA_BATCH_VARIANTS: usize = 4096;
+const MAX_MEGA_BATCH_VARIANTS: usize = 16384;
 const PIPELINE_SLOTS: usize = 2;
 
 fn create_progress_bar(len: u64, message: &str) -> ProgressBar {
@@ -97,33 +97,43 @@ extern "C" __global__ void unpack_plink(
 }
 
 extern "C" __global__ void build_batch_mats(
-    const float* weights,
-    const float* missing_corrections,
-    const unsigned char* count_mask,
+    const float* sparse_weights,
+    const float* sparse_missing_corrections,
+    const unsigned int* sparse_columns,
+    const unsigned long long* sparse_row_offsets,
     const unsigned int* reconciled_indices,
     int batch_variants,
-    int stride,
     int num_scores,
     float* out_effective,
     float* out_missing_corr,
     float* out_count
 ) {
-    unsigned long long idx =
+    unsigned long long v =
         (unsigned long long)blockIdx.x * (unsigned long long)blockDim.x +
         (unsigned long long)threadIdx.x;
-    unsigned long long total =
-        (unsigned long long)batch_variants * (unsigned long long)num_scores;
-    if (idx >= total) return;
+    if (v >= (unsigned long long)batch_variants) return;
 
-    unsigned long long v = idx / (unsigned long long)num_scores;
-    unsigned long long s = idx % (unsigned long long)num_scores;
     unsigned int reconciled = reconciled_indices[v];
-    size_t src = (size_t)reconciled * (size_t)stride + (size_t)s;
+    size_t row_base = (size_t)v * (size_t)num_scores;
 
-    float w = weights[src];
-    out_count[idx] = count_mask[src] ? 1.0f : 0.0f;
-    out_effective[idx] = w;
-    out_missing_corr[idx] = -missing_corrections[src];
+    // Dense row init for GEMM inputs.
+    for (int s = 0; s < num_scores; ++s) {
+        size_t dst = row_base + (size_t)s;
+        out_effective[dst] = 0.0f;
+        out_missing_corr[dst] = 0.0f;
+        out_count[dst] = 0.0f;
+    }
+
+    unsigned long long start = sparse_row_offsets[reconciled];
+    unsigned long long end = sparse_row_offsets[reconciled + 1u];
+    for (unsigned long long p = start; p < end; ++p) {
+        unsigned int col = sparse_columns[p];
+        if (col >= (unsigned int)num_scores) continue;
+        size_t dst = row_base + (size_t)col;
+        out_effective[dst] = sparse_weights[p];
+        out_missing_corr[dst] = -sparse_missing_corrections[p];
+        out_count[dst] = 1.0f;
+    }
 }
 
 extern "C" __global__ void accumulate_outputs_f64(
@@ -172,9 +182,10 @@ struct CudaRuntime {
     unpack_kernel: CudaFunction,
     build_batch_mats_kernel: CudaFunction,
     accumulate_outputs_kernel: CudaFunction,
-    full_weights: CudaSlice<f32>,
-    full_missing_corrections: CudaSlice<f32>,
-    full_count_mask: CudaSlice<u8>,
+    sparse_weights: CudaSlice<f32>,
+    sparse_missing_corrections: CudaSlice<f32>,
+    sparse_columns: CudaSlice<u32>,
+    sparse_row_offsets: CudaSlice<u64>,
     output_map: CudaSlice<u32>,
     mega_batch_variants: usize,
     pinned_staging: Vec<PinnedHostSlice<u8>>,
@@ -227,7 +238,6 @@ struct CudaDims {
     num_scores: usize,
     bytes_per_variant: usize,
     result_size: usize,
-    stride: usize,
 }
 
 impl CudaDims {
@@ -240,7 +250,6 @@ impl CudaDims {
             num_scores,
             bytes_per_variant: prep_result.bytes_per_variant as usize,
             result_size,
-            stride: prep_result.stride(),
         })
     }
 
@@ -259,10 +268,6 @@ impl CudaDims {
         checked_i32("bytes_per_variant", self.bytes_per_variant)
     }
 
-    #[inline]
-    fn stride_i32(self) -> Result<i32, PipelineError> {
-        checked_i32("stride", self.stride)
-    }
 }
 
 #[derive(Copy, Clone)]
@@ -400,25 +405,31 @@ impl CudaRuntime {
         let (free_mem, _) = cudarc::driver::result::mem_get_info()
             .map_err(|e| format!("Failed to query device memory: {e:?}"))?;
 
-        let count_weights_len = prep
-            .num_reconciled_variants
-            .checked_mul(prep.stride())
-            .ok_or_else(|| "CUDA memory estimate overflow: count_weights_len".to_string())?;
-        let dense_host_staging_bytes = count_weights_len
-            .checked_mul(std::mem::size_of::<f32>() * 2 + std::mem::size_of::<u8>())
-            .ok_or_else(|| "CUDA memory estimate overflow: dense_host_staging_bytes".to_string())?;
-        const MAX_DENSE_HOST_STAGING_BYTES: usize = 2 * 1024 * 1024 * 1024;
-        if dense_host_staging_bytes > MAX_DENSE_HOST_STAGING_BYTES {
-            return Err(format!(
-                "dense CUDA staging would require {:.2} GiB host RAM (limit {:.2} GiB); using CPU backend",
-                dense_host_staging_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-                MAX_DENSE_HOST_STAGING_BYTES as f64 / (1024.0 * 1024.0 * 1024.0)
-            ));
-        }
-        let static_bytes = count_weights_len
+        let static_bytes = prep
+            .sparse_weights()
+            .len()
             .checked_mul(std::mem::size_of::<f32>())
-            .and_then(|v| v.checked_add(count_weights_len.checked_mul(std::mem::size_of::<f32>())?))
-            .and_then(|v| v.checked_add(count_weights_len.checked_mul(std::mem::size_of::<u8>())?))
+            .and_then(|v| {
+                v.checked_add(
+                    prep.sparse_missing_corrections()
+                        .len()
+                        .checked_mul(std::mem::size_of::<f32>())?,
+                )
+            })
+            .and_then(|v| {
+                v.checked_add(
+                    prep.sparse_score_columns()
+                        .len()
+                        .checked_mul(std::mem::size_of::<u32>())?,
+                )
+            })
+            .and_then(|v| {
+                v.checked_add(
+                    prep.sparse_row_offsets()
+                        .len()
+                        .checked_mul(std::mem::size_of::<u64>())?,
+                )
+            })
             .and_then(|v| {
                 v.checked_add(
                     prep.output_idx_to_fam_idx
@@ -493,35 +504,22 @@ impl CudaRuntime {
             return Err("Insufficient GPU memory for minimum CUDA mega-batch".to_string());
         }
 
-        let mut host_weights = vec![0.0f32; count_weights_len];
-        let mut host_missing_corrections = vec![0.0f32; count_weights_len];
-        let mut host_count_mask = vec![0u8; count_weights_len];
-        for variant_idx in 0..prep.num_reconciled_variants {
-            let row_off = variant_idx * prep.stride();
-            let sparse_range = prep.sparse_row_range(variant_idx);
-            let cols = &prep.sparse_score_columns()[sparse_range.clone()];
-            let weights = &prep.sparse_weights()[sparse_range.clone()];
-            let missing = &prep.sparse_missing_corrections()[sparse_range];
-            for ((&col_u32, &w), &m) in cols.iter().zip(weights).zip(missing) {
-                let col = col_u32 as usize;
-                host_weights[row_off + col] = w;
-                host_missing_corrections[row_off + col] = m;
-                host_count_mask[row_off + col] = 1;
-            }
-        }
-
-        let full_weights = compute_stream
-            .clone_htod(&host_weights)
-            .map_err(|e| format!("Failed to upload full weights matrix: {e:?}"))?;
-        let full_missing_corrections = compute_stream
-            .clone_htod(&host_missing_corrections)
-            .map_err(|e| format!("Failed to upload full missing-correction matrix: {e:?}"))?;
+        let sparse_weights = compute_stream
+            .clone_htod(prep.sparse_weights())
+            .map_err(|e| format!("Failed to upload sparse weights: {e:?}"))?;
+        let sparse_missing_corrections = compute_stream
+            .clone_htod(prep.sparse_missing_corrections())
+            .map_err(|e| format!("Failed to upload sparse missing-corrections: {e:?}"))?;
+        let sparse_columns = compute_stream
+            .clone_htod(prep.sparse_score_columns())
+            .map_err(|e| format!("Failed to upload sparse score columns: {e:?}"))?;
+        let sparse_row_offsets = compute_stream
+            .clone_htod(prep.sparse_row_offsets())
+            .map_err(|e| format!("Failed to upload sparse row offsets: {e:?}"))?;
+        let host_output_map: Vec<u32> = prep.output_idx_to_fam_idx.iter().map(|idx| idx.0).collect();
         let output_map = compute_stream
-            .clone_htod(&prep.output_idx_to_fam_idx)
+            .clone_htod(&host_output_map)
             .map_err(|e| format!("Failed to upload output index map: {e:?}"))?;
-        let full_count_mask = compute_stream
-            .clone_htod(&host_count_mask)
-            .map_err(|e| format!("Failed to upload full count-mask matrix: {e:?}"))?;
 
         let ptx = compile_ptx(CUDA_KERNELS).map_err(|e| format!("NVRTC compile failed: {e:?}"))?;
         let module = match ctx.load_module(ptx) {
@@ -577,9 +575,10 @@ impl CudaRuntime {
             unpack_kernel,
             build_batch_mats_kernel,
             accumulate_outputs_kernel,
-            full_weights,
-            full_missing_corrections,
-            full_count_mask,
+            sparse_weights,
+            sparse_missing_corrections,
+            sparse_columns,
+            sparse_row_offsets,
             output_map,
             mega_batch_variants: mega,
             pinned_staging,
@@ -1357,25 +1356,24 @@ fn run_pending_compute_cuda(
     }
 
     let weights_elems = work.shape.weight_elems()?;
-    let stride_i32 = work.shape.dims.stride_i32()?;
     let num_scores_i32 = work.shape.dims.num_scores_i32()?;
-    let weights_launch_elems =
-        checked_u32("build_batch_mats kernel launch elements", weights_elems)?;
+    let build_launch_elems =
+        checked_u32("build_batch_mats kernel launch elements", work.shape.batch_len())?;
     unsafe {
         runtime
             .compute_stream
             .launch_builder(&runtime.build_batch_mats_kernel)
-            .arg(&runtime.full_weights)
-            .arg(&runtime.full_missing_corrections)
-            .arg(&runtime.full_count_mask)
+            .arg(&runtime.sparse_weights)
+            .arg(&runtime.sparse_missing_corrections)
+            .arg(&runtime.sparse_columns)
+            .arg(&runtime.sparse_row_offsets)
             .arg(&d_reconciled_slots[work.slot].slice(0..work.shape.batch_len()))
             .arg(&batch_len_i32)
-            .arg(&stride_i32)
             .arg(&num_scores_i32)
             .arg(&mut d_w_eff.slice_mut(0..weights_elems))
             .arg(&mut d_w_corr.slice_mut(0..weights_elems))
             .arg(&mut d_count_w.slice_mut(0..weights_elems))
-            .launch(LaunchConfig::for_num_elems(weights_launch_elems))
+            .launch(LaunchConfig::for_num_elems(build_launch_elems))
             .map_err(map_driver_err("Failed to launch build_batch_mats kernel"))?;
     }
 
@@ -1475,7 +1473,15 @@ fn run_row_major_gemm(
 }
 
 fn compute_cpu_precise_baseline(prep_result: &PreparationResult) -> Vec<f64> {
-    prep_result.baseline_missing_sum_by_score().to_vec()
+    let mut baseline = vec![0.0f64; prep_result.score_names.len()];
+    for (&col, &corr) in prep_result
+        .sparse_score_columns()
+        .iter()
+        .zip(prep_result.sparse_missing_corrections())
+    {
+        baseline[col as usize] += corr as f64;
+    }
+    baseline
 }
 
 fn derive_spool_destination(base_path: &Path) -> (PathBuf, String) {

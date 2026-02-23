@@ -28,6 +28,16 @@ use std::io::{BufWriter, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[inline]
+fn reconciled_index_from_usize(i: usize) -> Result<ReconciledVariantIndex, PipelineError> {
+    let idx = u32::try_from(i).map_err(|_| {
+        PipelineError::Compute(format!(
+            "Reconciled variant index {i} exceeds u32::MAX; too many variants in one run."
+        ))
+    })?;
+    Ok(ReconciledVariantIndex(idx))
+}
+
 pub struct SpoolPlan<'a> {
     pub is_complex_for_required: &'a [u8],
     pub compact_byte_index: &'a [u32],
@@ -175,9 +185,16 @@ pub fn producer_thread<'a, F>(
 
                 let path = path_decider(&buffer);
 
+                let reconciled_variant_index = match reconciled_index_from_usize(i) {
+                    Ok(idx) => idx,
+                    Err(err) => {
+                        send_error(err);
+                        break;
+                    }
+                };
                 let work_item = WorkItem {
                     data: buffer,
-                    reconciled_variant_index: ReconciledVariantIndex(i as u32),
+                    reconciled_variant_index,
                 };
 
                 let tx = if path == ComputePath::Pivot {
@@ -228,9 +245,16 @@ pub fn producer_thread<'a, F>(
 
                 let path = path_decider(&buffer);
 
+                let reconciled_variant_index = match reconciled_index_from_usize(i) {
+                    Ok(idx) => idx,
+                    Err(err) => {
+                        send_error(err);
+                        break;
+                    }
+                };
                 let work_item = WorkItem {
                     data: buffer,
-                    reconciled_variant_index: ReconciledVariantIndex(i as u32),
+                    reconciled_variant_index,
                 };
 
                 let tx = if path == ComputePath::Pivot {
@@ -342,9 +366,16 @@ pub fn multi_file_producer_thread<'a, F>(
                 }
 
                 let path = path_decider(&buffer);
+                let reconciled_variant_index = match reconciled_index_from_usize(i) {
+                    Ok(idx) => idx,
+                    Err(err) => {
+                        send_error(err);
+                        return;
+                    }
+                };
                 let work_item = WorkItem {
                     data: buffer,
-                    reconciled_variant_index: ReconciledVariantIndex(i as u32),
+                    reconciled_variant_index,
                 };
 
                 let tx = if path == ComputePath::Pivot {
@@ -406,9 +437,16 @@ pub fn multi_file_producer_thread<'a, F>(
                 }
 
                 let path = path_decider(&buffer);
+                let reconciled_variant_index = match reconciled_index_from_usize(i) {
+                    Ok(idx) => idx,
+                    Err(err) => {
+                        send_error(err);
+                        return;
+                    }
+                };
                 let work_item = WorkItem {
                     data: buffer,
-                    reconciled_variant_index: ReconciledVariantIndex(i as u32),
+                    reconciled_variant_index,
                 };
 
                 let tx = if path == ComputePath::Pivot {

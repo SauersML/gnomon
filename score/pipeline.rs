@@ -922,6 +922,21 @@ struct BufferGuard<'a> {
     pool: &'a ArrayQueue<Vec<u8>>,
 }
 
+struct DenseMiniBatchCanvas<'a> {
+    weights: &'a mut [f32],
+    missing_corrections: &'a mut [f32],
+    stride: usize,
+}
+
+impl<'a> DenseMiniBatchCanvas<'a> {
+    #[inline(always)]
+    fn set(&mut self, batch_row: usize, score_col: usize, weight: f32, missing_correction: f32) {
+        let idx = batch_row * self.stride + score_col;
+        self.weights[idx] = weight;
+        self.missing_corrections[idx] = missing_correction;
+    }
+}
+
 impl<'a> Drop for BufferGuard<'a> {
     fn drop(&mut self) {
         // When the guard is dropped, it returns its buffer to the pool.
@@ -1091,16 +1106,21 @@ fn process_dense_stream(
                     let mut weights_for_batch = vec![0.0f32; reconciled_indices.len() * stride];
                     let mut missing_corrections_for_batch =
                         vec![0.0f32; reconciled_indices.len() * stride];
+                    let mut canvas = DenseMiniBatchCanvas {
+                        weights: &mut weights_for_batch,
+                        missing_corrections: &mut missing_corrections_for_batch,
+                        stride,
+                    };
                     for (batch_row_idx, &reconciled_idx) in reconciled_indices.iter().enumerate() {
-                        let dense_offset = batch_row_idx * stride;
-                        let sparse_range = prep_result.sparse_row_range(reconciled_idx.0 as usize);
-                        let cols = &prep_result.sparse_score_columns()[sparse_range.clone()];
-                        let weights = &prep_result.sparse_weights()[sparse_range.clone()];
-                        let missing = &prep_result.sparse_missing_corrections()[sparse_range];
-                        for ((&col_u32, &w), &m) in cols.iter().zip(weights).zip(missing) {
-                            let col = col_u32 as usize;
-                            weights_for_batch[dense_offset + col] = w;
-                            missing_corrections_for_batch[dense_offset + col] = m;
+                        let variant_view = prep_result.variant_csr_view(reconciled_idx);
+                        for contribution in variant_view.iter() {
+                            let col = contribution.score_column.0;
+                            canvas.set(
+                                batch_row_idx,
+                                col,
+                                contribution.weight,
+                                contribution.missing_correction,
+                            );
                         }
                     }
 

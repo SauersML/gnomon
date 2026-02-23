@@ -8,6 +8,7 @@
 // blueprint." It now uses a low-memory, high-throughput streaming merge-join
 // algorithm to handle genome-scale data.
 
+use crate::score::kernel::MAX_SUPPORTED_SCORES;
 use crate::score::io::{TextSource, open_text_source};
 use crate::score::pipeline::PipelineError;
 use crate::score::reformat;
@@ -15,6 +16,7 @@ use crate::score::types::{
     BimRowIndex, FilesetBoundary, GenomicRegion, GroupedComplexRule, PersonSubset, PipelineKind,
     PreparationResult, ScoreColumnIndex, ScoreInfo, parse_chromosome_label,
 };
+use crate::score::types::{OriginalPersonIndex, OutputPersonIndex};
 use ahash::{AHashMap, AHashSet};
 use bumpalo::Bump;
 use rayon::prelude::*;
@@ -133,6 +135,65 @@ struct SimpleScoreAssignment {
     dosage_weight: f32,
     // Correction to subtract for missing calls at this variant/score cell.
     missing_correction: f32,
+}
+
+/// Lock-step CSR builder that guarantees aligned sparse vectors and valid row offsets.
+struct CsrBuilder {
+    sparse_weights: Vec<f32>,
+    sparse_missing_corrections: Vec<f32>,
+    sparse_score_columns: Vec<u32>,
+    sparse_row_offsets: Vec<u64>,
+}
+
+impl CsrBuilder {
+    fn with_capacity(num_variants: usize, estimated_nnz: usize) -> Self {
+        let mut sparse_row_offsets = Vec::<u64>::with_capacity(num_variants + 1);
+        sparse_row_offsets.push(0);
+        Self {
+            sparse_weights: Vec::with_capacity(estimated_nnz),
+            sparse_missing_corrections: Vec::with_capacity(estimated_nnz),
+            sparse_score_columns: Vec::with_capacity(estimated_nnz),
+            sparse_row_offsets,
+        }
+    }
+
+    fn push_contribution(
+        &mut self,
+        score_col_idx: ScoreColumnIndex,
+        assignment: SimpleScoreAssignment,
+    ) -> Result<(), PrepError> {
+        let col_u32 = u32::try_from(score_col_idx.0).map_err(|_| {
+            PrepError::Invariant(format!(
+                "Score column index {} exceeds u32::MAX while building CSR.",
+                score_col_idx.0
+            ))
+        })?;
+        self.sparse_score_columns.push(col_u32);
+        self.sparse_weights.push(assignment.dosage_weight);
+        self.sparse_missing_corrections
+            .push(assignment.missing_correction);
+        Ok(())
+    }
+
+    fn finish_variant(&mut self) -> Result<(), PrepError> {
+        let offset_u64 = u64::try_from(self.sparse_score_columns.len()).map_err(|_| {
+            PrepError::Invariant(format!(
+                "CSR non-zero count {} exceeds u64::MAX while building row offsets.",
+                self.sparse_score_columns.len()
+            ))
+        })?;
+        self.sparse_row_offsets.push(offset_u64);
+        Ok(())
+    }
+
+    fn into_parts(self) -> (Vec<f32>, Vec<f32>, Vec<u32>, Vec<u64>) {
+        (
+            self.sparse_weights,
+            self.sparse_missing_corrections,
+            self.sparse_score_columns,
+            self.sparse_row_offsets,
+        )
+    }
 }
 
 #[inline(always)]
@@ -318,6 +379,13 @@ fn prepare_for_computation_with_retry(
     // --- Stage 2: Global metadata discovery ---
     eprintln!("> Stage 2: Discovering all score columns...");
     let score_names = parse_score_file_headers_only(sorted_score_files)?;
+    if score_names.len() > MAX_SUPPORTED_SCORES {
+        return Err(PrepError::Invariant(format!(
+            "Found {} scores, but the current SIMD kernel supports at most {}.",
+            score_names.len(),
+            MAX_SUPPORTED_SCORES
+        )));
+    }
     let score_name_to_col_index: AHashMap<String, ScoreColumnIndex> = score_names
         .iter()
         .enumerate()
@@ -675,11 +743,7 @@ fn prepare_for_computation_with_retry(
 
     let stride = score_names.len().div_ceil(LANE_COUNT) * LANE_COUNT;
     let estimated_nnz: usize = simple_path_data.values().map(|m| m.len()).sum();
-    let mut sparse_weights = Vec::<f32>::with_capacity(estimated_nnz);
-    let mut sparse_missing_corrections = Vec::<f32>::with_capacity(estimated_nnz);
-    let mut sparse_score_columns = Vec::<u32>::with_capacity(estimated_nnz);
-    let mut sparse_row_offsets = Vec::<u64>::with_capacity(num_reconciled_variants + 1);
-    sparse_row_offsets.push(0);
+    let mut csr_builder = CsrBuilder::with_capacity(num_reconciled_variants, estimated_nnz);
 
     let mut baseline_missing_sum_by_score = vec![0.0f64; score_names.len()];
     let mut score_variant_counts = vec![0u32; score_names.len()];
@@ -687,28 +751,21 @@ fn prepare_for_computation_with_retry(
     for &bim_row_index in &required_bim_indices {
         if let Some(score_data_map) = simple_path_data.get(&bim_row_index) {
             for (&score_col_idx, assignment) in score_data_map.iter() {
-                let col_u32 = u32::try_from(score_col_idx.0).map_err(|_| {
-                    PrepError::Invariant(format!(
-                        "Score column index {} exceeds u32::MAX while building CSR.",
-                        score_col_idx.0
-                    ))
-                })?;
-                sparse_score_columns.push(col_u32);
-                sparse_weights.push(assignment.dosage_weight);
-                sparse_missing_corrections.push(assignment.missing_correction);
+                csr_builder.push_contribution(score_col_idx, *assignment)?;
                 baseline_missing_sum_by_score[score_col_idx.0] +=
                     assignment.missing_correction as f64;
                 score_variant_counts[score_col_idx.0] += 1;
             }
         }
-        let offset_u64 = u64::try_from(sparse_score_columns.len()).map_err(|_| {
-            PrepError::Invariant(format!(
-                "CSR non-zero count {} exceeds u64::MAX while building row offsets.",
-                sparse_score_columns.len()
-            ))
-        })?;
-        sparse_row_offsets.push(offset_u64);
+        csr_builder.finish_variant()?;
     }
+
+    let (
+        sparse_weights,
+        sparse_missing_corrections,
+        sparse_score_columns,
+        sparse_row_offsets,
+    ) = csr_builder.into_parts();
 
     if sparse_weights.len() != sparse_missing_corrections.len()
         || sparse_weights.len() != sparse_score_columns.len()
@@ -785,8 +842,14 @@ fn prepare_for_computation_with_retry(
 
     for (output_idx, iid) in final_person_iids.iter().enumerate() {
         let original_fam_idx = *iid_to_original_idx.get(iid).unwrap();
-        output_idx_to_fam_idx.push(original_fam_idx);
-        person_fam_to_output_idx[original_fam_idx as usize] = Some(output_idx as u32);
+        output_idx_to_fam_idx.push(OriginalPersonIndex(original_fam_idx));
+        let output_idx_u32 = u32::try_from(output_idx).map_err(|_| {
+            PrepError::Invariant(format!(
+                "Output person index {output_idx} exceeds u32::MAX."
+            ))
+        })?;
+        person_fam_to_output_idx[original_fam_idx as usize] =
+            Some(OutputPersonIndex(output_idx_u32));
     }
 
     let pipeline_kind = if fileset_paths.len() <= 1 {
@@ -1677,7 +1740,12 @@ fn parse_fam_and_build_lookup(
             }
         } else {
             for (idx, iid) in iids.iter().enumerate() {
-                iid_to_idx.insert(iid.clone(), idx as u32);
+                let idx_u32 = u32::try_from(idx).map_err(|_| {
+                    PrepError::Invariant(format!(
+                        "FAM index {idx} exceeds u32::MAX while building lookup."
+                    ))
+                })?;
+                iid_to_idx.insert(iid.clone(), idx_u32);
             }
             canonical_path = Some(fileset.fam.clone());
             canonical_iids = Some(iids);

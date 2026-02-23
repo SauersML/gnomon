@@ -15,6 +15,7 @@ use std::simd::f32x8;
 // These types are part of the public API of the kernel.
 pub type SimdVec = f32x8;
 pub const LANE_COUNT: usize = SimdVec::LEN;
+pub const MAX_SUPPORTED_SCORES: usize = 100;
 
 // ========================================================================================
 //                            Public API & type definitions
@@ -86,7 +87,7 @@ impl<'a> PaddedInterleavedWeights<'a> {
 // ========================================================================================
 /// This constant defines the maximum number of score columns the kernel can handle.
 /// It is used to size the kernel's internal accumulator buffer on the stack.
-const MAX_KERNEL_ACCUMULATOR_LANES: usize = 100_usize.div_ceil(LANE_COUNT);
+const MAX_KERNEL_ACCUMULATOR_LANES: usize = MAX_SUPPORTED_SCORES.div_ceil(LANE_COUNT);
 
 /// Calculates the score *adjustments* for a single person over a mini-batch of variants.
 /// This kernel is self-contained: it creates its own accumulators, performs the
@@ -105,6 +106,10 @@ pub fn accumulate_adjustments_for_person(
     g2_indices: &[u16],
 ) -> [SimdVec; MAX_KERNEL_ACCUMULATOR_LANES] {
     let num_scores = weights.num_scores();
+    assert!(
+        num_scores <= MAX_SUPPORTED_SCORES,
+        "Kernel received {num_scores} scores but supports at most {MAX_SUPPORTED_SCORES}."
+    );
     let num_accumulator_lanes = num_scores.div_ceil(LANE_COUNT);
 
     // A stack-allocated buffer for this person's mini-batch score adjustments.

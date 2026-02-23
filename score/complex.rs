@@ -741,7 +741,26 @@ pub fn resolve_complex_variants(
                             return Err(());
                         }
 
-                        let original_fam_idx = prep_result.output_idx_to_fam_idx[person_output_idx];
+                        let output_person_idx = match u32::try_from(person_output_idx) {
+                            Ok(v) => crate::score::types::OutputPersonIndex(v),
+                            Err(_) => {
+                                if fatal_error_flag
+                                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                                    .is_ok()
+                                {
+                                    *fatal_error_slot.lock().unwrap() = Some(FatalError::Io(
+                                        format!(
+                                            "Output person index {} exceeds u32::MAX.",
+                                            person_output_idx
+                                        ),
+                                    ));
+                                }
+                                return Err(());
+                            }
+                        };
+                        let original_fam_idx = prep_result
+                            .original_person_index_for_output(output_person_idx)
+                            .0;
 
                         for group_rule in &prep_result.complex_rules {
                             let mut valid_interpretations = Vec::new();
