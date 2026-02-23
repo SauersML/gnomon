@@ -5,6 +5,10 @@ on:
     branches:
       - main
       - master
+    paths:
+      - 'Cargo.toml'
+      - '**/*.rs'
+      - '.github/workflows/build-release-all.yml'
   workflow_dispatch:
 
 concurrency:
