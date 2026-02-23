@@ -259,7 +259,14 @@ def _simulate_for_generation(
     rng = np.random.default_rng(seed + 23)
     ooa_perm = rng.permutation(ooa_idx)
     ooa_train_idx = ooa_perm[:n_ooa_train]
-    ooa_test_idx = ooa_perm[n_ooa_train:n_ooa_train + n_ooa_test]
+    ooa_holdout_idx = ooa_perm[n_ooa_train:n_ooa_train + n_ooa_test]
+    ooa_n_cal = int(len(ooa_holdout_idx) // 2)
+    ooa_cal_idx = ooa_holdout_idx[:ooa_n_cal]
+    ooa_test_idx = ooa_holdout_idx[ooa_n_cal:]
+    afr_perm = rng.permutation(afr_idx)
+    afr_n_cal = int(len(afr_perm) // 2)
+    afr_cal_idx = afr_perm[:afr_n_cal]
+    afr_test_idx = afr_perm[afr_n_cal:]
 
     _log(f"[{prefix}] Sampling PCA+causal sites in one pass")
     pca_sites, causal_sites = sample_two_site_sets_for_maf(
@@ -304,13 +311,22 @@ def _simulate_for_generation(
 
     rows = []
     ooa_train_set = set(ooa_train_idx.tolist())
+    ooa_cal_set = set(ooa_cal_idx.tolist())
     ooa_test_set = set(ooa_test_idx.tolist())
+    afr_cal_set = set(afr_cal_idx.tolist())
+    afr_test_set = set(afr_test_idx.tolist())
     for i in range(len(pop)):
-        group = "AFR_test"
+        group = "unused"
         if i in ooa_train_set:
             group = "OOA_train"
+        elif i in ooa_cal_set:
+            group = "OOA_cal"
         elif i in ooa_test_set:
             group = "OOA_test"
+        elif i in afr_cal_set:
+            group = "AFR_cal"
+        elif i in afr_test_set:
+            group = "AFR_test"
         iid = f"ind_{i+1}"
         row = {
             "IID": iid,
@@ -382,12 +398,12 @@ def _prepare_bayesr_files(
     iid_to_fid = dict(zip(fam["IID"], fam["FID"]))
 
     train_ids = df.loc[df["group"] == "OOA_train", "IID"].astype(str).tolist()
-    test_ids = df.loc[df["group"].isin(["OOA_test", "AFR_test"]), "IID"].astype(str).tolist()
+    pred_ids = df.loc[df["group"].isin(["OOA_cal", "AFR_cal", "OOA_test", "AFR_test"]), "IID"].astype(str).tolist()
 
     train_keep = work_dir / "train.keep"
     test_keep = work_dir / "test.keep"
     pd.DataFrame({"FID": [iid_to_fid[i] for i in train_ids], "IID": train_ids}).to_csv(train_keep, sep="\t", header=False, index=False)
-    pd.DataFrame({"FID": [iid_to_fid[i] for i in test_ids], "IID": test_ids}).to_csv(test_keep, sep="\t", header=False, index=False)
+    pd.DataFrame({"FID": [iid_to_fid[i] for i in pred_ids], "IID": pred_ids}).to_csv(test_keep, sep="\t", header=False, index=False)
 
     plink = shutil.which("plink2") or "plink2"
 
@@ -700,6 +716,37 @@ def _plot_pc_grid(pc_rows: list[dict[str, object]], out_dir: Path) -> None:
     plt.close(fig)
 
 
+def _ensure_calibration_groups(df: pd.DataFrame, seed: int) -> pd.DataFrame:
+    """Backfill *_cal groups for legacy cached simulations that only have *_test."""
+    if "group" not in df.columns:
+        raise RuntimeError("Simulation table must include group column.")
+    has_cal = bool(df["group"].astype(str).str.endswith("_cal").any())
+    if has_cal:
+        return df
+
+    out = df.copy()
+    rng = np.random.default_rng(int(seed) + 29)
+    for pop in ("OOA", "AFR"):
+        test_label = f"{pop}_test"
+        cal_label = f"{pop}_cal"
+        idx = out.index[out["group"].astype(str) == test_label].to_numpy()
+        if idx.size == 0:
+            continue
+        perm = rng.permutation(idx)
+        n_cal = int(perm.size // 2)
+        out.loc[perm[:n_cal], "group"] = cal_label
+        out.loc[perm[n_cal:], "group"] = test_label
+
+    if not out["group"].astype(str).str.endswith("_cal").any():
+        raise RuntimeError("Could not derive calibration groups from cached simulation table.")
+    _log(
+        "[fig1] Upgraded cached split to include calibration groups: "
+        f"OOA_cal={int(np.count_nonzero(out['group'].astype(str) == 'OOA_cal'))}, "
+        f"AFR_cal={int(np.count_nonzero(out['group'].astype(str) == 'AFR_cal'))}"
+    )
+    return out
+
+
 def _log_results_table(title: str, df: pd.DataFrame) -> None:
     if df.empty:
         _log(f"{title}: <empty>")
@@ -797,6 +844,7 @@ def _run_generation_task(task: dict[str, object]) -> dict[str, object]:
         # Publish reusable simulation artifacts immediately so downstream failures
         # do not force re-simulation on restart with --use-existing.
         _publish_reuse_cache(prefix=prefix_path, out_dir=out_dir, run_id=run_id)
+    df = _ensure_calibration_groups(df, seed=seed)
     work = work_root / f"fig1_g{g}_s{seed}_work"
     train_prefix, test_prefix, train_phen, freq_file = _prepare_bayesr_files(
         df,
@@ -842,14 +890,31 @@ def _run_generation_task(task: dict[str, object]) -> dict[str, object]:
         _log(f"[fig1_g{g}_s{seed}] P+T fit/scoring complete")
 
     train_df = df[df["group"] == "OOA_train"].copy()
-    test_df = df[df["group"].isin(["OOA_test", "AFR_test"])].copy()
+    pred_df = df[df["group"].isin(["OOA_cal", "AFR_cal", "OOA_test", "AFR_test"])].copy()
 
     train_df = train_df.set_index("IID").loc[train_scores["IID"].astype(str)].reset_index()
+    pred_scores = test_scores.copy()
+    pred_df = pred_df.set_index("IID").loc[pred_scores["IID"].astype(str)].reset_index()
+    cal_df = pred_df[pred_df["group"].isin(["OOA_cal", "AFR_cal"])].copy()
+    test_df = pred_df[pred_df["group"].isin(["OOA_test", "AFR_test"])].copy()
+    cal_scores = pred_scores[pred_scores["IID"].astype(str).isin(cal_df["IID"].astype(str))].copy()
+    test_scores = pred_scores[pred_scores["IID"].astype(str).isin(test_df["IID"].astype(str))].copy()
+    cal_df = cal_df.set_index("IID").loc[cal_scores["IID"].astype(str)].reset_index()
     test_df = test_df.set_index("IID").loc[test_scores["IID"].astype(str)].reset_index()
     _assert_noncollapsed_prs(
         train_df["group"].to_numpy(),
         train_scores["PRS"].to_numpy(dtype=float),
         context=f"fig1_g{g}_s{seed} train",
+    )
+    _assert_noncollapsed_prs(
+        pred_df["group"].to_numpy(),
+        pred_scores["PRS"].to_numpy(dtype=float),
+        context=f"fig1_g{g}_s{seed} pred",
+    )
+    _assert_noncollapsed_prs(
+        cal_df["group"].to_numpy(),
+        cal_scores["PRS"].to_numpy(dtype=float),
+        context=f"fig1_g{g}_s{seed} cal",
     )
     _assert_noncollapsed_prs(
         test_df["group"].to_numpy(),
@@ -858,9 +923,9 @@ def _run_generation_task(task: dict[str, object]) -> dict[str, object]:
     )
 
     pred = _fit_and_predict_methods(
-        train_df,
+        cal_df,
         test_df,
-        train_scores["PRS"].to_numpy(dtype=float),
+        cal_scores["PRS"].to_numpy(dtype=float),
         test_scores["PRS"].to_numpy(dtype=float),
     )
     _log(f"[fig1_g{g}_s{seed}] Method fitting/prediction complete")
@@ -878,7 +943,8 @@ def _run_generation_task(task: dict[str, object]) -> dict[str, object]:
                 "gens": int(g),
                 "seed": int(seed),
                 "method": method,
-                "n_train": int(len(train_df)),
+                "n_train_prs": int(len(train_df)),
+                "n_calibration": int(len(cal_df)),
                 "n_test_total": int(len(test_df)),
                 "n_test_ooa": int(np.count_nonzero(o.to_numpy())),
                 "n_test_afr": int(np.count_nonzero(a.to_numpy())),

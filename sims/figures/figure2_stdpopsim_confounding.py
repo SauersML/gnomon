@@ -860,18 +860,34 @@ def _simulate(
     eur_idx = np.where(pop_label == "EUR")[0]
     eur_perm = rng.permutation(eur_idx)
     eur_train = eur_perm[:n_train_eur]
-    eur_test = eur_perm[n_train_eur:n_train_eur + n_test_per_pop]
+    eur_holdout = eur_perm[n_train_eur:n_train_eur + n_test_per_pop]
+    eur_n_cal = int(len(eur_holdout) // 2)
+    eur_cal = eur_holdout[:eur_n_cal]
+    eur_test = eur_holdout[eur_n_cal:]
+
+    holdout_idx_by_pop = {pop: rng.permutation(np.where(pop_label == pop)[0]) for pop in ("AFR", "ASIA", "ADMIX")}
+    cal_set_by_pop: dict[str, set[int]] = {}
+    test_set_by_pop: dict[str, set[int]] = {}
+    for pop, idx in holdout_idx_by_pop.items():
+        n_cal = int(len(idx) // 2)
+        cal_set_by_pop[pop] = set(idx[:n_cal].tolist())
+        test_set_by_pop[pop] = set(idx[n_cal:].tolist())
 
     eur_train_set = set(eur_train.tolist())
+    eur_cal_set = set(eur_cal.tolist())
     eur_test_set = set(eur_test.tolist())
     group_arr = np.empty(len(pop_label), dtype=object)
     for i in range(len(pop_label)):
-        grp = "test"
+        grp = "unused"
         if i in eur_train_set:
             grp = "EUR_train"
+        elif i in eur_cal_set:
+            grp = "EUR_cal"
         elif i in eur_test_set:
             grp = "EUR_test"
-        elif pop_label[i] in {"AFR", "ASIA", "ADMIX"}:
+        elif pop_label[i] in cal_set_by_pop and i in cal_set_by_pop[pop_label[i]]:
+            grp = f"{pop_label[i]}_cal"
+        elif pop_label[i] in test_set_by_pop and i in test_set_by_pop[pop_label[i]]:
             grp = f"{pop_label[i]}_test"
         group_arr[i] = grp
 
@@ -977,11 +993,11 @@ def _run_prs_and_predict(
     iid_to_fid = dict(zip(fam["IID"], fam["FID"]))
 
     train_ids = df.loc[df["group"] == "EUR_train", "IID"].astype(str).tolist()
-    test_ids = df.loc[df["group"].str.endswith("_test"), "IID"].astype(str).tolist()
+    pred_ids = df.loc[df["group"].str.endswith("_test") | df["group"].str.endswith("_cal"), "IID"].astype(str).tolist()
 
     pd.DataFrame({"FID": [iid_to_fid[i] for i in train_ids], "IID": train_ids}).to_csv(work / "train.keep", sep="\t", header=False, index=False)
-    pd.DataFrame({"FID": [iid_to_fid[i] for i in test_ids], "IID": test_ids}).to_csv(work / "test.keep", sep="\t", header=False, index=False)
-    _stage_done(run_id, "PRS file prep", t0, extra=f"(n_train={len(train_ids)}, n_test={len(test_ids)})")
+    pd.DataFrame({"FID": [iid_to_fid[i] for i in pred_ids], "IID": pred_ids}).to_csv(work / "test.keep", sep="\t", header=False, index=False)
+    _stage_done(run_id, "PRS file prep", t0, extra=f"(n_train={len(train_ids)}, n_pred={len(pred_ids)})")
 
     plink = shutil.which("plink2") or "plink2"
     common = ["--threads", str(plink_threads)]
@@ -1098,16 +1114,16 @@ def _fit_predict_single_method(
     raise RuntimeError(f"Unknown method_name={method_name}")
 
 
-def _method_preds(train_df: pd.DataFrame, test_df: pd.DataFrame, train_prs: np.ndarray, test_prs: np.ndarray) -> dict[str, np.ndarray]:
+def _method_preds(cal_df: pd.DataFrame, test_df: pd.DataFrame, cal_prs: np.ndarray, test_prs: np.ndarray) -> dict[str, np.ndarray]:
     out: dict[str, np.ndarray] = {}
 
     prs_scaler = StandardScaler()
-    P_train = prs_scaler.fit_transform(train_prs.reshape(-1, 1)).ravel()
+    P_train = prs_scaler.fit_transform(cal_prs.reshape(-1, 1)).ravel()
     P_test = prs_scaler.transform(test_prs.reshape(-1, 1)).ravel()
-    PC_train = train_df[[f"pc{i+1}" for i in range(N_PCS)]].to_numpy()
+    PC_train = cal_df[[f"pc{i+1}" for i in range(N_PCS)]].to_numpy()
     PC_test = test_df[[f"pc{i+1}" for i in range(N_PCS)]].to_numpy()
-    y_train = train_df["y"].to_numpy(dtype=np.int32)
-    train_pop = train_df["pop_label"].to_numpy(dtype=object)
+    y_train = cal_df["y"].to_numpy(dtype=np.int32)
+    train_pop = cal_df["pop_label"].to_numpy(dtype=object)
     test_pop = test_df["pop_label"].to_numpy(dtype=object)
 
     method_names = ["raw", "linear", "normalized"]
@@ -1286,6 +1302,50 @@ def _plot_pcs(df: pd.DataFrame, out_dir: Path) -> None:
     plt.close(fig)
 
 
+def _ensure_calibration_groups(df: pd.DataFrame, seed: int) -> pd.DataFrame:
+    """Backfill *_cal groups for legacy cached simulations that only have *_test."""
+    if "group" not in df.columns or "pop_label" not in df.columns:
+        raise RuntimeError("Simulation table must include group and pop_label columns.")
+    has_cal = bool(df["group"].astype(str).str.endswith("_cal").any())
+    if has_cal:
+        return df
+
+    out = df.copy()
+    rng = np.random.default_rng(int(seed) + 31)
+    pops = ["EUR", "AFR", "ASIA", "ADMIX"]
+    cal_counts: dict[str, int] = {}
+    test_counts: dict[str, int] = {}
+    for pop in pops:
+        mask = (out["pop_label"].astype(str) == pop) & (
+            out["group"].astype(str).str.endswith("_test") | (out["group"].astype(str) == "test")
+        )
+        idx = out.index[mask].to_numpy()
+        if idx.size == 0:
+            continue
+        perm = rng.permutation(idx)
+        n_cal = int(perm.size // 2)
+        cal_idx = perm[:n_cal]
+        test_idx = perm[n_cal:]
+        out.loc[cal_idx, "group"] = f"{pop}_cal"
+        out.loc[test_idx, "group"] = f"{pop}_test"
+        cal_counts[pop] = int(cal_idx.size)
+        test_counts[pop] = int(test_idx.size)
+
+    if not out["group"].astype(str).str.endswith("_cal").any():
+        raise RuntimeError(
+            "Could not derive calibration groups from cached simulation table. "
+            "Expected *_test (or test) rows by population."
+        )
+    _log(
+        "[fig2] Upgraded cached split to include calibration groups: "
+        + ", ".join(
+            f"{pop}(cal={cal_counts.get(pop, 0)},test={test_counts.get(pop, 0)})"
+            for pop in pops
+        )
+    )
+    return out
+
+
 def _log_results_table(title: str, df: pd.DataFrame) -> None:
     if df.empty:
         _log(f"{title}: <empty>")
@@ -1406,6 +1466,7 @@ def main() -> None:
             bp_cap=args.bp_cap,
             ancestry_threads=threads,
         )
+    df = _ensure_calibration_groups(df, seed=seed)
     seed_work = work_root / f"work_s{seed}"
     _log(f"[fig2_s{seed}] Starting PRS/prediction stage")
     train_scores, test_scores, pt_meta = _run_prs_and_predict(
@@ -1432,8 +1493,14 @@ def main() -> None:
         )
 
     train_df = df[df["group"] == "EUR_train"].copy()
-    test_df = df[df["group"].str.endswith("_test")].copy()
+    pred_df = df[df["group"].str.endswith("_test") | df["group"].str.endswith("_cal")].copy()
     train_df = train_df.set_index("IID").loc[train_scores["IID"].astype(str)].reset_index()
+    pred_df = pred_df.set_index("IID").loc[test_scores["IID"].astype(str)].reset_index()
+    cal_df = pred_df[pred_df["group"].str.endswith("_cal")].copy()
+    test_df = pred_df[pred_df["group"].str.endswith("_test")].copy()
+    cal_scores = test_scores[test_scores["IID"].astype(str).isin(cal_df["IID"].astype(str))].copy()
+    test_scores = test_scores[test_scores["IID"].astype(str).isin(test_df["IID"].astype(str))].copy()
+    cal_df = cal_df.set_index("IID").loc[cal_scores["IID"].astype(str)].reset_index()
     test_df = test_df.set_index("IID").loc[test_scores["IID"].astype(str)].reset_index()
     _assert_noncollapsed_prs(
         train_df["pop_label"].to_numpy(),
@@ -1443,13 +1510,23 @@ def main() -> None:
     _assert_noncollapsed_prs(
         test_df["pop_label"].to_numpy(),
         test_scores["PRS"].to_numpy(dtype=float),
+        context=f"fig2_s{seed} pred",
+    )
+    _assert_noncollapsed_prs(
+        cal_df["pop_label"].to_numpy(),
+        cal_scores["PRS"].to_numpy(dtype=float),
+        context=f"fig2_s{seed} cal",
+    )
+    _assert_noncollapsed_prs(
+        test_df["pop_label"].to_numpy(),
+        test_scores["PRS"].to_numpy(dtype=float),
         context=f"fig2_s{seed} test",
     )
 
     preds = _method_preds(
-        train_df,
+        cal_df,
         test_df,
-        train_scores["PRS"].to_numpy(dtype=float),
+        cal_scores["PRS"].to_numpy(dtype=float),
         test_scores["PRS"].to_numpy(dtype=float),
     )
     _log(f"[fig2_s{seed}] Method fitting/prediction complete")
@@ -1467,7 +1544,8 @@ def main() -> None:
                 {
                     "method": method,
                     "population": pop,
-                    "n_train": int(len(train_df)),
+                    "n_train_prs": int(len(train_df)),
+                    "n_calibration": int(len(cal_df)),
                     "n_test_total": int(len(test_df)),
                     "n": int(mask.sum()),
                     "prevalence": float(np.mean(y_pop)) if y_pop.size > 0 else np.nan,
