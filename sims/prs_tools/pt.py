@@ -200,9 +200,25 @@ class PPlusT:
             gwas = gwas[gwas["TEST"].astype(str) == "ADD"].copy()
         if "P" not in gwas.columns or "ID" not in gwas.columns or "A1" not in gwas.columns:
             raise RuntimeError(f"P+T GWAS file missing required columns (ID/A1/P): {glm_path}")
-        if "BETA" not in gwas.columns:
-            raise RuntimeError(f"P+T GWAS file missing required BETA effect column: {glm_path}")
-        eff = pd.to_numeric(gwas["BETA"], errors="coerce")
+        eff = None
+        eff_col_used = None
+        if "BETA" in gwas.columns:
+            eff = pd.to_numeric(gwas["BETA"], errors="coerce")
+            eff_col_used = "BETA"
+        elif "LOG(OR)" in gwas.columns:
+            eff = pd.to_numeric(gwas["LOG(OR)"], errors="coerce")
+            eff_col_used = "LOG(OR)"
+        elif "OR" in gwas.columns:
+            orv = pd.to_numeric(gwas["OR"], errors="coerce")
+            eff = np.log(orv.where(orv > 0))
+            eff_col_used = "OR(log)"
+        else:
+            raise RuntimeError(
+                "P+T GWAS file missing effect column. "
+                f"Expected one of BETA, LOG(OR), OR. File={glm_path} "
+                f"columns={list(gwas.columns)}"
+            )
+        print(f"[P+T] using effect column: {eff_col_used}")
 
         gwas = pd.DataFrame(
             {
