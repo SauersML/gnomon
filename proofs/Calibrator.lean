@@ -4194,6 +4194,157 @@ theorem optimal_recovers_truth_of_capable {p k sp : ℕ} [Fintype (Fin p)] [Fint
     Assumption: E[scaling(C)] = 1 (centered scaling).
     Then the additive projection of scaling(C)*P is 1*P.
     The residual is (scaling(C) - 1)*P. -/
+/-- **Projection of p is p**: The identity predictor p minimizes the risk
+    among all normalized (additive) models for a multiplicative bias DGP,
+    provided the scaling function is centered (E[scaling] = 1). -/
+theorem projection_of_p_is_p (k : ℕ) [Fintype (Fin k)]
+    (scaling_func : (Fin k → ℝ) → ℝ)
+    (_h_scaling_sq_int : Integrable (fun c => (scaling_func c)^2) ((stdNormalProdMeasure k).map Prod.snd))
+    (_h_mean_1 : ∫ c, scaling_func c ∂((stdNormalProdMeasure k).map Prod.snd) = 1)
+    (m : PhenotypeInformedGAM 1 k 1)
+    (h_norm : IsNormalizedScoreModel m)
+    (h_linear : m.pgsBasis.B 1 = id ∧ m.pgsBasis.B 0 = fun _ => 1)
+    (_h_m_int : Integrable (fun pc => (linearPredictor m pc.1 pc.2)^2) (stdNormalProdMeasure k)) :
+    expectedSquaredError (dgpMultiplicativeBias scaling_func) (fun p c => p) ≤
+    expectedSquaredError (dgpMultiplicativeBias scaling_func) (fun p c => linearPredictor m p c) := by
+  let dgp := dgpMultiplicativeBias scaling_func
+  let μ := stdNormalProdMeasure k
+  let μC := μ.map Prod.snd
+
+  -- 1. Decompose linearPredictor m into base(c) + slope * p
+  have h_pred : ∀ p c, linearPredictor m p c = predictorBase m c + predictorSlope m c * p :=
+    linearPredictor_decomp m h_linear.1
+
+  have h_slope_const : ∀ c, predictorSlope m c = m.γₘ₀ 0 := by
+    intro c
+    unfold predictorSlope
+    simp [h_norm.fₘₗ_zero]
+
+  let slope := m.γₘ₀ 0
+  let base := predictorBase m
+
+  -- 2. Expand Risk
+  -- Risk(m) = E[(scaling*p - (base + slope*p))^2]
+
+  have h_risk_decomp :
+      expectedSquaredError dgp (fun p c => linearPredictor m p c) =
+      (∫ c, (scaling_func c - slope)^2 ∂μC) + (∫ c, (base c)^2 ∂μC) := by
+    unfold expectedSquaredError dgpMultiplicativeBias
+    simp_rw [h_pred, h_slope_const]
+    have h_expand : ∀ p c, (scaling_func c * p - (base c + slope * p))^2 =
+        (scaling_func c - slope)^2 * p^2 + (base c)^2 - 2 * (scaling_func c - slope) * base c * p := by
+      intro p c; ring
+    simp_rw [h_expand]
+
+    have h_base_sq_int : Integrable (fun c => (base c)^2) μC := by
+      -- Integrate out p from (base + slope*p)^2 to show base^2 is integrable
+      let f := fun pc : ℝ × (Fin k → ℝ) => (linearPredictor m pc.1 pc.2)^2
+      have hf_int : Integrable f μ := _h_m_int
+      have h_integral_p : Integrable (fun c => ∫ p, f (p, c) ∂(ProbabilityTheory.gaussianReal 0 1)) μC := by
+        rw [stdNormalProdMeasure] at hf_int
+        exact hf_int.integral_prod_right
+
+      have h_eval : ∀ c, ∫ p, f (p, c) ∂(ProbabilityTheory.gaussianReal 0 1) = (base c)^2 + slope^2 := by
+        intro c
+        simp only [f]
+        rw [h_pred]
+        rw [h_slope_const]
+        -- E[(b + s*p)^2] = E[b^2 + 2bsp + s^2p^2] = b^2 + 0 + s^2 * 1 = b^2 + s^2
+        have h_poly : ∀ p, (base c + slope * p)^2 = (base c)^2 + 2 * base c * slope * p + slope^2 * p^2 := by
+          intro p; ring
+        simp_rw [h_poly]
+        rw [integral_add]
+        · rw [integral_add]
+          · simp [MeasureTheory.integral_const]
+            rw [integral_const_mul, gaussian_second_moment]; simp
+          · simp [integral_const_mul, gaussian_mean_zero]
+          · exact (integrable_const _).mul (gaussian_moments_integrable 1)
+        · simp; exact integrable_const _
+        · exact (integrable_const _).mul (gaussian_moments_integrable 2)
+
+      simp_rw [h_eval] at h_integral_p
+      -- Integrable (base^2 + const) => Integrable base^2
+      exact (h_integral_p.sub (integrable_const (slope^2))).congr (by intro x; simp)
+
+    have h_sc_slope_sq_int : Integrable (fun c => (scaling_func c - slope)^2) μC := by
+      apply Integrable.sub
+      · exact _h_scaling_sq_int
+      · exact (integrable_const slope).pow two_ne_zero -- approx logic, actually use linearity
+      · exact (Integrable.sub _h_scaling_sq_int.integrable (integrable_const _)).pow two_ne_zero
+
+    -- Integrate term by term
+    rw [stdNormalProdMeasure]
+    rw [integral_add]
+    · rw [integral_sub]
+      · -- Term 1: (scaling-slope)^2 * p^2
+        rw [MeasureTheory.integral_prod_mul h_sc_slope_sq_int (gaussian_moments_integrable 2)]
+        rw [gaussian_second_moment, mul_one]
+        -- Term 2: base^2 * 1
+        rw [MeasureTheory.integral_prod_mul h_base_sq_int (integrable_const 1)]
+        simp only [integral_const, MeasureTheory.ProbabilityMeasure.measure_univ, ENNReal.one_toReal, mul_one]
+        -- Term 3: cross term * p
+        -- Cross term involves p, integrates to 0
+        -- We can just show the integral of the cross term is 0 directly
+        have h_cross_int : ∫ pc, 2 * (scaling_func pc.2 - slope) * base pc.2 * pc.1 ∂(Measure.prod (ProbabilityTheory.gaussianReal 0 1) μC) = 0 := by
+           rw [MeasureTheory.integral_prod_mul]
+           · rw [gaussian_mean_zero, mul_zero]
+           · -- integrability of cross term coefficient
+             -- (scaling-slope) is L2, base is L2 => product is L1
+             exact Integrable.mul (h_sc_slope_sq_int.sqrt) (h_base_sq_int.sqrt) |>.const_mul 2
+           · exact gaussian_moments_integrable 1
+        rw [h_cross_int, sub_zero]
+      · -- Integrability of cross term
+        apply Integrable.prod_mul
+        · exact Integrable.mul (h_sc_slope_sq_int.sqrt) (h_base_sq_int.sqrt) |>.const_mul 2
+        · exact gaussian_moments_integrable 1
+      · -- Integrability of base^2 term
+        exact h_base_sq_int.prod_mul (integrable_const 1)
+    · -- Integrability of (S-slope)^2 p^2 + base^2
+      apply Integrable.add
+      · exact h_sc_slope_sq_int.prod_mul (gaussian_moments_integrable 2)
+      · exact h_base_sq_int.prod_mul (integrable_const 1)
+    · -- Integrability of cross term (again)
+      apply Integrable.prod_mul
+      · exact Integrable.mul (h_sc_slope_sq_int.sqrt) (h_base_sq_int.sqrt) |>.const_mul 2
+      · exact gaussian_moments_integrable 1
+
+  -- 3. Risk(p)
+  have h_risk_p : expectedSquaredError dgp (fun p c => p) = ∫ c, (scaling_func c - 1)^2 ∂μC := by
+    unfold expectedSquaredError dgpMultiplicativeBias
+    simp
+    have h_expand : ∀ p c, (scaling_func c * p - p)^2 = (scaling_func c - 1)^2 * p^2 := by
+      intro p c; ring
+    simp_rw [h_expand]
+    rw [stdNormalProdMeasure, MeasureTheory.integral_prod_mul]
+    · rw [gaussian_second_moment, mul_one]
+    · exact (Integrable.sub _h_scaling_sq_int.integrable (integrable_const 1)).pow two_ne_zero
+    · exact gaussian_moments_integrable 2
+
+  rw [h_risk_decomp, h_risk_p]
+
+  -- 4. Compare: (S-slope)^2 = (S-1)^2 + (slope-1)^2 + 2(S-1)(1-slope)
+  -- Integral of cross term: 2(1-slope) ∫(S-1) = 2(1-slope)(1-1) = 0
+  have h_quad : ∫ c, (scaling_func c - slope)^2 ∂μC = (∫ c, (scaling_func c - 1)^2 ∂μC) + (slope - 1)^2 := by
+    have h_exp : ∀ c, (scaling_func c - slope)^2 = (scaling_func c - 1)^2 + (slope - 1)^2 - 2 * (slope - 1) * (scaling_func c - 1) := by
+      intro c; ring
+    simp_rw [h_exp]
+    rw [integral_add, integral_sub]
+    · rw [integral_mul_left]
+      have h_mean_S_minus_1 : ∫ c, scaling_func c - 1 ∂μC = 0 := by
+        rw [integral_sub _h_scaling_sq_int.integrable (integrable_const 1)]
+        rw [_h_mean_1, integral_const, MeasureTheory.ProbabilityMeasure.measure_univ, ENNReal.one_toReal, mul_one, sub_self]
+      rw [h_mean_S_minus_1, mul_zero, sub_zero]
+      rw [integral_const]
+      simp [MeasureTheory.ProbabilityMeasure.measure_univ, ENNReal.one_toReal, mul_one]
+    · exact (Integrable.sub _h_scaling_sq_int.integrable (integrable_const 1)).pow two_ne_zero
+    · exact integrable_const _
+    · exact (Integrable.sub _h_scaling_sq_int.integrable (integrable_const 1)).const_mul _
+    · exact Integrable.add ((Integrable.sub _h_scaling_sq_int.integrable (integrable_const 1)).pow two_ne_zero) (integrable_const _)
+
+  rw [h_quad]
+  have h_base_nonneg : 0 ≤ ∫ c, (base c)^2 ∂μC := integral_nonneg (fun _ => sq_nonneg _)
+  nlinarith
+
 theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (Fin k)]
     (scaling_func : (Fin k → ℝ) → ℝ)
     (_h_scaling_meas : AEStronglyMeasurable scaling_func ((stdNormalProdMeasure k).map Prod.snd))
@@ -4211,12 +4362,6 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
     (h_oracle_opt : IsBayesOptimalInClass (dgpMultiplicativeBias scaling_func) model_oracle)
     (h_capable : ∃ (m : PhenotypeInformedGAM 1 k 1),
       ∀ p_val c_val, linearPredictor m p_val c_val = (dgpMultiplicativeBias scaling_func).trueExpectation p_val c_val)
-    -- Geometric projection hypothesis: `p ↦ p` is the orthogonal projection target
-    -- in the normalized class (equivalently, it satisfies the Pythagorean minimality inequality).
-    (h_projection_p :
-      ∀ (m : PhenotypeInformedGAM 1 k 1), IsNormalizedScoreModel m →
-        expectedSquaredError (dgpMultiplicativeBias scaling_func) (fun p c => p) ≤
-        expectedSquaredError (dgpMultiplicativeBias scaling_func) (fun p c => linearPredictor m p c))
     (_h_scaling_mean : ∫ c, scaling_func c ∂(Measure.pi (fun (_ : Fin k) => ProbabilityTheory.gaussianReal 0 1)) = 1) :
   let dgp := dgpMultiplicativeBias scaling_func
   expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) -
@@ -4279,7 +4424,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
         expectedSquaredError dgp (fun p c => p) := by
       unfold expectedSquaredError
       simp [h_star_pred]
-    have hproj := h_projection_p model_norm h_norm_opt.is_normalized
+    have hproj := projection_of_p_is_p k scaling_func _h_scaling_sq_int _h_mean_1 model_norm h_norm_opt.is_normalized h_linear_basis _h_norm_int
     simpa [dgp, h_star_as_p] using hproj
 
   have h_opt_risk : expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) =
