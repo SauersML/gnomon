@@ -6447,29 +6447,60 @@ theorem laml_gradient_is_exact
     (beta_hat : (Fin k → ℝ) → Matrix (Fin p) (Fin 1) ℝ)
     (grad_op : (Matrix (Fin p) (Fin 1) ℝ → ℝ) → Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin p) (Fin 1) ℝ)
     (rho : Fin k → ℝ) (i : Fin k)
-    (D : (Fin k → ℝ) →L[ℝ] ℝ)
-    (hF : HasFDerivAt (fun r => LAML_fn log_lik S_basis X W beta_hat r) D rho)
-    (h_split : D (Pi.single i 1) =
+    -- Structural Assumptions (Rigorous, Non-Vacuous)
+    (h_beta_diff : DifferentiableAt ℝ (fun r => beta_hat (Function.update rho i r)) (rho i))
+    (h_beta_grad : deriv (fun r => beta_hat (Function.update rho i r)) (rho i) = 
+                   rust_delta_fn S_basis X W beta_hat rho i)
+    -- Optimality: beta_hat is a critical point of L_pen (gradient w.r.t b is zero)
+    (h_stat : HasGradientAt (fun b => L_pen_fn log_lik S_basis rho b) 0 (beta_hat rho))
+    -- Gradient correctness for log det term
+    (h_hess_log_det : HasGradientAt (fun b => 0.5 * Real.log (Matrix.det (Hessian_fn S_basis X W rho b))) 
+                                    (grad_op (fun b => 0.5 * Real.log (Matrix.det (Hessian_fn S_basis X W rho b))) (beta_hat rho)) 
+                                    (beta_hat rho))
+    -- Invertibility
+    (h_H_inv : IsUnit (Hessian_fn S_basis X W rho (beta_hat rho)).det)
+    (h_S_inv : IsUnit (S_lambda_fn S_basis rho).det)
+    -- Symmetry
+    (h_S_symm : ∀ j, (S_basis j).IsSymm)
+    -- Smoothness needed for chain rule
+    (h_log_lik_diff : DifferentiableAt ℝ (fun r => log_lik (beta_hat (Function.update rho i r))) (rho i))
+    : deriv (fun r => LAML_fn log_lik S_basis X W beta_hat (Function.update rho i r)) (rho i) =
       rust_direct_gradient_fn S_basis X W beta_hat log_lik rho i +
-      rust_correction_fn S_basis X W beta_hat grad_op rho i) :
-  deriv (fun r => LAML_fn log_lik S_basis X W beta_hat (Function.update rho i r)) (rho i) =
-  rust_direct_gradient_fn S_basis X W beta_hat log_lik rho i +
-  rust_correction_fn S_basis X W beta_hat grad_op rho i :=
+      rust_correction_fn S_basis X W beta_hat grad_op rho i :=
 by
-  let g : ℝ → (Fin k → ℝ) := Function.update rho i
-  have hg : HasDerivAt g (Pi.single i 1) (rho i) := by
-    simpa [g] using (hasDerivAt_update rho i (rho i))
-  have h_update : g (rho i) = rho := by
-    simpa [g] using (Function.update_eq_self i rho)
-  have hF_at_update : HasFDerivAt (fun r => LAML_fn log_lik S_basis X W beta_hat r) D (g (rho i)) := by
-    simpa [h_update] using hF
-  have hcomp : HasDerivAt (fun r => LAML_fn log_lik S_basis X W beta_hat (g r))
-      (D (Pi.single i 1)) (rho i) := by
-    exact hF_at_update.comp_hasDerivAt (rho i) hg
-  have h_deriv :
-      deriv (fun r => LAML_fn log_lik S_basis X W beta_hat (g r)) (rho i) =
-      D (Pi.single i 1) := hcomp.deriv
-  simpa [g, h_split] using h_deriv
+  let g := Function.update rho i
+  let r0 := rho i
+
+  -- Define components
+  let term1 (rv : Fin k → ℝ) (b : Matrix (Fin p) (Fin 1) ℝ) := L_pen_fn log_lik S_basis rv b
+  let term2 (rv : Fin k → ℝ) (b : Matrix (Fin p) (Fin 1) ℝ) := 0.5 * Real.log (Hessian_fn S_basis X W rv b).det
+  let term3 (rv : Fin k → ℝ) := -0.5 * Real.log (S_lambda_fn S_basis rv).det
+
+  -- 1. Partial w.r.t b (fixing r) at (r0, b0)
+  -- Total derivative contribution from b variation:
+  -- ∂J/∂b * db/dr = (grad_op ... )ᵀ * delta
+  
+  have h_correction_term : 
+      deriv (fun r => term1 (g r) (beta_hat (g r)) + term2 (g r) (beta_hat (g r))) r0 - 
+      deriv (fun r => term1 (g r) (beta_hat (g r0)) + term2 (g r) (beta_hat (g r0))) r0 
+      = rust_correction_fn S_basis X W beta_hat grad_op rho i := by
+    sorry -- Proof requires rigorous chain rule application
+
+  -- 2. Partial w.r.t r (fixing b) at (r0, b0)
+  -- ∂term1/∂r = 0.5 * exp(r0) * trace(b0ᵀ * Si * b0)
+  -- ∂term2/∂r = 0.5 * exp(r0) * trace(H⁻¹ * Si)
+  -- ∂term3/∂r = -0.5 * exp(r0) * trace(S⁻¹ * Si)
+  
+  have h_direct_term :
+      deriv (fun r => term1 (g r) (beta_hat (g r0)) + term2 (g r) (beta_hat (g r0)) + term3 (g r)) r0
+      = rust_direct_gradient_fn S_basis X W beta_hat log_lik rho i := by
+    sorry -- Proof requires deriv_log_det lemmas
+
+  -- Combine:
+  -- f'(r0) = h_direct_term + h_correction_term
+  -- deriv f r0 = deriv (J(r, b(r))) = partial_r + partial_b
+  
+  sorry -- Full proof requires detailed calculus steps
 
 end GradientDescentVerification
 
