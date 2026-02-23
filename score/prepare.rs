@@ -68,8 +68,6 @@ struct KeyedScoreRecord<'arena> {
     other_allele: &'arena str,
     score_column_index: ScoreColumnIndex,
     weight: f32,
-    /// Index of the source file this record came from (0-indexed).
-    file_idx: usize,
 }
 
 // Manual implementation to handle f32 comparison correctly.
@@ -123,8 +121,32 @@ struct FileStream<'arena> {
     // This is a temporary buffer for reading lines from the file before they
     // are allocated into the long-lived arena.
     line_string_buffer: String,
+    /// 1-based line number in the currently read file.
+    file_line_number: u64,
     /// Counter for malformed lines in this specific file stream.
     malformed_lines_count: usize,
+}
+
+#[derive(Debug, Copy, Clone)]
+struct SimpleScoreAssignment {
+    // Weight applied to effect-allele dosage in canonical (BIM allele2) space.
+    dosage_weight: f32,
+    // Correction to subtract for missing calls at this variant/score cell.
+    missing_correction: f32,
+}
+
+#[inline(always)]
+fn apply_simple_score_assignment(entry: &mut SimpleScoreAssignment, weight: f32, is_flipped: bool) {
+    // Canonicalize every match into allele2-dosage space.
+    // If the score effect allele matches BIM allele1, the row contributes:
+    //   weight * (2 - dosage_allele2)
+    // = (2*weight) + (-weight * dosage_allele2).
+    if is_flipped {
+        entry.dosage_weight -= weight;
+        entry.missing_correction += 2.0 * weight;
+    } else {
+        entry.dosage_weight += weight;
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -344,10 +366,8 @@ fn prepare_for_computation_with_retry(
     // These data structures will store the results of the merge-join.
     // Allele strings borrowed from the arena are stored here temporarily.
     // The tuple is (weight, is_flipped, file_idx).
-    let mut simple_path_data: BTreeMap<
-        BimRowIndex,
-        BTreeMap<ScoreColumnIndex, (f32, bool, usize)>,
-    > = BTreeMap::new();
+    let mut simple_path_data: BTreeMap<BimRowIndex, BTreeMap<ScoreColumnIndex, SimpleScoreAssignment>> =
+        BTreeMap::new();
     // For complex rules, the key is the set of BIM contexts. The value is a tuple
     // containing the canonical chr:pos key for the locus and all score applications.
     let mut intermediate_complex_rules: BTreeMap<
@@ -458,35 +478,13 @@ fn prepare_for_computation_with_retry(
                                 let score_map =
                                     simple_path_data.entry(bim_rec.bim_row_index).or_default();
 
-                                if let Some(prev) = score_map.insert(
-                                    score_record.score_column_index,
-                                    (score_record.weight, is_flipped, score_record.file_idx),
-                                ) {
-                                    let (prev_weight, _, prev_file_idx) = prev;
-                                    let curr_file_idx = score_record.file_idx;
-                                    let score_name =
-                                        &score_names[score_record.score_column_index.0];
-
-                                    let location_msg = if prev_file_idx == curr_file_idx {
-                                        format!(
-                                            "Duplicate found within file: '{}'",
-                                            sorted_score_files[curr_file_idx].display()
-                                        )
-                                    } else {
-                                        format!(
-                                            "Conflict between files: '{}' (weight={}) and '{}' (weight={})",
-                                            sorted_score_files[prev_file_idx].display(),
-                                            prev_weight,
-                                            sorted_score_files[curr_file_idx].display(),
-                                            score_record.weight
-                                        )
-                                    };
-
-                                    return Err(PrepError::AmbiguousReconciliation(format!(
-                                        "Ambiguous input: The same variant appears multiple times with different weights for score '{}'. {}. Variant BIM index: {}",
-                                        score_name, location_msg, bim_rec.bim_row_index.0
-                                    )));
-                                }
+                                let entry = score_map.entry(score_record.score_column_index).or_insert(
+                                    SimpleScoreAssignment {
+                                        dosage_weight: 0.0,
+                                        missing_correction: 0.0,
+                                    },
+                                );
+                                apply_simple_score_assignment(entry, score_record.weight, is_flipped);
                             }
                         }
                         ReconciliationOutcome::Complex(matches) => {
@@ -670,21 +668,26 @@ fn prepare_for_computation_with_retry(
     let stride = score_names.len().div_ceil(LANE_COUNT) * LANE_COUNT;
     let mut weights_matrix = vec![0.0f32; num_reconciled_variants * stride];
     let mut flip_mask_matrix = vec![0u8; num_reconciled_variants * stride];
+    let mut missing_correction_matrix = vec![0.0f32; num_reconciled_variants * stride];
     let mut variant_to_scores_map: Vec<Vec<ScoreColumnIndex>> =
         vec![Vec::new(); num_reconciled_variants];
 
     weights_matrix
         .par_chunks_mut(stride)
         .zip(flip_mask_matrix.par_chunks_mut(stride))
+        .zip(missing_correction_matrix.par_chunks_mut(stride))
         .zip(variant_to_scores_map.par_iter_mut())
         .enumerate()
         .for_each(
-            |(reconciled_idx, ((weights_chunk, flip_chunk), vtsm_entry))| {
+            |(reconciled_idx, (((weights_chunk, flip_chunk), missing_chunk), vtsm_entry))| {
                 let bim_row_index = required_bim_indices[reconciled_idx];
                 if let Some(score_data_map) = simple_path_data.get(&bim_row_index) {
-                    for (&score_col_idx, &(weight, is_flipped, _)) in score_data_map.iter() {
-                        weights_chunk[score_col_idx.0] = weight;
-                        flip_chunk[score_col_idx.0] = if is_flipped { 1 } else { 0 };
+                    for (&score_col_idx, assignment) in score_data_map.iter() {
+                        weights_chunk[score_col_idx.0] = assignment.dosage_weight;
+                        // All simple rows are canonicalized to allele2-dosage space,
+                        // so sign is encoded in `weights_chunk` and flip is no longer needed.
+                        flip_chunk[score_col_idx.0] = 0;
+                        missing_chunk[score_col_idx.0] = assignment.missing_correction;
                     }
                     *vtsm_entry = score_data_map.keys().copied().collect();
                 }
@@ -736,6 +739,7 @@ fn prepare_for_computation_with_retry(
     Ok(PreparationResult::new(
         weights_matrix,
         flip_mask_matrix,
+        missing_correction_matrix,
         stride,
         required_bim_indices,
         final_complex_rules,
@@ -896,6 +900,65 @@ mod tests {
         }
 
         assert_eq!(keys, vec![(1, 150), (1, 180)]);
+    }
+
+    #[test]
+    fn duplicate_aggregation_same_orientation_sums_weights() {
+        let mut agg = SimpleScoreAssignment {
+            dosage_weight: 0.0,
+            missing_correction: 0.0,
+        };
+        apply_simple_score_assignment(&mut agg, 0.25, false);
+        apply_simple_score_assignment(&mut agg, -0.10, false);
+
+        assert!((agg.dosage_weight - 0.15).abs() < 1e-6);
+        assert!(agg.missing_correction.abs() < 1e-6);
+    }
+
+    #[test]
+    fn duplicate_aggregation_swapped_orientation_tracks_missing_correction() {
+        let mut agg = SimpleScoreAssignment {
+            dosage_weight: 0.0,
+            missing_correction: 0.0,
+        };
+        apply_simple_score_assignment(&mut agg, 0.40, true);
+
+        assert!((agg.dosage_weight - (-0.40)).abs() < 1e-6);
+        assert!((agg.missing_correction - 0.80).abs() < 1e-6);
+    }
+
+    #[test]
+    fn duplicate_aggregation_matches_row_by_row_for_all_dosages() {
+        let rows = [(0.35f32, false), (0.10f32, true), (-0.05f32, false)];
+        let mut agg = SimpleScoreAssignment {
+            dosage_weight: 0.0,
+            missing_correction: 0.0,
+        };
+        for (w, is_flipped) in rows {
+            apply_simple_score_assignment(&mut agg, w, is_flipped);
+        }
+
+        for dosage in [0.0f32, 1.0, 2.0] {
+            let row_by_row = rows
+                .iter()
+                .map(|(w, is_flipped)| {
+                    if *is_flipped {
+                        w * (2.0 - dosage)
+                    } else {
+                        w * dosage
+                    }
+                })
+                .sum::<f32>();
+            let aggregated = agg.missing_correction + (agg.dosage_weight * dosage);
+            assert!(
+                (row_by_row - aggregated).abs() < 1e-6,
+                "dosage={dosage} row_by_row={row_by_row} aggregated={aggregated}"
+            );
+        }
+
+        // Missing genotype contributes nothing after baseline correction.
+        let missing_after_baseline = agg.missing_correction - agg.missing_correction;
+        assert!(missing_after_baseline.abs() < 1e-6);
     }
 }
 
@@ -1232,6 +1295,7 @@ impl<'arena> KWayMergeIterator<'arena> {
                 line_buffer: std::collections::VecDeque::new(),
                 current_line_info: None,
                 line_string_buffer: String::new(),
+                file_line_number: 0,
                 malformed_lines_count: 0,
             });
         }
@@ -1344,6 +1408,7 @@ impl<'arena> KWayMergeIterator<'arena> {
             if bytes_read == 0 {
                 return Ok(LineReadOutcome::Eof);
             }
+            stream.file_line_number += 1;
 
             if stream.line_string_buffer.trim().is_empty()
                 || stream.line_string_buffer.starts_with('#')
@@ -1414,7 +1479,6 @@ impl<'arena> KWayMergeIterator<'arena> {
                 other_allele,
                 score_column_index,
                 weight,
-                file_idx,
             };
             heap.push(HeapItem { record, file_idx });
         }

@@ -238,14 +238,10 @@ fn run_single_file_pipeline(
             || vec![0.0f64; num_scores],
             |mut local_baseline, i| {
                 let flip_row_offset = i * stride;
-                let flip_row =
-                    &prep_result.flip_mask_matrix()[flip_row_offset..flip_row_offset + stride];
-                let weight_row =
-                    &prep_result.weights_matrix()[flip_row_offset..flip_row_offset + stride];
+                let missing_corr_row = &prep_result.missing_correction_matrix()
+                    [flip_row_offset..flip_row_offset + stride];
                 for k in 0..num_scores {
-                    if flip_row[k] == 1 {
-                        local_baseline[k] += 2.0 * weight_row[k] as f64;
-                    }
+                    local_baseline[k] += missing_corr_row[k] as f64;
                 }
                 local_baseline
             },
@@ -582,14 +578,10 @@ fn run_multi_file_pipeline(
                 || vec![0.0f64; num_scores],
                 |mut local_baseline, i| {
                     let flip_row_offset = i * stride;
-                    let flip_row =
-                        &prep_result.flip_mask_matrix()[flip_row_offset..flip_row_offset + stride];
-                    let weight_row =
-                        &prep_result.weights_matrix()[flip_row_offset..flip_row_offset + stride];
+                    let missing_corr_row = &prep_result.missing_correction_matrix()
+                        [flip_row_offset..flip_row_offset + stride];
                     for k in 0..num_scores {
-                        if flip_row[k] == 1 {
-                            local_baseline[k] += 2.0 * weight_row[k] as f64;
-                        }
+                        local_baseline[k] += missing_corr_row[k] as f64;
                     }
                     local_baseline
                 },
@@ -1144,6 +1136,8 @@ fn process_dense_stream(
                     let mut weights_for_batch =
                         Vec::with_capacity(reconciled_indices.len() * stride);
                     let mut flips_for_batch = Vec::with_capacity(reconciled_indices.len() * stride);
+                    let mut missing_corrections_for_batch =
+                        Vec::with_capacity(reconciled_indices.len() * stride);
                     for &reconciled_idx in &reconciled_indices {
                         let src_offset = reconciled_idx.0 as usize * stride;
                         weights_for_batch.extend_from_slice(
@@ -1152,12 +1146,16 @@ fn process_dense_stream(
                         flips_for_batch.extend_from_slice(
                             &prep_result.flip_mask_matrix()[src_offset..src_offset + stride],
                         );
+                        missing_corrections_for_batch.extend_from_slice(
+                            &prep_result.missing_correction_matrix()[src_offset..src_offset + stride],
+                        );
                     }
 
                     batch::run_person_major_path(
                         concatenated_data,
                         &weights_for_batch,
                         &flips_for_batch,
+                        &missing_corrections_for_batch,
                         &reconciled_indices,
                         prep_result,
                         &mut acc.0,

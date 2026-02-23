@@ -170,6 +170,7 @@ pub struct PreparationResult {
     // by the `prepare` module and can only be read by downstream modules.
     weights_matrix: Vec<f32>,
     flip_mask_matrix: Vec<u8>,
+    missing_correction_matrix: Vec<f32>,
     stride: usize,
 
     // --- Public metadata & lookup tables ---
@@ -232,6 +233,7 @@ impl PreparationResult {
     pub fn new(
         weights_matrix: Vec<f32>,
         flip_mask_matrix: Vec<u8>,
+        missing_correction_matrix: Vec<f32>,
         stride: usize,
         required_bim_indices: Vec<BimRowIndex>,
         complex_rules: Vec<GroupedComplexRule>,
@@ -256,6 +258,7 @@ impl PreparationResult {
         Self {
             weights_matrix,
             flip_mask_matrix,
+            missing_correction_matrix,
             stride,
             required_bim_indices,
             complex_rules,
@@ -289,6 +292,11 @@ impl PreparationResult {
     #[inline(always)]
     pub fn flip_mask_matrix(&self) -> &[u8] {
         &self.flip_mask_matrix
+    }
+
+    #[inline(always)]
+    pub fn missing_correction_matrix(&self) -> &[f32] {
+        &self.missing_correction_matrix
     }
 
     #[inline(always)]

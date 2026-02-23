@@ -126,6 +126,7 @@ fn setup_benchmark_context(
     let prep_result = PreparationResult::new(
         weights_matrix,
         flip_mask_matrix,
+        vec![0.0f32; num_variants * stride],
         stride,
         vec![],
         vec![],
@@ -257,6 +258,8 @@ fn benchmark_the_works(c: &mut Criterion) {
                         .collect();
                     let weights_for_batch = prep_result.weights_matrix().to_vec();
                     let flips_for_batch = prep_result.flip_mask_matrix().to_vec();
+                    let missing_corrections_for_batch =
+                        prep_result.missing_correction_matrix().to_vec();
 
                     group.bench_function(
                         BenchmarkId::new(format!("Pivot__{}", id_str), freq),
@@ -268,6 +271,7 @@ fn benchmark_the_works(c: &mut Criterion) {
                                         black_box(&batch_variant_data),
                                         black_box(&weights_for_batch),
                                         black_box(&flips_for_batch),
+                                        black_box(&missing_corrections_for_batch),
                                         black_box(&reconciled_indices),
                                         black_box(&prep_result),
                                         black_box(&mut scores_out),

@@ -99,7 +99,7 @@ extern "C" __global__ void unpack_plink(
 
 extern "C" __global__ void build_batch_mats(
     const float* weights,
-    const unsigned char* flips,
+    const float* missing_corrections,
     const unsigned char* count_mask,
     const unsigned int* reconciled_indices,
     int batch_variants,
@@ -122,15 +122,9 @@ extern "C" __global__ void build_batch_mats(
     size_t src = (size_t)reconciled * (size_t)stride + (size_t)s;
 
     float w = weights[src];
-    unsigned char f = flips[src];
     out_count[idx] = count_mask[src] ? 1.0f : 0.0f;
-    if (f == 1u) {
-        out_effective[idx] = -w;
-        out_missing_corr[idx] = -2.0f * w;
-    } else {
-        out_effective[idx] = w;
-        out_missing_corr[idx] = 0.0f;
-    }
+    out_effective[idx] = w;
+    out_missing_corr[idx] = -missing_corrections[src];
 }
 
 extern "C" __global__ void accumulate_outputs_f64(
@@ -180,7 +174,7 @@ struct CudaRuntime {
     build_batch_mats_kernel: CudaFunction,
     accumulate_outputs_kernel: CudaFunction,
     full_weights: CudaSlice<f32>,
-    full_flips: CudaSlice<u8>,
+    full_missing_corrections: CudaSlice<f32>,
     full_count_mask: CudaSlice<u8>,
     output_map: CudaSlice<u32>,
     mega_batch_variants: usize,
@@ -417,9 +411,9 @@ impl CudaRuntime {
             .checked_mul(std::mem::size_of::<f32>())
             .and_then(|v| {
                 v.checked_add(
-                    prep.flip_mask_matrix()
+                    prep.missing_correction_matrix()
                         .len()
-                        .checked_mul(std::mem::size_of::<u8>())?,
+                        .checked_mul(std::mem::size_of::<f32>())?,
                 )
             })
             .and_then(|v| v.checked_add(count_weights_len.checked_mul(std::mem::size_of::<u8>())?))
@@ -498,9 +492,9 @@ impl CudaRuntime {
         let full_weights = compute_stream
             .clone_htod(prep.weights_matrix())
             .map_err(|e| format!("Failed to upload full weights matrix: {e:?}"))?;
-        let full_flips = compute_stream
-            .clone_htod(prep.flip_mask_matrix())
-            .map_err(|e| format!("Failed to upload full flip mask matrix: {e:?}"))?;
+        let full_missing_corrections = compute_stream
+            .clone_htod(prep.missing_correction_matrix())
+            .map_err(|e| format!("Failed to upload full missing-correction matrix: {e:?}"))?;
         let output_map = compute_stream
             .clone_htod(&prep.output_idx_to_fam_idx)
             .map_err(|e| format!("Failed to upload output index map: {e:?}"))?;
@@ -571,7 +565,7 @@ impl CudaRuntime {
             build_batch_mats_kernel,
             accumulate_outputs_kernel,
             full_weights,
-            full_flips,
+            full_missing_corrections,
             full_count_mask,
             output_map,
             mega_batch_variants: mega,
@@ -1359,7 +1353,7 @@ fn run_pending_compute_cuda(
             .compute_stream
             .launch_builder(&runtime.build_batch_mats_kernel)
             .arg(&runtime.full_weights)
-            .arg(&runtime.full_flips)
+            .arg(&runtime.full_missing_corrections)
             .arg(&runtime.full_count_mask)
             .arg(&d_reconciled_slots[work.slot].slice(0..work.shape.batch_len()))
             .arg(&batch_len_i32)
@@ -1476,14 +1470,10 @@ fn compute_cpu_precise_baseline(prep_result: &PreparationResult) -> Vec<f64> {
             || vec![0.0f64; num_scores],
             |mut local_baseline, i| {
                 let flip_row_offset = i * stride;
-                let flip_row =
-                    &prep_result.flip_mask_matrix()[flip_row_offset..flip_row_offset + stride];
-                let weight_row =
-                    &prep_result.weights_matrix()[flip_row_offset..flip_row_offset + stride];
+                let missing_corr_row = &prep_result.missing_correction_matrix()
+                    [flip_row_offset..flip_row_offset + stride];
                 for k in 0..num_scores {
-                    if flip_row[k] == 1 {
-                        local_baseline[k] += 2.0 * weight_row[k] as f64;
-                    }
+                    local_baseline[k] += missing_corr_row[k] as f64;
                 }
                 local_baseline
             },

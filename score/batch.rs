@@ -47,6 +47,7 @@ pub fn run_person_major_path(
     variant_major_data: &[u8],
     weights_for_batch: &[f32],
     flips_for_batch: &[u8],
+    missing_corrections_for_batch: &[f32],
     reconciled_variant_indices_for_batch: &[ReconciledVariantIndex],
     prep_result: &PreparationResult,
     partial_scores_out: &mut [f64],
@@ -114,6 +115,7 @@ pub fn run_person_major_path(
                     variant_major_data,
                     weights_for_batch,
                     flips_for_batch,
+                    missing_corrections_for_batch,
                     reconciled_variant_indices_for_batch,
                     block_scores_out,
                     block_missing_counts_out,
@@ -135,6 +137,7 @@ pub fn process_tile<'a>(
     prep_result: &'a PreparationResult,
     weights_for_batch: &'a [f32],
     flips_for_batch: &'a [u8],
+    missing_corrections_for_batch: &'a [f32],
     reconciled_variant_indices_for_batch: &'a [ReconciledVariantIndex],
     block_scores_out: &mut [f64],
     block_missing_counts_out: &mut [u32],
@@ -144,6 +147,7 @@ pub fn process_tile<'a>(
         prep_result,
         weights_for_batch,
         flips_for_batch,
+        missing_corrections_for_batch,
         reconciled_variant_indices_for_batch,
         block_scores_out,
         block_missing_counts_out,
@@ -162,6 +166,7 @@ fn process_block<'a>(
     variant_major_data: &'a [u8],
     weights: &'a [f32],
     flips: &'a [u8],
+    missing_corrections: &'a [f32],
     reconciled_variant_indices_for_batch: &'a [ReconciledVariantIndex],
     block_scores_out: &mut [f64],
     block_missing_counts_out: &mut [u32],
@@ -187,6 +192,7 @@ fn process_block<'a>(
         prep_result,
         weights,
         flips,
+        missing_corrections,
         reconciled_variant_indices_for_batch,
         block_scores_out,
         block_missing_counts_out,
@@ -240,6 +246,7 @@ pub(crate) fn process_tile_impl<'a>(
     prep_result: &'a PreparationResult,
     weights_for_batch: &'a [f32],
     flips_for_batch: &'a [u8],
+    missing_corrections_for_batch: &'a [f32],
     reconciled_variant_indices_for_batch: &'a [ReconciledVariantIndex],
     block_scores_out: &mut [f64],
     block_missing_counts_out: &mut [u32],
@@ -280,6 +287,9 @@ pub(crate) fn process_tile_impl<'a>(
                 weights_for_batch.get_unchecked(matrix_slice_start..matrix_slice_end),
                 flips_for_batch.get_unchecked(matrix_slice_start..matrix_slice_end),
             )
+        };
+        let missing_corr_chunk = unsafe {
+            missing_corrections_for_batch.get_unchecked(matrix_slice_start..matrix_slice_end)
         };
 
         // SAFETY: The logic of the mini-batch slicing guarantees the chunks passed to
@@ -372,10 +382,8 @@ pub(crate) fn process_tile_impl<'a>(
                             for &score_idx in scores_for_this_variant {
                                 let score_col = score_idx.0;
                                 person_missing_counts_slice[score_col] += 1;
-                                if flip_flags_chunk[weight_row_offset + score_col] == 1 {
-                                    person_scores_slice[score_col] -=
-                                        2.0 * (weights_chunk[weight_row_offset + score_col] as f64);
-                                }
+                                person_scores_slice[score_col] -=
+                                    missing_corr_chunk[weight_row_offset + score_col] as f64;
                             }
                         }
                         _ => {} // dosage 0 shouldn't be in nonzero mask, but safe
@@ -412,10 +420,8 @@ pub(crate) fn process_tile_impl<'a>(
                         for &score_idx in scores_for_this_variant {
                             let score_col = score_idx.0;
                             person_missing_counts_slice[score_col] += 1;
-                            if flip_flags_chunk[weight_row_offset + score_col] == 1 {
-                                person_scores_slice[score_col] -=
-                                    2.0 * (weights_chunk[weight_row_offset + score_col] as f64);
-                            }
+                            person_scores_slice[score_col] -=
+                                missing_corr_chunk[weight_row_offset + score_col] as f64;
                         }
                     }
                     _ => (),
@@ -641,7 +647,8 @@ pub fn run_variant_major_path(
     // an efficient calculation of the offset into the global contiguous matrices.
     let matrix_row_offset = reconciled_variant_index.0 as usize * stride;
     let weight_row = &prep_result.weights_matrix()[matrix_row_offset..matrix_row_offset + stride];
-    let flip_row = &prep_result.flip_mask_matrix()[matrix_row_offset..matrix_row_offset + stride];
+    let missing_corr_row =
+        &prep_result.missing_correction_matrix()[matrix_row_offset..matrix_row_offset + stride];
     let affected_scores = &prep_result.variant_to_scores_map[reconciled_variant_index.0 as usize];
 
     // --- Main Compute Loop ---
@@ -682,11 +689,7 @@ pub fn run_variant_major_path(
                 for score_col_idx in affected_scores {
                     let col = score_col_idx.0;
                     partial_missing_counts_out[scores_offset + col] += 1;
-                    // If the variant was flipped, its contribution (2*W) was added to the
-                    // baseline. We must subtract it back out for missing individuals.
-                    if flip_row[col] == 1 {
-                        partial_scores_out[scores_offset + col] -= 2.0 * weight_row[col] as f64;
-                    }
+                    partial_scores_out[scores_offset + col] -= missing_corr_row[col] as f64;
                 }
             }
 
@@ -697,13 +700,7 @@ pub fn run_variant_major_path(
                 for score_col_idx in affected_scores {
                     let col = score_col_idx.0;
                     let weight = weight_row[col] as f64;
-                    // The baseline score already assumes a dosage of 0 for non-flipped variants,
-                    // and 2 for flipped variants. This calculation applies the correct adjustment.
-                    let adjustment = if flip_row[col] == 1 {
-                        -weight * dosage
-                    } else {
-                        weight * dosage
-                    };
+                    let adjustment = weight * dosage;
                     partial_scores_out[scores_offset + col] += adjustment;
                 }
             }
@@ -719,6 +716,54 @@ pub fn run_variant_major_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::score::types::{BimRowIndex, PipelineKind, ScoreColumnIndex};
+    use std::path::PathBuf;
+
+    fn make_single_variant_prep_result(
+        weight: f32,
+        missing_correction: f32,
+        num_people: usize,
+    ) -> PreparationResult {
+        let score_names = vec!["S0".to_string()];
+        let stride = 8;
+        let mut weights_matrix = vec![0.0f32; stride];
+        let flip_mask_matrix = vec![0u8; stride];
+        let mut missing_correction_matrix = vec![0.0f32; stride];
+        weights_matrix[0] = weight;
+        missing_correction_matrix[0] = missing_correction;
+
+        let output_idx_to_fam_idx: Vec<u32> = (0..num_people as u32).collect();
+        let mut person_fam_to_output_idx = vec![None; num_people];
+        for (out_idx, fam_idx) in output_idx_to_fam_idx.iter().enumerate() {
+            person_fam_to_output_idx[*fam_idx as usize] = Some(out_idx as u32);
+        }
+
+        PreparationResult::new(
+            weights_matrix,
+            flip_mask_matrix,
+            missing_correction_matrix,
+            stride,
+            vec![BimRowIndex(0)],
+            vec![],
+            score_names,
+            vec![1],
+            vec![vec![ScoreColumnIndex(0)]],
+            crate::score::types::PersonSubset::All,
+            (0..num_people).map(|i| format!("I{i}")).collect(),
+            num_people,
+            num_people,
+            1,
+            1,
+            1,
+            person_fam_to_output_idx,
+            output_idx_to_fam_idx,
+            vec![0],
+            vec![0],
+            vec![0],
+            1,
+            PipelineKind::SingleFile(PathBuf::from("test")),
+        )
+    }
 
     #[test]
     fn test_transpose_layout_is_empirically_verified() {
@@ -779,5 +824,31 @@ mod tests {
         eprintln!(
             "✅ SUCCESS: The transpose function shuffles variants within each person-vector as hypothesized."
         );
+    }
+
+    #[test]
+    fn run_variant_major_path_applies_missing_correction_matrix() {
+        let prep = make_single_variant_prep_result(1.5, 2.0, 4);
+        let mut scores = vec![0.0f64; 4];
+        let mut missing = vec![0u32; 4];
+
+        // Per-person PLINK genotypes packed into one byte (2 bits per person):
+        // p0=00 (dosage 0), p1=10 (dosage 1), p2=11 (dosage 2), p3=01 (missing)
+        let variant_data = vec![0b01_11_10_00];
+
+        run_variant_major_path(
+            &variant_data,
+            &prep,
+            &mut scores,
+            &mut missing,
+            ReconciledVariantIndex(0),
+        )
+        .expect("variant-major path should succeed");
+
+        assert!((scores[0] - 0.0).abs() < 1e-9);
+        assert!((scores[1] - 1.5).abs() < 1e-9);
+        assert!((scores[2] - 3.0).abs() < 1e-9);
+        assert!((scores[3] - (-2.0)).abs() < 1e-9);
+        assert_eq!(missing, vec![0, 0, 0, 1]);
     }
 }
