@@ -92,9 +92,9 @@ def test_convert_genome_to_vcf_passes_requested_assembly(
 
     recorded: list[list[str]] = []
 
-    def fake_run_command(argv, cwd=None):
+    def fake_run_command(argv, cwd=None, **kwargs):
         recorded.append(list(map(str, argv)))
-        Path(argv[3]).write_text("##fileformat=VCFv4.2\n", encoding="utf-8")
+        Path(argv[2]).write_text("##fileformat=VCFv4.2\n", encoding="utf-8")
 
     monkeypatch.setattr(convert_score, "run_command", fake_run_command)
 
@@ -109,7 +109,8 @@ def test_convert_genome_to_vcf_passes_requested_assembly(
 
     assert vcf_path.exists()
     assert recorded
-    assert recorded[0][-1] == "GRCh38"
+    assert "--assembly" in recorded[0]
+    assert recorded[0][recorded[0].index("--assembly") + 1] == "GRCh38"
 
 
 def test_parser_exposes_assembly_flag() -> None:
@@ -119,4 +120,3 @@ def test_parser_exposes_assembly_flag() -> None:
 
     custom_args = parser.parse_args(["--assembly", "GRCh38"])
     assert custom_args.assembly == "GRCh38"
-

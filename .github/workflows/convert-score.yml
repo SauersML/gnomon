@@ -6,6 +6,7 @@ on:
     branches: [main]
     paths:
       - 'examples/convert_score.py'
+      - 'examples/tests/test_convert_score.py'
       - 'score/**'
       - '.github/workflows/convert-score.yml'
   pull_request:
@@ -13,6 +14,7 @@ on:
     types: [opened, synchronize, reopened]
     paths:
       - 'examples/convert_score.py'
+      - 'examples/tests/test_convert_score.py'
       - 'score/**'
       - '.github/workflows/convert-score.yml'
 
@@ -23,20 +25,14 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Java
-        run: sudo apt-get update && sudo apt-get install -y default-jdk
-
-      - name: Install bcftools 1.23
-        run: |
-          sudo apt-get install -y libz-dev libbz2-dev liblzma-dev libcurl4-openssl-dev
-          curl -L https://github.com/samtools/bcftools/releases/download/1.23/bcftools-1.23.tar.bz2 | tar -xj
-          cd bcftools-1.23 && make -j4 && sudo make install
-
       - name: Install gnomon
         run: curl -fsSL https://raw.githubusercontent.com/SauersML/gnomon/main/install.sh | bash
 
-      - name: Add gnomon to PATH
-        run: echo "$HOME/.local/bin" >> $GITHUB_PATH
+      - name: Install convert_genome
+        run: curl -fsSL https://raw.githubusercontent.com/SauersML/convert_genome/main/install.sh | bash
+
+      - name: Add local binaries to PATH
+        run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Run convert_score example
         run: python examples/convert_score.py
