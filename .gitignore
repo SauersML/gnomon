@@ -63,3 +63,7 @@ gh_*/
 
 # Keep local build/dependency caches out of git status
 /target/
+
+# Final override: always ignore Python bytecode caches (after broad unignore rules above)
+**/__pycache__/
+**/__pycache__/**
