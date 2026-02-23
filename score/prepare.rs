@@ -50,8 +50,8 @@ struct FilesetPaths {
     fam: PathBuf,
 }
 
-/// A parsed record from a `.bim` file, holding borrowed string slices.
-#[derive(Debug, Copy, Clone)]
+/// A parsed record from a `.bim` file.
+#[derive(Debug, Clone)]
 struct KeyedBimRecord {
     key: VariantKey,
     bim_row_index: BimRowIndex,
@@ -59,8 +59,8 @@ struct KeyedBimRecord {
     allele2: String,
 }
 
-/// A parsed record from a score file, holding a borrowed string slice.
-#[derive(Debug, Copy, Clone)]
+/// A parsed record from a score file.
+#[derive(Debug, Clone)]
 struct KeyedScoreRecord {
     key: VariantKey,
     effect_allele: String,
@@ -78,7 +78,7 @@ impl PartialEq for KeyedScoreRecord {
 impl Eq for KeyedScoreRecord {}
 
 /// A self-contained item for the merge heap.
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Clone)]
 struct HeapItem {
     record: KeyedScoreRecord,
     file_idx: usize,
@@ -117,8 +117,7 @@ struct FileStream {
     line_buffer: std::collections::VecDeque<(f32, ScoreColumnIndex)>,
     /// The key and alleles for the current buffered line.
     current_line_info: Option<(VariantKey, String, String)>,
-    // This is a temporary buffer for reading lines from the file before they
-    // are allocated into the long-lived arena.
+    // Temporary buffer reused for reading raw line data from the file.
     line_string_buffer: String,
     /// 1-based line number in the currently read file.
     file_line_number: u64,
@@ -382,10 +381,6 @@ fn prepare_for_computation_with_retry(
     eprintln!("> Stage 3: Streaming and collecting data from all input files...");
     let overall_start_time = Instant::now();
 
-    // The `bump` arena is used for all temporary string allocations during the
-    // merge-join. This is the core of the zero-copy optimization.
-    let bump = Bump::new();
-
     let mut diagnostics = MergeDiagnosticInfo::default();
     if let Some(regions) = score_regions {
         diagnostics.record_region_filters(regions);
@@ -393,8 +388,8 @@ fn prepare_for_computation_with_retry(
     let mut seen_invalid_bim_chrs: AHashSet<String> = AHashSet::new();
     let mut seen_invalid_score_chrs: AHashSet<String> = AHashSet::new();
 
-    // Create the iterators, giving them a reference to the arena.
-    let mut bim_iterator = BimIterator::new(&fileset_paths, &bump)?;
+    // Create the iterators.
+    let mut bim_iterator = BimIterator::new(&fileset_paths)?;
     let region_filters = score_regions.and_then(|regions| {
         let mut has_any = false;
         let mut filters = Vec::with_capacity(score_names.len());
@@ -412,7 +407,6 @@ fn prepare_for_computation_with_retry(
         sorted_score_files,
         &score_name_to_col_index,
         region_filters.clone(),
-        &bump,
     )?;
 
     let mut bim_iter = bim_iterator.by_ref().peekable();
@@ -538,12 +532,12 @@ fn prepare_for_computation_with_retry(
                     BTreeMap<ScoreColumnIndex, SimpleScoreAssignment>,
                 > = BTreeMap::new();
                 let mut complex_for_key: BTreeMap<
-                    Vec<(BimRowIndex, &str, &str)>,
-                    Vec<(ScoreColumnIndex, f32, &str, &str)>,
+                    Vec<(BimRowIndex, String, String)>,
+                    Vec<(ScoreColumnIndex, f32, String, String)>,
                 > = BTreeMap::new();
 
                 for score_record in score_group {
-                    let outcome = resolve_matches_for_score_line(score_record, &bim_group)?;
+                    let outcome = resolve_matches_for_score_line(&score_record, &bim_group)?;
 
                     match outcome {
                         ReconciliationOutcome::Simple(matches) => {
@@ -568,13 +562,19 @@ fn prepare_for_computation_with_retry(
                         ReconciliationOutcome::Complex(matches) => {
                             let possible_contexts: Vec<_> = matches
                                 .iter()
-                                .map(|rec| (rec.bim_row_index, rec.allele1, rec.allele2))
+                                .map(|rec| {
+                                    (
+                                        rec.bim_row_index,
+                                        rec.allele1.clone(),
+                                        rec.allele2.clone(),
+                                    )
+                                })
                                 .collect();
                             let score_info = (
                                 score_record.score_column_index,
                                 score_record.weight,
-                                score_record.effect_allele,
-                                score_record.other_allele,
+                                score_record.effect_allele.clone(),
+                                score_record.other_allele.clone(),
                             );
                             complex_for_key.entry(possible_contexts).or_default().push(score_info);
                         }
@@ -986,13 +986,11 @@ mod tests {
             start: 140,
             end: 200,
         };
-        let bump = Bump::new();
         let file_paths = vec![score_path];
         let mut iter = KWayMergeIterator::new(
             &file_paths,
             &score_name_to_col_index,
             Some(vec![Some(region)]),
-            &bump,
         )
         .expect("iterator");
 
@@ -1123,8 +1121,7 @@ fn conduct_post_mortem(
     let mut bim_chromosomes: AHashSet<u8> = AHashSet::new();
     let mut score_chromosomes: AHashSet<u8> = AHashSet::new();
 
-    let post_mortem_bump = Bump::new();
-    let mut bim_iter = BimIterator::new(fileset_paths, &post_mortem_bump)?;
+    let mut bim_iter = BimIterator::new(fileset_paths)?;
     let mut previous_bim_key: Option<VariantKey> = None;
 
     while let Some(next_item) = bim_iter.next() {
@@ -1245,8 +1242,8 @@ fn conduct_post_mortem(
     Ok(PostMortemAction::None)
 }
 
-impl<'a, 'arena> BimIterator<'a, 'arena> {
-    fn new(filesets: &'a [FilesetPaths], bump: &'arena Bump) -> Result<Self, PrepError> {
+impl<'a> BimIterator<'a> {
+    fn new(filesets: &'a [FilesetPaths]) -> Result<Self, PrepError> {
         let mut iter = Self {
             filesets: filesets.iter(),
             current_reader: None,
@@ -1254,7 +1251,6 @@ impl<'a, 'arena> BimIterator<'a, 'arena> {
             local_line_num: 0,
             current_path: PathBuf::new(),
             boundaries: Vec::with_capacity(filesets.len()),
-            bump,
             total_variants: 0,
         };
         iter.next_file()?;
@@ -1290,8 +1286,8 @@ impl<'a, 'arena> BimIterator<'a, 'arena> {
     }
 }
 
-impl<'a, 'arena> Iterator for BimIterator<'a, 'arena> {
-    type Item = Result<KeyedBimRecord<'arena>, PrepError>;
+impl<'a> Iterator for BimIterator<'a> {
+    type Item = Result<KeyedBimRecord, PrepError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -1311,8 +1307,7 @@ impl<'a, 'arena> Iterator for BimIterator<'a, 'arena> {
                         }
                     };
 
-                    let line_in_arena = self.bump.alloc_str(line_str);
-                    let mut parts = line_in_arena.split_whitespace();
+                    let mut parts = line_str.split_whitespace();
                     let chr = parts.next();
                     parts.next();
                     parts.next();
@@ -1328,8 +1323,8 @@ impl<'a, 'arena> Iterator for BimIterator<'a, 'arena> {
                                     bim_row_index: BimRowIndex(
                                         self.global_offset + self.local_line_num - 1,
                                     ),
-                                    allele1: a1,
-                                    allele2: a2,
+                                    allele1: a1.to_string(),
+                                    allele2: a2.to_string(),
                                 }));
                             }
                             Err(e) => return Some(Err(e)),
@@ -1349,12 +1344,11 @@ impl<'a, 'arena> Iterator for BimIterator<'a, 'arena> {
     }
 }
 
-impl<'arena> KWayMergeIterator<'arena> {
+impl KWayMergeIterator {
     fn new(
         file_paths: &[PathBuf],
         score_name_to_col_index: &AHashMap<String, ScoreColumnIndex>,
         region_filters: Option<Vec<Option<GenomicRegion>>>,
-        bump: &'arena Bump,
     ) -> Result<Self, PrepError> {
         let mut streams = Vec::with_capacity(file_paths.len());
         let mut file_column_maps = Vec::with_capacity(file_paths.len());
@@ -1416,7 +1410,6 @@ impl<'arena> KWayMergeIterator<'arena> {
             next_error: None,
             region_filters,
             region_filter_hits,
-            bump,
         };
 
         for i in 0..iter.streams.len() {
@@ -1428,7 +1421,6 @@ impl<'arena> KWayMergeIterator<'arena> {
 
     fn replenish_from_stream(&mut self, file_idx: usize) -> Result<(), PrepError> {
         let column_map = &self.file_column_maps[file_idx];
-        let bump = self.bump;
 
         if self.region_filters.is_none() {
             loop {
@@ -1439,7 +1431,7 @@ impl<'arena> KWayMergeIterator<'arena> {
                         return Ok(());
                     }
 
-                    Self::read_line_into_buffer(stream, column_map, None, None, bump)?
+                    Self::read_line_into_buffer(stream, column_map, None, None)?
                 };
 
                 match outcome {
@@ -1473,7 +1465,6 @@ impl<'arena> KWayMergeIterator<'arena> {
                     column_map,
                     region_filters,
                     region_hits_slice,
-                    bump,
                 )?
             };
 
@@ -1494,11 +1485,10 @@ impl<'arena> KWayMergeIterator<'arena> {
     }
 
     fn read_line_into_buffer(
-        stream: &mut FileStream<'arena>,
+        stream: &mut FileStream,
         column_map: &[ScoreColumnIndex],
         region_filters: Option<&[Option<GenomicRegion>]>,
         mut region_hits: Option<&mut [bool]>,
-        bump: &'arena Bump,
     ) -> Result<LineReadOutcome, PrepError> {
         stream.line_buffer.clear();
         stream.current_line_info = None;
@@ -1521,10 +1511,7 @@ impl<'arena> KWayMergeIterator<'arena> {
                 continue;
             }
 
-            // Use the `bump` argument, not `self.bump`.
-            let line_in_arena = bump.alloc_str(&stream.line_string_buffer);
-
-            let mut parts = line_in_arena.split('\t');
+            let mut parts = stream.line_string_buffer.split('\t');
             let (variant_id, effect_allele, other_allele) =
                 match (parts.next(), parts.next(), parts.next()) {
                     (Some(v), Some(e), Some(o))
@@ -1542,7 +1529,7 @@ impl<'arena> KWayMergeIterator<'arena> {
             let chr_str = key_parts.next().unwrap_or("");
             let pos_str = key_parts.next().unwrap_or("");
             let key = parse_key(chr_str, pos_str)?;
-            stream.current_line_info = Some((key, effect_allele, other_allele));
+            stream.current_line_info = Some((key, effect_allele.to_string(), other_allele.to_string()));
 
             for (i, weight_str) in parts.enumerate() {
                 if let Ok(weight) = weight_str.trim().parse::<f32>()
@@ -1573,16 +1560,19 @@ impl<'arena> KWayMergeIterator<'arena> {
     }
 
     fn push_next_from_buffer_to_heap(
-        stream: &mut FileStream<'arena>,
+        stream: &mut FileStream,
         file_idx: usize,
-        heap: &mut BinaryHeap<HeapItem<'arena>>,
+        heap: &mut BinaryHeap<HeapItem>,
     ) {
         if let Some((weight, score_column_index)) = stream.line_buffer.pop_front() {
-            let (key, effect_allele, other_allele) = stream.current_line_info.unwrap();
+            let (key, effect_allele, other_allele) = stream
+                .current_line_info
+                .as_ref()
+                .expect("line info must exist when line buffer is non-empty");
             let record = KeyedScoreRecord {
-                key,
-                effect_allele,
-                other_allele,
+                key: *key,
+                effect_allele: effect_allele.clone(),
+                other_allele: other_allele.clone(),
                 score_column_index,
                 weight,
             };
@@ -1595,8 +1585,8 @@ impl<'arena> KWayMergeIterator<'arena> {
     }
 }
 
-impl<'arena> Iterator for KWayMergeIterator<'arena> {
-    type Item = Result<KeyedScoreRecord<'arena>, PrepError>;
+impl Iterator for KWayMergeIterator {
+    type Item = Result<KeyedScoreRecord, PrepError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(e) = self.next_error.take() {
@@ -1615,10 +1605,10 @@ impl<'arena> Iterator for KWayMergeIterator<'arena> {
     }
 }
 
-fn resolve_matches_for_score_line<'a, 'arena>(
-    score_record: KeyedScoreRecord,
-    bim_records_for_position: &'a [KeyedBimRecord<'arena>],
-) -> Result<ReconciliationOutcome<'a, 'arena>, PrepError> {
+fn resolve_matches_for_score_line<'a>(
+    score_record: &KeyedScoreRecord,
+    bim_records_for_position: &'a [KeyedBimRecord],
+) -> Result<ReconciliationOutcome<'a>, PrepError> {
     let is_multiallelic_site = bim_records_for_position.len() > 1;
 
     if is_multiallelic_site {
@@ -1627,9 +1617,9 @@ fn resolve_matches_for_score_line<'a, 'arena>(
     }
 
     let mut simple_matches = BTreeMap::new();
+    let effect_allele = score_record.effect_allele.as_str();
     for record_tuple in bim_records_for_position {
-        if record_tuple.allele1 == score_record.effect_allele
-            || record_tuple.allele2 == score_record.effect_allele
+        if record_tuple.allele1 == effect_allele || record_tuple.allele2 == effect_allele
         {
             simple_matches.insert(record_tuple.bim_row_index, record_tuple);
         }
