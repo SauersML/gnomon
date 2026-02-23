@@ -159,9 +159,9 @@ log_header "Checking Latest Binary Release"
 
 # Fetch all releases to find the most recent one with binary assets
 # This skips model-only releases (e.g., models-v1) automatically
-API_URL="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases"
+API_URL="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases?per_page=100&_=$(date +%s)"
 
-CURL_ARGS=(-sL --retry 5 --retry-delay 2 --retry-connrefused --connect-timeout 5 --max-time 20)
+CURL_ARGS=(-sL --retry 5 --retry-delay 2 --retry-connrefused --connect-timeout 5 --max-time 20 -H "Cache-Control: no-cache" -H "Pragma: no-cache")
 if [ -n "$GITHUB_TOKEN" ]; then
     log_info "Using GITHUB_TOKEN for authenticated API request."
     CURL_ARGS+=(-H "Authorization: token $GITHUB_TOKEN")
@@ -173,6 +173,7 @@ fi
 MAX_RETRIES=30
 DELAY=5
 DOWNLOAD_URL=""
+RELEASE_TAG=""
 
 for ((i=1; i<=MAX_RETRIES; i++)); do
     # Only print "Fetching..." on first attempt or every 5th retry to reduce log noise
@@ -206,7 +207,12 @@ if [ -z "$DOWNLOAD_URL" ]; then
     exit 1
 fi
 
+RELEASE_TAG="$(echo "$DOWNLOAD_URL" | sed -n 's#.*/download/\([^/]*\)/.*#\1#p' | head -n 1)"
 log_success "Found latest binary release."
+if [ -n "$RELEASE_TAG" ]; then
+    log_info "Selected release tag: ${BOLD}${RELEASE_TAG}${RESET}"
+fi
+log_info "Download URL: ${DOWNLOAD_URL}"
 
 # --- 3. Download & Install ---
 log_header "Installing gnomon"
@@ -279,6 +285,19 @@ INSTALLED_BIN="${INSTALL_DIR}/${DEST_BINARY_NAME}"
 # Test the binary directly from install path
 if [ -x "$INSTALLED_BIN" ] && "$INSTALLED_BIN" --help >/dev/null 2>&1; then
     log_success "Successfully installed gnomon!"
+
+    # If another gnomon earlier in PATH shadows this install, update it too when writable.
+    PATH_BIN="$(command -v gnomon 2>/dev/null || true)"
+    if [ -n "$PATH_BIN" ] && [ "$PATH_BIN" != "$INSTALLED_BIN" ]; then
+        log_info "Detected another gnomon in PATH before ${INSTALL_DIR}: ${PATH_BIN}"
+        if [ -w "$PATH_BIN" ]; then
+            cp "$INSTALLED_BIN" "$PATH_BIN"
+            chmod +x "$PATH_BIN"
+            log_success "Updated shadowing binary at ${PATH_BIN}"
+        else
+            log_info "Cannot overwrite ${PATH_BIN} (not writable). Use ${INSTALLED_BIN} directly or adjust PATH."
+        fi
+    fi
     
     # Check if install dir is in PATH
     if [[ ":$PATH:" == *":$INSTALL_DIR:"* ]]; then
