@@ -143,7 +143,7 @@ jobs:
 
       - name: Generate release tag
         id: tag
-        run: echo "release_tag=auto-$(date +'%Y%m%d-%H%M%S')" >> $GITHUB_OUTPUT
+        run: echo "release_tag=auto-${{ github.run_id }}-${{ github.run_number }}" >> $GITHUB_OUTPUT
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
