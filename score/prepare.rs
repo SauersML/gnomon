@@ -27,6 +27,7 @@ use std::io::{self, BufRead, BufReader};
 use std::num::ParseFloatError;
 use std::path::{Path, PathBuf};
 use std::str::Utf8Error;
+use std::sync::Arc;
 use std::time::Instant;
 
 // The number of SIMD lanes in the kernel. This MUST be kept in sync with kernel.rs.
@@ -63,8 +64,8 @@ struct KeyedBimRecord {
 #[derive(Debug, Clone)]
 struct KeyedScoreRecord {
     key: VariantKey,
-    effect_allele: String,
-    other_allele: String,
+    effect_allele: Arc<str>,
+    other_allele: Arc<str>,
     score_column_index: ScoreColumnIndex,
     weight: f32,
 }
@@ -116,7 +117,7 @@ struct FileStream {
     /// A buffer for weights and column indices from the current line being processed.
     line_buffer: std::collections::VecDeque<(f32, ScoreColumnIndex)>,
     /// The key and alleles for the current buffered line.
-    current_line_info: Option<(VariantKey, String, String)>,
+    current_line_info: Option<(VariantKey, Arc<str>, Arc<str>)>,
     // Temporary buffer reused for reading raw line data from the file.
     line_string_buffer: String,
     /// 1-based line number in the currently read file.
@@ -542,7 +543,8 @@ fn prepare_for_computation_with_retry(
                     match outcome {
                         ReconciliationOutcome::Simple(matches) => {
                             for bim_rec in matches {
-                                let is_flipped = score_record.effect_allele == bim_rec.allele1;
+                                let is_flipped =
+                                    score_record.effect_allele.as_ref() == bim_rec.allele1.as_str();
                                 let score_map =
                                     simple_for_key.entry(bim_rec.bim_row_index).or_default();
 
@@ -573,8 +575,8 @@ fn prepare_for_computation_with_retry(
                             let score_info = (
                                 score_record.score_column_index,
                                 score_record.weight,
-                                score_record.effect_allele.clone(),
-                                score_record.other_allele.clone(),
+                                score_record.effect_allele.to_string(),
+                                score_record.other_allele.to_string(),
                             );
                             complex_for_key.entry(possible_contexts).or_default().push(score_info);
                         }
@@ -606,15 +608,12 @@ fn prepare_for_computation_with_retry(
 
                     final_complex_rules.push(GroupedComplexRule {
                         locus_chr_pos: (chr_str, key.1),
-                        possible_contexts: contexts
-                            .into_iter()
-                            .map(|(idx, a1, a2)| (idx, a1.to_string(), a2.to_string()))
-                            .collect(),
+                        possible_contexts: contexts,
                         score_applications: scores
                             .into_iter()
                             .map(|(sc_idx, weight, ea, oa)| ScoreInfo {
-                                effect_allele: ea.to_string(),
-                                other_allele: oa.to_string(),
+                                effect_allele: ea,
+                                other_allele: oa,
                                 weight,
                                 score_column_index: sc_idx,
                             })
@@ -1427,7 +1426,7 @@ impl KWayMergeIterator {
                 let outcome = {
                     let stream = &mut self.streams[file_idx];
                     if !stream.line_buffer.is_empty() {
-                        Self::push_next_from_buffer_to_heap(stream, file_idx, &mut self.heap);
+                        Self::push_next_from_buffer_to_heap(stream, file_idx, &mut self.heap)?;
                         return Ok(());
                     }
 
@@ -1437,7 +1436,7 @@ impl KWayMergeIterator {
                 match outcome {
                     LineReadOutcome::Pushed => {
                         let stream = &mut self.streams[file_idx];
-                        Self::push_next_from_buffer_to_heap(stream, file_idx, &mut self.heap);
+                        Self::push_next_from_buffer_to_heap(stream, file_idx, &mut self.heap)?;
                         return Ok(());
                     }
                     LineReadOutcome::Skipped => continue,
@@ -1453,7 +1452,7 @@ impl KWayMergeIterator {
             let outcome = {
                 let stream = &mut self.streams[file_idx];
                 if !stream.line_buffer.is_empty() {
-                    Self::push_next_from_buffer_to_heap(stream, file_idx, &mut self.heap);
+                    Self::push_next_from_buffer_to_heap(stream, file_idx, &mut self.heap)?;
                     self.region_filter_hits = region_hits;
                     return Ok(());
                 }
@@ -1471,7 +1470,7 @@ impl KWayMergeIterator {
             match outcome {
                 LineReadOutcome::Pushed => {
                     let stream = &mut self.streams[file_idx];
-                    Self::push_next_from_buffer_to_heap(stream, file_idx, &mut self.heap);
+                    Self::push_next_from_buffer_to_heap(stream, file_idx, &mut self.heap)?;
                     self.region_filter_hits = region_hits;
                     return Ok(());
                 }
@@ -1529,7 +1528,11 @@ impl KWayMergeIterator {
             let chr_str = key_parts.next().unwrap_or("");
             let pos_str = key_parts.next().unwrap_or("");
             let key = parse_key(chr_str, pos_str)?;
-            stream.current_line_info = Some((key, effect_allele.to_string(), other_allele.to_string()));
+            stream.current_line_info = Some((
+                key,
+                Arc::<str>::from(effect_allele),
+                Arc::<str>::from(other_allele),
+            ));
 
             for (i, weight_str) in parts.enumerate() {
                 if let Ok(weight) = weight_str.trim().parse::<f32>()
@@ -1563,12 +1566,16 @@ impl KWayMergeIterator {
         stream: &mut FileStream,
         file_idx: usize,
         heap: &mut BinaryHeap<HeapItem>,
-    ) {
+    ) -> Result<(), PrepError> {
         if let Some((weight, score_column_index)) = stream.line_buffer.pop_front() {
-            let (key, effect_allele, other_allele) = stream
-                .current_line_info
-                .as_ref()
-                .expect("line info must exist when line buffer is non-empty");
+            let (key, effect_allele, other_allele) = stream.current_line_info.as_ref().ok_or_else(
+                || {
+                    PrepError::Invariant(
+                        "Score stream invariant violated: non-empty line buffer without current line info."
+                            .to_string(),
+                    )
+                },
+            )?;
             let record = KeyedScoreRecord {
                 key: *key,
                 effect_allele: effect_allele.clone(),
@@ -1578,6 +1585,7 @@ impl KWayMergeIterator {
             };
             heap.push(HeapItem { record, file_idx });
         }
+        Ok(())
     }
 
     fn take_region_filter_hits(&mut self) -> Option<Vec<bool>> {
@@ -1617,9 +1625,10 @@ fn resolve_matches_for_score_line<'a>(
     }
 
     let mut simple_matches = BTreeMap::new();
-    let effect_allele = score_record.effect_allele.as_str();
+    let effect_allele = score_record.effect_allele.as_ref();
     for record_tuple in bim_records_for_position {
-        if record_tuple.allele1 == effect_allele || record_tuple.allele2 == effect_allele
+        if record_tuple.allele1.as_str() == effect_allele
+            || record_tuple.allele2.as_str() == effect_allele
         {
             simple_matches.insert(record_tuple.bim_row_index, record_tuple);
         }
