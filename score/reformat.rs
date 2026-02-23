@@ -180,6 +180,7 @@ pub enum ReformatError {
         line_number: usize,
         line_content: String,
         missing_column_name: String,
+        column_diagnostics: Option<String>,
     },
     /// A value in the file could not be parsed correctly.
     Parse {
@@ -222,6 +223,7 @@ impl Display for ReformatError {
                 line_number,
                 line_content,
                 missing_column_name,
+                column_diagnostics,
             } => {
                 writeln!(f, "File:         {}", path.display())?;
                 writeln!(f, "Line Number:  {line_number}")?;
@@ -231,6 +233,9 @@ impl Display for ReformatError {
                     f,
                     "Details:      Expected to find column '{missing_column_name}', but it was not found in the header or data for this line."
                 )?;
+                if let Some(diag) = column_diagnostics {
+                    writeln!(f, "Header Parse: {diag}")?;
+                }
             }
             ReformatError::Parse {
                 path,
@@ -276,6 +281,40 @@ impl From<io::Error> for ReformatError {
     fn from(err: io::Error) -> Self {
         ReformatError::Io(err)
     }
+}
+
+fn build_header_column_diagnostics(header_line: &str) -> String {
+    let tab_columns: Vec<&str> = header_line.split('\t').collect();
+    let ws_columns: Vec<&str> = header_line.split_whitespace().collect();
+
+    let delimiter_hint = if tab_columns.len() > 1 {
+        "tab-delimited header detected"
+    } else if ws_columns.len() > 1 {
+        "header appears whitespace-delimited (spaces) instead of tab-delimited"
+    } else {
+        "header appears to be a single token"
+    };
+
+    let parsed_columns = if tab_columns.len() > 1 {
+        tab_columns
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+    } else {
+        ws_columns
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+    };
+
+    format!(
+        "{}; parsed {} column(s): [{}]",
+        delimiter_hint,
+        parsed_columns.len(),
+        parsed_columns.join(", ")
+    )
 }
 
 /// Reformat a PGS Catalog scoring file into a gnomon-native, sorted TSV.
@@ -433,6 +472,7 @@ pub fn reformat_pgs_file(input_path: &Path, output_path: &Path) -> Result<Reform
                 line_number: 0,
                 line_content: header_line.to_string(),
                 missing_column_name: "effect_allele".to_string(),
+                column_diagnostics: Some(build_header_column_diagnostics(header_line)),
             })?,
         ew: *header_map
             .get("effect_weight")
@@ -441,6 +481,7 @@ pub fn reformat_pgs_file(input_path: &Path, output_path: &Path) -> Result<Reform
                 line_number: 0,
                 line_content: header_line.to_string(),
                 missing_column_name: "effect_weight".to_string(),
+                column_diagnostics: Some(build_header_column_diagnostics(header_line)),
             })?,
         oa: header_map
             .get("other_allele")
@@ -811,6 +852,7 @@ pub fn sort_plink_fileset(
                 line_number,
                 line_content: line,
                 missing_column_name: "chromosome/position".to_string(),
+                column_diagnostics: None,
             });
         }
 
