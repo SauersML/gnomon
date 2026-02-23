@@ -7,6 +7,10 @@ on:
       - master
   workflow_dispatch:
 
+concurrency:
+  group: build-release-all-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -96,8 +100,8 @@ jobs:
           # Use specific CPU target instead of 'native' to fix ring#2527 while keeping max optimization
           RUSTFLAGS: "-C target-cpu=${{ matrix.cpu }}"
           GNOMON_SKIP_LINT_CHECKS: "1"
-          # Embed release tag in binary for version command
-          GNOMON_RELEASE_TAG: "auto-${{ github.run_id }}-${{ github.run_number }}"
+          # Embed commit-addressable release tag in binary for version command
+          GNOMON_RELEASE_TAG: "main-${{ github.sha }}"
         run: cargo +nightly build --release --target ${{ matrix.target }}
 
 
@@ -143,7 +147,7 @@ jobs:
 
       - name: Generate release tag
         id: tag
-        run: echo "release_tag=auto-${{ github.run_id }}-${{ github.run_number }}" >> $GITHUB_OUTPUT
+        run: echo "release_tag=main-${{ github.sha }}" >> $GITHUB_OUTPUT
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
