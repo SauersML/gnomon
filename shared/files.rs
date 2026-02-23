@@ -1047,23 +1047,23 @@ fn fetch_http_length(client: &Client, url: &str) -> Result<u64, PipelineError> {
         .get(url)
         .header(RANGE, "bytes=0-0")
         .send()
-        .map_err(|e| {
-            PipelineError::Io(format!("Failed to request HTTP range for {url}: {e:?}"))
-        })?;
+        .map_err(|e| PipelineError::Io(format!("Failed to request HTTP range for {url}: {e:?}")))?;
 
     if response.status() == StatusCode::PARTIAL_CONTENT
         && let Some(total) =
-            HttpByteRangeSource::parse_content_range(response.headers().get(CONTENT_RANGE)) {
-            let _ = response.bytes();
-            return Ok(total);
-        }
+            HttpByteRangeSource::parse_content_range(response.headers().get(CONTENT_RANGE))
+    {
+        let _ = response.bytes();
+        return Ok(total);
+    }
 
     if response.status().is_success()
         && let Some(len) =
-            HttpByteRangeSource::parse_content_length(response.headers().get(CONTENT_LENGTH)) {
-            let _ = response.bytes();
-            return Ok(len);
-        }
+            HttpByteRangeSource::parse_content_length(response.headers().get(CONTENT_LENGTH))
+    {
+        let _ = response.bytes();
+        return Ok(len);
+    }
 
     let status = response.status();
     Err(PipelineError::Io(format!(
@@ -1218,17 +1218,16 @@ impl TextSource for StreamingTextSource {
         }
 
         loop {
-            if self.cursor >= self.valid
-                && !self.fill_buffer()? {
-                    if self.carry.is_empty() {
-                        return Ok(None);
-                    }
-                    if self.carry.last() == Some(&b'\r') {
-                        self.carry.pop();
-                    }
-                    self.carry_active = true;
-                    return Ok(Some(&self.carry));
+            if self.cursor >= self.valid && !self.fill_buffer()? {
+                if self.carry.is_empty() {
+                    return Ok(None);
                 }
+                if self.carry.last() == Some(&b'\r') {
+                    self.carry.pop();
+                }
+                self.carry_active = true;
+                return Ok(Some(&self.carry));
+            }
 
             if let Some(rel_pos) = self.buffer[self.cursor..self.valid]
                 .iter()
@@ -1687,16 +1686,12 @@ impl HttpStreamingReader {
         if self.response.is_some() {
             return Ok(());
         }
-        let response = self
-            .client
-            .get(&self.url)
-            .send()
-            .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("Failed to start HTTP read for {}: {e}", self.url),
-                )
-            })?;
+        let response = self.client.get(&self.url).send().map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("Failed to start HTTP read for {}: {e}", self.url),
+            )
+        })?;
         if !response.status().is_success() {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
@@ -1766,16 +1761,18 @@ impl HttpByteRangeSource {
             })?;
 
         if response.status() == StatusCode::PARTIAL_CONTENT
-            && let Some(total) = Self::parse_content_range(response.headers().get(CONTENT_RANGE)) {
-                let _ = response.bytes();
-                return Ok(total);
-            }
+            && let Some(total) = Self::parse_content_range(response.headers().get(CONTENT_RANGE))
+        {
+            let _ = response.bytes();
+            return Ok(total);
+        }
 
         if response.status().is_success()
-            && let Some(len) = Self::parse_content_length(response.headers().get(CONTENT_LENGTH)) {
-                let _ = response.bytes();
-                return Ok(len);
-            }
+            && let Some(len) = Self::parse_content_length(response.headers().get(CONTENT_LENGTH))
+        {
+            let _ = response.bytes();
+            return Ok(len);
+        }
 
         let status = response.status();
         Err(PipelineError::Io(format!(
@@ -1840,13 +1837,12 @@ impl HttpByteRangeSource {
                 ))
             })?;
         let status = response.status();
-        if status != StatusCode::PARTIAL_CONTENT
-            && !(status.is_success() && start == 0) {
-                return Err(PipelineError::Io(format!(
-                    "HTTP range request for {} returned unexpected status {status}",
-                    self.url
-                )));
-            }
+        if status != StatusCode::PARTIAL_CONTENT && !(status.is_success() && start == 0) {
+            return Err(PipelineError::Io(format!(
+                "HTTP range request for {} returned unexpected status {status}",
+                self.url
+            )));
+        }
 
         let bytes = response.bytes().map_err(|e| {
             PipelineError::Io(format!("Failed to read HTTP body from {}: {e}", self.url))
@@ -2032,9 +2028,10 @@ impl RemoteCache {
             return;
         }
         if self.order.len() == self.capacity
-            && let Some(oldest) = self.order.pop_front() {
-                self.blocks.remove(&oldest);
-            }
+            && let Some(oldest) = self.order.pop_front()
+        {
+            self.blocks.remove(&oldest);
+        }
         self.order.push_back(key);
         self.blocks.insert(key, value);
     }

@@ -8,21 +8,20 @@ pub mod data;
 pub mod survival_data;
 
 pub mod calibrator;
+pub mod diagnostics;
 pub mod estimate;
 pub mod faer_ndarray;
+pub mod hmc;
 pub mod hull;
 pub mod joint;
-pub mod model;
 pub mod matrix;
+pub mod model;
 pub mod pirls;
-pub mod survival;
 pub mod quadrature;
-pub mod hmc;
 pub mod seeding;
-pub mod visualizer;
+pub mod survival;
 pub mod types;
-pub mod diagnostics;
+pub mod visualizer;
 
 #[cfg(test)]
 pub mod test_fixtures;
-

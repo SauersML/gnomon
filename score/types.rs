@@ -168,10 +168,12 @@ pub struct PreparationResult {
     // --- Private, compiled data matrices ---
     // These fields are private to guarantee their invariants. They are created once
     // by the `prepare` module and can only be read by downstream modules.
-    weights_matrix: Vec<f32>,
-    flip_mask_matrix: Vec<u8>,
-    missing_correction_matrix: Vec<f32>,
+    sparse_weights: Vec<f32>,
+    sparse_missing_corrections: Vec<f32>,
+    sparse_score_columns: Vec<u32>,
+    sparse_row_offsets: Vec<u64>,
     stride: usize,
+    baseline_missing_sum_by_score: Vec<f64>,
 
     // --- Public metadata & lookup tables ---
     /// The sorted list of original `.bim` row indices for the "fast path."
@@ -194,9 +196,6 @@ pub struct PreparationResult {
     /// This is used as the denominator for per-variant-average and missing % calculations.
     /// The order matches `score_names`.
     pub score_variant_counts: Vec<u32>,
-    /// A "missingness blueprint" mapping each dense matrix row (variant) to the
-    /// score column indices it affects.
-    pub variant_to_scores_map: Vec<Vec<ScoreColumnIndex>>,
     /// The exact subset of individuals to be processed.
     pub person_subset: PersonSubset,
     /// The list of Individual IDs (IIDs) for the individuals being scored, in the
@@ -231,15 +230,16 @@ impl PreparationResult {
     /// Only the `prepare` module can construct this "proof token".
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        weights_matrix: Vec<f32>,
-        flip_mask_matrix: Vec<u8>,
-        missing_correction_matrix: Vec<f32>,
+        sparse_weights: Vec<f32>,
+        sparse_missing_corrections: Vec<f32>,
+        sparse_score_columns: Vec<u32>,
+        sparse_row_offsets: Vec<u64>,
         stride: usize,
+        baseline_missing_sum_by_score: Vec<f64>,
         required_bim_indices: Vec<BimRowIndex>,
         complex_rules: Vec<GroupedComplexRule>,
         score_names: Vec<String>,
         score_variant_counts: Vec<u32>,
-        variant_to_scores_map: Vec<Vec<ScoreColumnIndex>>,
         person_subset: PersonSubset,
         final_person_iids: Vec<String>,
         num_people_to_score: usize,
@@ -256,15 +256,16 @@ impl PreparationResult {
         pipeline_kind: PipelineKind,
     ) -> Self {
         Self {
-            weights_matrix,
-            flip_mask_matrix,
-            missing_correction_matrix,
+            sparse_weights,
+            sparse_missing_corrections,
+            sparse_score_columns,
+            sparse_row_offsets,
             stride,
+            baseline_missing_sum_by_score,
             required_bim_indices,
             complex_rules,
             score_names,
             score_variant_counts,
-            variant_to_scores_map,
             person_subset,
             final_person_iids,
             num_people_to_score,
@@ -285,23 +286,43 @@ impl PreparationResult {
     // --- Public Getters for Private Data ---
 
     #[inline(always)]
-    pub fn weights_matrix(&self) -> &[f32] {
-        &self.weights_matrix
+    pub fn sparse_weights(&self) -> &[f32] {
+        &self.sparse_weights
     }
 
     #[inline(always)]
-    pub fn flip_mask_matrix(&self) -> &[u8] {
-        &self.flip_mask_matrix
+    pub fn sparse_missing_corrections(&self) -> &[f32] {
+        &self.sparse_missing_corrections
     }
 
     #[inline(always)]
-    pub fn missing_correction_matrix(&self) -> &[f32] {
-        &self.missing_correction_matrix
+    pub fn sparse_score_columns(&self) -> &[u32] {
+        &self.sparse_score_columns
+    }
+
+    #[inline(always)]
+    pub fn sparse_row_offsets(&self) -> &[u64] {
+        &self.sparse_row_offsets
     }
 
     #[inline(always)]
     pub fn stride(&self) -> usize {
         self.stride
+    }
+
+    #[inline(always)]
+    pub fn baseline_missing_sum_by_score(&self) -> &[f64] {
+        &self.baseline_missing_sum_by_score
+    }
+
+    #[inline(always)]
+    pub fn sparse_row_range(&self, variant_idx: usize) -> std::ops::Range<usize> {
+        debug_assert!(variant_idx + 1 < self.sparse_row_offsets.len());
+        let start = self.sparse_row_offsets[variant_idx] as usize;
+        let end = self.sparse_row_offsets[variant_idx + 1] as usize;
+        debug_assert!(end >= start);
+        debug_assert!(end <= self.sparse_weights.len());
+        start..end
     }
 
     #[inline(always)]
@@ -344,7 +365,7 @@ pub struct OriginalPersonIndex(pub u32);
 #[repr(transparent)]
 pub struct BimRowIndex(pub u64);
 
-/// An index into the dense, reconciled matrices (`weights_matrix`, `flip_mask_matrix`).
+/// An index into the reconciled variant rows.
 /// This wraps a u32, which is sufficient for >4 billion variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]

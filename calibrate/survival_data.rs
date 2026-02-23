@@ -264,7 +264,12 @@ pub fn load_survival_prediction_covariates(
     }
 
     // Skip known outcome columns if present
-    for skip in &["age_exit", "event_target", "event_competing", "sample_weight"] {
+    for skip in &[
+        "age_exit",
+        "event_target",
+        "event_competing",
+        "sample_weight",
+    ] {
         if let Some(actual) = name_map.get(&skip.to_ascii_lowercase()) {
             used_columns.insert(actual.clone());
         }
@@ -487,12 +492,10 @@ fn read_tabular(path: &str) -> Result<DataFrame, SurvivalDataError> {
 pub fn has_survival_columns(path: &str) -> Result<bool, SurvivalDataError> {
     let df = read_tabular(path)?;
     let name_map = build_case_insensitive_map(df.get_column_names());
-    Ok(
-        name_map.contains_key("age_entry")
-            && name_map.contains_key("age_exit")
-            && name_map.contains_key("event_target")
-            && name_map.contains_key("event_competing"),
-    )
+    Ok(name_map.contains_key("age_entry")
+        && name_map.contains_key("age_exit")
+        && name_map.contains_key("event_target")
+        && name_map.contains_key("event_competing"))
 }
 
 fn build_case_insensitive_map<I, S>(names: I) -> HashMap<String, String>

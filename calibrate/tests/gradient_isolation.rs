@@ -11,30 +11,30 @@
 //! 4. Rank-deficient penalties: difference and near-null cases
 //! 5. Projected tensor penalty: constraint projection
 
-use ndarray::{array, Array1, Array2};
+use ndarray::{Array1, Array2, array};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
 use faer::Side;
 use faer::linalg::solvers::Solve;
-use gnomon::calibrate::calibrator::FirthSpec;
 use gnomon::calibrate::basis::{
-    apply_sum_to_zero_constraint, create_basis, create_difference_penalty_matrix, BasisOptions,
-    Dense, KnotSource,
+    BasisOptions, Dense, KnotSource, apply_sum_to_zero_constraint, create_basis,
+    create_difference_penalty_matrix,
 };
+use gnomon::calibrate::calibrator::FirthSpec;
 use gnomon::calibrate::construction::{
-    build_design_and_penalty_matrices, compute_penalty_square_roots, stable_reparameterization,
-    ModelLayout,
+    ModelLayout, build_design_and_penalty_matrices, compute_penalty_square_roots,
+    stable_reparameterization,
 };
 use gnomon::calibrate::data::TrainingData;
 use gnomon::calibrate::estimate::{
-    evaluate_external_cost_and_ridge, evaluate_external_gradients, optimize_external_design,
-    ExternalOptimOptions,
+    ExternalOptimOptions, evaluate_external_cost_and_ridge, evaluate_external_gradients,
+    optimize_external_design,
 };
 use gnomon::calibrate::faer_ndarray::FaerCholesky;
 use gnomon::calibrate::model::{
-    default_reml_parallel_threshold, BasisConfig, InteractionPenaltyKind, LinkFunction,
-    ModelConfig, ModelFamily, PrincipalComponentConfig,
+    BasisConfig, InteractionPenaltyKind, LinkFunction, ModelConfig, ModelFamily,
+    PrincipalComponentConfig, default_reml_parallel_threshold,
 };
 use gnomon::calibrate::pirls::{calculate_deviance, fit_model_for_fixed_rho, update_glm_vectors};
 use gnomon::calibrate::types::LogSmoothingParamsView;
@@ -52,7 +52,7 @@ fn diagonal_penalty(p: usize, start: usize, end: usize) -> Array2<f64> {
 /// Generate synthetic logit data.
 fn generate_logit_data(n: usize, p: usize, seed: u64) -> (Array1<f64>, Array2<f64>, Array1<f64>) {
     let mut rng = StdRng::seed_from_u64(seed);
-    
+
     let mut x = Array2::<f64>::zeros((n, p));
     for i in 0..n {
         x[[i, 0]] = 1.0; // intercept
@@ -60,11 +60,11 @@ fn generate_logit_data(n: usize, p: usize, seed: u64) -> (Array1<f64>, Array2<f6
             x[[i, j]] = rng.random_range(-1.0..1.0);
         }
     }
-    
+
     let true_beta: Array1<f64> = (0..p)
         .map(|j| if j == 0 { 0.0 } else { 0.2 / (j as f64) })
         .collect();
-    
+
     let eta = x.dot(&true_beta);
     let y: Array1<f64> = eta
         .iter()
@@ -73,7 +73,7 @@ fn generate_logit_data(n: usize, p: usize, seed: u64) -> (Array1<f64>, Array2<f6
             if rng.random::<f64>() < prob { 1.0 } else { 0.0 }
         })
         .collect();
-    
+
     let weights = Array1::<f64>::ones(n);
     (y, x, weights)
 }
@@ -104,9 +104,13 @@ fn generate_logit_data_no_intercept(
 }
 
 /// Generate Gaussian data for identity link tests.
-fn generate_gaussian_data(n: usize, p: usize, seed: u64) -> (Array1<f64>, Array2<f64>, Array1<f64>) {
+fn generate_gaussian_data(
+    n: usize,
+    p: usize,
+    seed: u64,
+) -> (Array1<f64>, Array2<f64>, Array1<f64>) {
     let mut rng = StdRng::seed_from_u64(seed);
-    
+
     let mut x = Array2::<f64>::zeros((n, p));
     for i in 0..n {
         x[[i, 0]] = 1.0;
@@ -114,17 +118,17 @@ fn generate_gaussian_data(n: usize, p: usize, seed: u64) -> (Array1<f64>, Array2
             x[[i, j]] = rng.random_range(-1.0..1.0);
         }
     }
-    
+
     let true_beta: Array1<f64> = (0..p)
         .map(|j| if j == 0 { 1.0 } else { 0.5 / (j as f64) })
         .collect();
-    
+
     let eta = x.dot(&true_beta);
     let y: Array1<f64> = eta
         .iter()
         .map(|&e| e + rng.random_range(-0.5..0.5))
         .collect();
-    
+
     let weights = Array1::<f64>::ones(n);
     (y, x, weights)
 }
@@ -156,7 +160,11 @@ fn create_logistic_training_data(n_samples: usize, num_pcs: usize, seed: u64) ->
     let mut y = Array1::zeros(n_samples);
     for i in 0..n_samples {
         let prob = 1.0 / (1.0 + (-eta[i]).exp());
-        y[i] = if rng.random_range(0.0..1.0) < prob { 1.0 } else { 0.0 };
+        y[i] = if rng.random_range(0.0..1.0) < prob {
+            1.0
+        } else {
+            0.0
+        };
     }
 
     let sex = Array1::from_iter((0..n_samples).map(|_| {
@@ -344,15 +352,19 @@ fn check_gradient(
 ) -> Result<(f64, f64, f64, f64), String> {
     let n = x.nrows();
     let offset = Array1::<f64>::zeros(n);
-    
+
     let opts = ExternalOptimOptions {
         link,
-        firth: if firth { Some(FirthSpec { enabled: true }) } else { None },
+        firth: if firth {
+            Some(FirthSpec { enabled: true })
+        } else {
+            None
+        },
         tol: 1e-10,
         max_iter: 200,
         nullspace_dims,
     };
-    
+
     match evaluate_external_gradients(
         y.view(),
         weights.view(),
@@ -366,14 +378,21 @@ fn check_gradient(
             let dot: f64 = analytic.dot(&fd);
             let n_a: f64 = analytic.dot(&analytic).sqrt();
             let n_f: f64 = fd.dot(&fd).sqrt();
-            let cosine = if n_a * n_f > 1e-12 { dot / (n_a * n_f) } else { 1.0 };
-            
+            let cosine = if n_a * n_f > 1e-12 {
+                dot / (n_a * n_f)
+            } else {
+                1.0
+            };
+
             let diff = &analytic - &fd;
             let rel_l2 = diff.dot(&diff).sqrt() / n_f.max(n_a).max(1e-12);
-            
-            let max_a = analytic.iter().copied().fold(0.0f64, |acc, v| acc.max(v.abs()));
+
+            let max_a = analytic
+                .iter()
+                .copied()
+                .fold(0.0f64, |acc, v| acc.max(v.abs()));
             let max_f = fd.iter().copied().fold(0.0f64, |acc, v| acc.max(v.abs()));
-            
+
             Ok((cosine, rel_l2, max_a, max_f))
         }
         Err(e) => Err(format!("{:?}", e)),
@@ -381,23 +400,33 @@ fn check_gradient(
 }
 
 fn print_result(label: &str, cos: f64, rel: f64, max_a: f64, max_f: f64) {
-    let status = if cos > 0.99 && rel < 0.1 { "✓ PASS" } else { "✗ FAIL" };
-    println!("  {}: cos={:.4}, rel_l2={:.3e}, |a|={:.3e}, |fd|={:.3e} {}", 
-             label, cos, rel, max_a, max_f, status);
+    let status = if cos > 0.99 && rel < 0.1 {
+        "✓ PASS"
+    } else {
+        "✗ FAIL"
+    };
+    println!(
+        "  {}: cos={:.4}, rel_l2={:.3e}, |a|={:.3e}, |fd|={:.3e} {}",
+        label, cos, rel, max_a, max_f, status
+    );
 }
 
 fn gradient_metrics(a: &Array1<f64>, b: &Array1<f64>) -> (f64, f64, f64, f64) {
     let dot: f64 = a.dot(b);
     let n_a: f64 = a.dot(a).sqrt();
     let n_b: f64 = b.dot(b).sqrt();
-    let cosine = if n_a * n_b > 1e-12 { dot / (n_a * n_b) } else { 1.0 };
-    
+    let cosine = if n_a * n_b > 1e-12 {
+        dot / (n_a * n_b)
+    } else {
+        1.0
+    };
+
     let diff = a - b;
     let rel_l2 = diff.dot(&diff).sqrt() / n_b.max(n_a).max(1e-12);
-    
+
     let max_a = a.iter().copied().fold(0.0f64, |acc, v| acc.max(v.abs()));
     let max_b = b.iter().copied().fold(0.0f64, |acc, v| acc.max(v.abs()));
-    
+
     (cosine, rel_l2, max_a, max_b)
 }
 
@@ -495,12 +524,12 @@ fn frozen_fd_gradient_logit(
 #[test]
 fn isolation_baseline_single_penalty_no_firth() {
     println!("\n=== ISOLATION: Single penalty, No Firth ===");
-    
+
     let (y, x, w) = generate_logit_data(100, 8, 42);
     let p = x.ncols();
     let s = diagonal_penalty(p, 1, p);
     let rho = array![0.0];
-    
+
     match check_gradient(&y, &x, &w, &[s], &rho, false, vec![1], LinkFunction::Logit) {
         Ok((cos, rel, max_a, max_f)) => print_result("Baseline", cos, rel, max_a, max_f),
         Err(e) => println!("  ERROR: {}", e),
@@ -511,12 +540,12 @@ fn isolation_baseline_single_penalty_no_firth() {
 #[test]
 fn isolation_single_penalty_with_firth() {
     println!("\n=== ISOLATION: Single penalty, WITH Firth ===");
-    
+
     let (y, x, w) = generate_logit_data(100, 8, 42);
     let p = x.ncols();
     let s = diagonal_penalty(p, 1, p);
     let rho = array![0.0];
-    
+
     match check_gradient(&y, &x, &w, &[s], &rho, true, vec![1], LinkFunction::Logit) {
         Ok((cos, rel, max_a, max_f)) => print_result("Firth alone", cos, rel, max_a, max_f),
         Err(e) => println!("  ERROR: {}", e),
@@ -527,7 +556,7 @@ fn isolation_single_penalty_with_firth() {
 #[test]
 fn isolation_multi_penalty_isotropic_no_firth() {
     println!("\n=== ISOLATION: Multi-penalty (isotropic), No Firth ===");
-    
+
     let (y, x, w) = generate_logit_data(100, 12, 42);
     let p = x.ncols();
     let s_list = vec![
@@ -536,8 +565,17 @@ fn isolation_multi_penalty_isotropic_no_firth() {
         diagonal_penalty(p, 8, 12),
     ];
     let rho = array![0.0, 0.0, 0.0];
-    
-    match check_gradient(&y, &x, &w, &s_list, &rho, false, vec![1, 0, 0], LinkFunction::Logit) {
+
+    match check_gradient(
+        &y,
+        &x,
+        &w,
+        &s_list,
+        &rho,
+        false,
+        vec![1, 0, 0],
+        LinkFunction::Logit,
+    ) {
         Ok((cos, rel, max_a, max_f)) => print_result("Multi-iso", cos, rel, max_a, max_f),
         Err(e) => println!("  ERROR: {}", e),
     }
@@ -547,7 +585,7 @@ fn isolation_multi_penalty_isotropic_no_firth() {
 #[test]
 fn isolation_multi_penalty_anisotropic_no_firth() {
     println!("\n=== ISOLATION: Multi-penalty (ANISOTROPIC), No Firth ===");
-    
+
     let (y, x, w) = generate_logit_data(100, 12, 42);
     let p = x.ncols();
     let s_list = vec![
@@ -556,8 +594,17 @@ fn isolation_multi_penalty_anisotropic_no_firth() {
         diagonal_penalty(p, 8, 12),
     ];
     let rho = array![0.0, 4.6, -4.6]; // λ = [1, 100, 0.01]
-    
-    match check_gradient(&y, &x, &w, &s_list, &rho, false, vec![1, 0, 0], LinkFunction::Logit) {
+
+    match check_gradient(
+        &y,
+        &x,
+        &w,
+        &s_list,
+        &rho,
+        false,
+        vec![1, 0, 0],
+        LinkFunction::Logit,
+    ) {
         Ok((cos, rel, max_a, max_f)) => print_result("Multi-aniso", cos, rel, max_a, max_f),
         Err(e) => println!("  ERROR: {}", e),
     }
@@ -567,7 +614,7 @@ fn isolation_multi_penalty_anisotropic_no_firth() {
 #[test]
 fn isolation_multi_penalty_isotropic_with_firth() {
     println!("\n=== ISOLATION: Multi-penalty (isotropic) + Firth ===");
-    
+
     let (y, x, w) = generate_logit_data(100, 12, 42);
     let p = x.ncols();
     let s_list = vec![
@@ -576,8 +623,17 @@ fn isolation_multi_penalty_isotropic_with_firth() {
         diagonal_penalty(p, 8, 12),
     ];
     let rho = array![0.0, 0.0, 0.0];
-    
-    match check_gradient(&y, &x, &w, &s_list, &rho, true, vec![1, 0, 0], LinkFunction::Logit) {
+
+    match check_gradient(
+        &y,
+        &x,
+        &w,
+        &s_list,
+        &rho,
+        true,
+        vec![1, 0, 0],
+        LinkFunction::Logit,
+    ) {
         Ok((cos, rel, max_a, max_f)) => print_result("Multi-iso+Firth", cos, rel, max_a, max_f),
         Err(e) => println!("  ERROR: {}", e),
     }
@@ -587,7 +643,7 @@ fn isolation_multi_penalty_isotropic_with_firth() {
 #[test]
 fn isolation_multi_penalty_anisotropic_with_firth() {
     println!("\n=== ISOLATION: Multi-penalty (ANISOTROPIC) + Firth ===");
-    
+
     let (y, x, w) = generate_logit_data(100, 12, 42);
     let p = x.ncols();
     let s_list = vec![
@@ -596,8 +652,17 @@ fn isolation_multi_penalty_anisotropic_with_firth() {
         diagonal_penalty(p, 8, 12),
     ];
     let rho = array![0.0, 4.6, -4.6];
-    
-    match check_gradient(&y, &x, &w, &s_list, &rho, true, vec![1, 0, 0], LinkFunction::Logit) {
+
+    match check_gradient(
+        &y,
+        &x,
+        &w,
+        &s_list,
+        &rho,
+        true,
+        vec![1, 0, 0],
+        LinkFunction::Logit,
+    ) {
         Ok((cos, rel, max_a, max_f)) => print_result("Full complexity", cos, rel, max_a, max_f),
         Err(e) => println!("  ERROR: {}", e),
     }
@@ -607,18 +672,31 @@ fn isolation_multi_penalty_anisotropic_with_firth() {
 #[test]
 fn isolation_disjoint_null_spaces() {
     println!("\n=== ISOLATION: Disjoint null spaces ===");
-    
+
     let (y, x, w) = generate_logit_data(80, 6, 42);
-    
+
     let mut s1 = Array2::<f64>::zeros((6, 6));
-    for j in 1..4 { s1[[j, j]] = 1.0; }
-    
+    for j in 1..4 {
+        s1[[j, j]] = 1.0;
+    }
+
     let mut s2 = Array2::<f64>::zeros((6, 6));
-    for j in 4..6 { s2[[j, j]] = 1.0; }
-    
+    for j in 4..6 {
+        s2[[j, j]] = 1.0;
+    }
+
     let rho = array![2.0, -2.0];
-    
-    match check_gradient(&y, &x, &w, &[s1, s2], &rho, true, vec![1, 0], LinkFunction::Logit) {
+
+    match check_gradient(
+        &y,
+        &x,
+        &w,
+        &[s1, s2],
+        &rho,
+        true,
+        vec![1, 0],
+        LinkFunction::Logit,
+    ) {
         Ok((cos, rel, max_a, max_f)) => {
             print_result("Disjoint null", cos, rel, max_a, max_f);
         }
@@ -635,7 +713,7 @@ fn isolation_disjoint_null_spaces() {
 #[test]
 fn isolation_identity_link_control() {
     println!("\n=== IDENTITY LINK CONTROL ===");
-    
+
     let (y, x, w) = generate_gaussian_data(100, 12, 42);
     let p = x.ncols();
     let s_list = vec![
@@ -644,8 +722,17 @@ fn isolation_identity_link_control() {
         diagonal_penalty(p, 8, 12),
     ];
     let rho = array![0.0, 4.6, -4.6]; // Same anisotropic λ
-    
-    match check_gradient(&y, &x, &w, &s_list, &rho, false, vec![1, 0, 0], LinkFunction::Identity) {
+
+    match check_gradient(
+        &y,
+        &x,
+        &w,
+        &s_list,
+        &rho,
+        false,
+        vec![1, 0, 0],
+        LinkFunction::Identity,
+    ) {
         Ok((cos, rel, max_a, max_f)) => {
             print_result("Identity link", cos, rel, max_a, max_f);
         }
@@ -660,12 +747,12 @@ fn isolation_identity_link_control() {
 #[test]
 fn isolation_difference_penalty_logit_no_firth() {
     println!("\n=== ISOLATION: Difference penalty, Logit, No Firth ===");
-    
+
     let (y, x, w) = generate_logit_data(120, 10, 42);
     let p = x.ncols();
     let s = create_difference_penalty_matrix(p, 2, None).expect("difference penalty");
     let rho = array![0.0];
-    
+
     let (analytic, fd) = match evaluate_external_gradients(
         y.view(),
         w.view(),
@@ -687,7 +774,7 @@ fn isolation_difference_penalty_logit_no_firth() {
             return;
         }
     };
-    
+
     let (cos_fd, rel_fd, max_a, max_fd) = gradient_metrics(&analytic, &fd);
     print_result("Difference penalty", cos_fd, rel_fd, max_a, max_fd);
 }
@@ -695,7 +782,7 @@ fn isolation_difference_penalty_logit_no_firth() {
 #[test]
 fn isolation_dirty_nullspace_logit_no_firth() {
     println!("\n=== ISOLATION: Near-null penalty, Logit, No Firth ===");
-    
+
     let (y, x, w) = generate_logit_data(120, 10, 43);
     let p = x.ncols();
     let mut s = diagonal_penalty(p, 1, p - 2);
@@ -704,7 +791,7 @@ fn isolation_dirty_nullspace_logit_no_firth() {
         s[[j, j]] += eps;
     }
     let rho = array![0.0];
-    
+
     let (analytic, fd) = match evaluate_external_gradients(
         y.view(),
         w.view(),
@@ -726,7 +813,7 @@ fn isolation_dirty_nullspace_logit_no_firth() {
             return;
         }
     };
-    
+
     let (cos_fd, rel_fd, max_a, max_fd) = gradient_metrics(&analytic, &fd);
     print_result("Near-null penalty", cos_fd, rel_fd, max_a, max_fd);
 }
@@ -734,7 +821,7 @@ fn isolation_dirty_nullspace_logit_no_firth() {
 #[test]
 fn isolation_concurrent_nullspace_instability() {
     println!("\n=== ISOLATION: Concurrent nullspace, Logit, No Firth ===");
-    
+
     let n = 160;
     let p = 12;
     let x = design_with_nullspace_suppression(n, p, 44);
@@ -744,7 +831,7 @@ fn isolation_concurrent_nullspace_instability() {
         y[i] = if rng.random::<f64>() < 0.5 { 0.0 } else { 1.0 };
     }
     let w = Array1::<f64>::ones(n);
-    
+
     let mut s = create_difference_penalty_matrix(p, 2, None).expect("difference penalty");
     let eps = 1e-12;
     let mut b1 = Array1::<f64>::zeros(p);
@@ -753,12 +840,18 @@ fn isolation_concurrent_nullspace_instability() {
         b1[j] = 1.0;
         b2[j] = j as f64;
     }
-    let b1_outer = b1.view().insert_axis(ndarray::Axis(1)).dot(&b1.view().insert_axis(ndarray::Axis(0)));
-    let b2_outer = b2.view().insert_axis(ndarray::Axis(1)).dot(&b2.view().insert_axis(ndarray::Axis(0)));
+    let b1_outer = b1
+        .view()
+        .insert_axis(ndarray::Axis(1))
+        .dot(&b1.view().insert_axis(ndarray::Axis(0)));
+    let b2_outer = b2
+        .view()
+        .insert_axis(ndarray::Axis(1))
+        .dot(&b2.view().insert_axis(ndarray::Axis(0)));
     s.scaled_add(eps, &b1_outer);
     s.scaled_add(eps, &b2_outer);
     let rho = array![5.0];
-    
+
     let (analytic, fd) = match evaluate_external_gradients(
         y.view(),
         w.view(),
@@ -780,7 +873,7 @@ fn isolation_concurrent_nullspace_instability() {
             return;
         }
     };
-    
+
     let (cos_fd, rel_fd, max_a, max_fd) = gradient_metrics(&analytic, &fd);
     print_result("Concurrent nullspace", cos_fd, rel_fd, max_a, max_fd);
 }
@@ -792,9 +885,7 @@ fn isolation_projected_tensor_penalty_logit_no_firth() {
     let n_obs = 200;
     let degree = 3;
     let num_internal_knots = 20;
-    let data: Array1<f64> = (0..n_obs)
-        .map(|i| i as f64 / (n_obs - 1) as f64)
-        .collect();
+    let data: Array1<f64> = (0..n_obs).map(|i| i as f64 / (n_obs - 1) as f64).collect();
     let (basis_arc, _) = create_basis::<Dense>(
         data.view(),
         KnotSource::Generate {
@@ -814,10 +905,10 @@ fn isolation_projected_tensor_penalty_logit_no_firth() {
     let s_raw = kron_with_identity(&s1, n2);
     let z = kron_with_identity_right(&z1, n2);
     let s = z.t().dot(&s_raw).dot(&z);
-    
+
     let (y, x, w) = generate_logit_data_no_intercept(n, p_raw - n2, 55);
     let rho = array![0.0];
-    
+
     let (analytic, fd) = match evaluate_external_gradients(
         y.view(),
         w.view(),
@@ -839,7 +930,7 @@ fn isolation_projected_tensor_penalty_logit_no_firth() {
             return;
         }
     };
-    
+
     let (cos_fd, rel_fd, max_a, max_fd) = gradient_metrics(&analytic, &fd);
     print_result("Projected tensor penalty", cos_fd, rel_fd, max_a, max_fd);
 }
@@ -851,9 +942,7 @@ fn isolation_projected_tensor_penalty_with_firth() {
     let n_obs = 200;
     let degree = 3;
     let num_internal_knots = 20;
-    let data: Array1<f64> = (0..n_obs)
-        .map(|i| i as f64 / (n_obs - 1) as f64)
-        .collect();
+    let data: Array1<f64> = (0..n_obs).map(|i| i as f64 / (n_obs - 1) as f64).collect();
     let (basis_arc, _) = create_basis::<Dense>(
         data.view(),
         KnotSource::Generate {
@@ -913,9 +1002,7 @@ fn isolation_multiple_overlapping_dense_penalties_with_firth() {
     let n_obs = 180;
     let degree = 3;
     let num_internal_knots = 12;
-    let data: Array1<f64> = (0..n_obs)
-        .map(|i| i as f64 / (n_obs - 1) as f64)
-        .collect();
+    let data: Array1<f64> = (0..n_obs).map(|i| i as f64 / (n_obs - 1) as f64).collect();
     let (basis_arc, _) = create_basis::<Dense>(
         data.view(),
         KnotSource::Generate {
@@ -1051,15 +1138,8 @@ fn isolation_reparam_pgs_pc_mains_firth_frozen_beta_fd() {
     .unwrap();
     let beta_orig = pirls.reparam_result.qs.dot(pirls.beta_transformed.as_ref());
 
-    let frozen_fd = frozen_fd_gradient_logit(
-        &train.y,
-        &x,
-        &train.weights,
-        &s_list,
-        &rho,
-        &beta_orig,
-    )
-    .unwrap();
+    let frozen_fd =
+        frozen_fd_gradient_logit(&train.y, &x, &train.weights, &s_list, &rho, &beta_orig).unwrap();
 
     let (cos_fd, rel_fd, max_a, max_fd) = gradient_metrics(&analytic, &fd);
     let (cos_frozen, rel_frozen, max_af, max_frozen) = gradient_metrics(&analytic, &frozen_fd);
@@ -1073,8 +1153,10 @@ fn isolation_reparam_pgs_pc_mains_firth_frozen_beta_fd() {
     );
 
     // FD should agree well with analytic gradient
-    assert!(cos_fd > 0.99 && rel_fd < 0.05,
-        "FD disagrees with analytic: cos={cos_fd:.4}, rel={rel_fd:.3e}");
+    assert!(
+        cos_fd > 0.99 && rel_fd < 0.05,
+        "FD disagrees with analytic: cos={cos_fd:.4}, rel={rel_fd:.3e}"
+    );
 }
 
 // ============================================================================
@@ -1084,17 +1166,14 @@ fn isolation_reparam_pgs_pc_mains_firth_frozen_beta_fd() {
 #[test]
 fn isolation_frozen_beta_fd() {
     println!("\n=== ISOLATION: Frozen beta FD ===");
-    
+
     let (y, x, w) = generate_logit_data(120, 10, 42);
     let p = x.ncols();
-    let s_list = vec![
-        diagonal_penalty(p, 1, 6),
-        diagonal_penalty(p, 5, 10),
-    ];
+    let s_list = vec![diagonal_penalty(p, 1, 6), diagonal_penalty(p, 5, 10)];
     let rho = array![0.0, 3.2];
     let n = x.nrows();
     let offset = Array1::<f64>::zeros(n);
-    
+
     let opts = ExternalOptimOptions {
         link: LinkFunction::Logit,
         firth: None,
@@ -1102,7 +1181,7 @@ fn isolation_frozen_beta_fd() {
         max_iter: 200,
         nullspace_dims: vec![1, 0],
     };
-    
+
     let (analytic, fd) = match evaluate_external_gradients(
         y.view(),
         w.view(),
@@ -1118,7 +1197,7 @@ fn isolation_frozen_beta_fd() {
             return;
         }
     };
-    
+
     let layout = ModelLayout::external(p, s_list.len());
     let cfg = ModelConfig::external(LinkFunction::Logit, 1e-10, 200, false);
     let rs_list = match compute_penalty_square_roots(&s_list) {
@@ -1149,7 +1228,7 @@ fn isolation_frozen_beta_fd() {
         }
     };
     let beta_orig = pirls.reparam_result.qs.dot(pirls.beta_transformed.as_ref());
-    
+
     let frozen_fd = match frozen_fd_gradient_logit(&y, &x, &w, &s_list, &rho, &beta_orig) {
         Ok(g) => g,
         Err(e) => {
@@ -1157,11 +1236,17 @@ fn isolation_frozen_beta_fd() {
             return;
         }
     };
-    
+
     let (cos_fd, rel_fd, max_a, max_fd) = gradient_metrics(&analytic, &fd);
     let (cos_frozen, rel_frozen, max_af, max_frozen) = gradient_metrics(&analytic, &frozen_fd);
     print_result("Analytic vs FD", cos_fd, rel_fd, max_a, max_fd);
-    print_result("Analytic vs Frozen FD", cos_frozen, rel_frozen, max_af, max_frozen);
+    print_result(
+        "Analytic vs Frozen FD",
+        cos_frozen,
+        rel_frozen,
+        max_af,
+        max_frozen,
+    );
 }
 
 // ============================================================================
@@ -1175,7 +1260,7 @@ fn isolation_diagnostic_fd_noise_floor_at_high_smoothing() {
     config.firth_bias_reduction = true;
     let (x, s_list, layout, ..) =
         build_design_and_penalty_matrices(&train, &config).expect("design");
-    
+
     let offset = Array1::<f64>::zeros(train.y.len());
     let opts = ExternalOptimOptions {
         link: LinkFunction::Logit,
@@ -1184,23 +1269,38 @@ fn isolation_diagnostic_fd_noise_floor_at_high_smoothing() {
         max_iter: 200,
         nullspace_dims: vec![0; s_list.len()],
     };
-    
+
     let rho_mod = Array1::from_elem(layout.num_penalties, 2.0);
     let (a_mod, fd_mod) = evaluate_external_gradients(
-        train.y.view(), train.weights.view(), x.view(), offset.view(),
-        &s_list, &opts, &rho_mod,
-    ).unwrap();
+        train.y.view(),
+        train.weights.view(),
+        x.view(),
+        offset.view(),
+        &s_list,
+        &opts,
+        &rho_mod,
+    )
+    .unwrap();
     let (cos_mod, ..) = gradient_metrics(&a_mod, &fd_mod);
-    
+
     let rho_ext = Array1::from_elem(layout.num_penalties, 12.0);
     let (a_ext, fd_ext) = evaluate_external_gradients(
-        train.y.view(), train.weights.view(), x.view(), offset.view(),
-        &s_list, &opts, &rho_ext,
-    ).unwrap();
+        train.y.view(),
+        train.weights.view(),
+        x.view(),
+        offset.view(),
+        &s_list,
+        &opts,
+        &rho_ext,
+    )
+    .unwrap();
     let (cos_ext, _, max_a, _) = gradient_metrics(&a_ext, &fd_ext);
-    
+
     assert!(cos_mod > 0.999, "rho=2 failed: cos={cos_mod}");
-    assert!(cos_ext > 0.999, "rho=12 failed: cos={cos_ext}, |grad|={max_a:.2e}");
+    assert!(
+        cos_ext > 0.999,
+        "rho=12 failed: cos={cos_ext}, |grad|={max_a:.2e}"
+    );
 }
 
 // ============================================================================
@@ -1236,15 +1336,8 @@ fn isolation_stationarity_limit_at_optimum() {
     .unwrap();
     let n_baseline = a_baseline.dot(&a_baseline).sqrt();
 
-    let opt = optimize_external_design(
-        y.view(),
-        w.view(),
-        x.view(),
-        offset.view(),
-        &s_list,
-        &opts,
-    )
-    .unwrap();
+    let opt = optimize_external_design(y.view(), w.view(), x.view(), offset.view(), &s_list, &opts)
+        .unwrap();
     let rho_opt = opt.lambdas.mapv(|v| v.ln());
     let (a_opt, fd_opt) = evaluate_external_gradients(
         y.view(),
@@ -1308,7 +1401,13 @@ fn isolation_high_penalty_nullspace_gradient_decay() {
     )
     .unwrap();
     let (cos_high, rel_high, max_a_high, max_fd_high) = gradient_metrics(&a_high, &fd_high);
-    print_result("Nullspace rho=15", cos_high, rel_high, max_a_high, max_fd_high);
+    print_result(
+        "Nullspace rho=15",
+        cos_high,
+        rel_high,
+        max_a_high,
+        max_fd_high,
+    );
 
     let n_mid = a_mid.dot(&a_mid).sqrt();
     let n_high = a_high.dot(&a_high).sqrt();
@@ -1350,8 +1449,7 @@ fn diagnostic_super_convergence_tight_tol_improves_fd() {
         &rho,
     )
     .unwrap();
-    let (cos_base, rel_base, max_a_base, max_fd_base) =
-        gradient_metrics(&a_base, &fd_base);
+    let (cos_base, rel_base, max_a_base, max_fd_base) = gradient_metrics(&a_base, &fd_base);
     print_result("Base tol", cos_base, rel_base, max_a_base, max_fd_base);
 
     let grad_norm = a_base.dot(&a_base).sqrt();
@@ -1371,8 +1469,7 @@ fn diagnostic_super_convergence_tight_tol_improves_fd() {
         &rho,
     )
     .unwrap();
-    let (cos_tight, rel_tight, max_a_tight, max_fd_tight) =
-        gradient_metrics(&a_tight, &fd_tight);
+    let (cos_tight, rel_tight, max_a_tight, max_fd_tight) = gradient_metrics(&a_tight, &fd_tight);
     print_result("Tight tol", cos_tight, rel_tight, max_a_tight, max_fd_tight);
 
     assert!(
@@ -1465,7 +1562,7 @@ fn compute_firth_h_phi(
     // 1. Compute Hat Matrix "A" (or components B)
     // If s_lambda is None, use Fisher: A = W^1/2 X (X' W X)^-1 X' W^1/2
     // If s_lambda is Some, use Penalized: A = W^1/2 X (X' W X + S)^-1 X' W^1/2
-    
+
     let mut xw = x.clone();
     let mut sqrt_w = Array1::zeros(n);
     for i in 0..n {
@@ -1480,7 +1577,7 @@ fn compute_firth_h_phi(
     if let Some(s) = s_lambda {
         info = &info + s;
     }
-    
+
     // In production, we add a small ridge for stability
     let scale = info.diag().iter().fold(0.0f64, |acc, v| acc.max(v.abs()));
     let ridge = scale * 1e-8;
@@ -1490,37 +1587,37 @@ fn compute_firth_h_phi(
 
     let info_view = gnomon::calibrate::faer_ndarray::FaerArrayView::new(&info);
     // Note: FaerLlt might need to be imported or fully qualified
-    use gnomon::calibrate::faer_ndarray::{FaerLlt, array2_to_mat_mut}; 
-    
+    use gnomon::calibrate::faer_ndarray::{FaerLlt, array2_to_mat_mut};
+
     let chol = FaerLlt::new(info_view.as_ref(), Side::Lower).unwrap();
-    
+
     // H_hat = XW * Info^-1 * XW^T
     // Let B = XW * L^-T. Then H_hat = B B^T.
-    // L L^T = Info. 
+    // L L^T = Info.
     // Solve L Y = XW^T  => Y = L^-1 XW^T.  B = Y^T.
-    
+
     let mut rhs = xw.t().to_owned();
     let mut rhs_view = array2_to_mat_mut(&mut rhs);
-    chol.solve_in_place(rhs_view.as_mut()); 
+    chol.solve_in_place(rhs_view.as_mut());
     // Now rhs contains Info^-1 XW^T ?? No.
     // solve_in_place solves A x = b. Here A is LLT (Info).
     // So rhs column j solves: Info * x_j = (XW^T)_j
     // So rhs = Info^-1 * XW^T
     // So H_hat = XW * rhs
-    
+
     let h_hat = xw.dot(&rhs);
-    
+
     // 2. Compute components for H_phi
     // H_phi = 0.5 * (T1 - T2)
     // T1 = X^T diag(h dot v) X
     // T2 = X^T diag(u) (H_hat dot H_hat) diag(u) X
     // u = 1 - 2mu
     // v = u^2 - 2w (where w = mu(1-mu))
-    
+
     let mut u = Array1::zeros(n);
     let mut v = Array1::zeros(n);
     let mut h_diag = Array1::zeros(n);
-    
+
     for i in 0..n {
         let mu_i = mu[i];
         let w_b = mu_i * (1.0 - mu_i);
@@ -1528,7 +1625,7 @@ fn compute_firth_h_phi(
         v[i] = u[i] * u[i] - 2.0 * w_b; // = (1-2mu)^2 - 2mu(1-mu)
         h_diag[i] = h_hat[[i, i]];
     }
-    
+
     let mut t1 = Array2::zeros((p, p));
     // T1_jk = sum_i x_ij * (h_i * v_i) * x_ik
     for i in 0..n {
@@ -1539,17 +1636,19 @@ fn compute_firth_h_phi(
             }
         }
     }
-    
+
     // T2
     // Middle matrix M_mid = diag(u) (H_hat ∘ H_hat) diag(u)
     // M_mid_ij = u_i * (h_hat_ij^2) * u_j
-    
+
     // T2 = X^T M_mid X
     let mut t2 = Array2::<f64>::zeros((p, p));
     for i in 0..n {
         for j in 0..n {
             let m_val = u[i] * (h_hat[[i, j]] * h_hat[[i, j]]) * u[j];
-            if m_val.abs() < 1e-12 { continue; }
+            if m_val.abs() < 1e-12 {
+                continue;
+            }
             for a in 0..p {
                 for b in 0..p {
                     t2[[a, b]] += x[[i, a]] * m_val * x[[j, b]];
@@ -1557,28 +1656,25 @@ fn compute_firth_h_phi(
             }
         }
     }
-    
+
     let mut h_phi = t1 - &t2;
     h_phi.mapv_inplace(|val| 0.5 * val);
-    
+
     h_phi
 }
 
 #[test]
 fn isolation_missing_term_hypothesis() {
     println!("\n=== ISOLATION: Missing Term Hypothesis (Firth-LAML) ===");
-    
+
     // 1. Setup: High Smoothing + Firth
     // Use the "Test 6" anisotropic scenario which is complex
     let (y, x, w) = generate_logit_data(80, 8, 42); // Smaller N for speed
     let p = x.ncols();
-    let s_list = vec![
-        diagonal_penalty(p, 1, 5),
-        diagonal_penalty(p, 4, 8),
-    ];
+    let s_list = vec![diagonal_penalty(p, 1, 5), diagonal_penalty(p, 4, 8)];
     // High smoothing to exacerbate the term
-    let rho = array![5.0, 5.0]; 
-    
+    let rho = array![5.0, 5.0];
+
     // 2. Frozen Beta at Optimum
     let opts = ExternalOptimOptions {
         link: LinkFunction::Logit,
@@ -1587,7 +1683,7 @@ fn isolation_missing_term_hypothesis() {
         max_iter: 100,
         nullspace_dims: vec![1, 0],
     };
-    
+
     // Get analytic gradient and beta (implicitly via wrapper or we run pirls locally)
     let (analytic_gradient, _) = evaluate_external_gradients(
         y.view(),
@@ -1597,18 +1693,14 @@ fn isolation_missing_term_hypothesis() {
         &s_list,
         &opts,
         &rho,
-    ).expect("Gradient evaluation failed");
-    
+    )
+    .expect("Gradient evaluation failed");
+
     // Get optimal beta using public fit_model_for_fixed_rho
     let rs_list = compute_penalty_square_roots(&s_list).unwrap();
     let balanced = create_difference_penalty_matrix(p, 1, None).unwrap();
     let layout = ModelLayout::external(p, s_list.len());
-    let config = ModelConfig::external(
-        opts.link,
-        opts.tol,
-        opts.max_iter,
-        true,
-    );
+    let config = ModelConfig::external(opts.link, opts.tol, opts.max_iter, true);
 
     use gnomon::calibrate::types::LogSmoothingParamsView;
     let rho_view = LogSmoothingParamsView::new(rho.view());
@@ -1625,12 +1717,13 @@ fn isolation_missing_term_hypothesis() {
         &layout,
         &config,
         None,
-        None
-    ).expect("Fit failed");
-    
+        None,
+    )
+    .expect("Fit failed");
+
     let beta = fit.beta_transformed.clone();
-    let mu = fit.solve_mu; 
-    
+    let mu = fit.solve_mu;
+
     // 3. Compute H_phi(rho)
     // Reconstruct S
     let mut s_rho = Array2::<f64>::zeros((p, p));
@@ -1638,14 +1731,14 @@ fn isolation_missing_term_hypothesis() {
         let lambda = rho[k].exp();
         s_rho = s_rho + s.mapv(|v| v * lambda);
     }
-    
+
     // Compute H_phi using user's definition (WITH S)
     let h_phi = compute_firth_h_phi(&x, &w, &mu, Some(&s_rho));
-    
+
     // 4. Perturb and compute derivative
     let epsilon = 1e-4;
     let k_target = 0; // Check for first rho
-    
+
     let mut rho_plus = rho.clone();
     rho_plus[k_target] += epsilon;
     let mut s_rho_plus = Array2::<f64>::zeros((p, p));
@@ -1653,11 +1746,11 @@ fn isolation_missing_term_hypothesis() {
         let lambda = rho_plus[k].exp();
         s_rho_plus = s_rho_plus + s.mapv(|v| v * lambda);
     }
-    
+
     let h_phi_plus = compute_firth_h_phi(&x, &w, &mu, Some(&s_rho_plus));
-    
+
     let d_h_phi = (&h_phi_plus - &h_phi) / epsilon;
-    
+
     // 5. Compute H_total and Missing Term E
     // H_total = X'WX + S - H_phi
     let mut xtwx = Array2::<f64>::zeros((p, p));
@@ -1669,13 +1762,18 @@ fn isolation_missing_term_hypothesis() {
             }
         }
     }
-    
+
     let h_total = &xtwx + &s_rho - &h_phi;
-    
-    let scale_h = h_total.diag().iter().fold(0.0f64, |acc, v| acc.max(v.abs()));
+
+    let scale_h = h_total
+        .diag()
+        .iter()
+        .fold(0.0f64, |acc, v| acc.max(v.abs()));
     let mut h_total_ridge = h_total.clone();
-    for i in 0..p { h_total_ridge[[i, i]] += scale_h * 1e-8; }
-    
+    for i in 0..p {
+        h_total_ridge[[i, i]] += scale_h * 1e-8;
+    }
+
     let h_view = gnomon::calibrate::faer_ndarray::FaerArrayView::new(&h_total_ridge);
     use gnomon::calibrate::faer_ndarray::{FaerLlt, array2_to_mat_mut};
     let chol_h = FaerLlt::new(h_view.as_ref(), Side::Lower).unwrap();
@@ -1686,24 +1784,33 @@ fn isolation_missing_term_hypothesis() {
 
     let missing_term_matrix = h_inv.dot(&d_h_phi);
     let trace_val = missing_term_matrix.diag().sum();
-    
+
     // E = -0.5 * trace(...)
     let e = -0.5 * trace_val;
-    
-    println!("  Analytic Gradient[{}]: {:.5e}", k_target, analytic_gradient[k_target]);
+
+    println!(
+        "  Analytic Gradient[{}]: {:.5e}",
+        k_target, analytic_gradient[k_target]
+    );
     println!("  Missing Term E: {:.5e}", e);
-    
+
     // 6. Frozen FD Gradient (Standard from Code)
     let fd_frozen = frozen_fd_gradient_logit(&y, &x, &w, &s_list, &rho, &beta).unwrap();
     println!("  Frozen FD (Code Cost): {:.5e}", fd_frozen[k_target]);
-    
+
     let corrected = analytic_gradient[k_target] + e;
     let diff = (corrected - fd_frozen[k_target]).abs();
-    println!("  Corrected Analytic: {:.5e} (Diff from FD: {:.2e})", corrected, diff);
-    
-    // Assert match. 
+    println!(
+        "  Corrected Analytic: {:.5e} (Diff from FD: {:.2e})",
+        corrected, diff
+    );
+
+    // Assert match.
     if diff > 1e-3 {
-         panic!("Hypothesis verification failed: Corrected ({}) != Frozen FD ({})", corrected, fd_frozen[k_target]);
+        panic!(
+            "Hypothesis verification failed: Corrected ({}) != Frozen FD ({})",
+            corrected, fd_frozen[k_target]
+        );
     } else {
         println!("✓ Hypothesis Verified: Missing term explains the discrepancy.");
     }
@@ -1731,20 +1838,20 @@ fn isolation_missing_term_hypothesis() {
 #[test]
 fn isolation_truncation_correction_ridge_hypothesis() {
     println!("\n=== HYPOTHESIS TEST: Truncation Correction + Ridge Interaction ===");
-    
+
     // 1. Create a problem with rank-deficient penalty (difference matrix has null space)
     let n = 100;
     let p = 10;
     let (y, x, w) = generate_logit_data(n, p, 42);
-    
+
     // Difference penalty with order 2 has 2-dimensional null space
     let s = create_difference_penalty_matrix(p, 2, None).expect("difference penalty");
     let s_list = vec![s];
     let nullspace_dims = vec![2]; // Order-2 difference has 2D null space
-    
+
     // 2. Use high smoothing (large λ) to trigger ridge adjustment in PIRLS
     let rho = array![8.0]; // λ = exp(8) ≈ 2981
-    
+
     let opts = ExternalOptimOptions {
         link: LinkFunction::Logit,
         firth: None, // No Firth - isolate the truncation effect
@@ -1752,7 +1859,7 @@ fn isolation_truncation_correction_ridge_hypothesis() {
         max_iter: 200,
         nullspace_dims: nullspace_dims.clone(),
     };
-    
+
     // 3. Get analytic gradient (with truncation correction applied)
     let offset = Array1::<f64>::zeros(n);
     let (analytic, fd) = match evaluate_external_gradients(
@@ -1770,7 +1877,7 @@ fn isolation_truncation_correction_ridge_hypothesis() {
             panic!("Test setup failed");
         }
     };
-    
+
     // 4. Get the ridge value used (to verify ridge was active)
     let (_, ridge_used) = evaluate_external_cost_and_ridge(
         y.view(),
@@ -1782,25 +1889,28 @@ fn isolation_truncation_correction_ridge_hypothesis() {
         &rho,
     )
     .expect("Cost evaluation failed");
-    
+
     println!("  Ridge used: {:.3e}", ridge_used);
     println!("  Analytic gradient: {:.6e}", analytic[0]);
     println!("  FD gradient:       {:.6e}", fd[0]);
-    
+
     // 5. Compute error metrics
     let error_with_correction = (analytic[0] - fd[0]).abs();
     let scale = fd[0].abs().max(analytic[0].abs()).max(1e-8);
     let rel_error = error_with_correction / scale;
-    
+
     println!("  Absolute error: {:.3e}", error_with_correction);
     println!("  Relative error: {:.3e}", rel_error);
-    
+
     // 6. Interpretation
     if ridge_used > 0.0 {
         println!("\n  [RIDGE ACTIVE] Testing if truncation correction causes mismatch...");
-        
+
         if rel_error > 0.05 {
-            println!("  ✓ Large relative error ({:.1}%) when ridge is active.", rel_error * 100.0);
+            println!(
+                "  ✓ Large relative error ({:.1}%) when ridge is active.",
+                rel_error * 100.0
+            );
             println!("    SUPPORTS hypothesis: truncation correction should be");
             println!("    skipped when ridge is active.");
         } else {
@@ -1809,7 +1919,7 @@ fn isolation_truncation_correction_ridge_hypothesis() {
     } else {
         println!("\n  [NO RIDGE] Ridge was not triggered.");
     }
-    
+
     assert!(
         analytic[0].is_finite() && fd[0].is_finite(),
         "Gradient values must be finite"
@@ -1820,17 +1930,17 @@ fn isolation_truncation_correction_ridge_hypothesis() {
 #[test]
 fn isolation_truncation_correction_no_ridge_baseline() {
     println!("\n=== BASELINE: Truncation Correction Without Ridge ===");
-    
+
     let n = 150;
     let p = 8;
     let (y, x, w) = generate_logit_data(n, p, 42);
-    
+
     let s = create_difference_penalty_matrix(p, 1, None).expect("difference penalty");
     let s_list = vec![s];
     let nullspace_dims = vec![1];
-    
+
     let rho = array![0.0]; // λ = 1
-    
+
     let opts = ExternalOptimOptions {
         link: LinkFunction::Logit,
         firth: None,
@@ -1838,7 +1948,7 @@ fn isolation_truncation_correction_no_ridge_baseline() {
         max_iter: 200,
         nullspace_dims,
     };
-    
+
     let offset = Array1::<f64>::zeros(n);
     let (analytic, fd) = match evaluate_external_gradients(
         y.view(),
@@ -1855,7 +1965,7 @@ fn isolation_truncation_correction_no_ridge_baseline() {
             return;
         }
     };
-    
+
     let (_, ridge_used) = evaluate_external_cost_and_ridge(
         y.view(),
         w.view(),
@@ -1866,21 +1976,21 @@ fn isolation_truncation_correction_no_ridge_baseline() {
         &rho,
     )
     .expect("Cost evaluation failed");
-    
+
     let rel_error = (analytic[0] - fd[0]).abs() / fd[0].abs().max(1e-8);
-    
+
     println!("  Ridge used: {:.3e}", ridge_used);
     println!("  Analytic gradient: {:.6e}", analytic[0]);
     println!("  FD gradient:       {:.6e}", fd[0]);
     println!("  Relative error:    {:.3e}", rel_error);
-    
+
     if ridge_used == 0.0 {
         println!("\n  [NO RIDGE] Baseline without ridge regularization.");
         if rel_error < 0.05 {
             println!("  ✓ Good agreement - truncation correction works correctly without ridge.");
         }
     }
-    
+
     assert!(analytic[0].is_finite() && fd[0].is_finite());
 }
 
@@ -1893,17 +2003,17 @@ fn isolation_truncation_correction_no_ridge_baseline() {
 #[test]
 fn hypothesis_firth_alone_single_penalty() {
     println!("\n=== Hypothesis 2: Firth Alone (Single Penalty) ===");
-    
+
     let n = 100;
     let p = 10;
     let (y, x, w) = generate_logit_data(n, p, 42);
-    
+
     let s = create_difference_penalty_matrix(p, 2, None).expect("difference penalty");
     let s_list = vec![s];
     let nullspace_dims = vec![2];
-    
+
     let rho = array![2.0]; // Moderate smoothing
-    
+
     let opts = ExternalOptimOptions {
         link: LinkFunction::Logit,
         firth: Some(FirthSpec { enabled: true }), // <-- Firth ON
@@ -1911,38 +2021,52 @@ fn hypothesis_firth_alone_single_penalty() {
         max_iter: 200,
         nullspace_dims,
     };
-    
+
     let offset = Array1::<f64>::zeros(n);
     let (analytic, fd) = evaluate_external_gradients(
-        y.view(), w.view(), x.view(), offset.view(), &s_list, &opts, &rho,
-    ).expect("Gradient evaluation failed");
-    
+        y.view(),
+        w.view(),
+        x.view(),
+        offset.view(),
+        &s_list,
+        &opts,
+        &rho,
+    )
+    .expect("Gradient evaluation failed");
+
     let (cos, rel, max_a, max_f) = gradient_metrics(&analytic, &fd);
     print_result("Firth alone", cos, rel, max_a, max_f);
-    
-    let status = if cos > 0.99 && rel < 0.05 { "NEGATIVE" } else { "POSITIVE" };
-    println!("  Hypothesis 2: {} (cos={:.4}, rel={:.3e})", status, cos, rel);
+
+    let status = if cos > 0.99 && rel < 0.05 {
+        "NEGATIVE"
+    } else {
+        "POSITIVE"
+    };
+    println!(
+        "  Hypothesis 2: {} (cos={:.4}, rel={:.3e})",
+        status, cos, rel
+    );
 }
 
 /// Hypothesis 3: Multi-penalty (no Firth) causes gradient mismatch.
 #[test]
 fn hypothesis_multi_penalty_no_firth() {
     println!("\n=== Hypothesis 3: Multi-Penalty (No Firth) ===");
-    
+
     let n = 100;
     let p = 12;
     let (y, x, w) = generate_logit_data(n, p, 42);
-    
+
     let s_list = vec![
         diagonal_penalty(p, 1, 5),
         diagonal_penalty(p, 4, 9),
         diagonal_penalty(p, 8, 12),
     ];
     let nullspace_dims = vec![1, 0, 0];
-    
+
     // Anisotropic lambdas
     let rho = array![0.0, 4.6, -4.6]; // λ = [1, 100, 0.01]
-    
+
     let opts = ExternalOptimOptions {
         link: LinkFunction::Logit,
         firth: None,
@@ -1950,35 +2074,49 @@ fn hypothesis_multi_penalty_no_firth() {
         max_iter: 200,
         nullspace_dims,
     };
-    
+
     let offset = Array1::<f64>::zeros(n);
     let (analytic, fd) = evaluate_external_gradients(
-        y.view(), w.view(), x.view(), offset.view(), &s_list, &opts, &rho,
-    ).expect("Gradient evaluation failed");
-    
+        y.view(),
+        w.view(),
+        x.view(),
+        offset.view(),
+        &s_list,
+        &opts,
+        &rho,
+    )
+    .expect("Gradient evaluation failed");
+
     let (cos, rel, max_a, max_f) = gradient_metrics(&analytic, &fd);
     print_result("Multi-penalty", cos, rel, max_a, max_f);
-    
-    let status = if cos > 0.99 && rel < 0.05 { "NEGATIVE" } else { "POSITIVE" };
-    println!("  Hypothesis 3: {} (cos={:.4}, rel={:.3e})", status, cos, rel);
+
+    let status = if cos > 0.99 && rel < 0.05 {
+        "NEGATIVE"
+    } else {
+        "POSITIVE"
+    };
+    println!(
+        "  Hypothesis 3: {} (cos={:.4}, rel={:.3e})",
+        status, cos, rel
+    );
 }
 
 /// Hypothesis 4: Firth + high smoothing causes mismatch.
 #[test]
 fn hypothesis_firth_high_smoothing() {
     println!("\n=== Hypothesis 4: Firth + High Smoothing ===");
-    
+
     let n = 100;
     let p = 10;
     let (y, x, w) = generate_logit_data(n, p, 42);
-    
+
     let s = create_difference_penalty_matrix(p, 2, None).expect("difference penalty");
     let s_list = vec![s];
     let nullspace_dims = vec![2];
-    
+
     // Very high smoothing
     let rho = array![10.0]; // λ = exp(10) ≈ 22026
-    
+
     let opts = ExternalOptimOptions {
         link: LinkFunction::Logit,
         firth: Some(FirthSpec { enabled: true }),
@@ -1986,17 +2124,31 @@ fn hypothesis_firth_high_smoothing() {
         max_iter: 200,
         nullspace_dims,
     };
-    
+
     let offset = Array1::<f64>::zeros(n);
     let (analytic, fd) = evaluate_external_gradients(
-        y.view(), w.view(), x.view(), offset.view(), &s_list, &opts, &rho,
-    ).expect("Gradient evaluation failed");
-    
+        y.view(),
+        w.view(),
+        x.view(),
+        offset.view(),
+        &s_list,
+        &opts,
+        &rho,
+    )
+    .expect("Gradient evaluation failed");
+
     let (cos, rel, max_a, max_f) = gradient_metrics(&analytic, &fd);
     print_result("Firth+HighSmooth", cos, rel, max_a, max_f);
-    
-    let status = if cos > 0.99 && rel < 0.05 { "NEGATIVE" } else { "POSITIVE" };
-    println!("  Hypothesis 4: {} (cos={:.4}, rel={:.3e})", status, cos, rel);
+
+    let status = if cos > 0.99 && rel < 0.05 {
+        "NEGATIVE"
+    } else {
+        "POSITIVE"
+    };
+    println!(
+        "  Hypothesis 4: {} (cos={:.4}, rel={:.3e})",
+        status, cos, rel
+    );
 }
 
 /// Hypothesis 5: Firth + anisotropic multi-penalty causes mismatch.
@@ -2004,21 +2156,21 @@ fn hypothesis_firth_high_smoothing() {
 #[test]
 fn hypothesis_firth_anisotropic_multi_penalty() {
     println!("\n=== Hypothesis 5: Firth + Anisotropic Multi-Penalty ===");
-    
+
     let n = 100;
     let p = 12;
     let (y, x, w) = generate_logit_data(n, p, 42);
-    
+
     let s_list = vec![
         diagonal_penalty(p, 1, 5),
         diagonal_penalty(p, 4, 9),
         diagonal_penalty(p, 8, 12),
     ];
     let nullspace_dims = vec![1, 0, 0];
-    
+
     // Anisotropic lambdas (same as original failing test)
     let rho = array![0.0, 4.6, -4.6];
-    
+
     let opts = ExternalOptimOptions {
         link: LinkFunction::Logit,
         firth: Some(FirthSpec { enabled: true }), // Firth ON
@@ -2026,36 +2178,50 @@ fn hypothesis_firth_anisotropic_multi_penalty() {
         max_iter: 200,
         nullspace_dims,
     };
-    
+
     let offset = Array1::<f64>::zeros(n);
     let (analytic, fd) = evaluate_external_gradients(
-        y.view(), w.view(), x.view(), offset.view(), &s_list, &opts, &rho,
-    ).expect("Gradient evaluation failed");
-    
+        y.view(),
+        w.view(),
+        x.view(),
+        offset.view(),
+        &s_list,
+        &opts,
+        &rho,
+    )
+    .expect("Gradient evaluation failed");
+
     let (cos, rel, max_a, max_f) = gradient_metrics(&analytic, &fd);
     print_result("Firth+Aniso", cos, rel, max_a, max_f);
-    
-    let status = if cos > 0.99 && rel < 0.05 { "NEGATIVE" } else { "POSITIVE" };
-    println!("  Hypothesis 5: {} (cos={:.4}, rel={:.3e})", status, cos, rel);
+
+    let status = if cos > 0.99 && rel < 0.05 {
+        "NEGATIVE"
+    } else {
+        "POSITIVE"
+    };
+    println!(
+        "  Hypothesis 5: {} (cos={:.4}, rel={:.3e})",
+        status, cos, rel
+    );
 }
 
 /// Hypothesis 6: Firth + rank-deficient penalty (difference matrix).
 #[test]
 fn hypothesis_firth_rank_deficient_penalty() {
     println!("\n=== Hypothesis 6: Firth + Rank-Deficient Penalty ===");
-    
+
     let n = 100;
     let p = 12;
     let (y, x, w) = generate_logit_data(n, p, 42);
-    
+
     // Use difference penalty which has a proper null space
     let s = create_difference_penalty_matrix(p, 2, None).expect("difference penalty");
     let s_list = vec![s];
     let nullspace_dims = vec![2];
-    
+
     // High smoothing to stress the rank-deficiency
     let rho = array![6.0]; // λ ≈ 403
-    
+
     let opts = ExternalOptimOptions {
         link: LinkFunction::Logit,
         firth: Some(FirthSpec { enabled: true }),
@@ -2063,31 +2229,44 @@ fn hypothesis_firth_rank_deficient_penalty() {
         max_iter: 200,
         nullspace_dims,
     };
-    
+
     let offset = Array1::<f64>::zeros(n);
     let (analytic, fd) = evaluate_external_gradients(
-        y.view(), w.view(), x.view(), offset.view(), &s_list, &opts, &rho,
-    ).expect("Gradient evaluation failed");
-    
+        y.view(),
+        w.view(),
+        x.view(),
+        offset.view(),
+        &s_list,
+        &opts,
+        &rho,
+    )
+    .expect("Gradient evaluation failed");
+
     let (cos, rel, max_a, max_f) = gradient_metrics(&analytic, &fd);
     print_result("Firth+RankDef", cos, rel, max_a, max_f);
-    
-    let status = if cos > 0.99 && rel < 0.05 { "NEGATIVE" } else { "POSITIVE" };
-    println!("  Hypothesis 6: {} (cos={:.4}, rel={:.3e})", status, cos, rel);
-}
 
+    let status = if cos > 0.99 && rel < 0.05 {
+        "NEGATIVE"
+    } else {
+        "POSITIVE"
+    };
+    println!(
+        "  Hypothesis 6: {} (cos={:.4}, rel={:.3e})",
+        status, cos, rel
+    );
+}
 
 /// Hypothesis 7: Full complexity scenario with overlapping penalties.
 /// Firth + multi-penalty + anisotropic + high dimensionality.
 #[test]
 fn hypothesis_full_complexity_replication() {
     println!("\n=== Hypothesis 7: Full Complexity (Overlapping Penalties) ===");
-    
+
     // Larger problem with overlapping penalties (simulating GAM structure)
     let n = 200;
     let p = 20;
     let (y, x, w) = generate_logit_data(n, p, 42);
-    
+
     // Create overlapping penalties to simulate PGS + PC structure
     let s_list = vec![
         diagonal_penalty(p, 1, 8),   // "PGS main" effect
@@ -2095,10 +2274,10 @@ fn hypothesis_full_complexity_replication() {
         diagonal_penalty(p, 12, 20), // "PC2 main" effect (overlaps)
     ];
     let nullspace_dims = vec![1, 0, 0];
-    
+
     // Highly anisotropic lambdas (wide range, 4 orders of magnitude)
     let rho = array![3.0, 7.0, -1.0]; // Lambda = [20, 1097, 0.37]
-    
+
     let opts = ExternalOptimOptions {
         link: LinkFunction::Logit,
         firth: Some(FirthSpec { enabled: true }),
@@ -2106,27 +2285,45 @@ fn hypothesis_full_complexity_replication() {
         max_iter: 200,
         nullspace_dims: nullspace_dims.clone(),
     };
-    
+
     let offset = Array1::<f64>::zeros(n);
-    
+
     match evaluate_external_gradients(
-        y.view(), w.view(), x.view(), offset.view(), &s_list, &opts, &rho,
+        y.view(),
+        w.view(),
+        x.view(),
+        offset.view(),
+        &s_list,
+        &opts,
+        &rho,
     ) {
         Ok((analytic, fd)) => {
             let (cos, rel, max_a, max_f) = gradient_metrics(&analytic, &fd);
             print_result("FullComplex", cos, rel, max_a, max_f);
-            
-            let status = if cos > 0.99 && rel < 0.05 { "NEGATIVE" } else { "POSITIVE" };
-            println!("  Hypothesis 7: {} (cos={:.4}, rel={:.3e})", status, cos, rel);
-            
+
+            let status = if cos > 0.99 && rel < 0.05 {
+                "NEGATIVE"
+            } else {
+                "POSITIVE"
+            };
+            println!(
+                "  Hypothesis 7: {} (cos={:.4}, rel={:.3e})",
+                status, cos, rel
+            );
+
             // Print per-component breakdown
             if cos < 0.99 || rel > 0.05 {
                 println!("\n  Per-component gradient comparison:");
                 for k in 0..analytic.len().min(5) {
                     let diff = (analytic[k] - fd[k]).abs();
                     let scale = fd[k].abs().max(analytic[k].abs()).max(1e-10);
-                    println!("    k={}: analytic={:.4e}, fd={:.4e}, rel_err={:.2e}", 
-                             k, analytic[k], fd[k], diff/scale);
+                    println!(
+                        "    k={}: analytic={:.4e}, fd={:.4e}, rel_err={:.2e}",
+                        k,
+                        analytic[k],
+                        fd[k],
+                        diff / scale
+                    );
                 }
             }
         }
@@ -2141,24 +2338,24 @@ fn hypothesis_full_complexity_replication() {
 #[test]
 fn hypothesis_smoothing_sweep() {
     println!("\n=== Hypothesis 8: Smoothing Sweep (Find Breakpoint) ===");
-    
+
     let n = 100;
     let p = 10;
     let (y, x, w) = generate_logit_data(n, p, 42);
-    
+
     let s = create_difference_penalty_matrix(p, 2, None).expect("difference penalty");
     let s_list = vec![s];
     let nullspace_dims = vec![2];
-    
+
     let offset = Array1::<f64>::zeros(n);
     let rho_values = [-4.0, -2.0, 0.0, 2.0, 4.0, 6.0, 8.0, 10.0];
-    
+
     println!("  rho     λ           cos      rel_err");
     println!("  ------- ----------- -------- --------");
-    
+
     for &rho_val in &rho_values {
         let rho = array![rho_val];
-        
+
         let opts = ExternalOptimOptions {
             link: LinkFunction::Logit,
             firth: Some(FirthSpec { enabled: true }),
@@ -2166,16 +2363,28 @@ fn hypothesis_smoothing_sweep() {
             max_iter: 200,
             nullspace_dims: nullspace_dims.clone(),
         };
-        
+
         match evaluate_external_gradients(
-            y.view(), w.view(), x.view(), offset.view(), &s_list, &opts, &rho,
+            y.view(),
+            w.view(),
+            x.view(),
+            offset.view(),
+            &s_list,
+            &opts,
+            &rho,
         ) {
             Ok((analytic, fd)) => {
                 let (cos, rel, _, _) = gradient_metrics(&analytic, &fd);
                 let lambda = rho_val.exp();
-                let status = if cos > 0.99 && rel < 0.05 { "✓" } else { "✗" };
-                println!("  {:+6.1} {:11.2e} {:8.4} {:8.2e} {}", 
-                         rho_val, lambda, cos, rel, status);
+                let status = if cos > 0.99 && rel < 0.05 {
+                    "✓"
+                } else {
+                    "✗"
+                };
+                println!(
+                    "  {:+6.1} {:11.2e} {:8.4} {:8.2e} {}",
+                    rho_val, lambda, cos, rel, status
+                );
             }
             Err(_) => {
                 println!("  {:+6.1} ERROR", rho_val);
@@ -2193,11 +2402,11 @@ fn hypothesis_smoothing_sweep() {
 #[test]
 fn hypothesis_many_penalties_simple_structure() {
     println!("\n=== Hypothesis 9: Many Penalties (10) Simple Structure ===");
-    
+
     let n = 100;
     let p = 25;
     let (y, x, w) = generate_logit_data(n, p, 42);
-    
+
     // Create 10 non-overlapping diagonal penalties
     let mut s_list = Vec::new();
     for i in 0..10 {
@@ -2206,10 +2415,10 @@ fn hypothesis_many_penalties_simple_structure() {
         s_list.push(diagonal_penalty(p, start.min(p), end.min(p)));
     }
     let nullspace_dims = vec![1, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-    
+
     // Use same extreme smoothing as failing test
     let rho = Array1::from_elem(10, 12.0);
-    
+
     let opts = ExternalOptimOptions {
         link: LinkFunction::Logit,
         firth: Some(FirthSpec { enabled: true }),
@@ -2217,19 +2426,35 @@ fn hypothesis_many_penalties_simple_structure() {
         max_iter: 200,
         nullspace_dims,
     };
-    
+
     let offset = Array1::<f64>::zeros(n);
-    
+
     match evaluate_external_gradients(
-        y.view(), w.view(), x.view(), offset.view(), &s_list, &opts, &rho,
+        y.view(),
+        w.view(),
+        x.view(),
+        offset.view(),
+        &s_list,
+        &opts,
+        &rho,
     ) {
         Ok((analytic, fd)) => {
             let (cos, rel, max_a, max_f) = gradient_metrics(&analytic, &fd);
             print_result("10 penalties", cos, rel, max_a, max_f);
-            
-            let status = if cos > 0.99 && rel < 0.05 { "NEGATIVE" } else { "POSITIVE" };
-            println!("  Hypothesis 9: {} (cos={:.4}, rel={:.3e})", status, cos, rel);
-            println!("  Gradient magnitude: analytic={:.2e}, fd={:.2e}", max_a, max_f);
+
+            let status = if cos > 0.99 && rel < 0.05 {
+                "NEGATIVE"
+            } else {
+                "POSITIVE"
+            };
+            println!(
+                "  Hypothesis 9: {} (cos={:.4}, rel={:.3e})",
+                status, cos, rel
+            );
+            println!(
+                "  Gradient magnitude: analytic={:.2e}, fd={:.2e}",
+                max_a, max_f
+            );
         }
         Err(e) => {
             println!("  ERROR: {:?}", e);
@@ -2242,28 +2467,28 @@ fn hypothesis_many_penalties_simple_structure() {
 #[test]
 fn hypothesis_extreme_smoothing_tiny_gradients() {
     println!("\n=== Hypothesis 10: Extreme Smoothing -> Tiny Gradients ===");
-    
+
     let n = 100;
     let p = 12;
     let (y, x, w) = generate_logit_data(n, p, 42);
-    
+
     let s_list = vec![
         diagonal_penalty(p, 1, 5),
         diagonal_penalty(p, 4, 9),
         diagonal_penalty(p, 8, 12),
     ];
     let nullspace_dims = vec![1, 0, 0];
-    
+
     // Sweep through extreme smoothing values
     let rho_values = [8.0, 10.0, 12.0, 14.0, 16.0];
     let offset = Array1::<f64>::zeros(n);
-    
+
     println!("  rho    λ           cos       rel_err   |grad|");
     println!("  ------ ----------- --------- --------- ---------");
-    
+
     for &rho_val in &rho_values {
         let rho = Array1::from_elem(3, rho_val);
-        
+
         let opts = ExternalOptimOptions {
             link: LinkFunction::Logit,
             firth: Some(FirthSpec { enabled: true }),
@@ -2271,16 +2496,28 @@ fn hypothesis_extreme_smoothing_tiny_gradients() {
             max_iter: 200,
             nullspace_dims: nullspace_dims.clone(),
         };
-        
+
         match evaluate_external_gradients(
-            y.view(), w.view(), x.view(), offset.view(), &s_list, &opts, &rho,
+            y.view(),
+            w.view(),
+            x.view(),
+            offset.view(),
+            &s_list,
+            &opts,
+            &rho,
         ) {
             Ok((analytic, fd)) => {
                 let (cos, rel, max_a, _) = gradient_metrics(&analytic, &fd);
                 let lambda = rho_val.exp();
-                let status = if cos > 0.99 && rel < 0.05 { "✓" } else { "✗" };
-                println!("  {:+5.1} {:11.2e} {:9.4} {:9.2e} {:9.2e} {}", 
-                         rho_val, lambda, cos, rel, max_a, status);
+                let status = if cos > 0.99 && rel < 0.05 {
+                    "✓"
+                } else {
+                    "✗"
+                };
+                println!(
+                    "  {:+5.1} {:11.2e} {:9.4} {:9.2e} {:9.2e} {}",
+                    rho_val, lambda, cos, rel, max_a, status
+                );
             }
             Err(_) => {
                 println!("  {:+5.1} ERROR", rho_val);
@@ -2294,23 +2531,23 @@ fn hypothesis_extreme_smoothing_tiny_gradients() {
 #[test]
 fn hypothesis_real_gam_matrices_small() {
     println!("\n=== Hypothesis 11: Real GAM Matrices (Small Config) ===");
-    
+
     let train = create_logistic_training_data(100, 1, 31); // Only 1 PC
     let config = logistic_model_config(true, false, &train); // PC mains only
-    
+
     let (x, s_list, layout, ..) =
         build_design_and_penalty_matrices(&train, &config).expect("design");
-    
+
     println!("  Design dimensions: {} x {}", x.nrows(), x.ncols());
     println!("  Number of penalties: {}", s_list.len());
-    
+
     let nullspace_dims = vec![0; s_list.len()];
     let offset = Array1::<f64>::zeros(train.y.len());
-    
+
     // Test at moderate smoothing first
     for &rho_val in &[0.0, 6.0, 12.0] {
         let rho = Array1::from_elem(layout.num_penalties, rho_val);
-        
+
         let opts = ExternalOptimOptions {
             link: LinkFunction::Logit,
             firth: Some(FirthSpec { enabled: true }),
@@ -2318,7 +2555,7 @@ fn hypothesis_real_gam_matrices_small() {
             max_iter: 200,
             nullspace_dims: nullspace_dims.clone(),
         };
-        
+
         match evaluate_external_gradients(
             train.y.view(),
             train.weights.view(),
@@ -2330,9 +2567,15 @@ fn hypothesis_real_gam_matrices_small() {
         ) {
             Ok((analytic, fd)) => {
                 let (cos, rel, max_a, _) = gradient_metrics(&analytic, &fd);
-                let status = if cos > 0.99 && rel < 0.05 { "✓" } else { "✗" };
-                println!("  rho={:+5.1}: cos={:.4}, rel={:.2e}, |grad|={:.2e} {}", 
-                         rho_val, cos, rel, max_a, status);
+                let status = if cos > 0.99 && rel < 0.05 {
+                    "✓"
+                } else {
+                    "✗"
+                };
+                println!(
+                    "  rho={:+5.1}: cos={:.4}, rel={:.2e}, |grad|={:.2e} {}",
+                    rho_val, cos, rel, max_a, status
+                );
             }
             Err(e) => {
                 println!("  rho={:+5.1}: ERROR {:?}", rho_val, e);
@@ -2346,23 +2589,23 @@ fn hypothesis_real_gam_matrices_small() {
 #[test]
 fn hypothesis_gradient_magnitude_threshold() {
     println!("\n=== Hypothesis 12: Gradient Magnitude vs Quality ===");
-    
+
     let n = 100;
     let p = 10;
     let (y, x, w) = generate_logit_data(n, p, 42);
-    
+
     let s = create_difference_penalty_matrix(p, 2, None).expect("penalty");
     let s_list = vec![s];
     let nullspace_dims = vec![2];
     let offset = Array1::<f64>::zeros(n);
-    
+
     // Collect (grad_magnitude, cosine, rel_error) across smoothing values
     println!("  |grad|       cos       rel_err   Quality");
     println!("  ----------   -------- --------- ---------");
-    
+
     for rho_val in (-4..=16).step_by(2) {
         let rho = array![rho_val as f64];
-        
+
         let opts = ExternalOptimOptions {
             link: LinkFunction::Logit,
             firth: Some(FirthSpec { enabled: true }),
@@ -2370,20 +2613,26 @@ fn hypothesis_gradient_magnitude_threshold() {
             max_iter: 200,
             nullspace_dims: nullspace_dims.clone(),
         };
-        
+
         match evaluate_external_gradients(
-            y.view(), w.view(), x.view(), offset.view(), &s_list, &opts, &rho,
+            y.view(),
+            w.view(),
+            x.view(),
+            offset.view(),
+            &s_list,
+            &opts,
+            &rho,
         ) {
             Ok((analytic, fd)) => {
                 let (cos, rel, max_a, _) = gradient_metrics(&analytic, &fd);
-                let quality = if cos > 0.999 && rel < 0.01 { 
-                    "EXCELLENT" 
-                } else if cos > 0.99 && rel < 0.05 { 
-                    "GOOD" 
-                } else if cos > 0.95 { 
-                    "MARGINAL" 
-                } else { 
-                    "BAD" 
+                let quality = if cos > 0.999 && rel < 0.01 {
+                    "EXCELLENT"
+                } else if cos > 0.99 && rel < 0.05 {
+                    "GOOD"
+                } else if cos > 0.95 {
+                    "MARGINAL"
+                } else {
+                    "BAD"
                 };
                 println!("  {:10.2e}   {:8.4} {:9.2e} {}", max_a, cos, rel, quality);
             }
@@ -2399,18 +2648,18 @@ fn hypothesis_gradient_magnitude_threshold() {
 #[test]
 fn hypothesis_varying_pc_count() {
     println!("\n=== Hypothesis 13: Varying PC Count ===");
-    
+
     for num_pcs in [1, 2, 3, 4] {
         let train = create_logistic_training_data(100, num_pcs, 31);
         let config = logistic_model_config(true, false, &train);
-        
+
         let (x, s_list, layout, ..) =
             build_design_and_penalty_matrices(&train, &config).expect("design");
-        
+
         let rho = Array1::from_elem(layout.num_penalties, 12.0);
         let nullspace_dims = vec![0; s_list.len()];
         let offset = Array1::<f64>::zeros(train.y.len());
-        
+
         let opts = ExternalOptimOptions {
             link: LinkFunction::Logit,
             firth: Some(FirthSpec { enabled: true }),
@@ -2418,7 +2667,7 @@ fn hypothesis_varying_pc_count() {
             max_iter: 200,
             nullspace_dims,
         };
-        
+
         match evaluate_external_gradients(
             train.y.view(),
             train.weights.view(),
@@ -2430,9 +2679,15 @@ fn hypothesis_varying_pc_count() {
         ) {
             Ok((analytic, fd)) => {
                 let (cos, rel, max_a, _) = gradient_metrics(&analytic, &fd);
-                let status = if cos > 0.99 && rel < 0.05 { "✓" } else { "✗" };
-                println!("  {} PCs -> {} penalties: cos={:.4}, rel={:.2e}, |grad|={:.2e} {}", 
-                         num_pcs, layout.num_penalties, cos, rel, max_a, status);
+                let status = if cos > 0.99 && rel < 0.05 {
+                    "✓"
+                } else {
+                    "✗"
+                };
+                println!(
+                    "  {} PCs -> {} penalties: cos={:.4}, rel={:.2e}, |grad|={:.2e} {}",
+                    num_pcs, layout.num_penalties, cos, rel, max_a, status
+                );
             }
             Err(e) => {
                 println!("  {} PCs: ERROR {:?}", num_pcs, e);
@@ -2446,22 +2701,22 @@ fn hypothesis_varying_pc_count() {
 #[test]
 fn hypothesis_spline_penalty_synthetic_data() {
     println!("\n=== Hypothesis 14: Spline Penalty + Synthetic Data ===");
-    
+
     // Create difference penalties like real GAM uses
     let p = 20;
     let n = 120;
     let (y, x, w) = generate_logit_data(n, p, 42);
-    
+
     // Use multiple difference penalties (order 2) like real splines
     let s1 = create_difference_penalty_matrix(8, 2, None).expect("penalty 1");
     let s2 = create_difference_penalty_matrix(6, 2, None).expect("penalty 2");
     let s3 = create_difference_penalty_matrix(6, 2, None).expect("penalty 3");
-    
+
     // Embed them in a block-diagonal structure within the full p dimensions
     let mut s1_full = Array2::<f64>::zeros((p, p));
     let mut s2_full = Array2::<f64>::zeros((p, p));
     let mut s3_full = Array2::<f64>::zeros((p, p));
-    
+
     for i in 0..8 {
         for j in 0..8 {
             s1_full[[i, j]] = s1[[i, j]];
@@ -2469,24 +2724,24 @@ fn hypothesis_spline_penalty_synthetic_data() {
     }
     for i in 0..6 {
         for j in 0..6 {
-            s2_full[[8+i, 8+j]] = s2[[i, j]];
+            s2_full[[8 + i, 8 + j]] = s2[[i, j]];
         }
     }
     for i in 0..6 {
         for j in 0..6 {
-            s3_full[[14+i, 14+j]] = s3[[i, j]];
+            s3_full[[14 + i, 14 + j]] = s3[[i, j]];
         }
     }
-    
+
     let s_list = vec![s1_full, s2_full, s3_full];
     // Nullspace dims: order-2 difference has 2D null space each
     let nullspace_dims = vec![2, 2, 2];
-    
+
     let offset = Array1::<f64>::zeros(n);
-    
+
     for &rho_val in &[0.0, 6.0, 12.0] {
         let rho = Array1::from_elem(3, rho_val);
-        
+
         let opts = ExternalOptimOptions {
             link: LinkFunction::Logit,
             firth: Some(FirthSpec { enabled: true }),
@@ -2494,15 +2749,27 @@ fn hypothesis_spline_penalty_synthetic_data() {
             max_iter: 200,
             nullspace_dims: nullspace_dims.clone(),
         };
-        
+
         match evaluate_external_gradients(
-            y.view(), w.view(), x.view(), offset.view(), &s_list, &opts, &rho,
+            y.view(),
+            w.view(),
+            x.view(),
+            offset.view(),
+            &s_list,
+            &opts,
+            &rho,
         ) {
             Ok((analytic, fd)) => {
                 let (cos, rel, max_a, _) = gradient_metrics(&analytic, &fd);
-                let status = if cos > 0.99 && rel < 0.05 { "✓" } else { "✗" };
-                println!("  rho={:+5.1}: cos={:.4}, rel={:.2e}, |grad|={:.2e} {}", 
-                         rho_val, cos, rel, max_a, status);
+                let status = if cos > 0.99 && rel < 0.05 {
+                    "✓"
+                } else {
+                    "✗"
+                };
+                println!(
+                    "  rho={:+5.1}: cos={:.4}, rel={:.2e}, |grad|={:.2e} {}",
+                    rho_val, cos, rel, max_a, status
+                );
             }
             Err(e) => {
                 println!("  rho={:+5.1}: ERROR {:?}", rho_val, e);
@@ -2516,11 +2783,11 @@ fn hypothesis_spline_penalty_synthetic_data() {
 #[test]
 fn hypothesis_overlapping_penalty_structure() {
     println!("\n=== Hypothesis 15: Overlapping Penalty Structure ===");
-    
+
     let p = 20;
     let n = 120;
     let (y, x, w) = generate_logit_data(n, p, 42);
-    
+
     // Create OVERLAPPING penalties - this is what real GAM does
     // Penalty 1: covers indices 0-10
     // Penalty 2: covers indices 5-15 (overlaps with 1)
@@ -2528,12 +2795,12 @@ fn hypothesis_overlapping_penalty_structure() {
     let mut s1 = Array2::<f64>::zeros((p, p));
     let mut s2 = Array2::<f64>::zeros((p, p));
     let mut s3 = Array2::<f64>::zeros((p, p));
-    
+
     // Fill with difference penalty structure in each block
     let d1 = create_difference_penalty_matrix(11, 2, None).expect("d1");
     let d2 = create_difference_penalty_matrix(11, 2, None).expect("d2");
     let d3 = create_difference_penalty_matrix(10, 2, None).expect("d3");
-    
+
     for i in 0..11 {
         for j in 0..11 {
             s1[[i, j]] = d1[[i, j]];
@@ -2541,23 +2808,23 @@ fn hypothesis_overlapping_penalty_structure() {
     }
     for i in 0..11 {
         for j in 0..11 {
-            s2[[5+i, 5+j]] = d2[[i, j]];
+            s2[[5 + i, 5 + j]] = d2[[i, j]];
         }
     }
     for i in 0..10 {
         for j in 0..10 {
-            s3[[10+i, 10+j]] = d3[[i, j]];
+            s3[[10 + i, 10 + j]] = d3[[i, j]];
         }
     }
-    
+
     let s_list = vec![s1, s2, s3];
     let nullspace_dims = vec![2, 2, 2];
-    
+
     let offset = Array1::<f64>::zeros(n);
-    
+
     for &rho_val in &[0.0, 6.0, 12.0] {
         let rho = Array1::from_elem(3, rho_val);
-        
+
         let opts = ExternalOptimOptions {
             link: LinkFunction::Logit,
             firth: Some(FirthSpec { enabled: true }),
@@ -2565,15 +2832,27 @@ fn hypothesis_overlapping_penalty_structure() {
             max_iter: 200,
             nullspace_dims: nullspace_dims.clone(),
         };
-        
+
         match evaluate_external_gradients(
-            y.view(), w.view(), x.view(), offset.view(), &s_list, &opts, &rho,
+            y.view(),
+            w.view(),
+            x.view(),
+            offset.view(),
+            &s_list,
+            &opts,
+            &rho,
         ) {
             Ok((analytic, fd)) => {
                 let (cos, rel, max_a, _) = gradient_metrics(&analytic, &fd);
-                let status = if cos > 0.99 && rel < 0.05 { "✓" } else { "✗" };
-                println!("  rho={:+5.1}: cos={:.4}, rel={:.2e}, |grad|={:.2e} {}", 
-                         rho_val, cos, rel, max_a, status);
+                let status = if cos > 0.99 && rel < 0.05 {
+                    "✓"
+                } else {
+                    "✗"
+                };
+                println!(
+                    "  rho={:+5.1}: cos={:.4}, rel={:.2e}, |grad|={:.2e} {}",
+                    rho_val, cos, rel, max_a, status
+                );
             }
             Err(e) => {
                 println!("  rho={:+5.1}: ERROR {:?}", rho_val, e);
@@ -2587,45 +2866,62 @@ fn hypothesis_overlapping_penalty_structure() {
 #[test]
 fn hypothesis_reparameterization_trigger() {
     println!("\n=== Hypothesis 16: Reparameterization as Trigger ===");
-    
+
     // Get actual reparameterized matrices from real GAM construction
     let train = create_logistic_training_data(100, 2, 31);
     let config = logistic_model_config(true, false, &train);
-    
+
     let (x, s_list, layout, ..) =
         build_design_and_penalty_matrices(&train, &config).expect("design");
-    
-    println!("  Design: {} x {}, {} penalties", x.nrows(), x.ncols(), s_list.len());
-    
+
+    println!(
+        "  Design: {} x {}, {} penalties",
+        x.nrows(),
+        x.ncols(),
+        s_list.len()
+    );
+
     // Test WITHOUT reparameterization - use raw matrices
     // Note: s_list is already the penalties, x is the design
-    
+
     let nullspace_dims = vec![0; s_list.len()];
     let offset = Array1::<f64>::zeros(train.y.len());
-    
+
     // Get the reparameterization to see its condition number
     let rs_list = compute_penalty_square_roots(&s_list).unwrap();
     let lambdas: Vec<f64> = vec![1.0; s_list.len()];
     let reparam = stable_reparameterization(&rs_list, &lambdas, &layout).unwrap();
-    
-    println!("  Reparam.s_transformed dims: {} x {}", 
-             reparam.s_transformed.nrows(), reparam.s_transformed.ncols());
-    println!("  Reparam.qs dims: {} x {}", 
-             reparam.qs.nrows(), reparam.qs.ncols());
-    
+
+    println!(
+        "  Reparam.s_transformed dims: {} x {}",
+        reparam.s_transformed.nrows(),
+        reparam.s_transformed.ncols()
+    );
+    println!(
+        "  Reparam.qs dims: {} x {}",
+        reparam.qs.nrows(),
+        reparam.qs.ncols()
+    );
+
     // Check condition number of transformed penalty
     let s_diag: Vec<f64> = (0..reparam.s_transformed.nrows())
         .map(|i| reparam.s_transformed[[i, i]])
         .collect();
     let s_max = s_diag.iter().fold(0.0f64, |a, &b| a.max(b));
-    let s_min = s_diag.iter().filter(|&&x| x > 1e-12).fold(f64::INFINITY, |a, &b| a.min(b));
+    let s_min = s_diag
+        .iter()
+        .filter(|&&x| x > 1e-12)
+        .fold(f64::INFINITY, |a, &b| a.min(b));
     let cond = s_max / s_min;
-    println!("  s_transformed condition (diag): {:.2e} / {:.2e} = {:.2e}", s_max, s_min, cond);
-    
+    println!(
+        "  s_transformed condition (diag): {:.2e} / {:.2e} = {:.2e}",
+        s_max, s_min, cond
+    );
+
     // Now test at different rho values
     for &rho_val in &[0.0, 6.0, 12.0] {
         let rho = Array1::from_elem(layout.num_penalties, rho_val);
-        
+
         let opts = ExternalOptimOptions {
             link: LinkFunction::Logit,
             firth: Some(FirthSpec { enabled: true }),
@@ -2633,7 +2929,7 @@ fn hypothesis_reparameterization_trigger() {
             max_iter: 200,
             nullspace_dims: nullspace_dims.clone(),
         };
-        
+
         match evaluate_external_gradients(
             train.y.view(),
             train.weights.view(),
@@ -2645,12 +2941,18 @@ fn hypothesis_reparameterization_trigger() {
         ) {
             Ok((analytic, fd)) => {
                 let (cos, rel, max_a, _) = gradient_metrics(&analytic, &fd);
-                let status = if cos > 0.99 && rel < 0.05 { "✓" } else { "✗" };
-                
+                let status = if cos > 0.99 && rel < 0.05 {
+                    "✓"
+                } else {
+                    "✗"
+                };
+
                 // Check if any FD components have very small magnitude
                 let tiny_count = fd.iter().filter(|&&v| v.abs() < 1e-6).count();
-                println!("  rho={:+5.1}: cos={:.4}, rel={:.2e}, |grad|={:.2e}, tiny={} {}", 
-                         rho_val, cos, rel, max_a, tiny_count, status);
+                println!(
+                    "  rho={:+5.1}: cos={:.4}, rel={:.2e}, |grad|={:.2e}, tiny={} {}",
+                    rho_val, cos, rel, max_a, tiny_count, status
+                );
             }
             Err(e) => {
                 println!("  rho={:+5.1}: ERROR {:?}", rho_val, e);
@@ -2664,17 +2966,17 @@ fn hypothesis_reparameterization_trigger() {
 #[test]
 fn hypothesis_near_zero_components() {
     println!("\n=== Hypothesis 17: Near-Zero Component Analysis ===");
-    
+
     let train = create_logistic_training_data(100, 3, 31);
     let config = logistic_model_config(true, false, &train);
-    
+
     let (x, s_list, layout, ..) =
         build_design_and_penalty_matrices(&train, &config).expect("design");
-    
+
     let rho = Array1::from_elem(layout.num_penalties, 12.0);
     let nullspace_dims = vec![0; s_list.len()];
     let offset = Array1::<f64>::zeros(train.y.len());
-    
+
     let opts = ExternalOptimOptions {
         link: LinkFunction::Logit,
         firth: Some(FirthSpec { enabled: true }),
@@ -2682,7 +2984,7 @@ fn hypothesis_near_zero_components() {
         max_iter: 200,
         nullspace_dims,
     };
-    
+
     let (analytic, fd) = evaluate_external_gradients(
         train.y.view(),
         train.weights.view(),
@@ -2691,22 +2993,23 @@ fn hypothesis_near_zero_components() {
         &s_list,
         &opts,
         &rho,
-    ).expect("gradients");
-    
+    )
+    .expect("gradients");
+
     println!("  Per-component analysis:");
     println!("  k    analytic       fd             diff          rel_err");
     println!("  ---  ------------   ------------   ------------  --------");
-    
+
     let mut large_error_tiny_grad = 0;
     let mut large_error_normal_grad = 0;
-    
+
     for k in 0..analytic.len() {
         let a = analytic[k];
         let f = fd[k];
         let diff = (a - f).abs();
         let scale = a.abs().max(f.abs()).max(1e-10);
         let rel = diff / scale;
-        
+
         let note = if f.abs() < 1e-6 {
             if rel > 0.1 {
                 large_error_tiny_grad += 1;
@@ -2718,15 +3021,23 @@ fn hypothesis_near_zero_components() {
         } else {
             ""
         };
-        
-        println!("  {:2}   {:+12.4e}   {:+12.4e}   {:+12.4e}  {:8.2e}  {}", 
-                 k, a, f, diff, rel, note);
+
+        println!(
+            "  {:2}   {:+12.4e}   {:+12.4e}   {:+12.4e}  {:8.2e}  {}",
+            k, a, f, diff, rel, note
+        );
     }
-    
+
     println!("\n  Summary:");
-    println!("    Components with large error AND tiny gradient: {}", large_error_tiny_grad);
-    println!("    Components with large error AND normal gradient: {}", large_error_normal_grad);
-    
+    println!(
+        "    Components with large error AND tiny gradient: {}",
+        large_error_tiny_grad
+    );
+    println!(
+        "    Components with large error AND normal gradient: {}",
+        large_error_normal_grad
+    );
+
     if large_error_normal_grad == 0 && large_error_tiny_grad > 0 {
         println!("  => Hypothesis SUPPORTED: Errors only in tiny gradient components");
     } else if large_error_normal_grad > 0 {
@@ -2734,28 +3045,27 @@ fn hypothesis_near_zero_components() {
     }
 }
 
-
 /// Hypothesis 18: Use GAM S matrices but with random X.
 /// This tests if the problem is S-related or X-related.
 #[test]
 fn hypothesis_gam_s_random_x() {
     println!("\n=== Hypothesis 18: GAM S Matrices + Random X ===");
-    
+
     let train = create_logistic_training_data(100, 3, 31);
     let config = logistic_model_config(true, false, &train);
     let (x_gam, s_list_gam, layout, ..) =
         build_design_and_penalty_matrices(&train, &config).expect("design");
-    
+
     let p = x_gam.ncols();
     let n = x_gam.nrows();
-    
+
     // Create random X with same dimensions
     let (y_rand, x_rand, w_rand) = generate_logit_data(n, p, 42);
-    
+
     let nullspace_dims = vec![0; s_list_gam.len()];
     let offset = Array1::<f64>::zeros(n);
     let rho = Array1::from_elem(layout.num_penalties, 12.0);
-    
+
     let opts = ExternalOptimOptions {
         link: LinkFunction::Logit,
         firth: Some(FirthSpec { enabled: true }),
@@ -2763,17 +3073,30 @@ fn hypothesis_gam_s_random_x() {
         max_iter: 200,
         nullspace_dims,
     };
-    
+
     // Test: Use GAM penalties with random X and random y
     let (analytic, fd) = evaluate_external_gradients(
-        y_rand.view(), w_rand.view(), x_rand.view(), offset.view(),
-        &s_list_gam, &opts, &rho,
-    ).expect("gradients");
-    
+        y_rand.view(),
+        w_rand.view(),
+        x_rand.view(),
+        offset.view(),
+        &s_list_gam,
+        &opts,
+        &rho,
+    )
+    .expect("gradients");
+
     let (cos, rel, max_a, _) = gradient_metrics(&analytic, &fd);
-    let status = if cos > 0.99 && rel < 0.05 { "✓ PASS" } else { "✗ FAIL" };
-    println!("  GAM S + Random X: cos={:.4}, rel={:.2e}, |grad|={:.2e} {}", cos, rel, max_a, status);
-    
+    let status = if cos > 0.99 && rel < 0.05 {
+        "✓ PASS"
+    } else {
+        "✗ FAIL"
+    };
+    println!(
+        "  GAM S + Random X: cos={:.4}, rel={:.2e}, |grad|={:.2e} {}",
+        cos, rel, max_a, status
+    );
+
     if cos > 0.99 {
         println!("  => S matrices alone do NOT trigger failure");
     } else {
@@ -2785,24 +3108,28 @@ fn hypothesis_gam_s_random_x() {
 #[test]
 fn hypothesis_random_s_gam_xy() {
     println!("\n=== Hypothesis 19: Random S + GAM X and Y ===");
-    
+
     let train = create_logistic_training_data(100, 3, 31);
     let config = logistic_model_config(true, false, &train);
     let (x_gam, s_list_gam, layout, ..) =
         build_design_and_penalty_matrices(&train, &config).expect("design");
-    
+
     let p = x_gam.ncols();
-    
+
     // Create simple diagonal penalties matching the number of GAM penalties
     let mut s_list_diag = Vec::new();
     for k in 0..s_list_gam.len() {
-        s_list_diag.push(diagonal_penalty(p, k * (p / s_list_gam.len()), (k+1) * (p / s_list_gam.len())));
+        s_list_diag.push(diagonal_penalty(
+            p,
+            k * (p / s_list_gam.len()),
+            (k + 1) * (p / s_list_gam.len()),
+        ));
     }
-    
+
     let nullspace_dims = vec![0; s_list_gam.len()];
     let offset = Array1::<f64>::zeros(train.y.len());
     let rho = Array1::from_elem(layout.num_penalties, 12.0);
-    
+
     let opts = ExternalOptimOptions {
         link: LinkFunction::Logit,
         firth: Some(FirthSpec { enabled: true }),
@@ -2810,17 +3137,30 @@ fn hypothesis_random_s_gam_xy() {
         max_iter: 200,
         nullspace_dims,
     };
-    
+
     // Test: Use diagonal penalties with GAM X and y
     let (analytic, fd) = evaluate_external_gradients(
-        train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
-        &s_list_diag, &opts, &rho,
-    ).expect("gradients");
-    
+        train.y.view(),
+        train.weights.view(),
+        x_gam.view(),
+        offset.view(),
+        &s_list_diag,
+        &opts,
+        &rho,
+    )
+    .expect("gradients");
+
     let (cos, rel, max_a, _) = gradient_metrics(&analytic, &fd);
-    let status = if cos > 0.99 && rel < 0.05 { "✓ PASS" } else { "✗ FAIL" };
-    println!("  Random S + GAM X: cos={:.4}, rel={:.2e}, |grad|={:.2e} {}", cos, rel, max_a, status);
-    
+    let status = if cos > 0.99 && rel < 0.05 {
+        "✓ PASS"
+    } else {
+        "✗ FAIL"
+    };
+    println!(
+        "  Random S + GAM X: cos={:.4}, rel={:.2e}, |grad|={:.2e} {}",
+        cos, rel, max_a, status
+    );
+
     if cos > 0.99 {
         println!("  => GAM X/y alone do NOT trigger failure");
     } else {
@@ -2854,15 +3194,21 @@ fn hypothesis_fd_step_size_inconsistency() {
     let compute_cost = |rho_val: f64| -> f64 {
         let rho = array![rho_val];
         evaluate_external_cost_and_ridge(
-            train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
-            &[s_4.clone()], &opts, &rho,
-        ).map(|(c, ..)| c).unwrap_or(f64::NAN)
+            train.y.view(),
+            train.weights.view(),
+            x_gam.view(),
+            offset.view(),
+            &[s_4.clone()],
+            &opts,
+            &rho,
+        )
+        .map(|(c, ..)| c)
+        .unwrap_or(f64::NAN)
     };
 
     // FD derivative at step size h: (f(x+h) - f(x-h)) / 2h
-    let fd_derivative = |rho: f64, h: f64| -> f64 {
-        (compute_cost(rho + h) - compute_cost(rho - h)) / (2.0 * h)
-    };
+    let fd_derivative =
+        |rho: f64, h: f64| -> f64 { (compute_cost(rho + h) - compute_cost(rho - h)) / (2.0 * h) };
 
     let step_sizes = [1e-2, 5e-3, 2e-3, 1e-3, 5e-4, 2e-4, 1e-4];
 
@@ -2870,7 +3216,8 @@ fn hypothesis_fd_step_size_inconsistency() {
     let mut high_rho_inconsistencies = 0;
 
     for rho_val in [0.0_f64, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0] {
-        let derivatives: Vec<f64> = step_sizes.iter()
+        let derivatives: Vec<f64> = step_sizes
+            .iter()
             .map(|&h| fd_derivative(rho_val, h))
             .collect();
 
@@ -2887,14 +3234,18 @@ fn hypothesis_fd_step_size_inconsistency() {
     }
 
     // At low rho, FD should be consistent across step sizes
-    assert!(low_rho_inconsistencies == 0,
+    assert!(
+        low_rho_inconsistencies == 0,
         "low rho (0-4) should have consistent FD signs, found {} inconsistencies",
-        low_rho_inconsistencies);
+        low_rho_inconsistencies
+    );
 
     // At high rho, FD becomes inconsistent due to numerical noise
-    assert!(high_rho_inconsistencies >= 1,
+    assert!(
+        high_rho_inconsistencies >= 1,
         "high rho (10-12) should have inconsistent FD signs, found {} inconsistencies",
-        high_rho_inconsistencies);
+        high_rho_inconsistencies
+    );
 }
 
 /// Tests that analytic gradient sign matches cost function trend at all rho values.
@@ -2923,17 +3274,31 @@ fn hypothesis_analytic_gradient_matches_cost_trend() {
     let compute_cost = |rho_val: f64| -> f64 {
         let rho = array![rho_val];
         evaluate_external_cost_and_ridge(
-            train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
-            &[s_4.clone()], &opts, &rho,
-        ).map(|(c, ..)| c).unwrap_or(f64::NAN)
+            train.y.view(),
+            train.weights.view(),
+            x_gam.view(),
+            offset.view(),
+            &[s_4.clone()],
+            &opts,
+            &rho,
+        )
+        .map(|(c, ..)| c)
+        .unwrap_or(f64::NAN)
     };
 
     let compute_analytic_grad = |rho_val: f64| -> f64 {
         let rho = array![rho_val];
         evaluate_external_gradients(
-            train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
-            &[s_4.clone()], &opts, &rho,
-        ).map(|(analytic, _)| analytic[0]).unwrap_or(f64::NAN)
+            train.y.view(),
+            train.weights.view(),
+            x_gam.view(),
+            offset.view(),
+            &[s_4.clone()],
+            &opts,
+            &rho,
+        )
+        .map(|(analytic, _)| analytic[0])
+        .unwrap_or(f64::NAN)
     };
 
     // Use a large delta to get reliable cost trend (avoids FD precision issues)
@@ -2958,8 +3323,11 @@ fn hypothesis_analytic_gradient_matches_cost_trend() {
     }
 
     // Analytic gradient should match cost trend at all rho values
-    assert!(mismatches == 0,
-        "analytic gradient sign should match cost trend, found {} mismatches", mismatches);
+    assert!(
+        mismatches == 0,
+        "analytic gradient sign should match cost trend, found {} mismatches",
+        mismatches
+    );
 }
 
 /// Tests whether floating point precision is the root cause of FD failure at high rho.
@@ -2993,9 +3361,16 @@ fn hypothesis_floating_point_precision_not_root_cause() {
     let compute_cost = |rho_val: f64| -> f64 {
         let rho = array![rho_val];
         evaluate_external_cost_and_ridge(
-            train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
-            &[s_4.clone()], &opts, &rho,
-        ).map(|(c, ..)| c).unwrap_or(f64::NAN)
+            train.y.view(),
+            train.weights.view(),
+            x_gam.view(),
+            offset.view(),
+            &[s_4.clone()],
+            &opts,
+            &rho,
+        )
+        .map(|(c, ..)| c)
+        .unwrap_or(f64::NAN)
     };
 
     let epsilon = f64::EPSILON; // ~2.2e-16
@@ -3019,10 +3394,12 @@ fn hypothesis_floating_point_precision_not_root_cause() {
     let fp_is_root_cause = precision_margin < 100.0;
 
     // This test asserts that FP precision is NOT the root cause
-    assert!(!fp_is_root_cause,
+    assert!(
+        !fp_is_root_cause,
         "floating point precision IS the root cause at rho={} (margin={:.0}x epsilon, \
          need >100x to rule out FP)",
-        rho_val, precision_margin);
+        rho_val, precision_margin
+    );
 }
 
 /// Tests for cost function non-monotonicity at small scales.
@@ -3055,9 +3432,16 @@ fn hypothesis_cost_nonmonotonicity_at_high_rho() {
     let compute_cost = |rho_val: f64| -> f64 {
         let rho = array![rho_val];
         evaluate_external_cost_and_ridge(
-            train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
-            &[s_4.clone()], &opts, &rho,
-        ).map(|(c, ..)| c).unwrap_or(f64::NAN)
+            train.y.view(),
+            train.weights.view(),
+            x_gam.view(),
+            offset.view(),
+            &[s_4.clone()],
+            &opts,
+            &rho,
+        )
+        .map(|(c, ..)| c)
+        .unwrap_or(f64::NAN)
     };
 
     // Sample cost at 21 points in interval [rho-0.01, rho+0.01]
@@ -3085,13 +3469,17 @@ fn hypothesis_cost_nonmonotonicity_at_high_rho() {
     let high_rho_monotonic = check_monotonicity(12.0);
 
     // Test: low rho should be monotonic, high rho should show non-monotonicity
-    assert!(low_rho_monotonic,
-        "cost function should be monotonic at low rho (2.0)");
+    assert!(
+        low_rho_monotonic,
+        "cost function should be monotonic at low rho (2.0)"
+    );
 
-    assert!(!high_rho_monotonic,
+    assert!(
+        !high_rho_monotonic,
         "cost function should show non-monotonicity at high rho (12.0), \
          but it appears monotonic - this contradicts the hypothesis that \
-         non-monotonicity causes FD failure");
+         non-monotonicity causes FD failure"
+    );
 }
 
 /// Tests whether solver convergence variability causes the cost non-monotonicity.
@@ -3124,9 +3512,16 @@ fn hypothesis_solver_variability_causes_nonmonotonicity() {
         let compute_cost = |rho_val: f64| -> f64 {
             let rho = array![rho_val];
             evaluate_external_cost_and_ridge(
-                train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
-                &[s_4.clone()], &opts, &rho,
-            ).map(|(c, ..)| c).unwrap_or(f64::NAN)
+                train.y.view(),
+                train.weights.view(),
+                x_gam.view(),
+                offset.view(),
+                &[s_4.clone()],
+                &opts,
+                &rho,
+            )
+            .map(|(c, ..)| c)
+            .unwrap_or(f64::NAN)
         };
 
         // Sample at high rho where non-monotonicity occurs
@@ -3143,9 +3538,9 @@ fn hypothesis_solver_variability_causes_nonmonotonicity() {
 
         // Count direction changes
         let mut changes = 0;
-        for i in 1..costs.len()-1 {
-            let prev_dir = costs[i] - costs[i-1];
-            let next_dir = costs[i+1] - costs[i];
+        for i in 1..costs.len() - 1 {
+            let prev_dir = costs[i] - costs[i - 1];
+            let next_dir = costs[i + 1] - costs[i];
             if prev_dir * next_dir < 0.0 {
                 changes += 1;
             }
@@ -3163,9 +3558,13 @@ fn hypothesis_solver_variability_causes_nonmonotonicity() {
     // FINDING: Tighter tolerance INCREASES non-monotonicity, meaning the non-monotonicity
     // is intrinsic to the cost function, not caused by solver variability.
     // Loose tolerance hides it by stopping before revealing the true cost surface.
-    assert!(changes_tight > changes_loose,
+    assert!(
+        changes_tight > changes_loose,
         "tighter tolerance reveals more non-monotonicity (intrinsic to cost function): \
-         expected tight > loose, got tight={}, loose={}", changes_tight, changes_loose);
+         expected tight > loose, got tight={}, loose={}",
+        changes_tight,
+        changes_loose
+    );
 }
 
 /// Tests whether Firth adjustment causes the cost non-monotonicity.
@@ -3185,7 +3584,11 @@ fn hypothesis_firth_causes_nonmonotonicity() {
     let count_direction_changes = |firth_enabled: bool| -> usize {
         let opts = ExternalOptimOptions {
             link: LinkFunction::Logit,
-            firth: if firth_enabled { Some(FirthSpec { enabled: true }) } else { None },
+            firth: if firth_enabled {
+                Some(FirthSpec { enabled: true })
+            } else {
+                None
+            },
             tol: 1e-12,
             max_iter: 1000,
             nullspace_dims: vec![0],
@@ -3194,9 +3597,16 @@ fn hypothesis_firth_causes_nonmonotonicity() {
         let compute_cost = |rho_val: f64| -> f64 {
             let rho = array![rho_val];
             evaluate_external_cost_and_ridge(
-                train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
-                &[s_4.clone()], &opts, &rho,
-            ).map(|(c, ..)| c).unwrap_or(f64::NAN)
+                train.y.view(),
+                train.weights.view(),
+                x_gam.view(),
+                offset.view(),
+                &[s_4.clone()],
+                &opts,
+                &rho,
+            )
+            .map(|(c, ..)| c)
+            .unwrap_or(f64::NAN)
         };
 
         let n_samples = 21;
@@ -3211,9 +3621,9 @@ fn hypothesis_firth_causes_nonmonotonicity() {
             .collect();
 
         let mut changes = 0;
-        for i in 1..costs.len()-1 {
-            let prev_dir = costs[i] - costs[i-1];
-            let next_dir = costs[i+1] - costs[i];
+        for i in 1..costs.len() - 1 {
+            let prev_dir = costs[i] - costs[i - 1];
+            let next_dir = costs[i + 1] - costs[i];
             if prev_dir * next_dir < 0.0 {
                 changes += 1;
             }
@@ -3238,9 +3648,12 @@ fn hypothesis_firth_causes_nonmonotonicity() {
     }
 
     // FINDING: Firth causes non-monotonicity, not the base cost function
-    assert!(changes_with_firth > changes_without_firth,
+    assert!(
+        changes_with_firth > changes_without_firth,
         "Firth should increase non-monotonicity: with={}, without={}",
-        changes_with_firth, changes_without_firth);
+        changes_with_firth,
+        changes_without_firth
+    );
 }
 
 /// Tests whether Firth non-monotonicity is specific to high rho.
@@ -3269,9 +3682,16 @@ fn hypothesis_firth_nonmonotonicity_requires_high_rho() {
         let compute_cost = |rho_val: f64| -> f64 {
             let rho = array![rho_val];
             evaluate_external_cost_and_ridge(
-                train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
-                &[s_4.clone()], &opts, &rho,
-            ).map(|(c, ..)| c).unwrap_or(f64::NAN)
+                train.y.view(),
+                train.weights.view(),
+                x_gam.view(),
+                offset.view(),
+                &[s_4.clone()],
+                &opts,
+                &rho,
+            )
+            .map(|(c, ..)| c)
+            .unwrap_or(f64::NAN)
         };
 
         let n_samples = 21;
@@ -3285,9 +3705,9 @@ fn hypothesis_firth_nonmonotonicity_requires_high_rho() {
             .collect();
 
         let mut changes = 0;
-        for i in 1..costs.len()-1 {
-            let prev_dir = costs[i] - costs[i-1];
-            let next_dir = costs[i+1] - costs[i];
+        for i in 1..costs.len() - 1 {
+            let prev_dir = costs[i] - costs[i - 1];
+            let next_dir = costs[i + 1] - costs[i];
             if prev_dir * next_dir < 0.0 {
                 changes += 1;
             }
@@ -3303,9 +3723,12 @@ fn hypothesis_firth_nonmonotonicity_requires_high_rho() {
     println!("  rho=12: {} changes", changes_high_rho);
 
     // If Firth non-monotonicity requires high rho, we should see it only at high rho
-    assert!(changes_high_rho > changes_low_rho,
+    assert!(
+        changes_high_rho > changes_low_rho,
         "Firth non-monotonicity should be worse at high rho: high={}, low={}",
-        changes_high_rho, changes_low_rho);
+        changes_high_rho,
+        changes_low_rho
+    );
 }
 
 /// Analyzes the magnitude of cost oscillations caused by Firth at high rho.
@@ -3333,9 +3756,16 @@ fn hypothesis_firth_oscillation_magnitude() {
     let compute_cost = |rho_val: f64| -> f64 {
         let rho = array![rho_val];
         evaluate_external_cost_and_ridge(
-            train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
-            &[s_4.clone()], &opts, &rho,
-        ).map(|(c, ..)| c).unwrap_or(f64::NAN)
+            train.y.view(),
+            train.weights.view(),
+            x_gam.view(),
+            offset.view(),
+            &[s_4.clone()],
+            &opts,
+            &rho,
+        )
+        .map(|(c, ..)| c)
+        .unwrap_or(f64::NAN)
     };
 
     let n_samples = 21;
@@ -3356,15 +3786,16 @@ fn hypothesis_firth_oscillation_magnitude() {
     let relative_range = cost_range / cost_min.abs();
 
     // Max step between adjacent samples
-    let max_step: f64 = costs.windows(2)
+    let max_step: f64 = costs
+        .windows(2)
         .map(|w| (w[1] - w[0]).abs())
         .fold(0.0, f64::max);
 
     // Count reversals
     let mut reversals = 0;
-    for i in 1..costs.len()-1 {
-        let prev_dir = costs[i] - costs[i-1];
-        let next_dir = costs[i+1] - costs[i];
+    for i in 1..costs.len() - 1 {
+        let prev_dir = costs[i] - costs[i - 1];
+        let next_dir = costs[i + 1] - costs[i];
         if prev_dir * next_dir < 0.0 {
             reversals += 1;
         }
@@ -3376,12 +3807,15 @@ fn hypothesis_firth_oscillation_magnitude() {
     println!("  relative range: {:.6e}", relative_range);
     println!("  max step: {:.6e}", max_step);
     println!("  direction reversals: {}", reversals);
-    println!("  f64 epsilon * cost: {:.6e}", f64::EPSILON * cost_min.abs());
+    println!(
+        "  f64 epsilon * cost: {:.6e}",
+        f64::EPSILON * cost_min.abs()
+    );
 
     // Print first few cost differences to see the pattern
     println!("\n  First differences (cost[i+1] - cost[i]):");
-    for i in 0..5.min(costs.len()-1) {
-        let diff = costs[i+1] - costs[i];
+    for i in 0..5.min(costs.len() - 1) {
+        let diff = costs[i + 1] - costs[i];
         let sign = if diff > 0.0 { "+" } else { "-" };
         println!("    d[{}]: {:+.6e} ({})", i, diff, sign);
     }
@@ -3390,10 +3824,16 @@ fn hypothesis_firth_oscillation_magnitude() {
     // to confirm this is a systematic issue, not floating point noise
     let fp_noise = f64::EPSILON * cost_min.abs();
     let margin = cost_range / fp_noise;
-    println!("\n  Oscillation margin over FP noise: {:.0}x epsilon", margin);
+    println!(
+        "\n  Oscillation margin over FP noise: {:.0}x epsilon",
+        margin
+    );
 
-    assert!(margin > 100.0,
-        "oscillations should be well above FP noise level (margin={:.0}x)", margin);
+    assert!(
+        margin > 100.0,
+        "oscillations should be well above FP noise level (margin={:.0}x)",
+        margin
+    );
 }
 
 /// Tests whether the ridge value changes across evaluations, causing cost oscillations.
@@ -3431,9 +3871,15 @@ fn hypothesis_ridge_variation_causes_oscillations() {
         let rho = array![rho_val];
 
         let (cost, ridge) = evaluate_external_cost_and_ridge(
-            train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
-            &[s_4.clone()], &opts, &rho,
-        ).expect("cost evaluation");
+            train.y.view(),
+            train.weights.view(),
+            x_gam.view(),
+            offset.view(),
+            &[s_4.clone()],
+            &opts,
+            &rho,
+        )
+        .expect("cost evaluation");
 
         costs.push(cost);
         ridges.push(ridge);
@@ -3453,10 +3899,13 @@ fn hypothesis_ridge_variation_causes_oscillations() {
     // If ridge varies, check correlation with cost oscillations
     if ridge_varies {
         println!("\n  Ridge-cost correlation:");
-        for i in 0..5.min(ridges.len()-1) {
-            let d_ridge = ridges[i+1] - ridges[i];
-            let d_cost = costs[i+1] - costs[i];
-            println!("    step {}: d_ridge={:+.2e}, d_cost={:+.2e}", i, d_ridge, d_cost);
+        for i in 0..5.min(ridges.len() - 1) {
+            let d_ridge = ridges[i + 1] - ridges[i];
+            let d_cost = costs[i + 1] - costs[i];
+            println!(
+                "    step {}: d_ridge={:+.2e}, d_cost={:+.2e}",
+                i, d_ridge, d_cost
+            );
         }
     }
 
@@ -3489,25 +3938,34 @@ fn orthogonal_high_rho_without_firth_passes() {
     // WITHOUT Firth
     let opts = ExternalOptimOptions {
         link: LinkFunction::Logit,
-        firth: None,  // <-- Key difference: no Firth
+        firth: None, // <-- Key difference: no Firth
         tol: 1e-10,
         max_iter: 200,
         nullspace_dims,
     };
 
     let (analytic, fd) = evaluate_external_gradients(
-        train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
-        &s_list_gam, &opts, &rho,
-    ).expect("gradients");
+        train.y.view(),
+        train.weights.view(),
+        x_gam.view(),
+        offset.view(),
+        &s_list_gam,
+        &opts,
+        &rho,
+    )
+    .expect("gradients");
 
     let (cos, rel, ..) = gradient_metrics(&analytic, &fd);
 
     println!("High rho WITHOUT Firth: cos={:.4}, rel={:.2e}", cos, rel);
 
     // H1 prediction: should pass
-    assert!(cos > 0.99 && rel < 0.05,
+    assert!(
+        cos > 0.99 && rel < 0.05,
         "H1 REJECTED: Without Firth at rho=12, FD should pass but got cos={:.4}, rel={:.2e}",
-        cos, rel);
+        cos,
+        rel
+    );
 }
 
 /// Test: Full GAM at low rho WITH Firth.
@@ -3526,7 +3984,7 @@ fn orthogonal_low_rho_with_firth() {
 
     let nullspace_dims = vec![0; s_list_gam.len()];
     let offset = Array1::<f64>::zeros(train.y.len());
-    let rho = Array1::from_elem(layout.num_penalties, 2.0);  // <-- Low rho
+    let rho = Array1::from_elem(layout.num_penalties, 2.0); // <-- Low rho
 
     // WITH Firth
     let opts = ExternalOptimOptions {
@@ -3538,9 +3996,15 @@ fn orthogonal_low_rho_with_firth() {
     };
 
     let (analytic, fd) = evaluate_external_gradients(
-        train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
-        &s_list_gam, &opts, &rho,
-    ).expect("gradients");
+        train.y.view(),
+        train.weights.view(),
+        x_gam.view(),
+        offset.view(),
+        &s_list_gam,
+        &opts,
+        &rho,
+    )
+    .expect("gradients");
 
     let (cos, rel, ..) = gradient_metrics(&analytic, &fd);
 
@@ -3554,8 +4018,11 @@ fn orthogonal_low_rho_with_firth() {
     // where FD noise floor is relatively large
 
     // Use looser thresholds to document the finding
-    assert!(cos > 0.95,
-        "Gradient direction should be mostly correct: cos={:.4}", cos);
+    assert!(
+        cos > 0.95,
+        "Gradient direction should be mostly correct: cos={:.4}",
+        cos
+    );
 }
 
 /// Hypothesis: Component-by-component analysis reveals which gradient elements fail.
@@ -3584,12 +4051,21 @@ fn hypothesis_component_by_component_failure_pattern() {
     };
 
     let (analytic, fd) = evaluate_external_gradients(
-        train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
-        &s_list_gam, &opts, &rho,
-    ).expect("gradients");
+        train.y.view(),
+        train.weights.view(),
+        x_gam.view(),
+        offset.view(),
+        &s_list_gam,
+        &opts,
+        &rho,
+    )
+    .expect("gradients");
 
     println!("\nComponent-by-component analysis at rho=12 with Firth:");
-    println!("{:>4} {:>12} {:>12} {:>12} {:>8}", "idx", "analytic", "FD", "rel_err", "status");
+    println!(
+        "{:>4} {:>12} {:>12} {:>12} {:>8}",
+        "idx", "analytic", "FD", "rel_err", "status"
+    );
 
     let mut failing_components = Vec::new();
     let mut passing_components = Vec::new();
@@ -3606,9 +4082,16 @@ fn hypothesis_component_by_component_failure_pattern() {
         };
 
         let sign_match = (a >= 0.0) == (f >= 0.0);
-        let status = if sign_match && rel_err < 0.1 { "PASS" } else { "FAIL" };
+        let status = if sign_match && rel_err < 0.1 {
+            "PASS"
+        } else {
+            "FAIL"
+        };
 
-        println!("{:>4} {:>+12.4e} {:>+12.4e} {:>12.2e} {:>8}", i, a, f, rel_err, status);
+        println!(
+            "{:>4} {:>+12.4e} {:>+12.4e} {:>12.2e} {:>8}",
+            i, a, f, rel_err, status
+        );
 
         if status == "FAIL" {
             failing_components.push((i, a.abs(), rel_err));
@@ -3664,7 +4147,10 @@ fn hypothesis_penalty_count_affects_fd_reliability() {
 
     let mut cos_values = Vec::new();
 
-    for n_pen in [1, 2, 3, 5, 7, 10].iter().filter(|&&n| n <= s_list_gam.len()) {
+    for n_pen in [1, 2, 3, 5, 7, 10]
+        .iter()
+        .filter(|&&n| n <= s_list_gam.len())
+    {
         let s_subset: Vec<Array2<f64>> = s_list_gam.iter().take(*n_pen).cloned().collect();
         let rho = Array1::from_elem(*n_pen, 6.0);
         let nullspace_dims = vec![0; *n_pen];
@@ -3678,8 +4164,13 @@ fn hypothesis_penalty_count_affects_fd_reliability() {
         };
 
         let result = evaluate_external_gradients(
-            train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
-            &s_subset, &opts, &rho,
+            train.y.view(),
+            train.weights.view(),
+            x_gam.view(),
+            offset.view(),
+            &s_subset,
+            &opts,
+            &rho,
         );
 
         if let Ok((analytic, fd)) = result {
@@ -3726,7 +4217,10 @@ fn hypothesis_implicit_derivative_contamination() {
     let rho = array![12.0];
 
     println!("\nImplicit derivative contamination test:");
-    println!("{:>12} {:>10} {:>10} {:>10}", "tolerance", "cos", "rel_err", "|grad|");
+    println!(
+        "{:>12} {:>10} {:>10} {:>10}",
+        "tolerance", "cos", "rel_err", "|grad|"
+    );
 
     for tol in [1e-6, 1e-8, 1e-10, 1e-12] {
         let opts = ExternalOptimOptions {
@@ -3738,13 +4232,21 @@ fn hypothesis_implicit_derivative_contamination() {
         };
 
         let result = evaluate_external_gradients(
-            train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
-            &[s_4.clone()], &opts, &rho,
+            train.y.view(),
+            train.weights.view(),
+            x_gam.view(),
+            offset.view(),
+            &[s_4.clone()],
+            &opts,
+            &rho,
         );
 
         if let Ok((analytic, fd)) = result {
             let (cos, rel, max_a, _) = gradient_metrics(&analytic, &fd);
-            println!("{:>12.0e} {:>10.4} {:>10.2e} {:>10.2e}", tol, cos, rel, max_a);
+            println!(
+                "{:>12.0e} {:>10.4} {:>10.2e} {:>10.2e}",
+                tol, cos, rel, max_a
+            );
         }
     }
 
@@ -3778,16 +4280,21 @@ fn hypothesis_penalty_structure_matters() {
         nullspace_dims: vec![0],
     };
     if let Ok((a, f)) = evaluate_external_gradients(
-        train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
-        &[s_diag.clone()], &opts_single, &array![6.0],
+        train.y.view(),
+        train.weights.view(),
+        x_gam.view(),
+        offset.view(),
+        &[s_diag.clone()],
+        &opts_single,
+        &array![6.0],
     ) {
         let (cos, rel, ..) = gradient_metrics(&a, &f);
         println!("{:>20} {:>8.4} {:>10.2e}", "single diagonal", cos, rel);
     }
 
     // 2. Multiple diagonal penalties (non-overlapping)
-    let s_diag1 = diagonal_penalty(p, 1, p/2);
-    let s_diag2 = diagonal_penalty(p, p/2, p);
+    let s_diag1 = diagonal_penalty(p, 1, p / 2);
+    let s_diag2 = diagonal_penalty(p, p / 2, p);
     let opts_two = ExternalOptimOptions {
         link: LinkFunction::Logit,
         firth: Some(FirthSpec { enabled: true }),
@@ -3796,8 +4303,13 @@ fn hypothesis_penalty_structure_matters() {
         nullspace_dims: vec![0, 0],
     };
     if let Ok((a, f)) = evaluate_external_gradients(
-        train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
-        &[s_diag1, s_diag2], &opts_two, &array![6.0, 6.0],
+        train.y.view(),
+        train.weights.view(),
+        x_gam.view(),
+        offset.view(),
+        &[s_diag1, s_diag2],
+        &opts_two,
+        &array![6.0, 6.0],
     ) {
         let (cos, rel, ..) = gradient_metrics(&a, &f);
         println!("{:>20} {:>8.4} {:>10.2e}", "2 non-overlapping", cos, rel);
@@ -3813,8 +4325,13 @@ fn hypothesis_penalty_structure_matters() {
         nullspace_dims: vec![0, 0, 0],
     };
     if let Ok((a, f)) = evaluate_external_gradients(
-        train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
-        &s_gam_3, &opts_gam, &array![6.0, 6.0, 6.0],
+        train.y.view(),
+        train.weights.view(),
+        x_gam.view(),
+        offset.view(),
+        &s_gam_3,
+        &opts_gam,
+        &array![6.0, 6.0, 6.0],
     ) {
         let (cos, rel, ..) = gradient_metrics(&a, &f);
         println!("{:>20} {:>8.4} {:>10.2e}", "3 GAM penalties", cos, rel);
@@ -3830,8 +4347,13 @@ fn hypothesis_penalty_structure_matters() {
     };
     let rho_all = Array1::from_elem(s_list_gam.len(), 6.0);
     if let Ok((a, f)) = evaluate_external_gradients(
-        train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
-        &s_list_gam, &opts_all, &rho_all,
+        train.y.view(),
+        train.weights.view(),
+        x_gam.view(),
+        offset.view(),
+        &s_list_gam,
+        &opts_all,
+        &rho_all,
     ) {
         let (cos, rel, ..) = gradient_metrics(&a, &f);
         println!("{:>20} {:>8.4} {:>10.2e}", "all GAM penalties", cos, rel);
@@ -3863,28 +4385,43 @@ fn hypothesis_analytic_vs_cost_trend_per_component() {
     // Get analytic gradient at rho=12
     let rho = Array1::from_elem(layout.num_penalties, 12.0);
     let (analytic, fd) = evaluate_external_gradients(
-        train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
-        &s_list_gam, &opts, &rho,
-    ).expect("gradients");
+        train.y.view(),
+        train.weights.view(),
+        x_gam.view(),
+        offset.view(),
+        &s_list_gam,
+        &opts,
+        &rho,
+    )
+    .expect("gradients");
 
     // For each component, compute cost trend with a LARGE delta (0.5) to get reliable trend
     let delta = 0.5;
     let compute_cost = |rho_vec: &Array1<f64>| -> f64 {
         evaluate_external_cost_and_ridge(
-            train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
-            &s_list_gam, &ExternalOptimOptions {
+            train.y.view(),
+            train.weights.view(),
+            x_gam.view(),
+            offset.view(),
+            &s_list_gam,
+            &ExternalOptimOptions {
                 link: LinkFunction::Logit,
                 firth: Some(FirthSpec { enabled: true }),
                 tol: 1e-10,
                 max_iter: 200,
                 nullspace_dims: nullspace_dims.clone(),
-            }, rho_vec,
-        ).map(|(c, _)| c).unwrap_or(f64::NAN)
+            },
+            rho_vec,
+        )
+        .map(|(c, _)| c)
+        .unwrap_or(f64::NAN)
     };
 
     println!("\nAnalytic gradient vs cost trend per component at rho=12:");
-    println!("{:>4} {:>12} {:>12} {:>12} {:>10} {:>10} {:>8}",
-             "idx", "analytic", "FD", "cost_trend", "a_sign", "t_sign", "match?");
+    println!(
+        "{:>4} {:>12} {:>12} {:>12} {:>10} {:>10} {:>8}",
+        "idx", "analytic", "FD", "cost_trend", "a_sign", "t_sign", "match?"
+    );
 
     let mut analytic_wrong_count = 0;
     let mut fd_wrong_count = 0;
@@ -3914,8 +4451,10 @@ fn hypothesis_analytic_vs_cost_trend_per_component() {
 
         let status = if analytic_matches_trend { "YES" } else { "NO!" };
 
-        println!("{:>4} {:>+12.4e} {:>+12.4e} {:>+12.4e} {:>10} {:>10} {:>8}",
-                 i, analytic[i], fd[i], cost_trend, a_sign, t_sign, status);
+        println!(
+            "{:>4} {:>+12.4e} {:>+12.4e} {:>+12.4e} {:>10} {:>10} {:>8}",
+            i, analytic[i], fd[i], cost_trend, a_sign, t_sign, status
+        );
 
         if !analytic_matches_trend {
             analytic_wrong_count += 1;
@@ -3926,21 +4465,35 @@ fn hypothesis_analytic_vs_cost_trend_per_component() {
     }
 
     println!("\nSummary:");
-    println!("  Analytic mismatches cost trend: {}/{}", analytic_wrong_count, layout.num_penalties);
-    println!("  FD mismatches cost trend: {}/{}", fd_wrong_count, layout.num_penalties);
+    println!(
+        "  Analytic mismatches cost trend: {}/{}",
+        analytic_wrong_count, layout.num_penalties
+    );
+    println!(
+        "  FD mismatches cost trend: {}/{}",
+        fd_wrong_count, layout.num_penalties
+    );
 
     if analytic_wrong_count > 0 {
-        println!("  => ANALYTIC GRADIENT HAS BUG: {} components have wrong sign!", analytic_wrong_count);
+        println!(
+            "  => ANALYTIC GRADIENT HAS BUG: {} components have wrong sign!",
+            analytic_wrong_count
+        );
     } else if fd_wrong_count > 0 {
-        println!("  => FD is unreliable: {} components disagree with cost trend", fd_wrong_count);
+        println!(
+            "  => FD is unreliable: {} components disagree with cost trend",
+            fd_wrong_count
+        );
     } else {
         println!("  => Both analytic and FD match cost trend");
     }
 
     // If analytic gradient is wrong, this test should fail
-    assert!(analytic_wrong_count == 0,
+    assert!(
+        analytic_wrong_count == 0,
         "ANALYTIC GRADIENT BUG: {} components have wrong sign vs cost trend!",
-        analytic_wrong_count);
+        analytic_wrong_count
+    );
 }
 
 /// Deep investigation of component 8 which has wrong sign in analytic gradient.
@@ -3966,21 +4519,34 @@ fn hypothesis_component_8_deep_investigation() {
 
     let rho = Array1::from_elem(layout.num_penalties, 12.0);
     let (analytic, fd) = evaluate_external_gradients(
-        train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
-        &s_list_gam, &opts, &rho,
-    ).expect("gradients");
+        train.y.view(),
+        train.weights.view(),
+        x_gam.view(),
+        offset.view(),
+        &s_list_gam,
+        &opts,
+        &rho,
+    )
+    .expect("gradients");
 
     let compute_cost = |rho_vec: &Array1<f64>| -> f64 {
         evaluate_external_cost_and_ridge(
-            train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
-            &s_list_gam, &ExternalOptimOptions {
+            train.y.view(),
+            train.weights.view(),
+            x_gam.view(),
+            offset.view(),
+            &s_list_gam,
+            &ExternalOptimOptions {
                 link: LinkFunction::Logit,
                 firth: Some(FirthSpec { enabled: true }),
                 tol: 1e-10,
                 max_iter: 200,
                 nullspace_dims: nullspace_dims.clone(),
-            }, rho_vec,
-        ).map(|(c, _)| c).unwrap_or(f64::NAN)
+            },
+            rho_vec,
+        )
+        .map(|(c, _)| c)
+        .unwrap_or(f64::NAN)
     };
 
     println!("\n=== Deep investigation of component 8 ===\n");
@@ -4002,7 +4568,10 @@ fn hypothesis_component_8_deep_investigation() {
 
     // Test cost trend with multiple delta values
     println!("\nCost trend analysis for component 8:");
-    println!("{:>10} {:>15} {:>15} {:>10}", "delta", "cost_minus", "cost_plus", "trend_sign");
+    println!(
+        "{:>10} {:>15} {:>15} {:>10}",
+        "delta", "cost_minus", "cost_plus", "trend_sign"
+    );
 
     for delta in [0.1, 0.2, 0.5, 1.0, 2.0] {
         let mut rho_minus = rho.clone();
@@ -4016,7 +4585,10 @@ fn hypothesis_component_8_deep_investigation() {
         let trend = cost_plus - cost_minus;
         let trend_sign = if trend > 0.0 { "+" } else { "-" };
 
-        println!("{:>10.1} {:>15.8e} {:>15.8e} {:>10}", delta, cost_minus, cost_plus, trend_sign);
+        println!(
+            "{:>10.1} {:>15.8e} {:>15.8e} {:>10}",
+            delta, cost_minus, cost_plus, trend_sign
+        );
     }
 
     // Fine-grained cost sampling around rho[8]=12
@@ -4111,13 +4683,21 @@ fn hypothesis_component_4_low_vs_high_rho() {
     };
 
     println!("\n=== Component 4: Low vs High rho comparison ===");
-    println!("{:>6} {:>12} {:>12} {:>10}", "rho", "analytic[4]", "FD[4]", "ratio");
+    println!(
+        "{:>6} {:>12} {:>12} {:>10}",
+        "rho", "analytic[4]", "FD[4]", "ratio"
+    );
 
     for rho_val in [0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0] {
         let rho = Array1::from_elem(layout.num_penalties, rho_val);
         let result = evaluate_external_gradients(
-            train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
-            &s_list_gam, &opts, &rho,
+            train.y.view(),
+            train.weights.view(),
+            x_gam.view(),
+            offset.view(),
+            &s_list_gam,
+            &opts,
+            &rho,
         );
 
         if let Ok((analytic, fd)) = result {
@@ -4126,13 +4706,19 @@ fn hypothesis_component_4_low_vs_high_rho() {
             } else {
                 f64::NAN
             };
-            println!("{:>6.1} {:>+12.4e} {:>+12.4e} {:>10.1}", rho_val, analytic[4], fd[4], ratio);
+            println!(
+                "{:>6.1} {:>+12.4e} {:>+12.4e} {:>10.1}",
+                rho_val, analytic[4], fd[4], ratio
+            );
         }
     }
 
     // Also check all components at rho=0 vs rho=12
     println!("\n=== All components: ratio at rho=0 vs rho=12 ===");
-    println!("{:>4} {:>12} {:>12} {:>12} {:>12}", "comp", "ratio@rho=0", "ratio@rho=12", "a@0", "a@12");
+    println!(
+        "{:>4} {:>12} {:>12} {:>12} {:>12}",
+        "comp", "ratio@rho=0", "ratio@rho=12", "a@0", "a@12"
+    );
 
     let rho_0 = Array1::from_elem(layout.num_penalties, 0.0);
     let rho_12 = Array1::from_elem(layout.num_penalties, 12.0);
@@ -4146,33 +4732,63 @@ fn hypothesis_component_4_low_vs_high_rho() {
     };
 
     let (a0, fd0) = evaluate_external_gradients(
-        train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
-        &s_list_gam, &opts2, &rho_0,
-    ).expect("gradients");
+        train.y.view(),
+        train.weights.view(),
+        x_gam.view(),
+        offset.view(),
+        &s_list_gam,
+        &opts2,
+        &rho_0,
+    )
+    .expect("gradients");
 
     let (a12, fd12) = evaluate_external_gradients(
-        train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
-        &s_list_gam, &opts2, &rho_12,
-    ).expect("gradients");
+        train.y.view(),
+        train.weights.view(),
+        x_gam.view(),
+        offset.view(),
+        &s_list_gam,
+        &opts2,
+        &rho_12,
+    )
+    .expect("gradients");
 
     for i in 0..layout.num_penalties {
-        let ratio_0 = if fd0[i].abs() > 1e-15 { a0[i] / fd0[i] } else { f64::NAN };
-        let ratio_12 = if fd12[i].abs() > 1e-15 { a12[i] / fd12[i] } else { f64::NAN };
-        println!("{:>4} {:>12.1} {:>12.1} {:>12.4e} {:>12.4e}",
-                 i, ratio_0, ratio_12, a0[i], a12[i]);
+        let ratio_0 = if fd0[i].abs() > 1e-15 {
+            a0[i] / fd0[i]
+        } else {
+            f64::NAN
+        };
+        let ratio_12 = if fd12[i].abs() > 1e-15 {
+            a12[i] / fd12[i]
+        } else {
+            f64::NAN
+        };
+        println!(
+            "{:>4} {:>12.1} {:>12.1} {:>12.4e} {:>12.4e}",
+            i, ratio_0, ratio_12, a0[i], a12[i]
+        );
     }
 
     // Analyze all penalty structures to find what makes component 4 special
     println!("\n=== Penalty matrix structures ===");
-    println!("{:>4} {:>8} {:>8} {:>12} {:>12}", "pen", "nnz", "trace", "norm", "max_eig_approx");
+    println!(
+        "{:>4} {:>8} {:>8} {:>12} {:>12}",
+        "pen", "nnz", "trace", "norm", "max_eig_approx"
+    );
 
     for (i, s) in s_list_gam.iter().enumerate() {
         let nnz = s.iter().filter(|&&x| x.abs() > 1e-14).count();
         let trace: f64 = (0..s.nrows()).map(|j| s[[j, j]]).sum();
         let norm = s.mapv(|x| x * x).sum().sqrt();
         // Approximate max eigenvalue as max diagonal element (rough proxy)
-        let max_diag = (0..s.nrows()).map(|j| s[[j, j]]).fold(0.0_f64, |a, b| a.max(b));
-        println!("{:>4} {:>8} {:>8.2e} {:>12.4e} {:>12.4e}", i, nnz, trace, norm, max_diag);
+        let max_diag = (0..s.nrows())
+            .map(|j| s[[j, j]])
+            .fold(0.0_f64, |a, b| a.max(b));
+        println!(
+            "{:>4} {:>8} {:>8.2e} {:>12.4e} {:>12.4e}",
+            i, nnz, trace, norm, max_diag
+        );
     }
 
     // Test multiple seeds to see if the outlier component is always the same
@@ -4193,9 +4809,13 @@ fn hypothesis_component_4_low_vs_high_rho() {
         };
 
         if let Ok((a_seed, fd_seed)) = evaluate_external_gradients(
-            train_seed.y.view(), train_seed.weights.view(), x_seed.view(),
+            train_seed.y.view(),
+            train_seed.weights.view(),
+            x_seed.view(),
             Array1::<f64>::zeros(train_seed.y.len()).view(),
-            &s_list_seed, &opts_seed, &rho_12_seed,
+            &s_list_seed,
+            &opts_seed,
+            &rho_12_seed,
         ) {
             // Find component with max ratio
             let mut max_ratio = 0.0_f64;
@@ -4211,7 +4831,10 @@ fn hypothesis_component_4_low_vs_high_rho() {
                     max_idx = i;
                 }
             }
-            println!("  seed={}: max ratio at comp {} = {:.1}", seed, max_idx, max_ratio);
+            println!(
+                "  seed={}: max ratio at comp {} = {:.1}",
+                seed, max_idx, max_ratio
+            );
         }
     }
 
@@ -4231,12 +4854,23 @@ fn hypothesis_component_4_low_vs_high_rho() {
         };
 
         if let Ok((analytic, fd)) = evaluate_external_gradients(
-            train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
-            &s_single, &opts_single, &rho_single,
+            train.y.view(),
+            train.weights.view(),
+            x_gam.view(),
+            offset.view(),
+            &s_single,
+            &opts_single,
+            &rho_single,
         ) {
-            let ratio = if fd[0].abs() > 1e-15 { analytic[0] / fd[0] } else { f64::NAN };
-            println!("  pen {}: analytic={:+.4e}, FD={:+.4e}, ratio={:.1}",
-                     i, analytic[0], fd[0], ratio);
+            let ratio = if fd[0].abs() > 1e-15 {
+                analytic[0] / fd[0]
+            } else {
+                f64::NAN
+            };
+            println!(
+                "  pen {}: analytic={:+.4e}, FD={:+.4e}, ratio={:.1}",
+                i, analytic[0], fd[0], ratio
+            );
         }
     }
 
@@ -4253,24 +4887,52 @@ fn hypothesis_component_4_low_vs_high_rho() {
         nullspace_dims: vec![0],
     };
     let (a_alone, fd_alone) = evaluate_external_gradients(
-        train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
-        &s_4_alone, &opts_alone, &array![12.0],
-    ).expect("penalty 4 alone gradient");
+        train.y.view(),
+        train.weights.view(),
+        x_gam.view(),
+        offset.view(),
+        &s_4_alone,
+        &opts_alone,
+        &array![12.0],
+    )
+    .expect("penalty 4 alone gradient");
 
-    let ratio_alone = if fd_alone[0].abs() > 1e-15 { a_alone[0] / fd_alone[0] } else { f64::NAN };
-    println!("  ALONE:    analytic={:+.4e}, FD={:+.4e}, ratio={:.1}", a_alone[0], fd_alone[0], ratio_alone);
+    let ratio_alone = if fd_alone[0].abs() > 1e-15 {
+        a_alone[0] / fd_alone[0]
+    } else {
+        f64::NAN
+    };
+    println!(
+        "  ALONE:    analytic={:+.4e}, FD={:+.4e}, ratio={:.1}",
+        a_alone[0], fd_alone[0], ratio_alone
+    );
 
     // In full GAM
-    println!("  FULL GAM: analytic={:+.4e}, FD={:+.4e}, ratio={:.1}", a12[4], fd12[4],
-             if fd12[4].abs() > 1e-15 { a12[4] / fd12[4] } else { f64::NAN });
+    println!(
+        "  FULL GAM: analytic={:+.4e}, FD={:+.4e}, ratio={:.1}",
+        a12[4],
+        fd12[4],
+        if fd12[4].abs() > 1e-15 {
+            a12[4] / fd12[4]
+        } else {
+            f64::NAN
+        }
+    );
 
     // Verify with cost trend for penalty 4 ALONE
     println!("\n=== Penalty 4 ALONE: cost trend verification ===");
     let compute_cost_alone = |rho_val: f64| -> f64 {
         evaluate_external_cost_and_ridge(
-            train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
-            &s_4_alone, &opts_alone, &array![rho_val],
-        ).map(|(c, _)| c).unwrap_or(f64::NAN)
+            train.y.view(),
+            train.weights.view(),
+            x_gam.view(),
+            offset.view(),
+            &s_4_alone,
+            &opts_alone,
+            &array![rho_val],
+        )
+        .map(|(c, _)| c)
+        .unwrap_or(f64::NAN)
     };
 
     let cost_at_12 = compute_cost_alone(12.0);
@@ -4282,8 +4944,11 @@ fn hypothesis_component_4_low_vs_high_rho() {
     println!("  cost(rho=13) = {:.10e}", cost_at_13);
 
     let trend = cost_at_13 - cost_at_11;
-    let trend_sign = if trend > 0.0 { "INCREASING (grad should be positive)" }
-                     else { "DECREASING (grad should be negative)" };
+    let trend_sign = if trend > 0.0 {
+        "INCREASING (grad should be positive)"
+    } else {
+        "DECREASING (grad should be negative)"
+    };
     println!("  cost trend 11->13: {:+.4e} => {}", trend, trend_sign);
     println!("  Analytic gradient: {:+.4e}", a_alone[0]);
 
@@ -4321,9 +4986,16 @@ fn firth_fd_step_size_sensitivity() {
     // Compute true trend using wide interval (more robust to oscillations)
     let cost_at = |rho: f64| -> f64 {
         evaluate_external_cost_and_ridge(
-            train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
-            &s_single, &opts, &array![rho],
-        ).map(|(c, _)| c).unwrap_or(f64::NAN)
+            train.y.view(),
+            train.weights.view(),
+            x_gam.view(),
+            offset.view(),
+            &s_single,
+            &opts,
+            &array![rho],
+        )
+        .map(|(c, _)| c)
+        .unwrap_or(f64::NAN)
     };
 
     let wide_trend = cost_at(base_rho + 1.0) - cost_at(base_rho - 1.0);
@@ -4334,7 +5006,10 @@ fn firth_fd_step_size_sensitivity() {
     let mut consistent_count = 0;
 
     println!("FD consistency at rho={} with Firth:", base_rho);
-    println!("  Wide-interval trend sign: {}", if trend_sign { "positive" } else { "negative" });
+    println!(
+        "  Wide-interval trend sign: {}",
+        if trend_sign { "positive" } else { "negative" }
+    );
     println!("  Step size -> FD sign consistency:");
 
     for &h in &step_sizes {
@@ -4344,7 +5019,16 @@ fn firth_fd_step_size_sensitivity() {
         if consistent {
             consistent_count += 1;
         }
-        println!("    h={:.4}: {:+.4e} ({})", h, fd, if consistent { "consistent" } else { "inconsistent" });
+        println!(
+            "    h={:.4}: {:+.4e} ({})",
+            h,
+            fd,
+            if consistent {
+                "consistent"
+            } else {
+                "inconsistent"
+            }
+        );
     }
 
     // At least half of step sizes should give consistent sign
@@ -4375,31 +5059,51 @@ fn firth_beta_monotonicity_comparison() {
     let cfg_firth = ModelConfig::external(LinkFunction::Logit, 1e-10, 500, true);
     let cfg_no_firth = ModelConfig::external(LinkFunction::Logit, 1e-10, 500, false);
 
-    let deltas = [-0.010_f64, -0.005, -0.002, -0.001, 0.0, 0.001, 0.002, 0.005, 0.010];
+    let deltas = [
+        -0.010_f64, -0.005, -0.002, -0.001, 0.0, 0.001, 0.002, 0.005, 0.010,
+    ];
 
     let fit_beta_norm = |rho_val: f64, cfg: &ModelConfig| -> f64 {
         let rho = array![rho_val];
         fit_model_for_fixed_rho(
             LogSmoothingParamsView::new(rho.view()),
-            x_gam.view(), offset.view(), train.y.view(), train.weights.view(),
-            &rs_list, None, None, &single_layout, cfg, None, None,
-        ).map(|(pr, _)| {
+            x_gam.view(),
+            offset.view(),
+            train.y.view(),
+            train.weights.view(),
+            &rs_list,
+            None,
+            None,
+            &single_layout,
+            cfg,
+            None,
+            None,
+        )
+        .map(|(pr, _)| {
             let b = pr.beta_transformed.as_ref();
             b.dot(b).sqrt()
-        }).unwrap_or(f64::NAN)
+        })
+        .unwrap_or(f64::NAN)
     };
 
     // Count sign changes in consecutive deltas (non-monotonicity)
     let count_sign_changes = |values: &[f64]| -> usize {
-        values.windows(2)
+        values
+            .windows(2)
             .filter(|w| (w[1] - w[0]).signum() != 0.0)
             .zip(values.windows(2).skip(1))
             .filter(|(a, b)| (a[1] - a[0]).signum() * (b[1] - b[0]).signum() < 0.0)
             .count()
     };
 
-    let betas_firth: Vec<f64> = deltas.iter().map(|&d| fit_beta_norm(12.0 + d, &cfg_firth)).collect();
-    let betas_no_firth: Vec<f64> = deltas.iter().map(|&d| fit_beta_norm(12.0 + d, &cfg_no_firth)).collect();
+    let betas_firth: Vec<f64> = deltas
+        .iter()
+        .map(|&d| fit_beta_norm(12.0 + d, &cfg_firth))
+        .collect();
+    let betas_no_firth: Vec<f64> = deltas
+        .iter()
+        .map(|&d| fit_beta_norm(12.0 + d, &cfg_no_firth))
+        .collect();
 
     let changes_firth = count_sign_changes(&betas_firth);
     let changes_no_firth = count_sign_changes(&betas_no_firth);
@@ -4409,8 +5113,10 @@ fn firth_beta_monotonicity_comparison() {
     println!("  Firth OFF: {} sign changes", changes_no_firth);
 
     // Without Firth, β should be more monotonic
-    assert!(changes_no_firth <= changes_firth || changes_no_firth <= 2,
-        "Without Firth, β should be at least as monotonic as with Firth");
+    assert!(
+        changes_no_firth <= changes_firth || changes_no_firth <= 2,
+        "Without Firth, β should be at least as monotonic as with Firth"
+    );
 }
 
 /// Verify Firth creates cost oscillations while no-Firth is monotonic.
@@ -4447,26 +5153,46 @@ fn firth_cost_oscillation_vs_no_firth() {
     // Sample cost at fine resolution around rho=12
     let steps: Vec<f64> = (-20..=20).map(|i| i as f64 * 0.001).collect();
 
-    let cost_firth: Vec<f64> = steps.iter().map(|&delta| {
-        evaluate_external_cost_and_ridge(
-            train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
-            &s_4_alone, &opts_firth, &array![12.0 + delta],
-        ).map(|(c, _)| c).unwrap_or(f64::NAN)
-    }).collect();
+    let cost_firth: Vec<f64> = steps
+        .iter()
+        .map(|&delta| {
+            evaluate_external_cost_and_ridge(
+                train.y.view(),
+                train.weights.view(),
+                x_gam.view(),
+                offset.view(),
+                &s_4_alone,
+                &opts_firth,
+                &array![12.0 + delta],
+            )
+            .map(|(c, _)| c)
+            .unwrap_or(f64::NAN)
+        })
+        .collect();
 
-    let cost_no_firth: Vec<f64> = steps.iter().map(|&delta| {
-        evaluate_external_cost_and_ridge(
-            train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
-            &s_4_alone, &opts_no_firth, &array![12.0 + delta],
-        ).map(|(c, _)| c).unwrap_or(f64::NAN)
-    }).collect();
+    let cost_no_firth: Vec<f64> = steps
+        .iter()
+        .map(|&delta| {
+            evaluate_external_cost_and_ridge(
+                train.y.view(),
+                train.weights.view(),
+                x_gam.view(),
+                offset.view(),
+                &s_4_alone,
+                &opts_no_firth,
+                &array![12.0 + delta],
+            )
+            .map(|(c, _)| c)
+            .unwrap_or(f64::NAN)
+        })
+        .collect();
 
     // Count direction changes (oscillations)
     let count_direction_changes = |costs: &[f64]| -> usize {
         let mut changes = 0;
-        for i in 1..costs.len()-1 {
-            let left = costs[i] - costs[i-1];
-            let right = costs[i+1] - costs[i];
+        for i in 1..costs.len() - 1 {
+            let left = costs[i] - costs[i - 1];
+            let right = costs[i + 1] - costs[i];
             if left * right < 0.0 {
                 changes += 1;
             }
@@ -4477,14 +5203,25 @@ fn firth_cost_oscillation_vs_no_firth() {
     let firth_changes = count_direction_changes(&cost_firth);
     let no_firth_changes = count_direction_changes(&cost_no_firth);
 
-    println!("  Firth ON:  {} direction changes in {} samples", firth_changes, cost_firth.len());
-    println!("  Firth OFF: {} direction changes in {} samples", no_firth_changes, cost_no_firth.len());
+    println!(
+        "  Firth ON:  {} direction changes in {} samples",
+        firth_changes,
+        cost_firth.len()
+    );
+    println!(
+        "  Firth OFF: {} direction changes in {} samples",
+        no_firth_changes,
+        cost_no_firth.len()
+    );
 
     // Without Firth, the cost function should be at least as smooth as with Firth.
     // This test documents the smoothness relationship, not a specific oscillation count.
-    assert!(no_firth_changes <= firth_changes || no_firth_changes <= 5,
+    assert!(
+        no_firth_changes <= firth_changes || no_firth_changes <= 5,
         "Without Firth, cost should be at least as smooth: no_firth={} vs firth={}",
-        no_firth_changes, firth_changes);
+        no_firth_changes,
+        firth_changes
+    );
 }
 
 /// Verify the analytic gradient sign matches the cost function trend.
@@ -4513,21 +5250,41 @@ fn analytic_gradient_matches_cost_trend() {
 
     // Get analytic gradient at rho=12
     let (analytic, fd) = evaluate_external_gradients(
-        train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
-        &s_4_alone, &opts, &array![12.0],
-    ).expect("gradients");
+        train.y.view(),
+        train.weights.view(),
+        x_gam.view(),
+        offset.view(),
+        &s_4_alone,
+        &opts,
+        &array![12.0],
+    )
+    .expect("gradients");
     println!("  FD gradient = {:+.4e} (may be unreliable)", fd[0]);
 
     // Compute cost trend using wide interval to smooth over oscillations
     let cost_low = evaluate_external_cost_and_ridge(
-        train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
-        &s_4_alone, &opts, &array![11.0],
-    ).map(|(c, _)| c).unwrap();
+        train.y.view(),
+        train.weights.view(),
+        x_gam.view(),
+        offset.view(),
+        &s_4_alone,
+        &opts,
+        &array![11.0],
+    )
+    .map(|(c, _)| c)
+    .unwrap();
 
     let cost_high = evaluate_external_cost_and_ridge(
-        train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
-        &s_4_alone, &opts, &array![13.0],
-    ).map(|(c, _)| c).unwrap();
+        train.y.view(),
+        train.weights.view(),
+        x_gam.view(),
+        offset.view(),
+        &s_4_alone,
+        &opts,
+        &array![13.0],
+    )
+    .map(|(c, _)| c)
+    .unwrap();
 
     let cost_trend = cost_high - cost_low;
 
@@ -4541,9 +5298,11 @@ fn analytic_gradient_matches_cost_trend() {
     let analytic_sign = analytic[0] > 0.0;
     let trend_sign = cost_trend > 0.0;
 
-    assert_eq!(analytic_sign, trend_sign,
+    assert_eq!(
+        analytic_sign, trend_sign,
         "Analytic gradient sign ({:+.4e}) should match cost trend sign ({:+.4e})",
-        analytic[0], cost_trend);
+        analytic[0], cost_trend
+    );
 
     println!("  => Analytic gradient sign matches cost trend");
 }

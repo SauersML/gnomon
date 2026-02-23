@@ -22,7 +22,9 @@ const GRCH37_SOURCES: &[(&str, Option<&str>)] = &[
     // 1000 Genomes - has pre-built index (most reliable)
     (
         "https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/technical/reference/human_g1k_v37.fasta.gz",
-        Some("https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/technical/reference/human_g1k_v37.fasta.fai"),
+        Some(
+            "https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/technical/reference/human_g1k_v37.fasta.fai",
+        ),
     ),
     // Hail (Google Cloud) - fast, has index
     (
@@ -40,7 +42,9 @@ const GRCH38_SOURCES: &[(&str, Option<&str>)] = &[
     // Ensembl indexed - has pre-built index (most reliable)
     (
         "https://ftp.ensembl.org/pub/current_fasta/homo_sapiens/dna_index/Homo_sapiens.GRCh38.dna.toplevel.fa.gz",
-        Some("https://ftp.ensembl.org/pub/current_fasta/homo_sapiens/dna_index/Homo_sapiens.GRCh38.dna.toplevel.fa.gz.fai"),
+        Some(
+            "https://ftp.ensembl.org/pub/current_fasta/homo_sapiens/dna_index/Homo_sapiens.GRCh38.dna.toplevel.fa.gz.fai",
+        ),
     ),
     // UCSC - fast, no index
     (
@@ -130,11 +134,12 @@ fn ensure_reference_genome(build: &str) -> Result<PathBuf, Box<dyn Error + Send 
     let cache_dir = get_gnomon_cache_dir().join("refs");
     fs::create_dir_all(&cache_dir)?;
 
-    let (sources, canonical_filename) = if build.contains("37") || build.to_lowercase().contains("hg19") {
-        (GRCH37_SOURCES, "human_g1k_v37.fasta")
-    } else {
-        (GRCH38_SOURCES, "GRCh38_reference.fa")
-    };
+    let (sources, canonical_filename) =
+        if build.contains("37") || build.to_lowercase().contains("hg19") {
+            (GRCH37_SOURCES, "human_g1k_v37.fasta")
+        } else {
+            (GRCH38_SOURCES, "GRCh38_reference.fa")
+        };
 
     let ref_path = cache_dir.join(canonical_filename);
     let fai_path = cache_dir.join(format!("{}.fai", canonical_filename));
@@ -208,12 +213,15 @@ fn ensure_reference_genome(build: &str) -> Result<PathBuf, Box<dyn Error + Send 
         "Failed to download reference genome from all {} sources. Last error: {}",
         sources.len(),
         last_error
-    ).into())
+    )
+    .into())
 }
 
 /// Simple file download without progress (for small files like .fai)
 fn download_file(url: &str, dest: &Path) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let response = ureq::get(url).call().map_err(|e| format!("Download failed: {}", e))?;
+    let response = ureq::get(url)
+        .call()
+        .map_err(|e| format!("Download failed: {}", e))?;
     let mut reader = response.into_reader();
     let file = File::create(dest)?;
     let mut writer = BufWriter::new(file);
@@ -245,7 +253,9 @@ fn decompress_gz(src: &Path, dest: &Path) -> Result<(), Box<dyn Error + Send + S
 
 /// Downloads a file with progress indication
 fn download_with_progress(url: &str, dest: &Path) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let response = ureq::get(url).call().map_err(|e| format!("Download failed: {}", e))?;
+    let response = ureq::get(url)
+        .call()
+        .map_err(|e| format!("Download failed: {}", e))?;
 
     let content_length = response
         .header("Content-Length")
@@ -493,7 +503,9 @@ pub fn ensure_plink_format(
                 "> Conversion complete. Cache stored at '{}'",
                 cache_dir.display()
             );
-            eprintln!("> Note: Using raw genotyped data. Missing variants will be mean-imputed during scoring.");
+            eprintln!(
+                "> Note: Using raw genotyped data. Missing variants will be mean-imputed during scoring."
+            );
 
             Ok(cache_prefix)
         }

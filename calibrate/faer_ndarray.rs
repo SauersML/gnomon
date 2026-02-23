@@ -28,27 +28,19 @@ pub enum FaerLinalgError {
 pub fn array2_to_mat_mut(array: &mut Array2<f64>) -> MatMut<'_, f64> {
     let (rows, cols) = array.dim();
     let strides = array.strides();
-    
-    // Check if we can get a pointer. 
+
+    // Check if we can get a pointer.
     // If the array is contiguous (either C or F order), or simply sliced with strides,
     // faer can handle it as long as we pass the pointer and strides.
-    // However, as_mut_ptr() requires a mutable reference. 
+    // However, as_mut_ptr() requires a mutable reference.
     // ndarray's as_ptr/as_mut_ptr works for both layouts.
-    
+
     let s0 = strides[0];
     let s1 = strides[1];
-    
+
     // SAFETY: We are creating a MatMut from the raw parts of the Array2.
     // We strictly follow the dimensions and strides provided by ndarray.
-    unsafe {
-        MatMut::from_raw_parts_mut(
-            array.as_mut_ptr(),
-            rows,
-            cols,
-            s0,
-            s1,
-        )
-    }
+    unsafe { MatMut::from_raw_parts_mut(array.as_mut_ptr(), rows, cols, s0, s1) }
 }
 
 #[inline]
@@ -77,7 +69,7 @@ pub fn fast_ata<S: Data<Elem = f64>>(a: &ArrayBase<S, Ix2>) -> Array2<f64> {
     use faer::{Accum, Mat};
 
     let (n, p) = a.dim();
-    
+
     // For very small matrices, ndarray might be faster due to less overhead
     // Threshold chosen empirically - faer wins above ~64 elements in inner dim
     if n < 64 {
@@ -97,14 +89,7 @@ pub fn fast_ata<S: Data<Elem = f64>>(a: &ArrayBase<S, Ix2>) -> Array2<f64> {
     } else {
         get_global_parallelism()
     };
-    matmul(
-        result.as_mut(),
-        Accum::Replace,
-        a_t,
-        a_ref,
-        1.0,
-        par,
-    );
+    matmul(result.as_mut(), Accum::Replace, a_t, a_ref, 1.0, par);
 
     // Convert back to ndarray
     Array2::from_shape_fn((p, p), |(i, j)| result[(i, j)])
@@ -114,8 +99,8 @@ pub fn fast_ata<S: Data<Elem = f64>>(a: &ArrayBase<S, Ix2>) -> Array2<f64> {
 /// `out` must be shaped (p, p) where A is (n, p).
 #[inline]
 pub fn fast_ata_into<S: Data<Elem = f64>>(a: &ArrayBase<S, Ix2>, out: &mut Array2<f64>) {
-    use faer::linalg::matmul::matmul;
     use faer::Accum;
+    use faer::linalg::matmul::matmul;
 
     let (n, p) = a.dim();
     debug_assert_eq!(out.nrows(), p, "output rows must match p");
@@ -136,14 +121,7 @@ pub fn fast_ata_into<S: Data<Elem = f64>>(a: &ArrayBase<S, Ix2>, out: &mut Array
     } else {
         get_global_parallelism()
     };
-    matmul(
-        out_view.as_mut(),
-        Accum::Replace,
-        a_t,
-        a_ref,
-        1.0,
-        par,
-    );
+    matmul(out_view.as_mut(), Accum::Replace, a_t, a_ref, 1.0, par);
 }
 
 /// Compute A^T * B using faer's SIMD-optimized GEMM.
@@ -172,7 +150,7 @@ pub fn fast_atb<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     let b_view = FaerArrayView::new(b);
     let a_ref = a_view.as_ref();
     let b_ref = b_view.as_ref();
-    
+
     // dst = A^T * B
     let par = if n_a < 128 || p < 128 || q < 128 {
         Par::Seq
@@ -222,14 +200,7 @@ pub fn fast_ab<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     } else {
         get_global_parallelism()
     };
-    matmul(
-        result.as_mut(),
-        Accum::Replace,
-        a_ref,
-        b_ref,
-        1.0,
-        par,
-    );
+    matmul(result.as_mut(), Accum::Replace, a_ref, b_ref, 1.0, par);
 
     Array2::from_shape_fn((n, q), |(i, j)| result[(i, j)])
 }
@@ -242,8 +213,8 @@ pub fn fast_atv_into<S: Data<Elem = f64>>(
     v: &Array1<f64>,
     out: &mut Array1<f64>,
 ) {
-    use faer::linalg::matmul::matmul;
     use faer::Accum;
+    use faer::linalg::matmul::matmul;
 
     let (n, p) = a.dim();
     debug_assert_eq!(v.len(), n, "vector length must match A rows");
@@ -299,7 +270,7 @@ pub fn fast_atv<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     let v_view = FaerColView::new(v);
     let a_ref = a_view.as_ref();
     let v_ref = v_view.as_ref();
-    
+
     // dst = A^T * v (treating v as n×1 matrix)
     let par = if n < 128 || p < 128 {
         Par::Seq
@@ -321,7 +292,6 @@ pub fn fast_atv<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
 fn mat_to_array(mat: MatRef<'_, f64>) -> Array2<f64> {
     Array2::from_shape_fn((mat.nrows(), mat.ncols()), |(i, j)| mat[(i, j)])
 }
-
 
 fn diag_to_array(diag: DiagRef<'_, f64>) -> Array1<f64> {
     let mat = diag.column_vector().as_mat();

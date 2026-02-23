@@ -75,7 +75,13 @@ pub fn emit_overall_skip_summary(summaries: &[SkipSummary]) {
 
     let mut file_counts: Vec<(&Path, usize, usize)> = summaries
         .iter()
-        .map(|s| (s.input_path.as_path(), s.skipped_count, s.total_variant_lines))
+        .map(|s| {
+            (
+                s.input_path.as_path(),
+                s.skipped_count,
+                s.total_variant_lines,
+            )
+        })
         .collect();
     file_counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
 
@@ -318,7 +324,10 @@ fn build_header_column_diagnostics(header_line: &str) -> String {
 }
 
 /// Reformat a PGS Catalog scoring file into a gnomon-native, sorted TSV.
-pub fn reformat_pgs_file(input_path: &Path, output_path: &Path) -> Result<ReformatOutcome, ReformatError> {
+pub fn reformat_pgs_file(
+    input_path: &Path,
+    output_path: &Path,
+) -> Result<ReformatOutcome, ReformatError> {
     // --- Define helper types within the function scope ---
     #[derive(Clone, Copy)]
     enum ParsingStrategy {
@@ -355,9 +364,11 @@ pub fn reformat_pgs_file(input_path: &Path, output_path: &Path) -> Result<Reform
                             .parent()
                             .and_then(|p| p.file_name())
                             .and_then(|n| n.to_str())
-                            && parent_name != "." && parent_name != "/" {
-                                return format!("{}_{}", parent_name, s);
-                            }
+                            && parent_name != "."
+                            && parent_name != "/"
+                        {
+                            return format!("{}_{}", parent_name, s);
+                        }
                         s.to_string()
                     })
                     .unwrap_or_else(|| {

@@ -230,29 +230,7 @@ fn run_single_file_pipeline(
     let strategy = decide::RunStrategy::UseComplexTree;
     eprintln!("> Decision Engine Strategy: {strategy:?}");
 
-    let num_scores = prep_result.score_names.len();
-    let stride = prep_result.stride();
-    let master_baseline: Vec<f64> = (0..prep_result.num_reconciled_variants)
-        .into_par_iter()
-        .fold(
-            || vec![0.0f64; num_scores],
-            |mut local_baseline, i| {
-                let flip_row_offset = i * stride;
-                let missing_corr_row = &prep_result.missing_correction_matrix()
-                    [flip_row_offset..flip_row_offset + stride];
-                for k in 0..num_scores {
-                    local_baseline[k] += missing_corr_row[k] as f64;
-                }
-                local_baseline
-            },
-        )
-        .reduce(
-            || vec![0.0f64; num_scores],
-            |mut a, b| {
-                a.par_iter_mut().zip(b).for_each(|(v_a, v_b)| *v_a += v_b);
-                a
-            },
-        );
+    let master_baseline = prep_result.baseline_missing_sum_by_score().to_vec();
 
     let has_complex = !prep_result.complex_rules.is_empty();
     let is_remote = bed_source.mmap().is_none();
@@ -409,6 +387,7 @@ fn run_single_file_pipeline(
             let (sparse_adjustments, sparse_counts) = sparse_result?;
             let (dense_adjustments, dense_counts) = dense_result?;
             let num_people = prep_result.num_people_to_score;
+            let num_scores = prep_result.score_names.len();
             let mut final_scores = Vec::with_capacity(num_people * num_scores);
             for _ in 0..num_people {
                 final_scores.extend_from_slice(&master_baseline);
@@ -569,31 +548,7 @@ fn run_multi_file_pipeline(
     };
     let strategy = decide::RunStrategy::UseComplexTree;
     eprintln!("> Decision Engine Strategy: {strategy:?}");
-    let master_baseline = {
-        let num_scores = prep_result.score_names.len();
-        let stride = prep_result.stride();
-        (0..prep_result.num_reconciled_variants)
-            .into_par_iter()
-            .fold(
-                || vec![0.0f64; num_scores],
-                |mut local_baseline, i| {
-                    let flip_row_offset = i * stride;
-                    let missing_corr_row = &prep_result.missing_correction_matrix()
-                        [flip_row_offset..flip_row_offset + stride];
-                    for k in 0..num_scores {
-                        local_baseline[k] += missing_corr_row[k] as f64;
-                    }
-                    local_baseline
-                },
-            )
-            .reduce(
-                || vec![0.0f64; num_scores],
-                |mut a, b| {
-                    a.par_iter_mut().zip(b).for_each(|(v_a, v_b)| *v_a += v_b);
-                    a
-                },
-            )
-    };
+    let master_baseline = prep_result.baseline_missing_sum_by_score().to_vec();
 
     let has_complex = !prep_result.complex_rules.is_empty();
     let should_spool = has_complex && any_remote;
@@ -1133,28 +1088,25 @@ fn process_dense_stream(
                         .collect();
 
                     let stride = prep_result.stride();
-                    let mut weights_for_batch =
-                        Vec::with_capacity(reconciled_indices.len() * stride);
-                    let mut flips_for_batch = Vec::with_capacity(reconciled_indices.len() * stride);
+                    let mut weights_for_batch = vec![0.0f32; reconciled_indices.len() * stride];
                     let mut missing_corrections_for_batch =
-                        Vec::with_capacity(reconciled_indices.len() * stride);
-                    for &reconciled_idx in &reconciled_indices {
-                        let src_offset = reconciled_idx.0 as usize * stride;
-                        weights_for_batch.extend_from_slice(
-                            &prep_result.weights_matrix()[src_offset..src_offset + stride],
-                        );
-                        flips_for_batch.extend_from_slice(
-                            &prep_result.flip_mask_matrix()[src_offset..src_offset + stride],
-                        );
-                        missing_corrections_for_batch.extend_from_slice(
-                            &prep_result.missing_correction_matrix()[src_offset..src_offset + stride],
-                        );
+                        vec![0.0f32; reconciled_indices.len() * stride];
+                    for (batch_row_idx, &reconciled_idx) in reconciled_indices.iter().enumerate() {
+                        let dense_offset = batch_row_idx * stride;
+                        let sparse_range = prep_result.sparse_row_range(reconciled_idx.0 as usize);
+                        let cols = &prep_result.sparse_score_columns()[sparse_range.clone()];
+                        let weights = &prep_result.sparse_weights()[sparse_range.clone()];
+                        let missing = &prep_result.sparse_missing_corrections()[sparse_range];
+                        for ((&col_u32, &w), &m) in cols.iter().zip(weights).zip(missing) {
+                            let col = col_u32 as usize;
+                            weights_for_batch[dense_offset + col] = w;
+                            missing_corrections_for_batch[dense_offset + col] = m;
+                        }
                     }
 
                     batch::run_person_major_path(
                         concatenated_data,
                         &weights_for_batch,
-                        &flips_for_batch,
                         &missing_corrections_for_batch,
                         &reconciled_indices,
                         prep_result,

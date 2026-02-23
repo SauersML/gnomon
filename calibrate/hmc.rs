@@ -38,15 +38,19 @@ fn ensure_positive_definite_hmc(mat: &mut Array2<f64>) {
     if mat.cholesky(Side::Lower).is_ok() {
         return; // Already positive definite, no regularization needed
     }
-    
+
     // Matrix needs regularization - use diagonal-scaled nugget
-    let diag_scale = mat.diag().iter().map(|&d| d.abs()).fold(0.0_f64, f64::max).max(1.0);
+    let diag_scale = mat
+        .diag()
+        .iter()
+        .map(|&d| d.abs())
+        .fold(0.0_f64, f64::max)
+        .max(1.0);
     let nugget = 1e-8 * diag_scale;
     for i in 0..mat.nrows() {
         mat[[i, i]] += nugget;
     }
 }
-
 
 /// Compute split-chain R-hat and ESS using the Gelman-Rubin diagnostic.
 ///
@@ -56,24 +60,24 @@ fn compute_split_rhat_and_ess(samples: &Array3<f64>) -> (f64, f64) {
     let n_chains = samples.shape()[0];
     let n_samples = samples.shape()[1];
     let dim = samples.shape()[2];
-    
+
     if n_chains < 2 || n_samples < 4 {
         return (1.0, n_chains as f64 * n_samples as f64 * 0.5);
     }
-    
+
     // Split each chain in half to detect non-stationarity
     let half = n_samples / 2;
     let n_split_chains = n_chains * 2;
     let n_split_samples = half;
-    
+
     let mut max_rhat = 0.0f64;
     let mut min_ess = f64::INFINITY;
-    
+
     for d in 0..dim {
         // Collect split-chain means and variances
         let mut chain_means = Vec::with_capacity(n_split_chains);
         let mut chain_vars = Vec::with_capacity(n_split_chains);
-        
+
         for chain in 0..n_chains {
             // First half
             let mut sum1 = 0.0;
@@ -89,7 +93,7 @@ fn compute_split_rhat_and_ess(samples: &Array3<f64>) -> (f64, f64) {
             var1 /= (half - 1).max(1) as f64;
             chain_means.push(mean1);
             chain_vars.push(var1);
-            
+
             // Second half
             let mut sum2 = 0.0;
             for i in half..(2 * half) {
@@ -105,28 +109,27 @@ fn compute_split_rhat_and_ess(samples: &Array3<f64>) -> (f64, f64) {
             chain_means.push(mean2);
             chain_vars.push(var2);
         }
-        
+
         // Within-chain variance W
         let w: f64 = chain_vars.iter().sum::<f64>() / n_split_chains as f64;
-        
+
         // Between-chain variance B
         let overall_mean: f64 = chain_means.iter().sum::<f64>() / n_split_chains as f64;
-        let b: f64 = chain_means.iter()
+        let b: f64 = chain_means
+            .iter()
             .map(|m| (m - overall_mean).powi(2))
-            .sum::<f64>() * n_split_samples as f64 / (n_split_chains - 1) as f64;
-        
+            .sum::<f64>()
+            * n_split_samples as f64
+            / (n_split_chains - 1) as f64;
+
         // Estimated variance
-        let var_hat = (n_split_samples as f64 - 1.0) / n_split_samples as f64 * w 
-                    + b / n_split_samples as f64;
-        
+        let var_hat = (n_split_samples as f64 - 1.0) / n_split_samples as f64 * w
+            + b / n_split_samples as f64;
+
         // R-hat
-        let rhat_d = if w > 1e-10 {
-            (var_hat / w).sqrt()
-        } else {
-            1.0
-        };
+        let rhat_d = if w > 1e-10 { (var_hat / w).sqrt() } else { 1.0 };
         max_rhat = max_rhat.max(rhat_d);
-        
+
         // ESS approximation: n_eff ≈ n * m / (1 + 2 * sum of autocorrelations)
         // Simple approximation using variance ratio
         let ess_d = if var_hat > 1e-10 {
@@ -136,7 +139,7 @@ fn compute_split_rhat_and_ess(samples: &Array3<f64>) -> (f64, f64) {
         };
         min_ess = min_ess.min(ess_d);
     }
-    
+
     (max_rhat, min_ess.max(1.0))
 }
 
@@ -323,14 +326,14 @@ impl NutsPosterior {
         // === Step 5: Combined gradient in β space ===
         // ∇_β log p = ∇_β ll - ∇_β penalty
         let mut grad_beta = &grad_ll_beta - &grad_penalty_beta;
-        
+
         // === Step 5b: Firth bias reduction term (if enabled) ===
         // Firth adds 0.5 * log|I(β)| to log-posterior, where I = X'WX is Fisher information
         // For logistic regression, W = diag(w * μ(1-μ))
         let firth_term = if self.firth_bias_reduction && self.is_logit {
             let n = self.data.n_samples;
             let p = self.data.dim;
-            
+
             // Compute IRLS weights: w_irls = prior_weight * μ(1-μ)
             let mut w_irls = Array1::<f64>::zeros(n);
             for i in 0..n {
@@ -339,7 +342,7 @@ impl NutsPosterior {
                 let mu_clamped = mu_i.clamp(1e-10, 1.0 - 1e-10);
                 w_irls[i] = self.data.weights[i] * mu_clamped * (1.0 - mu_clamped);
             }
-            
+
             // Build Fisher information: I = X' W X
             let mut fisher = Array2::<f64>::zeros((p, p));
             for i in 0..n {
@@ -351,26 +354,26 @@ impl NutsPosterior {
                     }
                 }
             }
-            
+
             // Compute 0.5 * log|I| via Cholesky
             // Conditional regularization for stability
             ensure_positive_definite_hmc(&mut fisher);
-            
+
             match fisher.cholesky(Side::Lower) {
                 Ok(chol_i) => {
                     let half_log_det: f64 = chol_i.lower_triangular().diag().mapv(f64::ln).sum();
-                    
+
                     // Exact Firth gradient: ∂(0.5 log|I|)/∂β = X' h * (0.5 - μ)
                     // where h_i = leverage = x_i' (X'WX)^{-1} x_i * w_i
                     // Compute (X'WX)^{-1} = L^{-T} L^{-1} where L = chol(X'WX)
                     let l = chol_i.lower_triangular();
-                    
+
                     for i in 0..n {
                         let eta_i = eta[i].clamp(-700.0, 700.0);
                         let mu_i = 1.0 / (1.0 + (-eta_i).exp());
                         let mu_clamped = mu_i.clamp(1e-10, 1.0 - 1e-10);
                         let w_i = w_irls[i].max(1e-10);
-                        
+
                         // Compute h_ii = w_i * x_i' (X'WX)^{-1} x_i via L^{-1}(sqrt(w_i)*x_i)
                         // First solve L v = sqrt(w_i) * x_i
                         let sqrt_w = w_i.sqrt();
@@ -384,14 +387,14 @@ impl NutsPosterior {
                         }
                         // h_ii = ||v||^2
                         let h_ii: f64 = v.iter().map(|x| x * x).sum();
-                        
+
                         // Firth score contribution: h_ii * (0.5 - μ_i)
                         let firth_score = h_ii * (0.5 - mu_clamped);
                         for j in 0..p {
                             grad_beta[j] += firth_score * self.data.x[[i, j]];
                         }
                     }
-                    
+
                     half_log_det
                 }
                 Err(_) => 0.0, // Fall back to standard likelihood if Fisher is singular
@@ -513,31 +516,31 @@ impl Default for NutsConfig {
 
 impl NutsConfig {
     /// Create a config with sample counts tuned for the model dimension.
-    /// 
+    ///
     /// Higher dimensions need more samples because:
     /// - ESS decreases with dimension (autocorrelation grows)
     /// - Split R-hat needs enough samples per chain to be meaningful
-    /// 
+    ///
     /// Rule of thumb: target 100 effective samples per parameter.
     pub fn for_dimension(n_params: usize) -> Self {
         // ESS ≈ n_samples / (1 + 2τ) where τ ≈ sqrt(dim) for well-tuned NUTS
         let effective_autocorr = (n_params as f64).sqrt().max(1.0);
-        
+
         // Target: at least 100 effective samples per parameter
         let target_ess = 100 * n_params;
-        
+
         // Samples needed = ESS * (1 + 2τ), with 1.5x safety factor
         let raw_samples = (target_ess as f64 * (1.0 + 2.0 * effective_autocorr) * 1.5) as usize;
-        
+
         // Clamp to reasonable range [500, 10000]
         let n_samples = raw_samples.clamp(500, 10_000);
-        
+
         // Warmup ≈ samples (standard practice for adaptation)
         let n_warmup = n_samples;
-        
+
         // More chains for higher dims (better R-hat estimation)
         let n_chains = if n_params > 50 { 4 } else { 2 };
-        
+
         Self {
             n_samples,
             n_warmup,
@@ -632,7 +635,16 @@ pub fn run_nuts_sampling(
     let dim = mode.len();
 
     // Create posterior target with analytical gradients (Firth term included when enabled)
-    let target = NutsPosterior::new(x, y, weights, penalty_matrix, mode, hessian, is_logit, firth_bias_reduction)?;
+    let target = NutsPosterior::new(
+        x,
+        y,
+        weights,
+        penalty_matrix,
+        mode,
+        hessian,
+        is_logit,
+        firth_bias_reduction,
+    )?;
 
     // Get Cholesky factor for un-whitening samples later
     let chol = target.chol().clone();
@@ -677,9 +689,11 @@ pub fn run_nuts_sampling(
     }
 
     // Compute split-chain R-hat and ESS for proper convergence diagnostics
-    let posterior_mean = samples.mean_axis(Axis(0)).unwrap_or_else(|| Array1::zeros(dim));
+    let posterior_mean = samples
+        .mean_axis(Axis(0))
+        .unwrap_or_else(|| Array1::zeros(dim));
     let posterior_std = samples.std_axis(Axis(0), 0.0);
-    
+
     // Split-chain R-hat: compare variance within vs between chains
     // Gelman-Rubin diagnostic with split chains
     let (rhat, ess) = if n_chains >= 2 && n_samples_out >= 4 {
@@ -688,7 +702,7 @@ pub fn run_nuts_sampling(
         // Fall back to simple estimates if not enough chains/samples
         (1.0, (total_samples as f64) * 0.5)
     };
-    
+
     let converged = rhat < 1.1 && ess > 100.0;
 
     Ok(NutsResult {
@@ -776,11 +790,7 @@ mod survival_hmc {
                 mode: Arc::new(mode.to_owned()),
             };
 
-            Ok(Self {
-                data,
-                chol,
-                chol_t,
-            })
+            Ok(Self { data, chol, chol_t })
         }
 
         /// Compute log-posterior and gradient analytically.
@@ -862,14 +872,8 @@ mod survival_hmc {
         let dim = mode.len();
 
         // Create posterior target
-        let target = SurvivalPosterior::new(
-            layout,
-            training_data,
-            monotonicity,
-            spec,
-            mode,
-            hessian,
-        )?;
+        let target =
+            SurvivalPosterior::new(layout, training_data, monotonicity, spec, mode, hessian)?;
 
         // Get Cholesky factor for un-whitening samples later
         let chol = target.chol().clone();
@@ -920,7 +924,9 @@ mod survival_hmc {
         }
 
         // Compute statistics
-        let posterior_mean = samples.mean_axis(Axis(0)).unwrap_or_else(|| Array1::zeros(dim));
+        let posterior_mean = samples
+            .mean_axis(Axis(0))
+            .unwrap_or_else(|| Array1::zeros(dim));
         let posterior_std = samples.std_axis(Axis(0), 0.0);
         let rhat = f64::from(run_stats.rhat.mean);
         let ess = f64::from(run_stats.ess.mean);
@@ -942,8 +948,8 @@ mod survival_hmc {
     #[cfg(test)]
     mod survival_gradient_tests {
         use super::*;
+        use crate::calibrate::survival::{BasisDescriptor, build_survival_layout};
         use ndarray::array;
-        use crate::calibrate::survival::{build_survival_layout, BasisDescriptor};
 
         /// Helper to compute numerical gradient via central finite differences
         fn finite_difference_gradient<F>(f: F, x: &Array1<f64>, eps: f64) -> Array1<f64>
@@ -952,19 +958,19 @@ mod survival_hmc {
         {
             let dim = x.len();
             let mut grad = Array1::<f64>::zeros(dim);
-            
+
             for i in 0..dim {
                 let mut x_plus = x.clone();
                 let mut x_minus = x.clone();
                 x_plus[i] += eps;
                 x_minus[i] -= eps;
-                
+
                 let f_plus = f(&x_plus);
                 let f_minus = f(&x_minus);
-                
+
                 grad[i] = (f_plus - f_minus) / (2.0 * eps);
             }
-            
+
             grad
         }
 
@@ -990,10 +996,10 @@ mod survival_hmc {
 
             // Synthetic times and events
             let age_entry = Array1::<f64>::from_shape_fn(n, |_| 40.0 + rng.random_range(0.0..10.0));
-            let age_exit = Array1::<f64>::from_shape_fn(n, |i| age_entry[i] + rng.random_range(1.0..20.0));
-            let event_target = Array1::<u8>::from_shape_fn(n, |_| {
-                if rng.random::<f64>() < 0.3 { 1 } else { 0 }
-            });
+            let age_exit =
+                Array1::<f64>::from_shape_fn(n, |i| age_entry[i] + rng.random_range(1.0..20.0));
+            let event_target =
+                Array1::<u8>::from_shape_fn(n, |_| if rng.random::<f64>() < 0.3 { 1 } else { 0 });
             let sample_weight = Array1::<f64>::ones(n);
             let event_competing = Array1::<u8>::zeros(n);
             let pgs = Array1::<f64>::zeros(n);
@@ -1020,10 +1026,14 @@ mod survival_hmc {
                 degree: 2,
             };
 
-            let layout_bundle = match build_survival_layout(&training_data, &basis, 0.1, 2, 4, None) {
+            let layout_bundle = match build_survival_layout(&training_data, &basis, 0.1, 2, 4, None)
+            {
                 Ok(bundle) => bundle,
                 Err(e) => {
-                    println!("[Survival Gradient] Skipping: could not build layout: {}", e);
+                    println!(
+                        "[Survival Gradient] Skipping: could not build layout: {}",
+                        e
+                    );
                     return;
                 }
             };
@@ -1050,7 +1060,10 @@ mod survival_hmc {
             let posterior = match posterior_result {
                 Ok(p) => p,
                 Err(e) => {
-                    println!("[Survival Gradient] Skipping: could not create posterior: {}", e);
+                    println!(
+                        "[Survival Gradient] Skipping: could not create posterior: {}",
+                        e
+                    );
                     return;
                 }
             };
@@ -1069,18 +1082,19 @@ mod survival_hmc {
                 let (logp, analytical_grad) = match analytical_result {
                     Ok((lp, g)) => (lp, g),
                     Err(e) => {
-                        println!("[Survival Gradient] Point {}: evaluation failed: {}", test_idx, e);
+                        println!(
+                            "[Survival Gradient] Point {}: evaluation failed: {}",
+                            test_idx, e
+                        );
                         continue;
                     }
                 };
 
                 // Compute numerical gradient
                 let numeric_grad = finite_difference_gradient(
-                    |z_test| {
-                        match posterior.compute_logp_and_grad(z_test) {
-                            Ok((lp, _)) => lp,
-                            Err(_) => f64::NEG_INFINITY,
-                        }
+                    |z_test| match posterior.compute_logp_and_grad(z_test) {
+                        Ok((lp, _)) => lp,
+                        Err(_) => f64::NEG_INFINITY,
                     },
                     &z,
                     eps,
@@ -1088,10 +1102,11 @@ mod survival_hmc {
 
                 // Compute cosine similarity
                 let cos_sim = cosine_similarity(&analytical_grad, &numeric_grad);
-                
+
                 // Compute relative error
                 let diff = &analytical_grad - &numeric_grad;
-                let rel_error = diff.dot(&diff).sqrt() / (1e-10 + analytical_grad.dot(&analytical_grad).sqrt());
+                let rel_error =
+                    diff.dot(&diff).sqrt() / (1e-10 + analytical_grad.dot(&analytical_grad).sqrt());
 
                 println!(
                     "[Survival Gradient] Point {}: logp={:.4e}, cos_sim={:.6}, rel_error={:.4e}",
@@ -1153,8 +1168,8 @@ pub struct JointLinkPosterior {
     p_base: usize,
     p_link: usize,
     n_samples: usize,
-    is_logit: bool,  // true=logit, false=identity
-    scale: f64,      // dispersion parameter for identity link
+    is_logit: bool, // true=logit, false=identity
+    scale: f64,     // dispersion parameter for identity link
 }
 
 impl JointLinkPosterior {
@@ -1162,37 +1177,64 @@ impl JointLinkPosterior {
     /// `is_logit`: true for Bernoulli-logit, false for Gaussian-identity
     /// `scale`: dispersion parameter (ignored if is_logit=true)
     pub fn new(
-        x: ArrayView2<f64>, y: ArrayView1<f64>, weights: ArrayView1<f64>,
-        penalty_base: ArrayView2<f64>, penalty_link: ArrayView2<f64>,
-        mode_beta: ArrayView1<f64>, mode_theta: ArrayView1<f64>,
-        hessian: ArrayView2<f64>, spline: JointSplineArtifacts,
-        is_logit: bool, scale: f64,
+        x: ArrayView2<f64>,
+        y: ArrayView1<f64>,
+        weights: ArrayView1<f64>,
+        penalty_base: ArrayView2<f64>,
+        penalty_link: ArrayView2<f64>,
+        mode_beta: ArrayView1<f64>,
+        mode_theta: ArrayView1<f64>,
+        hessian: ArrayView2<f64>,
+        spline: JointSplineArtifacts,
+        is_logit: bool,
+        scale: f64,
     ) -> Result<Self, String> {
         let n_samples = x.nrows();
         let p_base = x.ncols();
         let p_link = mode_theta.len();
         let dim = p_base + p_link;
         if hessian.nrows() != dim || hessian.ncols() != dim {
-            return Err(format!("Hessian dim mismatch: {}x{} vs {}x{}", dim, dim, hessian.nrows(), hessian.ncols()));
+            return Err(format!(
+                "Hessian dim mismatch: {}x{} vs {}x{}",
+                dim,
+                dim,
+                hessian.nrows(),
+                hessian.ncols()
+            ));
         }
         let hessian_owned = hessian.to_owned();
-        let chol_factor = hessian_owned.cholesky(Side::Lower).map_err(|e| format!("Cholesky failed: {:?}", e))?;
+        let chol_factor = hessian_owned
+            .cholesky(Side::Lower)
+            .map_err(|e| format!("Cholesky failed: {:?}", e))?;
         let l_h = chol_factor.lower_triangular();
         let chol = solve_upper_triangular_transpose(&l_h, dim);
         let chol_t = chol.t().to_owned();
         Ok(Self {
-            x: Arc::new(x.to_owned()), y: Arc::new(y.to_owned()), weights: Arc::new(weights.to_owned()),
-            penalty_base: Arc::new(penalty_base.to_owned()), penalty_link: Arc::new(penalty_link.to_owned()),
-            mode_beta: Arc::new(mode_beta.to_owned()), mode_theta: Arc::new(mode_theta.to_owned()),
-            spline, chol, chol_t, p_base, p_link, n_samples, is_logit, scale,
+            x: Arc::new(x.to_owned()),
+            y: Arc::new(y.to_owned()),
+            weights: Arc::new(weights.to_owned()),
+            penalty_base: Arc::new(penalty_base.to_owned()),
+            penalty_link: Arc::new(penalty_link.to_owned()),
+            mode_beta: Arc::new(mode_beta.to_owned()),
+            mode_theta: Arc::new(mode_theta.to_owned()),
+            spline,
+            chol,
+            chol_t,
+            p_base,
+            p_link,
+            n_samples,
+            is_logit,
+            scale,
         })
     }
 
     fn compute_logp_and_grad(&self, z: &Array1<f64>) -> (f64, Array1<f64>) {
         let dim = self.p_base + self.p_link;
         let mut mode = Array1::<f64>::zeros(dim);
-        mode.slice_mut(ndarray::s![0..self.p_base]).assign(&self.mode_beta);
-        mode.slice_mut(ndarray::s![self.p_base..]).assign(&self.mode_theta);
+        mode.slice_mut(ndarray::s![0..self.p_base])
+            .assign(&self.mode_beta);
+        mode.slice_mut(ndarray::s![self.p_base..])
+            .assign(&self.mode_theta);
         let q = &mode + &self.chol.dot(z);
         let beta = q.slice(ndarray::s![0..self.p_base]).to_owned();
         let theta = q.slice(ndarray::s![self.p_base..]).to_owned();
@@ -1200,7 +1242,7 @@ impl JointLinkPosterior {
         let (b_wiggle, eta) = self.evaluate_link(&u, &theta);
         let mut ll = 0.0;
         let mut residual = Array1::<f64>::zeros(self.n_samples);
-        
+
         if self.is_logit {
             // Bernoulli-logit log-likelihood
             for i in 0..self.n_samples {
@@ -1231,15 +1273,24 @@ impl JointLinkPosterior {
                 residual[i] = w_i * r * inv_scale_sq; // grad of ll w.r.t. η
             }
         }
-        
+
         let g_prime = self.compute_g_prime(&u, &theta);
         let grad_theta = &b_wiggle.t().dot(&residual) - &self.penalty_link.dot(&theta);
-        let r_scaled: Array1<f64> = residual.iter().zip(g_prime.iter()).map(|(&r, &g)| r * g).collect();
+        let r_scaled: Array1<f64> = residual
+            .iter()
+            .zip(g_prime.iter())
+            .map(|(&r, &g)| r * g)
+            .collect();
         let grad_beta = &fast_atv(&self.x, &r_scaled) - &self.penalty_base.dot(&beta);
-        let penalty = 0.5 * beta.dot(&self.penalty_base.dot(&beta)) + 0.5 * theta.dot(&self.penalty_link.dot(&theta));
+        let penalty = 0.5 * beta.dot(&self.penalty_base.dot(&beta))
+            + 0.5 * theta.dot(&self.penalty_link.dot(&theta));
         let mut grad_q = Array1::<f64>::zeros(dim);
-        grad_q.slice_mut(ndarray::s![0..self.p_base]).assign(&grad_beta);
-        grad_q.slice_mut(ndarray::s![self.p_base..]).assign(&grad_theta);
+        grad_q
+            .slice_mut(ndarray::s![0..self.p_base])
+            .assign(&grad_beta);
+        grad_q
+            .slice_mut(ndarray::s![self.p_base..])
+            .assign(&grad_theta);
         (ll - penalty, self.chol_t.dot(&grad_q))
     }
 
@@ -1248,7 +1299,11 @@ impl JointLinkPosterior {
         let n = u.len();
         let (min_u, max_u) = self.spline.knot_range;
         let rw = (max_u - min_u).max(1e-6);
-        let n_raw = self.spline.knot_vector.len().saturating_sub(self.spline.degree + 1);
+        let n_raw = self
+            .spline
+            .knot_vector
+            .len()
+            .saturating_sub(self.spline.degree + 1);
         let n_c = self.spline.link_transform.ncols();
         if n_raw == 0 || n_c == 0 || theta.len() != n_c {
             // Return (n, 0) matrix when no link basis - avoids dimension mismatch downstream
@@ -1260,9 +1315,22 @@ impl JointLinkPosterior {
         let mut scratch = SplineScratch::new(self.spline.degree);
         for i in 0..n {
             raw.fill(0.0);
-            if evaluate_bspline_basis_scalar(z[i], self.spline.knot_vector.view(), self.spline.degree, &mut raw, &mut scratch).is_ok() && self.spline.link_transform.nrows() == n_raw {
-                for c in 0..n_c { 
-                    b[[i, c]] = raw.iter().zip(self.spline.link_transform.column(c).iter()).map(|(&r, &t)| r * t).sum(); 
+            if evaluate_bspline_basis_scalar(
+                z[i],
+                self.spline.knot_vector.view(),
+                self.spline.degree,
+                &mut raw,
+                &mut scratch,
+            )
+            .is_ok()
+                && self.spline.link_transform.nrows() == n_raw
+            {
+                for c in 0..n_c {
+                    b[[i, c]] = raw
+                        .iter()
+                        .zip(self.spline.link_transform.column(c).iter())
+                        .map(|(&r, &t)| r * t)
+                        .sum();
                 }
             }
         }
@@ -1270,59 +1338,86 @@ impl JointLinkPosterior {
     }
 
     fn compute_g_prime(&self, u: &Array1<f64>, theta: &Array1<f64>) -> Array1<f64> {
-        use crate::calibrate::basis::{evaluate_bspline_derivative_scalar_into, internal::BsplineScratch};
+        use crate::calibrate::basis::{
+            evaluate_bspline_derivative_scalar_into, internal::BsplineScratch,
+        };
         let n = u.len();
         let mut g = Array1::<f64>::ones(n);
         let (min_u, max_u) = self.spline.knot_range;
         let rw = (max_u - min_u).max(1e-6);
-        let n_raw = self.spline.knot_vector.len().saturating_sub(self.spline.degree + 1);
+        let n_raw = self
+            .spline
+            .knot_vector
+            .len()
+            .saturating_sub(self.spline.degree + 1);
         let n_c = self.spline.link_transform.ncols();
-        if n_raw == 0 || n_c == 0 || theta.len() != n_c { return g; }
-        
+        if n_raw == 0 || n_c == 0 || theta.len() != n_c {
+            return g;
+        }
+
         // Pre-allocate all buffers ONCE outside the loop
         let mut deriv_raw = vec![0.0; n_raw];
-        let num_basis_lower = self.spline.knot_vector.len().saturating_sub(self.spline.degree);
+        let num_basis_lower = self
+            .spline
+            .knot_vector
+            .len()
+            .saturating_sub(self.spline.degree);
         let mut lower_basis = vec![0.0; num_basis_lower];
         let mut lower_scratch = BsplineScratch::new(self.spline.degree.saturating_sub(1));
-        
+
         for i in 0..n {
             let u_i = u[i];
             let z_i = ((u_i - min_u) / rw).clamp(0.0, 1.0);
-            
+
             // At boundaries, g'(u) = 1 (wiggle is constant)
             if z_i <= 1e-8 || z_i >= 1.0 - 1e-8 {
                 g[i] = 1.0;
                 continue;
             }
-            
+
             // Zero-allocation eval using pre-allocated buffers
             deriv_raw.fill(0.0);
             if evaluate_bspline_derivative_scalar_into(
-                z_i, self.spline.knot_vector.view(), self.spline.degree, 
-                &mut deriv_raw, &mut lower_basis, &mut lower_scratch
-            ).is_err() {
+                z_i,
+                self.spline.knot_vector.view(),
+                self.spline.degree,
+                &mut deriv_raw,
+                &mut lower_basis,
+                &mut lower_scratch,
+            )
+            .is_err()
+            {
                 continue;
             }
-            
+
             // d(wiggle)/dz = B'(z) @ Z @ θ
             let d_wiggle_dz: f64 = if self.spline.link_transform.nrows() == n_raw {
-                (0..n_c).map(|c| {
-                    let b_prime_c: f64 = (0..n_raw).map(|r| 
-                        deriv_raw[r] * self.spline.link_transform[[r, c]]
-                    ).sum();
-                    b_prime_c * theta[c]
-                }).sum()
+                (0..n_c)
+                    .map(|c| {
+                        let b_prime_c: f64 = (0..n_raw)
+                            .map(|r| deriv_raw[r] * self.spline.link_transform[[r, c]])
+                            .sum();
+                        b_prime_c * theta[c]
+                    })
+                    .sum()
             } else {
                 0.0
             };
-            
+
             g[i] = 1.0 + d_wiggle_dz / rw;
         }
         g
     }
 
-    pub fn chol(&self) -> &Array2<f64> { &self.chol }
-    pub fn mode(&self) -> (Array1<f64>, Array1<f64>) { (self.mode_beta.as_ref().clone(), self.mode_theta.as_ref().clone()) }
+    pub fn chol(&self) -> &Array2<f64> {
+        &self.chol
+    }
+    pub fn mode(&self) -> (Array1<f64>, Array1<f64>) {
+        (
+            self.mode_beta.as_ref().clone(),
+            self.mode_theta.as_ref().clone(),
+        )
+    }
 }
 
 impl HamiltonianTarget<Array1<f64>> for JointLinkPosterior {
@@ -1337,24 +1432,48 @@ impl HamiltonianTarget<Array1<f64>> for JointLinkPosterior {
 /// `is_logit`: true for Bernoulli-logit, false for Gaussian-identity
 /// `scale`: dispersion parameter for identity link (ignored if is_logit=true)
 pub fn run_joint_nuts_sampling(
-    x: ArrayView2<f64>, y: ArrayView1<f64>, weights: ArrayView1<f64>,
-    penalty_base: ArrayView2<f64>, penalty_link: ArrayView2<f64>,
-    mode_beta: ArrayView1<f64>, mode_theta: ArrayView1<f64>,
-    hessian: ArrayView2<f64>, spline: JointSplineArtifacts, config: &NutsConfig,
-    is_logit: bool, scale: f64,
+    x: ArrayView2<f64>,
+    y: ArrayView1<f64>,
+    weights: ArrayView1<f64>,
+    penalty_base: ArrayView2<f64>,
+    penalty_link: ArrayView2<f64>,
+    mode_beta: ArrayView1<f64>,
+    mode_theta: ArrayView1<f64>,
+    hessian: ArrayView2<f64>,
+    spline: JointSplineArtifacts,
+    config: &NutsConfig,
+    is_logit: bool,
+    scale: f64,
 ) -> Result<NutsResult, String> {
     let (p_base, dim) = (mode_beta.len(), mode_beta.len() + mode_theta.len());
-    let target = JointLinkPosterior::new(x, y, weights, penalty_base, penalty_link, mode_beta, mode_theta, hessian, spline, is_logit, scale)?;
+    let target = JointLinkPosterior::new(
+        x,
+        y,
+        weights,
+        penalty_base,
+        penalty_link,
+        mode_beta,
+        mode_theta,
+        hessian,
+        spline,
+        is_logit,
+        scale,
+    )?;
     let chol = target.chol().clone();
     let (mb, mt) = target.mode();
     let mut mode_arr = Array1::<f64>::zeros(dim);
     mode_arr.slice_mut(ndarray::s![0..p_base]).assign(&mb);
     mode_arr.slice_mut(ndarray::s![p_base..]).assign(&mt);
     let mut rng = StdRng::seed_from_u64(config.seed);
-    let initial_positions: Vec<Array1<f64>> = (0..config.n_chains).map(|_| Array1::from_shape_fn(dim, |_| {
-        let u1: f64 = rng.random::<f64>().max(1e-10); let u2: f64 = rng.random();
-        (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos() * 0.1
-    })).collect();
+    let initial_positions: Vec<Array1<f64>> = (0..config.n_chains)
+        .map(|_| {
+            Array1::from_shape_fn(dim, |_| {
+                let u1: f64 = rng.random::<f64>().max(1e-10);
+                let u2: f64 = rng.random();
+                (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos() * 0.1
+            })
+        })
+        .collect();
     let mut sampler = GenericNUTS::new(target, initial_positions, config.target_accept);
     let samples_array = sampler.run(config.n_samples, config.n_warmup);
     let (n_chains, n_samples_out) = (samples_array.shape()[0], samples_array.shape()[1]);
@@ -1364,36 +1483,52 @@ pub fn run_joint_nuts_sampling(
     for chain in 0..n_chains {
         for sample_i in 0..n_samples_out {
             z_buffer.assign(&samples_array.slice(ndarray::s![chain, sample_i, ..]));
-            samples.row_mut(chain * n_samples_out + sample_i).assign(&(&mode_arr + &chol.dot(&z_buffer)));
+            samples
+                .row_mut(chain * n_samples_out + sample_i)
+                .assign(&(&mode_arr + &chol.dot(&z_buffer)));
         }
     }
-    let posterior_mean = samples.mean_axis(Axis(0)).unwrap_or_else(|| Array1::zeros(dim));
+    let posterior_mean = samples
+        .mean_axis(Axis(0))
+        .unwrap_or_else(|| Array1::zeros(dim));
     let posterior_std = samples.std_axis(Axis(0), 0.0);
-    
+
     // Compute R-hat and ESS heuristics (simplified between/within-chain variance method)
     let (rhat, ess) = compute_rhat_ess(&samples_array, n_chains, n_samples_out, dim);
     let converged = rhat < 1.1 && ess > 100.0;
-    
-    Ok(NutsResult { samples, posterior_mean, posterior_std, rhat, ess, converged })
+
+    Ok(NutsResult {
+        samples,
+        posterior_mean,
+        posterior_std,
+        rhat,
+        ess,
+        converged,
+    })
 }
 
 /// Compute R-hat and ESS heuristics for MCMC samples.
 /// NOTE: This is a simplified diagnostic, NOT the full Vehtari et al. split-R-hat/ESS.
 /// Uses basic between/within chain variance ratio as a convergence heuristic.
-fn compute_rhat_ess(samples: &Array3<f64>, n_chains: usize, n_samples: usize, dim: usize) -> (f64, f64) {
+fn compute_rhat_ess(
+    samples: &Array3<f64>,
+    n_chains: usize,
+    n_samples: usize,
+    dim: usize,
+) -> (f64, f64) {
     if n_chains < 2 || n_samples < 4 {
         return (f64::NAN, (n_chains * n_samples) as f64 * 0.5);
     }
-    
+
     let mut max_rhat = 1.0_f64;
     let mut min_ess = f64::MAX;
-    
+
     for d in 0..dim {
         // Compute chain means and overall mean
         let mut chain_means = vec![0.0; n_chains];
         let mut chain_vars = vec![0.0; n_chains];
         let mut overall_mean = 0.0;
-        
+
         for c in 0..n_chains {
             let mut sum = 0.0;
             for s in 0..n_samples {
@@ -1403,7 +1538,7 @@ fn compute_rhat_ess(samples: &Array3<f64>, n_chains: usize, n_samples: usize, di
             overall_mean += chain_means[c];
         }
         overall_mean /= n_chains as f64;
-        
+
         // Within-chain variance W
         for c in 0..n_chains {
             let mut sum_sq = 0.0;
@@ -1414,7 +1549,7 @@ fn compute_rhat_ess(samples: &Array3<f64>, n_chains: usize, n_samples: usize, di
             chain_vars[c] = sum_sq / (n_samples - 1) as f64;
         }
         let w: f64 = chain_vars.iter().sum::<f64>() / n_chains as f64;
-        
+
         // Between-chain variance B
         let b: f64 = {
             let mut sum_sq = 0.0;
@@ -1424,7 +1559,7 @@ fn compute_rhat_ess(samples: &Array3<f64>, n_chains: usize, n_samples: usize, di
             }
             sum_sq * n_samples as f64 / (n_chains - 1) as f64
         };
-        
+
         // R-hat = sqrt((n-1)/n + B/(n*W))
         let rhat_d = if w > 1e-10 {
             (((n_samples as f64 - 1.0) / n_samples as f64) + (b / (n_samples as f64 * w))).sqrt()
@@ -1432,8 +1567,8 @@ fn compute_rhat_ess(samples: &Array3<f64>, n_chains: usize, n_samples: usize, di
             1.0
         };
         max_rhat = max_rhat.max(rhat_d);
-        
-        // Simplified ESS = n * m * W / (W + B/n) 
+
+        // Simplified ESS = n * m * W / (W + B/n)
         let var_total = w + b / n_samples as f64;
         let ess_d = if var_total > 1e-10 {
             (n_chains * n_samples) as f64 * w / var_total
@@ -1442,7 +1577,7 @@ fn compute_rhat_ess(samples: &Array3<f64>, n_chains: usize, n_samples: usize, di
         };
         min_ess = min_ess.min(ess_d);
     }
-    
+
     (max_rhat, min_ess.max(1.0))
 }
 
@@ -1653,10 +1788,7 @@ mod tests {
 
         // Compute H^{-1} explicitly for comparison
         let det = 4.0 * 3.0 - 1.0 * 1.0; // = 11
-        let h_inv = ndarray::array![
-            [3.0 / det, -1.0 / det],
-            [-1.0 / det, 4.0 / det]
-        ];
+        let h_inv = ndarray::array![[3.0 / det, -1.0 / det], [-1.0 / det, 4.0 / det]];
 
         // Check each element
         for i in 0..dim {
@@ -1665,7 +1797,10 @@ mod tests {
                 assert!(
                     diff < 1e-10,
                     "Whitening transform error at [{},{}]: got {}, expected {}",
-                    i, j, llt[[i, j]], h_inv[[i, j]]
+                    i,
+                    j,
+                    llt[[i, j]],
+                    h_inv[[i, j]]
                 );
             }
         }
@@ -1676,13 +1811,7 @@ mod tests {
     #[test]
     fn test_nuts_sampler_runs_fast() {
         // Simple 2D logistic regression: 5 data points, 2 parameters
-        let x = ndarray::array![
-            [1.0, 0.5],
-            [0.5, 1.0],
-            [1.0, 1.0],
-            [0.0, 0.5],
-            [0.5, 0.0]
-        ];
+        let x = ndarray::array![[1.0, 0.5], [0.5, 1.0], [1.0, 1.0], [0.0, 0.5], [0.5, 0.0]];
         let y = ndarray::array![1.0, 0.0, 1.0, 0.0, 1.0];
         let weights = ndarray::array![1.0, 1.0, 1.0, 1.0, 1.0];
         let penalty = ndarray::array![[0.1, 0.0], [0.0, 0.1]];
@@ -1711,7 +1840,11 @@ mod tests {
         );
 
         // Should succeed
-        assert!(result.is_ok(), "NUTS sampling should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "NUTS sampling should succeed: {:?}",
+            result.err()
+        );
         let res = result.unwrap();
 
         // Should have correct shape: 2 chains * 20 samples = 40 rows, 2 params
@@ -1719,7 +1852,10 @@ mod tests {
         assert_eq!(res.samples.ncols(), 2, "Should have 2 parameters");
 
         // Samples should be finite
-        assert!(res.samples.iter().all(|x| x.is_finite()), "All samples should be finite");
+        assert!(
+            res.samples.iter().all(|x| x.is_finite()),
+            "All samples should be finite"
+        );
 
         // Samples should have some variance (chains moved)
         let std = res.samples.std_axis(ndarray::Axis(0), 0.0);
@@ -1733,16 +1869,20 @@ mod tests {
         // ESS should be positive
         assert!(res.ess > 0.0, "ESS should be positive");
 
-        println!("[NUTS Smoke] Passed: {} samples, ESS={:.1}, R-hat={:.3}", 
-            res.samples.nrows(), res.ess, res.rhat);
+        println!(
+            "[NUTS Smoke] Passed: {} samples, ESS={:.1}, R-hat={:.3}",
+            res.samples.nrows(),
+            res.ess,
+            res.rhat
+        );
     }
 
     /// Test NUTS with higher dimension (10D) to diagnose if dimension causes hanging.
     #[test]
     fn test_nuts_higher_dimension_10d() {
+        use rand::RngExt;
         use rand::SeedableRng;
         use rand::rngs::StdRng;
-        use rand::RngExt;
 
         let dim = 10;
         let n_obs = 20;
@@ -1753,23 +1893,19 @@ mod tests {
             .map(|_| rng.random::<f64>() * 2.0 - 1.0)
             .collect();
         let x = ndarray::Array2::from_shape_vec((n_obs, dim), x_data).unwrap();
-        
+
         // Random binary outcomes
         let y = ndarray::Array1::from_shape_fn(n_obs, |_| {
-            if rng.random::<f64>() > 0.5 {
-                1.0
-            } else {
-                0.0
-            }
+            if rng.random::<f64>() > 0.5 { 1.0 } else { 0.0 }
         });
         let weights = ndarray::Array1::ones(n_obs);
-        
+
         // Ridge penalty
         let penalty = ndarray::Array2::from_diag(&ndarray::Array1::from_elem(dim, 0.1));
-        
+
         // Mode near zero
         let mode = ndarray::Array1::zeros(dim);
-        
+
         // Well-conditioned Hessian (identity-like)
         let hessian = ndarray::Array2::from_diag(&ndarray::Array1::from_elem(dim, 2.0));
 
@@ -1784,7 +1920,7 @@ mod tests {
 
         println!("[NUTS 10D] Starting with {} dim, {} obs...", dim, n_obs);
         let start = std::time::Instant::now();
-        
+
         let result = run_nuts_sampling(
             x.view(),
             y.view(),
@@ -1800,23 +1936,31 @@ mod tests {
         let elapsed = start.elapsed();
         println!("[NUTS 10D] Completed in {:.2?}", elapsed);
 
-        assert!(result.is_ok(), "NUTS 10D should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "NUTS 10D should succeed: {:?}",
+            result.err()
+        );
         let res = result.unwrap();
-        
+
         // 2 chains * 10 samples = 20 total
         assert_eq!(res.samples.nrows(), 20);
         assert_eq!(res.samples.ncols(), dim);
         assert!(res.samples.iter().all(|x| x.is_finite()));
-        
-        println!("[NUTS 10D] Passed: {} samples, dim={}", res.samples.nrows(), dim);
+
+        println!(
+            "[NUTS 10D] Passed: {} samples, dim={}",
+            res.samples.nrows(),
+            dim
+        );
     }
 
     /// Test NUTS with ill-conditioned Hessian to diagnose hanging.
     #[test]
     fn test_nuts_ill_conditioned_hessian() {
+        use rand::RngExt;
         use rand::SeedableRng;
         use rand::rngs::StdRng;
-        use rand::RngExt;
 
         let dim = 8;
         let n_obs = 30;
@@ -1827,18 +1971,14 @@ mod tests {
             .map(|_| rng.random::<f64>() * 2.0 - 1.0)
             .collect();
         let x = ndarray::Array2::from_shape_vec((n_obs, dim), x_data).unwrap();
-        
+
         let y = ndarray::Array1::from_shape_fn(n_obs, |_| {
-            if rng.random::<f64>() > 0.5 {
-                1.0
-            } else {
-                0.0
-            }
+            if rng.random::<f64>() > 0.5 { 1.0 } else { 0.0 }
         });
         let weights = ndarray::Array1::ones(n_obs);
         let penalty = ndarray::Array2::from_diag(&ndarray::Array1::from_elem(dim, 0.1));
         let mode = ndarray::Array1::zeros(dim);
-        
+
         // ILL-CONDITIONED Hessian: eigenvalues span 6 orders of magnitude
         // This mimics what happens with spline bases where some directions are very flat
         let mut hessian = ndarray::Array2::zeros((dim, dim));
@@ -1848,7 +1988,10 @@ mod tests {
         }
 
         let cond_number = 10.0_f64.powi((dim - 1) as i32);
-        println!("[NUTS Ill-Cond] Hessian condition number: {:.0e}", cond_number);
+        println!(
+            "[NUTS Ill-Cond] Hessian condition number: {:.0e}",
+            cond_number
+        );
 
         let config = NutsConfig {
             n_samples: 10,
@@ -1860,7 +2003,7 @@ mod tests {
 
         println!("[NUTS Ill-Cond] Starting...");
         let start = std::time::Instant::now();
-        
+
         let result = run_nuts_sampling(
             x.view(),
             y.view(),
@@ -1876,11 +2019,15 @@ mod tests {
         let elapsed = start.elapsed();
         println!("[NUTS Ill-Cond] Completed in {:.2?}", elapsed);
 
-        assert!(result.is_ok(), "NUTS ill-conditioned should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "NUTS ill-conditioned should succeed: {:?}",
+            result.err()
+        );
         let res = result.unwrap();
         assert_eq!(res.samples.nrows(), 20);
         assert!(res.samples.iter().all(|x| x.is_finite()));
-        
+
         println!("[NUTS Ill-Cond] Passed: {} samples", res.samples.nrows());
     }
 
@@ -1892,9 +2039,9 @@ mod tests {
     /// This test verifies that MCMC samples have empirical covariance matching H^{-1}.
     #[test]
     fn test_gaussian_covariance_recovery() {
+        use ndarray::arr1;
         use rand::rngs::StdRng;
         use rand::{RngExt, SeedableRng};
-        use ndarray::arr1;
 
         let mut rng = StdRng::seed_from_u64(42);
         let n = 100;
@@ -1910,7 +2057,7 @@ mod tests {
 
         // True coefficients
         let true_beta = arr1(&[1.0, 0.5, -0.3, 0.2, -0.1]);
-        
+
         // Generate response: y = X * β + ε, where ε ~ N(0, 1)
         let eta = x.dot(&true_beta);
         let noise: Array1<f64> = Array1::from_shape_fn(n, |_| {
@@ -1938,8 +2085,8 @@ mod tests {
         // Run MCMC with sufficient samples to reduce Monte Carlo variance
         // Covariance estimation requires ~O(d^2) samples for stability
         let config = NutsConfig {
-            n_samples: 500,    // Increased for better covariance estimation
-            n_warmup: 200,     // Increased warmup for better adaptation
+            n_samples: 500, // Increased for better covariance estimation
+            n_warmup: 200,  // Increased warmup for better adaptation
             n_chains: 4,
             target_accept: 0.9,
             seed: 12345,
@@ -1960,7 +2107,7 @@ mod tests {
         assert!(result.is_ok(), "NUTS sampling failed: {:?}", result.err());
         let res = result.unwrap();
         let samples = &res.samples;
-        
+
         println!("[Gaussian Recovery] Samples shape: {:?}", samples.shape());
 
         // Compute empirical covariance
@@ -1971,10 +2118,11 @@ mod tests {
 
         // Compute theoretical covariance = H^{-1}
         let hessian_owned = hessian.clone();
-        let chol = hessian_owned.cholesky(Side::Lower)
+        let chol = hessian_owned
+            .cholesky(Side::Lower)
             .expect("Hessian should be positive definite");
         let l = chol.lower_triangular();
-        
+
         // Solve L L^T * X = I to get H^{-1}
         let mut h_inv = Array2::<f64>::zeros((dim, dim));
         for col in 0..dim {
@@ -2003,7 +2151,10 @@ mod tests {
         let h_inv_norm = h_inv.iter().map(|x| x * x).sum::<f64>().sqrt();
         let relative_error = frobenius_norm / h_inv_norm;
 
-        println!("[Gaussian Recovery] ||Σ_emp - H^{{-1}}||_F = {:.4}", frobenius_norm);
+        println!(
+            "[Gaussian Recovery] ||Σ_emp - H^{{-1}}||_F = {:.4}",
+            frobenius_norm
+        );
         println!("[Gaussian Recovery] ||H^{{-1}}||_F = {:.4}", h_inv_norm);
         println!("[Gaussian Recovery] Relative error = {:.4}", relative_error);
 
@@ -2016,7 +2167,7 @@ mod tests {
             "Covariance mismatch: relative error {:.4} > 0.25",
             relative_error
         );
-        
+
         println!("[Gaussian Recovery] PASSED: Empirical covariance matches H^{{-1}}");
     }
 
@@ -2026,9 +2177,9 @@ mod tests {
     /// For high logits, MCMC should shrink overconfident predictions.
     #[test]
     fn test_jensen_gap_overconfidence_shrinkage() {
+        use ndarray::arr1;
         use rand::rngs::StdRng;
         use rand::{RngExt, SeedableRng};
-        use ndarray::arr1;
 
         let mut rng = StdRng::seed_from_u64(42);
         let n = 200;
@@ -2044,16 +2195,12 @@ mod tests {
 
         // True coefficients - chosen so some predictions are extreme
         let true_beta = arr1(&[0.5, 1.5, 1.0]);
-        
+
         // Generate binary response
         let eta = x.dot(&true_beta);
         let y: Array1<f64> = eta.mapv(|e| {
             let p = 1.0 / (1.0 + (-e).exp());
-            if rng.random::<f64>() < p {
-                1.0
-            } else {
-                0.0
-            }
+            if rng.random::<f64>() < p { 1.0 } else { 0.0 }
         });
         let weights = Array1::<f64>::ones(n);
 
@@ -2084,8 +2231,8 @@ mod tests {
 
         // Run MCMC with more samples to reduce Monte Carlo variance
         let config = NutsConfig {
-            n_samples: 200,    // Increased from 50 for stability
-            n_warmup: 100,     // Increased from 20
+            n_samples: 200, // Increased from 50 for stability
+            n_warmup: 100,  // Increased from 20
             n_chains: 4,
             target_accept: 0.8,
             seed: 54321,
@@ -2110,11 +2257,11 @@ mod tests {
         // Create test input with high logit: x_test = [1, 2, 2]
         // η ≈ 0.5 + 1.5*2 + 1.0*2 = 5.5
         let x_test = arr1(&[1.0, 2.0, 2.0]);
-        
+
         // MAP prediction
         let eta_map = x_test.dot(&mode);
         let pred_map = 1.0 / (1.0 + (-eta_map).exp());
-        
+
         // MCMC prediction: E[σ(x_test^T * β)] and η moments for Jensen checks.
         let mut sum_prob = 0.0;
         let mut sum_eta = 0.0;
@@ -2134,9 +2281,18 @@ mod tests {
         let var_eta = (mean_eta_sq - mean_eta * mean_eta).max(0.0);
         let pred_mean_eta = 1.0 / (1.0 + (-mean_eta.clamp(-700.0, 700.0)).exp());
 
-        println!("[Jensen Gap] η_MAP = {:.4}, P_MAP = {:.4}", eta_map, pred_map);
-        println!("[Jensen Gap] E[η] = {:.4}, P_MCMC = {:.4}", mean_eta, pred_mcmc);
-        println!("[Jensen Gap] σ(E[η]) = {:.4}, var(η) = {:.4}", pred_mean_eta, var_eta);
+        println!(
+            "[Jensen Gap] η_MAP = {:.4}, P_MAP = {:.4}",
+            eta_map, pred_map
+        );
+        println!(
+            "[Jensen Gap] E[η] = {:.4}, P_MCMC = {:.4}",
+            mean_eta, pred_mcmc
+        );
+        println!(
+            "[Jensen Gap] σ(E[η]) = {:.4}, var(η) = {:.4}",
+            pred_mean_eta, var_eta
+        );
         println!("[Jensen Gap] Shrinkage = {:.4}", pred_map - pred_mcmc);
 
         // Guard against mode-collapse: eta variance should be non-trivial
@@ -2151,7 +2307,8 @@ mod tests {
         assert!(
             pred_mcmc <= pred_mean_eta + 1e-3,
             "Jensen gap violated: E[σ(η)] ({:.4}) > σ(E[η]) ({:.4})",
-            pred_mcmc, pred_mean_eta
+            pred_mcmc,
+            pred_mean_eta
         );
 
         // Note: We do NOT assert P_MCMC < P_MAP because the posterior mean of η

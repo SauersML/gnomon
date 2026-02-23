@@ -107,7 +107,11 @@ fn gpu_and_cpu_outputs_match_for_shared_scores_when_cuda_available() -> Result<(
     assert_backend_selected(&gpu_candidate_run.stderr);
 
     let gpu_table = parse_sscore_table(&gpu_candidate_run.output_path)?;
-    assert_eq!(cpu_table.rows.len(), gpu_table.rows.len(), "row count mismatch");
+    assert_eq!(
+        cpu_table.rows.len(),
+        gpu_table.rows.len(),
+        "row count mismatch"
+    );
 
     for score_idx in 0..small_scores {
         let score_name = format!("S{:03}", score_idx);
@@ -205,7 +209,11 @@ fn gpu_and_cpu_outputs_match_for_multifile_score_directory() -> Result<(), Box<d
     assert_backend_selected(&gpu_candidate_run.stderr);
 
     let gpu_table = parse_sscore_table(&gpu_candidate_run.output_path)?;
-    assert_eq!(cpu_table.rows.len(), gpu_table.rows.len(), "row count mismatch");
+    assert_eq!(
+        cpu_table.rows.len(),
+        gpu_table.rows.len(),
+        "row count mismatch"
+    );
 
     for score_idx in 0..common_scores {
         let score_name = format!("A{score_idx:03}");
@@ -284,7 +292,10 @@ fn five_samples_multichrom_partial_overlap_and_split_sites() -> Result<(), Box<d
 
     let table = parse_sscore_table(&run.output_path)?;
     assert_eq!(table.rows.len(), 5, "expected exactly 5 samples");
-    assert_eq!(table.score_names, vec!["S000".to_string(), "S001".to_string()]);
+    assert_eq!(
+        table.score_names,
+        vec!["S000".to_string(), "S001".to_string()]
+    );
 
     let mut observed_missing = false;
     for row in &table.rows {
@@ -299,7 +310,10 @@ fn five_samples_multichrom_partial_overlap_and_split_sites() -> Result<(), Box<d
             }
         }
     }
-    assert!(observed_missing, "expected at least one non-zero missing percentage");
+    assert!(
+        observed_missing,
+        "expected at least one non-zero missing percentage"
+    );
 
     Ok(())
 }
@@ -327,7 +341,10 @@ fn forty_genomes_hundred_scores_microarray_density_with_multiallelic() -> Result
             break;
         }
     }
-    assert!(saw_split_site, "expected multiallelic/split-site loci in fixture");
+    assert!(
+        saw_split_site,
+        "expected multiallelic/split-site loci in fixture"
+    );
 
     let score_dir = tmp.path().join("score_100_bundle");
     fs::create_dir_all(&score_dir)?;
@@ -430,7 +447,10 @@ fn fifty_thousand_samples_small_genome_varied_variants() -> Result<(), Box<dyn E
             break;
         }
     }
-    assert!(saw_missing, "expected at least one sample with missing variants");
+    assert!(
+        saw_missing,
+        "expected at least one sample with missing variants"
+    );
 
     Ok(())
 }
@@ -456,7 +476,11 @@ fn cuda_driver_present() -> bool {
     probe
 }
 
-fn run_score(score_path: &Path, genotype_prefix: &Path, cwd: &Path) -> Result<ScoreRunOutput, Box<dyn Error>> {
+fn run_score(
+    score_path: &Path,
+    genotype_prefix: &Path,
+    cwd: &Path,
+) -> Result<ScoreRunOutput, Box<dyn Error>> {
     let exe = env!("CARGO_BIN_EXE_gnomon");
     let output = Command::new(exe)
         .current_dir(cwd)
@@ -543,7 +567,11 @@ fn write_native_score_file(
     Ok(())
 }
 
-fn write_test_plink_files(prefix: &Path, n_people: usize, n_variants: usize) -> Result<(), Box<dyn Error>> {
+fn write_test_plink_files(
+    prefix: &Path,
+    n_people: usize,
+    n_variants: usize,
+) -> Result<(), Box<dyn Error>> {
     let fam_path = prefix.with_extension("fam");
     let bim_path = prefix.with_extension("bim");
     let bed_path = prefix.with_extension("bed");
@@ -616,17 +644,125 @@ fn write_custom_plink_files_multichrom_split_sites(prefix: &Path) -> Result<(), 
     fs::write(fam_path, fam)?;
 
     let variants: Vec<(&str, u32, &str, &str, [Genotype; 5])> = vec![
-        ("1", 1000, "A", "G", [Genotype::Dosage0, Genotype::Dosage1, Genotype::Dosage2, Genotype::Missing, Genotype::Dosage1]),
+        (
+            "1",
+            1000,
+            "A",
+            "G",
+            [
+                Genotype::Dosage0,
+                Genotype::Dosage1,
+                Genotype::Dosage2,
+                Genotype::Missing,
+                Genotype::Dosage1,
+            ],
+        ),
         // Split/multiallelic-style same locus in BIM with different allele pair.
-        ("1", 1000, "A", "T", [Genotype::Dosage1, Genotype::Dosage0, Genotype::Missing, Genotype::Dosage2, Genotype::Dosage1]),
-        ("2", 2000, "C", "T", [Genotype::Dosage2, Genotype::Dosage1, Genotype::Dosage0, Genotype::Dosage1, Genotype::Missing]),
-        ("2", 2001, "G", "A", [Genotype::Dosage0, Genotype::Dosage0, Genotype::Dosage1, Genotype::Dosage1, Genotype::Dosage2]),
-        ("3", 3000, "T", "C", [Genotype::Dosage1, Genotype::Dosage2, Genotype::Dosage1, Genotype::Missing, Genotype::Dosage0]),
+        (
+            "1",
+            1000,
+            "A",
+            "T",
+            [
+                Genotype::Dosage1,
+                Genotype::Dosage0,
+                Genotype::Missing,
+                Genotype::Dosage2,
+                Genotype::Dosage1,
+            ],
+        ),
+        (
+            "2",
+            2000,
+            "C",
+            "T",
+            [
+                Genotype::Dosage2,
+                Genotype::Dosage1,
+                Genotype::Dosage0,
+                Genotype::Dosage1,
+                Genotype::Missing,
+            ],
+        ),
+        (
+            "2",
+            2001,
+            "G",
+            "A",
+            [
+                Genotype::Dosage0,
+                Genotype::Dosage0,
+                Genotype::Dosage1,
+                Genotype::Dosage1,
+                Genotype::Dosage2,
+            ],
+        ),
+        (
+            "3",
+            3000,
+            "T",
+            "C",
+            [
+                Genotype::Dosage1,
+                Genotype::Dosage2,
+                Genotype::Dosage1,
+                Genotype::Missing,
+                Genotype::Dosage0,
+            ],
+        ),
         // Another split site at same chr:pos.
-        ("3", 3000, "T", "G", [Genotype::Dosage2, Genotype::Dosage1, Genotype::Missing, Genotype::Dosage0, Genotype::Dosage1]),
-        ("4", 4000, "A", "C", [Genotype::Dosage0, Genotype::Missing, Genotype::Dosage0, Genotype::Dosage1, Genotype::Dosage2]),
-        ("5", 5000, "G", "T", [Genotype::Dosage1, Genotype::Dosage1, Genotype::Dosage1, Genotype::Dosage1, Genotype::Dosage1]),
-        ("5", 5001, "C", "A", [Genotype::Missing, Genotype::Dosage2, Genotype::Dosage0, Genotype::Dosage1, Genotype::Dosage2]),
+        (
+            "3",
+            3000,
+            "T",
+            "G",
+            [
+                Genotype::Dosage2,
+                Genotype::Dosage1,
+                Genotype::Missing,
+                Genotype::Dosage0,
+                Genotype::Dosage1,
+            ],
+        ),
+        (
+            "4",
+            4000,
+            "A",
+            "C",
+            [
+                Genotype::Dosage0,
+                Genotype::Missing,
+                Genotype::Dosage0,
+                Genotype::Dosage1,
+                Genotype::Dosage2,
+            ],
+        ),
+        (
+            "5",
+            5000,
+            "G",
+            "T",
+            [
+                Genotype::Dosage1,
+                Genotype::Dosage1,
+                Genotype::Dosage1,
+                Genotype::Dosage1,
+                Genotype::Dosage1,
+            ],
+        ),
+        (
+            "5",
+            5001,
+            "C",
+            "A",
+            [
+                Genotype::Missing,
+                Genotype::Dosage2,
+                Genotype::Dosage0,
+                Genotype::Dosage1,
+                Genotype::Dosage2,
+            ],
+        ),
     ];
 
     let mut bim = String::new();
@@ -808,13 +944,12 @@ fn write_microarray_like_plink_files(
     Ok(loci)
 }
 
-fn synthetic_genotype_for_locus(person_idx: usize, variant_idx: usize, locus: &LocusSpec) -> Genotype {
-    let chrom_val = locus
-        .chrom
-        .as_bytes()
-        .first()
-        .copied()
-        .unwrap_or(b'1') as usize;
+fn synthetic_genotype_for_locus(
+    person_idx: usize,
+    variant_idx: usize,
+    locus: &LocusSpec,
+) -> Genotype {
+    let chrom_val = locus.chrom.as_bytes().first().copied().unwrap_or(b'1') as usize;
     let seed = person_idx * 197 + variant_idx * 61 + chrom_val * 11 + locus.pos as usize;
     let selector = seed % 101;
 
@@ -836,12 +971,7 @@ fn synthetic_genotype_for_split_site(
     row_alt: &str,
     other_alt: &str,
 ) -> Genotype {
-    let chrom_val = locus
-        .chrom
-        .as_bytes()
-        .first()
-        .copied()
-        .unwrap_or(b'1') as usize;
+    let chrom_val = locus.chrom.as_bytes().first().copied().unwrap_or(b'1') as usize;
     let seed = person_idx * 211 + chrom_val * 17 + locus.pos as usize;
     let selector = seed % 100;
 
@@ -945,11 +1075,7 @@ fn write_hundred_partial_overlap_scores(
         let anchor = &loci[score_idx % loci.len()];
         out.push_str(&format!(
             "{}:{}\t{}\t{}\t{:.8}\n",
-            anchor.chrom,
-            anchor.pos,
-            anchor.effect_allele,
-            anchor.other_allele,
-            0.12345678f64
+            anchor.chrom, anchor.pos, anchor.effect_allele, anchor.other_allele, 0.12345678f64
         ));
 
         // Non-overlap and malformed rows for messy-data handling.

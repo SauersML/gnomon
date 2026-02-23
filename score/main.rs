@@ -14,12 +14,12 @@
 
 use clap::Parser;
 use gnomon::score::download;
+use gnomon::score::genotype_convert;
 use gnomon::score::io::{gcs_billing_project_from_env, get_shared_runtime, load_adc_credentials};
 use gnomon::score::pipeline::{self, PipelineContext};
 use gnomon::score::prepare;
 use gnomon::score::reformat;
 use gnomon::score::types::{GenomicRegion, PreparationResult};
-use gnomon::score::genotype_convert;
 use natord::compare;
 use std::collections::HashMap;
 use std::error::Error;
@@ -244,7 +244,9 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
                             cache_files.push((path, stem.to_string()));
                         }
                     } else {
-                        if let Some(stem) = path.file_stem().map(|s| s.to_string_lossy().to_string()) {
+                        if let Some(stem) =
+                            path.file_stem().map(|s| s.to_string_lossy().to_string())
+                        {
                             // Grab mtime eagerly for source files
                             if let Ok(m) = fs::metadata(&path) {
                                 if let Ok(mtime) = m.modified() {
@@ -520,12 +522,10 @@ fn run_preparation_phase(
     native_score_files.sort();
     native_score_files.dedup();
     if native_score_files.is_empty() {
-        return Err(
-            "No compatible score files remained after normalization. \
+        return Err("No compatible score files remained after normalization. \
 Scores that only provide dosage-specific weights \
 ('dosage_0_weight', 'dosage_1_weight', 'dosage_2_weight') are currently unsupported."
-                .into(),
-        );
+            .into());
     }
 
     // --- Run the main preparation logic with the fully normalized and sorted files ---

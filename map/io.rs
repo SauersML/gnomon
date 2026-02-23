@@ -12,11 +12,11 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::adapt_plink2::{VirtualPlink19, open_virtual_plink19_from_paths};
 use crate::map::fit::{HwePcaModel, VariantBlockSource};
 use crate::map::project::ProjectionResult;
 use crate::map::variant_filter::{MatchKind, VariantFilter, VariantKey, VariantSelection};
 use crate::score::pipeline::PipelineError;
-use crate::adapt_plink2::{VirtualPlink19, open_virtual_plink19_from_paths};
 use crate::shared::files::{
     BedSource, ReadMetrics, TextSource, VariantCompression, VariantFormat, VariantSource,
     list_variant_paths, open_bed_source, open_text_source, open_variant_source,
@@ -34,8 +34,7 @@ use noodles_vcf::{
         series::{self, Value as SeriesValue, value::Array as SeriesArray},
     },
     variant::record::{
-        info::Info as VcfInfoTrait,
-        info::field::Value as InfoValue,
+        info::Info as VcfInfoTrait, info::field::Value as InfoValue,
         info::field::value::Array as InfoArray,
     },
 };
@@ -249,10 +248,7 @@ impl GenotypeDataset {
                 Ok(DatasetBlockSource::Plink(dataset.block_source()))
             }
             (Self::Pgen(dataset), SelectionPlan::ByIndices(indices)) => Ok(
-                DatasetBlockSource::Plink(dataset.block_source_with_selection(
-                    Some(indices),
-                    None,
-                )),
+                DatasetBlockSource::Plink(dataset.block_source_with_selection(Some(indices), None)),
             ),
             (Self::Pgen(dataset), SelectionPlan::ByKeys(filter)) => {
                 let selection = dataset
@@ -442,13 +438,15 @@ pub fn load_hwe_model(dataset: &GenotypeDataset) -> Result<HwePcaModel, DatasetO
             )));
         }
     } else if let Some(hint) = dataset.variant_count_hint()
-        && hint > 0 && model.n_variants() != hint {
-            return Err(DatasetOutputError::InvalidState(format!(
-                "Model expects {} variants but dataset provides {}",
-                model.n_variants(),
-                hint
-            )));
-        }
+        && hint > 0
+        && model.n_variants() != hint
+    {
+        return Err(DatasetOutputError::InvalidState(format!(
+            "Model expects {} variants but dataset provides {}",
+            model.n_variants(),
+            hint
+        )));
+    }
 
     Ok(model)
 }
@@ -571,9 +569,10 @@ pub fn save_fit_summary(
 
 fn prepare_output_path(path: &Path) -> Result<(), io::Error> {
     if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
-        }
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
     Ok(())
 }
 
@@ -835,11 +834,12 @@ impl PlinkDataset {
                 &record.allele1,
             );
             if let Some(status) = filter.match_status(&key)
-                && matched.insert(key.clone()) {
-                    indices.push(index);
-                    keys.push(key);
-                    match_kinds.push(status);
-                }
+                && matched.insert(key.clone())
+            {
+                indices.push(index);
+                keys.push(key);
+                match_kinds.push(status);
+            }
             index += 1;
         }
 
@@ -883,8 +883,7 @@ pub struct PgenDataset {
 impl PgenDataset {
     pub fn open(path: &Path) -> Result<Self, PlinkIoError> {
         let (pgen_path, pvar_path, psam_path) = normalize_pgen_paths(path);
-        let virtual_plink =
-            open_virtual_plink19_from_paths(&pgen_path, &pvar_path, &psam_path)?;
+        let virtual_plink = open_virtual_plink19_from_paths(&pgen_path, &pvar_path, &psam_path)?;
 
         let mut fam_source = virtual_plink.fam_source();
         let samples = read_fam_records_from_source(&psam_path, &mut *fam_source)?;
@@ -1017,11 +1016,12 @@ impl PgenDataset {
                 &record.allele1,
             );
             if let Some(status) = filter.match_status(&key)
-                && matched.insert(key.clone()) {
-                    indices.push(index);
-                    keys.push(key);
-                    match_kinds.push(status);
-                }
+                && matched.insert(key.clone())
+            {
+                indices.push(index);
+                keys.push(key);
+                match_kinds.push(status);
+            }
             index += 1;
         }
 
@@ -1283,13 +1283,14 @@ impl VariantBlockSource for PlinkVariantBlockSource {
                     decode_plink_variant(bytes, dest, nrows, table);
 
                     if let Some(kinds) = kinds_slice
-                        && kinds[emitted + local] == MatchKind::Swap {
-                            for val in dest.iter_mut() {
-                                if !val.is_nan() {
-                                    *val = 2.0 - *val;
-                                }
+                        && kinds[emitted + local] == MatchKind::Swap
+                    {
+                        for val in dest.iter_mut() {
+                            if !val.is_nan() {
+                                *val = 2.0 - *val;
                             }
                         }
+                    }
                 }
 
                 emitted += run;
@@ -1422,13 +1423,7 @@ impl VcfLikeDataset {
         for part in &parts {
             let (mut reader, compression, format, _) = create_variant_reader_for_file(part)
                 .inspect_err(|err| {
-                    print_variant_diagnostics(
-                        part,
-                        None,
-                        None,
-                        "initializing variant reader",
-                        err,
-                    );
+                    print_variant_diagnostics(part, None, None, "initializing variant reader", err);
                 })?;
             let header = reader.read_header().map_err(|err| {
                 print_variant_diagnostics(
@@ -1677,11 +1672,12 @@ impl VcfLikeDataset {
                         .unwrap_or_else(|| ".".to_string());
                     let key = VariantKey::new_with_alleles(&chrom, pos, &ref_allele, &alt_allele);
                     if let Some(status) = filter.match_status(&key)
-                        && matched.insert(key.clone()) {
-                            indices.push(record_idx);
-                            keys.push(key);
-                            match_kinds.push(status);
-                        }
+                        && matched.insert(key.clone())
+                    {
+                        indices.push(record_idx);
+                        keys.push(key);
+                        match_kinds.push(status);
+                    }
                 }
                 record_idx += 1;
             }
@@ -2008,7 +2004,8 @@ impl PrefetchState {
         while offset < data.len() {
             {
                 let mut guard = self.inner.lock().unwrap();
-                while guard.attached > 0 && guard.len == guard.buffer.len() && !guard.shutting_down {
+                while guard.attached > 0 && guard.len == guard.buffer.len() && !guard.shutting_down
+                {
                     guard = self.space_available.wait(guard).unwrap();
                 }
                 if guard.shutting_down {
@@ -2652,7 +2649,7 @@ impl VcfLikeVariantBlockSource {
                     }
                     return 0.0;
                 }
-                // No quality field found. 
+                // No quality field found.
                 // Check if 'IMP' flag is present (indicating Imputed data).
                 // If imputed but missing quality scores, it's unsafe to assume perfection.
                 if info.get(header, "IMP").is_some() {
@@ -2892,35 +2889,36 @@ impl VcfLikeVariantBlockSource {
             };
 
             if let Some(key) = self.current_variant_key()?
-                && let Some(status) = filter.match_status(&key) {
-                    let is_new_match = self.matched_seen.insert(key.clone());
-                    if is_new_match {
-                        let offset = filled * self.n_samples;
-                        let dest = &mut storage[offset..offset + self.n_samples];
-                        self.decode_current_variant(dest)?;
+                && let Some(status) = filter.match_status(&key)
+            {
+                let is_new_match = self.matched_seen.insert(key.clone());
+                if is_new_match {
+                    let offset = filled * self.n_samples;
+                    let dest = &mut storage[offset..offset + self.n_samples];
+                    self.decode_current_variant(dest)?;
 
-                        if status == MatchKind::Swap {
-                            for val in dest.iter_mut() {
-                                if !val.is_nan() {
-                                    *val = 2.0 - *val;
-                                }
+                    if status == MatchKind::Swap {
+                        for val in dest.iter_mut() {
+                            if !val.is_nan() {
+                                *val = 2.0 - *val;
                             }
                         }
-
-                        // Store imputation quality for this variant
-                        self.block_quality.push(self.current_variant_quality());
-
-                        if !self.selection_finalized {
-                            self.matched_keys.push(key);
-                        }
-                        filled += 1;
-                        if target_total > 0 && self.emitted + filled >= target_total {
-                            self.stream_exhausted = true;
-                            break;
-                        }
-                        continue;
                     }
+
+                    // Store imputation quality for this variant
+                    self.block_quality.push(self.current_variant_quality());
+
+                    if !self.selection_finalized {
+                        self.matched_keys.push(key);
+                    }
+                    filled += 1;
+                    if target_total > 0 && self.emitted + filled >= target_total {
+                        self.stream_exhausted = true;
+                        break;
+                    }
+                    continue;
                 }
+            }
         }
 
         assert!(!(filled == 0 && self.stream_exhausted));
@@ -3097,11 +3095,11 @@ fn print_variant_diagnostics(
             .to_string()
             .to_lowercase()
             .contains("invalid bgzf header")
-        {
-            eprintln!(
-                "  • Hint        : The BGZF stream appears corrupt or truncated; ensure the source is a complete BGZF-compressed .bcf file."
-            );
-        }
+    {
+        eprintln!(
+            "  • Hint        : The BGZF stream appears corrupt or truncated; ensure the source is a complete BGZF-compressed .bcf file."
+        );
+    }
 }
 
 fn parse_vcf_gp(s: &str) -> Result<Option<f64>, VariantIoError> {
@@ -3114,10 +3112,14 @@ fn parse_vcf_gp(s: &str) -> Result<Option<f64>, VariantIoError> {
     let p2_str = parts.next();
 
     if let (Some(_), Some(p1), Some(p2)) = (p0_str, p1_str, p2_str) {
-        // We only need p1 (Het) and p2 (HomAlt) for dosage. 
+        // We only need p1 (Het) and p2 (HomAlt) for dosage.
         // p0 is Ref probability (dosage 0).
-        let p1_val = p1.parse::<f64>().map_err(|_| VariantIoError::Decode(format!("Invalid GP float: {p1}")))?;
-        let p2_val = p2.parse::<f64>().map_err(|_| VariantIoError::Decode(format!("Invalid GP float: {p2}")))?;
+        let p1_val = p1
+            .parse::<f64>()
+            .map_err(|_| VariantIoError::Decode(format!("Invalid GP float: {p1}")))?;
+        let p2_val = p2
+            .parse::<f64>()
+            .map_err(|_| VariantIoError::Decode(format!("Invalid GP float: {p2}")))?;
         Ok(Some(p1_val + 2.0 * p2_val))
     } else {
         // Malformed GP or not biallelic logic (ignore)
@@ -3182,22 +3184,25 @@ fn decode_vcf_record(
 
         if prefer_ds {
             if let Some(value) = ds_field
-                && let Some(parsed) = parse_numeric_str(value)? {
-                    dest[sample_idx] = parsed;
-                    continue;
-                }
+                && let Some(parsed) = parse_numeric_str(value)?
+            {
+                dest[sample_idx] = parsed;
+                continue;
+            }
             // Fallback to GP if DS is missing but preferred
             if let Some(value) = gp_field
-                && let Some(parsed) = parse_vcf_gp(value)? {
-                    dest[sample_idx] = parsed;
-                    continue;
-                }
+                && let Some(parsed) = parse_vcf_gp(value)?
+            {
+                dest[sample_idx] = parsed;
+                continue;
+            }
         }
 
         if let Some(value) = gt_field
-            && let Some(parsed) = parse_vcf_genotype(value)? {
-                dest[sample_idx] = parsed;
-            }
+            && let Some(parsed) = parse_vcf_genotype(value)?
+        {
+            dest[sample_idx] = parsed;
+        }
     }
 
     Ok(())
@@ -3589,7 +3594,7 @@ fn decode_bcf_gp_series(
 ) -> Result<(), VariantIoError> {
     for (sample_idx, slot) in dest.iter_mut().enumerate() {
         let Some(value) = series.get(header, sample_idx) else {
-             return Err(VariantIoError::Decode(
+            return Err(VariantIoError::Decode(
                 "BCF GP series shorter than expected".to_string(),
             ));
         };
@@ -3602,15 +3607,17 @@ fn decode_bcf_gp_series(
                 let _ = iter.next(); // Skip Ref
                 let p1 = iter.next();
                 let p2 = iter.next();
-                
+
                 if let (Some(Ok(Some(h))), Some(Ok(Some(a)))) = (p1, p2)
-                    && h.is_finite() && a.is_finite() {
-                        *slot = (h + 2.0 * a) as f64;
-                    }
+                    && h.is_finite()
+                    && a.is_finite()
+                {
+                    *slot = (h + 2.0 * a) as f64;
+                }
             }
             Some(Ok(_)) => {}
             Some(Err(err)) => {
-                 return Err(VariantIoError::Decode(format!(
+                return Err(VariantIoError::Decode(format!(
                     "failed to decode BCF GP value: {err}"
                 )));
             }

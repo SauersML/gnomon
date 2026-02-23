@@ -117,17 +117,23 @@ pub struct BasisOptions {
 impl BasisOptions {
     /// Create options for evaluating basis functions (no derivative).
     pub fn value() -> Self {
-        Self { derivative_order: 0 }
+        Self {
+            derivative_order: 0,
+        }
     }
 
     /// Create options for evaluating first derivatives of basis functions.
     pub fn first_derivative() -> Self {
-        Self { derivative_order: 1 }
+        Self {
+            derivative_order: 1,
+        }
     }
 
     /// Create options for evaluating second derivatives of basis functions.
     pub fn second_derivative() -> Self {
-        Self { derivative_order: 2 }
+        Self {
+            derivative_order: 2,
+        }
     }
 }
 
@@ -193,9 +199,11 @@ pub fn create_basis<O: BasisOutputFormat>(
         0 => BasisEvalKind::Basis,
         1 => BasisEvalKind::FirstDerivative,
         2 => BasisEvalKind::SecondDerivative,
-        n => return Err(BasisError::InvalidInput(format!(
-            "unsupported derivative order {n}; only 0, 1, 2 are supported"
-        ))),
+        n => {
+            return Err(BasisError::InvalidInput(format!(
+                "unsupported derivative order {n}; only 0, 1, 2 are supported"
+            )));
+        }
     };
 
     let knot_vec: Array1<f64> = match knot_source {
@@ -203,7 +211,10 @@ pub fn create_basis<O: BasisOutputFormat>(
             validate_knots_for_degree(view, degree)?;
             view.to_owned()
         }
-        KnotSource::Generate { data_range, num_internal_knots } => {
+        KnotSource::Generate {
+            data_range,
+            num_internal_knots,
+        } => {
             if data_range.0 > data_range.1 {
                 return Err(BasisError::InvalidRange(data_range.0, data_range.1));
             }
@@ -221,7 +232,7 @@ pub fn create_basis<O: BasisOutputFormat>(
 /// This is an implementation detail for the unified `create_basis` function.
 pub trait BasisOutputFormat {
     type Output;
-    
+
     fn build_basis(
         data: ArrayView1<f64>,
         degree: usize,
@@ -232,7 +243,7 @@ pub trait BasisOutputFormat {
 
 impl BasisOutputFormat for Dense {
     type Output = Arc<Array2<f64>>;
-    
+
     fn build_basis(
         data: ArrayView1<f64>,
         degree: usize,
@@ -256,7 +267,10 @@ impl BasisOutputFormat for Dense {
         let basis_matrix = if should_use_sparse_basis(num_basis_functions, degree, 1) {
             // Build sparse internally then convert to dense for cache compatibility
             let sparse = generate_basis_internal::<SparseStorage>(
-                data.view(), knot_view, degree, eval_kind,
+                data.view(),
+                knot_view,
+                degree,
+                eval_kind,
             )?;
             let dense = sparse.as_ref().to_dense();
             Array2::from_shape_fn((dense.nrows(), dense.ncols()), |(i, j)| dense[(i, j)])
@@ -275,7 +289,7 @@ impl BasisOutputFormat for Dense {
 
 impl BasisOutputFormat for Sparse {
     type Output = SparseColMat<usize, f64>;
-    
+
     fn build_basis(
         data: ArrayView1<f64>,
         degree: usize,
@@ -283,13 +297,11 @@ impl BasisOutputFormat for Sparse {
         knot_vec: Array1<f64>,
     ) -> Result<(Self::Output, Array1<f64>), BasisError> {
         let knot_view = knot_vec.view();
-        let sparse = generate_basis_internal::<SparseStorage>(
-            data.view(), knot_view, degree, eval_kind,
-        )?;
+        let sparse =
+            generate_basis_internal::<SparseStorage>(data.view(), knot_view, degree, eval_kind)?;
         Ok((sparse, knot_vec))
     }
 }
-
 
 /// Compute a heuristic smoothing weight based on knot span, penalty order, and spline degree.
 pub fn baseline_lambda_seed(knot_vector: &Array1<f64>, degree: usize, penalty_order: usize) -> f64 {
@@ -667,13 +679,8 @@ fn evaluate_splines_derivative_sparse_into_with_lower(
     lower_values: &mut [f64],
     lower_scratch: &mut internal::BsplineScratch,
 ) -> usize {
-    let start_col = internal::evaluate_splines_sparse_into(
-        x,
-        degree,
-        knot_view,
-        values,
-        basis_scratch,
-    );
+    let start_col =
+        internal::evaluate_splines_sparse_into(x, degree, knot_view, values, basis_scratch);
     if degree == 0 {
         values.fill(0.0);
         return start_col;
@@ -775,7 +782,9 @@ fn evaluate_splines_second_derivative_sparse_into(
     let lower_lower_support = lower_lower_degree + 1;
     if scratch.lower_lower_basis.len() != lower_lower_support {
         scratch.lower_lower_basis.resize(lower_lower_support, 0.0);
-        scratch.lower_lower_scratch.ensure_degree(lower_lower_degree);
+        scratch
+            .lower_lower_scratch
+            .ensure_degree(lower_lower_degree);
     }
 
     let start_lower = evaluate_splines_derivative_sparse_into_with_lower(
@@ -830,13 +839,9 @@ fn evaluate_splines_sparse_with_kind(
     scratch: &mut BasisEvalScratch,
 ) -> usize {
     match eval_kind {
-        BasisEvalKind::Basis => internal::evaluate_splines_sparse_into(
-            x,
-            degree,
-            knot_view,
-            values,
-            &mut scratch.basis,
-        ),
+        BasisEvalKind::Basis => {
+            internal::evaluate_splines_sparse_into(x, degree, knot_view, values, &mut scratch.basis)
+        }
         BasisEvalKind::FirstDerivative => {
             evaluate_splines_derivative_sparse_into(x, degree, knot_view, values, scratch)
         }
@@ -966,59 +971,58 @@ impl BasisStorage for SparseStorage {
     ) -> Result<Self::Output, BasisError> {
         let nrows = data.len();
 
-        let triplets: Vec<Triplet<usize, usize, f64>> = if let (true, Some(data_slice)) =
-            (use_parallel, data.as_slice())
-        {
-            let triplet_chunks: Vec<Vec<Triplet<usize, usize, f64>>> =
-                bspline_thread_pool().install(|| {
-                    data_slice
-                        .par_iter()
-                        .enumerate()
-                        .map_init(
-                            || (BasisEvalScratch::new(degree), vec![0.0; support]),
-                            |(scratch, values), (row_i, &x)| {
-                                let mut local = Vec::with_capacity(support);
-                                evaluate_bspline_row_entries(
-                                    x,
-                                    degree,
-                                    knot_view,
-                                    eval_kind,
-                                    num_basis_functions,
-                                    scratch,
-                                    values,
-                                    |col_j, v| local.push(Triplet::new(row_i, col_j, v)),
-                                );
-                                local
-                            },
-                        )
-                        .collect()
-                });
+        let triplets: Vec<Triplet<usize, usize, f64>> =
+            if let (true, Some(data_slice)) = (use_parallel, data.as_slice()) {
+                let triplet_chunks: Vec<Vec<Triplet<usize, usize, f64>>> = bspline_thread_pool()
+                    .install(|| {
+                        data_slice
+                            .par_iter()
+                            .enumerate()
+                            .map_init(
+                                || (BasisEvalScratch::new(degree), vec![0.0; support]),
+                                |(scratch, values), (row_i, &x)| {
+                                    let mut local = Vec::with_capacity(support);
+                                    evaluate_bspline_row_entries(
+                                        x,
+                                        degree,
+                                        knot_view,
+                                        eval_kind,
+                                        num_basis_functions,
+                                        scratch,
+                                        values,
+                                        |col_j, v| local.push(Triplet::new(row_i, col_j, v)),
+                                    );
+                                    local
+                                },
+                            )
+                            .collect()
+                    });
 
-            let mut flattened = Vec::with_capacity(nrows.saturating_mul(support));
-            for mut chunk in triplet_chunks {
-                flattened.append(&mut chunk);
-            }
-            flattened
-        } else {
-            let mut scratch = BasisEvalScratch::new(degree);
-            let mut values = vec![0.0; support];
-            let mut triplets = Vec::with_capacity(nrows.saturating_mul(support));
+                let mut flattened = Vec::with_capacity(nrows.saturating_mul(support));
+                for mut chunk in triplet_chunks {
+                    flattened.append(&mut chunk);
+                }
+                flattened
+            } else {
+                let mut scratch = BasisEvalScratch::new(degree);
+                let mut values = vec![0.0; support];
+                let mut triplets = Vec::with_capacity(nrows.saturating_mul(support));
 
-            for (row_i, &x) in data.iter().enumerate() {
-                evaluate_bspline_row_entries(
-                    x,
-                    degree,
-                    knot_view,
-                    eval_kind,
-                    num_basis_functions,
-                    &mut scratch,
-                    &mut values,
-                    |col_j, v| triplets.push(Triplet::new(row_i, col_j, v)),
-                );
-            }
+                for (row_i, &x) in data.iter().enumerate() {
+                    evaluate_bspline_row_entries(
+                        x,
+                        degree,
+                        knot_view,
+                        eval_kind,
+                        num_basis_functions,
+                        &mut scratch,
+                        &mut values,
+                        |col_j, v| triplets.push(Triplet::new(row_i, col_j, v)),
+                    );
+                }
 
-            triplets
-        };
+                triplets
+            };
 
         SparseColMat::try_new_from_triplets(nrows, num_basis_functions, &triplets)
             .map_err(|err| BasisError::SparseCreation(format!("{err:?}")))
@@ -1171,12 +1175,10 @@ fn generate_basis_nd_dense(
         supports.push(degrees[dim] + 1);
     }
     let strides = compute_tensor_strides(&num_basis)?;
-    let total_cols = num_basis
-        .iter()
-        .try_fold(1usize, |acc, &v| {
-            acc.checked_mul(v)
-                .ok_or_else(|| BasisError::DimensionMismatch("tensor basis too large".to_string()))
-        })?;
+    let total_cols = num_basis.iter().try_fold(1usize, |acc, &v| {
+        acc.checked_mul(v)
+            .ok_or_else(|| BasisError::DimensionMismatch("tensor basis too large".to_string()))
+    })?;
 
     let mut basis_matrix = Array2::zeros((nrows, total_cols));
     const PAR_THRESHOLD: usize = 256;
@@ -1222,8 +1224,10 @@ fn generate_basis_nd_dense(
                 );
         });
     } else {
-        let mut scratch: Vec<BasisEvalScratch> =
-            degrees.iter().map(|&degree| BasisEvalScratch::new(degree)).collect();
+        let mut scratch: Vec<BasisEvalScratch> = degrees
+            .iter()
+            .map(|&degree| BasisEvalScratch::new(degree))
+            .collect();
         let mut values: Vec<Vec<f64>> = supports.iter().map(|&s| vec![0.0; s]).collect();
         let mut starts = vec![0usize; dims];
         let mut indices = vec![0usize; dims];
@@ -1267,12 +1271,10 @@ fn generate_basis_nd_sparse(
         supports.push(degrees[dim] + 1);
     }
     let strides = compute_tensor_strides(&num_basis)?;
-    let total_cols = num_basis
-        .iter()
-        .try_fold(1usize, |acc, &v| {
-            acc.checked_mul(v)
-                .ok_or_else(|| BasisError::DimensionMismatch("tensor basis too large".to_string()))
-        })?;
+    let total_cols = num_basis.iter().try_fold(1usize, |acc, &v| {
+        acc.checked_mul(v)
+            .ok_or_else(|| BasisError::DimensionMismatch("tensor basis too large".to_string()))
+    })?;
 
     const PAR_THRESHOLD: usize = 256;
     let triplets: Vec<Triplet<usize, usize, f64>> = if nrows >= PAR_THRESHOLD {
@@ -1292,9 +1294,8 @@ fn generate_basis_nd_sparse(
                         )
                     },
                     |(scratch, values, starts, indices), row_idx| {
-                        let mut local = Vec::with_capacity(
-                            supports.iter().fold(1usize, |acc, &s| acc * s),
-                        );
+                        let mut local =
+                            Vec::with_capacity(supports.iter().fold(1usize, |acc, &s| acc * s));
                         fill_tensor_row(
                             row_idx,
                             data,
@@ -1319,8 +1320,10 @@ fn generate_basis_nd_sparse(
                 })
         })
     } else {
-        let mut scratch: Vec<BasisEvalScratch> =
-            degrees.iter().map(|&degree| BasisEvalScratch::new(degree)).collect();
+        let mut scratch: Vec<BasisEvalScratch> = degrees
+            .iter()
+            .map(|&degree| BasisEvalScratch::new(degree))
+            .collect();
         let mut values: Vec<Vec<f64>> = supports.iter().map(|&s| vec![0.0; s]).collect();
         let mut starts = vec![0usize; dims];
         let mut indices = vec![0usize; dims];
@@ -1365,7 +1368,10 @@ fn generate_basis_nd_sparse(
 /// On success, returns a `Result` containing a tuple `(Arc<Array2<f64>>, Array1<f64>)`:
 /// - The **basis matrix**, with shape `[data.len(), num_basis_functions]`.
 /// - A copy of the **knot vector** used.
-#[deprecated(since = "0.1.3", note = "Use `create_basis` with `KnotSource::Provided` instead")]
+#[deprecated(
+    since = "0.1.3",
+    note = "Use `create_basis` with `KnotSource::Provided` instead"
+)]
 pub fn create_bspline_basis_with_knots(
     data: ArrayView1<f64>,
     knot_vector: ArrayView1<f64>,
@@ -1655,7 +1661,10 @@ pub fn create_bspline_basis_sparse_with_knots_second_derivative(
 /// The resulting basis matrix has the partition of unity property: each row sums to 1.
 /// Uniform knot spacing ensures that the discrete difference penalty D^T D has the
 /// correct mathematical interpretation as a discrete approximation to derivatives.
-#[deprecated(since = "0.1.3", note = "Use `create_basis` with `KnotSource::Generate` instead")]
+#[deprecated(
+    since = "0.1.3",
+    note = "Use `create_basis` with `KnotSource::Generate` instead"
+)]
 pub fn create_bspline_basis(
     data: ArrayView1<f64>,
     data_range: (f64, f64),
@@ -1840,12 +1849,7 @@ fn create_bspline_basis_nd_with_knots_internal(
         .map(|d| should_use_basis_cache(data[0].len(), d))
         .unwrap_or(false)
     {
-        Some(make_cache_key_multi(
-            &knot_views,
-            degrees,
-            data,
-            eval_kinds,
-        ))
+        Some(make_cache_key_multi(&knot_views, degrees, data, eval_kinds))
     } else {
         None
     };
@@ -3453,7 +3457,8 @@ mod tests {
         let knots = array![0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0];
         let degree = 3;
 
-        let g = compute_greville_abscissae(&knots, degree).expect("should compute Greville abscissae");
+        let g =
+            compute_greville_abscissae(&knots, degree).expect("should compute Greville abscissae");
 
         // For degree 3: G_j = (t_{j+1} + t_{j+2} + t_{j+3}) / 3
         // G_0 = (0 + 0 + 0) / 3 = 0
@@ -3476,10 +3481,13 @@ mod tests {
         let knots = array![0.0, 0.0, 0.0, 0.0, 0.25, 0.5, 0.75, 1.0, 1.0, 1.0, 1.0];
         let degree = 3;
 
-        let (z, s_constrained) =
-            compute_geometric_constraint_transform(&knots, degree, 2).expect("should compute transform");
+        let (z, s_constrained) = compute_geometric_constraint_transform(&knots, degree, 2)
+            .expect("should compute transform");
         // Verify s_constrained has expected dimensions
-        assert!(s_constrained.nrows() > 0, "s_constrained should not be empty");
+        assert!(
+            s_constrained.nrows() > 0,
+            "s_constrained should not be empty"
+        );
 
         let g = compute_greville_abscissae(&knots, degree).expect("should compute Greville");
         let k = g.len();
@@ -3537,7 +3545,11 @@ mod tests {
 
             assert_eq!(z.nrows(), n_basis, "Z rows should equal n_basis");
             assert_eq!(z.ncols(), n_constrained, "Z cols should equal n_basis - 2");
-            assert_eq!(s_c.nrows(), n_constrained, "S_c should be n_constrained x n_constrained");
+            assert_eq!(
+                s_c.nrows(),
+                n_constrained,
+                "S_c should be n_constrained x n_constrained"
+            );
             assert_eq!(s_c.ncols(), n_constrained);
         }
     }
@@ -3615,7 +3627,14 @@ pub fn evaluate_bspline_derivative_scalar(
     let num_basis_lower = knot_vector.len().saturating_sub(degree);
     let mut lower_basis = vec![0.0; num_basis_lower];
     let mut lower_scratch = internal::BsplineScratch::new(degree.saturating_sub(1));
-    evaluate_bspline_derivative_scalar_into(x, knot_vector, degree, out, &mut lower_basis, &mut lower_scratch)
+    evaluate_bspline_derivative_scalar_into(
+        x,
+        knot_vector,
+        degree,
+        out,
+        &mut lower_basis,
+        &mut lower_scratch,
+    )
 }
 
 /// Zero-allocation version: pass pre-allocated buffers for lower_basis and scratch.
@@ -3658,39 +3677,39 @@ pub fn evaluate_bspline_derivative_scalar_into(
             num_basis_lower
         )));
     }
-    
+
     // Fill lower basis with zeros
     for v in lower_basis.iter_mut().take(num_basis_lower) {
         *v = 0.0;
     }
-    
+
     // Evaluate lower-degree (k-1) basis functions
     internal::evaluate_splines_at_point_into(
-        x, 
-        degree - 1, 
-        knot_vector, 
+        x,
+        degree - 1,
+        knot_vector,
         &mut lower_basis[..num_basis_lower],
-        lower_scratch
+        lower_scratch,
     );
-    
+
     // Apply derivative formula: B'_{i,k}(x) = k * (B_{i,k-1}/(t_{i+k}-t_i) - B_{i+1,k-1}/(t_{i+k+1}-t_{i+1}))
     let k = degree as f64;
     for i in 0..num_basis {
         let denom_left = knot_vector[i + degree] - knot_vector[i];
         let denom_right = knot_vector[i + degree + 1] - knot_vector[i + 1];
-        
+
         let left_term = if denom_left.abs() > 1e-12 && i < num_basis_lower {
             lower_basis[i] / denom_left
         } else {
             0.0
         };
-        
+
         let right_term = if denom_right.abs() > 1e-12 && (i + 1) < num_basis_lower {
             lower_basis[i + 1] / denom_right
         } else {
             0.0
         };
-        
+
         out[i] = k * (left_term - right_term);
     }
 
@@ -3710,7 +3729,10 @@ pub fn evaluate_bspline_second_derivative_scalar(
     if degree < 2 {
         return Err(BasisError::InvalidDegree(degree));
     }
-    let num_basis_lower = knot_vector.len().saturating_sub(degree - 1).saturating_sub(1);
+    let num_basis_lower = knot_vector
+        .len()
+        .saturating_sub(degree - 1)
+        .saturating_sub(1);
     let mut deriv_lower = vec![0.0; num_basis_lower];
     let mut lower_basis = vec![0.0; knot_vector.len().saturating_sub(degree - 1)];
     let mut lower_scratch = internal::BsplineScratch::new(degree.saturating_sub(2));
@@ -3759,7 +3781,10 @@ pub fn evaluate_bspline_second_derivative_scalar_into(
         )));
     }
 
-    let num_basis_lower = knot_vector.len().saturating_sub(degree - 1).saturating_sub(1);
+    let num_basis_lower = knot_vector
+        .len()
+        .saturating_sub(degree - 1)
+        .saturating_sub(1);
     if deriv_lower.len() != num_basis_lower {
         return Err(BasisError::InvalidKnotVector(format!(
             "Lower-derivative buffer length {} does not match expected length {}",

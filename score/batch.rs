@@ -46,7 +46,6 @@ const KERNEL_MINI_BATCH_SIZE: usize = 256;
 pub fn run_person_major_path(
     variant_major_data: &[u8],
     weights_for_batch: &[f32],
-    flips_for_batch: &[u8],
     missing_corrections_for_batch: &[f32],
     reconciled_variant_indices_for_batch: &[ReconciledVariantIndex],
     prep_result: &PreparationResult,
@@ -114,7 +113,6 @@ pub fn run_person_major_path(
                     prep_result,
                     variant_major_data,
                     weights_for_batch,
-                    flips_for_batch,
                     missing_corrections_for_batch,
                     reconciled_variant_indices_for_batch,
                     block_scores_out,
@@ -136,7 +134,6 @@ pub fn process_tile<'a>(
     tile: &'a [EffectAlleleDosage],
     prep_result: &'a PreparationResult,
     weights_for_batch: &'a [f32],
-    flips_for_batch: &'a [u8],
     missing_corrections_for_batch: &'a [f32],
     reconciled_variant_indices_for_batch: &'a [ReconciledVariantIndex],
     block_scores_out: &mut [f64],
@@ -146,7 +143,6 @@ pub fn process_tile<'a>(
         tile,
         prep_result,
         weights_for_batch,
-        flips_for_batch,
         missing_corrections_for_batch,
         reconciled_variant_indices_for_batch,
         block_scores_out,
@@ -165,7 +161,6 @@ fn process_block<'a>(
     prep_result: &'a PreparationResult,
     variant_major_data: &'a [u8],
     weights: &'a [f32],
-    flips: &'a [u8],
     missing_corrections: &'a [f32],
     reconciled_variant_indices_for_batch: &'a [ReconciledVariantIndex],
     block_scores_out: &mut [f64],
@@ -191,7 +186,6 @@ fn process_block<'a>(
         &tile,
         prep_result,
         weights,
-        flips,
         missing_corrections,
         reconciled_variant_indices_for_batch,
         block_scores_out,
@@ -245,7 +239,6 @@ pub(crate) fn process_tile_impl<'a>(
     tile: &'a [EffectAlleleDosage],
     prep_result: &'a PreparationResult,
     weights_for_batch: &'a [f32],
-    flips_for_batch: &'a [u8],
     missing_corrections_for_batch: &'a [f32],
     reconciled_variant_indices_for_batch: &'a [ReconciledVariantIndex],
     block_scores_out: &mut [f64],
@@ -279,15 +272,11 @@ pub(crate) fn process_tile_impl<'a>(
 
         // SAFETY: The loop structure and mini-batch calculations ensure that the
         // `matrix_slice_start..matrix_slice_end` range is always within the bounds
-        // of `weights_for_batch` and `flips_for_batch`. Using `get_unchecked`
+        // of `weights_for_batch`. Using `get_unchecked`
         // bypasses the compiler's bounds checks, which is critical for performance
         // in this hot loop.
-        let (weights_chunk, flip_flags_chunk) = unsafe {
-            (
-                weights_for_batch.get_unchecked(matrix_slice_start..matrix_slice_end),
-                flips_for_batch.get_unchecked(matrix_slice_start..matrix_slice_end),
-            )
-        };
+        let weights_chunk =
+            unsafe { weights_for_batch.get_unchecked(matrix_slice_start..matrix_slice_end) };
         let missing_corr_chunk = unsafe {
             missing_corrections_for_batch.get_unchecked(matrix_slice_start..matrix_slice_end)
         };
@@ -298,10 +287,6 @@ pub(crate) fn process_tile_impl<'a>(
         // performance-killing panic branch from the hot loop.
         let weights = unsafe {
             kernel::PaddedInterleavedWeights::new(weights_chunk, mini_batch_size, num_scores)
-                .unwrap_unchecked()
-        };
-        let flip_flags = unsafe {
-            kernel::PaddedInterleavedFlags::new(flip_flags_chunk, mini_batch_size, num_scores)
                 .unwrap_unchecked()
         };
 
@@ -371,16 +356,17 @@ pub(crate) fn process_tile_impl<'a>(
                             let global_matrix_row_idx = reconciled_variant_indices_for_batch
                                 [variant_idx_in_chunk]
                                 .0 as usize;
-                            let scores_for_this_variant =
-                                &prep_result.variant_to_scores_map[global_matrix_row_idx];
+                            let sparse_range = prep_result.sparse_row_range(global_matrix_row_idx);
+                            let sparse_cols =
+                                &prep_result.sparse_score_columns()[sparse_range.clone()];
                             let weight_row_offset = i * stride;
                             let person_scores_slice = &mut block_scores_out
                                 [person_idx * num_scores..(person_idx + 1) * num_scores];
                             let person_missing_counts_slice = &mut block_missing_counts_out
                                 [person_idx * num_scores..(person_idx + 1) * num_scores];
 
-                            for &score_idx in scores_for_this_variant {
-                                let score_col = score_idx.0;
+                            for &score_col_u32 in sparse_cols {
+                                let score_col = score_col_u32 as usize;
                                 person_missing_counts_slice[score_col] += 1;
                                 person_scores_slice[score_col] -=
                                     missing_corr_chunk[weight_row_offset + score_col] as f64;
@@ -409,16 +395,16 @@ pub(crate) fn process_tile_impl<'a>(
                         let variant_idx_in_chunk = variant_mini_batch_start + i;
                         let global_matrix_row_idx =
                             reconciled_variant_indices_for_batch[variant_idx_in_chunk].0 as usize;
-                        let scores_for_this_variant =
-                            &prep_result.variant_to_scores_map[global_matrix_row_idx];
+                        let sparse_range = prep_result.sparse_row_range(global_matrix_row_idx);
+                        let sparse_cols = &prep_result.sparse_score_columns()[sparse_range];
                         let weight_row_offset = i * stride;
                         let person_scores_slice = &mut block_scores_out
                             [person_idx * num_scores..(person_idx + 1) * num_scores];
                         let person_missing_counts_slice = &mut block_missing_counts_out
                             [person_idx * num_scores..(person_idx + 1) * num_scores];
 
-                        for &score_idx in scores_for_this_variant {
-                            let score_col = score_idx.0;
+                        for &score_col_u32 in sparse_cols {
+                            let score_col = score_col_u32 as usize;
                             person_missing_counts_slice[score_col] += 1;
                             person_scores_slice[score_col] -=
                                 missing_corr_chunk[weight_row_offset + score_col] as f64;
@@ -431,7 +417,6 @@ pub(crate) fn process_tile_impl<'a>(
             // Call kernel with stack slices
             let kernel_result_buffer = kernel::accumulate_adjustments_for_person(
                 &weights,
-                &flip_flags,
                 &g1_indices[..g1_count],
                 &g2_indices[..g2_count],
             );
@@ -641,15 +626,10 @@ pub fn run_variant_major_path(
     reconciled_variant_index: ReconciledVariantIndex,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let num_scores = prep_result.score_names.len();
-    let stride = prep_result.stride();
-
-    // Get pointers to the relevant weight/flip data for this variant. This is
-    // an efficient calculation of the offset into the global contiguous matrices.
-    let matrix_row_offset = reconciled_variant_index.0 as usize * stride;
-    let weight_row = &prep_result.weights_matrix()[matrix_row_offset..matrix_row_offset + stride];
-    let missing_corr_row =
-        &prep_result.missing_correction_matrix()[matrix_row_offset..matrix_row_offset + stride];
-    let affected_scores = &prep_result.variant_to_scores_map[reconciled_variant_index.0 as usize];
+    let sparse_range = prep_result.sparse_row_range(reconciled_variant_index.0 as usize);
+    let cols = &prep_result.sparse_score_columns()[sparse_range.clone()];
+    let weights = &prep_result.sparse_weights()[sparse_range.clone()];
+    let missing_corr = &prep_result.sparse_missing_corrections()[sparse_range];
 
     // --- Main Compute Loop ---
     // This single loop iterates only over the individuals we need to score.
@@ -686,10 +666,10 @@ pub fn run_variant_major_path(
             // Missing genotype (0b01).
             0b01 => {
                 let scores_offset = out_idx * num_scores;
-                for score_col_idx in affected_scores {
-                    let col = score_col_idx.0;
+                for (&col_u32, &corr) in cols.iter().zip(missing_corr) {
+                    let col = col_u32 as usize;
                     partial_missing_counts_out[scores_offset + col] += 1;
-                    partial_scores_out[scores_offset + col] -= missing_corr_row[col] as f64;
+                    partial_scores_out[scores_offset + col] -= corr as f64;
                 }
             }
 
@@ -697,9 +677,9 @@ pub fn run_variant_major_path(
             0b10 | 0b11 => {
                 let dosage = if packed_val == 0b10 { 1.0 } else { 2.0 };
                 let scores_offset = out_idx * num_scores;
-                for score_col_idx in affected_scores {
-                    let col = score_col_idx.0;
-                    let weight = weight_row[col] as f64;
+                for (&col_u32, &weight) in cols.iter().zip(weights) {
+                    let col = col_u32 as usize;
+                    let weight = weight as f64;
                     let adjustment = weight * dosage;
                     partial_scores_out[scores_offset + col] += adjustment;
                 }
@@ -716,7 +696,7 @@ pub fn run_variant_major_path(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::score::types::{BimRowIndex, PipelineKind, ScoreColumnIndex};
+    use crate::score::types::{BimRowIndex, PipelineKind};
     use std::path::PathBuf;
 
     fn make_single_variant_prep_result(
@@ -726,11 +706,10 @@ mod tests {
     ) -> PreparationResult {
         let score_names = vec!["S0".to_string()];
         let stride = 8;
-        let mut weights_matrix = vec![0.0f32; stride];
-        let flip_mask_matrix = vec![0u8; stride];
-        let mut missing_correction_matrix = vec![0.0f32; stride];
-        weights_matrix[0] = weight;
-        missing_correction_matrix[0] = missing_correction;
+        let sparse_weights = vec![weight];
+        let sparse_missing_correction = vec![missing_correction];
+        let sparse_score_columns = vec![0u32];
+        let sparse_row_offsets = vec![0u64, 1u64];
 
         let output_idx_to_fam_idx: Vec<u32> = (0..num_people as u32).collect();
         let mut person_fam_to_output_idx = vec![None; num_people];
@@ -739,15 +718,16 @@ mod tests {
         }
 
         PreparationResult::new(
-            weights_matrix,
-            flip_mask_matrix,
-            missing_correction_matrix,
+            sparse_weights,
+            sparse_missing_correction,
+            sparse_score_columns,
+            sparse_row_offsets,
             stride,
+            vec![missing_correction as f64],
             vec![BimRowIndex(0)],
             vec![],
             score_names,
             vec![1],
-            vec![vec![ScoreColumnIndex(0)]],
             crate::score::types::PersonSubset::All,
             (0..num_people).map(|i| format!("I{i}")).collect(),
             num_people,

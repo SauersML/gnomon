@@ -5,26 +5,26 @@ use crate::calibrate::faer_ndarray::{
     array2_to_mat_mut, fast_ata_into, fast_atv, fast_atv_into,
 };
 use crate::calibrate::matrix::DesignMatrix;
+use crate::calibrate::model::{LinkFunction, ModelConfig, ModelFamily};
 use crate::calibrate::types::{Coefficients, LinearPredictor, LogSmoothingParamsView};
 use dyn_stack::{MemBuffer, MemStack};
-use faer::sparse::{SparseColMat, Triplet};
-use crate::calibrate::model::{LinkFunction, ModelConfig, ModelFamily};
 use faer::linalg::matmul::matmul;
 use faer::linalg::solvers::{
     Lblt as FaerLblt, Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve,
 };
 use faer::sparse::linalg::matmul::{
-    sparse_sparse_matmul_numeric, sparse_sparse_matmul_numeric_scratch, sparse_sparse_matmul_symbolic,
-    SparseMatMulInfo,
+    SparseMatMulInfo, sparse_sparse_matmul_numeric, sparse_sparse_matmul_numeric_scratch,
+    sparse_sparse_matmul_symbolic,
 };
+use faer::sparse::{SparseColMat, Triplet};
 use faer::sparse::{SparseColMatMut, SparseColMatRef, SparseRowMat, SymbolicSparseColMat};
-use faer::{Accum, Par, Side, get_global_parallelism, Unbind};
+use faer::{Accum, Par, Side, Unbind, get_global_parallelism};
 use log;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, ShapeBuilder};
 
-use std::borrow::Cow;
-use faer::{MatRef, Spec, Auto};
 use faer::linalg::cholesky::llt::factor::LltParams;
+use faer::{Auto, MatRef, Spec};
+use std::borrow::Cow;
 
 pub struct LltView<'a> {
     pub matrix: MatRef<'a, f64>,
@@ -36,7 +36,7 @@ impl<'a> LltView<'a> {
         let mut result_mat = array2_to_mat_mut(&mut result);
         // Copy rhs to result
         result_mat.as_mut().copy_from(rhs);
-        
+
         // Solve in place A x = b (x stored in result_mat)
         faer::linalg::cholesky::llt::solve::solve_in_place(
             self.matrix,
@@ -338,7 +338,6 @@ impl PirlsWorkspace {
         cache.compute_dense(x, weights)
     }
 
-    
     pub fn compute_hessian_sparse_faer(
         &mut self,
         x: &SparseRowMat<usize, f64>,
@@ -444,7 +443,6 @@ struct GamWorkingModel<'a> {
     quad_ctx: crate::calibrate::quadrature::QuadratureContext,
 }
 
-
 struct GamModelFinalState {
     x_transformed: Option<DesignMatrix>,
     e_transformed: Array2<f64>,
@@ -476,7 +474,9 @@ impl<'a> GamWorkingModel<'a> {
         } else {
             x_original_dense.nrows()
         };
-        let x_csr = x_transformed.as_ref().and_then(|matrix| matrix.to_csr_cache());
+        let x_csr = x_transformed
+            .as_ref()
+            .and_then(|matrix| matrix.to_csr_cache());
         let x_original_csr = x_original_sparse
             .as_ref()
             .and_then(|matrix| matrix.to_csr_cache());
@@ -504,7 +504,7 @@ impl<'a> GamWorkingModel<'a> {
             quad_ctx,
         }
     }
-    
+
     /// Set per-observation SE for integrated (GHQ) likelihood.
     /// When set, the working model uses uncertainty-aware IRLS updates.
     fn with_covariate_se(mut self, se: Array1<f64>) -> Self {
@@ -608,7 +608,8 @@ impl<'a> GamWorkingModel<'a> {
             self.workspace.wx.assign(&self.x_original_dense);
             self.workspace.wx *= &sqrt_w_col;
             let wx_view = FaerArrayView::new(&self.workspace.wx);
-            let mut xtwx = Array2::zeros((self.x_original_dense.ncols(), self.x_original_dense.ncols()));
+            let mut xtwx =
+                Array2::zeros((self.x_original_dense.ncols(), self.x_original_dense.ncols()));
             let mut xtwx_view = array2_to_mat_mut(&mut xtwx);
             matmul(
                 xtwx_view.as_mut(),
@@ -682,7 +683,6 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
             // when PIRLS is operating directly in the original basis.
             let (hat_diag, half_log_det) = match (&self.x_transformed, &self.x_csr) {
                 (Some(DesignMatrix::Sparse(_)), Some(csr)) => {
-
                     compute_firth_hat_and_half_logdet_sparse(
                         csr,
                         weights.view(),
@@ -781,31 +781,28 @@ pub(crate) struct SparseXtWxCache {
     nrows: usize,
     ncols: usize,
     nnz: usize,
-    x_t_csc: SparseColMat<usize, f64>,  // CSC format of X transpose for matmul
+    x_t_csc: SparseColMat<usize, f64>, // CSC format of X transpose for matmul
 }
 
 impl SparseXtWxCache {
     fn new(x: &SparseColMat<usize, f64>) -> Result<Self, EstimationError> {
         // For X^T X where X is CSC: X^T is a SparseRowMat, which we need to convert
         // to CSC format for the matmul API. Use the symbolic method properly.
-        let x_t_csc = x.as_ref().transpose().to_col_major().map_err(|_| {
-            EstimationError::InvalidInput("failed to transpose to CSC".to_string())
-        })?;
-        let (xtwx_symbolic, info) = sparse_sparse_matmul_symbolic(
-            x_t_csc.symbolic(),
-            x.symbolic(),
-        )
+        let x_t_csc =
+            x.as_ref().transpose().to_col_major().map_err(|_| {
+                EstimationError::InvalidInput("failed to transpose to CSC".to_string())
+            })?;
+        let (xtwx_symbolic, info) = sparse_sparse_matmul_symbolic(x_t_csc.symbolic(), x.symbolic())
             .map_err(|_| {
                 EstimationError::InvalidInput("failed to build symbolic XtWX cache".to_string())
             })?;
         let xtwx_values = vec![0.0; xtwx_symbolic.row_idx().len()];
         let wx_values = vec![0.0; x.val().len()];
         let par = sparse_xtwx_par(x.ncols());
-        let scratch =
-            MemBuffer::new(sparse_sparse_matmul_numeric_scratch::<usize, f64>(
-                xtwx_symbolic.as_ref(),
-                par,
-            ));
+        let scratch = MemBuffer::new(sparse_sparse_matmul_numeric_scratch::<usize, f64>(
+            xtwx_symbolic.as_ref(),
+            par,
+        ));
         Ok(Self {
             xtwx_symbolic,
             xtwx_values,
@@ -881,7 +878,6 @@ fn sparse_xtwx_par(ncols: usize) -> Par {
     }
 }
 
-
 fn compute_firth_hat_and_half_logdet_sparse(
     x_design_csr: &SparseRowMat<usize, f64>,
     weights: ArrayView1<f64>,
@@ -895,8 +891,9 @@ fn compute_firth_hat_and_half_logdet_sparse(
     let p = x_design_csr.ncols();
 
     // Use efficient faer sparse multiplication
-    let xtwx_transformed = workspace.compute_hessian_sparse_faer(x_design_csr, &weights.to_owned())?;
-    
+    let xtwx_transformed =
+        workspace.compute_hessian_sparse_faer(x_design_csr, &weights.to_owned())?;
+
     let mut stabilized = xtwx_transformed.clone();
     if let Some(s) = s_transformed {
         for i in 0..p {
@@ -957,8 +954,6 @@ fn compute_firth_hat_and_half_logdet_sparse(
 
     Ok((hat_diag, half_log_det))
 }
-
-
 
 fn solve_newton_direction_dense(
     hessian: &Array2<f64>,
@@ -1064,7 +1059,7 @@ where
 
     let mut lambda = 1e-6; // Initial damping (Levenberg-Marquardt parameter)
     let lambda_factor = 10.0;
-    
+
     'pirls_loop: for iter in 1..=options.max_iterations {
         iterations = iter;
         let state = model.update(&beta)?;
@@ -1074,15 +1069,14 @@ where
 
         // --- Levenberg-Marquardt Step ---
 
-        
         // Loop to adjust lambda until we accept a step or fail
         // In standard LM, we solve (H + λI)δ = -g
         let mut loop_lambda = lambda;
         let mut attempts = 0;
-        
+
         loop {
             attempts += 1;
-            
+
             // 1. Solve (H + λI)δ = -g
             // We clone the Hessian effectively implementing H_damped = H + λI
             let mut regularized = state.hessian.clone();
@@ -1090,21 +1084,21 @@ where
             for i in 0..dim {
                 regularized[[i, i]] += loop_lambda;
             }
-            
+
             let direction = match solve_newton_direction_dense(&regularized, &state.gradient) {
                 Ok(d) => d,
                 Err(_) => {
                     // Singular even with ridge (unlikely unless huge). Increase lambda.
-                   if loop_lambda < 1e12 {
-                       loop_lambda *= lambda_factor;
-                       continue;
-                   } else {
-                       // Fallback to gradient descent
-                       state.gradient.mapv(|g| -g) 
-                   }
+                    if loop_lambda < 1e12 {
+                        loop_lambda *= lambda_factor;
+                        continue;
+                    } else {
+                        // Fallback to gradient descent
+                        state.gradient.mapv(|g| -g)
+                    }
                 }
             };
-            
+
             // 2. Compute Predicted Reduction
             // Pred = -g'δ - 0.5 * δ'(H)δ
             // Actually, we should check against the model: m(0) - m(δ)
@@ -1114,14 +1108,14 @@ where
             let quad = 0.5 * direction.dot(&q_term);
             let lin = state.gradient.dot(&direction);
             let predicted_reduction = -(lin + quad);
-            
+
             // 3. Compute Actual Reduction
             let candidate_beta = Coefficients::new(&*beta + &direction);
             match model.update(&candidate_beta) {
                 Ok(candidate_state) => {
                     let candidate_penalized = penalized_objective(&candidate_state);
                     let actual_reduction = current_penalized - candidate_penalized;
-                    
+
                     // 4. Gain Ratio
                     let rho = if predicted_reduction > 1e-15 {
                         actual_reduction / predicted_reduction
@@ -1140,24 +1134,27 @@ where
                         if rho > 0.25 {
                             lambda = (loop_lambda / lambda_factor).max(1e-9);
                         } else {
-                            lambda = loop_lambda; 
+                            lambda = loop_lambda;
                         }
-                        
+
                         // Updates for next iteration
                         beta = candidate_beta;
-                        
-                         // Update Iteration Info
-                        let candidate_grad_norm = candidate_state.gradient.dot(&candidate_state.gradient).sqrt();
+
+                        // Update Iteration Info
+                        let candidate_grad_norm = candidate_state
+                            .gradient
+                            .dot(&candidate_state.gradient)
+                            .sqrt();
                         let deviance_change = actual_reduction;
-                         
+
                         iteration_callback(&WorkingModelIterationInfo {
                             iteration: iter,
                             deviance: candidate_state.deviance,
                             gradient_norm: candidate_grad_norm,
-                            step_size: 1.0, 
+                            step_size: 1.0,
                             step_halving: attempts, // repurpose as attempt count
                         });
-                        
+
                         last_gradient_norm = candidate_grad_norm;
                         last_deviance_change = deviance_change;
                         last_step_size = 1.0;
@@ -1168,53 +1165,54 @@ where
                             .copied()
                             .map(f64::abs)
                             .fold(0.0, f64::max);
-                        
+
                         // Preserve the structural ridge computed by the model.
                         // LM damping is a transient solver detail and must not
                         // redefine the objective's stabilization ridge.
                         final_state = Some(candidate_state.clone());
-                        
+
                         // Check Convergence
-                        let deviance_scale = current_penalized.abs().max(candidate_penalized.abs()).max(1.0);
+                        let deviance_scale = current_penalized
+                            .abs()
+                            .max(candidate_penalized.abs())
+                            .max(1.0);
                         let grad_tol = options.convergence_tolerance; // Absolute norm check
                         let dev_tol = options.convergence_tolerance * deviance_scale;
-                        
+
                         if candidate_grad_norm < grad_tol {
-                             status = PirlsStatus::Converged;
-                             break 'pirls_loop;
+                            status = PirlsStatus::Converged;
+                            break 'pirls_loop;
                         }
                         if deviance_change.abs() < dev_tol
                             && deviance_change >= 0.0
                             && candidate_grad_norm < grad_tol
                         {
-                             status = PirlsStatus::Converged;
-                             break 'pirls_loop;
+                            status = PirlsStatus::Converged;
+                            break 'pirls_loop;
                         }
-                        
+
                         break; // Break inner lambda loop, continue outer pirls loop
                     } else {
                         // Reject Step
-                         if loop_lambda > 1e12 {
-                             // Exhausted attempts
-                             if attempts > 30 {
-                                 status = PirlsStatus::StalledAtValidMinimum;
-                                 // Preserve the structural ridge from the model state.
-                                 final_state = Some(state.clone());
-                                 break 'pirls_loop;
-                             }
-                         }
-                         loop_lambda *= lambda_factor;
+                        if loop_lambda > 1e12 {
+                            // Exhausted attempts
+                            if attempts > 30 {
+                                status = PirlsStatus::StalledAtValidMinimum;
+                                // Preserve the structural ridge from the model state.
+                                final_state = Some(state.clone());
+                                break 'pirls_loop;
+                            }
+                        }
+                        loop_lambda *= lambda_factor;
                     }
                 }
                 Err(_) => {
-                     // Evaluation failed (NaN?)
-                     loop_lambda *= lambda_factor;
+                    // Evaluation failed (NaN?)
+                    loop_lambda *= lambda_factor;
                 }
             }
         } // end loop (lambda search)
     }
-
-
 
     let state = final_state.ok_or(EstimationError::PirlsDidNotConverge {
         max_iterations: options.max_iterations,
@@ -1495,12 +1493,7 @@ pub fn fit_model_for_fixed_rho<'a>(
     let eb: &Array2<f64> = eb_cow.as_ref();
 
     let reparam_result = if let Some(invariant) = reparam_invariant {
-        stable_reparameterization_with_invariant(
-            rs_original,
-            &lambdas.to_vec(),
-            layout,
-            invariant,
-        )?
+        stable_reparameterization_with_invariant(rs_original, &lambdas.to_vec(), layout, invariant)?
     } else {
         stable_reparameterization(rs_original, &lambdas.to_vec(), layout)?
     };
@@ -1519,16 +1512,15 @@ pub fn fit_model_for_fixed_rho<'a>(
         .as_ref()
         .map(|matrix| maybe_sparse_design(matrix));
 
-    let x_original_sparse = if use_explicit { None } else { x_original_sparse };
+    let x_original_sparse = if use_explicit {
+        None
+    } else {
+        x_original_sparse
+    };
 
     let eb_rows = eb.nrows();
     let e_rows = reparam_result.e_transformed.nrows();
-    let mut workspace = PirlsWorkspace::new(
-        x.nrows(),
-        x.ncols(),
-        eb_rows,
-        e_rows,
-    );
+    let mut workspace = PirlsWorkspace::new(x.nrows(), x.ncols(), eb_rows, e_rows);
 
     if matches!(link_function, LinkFunction::Identity) {
         let x_transformed_dense = x_transformed_dense
@@ -1575,7 +1567,8 @@ pub fn fit_model_for_fixed_rho<'a>(
             }
         }
         if ridge_used > 0.0 {
-            let ridge_penalty = ridge_used * beta_transformed.as_ref().dot(beta_transformed.as_ref());
+            let ridge_penalty =
+                ridge_used * beta_transformed.as_ref().dot(beta_transformed.as_ref());
             penalty_term += ridge_penalty;
             gradient += &beta_transformed.as_ref().mapv(|v| ridge_used * v);
         }
@@ -1644,10 +1637,14 @@ pub fn fit_model_for_fixed_rho<'a>(
         workspace,
         link_function,
         config.firth_bias_reduction && matches!(link_function, LinkFunction::Logit),
-        if use_explicit { None } else { Some(reparam_result.qs.clone()) },
+        if use_explicit {
+            None
+        } else {
+            Some(reparam_result.qs.clone())
+        },
         quad_ctx,
     );
-    
+
     // Apply integrated (GHQ) likelihood if per-observation SE is provided.
     // This is used by the calibrator to coherently account for base prediction uncertainty.
     if let Some(se) = covariate_se {
@@ -1657,11 +1654,12 @@ pub fn fit_model_for_fixed_rho<'a>(
     let beta_guess_original = warm_start_beta
         .filter(|beta| beta.len() == layout.total_coeffs)
         .map(|beta| beta.to_owned())
-        .unwrap_or_else(|| Coefficients::new(default_beta_guess(layout, link_function, y, prior_weights)));
+        .unwrap_or_else(|| {
+            Coefficients::new(default_beta_guess(layout, link_function, y, prior_weights))
+        });
     let initial_beta = reparam_result.qs.t().dot(beta_guess_original.as_ref());
 
-    let firth_active =
-        config.firth_bias_reduction && matches!(link_function, LinkFunction::Logit);
+    let firth_active = config.firth_bias_reduction && matches!(link_function, LinkFunction::Logit);
     let options = WorkingModelPirlsOptions {
         // Firth logit fits often need more inner iterations to settle.
         max_iterations: if firth_active {
@@ -1836,12 +1834,6 @@ fn sparse_from_dense_view(x: ArrayView2<f64>) -> Option<DesignMatrix> {
         .map(DesignMatrix::Sparse)
 }
 
-
-
-
-
-
-
 /// Insert zero rows into a vector at locations specified by `drop_indices`.
 /// This is a direct translation of `undrop_rows` from mgcv's C code:
 ///
@@ -1970,14 +1962,14 @@ pub fn update_glm_vectors(
                 let e = eta[i].clamp(-700.0, 700.0);
                 let mu_i = (1.0 / (1.0 + (-e).exp())).clamp(PROB_EPS, 1.0 - PROB_EPS);
                 mu[i] = mu_i;
-                
+
                 // dmu/deta = mu(1-mu)
                 let dmu = mu_i * (1.0 - mu_i);
-                
+
                 // Fisher weight with floor
                 let fisher_w = dmu.max(MIN_WEIGHT);
                 weights[i] = prior_weights[i] * fisher_w;
-                
+
                 // Working response
                 let denom = dmu.max(MIN_D_FOR_Z);
                 z[i] = e + (y[i] - mu_i) / denom;
@@ -2016,7 +2008,6 @@ pub fn update_glm_vectors_integrated(
     weights: &mut Array1<f64>,
     z: &mut Array1<f64>,
 ) {
-    
     const MIN_WEIGHT: f64 = 1e-12;
     const MIN_D_FOR_Z: f64 = 1e-6;
     const PROB_EPS: f64 = 1e-8;
@@ -2025,13 +2016,13 @@ pub fn update_glm_vectors_integrated(
     for i in 0..n {
         let e = eta[i].clamp(-700.0, 700.0);
         let se_i = se[i].max(0.0);
-        
+
         // Integrated probability and derivative via GHQ
         let (mu_i, dmu_deta) =
             crate::calibrate::quadrature::logit_posterior_mean_with_deriv(quad_ctx, e, se_i);
         let mu_clamped = mu_i.clamp(PROB_EPS, 1.0 - PROB_EPS);
         mu[i] = mu_clamped;
-        
+
         // General IRLS weight formula (not canonical shortcut):
         // W = prior × (dμ/dη)² / Var(Y|μ)
         // For Bernoulli: Var(Y|μ) = μ(1-μ)
@@ -2039,7 +2030,7 @@ pub fn update_glm_vectors_integrated(
         let dmu_sq = dmu_deta * dmu_deta;
         let fisher_w = (dmu_sq / variance).max(MIN_WEIGHT);
         weights[i] = prior_weights[i] * fisher_w;
-        
+
         // Working response using general formula:
         // z = η + (y - μ) / (dμ/dη)
         let denom = dmu_deta.max(MIN_D_FOR_Z);
@@ -2103,9 +2094,6 @@ pub struct StablePLSResult {
     /// Ridge added to ensure the SPD solve is well-posed.
     pub ridge_used: f64,
 }
-
-
-
 
 pub fn solve_penalized_least_squares(
     x_transformed: ArrayView2<f64>, // The TRANSFORMED design matrix
@@ -2263,10 +2251,9 @@ pub fn solve_penalized_least_squares(
                     }
                     m
                 };
-                let ldlt = FaerLdlt::new(h_reg_view.as_ref(), Side::Lower)
-                    .map_err(|_| EstimationError::LinearSystemSolveFailed(
-                        FaerLinalgError::FactorizationFailed,
-                    ))?;
+                let ldlt = FaerLdlt::new(h_reg_view.as_ref(), Side::Lower).map_err(|_| {
+                    EstimationError::LinearSystemSolveFailed(FaerLinalgError::FactorizationFailed)
+                })?;
                 let sol_mat: faer::Mat<f64> = ldlt.solve(&rhs_mat);
                 let mut b = Array1::zeros(p_dim);
                 for i in 0..p_dim {
@@ -2312,14 +2299,7 @@ pub fn solve_penalized_least_squares(
     // Re-use `regularized_hessian` for EDF to consistency.
     let edf = calculate_edf(&regularized_hessian, e_transformed)?;
 
-    let scale = calculate_scale(
-        &beta_vec,
-        x_transformed,
-        y,
-        weights,
-        edf,
-        link_function,
-    );
+    let scale = calculate_scale(&beta_vec, x_transformed, y, weights, edf, link_function);
 
     Ok((
         StablePLSResult {
@@ -2707,7 +2687,7 @@ mod tests {
             z.view(),
             weights.view(),
             offset.view(),
-            &e, 
+            &e,
             &s,
             &mut ws,
             z.view(),
@@ -4174,8 +4154,6 @@ mod tests {
             diff
         );
     }
-
-
 }
 
 /// Ensure positive definiteness by adding a small constant ridge to the diagonal if needed.
@@ -4267,22 +4245,18 @@ fn ensure_positive_definite_with_ridge(
     } else {
         0.0
     };
- 
+
     if hess.cholesky(Side::Lower).is_ok() {
         return Ok(0.0);
     }
- 
+
     if ridge > 0.0 {
         for i in 0..hess.nrows() {
             hess[[i, i]] += ridge;
         }
- 
+
         if hess.cholesky(Side::Lower).is_ok() {
-            log::debug!(
-                "{} stabilized with fixed ridge {:.1e}.",
-                label,
-                ridge
-            );
+            log::debug!("{} stabilized with fixed ridge {:.1e}.", label, ridge);
             return Ok(ridge);
         }
     }

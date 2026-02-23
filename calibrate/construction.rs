@@ -1,4 +1,6 @@
-use crate::calibrate::basis::{self, create_basis, create_bspline_basis_nd_with_knots, BasisOptions, Dense, KnotSource};
+use crate::calibrate::basis::{
+    self, BasisOptions, Dense, KnotSource, create_basis, create_bspline_basis_nd_with_knots,
+};
 use crate::calibrate::data::TrainingData;
 use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd};
@@ -620,7 +622,11 @@ fn build_banded_difference_penalty(
     }
 
     let coeffs: Array1<f64> = Array1::from_iter((0..=order).map(|j| {
-        let sign = if (order - j).is_multiple_of(2) { 1.0 } else { -1.0 };
+        let sign = if (order - j).is_multiple_of(2) {
+            1.0
+        } else {
+            -1.0
+        };
         sign * binomial(order, j) as f64
     }));
     let num_rows = num_basis_functions - order;
@@ -1390,27 +1396,28 @@ pub fn build_design_and_penalty_matrices(
         // Fill null-space columns
         let null_cols = &layout.pc_null_cols[pc_idx];
         if !null_cols.is_empty()
-            && let Some(null_basis) = &pc_null_bases[pc_idx] {
-                if null_basis.nrows() != n_samples {
-                    return Err(EstimationError::LayoutError(format!(
-                        "PC null basis {} has {} rows but expected {} samples",
-                        pc_name,
-                        null_basis.nrows(),
-                        n_samples
-                    )));
-                }
-                if null_basis.ncols() != null_cols.len() {
-                    return Err(EstimationError::LayoutError(format!(
-                        "PC null basis {} has {} columns but layout expects {} columns",
-                        pc_name,
-                        null_basis.ncols(),
-                        null_cols.len()
-                    )));
-                }
-                x_matrix
-                    .slice_mut(s![.., null_cols.clone()])
-                    .assign(null_basis);
+            && let Some(null_basis) = &pc_null_bases[pc_idx]
+        {
+            if null_basis.nrows() != n_samples {
+                return Err(EstimationError::LayoutError(format!(
+                    "PC null basis {} has {} rows but expected {} samples",
+                    pc_name,
+                    null_basis.nrows(),
+                    n_samples
+                )));
             }
+            if null_basis.ncols() != null_cols.len() {
+                return Err(EstimationError::LayoutError(format!(
+                    "PC null basis {} has {} columns but layout expects {} columns",
+                    pc_name,
+                    null_basis.ncols(),
+                    null_cols.len()
+                )));
+            }
+            x_matrix
+                .slice_mut(s![.., null_cols.clone()])
+                .assign(null_basis);
+        }
         // Fill penalized range-space columns
         for block in &layout.penalty_map {
             if block.term_name == format!("f({pc_name})") {
@@ -1718,7 +1725,9 @@ pub fn build_design_and_penalty_matrices(
             interaction_centering_means.insert(interaction_key.clone(), zeros);
 
             // Assign the orthogonalized tensor block to design matrix (no extra centering)
-            x_matrix.slice_mut(s![.., col_range.clone()]).assign(&tensor_orth);
+            x_matrix
+                .slice_mut(s![.., col_range.clone()])
+                .assign(&tensor_orth);
 
             // Anisotropic penalty construction (projected)
             // This is done HERE because we need `alpha` to project the penalty matrices
@@ -1791,8 +1800,10 @@ pub fn build_design_and_penalty_matrices(
                 let pc_range_offset = current_offset;
 
                 // Extract Alpha blocks
-                let alpha_pgs = alpha.slice(s![pgs_main_offset..pgs_main_offset + pgs_main_len, ..]);
-                let alpha_pc_null = alpha.slice(s![pc_null_offset..pc_null_offset + pc_null_len, ..]);
+                let alpha_pgs =
+                    alpha.slice(s![pgs_main_offset..pgs_main_offset + pgs_main_len, ..]);
+                let alpha_pc_null =
+                    alpha.slice(s![pc_null_offset..pc_null_offset + pc_null_len, ..]);
                 let alpha_pc_range =
                     alpha.slice(s![pc_range_offset..pc_range_offset + pc_range_len, ..]);
 
@@ -1845,7 +1856,10 @@ pub fn build_design_and_penalty_matrices(
                 // We need the penalty on the full PC main effect basis (null + range).
                 // Reconstruct PC main penalty on (null|range) basis.
                 let s_pc_main_unc = diff_penalty_cache
-                    .get(pc_unconstrained_bases_main[pc_idx].ncols(), config.penalty_order)?
+                    .get(
+                        pc_unconstrained_bases_main[pc_idx].ncols(),
+                        config.penalty_order,
+                    )?
                     .as_dense()
                     .clone();
                 // Transform to (Null | Range) space
@@ -1853,11 +1867,10 @@ pub fn build_design_and_penalty_matrices(
                 let z_null = &pc_null_transforms[pc_name];
                 let z_range = range_transforms.get(pc_name).unwrap();
                 let z_total = if z_null.ncols() > 0 {
-                    let mut combined = Array2::zeros((z_null.nrows(), z_null.ncols() + z_range.ncols()));
+                    let mut combined =
+                        Array2::zeros((z_null.nrows(), z_null.ncols() + z_range.ncols()));
                     combined.slice_mut(s![.., 0..z_null.ncols()]).assign(z_null);
-                    combined
-                        .slice_mut(s![.., z_null.ncols()..])
-                        .assign(z_range);
+                    combined.slice_mut(s![.., z_null.ncols()..]).assign(z_range);
                     combined
                 } else {
                     z_range.clone()
@@ -1900,10 +1913,7 @@ pub fn build_design_and_penalty_matrices(
                 // The null penalty targets interaction terms (p*z). Main effects have zero
                 // energy in this metric since they lack interaction structure. Therefore
                 // projection has no effect: S_null_proj ≈ S_null_raw. We use the raw form.
-                let s_null_raw = kronecker_product(
-                    &pgs_null_projector,
-                    pc_null_projector,
-                );
+                let s_null_raw = kronecker_product(&pgs_null_projector, pc_null_projector);
 
                 // Calculate norms on the PROJECTED matrices
                 let nf1 = frobenius_norm(&s_pgs_proj).max(1e-12);
@@ -2200,10 +2210,7 @@ pub fn precompute_reparam_invariant(
     }
 
     let rs_faer: Vec<Mat<f64>> = rs_list.iter().map(array_to_faer).collect();
-    let s_original_list: Vec<Mat<f64>> = rs_faer
-        .iter()
-        .map(penalty_from_root_faer)
-        .collect();
+    let s_original_list: Vec<Mat<f64>> = rs_faer.iter().map(penalty_from_root_faer).collect();
 
     let mut s_balanced = Mat::<f64>::zeros(p, p);
     let mut has_nonzero = false;
@@ -2349,7 +2356,7 @@ pub fn stable_reparameterization_with_invariant(
             rs_transformed: vec![],
             rs_transposed: vec![],
             e_transformed: Array2::zeros((0, p)),
-            u_truncated: Array2::zeros((p, p)),  // All modes truncated when no penalties
+            u_truncated: Array2::zeros((p, p)), // All modes truncated when no penalties
         });
     }
 
@@ -2362,7 +2369,7 @@ pub fn stable_reparameterization_with_invariant(
             rs_transformed: rs_list.to_vec(),
             rs_transposed: rs_list.iter().map(transpose_owned).collect(),
             e_transformed: Array2::zeros((0, p)),
-            u_truncated: Array2::zeros((p, p)),  // All modes truncated when zero penalty
+            u_truncated: Array2::zeros((p, p)), // All modes truncated when zero penalty
         });
     }
 
@@ -2498,21 +2505,23 @@ pub fn stable_reparameterization_with_invariant(
 
     // Use FIXED structural rank from invariant (ensures smooth objective)
     let structural_rank = penalized_rank.min(sorted_eigs.len());
-    let selected_eigs: Vec<(usize, f64)> = sorted_eigs.iter().take(structural_rank).cloned().collect();
+    let selected_eigs: Vec<(usize, f64)> =
+        sorted_eigs.iter().take(structural_rank).cloned().collect();
 
     // Relative floor for log_det: clamp small eigenvalues to avoid ln(noise)
     // This is applied when computing log_det, NOT when selecting rank
     let max_eig = sorted_eigs.first().map(|(_, v)| *v).unwrap_or(1.0);
     let eigenvalue_floor = max_eig * 1e-12;
-    
+
     // Extract truncated eigenvector indices (those NOT in selected_eigs)
     // These span the null space and are needed for gradient correction
-    let truncated_indices: Vec<usize> = sorted_eigs.iter()
+    let truncated_indices: Vec<usize> = sorted_eigs
+        .iter()
         .skip(structural_rank)
         .map(|&(idx, _)| idx)
         .collect();
     let truncated_count = truncated_indices.len();
-    
+
     // Build u_truncated matrix (p × truncated_count)
     let mut u_truncated_mat = Mat::<f64>::zeros(p, truncated_count);
     for (col_out, &col_in) in truncated_indices.iter().enumerate() {
@@ -2520,7 +2529,7 @@ pub fn stable_reparameterization_with_invariant(
             u_truncated_mat[(row, col_out)] = s_eigenvectors[(row, col_in)];
         }
     }
-    
+
     // Use relative floor for eigenvalue clamping (prevents ln(noise) without changing rank)
     // eigenvalue_floor = max_eig * 1e-12 ensures bounded contribution from noise modes
 
@@ -2574,13 +2583,13 @@ pub fn stable_reparameterization_with_invariant(
 
     // Rebuild s_transformed from e_transformed to ensure rank consistency.
     //
-    // The sum of λ*S_k may contain numerical noise modes (eigenvalues ~1e-15) that 
-    // become significant when λ is large (e.g., 10^12). These modes would appear in H 
+    // The sum of λ*S_k may contain numerical noise modes (eigenvalues ~1e-15) that
+    // become significant when λ is large (e.g., 10^12). These modes would appear in H
     // but are truncated from log|S|_+, creating a "phantom penalty" in the objective.
     //
     // By reconstructing s_transformed = E^T * E, we force the penalty matrix used
     // in H to have the EXACT same rank structure as the one used for log|S|_+.
-    // Any mode truncated from the prior is now strictly zero in the Hessian 
+    // Any mode truncated from the prior is now strictly zero in the Hessian
     // calculation, ensuring mathematical consistency of the gradients.
     let mut s_truncated = Mat::<f64>::zeros(p, p);
     matmul(
@@ -3000,7 +3009,9 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(12345);
 
         // Generate PGS data (standard normal)
-        let p: Array1<f64> = (0..n_samples).map(|_| rng.random_range(-2.0..2.0)).collect();
+        let p: Array1<f64> = (0..n_samples)
+            .map(|_| rng.random_range(-2.0..2.0))
+            .collect();
 
         // Generate PC data if requested
         let pcs = if num_pcs > 0 {
@@ -3265,12 +3276,8 @@ mod tests {
         let alpha_pc_range = alpha.slice(s![pc_range_offset..pc_range_offset + pc_range_len, ..]);
 
         // PGS projected penalty
-        let s_pgs_main_unc = create_difference_penalty_matrix(
-            pgs_cols,
-            config.penalty_order,
-            None,
-        )
-        .expect("PGS main penalty");
+        let s_pgs_main_unc = create_difference_penalty_matrix(pgs_cols, config.penalty_order, None)
+            .expect("PGS main penalty");
         let s_pgs_main_constrained = pgs_z_transform
             .t()
             .dot(&s_pgs_main_unc.dot(pgs_z_transform));
@@ -3305,12 +3312,9 @@ mod tests {
         } else {
             pc_range_transform.clone()
         };
-        let s_pc_main_unc = create_difference_penalty_matrix(
-            pc_basis_unc.ncols() - 1,
-            config.penalty_order,
-            None,
-        )
-        .expect("PC main penalty");
+        let s_pc_main_unc =
+            create_difference_penalty_matrix(pc_basis_unc.ncols() - 1, config.penalty_order, None)
+                .expect("PC main penalty");
         let s_pc_main_constrained = z_total.t().dot(&s_pc_main_unc.dot(&z_total));
         let mut alpha_pc = Array2::zeros((pc_null_len + pc_range_len, alpha.ncols()));
         if pc_null_len > 0 {
@@ -3388,9 +3392,12 @@ mod tests {
             Some(data.weights.view()),
         )
         .expect("sum-to-zero transform");
-        let s_pgs =
-            create_difference_penalty_matrix(pgs_main_basis_unc.ncols(), config.penalty_order, None)
-                .expect("PGS penalty");
+        let s_pgs = create_difference_penalty_matrix(
+            pgs_main_basis_unc.ncols(),
+            config.penalty_order,
+            None,
+        )
+        .expect("PGS penalty");
         let s_sex_pgs_wiggle = z_transform.t().dot(&s_pgs.dot(&z_transform));
         let s_sex_pgs_wiggle_block = &s_list[sex_pgs_block.penalty_indices[0]];
         let sex_range = sex_pgs_block.col_range.clone();
@@ -3799,8 +3806,7 @@ mod tests {
 
         // Capture penalty_structs (10th element) instead of s_list (2nd element which is dense matrices)
         let (_, _, layout, _, _, _, _, _, _, penalty_structs) =
-            build_design_and_penalty_matrices(&data, &config)
-                .expect("construction success");
+            build_design_and_penalty_matrices(&data, &config).expect("construction success");
 
         let ib = layout.interaction_block_idx[0];
         let block = &layout.penalty_map[ib];
@@ -3825,7 +3831,9 @@ mod tests {
                 density
             );
         } else {
-            panic!("Anisotropic penalty should be Dense after projection, but found another representation");
+            panic!(
+                "Anisotropic penalty should be Dense after projection, but found another representation"
+            );
         }
     }
 

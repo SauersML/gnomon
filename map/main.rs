@@ -1,10 +1,10 @@
-use super::prefit::{self, BuiltinModelError};
 use super::fit::{FitOptions, HwePcaError, HwePcaModel, LdConfig, LdWindow};
 use super::io::{
     DatasetOutputError, GenotypeDataset, GenotypeIoError, ProjectionOutputPaths, SelectionPlan,
     load_hwe_model, save_fit_summary, save_hwe_model, save_projection_results,
     save_sample_manifest,
 };
+use super::prefit::{self, BuiltinModelError};
 use super::progress::{fit_progress, projection_progress};
 use super::project::ProjectionOptions;
 use super::variant_filter::{VariantFilter, VariantKey, VariantListError};
@@ -383,13 +383,15 @@ fn run_project(genotype_path: &Path, model_name: Option<&str>) -> Result<(), Map
             }
         }
     } else if let Some(known) = dataset.variant_count_hint()
-        && known > 0 && known != model.n_variants() {
-            return Err(MapDriverError::InvalidState(format!(
-                "Model expects {} variants but dataset provides {}",
-                model.n_variants(),
-                known
-            )));
-        }
+        && known > 0
+        && known != model.n_variants()
+    {
+        return Err(MapDriverError::InvalidState(format!(
+            "Model expects {} variants but dataset provides {}",
+            model.n_variants(),
+            known
+        )));
+    }
 
     let mut source = dataset.block_source_with_plan(selection_plan)?;
     let options = ProjectionOptions::default();

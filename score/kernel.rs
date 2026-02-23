@@ -9,8 +9,7 @@
 // It functions as a "Virtual Machine" that executes a pre-compiled plan, containing
 // zero scientific logic, branches, or decisions.
 
-use std::simd::{Simd, f32x8};
-use std::simd::num::SimdUint;
+use std::simd::f32x8;
 
 // --- Type Aliases for Readability ---
 // These types are part of the public API of the kernel.
@@ -82,37 +81,6 @@ impl<'a> PaddedInterleavedWeights<'a> {
     }
 }
 
-/// A validated, type-safe, zero-cost view over a slice representing a padded,
-/// interleaved matrix of `u8` flags.
-pub struct PaddedInterleavedFlags<'a> {
-    slice: &'a [u8],
-    stride: usize,
-}
-
-impl<'a> PaddedInterleavedFlags<'a> {
-    /// Creates a new, validated `PaddedInterleavedFlags` view over a slice.
-    #[inline]
-    pub fn new(slice: &'a [u8], num_rows: usize, num_scores: usize) -> Result<Self, &'static str> {
-        let stride = num_scores.div_ceil(LANE_COUNT) * LANE_COUNT;
-        if slice.len() != num_rows * stride {
-            return Err(
-                "Mismatched flag matrix data: slice.len() does not equal num_rows * calculated_stride",
-            );
-        }
-        Ok(Self { slice, stride })
-    }
-
-    /// Fetches the i-th SIMD vector of flags for a given matrix row.
-    ///
-    /// # Safety
-    /// The caller MUST guarantee that `row_idx` is a valid row index and `lane_idx` is valid.
-    #[inline(always)]
-    unsafe fn get_simd_lane_unchecked(&self, row_idx: usize, lane_idx: usize) -> Simd<u8, 8> {
-        let offset = (row_idx * self.stride) + (lane_idx * LANE_COUNT);
-        unsafe { Simd::from_slice(self.slice.get_unchecked(offset..offset + LANE_COUNT)) }
-    }
-}
-
 // ========================================================================================
 //                              The kernel implementation
 // ========================================================================================
@@ -128,12 +96,11 @@ const MAX_KERNEL_ACCUMULATOR_LANES: usize = 100_usize.div_ceil(LANE_COUNT);
 ///
 /// # Safety
 /// The caller must uphold the contract that all indices in `g1_indices` and `g2_indices`
-/// are valid row indices for the `weights` and `flip_flags` matrices, which represent
+/// are valid row indices for the `weights` matrix, which represents
 /// a view of a single mini-batch.
 #[inline]
 pub fn accumulate_adjustments_for_person(
     weights: &PaddedInterleavedWeights,
-    flip_flags: &PaddedInterleavedFlags,
     g1_indices: &[u16],
     g2_indices: &[u16],
 ) -> [SimdVec; MAX_KERNEL_ACCUMULATOR_LANES] {
@@ -144,20 +111,13 @@ pub fn accumulate_adjustments_for_person(
     let mut accumulator_buffer = [SimdVec::splat(0.0); MAX_KERNEL_ACCUMULATOR_LANES];
 
     // --- Loop 1: Dosage=1 Adjustments ---
-    let two = SimdVec::splat(2.0);
-    let one = SimdVec::splat(1.0);
     for &matrix_row_idx in g1_indices {
         let matrix_row_idx = matrix_row_idx as usize;
         // This inner loop over score columns is the same performant structure as the original kernel.
         for i in 0..num_accumulator_lanes {
             unsafe {
                 let weights_vec = weights.get_simd_lane_unchecked(matrix_row_idx, i);
-                let flip_vec = flip_flags
-                    .get_simd_lane_unchecked(matrix_row_idx, i)
-                    .cast::<f32>();
-                let sign = one - (two * flip_vec);
-                let adj = sign * weights_vec;
-                *accumulator_buffer.get_unchecked_mut(i) += adj;
+                *accumulator_buffer.get_unchecked_mut(i) += weights_vec;
             }
         }
     }
@@ -168,12 +128,7 @@ pub fn accumulate_adjustments_for_person(
         for i in 0..num_accumulator_lanes {
             unsafe {
                 let weights_vec = weights.get_simd_lane_unchecked(matrix_row_idx, i);
-                let flip_vec = flip_flags
-                    .get_simd_lane_unchecked(matrix_row_idx, i)
-                    .cast::<f32>();
-                let sign = one - (two * flip_vec);
-                let signed_weights = sign * weights_vec;
-                let adj = signed_weights + signed_weights;
+                let adj = weights_vec + weights_vec;
                 *accumulator_buffer.get_unchecked_mut(i) += adj;
             }
         }

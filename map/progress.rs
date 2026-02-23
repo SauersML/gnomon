@@ -520,12 +520,13 @@ impl CiStageState {
         }
 
         if let Some(total) = self.total
-            && total > 0 {
-                let current_percent = (self.processed as f64 / total as f64) * 100.0;
-                if current_percent - self.last_log_percent >= CI_LOG_PERCENT_THRESHOLD {
-                    return true;
-                }
+            && total > 0
+        {
+            let current_percent = (self.processed as f64 / total as f64) * 100.0;
+            if current_percent - self.last_log_percent >= CI_LOG_PERCENT_THRESHOLD {
+                return true;
             }
+        }
 
         false
     }
@@ -533,9 +534,10 @@ impl CiStageState {
     fn mark_logged(&mut self) {
         self.last_log_time = Instant::now();
         if let Some(total) = self.total
-            && total > 0 {
-                self.last_log_percent = (self.processed as f64 / total as f64) * 100.0;
-            }
+            && total > 0
+        {
+            self.last_log_percent = (self.processed as f64 / total as f64) * 100.0;
+        }
     }
 
     fn format_progress(&self, stage: FitProgressStage) -> String {
@@ -627,9 +629,11 @@ impl FitProgressObserver for CiFitProgress {
     fn on_stage_estimate(&self, stage: FitProgressStage, estimated_total: usize) {
         let mut inner = self.inner.lock().unwrap();
         if let Some(state) = inner.get_mut(&stage)
-            && state.total.is_none() && estimated_total > 0 {
-                state.total = Some(estimated_total);
-            }
+            && state.total.is_none()
+            && estimated_total > 0
+        {
+            state.total = Some(estimated_total);
+        }
     }
 
     fn on_stage_total(&self, stage: FitProgressStage, total_variants: usize) {
@@ -661,25 +665,26 @@ impl FitProgressObserver for CiFitProgress {
         let mut inner = self.inner.lock().unwrap();
         if let Some(state) = inner.get_mut(&stage)
             && let Some(total) = total_bytes
-                && total > 0 {
-                    // Approximate variant progress from bytes
-                    let approx_variants = if let Some(variant_total) = state.total {
-                        ((processed_bytes as f64 / total as f64) * variant_total as f64) as usize
-                    } else {
-                        processed_bytes as usize
-                    };
-                    state.processed = approx_variants;
-                    if state.should_log() {
-                        let msg = format!(
-                            "[PCA] {} ({} / {} read)",
-                            ConsoleFitProgress::stage_message(stage),
-                            HumanBytes(processed_bytes),
-                            HumanBytes(total)
-                        );
-                        println!("{}", msg);
-                        state.mark_logged();
-                    }
-                }
+            && total > 0
+        {
+            // Approximate variant progress from bytes
+            let approx_variants = if let Some(variant_total) = state.total {
+                ((processed_bytes as f64 / total as f64) * variant_total as f64) as usize
+            } else {
+                processed_bytes as usize
+            };
+            state.processed = approx_variants;
+            if state.should_log() {
+                let msg = format!(
+                    "[PCA] {} ({} / {} read)",
+                    ConsoleFitProgress::stage_message(stage),
+                    HumanBytes(processed_bytes),
+                    HumanBytes(total)
+                );
+                println!("{}", msg);
+                state.mark_logged();
+            }
+        }
     }
 
     fn on_stage_finish(&self, stage: FitProgressStage) {

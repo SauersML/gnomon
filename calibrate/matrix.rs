@@ -36,10 +36,7 @@ impl DesignMatrix {
     pub fn to_csr_cache(&self) -> Option<SparseRowMat<usize, f64>> {
         match self {
             Self::Dense(_) => None,
-            Self::Sparse(matrix) => matrix
-                .as_ref()
-                .to_row_major()
-                .ok(),
+            Self::Sparse(matrix) => matrix.as_ref().to_row_major().ok(),
         }
     }
 

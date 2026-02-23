@@ -1,4 +1,4 @@
-use crate::calibrate::basis::{self, create_basis, BasisOptions, Dense, KnotSource};
+use crate::calibrate::basis::{self, BasisOptions, Dense, KnotSource, create_basis};
 use crate::calibrate::construction::ModelLayout;
 use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::hull::PeeledHull;
@@ -643,9 +643,10 @@ impl TrainedModel {
         };
 
         // Check if smoothing correction is available and compatible
-        let v_corr = self.smoothing_correction.as_ref().filter(|v| {
-            v.nrows() == x_new.ncols() && v.ncols() == x_new.ncols()
-        });
+        let v_corr = self
+            .smoothing_correction
+            .as_ref()
+            .filter(|v| v.nrows() == x_new.ncols() && v.ncols() == x_new.ncols());
 
         let mut vars = Array1::zeros(x_new.nrows());
         for i in 0..x_new.nrows() {
@@ -668,7 +669,7 @@ impl TrainedModel {
             // Scaling var_corr again would give y⁴ units - a catastrophic error!
             vars[i] = if link_function == LinkFunction::Identity {
                 let scale = self.scale.unwrap_or(1.0);
-                (var_base * scale) + var_corr  // Scale ONLY the base variance
+                (var_base * scale) + var_corr // Scale ONLY the base variance
             } else {
                 // For GLMs, both terms already have correct units
                 var_base + var_corr
@@ -695,7 +696,8 @@ impl TrainedModel {
             KnotSource::Provided(joint.knot_vector.view()),
             joint.degree,
             BasisOptions::value(),
-        ).ok()?;
+        )
+        .ok()?;
         let mut raw = basis.as_ref().clone();
         // Math note: to avoid a C^1 discontinuity from hard clamping, extend the basis
         // linearly outside [0,1]: B_ext(z_raw) = B(z_c) + (z_raw - z_c) * B'(z_c).
@@ -779,7 +781,9 @@ impl TrainedModel {
                 &mut deriv_raw,
                 &mut lower_basis,
                 &mut lower_scratch,
-            ).is_err() {
+            )
+            .is_err()
+            {
                 continue;
             }
 
@@ -798,14 +802,14 @@ impl TrainedModel {
     }
 
     /// Compute SE for joint model using the full joint Hessian.
-    /// 
+    ///
     /// For joint models η = g(Xβ; θ) = Xβ + B(z)θ where z = (u - min)/(max - min) and u = Xβ,
     /// the full variance propagation is:
-    /// 
+    ///
     ///   Var(η_i) = J_i^T H_joint^{-1} J_i
-    /// 
+    ///
     /// where J_i = [g'(u_i) × x_i, b_i] is the Jacobian row.
-    /// 
+    ///
     /// This properly accounts for uncertainty in BOTH β and θ, not just the simplified
     /// g'×SE approximation which ignores Var(θ).
     fn compute_joint_se_from_hessian(
@@ -819,20 +823,20 @@ impl TrainedModel {
         let p_base = x_new.ncols();
         let p_link = joint.beta_link.len();
         let dim = p_base + p_link;
-        
+
         // Check dimensions: joint Hessian should be (p_base + p_link) × (p_base + p_link)
         if h.nrows() != dim || h.ncols() != dim {
             // Fall back to base-only SE propagation if dimension mismatch
             return None;
         }
-        
+
         use crate::calibrate::faer_ndarray::FaerCholesky;
         use faer::Side;
         let chol = match h.clone().cholesky(Side::Lower) {
             Ok(c) => c,
             Err(_) => return None,
         };
-        
+
         let n = x_new.nrows();
         let b_wiggle = self.build_joint_link_basis(eta_base, joint)?;
         if b_wiggle.ncols() != p_link {
@@ -866,14 +870,11 @@ impl TrainedModel {
                 var_i
             };
         }
-        
+
         Some(vars.mapv(|v| v.max(0.0).sqrt()))
     }
 
-    fn mcmc_mean_logit_predictions(
-        &self,
-        x_new: &Array2<f64>,
-    ) -> Result<Array1<f64>, ModelError> {
+    fn mcmc_mean_logit_predictions(&self, x_new: &Array2<f64>) -> Result<Array1<f64>, ModelError> {
         const ROW_CHUNK_SIZE: usize = 2048;
         let samples = self.mcmc_samples.as_ref().ok_or_else(|| {
             ModelError::DimensionMismatch("MCMC samples missing for logit prediction.".to_string())
@@ -917,12 +918,12 @@ impl TrainedModel {
     }
 
     /// Compute mean η and SE η directly from MCMC samples for coherent uncertainty.
-    /// 
+    ///
     /// Unlike the previous approach which computed logit(E[σ(η)]) and paired it with
     /// Hessian-based SE (an incoherent pairing), this computes:
     ///   - mean_eta = E[η] = (1/S) Σ_s (X β_s)
     ///   - se_eta = sqrt(Var[η]) = sqrt((1/S) Σ_s (X β_s - mean_eta)²)
-    /// 
+    ///
     /// This provides a coherent (mean, variance) summary on the logit scale.
     fn mcmc_mean_and_se_eta(
         &self,
@@ -934,12 +935,15 @@ impl TrainedModel {
         })?;
         let n_samples = samples.nrows();
         if n_samples == 0 {
-            return Err(ModelError::DimensionMismatch("MCMC samples are empty.".to_string()));
+            return Err(ModelError::DimensionMismatch(
+                "MCMC samples are empty.".to_string(),
+            ));
         }
         if samples.ncols() != x_new.ncols() {
             return Err(ModelError::DimensionMismatch(format!(
                 "MCMC sample width {} does not match design columns {}",
-                samples.ncols(), x_new.ncols()
+                samples.ncols(),
+                x_new.ncols()
             )));
         }
 
@@ -947,14 +951,14 @@ impl TrainedModel {
         let mut sum_eta = Array1::<f64>::zeros(n);
         let mut sum_eta_sq = Array1::<f64>::zeros(n);
         let mut sum_prob = Array1::<f64>::zeros(n);
-        
+
         let samples_t = samples.t();
         let mut start = 0;
         while start < n {
             let end = (start + ROW_CHUNK_SIZE).min(n);
             let x_chunk = x_new.slice(s![start..end, ..]);
             let etas = x_chunk.dot(&samples_t); // [chunk_size, n_samples]
-            
+
             for (i, row) in etas.outer_iter().enumerate() {
                 let idx = start + i;
                 for &eta_s in row.iter() {
@@ -966,18 +970,18 @@ impl TrainedModel {
             }
             start = end;
         }
-        
+
         let scale = 1.0 / (n_samples as f64);
         let mean_eta = sum_eta.mapv(|v| v * scale);
         let mean_prob = sum_prob.mapv(|v| (v * scale).clamp(1e-8, 1.0 - 1e-8));
-        
+
         // Var[η] = E[η²] - E[η]²
         let mut se_eta = Array1::<f64>::zeros(n);
         for i in 0..n {
             let var_eta = (sum_eta_sq[i] * scale) - (mean_eta[i] * mean_eta[i]);
             se_eta[i] = var_eta.max(0.0).sqrt();
         }
-        
+
         Ok((mean_prob, mean_eta, se_eta))
     }
 
@@ -995,56 +999,73 @@ impl TrainedModel {
         let n_samples = samples.nrows();
         let n_points = x_new.nrows();
         if n_samples == 0 {
-            return Err(ModelError::DimensionMismatch("MCMC samples are empty.".to_string()));
+            return Err(ModelError::DimensionMismatch(
+                "MCMC samples are empty.".to_string(),
+            ));
         }
-        
+
         let p_base = x_new.ncols();
         let p_link = joint.beta_link.len();
         let expected_cols = p_base + p_link;
         if samples.ncols() != expected_cols {
             return Err(ModelError::DimensionMismatch(format!(
                 "Joint MCMC samples have {} cols, expected {} (p_base={}, p_link={})",
-                samples.ncols(), expected_cols, p_base, p_link
+                samples.ncols(),
+                expected_cols,
+                p_base,
+                p_link
             )));
         }
-        
+
         let (min_u, max_u) = joint.knot_range;
         let range_width = (max_u - min_u).max(1e-6);
         let n_raw = joint.knot_vector.len().saturating_sub(joint.degree + 1);
         let n_constrained = joint.link_transform.ncols();
-        
+
         let mut prob_sum = Array1::<f64>::zeros(n_points);
         let mut eta_sum = Array1::<f64>::zeros(n_points);
         let mut eta_sq_sum = Array1::<f64>::zeros(n_points);
         let mut raw = vec![0.0; n_raw];
         let mut constrained = vec![0.0; n_constrained];
         let mut scratch = basis::SplineScratch::new(joint.degree);
-        
+
         for s in 0..n_samples {
             let beta_s = samples.slice(s![s, 0..p_base]);
             let theta_s = samples.slice(s![s, p_base..]);
             let u = x_new.dot(&beta_s.to_owned());
-            
+
             for i in 0..n_points {
                 let u_i = u[i];
                 let z_i = ((u_i - min_u) / range_width).clamp(0.0, 1.0);
-                
+
                 raw.fill(0.0);
                 let eta_i = if basis::evaluate_bspline_basis_scalar(
-                    z_i, joint.knot_vector.view(), joint.degree, &mut raw, &mut scratch
-                ).is_ok() && joint.link_transform.nrows() == n_raw && n_constrained > 0 {
+                    z_i,
+                    joint.knot_vector.view(),
+                    joint.degree,
+                    &mut raw,
+                    &mut scratch,
+                )
+                .is_ok()
+                    && joint.link_transform.nrows() == n_raw
+                    && n_constrained > 0
+                {
                     constrained.fill(0.0);
                     for r in 0..n_raw {
                         let v = raw[r];
-                        for c in 0..n_constrained { constrained[c] += v * joint.link_transform[[r, c]]; }
+                        for c in 0..n_constrained {
+                            constrained[c] += v * joint.link_transform[[r, c]];
+                        }
                     }
                     let mut wiggle = 0.0;
-                    for c in 0..n_constrained.min(theta_s.len()) { wiggle += constrained[c] * theta_s[c]; }
+                    for c in 0..n_constrained.min(theta_s.len()) {
+                        wiggle += constrained[c] * theta_s[c];
+                    }
                     u_i + wiggle
                 } else {
                     u_i
                 };
-                
+
                 let eta_clamped = eta_i.clamp(-700.0, 700.0);
                 let p_i = 1.0 / (1.0 + f64::exp(-eta_clamped));
                 prob_sum[i] += p_i;
@@ -1052,13 +1073,13 @@ impl TrainedModel {
                 eta_sq_sum[i] += eta_i * eta_i;
             }
         }
-        
+
         let ns = n_samples as f64;
         let mean_prob = prob_sum.mapv(|p| (p / ns).clamp(1e-8, 1.0 - 1e-8));
         let mean_eta = eta_sum.mapv(|e| e / ns);
         let var_eta = (&eta_sq_sum / ns) - (&mean_eta * &mean_eta);
         let se_eta = var_eta.mapv(|v| v.max(0.0).sqrt());
-        
+
         Ok((mean_prob, mean_eta, se_eta))
     }
 
@@ -1118,21 +1139,23 @@ impl TrainedModel {
         let eta_base = x_new.dot(&beta);
         let (eta, se_eta_opt) = if let Some(joint) = &self.joint_link {
             // For joint models, first try to use the full joint Hessian for SE
-            let joint_se = self.compute_joint_se_from_hessian(&x_new, &eta_base, joint, link_function);
-            
+            let joint_se =
+                self.compute_joint_se_from_hessian(&x_new, &eta_base, joint, link_function);
+
             // Compute η_cal = u + wiggle(u) (no SE needed from this call since we compute properly above)
             let (eta_cal, _) = self.apply_joint_link_to_eta(&eta_base, None, joint);
-            
+
             // Use joint SE if available, otherwise fall back to simplified propagation
             let final_se = if joint_se.is_some() {
                 joint_se
             } else {
                 // Fall back to base SE propagated through g' (imperfect but better than nothing)
                 let base_se = self.compute_se_eta_from_hessian(&x_new, link_function);
-                let (_, propagated_se) = self.apply_joint_link_to_eta(&eta_base, base_se.as_ref(), joint);
+                let (_, propagated_se) =
+                    self.apply_joint_link_to_eta(&eta_base, base_se.as_ref(), joint);
                 propagated_se
             };
-            
+
             (eta_cal, final_se)
         } else {
             let se = self.compute_se_eta_from_hessian(&x_new, link_function);
@@ -1158,7 +1181,7 @@ impl TrainedModel {
         // This estimate does NOT account for smoothing bias. Penalized splines
         // systematically:
         //   - Flatten peaks (estimates too low at maxima)
-        //   - Fill valleys (estimates too high at minima)  
+        //   - Fill valleys (estimates too high at minima)
         //   - Round sharp corners
         //
         // The conditional CI centered at η̂ ± 1.96·SE will:
@@ -1304,13 +1327,9 @@ impl TrainedModel {
             LinkFunction::Logit => {
                 // Use quadrature if SE is available
                 match se_eta_opt {
-                    Some(se_eta) => {
-                        Ok(crate::calibrate::quadrature::logit_posterior_mean_batch(
-                            &quad_ctx,
-                            &eta,
-                            &se_eta,
-                        ))
-                    }
+                    Some(se_eta) => Ok(crate::calibrate::quadrature::logit_posterior_mean_batch(
+                        &quad_ctx, &eta, &se_eta,
+                    )),
                     None => {
                         // No SE available, fall back to mode
                         Ok(mode_mean)
@@ -1483,7 +1502,9 @@ impl TrainedModel {
 
         let coeffs = &artifacts.coefficients;
         let design_width = coeffs.len();
-        let mortality_width = mortality_model.map(|model| model.coefficients.len()).unwrap_or(0);
+        let mortality_width = mortality_model
+            .map(|model| model.coefficients.len())
+            .unwrap_or(0);
 
         if let Some(samples) = self.mcmc_samples.as_ref() {
             const MCMC_CHUNK_SIZE: usize = 32;
@@ -1504,11 +1525,8 @@ impl TrainedModel {
             // Pre-allocate scratch buffer for zero-allocation loop
             let max_basis = artifacts.age_basis.knot_vector.len().max(100);
             let max_pgs = 10;
-            let mut scratch = survival::SurvivalScratch::new(
-                artifacts.age_basis.degree,
-                max_basis,
-                max_pgs,
-            );
+            let mut scratch =
+                survival::SurvivalScratch::new(artifacts.age_basis.degree, max_basis, max_pgs);
             let mut entry_buf = Array1::<f64>::zeros(design_width);
             let mut exit_buf = Array1::<f64>::zeros(design_width);
 
@@ -1648,17 +1666,17 @@ impl TrainedModel {
                                 }
                                 SurvivalRiskType::Crude => {
                                     let mortality = mortality_ref.expect("checked above");
-                                    let mortality_coeffs = mortality_chunk.as_ref().map(|chunk| chunk.row(j));
-                                    let result =
-                                        survival::calculate_crude_risk_quadrature(
-                                            age_entry_chunk[i],
-                                            age_exit_chunk[i],
-                                            covariates.row(idx),
-                                            artifacts,
-                                            mortality,
-                                            Some(chunk.row(j)),
-                                            mortality_coeffs,
-                                        )?;
+                                    let mortality_coeffs =
+                                        mortality_chunk.as_ref().map(|chunk| chunk.row(j));
+                                    let result = survival::calculate_crude_risk_quadrature(
+                                        age_entry_chunk[i],
+                                        age_exit_chunk[i],
+                                        covariates.row(idx),
+                                        artifacts,
+                                        mortality,
+                                        Some(chunk.row(j)),
+                                        mortality_coeffs,
+                                    )?;
                                     grad_row_opt = Some(result.disease_gradient);
                                     mort_grad_row_opt = Some(result.mortality_gradient);
                                     result.risk
@@ -1671,18 +1689,17 @@ impl TrainedModel {
                             logit_risk_sum[idx] += logit_r;
                             logit_risk_sq_sum[idx] += logit_r * logit_r;
                             let logistic_scale = 1.0 / (risk_clamped * (1.0 - risk_clamped));
-                                match risk_type {
-                                    SurvivalRiskType::Net => {
-                                        let entry_row = design_entry_chunk.row(i);
-                                        let exit_row = design_exit_chunk.row(i);
-                                        let mut grad_acc = gradient.row_mut(idx);
-                                        for k in 0..design_width {
-                                            grad_acc[k] +=
-                                                (exit_row[k] * dr_deta_exit
-                                                    + entry_row[k] * dr_deta_entry)
-                                                    * logistic_scale;
-                                        }
+                            match risk_type {
+                                SurvivalRiskType::Net => {
+                                    let entry_row = design_entry_chunk.row(i);
+                                    let exit_row = design_exit_chunk.row(i);
+                                    let mut grad_acc = gradient.row_mut(idx);
+                                    for k in 0..design_width {
+                                        grad_acc[k] += (exit_row[k] * dr_deta_exit
+                                            + entry_row[k] * dr_deta_entry)
+                                            * logistic_scale;
                                     }
+                                }
                                 SurvivalRiskType::Crude => {
                                     if let Some(mut grad_row) = grad_row_opt {
                                         grad_row.mapv_inplace(|v| v * logistic_scale);
@@ -1792,11 +1809,8 @@ impl TrainedModel {
         // Pre-allocate scratch buffer for zero-allocation loop
         let max_basis = artifacts.age_basis.knot_vector.len().max(100);
         let max_pgs = 10;
-        let mut scratch = survival::SurvivalScratch::new(
-            artifacts.age_basis.degree,
-            max_basis,
-            max_pgs,
-        );
+        let mut scratch =
+            survival::SurvivalScratch::new(artifacts.age_basis.degree, max_basis, max_pgs);
         let mut design_entry = Array1::<f64>::zeros(design_width);
         let mut design_exit = Array1::<f64>::zeros(design_width);
 
@@ -1806,18 +1820,32 @@ impl TrainedModel {
             let entry_age = age_entry[i];
             let exit_age = age_exit[i];
 
-            let hazard_entry_val = survival::cumulative_hazard(entry_age, &cov_row_owned, artifacts)?;
+            let hazard_entry_val =
+                survival::cumulative_hazard(entry_age, &cov_row_owned, artifacts)?;
             let hazard_exit_val = survival::cumulative_hazard(exit_age, &cov_row_owned, artifacts)?;
             hazard_entry[i] = hazard_entry_val;
             hazard_exit[i] = hazard_exit_val;
 
-            let cif_entry_val = survival::cumulative_incidence(entry_age, &cov_row_owned, artifacts)?;
+            let cif_entry_val =
+                survival::cumulative_incidence(entry_age, &cov_row_owned, artifacts)?;
             let cif_exit_val = survival::cumulative_incidence(exit_age, &cov_row_owned, artifacts)?;
             cif_entry[i] = cif_entry_val;
             cif_exit[i] = cif_exit_val;
 
-            survival::design_row_at_age_scratch(entry_age, cov_row, artifacts, &mut design_entry, &mut scratch)?;
-            survival::design_row_at_age_scratch(exit_age, cov_row, artifacts, &mut design_exit, &mut scratch)?;
+            survival::design_row_at_age_scratch(
+                entry_age,
+                cov_row,
+                artifacts,
+                &mut design_entry,
+                &mut scratch,
+            )?;
+            survival::design_row_at_age_scratch(
+                exit_age,
+                cov_row,
+                artifacts,
+                &mut design_exit,
+                &mut scratch,
+            )?;
             if design_entry.len() != design_width || design_exit.len() != design_width {
                 return Err(ModelError::DimensionMismatch(
                     "Survival design reconstruction mismatch".to_string(),
@@ -1827,7 +1855,10 @@ impl TrainedModel {
             let (risk_val, mut grad_row, mut mort_grad_row_opt) = match risk_type {
                 SurvivalRiskType::Net => {
                     let risk = survival::conditional_absolute_risk(
-                        entry_age, exit_age, &cov_row_owned, artifacts,
+                        entry_age,
+                        exit_age,
+                        &cov_row_owned,
+                        artifacts,
                     )?;
 
                     let eta_entry = design_entry.dot(coeffs);
@@ -1868,11 +1899,19 @@ impl TrainedModel {
                 SurvivalRiskType::Crude => {
                     let mortality = mortality_model.expect("checked above");
                     let result = survival::calculate_crude_risk_quadrature(
-                        entry_age, exit_age, cov_row.view(), artifacts, mortality,
+                        entry_age,
+                        exit_age,
+                        cov_row.view(),
+                        artifacts,
+                        mortality,
                         None,
                         None,
                     )?;
-                    (result.risk, result.disease_gradient, Some(result.mortality_gradient))
+                    (
+                        result.risk,
+                        result.disease_gradient,
+                        Some(result.mortality_gradient),
+                    )
                 }
             };
             conditional_risk[i] = risk_val;
@@ -1900,8 +1939,8 @@ impl TrainedModel {
             }
             SurvivalRiskType::Crude => {
                 let disease_factor = artifacts.hessian_factor.as_ref();
-                let mortality_factor = mortality_model
-                    .and_then(|mortality| mortality.hessian_factor.as_ref());
+                let mortality_factor =
+                    mortality_model.and_then(|mortality| mortality.hessian_factor.as_ref());
                 let mortality_grad = mortality_gradient.as_ref();
                 let cross_cov = mortality_model
                     .and_then(|mortality| mortality.cross_covariance_to_primary.as_ref());
@@ -1909,7 +1948,8 @@ impl TrainedModel {
                 let disease_se = disease_factor
                     .map(|factor| survival::delta_method_standard_errors(factor, &gradient))
                     .transpose()?;
-                let mortality_se = if let (Some(mg), Some(mf)) = (mortality_grad, mortality_factor) {
+                let mortality_se = if let (Some(mg), Some(mf)) = (mortality_grad, mortality_factor)
+                {
                     Some(survival::delta_method_standard_errors(mf, mg)?)
                 } else {
                     None
@@ -2799,14 +2839,13 @@ mod tests {
         // --- Calculate the expected result CORRECTLY ---
         // The manual calculation was flawed. Here's the correct way to derive the ground truth:
         // Stage: Generate the raw, unconstrained basis at the test points
-        let (full_basis_unc, _) =
-            create_basis::<Dense>(
-                test_points.view(),
-                KnotSource::Provided(knot_vector.view()),
-                degree,
-                BasisOptions::value(),
-            )
-                .unwrap();
+        let (full_basis_unc, _) = create_basis::<Dense>(
+            test_points.view(),
+            KnotSource::Provided(knot_vector.view()),
+            degree,
+            BasisOptions::value(),
+        )
+        .unwrap();
 
         // Stage: Isolate the main effect part of the basis (all columns except the intercept)
         let pgs_main_basis_unc = full_basis_unc.slice(s![.., 1..]);
@@ -3029,14 +3068,13 @@ mod tests {
             .predict(test_points.view(), sex_points.view(), empty_pcs.view())
             .unwrap();
 
-        let (full_basis_unc, _) =
-            create_basis::<Dense>(
-                test_points.view(),
-                KnotSource::Provided(knot_vector.view()),
-                degree,
-                BasisOptions::value(),
-            )
-                .unwrap();
+        let (full_basis_unc, _) = create_basis::<Dense>(
+            test_points.view(),
+            KnotSource::Provided(knot_vector.view()),
+            degree,
+            BasisOptions::value(),
+        )
+        .unwrap();
         let pgs_main_basis_unc = full_basis_unc.slice(s![.., 1..]);
         let pgs_main_basis_con = pgs_main_basis_unc.dot(&z_transform);
         let coeffs = Array1::from(model.coefficients.main_effects.pgs.clone());
@@ -3595,8 +3633,14 @@ mod tests {
 
         // Stage: Check model configuration
         assert_eq!(
-            loaded_model.config.link_function().expect("link_function called on survival model"),
-            original_model.config.link_function().expect("link_function called on survival model")
+            loaded_model
+                .config
+                .link_function()
+                .expect("link_function called on survival model"),
+            original_model
+                .config
+                .link_function()
+                .expect("link_function called on survival model")
         );
         assert_eq!(
             loaded_model.config.penalty_order,

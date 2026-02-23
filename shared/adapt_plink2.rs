@@ -1121,9 +1121,10 @@ impl ByteRangeSource for VirtualBed {
                 decoder.decode_variant_hardcalls(in_idx, alt_ord, &mut hard, sample_ploidy)?;
 
                 if let Some(kind) = haploidy_kind
-                    && !matches!(kind, HaploidyKind::Diploid) {
-                        enforce_haploidy(&mut hard, &self.sex_by_sample, kind);
-                    }
+                    && !matches!(kind, HaploidyKind::Diploid)
+                {
+                    enforce_haploidy(&mut hard, &self.sex_by_sample, kind);
+                }
 
                 // Pack to bytes and store in cache.
                 let mut block = vec![0u8; self.block_bytes];
@@ -1812,10 +1813,7 @@ fn difflist_pairs(
     if ids.len() != l || vals.len() != l {
         return Err(ioerr("Difflist decode count mismatch"));
     }
-    Ok(ids
-        .into_iter()
-        .zip(vals.into_iter())
-        .collect())
+    Ok(ids.into_iter().zip(vals.into_iter()).collect())
 }
 
 struct PgenDecoder {
@@ -1925,9 +1923,10 @@ impl PgenDecoder {
             return Err(ioerr("Hardcall buffer length must equal sample count"));
         }
         if let Some(ploidy) = sample_ploidy
-            && ploidy.len() != self.n {
-                return Err(ioerr("Sample ploidy length mismatch"));
-            }
+            && ploidy.len() != self.n
+        {
+            return Err(ioerr("Sample ploidy length mismatch"));
+        }
         let idx = in_idx as usize;
         if idx >= self.hdr.m_variants as usize {
             return Err(ioerr("Variant index out of bounds"));

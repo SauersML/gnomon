@@ -270,6 +270,7 @@ pub enum PrepError {
     GenomeBuildMismatch,
     DisjointChromosomes,
     AmbiguousReconciliation(String),
+    Invariant(String),
 }
 
 enum PostMortemAction {
@@ -366,8 +367,10 @@ fn prepare_for_computation_with_retry(
     // These data structures will store the results of the merge-join.
     // Allele strings borrowed from the arena are stored here temporarily.
     // The tuple is (weight, is_flipped, file_idx).
-    let mut simple_path_data: BTreeMap<BimRowIndex, BTreeMap<ScoreColumnIndex, SimpleScoreAssignment>> =
-        BTreeMap::new();
+    let mut simple_path_data: BTreeMap<
+        BimRowIndex,
+        BTreeMap<ScoreColumnIndex, SimpleScoreAssignment>,
+    > = BTreeMap::new();
     // For complex rules, the key is the set of BIM contexts. The value is a tuple
     // containing the canonical chr:pos key for the locus and all score applications.
     let mut intermediate_complex_rules: BTreeMap<
@@ -478,13 +481,17 @@ fn prepare_for_computation_with_retry(
                                 let score_map =
                                     simple_path_data.entry(bim_rec.bim_row_index).or_default();
 
-                                let entry = score_map.entry(score_record.score_column_index).or_insert(
-                                    SimpleScoreAssignment {
+                                let entry = score_map
+                                    .entry(score_record.score_column_index)
+                                    .or_insert(SimpleScoreAssignment {
                                         dosage_weight: 0.0,
                                         missing_correction: 0.0,
-                                    },
+                                    });
+                                apply_simple_score_assignment(
+                                    entry,
+                                    score_record.weight,
+                                    is_flipped,
                                 );
-                                apply_simple_score_assignment(entry, score_record.weight, is_flipped);
                             }
                         }
                         ReconciliationOutcome::Complex(matches) => {
@@ -539,13 +546,14 @@ fn prepare_for_computation_with_retry(
     {
         for (idx, region_opt) in filters.iter().enumerate() {
             if let Some(region) = region_opt
-                && !hit_flags.get(idx).copied().unwrap_or(false) {
-                    let score_name = &score_names[idx];
-                    eprintln!(
-                        "Warning: Score '{score_name}' has no variants within the requested region {region}."
-                    );
-                    diagnostics.record_region_without_hits(score_name);
-                }
+                && !hit_flags.get(idx).copied().unwrap_or(false)
+            {
+                let score_name = &score_names[idx];
+                eprintln!(
+                    "Warning: Score '{score_name}' has no variants within the requested region {region}."
+                );
+                diagnostics.record_region_without_hits(score_name);
+            }
         }
     }
 
@@ -666,39 +674,90 @@ fn prepare_for_computation_with_retry(
         .collect();
 
     let stride = score_names.len().div_ceil(LANE_COUNT) * LANE_COUNT;
-    let mut weights_matrix = vec![0.0f32; num_reconciled_variants * stride];
-    let mut flip_mask_matrix = vec![0u8; num_reconciled_variants * stride];
-    let mut missing_correction_matrix = vec![0.0f32; num_reconciled_variants * stride];
-    let mut variant_to_scores_map: Vec<Vec<ScoreColumnIndex>> =
-        vec![Vec::new(); num_reconciled_variants];
+    let estimated_nnz: usize = simple_path_data.values().map(|m| m.len()).sum();
+    let mut sparse_weights = Vec::<f32>::with_capacity(estimated_nnz);
+    let mut sparse_missing_corrections = Vec::<f32>::with_capacity(estimated_nnz);
+    let mut sparse_score_columns = Vec::<u32>::with_capacity(estimated_nnz);
+    let mut sparse_row_offsets = Vec::<u64>::with_capacity(num_reconciled_variants + 1);
+    sparse_row_offsets.push(0);
 
-    weights_matrix
-        .par_chunks_mut(stride)
-        .zip(flip_mask_matrix.par_chunks_mut(stride))
-        .zip(missing_correction_matrix.par_chunks_mut(stride))
-        .zip(variant_to_scores_map.par_iter_mut())
-        .enumerate()
-        .for_each(
-            |(reconciled_idx, (((weights_chunk, flip_chunk), missing_chunk), vtsm_entry))| {
-                let bim_row_index = required_bim_indices[reconciled_idx];
-                if let Some(score_data_map) = simple_path_data.get(&bim_row_index) {
-                    for (&score_col_idx, assignment) in score_data_map.iter() {
-                        weights_chunk[score_col_idx.0] = assignment.dosage_weight;
-                        // All simple rows are canonicalized to allele2-dosage space,
-                        // so sign is encoded in `weights_chunk` and flip is no longer needed.
-                        flip_chunk[score_col_idx.0] = 0;
-                        missing_chunk[score_col_idx.0] = assignment.missing_correction;
-                    }
-                    *vtsm_entry = score_data_map.keys().copied().collect();
-                }
-            },
-        );
-
+    let mut baseline_missing_sum_by_score = vec![0.0f64; score_names.len()];
     let mut score_variant_counts = vec![0u32; score_names.len()];
-    for scores in &variant_to_scores_map {
-        for score_col in scores {
-            score_variant_counts[score_col.0] += 1;
+
+    for &bim_row_index in &required_bim_indices {
+        if let Some(score_data_map) = simple_path_data.get(&bim_row_index) {
+            for (&score_col_idx, assignment) in score_data_map.iter() {
+                let col_u32 = u32::try_from(score_col_idx.0).map_err(|_| {
+                    PrepError::Invariant(format!(
+                        "Score column index {} exceeds u32::MAX while building CSR.",
+                        score_col_idx.0
+                    ))
+                })?;
+                sparse_score_columns.push(col_u32);
+                sparse_weights.push(assignment.dosage_weight);
+                sparse_missing_corrections.push(assignment.missing_correction);
+                baseline_missing_sum_by_score[score_col_idx.0] +=
+                    assignment.missing_correction as f64;
+                score_variant_counts[score_col_idx.0] += 1;
+            }
         }
+        let offset_u64 = u64::try_from(sparse_score_columns.len()).map_err(|_| {
+            PrepError::Invariant(format!(
+                "CSR non-zero count {} exceeds u64::MAX while building row offsets.",
+                sparse_score_columns.len()
+            ))
+        })?;
+        sparse_row_offsets.push(offset_u64);
+    }
+
+    if sparse_weights.len() != sparse_missing_corrections.len()
+        || sparse_weights.len() != sparse_score_columns.len()
+    {
+        return Err(PrepError::Invariant(format!(
+            "CSR vector length mismatch: weights={}, missing_corrections={}, score_columns={}",
+            sparse_weights.len(),
+            sparse_missing_corrections.len(),
+            sparse_score_columns.len()
+        )));
+    }
+
+    if sparse_row_offsets.len() != num_reconciled_variants + 1 {
+        return Err(PrepError::Invariant(format!(
+            "CSR row offset length mismatch: got {}, expected {}",
+            sparse_row_offsets.len(),
+            num_reconciled_variants + 1
+        )));
+    }
+    if sparse_row_offsets.first().copied().unwrap_or_default() != 0 {
+        return Err(PrepError::Invariant(
+            "CSR row offsets must start at 0.".to_string(),
+        ));
+    }
+    if sparse_row_offsets.windows(2).any(|w| w[1] < w[0]) {
+        return Err(PrepError::Invariant(
+            "CSR row offsets must be non-decreasing.".to_string(),
+        ));
+    }
+    let expected_tail = u64::try_from(sparse_weights.len()).map_err(|_| {
+        PrepError::Invariant(format!(
+            "CSR non-zero count {} exceeds u64::MAX during final validation.",
+            sparse_weights.len()
+        ))
+    })?;
+    if sparse_row_offsets.last().copied().unwrap_or_default() != expected_tail {
+        return Err(PrepError::Invariant(format!(
+            "CSR row offset tail mismatch: tail={}, expected={expected_tail}",
+            sparse_row_offsets.last().copied().unwrap_or_default()
+        )));
+    }
+    if sparse_score_columns
+        .iter()
+        .any(|&col| col as usize >= score_names.len())
+    {
+        return Err(PrepError::Invariant(format!(
+            "CSR score column contains out-of-range index for {} scores.",
+            score_names.len()
+        )));
     }
     for rule in &final_complex_rules {
         let mut counted_cols: AHashSet<ScoreColumnIndex> = AHashSet::new();
@@ -737,15 +796,16 @@ fn prepare_for_computation_with_retry(
     };
 
     Ok(PreparationResult::new(
-        weights_matrix,
-        flip_mask_matrix,
-        missing_correction_matrix,
+        sparse_weights,
+        sparse_missing_corrections,
+        sparse_score_columns,
+        sparse_row_offsets,
         stride,
+        baseline_missing_sum_by_score,
         required_bim_indices,
         final_complex_rules,
         score_names,
         score_variant_counts,
-        variant_to_scores_map,
         person_subset,
         final_person_iids,
         num_people_to_score,
@@ -869,7 +929,8 @@ mod tests {
         let score_path = dir.path().join("score.tsv");
         {
             let mut file = std::fs::File::create(&score_path).expect("create score");
-            writeln!(file, "variant_id\teffect_allele\tother_allele\tScoreA").expect("write header");
+            writeln!(file, "variant_id\teffect_allele\tother_allele\tScoreA")
+                .expect("write header");
             writeln!(file, "1:100\tA\tG\t0.5").expect("write first line");
             writeln!(file, "1:150\tC\tT\t0.7").expect("write second line");
             writeln!(file, "1:180\tC\tT\t0.2").expect("write third line");
@@ -1031,27 +1092,28 @@ fn conduct_post_mortem(
                 bim_chromosomes.insert(current_key.0);
 
                 if let Some(prev_key) = previous_bim_key
-                    && current_key < prev_key {
-                        let unsorted_error = PrepError::UnsortedInput {
-                            source: "BIM",
-                            path: bim_iter.current_path.clone(),
-                            line_number: bim_iter.local_line_num,
-                            previous_key: prev_key,
-                            current_key,
-                        };
+                    && current_key < prev_key
+                {
+                    let unsorted_error = PrepError::UnsortedInput {
+                        source: "BIM",
+                        path: bim_iter.current_path.clone(),
+                        line_number: bim_iter.local_line_num,
+                        previous_key: prev_key,
+                        current_key,
+                    };
 
-                        if let Some(fileset) = fileset_paths
-                            .iter()
-                            .find(|fs| fs.bim == bim_iter.current_path)
-                        {
-                            return Ok(PostMortemAction::SortAndRetry {
-                                fileset: fileset.clone(),
-                                unsorted_error,
-                            });
-                        }
-
-                        return Ok(PostMortemAction::Fatal(unsorted_error));
+                    if let Some(fileset) = fileset_paths
+                        .iter()
+                        .find(|fs| fs.bim == bim_iter.current_path)
+                    {
+                        return Ok(PostMortemAction::SortAndRetry {
+                            fileset: fileset.clone(),
+                            unsorted_error,
+                        });
                     }
+
+                    return Ok(PostMortemAction::Fatal(unsorted_error));
+                }
 
                 previous_bim_key = Some(current_key);
             }
@@ -1107,15 +1169,16 @@ fn conduct_post_mortem(
             score_chromosomes.insert(key.0);
 
             if let Some(prev_key) = previous_key
-                && key < prev_key {
-                    return Ok(PostMortemAction::Fatal(PrepError::UnsortedInput {
-                        source: "score",
-                        path: path.clone(),
-                        line_number,
-                        previous_key: prev_key,
-                        current_key: key,
-                    }));
-                }
+                && key < prev_key
+            {
+                return Ok(PostMortemAction::Fatal(PrepError::UnsortedInput {
+                    source: "score",
+                    path: path.clone(),
+                    line_number,
+                    previous_key: prev_key,
+                    current_key: key,
+                }));
+            }
 
             previous_key = Some(key);
         }
@@ -1445,9 +1508,10 @@ impl<'arena> KWayMergeIterator<'arena> {
                 {
                     if let Some(filters) = region_filters {
                         if let Some(Some(region)) = filters.get(score_column_index.0)
-                            && !region.contains(key) {
-                                continue;
-                            }
+                            && !region.contains(key)
+                        {
+                            continue;
+                        }
                         if let Some(hit_flags) = region_hits.as_deref_mut() {
                             hit_flags[score_column_index.0] = true;
                         }
@@ -1873,6 +1937,7 @@ impl Display for PrepError {
                 )
             }
             PrepError::AmbiguousReconciliation(s) => write!(f, "{s}"),
+            PrepError::Invariant(s) => write!(f, "Internal invariant violation: {s}"),
         }
     }
 }

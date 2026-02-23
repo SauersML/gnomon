@@ -16,9 +16,8 @@ use cudarc::driver::{
 use cudarc::nvrtc::{Ptx, compile_ptx, result as nvrtc_result, sys as nvrtc_sys};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use memmap2::{Mmap, MmapOptions};
-use rayon::prelude::*;
-use std::ffi::CString;
 use std::env;
+use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{BufWriter, IsTerminal, Write};
 use std::num::NonZeroUsize;
@@ -405,17 +404,20 @@ impl CudaRuntime {
             .num_reconciled_variants
             .checked_mul(prep.stride())
             .ok_or_else(|| "CUDA memory estimate overflow: count_weights_len".to_string())?;
-        let static_bytes = prep
-            .weights_matrix()
-            .len()
+        let dense_host_staging_bytes = count_weights_len
+            .checked_mul(std::mem::size_of::<f32>() * 2 + std::mem::size_of::<u8>())
+            .ok_or_else(|| "CUDA memory estimate overflow: dense_host_staging_bytes".to_string())?;
+        const MAX_DENSE_HOST_STAGING_BYTES: usize = 2 * 1024 * 1024 * 1024;
+        if dense_host_staging_bytes > MAX_DENSE_HOST_STAGING_BYTES {
+            return Err(format!(
+                "dense CUDA staging would require {:.2} GiB host RAM (limit {:.2} GiB); using CPU backend",
+                dense_host_staging_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                MAX_DENSE_HOST_STAGING_BYTES as f64 / (1024.0 * 1024.0 * 1024.0)
+            ));
+        }
+        let static_bytes = count_weights_len
             .checked_mul(std::mem::size_of::<f32>())
-            .and_then(|v| {
-                v.checked_add(
-                    prep.missing_correction_matrix()
-                        .len()
-                        .checked_mul(std::mem::size_of::<f32>())?,
-                )
-            })
+            .and_then(|v| v.checked_add(count_weights_len.checked_mul(std::mem::size_of::<f32>())?))
             .and_then(|v| v.checked_add(count_weights_len.checked_mul(std::mem::size_of::<u8>())?))
             .and_then(|v| {
                 v.checked_add(
@@ -424,7 +426,9 @@ impl CudaRuntime {
                         .checked_mul(std::mem::size_of::<u32>())?,
                 )
             })
-            .ok_or_else(|| "CUDA memory estimate overflow: static device allocations".to_string())?;
+            .ok_or_else(|| {
+                "CUDA memory estimate overflow: static device allocations".to_string()
+            })?;
 
         let num_people = prep.num_people_to_score;
         let num_scores = prep.score_names.len();
@@ -489,23 +493,32 @@ impl CudaRuntime {
             return Err("Insufficient GPU memory for minimum CUDA mega-batch".to_string());
         }
 
+        let mut host_weights = vec![0.0f32; count_weights_len];
+        let mut host_missing_corrections = vec![0.0f32; count_weights_len];
+        let mut host_count_mask = vec![0u8; count_weights_len];
+        for variant_idx in 0..prep.num_reconciled_variants {
+            let row_off = variant_idx * prep.stride();
+            let sparse_range = prep.sparse_row_range(variant_idx);
+            let cols = &prep.sparse_score_columns()[sparse_range.clone()];
+            let weights = &prep.sparse_weights()[sparse_range.clone()];
+            let missing = &prep.sparse_missing_corrections()[sparse_range];
+            for ((&col_u32, &w), &m) in cols.iter().zip(weights).zip(missing) {
+                let col = col_u32 as usize;
+                host_weights[row_off + col] = w;
+                host_missing_corrections[row_off + col] = m;
+                host_count_mask[row_off + col] = 1;
+            }
+        }
+
         let full_weights = compute_stream
-            .clone_htod(prep.weights_matrix())
+            .clone_htod(&host_weights)
             .map_err(|e| format!("Failed to upload full weights matrix: {e:?}"))?;
         let full_missing_corrections = compute_stream
-            .clone_htod(prep.missing_correction_matrix())
+            .clone_htod(&host_missing_corrections)
             .map_err(|e| format!("Failed to upload full missing-correction matrix: {e:?}"))?;
         let output_map = compute_stream
             .clone_htod(&prep.output_idx_to_fam_idx)
             .map_err(|e| format!("Failed to upload output index map: {e:?}"))?;
-
-        let mut host_count_mask = vec![0u8; count_weights_len];
-        for (variant_idx, score_cols) in prep.variant_to_scores_map.iter().enumerate() {
-            let row_off = variant_idx * prep.stride();
-            for score_idx in score_cols {
-                host_count_mask[row_off + score_idx.0] = 1;
-            }
-        }
         let full_count_mask = compute_stream
             .clone_htod(&host_count_mask)
             .map_err(|e| format!("Failed to upload full count-mask matrix: {e:?}"))?;
@@ -1462,31 +1475,7 @@ fn run_row_major_gemm(
 }
 
 fn compute_cpu_precise_baseline(prep_result: &PreparationResult) -> Vec<f64> {
-    let num_scores = prep_result.score_names.len();
-    let stride = prep_result.stride();
-    (0..prep_result.num_reconciled_variants)
-        .into_par_iter()
-        .fold(
-            || vec![0.0f64; num_scores],
-            |mut local_baseline, i| {
-                let flip_row_offset = i * stride;
-                let missing_corr_row = &prep_result.missing_correction_matrix()
-                    [flip_row_offset..flip_row_offset + stride];
-                for k in 0..num_scores {
-                    local_baseline[k] += missing_corr_row[k] as f64;
-                }
-                local_baseline
-            },
-        )
-        .reduce(
-            || vec![0.0f64; num_scores],
-            |mut a, b| {
-                for (v_a, v_b) in a.iter_mut().zip(b) {
-                    *v_a += v_b;
-                }
-                a
-            },
-        )
+    prep_result.baseline_missing_sum_by_score().to_vec()
 }
 
 fn derive_spool_destination(base_path: &Path) -> (PathBuf, String) {

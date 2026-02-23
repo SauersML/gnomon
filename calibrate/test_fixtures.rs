@@ -4,8 +4,8 @@
 //! and default model configurations, reducing boilerplate across test files.
 
 use crate::calibrate::model::{
-    BasisConfig, InteractionPenaltyKind, LinkFunction, ModelConfig, ModelFamily,
-    PrincipalComponentConfig, TrainedModel, MappedCoefficients, MainEffects,
+    BasisConfig, InteractionPenaltyKind, LinkFunction, MainEffects, MappedCoefficients,
+    ModelConfig, ModelFamily, PrincipalComponentConfig, TrainedModel,
 };
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
@@ -124,17 +124,18 @@ impl SyntheticDataBuilder {
         let pcs = Array2::from_shape_fn((n, self.n_pcs), |_| rng.sample(StandardNormal));
 
         // Generate sex
-        let sex: Array1<f64> =
-            Array1::from_iter((0..n).map(|_| if rng.random::<f64>() < self.male_fraction { 1.0 } else { 0.0 }));
+        let sex: Array1<f64> = Array1::from_iter((0..n).map(|_| {
+            if rng.random::<f64>() < self.male_fraction {
+                1.0
+            } else {
+                0.0
+            }
+        }));
 
         // Generate liability based on signal type
         let liability: Array1<f64> = match self.signal_type {
-            SignalType::Linear => {
-                pgs.mapv(|p| self.signal_strength * p)
-            }
-            SignalType::Quadratic => {
-                pgs.mapv(|p| self.signal_strength * p + 0.3 * p * p)
-            }
+            SignalType::Linear => pgs.mapv(|p| self.signal_strength * p),
+            SignalType::Quadratic => pgs.mapv(|p| self.signal_strength * p + 0.3 * p * p),
             SignalType::Null => Array1::zeros(n),
         };
 
@@ -154,7 +155,13 @@ impl SyntheticDataBuilder {
 
         let weights = Array1::ones(n);
 
-        TestData { y, pgs, sex, pcs, weights }
+        TestData {
+            y,
+            pgs,
+            sex,
+            pcs,
+            weights,
+        }
     }
 
     /// Build synthetic data for a Gaussian regression model (continuous outcome).
@@ -169,17 +176,18 @@ impl SyntheticDataBuilder {
         let pcs = Array2::from_shape_fn((n, self.n_pcs), |_| rng.sample(StandardNormal));
 
         // Generate sex
-        let sex: Array1<f64> =
-            Array1::from_iter((0..n).map(|_| if rng.random::<f64>() < self.male_fraction { 1.0 } else { 0.0 }));
+        let sex: Array1<f64> = Array1::from_iter((0..n).map(|_| {
+            if rng.random::<f64>() < self.male_fraction {
+                1.0
+            } else {
+                0.0
+            }
+        }));
 
         // Generate continuous outcome based on signal type
         let signal: Array1<f64> = match self.signal_type {
-            SignalType::Linear => {
-                pgs.mapv(|p| self.signal_strength * p)
-            }
-            SignalType::Quadratic => {
-                pgs.mapv(|p| self.signal_strength * p + 0.3 * p * p)
-            }
+            SignalType::Linear => pgs.mapv(|p| self.signal_strength * p),
+            SignalType::Quadratic => pgs.mapv(|p| self.signal_strength * p + 0.3 * p * p),
             SignalType::Null => Array1::zeros(n),
         };
 
@@ -189,7 +197,13 @@ impl SyntheticDataBuilder {
 
         let weights = Array1::ones(n);
 
-        TestData { y, pgs, sex, pcs, weights }
+        TestData {
+            y,
+            pgs,
+            sex,
+            pcs,
+            weights,
+        }
     }
 }
 
@@ -221,12 +235,18 @@ pub fn default_model_config_with_link(link: LinkFunction) -> ModelConfig {
         pc_configs: vec![
             PrincipalComponentConfig {
                 name: "PC1".to_string(),
-                basis_config: BasisConfig { num_knots: 6, degree: 3 },
+                basis_config: BasisConfig {
+                    num_knots: 6,
+                    degree: 3,
+                },
                 range: (-3.0, 3.0),
             },
             PrincipalComponentConfig {
                 name: "PC2".to_string(),
-                basis_config: BasisConfig { num_knots: 6, degree: 3 },
+                basis_config: BasisConfig {
+                    num_knots: 6,
+                    degree: 3,
+                },
                 range: (-3.0, 3.0),
             },
         ],
@@ -238,7 +258,7 @@ pub fn default_model_config_with_link(link: LinkFunction) -> ModelConfig {
         interaction_centering_means: HashMap::new(),
         interaction_orth_alpha: HashMap::new(),
         pc_null_transforms: HashMap::new(),
-        mcmc_enabled: false, // Disable MCMC for faster tests
+        mcmc_enabled: false,       // Disable MCMC for faster tests
         calibrator_enabled: false, // Disable calibrator for faster tests
         survival: None,
     }
@@ -340,16 +360,23 @@ mod tests {
 
         // Check that y is continuous (has variance)
         let mean = data.y.sum() / data.n() as f64;
-        let variance: f64 = data.y.iter().map(|&v| (v - mean).powi(2)).sum::<f64>() / data.n() as f64;
+        let variance: f64 =
+            data.y.iter().map(|&v| (v - mean).powi(2)).sum::<f64>() / data.n() as f64;
         assert!(variance > 0.1);
     }
 
     #[test]
     fn test_default_model_configs() {
         let logit = default_model_config_logit();
-        assert!(matches!(logit.model_family, ModelFamily::Gam(LinkFunction::Logit)));
+        assert!(matches!(
+            logit.model_family,
+            ModelFamily::Gam(LinkFunction::Logit)
+        ));
 
         let identity = default_model_config_identity();
-        assert!(matches!(identity.model_family, ModelFamily::Gam(LinkFunction::Identity)));
+        assert!(matches!(
+            identity.model_family,
+            ModelFamily::Gam(LinkFunction::Identity)
+        ));
     }
 }

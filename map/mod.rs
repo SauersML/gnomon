@@ -1,7 +1,7 @@
-pub mod prefit;
 pub mod fit;
 pub mod io;
 pub mod main;
+pub mod prefit;
 pub mod progress;
 pub mod project;
 pub mod variant_filter;

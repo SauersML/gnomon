@@ -506,12 +506,8 @@ impl DropUsageCollector {
             error_msg.push_str(&format!("   {violation}\n"));
         }
 
-        error_msg.push_str(
-            "\n⚠️ Explicit drop(...) calls are forbidden in this project.\n",
-        );
-        error_msg.push_str(
-            "   Restructure the code to let values go out of scope naturally.\n",
-        );
+        error_msg.push_str("\n⚠️ Explicit drop(...) calls are forbidden in this project.\n");
+        error_msg.push_str("   Restructure the code to let values go out of scope naturally.\n");
 
         Some(error_msg)
     }
@@ -541,9 +537,7 @@ impl EmptyBlockCollector {
             error_msg.push_str(&format!("   {violation}\n"));
         }
 
-        error_msg.push_str(
-            "\n⚠️ Empty control-flow blocks are forbidden in this project.\n",
-        );
+        error_msg.push_str("\n⚠️ Empty control-flow blocks are forbidden in this project.\n");
         error_msg.push_str("   Remove the block or add meaningful logic.\n");
 
         Some(error_msg)
@@ -1325,11 +1319,11 @@ fn manually_check_for_unused_variables() {
     let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    
+
     // Support both workspace (shared/build.rs) and standalone (build.rs) configurations
     let shared_build_path = manifest_dir.join("shared/build.rs");
     let toplevel_build_path = manifest_dir.join("build.rs");
-    
+
     let build_path = if shared_build_path.exists() {
         shared_build_path
     } else if toplevel_build_path.exists() {
@@ -1915,7 +1909,10 @@ fn scan_for_previous_code_references(manifest_dir: &str) -> Vec<String> {
                 let path = entry.path();
 
                 let mut collector = PreviousCodeReferenceCollector::new(path);
-                if searcher.search_path(&matcher, path, &mut collector).is_err() {
+                if searcher
+                    .search_path(&matcher, path, &mut collector)
+                    .is_err()
+                {
                     continue;
                 }
 
@@ -2053,7 +2050,9 @@ fn scan_for_drop_in_build_scripts(manifest_dir: &str) -> Vec<String> {
                 .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
                 .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path()))
                 .filter(|e: &walkdir::DirEntry| {
-                    e.path().file_name().is_some_and(|name| name == OsStr::new("build.rs"))
+                    e.path()
+                        .file_name()
+                        .is_some_and(|name| name == OsStr::new("build.rs"))
                 })
             {
                 let path = entry.path();
@@ -2122,10 +2121,7 @@ fn scan_for_drop_usage(manifest_dir: &str) -> Vec<String> {
             }
         }
         Err(e) => {
-            all_violations.push(format!(
-                "Error creating drop usage regex matcher: {}",
-                e
-            ));
+            all_violations.push(format!("Error creating drop usage regex matcher: {}", e));
         }
     }
 
@@ -2194,10 +2190,7 @@ fn scan_for_debug_assert_usage(manifest_dir: &str) -> Vec<String> {
             }
         }
         Err(e) => {
-            all_violations.push(format!(
-                "Error creating debug_assert regex matcher: {}",
-                e
-            ));
+            all_violations.push(format!("Error creating debug_assert regex matcher: {}", e));
         }
     }
 

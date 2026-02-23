@@ -25,14 +25,12 @@ pub struct HwePcaProjector<'model> {
     model: &'model HwePcaModel,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum ZeroAlignmentAction {
     #[default]
     Zero,
     NaN,
 }
-
 
 #[derive(Clone, Copy, Debug)]
 pub struct ProjectionOptions {
@@ -325,7 +323,11 @@ impl ProjectionCudaPacked {
         Ok(())
     }
 
-    fn init_missing_info(&mut self, n_samples: usize, packed_info_size: usize) -> Result<(), String> {
+    fn init_missing_info(
+        &mut self,
+        n_samples: usize,
+        packed_info_size: usize,
+    ) -> Result<(), String> {
         let missing_info_len = n_samples
             .checked_mul(packed_info_size)
             .ok_or_else(|| "projection CUDA overflow for missing_info".to_string())?;
@@ -429,8 +431,8 @@ impl ProjectionCudaPacked {
             i32::try_from(filled).map_err(|_| format!("filled too large: {filled}"))?;
         let bytes_per_variant_i32 = i32::try_from(packed_bytes_per_variant(n_samples))
             .map_err(|_| format!("bytes_per_variant too large for n_samples={n_samples}"))?;
-        let unpack_elems_u32 = u32::try_from(a_len)
-            .map_err(|_| format!("unpack element count too large: {a_len}"))?;
+        let unpack_elems_u32 =
+            u32::try_from(a_len).map_err(|_| format!("unpack element count too large: {a_len}"))?;
         unsafe {
             self.stream
                 .launch_builder(&self.unpack_kernel)
@@ -550,7 +552,10 @@ impl ProjectionCudaPacked {
             self.h_missing_info.resize(len, 0.0);
         }
         self.stream
-            .memcpy_dtoh(&d_missing_info.slice(0..len), &mut self.h_missing_info[..len])
+            .memcpy_dtoh(
+                &d_missing_info.slice(0..len),
+                &mut self.h_missing_info[..len],
+            )
             .map_err(|e| format!("Failed to copy missing-info from GPU: {e:?}"))?;
         for i in 0..len {
             out_f64[i] = self.h_missing_info[i] as f64;
@@ -865,11 +870,12 @@ impl<'model> HwePcaProjector<'model> {
             ));
         }
         if let Some(ref alignment) = alignment_out
-            && (alignment.nrows() != n_samples || alignment.ncols() != components) {
-                return Err(HwePcaError::InvalidInput(
-                    "Alignment output shape must match projection output",
-                ));
-            }
+            && (alignment.nrows() != n_samples || alignment.ncols() != components)
+        {
+            return Err(HwePcaError::InvalidInput(
+                "Alignment output shape must match projection output",
+            ));
+        }
 
         scores.fill(0.0);
 
@@ -884,9 +890,9 @@ impl<'model> HwePcaProjector<'model> {
         let packed_info_size = packed_tri_size(components);
         let mut missing_info_storage = vec![
             0.0f64;
-            n_samples.checked_mul(packed_info_size).ok_or_else(|| {
-                HwePcaError::InvalidInput("WLS info matrix storage overflow")
-            })?
+            n_samples.checked_mul(packed_info_size).ok_or_else(
+                || { HwePcaError::InvalidInput("WLS info matrix storage overflow") }
+            )?
         ];
         let mut global_info_packed = vec![0.0f64; packed_info_size];
         let scaler = self.model.scaler();
@@ -900,9 +906,7 @@ impl<'model> HwePcaProjector<'model> {
         }
 
         if let Some(packed) = source.hard_call_packed() {
-            eprintln!(
-                "> Projection backend path: packed hard-call input (2-bit PLINK detected)"
-            );
+            eprintln!("> Projection backend path: packed hard-call input (2-bit PLINK detected)");
             project_from_packed_hard_calls(
                 packed,
                 n_samples,
@@ -968,11 +972,12 @@ impl<'model> HwePcaProjector<'model> {
                     break;
                 }
                 if processed + filled > expected_variants
-                    && (variant_hint != 0 || processed + filled > model_variants) {
-                        return Err(HwePcaError::InvalidInput(
-                            "VariantBlockSource returned more variants than reported",
-                        ));
-                    }
+                    && (variant_hint != 0 || processed + filled > model_variants)
+                {
+                    return Err(HwePcaError::InvalidInput(
+                        "VariantBlockSource returned more variants than reported",
+                    ));
+                }
 
                 // Get per-variant imputation quality for this block
                 source.variant_quality(filled, &mut quality_storage[..filled]);
@@ -1190,13 +1195,18 @@ impl<'model> HwePcaProjector<'model> {
                 .zip(align_vec.par_chunks_mut(components))
                 .enumerate()
                 .for_each_init(
-                    || (Mat::zeros(components, components), Mat::zeros(components, 1)),
+                    || {
+                        (
+                            Mat::zeros(components, components),
+                            Mat::zeros(components, 1),
+                        )
+                    },
                     |(a_mat, b_vec), (sample, (score_row, align_row))| {
                         let info_offset = sample * packed_info_size;
                         let mut trace = 0.0f64;
                         for &diag_idx in &diag_indices {
-                            let mass =
-                                global_info_packed[diag_idx] - missing_info_storage[info_offset + diag_idx];
+                            let mass = global_info_packed[diag_idx]
+                                - missing_info_storage[info_offset + diag_idx];
                             trace += mass;
                         }
 
@@ -1256,13 +1266,18 @@ impl<'model> HwePcaProjector<'model> {
                 .par_chunks_mut(components)
                 .enumerate()
                 .for_each_init(
-                    || (Mat::zeros(components, components), Mat::zeros(components, 1)),
+                    || {
+                        (
+                            Mat::zeros(components, components),
+                            Mat::zeros(components, 1),
+                        )
+                    },
                     |(a_mat, b_vec), (sample, score_row)| {
                         let info_offset = sample * packed_info_size;
                         let mut trace = 0.0f64;
                         for &diag_idx in &diag_indices {
-                            let mass =
-                                global_info_packed[diag_idx] - missing_info_storage[info_offset + diag_idx];
+                            let mass = global_info_packed[diag_idx]
+                                - missing_info_storage[info_offset + diag_idx];
                             trace += mass;
                         }
 
@@ -1315,7 +1330,8 @@ impl<'model> HwePcaProjector<'model> {
                 scores[(sample, k)] = solved_scores[row_offset + k];
             }
         }
-        if let (Some(ref mut align_out), Some(align_vec)) = (alignment_out.as_mut(), solved_alignment)
+        if let (Some(ref mut align_out), Some(align_vec)) =
+            (alignment_out.as_mut(), solved_alignment)
         {
             for sample in 0..n_samples {
                 let row_offset = sample * components;
@@ -1525,7 +1541,9 @@ where
     let mut gpu_scores_flushed = false;
     let mut logged_cuda_fallback = false;
     if let Some(runtime) = packed_cuda.as_mut()
-        && runtime.init_missing_info(n_samples, packed_info_size).is_err()
+        && runtime
+            .init_missing_info(n_samples, packed_info_size)
+            .is_err()
     {
         eprintln!(
             "> Projection backend switch: CPU (failed to initialize GPU missing-info buffer)"
@@ -1538,9 +1556,7 @@ where
     if let Some(runtime) = packed_cuda.as_mut()
         && runtime.init_scores_accum(n_samples, components).is_err()
     {
-        eprintln!(
-            "> Projection backend switch: CPU (failed to initialize GPU score accumulator)"
-        );
+        eprintln!("> Projection backend switch: CPU (failed to initialize GPU score accumulator)");
         packed_cuda = None;
         gpu_missing_active = false;
         gpu_scores_active = false;
@@ -1608,9 +1624,11 @@ where
 
         let mut used_gpu = false;
         if let Some(runtime) = packed_cuda.as_mut() {
-            let block_bytes = packed.slice(processed, filled).ok_or(HwePcaError::InvalidInput(
-                "VariantBlockSource terminated early during projection",
-            ))?;
+            let block_bytes = packed
+                .slice(processed, filled)
+                .ok_or(HwePcaError::InvalidInput(
+                    "VariantBlockSource terminated early during projection",
+                ))?;
             debug_assert_eq!(block_bytes.len(), packed_len);
 
             if gpu_loadings_col_major.len() < load_len {
@@ -2108,7 +2126,8 @@ fn accumulate_missing_info_from_raw(
                     continue;
                 }
                 let sample_offset = sample * packed_info_size;
-                let missing_info = &mut missing_info_storage[sample_offset..sample_offset + packed_info_size];
+                let missing_info =
+                    &mut missing_info_storage[sample_offset..sample_offset + packed_info_size];
                 for idx in 0..packed_info_size {
                     missing_info[idx] += contrib[idx];
                 }
@@ -2138,7 +2157,8 @@ fn accumulate_missing_info_from_raw(
                         continue;
                     }
                     let dst_offset = local * packed_info_size;
-                    let missing_info = &mut chunk_missing[dst_offset..dst_offset + packed_info_size];
+                    let missing_info =
+                        &mut chunk_missing[dst_offset..dst_offset + packed_info_size];
                     for idx in 0..packed_info_size {
                         missing_info[idx] += contrib[idx];
                     }
@@ -2495,8 +2515,6 @@ mod tests {
         }
     }
 
-
-
     #[test]
     fn ld_weighted_renormalization_matches_default_projection_without_missingness() {
         let model = fit_example_model_with_ld();
@@ -2828,8 +2846,8 @@ mod tests {
         let one_sample_variants: Vec<f64> = (0..N_VARIANTS)
             .map(|variant| data[variant * N_SAMPLES])
             .collect();
-        let mut source =
-            DenseBlockSource::new(&one_sample_variants, 1, N_VARIANTS).expect("single sample source");
+        let mut source = DenseBlockSource::new(&one_sample_variants, 1, N_VARIANTS)
+            .expect("single sample source");
         let options = ProjectionOptions {
             missing_axis_renormalization: true,
             return_alignment: true,

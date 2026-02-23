@@ -72,7 +72,7 @@ pub fn should_emit_h_min_eig_diag(min_eig: f64) -> bool {
 }
 
 // =============================================================================
-// Formatting Utilities for Diagnostic Output  
+// Formatting Utilities for Diagnostic Output
 // =============================================================================
 
 /// Approximate floating-point equality check for diagnostic deduplication.
@@ -96,11 +96,7 @@ pub fn quantize_value(value: f64, rel: f64, abs: f64) -> f64 {
     }
     let scale = abs.max(rel * value.abs());
     let quantized = (value / scale).round() * scale;
-    if quantized == 0.0 {
-        0.0
-    } else {
-        quantized
-    }
+    if quantized == 0.0 { 0.0 } else { quantized }
 }
 
 /// Quantize a vector of values for deduplication.
@@ -143,10 +139,11 @@ where
     if uniform_step {
         return format!("[{}..{} step {}]", fmt(first), fmt(last), fmt(step));
     }
-    let (min, max) = values.iter().fold(
-        (f64::INFINITY, f64::NEG_INFINITY),
-        |(min, max), &v| (min.min(v), max.max(v)),
-    );
+    let (min, max) = values
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(min, max), &v| {
+            (min.min(v), max.max(v))
+        });
     format!("[{}..{}] n={}", fmt(min), fmt(max), values.len())
 }
 
@@ -304,13 +301,13 @@ impl GradientDiagnosticReport {
     /// Generate a summary string of all issues found
     pub fn summary(&self) -> String {
         let mut lines = Vec::new();
-        
+
         if let Some(ref audit) = self.envelope_audit {
             if audit.is_violated {
                 lines.push(format!("[DIAG] {}", audit));
             }
         }
-        
+
         for (k, components) in self.component_fd.iter().enumerate() {
             for comp in components {
                 if comp.has_mismatch {
@@ -318,19 +315,19 @@ impl GradientDiagnosticReport {
                 }
             }
         }
-        
+
         for bleed in &self.spectral_bleed {
             if bleed.has_bleed {
                 lines.push(format!("[DIAG] {}", bleed));
             }
         }
-        
+
         if let Some(ref ridge) = self.dual_ridge {
             if ridge.has_mismatch {
                 lines.push(format!("[DIAG] {}", ridge));
             }
         }
-        
+
         if lines.is_empty() {
             "No gradient diagnostic issues detected.".to_string()
         } else {
@@ -379,7 +376,7 @@ pub fn compute_envelope_audit(
     if ridge_used > 0.0 {
         kkt_residual = &kkt_residual - &beta.mapv(|b| ridge_used * b);
     }
-    
+
     let kkt_norm = kkt_residual.dot(&kkt_residual).sqrt();
     let score_norm = score_gradient.dot(score_gradient).sqrt();
     let penalty_norm = penalty_gradient.dot(penalty_gradient).sqrt();
@@ -389,7 +386,7 @@ pub fn compute_envelope_audit(
     let ridge_mismatch = (ridge_used - ridge_assumed).abs() > 1e-12;
     let kkt_violation = kkt_norm > abs_tolerance && rel_kkt > rel_tolerance;
     let is_violated = kkt_violation || ridge_mismatch;
-    
+
     let message = if ridge_mismatch && kkt_violation {
         format!(
             "Envelope Violation: Inner solver ridge = {:.2e}, Outer gradient assumes ridge = {:.2e}. \
@@ -413,7 +410,7 @@ pub fn compute_envelope_audit(
             kkt_norm, rel_kkt, ridge_used
         )
     };
-    
+
     EnvelopeAudit {
         kkt_residual_norm: kkt_norm,
         inner_ridge: ridge_used,
@@ -460,9 +457,10 @@ pub fn compute_component_fd(
     rel_threshold: f64,
 ) -> Vec<ComponentFdResult> {
     let mut results = Vec::with_capacity(4);
-    
+
     // D_p component
-    let numeric_dp = (components_plus.penalized_deviance - components_minus.penalized_deviance) / (2.0 * h);
+    let numeric_dp =
+        (components_plus.penalized_deviance - components_minus.penalized_deviance) / (2.0 * h);
     let dp_denom = analytic_dp_grad.abs().max(numeric_dp.abs()).max(1e-8);
     let dp_rel = (analytic_dp_grad - numeric_dp).abs() / dp_denom;
     results.push(ComponentFdResult {
@@ -472,7 +470,7 @@ pub fn compute_component_fd(
         rel_error: dp_rel,
         has_mismatch: dp_rel > rel_threshold,
     });
-    
+
     // log|H| component
     let numeric_logh = (components_plus.log_det_h - components_minus.log_det_h) / (2.0 * h);
     let logh_denom = analytic_logh_grad.abs().max(numeric_logh.abs()).max(1e-8);
@@ -484,7 +482,7 @@ pub fn compute_component_fd(
         rel_error: logh_rel,
         has_mismatch: logh_rel > rel_threshold,
     });
-    
+
     // log|S| component
     let numeric_logs = (components_plus.log_det_s - components_minus.log_det_s) / (2.0 * h);
     let logs_denom = analytic_logs_grad.abs().max(numeric_logs.abs()).max(1e-8);
@@ -496,7 +494,7 @@ pub fn compute_component_fd(
         rel_error: logs_rel,
         has_mismatch: logs_rel > rel_threshold,
     });
-    
+
     // Total
     let analytic_total = analytic_dp_grad + analytic_logh_grad + analytic_logs_grad;
     let numeric_total = (components_plus.total - components_minus.total) / (2.0 * h);
@@ -509,7 +507,7 @@ pub fn compute_component_fd(
         rel_error: total_rel,
         has_mismatch: total_rel > rel_threshold,
     });
-    
+
     results
 }
 
@@ -542,17 +540,20 @@ pub fn compute_spectral_bleed(
 ) -> SpectralBleedResult {
     let truncated_count = u_truncated.ncols();
     let rank_k = r_k.nrows();
-    
+
     if truncated_count == 0 || rank_k == 0 {
         return SpectralBleedResult {
             penalty_k,
             truncated_energy: 0.0,
             applied_correction,
             has_bleed: false,
-            message: format!("Penalty {} has no truncated modes, no bleed possible.", penalty_k),
+            message: format!(
+                "Penalty {} has no truncated modes, no bleed possible.",
+                penalty_k
+            ),
         };
     }
-    
+
     // Compute W_k = R_k U_⊥ (rank_k × truncated_count)
     let r_k_cols = r_k.ncols().min(u_truncated.nrows());
     let mut w_k = Array2::<f64>::zeros((rank_k, truncated_count));
@@ -565,7 +566,7 @@ pub fn compute_spectral_bleed(
             w_k[(i, j)] = sum;
         }
     }
-    
+
     // Compute M_⊥ = U_⊥' H⁻¹ U_⊥ (truncated_count × truncated_count)
     let u_rows = u_truncated.nrows().min(h_inv_u_truncated.nrows());
     let mut m_perp = Array2::<f64>::zeros((truncated_count, truncated_count));
@@ -578,7 +579,7 @@ pub fn compute_spectral_bleed(
             m_perp[(i, j)] = sum;
         }
     }
-    
+
     // Error = tr(M_⊥ * W_k' W_k) = λ_k * tr(U_⊥' H⁻¹ U_⊥ * U_⊥' S_k U_⊥)
     let mut trace_error = 0.0;
     for i in 0..truncated_count {
@@ -590,20 +591,27 @@ pub fn compute_spectral_bleed(
             trace_error += m_perp[(i, j)] * wtw_ij;
         }
     }
-    
+
     let expected_correction = 0.5 * lambda_k * trace_error;
     let truncated_energy = trace_error;
-    
+
     // Check if correction matches expected
-    let denom = expected_correction.abs().max(applied_correction.abs()).max(1e-8);
+    let denom = expected_correction
+        .abs()
+        .max(applied_correction.abs())
+        .max(1e-8);
     let rel_diff = (expected_correction - applied_correction).abs() / denom;
     let has_bleed = rel_diff > rel_threshold && truncated_energy.abs() > 1e-6;
-    
+
     let message = if has_bleed {
         format!(
             "Spectral Bleed at k={}: Penalty S_{} has energy {:.2e} in truncated subspace. \
              Expected correction {:.2e}, but applied {:.2e} (rel diff = {:.1}%)",
-            penalty_k, penalty_k, truncated_energy, expected_correction, applied_correction,
+            penalty_k,
+            penalty_k,
+            truncated_energy,
+            expected_correction,
+            applied_correction,
             rel_diff * 100.0
         )
     } else {
@@ -612,7 +620,7 @@ pub fn compute_spectral_bleed(
             penalty_k, truncated_energy
         )
     };
-    
+
     SpectralBleedResult {
         penalty_k,
         truncated_energy,
@@ -646,31 +654,42 @@ pub fn compute_dual_ridge_check(
 ) -> DualRidgeResult {
     let beta_norm_sq = beta.dot(beta);
     let beta_norm = beta_norm_sq.sqrt();
-    
+
     let ridge_impact = pirls_ridge * beta_norm;
     let phantom_penalty = 0.5 * pirls_ridge * beta_norm_sq;
-    
+
     let pirls_cost_mismatch = (pirls_ridge - cost_ridge).abs() > 1e-12;
     let pirls_grad_mismatch = (pirls_ridge - gradient_ridge).abs() > 1e-12;
     let cost_grad_mismatch = (cost_ridge - gradient_ridge).abs() > 1e-12;
     let has_mismatch = pirls_cost_mismatch || pirls_grad_mismatch || cost_grad_mismatch;
-    
+
     let message = if has_mismatch {
         let mut mismatches = Vec::new();
         if pirls_cost_mismatch {
-            mismatches.push(format!("PIRLS({:.2e}) vs Cost({:.2e})", pirls_ridge, cost_ridge));
+            mismatches.push(format!(
+                "PIRLS({:.2e}) vs Cost({:.2e})",
+                pirls_ridge, cost_ridge
+            ));
         }
         if pirls_grad_mismatch {
-            mismatches.push(format!("PIRLS({:.2e}) vs Gradient({:.2e})", pirls_ridge, gradient_ridge));
+            mismatches.push(format!(
+                "PIRLS({:.2e}) vs Gradient({:.2e})",
+                pirls_ridge, gradient_ridge
+            ));
         }
         if cost_grad_mismatch {
-            mismatches.push(format!("Cost({:.2e}) vs Gradient({:.2e})", cost_ridge, gradient_ridge));
+            mismatches.push(format!(
+                "Cost({:.2e}) vs Gradient({:.2e})",
+                cost_ridge, gradient_ridge
+            ));
         }
         format!(
             "Ridge Mismatch detected: {}. Effective ridge impact on ||β|| = {:.2e}. \
              Phantom penalty = {:.2e}. The surface being differentiated differs from \
              the surface being optimized.",
-            mismatches.join(", "), ridge_impact, phantom_penalty
+            mismatches.join(", "),
+            ridge_impact,
+            phantom_penalty
         )
     } else if pirls_ridge > 0.0 {
         format!(
@@ -680,7 +699,7 @@ pub fn compute_dual_ridge_check(
     } else {
         "Ridge Consistency OK: No stabilization ridge required.".to_string()
     };
-    
+
     DualRidgeResult {
         pirls_ridge,
         cost_ridge,
@@ -709,16 +728,16 @@ pub fn gradient_perturbation_consistency(
 ) -> (bool, f64, f64) {
     // Average gradient
     let avg_grad = (grad_at_rho + grad_at_rho_plus).mapv(|v| v / 2.0);
-    
+
     // Check if average matches FD better than the gradient at rho
     let diff_avg = &avg_grad - fd_slope;
     let diff_rho = grad_at_rho - fd_slope;
-    
+
     let rel_error_avg = diff_avg.dot(&diff_avg).sqrt() / fd_slope.dot(fd_slope).sqrt().max(1e-8);
     let rel_error_rho = diff_rho.dot(&diff_rho).sqrt() / fd_slope.dot(fd_slope).sqrt().max(1e-8);
-    
+
     let has_bias = rel_error_avg < rel_error_rho * 0.5 && rel_error_rho > rel_threshold;
-    
+
     (has_bias, rel_error_avg, rel_error_rho)
 }
 
@@ -732,7 +751,7 @@ mod tests {
         let score = arr1(&[1.0, 2.0, 3.0]);
         let penalty = arr1(&[1.0, 2.0, 3.0]);
         let beta = arr1(&[0.1, 0.2, 0.3]);
-        
+
         let result = compute_envelope_audit(&score, &penalty, 0.0, 0.0, &beta, 1e-4, 1e-2);
         assert!(!result.is_violated);
         assert!(result.kkt_residual_norm < 1e-10);
@@ -743,11 +762,14 @@ mod tests {
         let score = arr1(&[1.0, 2.0, 3.0]);
         let penalty = arr1(&[0.9, 1.9, 2.9]);
         let beta = arr1(&[1.0, 1.0, 1.0]);
-        
+
         // PIRLS used ridge 0.1, but gradient assumes 0.0
         let result = compute_envelope_audit(&score, &penalty, 0.1, 0.0, &beta, 1e-4, 1e-2);
         assert!(result.is_violated);
-        assert!(result.message.contains("Ridge Mismatch") || result.message.contains("Envelope Violation"));
+        assert!(
+            result.message.contains("Ridge Mismatch")
+                || result.message.contains("Envelope Violation")
+        );
     }
 
     #[test]

@@ -1,10 +1,10 @@
 use gnomon::calibrate::model::{
-    BasisConfig, InteractionPenaltyKind, ModelConfig, ModelFamily,
-    SurvivalRiskType, TrainedModel, MappedCoefficients,
+    BasisConfig, InteractionPenaltyKind, MappedCoefficients, ModelConfig, ModelFamily,
+    SurvivalRiskType, TrainedModel,
 };
 use gnomon::calibrate::survival::{
-    CompanionModelHandle, SurvivalModelArtifacts, AgeTransform, BasisDescriptor, CovariateLayout,
-    ReferenceConstraint, MonotonicityPenalty, ValueRange, SurvivalSpec,
+    AgeTransform, BasisDescriptor, CompanionModelHandle, CovariateLayout, MonotonicityPenalty,
+    ReferenceConstraint, SurvivalModelArtifacts, SurvivalSpec, ValueRange,
 };
 use ndarray::{Array1, Array2, array};
 use std::collections::HashMap;
@@ -38,8 +38,11 @@ fn make_constant_hazard_artifacts(hazard_rate: f64) -> SurvivalModelArtifacts {
     let static_covariates = CovariateLayout {
         column_names: vec!["pgs".to_string(), "sex".to_string()],
         ranges: vec![
-            ValueRange { min: -100.0, max: 100.0 },
-            ValueRange { min: 0.0, max: 1.0 }
+            ValueRange {
+                min: -100.0,
+                max: 100.0,
+            },
+            ValueRange { min: 0.0, max: 1.0 },
         ],
     };
 
@@ -81,7 +84,7 @@ fn make_constant_hazard_artifacts(hazard_rate: f64) -> SurvivalModelArtifacts {
 
 fn create_mock_trained_model(
     disease: SurvivalModelArtifacts,
-    mortality: Option<SurvivalModelArtifacts>
+    mortality: Option<SurvivalModelArtifacts>,
 ) -> TrainedModel {
     let mut companions = HashMap::new();
     let mut disease_model = disease;
@@ -97,14 +100,29 @@ fn create_mock_trained_model(
     TrainedModel {
         config: ModelConfig {
             model_family: ModelFamily::Survival(SurvivalSpec::default()),
-            penalty_order: 2, convergence_tolerance: 1e-6, max_iterations: 1, reml_convergence_tolerance: 1e-6, reml_max_iterations: 1, firth_bias_reduction: false, reml_parallel_threshold: 4,
-            pgs_basis_config: BasisConfig { num_knots: 0, degree: 0 },
-            pc_configs: vec![], pgs_range: (0.0, 1.0), interaction_penalty: InteractionPenaltyKind::Anisotropic,
-            sum_to_zero_constraints: HashMap::new(), knot_vectors: HashMap::new(), range_transforms: HashMap::new(),
-            pc_null_transforms: HashMap::new(), interaction_centering_means: HashMap::new(), interaction_orth_alpha: HashMap::new(),
+            penalty_order: 2,
+            convergence_tolerance: 1e-6,
+            max_iterations: 1,
+            reml_convergence_tolerance: 1e-6,
+            reml_max_iterations: 1,
+            firth_bias_reduction: false,
+            reml_parallel_threshold: 4,
+            pgs_basis_config: BasisConfig {
+                num_knots: 0,
+                degree: 0,
+            },
+            pc_configs: vec![],
+            pgs_range: (0.0, 1.0),
+            interaction_penalty: InteractionPenaltyKind::Anisotropic,
+            sum_to_zero_constraints: HashMap::new(),
+            knot_vectors: HashMap::new(),
+            range_transforms: HashMap::new(),
+            pc_null_transforms: HashMap::new(),
+            interaction_centering_means: HashMap::new(),
+            interaction_orth_alpha: HashMap::new(),
             mcmc_enabled: false,
             calibrator_enabled: false,
-            survival: None
+            survival: None,
         },
         coefficients: MappedCoefficients::default(),
         lambdas: vec![],
@@ -136,17 +154,30 @@ fn test_crude_risk_analytic_match() {
     let age_entry = array![0.0];
     let age_exit = array![10.0];
 
-    let pred = model.predict_survival(
-        age_entry.view(), age_exit.view(), array![0.0].view(), array![0.0].view(), Array2::zeros((1, 0)).view(),
-        SurvivalRiskType::Crude,
-        None
-    ).expect("Prediction success");
+    let pred = model
+        .predict_survival(
+            age_entry.view(),
+            age_exit.view(),
+            array![0.0].view(),
+            array![0.0].view(),
+            Array2::zeros((1, 0)).view(),
+            SurvivalRiskType::Crude,
+            None,
+        )
+        .expect("Prediction success");
 
     let risk = pred.conditional_risk[0];
-    let expected = (lambda_d / (lambda_d + lambda_m)) * (1.0 - (- (lambda_d + lambda_m) * 10.0).exp());
+    let expected =
+        (lambda_d / (lambda_d + lambda_m)) * (1.0 - (-(lambda_d + lambda_m) * 10.0).exp());
 
-    println!("Analytic Match - Computed: {:.8}, Expected: {:.8}", risk, expected);
-    assert!((risk - expected).abs() < 2e-3, "Integration deviation too large");
+    println!(
+        "Analytic Match - Computed: {:.8}, Expected: {:.8}",
+        risk, expected
+    );
+    assert!(
+        (risk - expected).abs() < 2e-3,
+        "Integration deviation too large"
+    );
 }
 
 // --- Test 2: Zero Mortality Limit ---
@@ -159,16 +190,25 @@ fn test_crude_risk_zero_mortality() {
     let mortality = make_constant_hazard_artifacts(lambda_m);
     let model = create_mock_trained_model(disease, Some(mortality));
 
-    let pred = model.predict_survival(
-        array![0.0].view(), array![10.0].view(), array![0.0].view(), array![0.0].view(), Array2::zeros((1, 0)).view(),
-        SurvivalRiskType::Crude,
-        None
-    ).expect("Prediction success");
+    let pred = model
+        .predict_survival(
+            array![0.0].view(),
+            array![10.0].view(),
+            array![0.0].view(),
+            array![0.0].view(),
+            Array2::zeros((1, 0)).view(),
+            SurvivalRiskType::Crude,
+            None,
+        )
+        .expect("Prediction success");
 
     let risk = pred.conditional_risk[0];
     let expected = 1.0 - (-lambda_d * 10.0).exp();
 
-    println!("Zero Mortality - Computed: {:.8}, Expected: {:.8}", risk, expected);
+    println!(
+        "Zero Mortality - Computed: {:.8}, Expected: {:.8}",
+        risk, expected
+    );
     assert!((risk - expected).abs() < 2e-3);
 }
 
@@ -182,26 +222,44 @@ fn test_crude_risk_high_mortality_suppression() {
     let mortality = make_constant_hazard_artifacts(lambda_m);
     let model = create_mock_trained_model(disease, Some(mortality));
 
-    let pred = model.predict_survival(
-        array![0.0].view(), array![10.0].view(), array![0.0].view(), array![0.0].view(), Array2::zeros((1, 0)).view(),
-        SurvivalRiskType::Crude,
-        None
-    ).unwrap();
+    let pred = model
+        .predict_survival(
+            array![0.0].view(),
+            array![10.0].view(),
+            array![0.0].view(),
+            array![0.0].view(),
+            Array2::zeros((1, 0)).view(),
+            SurvivalRiskType::Crude,
+            None,
+        )
+        .unwrap();
 
     let risk = pred.conditional_risk[0];
     println!("High Mortality - Risk: {:.8}", risk);
-    assert!(risk < 2e-3, "Risk should be negligible due to immediate competing event");
+    assert!(
+        risk < 2e-3,
+        "Risk should be negligible due to immediate competing event"
+    );
 
     // Check Net Risk (Immortal Cohort)
-    let net_pred = model.predict_survival(
-        array![0.0].view(), array![10.0].view(), array![0.0].view(), array![0.0].view(), Array2::zeros((1, 0)).view(),
-        SurvivalRiskType::Net,
-        None
-    ).unwrap();
+    let net_pred = model
+        .predict_survival(
+            array![0.0].view(),
+            array![10.0].view(),
+            array![0.0].view(),
+            array![0.0].view(),
+            Array2::zeros((1, 0)).view(),
+            SurvivalRiskType::Net,
+            None,
+        )
+        .unwrap();
     let net_risk = net_pred.conditional_risk[0];
     let expected_net = 1.0 - (-lambda_d * 10.0).exp();
 
-    println!("High Mortality - Net Risk: {:.8} (Expected ~{:.8})", net_risk, expected_net);
+    println!(
+        "High Mortality - Net Risk: {:.8} (Expected ~{:.8})",
+        net_risk, expected_net
+    );
     assert!((net_risk - expected_net).abs() < 1e-6);
 }
 
@@ -219,16 +277,37 @@ fn test_missing_companion_error() {
     let model = TrainedModel {
         config: ModelConfig {
             model_family: ModelFamily::Survival(SurvivalSpec::default()),
-            penalty_order: 2, convergence_tolerance: 1e-6, max_iterations: 1, reml_convergence_tolerance: 1e-6, reml_max_iterations: 1, firth_bias_reduction: false, reml_parallel_threshold: 4,
-            pgs_basis_config: BasisConfig { num_knots: 0, degree: 0 },
-            pc_configs: vec![], pgs_range: (0.0, 1.0), interaction_penalty: InteractionPenaltyKind::Anisotropic,
-            sum_to_zero_constraints: HashMap::new(), knot_vectors: HashMap::new(), range_transforms: HashMap::new(),
-            pc_null_transforms: HashMap::new(), interaction_centering_means: HashMap::new(), interaction_orth_alpha: HashMap::new(),
+            penalty_order: 2,
+            convergence_tolerance: 1e-6,
+            max_iterations: 1,
+            reml_convergence_tolerance: 1e-6,
+            reml_max_iterations: 1,
+            firth_bias_reduction: false,
+            reml_parallel_threshold: 4,
+            pgs_basis_config: BasisConfig {
+                num_knots: 0,
+                degree: 0,
+            },
+            pc_configs: vec![],
+            pgs_range: (0.0, 1.0),
+            interaction_penalty: InteractionPenaltyKind::Anisotropic,
+            sum_to_zero_constraints: HashMap::new(),
+            knot_vectors: HashMap::new(),
+            range_transforms: HashMap::new(),
+            pc_null_transforms: HashMap::new(),
+            interaction_centering_means: HashMap::new(),
+            interaction_orth_alpha: HashMap::new(),
             mcmc_enabled: false,
             calibrator_enabled: false,
-            survival: None
+            survival: None,
         },
-        coefficients: MappedCoefficients::default(), lambdas: vec![], hull: None, penalized_hessian: None, scale: None, calibrator: None, joint_link: None,
+        coefficients: MappedCoefficients::default(),
+        lambdas: vec![],
+        hull: None,
+        penalized_hessian: None,
+        scale: None,
+        calibrator: None,
+        joint_link: None,
         survival: Some(disease_model),
         survival_companions: HashMap::new(),
         mcmc_samples: None,
@@ -236,19 +315,23 @@ fn test_missing_companion_error() {
     };
 
     let res = model.predict_survival(
-        array![0.0].view(), array![10.0].view(), array![0.0].view(), array![0.0].view(), Array2::zeros((1, 0)).view(),
+        array![0.0].view(),
+        array![10.0].view(),
+        array![0.0].view(),
+        array![0.0].view(),
+        Array2::zeros((1, 0)).view(),
         SurvivalRiskType::Crude,
-        None
+        None,
     );
 
     assert!(res.is_err());
     let err = res.unwrap_err();
     match err {
         gnomon::calibrate::model::ModelError::SurvivalPrediction(
-            gnomon::calibrate::survival::SurvivalError::CompanionModelUnavailable { reference }
+            gnomon::calibrate::survival::SurvivalError::CompanionModelUnavailable { reference },
         ) => {
             assert_eq!(reference, "__internal_mortality");
-        },
+        }
         _ => panic!("Unexpected error type: {:?}", err),
     }
 }

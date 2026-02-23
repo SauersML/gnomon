@@ -1,6 +1,6 @@
 use crate::calibrate::basis::{
-    BasisError, SplineScratch, baseline_lambda_seed, create_difference_penalty_matrix,
-    evaluate_bspline_basis_scalar, null_range_whiten, create_basis, BasisOptions, Dense, KnotSource,
+    BasisError, BasisOptions, Dense, KnotSource, SplineScratch, baseline_lambda_seed, create_basis,
+    create_difference_penalty_matrix, evaluate_bspline_basis_scalar, null_range_whiten,
 };
 use crate::calibrate::calibrator::CalibratorModel;
 use crate::calibrate::estimate::EstimationError;
@@ -550,7 +550,9 @@ fn nullspace_transform(constraint_row: &Array1<f64>) -> Result<Array2<f64>, Surv
     let (u_opt, ..) = row_mat
         .svd(true, false)
         .map_err(|err| SurvivalError::Basis(BasisError::from(err)))?;
-    let u = u_opt.ok_or(SurvivalError::Basis(BasisError::ConstraintNullspaceNotFound))?;
+    let u = u_opt.ok_or(SurvivalError::Basis(
+        BasisError::ConstraintNullspaceNotFound,
+    ))?;
     Ok(u.slice(s![.., 1..]).to_owned())
 }
 
@@ -770,8 +772,11 @@ pub fn build_survival_layout(
     let baseline_cols = constrained_exit.ncols();
     let penalty_matrix =
         create_difference_penalty_matrix(baseline_cols, baseline_penalty_order, None)?;
-    let baseline_lambda =
-        baseline_lambda_seed(&age_basis.knot_vector, age_basis.degree, baseline_penalty_order);
+    let baseline_lambda = baseline_lambda_seed(
+        &age_basis.knot_vector,
+        age_basis.degree,
+        baseline_penalty_order,
+    );
     let mut penalty_blocks = vec![PenaltyBlock {
         matrix: penalty_matrix.clone(),
         lambda: baseline_lambda,
@@ -878,25 +883,26 @@ pub fn build_survival_layout(
                 if let (Ok((age_null, _)), Ok((pgs_null, _))) = (
                     null_range_whiten(&age_penalty_1d),
                     null_range_whiten(&pgs_penalty_1d),
-                )
-                    && age_null.ncols() > 0 && pgs_null.ncols() > 0 {
-                        let age_projector = age_null.dot(&age_null.t());
-                        let pgs_projector = pgs_null.dot(&pgs_null.t());
-                        let kron_null = kronecker_product(&age_projector, &pgs_projector);
-                        let norm_null = frobenius_norm(&kron_null).max(1e-12);
-                        let kron_null_normed = kron_null.mapv(|v| v / norm_null);
-                        penalty_blocks.push(PenaltyBlock {
-                            matrix: kron_null_normed.clone(),
-                            lambda: lambda_null,
-                            range: time_range.clone(),
-                        });
-                        penalty_descriptors.push(PenaltyDescriptor {
-                            order: 0,
-                            lambda: lambda_null,
-                            matrix: kron_null_normed,
-                            column_range: ColumnRange::new(time_range.start, time_range.end),
-                        });
-                    }
+                ) && age_null.ncols() > 0
+                    && pgs_null.ncols() > 0
+                {
+                    let age_projector = age_null.dot(&age_null.t());
+                    let pgs_projector = pgs_null.dot(&pgs_null.t());
+                    let kron_null = kronecker_product(&age_projector, &pgs_projector);
+                    let norm_null = frobenius_norm(&kron_null).max(1e-12);
+                    let kron_null_normed = kron_null.mapv(|v| v / norm_null);
+                    penalty_blocks.push(PenaltyBlock {
+                        matrix: kron_null_normed.clone(),
+                        lambda: lambda_null,
+                        range: time_range.clone(),
+                    });
+                    penalty_descriptors.push(PenaltyDescriptor {
+                        order: 0,
+                        lambda: lambda_null,
+                        matrix: kron_null_normed,
+                        column_range: ColumnRange::new(time_range.start, time_range.end),
+                    });
+                }
 
                 time_varying_entry = Some(time_entry);
                 time_varying_exit = Some(time_exit);
@@ -1272,7 +1278,6 @@ impl WorkingModelSurvival {
         self
     }
 
-
     fn build_expected_information_hessian(
         &self,
         beta: &Array1<f64>,
@@ -1324,13 +1329,16 @@ impl WorkingModelSurvival {
 
             let mut design = Array1::<f64>::zeros(p);
             let mut derivative_design = Array1::<f64>::zeros(p);
-            
+
             // Pre-compute PGS basis for this subject if time-varying effects are present
             let pgs_basis_reduced: Option<Vec<f64>> = if time_cols > 0 {
                 if let Some(ref tv_basis) = self.time_varying_basis {
                     // PGS is typically the first static covariate
                     let pgs_value = self.layout.static_covariates[[i, 0]];
-                    let pgs_dim = tv_basis.knot_vector.len().saturating_sub(tv_basis.degree + 1);
+                    let pgs_dim = tv_basis
+                        .knot_vector
+                        .len()
+                        .saturating_sub(tv_basis.degree + 1);
                     if pgs_dim > 1 {
                         let mut pgs_buff = vec![0.0; pgs_dim];
                         let mut scratch = SplineScratch::new(tv_basis.degree);
@@ -1340,7 +1348,9 @@ impl WorkingModelSurvival {
                             tv_basis.degree,
                             &mut pgs_buff,
                             &mut scratch,
-                        ).is_ok() {
+                        )
+                        .is_ok()
+                        {
                             // Skip first column (same as build_survival_layout logic)
                             Some(pgs_buff[1..].to_vec())
                         } else {
@@ -1355,7 +1365,7 @@ impl WorkingModelSurvival {
             } else {
                 None
             };
-            
+
             for j in 0..grid_size {
                 if left_bounds[j] >= exit_age {
                     break;
@@ -1368,16 +1378,18 @@ impl WorkingModelSurvival {
                 if right <= left {
                     continue;
                 }
-                
+
                 // Assign baseline columns from quadrature design
                 design.assign(&self.monotonicity.quadrature_design.row(j));
                 derivative_design.assign(&self.monotonicity.derivative_design.row(j));
-                
+
                 // Compute time-varying columns: tensor product of baseline_basis(grid_age) ⊗ pgs_basis
                 if time_cols > 0 {
                     if let Some(ref pgs_reduced) = pgs_basis_reduced {
                         // baseline basis at this grid point is in quadrature_design columns 0..baseline_cols
-                        let baseline_at_grid: Vec<f64> = self.monotonicity.quadrature_design
+                        let baseline_at_grid: Vec<f64> = self
+                            .monotonicity
+                            .quadrature_design
                             .row(j)
                             .slice(s![..baseline_cols])
                             .iter()
@@ -1391,7 +1403,7 @@ impl WorkingModelSurvival {
                             .iter()
                             .copied()
                             .collect();
-                        
+
                         // Tensor product: out[k*pgs_len + l] = baseline[k] * pgs[l]
                         let pgs_len = pgs_reduced.len();
                         let expected_time_cols = baseline_cols * pgs_len;
@@ -1413,7 +1425,7 @@ impl WorkingModelSurvival {
                         }
                     }
                 }
-                
+
                 if static_cols > 0 {
                     design
                         .slice_mut(s![static_offset..extra_offset])
@@ -1485,10 +1497,12 @@ impl WorkingModelSurvival {
                 }
             }
             if let Ok((_, _, _, _, _, inertia)) = ldlt_rook(&shifted)
-                && inertia.1 == 0 && inertia.2 == 0 {
-                    expected = -shifted;
-                    break;
-                }
+                && inertia.1 == 0
+                && inertia.2 == 0
+            {
+                expected = -shifted;
+                break;
+            }
             attempts += 1;
             if attempts >= max_attempts {
                 expected = -shifted;
@@ -1582,7 +1596,7 @@ impl WorkingModelSurvival {
         // H_exit = -X_exit^T * diag(w * h_e) * X_exit
         // H_entry = X_entry^T * diag(w * h_s) * X_entry
         // This replaces O(N) scalar outer products with O(1) BLAS-3 operations
-        
+
         // Compute weight vectors for vectorized accumulation
         let mut w_exit = Array1::<f64>::zeros(n);
         let mut w_entry = Array1::<f64>::zeros(n);
@@ -1615,17 +1629,21 @@ impl WorkingModelSurvival {
         let mut gradient = -self.layout.combined_exit.t().dot(&w_h_e);
         gradient += &self.layout.combined_entry.t().dot(&w_h_s);
         gradient += &self.layout.combined_exit.t().dot(&w_event);
-        gradient += &self.layout.combined_derivative_exit.t().dot(&w_event_scaled);
+        gradient += &self
+            .layout
+            .combined_derivative_exit
+            .t()
+            .dot(&w_event_scaled);
 
         // Vectorized Hessian: H += -sqrt(w*h_e)*X_exit)^T * (sqrt(w*h_e)*X_exit)
         // Using BLAS GEMM (via ndarray general_mat_mul) for efficiency
         {
             use ndarray::linalg::general_mat_mul;
-            
+
             // Create weighted design matrices: sqrt(w) * X
             let n_rows = self.layout.combined_exit.nrows();
             let n_cols = self.layout.combined_exit.ncols();
-            
+
             // Exit term: H -= (sqrt(w*h_e)*X)^T * (sqrt(w*h_e)*X)
             let mut wx_exit = Array2::<f64>::zeros((n_rows, n_cols));
             for i in 0..n_rows {
@@ -1675,9 +1693,9 @@ impl WorkingModelSurvival {
         if self.spec.use_expected_information
             && let Some(expected_hessian) =
                 self.build_expected_information_hessian(beta, &penalty_hessian)?
-            {
-                hessian = expected_hessian;
-            }
+        {
+            hessian = expected_hessian;
+        }
 
         Ok(WorkingState {
             eta: LinearPredictor::new(eta_exit),
@@ -1879,7 +1897,7 @@ fn clamp_covariates_to_ranges(
     }
 
     let mut clamped = covariates.to_owned();
-    
+
     for (idx, value) in clamped.iter_mut().enumerate() {
         if !value.is_finite() {
             return Err(SurvivalError::NonFiniteCovariate);
@@ -1900,7 +1918,7 @@ fn clamp_covariates_to_ranges(
                 max: range.max,
             });
         }
-        
+
         let original = *value;
         if range.min.is_finite() && *value < range.min {
             *value = range.min;
@@ -2195,7 +2213,8 @@ impl SurvivalDesignCache {
             return Err(SurvivalError::CovariateDimensionMismatch);
         }
         // Clamp covariates to training ranges (production-safe)
-        let clamped_covs = clamp_covariates_to_ranges(covariates, &artifacts.static_covariate_layout)?;
+        let clamped_covs =
+            clamp_covariates_to_ranges(covariates, &artifacts.static_covariate_layout)?;
 
         let baseline_cols = artifacts.reference_constraint.transform.ncols();
         let total_cols = artifacts.coefficients.len();
@@ -2513,7 +2532,7 @@ pub fn calculate_crude_risk_quadrature<'a>(
 ) -> Result<CrudeRiskResult, SurvivalError> {
     let coeff_len_d = disease_model.coefficients.len();
     let coeff_len_m = mortality_model.coefficients.len();
-    
+
     if t1 <= t0 {
         return Ok(CrudeRiskResult {
             risk: 0.0,
@@ -2614,7 +2633,7 @@ pub fn calculate_crude_risk_quadrature<'a>(
         &mut scratch_d,
     )?;
     let design_d_t0 = design_d.clone();
-    
+
     // Design row at entry age for mortality model (for H_M(t0) gradient)
     design_and_derivative_at_age_cached(
         t0,
@@ -3465,8 +3484,7 @@ mod tests {
         } = build_survival_layout(&data, &basis, 0.1, 2, 10, None).unwrap();
         let spec = SurvivalSpec::default();
         let beta = Array1::<f64>::zeros(layout.combined_exit.ncols());
-        let model =
-            WorkingModelSurvival::new(layout.clone(), &data, monotonicity, spec).unwrap();
+        let model = WorkingModelSurvival::new(layout.clone(), &data, monotonicity, spec).unwrap();
 
         let state = model.update_state(&beta).unwrap();
         assert!(state.deviance.is_finite());
@@ -3529,9 +3547,8 @@ mod tests {
         let slopes = monotonicity.derivative_design.dot(&beta);
         assert!(slopes.iter().any(|value| *value < MONOTONICITY_TOLERANCE));
 
-        let model =
-            WorkingModelSurvival::new(layout, &data, monotonicity, SurvivalSpec::default())
-                .unwrap();
+        let model = WorkingModelSurvival::new(layout, &data, monotonicity, SurvivalSpec::default())
+            .unwrap();
         let err = model.update_state(&beta).unwrap_err();
         assert!(matches!(err, SurvivalError::MonotonicityViolation { .. }));
     }
@@ -4280,17 +4297,23 @@ mod tests {
             .iter()
             .position(|name| name == "pgs")
             .expect("pgs column present");
-        
+
         // Values outside range should now be clamped silently, not error
         let mut covariates_high = covariates.clone();
         covariates_high[pgs_idx] = metadata.value_ranges[0].max + 0.5;
         let result_high = design_row_at_age(data.age_exit[0], covariates_high.view(), &artifacts);
-        assert!(result_high.is_ok(), "out-of-range PGS should be clamped, not error");
+        assert!(
+            result_high.is_ok(),
+            "out-of-range PGS should be clamped, not error"
+        );
 
         let mut covariates_low = covariates;
         covariates_low[pgs_idx] = metadata.value_ranges[0].min - 0.5;
         let result_low = design_row_at_age(data.age_exit[0], covariates_low.view(), &artifacts);
-        assert!(result_low.is_ok(), "out-of-range PGS should be clamped, not error");
+        assert!(
+            result_low.is_ok(),
+            "out-of-range PGS should be clamped, not error"
+        );
 
         let model = WorkingModelSurvival::new(
             layout.clone(),

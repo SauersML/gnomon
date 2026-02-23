@@ -36,7 +36,11 @@ fn base_values(strategy: SeedStrategy, bounds: (f64, f64)) -> Vec<f64> {
     match strategy {
         SeedStrategy::Single => vec![0.0],
         SeedStrategy::Light | SeedStrategy::Exhaustive => {
-            let step = if strategy == SeedStrategy::Light { 4.0 } else { 2.0 };
+            let step = if strategy == SeedStrategy::Light {
+                4.0
+            } else {
+                2.0
+            };
             let (lo, hi) = if bounds.0 <= bounds.1 {
                 bounds
             } else {
@@ -104,7 +108,12 @@ pub fn generate_rho_candidates(
     if num_penalties >= 2 {
         let templates: Vec<(f64, f64)> = pairwise_templates(config.strategy)
             .into_iter()
-            .map(|(hi, lo)| (clamp_to_bounds(hi, config.bounds), clamp_to_bounds(lo, config.bounds)))
+            .map(|(hi, lo)| {
+                (
+                    clamp_to_bounds(hi, config.bounds),
+                    clamp_to_bounds(lo, config.bounds),
+                )
+            })
             .collect();
         for i in 0..num_penalties {
             for j in (i + 1)..num_penalties {

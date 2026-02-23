@@ -257,11 +257,8 @@ fn train_survival_from_args(args: &TrainArgs) -> Result<(), Box<dyn std::error::
         "Loading survival training data from: {}",
         args.training_data
     );
-    let bundle = load_survival_training_data(
-        &args.training_data,
-        args.num_pcs,
-        args.survival_guard_delta,
-    )?;
+    let bundle =
+        load_survival_training_data(&args.training_data, args.num_pcs, args.survival_guard_delta)?;
     println!(
         "Loaded {} samples with {} PCs",
         bundle.data.age_entry.len(),
@@ -291,9 +288,7 @@ fn train_survival_from_args(args: &TrainArgs) -> Result<(), Box<dyn std::error::
     if let Some(settings) = &time_varying {
         println!(
             "Enabling time-varying PGS × age interaction (knots={}, degree={}, penalty order={})",
-            settings.pgs_basis.num_knots,
-            settings.pgs_basis.degree,
-            settings.pgs_penalty_order
+            settings.pgs_basis.num_knots, settings.pgs_basis.degree, settings.pgs_penalty_order
         );
     }
 
@@ -436,12 +431,7 @@ pub fn infer(args: InferArgs) -> Result<(), Box<dyn std::error::Error>> {
             };
 
             let output_path = "predictions.tsv";
-            save_survival_predictions(
-                output_path,
-                &data,
-                &prediction,
-                calibrated_risk.as_ref(),
-            )?;
+            save_survival_predictions(output_path, &data, &prediction, calibrated_risk.as_ref())?;
             println!("Predictions saved to: {output_path}");
         }
     }

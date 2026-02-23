@@ -522,9 +522,7 @@ where
                 bytes_per_variant,
                 n_variants,
             } => {
-                let total_bytes = bytes_per_variant
-                    .checked_mul(*n_variants)
-                    .unwrap_or(0);
+                let total_bytes = bytes_per_variant.checked_mul(*n_variants).unwrap_or(0);
                 if packed.len() < total_bytes {
                     return;
                 }
@@ -539,7 +537,12 @@ where
                     }
                     let dest_offset = variant_idx * self.n_samples;
                     let dest = &mut storage[dest_offset..dest_offset + self.n_samples];
-                    decode_packed_hard_calls(&packed[byte_start..byte_end], dest, self.n_samples, table);
+                    decode_packed_hard_calls(
+                        &packed[byte_start..byte_end],
+                        dest,
+                        self.n_samples,
+                        table,
+                    );
                 }
             }
             CacheState::ReadyDense { data, n_variants } => {
@@ -598,7 +601,10 @@ where
             return Ok(0);
         }
 
-        if matches!(self.state, CacheState::ReadyHardCall { .. } | CacheState::ReadyDense { .. }) {
+        if matches!(
+            self.state,
+            CacheState::ReadyHardCall { .. } | CacheState::ReadyDense { .. }
+        ) {
             let remaining = self.n_variants.saturating_sub(self.cursor);
             if remaining == 0 {
                 return Ok(0);
@@ -679,12 +685,7 @@ where
                         *observed_variants,
                     ) {
                         if packed_count < filled {
-                            dense.push_block_range(
-                                storage,
-                                packed_count,
-                                filled,
-                                self.n_samples,
-                            );
+                            dense.push_block_range(storage, packed_count, filled, self.n_samples);
                             *observed_variants = base_observed.saturating_add(filled);
                         }
                         self.state = CacheState::BuildingDense {
@@ -1051,7 +1052,6 @@ impl HweScaler {
         let scales = &self.scales[start..end];
         standardize_block_impl(block, freqs, scales, par);
     }
-
 }
 
 fn standardize_block_with_mask_from_stats(
@@ -1379,10 +1379,7 @@ fn detected_simd_lane_selection() -> SimdLaneSelection {
         any(target_arch = "aarch64", target_arch = "wasm32")
     ))]
     {
-        record_simd_lane_diagnostic(
-            "default lanes4 architecture",
-            SimdLaneSelection::Lanes4,
-        )
+        record_simd_lane_diagnostic("default lanes4 architecture", SimdLaneSelection::Lanes4)
     }
 
     #[cfg(not(any(
@@ -2001,21 +1998,24 @@ impl HwePcaModel {
 
         // Reset source after LD computation
         if ld_weights_arc.is_some() {
-            source.reset().map_err(|err| HwePcaError::Source(Box::new(err)))?;
+            source
+                .reset()
+                .map_err(|err| HwePcaError::Source(Box::new(err)))?;
         }
 
         // Choose between dense and matrix-free paths
         let (decomposition, scaler, observed_variants) = match gram_mode {
             CovarianceComputationMode::Dense => {
                 // PATH A: Dense - Use fused pass for small/medium datasets
-                let (scaler, observed_variants, covariance) = compute_stats_and_covariance_blockwise(
-                    source,
-                    block_capacity,
-                    par,
-                    progress,
-                    n_variants_hint,
-                    ld_weights_arc.clone(),
-                )?;
+                let (scaler, observed_variants, covariance) =
+                    compute_stats_and_covariance_blockwise(
+                        source,
+                        block_capacity,
+                        par,
+                        progress,
+                        n_variants_hint,
+                        ld_weights_arc.clone(),
+                    )?;
 
                 // Decompose the dense covariance matrix
                 let eig_result = covariance.as_ref().self_adjoint_eigen(Side::Upper);
@@ -2026,19 +2026,20 @@ impl HwePcaModel {
                         let n_eig = eigenvalues_diag.dim();
 
                         // Create index-value pairs for sorting (descending by eigenvalue)
-                        let mut indexed_values: Vec<(usize, f64)> = (0..n_eig)
-                            .map(|i| (i, eigenvalues_diag[i]))
-                            .collect();
+                        let mut indexed_values: Vec<(usize, f64)> =
+                            (0..n_eig).map(|i| (i, eigenvalues_diag[i])).collect();
 
                         // Select top k components by eigenvalue magnitude
                         let kept = select_top_k_desc(&mut indexed_values, target_components);
 
                         // Extract selected values and vectors
-                        let selected_values: Vec<f64> = indexed_values[..kept].iter().map(|(_, val)| *val).collect();
-                        let selected_vectors = Mat::from_fn(eigenvectors_mat.nrows(), kept, |row, col| {
-                            let original_col = indexed_values[col].0;
-                            eigenvectors_mat[(row, original_col)]
-                        });
+                        let selected_values: Vec<f64> =
+                            indexed_values[..kept].iter().map(|(_, val)| *val).collect();
+                        let selected_vectors =
+                            Mat::from_fn(eigenvectors_mat.nrows(), kept, |row, col| {
+                                let original_col = indexed_values[col].0;
+                                eigenvectors_mat[(row, original_col)]
+                            });
 
                         Eigenpairs {
                             values: selected_values,
@@ -2064,7 +2065,10 @@ impl HwePcaModel {
 
                 // First pass: compute statistics only
                 progress.on_stage_start(FitProgressStage::AlleleStatistics, n_variants_hint);
-                let stats_progress = StageProgressHandle::new(Arc::clone(progress), FitProgressStage::AlleleStatistics);
+                let stats_progress = StageProgressHandle::new(
+                    Arc::clone(progress),
+                    FitProgressStage::AlleleStatistics,
+                );
                 let (scaler, observed_variants) = compute_variant_statistics(
                     source,
                     block_capacity,
@@ -2613,7 +2617,6 @@ where
             self.fail_invalid("VariantBlockSource terminated early during covariance accumulation");
         }
     }
-
 
     fn conj_apply(
         &self,
@@ -3421,7 +3424,6 @@ where
     Ok((scaler, processed))
 }
 
-
 fn build_sample_scores(n_samples: usize, decomposition: &Eigenpairs) -> (Vec<f64>, Mat<f64>) {
     let mut singular_values = Vec::with_capacity(decomposition.values.len());
     let mut sample_scores = decomposition.vectors.clone();
@@ -3474,7 +3476,8 @@ where
 
     // Start progress tracking for combined pass
     progress.on_stage_start(FitProgressStage::AlleleStatistics, n_variants_hint);
-    let stats_progress = StageProgressHandle::new(Arc::clone(progress), FitProgressStage::AlleleStatistics);
+    let stats_progress =
+        StageProgressHandle::new(Arc::clone(progress), FitProgressStage::AlleleStatistics);
 
     source
         .reset()
@@ -3803,7 +3806,7 @@ impl LdRingBuffer {
         if capacity == 0 {
             return 0;
         }
-        
+
         if self.len < capacity {
             let slot = (self.start + self.len) % capacity;
             self.len += 1;
@@ -4581,8 +4584,6 @@ where
     let block_capacity = block_capacity;
     let block_len = block_len;
     let expected_variants = expected_variants;
-
-    
 
     thread::scope(|scope| {
         let buffer_ptrs_prefetch = buffer_ptrs;

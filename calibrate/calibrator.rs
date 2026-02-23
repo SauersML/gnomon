@@ -1,6 +1,6 @@
 use crate::calibrate::basis::{
-    apply_weighted_orthogonality_constraint, compute_greville_abscissae, create_basis,
-    create_difference_penalty_matrix, BasisError, BasisOptions, Dense, KnotSource,
+    BasisError, BasisOptions, Dense, KnotSource, apply_weighted_orthogonality_constraint,
+    compute_greville_abscissae, create_basis, create_difference_penalty_matrix,
 };
 use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::faer_ndarray::FaerArrayView;
@@ -759,13 +759,14 @@ pub fn build_calibrator_design(
     }
 
     if let Some(w) = spec.prior_weights.as_ref()
-        && w.len() != n {
-            return Err(EstimationError::InvalidSpecification(format!(
-                "Calibrator prior weights length {} does not match number of observations {}",
-                w.len(),
-                n
-            )));
-        }
+        && w.len() != n
+    {
+        return Err(EstimationError::InvalidSpecification(format!(
+            "Calibrator prior weights length {} does not match number of observations {}",
+            w.len(),
+            n
+        )));
+    }
     if features.fisher_weights.len() != n {
         return Err(EstimationError::InvalidSpecification(format!(
             "Calibrator fisher weights length {} does not match number of observations {}",
@@ -1357,12 +1358,14 @@ pub fn build_calibrator_design(
         KnotSource::Provided(knots_pred.view()),
         spec.pred_basis.degree,
         BasisOptions::value(),
-    )?;    let (b_se_raw, _) = create_basis::<Dense>(
+    )?;
+    let (b_se_raw, _) = create_basis::<Dense>(
         se_std.view(),
         KnotSource::Provided(knots_se.view()),
         spec.se_basis.degree,
         BasisOptions::value(),
-    )?;    let pred_raw_cols = b_pred_raw.ncols();
+    )?;
+    let pred_raw_cols = b_pred_raw.ncols();
     let se_raw_cols = b_se_raw.ncols();
 
     let offset = features.pred_identity.clone();
@@ -1624,7 +1627,8 @@ pub fn build_calibrator_design(
             KnotSource::Provided(knots_dist_generated.view()),
             spec.dist_basis.degree,
             BasisOptions::value(),
-        )?;        let dist_raw_cols = b_dist_raw.ncols();
+        )?;
+        let dist_raw_cols = b_dist_raw.ncols();
 
         // Always enforce identifiability constraints so the optimizer sees the true nullspace
         // Replace STZ with full polynomial nullspace removal to match penalty nullspace
@@ -2017,12 +2021,13 @@ pub fn predict_calibrator(
     let b_pred = if n_pred_cols == 0 {
         Array2::<f64>::zeros((n, 0))
     } else {
-        let (b_pred_raw_arc, _) = crate::calibrate::basis::create_basis::<crate::calibrate::basis::Dense>(
-            pred_std.view(),
-            crate::calibrate::basis::KnotSource::Provided(model.knots_pred.view()),
-            model.spec.pred_basis.degree,
-            crate::calibrate::basis::BasisOptions::value(),
-        )?;
+        let (b_pred_raw_arc, _) =
+            crate::calibrate::basis::create_basis::<crate::calibrate::basis::Dense>(
+                pred_std.view(),
+                crate::calibrate::basis::KnotSource::Provided(model.knots_pred.view()),
+                model.spec.pred_basis.degree,
+                crate::calibrate::basis::BasisOptions::value(),
+            )?;
         let b_pred_raw = (*b_pred_raw_arc).clone();
         b_pred_raw.dot(&model.pred_constraint_transform)
     };
@@ -2041,12 +2046,13 @@ pub fn predict_calibrator(
     let b_se = if n_se_cols == 0 {
         Array2::<f64>::zeros((n, 0))
     } else {
-        let (b_se_raw_arc, _) = crate::calibrate::basis::create_basis::<crate::calibrate::basis::Dense>(
-            se_std.view(),
-            crate::calibrate::basis::KnotSource::Provided(model.knots_se.view()),
-            model.spec.se_basis.degree,
-            crate::calibrate::basis::BasisOptions::value(),
-        )?;
+        let (b_se_raw_arc, _) =
+            crate::calibrate::basis::create_basis::<crate::calibrate::basis::Dense>(
+                se_std.view(),
+                crate::calibrate::basis::KnotSource::Provided(model.knots_se.view()),
+                model.spec.se_basis.degree,
+                crate::calibrate::basis::BasisOptions::value(),
+            )?;
         let b_se_raw = (*b_se_raw_arc).clone();
         b_se_raw.dot(&model.stz_se)
     };
@@ -2054,12 +2060,13 @@ pub fn predict_calibrator(
     let b_dist = if n_dist_cols == 0 {
         Array2::<f64>::zeros((n, 0))
     } else {
-        let (b_dist_raw_arc, _) = crate::calibrate::basis::create_basis::<crate::calibrate::basis::Dense>(
-            dist_std.view(),
-            crate::calibrate::basis::KnotSource::Provided(model.knots_dist.view()),
-            model.spec.dist_basis.degree,
-            crate::calibrate::basis::BasisOptions::value(),
-        )?;
+        let (b_dist_raw_arc, _) =
+            crate::calibrate::basis::create_basis::<crate::calibrate::basis::Dense>(
+                dist_std.view(),
+                crate::calibrate::basis::KnotSource::Provided(model.knots_dist.view()),
+                model.spec.dist_basis.degree,
+                crate::calibrate::basis::BasisOptions::value(),
+            )?;
         let b_dist_raw = (*b_dist_raw_arc).clone();
         b_dist_raw.dot(&model.stz_dist)
     };
@@ -2121,7 +2128,10 @@ pub fn predict_calibrator(
             let probs = eta_c.mapv(|e| 1.0 / (1.0 + (-e).exp()));
 
             // Verify all probabilities are valid
-            if probs.iter().any(|&p| !(0.0..=1.0).contains(&p) || !p.is_finite()) {
+            if probs
+                .iter()
+                .any(|&p| !(0.0..=1.0).contains(&p) || !p.is_finite())
+            {
                 eprintln!("[CAL] ERROR: Invalid probability values in prediction");
                 return Err(EstimationError::PredictionError);
             }
@@ -2526,10 +2536,7 @@ mod tests {
             for i in 0..p {
                 s_ridge[[i, i]] += pirls.ridge_used;
             }
-            let chol_s = s_ridge
-                .clone()
-                .cholesky(Side::Lower)
-                .expect("S+ridge SPD");
+            let chol_s = s_ridge.clone().cholesky(Side::Lower).expect("S+ridge SPD");
             2.0 * chol_s.diag().mapv(|v: f64| v.ln()).sum()
         } else {
             pirls.reparam_result.log_det
@@ -2621,10 +2628,7 @@ mod tests {
             for i in 0..p {
                 s_ridge[[i, i]] += pirls.ridge_used;
             }
-            let chol_s = s_ridge
-                .clone()
-                .cholesky(Side::Lower)
-                .expect("S+ridge SPD");
+            let chol_s = s_ridge.clone().cholesky(Side::Lower).expect("S+ridge SPD");
             2.0 * chol_s.diag().mapv(|v: f64| v.ln()).sum()
         } else {
             pirls.reparam_result.log_det
@@ -3675,8 +3679,7 @@ mod tests {
         );
 
         // Compare returned SE vs full-sample naive SE (should match exactly)
-        let (rmse_se, max_abs_se, _, _) =
-            loo_compare(&alo.se, &naive_se, &naive_se, &naive_se);
+        let (rmse_se, max_abs_se, _, _) = loo_compare(&alo.se, &naive_se, &naive_se, &naive_se);
 
         println!(
             "[LOGIT SE] alo.se vs naive_se: rmse={:.3e}, max_abs={:.3e}",
@@ -3804,8 +3807,7 @@ mod tests {
         );
 
         // Compare returned SE vs full-sample naive SE
-        let (rmse_se, max_abs_se, _, _) =
-            loo_compare(&alo.se, &naive_se, &naive_se, &naive_se);
+        let (rmse_se, max_abs_se, _, _) = loo_compare(&alo.se, &naive_se, &naive_se, &naive_se);
 
         println!(
             "[GAUSS SE] alo.se vs naive_se: rmse={:.3e}, max_abs={:.3e}",
@@ -3986,13 +3988,14 @@ mod tests {
         }
 
         let pred_std = Array1::zeros(n);
-        let (b_pred_raw, _) = crate::calibrate::basis::create_basis::<crate::calibrate::basis::Dense>(
-            pred_std.view(),
-            crate::calibrate::basis::KnotSource::Provided(schema.knots_pred.view()),
-            spec.pred_basis.degree,
-            crate::calibrate::basis::BasisOptions::value(),
-        )
-        .unwrap();
+        let (b_pred_raw, _) =
+            crate::calibrate::basis::create_basis::<crate::calibrate::basis::Dense>(
+                pred_std.view(),
+                crate::calibrate::basis::KnotSource::Provided(schema.knots_pred.view()),
+                spec.pred_basis.degree,
+                crate::calibrate::basis::BasisOptions::value(),
+            )
+            .unwrap();
 
         let mut max_raw_norm = 0.0_f64;
         for j in 0..b_pred_raw.ncols() {

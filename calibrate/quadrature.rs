@@ -101,23 +101,23 @@ fn compute_gauss_hermite() -> GaussHermiteRule {
     // Build symmetric tridiagonal Jacobi matrix for physicist's Hermite polynomials
     // For the recurrence aₙHₙ₊₁ = (x - bₙ)Hₙ - cₙHₙ₋₁ where cₙ = n/(2aₙ₋₁)
     // The Jacobi matrix has: J[i,i] = 0, J[i,i+1] = J[i+1,i] = sqrt((i+1)/2)
-    
-    let mut diag = [0.0f64; N_POINTS];  // All zeros for Hermite
+
+    let mut diag = [0.0f64; N_POINTS]; // All zeros for Hermite
     let mut off_diag = [0.0f64; N_POINTS - 1];
-    
+
     for i in 0..(N_POINTS - 1) {
         // Off-diagonal: sqrt((i+1)/2) for physicist's Hermite
         off_diag[i] = (((i + 1) as f64) / 2.0).sqrt();
     }
-    
+
     // Find eigenvalues and eigenvectors using symmetric tridiagonal QR algorithm
     // This is the implicit symmetric QR algorithm with Wilkinson shifts
     let (eigenvalues, eigenvectors) = symmetric_tridiagonal_eigen(&mut diag, &mut off_diag);
-    
+
     // Nodes are the eigenvalues (sorted)
     let nodes = eigenvalues;
     let mut weights = [0.0f64; N_POINTS];
-    
+
     // Weights: wᵢ = μ₀ * (first component of eigenvector)²
     // For physicist's Hermite: μ₀ = ∫exp(-x²)dx = sqrt(π)
     let mu0 = std::f64::consts::PI.sqrt();
@@ -125,14 +125,14 @@ fn compute_gauss_hermite() -> GaussHermiteRule {
         let v0 = eigenvectors[i][0];
         weights[i] = mu0 * v0 * v0;
     }
-    
+
     // Sort nodes (and corresponding weights) in ascending order
     let mut indices: [usize; N_POINTS] = [0, 1, 2, 3, 4, 5, 6];
     indices.sort_by(|&a, &b| nodes[a].partial_cmp(&nodes[b]).unwrap());
-    
+
     let sorted_nodes: [f64; N_POINTS] = std::array::from_fn(|i| nodes[indices[i]]);
     let sorted_weights: [f64; N_POINTS] = std::array::from_fn(|i| weights[indices[i]]);
-    
+
     GaussHermiteRule {
         nodes: sorted_nodes,
         weights: sorted_weights,
@@ -151,10 +151,10 @@ fn symmetric_tridiagonal_eigen(
     for i in 0..N_POINTS {
         z[i][i] = 1.0;
     }
-    
+
     let eps = 1e-15;
     let max_iter = 100;
-    
+
     // Work on successively smaller submatrices
     let mut n = N_POINTS;
     while n > 1 {
@@ -169,22 +169,22 @@ fn symmetric_tridiagonal_eigen(
                 }
                 m -= 1;
             }
-            
+
             if m == n - 1 {
                 // Last element converged
                 n -= 1;
                 break;
             }
-            
+
             // Wilkinson shift: eigenvalue of trailing 2x2 closer to diag[n-1]
             let d = (diag[n - 2] - diag[n - 1]) / 2.0;
             let e = off_diag[n - 2];
             let shift = diag[n - 1] - e * e / (d + d.signum() * (d * d + e * e).sqrt());
-            
+
             // Implicit QR step with shift
             let mut x = diag[m] - shift;
             let mut y = off_diag[m];
-            
+
             for k in m..(n - 1) {
                 // Givens rotation to zero out y
                 let (c, s) = if y.abs() > eps {
@@ -193,26 +193,26 @@ fn symmetric_tridiagonal_eigen(
                 } else {
                     (1.0, 0.0)
                 };
-                
+
                 // Apply rotation to tridiagonal matrix
                 if k > m {
                     off_diag[k - 1] = (x * x + y * y).sqrt();
                 }
-                
+
                 let d1 = diag[k];
                 let d2 = diag[k + 1];
                 let e_k = off_diag[k];
-                
+
                 diag[k] = c * c * d1 + s * s * d2 - 2.0 * c * s * e_k;
                 diag[k + 1] = s * s * d1 + c * c * d2 + 2.0 * c * s * e_k;
                 off_diag[k] = c * s * (d1 - d2) + (c * c - s * s) * e_k;
-                
+
                 if k < n - 2 {
                     x = off_diag[k];
                     y = -s * off_diag[k + 1];
                     off_diag[k + 1] *= c;
                 }
-                
+
                 // Accumulate rotation into eigenvector matrix
                 for i in 0..N_POINTS {
                     let t = z[k][i];
@@ -222,7 +222,7 @@ fn symmetric_tridiagonal_eigen(
             }
         }
     }
-    
+
     (*diag, z)
 }
 
@@ -244,7 +244,7 @@ pub fn logit_posterior_mean(ctx: &QuadratureContext, eta: f64, se_eta: f64) -> f
     }
 
     let gh = ctx.gauss_hermite();
-    
+
     // Gauss-Hermite integration: E[f(η)] = ∫ f(η) φ(η) dη
     // Transform: η = eta + sqrt(2) * se_eta * x, where x ~ standard Hermite measure
     // This gives: E[f(η)] ≈ (1/sqrt(π)) Σᵢ wᵢ f(eta + sqrt(2) * se_eta * xᵢ)
@@ -278,7 +278,7 @@ pub fn logit_posterior_mean_with_deriv(
     se_eta: f64,
 ) -> (f64, f64) {
     const MIN_DERIV: f64 = 1e-6;
-    
+
     // If SE is negligible, return standard sigmoid and its derivative
     if se_eta < 1e-10 {
         let mu = sigmoid(eta);
@@ -289,22 +289,22 @@ pub fn logit_posterior_mean_with_deriv(
     let gh = ctx.gauss_hermite();
     let scale = std::f64::consts::SQRT_2 * se_eta;
     let norm = 1.0 / std::f64::consts::PI.sqrt();
-    
+
     let mut sum_mu = 0.0;
     let mut sum_dmu = 0.0;
 
     for i in 0..N_POINTS {
         let eta_i = eta + scale * gh.nodes[i];
         let prob_i = sigmoid(eta_i);
-        let deriv_i = prob_i * (1.0 - prob_i);  // σ'(η) = σ(η)(1-σ(η))
-        
+        let deriv_i = prob_i * (1.0 - prob_i); // σ'(η) = σ(η)(1-σ(η))
+
         sum_mu += gh.weights[i] * prob_i;
         sum_dmu += gh.weights[i] * deriv_i;
     }
 
     let mu = (sum_mu * norm).clamp(1e-10, 1.0 - 1e-10);
     let dmu = (sum_dmu * norm).max(MIN_DERIV);
-    
+
     (mu, dmu)
 }
 
@@ -318,13 +318,13 @@ pub fn logit_posterior_mean_with_deriv_batch(
     let n = eta.len();
     let mut mu = ndarray::Array1::<f64>::zeros(n);
     let mut dmu = ndarray::Array1::<f64>::zeros(n);
-    
+
     for i in 0..n {
         let (m, d) = logit_posterior_mean_with_deriv(ctx, eta[i], se_eta[i]);
         mu[i] = m;
         dmu[i] = d;
     }
-    
+
     (mu, dmu)
 }
 
