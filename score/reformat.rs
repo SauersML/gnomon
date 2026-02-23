@@ -22,8 +22,10 @@ use std::sync::Mutex;
 
 #[derive(Clone, Debug)]
 pub struct ReformatOutcome {
-    pub score_label: String,
+    pub score_label: Option<String>,
     pub skip_summary: Option<SkipSummary>,
+    pub warning: Option<String>,
+    pub wrote_output: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -300,6 +302,36 @@ pub fn reformat_pgs_file(input_path: &Path, output_path: &Path) -> Result<Reform
         hm_rs_id: Option<usize>,
     }
 
+    let derive_score_label = |score_id: Option<&String>| -> String {
+        score_id
+            .filter(|id| !id.eq_ignore_ascii_case("PGS_SCORE"))
+            .cloned()
+            .unwrap_or_else(|| {
+                input_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(|s| {
+                        // Smart fallback: include parent directory to reduce stem collisions.
+                        if let Some(parent_name) = input_path
+                            .parent()
+                            .and_then(|p| p.file_name())
+                            .and_then(|n| n.to_str())
+                            && parent_name != "." && parent_name != "/" {
+                                return format!("{}_{}", parent_name, s);
+                            }
+                        s.to_string()
+                    })
+                    .unwrap_or_else(|| {
+                        use std::time::{SystemTime, UNIX_EPOCH};
+                        let nanos = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_nanos())
+                            .unwrap_or(0);
+                        format!("PGS_SCORE_{}", nanos)
+                    })
+            })
+    };
+
     // --- Open file and handle potential GZIP compression ---
     let file = File::open(input_path)?;
     let a_reader: Box<dyn Read + Send> = if input_path.extension().is_some_and(|ext| ext == "gz") {
@@ -367,6 +399,27 @@ pub fn reformat_pgs_file(input_path: &Path, output_path: &Path) -> Result<Reform
         .enumerate()
         .map(|(i, name)| (name, i))
         .collect();
+
+    let has_effect_weight = header_map.contains_key("effect_weight");
+    let has_dosage_weights = header_map.contains_key("dosage_0_weight")
+        && header_map.contains_key("dosage_1_weight")
+        && header_map.contains_key("dosage_2_weight");
+
+    if !has_effect_weight && has_dosage_weights {
+        let label = derive_score_label(score_id.as_ref());
+        let warning = format!(
+            "Unsupported score format in '{}': found genotype-specific weights \
+('dosage_0_weight', 'dosage_1_weight', 'dosage_2_weight') but no additive \
+'effect_weight'. This score is skipped.",
+            input_path.display()
+        );
+        return Ok(ReformatOutcome {
+            score_label: Some(label),
+            skip_summary: None,
+            warning: Some(warning),
+            wrote_output: false,
+        });
+    }
 
     let column_indices = ColumnIndices {
         chr: header_map.get("chr_name").copied(),
@@ -450,34 +503,7 @@ pub fn reformat_pgs_file(input_path: &Path, output_path: &Path) -> Result<Reform
     // 1. If `#pgs_id` is present AND NOT generic "PGS_SCORE", use it.
     // 2. Otherwise, use filename stem.
     // 3. Fallback to unique generation to avoid collisions.
-    let score_label = score_id
-        .filter(|id| !id.eq_ignore_ascii_case("PGS_SCORE"))
-        .unwrap_or_else(|| {
-            input_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .map(|s| {
-                    // Smart Fallback: If parent directory exists, prepend it to avoid collisions
-                    // like "positive/score.txt" vs "negative/score.txt" -> "score" vs "score".
-                    // Result: "positive_score" vs "negative_score".
-                    if let Some(parent_name) = input_path
-                        .parent()
-                        .and_then(|p| p.file_name())
-                        .and_then(|n| n.to_str())
-                        && parent_name != "." && parent_name != "/" {
-                            return format!("{}_{}", parent_name, s);
-                        }
-                    s.to_string()
-                })
-                .unwrap_or_else(|| {
-                    use std::time::{SystemTime, UNIX_EPOCH};
-                    let nanos = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .map(|d| d.as_nanos())
-                        .unwrap_or(0);
-                    format!("PGS_SCORE_{}", nanos)
-                })
-        });
+    let score_label = derive_score_label(score_id.as_ref());
 
     // --- Define the resolver closure based on the chosen strategy ---
     // The `move` keyword captures the `column_indices` struct by value.
@@ -669,8 +695,10 @@ pub fn reformat_pgs_file(input_path: &Path, output_path: &Path) -> Result<Reform
     };
 
     Ok(ReformatOutcome {
-        score_label,
+        score_label: Some(score_label),
         skip_summary,
+        warning: None,
+        wrote_output: true,
     })
 }
 
@@ -955,4 +983,43 @@ fn parse_key(chr_str: &str, pos_str: &str) -> Result<(u8, u32), String> {
         .map_err(|e: ParseIntError| format!("Invalid position '{pos_str}': {e}"))?;
 
     Ok((chr_num, pos_num))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::tempdir;
+
+    #[test]
+    fn detects_dosage_weight_format_and_skips_without_error() {
+        let tmp = tempdir().expect("tempdir");
+        let input_path = tmp.path().join("PGS_TEST.txt");
+        let output_path = tmp.path().join("PGS_TEST.gnomon.tsv");
+
+        let mut input = File::create(&input_path).expect("create input");
+        writeln!(
+            input,
+            "###PGS CATALOG SCORING FILE - test\n\
+#format_version=2.0\n\
+#pgs_id=PGS_TEST\n\
+#genome_build=hg19\n\
+#HmPOS_build=GRCh38\n\
+chr_name\tchr_position\teffect_allele\tother_allele\tdosage_0_weight\tdosage_1_weight\tdosage_2_weight\thm_chr\thm_pos\n\
+1\t100\tA\tG\t0.0\t0.1\t0.2\t1\t100"
+        )
+        .expect("write input");
+
+        let outcome = reformat_pgs_file(&input_path, &output_path).expect("reformat outcome");
+
+        assert!(
+            !outcome.wrote_output,
+            "dosage-weight score should be skipped"
+        );
+        assert!(outcome.warning.is_some(), "expected explicit warning");
+        assert!(
+            !output_path.exists(),
+            "no normalized output should be produced for skipped score"
+        );
+    }
 }

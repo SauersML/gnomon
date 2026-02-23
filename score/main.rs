@@ -454,12 +454,29 @@ fn run_preparation_phase(
 
                     match reformat::reformat_pgs_file(score_file_path, &new_path) {
                         Ok(outcome) => {
-                            eprintln!("> Success: Converted to '{}'.", new_path.display());
-                            if let Some(summary) = outcome.skip_summary {
-                                skip_summaries.push(summary);
+                            if outcome.wrote_output {
+                                eprintln!("> Success: Converted to '{}'.", new_path.display());
+                                if let Some(summary) = outcome.skip_summary {
+                                    skip_summaries.push(summary);
+                                }
+                                native_score_files.push(new_path.clone());
+                                outcome
+                                    .score_label
+                                    .ok_or_else(|| {
+                                        "Internal error: missing score label after successful conversion."
+                                            .to_string()
+                                    })?
+                            } else {
+                                if let Some(warning) = outcome.warning {
+                                    eprintln!("> Warning: {warning}");
+                                } else {
+                                    eprintln!(
+                                        "> Warning: Unsupported score format for '{}'; skipping.",
+                                        score_file_path.display()
+                                    );
+                                }
+                                continue;
                             }
-                            native_score_files.push(new_path.clone());
-                            outcome.score_label
                         }
                         Err(e) => {
                             return Err(Box::new(e));
@@ -502,6 +519,14 @@ fn run_preparation_phase(
     // a source file (e.g. score.txt) and its converted output (score.gnomon.tsv).
     native_score_files.sort();
     native_score_files.dedup();
+    if native_score_files.is_empty() {
+        return Err(
+            "No compatible score files remained after normalization. \
+Scores that only provide dosage-specific weights \
+('dosage_0_weight', 'dosage_1_weight', 'dosage_2_weight') are currently unsupported."
+                .into(),
+        );
+    }
 
     // --- Run the main preparation logic with the fully normalized and sorted files ---
     let prep = prepare::prepare_for_computation(

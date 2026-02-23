@@ -139,23 +139,37 @@ pub fn resolve_and_download_scores(
     let reformatted = files_to_reformat
         .into_par_iter()
         .map(
-            |(input_path, final_native_path)| -> Result<(PathBuf, Option<reformat::SkipSummary>), DownloadError> {
+            |(input_path, final_native_path)| -> Result<(Option<PathBuf>, Option<reformat::SkipSummary>), DownloadError> {
                 let outcome = reformat::reformat_pgs_file(&input_path, &final_native_path)
                     .map_err(DownloadError::Reformat)?;
 
-                // Clean up the original downloaded file immediately after successful reformatting.
-                fs::remove_file(&input_path)
-                    .map_err(|e| DownloadError::Io(e, input_path.clone()))?;
+                if outcome.wrote_output {
+                    // Clean up the original downloaded file immediately after successful reformatting.
+                    fs::remove_file(&input_path)
+                        .map_err(|e| DownloadError::Io(e, input_path.clone()))?;
 
-                Ok((final_native_path, outcome.skip_summary))
+                    Ok((Some(final_native_path), outcome.skip_summary))
+                } else {
+                    if let Some(warning) = outcome.warning {
+                        eprintln!("> Warning: {warning}");
+                    } else {
+                        eprintln!(
+                            "> Warning: Unsupported score format for '{}'; skipping.",
+                            input_path.display()
+                        );
+                    }
+                    Ok((None, None))
+                }
             },
         )
-        .collect::<Result<Vec<(PathBuf, Option<reformat::SkipSummary>)>, _>>()?;
+        .collect::<Result<Vec<(Option<PathBuf>, Option<reformat::SkipSummary>)>, _>>()?;
 
     let mut new_native_paths = Vec::with_capacity(reformatted.len());
     let mut skip_summaries = Vec::new();
     for (path, summary) in reformatted {
-        new_native_paths.push(path);
+        if let Some(path) = path {
+            new_native_paths.push(path);
+        }
         if let Some(summary) = summary {
             skip_summaries.push(summary);
         }
@@ -166,6 +180,14 @@ pub fn resolve_and_download_scores(
 
     // --- Stage 4: Final Aggregation ---
     existing_native_paths.extend(new_native_paths);
+    if existing_native_paths.is_empty() {
+        return Err(
+            "No compatible score files remained after download/reformat. \
+Scores that only provide dosage-specific weights \
+('dosage_0_weight', 'dosage_1_weight', 'dosage_2_weight') are currently unsupported."
+                .into(),
+        );
+    }
     Ok(ResolvedScoreFiles {
         paths: existing_native_paths,
         regions: region_overrides,
