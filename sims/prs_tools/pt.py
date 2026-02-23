@@ -192,14 +192,34 @@ class PPlusT:
                 "P+T GWAS did not produce logistic output for binary phenotype. "
                 f"Found files={[p.name for p in glm_files]}"
             )
+        print(f"[P+T] GWAS logistic candidates: {[p.name for p in glm_logistic]}")
         glm_path = str(glm_logistic[0])
         print(f"[P+T] using GWAS results: {glm_path}")
 
+        header_preview = ""
+        try:
+            with open(glm_path, "r", encoding="utf-8", errors="replace") as f:
+                header_preview = "".join([next(f, ""), next(f, "")]).rstrip("\n")
+        except Exception:
+            header_preview = "<unavailable>"
+
         gwas = pd.read_csv(glm_path, sep=r"\s+")
+        cols = list(gwas.columns)
+        print(f"[P+T] GWAS columns: {cols}")
         if "TEST" in gwas.columns:
-            gwas = gwas[gwas["TEST"].astype(str) == "ADD"].copy()
-        if "P" not in gwas.columns or "ID" not in gwas.columns or "A1" not in gwas.columns:
-            raise RuntimeError(f"P+T GWAS file missing required columns (ID/A1/P): {glm_path}")
+            test_counts = gwas["TEST"].astype(str).value_counts(dropna=False).head(10).to_dict()
+            print(f"[P+T] GWAS TEST distribution (top): {test_counts}")
+            gwas_add = gwas[gwas["TEST"].astype(str) == "ADD"].copy()
+            if len(gwas_add) == 0:
+                print("[P+T] WARNING: TEST=ADD rows not found; using unfiltered GWAS rows.")
+            else:
+                gwas = gwas_add
+        required = {"P", "ID", "A1"}
+        if not required.issubset(set(gwas.columns)):
+            raise RuntimeError(
+                "P+T GWAS file missing required columns (ID/A1/P). "
+                f"file={glm_path} cols={list(gwas.columns)} header_preview={header_preview!r}"
+            )
         eff = None
         eff_col_used = None
         if "BETA" in gwas.columns:
@@ -216,7 +236,7 @@ class PPlusT:
             raise RuntimeError(
                 "P+T GWAS file missing effect column. "
                 f"Expected one of BETA, LOG(OR), OR. File={glm_path} "
-                f"columns={list(gwas.columns)}"
+                f"columns={list(gwas.columns)} header_preview={header_preview!r}"
             )
         print(f"[P+T] using effect column: {eff_col_used}")
 
@@ -228,12 +248,22 @@ class PPlusT:
                 "EFF": eff,
             }
         ).dropna(subset=["P", "EFF"])
+        if gwas.empty:
+            raise RuntimeError(
+                "P+T GWAS produced no usable rows after numeric parsing/dropna. "
+                f"file={glm_path} effect_col={eff_col_used} header_preview={header_preview!r}"
+            )
 
         prune_in = Path(f"{prune_prefix}.prune.in")
         if not prune_in.exists():
             raise RuntimeError(f"P+T missing prune list: {prune_in}")
         keep_ids = set(x.strip() for x in prune_in.read_text(encoding="utf-8", errors="replace").splitlines() if x.strip())
         gwas = gwas[gwas["ID"].isin(keep_ids)].copy()
+        if gwas.empty:
+            raise RuntimeError(
+                "P+T GWAS rows are empty after LD-pruned SNP intersection. "
+                f"pruned_count={len(keep_ids)} file={glm_path}"
+            )
         gwas = gwas.sort_values("P")
         thresholds = sorted(set(float(x) for x in self.p_thresholds))
         records: list[dict[str, object]] = []
@@ -320,9 +350,28 @@ class PPlusT:
         )
         best_idx = ranked.index[0]
         if not np.isfinite(float(metrics_rank.loc[best_idx, "train_auc"])):
+            invalid_rows = metrics.assign(
+                too_few_snps=metrics["n_snps"] < max(1, self.min_selected_snps)
+            )[
+                [
+                    "p_threshold",
+                    "n_snps",
+                    "n_train_used",
+                    "train_accuracy",
+                    "train_balanced_accuracy",
+                    "train_auc",
+                    "train_prs_sd",
+                    "train_prs_n_unique",
+                    "is_degenerate",
+                    "too_few_snps",
+                ]
+            ]
+            invalid_preview = invalid_rows.head(10).to_dict(orient="records")
             raise RuntimeError(
                 "P+T threshold selection failed: all thresholds are invalid "
-                "(degenerate PRS and/or below min_selected_snps)."
+                "(degenerate PRS and/or below min_selected_snps). "
+                f"class_counts={counts} min_selected_snps={self.min_selected_snps} "
+                f"threshold_preview={invalid_preview}"
             )
         best_thr = float(metrics.loc[best_idx, "p_threshold"])
         print(
