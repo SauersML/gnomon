@@ -17,11 +17,10 @@ use rand::{RngExt, SeedableRng};
 
 use faer::Side;
 use faer::linalg::solvers::Solve;
-use gnomon::calibrate::basis::{
+use gam::basis::{
     BasisOptions, Dense, KnotSource, apply_sum_to_zero_constraint, create_basis,
     create_difference_penalty_matrix,
 };
-use gnomon::calibrate::calibrator::FirthSpec;
 use gnomon::calibrate::construction::{
     ModelLayout, build_design_and_penalty_matrices, compute_penalty_square_roots,
     stable_reparameterization,
@@ -31,13 +30,13 @@ use gnomon::calibrate::estimate::{
     ExternalOptimOptions, evaluate_external_cost_and_ridge, evaluate_external_gradients,
     optimize_external_design,
 };
-use gnomon::calibrate::faer_ndarray::FaerCholesky;
+use gam::faer_ndarray::FaerCholesky;
 use gnomon::calibrate::model::{
     BasisConfig, InteractionPenaltyKind, LinkFunction, ModelConfig, ModelFamily,
     PrincipalComponentConfig, default_reml_parallel_threshold,
 };
-use gnomon::calibrate::pirls::{calculate_deviance, fit_model_for_fixed_rho, update_glm_vectors};
-use gnomon::calibrate::types::LogSmoothingParamsView;
+use gam::pirls::{calculate_deviance, fit_model_for_fixed_rho, update_glm_vectors};
+use gam::types::LogSmoothingParamsView;
 use std::collections::HashMap;
 
 /// Helper to create a simple diagonal penalty matrix.
@@ -352,13 +351,12 @@ fn check_gradient(
 ) -> Result<(f64, f64, f64, f64), String> {
     let n = x.nrows();
     let offset = Array1::<f64>::zeros(n);
+    let _ = firth;
 
     let opts = ExternalOptimOptions {
-        link,
-        firth: if firth {
-            Some(FirthSpec { enabled: true })
-        } else {
-            None
+        family: match link {
+            LinkFunction::Logit => gam::types::LikelihoodFamily::BinomialLogit,
+            LinkFunction::Identity => gam::types::LikelihoodFamily::GaussianIdentity,
         },
         tol: 1e-10,
         max_iter: 200,
@@ -443,7 +441,8 @@ fn laml_cost_logit_with_beta(
     let rs_list = compute_penalty_square_roots(s_list).map_err(|e| format!("{:?}", e))?;
     let lambdas: Vec<f64> = rho.iter().map(|v| v.exp()).collect();
     let reparam =
-        stable_reparameterization(&rs_list, &lambdas, &layout).map_err(|e| format!("{:?}", e))?;
+        stable_reparameterization(&rs_list, &lambdas, layout.total_coeffs)
+            .map_err(|e| format!("{:?}", e))?;
     let beta_t = reparam.qs.t().dot(beta);
     let x_t = x.dot(&reparam.qs);
     let n = x_t.nrows();
@@ -760,8 +759,7 @@ fn isolation_difference_penalty_logit_no_firth() {
         Array1::<f64>::zeros(x.nrows()).view(),
         &[s],
         &ExternalOptimOptions {
-            link: LinkFunction::Logit,
-            firth: None,
+            family: gam::types::LikelihoodFamily::BinomialLogit,
             tol: 1e-10,
             max_iter: 200,
             nullspace_dims: vec![2],
@@ -799,8 +797,7 @@ fn isolation_dirty_nullspace_logit_no_firth() {
         Array1::<f64>::zeros(x.nrows()).view(),
         &[s],
         &ExternalOptimOptions {
-            link: LinkFunction::Logit,
-            firth: None,
+            family: gam::types::LikelihoodFamily::BinomialLogit,
             tol: 1e-10,
             max_iter: 200,
             nullspace_dims: vec![2],
@@ -859,8 +856,7 @@ fn isolation_concurrent_nullspace_instability() {
         Array1::<f64>::zeros(n).view(),
         &[s],
         &ExternalOptimOptions {
-            link: LinkFunction::Logit,
-            firth: None,
+            family: gam::types::LikelihoodFamily::BinomialLogit,
             tol: 1e-10,
             max_iter: 200,
             nullspace_dims: vec![2],
@@ -916,8 +912,7 @@ fn isolation_projected_tensor_penalty_logit_no_firth() {
         Array1::<f64>::zeros(n).view(),
         &[s],
         &ExternalOptimOptions {
-            link: LinkFunction::Logit,
-            firth: None,
+            family: gam::types::LikelihoodFamily::BinomialLogit,
             tol: 1e-10,
             max_iter: 200,
             nullspace_dims: vec![n2],
@@ -976,8 +971,7 @@ fn isolation_projected_tensor_penalty_with_firth() {
         Array1::<f64>::zeros(n).view(),
         &[s1, s2],
         &ExternalOptimOptions {
-            link: LinkFunction::Logit,
-            firth: Some(FirthSpec { enabled: true }),
+            family: gam::types::LikelihoodFamily::BinomialLogit,
             tol: 1e-10,
             max_iter: 200,
             nullspace_dims: vec![n2, 2 * (k1 - 1)],
@@ -1032,8 +1026,7 @@ fn isolation_multiple_overlapping_dense_penalties_with_firth() {
         Array1::<f64>::zeros(n).view(),
         &[s1, s2],
         &ExternalOptimOptions {
-            link: LinkFunction::Logit,
-            firth: Some(FirthSpec { enabled: true }),
+            family: gam::types::LikelihoodFamily::BinomialLogit,
             tol: 1e-10,
             max_iter: 200,
             nullspace_dims: vec![1, 2],
@@ -1063,8 +1056,7 @@ fn isolation_reparam_pgs_pc_mains_firth() {
     let nullspace_dims = vec![0; s_list.len()];
     let offset = Array1::<f64>::zeros(train.y.len());
     let opts = ExternalOptimOptions {
-        link: LinkFunction::Logit,
-        firth: Some(FirthSpec { enabled: true }),
+        family: gam::types::LikelihoodFamily::BinomialLogit,
         tol: 1e-10,
         max_iter: 200,
         nullspace_dims,
@@ -1101,8 +1093,7 @@ fn isolation_reparam_pgs_pc_mains_firth_frozen_beta_fd() {
     let rho: Array1<f64> = Array1::from_elem(layout.num_penalties, 12.0);
     let offset = Array1::<f64>::zeros(train.y.len());
     let opts = ExternalOptimOptions {
-        link: LinkFunction::Logit,
-        firth: Some(FirthSpec { enabled: true }),
+        family: gam::types::LikelihoodFamily::BinomialLogit,
         tol: 1e-10,
         max_iter: 200,
         nullspace_dims: vec![0; s_list.len()],
@@ -1121,6 +1112,7 @@ fn isolation_reparam_pgs_pc_mains_firth_frozen_beta_fd() {
 
     let rs_list = compute_penalty_square_roots(&s_list).unwrap();
     let cfg = ModelConfig::external(LinkFunction::Logit, 1e-10, 200, true);
+    let engine_cfg = gnomon::calibrate::model::to_engine_model_config(&cfg).unwrap();
     let (pirls, _) = fit_model_for_fixed_rho(
         LogSmoothingParamsView::new(rho.view()),
         x.view(),
@@ -1130,8 +1122,8 @@ fn isolation_reparam_pgs_pc_mains_firth_frozen_beta_fd() {
         &rs_list,
         None,
         None,
-        &layout,
-        &cfg,
+        layout.total_coeffs,
+        &engine_cfg,
         None,
         None,
     )
@@ -1175,8 +1167,7 @@ fn isolation_frozen_beta_fd() {
     let offset = Array1::<f64>::zeros(n);
 
     let opts = ExternalOptimOptions {
-        link: LinkFunction::Logit,
-        firth: None,
+        family: gam::types::LikelihoodFamily::BinomialLogit,
         tol: 1e-10,
         max_iter: 200,
         nullspace_dims: vec![1, 0],
@@ -1200,6 +1191,7 @@ fn isolation_frozen_beta_fd() {
 
     let layout = ModelLayout::external(p, s_list.len());
     let cfg = ModelConfig::external(LinkFunction::Logit, 1e-10, 200, false);
+    let engine_cfg = gnomon::calibrate::model::to_engine_model_config(&cfg).unwrap();
     let rs_list = match compute_penalty_square_roots(&s_list) {
         Ok(list) => list,
         Err(e) => {
@@ -1216,8 +1208,8 @@ fn isolation_frozen_beta_fd() {
         &rs_list,
         None,
         None,
-        &layout,
-        &cfg,
+        layout.total_coeffs,
+        &engine_cfg,
         None,
         None,
     ) {
@@ -1263,8 +1255,7 @@ fn isolation_diagnostic_fd_noise_floor_at_high_smoothing() {
 
     let offset = Array1::<f64>::zeros(train.y.len());
     let opts = ExternalOptimOptions {
-        link: LinkFunction::Logit,
-        firth: Some(FirthSpec { enabled: true }),
+        family: gam::types::LikelihoodFamily::BinomialLogit,
         tol: 1e-10,
         max_iter: 200,
         nullspace_dims: vec![0; s_list.len()],
@@ -1316,8 +1307,7 @@ fn isolation_stationarity_limit_at_optimum() {
     let offset = Array1::<f64>::zeros(y.len());
     let nullspace_dims = vec![2];
     let opts = ExternalOptimOptions {
-        link: LinkFunction::Logit,
-        firth: None,
+        family: gam::types::LikelihoodFamily::BinomialLogit,
         tol: 1e-10,
         max_iter: 200,
         nullspace_dims: nullspace_dims.clone(),
@@ -1336,7 +1326,14 @@ fn isolation_stationarity_limit_at_optimum() {
     .unwrap();
     let n_baseline = a_baseline.dot(&a_baseline).sqrt();
 
-    let opt = optimize_external_design(y.view(), w.view(), x.view(), offset.view(), &s_list, &opts)
+    let opt = optimize_external_design(
+        y.view(),
+        w.view(),
+        x.view(),
+        offset.view(),
+        s_list.clone(),
+        &opts,
+    )
         .unwrap();
     let rho_opt = opt.lambdas.mapv(|v| v.ln());
     let (a_opt, fd_opt) = evaluate_external_gradients(
@@ -1367,8 +1364,7 @@ fn isolation_high_penalty_nullspace_gradient_decay() {
     let s_list = vec![diagonal_penalty(p, 0, 2)];
     let offset = Array1::<f64>::zeros(y.len());
     let opts = ExternalOptimOptions {
-        link: LinkFunction::Logit,
-        firth: Some(FirthSpec { enabled: true }),
+        family: gam::types::LikelihoodFamily::BinomialLogit,
         tol: 1e-10,
         max_iter: 200,
         nullspace_dims: vec![2],
@@ -1433,8 +1429,7 @@ fn diagnostic_super_convergence_tight_tol_improves_fd() {
     let offset = Array1::<f64>::zeros(train.y.len());
 
     let opts_base = ExternalOptimOptions {
-        link: LinkFunction::Logit,
-        firth: Some(FirthSpec { enabled: true }),
+        family: gam::types::LikelihoodFamily::BinomialLogit,
         tol: 1e-10,
         max_iter: 200,
         nullspace_dims: vec![0; s_list.len()],
@@ -1489,8 +1484,7 @@ fn diagnostic_fd_ridge_jitter_at_high_smoothing() {
     let rho = Array1::from_elem(layout.num_penalties, 12.0);
     let offset = Array1::<f64>::zeros(train.y.len());
     let opts = ExternalOptimOptions {
-        link: LinkFunction::Logit,
-        firth: Some(FirthSpec { enabled: true }),
+        family: gam::types::LikelihoodFamily::BinomialLogit,
         tol: 1e-10,
         max_iter: 200,
         nullspace_dims: vec![0; s_list.len()],
@@ -1585,9 +1579,9 @@ fn compute_firth_h_phi(
         info[[i, i]] += ridge;
     }
 
-    let info_view = gnomon::calibrate::faer_ndarray::FaerArrayView::new(&info);
+    let info_view = gam::faer_ndarray::FaerArrayView::new(&info);
     // Note: FaerLlt might need to be imported or fully qualified
-    use gnomon::calibrate::faer_ndarray::{FaerLlt, array2_to_mat_mut};
+    use gam::faer_ndarray::{FaerLlt, array2_to_mat_mut};
 
     let chol = FaerLlt::new(info_view.as_ref(), Side::Lower).unwrap();
 
@@ -1677,8 +1671,7 @@ fn isolation_missing_term_hypothesis() {
 
     // 2. Frozen Beta at Optimum
     let opts = ExternalOptimOptions {
-        link: LinkFunction::Logit,
-        firth: Some(FirthSpec { enabled: true }),
+        family: gam::types::LikelihoodFamily::BinomialLogit,
         tol: 1e-8,
         max_iter: 100,
         nullspace_dims: vec![1, 0],
@@ -1700,9 +1693,10 @@ fn isolation_missing_term_hypothesis() {
     let rs_list = compute_penalty_square_roots(&s_list).unwrap();
     let balanced = create_difference_penalty_matrix(p, 1, None).unwrap();
     let layout = ModelLayout::external(p, s_list.len());
-    let config = ModelConfig::external(opts.link, opts.tol, opts.max_iter, true);
+    let config = ModelConfig::external(LinkFunction::Logit, opts.tol, opts.max_iter, true);
+    let engine_config = gnomon::calibrate::model::to_engine_model_config(&config).unwrap();
 
-    use gnomon::calibrate::types::LogSmoothingParamsView;
+    use gam::types::LogSmoothingParamsView;
     let rho_view = LogSmoothingParamsView::new(rho.view());
 
     let (fit, _) = fit_model_for_fixed_rho(
@@ -1714,8 +1708,8 @@ fn isolation_missing_term_hypothesis() {
         &rs_list,
         Some(&balanced),
         None,
-        &layout,
-        &config,
+        layout.total_coeffs,
+        &engine_config,
         None,
         None,
     )
@@ -1774,8 +1768,8 @@ fn isolation_missing_term_hypothesis() {
         h_total_ridge[[i, i]] += scale_h * 1e-8;
     }
 
-    let h_view = gnomon::calibrate::faer_ndarray::FaerArrayView::new(&h_total_ridge);
-    use gnomon::calibrate::faer_ndarray::{FaerLlt, array2_to_mat_mut};
+    let h_view = gam::faer_ndarray::FaerArrayView::new(&h_total_ridge);
+    use gam::faer_ndarray::{FaerLlt, array2_to_mat_mut};
     let chol_h = FaerLlt::new(h_view.as_ref(), Side::Lower).unwrap();
     let mut id = Array2::<f64>::eye(p);
     let mut id_view = array2_to_mat_mut(&mut id);
@@ -1853,8 +1847,7 @@ fn isolation_truncation_correction_ridge_hypothesis() {
     let rho = array![8.0]; // λ = exp(8) ≈ 2981
 
     let opts = ExternalOptimOptions {
-        link: LinkFunction::Logit,
-        firth: None, // No Firth - isolate the truncation effect
+        family: gam::types::LikelihoodFamily::BinomialLogit, // No Firth - isolate the truncation effect
         tol: 1e-10,
         max_iter: 200,
         nullspace_dims: nullspace_dims.clone(),
@@ -1942,8 +1935,7 @@ fn isolation_truncation_correction_no_ridge_baseline() {
     let rho = array![0.0]; // λ = 1
 
     let opts = ExternalOptimOptions {
-        link: LinkFunction::Logit,
-        firth: None,
+        family: gam::types::LikelihoodFamily::BinomialLogit,
         tol: 1e-10,
         max_iter: 200,
         nullspace_dims,
@@ -2015,8 +2007,7 @@ fn hypothesis_firth_alone_single_penalty() {
     let rho = array![2.0]; // Moderate smoothing
 
     let opts = ExternalOptimOptions {
-        link: LinkFunction::Logit,
-        firth: Some(FirthSpec { enabled: true }), // <-- Firth ON
+        family: gam::types::LikelihoodFamily::BinomialLogit, // <-- Firth ON
         tol: 1e-10,
         max_iter: 200,
         nullspace_dims,
@@ -2068,8 +2059,7 @@ fn hypothesis_multi_penalty_no_firth() {
     let rho = array![0.0, 4.6, -4.6]; // λ = [1, 100, 0.01]
 
     let opts = ExternalOptimOptions {
-        link: LinkFunction::Logit,
-        firth: None,
+        family: gam::types::LikelihoodFamily::BinomialLogit,
         tol: 1e-10,
         max_iter: 200,
         nullspace_dims,
@@ -2118,8 +2108,7 @@ fn hypothesis_firth_high_smoothing() {
     let rho = array![10.0]; // λ = exp(10) ≈ 22026
 
     let opts = ExternalOptimOptions {
-        link: LinkFunction::Logit,
-        firth: Some(FirthSpec { enabled: true }),
+        family: gam::types::LikelihoodFamily::BinomialLogit,
         tol: 1e-10,
         max_iter: 200,
         nullspace_dims,
@@ -2172,8 +2161,7 @@ fn hypothesis_firth_anisotropic_multi_penalty() {
     let rho = array![0.0, 4.6, -4.6];
 
     let opts = ExternalOptimOptions {
-        link: LinkFunction::Logit,
-        firth: Some(FirthSpec { enabled: true }), // Firth ON
+        family: gam::types::LikelihoodFamily::BinomialLogit, // Firth ON
         tol: 1e-10,
         max_iter: 200,
         nullspace_dims,
@@ -2223,8 +2211,7 @@ fn hypothesis_firth_rank_deficient_penalty() {
     let rho = array![6.0]; // λ ≈ 403
 
     let opts = ExternalOptimOptions {
-        link: LinkFunction::Logit,
-        firth: Some(FirthSpec { enabled: true }),
+        family: gam::types::LikelihoodFamily::BinomialLogit,
         tol: 1e-10,
         max_iter: 200,
         nullspace_dims,
@@ -2279,8 +2266,7 @@ fn hypothesis_full_complexity_replication() {
     let rho = array![3.0, 7.0, -1.0]; // Lambda = [20, 1097, 0.37]
 
     let opts = ExternalOptimOptions {
-        link: LinkFunction::Logit,
-        firth: Some(FirthSpec { enabled: true }),
+        family: gam::types::LikelihoodFamily::BinomialLogit,
         tol: 1e-10,
         max_iter: 200,
         nullspace_dims: nullspace_dims.clone(),
@@ -2357,8 +2343,7 @@ fn hypothesis_smoothing_sweep() {
         let rho = array![rho_val];
 
         let opts = ExternalOptimOptions {
-            link: LinkFunction::Logit,
-            firth: Some(FirthSpec { enabled: true }),
+            family: gam::types::LikelihoodFamily::BinomialLogit,
             tol: 1e-10,
             max_iter: 200,
             nullspace_dims: nullspace_dims.clone(),
@@ -2420,8 +2405,7 @@ fn hypothesis_many_penalties_simple_structure() {
     let rho = Array1::from_elem(10, 12.0);
 
     let opts = ExternalOptimOptions {
-        link: LinkFunction::Logit,
-        firth: Some(FirthSpec { enabled: true }),
+        family: gam::types::LikelihoodFamily::BinomialLogit,
         tol: 1e-10,
         max_iter: 200,
         nullspace_dims,
@@ -2490,8 +2474,7 @@ fn hypothesis_extreme_smoothing_tiny_gradients() {
         let rho = Array1::from_elem(3, rho_val);
 
         let opts = ExternalOptimOptions {
-            link: LinkFunction::Logit,
-            firth: Some(FirthSpec { enabled: true }),
+            family: gam::types::LikelihoodFamily::BinomialLogit,
             tol: 1e-10,
             max_iter: 200,
             nullspace_dims: nullspace_dims.clone(),
@@ -2549,8 +2532,7 @@ fn hypothesis_real_gam_matrices_small() {
         let rho = Array1::from_elem(layout.num_penalties, rho_val);
 
         let opts = ExternalOptimOptions {
-            link: LinkFunction::Logit,
-            firth: Some(FirthSpec { enabled: true }),
+            family: gam::types::LikelihoodFamily::BinomialLogit,
             tol: 1e-10,
             max_iter: 200,
             nullspace_dims: nullspace_dims.clone(),
@@ -2607,8 +2589,7 @@ fn hypothesis_gradient_magnitude_threshold() {
         let rho = array![rho_val as f64];
 
         let opts = ExternalOptimOptions {
-            link: LinkFunction::Logit,
-            firth: Some(FirthSpec { enabled: true }),
+            family: gam::types::LikelihoodFamily::BinomialLogit,
             tol: 1e-10,
             max_iter: 200,
             nullspace_dims: nullspace_dims.clone(),
@@ -2661,8 +2642,7 @@ fn hypothesis_varying_pc_count() {
         let offset = Array1::<f64>::zeros(train.y.len());
 
         let opts = ExternalOptimOptions {
-            link: LinkFunction::Logit,
-            firth: Some(FirthSpec { enabled: true }),
+            family: gam::types::LikelihoodFamily::BinomialLogit,
             tol: 1e-10,
             max_iter: 200,
             nullspace_dims,
@@ -2743,8 +2723,7 @@ fn hypothesis_spline_penalty_synthetic_data() {
         let rho = Array1::from_elem(3, rho_val);
 
         let opts = ExternalOptimOptions {
-            link: LinkFunction::Logit,
-            firth: Some(FirthSpec { enabled: true }),
+            family: gam::types::LikelihoodFamily::BinomialLogit,
             tol: 1e-10,
             max_iter: 200,
             nullspace_dims: nullspace_dims.clone(),
@@ -2826,8 +2805,7 @@ fn hypothesis_overlapping_penalty_structure() {
         let rho = Array1::from_elem(3, rho_val);
 
         let opts = ExternalOptimOptions {
-            link: LinkFunction::Logit,
-            firth: Some(FirthSpec { enabled: true }),
+            family: gam::types::LikelihoodFamily::BinomialLogit,
             tol: 1e-10,
             max_iter: 200,
             nullspace_dims: nullspace_dims.clone(),
@@ -2890,7 +2868,7 @@ fn hypothesis_reparameterization_trigger() {
     // Get the reparameterization to see its condition number
     let rs_list = compute_penalty_square_roots(&s_list).unwrap();
     let lambdas: Vec<f64> = vec![1.0; s_list.len()];
-    let reparam = stable_reparameterization(&rs_list, &lambdas, &layout).unwrap();
+    let reparam = stable_reparameterization(&rs_list, &lambdas, layout.total_coeffs).unwrap();
 
     println!(
         "  Reparam.s_transformed dims: {} x {}",
@@ -2923,8 +2901,7 @@ fn hypothesis_reparameterization_trigger() {
         let rho = Array1::from_elem(layout.num_penalties, rho_val);
 
         let opts = ExternalOptimOptions {
-            link: LinkFunction::Logit,
-            firth: Some(FirthSpec { enabled: true }),
+            family: gam::types::LikelihoodFamily::BinomialLogit,
             tol: 1e-10,
             max_iter: 200,
             nullspace_dims: nullspace_dims.clone(),
@@ -2978,8 +2955,7 @@ fn hypothesis_near_zero_components() {
     let offset = Array1::<f64>::zeros(train.y.len());
 
     let opts = ExternalOptimOptions {
-        link: LinkFunction::Logit,
-        firth: Some(FirthSpec { enabled: true }),
+        family: gam::types::LikelihoodFamily::BinomialLogit,
         tol: 1e-10,
         max_iter: 200,
         nullspace_dims,
@@ -3067,8 +3043,7 @@ fn hypothesis_gam_s_random_x() {
     let rho = Array1::from_elem(layout.num_penalties, 12.0);
 
     let opts = ExternalOptimOptions {
-        link: LinkFunction::Logit,
-        firth: Some(FirthSpec { enabled: true }),
+        family: gam::types::LikelihoodFamily::BinomialLogit,
         tol: 1e-10,
         max_iter: 200,
         nullspace_dims,
@@ -3131,8 +3106,7 @@ fn hypothesis_random_s_gam_xy() {
     let rho = Array1::from_elem(layout.num_penalties, 12.0);
 
     let opts = ExternalOptimOptions {
-        link: LinkFunction::Logit,
-        firth: Some(FirthSpec { enabled: true }),
+        family: gam::types::LikelihoodFamily::BinomialLogit,
         tol: 1e-10,
         max_iter: 200,
         nullspace_dims,
@@ -3184,8 +3158,7 @@ fn hypothesis_fd_step_size_inconsistency() {
     let offset = Array1::<f64>::zeros(train.y.len());
 
     let opts = ExternalOptimOptions {
-        link: LinkFunction::Logit,
-        firth: Some(FirthSpec { enabled: true }),
+        family: gam::types::LikelihoodFamily::BinomialLogit,
         tol: 1e-10,
         max_iter: 500,
         nullspace_dims: vec![0],
@@ -3264,8 +3237,7 @@ fn hypothesis_analytic_gradient_matches_cost_trend() {
     let offset = Array1::<f64>::zeros(train.y.len());
 
     let opts = ExternalOptimOptions {
-        link: LinkFunction::Logit,
-        firth: Some(FirthSpec { enabled: true }),
+        family: gam::types::LikelihoodFamily::BinomialLogit,
         tol: 1e-10,
         max_iter: 500,
         nullspace_dims: vec![0],
@@ -3351,8 +3323,7 @@ fn hypothesis_floating_point_precision_not_root_cause() {
     let offset = Array1::<f64>::zeros(train.y.len());
 
     let opts = ExternalOptimOptions {
-        link: LinkFunction::Logit,
-        firth: Some(FirthSpec { enabled: true }),
+        family: gam::types::LikelihoodFamily::BinomialLogit,
         tol: 1e-10,
         max_iter: 500,
         nullspace_dims: vec![0],
@@ -3422,8 +3393,7 @@ fn hypothesis_cost_nonmonotonicity_at_high_rho() {
     let offset = Array1::<f64>::zeros(train.y.len());
 
     let opts = ExternalOptimOptions {
-        link: LinkFunction::Logit,
-        firth: Some(FirthSpec { enabled: true }),
+        family: gam::types::LikelihoodFamily::BinomialLogit,
         tol: 1e-10,
         max_iter: 500,
         nullspace_dims: vec![0],
@@ -3502,8 +3472,7 @@ fn hypothesis_solver_variability_causes_nonmonotonicity() {
     // Count direction changes (non-monotonicity) in cost function
     let count_direction_changes = |tol: f64| -> usize {
         let opts = ExternalOptimOptions {
-            link: LinkFunction::Logit,
-            firth: Some(FirthSpec { enabled: true }),
+            family: gam::types::LikelihoodFamily::BinomialLogit,
             tol,
             max_iter: 1000,
             nullspace_dims: vec![0],
@@ -3581,14 +3550,9 @@ fn hypothesis_firth_causes_nonmonotonicity() {
     let s_4 = s_list_gam[4].clone();
     let offset = Array1::<f64>::zeros(train.y.len());
 
-    let count_direction_changes = |firth_enabled: bool| -> usize {
+    let count_direction_changes = |_firth_enabled: bool| -> usize {
         let opts = ExternalOptimOptions {
-            link: LinkFunction::Logit,
-            firth: if firth_enabled {
-                Some(FirthSpec { enabled: true })
-            } else {
-                None
-            },
+            family: gam::types::LikelihoodFamily::BinomialLogit,
             tol: 1e-12,
             max_iter: 1000,
             nullspace_dims: vec![0],
@@ -3672,8 +3636,7 @@ fn hypothesis_firth_nonmonotonicity_requires_high_rho() {
 
     let count_direction_changes = |rho_center: f64| -> usize {
         let opts = ExternalOptimOptions {
-            link: LinkFunction::Logit,
-            firth: Some(FirthSpec { enabled: true }),
+            family: gam::types::LikelihoodFamily::BinomialLogit,
             tol: 1e-12,
             max_iter: 1000,
             nullspace_dims: vec![0],
@@ -3746,8 +3709,7 @@ fn hypothesis_firth_oscillation_magnitude() {
     let offset = Array1::<f64>::zeros(train.y.len());
 
     let opts = ExternalOptimOptions {
-        link: LinkFunction::Logit,
-        firth: Some(FirthSpec { enabled: true }),
+        family: gam::types::LikelihoodFamily::BinomialLogit,
         tol: 1e-12,
         max_iter: 1000,
         nullspace_dims: vec![0],
@@ -3851,8 +3813,7 @@ fn hypothesis_ridge_variation_causes_oscillations() {
     let offset = Array1::<f64>::zeros(train.y.len());
 
     let opts = ExternalOptimOptions {
-        link: LinkFunction::Logit,
-        firth: Some(FirthSpec { enabled: true }),
+        family: gam::types::LikelihoodFamily::BinomialLogit,
         tol: 1e-12,
         max_iter: 1000,
         nullspace_dims: vec![0],
@@ -3937,8 +3898,7 @@ fn orthogonal_high_rho_without_firth_passes() {
 
     // WITHOUT Firth
     let opts = ExternalOptimOptions {
-        link: LinkFunction::Logit,
-        firth: None, // <-- Key difference: no Firth
+        family: gam::types::LikelihoodFamily::BinomialLogit, // <-- Key difference: no Firth
         tol: 1e-10,
         max_iter: 200,
         nullspace_dims,
@@ -3988,8 +3948,7 @@ fn orthogonal_low_rho_with_firth() {
 
     // WITH Firth
     let opts = ExternalOptimOptions {
-        link: LinkFunction::Logit,
-        firth: Some(FirthSpec { enabled: true }),
+        family: gam::types::LikelihoodFamily::BinomialLogit,
         tol: 1e-10,
         max_iter: 200,
         nullspace_dims,
@@ -4043,8 +4002,7 @@ fn hypothesis_component_by_component_failure_pattern() {
     let rho = Array1::from_elem(layout.num_penalties, 12.0);
 
     let opts = ExternalOptimOptions {
-        link: LinkFunction::Logit,
-        firth: Some(FirthSpec { enabled: true }),
+        family: gam::types::LikelihoodFamily::BinomialLogit,
         tol: 1e-10,
         max_iter: 200,
         nullspace_dims,
@@ -4156,8 +4114,7 @@ fn hypothesis_penalty_count_affects_fd_reliability() {
         let nullspace_dims = vec![0; *n_pen];
 
         let opts = ExternalOptimOptions {
-            link: LinkFunction::Logit,
-            firth: Some(FirthSpec { enabled: true }),
+            family: gam::types::LikelihoodFamily::BinomialLogit,
             tol: 1e-10,
             max_iter: 200,
             nullspace_dims,
@@ -4224,8 +4181,7 @@ fn hypothesis_implicit_derivative_contamination() {
 
     for tol in [1e-6, 1e-8, 1e-10, 1e-12] {
         let opts = ExternalOptimOptions {
-            link: LinkFunction::Logit,
-            firth: Some(FirthSpec { enabled: true }),
+            family: gam::types::LikelihoodFamily::BinomialLogit,
             tol,
             max_iter: 1000,
             nullspace_dims: vec![0],
@@ -4273,8 +4229,7 @@ fn hypothesis_penalty_structure_matters() {
     // 1. Single diagonal penalty
     let s_diag = diagonal_penalty(p, 1, p);
     let opts_single = ExternalOptimOptions {
-        link: LinkFunction::Logit,
-        firth: Some(FirthSpec { enabled: true }),
+        family: gam::types::LikelihoodFamily::BinomialLogit,
         tol: 1e-10,
         max_iter: 200,
         nullspace_dims: vec![0],
@@ -4296,8 +4251,7 @@ fn hypothesis_penalty_structure_matters() {
     let s_diag1 = diagonal_penalty(p, 1, p / 2);
     let s_diag2 = diagonal_penalty(p, p / 2, p);
     let opts_two = ExternalOptimOptions {
-        link: LinkFunction::Logit,
-        firth: Some(FirthSpec { enabled: true }),
+        family: gam::types::LikelihoodFamily::BinomialLogit,
         tol: 1e-10,
         max_iter: 200,
         nullspace_dims: vec![0, 0],
@@ -4318,8 +4272,7 @@ fn hypothesis_penalty_structure_matters() {
     // 3. GAM penalties (first 3)
     let s_gam_3: Vec<Array2<f64>> = s_list_gam.iter().take(3).cloned().collect();
     let opts_gam = ExternalOptimOptions {
-        link: LinkFunction::Logit,
-        firth: Some(FirthSpec { enabled: true }),
+        family: gam::types::LikelihoodFamily::BinomialLogit,
         tol: 1e-10,
         max_iter: 200,
         nullspace_dims: vec![0, 0, 0],
@@ -4339,8 +4292,7 @@ fn hypothesis_penalty_structure_matters() {
 
     // 4. All GAM penalties
     let opts_all = ExternalOptimOptions {
-        link: LinkFunction::Logit,
-        firth: Some(FirthSpec { enabled: true }),
+        family: gam::types::LikelihoodFamily::BinomialLogit,
         tol: 1e-10,
         max_iter: 200,
         nullspace_dims: vec![0; s_list_gam.len()],
@@ -4375,8 +4327,7 @@ fn hypothesis_analytic_vs_cost_trend_per_component() {
     let offset = Array1::<f64>::zeros(train.y.len());
 
     let opts = ExternalOptimOptions {
-        link: LinkFunction::Logit,
-        firth: Some(FirthSpec { enabled: true }),
+        family: gam::types::LikelihoodFamily::BinomialLogit,
         tol: 1e-10,
         max_iter: 200,
         nullspace_dims: nullspace_dims.clone(),
@@ -4405,8 +4356,7 @@ fn hypothesis_analytic_vs_cost_trend_per_component() {
             offset.view(),
             &s_list_gam,
             &ExternalOptimOptions {
-                link: LinkFunction::Logit,
-                firth: Some(FirthSpec { enabled: true }),
+                family: gam::types::LikelihoodFamily::BinomialLogit,
                 tol: 1e-10,
                 max_iter: 200,
                 nullspace_dims: nullspace_dims.clone(),
@@ -4510,8 +4460,7 @@ fn hypothesis_component_8_deep_investigation() {
     let offset = Array1::<f64>::zeros(train.y.len());
 
     let opts = ExternalOptimOptions {
-        link: LinkFunction::Logit,
-        firth: Some(FirthSpec { enabled: true }),
+        family: gam::types::LikelihoodFamily::BinomialLogit,
         tol: 1e-10,
         max_iter: 200,
         nullspace_dims: nullspace_dims.clone(),
@@ -4537,8 +4486,7 @@ fn hypothesis_component_8_deep_investigation() {
             offset.view(),
             &s_list_gam,
             &ExternalOptimOptions {
-                link: LinkFunction::Logit,
-                firth: Some(FirthSpec { enabled: true }),
+                family: gam::types::LikelihoodFamily::BinomialLogit,
                 tol: 1e-10,
                 max_iter: 200,
                 nullspace_dims: nullspace_dims.clone(),
@@ -4675,8 +4623,7 @@ fn hypothesis_component_4_low_vs_high_rho() {
     let offset = Array1::<f64>::zeros(train.y.len());
 
     let opts = ExternalOptimOptions {
-        link: LinkFunction::Logit,
-        firth: Some(FirthSpec { enabled: true }),
+        family: gam::types::LikelihoodFamily::BinomialLogit,
         tol: 1e-10,
         max_iter: 200,
         nullspace_dims,
@@ -4724,8 +4671,7 @@ fn hypothesis_component_4_low_vs_high_rho() {
     let rho_12 = Array1::from_elem(layout.num_penalties, 12.0);
 
     let opts2 = ExternalOptimOptions {
-        link: LinkFunction::Logit,
-        firth: Some(FirthSpec { enabled: true }),
+        family: gam::types::LikelihoodFamily::BinomialLogit,
         tol: 1e-10,
         max_iter: 200,
         nullspace_dims: vec![0; layout.num_penalties],
@@ -4801,8 +4747,7 @@ fn hypothesis_component_4_low_vs_high_rho() {
 
         let rho_12_seed = Array1::from_elem(layout_seed.num_penalties, 12.0);
         let opts_seed = ExternalOptimOptions {
-            link: LinkFunction::Logit,
-            firth: Some(FirthSpec { enabled: true }),
+            family: gam::types::LikelihoodFamily::BinomialLogit,
             tol: 1e-10,
             max_iter: 200,
             nullspace_dims: vec![0; layout_seed.num_penalties],
@@ -4846,8 +4791,7 @@ fn hypothesis_component_4_low_vs_high_rho() {
         let s_single = vec![s_list_gam[i].clone()];
         let rho_single = array![12.0];
         let opts_single = ExternalOptimOptions {
-            link: LinkFunction::Logit,
-            firth: Some(FirthSpec { enabled: true }),
+            family: gam::types::LikelihoodFamily::BinomialLogit,
             tol: 1e-10,
             max_iter: 200,
             nullspace_dims: vec![0],
@@ -4880,8 +4824,7 @@ fn hypothesis_component_4_low_vs_high_rho() {
     // Alone
     let s_4_alone = vec![s_list_gam[4].clone()];
     let opts_alone = ExternalOptimOptions {
-        link: LinkFunction::Logit,
-        firth: Some(FirthSpec { enabled: true }),
+        family: gam::types::LikelihoodFamily::BinomialLogit,
         tol: 1e-10,
         max_iter: 200,
         nullspace_dims: vec![0],
@@ -4976,8 +4919,7 @@ fn firth_fd_step_size_sensitivity() {
     let base_rho = 12.0;
 
     let opts = ExternalOptimOptions {
-        link: LinkFunction::Logit,
-        firth: Some(FirthSpec { enabled: true }),
+        family: gam::types::LikelihoodFamily::BinomialLogit,
         tol: 1e-10,
         max_iter: 500,
         nullspace_dims: vec![0],
@@ -5058,12 +5000,15 @@ fn firth_beta_monotonicity_comparison() {
 
     let cfg_firth = ModelConfig::external(LinkFunction::Logit, 1e-10, 500, true);
     let cfg_no_firth = ModelConfig::external(LinkFunction::Logit, 1e-10, 500, false);
+    let engine_cfg_firth = gnomon::calibrate::model::to_engine_model_config(&cfg_firth).unwrap();
+    let engine_cfg_no_firth =
+        gnomon::calibrate::model::to_engine_model_config(&cfg_no_firth).unwrap();
 
     let deltas = [
         -0.010_f64, -0.005, -0.002, -0.001, 0.0, 0.001, 0.002, 0.005, 0.010,
     ];
 
-    let fit_beta_norm = |rho_val: f64, cfg: &ModelConfig| -> f64 {
+    let fit_beta_norm = |rho_val: f64, cfg: &gam::model::ModelConfig| -> f64 {
         let rho = array![rho_val];
         fit_model_for_fixed_rho(
             LogSmoothingParamsView::new(rho.view()),
@@ -5074,7 +5019,7 @@ fn firth_beta_monotonicity_comparison() {
             &rs_list,
             None,
             None,
-            &single_layout,
+            single_layout.total_coeffs,
             cfg,
             None,
             None,
@@ -5098,11 +5043,11 @@ fn firth_beta_monotonicity_comparison() {
 
     let betas_firth: Vec<f64> = deltas
         .iter()
-        .map(|&d| fit_beta_norm(12.0 + d, &cfg_firth))
+        .map(|&d| fit_beta_norm(12.0 + d, &engine_cfg_firth))
         .collect();
     let betas_no_firth: Vec<f64> = deltas
         .iter()
-        .map(|&d| fit_beta_norm(12.0 + d, &cfg_no_firth))
+        .map(|&d| fit_beta_norm(12.0 + d, &engine_cfg_no_firth))
         .collect();
 
     let changes_firth = count_sign_changes(&betas_firth);
@@ -5135,16 +5080,14 @@ fn firth_cost_oscillation_vs_no_firth() {
     let offset = Array1::<f64>::zeros(train.y.len());
 
     let opts_firth = ExternalOptimOptions {
-        link: LinkFunction::Logit,
-        firth: Some(FirthSpec { enabled: true }),
+        family: gam::types::LikelihoodFamily::BinomialLogit,
         tol: 1e-10,
         max_iter: 500,
         nullspace_dims: vec![0],
     };
 
     let opts_no_firth = ExternalOptimOptions {
-        link: LinkFunction::Logit,
-        firth: None,
+        family: gam::types::LikelihoodFamily::BinomialLogit,
         tol: 1e-10,
         max_iter: 500,
         nullspace_dims: vec![0],
@@ -5241,8 +5184,7 @@ fn analytic_gradient_matches_cost_trend() {
     let offset = Array1::<f64>::zeros(train.y.len());
 
     let opts = ExternalOptimOptions {
-        link: LinkFunction::Logit,
-        firth: Some(FirthSpec { enabled: true }),
+        family: gam::types::LikelihoodFamily::BinomialLogit,
         tol: 1e-10,
         max_iter: 500,
         nullspace_dims: vec![0],

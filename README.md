@@ -19,7 +19,7 @@ https://discourse.mc-stan.org/t/bayesian-implementation-of-the-royston-parmar-su
 - **[`cli/`](cli/)** – Run polygenic score calculations, fit ancestry models, and train calibration models from the command line. See [`cli/README.md`](cli/README.md) for usage.
 - **[`score/`](score/)** – Calculate raw polygenic scores for individuals from genotype data and published score files. See [`score/README.md`](score/README.md) for examples.
 - **[`map/`](map/)** – Infer genetic ancestry by fitting and projecting samples onto principal components that capture population structure. See [`map/README.md`](map/README.md) for details.
-- **[`calibrate/`](calibrate/)** – Transform raw polygenic scores into calibrated risk predictions that account for ancestry and sex. See [`calibrate/README.md`](calibrate/README.md) for statistical model and implementation.
+- **[`calibrate/`](calibrate/)** – Domain adapter layer for calibration and survival workflows in `gnomon`. Core spline/solver math lives in the separate `gam` repo (`/Users/user/gam`), which `calibrate/` imports. See [`calibrate/README.md`](calibrate/README.md) for boundary and ownership details.
 - **[`terms/`](terms/)** – Infer sample-level metadata terms, starting with sex inference. See [`terms/README.md`](terms/README.md) for CLI usage and integration tips.
 - **[`examples/`](examples/)** – Reproduce published polygenic score analyses and validate calibration performance.
 

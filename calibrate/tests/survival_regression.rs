@@ -78,7 +78,8 @@ struct TrustedReferenceFixture {
     event_competing: Vec<u8>,
     sample_weight: Vec<f64>,
     pgs: Vec<f64>,
-    sex: Vec<f64>,
+    #[serde(rename = "sex")]
+    _sex: Vec<f64>,
     pcs: Vec<Vec<f64>>,
     extra_static_covariates: Vec<Vec<f64>>,
     extra_static_names: Vec<String>,
@@ -100,7 +101,15 @@ impl TrustedReference {
     fn from_fixture(raw: TrustedReferenceFixture) -> Self {
         let static_covariates = rows_to_array(&raw.static_covariates);
         let extra_static_covariates = rows_to_array(&raw.extra_static_covariates);
-        let pcs = rows_to_array(&raw.pcs);
+        let _pcs = rows_to_array(&raw.pcs);
+        let mut names = vec!["pgs".to_string(), "sex".to_string()];
+        if static_covariates.ncols() >= 2 {
+            let num_pcs = static_covariates.ncols().saturating_sub(2 + raw.extra_static_names.len());
+            for idx in 0..num_pcs {
+                names.push(format!("pc{}", idx + 1));
+            }
+        }
+        names.extend(raw.extra_static_names.iter().cloned());
 
         let data = SurvivalTrainingData {
             age_entry: Array1::from(raw.age_entry),
@@ -108,11 +117,9 @@ impl TrustedReference {
             event_target: Array1::from(raw.event_target),
             event_competing: Array1::from(raw.event_competing),
             sample_weight: Array1::from(raw.sample_weight),
-            pgs: Array1::from(raw.pgs),
-            sex: Array1::from(raw.sex),
-            pcs,
-            extra_static_covariates: extra_static_covariates.clone(),
-            extra_static_names: raw.extra_static_names,
+            static_covariates: static_covariates.clone(),
+            static_covariate_names: names,
+            time_varying_covariate: Some(Array1::from(raw.pgs)),
         };
 
         Self {

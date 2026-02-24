@@ -1,30 +1,33 @@
-use crate::calibrate::basis::{self, BasisOptions, Dense, KnotSource, create_basis};
-use crate::calibrate::construction::ModelLayout;
+use gam::basis::{self, BasisOptions, Dense, KnotSource, create_basis};
+use crate::calibrate::construction::EngineLayout;
 use crate::calibrate::estimate::EstimationError;
-use crate::calibrate::hull::PeeledHull;
-use crate::calibrate::survival::{
+use gam::hull::PeeledHull;
+use gam::survival::{
     self, DEFAULT_RISK_EPSILON, SurvivalError, SurvivalModelArtifacts, SurvivalSpec,
 };
+pub use gam::types::LinkFunction;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, Zip, s};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufWriter, Write};
 use thiserror::Error;
 
+fn convert_struct<T, U>(value: &T) -> Result<U, EstimationError>
+where
+    T: Serialize,
+    U: DeserializeOwned,
+{
+    let encoded = toml::to_string(value)
+        .map_err(|e| EstimationError::InvalidInput(format!("serialization failure: {e}")))?;
+    toml::from_str::<U>(&encoded)
+        .map_err(|e| EstimationError::InvalidInput(format!("deserialization failure: {e}")))
+}
+
 // --- Public Data Structures ---
 // These structs define the public, human-readable format of the trained model
 // when serialized to a TOML file.
-
-/// Defines the link function, connecting the linear predictor to the mean response.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum LinkFunction {
-    /// The logit link, for binary or proportional outcomes (e.g., logistic regression).
-    /// Maps probabilities (0, 1) to the real line (-inf, +inf).
-    Logit,
-    /// The identity link, for continuous outcomes (e.g., Gaussian regression).
-    Identity,
-}
 
 /// Enumerates the supported working model families.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -119,7 +122,6 @@ pub fn default_calibrator_enabled() -> bool {
 /// The complete blueprint of a trained model.
 /// Contains all hyperparameters and structural information needed for prediction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(from = "ModelConfigSerde", into = "ModelConfigSerde")]
 pub struct ModelConfig {
     pub model_family: ModelFamily,
     pub penalty_order: usize,
@@ -227,154 +229,6 @@ impl ModelConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ModelConfigSerde {
-    #[serde(default)]
-    model_family: Option<ModelFamily>,
-    #[serde(default)]
-    link_function: Option<LinkFunction>,
-    penalty_order: usize,
-    convergence_tolerance: f64,
-    max_iterations: usize,
-    reml_convergence_tolerance: f64,
-    reml_max_iterations: u64,
-    #[serde(default)]
-    firth_bias_reduction: bool,
-    #[serde(default = "default_reml_parallel_threshold")]
-    reml_parallel_threshold: usize,
-    pgs_basis_config: BasisConfig,
-    pc_configs: Vec<PrincipalComponentConfig>,
-    pgs_range: (f64, f64),
-    interaction_penalty: InteractionPenaltyKind,
-    sum_to_zero_constraints: HashMap<String, Array2<f64>>,
-    knot_vectors: HashMap<String, Array1<f64>>,
-    range_transforms: HashMap<String, Array2<f64>>,
-    interaction_centering_means: HashMap<String, Array1<f64>>,
-    interaction_orth_alpha: HashMap<String, Array2<f64>>,
-    pc_null_transforms: HashMap<String, Array2<f64>>,
-    #[serde(default = "default_mcmc_enabled")]
-    mcmc_enabled: bool,
-    #[serde(default = "default_calibrator_enabled")]
-    calibrator_enabled: bool,
-    #[serde(default)]
-    survival: Option<SurvivalModelConfig>,
-}
-
-impl From<ModelConfigSerde> for ModelConfig {
-    fn from(helper: ModelConfigSerde) -> Self {
-        let ModelConfigSerde {
-            model_family,
-            link_function,
-            penalty_order,
-            convergence_tolerance,
-            max_iterations,
-            reml_convergence_tolerance,
-            reml_max_iterations,
-            firth_bias_reduction,
-            reml_parallel_threshold,
-            pgs_basis_config,
-            pc_configs,
-            pgs_range,
-            interaction_penalty,
-            sum_to_zero_constraints,
-            knot_vectors,
-            range_transforms,
-            interaction_centering_means,
-            interaction_orth_alpha,
-            pc_null_transforms,
-            mcmc_enabled,
-            calibrator_enabled,
-            survival,
-        } = helper;
-
-        let model_family = model_family
-            .or_else(|| link_function.map(ModelFamily::Gam))
-            .unwrap_or(ModelFamily::Gam(LinkFunction::Logit));
-
-        ModelConfig {
-            model_family,
-            penalty_order,
-            convergence_tolerance,
-            max_iterations,
-            reml_convergence_tolerance,
-            reml_max_iterations,
-            firth_bias_reduction,
-            reml_parallel_threshold,
-            pgs_basis_config,
-            pc_configs,
-            pgs_range,
-            interaction_penalty,
-            sum_to_zero_constraints,
-            knot_vectors,
-            range_transforms,
-            interaction_centering_means,
-            interaction_orth_alpha,
-            pc_null_transforms,
-            mcmc_enabled,
-            calibrator_enabled,
-            survival,
-        }
-    }
-}
-
-impl From<ModelConfig> for ModelConfigSerde {
-    fn from(config: ModelConfig) -> Self {
-        let ModelConfig {
-            model_family,
-            penalty_order,
-            convergence_tolerance,
-            max_iterations,
-            reml_convergence_tolerance,
-            reml_max_iterations,
-            firth_bias_reduction,
-            reml_parallel_threshold,
-            pgs_basis_config,
-            pc_configs,
-            pgs_range,
-            interaction_penalty,
-            sum_to_zero_constraints,
-            knot_vectors,
-            range_transforms,
-            interaction_centering_means,
-            interaction_orth_alpha,
-            pc_null_transforms,
-            mcmc_enabled,
-            calibrator_enabled,
-            survival,
-        } = config;
-
-        let legacy_link = match &model_family {
-            ModelFamily::Gam(link) => Some(*link),
-            ModelFamily::Survival(_) => None,
-        };
-
-        ModelConfigSerde {
-            model_family: Some(model_family),
-            link_function: legacy_link,
-            penalty_order,
-            convergence_tolerance,
-            max_iterations,
-            reml_convergence_tolerance,
-            reml_max_iterations,
-            firth_bias_reduction,
-            reml_parallel_threshold,
-            pgs_basis_config,
-            pc_configs,
-            pgs_range,
-            interaction_penalty,
-            sum_to_zero_constraints,
-            knot_vectors,
-            range_transforms,
-            interaction_centering_means,
-            interaction_orth_alpha,
-            pc_null_transforms,
-            mcmc_enabled,
-            calibrator_enabled,
-            survival,
-        }
-    }
-}
-
 /// A structured representation of the fitted model coefficients, designed for
 /// human interpretation and sharing. This structure is used in the TOML file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -427,7 +281,7 @@ pub struct TrainedModel {
     pub coefficients: MappedCoefficients,
     /// Estimated smoothing parameters from REML
     pub lambdas: Vec<f64>,
-    /// Robust geometric clamping hull (optional for backwards compatibility)
+    /// Robust geometric clamping hull.
     #[serde(default)]
     pub hull: Option<PeeledHull>,
     /// Optional penalized Hessian (X'WX + S) at convergence in the model's coefficient order.
@@ -635,7 +489,7 @@ impl TrainedModel {
         if h.nrows() != h.ncols() || h.ncols() != x_new.ncols() {
             return None;
         }
-        use crate::calibrate::faer_ndarray::FaerCholesky;
+        use gam::faer_ndarray::FaerCholesky;
         use faer::Side;
         let chol = match h.clone().cholesky(Side::Lower) {
             Ok(c) => c,
@@ -691,7 +545,7 @@ impl TrainedModel {
         let z_raw: Array1<f64> = eta_base.mapv(|u| (u - min_u) / range_width);
         let z_c: Array1<f64> = z_raw.mapv(|z| z.clamp(0.0, 1.0));
 
-        let (basis, _) = crate::calibrate::basis::create_basis::<Dense>(
+        let (basis, _) = gam::basis::create_basis::<Dense>(
             z_c.view(),
             KnotSource::Provided(joint.knot_vector.view()),
             joint.degree,
@@ -709,7 +563,7 @@ impl TrainedModel {
             }
         }
         if needs_ext {
-            if let Ok((b_prime_arc, _)) = crate::calibrate::basis::create_basis::<Dense>(
+            if let Ok((b_prime_arc, _)) = gam::basis::create_basis::<Dense>(
                 z_c.view(),
                 KnotSource::Provided(joint.knot_vector.view()),
                 joint.degree,
@@ -741,8 +595,7 @@ impl TrainedModel {
         eta_base: &Array1<f64>,
         joint: &JointLinkModel,
     ) -> Option<Array1<f64>> {
-        use crate::calibrate::basis::evaluate_bspline_derivative_scalar_into;
-        use crate::calibrate::basis::internal::BsplineScratch;
+        use gam::basis::evaluate_bspline_derivative_scalar;
 
         let n = eta_base.len();
         let mut deriv = Array1::<f64>::ones(n);
@@ -765,22 +618,17 @@ impl TrainedModel {
         }
 
         let mut deriv_raw = vec![0.0; n_raw];
-        let num_basis_lower = joint.knot_vector.len().saturating_sub(joint.degree);
-        let mut lower_basis = vec![0.0; num_basis_lower];
-        let mut lower_scratch = BsplineScratch::new(joint.degree.saturating_sub(1));
 
         for i in 0..n {
             // For the linear extension, d/dz_raw B_ext(z_raw) = B'(z_c) everywhere,
             // so we always evaluate B' at the clamped coordinate.
             let z_i = z_c[i];
             deriv_raw.fill(0.0);
-            if evaluate_bspline_derivative_scalar_into(
+            if evaluate_bspline_derivative_scalar(
                 z_i,
                 joint.knot_vector.view(),
                 joint.degree,
                 &mut deriv_raw,
-                &mut lower_basis,
-                &mut lower_scratch,
             )
             .is_err()
             {
@@ -830,7 +678,7 @@ impl TrainedModel {
             return None;
         }
 
-        use crate::calibrate::faer_ndarray::FaerCholesky;
+        use gam::faer_ndarray::FaerCholesky;
         use faer::Side;
         let chol = match h.clone().cholesky(Side::Lower) {
             Ok(c) => c,
@@ -1318,7 +1166,7 @@ impl TrainedModel {
 
         let (eta, mode_mean, _, se_eta_opt) = self.predict_detailed(p_new, sex_new, pcs_new)?;
 
-        let quad_ctx = crate::calibrate::quadrature::QuadratureContext::new();
+        let quad_ctx = gam::quadrature::QuadratureContext::new();
         match link_function {
             LinkFunction::Identity => {
                 // For identity link, mean = mode, no quadrature needed
@@ -1327,7 +1175,7 @@ impl TrainedModel {
             LinkFunction::Logit => {
                 // Use quadrature if SE is available
                 match se_eta_opt {
-                    Some(se_eta) => Ok(crate::calibrate::quadrature::logit_posterior_mean_batch(
+                    Some(se_eta) => Ok(gam::quadrature::logit_posterior_mean_batch(
                         &quad_ctx, &eta, &se_eta,
                     )),
                     None => {
@@ -2060,7 +1908,7 @@ impl TrainedModel {
         Ok(model)
     }
 
-    fn rebuild_layout_from_config(&self) -> Result<ModelLayout, ModelError> {
+    fn rebuild_layout_from_config(&self) -> Result<EngineLayout, ModelError> {
         if matches!(self.config.model_family, ModelFamily::Survival(_)) {
             return Err(ModelError::UnsupportedForSurvival(
                 "rebuild_layout_from_config",
@@ -2116,7 +1964,7 @@ impl TrainedModel {
 
         let sex_main_cols = 1;
 
-        ModelLayout::new(
+        EngineLayout::new(
             &self.config,
             &pc_null_ncols,
             &pc_range_ncols,
@@ -2139,7 +1987,7 @@ impl TrainedModel {
 
     pub(crate) fn assert_layout_consistency_with_layout(
         &self,
-        layout: &ModelLayout,
+        layout: &EngineLayout,
     ) -> Result<(), ModelError> {
         if matches!(self.config.model_family, ModelFamily::Survival(_)) {
             return Ok(());
@@ -2355,7 +2203,7 @@ mod internal {
         let pgs_main_basis = pgs_main_basis_unc.dot(pgs_z);
 
         // The interaction basis MUST be constructed from the UNCONSTRAINED PGS basis.
-        // The model's coefficient layout (defined in construction.rs -> ModelLayout::new) is derived
+        // The model's coefficient layout (defined in construction.rs -> EngineLayout::new) is derived
         // from the dimensions of the unconstrained bases. Changing this to use a constrained basis
         // without a corresponding change to the layout logic will cause a dimension mismatch and lead
         // to silently incorrect predictions. The debug_assert in TrainedModel::predict guards against this.
@@ -2719,8 +2567,7 @@ mod internal {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn internal_construct_design_matrix(
+pub fn internal_construct_design_matrix(
     p_new: ArrayView1<f64>,
     sex_new: ArrayView1<f64>,
     pcs_new: ArrayView2<f64>,
@@ -2730,8 +2577,7 @@ pub(crate) fn internal_construct_design_matrix(
     internal::construct_design_matrix(p_new, sex_new, pcs_new, config, coeffs)
 }
 
-#[cfg(test)]
-pub(crate) fn internal_flatten_coefficients(
+pub fn internal_flatten_coefficients(
     coeffs: &MappedCoefficients,
     config: &ModelConfig,
 ) -> Result<Array1<f64>, ModelError> {
@@ -2743,7 +2589,7 @@ mod tests {
     use super::*;
     // TrainingData is not used in tests
     use approx::assert_abs_diff_eq;
-    use ndarray::{Array1, Array2, array};
+    use ndarray::{Array1, Array2, array, s};
 
     fn sigmoid(x: f64) -> f64 {
         let x = x.clamp(-700.0, 700.0);
@@ -3091,22 +2937,20 @@ mod tests {
 
     #[test]
     fn survival_prediction_produces_risk_and_se() {
-        use crate::calibrate::survival::{
+        use gam::survival::{
             BasisDescriptor, CholeskyFactor, HessianFactor, SurvivalModelArtifacts,
-            SurvivalTrainingData, build_survival_layout,
+            SurvivalLayoutInputs, build_survival_layout,
         };
 
-        let data = SurvivalTrainingData {
+        let data = SurvivalLayoutInputs {
             age_entry: array![50.0, 55.0],
             age_exit: array![55.0, 60.0],
             event_target: array![1, 0],
             event_competing: array![0, 0],
             sample_weight: array![1.0, 1.0],
-            pgs: array![0.2, -0.1],
-            sex: array![0.0, 1.0],
-            pcs: Array2::<f64>::zeros((2, 0)),
-            extra_static_covariates: Array2::<f64>::zeros((2, 0)),
-            extra_static_names: Vec::new(),
+            static_covariates: array![[0.2, 0.0], [-0.1, 1.0]],
+            static_covariate_names: vec!["pgs".to_string(), "sex".to_string()],
+            time_varying_covariate: Some(array![0.2, -0.1]),
         };
         let basis = BasisDescriptor {
             knot_vector: array![0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0],
@@ -3124,7 +2968,7 @@ mod tests {
             let column = layout.static_covariates.column(col_idx);
             let min_val = column.iter().copied().fold(f64::INFINITY, f64::min);
             let max_val = column.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-            ranges.push(crate::calibrate::survival::ValueRange {
+            ranges.push(gam::survival::ValueRange {
                 min: min_val,
                 max: max_val,
             });
@@ -3133,7 +2977,7 @@ mod tests {
             coefficients: coeffs.clone(),
             age_basis: basis.clone(),
             time_varying_basis: None,
-            static_covariate_layout: crate::calibrate::survival::CovariateLayout {
+            static_covariate_layout: gam::survival::CovariateLayout {
                 column_names,
                 ranges,
             },
@@ -3208,9 +3052,9 @@ mod tests {
             .predict_survival(
                 data.age_entry.view(),
                 data.age_exit.view(),
-                data.pgs.view(),
-                data.sex.view(),
-                data.pcs.view(),
+                data.static_covariates.column(0),
+                data.static_covariates.column(1),
+                data.static_covariates.slice(s![.., 2..]),
                 SurvivalRiskType::Net,
                 None,
             )
@@ -3790,7 +3634,7 @@ mod tests {
 /// Maps the flattened coefficient vector to a structured representation.
 pub fn map_coefficients(
     beta: &Array1<f64>,
-    layout: &ModelLayout,
+    layout: &EngineLayout,
 ) -> Result<MappedCoefficients, EstimationError> {
     let intercept = beta[layout.intercept_col];
     let mut pcs = HashMap::new();
@@ -3852,4 +3696,14 @@ pub fn map_coefficients(
         main_effects: MainEffects { sex, pgs, pcs },
         interaction_effects,
     })
+}
+
+pub fn to_engine_model_config(config: &ModelConfig) -> Result<gam::model::ModelConfig, EstimationError> {
+    convert_struct(config)
+}
+
+pub fn from_engine_trained_model(
+    model: &gam::model::TrainedModel,
+) -> Result<TrainedModel, EstimationError> {
+    convert_struct(model)
 }

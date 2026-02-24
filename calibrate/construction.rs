@@ -1,9 +1,9 @@
-use crate::calibrate::basis::{
+use gam::basis::{
     self, BasisOptions, Dense, KnotSource, create_basis, create_bspline_basis_nd_with_knots,
 };
 use crate::calibrate::data::TrainingData;
 use crate::calibrate::estimate::EstimationError;
-use crate::calibrate::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd};
+use gam::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd};
 use crate::calibrate::model::{InteractionPenaltyKind, ModelConfig};
 use faer::linalg::matmul::matmul;
 use faer::{Accum, Mat, MatRef, Par, Side};
@@ -727,7 +727,7 @@ impl DifferencePenaltyCache {
 
 /// Holds the layout of the design matrix `X` and penalty matrices `S_i`.
 #[derive(Clone)]
-pub struct ModelLayout {
+pub struct EngineLayout {
     pub intercept_col: usize,
     pub sex_col: Option<usize>,
     pub pgs_main_cols: Range<usize>,
@@ -748,6 +748,8 @@ pub struct ModelLayout {
     pub total_coeffs: usize,
     pub num_penalties: usize,
 }
+
+pub type ModelLayout = EngineLayout;
 
 /// The semantic type of a penalized term in the model.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -771,11 +773,11 @@ pub struct PenalizedBlock {
     pub term_type: TermType,
 }
 
-impl ModelLayout {
+impl EngineLayout {
     /// Minimal external layout for arbitrary design matrices used by the calibrator or adapters.
     /// Sets only the fields required by PIRLS and reparameterization.
     pub fn external(total_coeffs: usize, num_penalties: usize) -> Self {
-        ModelLayout {
+        EngineLayout {
             intercept_col: 0,
             sex_col: None,
             pgs_main_cols: 0..0,
@@ -974,7 +976,7 @@ impl ModelLayout {
         // Verify that our calculation matches the actual column count
         if current_col != calculated_total_coeffs {
             return Err(EstimationError::LayoutError(format!(
-                "ModelLayout dimension calculation error: calculated total_coeffs={calculated_total_coeffs} but actual current_col={current_col}"
+                "EngineLayout dimension calculation error: calculated total_coeffs={calculated_total_coeffs} but actual current_col={current_col}"
             )));
         }
 
@@ -1002,7 +1004,7 @@ impl ModelLayout {
             )));
         }
 
-        Ok(ModelLayout {
+        Ok(EngineLayout {
             intercept_col,
             sex_col,
             pgs_main_cols,
@@ -1031,7 +1033,7 @@ pub fn build_design_and_penalty_matrices(
     (
         Array2<f64>,                  // design matrix
         Vec<Array2<f64>>,             // penalty matrices (dense)
-        ModelLayout,                  // model layout
+        EngineLayout,                  // model layout
         HashMap<String, Array2<f64>>, // sum_to_zero_constraints
         HashMap<String, Array1<f64>>, // knot_vectors
         HashMap<String, Array2<f64>>, // range_transforms
@@ -1267,7 +1269,7 @@ pub fn build_design_and_penalty_matrices(
 
     let sex_main_ncols = 1;
 
-    let layout = ModelLayout::new(
+    let layout = EngineLayout::new(
         config,
         &pc_null_ncols,
         &pc_range_ncols,
@@ -1720,7 +1722,7 @@ pub fn build_design_and_penalty_matrices(
             let interaction_key = format!("f(PGS,{})", pc_name);
             interaction_orth_alpha.insert(interaction_key.clone(), alpha.clone());
 
-            // Store zero means for backward compatibility
+            // Store zero means for legacy-free behavior
             let zeros = Array1::zeros(tensor_orth.ncols());
             interaction_centering_means.insert(interaction_key.clone(), zeros);
 
@@ -2152,10 +2154,9 @@ pub fn compute_penalty_square_roots(
 /// This version works with full-sized p × p penalty matrices from s_list.
 pub fn construct_s_lambda(
     lambdas: &Array1<f64>,
-    s_list: &[Array2<f64>], // Now receives a list of p × p matrices
-    layout: &ModelLayout,
+    s_list: &[Array2<f64>],
+    p: usize,
 ) -> Array2<f64> {
-    let p = layout.total_coeffs;
     let mut s_lambda = Array2::zeros((p, p));
 
     if s_list.is_empty() {
@@ -2193,11 +2194,10 @@ pub struct ReparamInvariant {
 /// Precompute the lambda-invariant reparameterization structure from penalty roots.
 pub fn precompute_reparam_invariant(
     rs_list: &[Array2<f64>],
-    layout: &ModelLayout,
+    p: usize,
 ) -> Result<ReparamInvariant, EstimationError> {
     use std::cmp::Ordering;
 
-    let p = layout.total_coeffs;
     let m = rs_list.len();
 
     if m == 0 {
@@ -2310,24 +2310,23 @@ pub fn precompute_reparam_invariant(
 /// transformed penalties, the orthogonal basis, and log-determinant
 /// information required by PIRLS.
 pub fn stable_reparameterization(
-    rs_list: &[Array2<f64>], // penalty square roots (each is rank_i x p) STANDARDIZED
+    rs_list: &[Array2<f64>],
     lambdas: &[f64],
-    layout: &ModelLayout,
+    p: usize,
 ) -> Result<ReparamResult, EstimationError> {
-    let invariant = precompute_reparam_invariant(rs_list, layout)?;
-    stable_reparameterization_with_invariant(rs_list, lambdas, layout, &invariant)
+    let invariant = precompute_reparam_invariant(rs_list, p)?;
+    stable_reparameterization_with_invariant(rs_list, lambdas, p, &invariant)
 }
 
 /// Apply stable reparameterization using precomputed lambda-invariant structures.
-pub fn stable_reparameterization_with_invariant(
+pub(crate) fn stable_reparameterization_with_invariant(
     rs_list: &[Array2<f64>],
     lambdas: &[f64],
-    layout: &ModelLayout,
+    p: usize,
     invariant: &ReparamInvariant,
 ) -> Result<ReparamResult, EstimationError> {
     use std::cmp::Ordering;
 
-    let p = layout.total_coeffs;
     let m = rs_list.len();
 
     if lambdas.len() != m {
@@ -2616,6 +2615,38 @@ pub fn stable_reparameterization_with_invariant(
     })
 }
 
+/// Minimal engine layout descriptor that avoids domain-specific layout coupling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EngineDims {
+    pub p: usize,
+    pub k: usize,
+}
+
+impl EngineDims {
+    pub fn new(p: usize, k: usize) -> Self {
+        Self { p, k }
+    }
+}
+
+/// Engine-facing stable reparameterization API using only `(p, k)`.
+pub fn stable_reparameterization_engine(
+    rs_list: &[Array2<f64>],
+    lambdas: &[f64],
+    dims: EngineDims,
+) -> Result<ReparamResult, EstimationError> {
+    stable_reparameterization(rs_list, lambdas, dims.p)
+}
+
+/// Engine-facing stable reparameterization API with precomputed invariant using only `(p, k)`.
+pub fn stable_reparameterization_with_invariant_engine(
+    rs_list: &[Array2<f64>],
+    lambdas: &[f64],
+    dims: EngineDims,
+    invariant: &ReparamInvariant,
+) -> Result<ReparamResult, EstimationError> {
+    stable_reparameterization_with_invariant(rs_list, lambdas, dims.p, invariant)
+}
+
 /// Result of the stable penalized least squares solve
 #[derive(Clone)]
 pub struct StablePLSResult {
@@ -2662,7 +2693,7 @@ pub fn calculate_condition_number(matrix: &Array2<f64>) -> Result<f64, FaerLinal
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::calibrate::basis::create_difference_penalty_matrix;
+    use gam::basis::create_difference_penalty_matrix;
     use crate::calibrate::data::TrainingData;
     use crate::calibrate::estimate::train_model;
     use crate::calibrate::model::{
@@ -2775,7 +2806,7 @@ mod tests {
     /// Construct canonical penalty square roots and smoothing parameters for stress scenarios.
     fn create_synthetic_penalty_scenario(
         scenario_name: &str,
-    ) -> (Vec<Array2<f64>>, Vec<f64>, ModelLayout) {
+    ) -> (Vec<Array2<f64>>, Vec<f64>, EngineLayout) {
         match scenario_name {
             "balanced" => {
                 let p = 10;
@@ -2793,7 +2824,7 @@ mod tests {
                 let rs2 = make_root(0.9);
                 let rs3 = make_root(1.1);
                 let lambdas = vec![1.0, 1.0, 1.0];
-                let layout = ModelLayout::external(p, lambdas.len());
+                let layout = EngineLayout::external(p, lambdas.len());
                 (vec![rs1, rs2, rs3], lambdas, layout)
             }
             "imbalanced" => {
@@ -2812,7 +2843,7 @@ mod tests {
                 let rs2 = make_root(3);
                 let rs3 = make_root(2);
                 let lambdas = vec![1000.0, 1.0, 1.0];
-                let layout = ModelLayout::external(p, lambdas.len());
+                let layout = EngineLayout::external(p, lambdas.len());
                 (vec![rs1, rs2, rs3], lambdas, layout)
             }
             "near_zero" => {
@@ -2820,7 +2851,7 @@ mod tests {
                 let rs1 = Array2::zeros((0, p));
                 let rs2 = Array2::zeros((0, p));
                 let lambdas = vec![1e-8, 2e-8];
-                let layout = ModelLayout::external(p, lambdas.len());
+                let layout = EngineLayout::external(p, lambdas.len());
                 (vec![rs1, rs2], lambdas, layout)
             }
             "high_rank" => {
@@ -2839,7 +2870,7 @@ mod tests {
                 let rs2 = make_root(55);
                 let rs3 = make_root(50);
                 let lambdas = vec![2.0, 1.5, 0.75];
-                let layout = ModelLayout::external(p, lambdas.len());
+                let layout = EngineLayout::external(p, lambdas.len());
                 (vec![rs1, rs2, rs3], lambdas, layout)
             }
             "degenerate" => {
@@ -2868,7 +2899,7 @@ mod tests {
                     stack
                 };
                 let lambdas = vec![3.0, 0.5];
-                let layout = ModelLayout::external(p, lambdas.len());
+                let layout = EngineLayout::external(p, lambdas.len());
                 (vec![rs_stack.clone(), rs_stack], lambdas, layout)
             }
             other => panic!("Unknown synthetic penalty scenario: {other}"),
@@ -3889,35 +3920,35 @@ mod tests {
     fn test_reparam_invariants_balanced_penalties() {
         let (rs_list, lambdas, layout) = create_synthetic_penalty_scenario("balanced");
         let reparam =
-            stable_reparameterization(&rs_list, &lambdas, &layout).expect("balanced reparam");
+            stable_reparameterization(&rs_list, &lambdas, layout.total_coeffs).expect("balanced reparam");
         assert_reparam_invariants(&reparam, &rs_list, &lambdas);
     }
 
     #[test]
     fn test_reparam_invariants_imbalanced_penalties() {
         let (rs_list, lambdas, layout) = create_synthetic_penalty_scenario("imbalanced");
-        let reparam = stable_reparameterization(&rs_list, &lambdas, &layout).expect("imbalanced");
+        let reparam = stable_reparameterization(&rs_list, &lambdas, layout.total_coeffs).expect("imbalanced");
         assert_reparam_invariants(&reparam, &rs_list, &lambdas);
     }
 
     #[test]
     fn test_reparam_invariants_near_zero_penalties() {
         let (rs_list, lambdas, layout) = create_synthetic_penalty_scenario("near_zero");
-        let reparam = stable_reparameterization(&rs_list, &lambdas, &layout).expect("near_zero");
+        let reparam = stable_reparameterization(&rs_list, &lambdas, layout.total_coeffs).expect("near_zero");
         assert_reparam_invariants(&reparam, &rs_list, &lambdas);
     }
 
     #[test]
     fn test_reparam_invariants_high_rank_penalties() {
         let (rs_list, lambdas, layout) = create_synthetic_penalty_scenario("high_rank");
-        let reparam = stable_reparameterization(&rs_list, &lambdas, &layout).expect("high_rank");
+        let reparam = stable_reparameterization(&rs_list, &lambdas, layout.total_coeffs).expect("high_rank");
         assert_reparam_invariants(&reparam, &rs_list, &lambdas);
     }
 
     #[test]
     fn test_reparam_invariants_degenerate_penalties() {
         let (rs_list, lambdas, layout) = create_synthetic_penalty_scenario("degenerate");
-        let reparam = stable_reparameterization(&rs_list, &lambdas, &layout).expect("degenerate");
+        let reparam = stable_reparameterization(&rs_list, &lambdas, layout.total_coeffs).expect("degenerate");
         assert_reparam_invariants(&reparam, &rs_list, &lambdas);
     }
 
@@ -3931,7 +3962,7 @@ mod tests {
             build_design_and_penalty_matrices(data_train, config).expect("build matrices");
         let rs_list = compute_penalty_square_roots(&s_list).expect("square roots");
         let reparam =
-            stable_reparameterization(&rs_list, &trained.lambdas, &layout).expect("reparam");
+            stable_reparameterization(&rs_list, &trained.lambdas, layout.total_coeffs).expect("reparam");
         assert_reparam_invariants(&reparam, &rs_list, &trained.lambdas);
 
         // --- Null space dimension check ---

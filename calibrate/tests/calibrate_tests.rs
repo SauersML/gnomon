@@ -1,6 +1,7 @@
+use gnomon::calibrate::alo::CalibratorFeatures;
 use gnomon::calibrate::calibrator::{
-    CalibratorFeatures, CalibratorModel, CalibratorSpec, auc, build_calibrator_design,
-    fit_calibrator, predict_calibrator,
+    CalibratorModel, CalibratorSpec, auc, build_calibrator_design, fit_calibrator,
+    predict_calibrator,
 };
 use gnomon::calibrate::model::{BasisConfig, LinkFunction};
 use gnomon::calibrate::survival::{

@@ -1,5 +1,13 @@
 # Survival Royston–Parmar Model Architecture
 
+> Status note: historical design document.  
+> Active repo split contract is:
+> - Adapter/domain layer: `/Users/user/gnomon/calibrate`
+> - Engine layer: `/Users/user/gam/src`
+>
+> `gnomon/calibrate` performs domain feature/layout assembly and calls engine APIs.
+> `gam` owns numeric solver and likelihood internals.
+
 ## 1. Purpose
 Deliver a first-class survival model family built on the Royston–Parmar (RP) parameterisation of the cause-specific cumulative hazard. The design must:
 

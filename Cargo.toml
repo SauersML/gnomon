@@ -17,7 +17,12 @@ path = "shared/lib.rs"
 name = "gnomon"
 path = "cli/main.rs"
 
+[features]
+default = []
+bench-path = []
+
 [dependencies]
+gam = { path = "../gam" }
 ahash = "0.8.12"
 clap = { version = "4.5.48", features = ["derive"] }
 memmap2 = "0.9.8"
@@ -112,6 +117,7 @@ grep = "0.3.2"
 [[bench]]
 name = "path_benchmark"
 harness = false
+required-features = ["bench-path"]
 
 [[test]]
 name = "calibrate"

@@ -1226,7 +1226,7 @@ mod tests {
         let mut mu = Array1::<f64>::zeros(eta.len());
         let mut weights = Array1::<f64>::zeros(eta.len());
         let mut z = Array1::<f64>::zeros(eta.len());
-        crate::calibrate::pirls::update_glm_vectors(
+        gam::pirls::update_glm_vectors(
             state.y(),
             &eta,
             LinkFunction::Logit,
@@ -1282,7 +1282,7 @@ mod tests {
         let mut mu = Array1::<f64>::zeros(eta.len());
         let mut weights = Array1::<f64>::zeros(eta.len());
         let mut z = Array1::<f64>::zeros(eta.len());
-        crate::calibrate::pirls::update_glm_vectors(
+        gam::pirls::update_glm_vectors(
             state.y(),
             &eta,
             LinkFunction::Logit,
@@ -1309,7 +1309,7 @@ mod tests {
 
         // Compute spectral factor W for the spectral version of the gradient
         // This matches the production code in estimate.rs
-        use crate::calibrate::faer_ndarray::FaerEigh;
+        use gam::faer_ndarray::FaerEigh;
         let (eigvals_arr, eigvecs_arr) = h_total.eigh(Side::Lower).expect("eigh");
 
         const EIG_THRESHOLD: f64 = 1e-12;
@@ -1404,7 +1404,7 @@ mod tests {
         let factor_g = state.factorize_faer(&h_total);
 
         // Compute spectral factor W for the spectral version of the gradient
-        use crate::calibrate::faer_ndarray::FaerEigh;
+        use gam::faer_ndarray::FaerEigh;
         let (eigvals_arr, eigvecs_arr) = h_total.eigh(Side::Lower).expect("eigh");
         const EIG_THRESHOLD: f64 = 1e-12;
         let valid_indices: Vec<usize> = eigvals_arr
@@ -1765,7 +1765,7 @@ mod tests {
         .unwrap();
 
         let rho = Array1::zeros(layout.num_penalties); // λ=1 across penalties
-        crate::calibrate::pirls::fit_model_for_fixed_rho(
+        gam::pirls::fit_model_for_fixed_rho(
             LogSmoothingParamsView::new(rho.view()),
             x.view(),
             reml_state.offset(),
@@ -1884,7 +1884,7 @@ mod tests {
         .unwrap();
 
         let rho = Array1::zeros(layout.num_penalties); // λ=1 across penalties
-        crate::calibrate::pirls::fit_model_for_fixed_rho(
+        gam::pirls::fit_model_for_fixed_rho(
             LogSmoothingParamsView::new(rho.view()),
             x.view(),
             reml_state.offset(),
@@ -2167,7 +2167,7 @@ mod tests {
                     create_balanced_penalty_root(&s_list, layout.total_coeffs).expect("eb");
                 let rho = Array1::from(rho_values.clone());
                 let offset = Array1::<f64>::zeros(data_train.y.len());
-                let (pirls_res, _) = crate::calibrate::pirls::fit_model_for_fixed_rho(
+                let (pirls_res, _) = gam::pirls::fit_model_for_fixed_rho(
                     LogSmoothingParamsView::new(rho.view()),
                     x_tr.view(),
                     offset.view(),
@@ -3512,7 +3512,7 @@ mod tests {
         let rs_original = compute_penalty_square_roots(&s_list)?;
 
         let offset = Array1::<f64>::zeros(data.y.len());
-        let result = crate::calibrate::pirls::fit_model_for_fixed_rho(
+        let result = gam::pirls::fit_model_for_fixed_rho(
             LogSmoothingParamsView::new(extreme_rho.view()),
             x_matrix.view(),
             offset.view(),
@@ -5720,7 +5720,7 @@ fn test_objective_consistency_raw_vs_stabilized() {
         w.view(),
         x.view(),
         offset.view(),
-        &[s1, s2],
+        vec![s1, s2],
         &opts,
     );
 
@@ -6070,7 +6070,7 @@ use rand::{RngExt, SeedableRng, rngs::StdRng};
 /// We test this by computing log|A| and its gradient via finite differences.
 #[test]
 fn test_log_det_gradient_formula() {
-    use crate::calibrate::faer_ndarray::FaerCholesky;
+    use gam::faer_ndarray::FaerCholesky;
     use faer::Side;
 
     // Simple 3×3 SPD matrix
@@ -6082,7 +6082,7 @@ fn test_log_det_gradient_formula() {
 
     // Helper to compute log|A| using faer Cholesky
     fn log_det_chol(mat: &Array2<f64>) -> Option<f64> {
-        use crate::calibrate::faer_ndarray::FaerCholesky;
+        use gam::faer_ndarray::FaerCholesky;
         use faer::Side;
         match mat.cholesky(Side::Lower) {
             Ok(chol) => {
@@ -6430,7 +6430,7 @@ fn stress_test_firth_gradient_vs_conditioning() {
 /// where A = X H⁻¹ X', and we compare both analytic AND FD to this ground truth.
 #[test]
 fn test_laml_gradient_exact_formula_ground_truth() {
-    use crate::calibrate::faer_ndarray::FaerCholesky;
+    use gam::faer_ndarray::FaerCholesky;
     use faer::Side;
 
     // Simple well-conditioned logit problem
@@ -6684,7 +6684,7 @@ fn test_laml_gradient_exact_formula_ground_truth() {
 /// - KKT residual included
 #[test]
 fn test_laml_gradient_firth_exact_formula_ground_truth() {
-    use crate::calibrate::faer_ndarray::FaerCholesky;
+    use gam::faer_ndarray::FaerCholesky;
     use faer::Side;
 
     // Well-conditioned Firth problem
