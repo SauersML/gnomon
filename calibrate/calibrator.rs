@@ -4,7 +4,7 @@ use gam::basis::{
 };
 use crate::calibrate::alo::CalibratorFeatures;
 #[cfg(test)]
-use crate::calibrate::alo::compute_alo_features;
+use crate::calibrate::alo::compute_alo_features_from_pirls;
 use crate::calibrate::estimate::EstimationError;
 use gam::matrix::DesignMatrix;
 #[cfg(test)]
@@ -2766,7 +2766,7 @@ mod tests {
         let x_dense = fit_res.x_transformed.to_dense();
 
         // Run ALO with our fixed code
-        let alo_features = compute_alo_features(&fit_res, y.view(), x.view(), None, link).unwrap();
+        let alo_features = compute_alo_features_from_pirls(&fit_res, y.view(), x.view(), None, link).unwrap();
 
         // Now implement the old buggy calculation manually to compare
         let n_test = 10; // Just test a few points for comparison
@@ -2839,7 +2839,7 @@ mod tests {
         let x_dense = fit_res.x_transformed.to_dense();
 
         // Compute ALO features
-        compute_alo_features(&fit_res, y.view(), x.view(), None, link).unwrap();
+        compute_alo_features_from_pirls(&fit_res, y.view(), x.view(), None, link).unwrap();
 
         // Extract hat diagonal elements using the LLT approach (matches compute_alo_features implementation)
         let mut aii = Array1::<f64>::zeros(n);
@@ -2943,7 +2943,7 @@ mod tests {
 
         let fit_with_zero = real_unpenalized_fit(&x, &y, &w_zero, link);
         let x_zero_dense = fit_with_zero.x_transformed.to_dense();
-        compute_alo_features(&fit_with_zero, y.view(), x.view(), None, link).unwrap();
+        compute_alo_features_from_pirls(&fit_with_zero, y.view(), x.view(), None, link).unwrap();
 
         // Check directly with small custom calculation
         let mut u_zero = x_zero_dense.clone();
@@ -3001,7 +3001,7 @@ mod tests {
         let x_full_dense = full_fit.x_transformed.to_dense();
 
         // Compute ALO features
-        let alo_features = compute_alo_features(&full_fit, y.view(), x.view(), None, link).unwrap();
+        let alo_features = compute_alo_features_from_pirls(&full_fit, y.view(), x.view(), None, link).unwrap();
 
         // Build the exact Sherman–Morrison LOO baseline using the full-fit Fisher geometry
         let w_full = full_fit.final_weights.clone();
@@ -3143,7 +3143,7 @@ mod tests {
         let link = LinkFunction::Logit;
 
         let full_fit = real_unpenalized_fit(&x, &y, &w, link);
-        let alo_full = compute_alo_features(&full_fit, y.view(), x.view(), None, link).unwrap();
+        let alo_full = compute_alo_features_from_pirls(&full_fit, y.view(), x.view(), None, link).unwrap();
 
         let mut loo_pred = Array1::<f64>::zeros(n);
         let mut loo_se = Array1::<f64>::zeros(n);
@@ -3246,7 +3246,7 @@ mod tests {
         let link = LinkFunction::Logit;
 
         let full_fit = real_unpenalized_fit(&x, &y, &w, link);
-        let alo = compute_alo_features(&full_fit, y.view(), x.view(), None, link)
+        let alo = compute_alo_features_from_pirls(&full_fit, y.view(), x.view(), None, link)
             .expect("compute_alo_features should succeed");
 
         // Compute full-sample naive SE using the EXACT formula from compute_alo_features:
@@ -3363,7 +3363,7 @@ mod tests {
         let link = LinkFunction::Identity;
 
         let full_fit = real_unpenalized_fit(&x, &y, &w, link);
-        let alo = compute_alo_features(&full_fit, y.view(), x.view(), None, link)
+        let alo = compute_alo_features_from_pirls(&full_fit, y.view(), x.view(), None, link)
             .expect("compute_alo_features should succeed");
 
         // Compute full-sample naive SE using the EXACT formula from compute_alo_features:
@@ -4552,7 +4552,7 @@ mod tests {
         let base_fit = real_unpenalized_fit(&fake_x, &y, &w, LinkFunction::Logit);
 
         // Generate ALO features
-        let mut alo_features = compute_alo_features(
+        let mut alo_features = compute_alo_features_from_pirls(
             &base_fit,
             y.view(),
             fake_x.view(),
@@ -4746,7 +4746,7 @@ mod tests {
 
             let base_fit = real_unpenalized_fit(&jittered_fake_x, &y, &w, LinkFunction::Logit);
 
-            let mut alo_features = compute_alo_features(
+            let mut alo_features = compute_alo_features_from_pirls(
                 &base_fit,
                 y.view(),
                 jittered_fake_x.view(),
@@ -4897,7 +4897,7 @@ mod tests {
         let fake_x = Array2::from_shape_fn((n, 1), |(i, _)| distorted_logits[i]);
         let base_fit = real_unpenalized_fit(&fake_x, &y, &w, LinkFunction::Logit);
 
-        let mut alo_features = compute_alo_features(
+        let mut alo_features = compute_alo_features_from_pirls(
             &base_fit,
             y.view(),
             fake_x.view(),
@@ -5065,7 +5065,7 @@ mod tests {
 
         // Generate ALO features
         let alo_features =
-            compute_alo_features(&base_fit, y.view(), x.view(), None, LinkFunction::Logit).unwrap();
+            compute_alo_features_from_pirls(&base_fit, y.view(), x.view(), None, LinkFunction::Logit).unwrap();
 
         // Create calibrator spec
         let spec = CalibratorSpec {
@@ -5204,7 +5204,7 @@ mod tests {
 
         let fit = real_unpenalized_fit(&x, &y, &Array1::<f64>::ones(n), LinkFunction::Logit);
         let alo_features =
-            compute_alo_features(&fit, y.view(), x.view(), None, LinkFunction::Logit).unwrap();
+            compute_alo_features_from_pirls(&fit, y.view(), x.view(), None, LinkFunction::Logit).unwrap();
 
         let spec = CalibratorSpec {
             link: LinkFunction::Logit,
@@ -5309,7 +5309,7 @@ mod tests {
         let w = Array1::<f64>::ones(n);
         let base_fit = real_unpenalized_fit(&x, &y, &w, LinkFunction::Logit);
         let alo_features =
-            compute_alo_features(&base_fit, y.view(), x.view(), None, LinkFunction::Logit).unwrap();
+            compute_alo_features_from_pirls(&base_fit, y.view(), x.view(), None, LinkFunction::Logit).unwrap();
 
         let spec = CalibratorSpec {
             link: LinkFunction::Logit,
@@ -5614,7 +5614,7 @@ mod tests {
         // Just test that we can fit a calibrator
         let base_fit = real_unpenalized_fit(&x, &y, &w, LinkFunction::Logit);
         let alo_features =
-            compute_alo_features(&base_fit, y.view(), x.view(), None, LinkFunction::Logit).unwrap();
+            compute_alo_features_from_pirls(&base_fit, y.view(), x.view(), None, LinkFunction::Logit).unwrap();
 
         let features = CalibratorFeatures {
             pred: alo_features.pred,
@@ -5850,7 +5850,7 @@ mod tests {
 
         // Generate ALO features
         let alo_features =
-            compute_alo_features(&base_fit, y.view(), x.view(), None, LinkFunction::Logit).unwrap();
+            compute_alo_features_from_pirls(&base_fit, y.view(), x.view(), None, LinkFunction::Logit).unwrap();
 
         // Create calibrator spec
         let spec = CalibratorSpec {
@@ -6680,14 +6680,14 @@ mod tests {
         let w = Array1::<f64>::ones(n);
         let base_fit1 = real_unpenalized_fit(&x, &y, &w, LinkFunction::Logit);
         let features1 =
-            compute_alo_features(&base_fit1, y.view(), x.view(), None, LinkFunction::Logit)
+            compute_alo_features_from_pirls(&base_fit1, y.view(), x.view(), None, LinkFunction::Logit)
                 .unwrap();
         let (beta1, lambdas1) = create_calibrator(&features1);
 
         // Second run - should be identical
         let base_fit2 = real_unpenalized_fit(&x, &y, &w, LinkFunction::Logit);
         let features2 =
-            compute_alo_features(&base_fit2, y.view(), x.view(), None, LinkFunction::Logit)
+            compute_alo_features_from_pirls(&base_fit2, y.view(), x.view(), None, LinkFunction::Logit)
                 .unwrap();
         let (beta2, lambdas2) = create_calibrator(&features2);
 
@@ -6735,7 +6735,7 @@ mod tests {
         // Compare results for small dataset using both original and blocked computation
         // Note: This is checking the internal implementation of compute_alo_features
         // which uses blocking for large datasets but direct computation for small ones
-        compute_alo_features(&small_fit, y_small.view(), x_small.view(), None, link).unwrap();
+        compute_alo_features_from_pirls(&small_fit, y_small.view(), x_small.view(), None, link).unwrap();
 
         // Now test performance on large dataset
         let start = Instant::now();
@@ -6746,7 +6746,7 @@ mod tests {
 
         // Time just the ALO computation
         let alo_start = Instant::now();
-        compute_alo_features(&large_fit, y_large.view(), x_large.view(), None, link).unwrap();
+        compute_alo_features_from_pirls(&large_fit, y_large.view(), x_large.view(), None, link).unwrap();
         let alo_duration = alo_start.elapsed();
 
         eprintln!(
@@ -6780,7 +6780,7 @@ mod tests {
         let base_fit = real_unpenalized_fit(&x, &y, &w, link);
 
         // Generate ALO features
-        let alo_features = compute_alo_features(&base_fit, y.view(), x.view(), None, link).unwrap();
+        let alo_features = compute_alo_features_from_pirls(&base_fit, y.view(), x.view(), None, link).unwrap();
 
         // Create calibrator spec with enough knots to get ~p_cal parameters
         let spec = CalibratorSpec {
@@ -7156,7 +7156,7 @@ mod tests {
         let fake_x = Array2::from_shape_fn((n, 1), |(i, _)| eta_base[i]);
         let base_fit = real_unpenalized_fit(&fake_x, &y, &w, LinkFunction::Logit);
 
-        let mut alo_features = compute_alo_features(
+        let mut alo_features = compute_alo_features_from_pirls(
             &base_fit,
             y.view(),
             fake_x.view(),
@@ -7438,7 +7438,7 @@ mod tests {
 
         // Compute ALO features
         let alo_features =
-            compute_alo_features(&fit_res, y.view(), x.view(), None, LinkFunction::Logit).unwrap();
+            compute_alo_features_from_pirls(&fit_res, y.view(), x.view(), None, LinkFunction::Logit).unwrap();
 
         // Get inputs for manual SE calculation using the final PIRLS weights
         let sqrt_w = fit_res.final_weights.mapv(f64::sqrt);
