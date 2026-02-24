@@ -47,6 +47,7 @@ class GAMMethod(PGSMethod):
         k_interaction: int = 5,
         method: str = 'REML',
         use_ti: bool = True,
+        use_double_penalty: bool = True,
     ):
         """
         Parameters
@@ -62,6 +63,9 @@ class GAMMethod(PGSMethod):
         use_ti : bool
             If True, use decomposed form s() + ti() for clearer interpretation.
             If False, use single te() tensor product.
+        use_double_penalty : bool
+            If True, set mgcv `select=TRUE` to add null-space penalties
+            and allow entire smooth terms to shrink toward zero.
         """
         self.n_pcs = 3
         super().__init__(name=f"GAM (mgcv, {self.n_pcs} PCs)")
@@ -70,6 +74,7 @@ class GAMMethod(PGSMethod):
         self.k_interaction = k_interaction
         self.method = method
         self.use_ti = use_ti
+        self.use_double_penalty = use_double_penalty
         self.r_model = None
         
         # Import R packages
@@ -144,6 +149,7 @@ class GAMMethod(PGSMethod):
             data=r_df,
             family=self.stats.binomial(),
             method=self.method,
+            select=self.use_double_penalty,
         )
 
         self.is_fitted = True
