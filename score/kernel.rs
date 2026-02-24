@@ -142,3 +142,59 @@ pub fn accumulate_adjustments_for_person(
 
     accumulator_buffer
 }
+
+/// Calculates a variable-width score chunk (up to 64 scores) of score
+/// adjustments for a single person over a mini-batch of variants.
+///
+/// `lane_count` is the number of SIMD lanes to compute from `score_start`.
+#[inline]
+pub fn accumulate_adjustments_for_person_lanes(
+    weights: &PaddedInterleavedWeights,
+    g1_indices: &[u16],
+    g2_indices: &[u16],
+    score_start: usize,
+    lane_count: usize,
+) -> [SimdVec; MAX_KERNEL_ACCUMULATOR_LANES] {
+    assert!(
+        score_start <= weights.num_scores(),
+        "Invalid chunk start {score_start}; total scores={}.",
+        weights.num_scores()
+    );
+    assert!(
+        lane_count <= MAX_KERNEL_ACCUMULATOR_LANES,
+        "Invalid lane_count={lane_count}; max={}.",
+        MAX_KERNEL_ACCUMULATOR_LANES
+    );
+    assert!(
+        score_start + (lane_count * LANE_COUNT) <= weights.stride,
+        "Invalid kernel chunk: start={score_start}, lanes={lane_count}, stride={}.",
+        weights.stride
+    );
+
+    let mut accumulator_buffer = [SimdVec::splat(0.0); MAX_KERNEL_ACCUMULATOR_LANES];
+
+    for &matrix_row_idx in g1_indices {
+        let matrix_row_idx = matrix_row_idx as usize;
+        for i in 0..lane_count {
+            unsafe {
+                let weights_vec =
+                    weights.get_simd_lane_for_score_window_unchecked(matrix_row_idx, score_start, i);
+                *accumulator_buffer.get_unchecked_mut(i) += weights_vec;
+            }
+        }
+    }
+
+    for &matrix_row_idx in g2_indices {
+        let matrix_row_idx = matrix_row_idx as usize;
+        for i in 0..lane_count {
+            unsafe {
+                let weights_vec =
+                    weights.get_simd_lane_for_score_window_unchecked(matrix_row_idx, score_start, i);
+                let adj = weights_vec + weights_vec;
+                *accumulator_buffer.get_unchecked_mut(i) += adj;
+            }
+        }
+    }
+
+    accumulator_buffer
+}

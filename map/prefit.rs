@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use crate::shared::files::ensure_rustls_provider;
 
 /// Information about a built-in pre-trained model.
 #[derive(Clone, Debug)]
@@ -178,6 +179,7 @@ pub fn ensure_model(model: &BuiltinModel) -> Result<PathBuf, BuiltinModelError> 
 
 /// Download a file from a URL to a local path.
 fn download_file(url: &str, dest: &Path) -> Result<(), BuiltinModelError> {
+    ensure_rustls_provider();
     let response = ureq::get(url)
         .call()
         .map_err(|e| BuiltinModelError::Download(e.to_string()))?;

@@ -1,5 +1,5 @@
 use crate::calibrate::survival::{
-    AgeTransform, CovariateViews, SurvivalError, SurvivalPredictionInputs, SurvivalLayoutInputs,
+    AgeTransform, CovariateViews, SurvivalError, SurvivalPredictionInputs, SurvivalTrainingData,
     validate_survival_inputs,
 };
 use ndarray::{Array1, Array2};
@@ -43,7 +43,7 @@ pub enum SurvivalDataError {
 /// Bundle containing frequency-weighted survival training data and the cached age transform.
 #[derive(Debug)]
 pub struct SurvivalTrainingBundle {
-    pub data: SurvivalLayoutInputs,
+    pub data: SurvivalTrainingData,
     pub age_transform: AgeTransform,
 }
 
@@ -112,38 +112,6 @@ impl SurvivalPredictionCovariates {
     }
 }
 
-fn assemble_engine_static_covariates(
-    pgs: &Array1<f64>,
-    sex: &Array1<f64>,
-    pcs: &Array2<f64>,
-    extra_static_covariates: &Array2<f64>,
-    extra_static_names: &[String],
-) -> (Array2<f64>, Vec<String>) {
-    let n = pgs.len();
-    let n_pcs = pcs.ncols();
-    let n_extra = extra_static_covariates.ncols();
-    let total_cols = 2 + n_pcs + n_extra;
-    let mut matrix = Array2::<f64>::zeros((n, total_cols));
-    matrix.column_mut(0).assign(pgs);
-    matrix.column_mut(1).assign(sex);
-    if n_pcs > 0 {
-        matrix.slice_mut(ndarray::s![.., 2..(2 + n_pcs)]).assign(pcs);
-    }
-    if n_extra > 0 {
-        matrix
-            .slice_mut(ndarray::s![.., (2 + n_pcs)..])
-            .assign(extra_static_covariates);
-    }
-    let mut names = Vec::with_capacity(total_cols);
-    names.push("pgs".to_string());
-    names.push("sex".to_string());
-    for idx in 0..n_pcs {
-        names.push(format!("pc{}", idx + 1));
-    }
-    names.extend(extra_static_names.iter().cloned());
-    (matrix, names)
-}
-
 /// Load survival training data from a TSV or Parquet file, validating and caching the age transform.
 pub fn load_survival_training_data(
     path: &str,
@@ -151,13 +119,6 @@ pub fn load_survival_training_data(
     guard_delta: f64,
 ) -> Result<SurvivalTrainingBundle, SurvivalDataError> {
     let arrays = read_survival_arrays(path, num_pcs)?;
-    let (static_covariates, static_covariate_names) = assemble_engine_static_covariates(
-        &arrays.pgs,
-        &arrays.sex,
-        &arrays.pcs,
-        &arrays.extra_static_covariates,
-        &arrays.extra_static_names,
-    );
 
     validate_survival_inputs(
         arrays.age_entry.view(),
@@ -165,22 +126,26 @@ pub fn load_survival_training_data(
         arrays.event_target.view(),
         arrays.event_competing.view(),
         arrays.sample_weight.view(),
-        static_covariates.view(),
-        Some(arrays.pgs.view()),
+        arrays.pgs.view(),
+        arrays.sex.view(),
+        arrays.pcs.view(),
+        arrays.extra_static_covariates.view(),
     )?;
 
     let age_transform = AgeTransform::from_training(&arrays.age_entry, guard_delta)?;
 
     Ok(SurvivalTrainingBundle {
-        data: SurvivalLayoutInputs {
+        data: SurvivalTrainingData {
             age_entry: arrays.age_entry,
             age_exit: arrays.age_exit,
             event_target: arrays.event_target,
             event_competing: arrays.event_competing,
             sample_weight: arrays.sample_weight,
-            static_covariates,
-            static_covariate_names,
-            time_varying_covariate: Some(arrays.pgs),
+            pgs: arrays.pgs,
+            sex: arrays.sex,
+            pcs: arrays.pcs,
+            extra_static_covariates: arrays.extra_static_covariates,
+            extra_static_names: arrays.extra_static_names,
         },
         age_transform,
     })
@@ -197,13 +162,6 @@ pub fn load_survival_prediction_data(
     num_pcs: usize,
 ) -> Result<SurvivalPredictionData, SurvivalDataError> {
     let arrays = read_survival_arrays(path, num_pcs)?;
-    let (static_covariates, _) = assemble_engine_static_covariates(
-        &arrays.pgs,
-        &arrays.sex,
-        &arrays.pcs,
-        &arrays.extra_static_covariates,
-        &arrays.extra_static_names,
-    );
 
     validate_survival_inputs(
         arrays.age_entry.view(),
@@ -211,8 +169,10 @@ pub fn load_survival_prediction_data(
         arrays.event_target.view(),
         arrays.event_competing.view(),
         arrays.sample_weight.view(),
-        static_covariates.view(),
-        Some(arrays.pgs.view()),
+        arrays.pgs.view(),
+        arrays.sex.view(),
+        arrays.pcs.view(),
+        arrays.extra_static_covariates.view(),
     )?;
 
     Ok(SurvivalPredictionData {
@@ -668,11 +628,9 @@ mod tests {
         assert_eq!(bundle.data.age_entry.len(), 3);
         assert_eq!(bundle.age_transform.minimum_age, 50.0);
         assert_eq!(bundle.data.sample_weight[1], 2.0);
-        assert_eq!(bundle.data.static_covariates.ncols(), 5);
-        assert_eq!(
-            bundle.data.static_covariate_names,
-            vec!["pgs", "sex", "pc1", "pc2", "bmi"]
-        );
+        assert_eq!(bundle.data.pcs.ncols(), 2);
+        assert_eq!(bundle.data.extra_static_covariates.ncols(), 1);
+        assert_eq!(bundle.data.extra_static_names, vec!["bmi"]);
     }
 
     #[test]

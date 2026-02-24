@@ -1085,11 +1085,11 @@ pub fn build_design_and_penalty_matrices(
             num_coeffs,
             num_samples: n_samples,
             intercept_coeffs,
-            sex_main_coeffs,
-            pgs_main_coeffs,
-            pc_main_coeffs,
-            sex_pgs_interaction_coeffs,
-            interaction_coeffs,
+            binary_main_coeffs: sex_main_coeffs,
+            primary_smooth_coeffs: pgs_main_coeffs,
+            aux_main_coeffs: pc_main_coeffs,
+            binary_primary_interaction_coeffs: sex_pgs_interaction_coeffs,
+            aux_interaction_coeffs: interaction_coeffs,
         });
     }
 

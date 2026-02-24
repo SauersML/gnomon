@@ -6,7 +6,7 @@ artifact mapping, and stable `gnomon::calibrate::*` entrypoints.
 
 Core numerical engine modules (basis construction, PIRLS/REML, HMC, ALO,
 reparameterization, diagnostics, and shared math types) live in the separate
-[`gam`](https://github.com/SauersML/gam) repo and are imported by this crate.
+solver engine repository and are imported by this crate.
 
 ## Statistical model
 
@@ -26,7 +26,7 @@ bases into a single design matrix with sum-to-zero constraints and ANOVA-style
 orthogonalization so the additive terms are identifiable and interpretable.
 
 Two likelihoods are supported via shared engine types
-(`gam::types::LinkFunction`): logistic (`Logit`) for binary traits and Gaussian
+(`LinkFunction`): logistic (`Logit`) for binary traits and Gaussian
 identity (`Identity`) for continuous phenotypes.
 
 ## Penalties and smoothing selection
@@ -42,7 +42,7 @@ respect the null spaces implied by the ANOVA constraints so that intercepts,
 sex main effects, and other lower-order components remain unpenalized by
 construction.
 
-Smoothing parameters (`λ`) are learned rather than fixed. `gam::estimate`
+Smoothing parameters (`λ`) are learned rather than fixed. The engine estimator
 implements a nested optimization in the style of Wood (2011): inner PIRLS for
 fixed `λ`, and outer BFGS on marginal likelihood. Gaussian models maximize
 REML, while non-Gaussian models maximize LAML; both objectives include
@@ -119,12 +119,12 @@ Adapter/domain files in `gnomon/calibrate`:
 - [`construction.rs`](construction.rs): domain-specific design assembly from
   `PGS/PC/sex` semantics and full-size `P x P` penalty preparation.
 - [`estimate.rs`](estimate.rs): stable adapter entrypoints that delegate to
-  `gam::estimate` (`train_model`, `train_survival_model`, flat wrappers).
+  engine estimation APIs (`train_model`, `train_survival_model`, flat wrappers).
 - [`calibrator.rs`](calibrator.rs): calibrator workflow orchestration.
 - [`survival.rs`](survival.rs): survival feature/layout assembly and domain wiring.
 - [`model.rs`](model.rs): artifact mapping and serde composition for gnomon outputs.
 
-Engine-owned modules in separate repo `gam/src`:
+Engine-owned modules in the separate solver repository:
 - `basis.rs`, `construction.rs`, `pirls.rs`, `estimate.rs`, `hmc.rs`, `joint.rs`,
   `alo.rs`, `diagnostics.rs`, `hull.rs`, `types.rs`, and related math utilities.
 
@@ -140,7 +140,7 @@ Engine-owned modules in separate repo `gam/src`:
    block-structured design matrices `X` and full-size `P x P` penalties from
    `PGS/PC/sex` configuration.
 3. **Optimize smoothing parameters** – adapter `estimate.rs` calls
-   `gam::estimate` entrypoints. The engine alternates PIRLS and BFGS over
+   engine estimation entrypoints. The engine alternates PIRLS and BFGS over
    log-smoothing parameters until convergence or guarded stop conditions.
 4. **Capture geometric guards** – During training the optimizer builds a peeled
    hull from the polygenic score and principal components. The hull and its
@@ -235,10 +235,10 @@ the deployed spline bases receive well-formed covariates.
 
 Path ownership is intentionally split:
 - Adapter/domain layer: `gnomon/calibrate`
-- Math/solver engine: `gam/src`
+- Math/solver engine: separate solver repository
 
 Contract summary:
 - `gnomon/calibrate` performs domain layout assembly and passes full-size `P x P`
-  penalties and numeric arrays into `gam`.
-- `gam` performs PIRLS/REML/HMC/ALO and returns engine fit outputs.
+  penalties and numeric arrays into the solver engine.
+- The solver engine performs PIRLS/REML/HMC/ALO and returns fit outputs.
 - Public call flow remains adapter-stable via `gnomon::calibrate::*` entrypoints.

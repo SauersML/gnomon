@@ -262,7 +262,7 @@ fn train_survival_from_args(args: &TrainArgs) -> Result<(), Box<dyn std::error::
     println!(
         "Loaded {} samples with {} PCs",
         bundle.data.age_entry.len(),
-        bundle.data.static_covariates.ncols().saturating_sub(2)
+        bundle.data.pcs.ncols()
     );
 
     let mut spec = SurvivalSpec::default();

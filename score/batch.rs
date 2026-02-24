@@ -390,12 +390,23 @@ pub(crate) fn process_tile_impl<'a>(
                 let score_chunk_end = (score_chunk_start + score_chunk_size).min(num_scores);
                 let score_chunk_len = score_chunk_end - score_chunk_start;
                 let score_chunk_lanes = score_chunk_len.div_ceil(SIMD_LANES);
-                let kernel_result_buffer = kernel::accumulate_adjustments_for_person(
-                    &weights,
-                    &g1_indices[..g1_count],
-                    &g2_indices[..g2_count],
-                    score_chunk_start,
-                );
+                let kernel_result_buffer = if score_chunk_lanes == kernel::MAX_KERNEL_ACCUMULATOR_LANES
+                {
+                    kernel::accumulate_adjustments_for_person(
+                        &weights,
+                        &g1_indices[..g1_count],
+                        &g2_indices[..g2_count],
+                        score_chunk_start,
+                    )
+                } else {
+                    kernel::accumulate_adjustments_for_person_lanes(
+                        &weights,
+                        &g1_indices[..g1_count],
+                        &g2_indices[..g2_count],
+                        score_chunk_start,
+                        score_chunk_lanes,
+                    )
+                };
                 let score_chunk_out = &mut scores_out_slice[score_chunk_start..score_chunk_end];
                 for i in 0..score_chunk_lanes {
                     let scores_offset = i * SIMD_LANES;

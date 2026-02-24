@@ -2,7 +2,7 @@ use gam::basis::{self, BasisOptions, Dense, KnotSource, create_basis};
 use crate::calibrate::construction::EngineLayout;
 use crate::calibrate::estimate::EstimationError;
 use gam::hull::PeeledHull;
-use gam::survival::{
+use crate::calibrate::survival::{
     self, DEFAULT_RISK_EPSILON, SurvivalError, SurvivalModelArtifacts, SurvivalSpec,
 };
 pub use gam::types::LinkFunction;
@@ -117,6 +117,21 @@ pub fn default_mcmc_enabled() -> bool {
 
 pub fn default_calibrator_enabled() -> bool {
     true
+}
+
+#[inline]
+fn normal_cdf_approx(x: f64) -> f64 {
+    let z = x.abs().clamp(0.0, 30.0);
+    let t = 1.0 / (1.0 + 0.231_641_9 * z);
+    let inv_sqrt_2pi = 0.398_942_280_401_432_7;
+    let pdf = inv_sqrt_2pi * (-0.5 * z * z).exp();
+    let poly = (((((1.330_274_429 * t - 1.821_255_978) * t) + 1.781_477_937) * t
+        - 0.356_563_782)
+        * t
+        + 0.319_381_530)
+        * t;
+    let cdf_pos = 1.0 - pdf * poly;
+    if x >= 0.0 { cdf_pos } else { 1.0 - cdf_pos }
 }
 
 /// The complete blueprint of a trained model.
@@ -1016,6 +1031,7 @@ impl TrainedModel {
                 probs.mapv_inplace(|p| p.clamp(1e-8, 1.0 - 1e-8));
                 probs
             }
+            LinkFunction::Probit => eta.mapv(normal_cdf_approx),
             LinkFunction::Identity => eta.clone(),
         };
 
@@ -1184,6 +1200,17 @@ impl TrainedModel {
                     }
                 }
             }
+            LinkFunction::Probit => {
+                match se_eta_opt {
+                    Some(se_eta) => Ok(Zip::from(&eta)
+                        .and(&se_eta)
+                        .map_collect(|&e, &se| {
+                            let denom = (1.0 + se * se).sqrt().max(1e-12);
+                            normal_cdf_approx(e / denom)
+                        })),
+                    None => Ok(mode_mean),
+                }
+            }
         }
     }
 
@@ -1231,6 +1258,7 @@ impl TrainedModel {
         let cal = self.calibrator.as_ref().unwrap();
         let pred_in = match link_function {
             LinkFunction::Logit => eta.clone(),
+            LinkFunction::Probit => eta.clone(),
             LinkFunction::Identity => baseline.clone(),
         };
         let se_in = se_eta_opt.unwrap_or_else(|| Array1::zeros(pred_in.len()));
@@ -2937,20 +2965,22 @@ mod tests {
 
     #[test]
     fn survival_prediction_produces_risk_and_se() {
-        use gam::survival::{
+        use crate::calibrate::survival::{
             BasisDescriptor, CholeskyFactor, HessianFactor, SurvivalModelArtifacts,
-            SurvivalLayoutInputs, build_survival_layout,
+            SurvivalTrainingData, build_survival_layout,
         };
 
-        let data = SurvivalLayoutInputs {
+        let data = SurvivalTrainingData {
             age_entry: array![50.0, 55.0],
             age_exit: array![55.0, 60.0],
             event_target: array![1, 0],
             event_competing: array![0, 0],
             sample_weight: array![1.0, 1.0],
-            static_covariates: array![[0.2, 0.0], [-0.1, 1.0]],
-            static_covariate_names: vec!["pgs".to_string(), "sex".to_string()],
-            time_varying_covariate: Some(array![0.2, -0.1]),
+            pgs: array![0.2, -0.1],
+            sex: array![0.0, 1.0],
+            pcs: Array2::zeros((2, 0)),
+            extra_static_covariates: Array2::zeros((2, 0)),
+            extra_static_names: Vec::new(),
         };
         let basis = BasisDescriptor {
             knot_vector: array![0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0],
@@ -2968,7 +2998,7 @@ mod tests {
             let column = layout.static_covariates.column(col_idx);
             let min_val = column.iter().copied().fold(f64::INFINITY, f64::min);
             let max_val = column.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-            ranges.push(gam::survival::ValueRange {
+            ranges.push(crate::calibrate::survival::ValueRange {
                 min: min_val,
                 max: max_val,
             });
@@ -2977,7 +3007,7 @@ mod tests {
             coefficients: coeffs.clone(),
             age_basis: basis.clone(),
             time_varying_basis: None,
-            static_covariate_layout: gam::survival::CovariateLayout {
+            static_covariate_layout: crate::calibrate::survival::CovariateLayout {
                 column_names,
                 ranges,
             },
@@ -3052,9 +3082,9 @@ mod tests {
             .predict_survival(
                 data.age_entry.view(),
                 data.age_exit.view(),
-                data.static_covariates.column(0),
-                data.static_covariates.column(1),
-                data.static_covariates.slice(s![.., 2..]),
+                data.pgs.view(),
+                data.sex.view(),
+                data.pcs.view(),
                 SurvivalRiskType::Net,
                 None,
             )
@@ -3698,19 +3728,20 @@ pub fn map_coefficients(
     })
 }
 
-pub fn to_engine_model_config(config: &ModelConfig) -> Result<gam::types::ModelConfig, EstimationError> {
-    Ok(gam::types::ModelConfig {
-        model_family: match config.model_family {
-            ModelFamily::Gam(link) => gam::types::ModelFamily::Gam(link),
-            ModelFamily::Survival(spec) => gam::types::ModelFamily::Survival(spec),
-        },
-        convergence_tolerance: config.convergence_tolerance,
+pub fn to_engine_model_config(config: &ModelConfig) -> Result<gam::pirls::PirlsConfig, EstimationError> {
+    let link = match config.model_family {
+        ModelFamily::Gam(link) => link,
+        ModelFamily::Survival(_) => {
+            return Err(EstimationError::InvalidInput(
+                "PIRLS engine config is only valid for GAM families".to_string(),
+            ));
+        }
+    };
+    Ok(gam::pirls::PirlsConfig {
+        link_function: link,
         max_iterations: config.max_iterations,
-        reml_convergence_tolerance: config.reml_convergence_tolerance,
-        reml_max_iterations: config.reml_max_iterations,
+        convergence_tolerance: config.convergence_tolerance,
         firth_bias_reduction: config.firth_bias_reduction,
-        reml_parallel_threshold: config.reml_parallel_threshold,
-        mcmc_enabled: config.mcmc_enabled,
     })
 }
 
