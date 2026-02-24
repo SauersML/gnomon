@@ -55,6 +55,7 @@ import Mathlib.Algebra.Polynomial.Roots
 import Mathlib.Analysis.Calculus.Deriv.Add
 import Mathlib.Analysis.Calculus.Deriv.Pi
 import Mathlib.Analysis.Calculus.Deriv.Comp
+import Mathlib.Analysis.Calculus.FDeriv.Add
 import Mathlib.Logic.Function.Basic
 
 open scoped InnerProductSpace
