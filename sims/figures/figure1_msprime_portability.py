@@ -38,6 +38,7 @@ from methods.raw_pgs import RawPGSMethod
 from methods.linear_interaction import LinearInteractionMethod
 from methods.normalization import NormalizationMethod
 from methods.gam_mgcv import GAMMethod
+from methods.thinplate_mgcv import ThinPlateMethod
 from plink_utils import run_plink_conversion
 from prs_tools import BayesR, PPlusT
 
@@ -534,6 +535,9 @@ def _fit_and_predict_methods(train_df: pd.DataFrame, test_df: pd.DataFrame, trai
     gm = GAMMethod(k_pgs=4, k_pc=4, k_interaction=3, use_ti=True)
     gm.fit(P_train, PC_train, y_train)
     out["pspline"] = gm.predict_proba(P_test, PC_test)
+    tp = ThinPlateMethod(k_pgs=4, k_pc=4, k_interaction=3, use_ti=True, use_double_penalty=True)
+    tp.fit(P_train, PC_train, y_train)
+    out["thinplate"] = tp.predict_proba(P_test, PC_test)
 
     return out
 
@@ -592,6 +596,7 @@ def _plot_main(df: pd.DataFrame, out_dir: Path) -> None:
         "normalized": CB["green"],
         "linear": CB["orange"],
         "pspline": CB["purple"],
+        "thinplate": CB["vermillion"],
     }
     for m in sorted(df["method"].unique()):
         sub = df[df["method"] == m].sort_values("gens")
@@ -1076,7 +1081,7 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     work_root = Path(args.work_root) if args.work_root else _default_work_root(out_dir)
     work_root.mkdir(parents=True, exist_ok=True)
-    _log("Figure1 P-spline backend: mgcv")
+    _log("Figure1 spline backends: pspline + thinplate (mgcv)")
     _log(f"Figure1 PRS backend: {'BayesR' if args.bayesr else 'P+T'}")
 
     score_path = ensure_pgs003725(Path(args.cache))
