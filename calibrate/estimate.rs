@@ -6,41 +6,160 @@ pub use gam::estimate::{
 
 pub use gam::estimate::internal;
 use gam::basis::{BasisOptions, Dense, KnotSource, create_basis};
+use gam::construction::compute_penalty_square_roots as compute_penalty_square_roots_engine;
+use gam::faer_ndarray::FaerCholesky;
+use gam::hmc;
+use gam::hull::build_peeled_hull;
 use gam::pirls::{self, PirlsStatus, WorkingModelPirlsOptions};
-use gam::types::Coefficients;
-use ndarray::Array1;
+use gam::types::{Coefficients, LogSmoothingParamsView};
+use faer::Side;
+use ndarray::{Array1, Array2, s};
 use std::collections::HashMap;
-use wolfe_bfgs::Bfgs;
 
 fn map_survival_error(err: crate::calibrate::survival::SurvivalError) -> EstimationError {
     EstimationError::InvalidSpecification(err.to_string())
 }
 
-fn finite_diff_gradient<F>(
-    z: &Array1<f64>,
-    step: f64,
-    objective: &F,
-) -> Result<Array1<f64>, EstimationError>
-where
-    F: Fn(&Array1<f64>) -> Result<f64, EstimationError>,
-{
-    let mut grad = Array1::<f64>::zeros(z.len());
-    for i in 0..z.len() {
-        let mut zp = z.clone();
-        zp[i] += step;
-        let fp = objective(&zp)?;
-        let mut zm = z.clone();
-        zm[i] -= step;
-        let fm = objective(&zm)?;
-        grad[i] = (fp - fm) / (2.0 * step);
+fn build_combined_penalty_matrix(s_list: &[Array2<f64>], lambdas: &Array1<f64>, p: usize) -> Array2<f64> {
+    let mut penalty = Array2::<f64>::zeros((p, p));
+    for (idx, s) in s_list.iter().enumerate() {
+        let lambda = lambdas.get(idx).copied().unwrap_or(0.0);
+        if lambda == 0.0 {
+            continue;
+        }
+        penalty = penalty + s.mapv(|v| v * lambda);
     }
-    Ok(grad)
+    penalty
+}
+
+fn run_gam_nuts_if_enabled(
+    enabled: bool,
+    link: gam::types::LinkFunction,
+    firth_bias_reduction: bool,
+    x: ndarray::ArrayView2<'_, f64>,
+    y: ndarray::ArrayView1<'_, f64>,
+    weights: ndarray::ArrayView1<'_, f64>,
+    penalty_matrix: ndarray::ArrayView2<'_, f64>,
+    mode: ndarray::ArrayView1<'_, f64>,
+    hessian: ndarray::ArrayView2<'_, f64>,
+) -> Result<Option<Array2<f64>>, EstimationError> {
+    if !enabled {
+        return Ok(None);
+    }
+    let is_logit = match link {
+        gam::types::LinkFunction::Identity => false,
+        gam::types::LinkFunction::Logit => true,
+        gam::types::LinkFunction::Probit => {
+            return Ok(None);
+        }
+    };
+    let config = hmc::NutsConfig::for_dimension(mode.len());
+    let nuts = hmc::run_nuts_sampling(
+        x,
+        y,
+        weights,
+        penalty_matrix,
+        mode,
+        hessian,
+        is_logit,
+        firth_bias_reduction,
+        &config,
+    )
+    .map_err(|err| EstimationError::InvalidSpecification(format!("NUTS sampling failed: {err}")))?;
+    Ok(Some(nuts.samples))
+}
+
+fn to_engine_survival_penalties(
+    penalties: &crate::calibrate::survival::PenaltyBlocks,
+) -> gam::survival::PenaltyBlocks {
+    let blocks = penalties
+        .blocks
+        .iter()
+        .map(|block| gam::survival::PenaltyBlock {
+            matrix: block.matrix.clone(),
+            lambda: block.lambda,
+            range: block.range.clone(),
+        })
+        .collect::<Vec<_>>();
+    gam::survival::PenaltyBlocks::new(blocks)
+}
+
+fn to_engine_survival_monotonicity(
+    monotonicity: &crate::calibrate::survival::MonotonicityPenalty,
+) -> gam::survival::MonotonicityPenalty {
+    let lambda = if monotonicity.derivative_design.nrows() == 0 {
+        0.0
+    } else {
+        1.0
+    };
+    gam::survival::MonotonicityPenalty {
+        lambda,
+        tolerance: 0.0,
+    }
+}
+
+fn to_engine_survival_spec(
+    data: &crate::calibrate::survival::SurvivalTrainingData,
+) -> gam::survival::SurvivalSpec {
+    if data.event_competing.iter().any(|&v| v > 0) {
+        gam::survival::SurvivalSpec::Crude
+    } else {
+        gam::survival::SurvivalSpec::Net
+    }
+}
+
+fn build_expected_hessian_factor(
+    hessian: &Array2<f64>,
+) -> Option<crate::calibrate::survival::HessianFactor> {
+    let chol = hessian.clone().cholesky(Side::Lower).ok()?;
+    Some(crate::calibrate::survival::HessianFactor::Expected {
+        factor: crate::calibrate::survival::CholeskyFactor {
+            lower: chol.lower_triangular(),
+        },
+    })
+}
+
+fn cross_covariance_primary_companion(
+    primary_samples: &Array2<f64>,
+    companion_samples: &Array2<f64>,
+) -> Option<Array2<f64>> {
+    let n = primary_samples.nrows().min(companion_samples.nrows());
+    if n < 2 {
+        return None;
+    }
+    let p_primary = primary_samples.ncols();
+    let p_companion = companion_samples.ncols();
+
+    let primary = primary_samples.slice(s![0..n, ..]).to_owned();
+    let companion = companion_samples.slice(s![0..n, ..]).to_owned();
+    let mean_primary = primary.mean_axis(ndarray::Axis(0))?;
+    let mean_companion = companion.mean_axis(ndarray::Axis(0))?;
+
+    let mut cov = Array2::<f64>::zeros((p_primary, p_companion));
+    for i in 0..n {
+        let row_p = &primary.row(i).to_owned() - &mean_primary;
+        let row_c = &companion.row(i).to_owned() - &mean_companion;
+        for r in 0..p_primary {
+            let pr = row_p[r];
+            for c in 0..p_companion {
+                cov[[r, c]] += pr * row_c[c];
+            }
+        }
+    }
+    cov.mapv_inplace(|v| v / ((n - 1) as f64));
+    Some(cov)
 }
 
 pub fn train_model(
     data: &crate::calibrate::data::TrainingData,
     config: &crate::calibrate::model::ModelConfig,
 ) -> Result<crate::calibrate::model::TrainedModel, EstimationError> {
+    use crate::calibrate::calibrator::{
+        CalibratorModel, CalibratorSpec, active_penalty_nullspace_dims, build_calibrator_design,
+        fit_calibrator,
+    };
+    use crate::calibrate::model::ModelFamily;
+
     let (
         x,
         s_list,
@@ -54,20 +173,23 @@ pub fn train_model(
         _penalty_structs,
     ) = crate::calibrate::construction::build_design_and_penalty_matrices(data, config)?;
 
-    let family = match config.model_family {
-        crate::calibrate::model::ModelFamily::Gam(gam::types::LinkFunction::Identity) => {
-            gam::types::LikelihoodFamily::GaussianIdentity
-        }
-        crate::calibrate::model::ModelFamily::Gam(gam::types::LinkFunction::Logit) => {
-            gam::types::LikelihoodFamily::BinomialLogit
-        }
-        crate::calibrate::model::ModelFamily::Gam(gam::types::LinkFunction::Probit) => {
-            gam::types::LikelihoodFamily::BinomialProbit
-        }
-        crate::calibrate::model::ModelFamily::Survival(_) => {
+    let link = match config.model_family {
+        ModelFamily::Gam(link) => link,
+        ModelFamily::Survival(_) => {
             return Err(EstimationError::InvalidInput(
                 "train_model expects GAM family; use train_survival_model for survival".to_string(),
             ));
+        }
+    };
+    let family = match link {
+        gam::types::LinkFunction::Identity => {
+            gam::types::LikelihoodFamily::GaussianIdentity
+        }
+        gam::types::LinkFunction::Logit => {
+            gam::types::LikelihoodFamily::BinomialLogit
+        }
+        gam::types::LinkFunction::Probit => {
+            gam::types::LikelihoodFamily::BinomialProbit
         }
     };
 
@@ -87,6 +209,111 @@ pub fn train_model(
         &opts,
     )?;
 
+    // Recover the full PIRLS state at the optimized lambdas for downstream ALO/calibrator stages.
+    let rs_list = compute_penalty_square_roots_engine(&s_list)?;
+    let rho = fit.lambdas.mapv(|lambda| lambda.max(1e-12).ln());
+    let pirls_cfg = crate::calibrate::model::to_engine_model_config(config)?;
+    let (base_pirls, _base_working) = pirls::fit_model_for_fixed_rho(
+        LogSmoothingParamsView::new(rho.view()),
+        x.view(),
+        offset.view(),
+        data.y.view(),
+        data.weights.view(),
+        &rs_list,
+        None,
+        None,
+        x.ncols(),
+        &pirls_cfg,
+        None,
+        None,
+    )?;
+
+    // Build raw geometry matrix used by the predictor path: [PGS | PCs...]
+    let n = data.p.len();
+    let raw_dim = 1 + data.pcs.ncols();
+    let mut raw_train = Array2::<f64>::zeros((n, raw_dim));
+    raw_train.slice_mut(s![.., 0]).assign(&data.p);
+    if data.pcs.ncols() > 0 {
+        raw_train.slice_mut(s![.., 1..]).assign(&data.pcs);
+    }
+    let hull = build_peeled_hull(&raw_train, 3).ok();
+
+    let calibrator = if config.calibrator_enabled {
+        let alo_features = crate::calibrate::alo::compute_alo_features(
+            &base_pirls,
+            data.y.view(),
+            raw_train.view(),
+            hull.as_ref(),
+            link,
+        )?;
+        let cal_spec = CalibratorSpec {
+            link,
+            pred_basis: crate::calibrate::model::BasisConfig {
+                degree: 3,
+                num_knots: 5,
+            },
+            se_basis: crate::calibrate::model::BasisConfig {
+                degree: 3,
+                num_knots: 5,
+            },
+            dist_basis: crate::calibrate::model::BasisConfig {
+                degree: 3,
+                num_knots: 5,
+            },
+            penalty_order_pred: 2,
+            penalty_order_se: 2,
+            penalty_order_dist: 2,
+            distance_enabled: true,
+            distance_hinge: true,
+            prior_weights: None,
+            firth: CalibratorSpec::firth_default_for_link(link),
+        };
+        let (x_cal, penalties, schema, cal_offset) = build_calibrator_design(&alo_features, &cal_spec)?;
+        let penalty_nullspace_dims = active_penalty_nullspace_dims(&schema, &penalties);
+        let (cal_beta, cal_lambdas, cal_scale, _edf, _optim) = fit_calibrator(
+            data.y.view(),
+            data.weights.view(),
+            x_cal.view(),
+            cal_offset.view(),
+            &penalties,
+            &penalty_nullspace_dims,
+            link,
+            &cal_spec,
+        )?;
+        Some(CalibratorModel {
+            spec: cal_spec,
+            knots_pred: schema.knots_pred,
+            knots_se: schema.knots_se,
+            knots_dist: schema.knots_dist,
+            pred_constraint_transform: schema.pred_constraint_transform,
+            stz_se: schema.stz_se,
+            stz_dist: schema.stz_dist,
+            penalty_nullspace_dims: schema.penalty_nullspace_dims,
+            standardize_pred: schema.standardize_pred,
+            standardize_se: schema.standardize_se,
+            standardize_dist: schema.standardize_dist,
+            interaction_center_pred: Some(schema.interaction_center_pred),
+            se_log_space: schema.se_log_space,
+            se_wiggle_only_drop: schema.se_wiggle_only_drop,
+            dist_wiggle_only_drop: schema.dist_wiggle_only_drop,
+            lambda_pred: cal_lambdas[0],
+            lambda_pred_param: cal_lambdas[1],
+            lambda_se: cal_lambdas[2],
+            lambda_dist: cal_lambdas[3],
+            coefficients: cal_beta,
+            column_spans: schema.column_spans,
+            pred_param_range: schema.pred_param_range.clone(),
+            scale: if matches!(link, gam::types::LinkFunction::Identity) {
+                Some(cal_scale)
+            } else {
+                None
+            },
+            assumes_frequency_weights: true,
+        })
+    } else {
+        None
+    };
+
     let mut trained_config = config.clone();
     trained_config.sum_to_zero_constraints = sum_to_zero_constraints;
     trained_config.knot_vectors = knot_vectors;
@@ -96,20 +323,32 @@ pub fn train_model(
     trained_config.interaction_orth_alpha = interaction_orth_alpha;
 
     let coefficients = crate::calibrate::model::map_coefficients(&fit.beta, &layout)?;
+    let penalty_matrix = build_combined_penalty_matrix(&s_list, &fit.lambdas, x.ncols());
+    let mcmc_samples = run_gam_nuts_if_enabled(
+        config.mcmc_enabled,
+        link,
+        pirls_cfg.firth_bias_reduction,
+        x.view(),
+        data.y.view(),
+        data.weights.view(),
+        penalty_matrix.view(),
+        fit.beta.view(),
+        base_pirls.state.hessian.view(),
+    )?;
 
     Ok(crate::calibrate::model::TrainedModel {
         config: trained_config,
         coefficients,
         lambdas: fit.lambdas.to_vec(),
-        hull: None,
-        penalized_hessian: None,
+        hull,
+        penalized_hessian: Some(base_pirls.state.hessian.clone()),
         scale: Some(fit.scale),
-        calibrator: None,
+        calibrator,
         joint_link: None,
         survival: None,
         survival_companions: HashMap::new(),
-        mcmc_samples: None,
-        smoothing_correction: None,
+        mcmc_samples,
+        smoothing_correction: fit.smoothing_correction,
     })
 }
 
@@ -118,10 +357,7 @@ pub fn train_survival_model(
     config: &crate::calibrate::model::ModelConfig,
 ) -> Result<crate::calibrate::model::TrainedModel, EstimationError> {
     use crate::calibrate::model::ModelFamily;
-    use crate::calibrate::survival::{
-        BasisDescriptor, CovariateLayout, SurvivalLayoutBundle, SurvivalModelArtifacts,
-        TensorProductConfig, WorkingModelSurvival, build_survival_layout,
-    };
+    use crate::calibrate::survival::CompanionModelHandle;
 
     let survival_cfg = config.survival.as_ref().ok_or_else(|| {
         EstimationError::InvalidSpecification(
@@ -135,6 +371,90 @@ pub fn train_survival_model(
                 "train_survival_model expects Survival model family".to_string(),
             ));
         }
+    };
+
+    let mut primary_fit = fit_single_survival_model(bundle, config, survival_cfg, survival_spec)?;
+    let mut survival_companions = HashMap::new();
+    let n = bundle.data.pgs.len();
+    let raw_dim = 1 + bundle.data.pcs.ncols();
+    let mut raw_train = Array2::<f64>::zeros((n, raw_dim));
+    raw_train.slice_mut(s![.., 0]).assign(&bundle.data.pgs);
+    if bundle.data.pcs.ncols() > 0 {
+        raw_train.slice_mut(s![.., 1..]).assign(&bundle.data.pcs);
+    }
+    let hull = build_peeled_hull(&raw_train, 3).ok();
+
+    if survival_cfg.model_competing_risk {
+        let mut mortality_bundle = crate::calibrate::survival_data::SurvivalTrainingBundle {
+            data: bundle.data.clone(),
+            age_transform: bundle.age_transform,
+        };
+        mortality_bundle.data.event_target = bundle.data.event_competing.clone();
+        mortality_bundle.data.event_competing = Array1::<u8>::zeros(bundle.data.event_competing.len());
+
+        let mut mortality_fit =
+            fit_single_survival_model(&mortality_bundle, config, survival_cfg, survival_spec)?;
+        let cross_cov = match (
+            primary_fit.artifacts.mcmc_samples.as_ref(),
+            mortality_fit.artifacts.mcmc_samples.as_ref(),
+        ) {
+            (Some(primary_samples), Some(mortality_samples)) => {
+                cross_covariance_primary_companion(primary_samples, mortality_samples)
+                    .or_else(|| {
+                        Some(Array2::<f64>::zeros((
+                            primary_fit.artifacts.coefficients.len(),
+                            mortality_fit.artifacts.coefficients.len(),
+                        )))
+                    })
+            }
+            _ => Some(Array2::<f64>::zeros((
+                primary_fit.artifacts.coefficients.len(),
+                mortality_fit.artifacts.coefficients.len(),
+            ))),
+        };
+        mortality_fit.artifacts.cross_covariance_to_primary = cross_cov;
+
+        primary_fit.artifacts.companion_models.push(CompanionModelHandle {
+            reference: "__internal_mortality".to_string(),
+            cif_horizons: Vec::new(),
+        });
+        survival_companions.insert("__internal_mortality".to_string(), mortality_fit.artifacts);
+    }
+
+    let primary_samples = primary_fit.artifacts.mcmc_samples.clone();
+    let primary_hessian = primary_fit.hessian.clone();
+
+    Ok(crate::calibrate::model::TrainedModel {
+        config: config.clone(),
+        coefficients: crate::calibrate::model::MappedCoefficients::default(),
+        lambdas: primary_fit.lambdas,
+        hull,
+        penalized_hessian: Some(primary_hessian),
+        scale: None,
+        calibrator: None,
+        joint_link: None,
+        survival: Some(primary_fit.artifacts),
+        survival_companions,
+        mcmc_samples: primary_samples,
+        smoothing_correction: None,
+    })
+}
+
+struct SurvivalFitResult {
+    artifacts: crate::calibrate::survival::SurvivalModelArtifacts,
+    lambdas: Vec<f64>,
+    hessian: Array2<f64>,
+}
+
+fn fit_single_survival_model(
+    bundle: &crate::calibrate::survival_data::SurvivalTrainingBundle,
+    config: &crate::calibrate::model::ModelConfig,
+    survival_cfg: &crate::calibrate::model::SurvivalModelConfig,
+    survival_spec: crate::calibrate::survival::SurvivalSpec,
+) -> Result<SurvivalFitResult, EstimationError> {
+    use crate::calibrate::survival::{
+        BasisDescriptor, CovariateLayout, SurvivalLayoutBundle, SurvivalModelArtifacts,
+        TensorProductConfig, WorkingModelSurvival, build_survival_layout,
     };
 
     let log_entry = bundle
@@ -230,15 +550,16 @@ pub fn train_survival_model(
     };
 
     if !layout.penalties.blocks.is_empty() {
-        let mut initial_z = Array1::<f64>::zeros(layout.penalties.blocks.len());
-        for (i, block) in layout.penalties.blocks.iter().enumerate() {
-            initial_z[i] = block.lambda.max(1e-12).ln();
-        }
-
-        let objective = |z: &Array1<f64>| -> Result<f64, EstimationError> {
+        let heuristic_lambdas = layout
+            .penalties
+            .blocks
+            .iter()
+            .map(|block| block.lambda.max(1e-12))
+            .collect::<Vec<_>>();
+        let objective = |rho: &Array1<f64>| -> Result<f64, EstimationError> {
             let mut eval_layout = layout.clone();
-            for (block, &zi) in eval_layout.penalties.blocks.iter_mut().zip(z.iter()) {
-                block.lambda = zi.exp();
+            for (block, &rho_i) in eval_layout.penalties.blocks.iter_mut().zip(rho.iter()) {
+                block.lambda = rho_i.exp();
             }
             let mut model = WorkingModelSurvival::new(
                 eval_layout,
@@ -256,43 +577,39 @@ pub fn train_survival_model(
             )?;
             Ok(result.state.deviance)
         };
-
-        let mut optimizer = Bfgs::new(initial_z.clone(), |z| {
-            let cost = objective(z).unwrap_or(f64::INFINITY);
-            let grad = finite_diff_gradient(z, 1e-3, &objective)
-                .unwrap_or_else(|_| Array1::<f64>::zeros(z.len()));
-            (cost, grad)
-        })
-        .with_tolerance(config.reml_convergence_tolerance)
-        .with_max_iterations(config.reml_max_iterations as usize)
-        .with_fp_tolerances(1e2, 1e2)
-        .with_no_improve_stop(1e-8, 5)
-        .with_rng_seed(0xDEC0DED_u64);
-
-        let solution = match optimizer.run() {
-            Ok(solution) => solution,
-            Err(wolfe_bfgs::BfgsError::LineSearchFailed { last_solution, .. }) => *last_solution,
-            Err(wolfe_bfgs::BfgsError::MaxIterationsReached { last_solution }) => *last_solution,
-            Err(err) => {
-                return Err(EstimationError::RemlOptimizationFailed(format!(
-                    "survival smoothing optimization failed: {err:?}"
-                )));
-            }
+        let seed_strategy = if layout.penalties.blocks.len() >= 10 {
+            gam::seeding::SeedStrategy::Light
+        } else {
+            gam::seeding::SeedStrategy::Exhaustive
         };
-
-        for (block, &zi) in layout
+        let smooth_opts = gam::families::royston_parmar::SurvivalLambdaOptimizerOptions {
+            max_iter: config.reml_max_iterations as usize,
+            tol: config.reml_convergence_tolerance,
+            finite_diff_step: 1e-3,
+            seed_config: gam::seeding::SeedConfig {
+                strategy: seed_strategy,
+                bounds: (-12.0, 12.0),
+            },
+        };
+        let smooth_sol = gam::families::royston_parmar::optimize_survival_lambdas_with_multistart(
+            layout.penalties.blocks.len(),
+            Some(heuristic_lambdas.as_slice()),
+            objective,
+            &smooth_opts,
+        )?;
+        for (block, &rho_i) in layout
             .penalties
             .blocks
             .iter_mut()
-            .zip(solution.final_point.iter())
+            .zip(smooth_sol.rho.iter())
         {
-            block.lambda = zi.exp();
+            block.lambda = rho_i.exp();
         }
-        for (descriptor, &zi) in penalty_descriptors
+        for (descriptor, &rho_i) in penalty_descriptors
             .iter_mut()
-            .zip(solution.final_point.iter())
+            .zip(smooth_sol.rho.iter())
         {
-            descriptor.lambda = zi.exp();
+            descriptor.lambda = rho_i.exp();
         }
     }
 
@@ -315,7 +632,6 @@ pub fn train_survival_model(
     }
 
     let coefficient_vector: Array1<f64> = outcome.beta.clone().into();
-
     let static_ranges = (0..layout.static_covariates.ncols())
         .map(|col| {
             let mut min_val = f64::INFINITY;
@@ -331,6 +647,38 @@ pub fn train_survival_model(
         })
         .collect();
 
+    let mcmc_samples = if config.mcmc_enabled {
+        let flat = hmc::SurvivalFlatInputs {
+            age_entry: bundle.data.age_entry.view(),
+            age_exit: bundle.data.age_exit.view(),
+            event_target: bundle.data.event_target.view(),
+            event_competing: bundle.data.event_competing.view(),
+            weights: bundle.data.sample_weight.view(),
+            x_entry: layout.combined_entry.view(),
+            x_exit: layout.combined_exit.view(),
+            x_derivative: layout.combined_derivative_exit.view(),
+        };
+        let penalties = to_engine_survival_penalties(&layout.penalties);
+        let mono = to_engine_survival_monotonicity(&monotonicity);
+        let spec = to_engine_survival_spec(&bundle.data);
+        let nuts_cfg = hmc::NutsConfig::for_dimension(coefficient_vector.len());
+        let nuts = hmc::run_survival_nuts_sampling_flattened(
+            flat,
+            penalties,
+            mono,
+            spec,
+            coefficient_vector.view(),
+            outcome.state.hessian.view(),
+            &nuts_cfg,
+        )
+        .map_err(|err| {
+            EstimationError::InvalidSpecification(format!("survival NUTS sampling failed: {err}"))
+        })?;
+        Some(nuts.samples)
+    } else {
+        None
+    };
+
     let artifacts = SurvivalModelArtifacts {
         coefficients: coefficient_vector,
         age_basis,
@@ -345,9 +693,9 @@ pub fn train_survival_model(
         monotonicity,
         interaction_metadata,
         companion_models: Vec::new(),
-        hessian_factor: None,
+        hessian_factor: build_expected_hessian_factor(&outcome.state.hessian),
         calibrator: None,
-        mcmc_samples: None,
+        mcmc_samples,
         cross_covariance_to_primary: None,
     };
 
@@ -358,18 +706,9 @@ pub fn train_survival_model(
         .map(|b| b.lambda)
         .collect::<Vec<_>>();
 
-    Ok(crate::calibrate::model::TrainedModel {
-        config: config.clone(),
-        coefficients: crate::calibrate::model::MappedCoefficients::default(),
+    Ok(SurvivalFitResult {
+        artifacts,
         lambdas,
-        hull: None,
-        penalized_hessian: Some(outcome.state.hessian),
-        scale: None,
-        calibrator: None,
-        joint_link: None,
-        survival: Some(artifacts),
-        survival_companions: HashMap::new(),
-        mcmc_samples: None,
-        smoothing_correction: None,
+        hessian: outcome.state.hessian,
     })
 }
