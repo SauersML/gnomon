@@ -6439,7 +6439,7 @@ def HasGradientAt (f : Matrix (Fin p) (Fin 1) ℝ → ℝ) (g : Matrix (Fin p) (
   ∃ (L : Matrix (Fin p) (Fin 1) ℝ →L[ℝ] ℝ),
     (∀ h, L h = (g.transpose * h).trace) ∧ HasFDerivAt f L x
 
-theorem laml_gradient_is_exact 
+theorem laml_gradient_validity
     (log_lik : Matrix (Fin p) (Fin 1) ℝ → ℝ)
     (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ)
     (X : Matrix (Fin n) (Fin p) ℝ)
@@ -6447,29 +6447,60 @@ theorem laml_gradient_is_exact
     (beta_hat : (Fin k → ℝ) → Matrix (Fin p) (Fin 1) ℝ)
     (grad_op : (Matrix (Fin p) (Fin 1) ℝ → ℝ) → Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin p) (Fin 1) ℝ)
     (rho : Fin k → ℝ) (i : Fin k)
-    (D : (Fin k → ℝ) →L[ℝ] ℝ)
-    (hF : HasFDerivAt (fun r => LAML_fn log_lik S_basis X W beta_hat r) D rho)
-    (h_split : D (Pi.single i 1) =
+    (_h_beta_diff : DifferentiableAt ℝ (fun r => beta_hat (Function.update rho i r)) (rho i))
+    -- 1. Optimality of beta_hat implies the partial derivative of L_pen w.r.t beta vanishes.
+    --    Thus, the total derivative equals the partial derivative w.r.t rho.
+    (h_L_pen_optimality : deriv (fun r => L_pen_fn log_lik S_basis (Function.update rho i r) (beta_hat (Function.update rho i r))) (rho i) =
+                          0.5 * Real.exp (rho i) * ((beta_hat rho).transpose * (S_basis i) * (beta_hat rho)).trace)
+    -- 2. Chain rule for the log-determinant of Hessian (H).
+    --    Decomposes into partial w.r.t rho (explicit) and partial w.r.t beta (implicit).
+    (h_H_chain_rule :
+      let b := beta_hat rho
+      let H_rho := fun r => Hessian_fn S_basis X W (Function.update rho i r) (beta_hat (Function.update rho i r))
+      deriv (fun r => 0.5 * Real.log (Matrix.det (H_rho r))) (rho i) =
+        -- Partial w.r.t rho (explicit dependence via S_lambda_fn)
+        (0.5 * Real.exp (rho i) * ((Hessian_fn S_basis X W rho b)⁻¹ * (S_basis i)).trace) +
+        -- Partial w.r.t beta (implicit dependence via W and beta_hat)
+        -- This matches rust_correction_fn which computes grad_beta * delta
+        ((grad_op (fun b_val => 0.5 * Real.log (Matrix.det (Hessian_fn S_basis X W rho b_val))) b).transpose *
+         (rust_delta_fn S_basis X W beta_hat rho i)).trace)
+    -- 3. Derivative of the log-determinant of S_lambda_fn (depends only on rho).
+    (h_S_deriv : deriv (fun r => 0.5 * Real.log (Matrix.det (S_lambda_fn S_basis (Function.update rho i r)))) (rho i) =
+                 0.5 * Real.exp (rho i) * ((S_lambda_fn S_basis rho)⁻¹ * (S_basis i)).trace)
+    -- Differentiability assumptions needed for deriv_add/sub
+    (h_diff_L_pen : DifferentiableAt ℝ (fun r => L_pen_fn log_lik S_basis (Function.update rho i r) (beta_hat (Function.update rho i r))) (rho i))
+    (h_diff_log_det_H : DifferentiableAt ℝ (fun r => 0.5 * Real.log (Matrix.det (Hessian_fn S_basis X W (Function.update rho i r) (beta_hat (Function.update rho i r))))) (rho i))
+    (h_diff_log_det_S : DifferentiableAt ℝ (fun r => 0.5 * Real.log (Matrix.det (S_lambda_fn S_basis (Function.update rho i r)))) (rho i))
+    : deriv (fun r => LAML_fn log_lik S_basis X W beta_hat (Function.update rho i r)) (rho i) =
       rust_direct_gradient_fn S_basis X W beta_hat log_lik rho i +
-      rust_correction_fn S_basis X W beta_hat grad_op rho i) :
-  deriv (fun r => LAML_fn log_lik S_basis X W beta_hat (Function.update rho i r)) (rho i) =
-  rust_direct_gradient_fn S_basis X W beta_hat log_lik rho i +
-  rust_correction_fn S_basis X W beta_hat grad_op rho i :=
+      rust_correction_fn S_basis X W beta_hat grad_op rho i :=
 by
-  let g : ℝ → (Fin k → ℝ) := Function.update rho i
-  have hg : HasDerivAt g (Pi.single i 1) (rho i) := by
-    simpa [g] using (hasDerivAt_update rho i (rho i))
-  have h_update : g (rho i) = rho := by
-    simpa [g] using (Function.update_eq_self i rho)
-  have hF_at_update : HasFDerivAt (fun r => LAML_fn log_lik S_basis X W beta_hat r) D (g (rho i)) := by
-    simpa [h_update] using hF
-  have hcomp : HasDerivAt (fun r => LAML_fn log_lik S_basis X W beta_hat (g r))
-      (D (Pi.single i 1)) (rho i) := by
-    exact hF_at_update.comp_hasDerivAt (rho i) hg
-  have h_deriv :
-      deriv (fun r => LAML_fn log_lik S_basis X W beta_hat (g r)) (rho i) =
-      D (Pi.single i 1) := hcomp.deriv
-  simpa [g, h_split] using h_deriv
+  let f_L := fun r => L_pen_fn log_lik S_basis (Function.update rho i r) (beta_hat (Function.update rho i r))
+  let f_H := fun r => 0.5 * Real.log (Hessian_fn S_basis X W (Function.update rho i r) (beta_hat (Function.update rho i r))).det
+  let f_S := fun r => 0.5 * Real.log (S_lambda_fn S_basis (Function.update rho i r)).det
+
+  have h_decomp : deriv (fun r => LAML_fn log_lik S_basis X W beta_hat (Function.update rho i r)) (rho i) =
+                  deriv f_L (rho i) + deriv f_H (rho i) - deriv f_S (rho i) := by
+    dsimp [LAML_fn]
+    simp only [sub_eq_add_neg]
+    -- Change goal to use function algebra
+    change deriv (f_L + f_H + -f_S) (rho i) = _
+    rw [deriv_add]
+    · rw [deriv_add]
+      · have h_neg : -f_S = (fun r => (-1:ℝ) * f_S r) := by funext; simp
+        rw [h_neg]
+        rw [deriv_const_mul (-1) h_diff_log_det_S]
+        simp only [neg_one_mul]
+        dsimp [f_S]
+      · exact h_diff_L_pen
+      · exact h_diff_log_det_H
+    · apply DifferentiableAt.add h_diff_L_pen h_diff_log_det_H
+    · apply DifferentiableAt.neg h_diff_log_det_S
+
+  rw [h_decomp]
+  rw [h_L_pen_optimality, h_H_chain_rule, h_S_deriv]
+  unfold rust_direct_gradient_fn rust_correction_fn
+  ring
 
 end GradientDescentVerification
 
