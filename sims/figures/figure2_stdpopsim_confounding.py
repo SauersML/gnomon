@@ -1165,7 +1165,7 @@ def _method_preds(cal_df: pd.DataFrame, test_df: pd.DataFrame, cal_prs: np.ndarr
 
     gm = GAMMethod(k_pgs=4, k_pc=4, k_interaction=3, use_ti=True)
     gm.fit(P_train, PC_train, y_train)
-    out["gam"] = gm.predict_proba(P_test, PC_test)
+    out["pspline"] = gm.predict_proba(P_test, PC_test)
 
     return out
 
@@ -1218,7 +1218,7 @@ def _assert_noncollapsed_prs(labels: np.ndarray, prs: np.ndarray, context: str) 
 
 def _plot_main(df: pd.DataFrame, out_dir: Path) -> None:
     _apply_plot_style()
-    methods = [m for m in ["raw", "normalized", "linear", "gam"] if m in set(df["method"])]
+    methods = [m for m in ["raw", "normalized", "linear", "pspline"] if m in set(df["method"])]
     pops = ["EUR", "AFR", "ASIA", "ADMIX"]
     pop_colors = {"EUR": CB["blue"], "AFR": CB["orange"], "ASIA": CB["green"], "ADMIX": CB["purple"]}
 
@@ -1419,7 +1419,7 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     work_root = Path(args.work_root) if args.work_root else _default_work_root(out_dir)
     work_root.mkdir(parents=True, exist_ok=True)
-    _log("Figure2 GAM backend: mgcv")
+    _log("Figure2 P-spline backend: mgcv")
     _log(f"Figure2 PRS backend: {'BayesR' if args.bayesr else 'P+T'}")
     threads = max(1, int(args.threads)) if args.threads is not None else _default_total_threads()
     if args.memory_mb is not None:

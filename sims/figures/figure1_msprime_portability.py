@@ -533,7 +533,7 @@ def _fit_and_predict_methods(train_df: pd.DataFrame, test_df: pd.DataFrame, trai
 
     gm = GAMMethod(k_pgs=4, k_pc=4, k_interaction=3, use_ti=True)
     gm.fit(P_train, PC_train, y_train)
-    out["gam"] = gm.predict_proba(P_test, PC_test)
+    out["pspline"] = gm.predict_proba(P_test, PC_test)
 
     return out
 
@@ -591,7 +591,7 @@ def _plot_main(df: pd.DataFrame, out_dir: Path) -> None:
         "raw": CB["blue"],
         "normalized": CB["green"],
         "linear": CB["orange"],
-        "gam": CB["purple"],
+        "pspline": CB["purple"],
     }
     for m in sorted(df["method"].unique()):
         sub = df[df["method"] == m].sort_values("gens")
@@ -1076,7 +1076,7 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     work_root = Path(args.work_root) if args.work_root else _default_work_root(out_dir)
     work_root.mkdir(parents=True, exist_ok=True)
-    _log("Figure1 GAM backend: mgcv")
+    _log("Figure1 P-spline backend: mgcv")
     _log(f"Figure1 PRS backend: {'BayesR' if args.bayesr else 'P+T'}")
 
     score_path = ensure_pgs003725(Path(args.cache))

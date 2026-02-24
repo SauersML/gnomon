@@ -68,7 +68,7 @@ class GAMMethod(PGSMethod):
             and allow entire smooth terms to shrink toward zero.
         """
         self.n_pcs = 3
-        super().__init__(name=f"GAM (mgcv, {self.n_pcs} PCs)")
+        super().__init__(name=f"P-spline (mgcv, {self.n_pcs} PCs)")
         self.k_pgs = k_pgs
         self.k_pc = k_pc
         self.k_interaction = k_interaction
