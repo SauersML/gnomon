@@ -1182,6 +1182,14 @@ def _auc(y: np.ndarray, p: np.ndarray) -> float:
     return float(roc_auc_score(y, p))
 
 
+def _brier(y: np.ndarray, p: np.ndarray) -> float:
+    from sklearn.metrics import brier_score_loss
+
+    if y.size == 0:
+        return np.nan
+    return float(brier_score_loss(y.astype(float), np.clip(p.astype(float), 0.0, 1.0)))
+
+
 def _assert_noncollapsed_prs(labels: np.ndarray, prs: np.ndarray, context: str) -> None:
     lab = np.asarray(labels, dtype=object)
     x = np.asarray(prs, dtype=float)
@@ -1253,6 +1261,32 @@ def _plot_main(df: pd.DataFrame, out_dir: Path) -> None:
     _style_axes(ax, y_grid=True)
     fig.tight_layout()
     fig.savefig(out_dir / "figure2_auc_by_method_population.png", dpi=240)
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    for i, pop in enumerate(pops):
+        vals = []
+        for m in methods:
+            sub = df[(df["method"] == m) & (df["population"] == pop)]
+            vals.append(float(sub["brier"].iloc[0]) if len(sub) else np.nan)
+        ax.bar(
+            x + (i - 1.5) * width,
+            vals,
+            width=width,
+            label=pop,
+            color=pop_colors[pop],
+            edgecolor="#222222",
+            linewidth=0.5,
+        )
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(methods)
+    ax.set_ylabel("Brier score")
+    ax.set_ylim(0.0, 1.0)
+    ax.legend(frameon=False)
+    _style_axes(ax, y_grid=True)
+    fig.tight_layout()
+    fig.savefig(out_dir / "figure2_brier_by_method_population.png", dpi=240)
     plt.close(fig)
 
 
@@ -1586,6 +1620,12 @@ def main() -> None:
             p_pop = np.asarray(y_prob, dtype=float)[mask.to_numpy()]
             prs_pop = test_prs[mask.to_numpy()]
             g_pop = test_df.loc[mask, "G_true"].to_numpy(dtype=float)
+            auc_pop = _auc(y_pop, p_pop)
+            brier_pop = _brier(y_pop, p_pop)
+            _log(
+                f"[fig2_s{seed}] method={method} pop={pop} n={int(mask.sum())} "
+                f"auc={auc_pop:.4f} brier={brier_pop:.4f}"
+            )
             rows.append(
                 {
                     "method": method,
@@ -1595,7 +1635,8 @@ def main() -> None:
                     "n_test_total": int(len(test_df)),
                     "n": int(mask.sum()),
                     "prevalence": float(np.mean(y_pop)) if y_pop.size > 0 else np.nan,
-                    "auc": _auc(y_pop, p_pop),
+                    "auc": auc_pop,
+                    "brier": brier_pop,
                     "mean_prs": float(np.mean(prs_pop)) if prs_pop.size > 0 else np.nan,
                     "sd_prs": float(np.std(prs_pop, ddof=1)) if prs_pop.size > 1 else np.nan,
                     "mean_g_true": float(np.mean(g_pop)) if g_pop.size > 0 else np.nan,
@@ -1606,9 +1647,11 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     res = pd.DataFrame(rows)
     res.to_csv(out_dir / "figure2_auc_by_method_population.tsv", sep="\t", index=False)
+    res.to_csv(out_dir / "figure2_auc_brier_by_method_population.tsv", sep="\t", index=False)
     _log("[fig2] Wrote figure2_auc_by_method_population.tsv")
+    _log("[fig2] Wrote figure2_auc_brier_by_method_population.tsv")
     _log_results_table(
-        "[fig2] AUC/statistics by method and population",
+        "[fig2] AUC/Brier/statistics by method and population",
         res.sort_values(["method", "population"]).reset_index(drop=True),
     )
     pred_rows = []

@@ -550,6 +550,14 @@ def _auc(y: np.ndarray, p: np.ndarray) -> float:
     return float(roc_auc_score(y, p))
 
 
+def _brier(y: np.ndarray, p: np.ndarray) -> float:
+    from sklearn.metrics import brier_score_loss
+
+    if y.size == 0:
+        return np.nan
+    return float(brier_score_loss(y.astype(float), np.clip(p.astype(float), 0.0, 1.0)))
+
+
 def _assert_noncollapsed_prs(labels: np.ndarray, prs: np.ndarray, context: str) -> None:
     lab = np.asarray(labels, dtype=object)
     x = np.asarray(prs, dtype=float)
@@ -617,6 +625,28 @@ def _plot_main(df: pd.DataFrame, out_dir: Path) -> None:
     plt.legend(frameon=False, loc="best")
     plt.tight_layout()
     plt.savefig(out_dir / "figure1_auc_ratio.png", dpi=240)
+    plt.close()
+
+    plt.figure(figsize=(10, 6))
+    for m in sorted(df["method"].unique()):
+        sub = df[df["method"] == m].sort_values("gens")
+        plt.plot(
+            sub["gens"],
+            sub["brier_ratio"],
+            marker="o",
+            markersize=4.5,
+            linewidth=2.0,
+            label=m,
+            color=method_colors.get(m, CB["black"]),
+        )
+    plt.xscale("log")
+    plt.xlabel("Generations of divergence")
+    plt.ylabel("Brier ratio (OoA test / AFR test)")
+    ax = plt.gca()
+    _style_axes(ax)
+    plt.legend(frameon=False, loc="best")
+    plt.tight_layout()
+    plt.savefig(out_dir / "figure1_brier_ratio.png", dpi=240)
     plt.close()
 
 
@@ -971,7 +1001,15 @@ def _run_generation_task(task: dict[str, object]) -> dict[str, object]:
         a = test_df["group"] == "AFR_test"
         auc_o = _auc(test_df.loc[o, "y"].to_numpy(), y_prob[o.to_numpy()])
         auc_a = _auc(test_df.loc[a, "y"].to_numpy(), y_prob[a.to_numpy()])
-        ratio = float(auc_o / auc_a) if np.isfinite(auc_o) and np.isfinite(auc_a) and auc_a > 0 else np.nan
+        auc_ratio = float(auc_o / auc_a) if np.isfinite(auc_o) and np.isfinite(auc_a) and auc_a > 0 else np.nan
+        brier_o = _brier(test_df.loc[o, "y"].to_numpy(), y_prob[o.to_numpy()])
+        brier_a = _brier(test_df.loc[a, "y"].to_numpy(), y_prob[a.to_numpy()])
+        brier_ratio = float(brier_o / brier_a) if np.isfinite(brier_o) and np.isfinite(brier_a) and brier_a > 0 else np.nan
+        _log(
+            f"[fig1_g{g}_s{seed}] method={method} "
+            f"auc_ooa={auc_o:.4f} auc_afr={auc_a:.4f} auc_ratio={auc_ratio:.4f} "
+            f"brier_ooa={brier_o:.4f} brier_afr={brier_a:.4f} brier_ratio={brier_ratio:.4f}"
+        )
         result_rows.append(
             {
                 "gens": int(g),
@@ -984,7 +1022,10 @@ def _run_generation_task(task: dict[str, object]) -> dict[str, object]:
                 "n_test_afr": int(np.count_nonzero(a.to_numpy())),
                 "auc_ooa": auc_o,
                 "auc_afr": auc_a,
-                "auc_ratio": ratio,
+                "auc_ratio": auc_ratio,
+                "brier_ooa": brier_o,
+                "brier_afr": brier_a,
+                "brier_ratio": brier_ratio,
             }
         )
 
@@ -1141,6 +1182,8 @@ def main() -> None:
     pc_df = pd.concat([pd.read_csv(str(r["pc_path"]), sep="\t") for r in done], ignore_index=True)
     pred_df = pd.concat([pd.read_csv(str(r["pred_path"]), sep="\t") for r in done], ignore_index=True)
     res_df.to_csv(out_dir / "figure1_auc_ratio.tsv", sep="\t", index=False)
+    res_df.to_csv(out_dir / "figure1_auc_brier_ratio.tsv", sep="\t", index=False)
+    _log("Figure1 wrote figure1_auc_ratio.tsv and figure1_auc_brier_ratio.tsv")
     pred_df.to_csv(out_dir / "figure1_predictions.tsv", sep="\t", index=False)
     pt_paths = [str(r.get("pt_thresholds_path", "")) for r in done if str(r.get("pt_thresholds_path", ""))]
     if pt_paths:
@@ -1183,7 +1226,7 @@ def main() -> None:
     detailed.to_csv(out_dir / "figure1_detailed_metrics.tsv", sep="\t", index=False)
     _log("Figure1 wrote aggregated results table")
     _log_results_table(
-        "[fig1] AUC ratio results (gens/method)",
+        "[fig1] AUC/Brier ratio results (gens/method)",
         res_df.sort_values(["gens", "method"]).reset_index(drop=True),
     )
     _log_results_table(
