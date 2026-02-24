@@ -50,6 +50,7 @@ jobs:
       - name: Build profiling binary
         env:
           CARGO_INCREMENTAL: 0
+          GNOMON_SKIP_LINT_CHECKS: 1
         run: |
           set -euxo pipefail
           cargo +nightly build --profile profiling --features no-inline-profiling
