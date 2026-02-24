@@ -14,9 +14,10 @@ from sklearn.preprocessing import StandardScaler
 def simulate_effect_size_distribution(
     n_effects: int = 200000,
     seed: int = 2026,
+    pi_zero: float = 0.85,
 ) -> np.ndarray:
     """
-    Simulate a heavy-tailed, sparse-like effect-size prior sample.
+    Simulate a sparse heavy-tailed spike-and-slab effect-size prior sample.
 
     This produces a reusable pool of causal-effect draws inspired by
     mixture-of-normals architectures (SBayesR/LDpred2-style priors).
@@ -24,12 +25,17 @@ def simulate_effect_size_distribution(
     m = max(1024, int(n_effects))
     rng = np.random.default_rng(int(seed))
 
-    # Mixture-of-normals with substantial near-zero mass + heavy tails.
-    # Components are centered at 0 and sampled for causal effects only.
+    p0 = min(0.999, max(0.0, float(pi_zero)))
+    effects = np.zeros(m, dtype=np.float64)
+    nonzero = rng.random(m) >= p0
+
+    # Slab: mixture-of-normals with near-zero mass + heavy tails.
     weights = np.array([0.90, 0.08, 0.018, 0.002], dtype=np.float64)
     sigmas = np.array([0.015, 0.08, 0.25, 0.60], dtype=np.float64)
-    comps = rng.choice(len(weights), size=m, p=weights)
-    effects = rng.normal(loc=0.0, scale=sigmas[comps], size=m).astype(np.float64, copy=False)
+    n_nz = int(np.count_nonzero(nonzero))
+    if n_nz > 0:
+        comps = rng.choice(len(weights), size=n_nz, p=weights)
+        effects[nonzero] = rng.normal(loc=0.0, scale=sigmas[comps], size=n_nz).astype(np.float64, copy=False)
     effects = effects[np.isfinite(effects)]
     if effects.size == 0:
         raise RuntimeError("Simulated effect pool is empty")
