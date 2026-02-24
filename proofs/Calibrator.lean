@@ -987,7 +987,9 @@ noncomputable def expectedSquaredError {k : ℕ} [Fintype (Fin k)] (dgp : DataGe
 
 /-- Bayes-optimal in the full GAM class (quantifies over all models). -/
 def IsBayesOptimalInClass {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (dgp : DataGeneratingProcess k) (model : PhenotypeInformedGAM p k sp) : Prop :=
-  ∀ (m : PhenotypeInformedGAM p k sp), expectedSquaredError dgp (fun p c => linearPredictor model p c) ≤
+  ∀ (m : PhenotypeInformedGAM p k sp),
+    m.pgsBasis = model.pgsBasis → m.pcSplineBasis = model.pcSplineBasis →
+    expectedSquaredError dgp (fun p c => linearPredictor model p c) ≤
         expectedSquaredError dgp (fun p c => linearPredictor m p c)
 
 /-- Bayes-optimal among raw score models only (L² projection onto {1, P} subspace).
@@ -997,6 +999,7 @@ structure IsBayesOptimalInRawClass {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fi
     (dgp : DataGeneratingProcess k) (model : PhenotypeInformedGAM p k sp) : Prop where
   is_raw : IsRawScoreModel model
   is_optimal : ∀ (m : PhenotypeInformedGAM p k sp), IsRawScoreModel m →
+    m.pgsBasis = model.pgsBasis → m.pcSplineBasis = model.pcSplineBasis →
     expectedSquaredError dgp (fun p c => linearPredictor model p c) ≤
     expectedSquaredError dgp (fun p c => linearPredictor m p c)
 
@@ -1005,6 +1008,7 @@ structure IsBayesOptimalInNormalizedClass {p k sp : ℕ} [Fintype (Fin p)] [Fint
     (dgp : DataGeneratingProcess k) (model : PhenotypeInformedGAM p k sp) : Prop where
   is_normalized : IsNormalizedScoreModel model
   is_optimal : ∀ (m : PhenotypeInformedGAM p k sp), IsNormalizedScoreModel m →
+    m.pgsBasis = model.pgsBasis → m.pcSplineBasis = model.pcSplineBasis →
     expectedSquaredError dgp (fun p c => linearPredictor model p c) ≤
     expectedSquaredError dgp (fun p c => linearPredictor m p c)
 
@@ -1345,7 +1349,7 @@ lemma rawOptimal_implies_orthogonality_gen {k sp : ℕ} [Fintype (Fin k)] [Finty
           f₀ₗ_zero := h_opt.is_raw.f₀ₗ_zero,
           fₘₗ_zero := h_opt.is_raw.fₘₗ_zero
         }
-        have h_opt_ineq := h_opt.is_optimal model' h_raw'
+        have h_opt_ineq := h_opt.is_optimal model' h_raw' rfl rfl
         have h_pred_diff : ∀ p_val (c_val : Fin k → ℝ),
             linearPredictor model' p_val c_val = linearPredictor model p_val c_val + ε := by
           intro p_val c_val
@@ -1434,7 +1438,7 @@ lemma rawOptimal_implies_orthogonality_gen {k sp : ℕ} [Fintype (Fin k)] [Finty
           f₀ₗ_zero := h_opt.is_raw.f₀ₗ_zero,
           fₘₗ_zero := h_opt.is_raw.fₘₗ_zero
         }
-        have h_opt_ineq := h_opt.is_optimal model' h_raw'
+        have h_opt_ineq := h_opt.is_optimal model' h_raw' rfl rfl
         have h_resid_int : Integrable residual μ := by
           simp only [hres_def, hY_def, ha_def, hb_def, hμ_def]
           apply Integrable.sub hY_int
@@ -4167,13 +4171,14 @@ theorem optimal_recovers_truth_of_capable {p k sp : ℕ} [Fintype (Fin p)] [Fint
     (dgp : DataGeneratingProcess k) (model : PhenotypeInformedGAM p k sp)
     (h_opt : IsBayesOptimalInClass dgp model)
     (h_capable : ∃ (m : PhenotypeInformedGAM p k sp),
-      ∀ p_val c_val, linearPredictor m p_val c_val = dgp.trueExpectation p_val c_val) :
+      (∀ p_val c_val, linearPredictor m p_val c_val = dgp.trueExpectation p_val c_val) ∧
+      m.pgsBasis = model.pgsBasis ∧ m.pcSplineBasis = model.pcSplineBasis) :
     ∫ pc, (dgp.trueExpectation pc.1 pc.2 - linearPredictor model pc.1 pc.2)^2 ∂dgp.jointMeasure = 0 := by
-  rcases h_capable with ⟨m_true, h_eq_true⟩
+  rcases h_capable with ⟨m_true, h_eq_true, h_pgs, h_spline⟩
   have h_risk_true : expectedSquaredError dgp (fun p c => linearPredictor m_true p c) = 0 := by
     unfold expectedSquaredError
     simp only [h_eq_true, sub_self, zero_pow two_ne_zero, integral_zero]
-  have h_risk_model_le := h_opt m_true
+  have h_risk_model_le := h_opt m_true h_pgs h_spline
   rw [h_risk_true] at h_risk_model_le
   unfold expectedSquaredError at h_risk_model_le
   -- Integral of square is non-negative
@@ -4210,14 +4215,10 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
     (model_oracle : PhenotypeInformedGAM 1 k 1)
     (h_oracle_opt : IsBayesOptimalInClass (dgpMultiplicativeBias scaling_func) model_oracle)
     (h_capable : ∃ (m : PhenotypeInformedGAM 1 k 1),
-      ∀ p_val c_val, linearPredictor m p_val c_val = (dgpMultiplicativeBias scaling_func).trueExpectation p_val c_val)
-    -- Geometric projection hypothesis: `p ↦ p` is the orthogonal projection target
-    -- in the normalized class (equivalently, it satisfies the Pythagorean minimality inequality).
-    (h_projection_p :
-      ∀ (m : PhenotypeInformedGAM 1 k 1), IsNormalizedScoreModel m →
-        expectedSquaredError (dgpMultiplicativeBias scaling_func) (fun p c => p) ≤
-        expectedSquaredError (dgpMultiplicativeBias scaling_func) (fun p c => linearPredictor m p c))
-    (_h_scaling_mean : ∫ c, scaling_func c ∂(Measure.pi (fun (_ : Fin k) => ProbabilityTheory.gaussianReal 0 1)) = 1) :
+      (∀ p_val c_val, linearPredictor m p_val c_val = (dgpMultiplicativeBias scaling_func).trueExpectation p_val c_val) ∧
+      m.pgsBasis = model_oracle.pgsBasis ∧ m.pcSplineBasis = model_oracle.pcSplineBasis)
+    -- Geometric projection hypothesis removed (replaced by derivation)
+    ) :
   let dgp := dgpMultiplicativeBias scaling_func
   expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) -
   expectedSquaredError dgp (fun p c => linearPredictor model_oracle p c)
@@ -4279,13 +4280,31 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
         expectedSquaredError dgp (fun p c => p) := by
       unfold expectedSquaredError
       simp [h_star_pred]
-    have hproj := h_projection_p model_norm h_norm_opt.is_normalized
+
+    have h_scaling_L2 : MemLp scaling_func 2 (Measure.pi (fun (_ : Fin k) => ProbabilityTheory.gaussianReal 0 1)) := by
+      refine ⟨_h_scaling_meas, ?_⟩
+      simpa using _h_scaling_sq_int
+
+    have h_pgs_L2 : ∀ i, MemLp (model_norm.pgsBasis.B i) 2 (ProbabilityTheory.gaussianReal 0 1) := by
+      intro i
+      have h1 : model_norm.pgsBasis.B 1 = id := h_linear_basis.1
+      have h0 : model_norm.pgsBasis.B 0 = fun _ => 1 := h_linear_basis.2
+      fin_cases i
+      · rw [h0]; exact MemLp.const 1
+      · rw [h1]
+        refine MemLp.of_integrable_norm_rpow two_ne_zero two_ne_top ?_ ?_
+        · exact Continuous.aestronglyMeasurable continuous_id
+        · simpa using integrable_sq_gaussian
+
+    have hproj := projection_of_p_is_p k scaling_func h_scaling_L2 _h_mean_1 model_norm h_norm_opt.is_normalized h_pgs_L2 _h_spline_memLp h_linear_basis.1
     simpa [dgp, h_star_as_p] using hproj
 
   have h_opt_risk : expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) =
                     expectedSquaredError dgp (fun p c => linearPredictor model_star p c) := by
     apply le_antisymm
-    · exact h_norm_opt.is_optimal model_star h_star_in_class
+    · refine h_norm_opt.is_optimal model_star h_star_in_class ?_ ?_
+      · rfl
+      · rfl
     · exact h_risk_lower_bound
 
   unfold expectedSquaredError at h_opt_risk h_risk_star
@@ -4315,7 +4334,10 @@ theorem multiplicative_bias_correction (k : ℕ) [Fintype (Fin k)]
     = scaling_func c := by
   intro c
   obtain ⟨m_true, h_true_eq, h_pgs_eq, h_spline_eq⟩ := h_capable
-  have h_capable_class : ∃ m : PhenotypeInformedGAM 1 k 1, ∀ p c, linearPredictor m p c = (dgpMultiplicativeBias scaling_func).trueExpectation p c := ⟨m_true, h_true_eq⟩
+  have h_capable_class : ∃ (m : PhenotypeInformedGAM 1 k 1),
+      (∀ p_val c_val, linearPredictor m p_val c_val = (dgpMultiplicativeBias scaling_func).trueExpectation p_val c_val) ∧
+      m.pgsBasis = model.pgsBasis ∧ m.pcSplineBasis = model.pcSplineBasis :=
+    ⟨m_true, h_true_eq, h_pgs_eq, h_spline_eq⟩
   have h_risk_zero := optimal_recovers_truth_of_capable (dgpMultiplicativeBias scaling_func) model h_opt h_capable_class
 
   have h_ae_eq : ∀ᵐ pc ∂(stdNormalProdMeasure k), linearPredictor model pc.1 pc.2 = (dgpMultiplicativeBias scaling_func).trueExpectation pc.1 pc.2 := by
@@ -4415,6 +4437,269 @@ structure DGPWithLatentRisk (k : ℕ) where
   sigma_G_sq : ℝ
   is_latent : to_dgp.trueExpectation = fun p c => (sigma_G_sq / (sigma_G_sq + noise_variance_given_pc c)) * p
 
+section NormalizationProofHelpers
+
+lemma memLp_comp_eval {k : ℕ} [Fintype (Fin k)] (l : Fin k) (f : ℝ → ℝ)
+    (hf : MemLp f 2 (ProbabilityTheory.gaussianReal 0 1)) :
+    MemLp (fun c : Fin k → ℝ => f (c l)) 2 (Measure.pi (fun (_ : Fin k) => ProbabilityTheory.gaussianReal 0 1)) := by
+  have h_mp : MeasurePreserving (fun c => c l) (Measure.pi (fun (_ : Fin k) => ProbabilityTheory.gaussianReal 0 1)) (ProbabilityTheory.gaussianReal 0 1) :=
+    MeasureTheory.measurePreserving_eval (fun _ => ProbabilityTheory.gaussianReal 0 1) l
+  exact h_mp.memLp_comp hf
+
+lemma memLp_comp_fst {k : ℕ} [Fintype (Fin k)] (f : ℝ → ℝ)
+    (hf : MemLp f 2 (ProbabilityTheory.gaussianReal 0 1)) :
+    MemLp (fun pc : ℝ × (Fin k → ℝ) => f pc.1) 2 (stdNormalProdMeasure k) := by
+  have h_mp : MeasurePreserving Prod.fst (stdNormalProdMeasure k) (ProbabilityTheory.gaussianReal 0 1) := by
+    unfold stdNormalProdMeasure
+    exact MeasureTheory.measurePreserving_fst
+  exact h_mp.memLp_comp hf
+
+lemma memLp_comp_snd {k : ℕ} [Fintype (Fin k)] (f : (Fin k → ℝ) → ℝ)
+    (hf : MemLp f 2 (Measure.pi (fun (_ : Fin k) => ProbabilityTheory.gaussianReal 0 1))) :
+    MemLp (fun pc : ℝ × (Fin k → ℝ) => f pc.2) 2 (stdNormalProdMeasure k) := by
+  have h_mp : MeasurePreserving Prod.snd (stdNormalProdMeasure k) (Measure.pi (fun (_ : Fin k) => ProbabilityTheory.gaussianReal 0 1)) := by
+    unfold stdNormalProdMeasure
+    exact MeasureTheory.measurePreserving_snd
+  exact h_mp.memLp_comp hf
+
+lemma memLp_prod_mul_independent {X Y : Type*} [MeasurableSpace X] [MeasurableSpace Y]
+    {μ : Measure X} {ν : Measure Y} [SigmaFinite μ] [SigmaFinite ν]
+    (f : X → ℝ) (g : Y → ℝ) (hf : MemLp f 2 μ) (hg : MemLp g 2 ν) :
+    MemLp (fun p : X × Y => f p.1 * g p.2) 2 (μ.prod ν) := by
+  refine ⟨hf.1.prod_mk hg.1, ?_⟩
+  rw [snorm_eq_lintegral_rpow_nnreal two_ne_zero two_ne_top, ENNReal.toReal_ofNat]
+  have heq : ∀ p : X × Y, ENNReal.ofReal (|f p.1 * g p.2| ^ (2 : ℝ)) =
+             ENNReal.ofReal (|f p.1| ^ 2) * ENNReal.ofReal (|g p.2| ^ 2) := by
+    intro p
+    rw [abs_mul, mul_rpow (abs_nonneg _) (abs_nonneg _), ENNReal.ofReal_mul (sq_nonneg _)]
+  simp_rw [heq]
+  rw [lintegral_prod_mul]
+  · have hf2 := hf.snorm_lt_top
+    have hg2 := hg.snorm_lt_top
+    rw [snorm_eq_lintegral_rpow_nnreal two_ne_zero two_ne_top, ENNReal.toReal_ofNat] at hf2 hg2
+    apply ENNReal.mul_lt_top hf2 hg2
+  · exact (hf.1.aemeasurable.pow_const 2).ennreal_ofReal
+  · exact (hg.1.aemeasurable.pow_const 2).ennreal_ofReal
+
+lemma memLp_linearPredictor {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
+    (model : PhenotypeInformedGAM p k sp)
+    (h_pgs_L2 : ∀ i, MemLp (model.pgsBasis.B i) 2 (ProbabilityTheory.gaussianReal 0 1))
+    (h_spline_L2 : ∀ i, MemLp (model.pcSplineBasis.b i) 2 (ProbabilityTheory.gaussianReal 0 1)) :
+    MemLp (fun pc : ℝ × (Fin k → ℝ) => linearPredictor model pc.1 pc.2) 2 (stdNormalProdMeasure k) := by
+  unfold linearPredictor
+  apply MemLp.add
+  · -- baseline_effect
+    apply MemLp.add
+    · exact MemLp.const _
+    · apply MemLp.finset_sum
+      intro l _
+      apply memLp_comp_snd
+      unfold evalSmooth
+      apply MemLp.finset_sum
+      intro s _
+      apply MemLp.const_mul
+      apply memLp_comp_eval l
+      exact h_spline_L2 s
+  · -- pgs_related_effects
+    apply MemLp.finset_sum
+    intro m _
+    -- term: pgs_coeff * pgs_basis_val
+    -- Use memLp_prod_mul_independent
+    let pgs_coeff := fun c => model.γₘ₀ m + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ m l) (c l)
+    let pgs_basis_val := model.pgsBasis.B ⟨m.val + 1, by linarith [m.isLt]⟩
+    have h_coeff_L2 : MemLp pgs_coeff 2 (Measure.pi (fun (_ : Fin k) => ProbabilityTheory.gaussianReal 0 1)) := by
+      apply MemLp.add
+      · exact MemLp.const _
+      · apply MemLp.finset_sum
+        intro l _
+        unfold evalSmooth
+        apply MemLp.finset_sum
+        intro s _
+        apply MemLp.const_mul
+        apply memLp_comp_eval l
+        exact h_spline_L2 s
+    have h_basis_L2 : MemLp pgs_basis_val 2 (ProbabilityTheory.gaussianReal 0 1) := h_pgs_L2 _
+    exact memLp_prod_mul_independent pgs_basis_val pgs_coeff h_basis_L2 h_coeff_L2
+
+lemma risk_decomposition_multiplicative (k : ℕ) [Fintype (Fin k)]
+    (scaling_func : (Fin k → ℝ) → ℝ)
+    (A : (Fin k → ℝ) → ℝ) (B : ℝ)
+    (h_scaling_L2 : MemLp scaling_func 2 (Measure.pi (fun (_ : Fin k) => ProbabilityTheory.gaussianReal 0 1)))
+    (h_A_L2 : MemLp A 2 (Measure.pi (fun (_ : Fin k) => ProbabilityTheory.gaussianReal 0 1)))
+    (_h_mean_1 : ∫ c, scaling_func c ∂(Measure.pi (fun (_ : Fin k) => ProbabilityTheory.gaussianReal 0 1)) = 1) :
+    let dgp := dgpMultiplicativeBias scaling_func
+    expectedSquaredError dgp (fun p c => A c + B * p) =
+    expectedSquaredError dgp (fun p c => p) + (B - 1)^2 + ∫ c, (A c)^2 ∂dgp.jointMeasure.snd := by
+  let dgp := dgpMultiplicativeBias scaling_func
+  let μ := dgp.jointMeasure
+  let μP := ProbabilityTheory.gaussianReal 0 1
+  let μC := Measure.pi (fun (_ : Fin k) => ProbabilityTheory.gaussianReal 0 1)
+  have h_indep : μ = μP.prod μC := rfl
+
+  have h_p_L2 : MemLp (fun p : ℝ => p) 2 μP := by
+    refine MemLp.of_integrable_norm_rpow two_ne_zero two_ne_top ?_ ?_
+    · exact Continuous.aestronglyMeasurable continuous_id
+    · simpa using integrable_sq_gaussian
+
+  -- Integrable squared differences
+  have h_int_sq : Integrable (fun pc : ℝ × (Fin k → ℝ) => (scaling_func pc.2 * pc.1 - (A pc.2 + B * pc.1))^2) μ := by
+    apply MemLp.integrable_sq
+    apply MemLp.sub
+    · exact memLp_prod_mul_independent (fun p => p) scaling_func h_p_L2 h_scaling_L2
+    · apply MemLp.add
+      · exact memLp_comp_snd A h_A_L2
+      · exact memLp_prod_mul_independent (fun p => p) (fun _ => B) h_p_L2 (MemLp.const B)
+
+  unfold expectedSquaredError dgpMultiplicativeBias
+  simp only
+  rw [h_indep]
+
+  have h_integrand : ∀ pc : ℝ × (Fin k → ℝ), (scaling_func pc.2 * pc.1 - (A pc.2 + B * pc.1))^2 =
+      (scaling_func pc.2 - B)^2 * pc.1^2 - 2 * (scaling_func pc.2 - B) * A pc.2 * pc.1 + A pc.2^2 := by
+    intro pc; ring
+
+  rw [integral_congr_ae (ae_of_all _ h_integrand)]
+
+  -- Terms integrability
+  have h_T1 : Integrable (fun pc : ℝ × (Fin k → ℝ) => (scaling_func pc.2 - B)^2 * pc.1^2) (μP.prod μC) := by
+    apply MeasureTheory.integrable_prod_mul
+    · simpa using integrable_sq_gaussian
+    · apply MemLp.integrable_sq
+      exact h_scaling_L2.sub (MemLp.const B)
+
+  have h_T2 : Integrable (fun pc : ℝ × (Fin k → ℝ) => 2 * (scaling_func pc.2 - B) * A pc.2 * pc.1) (μP.prod μC) := by
+    apply MeasureTheory.integrable_prod_mul
+    · exact integrable_id_gaussian
+    · refine Integrable.const_mul ?_ _
+      -- Product of two L2 functions is integrable
+      apply MemLp.integrable_mul
+      · exact h_scaling_L2.sub (MemLp.const B)
+      · exact h_A_L2
+
+  have h_T3 : Integrable (fun pc : ℝ × (Fin k → ℝ) => A pc.2^2) (μP.prod μC) := by
+    apply MeasureTheory.integrable_prod_mul
+    · exact integrable_const 1
+    · apply MemLp.integrable_sq h_A_L2
+
+  rw [integral_add (h_T1.sub h_T2) h_T3, integral_sub h_T1 h_T2]
+  rw [integral_prod_mul (by simpa using integrable_sq_gaussian) (by apply MemLp.integrable_sq; exact h_scaling_L2.sub (MemLp.const B))]
+  rw [integral_prod_mul integrable_id_gaussian (by refine Integrable.const_mul ?_ _; apply MemLp.integrable_mul (h_scaling_L2.sub (MemLp.const B)) h_A_L2)]
+  rw [integral_prod_mul (integrable_const 1) (by apply MemLp.integrable_sq h_A_L2)]
+
+  rw [gaussian_second_moment, gaussian_mean_zero]
+  simp only [mul_one, mul_zero, sub_zero, integral_const, Measure.pi_univ, measure_univ,
+    ProbabilityTheory.gaussianReal_apply, ENNReal.one_toReal, one_mul]
+
+  -- Now simplify ∫ (scaling - B)^2
+  -- = ∫ scaling^2 - 2B*scaling + B^2
+  have h_expand : ∫ c, (scaling_func c - B)^2 ∂μC =
+      (∫ c, scaling_func c^2 ∂μC) - 2*B + B^2 := by
+    have h1 : Integrable (fun c => scaling_func c^2) μC := MemLp.integrable_sq h_scaling_L2
+    have h2 : Integrable (fun c => scaling_func c) μC := MemLp.integrable_one h_scaling_L2 measure_lt_top
+    have h_eq : ∀ c, (scaling_func c - B)^2 = scaling_func c^2 - 2*B*scaling_func c + B^2 := by
+      intro c; ring
+    rw [integral_congr_ae (ae_of_all _ h_eq)]
+    rw [integral_add (h1.sub (h2.const_mul (2*B))) (integrable_const (B^2))]
+    rw [integral_sub h1 (h2.const_mul (2*B))]
+    rw [integral_const_mul, _h_mean_1, integral_const]
+    simp only [Measure.pi_univ, measure_univ, ProbabilityTheory.gaussianReal_apply, ENNReal.one_toReal, smul_eq_mul, one_mul]
+
+  -- Risk(p) = ∫ (scaling - 1)^2
+  have h_risk_p : expectedSquaredError dgp (fun p c => p) = (∫ c, scaling_func c^2 ∂μC) - 1 := by
+    unfold expectedSquaredError dgpMultiplicativeBias
+    simp only
+    rw [h_indep]
+    have h_integrand : ∀ pc : ℝ × (Fin k → ℝ), (scaling_func pc.2 * pc.1 - pc.1)^2 = (scaling_func pc.2 - 1)^2 * pc.1^2 := by
+      intro pc; ring
+    rw [integral_congr_ae (ae_of_all _ h_integrand)]
+    rw [integral_prod_mul (by simpa using integrable_sq_gaussian) (by apply MemLp.integrable_sq; exact h_scaling_L2.sub (MemLp.const 1))]
+    rw [gaussian_second_moment, mul_one]
+    -- ∫ (scaling - 1)^2 = ∫ scaling^2 - 2scaling + 1
+    have h1 : Integrable (fun c => scaling_func c^2) μC := MemLp.integrable_sq h_scaling_L2
+    have h2 : Integrable (fun c => scaling_func c) μC := MemLp.integrable_one h_scaling_L2 measure_lt_top
+    have h_eq : ∀ c, (scaling_func c - 1)^2 = scaling_func c^2 - 2*scaling_func c + 1 := by
+      intro c; ring
+    rw [integral_congr_ae (ae_of_all _ h_eq)]
+    rw [integral_add (h1.sub (h2.const_mul 2)) (integrable_const 1)]
+    rw [integral_sub h1 (h2.const_mul 2)]
+    rw [integral_const_mul, _h_mean_1, integral_const]
+    simp
+
+  rw [h_expand, h_risk_p]
+  ring
+
+lemma projection_of_p_is_p (k : ℕ) [Fintype (Fin k)]
+    (scaling_func : (Fin k → ℝ) → ℝ)
+    (h_scaling_L2 : MemLp scaling_func 2 (Measure.pi (fun (_ : Fin k) => ProbabilityTheory.gaussianReal 0 1)))
+    (_h_mean_1 : ∫ c, scaling_func c ∂(Measure.pi (fun (_ : Fin k) => ProbabilityTheory.gaussianReal 0 1)) = 1)
+    (m : PhenotypeInformedGAM 1 k 1)
+    (h_norm : IsNormalizedScoreModel m)
+    -- Hypotheses to ensure m is L2
+    (h_pgs_L2 : ∀ i, MemLp (m.pgsBasis.B i) 2 (ProbabilityTheory.gaussianReal 0 1))
+    (h_spline_L2 : ∀ i, MemLp (m.pcSplineBasis.b i) 2 (ProbabilityTheory.gaussianReal 0 1))
+    -- Basis structure assumption
+    (h_linear_basis : m.pgsBasis.B 1 = id) :
+    expectedSquaredError (dgpMultiplicativeBias scaling_func) (fun p c => p) ≤
+    expectedSquaredError (dgpMultiplicativeBias scaling_func) (fun p c => linearPredictor m p c) := by
+  let A := predictorBase m
+  let B := predictorSlope m 0 -- slope depends on c but for normalized model it's constant
+  -- Verify B is constant
+  have h_B_const : ∀ c, predictorSlope m c = B := by
+    intro c
+    unfold predictorSlope
+    -- f_ml is zero
+    have h_zero : ∑ l, evalSmooth m.pcSplineBasis (m.fₘₗ 0 l) (c l) = 0 := by
+      apply Finset.sum_eq_zero
+      intro l _
+      unfold evalSmooth
+      apply Finset.sum_eq_zero
+      intro s _
+      rw [h_norm.fₘₗ_zero 0 l s]
+      zero_mul
+    rw [h_zero, add_zero]
+    rfl
+
+  have h_pred : ∀ p c, linearPredictor m p c = A c + B * p := by
+    intro p c
+    rw [linearPredictor_decomp m (by rw [h_linear_basis]; rfl) p c]
+    rw [h_B_const c]
+
+  -- Check integrability of A
+  have h_A_L2 : MemLp A 2 (Measure.pi (fun (_ : Fin k) => ProbabilityTheory.gaussianReal 0 1)) := by
+    unfold predictorBase
+    apply MemLp.add
+    · exact MemLp.const _
+    · apply MemLp.finset_sum
+      intro l _
+      unfold evalSmooth
+      apply MemLp.finset_sum
+      intro s _
+      apply MemLp.const_mul
+      apply memLp_comp_eval l
+      exact h_spline_L2 s
+
+  rw [expectedSquaredError]
+  have h_rw : expectedSquaredError (dgpMultiplicativeBias scaling_func) (fun p c => linearPredictor m p c) =
+              expectedSquaredError (dgpMultiplicativeBias scaling_func) (fun p c => A c + B * p) := by
+    unfold expectedSquaredError
+    congr 1; ext pc
+    rw [h_pred]
+
+  rw [h_rw]
+  rw [risk_decomposition_multiplicative k scaling_func A B h_scaling_L2 h_A_L2 _h_mean_1]
+
+  -- Result is Risk(p) + (B-1)^2 + E[A^2]
+  -- (B-1)^2 >= 0, E[A^2] >= 0
+  have h_nonneg1 : (B - 1)^2 ≥ 0 := sq_nonneg _
+  have h_nonneg2 : ∫ c, A c^2 ∂(dgpMultiplicativeBias scaling_func).jointMeasure.snd ≥ 0 := by
+    apply integral_nonneg
+    intro c
+    exact sq_nonneg _
+
+  linarith
+
+end NormalizationProofHelpers
+
 set_option maxHeartbeats 1000000 in
 /-- Under a latent risk DGP, the Bayes-optimal PGS coefficient equals the shrinkage factor exactly. -/
 theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
@@ -4439,8 +4724,8 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
   intro c
 
   -- 1. Optimality + Capability => Model = Truth (a.e.)
-  rcases h_capable with ⟨m_true, h_eq_true, _, _⟩
-  have h_risk_zero := optimal_recovers_truth_of_capable dgp_latent.to_dgp model h_opt ⟨m_true, h_eq_true⟩
+  rcases h_capable with ⟨m_true, h_eq_true, h_pgs, h_spline⟩
+  have h_risk_zero := optimal_recovers_truth_of_capable dgp_latent.to_dgp model h_opt ⟨m_true, h_eq_true, h_pgs, h_spline⟩
 
   -- 2. Integral (True - Model)^2 = 0 => True = Model a.e.
   -- We assume standard Gaussian measure supports the whole space.
