@@ -26,8 +26,7 @@ if str(SIMS_DIR) not in sys.path:
     sys.path.append(str(SIMS_DIR))
 
 from .common import (
-    ensure_pgs003725,
-    load_pgs003725_effects,
+    simulate_effect_size_distribution,
     diploid_index_pairs,
     sample_two_site_sets_for_maf,
     compute_pcs_risk_and_diagnostics,
@@ -1131,7 +1130,7 @@ def main() -> None:
     parser.add_argument("--out", default="sims/results_figure1_local", help="Output directory")
     parser.add_argument("--seed", type=int, default=90210)
     parser.add_argument("--gens", nargs="*", type=int, default=DIVERGENCE_GENS)
-    parser.add_argument("--cache", default="sims/.cache")
+    parser.add_argument("--cache", default="sims/.cache", help="Deprecated: external PGS cache is no longer used.")
     parser.add_argument("--n-afr", type=int, default=N_AFR)
     parser.add_argument("--n-ooa-train", type=int, default=N_OOA_TRAIN)
     parser.add_argument("--n-ooa-test", type=int, default=N_OOA_TEST)
@@ -1171,8 +1170,11 @@ def main() -> None:
     _log("Figure1 spline backends: pspline + thinplate (mgcv)")
     _log(f"Figure1 PRS backend: {'BayesR' if args.bayesr else 'P+T'}")
 
-    score_path = ensure_pgs003725(Path(args.cache))
-    pgs_effects = load_pgs003725_effects(score_path, chr_filter="22")
+    pgs_effects = simulate_effect_size_distribution(
+        n_effects=200000,
+        seed=int(args.seed) + 4049,
+    )
+    _log(f"Figure1 using runtime-simulated effect-size distribution (n={len(pgs_effects)})")
     # Prewarm stdpopsim chr22 map once in the parent process to avoid
     # concurrent cache initialization races across workers.
     _ = get_chr22_recomb_map()

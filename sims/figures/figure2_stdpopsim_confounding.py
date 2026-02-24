@@ -32,8 +32,7 @@ if str(SIMS_DIR) not in sys.path:
     sys.path.append(str(SIMS_DIR))
 
 from .common import (
-    ensure_pgs003725,
-    load_pgs003725_effects,
+    simulate_effect_size_distribution,
     diploid_index_pairs,
     sample_two_site_sets_for_maf,
     compute_pcs_risk_and_diagnostics,
@@ -1437,7 +1436,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", default="sims/results_figure2_local")
     parser.add_argument("--seed", type=int, default=99173)
-    parser.add_argument("--cache", default="sims/.cache")
+    parser.add_argument("--cache", default="sims/.cache", help="Deprecated: external PGS cache is no longer used.")
     parser.add_argument("--n-train-eur", type=int, default=N_TRAIN_EUR)
     parser.add_argument("--n-test-per-pop", type=int, default=N_TEST_PER_POP)
     parser.add_argument(
@@ -1473,9 +1472,11 @@ def main() -> None:
     _log(f"Figure2 resources: threads={threads} memory_mb={memory_mb}")
     _set_runtime_thread_env(threads)
 
-    score_path = ensure_pgs003725(Path(args.cache))
-    _log(f"Figure2 loading PGS effects from cache={args.cache}")
-    pgs_effects = load_pgs003725_effects(score_path, chr_filter="22")
+    pgs_effects = simulate_effect_size_distribution(
+        n_effects=200000,
+        seed=int(args.seed) + 4049,
+    )
+    _log(f"Figure2 using runtime-simulated effect-size distribution (n={len(pgs_effects)})")
 
     df = None
     prefix = None
