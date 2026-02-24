@@ -95,18 +95,18 @@ def _clear_ramdisk_after() -> bool:
 def _cohort_sizes(small: bool) -> dict[str, int]:
     if small:
         return {
-            "fig1_n_afr": 300,
-            "fig1_n_ooa_train": 300,
-            "fig1_n_ooa_test": 300,
-            "fig2_n_train_eur": 600,
-            "fig2_n_test_per_pop": 150,
+            "fig1_n_afr": 3000,
+            "fig1_n_ooa_train": 3000,
+            "fig1_n_ooa_test": 3000,
+            "fig2_n_train_eur": 6000,
+            "fig2_n_test_per_pop": 1500,
         }
     return {
-        "fig1_n_afr": 10000,
-        "fig1_n_ooa_train": 10000,
-        "fig1_n_ooa_test": 10000,
-        "fig2_n_train_eur": 12000,
-        "fig2_n_test_per_pop": 3000,
+        "fig1_n_afr": 100000,
+        "fig1_n_ooa_train": 100000,
+        "fig1_n_ooa_test": 100000,
+        "fig2_n_train_eur": 120000,
+        "fig2_n_test_per_pop": 30000,
     }
 
 

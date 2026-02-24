@@ -45,10 +45,10 @@ from prs_tools import BayesR, PPlusT
 
 DIVERGENCE_GENS = [5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000]
 
-# Requested scale-down by 100 from original design.
-N_AFR = 100
-N_OOA_TRAIN = 100
-N_OOA_TEST = 100
+# Requested scale-down by 10 from original design.
+N_AFR = 1000
+N_OOA_TRAIN = 1000
+N_OOA_TEST = 1000
 N_PCS = 5
 
 CB = {

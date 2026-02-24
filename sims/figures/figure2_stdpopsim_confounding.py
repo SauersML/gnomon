@@ -49,9 +49,9 @@ from plink_utils import run_plink_conversion
 from prs_tools import BayesR, PPlusT
 
 
-# Requested scale-down by 100.
-N_TRAIN_EUR = 120
-N_TEST_PER_POP = 30
+# Requested scale-down by 10.
+N_TRAIN_EUR = 1200
+N_TEST_PER_POP = 300
 N_PCS = 5
 
 CB = {
