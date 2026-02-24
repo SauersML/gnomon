@@ -1,12 +1,17 @@
 """
 Method 5: Thin-plate spline GAM using R's mgcv.
 """
+import numpy as np
 from .gam_mgcv import GAMMethod
 
 
 class ThinPlateMethod(GAMMethod):
     """
-    Thin-plate spline variant of the mgcv GAM with optional double penalty.
+    Thin-plate spline variant of the mgcv GAM.
+
+    Uses mgcv's `bs="tp"` basis, which is constructed from unique covariate
+    locations in the observed data (no fixed knot grid), and always enables
+    double-penalty term selection (`select=TRUE`).
     """
 
     def __init__(
@@ -16,7 +21,6 @@ class ThinPlateMethod(GAMMethod):
         k_interaction: int = 5,
         method: str = "REML",
         use_ti: bool = True,
-        use_double_penalty: bool = True,
     ):
         super().__init__(
             k_pgs=k_pgs,
@@ -24,9 +28,15 @@ class ThinPlateMethod(GAMMethod):
             k_interaction=k_interaction,
             method=method,
             use_ti=use_ti,
-            use_double_penalty=use_double_penalty,
+            use_double_penalty=True,
         )
         self.name = f"Thin-plate spline (mgcv, {self.n_pcs} PCs)"
+
+    def fit(self, P: np.ndarray, PC: np.ndarray, y: np.ndarray) -> "ThinPlateMethod":
+        # Guard against accidental external mutation of this setting.
+        self.use_double_penalty = True
+        super().fit(P, PC, y)
+        return self
 
     def _build_formula(self, n_pcs_actual: int) -> str:
         if self.use_ti:

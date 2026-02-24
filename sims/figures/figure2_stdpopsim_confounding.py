@@ -1167,7 +1167,7 @@ def _method_preds(cal_df: pd.DataFrame, test_df: pd.DataFrame, cal_prs: np.ndarr
     gm = GAMMethod(k_pgs=4, k_pc=4, k_interaction=3, use_ti=True)
     gm.fit(P_train, PC_train, y_train)
     out["pspline"] = gm.predict_proba(P_test, PC_test)
-    tp = ThinPlateMethod(k_pgs=4, k_pc=4, k_interaction=3, use_ti=True, use_double_penalty=True)
+    tp = ThinPlateMethod(k_pgs=4, k_pc=4, k_interaction=3, use_ti=True)
     tp.fit(P_train, PC_train, y_train)
     out["thinplate"] = tp.predict_proba(P_test, PC_test)
 
