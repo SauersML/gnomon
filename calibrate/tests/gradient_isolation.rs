@@ -357,6 +357,7 @@ fn check_gradient(
         family: match link {
             LinkFunction::Logit => gam::types::LikelihoodFamily::BinomialLogit,
             LinkFunction::Identity => gam::types::LikelihoodFamily::GaussianIdentity,
+            LinkFunction::Probit => gam::types::LikelihoodFamily::BinomialProbit,
         },
         tol: 1e-10,
         max_iter: 200,

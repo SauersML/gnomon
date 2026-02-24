@@ -11,6 +11,7 @@ use gam::custom_family::{
 };
 use gam::generative::{CustomFamilyGenerative, GenerativeSpec, NoiseModel};
 use gam::matrix::DesignMatrix;
+use gam::probability::{normal_cdf_approx, normal_pdf};
 use gam::types::LinkFunction;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 
@@ -93,23 +94,6 @@ struct LiabilityFamily {
     sigma_max: f64,
     wiggle_knots: Option<Array1<f64>>,
     wiggle_degree: Option<usize>,
-}
-
-fn normal_pdf(x: f64) -> f64 {
-    const INV_SQRT_2PI: f64 = 0.398_942_280_401_432_7;
-    INV_SQRT_2PI * (-0.5 * x * x).exp()
-}
-
-fn normal_cdf(x: f64) -> f64 {
-    let z = x.abs();
-    let t = 1.0 / (1.0 + 0.231_641_9 * z);
-    let poly = (((((1.330_274_429 * t - 1.821_255_978) * t) + 1.781_477_937) * t
-        - 0.356_563_782)
-        * t
-        + 0.319_381_530)
-        * t;
-    let cdf_pos = 1.0 - normal_pdf(z) * poly;
-    if x >= 0.0 { cdf_pos } else { 1.0 - cdf_pos }
 }
 
 fn prepend_column(col: ArrayView1<'_, f64>, rest: &Array2<f64>) -> Array2<f64> {
@@ -372,10 +356,11 @@ impl CustomFamily for LiabilityFamily {
             };
             z[i] = (eta_m[i] - eta_t[i]) / sigma[i];
             q[i] = z[i] + eta_w.map_or(0.0, |ew| ew[i]);
-            let p = normal_cdf(q[i]).clamp(1e-10, 1.0 - 1e-10);
+            let p = normal_cdf_approx(q[i]).clamp(1e-10, 1.0 - 1e-10);
             mu[i] = p;
             dmu_dq[i] = normal_pdf(q[i]).max(1e-8);
-            log_lik += self.weights[i] * (self.y[i] * p.ln() + (1.0 - self.y[i]) * (1.0 - p).ln());
+            log_lik += self.weights[i]
+                * (self.y[i] * p.ln() + (1.0_f64 - self.y[i]) * (1.0_f64 - p).ln());
         }
 
         let mut working_sets = Vec::with_capacity(n_blocks);
@@ -527,7 +512,7 @@ impl CustomFamilyGenerative for LiabilityFamily {
             let sigma = eta_log_sigma[i].exp().clamp(self.sigma_min, self.sigma_max);
             let z = (eta_m[i] - eta_t[i]) / sigma;
             let q = z + eta_w.map_or(0.0, |w| w[i]);
-            mean[i] = normal_cdf(q).clamp(1e-12, 1.0 - 1e-12);
+            mean[i] = normal_cdf_approx(q).clamp(1e-12, 1.0 - 1e-12);
         }
         Ok(GenerativeSpec {
             mean,
@@ -645,8 +630,8 @@ pub fn predict_liability_model(
     };
 
     let probability = match &wiggle {
-        Some(w) => (&z + w).mapv(normal_cdf),
-        None => z.mapv(normal_cdf),
+        Some(w) => (&z + w).mapv(normal_cdf_approx),
+        None => z.mapv(normal_cdf_approx),
     }
     .mapv(|v| v.clamp(1e-10, 1.0 - 1e-10));
 

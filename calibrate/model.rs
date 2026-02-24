@@ -2,28 +2,17 @@ use gam::basis::{self, BasisOptions, Dense, KnotSource, create_basis};
 use crate::calibrate::construction::EngineLayout;
 use crate::calibrate::estimate::EstimationError;
 use gam::hull::PeeledHull;
+use gam::probability::normal_cdf_approx;
 use crate::calibrate::survival::{
     self, DEFAULT_RISK_EPSILON, SurvivalError, SurvivalModelArtifacts, SurvivalSpec,
 };
 pub use gam::types::LinkFunction;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, Zip, s};
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufWriter, Write};
 use thiserror::Error;
-
-fn convert_struct<T, U>(value: &T) -> Result<U, EstimationError>
-where
-    T: Serialize,
-    U: DeserializeOwned,
-{
-    let encoded = toml::to_string(value)
-        .map_err(|e| EstimationError::InvalidInput(format!("serialization failure: {e}")))?;
-    toml::from_str::<U>(&encoded)
-        .map_err(|e| EstimationError::InvalidInput(format!("deserialization failure: {e}")))
-}
 
 // --- Public Data Structures ---
 // These structs define the public, human-readable format of the trained model
@@ -117,21 +106,6 @@ pub fn default_mcmc_enabled() -> bool {
 
 pub fn default_calibrator_enabled() -> bool {
     true
-}
-
-#[inline]
-fn normal_cdf_approx(x: f64) -> f64 {
-    let z = x.abs().clamp(0.0, 30.0);
-    let t = 1.0 / (1.0 + 0.231_641_9 * z);
-    let inv_sqrt_2pi = 0.398_942_280_401_432_7;
-    let pdf = inv_sqrt_2pi * (-0.5 * z * z).exp();
-    let poly = (((((1.330_274_429 * t - 1.821_255_978) * t) + 1.781_477_937) * t
-        - 0.356_563_782)
-        * t
-        + 0.319_381_530)
-        * t;
-    let cdf_pos = 1.0 - pdf * poly;
-    if x >= 0.0 { cdf_pos } else { 1.0 - cdf_pos }
 }
 
 /// The complete blueprint of a trained model.
@@ -3743,11 +3717,4 @@ pub fn to_engine_model_config(config: &ModelConfig) -> Result<gam::pirls::PirlsC
         convergence_tolerance: config.convergence_tolerance,
         firth_bias_reduction: config.firth_bias_reduction,
     })
-}
-
-pub fn from_engine_trained_model<T>(model: &T) -> Result<TrainedModel, EstimationError>
-where
-    T: Serialize,
-{
-    convert_struct(model)
 }

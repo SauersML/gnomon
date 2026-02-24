@@ -7,6 +7,7 @@ use crate::calibrate::alo::CalibratorFeatures;
 use crate::calibrate::alo::compute_alo_features_from_pirls;
 use crate::calibrate::estimate::EstimationError;
 use gam::matrix::DesignMatrix;
+use gam::probability::normal_cdf_approx;
 #[cfg(test)]
 use gam::faer_ndarray::FaerArrayView;
 #[cfg(test)]
@@ -68,21 +69,6 @@ impl CalibratorSpec {
             LinkFunction::Identity => None,
         }
     }
-}
-
-#[inline]
-fn normal_cdf_approx(x: f64) -> f64 {
-    let z = x.abs().clamp(0.0, 30.0);
-    let t = 1.0 / (1.0 + 0.231_641_9 * z);
-    let inv_sqrt_2pi = 0.398_942_280_401_432_7;
-    let pdf = inv_sqrt_2pi * (-0.5 * z * z).exp();
-    let poly = (((((1.330_274_429 * t - 1.821_255_978) * t) + 1.781_477_937) * t
-        - 0.356_563_782)
-        * t
-        + 0.319_381_530)
-        * t;
-    let cdf_pos = 1.0 - pdf * poly;
-    if x >= 0.0 { cdf_pos } else { 1.0 - cdf_pos }
 }
 
 /// Schema and parameters needed to rebuild the calibrator design at inference
