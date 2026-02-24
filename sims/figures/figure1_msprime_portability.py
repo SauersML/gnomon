@@ -598,7 +598,6 @@ def _assert_noncollapsed_prs(labels: np.ndarray, prs: np.ndarray, context: str) 
 
 def _plot_main(df: pd.DataFrame, out_dir: Path) -> None:
     _apply_plot_style()
-    plt.figure(figsize=(10, 6))
     method_colors = {
         "raw": CB["blue"],
         "normalized": CB["green"],
@@ -606,48 +605,55 @@ def _plot_main(df: pd.DataFrame, out_dir: Path) -> None:
         "pspline": CB["purple"],
         "thinplate": CB["vermillion"],
     }
-    for m in sorted(df["method"].unique()):
-        sub = df[df["method"] == m].sort_values("gens")
-        plt.plot(
-            sub["gens"],
-            sub["auc_ratio"],
-            marker="o",
-            markersize=4.5,
-            linewidth=2.0,
-            label=m,
-            color=method_colors.get(m, CB["black"]),
-        )
-    plt.xscale("log")
-    plt.xlabel("Generations of divergence")
-    plt.ylabel("AUC ratio (OoA test / AFR test)")
-    ax = plt.gca()
-    _style_axes(ax)
-    plt.legend(frameon=False, loc="best")
-    plt.tight_layout()
-    plt.savefig(out_dir / "figure1_auc_ratio.png", dpi=240)
-    plt.close()
+    prs_sources = sorted(df["prs_source"].unique()) if "prs_source" in df.columns else ["estimated"]
+    for prs_source in prs_sources:
+        sub_df = df[df["prs_source"] == prs_source] if "prs_source" in df.columns else df
+        source_suffix = "" if prs_source == "estimated" else f"_{prs_source}"
+        source_title = f" ({prs_source} PRS)" if len(prs_sources) > 1 else ""
 
-    plt.figure(figsize=(10, 6))
-    for m in sorted(df["method"].unique()):
-        sub = df[df["method"] == m].sort_values("gens")
-        plt.plot(
-            sub["gens"],
-            sub["brier_ratio"],
-            marker="o",
-            markersize=4.5,
-            linewidth=2.0,
-            label=m,
-            color=method_colors.get(m, CB["black"]),
-        )
-    plt.xscale("log")
-    plt.xlabel("Generations of divergence")
-    plt.ylabel("Brier ratio (OoA test / AFR test)")
-    ax = plt.gca()
-    _style_axes(ax)
-    plt.legend(frameon=False, loc="best")
-    plt.tight_layout()
-    plt.savefig(out_dir / "figure1_brier_ratio.png", dpi=240)
-    plt.close()
+        plt.figure(figsize=(10, 6))
+        for m in sorted(sub_df["method"].unique()):
+            sub = sub_df[sub_df["method"] == m].sort_values("gens")
+            plt.plot(
+                sub["gens"],
+                sub["auc_ratio"],
+                marker="o",
+                markersize=4.5,
+                linewidth=2.0,
+                label=m,
+                color=method_colors.get(m, CB["black"]),
+            )
+        plt.xscale("log")
+        plt.xlabel("Generations of divergence")
+        plt.ylabel(f"AUC ratio (OoA test / AFR test){source_title}")
+        ax = plt.gca()
+        _style_axes(ax)
+        plt.legend(frameon=False, loc="best")
+        plt.tight_layout()
+        plt.savefig(out_dir / f"figure1_auc_ratio{source_suffix}.png", dpi=240)
+        plt.close()
+
+        plt.figure(figsize=(10, 6))
+        for m in sorted(sub_df["method"].unique()):
+            sub = sub_df[sub_df["method"] == m].sort_values("gens")
+            plt.plot(
+                sub["gens"],
+                sub["brier_ratio"],
+                marker="o",
+                markersize=4.5,
+                linewidth=2.0,
+                label=m,
+                color=method_colors.get(m, CB["black"]),
+            )
+        plt.xscale("log")
+        plt.xlabel("Generations of divergence")
+        plt.ylabel(f"Brier ratio (OoA test / AFR test){source_title}")
+        ax = plt.gca()
+        _style_axes(ax)
+        plt.legend(frameon=False, loc="best")
+        plt.tight_layout()
+        plt.savefig(out_dir / f"figure1_brier_ratio{source_suffix}.png", dpi=240)
+        plt.close()
 
 
 def _plot_demography(out_dir: Path, split_gens: int) -> None:
@@ -702,27 +708,31 @@ def _plot_prs_grid(prs_rows: list[dict[str, object]], out_dir: Path) -> None:
         ax.fill_between(grid, 0.0, dens, color=color, alpha=0.22)
 
     df = pd.DataFrame(prs_rows)
-    gens = sorted(df["gens"].unique())
-    ncols = 4
-    nrows = int(math.ceil(len(gens) / ncols))
-    fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 3 * nrows), squeeze=False)
-    for i, g in enumerate(gens):
-        ax = axes[i // ncols][i % ncols]
-        sub = df[df["gens"] == g]
-        for pop, color in [("OOA_test", CB["blue"]), ("AFR_test", CB["orange"])]:
-            x = sub.loc[sub["group"] == pop, "prs"].to_numpy(dtype=float)
-            if x.size:
-                _draw_kde(ax, x, color=color, label=pop)
-        ax.text(0.03, 0.95, f"g={g}", transform=ax.transAxes, ha="left", va="top", fontsize=8.5)
-        _style_axes(ax)
-    for j in range(len(gens), nrows * ncols):
-        axes[j // ncols][j % ncols].axis("off")
-    axes[0][0].legend(frameon=False, ncol=2, loc="upper right")
-    fig.supxlabel("PRS", y=0.02)
-    fig.supylabel("Density", x=0.01)
-    fig.tight_layout()
-    fig.savefig(out_dir / "figure1_prs_distributions_grid.png", dpi=240)
-    plt.close(fig)
+    prs_sources = sorted(df["prs_source"].unique()) if "prs_source" in df.columns else ["estimated"]
+    for prs_source in prs_sources:
+        sub_df = df[df["prs_source"] == prs_source] if "prs_source" in df.columns else df
+        gens = sorted(sub_df["gens"].unique())
+        ncols = 4
+        nrows = int(math.ceil(len(gens) / ncols))
+        fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 3 * nrows), squeeze=False)
+        for i, g in enumerate(gens):
+            ax = axes[i // ncols][i % ncols]
+            gsub = sub_df[sub_df["gens"] == g]
+            for pop, color in [("OOA_test", CB["blue"]), ("AFR_test", CB["orange"])]:
+                x = gsub.loc[gsub["group"] == pop, "prs"].to_numpy(dtype=float)
+                if x.size:
+                    _draw_kde(ax, x, color=color, label=pop)
+            ax.text(0.03, 0.95, f"g={g}", transform=ax.transAxes, ha="left", va="top", fontsize=8.5)
+            _style_axes(ax)
+        for j in range(len(gens), nrows * ncols):
+            axes[j // ncols][j % ncols].axis("off")
+        axes[0][0].legend(frameon=False, ncol=2, loc="upper right")
+        fig.supxlabel(f"PRS ({prs_source})", y=0.02)
+        fig.supylabel("Density", x=0.01)
+        fig.tight_layout()
+        suffix = "" if prs_source == "estimated" else f"_{prs_source}"
+        fig.savefig(out_dir / f"figure1_prs_distributions_grid{suffix}.png", dpi=240)
+        plt.close(fig)
 
 
 def _plot_pc_grid(pc_rows: list[dict[str, object]], out_dir: Path) -> None:
@@ -986,71 +996,107 @@ def _run_generation_task(task: dict[str, object]) -> dict[str, object]:
         context=f"fig1_g{g}_s{seed} test",
     )
 
-    pred = _fit_and_predict_methods(
-        cal_df,
-        test_df,
-        cal_scores["PRS"].to_numpy(dtype=float),
-        test_scores["PRS"].to_numpy(dtype=float),
-    )
-    _log(f"[fig1_g{g}_s{seed}] Method fitting/prediction complete")
-    test_prs = test_scores["PRS"].to_numpy(dtype=float)
-
     result_rows = []
-    for method, y_prob in pred.items():
+    prs_sources = {
+        "estimated": {
+            "train": train_scores["PRS"].to_numpy(dtype=float),
+            "pred": pred_scores["PRS"].to_numpy(dtype=float),
+            "cal": cal_scores["PRS"].to_numpy(dtype=float),
+            "test": test_scores["PRS"].to_numpy(dtype=float),
+        },
+        "oracle": {
+            "train": train_df["G_true"].to_numpy(dtype=float),
+            "pred": pred_df["G_true"].to_numpy(dtype=float),
+            "cal": cal_df["G_true"].to_numpy(dtype=float),
+            "test": test_df["G_true"].to_numpy(dtype=float),
+        },
+    }
+
+    predictions_by_source: dict[str, dict[str, np.ndarray]] = {}
+    prs_parts: list[pd.DataFrame] = []
+    for prs_source, prs_vals in prs_sources.items():
+        _assert_noncollapsed_prs(
+            train_df["group"].to_numpy(),
+            prs_vals["train"],
+            context=f"fig1_g{g}_s{seed} train ({prs_source})",
+        )
+        _assert_noncollapsed_prs(
+            pred_df["group"].to_numpy(),
+            prs_vals["pred"],
+            context=f"fig1_g{g}_s{seed} pred ({prs_source})",
+        )
+        _assert_noncollapsed_prs(
+            cal_df["group"].to_numpy(),
+            prs_vals["cal"],
+            context=f"fig1_g{g}_s{seed} cal ({prs_source})",
+        )
+        _assert_noncollapsed_prs(
+            test_df["group"].to_numpy(),
+            prs_vals["test"],
+            context=f"fig1_g{g}_s{seed} test ({prs_source})",
+        )
+        pred = _fit_and_predict_methods(cal_df, test_df, prs_vals["cal"], prs_vals["test"])
+        predictions_by_source[prs_source] = pred
+        _log(f"[fig1_g{g}_s{seed}] Method fitting/prediction complete (prs_source={prs_source})")
+
         o = test_df["group"] == "OOA_test"
         a = test_df["group"] == "AFR_test"
-        auc_o = _auc(test_df.loc[o, "y"].to_numpy(), y_prob[o.to_numpy()])
-        auc_a = _auc(test_df.loc[a, "y"].to_numpy(), y_prob[a.to_numpy()])
-        auc_ratio = float(auc_o / auc_a) if np.isfinite(auc_o) and np.isfinite(auc_a) and auc_a > 0 else np.nan
-        brier_o = _brier(test_df.loc[o, "y"].to_numpy(), y_prob[o.to_numpy()])
-        brier_a = _brier(test_df.loc[a, "y"].to_numpy(), y_prob[a.to_numpy()])
-        brier_ratio = float(brier_o / brier_a) if np.isfinite(brier_o) and np.isfinite(brier_a) and brier_a > 0 else np.nan
-        _log(
-            f"[fig1_g{g}_s{seed}] method={method} "
-            f"auc_ooa={auc_o:.4f} auc_afr={auc_a:.4f} auc_ratio={auc_ratio:.4f} "
-            f"brier_ooa={brier_o:.4f} brier_afr={brier_a:.4f} brier_ratio={brier_ratio:.4f}"
-        )
-        result_rows.append(
-            {
-                "gens": int(g),
-                "seed": int(seed),
-                "method": method,
-                "n_train_prs": int(len(train_df)),
-                "n_calibration": int(len(cal_df)),
-                "n_test_total": int(len(test_df)),
-                "n_test_ooa": int(np.count_nonzero(o.to_numpy())),
-                "n_test_afr": int(np.count_nonzero(a.to_numpy())),
-                "auc_ooa": auc_o,
-                "auc_afr": auc_a,
-                "auc_ratio": auc_ratio,
-                "brier_ooa": brier_o,
-                "brier_afr": brier_a,
-                "brier_ratio": brier_ratio,
-            }
-        )
+        for method, y_prob in pred.items():
+            auc_o = _auc(test_df.loc[o, "y"].to_numpy(), y_prob[o.to_numpy()])
+            auc_a = _auc(test_df.loc[a, "y"].to_numpy(), y_prob[a.to_numpy()])
+            auc_ratio = float(auc_o / auc_a) if np.isfinite(auc_o) and np.isfinite(auc_a) and auc_a > 0 else np.nan
+            brier_o = _brier(test_df.loc[o, "y"].to_numpy(), y_prob[o.to_numpy()])
+            brier_a = _brier(test_df.loc[a, "y"].to_numpy(), y_prob[a.to_numpy()])
+            brier_ratio = float(brier_o / brier_a) if np.isfinite(brier_o) and np.isfinite(brier_a) and brier_a > 0 else np.nan
+            _log(
+                f"[fig1_g{g}_s{seed}] prs_source={prs_source} method={method} "
+                f"auc_ooa={auc_o:.4f} auc_afr={auc_a:.4f} auc_ratio={auc_ratio:.4f} "
+                f"brier_ooa={brier_o:.4f} brier_afr={brier_a:.4f} brier_ratio={brier_ratio:.4f}"
+            )
+            result_rows.append(
+                {
+                    "gens": int(g),
+                    "seed": int(seed),
+                    "prs_source": prs_source,
+                    "method": method,
+                    "n_train_prs": int(len(train_df)),
+                    "n_calibration": int(len(cal_df)),
+                    "n_test_total": int(len(test_df)),
+                    "n_test_ooa": int(np.count_nonzero(o.to_numpy())),
+                    "n_test_afr": int(np.count_nonzero(a.to_numpy())),
+                    "auc_ooa": auc_o,
+                    "auc_afr": auc_a,
+                    "auc_ratio": auc_ratio,
+                    "brier_ooa": brier_o,
+                    "brier_afr": brier_a,
+                    "brier_ratio": brier_ratio,
+                }
+            )
 
-    prs_df = test_df[["IID", "group"]].copy()
-    prs_df["IID"] = prs_df["IID"].astype(str)
-    prs_df = prs_df.merge(
-        test_scores[["IID", "PRS"]].assign(IID=test_scores["IID"].astype(str)),
-        on="IID",
-        how="left",
-    )
-    prs_df.insert(0, "gens", int(g))
-    prs_df = prs_df.rename(columns={"PRS": "prs"})
+        part = test_df[["IID", "group"]].copy()
+        part["IID"] = part["IID"].astype(str)
+        part.insert(0, "gens", int(g))
+        part["prs_source"] = prs_source
+        part["prs"] = prs_vals["test"]
+        prs_parts.append(part)
+
+    prs_df = pd.concat(prs_parts, ignore_index=True)
 
     pc_df = df[["group", "pc1", "pc2"]].copy()
     pc_df.insert(0, "gens", int(g))
 
     pred_rows = []
-    for method, y_prob in pred.items():
-        part = test_df[["IID", "group", "pop_label", "y", "G_true", "pc1", "pc2", "pc3", "pc4", "pc5"]].copy()
-        part.insert(0, "seed", int(seed))
-        part.insert(0, "gens", int(g))
-        part["method"] = method
-        part["prs"] = test_prs
-        part["y_prob"] = np.asarray(y_prob, dtype=float)
-        pred_rows.append(part)
+    for prs_source, pred in predictions_by_source.items():
+        test_prs = prs_sources[prs_source]["test"]
+        for method, y_prob in pred.items():
+            part = test_df[["IID", "group", "pop_label", "y", "G_true", "pc1", "pc2", "pc3", "pc4", "pc5"]].copy()
+            part.insert(0, "seed", int(seed))
+            part.insert(0, "gens", int(g))
+            part["prs_source"] = prs_source
+            part["method"] = method
+            part["prs"] = test_prs
+            part["y_prob"] = np.asarray(y_prob, dtype=float)
+            pred_rows.append(part)
     pred_df = pd.concat(pred_rows, ignore_index=True)
 
     res_path = out_dir / f"fig1_g{g}_s{seed}.results.tsv"
@@ -1177,7 +1223,7 @@ def main() -> None:
             _log(f"Completed generation g={rec['gens']} seed={rec['seed']}")
 
     done = sorted(done, key=lambda x: int(x["gens"]))
-    res_df = pd.concat([pd.read_csv(str(r["res_path"]), sep="\t") for r in done], ignore_index=True).sort_values(["method", "gens"])
+    res_df = pd.concat([pd.read_csv(str(r["res_path"]), sep="\t") for r in done], ignore_index=True).sort_values(["prs_source", "method", "gens"])
     prs_df = pd.concat([pd.read_csv(str(r["prs_path"]), sep="\t") for r in done], ignore_index=True)
     pc_df = pd.concat([pd.read_csv(str(r["pc_path"]), sep="\t") for r in done], ignore_index=True)
     pred_df = pd.concat([pd.read_csv(str(r["pred_path"]), sep="\t") for r in done], ignore_index=True)
@@ -1212,7 +1258,7 @@ def main() -> None:
         fig.savefig(out_dir / "figure1_pt_train_accuracy_by_generation.png", dpi=240)
         plt.close(fig)
     detailed = (
-        pred_df.groupby(["gens", "method", "group"], as_index=False)
+        pred_df.groupby(["gens", "prs_source", "method", "group"], as_index=False)
         .agg(
             n=("y", "size"),
             prevalence=("y", "mean"),
@@ -1221,17 +1267,17 @@ def main() -> None:
             mean_g_true=("G_true", "mean"),
             mean_y_prob=("y_prob", "mean"),
         )
-        .sort_values(["gens", "method", "group"])
+        .sort_values(["gens", "prs_source", "method", "group"])
     )
     detailed.to_csv(out_dir / "figure1_detailed_metrics.tsv", sep="\t", index=False)
     _log("Figure1 wrote aggregated results table")
     _log_results_table(
         "[fig1] AUC/Brier ratio results (gens/method)",
-        res_df.sort_values(["gens", "method"]).reset_index(drop=True),
+        res_df.sort_values(["gens", "prs_source", "method"]).reset_index(drop=True),
     )
     _log_results_table(
         "[fig1] Detailed grouped stats",
-        detailed.sort_values(["gens", "method", "group"]).reset_index(drop=True),
+        detailed.sort_values(["gens", "prs_source", "method", "group"]).reset_index(drop=True),
     )
 
     _log("Figure1 plotting outputs")

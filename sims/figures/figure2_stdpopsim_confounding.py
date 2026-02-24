@@ -1230,67 +1230,71 @@ def _assert_noncollapsed_prs(labels: np.ndarray, prs: np.ndarray, context: str) 
 
 def _plot_main(df: pd.DataFrame, out_dir: Path) -> None:
     _apply_plot_style()
-    methods = [m for m in ["raw", "normalized", "linear", "pspline", "thinplate"] if m in set(df["method"])]
+    prs_sources = sorted(df["prs_source"].unique()) if "prs_source" in df.columns else ["estimated"]
     pops = ["EUR", "AFR", "ASIA", "ADMIX"]
     pop_colors = {"EUR": CB["blue"], "AFR": CB["orange"], "ASIA": CB["green"], "ADMIX": CB["purple"]}
 
-    x = np.arange(len(methods))
-    width = 0.18
+    for prs_source in prs_sources:
+        sub_df = df[df["prs_source"] == prs_source] if "prs_source" in df.columns else df
+        methods = [m for m in ["raw", "normalized", "linear", "pspline", "thinplate"] if m in set(sub_df["method"])]
+        x = np.arange(len(methods))
+        width = 0.18
+        source_suffix = "" if prs_source == "estimated" else f"_{prs_source}"
 
-    fig, ax = plt.subplots(figsize=(10, 6))
-    for i, pop in enumerate(pops):
-        vals = []
-        for m in methods:
-            sub = df[(df["method"] == m) & (df["population"] == pop)]
-            vals.append(float(sub["auc"].iloc[0]) if len(sub) else np.nan)
-        ax.bar(
-            x + (i - 1.5) * width,
-            vals,
-            width=width,
-            label=pop,
-            color=pop_colors[pop],
-            edgecolor="#222222",
-            linewidth=0.5,
-        )
+        fig, ax = plt.subplots(figsize=(10, 6))
+        for i, pop in enumerate(pops):
+            vals = []
+            for m in methods:
+                sub = sub_df[(sub_df["method"] == m) & (sub_df["population"] == pop)]
+                vals.append(float(sub["auc"].iloc[0]) if len(sub) else np.nan)
+            ax.bar(
+                x + (i - 1.5) * width,
+                vals,
+                width=width,
+                label=pop,
+                color=pop_colors[pop],
+                edgecolor="#222222",
+                linewidth=0.5,
+            )
 
-    ax.set_xticks(x)
-    ax.set_xticklabels(methods)
-    ax.set_ylabel("AUC")
-    ax.set_ylim(0.0, 1.0)
-    ax.legend(frameon=False)
-    _style_axes(ax, y_grid=True)
-    fig.tight_layout()
-    fig.savefig(out_dir / "figure2_auc_by_method_population.png", dpi=240)
-    plt.close(fig)
+        ax.set_xticks(x)
+        ax.set_xticklabels(methods)
+        ax.set_ylabel(f"AUC ({prs_source} PRS)")
+        ax.set_ylim(0.0, 1.0)
+        ax.legend(frameon=False)
+        _style_axes(ax, y_grid=True)
+        fig.tight_layout()
+        fig.savefig(out_dir / f"figure2_auc_by_method_population{source_suffix}.png", dpi=240)
+        plt.close(fig)
 
-    fig, ax = plt.subplots(figsize=(10, 6))
-    for i, pop in enumerate(pops):
-        vals = []
-        for m in methods:
-            sub = df[(df["method"] == m) & (df["population"] == pop)]
-            vals.append(float(sub["brier"].iloc[0]) if len(sub) else np.nan)
-        ax.bar(
-            x + (i - 1.5) * width,
-            vals,
-            width=width,
-            label=pop,
-            color=pop_colors[pop],
-            edgecolor="#222222",
-            linewidth=0.5,
-        )
+        fig, ax = plt.subplots(figsize=(10, 6))
+        for i, pop in enumerate(pops):
+            vals = []
+            for m in methods:
+                sub = sub_df[(sub_df["method"] == m) & (sub_df["population"] == pop)]
+                vals.append(float(sub["brier"].iloc[0]) if len(sub) else np.nan)
+            ax.bar(
+                x + (i - 1.5) * width,
+                vals,
+                width=width,
+                label=pop,
+                color=pop_colors[pop],
+                edgecolor="#222222",
+                linewidth=0.5,
+            )
 
-    ax.set_xticks(x)
-    ax.set_xticklabels(methods)
-    ax.set_ylabel("Brier score")
-    ax.set_ylim(0.0, 1.0)
-    ax.legend(frameon=False)
-    _style_axes(ax, y_grid=True)
-    fig.tight_layout()
-    fig.savefig(out_dir / "figure2_brier_by_method_population.png", dpi=240)
-    plt.close(fig)
+        ax.set_xticks(x)
+        ax.set_xticklabels(methods)
+        ax.set_ylabel(f"Brier score ({prs_source} PRS)")
+        ax.set_ylim(0.0, 1.0)
+        ax.legend(frameon=False)
+        _style_axes(ax, y_grid=True)
+        fig.tight_layout()
+        fig.savefig(out_dir / f"figure2_brier_by_method_population{source_suffix}.png", dpi=240)
+        plt.close(fig)
 
 
-def _plot_prs_distribution(test_df: pd.DataFrame, prs: np.ndarray, out_dir: Path) -> None:
+def _plot_prs_distribution(test_df: pd.DataFrame, prs: np.ndarray, out_dir: Path, prs_source: str = "estimated") -> None:
     _apply_plot_style()
     def _draw_kde(ax, x: np.ndarray, color: str, label: str) -> None:
         x = np.asarray(x, dtype=float)
@@ -1315,12 +1319,13 @@ def _plot_prs_distribution(test_df: pd.DataFrame, prs: np.ndarray, out_dir: Path
         x = prs[mask.to_numpy()]
         if x.size:
             _draw_kde(ax, x, color=color, label=pop)
-    ax.set_xlabel("PRS")
+    ax.set_xlabel(f"PRS ({prs_source})")
     ax.set_ylabel("Density")
     ax.legend(frameon=False)
     _style_axes(ax, y_grid=False)
     fig.tight_layout()
-    fig.savefig(out_dir / "figure2_prs_distributions.png", dpi=240)
+    suffix = "" if prs_source == "estimated" else f"_{prs_source}"
+    fig.savefig(out_dir / f"figure2_prs_distributions{suffix}.png", dpi=240)
     plt.close(fig)
 
 
@@ -1603,46 +1608,73 @@ def main() -> None:
         context=f"fig2_s{seed} test",
     )
 
-    preds = _method_preds(
-        cal_df,
-        test_df,
-        cal_scores["PRS"].to_numpy(dtype=float),
-        test_scores["PRS"].to_numpy(dtype=float),
-    )
-    _log(f"[fig2_s{seed}] Method fitting/prediction complete")
-
     rows = []
-    test_prs = test_scores["PRS"].to_numpy(dtype=float)
-    for method, y_prob in preds.items():
-        for pop in ["EUR", "AFR", "ASIA", "ADMIX"]:
-            mask = test_df["pop_label"] == pop
-            y_pop = test_df.loc[mask, "y"].to_numpy()
-            p_pop = np.asarray(y_prob, dtype=float)[mask.to_numpy()]
-            prs_pop = test_prs[mask.to_numpy()]
-            g_pop = test_df.loc[mask, "G_true"].to_numpy(dtype=float)
-            auc_pop = _auc(y_pop, p_pop)
-            brier_pop = _brier(y_pop, p_pop)
-            _log(
-                f"[fig2_s{seed}] method={method} pop={pop} n={int(mask.sum())} "
-                f"auc={auc_pop:.4f} brier={brier_pop:.4f}"
-            )
-            rows.append(
-                {
-                    "method": method,
-                    "population": pop,
-                    "n_train_prs": int(len(train_df)),
-                    "n_calibration": int(len(cal_df)),
-                    "n_test_total": int(len(test_df)),
-                    "n": int(mask.sum()),
-                    "prevalence": float(np.mean(y_pop)) if y_pop.size > 0 else np.nan,
-                    "auc": auc_pop,
-                    "brier": brier_pop,
-                    "mean_prs": float(np.mean(prs_pop)) if prs_pop.size > 0 else np.nan,
-                    "sd_prs": float(np.std(prs_pop, ddof=1)) if prs_pop.size > 1 else np.nan,
-                    "mean_g_true": float(np.mean(g_pop)) if g_pop.size > 0 else np.nan,
-                    "mean_y_prob": float(np.mean(p_pop)) if p_pop.size > 0 else np.nan,
-                }
-            )
+    prs_sources = {
+        "estimated": {
+            "train": train_scores["PRS"].to_numpy(dtype=float),
+            "test": test_scores["PRS"].to_numpy(dtype=float),
+            "cal": cal_scores["PRS"].to_numpy(dtype=float),
+        },
+        "oracle": {
+            "train": train_df["G_true"].to_numpy(dtype=float),
+            "test": test_df["G_true"].to_numpy(dtype=float),
+            "cal": cal_df["G_true"].to_numpy(dtype=float),
+        },
+    }
+
+    preds_by_source: dict[str, dict[str, np.ndarray]] = {}
+    for prs_source, prs_vals in prs_sources.items():
+        _assert_noncollapsed_prs(
+            train_df["pop_label"].to_numpy(),
+            prs_vals["train"],
+            context=f"fig2_s{seed} train ({prs_source})",
+        )
+        _assert_noncollapsed_prs(
+            test_df["pop_label"].to_numpy(),
+            prs_vals["test"],
+            context=f"fig2_s{seed} pred ({prs_source})",
+        )
+        _assert_noncollapsed_prs(
+            cal_df["pop_label"].to_numpy(),
+            prs_vals["cal"],
+            context=f"fig2_s{seed} cal ({prs_source})",
+        )
+        preds = _method_preds(cal_df, test_df, prs_vals["cal"], prs_vals["test"])
+        preds_by_source[prs_source] = preds
+        _log(f"[fig2_s{seed}] Method fitting/prediction complete (prs_source={prs_source})")
+
+        test_prs = prs_vals["test"]
+        for method, y_prob in preds.items():
+            for pop in ["EUR", "AFR", "ASIA", "ADMIX"]:
+                mask = test_df["pop_label"] == pop
+                y_pop = test_df.loc[mask, "y"].to_numpy()
+                p_pop = np.asarray(y_prob, dtype=float)[mask.to_numpy()]
+                prs_pop = test_prs[mask.to_numpy()]
+                g_pop = test_df.loc[mask, "G_true"].to_numpy(dtype=float)
+                auc_pop = _auc(y_pop, p_pop)
+                brier_pop = _brier(y_pop, p_pop)
+                _log(
+                    f"[fig2_s{seed}] prs_source={prs_source} method={method} pop={pop} n={int(mask.sum())} "
+                    f"auc={auc_pop:.4f} brier={brier_pop:.4f}"
+                )
+                rows.append(
+                    {
+                        "prs_source": prs_source,
+                        "method": method,
+                        "population": pop,
+                        "n_train_prs": int(len(train_df)),
+                        "n_calibration": int(len(cal_df)),
+                        "n_test_total": int(len(test_df)),
+                        "n": int(mask.sum()),
+                        "prevalence": float(np.mean(y_pop)) if y_pop.size > 0 else np.nan,
+                        "auc": auc_pop,
+                        "brier": brier_pop,
+                        "mean_prs": float(np.mean(prs_pop)) if prs_pop.size > 0 else np.nan,
+                        "sd_prs": float(np.std(prs_pop, ddof=1)) if prs_pop.size > 1 else np.nan,
+                        "mean_g_true": float(np.mean(g_pop)) if g_pop.size > 0 else np.nan,
+                        "mean_y_prob": float(np.mean(p_pop)) if p_pop.size > 0 else np.nan,
+                    }
+                )
 
     out_dir.mkdir(parents=True, exist_ok=True)
     res = pd.DataFrame(rows)
@@ -1652,32 +1684,35 @@ def main() -> None:
     _log("[fig2] Wrote figure2_auc_brier_by_method_population.tsv")
     _log_results_table(
         "[fig2] AUC/Brier/statistics by method and population",
-        res.sort_values(["method", "population"]).reset_index(drop=True),
+        res.sort_values(["prs_source", "method", "population"]).reset_index(drop=True),
     )
     pred_rows = []
-    for method, y_prob in preds.items():
-        part = test_df[
-            [
-                "IID",
-                "group",
-                "pop_label",
-                "y",
-                "G_true",
-                "afr_prop",
-                "eur_prop",
-                "asia_prop",
-                "pc1",
-                "pc2",
-                "pc3",
-                "pc4",
-                "pc5",
-                "seed",
-            ]
-        ].copy()
-        part["method"] = method
-        part["prs"] = test_prs
-        part["y_prob"] = np.asarray(y_prob, dtype=float)
-        pred_rows.append(part)
+    for prs_source, preds in preds_by_source.items():
+        test_prs = prs_sources[prs_source]["test"]
+        for method, y_prob in preds.items():
+            part = test_df[
+                [
+                    "IID",
+                    "group",
+                    "pop_label",
+                    "y",
+                    "G_true",
+                    "afr_prop",
+                    "eur_prop",
+                    "asia_prop",
+                    "pc1",
+                    "pc2",
+                    "pc3",
+                    "pc4",
+                    "pc5",
+                    "seed",
+                ]
+            ].copy()
+            part["prs_source"] = prs_source
+            part["method"] = method
+            part["prs"] = test_prs
+            part["y_prob"] = np.asarray(y_prob, dtype=float)
+            pred_rows.append(part)
     pred_df = pd.concat(pred_rows, ignore_index=True)
     out_dir.mkdir(parents=True, exist_ok=True)
     pred_df.to_csv(out_dir / "figure2_test_predictions.tsv", sep="\t", index=False)
@@ -1685,7 +1720,8 @@ def main() -> None:
 
     _log("[fig2] Plotting outputs")
     _plot_main(res, out_dir)
-    _plot_prs_distribution(test_df, test_scores["PRS"].to_numpy(dtype=float), out_dir)
+    for prs_source, prs_vals in prs_sources.items():
+        _plot_prs_distribution(test_df, prs_vals["test"], out_dir, prs_source=prs_source)
     _plot_pcs(df, out_dir)
 
     if not args.keep_intermediates and not args.use_existing:
