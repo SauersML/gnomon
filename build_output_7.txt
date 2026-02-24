@@ -1,0 +1,1359 @@
+Try this:
+  ring_nf
+
+  The `ring` tactic failed to close the goal. Use `ring_nf` to obtain a normal form.
+
+  Note that `ring` works primarily in *commutative* rings. If you have a noncommutative ring, abelian group or module, consider using `noncomm_ring`, `abel` or `module` instead.
+Try this:
+  ring_nf
+
+  The `ring` tactic failed to close the goal. Use `ring_nf` to obtain a normal form.
+
+  Note that `ring` works primarily in *commutative* rings. If you have a noncommutative ring, abelian group or module, consider using `noncomm_ring`, `abel` or `module` instead.
+proofs/Calibrator.lean:91:21: warning: This simp argument is unused:
+  mul_comm
+
+Hint: Omit it from the simp argument list.
+  simp_all +decide [̵ ̵m̵u̵l̵_̵c̵o̵m̵m̵,̵ ̵P̵r̵o̵b̵a̵b̵i̵l̵i̵t̵y̵T̵h̵e̵o̵r̵y̵.̵g̵a̵u̵s̵s̵i̵a̵n̵R̵e̵a̵l̵ ̵]̵[̲P̲r̲o̲b̲a̲b̲i̲l̲i̲t̲y̲T̲h̲e̲o̲r̲y̲.̲g̲a̲u̲s̲s̲i̲a̲n̲R̲e̲a̲l̲]̲
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:125:8: warning: `MeasureTheory.Integrable.prod_mul` has been deprecated: Use `MeasureTheory.Integrable.mul_prod` instead
+proofs/Calibrator.lean:431:2: warning: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+proofs/Calibrator.lean:437:4: warning: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+proofs/Calibrator.lean:475:18: warning: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+proofs/Calibrator.lean:481:22: warning: This simp argument is unused:
+  gaussian_mean_zero
+
+Hint: Omit it from the simp argument list.
+  simp [g̵a̵u̵s̵s̵i̵a̵n̵_̵m̵e̵a̵n̵_̵z̵e̵r̵o̵,̵ ̵hC0]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:633:33: warning: This simp argument is unused:
+  zero_mul
+
+Hint: Omit it from the simp argument list.
+  simp only [mul_zero, add_zero, z̵e̵r̵o̵_̵m̵u̵l̵,̵ ̵mul_one] at h0 h1
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:896:5: warning: unused variable `h_pi_bar`
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+proofs/Calibrator.lean:1468:29: warning: This simp argument is unused:
+  ha_def
+
+Hint: Omit it from the simp argument list.
+  simp only [model', ha̵_̵d̵e̵f̵,̵ ̵h̵b_def] at h
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:1468:37: warning: This simp argument is unused:
+  hb_def
+
+Hint: Omit it from the simp argument list.
+  simp only [model', ha_def,̵ ̵h̵b̵_̵d̵e̵f̵] at h
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:1469:32: warning: 'ring' tactic does nothing
+
+Note: This linter can be disabled with `set_option linter.unusedTactic false`
+proofs/Calibrator.lean:1469:32: warning: this tactic is never executed
+
+Note: This linter can be disabled with `set_option linter.unreachableTactic false`
+proofs/Calibrator.lean:1681:4: warning: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+proofs/Calibrator.lean:1735:8: warning: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+proofs/Calibrator.lean:1737:8: warning: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+proofs/Calibrator.lean:1741:8: warning: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+proofs/Calibrator.lean:1743:8: warning: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+proofs/Calibrator.lean:1750:8: warning: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+proofs/Calibrator.lean:1752:8: warning: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+proofs/Calibrator.lean:1756:8: warning: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+proofs/Calibrator.lean:1758:8: warning: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+proofs/Calibrator.lean:1859:5: warning: unused variable `hC_int`
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+proofs/Calibrator.lean:2043:34: warning: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+proofs/Calibrator.lean:2046:34: warning: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+proofs/Calibrator.lean:2087:28: warning: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+proofs/Calibrator.lean:2092:35: warning: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+proofs/Calibrator.lean:2080:66: warning: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+proofs/Calibrator.lean:2083:44: warning: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+proofs/Calibrator.lean:2099:30: warning: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+proofs/Calibrator.lean:2104:30: warning: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+proofs/Calibrator.lean:2115:68: warning: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+proofs/Calibrator.lean:2118:46: warning: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+proofs/Calibrator.lean:2137:30: warning: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+proofs/Calibrator.lean:2141:31: warning: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+proofs/Calibrator.lean:2148:32: warning: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+proofs/Calibrator.lean:2152:32: warning: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+proofs/Calibrator.lean:2160:32: warning: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+proofs/Calibrator.lean:2166:30: warning: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+proofs/Calibrator.lean:2171:32: warning: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+proofs/Calibrator.lean:2176:33: warning: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+proofs/Calibrator.lean:2182:37: warning: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+proofs/Calibrator.lean:2188:30: warning: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+proofs/Calibrator.lean:2193:37: warning: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+proofs/Calibrator.lean:2123:56: warning: This simp argument is unused:
+  mul_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [g, ParamIx.equivSum, mul_assoc, m̵u̵l̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵mul_comm]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:2195:79: warning: This simp argument is unused:
+  Finset.sum_mul
+
+Hint: Omit it from the simp argument list.
+  simp [linearPredictor, evalSmooth, Finset.sum_add_distrib, Finset.mul_sum, F̵i̵n̵s̵e̵t̵.̵s̵u̵m̵_̵m̵u̵l̵,̵add_mul, mul_add,
+  ̲  ̲ ̲ ̲ ̲ ̲mul_comm, mul_left_comm, mul_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:2196:6: warning: This simp argument is unused:
+  add_mul
+
+Hint: Omit it from the simp argument list.
+  simp [linearPredictor, evalSmooth, Finset.sum_add_distrib, Finset.mul_sum, Finset.sum_mul,
+        a̵d̵d̵_̵mul,̵ ̵m̵u̵l̵_add, mul_comm, mul_left_comm, mul_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:2196:34: warning: This simp argument is unused:
+  mul_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [linearPredictor, evalSmooth, Finset.sum_add_distrib, Finset.mul_sum, Finset.sum_mul,
+        add_mul, mul_add, mul_comm, mul_l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵m̵u̵l̵_̵assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:2196:49: warning: This simp argument is unused:
+  mul_assoc
+
+Hint: Omit it from the simp argument list.
+  simp [linearPredictor, evalSmooth, Finset.sum_add_distrib, Finset.mul_sum, Finset.sum_mul,
+        add_mul, mul_add, mul_comm, mul_left_comm,̵ ̵m̵u̵l̵_̵a̵s̵s̵o̵c̵]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:2197:29: warning: This simp argument is unused:
+  mul_comm
+
+Hint: Omit it from the simp argument list.
+  simp [hsum_pc, hsum_int, mul_c̵o̵m̵m̵,̵ ̵m̵u̵l_̵l̵eft_comm, mul_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:2197:39: warning: This simp argument is unused:
+  mul_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [hsum_pc, hsum_int, mul_comm, mul_l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵m̵u̵l̵_̵assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:2197:54: warning: This simp argument is unused:
+  mul_assoc
+
+Hint: Omit it from the simp argument list.
+  simp [hsum_pc, hsum_int, mul_comm, mul_left_comm,̵ ̵m̵u̵l̵_̵a̵s̵s̵o̵c̵]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:2362:4: warning: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+proofs/Calibrator.lean:2372:31: warning: Try `simp at this` instead of `simpa using this`
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+proofs/Calibrator.lean:2386:38: warning: This simp argument is unused:
+  norm_norm
+
+Hint: Omit it from the simp argument list.
+  simp [u, norm_smul, norm_inv, n̵o̵r̵m̵_̵n̵o̵r̵m̵,̵ ̵hnorm]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:2568:20: warning: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+proofs/Calibrator.lean:2570:20: warning: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+proofs/Calibrator.lean:2524:66: warning: This simp argument is unused:
+  Finset.sum_mul
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, F̵i̵n̵s̵e̵t̵.̵s̵u̵m̵_̵m̵u̵l̵,̵ ̵sub_eq_add_neg, add_comm,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲add_left_comm, add_assoc, mul_comm, mul_left_comm, mul_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:2525:22: warning: This simp argument is unused:
+  add_comm
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, Finset.sum_mul, sub_eq_add_neg,
+                        add_c̵o̵m̵m̵,̵ ̵a̵d̵d̵_̵left_comm, add_assoc, mul_comm, mul_left_comm, mul_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:2525:32: warning: This simp argument is unused:
+  add_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, Finset.sum_mul, sub_eq_add_neg,
+                        add_comm, add_l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵ad̵d̵_̵a̵ssoc, mul_comm, mul_left_comm, mul_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:2525:47: warning: This simp argument is unused:
+  add_assoc
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, Finset.sum_mul, sub_eq_add_neg,
+                        add_comm, add_left_comm, a̵d̵d̵_̵a̵s̵s̵o̵c̵,̵ ̵mul_comm, mul_left_comm, mul_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:2525:68: warning: This simp argument is unused:
+  mul_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, Finset.sum_mul, sub_eq_add_neg,
+                        add_comm, add_left_comm, add_assoc, mul_comm, mul_l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵m̵u̵l̵_̵assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:2525:83: warning: This simp argument is unused:
+  mul_assoc
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, Finset.sum_mul, sub_eq_add_neg,
+                        add_comm, add_left_comm, add_assoc, mul_comm, mul_left_comm,̵ ̵m̵u̵l̵_̵a̵s̵s̵o̵c̵]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:2535:14: warning: This simp argument is unused:
+  Finset.sum_ite_eq'
+
+Hint: Omit it from the simp argument list.
+  simp [S, Matrix.mulVec, dotProduct, Matrix.diagonal_apply, F̵i̵n̵s̵e̵t̵.̵s̵u̵m̵_̵i̵t̵e̵_̵e̵q̵'̵,̵ ̵Finset.sum_ite_eq, mul_comm,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲mul_left_comm, mul_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:2535:63: warning: This simp argument is unused:
+  mul_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [S, Matrix.mulVec, dotProduct, Matrix.diagonal_apply, Finset.sum_ite_eq',
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲Finset.sum_ite_eq, mul_comm, m̵u̵l̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵mul_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:2535:78: warning: This simp argument is unused:
+  mul_assoc
+
+Hint: Omit it from the simp argument list.
+  simp [S, Matrix.mulVec, dotProduct, Matrix.diagonal_apply, Finset.sum_ite_eq',
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲Finset.sum_ite_eq, mul_comm, m̵u̵l̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵m̵u̵l̵_̵a̵s̵s̵o̵c̵]̵m̲u̲l̲_̲l̲e̲f̲t̲_̲c̲o̲m̲m̲]̲
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:2536:46: warning: This simp argument is unused:
+  mul_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [hSi, s, mul_comm, mul_l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵m̵u̵l̵_̵assoc, mul_self_nonneg]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:2536:61: warning: This simp argument is unused:
+  mul_assoc
+
+Hint: Omit it from the simp argument list.
+  simp [hSi, s, mul_comm, mul_left_comm, mul_a̵ss̵o̵c̵,̵ ̵m̵u̵l̵_̵s̵elf_nonneg]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:2555:37: warning: This simp argument is unused:
+  mul_comm
+
+Hint: Omit it from the simp argument list.
+  simp [dotProduct, pow_two,̵ ̵m̵u̵l̵_̵c̵o̵m̵m̵]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:2559:28: warning: This simp argument is unused:
+  mul_comm
+
+Hint: Omit it from the simp argument list.
+  simp [dotProduct,̵ ̵m̵u̵l̵_̵c̵o̵m̵m̵]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:2728:20: warning: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+proofs/Calibrator.lean:2730:20: warning: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+proofs/Calibrator.lean:2685:66: warning: This simp argument is unused:
+  Finset.sum_mul
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, F̵i̵n̵s̵e̵t̵.̵s̵u̵m̵_̵m̵u̵l̵,̵ ̵sub_eq_add_neg, add_comm,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲add_left_comm, add_assoc, mul_comm, mul_left_comm, mul_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:2686:22: warning: This simp argument is unused:
+  add_comm
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, Finset.sum_mul, sub_eq_add_neg,
+                        add_c̵o̵m̵m̵,̵ ̵a̵d̵d̵_̵left_comm, add_assoc, mul_comm, mul_left_comm, mul_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:2686:32: warning: This simp argument is unused:
+  add_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, Finset.sum_mul, sub_eq_add_neg,
+                        add_comm, add_l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵ad̵d̵_̵a̵ssoc, mul_comm, mul_left_comm, mul_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:2686:47: warning: This simp argument is unused:
+  add_assoc
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, Finset.sum_mul, sub_eq_add_neg,
+                        add_comm, add_left_comm, a̵d̵d̵_̵a̵s̵s̵o̵c̵,̵ ̵mul_comm, mul_left_comm, mul_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:2686:68: warning: This simp argument is unused:
+  mul_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, Finset.sum_mul, sub_eq_add_neg,
+                        add_comm, add_left_comm, add_assoc, mul_comm, mul_l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵m̵u̵l̵_̵assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:2686:83: warning: This simp argument is unused:
+  mul_assoc
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, Finset.sum_mul, sub_eq_add_neg,
+                        add_comm, add_left_comm, add_assoc, mul_comm, mul_left_comm,̵ ̵m̵u̵l̵_̵a̵s̵s̵o̵c̵]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:2696:14: warning: This simp argument is unused:
+  Finset.sum_ite_eq'
+
+Hint: Omit it from the simp argument list.
+  simp [S, Matrix.mulVec, dotProduct, Matrix.diagonal_apply, F̵i̵n̵s̵e̵t̵.̵s̵u̵m̵_̵i̵t̵e̵_̵e̵q̵'̵,̵ ̵Finset.sum_ite_eq, mul_comm,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲mul_left_comm, mul_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:2696:63: warning: This simp argument is unused:
+  mul_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [S, Matrix.mulVec, dotProduct, Matrix.diagonal_apply, Finset.sum_ite_eq',
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲Finset.sum_ite_eq, mul_comm, m̵u̵l̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵mul_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:2696:78: warning: This simp argument is unused:
+  mul_assoc
+
+Hint: Omit it from the simp argument list.
+  simp [S, Matrix.mulVec, dotProduct, Matrix.diagonal_apply, Finset.sum_ite_eq',
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲Finset.sum_ite_eq, mul_comm, m̵u̵l̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵m̵u̵l̵_̵a̵s̵s̵o̵c̵]̵m̲u̲l̲_̲l̲e̲f̲t̲_̲c̲o̲m̲m̲]̲
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:2697:46: warning: This simp argument is unused:
+  mul_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [hSi, s, mul_comm, mul_l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵m̵u̵l̵_̵assoc, mul_self_nonneg]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:2697:61: warning: This simp argument is unused:
+  mul_assoc
+
+Hint: Omit it from the simp argument list.
+  simp [hSi, s, mul_comm, mul_left_comm, mul_a̵ss̵o̵c̵,̵ ̵m̵u̵l̵_̵s̵elf_nonneg]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:2715:37: warning: This simp argument is unused:
+  mul_comm
+
+Hint: Omit it from the simp argument list.
+  simp [dotProduct, pow_two,̵ ̵m̵u̵l̵_̵c̵o̵m̵m̵]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:2719:28: warning: This simp argument is unused:
+  mul_comm
+
+Hint: Omit it from the simp argument list.
+  simp [dotProduct,̵ ̵m̵u̵l̵_̵c̵o̵m̵m̵]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:2772:44: warning: This simp argument is unused:
+  Pi.sub_apply
+
+Hint: Omit it from the simp argument list.
+  simp [pointwiseNLL, hm.dist_gaussian, P̵i̵.̵s̵u̵b̵_̵a̵p̵p̵l̵y̵,̵ ̵h_lin, X]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:2777:8: warning: This simp argument is unused:
+  Finset.sum_ite_eq'
+
+Hint: Omit it from the simp argument list.
+  simp [S, Matrix.mulVec, dotProduct, Matrix.diagonal_apply, F̵i̵n̵s̵e̵t̵.̵s̵u̵m̵_̵i̵t̵e̵_̵e̵q̵'̵,̵ ̵Finset.sum_ite_eq, mul_comm,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲mul_left_comm, mul_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:2777:57: warning: This simp argument is unused:
+  mul_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [S, Matrix.mulVec, dotProduct, Matrix.diagonal_apply, Finset.sum_ite_eq',
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲Finset.sum_ite_eq, mul_comm, m̵u̵l̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵mul_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:2777:72: warning: This simp argument is unused:
+  mul_assoc
+
+Hint: Omit it from the simp argument list.
+  simp [S, Matrix.mulVec, dotProduct, Matrix.diagonal_apply, Finset.sum_ite_eq',
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲Finset.sum_ite_eq, mul_comm, m̵u̵l̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵m̵u̵l̵_̵a̵s̵s̵o̵c̵]̵m̲u̲l̲_̲l̲e̲f̲t̲_̲c̲o̲m̲m̲]̲
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:2788:41: warning: This simp argument is unused:
+  mul_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [h_diag, pow_two, mul_comm, mul_l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵m̵u̵l̵_̵assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:2838:52: warning: This simp argument is unused:
+  Finset.sum_add_distrib
+
+Hint: Omit it from the simp argument list.
+  simp [g, ParamIxSum, hsum_pc, hsum_int,̵ ̵F̵i̵n̵s̵e̵t̵.̵s̵u̵m̵_̵a̵d̵d̵_̵d̵i̵s̵t̵r̵i̵b̵]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:3035:73: warning: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+proofs/Calibrator.lean:3134:10: warning: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+proofs/Calibrator.lean:2991:54: warning: This simp argument is unused:
+  Finset.sum_mul
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, F̵i̵n̵s̵e̵t̵.̵s̵u̵m̵_̵m̵u̵l̵,̵ ̵sub_eq_add_neg, add_comm, add_left_comm,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲add_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:2992:10: warning: This simp argument is unused:
+  add_comm
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, Finset.sum_mul, sub_eq_add_neg, a̵d̵d̵_̵c̵o̵m̵m̵,̵ ̵add_left_comm,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲add_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:2992:20: warning: This simp argument is unused:
+  add_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, Finset.sum_mul, sub_eq_add_neg, add_comm,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲a̵d̵d̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵add_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:3068:62: warning: This simp argument is unused:
+  Finset.sum_mul
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, F̵i̵n̵s̵e̵t̵.̵s̵u̵m̵_̵m̵u̵l̵,̵ ̵sub_eq_add_neg, add_comm,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲add_left_comm, add_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:3069:18: warning: This simp argument is unused:
+  add_comm
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, Finset.sum_mul, sub_eq_add_neg,
+                    add_c̵o̵m̵m̵,̵ ̵a̵d̵d̵_̵left_comm, add_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:3069:28: warning: This simp argument is unused:
+  add_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, Finset.sum_mul, sub_eq_add_neg,
+                    add_comm, add_l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵ad̵d̵_̵a̵ssoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:3073:61: warning: This simp argument is unused:
+  Matrix.mulVec_sub
+
+Hint: Omit it from the simp argument list.
+  simp [Matrix.mulVec_add, Matrix.mulVec_smul, M̵a̵t̵r̵i̵x̵.̵m̵u̵l̵V̵e̵c̵_̵s̵u̵b̵,̵ ̵Matrix.mulVec_neg, Pi.add_apply,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲Pi.sub_apply, Pi.neg_apply, Pi.smul_apply, smul_eq_mul, mul_add, add_mul,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲sub_eq_add_neg, hb']
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:3078:38: warning: This simp argument is unused:
+  mul_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.mul_sum, m̵u̵l̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵mul_comm, mul_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:3248:15: warning: unused variable `hlam`
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+proofs/Calibrator.lean:3248:32: warning: unused variable `hS_posDef`
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+proofs/Calibrator.lean:3570:58: warning: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+proofs/Calibrator.lean:3571:57: warning: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+proofs/Calibrator.lean:3668:18: warning: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+proofs/Calibrator.lean:3649:64: warning: This simp argument is unused:
+  mul_add
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, m̵u̵l̵_̵a̵d̵d̵,̵ ̵add_mul, mul_assoc, mul_left_comm,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲mul_comm]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:3649:73: warning: This simp argument is unused:
+  add_mul
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, mul_add, a̵d̵d̵_̵m̵u̵l̵,̵ ̵mul_assoc, mul_left_comm,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲mul_comm]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:3649:82: warning: This simp argument is unused:
+  mul_assoc
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, mul_add, add_mul, m̵u̵l̵_̵a̵s̵s̵o̵c̵,̵ ̵mul_left_comm,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲mul_comm]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:3649:93: warning: This simp argument is unused:
+  mul_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, mul_add, add_mul, mul_assoc,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲m̵u̵l̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵mul_comm]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:3649:108: warning: This simp argument is unused:
+  mul_comm
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, mul_add, add_mul, mul_assoc,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲m̵u̵l̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵m̵u̵l̵_̵c̵o̵m̵m̵]̵m̲u̲l̲_̲l̲e̲f̲t̲_̲c̲o̲m̲m̲]̲
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:3702:64: warning: This simp argument is unused:
+  mul_add
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, m̵u̵l̵_̵a̵d̵d̵,̵ ̵add_mul, mul_assoc, mul_left_comm,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲mul_comm]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:3702:73: warning: This simp argument is unused:
+  add_mul
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, mul_add, a̵d̵d̵_̵m̵u̵l̵,̵ ̵mul_assoc, mul_left_comm,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲mul_comm]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:3702:82: warning: This simp argument is unused:
+  mul_assoc
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, mul_add, add_mul, m̵u̵l̵_̵a̵s̵s̵o̵c̵,̵ ̵mul_left_comm,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲mul_comm]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:3702:93: warning: This simp argument is unused:
+  mul_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, mul_add, add_mul, mul_assoc,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲m̵u̵l̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵mul_comm]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:3702:108: warning: This simp argument is unused:
+  mul_comm
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, mul_add, add_mul, mul_assoc,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲m̵u̵l̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵m̵u̵l̵_̵c̵o̵m̵m̵]̵m̲u̲l̲_̲l̲e̲f̲t̲_̲c̲o̲m̲m̲]̲
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:3724:10: warning: This simp argument is unused:
+  Finset.sum_ite_eq'
+
+Hint: Omit it from the simp argument list.
+  simp [S, Matrix.mulVec, dotProduct, Matrix.diagonal_apply, F̵i̵n̵s̵e̵t̵.̵s̵u̵m̵_̵i̵t̵e̵_̵e̵q̵'̵,̵ ̵Finset.sum_ite_eq, mul_comm,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲mul_left_comm, mul_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:3724:59: warning: This simp argument is unused:
+  mul_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [S, Matrix.mulVec, dotProduct, Matrix.diagonal_apply, Finset.sum_ite_eq',
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲Finset.sum_ite_eq, mul_comm, m̵u̵l̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵mul_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:3724:74: warning: This simp argument is unused:
+  mul_assoc
+
+Hint: Omit it from the simp argument list.
+  simp [S, Matrix.mulVec, dotProduct, Matrix.diagonal_apply, Finset.sum_ite_eq',
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲Finset.sum_ite_eq, mul_comm, m̵u̵l̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵m̵u̵l̵_̵a̵s̵s̵o̵c̵]̵m̲u̲l̲_̲l̲e̲f̲t̲_̲c̲o̲m̲m̲]̲
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:3725:33: warning: This simp argument is unused:
+  mul_comm
+
+Hint: Omit it from the simp argument list.
+  simp [s, hmul, mul_c̵o̵m̵m̵,̵ ̵m̵u̵l_̵l̵eft_comm, mul_assoc, mul_self_nonneg]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:3725:43: warning: This simp argument is unused:
+  mul_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [s, hmul, mul_comm, mul_l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵m̵u̵l̵_̵assoc, mul_self_nonneg]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:3725:58: warning: This simp argument is unused:
+  mul_assoc
+
+Hint: Omit it from the simp argument list.
+  simp [s, hmul, mul_comm, mul_left_comm, mul_a̵ss̵o̵c̵,̵ ̵m̵u̵l̵_̵s̵elf_nonneg]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:3748:10: warning: This simp argument is unused:
+  Finset.sum_ite_eq'
+
+Hint: Omit it from the simp argument list.
+  simp [S, Matrix.mulVec, dotProduct, Matrix.diagonal_apply, F̵i̵n̵s̵e̵t̵.̵s̵u̵m̵_̵i̵t̵e̵_̵e̵q̵'̵,̵ ̵Finset.sum_ite_eq, mul_comm,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲mul_left_comm, mul_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:3748:59: warning: This simp argument is unused:
+  mul_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [S, Matrix.mulVec, dotProduct, Matrix.diagonal_apply, Finset.sum_ite_eq',
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲Finset.sum_ite_eq, mul_comm, m̵u̵l̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵mul_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:3748:74: warning: This simp argument is unused:
+  mul_assoc
+
+Hint: Omit it from the simp argument list.
+  simp [S, Matrix.mulVec, dotProduct, Matrix.diagonal_apply, Finset.sum_ite_eq',
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲Finset.sum_ite_eq, mul_comm, m̵u̵l̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵m̵u̵l̵_̵a̵s̵s̵o̵c̵]̵m̲u̲l̲_̲l̲e̲f̲t̲_̲c̲o̲m̲m̲]̲
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:3759:43: warning: This simp argument is unused:
+  mul_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [h_diag, pow_two, mul_comm, mul_l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵m̵u̵l̵_̵assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:3808:50: warning: This simp argument is unused:
+  Finset.sum_add_distrib
+
+Hint: Omit it from the simp argument list.
+  simp [ParamIxSum, g, hsum_pc, hsum_int,̵ ̵F̵i̵n̵s̵e̵t̵.̵s̵u̵m̵_̵a̵d̵d̵_̵d̵i̵s̵t̵r̵i̵b̵]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:4154:5: warning: unused variable `hf_int`
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+proofs/Calibrator.lean:4239:10: warning: `MeasureTheory.Integrable.prod_mul` has been deprecated: Use `MeasureTheory.Integrable.mul_prod` instead
+proofs/Calibrator.lean:4239:4: error: Tactic `apply` failed: could not unify the conclusion of `Integrable.prod_mul (gaussian_moments_integrable 2)`
+  Integrable (fun z => z.1 ^ 2 * ?m.509 z.2) ((ProbabilityTheory.gaussianReal 0 1).prod ?m.505)
+with the goal
+  Integrable (fun pc => pc.1 ^ 2 * (scaling_func pc.2 - a) ^ 2) (μ0.prod ν0)
+
+Note: The full type of `Integrable.prod_mul (gaussian_moments_integrable 2)` is
+  Integrable ?m.509 ?m.505 →
+    Integrable (fun z => z.1 ^ 2 * ?m.509 z.2) ((ProbabilityTheory.gaussianReal 0 1).prod ?m.505)
+
+k : ℕ
+inst✝ : Fintype (Fin k)
+scaling_func : (Fin k → ℝ) → ℝ
+a : ℝ
+B : (Fin k → ℝ) → ℝ
+hS_sq : Integrable (fun c => scaling_func c ^ 2) (Measure.map Prod.snd (stdNormalProdMeasure k))
+hB_sq : Integrable (fun c => B c ^ 2) (Measure.map Prod.snd (stdNormalProdMeasure k))
+μ : Measure (ℝ × (Fin k → ℝ)) := stdNormalProdMeasure k
+μ0 : Measure ℝ := ProbabilityTheory.gaussianReal 0 1
+ν0 : Measure (Fin k → ℝ) := Measure.pi fun x => ProbabilityTheory.gaussianReal 0 1
+h_indep : μ = μ0.prod ν0
+h_map_snd : Measure.map Prod.snd μ = ν0
+hS_sq' : Integrable (fun c => scaling_func c ^ 2) ν0
+hB_sq' : Integrable (fun c => B c ^ 2) ν0
+h_eq :
+  ∀ (p : ℝ) (c : Fin k → ℝ),
+    (scaling_func c * p - (a * p + B c)) ^ 2 =
+      p ^ 2 * (scaling_func c - a) ^ 2 + -2 * p * ((scaling_func c - a) * B c) + 1 * B c ^ 2
+⊢ Integrable (fun pc => pc.1 ^ 2 * (scaling_func pc.2 - a) ^ 2) (μ0.prod ν0)
+proofs/Calibrator.lean:4251:10: warning: `MeasureTheory.Integrable.prod_mul` has been deprecated: Use `MeasureTheory.Integrable.mul_prod` instead
+proofs/Calibrator.lean:4251:4: error: Tactic `apply` failed: could not unify the conclusion of `Integrable.prod_mul
+  (Integrable.const_mul (gaussian_moments_integrable 1) (-2))`
+  Integrable (fun z => -2 * z.1 ^ 1 * ?m.558 z.2) ((ProbabilityTheory.gaussianReal 0 1).prod ?m.554)
+with the goal
+  Integrable (fun pc => -2 * pc.1 * ((scaling_func pc.2 - a) * B pc.2)) (μ0.prod ν0)
+
+Note: The full type of `Integrable.prod_mul (Integrable.const_mul (gaussian_moments_integrable 1) (-2))` is
+  Integrable ?m.558 ?m.554 →
+    Integrable (fun z => -2 * z.1 ^ 1 * ?m.558 z.2) ((ProbabilityTheory.gaussianReal 0 1).prod ?m.554)
+
+k : ℕ
+inst✝ : Fintype (Fin k)
+scaling_func : (Fin k → ℝ) → ℝ
+a : ℝ
+B : (Fin k → ℝ) → ℝ
+hS_sq : Integrable (fun c => scaling_func c ^ 2) (Measure.map Prod.snd (stdNormalProdMeasure k))
+hB_sq : Integrable (fun c => B c ^ 2) (Measure.map Prod.snd (stdNormalProdMeasure k))
+μ : Measure (ℝ × (Fin k → ℝ)) := stdNormalProdMeasure k
+μ0 : Measure ℝ := ProbabilityTheory.gaussianReal 0 1
+ν0 : Measure (Fin k → ℝ) := Measure.pi fun x => ProbabilityTheory.gaussianReal 0 1
+h_indep : μ = μ0.prod ν0
+h_map_snd : Measure.map Prod.snd μ = ν0
+hS_sq' : Integrable (fun c => scaling_func c ^ 2) ν0
+hB_sq' : Integrable (fun c => B c ^ 2) ν0
+h_eq :
+  ∀ (p : ℝ) (c : Fin k → ℝ),
+    (scaling_func c * p - (a * p + B c)) ^ 2 =
+      p ^ 2 * (scaling_func c - a) ^ 2 + -2 * p * ((scaling_func c - a) * B c) + 1 * B c ^ 2
+h_term1_int : Integrable (fun pc => pc.1 ^ 2 * (scaling_func pc.2 - a) ^ 2) μ
+⊢ Integrable (fun pc => -2 * pc.1 * ((scaling_func pc.2 - a) * B pc.2)) (μ0.prod ν0)
+proofs/Calibrator.lean:4265:10: warning: `MeasureTheory.Integrable.prod_mul` has been deprecated: Use `MeasureTheory.Integrable.mul_prod` instead
+proofs/Calibrator.lean:4265:4: error: Tactic `apply` failed: could not unify the type of `Integrable.prod_mul ?m.621 hB_sq'`
+  Integrable (fun z => ?m.619 z.1 * B z.2 ^ 2) (Measure.prod ?m.615 ν0)
+with the goal
+  Integrable (fun pc => 1 * B pc.2 ^ 2) (μ0.prod ν0)
+
+k : ℕ
+inst✝ : Fintype (Fin k)
+scaling_func : (Fin k → ℝ) → ℝ
+a : ℝ
+B : (Fin k → ℝ) → ℝ
+hS_sq : Integrable (fun c => scaling_func c ^ 2) (Measure.map Prod.snd (stdNormalProdMeasure k))
+hB_sq : Integrable (fun c => B c ^ 2) (Measure.map Prod.snd (stdNormalProdMeasure k))
+μ : Measure (ℝ × (Fin k → ℝ)) := stdNormalProdMeasure k
+μ0 : Measure ℝ := ProbabilityTheory.gaussianReal 0 1
+ν0 : Measure (Fin k → ℝ) := Measure.pi fun x => ProbabilityTheory.gaussianReal 0 1
+h_indep : μ = μ0.prod ν0
+h_map_snd : Measure.map Prod.snd μ = ν0
+hS_sq' : Integrable (fun c => scaling_func c ^ 2) ν0
+hB_sq' : Integrable (fun c => B c ^ 2) ν0
+h_eq :
+  ∀ (p : ℝ) (c : Fin k → ℝ),
+    (scaling_func c * p - (a * p + B c)) ^ 2 =
+      p ^ 2 * (scaling_func c - a) ^ 2 + -2 * p * ((scaling_func c - a) * B c) + 1 * B c ^ 2
+h_term1_int : Integrable (fun pc => pc.1 ^ 2 * (scaling_func pc.2 - a) ^ 2) μ
+h_term2_int : Integrable (fun pc => -2 * pc.1 * ((scaling_func pc.2 - a) * B pc.2)) μ
+⊢ Integrable (fun pc => 1 * B pc.2 ^ 2) (μ0.prod ν0)
+proofs/Calibrator.lean:4270:10: error: Tactic `rewrite` failed: Did not find an occurrence of the pattern
+  μ
+in the target expression
+  ∫ (a_1 : ℝ × (Fin k → ℝ)),
+          a_1.1 ^ 2 *
+            (scaling_func a_1.2 - a) ^
+              2 ∂(ProbabilityTheory.gaussianReal 0 1).prod (Measure.pi fun x => ProbabilityTheory.gaussianReal 0 1) +
+        ∫ (a_1 : ℝ × (Fin k → ℝ)),
+          -2 * a_1.1 *
+            ((scaling_func a_1.2 - a) *
+              B
+                a_1.2) ∂(ProbabilityTheory.gaussianReal 0 1).prod
+            (Measure.pi fun x => ProbabilityTheory.gaussianReal 0 1) +
+      ∫ (a : ℝ × (Fin k → ℝ)),
+        1 *
+          B a.2 ^
+            2 ∂(ProbabilityTheory.gaussianReal 0 1).prod (Measure.pi fun x => ProbabilityTheory.gaussianReal 0 1) =
+    ∫ (c : Fin k → ℝ),
+        (scaling_func c - a) ^
+          2 ∂Measure.map Prod.snd
+          ((ProbabilityTheory.gaussianReal 0 1).prod (Measure.pi fun x => ProbabilityTheory.gaussianReal 0 1)) +
+      ∫ (c : Fin k → ℝ),
+        B c ^
+          2 ∂Measure.map Prod.snd
+          ((ProbabilityTheory.gaussianReal 0 1).prod (Measure.pi fun x => ProbabilityTheory.gaussianReal 0 1))
+
+k : ℕ
+inst✝ : Fintype (Fin k)
+scaling_func : (Fin k → ℝ) → ℝ
+a : ℝ
+B : (Fin k → ℝ) → ℝ
+hS_sq : Integrable (fun c => scaling_func c ^ 2) (Measure.map Prod.snd (stdNormalProdMeasure k))
+hB_sq : Integrable (fun c => B c ^ 2) (Measure.map Prod.snd (stdNormalProdMeasure k))
+μ : Measure (ℝ × (Fin k → ℝ)) := stdNormalProdMeasure k
+μ0 : Measure ℝ := ProbabilityTheory.gaussianReal 0 1
+ν0 : Measure (Fin k → ℝ) := Measure.pi fun x => ProbabilityTheory.gaussianReal 0 1
+h_indep : μ = μ0.prod ν0
+h_map_snd : Measure.map Prod.snd μ = ν0
+hS_sq' : Integrable (fun c => scaling_func c ^ 2) ν0
+hB_sq' : Integrable (fun c => B c ^ 2) ν0
+h_eq :
+  ∀ (p : ℝ) (c : Fin k → ℝ),
+    (scaling_func c * p - (a * p + B c)) ^ 2 =
+      p ^ 2 * (scaling_func c - a) ^ 2 + -2 * p * ((scaling_func c - a) * B c) + 1 * B c ^ 2
+h_term1_int : Integrable (fun pc => pc.1 ^ 2 * (scaling_func pc.2 - a) ^ 2) μ
+h_term2_int : Integrable (fun pc => -2 * pc.1 * ((scaling_func pc.2 - a) * B pc.2)) μ
+h_term3_int : Integrable (fun pc => 1 * B pc.2 ^ 2) μ
+⊢ ∫ (a_1 : ℝ × (Fin k → ℝ)),
+          a_1.1 ^ 2 *
+            (scaling_func a_1.2 - a) ^
+              2 ∂(ProbabilityTheory.gaussianReal 0 1).prod (Measure.pi fun x => ProbabilityTheory.gaussianReal 0 1) +
+        ∫ (a_1 : ℝ × (Fin k → ℝ)),
+          -2 * a_1.1 *
+            ((scaling_func a_1.2 - a) *
+              B
+                a_1.2) ∂(ProbabilityTheory.gaussianReal 0 1).prod
+            (Measure.pi fun x => ProbabilityTheory.gaussianReal 0 1) +
+      ∫ (a : ℝ × (Fin k → ℝ)),
+        1 *
+          B a.2 ^
+            2 ∂(ProbabilityTheory.gaussianReal 0 1).prod (Measure.pi fun x => ProbabilityTheory.gaussianReal 0 1) =
+    ∫ (c : Fin k → ℝ),
+        (scaling_func c - a) ^
+          2 ∂Measure.map Prod.snd
+          ((ProbabilityTheory.gaussianReal 0 1).prod (Measure.pi fun x => ProbabilityTheory.gaussianReal 0 1)) +
+      ∫ (c : Fin k → ℝ),
+        B c ^
+          2 ∂Measure.map Prod.snd
+          ((ProbabilityTheory.gaussianReal 0 1).prod (Measure.pi fun x => ProbabilityTheory.gaussianReal 0 1))
+proofs/Calibrator.lean:4286:10: error: Tactic `rewrite` failed: Did not find an occurrence of the pattern
+  μ
+in the target expression
+  Integrable (fun a_1 => a_1.1 ^ 2 * (scaling_func a_1.2 - a) ^ 2)
+    ((ProbabilityTheory.gaussianReal 0 1).prod (Measure.pi fun x => ProbabilityTheory.gaussianReal 0 1))
+
+case hf
+k : ℕ
+inst✝ : Fintype (Fin k)
+scaling_func : (Fin k → ℝ) → ℝ
+a : ℝ
+B : (Fin k → ℝ) → ℝ
+hS_sq : Integrable (fun c => scaling_func c ^ 2) (Measure.map Prod.snd (stdNormalProdMeasure k))
+hB_sq : Integrable (fun c => B c ^ 2) (Measure.map Prod.snd (stdNormalProdMeasure k))
+μ : Measure (ℝ × (Fin k → ℝ)) := stdNormalProdMeasure k
+μ0 : Measure ℝ := ProbabilityTheory.gaussianReal 0 1
+ν0 : Measure (Fin k → ℝ) := Measure.pi fun x => ProbabilityTheory.gaussianReal 0 1
+h_indep : μ = μ0.prod ν0
+h_map_snd : Measure.map Prod.snd μ = ν0
+hS_sq' : Integrable (fun c => scaling_func c ^ 2) ν0
+hB_sq' : Integrable (fun c => B c ^ 2) ν0
+h_eq :
+  ∀ (p : ℝ) (c : Fin k → ℝ),
+    (scaling_func c * p - (a * p + B c)) ^ 2 =
+      p ^ 2 * (scaling_func c - a) ^ 2 + -2 * p * ((scaling_func c - a) * B c) + 1 * B c ^ 2
+h_term1_int : Integrable (fun pc => pc.1 ^ 2 * (scaling_func pc.2 - a) ^ 2) μ
+h_term2_int : Integrable (fun pc => -2 * pc.1 * ((scaling_func pc.2 - a) * B pc.2)) μ
+h_term3_int : Integrable (fun pc => 1 * B pc.2 ^ 2) μ
+⊢ Integrable (fun a_1 => a_1.1 ^ 2 * (scaling_func a_1.2 - a) ^ 2)
+    ((ProbabilityTheory.gaussianReal 0 1).prod (Measure.pi fun x => ProbabilityTheory.gaussianReal 0 1))
+proofs/Calibrator.lean:4265:34: error: `simp` made no progress
+proofs/Calibrator.lean:4299:6: error: Type mismatch
+  h_term1_int
+has type
+  Integrable (fun pc => pc.1 ^ 2 * (scaling_func pc.2 - a) ^ 2) μ
+but is expected to have type
+  Integrable (fun a_1 => -2 * a_1.1 * ((scaling_func a_1.2 - a) * B a_1.2))
+    ((ProbabilityTheory.gaussianReal 0 1).prod (Measure.pi fun x => ProbabilityTheory.gaussianReal 0 1))
+proofs/Calibrator.lean:4300:4: error: No goals to be solved
+proofs/Calibrator.lean:4302:8: error: Tactic `rewrite` failed: Did not find an occurrence of the pattern
+  μ
+in the target expression
+  Integrable (fun pc => pc.1 ^ 2 * (scaling_func pc.2 - a) ^ 2 + -2 * pc.1 * ((scaling_func pc.2 - a) * B pc.2))
+    ((ProbabilityTheory.gaussianReal 0 1).prod (Measure.pi fun x => ProbabilityTheory.gaussianReal 0 1))
+
+case hf
+k : ℕ
+inst✝ : Fintype (Fin k)
+scaling_func : (Fin k → ℝ) → ℝ
+a : ℝ
+B : (Fin k → ℝ) → ℝ
+hS_sq : Integrable (fun c => scaling_func c ^ 2) (Measure.map Prod.snd (stdNormalProdMeasure k))
+hB_sq : Integrable (fun c => B c ^ 2) (Measure.map Prod.snd (stdNormalProdMeasure k))
+μ : Measure (ℝ × (Fin k → ℝ)) := stdNormalProdMeasure k
+μ0 : Measure ℝ := ProbabilityTheory.gaussianReal 0 1
+ν0 : Measure (Fin k → ℝ) := Measure.pi fun x => ProbabilityTheory.gaussianReal 0 1
+h_indep : μ = μ0.prod ν0
+h_map_snd : Measure.map Prod.snd μ = ν0
+hS_sq' : Integrable (fun c => scaling_func c ^ 2) ν0
+hB_sq' : Integrable (fun c => B c ^ 2) ν0
+h_eq :
+  ∀ (p : ℝ) (c : Fin k → ℝ),
+    (scaling_func c * p - (a * p + B c)) ^ 2 =
+      p ^ 2 * (scaling_func c - a) ^ 2 + -2 * p * ((scaling_func c - a) * B c) + 1 * B c ^ 2
+h_term1_int : Integrable (fun pc => pc.1 ^ 2 * (scaling_func pc.2 - a) ^ 2) μ
+h_term2_int : Integrable (fun pc => -2 * pc.1 * ((scaling_func pc.2 - a) * B pc.2)) μ
+h_term3_int : Integrable (fun pc => 1 * B pc.2 ^ 2) μ
+⊢ Integrable (fun pc => pc.1 ^ 2 * (scaling_func pc.2 - a) ^ 2 + -2 * pc.1 * ((scaling_func pc.2 - a) * B pc.2))
+    ((ProbabilityTheory.gaussianReal 0 1).prod (Measure.pi fun x => ProbabilityTheory.gaussianReal 0 1))
+proofs/Calibrator.lean:4309:4: error: Tactic `apply` failed: could not unify the conclusion of `@Integrable.add`
+  Integrable (?f + ?g) ?μ
+with the goal
+  Integrable (fun pc => 1 * B pc.2 ^ 2)
+    ((ProbabilityTheory.gaussianReal 0 1).prod (Measure.pi fun x => ProbabilityTheory.gaussianReal 0 1))
+
+Note: The full type of `@Integrable.add` is
+  ∀ {α : Type ?u.319428} {m : MeasurableSpace α} {μ : Measure α} {ε' : Type ?u.319427} [inst : TopologicalSpace ε']
+    [inst_1 : ESeminormedAddMonoid ε'] [ContinuousAdd ε'] {f g : α → ε'},
+    Integrable f μ → Integrable g μ → Integrable (f + g) μ
+
+case hg
+k : ℕ
+inst✝ : Fintype (Fin k)
+scaling_func : (Fin k → ℝ) → ℝ
+a : ℝ
+B : (Fin k → ℝ) → ℝ
+hS_sq : Integrable (fun c => scaling_func c ^ 2) (Measure.map Prod.snd (stdNormalProdMeasure k))
+hB_sq : Integrable (fun c => B c ^ 2) (Measure.map Prod.snd (stdNormalProdMeasure k))
+μ : Measure (ℝ × (Fin k → ℝ)) := stdNormalProdMeasure k
+μ0 : Measure ℝ := ProbabilityTheory.gaussianReal 0 1
+ν0 : Measure (Fin k → ℝ) := Measure.pi fun x => ProbabilityTheory.gaussianReal 0 1
+h_indep : μ = μ0.prod ν0
+h_map_snd : Measure.map Prod.snd μ = ν0
+hS_sq' : Integrable (fun c => scaling_func c ^ 2) ν0
+hB_sq' : Integrable (fun c => B c ^ 2) ν0
+h_eq :
+  ∀ (p : ℝ) (c : Fin k → ℝ),
+    (scaling_func c * p - (a * p + B c)) ^ 2 =
+      p ^ 2 * (scaling_func c - a) ^ 2 + -2 * p * ((scaling_func c - a) * B c) + 1 * B c ^ 2
+h_term1_int : Integrable (fun pc => pc.1 ^ 2 * (scaling_func pc.2 - a) ^ 2) μ
+h_term2_int : Integrable (fun pc => -2 * pc.1 * ((scaling_func pc.2 - a) * B pc.2)) μ
+h_term3_int : Integrable (fun pc => 1 * B pc.2 ^ 2) μ
+⊢ Integrable (fun pc => 1 * B pc.2 ^ 2)
+    ((ProbabilityTheory.gaussianReal 0 1).prod (Measure.pi fun x => ProbabilityTheory.gaussianReal 0 1))
+proofs/Calibrator.lean:4312:2: error: No goals to be solved
+proofs/Calibrator.lean:4220:13: warning: This simp argument is unused:
+  dgpMultiplicativeBias
+
+Hint: Omit it from the simp argument list.
+  simp only [̵d̵g̵p̵M̵u̵l̵t̵i̵p̵l̵i̵c̵a̵t̵i̵v̵e̵B̵i̵a̵s̵,̵ ̵s̵t̵d̵N̵o̵r̵m̵a̵l̵P̵r̵o̵d̵M̵e̵a̵s̵u̵r̵e̵]̵[̲s̲t̲d̲N̲o̲r̲m̲a̲l̲P̲r̲o̲d̲M̲e̲a̲s̲u̲r̲e̲]̲
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:4326:21: error: don't know how to synthesize implicit argument `α`
+  @Eq ((p : ℕ) → ?m.147 p → ℕ) (fun p c => 1 * p) fun p c => 1 * p + (fun x => 0) c
+context:
+k : ℕ
+inst✝ : Fintype (Fin k)
+scaling_func : (Fin k → ℝ) → ℝ
+_h_scaling_meas : AEStronglyMeasurable scaling_func (Measure.map Prod.snd (stdNormalProdMeasure k))
+hS_sq : Integrable (fun c => scaling_func c ^ 2) (Measure.map Prod.snd (stdNormalProdMeasure k))
+h_mean_1 : ∫ (c : Fin k → ℝ), scaling_func c ∂Measure.map Prod.snd (stdNormalProdMeasure k) = 1
+a : ℝ
+B : (Fin k → ℝ) → ℝ
+_h_B_meas : AEStronglyMeasurable B (Measure.map Prod.snd (stdNormalProdMeasure k))
+hB_sq : Integrable (fun c => B c ^ 2) (Measure.map Prod.snd (stdNormalProdMeasure k))
+⊢ Sort (max ?u.304993 1)
+proofs/Calibrator.lean:4326:67: error(lean.inferBinderTypeFailed): Failed to infer binder type
+proofs/Calibrator.lean:4326:49: error(lean.inferBinderTypeFailed): Failed to infer type of binder `c`
+proofs/Calibrator.lean:4326:28: error(lean.inferBinderTypeFailed): Failed to infer type of binder `c`
+proofs/Calibrator.lean:4324:90: error: unsolved goals
+k : ℕ
+inst✝ : Fintype (Fin k)
+scaling_func : (Fin k → ℝ) → ℝ
+_h_scaling_meas : AEStronglyMeasurable scaling_func (Measure.map Prod.snd (stdNormalProdMeasure k))
+hS_sq : Integrable (fun c => scaling_func c ^ 2) (Measure.map Prod.snd (stdNormalProdMeasure k))
+h_mean_1 : ∫ (c : Fin k → ℝ), scaling_func c ∂Measure.map Prod.snd (stdNormalProdMeasure k) = 1
+a : ℝ
+B : (Fin k → ℝ) → ℝ
+_h_B_meas : AEStronglyMeasurable B (Measure.map Prod.snd (stdNormalProdMeasure k))
+hB_sq : Integrable (fun c => B c ^ 2) (Measure.map Prod.snd (stdNormalProdMeasure k))
+⊢ (expectedSquaredError (dgpMultiplicativeBias scaling_func) fun p c => 1 * p) ≤
+    expectedSquaredError (dgpMultiplicativeBias scaling_func) fun p c => a * p + B c
+proofs/Calibrator.lean:4462:62: error: unsolved goals
+k : ℕ
+inst✝ : Fintype (Fin k)
+scaling_func : (Fin k → ℝ) → ℝ
+_h_scaling_meas : AEStronglyMeasurable scaling_func (Measure.map Prod.snd (stdNormalProdMeasure k))
+_h_integrable : Integrable (fun pc => (scaling_func pc.2 * pc.1) ^ 2) (stdNormalProdMeasure k)
+_h_scaling_sq_int : Integrable (fun c => scaling_func c ^ 2) (Measure.map Prod.snd (stdNormalProdMeasure k))
+_h_mean_1 : ∫ (c : Fin k → ℝ), scaling_func c ∂Measure.map Prod.snd (stdNormalProdMeasure k) = 1
+model_norm : PhenotypeInformedGAM 1 k 1
+h_norm_opt : IsBayesOptimalInNormalizedClass (dgpMultiplicativeBias scaling_func) model_norm
+h_linear_basis : model_norm.pgsBasis.B 1 = id ∧ model_norm.pgsBasis.B 0 = fun x => 1
+h_spline_cont : ∀ (i : Fin 1), Continuous (model_norm.pcSplineBasis.b i)
+_h_norm_int : Integrable (fun pc => linearPredictor model_norm pc.1 pc.2 ^ 2) (stdNormalProdMeasure k)
+_h_spline_memLp : ∀ (i : Fin 1), MemLp (model_norm.pcSplineBasis.b i) 2 (ProbabilityTheory.gaussianReal 0 1)
+_h_pred_meas : AEStronglyMeasurable (fun pc => linearPredictor model_norm pc.1 pc.2) (stdNormalProdMeasure k)
+model_oracle : PhenotypeInformedGAM 1 k 1
+h_oracle_opt : IsBayesOptimalInClass (dgpMultiplicativeBias scaling_func) model_oracle
+h_capable :
+  ∃ m,
+    ∀ (p_val : ℝ) (c_val : Fin k → ℝ),
+      linearPredictor m p_val c_val = (dgpMultiplicativeBias scaling_func).trueExpectation p_val c_val
+dgp : DataGeneratingProcess k := dgpMultiplicativeBias scaling_func
+h_oracle_risk_zero : (expectedSquaredError dgp fun p c => linearPredictor model_oracle p c) = 0
+h_diff_eq_norm_sq :
+  ((expectedSquaredError dgp fun p c => linearPredictor model_norm p c) -
+      expectedSquaredError dgp fun p c => linearPredictor model_oracle p c) =
+    ∫ (pc : ℝ × (Fin k → ℝ)),
+      (dgp.trueExpectation pc.1 pc.2 - linearPredictor model_norm pc.1 pc.2) ^ 2 ∂dgp.jointMeasure
+model_star : PhenotypeInformedGAM 1 k 1 :=
+  { pgsBasis := model_norm.pgsBasis, pcSplineBasis := model_norm.pcSplineBasis, γ₀₀ := 0, γₘ₀ := fun x => 1,
+    f₀ₗ := fun x x => 0, fₘₗ := fun x x x => 0, link := model_norm.link, dist := model_norm.dist }
+h_star_pred : ∀ (p : ℝ) (c : Fin k → ℝ), linearPredictor model_star p c = p
+h_star_in_class : IsNormalizedScoreModel model_star
+h_risk_star :
+  (expectedSquaredError (dgpMultiplicativeBias scaling_func) fun p c => linearPredictor model_star p c) =
+    ∫ (pc : ℝ × (Fin k → ℝ)), ((scaling_func pc.2 - 1) * pc.1) ^ 2 ∂stdNormalProdMeasure k
+h_decomp_norm :
+  ∀ (pgs_val : ℝ) (pc_val : Fin k → ℝ),
+    linearPredictor model_norm pgs_val pc_val =
+      predictorBase model_norm pc_val + predictorSlope model_norm pc_val * pgs_val
+a : ℝ := predictorSlope model_norm 0
+B : (Fin k → ℝ) → ℝ := predictorBase model_norm
+p : ℝ
+c : Fin k → ℝ
+⊢ model_norm.γₘ₀ 0 = a
+proofs/Calibrator.lean:4459:78: error: unsolved goals
+k : ℕ
+inst✝ : Fintype (Fin k)
+scaling_func : (Fin k → ℝ) → ℝ
+_h_scaling_meas : AEStronglyMeasurable scaling_func (Measure.map Prod.snd (stdNormalProdMeasure k))
+_h_integrable : Integrable (fun pc => (scaling_func pc.2 * pc.1) ^ 2) (stdNormalProdMeasure k)
+_h_scaling_sq_int : Integrable (fun c => scaling_func c ^ 2) (Measure.map Prod.snd (stdNormalProdMeasure k))
+_h_mean_1 : ∫ (c : Fin k → ℝ), scaling_func c ∂Measure.map Prod.snd (stdNormalProdMeasure k) = 1
+model_norm : PhenotypeInformedGAM 1 k 1
+h_norm_opt : IsBayesOptimalInNormalizedClass (dgpMultiplicativeBias scaling_func) model_norm
+h_linear_basis : model_norm.pgsBasis.B 1 = id ∧ model_norm.pgsBasis.B 0 = fun x => 1
+h_spline_cont : ∀ (i : Fin 1), Continuous (model_norm.pcSplineBasis.b i)
+_h_norm_int : Integrable (fun pc => linearPredictor model_norm pc.1 pc.2 ^ 2) (stdNormalProdMeasure k)
+_h_spline_memLp : ∀ (i : Fin 1), MemLp (model_norm.pcSplineBasis.b i) 2 (ProbabilityTheory.gaussianReal 0 1)
+_h_pred_meas : AEStronglyMeasurable (fun pc => linearPredictor model_norm pc.1 pc.2) (stdNormalProdMeasure k)
+model_oracle : PhenotypeInformedGAM 1 k 1
+h_oracle_opt : IsBayesOptimalInClass (dgpMultiplicativeBias scaling_func) model_oracle
+h_capable :
+  ∃ m,
+    ∀ (p_val : ℝ) (c_val : Fin k → ℝ),
+      linearPredictor m p_val c_val = (dgpMultiplicativeBias scaling_func).trueExpectation p_val c_val
+dgp : DataGeneratingProcess k := dgpMultiplicativeBias scaling_func
+h_oracle_risk_zero : (expectedSquaredError dgp fun p c => linearPredictor model_oracle p c) = 0
+h_diff_eq_norm_sq :
+  ((expectedSquaredError dgp fun p c => linearPredictor model_norm p c) -
+      expectedSquaredError dgp fun p c => linearPredictor model_oracle p c) =
+    ∫ (pc : ℝ × (Fin k → ℝ)),
+      (dgp.trueExpectation pc.1 pc.2 - linearPredictor model_norm pc.1 pc.2) ^ 2 ∂dgp.jointMeasure
+model_star : PhenotypeInformedGAM 1 k 1 :=
+  { pgsBasis := model_norm.pgsBasis, pcSplineBasis := model_norm.pcSplineBasis, γ₀₀ := 0, γₘ₀ := fun x => 1,
+    f₀ₗ := fun x x => 0, fₘₗ := fun x x x => 0, link := model_norm.link, dist := model_norm.dist }
+h_star_pred : ∀ (p : ℝ) (c : Fin k → ℝ), linearPredictor model_star p c = p
+h_star_in_class : IsNormalizedScoreModel model_star
+h_risk_star :
+  (expectedSquaredError (dgpMultiplicativeBias scaling_func) fun p c => linearPredictor model_star p c) =
+    ∫ (pc : ℝ × (Fin k → ℝ)), ((scaling_func pc.2 - 1) * pc.1) ^ 2 ∂stdNormalProdMeasure k
+h_decomp_norm :
+  ∀ (pgs_val : ℝ) (pc_val : Fin k → ℝ),
+    linearPredictor model_norm pgs_val pc_val =
+      predictorBase model_norm pc_val + predictorSlope model_norm pc_val * pgs_val
+a : ℝ := predictorSlope model_norm 0
+B : (Fin k → ℝ) → ℝ := predictorBase model_norm
+p : ℝ
+c : Fin k → ℝ
+h_slope_const : predictorSlope model_norm c = a
+⊢ predictorBase model_norm c + p * a = p * a + B c
+proofs/Calibrator.lean:4490:9: error(lean.unknownIdentifier): Unknown constant `MeasureTheory.MemLp.of_integrable_sq`
+proofs/Calibrator.lean:4492:9: error(lean.unknownIdentifier): Unknown constant `MeasureTheory.MemLp.of_integrable_sq`
+proofs/Calibrator.lean:4495:31: error: Invalid projection: Type of
+  pc
+is not known; cannot resolve projection `2`
+proofs/Calibrator.lean:4495:65: error: Invalid projection: Type of
+  pc
+is not known; cannot resolve projection `1`
+proofs/Calibrator.lean:4495:70: error: Invalid projection: Type of
+  pc
+is not known; cannot resolve projection `2`
+proofs/Calibrator.lean:4495:81: error: Invalid projection: Type of
+  pc
+is not known; cannot resolve projection `1`
+proofs/Calibrator.lean:4508:12: error(lean.unknownIdentifier): Unknown identifier `MeasureTheory.integrable_comp_snd_iff`
+proofs/Calibrator.lean:4513:4: error: Tactic `apply` failed: could not unify the type of `projection_of_p_is_p scaling_func _h_scaling_meas _h_scaling_sq_int
+  _h_mean_1 a B h_B_meas h_B_int`
+  (expectedSquaredError (dgpMultiplicativeBias scaling_func) fun p c => 1 * p) ≤
+    expectedSquaredError (dgpMultiplicativeBias scaling_func) fun p c => a * p + B c
+with the goal
+  (expectedSquaredError dgp fun p c => a * p + B c) ≥ expectedSquaredError dgp fun p c => 1 * p + 0
+
+k : ℕ
+inst✝ : Fintype (Fin k)
+scaling_func : (Fin k → ℝ) → ℝ
+_h_scaling_meas : AEStronglyMeasurable scaling_func (Measure.map Prod.snd (stdNormalProdMeasure k))
+_h_integrable : Integrable (fun pc => (scaling_func pc.2 * pc.1) ^ 2) (stdNormalProdMeasure k)
+_h_scaling_sq_int : Integrable (fun c => scaling_func c ^ 2) (Measure.map Prod.snd (stdNormalProdMeasure k))
+_h_mean_1 : ∫ (c : Fin k → ℝ), scaling_func c ∂Measure.map Prod.snd (stdNormalProdMeasure k) = 1
+model_norm : PhenotypeInformedGAM 1 k 1
+h_norm_opt : IsBayesOptimalInNormalizedClass (dgpMultiplicativeBias scaling_func) model_norm
+h_linear_basis : model_norm.pgsBasis.B 1 = id ∧ model_norm.pgsBasis.B 0 = fun x => 1
+h_spline_cont : ∀ (i : Fin 1), Continuous (model_norm.pcSplineBasis.b i)
+_h_norm_int : Integrable (fun pc => linearPredictor model_norm pc.1 pc.2 ^ 2) (stdNormalProdMeasure k)
+_h_spline_memLp : ∀ (i : Fin 1), MemLp (model_norm.pcSplineBasis.b i) 2 (ProbabilityTheory.gaussianReal 0 1)
+_h_pred_meas : AEStronglyMeasurable (fun pc => linearPredictor model_norm pc.1 pc.2) (stdNormalProdMeasure k)
+model_oracle : PhenotypeInformedGAM 1 k 1
+h_oracle_opt : IsBayesOptimalInClass (dgpMultiplicativeBias scaling_func) model_oracle
+h_capable :
+  ∃ m,
+    ∀ (p_val : ℝ) (c_val : Fin k → ℝ),
+      linearPredictor m p_val c_val = (dgpMultiplicativeBias scaling_func).trueExpectation p_val c_val
+dgp : DataGeneratingProcess k := dgpMultiplicativeBias scaling_func
+h_oracle_risk_zero : (expectedSquaredError dgp fun p c => linearPredictor model_oracle p c) = 0
+h_diff_eq_norm_sq :
+  ((expectedSquaredError dgp fun p c => linearPredictor model_norm p c) -
+      expectedSquaredError dgp fun p c => linearPredictor model_oracle p c) =
+    ∫ (pc : ℝ × (Fin k → ℝ)),
+      (dgp.trueExpectation pc.1 pc.2 - linearPredictor model_norm pc.1 pc.2) ^ 2 ∂dgp.jointMeasure
+model_star : PhenotypeInformedGAM 1 k 1 :=
+  { pgsBasis := model_norm.pgsBasis, pcSplineBasis := model_norm.pcSplineBasis, γ₀₀ := 0, γₘ₀ := fun x => 1,
+    f₀ₗ := fun x x => 0, fₘₗ := fun x x x => 0, link := model_norm.link, dist := model_norm.dist }
+h_star_pred : ∀ (p : ℝ) (c : Fin k → ℝ), linearPredictor model_star p c = p
+h_star_in_class : IsNormalizedScoreModel model_star
+h_risk_star :
+  (expectedSquaredError (dgpMultiplicativeBias scaling_func) fun p c => linearPredictor model_star p c) =
+    ∫ (pc : ℝ × (Fin k → ℝ)), ((scaling_func pc.2 - 1) * pc.1) ^ 2 ∂stdNormalProdMeasure k
+h_decomp_norm :
+  ∀ (pgs_val : ℝ) (pc_val : Fin k → ℝ),
+    linearPredictor model_norm pgs_val pc_val =
+      predictorBase model_norm pc_val + predictorSlope model_norm pc_val * pgs_val
+a : ℝ := predictorSlope model_norm 0
+B : (Fin k → ℝ) → ℝ := predictorBase model_norm
+h_pred_norm : ∀ (p : ℝ) (c : Fin k → ℝ), linearPredictor model_norm p c = a * p + B c
+h_pred_star : ∀ (p : ℝ) (c : Fin k → ℝ), linearPredictor model_star p c = 1 * p + 0
+h_B_meas : AEStronglyMeasurable B (Measure.map Prod.snd (stdNormalProdMeasure k))
+μ : Measure (ℝ × (Fin k → ℝ)) := stdNormalProdMeasure k
+h_norm_L2 : MemLp (fun pc => linearPredictor model_norm pc.1 pc.2) 2 μ
+h_P_L2 : MemLp (fun pc => pc.1) 2 μ
+h_aP_L2 : MemLp (fun pc => a * pc.1) 2 μ
+h_B_L2_joint : MemLp (fun pc => B pc.2) 2 μ
+h_sq_int_joint : Integrable (fun pc => B pc.2 ^ 2) μ
+h_B_int : Integrable (fun c => B c ^ 2) (Measure.map Prod.snd (stdNormalProdMeasure k))
+⊢ (expectedSquaredError dgp fun p c => a * p + B c) ≥ expectedSquaredError dgp fun p c => 1 * p + 0
+proofs/Calibrator.lean:4830:4: warning: `Submodule.sub_orthogonalProjection_mem_orthogonal` has been deprecated: Use `Submodule.sub_starProjection_mem_orthogonal` instead
+proofs/Calibrator.lean:4851:13: warning: This simp argument is unused:
+  iso.symm_apply_apply
+
+Hint: Omit it from the simp argument list.
+  simp only ̵[̵i̵s̵o̵.̵s̵y̵m̵m̵_̵a̵p̵p̵l̵y̵_̵a̵p̵p̵l̵y̵]̵
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:4949:8: warning: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+proofs/Calibrator.lean:4950:27: warning: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+proofs/Calibrator.lean:4963:8: warning: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+proofs/Calibrator.lean:4964:28: warning: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+proofs/Calibrator.lean:5082:44: warning: unused variable `h_opt1`
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+proofs/Calibrator.lean:5952:10: warning: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+proofs/Calibrator.lean:5971:14: warning: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+proofs/Calibrator.lean:6504:41: warning: unused variable `hμ_pos`
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+Try this:
+  ring_nf
+
+  The `ring` tactic failed to close the goal. Use `ring_nf` to obtain a normal form.
+
+  Note that `ring` works primarily in *commutative* rings. If you have a noncommutative ring, abelian group or module, consider using `noncomm_ring`, `abel` or `module` instead.
+Try this:
+  ring_nf
+
+  The `ring` tactic failed to close the goal. Use `ring_nf` to obtain a normal form.
+
+  Note that `ring` works primarily in *commutative* rings. If you have a noncommutative ring, abelian group or module, consider using `noncomm_ring`, `abel` or `module` instead.
+Try this:
+  ring_nf!
+
+  The `ring!` tactic failed to close the goal. Use `ring_nf!` to obtain a normal form.
+
+  Note that `ring!` works primarily in *commutative* rings. If you have a noncommutative ring, abelian group or module, consider using `noncomm_ring`, `abel` or `module` instead.
+proofs/Calibrator.lean:6571:69: warning: This simp argument is unused:
+  Matrix.mul_apply
+
+Hint: Omit it from the simp argument list.
+  simp +decide [̵ ̵M̵a̵t̵r̵i̵x̵.̵d̵e̵t̵_̵a̵p̵p̵l̵y̵'̵,̵ ̵M̵a̵t̵r̵i̵x̵.̵a̵d̵j̵u̵g̵a̵t̵e̵_̵a̵p̵p̵l̵y̵,̵ ̵M̵a̵t̵r̵i̵x̵.̵m̵u̵l̵_̵a̵p̵p̵l̵y̵ ̵]̵[̲M̲a̲t̲r̲i̲x̲.̲d̲e̲t̲_̲a̲p̲p̲l̲y̲'̲,̲ ̲M̲a̲t̲r̲i̲x̲.̲a̲d̲j̲u̲g̲a̲t̲e̲_̲a̲p̲p̲l̲y̲]̲
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:6596:100: warning: This simp argument is unused:
+  Finset.filter_ne'
+
+Hint: Omit it from the simp argument list.
+  simp +decide [̵ ̵F̵i̵n̵s̵e̵t̵.̵p̵r̵o̵d̵_̵i̵t̵e̵,̵ ̵F̵i̵n̵s̵e̵t̵.̵f̵i̵l̵t̵e̵r̵_̵n̵e̵'̵,̵ ̵F̵i̵n̵s̵e̵t̵.̵f̵i̵l̵t̵e̵r̵_̵e̵q̵'̵ ̵]̵[̲F̲i̲n̲s̲e̲t̲.̲p̲r̲o̲d̲_̲i̲t̲e̲,̲
+  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲F̲i̲n̲s̲e̲t̲.̲f̲i̲l̲t̲e̲r̲_̲e̲q̲'̲]̲
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:6596:119: warning: This simp argument is unused:
+  Finset.filter_eq'
+
+Hint: Omit it from the simp argument list.
+  simp +decide [̵ ̵F̵i̵n̵s̵e̵t̵.̵p̵r̵o̵d̵_̵i̵t̵e̵,̵ ̵F̵i̵n̵s̵e̵t̵.̵f̵i̵l̵t̵e̵r̵_̵n̵e̵'̵,̵ ̵F̵i̵n̵s̵e̵t̵.̵f̵i̵l̵t̵e̵r̵_̵e̵q̵'̵ ̵]̵[̲F̲i̲n̲s̲e̲t̲.̲p̲r̲o̲d̲_̲i̲t̲e̲,̲
+  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲F̲i̲n̲s̲e̲t̲.̲f̲i̲l̲t̲e̲r̲_̲n̲e̲'̲]̲
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:6597:92: warning: This simp argument is unused:
+  Finset.prod_ite
+
+Hint: Omit it from the simp argument list.
+  simp +decide [̵ ̵F̵i̵n̵s̵e̵t̵.̵p̵r̵o̵d̵_̵i̵t̵e̵,̵ ̵F̵i̵n̵s̵e̵t̵.̵f̵i̵l̵t̵e̵r̵_̵n̵e̵'̵,̵ ̵F̵i̵n̵s̵e̵t̵.̵f̵i̵l̵t̵e̵r̵_̵e̵q̵'̵ ̵]̵[̲F̲i̲n̲s̲e̲t̲.̲f̲i̲l̲t̲e̲r̲_̲n̲e̲'̲,̲
+  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲F̲i̲n̲s̲e̲t̲.̲f̲i̲l̲t̲e̲r̲_̲e̲q̲'̲]̲
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:6598:56: warning: This simp argument is unused:
+  hj
+
+Hint: Omit it from the simp argument list.
+  simp +decide [ ̵Pi.single_apply,̵ ̵h̵j̵ ̵]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:6599:66: warning: This simp argument is unused:
+  hj
+
+Hint: Omit it from the simp argument list.
+  simp +decide ̵[̵ ̵h̵j̵ ̵]̵
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:6603:45: warning: This simp argument is unused:
+  Finset.mul_sum _ _ _
+
+Hint: Omit it from the simp argument list.
+  simp +decide [̵ ̵M̵a̵t̵r̵i̵x̵.̵m̵u̵l̵_̵a̵p̵p̵l̵y̵,̵ ̵F̵i̵n̵s̵e̵t̵.̵m̵u̵l̵_̵s̵u̵m̵ ̵_̵ ̵_̵ ̵_̵ ̵]̵[̲M̲a̲t̲r̲i̲x̲.̲m̲u̲l̲_̲a̲p̲p̲l̲y̲]̲
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:6611:41: warning: This simp argument is unused:
+  mul_assoc
+
+Hint: Omit it from the simp argument list.
+  simp_all +decide [̵ ̵M̵a̵t̵r̵i̵x̵.̵i̵n̵v̵_̵d̵e̵f̵,̵ ̵m̵u̵l̵_̵a̵s̵s̵o̵c̵,̵[̲M̲a̲t̲r̲i̲x̲.̲i̲n̲v̲_̲d̲e̲f̲,̲ mul_left_comm, mul_comm,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲Matrix.trace_mul_comm (̵ ̵M̵a̵t̵r̵i̵x̵.̵a̵d̵j̵u̵g̵a̵t̵e̵ ̵_̵ ̵)̵ ̵]̵(̲M̲a̲t̲r̲i̲x̲.̲a̲d̲j̲u̲g̲a̲t̲e̲ ̲_̲)̲]̲
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:6613:103: warning: This simp argument is unused:
+  mul_assoc
+
+Hint: Omit it from the simp argument list.
+  simp_all +decide [̵ ̵M̵a̵t̵r̵i̵x̵.̵t̵r̵a̵c̵e̵_̵s̵m̵u̵l̵,̵ ̵m̵u̵l̵_̵a̵s̵s̵o̵c̵,̵[̲M̲a̲t̲r̲i̲x̲.̲t̲r̲a̲c̲e̲_̲s̲m̲u̲l̲,̲
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲mul_comm, m̵u̵l̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵ ̵]̵m̲u̲l̲_̲l̲e̲f̲t̲_̲c̲o̲m̲m̲]̲
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:6613:124: warning: This simp argument is unused:
+  mul_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp_all +decide [̵ ̵M̵a̵t̵r̵i̵x̵.̵t̵r̵a̵c̵e̵_̵s̵m̵u̵l̵,̵[̲M̲a̲t̲r̲i̲x̲.̲t̲r̲a̲c̲e̲_̲s̲m̲u̲l̲,̲
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲mul_assoc, m̵u̵l̵_̵c̵o̵m̵m̵,̵ ̵m̵u̵l̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵ ̵]̵m̲u̲l̲_̲c̲o̲m̲m̲]̲
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:6617:118: warning: This simp argument is unused:
+  Real.exp_ne_zero
+
+Hint: Omit it from the simp argument list.
+  simp_all +decide [̵ ̵R̵e̵a̵l̵.̵e̵x̵p̵_̵n̵e̵_̵z̵e̵r̵o̵,̵ ̵m̵u̵l̵_̵a̵s̵s̵o̵c̵,̵[̲m̲u̲l̲_̲a̲s̲s̲o̲c̲,̲
+  ̲  ̲ ̲ ̲ ̲ ̲mul_comm, m̵u̵l̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵ ̵]̵m̲u̲l̲_̲l̲e̲f̲t̲_̲c̲o̲m̲m̲]̲
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:6617:136: warning: This simp argument is unused:
+  mul_assoc
+
+Hint: Omit it from the simp argument list.
+  simp_all +decide [̵ ̵R̵e̵a̵l̵.̵e̵x̵p̵_̵n̵e̵_̵z̵e̵r̵o̵,̵ ̵m̵u̵l̵_̵a̵s̵s̵o̵c̵,̵[̲R̲e̲a̲l̲.̲e̲x̲p̲_̲n̲e̲_̲z̲e̲r̲o̲,̲
+  ̲  ̲ ̲ ̲ ̲ ̲mul_comm, m̵u̵l̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵ ̵]̵m̲u̲l̲_̲l̲e̲f̲t̲_̲c̲o̲m̲m̲]̲
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:6617:157: warning: This simp argument is unused:
+  mul_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp_all +decide [̵ ̵R̵e̵a̵l̵.̵e̵x̵p̵_̵n̵e̵_̵z̵e̵r̵o̵,̵[̲R̲e̲a̲l̲.̲e̲x̲p̲_̲n̲e̲_̲z̲e̲r̲o̲,̲
+  ̲  ̲ ̲ ̲ ̲ ̲mul_assoc, m̵u̵l̵_̵c̵o̵m̵m̵,̵ ̵m̵u̵l̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵ ̵]̵m̲u̲l̲_̲c̲o̲m̲m̲]̲
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+proofs/Calibrator.lean:6654:229: warning: unused variable `log_lik`
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+proofs/Calibrator.lean:6692:4: warning: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
