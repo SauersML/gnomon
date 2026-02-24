@@ -6,7 +6,7 @@ artifact mapping, and stable `gnomon::calibrate::*` entrypoints.
 
 Core numerical engine modules (basis construction, PIRLS/REML, HMC, ALO,
 reparameterization, diagnostics, and shared math types) live in the separate
-repo at `/Users/user/gam` and are imported by this crate.
+[`gam`](https://github.com/SauersML/gam) repo and are imported by this crate.
 
 ## Statistical model
 
@@ -124,7 +124,7 @@ Adapter/domain files in `gnomon/calibrate`:
 - [`survival.rs`](survival.rs): survival feature/layout assembly and domain wiring.
 - [`model.rs`](model.rs): artifact mapping and serde composition for gnomon outputs.
 
-Engine-owned modules in separate repo `/Users/user/gam/src`:
+Engine-owned modules in separate repo `gam/src`:
 - `basis.rs`, `construction.rs`, `pirls.rs`, `estimate.rs`, `hmc.rs`, `joint.rs`,
   `alo.rs`, `diagnostics.rs`, `hull.rs`, `types.rs`, and related math utilities.
 
@@ -234,8 +234,8 @@ the deployed spline bases receive well-formed covariates.
 ## Repo split note
 
 Path ownership is intentionally split:
-- Adapter/domain layer: `/Users/user/gnomon/calibrate`
-- Math/solver engine: `/Users/user/gam/src`
+- Adapter/domain layer: `gnomon/calibrate`
+- Math/solver engine: `gam/src`
 
 Contract summary:
 - `gnomon/calibrate` performs domain layout assembly and passes full-size `P x P`

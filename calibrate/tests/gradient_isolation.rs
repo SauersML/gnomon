@@ -5008,7 +5008,7 @@ fn firth_beta_monotonicity_comparison() {
         -0.010_f64, -0.005, -0.002, -0.001, 0.0, 0.001, 0.002, 0.005, 0.010,
     ];
 
-    let fit_beta_norm = |rho_val: f64, cfg: &gam::model::ModelConfig| -> f64 {
+    let fit_beta_norm = |rho_val: f64, cfg: &gam::types::ModelConfig| -> f64 {
         let rho = array![rho_val];
         fit_model_for_fixed_rho(
             LogSmoothingParamsView::new(rho.view()),

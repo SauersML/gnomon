@@ -3698,12 +3698,25 @@ pub fn map_coefficients(
     })
 }
 
-pub fn to_engine_model_config(config: &ModelConfig) -> Result<gam::model::ModelConfig, EstimationError> {
-    convert_struct(config)
+pub fn to_engine_model_config(config: &ModelConfig) -> Result<gam::types::ModelConfig, EstimationError> {
+    Ok(gam::types::ModelConfig {
+        model_family: match config.model_family {
+            ModelFamily::Gam(link) => gam::types::ModelFamily::Gam(link),
+            ModelFamily::Survival(spec) => gam::types::ModelFamily::Survival(spec),
+        },
+        convergence_tolerance: config.convergence_tolerance,
+        max_iterations: config.max_iterations,
+        reml_convergence_tolerance: config.reml_convergence_tolerance,
+        reml_max_iterations: config.reml_max_iterations,
+        firth_bias_reduction: config.firth_bias_reduction,
+        reml_parallel_threshold: config.reml_parallel_threshold,
+        mcmc_enabled: config.mcmc_enabled,
+    })
 }
 
-pub fn from_engine_trained_model(
-    model: &gam::model::TrainedModel,
-) -> Result<TrainedModel, EstimationError> {
+pub fn from_engine_trained_model<T>(model: &T) -> Result<TrainedModel, EstimationError>
+where
+    T: Serialize,
+{
     convert_struct(model)
 }
