@@ -1,11 +1,11 @@
-use gam::basis::{self, BasisOptions, Dense, KnotSource, create_basis};
 use crate::calibrate::construction::DomainLayout;
 use crate::calibrate::estimate::EstimationError;
-use gam::hull::PeeledHull;
-use gam::probability::normal_cdf_approx;
 use crate::calibrate::survival::{
     self, DEFAULT_RISK_EPSILON, SurvivalError, SurvivalModelArtifacts, SurvivalSpec,
 };
+use gam::basis::{self, BasisOptions, Dense, KnotSource, create_basis};
+use gam::hull::PeeledHull;
+use gam::probability::normal_cdf_approx;
 pub use gam::types::LinkFunction;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, Zip, s};
 use serde::{Deserialize, Serialize};
@@ -478,8 +478,8 @@ impl TrainedModel {
         if h.nrows() != h.ncols() || h.ncols() != x_new.ncols() {
             return None;
         }
-        use gam::faer_ndarray::FaerCholesky;
         use faer::Side;
+        use gam::faer_ndarray::FaerCholesky;
         let chol = match h.clone().cholesky(Side::Lower) {
             Ok(c) => c,
             Err(_) => return None,
@@ -647,8 +647,8 @@ impl TrainedModel {
             return None;
         }
 
-        use gam::faer_ndarray::FaerCholesky;
         use faer::Side;
+        use gam::faer_ndarray::FaerCholesky;
         let chol = match h.clone().cholesky(Side::Lower) {
             Ok(c) => c,
             Err(_) => return None,
@@ -1160,17 +1160,13 @@ impl TrainedModel {
                     }
                 }
             }
-            LinkFunction::Probit => {
-                match se_eta_opt {
-                    Some(se_eta) => Ok(Zip::from(&eta)
-                        .and(&se_eta)
-                        .map_collect(|&e, &se| {
-                            let denom = (1.0 + se * se).sqrt().max(1e-12);
-                            normal_cdf_approx(e / denom)
-                        })),
-                    None => Ok(mode_mean),
-                }
-            }
+            LinkFunction::Probit => match se_eta_opt {
+                Some(se_eta) => Ok(Zip::from(&eta).and(&se_eta).map_collect(|&e, &se| {
+                    let denom = (1.0 + se * se).sqrt().max(1e-12);
+                    normal_cdf_approx(e / denom)
+                })),
+                None => Ok(mode_mean),
+            },
             LinkFunction::CLogLog => Ok(mode_mean),
         }
     }
@@ -3690,7 +3686,9 @@ pub fn map_coefficients(
     })
 }
 
-pub fn to_engine_model_config(config: &ModelConfig) -> Result<gam::pirls::PirlsConfig, EstimationError> {
+pub fn to_engine_model_config(
+    config: &ModelConfig,
+) -> Result<gam::pirls::PirlsConfig, EstimationError> {
     let link = match config.model_family {
         ModelFamily::Gam(link) => link,
         ModelFamily::Survival(_) => {

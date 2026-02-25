@@ -2,8 +2,8 @@ use crate::calibrate::data::TrainingData;
 use crate::calibrate::estimate::EstimationError;
 use gam::basis::{
     BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, BasisMetadata, BasisOptions,
-    CenterStrategy, Dense, KnotSource, ThinPlateBasisSpec, build_bspline_basis_1d, build_thin_plate_basis,
-    create_basis,
+    CenterStrategy, Dense, KnotSource, ThinPlateBasisSpec, build_bspline_basis_1d,
+    build_thin_plate_basis, create_basis,
 };
 use gam::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, BlockwiseFitResult, CustomFamily, FamilyEvaluation,
@@ -131,7 +131,10 @@ fn expand_penalties_with_prefix_zeros(
         let p_block = s_block.nrows();
         let mut s_full = Array2::<f64>::zeros((total_p, total_p));
         s_full
-            .slice_mut(s![prefix_cols..prefix_cols + p_block, prefix_cols..prefix_cols + p_block])
+            .slice_mut(s![
+                prefix_cols..prefix_cols + p_block,
+                prefix_cols..prefix_cols + p_block
+            ])
             .assign(s_block);
         out.push(s_full);
     }
@@ -181,7 +184,16 @@ fn default_initial_z_from_training(data: &TrainingData) -> Array1<f64> {
 fn build_liability_specs(
     data: &TrainingData,
     cfg: &LiabilityFitConfig,
-) -> Result<(Vec<ParameterBlockSpec>, Array2<f64>, Array2<f64>, Array1<f64>, Option<Array1<f64>>), EstimationError> {
+) -> Result<
+    (
+        Vec<ParameterBlockSpec>,
+        Array2<f64>,
+        Array2<f64>,
+        Array1<f64>,
+        Option<Array1<f64>>,
+    ),
+    EstimationError,
+> {
     let n = data.y.len();
 
     let tps_spec = ThinPlateBasisSpec {
@@ -306,12 +318,14 @@ fn build_liability_specs(
             ));
         }
         let x_wiggle = seed.slice(s![.., 1..]).to_owned();
-        let mut wiggle_penalties = vec![gam::basis::create_difference_penalty_matrix(
-            x_wiggle.ncols(),
-            wcfg.penalty_order,
-            None,
-        )
-        .map_err(|e| EstimationError::InvalidInput(e.to_string()))?];
+        let mut wiggle_penalties = vec![
+            gam::basis::create_difference_penalty_matrix(
+                x_wiggle.ncols(),
+                wcfg.penalty_order,
+                None,
+            )
+            .map_err(|e| EstimationError::InvalidInput(e.to_string()))?,
+        ];
         if wcfg.double_penalty {
             wiggle_penalties.push(Array2::<f64>::eye(x_wiggle.ncols()));
         }
@@ -341,7 +355,10 @@ impl CustomFamily for LiabilityFamily {
             ));
         }
         let n = self.y.len();
-        if block_states.iter().any(|b| b.eta.len() != n || b.beta.iter().any(|v| !v.is_finite())) {
+        if block_states
+            .iter()
+            .any(|b| b.eta.len() != n || b.beta.iter().any(|v| !v.is_finite()))
+        {
             return Err("non-finite or dimension-mismatched block state".to_string());
         }
 
@@ -382,8 +399,8 @@ impl CustomFamily for LiabilityFamily {
             let p = normal_cdf_approx(q[i]).clamp(1e-10, 1.0 - 1e-10);
             mu[i] = p;
             dmu_dq[i] = normal_pdf(q[i]).max(1e-8);
-            log_lik += self.weights[i]
-                * (self.y[i] * p.ln() + (1.0_f64 - self.y[i]) * (1.0_f64 - p).ln());
+            log_lik +=
+                self.weights[i] * (self.y[i] * p.ln() + (1.0_f64 - self.y[i]) * (1.0_f64 - p).ln());
         }
 
         let mut working_sets = Vec::with_capacity(n_blocks);
@@ -521,7 +538,10 @@ impl CustomFamily for LiabilityFamily {
 }
 
 impl CustomFamilyGenerative for LiabilityFamily {
-    fn generative_spec(&self, block_states: &[ParameterBlockState]) -> Result<GenerativeSpec, String> {
+    fn generative_spec(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<GenerativeSpec, String> {
         if block_states.len() != 3 && block_states.len() != 4 {
             return Err(format!(
                 "liability generative path expects 3 or 4 blocks, got {}",

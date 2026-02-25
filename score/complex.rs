@@ -221,8 +221,8 @@ pub enum ResolutionMethod {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use memmap2::MmapOptions;
     use crate::score::types::ScoreColumnIndex;
+    use memmap2::MmapOptions;
 
     #[test]
     fn spool_resolver_returns_expected_genotypes() {

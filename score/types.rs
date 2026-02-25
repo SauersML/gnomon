@@ -438,11 +438,13 @@ impl<'a> VariantCsrView<'a> {
             .iter()
             .zip(self.weights)
             .zip(self.missing_corrections)
-            .map(|((&col_u32, &weight), &missing_correction)| CsrContribution {
-                score_column: ScoreColumnIndex(col_u32 as usize),
-                weight,
-                missing_correction,
-            })
+            .map(
+                |((&col_u32, &weight), &missing_correction)| CsrContribution {
+                    score_column: ScoreColumnIndex(col_u32 as usize),
+                    weight,
+                    missing_correction,
+                },
+            )
     }
 }
 

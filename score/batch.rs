@@ -89,10 +89,9 @@ pub fn run_person_major_path(
 
                 // This temporary Vec holds the original FAM indices for only the people
                 // in the current block. This is a small, fast allocation.
-                let person_indices_in_block: Vec<OriginalPersonIndex> =
-                    prep_result.output_idx_to_fam_idx
-                        [person_output_start_idx..person_output_end_idx]
-                        .to_vec();
+                let person_indices_in_block: Vec<OriginalPersonIndex> = prep_result
+                    .output_idx_to_fam_idx[person_output_start_idx..person_output_end_idx]
+                    .to_vec();
 
                 process_block(
                     &person_indices_in_block,
@@ -390,23 +389,23 @@ pub(crate) fn process_tile_impl<'a>(
                 let score_chunk_end = (score_chunk_start + score_chunk_size).min(num_scores);
                 let score_chunk_len = score_chunk_end - score_chunk_start;
                 let score_chunk_lanes = score_chunk_len.div_ceil(SIMD_LANES);
-                let kernel_result_buffer = if score_chunk_lanes == kernel::MAX_KERNEL_ACCUMULATOR_LANES
-                {
-                    kernel::accumulate_adjustments_for_person(
-                        &weights,
-                        &g1_indices[..g1_count],
-                        &g2_indices[..g2_count],
-                        score_chunk_start,
-                    )
-                } else {
-                    kernel::accumulate_adjustments_for_person_lanes(
-                        &weights,
-                        &g1_indices[..g1_count],
-                        &g2_indices[..g2_count],
-                        score_chunk_start,
-                        score_chunk_lanes,
-                    )
-                };
+                let kernel_result_buffer =
+                    if score_chunk_lanes == kernel::MAX_KERNEL_ACCUMULATOR_LANES {
+                        kernel::accumulate_adjustments_for_person(
+                            &weights,
+                            &g1_indices[..g1_count],
+                            &g2_indices[..g2_count],
+                            score_chunk_start,
+                        )
+                    } else {
+                        kernel::accumulate_adjustments_for_person_lanes(
+                            &weights,
+                            &g1_indices[..g1_count],
+                            &g2_indices[..g2_count],
+                            score_chunk_start,
+                            score_chunk_lanes,
+                        )
+                    };
                 let score_chunk_out = &mut scores_out_slice[score_chunk_start..score_chunk_end];
                 for i in 0..score_chunk_lanes {
                     let scores_offset = i * SIMD_LANES;
@@ -654,7 +653,8 @@ pub fn run_variant_major_path(
                 for contribution in variant_view.iter() {
                     let col = contribution.score_column.0;
                     partial_missing_counts_out[scores_offset + col] += 1;
-                    partial_scores_out[scores_offset + col] -= contribution.missing_correction as f64;
+                    partial_scores_out[scores_offset + col] -=
+                        contribution.missing_correction as f64;
                 }
             }
 
@@ -696,10 +696,10 @@ mod tests {
         let sparse_score_columns = vec![0u32];
         let sparse_row_offsets = vec![0u64, 1u64];
 
-        let output_idx_to_fam_idx: Vec<crate::score::types::OriginalPersonIndex> =
-            (0..num_people as u32)
-                .map(crate::score::types::OriginalPersonIndex)
-                .collect();
+        let output_idx_to_fam_idx: Vec<crate::score::types::OriginalPersonIndex> = (0..num_people
+            as u32)
+            .map(crate::score::types::OriginalPersonIndex)
+            .collect();
         let mut person_fam_to_output_idx = vec![None; num_people];
         for (out_idx, fam_idx) in output_idx_to_fam_idx.iter().enumerate() {
             person_fam_to_output_idx[fam_idx.0 as usize] =
@@ -734,7 +734,10 @@ mod tests {
         )
     }
 
-    fn make_single_variant_multi_score_prep_result(num_people: usize, num_scores: usize) -> PreparationResult {
+    fn make_single_variant_multi_score_prep_result(
+        num_people: usize,
+        num_scores: usize,
+    ) -> PreparationResult {
         let score_names: Vec<String> = (0..num_scores).map(|i| format!("S{i}")).collect();
         let stride = num_scores.div_ceil(SIMD_LANES) * SIMD_LANES;
         let sparse_weights = vec![1.0f32; num_scores];
@@ -742,10 +745,10 @@ mod tests {
         let sparse_score_columns: Vec<u32> = (0..num_scores as u32).collect();
         let sparse_row_offsets = vec![0u64, num_scores as u64];
 
-        let output_idx_to_fam_idx: Vec<crate::score::types::OriginalPersonIndex> =
-            (0..num_people as u32)
-                .map(crate::score::types::OriginalPersonIndex)
-                .collect();
+        let output_idx_to_fam_idx: Vec<crate::score::types::OriginalPersonIndex> = (0..num_people
+            as u32)
+            .map(crate::score::types::OriginalPersonIndex)
+            .collect();
         let mut person_fam_to_output_idx = vec![None; num_people];
         for (out_idx, fam_idx) in output_idx_to_fam_idx.iter().enumerate() {
             person_fam_to_output_idx[fam_idx.0 as usize] =
@@ -899,7 +902,10 @@ mod tests {
         );
 
         for s in 0..num_scores {
-            assert!((scores[s] - 1.0).abs() < 1e-9, "person0 score mismatch at {s}");
+            assert!(
+                (scores[s] - 1.0).abs() < 1e-9,
+                "person0 score mismatch at {s}"
+            );
             assert!(
                 (scores[num_scores + s] - 2.0).abs() < 1e-9,
                 "person1 score mismatch at {s}"

@@ -288,7 +288,6 @@ impl BatchShape {
     fn unpack_elems(self) -> Result<usize, PipelineError> {
         checked_mul_usize("unpack_elems", self.dims.num_people, self.batch_len())
     }
-
 }
 
 pub fn try_run_cuda(
@@ -491,7 +490,8 @@ impl CudaRuntime {
                         None => selected = Some((mega, score_tile)),
                         Some((best_mega, best_tile)) => {
                             // Prefer larger score tiles first (better GEMM shape), then larger mega-batches.
-                            if score_tile > best_tile || (score_tile == best_tile && mega > best_mega)
+                            if score_tile > best_tile
+                                || (score_tile == best_tile && mega > best_mega)
                             {
                                 selected = Some((mega, score_tile));
                             }
@@ -503,8 +503,8 @@ impl CudaRuntime {
             }
         }
 
-        let (mega, gpu_score_chunk_size) =
-            selected.ok_or_else(|| "Insufficient GPU memory for minimum CUDA workload".to_string())?;
+        let (mega, gpu_score_chunk_size) = selected
+            .ok_or_else(|| "Insufficient GPU memory for minimum CUDA workload".to_string())?;
         eprintln!(
             "> CUDA tiling: mega_batch_variants={mega}, gpu_score_chunk_size={gpu_score_chunk_size}, vram_budget_bytes={budget}"
         );
@@ -521,7 +521,8 @@ impl CudaRuntime {
         let sparse_row_offsets = compute_stream
             .clone_htod(prep.sparse_row_offsets())
             .map_err(|e| format!("Failed to upload sparse row offsets: {e:?}"))?;
-        let host_output_map: Vec<u32> = prep.output_idx_to_fam_idx.iter().map(|idx| idx.0).collect();
+        let host_output_map: Vec<u32> =
+            prep.output_idx_to_fam_idx.iter().map(|idx| idx.0).collect();
         let output_map = compute_stream
             .clone_htod(&host_output_map)
             .map_err(|e| format!("Failed to upload output index map: {e:?}"))?;
@@ -1044,8 +1045,11 @@ fn process_dense_stream_cuda(
     let max_packed = checked_mul_usize("max_packed", mega, dims.bytes_per_variant)?;
     let max_weights_tile_elems =
         checked_mul_usize("max_weights_tile_elems", mega, gpu_score_chunk_size)?;
-    let max_tile_result_elems =
-        checked_mul_usize("max_tile_result_elems", dims.num_people, gpu_score_chunk_size)?;
+    let max_tile_result_elems = checked_mul_usize(
+        "max_tile_result_elems",
+        dims.num_people,
+        gpu_score_chunk_size,
+    )?;
     let mut d_packed_slots: Vec<CudaSlice<u8>> = (0..PIPELINE_SLOTS)
         .map(|_| {
             runtime
@@ -1334,13 +1338,16 @@ fn run_pending_compute_cuda(
             .map_err(map_driver_err("Failed to launch unpack_plink kernel"))?;
     }
 
-    let build_launch_elems =
-        checked_u32("build_batch_mats kernel launch elements", work.shape.batch_len())?;
+    let build_launch_elems = checked_u32(
+        "build_batch_mats kernel launch elements",
+        work.shape.batch_len(),
+    )?;
     for score_offset in (0..dims.num_scores).step_by(runtime.gpu_score_chunk_size) {
         let tile_scores = (dims.num_scores - score_offset).min(runtime.gpu_score_chunk_size);
         let tile_scores_i32 = checked_i32("tile_scores", tile_scores)?;
         let score_offset_i32 = checked_i32("score_offset", score_offset)?;
-        let weights_elems = checked_mul_usize("weights_elems", work.shape.batch_len(), tile_scores)?;
+        let weights_elems =
+            checked_mul_usize("weights_elems", work.shape.batch_len(), tile_scores)?;
         let tile_result_elems =
             checked_mul_usize("tile_result_elems", dims.num_people, tile_scores)?;
 
@@ -1407,7 +1414,9 @@ fn run_pending_compute_cuda(
                 &d_out_corr_slots[work.slot].slice(0..tile_result_elems),
                 &mut host_tile_corr_slots[work.slot][..tile_result_elems],
             )
-            .map_err(map_driver_err("Failed to copy correction tile output to host"))?;
+            .map_err(map_driver_err(
+                "Failed to copy correction tile output to host",
+            ))?;
         runtime
             .compute_stream
             .memcpy_dtoh(

@@ -1055,7 +1055,9 @@ fn process_sparse_stream(
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(consumer_threads)
         .build()
-        .map_err(|e| PipelineError::Compute(format!("Failed to build sparse consumer pool: {e}")))?;
+        .map_err(|e| {
+            PipelineError::Compute(format!("Failed to build sparse consumer pool: {e}"))
+        })?;
 
     // The fold/reduce pattern creates thread-local accumulators for scores and counts.
     // After processing a work item, its data buffer is immediately returned to the
@@ -1179,7 +1181,8 @@ fn process_dense_stream(
                             missing_corrections: &mut missing_corrections_for_batch,
                             stride,
                         };
-                        for (batch_row_idx, &reconciled_idx) in reconciled_indices.iter().enumerate()
+                        for (batch_row_idx, &reconciled_idx) in
+                            reconciled_indices.iter().enumerate()
                         {
                             let variant_view = prep_result.variant_csr_view(reconciled_idx);
                             for contribution in variant_view.iter() {

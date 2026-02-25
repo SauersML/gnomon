@@ -120,8 +120,11 @@ pub fn accumulate_adjustments_for_person(
         // This inner loop over score columns is the same performant structure as the original kernel.
         for i in 0..MAX_KERNEL_ACCUMULATOR_LANES {
             unsafe {
-                let weights_vec =
-                    weights.get_simd_lane_for_score_window_unchecked(matrix_row_idx, score_start, i);
+                let weights_vec = weights.get_simd_lane_for_score_window_unchecked(
+                    matrix_row_idx,
+                    score_start,
+                    i,
+                );
                 *accumulator_buffer.get_unchecked_mut(i) += weights_vec;
             }
         }
@@ -132,8 +135,11 @@ pub fn accumulate_adjustments_for_person(
         let matrix_row_idx = matrix_row_idx as usize;
         for i in 0..MAX_KERNEL_ACCUMULATOR_LANES {
             unsafe {
-                let weights_vec =
-                    weights.get_simd_lane_for_score_window_unchecked(matrix_row_idx, score_start, i);
+                let weights_vec = weights.get_simd_lane_for_score_window_unchecked(
+                    matrix_row_idx,
+                    score_start,
+                    i,
+                );
                 let adj = weights_vec + weights_vec;
                 *accumulator_buffer.get_unchecked_mut(i) += adj;
             }
@@ -177,8 +183,11 @@ pub fn accumulate_adjustments_for_person_lanes(
         let matrix_row_idx = matrix_row_idx as usize;
         for i in 0..lane_count {
             unsafe {
-                let weights_vec =
-                    weights.get_simd_lane_for_score_window_unchecked(matrix_row_idx, score_start, i);
+                let weights_vec = weights.get_simd_lane_for_score_window_unchecked(
+                    matrix_row_idx,
+                    score_start,
+                    i,
+                );
                 *accumulator_buffer.get_unchecked_mut(i) += weights_vec;
             }
         }
@@ -188,8 +197,11 @@ pub fn accumulate_adjustments_for_person_lanes(
         let matrix_row_idx = matrix_row_idx as usize;
         for i in 0..lane_count {
             unsafe {
-                let weights_vec =
-                    weights.get_simd_lane_for_score_window_unchecked(matrix_row_idx, score_start, i);
+                let weights_vec = weights.get_simd_lane_for_score_window_unchecked(
+                    matrix_row_idx,
+                    score_start,
+                    i,
+                );
                 let adj = weights_vec + weights_vec;
                 *accumulator_buffer.get_unchecked_mut(i) += adj;
             }

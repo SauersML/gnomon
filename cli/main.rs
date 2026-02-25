@@ -494,23 +494,22 @@ fn save_predictions_detailed(
                 // If calibrated predictions are available, use them, otherwise use uncalibrated
                 let p = calibrated_mean_opt.map_or(uncalibrated_p, |cal| cal[i]);
 
-                    let (se_str, lo_str, hi_str) = if let Some(se_eta) = se_eta_opt {
-                        let se = se_eta[i];
-                        let lo_eta = log_odds - 1.959964 * se;
-                        let hi_eta = log_odds + 1.959964 * se;
-                        let (lo_p, hi_p) = match link {
-                            LinkFunction::Logit => (
-                                1.0 / (1.0 + (-lo_eta).exp()),
-                                1.0 / (1.0 + (-hi_eta).exp()),
-                            ),
-                            LinkFunction::Probit => {
-                                (normal_cdf_approx(lo_eta), normal_cdf_approx(hi_eta))
-                            }
-                            LinkFunction::CLogLog => {
-                                (1.0 - (-lo_eta.exp()).exp(), 1.0 - (-hi_eta.exp()).exp())
-                            }
-                            LinkFunction::Identity => unreachable!(),
-                        };
+                let (se_str, lo_str, hi_str) = if let Some(se_eta) = se_eta_opt {
+                    let se = se_eta[i];
+                    let lo_eta = log_odds - 1.959964 * se;
+                    let hi_eta = log_odds + 1.959964 * se;
+                    let (lo_p, hi_p) = match link {
+                        LinkFunction::Logit => {
+                            (1.0 / (1.0 + (-lo_eta).exp()), 1.0 / (1.0 + (-hi_eta).exp()))
+                        }
+                        LinkFunction::Probit => {
+                            (normal_cdf_approx(lo_eta), normal_cdf_approx(hi_eta))
+                        }
+                        LinkFunction::CLogLog => {
+                            (1.0 - (-lo_eta.exp()).exp(), 1.0 - (-hi_eta.exp()).exp())
+                        }
+                        LinkFunction::Identity => unreachable!(),
+                    };
                     (
                         se.to_string(),
                         lo_p.max(0.0).min(1.0).to_string(),

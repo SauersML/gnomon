@@ -1,12 +1,12 @@
+use crate::calibrate::data::TrainingData;
+use crate::calibrate::estimate::EstimationError;
+use crate::calibrate::model::{InteractionPenaltyKind, ModelConfig};
 use gam::basis::{
     self, BasisOptions, Dense, KnotSource, create_basis, create_bspline_basis_nd_with_knots,
     create_difference_penalty_matrix,
 };
 use gam::construction::{frobenius_norm, row_wise_tensor_product};
-use crate::calibrate::data::TrainingData;
-use crate::calibrate::estimate::EstimationError;
 use gam::faer_ndarray::FaerSvd;
-use crate::calibrate::model::{InteractionPenaltyKind, ModelConfig};
 use ndarray::{Array1, Array2, Axis, s};
 use std::collections::HashMap;
 use std::ops::Range;
@@ -23,11 +23,7 @@ impl DifferencePenaltyCache {
         }
     }
 
-    fn get(
-        &mut self,
-        ncols: usize,
-        order: usize,
-    ) -> Result<Arc<Array2<f64>>, EstimationError> {
+    fn get(&mut self, ncols: usize, order: usize) -> Result<Arc<Array2<f64>>, EstimationError> {
         if let std::collections::hash_map::Entry::Vacant(e) = self.cache.entry((ncols, order)) {
             let dense = create_difference_penalty_matrix(ncols, order, None)
                 .map_err(|err| EstimationError::InvalidInput(err.to_string()))?;
@@ -349,7 +345,7 @@ pub fn build_design_and_penalty_matrices(
     (
         Array2<f64>,                  // design matrix
         Vec<Array2<f64>>,             // penalty matrices (dense)
-        DomainLayout,                  // model layout
+        DomainLayout,                 // model layout
         HashMap<String, Array2<f64>>, // sum_to_zero_constraints
         HashMap<String, Array1<f64>>, // knot_vectors
         HashMap<String, Array2<f64>>, // range_transforms
@@ -1326,7 +1322,9 @@ pub type ReparamInvariant = gam::construction::ReparamInvariant;
 pub type ReparamResult = gam::construction::ReparamResult;
 pub type StablePLSResult = gam::construction::StablePLSResult;
 
-pub fn calculate_condition_number(matrix: &Array2<f64>) -> Result<f64, gam::faer_ndarray::FaerLinalgError> {
+pub fn calculate_condition_number(
+    matrix: &Array2<f64>,
+) -> Result<f64, gam::faer_ndarray::FaerLinalgError> {
     gam::construction::calculate_condition_number(matrix)
 }
 
@@ -1410,8 +1408,6 @@ pub fn stable_reparameterization_with_invariant(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gam::basis::create_difference_penalty_matrix;
-    use gam::faer_ndarray::FaerEigh;
     use crate::calibrate::data::TrainingData;
     use crate::calibrate::estimate::train_model;
     use crate::calibrate::model::{
@@ -1420,6 +1416,8 @@ mod tests {
     };
     use approx::assert_abs_diff_eq;
     use faer::Side;
+    use gam::basis::create_difference_penalty_matrix;
+    use gam::faer_ndarray::FaerEigh;
     use ndarray::s;
     use ndarray::{Array1, Array2, array};
     use rand::rngs::StdRng;
@@ -2638,36 +2636,40 @@ mod tests {
     #[test]
     fn test_reparam_invariants_balanced_penalties() {
         let (rs_list, lambdas, layout) = create_synthetic_penalty_scenario("balanced");
-        let reparam =
-            stable_reparameterization(&rs_list, &lambdas, layout.total_coeffs).expect("balanced reparam");
+        let reparam = stable_reparameterization(&rs_list, &lambdas, layout.total_coeffs)
+            .expect("balanced reparam");
         assert_reparam_invariants(&reparam, &rs_list, &lambdas);
     }
 
     #[test]
     fn test_reparam_invariants_imbalanced_penalties() {
         let (rs_list, lambdas, layout) = create_synthetic_penalty_scenario("imbalanced");
-        let reparam = stable_reparameterization(&rs_list, &lambdas, layout.total_coeffs).expect("imbalanced");
+        let reparam =
+            stable_reparameterization(&rs_list, &lambdas, layout.total_coeffs).expect("imbalanced");
         assert_reparam_invariants(&reparam, &rs_list, &lambdas);
     }
 
     #[test]
     fn test_reparam_invariants_near_zero_penalties() {
         let (rs_list, lambdas, layout) = create_synthetic_penalty_scenario("near_zero");
-        let reparam = stable_reparameterization(&rs_list, &lambdas, layout.total_coeffs).expect("near_zero");
+        let reparam =
+            stable_reparameterization(&rs_list, &lambdas, layout.total_coeffs).expect("near_zero");
         assert_reparam_invariants(&reparam, &rs_list, &lambdas);
     }
 
     #[test]
     fn test_reparam_invariants_high_rank_penalties() {
         let (rs_list, lambdas, layout) = create_synthetic_penalty_scenario("high_rank");
-        let reparam = stable_reparameterization(&rs_list, &lambdas, layout.total_coeffs).expect("high_rank");
+        let reparam =
+            stable_reparameterization(&rs_list, &lambdas, layout.total_coeffs).expect("high_rank");
         assert_reparam_invariants(&reparam, &rs_list, &lambdas);
     }
 
     #[test]
     fn test_reparam_invariants_degenerate_penalties() {
         let (rs_list, lambdas, layout) = create_synthetic_penalty_scenario("degenerate");
-        let reparam = stable_reparameterization(&rs_list, &lambdas, layout.total_coeffs).expect("degenerate");
+        let reparam =
+            stable_reparameterization(&rs_list, &lambdas, layout.total_coeffs).expect("degenerate");
         assert_reparam_invariants(&reparam, &rs_list, &lambdas);
     }
 
@@ -2680,8 +2682,8 @@ mod tests {
         let (_, s_list, layout, _, _, _, _, _, _, _) =
             build_design_and_penalty_matrices(data_train, config).expect("build matrices");
         let rs_list = compute_penalty_square_roots(&s_list).expect("square roots");
-        let reparam =
-            stable_reparameterization(&rs_list, &trained.lambdas, layout.total_coeffs).expect("reparam");
+        let reparam = stable_reparameterization(&rs_list, &trained.lambdas, layout.total_coeffs)
+            .expect("reparam");
         assert_reparam_invariants(&reparam, &rs_list, &trained.lambdas);
 
         // --- Null space dimension check ---

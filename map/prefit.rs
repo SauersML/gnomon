@@ -7,9 +7,9 @@ use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
+use crate::shared::files::ensure_rustls_provider;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use crate::shared::files::ensure_rustls_provider;
 
 /// Information about a built-in pre-trained model.
 #[derive(Clone, Debug)]

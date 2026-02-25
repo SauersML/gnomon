@@ -1,15 +1,15 @@
+use faer::Side;
+use gam::basis::{BasisOptions, Dense, KnotSource, create_basis};
 pub use gam::estimate::{
     EstimationError, ExternalOptimOptions, ExternalOptimResult, FitOptions, FitResult,
     evaluate_external_cost_and_ridge, evaluate_external_gradients, fit_gam,
     optimize_external_design,
 };
-use gam::basis::{BasisOptions, Dense, KnotSource, create_basis};
 use gam::faer_ndarray::FaerCholesky;
 use gam::hmc;
 use gam::hull::build_peeled_hull;
 use gam::pirls::{self, PirlsStatus, WorkingModelPirlsOptions};
 use gam::types::Coefficients;
-use faer::Side;
 use ndarray::{Array1, Array2, s};
 use std::collections::HashMap;
 
@@ -17,7 +17,11 @@ fn map_survival_error(err: crate::calibrate::survival::SurvivalError) -> Estimat
     EstimationError::InvalidSpecification(err.to_string())
 }
 
-fn build_combined_penalty_matrix(s_list: &[Array2<f64>], lambdas: &Array1<f64>, p: usize) -> Array2<f64> {
+fn build_combined_penalty_matrix(
+    s_list: &[Array2<f64>],
+    lambdas: &Array1<f64>,
+    p: usize,
+) -> Array2<f64> {
     let mut penalty = Array2::<f64>::zeros((p, p));
     for (idx, s) in s_list.iter().enumerate() {
         let lambda = lambdas.get(idx).copied().unwrap_or(0.0);
@@ -57,12 +61,9 @@ fn run_gam_nuts_if_enabled(
         hessian,
         firth_bias_reduction,
     });
-    let nuts = hmc::run_nuts_sampling_flattened_family(
-        family,
-        inputs,
-        &config,
-    )
-    .map_err(|err| EstimationError::InvalidSpecification(format!("NUTS sampling failed: {err}")))?;
+    let nuts = hmc::run_nuts_sampling_flattened_family(family, inputs, &config).map_err(|err| {
+        EstimationError::InvalidSpecification(format!("NUTS sampling failed: {err}"))
+    })?;
     Ok(Some(nuts.samples))
 }
 
@@ -196,9 +197,7 @@ fn fit_survival_logit_calibrator(
         .clone()
         .unwrap_or_else(|| Array1::<f64>::zeros(n));
     let dist = Array1::<f64>::zeros(n);
-    let fisher_weights = pred
-        .conditional_risk
-        .mapv(|p| (p * (1.0 - p)).max(1e-8));
+    let fisher_weights = pred.conditional_risk.mapv(|p| (p * (1.0 - p)).max(1e-8));
     let alo_features = crate::calibrate::alo::CalibratorFeatures {
         pred: pred.logit_risk,
         se,
@@ -302,18 +301,10 @@ pub fn train_model(
         }
     };
     let family = match link {
-        gam::types::LinkFunction::Identity => {
-            gam::types::LikelihoodFamily::GaussianIdentity
-        }
-        gam::types::LinkFunction::Logit => {
-            gam::types::LikelihoodFamily::BinomialLogit
-        }
-        gam::types::LinkFunction::Probit => {
-            gam::types::LikelihoodFamily::BinomialProbit
-        }
-        gam::types::LinkFunction::CLogLog => {
-            gam::types::LikelihoodFamily::BinomialCLogLog
-        }
+        gam::types::LinkFunction::Identity => gam::types::LikelihoodFamily::GaussianIdentity,
+        gam::types::LinkFunction::Logit => gam::types::LikelihoodFamily::BinomialLogit,
+        gam::types::LinkFunction::Probit => gam::types::LikelihoodFamily::BinomialProbit,
+        gam::types::LinkFunction::CLogLog => gam::types::LikelihoodFamily::BinomialCLogLog,
     };
 
     let opts = FitOptions {
@@ -374,7 +365,8 @@ pub fn train_model(
             prior_weights: None,
             firth: CalibratorSpec::firth_default_for_link(link),
         };
-        let (x_cal, penalties, schema, cal_offset) = build_calibrator_design(&alo_features, &cal_spec)?;
+        let (x_cal, penalties, schema, cal_offset) =
+            build_calibrator_design(&alo_features, &cal_spec)?;
         let penalty_nullspace_dims = active_penalty_nullspace_dims(&schema, &penalties);
         let (cal_beta, cal_lambdas, cal_scale, _edf, _optim) = fit_calibrator(
             data.y.view(),
@@ -589,7 +581,8 @@ pub fn train_survival_model(
             age_transform: bundle.age_transform,
         };
         mortality_bundle.data.event_target = bundle.data.event_competing.clone();
-        mortality_bundle.data.event_competing = Array1::<u8>::zeros(bundle.data.event_competing.len());
+        mortality_bundle.data.event_competing =
+            Array1::<u8>::zeros(bundle.data.event_competing.len());
 
         let mut mortality_fit =
             fit_single_survival_model(&mortality_bundle, config, survival_cfg, survival_spec)?;
@@ -598,13 +591,14 @@ pub fn train_survival_model(
             mortality_fit.artifacts.mcmc_samples.as_ref(),
         ) {
             (Some(primary_samples), Some(mortality_samples)) => {
-                cross_covariance_primary_companion(primary_samples, mortality_samples)
-                    .or_else(|| {
+                cross_covariance_primary_companion(primary_samples, mortality_samples).or_else(
+                    || {
                         Some(Array2::<f64>::zeros((
                             primary_fit.artifacts.coefficients.len(),
                             mortality_fit.artifacts.coefficients.len(),
                         )))
-                    })
+                    },
+                )
             }
             _ => Some(Array2::<f64>::zeros((
                 primary_fit.artifacts.coefficients.len(),
@@ -613,10 +607,13 @@ pub fn train_survival_model(
         };
         mortality_fit.artifacts.cross_covariance_to_primary = cross_cov;
 
-        primary_fit.artifacts.companion_models.push(CompanionModelHandle {
-            reference: "__internal_mortality".to_string(),
-            cif_horizons: Vec::new(),
-        });
+        primary_fit
+            .artifacts
+            .companion_models
+            .push(CompanionModelHandle {
+                reference: "__internal_mortality".to_string(),
+                cif_horizons: Vec::new(),
+            });
         survival_companions.insert("__internal_mortality".to_string(), mortality_fit.artifacts);
     }
 
@@ -756,41 +753,43 @@ fn fit_single_survival_model(
             .iter()
             .map(|block| block.lambda.max(1e-12))
             .collect::<Vec<_>>();
-        let objective_with_gradient = |rho: &Array1<f64>| -> Result<(f64, Array1<f64>), EstimationError> {
-            let mut eval_layout = layout.clone();
-            for (block, &rho_i) in eval_layout.penalties.blocks.iter_mut().zip(rho.iter()) {
-                block.lambda = rho_i.exp();
-            }
-            let p = eval_layout.combined_exit.ncols();
-            let penalties = to_engine_survival_penalties(&eval_layout.penalties);
-            let mono = to_engine_survival_monotonicity(&monotonicity);
-            let spec = to_engine_survival_spec(&bundle.data);
-            let mut model = working_model_from_flattened(
-                penalties,
-                mono,
-                spec,
-                RoystonParmarInputs {
-                    age_entry: bundle.data.age_entry.view(),
-                    age_exit: bundle.data.age_exit.view(),
-                    event_target: bundle.data.event_target.view(),
-                    event_competing: bundle.data.event_competing.view(),
-                    weights: bundle.data.sample_weight.view(),
-                    x_entry: eval_layout.combined_entry.view(),
-                    x_exit: eval_layout.combined_exit.view(),
-                    x_derivative: eval_layout.combined_derivative_exit.view(),
-                },
-            )
-            .map_err(|e| EstimationError::InvalidSpecification(e.to_string()))?;
-            let result = pirls::run_working_model_pirls(
-                &mut model,
-                Coefficients::zeros(p),
-                &pirls_options,
-                |_| {},
-            )?;
-            let beta_arr: Array1<f64> = result.beta.clone().into();
-            let (value, grad) = model.laml_objective_and_rho_gradient(&beta_arr, &result.state)?;
-            Ok((value, grad))
-        };
+        let objective_with_gradient =
+            |rho: &Array1<f64>| -> Result<(f64, Array1<f64>), EstimationError> {
+                let mut eval_layout = layout.clone();
+                for (block, &rho_i) in eval_layout.penalties.blocks.iter_mut().zip(rho.iter()) {
+                    block.lambda = rho_i.exp();
+                }
+                let p = eval_layout.combined_exit.ncols();
+                let penalties = to_engine_survival_penalties(&eval_layout.penalties);
+                let mono = to_engine_survival_monotonicity(&monotonicity);
+                let spec = to_engine_survival_spec(&bundle.data);
+                let mut model = working_model_from_flattened(
+                    penalties,
+                    mono,
+                    spec,
+                    RoystonParmarInputs {
+                        age_entry: bundle.data.age_entry.view(),
+                        age_exit: bundle.data.age_exit.view(),
+                        event_target: bundle.data.event_target.view(),
+                        event_competing: bundle.data.event_competing.view(),
+                        weights: bundle.data.sample_weight.view(),
+                        x_entry: eval_layout.combined_entry.view(),
+                        x_exit: eval_layout.combined_exit.view(),
+                        x_derivative: eval_layout.combined_derivative_exit.view(),
+                    },
+                )
+                .map_err(|e| EstimationError::InvalidSpecification(e.to_string()))?;
+                let result = pirls::run_working_model_pirls(
+                    &mut model,
+                    Coefficients::zeros(p),
+                    &pirls_options,
+                    |_| {},
+                )?;
+                let beta_arr: Array1<f64> = result.beta.clone().into();
+                let (value, grad) =
+                    model.laml_objective_and_rho_gradient(&beta_arr, &result.state)?;
+                Ok((value, grad))
+            };
         let seed_strategy = if layout.penalties.blocks.len() >= 10 {
             gam::seeding::SeedStrategy::Light
         } else {
@@ -805,12 +804,13 @@ fn fit_single_survival_model(
                 bounds: (-12.0, 12.0),
             },
         };
-        let smooth_sol = gam::families::royston_parmar::optimize_survival_lambdas_with_multistart_with_gradient(
-            layout.penalties.blocks.len(),
-            Some(heuristic_lambdas.as_slice()),
-            objective_with_gradient,
-            &smooth_opts,
-        )?;
+        let smooth_sol =
+            gam::families::royston_parmar::optimize_survival_lambdas_with_multistart_with_gradient(
+                layout.penalties.blocks.len(),
+                Some(heuristic_lambdas.as_slice()),
+                objective_with_gradient,
+                &smooth_opts,
+            )?;
         for (block, &rho_i) in layout
             .penalties
             .blocks
@@ -819,10 +819,7 @@ fn fit_single_survival_model(
         {
             block.lambda = rho_i.exp();
         }
-        for (descriptor, &rho_i) in penalty_descriptors
-            .iter_mut()
-            .zip(smooth_sol.rho.iter())
-        {
+        for (descriptor, &rho_i) in penalty_descriptors.iter_mut().zip(smooth_sol.rho.iter()) {
             descriptor.lambda = rho_i.exp();
         }
     }
@@ -847,12 +844,8 @@ fn fit_single_survival_model(
         },
     )
     .map_err(|e| EstimationError::InvalidSpecification(e.to_string()))?;
-    let outcome = pirls::run_working_model_pirls(
-        &mut model,
-        Coefficients::zeros(p),
-        &pirls_options,
-        |_| {},
-    )?;
+    let outcome =
+        pirls::run_working_model_pirls(&mut model, Coefficients::zeros(p), &pirls_options, |_| {})?;
 
     if matches!(outcome.status, PirlsStatus::Unstable) {
         return Err(EstimationError::PirlsDidNotConverge {

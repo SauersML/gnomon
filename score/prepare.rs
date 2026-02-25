@@ -565,11 +565,7 @@ fn prepare_for_computation_with_retry(
                             let possible_contexts: Vec<_> = matches
                                 .iter()
                                 .map(|rec| {
-                                    (
-                                        rec.bim_row_index,
-                                        rec.allele1.clone(),
-                                        rec.allele2.clone(),
-                                    )
+                                    (rec.bim_row_index, rec.allele1.clone(), rec.allele2.clone())
                                 })
                                 .collect();
                             let score_info = (
@@ -578,7 +574,10 @@ fn prepare_for_computation_with_retry(
                                 score_record.effect_allele.to_string(),
                                 score_record.other_allele.to_string(),
                             );
-                            complex_for_key.entry(possible_contexts).or_default().push(score_info);
+                            complex_for_key
+                                .entry(possible_contexts)
+                                .or_default()
+                                .push(score_info);
                         }
                         ReconciliationOutcome::NotFound => {}
                     }
@@ -629,7 +628,8 @@ fn prepare_for_computation_with_retry(
 
                 for bim_row_index in key_required_indices {
                     required_bim_indices.push(bim_row_index);
-                    required_is_complex.push(u8::from(key_complex_indices.contains(&bim_row_index)));
+                    required_is_complex
+                        .push(u8::from(key_complex_indices.contains(&bim_row_index)));
 
                     if let Some(score_data_map) = simple_for_key.get(&bim_row_index) {
                         for (&score_col_idx, assignment) in score_data_map.iter() {
@@ -747,12 +747,8 @@ fn prepare_for_computation_with_retry(
 
     let num_reconciled_variants = required_bim_indices.len();
 
-    let (
-        sparse_weights,
-        sparse_missing_corrections,
-        sparse_score_columns,
-        sparse_row_offsets,
-    ) = csr_builder.into_parts();
+    let (sparse_weights, sparse_missing_corrections, sparse_score_columns, sparse_row_offsets) =
+        csr_builder.into_parts();
 
     if sparse_weights.len() != sparse_missing_corrections.len()
         || sparse_weights.len() != sparse_score_columns.len()
@@ -1459,12 +1455,7 @@ impl KWayMergeIterator {
 
                 let region_hits_slice = region_hits.as_deref_mut();
 
-                Self::read_line_into_buffer(
-                    stream,
-                    column_map,
-                    region_filters,
-                    region_hits_slice,
-                )?
+                Self::read_line_into_buffer(stream, column_map, region_filters, region_hits_slice)?
             };
 
             match outcome {

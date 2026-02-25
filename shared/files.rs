@@ -2087,7 +2087,9 @@ mod tests {
         let result = match rx.recv_timeout(Duration::from_secs(20)) {
             Ok(result) => result,
             Err(_) => {
-                eprintln!("Skipping {test_name}: timed out waiting for remote source initialization");
+                eprintln!(
+                    "Skipping {test_name}: timed out waiting for remote source initialization"
+                );
                 return Ok(None);
             }
         };
