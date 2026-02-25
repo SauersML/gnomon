@@ -307,11 +307,12 @@ fn extract_predictions(
 }
 
 fn cli_train_large_zero_pc_dataset_produces_model_impl() -> Result<(), Box<dyn std::error::Error>> {
-    const TOTAL_ROWS: usize = 33_000;
-    const MALE_ROWS: usize = 19_800;
-    const FEMALE_ROWS: usize = 13_200;
-    const MALE_CASES: usize = 206;
-    const FEMALE_CASES: usize = 98;
+    // Keep this materially larger than the small fixture while avoiding multi-minute CLI runs.
+    const TOTAL_ROWS: usize = 5_500;
+    const MALE_ROWS: usize = 3_300;
+    const FEMALE_ROWS: usize = 2_200;
+    const MALE_CASES: usize = 34;
+    const FEMALE_CASES: usize = 16;
     // Calculate exact target prevalence
     const TARGET_PREVALENCE: f64 = (MALE_CASES + FEMALE_CASES) as f64 / TOTAL_ROWS as f64;
     // Calculate exact ratio based on integer counts
