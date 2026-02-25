@@ -32,14 +32,83 @@ jobs:
       - name: Ensure perf tooling is available
         run: |
           set -euxo pipefail
-          if ! command -v perf >/dev/null 2>&1; then
-            sudo apt-get update
-            sudo apt-get install -y linux-tools-common linux-tools-generic || true
-            if ! command -v perf >/dev/null 2>&1; then
-              KERNEL="$(uname -r)"
-              sudo apt-get install -y "linux-tools-$KERNEL" || true
+          CURRENT_KERNEL="$(uname -r)"
+          KERNEL_NO_FLAVOR="${CURRENT_KERNEL%%-*}"
+          KERNEL_MAJOR_MINOR="$(echo "$CURRENT_KERNEL" | cut -d. -f1-2)"
+
+          sudo apt-get update -y
+
+          install_pkg_if_available() {
+            local pkg="$1"
+            if apt-cache policy "$pkg" 2>/dev/null | grep -q 'Candidate: (none)'; then
+              echo "Skipping unavailable package: $pkg"
+              return 1
+            else
+              sudo apt-get install -y --no-install-recommends "$pkg"
+              return 0
             fi
+          }
+
+          install_pkg_if_available linux-tools-common || true
+
+          HAVE_KERNEL_TOOLS=0
+          if install_pkg_if_available "linux-tools-${CURRENT_KERNEL}"; then
+            HAVE_KERNEL_TOOLS=1
           fi
+          install_pkg_if_available "linux-cloud-tools-${CURRENT_KERNEL}" || true
+
+          if [ "$HAVE_KERNEL_TOOLS" -eq 0 ]; then
+            install_pkg_if_available linux-tools-azure || true
+            install_pkg_if_available linux-cloud-tools-azure || true
+          fi
+
+          ensure_perf_symlink() {
+            local candidate
+            for candidate in \
+              "/usr/bin/perf_${CURRENT_KERNEL}" \
+              "/usr/bin/perf_${KERNEL_NO_FLAVOR}" \
+              "/usr/bin/perf_${KERNEL_MAJOR_MINOR}" \
+              "/usr/lib/linux-tools-${CURRENT_KERNEL}/perf" \
+              "/usr/lib/linux-tools-${KERNEL_NO_FLAVOR}/perf" \
+              "/usr/lib/linux-tools-${KERNEL_MAJOR_MINOR}/perf"; do
+              if [ -x "$candidate" ]; then
+                echo "Linking perf from $candidate"
+                sudo ln -sf "$candidate" /usr/local/bin/perf
+                return 0
+              fi
+            done
+
+            candidate=$(find /usr/lib/linux-tools -maxdepth 2 -type f -name perf -print -quit 2>/dev/null || true)
+            if [ -n "$candidate" ]; then
+              echo "Linking perf from $candidate"
+              sudo ln -sf "$candidate" /usr/local/bin/perf
+              return 0
+            fi
+
+            return 1
+          }
+
+          ensure_perf_symlink || true
+          hash -r || true
+
+          if ! command -v perf >/dev/null 2>&1; then
+            echo "::error::perf binary not found after installation attempts"
+            exit 1
+          fi
+
+          if ! perf --version >/dev/null 2>&1; then
+            echo "perf command exists but failed; retrying symlink resolution..."
+            ensure_perf_symlink || true
+            hash -r || true
+          fi
+
+          if ! perf --version >/dev/null 2>&1; then
+            echo "::error::perf is present but unusable for kernel ${CURRENT_KERNEL}"
+            command -v perf || true
+            perf --version || true
+            exit 1
+          fi
+
           perf --version
 
       - name: Allow perf events recording

@@ -284,7 +284,26 @@ if [ -x "$INSTALLED_BIN" ] && "$INSTALLED_BIN" --help >/dev/null 2>&1; then
     PATH_BIN="$(command -v gnomon 2>/dev/null || true)"
     if [ -n "$PATH_BIN" ] && [ "$PATH_BIN" != "$INSTALLED_BIN" ]; then
         log_info "Detected another gnomon in PATH before ${INSTALL_DIR}: ${PATH_BIN}"
-        if [ -w "$PATH_BIN" ]; then
+
+        # On Git Bash/Windows, `command -v gnomon` may return .../gnomon while the
+        # installed file is .../gnomon.exe; these can be the exact same file.
+        SAME_FILE=0
+        if [ -e "$PATH_BIN" ] && [ -e "$INSTALLED_BIN" ] && [ "$PATH_BIN" -ef "$INSTALLED_BIN" ]; then
+            SAME_FILE=1
+        elif [[ "$OS" == "windows" ]] && [[ "$INSTALLED_BIN" == *.exe ]]; then
+            # Git Bash often reports extensionless command paths (e.g. .../gnomon)
+            # even when the underlying file is .../gnomon.exe.
+            PATH_BIN_EXE="${PATH_BIN}.exe"
+            if [ "$PATH_BIN_EXE" = "$INSTALLED_BIN" ]; then
+                SAME_FILE=1
+            elif [ -e "$PATH_BIN_EXE" ] && [ "$PATH_BIN_EXE" -ef "$INSTALLED_BIN" ]; then
+                SAME_FILE=1
+            fi
+        fi
+
+        if [ "$SAME_FILE" -eq 1 ]; then
+            log_info "PATH binary already resolves to installed binary; skipping shadow update."
+        elif [ -w "$PATH_BIN" ]; then
             cp "$INSTALLED_BIN" "$PATH_BIN"
             chmod +x "$PATH_BIN"
             log_success "Updated shadowing binary at ${PATH_BIN}"
@@ -298,7 +317,7 @@ if [ -x "$INSTALLED_BIN" ] && "$INSTALLED_BIN" --help >/dev/null 2>&1; then
         echo -e "\n${ICON_ROCK}  ${BOLD}Run 'gnomon --help' to get started!${RESET}\n"
     else
         # Auto-add to PATH in shell config
-        PATH_LINE='export PATH="$HOME/.local/bin:$PATH"'
+        PATH_LINE="export PATH=\"${INSTALL_DIR}:\$PATH\""
         
         # Determine which shell config to update
         if [ -n "$ZSH_VERSION" ] || [[ "$SHELL" == *"zsh"* ]]; then

@@ -683,16 +683,28 @@ jobs:
             local pkg="$1"
             if apt-cache policy "$pkg" 2>/dev/null | grep -q 'Candidate: (none)'; then
               echo "Skipping unavailable package: $pkg"
+              return 1
             else
               sudo apt-get install -y --no-install-recommends "$pkg"
+              return 0
             fi
           }
 
           install_pkg_if_available linux-tools-common
-          install_pkg_if_available "linux-tools-${CURRENT_KERNEL}"
-          install_pkg_if_available "linux-cloud-tools-${CURRENT_KERNEL}"
-          install_pkg_if_available linux-tools-azure
-          install_pkg_if_available linux-cloud-tools-azure
+
+          HAVE_KERNEL_TOOLS=0
+          if install_pkg_if_available "linux-tools-${CURRENT_KERNEL}"; then
+            HAVE_KERNEL_TOOLS=1
+          fi
+          install_pkg_if_available "linux-cloud-tools-${CURRENT_KERNEL}" || true
+
+          # Fallback only when running-kernel packages are unavailable.
+          # Installing azure meta packages unconditionally can upgrade kernel packages
+          # during the job without reboot, leaving perf mismatched to uname -r.
+          if [ "$HAVE_KERNEL_TOOLS" -eq 0 ]; then
+            install_pkg_if_available linux-tools-azure || true
+            install_pkg_if_available linux-cloud-tools-azure || true
+          fi
 
           ensure_perf_symlink() {
             local candidate
@@ -720,12 +732,30 @@ jobs:
             return 1
           }
 
+          # `perf` may exist but still fail (wrapper mismatch for running kernel).
+          # Always try to point PATH at a concrete perf binary when possible.
+          ensure_perf_symlink || true
+          hash -r || true
+
           if ! command -v perf >/dev/null 2>&1; then
             ensure_perf_symlink || true
           fi
 
           if ! command -v perf >/dev/null 2>&1; then
             echo "::error::perf binary not found after installation attempts"
+            exit 1
+          fi
+
+          if ! perf --version >/dev/null 2>&1; then
+            echo "perf command exists but failed; retrying symlink resolution..."
+            ensure_perf_symlink || true
+            hash -r || true
+          fi
+
+          if ! perf --version >/dev/null 2>&1; then
+            echo "::error::perf is present but unusable for kernel ${CURRENT_KERNEL}"
+            command -v perf || true
+            perf --version || true
             exit 1
           fi
 
