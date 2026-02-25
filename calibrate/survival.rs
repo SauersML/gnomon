@@ -1,18 +1,19 @@
+use crate::calibrate::calibrator::CalibratorModel;
+use crate::calibrate::estimate::EstimationError;
 use gam::basis::{
     BasisError, BasisOptions, Dense, KnotSource, SplineScratch, baseline_lambda_seed, create_basis,
     create_difference_penalty_matrix, evaluate_bspline_basis_scalar, null_range_whiten,
 };
-use crate::calibrate::calibrator::CalibratorModel;
-use crate::calibrate::estimate::EstimationError;
 use gam::faer_ndarray::{FaerSvd, ldlt_rook};
 use gam::pirls::{WorkingModel as PirlsWorkingModel, WorkingState};
+use gam::survival as gam_survival;
 use gam::types::{Coefficients, LinearPredictor};
 use log::warn;
 use ndarray::prelude::*;
 use ndarray::{ArrayBase, Data, Ix1, Zip, concatenate};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use thiserror::Error;
 
 const DEFAULT_DERIVATIVE_GUARD: f64 = 1e-8;
@@ -2388,70 +2389,7 @@ pub fn conditional_absolute_risk(
     Ok(-(-delta_h).exp_m1())
 }
 
-/// Compute Gauss-Legendre quadrature nodes and weights for N points on interval [-1, 1].
-fn compute_gauss_legendre_nodes(n: usize) -> Vec<(f64, f64)> {
-    let mut nodes_weights = Vec::with_capacity(n);
-    let m = n.div_ceil(2);
-    let pi = std::f64::consts::PI;
-
-    for i in 0..m {
-        // Initial guess for the root using asymptotic approximation
-        let mut z = (pi * (i as f64 + 0.75) / (n as f64 + 0.5)).cos();
-        let mut pp = 0.0;
-
-        // Newton's method
-        for _ in 0..100 {
-            let mut p1 = 1.0;
-            let mut p2 = 0.0;
-            for j in 0..n {
-                let p3 = p2;
-                p2 = p1;
-                p1 = ((2.0 * j as f64 + 1.0) * z * p2 - j as f64 * p3) / (j as f64 + 1.0);
-            }
-            // p1 is P_n(z)
-            // pp is P'_n(z) calculated using derivative relation
-            pp = n as f64 * (z * p1 - p2) / (z * z - 1.0);
-            let z1 = z;
-            z = z1 - p1 / pp;
-
-            if (z - z1).abs() < 1e-14 {
-                break;
-            }
-        }
-
-        let x = z;
-        let w = 2.0 / ((1.0 - z * z) * pp * pp);
-
-        if !n.is_multiple_of(2) && i == m - 1 {
-            nodes_weights.push((0.0, w));
-        } else {
-            nodes_weights.push((-x, w));
-            nodes_weights.push((x, w));
-        }
-    }
-    nodes_weights.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-    nodes_weights
-}
-
-/// Returns cached Gauss-Legendre quadrature nodes and weights for N=40 on interval [-1, 1].
-/// High precision is required for accurate integration of spline products.
-/// Previously hardcoded as N=30 but values corresponded to N=40.
-fn gauss_legendre_quadrature() -> &'static [(f64, f64)] {
-    static CACHE: OnceLock<Vec<(f64, f64)>> = OnceLock::new();
-    CACHE.get_or_init(|| compute_gauss_legendre_nodes(40))
-}
-
-/// Compute Crude Risk (Real-world risk) via numerical integration.
-/// Result of crude risk calculation with gradients for uncertainty quantification.
-#[derive(Debug, Clone)]
-pub struct CrudeRiskResult {
-    /// The crude risk value (probability of event in time window)
-    pub risk: f64,
-    /// Gradient of risk with respect to disease model coefficients
-    pub disease_gradient: Array1<f64>,
-    /// Gradient of risk with respect to mortality model coefficients
-    pub mortality_gradient: Array1<f64>,
-}
+pub use gam_survival::CrudeRiskResult;
 
 /// Compute the Cumulative Incidence Function (Crude Risk) with competing mortality.
 /// P(Event in (t0, t1] | Survival to t0, Accounting for Competing Mortality)
@@ -2479,7 +2417,6 @@ pub fn calculate_crude_risk_quadrature<'a>(
         });
     }
 
-    // 1. Collect all knots from both models within range [t0, t1]
     let mut breakpoints = Vec::new();
     breakpoints.push(t0);
     breakpoints.push(t1);
@@ -2499,12 +2436,9 @@ pub fn calculate_crude_risk_quadrature<'a>(
     add_knots(disease_model);
     add_knots(mortality_model);
 
-    // Sort and deduplicate
     breakpoints.sort_by(|a, b| a.partial_cmp(b).unwrap());
     breakpoints.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
 
-    // 2. Pre-calculate baselines at t0 to normalize conditional survival
-    // H(u|t0) = H(u) - H(t0)
     let coeff_d = match disease_coeffs {
         Some(c) => {
             if c.len() != coeff_len_d {
@@ -2533,35 +2467,24 @@ pub fn calculate_crude_risk_quadrature<'a>(
     let h_dis_t0 = cumulative_hazard_with_coeffs(t0, covariates, disease_model, coeff_d)?;
     let h_mor_t0 = cumulative_hazard_with_coeffs(t0, covariates, mortality_model, coeff_m)?;
 
-    // Pre-allocate scratch for hot loop
-    // Determine max sizes
     let max_basis = disease_model
         .age_basis
         .knot_vector
         .len()
         .max(mortality_model.age_basis.knot_vector.len());
-    let max_pgs = 20; // Sufficient for most splines
+    let max_pgs = 20;
 
     let mut scratch_d = SurvivalScratch::new(disease_model.age_basis.degree, max_basis, max_pgs);
-
     let mut scratch_m = SurvivalScratch::new(mortality_model.age_basis.degree, max_basis, max_pgs);
 
     let mut design_d = Array1::zeros(coeff_len_d);
     let mut deriv_d = Array1::zeros(coeff_len_d);
-
     let mut design_m = Array1::zeros(coeff_len_m);
     let mut deriv_m = Array1::zeros(coeff_len_m);
 
     let disease_cache = SurvivalDesignCache::new(covariates, disease_model, &mut scratch_d)?;
     let mortality_cache = SurvivalDesignCache::new(covariates, mortality_model, &mut scratch_m)?;
 
-    // 3. Integrate segment by segment
-    let mut total_risk = 0.0;
-    let mut disease_gradient = Array1::zeros(coeff_len_d);
-    let mut mortality_gradient = Array1::zeros(coeff_len_m);
-    let nodes_weights = gauss_legendre_quadrature();
-
-    // Design row at entry age for gradient term involving H_D(t0) X(t0)
     design_and_derivative_at_age_cached(
         t0,
         disease_model,
@@ -2572,7 +2495,6 @@ pub fn calculate_crude_risk_quadrature<'a>(
     )?;
     let design_d_t0 = design_d.clone();
 
-    // Design row at entry age for mortality model (for H_M(t0) gradient)
     design_and_derivative_at_age_cached(
         t0,
         mortality_model,
@@ -2583,91 +2505,46 @@ pub fn calculate_crude_risk_quadrature<'a>(
     )?;
     let design_m_t0 = design_m.clone();
 
-    for i in 0..breakpoints.len() - 1 {
-        let a = breakpoints[i];
-        let b = breakpoints[i + 1];
-        let center = 0.5 * (b + a);
-        let half_width = 0.5 * (b - a);
-
-        for &(x, w) in nodes_weights {
-            let u = center + half_width * x;
-
-            // Eval Disease: h(u), H(u)
+    let result = gam_survival::calculate_crude_risk_quadrature(
+        t0,
+        t1,
+        &breakpoints,
+        h_dis_t0,
+        h_mor_t0,
+        design_d_t0.view(),
+        design_m_t0.view(),
+        |u, design_d_out, deriv_d_out, design_m_out| {
             design_and_derivative_at_age_cached(
                 u,
                 disease_model,
                 &disease_cache,
-                &mut design_d,
-                &mut deriv_d,
+                design_d_out,
+                deriv_d_out,
                 &mut scratch_d,
-            )?;
-
-            let eta_d = design_d.dot(&coeff_d);
-            let slope_d = deriv_d.dot(&coeff_d);
+            )
+            .map_err(|_| gam_survival::SurvivalError::InvalidIntegrationSetup)?;
+            let eta_d = design_d_out.dot(&coeff_d);
+            let slope_d = deriv_d_out.dot(&coeff_d);
             let hazard_d = eta_d.exp();
             let inst_hazard_d = (hazard_d * slope_d).max(0.0);
 
-            // Eval Mortality: H(u)
             design_and_derivative_at_age_cached(
                 u,
                 mortality_model,
                 &mortality_cache,
-                &mut design_m,
+                design_m_out,
                 &mut deriv_m,
                 &mut scratch_m,
-            )?;
-            let eta_m = design_m.dot(&coeff_m);
+            )
+            .map_err(|_| gam_survival::SurvivalError::InvalidIntegrationSetup)?;
+            let eta_m = design_m_out.dot(&coeff_m);
             let hazard_m = eta_m.exp();
+            Ok((inst_hazard_d, hazard_d, hazard_m))
+        },
+    )
+    .map_err(|e| SurvivalError::Calibrator(e.to_string()))?;
 
-            // Conditional Cumulative Hazards
-            // Ensure non-negative via max(0.0) to handle potential spline wiggle near t0
-            let h_dis_cond = (hazard_d - h_dis_t0).max(0.0);
-            let h_mor_cond = (hazard_m - h_mor_t0).max(0.0);
-
-            // Survival Function S_total(u|t0)
-            let s_total = (-(h_dis_cond + h_mor_cond)).exp();
-
-            // Accumulate risk
-            // Integral += h_dis(u) * S_total(u) * du
-            // weight scaled by half_width due to change of variables
-            total_risk += w * inst_hazard_d * s_total * half_width;
-
-            // ========== Disease Gradient ==========
-            // ∂Risk/∂β_d = ∫ (∂h_d/∂β_d * S - h_d * S * ∂H_d/∂β_d) du
-            if inst_hazard_d > 0.0 {
-                let weight = w * s_total * half_width;
-                let mut grad_contrib = design_d.mapv(|x| inst_hazard_d * (1.0 - hazard_d) * x);
-                grad_contrib.zip_mut_with(&deriv_d, |g, &d| {
-                    *g += hazard_d * d;
-                });
-                grad_contrib.zip_mut_with(&design_d_t0, |g, &x0| {
-                    *g += inst_hazard_d * h_dis_t0 * x0;
-                });
-                grad_contrib.mapv_inplace(|v| v * weight);
-                disease_gradient += &grad_contrib;
-            }
-
-            // ========== Mortality Gradient ==========
-            // ∂Risk/∂β_m = -∫ h_d(u) * S_total(u) * ∂H_m(u|t0)/∂β_m du
-            // where ∂H_m(u|t0)/∂β_m = H_m(u) * X_m(u) - H_m(t0) * X_m(t0)
-            // Since H_m = exp(η_m), ∂H_m/∂β_m = H_m * X_m
-            if inst_hazard_d > 0.0 && hazard_m > 0.0 {
-                let weight = w * inst_hazard_d * s_total * half_width;
-                // ∂H_m(u|t0)/∂β_m = H_m(u) * X_m(u) - H_m(t0) * X_m(t0)
-                let mut mort_grad_contrib = design_m.mapv(|x| -weight * hazard_m * x);
-                mort_grad_contrib.zip_mut_with(&design_m_t0, |g, &x0| {
-                    *g += weight * h_mor_t0 * x0;
-                });
-                mortality_gradient += &mort_grad_contrib;
-            }
-        }
-    }
-
-    Ok(CrudeRiskResult {
-        risk: total_risk,
-        disease_gradient,
-        mortality_gradient,
-    })
+    Ok(result)
 }
 
 pub fn survival_calibrator_features(
@@ -3946,8 +3823,7 @@ mod tests {
             }
             let rhs = d_exit.t().dot(&target);
             let factor =
-                gam::faer_ndarray::FaerCholesky::cholesky(&normal, faer::Side::Lower)
-                    .unwrap();
+                gam::faer_ndarray::FaerCholesky::cholesky(&normal, faer::Side::Lower).unwrap();
             beta = factor.solve_vec(&rhs);
             derivative_exit = d_exit.dot(&beta);
 
