@@ -17,7 +17,12 @@ path = "shared/lib.rs"
 name = "gnomon"
 path = "cli/main.rs"
 
+[features]
+default = []
+bench-path = []
+
 [dependencies]
+gam = { git = "https://github.com/SauersML/gam.git", rev = "05a9ede" }
 ahash = "0.8.12"
 clap = { version = "4.5.48", features = ["derive"] }
 memmap2 = "0.9.8"
@@ -49,6 +54,7 @@ noodles-bcf = "0.78.0"
 noodles-vcf = "0.81.0"
 noodles-bgzf = "0.43.0"
 reqwest = { version = "0.12.9", default-features = false, features = ["blocking", "rustls-tls-native-roots"] }
+rustls = { version = "0.23.36", features = ["ring"] }
 serde_json = "1.0.145"
 sysinfo = "0.30.12"
 ratatui = "0.30"
@@ -112,6 +118,7 @@ grep = "0.3.2"
 [[bench]]
 name = "path_benchmark"
 harness = false
+required-features = ["bench-path"]
 
 [[test]]
 name = "calibrate"

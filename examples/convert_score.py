@@ -155,9 +155,14 @@ def stream_download(url: str, destination: Path) -> None:
         raise RuntimeError(f"Download failed: {exc}") from exc
 
 
-def require_binary(name: str, install_hint: str) -> Path:
+def require_binary(name: str, install_hint: str, preferred: tuple[Path, ...] = ()) -> Path:
+    for candidate in preferred:
+        if candidate.exists() and candidate.is_file():
+            debug(f"Using local {name} at {candidate}")
+            return candidate
     found = shutil.which(name)
     if found:
+        debug(f"Using {name} at {found}")
         return Path(found)
     raise RuntimeError(f"{name} not found. Install with:\n  {install_hint}")
 
@@ -299,6 +304,10 @@ def main() -> None:
     gnomon = require_binary(
         "gnomon",
         "curl -fsSL https://raw.githubusercontent.com/SauersML/gnomon/main/install.sh | bash",
+        preferred=(
+            REPO_ROOT / "target" / "release" / "gnomon",
+            REPO_ROOT / "target" / "debug" / "gnomon",
+        ),
     )
     convert_genome = require_binary(
         "convert_genome",

@@ -8,13 +8,17 @@
 // for use with the gnomon scoring pipeline. It includes caching to avoid re-conversion
 // on repeated runs, and automatic reference genome downloading for DTC files.
 
+use convert_genome::cli::Sex;
 use convert_genome::input::InputFormat as ConvertInputFormat;
 use convert_genome::{ConversionConfig, OutputFormat, convert_dtc_file};
 use flate2::read::GzDecoder;
+use infer_sex::{GenomeBuild, InferredSex};
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+
+use crate::terms::infer_first_sample_sex;
 
 /// Reference genome sources: (FASTA URL, optional FAI URL)
 /// Sources with pre-built .fai indexes are preferred as they're more reliable
@@ -69,6 +73,25 @@ pub enum InputFormat {
     Bcf,
     /// Direct-to-consumer text format (23andMe, AncestryDNA, etc.)
     Dtc,
+}
+
+fn parse_genome_build_hint(build: &str) -> Option<GenomeBuild> {
+    let lower = build.to_ascii_lowercase();
+    if lower.contains("37") || lower.contains("hg19") || lower.contains("grch37") {
+        Some(GenomeBuild::Build37)
+    } else if lower.contains("38") || lower.contains("hg38") || lower.contains("grch38") {
+        Some(GenomeBuild::Build38)
+    } else {
+        None
+    }
+}
+
+fn to_convert_sex(inferred: InferredSex) -> Sex {
+    match inferred {
+        InferredSex::Male => Sex::Male,
+        InferredSex::Female => Sex::Female,
+        InferredSex::Indeterminate => Sex::Unknown,
+    }
 }
 
 /// Detects the input format based on file extension.
@@ -405,6 +428,22 @@ pub fn ensure_plink_format(
             };
 
             let assembly = build.unwrap_or("GRCh38").to_string();
+            let build_hint = parse_genome_build_hint(&assembly);
+            let inferred_sex = match infer_first_sample_sex(input_path, build_hint) {
+                Ok(Some(sex)) => {
+                    let convert_sex = to_convert_sex(sex);
+                    eprintln!("> Inferred sample sex from input: {:?}", convert_sex);
+                    convert_sex
+                }
+                Ok(None) => {
+                    eprintln!("> Sex inference produced no sample calls; defaulting to Unknown");
+                    Sex::Unknown
+                }
+                Err(err) => {
+                    eprintln!("> Sex inference unavailable ({err}); defaulting to Unknown");
+                    Sex::Unknown
+                }
+            };
 
             // No reference needed for VCF/BCF - they have embedded reference info
             let config = ConversionConfig {
@@ -421,7 +460,7 @@ pub fn ensure_plink_format(
                 sample_id: "sample".to_string(),
                 assembly,
                 include_reference_sites: false,
-                sex: None,
+                sex: Some(inferred_sex),
                 par_boundaries: None,
                 standardize: false,
                 panel: panel.map(|p| p.to_path_buf()),

@@ -25,14 +25,21 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install gnomon
-        run: curl -fsSL https://raw.githubusercontent.com/SauersML/gnomon/main/install.sh | bash
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Build local gnomon
+        env:
+          GNOMON_SKIP_LINT_CHECKS: 1
+        run: cargo +nightly build --release
 
       - name: Install convert_genome
         run: curl -fsSL https://raw.githubusercontent.com/SauersML/convert_genome/main/install.sh | bash
 
-      - name: Add local binaries to PATH
-        run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Add binaries to PATH (prefer local build)
+        run: |
+          echo "$GITHUB_WORKSPACE/target/release" >> "$GITHUB_PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Run convert_score example
         run: python examples/convert_score.py

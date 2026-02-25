@@ -1,39 +1,34 @@
-use crate::calibrate::basis::{
+use gam::basis::{
     BasisError, BasisOptions, Dense, KnotSource, apply_weighted_orthogonality_constraint,
     compute_greville_abscissae, create_basis, create_difference_penalty_matrix,
 };
-use crate::calibrate::estimate::EstimationError;
-use crate::calibrate::faer_ndarray::FaerArrayView;
+use crate::calibrate::alo::CalibratorFeatures;
 #[cfg(test)]
-use crate::calibrate::faer_ndarray::{FaerColView, fast_ata};
-use crate::calibrate::hull::PeeledHull;
-use crate::calibrate::model::{BasisConfig, LinkFunction};
-use crate::calibrate::pirls::{self, PirlsStatus}; // for PirlsResult
+use crate::calibrate::alo::compute_alo_features_from_pirls;
+use crate::calibrate::estimate::EstimationError;
+use gam::matrix::DesignMatrix;
+use gam::probability::normal_cdf_approx;
+#[cfg(test)]
+use gam::faer_ndarray::FaerArrayView;
+#[cfg(test)]
+use gam::faer_ndarray::{FaerColView, fast_ata};
+use crate::calibrate::model::BasisConfig;
+use gam::types::LinkFunction;
+use gam::pirls::PirlsStatus; // for PirlsResult
+#[cfg(test)]
+use gam::pirls;
 
-use faer::Mat as FaerMat;
-use faer::Side;
-use faer::linalg::matmul::matmul;
-use faer::linalg::solvers::{Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve};
-use faer::{Accum, Par};
+#[cfg(test)]
+use faer::linalg::solvers::Solve as FaerSolve;
 use ndarray::parallel::prelude::*;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, Zip, s};
 use serde::{Deserialize, Serialize};
-use std::cmp::Ordering;
 use std::collections::HashSet;
 // Use the shared optimizer facade from estimate.rs
 use crate::calibrate::estimate::{
     ExternalOptimOptions, ExternalOptimResult, optimize_external_design,
 };
 use rayon::slice::ParallelSliceMut;
-
-/// Features used to train the calibrator GAM
-pub struct CalibratorFeatures {
-    pub pred: Array1<f64>,           // η̃ (logit) or μ̃ (identity)
-    pub se: Array1<f64>,             // SẼ on the same scale
-    pub dist: Array1<f64>,           // signed distance to peeled hull (negative inside)
-    pub pred_identity: Array1<f64>,  // baseline η (or μ) to preserve with identity backbone
-    pub fisher_weights: Array1<f64>, // final PIRLS weights (prior × Fisher) for metric-aware ops
-}
 
 /// Configuration of the calibrator smooths and penalties
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -70,6 +65,7 @@ impl CalibratorSpec {
     pub fn firth_default_for_link(link: LinkFunction) -> Option<FirthSpec> {
         match link {
             LinkFunction::Logit => Some(FirthSpec::all_enabled()),
+            LinkFunction::Probit => None,
             LinkFunction::Identity => None,
         }
     }
@@ -97,16 +93,13 @@ pub struct CalibratorModel {
 
     // SE is log-transformed before standardization for better variance modeling.
     // Log-space is natural for variance (multiplicative effects, like GAMLSS).
-    // Default true for new models; false for backwards compatibility with old serialized models.
     #[serde(default = "default_true")]
     pub se_log_space: bool,
 
     // Flag for SE wiggle-only drop when SE range is negligible
-    #[serde(alias = "se_linear_fallback")]
     pub se_wiggle_only_drop: bool,
 
     // Flag for distance wiggle-only drop when distance range is negligible
-    #[serde(alias = "dist_linear_fallback")]
     pub dist_wiggle_only_drop: bool,
 
     // Fitted lambdas
@@ -282,7 +275,7 @@ pub struct InternalSchema {
     pub pred_param_range: std::ops::Range<usize>,
 }
 
-pub(crate) fn active_penalty_nullspace_dims(
+pub fn active_penalty_nullspace_dims(
     schema: &InternalSchema,
     penalties: &[Array2<f64>],
 ) -> Vec<usize> {
@@ -303,381 +296,6 @@ pub(crate) fn active_penalty_nullspace_dims(
             (max_abs > tol).then_some(dim)
         })
         .collect()
-}
-
-/// Compute ALO features (η̃/μ̃, SẼ, signed distance) from a single base fit
-pub fn compute_alo_features(
-    base: &pirls::PirlsResult,
-    y: ArrayView1<f64>,
-    raw_train: ArrayView2<f64>,
-    hull_opt: Option<&PeeledHull>,
-    link: LinkFunction,
-) -> Result<CalibratorFeatures, EstimationError> {
-    let x_dense = base.x_transformed.to_dense();
-    let n = x_dense.nrows();
-
-    // Prepare U = sqrt(W) X and z
-    let w = &base.final_weights;
-    let sqrt_w = w.mapv(f64::sqrt);
-    let mut u = x_dense.clone();
-    let sqrt_w_col = sqrt_w.view().insert_axis(Axis(1));
-    u *= &sqrt_w_col;
-
-    // K = X' W X + S_λ from PIRLS; add tiny ridge for numerical consistency with stabilized usage elsewhere
-    let mut k = base.penalized_hessian_transformed.clone();
-    // Tiny ridge for numerical consistency with stabilized Hessian usage elsewhere.
-    for d in 0..k.nrows() {
-        k[[d, d]] += 1e-12;
-    }
-    let p = k.nrows();
-    let k_view = FaerArrayView::new(&k);
-
-    enum Factor {
-        Llt(FaerLlt<f64>),
-        Ldlt(FaerLdlt<f64>),
-    }
-    impl Factor {
-        fn solve(&self, rhs: faer::MatRef<'_, f64>) -> FaerMat<f64> {
-            match self {
-                Factor::Llt(f) => f.solve(rhs),
-                Factor::Ldlt(f) => f.solve(rhs),
-            }
-        }
-    }
-
-    let factor = if let Ok(f) = FaerLlt::new(k_view.as_ref(), Side::Lower) {
-        // SPD fast path
-        Factor::Llt(f)
-    } else {
-        // Robust to semi-definiteness / near-rank-deficiency without changing K
-        Factor::Ldlt(FaerLdlt::new(k_view.as_ref(), Side::Lower).map_err(|_| {
-            EstimationError::ModelIsIllConditioned {
-                condition_number: f64::INFINITY,
-            }
-        })?)
-    };
-
-    let ut = u.t(); // p x n
-    // Precompute Xᵀ W X = Uᵀ U (U = sqrt(W) X). This is required for the
-    // Fisher prediction variance in penalized models.
-    let xtwx = ut.dot(&u);
-
-    // Gaussian dispersion φ (use PIRLS final weights)
-    let phi = match link {
-        LinkFunction::Logit => 1.0,
-        LinkFunction::Identity => {
-            let mut rss = 0.0;
-            for i in 0..n {
-                let r = y[i] - base.final_mu[i];
-                let wi = base.final_weights[i];
-                rss += wi * r * r;
-            }
-            // In Gaussian P-IRLS, the working weights encode observation precision
-            // (w_i = 1 / Var(y_i | μ_i)).  The weighted residual sum of squares therefore
-            // has expectation φ (n - edf), regardless of the absolute scale of the weights.
-            // Using ∑ w_i in the denominator would incorrectly scale the dispersion whenever
-            // the weights differ from 1.  We must divide by the residual degrees of freedom in
-            // terms of the actual number of observations.
-            let dof = (n as f64) - base.edf;
-            let denom = dof.max(1.0);
-            rss / denom
-        }
-    };
-
-    // Solve K S = Uᵀ once and reuse it to compute leverage and variances efficiently.
-    let xtwx_view = FaerArrayView::new(&xtwx);
-    let mut aii = Array1::<f64>::zeros(n);
-    let mut se_naive = Array1::<f64>::zeros(n);
-    let eta_hat = x_dense.dot(base.beta_transformed.as_ref());
-    let z = &base.solve_working_response;
-
-    let mut diag_counter = 0;
-    let max_diag_samples = 5;
-
-    let mut percentiles_data = Vec::with_capacity(n);
-    let mut sum_aii = 0.0_f64;
-    let mut max_aii = f64::NEG_INFINITY;
-    let mut invalid_count = 0usize;
-    let mut high_leverage_count = 0usize;
-    let mut a_hi_90 = 0usize;
-    let mut a_hi_95 = 0usize;
-    let mut a_hi_99 = 0usize;
-
-    let block_cols = 8192usize;
-
-    let mut rhs_chunk_buf = Array2::<f64>::zeros((p, block_cols));
-    let mut t_chunk_storage = FaerMat::<f64>::zeros(p, block_cols);
-
-    for chunk_start in (0..n).step_by(block_cols) {
-        let chunk_end = (chunk_start + block_cols).min(n);
-        let width = chunk_end - chunk_start;
-
-        rhs_chunk_buf
-            .slice_mut(s![.., ..width])
-            .assign(&ut.slice(s![.., chunk_start..chunk_end]));
-
-        let rhs_chunk_view = rhs_chunk_buf.slice(s![.., ..width]);
-        let rhs_chunk = FaerArrayView::new(&rhs_chunk_view);
-        let s_chunk = factor.solve(rhs_chunk.as_ref());
-        // SAFETY: `t_chunk_storage` was allocated with `block_cols` columns. Each
-        // chunk width is bounded by `block_cols`, so resizing the view cannot
-        // exceed the underlying capacity.
-        unsafe {
-            t_chunk_storage.set_dims(p, width);
-        }
-        matmul(
-            t_chunk_storage.as_mut(),
-            Accum::Replace,
-            xtwx_view.as_ref(),
-            s_chunk.as_ref(),
-            1.0,
-            Par::Seq,
-        );
-        let t_chunk = t_chunk_storage.as_ref();
-        let s_col_stride = s_chunk.col_stride();
-        let t_col_stride = t_chunk.col_stride();
-        assert!(s_col_stride >= 0 && t_col_stride >= 0);
-        let s_col_stride = s_col_stride as usize;
-        let t_col_stride = t_col_stride as usize;
-        let s_ptr = s_chunk.as_ptr();
-        let t_ptr = t_chunk.as_ptr();
-
-        for local_col in 0..width {
-            let obs = chunk_start + local_col;
-            let u_row = u.row(obs);
-            // SAFETY: `FaerMat` stores each column contiguously with stride
-            // `col_stride`, so slicing `p` elements from the column offset stays
-            // inside initialized data for both `s_chunk` and `t_chunk`.
-            let s_col =
-                unsafe { std::slice::from_raw_parts(s_ptr.add(local_col * s_col_stride), p) };
-            let t_col =
-                unsafe { std::slice::from_raw_parts(t_ptr.add(local_col * t_col_stride), p) };
-            let mut ai = 0.0f64;
-            let mut quad = 0.0f64;
-            for ((&s_val, &t_val), &u_val) in s_col.iter().zip(t_col.iter()).zip(u_row.iter()) {
-                ai = s_val.mul_add(u_val, ai);
-                quad = s_val.mul_add(t_val, quad);
-            }
-            aii[obs] = ai;
-            percentiles_data.push(ai);
-
-            if ai.is_finite() {
-                sum_aii += ai;
-            } else {
-                sum_aii = f64::NAN;
-            }
-
-            if ai.is_finite() {
-                max_aii = max_aii.max(ai);
-            }
-
-            if !(0.0..=1.0).contains(&ai) || !ai.is_finite() {
-                invalid_count += 1;
-                eprintln!(
-                    "[CAL] WARNING: Invalid leverage at i={}, a_ii={:.6e}",
-                    obs, ai
-                );
-            } else if ai > 0.99 {
-                high_leverage_count += 1;
-                if ai > 0.999 {
-                    eprintln!("[CAL] Very high leverage at i={}, a_ii={:.6e}", obs, ai);
-                }
-            }
-
-            if ai > 0.90 {
-                a_hi_90 += 1;
-            }
-            if ai > 0.95 {
-                a_hi_95 += 1;
-            }
-            if ai > 0.99 {
-                a_hi_99 += 1;
-            }
-
-            let wi = base.final_weights[obs].max(1e-12);
-
-            // NOTE: If the original weight w_i is zero (e.g., near-separation in logistic
-            // regression), then u_i = sqrt(w_i) * x_i = 0, so quad = 0 and var_full = 0.
-            // This results in SE = 0, which incorrectly implies infinite confidence.
-            // In practice, zero weights only occur at complete separation (μ=0 or μ=1),
-            // which indicates a degenerate fit. We warn if this happens.
-            let var_full = phi * (quad / wi);
-            if var_full == 0.0 && base.final_weights[obs] < 1e-10 {
-                eprintln!(
-                    "[CAL] WARNING: obs {} has near-zero weight ({:.2e}) resulting in SE=0",
-                    obs, base.final_weights[obs]
-                );
-            }
-            let se_full = var_full.max(0.0).sqrt();
-
-            // Use naive (full-sample) SE for train/inference consistency.
-            // At inference, we compute delta-method SE which is equivalent to se_full.
-            // ALO-inflated SE would cause a mismatch since new observations have no self-influence.
-            se_naive[obs] = se_full;
-
-            if diag_counter < max_diag_samples {
-                println!("[GNOMON DIAG] SE formula (obs {}):", obs);
-                println!("  - w_i: {:.6e}", wi);
-                println!("  - a_ii: {:.6e}", ai);
-                println!("  - var_full: {:.6e}", var_full);
-                println!("  - SE_naive: {:.6e}", se_full);
-                diag_counter += 1;
-            }
-        }
-    }
-
-    if invalid_count > 0 || high_leverage_count > 0 {
-        eprintln!(
-            "[CAL] Leverage diagnostics: {} invalid values, {} high values (>0.99)",
-            invalid_count, high_leverage_count
-        );
-    }
-
-    // LOO predictor using the ALO formula - compute more carefully with proper diagnostics
-    // (reusing the leverage_eta_tilde array from above would be more efficient, but we do this
-    // calculation from scratch for clarity and to add additional diagnostics)
-    let mut eta_tilde = Array1::<f64>::zeros(n);
-    for i in 0..n {
-        // Robust ALO denominator with epsilon floor
-        let denom_raw = 1.0 - aii[i];
-        let denom = if denom_raw <= 1e-12 {
-            eprintln!(
-                "[CAL] WARNING: 1 - a_ii ≤ eps at i={}, a_ii={:.6e}",
-                i, aii[i]
-            );
-            1e-12
-        } else {
-            denom_raw
-        };
-
-        // CORRECT ALO predictor formula using the Sherman-Morrison identity:
-        //   η̂^{(-i)} = (η̂_i - a_ii * z_i) / (1 - a_ii)
-        //
-        // Mathematical justification:
-        // - Define z_i = η̂_i + (y_i - μ_i)/v_i as the working response
-        // - The LOO predictor is β̂^{(-i)} * x_i, where β̂^{(-i)} is fit without obs i
-        // - Using the Sherman-Morrison formula for the rank-1 update to the inverse:
-        //    η̂^{(-i)} = (η̂_i - a_ii z_i) / (1 - a_ii)
-        //    where a_ii = x_i^T(X^TWX)^{-1}x_i is the leverage
-        //
-        // This formula is mathematically correct even when denom is very small
-        // and provides exact LOO predictions for linear/linearized models
-
-        if denom <= 1e-4 {
-            // Log warning when leverage is close to 1
-            eprintln!(
-                "[CAL] ALO 1-a_ii very small at i={}, a_ii={:.6e}",
-                i, aii[i]
-            );
-        }
-
-        eta_tilde[i] = (eta_hat[i] - aii[i] * z[i]) / denom;
-
-        // Optional: soft-clip extreme values if needed
-        if !eta_tilde[i].is_finite() || eta_tilde[i].abs() > 1e6 {
-            eprintln!(
-                "[CAL] ALO eta_tilde extreme value at i={}: {}, capping",
-                i, eta_tilde[i]
-            );
-            eta_tilde[i] = eta_tilde[i].clamp(-1e6, 1e6);
-        }
-    }
-
-    // Comprehensive leverage and dispersion diagnostics
-    // These metrics help identify potential numerical issues or ill-conditioned fits
-    let mut percentiles = percentiles_data;
-
-    // Calculate percentiles safely even with small n
-    let p50_idx = if n > 1 {
-        ((0.50_f64 * (n as f64 - 1.0)).round() as usize).min(n - 1)
-    } else {
-        0
-    };
-    let p95_idx = if n > 1 {
-        ((0.95_f64 * (n as f64 - 1.0)).round() as usize).min(n - 1)
-    } else {
-        0
-    };
-    let p99_idx = if n > 1 {
-        ((0.99_f64 * (n as f64 - 1.0)).round() as usize).min(n - 1)
-    } else {
-        0
-    };
-
-    let mut percentile_value = |idx: usize| -> f64 {
-        if percentiles.is_empty() {
-            0.0
-        } else {
-            let target = idx.min(percentiles.len() - 1);
-            let (_, nth, _) = percentiles
-                .select_nth_unstable_by(target, |a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
-            *nth
-        }
-    };
-
-    // Calculate key statistics
-    let a_mean: f64 = if n == 0 { 0.0 } else { sum_aii / (n as f64) };
-    let a_median = percentile_value(p50_idx);
-    let a_p95 = percentile_value(p95_idx);
-    let a_p99 = percentile_value(p99_idx);
-    let a_max = if max_aii.is_finite() { max_aii } else { 0.0 };
-
-    eprintln!(
-        "[CAL] ALO leverage: n={}, mean={:.3e}, median={:.3e}, p95={:.3e}, p99={:.3e}, max={:.3e}",
-        n, a_mean, a_median, a_p95, a_p99, a_max
-    );
-    eprintln!(
-        "[CAL] ALO high-leverage: a>0.90: {:.2}%, a>0.95: {:.2}%, a>0.99: {:.2}%, dispersion phi={:.3e}",
-        100.0 * (a_hi_90 as f64) / (n as f64).max(1.0),
-        100.0 * (a_hi_95 as f64) / (n as f64).max(1.0),
-        100.0 * (a_hi_99 as f64) / (n as f64).max(1.0),
-        phi
-    );
-
-    // Signed distance to peeled hull for raw predictors (zeros if no hull)
-    let dist = if let Some(hull) = hull_opt {
-        hull.signed_distance_many(raw_train)
-    } else {
-        Array1::zeros(raw_train.nrows())
-    };
-
-    // For Identity link, pred is mean (same as eta). For Logit, pred is eta.
-    let pred = match link {
-        LinkFunction::Logit => eta_tilde,
-        LinkFunction::Identity => eta_tilde,
-    };
-
-    // Perform final sanity checks on ALO features before returning
-    let has_nan_pred = pred.iter().any(|&x| x.is_nan());
-    let has_nan_se = se_naive.iter().any(|&x| x.is_nan());
-    let has_nan_dist = dist.iter().any(|&x| x.is_nan());
-
-    if has_nan_pred || has_nan_se || has_nan_dist {
-        eprintln!("[CAL] ERROR: NaN values found in ALO features:");
-        eprintln!(
-            "      - pred: {} NaN values",
-            pred.iter().filter(|&&x| x.is_nan()).count()
-        );
-        eprintln!(
-            "      - se: {} NaN values",
-            se_naive.iter().filter(|&&x| x.is_nan()).count()
-        );
-        eprintln!(
-            "      - dist: {} NaN values",
-            dist.iter().filter(|&&x| x.is_nan()).count()
-        );
-        return Err(EstimationError::ModelIsIllConditioned {
-            condition_number: f64::INFINITY,
-        });
-    }
-
-    Ok(CalibratorFeatures {
-        pred,
-        se: se_naive,
-        dist,
-        pred_identity: eta_hat,
-        fisher_weights: base.final_weights.clone(),
-    })
 }
 
 /// Build calibrator design matrix, penalties and schema from features and spec
@@ -2022,11 +1640,11 @@ pub fn predict_calibrator(
         Array2::<f64>::zeros((n, 0))
     } else {
         let (b_pred_raw_arc, _) =
-            crate::calibrate::basis::create_basis::<crate::calibrate::basis::Dense>(
+            gam::basis::create_basis::<gam::basis::Dense>(
                 pred_std.view(),
-                crate::calibrate::basis::KnotSource::Provided(model.knots_pred.view()),
+                gam::basis::KnotSource::Provided(model.knots_pred.view()),
                 model.spec.pred_basis.degree,
-                crate::calibrate::basis::BasisOptions::value(),
+                gam::basis::BasisOptions::value(),
             )?;
         let b_pred_raw = (*b_pred_raw_arc).clone();
         b_pred_raw.dot(&model.pred_constraint_transform)
@@ -2047,11 +1665,11 @@ pub fn predict_calibrator(
         Array2::<f64>::zeros((n, 0))
     } else {
         let (b_se_raw_arc, _) =
-            crate::calibrate::basis::create_basis::<crate::calibrate::basis::Dense>(
+            gam::basis::create_basis::<gam::basis::Dense>(
                 se_std.view(),
-                crate::calibrate::basis::KnotSource::Provided(model.knots_se.view()),
+                gam::basis::KnotSource::Provided(model.knots_se.view()),
                 model.spec.se_basis.degree,
-                crate::calibrate::basis::BasisOptions::value(),
+                gam::basis::BasisOptions::value(),
             )?;
         let b_se_raw = (*b_se_raw_arc).clone();
         b_se_raw.dot(&model.stz_se)
@@ -2061,11 +1679,11 @@ pub fn predict_calibrator(
         Array2::<f64>::zeros((n, 0))
     } else {
         let (b_dist_raw_arc, _) =
-            crate::calibrate::basis::create_basis::<crate::calibrate::basis::Dense>(
+            gam::basis::create_basis::<gam::basis::Dense>(
                 dist_std.view(),
-                crate::calibrate::basis::KnotSource::Provided(model.knots_dist.view()),
+                gam::basis::KnotSource::Provided(model.knots_dist.view()),
                 model.spec.dist_basis.degree,
-                crate::calibrate::basis::BasisOptions::value(),
+                gam::basis::BasisOptions::value(),
             )?;
         let b_dist_raw = (*b_dist_raw_arc).clone();
         b_dist_raw.dot(&model.stz_dist)
@@ -2138,6 +1756,7 @@ pub fn predict_calibrator(
 
             probs
         }
+        LinkFunction::Probit => eta.mapv(normal_cdf_approx),
         LinkFunction::Identity => {
             // For identity link, eta is the result
             eta
@@ -2175,6 +1794,7 @@ pub fn fit_calibrator(
     ),
     EstimationError,
 > {
+    let x_design = DesignMatrix::Dense(x.to_owned());
     // Row-shape sanity checks
     if !(y.len() == prior_weights.len() && y.len() == x.nrows() && y.len() == offset.len()) {
         return Err(EstimationError::InvalidInput(format!(
@@ -2250,12 +1870,16 @@ pub fn fit_calibrator(
 
     let attempt_fit =
         |firth_override: Option<&FirthSpec>| -> Result<ExternalOptimResult, EstimationError> {
+            let family = match link {
+                LinkFunction::Logit => gam::types::LikelihoodFamily::BinomialLogit,
+                LinkFunction::Probit => gam::types::LikelihoodFamily::BinomialProbit,
+                LinkFunction::Identity => gam::types::LikelihoodFamily::GaussianIdentity,
+            };
             let opts = ExternalOptimOptions {
-                link,
+                family,
                 max_iter: 75,
                 tol: 1e-3,
                 nullspace_dims: active_null_dims.clone(),
-                firth: firth_override.cloned(),
             };
             if matches!(link, LinkFunction::Logit) {
                 match firth_override {
@@ -2270,7 +1894,14 @@ pub fn fit_calibrator(
                 active_penalty_count,
                 link
             );
-            optimize_external_design(y, prior_weights, x, offset, &active_penalties, &opts)
+            optimize_external_design(
+                y,
+                prior_weights,
+                &x_design,
+                offset,
+                active_penalties.clone(),
+                &opts,
+            )
         };
 
     fn pirls_status_stable(status: &PirlsStatus) -> bool {
@@ -2466,12 +2097,13 @@ pub fn fit_calibrator(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::calibrate::basis::null_range_whiten;
-    use crate::calibrate::construction::{ModelLayout, compute_penalty_square_roots};
+    use gam::basis::null_range_whiten;
+    use crate::calibrate::construction::{EngineLayout, compute_penalty_square_roots};
     use crate::calibrate::estimate::evaluate_external_gradients;
-    use crate::calibrate::faer_ndarray::FaerCholesky;
+    use gam::faer_ndarray::FaerCholesky;
+    use gam::faer_ndarray::FaerLdlt;
     use crate::calibrate::model::ModelConfig;
-    use crate::calibrate::types::LogSmoothingParamsView;
+    use gam::types::LogSmoothingParamsView;
     use faer::Mat as FaerMat;
     use faer::Side;
     use faer::linalg::solvers::Llt as FaerLlt;
@@ -2503,14 +2135,16 @@ mod tests {
         rs_blocks: &[Array2<f64>],
         rho: &[f64],
     ) -> LamlBreakdown {
-        use crate::calibrate::construction::{ModelLayout, compute_penalty_square_roots};
+        use crate::calibrate::construction::{EngineLayout, compute_penalty_square_roots};
         use crate::calibrate::model::ModelConfig;
 
         let rho_arr = Array1::from_vec(rho.to_vec());
-        let layout = ModelLayout::external(x.ncols(), rs_blocks.len());
+        let layout = EngineLayout::external(x.ncols(), rs_blocks.len());
         let firth_active = CalibratorSpec::firth_default_for_link(LinkFunction::Logit)
             .map_or(false, |spec| spec.enabled);
         let cfg = ModelConfig::external(LinkFunction::Logit, 1e-3, 75, firth_active);
+        let engine_cfg = crate::calibrate::model::to_engine_model_config(&cfg)
+            .expect("engine config conversion");
         let rs_list = compute_penalty_square_roots(rs_blocks).expect("penalty roots");
 
         let (pirls, _) = pirls::fit_model_for_fixed_rho(
@@ -2522,8 +2156,8 @@ mod tests {
             &rs_list,
             None,
             None,
-            &layout,
-            &cfg,
+            layout.total_coeffs,
+            &engine_cfg,
             None,
             None, // No SE for log-det computation
         )
@@ -2580,12 +2214,14 @@ mod tests {
         rho: &[f64],
         scale: f64, // Gaussian dispersion parameter
     ) -> f64 {
-        use crate::calibrate::construction::{ModelLayout, compute_penalty_square_roots};
+        use crate::calibrate::construction::{EngineLayout, compute_penalty_square_roots};
         use crate::calibrate::model::ModelConfig;
 
         let rho_arr = Array1::from_vec(rho.to_vec());
-        let layout = ModelLayout::external(x.ncols(), rs_blocks.len());
+        let layout = EngineLayout::external(x.ncols(), rs_blocks.len());
         let cfg = ModelConfig::external(LinkFunction::Identity, 1e-3, 75, false);
+        let engine_cfg = crate::calibrate::model::to_engine_model_config(&cfg)
+            .expect("engine config conversion");
         let rs_list = compute_penalty_square_roots(rs_blocks).expect("penalty roots");
 
         let (pirls, _) = pirls::fit_model_for_fixed_rho(
@@ -2597,8 +2233,8 @@ mod tests {
             &rs_list,
             None,
             None,
-            &layout,
-            &cfg,
+            layout.total_coeffs,
+            &engine_cfg,
             None,
             None, // No SE for Identity link
         )
@@ -3061,8 +2697,10 @@ mod tests {
         let rho = Array1::<f64>::zeros(0);
         let offset = Array1::<f64>::zeros(n);
 
-        let layout = ModelLayout::external(p, 0);
+        let layout = EngineLayout::external(p, 0);
         let cfg = ModelConfig::external(link, 1e-10, 100, matches!(link, LinkFunction::Logit));
+        let engine_cfg = crate::calibrate::model::to_engine_model_config(&cfg)
+            .expect("engine config conversion");
 
         let (pirls_result, _) = pirls::fit_model_for_fixed_rho(
             LogSmoothingParamsView::new(rho.view()),
@@ -3073,8 +2711,8 @@ mod tests {
             &rs_original,
             None,
             None,
-            &layout,
-            &cfg,
+            layout.total_coeffs,
+            &engine_cfg,
             None,
             None, // No SE for test helper
         )
@@ -3114,7 +2752,7 @@ mod tests {
         let x_dense = fit_res.x_transformed.to_dense();
 
         // Run ALO with our fixed code
-        let alo_features = compute_alo_features(&fit_res, y.view(), x.view(), None, link).unwrap();
+        let alo_features = compute_alo_features_from_pirls(&fit_res, y.view(), x.view(), None, link).unwrap();
 
         // Now implement the old buggy calculation manually to compare
         let n_test = 10; // Just test a few points for comparison
@@ -3187,7 +2825,7 @@ mod tests {
         let x_dense = fit_res.x_transformed.to_dense();
 
         // Compute ALO features
-        compute_alo_features(&fit_res, y.view(), x.view(), None, link).unwrap();
+        compute_alo_features_from_pirls(&fit_res, y.view(), x.view(), None, link).unwrap();
 
         // Extract hat diagonal elements using the LLT approach (matches compute_alo_features implementation)
         let mut aii = Array1::<f64>::zeros(n);
@@ -3291,7 +2929,7 @@ mod tests {
 
         let fit_with_zero = real_unpenalized_fit(&x, &y, &w_zero, link);
         let x_zero_dense = fit_with_zero.x_transformed.to_dense();
-        compute_alo_features(&fit_with_zero, y.view(), x.view(), None, link).unwrap();
+        compute_alo_features_from_pirls(&fit_with_zero, y.view(), x.view(), None, link).unwrap();
 
         // Check directly with small custom calculation
         let mut u_zero = x_zero_dense.clone();
@@ -3349,7 +2987,7 @@ mod tests {
         let x_full_dense = full_fit.x_transformed.to_dense();
 
         // Compute ALO features
-        let alo_features = compute_alo_features(&full_fit, y.view(), x.view(), None, link).unwrap();
+        let alo_features = compute_alo_features_from_pirls(&full_fit, y.view(), x.view(), None, link).unwrap();
 
         // Build the exact Sherman–Morrison LOO baseline using the full-fit Fisher geometry
         let w_full = full_fit.final_weights.clone();
@@ -3491,7 +3129,7 @@ mod tests {
         let link = LinkFunction::Logit;
 
         let full_fit = real_unpenalized_fit(&x, &y, &w, link);
-        let alo_full = compute_alo_features(&full_fit, y.view(), x.view(), None, link).unwrap();
+        let alo_full = compute_alo_features_from_pirls(&full_fit, y.view(), x.view(), None, link).unwrap();
 
         let mut loo_pred = Array1::<f64>::zeros(n);
         let mut loo_se = Array1::<f64>::zeros(n);
@@ -3594,7 +3232,7 @@ mod tests {
         let link = LinkFunction::Logit;
 
         let full_fit = real_unpenalized_fit(&x, &y, &w, link);
-        let alo = compute_alo_features(&full_fit, y.view(), x.view(), None, link)
+        let alo = compute_alo_features_from_pirls(&full_fit, y.view(), x.view(), None, link)
             .expect("compute_alo_features should succeed");
 
         // Compute full-sample naive SE using the EXACT formula from compute_alo_features:
@@ -3711,7 +3349,7 @@ mod tests {
         let link = LinkFunction::Identity;
 
         let full_fit = real_unpenalized_fit(&x, &y, &w, link);
-        let alo = compute_alo_features(&full_fit, y.view(), x.view(), None, link)
+        let alo = compute_alo_features_from_pirls(&full_fit, y.view(), x.view(), None, link)
             .expect("compute_alo_features should succeed");
 
         // Compute full-sample naive SE using the EXACT formula from compute_alo_features:
@@ -3828,7 +3466,7 @@ mod tests {
         let n = points.nrows();
 
         // Build a peeled hull from the points
-        let hull = crate::calibrate::hull::build_peeled_hull(&points, 3).unwrap();
+        let hull = gam::hull::build_peeled_hull(&points, 3).unwrap();
 
         // Compute signed distances to the hull
         let signed_distances = hull.signed_distance_many(points.view());
@@ -3989,11 +3627,11 @@ mod tests {
 
         let pred_std = Array1::zeros(n);
         let (b_pred_raw, _) =
-            crate::calibrate::basis::create_basis::<crate::calibrate::basis::Dense>(
+            gam::basis::create_basis::<gam::basis::Dense>(
                 pred_std.view(),
-                crate::calibrate::basis::KnotSource::Provided(schema.knots_pred.view()),
+                gam::basis::KnotSource::Provided(schema.knots_pred.view()),
                 spec.pred_basis.degree,
-                crate::calibrate::basis::BasisOptions::value(),
+                gam::basis::BasisOptions::value(),
             )
             .unwrap();
 
@@ -4296,8 +3934,10 @@ mod tests {
 
         // Prepare fixed-ρ PIRLS inputs so we can compare explicit smoothing levels without REML
         let w = Array1::<f64>::ones(n);
-        let layout = ModelLayout::external(x_with_ridge.ncols(), penalties_with_ridge.len());
+        let layout = EngineLayout::external(x_with_ridge.ncols(), penalties_with_ridge.len());
         let cfg = ModelConfig::external(LinkFunction::Identity, 1e-3, 75, false);
+        let engine_cfg = crate::calibrate::model::to_engine_model_config(&cfg)
+            .expect("engine config conversion");
         let penalty_roots =
             compute_penalty_square_roots(&penalties_with_ridge).expect("penalty roots");
 
@@ -4313,8 +3953,8 @@ mod tests {
             &penalty_roots,
             None,
             None,
-            &layout,
-            &cfg,
+            layout.total_coeffs,
+            &engine_cfg,
             None,
             None, // No SE for test
         )
@@ -4328,8 +3968,8 @@ mod tests {
             &penalty_roots,
             None,
             None,
-            &layout,
-            &cfg,
+            layout.total_coeffs,
+            &engine_cfg,
             None,
             None, // No SE for test
         )
@@ -4543,23 +4183,23 @@ mod tests {
 
         // Create ExternalOptimOptions
         let opts = crate::calibrate::estimate::ExternalOptimOptions {
-            link: LinkFunction::Identity,
+            family: gam::types::LikelihoodFamily::GaussianIdentity,
             max_iter: 50,
             tol: 1e-3_f64,
             nullspace_dims: penalty_nullspace_dims.clone(),
-            firth: CalibratorSpec::firth_default_for_link(LinkFunction::Identity),
         };
 
         // Set uniform weights
         let w = Array1::<f64>::ones(n);
 
         // Run the external optimizer directly so we can inspect the stabilized state
+        let x_design = DesignMatrix::Dense(x.clone());
         let optim_result = optimize_external_design(
             y.view(),
             w.view(),
-            x.view(),
+            &x_design,
             offset.view(),
-            &active_penalties,
+            active_penalties.clone(),
             &opts,
         )
         .expect("Calibrator REML optimization should succeed");
@@ -4589,10 +4229,11 @@ mod tests {
 
         // Compare analytic and finite-difference gradients at the stabilized rho
         let rho = optim_result.lambdas.mapv(f64::ln);
+        let x_design = DesignMatrix::Dense(x.clone());
         let (grad_analytic, grad_fd) = evaluate_external_gradients(
             y.view(),
             w.view(),
-            x.view(),
+            &x_design,
             offset.view(),
             &active_penalties,
             &opts,
@@ -4897,7 +4538,7 @@ mod tests {
         let base_fit = real_unpenalized_fit(&fake_x, &y, &w, LinkFunction::Logit);
 
         // Generate ALO features
-        let mut alo_features = compute_alo_features(
+        let mut alo_features = compute_alo_features_from_pirls(
             &base_fit,
             y.view(),
             fake_x.view(),
@@ -5091,7 +4732,7 @@ mod tests {
 
             let base_fit = real_unpenalized_fit(&jittered_fake_x, &y, &w, LinkFunction::Logit);
 
-            let mut alo_features = compute_alo_features(
+            let mut alo_features = compute_alo_features_from_pirls(
                 &base_fit,
                 y.view(),
                 jittered_fake_x.view(),
@@ -5242,7 +4883,7 @@ mod tests {
         let fake_x = Array2::from_shape_fn((n, 1), |(i, _)| distorted_logits[i]);
         let base_fit = real_unpenalized_fit(&fake_x, &y, &w, LinkFunction::Logit);
 
-        let mut alo_features = compute_alo_features(
+        let mut alo_features = compute_alo_features_from_pirls(
             &base_fit,
             y.view(),
             fake_x.view(),
@@ -5410,7 +5051,7 @@ mod tests {
 
         // Generate ALO features
         let alo_features =
-            compute_alo_features(&base_fit, y.view(), x.view(), None, LinkFunction::Logit).unwrap();
+            compute_alo_features_from_pirls(&base_fit, y.view(), x.view(), None, LinkFunction::Logit).unwrap();
 
         // Create calibrator spec
         let spec = CalibratorSpec {
@@ -5549,7 +5190,7 @@ mod tests {
 
         let fit = real_unpenalized_fit(&x, &y, &Array1::<f64>::ones(n), LinkFunction::Logit);
         let alo_features =
-            compute_alo_features(&fit, y.view(), x.view(), None, LinkFunction::Logit).unwrap();
+            compute_alo_features_from_pirls(&fit, y.view(), x.view(), None, LinkFunction::Logit).unwrap();
 
         let spec = CalibratorSpec {
             link: LinkFunction::Logit,
@@ -5654,7 +5295,7 @@ mod tests {
         let w = Array1::<f64>::ones(n);
         let base_fit = real_unpenalized_fit(&x, &y, &w, LinkFunction::Logit);
         let alo_features =
-            compute_alo_features(&base_fit, y.view(), x.view(), None, LinkFunction::Logit).unwrap();
+            compute_alo_features_from_pirls(&base_fit, y.view(), x.view(), None, LinkFunction::Logit).unwrap();
 
         let spec = CalibratorSpec {
             link: LinkFunction::Logit,
@@ -5959,7 +5600,7 @@ mod tests {
         // Just test that we can fit a calibrator
         let base_fit = real_unpenalized_fit(&x, &y, &w, LinkFunction::Logit);
         let alo_features =
-            compute_alo_features(&base_fit, y.view(), x.view(), None, LinkFunction::Logit).unwrap();
+            compute_alo_features_from_pirls(&base_fit, y.view(), x.view(), None, LinkFunction::Logit).unwrap();
 
         let features = CalibratorFeatures {
             pred: alo_features.pred,
@@ -6195,7 +5836,7 @@ mod tests {
 
         // Generate ALO features
         let alo_features =
-            compute_alo_features(&base_fit, y.view(), x.view(), None, LinkFunction::Logit).unwrap();
+            compute_alo_features_from_pirls(&base_fit, y.view(), x.view(), None, LinkFunction::Logit).unwrap();
 
         // Create calibrator spec
         let spec = CalibratorSpec {
@@ -7025,14 +6666,14 @@ mod tests {
         let w = Array1::<f64>::ones(n);
         let base_fit1 = real_unpenalized_fit(&x, &y, &w, LinkFunction::Logit);
         let features1 =
-            compute_alo_features(&base_fit1, y.view(), x.view(), None, LinkFunction::Logit)
+            compute_alo_features_from_pirls(&base_fit1, y.view(), x.view(), None, LinkFunction::Logit)
                 .unwrap();
         let (beta1, lambdas1) = create_calibrator(&features1);
 
         // Second run - should be identical
         let base_fit2 = real_unpenalized_fit(&x, &y, &w, LinkFunction::Logit);
         let features2 =
-            compute_alo_features(&base_fit2, y.view(), x.view(), None, LinkFunction::Logit)
+            compute_alo_features_from_pirls(&base_fit2, y.view(), x.view(), None, LinkFunction::Logit)
                 .unwrap();
         let (beta2, lambdas2) = create_calibrator(&features2);
 
@@ -7080,7 +6721,7 @@ mod tests {
         // Compare results for small dataset using both original and blocked computation
         // Note: This is checking the internal implementation of compute_alo_features
         // which uses blocking for large datasets but direct computation for small ones
-        compute_alo_features(&small_fit, y_small.view(), x_small.view(), None, link).unwrap();
+        compute_alo_features_from_pirls(&small_fit, y_small.view(), x_small.view(), None, link).unwrap();
 
         // Now test performance on large dataset
         let start = Instant::now();
@@ -7091,7 +6732,7 @@ mod tests {
 
         // Time just the ALO computation
         let alo_start = Instant::now();
-        compute_alo_features(&large_fit, y_large.view(), x_large.view(), None, link).unwrap();
+        compute_alo_features_from_pirls(&large_fit, y_large.view(), x_large.view(), None, link).unwrap();
         let alo_duration = alo_start.elapsed();
 
         eprintln!(
@@ -7125,7 +6766,7 @@ mod tests {
         let base_fit = real_unpenalized_fit(&x, &y, &w, link);
 
         // Generate ALO features
-        let alo_features = compute_alo_features(&base_fit, y.view(), x.view(), None, link).unwrap();
+        let alo_features = compute_alo_features_from_pirls(&base_fit, y.view(), x.view(), None, link).unwrap();
 
         // Create calibrator spec with enough knots to get ~p_cal parameters
         let spec = CalibratorSpec {
@@ -7501,7 +7142,7 @@ mod tests {
         let fake_x = Array2::from_shape_fn((n, 1), |(i, _)| eta_base[i]);
         let base_fit = real_unpenalized_fit(&fake_x, &y, &w, LinkFunction::Logit);
 
-        let mut alo_features = compute_alo_features(
+        let mut alo_features = compute_alo_features_from_pirls(
             &base_fit,
             y.view(),
             fake_x.view(),
@@ -7783,7 +7424,7 @@ mod tests {
 
         // Compute ALO features
         let alo_features =
-            compute_alo_features(&fit_res, y.view(), x.view(), None, LinkFunction::Logit).unwrap();
+            compute_alo_features_from_pirls(&fit_res, y.view(), x.view(), None, LinkFunction::Logit).unwrap();
 
         // Get inputs for manual SE calculation using the final PIRLS weights
         let sqrt_w = fit_res.final_weights.mapv(f64::sqrt);

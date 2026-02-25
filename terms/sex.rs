@@ -129,10 +129,14 @@ const SEX_TSV_HEADER: &str = concat!(
 enum TermsProgress {
     Terminal(ProgressBar),
     Plain { last_percent: u64 },
+    Silent,
 }
 
 impl TermsProgress {
-    fn new(total_variants: usize) -> Self {
+    fn new(total_variants: usize, enabled: bool) -> Self {
+        if !enabled {
+            return Self::Silent;
+        }
         let total = total_variants as u64;
         if std::io::stderr().is_terminal() {
             let pb =
@@ -163,6 +167,7 @@ impl TermsProgress {
                     eprintln!("Inferring sex terms: {percent}% complete...");
                 }
             }
+            Self::Silent => {}
         }
     }
 
@@ -178,6 +183,7 @@ impl TermsProgress {
                     eprintln!("Inferring sex terms: 100% complete.");
                 }
             }
+            Self::Silent => {}
         }
     }
 }
@@ -186,9 +192,28 @@ pub fn infer_sex_to_tsv(
     genotype_path: &Path,
     force_build: Option<GenomeBuild>,
 ) -> Result<PathBuf, SexInferenceError> {
-    let dataset = GenotypeDataset::open(genotype_path)?;
+    let (dataset, build, records) = infer_records(genotype_path, force_build, true)?;
     let default_output = dataset.output_path("sex.tsv");
 
+    write_results(&default_output, &records, build)?;
+
+    Ok(default_output)
+}
+
+pub fn infer_first_sample_sex(
+    genotype_path: &Path,
+    force_build: Option<GenomeBuild>,
+) -> Result<Option<InferredSex>, SexInferenceError> {
+    let (_, _, records) = infer_records(genotype_path, force_build, false)?;
+    Ok(records.first().map(|record| record.inference.final_call))
+}
+
+fn infer_records(
+    genotype_path: &Path,
+    force_build: Option<GenomeBuild>,
+    show_progress: bool,
+) -> Result<(GenotypeDataset, GenomeBuild, Vec<SexInferenceRecord>), SexInferenceError> {
+    let dataset = GenotypeDataset::open(genotype_path)?;
     let variant_keys = dataset.variant_keys_for_plan(&SelectionPlan::All)?;
     let build = force_build.unwrap_or_else(|| {
         let inferred = infer_build_from_keys(&variant_keys);
@@ -196,16 +221,14 @@ pub fn infer_sex_to_tsv(
         inferred
     });
     let selection = SexVariantSelection::from_all_keys(&variant_keys, build);
-    let records = collect_inference(&dataset, &selection)?;
-
-    write_results(&default_output, &records, build)?;
-
-    Ok(default_output)
+    let records = collect_inference(&dataset, &selection, show_progress)?;
+    Ok((dataset, build, records))
 }
 
 fn collect_inference(
     dataset: &GenotypeDataset,
     selection: &SexVariantSelection,
+    show_progress: bool,
 ) -> Result<Vec<SexInferenceRecord>, SexInferenceError> {
     let sample_ids: Vec<String> = dataset
         .samples()
@@ -231,7 +254,7 @@ fn collect_inference(
     let block_capacity = 256usize;
     let mut storage = vec![f64::NAN; block_capacity * n_samples];
     let mut processed = 0usize;
-    let mut progress = TermsProgress::new(total_variants);
+    let mut progress = TermsProgress::new(total_variants, show_progress);
 
     while processed < total_variants {
         progress.update(processed, total_variants);

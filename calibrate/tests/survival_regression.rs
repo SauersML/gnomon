@@ -78,6 +78,7 @@ struct TrustedReferenceFixture {
     event_competing: Vec<u8>,
     sample_weight: Vec<f64>,
     pgs: Vec<f64>,
+    #[serde(rename = "sex")]
     sex: Vec<f64>,
     pcs: Vec<Vec<f64>>,
     extra_static_covariates: Vec<Vec<f64>>,

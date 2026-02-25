@@ -628,8 +628,9 @@ mod tests {
         assert_eq!(bundle.data.age_entry.len(), 3);
         assert_eq!(bundle.age_transform.minimum_age, 50.0);
         assert_eq!(bundle.data.sample_weight[1], 2.0);
+        assert_eq!(bundle.data.pcs.ncols(), 2);
         assert_eq!(bundle.data.extra_static_covariates.ncols(), 1);
-        assert_eq!(bundle.data.extra_static_names, vec!["bmi".to_string()]);
+        assert_eq!(bundle.data.extra_static_names, vec!["bmi"]);
     }
 
     #[test]

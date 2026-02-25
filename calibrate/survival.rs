@@ -1,12 +1,12 @@
-use crate::calibrate::basis::{
+use gam::basis::{
     BasisError, BasisOptions, Dense, KnotSource, SplineScratch, baseline_lambda_seed, create_basis,
     create_difference_penalty_matrix, evaluate_bspline_basis_scalar, null_range_whiten,
 };
 use crate::calibrate::calibrator::CalibratorModel;
 use crate::calibrate::estimate::EstimationError;
-use crate::calibrate::faer_ndarray::{FaerSvd, ldlt_rook};
-use crate::calibrate::pirls::{WorkingModel as PirlsWorkingModel, WorkingState};
-use crate::calibrate::types::{Coefficients, LinearPredictor};
+use gam::faer_ndarray::{FaerSvd, ldlt_rook};
+use gam::pirls::{WorkingModel as PirlsWorkingModel, WorkingState};
+use gam::types::{Coefficients, LinearPredictor};
 use log::warn;
 use ndarray::prelude::*;
 use ndarray::{ArrayBase, Data, Ix1, Zip, concatenate};
@@ -116,7 +116,7 @@ pub enum SurvivalError {
     MonotonicityViolation { age: f64, derivative: f64 },
 }
 
-pub use crate::calibrate::pirls::WorkingModel;
+pub use gam::pirls::WorkingModel;
 
 /// Guarded log-age transformation used across training and scoring.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -4008,7 +4008,7 @@ mod tests {
             }
             let rhs = d_exit.t().dot(&target);
             let factor =
-                crate::calibrate::faer_ndarray::FaerCholesky::cholesky(&normal, faer::Side::Lower)
+                gam::faer_ndarray::FaerCholesky::cholesky(&normal, faer::Side::Lower)
                     .unwrap();
             beta = factor.solve_vec(&rhs);
             derivative_exit = d_exit.dot(&beta);

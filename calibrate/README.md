@@ -1,12 +1,12 @@
-# Calibration crate
+# Calibration adapter crate
 
-The `calibrate/` crate hosts the end-to-end pipeline that fits Gnomon's
-penalized additive model and its optional post-hoc calibrator. The code in this
-directory is responsible for ingesting the tabular training data, constructing
-the spline bases and their penalties, solving the penalized iteratively
-reweighted least squares (P-IRLS) updates with REML/LAML smoothing selection,
-and (when enabled) training a secondary calibrator that sharpens probability
-calibration or identity-scale accuracy.
+`gnomon/calibrate` is the domain adapter layer for Gnomon's calibration and
+survival workflows. It owns schema/data policy, PGS/PC/sex feature semantics,
+artifact mapping, and stable `gnomon::calibrate::*` entrypoints.
+
+Core numerical engine modules (basis construction, PIRLS/REML, HMC, ALO,
+reparameterization, diagnostics, and shared math types) live in the separate
+solver engine repository and are imported by this crate.
 
 ## Statistical model
 
@@ -25,16 +25,14 @@ the polygenic score effect differ by sex. This structure is encoded in
 bases into a single design matrix with sum-to-zero constraints and ANOVA-style
 orthogonalization so the additive terms are identifiable and interpretable.
 
-Two likelihoods are supported via [`model::LinkFunction`](model.rs): logistic
-(`Logit`) for binary traits and Gaussian identity (`Identity`) for continuous
-phenotypes. For the logistic case the P-IRLS inner loop targets the binomial
-deviance, while the Gaussian case profiles a scale parameter that is later
-stored for prediction-time standard errors.
+Two likelihoods are supported via shared engine types
+(`LinkFunction`): logistic (`Logit`) for binary traits and Gaussian
+identity (`Identity`) for continuous phenotypes.
 
 ## Penalties and smoothing selection
 
-Each smooth term is represented with B-spline bases generated in
-[`basis.rs`](basis.rs). Difference penalties of configurable order control the
+Each smooth term is represented with B-spline bases generated in the engine.
+Difference penalties of configurable order control the
 wiggliness of the univariate smooths, tensor-product penalties regularize the
 interactions with PCs using directional smoothness along the PGS and PC axes
 plus an explicit null⊗null shrinkage, and a wiggle-only penalty tempers the
@@ -44,14 +42,19 @@ respect the null spaces implied by the ANOVA constraints so that intercepts,
 sex main effects, and other lower-order components remain unpenalized by
 construction.
 
-Smoothing parameters (`λ`) are learned rather than fixed. [`estimate.rs`](estimate.rs)
-implements a nested optimization in the style of Wood (2011): the inner loop is
-the penalized IRLS solver that returns coefficients for any proposed set of
-`λ`, and the outer loop runs a box-constrained BFGS optimizer on the marginal
-likelihood of those smoothing parameters. Gaussian models maximize the exact
-restricted likelihood (REML), while non-Gaussian models maximize the Laplace
-approximate marginal likelihood (LAML); both objectives include stabilization
-priors and null-space accounting to prevent degeneracy. This approach is
+For liability-style fits, the implementation smooths the scientific channels
+`T` and `log_sigma` directly (plus `m` and optional `wiggle`) instead of
+smoothing transformed channels such as `alpha=-T/sigma` and `beta=1/sigma`
+independently. That choice avoids an implicit reparameterization penalty of the
+form `∫ beta^2[... ] dx` with extra gradient/Hessian coupling terms, which can
+otherwise distort roughness control when `sigma` varies over the covariate
+space.
+
+Smoothing parameters (`λ`) are learned rather than fixed. The engine estimator
+implements a nested optimization in the style of Wood (2011): inner PIRLS for
+fixed `λ`, and outer BFGS on marginal likelihood. Gaussian models maximize
+REML, while non-Gaussian models maximize LAML; both objectives include
+stabilization priors and null-space accounting to prevent degeneracy. This approach is
 **empirical Bayes**: the smoothing parameters (hyperparameters) are estimated
 from the data via marginal likelihood, then coefficients are inferred
 conditional on those point estimates.
@@ -118,37 +121,20 @@ metadata so predictions can reproduce the post-hoc correction faithfully.
 
 ## What lives where
 
-- [`data.rs`](data.rs) reads TSV inputs with Polars, enforces the strict schema
-  (`phenotype`, `score`, `sex`, `PC*`, optional `weights`, optional
-  `sample_id`), and produces the `TrainingData` bundle consumed by the
-  optimizer. The same module also validates prediction inputs, defaults missing
-  weights to 1.0, and generates stable sample identifiers when none are
-  provided.
-- [`basis.rs`](basis.rs) builds B-spline bases, applies sum-to-zero constraints,
-  and constructs difference penalties that ultimately drive smoothness control
-  for both the primary model and the calibrator.
-- [`construction.rs`](construction.rs) converts configuration into concrete
-  design matrices and penalty layouts. It tracks how every block of columns maps
-  to penalties and interaction terms so the downstream optimizer can assemble
-  the correct objective.
-- [`pirls.rs`](pirls.rs) implements the weighted least squares inner loop shared
-  by the base fit and the calibrator. It accepts arbitrary designs along with
-  penalty metadata produced by `ModelLayout`.
-- [`estimate.rs`](estimate.rs) is the orchestrator. `train_model` triggers design
-  construction, runs REML/BFGS over smoothing parameters, guards against
-  degeneracy, and optionally launches the calibrator fitting routine.
-- [`hull.rs`](hull.rs) derives a peeled convex hull around the training domain
-  and provides signed-distance queries that the calibrator uses to detect and
-  damp extrapolation.
-- [`calibrator.rs`](calibrator.rs) converts base-model diagnostics into
-  calibrator features, builds its own constrained design, fits smoothing
-  parameters, and exposes inference helpers for applying the learned correction.
-- [`model.rs`](model.rs) defines the serialized `TrainedModel`, handles
-  persistence, and applies both the baseline GAM and the optional calibrator at
-  prediction time.
-- [`faer_ndarray.rs`](faer_ndarray.rs) bridges `ndarray` structures with the
-  `faer` linear algebra backend for eigen decompositions and solves, which keeps
-  large penalized systems numerically stable.
+Adapter/domain files in `gnomon/calibrate`:
+- [`data.rs`](data.rs) and [`survival_data.rs`](survival_data.rs): file/schema
+  policy, ingestion, domain validation, and training bundles.
+- [`construction.rs`](construction.rs): domain-specific design assembly from
+  `PGS/PC/sex` semantics and full-size `P x P` penalty preparation.
+- [`estimate.rs`](estimate.rs): stable adapter entrypoints that delegate to
+  engine estimation APIs (`train_model`, `train_survival_model`, flat wrappers).
+- [`calibrator.rs`](calibrator.rs): calibrator workflow orchestration.
+- [`survival.rs`](survival.rs): survival feature/layout assembly and domain wiring.
+- [`model.rs`](model.rs): artifact mapping and serde composition for gnomon outputs.
+
+Engine-owned modules in the separate solver repository:
+- `basis.rs`, `construction.rs`, `pirls.rs`, `estimate.rs`, `hmc.rs`, `joint.rs`,
+  `alo.rs`, `diagnostics.rs`, `hull.rs`, `types.rs`, and related math utilities.
 
 ## Training flow at a glance
 
@@ -158,27 +144,18 @@ metadata so predictions can reproduce the post-hoc correction faithfully.
    `TrainingData` containing the phenotype, score, sex indicator, principal
    components, and a weight vector (defaulting to ones when the file omits
    `weights`).
-2. **Construct the base GAM** – `estimate::train_model` delegates to
-   `construction::build_design_and_penalty_matrices`. This step selects knot
-   vectors via `basis`, assembles the block-structured design matrix `X`, and
-   pairs each block with its penalty matrices. The resulting `ModelLayout`
-   tracks the intercept, sex main effect, PGS smooth, PC main effects,
-   tensor-product interactions, the sex×PGS varying coefficient, and their
-   null-space bases.
-3. **Optimize smoothing parameters** – With the design in place, the REML
-   optimizer in `estimate.rs` alternates between P-IRLS solves (via `pirls.rs`)
-   and BFGS updates over log-smoothing parameters until convergence or until it
-   detects degeneracy (separation, rank deficiency, etc.). Survival models seed
-   their baseline and monotonic penalties from basis metadata and age ranges,
-   but the final smoothing strengths are still chosen automatically by the
-   REML/BFGS loop.
+2. **Construct the base GAM** – adapter `construction.rs` assembles
+   block-structured design matrices `X` and full-size `P x P` penalties from
+   `PGS/PC/sex` configuration.
+3. **Optimize smoothing parameters** – adapter `estimate.rs` calls
+   engine estimation entrypoints. The engine alternates PIRLS and BFGS over
+   log-smoothing parameters until convergence or guarded stop conditions.
 4. **Capture geometric guards** – During training the optimizer builds a peeled
    hull from the polygenic score and principal components. The hull and its
    signed-distance function inform both the calibrator and future prediction
    time clamping.
 5. **Optional calibrator fitting** – If `ModelConfig.calibrator_enabled` is
-   true, `estimate::train_model` computes approximate leave-one-out (ALO)
-   diagnostics from the converged fit using `calibrator::compute_alo_features`.
+   true, the adapter computes/requests ALO diagnostics through engine ALO APIs.
    Those diagnostics (baseline predictor, its standard error, and the signed
    distance to the peeled hull, along with the identity-scale baseline needed
    for constraints) feed into `calibrator::build_calibrator_design`, which
@@ -262,5 +239,14 @@ Weights and phenotypes are ignored during inference. Prediction data is
 validated with the same finite-value checks as training data, ensuring that
 the deployed spline bases receive well-formed covariates.
 
-## TODO
-Implement the survival model in plan/survival.md.
+## Repo split note
+
+Path ownership is intentionally split:
+- Adapter/domain layer: `gnomon/calibrate`
+- Math/solver engine: separate solver repository
+
+Contract summary:
+- `gnomon/calibrate` performs domain layout assembly and passes full-size `P x P`
+  penalties and numeric arrays into the solver engine.
+- The solver engine performs PIRLS/REML/HMC/ALO and returns fit outputs.
+- Public call flow remains adapter-stable via `gnomon::calibrate::*` entrypoints.

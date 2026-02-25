@@ -11,6 +11,7 @@ use reqwest::StatusCode;
 use reqwest::Url;
 use reqwest::blocking::Client;
 use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, RANGE};
+use rustls::crypto::ring;
 use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::fs::{self, File};
@@ -72,6 +73,13 @@ impl ReadMetrics {
 }
 
 static RUNTIME_MANAGER: OnceLock<Arc<Runtime>> = OnceLock::new();
+static RUSTLS_PROVIDER_INITIALIZED: OnceLock<()> = OnceLock::new();
+
+pub fn ensure_rustls_provider() {
+    let _ = RUSTLS_PROVIDER_INITIALIZED.get_or_init(|| {
+        let _ = ring::default_provider().install_default();
+    });
+}
 
 pub fn get_shared_runtime() -> Result<Arc<Runtime>, PipelineError> {
     if let Some(runtime) = RUNTIME_MANAGER.get() {
@@ -108,6 +116,7 @@ pub fn gcs_billing_project_from_env() -> Option<String> {
 }
 
 pub fn load_adc_credentials() -> Result<Credentials, PipelineError> {
+    ensure_rustls_provider();
     let mut builder = google_cloud_auth::credentials::Builder::default();
     if let Some(project) = gcs_billing_project_from_env() {
         builder = builder.with_quota_project_id(project);
@@ -962,6 +971,7 @@ fn open_remote_variant_source(path: &Path) -> Result<VariantSource, PipelineErro
 }
 
 fn open_http_variant_source(path: &Path) -> Result<VariantSource, PipelineError> {
+    ensure_rustls_provider();
     let url = path
         .to_str()
         .ok_or_else(|| PipelineError::Io("Invalid UTF-8 in path".to_string()))?;
@@ -1462,6 +1472,7 @@ impl RemoteByteRangeSource {
         runtime: &Arc<Runtime>,
         credentials: Option<Credentials>,
     ) -> Result<(Storage, StorageControl), PipelineError> {
+        ensure_rustls_provider();
         let base_credentials = match credentials {
             Some(creds) => creds,
             None => load_adc_credentials()?,
@@ -1727,6 +1738,7 @@ impl Read for HttpStreamingReader {
 
 impl HttpByteRangeSource {
     fn new(url: &str) -> Result<Self, PipelineError> {
+        ensure_rustls_provider();
         let client = Client::builder()
             .user_agent(HTTP_USER_AGENT)
             .build()
@@ -2045,6 +2057,9 @@ impl RemoteCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
     use tempfile::NamedTempFile;
 
     const PUBLIC_BUCKET: &str = "genomics-public-data";
@@ -2063,7 +2078,21 @@ mod tests {
     fn remote_source_or_skip(
         test_name: &str,
     ) -> Result<Option<RemoteByteRangeSource>, PipelineError> {
-        match RemoteByteRangeSource::new(PUBLIC_BUCKET, PUBLIC_REFERENCE_OBJECT) {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = RemoteByteRangeSource::new(PUBLIC_BUCKET, PUBLIC_REFERENCE_OBJECT);
+            let _ = tx.send(result);
+        });
+
+        let result = match rx.recv_timeout(Duration::from_secs(20)) {
+            Ok(result) => result,
+            Err(_) => {
+                eprintln!("Skipping {test_name}: timed out waiting for remote source initialization");
+                return Ok(None);
+            }
+        };
+
+        match result {
             Ok(source) => Ok(Some(source)),
             Err(err) => {
                 if should_skip_remote_test(&err) {
