@@ -542,34 +542,14 @@ impl TrainedModel {
         )
         .ok()?;
         let mut raw = basis.as_ref().clone();
-        // Math note: to avoid a C^1 discontinuity from hard clamping, extend the basis
-        // linearly outside [0,1]: B_ext(z_raw) = B(z_c) + (z_raw - z_c) * B'(z_c).
-        let mut needs_ext = false;
-        for i in 0..z_raw.len() {
-            if (z_raw[i] - z_c[i]).abs() > 1e-12 {
-                needs_ext = true;
-                break;
-            }
-        }
-        if needs_ext {
-            if let Ok((b_prime_arc, _)) = gam::basis::create_basis::<Dense>(
-                z_c.view(),
-                KnotSource::Provided(joint.knot_vector.view()),
-                joint.degree,
-                BasisOptions::first_derivative(),
-            ) {
-                let b_prime = b_prime_arc.as_ref();
-                for i in 0..z_raw.len() {
-                    let dz = z_raw[i] - z_c[i];
-                    if dz.abs() <= 1e-12 {
-                        continue;
-                    }
-                    for j in 0..raw.ncols() {
-                        raw[[i, j]] += dz * b_prime[[i, j]];
-                    }
-                }
-            }
-        }
+        gam::basis::apply_linear_extension_from_first_derivative(
+            z_raw.view(),
+            z_c.view(),
+            joint.knot_vector.view(),
+            joint.degree,
+            &mut raw,
+        )
+        .ok()?;
         if joint.link_transform.nrows() != raw.ncols()
             || joint.link_transform.ncols() != joint.beta_link.len()
         {
@@ -1006,6 +986,12 @@ impl TrainedModel {
                 probs
             }
             LinkFunction::Probit => eta.mapv(normal_cdf_approx),
+            LinkFunction::CLogLog => {
+                let eta_clamped = eta.mapv(|e| e.clamp(-40.0, 40.0));
+                let mut probs = eta_clamped.mapv(|e| 1.0 - (-e.exp()).exp());
+                probs.mapv_inplace(|p| p.clamp(1e-8, 1.0 - 1e-8));
+                probs
+            }
             LinkFunction::Identity => eta.clone(),
         };
 
@@ -1185,6 +1171,7 @@ impl TrainedModel {
                     None => Ok(mode_mean),
                 }
             }
+            LinkFunction::CLogLog => Ok(mode_mean),
         }
     }
 
@@ -1233,6 +1220,7 @@ impl TrainedModel {
         let pred_in = match link_function {
             LinkFunction::Logit => eta.clone(),
             LinkFunction::Probit => eta.clone(),
+            LinkFunction::CLogLog => eta.clone(),
             LinkFunction::Identity => baseline.clone(),
         };
         let se_in = se_eta_opt.unwrap_or_else(|| Array1::zeros(pred_in.len()));

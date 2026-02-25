@@ -472,7 +472,7 @@ fn save_predictions_detailed(
 
     let mut file = std::fs::File::create(output_path)?;
     match link {
-        LinkFunction::Logit | LinkFunction::Probit => {
+        LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog => {
             // Header for binary target - include uncalibrated_prediction column when calibration is enabled
             if calibrated_mean_opt.is_some() {
                 writeln!(
@@ -505,6 +505,9 @@ fn save_predictions_detailed(
                             ),
                             LinkFunction::Probit => {
                                 (normal_cdf_approx(lo_eta), normal_cdf_approx(hi_eta))
+                            }
+                            LinkFunction::CLogLog => {
+                                (1.0 - (-lo_eta.exp()).exp(), 1.0 - (-hi_eta.exp()).exp())
                             }
                             LinkFunction::Identity => unreachable!(),
                         };

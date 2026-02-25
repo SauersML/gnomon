@@ -67,6 +67,7 @@ impl CalibratorSpec {
             LinkFunction::Logit => Some(FirthSpec::all_enabled()),
             LinkFunction::Probit => None,
             LinkFunction::Identity => None,
+            LinkFunction::CLogLog => None,
         }
     }
 }
@@ -1757,6 +1758,10 @@ pub fn predict_calibrator(
             probs
         }
         LinkFunction::Probit => eta.mapv(normal_cdf_approx),
+        LinkFunction::CLogLog => {
+            let eta_c = eta.mapv(|e| e.clamp(-40.0, 40.0));
+            eta_c.mapv(|e| 1.0 - (-e.exp()).exp())
+        }
         LinkFunction::Identity => {
             // For identity link, eta is the result
             eta
@@ -1873,6 +1878,7 @@ pub fn fit_calibrator(
             let family = match link {
                 LinkFunction::Logit => gam::types::LikelihoodFamily::BinomialLogit,
                 LinkFunction::Probit => gam::types::LikelihoodFamily::BinomialProbit,
+                LinkFunction::CLogLog => gam::types::LikelihoodFamily::BinomialCLogLog,
                 LinkFunction::Identity => gam::types::LikelihoodFamily::GaussianIdentity,
             };
             let opts = ExternalOptimOptions {
@@ -3004,26 +3010,8 @@ mod tests {
         let p_dim = h.nrows();
         let h_view = FaerArrayView::new(&h);
 
-        enum SolverFactor {
-            Llt(FaerLlt<f64>),
-            Ldlt(FaerLdlt<f64>),
-        }
-        impl SolverFactor {
-            fn solve(&self, rhs: faer::MatRef<'_, f64>) -> FaerMat<f64> {
-                match self {
-                    SolverFactor::Llt(f) => f.solve(rhs),
-                    SolverFactor::Ldlt(f) => f.solve(rhs),
-                }
-            }
-        }
-
-        let factor = if let Ok(f) = FaerLlt::new(h_view.as_ref(), Side::Lower) {
-            SolverFactor::Llt(f)
-        } else {
-            let ldlt =
-                FaerLdlt::new(h_view.as_ref(), Side::Lower).expect("LDLT factorization failed");
-            SolverFactor::Ldlt(ldlt)
-        };
+        let factor = gam::faer_ndarray::factorize_symmetric_with_fallback(h_view.as_ref(), Side::Lower)
+            .expect("LLT/LDLT factorization failed");
 
         let ut = u.t();
         let xtwx = ut.dot(&u);
@@ -7439,27 +7427,8 @@ mod tests {
         }
         let k_view = FaerArrayView::new(&k);
 
-        enum Factor {
-            Llt(FaerLlt<f64>),
-            Ldlt(FaerLdlt<f64>),
-        }
-        impl Factor {
-            fn solve(&self, rhs: faer::MatRef<'_, f64>) -> FaerMat<f64> {
-                match self {
-                    Factor::Llt(f) => f.solve(rhs),
-                    Factor::Ldlt(f) => f.solve(rhs),
-                }
-            }
-        }
-
-        let factor = FaerLlt::new(k_view.as_ref(), Side::Lower)
-            .map(Factor::Llt)
-            .unwrap_or_else(|_| {
-                Factor::Ldlt(
-                    FaerLdlt::new(k_view.as_ref(), Side::Lower)
-                        .expect("LDLT factorization should succeed for test"),
-                )
-            });
+        let factor = gam::faer_ndarray::factorize_symmetric_with_fallback(k_view.as_ref(), Side::Lower)
+            .expect("LLT/LDLT factorization should succeed for test");
 
         // Compute hat diagonals and both SE conventions for a few observations
         println!("\nALO weighting convention test:");

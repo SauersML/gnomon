@@ -1,8 +1,8 @@
 use crate::calibrate::data::TrainingData;
 use crate::calibrate::estimate::EstimationError;
 use gam::basis::{
-    BSplineBasisSpec, BSplineKnotSpec, BasisMetadata, BasisOptions, CenterStrategy, Dense,
-    KnotSource, ThinPlateBasisSpec, build_bspline_basis_1d, build_thin_plate_basis,
+    BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, BasisMetadata, BasisOptions,
+    CenterStrategy, Dense, KnotSource, ThinPlateBasisSpec, build_bspline_basis_1d, build_thin_plate_basis,
     create_basis,
 };
 use gam::custom_family::{
@@ -236,6 +236,7 @@ fn build_liability_specs(
             num_internal_knots: cfg.pgs_num_internal_knots,
         },
         double_penalty: cfg.pgs_double_penalty,
+        identifiability: BSplineIdentifiability::default(),
     };
     let m_basis = build_bspline_basis_1d(data.p.view(), &m_spec)
         .map_err(|e| EstimationError::InvalidInput(e.to_string()))?;

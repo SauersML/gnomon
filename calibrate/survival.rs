@@ -12,7 +12,6 @@ use ndarray::prelude::*;
 use ndarray::{ArrayBase, Data, Ix1, Zip, concatenate};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 use thiserror::Error;
 
@@ -272,68 +271,7 @@ pub struct CovariateLayout {
     pub ranges: Vec<ValueRange>,
 }
 
-#[derive(Debug, Clone)]
-pub struct PenaltyBlock {
-    pub matrix: Array2<f64>,
-    pub lambda: f64,
-    pub range: Range<usize>,
-}
-
-#[derive(Debug, Clone)]
-pub struct PenaltyBlocks {
-    pub blocks: Vec<PenaltyBlock>,
-}
-
-impl PenaltyBlocks {
-    pub fn new(blocks: Vec<PenaltyBlock>) -> Self {
-        Self { blocks }
-    }
-
-    pub fn gradient(&self, beta: &Array1<f64>) -> Array1<f64> {
-        let mut grad = Array1::zeros(beta.len());
-        for block in &self.blocks {
-            if block.lambda == 0.0 {
-                continue;
-            }
-
-            let view = beta.slice(s![block.range.clone()]);
-            let contrib = block.matrix.dot(&view.to_owned());
-            let mut grad_slice = grad.slice_mut(s![block.range.clone()]);
-            grad_slice += &(2.0 * block.lambda * contrib);
-        }
-        grad
-    }
-
-    pub fn hessian(&self, dim: usize) -> Array2<f64> {
-        let mut hessian = Array2::zeros((dim, dim));
-        for block in &self.blocks {
-            if block.lambda == 0.0 {
-                continue;
-            }
-            let rows = block.range.clone();
-            for (local_i, row_idx) in rows.clone().enumerate() {
-                for (local_j, col_idx) in rows.clone().enumerate() {
-                    hessian[[row_idx, col_idx]] +=
-                        2.0 * block.lambda * block.matrix[[local_i, local_j]];
-                }
-            }
-        }
-        hessian
-    }
-
-    pub fn deviance(&self, beta: &Array1<f64>) -> f64 {
-        let mut value = 0.0;
-        for block in &self.blocks {
-            if block.lambda == 0.0 {
-                continue;
-            }
-            let view = beta.slice(s![block.range.clone()]);
-            let quad = view.dot(&block.matrix.dot(&view.to_owned()));
-            value += block.lambda * quad;
-        }
-        value
-    }
-}
+pub use gam::survival::{PenaltyBlock, PenaltyBlocks};
 
 /// Bundle returned by [`build_survival_layout`] containing cached designs and metadata
 /// required for serialization.

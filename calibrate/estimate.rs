@@ -313,6 +313,9 @@ pub fn train_model(
         gam::types::LinkFunction::Probit => {
             gam::types::LikelihoodFamily::BinomialProbit
         }
+        gam::types::LinkFunction::CLogLog => {
+            gam::types::LikelihoodFamily::BinomialCLogLog
+        }
     };
 
     let opts = FitOptions {
@@ -648,12 +651,13 @@ fn fit_single_survival_model(
     bundle: &crate::calibrate::survival_data::SurvivalTrainingBundle,
     config: &crate::calibrate::model::ModelConfig,
     survival_cfg: &crate::calibrate::model::SurvivalModelConfig,
-    survival_spec: crate::calibrate::survival::SurvivalSpec,
+    _survival_spec: crate::calibrate::survival::SurvivalSpec,
 ) -> Result<SurvivalFitResult, EstimationError> {
     use crate::calibrate::survival::{
         BasisDescriptor, CovariateLayout, SurvivalLayoutBundle, SurvivalModelArtifacts,
-        TensorProductConfig, WorkingModelSurvival, build_survival_layout,
+        TensorProductConfig, build_survival_layout,
     };
+    use gam::families::royston_parmar::{RoystonParmarInputs, working_model_from_flattened};
 
     let log_entry = bundle
         .age_transform
@@ -759,14 +763,26 @@ fn fit_single_survival_model(
             for (block, &rho_i) in eval_layout.penalties.blocks.iter_mut().zip(rho.iter()) {
                 block.lambda = rho_i.exp();
             }
-            let mut model = WorkingModelSurvival::new(
-                eval_layout,
-                &bundle.data,
-                monotonicity.clone(),
-                survival_spec,
+            let p = eval_layout.combined_exit.ncols();
+            let penalties = to_engine_survival_penalties(&eval_layout.penalties);
+            let mono = to_engine_survival_monotonicity(&monotonicity);
+            let spec = to_engine_survival_spec(&bundle.data);
+            let mut model = working_model_from_flattened(
+                penalties,
+                mono,
+                spec,
+                RoystonParmarInputs {
+                    age_entry: bundle.data.age_entry.view(),
+                    age_exit: bundle.data.age_exit.view(),
+                    event_target: bundle.data.event_target.view(),
+                    event_competing: bundle.data.event_competing.view(),
+                    weights: bundle.data.sample_weight.view(),
+                    x_entry: eval_layout.combined_entry.view(),
+                    x_exit: eval_layout.combined_exit.view(),
+                    x_derivative: eval_layout.combined_derivative_exit.view(),
+                },
             )
-            .map_err(map_survival_error)?;
-            let p = model.layout.combined_exit.ncols();
+            .map_err(|e| EstimationError::InvalidSpecification(e.to_string()))?;
             let result = pirls::run_working_model_pirls(
                 &mut model,
                 Coefficients::zeros(p),
@@ -811,10 +827,26 @@ fn fit_single_survival_model(
         }
     }
 
-    let mut model =
-        WorkingModelSurvival::new(layout.clone(), &bundle.data, monotonicity.clone(), survival_spec)
-            .map_err(map_survival_error)?;
     let p = layout.combined_exit.ncols();
+    let penalties = to_engine_survival_penalties(&layout.penalties);
+    let mono = to_engine_survival_monotonicity(&monotonicity);
+    let spec = to_engine_survival_spec(&bundle.data);
+    let mut model = working_model_from_flattened(
+        penalties,
+        mono,
+        spec,
+        RoystonParmarInputs {
+            age_entry: bundle.data.age_entry.view(),
+            age_exit: bundle.data.age_exit.view(),
+            event_target: bundle.data.event_target.view(),
+            event_competing: bundle.data.event_competing.view(),
+            weights: bundle.data.sample_weight.view(),
+            x_entry: layout.combined_entry.view(),
+            x_exit: layout.combined_exit.view(),
+            x_derivative: layout.combined_derivative_exit.view(),
+        },
+    )
+    .map_err(|e| EstimationError::InvalidSpecification(e.to_string()))?;
     let outcome = pirls::run_working_model_pirls(
         &mut model,
         Coefficients::zeros(p),
