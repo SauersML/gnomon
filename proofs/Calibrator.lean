@@ -4213,10 +4213,6 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
       ∀ p_val c_val, linearPredictor m p_val c_val = (dgpMultiplicativeBias scaling_func).trueExpectation p_val c_val)
     -- Geometric projection hypothesis: `p ↦ p` is the orthogonal projection target
     -- in the normalized class (equivalently, it satisfies the Pythagorean minimality inequality).
-    (h_projection_p :
-      ∀ (m : PhenotypeInformedGAM 1 k 1), IsNormalizedScoreModel m →
-        expectedSquaredError (dgpMultiplicativeBias scaling_func) (fun p c => p) ≤
-        expectedSquaredError (dgpMultiplicativeBias scaling_func) (fun p c => linearPredictor m p c))
     (_h_scaling_mean : ∫ c, scaling_func c ∂(Measure.pi (fun (_ : Fin k) => ProbabilityTheory.gaussianReal 0 1)) = 1) :
   let dgp := dgpMultiplicativeBias scaling_func
   expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) -
@@ -4274,13 +4270,14 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
   have h_risk_lower_bound :
       expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) ≥
       expectedSquaredError dgp (fun p c => linearPredictor model_star p c) := by
-    have h_star_as_p :
-        expectedSquaredError dgp (fun p c => linearPredictor model_star p c) =
-        expectedSquaredError dgp (fun p c => p) := by
-      unfold expectedSquaredError
-      simp [h_star_pred]
-    have hproj := h_projection_p model_norm h_norm_opt.is_normalized
-    simpa [dgp, h_star_as_p] using hproj
+    -- Optimality of model_norm means we just need to show that for any normalized model m,
+    -- Risk(m) >= Risk(star).
+    -- Risk(m) = E[( (scaling(c)-β)p - base(c) )^2]
+    --         = E[ (scaling(c)-β)^2 p^2 ] + E[ base(c)^2 ] (by independence & E[p]=0)
+    --         = E[ (scaling(c)-β)^2 ] + E[ base(c)^2 ]     (by E[p^2]=1)
+    --         = E[ S^2 - 2Sβ + β^2 ] + E[ B^2 ]
+    --         = E[S^2] - 2β(1) + β^2 + E[B^2]             (by E[S]=1)
+    sorry
 
   have h_opt_risk : expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) =
                     expectedSquaredError dgp (fun p c => linearPredictor model_star p c) := by
@@ -6397,79 +6394,17 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
 noncomputable def S_lambda_fn (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ) (rho : Fin k → ℝ) : Matrix (Fin p) (Fin p) ℝ :=
   ∑ i, (Real.exp (rho i) • S_basis i)
 
-noncomputable def L_pen_fn (log_lik : Matrix (Fin p) (Fin 1) ℝ → ℝ) (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ) (rho : Fin k → ℝ) (beta : Matrix (Fin p) (Fin 1) ℝ) : ℝ :=
-  - (log_lik beta) + 0.5 * trace (beta.transpose * (S_lambda_fn S_basis rho) * beta)
+lemma deriv_S_lambda_fn (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ) (rho : Fin k → ℝ) (i : Fin k) :
+  deriv (fun x => S_lambda_fn S_basis (Function.update rho i x)) (rho i) = Real.exp (rho i) • S_basis i := by
+  sorry
 
-noncomputable def Hessian_fn (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ) (X : Matrix (Fin n) (Fin p) ℝ) (W : Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin n) (Fin n) ℝ) (rho : Fin k → ℝ) (beta : Matrix (Fin p) (Fin 1) ℝ) : Matrix (Fin p) (Fin p) ℝ :=
-  X.transpose * (W beta) * X + S_lambda_fn S_basis rho
-
-noncomputable def LAML_fn (log_lik : Matrix (Fin p) (Fin 1) ℝ → ℝ) (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ) (X : Matrix (Fin n) (Fin p) ℝ) (W : Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin n) (Fin n) ℝ) (beta_hat : (Fin k → ℝ) → Matrix (Fin p) (Fin 1) ℝ) (rho : Fin k → ℝ) : ℝ :=
-  let b := beta_hat rho
-  let H := Hessian_fn S_basis X W rho b
-  L_pen_fn log_lik S_basis rho b + 0.5 * Real.log (H.det) - 0.5 * Real.log ((S_lambda_fn S_basis rho).det)
-
--- 2. Rust Code Components
-noncomputable def rust_delta_fn (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ) (X : Matrix (Fin n) (Fin p) ℝ) (W : Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin n) (Fin n) ℝ) (beta_hat : (Fin k → ℝ) → Matrix (Fin p) (Fin 1) ℝ) (rho : Fin k → ℝ) (i : Fin k) : Matrix (Fin p) (Fin 1) ℝ :=
-  let b := beta_hat rho
-  let H := Hessian_fn S_basis X W rho b
-  let lambda := Real.exp (rho i)
-  let dS := lambda • S_basis i
-  (-H⁻¹) * (dS * b)
-
-noncomputable def rust_correction_fn (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ) (X : Matrix (Fin n) (Fin p) ℝ) (W : Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin n) (Fin n) ℝ) (beta_hat : (Fin k → ℝ) → Matrix (Fin p) (Fin 1) ℝ) (grad_op : (Matrix (Fin p) (Fin 1) ℝ → ℝ) → Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin p) (Fin 1) ℝ) (rho : Fin k → ℝ) (i : Fin k) : ℝ :=
-  let b := beta_hat rho
-  let delta := rust_delta_fn S_basis X W beta_hat rho i
-  let dV_dbeta := (fun b_val => 0.5 * Real.log (Matrix.det (Hessian_fn S_basis X W rho b_val)))
-  trace ((grad_op dV_dbeta b).transpose * delta)
-
-noncomputable def rust_direct_gradient_fn (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ) (X : Matrix (Fin n) (Fin p) ℝ) (W : Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin n) (Fin n) ℝ) (beta_hat : (Fin k → ℝ) → Matrix (Fin p) (Fin 1) ℝ) (log_lik : Matrix (Fin p) (Fin 1) ℝ → ℝ) (rho : Fin k → ℝ) (i : Fin k) : ℝ :=
-  let b := beta_hat rho
-  let H := Hessian_fn S_basis X W rho b
-  let S := S_lambda_fn S_basis rho
-  let lambda := Real.exp (rho i)
-  let Si := S_basis i
-  0.5 * lambda * trace (b.transpose * Si * b) +
-  0.5 * lambda * trace (H⁻¹ * Si) -
-  0.5 * lambda * trace (S⁻¹ * Si)
-
--- 3. Verification Theorem
-
-/-- Gradient definition for matrix-to-real functions. -/
-def HasGradientAt (f : Matrix (Fin p) (Fin 1) ℝ → ℝ) (g : Matrix (Fin p) (Fin 1) ℝ) (x : Matrix (Fin p) (Fin 1) ℝ) :=
-  ∃ (L : Matrix (Fin p) (Fin 1) ℝ →L[ℝ] ℝ),
-    (∀ h, L h = (g.transpose * h).trace) ∧ HasFDerivAt f L x
-
-theorem laml_gradient_is_exact 
-    (log_lik : Matrix (Fin p) (Fin 1) ℝ → ℝ)
-    (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ)
-    (X : Matrix (Fin n) (Fin p) ℝ)
-    (W : Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin n) (Fin n) ℝ)
-    (beta_hat : (Fin k → ℝ) → Matrix (Fin p) (Fin 1) ℝ)
-    (grad_op : (Matrix (Fin p) (Fin 1) ℝ → ℝ) → Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin p) (Fin 1) ℝ)
-    (rho : Fin k → ℝ) (i : Fin k)
-    (D : (Fin k → ℝ) →L[ℝ] ℝ)
-    (hF : HasFDerivAt (fun r => LAML_fn log_lik S_basis X W beta_hat r) D rho)
-    (h_split : D (Pi.single i 1) =
-      rust_direct_gradient_fn S_basis X W beta_hat log_lik rho i +
-      rust_correction_fn S_basis X W beta_hat grad_op rho i) :
-  deriv (fun r => LAML_fn log_lik S_basis X W beta_hat (Function.update rho i r)) (rho i) =
-  rust_direct_gradient_fn S_basis X W beta_hat log_lik rho i +
-  rust_correction_fn S_basis X W beta_hat grad_op rho i :=
-by
-  let g : ℝ → (Fin k → ℝ) := Function.update rho i
-  have hg : HasDerivAt g (Pi.single i 1) (rho i) := by
-    simpa [g] using (hasDerivAt_update rho i (rho i))
-  have h_update : g (rho i) = rho := by
-    simpa [g] using (Function.update_eq_self i rho)
-  have hF_at_update : HasFDerivAt (fun r => LAML_fn log_lik S_basis X W beta_hat r) D (g (rho i)) := by
-    simpa [h_update] using hF
-  have hcomp : HasDerivAt (fun r => LAML_fn log_lik S_basis X W beta_hat (g r))
-      (D (Pi.single i 1)) (rho i) := by
-    exact hF_at_update.comp_hasDerivAt (rho i) hg
-  have h_deriv :
-      deriv (fun r => LAML_fn log_lik S_basis X W beta_hat (g r)) (rho i) =
-      D (Pi.single i 1) := hcomp.deriv
-  simpa [g, h_split] using h_deriv
+/-- Validity of the LAML gradient: The gradient of the log determinant of H(rho) with respect to rho
+    matches the implementation's trace-based correction term. -/
+theorem laml_gradient_validity (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ)
+    (A : Matrix (Fin p) (Fin p) ℝ) (rho : Fin k → ℝ) (i : Fin k) :
+    deriv (fun x => Real.log (Matrix.det (A + S_lambda_fn S_basis (Function.update rho i x)))) (rho i)
+      = ((A + S_lambda_fn S_basis rho)⁻¹ * (Real.exp (rho i) • S_basis i)).trace := by
+  sorry
 
 end GradientDescentVerification
 
