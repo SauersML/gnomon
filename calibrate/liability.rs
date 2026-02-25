@@ -15,6 +15,22 @@ use gam::probability::{normal_cdf_approx, normal_pdf};
 use gam::types::LinkFunction;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 
+// Model parameterization note:
+// We fit smooth blocks directly for (T, log_sigma, m[, wiggle]) and form
+// z = (m - T) / sigma with sigma = exp(log_sigma).
+//
+// This keeps smoothing penalties aligned with scientifically meaningful fields
+// (threshold and log-scale), instead of smoothing transformed channels like
+// alpha = -T/sigma and beta = 1/sigma independently.
+//
+// Independent smoothing in (alpha, beta) induces an implicit penalty with
+// beta^2 weighting and mixed Hessian/gradient couplings:
+//   P ~ ∫ beta^2 [lambda_alpha |H_T + T B - S|^2 + lambda_beta |B|^2] dx
+// where B = (∇log_sigma)(∇log_sigma)^T - H_log_sigma and
+// S = (∇T)(∇log_sigma)^T + (∇log_sigma)(∇T)^T.
+// That coupling can distort roughness control when sigma varies spatially.
+// Using (T, log_sigma) blocks avoids that specific reparameterization artifact.
+
 const BLOCK_T: usize = 0;
 const BLOCK_LOG_SIGMA: usize = 1;
 const BLOCK_M: usize = 2;
@@ -346,14 +362,20 @@ impl CustomFamily for LiabilityFamily {
 
         let mut log_lik = 0.0_f64;
         for i in 0..n {
+            // sigma = exp(eta_log_sigma), hard-clamped to protect the ratio map
+            // z = (m - T) / sigma from blow-ups near sigma -> 0.
             let raw_sigma = eta_log_sigma[i].exp();
             sigma[i] = raw_sigma.clamp(self.sigma_min, self.sigma_max);
+            // d sigma / d eta_log_sigma = sigma in the unclamped interior; 0 once clamped.
+            // This yields piecewise-smooth optimization around clamp boundaries.
             dsigma_deta_log_sigma[i] = if raw_sigma >= self.sigma_min && raw_sigma <= self.sigma_max
             {
                 raw_sigma
             } else {
                 0.0
             };
+            // Probit latent margin:
+            //   q = z + wiggle(z), with z = (m - T) / sigma.
             z[i] = (eta_m[i] - eta_t[i]) / sigma[i];
             q[i] = z[i] + eta_w.map_or(0.0, |ew| ew[i]);
             let p = normal_cdf_approx(q[i]).clamp(1e-10, 1.0 - 1e-10);
@@ -371,12 +393,20 @@ impl CustomFamily for LiabilityFamily {
 
             for i in 0..n {
                 let chain = match b {
+                    // q = (m - T)/sigma + w
+                    // dq/deta_T = -1/sigma
                     BLOCK_T => -1.0 / sigma[i],
                     BLOCK_LOG_SIGMA => {
                         let sigma_i = sigma[i].max(1e-12);
+                        // z = (m - T)/sigma, sigma = exp(eta_log_sigma)
+                        // dz/deta_log_sigma = -(m - T)/sigma^2 * d sigma/deta
+                        //                  = -z * (d sigma/deta)/sigma
+                        // and dq/deta_log_sigma = dz/deta_log_sigma.
                         -z[i] * dsigma_deta_log_sigma[i] / sigma_i
                     }
+                    // dq/deta_m = +1/sigma
                     BLOCK_M => 1.0 / sigma[i],
+                    // Optional additive nonlinearity in q.
                     BLOCK_WIGGLE => 1.0,
                     _ => return Err("invalid block index".to_string()),
                 };
@@ -389,8 +419,11 @@ impl CustomFamily for LiabilityFamily {
                     -dmu_deta_abs
                 };
 
+                // IRLS approximation for each block:
+                //   w_i = (dmu/deta)^2 / Var(y_i), z_i = eta_i + (y_i - mu_i)/(dmu/deta).
                 ww[i] = self.weights[i] * (dmu_deta * dmu_deta / var).max(1e-12);
                 wz[i] = block_states[b].eta[i] + (self.y[i] - mu[i]) / denom;
+                // Score in eta coordinates for blockwise Newton updates.
                 grad[i] = self.weights[i] * (self.y[i] - mu[i]) * dmu_deta / var;
             }
 
@@ -450,6 +483,9 @@ impl CustomFamily for LiabilityFamily {
             z[i] = (eta_m[i] - eta_t[i]) / sigma;
         }
 
+        // The wiggle basis is re-evaluated on current z each iteration.
+        // This keeps the optional link-flexibility term aligned to the current
+        // latent axis rather than a fixed preprocessing transform.
         let x = build_wiggle_design_from_z(z.view(), knots, degree)
             .map_err(|e| format!("failed to build dynamic wiggle design: {e}"))?;
         if x.ncols() != spec.design.ncols() {
@@ -472,6 +508,8 @@ impl CustomFamily for LiabilityFamily {
             return Ok(beta);
         }
         let mut projected = beta;
+        // Isotonic projection in coefficient space to preserve a monotone
+        // score-transform channel (nondecreasing spline coefficients).
         for j in 1..projected.len() {
             if projected[j] < projected[j - 1] {
                 projected[j] = projected[j - 1];
@@ -611,6 +649,8 @@ pub fn predict_liability_model(
     let eta_log_sigma = x_sigma.dot(&model.fit.block_states[BLOCK_LOG_SIGMA].beta);
     let eta_m = x_m.dot(&model.fit.block_states[BLOCK_M].beta);
 
+    // Same forward map as training:
+    // sigma = exp(log_sigma), z = (m - T)/sigma, optional q = z + wiggle(z).
     let mut sigma = eta_log_sigma.mapv(f64::exp);
     sigma.mapv_inplace(|v| v.clamp(model.sigma_min, model.sigma_max));
     let z = (&eta_m - &eta_t) / &sigma;

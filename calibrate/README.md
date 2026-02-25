@@ -42,6 +42,14 @@ respect the null spaces implied by the ANOVA constraints so that intercepts,
 sex main effects, and other lower-order components remain unpenalized by
 construction.
 
+For liability-style fits, the implementation smooths the scientific channels
+`T` and `log_sigma` directly (plus `m` and optional `wiggle`) instead of
+smoothing transformed channels such as `alpha=-T/sigma` and `beta=1/sigma`
+independently. That choice avoids an implicit reparameterization penalty of the
+form `∫ beta^2[... ] dx` with extra gradient/Hessian coupling terms, which can
+otherwise distort roughness control when `sigma` varies over the covariate
+space.
+
 Smoothing parameters (`λ`) are learned rather than fixed. The engine estimator
 implements a nested optimization in the style of Wood (2011): inner PIRLS for
 fixed `λ`, and outer BFGS on marginal likelihood. Gaussian models maximize
