@@ -22,7 +22,7 @@ default = []
 bench-path = []
 
 [dependencies]
-gam = { git = "https://github.com/SauersML/gam.git", tag = "v0.1.5" }
+gam = { git = "https://github.com/SauersML/gam.git", tag = "v0.1.6" }
 ahash = "0.8.12"
 clap = { version = "4.5.48", features = ["derive"] }
 memmap2 = "0.9.8"
