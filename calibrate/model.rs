@@ -1,5 +1,5 @@
 use gam::basis::{self, BasisOptions, Dense, KnotSource, create_basis};
-use crate::calibrate::construction::EngineLayout;
+use crate::calibrate::construction::DomainLayout;
 use crate::calibrate::estimate::EstimationError;
 use gam::hull::PeeledHull;
 use gam::probability::normal_cdf_approx;
@@ -1898,7 +1898,7 @@ impl TrainedModel {
         Ok(model)
     }
 
-    fn rebuild_layout_from_config(&self) -> Result<EngineLayout, ModelError> {
+    fn rebuild_layout_from_config(&self) -> Result<DomainLayout, ModelError> {
         if matches!(self.config.model_family, ModelFamily::Survival(_)) {
             return Err(ModelError::UnsupportedForSurvival(
                 "rebuild_layout_from_config",
@@ -1954,7 +1954,7 @@ impl TrainedModel {
 
         let sex_main_cols = 1;
 
-        EngineLayout::new(
+        DomainLayout::new(
             &self.config,
             &pc_null_ncols,
             &pc_range_ncols,
@@ -1977,7 +1977,7 @@ impl TrainedModel {
 
     pub(crate) fn assert_layout_consistency_with_layout(
         &self,
-        layout: &EngineLayout,
+        layout: &DomainLayout,
     ) -> Result<(), ModelError> {
         if matches!(self.config.model_family, ModelFamily::Survival(_)) {
             return Ok(());
@@ -2193,7 +2193,7 @@ mod internal {
         let pgs_main_basis = pgs_main_basis_unc.dot(pgs_z);
 
         // The interaction basis MUST be constructed from the UNCONSTRAINED PGS basis.
-        // The model's coefficient layout (defined in construction.rs -> EngineLayout::new) is derived
+        // The model's coefficient layout (defined in construction.rs -> DomainLayout::new) is derived
         // from the dimensions of the unconstrained bases. Changing this to use a constrained basis
         // without a corresponding change to the layout logic will cause a dimension mismatch and lead
         // to silently incorrect predictions. The debug_assert in TrainedModel::predict guards against this.
@@ -3626,7 +3626,7 @@ mod tests {
 /// Maps the flattened coefficient vector to a structured representation.
 pub fn map_coefficients(
     beta: &Array1<f64>,
-    layout: &EngineLayout,
+    layout: &DomainLayout,
 ) -> Result<MappedCoefficients, EstimationError> {
     let intercept = beta[layout.intercept_col];
     let mut pcs = HashMap::new();

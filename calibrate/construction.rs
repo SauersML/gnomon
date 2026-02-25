@@ -43,7 +43,7 @@ impl DifferencePenaltyCache {
 
 /// Holds the layout of the design matrix `X` and penalty matrices `S_i`.
 #[derive(Clone)]
-pub struct EngineLayout {
+pub struct DomainLayout {
     pub intercept_col: usize,
     pub sex_col: Option<usize>,
     pub pgs_main_cols: Range<usize>,
@@ -65,7 +65,7 @@ pub struct EngineLayout {
     pub num_penalties: usize,
 }
 
-pub type ModelLayout = EngineLayout;
+pub type ModelLayout = DomainLayout;
 
 /// The semantic type of a penalized term in the model.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -89,11 +89,11 @@ pub struct PenalizedBlock {
     pub term_type: TermType,
 }
 
-impl EngineLayout {
+impl DomainLayout {
     /// Minimal external layout for arbitrary design matrices used by the calibrator or adapters.
     /// Sets only the fields required by PIRLS and reparameterization.
     pub fn external(total_coeffs: usize, num_penalties: usize) -> Self {
-        EngineLayout {
+        DomainLayout {
             intercept_col: 0,
             sex_col: None,
             pgs_main_cols: 0..0,
@@ -292,7 +292,7 @@ impl EngineLayout {
         // Verify that our calculation matches the actual column count
         if current_col != calculated_total_coeffs {
             return Err(EstimationError::LayoutError(format!(
-                "EngineLayout dimension calculation error: calculated total_coeffs={calculated_total_coeffs} but actual current_col={current_col}"
+                "DomainLayout dimension calculation error: calculated total_coeffs={calculated_total_coeffs} but actual current_col={current_col}"
             )));
         }
 
@@ -320,7 +320,7 @@ impl EngineLayout {
             )));
         }
 
-        Ok(EngineLayout {
+        Ok(DomainLayout {
             intercept_col,
             sex_col,
             pgs_main_cols,
@@ -349,7 +349,7 @@ pub fn build_design_and_penalty_matrices(
     (
         Array2<f64>,                  // design matrix
         Vec<Array2<f64>>,             // penalty matrices (dense)
-        EngineLayout,                  // model layout
+        DomainLayout,                  // model layout
         HashMap<String, Array2<f64>>, // sum_to_zero_constraints
         HashMap<String, Array1<f64>>, // knot_vectors
         HashMap<String, Array2<f64>>, // range_transforms
@@ -585,7 +585,7 @@ pub fn build_design_and_penalty_matrices(
 
     let sex_main_ncols = 1;
 
-    let layout = EngineLayout::new(
+    let layout = DomainLayout::new(
         config,
         &pc_null_ncols,
         &pc_range_ncols,
@@ -1525,7 +1525,7 @@ mod tests {
     /// Construct canonical penalty square roots and smoothing parameters for stress scenarios.
     fn create_synthetic_penalty_scenario(
         scenario_name: &str,
-    ) -> (Vec<Array2<f64>>, Vec<f64>, EngineLayout) {
+    ) -> (Vec<Array2<f64>>, Vec<f64>, DomainLayout) {
         match scenario_name {
             "balanced" => {
                 let p = 10;
@@ -1543,7 +1543,7 @@ mod tests {
                 let rs2 = make_root(0.9);
                 let rs3 = make_root(1.1);
                 let lambdas = vec![1.0, 1.0, 1.0];
-                let layout = EngineLayout::external(p, lambdas.len());
+                let layout = DomainLayout::external(p, lambdas.len());
                 (vec![rs1, rs2, rs3], lambdas, layout)
             }
             "imbalanced" => {
@@ -1562,7 +1562,7 @@ mod tests {
                 let rs2 = make_root(3);
                 let rs3 = make_root(2);
                 let lambdas = vec![1000.0, 1.0, 1.0];
-                let layout = EngineLayout::external(p, lambdas.len());
+                let layout = DomainLayout::external(p, lambdas.len());
                 (vec![rs1, rs2, rs3], lambdas, layout)
             }
             "near_zero" => {
@@ -1570,7 +1570,7 @@ mod tests {
                 let rs1 = Array2::zeros((0, p));
                 let rs2 = Array2::zeros((0, p));
                 let lambdas = vec![1e-8, 2e-8];
-                let layout = EngineLayout::external(p, lambdas.len());
+                let layout = DomainLayout::external(p, lambdas.len());
                 (vec![rs1, rs2], lambdas, layout)
             }
             "high_rank" => {
@@ -1589,7 +1589,7 @@ mod tests {
                 let rs2 = make_root(55);
                 let rs3 = make_root(50);
                 let lambdas = vec![2.0, 1.5, 0.75];
-                let layout = EngineLayout::external(p, lambdas.len());
+                let layout = DomainLayout::external(p, lambdas.len());
                 (vec![rs1, rs2, rs3], lambdas, layout)
             }
             "degenerate" => {
@@ -1618,7 +1618,7 @@ mod tests {
                     stack
                 };
                 let lambdas = vec![3.0, 0.5];
-                let layout = EngineLayout::external(p, lambdas.len());
+                let layout = DomainLayout::external(p, lambdas.len());
                 (vec![rs_stack.clone(), rs_stack], lambdas, layout)
             }
             other => panic!("Unknown synthetic penalty scenario: {other}"),

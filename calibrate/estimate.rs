@@ -3,8 +3,6 @@ pub use gam::estimate::{
     evaluate_external_cost_and_ridge, evaluate_external_gradients, fit_gam,
     optimize_external_design,
 };
-
-pub use gam::estimate::internal;
 use gam::basis::{BasisOptions, Dense, KnotSource, create_basis};
 use gam::faer_ndarray::FaerCholesky;
 use gam::hmc;
@@ -758,7 +756,7 @@ fn fit_single_survival_model(
             .iter()
             .map(|block| block.lambda.max(1e-12))
             .collect::<Vec<_>>();
-        let objective = |rho: &Array1<f64>| -> Result<f64, EstimationError> {
+        let objective_with_gradient = |rho: &Array1<f64>| -> Result<(f64, Array1<f64>), EstimationError> {
             let mut eval_layout = layout.clone();
             for (block, &rho_i) in eval_layout.penalties.blocks.iter_mut().zip(rho.iter()) {
                 block.lambda = rho_i.exp();
@@ -789,7 +787,9 @@ fn fit_single_survival_model(
                 &pirls_options,
                 |_| {},
             )?;
-            Ok(result.state.deviance)
+            let beta_arr: Array1<f64> = result.beta.clone().into();
+            let (value, grad) = model.laml_objective_and_rho_gradient(&beta_arr, &result.state)?;
+            Ok((value, grad))
         };
         let seed_strategy = if layout.penalties.blocks.len() >= 10 {
             gam::seeding::SeedStrategy::Light
@@ -805,10 +805,10 @@ fn fit_single_survival_model(
                 bounds: (-12.0, 12.0),
             },
         };
-        let smooth_sol = gam::families::royston_parmar::optimize_survival_lambdas_with_multistart(
+        let smooth_sol = gam::families::royston_parmar::optimize_survival_lambdas_with_multistart_with_gradient(
             layout.penalties.blocks.len(),
             Some(heuristic_lambdas.as_slice()),
-            objective,
+            objective_with_gradient,
             &smooth_opts,
         )?;
         for (block, &rho_i) in layout
