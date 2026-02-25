@@ -2107,10 +2107,8 @@ mod tests {
     use crate::calibrate::construction::{EngineLayout, compute_penalty_square_roots};
     use crate::calibrate::estimate::evaluate_external_gradients;
     use gam::faer_ndarray::FaerCholesky;
-    use gam::faer_ndarray::FaerLdlt;
     use crate::calibrate::model::ModelConfig;
     use gam::types::LogSmoothingParamsView;
-    use faer::Mat as FaerMat;
     use faer::Side;
     use faer::linalg::solvers::Llt as FaerLlt;
     use ndarray::{Array1, Array2, Axis};
