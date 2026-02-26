@@ -6439,7 +6439,7 @@ def HasGradientAt (f : Matrix (Fin p) (Fin 1) ℝ → ℝ) (g : Matrix (Fin p) (
   ∃ (L : Matrix (Fin p) (Fin 1) ℝ →L[ℝ] ℝ),
     (∀ h, L h = (g.transpose * h).trace) ∧ HasFDerivAt f L x
 
-theorem laml_gradient_is_exact 
+theorem laml_gradient_is_exact
     (log_lik : Matrix (Fin p) (Fin 1) ℝ → ℝ)
     (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ)
     (X : Matrix (Fin n) (Fin p) ℝ)
@@ -6447,29 +6447,76 @@ theorem laml_gradient_is_exact
     (beta_hat : (Fin k → ℝ) → Matrix (Fin p) (Fin 1) ℝ)
     (grad_op : (Matrix (Fin p) (Fin 1) ℝ → ℝ) → Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin p) (Fin 1) ℝ)
     (rho : Fin k → ℝ) (i : Fin k)
-    (D : (Fin k → ℝ) →L[ℝ] ℝ)
-    (hF : HasFDerivAt (fun r => LAML_fn log_lik S_basis X W beta_hat r) D rho)
-    (h_split : D (Pi.single i 1) =
-      rust_direct_gradient_fn S_basis X W beta_hat log_lik rho i +
-      rust_correction_fn S_basis X W beta_hat grad_op rho i) :
+    -- 1. Partial Derivatives of Components (Structural Hypotheses)
+    (h_deriv_L_pen_partial : ∀ b, deriv (fun r => L_pen_fn log_lik S_basis (Function.update rho i r) b) (rho i) =
+        0.5 * Real.exp (rho i) * trace (b.transpose * (S_basis i) * b))
+    (h_deriv_H_partial : ∀ b, deriv (fun r => Real.log (Hessian_fn S_basis X W (Function.update rho i r) b).det) (rho i) =
+        Real.exp (rho i) * trace ((Hessian_fn S_basis X W rho b)⁻¹ * (S_basis i)))
+    (h_deriv_log_S : deriv (fun r => Real.log (S_lambda_fn S_basis (Function.update rho i r)).det) (rho i) =
+        Real.exp (rho i) * trace ((S_lambda_fn S_basis rho)⁻¹ * (S_basis i)))
+    -- 2. Optimality of beta_hat (Total deriv of L_pen wrt rho is just partial deriv wrt rho)
+    (h_beta_opt : deriv (fun r => L_pen_fn log_lik S_basis (Function.update rho i r) (beta_hat (Function.update rho i r))) (rho i) =
+                  deriv (fun r => L_pen_fn log_lik S_basis (Function.update rho i r) (beta_hat rho)) (rho i))
+    -- 3. Correction term (Beta dependence of log det H)
+    (h_correction : deriv (fun r => 0.5 * Real.log (Hessian_fn S_basis X W rho (beta_hat (Function.update rho i r))).det) (rho i) =
+                    rust_correction_fn S_basis X W beta_hat grad_op rho i)
+    -- 4. Composition property: Total deriv of H term splits into partial + correction
+    (h_split_H : deriv (fun r => 0.5 * Real.log (Hessian_fn S_basis X W (Function.update rho i r) (beta_hat (Function.update rho i r))).det) (rho i) =
+                 deriv (fun r => 0.5 * Real.log (Hessian_fn S_basis X W (Function.update rho i r) (beta_hat rho)).det) (rho i) +
+                 deriv (fun r => 0.5 * Real.log (Hessian_fn S_basis X W rho (beta_hat (Function.update rho i r))).det) (rho i))
+    -- 5. Differentiability assumptions
+    (h_diff_L_pen : DifferentiableAt ℝ (fun r => L_pen_fn log_lik S_basis (Function.update rho i r) (beta_hat (Function.update rho i r))) (rho i))
+    (h_diff_H_total : DifferentiableAt ℝ (fun r => Real.log (Hessian_fn S_basis X W (Function.update rho i r) (beta_hat (Function.update rho i r))).det) (rho i))
+    (h_diff_H_partial : DifferentiableAt ℝ (fun r => Real.log (Hessian_fn S_basis X W (Function.update rho i r) (beta_hat rho)).det) (rho i))
+    (h_diff_S : DifferentiableAt ℝ (fun r => Real.log (S_lambda_fn S_basis (Function.update rho i r)).det) (rho i))
+    (h_diff_log_S : DifferentiableAt ℝ (fun r => Real.log (S_lambda_fn S_basis (Function.update rho i r)).det) (rho i)) :
   deriv (fun r => LAML_fn log_lik S_basis X W beta_hat (Function.update rho i r)) (rho i) =
   rust_direct_gradient_fn S_basis X W beta_hat log_lik rho i +
-  rust_correction_fn S_basis X W beta_hat grad_op rho i :=
-by
-  let g : ℝ → (Fin k → ℝ) := Function.update rho i
-  have hg : HasDerivAt g (Pi.single i 1) (rho i) := by
-    simpa [g] using (hasDerivAt_update rho i (rho i))
-  have h_update : g (rho i) = rho := by
-    simpa [g] using (Function.update_eq_self i rho)
-  have hF_at_update : HasFDerivAt (fun r => LAML_fn log_lik S_basis X W beta_hat r) D (g (rho i)) := by
-    simpa [h_update] using hF
-  have hcomp : HasDerivAt (fun r => LAML_fn log_lik S_basis X W beta_hat (g r))
-      (D (Pi.single i 1)) (rho i) := by
-    exact hF_at_update.comp_hasDerivAt (rho i) hg
-  have h_deriv :
-      deriv (fun r => LAML_fn log_lik S_basis X W beta_hat (g r)) (rho i) =
-      D (Pi.single i 1) := hcomp.deriv
-  simpa [g, h_split] using h_deriv
+  rust_correction_fn S_basis X W beta_hat grad_op rho i := by
+  -- Expand LAML_fn definition
+  have h_LAML_def : (fun r => LAML_fn log_lik S_basis X W beta_hat (Function.update rho i r)) =
+      (fun r => L_pen_fn log_lik S_basis (Function.update rho i r) (beta_hat (Function.update rho i r)) +
+                0.5 * Real.log (Hessian_fn S_basis X W (Function.update rho i r) (beta_hat (Function.update rho i r))).det -
+                0.5 * Real.log (S_lambda_fn S_basis (Function.update rho i r)).det) := by
+    ext r
+    simp [LAML_fn]
+    ring
+  rw [h_LAML_def]
+
+  -- Apply sum rule for derivatives
+  rw [deriv_sub, deriv_add]
+  · -- Substitute individual derivatives
+    rw [h_beta_opt]
+    rw [h_deriv_L_pen_partial (beta_hat rho)]
+    rw [h_split_H]
+    rw [h_correction]
+
+    -- Handle partial deriv of H term
+    have h_deriv_H_partial_scaled : deriv (fun r => 0.5 * Real.log (Hessian_fn S_basis X W (Function.update rho i r) (beta_hat rho)).det) (rho i) =
+        0.5 * Real.exp (rho i) * trace ((Hessian_fn S_basis X W rho (beta_hat rho))⁻¹ * (S_basis i)) := by
+      rw [deriv_const_mul _ h_diff_H_partial]
+      rw [h_deriv_H_partial (beta_hat rho)]
+      rw [Function.update_eq_self]
+    rw [h_deriv_H_partial_scaled]
+
+    -- Handle deriv of S term
+    have h_deriv_S_scaled : deriv (fun r => 0.5 * Real.log (S_lambda_fn S_basis (Function.update rho i r)).det) (rho i) =
+        0.5 * Real.exp (rho i) * trace ((S_lambda_fn S_basis rho)⁻¹ * (S_basis i)) := by
+      rw [deriv_const_mul _ h_diff_log_S]
+      rw [h_deriv_log_S]
+      rw [Function.update_eq_self]
+    rw [h_deriv_S_scaled]
+
+    -- Now assemble terms to match rust_direct_gradient_fn + rust_correction_fn
+    unfold rust_direct_gradient_fn
+    ring
+
+  -- Differentiability checks for sum rule
+  · exact h_diff_L_pen.add h_diff_H_total
+  · simp only [Function.update_eq_self]
+    exact DifferentiableAt.const_mul h_diff_log_S 0.5
+  · exact h_diff_L_pen
+  · exact h_diff_H_total
 
 end GradientDescentVerification
 
