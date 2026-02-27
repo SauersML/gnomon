@@ -4211,13 +4211,9 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
     (h_oracle_opt : IsBayesOptimalInClass (dgpMultiplicativeBias scaling_func) model_oracle)
     (h_capable : ∃ (m : PhenotypeInformedGAM 1 k 1),
       ∀ p_val c_val, linearPredictor m p_val c_val = (dgpMultiplicativeBias scaling_func).trueExpectation p_val c_val)
-    -- Geometric projection hypothesis: `p ↦ p` is the orthogonal projection target
-    -- in the normalized class (equivalently, it satisfies the Pythagorean minimality inequality).
-    (h_projection_p :
-      ∀ (m : PhenotypeInformedGAM 1 k 1), IsNormalizedScoreModel m →
-        expectedSquaredError (dgpMultiplicativeBias scaling_func) (fun p c => p) ≤
-        expectedSquaredError (dgpMultiplicativeBias scaling_func) (fun p c => linearPredictor m p c))
-    (_h_scaling_mean : ∫ c, scaling_func c ∂(Measure.pi (fun (_ : Fin k) => ProbabilityTheory.gaussianReal 0 1)) = 1) :
+    -- Geometric projection hypothesis `h_projection_p` is removed.
+    -- It is now proven via `projection_of_p_is_p`.
+    (_h_mean_1 : ∫ c, scaling_func c ∂((stdNormalProdMeasure k).map Prod.snd) = 1) :
   let dgp := dgpMultiplicativeBias scaling_func
   expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) -
   expectedSquaredError dgp (fun p c => linearPredictor model_oracle p c)
@@ -4279,7 +4275,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
         expectedSquaredError dgp (fun p c => p) := by
       unfold expectedSquaredError
       simp [h_star_pred]
-    have hproj := h_projection_p model_norm h_norm_opt.is_normalized
+    have hproj := projection_of_p_is_p k scaling_func _h_mean_1 model_norm h_norm_opt.is_normalized h_linear_basis.1 _h_norm_int _h_scaling_sq_int
     simpa [dgp, h_star_as_p] using hproj
 
   have h_opt_risk : expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) =
