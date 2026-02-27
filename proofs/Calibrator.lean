@@ -4150,8 +4150,7 @@ noncomputable def dgpMultiplicativeBias {k : ℕ} [Fintype (Fin k)] (scaling_fun
     The expected squared error of any predictor f decomposes into the irreducible error
     (risk of the true expectation) plus the distance from the true expectation. -/
 lemma risk_decomposition {k : ℕ} [Fintype (Fin k)]
-    (dgp : DataGeneratingProcess k) (f : ℝ → (Fin k → ℝ) → ℝ)
-    (hf_int : Integrable (fun pc => (dgp.trueExpectation pc.1 pc.2 - f pc.1 pc.2)^2) dgp.jointMeasure) :
+    (dgp : DataGeneratingProcess k) (f : ℝ → (Fin k → ℝ) → ℝ) :
     expectedSquaredError dgp f =
     expectedSquaredError dgp dgp.trueExpectation +
     ∫ pc, (dgp.trueExpectation pc.1 pc.2 - f pc.1 pc.2)^2 ∂dgp.jointMeasure := by
@@ -4215,7 +4214,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
     -- in the normalized class (equivalently, it satisfies the Pythagorean minimality inequality).
     (h_projection_p :
       ∀ (m : PhenotypeInformedGAM 1 k 1), IsNormalizedScoreModel m →
-        expectedSquaredError (dgpMultiplicativeBias scaling_func) (fun p c => p) ≤
+        expectedSquaredError (dgpMultiplicativeBias scaling_func) (fun p _ => p) ≤
         expectedSquaredError (dgpMultiplicativeBias scaling_func) (fun p c => linearPredictor m p c))
     (_h_scaling_mean : ∫ c, scaling_func c ∂(Measure.pi (fun (_ : Fin k) => ProbabilityTheory.gaussianReal 0 1)) = 1) :
   let dgp := dgpMultiplicativeBias scaling_func
@@ -4851,27 +4850,63 @@ theorem context_specificity {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [
     (h_same_genetics : dgp1.trueGeneticEffect = dgp2.trueGeneticEffect ∧ dgp1.to_dgp.jointMeasure = dgp2.to_dgp.jointMeasure)
     (h_diff_env : dgp1.environmentalEffect ≠ dgp2.environmentalEffect)
     (model1 : PhenotypeInformedGAM p k sp) (h_opt1 : IsBayesOptimalInClass dgp1.to_dgp model1)
-    (h_repr :
-      IsBayesOptimalInClass dgp2.to_dgp model1 →
-        dgp1.to_dgp.trueExpectation = dgp2.to_dgp.trueExpectation) :
+    (h_capable1 : ∃ (m : PhenotypeInformedGAM p k sp),
+      ∀ p_val c_val, linearPredictor m p_val c_val = dgp1.to_dgp.trueExpectation p_val c_val)
+    (h_capable2 : ∃ (m : PhenotypeInformedGAM p k sp),
+      ∀ p_val c_val, linearPredictor m p_val c_val = dgp2.to_dgp.trueExpectation p_val c_val)
+    (h_measure_pos : Measure.IsOpenPosMeasure dgp1.to_dgp.jointMeasure)
+    (h_cont_dgp1 : Continuous (fun x : ℝ × (Fin k → ℝ) => dgp1.to_dgp.trueExpectation x.1 x.2))
+    (h_cont_dgp2 : Continuous (fun x : ℝ × (Fin k → ℝ) => dgp2.to_dgp.trueExpectation x.1 x.2))
+    (_h_cont_model : Continuous (fun x : ℝ × (Fin k → ℝ) => linearPredictor model1 x.1 x.2))
+    (h_int1 : Integrable (fun pc : ℝ × (Fin k → ℝ) => (dgp1.to_dgp.trueExpectation pc.1 pc.2 - linearPredictor model1 pc.1 pc.2)^2) dgp1.to_dgp.jointMeasure)
+    (h_int2 : Integrable (fun pc : ℝ × (Fin k → ℝ) => (dgp2.to_dgp.trueExpectation pc.1 pc.2 - linearPredictor model1 pc.1 pc.2)^2) dgp2.to_dgp.jointMeasure) :
   ¬ IsBayesOptimalInClass dgp2.to_dgp model1 := by
   intro h_opt2
-  have h_neq : dgp1.to_dgp.trueExpectation ≠ dgp2.to_dgp.trueExpectation := by
-    intro h_eq_fn
-    rw [dgp1.is_additive_causal, dgp2.is_additive_causal, h_same_genetics.1] at h_eq_fn
-    have : dgp1.environmentalEffect = dgp2.environmentalEffect := by
-      ext c
-      have := congr_fun (congr_fun h_eq_fn 0) c
-      simp at this; exact this
-    exact h_diff_env this
-  -- The Bayes-optimal predictor is the conditional expectation E[Y|P,C] = dgp.trueExpectation
-  -- If model1 is Bayes-optimal for both dgp1 and dgp2, then:
-  --   linearPredictor model1 = dgp1.trueExpectation (from h_opt1)
-  --   linearPredictor model1 = dgp2.trueExpectation (from h_opt2)
-  -- Therefore dgp1.trueExpectation = dgp2.trueExpectation, contradicting h_neq.
-  --
-  -- Use the representability hypothesis to derive the contradiction.
-  exact h_neq (h_repr h_opt2)
+
+  -- 1. Optimality + Capability implies the model recovers the truth a.e.
+  have h_risk_zero1 := optimal_recovers_truth_of_capable dgp1.to_dgp model1 h_opt1 h_capable1
+  have h_risk_zero2 := optimal_recovers_truth_of_capable dgp2.to_dgp model1 h_opt2 h_capable2
+
+  -- 2. Integral of squared error = 0 => integrand = 0 a.e.
+  have h_ae_eq1 : (fun pc : ℝ × (Fin k → ℝ) => linearPredictor model1 pc.1 pc.2) =ᵐ[dgp1.to_dgp.jointMeasure] (fun pc => dgp1.to_dgp.trueExpectation pc.1 pc.2) := by
+    rw [integral_eq_zero_iff_of_nonneg] at h_risk_zero1
+    · filter_upwards [h_risk_zero1] with pc h_sq
+      exact (sub_eq_zero.mp (sq_eq_zero_iff.mp h_sq)).symm
+    · intro pc; exact sq_nonneg _
+    · exact h_int1
+
+  have h_ae_eq2 : (fun pc : ℝ × (Fin k → ℝ) => linearPredictor model1 pc.1 pc.2) =ᵐ[dgp2.to_dgp.jointMeasure] (fun pc => dgp2.to_dgp.trueExpectation pc.1 pc.2) := by
+    rw [integral_eq_zero_iff_of_nonneg] at h_risk_zero2
+    · filter_upwards [h_risk_zero2] with pc h_sq
+      exact (sub_eq_zero.mp (sq_eq_zero_iff.mp h_sq)).symm
+    · intro pc; exact sq_nonneg _
+    · exact h_int2
+
+  -- 3. Transitivity: dgp1 = model1 = dgp2 a.e.
+  -- Note: joint measures are equal by h_same_genetics.
+  rw [← h_same_genetics.2] at h_ae_eq2
+  have h_ae_eq_dgps : (fun pc : ℝ × (Fin k → ℝ) => dgp1.to_dgp.trueExpectation pc.1 pc.2) =ᵐ[dgp1.to_dgp.jointMeasure] (fun pc => dgp2.to_dgp.trueExpectation pc.1 pc.2) := by
+    filter_upwards [h_ae_eq1, h_ae_eq2] with pc h1 h2
+    rw [← h1, ← h2]
+
+  -- 4. Pointwise equality from a.e. equality + continuity + positive measure
+  have h_pointwise_eq : ∀ p c, dgp1.to_dgp.trueExpectation p c = dgp2.to_dgp.trueExpectation p c := by
+    let f := fun pc : ℝ × (Fin k → ℝ) => dgp1.to_dgp.trueExpectation pc.1 pc.2
+    let g := fun pc : ℝ × (Fin k → ℝ) => dgp2.to_dgp.trueExpectation pc.1 pc.2
+    have h_eq_fun : f = g := by
+      apply eq_of_ae_eq_of_continuous h_cont_dgp1 h_cont_dgp2 h_ae_eq_dgps
+    intro p c
+    exact congr_fun h_eq_fun (p, c)
+
+  -- 5. Contradiction with environmental difference
+  apply h_diff_env
+  ext c
+  -- Use the structural form: G(P) + E1(C) = G(P) + E2(C)
+  have h_eval := h_pointwise_eq 0 c
+  rw [dgp1.is_additive_causal, dgp2.is_additive_causal] at h_eval
+  rw [h_same_genetics.1] at h_eval
+  simp at h_eval
+  exact h_eval
 
 /-! ### Effect Heterogeneity: R² and AUC Improvement
 
@@ -6272,7 +6307,7 @@ lemma sigmoid_strictConcaveOn_Ici : StrictConcaveOn ℝ (Set.Ici 0) sigmoid := b
     ("calibrated probability") is strictly less than the probability at the mean score.
     i.e., The model is "over-confident" if it predicts sigmoid(E[X]).
     The true probability E[sigmoid(X)] is "shrunk" toward 0.5. -/
-  theorem calibration_shrinkage (μ : ℝ) (hμ_pos : μ > 0)
+  theorem calibration_shrinkage (μ : ℝ)
       (X : Ω → ℝ) (P : Measure Ω) [IsProbabilityMeasure P]
       (h_measurable : Measurable X) (h_integrable : Integrable X P)
       (h_mean : ∫ ω, X ω ∂P = μ)
