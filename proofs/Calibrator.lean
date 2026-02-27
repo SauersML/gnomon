@@ -4185,6 +4185,219 @@ theorem optimal_recovers_truth_of_capable {p k sp : ℕ} [Fintype (Fin p)] [Fint
     Assumption: E[scaling(C)] = 1 (centered scaling).
     Then the additive projection of scaling(C)*P is 1*P.
     The residual is (scaling(C) - 1)*P. -/
+/-- **Projection Lemma**: The identity predictor `p ↦ p` minimizes the expected squared error
+    among all normalized models (which have the form `Base(C) + γ·P`) when the true model
+    is multiplicative `Y = S(C)·P` and `E[S(C)] = 1`. -/
+lemma h_projection_p_proof {k : ℕ} [Fintype (Fin k)]
+    (scaling_func : (Fin k → ℝ) → ℝ)
+    (_h_mean_1 : ∫ c, scaling_func c ∂((stdNormalProdMeasure k).map Prod.snd) = 1)
+    (m : PhenotypeInformedGAM 1 k 1)
+    (hm : IsNormalizedScoreModel m)
+    (h_linear_basis : m.pgsBasis.B 1 = id)
+    (_h_scaling_sq_int : Integrable (fun c => (scaling_func c)^2) ((stdNormalProdMeasure k).map Prod.snd))
+    (_h_m_int : Integrable (fun pc => (linearPredictor m pc.1 pc.2)^2) (stdNormalProdMeasure k)) :
+    expectedSquaredError (dgpMultiplicativeBias scaling_func) (fun p c => p) ≤
+      expectedSquaredError (dgpMultiplicativeBias scaling_func) (fun p c => linearPredictor m p c) := by
+  let dgp := dgpMultiplicativeBias scaling_func
+  let μ := stdNormalProdMeasure k
+  let μC := μ.map Prod.snd
+  let μP := μ.map Prod.fst
+
+  -- 1. Characterize the normalized model: f(p,c) = Base(c) + γ*p
+  have h_slope_const : ∀ c, predictorSlope m c = m.γₘ₀ 0 := by
+    intro c; unfold predictorSlope; simp [hm.fₘₗ_zero]
+  have h_pred_form : ∀ p c, linearPredictor m p c = predictorBase m c + m.γₘ₀ 0 * p := by
+    intro p c; rw [linearPredictor_decomp m h_linear_basis, h_slope_const]
+
+  let B := predictorBase m
+  let γ := m.γₘ₀ 0
+
+  -- 2. Expand Risk(m)
+  have h_expand : ∀ p c, (scaling_func c * p - (B c + γ * p))^2 =
+      (scaling_func c - γ)^2 * p^2 + (B c)^2 - 2 * (scaling_func c - γ) * B c * p := by
+    intro p c; ring
+
+  -- Integrability
+  have h_P2_int : Integrable (fun p => p^2) μP := integrable_sq_gaussian
+  have h_P_int : Integrable (fun p => p) μP := integrable_id_gaussian
+  have h_Sc_gamma_sq_int : Integrable (fun c => (scaling_func c - γ)^2) μC := by
+    apply Integrable.sub
+    · exact _h_scaling_sq_int
+    · exact integrable_const _ |> fun h => h.sub (integrable_const _) |> fun h => h.pow_const 2 |> fun h => h.mono (by exact _h_scaling_sq_int) (by exact le_of_lt (by norm_num)) -- Justification: (S-g)^2 <= 2S^2 + 2g^2
+      -- Simpler: (S-g)^2 is linear combo of S^2, S, 1. S^2 is int. S is int (by Jensen or just property of L2). 1 is int.
+      apply Integrable.pow_const
+      apply Integrable.sub
+      · -- S is L2 => S is L1
+        exact MeasureTheory.MemLp.integrable (MeasureTheory.MemLp.of_integrable _h_scaling_sq_int one_le_two) one_le_two
+      · exact integrable_const _
+      exact 2
+
+  have h_B_sq_int : Integrable (fun c => (B c)^2) μC := by
+    -- B = Pred - γP. Pred is L2. P is L2. So B is L2.
+    have h_pred_L2 : Integrable (fun pc : ℝ × (Fin k → ℝ) => (linearPredictor m pc.1 pc.2)^2) μ := _h_m_int
+    have h_gamma_p_L2 : Integrable (fun pc : ℝ × (Fin k → ℝ) => (γ * pc.1)^2) μ := by
+      have : (fun pc : ℝ × (Fin k → ℝ) => (γ * pc.1)^2) = (fun pc => γ^2 * pc.1^2) := by ext; ring
+      rw [this]
+      apply Integrable.prod_mul (integrable_const _) h_P2_int
+    have h_B_L2 : Integrable (fun pc : ℝ × (Fin k → ℝ) => (B pc.2)^2) μ := by
+      have h_diff : Integrable (fun pc : ℝ × (Fin k → ℝ) => (linearPredictor m pc.1 pc.2 - γ * pc.1)^2) μ := by
+        -- (a-b)^2 <= 2a^2 + 2b^2
+        refine Integrable.mono (h_pred_L2.add h_gamma_p_L2) ?_ ?_
+        · refine (h_pred_L2.add h_gamma_p_L2).const_mul 2
+        · filter_upwards with pc
+          calc (linearPredictor m pc.1 pc.2 - γ * pc.1)^2
+             ≤ 2 * (linearPredictor m pc.1 pc.2)^2 + 2 * (γ * pc.1)^2 := by
+               exact add_pow_two_le_two_add_two_mul_two _ _ -- actually real_add_pow_two ...
+               -- Manual: (a-b)^2 = a^2 + b^2 - 2ab. 2a^2 + 2b^2 - (a^2+b^2-2ab) = a^2+b^2+2ab = (a+b)^2 >= 0.
+               nlinarith
+      -- B(c) = Pred(p,c) - γp
+      have h_eq : ∀ pc, (B pc.2)^2 = (linearPredictor m pc.1 pc.2 - γ * pc.1)^2 := by
+        intro pc; rw [h_pred_form]; ring
+      simp_rw [h_eq]
+      exact h_diff
+    exact MeasureTheory.integrable_comp_snd_iff.mp h_B_L2
+
+  -- Expand Risk(m)
+  have h_risk_m : expectedSquaredError dgp (fun p c => linearPredictor m p c) =
+                  ∫ c, (scaling_func c - γ)^2 ∂μC + ∫ c, (B c)^2 ∂μC := by
+    unfold expectedSquaredError dgpMultiplicativeBias
+    simp_rw [h_expand]
+    rw [integral_add]
+    · rw [integral_add]
+      · -- Term 1: E[(S-γ)^2 P^2]
+        rw [MeasureTheory.integral_prod_mul]
+        · rw [gaussian_second_moment, mul_one]
+        · exact h_Sc_gamma_sq_int
+        · exact h_P2_int
+      · -- Term 2: E[B^2]
+        rw [MeasureTheory.integral_prod_mul]
+        · rw [ProbabilityTheory.integral_const_one_of_isProbabilityMeasure, mul_one]
+        · exact integrable_const 1
+        · exact h_B_sq_int
+      · -- Integrability of Term 1
+        exact h_Sc_gamma_sq_int.prod_mul h_P2_int
+      · -- Integrability of Term 2
+        exact (integrable_const 1).prod_mul h_B_sq_int
+    · -- Term 3: E[-2(S-γ)B P]
+      rw [MeasureTheory.integral_prod_mul]
+      · rw [gaussian_mean_zero, mul_zero]
+      · -- Integrability of (S-γ)B
+        apply Integrable.const_mul
+        -- (S-γ) is L2, B is L2 => product is L1 (Cauchy-Schwarz)
+        apply Integrable.mul
+        · exact MeasureTheory.MemLp.integrable (MeasureTheory.MemLp.of_integrable h_Sc_gamma_sq_int one_le_two) one_le_two
+        · exact MeasureTheory.MemLp.integrable (MeasureTheory.MemLp.of_integrable h_B_sq_int one_le_two) one_le_two
+        -- Actually just use `Integrable.mul` if we have L2.
+        -- But `Integrable` means L1.
+        -- We proved (S-γ)^2 and B^2 are integrable.
+        -- `Integrable.mul` requires `AEStronglyMeasurable` and norms.
+        -- Standard Hölder: f, g in L2 => fg in L1.
+        apply Integrable.mul_of_square
+        · exact h_Sc_gamma_sq_int
+        · exact h_B_sq_int
+        · exact _h_scaling_meas.sub (aestronglyMeasurable_const)
+        · -- B is measurable? Yes continuous.
+          -- We need B to be AEStronglyMeasurable.
+          -- B = predictorBase m. Continuous.
+          apply Continuous.aestronglyMeasurable
+          unfold predictorBase
+          apply Continuous.add
+          · exact continuous_const
+          · apply continuous_finset_sum
+            intro i _
+            apply Continuous.comp (by continuity) continuous_apply
+      · exact h_P_int
+    · -- Integrability of Term 1+2
+      apply Integrable.add
+      · exact h_Sc_gamma_sq_int.prod_mul h_P2_int
+      · exact (integrable_const 1).prod_mul h_B_sq_int
+    · -- Integrability of Term 3
+      apply Integrable.const_mul
+      apply Integrable.prod_mul
+      · apply Integrable.mul_of_square h_Sc_gamma_sq_int h_B_sq_int
+        · exact _h_scaling_meas.sub aestronglyMeasurable_const
+        · apply Continuous.aestronglyMeasurable
+          unfold predictorBase
+          apply Continuous.add
+          · exact continuous_const
+          · apply continuous_finset_sum; intro i _; apply Continuous.comp (by continuity) continuous_apply
+      · exact h_P_int
+
+  -- 3. Expand Risk(p) (Case B=0, γ=1)
+  have h_risk_p : expectedSquaredError dgp (fun p c => p) = ∫ c, (scaling_func c - 1)^2 ∂μC := by
+    unfold expectedSquaredError dgpMultiplicativeBias
+    have h_expand_p : ∀ p c, (scaling_func c * p - p)^2 = (scaling_func c - 1)^2 * p^2 := by
+      intro p c; ring
+    simp_rw [h_expand_p]
+    rw [MeasureTheory.integral_prod_mul]
+    · rw [gaussian_second_moment, mul_one]
+    · -- Integrability of (S-1)^2
+      -- S L2 => S-1 L2
+      apply Integrable.sub
+      · exact _h_scaling_sq_int
+      · exact integrable_const _ |> fun h => h.sub (integrable_const _) |> fun h => h.pow_const 2 |> fun h => h.mono (by exact _h_scaling_sq_int) (by exact le_of_lt (by norm_num))
+        apply Integrable.pow_const
+        apply Integrable.sub
+        · exact MeasureTheory.MemLp.integrable (MeasureTheory.MemLp.of_integrable _h_scaling_sq_int one_le_two) one_le_two
+        · exact integrable_const 1
+        exact 2
+    · exact h_P2_int
+
+  -- 4. Compare
+  rw [h_risk_m, h_risk_p]
+  -- Decompose ∫ (S-γ)^2 = ∫ (S-1)^2 + (1-γ)^2
+  have h_decomp_risk : ∫ c, (scaling_func c - γ)^2 ∂μC = ∫ c, (scaling_func c - 1)^2 ∂μC + (1 - γ)^2 := by
+    have h_alg : ∀ c, (scaling_func c - γ)^2 = (scaling_func c - 1)^2 + (1 - γ)^2 + 2 * (1 - γ) * (scaling_func c - 1) := by
+      intro c; ring_nf;
+      -- (S-g)^2 = S^2 - 2Sg + g^2
+      -- (S-1)^2 + (1-g)^2 + 2(1-g)(S-1) = S^2 - 2S + 1 + 1 - 2g + g^2 + 2(S - 1 - gS + g)
+      -- = S^2 - 2S + 2 + g^2 - 2g + 2S - 2 - 2gS + 2g
+      -- = S^2 + g^2 - 2gS
+      -- Matches.
+      norm_num; ring
+    simp_rw [h_alg]
+    rw [integral_add]
+    · rw [integral_add]
+      · rw [integral_mul_left]
+        have h_int_S_minus_1 : ∫ c, scaling_func c - 1 ∂μC = 0 := by
+          rw [integral_sub]
+          · rw [_h_mean_1, integral_const_one_of_isProbabilityMeasure]; norm_num
+          · exact MeasureTheory.MemLp.integrable (MeasureTheory.MemLp.of_integrable _h_scaling_sq_int one_le_two) one_le_two
+          · exact integrable_const 1
+        rw [h_int_S_minus_1, mul_zero, add_zero]
+        rw [integral_const]
+        simp
+      · -- Int (S-1)^2
+        apply Integrable.pow_const
+        apply Integrable.sub
+        · exact MeasureTheory.MemLp.integrable (MeasureTheory.MemLp.of_integrable _h_scaling_sq_int one_le_two) one_le_two
+        · exact integrable_const 1
+        exact 2
+      · -- Int (1-g)^2
+        exact integrable_const _
+    · -- Int (S-1)^2 + (1-g)^2
+      apply Integrable.add
+      · apply Integrable.pow_const
+        apply Integrable.sub
+        · exact MeasureTheory.MemLp.integrable (MeasureTheory.MemLp.of_integrable _h_scaling_sq_int one_le_two) one_le_two
+        · exact integrable_const 1
+        exact 2
+      · exact integrable_const _
+    · -- Int 2(1-g)(S-1)
+      apply Integrable.const_mul
+      apply Integrable.sub
+      · exact MeasureTheory.MemLp.integrable (MeasureTheory.MemLp.of_integrable _h_scaling_sq_int one_le_two) one_le_two
+      · exact integrable_const 1
+
+  rw [h_decomp_risk]
+  -- Risk(m) = Risk(p) + (1-γ)^2 + ∫ B^2
+  -- Since squares are non-negative, this is >= Risk(p)
+  have h_sq_nonneg : 0 ≤ (1 - γ)^2 := sq_nonneg _
+  have h_int_nonneg : 0 ≤ ∫ c, (B c)^2 ∂μC := integral_nonneg (fun c => sq_nonneg _)
+  calc ∫ c, (scaling_func c - 1)^2 ∂μC
+     ≤ ∫ c, (scaling_func c - 1)^2 ∂μC + (1 - γ)^2 := le_add_of_nonneg_right h_sq_nonneg
+   _ ≤ (∫ c, (scaling_func c - 1)^2 ∂μC + (1 - γ)^2) + ∫ c, (B c)^2 ∂μC := le_add_of_nonneg_right h_int_nonneg
+
 /-- Quantitative Error of Normalization (Multiplicative Case):
     In a multiplicative bias DGP Y = scaling(C) * P, the error of a normalized (additive) model
     relative to the optimal model is the variance of the interaction term.
@@ -4210,14 +4423,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
     (model_oracle : PhenotypeInformedGAM 1 k 1)
     (h_oracle_opt : IsBayesOptimalInClass (dgpMultiplicativeBias scaling_func) model_oracle)
     (h_capable : ∃ (m : PhenotypeInformedGAM 1 k 1),
-      ∀ p_val c_val, linearPredictor m p_val c_val = (dgpMultiplicativeBias scaling_func).trueExpectation p_val c_val)
-    -- Geometric projection hypothesis: `p ↦ p` is the orthogonal projection target
-    -- in the normalized class (equivalently, it satisfies the Pythagorean minimality inequality).
-    (h_projection_p :
-      ∀ (m : PhenotypeInformedGAM 1 k 1), IsNormalizedScoreModel m →
-        expectedSquaredError (dgpMultiplicativeBias scaling_func) (fun p c => p) ≤
-        expectedSquaredError (dgpMultiplicativeBias scaling_func) (fun p c => linearPredictor m p c))
-    (_h_scaling_mean : ∫ c, scaling_func c ∂(Measure.pi (fun (_ : Fin k) => ProbabilityTheory.gaussianReal 0 1)) = 1) :
+      ∀ p_val c_val, linearPredictor m p_val c_val = (dgpMultiplicativeBias scaling_func).trueExpectation p_val c_val) :
   let dgp := dgpMultiplicativeBias scaling_func
   expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) -
   expectedSquaredError dgp (fun p c => linearPredictor model_oracle p c)
@@ -4279,8 +4485,9 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
         expectedSquaredError dgp (fun p c => p) := by
       unfold expectedSquaredError
       simp [h_star_pred]
-    have hproj := h_projection_p model_norm h_norm_opt.is_normalized
-    simpa [dgp, h_star_as_p] using hproj
+    rw [h_star_as_p]
+    -- Apply the projection lemma instead of begging the question
+    apply h_projection_p_proof scaling_func _h_mean_1 model_norm h_norm_opt.is_normalized h_linear_basis.1 _h_scaling_sq_int _h_norm_int
 
   have h_opt_risk : expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) =
                     expectedSquaredError dgp (fun p c => linearPredictor model_star p c) := by
