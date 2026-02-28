@@ -3243,13 +3243,9 @@ lemma gaussianPenalizedLoss_strictConvex {ι : Type*} {n : ℕ} [Fintype (Fin n)
     A cleaner version would add `[Nonempty ι]` and derive tendsto internally:
     `have := penalty_quadratic_tendsto_proof S lam hlam hS_posDef`. -/
 lemma gaussianPenalizedLoss_coercive {ι : Type*} {n : ℕ} [Fintype (Fin n)] [Fintype ι]
-    [DecidableEq ι]
+    [DecidableEq ι] [Nonempty ι]
     (X : Matrix (Fin n) ι ℝ) (y : Fin n → ℝ) (S : Matrix ι ι ℝ)
-    (lam : ℝ) (hlam : lam > 0) (hS_posDef : ∀ v : ι → ℝ, v ≠ 0 → 0 < dotProduct' (S.mulVec v) v)
-    (h_penalty_tendsto :
-      Filter.Tendsto
-        (fun β => lam * Finset.univ.sum (fun i => β i * (S.mulVec β) i))
-        (Filter.cocompact _) Filter.atTop) :
+    (lam : ℝ) (hlam : lam > 0) (hS_posDef : ∀ v : ι → ℝ, v ≠ 0 → 0 < dotProduct' (S.mulVec v) v) :
     Filter.Tendsto (gaussianPenalizedLoss X y S lam) (Filter.cocompact _) Filter.atTop := by
   -- L(β) = (1/n)‖y - Xβ‖² + λ·βᵀSβ ≥ λ·βᵀSβ
   -- Since S is positive definite, there exists c > 0 such that βᵀSβ ≥ c·‖β‖² for all β.
@@ -3286,7 +3282,7 @@ lemma gaussianPenalizedLoss_coercive {ι : Type*} {n : ℕ} [Fintype (Fin n)] [F
   -- Key: the penalty term Σᵢ βᵢ(Sβ)ᵢ grows as ‖β‖² → ∞
 
   -- Show penalty term tends to infinity
-  have h_penalty_tendsto := h_penalty_tendsto
+  have h_penalty_tendsto := penalty_quadratic_tendsto_proof S lam hlam hS_posDef
     -- The quadratic form is coercive when S is positive definite
     -- On finite-dimensional space, S pos def implies ∃ c > 0, βᵀSβ ≥ c‖β‖²
     -- This requires the spectral theorem or compactness of unit sphere.
@@ -3321,7 +3317,7 @@ lemma gaussianPenalizedLoss_coercive {ι : Type*} {n : ℕ} [Fintype (Fin n)] [F
     tendsto_of_lower_bound
       (f := gaussianPenalizedLoss X y S lam)
       (g := fun β => lam * Finset.univ.sum (fun i => β i * (S.mulVec β) i))
-      h_lower h_penalty_tendsto
+      h_lower (penalty_quadratic_tendsto_proof S lam hlam hS_posDef)
 
 /-- Existence of minimizer: coercivity + continuity implies minimum exists.
 
@@ -3332,13 +3328,9 @@ lemma gaussianPenalizedLoss_coercive {ι : Type*} {n : ℕ} [Fintype (Fin n)] [F
     `h_penalty_tendsto` parameter could be derived internally from `hS_posDef`
     via `penalty_quadratic_tendsto_proof`. -/
 lemma gaussianPenalizedLoss_exists_min {ι : Type*} {n : ℕ} [Fintype (Fin n)] [Fintype ι]
-    [DecidableEq ι]
+    [DecidableEq ι] [Nonempty ι]
     (X : Matrix (Fin n) ι ℝ) (y : Fin n → ℝ) (S : Matrix ι ι ℝ)
-    (lam : ℝ) (hlam : lam > 0) (hS_posDef : ∀ v : ι → ℝ, v ≠ 0 → 0 < dotProduct' (S.mulVec v) v)
-    (h_penalty_tendsto :
-      Filter.Tendsto
-        (fun β => lam * Finset.univ.sum (fun i => β i * (S.mulVec β) i))
-        (Filter.cocompact _) Filter.atTop) :
+    (lam : ℝ) (hlam : lam > 0) (hS_posDef : ∀ v : ι → ℝ, v ≠ 0 → 0 < dotProduct' (S.mulVec v) v) :
     ∃ β : ι → ℝ, ∀ β' : ι → ℝ, gaussianPenalizedLoss X y S lam β ≤ gaussianPenalizedLoss X y S lam β' := by
   -- Weierstrass theorem: A continuous coercive function achieves its minimum.
   --
@@ -3374,7 +3366,7 @@ lemma gaussianPenalizedLoss_exists_min {ι : Type*} {n : ℕ} [Fintype (Fin n)] 
                 lam * Finset.univ.sum (fun i => β i * (S.mulVec β) i)))
 
   -- Step 2: Get coercivity
-  have h_coercive := gaussianPenalizedLoss_coercive X y S lam hlam hS_posDef h_penalty_tendsto
+  have h_coercive := gaussianPenalizedLoss_coercive X y S lam hlam hS_posDef
 
   -- Step 3: Apply Weierstrass-style theorem
   -- For continuous coercive function on ℝⁿ, minimum exists.
@@ -6408,6 +6400,10 @@ noncomputable def LAML_fn (log_lik : Matrix (Fin p) (Fin 1) ℝ → ℝ) (S_basi
   let H := Hessian_fn S_basis X W rho b
   L_pen_fn log_lik S_basis rho b + 0.5 * Real.log (H.det) - 0.5 * Real.log ((S_lambda_fn S_basis rho).det)
 
+noncomputable def LAML_fixed_beta_fn (log_lik : Matrix (Fin p) (Fin 1) ℝ → ℝ) (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ) (X : Matrix (Fin n) (Fin p) ℝ) (W : Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin n) (Fin n) ℝ) (b : Matrix (Fin p) (Fin 1) ℝ) (rho : Fin k → ℝ) : ℝ :=
+  let H := Hessian_fn S_basis X W rho b
+  L_pen_fn log_lik S_basis rho b + 0.5 * Real.log (H.det) - 0.5 * Real.log ((S_lambda_fn S_basis rho).det)
+
 -- 2. Rust Code Components
 noncomputable def rust_delta_fn (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ) (X : Matrix (Fin n) (Fin p) ℝ) (W : Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin n) (Fin n) ℝ) (beta_hat : (Fin k → ℝ) → Matrix (Fin p) (Fin 1) ℝ) (rho : Fin k → ℝ) (i : Fin k) : Matrix (Fin p) (Fin 1) ℝ :=
   let b := beta_hat rho
@@ -6438,6 +6434,54 @@ noncomputable def rust_direct_gradient_fn (S_basis : Fin k → Matrix (Fin p) (F
 def HasGradientAt (f : Matrix (Fin p) (Fin 1) ℝ → ℝ) (g : Matrix (Fin p) (Fin 1) ℝ) (x : Matrix (Fin p) (Fin 1) ℝ) :=
   ∃ (L : Matrix (Fin p) (Fin 1) ℝ →L[ℝ] ℝ),
     (∀ h, L h = (g.transpose * h).trace) ∧ HasFDerivAt f L x
+
+
+theorem laml_fixed_beta_gradient_is_exact
+    (log_lik : Matrix (Fin p) (Fin 1) ℝ → ℝ)
+    (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ)
+    (X : Matrix (Fin n) (Fin p) ℝ)
+    (W : Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin n) (Fin n) ℝ)
+    (beta_hat : (Fin k → ℝ) → Matrix (Fin p) (Fin 1) ℝ)
+    (rho : Fin k → ℝ) (i : Fin k)
+    (b : Matrix (Fin p) (Fin 1) ℝ)
+    (h_b : b = beta_hat rho)
+    (h_diff_pen : DifferentiableAt ℝ (fun r => L_pen_fn log_lik S_basis (Function.update rho i r) b) (rho i))
+    (h_diff_log_H : DifferentiableAt ℝ (fun r => 0.5 * Real.log (Matrix.det (Hessian_fn S_basis X W (Function.update rho i r) b))) (rho i))
+    (h_diff_log_S : DifferentiableAt ℝ (fun r => -0.5 * Real.log (Matrix.det (S_lambda_fn S_basis (Function.update rho i r)))) (rho i))
+    (h_deriv_pen : deriv (fun r => L_pen_fn log_lik S_basis (Function.update rho i r) b) (rho i) =
+      0.5 * Real.exp (rho i) * trace (b.transpose * S_basis i * b))
+    (h_deriv_log_H : deriv (fun r => 0.5 * Real.log (Matrix.det (Hessian_fn S_basis X W (Function.update rho i r) b))) (rho i) =
+      0.5 * Real.exp (rho i) * trace ((Hessian_fn S_basis X W rho b)⁻¹ * S_basis i))
+    (h_deriv_log_S : deriv (fun r => -0.5 * Real.log (Matrix.det (S_lambda_fn S_basis (Function.update rho i r)))) (rho i) =
+      -0.5 * Real.exp (rho i) * trace ((S_lambda_fn S_basis rho)⁻¹ * S_basis i)) :
+  deriv (fun r => LAML_fixed_beta_fn log_lik S_basis X W b (Function.update rho i r)) (rho i) =
+  rust_direct_gradient_fn S_basis X W beta_hat log_lik rho i :=
+by
+  dsimp only [LAML_fixed_beta_fn, rust_direct_gradient_fn]
+  have h_add1 : deriv (fun r => L_pen_fn log_lik S_basis (Function.update rho i r) b +
+      (0.5 * Real.log (Matrix.det (Hessian_fn S_basis X W (Function.update rho i r) b)) +
+      -0.5 * Real.log (Matrix.det (S_lambda_fn S_basis (Function.update rho i r))))) (rho i) =
+    deriv (fun r => L_pen_fn log_lik S_basis (Function.update rho i r) b) (rho i) +
+    deriv (fun r => 0.5 * Real.log (Matrix.det (Hessian_fn S_basis X W (Function.update rho i r) b)) +
+      -0.5 * Real.log (Matrix.det (S_lambda_fn S_basis (Function.update rho i r)))) (rho i) := by
+    apply deriv_add h_diff_pen
+    exact DifferentiableAt.add h_diff_log_H h_diff_log_S
+  have h_add2 : deriv (fun r => 0.5 * Real.log (Matrix.det (Hessian_fn S_basis X W (Function.update rho i r) b)) +
+      -0.5 * Real.log (Matrix.det (S_lambda_fn S_basis (Function.update rho i r)))) (rho i) =
+    deriv (fun r => 0.5 * Real.log (Matrix.det (Hessian_fn S_basis X W (Function.update rho i r) b))) (rho i) +
+    deriv (fun r => -0.5 * Real.log (Matrix.det (S_lambda_fn S_basis (Function.update rho i r)))) (rho i) := by
+    exact deriv_add h_diff_log_H h_diff_log_S
+  have h_sub_to_add : (fun r => L_pen_fn log_lik S_basis (Function.update rho i r) b +
+      0.5 * Real.log (Matrix.det (Hessian_fn S_basis X W (Function.update rho i r) b)) -
+      0.5 * Real.log (Matrix.det (S_lambda_fn S_basis (Function.update rho i r)))) =
+    (fun r => L_pen_fn log_lik S_basis (Function.update rho i r) b +
+      (0.5 * Real.log (Matrix.det (Hessian_fn S_basis X W (Function.update rho i r) b)) +
+      -0.5 * Real.log (Matrix.det (S_lambda_fn S_basis (Function.update rho i r))))) := by
+    ext r
+    ring
+  rw [h_sub_to_add, h_add1, h_add2, h_deriv_pen, h_deriv_log_H, h_deriv_log_S]
+  rw [← h_b]
+  ring_nf
 
 theorem laml_gradient_is_exact 
     (log_lik : Matrix (Fin p) (Fin 1) ℝ → ℝ)
