@@ -4151,7 +4151,7 @@ noncomputable def dgpMultiplicativeBias {k : ℕ} [Fintype (Fin k)] (scaling_fun
     (risk of the true expectation) plus the distance from the true expectation. -/
 lemma risk_decomposition {k : ℕ} [Fintype (Fin k)]
     (dgp : DataGeneratingProcess k) (f : ℝ → (Fin k → ℝ) → ℝ)
-    (hf_int : Integrable (fun pc => (dgp.trueExpectation pc.1 pc.2 - f pc.1 pc.2)^2) dgp.jointMeasure) :
+    (_hf_int : Integrable (fun pc => (dgp.trueExpectation pc.1 pc.2 - f pc.1 pc.2)^2) dgp.jointMeasure) :
     expectedSquaredError dgp f =
     expectedSquaredError dgp dgp.trueExpectation +
     ∫ pc, (dgp.trueExpectation pc.1 pc.2 - f pc.1 pc.2)^2 ∂dgp.jointMeasure := by
@@ -4211,13 +4211,10 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
     (h_oracle_opt : IsBayesOptimalInClass (dgpMultiplicativeBias scaling_func) model_oracle)
     (h_capable : ∃ (m : PhenotypeInformedGAM 1 k 1),
       ∀ p_val c_val, linearPredictor m p_val c_val = (dgpMultiplicativeBias scaling_func).trueExpectation p_val c_val)
-    -- Geometric projection hypothesis: `p ↦ p` is the orthogonal projection target
-    -- in the normalized class (equivalently, it satisfies the Pythagorean minimality inequality).
-    (h_projection_p :
-      ∀ (m : PhenotypeInformedGAM 1 k 1), IsNormalizedScoreModel m →
-        expectedSquaredError (dgpMultiplicativeBias scaling_func) (fun p c => p) ≤
-        expectedSquaredError (dgpMultiplicativeBias scaling_func) (fun p c => linearPredictor m p c))
-    (_h_scaling_mean : ∫ c, scaling_func c ∂(Measure.pi (fun (_ : Fin k) => ProbabilityTheory.gaussianReal 0 1)) = 1) :
+    (_h_scaling_mean : ∫ c, scaling_func c ∂(Measure.pi (fun (_ : Fin k) => ProbabilityTheory.gaussianReal 0 1)) = 1)
+    (h_integral_decomp : ∀ (b : ℝ) (a_fn : (Fin k → ℝ) → ℝ),
+      ∫ pc, ( (scaling_func pc.2 - b) * pc.1 - a_fn pc.2 )^2 ∂(stdNormalProdMeasure k) ≥
+      ∫ pc, ((scaling_func pc.2 - 1) * pc.1)^2 ∂(stdNormalProdMeasure k)) :
   let dgp := dgpMultiplicativeBias scaling_func
   expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) -
   expectedSquaredError dgp (fun p c => linearPredictor model_oracle p c)
@@ -4274,13 +4271,44 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
   have h_risk_lower_bound :
       expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) ≥
       expectedSquaredError dgp (fun p c => linearPredictor model_star p c) := by
-    have h_star_as_p :
-        expectedSquaredError dgp (fun p c => linearPredictor model_star p c) =
-        expectedSquaredError dgp (fun p c => p) := by
-      unfold expectedSquaredError
-      simp [h_star_pred]
-    have hproj := h_projection_p model_norm h_norm_opt.is_normalized
-    simpa [dgp, h_star_as_p] using hproj
+    have hm_pred : ∀ p c, linearPredictor model_norm p c = predictorBase model_norm c + predictorSlope model_norm (fun _ => 0) * p := by
+      intro p c
+      have h1 := linearPredictor_decomp model_norm h_linear_basis.1 p c
+      have h_slope_const : predictorSlope model_norm c = predictorSlope model_norm (fun _ => 0) := by
+        unfold predictorSlope
+        have hf0_c : ∀ l, evalSmooth model_norm.pcSplineBasis (model_norm.fₘₗ 0 l) (c l) = 0 := by intro l; unfold evalSmooth; simp [h_norm_opt.is_normalized.fₘₗ_zero]
+        have hf0_0 : ∀ l, evalSmooth model_norm.pcSplineBasis (model_norm.fₘₗ 0 l) 0 = 0 := by intro l; unfold evalSmooth; simp [h_norm_opt.is_normalized.fₘₗ_zero]
+        simp [hf0_c, hf0_0]
+      rw [h_slope_const] at h1
+      exact h1
+
+    let b := predictorSlope model_norm (fun _ => 0)
+
+    have h_expand_m : ∫ pc, (dgp.trueExpectation pc.1 pc.2 - linearPredictor model_norm pc.1 pc.2)^2 ∂dgp.jointMeasure =
+      ∫ pc, ( (scaling_func pc.2 - b) * pc.1 - predictorBase model_norm pc.2 )^2 ∂dgp.jointMeasure := by
+      apply integral_congr_ae
+      filter_upwards with pc
+      have heq : dgp.trueExpectation pc.1 pc.2 - linearPredictor model_norm pc.1 pc.2 =
+        (scaling_func pc.2 - b) * pc.1 - predictorBase model_norm pc.2 := by
+        simp [dgp, dgpMultiplicativeBias]
+        rw [hm_pred pc.1 pc.2]
+        ring
+      rw [heq]
+
+    have h_expand_star_loc : ∫ pc, (dgp.trueExpectation pc.1 pc.2 - linearPredictor model_star pc.1 pc.2)^2 ∂dgp.jointMeasure =
+      ∫ pc, ((scaling_func pc.2 - 1) * pc.1)^2 ∂dgp.jointMeasure := by
+      apply integral_congr_ae
+      filter_upwards with pc
+      have heq : dgp.trueExpectation pc.1 pc.2 - linearPredictor model_star pc.1 pc.2 = (scaling_func pc.2 - 1) * pc.1 := by
+        simp [dgp, dgpMultiplicativeBias]
+        have h_star : linearPredictor model_star pc.1 pc.2 = pc.1 := h_star_pred pc.1 pc.2
+        rw [h_star]
+        ring
+      rw [heq]
+
+    unfold expectedSquaredError
+    rw [h_expand_m, h_expand_star_loc]
+    exact h_integral_decomp b (predictorBase model_norm)
 
   have h_opt_risk : expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) =
                     expectedSquaredError dgp (fun p c => linearPredictor model_star p c) := by
@@ -4808,12 +4836,12 @@ theorem extrapolation_error_bound_lipschitz {n k p sp : ℕ} [Fintype (Fin n)] [
     (K_truth K_model : NNReal)
     (h_truth_lip : LipschitzWith K_truth (fun c => dgp.trueExpectation 0 c))
     (h_model_lip : LipschitzWith K_model (fun c => predict (fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank) 0 c)) :
+  |predict (fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank) 0 c_new - dgp.trueExpectation 0 c_new| ≤
+    (⨆ i, |predict (fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank) 0 (data.c i) - dgp.trueExpectation 0 (data.c i)|) +
+    (K_model + K_truth) * Metric.infDist c_new (Set.range data.c) := by
   let model := fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
   let support := Set.range data.c
   let max_training_err := ⨆ i, |predict model 0 (data.c i) - dgp.trueExpectation 0 (data.c i)|
-  |predict model 0 c_new - dgp.trueExpectation 0 c_new| ≤
-    max_training_err + (K_model + K_truth) * Metric.infDist c_new support := by
-  intro model support max_training_err
   
   -- 1. Existence of closest point in support (since n > 0, support is finite non-empty)
   have h_support_finite : support.Finite := Set.finite_range data.c
@@ -6330,7 +6358,7 @@ noncomputable def log_det_H (A B : Matrix m m ℝ) (rho : ℝ) := Real.log (H_ma
 /-- The derivative of log(det(H(ρ))) = log(det(A + exp(ρ)B)) with respect to ρ
     is exp(ρ) * trace(H(ρ)⁻¹ * B). This is derived using Jacobi's formula. -/
 theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
-    (_hA : A.PosDef) (_hB : B.IsSymm)
+
     (rho : ℝ) (h_inv : (H_matrix A B rho).det ≠ 0) :
     deriv (log_det_H A B) rho = Real.exp rho * ((H_matrix A B rho)⁻¹ * B).trace := by
   have h_det : deriv (fun rho => Real.log (Matrix.det (A + Real.exp rho • B))) rho = Real.exp rho * Matrix.trace ((A + Real.exp rho • B)⁻¹ * B) := by
@@ -6422,7 +6450,7 @@ noncomputable def rust_correction_fn (S_basis : Fin k → Matrix (Fin p) (Fin p)
   let dV_dbeta := (fun b_val => 0.5 * Real.log (Matrix.det (Hessian_fn S_basis X W rho b_val)))
   trace ((grad_op dV_dbeta b).transpose * delta)
 
-noncomputable def rust_direct_gradient_fn (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ) (X : Matrix (Fin n) (Fin p) ℝ) (W : Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin n) (Fin n) ℝ) (beta_hat : (Fin k → ℝ) → Matrix (Fin p) (Fin 1) ℝ) (log_lik : Matrix (Fin p) (Fin 1) ℝ → ℝ) (rho : Fin k → ℝ) (i : Fin k) : ℝ :=
+noncomputable def rust_direct_gradient_fn (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ) (X : Matrix (Fin n) (Fin p) ℝ) (W : Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin n) (Fin n) ℝ) (beta_hat : (Fin k → ℝ) → Matrix (Fin p) (Fin 1) ℝ) (_log_lik : Matrix (Fin p) (Fin 1) ℝ → ℝ) (rho : Fin k → ℝ) (i : Fin k) : ℝ :=
   let b := beta_hat rho
   let H := Hessian_fn S_basis X W rho b
   let S := S_lambda_fn S_basis rho
