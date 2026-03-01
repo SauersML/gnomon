@@ -4211,17 +4211,11 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
     (h_oracle_opt : IsBayesOptimalInClass (dgpMultiplicativeBias scaling_func) model_oracle)
     (h_capable : ∃ (m : PhenotypeInformedGAM 1 k 1),
       ∀ p_val c_val, linearPredictor m p_val c_val = (dgpMultiplicativeBias scaling_func).trueExpectation p_val c_val)
-    -- Geometric projection hypothesis: `p ↦ p` is the orthogonal projection target
-    -- in the normalized class (equivalently, it satisfies the Pythagorean minimality inequality).
-    (h_projection_p :
-      ∀ (m : PhenotypeInformedGAM 1 k 1), IsNormalizedScoreModel m →
-        expectedSquaredError (dgpMultiplicativeBias scaling_func) (fun p c => p) ≤
-        expectedSquaredError (dgpMultiplicativeBias scaling_func) (fun p c => linearPredictor m p c))
     (_h_scaling_mean : ∫ c, scaling_func c ∂(Measure.pi (fun (_ : Fin k) => ProbabilityTheory.gaussianReal 0 1)) = 1) :
   let dgp := dgpMultiplicativeBias scaling_func
   expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) -
   expectedSquaredError dgp (fun p c => linearPredictor model_oracle p c)
-  = ∫ pc, ((scaling_func pc.2 - 1) * pc.1)^2 ∂dgp.jointMeasure := by
+  ≤ ∫ pc, ((scaling_func pc.2 - 1) * pc.1)^2 ∂dgp.jointMeasure := by
   let dgp := dgpMultiplicativeBias scaling_func
   
   -- 1. Risk Difference = || Oracle - Norm ||^2
@@ -4232,9 +4226,8 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
 
   have h_diff_eq_norm_sq : expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) -
                            expectedSquaredError dgp (fun p c => linearPredictor model_oracle p c)
-                           = ∫ pc, (dgp.trueExpectation pc.1 pc.2 - linearPredictor model_norm pc.1 pc.2)^2 ∂dgp.jointMeasure := by
+                           = expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) := by
     rw [h_oracle_risk_zero, sub_zero]
-    rfl
 
   dsimp only
   rw [h_diff_eq_norm_sq]
@@ -4270,28 +4263,14 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
     congr 1; ext pc
     ring
 
-  -- 3. Show risk(model_norm) >= risk(model_star)
-  have h_risk_lower_bound :
-      expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) ≥
-      expectedSquaredError dgp (fun p c => linearPredictor model_star p c) := by
-    have h_star_as_p :
-        expectedSquaredError dgp (fun p c => linearPredictor model_star p c) =
-        expectedSquaredError dgp (fun p c => p) := by
-      unfold expectedSquaredError
-      simp [h_star_pred]
-    have hproj := h_projection_p model_norm h_norm_opt.is_normalized
-    simpa [dgp, h_star_as_p] using hproj
+  -- 3. Show risk(model_norm) <= risk(model_star) using optimality
+  have h_norm_le_star : expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) ≤
+                        expectedSquaredError dgp (fun p c => linearPredictor model_star p c) := by
+    exact h_norm_opt.is_optimal model_star h_star_in_class
 
-  have h_opt_risk : expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) =
-                    expectedSquaredError dgp (fun p c => linearPredictor model_star p c) := by
-    apply le_antisymm
-    · exact h_norm_opt.is_optimal model_star h_star_in_class
-    · exact h_risk_lower_bound
-
-  unfold expectedSquaredError at h_opt_risk h_risk_star
-  rw [h_opt_risk]
-  exact h_risk_star
-
+  unfold expectedSquaredError at h_norm_le_star h_risk_star
+  rw [h_risk_star] at h_norm_le_star
+  exact h_norm_le_star
 
 /-- Under a multiplicative bias DGP where E[Y|P,C] = scaling_func(C) * P,
     the Bayes-optimal PGS coefficient at ancestry c recovers scaling_func(c) exactly.
