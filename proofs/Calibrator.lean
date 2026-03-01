@@ -3238,18 +3238,11 @@ lemma gaussianPenalizedLoss_strictConvex {ι : Type*} {n : ℕ} [Fintype (Fin n)
 
     For ridge penalty specifically: L(β) ≥ λ·‖β‖² → ∞.
 
-    **TODO (suggestion 9)**: The `h_penalty_tendsto` hypothesis is tautological —
-    it is exactly what `penalty_quadratic_tendsto_proof` proves from `hS_posDef`.
-    A cleaner version would add `[Nonempty ι]` and derive tendsto internally:
-    `have := penalty_quadratic_tendsto_proof S lam hlam hS_posDef`. -/
+    Derived internally using `penalty_quadratic_tendsto_proof` from `hS_posDef` and `[Nonempty ι]`. -/
 lemma gaussianPenalizedLoss_coercive {ι : Type*} {n : ℕ} [Fintype (Fin n)] [Fintype ι]
-    [DecidableEq ι]
+    [DecidableEq ι] [Nonempty ι]
     (X : Matrix (Fin n) ι ℝ) (y : Fin n → ℝ) (S : Matrix ι ι ℝ)
-    (lam : ℝ) (hlam : lam > 0) (hS_posDef : ∀ v : ι → ℝ, v ≠ 0 → 0 < dotProduct' (S.mulVec v) v)
-    (h_penalty_tendsto :
-      Filter.Tendsto
-        (fun β => lam * Finset.univ.sum (fun i => β i * (S.mulVec β) i))
-        (Filter.cocompact _) Filter.atTop) :
+    (lam : ℝ) (hlam : lam > 0) (hS_posDef : ∀ v : ι → ℝ, v ≠ 0 → 0 < dotProduct' (S.mulVec v) v) :
     Filter.Tendsto (gaussianPenalizedLoss X y S lam) (Filter.cocompact _) Filter.atTop := by
   -- L(β) = (1/n)‖y - Xβ‖² + λ·βᵀSβ ≥ λ·βᵀSβ
   -- Since S is positive definite, there exists c > 0 such that βᵀSβ ≥ c·‖β‖² for all β.
@@ -3286,7 +3279,7 @@ lemma gaussianPenalizedLoss_coercive {ι : Type*} {n : ℕ} [Fintype (Fin n)] [F
   -- Key: the penalty term Σᵢ βᵢ(Sβ)ᵢ grows as ‖β‖² → ∞
 
   -- Show penalty term tends to infinity
-  have h_penalty_tendsto := h_penalty_tendsto
+  have h_penalty_tendsto := penalty_quadratic_tendsto_proof S lam hlam hS_posDef
     -- The quadratic form is coercive when S is positive definite
     -- On finite-dimensional space, S pos def implies ∃ c > 0, βᵀSβ ≥ c‖β‖²
     -- This requires the spectral theorem or compactness of unit sphere.
@@ -3328,17 +3321,12 @@ lemma gaussianPenalizedLoss_coercive {ι : Type*} {n : ℕ} [Fintype (Fin n)] [F
     This uses the Weierstrass extreme value theorem: a continuous function
     that tends to infinity at infinity achieves its minimum on ℝⁿ.
 
-    **TODO (suggestion 9)**: Same as `gaussianPenalizedLoss_coercive` — the
-    `h_penalty_tendsto` parameter could be derived internally from `hS_posDef`
+    The `h_penalty_tendsto` is derived internally from `hS_posDef`
     via `penalty_quadratic_tendsto_proof`. -/
 lemma gaussianPenalizedLoss_exists_min {ι : Type*} {n : ℕ} [Fintype (Fin n)] [Fintype ι]
-    [DecidableEq ι]
+    [DecidableEq ι] [Nonempty ι]
     (X : Matrix (Fin n) ι ℝ) (y : Fin n → ℝ) (S : Matrix ι ι ℝ)
-    (lam : ℝ) (hlam : lam > 0) (hS_posDef : ∀ v : ι → ℝ, v ≠ 0 → 0 < dotProduct' (S.mulVec v) v)
-    (h_penalty_tendsto :
-      Filter.Tendsto
-        (fun β => lam * Finset.univ.sum (fun i => β i * (S.mulVec β) i))
-        (Filter.cocompact _) Filter.atTop) :
+    (lam : ℝ) (hlam : lam > 0) (hS_posDef : ∀ v : ι → ℝ, v ≠ 0 → 0 < dotProduct' (S.mulVec v) v) :
     ∃ β : ι → ℝ, ∀ β' : ι → ℝ, gaussianPenalizedLoss X y S lam β ≤ gaussianPenalizedLoss X y S lam β' := by
   -- Weierstrass theorem: A continuous coercive function achieves its minimum.
   --
@@ -3374,7 +3362,7 @@ lemma gaussianPenalizedLoss_exists_min {ι : Type*} {n : ℕ} [Fintype (Fin n)] 
                 lam * Finset.univ.sum (fun i => β i * (S.mulVec β) i)))
 
   -- Step 2: Get coercivity
-  have h_coercive := gaussianPenalizedLoss_coercive X y S lam hlam hS_posDef h_penalty_tendsto
+  have h_coercive := gaussianPenalizedLoss_coercive X y S lam hlam hS_posDef
 
   -- Step 3: Apply Weierstrass-style theorem
   -- For continuous coercive function on ℝⁿ, minimum exists.
@@ -4167,13 +4155,23 @@ theorem optimal_recovers_truth_of_capable {p k sp : ℕ} [Fintype (Fin p)] [Fint
     (dgp : DataGeneratingProcess k) (model : PhenotypeInformedGAM p k sp)
     (h_opt : IsBayesOptimalInClass dgp model)
     (h_capable : ∃ (m : PhenotypeInformedGAM p k sp),
-      ∀ p_val c_val, linearPredictor m p_val c_val = dgp.trueExpectation p_val c_val) :
+      (∀ p_val c_val, linearPredictor m p_val c_val = dgp.trueExpectation p_val c_val) ∧
+      m.pgsBasis = model.pgsBasis ∧ m.pcSplineBasis = model.pcSplineBasis) :
     ∫ pc, (dgp.trueExpectation pc.1 pc.2 - linearPredictor model pc.1 pc.2)^2 ∂dgp.jointMeasure = 0 := by
-  rcases h_capable with ⟨m_true, h_eq_true⟩
+  rcases h_capable with ⟨m_true, h_eq_true, h_pgs, h_spline⟩
   have h_risk_true : expectedSquaredError dgp (fun p c => linearPredictor m_true p c) = 0 := by
     unfold expectedSquaredError
     simp only [h_eq_true, sub_self, zero_pow two_ne_zero, integral_zero]
-  have h_risk_model_le := h_opt m_true
+  have h_m_true_eq : m_true = { model with γ₀₀ := m_true.γ₀₀, γₘ₀ := m_true.γₘ₀, f₀ₗ := m_true.f₀ₗ, fₘₗ := m_true.fₘₗ, link := m_true.link, dist := m_true.dist } := by
+    cases m_true
+    cases model
+    simp at h_pgs h_spline
+    subst h_pgs
+    subst h_spline
+    rfl
+  have h_risk_model_le : expectedSquaredError dgp (fun p c => linearPredictor model p c) ≤ expectedSquaredError dgp (fun p c => linearPredictor m_true p c) := by
+    rw [h_m_true_eq]
+    exact h_opt _
   rw [h_risk_true] at h_risk_model_le
   unfold expectedSquaredError at h_risk_model_le
   -- Integral of square is non-negative
@@ -4210,7 +4208,8 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
     (model_oracle : PhenotypeInformedGAM 1 k 1)
     (h_oracle_opt : IsBayesOptimalInClass (dgpMultiplicativeBias scaling_func) model_oracle)
     (h_capable : ∃ (m : PhenotypeInformedGAM 1 k 1),
-      ∀ p_val c_val, linearPredictor m p_val c_val = (dgpMultiplicativeBias scaling_func).trueExpectation p_val c_val)
+      (∀ p_val c_val, linearPredictor m p_val c_val = (dgpMultiplicativeBias scaling_func).trueExpectation p_val c_val) ∧
+      m.pgsBasis = model_oracle.pgsBasis ∧ m.pcSplineBasis = model_oracle.pcSplineBasis)
     -- Geometric projection hypothesis: `p ↦ p` is the orthogonal projection target
     -- in the normalized class (equivalently, it satisfies the Pythagorean minimality inequality).
     (h_projection_p :
@@ -4315,7 +4314,7 @@ theorem multiplicative_bias_correction (k : ℕ) [Fintype (Fin k)]
     = scaling_func c := by
   intro c
   obtain ⟨m_true, h_true_eq, h_pgs_eq, h_spline_eq⟩ := h_capable
-  have h_capable_class : ∃ m : PhenotypeInformedGAM 1 k 1, ∀ p c, linearPredictor m p c = (dgpMultiplicativeBias scaling_func).trueExpectation p c := ⟨m_true, h_true_eq⟩
+  have h_capable_class : ∃ m : PhenotypeInformedGAM 1 k 1, (∀ p c, linearPredictor m p c = (dgpMultiplicativeBias scaling_func).trueExpectation p c) ∧ m.pgsBasis = model.pgsBasis ∧ m.pcSplineBasis = model.pcSplineBasis := ⟨m_true, h_true_eq, h_pgs_eq, h_spline_eq⟩
   have h_risk_zero := optimal_recovers_truth_of_capable (dgpMultiplicativeBias scaling_func) model h_opt h_capable_class
 
   have h_ae_eq : ∀ᵐ pc ∂(stdNormalProdMeasure k), linearPredictor model pc.1 pc.2 = (dgpMultiplicativeBias scaling_func).trueExpectation pc.1 pc.2 := by
@@ -4439,8 +4438,8 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
   intro c
 
   -- 1. Optimality + Capability => Model = Truth (a.e.)
-  rcases h_capable with ⟨m_true, h_eq_true, _, _⟩
-  have h_risk_zero := optimal_recovers_truth_of_capable dgp_latent.to_dgp model h_opt ⟨m_true, h_eq_true⟩
+  rcases h_capable with ⟨m_true, h_eq_true, h_pgs_eq, h_spline_eq⟩
+  have h_risk_zero := optimal_recovers_truth_of_capable dgp_latent.to_dgp model h_opt ⟨m_true, h_eq_true, h_pgs_eq, h_spline_eq⟩
 
   -- 2. Integral (True - Model)^2 = 0 => True = Model a.e.
   -- We assume standard Gaussian measure supports the whole space.
