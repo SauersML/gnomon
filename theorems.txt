@@ -1,0 +1,646 @@
+--- Theorem: integrable_poly_n ---
+(n : Nat) : MeasureTheory.Integrable (poly_n n) stdGaussianMeasure
+
+--- Theorem: integrable_sq_gaussian ---
+: MeasureTheory.Integrable (fun x => x ^ 2) stdGaussianMeasure
+
+--- Theorem: integrable_id_gaussian ---
+: MeasureTheory.Integrable (fun x => x) stdGaussianMeasure
+
+--- Theorem: integrable_pow4_gaussian ---
+: MeasureTheory.Integrable (fun x => x ^ 4) stdGaussianMeasure
+
+--- Theorem: integrable_prod_mul ---
+{X Y : Type*} [MeasurableSpace X] [MeasurableSpace Y]
+    {μ : Measure X} {ν : Measure Y} [SigmaFinite μ] [SigmaFinite ν]
+    (f : X → ℝ) (g : Y → ℝ) (hf : Integrable f μ) (hg : Integrable g ν) :
+    Integrable (fun p : X × Y => f p.1 * g p.2) (μ.prod ν)
+
+--- Theorem: linearPredictor_decomp ---
+{k sp : ℕ} [Fintype (Fin k)] [Fintype (Fin sp)]
+    (model : PhenotypeInformedGAM 1 k sp)
+    (h_linear_basis : model.pgsBasis.B ⟨1,
+
+--- Theorem: fitRaw_minimizes_loss ---
+(p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)]
+    (data : RealizedData n k) (lambda : ℝ)
+    (h_fitRaw_exists :
+      ∃ (m : PhenotypeInformedGAM p k sp),
+        IsRawScoreModel m ∧
+        ∀ (m' : PhenotypeInformedGAM p k sp), IsRawScoreModel m' →
+          empiricalLoss m data lambda ≤ empiricalLoss m' data lambda) :
+  IsRawScoreModel (fitRaw p k sp n data lambda h_fitRaw_exists) ∧
+  ∀ (m : PhenotypeInformedGAM p k sp) (_h_m : IsRawScoreModel m),
+    empiricalLoss (fitRaw p k sp n data lambda h_fitRaw_exists) data lambda ≤ empiricalLoss m data lambda
+
+--- Theorem: fitNormalized_minimizes_loss ---
+(p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)]
+    (data : RealizedData n k) (lambda : ℝ)
+    (h_fitNormalized_exists :
+      ∃ (m : PhenotypeInformedGAM p k sp),
+        IsNormalizedScoreModel m ∧
+        ∀ (m' : PhenotypeInformedGAM p k sp), IsNormalizedScoreModel m' →
+          empiricalLoss m data lambda ≤ empiricalLoss m' data lambda) :
+  IsNormalizedScoreModel (fitNormalized p k sp n data lambda h_fitNormalized_exists) ∧
+  ∀ (m : PhenotypeInformedGAM p k sp) (_h_m : IsNormalizedScoreModel m),
+    empiricalLoss (fitNormalized p k sp n data lambda h_fitNormalized_exists) data lambda ≤ empiricalLoss m data lambda
+
+--- Theorem: statement ---
+. -/
+
+/-- E[P] = 0 under the standard Gaussian. -/
+theorem gaussian_mean_zero :
+    ∫ x, x ∂(ProbabilityTheory.gaussianReal 0 1) = 0
+
+--- Theorem: gaussian_second_moment ---
+:
+    ∫ x, x ^ 2 ∂(ProbabilityTheory.gaussianReal 0 1) = 1
+
+--- Theorem: eq_of_ae_eq_of_continuous ---
+{α : Type*} [TopologicalSpace α]
+    [MeasurableSpace α] {μ : Measure α} [μ.IsOpenPosMeasure] {f g : α → ℝ}
+    (hf : Continuous f) (hg : Continuous g)
+    (h_ae : f =ᵐ[μ] g) : f = g
+
+--- Theorem: scenarios_are_distinct ---
+(k : ℕ) (hk_pos : 0 < k) :
+  hasInteraction (dgpInteractiveBias k 0.1).trueExpectation ∧
+  ¬ hasInteraction (dgpAdditiveBias k 0.5).trueExpectation ∧
+  ¬ hasInteraction (dgpAdditiveBias k (-0.8)).trueExpectation
+
+--- Theorem: necessity_of_phenotype_data ---
+:
+  ∃ (dgp_A dgp_B : DataGeneratingProcess 1),
+    dgp_A.jointMeasure = dgp_B.jointMeasure ∧ hasInteraction dgp_A.trueExpectation ∧ ¬ hasInteraction dgp_B.trueExpectation
+
+--- Theorem: drift_implies_attenuation ---
+{k : ℕ} [Fintype (Fin k)]
+    (phys : DriftPhysics k) (c_near c_far : Fin k → ℝ)
+    (h_decay : phys.tagging_efficiency c_far < phys.tagging_efficiency c_near) :
+    optimalSlopeDrift phys c_far < optimalSlopeDrift phys c_near
+
+--- Theorem: linear_noise_implies_nonlinear_slope ---
+(sigma_g_sq base_error slope_error : ℝ)
+    (h_g_pos : 0 < sigma_g_sq)
+    (hB_pos : 0 < sigma_g_sq + base_error)
+    (hB1_pos : 0 < sigma_g_sq + base_error + slope_error)
+    (hB2_pos : 0 < sigma_g_sq + base_error + 2 * slope_error)
+    (h_slope_ne : slope_error ≠ 0) :
+    ∀ (beta0 beta1 : ℝ),
+      (fun c => beta0 + beta1 * c) ≠
+        (fun c => optimalSlopeLinearNoise sigma_g_sq base_error slope_error c)
+
+--- Theorem: directionalLD_nonzero_implies_slope_ne_one ---
+{k : ℕ} [Fintype (Fin k)]
+    (arch : GeneticArchitecture k) (c : Fin k → ℝ)
+    (h_genic_pos : arch.V_genic c ≠ 0)
+    (h_cov_ne : arch.V_cov c ≠ 0) :
+    optimalSlopeFromVariance arch c ≠ 1
+
+--- Theorem: selection_variation_implies_nonlinear_slope ---
+{k : ℕ} [Fintype (Fin k)]
+    (arch : GeneticArchitecture k) (c₁ c₂ : Fin k → ℝ)
+    (h_genic_pos₁ : arch.V_genic c₁ ≠ 0)
+    (h_genic_pos₂ : arch.V_genic c₂ ≠ 0)
+    (h_link : ∀ c, arch.selection_effect c = arch.V_cov c / arch.V_genic c)
+    (h_sel_var : arch.selection_effect c₁ ≠ arch.selection_effect c₂) :
+    optimalSlopeFromVariance arch c₁ ≠ optimalSlopeFromVariance arch c₂
+
+--- Theorem: ld_decay_implies_nonlinear_calibration ---
+(sigma_g_sq base_error slope_error : ℝ)
+    (h_g_pos : 0 < sigma_g_sq)
+    (h_base : 0 ≤ base_error)
+    (h_slope_pos : 0 ≤ slope_error)
+    (h_slope_ne : slope_error ≠ 0) :
+    ∀ (beta0 beta1 : ℝ),
+      (fun c => beta0 + beta1 * c) ≠
+        (fun c => optimalSlopeLinearNoise sigma_g_sq base_error slope_error c)
+
+--- Theorem: normalization_erases_heritability ---
+{k : ℕ} [Fintype (Fin k)]
+    (arch : GeneticArchitecture k) (c : Fin k → ℝ)
+    (h_genic_pos : arch.V_genic c > 0)
+    (h_cov_pos : arch.V_cov c > 0) :
+    optimalSlopeFromVariance arch c > 1
+
+--- Theorem: neutral_drift_implies_additive_correction ---
+{k : ℕ} [Fintype (Fin k)]
+    (mech : NeutralScoreDrift k) :
+    ∀ c : Fin k → ℝ, driftedScore mech c - mech.drift_artifact c = mech.true_liability
+
+--- Theorem: confounding_preserves_ranking ---
+{k : ℕ} [Fintype (Fin k)]
+    (β_env : ℝ) (p1 p2 : ℝ) (c : Fin k → ℝ) (h_le : p1 ≤ p2) :
+    p1 + β_env * (∑ l, c l) ≤ p2 + β_env * (∑ l, c l)
+
+--- Theorem: normalization_prevalence_bias ---
+{k : ℕ} [Fintype (Fin k)]
+    (pdgp : PrevalenceDGP k)
+    (pi_bar : ℝ)
+    -- π̄ is the population-average prevalence under the training distribution
+    (h_pi_bar : pi_bar = ∫ pc, pdgp.prevalence pc.2 ∂pdgp.jointMeasure)
+    -- The normalized predictor uses π̄ as its intercept (ignoring ancestry-specific π)
+    (f_norm : ℝ → (Fin k → ℝ) → ℝ)
+    (h_norm : ∀ p c, f_norm p c = pi_bar + pdgp.pgs_effect * p) :
+    ∀ p c, prevalenceDGP_trueExpectation pdgp p c - f_norm p c =
+      pdgp.prevalence c - pi_bar
+
+--- Theorem: normalization_prevalence_mse ---
+{k : ℕ} [Fintype (Fin k)]
+    (pdgp : PrevalenceDGP k)
+    (pi_bar : ℝ)
+    (h_pi_bar : pi_bar = ∫ pc, pdgp.prevalence pc.2 ∂pdgp.jointMeasure)
+    (f_norm : ℝ → (Fin k → ℝ) → ℝ)
+    (h_norm : ∀ p c, f_norm p c = pi_bar + pdgp.pgs_effect * p) :
+    mseRisk pdgp.toDGP f_norm =
+      ∫ pc, (pdgp.prevalence pc.2 - pi_bar)^2 ∂pdgp.jointMeasure
+
+--- Theorem: normalization_no_bias_iff_constant_prevalence ---
+{k : ℕ} [Fintype (Fin k)]
+    (pdgp : PrevalenceDGP k) (π₀ : ℝ)
+    (h_const : ∀ c, pdgp.prevalence c = π₀) :
+    ∀ p c, prevalenceDGP_trueExpectation pdgp p c - (π₀ + pdgp.pgs_effect * p) = 0
+
+--- Theorem: ld_decay_implies_shrinkage ---
+{k : ℕ} [Fintype (Fin k)]
+    (mech : LDDecayMechanism k) (c_near c_far : Fin k → ℝ)
+    (h_dist : mech.distance c_near < mech.distance c_far)
+    (h_mono : StrictAnti (mech.tagging_efficiency)) :
+    decaySlope mech c_far < decaySlope mech c_near
+
+--- Theorem: ld_decay_implies_nonlinear_calibration_sketch ---
+{k : ℕ} [Fintype (Fin k)]
+    (mech : LDDecayMechanism k)
+    (h_nonlin : ¬ ∃ a b, ∀ d ∈ Set.range mech.distance, mech.tagging_efficiency d = a + b * d) :
+    ∀ (beta0 beta1 : ℝ),
+      (fun c => beta0 + beta1 * mech.distance c) ≠
+        (fun c => decaySlope mech c)
+
+--- Theorem: optimal_slope_trace_variance ---
+{k : ℕ} [Fintype (Fin k)]
+    (arch : GeneticArchitecture k) (c : Fin k → ℝ)
+    (h_genic_pos : arch.V_genic c ≠ 0) :
+    optimalSlopeFromVariance arch c =
+      1 + (arch.V_cov c) / (arch.V_genic c)
+
+--- Theorem: normalization_suboptimal_under_ld ---
+{k : ℕ} [Fintype (Fin k)]
+    (arch : GeneticArchitecture k) (c : Fin k → ℝ)
+    (h_genic_pos : arch.V_genic c ≠ 0)
+    (h_cov_ne : arch.V_cov c ≠ 0) :
+    optimalSlopeFromVariance arch c ≠ 1
+
+--- Theorem: l2_projection_of_additive_is_additive ---
+(k sp : ℕ) [Fintype (Fin k)] [Fintype (Fin sp)] {f : ℝ → ℝ} {g : Fin k → ℝ → ℝ} {dgp : DataGeneratingProcess k}
+  (h_true_fn : dgp.trueExpectation = fun p c => f p + ∑ i, g i (c i))
+  (proj : PhenotypeInformedGAM 1 k sp)
+  (h_spline : proj.pcSplineBasis = polynomialSplineBasis sp)
+  (h_pgs : proj.pgsBasis = linearPGSBasis)
+  (h_opt : IsBayesOptimalInClass dgp proj)
+  (h_realizable : ∃ (m_true : PhenotypeInformedGAM 1 k sp), (∀ p c, linearPredictor m_true p c = dgp.trueExpectation p c) ∧ m_true.pgsBasis = proj.pgsBasis ∧ m_true.pcSplineBasis = proj.pcSplineBasis)
+  (h_risk_zero : expectedSquaredError dgp (fun p c => linearPredictor proj p c) = 0)
+  (h_zero_risk_implies_pointwise :
+    expectedSquaredError dgp (fun p c => linearPredictor proj p c) = 0 →
+    ∀ p c, linearPredictor proj p c = dgp.trueExpectation p c) :
+  IsNormalizedScoreModel proj
+
+--- Theorem: independence_implies_no_interaction ---
+(k sp : ℕ) [Fintype (Fin k)] [Fintype (Fin sp)] (dgp : DataGeneratingProcess k)
+    (h_additive : ∃ (f : ℝ → ℝ) (g : Fin k → ℝ → ℝ), dgp.trueExpectation = fun p c => f p + ∑ i, g i (c i))
+    (m : PhenotypeInformedGAM 1 k sp)
+    (h_spline : m.pcSplineBasis = polynomialSplineBasis sp)
+    (h_pgs : m.pgsBasis = linearPGSBasis)
+    (h_opt : IsBayesOptimalInClass dgp m)
+    (h_realizable : ∃ (m_true : PhenotypeInformedGAM 1 k sp), (∀ p c, linearPredictor m_true p c = dgp.trueExpectation p c) ∧ m_true.pgsBasis = m.pgsBasis ∧ m_true.pcSplineBasis = m.pcSplineBasis)
+    (h_risk_zero : expectedSquaredError dgp (fun p c => linearPredictor m p c) = 0)
+    (h_zero_risk_implies_pointwise :
+      expectedSquaredError dgp (fun p c => linearPredictor m p c) = 0 →
+      ∀ p c, linearPredictor m p c = dgp.trueExpectation p c) :
+    IsNormalizedScoreModel m
+
+--- Theorem: prediction_causality_tradeoff_linear_general ---
+(sp : ℕ) [Fintype (Fin sp)]
+    (dgp_env : DGPWithEnvironment 1)
+    (α γ : ℝ)
+    (h_gen : dgp_env.trueGeneticEffect = fun p => α * p)
+    (h_env : dgp_env.environmentalEffect = fun c => γ * (c ⟨0,
+
+--- Theorem: penalty_quadratic_tendsto_proof ---
+{ι : Type*} [Fintype ι] [DecidableEq ι] [Nonempty ι]
+    (S : Matrix ι ι ℝ) (lam : ℝ) (hlam : 0 < lam)
+    (hS_posDef : ∀ v : ι → ℝ, v ≠ 0 → 0 < dotProduct' (S.mulVec v) v) :
+    Filter.Tendsto
+      (fun β => lam * Finset.univ.sum (fun i => β i * (S.mulVec β) i))
+      (Filter.cocompact (ι → ℝ)) Filter.atTop
+
+--- Theorem: fit_minimizes_loss ---
+(p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)]
+    (data : RealizedData n k) (lambda : ℝ)
+    (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp)
+    (h_n_pos : n > 0)
+    (h_lambda_nonneg : 0 ≤ lambda)
+    (h_rank : Matrix.rank (designMatrix data pgsBasis splineBasis) = Fintype.card (ParamIx p k sp)) :
+  ∀ (m : PhenotypeInformedGAM p k sp),
+    InModelClass m pgsBasis splineBasis →
+    empiricalLoss (fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank) data lambda
+      ≤ empiricalLoss m data lambda
+
+--- Theorem: or ---
+compactness of unit sphere.
+
+    -- For a positive definite symmetric matrix S, the function β ↦ βᵀSβ/‖β‖²
+    -- is continuous on the punctured space and extends to the unit sphere,
+    -- where it achieves a positive minimum (the smallest eigenvalue).
+
+    -- Abstract argument: positive definite quadratic forms are coercive.
+    -- Mathlib approach: use that βᵀSβ defines a norm-equivalent inner product.
+
+    -- Direct proof: On finite type ι, use compactness of unit sphere.
+    -- Let c = inf{βᵀSβ : ‖β‖ = 1}. By pos def, c > 0.
+    -- Then βᵀSβ ≥ c‖β‖² for all β.
+
+    -- Penalty term coercivity: λ · quadratic goes to ∞ as ‖β‖ → ∞
+    -- For S positive definite, βᵀSβ/‖β‖² ≥ c > 0 (min eigenvalue)
+    -- So βᵀSβ ≥ c‖β‖² → ∞
+    --
+    -- This is standard: positive definite quadratics are coercive.
+
+  -- The full proof combines h_lower with the tendsto of the penalty term.
+  -- Both steps require infrastructure (ProperSpace, compact sphere, etc.)
+  -- For now, we note that the coercivity of L follows from:
+  -- 1. L(β) ≥ λ·βᵀSβ (
+
+--- Theorem: parameter_identifiability ---
+{n p k sp : ℕ} [Fintype (Fin n)] [Fintype (Fin p)]
+    [Fintype (Fin k)] [Fintype (Fin sp)]
+    (data : RealizedData n k) (lambda : ℝ)
+    (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp)
+    (_hp : p > 0) (_hk : k > 0) (_hsp : sp > 0)
+    (h_rank : Matrix.rank (designMatrix data pgsBasis splineBasis) = Fintype.card (ParamIx p k sp))
+    (h_lambda_pos : lambda > 0)
+    (h_exists_min :
+      ∃ (m : PhenotypeInformedGAM p k sp),
+        InModelClass m pgsBasis splineBasis ∧
+        IsIdentifiable m data ∧
+        ∀ (m' : PhenotypeInformedGAM p k sp),
+          InModelClass m' pgsBasis splineBasis →
+          IsIdentifiable m' data →
+          empiricalLoss m data lambda ≤ empiricalLoss m' data lambda) :
+  ∃! (m : PhenotypeInformedGAM p k sp),
+    InModelClass m pgsBasis splineBasis ∧
+    IsIdentifiable m data ∧
+    ∀ (m' : PhenotypeInformedGAM p k sp),
+      InModelClass m' pgsBasis splineBasis →
+      IsIdentifiable m' data → empiricalLoss m data lambda ≤ empiricalLoss m' data lambda
+
+--- Theorem: generalizes ---
+the above to any β_env, using the L² projection framework.
+
+**Key Insight** (Geometry, not Calculus):
+- View P, C, 1 as vectors in L²(μ)
+- Under independence + zero means, these form an orthogonal basis
+- The raw model projects Y = P + β_env*C onto span{1, P}
+- Since C ⊥ span{1, P}, the projection of β_env*C is 0
+- Therefore: proj(Y) = P, and bias = Y - proj(Y) = β_env*C -/
+
+/-- **Generalized Raw Score Bias**: For any environmental effect β_env,
+    the raw model (which ignores ancestry) produces bias = β_env * C.
+
+    This is the L² projection of Y = P + β_env*C onto span{1, P}.
+    Since C is orthogonal to this subspace, the projection is simply P,
+    leaving a residual of β_env*C. -/
+theorem raw_score_bias_general [Fact (p = 1)]
+    (β_env : ℝ)
+    (model_raw : PhenotypeInformedGAM 1 1 1) (h_raw_struct : IsRawScoreModel model_raw)
+    (h_pgs_basis_linear : model_raw.pgsBasis.B 1 = id ∧ model_raw.pgsBasis.B 0 = fun _ => 1)
+    (dgp : DataGeneratingProcess 1)
+    (h_dgp : dgp.trueExpectation = fun p c => p + β_env * c ⟨0,
+
+--- Theorem: optimal_recovers_truth_of_capable ---
+{p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
+    (dgp : DataGeneratingProcess k) (model : PhenotypeInformedGAM p k sp)
+    (h_opt : IsBayesOptimalInClass dgp model)
+    (h_capable : ∃ (m : PhenotypeInformedGAM p k sp),
+      (∀ p_val c_val, linearPredictor m p_val c_val = dgp.trueExpectation p_val c_val) ∧
+      m.pgsBasis = model.pgsBasis ∧ m.pcSplineBasis = model.pcSplineBasis) :
+    ∫ pc, (dgp.trueExpectation pc.1 pc.2 - linearPredictor model pc.1 pc.2)^2 ∂dgp.jointMeasure = 0
+
+--- Theorem: quantitative_error_of_normalization_multiplicative ---
+(k : ℕ) [Fintype (Fin k)]
+    (scaling_func : (Fin k → ℝ) → ℝ)
+    (_h_scaling_meas : AEStronglyMeasurable scaling_func ((stdNormalProdMeasure k).map Prod.snd))
+    (_h_integrable : Integrable (fun pc : ℝ × (Fin k → ℝ) => (scaling_func pc.2 * pc.1)^2) (stdNormalProdMeasure k))
+    (_h_scaling_sq_int : Integrable (fun c => (scaling_func c)^2) ((stdNormalProdMeasure k).map Prod.snd))
+    (_h_mean_1 : ∫ c, scaling_func c ∂((stdNormalProdMeasure k).map Prod.snd) = 1)
+    (model_norm : PhenotypeInformedGAM 1 k 1)
+    (h_norm_opt : IsBayesOptimalInNormalizedClass (dgpMultiplicativeBias scaling_func) model_norm)
+    (h_linear_basis : model_norm.pgsBasis.B 1 = id ∧ model_norm.pgsBasis.B 0 = fun _ => 1)
+    -- Add Integrability hypothesis for the normalized model to avoid specification gaming
+    (_h_norm_int : Integrable (fun pc => (linearPredictor model_norm pc.1 pc.2)^2) (stdNormalProdMeasure k))
+    (_h_spline_memLp : ∀ i, MemLp (model_norm.pcSplineBasis.b i) 2 (ProbabilityTheory.gaussianReal 0 1))
+    (_h_pred_meas : AEStronglyMeasurable (fun pc => linearPredictor model_norm pc.1 pc.2) (stdNormalProdMeasure k))
+    (model_oracle : PhenotypeInformedGAM 1 k 1)
+    (h_oracle_opt : IsBayesOptimalInClass (dgpMultiplicativeBias scaling_func) model_oracle)
+    (h_capable : ∃ (m : PhenotypeInformedGAM 1 k 1),
+      (∀ p_val c_val, linearPredictor m p_val c_val = (dgpMultiplicativeBias scaling_func).trueExpectation p_val c_val) ∧
+      m.pgsBasis = model_oracle.pgsBasis ∧ m.pcSplineBasis = model_oracle.pcSplineBasis)
+    (_h_scaling_mean : ∫ c, scaling_func c ∂(Measure.pi (fun (_ : Fin k) => ProbabilityTheory.gaussianReal 0 1)) = 1) :
+  let dgp
+
+--- Theorem: multiplicative_bias_correction ---
+(k : ℕ) [Fintype (Fin k)]
+    (scaling_func : (Fin k → ℝ) → ℝ)
+    (model : PhenotypeInformedGAM 1 k 1) (h_opt : IsBayesOptimalInClass (dgpMultiplicativeBias scaling_func) model)
+    (h_linear_basis : model.pgsBasis.B ⟨1,
+
+--- Theorem: shrinkage_effect ---
+{p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
+    (dgp_latent : DGPWithLatentRisk k) (model : PhenotypeInformedGAM 1 k sp)
+    (h_opt : IsBayesOptimalInClass dgp_latent.to_dgp model)
+    (h_linear_basis : model.pgsBasis.B ⟨1,
+
+--- Theorem: prediction_is_invariant_to_affine_pc_transform_rigorous ---
+{n k p sp : ℕ}
+    (A : Matrix (Fin k) (Fin k) ℝ) (_hA : IsUnit A.det) (b : Fin k → ℝ)
+    (data : RealizedData n k) (lambda : ℝ)
+    (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp)
+    (h_n_pos : n > 0) (h_lambda_nonneg : 0 ≤ lambda)
+    (h_lambda_zero : lambda = 0)
+    (h_rank : Matrix.rank (designMatrix data pgsBasis splineBasis) = Fintype.card (ParamIx p k sp))
+    (h_reparam_fwd :
+      let data' : RealizedData n k
+
+--- Theorem: extrapolation_error_bound_lipschitz ---
+{n k p sp : ℕ} [Fintype (Fin n)] [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)]
+    (dgp : DataGeneratingProcess k) (data : RealizedData n k) (lambda : ℝ) (c_new : Fin k → ℝ)
+    (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp)
+    (h_n_pos : n > 0) (h_lambda_nonneg : 0 ≤ lambda)
+    (h_rank : Matrix.rank (designMatrix data pgsBasis splineBasis) = Fintype.card (ParamIx p k sp))
+    (K_truth K_model : NNReal)
+    (h_truth_lip : LipschitzWith K_truth (fun c => dgp.trueExpectation 0 c))
+    (h_model_lip : LipschitzWith K_model (fun c => predict (fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank) 0 c)) :
+  |predict (fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank) 0 c_new - dgp.trueExpectation 0 c_new| ≤
+    (⨆ i, |predict (fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank) 0 (data.c i) - dgp.trueExpectation 0 (data.c i)|) +
+    (K_model + K_truth) * Metric.infDist c_new (Set.range data.c)
+
+--- Theorem: context_specificity ---
+{p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (dgp1 dgp2 : DGPWithEnvironment k)
+    (h_same_genetics : dgp1.trueGeneticEffect = dgp2.trueGeneticEffect ∧ dgp1.to_dgp.jointMeasure = dgp2.to_dgp.jointMeasure)
+    (h_diff_env : dgp1.environmentalEffect ≠ dgp2.environmentalEffect)
+    (model1 : PhenotypeInformedGAM p k sp) (h_opt1 : IsBayesOptimalInClass dgp1.to_dgp model1)
+    (h_repr :
+      IsBayesOptimalInClass dgp2.to_dgp model1 →
+        dgp1.to_dgp.trueExpectation = dgp2.to_dgp.trueExpectation) :
+  ¬ IsBayesOptimalInClass dgp2.to_dgp model1
+
+--- Theorem: mse_calibrated_zero ---
+{k : ℕ} [Fintype (Fin k)] (hdgp : HeterogeneousEffectDGP k) :
+    mse hdgp.toDGP hdgp.trueExp = 0
+
+--- Theorem: mse_raw_formula ---
+{k : ℕ} [Fintype (Fin k)] (hdgp : HeterogeneousEffectDGP k) (β : ℝ) :
+    let pred_raw
+
+--- Theorem: mse_improvement ---
+{k : ℕ} [Fintype (Fin k)] (hdgp : HeterogeneousEffectDGP k) (β : ℝ)
+    -- Direct hypothesis: the product integral is positive
+    (h_product_pos : ∫ pc, (hdgp.alpha pc.2 - β)^2 * pc.1^2 ∂hdgp.jointMeasure > 0) :
+    let pred_raw
+
+--- Theorem: rsquared_improvement ---
+{k : ℕ} [Fintype (Fin k)] (hdgp : HeterogeneousEffectDGP k) (β : ℝ)
+    (hY_var_pos : var hdgp.toDGP hdgp.trueExp > 0)
+    (h_product_pos : ∫ pc, (hdgp.alpha pc.2 - β)^2 * pc.1^2 ∂hdgp.jointMeasure > 0) :
+    let pred_raw
+
+--- Theorem: within_pc_rankings_preserved ---
+{k : ℕ} [Fintype (Fin k)]
+    (hdgp : HeterogeneousEffectDGP k) (β : ℝ) (c : Fin k → ℝ)
+    (hα_pos : hdgp.alpha c > 0) (hβ_pos : β > 0) :
+    ∀ p₁ p₂ : ℝ,
+      (β * p₁ + hdgp.baseline c > β * p₂ + hdgp.baseline c) ↔
+      (hdgp.alpha c * p₁ + hdgp.baseline c > hdgp.alpha c * p₂ + hdgp.baseline c)
+
+--- Theorem: mse_pointwise_larger_for_distant ---
+{k : ℕ} [Fintype (Fin k)]
+    (hdgp : HeterogeneousEffectDGP k) (β : ℝ)
+    (c_near c_far : Fin k → ℝ) (p : ℝ)
+    (h_deviation : |hdgp.alpha c_near - β| < |hdgp.alpha c_far - β|) :
+    -- Pointwise squared error is larger for distant PC
+    (hdgp.alpha c_far - β)^2 * p^2 ≥ (hdgp.alpha c_near - β)^2 * p^2
+
+--- Theorem: bspline_local_support ---
+(t : ℕ → ℝ)
+    (h_sorted : ∀ i j, i ≤ j → t i ≤ t j)
+    (i p : ℕ) (x : ℝ)
+    (h_outside : x < t i ∨ t (i + p + 1) ≤ x) :
+    bspline_basis_raw t i p x = 0
+
+--- Theorem: bspline_nonneg ---
+(t : ℕ → ℝ) (h_sorted : ∀ i j, i ≤ j → t i ≤ t j)
+    (i p : ℕ) (x : ℝ) : 0 ≤ bspline_basis_raw t i p x
+
+--- Theorem: bspline_partition_of_unity ---
+(t : ℕ → ℝ) (num_basis : ℕ)
+    (h_sorted : ∀ i j, i ≤ j → t i ≤ t j)
+    (p : ℕ) (x : ℝ)
+    (h_domain : t p ≤ x ∧ x < t num_basis)
+    (h_valid : num_basis > p) :
+    (Finset.range num_basis).sum (fun i => bspline_basis_raw t i p x) = 1
+
+--- Theorem: constraint_projection_correctness ---
+(B : Matrix (Fin n) (Fin m) ℝ)
+    (C : Matrix (Fin n) (Fin k) ℝ)
+    (W : Matrix (Fin n) (Fin n) ℝ)
+    (Z : Matrix (Fin m) (Fin (m - k)) ℝ)
+    (h_spans : SpansNullspace Z (Matrix.transpose (Matrix.transpose B * W * C))) :
+    IsWeightedOrthogonal (B * Z) C W
+
+--- Theorem: uses ---
+a specialized constraint for k=1. -/
+theorem sum_to_zero_after_projection
+    (B : Matrix (Fin n) (Fin m) ℝ)
+    (W : Matrix (Fin n) (Fin n) ℝ) (hW_diag : W = Matrix.diagonal (fun i => W i i))
+    (Z : Matrix (Fin m) (Fin (m - 1)) ℝ)
+    (h_constraint : SpansNullspace Z (Matrix.transpose (Matrix.transpose B * W * sumToZeroConstraint n)))
+    (β : Fin (m - 1) → ℝ) :
+    Finset.univ.sum (fun i : Fin n => ((B * Z).mulVec β) i * W i i) = 0
+
+--- Theorem: penalty_congruence ---
+(S : Matrix (Fin p) (Fin p) ℝ) (Q : Matrix (Fin p) (Fin p) ℝ)
+    (β' : Fin p → ℝ) (_h_orth : IsOrthogonal Q) :
+    quadForm S (Q.mulVec β') = quadForm (Matrix.transpose Q * S * Q) β'
+
+--- Theorem: reparameterization_equivalence ---
+(X : Matrix (Fin n) (Fin p) ℝ) (y : Fin n → ℝ)
+    (S : Matrix (Fin p) (Fin p) ℝ) (Q : Matrix (Fin p) (Fin p) ℝ)
+    (β' : Fin p → ℝ) (h_orth : IsOrthogonal Q) :
+    penalized_objective X y S (Q.mulVec β') =
+    penalized_objective (X * Q) y (Matrix.transpose Q * S * Q) β'
+
+--- Theorem: fitted_values_invariant ---
+(X : Matrix (Fin n) (Fin p) ℝ) (Q : Matrix (Fin p) (Fin p) ℝ)
+    (β : Fin p → ℝ) (_h_orth : IsOrthogonal Q)
+    (β' : Fin p → ℝ) (h_relation : β = Q.mulVec β') :
+    X.mulVec β = (X * Q).mulVec β'
+
+--- Theorem: eigendecomposition_diagonalizes ---
+(S : Matrix (Fin p) (Fin p) ℝ) (Q : Matrix (Fin p) (Fin p) ℝ)
+    (Λ : Matrix (Fin p) (Fin p) ℝ)
+    (h_orth : IsOrthogonal Q)
+    (h_decomp : S = Q * Λ * Matrix.transpose Q)
+    (_h_diag : ∀ i j : Fin p, i ≠ j → Λ i j = 0) :
+    Matrix.transpose Q * S * Q = Λ
+
+--- Theorem: optimal_solution_transforms ---
+(X : Matrix (Fin n) (Fin p) ℝ) (y : Fin n → ℝ)
+    (S : Matrix (Fin p) (Fin p) ℝ) (Q : Matrix (Fin p) (Fin p) ℝ)
+    (h_orth : IsOrthogonal Q) (β_opt : Fin p → ℝ) (β'_opt : Fin p → ℝ)
+    (h_opt : ∀ β, penalized_objective X y S β_opt ≤ penalized_objective X y S β)
+    (h_opt'_unique :
+      ∀ β',
+        penalized_objective (X * Q) y (Matrix.transpose Q * S * Q) β' ≤
+            penalized_objective (X * Q) y (Matrix.transpose Q * S * Q) β'_opt ↔
+          β' = β'_opt) :
+    X.mulVec β_opt = (X * Q).mulVec β'_opt
+
+--- Theorem: brierScore_strict_minimum ---
+(π p : ℝ) (hp : p ≠ π) :
+    expectedBrierScore π π < expectedBrierScore p π
+
+--- Theorem: justifies ---
+`quadrature.rs` and `hmc.rs` in the Rust codebase. -/
+theorem posterior_mean_optimal (pred : PosteriorPrediction)
+    (π : ℝ) (_hπ : 0 ≤ π ∧ π ≤ 1)
+    (h_true : π = pred.prob_mean) :
+    expectedBrierScore pred.prob_mean π ≤ expectedBrierScore pred.prob_mode π
+
+--- Theorem: posterior_mean_strictly_better ---
+(pred : PosteriorPrediction)
+    (π : ℝ) (h_true : π = pred.prob_mean)
+    (h_uncertainty : pred.prob_mean ≠ pred.prob_mode) :
+    expectedBrierScore pred.prob_mean π < expectedBrierScore pred.prob_mode π
+
+--- Theorem: sigmoid_gt_half ---
+{x : ℝ} (hx : x > 0) : sigmoid x > 1 / 2
+
+--- Theorem: sigmoid_lt_half ---
+{x : ℝ} (hx : x < 0) : sigmoid x < 1 / 2
+
+--- Theorem: calibration_shrinkage ---
+(μ : ℝ)
+      (X : Ω → ℝ) (P : Measure Ω) [IsProbabilityMeasure P]
+      (h_measurable : Measurable X) (h_integrable : Integrable X P)
+      (h_mean : ∫ ω, X ω ∂P = μ)
+      (h_support : ∀ᵐ ω ∂P, X ω > 0)
+      (h_non_degenerate : ¬ ∀ᵐ ω ∂P, X ω = μ) :
+      (∫ ω, sigmoid (X ω) ∂P) < sigmoid μ
+
+--- Theorem: derivative_log_det_H_matrix ---
+(A B : Matrix m m ℝ)
+    (_hB : B.IsSymm)
+    (rho : ℝ) (h_pos : (H_matrix A B rho).PosDef) :
+    deriv (log_det_H A B) rho = Real.exp rho * ((H_matrix A B rho)⁻¹ * B).trace
+
+--- Theorem: inv_mul_self_of_det_ne_zero ---
+{α : Type*} [Fintype α] [DecidableEq α]
+    (M : Matrix α α ℝ) (h_det : M.det ≠ 0) : M⁻¹ * M = 1
+
+--- Theorem: laml_gradient_composition_verification ---
+(log_lik : Matrix (Fin p) (Fin 1) ℝ → ℝ)
+    (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ)
+    (X : Matrix (Fin n) (Fin p) ℝ)
+    (W : Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin n) (Fin n) ℝ)
+    (beta_hat : (Fin k → ℝ) → Matrix (Fin p) (Fin 1) ℝ)
+    (grad_op : (Matrix (Fin p) (Fin 1) ℝ → ℝ) → Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin p) (Fin 1) ℝ)
+    (rho : Fin k → ℝ) (i : Fin k)
+    (h_deriv_L1 : deriv (laml_L1 log_lik S_basis beta_hat rho i) (rho i) =
+      0.5 * Real.exp (rho i) * trace ((beta_hat rho).transpose * (S_basis i) * (beta_hat rho)))
+    (h_deriv_L2 : deriv (laml_L2 S_basis X W beta_hat rho i) (rho i) =
+      0.5 * Real.exp (rho i) * trace ((Hessian_fn S_basis X W rho (beta_hat rho))⁻¹ * (S_basis i)) +
+      trace ((grad_op (fun b_val => 0.5 * Real.log (Matrix.det (Hessian_fn S_basis X W rho b_val))) (beta_hat rho)).transpose * rust_delta_fn S_basis X W beta_hat rho i))
+    (h_deriv_L3 : deriv (laml_L3 S_basis rho i) (rho i) =
+      0.5 * Real.exp (rho i) * trace ((S_lambda_fn S_basis rho)⁻¹ * (S_basis i)))
+    (h_diff_L1 : DifferentiableAt ℝ (laml_L1 log_lik S_basis beta_hat rho i) (rho i))
+    (h_diff_L2 : DifferentiableAt ℝ (laml_L2 S_basis X W beta_hat rho i) (rho i))
+    (h_diff_L3 : DifferentiableAt ℝ (laml_L3 S_basis rho i) (rho i)) :
+    deriv (fun r => LAML_fn log_lik S_basis X W beta_hat (laml_u rho i r)) (rho i) =
+      rust_direct_gradient_fn S_basis X W beta_hat log_lik rho i +
+      rust_correction_fn S_basis X W beta_hat grad_op rho i
+
+--- Theorem: laml_fixed_beta_gradient_is_exact ---
+(log_lik : Matrix (Fin p) (Fin 1) ℝ → ℝ)
+    (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ)
+    (X : Matrix (Fin n) (Fin p) ℝ)
+    (W : Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin n) (Fin n) ℝ)
+    (beta_hat : (Fin k → ℝ) → Matrix (Fin p) (Fin 1) ℝ)
+    (rho : Fin k → ℝ) (i : Fin k)
+    (b : Matrix (Fin p) (Fin 1) ℝ)
+    (h_b : b = beta_hat rho)
+    (h_diff_pen : DifferentiableAt ℝ (fun r => L_pen_fn log_lik S_basis (Function.update rho i r) b) (rho i))
+    (h_diff_log_H : DifferentiableAt ℝ (fun r => 0.5 * Real.log (Matrix.det (Hessian_fn S_basis X W (Function.update rho i r) b))) (rho i))
+    (h_diff_log_S : DifferentiableAt ℝ (fun r => -0.5 * Real.log (Matrix.det (S_lambda_fn S_basis (Function.update rho i r)))) (rho i))
+    (h_deriv_pen : deriv (fun r => L_pen_fn log_lik S_basis (Function.update rho i r) b) (rho i) =
+      0.5 * Real.exp (rho i) * trace (b.transpose * S_basis i * b))
+    (h_deriv_log_H : deriv (fun r => 0.5 * Real.log (Matrix.det (Hessian_fn S_basis X W (Function.update rho i r) b))) (rho i) =
+      0.5 * Real.exp (rho i) * trace ((Hessian_fn S_basis X W rho b)⁻¹ * S_basis i))
+    (h_deriv_log_S : deriv (fun r => -0.5 * Real.log (Matrix.det (S_lambda_fn S_basis (Function.update rho i r)))) (rho i) =
+      -0.5 * Real.exp (rho i) * trace ((S_lambda_fn S_basis rho)⁻¹ * S_basis i)) :
+  deriv (fun r => LAML_fixed_beta_fn log_lik S_basis X W b (Function.update rho i r)) (rho i) =
+  rust_direct_gradient_fn S_basis X W beta_hat log_lik rho i
+
+--- Theorem: verifies ---
+that `rust_delta_fn` computes exactly this quantity. -/
+theorem rust_delta_correctness
+    (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ)
+    (X : Matrix (Fin n) (Fin p) ℝ)
+    (W : Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin n) (Fin n) ℝ)
+    (beta_hat : (Fin k → ℝ) → Matrix (Fin p) (Fin 1) ℝ)
+    (rho : Fin k → ℝ) (i : Fin k) :
+    rust_delta_fn S_basis X W beta_hat rho i =
+    -(Hessian_fn S_basis X W rho (beta_hat rho))⁻¹ *
+    ((Real.exp (rho i) • S_basis i) * beta_hat rho)
+
+--- Theorem: proves ---
+that the total derivative of `LAML_fn` is correctly assembled
+    from its partial derivatives and the implicit derivative of `beta`.
+
+    It relies on structural hypotheses:
+    1. Chain rule: d(LAML)/d(rho_i) = ∂(LAML)/∂(rho_i) + <∇_beta(LAML), d(beta)/d(rho_i)>
+    2. Partial rho: ∂(LAML)/∂(rho_i) matches `rust_direct_gradient_fn`
+    3. Partial beta: ∇_beta(LAML) matches the gradient term in `rust_correction_fn`
+    4. Implicit beta: the differentiated optimality condition gives the linear system
+       `H * d(beta)/d(rho_i) = -dS * beta`, which is then solved to recover `rust_delta_fn`
+
+    This replaces the previous vacuous verification with a rigorous assembly proof. -/
+theorem laml_gradient_validity
+    (log_lik : Matrix (Fin p) (Fin 1) ℝ → ℝ)
+    (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ)
+    (X : Matrix (Fin n) (Fin p) ℝ)
+    (W : Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin n) (Fin n) ℝ)
+    (beta_hat : (Fin k → ℝ) → Matrix (Fin p) (Fin 1) ℝ)
+    (grad_op : (Matrix (Fin p) (Fin 1) ℝ → ℝ) → Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin p) (Fin 1) ℝ)
+    (rho : Fin k → ℝ) (i : Fin k)
+    -- 1. Hessian solvability at the evaluation point
+    (h_hess_pos : (Hessian_fn S_basis X W rho (beta_hat rho)).PosDef)
+    -- 2. Implicit differentiation of the optimality condition, stated without inversion
+    (h_implicit : Hessian_fn S_basis X W rho (beta_hat rho) *
+                  deriv (fun r => beta_hat (Function.update rho i r)) (rho i) =
+                  - (Real.exp (rho i) • S_basis i) * (beta_hat rho))
+    -- 2. Partial derivative wrt rho matches rust_direct_gradient_fn
+    (h_partial_rho : deriv (fun r => LAML_fn log_lik S_basis X W (fun _ => beta_hat rho) (Function.update rho i r)) (rho i) =
+                     rust_direct_gradient_fn S_basis X W beta_hat log_lik rho i)
+    -- 3. Gradient wrt beta matches the term used in rust_correction_fn
+    --    Note: rust_correction_fn uses `grad_op dV_dbeta`.
+    --    Optimality of beta implies grad(L_pen) = 0, so grad(LAML) = grad(0.5 log det H).
+    (h_grad_beta : HasGradientAt (fun b => LAML_fn log_lik S_basis X W (fun _ => b) rho)
+                                 (grad_op (fun b_val => 0.5 * Real.log (Matrix.det (Hessian_fn S_basis X W rho b_val))) (beta_hat rho))
+                                 (beta_hat rho))
+    -- 4. Chain rule holds for the total derivative
+    (h_chain : deriv (fun r => LAML_fn log_lik S_basis X W beta_hat (Function.update rho i r)) (rho i) =
+               deriv (fun r => LAML_fn log_lik S_basis X W (fun _ => beta_hat rho) (Function.update rho i r)) (rho i) +
+               ( (grad_op (fun b_val => 0.5 * Real.log (Matrix.det (Hessian_fn S_basis X W rho b_val))) (beta_hat rho)).transpose *
+                 deriv (fun r => beta_hat (Function.update rho i r)) (rho i) ).trace) :
+  deriv (fun r => LAML_fn log_lik S_basis X W beta_hat (Function.update rho i r)) (rho i) =
+  rust_direct_gradient_fn S_basis X W beta_hat log_lik rho i +
+  rust_correction_fn S_basis X W beta_hat grad_op rho i
