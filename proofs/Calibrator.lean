@@ -6015,7 +6015,52 @@ theorem expectedBrierScore_quadratic (p π : ℝ) :
 
     Setting this to zero gives p* = π. -/
 theorem expectedBrierScore_deriv (p π : ℝ) :
-    2 * (p - π) = -2 * π + 2 * p := by ring
+    deriv (fun x => expectedBrierScore x π) p = 2 * (p - π) := by
+  have h1 : DifferentiableAt ℝ (fun x : ℝ => π * (1 - x) ^ 2) p := by
+    apply DifferentiableAt.const_mul
+    apply DifferentiableAt.pow
+    apply DifferentiableAt.sub
+    · exact differentiableAt_const 1
+    · exact differentiableAt_id
+  have h2 : DifferentiableAt ℝ (fun x : ℝ => (1 - π) * x ^ 2) p := by
+    apply DifferentiableAt.const_mul
+    apply DifferentiableAt.pow
+    exact differentiableAt_id
+
+  unfold expectedBrierScore
+  change deriv ((fun x => π * (1 - x) ^ 2) + (fun x => (1 - π) * x ^ 2)) p = _
+  rw [deriv_add h1 h2]
+
+  have h3 : DifferentiableAt ℝ (fun x : ℝ => (1 - x)) p := by
+    apply DifferentiableAt.sub
+    · exact differentiableAt_const 1
+    · exact differentiableAt_id
+  have h4 : DifferentiableAt ℝ (fun x : ℝ => x) p := differentiableAt_id
+
+  have h5 : deriv (fun x => π * (1 - x) ^ 2) p = π * deriv (fun x => (1 - x) ^ 2) p := deriv_const_mul π (DifferentiableAt.pow h3 2)
+  have h6 : deriv (fun x => (1 - π) * x ^ 2) p = (1 - π) * deriv (fun x => x ^ 2) p := deriv_const_mul (1 - π) (DifferentiableAt.pow h4 2)
+  rw [h5, h6]
+
+  have h7 : deriv (fun x => (1 - x) ^ 2) p = 2 * (1 - p) ^ (2 - 1) * deriv (fun x => 1 - x) p := deriv_pow (n := 2) h3
+  have h8 : deriv (fun x => x ^ 2) p = 2 * p ^ (2 - 1) * deriv (fun x => x) p := deriv_pow (n := 2) h4
+  rw [h7, h8]
+
+  have h9 : deriv (fun x => 1 - x) p = -1 := by
+    have hd1 : DifferentiableAt ℝ (fun x : ℝ => (1 : ℝ)) p := differentiableAt_const 1
+    have hd2 : DifferentiableAt ℝ (fun x : ℝ => x) p := differentiableAt_id
+    change deriv ((fun x : ℝ => (1 : ℝ)) - (fun x : ℝ => x)) p = -1
+    rw [deriv_sub hd1 hd2, deriv_const]
+    have h11 : deriv (fun x : ℝ => x) p = 1 := by
+      have h12 : deriv id p = 1 := deriv_id p
+      exact h12
+    rw [h11]
+    ring
+  rw [h9]
+  have h10 : deriv (fun x : ℝ => x) p = 1 := by
+    have h12 : deriv id p = 1 := deriv_id p
+    exact h12
+  rw [h10]
+  ring
 
 /-! ### Brier Score is a Proper Scoring Rule -/
 
