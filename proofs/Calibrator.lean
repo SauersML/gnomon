@@ -4835,9 +4835,10 @@ theorem context_specificity {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [
     (h_same_genetics : dgp1.trueGeneticEffect = dgp2.trueGeneticEffect ∧ dgp1.to_dgp.jointMeasure = dgp2.to_dgp.jointMeasure)
     (h_diff_env : dgp1.environmentalEffect ≠ dgp2.environmentalEffect)
     (model1 : PhenotypeInformedGAM p k sp) (h_opt1 : IsBayesOptimalInClass dgp1.to_dgp model1)
-    (h_repr :
-      IsBayesOptimalInClass dgp2.to_dgp model1 →
-        dgp1.to_dgp.trueExpectation = dgp2.to_dgp.trueExpectation) :
+    (h_realizable1 : ∃ (m1 : PhenotypeInformedGAM p k sp), (∀ p_val c_val, linearPredictor m1 p_val c_val = dgp1.to_dgp.trueExpectation p_val c_val) ∧ m1.pgsBasis = model1.pgsBasis ∧ m1.pcSplineBasis = model1.pcSplineBasis)
+    (h_realizable2 : ∃ (m2 : PhenotypeInformedGAM p k sp), (∀ p_val c_val, linearPredictor m2 p_val c_val = dgp2.to_dgp.trueExpectation p_val c_val) ∧ m2.pgsBasis = model1.pgsBasis ∧ m2.pcSplineBasis = model1.pcSplineBasis)
+    (h_zero_risk_implies_pointwise1 : expectedSquaredError dgp1.to_dgp (fun p c => linearPredictor model1 p c) = 0 → ∀ p c, linearPredictor model1 p c = dgp1.to_dgp.trueExpectation p c)
+    (h_zero_risk_implies_pointwise2 : expectedSquaredError dgp2.to_dgp (fun p c => linearPredictor model1 p c) = 0 → ∀ p c, linearPredictor model1 p c = dgp2.to_dgp.trueExpectation p c) :
   ¬ IsBayesOptimalInClass dgp2.to_dgp model1 := by
   intro h_opt2
   have h_neq : dgp1.to_dgp.trueExpectation ≠ dgp2.to_dgp.trueExpectation := by
@@ -4849,13 +4850,19 @@ theorem context_specificity {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [
       simp at this; exact this
     exact h_diff_env this
   -- The Bayes-optimal predictor is the conditional expectation E[Y|P,C] = dgp.trueExpectation
-  -- If model1 is Bayes-optimal for both dgp1 and dgp2, then:
-  --   linearPredictor model1 = dgp1.trueExpectation (from h_opt1)
-  --   linearPredictor model1 = dgp2.trueExpectation (from h_opt2)
-  -- Therefore dgp1.trueExpectation = dgp2.trueExpectation, contradicting h_neq.
-  --
-  -- Use the representability hypothesis to derive the contradiction.
-  exact h_neq (h_repr h_opt2)
+  have h_risk_zero1 := optimal_recovers_truth_of_capable dgp1.to_dgp model1 h_opt1 h_realizable1
+  have h_risk_zero2 := optimal_recovers_truth_of_capable dgp2.to_dgp model1 h_opt2 h_realizable2
+
+  -- We need pointwise equality to contradict h_neq
+  -- Assuming expectedSquaredError = 0 implies pointwise equality
+  have h_pointwise1 : ∀ p c, linearPredictor model1 p c = dgp1.to_dgp.trueExpectation p c := h_zero_risk_implies_pointwise1 h_risk_zero1
+  have h_pointwise2 : ∀ p c, linearPredictor model1 p c = dgp2.to_dgp.trueExpectation p c := h_zero_risk_implies_pointwise2 h_risk_zero2
+
+  have h_eq : dgp1.to_dgp.trueExpectation = dgp2.to_dgp.trueExpectation := by
+    ext p c
+    rw [← h_pointwise1 p c, h_pointwise2 p c]
+
+  exact h_neq h_eq
 
 /-! ### Effect Heterogeneity: R² and AUC Improvement
 
