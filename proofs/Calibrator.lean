@@ -2557,7 +2557,7 @@ noncomputable def fit (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fint
         have h_right :
             Finset.univ.sum (fun i => β i * ((Matrix.transpose X * X).mulVec β) i) =
               dotProduct β ((Matrix.transpose X * X).mulVec β) := by
-          simp [dotProduct, mul_comm]
+          simp [dotProduct]
         have h_eq :
             dotProduct β ((Matrix.transpose X * X).mulVec β) =
               dotProduct (X.mulVec β) (X.mulVec β) := by
@@ -2717,7 +2717,7 @@ theorem fit_minimizes_loss (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] 
         have h_right :
             Finset.univ.sum (fun i => β i * ((Matrix.transpose X * X).mulVec β) i) =
               dotProduct β ((Matrix.transpose X * X).mulVec β) := by
-          simp [dotProduct, mul_comm]
+          simp [dotProduct]
         have h_eq :
             dotProduct β ((Matrix.transpose X * X).mulVec β) =
               dotProduct (X.mulVec β) (X.mulVec β) := by
@@ -2770,7 +2770,7 @@ theorem fit_minimizes_loss (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] 
       classical
       refine Finset.sum_congr rfl ?_
       intro i _
-      simp [pointwiseNLL, hm.dist_gaussian, Pi.sub_apply, h_lin, X]
+      simp [pointwiseNLL, hm.dist_gaussian, h_lin, X]
     have h_diag : ∀ i, (S.mulVec (packParams m)) i = s i * (packParams m) i := by
       intro i
       classical
@@ -2786,7 +2786,7 @@ theorem fit_minimizes_loss (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] 
             Finset.univ.sum (fun i => s i * (packParams m i) ^ 2) := by
         refine Finset.sum_congr rfl ?_
         intro i _
-        simp [h_diag, pow_two, mul_comm, mul_left_comm, mul_assoc]
+        simp [h_diag, pow_two, mul_comm, mul_assoc]
       let g : ParamIxSum p k sp → ℝ
         | Sum.inl _ => 0
         | Sum.inr (Sum.inl _) => 0
@@ -2836,7 +2836,7 @@ theorem fit_minimizes_loss (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] 
             = ∑ x : ParamIxSum p k sp, g x := by simpa [hsum] using hsum'
         _ = (∑ l, ∑ j, (m.f₀ₗ l j) ^ 2) +
             (∑ mIdx, ∑ l, ∑ j, (m.fₘₗ mIdx l j) ^ 2) := by
-            simp [g, ParamIxSum, hsum_pc, hsum_int, Finset.sum_add_distrib]
+            simp [g, ParamIxSum, hsum_pc, hsum_int]
     simp [h_data, h_penalty]
   have h_emp := h_emp' m hm
   let m_fit := unpackParams pgsBasis splineBasis βmin
@@ -3076,7 +3076,7 @@ lemma gaussianPenalizedLoss_strictConvex {ι : Type*} {n : ℕ} [Fintype (Fin n)
                   add_mul, sub_eq_add_neg, hb']
                 ring
           _ = a * b * ∑ i, (S.mulVec (β₁ - β₂)) i * (β₁ - β₂) i := by
-                simp [Finset.mul_sum, mul_left_comm, mul_comm, mul_assoc]
+                simp [Finset.mul_sum, mul_comm, mul_assoc]
           _ = a * b * dotProduct' (S.mulVec (β₁ - β₂)) (β₁ - β₂) := by
                 rfl
       -- The RHS is ≥ 0 by PSD of S
@@ -3630,7 +3630,7 @@ theorem parameter_identifiability {n p k sp : ℕ} [Fintype (Fin n)] [Fintype (F
                   exact h_linear_pc x
             _ = t * ∑ x, evalSmooth splineBasis (fun j => β₁ (ParamIx.pcSpline l j)) (data.c x l) +
                 (1 - t) * ∑ x, evalSmooth splineBasis (fun j => β₂ (ParamIx.pcSpline l j)) (data.c x l) := by
-                  simp [Finset.sum_add_distrib, Finset.mul_sum, mul_add, add_mul, mul_assoc, mul_left_comm, mul_comm]
+                  simp [Finset.sum_add_distrib, Finset.mul_sum]
             _ = 0 := by
                   simp [h₁, h₂]
 
@@ -3683,7 +3683,7 @@ theorem parameter_identifiability {n p k sp : ℕ} [Fintype (Fin n)] [Fintype (F
                   exact h_linear_int x
             _ = t * ∑ x, evalSmooth splineBasis (fun j => β₁ (ParamIx.interaction mIdx l j)) (data.c x l) +
                 (1 - t) * ∑ x, evalSmooth splineBasis (fun j => β₂ (ParamIx.interaction mIdx l j)) (data.c x l) := by
-                  simp [Finset.sum_add_distrib, Finset.mul_sum, mul_add, add_mul, mul_assoc, mul_left_comm, mul_comm]
+                  simp [Finset.sum_add_distrib, Finset.mul_sum]
             _ = 0 := by
                   simp [h₁, h₂]
     refine ⟨hm_interp, ?_⟩
@@ -3706,7 +3706,7 @@ theorem parameter_identifiability {n p k sp : ℕ} [Fintype (Fin n)] [Fintype (F
         classical
         simp [S, Matrix.mulVec, dotProduct, Matrix.diagonal_apply,
           Finset.sum_ite_eq', Finset.sum_ite_eq, mul_comm, mul_left_comm, mul_assoc]
-      cases i <;> simp [s, hmul, mul_comm, mul_left_comm, mul_assoc, mul_self_nonneg]
+      cases i <;> simp [s, hmul, mul_self_nonneg]
 
     have h_emp_eq :
         ∀ m, InModelClass m pgsBasis splineBasis →
@@ -3723,7 +3723,7 @@ theorem parameter_identifiability {n p k sp : ℕ} [Fintype (Fin n)] [Fintype (F
         unfold l2norm_sq
         refine Finset.sum_congr rfl ?_
         intro i _
-        simp [pointwiseNLL, hm.dist_gaussian, Pi.sub_apply, h_lin, X]
+        simp [pointwiseNLL, hm.dist_gaussian, h_lin, X]
       -- penalty term (diagonal mask)
       have h_diag : ∀ i, (S.mulVec (packParams m)) i = s i * (packParams m) i := by
         intro i
@@ -3740,7 +3740,7 @@ theorem parameter_identifiability {n p k sp : ℕ} [Fintype (Fin n)] [Fintype (F
               Finset.univ.sum (fun i => s i * (packParams m i) ^ 2) := by
           refine Finset.sum_congr rfl ?_
           intro i _
-          simp [h_diag, pow_two, mul_comm, mul_left_comm, mul_assoc]
+          simp [h_diag, pow_two, mul_comm, mul_assoc]
         let g : ParamIxSum p k sp → ℝ
           | Sum.inl _ => 0
           | Sum.inr (Sum.inl _) => 0
@@ -3789,7 +3789,7 @@ theorem parameter_identifiability {n p k sp : ℕ} [Fintype (Fin n)] [Fintype (F
             (∑ x : ParamIxSum p k sp, g x) =
               (∑ l, ∑ j, (m.f₀ₗ l j) ^ 2) +
                 (∑ mIdx, ∑ l, ∑ j, (m.fₘₗ mIdx l j) ^ 2) := by
-          simp [ParamIxSum, g, hsum_pc, hsum_int, Finset.sum_add_distrib]
+          simp [ParamIxSum, g, hsum_pc, hsum_int]
         simpa [hsum, hsum'] using hsum''
       unfold empiricalLoss gaussianPenalizedLoss
       simp [h_data, h_penalty]
@@ -4603,7 +4603,7 @@ lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n →
 
   apply iso.injective
   rw [orthogonalProjection]
-  simp only [iso.symm_apply_apply]
+  simp only []
   exact h_eq_E
 set_option maxHeartbeats 10000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
@@ -6015,7 +6015,39 @@ theorem expectedBrierScore_quadratic (p π : ℝ) :
 
     Setting this to zero gives p* = π. -/
 theorem expectedBrierScore_deriv (p π : ℝ) :
-    2 * (p - π) = -2 * π + 2 * p := by ring
+    deriv (fun x => expectedBrierScore x π) p = 2 * (p - π) := by
+  have hd1 : DifferentiableAt ℝ (fun x => π - 2 * π * x) p := by
+    apply DifferentiableAt.sub
+    · exact differentiableAt_const π
+    · exact DifferentiableAt.const_mul (differentiableAt_id) _
+  have hd2 : DifferentiableAt ℝ (fun x => x ^ 2) p := by
+    exact differentiableAt_id.pow 2
+  have h_eq : (fun x => expectedBrierScore x π) = (fun x => π - 2 * π * x + x ^ 2) := by ext x; rw [expectedBrierScore_quadratic x π]
+  rw [h_eq]
+  have h_eq_split : (fun x => π - 2 * π * x + x ^ 2) = (fun x => π - 2 * π * x) + (fun x => x ^ 2) := by ext x; ring_nf; rfl
+  rw [h_eq_split]
+  rw [deriv_add hd1 hd2]
+  have h_deriv_pow : deriv (fun x => x ^ 2) p = 2 * p := by
+    simp
+  have h_deriv_lin : deriv (fun x => π - 2 * π * x) p = -2 * π := by
+    have h_eq2 : (fun x => π - 2 * π * x) = (fun x => π) - (fun x => 2 * π * x) := by ext x; ring_nf; rfl
+    rw [h_eq2]
+    have h_sub : deriv ((fun x => π) - (fun x => 2 * π * x)) p = deriv (fun x => π) p - deriv (fun x => 2 * π * x) p := by
+      exact deriv_sub (differentiableAt_const π) (DifferentiableAt.const_mul differentiableAt_id _)
+    rw [h_sub]
+    have hd_const : deriv (fun x => π) p = 0 := deriv_const p π
+    rw [hd_const]
+    have hd_mul : deriv (fun x => 2 * π * x) p = 2 * π := by
+      have h_mul_deriv : deriv (fun x => 2 * π * x) p = 2 * π * deriv (fun x => x) p := by
+        apply deriv_const_mul (2 * π) differentiableAt_id
+      rw [h_mul_deriv]
+      have h_id : deriv (fun x => x) p = 1 := deriv_id p
+      rw [h_id]
+      ring
+    rw [hd_mul]
+    ring
+  rw [h_deriv_pow, h_deriv_lin]
+  ring
 
 /-! ### Brier Score is a Proper Scoring Rule -/
 
@@ -6324,7 +6356,7 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
         have h_jacobi : ∀ (M : ℝ → Matrix m m ℝ), DifferentiableAt ℝ M rho → deriv (fun rho => Matrix.det (M rho)) rho = Matrix.trace (Matrix.adjugate (M rho) * deriv M rho) := by
           intro M hM_diff
           have h_jacobi : deriv (fun rho => Matrix.det (M rho)) rho = ∑ i, ∑ j, (Matrix.adjugate (M rho)) i j * deriv (fun rho => (M rho) j i) rho := by
-            simp +decide [ Matrix.det_apply', Matrix.adjugate_apply, Matrix.mul_apply ]
+            simp +decide [ Matrix.det_apply', Matrix.adjugate_apply ]
             have h_jacobi : deriv (fun rho => ∑ σ : Equiv.Perm m, (↑(↑((Equiv.Perm.sign : Equiv.Perm m → ℤˣ) σ) : ℤ) : ℝ) * ∏ i : m, M rho ((σ : m → m) i) i) rho = ∑ σ : Equiv.Perm m, (↑(↑((Equiv.Perm.sign : Equiv.Perm m → ℤˣ) σ) : ℤ) : ℝ) * ∑ i : m, (∏ j ∈ Finset.univ.erase i, M rho ((σ : m → m) j) j) * deriv (fun rho => M rho ((σ : m → m) i) i) rho := by
               have h_jacobi : ∀ σ : Equiv.Perm m, deriv (fun rho => ∏ i : m, M rho ((σ : m → m) i) i) rho = ∑ i : m, (∏ j ∈ Finset.univ.erase i, M rho ((σ : m → m) j) j) * deriv (fun rho => M rho ((σ : m → m) i) i) rho := by
                 intro σ
@@ -6351,12 +6383,12 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
             refine' Finset.sum_congr rfl fun i hi => _
             rw [ Finset.sum_comm, Finset.sum_congr rfl ] ; intros ; simp +decide [ Finset.prod_ite, Finset.filter_ne', Finset.filter_eq' ] ; ring
             rw [ Finset.sum_eq_single ( ( ‹Equiv.Perm m› : m → m ) i ) ] <;> simp +decide [ Finset.prod_ite, Finset.filter_ne', Finset.filter_eq' ] ; ring
-            intro j hj; simp +decide [ Pi.single_apply, hj ]
-            rw [ Finset.prod_eq_zero_iff.mpr ] <;> simp +decide [ hj ]
+            intro j hj; simp +decide [ Pi.single_apply ]
+            rw [ Finset.prod_eq_zero_iff.mpr ] <;> simp +decide [ Finset.prod_ite, Finset.filter_ne', Finset.filter_eq' ]
             exact ⟨ ( ‹Equiv.Perm m›.symm j ), by simp +decide, by simpa [ Equiv.symm_apply_eq ] using hj ⟩
           rw [ h_jacobi, Matrix.trace ]
           rw [ deriv_pi ]
-          · simp +decide [ Matrix.mul_apply, Finset.mul_sum _ _ _ ]
+          · simp +decide [ Matrix.mul_apply ]
             refine' Finset.sum_congr rfl fun i _ => Finset.sum_congr rfl fun j _ => _
             rw [ deriv_pi ]
             intro i; exact (by
@@ -6364,13 +6396,13 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
           · exact fun i => DifferentiableAt.comp rho ( differentiableAt_pi.1 hM_diff i ) differentiableAt_id
         apply h_jacobi
         exact differentiableAt_pi.2 fun i => differentiableAt_pi.2 fun j => DifferentiableAt.add ( differentiableAt_const _ ) ( DifferentiableAt.smul ( Real.differentiableAt_exp ) ( differentiableAt_const _ ) )
-      simp_all +decide [ Matrix.inv_def, mul_assoc, mul_left_comm, mul_comm, Matrix.trace_mul_comm ( Matrix.adjugate _ ) ]
+      simp_all +decide [ Matrix.inv_def, mul_left_comm, mul_comm, Matrix.trace_mul_comm ( Matrix.adjugate _ ) ]
       rw [ show deriv ( fun rho => A + Real.exp rho • B ) rho = Real.exp rho • B from ?_ ]
-      · by_cases h : Matrix.det ( A + Real.exp rho • B ) = 0 <;> simp_all +decide [ Matrix.trace_smul, mul_assoc, mul_comm, mul_left_comm ]
+      · by_cases h : Matrix.det ( A + Real.exp rho • B ) = 0 <;> simp_all +decide [ Matrix.trace_smul, mul_comm ]
         exact False.elim <| h_inv h
       · rw [ deriv_pi ] <;> norm_num [ Real.differentiableAt_exp, mul_comm ]
         ext i; rw [ deriv_pi ] <;> norm_num [ Real.differentiableAt_exp, mul_comm ]
-    by_cases h_det : DifferentiableAt ℝ ( fun rho => Matrix.det ( A + Real.exp rho • B ) ) rho <;> simp_all +decide [ Real.exp_ne_zero, mul_assoc, mul_comm, mul_left_comm ]
+    by_cases h_det : DifferentiableAt ℝ ( fun rho => Matrix.det ( A + Real.exp rho • B ) ) rho <;> simp_all +decide [ mul_comm ]
     · convert HasDerivAt.deriv ( HasDerivAt.log ( h_det.hasDerivAt ) h_inv ) using 1 ; ring!
       exact eq_div_of_mul_eq ( by aesop ) ( by linear_combination' h_det_step1.symm )
     · contrapose! h_det
@@ -6397,8 +6429,8 @@ noncomputable def matrixInvAlg {α : Type*} [Fintype α] [DecidableEq α] (M : M
 theorem matrixInvAlg_eq_inv {α : Type*} [Fintype α] [DecidableEq α] (M : Matrix α α ℝ) :
     matrixInvAlg M = M⁻¹ := by
   by_cases h_det : M.det = 0
-  · simp [matrixInvAlg, Matrix.inv_def, h_det]
-  · simp [matrixInvAlg, Matrix.inv_def, h_det]
+  · simp [matrixInvAlg, Matrix.inv_def]
+  · simp [matrixInvAlg, Matrix.inv_def]
 
 theorem inv_mul_self_of_det_ne_zero {α : Type*} [Fintype α] [DecidableEq α]
     (M : Matrix α α ℝ) (h_det : M.det ≠ 0) : M⁻¹ * M = 1 := by
@@ -6463,27 +6495,27 @@ noncomputable def laml_L3 (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ) (rho 
     This packages the sum/subtraction rule argument once the three scalar
     component derivatives are established. -/
 theorem laml_gradient_composition_verification
-    (log_lik : Matrix (Fin p) (Fin 1) ℝ → ℝ)
+    (_log_lik : Matrix (Fin p) (Fin 1) ℝ → ℝ)
     (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ)
     (X : Matrix (Fin n) (Fin p) ℝ)
     (W : Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin n) (Fin n) ℝ)
     (beta_hat : (Fin k → ℝ) → Matrix (Fin p) (Fin 1) ℝ)
     (grad_op : (Matrix (Fin p) (Fin 1) ℝ → ℝ) → Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin p) (Fin 1) ℝ)
     (rho : Fin k → ℝ) (i : Fin k)
-    (h_deriv_L1 : deriv (laml_L1 log_lik S_basis beta_hat rho i) (rho i) =
+    (h_deriv_L1 : deriv (laml_L1 _log_lik S_basis beta_hat rho i) (rho i) =
       0.5 * Real.exp (rho i) * trace ((beta_hat rho).transpose * (S_basis i) * (beta_hat rho)))
     (h_deriv_L2 : deriv (laml_L2 S_basis X W beta_hat rho i) (rho i) =
       0.5 * Real.exp (rho i) * trace ((Hessian_fn S_basis X W rho (beta_hat rho))⁻¹ * (S_basis i)) +
       trace ((grad_op (fun b_val => 0.5 * Real.log (Matrix.det (Hessian_fn S_basis X W rho b_val))) (beta_hat rho)).transpose * rust_delta_fn S_basis X W beta_hat rho i))
     (h_deriv_L3 : deriv (laml_L3 S_basis rho i) (rho i) =
       0.5 * Real.exp (rho i) * trace ((S_lambda_fn S_basis rho)⁻¹ * (S_basis i)))
-    (h_diff_L1 : DifferentiableAt ℝ (laml_L1 log_lik S_basis beta_hat rho i) (rho i))
+    (h_diff_L1 : DifferentiableAt ℝ (laml_L1 _log_lik S_basis beta_hat rho i) (rho i))
     (h_diff_L2 : DifferentiableAt ℝ (laml_L2 S_basis X W beta_hat rho i) (rho i))
     (h_diff_L3 : DifferentiableAt ℝ (laml_L3 S_basis rho i) (rho i)) :
-    deriv (fun r => LAML_fn log_lik S_basis X W beta_hat (laml_u rho i r)) (rho i) =
-      rust_direct_gradient_fn S_basis X W beta_hat log_lik rho i +
+    deriv (fun r => LAML_fn _log_lik S_basis X W beta_hat (laml_u rho i r)) (rho i) =
+      rust_direct_gradient_fn S_basis X W beta_hat _log_lik rho i +
       rust_correction_fn S_basis X W beta_hat grad_op rho i := by
-  let L1 := laml_L1 log_lik S_basis beta_hat rho i
+  let L1 := laml_L1 _log_lik S_basis beta_hat rho i
   let L2 := laml_L2 S_basis X W beta_hat rho i
   let L3 := laml_L3 S_basis rho i
 
@@ -6491,12 +6523,12 @@ theorem laml_gradient_composition_verification
   have h_diff_L2' : DifferentiableAt ℝ L2 (rho i) := h_diff_L2
   have h_diff_L3' : DifferentiableAt ℝ L3 (rho i) := h_diff_L3
 
-  have h_split : ∀ r, LAML_fn log_lik S_basis X W beta_hat (laml_u rho i r) = L1 r + L2 r - L3 r := by
+  have h_split : ∀ r, LAML_fn _log_lik S_basis X W beta_hat (laml_u rho i r) = L1 r + L2 r - L3 r := by
     intro r
     unfold LAML_fn
     rfl
 
-  rw [show (fun r => LAML_fn log_lik S_basis X W beta_hat (laml_u rho i r)) = fun r => L1 r + L2 r - L3 r by
+  rw [show (fun r => LAML_fn _log_lik S_basis X W beta_hat (laml_u rho i r)) = fun r => L1 r + L2 r - L3 r by
     funext r
     exact h_split r]
   change deriv ((fun r => L1 r + L2 r) - L3) (rho i) = _
@@ -6535,7 +6567,7 @@ theorem laml_fixed_beta_gradient_is_exact
     (h_deriv_log_S : deriv (fun r => -0.5 * Real.log (Matrix.det (S_lambda_fn S_basis (Function.update rho i r)))) (rho i) =
       -0.5 * Real.exp (rho i) * trace ((S_lambda_fn S_basis rho)⁻¹ * S_basis i)) :
   deriv (fun r => LAML_fixed_beta_fn log_lik S_basis X W b (Function.update rho i r)) (rho i) =
-  rust_direct_gradient_fn S_basis X W beta_hat log_lik rho i := by
+  rust_direct_gradient_fn S_basis X W beta_hat _log_lik rho i := by
   change deriv (fun r =>
       L_pen_fn log_lik S_basis (Function.update rho i r) b +
       0.5 * Real.log (Matrix.det (Hessian_fn S_basis X W (Function.update rho i r) b)) -
@@ -6582,7 +6614,7 @@ theorem rust_delta_correctness
     -(Hessian_fn S_basis X W rho (beta_hat rho))⁻¹ *
     ((Real.exp (rho i) • S_basis i) * beta_hat rho) := by
   unfold rust_delta_fn
-  simp [matrixInvAlg_eq_inv, neg_mul, Matrix.smul_mul]
+  simp [matrixInvAlg_eq_inv, Matrix.smul_mul]
 
 /-- Structural verification: `laml_gradient_validity`
 
@@ -6613,20 +6645,20 @@ theorem laml_gradient_validity
                   - (Real.exp (rho i) • S_basis i) * (beta_hat rho))
     -- 2. Partial derivative wrt rho matches rust_direct_gradient_fn
     (h_partial_rho : deriv (fun r => LAML_fn log_lik S_basis X W (fun _ => beta_hat rho) (Function.update rho i r)) (rho i) =
-                     rust_direct_gradient_fn S_basis X W beta_hat log_lik rho i)
+                     rust_direct_gradient_fn S_basis X W beta_hat _log_lik rho i)
     -- 3. Gradient wrt beta matches the term used in rust_correction_fn
     --    Note: rust_correction_fn uses `grad_op dV_dbeta`.
     --    Optimality of beta implies grad(L_pen) = 0, so grad(LAML) = grad(0.5 log det H).
-    (h_grad_beta : HasGradientAt (fun b => LAML_fn log_lik S_basis X W (fun _ => b) rho)
+    (_h_grad_beta : HasGradientAt (fun b => LAML_fn log_lik S_basis X W (fun _ => b) rho)
                                  (grad_op (fun b_val => 0.5 * Real.log (Matrix.det (Hessian_fn S_basis X W rho b_val))) (beta_hat rho))
                                  (beta_hat rho))
     -- 4. Chain rule holds for the total derivative
-    (h_chain : deriv (fun r => LAML_fn log_lik S_basis X W beta_hat (Function.update rho i r)) (rho i) =
+    (h_chain : deriv (fun r => LAML_fn _log_lik S_basis X W beta_hat (Function.update rho i r)) (rho i) =
                deriv (fun r => LAML_fn log_lik S_basis X W (fun _ => beta_hat rho) (Function.update rho i r)) (rho i) +
                ( (grad_op (fun b_val => 0.5 * Real.log (Matrix.det (Hessian_fn S_basis X W rho b_val))) (beta_hat rho)).transpose *
                  deriv (fun r => beta_hat (Function.update rho i r)) (rho i) ).trace) :
-  deriv (fun r => LAML_fn log_lik S_basis X W beta_hat (Function.update rho i r)) (rho i) =
-  rust_direct_gradient_fn S_basis X W beta_hat log_lik rho i +
+  deriv (fun r => LAML_fn _log_lik S_basis X W beta_hat (Function.update rho i r)) (rho i) =
+  rust_direct_gradient_fn S_basis X W beta_hat _log_lik rho i +
   rust_correction_fn S_basis X W beta_hat grad_op rho i :=
 by
   have h_hess_det : (Hessian_fn S_basis X W rho (beta_hat rho)).det ≠ 0 := h_hess_pos.det_pos.ne'
@@ -6646,7 +6678,7 @@ by
         _ = H⁻¹ * (- (Real.exp (rho i) • S_basis i) * beta_hat rho) := by
           simpa [H] using h_mul
         _ = -H⁻¹ * ((Real.exp (rho i) • S_basis i) * beta_hat rho) := by
-          simp [Matrix.mul_assoc, neg_mul]
+          simp []
     calc
       deriv (fun r => beta_hat (Function.update rho i r)) (rho i)
           = -H⁻¹ * ((Real.exp (rho i) • S_basis i) * beta_hat rho) := h_solved
