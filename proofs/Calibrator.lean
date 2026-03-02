@@ -1713,16 +1713,9 @@ theorem l2_projection_of_additive_is_additive (k sp : ℕ) [Fintype (Fin k)] [Fi
   (h_spline : proj.pcSplineBasis = polynomialSplineBasis sp)
   (h_pgs : proj.pgsBasis = linearPGSBasis)
   (h_opt : IsBayesOptimalInClass dgp proj)
-  (h_realizable : ∃ (m_true : PhenotypeInformedGAM 1 k sp), (∀ p c, linearPredictor m_true p c = dgp.trueExpectation p c) ∧ m_true.pgsBasis = proj.pgsBasis ∧ m_true.pcSplineBasis = proj.pcSplineBasis)
-  (h_risk_zero : expectedSquaredError dgp (fun p c => linearPredictor proj p c) = 0)
-  (h_zero_risk_implies_pointwise :
-    expectedSquaredError dgp (fun p c => linearPredictor proj p c) = 0 →
-    ∀ p c, linearPredictor proj p c = dgp.trueExpectation p c) :
+  (h_fit : ∀ p c, linearPredictor proj p c = dgp.trueExpectation p c) :
   IsNormalizedScoreModel proj := by
   have _h_opt := h_opt
-  have _h_realizable := h_realizable
-  have h_fit : ∀ p c, linearPredictor proj p c = dgp.trueExpectation p c :=
-    h_zero_risk_implies_pointwise h_risk_zero
   -- Use decomposition
   have h_lin : proj.pgsBasis.B 1 = id := by rw [h_pgs]; rfl
   have h_pred : ∀ p c, linearPredictor proj p c = predictorBase proj c + predictorSlope proj c * p :=
@@ -1827,14 +1820,10 @@ theorem independence_implies_no_interaction (k sp : ℕ) [Fintype (Fin k)] [Fint
     (h_spline : m.pcSplineBasis = polynomialSplineBasis sp)
     (h_pgs : m.pgsBasis = linearPGSBasis)
     (h_opt : IsBayesOptimalInClass dgp m)
-    (h_realizable : ∃ (m_true : PhenotypeInformedGAM 1 k sp), (∀ p c, linearPredictor m_true p c = dgp.trueExpectation p c) ∧ m_true.pgsBasis = m.pgsBasis ∧ m_true.pcSplineBasis = m.pcSplineBasis)
-    (h_risk_zero : expectedSquaredError dgp (fun p c => linearPredictor m p c) = 0)
-    (h_zero_risk_implies_pointwise :
-      expectedSquaredError dgp (fun p c => linearPredictor m p c) = 0 →
-      ∀ p c, linearPredictor m p c = dgp.trueExpectation p c) :
+    (h_fit : ∀ p c, linearPredictor m p c = dgp.trueExpectation p c) :
     IsNormalizedScoreModel m := by
   rcases h_additive with ⟨f, g, h_fn_struct⟩
-  exact l2_projection_of_additive_is_additive k sp h_fn_struct m h_spline h_pgs h_opt h_realizable h_risk_zero h_zero_risk_implies_pointwise
+  exact l2_projection_of_additive_is_additive k sp h_fn_struct m h_spline h_pgs h_opt h_fit
 
 structure DGPWithEnvironment (k : ℕ) where
   to_dgp : DataGeneratingProcess k
@@ -4727,15 +4716,13 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
     (h_n_pos : n > 0) (h_lambda_nonneg : 0 ≤ lambda)
     (h_lambda_zero : lambda = 0)
     (h_rank : Matrix.rank (designMatrix data pgsBasis splineBasis) = Fintype.card (ParamIx p k sp))
+    (data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b })
     (h_reparam_fwd :
-      let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
       ∃ T : Matrix (ParamIx p k sp) (ParamIx p k sp) ℝ,
         designMatrix data' pgsBasis splineBasis = designMatrix data pgsBasis splineBasis * T)
     (h_reparam_bwd :
-      let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
       ∃ U : Matrix (ParamIx p k sp) (ParamIx p k sp) ℝ,
         designMatrix data pgsBasis splineBasis = designMatrix data' pgsBasis splineBasis * U) :
-  let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
   let model := fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
   let model_prime := fit p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
       let X := designMatrix data pgsBasis splineBasis
@@ -4750,7 +4737,7 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   ∀ (i : Fin n),
       linearPredictor model (data.p i) (data.c i) =
       linearPredictor model_prime (data'.p i) (data'.c i) := by
-  intro data' model model_prime i
+  intro model model_prime i
   let X := designMatrix data pgsBasis splineBasis
   let X' := designMatrix data' pgsBasis splineBasis
   let K := LinearMap.range (Matrix.toLin' X)
@@ -4835,9 +4822,8 @@ theorem context_specificity {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [
     (h_same_genetics : dgp1.trueGeneticEffect = dgp2.trueGeneticEffect ∧ dgp1.to_dgp.jointMeasure = dgp2.to_dgp.jointMeasure)
     (h_diff_env : dgp1.environmentalEffect ≠ dgp2.environmentalEffect)
     (model1 : PhenotypeInformedGAM p k sp) (h_opt1 : IsBayesOptimalInClass dgp1.to_dgp model1)
-    (h_repr :
-      IsBayesOptimalInClass dgp2.to_dgp model1 →
-        dgp1.to_dgp.trueExpectation = dgp2.to_dgp.trueExpectation) :
+    (h_realizable1 : ∀ p c, linearPredictor model1 p c = dgp1.to_dgp.trueExpectation p c)
+    (h_realizable2 : IsBayesOptimalInClass dgp2.to_dgp model1 → ∀ p c, linearPredictor model1 p c = dgp2.to_dgp.trueExpectation p c) :
   ¬ IsBayesOptimalInClass dgp2.to_dgp model1 := by
   intro h_opt2
   have h_neq : dgp1.to_dgp.trueExpectation ≠ dgp2.to_dgp.trueExpectation := by
@@ -4848,14 +4834,10 @@ theorem context_specificity {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [
       have := congr_fun (congr_fun h_eq_fn 0) c
       simp at this; exact this
     exact h_diff_env this
-  -- The Bayes-optimal predictor is the conditional expectation E[Y|P,C] = dgp.trueExpectation
-  -- If model1 is Bayes-optimal for both dgp1 and dgp2, then:
-  --   linearPredictor model1 = dgp1.trueExpectation (from h_opt1)
-  --   linearPredictor model1 = dgp2.trueExpectation (from h_opt2)
-  -- Therefore dgp1.trueExpectation = dgp2.trueExpectation, contradicting h_neq.
-  --
-  -- Use the representability hypothesis to derive the contradiction.
-  exact h_neq (h_repr h_opt2)
+  have h_eq : dgp1.to_dgp.trueExpectation = dgp2.to_dgp.trueExpectation := by
+    ext p c
+    rw [← h_realizable1 p c, ← h_realizable2 h_opt2 p c]
+  exact h_neq h_eq
 
 /-! ### Effect Heterogeneity: R² and AUC Improvement
 
