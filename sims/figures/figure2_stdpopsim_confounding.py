@@ -214,18 +214,45 @@ def _set_runtime_thread_env(threads: int) -> None:
         os.environ[k] = t
 
 
+def _parse_int_prefix(raw: str | None) -> int | None:
+    if not raw:
+        return None
+    s = str(raw).strip()
+    digits = []
+    for ch in s:
+        if ch.isdigit():
+            digits.append(ch)
+        else:
+            break
+    if not digits:
+        return None
+    try:
+        return int("".join(digits))
+    except Exception:
+        return None
+
+
 def _default_total_threads() -> int:
-    for key in ("SLURM_CPUS_PER_TASK", "SLURM_CPUS_ON_NODE", "OMP_NUM_THREADS"):
+    candidates: list[int] = []
+    for key in ("PBS_NP", "NSLOTS", "OMP_NUM_THREADS"):
         val = os.environ.get(key)
         if val:
             try:
-                return max(1, int(val))
+                n = int(val)
+                if n > 0:
+                    candidates.append(n)
             except Exception:
                 pass
-    return max(1, int(os.cpu_count() or 1))
+    if hasattr(os, "sched_getaffinity"):
+        try:
+            candidates.append(max(1, len(os.sched_getaffinity(0))))  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    candidates.append(max(1, int(os.cpu_count() or 1)))
+    return max(1, min(candidates))
 
 
-def _detect_total_mem_mb() -> int | None:
+def _detect_physical_mem_mb() -> int | None:
     try:
         with open("/proc/meminfo", "r", encoding="utf-8", errors="replace") as f:
             for line in f:
@@ -235,6 +262,53 @@ def _detect_total_mem_mb() -> int | None:
     except Exception:
         return None
     return None
+
+
+def _detect_cgroup_mem_limit_mb() -> int | None:
+    limit_bytes: int | None = None
+    for p in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        try:
+            txt = Path(p).read_text(encoding="utf-8", errors="replace").strip()
+        except Exception:
+            continue
+        if not txt or txt == "max":
+            continue
+        try:
+            b = int(txt)
+        except Exception:
+            continue
+        if b <= 0 or b >= (1 << 60):
+            continue
+        limit_bytes = b if limit_bytes is None else min(limit_bytes, b)
+    if limit_bytes is None:
+        return None
+    return max(1, limit_bytes // (1024 * 1024))
+
+
+def _detect_scheduler_mem_limit_mb(thread_budget: int) -> int | None:
+    out: list[int] = []
+    pbs_mem_mb = _parse_int_prefix(os.environ.get("PBS_MEM_MB"))
+    if pbs_mem_mb is not None and pbs_mem_mb > 0:
+        out.append(pbs_mem_mb)
+    if not out:
+        return None
+    return max(1, min(out))
+
+
+def _detect_total_mem_mb() -> int | None:
+    thread_budget = _default_total_threads()
+    caps = [
+        v
+        for v in (
+            _detect_physical_mem_mb(),
+            _detect_cgroup_mem_limit_mb(),
+            _detect_scheduler_mem_limit_mb(thread_budget),
+        )
+        if v is not None and v > 0
+    ]
+    if not caps:
+        return None
+    return max(1, min(caps))
 
 
 def _default_work_root(out_dir: Path) -> Path:
@@ -1468,7 +1542,7 @@ def main() -> None:
         memory_mb = max(512, int(args.memory_mb))
     else:
         total_mb = _detect_total_mem_mb()
-        memory_mb = max(2048, int(0.85 * total_mb)) if total_mb is not None else None
+        memory_mb = max(2048, int(0.80 * total_mb)) if total_mb is not None else None
     _log(f"Figure2 resources: threads={threads} memory_mb={memory_mb}")
     _set_runtime_thread_env(threads)
 

@@ -24,6 +24,83 @@ def _exists(cmd: str) -> bool:
     return shutil.which(cmd) is not None
 
 
+def _parse_int_prefix(raw: str | None) -> int | None:
+    if not raw:
+        return None
+    s = str(raw).strip()
+    digits = []
+    for ch in s:
+        if ch.isdigit():
+            digits.append(ch)
+        else:
+            break
+    if not digits:
+        return None
+    try:
+        return int("".join(digits))
+    except Exception:
+        return None
+
+
+def _detect_total_threads() -> int:
+    candidates: list[int] = []
+    for key in ("PBS_NP", "NSLOTS"):
+        v = _parse_int_prefix(os.environ.get(key))
+        if v is not None and v > 0:
+            candidates.append(v)
+    if hasattr(os, "sched_getaffinity"):
+        try:
+            candidates.append(max(1, len(os.sched_getaffinity(0))))  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    candidates.append(max(1, int(os.cpu_count() or 1)))
+    return max(1, min(candidates))
+
+
+def _detect_physical_mem_mb() -> int | None:
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    kb = int(line.split()[1])
+                    return max(1, kb // 1024)
+    except Exception:
+        return None
+    return None
+
+
+def _detect_cgroup_mem_limit_mb() -> int | None:
+    limit_bytes: int | None = None
+    for p in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        try:
+            txt = Path(p).read_text(encoding="utf-8", errors="replace").strip()
+        except Exception:
+            continue
+        if not txt or txt == "max":
+            continue
+        try:
+            b = int(txt)
+        except Exception:
+            continue
+        # Treat huge sentinel limits as effectively unlimited.
+        if b <= 0 or b >= (1 << 60):
+            continue
+        limit_bytes = b if limit_bytes is None else min(limit_bytes, b)
+    if limit_bytes is None:
+        return None
+    return max(1, limit_bytes // (1024 * 1024))
+
+
+def _detect_scheduler_mem_limit_mb(thread_budget: int) -> int | None:
+    out: list[int] = []
+    pbs_mem_mb = _parse_int_prefix(os.environ.get("PBS_MEM_MB"))
+    if pbs_mem_mb is not None and pbs_mem_mb > 0:
+        out.append(pbs_mem_mb)
+    if not out:
+        return None
+    return max(1, min(out))
+
+
 def _assert_mgcv_available(env: dict[str, str]) -> None:
     # Hard requirement: GAM must run with R mgcv via rpy2.
     subprocess.run(
@@ -56,7 +133,7 @@ def _default_out_root() -> Path:
 
 
 def _jobs() -> int:
-    return max(1, int(os.cpu_count() or 8))
+    return _detect_total_threads()
 
 
 def _apply_thread_env(env: dict[str, str], threads: int) -> None:
@@ -74,15 +151,19 @@ def _apply_thread_env(env: dict[str, str], threads: int) -> None:
 
 
 def _detect_total_mem_mb() -> int | None:
-    try:
-        with open("/proc/meminfo", "r", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                if line.startswith("MemTotal:"):
-                    kb = int(line.split()[1])
-                    return max(1, kb // 1024)
-    except Exception:
+    thread_budget = _detect_total_threads()
+    caps = [
+        v
+        for v in (
+            _detect_physical_mem_mb(),
+            _detect_cgroup_mem_limit_mb(),
+            _detect_scheduler_mem_limit_mb(thread_budget),
+        )
+        if v is not None and v > 0
+    ]
+    if not caps:
         return None
-    return None
+    return max(1, min(caps))
 
 
 def _keep_intermediates() -> bool:
@@ -266,7 +347,7 @@ def _run_fig2(
 def _resource_split(run_fig1: bool, run_fig2: bool) -> dict[str, int | None]:
     total_threads = _jobs()
     total_mem_mb = _detect_total_mem_mb()
-    usable_mem_mb = int(0.90 * total_mem_mb) if total_mem_mb is not None else None
+    usable_mem_mb = int(0.80 * total_mem_mb) if total_mem_mb is not None else None
 
     if run_fig1 and run_fig2:
         fig1_threads = max(1, int(round(total_threads * 0.75)))

@@ -25,6 +25,127 @@ log() { printf '[hpc_run] %s\n' "$*"; }
 
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
 
+_cgroup_memory_events_path() {
+  local pid="$1"
+  [[ -r "/proc/$pid/cgroup" ]] || return 1
+  local cgv2_path
+  cgv2_path="$(awk -F: '$1=="0" && $2=="" {print $3; exit}' "/proc/$pid/cgroup" 2>/dev/null || true)"
+  [[ -n "$cgv2_path" ]] || return 1
+  local events="/sys/fs/cgroup${cgv2_path}/memory.events"
+  [[ -r "$events" ]] || return 1
+  printf '%s\n' "$events"
+}
+
+_oom_kill_count() {
+  local events_file="${1:-}"
+  [[ -n "$events_file" && -r "$events_file" ]] || {
+    printf '0\n'
+    return 0
+  }
+  awk '$1=="oom_kill" {print $2; found=1} END{if (!found) print 0}' "$events_file" 2>/dev/null
+}
+
+_disk_space_line() {
+  local path="$1"
+  df -Pk "$path" 2>/dev/null | awk -v p="$path" 'NR==2{printf "[hpc_run] disk-space path=%s size_kb=%s used_kb=%s avail_kb=%s use=%s mount=%s\n", p, $2, $3, $4, $5, $6}'
+}
+
+_inode_space_line() {
+  local path="$1"
+  df -Pi "$path" 2>/dev/null | awk -v p="$path" 'NR==2{printf "[hpc_run] inode-space path=%s inodes=%s iused=%s ifree=%s iuse=%s mount=%s\n", p, $2, $3, $4, $5, $6}'
+}
+
+_cgroup_memory_value() {
+  local events_file="${1:-}"
+  local key="${2:-}"
+  [[ -n "$events_file" && -r "$events_file" && -n "$key" ]] || {
+    printf 'NA\n'
+    return 0
+  }
+  local cg_dir
+  cg_dir="$(dirname "$events_file")"
+  local f="$cg_dir/$key"
+  if [[ -r "$f" ]]; then
+    head -n 1 "$f" 2>/dev/null || printf 'NA\n'
+  else
+    printf 'NA\n'
+  fi
+}
+
+_memory_events_line() {
+  local events_file="${1:-}"
+  [[ -n "$events_file" && -r "$events_file" ]] || return 0
+  local line
+  line="$(tr '\n' ' ' < "$events_file" 2>/dev/null | sed 's/[[:space:]]\+/ /g' | sed 's/ $//')"
+  [[ -n "$line" ]] && printf '[hpc_run] cgroup-memory-events %s\n' "$line"
+}
+
+_cpu_total_available() {
+  if has_cmd nproc; then
+    nproc
+    return 0
+  fi
+  if has_cmd getconf; then
+    getconf _NPROCESSORS_ONLN
+    return 0
+  fi
+  printf '1\n'
+}
+
+_read_cpu_jiffies() {
+  [[ -r /proc/stat ]] || return 1
+  awk '
+    $1=="cpu" {
+      idle=$5+$6;
+      total=0;
+      for (i=2;i<=NF;i++) total+=$i;
+      printf "%s %s\n", total, idle;
+      exit
+    }
+  ' /proc/stat
+}
+
+_cpu_util_pct_from_delta() {
+  local prev_total="$1"
+  local prev_idle="$2"
+  local curr_total="$3"
+  local curr_idle="$4"
+  awk -v pt="$prev_total" -v pi="$prev_idle" -v ct="$curr_total" -v ci="$curr_idle" '
+    BEGIN {
+      dt = ct - pt;
+      di = ci - pi;
+      if (dt <= 0) { print "NA"; exit }
+      util = ((dt - di) / dt) * 100.0;
+      if (util < 0) util = 0;
+      if (util > 100) util = 100;
+      printf "%.2f", util;
+    }
+  '
+}
+
+_append_abnormal_diagnostics() {
+  local log_file="$1"
+  local events_file="${2:-}"
+  {
+    printf '[hpc_run] abnormal-termination-diagnostics begin\n'
+    _disk_space_line "$RESULTS_DIR" || true
+    _inode_space_line "$RESULTS_DIR" || true
+    _disk_space_line "$LOG_DIR" || true
+    _inode_space_line "$LOG_DIR" || true
+    _disk_space_line "/tmp" || true
+    _inode_space_line "/tmp" || true
+    if [[ -d "/dev/shm" ]]; then
+      _disk_space_line "/dev/shm" || true
+      _inode_space_line "/dev/shm" || true
+    fi
+    _memory_events_line "$events_file" || true
+    printf '[hpc_run] cgroup-memory-current=%s\n' "$(_cgroup_memory_value "$events_file" "memory.current")"
+    printf '[hpc_run] cgroup-memory-max=%s\n' "$(_cgroup_memory_value "$events_file" "memory.max")"
+    printf '[hpc_run] cgroup-memory-peak=%s\n' "$(_cgroup_memory_value "$events_file" "memory.peak")"
+    printf '[hpc_run] abnormal-termination-diagnostics end\n'
+  } >>"$log_file"
+}
+
 is_running() {
   [[ -f "$PID_FILE" ]] || return 1
   local pid
@@ -242,6 +363,77 @@ nohup setsid "$WRAP_FILE" >"$LOG_FILE" 2>&1 < /dev/null &
 echo $! >"$PID_FILE"
 echo "$LOG_FILE" >"$LOG_DIR/latest.log.path"
 echo "$EXIT_FILE" >"$LOG_DIR/latest.exit.path"
+
+# Sidecar monitor: if the run is externally killed (OOM, timeout, preemption),
+# write a clear marker to the log and synthesize an exit code file.
+(
+  run_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+  [[ -n "$run_pid" ]] || exit 0
+
+  heartbeat_s=60
+  total_cpus="$(_cpu_total_available)"
+  run_started_ts="$(date +%s)"
+  last_hb_ts="$run_started_ts"
+  prev_total=""
+  prev_idle=""
+  if read -r prev_total prev_idle < <(_read_cpu_jiffies 2>/dev/null); then
+    :
+  else
+    prev_total=""
+    prev_idle=""
+  fi
+
+  events_file="$(_cgroup_memory_events_path "$run_pid" || true)"
+  oom_before="$(_oom_kill_count "$events_file")"
+
+  while kill -0 "$run_pid" 2>/dev/null; do
+    sleep 5
+    now_ts="$(date +%s)"
+
+    curr_total=""
+    curr_idle=""
+    cpu_system_util_pct="NA"
+    if read -r curr_total curr_idle < <(_read_cpu_jiffies 2>/dev/null); then
+      if [[ -n "$prev_total" && -n "$prev_idle" ]]; then
+        cpu_system_util_pct="$(_cpu_util_pct_from_delta "$prev_total" "$prev_idle" "$curr_total" "$curr_idle")"
+      fi
+      prev_total="$curr_total"
+      prev_idle="$curr_idle"
+    fi
+
+    if (( now_ts - last_hb_ts >= heartbeat_s )); then
+      elapsed_s=$((now_ts - run_started_ts))
+      cpu_proc_pct="$(ps -p "$run_pid" -o %cpu= 2>/dev/null | awk '{print $1; exit}' || true)"
+      cpu_proc_pct="${cpu_proc_pct:-NA}"
+      cpu_threads="$(ps -p "$run_pid" -o nlwp= 2>/dev/null | awk '{print $1; exit}' || true)"
+      cpu_threads="${cpu_threads:-NA}"
+      cpu_system_used_est="NA"
+      cpu_proc_used_est="NA"
+      if [[ "$cpu_system_util_pct" != "NA" ]]; then
+        cpu_system_used_est="$(awk -v pct="$cpu_system_util_pct" -v total="$total_cpus" 'BEGIN{printf "%.2f", (pct/100.0)*total}')"
+      fi
+      if [[ "$cpu_proc_pct" != "NA" ]]; then
+        cpu_proc_used_est="$(awk -v pct="$cpu_proc_pct" 'BEGIN{printf "%.2f", pct/100.0}')"
+      fi
+      printf '[hpc_run] heartbeat elapsed_s=%s pid=%s cpu_total=%s cpu_system_util_pct=%s cpu_system_used_est=%s cpu_proc_pct=%s cpu_proc_used_est=%s proc_threads=%s\n' \
+        "$elapsed_s" "$run_pid" "$total_cpus" "$cpu_system_util_pct" "$cpu_system_used_est" "$cpu_proc_pct" "$cpu_proc_used_est" "$cpu_threads" >>"$LOG_FILE"
+      last_hb_ts="$now_ts"
+    fi
+  done
+
+  if [[ ! -f "$EXIT_FILE" ]]; then
+    oom_after="$(_oom_kill_count "$events_file")"
+    if [[ "$oom_after" =~ ^[0-9]+$ && "$oom_before" =~ ^[0-9]+$ && "$oom_after" -gt "$oom_before" ]]; then
+      printf '[hpc_run] Run ended without normal exit file; cgroup oom_kill increased (%s -> %s), likely OOM kill\n' "$oom_before" "$oom_after" >>"$LOG_FILE"
+    else
+      printf '[hpc_run] Run ended without normal exit file; likely external kill (OOM/timeout/preemption)\n' >>"$LOG_FILE"
+    fi
+    _append_abnormal_diagnostics "$LOG_FILE" "$events_file"
+    printf '137\n' >"$EXIT_FILE"
+  fi
+  rm -f "$PID_FILE"
+) >/dev/null 2>&1 &
+
 sleep 1
 if ! is_running; then
   echo "Failed to start detached run. Check log: $LOG_FILE"
