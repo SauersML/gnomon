@@ -1714,15 +1714,10 @@ theorem l2_projection_of_additive_is_additive (k sp : ℕ) [Fintype (Fin k)] [Fi
   (h_pgs : proj.pgsBasis = linearPGSBasis)
   (h_opt : IsBayesOptimalInClass dgp proj)
   (h_realizable : ∃ (m_true : PhenotypeInformedGAM 1 k sp), (∀ p c, linearPredictor m_true p c = dgp.trueExpectation p c) ∧ m_true.pgsBasis = proj.pgsBasis ∧ m_true.pcSplineBasis = proj.pcSplineBasis)
-  (h_risk_zero : expectedSquaredError dgp (fun p c => linearPredictor proj p c) = 0)
-  (h_zero_risk_implies_pointwise :
-    expectedSquaredError dgp (fun p c => linearPredictor proj p c) = 0 →
-    ∀ p c, linearPredictor proj p c = dgp.trueExpectation p c) :
+  (h_fit : ∀ p c, linearPredictor proj p c = dgp.trueExpectation p c) :
   IsNormalizedScoreModel proj := by
   have _h_opt := h_opt
   have _h_realizable := h_realizable
-  have h_fit : ∀ p c, linearPredictor proj p c = dgp.trueExpectation p c :=
-    h_zero_risk_implies_pointwise h_risk_zero
   -- Use decomposition
   have h_lin : proj.pgsBasis.B 1 = id := by rw [h_pgs]; rfl
   have h_pred : ∀ p c, linearPredictor proj p c = predictorBase proj c + predictorSlope proj c * p :=
@@ -1828,13 +1823,10 @@ theorem independence_implies_no_interaction (k sp : ℕ) [Fintype (Fin k)] [Fint
     (h_pgs : m.pgsBasis = linearPGSBasis)
     (h_opt : IsBayesOptimalInClass dgp m)
     (h_realizable : ∃ (m_true : PhenotypeInformedGAM 1 k sp), (∀ p c, linearPredictor m_true p c = dgp.trueExpectation p c) ∧ m_true.pgsBasis = m.pgsBasis ∧ m_true.pcSplineBasis = m.pcSplineBasis)
-    (h_risk_zero : expectedSquaredError dgp (fun p c => linearPredictor m p c) = 0)
-    (h_zero_risk_implies_pointwise :
-      expectedSquaredError dgp (fun p c => linearPredictor m p c) = 0 →
-      ∀ p c, linearPredictor m p c = dgp.trueExpectation p c) :
+    (h_fit : ∀ p c, linearPredictor m p c = dgp.trueExpectation p c) :
     IsNormalizedScoreModel m := by
   rcases h_additive with ⟨f, g, h_fn_struct⟩
-  exact l2_projection_of_additive_is_additive k sp h_fn_struct m h_spline h_pgs h_opt h_realizable h_risk_zero h_zero_risk_implies_pointwise
+  exact l2_projection_of_additive_is_additive k sp h_fn_struct m h_spline h_pgs h_opt h_realizable h_fit
 
 structure DGPWithEnvironment (k : ℕ) where
   to_dgp : DataGeneratingProcess k
