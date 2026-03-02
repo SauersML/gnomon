@@ -5,6 +5,7 @@ import concurrent.futures
 import math
 import multiprocessing as mp
 import os
+import re
 import shutil
 import sys
 import time
@@ -968,6 +969,108 @@ def _plot_pt_train_accuracy(metrics_df: pd.DataFrame, out_path: Path, title: str
     plt.close(fig)
 
 
+def _collect_existing_generation_records(out_dir: Path) -> list[dict[str, object]]:
+    patt = re.compile(r"^fig1_g(?P<g>\d+)_s(?P<s>\d+)\.results\.tsv$")
+    recs: list[dict[str, object]] = []
+    for res_path in sorted(out_dir.glob("fig1_g*_s*.results.tsv")):
+        m = patt.match(res_path.name)
+        if m is None:
+            continue
+        g = int(m.group("g"))
+        s = int(m.group("s"))
+        stem = out_dir / f"fig1_g{g}_s{s}"
+        prs_path = Path(f"{stem}.prs.tsv")
+        pc_path = Path(f"{stem}.pc.tsv")
+        pred_path = Path(f"{stem}.predictions.tsv")
+        if not (prs_path.exists() and pc_path.exists() and pred_path.exists()):
+            continue
+        pt_path = Path(f"{stem}.pt_thresholds.tsv")
+        recs.append(
+            {
+                "gens": g,
+                "seed": s,
+                "res_path": str(res_path),
+                "prs_path": str(prs_path),
+                "pc_path": str(pc_path),
+                "pred_path": str(pred_path),
+                "pt_thresholds_path": str(pt_path) if pt_path.exists() else "",
+            }
+        )
+    recs.sort(key=lambda x: (int(x["gens"]), int(x["seed"])))
+    return recs
+
+
+def _aggregate_and_plot(done: list[dict[str, object]], out_dir: Path, demography_split_gens: int | None = None) -> None:
+    if not done:
+        raise RuntimeError("No per-generation outputs available to aggregate.")
+    done = sorted(done, key=lambda x: (int(x["gens"]), int(x["seed"])))
+    res_df = pd.concat([pd.read_csv(str(r["res_path"]), sep="\t") for r in done], ignore_index=True).sort_values(["prs_source", "method", "gens"])
+    prs_df = pd.concat([pd.read_csv(str(r["prs_path"]), sep="\t") for r in done], ignore_index=True)
+    pc_df = pd.concat([pd.read_csv(str(r["pc_path"]), sep="\t") for r in done], ignore_index=True)
+    pred_df = pd.concat([pd.read_csv(str(r["pred_path"]), sep="\t") for r in done], ignore_index=True)
+    res_df.to_csv(out_dir / "figure1_auc_ratio.tsv", sep="\t", index=False)
+    res_df.to_csv(out_dir / "figure1_auc_brier_ratio.tsv", sep="\t", index=False)
+    _log("Figure1 wrote figure1_auc_ratio.tsv and figure1_auc_brier_ratio.tsv")
+    pred_df.to_csv(out_dir / "figure1_predictions.tsv", sep="\t", index=False)
+    pt_paths = [str(r.get("pt_thresholds_path", "")) for r in done if str(r.get("pt_thresholds_path", ""))]
+    if pt_paths:
+        pt_all = pd.concat([pd.read_csv(p, sep="\t") for p in pt_paths], ignore_index=True)
+        pt_all.to_csv(out_dir / "figure1_pt_thresholds.tsv", sep="\t", index=False)
+        _apply_plot_style()
+        fig, ax = plt.subplots(figsize=(9, 5.5))
+        metric_col = "train_auc" if "train_auc" in pt_all.columns else "train_accuracy"
+        metric_label = "Train AUC" if metric_col == "train_auc" else "Train accuracy"
+        for g in sorted(pt_all["gens"].unique()):
+            sub = pt_all[pt_all["gens"] == g].sort_values("p_threshold")
+            ax.plot(
+                sub["p_threshold"].to_numpy(dtype=float),
+                sub[metric_col].to_numpy(dtype=float),
+                marker="o",
+                linewidth=1.8,
+                label=f"g={int(g)}",
+            )
+        ax.set_xscale("log")
+        ax.set_xlabel("P+T p-value threshold")
+        ax.set_ylabel(metric_label)
+        ax.set_title(f"Figure1 P+T {metric_label.lower()} across thresholds")
+        ax.legend(frameon=False, ncol=2)
+        _style_axes(ax)
+        fig.tight_layout()
+        fig.savefig(out_dir / "figure1_pt_train_accuracy_by_generation.png", dpi=240)
+        plt.close(fig)
+    detailed = (
+        pred_df.groupby(["gens", "prs_source", "method", "group"], as_index=False)
+        .agg(
+            n=("y", "size"),
+            prevalence=("y", "mean"),
+            mean_prs=("prs", "mean"),
+            sd_prs=("prs", "std"),
+            mean_g_true=("G_true", "mean"),
+            mean_y_prob=("y_prob", "mean"),
+        )
+        .sort_values(["gens", "prs_source", "method", "group"])
+    )
+    detailed.to_csv(out_dir / "figure1_detailed_metrics.tsv", sep="\t", index=False)
+    _log("Figure1 wrote aggregated results table")
+    _log_results_table(
+        "[fig1] AUC/Brier ratio results (gens/method)",
+        res_df.sort_values(["gens", "prs_source", "method"]).reset_index(drop=True),
+    )
+    _log_results_table(
+        "[fig1] Detailed grouped stats",
+        detailed.sort_values(["gens", "prs_source", "method", "group"]).reset_index(drop=True),
+    )
+    _log("Figure1 plotting outputs")
+    _plot_main(res_df, out_dir)
+    if demography_split_gens is None:
+        avail = sorted({int(r["gens"]) for r in done})
+        demography_split_gens = int(avail[len(avail) // 2])
+    _plot_demography(out_dir, split_gens=int(demography_split_gens))
+    _plot_prs_grid(prs_df.to_dict("records"), out_dir)
+    _plot_pc_grid(pc_df.to_dict("records"), out_dir)
+    _log("Figure1 run complete")
+
+
 def _run_generation_task(task: dict[str, object]) -> dict[str, object]:
     g = int(task["g"])
     seed = int(task["seed"])
@@ -1312,6 +1415,11 @@ def main() -> None:
     parser.add_argument("--bayesr", action="store_true", help="Use BayesR backend (default is fast P+T).")
     parser.add_argument("--use-existing", action="store_true", help="Reuse existing fig1_g*_s* PLINK/TSV files; skip simulation.")
     parser.add_argument("--use-existing-dir", default=None, help="Directory containing existing fig1_g*_s* PLINK/TSV files.")
+    parser.add_argument(
+        "--force-figs",
+        action="store_true",
+        help="Force regeneration of Figure1 aggregate tables/plots from whatever per-generation outputs already exist.",
+    )
     args = parser.parse_args()
 
     out_dir = Path(args.out)
@@ -1320,6 +1428,17 @@ def main() -> None:
     work_root.mkdir(parents=True, exist_ok=True)
     _log("Figure1 spline backends: pspline + thinplate (mgcv)")
     _log(f"Figure1 PRS backend: {'BayesR' if args.bayesr else 'P+T'}")
+
+    if bool(args.force_figs):
+        existing = _collect_existing_generation_records(out_dir)
+        if not existing:
+            raise RuntimeError(
+                f"No existing Figure1 per-generation result sets found in {out_dir}. "
+                "Expected files like fig1_g*_s*.results.tsv/.prs.tsv/.pc.tsv/.predictions.tsv."
+            )
+        _log(f"Figure1 force-figs mode: found {len(existing)} generation result sets; regenerating aggregate outputs.")
+        _aggregate_and_plot(existing, out_dir=out_dir, demography_split_gens=None)
+        return
 
     pgs_effects = simulate_effect_size_distribution(
         n_effects=200000,
@@ -1449,70 +1568,7 @@ def main() -> None:
     finally:
         ex.shutdown(wait=not pool_failed, cancel_futures=pool_failed)
 
-    done = sorted(done, key=lambda x: int(x["gens"]))
-    res_df = pd.concat([pd.read_csv(str(r["res_path"]), sep="\t") for r in done], ignore_index=True).sort_values(["prs_source", "method", "gens"])
-    prs_df = pd.concat([pd.read_csv(str(r["prs_path"]), sep="\t") for r in done], ignore_index=True)
-    pc_df = pd.concat([pd.read_csv(str(r["pc_path"]), sep="\t") for r in done], ignore_index=True)
-    pred_df = pd.concat([pd.read_csv(str(r["pred_path"]), sep="\t") for r in done], ignore_index=True)
-    res_df.to_csv(out_dir / "figure1_auc_ratio.tsv", sep="\t", index=False)
-    res_df.to_csv(out_dir / "figure1_auc_brier_ratio.tsv", sep="\t", index=False)
-    _log("Figure1 wrote figure1_auc_ratio.tsv and figure1_auc_brier_ratio.tsv")
-    pred_df.to_csv(out_dir / "figure1_predictions.tsv", sep="\t", index=False)
-    pt_paths = [str(r.get("pt_thresholds_path", "")) for r in done if str(r.get("pt_thresholds_path", ""))]
-    if pt_paths:
-        pt_all = pd.concat([pd.read_csv(p, sep="\t") for p in pt_paths], ignore_index=True)
-        pt_all.to_csv(out_dir / "figure1_pt_thresholds.tsv", sep="\t", index=False)
-        _apply_plot_style()
-        fig, ax = plt.subplots(figsize=(9, 5.5))
-        metric_col = "train_auc" if "train_auc" in pt_all.columns else "train_accuracy"
-        metric_label = "Train AUC" if metric_col == "train_auc" else "Train accuracy"
-        for g in sorted(pt_all["gens"].unique()):
-            sub = pt_all[pt_all["gens"] == g].sort_values("p_threshold")
-            ax.plot(
-                sub["p_threshold"].to_numpy(dtype=float),
-                sub[metric_col].to_numpy(dtype=float),
-                marker="o",
-                linewidth=1.8,
-                label=f"g={int(g)}",
-            )
-        ax.set_xscale("log")
-        ax.set_xlabel("P+T p-value threshold")
-        ax.set_ylabel(metric_label)
-        ax.set_title(f"Figure1 P+T {metric_label.lower()} across thresholds")
-        ax.legend(frameon=False, ncol=2)
-        _style_axes(ax)
-        fig.tight_layout()
-        fig.savefig(out_dir / "figure1_pt_train_accuracy_by_generation.png", dpi=240)
-        plt.close(fig)
-    detailed = (
-        pred_df.groupby(["gens", "prs_source", "method", "group"], as_index=False)
-        .agg(
-            n=("y", "size"),
-            prevalence=("y", "mean"),
-            mean_prs=("prs", "mean"),
-            sd_prs=("prs", "std"),
-            mean_g_true=("G_true", "mean"),
-            mean_y_prob=("y_prob", "mean"),
-        )
-        .sort_values(["gens", "prs_source", "method", "group"])
-    )
-    detailed.to_csv(out_dir / "figure1_detailed_metrics.tsv", sep="\t", index=False)
-    _log("Figure1 wrote aggregated results table")
-    _log_results_table(
-        "[fig1] AUC/Brier ratio results (gens/method)",
-        res_df.sort_values(["gens", "prs_source", "method"]).reset_index(drop=True),
-    )
-    _log_results_table(
-        "[fig1] Detailed grouped stats",
-        detailed.sort_values(["gens", "prs_source", "method", "group"]).reset_index(drop=True),
-    )
-
-    _log("Figure1 plotting outputs")
-    _plot_main(res_df, out_dir)
-    _plot_demography(out_dir, split_gens=int(sorted(args.gens)[len(args.gens) // 2]))
-    _plot_prs_grid(prs_df.to_dict("records"), out_dir)
-    _plot_pc_grid(pc_df.to_dict("records"), out_dir)
-    _log("Figure1 run complete")
+    _aggregate_and_plot(done, out_dir=out_dir, demography_split_gens=int(sorted(args.gens)[len(args.gens) // 2]))
 
 
 if __name__ == "__main__":

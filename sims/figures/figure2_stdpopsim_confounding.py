@@ -1506,6 +1506,59 @@ def _plot_pt_train_accuracy(metrics_df: pd.DataFrame, out_path: Path) -> None:
     plt.close(fig)
 
 
+def _force_plots_from_existing(out_dir: Path) -> None:
+    res_path = out_dir / "figure2_auc_by_method_population.tsv"
+    if not res_path.exists():
+        alt = out_dir / "figure2_auc_brier_by_method_population.tsv"
+        if alt.exists():
+            res_path = alt
+    if not res_path.exists():
+        raise RuntimeError(
+            f"No Figure2 aggregate table found in {out_dir}. "
+            "Expected figure2_auc_by_method_population.tsv or figure2_auc_brier_by_method_population.tsv."
+        )
+    res = pd.read_csv(res_path, sep="\t")
+    if res.empty:
+        raise RuntimeError(f"Figure2 aggregate table is empty: {res_path}")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    res.to_csv(out_dir / "figure2_auc_by_method_population.tsv", sep="\t", index=False)
+    res.to_csv(out_dir / "figure2_auc_brier_by_method_population.tsv", sep="\t", index=False)
+    _log("[fig2] Wrote figure2_auc_by_method_population.tsv")
+    _log("[fig2] Wrote figure2_auc_brier_by_method_population.tsv")
+    _log_results_table(
+        "[fig2] AUC/Brier/statistics by method and population",
+        res.sort_values(["prs_source", "method", "population"]).reset_index(drop=True),
+    )
+    _plot_main(res, out_dir)
+
+    pred_path = out_dir / "figure2_test_predictions.tsv"
+    if pred_path.exists():
+        pred_df = pd.read_csv(pred_path, sep="\t")
+        if not pred_df.empty:
+            for prs_source in sorted(pred_df["prs_source"].dropna().astype(str).unique()):
+                sub = pred_df[pred_df["prs_source"].astype(str) == prs_source].copy()
+                if sub.empty:
+                    continue
+                method_order = sorted(sub["method"].dropna().astype(str).unique())
+                if method_order:
+                    sub = sub[sub["method"].astype(str) == method_order[0]].copy()
+                _plot_prs_distribution(sub, sub["prs"].to_numpy(dtype=float), out_dir, prs_source=prs_source)
+            pc_df = (
+                pred_df[["IID", "pop_label", "pc1", "pc2"]]
+                .dropna(subset=["IID"])
+                .drop_duplicates(subset=["IID"])
+                .rename(columns={"pop_label": "pop_label"})
+            )
+            if not pc_df.empty:
+                _plot_pcs(pc_df, out_dir)
+    pt_path = out_dir / "figure2_pt_thresholds.tsv"
+    if pt_path.exists():
+        pt_metrics = pd.read_csv(pt_path, sep="\t")
+        if not pt_metrics.empty:
+            _plot_pt_train_accuracy(pt_metrics.sort_values("p_threshold"), out_dir / "figure2_pt_train_accuracy.png")
+    _log("[fig2] Force-figs regeneration complete")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", default="sims/results_figure2_local")
@@ -1529,12 +1582,21 @@ def main() -> None:
     parser.add_argument("--bayesr", action="store_true", help="Use BayesR backend (default is fast P+T).")
     parser.add_argument("--use-existing", action="store_true", help="Reuse existing fig2_s* PLINK/TSV files; skip simulation.")
     parser.add_argument("--use-existing-dir", default=None, help="Directory containing existing fig2_s* PLINK/TSV files.")
+    parser.add_argument(
+        "--force-figs",
+        action="store_true",
+        help="Force regeneration of Figure2 aggregate tables/plots from existing available outputs.",
+    )
     args = parser.parse_args()
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     work_root = Path(args.work_root) if args.work_root else _default_work_root(out_dir)
     work_root.mkdir(parents=True, exist_ok=True)
+    if bool(args.force_figs):
+        _log("Figure2 force-figs mode: regenerating from existing outputs only")
+        _force_plots_from_existing(out_dir)
+        return
     _log("Figure2 spline backends: pspline + thinplate (mgcv)")
     _log(f"Figure2 PRS backend: {'BayesR' if args.bayesr else 'P+T'}")
     threads = max(1, int(args.threads)) if args.threads is not None else _default_total_threads()

@@ -326,18 +326,16 @@ if [[ "${1:-}" == "_run-main" ]]; then
   run_main "$@"
 fi
 
-if [[ "$#" -ne 0 ]]; then
-  echo "Usage: $0"
-  echo "Run with zero args; this starts the detached full run."
-  exit 2
-fi
-
 if is_running; then
   echo "A run is already active (pid=$(cat "$PID_FILE"))."
   exit 0
 fi
 
-local_args=(run --figure both)
+if [[ "$#" -eq 0 ]]; then
+  local_args=(run --figure both)
+else
+  local_args=("$@")
+fi
 ts="$(date +%Y%m%d_%H%M%S)"
 LOG_FILE="$LOG_DIR/full_run_${ts}.log"
 EXIT_FILE="$LOG_DIR/full_run_${ts}.exitcode"

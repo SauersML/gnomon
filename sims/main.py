@@ -267,6 +267,7 @@ def _run_fig1(
     total_memory_mb: int | None,
     use_existing: bool,
     use_existing_dir: str | None,
+    force_figs: bool,
 ) -> None:
     sizes = _cohort_sizes(small)
     out = out_root / "figure1"
@@ -298,6 +299,8 @@ def _run_fig1(
         cmd.append("--use-existing")
         if use_existing_dir:
             cmd.extend(["--use-existing-dir", str(use_existing_dir)])
+    if force_figs:
+        cmd.append("--force-figs")
     if _keep_intermediates():
         cmd.append("--keep-intermediates")
     _run(cmd, env=env)
@@ -312,6 +315,7 @@ def _run_fig2(
     total_memory_mb: int | None,
     use_existing: bool,
     use_existing_dir: str | None,
+    force_figs: bool,
 ) -> None:
     sizes = _cohort_sizes(small)
     out = out_root / "figure2"
@@ -339,6 +343,8 @@ def _run_fig2(
         cmd.append("--use-existing")
         if use_existing_dir:
             cmd.extend(["--use-existing-dir", str(use_existing_dir)])
+    if force_figs:
+        cmd.append("--force-figs")
     if _keep_intermediates():
         cmd.append("--keep-intermediates")
     _run(cmd, env=env)
@@ -406,7 +412,13 @@ def _resolve_existing_dir(base: str | None, figure_subdir: str) -> str | None:
     return str(p)
 
 
-def run_pipeline(figure: str, small: bool, use_existing: bool = False, use_existing_dir: str | None = None) -> None:
+def run_pipeline(
+    figure: str,
+    small: bool,
+    use_existing: bool = False,
+    use_existing_dir: str | None = None,
+    force_figs: bool = False,
+) -> None:
     out_root = _default_out_root()
     out_root.mkdir(parents=True, exist_ok=True)
 
@@ -418,7 +430,8 @@ def run_pipeline(figure: str, small: bool, use_existing: bool = False, use_exist
     env.setdefault("RPY2_CFFI_MODE", "API")
     env.setdefault("PYTHONUNBUFFERED", "1")
     _apply_thread_env(env, jobs)
-    _assert_mgcv_available(env)
+    if not force_figs:
+        _assert_mgcv_available(env)
 
     run_fig1 = figure in ("1", "both")
     run_fig2 = figure in ("2", "both")
@@ -432,6 +445,8 @@ def run_pipeline(figure: str, small: bool, use_existing: bool = False, use_exist
         f"fig1_mem_mb={split['fig1_mem_mb']}",
         f"fig2_mem_mb={split['fig2_mem_mb']}",
     )
+    if force_figs:
+        print("Force-figs mode: recomputing figures/stats from existing available artifacts only.")
 
     # Run both figures concurrently when requested.
     if run_fig1 and run_fig2:
@@ -462,6 +477,7 @@ def run_pipeline(figure: str, small: bool, use_existing: bool = False, use_exist
                 *(["--gens", "5", "20", "100", "500", "2000"] if small else []),
                 *(["--use-existing"] if use_existing else []),
                 *([] if (not use_existing or fig1_existing_dir is None) else ["--use-existing-dir", fig1_existing_dir]),
+                *(["--force-figs"] if force_figs else []),
                 *(["--keep-intermediates"] if _keep_intermediates() else []),
             ],
             env=fig1_env,
@@ -483,6 +499,7 @@ def run_pipeline(figure: str, small: bool, use_existing: bool = False, use_exist
                 *([] if split["fig2_mem_mb"] is None else ["--memory-mb", str(split["fig2_mem_mb"])]),
                 *(["--use-existing"] if use_existing else []),
                 *([] if (not use_existing or fig2_existing_dir is None) else ["--use-existing-dir", fig2_existing_dir]),
+                *(["--force-figs"] if force_figs else []),
                 *(["--keep-intermediates"] if _keep_intermediates() else []),
             ],
             env=fig2_env,
@@ -537,6 +554,7 @@ def run_pipeline(figure: str, small: bool, use_existing: bool = False, use_exist
                 total_memory_mb=split["fig1_mem_mb"],
                 use_existing=use_existing,
                 use_existing_dir=fig1_existing_dir,
+                force_figs=force_figs,
             )
         if run_fig2:
             fig2_existing_dir = _resolve_existing_dir(use_existing_dir, "figure2")
@@ -549,6 +567,7 @@ def run_pipeline(figure: str, small: bool, use_existing: bool = False, use_exist
                 total_memory_mb=split["fig2_mem_mb"],
                 use_existing=use_existing,
                 use_existing_dir=fig2_existing_dir,
+                force_figs=force_figs,
             )
 
     if _clear_ramdisk_after() and work_root.exists():
@@ -583,12 +602,22 @@ def build_parser() -> argparse.ArgumentParser:
     ps.add_argument("--figure", choices=["1", "2", "both"], default="both")
     ps.add_argument("--use-existing", action="store_true", help="Reuse existing per-seed PLINK/TSV files and skip simulation.")
     ps.add_argument("--use-existing-dir", default=None, help="Directory holding existing reuse files (or parent containing figure1/figure2).")
+    ps.add_argument(
+        "--force-figs",
+        action="store_true",
+        help="Force figure/stat generation from available existing outputs without rerunning full simulation.",
+    )
 
     pr = sub.add_parser("run", help="Run simulations")
     pr.add_argument("--small", action="store_true", help="Use smaller debug cohorts")
     pr.add_argument("--figure", choices=["1", "2", "both"], default="both")
     pr.add_argument("--use-existing", action="store_true", help="Reuse existing per-seed PLINK/TSV files and skip simulation.")
     pr.add_argument("--use-existing-dir", default=None, help="Directory holding existing reuse files (or parent containing figure1/figure2).")
+    pr.add_argument(
+        "--force-figs",
+        action="store_true",
+        help="Force figure/stat generation from available existing outputs without rerunning full simulation.",
+    )
 
     sub.add_parser("clean-ramdisk", help="Delete transient work directory")
     return p
@@ -611,6 +640,7 @@ def main() -> None:
             small=bool(args.small),
             use_existing=bool(args.use_existing),
             use_existing_dir=args.use_existing_dir,
+            force_figs=bool(args.force_figs),
         )
         return
 
@@ -620,6 +650,7 @@ def main() -> None:
             small=bool(args.small),
             use_existing=bool(args.use_existing),
             use_existing_dir=args.use_existing_dir,
+            force_figs=bool(args.force_figs),
         )
         return
 
