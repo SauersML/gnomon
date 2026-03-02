@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from datetime import datetime
 import zipfile
@@ -406,13 +407,43 @@ def run_pipeline(figure: str, small: bool, use_existing: bool = False, use_exist
             env=fig2_env,
         )
 
-        rc1 = p1.wait()
-        rc2 = p2.wait()
-        if rc1 != 0 or rc2 != 0:
-            raise subprocess.CalledProcessError(
-                rc1 if rc1 != 0 else rc2,
-                "parallel figure run",
-            )
+        procs = {"figure1": p1, "figure2": p2}
+        while True:
+            rc = {name: proc.poll() for name, proc in procs.items()}
+            if all(v is not None for v in rc.values()):
+                if rc["figure1"] != 0 or rc["figure2"] != 0:
+                    raise subprocess.CalledProcessError(
+                        rc["figure1"] if rc["figure1"] != 0 else int(rc["figure2"]),
+                        "parallel figure run",
+                    )
+                break
+
+            failed = [name for name, code in rc.items() if (code is not None and code != 0)]
+            if failed:
+                survivor_names = [name for name in procs if name not in failed]
+                for name in survivor_names:
+                    proc = procs[name]
+                    if proc.poll() is None:
+                        proc.terminate()
+                deadline = time.time() + 10.0
+                for name in survivor_names:
+                    proc = procs[name]
+                    if proc.poll() is None:
+                        remaining = max(0.0, deadline - time.time())
+                        try:
+                            proc.wait(timeout=remaining)
+                        except subprocess.TimeoutExpired:
+                            pass
+                for name in survivor_names:
+                    proc = procs[name]
+                    if proc.poll() is None:
+                        proc.kill()
+                raise subprocess.CalledProcessError(
+                    int(rc[failed[0]]),
+                    f"parallel figure run ({failed[0]} failed)",
+                )
+
+            time.sleep(1.0)
     else:
         if run_fig1:
             fig1_existing_dir = _resolve_existing_dir(use_existing_dir, "figure1")

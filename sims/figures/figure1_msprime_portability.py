@@ -3,9 +3,11 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import math
+import multiprocessing as mp
 import os
 import shutil
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -185,6 +187,63 @@ def _resource_plan(
     assert best is not None
     _, jobs, threads_per_job, mem_per_job_mb = best
     return int(jobs), int(threads_per_job), mem_per_job_mb
+
+
+def _choose_mp_context() -> mp.context.BaseContext:
+    requested = str(os.environ.get("GNOMON_FIG1_MP_START_METHOD", "spawn")).strip().lower()
+    methods = set(mp.get_all_start_methods())
+    if requested and requested in methods:
+        return mp.get_context(requested)
+    if "spawn" in methods:
+        return mp.get_context("spawn")
+    return mp.get_context()
+
+
+def _pool_workers(ex: concurrent.futures.ProcessPoolExecutor) -> dict[int, object]:
+    workers = getattr(ex, "_processes", {}) or {}
+    out: dict[int, object] = {}
+    for p in workers.values():
+        if p is None:
+            continue
+        pid = getattr(p, "pid", None)
+        if pid is None:
+            continue
+        out[int(pid)] = p
+    return out
+
+
+def _terminated_workers(ex: concurrent.futures.ProcessPoolExecutor) -> list[tuple[int, int | None]]:
+    out: list[tuple[int, int | None]] = []
+    for pid, proc in _pool_workers(ex).items():
+        exitcode = getattr(proc, "exitcode", None)
+        if exitcode is not None:
+            out.append((pid, int(exitcode)))
+    return out
+
+
+def _shutdown_pool_hard(ex: concurrent.futures.ProcessPoolExecutor, reason: str) -> None:
+    _log(f"Figure1 pool hard-stop: {reason}")
+    workers = _pool_workers(ex)
+    for proc in workers.values():
+        try:
+            if proc.is_alive():
+                proc.terminate()
+        except Exception:
+            pass
+    deadline = time.monotonic() + 5.0
+    for proc in workers.values():
+        try:
+            remaining = max(0.0, deadline - time.monotonic())
+            proc.join(timeout=remaining)
+        except Exception:
+            pass
+    for proc in workers.values():
+        try:
+            if proc.is_alive():
+                proc.kill()
+        except Exception:
+            pass
+    ex.shutdown(wait=False, cancel_futures=True)
 
 
 def _build_demography(split_gens: int) -> msprime.Demography:
@@ -1157,6 +1216,24 @@ def main() -> None:
         help="Total memory budget (MB) for Figure 1 auto-planner.",
     )
     parser.add_argument("--work-root", default=None, help="Directory for heavy transient work files (e.g., RAM disk).")
+    parser.add_argument(
+        "--task-timeout-s",
+        type=float,
+        default=float(os.environ.get("GNOMON_FIG1_TASK_TIMEOUT_S", "43200")),
+        help="Per-generation hard timeout in seconds (default: 43200 = 12h).",
+    )
+    parser.add_argument(
+        "--pool-stall-timeout-s",
+        type=float,
+        default=float(os.environ.get("GNOMON_FIG1_POOL_STALL_TIMEOUT_S", "7200")),
+        help="Fail the run if no task completes for this many seconds (default: 7200 = 2h).",
+    )
+    parser.add_argument(
+        "--pool-poll-s",
+        type=float,
+        default=float(os.environ.get("GNOMON_FIG1_POOL_POLL_S", "15")),
+        help="Executor polling interval in seconds (default: 15).",
+    )
     parser.add_argument("--keep-intermediates", action="store_true", help="Keep per-generation PLINK/GCTB intermediate files.")
     parser.add_argument("--bayesr", action="store_true", help="Use BayesR backend (default is fast P+T).")
     parser.add_argument("--use-existing", action="store_true", help="Reuse existing fig1_g*_s* PLINK/TSV files; skip simulation.")
@@ -1217,12 +1294,86 @@ def main() -> None:
     _log(f"Figure1 queued {len(tasks)} generation tasks")
 
     done = []
-    with concurrent.futures.ProcessPoolExecutor(max_workers=jobs) as ex:
-        futs = [ex.submit(_run_generation_task, t) for t in tasks]
-        for fut in concurrent.futures.as_completed(futs):
-            rec = fut.result()
-            done.append(rec)
-            _log(f"Completed generation g={rec['gens']} seed={rec['seed']}")
+    mp_ctx = _choose_mp_context()
+    _log(f"Figure1 process start method: {mp_ctx.get_start_method()}")
+    ex = concurrent.futures.ProcessPoolExecutor(
+        max_workers=jobs,
+        mp_context=mp_ctx,
+        max_tasks_per_child=1,
+    )
+    pool_failed = False
+    try:
+        future_to_task = {ex.submit(_run_generation_task, t): t for t in tasks}
+        pending = set(future_to_task.keys())
+        submitted_at = {fut: time.monotonic() for fut in pending}
+        last_completion = time.monotonic()
+        task_timeout_s = max(1.0, float(args.task_timeout_s))
+        stall_timeout_s = max(1.0, float(args.pool_stall_timeout_s))
+        poll_s = max(1.0, float(args.pool_poll_s))
+
+        while pending:
+            finished, pending = concurrent.futures.wait(
+                pending,
+                timeout=poll_s,
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            now = time.monotonic()
+            if finished:
+                for fut in finished:
+                    rec = fut.result()
+                    done.append(rec)
+                    _log(f"Completed generation g={rec['gens']} seed={rec['seed']}")
+                    last_completion = now
+                continue
+
+            dead_workers = _terminated_workers(ex)
+            if dead_workers:
+                pool_failed = True
+                _shutdown_pool_hard(
+                    ex,
+                    reason=(
+                        "detected terminated worker(s): "
+                        + ", ".join([f"pid={pid},exit={code}" for pid, code in dead_workers])
+                    ),
+                )
+                raise RuntimeError(
+                    "Figure1 worker process exited unexpectedly; aborted to prevent deadlock. "
+                    f"terminated_workers={dead_workers}"
+                )
+
+            overdue = []
+            for fut in pending:
+                age_s = now - submitted_at[fut]
+                if age_s > task_timeout_s:
+                    task = future_to_task[fut]
+                    overdue.append((int(task["g"]), int(task["seed"]), age_s))
+            if overdue:
+                pool_failed = True
+                _shutdown_pool_hard(
+                    ex,
+                    reason=(
+                        "generation task timeout(s): "
+                        + ", ".join([f"g={g},seed={s},age_s={age:.1f}" for g, s, age in overdue])
+                    ),
+                )
+                raise TimeoutError(
+                    "Figure1 task timeout hit; aborted to prevent indefinite hang. "
+                    + ", ".join([f"g={g},seed={s},age_s={age:.1f}" for g, s, age in overdue])
+                )
+
+            idle_s = now - last_completion
+            if idle_s > stall_timeout_s:
+                pool_failed = True
+                _shutdown_pool_hard(
+                    ex,
+                    reason=f"no completed tasks for {idle_s:.1f}s (stall timeout={stall_timeout_s:.1f}s)",
+                )
+                raise TimeoutError(
+                    "Figure1 pool stalled with no completed tasks; "
+                    f"idle_for_s={idle_s:.1f}, stall_timeout_s={stall_timeout_s:.1f}"
+                )
+    finally:
+        ex.shutdown(wait=not pool_failed, cancel_futures=pool_failed)
 
     done = sorted(done, key=lambda x: int(x["gens"]))
     res_df = pd.concat([pd.read_csv(str(r["res_path"]), sep="\t") for r in done], ignore_index=True).sort_values(["prs_source", "method", "gens"])
