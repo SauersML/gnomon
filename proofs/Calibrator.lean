@@ -88,7 +88,7 @@ theorem integrable_poly_n (n : Nat) : MeasureTheory.Integrable (poly_n n) stdGau
     simpa [ div_eq_inv_mul ] using @this ( 1 / 2 ) ( by norm_num ) n ( by linarith )
   unfold poly_n
   unfold stdGaussianMeasure
-  simp_all +decide [ mul_comm, ProbabilityTheory.gaussianReal ]
+  simp_all +decide [ ProbabilityTheory.gaussianReal ]
   refine' MeasureTheory.Integrable.mono' _ _ _
   refine' fun x => |x ^ n|
   · refine' MeasureTheory.Integrable.abs _
@@ -122,7 +122,7 @@ theorem integrable_prod_mul {X Y : Type*} [MeasurableSpace X] [MeasurableSpace Y
     {μ : Measure X} {ν : Measure Y} [SigmaFinite μ] [SigmaFinite ν]
     (f : X → ℝ) (g : Y → ℝ) (hf : Integrable f μ) (hg : Integrable g ν) :
     Integrable (fun p : X × Y => f p.1 * g p.2) (μ.prod ν) := by
-  exact hf.prod_mul hg
+  exact hf.mul_prod hg
 
 /-!
 =================================================================
@@ -428,13 +428,13 @@ avoid threading explicit moment hypotheses (hP0, hP2, hPC0) through every theore
 /-- E[P] = 0 under the standard Gaussian. -/
 theorem gaussian_mean_zero :
     ∫ x, x ∂(ProbabilityTheory.gaussianReal 0 1) = 0 := by
-  simpa using (ProbabilityTheory.integral_id_gaussianReal (μ := (0 : ℝ)) (v := (1 : ℝ≥0)))
+  simp using (ProbabilityTheory.integral_id_gaussianReal (μ := (0 : ℝ)) (v := (1 : ℝ≥0)))
 
 /-- E[P²] = 1 under the standard Gaussian (variance = 1). -/
 theorem gaussian_second_moment :
     ∫ x, x ^ 2 ∂(ProbabilityTheory.gaussianReal 0 1) = 1 := by
   have h_var : ProbabilityTheory.variance id (ProbabilityTheory.gaussianReal 0 1) = (1 : ℝ) := by
-    simpa using (ProbabilityTheory.variance_id_gaussianReal (μ := (0 : ℝ)) (v := (1 : ℝ≥0)))
+    simp using (ProbabilityTheory.variance_id_gaussianReal (μ := (0 : ℝ)) (v := (1 : ℝ≥0)))
   have h_var_int :
       ProbabilityTheory.variance id (ProbabilityTheory.gaussianReal 0 1) =
         ∫ x, (x - ∫ t, t ∂(ProbabilityTheory.gaussianReal 0 1)) ^ 2
@@ -472,7 +472,7 @@ theorem independent_product_mean_zero {k : ℕ} [Fintype (Fin k)] (l : Fin k) :
         simpa using
           (MeasureTheory.integral_map (μ := μC) (φ := Function.eval l)
             (f := fun x : ℝ => x) h_eval_ae aestronglyMeasurable_id).symm
-      _ = 0 := by simpa [hC_map] using gaussian_mean_zero
+      _ = 0 := by simp [hC_map] using gaussian_mean_zero
   calc
     ∫ pc, pc.1 * pc.2 l ∂(stdNormalProdMeasure k)
         = ∫ pc, pc.1 * pc.2 l ∂(μP.prod μC) := by
@@ -630,7 +630,7 @@ theorem linear_noise_implies_nonlinear_slope
   dsimp [optimalSlopeLinearNoise] at h0 h1 h2
 
   -- Simplify the equations
-  simp only [mul_zero, add_zero, zero_mul, mul_one] at h0 h1
+  simp only [mul_zero, add_zero, mul_one] at h0 h1
   have h2 : beta0 + 2 * beta1 = sigma_g_sq / (sigma_g_sq + base_error + slope_error * 2) := by
     convert h2 using 1
     ring
@@ -893,7 +893,7 @@ theorem normalization_prevalence_bias {k : ℕ} [Fintype (Fin k)]
     (pdgp : PrevalenceDGP k)
     (pi_bar : ℝ)
     -- π̄ is the population-average prevalence under the training distribution
-    (h_pi_bar : pi_bar = ∫ pc, pdgp.prevalence pc.2 ∂pdgp.jointMeasure)
+    (_h_pi_bar : pi_bar = ∫ pc, pdgp.prevalence pc.2 ∂pdgp.jointMeasure)
     -- The normalized predictor uses π̄ as its intercept (ignoring ancestry-specific π)
     (f_norm : ℝ → (Fin k → ℝ) → ℝ)
     (h_norm : ∀ p c, f_norm p c = pi_bar + pdgp.pgs_effect * p) :
@@ -1466,8 +1466,8 @@ lemma rawOptimal_implies_orthogonality_gen {k sp : ℕ} [Fintype (Fin k)] [Finty
             linearPredictor model' p_val c_val = a + (b + ε) * p_val := by
           intro p_val c_val
           have h := linearPredictor_eq_affine_of_raw_gen model' h_raw' h_linear p_val c_val
-          simp only [model', ha_def, hb_def] at h
-          convert h using 2 <;> ring
+          simp only [model'] at h
+          convert h using 2; ring
 
         have h_expand_full : ∫ pc, (residual pc - ε * pc.1) ^ 2 ∂μ =
             ∫ pc, residual pc ^ 2 ∂μ - 2 * ε * ∫ pc, residual pc * pc.1 ∂μ + ε ^ 2 * ∫ pc, pc.1 ^ 2 ∂μ := by
@@ -1679,7 +1679,7 @@ lemma polynomial_spline_coeffs_unique {n : ℕ} [Fintype (Fin n)] (coeffs : Fin 
     intro x
     simpa using h_eval x
   have h_coeff : p.coeff (i.val + 1) = 0 := by
-    simpa [h_p_zero]
+    simp [h_p_zero]
   have h_coeff' : p.coeff (i.val + 1) = coeffs i := by
     classical
     have h_sum :
@@ -1733,30 +1733,30 @@ theorem l2_projection_of_additive_is_additive (k sp : ℕ) [Fintype (Fin k)] [Fi
     intros c1 c2
     have h1 : predictorBase proj c1 + predictorSlope proj c1 = f 1 + ∑ i, g i (c1 i) := by
       have h_fit1 : linearPredictor proj 1 c1 = f 1 + ∑ i, g i (c1 i) := by
-        simpa [h_fit, h_true_fn]
+        simp [h_fit, h_true_fn]
       have h_pred1 : linearPredictor proj 1 c1 = predictorBase proj c1 + predictorSlope proj c1 := by
-        simpa [h_pred]
+        simp [h_pred]
       simpa [h_pred1] using h_fit1
     have h0 : predictorBase proj c1 = f 0 + ∑ i, g i (c1 i) := by
       have h_fit0 : linearPredictor proj 0 c1 = f 0 + ∑ i, g i (c1 i) := by
-        simpa [h_fit, h_true_fn]
+        simp [h_fit, h_true_fn]
       have h_pred0 : linearPredictor proj 0 c1 = predictorBase proj c1 := by
-        simpa [h_pred]
+        simp [h_pred]
       simpa [h_pred0] using h_fit0
     have hs1 : predictorSlope proj c1 = (f 1 - f 0) := by
       linarith
 
     have h1' : predictorBase proj c2 + predictorSlope proj c2 = f 1 + ∑ i, g i (c2 i) := by
       have h_fit1 : linearPredictor proj 1 c2 = f 1 + ∑ i, g i (c2 i) := by
-        simpa [h_fit, h_true_fn]
+        simp [h_fit, h_true_fn]
       have h_pred1 : linearPredictor proj 1 c2 = predictorBase proj c2 + predictorSlope proj c2 := by
-        simpa [h_pred]
+        simp [h_pred]
       simpa [h_pred1] using h_fit1
     have h0' : predictorBase proj c2 = f 0 + ∑ i, g i (c2 i) := by
       have h_fit0 : linearPredictor proj 0 c2 = f 0 + ∑ i, g i (c2 i) := by
-        simpa [h_fit, h_true_fn]
+        simp [h_fit, h_true_fn]
       have h_pred0 : linearPredictor proj 0 c2 = predictorBase proj c2 := by
-        simpa [h_pred]
+        simp [h_pred]
       simpa [h_pred0] using h_fit0
     have hs2 : predictorSlope proj c2 = (f 1 - f 0) := by
       linarith
@@ -1857,7 +1857,7 @@ theorem prediction_causality_tradeoff_linear_general (sp : ℕ) [Fintype (Fin sp
     (_hC0 : ∫ pc, pc.2 ⟨0, by norm_num⟩ ∂dgp_env.to_dgp.jointMeasure = 0)
     (hP2 : ∫ pc, pc.1^2 ∂dgp_env.to_dgp.jointMeasure = 1)
     (hP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1) dgp_env.to_dgp.jointMeasure)
-    (hC_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.2 ⟨0, by norm_num⟩) dgp_env.to_dgp.jointMeasure)
+    (_hC_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.2 ⟨0, by norm_num⟩) dgp_env.to_dgp.jointMeasure)
     (hP2_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1 ^ 2) dgp_env.to_dgp.jointMeasure)
     (hPC_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1 * pc.2 ⟨0, by norm_num⟩) dgp_env.to_dgp.jointMeasure)
     (hY_int : Integrable (fun pc => dgp_env.to_dgp.trueExpectation pc.1 pc.2) dgp_env.to_dgp.jointMeasure)
@@ -2041,10 +2041,10 @@ noncomputable def designMatrix {n p k sp : ℕ} [Fintype (Fin n)] [Fintype (Fin 
     match j with
     | .intercept => 1
     | .pgsCoeff m =>
-        pgsBasis.B ⟨m.val + 1, by simpa using (Nat.succ_lt_succ m.isLt)⟩ (data.p i)
+        pgsBasis.B ⟨m.val + 1, by simp using (Nat.succ_lt_succ m.isLt)⟩ (data.p i)
     | .pcSpline l s => splineBasis.b s (data.c i l)
     | .interaction m l s =>
-        pgsBasis.B ⟨m.val + 1, by simpa using (Nat.succ_lt_succ m.isLt)⟩ (data.p i) *
+        pgsBasis.B ⟨m.val + 1, by simp using (Nat.succ_lt_succ m.isLt)⟩ (data.p i) *
           splineBasis.b s (data.c i l)
 
 /-- **Key Lemma**: Linear predictor equals design matrix times parameter vector.
@@ -2078,31 +2078,31 @@ lemma linearPredictor_eq_designMatrix_mulVec {n p k sp : ℕ}
             | ParamIx.interaction m0 l s => m.fₘₗ m0 l s) *
           match x with
           | ParamIx.intercept => 1
-          | ParamIx.pgsCoeff m_1 => m.pgsBasis.B ⟨m_1.val + 1, by simpa using (Nat.succ_lt_succ m_1.isLt)⟩ (data.p i)
+          | ParamIx.pgsCoeff m_1 => m.pgsBasis.B ⟨m_1.val + 1, by simp using (Nat.succ_lt_succ m_1.isLt)⟩ (data.p i)
           | ParamIx.pcSpline l s => m.pcSplineBasis.b s (data.c i l)
           | ParamIx.interaction m_1 l s =>
-              m.pgsBasis.B ⟨m_1.val + 1, by simpa using (Nat.succ_lt_succ m_1.isLt)⟩ (data.p i) *
+              m.pgsBasis.B ⟨m_1.val + 1, by simp using (Nat.succ_lt_succ m_1.isLt)⟩ (data.p i) *
                 m.pcSplineBasis.b s (data.c i l)) =
       m.γ₀₀
       + (∑ mIdx, m.pgsBasis.B
-          ⟨mIdx.val + 1, by simpa using (Nat.succ_lt_succ mIdx.isLt)⟩ (data.p i) * m.γₘ₀ mIdx
+          ⟨mIdx.val + 1, by simp using (Nat.succ_lt_succ mIdx.isLt)⟩ (data.p i) * m.γₘ₀ mIdx
         + (∑ lj : Fin k × Fin sp,
             m.pcSplineBasis.b lj.2 (data.c i lj.1) * m.f₀ₗ lj.1 lj.2
           + ∑ mlj : Fin p × Fin k × Fin sp,
               m.pgsBasis.B
-                ⟨mlj.1.val + 1, by simpa using (Nat.succ_lt_succ mlj.1.isLt)⟩ (data.p i) *
+                ⟨mlj.1.val + 1, by simp using (Nat.succ_lt_succ mlj.1.isLt)⟩ (data.p i) *
                 (m.pcSplineBasis.b mlj.2.2 (data.c i mlj.2.1) * m.fₘₗ mlj.1 mlj.2.1 mlj.2.2))) := by
     -- Convert the sum over ParamIx using the equivalence to a sum type, then split.
     let g : ParamIxSum p k sp → ℝ
       | Sum.inl _ => m.γ₀₀
       | Sum.inr (Sum.inl mIdx) =>
           m.pgsBasis.B
-            ⟨mIdx.val + 1, by simpa using (Nat.succ_lt_succ mIdx.isLt)⟩ (data.p i) * m.γₘ₀ mIdx
+            ⟨mIdx.val + 1, by simp using (Nat.succ_lt_succ mIdx.isLt)⟩ (data.p i) * m.γₘ₀ mIdx
       | Sum.inr (Sum.inr (Sum.inl (l, j))) =>
           m.pcSplineBasis.b j (data.c i l) * m.f₀ₗ l j
       | Sum.inr (Sum.inr (Sum.inr (mIdx, l, j))) =>
           m.pgsBasis.B
-            ⟨mIdx.val + 1, by simpa using (Nat.succ_lt_succ mIdx.isLt)⟩ (data.p i) *
+            ⟨mIdx.val + 1, by simp using (Nat.succ_lt_succ mIdx.isLt)⟩ (data.p i) *
             (m.pcSplineBasis.b j (data.c i l) * m.fₘₗ mIdx l j)
     have hsum' :
         (∑ x : ParamIx p k sp,
@@ -2113,10 +2113,10 @@ lemma linearPredictor_eq_designMatrix_mulVec {n p k sp : ℕ}
               | ParamIx.interaction m0 l s => m.fₘₗ m0 l s) *
             match x with
             | ParamIx.intercept => 1
-            | ParamIx.pgsCoeff m_1 => m.pgsBasis.B ⟨m_1.val + 1, by simpa using (Nat.succ_lt_succ m_1.isLt)⟩ (data.p i)
+            | ParamIx.pgsCoeff m_1 => m.pgsBasis.B ⟨m_1.val + 1, by simp using (Nat.succ_lt_succ m_1.isLt)⟩ (data.p i)
             | ParamIx.pcSpline l s => m.pcSplineBasis.b s (data.c i l)
             | ParamIx.interaction m_1 l s =>
-                m.pgsBasis.B ⟨m_1.val + 1, by simpa using (Nat.succ_lt_succ m_1.isLt)⟩ (data.p i) *
+                m.pgsBasis.B ⟨m_1.val + 1, by simp using (Nat.succ_lt_succ m_1.isLt)⟩ (data.p i) *
                   m.pcSplineBasis.b s (data.c i l)) =
           ∑ x : ParamIxSum p k sp, g x := by
       refine (Fintype.sum_equiv (ParamIx.equivSum p k sp) _ g ?_)
@@ -2135,22 +2135,22 @@ lemma linearPredictor_eq_designMatrix_mulVec {n p k sp : ℕ}
   have hsum_int :
       (∑ mIdx, ∑ l, ∑ j,
           m.pgsBasis.B
-            ⟨mIdx.val + 1, by simpa using (Nat.succ_lt_succ mIdx.isLt)⟩ (data.p i) *
+            ⟨mIdx.val + 1, by simp using (Nat.succ_lt_succ mIdx.isLt)⟩ (data.p i) *
             (m.pcSplineBasis.b j (data.c i l) * m.fₘₗ mIdx l j)) =
         ∑ mlj : Fin p × Fin k × Fin sp,
           m.pgsBasis.B
-            ⟨mlj.1.val + 1, by simpa using (Nat.succ_lt_succ mlj.1.isLt)⟩ (data.p i) *
+            ⟨mlj.1.val + 1, by simp using (Nat.succ_lt_succ mlj.1.isLt)⟩ (data.p i) *
             (m.pcSplineBasis.b mlj.2.2 (data.c i mlj.2.1) * m.fₘₗ mlj.1 mlj.2.1 mlj.2.2) := by
     classical
     -- First convert the inner (l, j) sums into a sum over pairs.
     have hsum_inner :
         (∑ mIdx, ∑ l, ∑ j,
             m.pgsBasis.B
-              ⟨mIdx.val + 1, by simpa using (Nat.succ_lt_succ mIdx.isLt)⟩ (data.p i) *
+              ⟨mIdx.val + 1, by simp using (Nat.succ_lt_succ mIdx.isLt)⟩ (data.p i) *
               (m.pcSplineBasis.b j (data.c i l) * m.fₘₗ mIdx l j)) =
           ∑ mIdx, ∑ lj : Fin k × Fin sp,
             m.pgsBasis.B
-              ⟨mIdx.val + 1, by simpa using (Nat.succ_lt_succ mIdx.isLt)⟩ (data.p i) *
+              ⟨mIdx.val + 1, by simp using (Nat.succ_lt_succ mIdx.isLt)⟩ (data.p i) *
               (m.pcSplineBasis.b lj.2 (data.c i lj.1) * m.fₘₗ mIdx lj.1 lj.2) := by
       refine Finset.sum_congr rfl ?_
       intro mIdx _
@@ -2158,44 +2158,44 @@ lemma linearPredictor_eq_designMatrix_mulVec {n p k sp : ℕ}
         (Finset.sum_product (s := Finset.univ) (t := Finset.univ)
           (f := fun lj =>
             m.pgsBasis.B
-              ⟨mIdx.val + 1, by simpa using (Nat.succ_lt_succ mIdx.isLt)⟩ (data.p i) *
+              ⟨mIdx.val + 1, by simp using (Nat.succ_lt_succ mIdx.isLt)⟩ (data.p i) *
               (m.pcSplineBasis.b lj.2 (data.c i lj.1) * m.fₘₗ mIdx lj.1 lj.2))).symm
     -- Then combine mIdx with (l, j) into a single product sum.
     calc
       (∑ mIdx, ∑ l, ∑ j,
           m.pgsBasis.B
-            ⟨mIdx.val + 1, by simpa using (Nat.succ_lt_succ mIdx.isLt)⟩ (data.p i) *
+            ⟨mIdx.val + 1, by simp using (Nat.succ_lt_succ mIdx.isLt)⟩ (data.p i) *
             (m.pcSplineBasis.b j (data.c i l) * m.fₘₗ mIdx l j))
           =
           ∑ mIdx, ∑ lj : Fin k × Fin sp,
             m.pgsBasis.B
-              ⟨mIdx.val + 1, by simpa using (Nat.succ_lt_succ mIdx.isLt)⟩ (data.p i) *
+              ⟨mIdx.val + 1, by simp using (Nat.succ_lt_succ mIdx.isLt)⟩ (data.p i) *
               (m.pcSplineBasis.b lj.2 (data.c i lj.1) * m.fₘₗ mIdx lj.1 lj.2) := hsum_inner
       _ =
           ∑ mlj : Fin p × Fin k × Fin sp,
             m.pgsBasis.B
-              ⟨mlj.1.val + 1, by simpa using (Nat.succ_lt_succ mlj.1.isLt)⟩ (data.p i) *
+              ⟨mlj.1.val + 1, by simp using (Nat.succ_lt_succ mlj.1.isLt)⟩ (data.p i) *
               (m.pcSplineBasis.b mlj.2.2 (data.c i mlj.2.1) * m.fₘₗ mlj.1 mlj.2.1 mlj.2.2) := by
           simpa using
             (Finset.sum_product (s := Finset.univ) (t := Finset.univ)
               (f := fun mlj : Fin p × (Fin k × Fin sp) =>
                 m.pgsBasis.B
-                  ⟨mlj.1.val + 1, by simpa using (Nat.succ_lt_succ mlj.1.isLt)⟩ (data.p i) *
+                  ⟨mlj.1.val + 1, by simp using (Nat.succ_lt_succ mlj.1.isLt)⟩ (data.p i) *
                   (m.pcSplineBasis.b mlj.2.2 (data.c i mlj.2.1) * m.fₘₗ mlj.1 mlj.2.1 mlj.2.2))).symm
   have hsum_lin :
       linearPredictor m (data.p i) (data.c i) =
         m.γ₀₀
         + (∑ mIdx, m.pgsBasis.B
-            ⟨mIdx.val + 1, by simpa using (Nat.succ_lt_succ mIdx.isLt)⟩ (data.p i) * m.γₘ₀ mIdx
+            ⟨mIdx.val + 1, by simp using (Nat.succ_lt_succ mIdx.isLt)⟩ (data.p i) * m.γₘ₀ mIdx
           + (∑ lj : Fin k × Fin sp,
               m.pcSplineBasis.b lj.2 (data.c i lj.1) * m.f₀ₗ lj.1 lj.2
             + ∑ mlj : Fin p × Fin k × Fin sp,
                 m.pgsBasis.B
-                  ⟨mlj.1.val + 1, by simpa using (Nat.succ_lt_succ mlj.1.isLt)⟩ (data.p i) *
+                  ⟨mlj.1.val + 1, by simp using (Nat.succ_lt_succ mlj.1.isLt)⟩ (data.p i) *
                   (m.pcSplineBasis.b mlj.2.2 (data.c i mlj.2.1) * m.fₘₗ mlj.1 mlj.2.1 mlj.2.2))) := by
     simp [linearPredictor, evalSmooth, Finset.sum_add_distrib, Finset.mul_sum, Finset.sum_mul,
-      add_mul, mul_add, mul_comm, mul_left_comm, mul_assoc]
-    simp [hsum_pc, hsum_int, mul_comm, mul_left_comm, mul_assoc]
+      add_mul, mul_add, mul_comm]
+    simp [hsum_pc, hsum_int, mul_comm]
     ring_nf
   -- Finish by expanding the design-matrix side.
   simpa [designMatrix, packParams, Matrix.mulVec, dotProduct, mul_assoc, mul_left_comm, mul_comm,
@@ -2360,7 +2360,7 @@ theorem penalty_quadratic_tendsto_proof {ι : Type*} [Fintype ι] [DecidableEq �
   -- Sphere is nonempty in the nontrivial case
   have h_sphere_nonempty : sphere.Nonempty := by
     have : 0 ≤ (1 : ℝ) := by linarith
-    simpa [sphere] using (NormedSpace.sphere_nonempty (x := (0 : ι → ℝ)) (r := (1 : ℝ))).2 this
+    simp [sphere] using (NormedSpace.sphere_nonempty (x := (0 : ι → ℝ)) (r := (1 : ℝ))).2 this
 
   -- Q attains a minimum on the sphere
   obtain ⟨v_min, hv_min_in, h_min⟩ :=
@@ -2522,8 +2522,8 @@ noncomputable def fit (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fint
                     intro i _; exact h_term i
           _ = (1 / (2 : ℝ)) * Finset.univ.sum (fun i => (X.mulVec β i) ^ 2) -
                 Finset.univ.sum (fun i => (data.y i) ^ 2) := by
-                    simp [Finset.sum_add_distrib, Finset.mul_sum, Finset.sum_mul, sub_eq_add_neg,
-                      add_comm, add_left_comm, add_assoc, mul_comm, mul_left_comm, mul_assoc]
+                    simp [Finset.sum_add_distrib, Finset.mul_sum, sub_eq_add_neg,
+                      mul_comm]
       have h_pen_nonneg :
           0 ≤ lambda * Finset.univ.sum (fun i => β i * (S.mulVec β) i) := by
         have hsum_nonneg :
@@ -2533,8 +2533,8 @@ noncomputable def fit (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fint
           have hSi : (S.mulVec β) i = s i * β i := by
             classical
             simp [S, Matrix.mulVec, dotProduct, Matrix.diagonal_apply,
-              Finset.sum_ite_eq', Finset.sum_ite_eq, mul_comm, mul_left_comm, mul_assoc]
-          cases i <;> simp [hSi, s, mul_comm, mul_left_comm, mul_assoc, mul_self_nonneg]
+              Finset.sum_ite_eq, mul_comm]
+          cases i <;> simp [hSi, s, mul_comm, mul_self_nonneg]
         exact mul_nonneg h_lambda_nonneg hsum_nonneg
       have h_scale :
           (1 / (n : ℝ)) * Finset.univ.sum (fun i => (data.y i - X.mulVec β i) ^ 2)
@@ -2553,11 +2553,11 @@ noncomputable def fit (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fint
         have h_left :
             Finset.univ.sum (fun i => (X.mulVec β i) ^ 2) =
               dotProduct (X.mulVec β) (X.mulVec β) := by
-          simp [dotProduct, pow_two, mul_comm]
+          simp [dotProduct, pow_two]
         have h_right :
             Finset.univ.sum (fun i => β i * ((Matrix.transpose X * X).mulVec β) i) =
               dotProduct β ((Matrix.transpose X * X).mulVec β) := by
-          simp [dotProduct, mul_comm]
+          simp [dotProduct]
         have h_eq :
             dotProduct β ((Matrix.transpose X * X).mulVec β) =
               dotProduct (X.mulVec β) (X.mulVec β) := by
@@ -2566,9 +2566,9 @@ noncomputable def fit (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fint
                 = dotProduct β ((Matrix.transpose X).mulVec (X.mulVec β)) := by
                     simp [Matrix.mulVec_mulVec]
             _ = dotProduct (Matrix.vecMul β (Matrix.transpose X)) (X.mulVec β) := by
-                    simpa [Matrix.dotProduct_mulVec]
+                    simp [Matrix.dotProduct_mulVec]
             _ = dotProduct (X.mulVec β) (X.mulVec β) := by
-                    simpa [Matrix.vecMul_transpose]
+                    simp [Matrix.vecMul_transpose]
         simpa [h_left, h_right] using h_eq.symm
       -- add the nonnegative penalty and rewrite the quadratic term via h_XtX
       have hL1 :
@@ -2683,8 +2683,8 @@ theorem fit_minimizes_loss (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] 
                     intro i _; exact h_term i
           _ = (1 / (2 : ℝ)) * Finset.univ.sum (fun i => (X.mulVec β i) ^ 2) -
                 Finset.univ.sum (fun i => (data.y i) ^ 2) := by
-                    simp [Finset.sum_add_distrib, Finset.mul_sum, Finset.sum_mul, sub_eq_add_neg,
-                      add_comm, add_left_comm, add_assoc, mul_comm, mul_left_comm, mul_assoc]
+                    simp [Finset.sum_add_distrib, Finset.mul_sum, sub_eq_add_neg,
+                      mul_comm]
       have h_pen_nonneg :
           0 ≤ lambda * Finset.univ.sum (fun i => β i * (S.mulVec β) i) := by
         have hsum_nonneg :
@@ -2694,8 +2694,8 @@ theorem fit_minimizes_loss (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] 
           have hSi : (S.mulVec β) i = s i * β i := by
             classical
             simp [S, Matrix.mulVec, dotProduct, Matrix.diagonal_apply,
-              Finset.sum_ite_eq', Finset.sum_ite_eq, mul_comm, mul_left_comm, mul_assoc]
-          cases i <;> simp [hSi, s, mul_comm, mul_left_comm, mul_assoc, mul_self_nonneg]
+              Finset.sum_ite_eq, mul_comm]
+          cases i <;> simp [hSi, s, mul_comm, mul_self_nonneg]
         exact mul_nonneg h_lambda_nonneg hsum_nonneg
       have h_scale :
           (1 / (n : ℝ)) * Finset.univ.sum (fun i => (data.y i - X.mulVec β i) ^ 2)
@@ -2713,11 +2713,11 @@ theorem fit_minimizes_loss (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] 
         have h_left :
             Finset.univ.sum (fun i => (X.mulVec β i) ^ 2) =
               dotProduct (X.mulVec β) (X.mulVec β) := by
-          simp [dotProduct, pow_two, mul_comm]
+          simp [dotProduct, pow_two]
         have h_right :
             Finset.univ.sum (fun i => β i * ((Matrix.transpose X * X).mulVec β) i) =
               dotProduct β ((Matrix.transpose X * X).mulVec β) := by
-          simp [dotProduct, mul_comm]
+          simp [dotProduct]
         have h_eq :
             dotProduct β ((Matrix.transpose X * X).mulVec β) =
               dotProduct (X.mulVec β) (X.mulVec β) := by
@@ -2726,9 +2726,9 @@ theorem fit_minimizes_loss (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] 
                 = dotProduct β ((Matrix.transpose X).mulVec (X.mulVec β)) := by
                     simp [Matrix.mulVec_mulVec]
             _ = dotProduct (Matrix.vecMul β (Matrix.transpose X)) (X.mulVec β) := by
-                    simpa [Matrix.dotProduct_mulVec]
+                    simp [Matrix.dotProduct_mulVec]
             _ = dotProduct (X.mulVec β) (X.mulVec β) := by
-                    simpa [Matrix.vecMul_transpose]
+                    simp [Matrix.vecMul_transpose]
         simpa [h_left, h_right] using h_eq.symm
       have hL1 :
           (1 / (n : ℝ)) * Finset.univ.sum (fun i => (data.y i - X.mulVec β i) ^ 2) +
@@ -2770,12 +2770,12 @@ theorem fit_minimizes_loss (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] 
       classical
       refine Finset.sum_congr rfl ?_
       intro i _
-      simp [pointwiseNLL, hm.dist_gaussian, Pi.sub_apply, h_lin, X]
+      simp [pointwiseNLL, hm.dist_gaussian, h_lin, X]
     have h_diag : ∀ i, (S.mulVec (packParams m)) i = s i * (packParams m) i := by
       intro i
       classical
       simp [S, Matrix.mulVec, dotProduct, Matrix.diagonal_apply,
-        Finset.sum_ite_eq', Finset.sum_ite_eq, mul_comm, mul_left_comm, mul_assoc]
+        Finset.sum_ite_eq, mul_comm]
     have h_penalty :
         Finset.univ.sum (fun i => (packParams m) i * (S.mulVec (packParams m)) i) =
           (∑ l, ∑ j, (m.f₀ₗ l j) ^ 2) +
@@ -2786,7 +2786,7 @@ theorem fit_minimizes_loss (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] 
             Finset.univ.sum (fun i => s i * (packParams m i) ^ 2) := by
         refine Finset.sum_congr rfl ?_
         intro i _
-        simp [h_diag, pow_two, mul_comm, mul_left_comm, mul_assoc]
+        simp [h_diag, pow_two, mul_comm]
       let g : ParamIxSum p k sp → ℝ
         | Sum.inl _ => 0
         | Sum.inr (Sum.inl _) => 0
@@ -2836,7 +2836,7 @@ theorem fit_minimizes_loss (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] 
             = ∑ x : ParamIxSum p k sp, g x := by simpa [hsum] using hsum'
         _ = (∑ l, ∑ j, (m.f₀ₗ l j) ^ 2) +
             (∑ mIdx, ∑ l, ∑ j, (m.fₘₗ mIdx l j) ^ 2) := by
-            simp [g, ParamIxSum, hsum_pc, hsum_int, Finset.sum_add_distrib]
+            simp [g, ParamIxSum, hsum_pc, hsum_int]
     simp [h_data, h_penalty]
   have h_emp := h_emp' m hm
   let m_fit := unpackParams pgsBasis splineBasis βmin
@@ -2989,8 +2989,8 @@ lemma gaussianPenalizedLoss_strictConvex {ι : Type*} {n : ℕ} [Fintype (Fin n)
       have hsum :
           a * (∑ i, r₁ i ^ 2) + b * (∑ i, r₂ i ^ 2) - (∑ i, r_mid i ^ 2) =
             ∑ i, (a * r₁ i ^ 2 + b * r₂ i ^ 2 - r_mid i ^ 2) := by
-        simp [Finset.sum_add_distrib, Finset.mul_sum, Finset.sum_mul, sub_eq_add_neg,
-          add_comm, add_left_comm, add_assoc]
+        simp [Finset.sum_add_distrib, Finset.mul_sum, sub_eq_add_neg,
+          add_assoc]
       have hsum' :
           a * b * (∑ i, (r₁ i - r₂ i) ^ 2) =
             ∑ i, a * b * (r₁ i - r₂ i) ^ 2 := by
@@ -3033,7 +3033,7 @@ lemma gaussianPenalizedLoss_strictConvex {ι : Type*} {n : ℕ} [Fintype (Fin n)
       have hneg_i : (X.mulVec (β₂ - β₁)) i = - (X.mulVec (β₁ - β₂)) i := by
         simpa using congrArg (fun f => f i) hneg'
       calc
-        (X.mulVec (β₂ - β₁) i) ^ 2 = (-(X.mulVec (β₁ - β₂) i)) ^ 2 := by simpa [hneg_i]
+        (X.mulVec (β₂ - β₁) i) ^ 2 = (-(X.mulVec (β₁ - β₂) i)) ^ 2 := by simp [hneg_i]
         _ = (X.mulVec (β₁ - β₂) i) ^ 2 := by ring
 
     -- Similarly for the penalty term: a·β₁ᵀSβ₁ + b·β₂ᵀSβ₂ - β_midᵀSβ_mid = a*b*(β₁-β₂)ᵀS(β₁-β₂)
@@ -3066,17 +3066,17 @@ lemma gaussianPenalizedLoss_strictConvex {ι : Type*} {n : ℕ} [Fintype (Fin n)
                 (a * ((S.mulVec β₁) i * β₁ i) +
                   b * ((S.mulVec β₂) i * β₂ i) -
                   ((S.mulVec (a • β₁ + b • β₂)) i * (a • β₁ + b • β₂) i)) := by
-                simp [Finset.sum_add_distrib, Finset.mul_sum, Finset.sum_mul, sub_eq_add_neg,
-                  add_comm, add_left_comm, add_assoc]
+                simp [Finset.sum_add_distrib, Finset.mul_sum, sub_eq_add_neg,
+                  add_assoc]
           _ = ∑ i, a * b * ((S.mulVec (β₁ - β₂)) i * (β₁ - β₂) i) := by
                 apply Finset.sum_congr rfl
                 intro i _
-                simp [Matrix.mulVec_add, Matrix.mulVec_smul, Matrix.mulVec_sub, Matrix.mulVec_neg,
+                simp [Matrix.mulVec_add, Matrix.mulVec_smul, Matrix.mulVec_neg,
                   Pi.add_apply, Pi.sub_apply, Pi.neg_apply, Pi.smul_apply, smul_eq_mul, mul_add,
                   add_mul, sub_eq_add_neg, hb']
                 ring
           _ = a * b * ∑ i, (S.mulVec (β₁ - β₂)) i * (β₁ - β₂) i := by
-                simp [Finset.mul_sum, mul_left_comm, mul_comm, mul_assoc]
+                simp [Finset.mul_sum, mul_comm, mul_assoc]
           _ = a * b * dotProduct' (S.mulVec (β₁ - β₂)) (β₁ - β₂) := by
                 rfl
       -- The RHS is ≥ 0 by PSD of S
@@ -3132,7 +3132,7 @@ lemma gaussianPenalizedLoss_strictConvex {ι : Type*} {n : ℕ} [Fintype (Fin n)
         intro h0
         have hzero : β₁ - β₂ = 0 := by
           apply h_inj
-          simpa [h0] using (X.mulVec_zero : X.mulVec (0 : ι → ℝ) = 0)
+          simp [h0] using (X.mulVec_zero : X.mulVec (0 : ι → ℝ) = 0)
         exact h_diff_ne (by simpa using hzero)
       have h_nonneg : 0 ≤ l2norm_sq (X.mulVec (β₁ - β₂)) := by
         unfold l2norm_sq
@@ -3551,8 +3551,8 @@ theorem parameter_identifiability {n p k sp : ℕ} [Fintype (Fin n)] [Fintype (F
         simpa [β₂] using h_unpack₂
       have h_m_eq : m₁ = m₂ := by
         calc
-          m₁ = unpackParams pgsBasis splineBasis β₁ := by simpa [h_unpack₁']
-          _ = unpackParams pgsBasis splineBasis β₂ := by simpa [h_eq]
+          m₁ = unpackParams pgsBasis splineBasis β₁ := by simp [h_unpack₁']
+          _ = unpackParams pgsBasis splineBasis β₂ := by simp [h_eq]
           _ = m₂ := h_unpack₂'
       exact hne h_m_eq
 
@@ -3630,7 +3630,7 @@ theorem parameter_identifiability {n p k sp : ℕ} [Fintype (Fin n)] [Fintype (F
                   exact h_linear_pc x
             _ = t * ∑ x, evalSmooth splineBasis (fun j => β₁ (ParamIx.pcSpline l j)) (data.c x l) +
                 (1 - t) * ∑ x, evalSmooth splineBasis (fun j => β₂ (ParamIx.pcSpline l j)) (data.c x l) := by
-                  simp [Finset.sum_add_distrib, Finset.mul_sum, mul_add, add_mul, mul_assoc, mul_left_comm, mul_comm]
+                  simp [Finset.sum_add_distrib, Finset.mul_sum]
             _ = 0 := by
                   simp [h₁, h₂]
 
@@ -3649,7 +3649,7 @@ theorem parameter_identifiability {n p k sp : ℕ} [Fintype (Fin n)] [Fintype (F
                   intro j _
                   ring
               _ = ∑ j, a * (c₁ j * splineBasis.b j x) + ∑ j, b * (c₂ j * splineBasis.b j x) := by
-                  simpa [Finset.sum_add_distrib]
+                  simp [Finset.sum_add_distrib]
               _ = a * ∑ j, c₁ j * splineBasis.b j x + b * ∑ j, c₂ j * splineBasis.b j x := by
                   simp [Finset.mul_sum]
 
@@ -3683,7 +3683,7 @@ theorem parameter_identifiability {n p k sp : ℕ} [Fintype (Fin n)] [Fintype (F
                   exact h_linear_int x
             _ = t * ∑ x, evalSmooth splineBasis (fun j => β₁ (ParamIx.interaction mIdx l j)) (data.c x l) +
                 (1 - t) * ∑ x, evalSmooth splineBasis (fun j => β₂ (ParamIx.interaction mIdx l j)) (data.c x l) := by
-                  simp [Finset.sum_add_distrib, Finset.mul_sum, mul_add, add_mul, mul_assoc, mul_left_comm, mul_comm]
+                  simp [Finset.sum_add_distrib, Finset.mul_sum]
             _ = 0 := by
                   simp [h₁, h₂]
     refine ⟨hm_interp, ?_⟩
@@ -3705,8 +3705,8 @@ theorem parameter_identifiability {n p k sp : ℕ} [Fintype (Fin n)] [Fintype (F
       have hmul : (S.mulVec v) i = s i * v i := by
         classical
         simp [S, Matrix.mulVec, dotProduct, Matrix.diagonal_apply,
-          Finset.sum_ite_eq', Finset.sum_ite_eq, mul_comm, mul_left_comm, mul_assoc]
-      cases i <;> simp [s, hmul, mul_comm, mul_left_comm, mul_assoc, mul_self_nonneg]
+          Finset.sum_ite_eq, mul_comm]
+      cases i <;> simp [s, hmul, mul_self_nonneg]
 
     have h_emp_eq :
         ∀ m, InModelClass m pgsBasis splineBasis →
@@ -3729,7 +3729,7 @@ theorem parameter_identifiability {n p k sp : ℕ} [Fintype (Fin n)] [Fintype (F
         intro i
         classical
         simp [S, Matrix.mulVec, dotProduct, Matrix.diagonal_apply,
-          Finset.sum_ite_eq', Finset.sum_ite_eq, mul_comm, mul_left_comm, mul_assoc]
+          Finset.sum_ite_eq, mul_comm]
       have h_penalty :
           Finset.univ.sum (fun i => (packParams m) i * (S.mulVec (packParams m)) i) =
             (∑ l, ∑ j, (m.f₀ₗ l j) ^ 2) +
@@ -3740,7 +3740,7 @@ theorem parameter_identifiability {n p k sp : ℕ} [Fintype (Fin n)] [Fintype (F
               Finset.univ.sum (fun i => s i * (packParams m i) ^ 2) := by
           refine Finset.sum_congr rfl ?_
           intro i _
-          simp [h_diag, pow_two, mul_comm, mul_left_comm, mul_assoc]
+          simp [h_diag, pow_two, mul_comm]
         let g : ParamIxSum p k sp → ℝ
           | Sum.inl _ => 0
           | Sum.inr (Sum.inl _) => 0
@@ -3789,7 +3789,7 @@ theorem parameter_identifiability {n p k sp : ℕ} [Fintype (Fin n)] [Fintype (F
             (∑ x : ParamIxSum p k sp, g x) =
               (∑ l, ∑ j, (m.f₀ₗ l j) ^ 2) +
                 (∑ mIdx, ∑ l, ∑ j, (m.fₘₗ mIdx l j) ^ 2) := by
-          simp [ParamIxSum, g, hsum_pc, hsum_int, Finset.sum_add_distrib]
+          simp [ParamIxSum, g, hsum_pc, hsum_int]
         simpa [hsum, hsum'] using hsum''
       unfold empiricalLoss gaussianPenalizedLoss
       simp [h_data, h_penalty]
@@ -4135,7 +4135,7 @@ noncomputable def dgpMultiplicativeBias {k : ℕ} [Fintype (Fin k)] (scaling_fun
     (risk of the true expectation) plus the distance from the true expectation. -/
 lemma risk_decomposition {k : ℕ} [Fintype (Fin k)]
     (dgp : DataGeneratingProcess k) (f : ℝ → (Fin k → ℝ) → ℝ)
-    (hf_int : Integrable (fun pc => (dgp.trueExpectation pc.1 pc.2 - f pc.1 pc.2)^2) dgp.jointMeasure) :
+    (_hf_int : Integrable (fun pc => (dgp.trueExpectation pc.1 pc.2 - f pc.1 pc.2)^2) dgp.jointMeasure) :
     expectedSquaredError dgp f =
     expectedSquaredError dgp dgp.trueExpectation +
     ∫ pc, (dgp.trueExpectation pc.1 pc.2 - f pc.1 pc.2)^2 ∂dgp.jointMeasure := by
@@ -4565,7 +4565,7 @@ lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n →
 
   let P_y := Submodule.orthogonalProjection K_E y_E
   have h_orth_P : y_E - (P_y : EuclideanSpace ℝ (Fin n)) ∈ K_E.orthogonal :=
-    Submodule.sub_orthogonalProjection_mem_orthogonal y_E
+    Submodule.sub_starProjection_mem_orthogonal y_E
   have h_mem_P : (P_y : EuclideanSpace ℝ (Fin n)) ∈ K_E := P_y.2
   have h_diff_mem : (P_y : EuclideanSpace ℝ (Fin n)) - p_E ∈ K_E :=
     Submodule.sub_mem K_E h_mem_P h_mem_E
@@ -4586,7 +4586,7 @@ lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n →
 
   apply iso.injective
   rw [orthogonalProjection]
-  simp only [iso.symm_apply_apply]
+  simp only
   exact h_eq_E
 set_option maxHeartbeats 10000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
@@ -4684,8 +4684,8 @@ lemma range_eq_of_two_sided_design_reparam {n m : Type} [Fintype n] [Fintype m] 
           = X'.mulVec (U.mulVec β) := by rw [Matrix.toLin'_apply]
       _ = (X' * U).mulVec β := by
         symm
-        simpa using (Matrix.mulVec_mulVec X' U β)
-      _ = X.mulVec β := by simpa [hU]
+        simp using (Matrix.mulVec_mulVec X' U β)
+      _ = X.mulVec β := by simp [hU]
       _ = Matrix.toLin' X β := by rw [Matrix.toLin'_apply]
       _ = y := hβ
   · intro y hy
@@ -4698,8 +4698,8 @@ lemma range_eq_of_two_sided_design_reparam {n m : Type} [Fintype n] [Fintype m] 
           = X.mulVec (T.mulVec β) := by rw [Matrix.toLin'_apply]
       _ = (X * T).mulVec β := by
         symm
-        simpa using (Matrix.mulVec_mulVec X T β)
-      _ = X'.mulVec β := by simpa [hT]
+        simp using (Matrix.mulVec_mulVec X T β)
+      _ = X'.mulVec β := by simp [hT]
       _ = Matrix.toLin' X' β := by rw [Matrix.toLin'_apply]
       _ = y := hβ
 
@@ -4817,7 +4817,7 @@ theorem extrapolation_error_bound_lipschitz {n k p sp : ℕ} [Fintype (Fin n)] [
 theorem context_specificity {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (dgp1 dgp2 : DGPWithEnvironment k)
     (h_same_genetics : dgp1.trueGeneticEffect = dgp2.trueGeneticEffect ∧ dgp1.to_dgp.jointMeasure = dgp2.to_dgp.jointMeasure)
     (h_diff_env : dgp1.environmentalEffect ≠ dgp2.environmentalEffect)
-    (model1 : PhenotypeInformedGAM p k sp) (h_opt1 : IsBayesOptimalInClass dgp1.to_dgp model1)
+    (model1 : PhenotypeInformedGAM p k sp) (_h_opt1 : IsBayesOptimalInClass dgp1.to_dgp model1)
     (h_repr :
       IsBayesOptimalInClass dgp2.to_dgp model1 →
         dgp1.to_dgp.trueExpectation = dgp2.to_dgp.trueExpectation) :
@@ -5687,7 +5687,7 @@ theorem sum_to_zero_after_projection
       (∑ x_1, (B * Z) x x_1 * β x_1) * W x x
           = W x x * ∑ x_1, (B * Z) x x_1 * β x_1 := by ring
       _ = ∑ x_1, W x x * ((B * Z) x x_1 * β x_1) := by
-          simpa [Finset.mul_sum]
+          simp [Finset.mul_sum]
       _ = ∑ x_1, (B * Z) x x_1 * β x_1 * W x x := by
           refine Finset.sum_congr rfl ?_
           intro x_1 _
@@ -5706,7 +5706,7 @@ theorem sum_to_zero_after_projection
               intro x _
               ring
       _ = β y * ∑ x, (B * Z) x y * W x x := by
-              simpa [Finset.mul_sum]
+              simp [Finset.mul_sum]
   simp [h_factor]
   -- Now: Σⱼ βⱼ * (Σᵢ (B*Z)ᵢⱼ * Wᵢᵢ)
 
@@ -6239,7 +6239,7 @@ lemma sigmoid_strictConcaveOn_Ici : StrictConcaveOn ℝ (Set.Ici 0) sigmoid := b
     ("calibrated probability") is strictly less than the probability at the mean score.
     i.e., The model is "over-confident" if it predicts sigmoid(E[X]).
     The true probability E[sigmoid(X)] is "shrunk" toward 0.5. -/
-  theorem calibration_shrinkage (μ : ℝ) (hμ_pos : μ > 0)
+  theorem calibration_shrinkage (μ : ℝ) (_hμ_pos : μ > 0)
       (X : Ω → ℝ) (P : Measure Ω) [IsProbabilityMeasure P]
       (h_measurable : Measurable X) (h_integrable : Integrable X P)
       (h_mean : ∫ ω, X ω ∂P = μ)
@@ -6306,7 +6306,7 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
         have h_jacobi : ∀ (M : ℝ → Matrix m m ℝ), DifferentiableAt ℝ M rho → deriv (fun rho => Matrix.det (M rho)) rho = Matrix.trace (Matrix.adjugate (M rho) * deriv M rho) := by
           intro M hM_diff
           have h_jacobi : deriv (fun rho => Matrix.det (M rho)) rho = ∑ i, ∑ j, (Matrix.adjugate (M rho)) i j * deriv (fun rho => (M rho) j i) rho := by
-            simp +decide [ Matrix.det_apply', Matrix.adjugate_apply, Matrix.mul_apply ]
+            simp +decide [ Matrix.det_apply', Matrix.adjugate_apply ]
             have h_jacobi : deriv (fun rho => ∑ σ : Equiv.Perm m, (↑(↑((Equiv.Perm.sign : Equiv.Perm m → ℤˣ) σ) : ℤ) : ℝ) * ∏ i : m, M rho ((σ : m → m) i) i) rho = ∑ σ : Equiv.Perm m, (↑(↑((Equiv.Perm.sign : Equiv.Perm m → ℤˣ) σ) : ℤ) : ℝ) * ∑ i : m, (∏ j ∈ Finset.univ.erase i, M rho ((σ : m → m) j) j) * deriv (fun rho => M rho ((σ : m → m) i) i) rho := by
               have h_jacobi : ∀ σ : Equiv.Perm m, deriv (fun rho => ∏ i : m, M rho ((σ : m → m) i) i) rho = ∑ i : m, (∏ j ∈ Finset.univ.erase i, M rho ((σ : m → m) j) j) * deriv (fun rho => M rho ((σ : m → m) i) i) rho := by
                 intro σ
@@ -6331,14 +6331,14 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
             simp +decide [ Finset.sum_mul _ _ _, Matrix.updateRow_apply ]
             rw [ Finset.sum_comm ]
             refine' Finset.sum_congr rfl fun i hi => _
-            rw [ Finset.sum_comm, Finset.sum_congr rfl ] ; intros ; simp +decide [ Finset.prod_ite, Finset.filter_ne', Finset.filter_eq' ] ; ring
-            rw [ Finset.sum_eq_single ( ( ‹Equiv.Perm m› : m → m ) i ) ] <;> simp +decide [ Finset.prod_ite, Finset.filter_ne', Finset.filter_eq' ] ; ring
-            intro j hj; simp +decide [ Pi.single_apply, hj ]
-            rw [ Finset.prod_eq_zero_iff.mpr ] <;> simp +decide [ hj ]
+            rw [ Finset.sum_comm, Finset.sum_congr rfl ] ; intros ; simp +decide [ Finset.prod_ite ] ; ring
+            rw [ Finset.sum_eq_single ( ( ‹Equiv.Perm m› : m → m ) i ) ] <;> simp +decide [ Finset.filter_ne', Finset.filter_eq' ] ; ring
+            intro j hj; simp +decide [ Pi.single_apply ]
+            rw [ Finset.prod_eq_zero_iff.mpr ] <;> simp +decide
             exact ⟨ ( ‹Equiv.Perm m›.symm j ), by simp +decide, by simpa [ Equiv.symm_apply_eq ] using hj ⟩
           rw [ h_jacobi, Matrix.trace ]
           rw [ deriv_pi ]
-          · simp +decide [ Matrix.mul_apply, Finset.mul_sum _ _ _ ]
+          · simp +decide [ Matrix.mul_apply ]
             refine' Finset.sum_congr rfl fun i _ => Finset.sum_congr rfl fun j _ => _
             rw [ deriv_pi ]
             intro i; exact (by
@@ -6346,13 +6346,13 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
           · exact fun i => DifferentiableAt.comp rho ( differentiableAt_pi.1 hM_diff i ) differentiableAt_id
         apply h_jacobi
         exact differentiableAt_pi.2 fun i => differentiableAt_pi.2 fun j => DifferentiableAt.add ( differentiableAt_const _ ) ( DifferentiableAt.smul ( Real.differentiableAt_exp ) ( differentiableAt_const _ ) )
-      simp_all +decide [ Matrix.inv_def, mul_assoc, mul_left_comm, mul_comm, Matrix.trace_mul_comm ( Matrix.adjugate _ ) ]
+      simp_all +decide [ Matrix.inv_def, mul_left_comm, mul_comm, Matrix.trace_mul_comm ( Matrix.adjugate _ ) ]
       rw [ show deriv ( fun rho => A + Real.exp rho • B ) rho = Real.exp rho • B from ?_ ]
-      · by_cases h : Matrix.det ( A + Real.exp rho • B ) = 0 <;> simp_all +decide [ Matrix.trace_smul, mul_assoc, mul_comm, mul_left_comm ]
+      · by_cases h : Matrix.det ( A + Real.exp rho • B ) = 0 <;> simp_all +decide [ Matrix.trace_smul, mul_comm ]
         exact False.elim <| h_inv h
       · rw [ deriv_pi ] <;> norm_num [ Real.differentiableAt_exp, mul_comm ]
         ext i; rw [ deriv_pi ] <;> norm_num [ Real.differentiableAt_exp, mul_comm ]
-    by_cases h_det : DifferentiableAt ℝ ( fun rho => Matrix.det ( A + Real.exp rho • B ) ) rho <;> simp_all +decide [ Real.exp_ne_zero, mul_assoc, mul_comm, mul_left_comm ]
+    by_cases h_det : DifferentiableAt ℝ ( fun rho => Matrix.det ( A + Real.exp rho • B ) ) rho <;> simp_all +decide [ mul_comm ]
     · convert HasDerivAt.deriv ( HasDerivAt.log ( h_det.hasDerivAt ) h_inv ) using 1 ; ring!
       exact eq_div_of_mul_eq ( by aesop ) ( by linear_combination' h_det_step1.symm )
     · contrapose! h_det
@@ -6389,7 +6389,7 @@ noncomputable def rust_correction_fn (S_basis : Fin k → Matrix (Fin p) (Fin p)
   let dV_dbeta := (fun b_val => 0.5 * Real.log (Matrix.det (Hessian_fn S_basis X W rho b_val)))
   trace ((grad_op dV_dbeta b).transpose * delta)
 
-noncomputable def rust_direct_gradient_fn (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ) (X : Matrix (Fin n) (Fin p) ℝ) (W : Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin n) (Fin n) ℝ) (beta_hat : (Fin k → ℝ) → Matrix (Fin p) (Fin 1) ℝ) (log_lik : Matrix (Fin p) (Fin 1) ℝ → ℝ) (rho : Fin k → ℝ) (i : Fin k) : ℝ :=
+noncomputable def rust_direct_gradient_fn (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ) (X : Matrix (Fin n) (Fin p) ℝ) (W : Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin n) (Fin n) ℝ) (beta_hat : (Fin k → ℝ) → Matrix (Fin p) (Fin 1) ℝ) (_log_lik : Matrix (Fin p) (Fin 1) ℝ → ℝ) (rho : Fin k → ℝ) (i : Fin k) : ℝ :=
   let b := beta_hat rho
   let H := Hessian_fn S_basis X W rho b
   let S := S_lambda_fn S_basis rho
@@ -6421,7 +6421,7 @@ theorem rust_delta_correctness
     -(Hessian_fn S_basis X W rho (beta_hat rho))⁻¹ *
     ((Real.exp (rho i) • S_basis i) * beta_hat rho) := by
   unfold rust_delta_fn
-  simp only [neg_mul, Matrix.smul_mul]
+  simp only [Matrix.smul_mul]
 
 /-- Structural verification: `laml_gradient_validity`
 
@@ -6451,7 +6451,7 @@ theorem laml_gradient_validity
     -- 3. Gradient wrt beta matches the term used in rust_correction_fn
     --    Note: rust_correction_fn uses `grad_op dV_dbeta`.
     --    Optimality of beta implies grad(L_pen) = 0, so grad(LAML) = grad(0.5 log det H).
-    (h_grad_beta : HasGradientAt (fun b => LAML_fn log_lik S_basis X W (fun _ => b) rho)
+    (_h_grad_beta : HasGradientAt (fun b => LAML_fn log_lik S_basis X W (fun _ => b) rho)
                                  (grad_op (fun b_val => 0.5 * Real.log (Matrix.det (Hessian_fn S_basis X W rho b_val))) (beta_hat rho))
                                  (beta_hat rho))
     -- 4. Chain rule holds for the total derivative
