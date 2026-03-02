@@ -93,8 +93,8 @@ theorem integrable_poly_n (n : Nat) : MeasureTheory.Integrable (poly_n n) stdGau
   refine' fun x => |x ^ n|
   · refine' MeasureTheory.Integrable.abs _
     rw [ MeasureTheory.integrable_withDensity_iff ]
-    · convert h_gauss_integral n |> fun h => h.div_const ( Real.sqrt ( 2 * Real.pi ) ) using 2 ; norm_num [ ProbabilityTheory.gaussianPDF ] ; ring
-      norm_num [ ProbabilityTheory.gaussianPDFReal ] ; ring
+    · convert h_gauss_integral n |> fun h => h.div_const ( Real.sqrt ( 2 * Real.pi ) ) using 2 ; norm_num [ ProbabilityTheory.gaussianPDF ] ; ring_nf
+      norm_num [ ProbabilityTheory.gaussianPDFReal ] ; ring_nf
       rw [ ENNReal.toReal_ofReal ( Real.exp_nonneg _ ) ]
     · fun_prop
     · simp [ProbabilityTheory.gaussianPDF]
@@ -6349,8 +6349,8 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
             simp +decide [ Finset.sum_mul _ _ _, Matrix.updateRow_apply ]
             rw [ Finset.sum_comm ]
             refine' Finset.sum_congr rfl fun i hi => _
-            rw [ Finset.sum_comm, Finset.sum_congr rfl ] ; intros ; simp +decide [ Finset.prod_ite, Finset.filter_ne', Finset.filter_eq' ] ; ring
-            rw [ Finset.sum_eq_single ( ( ‹Equiv.Perm m› : m → m ) i ) ] <;> simp +decide [ Finset.prod_ite, Finset.filter_ne', Finset.filter_eq' ] ; ring
+            rw [ Finset.sum_comm, Finset.sum_congr rfl ] ; intros ; simp +decide [ Finset.prod_ite, Finset.filter_ne', Finset.filter_eq' ] ; ring_nf
+            rw [ Finset.sum_eq_single ( ( ‹Equiv.Perm m› : m → m ) i ) ] <;> simp +decide [ Finset.prod_ite, Finset.filter_ne', Finset.filter_eq' ] ; ring_nf
             intro j hj; simp +decide [ Pi.single_apply, hj ]
             rw [ Finset.prod_eq_zero_iff.mpr ] <;> simp +decide [ hj ]
             exact ⟨ ( ‹Equiv.Perm m›.symm j ), by simp +decide, by simpa [ Equiv.symm_apply_eq ] using hj ⟩
@@ -6371,7 +6371,7 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
       · rw [ deriv_pi ] <;> norm_num [ Real.differentiableAt_exp, mul_comm ]
         ext i; rw [ deriv_pi ] <;> norm_num [ Real.differentiableAt_exp, mul_comm ]
     by_cases h_det : DifferentiableAt ℝ ( fun rho => Matrix.det ( A + Real.exp rho • B ) ) rho <;> simp_all +decide [ Real.exp_ne_zero, mul_assoc, mul_comm, mul_left_comm ]
-    · convert HasDerivAt.deriv ( HasDerivAt.log ( h_det.hasDerivAt ) h_inv ) using 1 ; ring!
+    · convert HasDerivAt.deriv ( HasDerivAt.log ( h_det.hasDerivAt ) h_inv ) using 1 ; ring_nf!
       exact eq_div_of_mul_eq ( by aesop ) ( by linear_combination' h_det_step1.symm )
     · contrapose! h_det
       simp +decide [ Matrix.det_apply' ]
@@ -6429,7 +6429,7 @@ noncomputable def rust_correction_fn (S_basis : Fin k → Matrix (Fin p) (Fin p)
   let dV_dbeta := (fun b_val => 0.5 * Real.log (Matrix.det (Hessian_fn S_basis X W rho b_val)))
   ((grad_op dV_dbeta b).transpose * delta).trace
 
-noncomputable def rust_direct_gradient_fn (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ) (X : Matrix (Fin n) (Fin p) ℝ) (W : Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin n) (Fin n) ℝ) (beta_hat : (Fin k → ℝ) → Matrix (Fin p) (Fin 1) ℝ) (log_lik : Matrix (Fin p) (Fin 1) ℝ → ℝ) (rho : Fin k → ℝ) (i : Fin k) : ℝ :=
+noncomputable def rust_direct_gradient_fn (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ) (X : Matrix (Fin n) (Fin p) ℝ) (W : Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin n) (Fin n) ℝ) (beta_hat : (Fin k → ℝ) → Matrix (Fin p) (Fin 1) ℝ) (_log_lik : Matrix (Fin p) (Fin 1) ℝ → ℝ) (rho : Fin k → ℝ) (i : Fin k) : ℝ :=
   let b := beta_hat rho
   let H := Hessian_fn S_basis X W rho b
   let H_inv := matrixInvAlg H
@@ -6617,7 +6617,7 @@ theorem laml_gradient_validity
     -- 3. Gradient wrt beta matches the term used in rust_correction_fn
     --    Note: rust_correction_fn uses `grad_op dV_dbeta`.
     --    Optimality of beta implies grad(L_pen) = 0, so grad(LAML) = grad(0.5 log det H).
-    (h_grad_beta : HasGradientAt (fun b => LAML_fn log_lik S_basis X W (fun _ => b) rho)
+    (_h_grad_beta : HasGradientAt (fun b => LAML_fn log_lik S_basis X W (fun _ => b) rho)
                                  (grad_op (fun b_val => 0.5 * Real.log (Matrix.det (Hessian_fn S_basis X W rho b_val))) (beta_hat rho))
                                  (beta_hat rho))
     -- 4. Chain rule holds for the total derivative
