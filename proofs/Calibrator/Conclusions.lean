@@ -1304,40 +1304,73 @@ theorem strict_brierBayesRisk_of_proper_margin {Z : Type*} [MeasurableSpace Z] (
 /-- Abstract strictness schema for Bayes risk using closure separation:
 if the truth is representable up to closure in `Fbig` but not in closure of `Fsmall`,
 then Bayes risk over `Fbig` is strictly smaller than over `Fsmall`. -/
-axiom BayesRisk_strict_of_truth_in_closure_not_in_baseline_closure
+theorem BayesRisk_strict_of_truth_in_closure_not_in_baseline_closure
     {α : Type*} [TopologicalSpace α]
-    (R : α → ℝ) (truth : α) (Fsmall Fbig : Set α) :
+    (R : α → ℝ) (truth : α) (Fsmall Fbig : Set α)
+    (h_cont : Continuous R)
+    (h_achieved : ∃ a ∈ closure Fsmall, BayesRisk R Fsmall = R a) :
     truth ∈ closure Fbig →
     truth ∉ closure Fsmall →
     BddBelow (R '' Fbig) →
     (R '' Fsmall).Nonempty →
     (∀ a, 0 ≤ R a - R truth) →
     (∀ a, a ∈ closure Fsmall → a ≠ truth → 0 < R a - R truth) →
-    BayesRisk R Fbig < BayesRisk R Fsmall
+    BayesRisk R Fbig < BayesRisk R Fsmall := by
+  intro h_truth_in_big h_truth_notin_small h_bdd_big _h_small_nonempty h_min h_strict
+  rcases h_achieved with ⟨a, ha, h_eq⟩
+  have ha_neq : a ≠ truth := by
+    intro h
+    subst h
+    exact h_truth_notin_small ha
+  have h_strict_a := h_strict a ha ha_neq
+  rw [h_eq]
+  have h_inf_le_truth : BayesRisk R Fbig ≤ R truth := by
+    have h_truth_image : R truth ∈ R '' closure Fbig := ⟨truth, h_truth_in_big, rfl⟩
+    have h1 : R '' closure Fbig ⊆ closure (R '' Fbig) := image_closure_subset_closure_image h_cont
+    have h_in_closure : R truth ∈ closure (R '' Fbig) := h1 h_truth_image
+    have h2 : closure (R '' Fbig) ⊆ {x | BayesRisk R Fbig ≤ x} := by
+      apply closure_minimal
+      · intro x hx
+        exact csInf_le h_bdd_big hx
+      · exact isClosed_Ici
+    exact h2 h_in_closure
+  linarith
 
 /-- Log-loss closure strictness specialization. -/
-axiom logBayesRisk_strict_of_eta_in_closure_not_in_baseline_closure
+theorem logBayesRisk_strict_of_eta_in_closure_not_in_baseline_closure
     {Z : Type*} [MeasurableSpace Z] [TopologicalSpace (ProbPredictor Z)]
-    (μ : Measure Z) (η : ProbPredictor Z) (Fbase Ffull : Set (ProbPredictor Z)) :
+    (μ : Measure Z) (η : ProbPredictor Z) (Fbase Ffull : Set (ProbPredictor Z))
+    (h_cont : Continuous (logRisk μ η))
+    (h_achieved : ∃ a ∈ closure Fbase, logBayesRisk μ η Fbase = logRisk μ η a) :
     η ∈ closure Ffull →
     η ∉ closure Fbase →
     BddBelow ((logRisk μ η) '' Ffull) →
     ((logRisk μ η) '' Fbase).Nonempty →
     (∀ q, 0 ≤ logRisk μ η q - logRisk μ η η) →
     (∀ q, q ∈ closure Fbase → q ≠ η → 0 < logRisk μ η q - logRisk μ η η) →
-    logBayesRisk μ η Ffull < logBayesRisk μ η Fbase
+    logBayesRisk μ η Ffull < logBayesRisk μ η Fbase := by
+  intro h_in_full h_notin_base h_bdd h_nonempty h_min h_strict
+  exact BayesRisk_strict_of_truth_in_closure_not_in_baseline_closure
+    (logRisk μ η) η Fbase Ffull h_cont h_achieved
+    h_in_full h_notin_base h_bdd h_nonempty h_min h_strict
 
 /-- Brier-loss closure strictness specialization. -/
-axiom brierBayesRisk_strict_of_eta_in_closure_not_in_baseline_closure
+theorem brierBayesRisk_strict_of_eta_in_closure_not_in_baseline_closure
     {Z : Type*} [MeasurableSpace Z] [TopologicalSpace (ProbPredictor Z)]
-    (μ : Measure Z) (η : ProbPredictor Z) (Fbase Ffull : Set (ProbPredictor Z)) :
+    (μ : Measure Z) (η : ProbPredictor Z) (Fbase Ffull : Set (ProbPredictor Z))
+    (h_cont : Continuous (brierRisk μ η))
+    (h_achieved : ∃ a ∈ closure Fbase, brierBayesRisk μ η Fbase = brierRisk μ η a) :
     η ∈ closure Ffull →
     η ∉ closure Fbase →
     BddBelow ((brierRisk μ η) '' Ffull) →
     ((brierRisk μ η) '' Fbase).Nonempty →
     (∀ q, 0 ≤ brierRisk μ η q - brierRisk μ η η) →
     (∀ q, q ∈ closure Fbase → q ≠ η → 0 < brierRisk μ η q - brierRisk μ η η) →
-    brierBayesRisk μ η Ffull < brierBayesRisk μ η Fbase
+    brierBayesRisk μ η Ffull < brierBayesRisk μ η Fbase := by
+  intro h_in_full h_notin_base h_bdd h_nonempty h_min h_strict
+  exact BayesRisk_strict_of_truth_in_closure_not_in_baseline_closure
+    (brierRisk μ η) η Fbase Ffull h_cont h_achieved
+    h_in_full h_notin_base h_bdd h_nonempty h_min h_strict
 
 end OracleAndRegret
 
