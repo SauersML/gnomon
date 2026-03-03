@@ -3,3 +3,48 @@ import Calibrator.DGP
 import Calibrator.Models
 import Calibrator.Conclusions
 import Calibrator.PortabilityDrift
+
+
+namespace Calibrator.DGP
+
+/-- If the demographic lower bound is available and strictly positive, covariance mismatch is strict. -/
+theorem covariance_mismatch_pos_of_fst_and_sparse_array_proved
+    {t : ℕ}
+    (sigmaSource sigmaTarget : Matrix (Fin t) (Fin t) ℝ)
+    (fstSource fstTarget recombRate arraySparsity kappa : ℝ)
+    (h_cov_lb :
+      demographicCovarianceGapLowerBound fstSource fstTarget recombRate arraySparsity kappa
+        ≤ frobeniusNormSq (sigmaSource - sigmaTarget))
+    (h_fst : fstSource < fstTarget)
+    (h_recomb_pos : 0 < recombRate)
+    (h_sparse_pos : 0 < arraySparsity)
+    (h_kappa_pos : 0 < kappa) :
+    0 < frobeniusNormSq (sigmaSource - sigmaTarget) := by
+  have h_scale_pos : 0 < taggingMismatchScale recombRate arraySparsity := by
+    unfold taggingMismatchScale
+    exact mul_pos h_recomb_pos h_sparse_pos
+  have h_delta_pos : 0 < fstTarget - fstSource := sub_pos.mpr h_fst
+  have h_lb_pos :
+      0 < demographicCovarianceGapLowerBound fstSource fstTarget recombRate arraySparsity kappa := by
+    unfold demographicCovarianceGapLowerBound
+    exact mul_pos (mul_pos h_kappa_pos h_scale_pos) h_delta_pos
+  exact lt_of_lt_of_le h_lb_pos h_cov_lb
+
+/-- Convenience corollary using the Wright–Fisher demographic bound. -/
+theorem covariance_mismatch_pos_of_fst_and_sparse_array_wf_proved
+    {t : ℕ}
+    (sigmaSource sigmaTarget : Matrix (Fin t) (Fin t) ℝ)
+    (fstSource fstTarget recombRate arraySparsity kappa : ℝ)
+    (h_wf_lb: demographicCovarianceGapLowerBound fstSource fstTarget recombRate arraySparsity kappa
+      ≤ frobeniusNormSq (sigmaSource - sigmaTarget))
+    (h_fst : fstSource < fstTarget)
+    (h_recomb_pos : 0 < recombRate)
+    (h_sparse_pos : 0 < arraySparsity)
+    (h_kappa_pos : 0 < kappa) :
+    0 < frobeniusNormSq (sigmaSource - sigmaTarget) := by
+  exact covariance_mismatch_pos_of_fst_and_sparse_array_proved
+    sigmaSource sigmaTarget fstSource fstTarget recombRate arraySparsity kappa
+    h_wf_lb
+    h_fst h_recomb_pos h_sparse_pos h_kappa_pos
+
+end Calibrator.DGP
