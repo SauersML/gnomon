@@ -1,0 +1,209 @@
+diff --git a/proofs/Calibrator.lean b/proofs/Calibrator.lean
+index 6a66c93..a7a0fef 100644
+--- a/proofs/Calibrator.lean
++++ b/proofs/Calibrator.lean
+@@ -3,3 +3,204 @@ import Calibrator.DGP
+ import Calibrator.Models
+ import Calibrator.Conclusions
+ import Calibrator.PortabilityDrift
++
++
++namespace Calibrator
++
++theorem l2_projection_of_additive_is_additive_proved (k sp : ℕ) [Fintype (Fin k)] [Fintype (Fin sp)] {f : ℝ → ℝ} {g : Fin k → ℝ → ℝ} {dgp : DataGeneratingProcess k}
++  (h_true_fn : dgp.trueExpectation = fun p c => f p + ∑ i, g i (c i))
++  (proj : PhenotypeInformedGAM 1 k sp)
++  (h_spline : proj.pcSplineBasis = polynomialSplineBasis sp)
++  (h_pgs : proj.pgsBasis = linearPGSBasis)
++  (h_fit : ∀ p c, linearPredictor proj p c = dgp.trueExpectation p c) :
++  IsNormalizedScoreModel proj := by
++  -- Use decomposition
++  have h_lin : proj.pgsBasis.B 1 = id := by rw [h_pgs]; rfl
++  have h_pred : ∀ p c, linearPredictor proj p c = predictorBase proj c + predictorSlope proj c * p :=
++    linearPredictor_decomp proj h_lin
++
++  -- Show slope is constant
++  have h_slope_const : ∀ c1 c2, predictorSlope proj c1 = predictorSlope proj c2 := by
++    intros c1 c2
++    have h1 : predictorBase proj c1 + predictorSlope proj c1 = f 1 + ∑ i, g i (c1 i) := by
++      have h_fit1 : linearPredictor proj 1 c1 = f 1 + ∑ i, g i (c1 i) := by
++        simpa [h_fit, h_true_fn]
++      have h_pred1 : linearPredictor proj 1 c1 = predictorBase proj c1 + predictorSlope proj c1 := by
++        simpa [h_pred]
++      simpa [h_pred1] using h_fit1
++    have h0 : predictorBase proj c1 = f 0 + ∑ i, g i (c1 i) := by
++      have h_fit0 : linearPredictor proj 0 c1 = f 0 + ∑ i, g i (c1 i) := by
++        simpa [h_fit, h_true_fn]
++      have h_pred0 : linearPredictor proj 0 c1 = predictorBase proj c1 := by
++        simpa [h_pred]
++      simpa [h_pred0] using h_fit0
++    have hs1 : predictorSlope proj c1 = (f 1 - f 0) := by
++      linarith
++
++    have h1' : predictorBase proj c2 + predictorSlope proj c2 = f 1 + ∑ i, g i (c2 i) := by
++      have h_fit1 : linearPredictor proj 1 c2 = f 1 + ∑ i, g i (c2 i) := by
++        simpa [h_fit, h_true_fn]
++      have h_pred1 : linearPredictor proj 1 c2 = predictorBase proj c2 + predictorSlope proj c2 := by
++        simpa [h_pred]
++      simpa [h_pred1] using h_fit1
++    have h0' : predictorBase proj c2 = f 0 + ∑ i, g i (c2 i) := by
++      have h_fit0 : linearPredictor proj 0 c2 = f 0 + ∑ i, g i (c2 i) := by
++        simpa [h_fit, h_true_fn]
++      have h_pred0 : linearPredictor proj 0 c2 = predictorBase proj c2 := by
++        simpa [h_pred]
++      simpa [h_pred0] using h_fit0
++    have hs2 : predictorSlope proj c2 = (f 1 - f 0) := by
++      linarith
++    rw [hs1, hs2]
++
++  unfold predictorSlope at h_slope_const
++
++  constructor
++  intro i l s
++  have hi : i = 0 := by apply Subsingleton.elim
++  subst hi
++
++  have h_S_zero_at_zero : ∀ l, evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 l) 0 = 0 := by
++    intro l
++    rw [h_spline]
++    simp [evalSmooth, polynomialSplineBasis]
++
++  have h_Sl_zero : ∀ x, ∑ s, (proj.fₘₗ 0 l) s * x ^ (s.val + 1) = 0 := by
++    intro x
++    let c : Fin k → ℝ := fun j => if j = l then x else 0
++    have h_eq := h_slope_const c (fun _ => 0)
++    have h_sum_c' : ∑ j, evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 j) (c j) = evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 l) (c l) := by
++      classical
++      have h_sum_c'' :
++          (Finset.sum (s:=Finset.univ)
++            (f:=fun j => evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 j) (c j)) : ℝ) =
++            evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 l) (c l) := by
++        refine (Finset.sum_eq_single (s:=Finset.univ)
++          (f:=fun j => evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 j) (c j)) l ?_ ?_)
++        · intro j _ h_ne
++          have h_cj : c j = 0 := by simp [c, h_ne]
++          simp [h_cj, h_S_zero_at_zero]
++        · intro h_not_mem
++          exfalso; exact h_not_mem (Finset.mem_univ l)
++      simpa using h_sum_c''
++    have h_sum_c : ∑ j, evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 j) (c j) = evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 l) x := by
++      simpa [c] using h_sum_c'
++    have h_sum_0 : ∑ j, evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 j) 0 = 0 := by
++      classical
++      have h_sum_0' :
++          (Finset.sum (s:=Finset.univ)
++            (f:=fun j => evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 j) 0) : ℝ) = 0 := by
++        refine (Finset.sum_eq_zero (s:=Finset.univ)
++          (f:=fun j => evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 j) 0) ?_)
++        intro j _
++        simpa using h_S_zero_at_zero j
++      simpa using h_sum_0'
++    have h_eq' : evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 l) x = 0 := by
++      have h_eq' := congrArg (fun t => t - proj.γₘ₀ 0) h_eq
++      calc
++        evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 l) x
++            = ∑ j, evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 j) (c j) := by
++              symm; exact h_sum_c
++        _ = ∑ j, evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 j) 0 := by
++              simpa using h_eq'
++        _ = 0 := h_sum_0
++    have h_eq'' : ∑ s, (proj.fₘₗ 0 l) s * x ^ (s.val + 1) = 0 := by
++      simpa [h_spline, evalSmooth, polynomialSplineBasis] using h_eq'
++    exact h_eq''
++
++  have h_poly := polynomial_spline_coeffs_unique (proj.fₘₗ 0 l) h_Sl_zero s
++  exact h_poly
++
++theorem independence_implies_no_interaction_proved (k sp : ℕ) [Fintype (Fin k)] [Fintype (Fin sp)] (dgp : DataGeneratingProcess k)
++    (h_additive : ∃ (f : ℝ → ℝ) (g : Fin k → ℝ → ℝ), dgp.trueExpectation = fun p c => f p + ∑ i, g i (c i))
++    (m : PhenotypeInformedGAM 1 k sp)
++    (h_spline : m.pcSplineBasis = polynomialSplineBasis sp)
++    (h_pgs : m.pgsBasis = linearPGSBasis)
++    (h_fit : ∀ p c, linearPredictor m p c = dgp.trueExpectation p c) :
++    IsNormalizedScoreModel m := by
++  rcases h_additive with ⟨f, g, h_fn_struct⟩
++  exact l2_projection_of_additive_is_additive_proved k sp h_fn_struct m h_spline h_pgs h_fit
++
++theorem prediction_is_invariant_to_affine_pc_transform_rigorous_proved {n k p sp : ℕ}
++    (A : Matrix (Fin k) (Fin k) ℝ) (_hA : IsUnit A.det) (b : Fin k → ℝ)
++    (data : RealizedData n k) (lambda : ℝ)
++    (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp)
++    (data' : RealizedData n k)
++    (h_data' : data' = { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b })
++    (h_n_pos : n > 0) (h_lambda_nonneg : 0 ≤ lambda)
++    (h_lambda_zero : lambda = 0)
++    (h_rank : Matrix.rank (designMatrix data pgsBasis splineBasis) = Fintype.card (ParamIx p k sp))
++    (h_reparam_fwd :
++      ∃ T : Matrix (ParamIx p k sp) (ParamIx p k sp) ℝ,
++        designMatrix data' pgsBasis splineBasis = designMatrix data pgsBasis splineBasis * T)
++    (h_reparam_bwd :
++      ∃ U : Matrix (ParamIx p k sp) (ParamIx p k sp) ℝ,
++        designMatrix data pgsBasis splineBasis = designMatrix data' pgsBasis splineBasis * U) :
++  let model := fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
++  let model_prime := fit p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
++      let X := designMatrix data pgsBasis splineBasis
++      let X' := designMatrix data' pgsBasis splineBasis
++      have h_range_eq : LinearMap.range (Matrix.toLin' X) = LinearMap.range (Matrix.toLin' X') := by
++        exact range_eq_of_two_sided_design_reparam X X' h_reparam_fwd h_reparam_bwd
++      have h_rank_eq : X.rank = X'.rank := by
++        exact rank_eq_of_range_eq X X' h_range_eq
++      rw [← h_rank_eq]
++      exact h_rank
++  )
++  ∀ (i : Fin n),
++      linearPredictor model (data.p i) (data.c i) =
++      linearPredictor model_prime (data'.p i) (data'.c i) := by
++  intro model model_prime i
++  let X := designMatrix data pgsBasis splineBasis
++  let X' := designMatrix data' pgsBasis splineBasis
++  let K := LinearMap.range (Matrix.toLin' X)
++  let K' := LinearMap.range (Matrix.toLin' X')
++
++  have h_range_eq : LinearMap.range (Matrix.toLin' X) = LinearMap.range (Matrix.toLin' X') := by
++    exact range_eq_of_two_sided_design_reparam X X' h_reparam_fwd h_reparam_bwd
++
++  have h_pred := fit_gives_projection_linear data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_lambda_zero h_rank
++
++  have h_rank' : Matrix.rank X' = Fintype.card (ParamIx p k sp) := by
++    rw [← rank_eq_of_range_eq X X' h_range_eq]
++    exact h_rank
++
++  have h_pred' := fit_gives_projection_linear data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_lambda_zero h_rank'
++
++  have h_K_eq : K = K' := h_range_eq
++  have h_y_eq : data.y = data'.y := by rw [h_data']
++
++  change _ = orthogonalProjection K data.y at h_pred
++  change _ = orthogonalProjection K' data'.y at h_pred'
++
++  rw [h_K_eq] at h_pred
++  rw [← h_y_eq] at h_pred'
++
++  have h_vec_eq : (fun i => linearPredictor model (data.p i) (data.c i)) = (fun i => linearPredictor model_prime (data'.p i) (data'.c i)) := by
++    rw [h_pred, h_pred']
++
++  exact congr_fun h_vec_eq i
++
++theorem context_specificity_proved {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (dgp1 dgp2 : DGPWithEnvironment k)
++    (h_same_genetics : dgp1.trueGeneticEffect = dgp2.trueGeneticEffect ∧ dgp1.to_dgp.jointMeasure = dgp2.to_dgp.jointMeasure)
++    (h_diff_env : dgp1.environmentalEffect ≠ dgp2.environmentalEffect)
++    (model1 : PhenotypeInformedGAM p k sp)
++    (h_realizable1 : ∀ p c, linearPredictor model1 p c = dgp1.to_dgp.trueExpectation p c)
++    (h_realizable2_impl : IsBayesOptimalInClass dgp2.to_dgp model1 → ∀ p c, linearPredictor model1 p c = dgp2.to_dgp.trueExpectation p c) :
++  ¬ IsBayesOptimalInClass dgp2.to_dgp model1 := by
++  intro h_opt2
++  have h_realizable2 := h_realizable2_impl h_opt2
++  have h_neq : dgp1.to_dgp.trueExpectation ≠ dgp2.to_dgp.trueExpectation := by
++    intro h_eq_fn
++    rw [dgp1.is_additive_causal, dgp2.is_additive_causal, h_same_genetics.1] at h_eq_fn
++    have : dgp1.environmentalEffect = dgp2.environmentalEffect := by
++      ext c
++      have := congr_fun (congr_fun h_eq_fn 0) c
++      simp at this; exact this
++    exact h_diff_env this
++  have h_eq : dgp1.to_dgp.trueExpectation = dgp2.to_dgp.trueExpectation := by
++    funext p c
++    rw [← h_realizable1 p c, h_realizable2 p c]
++  exact h_neq h_eq
++
++end Calibrator
