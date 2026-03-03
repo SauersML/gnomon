@@ -1,0 +1,102 @@
+diff --git a/proofs/Calibrator/Conclusions.lean b/proofs/Calibrator/Conclusions.lean
+index 1d1c7dd..aee29e0 100644
+--- a/proofs/Calibrator/Conclusions.lean
++++ b/proofs/Calibrator/Conclusions.lean
+@@ -1304,40 +1304,70 @@ theorem strict_brierBayesRisk_of_proper_margin {Z : Type*} [MeasurableSpace Z] (
+ /-- Abstract strictness schema for Bayes risk using closure separation:
+ if the truth is representable up to closure in `Fbig` but not in closure of `Fsmall`,
+ then Bayes risk over `Fbig` is strictly smaller than over `Fsmall`. -/
+-axiom BayesRisk_strict_of_truth_in_closure_not_in_baseline_closure
++theorem BayesRisk_strict_of_truth_in_closure_not_in_baseline_closure
+     {α : Type*} [TopologicalSpace α]
+-    (R : α → ℝ) (truth : α) (Fsmall Fbig : Set α) :
+-    truth ∈ closure Fbig →
+-    truth ∉ closure Fsmall →
+-    BddBelow (R '' Fbig) →
+-    (R '' Fsmall).Nonempty →
+-    (∀ a, 0 ≤ R a - R truth) →
+-    (∀ a, a ∈ closure Fsmall → a ≠ truth → 0 < R a - R truth) →
+-    BayesRisk R Fbig < BayesRisk R Fsmall
++    (R : α → ℝ) (truth : α) (Fsmall Fbig : Set α)
++    (h_truth_big : truth ∈ closure Fbig)
++    (h_truth_small : truth ∉ closure Fsmall)
++    (h_bdd : BddBelow (R '' Fbig))
++    (h_nonempty : (R '' Fsmall).Nonempty)
++    (h_cont : Continuous R)
++    (h_attains : ∃ a ∈ closure Fsmall, BayesRisk R Fsmall = R a)
++    (h_pos : ∀ a, 0 ≤ R a - R truth)
++    (h_pos_strict : ∀ a, a ∈ closure Fsmall → a ≠ truth → 0 < R a - R truth) :
++    BayesRisk R Fbig < BayesRisk R Fsmall := by
++  unfold BayesRisk oracleRisk
++  unfold BayesRisk oracleRisk at h_attains
++  rcases h_attains with ⟨a_star, ha_star, heq⟩
++  have h_ne : a_star ≠ truth := by
++    intro heq_a
++    subst heq_a
++    exact h_truth_small ha_star
++  have h_gap : 0 < R a_star - R truth := h_pos_strict a_star ha_star h_ne
++  have h_inf_big : sInf (R '' Fbig) ≤ R truth := by
++    have h_sub : R '' Fbig ⊆ Set.Ici (sInf (R '' Fbig)) := fun x hx => csInf_le h_bdd hx
++    have h_closed : IsClosed (Set.Ici (sInf (R '' Fbig))) := isClosed_Ici
++    have h_truth_mem_closure : R truth ∈ closure (R '' Fbig) :=
++      h_cont.continuousWithinAt.mem_closure_image h_truth_big
++    have h_truth_mem_Ici : R truth ∈ Set.Ici (sInf (R '' Fbig)) :=
++      closure_minimal h_sub h_closed h_truth_mem_closure
++    exact h_truth_mem_Ici
++  have h_gap2 : R truth < R a_star := by linarith
++  have h_inf_big_lt : sInf (R '' Fbig) < R a_star := by linarith
++  rw [heq]
++  exact h_inf_big_lt
+ 
+ /-- Log-loss closure strictness specialization. -/
+-axiom logBayesRisk_strict_of_eta_in_closure_not_in_baseline_closure
++theorem logBayesRisk_strict_of_eta_in_closure_not_in_baseline_closure
+     {Z : Type*} [MeasurableSpace Z] [TopologicalSpace (ProbPredictor Z)]
+-    (μ : Measure Z) (η : ProbPredictor Z) (Fbase Ffull : Set (ProbPredictor Z)) :
+-    η ∈ closure Ffull →
+-    η ∉ closure Fbase →
+-    BddBelow ((logRisk μ η) '' Ffull) →
+-    ((logRisk μ η) '' Fbase).Nonempty →
+-    (∀ q, 0 ≤ logRisk μ η q - logRisk μ η η) →
+-    (∀ q, q ∈ closure Fbase → q ≠ η → 0 < logRisk μ η q - logRisk μ η η) →
+-    logBayesRisk μ η Ffull < logBayesRisk μ η Fbase
++    (μ : Measure Z) (η : ProbPredictor Z) (Fbase Ffull : Set (ProbPredictor Z))
++    (h_eta_mem_full : η ∈ closure Ffull)
++    (h_eta_not_mem_base : η ∉ closure Fbase)
++    (h_bdd_full : BddBelow ((logRisk μ η) '' Ffull))
++    (h_nonempty_base : ((logRisk μ η) '' Fbase).Nonempty)
++    (h_cont : Continuous (logRisk μ η))
++    (h_attains : ∃ a ∈ closure Fbase, logBayesRisk μ η Fbase = logRisk μ η a)
++    (h_pos : ∀ q, 0 ≤ logRisk μ η q - logRisk μ η η)
++    (h_pos_strict : ∀ q, q ∈ closure Fbase → q ≠ η → 0 < logRisk μ η q - logRisk μ η η) :
++    logBayesRisk μ η Ffull < logBayesRisk μ η Fbase := by
++  exact BayesRisk_strict_of_truth_in_closure_not_in_baseline_closure (logRisk μ η) η Fbase Ffull
++    h_eta_mem_full h_eta_not_mem_base h_bdd_full h_nonempty_base h_cont h_attains h_pos h_pos_strict
+ 
+ /-- Brier-loss closure strictness specialization. -/
+-axiom brierBayesRisk_strict_of_eta_in_closure_not_in_baseline_closure
++theorem brierBayesRisk_strict_of_eta_in_closure_not_in_baseline_closure
+     {Z : Type*} [MeasurableSpace Z] [TopologicalSpace (ProbPredictor Z)]
+-    (μ : Measure Z) (η : ProbPredictor Z) (Fbase Ffull : Set (ProbPredictor Z)) :
+-    η ∈ closure Ffull →
+-    η ∉ closure Fbase →
+-    BddBelow ((brierRisk μ η) '' Ffull) →
+-    ((brierRisk μ η) '' Fbase).Nonempty →
+-    (∀ q, 0 ≤ brierRisk μ η q - brierRisk μ η η) →
+-    (∀ q, q ∈ closure Fbase → q ≠ η → 0 < brierRisk μ η q - brierRisk μ η η) →
+-    brierBayesRisk μ η Ffull < brierBayesRisk μ η Fbase
++    (μ : Measure Z) (η : ProbPredictor Z) (Fbase Ffull : Set (ProbPredictor Z))
++    (h_eta_mem_full : η ∈ closure Ffull)
++    (h_eta_not_mem_base : η ∉ closure Fbase)
++    (h_bdd_full : BddBelow ((brierRisk μ η) '' Ffull))
++    (h_nonempty_base : ((brierRisk μ η) '' Fbase).Nonempty)
++    (h_cont : Continuous (brierRisk μ η))
++    (h_attains : ∃ a ∈ closure Fbase, brierBayesRisk μ η Fbase = brierRisk μ η a)
++    (h_pos : ∀ q, 0 ≤ brierRisk μ η q - brierRisk μ η η)
++    (h_pos_strict : ∀ q, q ∈ closure Fbase → q ≠ η → 0 < brierRisk μ η q - brierRisk μ η η) :
++    brierBayesRisk μ η Ffull < brierBayesRisk μ η Fbase := by
++  exact BayesRisk_strict_of_truth_in_closure_not_in_baseline_closure (brierRisk μ η) η Fbase Ffull
++    h_eta_mem_full h_eta_not_mem_base h_bdd_full h_nonempty_base h_cont h_attains h_pos h_pos_strict
+ 
+ end OracleAndRegret
+ 
