@@ -517,7 +517,25 @@ This is the key analytic fact driving the classical slogan. -/
 theorem demesCorrectionFactor_tendsto_one :
     Filter.Tendsto (fun n : ℕ => demesCorrectionFactor n)
       Filter.atTop (nhds 1) := by
-  sorry -- Standard: (n/(n-1))² → 1 as n → ∞
+  have h_eq : ∀ᶠ n in Filter.atTop, demesCorrectionFactor n = (1 / (1 - (n : ℝ)⁻¹)) ^ 2 := by
+    filter_upwards [Filter.eventually_gt_atTop 1] with n hn
+    have hn_neq_0 : (n : ℝ) ≠ 0 := by positivity
+    unfold demesCorrectionFactor
+    calc ((n : ℝ) ^ 2) / (((n : ℝ) - 1) ^ 2)
+      _ = ((n : ℝ) / ((n : ℝ) - 1)) ^ 2 := by rw [div_pow]
+      _ = (1 / (((n : ℝ) - 1) / (n : ℝ))) ^ 2 := by rw [one_div, inv_div]
+      _ = (1 / ((n : ℝ) / (n : ℝ) - 1 / (n : ℝ))) ^ 2 := by rw [sub_div]
+      _ = (1 / (1 - 1 / (n : ℝ))) ^ 2 := by rw [div_self hn_neq_0]
+      _ = (1 / (1 - (n : ℝ)⁻¹)) ^ 2 := by rw [one_div]
+  apply Filter.Tendsto.congr' h_eq
+  have h_inv : Filter.Tendsto (fun n : ℕ => (n : ℝ)⁻¹) Filter.atTop (nhds 0) := tendsto_inv_nat_cast_atTop_nhds_0
+  have h_sub : Filter.Tendsto (fun n : ℕ => 1 - (n : ℝ)⁻¹) Filter.atTop (nhds (1 - 0)) := Filter.Tendsto.sub tendsto_const_nhds h_inv
+  rw [sub_zero] at h_sub
+  have h_div : Filter.Tendsto (fun n : ℕ => 1 / (1 - (n : ℝ)⁻¹)) Filter.atTop (nhds (1 / 1)) := Filter.Tendsto.div tendsto_const_nhds h_sub (by norm_num)
+  rw [div_one] at h_div
+  have h_pow : Filter.Tendsto (fun n : ℕ => (1 / (1 - (n : ℝ)⁻¹)) ^ 2) Filter.atTop (nhds (1 ^ 2)) := Filter.Tendsto.pow h_div 2
+  rw [one_pow] at h_pow
+  exact h_pow
 
 /-- Many-deme limit form for fixed `M ≥ 0` and zero mutation:
 `1/(1 + M · n²/(n-1)²) → 1/(1+M)` as `n → ∞`.
@@ -528,7 +546,13 @@ theorem WilkinsonHerbots_fstGlobal_manyDeme_limit (M : ℝ) (hM : 0 ≤ M) :
       (fun n : ℕ => (1 : ℝ) / (1 + M * demesCorrectionFactor n))
       Filter.atTop
       (nhds (1 / (1 + M))) := by
-  sorry -- Follows from demesCorrectionFactor_tendsto_one and continuity of 1/(1+M·x)
+  have h_mul : Filter.Tendsto (fun n : ℕ => M * demesCorrectionFactor n) Filter.atTop (nhds (M * 1)) :=
+    Filter.Tendsto.mul tendsto_const_nhds demesCorrectionFactor_tendsto_one
+  rw [mul_one] at h_mul
+  have h_add : Filter.Tendsto (fun n : ℕ => 1 + M * demesCorrectionFactor n) Filter.atTop (nhds (1 + M)) :=
+    Filter.Tendsto.add tendsto_const_nhds h_mul
+  have h_denom_ne_0 : 1 + M ≠ 0 := by linarith
+  exact Filter.Tendsto.div tendsto_const_nhds h_add h_denom_ne_0
 
 /-- Classical population-genetics slogan as a corollary limit theorem:
 under the structured coalescent with `M = 4Nₑm`, zero mutation, and many demes,
@@ -717,15 +741,21 @@ Satisfies `λ₂ < λ₁ < 0` for all `M ≥ 0`. -/
 noncomputable def twoDemeIMEigenvalue2 (M : ℝ) : ℝ :=
   (-(1 + 2 * M) - Real.sqrt (twoDemeIMGeneratorDiscriminant M)) / 2
 
-/-- Both eigenvalues are negative for `M ≥ 0`. -/
-theorem twoDemeIMEigenvalues_neg (M : ℝ) (hM : 0 ≤ M) :
+/-- Both eigenvalues are non-positive for `M ≥ 0`, strictly negative for `M > 0`.
+    Here we show they are strictly negative under the assumption `0 < M`. -/
+theorem twoDemeIMEigenvalues_neg (M : ℝ) (hM : 0 < M) :
     twoDemeIMEigenvalue1 M < 0 ∧ twoDemeIMEigenvalue2 M < 0 := by
   constructor
-  · -- λ₁ < 0 iff √(1+4M²) < 1+2M, iff 1+4M² < (1+2M)² = 1+4M+4M², iff 0 < 4M
-    unfold twoDemeIMEigenvalue1
-    sorry -- Follows from 1+2M > √(1+4M²) for M > 0; at M=0, λ₁ = 0 needs care
-  · unfold twoDemeIMEigenvalue2
-    have hsqrt_pos := Real.sqrt_nonneg (twoDemeIMGeneratorDiscriminant M)
+  · unfold twoDemeIMEigenvalue1 twoDemeIMGeneratorDiscriminant
+    have h_sqrt : Real.sqrt (1 + 4 * M ^ 2) < 1 + 2 * M := by
+      have h_pos : 0 ≤ 1 + 2 * M := by positivity
+      rw [Real.sqrt_lt h_pos]
+      calc 1 + 4 * M ^ 2
+        _ < 1 + 4 * M + 4 * M ^ 2 := by linarith
+        _ = (1 + 2 * M) ^ 2 := by ring
+    linarith
+  · unfold twoDemeIMEigenvalue2 twoDemeIMGeneratorDiscriminant
+    have hsqrt_pos := Real.sqrt_nonneg (1 + 4 * M ^ 2)
     linarith
 
 /-- Explicit inverse of the 2×2 IM generator:
@@ -753,10 +783,12 @@ theorem twoDemeIMGeneratorInv_eq_explicit (M : ℝ) (hM : M ≠ 0) :
   have hunit : IsUnit (twoDemeIMGeneratorMatrix M) := by
     rw [Matrix.isUnit_iff_isUnit_det, twoDemeIMGeneratorMatrix_det]
     exact isUnit_iff_ne_zero.mpr hM
-  exact Matrix.inv_eq_right_inv (twoDemeIMGeneratorInvExplicit_mul_right M hM)
-    |>.symm |> fun _ => by
-      rw [← Matrix.nonsing_inv_eq_inv_of_isUnit _ hunit]
-      sorry -- Matrix.nonsing_inv uniqueness; provable but Mathlib API is version-dependent
+  have h_inv : (twoDemeIMGeneratorMatrix M)⁻¹ * twoDemeIMGeneratorMatrix M * twoDemeIMGeneratorInvExplicit M = (twoDemeIMGeneratorMatrix M)⁻¹ * 1 := by
+    rw [twoDemeIMGeneratorInvExplicit_mul_right M hM]
+  have h_left_inv : (twoDemeIMGeneratorMatrix M)⁻¹ * twoDemeIMGeneratorMatrix M = 1 := by
+    apply Matrix.inv_mul_of_isUnit hunit
+  rw [h_left_inv, Matrix.one_mul, Matrix.mul_one] at h_inv
+  exact h_inv.symm
 
 /-! #### Fundamental Matrix-Exponential Integral Identity -/
 
