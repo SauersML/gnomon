@@ -3,3 +3,51 @@ import Calibrator.DGP
 import Calibrator.Models
 import Calibrator.Conclusions
 import Calibrator.PortabilityDrift
+
+namespace Calibrator
+
+/-- Convenience corollary using the Wright–Fisher demographic bound directly as a local hypothesis instead of an axiom. -/
+theorem covariance_mismatch_pos_of_fst_and_sparse_array_wf_proved
+    {t : ℕ}
+    (sigmaSource sigmaTarget : Matrix (Fin t) (Fin t) ℝ)
+    (fstSource fstTarget recombRate arraySparsity kappa : ℝ)
+    (h_axiom : demographicCovarianceGapLowerBound fstSource fstTarget recombRate arraySparsity kappa
+      ≤ frobeniusNormSq (sigmaSource - sigmaTarget))
+    (h_fst : fstSource < fstTarget)
+    (h_recomb_pos : 0 < recombRate)
+    (h_sparse_pos : 0 < arraySparsity)
+    (h_kappa_pos : 0 < kappa) :
+    0 < frobeniusNormSq (sigmaSource - sigmaTarget) := by
+  exact covariance_mismatch_pos_of_fst_and_sparse_array
+    sigmaSource sigmaTarget fstSource fstTarget recombRate arraySparsity kappa
+    h_axiom
+    h_fst h_recomb_pos h_sparse_pos h_kappa_pos
+
+/-- End-to-end portability drop from demography + sparse tagging (proved version):
+`F_ST` divergence and sparse arrays force `R²_target < R²_source` once mismatch lifts MSE. -/
+theorem target_r2_drop_of_fst_and_sparse_array_proved
+    {t : ℕ}
+    (mseSource mseTarget varY lam : ℝ)
+    (sigmaSource sigmaTarget : Matrix (Fin t) (Fin t) ℝ)
+    (fstSource fstTarget recombRate arraySparsity kappa : ℝ)
+    (h_mse_gap_lb :
+      lam * frobeniusNormSq (sigmaSource - sigmaTarget) ≤ mseTarget - mseSource)
+    (h_cov_lb :
+      demographicCovarianceGapLowerBound fstSource fstTarget recombRate arraySparsity kappa
+        ≤ frobeniusNormSq (sigmaSource - sigmaTarget))
+    (h_lam_pos : 0 < lam)
+    (h_varY_pos : 0 < varY)
+    (h_fst : fstSource < fstTarget)
+    (h_recomb_pos : 0 < recombRate)
+    (h_sparse_pos : 0 < arraySparsity)
+    (h_kappa_pos : 0 < kappa) :
+    r2FromMSE mseTarget varY < r2FromMSE mseSource varY := by
+  have h_mismatch : 0 < frobeniusNormSq (sigmaSource - sigmaTarget) :=
+    covariance_mismatch_pos_of_fst_and_sparse_array_wf_proved
+      sigmaSource sigmaTarget fstSource fstTarget recombRate arraySparsity kappa
+      h_cov_lb h_fst h_recomb_pos h_sparse_pos h_kappa_pos
+  exact target_r2_strictly_decreases_of_covariance_mismatch
+    mseSource mseTarget varY lam sigmaSource sigmaTarget
+    h_mse_gap_lb h_lam_pos h_mismatch h_varY_pos
+
+end Calibrator
