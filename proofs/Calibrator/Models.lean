@@ -1195,7 +1195,7 @@ def MaternRkhsEffect {X : Type*} [MeasurableSpace X]
     (sd : SobolevData X) (md : MaternSpectralData X) (ν κ B : ℝ) (f : X → ℝ) : Prop :=
   Measurable f ∧ InMaternRKHS md ν κ f ∧ maternRkhsNorm md ν κ f ≤ B ∧ (∫ x, f x ∂sd.pi) = 0
 
-/-- Norm-equivalence axiom package connecting Matérn-RKHS and Sobolev norms. -/
+/-- Norm-equivalence assumption bundle connecting Matérn-RKHS and Sobolev norms. -/
 structure MaternSobolevNormEquiv {X : Type*} [MeasurableSpace X]
     (sd : SobolevData X) (md : MaternSpectralData X) (s ν κ : ℝ) where
   cLower : ℝ
