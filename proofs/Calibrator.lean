@@ -3,3 +3,59 @@ import Calibrator.DGP
 import Calibrator.Models
 import Calibrator.Conclusions
 import Calibrator.PortabilityDrift
+
+
+namespace Calibrator
+section NoAxioms
+variable {t : ℕ}
+
+/-- If the demographic lower bound is available and strictly positive, covariance mismatch is strict. -/
+theorem covariance_mismatch_pos_of_fst_and_sparse_array_proved
+    (sigmaSource sigmaTarget : Matrix (Fin t) (Fin t) ℝ)
+    (fstSource fstTarget recombRate arraySparsity kappa : ℝ)
+    (h_cov_lb :
+      demographicCovarianceGapLowerBound fstSource fstTarget recombRate arraySparsity kappa
+        ≤ frobeniusNormSq (sigmaSource - sigmaTarget))
+    (h_fst : fstSource < fstTarget)
+    (h_recomb_pos : 0 < recombRate)
+    (h_sparse_pos : 0 < arraySparsity)
+    (h_kappa_pos : 0 < kappa) :
+    0 < frobeniusNormSq (sigmaSource - sigmaTarget) := by
+  have h_scale_pos : 0 < taggingMismatchScale recombRate arraySparsity := by
+    unfold taggingMismatchScale
+    exact mul_pos h_recomb_pos h_sparse_pos
+  have h_delta_pos : 0 < fstTarget - fstSource := sub_pos.mpr h_fst
+  have h_lb_pos :
+      0 < demographicCovarianceGapLowerBound fstSource fstTarget recombRate arraySparsity kappa := by
+    unfold demographicCovarianceGapLowerBound
+    exact mul_pos (mul_pos h_kappa_pos h_scale_pos) h_delta_pos
+  exact lt_of_lt_of_le h_lb_pos h_cov_lb
+
+/-- End-to-end portability drop from demography + sparse tagging:
+`F_ST` divergence and sparse arrays force `R²_target < R²_source` once mismatch lifts MSE. -/
+theorem target_r2_drop_of_fst_and_sparse_array_proved
+    (mseSource mseTarget varY lam : ℝ)
+    (sigmaSource sigmaTarget : Matrix (Fin t) (Fin t) ℝ)
+    (fstSource fstTarget recombRate arraySparsity kappa : ℝ)
+    (h_mse_gap_lb :
+      lam * frobeniusNormSq (sigmaSource - sigmaTarget) ≤ mseTarget - mseSource)
+    (h_cov_lb :
+      demographicCovarianceGapLowerBound fstSource fstTarget recombRate arraySparsity kappa
+        ≤ frobeniusNormSq (sigmaSource - sigmaTarget))
+    (h_lam_pos : 0 < lam)
+    (h_varY_pos : 0 < varY)
+    (h_fst : fstSource < fstTarget)
+    (h_recomb_pos : 0 < recombRate)
+    (h_sparse_pos : 0 < arraySparsity)
+    (h_kappa_pos : 0 < kappa) :
+    r2FromMSE mseTarget varY < r2FromMSE mseSource varY := by
+  have h_mismatch : 0 < frobeniusNormSq (sigmaSource - sigmaTarget) :=
+    covariance_mismatch_pos_of_fst_and_sparse_array_proved
+      sigmaSource sigmaTarget fstSource fstTarget recombRate arraySparsity kappa
+      h_cov_lb h_fst h_recomb_pos h_sparse_pos h_kappa_pos
+  exact target_r2_strictly_decreases_of_covariance_mismatch
+    mseSource mseTarget varY lam sigmaSource sigmaTarget
+    h_mse_gap_lb h_lam_pos h_mismatch h_varY_pos
+
+end NoAxioms
+end Calibrator
