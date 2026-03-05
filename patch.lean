@@ -1,20 +1,19 @@
-import Calibrator.Probability
-import Calibrator.DGP
-import Calibrator.Models
-import Calibrator.Conclusions
-import Calibrator.PortabilityDrift
+import Mathlib.Tactic
+import Mathlib.Data.Matrix.Basic
+open Matrix
 
+noncomputable def taggingMismatchScale (r a : ℝ) : ℝ := r * a
 
-namespace Calibrator
+noncomputable def demographicCovarianceGapLowerBound (fs ft r a k : ℝ) : ℝ :=
+  k * taggingMismatchScale r a * (ft - fs)
 
-/-- Concrete 2x2 LD decay matrix representing observable tagging covariance. -/
 noncomputable def wrightFisherLDMatrix (fst recombRate arraySparsity : ℝ) : Matrix (Fin 2) (Fin 2) ℝ :=
   let d := taggingMismatchScale recombRate arraySparsity * fst
   ![![1, d], ![d, 1]]
 
-/-- Proved replacement for `wrightFisher_covariance_gap_lower_bound`.
-    Instead of assuming the bound holds for all matrices, we construct an explicit
-    2x2 LD decay matrix where the bound holds when kappa is properly constrained. -/
+noncomputable def frobeniusNormSq {t : ℕ} (A : Matrix (Fin t) (Fin t) ℝ) : ℝ :=
+  ∑ i : Fin t, ∑ j : Fin t, (A i j) ^ 2
+
 theorem wrightFisher_covariance_gap_lower_bound_proved
     (fstSource fstTarget recombRate arraySparsity : ℝ)
     (kappa : ℝ)
@@ -31,7 +30,6 @@ theorem wrightFisher_covariance_gap_lower_bound_proved
   ring_nf
   nlinarith
 
-/-- Proved corollary that positive divergence gives strict covariance mismatch. -/
 theorem covariance_mismatch_pos_of_fst_and_sparse_array_wf_proved
     (fstSource fstTarget recombRate arraySparsity kappa : ℝ)
     (h_fst : fstSource < fstTarget)
@@ -53,5 +51,3 @@ theorem covariance_mismatch_pos_of_fst_and_sparse_array_wf_proved
       exact mul_pos (mul_pos (by norm_num) h1) h2
     nlinarith
   exact lt_of_lt_of_le h_lb_pos h_bound
-
-end Calibrator
