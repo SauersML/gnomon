@@ -53,4 +53,54 @@ theorem covariance_mismatch_pos_of_fst_and_sparse_array_wf_proved
     (wrightFisher_covariance_gap_lower_bound_proved fstSource fstTarget recombRate arraySparsity rS rT h_delta)
     h_fst h_recomb_pos h_sparse_pos h_kappa_pos
 
+
+/-- Rigorous proof of expected absolute mean shift without using the AssumesRandomWalkDrift specification gaming. -/
+theorem expected_abs_mean_shift_bound_proved
+    (V_A fstS fstT : ℝ)
+    (hVA_pos : 0 < V_A)
+    (hfst_sum_nonneg : 0 ≤ fstS + fstT)
+    (hfstS_lt_one : fstS < 1) :
+    Expected_Abs_Shift V_A fstS fstT / Real.sqrt (presentDayPGSVariance V_A fstS) =
+      2 * Real.sqrt ((fstS + fstT) / (Real.pi * (1 - fstS))) := by
+  unfold Expected_Abs_Shift Var_Delta_Mu presentDayPGSVariance
+  have h1 : Real.sqrt (2 * (fstS + fstT) * V_A) = Real.sqrt (2 * (fstS + fstT)) * Real.sqrt V_A := by
+    have h_nonneg : 0 ≤ 2 * (fstS + fstT) := mul_nonneg (by norm_num) hfst_sum_nonneg
+    apply Real.sqrt_mul h_nonneg
+  have h2 : Real.sqrt ((1 - fstS) * V_A) = Real.sqrt (1 - fstS) * Real.sqrt V_A := by
+    have h1_sub_fstS_pos : 0 ≤ 1 - fstS := by linarith
+    apply Real.sqrt_mul h1_sub_fstS_pos
+  rw [h1, h2]
+  have h_sqrt_VA_ne_zero : Real.sqrt V_A ≠ 0 := Real.sqrt_ne_zero'.mpr hVA_pos
+  have h_div : (Real.sqrt (2 * (fstS + fstT)) * Real.sqrt V_A * Real.sqrt (2 / Real.pi)) / (Real.sqrt (1 - fstS) * Real.sqrt V_A) =
+               (Real.sqrt (2 * (fstS + fstT)) * Real.sqrt (2 / Real.pi)) / Real.sqrt (1 - fstS) := by
+    calc (Real.sqrt (2 * (fstS + fstT)) * Real.sqrt V_A * Real.sqrt (2 / Real.pi)) / (Real.sqrt (1 - fstS) * Real.sqrt V_A)
+      _ = (Real.sqrt (2 * (fstS + fstT)) * Real.sqrt (2 / Real.pi) * Real.sqrt V_A) / (Real.sqrt (1 - fstS) * Real.sqrt V_A) := by
+        congr 1
+        ring
+      _ = (Real.sqrt (2 * (fstS + fstT)) * Real.sqrt (2 / Real.pi)) / Real.sqrt (1 - fstS) := by
+        rw [mul_div_mul_right _ _ h_sqrt_VA_ne_zero]
+  rw [h_div]
+
+  have h3 : Real.sqrt (2 * (fstS + fstT)) * Real.sqrt (2 / Real.pi) = Real.sqrt (4 * (fstS + fstT) / Real.pi) := by
+    have h_nonneg : 0 ≤ 2 * (fstS + fstT) := mul_nonneg (by norm_num) hfst_sum_nonneg
+    rw [← Real.sqrt_mul h_nonneg]
+    congr 1
+    ring
+  rw [h3]
+  have h4 : Real.sqrt (4 * (fstS + fstT) / Real.pi) / Real.sqrt (1 - fstS) = Real.sqrt ((4 * (fstS + fstT) / Real.pi) / (1 - fstS)) := by
+    have hpos : 0 ≤ 4 * (fstS + fstT) / Real.pi := by
+      apply div_nonneg
+      · linarith
+      · exact Real.pi_pos.le
+    rw [← Real.sqrt_div hpos]
+  rw [h4]
+  have h5 : (4 * (fstS + fstT) / Real.pi) / (1 - fstS) = 4 * ((fstS + fstT) / (Real.pi * (1 - fstS))) := by
+    calc (4 * (fstS + fstT) / Real.pi) / (1 - fstS) = (4 * (fstS + fstT)) / (Real.pi * (1 - fstS)) := by rw [div_div]
+      _ = 4 * ((fstS + fstT) / (Real.pi * (1 - fstS))) := by ring
+  rw [h5]
+  have hpos2 : (0:ℝ) ≤ 4 := by norm_num
+  rw [Real.sqrt_mul hpos2]
+  have h6 : Real.sqrt 4 = 2 := by norm_num
+  rw [h6]
+
 end Calibrator
