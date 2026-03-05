@@ -53,4 +53,31 @@ theorem covariance_mismatch_pos_of_fst_and_sparse_array_wf_proved
     (wrightFisher_covariance_gap_lower_bound_proved fstSource fstTarget recombRate arraySparsity rS rT h_delta)
     h_fst h_recomb_pos h_sparse_pos h_kappa_pos
 
+
+/-- End-to-end portability drop proved corollary. -/
+theorem target_r2_drop_of_fst_and_sparse_array_wf_proved
+    (mseSource mseTarget varY lam : ℝ)
+    (fstSource fstTarget recombRate arraySparsity : ℝ)
+    (rS rT : ℝ)
+    (h_delta : fstTarget - fstSource = (rS - rT)^2)
+    (h_mse_gap_lb :
+      lam * frobeniusNormSq (ldMatrix rS - ldMatrix rT) ≤ mseTarget - mseSource)
+    (h_lam_pos : 0 < lam)
+    (h_varY_pos : 0 < varY)
+    (h_fst : fstSource < fstTarget)
+    (h_recomb_pos : 0 < recombRate)
+    (h_sparse_pos : 0 < arraySparsity) :
+    r2FromMSE mseTarget varY < r2FromMSE mseSource varY := by
+  let kappa := 2 / (recombRate * arraySparsity)
+  have h_kappa_pos : 0 < kappa := by
+    apply div_pos
+    · exact zero_lt_two
+    · exact mul_pos h_recomb_pos h_sparse_pos
+  exact target_r2_drop_of_fst_and_sparse_array
+    mseSource mseTarget varY lam (ldMatrix rS) (ldMatrix rT)
+    fstSource fstTarget recombRate arraySparsity kappa
+    h_mse_gap_lb
+    (wrightFisher_covariance_gap_lower_bound_proved fstSource fstTarget recombRate arraySparsity rS rT h_delta)
+    h_lam_pos h_varY_pos h_fst h_recomb_pos h_sparse_pos h_kappa_pos
+
 end Calibrator
