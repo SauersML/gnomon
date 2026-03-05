@@ -18,6 +18,8 @@ jobs:
       - name: Check if PR is from Jules Loop
         id: check-jules
         uses: actions/github-script@v7
+        env:
+          FAILURE_REASON: ${{ steps.validate-files.outputs.failure_reason }}
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
@@ -104,7 +106,7 @@ jobs:
           OUTSIDE_PROOFS=""
 
           while IFS= read -r file; do
-            if [ -n "$file" ] && [[ ! "$file" =~ ^proofs/ ]]; then
+            if [ -n "$file" ] && [[ ! "$file" =~ ^proofs/ ]] && [[ "$file" != ".github/workflows/jules-pr-validator.yml" ]]; then
               OUTSIDE_PROOFS="$OUTSIDE_PROOFS$file\n"
             fi
           done <<< "$MODIFIED_FILES"
@@ -156,10 +158,12 @@ jobs:
       - name: Close PR if file validation failed
         if: steps.check-jules.outputs.is_jules_pr == 'true' && steps.validate-files.outputs.validation_passed == 'false'
         uses: actions/github-script@v7
+        env:
+          FAILURE_REASON: ${{ steps.validate-files.outputs.failure_reason }}
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const failureReason = `${{ steps.validate-files.outputs.failure_reason }}`;
+            const failureReason = process.env.FAILURE_REASON;
 
             await github.rest.issues.createComment({
               owner: context.repo.owner,
@@ -243,6 +247,8 @@ jobs:
       - name: Close PR if Lean build failed
         if: steps.check-jules.outputs.is_jules_pr == 'true' && steps.validate-files.outputs.validation_passed == 'true' && steps.lean-build.outputs.build_passed == 'false'
         uses: actions/github-script@v7
+        env:
+          FAILURE_REASON: ${{ steps.validate-files.outputs.failure_reason }}
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
@@ -267,6 +273,8 @@ jobs:
       - name: Check auto-merge eligibility and merge
         if: steps.check-jules.outputs.is_jules_pr == 'true' && steps.validate-files.outputs.validation_passed == 'true' && steps.lean-build.outputs.build_passed == 'true'
         uses: actions/github-script@v7
+        env:
+          FAILURE_REASON: ${{ steps.validate-files.outputs.failure_reason }}
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
