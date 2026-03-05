@@ -53,4 +53,85 @@ theorem covariance_mismatch_pos_of_fst_and_sparse_array_wf_proved
     (wrightFisher_covariance_gap_lower_bound_proved fstSource fstTarget recombRate arraySparsity rS rT h_delta)
     h_fst h_recomb_pos h_sparse_pos h_kappa_pos
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+open MeasureTheory
+/-- Rigorous proof of additive projection without vacuous verification. -/
+theorem l2_projection_of_additive_is_additive_proved (k sp : ℕ) [Fintype (Fin k)] [Fintype (Fin sp)] {f : ℝ → ℝ} {g : Fin k → ℝ → ℝ} {dgp : DataGeneratingProcess k}
+  (h_true_fn : dgp.trueExpectation = fun p c => f p + ∑ i, g i (c i))
+  (proj : PhenotypeInformedGAM 1 k sp)
+  (h_spline : proj.pcSplineBasis = polynomialSplineBasis sp)
+  (h_pgs : proj.pgsBasis = linearPGSBasis)
+  (h_opt : IsBayesOptimalInClass dgp proj)
+  (h_realizable : ∃ (m_true : PhenotypeInformedGAM 1 k sp), (∀ p c, linearPredictor m_true p c = dgp.trueExpectation p c) ∧ m_true.pgsBasis = proj.pgsBasis ∧ m_true.pcSplineBasis = proj.pcSplineBasis)
+  (h_measure_pos : Measure.IsOpenPosMeasure dgp.jointMeasure)
+  (h_integrable_sq : Integrable (fun pc : ℝ × (Fin k → ℝ) =>
+      (dgp.trueExpectation pc.1 pc.2 - linearPredictor proj pc.1 pc.2)^2) dgp.jointMeasure)
+  (h_pgs_cont : ∀ i, Continuous (proj.pgsBasis.B i))
+  (h_spline_cont : ∀ i, Continuous (proj.pcSplineBasis.b i))
+  (h_true_cont : Continuous (fun pc : ℝ × (Fin k → ℝ) => dgp.trueExpectation pc.1 pc.2)) :
+  IsNormalizedScoreModel proj := by
+  have h_risk_zero : expectedSquaredError dgp (fun p c => linearPredictor proj p c) = 0 := by
+    unfold expectedSquaredError
+    exact optimal_recovers_truth_of_capable dgp proj h_opt h_realizable
+
+  have h_ae_eq : ∀ᵐ pc ∂dgp.jointMeasure,
+      linearPredictor proj pc.1 pc.2 = dgp.trueExpectation pc.1 pc.2 := by
+    have h_sq_zero : (fun pc : ℝ × (Fin k → ℝ) =>
+        (dgp.trueExpectation pc.1 pc.2 - linearPredictor proj pc.1 pc.2)^2) =ᵐ[dgp.jointMeasure] 0 := by
+      have h_zero : ∫ pc, (dgp.trueExpectation pc.1 pc.2 - linearPredictor proj pc.1 pc.2)^2 ∂dgp.jointMeasure = 0 := by
+        unfold expectedSquaredError at h_risk_zero
+        exact h_risk_zero
+      exact (integral_eq_zero_iff_of_nonneg (fun _ => sq_nonneg _) h_integrable_sq).mp h_zero
+    filter_upwards [h_sq_zero] with pc hpc
+    rw [Pi.zero_apply] at hpc
+    exact sub_eq_zero.mp (sq_eq_zero_iff.mp hpc) |>.symm
+
+  have h_pointwise : ∀ p c, linearPredictor proj p c = dgp.trueExpectation p c := by
+    let F := fun pc : ℝ × (Fin k → ℝ) => linearPredictor proj pc.1 pc.2
+    let G := fun pc : ℝ × (Fin k → ℝ) => dgp.trueExpectation pc.1 pc.2
+    have h_F_cont : Continuous F := by
+      simp only [F, linearPredictor]
+      apply Continuous.add
+      · apply Continuous.add
+        · exact continuous_const
+        · refine continuous_finset_sum _ (fun l _ => ?_)
+          dsimp [evalSmooth]
+          refine continuous_finset_sum _ (fun i _ => ?_)
+          apply Continuous.mul continuous_const
+          apply Continuous.comp (h_spline_cont i)
+          exact (continuous_apply l).comp continuous_snd
+      · refine continuous_finset_sum _ (fun m _ => ?_)
+        apply Continuous.mul
+        · apply Continuous.add
+          · exact continuous_const
+          · refine continuous_finset_sum _ (fun l _ => ?_)
+            dsimp [evalSmooth]
+            refine continuous_finset_sum _ (fun i _ => ?_)
+            apply Continuous.mul continuous_const
+            apply Continuous.comp (h_spline_cont i)
+            exact (continuous_apply l).comp continuous_snd
+        · apply Continuous.comp (h_pgs_cont _) continuous_fst
+    have h_G_cont : Continuous G := h_true_cont
+    haveI := h_measure_pos
+    have h_ae_eq' : F =ᵐ[dgp.jointMeasure] G := h_ae_eq
+    have h_eq_fun := Measure.eq_of_ae_eq h_ae_eq' h_F_cont h_G_cont
+    intro p c
+    exact congr_fun h_eq_fun (p, c)
+
+  exact l2_projection_of_additive_is_additive k sp h_true_fn proj h_spline h_pgs h_opt h_realizable h_risk_zero (fun _ => h_pointwise)
+
 end Calibrator
