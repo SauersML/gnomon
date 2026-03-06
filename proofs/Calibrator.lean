@@ -54,3 +54,44 @@ theorem covariance_mismatch_pos_of_fst_and_sparse_array_wf_proved
     h_fst h_recomb_pos h_sparse_pos h_kappa_pos
 
 end Calibrator
+
+/-- Concrete source LD matrix for mismatch witness. -/
+def sigmaObsSource : Matrix (Fin 2) (Fin 2) ℝ := ![![1, 0.5], ![0.5, 1]]
+
+/-- Concrete target LD matrix for mismatch witness. -/
+def sigmaObsTarget : Matrix (Fin 2) (Fin 2) ℝ := ![![1, 0.1], ![0.1, 1]]
+
+/-- Concrete source cross-covariance for mismatch witness. -/
+def crossSource : Fin 2 → ℝ := ![0.8, 0.4]
+
+/-- Concrete target cross-covariance for mismatch witness. -/
+def crossTarget : Fin 2 → ℝ := ![0.8, 0.0]
+
+/-- Optimal weights for the source system. -/
+noncomputable def wSource_opt : Fin 2 → ℝ := ![0.8, 0.0]
+
+/-- Optimal weights for the target system. -/
+noncomputable def wTarget_opt : Fin 2 → ℝ := ![80/99, -8/99]
+
+/-- Rigorous proof that source and target ERMs differ when their respective normal equations
+    are satisfied by conflicting weights under shifting LD, avoiding the abstract conflict axiom. -/
+theorem source_target_erm_differ_of_ld_system_conflict_proved :
+  ∃ (wSource wTarget : Fin 2 → ℝ),
+    sigmaObsSource.mulVec wSource = crossSource ∧
+    sigmaObsTarget.mulVec wTarget = crossTarget ∧
+    wSource ≠ wTarget := by
+  use wSource_opt, wTarget_opt
+  refine ⟨?_, ?_, ?_⟩
+  · ext i; fin_cases i
+    · simp only [sigmaObsSource, wSource_opt, crossSource, Matrix.mulVec, Matrix.cons_val', Matrix.cons_val_fin_one]
+      norm_num
+    · simp only [sigmaObsSource, wSource_opt, crossSource, Matrix.mulVec, Matrix.cons_val', Matrix.cons_val_fin_one]
+      norm_num
+  · ext i; fin_cases i
+    · simp only [sigmaObsTarget, wTarget_opt, crossTarget, Matrix.mulVec, Matrix.cons_val', Matrix.cons_val_fin_one]
+      norm_num
+    · simp only [sigmaObsTarget, wTarget_opt, crossTarget, Matrix.mulVec, Matrix.cons_val', Matrix.cons_val_fin_one]
+      norm_num
+  · intro h; have h0 := congr_fun h 1
+    simp only [wSource_opt, wTarget_opt, Matrix.cons_val_fin_one, Matrix.cons_val_one] at h0
+    norm_num at h0
