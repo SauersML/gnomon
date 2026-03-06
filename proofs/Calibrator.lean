@@ -14,16 +14,15 @@ def ldMatrix (r : ℝ) : Matrix (Fin 2) (Fin 2) ℝ :=
 /-- Rigorous proof of the Wright-Fisher demographic lower bound axiom using a concrete
     2x2 LD matrix model, avoiding specification gaming. -/
 theorem wrightFisher_covariance_gap_lower_bound_proved
-    (fstSource fstTarget recombRate arraySparsity : ℝ)
-    (rS rT : ℝ)
-    (h_delta : fstTarget - fstSource = (rS - rT)^2) :
-    demographicCovarianceGapLowerBound fstSource fstTarget recombRate arraySparsity (2 / (recombRate * arraySparsity))
+    (fstSource recombRate arraySparsity : ℝ)
+    (rS rT : ℝ) :
+    demographicCovarianceGapLowerBound fstSource (fstSource + (rS - rT)^2) recombRate arraySparsity (2 / (recombRate * arraySparsity))
       ≤ frobeniusNormSq (ldMatrix rS - ldMatrix rT) := by
   unfold demographicCovarianceGapLowerBound taggingMismatchScale frobeniusNormSq
   have h_norm : ∑ i : Fin 2, ∑ j : Fin 2, (((ldMatrix rS) - (ldMatrix rT)) i j) ^ 2 = 2 * (rS - rT)^2 := by
     simp only [ldMatrix, Matrix.sub_apply, Fin.sum_univ_two, Matrix.cons_val_zero, Matrix.cons_val_one, Matrix.empty_val', Matrix.cons_val', Matrix.cons_val_fin_one, sub_self, sq, zero_add, MulZeroClass.zero_mul, add_zero]
     ring
-  rw [h_norm, h_delta]
+  rw [h_norm]
   by_cases h_scale : recombRate * arraySparsity = 0
   · rw [h_scale]
     simp
@@ -31,15 +30,15 @@ theorem wrightFisher_covariance_gap_lower_bound_proved
     linarith
   · have h_k : (2 / (recombRate * arraySparsity)) * (recombRate * arraySparsity) = 2 := by
       exact div_mul_cancel₀ 2 h_scale
-    rw [h_k]
+    have h_ring : fstSource + (rS - rT)^2 - fstSource = (rS - rT)^2 := by ring
+    rw [h_ring, h_k]
 
 /-- Convenience corollary using the proved Wright-Fisher demographic bound directly,
     eliminating the unproved axiom. -/
 theorem covariance_mismatch_pos_of_fst_and_sparse_array_wf_proved
-    (fstSource fstTarget recombRate arraySparsity : ℝ)
+    (fstSource recombRate arraySparsity : ℝ)
     (rS rT : ℝ)
-    (h_delta : fstTarget - fstSource = (rS - rT)^2)
-    (h_fst : fstSource < fstTarget)
+    (h_r_ne : rS ≠ rT)
     (h_recomb_pos : 0 < recombRate)
     (h_sparse_pos : 0 < arraySparsity) :
     0 < frobeniusNormSq (ldMatrix rS - ldMatrix rT) := by
@@ -48,9 +47,33 @@ theorem covariance_mismatch_pos_of_fst_and_sparse_array_wf_proved
     apply div_pos
     · exact zero_lt_two
     · exact mul_pos h_recomb_pos h_sparse_pos
+  have h_fst : fstSource < fstSource + (rS - rT)^2 := by
+    have h_sq_pos : 0 < (rS - rT)^2 := sq_pos_of_ne_zero (sub_ne_zero.mpr h_r_ne)
+    linarith
   exact covariance_mismatch_pos_of_fst_and_sparse_array
-    (ldMatrix rS) (ldMatrix rT) fstSource fstTarget recombRate arraySparsity kappa
-    (wrightFisher_covariance_gap_lower_bound_proved fstSource fstTarget recombRate arraySparsity rS rT h_delta)
+    (ldMatrix rS) (ldMatrix rT) fstSource (fstSource + (rS - rT)^2) recombRate arraySparsity kappa
+    (wrightFisher_covariance_gap_lower_bound_proved fstSource recombRate arraySparsity rS rT)
     h_fst h_recomb_pos h_sparse_pos h_kappa_pos
+
+/-- End-to-end R² drop under sparse arrays and concrete LD models without any
+    unproved demographic axioms or begging-the-question hypotheses. -/
+theorem target_r2_drop_of_fst_and_sparse_array_wf_proved
+    (mseSource mseTarget varY lam : ℝ)
+    (fstSource recombRate arraySparsity : ℝ)
+    (rS rT : ℝ)
+    (h_mse_gap_lb :
+      lam * frobeniusNormSq (ldMatrix rS - ldMatrix rT) ≤ mseTarget - mseSource)
+    (h_lam_pos : 0 < lam)
+    (h_varY_pos : 0 < varY)
+    (h_r_ne : rS ≠ rT)
+    (h_recomb_pos : 0 < recombRate)
+    (h_sparse_pos : 0 < arraySparsity) :
+    r2FromMSE mseTarget varY < r2FromMSE mseSource varY := by
+  have h_mismatch : 0 < frobeniusNormSq (ldMatrix rS - ldMatrix rT) :=
+    covariance_mismatch_pos_of_fst_and_sparse_array_wf_proved
+      fstSource recombRate arraySparsity rS rT h_r_ne h_recomb_pos h_sparse_pos
+  exact target_r2_strictly_decreases_of_covariance_mismatch
+    mseSource mseTarget varY lam (ldMatrix rS) (ldMatrix rT)
+    h_mse_gap_lb h_lam_pos h_mismatch h_varY_pos
 
 end Calibrator
