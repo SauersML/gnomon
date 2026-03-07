@@ -5,7 +5,6 @@ import concurrent.futures
 import json
 import multiprocessing as mp
 import os
-import re
 import time
 import shutil
 import sys
