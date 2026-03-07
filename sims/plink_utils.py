@@ -1,9 +1,9 @@
 """
 Helper functions for managing PLINK and external tools integration.
 """
-import subprocess
 import os
 import shutil
+import subprocess
 import time
 from pathlib import Path
 
@@ -62,7 +62,7 @@ def run_plink_conversion(
 
     if result.returncode != 0:
         raise RuntimeError(f"PLINK conversion failed:\n{result.stderr}")
-        
+    
     print(f"Created PLINK files: {out_prefix}.bed/bim/fam")
     
     # Inject Genetic Map if provided
