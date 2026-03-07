@@ -5,6 +5,7 @@ import concurrent.futures
 import json
 import multiprocessing as mp
 import os
+import re
 import time
 import shutil
 import sys
@@ -22,9 +23,6 @@ import numba as nb
 from scipy.stats import gaussian_kde
 from scipy.special import expit as sigmoid
 from sklearn.preprocessing import StandardScaler
-
-# mgcv path is required; prefer rpy2 API mode.
-os.environ.setdefault("RPY2_CFFI_MODE", "API")
 
 THIS_DIR = Path(__file__).resolve().parent
 SIMS_DIR = THIS_DIR.parent
@@ -214,35 +212,8 @@ def _set_runtime_thread_env(threads: int) -> None:
         os.environ[k] = t
 
 
-def _parse_int_prefix(raw: str | None) -> int | None:
-    if not raw:
-        return None
-    s = str(raw).strip()
-    digits = []
-    for ch in s:
-        if ch.isdigit():
-            digits.append(ch)
-        else:
-            break
-    if not digits:
-        return None
-    try:
-        return int("".join(digits))
-    except Exception:
-        return None
-
-
 def _default_total_threads() -> int:
     candidates: list[int] = []
-    for key in ("PBS_NP", "NSLOTS", "OMP_NUM_THREADS"):
-        val = os.environ.get(key)
-        if val:
-            try:
-                n = int(val)
-                if n > 0:
-                    candidates.append(n)
-            except Exception:
-                pass
     if hasattr(os, "sched_getaffinity"):
         try:
             candidates.append(max(1, len(os.sched_getaffinity(0))))  # type: ignore[attr-defined]
@@ -285,24 +256,12 @@ def _detect_cgroup_mem_limit_mb() -> int | None:
     return max(1, limit_bytes // (1024 * 1024))
 
 
-def _detect_scheduler_mem_limit_mb(thread_budget: int) -> int | None:
-    out: list[int] = []
-    pbs_mem_mb = _parse_int_prefix(os.environ.get("PBS_MEM_MB"))
-    if pbs_mem_mb is not None and pbs_mem_mb > 0:
-        out.append(pbs_mem_mb)
-    if not out:
-        return None
-    return max(1, min(out))
-
-
 def _detect_total_mem_mb() -> int | None:
-    thread_budget = _default_total_threads()
     caps = [
         v
         for v in (
             _detect_physical_mem_mb(),
             _detect_cgroup_mem_limit_mb(),
-            _detect_scheduler_mem_limit_mb(thread_budget),
         )
         if v is not None and v > 0
     ]
@@ -1595,8 +1554,25 @@ def main() -> None:
     work_root.mkdir(parents=True, exist_ok=True)
     if bool(args.force_figs):
         _log("Figure2 force-figs mode: regenerating from existing outputs only")
-        _force_plots_from_existing(out_dir)
-        return
+        try:
+            _force_plots_from_existing(out_dir)
+            return
+        except RuntimeError as e:
+            source_base = Path(args.use_existing_dir) if args.use_existing_dir else out_dir
+            seed = int(args.seed)
+            source_prefix = str(source_base / f"fig2_s{seed}")
+            sim_tsv = source_base / f"fig2_s{seed}.tsv"
+            needed = [Path(f"{source_prefix}.bed"), Path(f"{source_prefix}.bim"), Path(f"{source_prefix}.fam"), sim_tsv]
+            miss = [str(p) for p in needed if not p.exists()]
+            if miss:
+                raise RuntimeError(
+                    f"{e} Recovery without rerunning simulation requires existing "
+                    f"fig2_s{seed}.bed/.bim/.fam and fig2_s{seed}.tsv. Missing: {miss}"
+                ) from e
+            _log(
+                f"[fig2] Force-figs mode: aggregate table missing; recovering real outputs from existing artifacts in {source_base}"
+            )
+            args.use_existing = True
     _log("Figure2 spline backends: pspline + thinplate (mgcv)")
     _log(f"Figure2 PRS backend: {'BayesR' if args.bayesr else 'P+T'}")
     threads = max(1, int(args.threads)) if args.threads is not None else _default_total_threads()

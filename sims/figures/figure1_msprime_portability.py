@@ -6,8 +6,10 @@ import math
 import multiprocessing as mp
 import os
 import re
+import signal
 import shutil
 import sys
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -19,9 +21,6 @@ import msprime
 from scipy.stats import gaussian_kde
 from scipy.special import expit as sigmoid
 from sklearn.preprocessing import StandardScaler
-
-# mgcv path is required; prefer rpy2 API mode.
-os.environ.setdefault("RPY2_CFFI_MODE", "API")
 
 THIS_DIR = Path(__file__).resolve().parent
 SIMS_DIR = THIS_DIR.parent
@@ -52,6 +51,9 @@ N_AFR = 1000
 N_OOA_TRAIN = 1000
 N_OOA_TEST = 1000
 N_PCS = 5
+FIG1_TASK_TIMEOUT_S = 43_200.0
+FIG1_POOL_STALL_TIMEOUT_S = 57_600.0
+FIG1_POOL_POLL_S = 15.0
 
 CB = {
     "blue": "#0072B2",
@@ -108,35 +110,8 @@ def _set_runtime_thread_env(threads: int) -> None:
         os.environ[k] = t
 
 
-def _parse_int_prefix(raw: str | None) -> int | None:
-    if not raw:
-        return None
-    s = str(raw).strip()
-    digits = []
-    for ch in s:
-        if ch.isdigit():
-            digits.append(ch)
-        else:
-            break
-    if not digits:
-        return None
-    try:
-        return int("".join(digits))
-    except Exception:
-        return None
-
-
 def _default_total_threads() -> int:
     candidates: list[int] = []
-    for key in ("PBS_NP", "NSLOTS", "OMP_NUM_THREADS"):
-        val = os.environ.get(key)
-        if val:
-            try:
-                n = int(val)
-                if n > 0:
-                    candidates.append(n)
-            except Exception:
-                pass
     if hasattr(os, "sched_getaffinity"):
         try:
             candidates.append(max(1, len(os.sched_getaffinity(0))))  # type: ignore[attr-defined]
@@ -179,24 +154,12 @@ def _detect_cgroup_mem_limit_mb() -> int | None:
     return max(1, limit_bytes // (1024 * 1024))
 
 
-def _detect_scheduler_mem_limit_mb(thread_budget: int) -> int | None:
-    out: list[int] = []
-    pbs_mem_mb = _parse_int_prefix(os.environ.get("PBS_MEM_MB"))
-    if pbs_mem_mb is not None and pbs_mem_mb > 0:
-        out.append(pbs_mem_mb)
-    if not out:
-        return None
-    return max(1, min(out))
-
-
 def _detect_total_mem_mb() -> int | None:
-    thread_budget = _default_total_threads()
     caps = [
         v
         for v in (
             _detect_physical_mem_mb(),
             _detect_cgroup_mem_limit_mb(),
-            _detect_scheduler_mem_limit_mb(thread_budget),
         )
         if v is not None and v > 0
     ]
@@ -210,6 +173,39 @@ def _default_work_root(out_dir: Path) -> Path:
         if base.exists():
             return (base / "gnomon_sims_work" / "figure1").resolve()
     return out_dir / "work"
+
+
+def _task_vcf_tmp_dir(work_root: Path, run_id: str) -> Path:
+    return work_root / f"{run_id}_vcf_tmp"
+
+
+def _cleanup_task_vcf_tmp_dir(work_root: Path, run_id: str) -> None:
+    shutil.rmtree(_task_vcf_tmp_dir(work_root, run_id), ignore_errors=True)
+
+
+def _install_task_termination_logging(run_id: str) -> dict[int, object]:
+    previous: dict[int, object] = {}
+
+    def _handler(signum: int, _frame: object) -> None:
+        signame = signal.Signals(signum).name
+        _log(f"[{run_id}] Received {signame}; terminating task")
+        raise SystemExit(128 + int(signum))
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            previous[int(sig)] = signal.getsignal(sig)
+            signal.signal(sig, _handler)
+        except Exception:
+            continue
+    return previous
+
+
+def _restore_task_termination_logging(previous: dict[int, object]) -> None:
+    for sig, handler in previous.items():
+        try:
+            signal.signal(sig, handler)
+        except Exception:
+            continue
 
 
 def _truncate_ratemap(rate_map: msprime.RateMap, bp_cap: int | None) -> msprime.RateMap:
@@ -265,10 +261,7 @@ def _resource_plan(
 
 
 def _choose_mp_context() -> mp.context.BaseContext:
-    requested = str(os.environ.get("GNOMON_FIG1_MP_START_METHOD", "spawn")).strip().lower()
     methods = set(mp.get_all_start_methods())
-    if requested and requested in methods:
-        return mp.get_context(requested)
     if "spawn" in methods:
         return mp.get_context("spawn")
     return mp.get_context()
@@ -338,6 +331,7 @@ def _simulate_for_generation(
     seed: int,
     pgs_effects: np.ndarray,
     out_dir: Path,
+    work_root: Path,
     n_afr: int,
     n_ooa_train: int,
     n_ooa_test: int,
@@ -480,20 +474,28 @@ def _simulate_for_generation(
     _log(f"[{prefix}] Building dataframe (n_rows={len(rows)})")
     df = pd.DataFrame(rows)
 
-    # Write VCF + PLINK files for downstream PRS training/scoring.
-    vcf_path = out_dir / f"{prefix}.vcf"
-    _log(f"[{prefix}] Writing VCF to {vcf_path}")
-    with open(vcf_path, "w") as f:
-        names = [f"ind_{i+1}" for i in range(ts.num_individuals)]
-        ts.write_vcf(f, individual_names=names, position_transform=lambda x: np.asarray(x) + 1)
-    _log(f"[{prefix}] Converting VCF to PLINK")
-    run_plink_conversion(
-        str(vcf_path),
-        str(out_dir / prefix),
-        cm_map_path=None,
-        threads=plink_threads,
-        memory_mb=plink_memory_mb,
-    )
+    # Keep the transient VCF out of the persistent results directory so worker
+    # failures cannot strand massive intermediates there.
+    vcf_tmp_root = _task_vcf_tmp_dir(work_root, prefix)
+    _cleanup_task_vcf_tmp_dir(work_root, prefix)
+    vcf_tmp_root.mkdir(parents=True, exist_ok=True)
+    vcf_tmp_dir = Path(tempfile.mkdtemp(prefix=f"{prefix}_", dir=vcf_tmp_root))
+    vcf_path = vcf_tmp_dir / f"{prefix}.vcf"
+    try:
+        _log(f"[{prefix}] Writing VCF to {vcf_path}")
+        with open(vcf_path, "w") as f:
+            names = [f"ind_{i+1}" for i in range(ts.num_individuals)]
+            ts.write_vcf(f, individual_names=names, position_transform=lambda x: np.asarray(x) + 1)
+        _log(f"[{prefix}] Converting VCF to PLINK")
+        run_plink_conversion(
+            str(vcf_path),
+            str(out_dir / prefix),
+            cm_map_path=None,
+            threads=plink_threads,
+            memory_mb=plink_memory_mb,
+        )
+    finally:
+        _cleanup_task_vcf_tmp_dir(work_root, prefix)
     bim_path = out_dir / f"{prefix}.bim"
     bim_n_variants = sum(1 for _ in open(bim_path, "r", encoding="utf-8", errors="replace"))
     bim_pos = set()
@@ -510,8 +512,6 @@ def _simulate_for_generation(
         f"[{prefix}] PLINK conversion complete "
         f"(bim_variants={bim_n_variants}, overlap_true_effect_positions={overlap_bim_true_effect})"
     )
-    vcf_path.unlink(missing_ok=True)
-
     _log(f"[{prefix}] Writing simulation table to {out_dir / f'{prefix}.tsv'}")
     df.to_csv(out_dir / f"{prefix}.tsv", sep="\t", index=False)
     _log(f"[{prefix}] Generation simulation complete")
@@ -1000,6 +1000,28 @@ def _collect_existing_generation_records(out_dir: Path) -> list[dict[str, object
     return recs
 
 
+def _discover_recoverable_existing_generations(out_dir: Path) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+    patt = re.compile(r"^fig1_g(?P<g>\d+)_s(?P<s>\d+)\.bed$")
+    recoverable: list[tuple[int, int]] = []
+    missing_sim_tsv: list[tuple[int, int]] = []
+    for bed_path in sorted(out_dir.glob("fig1_g*_s*.bed")):
+        m = patt.match(bed_path.name)
+        if m is None:
+            continue
+        g = int(m.group("g"))
+        s = int(m.group("s"))
+        stem = out_dir / f"fig1_g{g}_s{s}"
+        needed_plink = [Path(f"{stem}.bed"), Path(f"{stem}.bim"), Path(f"{stem}.fam")]
+        if not all(p.exists() for p in needed_plink):
+            continue
+        sim_tsv = Path(f"{stem}.tsv")
+        if sim_tsv.exists():
+            recoverable.append((g, s))
+        else:
+            missing_sim_tsv.append((g, s))
+    return recoverable, missing_sim_tsv
+
+
 def _aggregate_and_plot(done: list[dict[str, object]], out_dir: Path, demography_split_gens: int | None = None) -> None:
     if not done:
         raise RuntimeError("No per-generation outputs available to aggregate.")
@@ -1097,62 +1119,49 @@ def _run_generation_task(task: dict[str, object]) -> dict[str, object]:
     _log(f"[fig1_g{g}_s{seed}] Runtime resources set (threads={threads_per_job}, memory_mb={memory_mb_per_job})")
 
     run_id = f"fig1_g{g}_s{seed}"
+    previous_signal_handlers = _install_task_termination_logging(run_id)
     prefix_path = out_dir / run_id
     prefix = str(prefix_path)
     source_prefix = prefix_path
+    try:
+        def _simulate_and_publish() -> pd.DataFrame:
+            df_local = _simulate_for_generation(
+                g,
+                seed,
+                pgs_effects,
+                out_dir,
+                work_root,
+                n_afr=n_afr,
+                n_ooa_train=n_ooa_train,
+                n_ooa_test=n_ooa_test,
+                plink_threads=threads_per_job,
+                plink_memory_mb=memory_mb_per_job,
+                msprime_model=msprime_model,
+                mut_rate=mut_rate,
+                pca_n_sites=pca_n_sites,
+                causal_max_sites=causal_max_sites,
+                bp_cap=(int(bp_cap) if bp_cap is not None else None),
+            )
+            _publish_reuse_cache(prefix=prefix_path, out_dir=out_dir, run_id=run_id)
+            return df_local
 
-    def _simulate_and_publish() -> pd.DataFrame:
-        df_local = _simulate_for_generation(
-            g,
-            seed,
-            pgs_effects,
-            out_dir,
-            n_afr=n_afr,
-            n_ooa_train=n_ooa_train,
-            n_ooa_test=n_ooa_test,
-            plink_threads=threads_per_job,
-            plink_memory_mb=memory_mb_per_job,
-            msprime_model=msprime_model,
-            mut_rate=mut_rate,
-            pca_n_sites=pca_n_sites,
-            causal_max_sites=causal_max_sites,
-            bp_cap=(int(bp_cap) if bp_cap is not None else None),
-        )
-        _publish_reuse_cache(prefix=prefix_path, out_dir=out_dir, run_id=run_id)
-        return df_local
-
-    reused_existing = False
-    if use_existing:
-        try:
-            source_prefix, sim_tsv = _resolve_existing_source(g, seed, out_dir, use_existing_dir)
-            _log(f"[{run_id}] Reusing existing simulation/PLINK files from {source_prefix.parent}")
-            df = pd.read_csv(sim_tsv, sep="\t")
-            reused_existing = True
-        except Exception as e:
-            _log(f"[{run_id}] Existing artifacts unavailable/unreadable; regenerating this generation ({type(e).__name__}: {e})")
+        reused_existing = False
+        if use_existing:
+            try:
+                source_prefix, sim_tsv = _resolve_existing_source(g, seed, out_dir, use_existing_dir)
+                _log(f"[{run_id}] Reusing existing simulation/PLINK files from {source_prefix.parent}")
+                df = pd.read_csv(sim_tsv, sep="\t")
+                reused_existing = True
+            except Exception as e:
+                _log(f"[{run_id}] Existing artifacts unavailable/unreadable; regenerating this generation ({type(e).__name__}: {e})")
+                source_prefix = prefix_path
+                df = _simulate_and_publish()
+        else:
             source_prefix = prefix_path
             df = _simulate_and_publish()
-    else:
-        source_prefix = prefix_path
-        df = _simulate_and_publish()
-    df = _ensure_calibration_groups(df, seed=seed)
-    work = work_root / f"fig1_g{g}_s{seed}_work"
-    try:
-        train_prefix, test_prefix, train_phen, freq_file = _prepare_bayesr_files(
-            df,
-            str(source_prefix),
-            work,
-            plink_threads=threads_per_job,
-            plink_memory_mb=memory_mb_per_job,
-        )
-    except Exception as e:
-        if use_existing and reused_existing:
-            _log(
-                f"[{run_id}] Existing PLINK/TSV artifacts failed during PRS prep; "
-                f"regenerating and retrying ({type(e).__name__}: {e})"
-            )
-            source_prefix = prefix_path
-            df = _ensure_calibration_groups(_simulate_and_publish(), seed=seed)
+        df = _ensure_calibration_groups(df, seed=seed)
+        work = work_root / f"fig1_g{g}_s{seed}_work"
+        try:
             train_prefix, test_prefix, train_phen, freq_file = _prepare_bayesr_files(
                 df,
                 str(source_prefix),
@@ -1160,43 +1169,63 @@ def _run_generation_task(task: dict[str, object]) -> dict[str, object]:
                 plink_threads=threads_per_job,
                 plink_memory_mb=memory_mb_per_job,
             )
+        except Exception as e:
+            if use_existing and reused_existing:
+                _log(
+                    f"[{run_id}] Existing PLINK/TSV artifacts failed during PRS prep; "
+                    f"regenerating and retrying ({type(e).__name__}: {e})"
+                )
+                source_prefix = prefix_path
+                df = _ensure_calibration_groups(_simulate_and_publish(), seed=seed)
+                train_prefix, test_prefix, train_phen, freq_file = _prepare_bayesr_files(
+                    df,
+                    str(source_prefix),
+                    work,
+                    plink_threads=threads_per_job,
+                    plink_memory_mb=memory_mb_per_job,
+                )
+            else:
+                raise
+        use_bayesr = bool(task.get("use_bayesr", False))
+        if use_bayesr:
+            _log(f"[fig1_g{g}_s{seed}] BayesR fit starting")
+            br = BayesR(threads=threads_per_job, plink_memory_mb=memory_mb_per_job)
+            eff_file = br.fit(train_prefix, train_phen, str(work / "bayesr"), covar_file=str(work / "train.covar"))
+            _log(f"[fig1_g{g}_s{seed}] BayesR fit complete; scoring test/train")
+            test_scores = br.predict(test_prefix, eff_file, str(work / "bayesr_test"), freq_file=freq_file)
+            train_scores = br.predict(train_prefix, eff_file, str(work / "bayesr_train"), freq_file=freq_file)
         else:
-            raise
-    use_bayesr = bool(task.get("use_bayesr", False))
-    if use_bayesr:
-        _log(f"[fig1_g{g}_s{seed}] BayesR fit starting")
-        br = BayesR(threads=threads_per_job, plink_memory_mb=memory_mb_per_job)
-        eff_file = br.fit(train_prefix, train_phen, str(work / "bayesr"), covar_file=str(work / "train.covar"))
-        _log(f"[fig1_g{g}_s{seed}] BayesR fit complete; scoring test/train")
-        test_scores = br.predict(test_prefix, eff_file, str(work / "bayesr_test"), freq_file=freq_file)
-        train_scores = br.predict(train_prefix, eff_file, str(work / "bayesr_train"), freq_file=freq_file)
-    else:
-        _log(f"[fig1_g{g}_s{seed}] P+T fit/scoring starting")
-        pt = PPlusT(threads=threads_per_job, plink_memory_mb=memory_mb_per_job)
-        train_scores, test_scores, pt_meta = pt.fit_and_predict(
-            bfile_train=train_prefix,
-            bfile_test=test_prefix,
-            pheno_file=train_phen,
-            covar_file=str(work / "train.covar"),
-            freq_file=freq_file,
-            out_prefix=str(work / "pt"),
-        )
-        pt_metrics_df = pt_meta["threshold_metrics"].copy()
-        pt_metrics_df.insert(0, "gens", int(g))
-        pt_metrics_df.insert(1, "seed", int(seed))
-        pt_metrics_df["is_selected"] = pt_metrics_df["p_threshold"] == float(pt_meta["best_p_threshold"])
-        pt_tsv_path = out_dir / f"fig1_g{g}_s{seed}.pt_thresholds.tsv"
-        pt_plot_path = out_dir / f"fig1_g{g}_s{seed}.pt_train_accuracy.png"
-        pt_metrics_df.to_csv(pt_tsv_path, sep="\t", index=False)
-        _plot_pt_train_accuracy(pt_metrics_df, pt_plot_path, title=f"fig1 g={g} seed={seed} train accuracy")
-        _log(
-            f"[fig1_g{g}_s{seed}] P+T selected p={float(pt_meta['best_p_threshold']):g} "
-            f"(train_accuracy={float(pt_meta['best_train_accuracy']):.4f}, "
-            f"train_balanced_accuracy={float(pt_meta.get('best_train_balanced_accuracy', float('nan'))):.4f}, "
-            f"train_auc={float(pt_meta.get('best_train_auc', float('nan'))):.4f}, "
-            f"n_snps={int(pt_meta['best_n_snps'])})"
-        )
-        _log(f"[fig1_g{g}_s{seed}] P+T fit/scoring complete")
+            _log(f"[fig1_g{g}_s{seed}] P+T fit/scoring starting")
+            pt = PPlusT(threads=threads_per_job, plink_memory_mb=memory_mb_per_job)
+            train_scores, test_scores, pt_meta = pt.fit_and_predict(
+                bfile_train=train_prefix,
+                bfile_test=test_prefix,
+                pheno_file=train_phen,
+                covar_file=str(work / "train.covar"),
+                freq_file=freq_file,
+                out_prefix=str(work / "pt"),
+            )
+            pt_metrics_df = pt_meta["threshold_metrics"].copy()
+            pt_metrics_df.insert(0, "gens", int(g))
+            pt_metrics_df.insert(1, "seed", int(seed))
+            pt_metrics_df["is_selected"] = pt_metrics_df["p_threshold"] == float(pt_meta["best_p_threshold"])
+            pt_tsv_path = out_dir / f"fig1_g{g}_s{seed}.pt_thresholds.tsv"
+            pt_plot_path = out_dir / f"fig1_g{g}_s{seed}.pt_train_accuracy.png"
+            pt_metrics_df.to_csv(pt_tsv_path, sep="\t", index=False)
+            _plot_pt_train_accuracy(pt_metrics_df, pt_plot_path, title=f"fig1 g={g} seed={seed} train accuracy")
+            _log(
+                f"[fig1_g{g}_s{seed}] P+T selected p={float(pt_meta['best_p_threshold']):g} "
+                f"(train_accuracy={float(pt_meta['best_train_accuracy']):.4f}, "
+                f"train_balanced_accuracy={float(pt_meta.get('best_train_balanced_accuracy', float('nan'))):.4f}, "
+                f"train_auc={float(pt_meta.get('best_train_auc', float('nan'))):.4f}, "
+                f"n_snps={int(pt_meta['best_n_snps'])})"
+            )
+            _log(f"[fig1_g{g}_s{seed}] P+T fit/scoring complete")
+    except BaseException as e:
+        _log(f"[{run_id}] Task aborted ({type(e).__name__}: {e})")
+        raise
+    finally:
+        _restore_task_termination_logging(previous_signal_handlers)
 
     train_df = df[df["group"] == "OOA_train"].copy()
     pred_df = df[df["group"].isin(["OOA_cal", "AFR_cal", "OOA_test", "AFR_test"])].copy()
@@ -1396,19 +1425,19 @@ def main() -> None:
     parser.add_argument(
         "--task-timeout-s",
         type=float,
-        default=float(os.environ.get("GNOMON_FIG1_TASK_TIMEOUT_S", "43200")),
+        default=FIG1_TASK_TIMEOUT_S,
         help="Per-generation hard timeout in seconds (default: 43200 = 12h).",
     )
     parser.add_argument(
         "--pool-stall-timeout-s",
         type=float,
-        default=float(os.environ.get("GNOMON_FIG1_POOL_STALL_TIMEOUT_S", "7200")),
-        help="Fail the run if no task completes for this many seconds (default: 7200 = 2h).",
+        default=FIG1_POOL_STALL_TIMEOUT_S,
+        help="Fail the run if no task completes for this many seconds (default: 57600 = 16h).",
     )
     parser.add_argument(
         "--pool-poll-s",
         type=float,
-        default=float(os.environ.get("GNOMON_FIG1_POOL_POLL_S", "15")),
+        default=FIG1_POOL_POLL_S,
         help="Executor polling interval in seconds (default: 15).",
     )
     parser.add_argument("--keep-intermediates", action="store_true", help="Keep per-generation PLINK/GCTB intermediate files.")
@@ -1432,9 +1461,66 @@ def main() -> None:
     if bool(args.force_figs):
         existing = _collect_existing_generation_records(out_dir)
         if not existing:
+            recoverable, missing_sim_tsv = _discover_recoverable_existing_generations(out_dir)
+            if recoverable:
+                _log(
+                    f"Figure1 force-figs mode: recovering downstream outputs from "
+                    f"{len(recoverable)} existing PLINK+TSV generation(s)."
+                )
+                pgs_effects = simulate_effect_size_distribution(
+                    n_effects=200000,
+                    seed=int(args.seed) + 4049,
+                )
+                jobs, threads_per_job, memory_mb_per_job = _resource_plan(
+                    n_tasks=len(recoverable),
+                    total_threads_override=args.total_threads,
+                    total_mem_mb_override=args.memory_mb_total,
+                )
+                _set_runtime_thread_env(threads_per_job)
+                recovered: list[dict[str, object]] = []
+                for g, s in recoverable:
+                    rec = _run_generation_task(
+                        {
+                            "g": int(g),
+                            "seed": int(s),
+                            "out_dir": str(out_dir),
+                            "work_root": str(work_root),
+                            "n_afr": int(args.n_afr),
+                            "n_ooa_train": int(args.n_ooa_train),
+                            "n_ooa_test": int(args.n_ooa_test),
+                            "threads_per_job": int(threads_per_job),
+                            "memory_mb_per_job": memory_mb_per_job,
+                            "keep_intermediates": bool(args.keep_intermediates),
+                            "msprime_model": str(args.msprime_model),
+                            "mut_rate": float(args.mut_rate),
+                            "pca_n_sites": int(args.pca_sites),
+                            "causal_max_sites": int(args.causal_sites),
+                            "bp_cap": args.bp_cap,
+                            "pgs_effects": pgs_effects,
+                            "use_bayesr": bool(args.bayesr),
+                            "use_existing": True,
+                            "use_existing_dir": str(out_dir),
+                        }
+                    )
+                    recovered.append(rec)
+                    _log(f"Figure1 force-figs recovered generation g={g} seed={s}")
+                existing = _collect_existing_generation_records(out_dir)
+                if existing:
+                    _log(
+                        f"Figure1 force-figs mode: recovered {len(recovered)} generation(s); regenerating aggregate outputs."
+                    )
+                    _aggregate_and_plot(existing, out_dir=out_dir, demography_split_gens=None)
+                    return
+            missing_bits = (
+                f" Missing simulation tables for: {', '.join([f'g={g},seed={s}' for g, s in missing_sim_tsv])}."
+                if missing_sim_tsv
+                else ""
+            )
             raise RuntimeError(
-                f"No existing Figure1 per-generation result sets found in {out_dir}. "
-                "Expected files like fig1_g*_s*.results.tsv/.prs.tsv/.pc.tsv/.predictions.tsv."
+                f"No recoverable Figure1 per-generation outputs found in {out_dir}."
+                " Full regeneration requires existing fig1_g*_s*.results.tsv/.prs.tsv/.pc.tsv/.predictions.tsv, "
+                "or recovery inputs fig1_g*_s*.bed/.bim/.fam plus fig1_g*_s*.tsv."
+                f"{missing_bits}"
             )
         _log(f"Figure1 force-figs mode: found {len(existing)} generation result sets; regenerating aggregate outputs.")
         _aggregate_and_plot(existing, out_dir=out_dir, demography_split_gens=None)
@@ -1565,8 +1651,13 @@ def main() -> None:
                     "Figure1 pool stalled with no completed tasks; "
                     f"idle_for_s={idle_s:.1f}, stall_timeout_s={stall_timeout_s:.1f}"
                 )
+    except BaseException as e:
+        _log(f"Figure1 main loop aborted ({type(e).__name__}: {e})")
+        raise
     finally:
         ex.shutdown(wait=not pool_failed, cancel_futures=pool_failed)
+        for task in tasks:
+            _cleanup_task_vcf_tmp_dir(work_root, f"fig1_g{int(task['g'])}_s{int(task['seed'])}")
 
     _aggregate_and_plot(done, out_dir=out_dir, demography_split_gens=int(sorted(args.gens)[len(args.gens) // 2]))
 

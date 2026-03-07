@@ -13,8 +13,6 @@ USER_BIN="${USER_BIN:-$HOME/bin}"
 PIP_USER_BIN="$HOME/.local/bin"
 
 export PATH="$USER_BIN:$PIP_USER_BIN:$PATH"
-export RPY2_CFFI_MODE="${RPY2_CFFI_MODE:-API}"
-export PYTHONUNBUFFERED=1
 
 mkdir -p "$LOG_DIR"
 
@@ -156,13 +154,6 @@ is_running() {
   fi
   rm -f "$PID_FILE"
   return 1
-}
-
-find_live_pipeline_pid() {
-  # Match actual python pipeline process, not incidental shell command strings.
-  ps -eo pid=,comm=,args= \
-    | awk '$2 ~ /^python/ && $0 ~ /sims\/main.py([[:space:]]|$)/ {print $1; exit}' \
-    || true
 }
 
 maybe_load_modules() {

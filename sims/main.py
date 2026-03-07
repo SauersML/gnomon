@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import os
 import shutil
 import subprocess
@@ -14,6 +15,45 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 FIG1_SCRIPT = REPO_ROOT / "sims" / "figure1_msprime_portability.py"
 FIG2_SCRIPT = REPO_ROOT / "sims" / "figure2_stdpopsim_confounding.py"
 
+PYTHON_RUNTIME_IMPORTS = [
+    "numpy",
+    "pandas",
+    "scipy",
+    "sklearn",
+    "matplotlib",
+    "msprime",
+    "stdpopsim",
+    "tskit",
+    "seaborn",
+    "tabulate",
+    "h5py",
+    "statsmodels",
+    "numba",
+    "demes",
+    "demesdraw",
+    "rpy2",
+]
+
+PYTHON_SETUP_PACKAGES = [
+    "numpy<2",
+    "pandas<3",
+    "scipy",
+    "scikit-learn",
+    "matplotlib",
+    "numba",
+    "msprime==1.3.4",
+    "stdpopsim==0.3.0",
+    "tskit<1",
+    "pgscatalog-calc",
+    "seaborn",
+    "tabulate",
+    "h5py",
+    "statsmodels",
+    "demes",
+    "demesdraw",
+    "rpy2",
+]
+
 
 def _run(cmd: list[str], env: dict[str, str] | None = None) -> None:
     print("+", " ".join(cmd), flush=True)
@@ -24,30 +64,8 @@ def _exists(cmd: str) -> bool:
     return shutil.which(cmd) is not None
 
 
-def _parse_int_prefix(raw: str | None) -> int | None:
-    if not raw:
-        return None
-    s = str(raw).strip()
-    digits = []
-    for ch in s:
-        if ch.isdigit():
-            digits.append(ch)
-        else:
-            break
-    if not digits:
-        return None
-    try:
-        return int("".join(digits))
-    except Exception:
-        return None
-
-
 def _detect_total_threads() -> int:
     candidates: list[int] = []
-    for key in ("PBS_NP", "NSLOTS"):
-        v = _parse_int_prefix(os.environ.get(key))
-        if v is not None and v > 0:
-            candidates.append(v)
     if hasattr(os, "sched_getaffinity"):
         try:
             candidates.append(max(1, len(os.sched_getaffinity(0))))  # type: ignore[attr-defined]
@@ -91,16 +109,6 @@ def _detect_cgroup_mem_limit_mb() -> int | None:
     return max(1, limit_bytes // (1024 * 1024))
 
 
-def _detect_scheduler_mem_limit_mb(thread_budget: int) -> int | None:
-    out: list[int] = []
-    pbs_mem_mb = _parse_int_prefix(os.environ.get("PBS_MEM_MB"))
-    if pbs_mem_mb is not None and pbs_mem_mb > 0:
-        out.append(pbs_mem_mb)
-    if not out:
-        return None
-    return max(1, min(out))
-
-
 def _assert_mgcv_available(env: dict[str, str]) -> None:
     # Hard requirement: GAM must run with R mgcv via rpy2.
     subprocess.run(
@@ -108,8 +116,6 @@ def _assert_mgcv_available(env: dict[str, str]) -> None:
             sys.executable,
             "-c",
             (
-                "import os; "
-                "os.environ.setdefault('RPY2_CFFI_MODE', 'API'); "
                 "import rpy2.robjects as ro; "
                 "from rpy2.robjects.packages import importr; "
                 "importr('mgcv'); "
@@ -151,13 +157,11 @@ def _apply_thread_env(env: dict[str, str], threads: int) -> None:
 
 
 def _detect_total_mem_mb() -> int | None:
-    thread_budget = _detect_total_threads()
     caps = [
         v
         for v in (
             _detect_physical_mem_mb(),
             _detect_cgroup_mem_limit_mb(),
-            _detect_scheduler_mem_limit_mb(thread_budget),
         )
         if v is not None and v > 0
     ]
@@ -196,25 +200,9 @@ def setup_env() -> None:
     py = sys.executable
     pip = [py, "-m", "pip"]
 
-    _run(pip + ["install", "--upgrade", "pip", "setuptools", "wheel"])
-    _run(
-        pip
-        + [
-            "install",
-            "numpy",
-            "pandas",
-            "scipy",
-            "scikit-learn",
-            "numba",
-            "matplotlib",
-            "demes",
-            "demesdraw",
-            "msprime",
-            "stdpopsim",
-            "rpy2",
-            "pgscatalog-calc",
-        ]
-    )
+    if not _python_runtime_ready():
+        _run(pip + ["install", "--upgrade", "pip<25", "setuptools", "wheel"])
+        _run(pip + ["install", *PYTHON_SETUP_PACKAGES])
 
     mamba = shutil.which("micromamba") or shutil.which("mamba") or shutil.which("conda")
 
@@ -256,6 +244,64 @@ def setup_env() -> None:
 
     for tool in ["python3", "plink2", "gctb", "Rscript"]:
         print(f"tool {tool}:", shutil.which(tool) or "MISSING")
+
+
+def _python_runtime_ready() -> bool:
+    try:
+        for mod in PYTHON_RUNTIME_IMPORTS:
+            importlib.import_module(mod)
+    except Exception:
+        return False
+    return True
+
+
+def _tool_runtime_ready() -> bool:
+    return all(_exists(tool) for tool in ("plink2", "gctb"))
+
+
+def _r_runtime_ready() -> bool:
+    if not _exists("Rscript"):
+        return False
+
+    try:
+        subprocess.run(
+            ["Rscript", "-e", "library(mgcv)"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        return False
+
+    try:
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "from rpy2.robjects.packages import importr; "
+                    "importr('mgcv')"
+                ),
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        return False
+
+    return True
+
+
+def ensure_runtime() -> None:
+    if _python_runtime_ready() and _tool_runtime_ready() and _r_runtime_ready():
+        return
+    setup_env()
+    if not (_python_runtime_ready() and _tool_runtime_ready() and _r_runtime_ready()):
+        raise RuntimeError(
+            "Runtime setup did not complete successfully: Python deps, R/mgcv+rpy2, "
+            "and plink2/gctb must all be available before the simulation run starts."
+        )
 
 
 def _run_fig1(
@@ -427,8 +473,6 @@ def run_pipeline(
 
     jobs = _jobs()
     env = os.environ.copy()
-    env.setdefault("RPY2_CFFI_MODE", "API")
-    env.setdefault("PYTHONUNBUFFERED", "1")
     _apply_thread_env(env, jobs)
     if not force_figs:
         _assert_mgcv_available(env)
@@ -645,6 +689,7 @@ def main() -> None:
         return
 
     if args.cmd == "run":
+        ensure_runtime()
         run_pipeline(
             figure=args.figure,
             small=bool(args.small),
