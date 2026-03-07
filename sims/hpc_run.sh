@@ -269,6 +269,26 @@ install_plink2() {
   log "Installed plink2: $USER_BIN/plink2"
 }
 
+install_plink() {
+  if has_cmd plink; then
+    log "Found plink: $(command -v plink)"
+    return
+  fi
+
+  log "Installing plink into $USER_BIN"
+  mkdir -p "$USER_BIN"
+  local tmp
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+
+  curl -fsSL -o "$tmp/plink.zip" https://s3.amazonaws.com/plink1-assets/plink_linux_x86_64_20250819.zip
+  unzip -q -o "$tmp/plink.zip" -d "$tmp"
+  cp "$tmp/plink" "$USER_BIN/plink"
+  chmod +x "$USER_BIN/plink"
+
+  log "Installed plink: $USER_BIN/plink"
+}
+
 install_gctb() {
   if has_cmd gctb; then
     log "Found gctb: $(command -v gctb)"
@@ -300,10 +320,12 @@ run_main() {
   maybe_load_modules
   ensure_python
   ensure_r_mgcv
+  install_plink
   install_plink2
   install_gctb
 
   log "Tool check: python=$(command -v "$PYTHON_BIN")"
+  log "Tool check: plink=$(command -v plink || true)"
   log "Tool check: plink2=$(command -v plink2 || true)"
   log "Tool check: gctb=$(command -v gctb || true)"
   log "Tool check: Rscript=$(command -v Rscript || true)"

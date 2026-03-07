@@ -4,64 +4,69 @@ Helper functions for managing PLINK and external tools integration.
 import os
 import shutil
 import subprocess
-import time
 from pathlib import Path
+from typing import Callable, TextIO
 
 def run_plink_conversion(
-    vcf_path: str,
+    vcf_writer: Callable[[TextIO], None],
     out_prefix: str,
     cm_map_path: str = None,
     threads: int | None = None,
     memory_mb: int | None = None,
 ) -> None:
     """
-    Convert VCF to PLINK binary format (.bed/.bim/.fam).
-    Uses plink2.
-    
+    Stream VCF text into PLINK 1.9 and write PLINK 1 binary format (.bed/.bim/.fam).
+
     If cm_map_path is provided (format: BP cM per line), updates the .bim file
     with correct genetic positions.
     """
     out_parent = Path(out_prefix).parent
     out_parent.mkdir(parents=True, exist_ok=True)
 
-    plink_exe = shutil.which("plink2")
+    plink_exe = shutil.which("plink")
     if plink_exe is None:
-        raise FileNotFoundError("plink2 not found on PATH.")
+        raise FileNotFoundError("plink (PLINK 1.9) not found on PATH.")
 
-    def _wait_for_file(path: str, timeout_s: float = 10.0) -> bool:
-        t0 = time.time()
-        while time.time() - t0 < timeout_s:
-            if os.path.exists(path):
-                return True
-            time.sleep(0.1)
-        return os.path.exists(path)
-    
-    def _run_plink(vcf_input: str) -> subprocess.CompletedProcess:
-        cmd = [
-            plink_exe,
-            "--vcf", vcf_input,
-            "--max-alleles", "2",
-            "--allow-extra-chr",
-            "--rm-dup", "exclude-all",
-            "--make-bed",
-            "--out", out_prefix,
-            "--silent"
-        ]
-        if threads is not None and int(threads) > 0:
-            cmd.extend(["--threads", str(int(threads))])
-        if memory_mb is not None and int(memory_mb) > 0:
-            cmd.extend(["--memory", str(int(memory_mb))])
-        print(f"Running PLINK conversion: {' '.join(cmd)}")
-        return subprocess.run(cmd, capture_output=True, text=True)
+    cmd = [
+        plink_exe,
+        "--vcf", "/dev/stdin",
+        "--allow-extra-chr",
+        "--biallelic-only", "strict",
+        "--make-bed",
+        "--out", out_prefix,
+        "--silent",
+    ]
+    if threads is not None and int(threads) > 0:
+        cmd.extend(["--threads", str(int(threads))])
+    if memory_mb is not None and int(memory_mb) > 0:
+        cmd.extend(["--memory", str(int(memory_mb))])
+    print(f"Running PLINK conversion: {' '.join(cmd)}")
 
-    # Wait briefly for potentially network-backed VCF metadata to become visible.
-    if not _wait_for_file(vcf_path, timeout_s=10.0):
-        raise RuntimeError(f"VCF input not found for PLINK conversion: {vcf_path}")
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert proc.stdin is not None
+        vcf_writer(proc.stdin)
+        proc.stdin.close()
+    except Exception:
+        if proc.stdin is not None and not proc.stdin.closed:
+            proc.stdin.close()
+        proc.kill()
+        proc.wait()
+        raise
 
-    result = _run_plink(vcf_path)
-
-    if result.returncode != 0:
-        raise RuntimeError(f"PLINK conversion failed:\n{result.stderr}")
+    stderr = ""
+    if proc.stderr is not None:
+        stderr = proc.stderr.read()
+        proc.stderr.close()
+    returncode = proc.wait()
+    if returncode != 0:
+        raise RuntimeError(f"PLINK conversion failed:\n{stderr}")
     
     print(f"Created PLINK files: {out_prefix}.bed/bim/fam")
     

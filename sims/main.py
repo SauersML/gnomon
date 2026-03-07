@@ -219,7 +219,7 @@ def setup_env() -> None:
         ]
     )
 
-    if not (_exists("plink2") and _exists("gctb")):
+    if not (_exists("plink") and _exists("plink2") and _exists("gctb")):
         if mamba:
             _run(
                 [
@@ -230,6 +230,7 @@ def setup_env() -> None:
                     "conda-forge",
                     "-c",
                     "bioconda",
+                    "plink",
                     "plink2",
                     "gctb",
                     "r-base",
@@ -238,11 +239,11 @@ def setup_env() -> None:
             )
         else:
             raise RuntimeError(
-                "plink2 and/or gctb missing and no conda/mamba executable was found on PATH. "
-                "Install micromamba/mamba/conda or preinstall plink2 and gctb."
+                "plink, plink2, and/or gctb missing and no conda/mamba executable was found on PATH. "
+                "Install micromamba/mamba/conda or preinstall plink, plink2, and gctb."
             )
 
-    for tool in ["python3", "plink2", "gctb", "Rscript"]:
+    for tool in ["python3", "plink", "plink2", "gctb", "Rscript"]:
         print(f"tool {tool}:", shutil.which(tool) or "MISSING")
 
 
@@ -256,7 +257,7 @@ def _python_runtime_ready() -> bool:
 
 
 def _tool_runtime_ready() -> bool:
-    return all(_exists(tool) for tool in ("plink2", "gctb"))
+    return all(_exists(tool) for tool in ("plink", "plink2", "gctb"))
 
 
 def _r_runtime_ready() -> bool:
@@ -300,7 +301,7 @@ def ensure_runtime() -> None:
     if not (_python_runtime_ready() and _tool_runtime_ready() and _r_runtime_ready()):
         raise RuntimeError(
             "Runtime setup did not complete successfully: Python deps, R/mgcv+rpy2, "
-            "and plink2/gctb must all be available before the simulation run starts."
+            "and plink/plink2/gctb must all be available before the simulation run starts."
         )
 
 

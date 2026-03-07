@@ -8,7 +8,6 @@ import os
 import time
 import shutil
 import sys
-import tempfile
 from datetime import datetime
 from multiprocessing import shared_memory
 from pathlib import Path
@@ -950,29 +949,25 @@ def _simulate(
     _stage_done(run_id, "dataframe build", t0)
 
     prefix = out_dir / f"fig2_s{seed}"
-    vcf_tmp_dir = Path(tempfile.mkdtemp(prefix=f"{run_id}_vcf_"))
-    vcf = vcf_tmp_dir / f"{run_id}.vcf"
-    _stage_mark(run_id, 12, total_steps, "write VCF")
-    _log(f"[{run_id}] Writing VCF to {vcf}")
+    _stage_mark(run_id, 12, total_steps, "stream VCF")
+    _log(f"[{run_id}] Streaming VCF to PLINK")
     t0 = time.perf_counter()
-    with open(vcf, "w") as f:
+
+    def _write_vcf_stream(handle) -> None:
         names = [f"ind_{i+1}" for i in range(ts.num_individuals)]
-        ts.write_vcf(f, individual_names=names, position_transform=lambda x: np.asarray(x) + 1)
-    _stage_done(run_id, "write VCF", t0)
+        ts.write_vcf(handle, individual_names=names, position_transform=lambda x: np.asarray(x) + 1)
+
+    _stage_done(run_id, "stream VCF", t0)
     _stage_mark(run_id, 13, total_steps, "VCF->PLINK conversion")
     _log(f"[{run_id}] Converting VCF to PLINK")
     t0 = time.perf_counter()
-    try:
-        run_plink_conversion(
-            str(vcf),
-            str(prefix),
-            cm_map_path=None,
-            threads=plink_threads,
-            memory_mb=plink_memory_mb,
-        )
-    finally:
-        vcf.unlink(missing_ok=True)
-        shutil.rmtree(vcf_tmp_dir, ignore_errors=True)
+    run_plink_conversion(
+        _write_vcf_stream,
+        str(prefix),
+        cm_map_path=None,
+        threads=plink_threads,
+        memory_mb=plink_memory_mb,
+    )
     _stage_done(run_id, "PLINK conversion", t0)
     bim_path = prefix.with_suffix(".bim")
     bim_n_variants = sum(1 for _ in open(bim_path, "r", encoding="utf-8", errors="replace"))

@@ -9,7 +9,6 @@ import re
 import signal
 import shutil
 import sys
-import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -173,14 +172,6 @@ def _default_work_root(out_dir: Path) -> Path:
         if base.exists():
             return (base / "gnomon_sims_work" / "figure1").resolve()
     return out_dir / "work"
-
-
-def _task_vcf_tmp_dir(work_root: Path, run_id: str) -> Path:
-    return work_root / f"{run_id}_vcf_tmp"
-
-
-def _cleanup_task_vcf_tmp_dir(work_root: Path, run_id: str) -> None:
-    shutil.rmtree(_task_vcf_tmp_dir(work_root, run_id), ignore_errors=True)
 
 
 def _install_task_termination_logging(run_id: str) -> dict[int, object]:
@@ -474,28 +465,19 @@ def _simulate_for_generation(
     _log(f"[{prefix}] Building dataframe (n_rows={len(rows)})")
     df = pd.DataFrame(rows)
 
-    # Keep the transient VCF out of the persistent results directory so worker
-    # failures cannot strand massive intermediates there.
-    vcf_tmp_root = _task_vcf_tmp_dir(work_root, prefix)
-    _cleanup_task_vcf_tmp_dir(work_root, prefix)
-    vcf_tmp_root.mkdir(parents=True, exist_ok=True)
-    vcf_tmp_dir = Path(tempfile.mkdtemp(prefix=f"{prefix}_", dir=vcf_tmp_root))
-    vcf_path = vcf_tmp_dir / f"{prefix}.vcf"
-    try:
-        _log(f"[{prefix}] Writing VCF to {vcf_path}")
-        with open(vcf_path, "w") as f:
-            names = [f"ind_{i+1}" for i in range(ts.num_individuals)]
-            ts.write_vcf(f, individual_names=names, position_transform=lambda x: np.asarray(x) + 1)
-        _log(f"[{prefix}] Converting VCF to PLINK")
-        run_plink_conversion(
-            str(vcf_path),
-            str(out_dir / prefix),
-            cm_map_path=None,
-            threads=plink_threads,
-            memory_mb=plink_memory_mb,
-        )
-    finally:
-        _cleanup_task_vcf_tmp_dir(work_root, prefix)
+    def _write_vcf_stream(handle) -> None:
+        _log(f"[{prefix}] Streaming VCF to PLINK")
+        names = [f"ind_{i+1}" for i in range(ts.num_individuals)]
+        ts.write_vcf(handle, individual_names=names, position_transform=lambda x: np.asarray(x) + 1)
+
+    _log(f"[{prefix}] Converting simulated variants to PLINK")
+    run_plink_conversion(
+        _write_vcf_stream,
+        str(out_dir / prefix),
+        cm_map_path=None,
+        threads=plink_threads,
+        memory_mb=plink_memory_mb,
+    )
     bim_path = out_dir / f"{prefix}.bim"
     bim_n_variants = sum(1 for _ in open(bim_path, "r", encoding="utf-8", errors="replace"))
     bim_pos = set()
@@ -1656,8 +1638,6 @@ def main() -> None:
         raise
     finally:
         ex.shutdown(wait=not pool_failed, cancel_futures=pool_failed)
-        for task in tasks:
-            _cleanup_task_vcf_tmp_dir(work_root, f"fig1_g{int(task['g'])}_s{int(task['seed'])}")
 
     _aggregate_and_plot(done, out_dir=out_dir, demography_split_gens=int(sorted(args.gens)[len(args.gens) // 2]))
 
