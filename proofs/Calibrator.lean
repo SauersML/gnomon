@@ -472,6 +472,69 @@ section NoAxioms
 
 variable {t : ℕ}
 
+/-- A rigorous proof of the LD decay sketching theorem:
+    When tagging efficiency strictly decays exponentially with distance
+    (`tagging_efficiency d = exp(-lambda * d)`), no linear function
+    can calibrate the slope across all distances perfectly.
+    This resolves the specification gaming of abstract un-representability hypotheses
+    by using the concrete property of the exponential function. -/
+theorem ld_decay_implies_nonlinear_calibration_sketch_proved {k : ℕ} [Fintype (Fin k)]
+    (mech : LDDecayMechanism k)
+    (lambda : ℝ) (h_lambda_pos : 0 < lambda)
+    (h_tag : ∀ d, mech.tagging_efficiency d = Real.exp (- (lambda * d)))
+    (h_surj : Set.range mech.distance = Set.Ici 0) :
+    ∀ (beta0 beta1 : ℝ),
+      (fun c => beta0 + beta1 * mech.distance c) ≠
+        (fun c => decaySlope mech c) := by
+  intro beta0 beta1 h_eq
+  have h_forall : ∀ c, beta0 + beta1 * mech.distance c = Real.exp (- (lambda * mech.distance c)) := by
+    intro c
+    have h_c := congr_fun h_eq c
+    unfold decaySlope at h_c
+    rw [h_tag] at h_c
+    exact h_c
+  have h_exp : ∀ d ≥ 0, beta0 + beta1 * d = Real.exp (- (lambda * d)) := by
+    intro d hd
+    have hd_in_range : d ∈ Set.range mech.distance := by
+      rw [h_surj]
+      exact hd
+    rcases hd_in_range with ⟨c, hc⟩
+    rw [← hc]
+    exact h_forall c
+  have h0 := h_exp 0 (by norm_num)
+  have h1 := h_exp (1 / lambda) (by positivity)
+  have h2 := h_exp (2 / lambda) (by positivity)
+  simp only [mul_zero, add_zero, neg_zero, Real.exp_zero] at h0
+  have hl1 : lambda * (1 / lambda) = 1 := mul_one_div_cancel (ne_of_gt h_lambda_pos)
+  have hl2 : lambda * (2 / lambda) = 2 := by
+    calc lambda * (2 / lambda) = 2 * (lambda * (1 / lambda)) := by ring
+         _ = 2 * 1 := by rw [hl1]
+         _ = 2 := by ring
+  rw [hl1] at h1
+  rw [hl2] at h2
+  rw [h0] at h1 h2
+  have hb : beta1 * (1 / lambda) = Real.exp (-1) - 1 := by linarith
+  have h_sub : 1 + 2 * (beta1 * (1 / lambda)) = 1 + beta1 * (2 / lambda) := by ring
+  rw [← h_sub] at h2
+  rw [hb] at h2
+  have h_eq_e : 2 * Real.exp (-1) - 1 = Real.exp (-2) := by linarith
+  have hexp_sq : Real.exp (-2) = (Real.exp (-1))^2 := by
+    calc
+      Real.exp (-2) = Real.exp (-1 + -1) := by norm_num
+      _ = Real.exp (-1) * Real.exp (-1) := by rw [← Real.exp_add]
+      _ = (Real.exp (-1))^2 := by ring
+  rw [hexp_sq] at h_eq_e
+  have h_sq_zero : (Real.exp (-1) - 1)^2 = 0 := by
+    calc (Real.exp (-1) - 1)^2 = (Real.exp (-1))^2 - 2 * Real.exp (-1) + 1 := by ring
+    _ = (2 * Real.exp (-1) - 1) - 2 * Real.exp (-1) + 1 := by rw [← h_eq_e]
+    _ = 0 := by ring
+  have h_exp_one : Real.exp (-1) - 1 = 0 := sq_eq_zero_iff.mp h_sq_zero
+  have h_exp_one' : Real.exp (-1) = 1 := by linarith
+  have h_exp_zero : Real.exp 0 = 1 := Real.exp_zero
+  have h_inj := Real.exp_injective
+  have h_neg_one_eq_zero : (-1 : ℝ) = 0 := h_inj (h_exp_one'.trans h_exp_zero.symm)
+  norm_num at h_neg_one_eq_zero
+
 /-- Abstract API wrapper: any concrete witness for the demographic covariance lower bound
     yields strict covariance mismatch in arbitrary matrix dimension. -/
 theorem covariance_mismatch_pos_of_fst_and_sparse_array_proved
