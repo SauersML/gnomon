@@ -860,6 +860,43 @@ noncomputable def bernoulliKLReal (p q : ℝ) : ℝ :=
 noncomputable def klBern (p q : UnitProb) : ℝ :=
   bernoulliKLReal p.1 q.1
 
+theorem klBern_nonneg (p q : UnitProb)
+    (hp0 : 0 < p.1) (hp1 : p.1 < 1) (hq0 : 0 < q.1) (hq1 : q.1 < 1) :
+    0 ≤ klBern p q := by
+  have h_bernoulli : 0 ≤ bernoulliKLReal p.1 q.1 := by
+    have hp_ne : p.1 ≠ 0 := ne_of_gt hp0
+    have hp1_ne : 1 - p.1 ≠ 0 := sub_ne_zero.mpr (ne_of_lt hp1).symm
+    have h1 : Real.log (q.1 / p.1) ≤ q.1 / p.1 - 1 := by
+      apply Real.log_le_sub_one_of_pos
+      apply div_pos hq0 hp0
+    have h2 : Real.log ((1 - q.1) / (1 - p.1)) ≤ (1 - q.1) / (1 - p.1) - 1 := by
+      apply Real.log_le_sub_one_of_pos
+      apply div_pos (sub_pos.mpr hq1) (sub_pos.mpr hp1)
+    have h3 : p.1 * Real.log (q.1 / p.1) ≤ p.1 * (q.1 / p.1 - 1) := mul_le_mul_of_nonneg_left h1 (le_of_lt hp0)
+    have h4 : (1 - p.1) * Real.log ((1 - q.1) / (1 - p.1)) ≤ (1 - p.1) * ((1 - q.1) / (1 - p.1) - 1) := mul_le_mul_of_nonneg_left h2 (sub_nonneg.mpr (le_of_lt hp1))
+    have h5 : p.1 * Real.log (q.1 / p.1) + (1 - p.1) * Real.log ((1 - q.1) / (1 - p.1)) ≤ p.1 * (q.1 / p.1 - 1) + (1 - p.1) * ((1 - q.1) / (1 - p.1) - 1) := add_le_add h3 h4
+    have h6 : p.1 * (q.1 / p.1 - 1) + (1 - p.1) * ((1 - q.1) / (1 - p.1) - 1) = 0 := by
+      calc
+        p.1 * (q.1 / p.1 - 1) + (1 - p.1) * ((1 - q.1) / (1 - p.1) - 1) = p.1 * (q.1 / p.1) - p.1 + (1 - p.1) * ((1 - q.1) / (1 - p.1)) - (1 - p.1) := by ring
+        _ = q.1 - p.1 + (1 - q.1) - (1 - p.1) := by
+          rw [mul_div_cancel₀ _ hp_ne, mul_div_cancel₀ _ hp1_ne]
+        _ = 0 := by ring
+    have h7 : p.1 * Real.log (q.1 / p.1) + (1 - p.1) * Real.log ((1 - q.1) / (1 - p.1)) ≤ 0 := by linarith
+    have h8 : Real.log (p.1 / q.1) = - Real.log (q.1 / p.1) := by
+      have h_inv : (q.1 / p.1)⁻¹ = p.1 / q.1 := inv_div q.1 p.1
+      rw [← h_inv, Real.log_inv]
+    have h9 : Real.log ((1 - p.1) / (1 - q.1)) = - Real.log ((1 - q.1) / (1 - p.1)) := by
+      have h_inv : ((1 - q.1) / (1 - p.1))⁻¹ = (1 - p.1) / (1 - q.1) := inv_div (1 - q.1) (1 - p.1)
+      rw [← h_inv, Real.log_inv]
+    unfold bernoulliKLReal
+    calc
+      0 ≤ - (p.1 * Real.log (q.1 / p.1) + (1 - p.1) * Real.log ((1 - q.1) / (1 - p.1))) := neg_nonneg.mpr h7
+      _ = - (p.1 * Real.log (q.1 / p.1)) - ((1 - p.1) * Real.log ((1 - q.1) / (1 - p.1))) := by ring
+      _ = p.1 * -Real.log (q.1 / p.1) + (1 - p.1) * -Real.log ((1 - q.1) / (1 - p.1)) := by ring
+      _ = p.1 * Real.log (p.1 / q.1) + (1 - p.1) * Real.log ((1 - p.1) / (1 - q.1)) := by rw [←h8, ←h9]
+  unfold klBern
+  exact h_bernoulli
+
 /-- Pointwise log-loss regret equals Bernoulli KL. -/
 theorem logLoss_regret_eq_kl_pointwise (p q : ℝ)
     (hp0 : 0 < p) (hp1 : p < 1) (hq0 : 0 < q) (hq1 : q < 1) :
