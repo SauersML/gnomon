@@ -1,0 +1,19 @@
+name: Repro PLINK Sample ID Split
+
+on:
+  workflow_dispatch:
+
+jobs:
+  repro:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install repro dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl unzip python3
+
+      - name: Run PLINK 1.9 sample ID repro
+        run: bash sims/repro_plink_sample_id_split.sh

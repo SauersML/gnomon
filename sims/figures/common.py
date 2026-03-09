@@ -11,6 +11,10 @@ from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 
 
+def plink_safe_individual_id(index_0based: int) -> str:
+    return f"ind{int(index_0based) + 1}"
+
+
 def simulate_effect_size_distribution(
     n_effects: int = 200000,
     seed: int = 2026,

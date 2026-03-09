@@ -33,6 +33,7 @@ from .common import (
     compute_pcs_risk_and_diagnostics,
     solve_intercept_for_prevalence,
     get_chr22_recomb_map,
+    plink_safe_individual_id,
 )
 from methods.raw_pgs import RawPGSMethod
 from methods.linear_interaction import LinearInteractionMethod
@@ -446,7 +447,7 @@ def _simulate_for_generation(
             group = "AFR_cal"
         elif i in afr_test_set:
             group = "AFR_test"
-        iid = f"ind_{i+1}"
+        iid = plink_safe_individual_id(i)
         row = {
             "IID": iid,
             "individual_id": iid,
@@ -467,7 +468,7 @@ def _simulate_for_generation(
 
     def _write_vcf_stream(handle) -> None:
         _log(f"[{prefix}] Streaming VCF to PLINK")
-        names = [f"ind_{i+1}" for i in range(ts.num_individuals)]
+        names = [plink_safe_individual_id(i) for i in range(ts.num_individuals)]
         ts.write_vcf(handle, individual_names=names, position_transform=lambda x: np.asarray(x) + 1)
 
     _log(f"[{prefix}] Converting simulated variants to PLINK")

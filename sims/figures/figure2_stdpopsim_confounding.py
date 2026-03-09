@@ -34,6 +34,7 @@ from .common import (
     compute_pcs_risk_and_diagnostics,
     solve_intercept_for_prevalence,
     pop_names_from_ts,
+    plink_safe_individual_id,
 )
 from methods.raw_pgs import RawPGSMethod
 from methods.linear_interaction import LinearInteractionMethod
@@ -924,7 +925,7 @@ def _simulate(
 
     for i in range(len(pop_label)):
         grp = str(group_arr[i])
-        iid = f"ind_{i+1}"
+        iid = plink_safe_individual_id(i)
         row = {
             "IID": iid,
             "individual_id": iid,
@@ -954,7 +955,7 @@ def _simulate(
     t0 = time.perf_counter()
 
     def _write_vcf_stream(handle) -> None:
-        names = [f"ind_{i+1}" for i in range(ts.num_individuals)]
+        names = [plink_safe_individual_id(i) for i in range(ts.num_individuals)]
         ts.write_vcf(handle, individual_names=names, position_transform=lambda x: np.asarray(x) + 1)
 
     _stage_done(run_id, "stream VCF", t0)
