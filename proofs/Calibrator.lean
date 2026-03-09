@@ -516,4 +516,84 @@ theorem target_r2_drop_of_fst_and_sparse_array_proved
     h_mse_gap_lb h_lam_pos h_mismatch h_varY_pos
 
 end NoAxioms
+
+/-- Concrete mathematical proof of non-linearity replacing tautological hypotheses. -/
+theorem ld_decay_implies_nonlinear_calibration_proved {k : ℕ} [Fintype (Fin k)]
+    (mech : LDDecayMechanism k)
+    (lambda : ℝ) (h_lambda_pos : 0 < lambda)
+    (h_tag : ∀ c, mech.tagging_efficiency (mech.distance c) = Real.exp (- (lambda * mech.distance c)))
+    (c0 c1 c2 : Fin k → ℝ)
+    (h_d0 : mech.distance c0 = 0)
+    (h_d1 : mech.distance c1 = 1)
+    (h_d2 : mech.distance c2 = 2) :
+    ∀ (beta0 beta1 : ℝ),
+      (fun c => beta0 + beta1 * mech.distance c) ≠
+        (fun c => decaySlope mech c) := by
+  intro b0 b1 h_eq
+  have h_forall : ∀ c, b0 + b1 * mech.distance c = Real.exp (- (lambda * mech.distance c)) := by
+    intro c
+    have h1 := congr_fun h_eq c
+    unfold decaySlope at h1
+    rw [h1, h_tag c]
+
+  have h0 : b0 + b1 * 0 = Real.exp (- (lambda * 0)) := by
+    have hc := h_forall c0
+    rw [h_d0] at hc
+    exact hc
+  have h1 : b0 + b1 * 1 = Real.exp (- (lambda * 1)) := by
+    have hc := h_forall c1
+    rw [h_d1] at hc
+    exact hc
+  have h2 : b0 + b1 * 2 = Real.exp (- (lambda * 2)) := by
+    have hc := h_forall c2
+    rw [h_d2] at hc
+    exact hc
+
+  have h0_simp : b0 = 1 := by
+    have h_exp_0 : Real.exp (- (lambda * 0)) = 1 := by
+      have : - (lambda * 0) = 0 := by ring
+      rw [this, Real.exp_zero]
+    have h_b0 : b0 + b1 * 0 = b0 := by ring
+    rw [h_b0] at h0
+    rw [h_exp_0] at h0
+    exact h0
+
+  have h1_simp : b1 = Real.exp (-lambda) - 1 := by
+    have h_exp_1 : Real.exp (- (lambda * 1)) = Real.exp (-lambda) := by
+      have : - (lambda * 1) = -lambda := by ring
+      rw [this]
+    have h_b1 : b0 + b1 * 1 = b0 + b1 := by ring
+    rw [h_b1] at h1
+    rw [h_exp_1] at h1
+    rw [h0_simp] at h1
+    linarith
+
+  have h2_simp : 1 + 2 * (Real.exp (-lambda) - 1) = Real.exp (- (lambda * 2)) := by
+    have h_b2 : b0 + b1 * 2 = b0 + 2 * b1 := by ring
+    rw [h_b2] at h2
+    rw [h0_simp, h1_simp] at h2
+    exact h2
+
+  have h_x_eq : (Real.exp (-lambda) - 1)^2 = 0 := by
+    have h_exp_2 : Real.exp (- (lambda * 2)) = Real.exp (-lambda)^2 := by
+      have : - (lambda * 2) = -lambda + -lambda := by ring
+      rw [this, Real.exp_add]
+      ring
+    rw [h_exp_2] at h2_simp
+    have h_eq : 1 + 2 * (Real.exp (-lambda) - 1) = Real.exp (-lambda)^2 := h2_simp
+    calc (Real.exp (-lambda) - 1)^2 = Real.exp (-lambda)^2 - 2 * Real.exp (-lambda) + 1 := by ring
+    _ = (1 + 2 * (Real.exp (-lambda) - 1)) - 2 * Real.exp (-lambda) + 1 := by rw [← h_eq]
+    _ = 0 := by ring
+
+  have h_x_one : Real.exp (-lambda) = 1 := by
+    have h_sub : Real.exp (-lambda) - 1 = 0 := sq_eq_zero_iff.mp h_x_eq
+    linarith
+
+  have h_lambda_zero : -lambda = 0 := by
+    have h_one : Real.exp 0 = 1 := Real.exp_zero
+    rw [← h_one] at h_x_one
+    exact Real.exp_injective h_x_one
+
+  linarith
+
 end Calibrator
