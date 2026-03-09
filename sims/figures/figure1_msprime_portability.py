@@ -200,23 +200,6 @@ def _restore_task_termination_logging(previous: dict[int, object]) -> None:
             continue
 
 
-def _truncate_ratemap(rate_map: msprime.RateMap, bp_cap: int | None) -> msprime.RateMap:
-    if bp_cap is None:
-        return rate_map
-    cap = int(bp_cap)
-    if cap <= 0:
-        raise ValueError("bp_cap must be positive")
-    pos = np.asarray(rate_map.position, dtype=float)
-    rates = np.asarray(rate_map.rate, dtype=float)
-    if cap >= int(pos[-1]):
-        return rate_map
-    i = int(np.searchsorted(pos, float(cap), side="right") - 1)
-    i = max(0, min(i, len(rates) - 1))
-    new_pos = np.concatenate([pos[: i + 1], np.asarray([float(cap)])])
-    new_rates = rates[: i + 1]
-    return msprime.RateMap(position=new_pos, rate=new_rates)
-
-
 def _resource_plan(
     n_tasks: int,
     total_threads_override: int | None = None,
@@ -343,7 +326,14 @@ def _simulate_for_generation(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     _log(f"[{prefix}] Loading/truncating recombination map (bp_cap={bp_cap})")
-    recomb_map = _truncate_ratemap(get_chr22_recomb_map(), bp_cap=bp_cap)
+    if bp_cap is not None:
+        if int(bp_cap) <= 0:
+            raise ValueError("bp_cap must be positive")
+        # For short debug runs, use a simple capped map instead of truncating chr22's
+        # HapMap map into its leading no-data interval.
+        recomb_map = msprime.RateMap(position=[0.0, float(int(bp_cap))], rate=[1e-8])
+    else:
+        recomb_map = get_chr22_recomb_map()
     _log(f"[{prefix}] Building demography for split_gens={gens}")
     dem = _build_demography(gens)
 
