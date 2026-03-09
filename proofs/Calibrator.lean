@@ -516,4 +516,65 @@ theorem target_r2_drop_of_fst_and_sparse_array_proved
     h_mse_gap_lb h_lam_pos h_mismatch h_varY_pos
 
 end NoAxioms
+
+/-- A concrete proof of non-linearity for LD decay.
+    This resolves the vacuous verification in `ld_decay_implies_nonlinear_calibration_sketch`
+    by using an explicit exponential decay function instead of a tautological hypothesis. -/
+theorem ld_decay_implies_nonlinear_calibration_sketch_proved {k : ℕ} [Fintype (Fin k)]
+    (mech : Calibrator.LDDecayMechanism k) (lambda : ℝ) (h_lambda_pos : 0 < lambda)
+    (h_eff : ∀ d, mech.tagging_efficiency d = Real.exp (-lambda * d))
+    (h_dist_surj : {0, 1, 2} ⊆ Set.range mech.distance) :
+    ∀ (beta0 beta1 : ℝ),
+      (fun c => beta0 + beta1 * mech.distance c) ≠
+        (fun c => Calibrator.decaySlope mech c) := by
+  intro beta0 beta1 h_eq
+  have h_forall : ∀ c, beta0 + beta1 * mech.distance c = mech.tagging_efficiency (mech.distance c) :=
+    fun c => congr_fun h_eq c
+
+  have h_eq_d : ∀ d ∈ ({0, 1, 2} : Set ℝ), Real.exp (-lambda * d) = beta0 + beta1 * d := by
+    intro d hd
+    obtain ⟨c, hc⟩ := h_dist_surj hd
+    rw [← hc]
+    rw [← h_eff (mech.distance c)]
+    exact (h_forall c).symm
+
+  have h0 : Real.exp (-lambda * 0) = beta0 + beta1 * 0 := h_eq_d 0 (by simp)
+  have h1 : Real.exp (-lambda * 1) = beta0 + beta1 * 1 := h_eq_d 1 (by simp)
+  have h2 : Real.exp (-lambda * 2) = beta0 + beta1 * 2 := h_eq_d 2 (by simp)
+
+  have h_zero : -lambda * 0 = 0 := by ring
+  rw [h_zero, Real.exp_zero] at h0
+  have h0_eq : beta0 = 1 := by linarith
+
+  have h_one : -lambda * 1 = -lambda := by ring
+  rw [h_one] at h1
+  have h1' : beta1 = Real.exp (-lambda) - 1 := by linarith [h0_eq, h1]
+
+  have h2' : Real.exp (-lambda * 2) = 1 + 2 * (Real.exp (-lambda) - 1) := by
+    calc Real.exp (-lambda * 2) = beta0 + beta1 * 2 := h2
+      _ = 1 + beta1 * 2 := by rw [h0_eq]
+      _ = 1 + (Real.exp (-lambda) - 1) * 2 := by rw [h1']
+      _ = 1 + 2 * (Real.exp (-lambda) - 1) := by ring
+
+  have h_add : -lambda * 2 = -lambda + -lambda := by ring
+  have h_sq : Real.exp (-lambda * 2) = (Real.exp (-lambda))^2 := by
+    rw [h_add, Real.exp_add]
+    ring
+
+  rw [h_sq] at h2'
+  have h_quad : (Real.exp (-lambda))^2 - 2 * Real.exp (-lambda) + 1 = 0 := by linarith [h2']
+  have h_factor : (Real.exp (-lambda) - 1)^2 = 0 := by
+    calc (Real.exp (-lambda) - 1)^2 = (Real.exp (-lambda))^2 - 2 * Real.exp (-lambda) + 1 := by ring
+      _ = 0 := h_quad
+
+  have h_root : Real.exp (-lambda) - 1 = 0 := sq_eq_zero_iff.mp h_factor
+  have h_exp_eq_one : Real.exp (-lambda) = 1 := by linarith
+
+  have h_exp_zero : Real.exp 0 = 1 := Real.exp_zero
+  have h_eq_zero : -lambda = 0 := by
+    apply Real.exp_injective
+    rw [h_exp_eq_one, ← h_exp_zero]
+
+  linarith
+
 end Calibrator
