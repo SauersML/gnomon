@@ -515,5 +515,122 @@ theorem target_r2_drop_of_fst_and_sparse_array_proved
     mseSource mseTarget varY lam sigmaSource sigmaTarget
     h_mse_gap_lb h_lam_pos h_mismatch h_varY_pos
 
+/-- Concrete instance of LD decay mechanism using exponential decay. -/
+noncomputable def exponentialLDDecay (k : ℕ) [Fintype (Fin k)]
+    (dist : (Fin k → ℝ) → ℝ) (lambda : ℝ) : LDDecayMechanism k where
+  distance := dist
+  tagging_efficiency := fun d => Real.exp (- (lambda * d))
+
+/-- A concrete proof that exponential LD decay cannot be perfectly captured by a linear calibration.
+    This avoids the tautological `h_nonlin` hypothesis in `ld_decay_implies_nonlinear_calibration_sketch`
+    by providing a specific, mathematically rigorous counterexample. -/
+theorem exponential_ld_decay_implies_nonlinear_calibration_proved
+    (k : ℕ) [Fintype (Fin k)] (dist : (Fin k → ℝ) → ℝ)
+    (lambda : ℝ) (h_lambda_pos : 0 < lambda)
+    (c0 c1 c2 : Fin k → ℝ)
+    (h_dist0 : dist c0 = 0)
+    (h_dist1 : dist c1 = 1)
+    (h_dist2 : dist c2 = 2) :
+    ∀ (beta0 beta1 : ℝ),
+      (fun c => beta0 + beta1 * dist c) ≠
+      (fun c => decaySlope (exponentialLDDecay k dist lambda) c) := by
+  intro beta0 beta1 h_eq
+  have h0 := congr_fun h_eq c0
+  have h1 := congr_fun h_eq c1
+  have h2 := congr_fun h_eq c2
+
+  unfold decaySlope exponentialLDDecay at h0 h1 h2
+  dsimp at h0 h1 h2
+
+  rw [h_dist0] at h0
+  rw [h_dist1] at h1
+  rw [h_dist2] at h2
+
+  have h0_simp : beta0 = 1 := by
+    have h_inner : - (lambda * 0) = 0 := by ring
+    rw [h_inner, Real.exp_zero] at h0
+    linarith
+
+  have h1_simp : beta0 + beta1 = Real.exp (-lambda) := by
+    have h_inner : - (lambda * 1) = -lambda := by ring
+    rw [h_inner] at h1
+    linarith
+
+  have h2_simp : beta0 + 2 * beta1 = Real.exp (-2 * lambda) := by
+    have h_inner : - (lambda * 2) = -2 * lambda := by ring
+    rw [h_inner] at h2
+    linarith
+
+  have h_beta1 : beta1 = Real.exp (-lambda) - 1 := by
+    linarith
+
+  have h_subst : 1 + 2 * (Real.exp (-lambda) - 1) = Real.exp (-2 * lambda) := by
+    linarith
+
+  set x := Real.exp (-lambda)
+  have hx_sq : x^2 = Real.exp (-2 * lambda) := by
+    calc
+      x^2 = x * x := by ring
+      _ = Real.exp (-lambda) * Real.exp (-lambda) := rfl
+      _ = Real.exp (-lambda + -lambda) := (Real.exp_add (-lambda) (-lambda)).symm
+      _ = Real.exp (-2 * lambda) := by congr 1; ring
+
+  have h_eq_x : 1 + 2 * (x - 1) = x^2 := by
+    linarith [h_subst, hx_sq]
+
+  have h_root : (x - 1)^2 = 0 := by
+    calc
+      (x - 1)^2 = x^2 - 2 * x + 1 := by ring
+      _ = 1 + 2 * (x - 1) - 2 * x + 1 := by rw [← h_eq_x]
+      _ = 0 := by ring
+
+  have h_x_eq_1 : x = 1 := by
+    have h_zero : x - 1 = 0 := sq_eq_zero_iff.mp h_root
+    linarith
+
+  have h_x_lt_1 : x < 1 := by
+    have h_neg_lambda : -lambda < 0 := neg_lt_zero.mpr h_lambda_pos
+    have h_exp_0 : Real.exp 0 = 1 := Real.exp_zero
+    rw [← h_exp_0]
+    exact Real.exp_lt_exp.mpr h_neg_lambda
+
+  linarith
+
+/-- Drift monotonically degrades present-day `R²` when `V_A, V_E > 0` and `fst < 1`.
+    This removes the vacuous `hmono` hypothesis from `drift_degrades_R2`. -/
+theorem drift_degrades_R2_proved
+    (V_A V_E fstS fstT : ℝ)
+    (hVA : 0 < V_A)
+    (hVE : 0 < V_E)
+    (hfst : fstS < fstT)
+    (hfstT_lt_one : fstT < 1) :
+    presentDayR2 V_A V_E fstT < presentDayR2 V_A V_E fstS := by
+  have hfstS_lt_one : fstS < 1 := lt_trans hfst hfstT_lt_one
+  have hvT_nonneg : 0 ≤ presentDayPGSVariance V_A fstT := by
+    unfold presentDayPGSVariance
+    have : 0 ≤ 1 - fstT := by linarith
+    exact mul_nonneg this (le_of_lt hVA)
+  have hvT_lt_vS : presentDayPGSVariance V_A fstT < presentDayPGSVariance V_A fstS := by
+    unfold presentDayPGSVariance
+    nlinarith [mul_lt_mul_of_pos_right hfst hVA]
+  have h_expR2 : expectedR2 (presentDayPGSVariance V_A fstT) V_E <
+                 expectedR2 (presentDayPGSVariance V_A fstS) V_E :=
+    expectedR2_strictMono_nonneg V_E (presentDayPGSVariance V_A fstT) (presentDayPGSVariance V_A fstS) hVE hvT_nonneg hvT_lt_vS
+  exact h_expR2
+
+/-- Headline portability theorem without vacuous `hmono`. -/
+theorem portability_ratio_lt_one_of_positive_drift_proved
+    (V_A V_E fstS fstT : ℝ)
+    (hVA : 0 < V_A)
+    (hVE : 0 < V_E)
+    (hfst : fstS < fstT)
+    (hfstT_lt_one : fstT < 1)
+    (hsrc_pos : 0 < presentDayR2 V_A V_E fstS) :
+    presentDayR2 V_A V_E fstT / presentDayR2 V_A V_E fstS < 1 := by
+  have hdrop : presentDayR2 V_A V_E fstT < presentDayR2 V_A V_E fstS :=
+    drift_degrades_R2_proved V_A V_E fstS fstT hVA hVE hfst hfstT_lt_one
+  exact portability_ratio_lt_one_of_drop (presentDayR2 V_A V_E fstS)
+    (presentDayR2 V_A V_E fstT) hsrc_pos hdrop
+
 end NoAxioms
 end Calibrator
