@@ -1017,6 +1017,77 @@ theorem ld_decay_implies_nonlinear_calibration_sketch {k : ℕ} [Fintype (Fin k)
   obtain ⟨c, hc⟩ := hd
   rw [← hc, h_forall c]
 
+theorem ld_decay_implies_nonlinear_calibration_proved {k : ℕ} [Fintype (Fin k)]
+    (mech : LDDecayMechanism k)
+    (lambda : ℝ) (h_lambda : 0 < lambda)
+    (h_exp_decay : ∀ c, mech.tagging_efficiency (mech.distance c) = Real.exp (-(lambda * mech.distance c)))
+    (h_distance_surj : Set.range mech.distance ⊇ {0, 1 / lambda, 2 / lambda}) :
+    ∀ (beta0 beta1 : ℝ),
+      (fun c => beta0 + beta1 * mech.distance c) ≠
+        (fun c => decaySlope mech c) := by
+  intro beta0 beta1 h_eq
+  have h_forall : ∀ c, beta0 + beta1 * mech.distance c = Real.exp (-(lambda * mech.distance c)) := by
+    intro c
+    have h_eval := congr_fun h_eq c
+    unfold decaySlope at h_eval
+    rw [h_eval]
+    exact h_exp_decay c
+  have h_surj_0 : 0 ∈ Set.range mech.distance := h_distance_surj (by simp)
+  have h_surj_1 : 1 / lambda ∈ Set.range mech.distance := h_distance_surj (by simp)
+  have h_surj_2 : 2 / lambda ∈ Set.range mech.distance := h_distance_surj (by simp)
+  obtain ⟨c0, hc0⟩ := h_surj_0
+  obtain ⟨c1, hc1⟩ := h_surj_1
+  obtain ⟨c2, hc2⟩ := h_surj_2
+  have h0 := h_forall c0
+  have h1 := h_forall c1
+  have h2 := h_forall c2
+  rw [hc0] at h0
+  rw [hc1] at h1
+  rw [hc2] at h2
+  have h0_simpl : Real.exp (-(lambda * 0)) = beta0 + beta1 * 0 := h0.symm
+  have hl0 : -(lambda * 0) = 0 := by ring
+  rw [hl0, Real.exp_zero] at h0_simpl
+  have h_b0 : beta0 = 1 := by linarith [h0_simpl]
+  have h1_simpl : Real.exp (-(lambda * (1 / lambda))) = beta0 + beta1 * (1 / lambda) := h1.symm
+  have hl1 : lambda * (1 / lambda) = 1 := mul_one_div_cancel (ne_of_gt h_lambda)
+  have hl1_neg : -(lambda * (1 / lambda)) = -1 := by rw [hl1]
+  rw [hl1_neg, h_b0] at h1_simpl
+  have h2_simpl : Real.exp (-(lambda * (2 / lambda))) = beta0 + beta1 * (2 / lambda) := h2.symm
+  have hl2 : lambda * (2 / lambda) = 2 := by
+    calc lambda * (2 / lambda) = 2 * (lambda * (1 / lambda)) := by ring
+    _ = 2 * 1 := by rw [hl1]
+    _ = 2 := by ring
+  have hl2_neg : -(lambda * (2 / lambda)) = -2 := by rw [hl2]
+  rw [hl2_neg, h_b0] at h2_simpl
+  have h_beta1_div_lambda : beta1 * (1 / lambda) = Real.exp (-1) - 1 := by
+    linarith [h1_simpl]
+  have h_exp2 : Real.exp (-2) = 1 + 2 * (Real.exp (-1) - 1) := by
+    calc Real.exp (-2) = 1 + beta1 * (2 / lambda) := h2_simpl
+    _ = 1 + 2 * (beta1 * (1 / lambda)) := by ring
+    _ = 1 + 2 * (Real.exp (-1) - 1) := by rw [h_beta1_div_lambda]
+  have h_exp_sq : Real.exp (-2) = (Real.exp (-1)) ^ 2 := by
+    have h_pow : (Real.exp (-1)) ^ 2 = Real.exp (-1 * 2) := by
+      rw [← Real.exp_nat_mul]
+      congr 1
+      ring
+    rw [h_pow]
+    congr 1
+    ring
+  rw [h_exp_sq] at h_exp2
+  have h_quad : (Real.exp (-1) - 1) ^ 2 = 0 := by
+    calc (Real.exp (-1) - 1) ^ 2 = (Real.exp (-1)) ^ 2 - 2 * Real.exp (-1) + 1 := by ring
+    _ = (1 + 2 * (Real.exp (-1) - 1)) - 2 * Real.exp (-1) + 1 := by rw [← h_exp2]
+    _ = 0 := by ring
+  have h_exp_eq_one : Real.exp (-1) - 1 = 0 := sq_eq_zero_iff.mp h_quad
+  have h_exp_eq_one' : Real.exp (-1) = 1 := by linarith
+  have h_inj : (-1 : ℝ) = 0 := by
+    have h_one : (1 : ℝ) = Real.exp 0 := Real.exp_zero.symm
+    have h_exp_eq_exp : Real.exp (-1) = Real.exp 0 := by
+      calc Real.exp (-1) = 1 := h_exp_eq_one'
+      _ = Real.exp 0 := h_one
+    exact Real.exp_injective h_exp_eq_exp
+  norm_num at h_inj
+
 theorem optimal_slope_trace_variance {k : ℕ} [Fintype (Fin k)]
     (arch : GeneticArchitecture k) (c : Fin k → ℝ)
     (h_genic_pos : arch.V_genic c ≠ 0) :
