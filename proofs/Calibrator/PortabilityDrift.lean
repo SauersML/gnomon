@@ -391,12 +391,20 @@ theorem drift_degrades_signalToNoise
 theorem drift_degrades_R2
     (V_A V_E fstS fstT : ℝ)
     (hVA : 0 < V_A)
+    (hVE : 0 < V_E)
     (hfst : fstS < fstT)
-    (hmono : StrictMono (fun x : ℝ => x / (x + V_E))) :
+    (hfstT_le_one : fstT ≤ 1) :
     presentDayR2 V_A V_E fstT < presentDayR2 V_A V_E fstS := by
-  unfold presentDayR2 presentDayPGSVariance
-  apply hmono
-  nlinarith [mul_lt_mul_of_pos_right hfst hVA]
+  unfold presentDayR2
+  have h_var_lt : presentDayPGSVariance V_A fstT < presentDayPGSVariance V_A fstS := by
+    unfold presentDayPGSVariance
+    nlinarith [mul_lt_mul_of_pos_right hfst hVA]
+  have h_var_T_nonneg : 0 ≤ presentDayPGSVariance V_A fstT := by
+    unfold presentDayPGSVariance
+    exact mul_nonneg (by linarith) (le_of_lt hVA)
+  have h_mono : expectedR2 (presentDayPGSVariance V_A fstT) V_E < expectedR2 (presentDayPGSVariance V_A fstS) V_E :=
+    expectedR2_strictMono_nonneg V_E (presentDayPGSVariance V_A fstT) (presentDayPGSVariance V_A fstS) hVE h_var_T_nonneg h_var_lt
+  exact h_mono
 
 /-- Drift monotonically degrades AUC for any strictly increasing AUC link on SNR. -/
 theorem drift_degrades_AUC_of_strictMono
@@ -450,34 +458,37 @@ noncomputable def targetLinearRisk {p : ℕ}
     (w : Fin p → ℝ) : ℝ :=
   noiseVar + dotProduct w (sigmaObsTarget.mulVec w) - 2 * dotProduct w crossTarget
 
-/-- If source ERM satisfies source normal equations but not target normal equations,
-the learned projection is source-LD specific (Euro-centric mismatch statement). -/
-theorem source_erm_is_ld_specific_of_normal_eq_mismatch
-    {p : Nat}
-    (sigmaObsSource sigmaObsTarget : Matrix (Fin p) (Fin p) Real)
-    (crossSource crossTarget : Fin p -> Real)
-    (wSource : Fin p -> Real)
-    (_hSource : sigmaObsSource.mulVec wSource = crossSource)
-    (hMismatch : sigmaObsTarget.mulVec wSource ≠ crossTarget) :
-    ¬ sigmaObsTarget.mulVec wSource = crossTarget := by
-  exact hMismatch
+/-- Source ERM is LD-specific under concrete structural shifts:
+the optimal source weights do not solve the target normal equations. -/
+theorem source_erm_is_ld_specific_concrete :
+    sigmaObsTarget.mulVec wSource_opt ≠ crossTarget := by
+  intro h
+  have h_eval : sigmaObsTarget.mulVec wSource_opt = ![0.8, 0.08] := by
+    ext i
+    fin_cases i <;> norm_num [sigmaObsTarget, wSource_opt, Matrix.mulVec, dotProduct]
+  have h_cross : crossTarget = ![0.8, 0.0] := rfl
+  rw [h_eval, h_cross] at h
+  have h_1 : (![0.8, 0.08] : Fin 2 → ℝ) 1 = 0.08 := rfl
+  have h_2 : (![0.8, 0.0] : Fin 2 → ℝ) 1 = 0.0 := rfl
+  have h_eq : (0.08 : ℝ) = 0.0 := by
+    calc
+      (0.08 : ℝ) = (![0.8, 0.08] : Fin 2 → ℝ) 1 := h_1.symm
+      _ = (![0.8, 0.0] : Fin 2 → ℝ) 1 := by rw [h]
+      _ = 0.0 := h_2
+  norm_num at h_eq
 
-/-- If one coefficient vector solves source normal equations and another solves target normal equations,
-and no single vector can satisfy both systems, then source ERM and target ERM must differ. -/
-theorem source_target_erm_differ_of_ld_system_conflict
-    {p : Nat}
-    (sigmaObsSource sigmaObsTarget : Matrix (Fin p) (Fin p) Real)
-    (crossSource crossTarget : Fin p -> Real)
-    (wSource wTarget : Fin p -> Real)
-    (hSource : sigmaObsSource.mulVec wSource = crossSource)
-    (hTarget : sigmaObsTarget.mulVec wTarget = crossTarget)
-    (hConflict :
-      ∀ w : Fin p -> Real, sigmaObsSource.mulVec w = crossSource -> sigmaObsTarget.mulVec w ≠ crossTarget) :
-    wSource ≠ wTarget := by
-  intro hEq
-  have hNotTargetAtSource : sigmaObsTarget.mulVec wSource ≠ crossTarget := hConflict wSource hSource
-  have hTargetAtSource : sigmaObsTarget.mulVec wSource = crossTarget := by simpa [hEq] using hTarget
-  exact hNotTargetAtSource hTargetAtSource
+/-- Source and target ERM solutions differ explicitly under concrete LD structural shifts. -/
+theorem source_target_erm_differ_concrete :
+    wSource_opt ≠ wTarget_opt := by
+  intro h
+  have h_eval_source : wSource_opt 0 = 0.8 := rfl
+  have h_eval_target : wTarget_opt 0 = 80 / 99 := rfl
+  have h_eq : (0.8 : ℝ) = 80 / 99 := by
+    calc
+      (0.8 : ℝ) = wSource_opt 0 := h_eval_source.symm
+      _ = wTarget_opt 0 := by rw [h]
+      _ = 80 / 99 := h_eval_target
+  norm_num at h_eq
 
 /-- Multi-locus tag/causal architecture used in statistical genetics portability formulas. -/
 structure MultiLocusTagModel (p q : ℕ) where
@@ -785,12 +796,13 @@ theorem portability_ratio_lt_one_of_drop
 theorem portability_ratio_lt_one_of_positive_drift
     (V_A V_E fstS fstT : ℝ)
     (hVA : 0 < V_A)
+    (hVE : 0 < V_E)
     (hfst : fstS < fstT)
-    (hmono : StrictMono (fun x : ℝ => x / (x + V_E)))
+    (hfstT_le_one : fstT ≤ 1)
     (hsrc_pos : 0 < presentDayR2 V_A V_E fstS) :
     presentDayR2 V_A V_E fstT / presentDayR2 V_A V_E fstS < 1 := by
   have hdrop : presentDayR2 V_A V_E fstT < presentDayR2 V_A V_E fstS :=
-    drift_degrades_R2 V_A V_E fstS fstT hVA hfst hmono
+    drift_degrades_R2 V_A V_E fstS fstT hVA hVE hfst hfstT_le_one
   exact portability_ratio_lt_one_of_drop (presentDayR2 V_A V_E fstS)
     (presentDayR2 V_A V_E fstT) hsrc_pos hdrop
 
