@@ -1233,7 +1233,8 @@ def _run_generation_task(task: dict[str, object]) -> dict[str, object]:
                 f"train_accuracy={float(pt_meta['best_train_accuracy']):.4f}, "
                 f"train_balanced_accuracy={float(pt_meta.get('best_train_balanced_accuracy', float('nan'))):.4f}, "
                 f"train_auc={float(pt_meta.get('best_train_auc', float('nan'))):.4f}, "
-                f"n_snps={int(pt_meta['best_n_snps'])})"
+                f"n_snps={int(pt_meta['best_n_snps'])}, "
+                f"gwas_covars={','.join(pt_meta.get('gwas_covariates_kept', [])) or '<none>'})"
             )
             _log(f"[fig1_g{g}_s{seed}] P+T fit/scoring complete")
     except BaseException as e:

@@ -3,40 +3,15 @@ Fast pruning-and-thresholding (P+T) PRS wrapper built on PLINK2.
 """
 from __future__ import annotations
 
-import math
 import shutil
 import subprocess
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from figures.common import nagelkerke_r2_binary
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, roc_auc_score
-
-
-def _nagelkerke_r2_binary(y_true: np.ndarray, y_prob: np.ndarray, eps: float = 1e-15) -> float:
-    y = np.asarray(y_true, dtype=float)
-    p = np.asarray(y_prob, dtype=float)
-    mask = np.isfinite(y) & np.isfinite(p)
-    if not np.any(mask):
-        return np.nan
-    y = y[mask]
-    p = np.clip(p[mask], float(eps), 1.0 - float(eps))
-    n = int(y.size)
-    if n == 0:
-        return np.nan
-    y_mean = float(np.mean(y))
-    if not np.isfinite(y_mean) or y_mean <= 0.0 or y_mean >= 1.0:
-        return np.nan
-
-    ll_model = float(np.sum(y * np.log(p) + (1.0 - y) * np.log(1.0 - p)))
-    ll_null = float(np.sum(y * math.log(y_mean) + (1.0 - y) * math.log(1.0 - y_mean)))
-    cox_snell = 1.0 - math.exp((2.0 / n) * (ll_null - ll_model))
-    max_cox_snell = 1.0 - math.exp((2.0 / n) * ll_null)
-    if not np.isfinite(cox_snell) or not np.isfinite(max_cox_snell) or max_cox_snell <= 0.0:
-        return np.nan
-    out = cox_snell / max_cox_snell
-    return float(min(1.0, max(0.0, out)))
 
 
 class PPlusT:
@@ -71,6 +46,86 @@ class PPlusT:
         if res.returncode != 0:
             raise RuntimeError(
                 f"P+T command failed ({desc}) rc={res.returncode}\nSTDERR:\n{res.stderr}\nSTDOUT:\n{res.stdout}"
+            )
+
+    @staticmethod
+    def _read_covar_frame(path: str) -> pd.DataFrame:
+        covar = pd.read_csv(path, sep=r"\s+", header=None)
+        if covar.shape[1] < 2:
+            raise RuntimeError(f"P+T covariate file must contain at least FID/IID columns: {path}")
+        covar.columns = ["FID", "IID"] + [f"COVAR{i}" for i in range(1, covar.shape[1] - 1)]
+        return covar
+
+    @staticmethod
+    def _write_covar_subset(base: pd.DataFrame, keep_covars: list[str], path: str) -> None:
+        cols = ["FID", "IID", *keep_covars]
+        base.loc[:, cols].to_csv(path, sep=" ", header=False, index=False)
+
+    @staticmethod
+    def _is_vif_failure(res: subprocess.CompletedProcess[str]) -> bool:
+        stderr = res.stderr or ""
+        stdout = res.stdout or ""
+        return ("VIF_TOO_HIGH" in stderr) or ("VIF_TOO_HIGH" in stdout)
+
+    def _run_gwas_with_covar_backoff(
+        self,
+        *,
+        plink: str,
+        bfile_train: str,
+        pheno_file: str,
+        covar_file: str,
+        common: list[str],
+        glm_prefix: str,
+    ) -> tuple[str, list[str]]:
+        covar_base = self._read_covar_frame(covar_file)
+        keep_covars = [c for c in covar_base.columns if c not in {"FID", "IID"}]
+        attempt = 0
+
+        while True:
+            attempt += 1
+            attempt_prefix = glm_prefix if attempt == 1 else f"{glm_prefix}.retry{attempt}"
+            current_covar_file = covar_file if attempt == 1 else f"{glm_prefix}.covar_retry{attempt}"
+            if attempt > 1:
+                self._write_covar_subset(covar_base, keep_covars, current_covar_file)
+
+            glm_cmd = [
+                plink,
+                "--bfile",
+                bfile_train,
+                "--pheno",
+                pheno_file,
+                "--pheno-col-nums",
+                "3",
+                "--1",
+                "--glm",
+                "hide-covar",
+                "--allow-no-sex",
+                *common,
+                "--out",
+                attempt_prefix,
+            ]
+            if keep_covars:
+                glm_cmd.extend(["--covar", str(current_covar_file)])
+
+            covar_desc = ",".join(keep_covars) if keep_covars else "<none>"
+            print(f"[P+T] GWAS covariates attempt={attempt} keep={covar_desc}")
+            print(f"[P+T] GWAS: {' '.join(glm_cmd)}")
+            res = subprocess.run(glm_cmd, capture_output=True, text=True)
+            if res.returncode == 0:
+                if attempt > 1:
+                    print(f"[P+T] GWAS succeeded after dropping trailing covariates; kept={covar_desc}")
+                return attempt_prefix, keep_covars
+
+            if self._is_vif_failure(res) and keep_covars:
+                dropped = keep_covars[-1]
+                keep_covars = keep_covars[:-1]
+                next_covars = ",".join(keep_covars) if keep_covars else "<none>"
+                print(f"[P+T] GWAS VIF failure; dropping trailing covariate {dropped} and retrying with {next_covars}")
+                continue
+
+            covar_msg = covar_desc
+            raise RuntimeError(
+                f"P+T command failed (GWAS) rc={res.returncode} covars={covar_msg}\nSTDERR:\n{res.stderr}\nSTDOUT:\n{res.stdout}"
             )
 
     def _common(self) -> list[str]:
@@ -129,7 +184,7 @@ class PPlusT:
         acc = float(accuracy_score(y, yhat))
         bacc = float(balanced_accuracy_score(y, yhat))
         auc = float(roc_auc_score(y, p))
-        nagelkerke = float(_nagelkerke_r2_binary(y, p))
+        nagelkerke = float(nagelkerke_r2_binary(y, p))
         return acc, bacc, auc, nagelkerke, n
 
     @staticmethod
@@ -187,27 +242,14 @@ class PPlusT:
         )
 
         glm_prefix = f"{out_prefix}.gwas"
-        glm_cmd = [
-            plink,
-            "--bfile",
-            bfile_train,
-            "--pheno",
-            pheno_file,
-            "--pheno-col-nums",
-            "3",
-            # Our train.phen encodes binary phenotype as 0/1.
-            # Tell PLINK2 to interpret 0 as valid case/control coding
-            # rather than missing phenotype.
-            "--1",
-            "--glm",
-            "hide-covar",
-            "--allow-no-sex",
-            *common,
-            "--out",
-            glm_prefix,
-        ]
-        glm_cmd.extend(["--covar", str(covar_file)])
-        self._run(glm_cmd, "GWAS")
+        glm_prefix, gwas_covars_kept = self._run_gwas_with_covar_backoff(
+            plink=plink,
+            bfile_train=bfile_train,
+            pheno_file=pheno_file,
+            covar_file=str(covar_file),
+            common=common,
+            glm_prefix=glm_prefix,
+        )
         glm_files = sorted(Path(".").glob(f"{Path(glm_prefix).name}*.glm.*"))
         if not glm_files:
             glm_files = sorted(Path(Path(glm_prefix).parent).glob(f"{Path(glm_prefix).name}*.glm.*"))
@@ -437,6 +479,7 @@ class PPlusT:
             "best_train_balanced_accuracy": float(metrics.loc[best_idx, "train_balanced_accuracy"]),
             "best_train_auc": float(metrics.loc[best_idx, "train_auc"]),
             "best_n_snps": int(metrics.loc[best_idx, "n_snps"]),
+            "gwas_covariates_kept": list(gwas_covars_kept),
             "threshold_metrics": metrics,
         }
         return best_train_scores, best_test_scores, meta
