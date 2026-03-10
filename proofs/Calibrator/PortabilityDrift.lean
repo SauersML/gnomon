@@ -368,6 +368,7 @@ theorem presentDayR2_eq_statistical_rsquared
 noncomputable def expectedR2 (vSignal V_E : ℝ) : ℝ :=
   vSignal / (vSignal + V_E)
 
+
 /-- Generic present-day AUC map from signal-to-noise (e.g. Gaussian-liability link). -/
 noncomputable def presentDayAUC (aucLink : ℝ → ℝ) (V_A V_E fst : ℝ) : ℝ :=
   aucLink (presentDaySignalToNoise V_A V_E fst)
@@ -397,6 +398,50 @@ theorem drift_degrades_R2
   unfold presentDayR2 presentDayPGSVariance
   apply hmono
   nlinarith [mul_lt_mul_of_pos_right hfst hVA]
+
+/-- For fixed `V_E > 0`, `v ↦ v / (v + V_E)` is strictly increasing on nonnegative variances. -/
+theorem expectedR2_strictMono_nonneg
+    (V_E x y : ℝ)
+    (hVE : 0 < V_E) (hx : 0 ≤ x) (hxy : x < y) :
+    expectedR2 x V_E < expectedR2 y V_E := by
+  unfold expectedR2
+  have hxE : 0 < x + V_E := by linarith
+  have hyE : 0 < y + V_E := by linarith [hx, hxy]
+  have hxyE : x + V_E < y + V_E := by linarith
+  have hInv : 1 / (y + V_E) < 1 / (x + V_E) := by
+    rw [one_div_lt_one_div hyE hxE]
+    exact hxyE
+  have hsub : 1 - V_E / (x + V_E) < 1 - V_E / (y + V_E) := by
+    have hmul := mul_lt_mul_of_pos_left hInv hVE
+    have hfrac : V_E / (y + V_E) < V_E / (x + V_E) := by
+      simpa [div_eq_mul_inv, mul_comm, mul_left_comm, mul_assoc] using hmul
+    nlinarith [hfrac]
+  have hxne : x + V_E ≠ 0 := by linarith
+  have hyne : y + V_E ≠ 0 := by linarith
+  have hxrepr : x / (x + V_E) = 1 - V_E / (x + V_E) := by
+    field_simp [hxne]
+    ring
+  have hyrepr : y / (y + V_E) = 1 - V_E / (y + V_E) := by
+    field_simp [hyne]
+    ring
+  simpa [hxrepr, hyrepr] using hsub
+
+/-- Drift monotonically degrades present-day `R²` when `V_A, V_E > 0` and `fst < 1`, proved without `StrictMono` hypothesis. -/
+theorem drift_degrades_R2_proved
+    (V_A V_E fstS fstT : ℝ)
+    (hVA : 0 < V_A)
+    (hVE : 0 < V_E)
+    (hfst : fstS < fstT)
+    (hfstT_lt_one : fstT < 1) :
+    presentDayR2 V_A V_E fstT < presentDayR2 V_A V_E fstS := by
+  unfold presentDayR2 presentDayPGSVariance
+  have hTarget_nonneg : 0 ≤ (1 - fstT) * V_A := by
+    have : 0 ≤ 1 - fstT := by linarith
+    exact mul_nonneg this (le_of_lt hVA)
+  have hTarget_lt_Source : (1 - fstT) * V_A < (1 - fstS) * V_A := by
+    nlinarith [mul_lt_mul_of_pos_right hfst hVA]
+  have h_mono := expectedR2_strictMono_nonneg V_E ((1 - fstT) * V_A) ((1 - fstS) * V_A) hVE hTarget_nonneg hTarget_lt_Source
+  exact h_mono
 
 /-- Drift monotonically degrades AUC for any strictly increasing AUC link on SNR. -/
 theorem drift_degrades_AUC_of_strictMono
@@ -519,6 +564,31 @@ noncomputable def wSource_opt : Fin 2 → ℝ :=
 noncomputable def wTarget_opt : Fin 2 → ℝ :=
   ![80 / 99, -8 / 99]
 
+/-- A concrete proof that ERM mismatch occurs under LD shift, without relying on
+    the abstract `hConflict` hypothesis, using dense 2x2 witnesses. -/
+theorem source_target_erm_differ_dense_witness_proved :
+    sigmaObsSource.mulVec wSource_opt = crossSource ∧
+    sigmaObsTarget.mulVec wTarget_opt = crossTarget ∧
+    wSource_opt ≠ wTarget_opt := by
+  refine ⟨?_, ?_, ?_⟩
+  · ext i
+    fin_cases i
+    · simp [wSource_opt, sigmaObsSource, crossSource, Matrix.mulVec, Matrix.cons_val', Matrix.cons_val_fin_one, dotProduct]
+      norm_num
+    · simp [wSource_opt, sigmaObsSource, crossSource, Matrix.mulVec, Matrix.cons_val', Matrix.cons_val_fin_one, dotProduct]
+      norm_num
+  · ext i
+    fin_cases i
+    · simp [wTarget_opt, sigmaObsTarget, crossTarget, Matrix.mulVec, Matrix.cons_val', Matrix.cons_val_fin_one, dotProduct]
+      norm_num
+    · simp [wTarget_opt, sigmaObsTarget, crossTarget, Matrix.mulVec, Matrix.cons_val', Matrix.cons_val_fin_one, dotProduct]
+      norm_num
+  · intro heq
+    have h : wSource_opt 0 = wTarget_opt 0 := congrFun heq 0
+    revert h
+    simp [wSource_opt, wTarget_opt]
+    norm_num
+
 /-- Source OLS-style weights: `w_S = Σ_S^{-1} Σ_tc,S β_c`. -/
 noncomputable def sourceOLSWeights {p q : ℕ}
     (m : MultiLocusTagModel p q) : Fin p → ℝ :=
@@ -627,33 +697,6 @@ theorem ld_strictly_dominates_af_in_joint_loss
       2 * afTransportLoss fstSource fstTarget := by
   unfold jointTransportLoss
   linarith
-
-/-- For fixed `V_E > 0`, `v ↦ v / (v + V_E)` is strictly increasing on nonnegative variances. -/
-theorem expectedR2_strictMono_nonneg
-    (V_E x y : ℝ)
-    (hVE : 0 < V_E) (hx : 0 ≤ x) (hxy : x < y) :
-    expectedR2 x V_E < expectedR2 y V_E := by
-  unfold expectedR2
-  have hxE : 0 < x + V_E := by linarith
-  have hyE : 0 < y + V_E := by linarith [hx, hxy]
-  have hxyE : x + V_E < y + V_E := by linarith
-  have hInv : 1 / (y + V_E) < 1 / (x + V_E) := by
-    rw [one_div_lt_one_div hyE hxE]
-    exact hxyE
-  have hsub : 1 - V_E / (x + V_E) < 1 - V_E / (y + V_E) := by
-    have hmul := mul_lt_mul_of_pos_left hInv hVE
-    have hfrac : V_E / (y + V_E) < V_E / (x + V_E) := by
-      simpa [div_eq_mul_inv, mul_comm, mul_left_comm, mul_assoc] using hmul
-    nlinarith [hfrac]
-  have hxne : x + V_E ≠ 0 := by linarith
-  have hyne : y + V_E ≠ 0 := by linarith
-  have hxrepr : x / (x + V_E) = 1 - V_E / (x + V_E) := by
-    field_simp [hxne]
-    ring
-  have hyrepr : y / (y + V_E) = 1 - V_E / (y + V_E) := by
-    field_simp [hyne]
-    ring
-  simpa [hxrepr, hyrepr] using hsub
 
 /-- With any imperfect source tagging (`ρS > 0`), worsening target tagging (`ρT < ρS`)
 strictly lowers portability when drift terms are fixed. -/
@@ -791,6 +834,20 @@ theorem portability_ratio_lt_one_of_positive_drift
     presentDayR2 V_A V_E fstT / presentDayR2 V_A V_E fstS < 1 := by
   have hdrop : presentDayR2 V_A V_E fstT < presentDayR2 V_A V_E fstS :=
     drift_degrades_R2 V_A V_E fstS fstT hVA hfst hmono
+  exact portability_ratio_lt_one_of_drop (presentDayR2 V_A V_E fstS)
+    (presentDayR2 V_A V_E fstT) hsrc_pos hdrop
+
+/-- Headline portability theorem: positive drift implies `R²` ratio is strictly below `1`, proved without `StrictMono`. -/
+theorem portability_ratio_lt_one_of_positive_drift_proved
+    (V_A V_E fstS fstT : ℝ)
+    (hVA : 0 < V_A)
+    (hVE : 0 < V_E)
+    (hfst : fstS < fstT)
+    (hfstT_lt_one : fstT < 1)
+    (hsrc_pos : 0 < presentDayR2 V_A V_E fstS) :
+    presentDayR2 V_A V_E fstT / presentDayR2 V_A V_E fstS < 1 := by
+  have hdrop : presentDayR2 V_A V_E fstT < presentDayR2 V_A V_E fstS :=
+    drift_degrades_R2_proved V_A V_E fstS fstT hVA hVE hfst hfstT_lt_one
   exact portability_ratio_lt_one_of_drop (presentDayR2 V_A V_E fstS)
     (presentDayR2 V_A V_E fstT) hsrc_pos hdrop
 
