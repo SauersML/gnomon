@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import time
 from typing import Callable
 
@@ -64,6 +65,31 @@ def stable_prs_covar_frame(
         }
     )
     return covar, kept_cols, dropped
+
+
+def nagelkerke_r2_binary(y_true: np.ndarray, y_prob: np.ndarray, eps: float = 1e-15) -> float:
+    y = np.asarray(y_true, dtype=float)
+    p = np.asarray(y_prob, dtype=float)
+    mask = np.isfinite(y) & np.isfinite(p)
+    if not np.any(mask):
+        return np.nan
+    y = y[mask]
+    p = np.clip(p[mask], float(eps), 1.0 - float(eps))
+    n = int(y.size)
+    if n == 0:
+        return np.nan
+    y_mean = float(np.mean(y))
+    if not np.isfinite(y_mean) or y_mean <= 0.0 or y_mean >= 1.0:
+        return np.nan
+
+    ll_model = float(np.sum(y * np.log(p) + (1.0 - y) * np.log(1.0 - p)))
+    ll_null = float(np.sum(y * math.log(y_mean) + (1.0 - y) * math.log(1.0 - y_mean)))
+    cox_snell = 1.0 - math.exp((2.0 / n) * (ll_null - ll_model))
+    max_cox_snell = 1.0 - math.exp((2.0 / n) * ll_null)
+    if not np.isfinite(cox_snell) or not np.isfinite(max_cox_snell) or max_cox_snell <= 0.0:
+        return np.nan
+    out = cox_snell / max_cox_snell
+    return float(min(1.0, max(0.0, out)))
 
 
 def simulate_effect_size_distribution(

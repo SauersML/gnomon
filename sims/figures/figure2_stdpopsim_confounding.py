@@ -28,6 +28,7 @@ if str(SIMS_DIR) not in sys.path:
     sys.path.append(str(SIMS_DIR))
 
 from .common import (
+    nagelkerke_r2_binary,
     simulate_effect_size_distribution,
     diploid_index_pairs,
     sample_two_site_sets_for_maf,
@@ -1223,6 +1224,10 @@ def _brier(y: np.ndarray, p: np.ndarray) -> float:
     return float(brier_score_loss(y.astype(float), np.clip(p.astype(float), 0.0, 1.0)))
 
 
+def _nagelkerke(y: np.ndarray, p: np.ndarray) -> float:
+    return float(nagelkerke_r2_binary(y, p))
+
+
 def _assert_noncollapsed_prs(labels: np.ndarray, prs: np.ndarray, context: str) -> None:
     lab = np.asarray(labels, dtype=object)
     x = np.asarray(prs, dtype=float)
@@ -1273,6 +1278,32 @@ def _plot_main(df: pd.DataFrame, out_dir: Path) -> None:
         x = np.arange(len(methods))
         width = 0.18
         source_suffix = "" if prs_source == "estimated" else f"_{prs_source}"
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+        for i, pop in enumerate(pops):
+            vals = []
+            for m in methods:
+                sub = sub_df[(sub_df["method"] == m) & (sub_df["population"] == pop)]
+                vals.append(float(sub["nagelkerke_r2"].iloc[0]) if len(sub) else np.nan)
+            ax.bar(
+                x + (i - 1.5) * width,
+                vals,
+                width=width,
+                label=pop,
+                color=pop_colors[pop],
+                edgecolor="#222222",
+                linewidth=0.5,
+            )
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(methods)
+        ax.set_ylabel(f"Nagelkerke R^2 ({prs_source} PRS)")
+        ax.set_ylim(0.0, 1.0)
+        ax.legend(frameon=False)
+        _style_axes(ax, y_grid=True)
+        fig.tight_layout()
+        fig.savefig(out_dir / f"figure2_nagelkerke_by_method_population{source_suffix}.png", dpi=240)
+        plt.close(fig)
 
         fig, ax = plt.subplots(figsize=(10, 6))
         for i, pop in enumerate(pops):
@@ -1437,6 +1468,15 @@ def _plot_pt_train_accuracy(metrics_df: pd.DataFrame, out_path: Path) -> None:
     fig, ax = plt.subplots(figsize=(7, 4.5))
     x = metrics_df["p_threshold"].to_numpy(dtype=float)
     ax.plot(x, metrics_df["train_accuracy"].to_numpy(dtype=float), marker="o", linewidth=2, color=CB["blue"], label="Accuracy")
+    if "train_nagelkerke_r2" in metrics_df.columns:
+        ax.plot(
+            x,
+            metrics_df["train_nagelkerke_r2"].to_numpy(dtype=float),
+            marker="D",
+            linewidth=2,
+            color=CB["vermillion"],
+            label="Nagelkerke R^2",
+        )
     if "train_balanced_accuracy" in metrics_df.columns:
         ax.plot(
             x,
@@ -1458,7 +1498,7 @@ def _plot_pt_train_accuracy(metrics_df: pd.DataFrame, out_path: Path) -> None:
     ax.set_xscale("log")
     ax.set_xlabel("P+T p-value threshold")
     ax.set_ylabel("Train metric")
-    ax.set_title("Figure2 P+T train metrics across thresholds")
+    ax.set_title("Figure2 P+T train Nagelkerke R^2 across thresholds")
     ax.legend(frameon=False, loc="best")
     _style_axes(ax, y_grid=True)
     fig.tight_layout()
@@ -1467,26 +1507,22 @@ def _plot_pt_train_accuracy(metrics_df: pd.DataFrame, out_path: Path) -> None:
 
 
 def _force_plots_from_existing(out_dir: Path) -> None:
-    res_path = out_dir / "figure2_auc_by_method_population.tsv"
-    if not res_path.exists():
-        alt = out_dir / "figure2_auc_brier_by_method_population.tsv"
-        if alt.exists():
-            res_path = alt
+    res_path = out_dir / "figure2_nagelkerke_by_method_population.tsv"
     if not res_path.exists():
         raise RuntimeError(
             f"No Figure2 aggregate table found in {out_dir}. "
-            "Expected figure2_auc_by_method_population.tsv or figure2_auc_brier_by_method_population.tsv."
+            "Expected figure2_nagelkerke_by_method_population.tsv."
         )
     res = pd.read_csv(res_path, sep="\t")
     if res.empty:
         raise RuntimeError(f"Figure2 aggregate table is empty: {res_path}")
     out_dir.mkdir(parents=True, exist_ok=True)
-    res.to_csv(out_dir / "figure2_auc_by_method_population.tsv", sep="\t", index=False)
-    res.to_csv(out_dir / "figure2_auc_brier_by_method_population.tsv", sep="\t", index=False)
-    _log("[fig2] Wrote figure2_auc_by_method_population.tsv")
-    _log("[fig2] Wrote figure2_auc_brier_by_method_population.tsv")
+    res.to_csv(out_dir / "figure2_nagelkerke_by_method_population.tsv", sep="\t", index=False)
+    res.to_csv(out_dir / "figure2_metrics_by_method_population.tsv", sep="\t", index=False)
+    _log("[fig2] Wrote figure2_nagelkerke_by_method_population.tsv")
+    _log("[fig2] Wrote figure2_metrics_by_method_population.tsv")
     _log_results_table(
-        "[fig2] AUC/Brier/statistics by method and population",
+        "[fig2] Nagelkerke/AUC/Brier statistics by method and population",
         res.sort_values(["prs_source", "method", "population"]).reset_index(drop=True),
     )
     _plot_main(res, out_dir)
@@ -1515,7 +1551,7 @@ def _force_plots_from_existing(out_dir: Path) -> None:
     if pt_path.exists():
         pt_metrics = pd.read_csv(pt_path, sep="\t")
         if not pt_metrics.empty:
-            _plot_pt_train_accuracy(pt_metrics.sort_values("p_threshold"), out_dir / "figure2_pt_train_accuracy.png")
+            _plot_pt_train_accuracy(pt_metrics.sort_values("p_threshold"), out_dir / "figure2_pt_train_nagelkerke.png")
     _log("[fig2] Force-figs regeneration complete")
 
 
@@ -1682,10 +1718,11 @@ def main() -> None:
         pt_metrics["seed"] = int(seed)
         pt_metrics["is_selected"] = pt_metrics["p_threshold"] == float(pt_meta["best_p_threshold"])
         pt_metrics.to_csv(out_dir / "figure2_pt_thresholds.tsv", sep="\t", index=False)
-        _plot_pt_train_accuracy(pt_metrics.sort_values("p_threshold"), out_dir / "figure2_pt_train_accuracy.png")
+        _plot_pt_train_accuracy(pt_metrics.sort_values("p_threshold"), out_dir / "figure2_pt_train_nagelkerke.png")
         _log(
             f"[fig2_s{seed}] P+T selected p={float(pt_meta['best_p_threshold']):g} "
-            f"(train_accuracy={float(pt_meta['best_train_accuracy']):.4f}, "
+            f"(train_nagelkerke_r2={float(pt_meta.get('best_train_nagelkerke_r2', float('nan'))):.4f}, "
+            f"train_accuracy={float(pt_meta['best_train_accuracy']):.4f}, "
             f"train_balanced_accuracy={float(pt_meta.get('best_train_balanced_accuracy', float('nan'))):.4f}, "
             f"train_auc={float(pt_meta.get('best_train_auc', float('nan'))):.4f}, "
             f"n_snps={int(pt_meta['best_n_snps'])})"
@@ -1765,11 +1802,12 @@ def main() -> None:
                 p_pop = np.asarray(y_prob, dtype=float)[mask.to_numpy()]
                 prs_pop = test_prs[mask.to_numpy()]
                 g_pop = test_df.loc[mask, "G_true"].to_numpy(dtype=float)
+                nagelkerke_pop = _nagelkerke(y_pop, p_pop)
                 auc_pop = _auc(y_pop, p_pop)
                 brier_pop = _brier(y_pop, p_pop)
                 _log(
                     f"[fig2_s{seed}] prs_source={prs_source} method={method} pop={pop} n={int(mask.sum())} "
-                    f"auc={auc_pop:.4f} brier={brier_pop:.4f}"
+                    f"nagelkerke_r2={nagelkerke_pop:.4f} auc={auc_pop:.4f} brier={brier_pop:.4f}"
                 )
                 rows.append(
                     {
@@ -1781,6 +1819,7 @@ def main() -> None:
                         "n_test_total": int(len(test_df)),
                         "n": int(mask.sum()),
                         "prevalence": float(np.mean(y_pop)) if y_pop.size > 0 else np.nan,
+                        "nagelkerke_r2": nagelkerke_pop,
                         "auc": auc_pop,
                         "brier": brier_pop,
                         "mean_prs": float(np.mean(prs_pop)) if prs_pop.size > 0 else np.nan,
@@ -1792,12 +1831,12 @@ def main() -> None:
 
     out_dir.mkdir(parents=True, exist_ok=True)
     res = pd.DataFrame(rows)
-    res.to_csv(out_dir / "figure2_auc_by_method_population.tsv", sep="\t", index=False)
-    res.to_csv(out_dir / "figure2_auc_brier_by_method_population.tsv", sep="\t", index=False)
-    _log("[fig2] Wrote figure2_auc_by_method_population.tsv")
-    _log("[fig2] Wrote figure2_auc_brier_by_method_population.tsv")
+    res.to_csv(out_dir / "figure2_nagelkerke_by_method_population.tsv", sep="\t", index=False)
+    res.to_csv(out_dir / "figure2_metrics_by_method_population.tsv", sep="\t", index=False)
+    _log("[fig2] Wrote figure2_nagelkerke_by_method_population.tsv")
+    _log("[fig2] Wrote figure2_metrics_by_method_population.tsv")
     _log_results_table(
-        "[fig2] AUC/Brier/statistics by method and population",
+        "[fig2] Nagelkerke/AUC/Brier statistics by method and population",
         res.sort_values(["prs_source", "method", "population"]).reset_index(drop=True),
     )
     pred_rows = []

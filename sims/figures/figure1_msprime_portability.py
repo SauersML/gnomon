@@ -27,6 +27,7 @@ if str(SIMS_DIR) not in sys.path:
     sys.path.append(str(SIMS_DIR))
 
 from .common import (
+    nagelkerke_r2_binary,
     simulate_effect_size_distribution,
     diploid_index_pairs,
     sample_two_site_sets_for_maf,
@@ -669,6 +670,10 @@ def _brier(y: np.ndarray, p: np.ndarray) -> float:
     return float(brier_score_loss(y.astype(float), np.clip(p.astype(float), 0.0, 1.0)))
 
 
+def _nagelkerke(y: np.ndarray, p: np.ndarray) -> float:
+    return float(nagelkerke_r2_binary(y, p))
+
+
 def _assert_noncollapsed_prs(labels: np.ndarray, prs: np.ndarray, context: str) -> None:
     lab = np.asarray(labels, dtype=object)
     x = np.asarray(prs, dtype=float)
@@ -721,6 +726,28 @@ def _plot_main(df: pd.DataFrame, out_dir: Path) -> None:
         sub_df = df[df["prs_source"] == prs_source] if "prs_source" in df.columns else df
         source_suffix = "" if prs_source == "estimated" else f"_{prs_source}"
         source_title = f" ({prs_source} PRS)" if len(prs_sources) > 1 else ""
+
+        plt.figure(figsize=(10, 6))
+        for m in sorted(sub_df["method"].unique()):
+            sub = sub_df[sub_df["method"] == m].sort_values("gens")
+            plt.plot(
+                sub["gens"],
+                sub["nagelkerke_ratio"],
+                marker="o",
+                markersize=4.5,
+                linewidth=2.0,
+                label=m,
+                color=method_colors.get(m, CB["black"]),
+            )
+        plt.xscale("log")
+        plt.xlabel("Generations of divergence")
+        plt.ylabel(f"Nagelkerke R^2 ratio (OoA test / AFR test){source_title}")
+        ax = plt.gca()
+        _style_axes(ax)
+        plt.legend(frameon=False, loc="best")
+        plt.tight_layout()
+        plt.savefig(out_dir / f"figure1_nagelkerke_ratio{source_suffix}.png", dpi=240)
+        plt.close()
 
         plt.figure(figsize=(10, 6))
         for m in sorted(sub_df["method"].unique()):
@@ -918,6 +945,15 @@ def _plot_pt_train_accuracy(metrics_df: pd.DataFrame, out_path: Path, title: str
     fig, ax = plt.subplots(figsize=(7, 4.5))
     x = metrics_df["p_threshold"].to_numpy(dtype=float)
     ax.plot(x, metrics_df["train_accuracy"].to_numpy(dtype=float), marker="o", linewidth=2, color=CB["blue"], label="Accuracy")
+    if "train_nagelkerke_r2" in metrics_df.columns:
+        ax.plot(
+            x,
+            metrics_df["train_nagelkerke_r2"].to_numpy(dtype=float),
+            marker="D",
+            linewidth=2,
+            color=CB["vermillion"],
+            label="Nagelkerke R^2",
+        )
     if "train_balanced_accuracy" in metrics_df.columns:
         ax.plot(
             x,
@@ -1008,9 +1044,9 @@ def _aggregate_and_plot(done: list[dict[str, object]], out_dir: Path, demography
     prs_df = pd.concat([pd.read_csv(str(r["prs_path"]), sep="\t") for r in done], ignore_index=True)
     pc_df = pd.concat([pd.read_csv(str(r["pc_path"]), sep="\t") for r in done], ignore_index=True)
     pred_df = pd.concat([pd.read_csv(str(r["pred_path"]), sep="\t") for r in done], ignore_index=True)
-    res_df.to_csv(out_dir / "figure1_auc_ratio.tsv", sep="\t", index=False)
-    res_df.to_csv(out_dir / "figure1_auc_brier_ratio.tsv", sep="\t", index=False)
-    _log("Figure1 wrote figure1_auc_ratio.tsv and figure1_auc_brier_ratio.tsv")
+    res_df.to_csv(out_dir / "figure1_nagelkerke_ratio.tsv", sep="\t", index=False)
+    res_df.to_csv(out_dir / "figure1_metrics_ratio.tsv", sep="\t", index=False)
+    _log("Figure1 wrote figure1_nagelkerke_ratio.tsv and figure1_metrics_ratio.tsv")
     pred_df.to_csv(out_dir / "figure1_predictions.tsv", sep="\t", index=False)
     pt_paths = [str(r.get("pt_thresholds_path", "")) for r in done if str(r.get("pt_thresholds_path", ""))]
     if pt_paths:
@@ -1018,8 +1054,8 @@ def _aggregate_and_plot(done: list[dict[str, object]], out_dir: Path, demography
         pt_all.to_csv(out_dir / "figure1_pt_thresholds.tsv", sep="\t", index=False)
         _apply_plot_style()
         fig, ax = plt.subplots(figsize=(9, 5.5))
-        metric_col = "train_auc" if "train_auc" in pt_all.columns else "train_accuracy"
-        metric_label = "Train AUC" if metric_col == "train_auc" else "Train accuracy"
+        metric_col = "train_nagelkerke_r2" if "train_nagelkerke_r2" in pt_all.columns else "train_accuracy"
+        metric_label = "Train Nagelkerke R^2" if metric_col == "train_nagelkerke_r2" else "Train accuracy"
         for g in sorted(pt_all["gens"].unique()):
             sub = pt_all[pt_all["gens"] == g].sort_values("p_threshold")
             ax.plot(
@@ -1036,7 +1072,7 @@ def _aggregate_and_plot(done: list[dict[str, object]], out_dir: Path, demography
         ax.legend(frameon=False, ncol=2)
         _style_axes(ax)
         fig.tight_layout()
-        fig.savefig(out_dir / "figure1_pt_train_accuracy_by_generation.png", dpi=240)
+        fig.savefig(out_dir / "figure1_pt_train_nagelkerke_by_generation.png", dpi=240)
         plt.close(fig)
     detailed = (
         pred_df.groupby(["gens", "prs_source", "method", "group"], as_index=False)
@@ -1053,7 +1089,7 @@ def _aggregate_and_plot(done: list[dict[str, object]], out_dir: Path, demography
     detailed.to_csv(out_dir / "figure1_detailed_metrics.tsv", sep="\t", index=False)
     _log("Figure1 wrote aggregated results table")
     _log_results_table(
-        "[fig1] AUC/Brier ratio results (gens/method)",
+        "[fig1] Nagelkerke/AUC/Brier ratio results (gens/method)",
         res_df.sort_values(["gens", "prs_source", "method"]).reset_index(drop=True),
     )
     _log_results_table(
@@ -1188,12 +1224,13 @@ def _run_generation_task(task: dict[str, object]) -> dict[str, object]:
             pt_metrics_df.insert(1, "seed", int(seed))
             pt_metrics_df["is_selected"] = pt_metrics_df["p_threshold"] == float(pt_meta["best_p_threshold"])
             pt_tsv_path = out_dir / f"fig1_g{g}_s{seed}.pt_thresholds.tsv"
-            pt_plot_path = out_dir / f"fig1_g{g}_s{seed}.pt_train_accuracy.png"
+            pt_plot_path = out_dir / f"fig1_g{g}_s{seed}.pt_train_nagelkerke.png"
             pt_metrics_df.to_csv(pt_tsv_path, sep="\t", index=False)
-            _plot_pt_train_accuracy(pt_metrics_df, pt_plot_path, title=f"fig1 g={g} seed={seed} train accuracy")
+            _plot_pt_train_accuracy(pt_metrics_df, pt_plot_path, title=f"fig1 g={g} seed={seed} train Nagelkerke R^2")
             _log(
                 f"[fig1_g{g}_s{seed}] P+T selected p={float(pt_meta['best_p_threshold']):g} "
-                f"(train_accuracy={float(pt_meta['best_train_accuracy']):.4f}, "
+                f"(train_nagelkerke_r2={float(pt_meta.get('best_train_nagelkerke_r2', float('nan'))):.4f}, "
+                f"train_accuracy={float(pt_meta['best_train_accuracy']):.4f}, "
                 f"train_balanced_accuracy={float(pt_meta.get('best_train_balanced_accuracy', float('nan'))):.4f}, "
                 f"train_auc={float(pt_meta.get('best_train_auc', float('nan'))):.4f}, "
                 f"n_snps={int(pt_meta['best_n_snps'])})"
@@ -1284,6 +1321,13 @@ def _run_generation_task(task: dict[str, object]) -> dict[str, object]:
         o = test_df["group"] == "OOA_test"
         a = test_df["group"] == "AFR_test"
         for method, y_prob in pred.items():
+            nagelkerke_o = _nagelkerke(test_df.loc[o, "y"].to_numpy(), y_prob[o.to_numpy()])
+            nagelkerke_a = _nagelkerke(test_df.loc[a, "y"].to_numpy(), y_prob[a.to_numpy()])
+            nagelkerke_ratio = (
+                float(nagelkerke_o / nagelkerke_a)
+                if np.isfinite(nagelkerke_o) and np.isfinite(nagelkerke_a) and nagelkerke_a > 0
+                else np.nan
+            )
             auc_o = _auc(test_df.loc[o, "y"].to_numpy(), y_prob[o.to_numpy()])
             auc_a = _auc(test_df.loc[a, "y"].to_numpy(), y_prob[a.to_numpy()])
             auc_ratio = float(auc_o / auc_a) if np.isfinite(auc_o) and np.isfinite(auc_a) and auc_a > 0 else np.nan
@@ -1292,6 +1336,7 @@ def _run_generation_task(task: dict[str, object]) -> dict[str, object]:
             brier_ratio = float(brier_o / brier_a) if np.isfinite(brier_o) and np.isfinite(brier_a) and brier_a > 0 else np.nan
             _log(
                 f"[fig1_g{g}_s{seed}] prs_source={prs_source} method={method} "
+                f"nagelkerke_ooa={nagelkerke_o:.4f} nagelkerke_afr={nagelkerke_a:.4f} nagelkerke_ratio={nagelkerke_ratio:.4f} "
                 f"auc_ooa={auc_o:.4f} auc_afr={auc_a:.4f} auc_ratio={auc_ratio:.4f} "
                 f"brier_ooa={brier_o:.4f} brier_afr={brier_a:.4f} brier_ratio={brier_ratio:.4f}"
             )
@@ -1306,6 +1351,9 @@ def _run_generation_task(task: dict[str, object]) -> dict[str, object]:
                     "n_test_total": int(len(test_df)),
                     "n_test_ooa": int(np.count_nonzero(o.to_numpy())),
                     "n_test_afr": int(np.count_nonzero(a.to_numpy())),
+                    "nagelkerke_ooa": nagelkerke_o,
+                    "nagelkerke_afr": nagelkerke_a,
+                    "nagelkerke_ratio": nagelkerke_ratio,
                     "auc_ooa": auc_o,
                     "auc_afr": auc_a,
                     "auc_ratio": auc_ratio,

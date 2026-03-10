@@ -3,6 +3,7 @@ Fast pruning-and-thresholding (P+T) PRS wrapper built on PLINK2.
 """
 from __future__ import annotations
 
+import math
 import shutil
 import subprocess
 from pathlib import Path
@@ -11,6 +12,31 @@ import numpy as np
 import pandas as pd
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, roc_auc_score
+
+
+def _nagelkerke_r2_binary(y_true: np.ndarray, y_prob: np.ndarray, eps: float = 1e-15) -> float:
+    y = np.asarray(y_true, dtype=float)
+    p = np.asarray(y_prob, dtype=float)
+    mask = np.isfinite(y) & np.isfinite(p)
+    if not np.any(mask):
+        return np.nan
+    y = y[mask]
+    p = np.clip(p[mask], float(eps), 1.0 - float(eps))
+    n = int(y.size)
+    if n == 0:
+        return np.nan
+    y_mean = float(np.mean(y))
+    if not np.isfinite(y_mean) or y_mean <= 0.0 or y_mean >= 1.0:
+        return np.nan
+
+    ll_model = float(np.sum(y * np.log(p) + (1.0 - y) * np.log(1.0 - p)))
+    ll_null = float(np.sum(y * math.log(y_mean) + (1.0 - y) * math.log(1.0 - y_mean)))
+    cox_snell = 1.0 - math.exp((2.0 / n) * (ll_null - ll_model))
+    max_cox_snell = 1.0 - math.exp((2.0 / n) * ll_null)
+    if not np.isfinite(cox_snell) or not np.isfinite(max_cox_snell) or max_cox_snell <= 0.0:
+        return np.nan
+    out = cox_snell / max_cox_snell
+    return float(min(1.0, max(0.0, out)))
 
 
 class PPlusT:
@@ -85,17 +111,17 @@ class PPlusT:
         return ph[["IID", "y"]].dropna()
 
     @staticmethod
-    def _train_metrics(train_scores: pd.DataFrame, pheno: pd.DataFrame) -> tuple[float, float, float, int]:
+    def _train_metrics(train_scores: pd.DataFrame, pheno: pd.DataFrame) -> tuple[float, float, float, float, int]:
         m = pheno.merge(train_scores, on="IID", how="inner")
         m = m.dropna(subset=["y", "PRS"])
         n = int(len(m))
         if n == 0:
-            return float("nan"), float("nan"), float("nan"), 0
+            return float("nan"), float("nan"), float("nan"), float("nan"), 0
         y = m["y"].to_numpy(dtype=int)
         x = m["PRS"].to_numpy(dtype=float).reshape(-1, 1)
         uniq = np.unique(y)
         if uniq.size < 2:
-            return 1.0, 1.0, float("nan"), n
+            return 1.0, 1.0, float("nan"), float("nan"), n
         lr = LogisticRegression(max_iter=1000, solver="lbfgs")
         lr.fit(x, y)
         p = lr.predict_proba(x)[:, 1]
@@ -103,7 +129,8 @@ class PPlusT:
         acc = float(accuracy_score(y, yhat))
         bacc = float(balanced_accuracy_score(y, yhat))
         auc = float(roc_auc_score(y, p))
-        return acc, bacc, auc, n
+        nagelkerke = float(_nagelkerke_r2_binary(y, p))
+        return acc, bacc, auc, nagelkerke, n
 
     @staticmethod
     def _prs_stats(scores: pd.DataFrame) -> tuple[float, int]:
@@ -321,7 +348,7 @@ class PPlusT:
                 n_snps = 1
             prs_sd, prs_n_unique = self._prs_stats(train_scores)
             is_degenerate = (not np.isfinite(prs_sd)) or (prs_sd <= self.min_prs_sd) or (prs_n_unique <= 2)
-            train_acc, train_bacc, train_auc, n_train_used = self._train_metrics(train_scores, pheno)
+            train_acc, train_bacc, train_auc, train_nagelkerke_r2, n_train_used = self._train_metrics(train_scores, pheno)
             records.append(
                 {
                     "p_threshold": thr,
@@ -330,6 +357,7 @@ class PPlusT:
                     "train_accuracy": train_acc,
                     "train_balanced_accuracy": train_bacc,
                     "train_auc": train_auc,
+                    "train_nagelkerke_r2": train_nagelkerke_r2,
                     "train_prs_sd": prs_sd,
                     "train_prs_n_unique": prs_n_unique,
                     "is_degenerate": bool(is_degenerate),
@@ -339,17 +367,19 @@ class PPlusT:
         metrics = pd.DataFrame(records).sort_values("p_threshold").reset_index(drop=True)
         metrics_rank = metrics.copy()
         # Exclude pathological score distributions and tiny models first.
-        metrics_rank.loc[metrics_rank["is_degenerate"].astype(bool), ["train_accuracy", "train_balanced_accuracy", "train_auc"]] = -np.inf
-        metrics_rank.loc[metrics_rank["n_snps"] < max(1, self.min_selected_snps), ["train_accuracy", "train_balanced_accuracy", "train_auc"]] = -np.inf
+        rank_cols = ["train_accuracy", "train_balanced_accuracy", "train_auc", "train_nagelkerke_r2"]
+        metrics_rank.loc[metrics_rank["is_degenerate"].astype(bool), rank_cols] = -np.inf
+        metrics_rank.loc[metrics_rank["n_snps"] < max(1, self.min_selected_snps), rank_cols] = -np.inf
         metrics_rank["train_accuracy"] = metrics_rank["train_accuracy"].fillna(-np.inf)
         metrics_rank["train_balanced_accuracy"] = metrics_rank["train_balanced_accuracy"].fillna(-np.inf)
         metrics_rank["train_auc"] = metrics_rank["train_auc"].fillna(-np.inf)
+        metrics_rank["train_nagelkerke_r2"] = metrics_rank["train_nagelkerke_r2"].fillna(-np.inf)
         ranked = metrics_rank.sort_values(
-            ["train_auc", "train_balanced_accuracy", "train_accuracy", "n_snps"],
-            ascending=[False, False, False, False],
+            ["train_nagelkerke_r2", "train_auc", "train_balanced_accuracy", "train_accuracy", "n_snps"],
+            ascending=[False, False, False, False, False],
         )
         best_idx = ranked.index[0]
-        if not np.isfinite(float(metrics_rank.loc[best_idx, "train_auc"])):
+        if not np.isfinite(float(metrics_rank.loc[best_idx, "train_nagelkerke_r2"])):
             invalid_rows = metrics.assign(
                 too_few_snps=metrics["n_snps"] < max(1, self.min_selected_snps)
             )[
@@ -360,6 +390,7 @@ class PPlusT:
                     "train_accuracy",
                     "train_balanced_accuracy",
                     "train_auc",
+                    "train_nagelkerke_r2",
                     "train_prs_sd",
                     "train_prs_n_unique",
                     "is_degenerate",
@@ -376,7 +407,8 @@ class PPlusT:
         best_thr = float(metrics.loc[best_idx, "p_threshold"])
         print(
             f"[P+T] selected best threshold={best_thr:g} "
-            f"(train_accuracy={metrics.loc[best_idx, 'train_accuracy']}, "
+            f"(train_nagelkerke_r2={metrics.loc[best_idx, 'train_nagelkerke_r2']}, "
+            f"train_accuracy={metrics.loc[best_idx, 'train_accuracy']}, "
             f"train_balanced_accuracy={metrics.loc[best_idx, 'train_balanced_accuracy']}, "
             f"train_auc={metrics.loc[best_idx, 'train_auc']}, "
             f"n_snps={int(metrics.loc[best_idx, 'n_snps'])}, "
@@ -400,6 +432,7 @@ class PPlusT:
 
         meta = {
             "best_p_threshold": best_thr,
+            "best_train_nagelkerke_r2": float(metrics.loc[best_idx, "train_nagelkerke_r2"]),
             "best_train_accuracy": float(metrics.loc[best_idx, "train_accuracy"]),
             "best_train_balanced_accuracy": float(metrics.loc[best_idx, "train_balanced_accuracy"]),
             "best_train_auc": float(metrics.loc[best_idx, "train_auc"]),
