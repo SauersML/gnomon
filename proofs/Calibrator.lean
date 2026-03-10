@@ -143,6 +143,81 @@ theorem expectedBrierScore_deriv_proved (p π : ℝ) :
 /-- Concrete 2x2 matrix representing independent LD. -/
 def sigmaS : Matrix (Fin 2) (Fin 2) ℝ := ![![1, 0], ![0, 1]]
 
+noncomputable def decaySlope_exp (lambda : ℝ) (d : ℝ) : ℝ :=
+  Real.exp (-lambda * d)
+
+/-- Rigorous proof that exponential LD decay implies nonlinear calibration.
+This replaces the specification gaming of `ld_decay_implies_nonlinear_calibration_sketch`
+which simply assumes the non-linearity. -/
+theorem ld_decay_implies_nonlinear_calibration_sketch_proved
+    (lambda : ℝ) (h_lambda_pos : 0 < lambda) :
+    ∀ (beta0 beta1 : ℝ),
+      (fun d => beta0 + beta1 * d) ≠
+        (fun d => decaySlope_exp lambda d) := by
+  intro beta0 beta1 h_eq
+  have h_forall : ∀ d, beta0 + beta1 * d = decaySlope_exp lambda d := fun d => congr_fun h_eq d
+
+  have h0 : Real.exp 0 = beta0 + beta1 * 0 := by
+    have := (h_forall 0).symm
+    unfold decaySlope_exp at this
+    ring_nf at this ⊢
+    exact this
+  have h1 : Real.exp (-lambda) = beta0 + beta1 * 1 := by
+    have := (h_forall 1).symm
+    unfold decaySlope_exp at this
+    ring_nf at this ⊢
+    exact this
+  have h2 : Real.exp (-lambda * 2) = beta0 + beta1 * 2 := by
+    have := (h_forall 2).symm
+    unfold decaySlope_exp at this
+    ring_nf at this ⊢
+    exact this
+
+  have h_a_val : beta0 = 1 := by
+    calc
+      beta0 = beta0 + beta1 * 0 := by ring
+      _ = Real.exp 0 := h0.symm
+      _ = 1 := Real.exp_zero
+
+  have h_b_val : beta1 = Real.exp (-lambda) - 1 := by
+    calc
+      beta1 = beta0 + beta1 * 1 - beta0 := by ring
+      _ = Real.exp (-lambda) - beta0 := by rw [←h1]
+      _ = Real.exp (-lambda) - 1 := by rw [h_a_val]
+
+  have h_exp_2 : Real.exp (-lambda * 2) = (Real.exp (-lambda))^2 := by
+    calc
+      Real.exp (-lambda * 2) = Real.exp (-(lambda * 2)) := by ring_nf
+      _ = Real.exp ((-lambda) * 2) := by ring_nf
+      _ = Real.exp (-lambda + -lambda) := by ring_nf
+      _ = Real.exp (-lambda) * Real.exp (-lambda) := by rw [Real.exp_add]
+      _ = (Real.exp (-lambda))^2 := by ring
+
+  have h2_eval : Real.exp (-lambda * 2) = 1 + 2 * (Real.exp (-lambda) - 1) := by
+    calc
+      Real.exp (-lambda * 2) = beta0 + beta1 * 2 := h2
+      _ = 1 + beta1 * 2 := by rw [h_a_val]
+      _ = 1 + 2 * beta1 := by ring
+      _ = 1 + 2 * (Real.exp (-lambda) - 1) := by rw [h_b_val]
+
+  rw [h_exp_2] at h2_eval
+
+  have h_quad : (Real.exp (-lambda) - 1)^2 = 0 := by
+    calc
+      (Real.exp (-lambda) - 1)^2 = (Real.exp (-lambda))^2 - 2 * Real.exp (-lambda) + 1 := by ring
+      _ = 1 + 2 * (Real.exp (-lambda) - 1) - 2 * Real.exp (-lambda) + 1 := by rw [h2_eval]
+      _ = 0 := by ring
+
+  have h_eq_1 : Real.exp (-lambda) - 1 = 0 := sq_eq_zero_iff.mp h_quad
+  have h_exp_eq_1 : Real.exp (-lambda) = 1 := by linarith
+
+  have h_lambda_zero : -lambda = 0 := by
+    have h_zero : Real.exp 0 = 1 := Real.exp_zero
+    rw [←h_zero] at h_exp_eq_1
+    exact Real.exp_injective h_exp_eq_1
+
+  linarith
+
 /-- Concrete 2x2 matrix representing perfectly correlated LD. -/
 def sigmaT : Matrix (Fin 2) (Fin 2) ℝ := ![![1, 1], ![1, 1]]
 
