@@ -516,4 +516,68 @@ theorem target_r2_drop_of_fst_and_sparse_array_proved
     h_mse_gap_lb h_lam_pos h_mismatch h_varY_pos
 
 end NoAxioms
+
+/-- A concrete, rigorous proof avoiding the tautological specification gaming of `ld_decay_implies_nonlinear_calibration_sketch`.
+    Instead of assuming the tagging efficiency cannot be a linear function, we show that
+    an explicit exponential LD correlation decay model `Real.exp (-lambda * d)`
+    is strictly nonlinear for any positive decay rate `lambda`. -/
+theorem ld_decay_implies_nonlinear_calibration_proved
+    (lambda : ℝ) (h_lambda_pos : 0 < lambda) :
+    ∀ (beta0 beta1 : ℝ),
+      ¬(beta0 + beta1 * 0 = Real.exp (- (lambda * 0)) ∧
+        beta0 + beta1 * 1 = Real.exp (- (lambda * 1)) ∧
+        beta0 + beta1 * 2 = Real.exp (- (lambda * 2))) := by
+  intro beta0 beta1
+  rintro ⟨h0, h1, h2⟩
+  have he0 : Real.exp (- (lambda * 0)) = 1 := by simp
+  rw [he0] at h0
+  simp only [mul_zero, add_zero] at h0
+  -- beta0 = 1
+
+  have he1 : Real.exp (- (lambda * 1)) = Real.exp (-lambda) := by
+    have h1_inner : lambda * 1 = lambda := mul_one lambda
+    rw [h1_inner]
+  rw [he1] at h1
+
+  have he2 : Real.exp (- (lambda * 2)) = Real.exp (-2 * lambda) := by
+    have h2_inner : -(lambda * 2) = -2 * lambda := by ring
+    rw [h2_inner]
+  rw [he2] at h2
+
+  have h3 : beta1 = Real.exp (-lambda) - beta0 := by linarith
+  rw [h0] at h3
+
+  have h4 : beta0 + beta1 * 2 = 1 + 2 * (Real.exp (-lambda) - 1) := by
+    rw [h0, h3]
+    ring
+  rw [h4] at h2
+
+  have h5 : 1 + 2 * (Real.exp (-lambda) - 1) = 2 * Real.exp (-lambda) - 1 := by ring
+  rw [h5] at h2
+
+  have h6 : Real.exp (-2 * lambda) = (Real.exp (-lambda))^2 := by
+    calc Real.exp (-2 * lambda) = Real.exp (-lambda + -lambda) := by
+          have h : -2 * lambda = -lambda + -lambda := by ring
+          rw [h]
+      _ = Real.exp (-lambda) * Real.exp (-lambda) := Real.exp_add _ _
+      _ = (Real.exp (-lambda))^2 := by ring
+
+  rw [h6] at h2
+
+  have h7 : (Real.exp (-lambda))^2 - 2 * Real.exp (-lambda) + 1 = 0 := by linarith
+  have h8 : (Real.exp (-lambda) - 1)^2 = 0 := by
+    calc
+      (Real.exp (-lambda) - 1)^2 = (Real.exp (-lambda))^2 - 2 * Real.exp (-lambda) + 1 := by ring
+      _ = 0 := h7
+
+  have h9 : Real.exp (-lambda) - 1 = 0 := sq_eq_zero_iff.mp h8
+  have h10 : Real.exp (-lambda) = 1 := by linarith
+  have h11 : -lambda = 0 := by
+    -- We can write 1 as Real.exp 0
+    have hz : (1 : ℝ) = Real.exp 0 := Real.exp_zero.symm
+    rw [hz] at h10
+    exact Real.exp_injective h10
+  have h12 : lambda = 0 := by linarith
+  exact ne_of_gt h_lambda_pos h12
+
 end Calibrator
