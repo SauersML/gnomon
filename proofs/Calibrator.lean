@@ -515,5 +515,73 @@ theorem target_r2_drop_of_fst_and_sparse_array_proved
     mseSource mseTarget varY lam sigmaSource sigmaTarget
     h_mse_gap_lb h_lam_pos h_mismatch h_varY_pos
 
+/-- Helper lemma: Non-linearity of exponential decay. -/
+lemma exp_nonlinear_proved (lambda : ℝ) (h_lambda_pos : 0 < lambda) (b0 b1 : ℝ)
+    (h0 : b0 + b1 * 0 = Real.exp (-(lambda * 0)))
+    (h1 : b0 + b1 * 1 = Real.exp (-(lambda * 1)))
+    (h2 : b0 + b1 * 2 = Real.exp (-(lambda * 2))) : False := by
+  have hz : -(lambda * 0) = 0 := by ring
+  rw [hz, Real.exp_zero] at h0
+  have hb0 : b0 = 1 := by linarith
+
+  have hone : -(lambda * 1) = -lambda := by ring
+  rw [hone] at h1
+  have hb1 : b1 = Real.exp (-lambda) - 1 := by linarith
+
+  have htwo : -(lambda * 2) = -lambda + -lambda := by ring
+  rw [htwo, Real.exp_add] at h2
+
+  have h_eq : 1 + 2 * (Real.exp (-lambda) - 1) = Real.exp (-lambda) * Real.exp (-lambda) := by linarith
+  have h_eq2 : (Real.exp (-lambda) - 1)^2 = 0 := by
+    calc
+      (Real.exp (-lambda) - 1)^2 = Real.exp (-lambda) * Real.exp (-lambda) - 2 * Real.exp (-lambda) + 1 := by ring
+      _ = 1 + 2 * (Real.exp (-lambda) - 1) - 2 * Real.exp (-lambda) + 1 := by rw [←h_eq]
+      _ = 0 := by ring
+
+  have h_exp_eq_one : Real.exp (-lambda) - 1 = 0 := sq_eq_zero_iff.mp h_eq2
+  have h_exp_eq_one' : Real.exp (-lambda) = 1 := by linarith
+
+  have h0_exp : Real.exp 0 = 1 := Real.exp_zero
+  rw [←h0_exp] at h_exp_eq_one'
+  have h_lambda_zero : -lambda = 0 := Real.exp_injective h_exp_eq_one'
+  linarith
+
+/-- A concrete proof of non-linearity of exponential LD decay, replacing the abstract `h_nonlin` hypothesis.
+    This avoids the vacuous verification found in `ld_decay_implies_nonlinear_calibration_sketch`. -/
+theorem ld_decay_implies_nonlinear_calibration_proved {k : ℕ} [Fintype (Fin k)]
+    (lambda : ℝ) (h_lambda_pos : 0 < lambda)
+    (dist : (Fin k → ℝ) → ℝ)
+    (c0 c1 c2 : Fin k → ℝ)
+    (hd0 : dist c0 = 0)
+    (hd1 : dist c1 = 1)
+    (hd2 : dist c2 = 2) :
+    let mech := LDDecayMechanism.mk dist (fun d => Real.exp (-(lambda * d)))
+    ∀ (beta0 beta1 : ℝ),
+      (fun c => beta0 + beta1 * mech.distance c) ≠
+        (fun c => decaySlope mech c) := by
+  intro mech beta0 beta1 h_eq
+  have h_forall : ∀ c, beta0 + beta1 * mech.distance c = mech.tagging_efficiency (mech.distance c) :=
+    fun c => congr_fun h_eq c
+
+  have h0 : beta0 + beta1 * 0 = Real.exp (-(lambda * 0)) := by
+    have hc0 := h_forall c0
+    simp only [mech] at hc0
+    rw [hd0] at hc0
+    exact hc0
+
+  have h1 : beta0 + beta1 * 1 = Real.exp (-(lambda * 1)) := by
+    have hc1 := h_forall c1
+    simp only [mech] at hc1
+    rw [hd1] at hc1
+    exact hc1
+
+  have h2 : beta0 + beta1 * 2 = Real.exp (-(lambda * 2)) := by
+    have hc2 := h_forall c2
+    simp only [mech] at hc2
+    rw [hd2] at hc2
+    exact hc2
+
+  exact exp_nonlinear_proved lambda h_lambda_pos beta0 beta1 h0 h1 h2
+
 end NoAxioms
 end Calibrator
