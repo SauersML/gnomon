@@ -34,6 +34,7 @@ from .common import (
     solve_intercept_for_prevalence,
     get_chr22_recomb_map,
     plink_safe_individual_id,
+    stable_prs_covar_frame,
 )
 from methods.raw_pgs import RawPGSMethod
 from methods.linear_interaction import LinearInteractionMethod
@@ -51,6 +52,7 @@ N_AFR = 1000
 N_OOA_TRAIN = 1000
 N_OOA_TEST = 1000
 N_PCS = 5
+PRS_COVAR_PCS = 3
 FIG1_TASK_TIMEOUT_S = 43_200.0
 FIG1_POOL_STALL_TIMEOUT_S = 57_600.0
 FIG1_POOL_POLL_S = 15.0
@@ -533,12 +535,15 @@ def _prepare_bayesr_files(
         "y": train_df["y"].astype(int),
     }).to_csv(work_dir / "train.phen", sep=" ", header=False, index=False)
 
-    covar_cols = [f"pc{i+1}" for i in range(N_PCS)]
-    pd.DataFrame({
-        "FID": [iid_to_fid[i] for i in train_df["IID"].astype(str)],
-        "IID": train_df["IID"].astype(str),
-        **{c: train_df[c].to_numpy() for c in covar_cols},
-    }).to_csv(work_dir / "train.covar", sep=" ", header=False, index=False)
+    covar_df, kept_cols, dropped_cols = stable_prs_covar_frame(
+        train_df,
+        iid_to_fid=iid_to_fid,
+        max_pcs=PRS_COVAR_PCS,
+    )
+    if dropped_cols:
+        _log(f"[{Path(prefix).name}] PRS covariates dropped: {', '.join(dropped_cols)}")
+    _log(f"[{Path(prefix).name}] PRS covariates kept: {', '.join(kept_cols)}")
+    covar_df.to_csv(work_dir / "train.covar", sep=" ", header=False, index=False)
 
     return (
         str(work_dir / "train"),
@@ -641,9 +646,9 @@ def _fit_and_predict_methods(train_df: pd.DataFrame, test_df: pd.DataFrame, trai
     gm = GAMMethod(k_pgs=4, k_pc=4, k_interaction=3, use_ti=True)
     gm.fit(P_train, PC_train, y_train)
     out["pspline"] = gm.predict_proba(P_test, PC_test)
-    tp = ThinPlateMethod(k_pgs=4, k_pc=4, k_interaction=3, use_ti=True)
+    tp = ThinPlateMethod(k_joint=80)
     tp.fit(P_train, PC_train, y_train)
-    out["thinplate"] = tp.predict_proba(P_test, PC_test)
+    out["duchon"] = tp.predict_proba(P_test, PC_test)
 
     return out
 
@@ -709,7 +714,7 @@ def _plot_main(df: pd.DataFrame, out_dir: Path) -> None:
         "normalized": CB["green"],
         "linear": CB["orange"],
         "pspline": CB["purple"],
-        "thinplate": CB["vermillion"],
+        "duchon": CB["vermillion"],
     }
     prs_sources = sorted(df["prs_source"].unique()) if "prs_source" in df.columns else ["estimated"]
     for prs_source in prs_sources:
@@ -1428,7 +1433,7 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     work_root = Path(args.work_root) if args.work_root else _default_work_root(out_dir)
     work_root.mkdir(parents=True, exist_ok=True)
-    _log("Figure1 spline backends: pspline + thinplate (mgcv)")
+    _log("Figure1 spline backends: pspline + duchon (mgcv)")
     _log(f"Figure1 PRS backend: {'BayesR' if args.bayesr else 'P+T'}")
 
     if bool(args.force_figs):

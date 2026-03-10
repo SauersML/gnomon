@@ -15,6 +15,57 @@ def plink_safe_individual_id(index_0based: int) -> str:
     return f"ind{int(index_0based) + 1}"
 
 
+def stable_prs_covar_frame(
+    df: pd.DataFrame,
+    iid_to_fid: dict[str, str],
+    max_pcs: int,
+    variance_tol: float = 1e-12,
+    collinearity_r2_tol: float = 1e-8,
+) -> tuple[pd.DataFrame, list[str], list[str]]:
+    candidate_cols = [f"pc{i+1}" for i in range(max(0, int(max_pcs))) if f"pc{i+1}" in df.columns]
+    kept_cols: list[str] = []
+    dropped: list[str] = []
+    kept_matrix: np.ndarray | None = None
+
+    for col in candidate_cols:
+        x = pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=float)
+        if not np.all(np.isfinite(x)):
+            dropped.append(f"{col}:non_finite")
+            continue
+        x = x - float(np.mean(x))
+        var_x = float(np.var(x))
+        if not np.isfinite(var_x) or var_x <= float(variance_tol):
+            dropped.append(f"{col}:near_constant")
+            continue
+        if kept_matrix is not None and kept_matrix.shape[1] > 0:
+            coef, *_ = np.linalg.lstsq(kept_matrix, x, rcond=None)
+            resid = x - kept_matrix @ coef
+            resid_var = float(np.var(resid))
+            r2 = 1.0 - (resid_var / var_x if var_x > 0 else 0.0)
+            if np.isfinite(r2) and r2 >= (1.0 - float(collinearity_r2_tol)):
+                dropped.append(f"{col}:collinear")
+                continue
+            kept_matrix = np.column_stack([kept_matrix, x])
+        else:
+            kept_matrix = x.reshape(-1, 1)
+        kept_cols.append(col)
+
+    if not kept_cols:
+        raise RuntimeError(
+            "No stable PRS covariates remain after filtering. "
+            f"Candidates={candidate_cols} dropped={dropped}"
+        )
+
+    covar = pd.DataFrame(
+        {
+            "FID": [iid_to_fid[i] for i in df["IID"].astype(str)],
+            "IID": df["IID"].astype(str),
+            **{c: pd.to_numeric(df[c], errors="raise").to_numpy(dtype=float) for c in kept_cols},
+        }
+    )
+    return covar, kept_cols, dropped
+
+
 def simulate_effect_size_distribution(
     n_effects: int = 200000,
     seed: int = 2026,

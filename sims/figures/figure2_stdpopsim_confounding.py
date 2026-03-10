@@ -35,6 +35,7 @@ from .common import (
     solve_intercept_for_prevalence,
     pop_names_from_ts,
     plink_safe_individual_id,
+    stable_prs_covar_frame,
 )
 from methods.raw_pgs import RawPGSMethod
 from methods.linear_interaction import LinearInteractionMethod
@@ -49,6 +50,7 @@ from prs_tools import BayesR, PPlusT
 N_TRAIN_EUR = 1200
 N_TEST_PER_POP = 300
 N_PCS = 5
+PRS_COVAR_PCS = 3
 
 CB = {
     "blue": "#0072B2",
@@ -1055,11 +1057,15 @@ def _run_prs_and_predict(
         "y": train_df["y"].astype(int),
     }).to_csv(work / "train.phen", sep=" ", header=False, index=False)
 
-    pd.DataFrame({
-        "FID": [iid_to_fid[i] for i in train_df["IID"].astype(str)],
-        "IID": train_df["IID"].astype(str),
-        **{f"pc{i+1}": train_df[f"pc{i+1}"].to_numpy() for i in range(N_PCS)},
-    }).to_csv(work / "train.covar", sep=" ", header=False, index=False)
+    covar_df, kept_cols, dropped_cols = stable_prs_covar_frame(
+        train_df,
+        iid_to_fid=iid_to_fid,
+        max_pcs=PRS_COVAR_PCS,
+    )
+    if dropped_cols:
+        _log(f"[{run_id}] PRS covariates dropped: {', '.join(dropped_cols)}")
+    _log(f"[{run_id}] PRS covariates kept: {', '.join(kept_cols)}")
+    covar_df.to_csv(work / "train.covar", sep=" ", header=False, index=False)
     _stage_done(run_id, "write PRS phenotype/covariate files", t0)
 
     if use_bayesr:
@@ -1194,9 +1200,9 @@ def _method_preds(cal_df: pd.DataFrame, test_df: pd.DataFrame, cal_prs: np.ndarr
     gm = GAMMethod(k_pgs=4, k_pc=4, k_interaction=3, use_ti=True)
     gm.fit(P_train, PC_train, y_train)
     out["pspline"] = gm.predict_proba(P_test, PC_test)
-    tp = ThinPlateMethod(k_pgs=4, k_pc=4, k_interaction=3, use_ti=True)
+    tp = ThinPlateMethod(k_joint=80)
     tp.fit(P_train, PC_train, y_train)
-    out["thinplate"] = tp.predict_proba(P_test, PC_test)
+    out["duchon"] = tp.predict_proba(P_test, PC_test)
 
     return out
 
@@ -1263,7 +1269,7 @@ def _plot_main(df: pd.DataFrame, out_dir: Path) -> None:
 
     for prs_source in prs_sources:
         sub_df = df[df["prs_source"] == prs_source] if "prs_source" in df.columns else df
-        methods = [m for m in ["raw", "normalized", "linear", "pspline", "thinplate"] if m in set(sub_df["method"])]
+        methods = [m for m in ["raw", "normalized", "linear", "pspline", "duchon"] if m in set(sub_df["method"])]
         x = np.arange(len(methods))
         width = 0.18
         source_suffix = "" if prs_source == "estimated" else f"_{prs_source}"
@@ -1568,7 +1574,7 @@ def main() -> None:
                 f"[fig2] Force-figs mode: aggregate table missing; recovering real outputs from existing artifacts in {source_base}"
             )
             args.use_existing = True
-    _log("Figure2 spline backends: pspline + thinplate (mgcv)")
+    _log("Figure2 spline backends: pspline + duchon (mgcv)")
     _log(f"Figure2 PRS backend: {'BayesR' if args.bayesr else 'P+T'}")
     threads = max(1, int(args.threads)) if args.threads is not None else _default_total_threads()
     if args.memory_mb is not None:
