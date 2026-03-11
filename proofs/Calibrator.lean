@@ -139,7 +139,9 @@ theorem source_target_erm_differ_proved :
   · ext i; fin_cases i <;> simp [wT, sigmaT, crossT, Matrix.mulVec, dotProduct] <;> ring
   · intro heq
     have h : wS 0 = wT 0 := congrFun heq 0
-    simp [wS, wT] at h
+    revert h
+    simp [wS, wT]
+    norm_num
 
 /--
 Helper lemma: A Bayes-optimal model in a capable class Recovers the true expectation pointwise,
@@ -480,7 +482,7 @@ theorem targetBrier_strict_gt_source_proved
 
 /-- Top-level: increasing migration strictly reduces IM equilibrium differentiation. -/
 theorem im_delta_strictAnti_proved :
-    StrictAnti (fun M : ℝ => twoDemeIMEquilibriumDelta M) :=
+    StrictAntiOn (fun M : ℝ => twoDemeIMEquilibriumDelta M) (Set.Ici 0) :=
   twoDemeIMEquilibriumDelta_strictAnti
 
 end Calibrator
