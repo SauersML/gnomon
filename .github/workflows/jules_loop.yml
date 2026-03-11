@@ -2,7 +2,7 @@ name: Jules Optimizer Loop
 
 on:
   schedule:
-    - cron: '*/3000 * * * *'
+    - cron: '*/30 * * * *'
   
   # Manual trigger
   workflow_dispatch:
