@@ -1,0 +1,16 @@
+diff --git a/proofs/Calibrator/PortabilityDrift.lean b/proofs/Calibrator/PortabilityDrift.lean
+index af34c5d..945837e 100644
+--- a/proofs/Calibrator/PortabilityDrift.lean
++++ b/proofs/Calibrator/PortabilityDrift.lean
+@@ -177,9 +177,9 @@ private lemma wrightFisherBase_bounds (N : ℕ) (hN : 0 < N) :
+   have hpos : 0 < 2 * (N : ℝ) := by positivity
+   constructor
+   · have : (1 : ℝ) < 2 * (N : ℝ) := by nlinarith
+-    have := div_lt_one_of_lt this (by positivity)
++    have := (div_lt_one hpos).mpr this
+     linarith
+-  · have := div_nonneg (le_refl (1 : ℝ)) (le_of_lt hpos)
++  · have := div_nonneg (zero_le_one : (0 : ℝ) ≤ 1) (le_of_lt hpos)
+     linarith
+ 
+ theorem wrightFisherFst_nonneg
