@@ -217,8 +217,11 @@ theorem r2_concave_in_n
     ((n + dn) * h2 + M) * (n * h2) = dn * h2 * M := by ring
   rw [lhs_eq, rhs_eq]
   -- Goal: dn*h2*M / (h3*h2') < dn*h2*M / (h2'*h1)
-  apply div_lt_div_of_pos_left (mul_pos (mul_pos h_dn h_h2) h_M) (mul_pos h2' h1) _
-  -- Need: h2'*h1 < h3*h2', i.e., h2'*(h3 - h1) > 0
+  have h_num_pos : 0 < dn * h2 * M := mul_pos (mul_pos h_dn h_h2) h_M
+  have h_lhs_den_pos : 0 < ((n + 2 * dn) * h2 + M) * ((n + dn) * h2 + M) := mul_pos h3 h2'
+  have h_rhs_den_pos : 0 < ((n + dn) * h2 + M) * (n * h2 + M) := mul_pos h2' h1
+  apply div_lt_div_of_pos_left h_num_pos h_rhs_den_pos
+  -- Need h2'*h1 < h3*h2', which is true because h1 < h3 and h2' > 0
   nlinarith [mul_pos h2' (show 0 < 2 * dn * h2 from by nlinarith [mul_pos h_dn h_h2])]
 
 /-- **Marginal value of diversity.**

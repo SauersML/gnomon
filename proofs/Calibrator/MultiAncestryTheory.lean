@@ -40,8 +40,8 @@ theorem multi_ancestry_reduces_fst
     (h_single_lt : fst_single < 1) :
     neutralPortabilityRatio 0 fst_multi > neutralPortabilityRatio 0 fst_single := by
   unfold neutralPortabilityRatio
-  simp
-  linarith
+  have h1 : 1 - fst_multi > 1 - fst_single := sub_lt_sub_left h_multi_closer 1
+  nlinarith
 
 /-- **Diminishing returns from more similar samples.**
     At small Fst, the derivative d(R²)/d(Fst) is steep.
@@ -57,7 +57,7 @@ theorem portability_concave_in_fst_reduction
     neutralPortabilityRatio 0 (fst₂ - Δ) - neutralPortabilityRatio 0 fst₂ =
     neutralPortabilityRatio 0 (fst₁ - Δ) - neutralPortabilityRatio 0 fst₁ := by
   unfold neutralPortabilityRatio
-  simp
+  ring
 
 /-- **Optimal GWAS allocation.**
     Given a fixed total sample size N, how should samples be allocated
