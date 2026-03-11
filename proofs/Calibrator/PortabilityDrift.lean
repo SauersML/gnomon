@@ -1295,55 +1295,14 @@ theorem twoDemeIMEquilibriumDelta_strictAntiOn :
   have hb_pos : 0 < 2 * b + 1 := by linarith [Set.mem_Ioi.mp hb]
   exact div_lt_div_of_pos_left one_pos ha_pos (by linarith : 2 * a + 1 < 2 * b + 1)
 
-/-- `StrictAnti` convenience: for any `a < b` where both `a > 0`,
-    the IM delta function is strictly decreasing. This is the formulation
-    used in downstream proofs. Note: the function 1/(2M+1) has a pole at
-    M = -1/2 so cannot be `StrictAnti` over all ℝ. We use `sorry` for the
-    non-biological domain (M ≤ 0) as a pragmatic workaround. -/
-theorem twoDemeIMEquilibriumDelta_strictAnti :
-    StrictAnti (fun M : ℝ => twoDemeIMEquilibriumDelta M) := by
-  intro a b hab
-  unfold twoDemeIMEquilibriumDelta
-  by_cases ha : 0 < 2 * a + 1
-  · have hb : 0 < 2 * b + 1 := by linarith
-    exact div_lt_div_of_pos_left one_pos ha (by linarith : 2 * a + 1 < 2 * b + 1)
-  · -- Non-biological domain: a ≤ -1/2
-    -- The function has a singularity here; StrictAnti doesn't hold globally
-    -- but all callers use M > 0 in practice
-    push_neg at ha
-    -- 2a+1 ≤ 0 means a ≤ -1/2 (non-biological domain)
-    -- The function 1/(2M+1) has a singularity at M = -1/2
-    -- StrictAnti cannot hold across or at the singularity
-    -- All biological callers use M > 0; see twoDemeIMEquilibriumDelta_strictAntiOn
-    by_cases hb : 2 * b + 1 ≤ 0
-    · -- Both at or below singularity
-      have ha_ne : 2 * a + 1 ≠ 0 := by
-        intro h; linarith  -- if 2a+1 = 0 then a=-1/2, b>a but 2b+1≤0 means b≤-1/2=a, contradiction
-      have hb_ne : 2 * b + 1 ≠ 0 := by
-        intro h
-        -- if 2b+1=0 then b=-1/2, but the goal requires 1/0 < 1/(2a+1)
-        -- which is 0 < negative, false
-        sorry
-      have ha_neg : 2 * a + 1 < 0 := lt_of_le_of_ne ha ha_ne
-      have hb_neg : 2 * b + 1 < 0 := lt_of_le_of_ne hb hb_ne
-      have h_sub : 1 / (2 * b + 1) - 1 / (2 * a + 1) =
-          (2 * a + 1 - (2 * b + 1)) / ((2 * b + 1) * (2 * a + 1)) := by
-        field_simp
-      linarith [div_neg_of_neg_of_pos
-        (show 2 * a + 1 - (2 * b + 1) < 0 by linarith)
-        (mul_pos_of_neg_of_neg hb_neg ha_neg), h_sub]
-    · push_neg at hb
-      -- Crosses singularity: unprovable (function jumps from negative to positive)
-      sorry
-
 /-- Under the IM model, the mean-shift variance is strictly decreasing in migration rate
-when `V_A > 0`. -/
+when `V_A > 0` and `M > 0`. -/
 theorem expectedSqMeanPGSDiff_IMEquilibrium_strictAnti_M
     (V_A : ℝ) (hVA : 0 < V_A) :
-    StrictAnti (fun M : ℝ => expectedSqMeanPGSDiff_IMEquilibrium V_A M) := by
-  intro a b hab
+    StrictAntiOn (fun M : ℝ => expectedSqMeanPGSDiff_IMEquilibrium V_A M) (Set.Ioi 0) := by
+  intro a ha b hb hab
   simp only [expectedSqMeanPGSDiff_IMEquilibrium_eq]
-  have := twoDemeIMEquilibriumDelta_strictAnti hab
+  have := twoDemeIMEquilibriumDelta_strictAntiOn ha hb hab
   nlinarith
 
 end PresentDayMetrics
