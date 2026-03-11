@@ -121,7 +121,7 @@ noncomputable def DemographicCoalescenceScalars.delta
     d.delta = 1 - d.ETss / d.ETst := by
   rfl
 
-noncomputable def twoDemeIMEquilibriumETss (M : ℝ) : ℝ := 2
+noncomputable def twoDemeIMEquilibriumETss (_M : ℝ) : ℝ := 2
 
 noncomputable def twoDemeIMEquilibriumETst (M : ℝ) : ℝ :=
   (2 * M + 1) / M
@@ -133,12 +133,12 @@ noncomputable def twoDemeIMEquilibriumScalars (M : ℝ) : DemographicCoalescence
 noncomputable def twoDemeIMEquilibriumDelta (M : ℝ) : ℝ :=
   1 / (2 * M + 1)
 
-theorem twoDemeIMEquilibriumDelta_eq (M : ℝ) (hM : M ≠ 0) (h2M1 : 2 * M + 1 ≠ 0) :
+theorem twoDemeIMEquilibriumDelta_eq (M : ℝ) (_hM : M ≠ 0) (h2M1 : 2 * M + 1 ≠ 0) :
     (twoDemeIMEquilibriumScalars M).delta = twoDemeIMEquilibriumDelta M := by
   simp [DemographicCoalescenceScalars.delta, hudsonFstFromCoalescenceTimes,
     twoDemeIMEquilibriumScalars, twoDemeIMEquilibriumETss,
     twoDemeIMEquilibriumETst, twoDemeIMEquilibriumDelta]
-  field_simp [hM, h2M1]
+  field_simp [h2M1]
   ring
 
 theorem twoDemeIMEquilibriumDelta_pos (M : ℝ) (hM : 0 < M) :
@@ -177,9 +177,9 @@ private lemma wrightFisherBase_bounds (N : ℕ) (hN : 0 < N) :
   have hpos : 0 < 2 * (N : ℝ) := by positivity
   constructor
   · have : (1 : ℝ) < 2 * (N : ℝ) := by nlinarith
-    have := div_lt_one_of_lt this (by positivity)
+    have := (div_lt_one (by positivity)).mpr this
     linarith
-  · have := div_nonneg (le_refl (1 : ℝ)) (le_of_lt hpos)
+  · have := div_nonneg zero_le_one (le_of_lt hpos)
     linarith
 
 theorem wrightFisherFst_nonneg
@@ -699,7 +699,7 @@ theorem ld_strictly_dominates_af_in_joint_loss
   linarith
 
 /-- For fixed `V_E > 0`, `v ↦ v / (v + V_E)` is strictly increasing on nonnegative variances. -/
-theorem expectedR2_strictMono_nonneg
+theorem expectedR2_strictMono_nonneg_dup
     (V_E x y : ℝ)
     (hVE : 0 < V_E) (hx : 0 ≤ x) (hxy : x < y) :
     expectedR2 x V_E < expectedR2 y V_E := by
@@ -1305,22 +1305,21 @@ noncomputable def expectedSqMeanPGSDiff_IMEquilibrium (V_A M : ℝ) : ℝ :=
 
 /-- IM equilibrium: increasing migration strictly decreases genetic differentiation. -/
 theorem twoDemeIMEquilibriumDelta_strictAnti :
-    StrictAnti (fun M : ℝ => twoDemeIMEquilibriumDelta M) := by
-  intro a b hab
+    StrictAntiOn (fun M : ℝ => twoDemeIMEquilibriumDelta M) (Set.Ici 0) := by
+  intro a ha_pos b hb_pos hab
   unfold twoDemeIMEquilibriumDelta
-  have ha : 0 < 2 * a + 1 := by linarith
-  have hb : 0 < 2 * b + 1 := by linarith
-  rw [div_lt_div_iff hb ha]
-  linarith
+  have ha : 0 < 2 * a + 1 := by linarith [Set.mem_Ici.mp ha_pos]
+  have hab2 : 2 * a + 1 < 2 * b + 1 := by linarith [Set.mem_Ici.mp ha_pos, Set.mem_Ici.mp hb_pos, hab]
+  exact one_div_lt_one_div_of_lt ha hab2
 
 /-- Under the IM model, the mean-shift variance is strictly decreasing in migration rate
 when `V_A > 0`. -/
 theorem expectedSqMeanPGSDiff_IMEquilibrium_strictAnti_M
     (V_A : ℝ) (hVA : 0 < V_A) :
-    StrictAnti (fun M : ℝ => expectedSqMeanPGSDiff_IMEquilibrium V_A M) := by
-  intro a b hab
+    StrictAntiOn (fun M : ℝ => expectedSqMeanPGSDiff_IMEquilibrium V_A M) (Set.Ici 0) := by
+  intro a ha_pos b hb_pos hab
   simp only [expectedSqMeanPGSDiff_IMEquilibrium_eq]
-  have := twoDemeIMEquilibriumDelta_strictAnti hab
+  have := twoDemeIMEquilibriumDelta_strictAnti ha_pos hb_pos hab
   nlinarith
 
 end PresentDayMetrics
