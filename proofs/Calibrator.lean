@@ -3,6 +3,7 @@ import Calibrator.DGP
 import Calibrator.Models
 import Calibrator.Conclusions
 import Calibrator.PortabilityDrift
+import Calibrator.SpectralPortability
 
 namespace Calibrator
 
@@ -415,5 +416,60 @@ theorem targetBrier_strict_gt_source_proved
 theorem im_delta_strictAnti_proved :
     StrictAnti (fun M : ℝ => twoDemeIMEquilibriumDelta M) :=
   twoDemeIMEquilibriumDelta_strictAnti
+
+/-! ### Spectral Portability Theory -/
+
+/-- **Spectral Decomposition Theorem**: The portability gap decomposes into
+source-metric estimation error plus the operator mismatch penalty `δᵀ(Σ_T − Σ_S)δ`.
+This is the fundamental theorem connecting LD eigenvalue structure to PGS portability. -/
+theorem portabilityGap_spectral_decomposition_proved {p : ℕ}
+    (model : TwoPopulationLinearModel p)
+    (w : Fin p → ℝ) :
+    portabilityGap model w =
+      sourceMetricError model.sigmaSource (estimationError model.beta w) +
+        operatorMismatchPenalty model.sigmaSource model.sigmaTarget
+          (estimationError model.beta w) :=
+  portabilityGap_spectral_decomposition model w
+
+/-- **F_ST Insufficiency Theorem**: Two population pairs with identical diagonal
+structure (same F_ST) produce different operator mismatch penalties, proving that
+F_ST is not a sufficient statistic for portability prediction. -/
+theorem fst_insufficient_for_portability_proved :
+    operatorMismatchPenalty fstPair1_sigmaSource fstPair1_sigmaTarget fstDelta ≠
+    operatorMismatchPenalty fstPair2_sigmaSource fstPair2_sigmaTarget fstDelta :=
+  fst_insufficient_for_portability
+
+/-- **Operator Bound Theorem (entrywise)**: The operator mismatch penalty is bounded by
+the entrywise LD mismatch magnitude times the squared estimation error norm, scaled by p². -/
+theorem portability_gap_operator_bound_proved {p : ℕ}
+    (model : TwoPopulationLinearModel p)
+    (w : Fin p → ℝ) (C D : ℝ)
+    (hC : ∀ i j : Fin p, |((model.sigmaTarget - model.sigmaSource) i j)| ≤ C)
+    (hD : ∀ i : Fin p, |estimationError model.beta w i| ≤ D)
+    (hC_nn : 0 ≤ C) (hD_nn : 0 ≤ D) :
+    |operatorMismatchPenalty model.sigmaSource model.sigmaTarget
+        (estimationError model.beta w)| ≤
+      (Fintype.card (Fin p)) ^ 2 * C * D ^ 2 :=
+  portability_gap_entrywise_bound model w C D hC hD hC_nn hD_nn
+
+/-- **R² Portability Drop Theorem**: Positive operator mismatch implies strict R² decay. -/
+theorem r2_portability_drop_proved {p : ℕ}
+    (model : TwoPopulationLinearModel p)
+    (w : Fin p → ℝ) (varY : ℝ)
+    (h_same_noise : model.noiseVarSource = model.noiseVarTarget)
+    (h_varY_pos : 0 < varY)
+    (h_mismatch_pos :
+      0 < operatorMismatchPenalty model.sigmaSource model.sigmaTarget
+        (estimationError model.beta w)) :
+    targetR2Spectral model w varY < sourceR2Spectral model w varY :=
+  r2_portability_drop_from_operator_mismatch model w varY h_same_noise h_varY_pos h_mismatch_pos
+
+/-- **Directionality Theorem**: The same LD mismatch produces both positive and negative
+portability penalties depending on estimation error direction, proving scalar summaries
+cannot predict portability sign. -/
+theorem mismatch_directionality_proved :
+    0 < dotProduct deltaAligned (directionalMismatch.mulVec deltaAligned) ∧
+    dotProduct deltaAntiAligned (directionalMismatch.mulVec deltaAntiAligned) < 0 :=
+  mismatch_penalty_sign_depends_on_direction
 
 end Calibrator
