@@ -175,11 +175,15 @@ private lemma wrightFisherBase_bounds (N : ℕ) (hN : 0 < N) :
     0 < 1 - 1 / (2 * (N : ℝ)) ∧ 1 - 1 / (2 * (N : ℝ)) ≤ 1 := by
   have hNge : (1 : ℝ) ≤ N := by exact_mod_cast Nat.succ_le_of_lt hN
   have hpos : 0 < 2 * (N : ℝ) := by positivity
+  have hne : (2 * (N : ℝ)) ≠ 0 := ne_of_gt hpos
   constructor
-  · have : (1 : ℝ) < 2 * (N : ℝ) := by nlinarith
-    have := div_lt_one_of_lt this (by positivity)
+  · -- Show 0 < 1 - 1/(2N) by showing 1/(2N) < 1
+    -- Equivalently: 1 < 2N (which holds since N ≥ 1)
+    have h1 : (1 : ℝ) < 2 * N := by nlinarith
+    have h2 : 1 / (2 * (N : ℝ)) < 1 := by
+      rwa [div_lt_one hpos]
     linarith
-  · have := div_nonneg (le_refl (1 : ℝ)) (le_of_lt hpos)
+  · have : 0 ≤ 1 / (2 * (N : ℝ)) := by positivity
     linarith
 
 theorem wrightFisherFst_nonneg
@@ -1224,24 +1228,32 @@ noncomputable def expectedSqMeanPGSDiff_IMEquilibrium (V_A M : ℝ) : ℝ :=
   unfold expectedSqMeanPGSDiff_IMEquilibrium Var_Delta_Mu
   ring
 
-/-- IM equilibrium: increasing migration strictly decreases genetic differentiation. -/
+/-- IM equilibrium: increasing migration strictly decreases genetic differentiation
+on the biologically relevant domain `M > 0`. -/
 theorem twoDemeIMEquilibriumDelta_strictAnti :
-    StrictAnti (fun M : ℝ => twoDemeIMEquilibriumDelta M) := by
-  intro a b hab
+    StrictAntiOn (fun M : ℝ => twoDemeIMEquilibriumDelta M) (Set.Ioi 0) := by
+  intro a ha b hb hab
   unfold twoDemeIMEquilibriumDelta
-  have ha : 0 < 2 * a + 1 := by linarith
-  have hb : 0 < 2 * b + 1 := by linarith
-  rw [div_lt_div_iff hb ha]
+  have ha' : 0 < 2 * a + 1 := by linarith [Set.mem_Ioi.mp ha]
+  have hb' : 0 < 2 * b + 1 := by linarith [Set.mem_Ioi.mp hb]
+  -- 1/(2b+1) < 1/(2a+1) because 2a+1 < 2b+1 and both positive
+  have : 1 / (2 * b + 1) - 1 / (2 * a + 1) < 0 := by
+    have hane : (2 * a + 1 : ℝ) ≠ 0 := ne_of_gt ha'
+    have hbne : (2 * b + 1 : ℝ) ≠ 0 := ne_of_gt hb'
+    rw [div_sub_div _ _ hbne hane]
+    apply div_neg_of_neg_of_pos
+    · linarith
+    · exact mul_pos hb' ha'
   linarith
 
 /-- Under the IM model, the mean-shift variance is strictly decreasing in migration rate
-when `V_A > 0`. -/
+when `V_A > 0` and `M > 0`. -/
 theorem expectedSqMeanPGSDiff_IMEquilibrium_strictAnti_M
     (V_A : ℝ) (hVA : 0 < V_A) :
-    StrictAnti (fun M : ℝ => expectedSqMeanPGSDiff_IMEquilibrium V_A M) := by
-  intro a b hab
+    StrictAntiOn (fun M : ℝ => expectedSqMeanPGSDiff_IMEquilibrium V_A M) (Set.Ioi 0) := by
+  intro a ha b hb hab
   simp only [expectedSqMeanPGSDiff_IMEquilibrium_eq]
-  have := twoDemeIMEquilibriumDelta_strictAnti hab
+  have := twoDemeIMEquilibriumDelta_strictAnti ha hb hab
   nlinarith
 
 end PresentDayMetrics
