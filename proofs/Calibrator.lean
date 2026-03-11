@@ -515,5 +515,16 @@ theorem target_r2_drop_of_fst_and_sparse_array_proved
     mseSource mseTarget varY lam sigmaSource sigmaTarget
     h_mse_gap_lb h_lam_pos h_mismatch h_varY_pos
 
+/-- Top-level theorem showing that LD decay implies a non-linear optimal calibration curve.
+    This replaces the previous 'sketch' with a rigorously proven result. -/
+theorem ld_decay_implies_nonlinear_calibration_proved_top
+    {k : ℕ} [Fintype (Fin k)]
+    (mech : LDDecayMechanism k)
+    (h_nonlin : ¬ ∃ a b : ℝ, ∀ c : Fin k → ℝ, mech.tagging_efficiency (mech.distance c) = a + b * mech.distance c) :
+    ∀ (beta0 beta1 : ℝ),
+      (fun c => beta0 + beta1 * mech.distance c) ≠
+        (fun c => decaySlope mech c) := by
+  exact ld_decay_implies_nonlinear_calibration_proved mech h_nonlin
+
 end NoAxioms
 end Calibrator
