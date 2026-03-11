@@ -5102,19 +5102,25 @@ noncomputable def EvolutionaryParameters.bigM (p : EvolutionaryParameters) : ℝ
 theorem EvolutionaryParameters.theta_nonneg (p : EvolutionaryParameters) :
     0 ≤ p.theta := by
   unfold theta
+  have := p.Ne_pos
+  have := p.mu_nonneg
   positivity
 
 /-- M ≥ 0. -/
 theorem EvolutionaryParameters.bigM_nonneg (p : EvolutionaryParameters) :
     0 ≤ p.bigM := by
   unfold bigM
+  have := p.Ne_pos
+  have := p.mig_nonneg
   positivity
 
 /-- τ ≥ 0. -/
 theorem EvolutionaryParameters.tau_nonneg (p : EvolutionaryParameters) :
     0 ≤ p.tau := by
   unfold tau
-  exact div_nonneg p.t_div_nonneg (by positivity)
+  have := p.t_div_nonneg
+  have := p.Ne_pos
+  positivity
 
 /-- **Drift-only Fst**: Fst = 1 - exp(-τ). -/
 noncomputable def fstDriftOnly (p : EvolutionaryParameters) : ℝ :=
@@ -5154,7 +5160,7 @@ theorem fstEquilibrium_lt_one (p : EvolutionaryParameters)
 theorem fstEquilibrium_le_driftMutation (p : EvolutionaryParameters) :
     fstEquilibrium p ≤ fstDriftMutation p := by
   unfold fstEquilibrium fstDriftMutation
-  apply div_le_div_of_nonneg_left one_pos
+  apply div_le_div_of_nonneg_left zero_le_one
   · linarith [p.theta_nonneg, p.bigM_nonneg]
   · linarith [p.bigM_nonneg]
 
@@ -5162,7 +5168,7 @@ theorem fstEquilibrium_le_driftMutation (p : EvolutionaryParameters) :
 theorem fstEquilibrium_le_driftMigration (p : EvolutionaryParameters) :
     fstEquilibrium p ≤ fstDriftMigration p := by
   unfold fstEquilibrium fstDriftMigration
-  apply div_le_div_of_nonneg_left one_pos
+  apply div_le_div_of_nonneg_left zero_le_one
   · linarith [p.theta_nonneg, p.bigM_nonneg]
   · linarith [p.theta_nonneg]
 
@@ -5205,6 +5211,9 @@ theorem sharedLDRetention_decreasing_in_time
     sharedLDRetention p₂ < sharedLDRetention p₁ := by
   unfold sharedLDRetention
   apply Real.exp_lt_exp.mpr
+  have h1 : -2 * p₂.recomb * p₂.t_div = -2 * p₁.recomb * p₂.t_div := by rw [← h_same]
+  rw [h1]
+  have hr : 0 < 2 * p₁.recomb := by linarith
   nlinarith
 
 /-- **Mutation-induced LD erosion**: new mutations create population-specific LD
@@ -5276,35 +5285,33 @@ theorem unifiedPortabilityRatio_nonneg (p : EvolutionaryParameters)
     Increasing any counterbalancing force (θ or M) strictly decreases Fst. -/
 theorem fstEquilibrium_decreasing_in_theta
     (Ne mu₁ mu₂ mig t_div recomb V_A : ℝ)
-    (hNe : 0 < Ne) (hmu₁ : 0 ≤ mu₁) (hmu₂ : 0 ≤ mu₂) (hmig : 0 ≤ mig)
-    (ht : 0 ≤ t_div) (hr : 0 ≤ recomb) (hr2 : recomb ≤ 1/2) (hV : 0 < V_A)
+    (hNe : 0 < Ne) (hmu₁ : 0 ≤ mu₁) (_ : 0 ≤ mu₂) (hmig : 0 ≤ mig)
+    (_ : 0 ≤ t_div) (_ : 0 ≤ recomb) (_ : recomb ≤ 1/2) (_ : 0 < V_A)
     (h_mu : mu₁ < mu₂) :
-    let p₁ : EvolutionaryParameters := ⟨Ne, mu₁, mig, t_div, recomb, V_A, hNe, hmu₁, hmig, ht, hr, hr2, hV⟩
-    let p₂ : EvolutionaryParameters := ⟨Ne, mu₂, mig, t_div, recomb, V_A, hNe, hmu₂, hmig, ht, hr, hr2, hV⟩
+    let p₁ : EvolutionaryParameters := ⟨Ne, mu₁, mig, t_div, recomb, V_A, hNe, hmu₁, hmig, ‹_›, ‹_›, ‹_›, ‹_›⟩
+    let p₂ : EvolutionaryParameters := ⟨Ne, mu₂, mig, t_div, recomb, V_A, hNe, ‹_›, hmig, ‹_›, ‹_›, ‹_›, ‹_›⟩
     fstEquilibrium p₂ < fstEquilibrium p₁ := by
   simp only
   unfold fstEquilibrium EvolutionaryParameters.theta EvolutionaryParameters.bigM
   simp only
-  rw [div_lt_div_iff
-    (by nlinarith : 0 < 1 + 4 * Ne * mu₂ + 4 * Ne * mig)
-    (by nlinarith : 0 < 1 + 4 * Ne * mu₁ + 4 * Ne * mig)]
-  nlinarith
+  apply one_div_lt_one_div_of_lt
+  · nlinarith
+  · nlinarith
 
 theorem fstEquilibrium_decreasing_in_migration
     (Ne mu mig₁ mig₂ t_div recomb V_A : ℝ)
-    (hNe : 0 < Ne) (hmu : 0 ≤ mu) (hmig₁ : 0 ≤ mig₁) (hmig₂ : 0 ≤ mig₂)
-    (ht : 0 ≤ t_div) (hr : 0 ≤ recomb) (hr2 : recomb ≤ 1/2) (hV : 0 < V_A)
+    (hNe : 0 < Ne) (hmu : 0 ≤ mu) (hmig₁ : 0 ≤ mig₁) (_ : 0 ≤ mig₂)
+    (_ : 0 ≤ t_div) (_ : 0 ≤ recomb) (_ : recomb ≤ 1/2) (_ : 0 < V_A)
     (h_mig : mig₁ < mig₂) :
-    let p₁ : EvolutionaryParameters := ⟨Ne, mu, mig₁, t_div, recomb, V_A, hNe, hmu, hmig₁, ht, hr, hr2, hV⟩
-    let p₂ : EvolutionaryParameters := ⟨Ne, mu, mig₂, t_div, recomb, V_A, hNe, hmu, hmig₂, ht, hr, hr2, hV⟩
+    let p₁ : EvolutionaryParameters := ⟨Ne, mu, mig₁, t_div, recomb, V_A, hNe, hmu, hmig₁, ‹_›, ‹_›, ‹_›, ‹_›⟩
+    let p₂ : EvolutionaryParameters := ⟨Ne, mu, mig₂, t_div, recomb, V_A, hNe, hmu, ‹_›, ‹_›, ‹_›, ‹_›, ‹_›⟩
     fstEquilibrium p₂ < fstEquilibrium p₁ := by
   simp only
   unfold fstEquilibrium EvolutionaryParameters.theta EvolutionaryParameters.bigM
   simp only
-  rw [div_lt_div_iff
-    (by nlinarith : 0 < 1 + 4 * Ne * mu + 4 * Ne * mig₂)
-    (by nlinarith : 0 < 1 + 4 * Ne * mu + 4 * Ne * mig₁)]
-  nlinarith
+  apply one_div_lt_one_div_of_lt
+  · nlinarith
+  · nlinarith
 
 /-- **Connecting to the DGP framework**: The unified Fst maps to the demographic
     covariance gap. Higher Fst → larger covariance mismatch → worse portability. -/
@@ -5322,7 +5329,7 @@ theorem full_model_smaller_gap_than_drift
     (h_kappa : 0 < kappa)
     (h_less : fst_full < fst_drift) :
     kappa * fst_full < kappa * fst_drift :=
-  mul_lt_mul_of_pos_left h_less h_kappa
+  (mul_lt_mul_iff_of_pos_left h_kappa).mpr h_less
 
 /-- **Variable Ne modulates drift via harmonic mean.**
     If Ne varies over T generations with harmonic mean Ne_h,
@@ -5342,13 +5349,36 @@ theorem harmonic_mean_governs_drift
   -- Strategy: HM < AM via the Cauchy-Schwarz identity
   --   P·D - T²·Ne_s·Ne_l = T_b·(T-T_b)·(Ne_l - Ne_s)² > 0
   -- where D = T_b·Ne_l + (T-T_b)·Ne_s  and  P = T_b·Ne_s + (T-T_b)·Ne_l
-  rw [lt_div_iff h_T_pos]
+  rw [lt_div_iff₀ h_T_pos]
   -- Clear fractions in harmonic mean to get: Ne_h · D = T · Ne_s · Ne_l
+  have h_diff_T_pos : (0:ℝ) < T_total - T_bottleneck := by linarith
   have hD_pos : (0:ℝ) < T_bottleneck * Ne_large + (T_total - T_bottleneck) * Ne_small := by
     positivity
   have h1 : Ne_h * (T_bottleneck * Ne_large + (T_total - T_bottleneck) * Ne_small) =
       T_total * Ne_small * Ne_large := by
-    field_simp at h_harmonic ⊢; linarith
+    -- Clear fractions in h_harmonic
+    have h_eq2 : (T_total / Ne_h) * Ne_h * Ne_small * Ne_large =
+      (T_bottleneck / Ne_small + (T_total - T_bottleneck) / Ne_large) * Ne_h * Ne_small * Ne_large := by
+      rw [h_harmonic]
+    have h_lhs : (T_total / Ne_h) * Ne_h * Ne_small * Ne_large = T_total * Ne_small * Ne_large := by
+      calc
+        (T_total / Ne_h) * Ne_h * Ne_small * Ne_large = T_total * (Ne_h / Ne_h) * Ne_small * Ne_large := by ring
+        _ = T_total * 1 * Ne_small * Ne_large := by rw [div_self (ne_of_gt h_Ne_h_pos)]
+        _ = T_total * Ne_small * Ne_large := by ring
+    have h_rhs : (T_bottleneck / Ne_small + (T_total - T_bottleneck) / Ne_large) * Ne_h * Ne_small * Ne_large =
+      Ne_h * (T_bottleneck * Ne_large + (T_total - T_bottleneck) * Ne_small) := by
+      calc
+        (T_bottleneck / Ne_small + (T_total - T_bottleneck) / Ne_large) * Ne_h * Ne_small * Ne_large
+          = T_bottleneck / Ne_small * Ne_h * Ne_small * Ne_large +
+            (T_total - T_bottleneck) / Ne_large * Ne_h * Ne_small * Ne_large := by ring
+        _ = T_bottleneck * (Ne_small / Ne_small) * Ne_h * Ne_large +
+            (T_total - T_bottleneck) * (Ne_large / Ne_large) * Ne_h * Ne_small := by ring
+        _ = T_bottleneck * 1 * Ne_h * Ne_large +
+            (T_total - T_bottleneck) * 1 * Ne_h * Ne_small := by
+            rw [div_self (ne_of_gt h_small), div_self (ne_of_gt h_large)]
+        _ = Ne_h * (T_bottleneck * Ne_large + (T_total - T_bottleneck) * Ne_small) := by ring
+    rw [h_lhs, h_rhs] at h_eq2
+    exact h_eq2.symm
   -- Key algebraic identity (Cauchy-Schwarz for two terms):
   have identity :
       (T_bottleneck * Ne_small + (T_total - T_bottleneck) * Ne_large) *
@@ -5357,18 +5387,23 @@ theorem harmonic_mean_governs_drift
       T_bottleneck * (T_total - T_bottleneck) * (Ne_large - Ne_small) ^ 2 := by ring
   -- Multiply goal by D > 0: reduces to T²·Ne_s·Ne_l < P·D
   have hmul :
-      Ne_h * T_total * (T_bottleneck * Ne_large + (T_total - T_bottleneck) * Ne_small) <
+      (Ne_h * T_total) * (T_bottleneck * Ne_large + (T_total - T_bottleneck) * Ne_small) <
       (T_bottleneck * Ne_small + (T_total - T_bottleneck) * Ne_large) *
       (T_bottleneck * Ne_large + (T_total - T_bottleneck) * Ne_small) := by
     -- LHS = T · (Ne_h · D) = T · (T · Ne_s · Ne_l) by h1
     have lhs_eq :
-        Ne_h * T_total * (T_bottleneck * Ne_large + (T_total - T_bottleneck) * Ne_small) =
-        T_total * (T_total * Ne_small * Ne_large) := by linear_combination T_total * h1
+        (Ne_h * T_total) * (T_bottleneck * Ne_large + (T_total - T_bottleneck) * Ne_small) =
+        T_total * (T_total * Ne_small * Ne_large) := by
+        calc (Ne_h * T_total) * (T_bottleneck * Ne_large + (T_total - T_bottleneck) * Ne_small)
+          _ = T_total * (Ne_h * (T_bottleneck * Ne_large + (T_total - T_bottleneck) * Ne_small)) := by ring
+          _ = T_total * (T_total * Ne_small * Ne_large) := by rw [h1]
     rw [lhs_eq, identity]
     -- Now: T²·Ne_s·Ne_l < T²·Ne_s·Ne_l + T_b·(T-T_b)·(Ne_l - Ne_s)²
-    linarith [mul_pos (mul_pos h_Tb_pos (show (0:ℝ) < T_total - T_bottleneck by linarith))
-                       (sq_pos_of_pos (show (0:ℝ) < Ne_large - Ne_small by linarith))]
-  exact (mul_lt_mul_right hD_pos).mp hmul
+    have h_diff_sq_pos : (0:ℝ) < (Ne_large - Ne_small) ^ 2 := sq_pos_of_ne_zero (ne_of_gt (by linarith))
+    have h_term_pos : (0:ℝ) < T_bottleneck * (T_total - T_bottleneck) * (Ne_large - Ne_small) ^ 2 := by
+      positivity
+    linarith
+  exact (mul_lt_mul_iff_of_pos_right hD_pos).mp hmul
 
 /-- **Integration theorem**: Under the unified model, portability at equilibrium is
     strictly between 0 and 1 when all forces are present. -/
