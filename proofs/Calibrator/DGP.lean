@@ -5102,18 +5102,23 @@ noncomputable def EvolutionaryParameters.bigM (p : EvolutionaryParameters) : ℝ
 theorem EvolutionaryParameters.theta_nonneg (p : EvolutionaryParameters) :
     0 ≤ p.theta := by
   unfold theta
+  have : 0 ≤ p.Ne := le_of_lt p.Ne_pos
+  have : 0 ≤ p.mu := p.mu_nonneg
   positivity
 
 /-- M ≥ 0. -/
 theorem EvolutionaryParameters.bigM_nonneg (p : EvolutionaryParameters) :
     0 ≤ p.bigM := by
   unfold bigM
+  have : 0 ≤ p.Ne := le_of_lt p.Ne_pos
+  have : 0 ≤ p.mig := p.mig_nonneg
   positivity
 
 /-- τ ≥ 0. -/
 theorem EvolutionaryParameters.tau_nonneg (p : EvolutionaryParameters) :
     0 ≤ p.tau := by
   unfold tau
+  have : 0 < p.Ne := p.Ne_pos
   exact div_nonneg p.t_div_nonneg (by positivity)
 
 /-- **Drift-only Fst**: Fst = 1 - exp(-τ). -/
@@ -5154,7 +5159,7 @@ theorem fstEquilibrium_lt_one (p : EvolutionaryParameters)
 theorem fstEquilibrium_le_driftMutation (p : EvolutionaryParameters) :
     fstEquilibrium p ≤ fstDriftMutation p := by
   unfold fstEquilibrium fstDriftMutation
-  apply div_le_div_of_nonneg_left one_pos
+  apply div_le_div_of_nonneg_left zero_le_one
   · linarith [p.theta_nonneg, p.bigM_nonneg]
   · linarith [p.bigM_nonneg]
 
@@ -5162,7 +5167,7 @@ theorem fstEquilibrium_le_driftMutation (p : EvolutionaryParameters) :
 theorem fstEquilibrium_le_driftMigration (p : EvolutionaryParameters) :
     fstEquilibrium p ≤ fstDriftMigration p := by
   unfold fstEquilibrium fstDriftMigration
-  apply div_le_div_of_nonneg_left one_pos
+  apply div_le_div_of_nonneg_left zero_le_one
   · linarith [p.theta_nonneg, p.bigM_nonneg]
   · linarith [p.theta_nonneg]
 
@@ -5205,7 +5210,9 @@ theorem sharedLDRetention_decreasing_in_time
     sharedLDRetention p₂ < sharedLDRetention p₁ := by
   unfold sharedLDRetention
   apply Real.exp_lt_exp.mpr
-  nlinarith
+  rw [←h_same]
+  apply mul_lt_mul_of_neg_left h_time
+  linarith
 
 /-- **Mutation-induced LD erosion**: new mutations create population-specific LD
     that is not shared. The fraction of LD that remains "ancestral" (shared)
@@ -5285,10 +5292,9 @@ theorem fstEquilibrium_decreasing_in_theta
   simp only
   unfold fstEquilibrium EvolutionaryParameters.theta EvolutionaryParameters.bigM
   simp only
-  rw [div_lt_div_iff
-    (by nlinarith : 0 < 1 + 4 * Ne * mu₂ + 4 * Ne * mig)
-    (by nlinarith : 0 < 1 + 4 * Ne * mu₁ + 4 * Ne * mig)]
-  nlinarith
+  apply one_div_lt_one_div_of_lt
+  · nlinarith
+  · nlinarith
 
 theorem fstEquilibrium_decreasing_in_migration
     (Ne mu mig₁ mig₂ t_div recomb V_A : ℝ)
@@ -5301,10 +5307,9 @@ theorem fstEquilibrium_decreasing_in_migration
   simp only
   unfold fstEquilibrium EvolutionaryParameters.theta EvolutionaryParameters.bigM
   simp only
-  rw [div_lt_div_iff
-    (by nlinarith : 0 < 1 + 4 * Ne * mu + 4 * Ne * mig₂)
-    (by nlinarith : 0 < 1 + 4 * Ne * mu + 4 * Ne * mig₁)]
-  nlinarith
+  apply one_div_lt_one_div_of_lt
+  · nlinarith
+  · nlinarith
 
 /-- **Portability is bounded by the drift-only bound.**
     Adding mutation and migration can only improve portability
@@ -5332,10 +5337,9 @@ theorem portability_loss_decomposition_from_model
   constructor
   · -- fstEquilibrium < fstDriftMutation because migration adds to denominator
     unfold fstEquilibrium fstDriftMutation
-    rw [div_lt_div_iff
-      (by linarith [p.theta_nonneg, p.bigM_nonneg] : 0 < 1 + p.theta + p.bigM)
-      (by linarith : 0 < 1 + p.theta)]
-    nlinarith
+    apply one_div_lt_one_div_of_lt
+    · linarith
+    · linarith
   · -- fstDriftMutation < 1 because theta > 0
     unfold fstDriftMutation
     rw [div_lt_one (by linarith : 0 < 1 + p.theta)]
@@ -5347,7 +5351,7 @@ theorem portability_loss_decomposition_from_model
     which equals fstDriftMutation - fstEquilibrium. This is strictly positive but bounded
     by fstDriftMutation (the total drift+mutation loss). -/
 theorem migration_gain_bounded_by_model
-    (p : EvolutionaryParameters) (h_theta : 0 < p.theta) (h_mig : 0 < p.bigM) :
+    (p : EvolutionaryParameters) (_h_theta : 0 < p.theta) (_h_mig : 0 < p.bigM) :
     fstDriftMutation p - fstEquilibrium p < fstDriftMutation p := by
   have := fstEquilibrium_pos p
   linarith
@@ -5364,7 +5368,9 @@ theorem timescale_hierarchy_from_rates
     -- is exp(-2r·2Ne) = exp(-4rNe) which is much less than the drift
     -- retention (1 - Fst) ≈ exp(-1) ≈ 0.37 when 4rNe >> 1
     2 * p.recomb * (2 * p.Ne) > 1 := by
-  nlinarith [p.Ne_pos]
+  have h1 : 0 < 2 * p.Ne := by linarith [p.Ne_pos]
+  have h2 := (div_lt_iff₀ h1).mp h_ld_faster
+  linarith
 
 /-- **Sensitivity: Fst has larger effect than mutation on portability.**
     Derived from the unified model: increasing Fst (by increasing θ+M denominator)
@@ -5388,7 +5394,7 @@ theorem drift_component_dominates_ratio
 theorem unified_fst_to_covariance_gap
     (p : EvolutionaryParameters)
     (kappa : ℝ) (h_kappa : 0 < kappa)
-    (h_forces : 0 < p.theta + p.bigM) :
+    (_h_forces : 0 < p.theta + p.bigM) :
     0 < kappa * fstEquilibrium p := by
   exact mul_pos h_kappa (fstEquilibrium_pos p)
 
@@ -5419,9 +5425,10 @@ theorem harmonic_mean_governs_drift
   -- Strategy: HM < AM via the Cauchy-Schwarz identity
   --   P·D - T²·Ne_s·Ne_l = T_b·(T-T_b)·(Ne_l - Ne_s)² > 0
   -- where D = T_b·Ne_l + (T-T_b)·Ne_s  and  P = T_b·Ne_s + (T-T_b)·Ne_l
-  rw [lt_div_iff h_T_pos]
+  rw [lt_div_iff₀ h_T_pos]
   -- Clear fractions in harmonic mean to get: Ne_h · D = T · Ne_s · Ne_l
   have hD_pos : (0:ℝ) < T_bottleneck * Ne_large + (T_total - T_bottleneck) * Ne_small := by
+    have : 0 ≤ T_total - T_bottleneck := by linarith
     positivity
   have h1 : Ne_h * (T_bottleneck * Ne_large + (T_total - T_bottleneck) * Ne_small) =
       T_total * Ne_small * Ne_large := by
@@ -5445,14 +5452,14 @@ theorem harmonic_mean_governs_drift
     -- Now: T²·Ne_s·Ne_l < T²·Ne_s·Ne_l + T_b·(T-T_b)·(Ne_l - Ne_s)²
     linarith [mul_pos (mul_pos h_Tb_pos (show (0:ℝ) < T_total - T_bottleneck by linarith))
                        (sq_pos_of_pos (show (0:ℝ) < Ne_large - Ne_small by linarith))]
-  exact (mul_lt_mul_right hD_pos).mp hmul
+  exact (mul_lt_mul_iff_of_pos_right hD_pos).mp hmul
 
 /-- **Integration theorem**: Under the unified model, portability at equilibrium is
     strictly between 0 and 1 when all forces are present. -/
 theorem unified_portability_between_zero_and_one
     (p : EvolutionaryParameters)
     (h_theta : 0 < p.theta) (h_mig : 0 < p.bigM)
-    (h_time : 0 < p.t_div) :
+    (_h_time : 0 < p.t_div) :
     -- Fst is strictly between 0 and 1
     0 < fstEquilibrium p ∧ fstEquilibrium p < 1 := by
   constructor
