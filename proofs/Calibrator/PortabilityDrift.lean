@@ -121,7 +121,7 @@ noncomputable def DemographicCoalescenceScalars.delta
     d.delta = 1 - d.ETss / d.ETst := by
   rfl
 
-noncomputable def twoDemeIMEquilibriumETss (M : ℝ) : ℝ := 2
+noncomputable def twoDemeIMEquilibriumETss (_M : ℝ) : ℝ := 2
 
 noncomputable def twoDemeIMEquilibriumETst (M : ℝ) : ℝ :=
   (2 * M + 1) / M
@@ -176,10 +176,11 @@ private lemma wrightFisherBase_bounds (N : ℕ) (hN : 0 < N) :
   have hNge : (1 : ℝ) ≤ N := by exact_mod_cast Nat.succ_le_of_lt hN
   have hpos : 0 < 2 * (N : ℝ) := by positivity
   constructor
-  · have : (1 : ℝ) < 2 * (N : ℝ) := by nlinarith
-    have := div_lt_one_of_lt this (by positivity)
+  · have : 1 / (2 * (N : ℝ)) < 1 := by
+      rw [div_lt_one hpos]
+      nlinarith
     linarith
-  · have := div_nonneg (le_refl (1 : ℝ)) (le_of_lt hpos)
+  · have := div_nonneg zero_le_one (le_of_lt hpos)
     linarith
 
 theorem wrightFisherFst_nonneg
@@ -698,24 +699,6 @@ theorem ld_strictly_dominates_af_in_joint_loss
   unfold jointTransportLoss
   linarith
 
-/-- For fixed `V_E > 0`, `v ↦ v / (v + V_E)` is strictly increasing on nonnegative variances. -/
-theorem expectedR2_strictMono_nonneg
-    (V_E x y : ℝ)
-    (hVE : 0 < V_E) (hx : 0 ≤ x) (hxy : x < y) :
-    expectedR2 x V_E < expectedR2 y V_E := by
-  unfold expectedR2
-  have hxE : 0 < x + V_E := by linarith
-  have hyE : 0 < y + V_E := by linarith [hx, hxy]
-  -- Use the identity v/(v+E) = 1 - E/(v+E) to reduce to monotonicity of E/(v+E)
-  have hxne : x + V_E ≠ 0 := ne_of_gt hxE
-  have hyne : y + V_E ≠ 0 := ne_of_gt hyE
-  have hxrepr : x / (x + V_E) = 1 - V_E / (x + V_E) := by field_simp; ring
-  have hyrepr : y / (y + V_E) = 1 - V_E / (y + V_E) := by field_simp; ring
-  rw [hxrepr, hyrepr]
-  -- E/(y+E) < E/(x+E) because x+E < y+E and E > 0
-  have : V_E / (y + V_E) < V_E / (x + V_E) :=
-    div_lt_div_of_pos_left hVE hxE (by linarith)
-  linarith
 
 /-- With any imperfect source tagging (`ρS > 0`), worsening target tagging (`ρT < ρS`)
 strictly lowers portability when drift terms are fixed. -/
@@ -1304,23 +1287,24 @@ noncomputable def expectedSqMeanPGSDiff_IMEquilibrium (V_A M : ℝ) : ℝ :=
   ring
 
 /-- IM equilibrium: increasing migration strictly decreases genetic differentiation. -/
-theorem twoDemeIMEquilibriumDelta_strictAnti :
-    StrictAnti (fun M : ℝ => twoDemeIMEquilibriumDelta M) := by
-  intro a b hab
+theorem twoDemeIMEquilibriumDelta_strictAntiOn :
+    StrictAntiOn (fun M : ℝ => twoDemeIMEquilibriumDelta M) (Set.Ici 0) := by
+  intro a ha b _hb hab
   unfold twoDemeIMEquilibriumDelta
-  have ha : 0 < 2 * a + 1 := by linarith
-  have hb : 0 < 2 * b + 1 := by linarith
-  rw [div_lt_div_iff hb ha]
-  linarith
+  have ha_pos : 0 < 2 * a + 1 := by
+    have ha_ge : 0 ≤ a := ha
+    linarith
+  have : 2 * a + 1 < 2 * b + 1 := by linarith
+  exact one_div_lt_one_div_of_lt ha_pos this
 
 /-- Under the IM model, the mean-shift variance is strictly decreasing in migration rate
 when `V_A > 0`. -/
 theorem expectedSqMeanPGSDiff_IMEquilibrium_strictAnti_M
     (V_A : ℝ) (hVA : 0 < V_A) :
-    StrictAnti (fun M : ℝ => expectedSqMeanPGSDiff_IMEquilibrium V_A M) := by
-  intro a b hab
+    StrictAntiOn (fun M : ℝ => expectedSqMeanPGSDiff_IMEquilibrium V_A M) (Set.Ici 0) := by
+  intro a ha b hb hab
   simp only [expectedSqMeanPGSDiff_IMEquilibrium_eq]
-  have := twoDemeIMEquilibriumDelta_strictAnti hab
+  have h_delta := twoDemeIMEquilibriumDelta_strictAntiOn ha hb hab
   nlinarith
 
 end PresentDayMetrics

@@ -1,0 +1,19 @@
+--- proofs/Calibrator.lean
++++ proofs/Calibrator.lean
+@@ -138,7 +138,7 @@
+   · ext i; fin_cases i <;> simp [wS, sigmaS, crossS, Matrix.mulVec, dotProduct]
+   · ext i; fin_cases i <;> simp [wT, sigmaT, crossT, Matrix.mulVec, dotProduct] <;> ring
+   · intro heq
+     have h : wS 0 = wT 0 := congrFun heq 0
+-    simp [wS, wT] at h
++    simp [wS, wT] at h; exact h
+
+ /--
+@@ -481,5 +481,5 @@
+ /-- Top-level: increasing migration strictly reduces IM equilibrium differentiation. -/
+-theorem im_delta_strictAnti_proved :
+-    StrictAnti (fun M : ℝ => twoDemeIMEquilibriumDelta M) :=
+-  twoDemeIMEquilibriumDelta_strictAnti
++theorem im_delta_strictAntiOn_proved :
++    StrictAntiOn (fun M : ℝ => twoDemeIMEquilibriumDelta M) (Set.Ici 0) :=
++  twoDemeIMEquilibriumDelta_strictAntiOn
