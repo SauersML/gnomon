@@ -4,8 +4,8 @@
 //! and default model configurations, reducing boilerplate across test files.
 
 use crate::calibrate::model::{
-    BasisConfig, InteractionPenaltyKind, LinkFunction, MainEffects, MappedCoefficients,
-    ModelConfig, ModelFamily, PrincipalComponentConfig, TrainedModel,
+    BasisConfig, LinkFunction, MainEffects, MappedCoefficients, ModelConfig, ModelFamily,
+    PrincipalComponentConfig, TrainedModel,
 };
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
