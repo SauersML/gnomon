@@ -162,6 +162,37 @@ pub struct ModelConfig {
     pub survival: Option<SurvivalModelConfig>,
 }
 
+impl Default for ModelConfig {
+    fn default() -> Self {
+        ModelConfig {
+            model_family: ModelFamily::Gam(LinkFunction::Identity),
+            penalty_order: 2,
+            convergence_tolerance: 1e-7,
+            max_iterations: 50,
+            reml_convergence_tolerance: 1e-3,
+            reml_max_iterations: 100,
+            firth_bias_reduction: false,
+            reml_parallel_threshold: default_reml_parallel_threshold(),
+            pgs_basis_config: BasisConfig {
+                num_knots: 0,
+                degree: 0,
+            },
+            pc_configs: Vec::new(),
+            pgs_range: (0.0, 0.0),
+            interaction_penalty: InteractionPenaltyKind::Anisotropic,
+            sum_to_zero_constraints: HashMap::new(),
+            knot_vectors: HashMap::new(),
+            range_transforms: HashMap::new(),
+            interaction_centering_means: HashMap::new(),
+            interaction_orth_alpha: HashMap::new(),
+            pc_null_transforms: HashMap::new(),
+            mcmc_enabled: true,
+            calibrator_enabled: true,
+            survival: None,
+        }
+    }
+}
+
 impl ModelConfig {
     /// Minimal configuration for external designs (calibrator adapter).
     /// Only the fields used by PIRLS/REML are populated; others are left empty.
@@ -173,7 +204,6 @@ impl ModelConfig {
     ) -> Self {
         ModelConfig {
             model_family: ModelFamily::Gam(link),
-            penalty_order: 2,
             // Align PIRLS tolerance with external REML tolerance to avoid over-iterating
             // on small calibrator fits where the outer loop is already coarse.
             convergence_tolerance: reml_tol,
@@ -181,23 +211,8 @@ impl ModelConfig {
             reml_convergence_tolerance: reml_tol,
             reml_max_iterations: reml_max_iter as u64,
             firth_bias_reduction,
-            reml_parallel_threshold: default_reml_parallel_threshold(),
-            pgs_basis_config: BasisConfig {
-                num_knots: 0,
-                degree: 0,
-            },
-            pc_configs: Vec::new(),
             pgs_range: (0.0, 1.0),
-            interaction_penalty: InteractionPenaltyKind::Anisotropic,
-            sum_to_zero_constraints: HashMap::new(),
-            knot_vectors: HashMap::new(),
-            range_transforms: HashMap::new(),
-            interaction_centering_means: HashMap::new(),
-            interaction_orth_alpha: HashMap::new(),
-            pc_null_transforms: HashMap::new(),
-            mcmc_enabled: true, // Honest uncertainty by default
-            calibrator_enabled: true,
-            survival: None,
+            ..Default::default()
         }
     }
 
@@ -2608,38 +2623,24 @@ mod tests {
 
         let model = TrainedModel {
             config: ModelConfig {
-                model_family: ModelFamily::Gam(LinkFunction::Identity),
-                penalty_order: 2,
                 convergence_tolerance: 1e-6,
                 max_iterations: 100,
                 reml_convergence_tolerance: 1e-6,
                 reml_max_iterations: 50,
-                firth_bias_reduction: false,
-                reml_parallel_threshold: default_reml_parallel_threshold(),
                 pgs_basis_config: BasisConfig {
                     num_knots: 1, // Number of internal knots
                     degree,
                 },
-                pc_configs: vec![],
                 pgs_range: (0.0, 1.0),
-                interaction_penalty: InteractionPenaltyKind::Anisotropic,
-                sum_to_zero_constraints: {
-                    let mut constraints = HashMap::new();
-                    constraints.insert("pgs_main".to_string(), z_transform.clone());
-                    constraints
-                },
-                knot_vectors: {
-                    let mut knots = HashMap::new();
-                    knots.insert("pgs".to_string(), knot_vector.clone());
-                    knots
-                },
-                range_transforms: HashMap::new(),
-                pc_null_transforms: HashMap::new(),
-                interaction_centering_means: HashMap::new(),
-                interaction_orth_alpha: HashMap::new(),
+                sum_to_zero_constraints: HashMap::from([
+                    ("pgs_main".to_string(), z_transform.clone()),
+                ]),
+                knot_vectors: HashMap::from([
+                    ("pgs".to_string(), knot_vector.clone()),
+                ]),
                 mcmc_enabled: false,
                 calibrator_enabled: false,
-                survival: None,
+                ..Default::default()
             },
             coefficients: MappedCoefficients {
                 intercept: 0.5, // Added an intercept for a more complete test
@@ -2725,37 +2726,23 @@ mod tests {
         let mut model = TrainedModel {
             config: ModelConfig {
                 model_family: ModelFamily::Gam(LinkFunction::Logit),
-                penalty_order: 2,
                 convergence_tolerance: 1e-6,
                 max_iterations: 100,
                 reml_convergence_tolerance: 1e-6,
                 reml_max_iterations: 50,
-                firth_bias_reduction: false,
-                reml_parallel_threshold: default_reml_parallel_threshold(),
                 pgs_basis_config: BasisConfig {
                     num_knots: 1,
                     degree,
                 },
-                pc_configs: vec![],
                 pgs_range: (0.0, 1.0),
-                interaction_penalty: InteractionPenaltyKind::Anisotropic,
-                sum_to_zero_constraints: {
-                    let mut constraints = HashMap::new();
-                    constraints.insert("pgs_main".to_string(), z_transform.clone());
-                    constraints
-                },
-                knot_vectors: {
-                    let mut knots = HashMap::new();
-                    knots.insert("pgs".to_string(), knot_vector.clone());
-                    knots
-                },
-                range_transforms: HashMap::new(),
-                pc_null_transforms: HashMap::new(),
-                interaction_centering_means: HashMap::new(),
-                interaction_orth_alpha: HashMap::new(),
-                mcmc_enabled: true,
+                sum_to_zero_constraints: HashMap::from([
+                    ("pgs_main".to_string(), z_transform.clone()),
+                ]),
+                knot_vectors: HashMap::from([
+                    ("pgs".to_string(), knot_vector.clone()),
+                ]),
                 calibrator_enabled: false,
-                survival: None,
+                ..Default::default()
             },
             coefficients: MappedCoefficients {
                 intercept: 0.5,
@@ -2839,38 +2826,23 @@ mod tests {
 
         let model = TrainedModel {
             config: ModelConfig {
-                model_family: ModelFamily::Gam(LinkFunction::Identity),
-                penalty_order: 2,
                 convergence_tolerance: 1e-6,
                 max_iterations: 100,
                 reml_convergence_tolerance: 1e-6,
                 reml_max_iterations: 50,
-                firth_bias_reduction: false,
-                reml_parallel_threshold: default_reml_parallel_threshold(),
                 pgs_basis_config: BasisConfig {
                     num_knots: 1,
                     degree,
                 },
-                pc_configs: vec![],
                 pgs_range: (0.0, 1.0),
-                interaction_penalty: InteractionPenaltyKind::Anisotropic,
-                sum_to_zero_constraints: {
-                    let mut constraints = HashMap::new();
-                    constraints.insert("pgs_main".to_string(), z_transform.clone());
-                    constraints
-                },
-                knot_vectors: {
-                    let mut knots = HashMap::new();
-                    knots.insert("pgs".to_string(), knot_vector.clone());
-                    knots
-                },
-                range_transforms: HashMap::new(),
-                pc_null_transforms: HashMap::new(),
-                interaction_centering_means: HashMap::new(),
-                interaction_orth_alpha: HashMap::new(),
-                mcmc_enabled: true,
+                sum_to_zero_constraints: HashMap::from([
+                    ("pgs_main".to_string(), z_transform.clone()),
+                ]),
+                knot_vectors: HashMap::from([
+                    ("pgs".to_string(), knot_vector.clone()),
+                ]),
                 calibrator_enabled: false,
-                survival: None,
+                ..Default::default()
             },
             coefficients: MappedCoefficients {
                 intercept: 0.5,
@@ -2987,26 +2959,11 @@ mod tests {
 
         let config = ModelConfig {
             model_family: ModelFamily::Survival(SurvivalSpec::default()),
-            penalty_order: 2,
             convergence_tolerance: 1e-6,
             max_iterations: 20,
             reml_convergence_tolerance: 1e-6,
             reml_max_iterations: 20,
-            firth_bias_reduction: false,
-            reml_parallel_threshold: default_reml_parallel_threshold(),
-            pgs_basis_config: BasisConfig {
-                num_knots: 0,
-                degree: 0,
-            },
-            pc_configs: Vec::new(),
             pgs_range: (0.0, 1.0),
-            interaction_penalty: InteractionPenaltyKind::Anisotropic,
-            sum_to_zero_constraints: HashMap::new(),
-            knot_vectors: HashMap::new(),
-            range_transforms: HashMap::new(),
-            interaction_centering_means: HashMap::new(),
-            interaction_orth_alpha: HashMap::new(),
-            pc_null_transforms: HashMap::new(),
             mcmc_enabled: false,
             calibrator_enabled: false,
             survival: Some(SurvivalModelConfig {
@@ -3019,6 +2976,7 @@ mod tests {
                 time_varying: None,
                 model_competing_risk: false,
             }),
+            ..Default::default()
         };
 
         let model = TrainedModel {
@@ -3070,14 +3028,10 @@ mod tests {
     fn test_trained_model_predict_invalid_input() {
         let model = TrainedModel {
             config: ModelConfig {
-                model_family: ModelFamily::Gam(LinkFunction::Identity),
-                penalty_order: 2,
                 convergence_tolerance: 1e-6,
                 max_iterations: 100,
                 reml_convergence_tolerance: 1e-6,
                 reml_max_iterations: 50,
-                firth_bias_reduction: false,
-                reml_parallel_threshold: default_reml_parallel_threshold(),
                 pgs_basis_config: BasisConfig {
                     num_knots: 2,
                     degree: 1,
@@ -3091,16 +3045,9 @@ mod tests {
                     range: (-1.0, 1.0),
                 }],
                 pgs_range: (-2.0, 2.0),
-                interaction_penalty: InteractionPenaltyKind::Anisotropic,
-                sum_to_zero_constraints: HashMap::new(),
-                knot_vectors: HashMap::new(),
-                range_transforms: HashMap::new(),
-                pc_null_transforms: HashMap::new(),
-                interaction_centering_means: HashMap::new(),
-                interaction_orth_alpha: HashMap::new(),
                 mcmc_enabled: false,
                 calibrator_enabled: false,
-                survival: None,
+                ..Default::default()
             },
             coefficients: MappedCoefficients {
                 intercept: 0.0,
@@ -3177,14 +3124,10 @@ mod tests {
 
         // Create a simple model config for testing
         let config = ModelConfig {
-            model_family: ModelFamily::Gam(LinkFunction::Identity),
-            penalty_order: 2,
             convergence_tolerance: 1e-6,
             max_iterations: 100,
             reml_convergence_tolerance: 1e-6,
             reml_max_iterations: 50,
-            firth_bias_reduction: false,
-            reml_parallel_threshold: default_reml_parallel_threshold(),
             pgs_basis_config: BasisConfig {
                 num_knots: 3,
                 degree: 3,
@@ -3208,16 +3151,9 @@ mod tests {
                 },
             ],
             pgs_range: (0.0, 1.0),
-            interaction_penalty: InteractionPenaltyKind::Anisotropic,
-            sum_to_zero_constraints: HashMap::new(),
-            knot_vectors: HashMap::new(),
-            range_transforms: HashMap::new(),
-            pc_null_transforms: HashMap::new(),
-            interaction_centering_means: HashMap::new(),
-            interaction_orth_alpha: HashMap::new(),
             mcmc_enabled: false,
             calibrator_enabled: false,
-            survival: None,
+            ..Default::default()
         };
 
         // Use the internal flatten_coefficients function
@@ -3282,15 +3218,13 @@ mod tests {
         };
 
         // Create a ModelConfig to use for both generation and testing
+        // HashMap fields will be populated by build_design_and_penalty_matrices
         let model_config = ModelConfig {
             model_family: ModelFamily::Gam(LinkFunction::Logit),
-            penalty_order: 2,
             convergence_tolerance: 1e-6,
             max_iterations: 100,
             reml_convergence_tolerance: 1e-6,
             reml_max_iterations: 50,
-            firth_bias_reduction: false,
-            reml_parallel_threshold: default_reml_parallel_threshold(),
             pgs_basis_config: pgs_basis_config.clone(),
             pc_configs: vec![PrincipalComponentConfig {
                 name: "PC1".to_string(),
@@ -3298,16 +3232,9 @@ mod tests {
                 range: (-0.5, 0.5),
             }],
             pgs_range: (-1.0, 1.0),
-            interaction_penalty: InteractionPenaltyKind::Anisotropic,
-            sum_to_zero_constraints: HashMap::new(), // Will be populated by build_design_and_penalty_matrices
-            knot_vectors: HashMap::new(), // Will be populated by build_design_and_penalty_matrices
-            range_transforms: HashMap::new(), // Will be populated by build_design_and_penalty_matrices
-            pc_null_transforms: HashMap::new(),
-            interaction_centering_means: HashMap::new(),
-            interaction_orth_alpha: HashMap::new(),
             mcmc_enabled: false,
             calibrator_enabled: false,
-            survival: None,
+            ..Default::default()
         };
 
         // Create a dummy dataset for generating the correct model structure
@@ -3349,13 +3276,10 @@ mod tests {
         let original_model = TrainedModel {
             config: ModelConfig {
                 model_family: ModelFamily::Gam(LinkFunction::Logit),
-                penalty_order: 2,
                 convergence_tolerance: 1e-6,
                 max_iterations: 100,
                 reml_convergence_tolerance: 1e-6,
                 reml_max_iterations: 50,
-                firth_bias_reduction: false,
-                reml_parallel_threshold: default_reml_parallel_threshold(),
                 pgs_basis_config: pgs_basis_config.clone(),
                 pc_configs: vec![PrincipalComponentConfig {
                     name: "PC1".to_string(),
@@ -3363,16 +3287,15 @@ mod tests {
                     range: (-0.5, 0.5),
                 }],
                 pgs_range: (-1.0, 1.0),
-                interaction_penalty: InteractionPenaltyKind::Anisotropic,
-                sum_to_zero_constraints: sum_to_zero_constraints.clone(), // Clone the new field
-                knot_vectors, // Use the knot vectors generated by the model-building code
-                range_transforms: range_transforms.clone(), // Use full Option 3 pipeline
+                sum_to_zero_constraints: sum_to_zero_constraints.clone(),
+                knot_vectors,
+                range_transforms: range_transforms.clone(),
                 pc_null_transforms: pc_null_transforms.clone(),
                 interaction_centering_means: interaction_centering_means.clone(),
                 interaction_orth_alpha: interaction_orth_alpha.clone(),
                 mcmc_enabled: false,
                 calibrator_enabled: false,
-                survival: None,
+                ..Default::default()
             },
             coefficients: MappedCoefficients {
                 intercept: 0.5,

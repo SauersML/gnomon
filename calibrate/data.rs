@@ -124,6 +124,114 @@ mod internal {
 
     const MINIMUM_ROWS: usize = 20;
 
+    /// Read a TSV file into a Polars DataFrame.
+    fn read_tsv(path: &str) -> Result<DataFrame, DataError> {
+        Ok(CsvReader::new(File::open(Path::new(path))?)
+            .with_options(
+                CsvReadOptions::default()
+                    .with_has_header(true)
+                    .with_parse_options(CsvParseOptions::default().with_separator(b'\t')),
+            )
+            .finish()?)
+    }
+
+    /// Extract a single column from a DataFrame as a validated, finite Array1<f64>.
+    /// Checks for nulls before and after casting, and validates all values are finite.
+    fn extract_f64_column(df: &DataFrame, column_name: &str) -> Result<Array1<f64>, DataError> {
+        let series = df.column(column_name)?;
+        if series.null_count() > 0 {
+            return Err(DataError::MissingValuesFound(column_name.to_string()));
+        }
+        let casted = series.cast(&DataType::Float64).map_err(|_| {
+            DataError::ColumnWrongType {
+                column_name: column_name.to_string(),
+                expected_type: "f64 (numeric)",
+                found_type: format!("{:?}", series.dtype()),
+            }
+        })?;
+        if casted.null_count() > 0 {
+            return Err(DataError::ColumnWrongType {
+                column_name: column_name.to_string(),
+                expected_type: "f64 (numeric)",
+                found_type: format!("{:?}", series.dtype()),
+            });
+        }
+        let arr = Array1::from_vec(casted.rechunk().f64()?.into_no_null_iter().collect());
+        if arr.iter().any(|&v| !v.is_finite()) {
+            return Err(DataError::NonFiniteValuesFound(column_name.to_string()));
+        }
+        Ok(arr)
+    }
+
+    /// Extract sample IDs from a DataFrame, falling back to sequential numeric IDs.
+    fn extract_sample_ids(df: &DataFrame, n: usize) -> Vec<String> {
+        let has_col = df.get_column_names().iter().any(|c| c == &"sample_id");
+        if !has_col {
+            return (1..=n).map(|i| i.to_string()).collect();
+        }
+        let s = match df.column("sample_id") {
+            Ok(s) if s.null_count() == 0 => s,
+            _ => return (1..=n).map(|i| i.to_string()).collect(),
+        };
+        let len = s.len().min(n);
+        let mut out = Vec::with_capacity(n);
+        for i in 0..len {
+            let v = s.get(i).unwrap_or(polars::prelude::AnyValue::Null);
+            out.push(match v {
+                polars::prelude::AnyValue::Null => (i + 1).to_string(),
+                _ => v.to_string(),
+            });
+        }
+        for i in len..n {
+            out.push((i + 1).to_string());
+        }
+        out
+    }
+
+    /// Stack per-column PC arrays into an (n_rows, n_cols) matrix.
+    fn stack_pc_matrix(pc_arrays: &[Array1<f64>], fallback_rows: usize) -> Array2<f64> {
+        if pc_arrays.is_empty() {
+            return Array2::zeros((fallback_rows, 0));
+        }
+        let n_rows = pc_arrays[0].len();
+        let n_cols = pc_arrays.len();
+        let mut flat = Vec::with_capacity(n_rows * n_cols);
+        for col in pc_arrays {
+            flat.extend(col.iter().cloned());
+        }
+        Array2::from_shape_vec((n_cols, n_rows), flat)
+            .expect("PC arrays should have consistent dimensions")
+            .reversed_axes()
+    }
+
+    /// Load and validate weights from a DataFrame, with optional requirement enforcement.
+    fn extract_weights(
+        df: &DataFrame,
+        require: bool,
+        has_weights: bool,
+        fallback_len: usize,
+    ) -> Result<Array1<f64>, DataError> {
+        if require && !has_weights {
+            return Err(DataError::WeightsColumnRequired);
+        }
+        if !has_weights {
+            return Ok(Array1::from_elem(fallback_len, 1.0));
+        }
+        let weights = extract_f64_column(df, "weights")?;
+        if require {
+            for (i, &w) in weights.iter().enumerate() {
+                if w < 0.0 {
+                    return Err(DataError::ColumnWrongType {
+                        column_name: "weights".to_string(),
+                        expected_type: "non-negative f64 values",
+                        found_type: format!("negative value {} at row {}", w, i + 1),
+                    });
+                }
+            }
+        }
+        Ok(weights)
+    }
+
     /// The single, unified data loading function. It reads a file, validates it against
     /// a dynamically generated schema, and returns the core `ndarray` objects.
     pub(super) fn load_data(
@@ -141,15 +249,6 @@ mod internal {
         ),
         DataError,
     > {
-        // Small helper: validate that an array contains only finite values
-        fn validate_is_finite(arr: &Array1<f64>, column_name: &str) -> Result<(), DataError> {
-            if arr.iter().any(|&v| !v.is_finite()) {
-                return Err(DataError::NonFiniteValuesFound(column_name.to_string()));
-            }
-            Ok(())
-        }
-
-        // --- Generate the exact list of required column names ---
         let pc_names: Vec<String> = (1..=num_pcs).map(|i| format!("PC{i}")).collect();
         let mut required_cols: Vec<String> = Vec::with_capacity(3 + num_pcs);
         if include_phenotype {
@@ -159,23 +258,10 @@ mod internal {
         required_cols.push("sex".to_string());
         required_cols.extend_from_slice(&pc_names);
 
-        // --- Read and validate the DataFrame using Polars ---
         println!("Loading data from '{path}'");
-
-        // Use the Polars CsvReader for efficiency
-        let df = CsvReader::new(File::open(Path::new(path))?)
-            .with_options(
-                CsvReadOptions::default()
-                    .with_has_header(true)
-                    .with_parse_options(
-                        CsvParseOptions::default().with_separator(b'\t'), // Using tab as separator
-                    ),
-            )
-            .finish()?;
-
+        let df = read_tsv(path)?;
         println!("Successfully loaded data file.");
 
-        // Check if we have the minimum number of rows
         if df.height() < MINIMUM_ROWS {
             return Err(DataError::InsufficientRows {
                 found: df.height(),
@@ -183,280 +269,36 @@ mod internal {
             });
         }
 
-        // Verify all required columns exist
-        let df_columns = df.get_column_names();
-        let columns_set: HashSet<String> = df_columns.into_iter().map(|s| s.to_string()).collect();
-
+        let columns_set: HashSet<String> = df
+            .get_column_names()
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect();
         for col_name in &required_cols {
             if !columns_set.contains(col_name) {
                 return Err(DataError::ColumnNotFound(col_name.clone()));
             }
         }
-
-        // Check if required weights column exists
         let has_weights = columns_set.contains("weights");
         println!("All required columns found: {required_cols:?}");
         if has_weights {
             println!("Required 'weights' column found.");
         }
 
-        // --- Convert columns efficiently to ndarray structures ---
-
-        // Process phenotype column if needed
         let phenotype_opt = if include_phenotype {
-            let phenotype_series = df.column("phenotype")?;
-            if phenotype_series.null_count() > 0 {
-                return Err(DataError::MissingValuesFound("phenotype".to_string()));
-            }
-
-            // Convert to f64
-            let phenotype_casted = match phenotype_series.cast(&DataType::Float64) {
-                Ok(casted) => casted,
-                Err(_) => {
-                    return Err(DataError::ColumnWrongType {
-                        column_name: "phenotype".to_string(),
-                        expected_type: "f64 (numeric)",
-                        found_type: format!("{:?}", phenotype_series.dtype()),
-                    });
-                }
-            };
-
-            // Check for nulls AFTER casting to detect non-numeric values
-            if phenotype_casted.null_count() > 0 {
-                return Err(DataError::ColumnWrongType {
-                    column_name: "phenotype".to_string(),
-                    expected_type: "f64 (numeric)",
-                    found_type: format!("{:?}", phenotype_series.dtype()),
-                });
-            }
-
-            // Now convert to ndarray without relying on polars' ndarray feature
-            let arr = Array1::from_vec(
-                phenotype_casted
-                    .rechunk()
-                    .f64()?
-                    .into_no_null_iter()
-                    .collect(),
-            );
-            validate_is_finite(&arr, "phenotype")?;
-            Some(arr)
+            Some(extract_f64_column(&df, "phenotype")?)
         } else {
             None
         };
+        let pgs = extract_f64_column(&df, "score")?;
+        let sex = extract_f64_column(&df, "sex")?;
 
-        // Process score column
-        let score_series = df.column("score")?;
-        if score_series.null_count() > 0 {
-            return Err(DataError::MissingValuesFound("score".to_string()));
-        }
-
-        // Convert to f64
-        let score_casted = match score_series.cast(&DataType::Float64) {
-            Ok(casted) => casted,
-            Err(_) => {
-                return Err(DataError::ColumnWrongType {
-                    column_name: "score".to_string(),
-                    expected_type: "f64 (numeric)",
-                    found_type: format!("{:?}", score_series.dtype()),
-                });
-            }
-        };
-
-        // Check for nulls AFTER casting to detect non-numeric values
-        // Casting non-numeric strings to f64 produces nulls, which we need to detect here
-        if score_casted.null_count() > 0 {
-            return Err(DataError::ColumnWrongType {
-                column_name: "score".to_string(),
-                expected_type: "f64 (numeric)",
-                found_type: format!("{:?}", score_series.dtype()),
-            });
-        }
-
-        // Now convert to ndarray without relying on polars' ndarray feature
-        let pgs = Array1::from_vec(score_casted.rechunk().f64()?.into_no_null_iter().collect());
-        validate_is_finite(&pgs, "score")?;
-
-        // Process sex column
-        let sex_series = df.column("sex")?;
-        if sex_series.null_count() > 0 {
-            return Err(DataError::MissingValuesFound("sex".to_string()));
-        }
-
-        let sex_casted = match sex_series.cast(&DataType::Float64) {
-            Ok(casted) => casted,
-            Err(_) => {
-                return Err(DataError::ColumnWrongType {
-                    column_name: "sex".to_string(),
-                    expected_type: "f64 (numeric)",
-                    found_type: format!("{:?}", sex_series.dtype()),
-                });
-            }
-        };
-
-        if sex_casted.null_count() > 0 {
-            return Err(DataError::ColumnWrongType {
-                column_name: "sex".to_string(),
-                expected_type: "f64 (numeric)",
-                found_type: format!("{:?}", sex_series.dtype()),
-            });
-        }
-
-        let sex = Array1::from_vec(sex_casted.rechunk().f64()?.into_no_null_iter().collect());
-        validate_is_finite(&sex, "sex")?;
-
-        // Process PC columns efficiently
         let mut pc_arrays = Vec::with_capacity(num_pcs);
         for pc_name in &pc_names {
-            let pc_series = df.column(pc_name)?;
-            if pc_series.null_count() > 0 {
-                return Err(DataError::MissingValuesFound(pc_name.clone()));
-            }
-
-            // Convert to f64
-            let pc_casted = match pc_series.cast(&DataType::Float64) {
-                Ok(casted) => casted,
-                Err(_) => {
-                    return Err(DataError::ColumnWrongType {
-                        column_name: pc_name.clone(),
-                        expected_type: "f64 (numeric)",
-                        found_type: format!("{:?}", pc_series.dtype()),
-                    });
-                }
-            };
-
-            // Check for nulls AFTER casting to detect non-numeric values
-            if pc_casted.null_count() > 0 {
-                return Err(DataError::ColumnWrongType {
-                    column_name: pc_name.clone(),
-                    expected_type: "f64 (numeric)",
-                    found_type: format!("{:?}", pc_series.dtype()),
-                });
-            }
-
-            // Now convert to ndarray without relying on polars' ndarray feature
-            let arr = Array1::from_vec(pc_casted.rechunk().f64()?.into_no_null_iter().collect());
-            validate_is_finite(&arr, pc_name)?;
-            pc_arrays.push(arr);
+            pc_arrays.push(extract_f64_column(&df, pc_name)?);
         }
-
-        // Stack PC arrays into a matrix
-        // Handle the case where num_pcs = 0 (no PC covariates)
-        let (pcs_flat, n_rows, n_cols) = if pc_arrays.is_empty() {
-            // No PCs requested - create empty matrix with correct number of rows
-            let n_rows = pgs.len();
-            (Vec::new(), n_rows, 0)
-        } else {
-            let n_rows = pc_arrays[0].len();
-            let n_cols = pc_arrays.len();
-            let mut pcs_flat = Vec::with_capacity(n_rows * n_cols);
-
-            // Convert column vectors to column-major format (F-order)
-            // This aligns with faer's preference for column-major matrices
-            for col_idx in 0..n_cols {
-                pcs_flat.extend(pc_arrays[col_idx].iter().cloned());
-            }
-            (pcs_flat, n_rows, n_cols)
-        };
-
-        let pcs_t = Array2::from_shape_vec((n_cols, n_rows), pcs_flat)
-            .expect("PC arrays should have consistent dimensions");
-        // Transpose to get (n_rows, n_cols) in Column-Major layout
-        let pcs = pcs_t.reversed_axes();
-
-        // Process weights column
-        let weights = if require_weights {
-            if !has_weights {
-                return Err(DataError::WeightsColumnRequired);
-            }
-
-            let weights_series = df.column("weights")?;
-            if weights_series.null_count() > 0 {
-                return Err(DataError::MissingValuesFound("weights".to_string()));
-            }
-
-            // Convert to f64
-            let weights_casted = match weights_series.cast(&DataType::Float64) {
-                Ok(casted) => casted,
-                Err(_) => {
-                    return Err(DataError::ColumnWrongType {
-                        column_name: "weights".to_string(),
-                        expected_type: "f64 (numeric)",
-                        found_type: format!("{:?}", weights_series.dtype()),
-                    });
-                }
-            };
-
-            // Check for nulls AFTER casting to detect non-numeric values
-            if weights_casted.null_count() > 0 {
-                return Err(DataError::ColumnWrongType {
-                    column_name: "weights".to_string(),
-                    expected_type: "f64 (numeric)",
-                    found_type: format!("{:?}", weights_series.dtype()),
-                });
-            }
-
-            // Convert to ndarray without relying on polars' ndarray feature
-            let weights_array = Array1::from_vec(
-                weights_casted
-                    .rechunk()
-                    .f64()?
-                    .into_no_null_iter()
-                    .collect(),
-            );
-            validate_is_finite(&weights_array, "weights")?;
-
-            // Validate that all weights are non-negative
-            for (i, &weight) in weights_array.iter().enumerate() {
-                if weight < 0.0 {
-                    return Err(DataError::ColumnWrongType {
-                        column_name: "weights".to_string(),
-                        expected_type: "non-negative f64 values",
-                        found_type: format!("negative value {} at row {}", weight, i + 1),
-                    });
-                }
-            }
-
-            weights_array
-        } else {
-            // If weights are not required and not present, default to 1.0 per row
-            if has_weights {
-                let weights_series = df.column("weights")?;
-                if weights_series.null_count() > 0 {
-                    return Err(DataError::MissingValuesFound("weights".to_string()));
-                }
-
-                let weights_casted = match weights_series.cast(&DataType::Float64) {
-                    Ok(casted) => casted,
-                    Err(_) => {
-                        return Err(DataError::ColumnWrongType {
-                            column_name: "weights".to_string(),
-                            expected_type: "f64 (numeric)",
-                            found_type: format!("{:?}", weights_series.dtype()),
-                        });
-                    }
-                };
-
-                if weights_casted.null_count() > 0 {
-                    return Err(DataError::ColumnWrongType {
-                        column_name: "weights".to_string(),
-                        expected_type: "f64 (numeric)",
-                        found_type: format!("{:?}", weights_series.dtype()),
-                    });
-                }
-
-                let weights_array = Array1::from_vec(
-                    weights_casted
-                        .rechunk()
-                        .f64()?
-                        .into_no_null_iter()
-                        .collect(),
-                );
-                validate_is_finite(&weights_array, "weights")?;
-                weights_array
-            } else {
-                Array1::from_elem(pgs.len(), 1.0)
-            }
-        };
+        let pcs = stack_pc_matrix(&pc_arrays, pgs.len());
+        let weights = extract_weights(&df, require_weights, has_weights, pgs.len())?;
 
         println!(
             "Data validation successful: all required columns have numeric data with no missing values."
@@ -481,47 +323,58 @@ mod internal {
         ),
         DataError,
     > {
-        // Load using the existing path
-        let (p, sex, pcs, y_opt, w) = load_data(path, num_pcs, include_phenotype, require_weights)?;
+        let pc_names: Vec<String> = (1..=num_pcs).map(|i| format!("PC{i}")).collect();
+        let mut required_cols: Vec<String> = Vec::with_capacity(3 + num_pcs);
+        if include_phenotype {
+            required_cols.push("phenotype".to_string());
+        }
+        required_cols.push("score".to_string());
+        required_cols.push("sex".to_string());
+        required_cols.extend_from_slice(&pc_names);
 
-        // Reload a lightweight frame to try to get sample_id without duplicating conversions
-        let df = CsvReader::new(File::open(Path::new(path))?)
-            .with_options(
-                CsvReadOptions::default()
-                    .with_has_header(true)
-                    .with_parse_options(CsvParseOptions::default().with_separator(b'\t')),
-            )
-            .finish()?;
+        println!("Loading data from '{path}'");
+        let df = read_tsv(path)?;
+        println!("Successfully loaded data file.");
 
-        let n = p.len();
-        let sample_ids: Vec<String> = if df.get_column_names().iter().any(|c| c == &"sample_id") {
-            let s = df.column("sample_id")?;
-            if s.null_count() > 0 {
-                // If nulls exist, synthesize IDs
-                (1..=n).map(|i| i.to_string()).collect()
-            } else {
-                // Collect via per-row AnyValue -> String for robustness across dtypes
-                let len = s.len().min(n);
-                let mut out = Vec::with_capacity(n);
-                for i in 0..len {
-                    let v = s.get(i).unwrap_or(polars::prelude::AnyValue::Null);
-                    out.push(match v {
-                        polars::prelude::AnyValue::Null => (i + 1).to_string(),
-                        _ => v.to_string(),
-                    });
-                }
-                // If fewer than n due to any mismatch, pad sequentially
-                for i in len..n {
-                    out.push((i + 1).to_string());
-                }
-                out
+        if df.height() < MINIMUM_ROWS {
+            return Err(DataError::InsufficientRows {
+                found: df.height(),
+                required: MINIMUM_ROWS,
+            });
+        }
+
+        let columns_set: HashSet<String> = df
+            .get_column_names()
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect();
+        for col_name in &required_cols {
+            if !columns_set.contains(col_name) {
+                return Err(DataError::ColumnNotFound(col_name.clone()));
             }
-        } else {
-            // No sample_id column; synthesize sequential numeric IDs as strings
-            (1..=n).map(|i| i.to_string()).collect()
-        };
+        }
+        let has_weights = columns_set.contains("weights");
 
-        Ok((p, sex, pcs, y_opt, w, sample_ids))
+        let phenotype_opt = if include_phenotype {
+            Some(extract_f64_column(&df, "phenotype")?)
+        } else {
+            None
+        };
+        let pgs = extract_f64_column(&df, "score")?;
+        let sex = extract_f64_column(&df, "sex")?;
+
+        let mut pc_arrays = Vec::with_capacity(num_pcs);
+        for pc_name in &pc_names {
+            pc_arrays.push(extract_f64_column(&df, pc_name)?);
+        }
+        let pcs = stack_pc_matrix(&pc_arrays, pgs.len());
+        let weights = extract_weights(&df, require_weights, has_weights, pgs.len())?;
+        let sample_ids = extract_sample_ids(&df, pgs.len());
+
+        println!(
+            "Data validation successful: all required columns have numeric data with no missing values."
+        );
+        Ok((pgs, sex, pcs, phenotype_opt, weights, sample_ids))
     }
 }
 

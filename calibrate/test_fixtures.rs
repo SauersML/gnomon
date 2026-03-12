@@ -221,13 +221,10 @@ pub fn default_model_config_identity() -> ModelConfig {
 pub fn default_model_config_with_link(link: LinkFunction) -> ModelConfig {
     ModelConfig {
         model_family: ModelFamily::Gam(link),
-        penalty_order: 2,
         convergence_tolerance: 1e-6,
         max_iterations: 100,
         reml_convergence_tolerance: 1e-5,
         reml_max_iterations: 50,
-        firth_bias_reduction: false,
-        reml_parallel_threshold: 4,
         pgs_basis_config: BasisConfig {
             num_knots: 8,
             degree: 3,
@@ -251,16 +248,9 @@ pub fn default_model_config_with_link(link: LinkFunction) -> ModelConfig {
             },
         ],
         pgs_range: (-3.0, 3.0),
-        interaction_penalty: InteractionPenaltyKind::Anisotropic,
-        sum_to_zero_constraints: HashMap::new(),
-        knot_vectors: HashMap::new(),
-        range_transforms: HashMap::new(),
-        interaction_centering_means: HashMap::new(),
-        interaction_orth_alpha: HashMap::new(),
-        pc_null_transforms: HashMap::new(),
         mcmc_enabled: false,       // Disable MCMC for faster tests
         calibrator_enabled: false, // Disable calibrator for faster tests
-        survival: None,
+        ..Default::default()
     }
 }
 
@@ -268,29 +258,16 @@ pub fn default_model_config_with_link(link: LinkFunction) -> ModelConfig {
 pub fn minimal_model_config_logit() -> ModelConfig {
     ModelConfig {
         model_family: ModelFamily::Gam(LinkFunction::Logit),
-        penalty_order: 2,
         convergence_tolerance: 1e-4,
-        max_iterations: 50,
-        reml_convergence_tolerance: 1e-3,
         reml_max_iterations: 20,
-        firth_bias_reduction: false,
-        reml_parallel_threshold: 4,
         pgs_basis_config: BasisConfig {
             num_knots: 4,
             degree: 3,
         },
-        pc_configs: vec![],
         pgs_range: (-3.0, 3.0),
-        interaction_penalty: InteractionPenaltyKind::Anisotropic,
-        sum_to_zero_constraints: HashMap::new(),
-        knot_vectors: HashMap::new(),
-        range_transforms: HashMap::new(),
-        interaction_centering_means: HashMap::new(),
-        interaction_orth_alpha: HashMap::new(),
-        pc_null_transforms: HashMap::new(),
         mcmc_enabled: false,
         calibrator_enabled: false,
-        survival: None,
+        ..Default::default()
     }
 }
 

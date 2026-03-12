@@ -128,13 +128,9 @@ mod tests {
 
         let base_config = ModelConfig {
             model_family: ModelFamily::Gam(LinkFunction::Logit),
-            penalty_order: 2,
             convergence_tolerance: 1e-6,
             max_iterations: 100,
-            reml_convergence_tolerance: 1e-3,
             reml_max_iterations: 30,
-            firth_bias_reduction: false,
-            reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
             pgs_basis_config: BasisConfig {
                 num_knots: 5,
                 degree: 3,
@@ -148,17 +144,9 @@ mod tests {
                 range: (-1.5, 1.5),
             }],
             pgs_range: (-2.0, 2.0),
-            interaction_penalty: InteractionPenaltyKind::Anisotropic,
-            sum_to_zero_constraints: std::collections::HashMap::new(),
-            knot_vectors: std::collections::HashMap::new(),
-            range_transforms: std::collections::HashMap::new(),
-            pc_null_transforms: std::collections::HashMap::new(),
-            interaction_centering_means: std::collections::HashMap::new(),
-            interaction_orth_alpha: std::collections::HashMap::new(),
-
             mcmc_enabled: false,
             calibrator_enabled: false,
-            survival: None,
+            ..Default::default()
         };
 
         RealWorldTestFixture {
@@ -589,13 +577,9 @@ mod tests {
         // Train the model
         let config = ModelConfig {
             model_family: ModelFamily::Gam(LinkFunction::Logit),
-            penalty_order: 2,
             convergence_tolerance: 1e-6,
             max_iterations: 100,
-            reml_convergence_tolerance: 1e-3,
             reml_max_iterations: 20,
-            firth_bias_reduction: false,
-            reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
             pgs_basis_config: BasisConfig {
                 num_knots: 6,
                 degree: 3,
@@ -609,17 +593,9 @@ mod tests {
                 range: (-1.5, 1.5),
             }],
             pgs_range: (-2.0, 2.0),
-            interaction_penalty: InteractionPenaltyKind::Anisotropic,
-            sum_to_zero_constraints: std::collections::HashMap::new(),
-            knot_vectors: std::collections::HashMap::new(),
-            range_transforms: std::collections::HashMap::new(),
-            pc_null_transforms: std::collections::HashMap::new(),
-            interaction_centering_means: std::collections::HashMap::new(),
-            interaction_orth_alpha: std::collections::HashMap::new(),
-
             mcmc_enabled: false,
             calibrator_enabled: false,
-            survival: None,
+            ..Default::default()
         };
 
         let mut model_for_pd = train_model(&data, &config)
@@ -791,13 +767,9 @@ mod tests {
         // Train model only on training data
         let config = ModelConfig {
             model_family: ModelFamily::Gam(LinkFunction::Logit),
-            penalty_order: 2,
             convergence_tolerance: 1e-6,
             max_iterations: 100,
-            reml_convergence_tolerance: 1e-3,
             reml_max_iterations: 20,
-            firth_bias_reduction: false,
-            reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
             pgs_basis_config: BasisConfig {
                 num_knots: 3,
                 degree: 3,
@@ -811,17 +783,9 @@ mod tests {
                 range: (-1.5, 1.5),
             }],
             pgs_range: (-2.0, 2.0),
-            interaction_penalty: InteractionPenaltyKind::Anisotropic,
-            sum_to_zero_constraints: std::collections::HashMap::new(),
-            knot_vectors: std::collections::HashMap::new(),
-            range_transforms: std::collections::HashMap::new(),
-            pc_null_transforms: std::collections::HashMap::new(),
-            interaction_centering_means: std::collections::HashMap::new(),
-            interaction_orth_alpha: std::collections::HashMap::new(),
-
             mcmc_enabled: false,
             calibrator_enabled: false,
-            survival: None,
+            ..Default::default()
         };
 
         let trained_model = train_model(&train_data, &config)
@@ -890,13 +854,9 @@ mod tests {
 
         let config = ModelConfig {
             model_family: ModelFamily::Gam(LinkFunction::Logit),
-            penalty_order: 2,
             convergence_tolerance: 1e-6,
             max_iterations: 100,
-            reml_convergence_tolerance: 1e-3,
             reml_max_iterations: 20,
-            firth_bias_reduction: false,
-            reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
             pgs_basis_config: BasisConfig {
                 num_knots: 4,
                 degree: 3,
@@ -910,17 +870,9 @@ mod tests {
                 range: (-1.5, 1.5),
             }],
             pgs_range: (-2.0, 2.0),
-            interaction_penalty: InteractionPenaltyKind::Anisotropic,
-            sum_to_zero_constraints: std::collections::HashMap::new(),
-            knot_vectors: std::collections::HashMap::new(),
-            range_transforms: std::collections::HashMap::new(),
-            pc_null_transforms: std::collections::HashMap::new(),
-            interaction_centering_means: std::collections::HashMap::new(),
-            interaction_orth_alpha: std::collections::HashMap::new(),
-
             mcmc_enabled: false,
             calibrator_enabled: false,
-            survival: None,
+            ..Default::default()
         };
 
         let (x, s_list, layout, ..) =
@@ -984,13 +936,10 @@ mod tests {
 
         let config = ModelConfig {
             model_family: ModelFamily::Gam(LinkFunction::Logit),
-            penalty_order: 2,
             convergence_tolerance: 1e-6,
             max_iterations: 100,
-            reml_convergence_tolerance: 1e-3,
             reml_max_iterations: 20,
             firth_bias_reduction: true,
-            reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
             pgs_basis_config: BasisConfig {
                 num_knots: 4,
                 degree: 3,
@@ -1004,17 +953,9 @@ mod tests {
                 range: (-1.5, 1.5),
             }],
             pgs_range: (-2.0, 2.0),
-            interaction_penalty: InteractionPenaltyKind::Anisotropic,
-            sum_to_zero_constraints: std::collections::HashMap::new(),
-            knot_vectors: std::collections::HashMap::new(),
-            range_transforms: std::collections::HashMap::new(),
-            pc_null_transforms: std::collections::HashMap::new(),
-            interaction_centering_means: std::collections::HashMap::new(),
-            interaction_orth_alpha: std::collections::HashMap::new(),
-
             mcmc_enabled: false,
             calibrator_enabled: false,
-            survival: None,
+            ..Default::default()
         };
 
         let (x, s_list, layout, ..) =
@@ -1706,14 +1647,9 @@ mod tests {
 
         // Keep interactions - we'll just focus our test on main effects
         let config = ModelConfig {
-            model_family: ModelFamily::Gam(LinkFunction::Identity),
-            penalty_order: 2,
             convergence_tolerance: 1e-6,
             max_iterations: 100,
-            reml_convergence_tolerance: 1e-3,
             reml_max_iterations: 20,
-            firth_bias_reduction: false,
-            reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
             pgs_basis_config: BasisConfig {
                 num_knots: 3,
                 degree: 3,
@@ -1737,17 +1673,9 @@ mod tests {
                 },
             ],
             pgs_range: (-2.0, 2.0),
-            interaction_penalty: InteractionPenaltyKind::Anisotropic,
-            sum_to_zero_constraints: std::collections::HashMap::new(),
-            knot_vectors: std::collections::HashMap::new(),
-            range_transforms: std::collections::HashMap::new(),
-            pc_null_transforms: std::collections::HashMap::new(),
-            interaction_centering_means: std::collections::HashMap::new(),
-            interaction_orth_alpha: std::collections::HashMap::new(),
-
             mcmc_enabled: false,
             calibrator_enabled: false,
-            survival: None,
+            ..Default::default()
         };
 
         let (x, s_list, layout, _, _, _, _, _, _, _) =
@@ -1825,14 +1753,9 @@ mod tests {
 
         // Keep interactions - we'll just focus our test on main effects
         let config = ModelConfig {
-            model_family: ModelFamily::Gam(LinkFunction::Identity),
-            penalty_order: 2,
             convergence_tolerance: 1e-6,
             max_iterations: 100,
-            reml_convergence_tolerance: 1e-3,
             reml_max_iterations: 20,
-            firth_bias_reduction: false,
-            reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
             pgs_basis_config: BasisConfig {
                 num_knots: 3,
                 degree: 3,
@@ -1856,17 +1779,9 @@ mod tests {
                 },
             ],
             pgs_range: (-2.0, 2.0),
-            interaction_penalty: InteractionPenaltyKind::Anisotropic,
-            sum_to_zero_constraints: std::collections::HashMap::new(),
-            knot_vectors: std::collections::HashMap::new(),
-            range_transforms: std::collections::HashMap::new(),
-            pc_null_transforms: std::collections::HashMap::new(),
-            interaction_centering_means: std::collections::HashMap::new(),
-            interaction_orth_alpha: std::collections::HashMap::new(),
-
             mcmc_enabled: false,
             calibrator_enabled: false,
-            survival: None,
+            ..Default::default()
         };
 
         let (x, s_list, layout, _, _, _, _, _, _, _) =
@@ -2971,13 +2886,9 @@ mod tests {
         };
         let config = ModelConfig {
             model_family: ModelFamily::Gam(LinkFunction::Logit),
-            penalty_order: 2,
             convergence_tolerance: 1e-6,
             max_iterations: 100,
-            reml_convergence_tolerance: 1e-3,
             reml_max_iterations: 20,
-            firth_bias_reduction: false,
-            reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
             pgs_basis_config: BasisConfig {
                 num_knots: 3,
                 degree: 3,
@@ -3009,17 +2920,9 @@ mod tests {
                 },
             ],
             pgs_range: (-3.0, 3.0),
-            interaction_penalty: InteractionPenaltyKind::Anisotropic,
-            sum_to_zero_constraints: std::collections::HashMap::new(),
-            knot_vectors: std::collections::HashMap::new(),
-            range_transforms: std::collections::HashMap::new(),
-            pc_null_transforms: std::collections::HashMap::new(),
-            interaction_centering_means: std::collections::HashMap::new(),
-            interaction_orth_alpha: std::collections::HashMap::new(),
-
             mcmc_enabled: false,
             calibrator_enabled: false,
-            survival: None,
+            ..Default::default()
         };
 
         // --- Train model ---
@@ -3100,14 +3003,10 @@ mod tests {
 
         // --- Model configuration ---
         let config = ModelConfig {
-            model_family: ModelFamily::Gam(LinkFunction::Identity), // More stable
-            penalty_order: 2,
             convergence_tolerance: 1e-4, // Relaxed tolerance for better convergence
             max_iterations: 100,         // Reasonable number of iterations
             reml_convergence_tolerance: 1e-2,
             reml_max_iterations: 20,
-            firth_bias_reduction: false,
-            reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
             pgs_basis_config: BasisConfig {
                 num_knots: 2, // Fewer knots for stability
                 degree: 2,    // Lower degree for stability
@@ -3131,17 +3030,9 @@ mod tests {
                 }, // PC2 - same basis size as PC1
             ],
             pgs_range: (-2.5, 2.5),
-            interaction_penalty: InteractionPenaltyKind::Anisotropic,
-            sum_to_zero_constraints: std::collections::HashMap::new(),
-            knot_vectors: std::collections::HashMap::new(),
-            range_transforms: std::collections::HashMap::new(),
-            pc_null_transforms: std::collections::HashMap::new(),
-            interaction_centering_means: std::collections::HashMap::new(),
-            interaction_orth_alpha: std::collections::HashMap::new(),
-
             mcmc_enabled: false,
             calibrator_enabled: false,
-            survival: None,
+            ..Default::default()
         };
 
         // --- Build model structure ---
@@ -3335,30 +3226,17 @@ mod tests {
         // --- Model configuration ---
         let mut config = ModelConfig {
             model_family: ModelFamily::Gam(LinkFunction::Logit),
-            penalty_order: 2,
             convergence_tolerance: 1e-6,
             max_iterations: 100,
-            reml_convergence_tolerance: 1e-3,
             reml_max_iterations: 20,
-            firth_bias_reduction: false,
-            reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
             pgs_basis_config: BasisConfig {
                 num_knots: 3,
                 degree: 3,
             },
-            pc_configs: vec![],
             pgs_range: (-2.0, 2.0),
-            interaction_penalty: InteractionPenaltyKind::Anisotropic,
-            sum_to_zero_constraints: std::collections::HashMap::new(),
-            knot_vectors: std::collections::HashMap::new(),
-            range_transforms: std::collections::HashMap::new(),
-            pc_null_transforms: std::collections::HashMap::new(),
-            interaction_centering_means: std::collections::HashMap::new(),
-            interaction_orth_alpha: std::collections::HashMap::new(),
-
             mcmc_enabled: false,
             calibrator_enabled: false,
-            survival: None,
+            ..Default::default()
         };
         // Clear PC configurations
         config.pc_configs.clear();
@@ -3464,13 +3342,8 @@ mod tests {
 
         let config = ModelConfig {
             model_family: ModelFamily::Gam(LinkFunction::Logit),
-            penalty_order: 2,
-            convergence_tolerance: 1e-7, // Keep strict tolerance
             max_iterations: 150,         // Generous iterations for complex models
-            reml_convergence_tolerance: 1e-3,
             reml_max_iterations: 15,
-            firth_bias_reduction: false,
-            reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
             pgs_basis_config: BasisConfig {
                 num_knots: 2,
                 degree: 3,
@@ -3484,17 +3357,9 @@ mod tests {
                 range: (-1.5, 1.5),
             }],
             pgs_range: (-6.0, 6.0),
-            interaction_penalty: InteractionPenaltyKind::Anisotropic,
-            sum_to_zero_constraints: HashMap::new(),
-            knot_vectors: HashMap::new(),
-            range_transforms: HashMap::new(),
-            pc_null_transforms: HashMap::new(),
-            interaction_centering_means: HashMap::new(),
-            interaction_orth_alpha: HashMap::new(),
-
             mcmc_enabled: false,
             calibrator_enabled: false,
-            survival: None,
+            ..Default::default()
         };
 
         // Test with extreme lambda values that might cause issues
@@ -3609,13 +3474,8 @@ mod tests {
         // Use the same config but smaller basis to speed up
         let config = ModelConfig {
             model_family: ModelFamily::Gam(LinkFunction::Logit),
-            penalty_order: 2,
-            convergence_tolerance: 1e-7, // Keep strict tolerance
             max_iterations: 150,         // Generous iterations for complex models
-            reml_convergence_tolerance: 1e-3,
             reml_max_iterations: 15,
-            firth_bias_reduction: false,
-            reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
             pgs_basis_config: BasisConfig {
                 num_knots: 3, // Smaller than original 5
                 degree: 3,
@@ -3629,17 +3489,9 @@ mod tests {
                 range: (-1.5, 1.5),
             }],
             pgs_range: (-3.0, 3.0),
-            interaction_penalty: InteractionPenaltyKind::Anisotropic,
-            sum_to_zero_constraints: HashMap::new(),
-            knot_vectors: HashMap::new(),
-            range_transforms: HashMap::new(),
-            pc_null_transforms: HashMap::new(),
-            interaction_centering_means: HashMap::new(),
-            interaction_orth_alpha: HashMap::new(),
-
             mcmc_enabled: false,
             calibrator_enabled: false,
-            survival: None,
+            ..Default::default()
         };
 
         // Test that we can at least compute cost without getting infinity
@@ -3740,14 +3592,9 @@ mod tests {
 
         // Over-parameterized model: many knots and PCs for small dataset
         let config = ModelConfig {
-            model_family: ModelFamily::Gam(LinkFunction::Identity),
-            penalty_order: 2,
             convergence_tolerance: 1e-6,
             max_iterations: 100,
-            reml_convergence_tolerance: 1e-3,
             reml_max_iterations: 20,
-            firth_bias_reduction: false,
-            reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
             pgs_basis_config: BasisConfig {
                 num_knots: 15, // Too many knots for small data
                 degree: 3,
@@ -3820,17 +3667,9 @@ mod tests {
                 },
             ],
             pgs_range: (-1.0, 1.0),
-            interaction_penalty: InteractionPenaltyKind::Anisotropic,
-            sum_to_zero_constraints: std::collections::HashMap::new(),
-            knot_vectors: std::collections::HashMap::new(),
-            range_transforms: std::collections::HashMap::new(),
-            pc_null_transforms: std::collections::HashMap::new(),
-            interaction_centering_means: std::collections::HashMap::new(),
-            interaction_orth_alpha: std::collections::HashMap::new(),
-
             mcmc_enabled: false,
             calibrator_enabled: false,
-            survival: None,
+            ..Default::default()
         };
         // This creates way too many parameters for 30 data points
 
@@ -3924,14 +3763,9 @@ mod tests {
 
         // Create massively over-parameterized model
         let config = ModelConfig {
-            model_family: ModelFamily::Gam(LinkFunction::Identity),
-            penalty_order: 2,
             convergence_tolerance: 1e-6,
             max_iterations: 100,
-            reml_convergence_tolerance: 1e-3,
             reml_max_iterations: 50,
-            firth_bias_reduction: false,
-            reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
             pgs_basis_config: BasisConfig {
                 num_knots: 6, // Reduced to avoid ModelOverparameterized
                 degree: 3,
@@ -3945,17 +3779,9 @@ mod tests {
                 range: (-1.5, 1.5),
             }],
             pgs_range: (0.0, 1.0),
-            interaction_penalty: InteractionPenaltyKind::Anisotropic,
-            sum_to_zero_constraints: std::collections::HashMap::new(),
-            knot_vectors: std::collections::HashMap::new(),
-            range_transforms: std::collections::HashMap::new(),
-            pc_null_transforms: std::collections::HashMap::new(),
-            interaction_centering_means: std::collections::HashMap::new(),
-            interaction_orth_alpha: std::collections::HashMap::new(),
-
             mcmc_enabled: false,
             calibrator_enabled: false,
-            survival: None,
+            ..Default::default()
         };
 
         println!(
@@ -4045,13 +3871,10 @@ mod tests {
         // Create a minimal model config
         let config = ModelConfig {
             model_family: ModelFamily::Gam(LinkFunction::Logit),
-            penalty_order: 2,
             convergence_tolerance: 1e-6,
             max_iterations: 100,
             reml_convergence_tolerance: 1e-6,
             reml_max_iterations: 50,
-            firth_bias_reduction: false,
-            reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
             pgs_basis_config: BasisConfig {
                 num_knots: 3,
                 degree: 3,
@@ -4065,17 +3888,9 @@ mod tests {
                 range: (-1.5, 1.5),
             }],
             pgs_range: (0.0, 1.0),
-            interaction_penalty: InteractionPenaltyKind::Anisotropic,
-            sum_to_zero_constraints: std::collections::HashMap::new(),
-            knot_vectors: std::collections::HashMap::new(),
-            range_transforms: std::collections::HashMap::new(),
-            pc_null_transforms: std::collections::HashMap::new(),
-            interaction_centering_means: std::collections::HashMap::new(),
-            interaction_orth_alpha: std::collections::HashMap::new(),
-
             mcmc_enabled: false,
             calibrator_enabled: false,
-            survival: None,
+            ..Default::default()
         };
 
         // Build design and penalty matrices
@@ -4203,31 +4018,17 @@ mod tests {
             // Stage: Define a simple configuration for a model with only a PGS term
             let mut simple_config = ModelConfig {
                 model_family: ModelFamily::Gam(LinkFunction::Logit),
-                penalty_order: 2,
                 convergence_tolerance: 1e-6,
                 max_iterations: 100,
-                reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 20,
-                firth_bias_reduction: false,
-                reml_parallel_threshold:
-                    crate::calibrate::model::default_reml_parallel_threshold(),
                 pgs_basis_config: BasisConfig {
                     num_knots: 3,
                     degree: 3,
                 },
-                pc_configs: vec![],
                 pgs_range: (-2.0, 2.0),
-                interaction_penalty: InteractionPenaltyKind::Anisotropic,
-                sum_to_zero_constraints: std::collections::HashMap::new(),
-                knot_vectors: std::collections::HashMap::new(),
-                range_transforms: std::collections::HashMap::new(),
-                pc_null_transforms: std::collections::HashMap::new(),
-                interaction_centering_means: std::collections::HashMap::new(),
-                interaction_orth_alpha: std::collections::HashMap::new(),
-
                 mcmc_enabled: false,
-            calibrator_enabled: false,
-            survival: None,
+                calibrator_enabled: false,
+                ..Default::default()
             };
             simple_config.model_family = ModelFamily::Gam(link_function);
             simple_config.pgs_basis_config.num_knots = 4; // Use a reasonable number of knots
@@ -4351,31 +4152,17 @@ mod tests {
             // Stage: Define a simple model configuration for a PGS-only model
             let mut simple_config = ModelConfig {
                 model_family: ModelFamily::Gam(link_function),
-                penalty_order: 2,
                 convergence_tolerance: 1e-6,
                 max_iterations: 100,
-                reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 20,
-                firth_bias_reduction: false,
-                reml_parallel_threshold:
-                    crate::calibrate::model::default_reml_parallel_threshold(),
                 pgs_basis_config: BasisConfig {
                     num_knots: 3,
                     degree: 3,
                 },
-                pc_configs: vec![],
                 pgs_range: (-1.0, 1.0),
-                interaction_penalty: InteractionPenaltyKind::Anisotropic,
-                sum_to_zero_constraints: std::collections::HashMap::new(),
-                knot_vectors: std::collections::HashMap::new(),
-                range_transforms: std::collections::HashMap::new(),
-                pc_null_transforms: std::collections::HashMap::new(),
-                interaction_centering_means: std::collections::HashMap::new(),
-                interaction_orth_alpha: std::collections::HashMap::new(),
-
                 mcmc_enabled: false,
-            calibrator_enabled: false,
-            survival: None,
+                calibrator_enabled: false,
+                ..Default::default()
             };
 
             // Use a simple basis with fewer knots to reduce complexity
@@ -4527,14 +4314,9 @@ mod tests {
 
         // Stage: Define a simple model configuration for the test
         let simple_config = ModelConfig {
-            model_family: ModelFamily::Gam(LinkFunction::Identity), // Use Identity for simpler test
-            penalty_order: 2,
             convergence_tolerance: 1e-6,
             max_iterations: 100,
-            reml_convergence_tolerance: 1e-3,
             reml_max_iterations: 20,
-            firth_bias_reduction: false,
-            reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
             pgs_basis_config: BasisConfig {
                 num_knots: 2,
                 degree: 3,
@@ -4548,17 +4330,9 @@ mod tests {
                 range: (-1.5, 1.5),
             }],
             pgs_range: (-2.0, 2.0),
-            interaction_penalty: InteractionPenaltyKind::Anisotropic,
-            sum_to_zero_constraints: std::collections::HashMap::new(),
-            knot_vectors: std::collections::HashMap::new(),
-            range_transforms: std::collections::HashMap::new(),
-            pc_null_transforms: std::collections::HashMap::new(),
-            interaction_centering_means: std::collections::HashMap::new(),
-            interaction_orth_alpha: std::collections::HashMap::new(),
-
             mcmc_enabled: false,
             calibrator_enabled: false,
-            survival: None,
+            ..Default::default()
         };
 
         // Create data with non-collinear predictors to avoid perfect collinearity
@@ -4730,31 +4504,17 @@ mod tests {
 
         // Stage: Define a simple model configuration for a PGS-only model
         let simple_config = ModelConfig {
-            model_family: ModelFamily::Gam(LinkFunction::Identity),
-            penalty_order: 2,
             convergence_tolerance: 1e-6,
             max_iterations: 100,
-            reml_convergence_tolerance: 1e-3,
             reml_max_iterations: 20,
-            firth_bias_reduction: false,
-            reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
             pgs_basis_config: BasisConfig {
                 num_knots: 3,
                 degree: 3,
             },
-            pc_configs: vec![],
             pgs_range: (-1.0, 1.0),
-            interaction_penalty: InteractionPenaltyKind::Anisotropic,
-            sum_to_zero_constraints: std::collections::HashMap::new(),
-            knot_vectors: std::collections::HashMap::new(),
-            range_transforms: std::collections::HashMap::new(),
-            pc_null_transforms: std::collections::HashMap::new(),
-            interaction_centering_means: std::collections::HashMap::new(),
-            interaction_orth_alpha: std::collections::HashMap::new(),
-
             mcmc_enabled: false,
             calibrator_enabled: false,
-            survival: None,
+            ..Default::default()
         };
 
         // Stage: Generate consistent structures using the canonical function
@@ -4857,31 +4617,17 @@ mod tests {
 
         // Stage: Define a simple model configuration for a PGS-only model
         let simple_config = ModelConfig {
-            model_family: ModelFamily::Gam(LinkFunction::Identity),
-            penalty_order: 2,
             convergence_tolerance: 1e-6,
             max_iterations: 100,
-            reml_convergence_tolerance: 1e-3,
             reml_max_iterations: 20,
-            firth_bias_reduction: false,
-            reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
             pgs_basis_config: BasisConfig {
                 num_knots: 3,
                 degree: 3,
             },
-            pc_configs: vec![],
             pgs_range: (-1.0, 1.0),
-            interaction_penalty: InteractionPenaltyKind::Anisotropic,
-            sum_to_zero_constraints: std::collections::HashMap::new(),
-            knot_vectors: std::collections::HashMap::new(),
-            range_transforms: std::collections::HashMap::new(),
-            pc_null_transforms: std::collections::HashMap::new(),
-            interaction_centering_means: std::collections::HashMap::new(),
-            interaction_orth_alpha: std::collections::HashMap::new(),
-
             mcmc_enabled: false,
             calibrator_enabled: false,
-            survival: None,
+            ..Default::default()
         };
 
         // Stage: Generate consistent structures using the canonical function
@@ -4957,8 +4703,7 @@ mod tests {
 
 #[test]
 fn test_train_model_fails_gracefully_on_perfect_separation() {
-use crate::calibrate::model::{BasisConfig, InteractionPenaltyKind, ModelFamily};
-use std::collections::HashMap;
+use crate::calibrate::model::{BasisConfig, ModelFamily};
 
 // Stage: Create a perfectly separated dataset
 let n_samples = 1000;
@@ -4976,30 +4721,17 @@ let data = TrainingData {
 // Stage: Configure a logit model
 let config = ModelConfig {
     model_family: ModelFamily::Gam(LinkFunction::Logit),
-    penalty_order: 2,
     convergence_tolerance: 1e-6,
     max_iterations: 100,
-    reml_convergence_tolerance: 1e-3,
     reml_max_iterations: 20,
-    firth_bias_reduction: false,
-    reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
     pgs_basis_config: BasisConfig {
         num_knots: 5,
         degree: 3,
     },
-    pc_configs: vec![],
     pgs_range: (-1.0, 1.0),
-    interaction_penalty: InteractionPenaltyKind::Anisotropic,
-    sum_to_zero_constraints: HashMap::new(),
-    knot_vectors: HashMap::new(),
-    range_transforms: HashMap::new(),
-    pc_null_transforms: HashMap::new(),
-    interaction_centering_means: HashMap::new(),
-    interaction_orth_alpha: HashMap::new(),
-
     mcmc_enabled: false,
     calibrator_enabled: false,
-    survival: None,
+    ..Default::default()
 };
 
 // Stage: Train the model and expect an error
@@ -5057,14 +4789,9 @@ let data = TrainingData {
 
 // Create a basic config
 let config = ModelConfig {
-    model_family: ModelFamily::Gam(LinkFunction::Identity),
-    penalty_order: 2,
     convergence_tolerance: 1e-6,
-    max_iterations: 50,
     reml_convergence_tolerance: 1e-6,
     reml_max_iterations: 20,
-    firth_bias_reduction: false,
-    reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
     pgs_basis_config: BasisConfig {
         num_knots: 3,
         degree: 3,
@@ -5078,17 +4805,9 @@ let config = ModelConfig {
         range: (-1.0, 1.0),
     }],
     pgs_range: (-1.0, 1.0),
-    interaction_penalty: InteractionPenaltyKind::Anisotropic,
-    sum_to_zero_constraints: std::collections::HashMap::new(),
-    knot_vectors: std::collections::HashMap::new(),
-    range_transforms: std::collections::HashMap::new(),
-    pc_null_transforms: std::collections::HashMap::new(),
-    interaction_centering_means: std::collections::HashMap::new(),
-    interaction_orth_alpha: std::collections::HashMap::new(),
-
     mcmc_enabled: false,
     calibrator_enabled: false,
-    survival: None,
+    ..Default::default()
 };
 
 // Try to build the matrices - if this fails, the test is still valid
@@ -5274,13 +4993,9 @@ fn run(link_function: LinkFunction) -> Result<(), Box<dyn std::error::Error>> {
     // Stage: Configure a simple, stable model that includes penalties for PC1, PGS, and the interaction
     let config = ModelConfig {
         model_family: ModelFamily::Gam(link_function),
-        penalty_order: 2,
         convergence_tolerance: 1e-6,
         max_iterations: 150,
-        reml_convergence_tolerance: 1e-3,
         reml_max_iterations: 50,
-        firth_bias_reduction: false,
-        reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
         pgs_basis_config: BasisConfig {
             num_knots: 3,
             degree: 3,
@@ -5294,17 +5009,9 @@ fn run(link_function: LinkFunction) -> Result<(), Box<dyn std::error::Error>> {
             range: (-3.0, 3.0),
         }],
         pgs_range: (-3.5, 3.5), // Use slightly wider ranges for robustness
-        interaction_penalty: InteractionPenaltyKind::Anisotropic,
-        sum_to_zero_constraints: std::collections::HashMap::new(),
-        knot_vectors: std::collections::HashMap::new(),
-        range_transforms: std::collections::HashMap::new(),
-        pc_null_transforms: std::collections::HashMap::new(),
-        interaction_centering_means: std::collections::HashMap::new(),
-        interaction_orth_alpha: std::collections::HashMap::new(),
-
         mcmc_enabled: false,
         calibrator_enabled: false,
-        survival: None,
+        ..Default::default()
     };
 
     // Stage: Build matrices and the REML state to evaluate cost at specific rho values
@@ -5395,31 +5102,17 @@ fn reparam_consistency_rho_vs_lambda_gaussian_identity() {
     };
 
     let config = ModelConfig {
-        model_family: ModelFamily::Gam(LinkFunction::Identity),
-        penalty_order: 2,
         convergence_tolerance: 1e-6,
         max_iterations: 100,
-        reml_convergence_tolerance: 1e-3,
         reml_max_iterations: 20,
-        firth_bias_reduction: false,
-        reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
         pgs_basis_config: BasisConfig {
             num_knots: 4,
             degree: 3,
         },
-        pc_configs: vec![],
         pgs_range: (-1.0, 1.0),
-        interaction_penalty: InteractionPenaltyKind::Anisotropic,
-        sum_to_zero_constraints: std::collections::HashMap::new(),
-        knot_vectors: std::collections::HashMap::new(),
-        range_transforms: std::collections::HashMap::new(),
-        pc_null_transforms: std::collections::HashMap::new(),
-        interaction_centering_means: std::collections::HashMap::new(),
-        interaction_orth_alpha: std::collections::HashMap::new(),
-
         mcmc_enabled: false,
         calibrator_enabled: false,
-        survival: None,
+        ..Default::default()
     };
 
     let (x, s_list, layout, ..) =
@@ -5561,13 +5254,9 @@ fn test_laml_gradient_matches_finite_difference() {
 
     let config = ModelConfig {
         model_family: ModelFamily::Gam(LinkFunction::Logit),
-        penalty_order: 2,
         convergence_tolerance: 1e-6,
         max_iterations: 100,
-        reml_convergence_tolerance: 1e-3,
         reml_max_iterations: 20,
-        firth_bias_reduction: false,
-        reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
         pgs_basis_config: BasisConfig {
             num_knots: 4,
             degree: 3,
@@ -5581,17 +5270,9 @@ fn test_laml_gradient_matches_finite_difference() {
             range: (-1.5, 1.5),
         }],
         pgs_range: (-2.0, 2.0),
-        interaction_penalty: InteractionPenaltyKind::Anisotropic,
-        sum_to_zero_constraints: std::collections::HashMap::new(),
-        knot_vectors: std::collections::HashMap::new(),
-        range_transforms: std::collections::HashMap::new(),
-        pc_null_transforms: std::collections::HashMap::new(),
-        interaction_centering_means: std::collections::HashMap::new(),
-        interaction_orth_alpha: std::collections::HashMap::new(),
-
         mcmc_enabled: false,
         calibrator_enabled: false,
-        survival: None,
+        ..Default::default()
     };
 
     let (x, s_list, layout, _, _, _, _, _, _, _) =
@@ -5766,30 +5447,18 @@ fn test_hmc_integration_runs() {
     // 2. Configure model with MCMC enabled
     let config = ModelConfig {
         model_family: ModelFamily::Gam(LinkFunction::Logit),
-        penalty_order: 2,
         convergence_tolerance: 1e-4,
         max_iterations: 20,
         reml_convergence_tolerance: 1e-4,
         reml_max_iterations: 20,
-        firth_bias_reduction: false,
-        reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
         pgs_basis_config: BasisConfig {
             num_knots: 2,  // Minimal knots for fast sampling
             degree: 1,    // Linear spline = fewer params
         },
-        pc_configs: vec![],
         pgs_range: (-2.0, 2.0),
-        interaction_penalty: InteractionPenaltyKind::Anisotropic,
-        sum_to_zero_constraints: std::collections::HashMap::new(),
-        knot_vectors: std::collections::HashMap::new(),
-        range_transforms: std::collections::HashMap::new(),
-        pc_null_transforms: std::collections::HashMap::new(),
-        interaction_centering_means: std::collections::HashMap::new(),
-        interaction_orth_alpha: std::collections::HashMap::new(),
-
         mcmc_enabled: true, // ENABLE MCMC
         calibrator_enabled: false,
-        survival: None,
+        ..Default::default()
     };
 
     // 3. Train
@@ -5897,29 +5566,16 @@ fn test_mcmc_end_to_end_with_disk_io() {
     // === Configure and train ===
     let config = ModelConfig {
         model_family: ModelFamily::Gam(LinkFunction::Logit),
-        penalty_order: 2,
         convergence_tolerance: 1e-4,
-        max_iterations: 50,
         reml_convergence_tolerance: 1e-4,
         reml_max_iterations: 30,
-        firth_bias_reduction: false,
-        reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
         pgs_basis_config: BasisConfig {
             num_knots: 4,
             degree: 3,
         },
-        pc_configs: vec![],
         pgs_range: (-3.0, 3.0),
-        interaction_penalty: InteractionPenaltyKind::Anisotropic,
-        sum_to_zero_constraints: std::collections::HashMap::new(),
-        knot_vectors: std::collections::HashMap::new(),
-        range_transforms: std::collections::HashMap::new(),
-        pc_null_transforms: std::collections::HashMap::new(),
-        interaction_centering_means: std::collections::HashMap::new(),
-        interaction_orth_alpha: std::collections::HashMap::new(),
-        mcmc_enabled: true,
         calibrator_enabled: false,
-        survival: None,
+        ..Default::default()
     };
 
     println!("[MCMC E2E] Training model with heavy-tailed data...");

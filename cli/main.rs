@@ -17,9 +17,7 @@ use gnomon::calibrate::model::SurvivalModelConfig;
 use gnomon::calibrate::model::SurvivalPrediction;
 use gnomon::calibrate::model::SurvivalRiskType;
 use gnomon::calibrate::model::SurvivalTimeVaryingConfig;
-use gnomon::calibrate::model::{
-    InteractionPenaltyKind, LinkFunction, ModelConfig, ModelFamily, TrainedModel,
-};
+use gnomon::calibrate::model::{LinkFunction, ModelConfig, ModelFamily, TrainedModel};
 use gnomon::calibrate::survival::SurvivalSpec;
 use gnomon::calibrate::survival_data::{
     SurvivalPredictionData, has_survival_columns, load_survival_prediction_data,
@@ -28,7 +26,6 @@ use gnomon::calibrate::survival_data::{
 use gnomon::map::main as map_cli;
 use gnomon::map::{DEFAULT_LD_WINDOW, LdWindow};
 use gnomon::terms::infer_sex_to_tsv;
-use std::collections::HashMap;
 
 #[derive(Clone, ValueEnum)]
 pub enum ModelFamilyCli {
@@ -222,22 +219,11 @@ pub fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
                 max_iterations: args.max_iterations,
                 reml_convergence_tolerance: args.reml_convergence_tolerance,
                 reml_max_iterations: args.reml_max_iterations,
-                firth_bias_reduction: false,
-                reml_parallel_threshold: gnomon::calibrate::model::default_reml_parallel_threshold(
-                ),
                 pgs_basis_config,
                 pc_configs,
                 pgs_range,
-                interaction_penalty: InteractionPenaltyKind::Anisotropic,
-                sum_to_zero_constraints: HashMap::new(),
-                knot_vectors: HashMap::new(),
-                range_transforms: HashMap::new(),
-                interaction_centering_means: HashMap::new(),
-                interaction_orth_alpha: HashMap::new(),
-                pc_null_transforms: HashMap::new(),
-                mcmc_enabled: true,
                 calibrator_enabled: !args.no_calibration,
-                survival: None,
+                ..Default::default()
             };
 
             println!("Training final model...");
@@ -311,24 +297,9 @@ fn train_survival_from_args(args: &TrainArgs) -> Result<(), Box<dyn std::error::
         max_iterations: args.max_iterations,
         reml_convergence_tolerance: args.reml_convergence_tolerance,
         reml_max_iterations: args.reml_max_iterations,
-        firth_bias_reduction: false,
-        reml_parallel_threshold: gnomon::calibrate::model::default_reml_parallel_threshold(),
-        pgs_basis_config: BasisConfig {
-            num_knots: 0,
-            degree: 0,
-        },
-        pc_configs: Vec::new(),
-        pgs_range: (0.0, 0.0),
-        interaction_penalty: InteractionPenaltyKind::Anisotropic,
-        sum_to_zero_constraints: HashMap::new(),
-        knot_vectors: HashMap::new(),
-        range_transforms: HashMap::new(),
-        interaction_centering_means: HashMap::new(),
-        interaction_orth_alpha: HashMap::new(),
-        pc_null_transforms: HashMap::new(),
-        mcmc_enabled: true,
         calibrator_enabled: !args.no_calibration,
         survival: Some(survival_config),
+        ..Default::default()
     };
 
     println!("Training survival model...");
@@ -458,8 +429,74 @@ fn calculate_range(data: ArrayView1<f64>) -> (f64, f64) {
     (min_val, max_val)
 }
 
+/// Write a TSV row, optionally inserting an extra column before the prediction column.
+fn write_tsv_row(
+    file: &mut std::fs::File,
+    base_fields: &[&dyn std::fmt::Display],
+    uncalibrated: Option<&dyn std::fmt::Display>,
+    tail_fields: &[&dyn std::fmt::Display],
+) -> Result<(), std::io::Error> {
+    use std::io::Write;
+    let mut first = true;
+    for field in base_fields {
+        if !first {
+            write!(file, "\t")?;
+        }
+        write!(file, "{field}")?;
+        first = false;
+    }
+    if let Some(uncal) = uncalibrated {
+        write!(file, "\t{uncal}")?;
+    }
+    for field in tail_fields {
+        write!(file, "\t{field}")?;
+    }
+    writeln!(file)?;
+    Ok(())
+}
+
+fn se_and_ci(
+    se_eta_opt: Option<&Array1<f64>>,
+    i: usize,
+    eta_i: f64,
+    link: LinkFunction,
+) -> (String, String, String) {
+    let Some(se_eta) = se_eta_opt else {
+        return ("NA".to_string(), "NA".to_string(), "NA".to_string());
+    };
+    let se = se_eta[i];
+    let lo_eta = eta_i - 1.959964 * se;
+    let hi_eta = eta_i + 1.959964 * se;
+    match link {
+        LinkFunction::Identity => (se.to_string(), lo_eta.to_string(), hi_eta.to_string()),
+        LinkFunction::Logit => {
+            let lo_p = 1.0 / (1.0 + (-lo_eta).exp());
+            let hi_p = 1.0 / (1.0 + (-hi_eta).exp());
+            (
+                se.to_string(),
+                lo_p.clamp(0.0, 1.0).to_string(),
+                hi_p.clamp(0.0, 1.0).to_string(),
+            )
+        }
+        LinkFunction::Probit => (
+            se.to_string(),
+            normal_cdf_approx(lo_eta).clamp(0.0, 1.0).to_string(),
+            normal_cdf_approx(hi_eta).clamp(0.0, 1.0).to_string(),
+        ),
+        LinkFunction::CLogLog => {
+            let lo_p = 1.0 - (-lo_eta.exp()).exp();
+            let hi_p = 1.0 - (-hi_eta.exp()).exp();
+            (
+                se.to_string(),
+                lo_p.clamp(0.0, 1.0).to_string(),
+                hi_p.clamp(0.0, 1.0).to_string(),
+            )
+        }
+    }
+}
+
 fn save_predictions_detailed(
-    sample_ids: &Vec<String>,
+    sample_ids: &[String],
     signed_distance: &Array1<f64>,
     eta: &Array1<f64>,
     mean: &Array1<f64>,
@@ -471,115 +508,57 @@ fn save_predictions_detailed(
     use std::io::Write;
 
     let mut file = std::fs::File::create(output_path)?;
-    match link {
-        LinkFunction::Logit | LinkFunction::Probit | LinkFunction::CLogLog => {
-            // Header for binary target - include uncalibrated_prediction column when calibration is enabled
-            if calibrated_mean_opt.is_some() {
-                writeln!(
-                    file,
-                    "sample_id\thull_signed_distance\tlog_odds\tstandard_error_log_odds\tuncalibrated_prediction\tprediction\tprobability_lower_95\tprobability_upper_95"
-                )?
-            } else {
-                writeln!(
-                    file,
-                    "sample_id\thull_signed_distance\tlog_odds\tstandard_error_log_odds\tprediction\tprobability_lower_95\tprobability_upper_95"
-                )?
-            };
+    let has_cal = calibrated_mean_opt.is_some();
+    let is_binary = !matches!(link, LinkFunction::Identity);
 
-            for i in 0..eta.len() {
-                let id = &sample_ids[i];
-                let sd = signed_distance[i];
-                let log_odds = eta[i];
-                let uncalibrated_p = mean[i];
-                // If calibrated predictions are available, use them, otherwise use uncalibrated
-                let p = calibrated_mean_opt.map_or(uncalibrated_p, |cal| cal[i]);
-
-                let (se_str, lo_str, hi_str) = if let Some(se_eta) = se_eta_opt {
-                    let se = se_eta[i];
-                    let lo_eta = log_odds - 1.959964 * se;
-                    let hi_eta = log_odds + 1.959964 * se;
-                    let (lo_p, hi_p) = match link {
-                        LinkFunction::Logit => {
-                            (1.0 / (1.0 + (-lo_eta).exp()), 1.0 / (1.0 + (-hi_eta).exp()))
-                        }
-                        LinkFunction::Probit => {
-                            (normal_cdf_approx(lo_eta), normal_cdf_approx(hi_eta))
-                        }
-                        LinkFunction::CLogLog => {
-                            (1.0 - (-lo_eta.exp()).exp(), 1.0 - (-hi_eta.exp()).exp())
-                        }
-                        LinkFunction::Identity => unreachable!(),
-                    };
-                    (
-                        se.to_string(),
-                        lo_p.max(0.0).min(1.0).to_string(),
-                        hi_p.max(0.0).min(1.0).to_string(),
-                    )
-                } else {
-                    ("NA".to_string(), "NA".to_string(), "NA".to_string())
-                };
-
-                // Include uncalibrated prediction column when calibration is enabled
-                if calibrated_mean_opt.is_some() {
-                    writeln!(
-                        file,
-                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                        id, sd, log_odds, se_str, uncalibrated_p, p, lo_str, hi_str
-                    )?
-                } else {
-                    writeln!(
-                        file,
-                        "{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                        id, sd, log_odds, se_str, p, lo_str, hi_str
-                    )?
-                };
-            }
+    // Write header
+    if is_binary {
+        let base = "sample_id\thull_signed_distance\tlog_odds\tstandard_error_log_odds";
+        let tail = "prediction\tprobability_lower_95\tprobability_upper_95";
+        if has_cal {
+            writeln!(file, "{base}\tuncalibrated_prediction\t{tail}")?;
+        } else {
+            writeln!(file, "{base}\t{tail}")?;
         }
-        LinkFunction::Identity => {
-            // Header for continuous target - include uncalibrated_prediction column when calibration is enabled
-            if calibrated_mean_opt.is_some() {
-                writeln!(
-                    file,
-                    "sample_id\thull_signed_distance\tuncalibrated_prediction\tprediction\tstandard_error_mean\tmean_lower_95\tmean_upper_95"
-                )?
-            } else {
-                writeln!(
-                    file,
-                    "sample_id\thull_signed_distance\tprediction\tstandard_error_mean\tmean_lower_95\tmean_upper_95"
-                )?
-            };
+    } else {
+        let tail = "prediction\tstandard_error_mean\tmean_lower_95\tmean_upper_95";
+        if has_cal {
+            writeln!(file, "sample_id\thull_signed_distance\tuncalibrated_prediction\t{tail}")?;
+        } else {
+            writeln!(file, "sample_id\thull_signed_distance\t{tail}")?;
+        }
+    }
 
-            for i in 0..eta.len() {
-                let id = &sample_ids[i];
-                let sd = signed_distance[i];
-                let uncalibrated_pred = mean[i];
-                // If calibrated predictions are available, use them, otherwise use uncalibrated
-                let pred = calibrated_mean_opt.map_or(uncalibrated_pred, |cal| cal[i]);
+    // Write rows
+    for i in 0..eta.len() {
+        let uncalibrated = mean[i];
+        let prediction = calibrated_mean_opt.map_or(uncalibrated, |cal| cal[i]);
+        let (se_str, lo_str, hi_str) = se_and_ci(
+            se_eta_opt,
+            i,
+            if is_binary { eta[i] } else { prediction },
+            link,
+        );
 
-                let (se_str, lo_str, hi_str) = if let Some(se_eta) = se_eta_opt {
-                    let se = se_eta[i];
-                    let lo = pred - 1.959964 * se;
-                    let hi = pred + 1.959964 * se;
-                    (se.to_string(), lo.to_string(), hi.to_string())
-                } else {
-                    ("NA".to_string(), "NA".to_string(), "NA".to_string())
-                };
-
-                // Include uncalibrated prediction column when calibration is enabled
-                if calibrated_mean_opt.is_some() {
-                    writeln!(
-                        file,
-                        "{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                        id, sd, uncalibrated_pred, pred, se_str, lo_str, hi_str
-                    )?
-                } else {
-                    writeln!(
-                        file,
-                        "{}\t{}\t{}\t{}\t{}\t{}",
-                        id, sd, pred, se_str, lo_str, hi_str
-                    )?
-                };
-            }
+        if is_binary {
+            write_tsv_row(
+                &mut file,
+                &[
+                    &sample_ids[i] as &dyn std::fmt::Display,
+                    &signed_distance[i],
+                    &eta[i],
+                    &se_str,
+                ],
+                has_cal.then_some(&uncalibrated as &dyn std::fmt::Display),
+                &[&prediction, &lo_str, &hi_str],
+            )?;
+        } else {
+            write_tsv_row(
+                &mut file,
+                &[&sample_ids[i] as &dyn std::fmt::Display, &signed_distance[i]],
+                has_cal.then_some(&uncalibrated as &dyn std::fmt::Display),
+                &[&prediction, &se_str, &lo_str, &hi_str],
+            )?;
         }
     }
     Ok(())
@@ -594,65 +573,41 @@ fn save_survival_predictions(
     use std::io::Write;
 
     let mut file = std::fs::File::create(output_path)?;
+    let base_header = "sample_id\tage_entry\tage_exit\tcumulative_hazard_entry\tcumulative_hazard_exit\tcumulative_incidence_entry\tcumulative_incidence_exit\tconditional_risk\tlogit_risk\tlogit_risk_standard_error";
     if calibrated_risk.is_some() {
-        writeln!(
-            file,
-            "sample_id\tage_entry\tage_exit\tcumulative_hazard_entry\tcumulative_hazard_exit\tcumulative_incidence_entry\tcumulative_incidence_exit\tconditional_risk\tlogit_risk\tlogit_risk_standard_error\tcalibrated_risk"
-        )?;
+        writeln!(file, "{base_header}\tcalibrated_risk")?;
     } else {
-        writeln!(
-            file,
-            "sample_id\tage_entry\tage_exit\tcumulative_hazard_entry\tcumulative_hazard_exit\tcumulative_incidence_entry\tcumulative_incidence_exit\tconditional_risk\tlogit_risk\tlogit_risk_standard_error"
-        )?;
+        writeln!(file, "{base_header}")?;
     }
 
-    let count = prediction.conditional_risk.len();
-    for idx in 0..count {
+    for idx in 0..prediction.conditional_risk.len() {
         let sample_id = (idx + 1).to_string();
-        let hazard_entry = prediction.cumulative_hazard_entry[idx];
-        let hazard_exit = prediction.cumulative_hazard_exit[idx];
-        let incidence_entry = prediction.cumulative_incidence_entry[idx];
-        let incidence_exit = prediction.cumulative_incidence_exit[idx];
-        let conditional_risk = prediction.conditional_risk[idx];
-        let logit_risk = prediction.logit_risk[idx];
         let se = prediction
             .logit_risk_se
             .as_ref()
-            .map(|array| array[idx].to_string())
+            .map(|a| a[idx].to_string())
             .unwrap_or_else(|| "NA".to_string());
 
-        if let Some(calibrated) = calibrated_risk {
-            writeln!(
-                file,
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                sample_id,
-                data.age_entry[idx],
-                data.age_exit[idx],
-                hazard_entry,
-                hazard_exit,
-                incidence_entry,
-                incidence_exit,
-                conditional_risk,
-                logit_risk,
-                se,
-                calibrated[idx]
-            )?;
-        } else {
-            writeln!(
-                file,
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                sample_id,
-                data.age_entry[idx],
-                data.age_exit[idx],
-                hazard_entry,
-                hazard_exit,
-                incidence_entry,
-                incidence_exit,
-                conditional_risk,
-                logit_risk,
-                se
-            )?;
-        }
+        write_tsv_row(
+            &mut file,
+            &[
+                &sample_id as &dyn std::fmt::Display,
+                &data.age_entry[idx],
+                &data.age_exit[idx],
+                &prediction.cumulative_hazard_entry[idx],
+                &prediction.cumulative_hazard_exit[idx],
+                &prediction.cumulative_incidence_entry[idx],
+                &prediction.cumulative_incidence_exit[idx],
+                &prediction.conditional_risk[idx],
+                &prediction.logit_risk[idx],
+                &se,
+            ],
+            None,
+            calibrated_risk
+                .map(|cal| -> Vec<&dyn std::fmt::Display> { vec![&cal[idx]] })
+                .unwrap_or_default()
+                .as_slice(),
+        )?;
     }
 
     Ok(())
@@ -819,34 +774,20 @@ fn main() {
 
 /// Format seconds into a human-readable duration like "2.4 hours ago"
 fn format_duration_ago(seconds: u64) -> String {
-    const MINUTE: u64 = 60;
-    const HOUR: u64 = 60 * MINUTE;
-    const DAY: u64 = 24 * HOUR;
-    const WEEK: u64 = 7 * DAY;
-    const MONTH: u64 = 30 * DAY;
-    const YEAR: u64 = 365 * DAY;
-
-    if seconds < MINUTE {
-        format!("{} seconds ago", seconds)
-    } else if seconds < HOUR {
-        let mins = seconds as f64 / MINUTE as f64;
-        format!("{:.1} minutes ago", mins)
-    } else if seconds < DAY {
-        let hours = seconds as f64 / HOUR as f64;
-        format!("{:.1} hours ago", hours)
-    } else if seconds < WEEK {
-        let days = seconds as f64 / DAY as f64;
-        format!("{:.1} days ago", days)
-    } else if seconds < MONTH {
-        let weeks = seconds as f64 / WEEK as f64;
-        format!("{:.1} weeks ago", weeks)
-    } else if seconds < YEAR {
-        let months = seconds as f64 / MONTH as f64;
-        format!("{:.1} months ago", months)
-    } else {
-        let years = seconds as f64 / YEAR as f64;
-        format!("{:.1} years ago", years)
+    const UNITS: &[(u64, &str)] = &[
+        (365 * 24 * 3600, "years"),
+        (30 * 24 * 3600, "months"),
+        (7 * 24 * 3600, "weeks"),
+        (24 * 3600, "days"),
+        (3600, "hours"),
+        (60, "minutes"),
+    ];
+    for &(threshold, label) in UNITS {
+        if seconds >= threshold {
+            return format!("{:.1} {label} ago", seconds as f64 / threshold as f64);
+        }
     }
+    format!("{seconds} seconds ago")
 }
 
 fn print_version_info() {

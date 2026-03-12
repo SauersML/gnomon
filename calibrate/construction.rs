@@ -1722,13 +1722,10 @@ mod tests {
 
         ModelConfig {
             model_family: ModelFamily::Gam(LinkFunction::Logit),
-            penalty_order: 2,
             convergence_tolerance: 1e-6,
             max_iterations: 15,
             reml_convergence_tolerance: 1e-6,
             reml_max_iterations: 0,
-            firth_bias_reduction: false,
-            reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
             pgs_basis_config,
             pc_configs,
             pgs_range: range_from_column(&data.p),
@@ -1737,15 +1734,9 @@ mod tests {
             } else {
                 InteractionPenaltyKind::Isotropic
             },
-            sum_to_zero_constraints: HashMap::new(),
-            knot_vectors: HashMap::new(),
-            range_transforms: HashMap::new(),
-            pc_null_transforms: HashMap::new(),
-            interaction_centering_means: HashMap::new(),
-            interaction_orth_alpha: HashMap::new(),
             mcmc_enabled: false,
             calibrator_enabled: false,
-            survival: None,
+            ..Default::default()
         }
     }
 
@@ -1835,27 +1826,15 @@ mod tests {
             .collect();
 
         let config = ModelConfig {
-            model_family: ModelFamily::Gam(LinkFunction::Identity),
-            penalty_order: 2,
             convergence_tolerance: 1e-6,
             max_iterations: 100,
             reml_convergence_tolerance: 1e-6,
-            reml_max_iterations: 100,
-            firth_bias_reduction: false,
-            reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
             pgs_basis_config,
             pc_configs,
             pgs_range,
-            interaction_penalty: InteractionPenaltyKind::Anisotropic,
-            sum_to_zero_constraints: HashMap::new(),
-            knot_vectors: HashMap::new(),
-            range_transforms: HashMap::new(),
-            pc_null_transforms: HashMap::new(),
-            interaction_centering_means: HashMap::new(),
-            interaction_orth_alpha: HashMap::new(),
             mcmc_enabled: false,
             calibrator_enabled: false,
-            survival: None,
+            ..Default::default()
         };
 
         (data, config)
@@ -2462,27 +2441,17 @@ mod tests {
             basis_config: pc_basis,
         };
         ModelConfig {
-            model_family: ModelFamily::Gam(LinkFunction::Identity),
             penalty_order,
             convergence_tolerance: 1e-6,
             max_iterations: 100,
             reml_convergence_tolerance: 1e-6,
-            reml_max_iterations: 100,
-            firth_bias_reduction: false,
-            reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
             pgs_basis_config: pgs_basis,
             pc_configs: vec![pc1],
             pgs_range: (0.0, 1.0),
             interaction_penalty: kind,
-            sum_to_zero_constraints: HashMap::new(),
-            knot_vectors: HashMap::new(),
-            range_transforms: HashMap::new(),
-            pc_null_transforms: HashMap::new(),
-            interaction_centering_means: HashMap::new(),
-            interaction_orth_alpha: HashMap::new(),
             mcmc_enabled: false,
             calibrator_enabled: false,
-            survival: None,
+            ..Default::default()
         }
     }
 
