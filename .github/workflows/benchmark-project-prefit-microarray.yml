@@ -1,0 +1,207 @@
+name: Benchmark Project Prefit Microarray
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "map/**"
+      - "scripts/benchmark_project_prefit_microarray.py"
+      - ".github/workflows/benchmark-project-prefit-microarray.yml"
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "map/**"
+      - "scripts/benchmark_project_prefit_microarray.py"
+      - ".github/workflows/benchmark-project-prefit-microarray.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+
+jobs:
+  build:
+    name: Build Release Binary
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache Rust dependencies and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          cache-targets: true
+          cache-all-crates: true
+          shared-key: benchmark-project-prefit-microarray
+
+      - name: Build release binary
+        env:
+          CARGO_INCREMENTAL: 0
+        run: cargo +nightly build --release --locked
+
+      - name: Upload release binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: gnomon-release-binary
+          path: target/release/gnomon
+          if-no-files-found: error
+
+  benchmark:
+    name: Benchmark shard ${{ matrix.shard }}
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: small
+            counts: "1,4,16"
+          - shard: medium
+            counts: "64,256"
+          - shard: large
+            counts: "512,1024"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install benchmark runtime dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install matplotlib
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends zstd
+
+      - name: Download release binary
+        uses: actions/download-artifact@v4
+        with:
+          name: gnomon-release-binary
+          path: /tmp/gnomon-binary
+
+      - name: Install release binary into benchmark path
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          install -m 0755 /tmp/gnomon-binary/gnomon "$HOME/.local/bin/gnomon"
+
+      - name: Run benchmark shard with clear logs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/gnomon_project_prefit_microarray/shards
+          echo "START shard=${{ matrix.shard }} counts=${{ matrix.counts }}"
+          python scripts/benchmark_project_prefit_microarray.py \
+            --counts "${{ matrix.counts }}" \
+            --output-csv "/tmp/gnomon_project_prefit_microarray/shards/${{ matrix.shard }}.csv" \
+            --output-png "/tmp/gnomon_project_prefit_microarray/shards/${{ matrix.shard }}.png" \
+            --title-suffix "shard-${{ matrix.shard }}" \
+            2>&1 | tee "/tmp/gnomon_project_prefit_microarray/shards/${{ matrix.shard }}.log"
+          echo "DONE shard=${{ matrix.shard }} counts=${{ matrix.counts }}"
+
+      - name: Upload shard artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-shard-${{ matrix.shard }}
+          path: |
+            /tmp/gnomon_project_prefit_microarray/shards/${{ matrix.shard }}.csv
+            /tmp/gnomon_project_prefit_microarray/shards/${{ matrix.shard }}.png
+            /tmp/gnomon_project_prefit_microarray/shards/${{ matrix.shard }}.log
+          if-no-files-found: error
+
+  aggregate:
+    name: Aggregate Benchmark Results
+    needs: benchmark
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install plot dependency
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install matplotlib
+
+      - name: Download shard artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: benchmark-shard-*
+          path: /tmp/gnomon_project_prefit_microarray/shards
+          merge-multiple: false
+
+      - name: Merge shard CSVs and render final plot
+        run: |
+          python - <<'PY'
+          import csv
+          from pathlib import Path
+          import matplotlib.pyplot as plt
+
+          root = Path("/tmp/gnomon_project_prefit_microarray")
+          shards = root / "shards"
+          rows = []
+          for csv_path in sorted(shards.glob("benchmark-shard-*/*.csv")):
+              with csv_path.open() as fh:
+                  rows.extend(csv.DictReader(fh))
+
+          rows.sort(key=lambda row: int(row["samples"]))
+          out_csv = root / "project_scaling_realistic.csv"
+          with out_csv.open("w", newline="") as fh:
+              writer = csv.DictWriter(
+                  fh,
+                  fieldnames=["samples", "repeat", "seconds", "samples_per_sec", "ms_per_sample"],
+              )
+              writer.writeheader()
+              writer.writerows(rows)
+
+          xs = [int(row["samples"]) for row in rows]
+          ys = [float(row["samples_per_sec"]) for row in rows]
+          plt.figure(figsize=(8.5, 5))
+          plt.plot(xs, ys, marker="o", linewidth=2)
+          plt.xscale("log", base=2)
+          plt.xlabel("Sample count")
+          plt.ylabel("Samples/sec")
+          plt.title("gnomon project --model hwe_1kg_hgdp_gsa_v3 scaling (realistic synthetic microarray)")
+          plt.grid(True, alpha=0.3)
+          plt.tight_layout()
+          out_png = root / "project_scaling_realistic.png"
+          plt.savefig(out_png, dpi=160)
+
+          print("FINAL_RESULTS")
+          for row in rows:
+              print(
+                  "  "
+                  f"samples={row['samples']} "
+                  f"seconds={float(row['seconds']):.6f} "
+                  f"samples_per_sec={float(row['samples_per_sec']):.6f} "
+                  f"ms_per_sample={float(row['ms_per_sample']):.6f}"
+              )
+          print(f"csv={out_csv}")
+          print(f"png={out_png}")
+          PY
+
+      - name: Upload merged benchmark artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: project-prefit-microarray-benchmark
+          path: |
+            /tmp/gnomon_project_prefit_microarray/project_scaling_realistic.csv
+            /tmp/gnomon_project_prefit_microarray/project_scaling_realistic.png
+            /tmp/gnomon_project_prefit_microarray/shards
+          if-no-files-found: error
