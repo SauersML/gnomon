@@ -290,7 +290,13 @@ theorem portability_upper_bound_from_rg_fst
     (h_low_rg : rg < rg_ub) (h_high_fst : fst_lb < fst)
     (h_fst_le : fst ≤ 1) (h_fst_lb_nn : 0 ≤ fst_lb) :
     rg ^ 2 * (1 - fst) < rg_ub ^ 2 * (1 - fst_lb) := by
-  nlinarith [sq_nonneg rg, sq_nonneg (rg_ub - rg)]
+  have h_rg_sq : rg ^ 2 ≤ rg_ub ^ 2 := by nlinarith [sq_nonneg rg, sq_nonneg (rg_ub - rg)]
+  have h_fst_term : 1 - fst < 1 - fst_lb := by linarith
+  have h_fst_nn : 0 ≤ 1 - fst := by linarith
+  have h_rg_ub_sq_pos : 0 < rg_ub ^ 2 := by nlinarith
+  have step1 : rg ^ 2 * (1 - fst) ≤ rg_ub ^ 2 * (1 - fst) := mul_le_mul_of_nonneg_right h_rg_sq h_fst_nn
+  have step2 : rg_ub ^ 2 * (1 - fst) < rg_ub ^ 2 * (1 - fst_lb) := mul_lt_mul_of_pos_left h_fst_term h_rg_ub_sq_pos
+  linarith
 
 end ArchitecturePredictions
 

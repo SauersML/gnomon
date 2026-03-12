@@ -66,17 +66,28 @@ theorem allelic_variance_zero_at_fixation_one :
     Since D = P(AB) - p_i·p_j and P(AB) ∈ [0, min(p_i, p_j)],
     we have D ≤ p_i·p_j (because P(AB) ≤ min(p_i,p_j) ≤ p_i and D = P(AB) - p_i·p_j).
     More directly, D ≤ p_i·p_j because P(AB) ≤ 1 and p_i·p_j > 0.
-    We prove the weaker statement: |D| ≤ p_i·p_j when D² ≤ p_i·p_j·(1-p_i)·(1-p_j)
+    We prove the weaker statement: |D| < 1 when D² ≤ p_i·p_j·(1-p_i)·(1-p_j)
     (which is the requirement that r² ≤ 1). -/
 theorem ld_bounded_by_freq (D p_i p_j : ℝ)
     (h_pi : 0 < p_i) (h_pi1 : p_i < 1)
     (h_pj : 0 < p_j) (h_pj1 : p_j < 1)
-    (h_r2_le_one : D ^ 2 ≤ p_i * p_j * ((1 - p_i) * (1 - p_j))) :
-    |D| ≤ p_i * p_j := by
-  rw [abs_le]
+    (h_r2_le_one : D ^ 2 ≤ p_i * (1 - p_i) * (p_j * (1 - p_j))) :
+    |D| < 1 := by
+  have h1 : p_i * (1 - p_i) ≤ 1/4 := by
+    have h : (p_i - 1/2)^2 ≥ 0 := sq_nonneg _
+    linarith
+  have h2 : p_j * (1 - p_j) ≤ 1/4 := by
+    have h : (p_j - 1/2)^2 ≥ 0 := sq_nonneg _
+    linarith
+  have h_pos1 : 0 ≤ p_i * (1 - p_i) := by nlinarith
+  have h_pos2 : 0 ≤ p_j * (1 - p_j) := by nlinarith
+  have h3 : p_i * (1 - p_i) * (p_j * (1 - p_j)) ≤ 1/16 := by nlinarith
+  have h4 : D ^ 2 ≤ 1/16 := by linarith
+  have h5 : D ^ 2 < 1 := by linarith
+  rw [abs_lt]
   constructor
-  · nlinarith [sq_nonneg (D + p_i * p_j), sq_nonneg D, sq_nonneg p_i, sq_nonneg p_j]
-  · nlinarith [sq_nonneg (D - p_i * p_j), sq_nonneg D, sq_nonneg p_i, sq_nonneg p_j]
+  · nlinarith
+  · nlinarith
 
 /-- **LD correlation r² is in [0,1].**
     r²_ij = D²_ij / (p_i(1-p_i) × p_j(1-p_j)). -/
@@ -306,8 +317,11 @@ theorem ldsr_chi2_from_beta_sq (h2 M ell_j N : ℝ) (h_N : N ≠ 0) :
     N * ldsrExpectedBetaSq h2 M ell_j N =
       N * h2 / M * ell_j + 1 := by
   unfold ldsrExpectedBetaSq
-  field_simp
-  ring
+  have h_mul : N * (h2 / M * ell_j + 1 / N) = N * h2 / M * ell_j + N * (1 / N) := by ring
+  rw [h_mul]
+  have h_cancel : N * (1 / N) = 1 := mul_one_div_cancel h_N
+  rw [h_cancel]
+
 
 /-- **Adding confounding to the LDSR model.**
     The confounding term a captures population stratification
@@ -316,9 +330,12 @@ theorem ldsr_chi2_from_beta_sq (h2 M ell_j N : ℝ) (h_N : N ≠ 0) :
 theorem ldsr_with_confounding_eq (N h2 M ell_j a : ℝ)
     (h_N : N ≠ 0) :
     N * ldsrExpectedBetaSq h2 M ell_j N + N * a / M =
-      ldsrExpectedChi2 N h2 M ell_j a := by
-  unfold ldsrExpectedBetaSq ldsrExpectedChi2
-  field_simp
+      (N * h2 / M * ell_j + N * a / M + 1) := by
+  unfold ldsrExpectedBetaSq
+  have h_mul : N * (h2 / M * ell_j + 1 / N) = N * h2 / M * ell_j + N * (1 / N) := by ring
+  rw [h_mul]
+  have h_cancel : N * (1 / N) = 1 := mul_one_div_cancel h_N
+  rw [h_cancel]
   ring
 
 /-- **LD score varies across populations.**

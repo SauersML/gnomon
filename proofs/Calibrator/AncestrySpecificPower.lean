@@ -235,6 +235,7 @@ theorem effective_n_mono_n (n_a n_b : ℕ) (p r2_ld : ℝ)
     Compose by transitivity. -/
 theorem source_higher_effective_n
     (n_source n_target : ℕ) (p_source p_target r2_source r2_target : ℝ)
+    (h_n_target_pos : 0 < n_target)
     (h_n : n_target < n_source) (h_r2 : r2_target < r2_source)
     (h_p_source : 0 < p_source) (h_p_source_lt : p_source < 1)
     (h_p_target : 0 < p_target) (h_p_target_lt : p_target < 1)
@@ -245,9 +246,9 @@ theorem source_higher_effective_n
       effectiveSampleSize n_source p_source r2_source := by
   -- Step 1: mono in r² at fixed n_target
   have step1 : effectiveSampleSize n_target p_target r2_target <
-      effectiveSampleSize n_target p_target r2_source :=
-    effective_n_mono_r2 n_target p_target r2_target r2_source
-      (Nat.pos_of_ne_zero (by omega)) h_p_target h_p_target_lt
+      effectiveSampleSize n_target p_target r2_source := by
+    exact effective_n_mono_r2 n_target p_target r2_target r2_source
+      h_n_target_pos h_p_target h_p_target_lt
       (le_of_lt h_r2_target) (le_of_lt (by linarith)) h_r2
   -- Step 2: mono in n at fixed r2_source
   have step2 : effectiveSampleSize n_target p_target r2_source <

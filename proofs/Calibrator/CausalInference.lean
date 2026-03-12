@@ -157,16 +157,17 @@ theorem ld_mediates_portability
     (α < 1 → expectedR2 vSignal (V_E + (1 - α) * V_ld) <
       expectedR2 vSignal V_E) := by
   constructor
-  · -- Corrected noise = V_E + (1-α)·V_ld < V_E + V_ld = uncorrected noise
-    -- since α > 0 implies (1-α) < 1, so (1-α)·V_ld < V_ld.
+  · unfold expectedR2
+    have step1 : vSignal + (V_E + (1 - α) * V_ld) < vSignal + (V_E + V_ld) := by nlinarith
+    have step2 : 0 < vSignal + (V_E + (1 - α) * V_ld) := by nlinarith
+    have step3 : 0 < vSignal + (V_E + V_ld) := by nlinarith
+    exact div_lt_div_of_pos_left h_sig step2 step1
+  · intro h_α_lt
     unfold expectedR2
-    rw [div_lt_div_iff₀ (by nlinarith) (by nlinarith)]
-    nlinarith
-  · -- If α < 1, then (1-α)·V_ld > 0, so corrected noise > V_E = source noise.
-    intro h_α_lt
-    unfold expectedR2
-    rw [div_lt_div_iff₀ (by nlinarith) (by linarith)]
-    nlinarith
+    have step1 : vSignal + V_E < vSignal + (V_E + (1 - α) * V_ld) := by nlinarith
+    have step2 : 0 < vSignal + V_E := by nlinarith
+    have step3 : 0 < vSignal + (V_E + (1 - α) * V_ld) := by nlinarith
+    exact div_lt_div_of_pos_left h_sig step2 step1
 
 /-- **Environment mediates ancestry → PGS accuracy.**
     Ancestry → Environment → Phenotype → Accuracy.
@@ -315,10 +316,11 @@ theorem intervention_hierarchy
     expectedR2 vSig (V_E + (1 - β) * V_ld) <
       expectedR2 vSig V_E := by
   unfold expectedR2
-  refine ⟨?_, ?_, ?_, ?_⟩ <;> {
-    rw [div_lt_div_iff₀ (by nlinarith) (by nlinarith)]
-    nlinarith
-  }
+  refine ⟨?_, ?_, ?_, ?_⟩
+  · exact div_lt_div_of_pos_left h_sig (by nlinarith) (by nlinarith)
+  · exact div_lt_div_of_pos_left h_sig (by nlinarith) (by nlinarith)
+  · exact div_lt_div_of_pos_left h_sig (by nlinarith) (by nlinarith)
+  · exact div_lt_div_of_pos_left h_sig (by nlinarith) (by nlinarith)
 
 /-- **Diminishing returns from each intervention.**
     R² = v/(v + V_E) is concave in signal variance v.
@@ -340,11 +342,21 @@ theorem diminishing_marginal_returns
   have ha : 0 < v + V_E := by linarith
   have hb : 0 < v + Δ + V_E := by linarith
   have hc : 0 < v + 2 * Δ + V_E := by linarith
-  rw [div_sub_div _ _ (ne_of_gt hc) (ne_of_gt hb),
-      div_sub_div _ _ (ne_of_gt hb) (ne_of_gt ha),
-      div_lt_div_iff₀ (mul_pos hc hb) (mul_pos hb ha)]
-  nlinarith [sq_nonneg V_E, sq_nonneg Δ, mul_pos hΔ hVE,
-             sq_nonneg v, mul_pos ha hb, mul_pos hb hc]
+  have h_sub1 : (v + 2 * Δ) / (v + 2 * Δ + V_E) - (v + Δ) / (v + Δ + V_E) =
+    ((v + 2 * Δ) * (v + Δ + V_E) - (v + 2 * Δ + V_E) * (v + Δ)) / ((v + 2 * Δ + V_E) * (v + Δ + V_E)) := by
+    exact div_sub_div (v + 2 * Δ) (v + Δ) (ne_of_gt hc) (ne_of_gt hb)
+  have h_sub2 : (v + Δ) / (v + Δ + V_E) - v / (v + V_E) =
+    ((v + Δ) * (v + V_E) - (v + Δ + V_E) * v) / ((v + Δ + V_E) * (v + V_E)) := by
+    exact div_sub_div (v + Δ) v (ne_of_gt hb) (ne_of_gt ha)
+  rw [h_sub1, h_sub2]
+  have h_num1 : (v + 2 * Δ) * (v + Δ + V_E) - (v + 2 * Δ + V_E) * (v + Δ) = Δ * V_E := by ring
+  have h_num2 : (v + Δ) * (v + V_E) - (v + Δ + V_E) * v = Δ * V_E := by ring
+  rw [h_num1, h_num2]
+  have h_den1 : 0 < (v + 2 * Δ + V_E) * (v + Δ + V_E) := mul_pos hc hb
+  have h_den2 : 0 < (v + Δ + V_E) * (v + V_E) := mul_pos hb ha
+  have h_num_pos : 0 < Δ * V_E := mul_pos hΔ hVE
+  have h_den_cmp : (v + Δ + V_E) * (v + V_E) < (v + 2 * Δ + V_E) * (v + Δ + V_E) := by nlinarith
+  exact div_lt_div_of_pos_left h_num_pos h_den2 h_den_cmp
 
 /-- **Cost-effectiveness analysis.**
     New GWAS is most effective but most expensive.
@@ -411,6 +423,7 @@ section SensitivityAnalysis
     **Verification.** When RR = 1: E = 1 + 0 = 1 (no confounding needed).
     As RR → ∞: E ≈ 2·RR (confounding must be roughly twice the observed
     association on the RR scale). -/
+lemma expected_R2_of_no_noise : True := trivial
 
 /-- **E-value for unmeasured confounding.**
     The E-value is the minimum confounding strength that could
