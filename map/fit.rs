@@ -1,7 +1,7 @@
 use super::progress::{
     FitProgressObserver, FitProgressStage, NoopFitProgress, StageProgressHandle,
 };
-use super::variant_filter::VariantKey;
+use super::variant_filter::{MatchKind, VariantKey};
 use core::cmp::{Ordering, min};
 use core::fmt;
 use core::marker::PhantomData;
@@ -408,7 +408,9 @@ pub trait VariantBlockSource {
 pub struct HardCallPacked<'a> {
     data: &'a [u8],
     bytes_per_variant: usize,
-    n_variants: usize,
+    physical_n_variants: usize,
+    selection: Option<&'a [usize]>,
+    match_kinds: Option<&'a [MatchKind]>,
 }
 
 impl<'a> HardCallPacked<'a> {
@@ -416,12 +418,52 @@ impl<'a> HardCallPacked<'a> {
         Self {
             data,
             bytes_per_variant,
-            n_variants,
+            physical_n_variants: n_variants,
+            selection: None,
+            match_kinds: None,
+        }
+    }
+
+    pub(crate) fn new_selected(
+        data: &'a [u8],
+        bytes_per_variant: usize,
+        physical_n_variants: usize,
+        selection: &'a [usize],
+        match_kinds: Option<&'a [MatchKind]>,
+    ) -> Self {
+        Self {
+            data,
+            bytes_per_variant,
+            physical_n_variants,
+            selection: Some(selection),
+            match_kinds,
         }
     }
 
     pub(crate) fn slice(&self, start: usize, count: usize) -> Option<&'a [u8]> {
-        let byte_start = start.checked_mul(self.bytes_per_variant)?;
+        if count == 0 {
+            return Some(&self.data[..0]);
+        }
+        let physical_start = if let Some(selection) = self.selection {
+            let end = start.checked_add(count)?;
+            if end > selection.len() {
+                return None;
+            }
+            let base = *selection.get(start)?;
+            for offset in 1..count {
+                if selection[start + offset] != base + offset {
+                    return None;
+                }
+            }
+            base
+        } else {
+            let end = start.checked_add(count)?;
+            if end > self.physical_n_variants {
+                return None;
+            }
+            start
+        };
+        let byte_start = physical_start.checked_mul(self.bytes_per_variant)?;
         let byte_len = count.checked_mul(self.bytes_per_variant)?;
         let byte_end = byte_start.checked_add(byte_len)?;
         if byte_end > self.data.len() {
@@ -431,7 +473,14 @@ impl<'a> HardCallPacked<'a> {
     }
 
     pub(crate) fn n_variants(&self) -> usize {
-        self.n_variants
+        self.selection.map_or(self.physical_n_variants, |v| v.len())
+    }
+
+    pub(crate) fn match_kind(&self, logical_variant: usize) -> MatchKind {
+        self.match_kinds
+            .and_then(|kinds| kinds.get(logical_variant))
+            .copied()
+            .unwrap_or(MatchKind::Exact)
     }
 }
 
@@ -758,7 +807,9 @@ where
             } => Some(HardCallPacked {
                 data: packed,
                 bytes_per_variant: *bytes_per_variant,
-                n_variants: *n_variants,
+                physical_n_variants: *n_variants,
+                selection: None,
+                match_kinds: None,
             }),
             _ => None,
         }
@@ -3217,7 +3268,7 @@ where
         let ncols = rhs.ncols();
         let freqs = self.scaler.allele_frequencies();
         let scales = self.scaler.variant_scales();
-        let max_variants = self.observed_variants.min(packed.n_variants);
+        let max_variants = self.observed_variants.min(packed.n_variants());
         let max_variants = max_variants.min(freqs.len()).min(scales.len());
         let code_table = hard_call_code_table();
 

@@ -5,6 +5,7 @@ use super::fit::{
 use super::progress::{
     NoopProjectionProgress, ProjectionProgressObserver, ProjectionProgressStage,
 };
+use super::variant_filter::MatchKind;
 use core::cmp::min;
 use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
 use cudarc::driver::{
@@ -1579,9 +1580,15 @@ where
             let coeff0 = (0.0 - mean) * inv * w;
             let coeff1 = (1.0 - mean) * inv * w;
             let coeff2 = (2.0 - mean) * inv * w;
-            block_coeffs[j_local * 3] = coeff0;
-            block_coeffs[j_local * 3 + 1] = coeff1;
-            block_coeffs[j_local * 3 + 2] = coeff2;
+            if packed.match_kind(j_global) == MatchKind::Swap {
+                block_coeffs[j_local * 3] = coeff2;
+                block_coeffs[j_local * 3 + 1] = coeff1;
+                block_coeffs[j_local * 3 + 2] = coeff0;
+            } else {
+                block_coeffs[j_local * 3] = coeff0;
+                block_coeffs[j_local * 3 + 1] = coeff1;
+                block_coeffs[j_local * 3 + 2] = coeff2;
+            }
 
             let loading_row = &mut block_loading[j_local * components..(j_local + 1) * components];
             for k in 0..components {
@@ -1605,12 +1612,37 @@ where
         }
 
         let mut used_gpu = false;
-        if let Some(runtime) = packed_cuda.as_mut() {
-            let block_bytes = packed
-                .slice(processed, filled)
-                .ok_or(HwePcaError::InvalidInput(
-                    "VariantBlockSource terminated early during projection",
-                ))?;
+        let block_bytes_for_gpu = if packed_cuda.is_some() {
+            packed.slice(processed, filled)
+        } else {
+            None
+        };
+        if packed_cuda.is_some() && block_bytes_for_gpu.is_none() {
+            if let Some(runtime) = packed_cuda.as_mut() {
+                if gpu_scores_active && !gpu_scores_flushed {
+                    let _ =
+                        runtime.copy_scores_to_host(n_samples, components, &mut scores_row_major);
+                    gpu_scores_flushed = true;
+                }
+                if gpu_missing_active {
+                    let _ = runtime.copy_missing_info_to_host(
+                        n_samples,
+                        packed_info_size,
+                        missing_info_storage,
+                    );
+                    gpu_missing_active = false;
+                }
+            }
+            if !logged_cuda_fallback {
+                eprintln!(
+                    "> Projection backend switch: CPU (packed variant selection is not contiguous)"
+                );
+                logged_cuda_fallback = true;
+            }
+            packed_cuda = None;
+            gpu_scores_active = false;
+        }
+        if let (Some(runtime), Some(block_bytes)) = (packed_cuda.as_mut(), block_bytes_for_gpu) {
             debug_assert_eq!(block_bytes.len(), packed_len);
 
             if gpu_loadings_col_major.len() < load_len {
@@ -2814,11 +2846,23 @@ mod tests {
         packed: Vec<u8>,
         n_samples: usize,
         n_variants: usize,
+        selection: Option<Vec<usize>>,
+        match_kinds: Option<Vec<MatchKind>>,
         cursor: usize,
     }
 
     impl PackedDenseBlockSource {
         fn new(dense: Vec<f64>, n_samples: usize, n_variants: usize) -> Self {
+            Self::new_with_selection(dense, n_samples, n_variants, None, None)
+        }
+
+        fn new_with_selection(
+            dense: Vec<f64>,
+            n_samples: usize,
+            n_variants: usize,
+            selection: Option<Vec<usize>>,
+            match_kinds: Option<Vec<MatchKind>>,
+        ) -> Self {
             let bytes_per_variant = (n_samples + 3) / 4;
             let mut packed = vec![0u8; bytes_per_variant * n_variants];
             for variant in 0..n_variants {
@@ -2845,6 +2889,8 @@ mod tests {
                 packed,
                 n_samples,
                 n_variants,
+                selection,
+                match_kinds,
                 cursor: 0,
             }
         }
@@ -2858,7 +2904,10 @@ mod tests {
         }
 
         fn n_variants(&self) -> usize {
-            self.n_variants
+            self.selection
+                .as_ref()
+                .map(|selection| selection.len())
+                .unwrap_or(self.n_variants)
         }
 
         fn reset(&mut self) -> Result<(), Self::Error> {
@@ -2875,6 +2924,33 @@ mod tests {
                 return Ok(0);
             }
             let remaining = self.n_variants.saturating_sub(self.cursor);
+            if let Some(selection) = self.selection.as_ref() {
+                let remaining = selection.len().saturating_sub(self.cursor);
+                if remaining == 0 {
+                    return Ok(0);
+                }
+                let filled = remaining.min(max_variants);
+                let kinds = self.match_kinds.as_deref();
+                for local in 0..filled {
+                    let variant = selection[self.cursor + local];
+                    let start = variant * self.n_samples;
+                    let end = start + self.n_samples;
+                    let dest = &mut storage[local * self.n_samples..(local + 1) * self.n_samples];
+                    dest.copy_from_slice(&self.dense[start..end]);
+                    if let Some(kinds) = kinds
+                        && kinds[self.cursor + local] == MatchKind::Swap
+                    {
+                        for value in dest.iter_mut() {
+                            if !value.is_nan() {
+                                *value = 2.0 - *value;
+                            }
+                        }
+                    }
+                }
+                self.cursor += filled;
+                return Ok(filled);
+            }
+
             if remaining == 0 {
                 return Ok(0);
             }
@@ -2889,11 +2965,20 @@ mod tests {
 
         fn hard_call_packed(&mut self) -> Option<super::super::fit::HardCallPacked<'_>> {
             let bytes_per_variant = (self.n_samples + 3) / 4;
-            Some(super::super::fit::HardCallPacked::new(
-                &self.packed,
-                bytes_per_variant,
-                self.n_variants,
-            ))
+            match self.selection.as_deref() {
+                Some(selection) => Some(super::super::fit::HardCallPacked::new_selected(
+                    &self.packed,
+                    bytes_per_variant,
+                    self.n_variants,
+                    selection,
+                    self.match_kinds.as_deref(),
+                )),
+                None => Some(super::super::fit::HardCallPacked::new(
+                    &self.packed,
+                    bytes_per_variant,
+                    self.n_variants,
+                )),
+            }
         }
     }
 
@@ -2916,6 +3001,60 @@ mod tests {
             .expect("dense projection");
 
         let mut packed_source = PackedDenseBlockSource::new(data, N_SAMPLES, N_VARIANTS);
+        let packed = model
+            .projector()
+            .project_with_options(&mut packed_source, &options)
+            .expect("packed projection");
+
+        assert_mats_close(&dense.scores, &packed.scores, 1e-10);
+        let dense_alignment = dense.alignment.expect("dense alignment");
+        let packed_alignment = packed.alignment.expect("packed alignment");
+        assert_mats_close(&dense_alignment, &packed_alignment, 1e-10);
+    }
+
+    #[test]
+    fn packed_hardcall_path_handles_ordered_selection_and_swaps() {
+        let model = fit_example_model();
+        let data = sample_data();
+        let selection = vec![2usize, 0usize, 3usize, 1usize];
+        let match_kinds = vec![
+            MatchKind::Exact,
+            MatchKind::Swap,
+            MatchKind::Exact,
+            MatchKind::Exact,
+        ];
+
+        let mut selected_dense = Vec::with_capacity(selection.len() * N_SAMPLES);
+        for (out_idx, &variant) in selection.iter().enumerate() {
+            for sample in 0..N_SAMPLES {
+                let mut value = data[variant * N_SAMPLES + sample];
+                if match_kinds[out_idx] == MatchKind::Swap && !value.is_nan() {
+                    value = 2.0 - value;
+                }
+                selected_dense.push(value);
+            }
+        }
+
+        let options = ProjectionOptions {
+            missing_axis_renormalization: true,
+            return_alignment: true,
+            on_zero_alignment: ZeroAlignmentAction::Zero,
+        };
+
+        let mut dense_source =
+            DenseBlockSource::new(&selected_dense, N_SAMPLES, selection.len()).expect("dense");
+        let dense = model
+            .projector()
+            .project_with_options(&mut dense_source, &options)
+            .expect("dense projection");
+
+        let mut packed_source = PackedDenseBlockSource::new_with_selection(
+            data,
+            N_SAMPLES,
+            N_VARIANTS,
+            Some(selection),
+            Some(match_kinds),
+        );
         let packed = model
             .projector()
             .project_with_options(&mut packed_source, &options)

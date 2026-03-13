@@ -1754,18 +1754,24 @@ impl VariantBlockSource for PlinkVariantBlockSource {
     }
 
     fn hard_call_packed(&mut self) -> Option<crate::map::fit::HardCallPacked<'_>> {
-        if self.selection.is_some() || self.match_kinds.is_some() {
-            return None;
-        }
         let total_bytes = self.bytes_per_variant.checked_mul(self.total_variants)?;
         let data = self
             .bed
             .mmap_slice(PLINK_HEADER_LEN as usize, total_bytes)?;
-        Some(crate::map::fit::HardCallPacked::new(
-            data,
-            self.bytes_per_variant,
-            self.total_variants,
-        ))
+        match self.selection.as_deref() {
+            Some(selection) => Some(crate::map::fit::HardCallPacked::new_selected(
+                data,
+                self.bytes_per_variant,
+                self.total_variants,
+                selection,
+                self.match_kinds.as_deref(),
+            )),
+            None => Some(crate::map::fit::HardCallPacked::new(
+                data,
+                self.bytes_per_variant,
+                self.total_variants,
+            )),
+        }
     }
 }
 
