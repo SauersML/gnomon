@@ -314,38 +314,48 @@ impl GenotypeDataset {
         &self,
         keys: &[VariantKey],
     ) -> Result<VariantSelection, GenotypeIoError> {
-        let filter = VariantFilter::from_keys(keys.iter().cloned());
-        let mut selection = self.select_variants(&filter)?;
+        match self {
+            Self::Plink(dataset) => dataset
+                .select_variants_by_keys(keys)
+                .map_err(GenotypeIoError::from),
+            Self::Pgen(dataset) => dataset
+                .select_variants_by_keys(keys)
+                .map_err(GenotypeIoError::from),
+            Self::Variants(_) => {
+                let filter = VariantFilter::from_keys(keys.iter().cloned());
+                let mut selection = self.select_variants(&filter)?;
 
-        let original_indices = std::mem::take(&mut selection.indices);
-        let original_keys = std::mem::take(&mut selection.keys);
-        let original_kinds = std::mem::take(&mut selection.match_kinds);
+                let original_indices = std::mem::take(&mut selection.indices);
+                let original_keys = std::mem::take(&mut selection.keys);
+                let original_kinds = std::mem::take(&mut selection.match_kinds);
 
-        let mut matched = HashMap::with_capacity(original_keys.len());
-        for ((index, key), kind) in original_indices
-            .into_iter()
-            .zip(original_keys.into_iter())
-            .zip(original_kinds.into_iter())
-        {
-            matched.insert(key.clone(), (index, key, kind));
-        }
+                let mut matched = HashMap::with_capacity(original_keys.len());
+                for ((index, key), kind) in original_indices
+                    .into_iter()
+                    .zip(original_keys.into_iter())
+                    .zip(original_kinds.into_iter())
+                {
+                    matched.insert(key.clone(), (index, key, kind));
+                }
 
-        let mut ordered_indices = Vec::with_capacity(matched.len());
-        let mut ordered_keys = Vec::with_capacity(matched.len());
-        let mut ordered_kinds = Vec::with_capacity(matched.len());
+                let mut ordered_indices = Vec::with_capacity(matched.len());
+                let mut ordered_keys = Vec::with_capacity(matched.len());
+                let mut ordered_kinds = Vec::with_capacity(matched.len());
 
-        for key in keys {
-            if let Some((index, stored_key, kind)) = matched.remove(key) {
-                ordered_indices.push(index);
-                ordered_keys.push(stored_key);
-                ordered_kinds.push(kind);
+                for key in keys {
+                    if let Some((index, stored_key, kind)) = matched.remove(key) {
+                        ordered_indices.push(index);
+                        ordered_keys.push(stored_key);
+                        ordered_kinds.push(kind);
+                    }
+                }
+
+                selection.indices = ordered_indices;
+                selection.keys = ordered_keys;
+                selection.match_kinds = ordered_kinds;
+                Ok(selection)
             }
         }
-
-        selection.indices = ordered_indices;
-        selection.keys = ordered_keys;
-        selection.match_kinds = ordered_kinds;
-        Ok(selection)
     }
 
     pub fn data_path(&self) -> &Path {
@@ -1243,6 +1253,13 @@ impl PlinkDataset {
         })
     }
 
+    pub fn select_variants_by_keys(
+        &self,
+        keys: &[VariantKey],
+    ) -> Result<VariantSelection, PlinkIoError> {
+        select_plink_variant_records_by_keys(self.variant_records()?, keys)
+    }
+
     pub fn output_path(&self, filename: &str) -> PathBuf {
         if is_remote_path(&self.bed_path) {
             let stem = self
@@ -1425,6 +1442,13 @@ impl PgenDataset {
         })
     }
 
+    pub fn select_variants_by_keys(
+        &self,
+        keys: &[VariantKey],
+    ) -> Result<VariantSelection, PlinkIoError> {
+        select_plink_variant_records_by_keys(self.variant_records()?, keys)
+    }
+
     pub fn output_path(&self, filename: &str) -> PathBuf {
         let mut local = self.pgen_path.clone();
         local.set_extension(filename);
@@ -1440,6 +1464,118 @@ impl fmt::Debug for PgenDataset {
             .field("n_variants", &self.n_variants)
             .finish()
     }
+}
+
+fn select_plink_variant_records_by_keys(
+    mut iter: PlinkVariantRecordIter,
+    requested_keys: &[VariantKey],
+) -> Result<VariantSelection, PlinkIoError> {
+    let mut seen = HashSet::with_capacity(requested_keys.len());
+    let mut unique_keys = Vec::with_capacity(requested_keys.len());
+    for key in requested_keys {
+        if seen.insert(key.clone()) {
+            unique_keys.push(key.clone());
+        }
+    }
+
+    let mut exact_positions = HashMap::with_capacity(unique_keys.len());
+    let mut wildcard_positions = HashMap::with_capacity(unique_keys.len());
+    for (slot, key) in unique_keys.iter().cloned().enumerate() {
+        if key.alleles.is_some() {
+            exact_positions.entry(key).or_insert(slot);
+        } else {
+            wildcard_positions.entry(key).or_insert(slot);
+        }
+    }
+
+    let requested_unique = unique_keys.len();
+    let mut matched_indices = vec![None; requested_unique];
+    let mut matched_keys = vec![None; requested_unique];
+    let mut matched_kinds = vec![MatchKind::Exact; requested_unique];
+    let mut dataset_index = 0usize;
+
+    while let Some(result) = iter.next() {
+        let record = result?;
+        let position =
+            record
+                .position
+                .parse::<u64>()
+                .map_err(|err| PlinkIoError::MalformedRecord {
+                    path: iter.path().display().to_string(),
+                    line: iter.line(),
+                    message: format!(
+                        "invalid position '{}' for variant {}: {err}",
+                        record.position, record.identifier
+                    ),
+                })?;
+
+        let key = VariantKey::new_with_alleles(
+            &record.chromosome,
+            position,
+            &record.allele2,
+            &record.allele1,
+        );
+        let wildcard = VariantKey::new(&record.chromosome, position);
+        let swap_key = key
+            .alleles
+            .as_ref()
+            .map(|(reference, alternate)| VariantKey {
+                chromosome: key.chromosome.clone(),
+                position: key.position,
+                alleles: Some((alternate.clone(), reference.clone())),
+            });
+
+        let matched = exact_positions
+            .get(&key)
+            .copied()
+            .map(|slot| (slot, MatchKind::Exact))
+            .or_else(|| {
+                wildcard_positions
+                    .get(&wildcard)
+                    .copied()
+                    .map(|slot| (slot, MatchKind::Wildcard))
+            })
+            .or_else(|| {
+                swap_key
+                    .as_ref()
+                    .and_then(|swapped| exact_positions.get(swapped).copied())
+                    .map(|slot| (slot, MatchKind::Swap))
+            });
+
+        if let Some((slot, kind)) = matched
+            && matched_indices[slot].is_none()
+        {
+            matched_indices[slot] = Some(dataset_index);
+            matched_keys[slot] = Some(key);
+            matched_kinds[slot] = kind;
+        }
+
+        dataset_index += 1;
+    }
+
+    let mut indices = Vec::with_capacity(requested_unique);
+    let mut keys = Vec::with_capacity(requested_unique);
+    let mut match_kinds = Vec::with_capacity(requested_unique);
+    let mut missing = Vec::new();
+
+    for (slot, requested_key) in unique_keys.into_iter().enumerate() {
+        if let (Some(index), Some(stored_key)) = (matched_indices[slot], matched_keys[slot].take())
+        {
+            indices.push(index);
+            keys.push(stored_key);
+            match_kinds.push(matched_kinds[slot]);
+        } else {
+            missing.push(requested_key);
+        }
+    }
+
+    Ok(VariantSelection {
+        indices,
+        keys,
+        match_kinds,
+        missing,
+        requested_unique,
+    })
 }
 
 pub struct PlinkVariantRecordIter {
