@@ -20,10 +20,6 @@ permissions:
   contents: read
   actions: read
 
-concurrency:
-  group: compare-ld-window-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   compare-latest:
     name: Python-only comparison using latest LD window artifacts

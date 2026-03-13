@@ -20,10 +20,6 @@ permissions:
   contents: read
   actions: read
 
-concurrency:
-  group: compare-latest-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   compare-latest:
     name: Python-only comparison using latest artifacts
