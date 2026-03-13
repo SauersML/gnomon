@@ -740,7 +740,7 @@ by
           symm
           exact h_left
         _ = H⁻¹ * (- (Real.exp (rho i) • S_basis i) * beta_hat rho) := by
-          simp [H] using h_mul
+          simpa [H] using h_mul
         _ = -H⁻¹ * ((Real.exp (rho i) • S_basis i) * beta_hat rho) := by
           simp [neg_mul]
     calc
