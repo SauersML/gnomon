@@ -57,6 +57,7 @@ pub struct ProjectionResult {
 }
 
 const DEFAULT_PROJECT_CUDA_MIN_WORK: usize = 50_000_000;
+const WLS_RIDGE: f64 = 1.0e-5;
 const PROJECT_CUDA_UNPACK_KERNELS: &str = r#"
 extern "C" __global__ void unpack_weighted_plink(
     const unsigned char* packed,
@@ -826,7 +827,7 @@ impl<'model> HwePcaProjector<'model> {
         source: &mut S,
         mut scores: MatMut<'_, f64>,
         opts: &ProjectionOptions,
-        mut alignment_out: Option<MatMut<'_, f64>>,
+        alignment_out: Option<MatMut<'_, f64>>,
         progress: &P,
     ) -> Result<(), HwePcaError>
     where
@@ -884,17 +885,7 @@ impl<'model> HwePcaProjector<'model> {
             .reset()
             .map_err(|e| HwePcaError::Source(Box::new(e)))?;
 
-        // WLS: store only the packed upper-triangular K×K missing contribution
-        // per sample. The final info matrix is reconstructed as:
-        // A_sample = A_global - A_missing_sample.
-        const WLS_RIDGE: f64 = 1.0e-5;
         let packed_info_size = packed_tri_size(components);
-        let mut missing_info_storage = vec![
-            0.0f64;
-            n_samples.checked_mul(packed_info_size).ok_or_else(
-                || { HwePcaError::InvalidInput("WLS info matrix storage overflow") }
-            )?
-        ];
         let mut global_info_packed = vec![0.0f64; packed_info_size];
         let scaler = self.model.scaler();
         let loadings = self.model.variant_loadings();
@@ -909,7 +900,8 @@ impl<'model> HwePcaProjector<'model> {
 
         if let Some(packed) = source.hard_call_packed() {
             eprintln!("> Projection backend path: packed hard-call input (2-bit PLINK detected)");
-            project_from_packed_hard_calls(
+            let mut missing_variants = vec![Vec::<u32>::new(); n_samples];
+            let dense_missing_info = project_from_packed_hard_calls(
                 packed,
                 n_samples,
                 expected_variants,
@@ -920,13 +912,42 @@ impl<'model> HwePcaProjector<'model> {
                 packed_info_size,
                 &mut global_info_packed,
                 &mut scores,
-                &mut missing_info_storage,
+                &mut missing_variants,
                 progress,
             )?;
+            progress.on_stage_finish(ProjectionProgressStage::Projection);
+            match dense_missing_info {
+                Some(missing_info_storage) => solve_projection_with_dense_missing_info(
+                    scores,
+                    alignment_out,
+                    &missing_info_storage,
+                    &global_info_packed,
+                    normalization,
+                    components,
+                    packed_info_size,
+                    opts.on_zero_alignment,
+                ),
+                None => solve_projection_with_sparse_missing_variants(
+                    scores,
+                    alignment_out,
+                    &missing_variants,
+                    &global_info_packed,
+                    normalization,
+                    loadings,
+                    opts.on_zero_alignment,
+                ),
+            }
+            return Ok(());
         } else {
             eprintln!(
                 "> Projection backend path: dense/streaming input (no packed hard-call source)"
             );
+            let mut missing_info_storage = vec![
+                0.0f64;
+                n_samples.checked_mul(packed_info_size).ok_or_else(
+                    || { HwePcaError::InvalidInput("WLS info matrix storage overflow") }
+                )?
+            ];
             let block_capacity = projection_block_capacity(
                 self.model.n_samples(),
                 n_samples,
@@ -1166,75 +1187,274 @@ impl<'model> HwePcaProjector<'model> {
                     ));
                 }
             }
+
+            progress.on_stage_finish(ProjectionProgressStage::Projection);
+            solve_projection_with_dense_missing_info(
+                scores,
+                alignment_out,
+                &missing_info_storage,
+                &global_info_packed,
+                normalization,
+                components,
+                packed_info_size,
+                opts.on_zero_alignment,
+            );
         }
+        Ok(())
+    }
 
-        progress.on_stage_finish(ProjectionProgressStage::Projection);
+    pub fn model(&self) -> &'model HwePcaModel {
+        self.model
+    }
+}
 
-        // WLS: Apply renormalization by solving A·s = b for each sample
-        // where A is the K×K info matrix and b is the raw weighted projection.
-        let diag_indices: Vec<usize> = (0..components)
-            .map(|k| packed_tri_index(components, k, k))
-            .collect();
-        let base_info = build_dense_lower_info_matrix(&global_info_packed, components, WLS_RIDGE);
-        let mut base_factor = base_info.clone();
-        let base_factor_ready = factorize_spd_lower_in_place(&mut base_factor, components);
-        let global_trace: f64 = diag_indices
-            .iter()
-            .map(|&idx| global_info_packed[idx])
-            .sum();
-        let base_alignment: Vec<f64> = diag_indices
-            .iter()
-            .enumerate()
-            .map(|(k, &diag_idx)| {
-                let mass = global_info_packed[diag_idx];
-                let denom = normalization.get(k).copied().unwrap_or(0.0);
-                if mass > 0.0 && denom > 0.0 {
-                    (mass / denom).sqrt()
-                } else {
-                    0.0
+struct ProjectionSolveBase {
+    diag_indices: Vec<usize>,
+    global_diag: Vec<f64>,
+    base_info: Vec<f64>,
+    base_factor: Vec<f64>,
+    base_factor_ready: bool,
+    global_trace: f64,
+    base_alignment: Vec<f64>,
+}
+
+fn build_projection_solve_base(
+    global_info_packed: &[f64],
+    normalization: &[f64],
+    components: usize,
+) -> ProjectionSolveBase {
+    let diag_indices: Vec<usize> = (0..components)
+        .map(|k| packed_tri_index(components, k, k))
+        .collect();
+    let global_diag: Vec<f64> = diag_indices
+        .iter()
+        .map(|&idx| global_info_packed[idx])
+        .collect();
+    let base_info = build_dense_lower_info_matrix(global_info_packed, components, WLS_RIDGE);
+    let mut base_factor = base_info.clone();
+    let base_factor_ready = factorize_spd_lower_in_place(&mut base_factor, components);
+    let global_trace = global_diag.iter().sum();
+    let base_alignment = global_diag
+        .iter()
+        .enumerate()
+        .map(|(k, &mass)| {
+            let denom = normalization.get(k).copied().unwrap_or(0.0);
+            if mass > 0.0 && denom > 0.0 {
+                (mass / denom).sqrt()
+            } else {
+                0.0
+            }
+        })
+        .collect();
+
+    ProjectionSolveBase {
+        diag_indices,
+        global_diag,
+        base_info,
+        base_factor,
+        base_factor_ready,
+        global_trace,
+        base_alignment,
+    }
+}
+
+fn solve_projection_with_dense_missing_info(
+    mut scores: MatMut<'_, f64>,
+    mut alignment_out: Option<MatMut<'_, f64>>,
+    missing_info_storage: &[f64],
+    global_info_packed: &[f64],
+    normalization: &[f64],
+    components: usize,
+    packed_info_size: usize,
+    zero_action: ZeroAlignmentAction,
+) {
+    let n_samples = scores.nrows();
+    let solve_base = build_projection_solve_base(global_info_packed, normalization, components);
+    let scores_ptr = {
+        let scores_col_major = scores
+            .rb_mut()
+            .try_as_col_major_mut()
+            .expect("projection output matrix must be contiguous column-major");
+        scores_col_major.as_ptr_mut() as usize
+    };
+    let alignment_ptr = alignment_out.as_mut().map(|alignment| {
+        let alignment_col_major = alignment
+            .rb_mut()
+            .try_as_col_major_mut()
+            .expect("projection alignment matrix must be contiguous column-major");
+        alignment_col_major.as_ptr_mut() as usize
+    });
+    let solve_chunk = projection_solve_sample_chunk(n_samples);
+    let solve_chunks = n_samples.div_ceil(solve_chunk);
+
+    (0..solve_chunks).into_par_iter().for_each_init(
+        || {
+            (
+                vec![0.0f64; components * components],
+                vec![0.0f64; components],
+            )
+        },
+        |(info_matrix, rhs), chunk_idx| {
+            let scores_ptr = scores_ptr as *mut f64;
+            let alignment_ptr = alignment_ptr.map(|ptr| ptr as *mut f64);
+            let sample_start = chunk_idx * solve_chunk;
+            let sample_end = (sample_start + solve_chunk).min(n_samples);
+
+            for sample in sample_start..sample_end {
+                let info_offset = sample * packed_info_size;
+                let mut missing_trace = 0.0f64;
+                for &diag_idx in &solve_base.diag_indices {
+                    missing_trace += missing_info_storage[info_offset + diag_idx];
                 }
-            })
-            .collect();
+                let trace = solve_base.global_trace - missing_trace;
 
-        let zero_action = opts.on_zero_alignment;
-        let scores_ptr = {
-            let scores_col_major = scores
-                .rb_mut()
-                .try_as_col_major_mut()
-                .expect("projection output matrix must be contiguous column-major");
-            scores_col_major.as_ptr_mut() as usize
-        };
-        let alignment_ptr = alignment_out.as_mut().map(|alignment| {
-            let alignment_col_major = alignment
-                .rb_mut()
-                .try_as_col_major_mut()
-                .expect("projection alignment matrix must be contiguous column-major");
-            alignment_col_major.as_ptr_mut() as usize
-        });
-        let solve_chunk = projection_solve_sample_chunk(n_samples);
-        let solve_chunks = n_samples.div_ceil(solve_chunk);
+                if trace <= WLS_RIDGE * (components as f64) {
+                    write_zero_projection_sample(
+                        scores_ptr,
+                        alignment_ptr,
+                        n_samples,
+                        components,
+                        sample,
+                        zero_action,
+                    );
+                    continue;
+                }
 
-        (0..solve_chunks).into_par_iter().for_each_init(
-            || {
-                (
-                    vec![0.0f64; components * components],
-                    vec![0.0f64; components],
-                )
-            },
-            |(info_matrix, rhs), chunk_idx| {
-                let scores_ptr = scores_ptr as *mut f64;
-                let alignment_ptr = alignment_ptr.map(|ptr| ptr as *mut f64);
-                let sample_start = chunk_idx * solve_chunk;
-                let sample_end = (sample_start + solve_chunk).min(n_samples);
+                for k in 0..components {
+                    rhs[k] = unsafe { *scores_ptr.add(k * n_samples + sample) };
+                }
 
-                for sample in sample_start..sample_end {
-                    let info_offset = sample * packed_info_size;
-                    let mut missing_trace = 0.0f64;
-                    for &diag_idx in &diag_indices {
-                        missing_trace += missing_info_storage[info_offset + diag_idx];
+                let solved = if missing_trace == 0.0 && solve_base.base_factor_ready {
+                    solve_cholesky_factor_in_place(
+                        &solve_base.base_factor,
+                        &mut rhs[..components],
+                        components,
+                    )
+                } else {
+                    fill_sample_info_matrix(
+                        info_matrix,
+                        &solve_base.base_info,
+                        &missing_info_storage[info_offset..info_offset + packed_info_size],
+                        components,
+                    );
+                    solve_spd_lower_in_place(info_matrix, &mut rhs[..components], components)
+                };
+
+                if solved {
+                    for k in 0..components {
+                        unsafe {
+                            *scores_ptr.add(k * n_samples + sample) = rhs[k];
+                        }
                     }
-                    let trace = global_trace - missing_trace;
+                    if let Some(alignment_ptr) = alignment_ptr {
+                        if missing_trace == 0.0 {
+                            for (k, &value) in solve_base.base_alignment.iter().enumerate() {
+                                unsafe {
+                                    *alignment_ptr.add(k * n_samples + sample) = value;
+                                }
+                            }
+                        } else {
+                            for (k, &diag_idx) in solve_base.diag_indices.iter().enumerate() {
+                                let mass = global_info_packed[diag_idx]
+                                    - missing_info_storage[info_offset + diag_idx];
+                                let denom = normalization.get(k).copied().unwrap_or(0.0);
+                                let value = if mass > 0.0 && denom > 0.0 {
+                                    (mass / denom).sqrt()
+                                } else {
+                                    0.0
+                                };
+                                unsafe {
+                                    *alignment_ptr.add(k * n_samples + sample) = value;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    write_zero_projection_sample(
+                        scores_ptr,
+                        alignment_ptr,
+                        n_samples,
+                        components,
+                        sample,
+                        zero_action,
+                    );
+                }
+            }
+        },
+    );
+}
 
+fn solve_projection_with_sparse_missing_variants(
+    mut scores: MatMut<'_, f64>,
+    mut alignment_out: Option<MatMut<'_, f64>>,
+    missing_variants: &[Vec<u32>],
+    global_info_packed: &[f64],
+    normalization: &[f64],
+    loadings: faer::MatRef<'_, f64>,
+    zero_action: ZeroAlignmentAction,
+) {
+    let n_samples = scores.nrows();
+    let components = scores.ncols();
+    let solve_base = build_projection_solve_base(global_info_packed, normalization, components);
+    let scores_ptr = {
+        let scores_col_major = scores
+            .rb_mut()
+            .try_as_col_major_mut()
+            .expect("projection output matrix must be contiguous column-major");
+        scores_col_major.as_ptr_mut() as usize
+    };
+    let alignment_ptr = alignment_out.as_mut().map(|alignment| {
+        let alignment_col_major = alignment
+            .rb_mut()
+            .try_as_col_major_mut()
+            .expect("projection alignment matrix must be contiguous column-major");
+        alignment_col_major.as_ptr_mut() as usize
+    });
+    let solve_chunk = projection_solve_sample_chunk(n_samples);
+    let solve_chunks = n_samples.div_ceil(solve_chunk);
+
+    (0..solve_chunks).into_par_iter().for_each_init(
+        || {
+            (
+                vec![0.0f64; components * components],
+                vec![0.0f64; components],
+                vec![0.0f64; components],
+            )
+        },
+        |(info_matrix, rhs, diag_mass), chunk_idx| {
+            let scores_ptr = scores_ptr as *mut f64;
+            let alignment_ptr = alignment_ptr.map(|ptr| ptr as *mut f64);
+            let sample_start = chunk_idx * solve_chunk;
+            let sample_end = (sample_start + solve_chunk).min(n_samples);
+
+            for sample in sample_start..sample_end {
+                let missing = &missing_variants[sample];
+                for k in 0..components {
+                    rhs[k] = unsafe { *scores_ptr.add(k * n_samples + sample) };
+                }
+
+                let solved = if missing.is_empty() && solve_base.base_factor_ready {
+                    solve_cholesky_factor_in_place(
+                        &solve_base.base_factor,
+                        &mut rhs[..components],
+                        components,
+                    )
+                } else {
+                    info_matrix[..components * components]
+                        .copy_from_slice(&solve_base.base_info[..components * components]);
+                    diag_mass[..components].copy_from_slice(&solve_base.global_diag[..components]);
+                    for &variant in missing {
+                        let variant = variant as usize;
+                        for row in 0..components {
+                            let row_loading = loadings[(variant, row)];
+                            diag_mass[row] -= row_loading * row_loading;
+                            for col in row..components {
+                                info_matrix[col * components + row] -=
+                                    row_loading * loadings[(variant, col)];
+                            }
+                        }
+                    }
+                    let trace: f64 = diag_mass.iter().sum();
                     if trace <= WLS_RIDGE * (components as f64) {
                         write_zero_projection_sample(
                             scores_ptr,
@@ -1246,76 +1466,49 @@ impl<'model> HwePcaProjector<'model> {
                         );
                         continue;
                     }
+                    solve_spd_lower_in_place(info_matrix, &mut rhs[..components], components)
+                };
 
+                if solved {
                     for k in 0..components {
-                        rhs[k] = unsafe { *scores_ptr.add(k * n_samples + sample) };
-                    }
-
-                    let solved = if missing_trace == 0.0 && base_factor_ready {
-                        solve_cholesky_factor_in_place(
-                            &base_factor,
-                            &mut rhs[..components],
-                            components,
-                        )
-                    } else {
-                        fill_sample_info_matrix(
-                            info_matrix,
-                            &base_info,
-                            &missing_info_storage[info_offset..info_offset + packed_info_size],
-                            components,
-                        );
-                        solve_spd_lower_in_place(info_matrix, &mut rhs[..components], components)
-                    };
-
-                    if solved {
-                        for k in 0..components {
-                            unsafe {
-                                *scores_ptr.add(k * n_samples + sample) = rhs[k];
-                            }
+                        unsafe {
+                            *scores_ptr.add(k * n_samples + sample) = rhs[k];
                         }
-                        if let Some(alignment_ptr) = alignment_ptr {
-                            if missing_trace == 0.0 {
-                                for (k, &value) in base_alignment.iter().enumerate() {
-                                    unsafe {
-                                        *alignment_ptr.add(k * n_samples + sample) = value;
-                                    }
+                    }
+                    if let Some(alignment_ptr) = alignment_ptr {
+                        if missing.is_empty() {
+                            for (k, &value) in solve_base.base_alignment.iter().enumerate() {
+                                unsafe {
+                                    *alignment_ptr.add(k * n_samples + sample) = value;
                                 }
-                            } else {
-                                for (k, &diag_idx) in diag_indices.iter().enumerate() {
-                                    let mass = global_info_packed[diag_idx]
-                                        - missing_info_storage[info_offset + diag_idx];
-                                    let denom = normalization.get(k).copied().unwrap_or(0.0);
-                                    let value = if mass > 0.0 && denom > 0.0 {
-                                        (mass / denom).sqrt()
-                                    } else {
-                                        0.0
-                                    };
-                                    unsafe {
-                                        *alignment_ptr.add(k * n_samples + sample) = value;
-                                    }
+                            }
+                        } else {
+                            for (k, &mass) in diag_mass.iter().enumerate() {
+                                let denom = normalization.get(k).copied().unwrap_or(0.0);
+                                let value = if mass > 0.0 && denom > 0.0 {
+                                    (mass / denom).sqrt()
+                                } else {
+                                    0.0
+                                };
+                                unsafe {
+                                    *alignment_ptr.add(k * n_samples + sample) = value;
                                 }
                             }
                         }
-                    } else {
-                        write_zero_projection_sample(
-                            scores_ptr,
-                            alignment_ptr,
-                            n_samples,
-                            components,
-                            sample,
-                            zero_action,
-                        );
                     }
+                } else {
+                    write_zero_projection_sample(
+                        scores_ptr,
+                        alignment_ptr,
+                        n_samples,
+                        components,
+                        sample,
+                        zero_action,
+                    );
                 }
-            },
-        );
-
-        Ok(())
-    }
-
-    pub fn model(&self) -> &'model HwePcaModel {
-        self.model
-    }
+            }
+        },
+    );
 }
 
 fn standardize_projection_block(
@@ -1457,15 +1650,20 @@ fn project_from_packed_hard_calls<P>(
     packed_info_size: usize,
     global_info_packed: &mut [f64],
     scores: &mut MatMut<'_, f64>,
-    missing_info_storage: &mut [f64],
+    missing_variants: &mut [Vec<u32>],
     progress: &P,
-) -> Result<(), HwePcaError>
+) -> Result<Option<Vec<f64>>, HwePcaError>
 where
     P: ProjectionProgressObserver,
 {
     if packed.n_variants() < expected_variants {
         return Err(HwePcaError::InvalidInput(
             "VariantBlockSource terminated early during projection",
+        ));
+    }
+    if expected_variants > u32::MAX as usize {
+        return Err(HwePcaError::InvalidInput(
+            "Projection variant dimension exceeds packed missingness index capacity",
         ));
     }
 
@@ -1502,6 +1700,9 @@ where
         },
     };
     let mut scores_row_major = vec![0.0f64; n_samples * components];
+    let mut dense_missing_info_storage = packed_cuda
+        .as_ref()
+        .map(|_| vec![0.0f64; n_samples * packed_info_size]);
     let mut gpu_loadings_col_major = vec![0.0f32; block_variants * components];
     let mut gpu_coeffs = vec![0.0f32; block_variants * 3];
     let mut gpu_block_contrib = vec![0.0f32; block_variants * packed_info_size];
@@ -1521,6 +1722,7 @@ where
         gpu_missing_active = false;
         gpu_scores_active = false;
         logged_cuda_fallback = true;
+        dense_missing_info_storage = None;
     }
     if let Some(runtime) = packed_cuda.as_mut()
         && runtime.init_scores_accum(n_samples, components).is_err()
@@ -1530,6 +1732,7 @@ where
         gpu_missing_active = false;
         gpu_scores_active = false;
         logged_cuda_fallback = true;
+        dense_missing_info_storage = None;
     }
 
     let mut processed = 0usize;
@@ -1615,7 +1818,9 @@ where
                     let _ = runtime.copy_missing_info_to_host(
                         n_samples,
                         packed_info_size,
-                        missing_info_storage,
+                        dense_missing_info_storage
+                            .as_mut()
+                            .expect("dense missing-info storage must exist when GPU is active"),
                     );
                     gpu_missing_active = false;
                 }
@@ -1686,7 +1891,9 @@ where
                                 let _ = runtime.copy_missing_info_to_host(
                                     n_samples,
                                     packed_info_size,
-                                    missing_info_storage,
+                                    dense_missing_info_storage.as_mut().expect(
+                                        "dense missing-info storage must exist when GPU is active",
+                                    ),
                                 );
                                 if !logged_cuda_fallback {
                                     eprintln!(
@@ -1715,7 +1922,9 @@ where
                         let _ = runtime.copy_missing_info_to_host(
                             n_samples,
                             packed_info_size,
-                            missing_info_storage,
+                            dense_missing_info_storage
+                                .as_mut()
+                                .expect("dense missing-info storage must exist when GPU is active"),
                         );
                         gpu_missing_active = false;
                     }
@@ -1732,17 +1941,30 @@ where
         }
 
         if !used_gpu {
-            accumulate_packed_cpu_block_row_major(
-                &block_variant_bytes,
-                &block_loading[..load_len],
-                &block_coeffs[..coeff_len],
-                &block_info_contrib[..contrib_len],
-                sample_chunk,
-                components,
-                packed_info_size,
-                &mut scores_row_major,
-                missing_info_storage,
-            );
+            if let Some(missing_info_storage) = dense_missing_info_storage.as_mut() {
+                accumulate_packed_cpu_block_row_major(
+                    &block_variant_bytes,
+                    &block_loading[..load_len],
+                    &block_coeffs[..coeff_len],
+                    &block_info_contrib[..contrib_len],
+                    sample_chunk,
+                    components,
+                    packed_info_size,
+                    &mut scores_row_major,
+                    missing_info_storage,
+                );
+            } else {
+                accumulate_packed_cpu_block_row_major_sparse_missing(
+                    &block_variant_bytes,
+                    &block_loading[..load_len],
+                    &block_coeffs[..coeff_len],
+                    processed,
+                    sample_chunk,
+                    components,
+                    &mut scores_row_major,
+                    missing_variants,
+                );
+            }
         }
 
         processed += filled;
@@ -1752,7 +1974,13 @@ where
     if gpu_missing_active
         && let Some(runtime) = packed_cuda.as_mut()
         && runtime
-            .copy_missing_info_to_host(n_samples, packed_info_size, missing_info_storage)
+            .copy_missing_info_to_host(
+                n_samples,
+                packed_info_size,
+                dense_missing_info_storage
+                    .as_mut()
+                    .expect("dense missing-info storage must exist when GPU is active"),
+            )
             .is_err()
     {
         // Fall back to whatever CPU accumulation already has (currently none for
@@ -1773,7 +2001,7 @@ where
         }
     }
 
-    Ok(())
+    Ok(dense_missing_info_storage)
 }
 
 fn accumulate_packed_cpu_block_row_major(
@@ -1822,6 +2050,63 @@ fn accumulate_packed_cpu_block_row_major(
                             for idx in 0..packed_info_size {
                                 dst[idx] += contrib[idx];
                             }
+                            continue;
+                        }
+
+                        let coeff = match code {
+                            0 => coeffs[0],
+                            2 => coeffs[1],
+                            3 => coeffs[2],
+                            _ => continue,
+                        };
+                        let dst = &mut score_chunk[score_offset..score_offset + components];
+                        for k in 0..components {
+                            dst[k] += coeff * loading[k];
+                        }
+                    }
+                }
+            }
+        });
+}
+
+fn accumulate_packed_cpu_block_row_major_sparse_missing(
+    block_variant_bytes: &[&[u8]],
+    block_loading: &[f64],
+    block_coeffs: &[f64],
+    variant_offset: usize,
+    sample_chunk: usize,
+    components: usize,
+    scores_row_major: &mut [f64],
+    missing_variants: &mut [Vec<u32>],
+) {
+    let samples = scores_row_major.len() / components;
+    let chunk_scores = sample_chunk * components;
+    scores_row_major
+        .par_chunks_mut(chunk_scores)
+        .zip(missing_variants.par_chunks_mut(sample_chunk))
+        .enumerate()
+        .for_each(|(chunk_idx, (score_chunk, missing_chunk))| {
+            let sample_start = chunk_idx * sample_chunk;
+            let chunk_samples = score_chunk.len() / components;
+            let byte_start = sample_start >> 2;
+            let byte_len = packed_bytes_per_variant(chunk_samples);
+
+            for (variant, variant_bytes) in block_variant_bytes.iter().enumerate() {
+                debug_assert_eq!(variant_bytes.len(), packed_bytes_per_variant(samples));
+                let bytes = &variant_bytes[byte_start..byte_start + byte_len];
+                let coeffs = &block_coeffs[variant * 3..variant * 3 + 3];
+                let loading = &block_loading[variant * components..(variant + 1) * components];
+                let global_variant = (variant_offset + variant) as u32;
+
+                for (byte_idx, &byte) in bytes.iter().enumerate() {
+                    let sample_base = byte_idx << 2;
+                    let lanes = (chunk_samples - sample_base).min(4);
+                    for lane in 0..lanes {
+                        let sample = sample_base + lane;
+                        let code = (byte >> (lane << 1)) & 0b11;
+                        let score_offset = sample * components;
+                        if code == 1 {
+                            missing_chunk[sample].push(global_variant);
                             continue;
                         }
 
