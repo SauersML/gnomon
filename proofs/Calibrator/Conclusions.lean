@@ -740,15 +740,15 @@ by
           symm
           exact h_left
         _ = H⁻¹ * (- (Real.exp (rho i) • S_basis i) * beta_hat rho) := by
-          simp [H] using h_mul
+          exact h_mul
         _ = -H⁻¹ * ((Real.exp (rho i) • S_basis i) * beta_hat rho) := by
-          simp [neg_mul]
+          simp [Matrix.mul_neg, Matrix.neg_mul]
     calc
       deriv (fun r => beta_hat (Function.update rho i r)) (rho i)
           = -H⁻¹ * ((Real.exp (rho i) • S_basis i) * beta_hat rho) := h_solved
       _ = rust_delta_fn S_basis X W beta_hat rho i := by
         symm
-        simpa [H] using rust_delta_correctness S_basis X W beta_hat rho i
+        exact rust_delta_correctness S_basis X W beta_hat rho i
   rw [h_chain, h_partial_rho, h_deriv_beta]
   unfold rust_correction_fn
   rfl
