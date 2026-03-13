@@ -46,7 +46,7 @@ jobs:
       - name: Build release binary
         env:
           CARGO_INCREMENTAL: 0
-        run: cargo +nightly build --release --locked
+        run: cargo +nightly build --release
 
       - name: Upload release binary
         uses: actions/upload-artifact@v4
