@@ -13,7 +13,7 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::adapt_plink2::{VirtualPlink19, open_virtual_plink19_from_paths};
-use crate::map::fit::{HwePcaModel, VariantBlockSource};
+use crate::map::fit::{HwePcaModel, LdWeights, VariantBlockSource};
 use crate::map::project::ProjectionResult;
 use crate::map::variant_filter::{MatchKind, VariantFilter, VariantKey, VariantSelection};
 use crate::score::pipeline::PipelineError;
@@ -38,6 +38,7 @@ use noodles_vcf::{
         info::field::value::Array as InfoArray,
     },
 };
+use serde::Serialize;
 use thiserror::Error;
 
 const PLINK_HEADER_LEN: u64 = 3;
@@ -146,9 +147,25 @@ pub enum GenotypeDataset {
 }
 
 #[derive(Clone, Debug)]
+pub struct OrderedSelectionPlan {
+    pub indices: Vec<usize>,
+    pub match_kinds: Vec<MatchKind>,
+}
+
+impl OrderedSelectionPlan {
+    pub fn new(indices: Vec<usize>, match_kinds: Vec<MatchKind>) -> Self {
+        Self {
+            indices,
+            match_kinds,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub enum SelectionPlan {
     All,
     ByIndices(Vec<usize>),
+    Ordered(OrderedSelectionPlan),
     ByKeys(Arc<VariantFilter>),
 }
 
@@ -230,6 +247,12 @@ impl GenotypeDataset {
             (Self::Plink(dataset), SelectionPlan::ByIndices(indices)) => Ok(
                 DatasetBlockSource::Plink(dataset.block_source_with_selection(Some(indices), None)),
             ),
+            (Self::Plink(dataset), SelectionPlan::Ordered(selection)) => Ok(
+                DatasetBlockSource::Plink(dataset.block_source_with_selection(
+                    Some(selection.indices),
+                    Some(selection.match_kinds),
+                )),
+            ),
             (Self::Plink(dataset), SelectionPlan::ByKeys(filter)) => {
                 let selection = dataset
                     .select_variants(filter.as_ref())
@@ -249,6 +272,12 @@ impl GenotypeDataset {
             }
             (Self::Pgen(dataset), SelectionPlan::ByIndices(indices)) => Ok(
                 DatasetBlockSource::Plink(dataset.block_source_with_selection(Some(indices), None)),
+            ),
+            (Self::Pgen(dataset), SelectionPlan::Ordered(selection)) => Ok(
+                DatasetBlockSource::Plink(dataset.block_source_with_selection(
+                    Some(selection.indices),
+                    Some(selection.match_kinds),
+                )),
             ),
             (Self::Pgen(dataset), SelectionPlan::ByKeys(filter)) => {
                 let selection = dataset
@@ -355,6 +384,20 @@ impl GenotypeDataset {
                 }
                 Ok(selected)
             }
+            (Self::Plink(dataset), SelectionPlan::Ordered(selection)) => {
+                let keys = dataset.variant_keys_all()?;
+                let mut selected = Vec::with_capacity(selection.indices.len());
+                for &idx in &selection.indices {
+                    if let Some(key) = keys.get(idx) {
+                        selected.push(key.clone());
+                    } else {
+                        return Err(GenotypeIoError::Plink(PlinkIoError::InvalidHeader(
+                            format!("variant index {idx} exceeds dataset bounds"),
+                        )));
+                    }
+                }
+                Ok(selected)
+            }
             (Self::Plink(dataset), SelectionPlan::ByKeys(filter)) => {
                 let selection = dataset.select_variants(filter)?;
                 Ok(selection.keys)
@@ -369,6 +412,21 @@ impl GenotypeDataset {
                     } else {
                         return Err(GenotypeIoError::Variant(VariantIoError::UnexpectedEof {
                             expected: indices.len(),
+                            actual: selected.len(),
+                        }));
+                    }
+                }
+                Ok(selected)
+            }
+            (Self::Variants(dataset), SelectionPlan::Ordered(selection)) => {
+                let keys = dataset.variant_keys_all()?;
+                let mut selected = Vec::with_capacity(selection.indices.len());
+                for &idx in &selection.indices {
+                    if let Some(key) = keys.get(idx) {
+                        selected.push(key.clone());
+                    } else {
+                        return Err(GenotypeIoError::Variant(VariantIoError::UnexpectedEof {
+                            expected: selection.indices.len(),
                             actual: selected.len(),
                         }));
                     }
@@ -394,6 +452,20 @@ impl GenotypeDataset {
                 }
                 Ok(selected)
             }
+            (Self::Pgen(dataset), SelectionPlan::Ordered(selection)) => {
+                let keys = dataset.variant_keys_all()?;
+                let mut selected = Vec::with_capacity(selection.indices.len());
+                for &idx in &selection.indices {
+                    if let Some(key) = keys.get(idx) {
+                        selected.push(key.clone());
+                    } else {
+                        return Err(GenotypeIoError::Plink(PlinkIoError::InvalidHeader(
+                            format!("variant index {idx} exceeds dataset bounds"),
+                        )));
+                    }
+                }
+                Ok(selected)
+            }
             (Self::Pgen(dataset), SelectionPlan::ByKeys(filter)) => {
                 let selection = dataset.select_variants(filter)?;
                 Ok(selection.keys)
@@ -405,8 +477,27 @@ impl GenotypeDataset {
 #[derive(Debug, Clone)]
 pub struct ProjectionOutputPaths {
     pub scores: PathBuf,
+    pub scores_metadata: PathBuf,
     pub alignment: Option<PathBuf>,
+    pub alignment_metadata: Option<PathBuf>,
 }
+
+#[derive(Serialize)]
+struct ProjectionMatrixMetadata {
+    version: u32,
+    kind: &'static str,
+    layout: &'static str,
+    dtype: &'static str,
+    rows: usize,
+    cols: usize,
+    row_order: &'static str,
+}
+
+const PROJECTION_MATRIX_MAGIC: &[u8; 8] = b"GNPRJ001";
+const PROJECTION_MATRIX_VERSION: u32 = 1;
+const PROJECTION_CACHE_MAGIC: &[u8; 8] = b"GNPCCH01";
+const PROJECTION_CACHE_VERSION: u32 = 1;
+const PROJECTION_CACHE_NO_BP_WINDOW: u64 = u64::MAX;
 
 pub fn save_hwe_model(
     dataset: &GenotypeDataset,
@@ -419,15 +510,32 @@ pub fn save_hwe_model(
     let mut writer = BufWriter::new(file);
     serde_json::to_writer_pretty(&mut writer, model)?;
     writer.flush()?;
+    write_projection_cache(&model_path, model)?;
 
     Ok(model_path)
 }
 
-pub fn load_hwe_model(dataset: &GenotypeDataset) -> Result<HwePcaModel, DatasetOutputError> {
-    let model_path = dataset.output_path("hwe.json");
-    let file = File::open(&model_path)?;
+pub fn load_model_from_path(model_path: &Path) -> Result<HwePcaModel, DatasetOutputError> {
+    let cache_path = projection_cache_path(model_path);
+    if cache_path.exists() {
+        match read_projection_cache(&cache_path) {
+            Ok(model) => return Ok(model),
+            Err(_) => {
+                let _ = fs::remove_file(&cache_path);
+            }
+        }
+    }
+
+    let file = File::open(model_path)?;
     let reader = BufReader::new(file);
     let model: HwePcaModel = serde_json::from_reader(reader)?;
+    let _ = write_projection_cache(model_path, &model);
+    Ok(model)
+}
+
+pub fn load_hwe_model(dataset: &GenotypeDataset) -> Result<HwePcaModel, DatasetOutputError> {
+    let model_path = dataset.output_path("hwe.json");
+    let model = load_model_from_path(&model_path)?;
 
     if let Some(keys) = model.variant_keys() {
         if keys.len() != model.n_variants() {
@@ -451,6 +559,149 @@ pub fn load_hwe_model(dataset: &GenotypeDataset) -> Result<HwePcaModel, DatasetO
     Ok(model)
 }
 
+fn projection_cache_path(model_path: &Path) -> PathBuf {
+    let mut cache_path = model_path.to_path_buf();
+    cache_path.set_extension("project.bin");
+    cache_path
+}
+
+fn write_projection_cache(
+    model_path: &Path,
+    model: &HwePcaModel,
+) -> Result<(), DatasetOutputError> {
+    let cache_path = projection_cache_path(model_path);
+    prepare_output_path(&cache_path)?;
+    let temp_path = cache_path.with_extension("project.bin.tmp");
+    let file = File::create(&temp_path)?;
+    let mut writer = BufWriter::with_capacity(16 * 1024 * 1024, file);
+    let variant_keys = model.variant_keys();
+    let ld = model.ld();
+    let genome_build = model.genome_build();
+
+    writer.write_all(PROJECTION_CACHE_MAGIC)?;
+    writer.write_all(&PROJECTION_CACHE_VERSION.to_le_bytes())?;
+    write_u64(&mut writer, model.n_samples() as u64)?;
+    write_u64(&mut writer, model.n_variants() as u64)?;
+    write_u64(&mut writer, model.components() as u64)?;
+    write_u64(
+        &mut writer,
+        variant_keys.map_or(0, |keys| keys.len() as u64),
+    )?;
+    write_u64(
+        &mut writer,
+        ld.map_or(0, |weights| weights.weights.len() as u64),
+    )?;
+    write_u64(
+        &mut writer,
+        genome_build.map_or(0, |value| value.len() as u64),
+    )?;
+    write_u64(&mut writer, ld.map_or(0, |weights| weights.window as u64))?;
+    write_u64(
+        &mut writer,
+        ld.and_then(|weights| weights.bp_window)
+            .unwrap_or(PROJECTION_CACHE_NO_BP_WINDOW),
+    )?;
+    writer.write_all(&ld.map_or(0.0, |weights| weights.ridge).to_le_bytes())?;
+    write_f64_slice(&mut writer, model.scaler().allele_frequencies())?;
+    write_f64_slice(&mut writer, model.scaler().variant_scales())?;
+    for column in model.variant_loadings().col_iter() {
+        let contiguous = column
+            .try_as_col_major()
+            .expect("projection loadings columns must be contiguous");
+        write_f64_slice(&mut writer, contiguous.as_slice())?;
+    }
+    write_f64_slice(&mut writer, model.component_weighted_norms_sq())?;
+    if let Some(keys) = variant_keys {
+        for key in keys {
+            write_variant_key(&mut writer, key)?;
+        }
+    }
+    if let Some(weights) = ld {
+        write_f64_slice(&mut writer, &weights.weights)?;
+    }
+    if let Some(build) = genome_build {
+        writer.write_all(build.as_bytes())?;
+    }
+    writer.flush()?;
+    fs::rename(&temp_path, &cache_path)?;
+    Ok(())
+}
+
+fn read_projection_cache(cache_path: &Path) -> Result<HwePcaModel, DatasetOutputError> {
+    let file = File::open(cache_path)?;
+    let mut reader = BufReader::with_capacity(16 * 1024 * 1024, file);
+    let mut magic = [0u8; 8];
+    reader.read_exact(&mut magic)?;
+    if &magic != PROJECTION_CACHE_MAGIC {
+        return Err(DatasetOutputError::InvalidState(
+            "projection cache magic did not match".into(),
+        ));
+    }
+
+    let version = read_u32(&mut reader)?;
+    if version != PROJECTION_CACHE_VERSION {
+        return Err(DatasetOutputError::InvalidState(format!(
+            "unsupported projection cache version {version}"
+        )));
+    }
+
+    let n_samples = read_u64_as_usize(&mut reader, "projection cache n_samples")?;
+    let n_variants = read_u64_as_usize(&mut reader, "projection cache n_variants")?;
+    let components = read_u64_as_usize(&mut reader, "projection cache components")?;
+    let variant_key_count = read_u64_as_usize(&mut reader, "projection cache variant_key_count")?;
+    let ld_weight_count = read_u64_as_usize(&mut reader, "projection cache ld_weight_count")?;
+    let genome_build_len = read_u64_as_usize(&mut reader, "projection cache genome_build_len")?;
+    let ld_window = read_u64_as_usize(&mut reader, "projection cache ld_window")?;
+    let ld_bp_window = read_u64(&mut reader)?;
+    let ridge = read_f64(&mut reader)?;
+
+    let frequencies = read_f64_vec(&mut reader, n_variants)?;
+    let scales = read_f64_vec(&mut reader, n_variants)?;
+    let loadings_len = n_variants.checked_mul(components).ok_or_else(|| {
+        DatasetOutputError::InvalidState("projection cache loadings length overflow".into())
+    })?;
+    let loadings_col_major = read_f64_vec(&mut reader, loadings_len)?;
+    let component_weighted_norms_sq = read_f64_vec(&mut reader, components)?;
+    let variant_keys = if variant_key_count == 0 {
+        None
+    } else {
+        Some(read_variant_keys(&mut reader, variant_key_count)?)
+    };
+    let ld = if ld_weight_count == 0 {
+        None
+    } else {
+        Some(LdWeights {
+            weights: read_f64_vec(&mut reader, ld_weight_count)?,
+            window: ld_window,
+            bp_window: if ld_bp_window == PROJECTION_CACHE_NO_BP_WINDOW {
+                None
+            } else {
+                Some(ld_bp_window)
+            },
+            ridge,
+        })
+    };
+    let genome_build = if genome_build_len == 0 {
+        None
+    } else {
+        Some(read_string_with_len(&mut reader, genome_build_len)?)
+    };
+
+    HwePcaModel::from_projection_binary_parts(
+        n_samples,
+        n_variants,
+        frequencies,
+        scales,
+        loadings_col_major,
+        components,
+        component_weighted_norms_sq,
+        variant_keys,
+        ld,
+        genome_build,
+    )
+    .map_err(DatasetOutputError::InvalidState)
+}
+
 pub fn save_projection_results(
     dataset: &GenotypeDataset,
     result: &ProjectionResult,
@@ -466,55 +717,187 @@ pub fn save_projection_results(
         )));
     }
 
-    let scores_path = dataset.output_path("projection_scores.tsv");
-    prepare_output_path(&scores_path)?;
-    let mut writer = BufWriter::new(File::create(&scores_path)?);
-
-    write!(writer, "FID\tIID")?;
-    for idx in 0..scores.ncols() {
-        write!(writer, "\tPC{}", idx + 1)?;
-    }
-    writeln!(writer)?;
-
-    for (row, sample) in samples.iter().enumerate() {
-        write!(writer, "{}\t{}", sample.family_id, sample.individual_id)?;
-        for col in 0..scores.ncols() {
-            let value = scores[(row, col)];
-            write!(writer, "\t{}", value)?;
-        }
-        writeln!(writer)?;
-    }
-
-    writer.flush()?;
+    let scores_path = dataset.output_path("projection_scores.bin");
+    let scores_metadata = write_projection_matrix(&scores_path, &result.scores, "scores")?;
 
     let mut alignment_path = None;
+    let mut alignment_metadata = None;
     if let Some(alignment) = result.alignment.as_ref() {
-        let path = dataset.output_path("projection_alignment.tsv");
-        prepare_output_path(&path)?;
-        let mut writer = BufWriter::new(File::create(&path)?);
-
-        write!(writer, "FID\tIID")?;
-        for idx in 0..alignment.ncols() {
-            write!(writer, "\tPC{}", idx + 1)?;
-        }
-        writeln!(writer)?;
-
-        for (row, sample) in samples.iter().enumerate() {
-            write!(writer, "{}\t{}", sample.family_id, sample.individual_id)?;
-            for col in 0..alignment.ncols() {
-                let value = alignment[(row, col)];
-                write!(writer, "\t{}", value)?;
-            }
-            writeln!(writer)?;
-        }
-
-        writer.flush()?;
+        let path = dataset.output_path("projection_alignment.bin");
+        let metadata = write_projection_matrix(&path, alignment, "alignment")?;
         alignment_path = Some(path);
+        alignment_metadata = Some(metadata);
     }
 
     Ok(ProjectionOutputPaths {
         scores: scores_path,
+        scores_metadata,
         alignment: alignment_path,
+        alignment_metadata,
+    })
+}
+
+fn write_projection_matrix(
+    matrix_path: &Path,
+    matrix: &faer::Mat<f64>,
+    kind: &'static str,
+) -> Result<PathBuf, DatasetOutputError> {
+    prepare_output_path(matrix_path)?;
+    let metadata_path = matrix_path.with_extension("metadata.json");
+
+    let mut writer = BufWriter::with_capacity(16 * 1024 * 1024, File::create(matrix_path)?);
+    writer.write_all(PROJECTION_MATRIX_MAGIC)?;
+    writer.write_all(&PROJECTION_MATRIX_VERSION.to_le_bytes())?;
+    writer.write_all(&(matrix.nrows() as u64).to_le_bytes())?;
+    writer.write_all(&(matrix.ncols() as u64).to_le_bytes())?;
+    for col in 0..matrix.ncols() {
+        write_f64_slice(&mut writer, matrix.col_as_slice(col))?;
+    }
+    writer.flush()?;
+
+    prepare_output_path(&metadata_path)?;
+    let metadata = ProjectionMatrixMetadata {
+        version: PROJECTION_MATRIX_VERSION,
+        kind,
+        layout: "column_major",
+        dtype: "f64_le",
+        rows: matrix.nrows(),
+        cols: matrix.ncols(),
+        row_order: "matches the input genotype dataset sample order",
+    };
+    let file = File::create(&metadata_path)?;
+    let mut metadata_writer = BufWriter::new(file);
+    serde_json::to_writer_pretty(&mut metadata_writer, &metadata)?;
+    metadata_writer.flush()?;
+
+    Ok(metadata_path)
+}
+
+#[cfg(target_endian = "little")]
+fn write_f64_slice<W: Write>(writer: &mut W, values: &[f64]) -> Result<(), io::Error> {
+    let len = values
+        .len()
+        .checked_mul(std::mem::size_of::<f64>())
+        .ok_or_else(|| io::Error::other("projection matrix byte count overflow"))?;
+    let bytes = unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), len) };
+    writer.write_all(bytes)
+}
+
+#[cfg(not(target_endian = "little"))]
+fn write_f64_slice<W: Write>(writer: &mut W, values: &[f64]) -> Result<(), io::Error> {
+    for &value in values {
+        writer.write_all(&value.to_le_bytes())?;
+    }
+    Ok(())
+}
+
+fn write_u64<W: Write>(writer: &mut W, value: u64) -> Result<(), io::Error> {
+    writer.write_all(&value.to_le_bytes())
+}
+
+fn read_u32<R: Read>(reader: &mut R) -> Result<u32, DatasetOutputError> {
+    let mut bytes = [0u8; 4];
+    reader.read_exact(&mut bytes)?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn read_u64<R: Read>(reader: &mut R) -> Result<u64, DatasetOutputError> {
+    let mut bytes = [0u8; 8];
+    reader.read_exact(&mut bytes)?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn read_u64_as_usize<R: Read>(
+    reader: &mut R,
+    field: &'static str,
+) -> Result<usize, DatasetOutputError> {
+    usize::try_from(read_u64(reader)?).map_err(|_| {
+        DatasetOutputError::InvalidState(format!("{field} exceeded platform usize capacity"))
+    })
+}
+
+fn read_f64<R: Read>(reader: &mut R) -> Result<f64, DatasetOutputError> {
+    let mut bytes = [0u8; 8];
+    reader.read_exact(&mut bytes)?;
+    Ok(f64::from_le_bytes(bytes))
+}
+
+#[cfg(target_endian = "little")]
+fn read_f64_vec<R: Read>(reader: &mut R, len: usize) -> Result<Vec<f64>, DatasetOutputError> {
+    let byte_len = len.checked_mul(std::mem::size_of::<f64>()).ok_or_else(|| {
+        DatasetOutputError::InvalidState("projection cache length overflow".into())
+    })?;
+    let mut values = vec![0.0f64; len];
+    let bytes =
+        unsafe { std::slice::from_raw_parts_mut(values.as_mut_ptr().cast::<u8>(), byte_len) };
+    reader.read_exact(bytes)?;
+    Ok(values)
+}
+
+#[cfg(not(target_endian = "little"))]
+fn read_f64_vec<R: Read>(reader: &mut R, len: usize) -> Result<Vec<f64>, DatasetOutputError> {
+    let mut values = Vec::with_capacity(len);
+    for _ in 0..len {
+        values.push(read_f64(reader)?);
+    }
+    Ok(values)
+}
+
+fn write_variant_key<W: Write>(writer: &mut W, key: &VariantKey) -> Result<(), io::Error> {
+    write_string(writer, &key.chromosome)?;
+    write_u64(writer, key.position)?;
+    match &key.alleles {
+        Some((reference, alternate)) => {
+            writer.write_all(&[1])?;
+            write_string(writer, reference)?;
+            write_string(writer, alternate)?;
+        }
+        None => writer.write_all(&[0])?,
+    }
+    Ok(())
+}
+
+fn read_variant_keys<R: Read>(
+    reader: &mut R,
+    count: usize,
+) -> Result<Vec<VariantKey>, DatasetOutputError> {
+    let mut keys = Vec::with_capacity(count);
+    for _ in 0..count {
+        let chromosome = read_string(reader)?;
+        let position = read_u64(reader)?;
+        let mut allele_flag = [0u8; 1];
+        reader.read_exact(&mut allele_flag)?;
+        let alleles = if allele_flag[0] == 0 {
+            None
+        } else {
+            Some((read_string(reader)?, read_string(reader)?))
+        };
+        keys.push(VariantKey {
+            chromosome,
+            position,
+            alleles,
+        });
+    }
+    Ok(keys)
+}
+
+fn write_string<W: Write>(writer: &mut W, value: &str) -> Result<(), io::Error> {
+    write_u64(writer, value.len() as u64)?;
+    writer.write_all(value.as_bytes())
+}
+
+fn read_string<R: Read>(reader: &mut R) -> Result<String, DatasetOutputError> {
+    let len = read_u64_as_usize(reader, "projection cache string length")?;
+    read_string_with_len(reader, len)
+}
+
+fn read_string_with_len<R: Read>(reader: &mut R, len: usize) -> Result<String, DatasetOutputError> {
+    let mut bytes = vec![0u8; len];
+    reader.read_exact(&mut bytes)?;
+    String::from_utf8(bytes).map_err(|err| {
+        DatasetOutputError::InvalidState(format!(
+            "projection cache string was not valid UTF-8: {err}"
+        ))
     })
 }
 
@@ -632,6 +1015,13 @@ impl VariantBlockSource for DatasetBlockSource {
         match self {
             Self::Plink(source) => source.progress_variants(),
             Self::Variants(source) => source.progress_variants(),
+        }
+    }
+
+    fn hard_call_packed(&mut self) -> Option<crate::map::fit::HardCallPacked<'_>> {
+        match self {
+            Self::Plink(source) => source.hard_call_packed(),
+            Self::Variants(_) => None,
         }
     }
 }
@@ -1361,6 +1751,21 @@ impl VariantBlockSource for PlinkVariantBlockSource {
             .map(|indices| indices.len())
             .unwrap_or(self.total_variants);
         Some((self.cursor.min(total), Some(total)))
+    }
+
+    fn hard_call_packed(&mut self) -> Option<crate::map::fit::HardCallPacked<'_>> {
+        if self.selection.is_some() || self.match_kinds.is_some() {
+            return None;
+        }
+        let total_bytes = self.bytes_per_variant.checked_mul(self.total_variants)?;
+        let data = self
+            .bed
+            .mmap_slice(PLINK_HEADER_LEN as usize, total_bytes)?;
+        Some(crate::map::fit::HardCallPacked::new(
+            data,
+            self.bytes_per_variant,
+            self.total_variants,
+        ))
     }
 }
 
@@ -2310,11 +2715,13 @@ impl VcfLikeVariantBlockSource {
         let filtered_variants_hint = match &selection_plan {
             SelectionPlan::All => n_variants_hint.unwrap_or(0),
             SelectionPlan::ByIndices(indices) => indices.len(),
+            SelectionPlan::Ordered(selection) => selection.indices.len(),
             SelectionPlan::ByKeys(filter) => filter.requested_unique(),
         };
         let requested_unique = match &selection_plan {
             SelectionPlan::ByKeys(filter) => filter.requested_unique(),
             SelectionPlan::ByIndices(indices) => indices.len(),
+            SelectionPlan::Ordered(selection) => selection.indices.len(),
             SelectionPlan::All => n_variants_hint.unwrap_or(0),
         };
         let mut source = Self {
@@ -2522,6 +2929,10 @@ impl VariantBlockSource for VcfLikeVariantBlockSource {
             SelectionPlan::ByIndices(indices) => {
                 let result = self.next_block_indices(&indices, max_variants, storage);
                 (SelectionPlan::ByIndices(indices), result)
+            }
+            SelectionPlan::Ordered(selection) => {
+                let result = self.next_block_indices(&selection.indices, max_variants, storage);
+                (SelectionPlan::Ordered(selection), result)
             }
             SelectionPlan::ByKeys(filter) => {
                 let result = self.next_block_keys(filter.as_ref(), max_variants, storage);
@@ -2939,6 +3350,9 @@ impl VcfLikeVariantBlockSource {
                 self.variant_count.set(self.emitted);
             }
             SelectionPlan::ByIndices(_) => {
+                self.total_variants_hint = Some(self.processed);
+            }
+            SelectionPlan::Ordered(_) => {
                 self.total_variants_hint = Some(self.processed);
             }
             SelectionPlan::ByKeys(filter) => {

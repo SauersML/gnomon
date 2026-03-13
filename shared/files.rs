@@ -203,6 +203,15 @@ impl BedSource {
         self.mmap.as_ref().map(Arc::clone)
     }
 
+    pub fn mmap_slice(&self, offset: usize, len: usize) -> Option<&[u8]> {
+        let mmap = self.mmap.as_ref()?;
+        let end = offset.checked_add(len)?;
+        if end > mmap.len() {
+            return None;
+        }
+        Some(&mmap[offset..end])
+    }
+
     pub fn len(&self) -> u64 {
         self.byte_source.len()
     }

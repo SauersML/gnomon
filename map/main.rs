@@ -1,8 +1,8 @@
 use super::fit::{FitOptions, HwePcaError, HwePcaModel, LdConfig, LdWindow};
 use super::io::{
-    DatasetOutputError, GenotypeDataset, GenotypeIoError, ProjectionOutputPaths, SelectionPlan,
-    load_hwe_model, save_fit_summary, save_hwe_model, save_projection_results,
-    save_sample_manifest,
+    DatasetOutputError, GenotypeDataset, GenotypeIoError, OrderedSelectionPlan,
+    ProjectionOutputPaths, SelectionPlan, load_hwe_model, load_model_from_path, save_fit_summary,
+    save_hwe_model, save_projection_results, save_sample_manifest,
 };
 use super::prefit::{self, BuiltinModelError};
 use super::progress::{fit_progress, projection_progress};
@@ -186,7 +186,10 @@ fn run_fit(
                 );
 
                 variant_keys = Some(Arc::new(selection.keys.clone()));
-                selection_plan = SelectionPlan::ByIndices(selection.indices);
+                selection_plan = SelectionPlan::Ordered(OrderedSelectionPlan::new(
+                    selection.indices,
+                    selection.match_kinds,
+                ));
             }
             GenotypeDataset::Variants(_) => {
                 let requested = filter.requested_unique();
@@ -371,7 +374,24 @@ fn run_project(genotype_path: &Path, model_name: Option<&str>) -> Result<(), Map
                     "Using stored variant subset with {} variants for projection",
                     selection.indices.len()
                 );
-                selection_plan = SelectionPlan::ByIndices(selection.indices);
+                if selection.indices.len() == model.n_variants()
+                    && selection
+                        .indices
+                        .iter()
+                        .enumerate()
+                        .all(|(expected, &actual)| expected == actual)
+                    && selection
+                        .match_kinds
+                        .iter()
+                        .all(|kind| *kind != super::variant_filter::MatchKind::Swap)
+                {
+                    selection_plan = SelectionPlan::All;
+                } else {
+                    selection_plan = SelectionPlan::Ordered(OrderedSelectionPlan::new(
+                        selection.indices,
+                        selection.match_kinds,
+                    ));
+                }
             }
             GenotypeDataset::Variants(_) => {
                 println!(
@@ -414,12 +434,21 @@ fn run_project(genotype_path: &Path, model_name: Option<&str>) -> Result<(), Map
         }
     }
 
-    let ProjectionOutputPaths { scores, alignment } = save_projection_results(&dataset, &result)?;
+    let ProjectionOutputPaths {
+        scores,
+        scores_metadata,
+        alignment,
+        alignment_metadata,
+    } = save_projection_results(&dataset, &result)?;
 
     println!("Generated projection outputs:");
     println!("  • Scores    : {}", scores.display());
+    println!("  • Scores metadata : {}", scores_metadata.display());
     if let Some(path) = alignment {
         println!("  • Alignment : {}", path.display());
+    }
+    if let Some(path) = alignment_metadata {
+        println!("  • Alignment metadata : {}", path.display());
     }
 
     println!("Projection complete for {} samples", result.scores.nrows());
@@ -444,11 +473,7 @@ fn load_builtin_model(name: &str) -> Result<HwePcaModel, MapDriverError> {
     let model_path = prefit::ensure_model(model_info)?;
 
     // Load the model
-    let file = std::fs::File::open(&model_path)?;
-    let reader = std::io::BufReader::new(file);
-    let model: HwePcaModel = serde_json::from_reader(reader)?;
-
-    Ok(model)
+    load_model_from_path(&model_path).map_err(MapDriverError::from)
 }
 
 fn map_variant_list_error(path: &Path, err: VariantListError) -> MapDriverError {
@@ -671,12 +696,26 @@ mod tests {
         assert_eq!(result.scores.nrows(), dataset.n_samples());
         assert_eq!(result.scores.ncols(), reloaded.components());
 
-        let ProjectionOutputPaths { scores, alignment } =
-            save_projection_results(&dataset, &result)?;
+        let ProjectionOutputPaths {
+            scores,
+            scores_metadata,
+            alignment,
+            alignment_metadata,
+        } = save_projection_results(&dataset, &result)?;
 
         assert!(scores.exists(), "projection scores were not written");
+        assert!(
+            scores_metadata.exists(),
+            "projection score metadata was not written"
+        );
         if let Some(alignment) = alignment {
             assert!(alignment.exists(), "projection alignment was not written");
+        }
+        if let Some(alignment_metadata) = alignment_metadata {
+            assert!(
+                alignment_metadata.exists(),
+                "projection alignment metadata was not written"
+            );
         }
 
         Ok(())

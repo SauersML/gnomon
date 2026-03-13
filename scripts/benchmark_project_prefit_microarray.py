@@ -228,9 +228,12 @@ def benchmark_one(prefix: Path) -> list[dict[str, float | int]]:
     n_samples = sum(1 for _ in prefix.with_suffix(".fam").open("r", encoding="ascii"))
     for repeat in range(1, REPEATS + 1):
         print(f"benchmark samples={n_samples} repeat={repeat}", flush=True)
-        out_path = prefix.with_suffix(".projection_scores.tsv")
+        out_path = prefix.with_suffix(".projection_scores.bin")
+        metadata_path = prefix.with_suffix(".projection_scores.metadata.json")
         if out_path.exists():
             out_path.unlink()
+        if metadata_path.exists():
+            metadata_path.unlink()
         start = time.perf_counter()
         proc = subprocess.run(
             [str(GNOMON), "project", "--model", MODEL_NAME, str(prefix.with_suffix(".bed"))],
@@ -241,6 +244,10 @@ def benchmark_one(prefix: Path) -> list[dict[str, float | int]]:
             sys.stderr.write(proc.stdout)
             sys.stderr.write(proc.stderr)
             raise SystemExit(f"projection failed for samples={n_samples}, repeat={repeat}")
+        if not out_path.exists() or not metadata_path.exists():
+            raise SystemExit(
+                f"projection output missing for samples={n_samples}, repeat={repeat}"
+            )
         elapsed = time.perf_counter() - start
         rows.append(
             {
@@ -318,6 +325,11 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_MODE,
         help="suffix appended to plot title",
     )
+    parser.add_argument(
+        "--reuse-existing",
+        action="store_true",
+        help="reuse existing .bed/.bim/.fam trios instead of regenerating them",
+    )
     return parser.parse_args()
 
 
@@ -334,12 +346,23 @@ def main() -> None:
     rows: list[dict[str, float | int]] = []
     for n_samples in counts:
         prefix = DATA_DIR / f"gsa_v3_{n_samples}"
-        if prefix.with_suffix(".bed").exists():
-            for ext in (".bed", ".bim", ".fam", ".projection_scores.tsv"):
+        dataset_exists = all(
+            prefix.with_suffix(ext).exists() for ext in (".bed", ".bim", ".fam")
+        )
+        if dataset_exists and args.reuse_existing:
+            print(f"reusing dataset samples={n_samples}", flush=True)
+        else:
+            for ext in (
+                ".bed",
+                ".bim",
+                ".fam",
+                ".projection_scores.bin",
+                ".projection_scores.metadata.json",
+            ):
                 path = prefix.with_suffix(ext)
                 if path.exists():
                     path.unlink()
-        make_dataset(prefix, n_samples, variant_keys)
+            make_dataset(prefix, n_samples, variant_keys)
         rows.extend(benchmark_one(prefix))
 
     output_csv.parent.mkdir(parents=True, exist_ok=True)

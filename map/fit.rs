@@ -412,7 +412,6 @@ pub struct HardCallPacked<'a> {
 }
 
 impl<'a> HardCallPacked<'a> {
-    #[cfg(test)]
     pub(crate) fn new(data: &'a [u8], bytes_per_variant: usize, n_variants: usize) -> Self {
         Self {
             data,
@@ -2255,6 +2254,50 @@ impl HwePcaModel {
 
     pub fn set_genome_build(&mut self, build: Option<String>) {
         self.genome_build = build;
+    }
+
+    pub(crate) fn from_projection_binary_parts(
+        n_samples: usize,
+        n_variants: usize,
+        frequencies: Vec<f64>,
+        scales: Vec<f64>,
+        loadings_col_major: Vec<f64>,
+        components: usize,
+        component_weighted_norms_sq: Vec<f64>,
+        variant_keys: Option<Vec<VariantKey>>,
+        ld: Option<LdWeights>,
+        genome_build: Option<String>,
+    ) -> Result<Self, String> {
+        let scaler = HweScaler::new(frequencies, scales);
+        let loadings = MatrixData {
+            nrows: n_variants,
+            ncols: components,
+            data: loadings_col_major,
+        }
+        .into_mat()?;
+        let component_weighted_norms_sq = if component_weighted_norms_sq.len() == components {
+            component_weighted_norms_sq
+        } else {
+            compute_component_weighted_norms_sq(
+                loadings.as_ref(),
+                ld.as_ref().map(|weights| weights.weights.as_slice()),
+            )
+        };
+
+        Ok(Self {
+            n_samples,
+            n_variants,
+            scaler,
+            eigenvalues: vec![0.0; components],
+            singular_values: vec![0.0; components],
+            sample_basis: Mat::zeros(0, components),
+            sample_scores: Mat::zeros(0, components),
+            loadings,
+            component_weighted_norms_sq,
+            variant_keys,
+            ld,
+            genome_build,
+        })
     }
 }
 

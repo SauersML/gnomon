@@ -898,6 +898,7 @@ impl<'model> HwePcaProjector<'model> {
         let scaler = self.model.scaler();
         let loadings = self.model.variant_loadings();
         let ld_weights = self.model.ld().map(|ld| ld.weights.as_slice());
+        let normalization = self.model.component_weighted_norms_sq();
         let par = faer::get_global_parallelism();
 
         progress.on_stage_start(ProjectionProgressStage::Projection, variant_hint);
@@ -907,6 +908,10 @@ impl<'model> HwePcaProjector<'model> {
 
         if let Some(packed) = source.hard_call_packed() {
             eprintln!("> Projection backend path: packed hard-call input (2-bit PLINK detected)");
+            for (component, &norm_sq) in normalization.iter().take(components).enumerate() {
+                let diag_idx = packed_tri_index(components, component, component);
+                global_info_packed[diag_idx] = norm_sq;
+            }
             project_from_packed_hard_calls(
                 packed,
                 n_samples,
@@ -918,7 +923,6 @@ impl<'model> HwePcaProjector<'model> {
                 packed_info_size,
                 &mut scores,
                 &mut missing_info_storage,
-                &mut global_info_packed,
                 progress,
             )?;
         } else {
@@ -1170,18 +1174,16 @@ impl<'model> HwePcaProjector<'model> {
 
         // WLS: Apply renormalization by solving A·s = b for each sample
         // where A is the K×K info matrix and b is the raw weighted projection.
-        let normalization = self.model.component_weighted_norms_sq();
         let diag_indices: Vec<usize> = (0..components)
             .map(|k| packed_tri_index(components, k, k))
             .collect();
-        let mut rhs_scores = vec![0.0f64; n_samples * components];
+        let mut row_scores = vec![0.0f64; n_samples * components];
         for sample in 0..n_samples {
             let row_offset = sample * components;
             for k in 0..components {
-                rhs_scores[row_offset + k] = scores[(sample, k)];
+                row_scores[row_offset + k] = scores[(sample, k)];
             }
         }
-        let mut solved_scores = vec![0.0f64; n_samples * components];
         let mut solved_alignment = if alignment_out.is_some() {
             Some(vec![0.0f64; n_samples * components])
         } else {
@@ -1190,7 +1192,7 @@ impl<'model> HwePcaProjector<'model> {
 
         let zero_action = opts.on_zero_alignment;
         if let Some(ref mut align_vec) = solved_alignment {
-            solved_scores
+            row_scores
                 .par_chunks_mut(components)
                 .zip(align_vec.par_chunks_mut(components))
                 .enumerate()
@@ -1231,7 +1233,7 @@ impl<'model> HwePcaProjector<'model> {
                                 packed_idx += 1;
                             }
                             a_mat[(k, k)] += WLS_RIDGE;
-                            b_vec[(k, 0)] = rhs_scores[sample * components + k];
+                            b_vec[(k, 0)] = score_row[k];
                         }
 
                         match Llt::new(a_mat.as_ref(), Side::Lower) {
@@ -1262,7 +1264,7 @@ impl<'model> HwePcaProjector<'model> {
                     },
                 );
         } else {
-            solved_scores
+            row_scores
                 .par_chunks_mut(components)
                 .enumerate()
                 .for_each_init(
@@ -1301,7 +1303,7 @@ impl<'model> HwePcaProjector<'model> {
                                 packed_idx += 1;
                             }
                             a_mat[(k, k)] += WLS_RIDGE;
-                            b_vec[(k, 0)] = rhs_scores[sample * components + k];
+                            b_vec[(k, 0)] = score_row[k];
                         }
 
                         match Llt::new(a_mat.as_ref(), Side::Lower) {
@@ -1327,7 +1329,7 @@ impl<'model> HwePcaProjector<'model> {
         for sample in 0..n_samples {
             let row_offset = sample * components;
             for k in 0..components {
-                scores[(sample, k)] = solved_scores[row_offset + k];
+                scores[(sample, k)] = row_scores[row_offset + k];
             }
         }
         if let (Some(ref mut align_out), Some(align_vec)) =
@@ -1488,7 +1490,6 @@ fn project_from_packed_hard_calls<P>(
     packed_info_size: usize,
     scores: &mut MatMut<'_, f64>,
     missing_info_storage: &mut [f64],
-    global_info_packed: &mut [f64],
     progress: &P,
 ) -> Result<(), HwePcaError>
 where
@@ -1568,10 +1569,12 @@ where
     let mut block_coeffs = vec![0.0f64; block_variants * 3];
     let mut block_info_contrib = vec![0.0f64; block_variants * packed_info_size];
     let mut block_variant_bytes: Vec<&[u8]> = Vec::with_capacity(block_variants);
+    let mut variant_has_missing = vec![false; block_variants];
 
     while processed < expected_variants {
         let filled = (expected_variants - processed).min(block_variants);
         block_variant_bytes.clear();
+        variant_has_missing[..filled].fill(false);
 
         let load_len = filled * components;
         let coeff_len = filled * 3;
@@ -1607,18 +1610,32 @@ where
             for k in 0..components {
                 loading_row[k] = loadings[(j_global, k)];
             }
+        }
 
-            let contrib = &mut block_info_contrib
-                [j_local * packed_info_size..(j_local + 1) * packed_info_size];
-            let mut idx = 0usize;
-            for k in 0..components {
-                let l_jk = loading_row[k];
-                for l in k..components {
-                    let value = l_jk * loading_row[l];
-                    contrib[idx] = value;
-                    global_info_packed[idx] += value;
-                    idx += 1;
+        if packed_cuda.is_some() {
+            for j_local in 0..filled {
+                populate_packed_info_contrib(
+                    &block_loading,
+                    components,
+                    packed_info_size,
+                    j_local,
+                    &mut block_info_contrib,
+                );
+            }
+        } else {
+            for j_local in 0..filled {
+                let bytes = block_variant_bytes[j_local];
+                if !packed_variant_has_missing(bytes, n_samples) {
+                    continue;
                 }
+                variant_has_missing[j_local] = true;
+                populate_packed_info_contrib(
+                    &block_loading,
+                    components,
+                    packed_info_size,
+                    j_local,
+                    &mut block_info_contrib,
+                );
             }
         }
 
@@ -1731,30 +1748,35 @@ where
         }
 
         if !used_gpu {
-            missing_info_storage
-                .par_chunks_mut(sample_chunk * packed_info_size)
-                .enumerate()
-                .for_each(|(chunk_idx, missing_chunk)| {
-                    let sample_start = chunk_idx * sample_chunk;
-                    let chunk_len = missing_chunk.len() / packed_info_size;
-                    for j_local in 0..filled {
-                        let bytes = block_variant_bytes[j_local];
-                        let contrib = &block_info_contrib
-                            [j_local * packed_info_size..(j_local + 1) * packed_info_size];
-                        for local_sample in 0..chunk_len {
-                            let sample = sample_start + local_sample;
-                            if packed_code_at(bytes, sample) != 1 {
+            if variant_has_missing[..filled].iter().any(|&flag| flag) {
+                missing_info_storage
+                    .par_chunks_mut(sample_chunk * packed_info_size)
+                    .enumerate()
+                    .for_each(|(chunk_idx, missing_chunk)| {
+                        let sample_start = chunk_idx * sample_chunk;
+                        let chunk_len = missing_chunk.len() / packed_info_size;
+                        for j_local in 0..filled {
+                            if !variant_has_missing[j_local] {
                                 continue;
                             }
-                            let miss_offset = local_sample * packed_info_size;
-                            let missing_row =
-                                &mut missing_chunk[miss_offset..miss_offset + packed_info_size];
-                            for idx in 0..packed_info_size {
-                                missing_row[idx] += contrib[idx];
+                            let bytes = block_variant_bytes[j_local];
+                            let contrib = &block_info_contrib
+                                [j_local * packed_info_size..(j_local + 1) * packed_info_size];
+                            for local_sample in 0..chunk_len {
+                                let sample = sample_start + local_sample;
+                                if packed_code_at(bytes, sample) != 1 {
+                                    continue;
+                                }
+                                let miss_offset = local_sample * packed_info_size;
+                                let missing_row =
+                                    &mut missing_chunk[miss_offset..miss_offset + packed_info_size];
+                                for idx in 0..packed_info_size {
+                                    missing_row[idx] += contrib[idx];
+                                }
                             }
                         }
-                    }
-                });
+                    });
+            }
         }
 
         if !used_gpu {
@@ -1835,6 +1857,46 @@ where
 fn packed_code_at(variant_bytes: &[u8], sample: usize) -> u8 {
     let byte = variant_bytes[sample >> 2];
     (byte >> ((sample & 3) * 2)) & 0b11
+}
+
+#[inline]
+fn packed_variant_has_missing(variant_bytes: &[u8], n_samples: usize) -> bool {
+    let mut sample = 0usize;
+    for &byte in variant_bytes {
+        if sample >= n_samples {
+            break;
+        }
+        for offset in 0..4 {
+            if sample >= n_samples {
+                return false;
+            }
+            if ((byte >> (offset * 2)) & 0b11) == 1 {
+                return true;
+            }
+            sample += 1;
+        }
+    }
+    false
+}
+
+fn populate_packed_info_contrib(
+    block_loading: &[f64],
+    components: usize,
+    packed_info_size: usize,
+    variant: usize,
+    block_info_contrib: &mut [f64],
+) {
+    let loading_row = &block_loading[variant * components..(variant + 1) * components];
+    let contrib =
+        &mut block_info_contrib[variant * packed_info_size..(variant + 1) * packed_info_size];
+    let mut idx = 0usize;
+    for k in 0..components {
+        let l_jk = loading_row[k];
+        for l in k..components {
+            contrib[idx] = l_jk * loading_row[l];
+            idx += 1;
+        }
+    }
 }
 
 #[inline]
