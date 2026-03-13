@@ -11,6 +11,7 @@ use super::variant_filter::{VariantFilter, VariantKey, VariantListError};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 /// High-level commands that can be executed within the `map` module.
 #[derive(Debug)]
@@ -334,12 +335,17 @@ fn run_project(genotype_path: &Path, model_name: Option<&str>) -> Result<(), Map
         variant_display
     );
 
+    let model_start = Instant::now();
     // Load model: either from --model flag (built-in) or from adjacent hwe.json
     let model = if let Some(name) = model_name {
         load_builtin_model(name)?
     } else {
         load_hwe_model(&dataset)?
     };
+    println!(
+        "Model load time: {:.3}s",
+        model_start.elapsed().as_secs_f64()
+    );
 
     println!(
         "Loaded model with {} principal components spanning {} variants",
@@ -355,6 +361,7 @@ fn run_project(genotype_path: &Path, model_name: Option<&str>) -> Result<(), Map
     let mut selection_plan = SelectionPlan::All;
 
     if let Some(keys) = model.variant_keys() {
+        let selection_start = Instant::now();
         match &dataset {
             GenotypeDataset::Plink(_) | GenotypeDataset::Pgen(_) => {
                 let selection = dataset.select_variants_by_keys(keys)?;
@@ -402,6 +409,10 @@ fn run_project(genotype_path: &Path, model_name: Option<&str>) -> Result<(), Map
                 selection_plan = SelectionPlan::ByKeys(Arc::new(filter));
             }
         }
+        println!(
+            "Variant selection time: {:.3}s",
+            selection_start.elapsed().as_secs_f64()
+        );
     } else if let Some(known) = dataset.variant_count_hint()
         && known > 0
         && known != model.n_variants()
@@ -417,6 +428,7 @@ fn run_project(genotype_path: &Path, model_name: Option<&str>) -> Result<(), Map
     let options = ProjectionOptions::default();
     let projector = model.projector();
     let progress = projection_progress();
+    let projection_start = Instant::now();
     let mut score_sink = create_projection_matrix_sink(
         &dataset,
         "projection_scores.bin",
@@ -434,6 +446,10 @@ fn run_project(genotype_path: &Path, model_name: Option<&str>) -> Result<(), Map
             &*progress,
         )?;
     }
+    println!(
+        "Projection compute time: {:.3}s",
+        projection_start.elapsed().as_secs_f64()
+    );
 
     if let Some(outcome) = source.take_selection_outcome() {
         if !outcome.missing_keys.is_empty() {
@@ -450,8 +466,13 @@ fn run_project(genotype_path: &Path, model_name: Option<&str>) -> Result<(), Map
         }
     }
 
+    let finalize_start = Instant::now();
     let scores = score_sink.path().to_path_buf();
     let scores_metadata = score_sink.finalize()?;
+    println!(
+        "Projection finalize time: {:.3}s",
+        finalize_start.elapsed().as_secs_f64()
+    );
     let ProjectionOutputPaths {
         scores,
         scores_metadata,
