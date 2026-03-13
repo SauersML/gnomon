@@ -21,6 +21,7 @@ use crate::shared::files::{
     BedSource, ReadMetrics, TextSource, VariantCompression, VariantFormat, VariantSource,
     list_variant_paths, open_bed_source, open_text_source, open_variant_source,
 };
+use memmap2::{MmapMut, MmapOptions};
 use noodles_bcf::Record as BcfRecord;
 use noodles_bcf::io::Reader as BcfReader;
 use noodles_bgzf::io::Reader as BgzfReader;
@@ -504,10 +505,45 @@ struct ProjectionMatrixMetadata {
 }
 
 const PROJECTION_MATRIX_MAGIC: &[u8; 8] = b"GNPRJ001";
-const PROJECTION_MATRIX_VERSION: u32 = 1;
+const PROJECTION_MATRIX_VERSION: u32 = 2;
+const PROJECTION_MATRIX_HEADER_LEN: usize = 32;
 const PROJECTION_CACHE_MAGIC: &[u8; 8] = b"GNPCCH01";
 const PROJECTION_CACHE_VERSION: u32 = 1;
 const PROJECTION_CACHE_NO_BP_WINDOW: u64 = u64::MAX;
+
+pub struct ProjectionMatrixSink {
+    path: PathBuf,
+    metadata_path: PathBuf,
+    kind: &'static str,
+    rows: usize,
+    cols: usize,
+    mmap: MmapMut,
+}
+
+impl ProjectionMatrixSink {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn as_mat_mut(&mut self) -> Result<faer::MatMut<'_, f64>, DatasetOutputError> {
+        let data = &mut self.mmap[PROJECTION_MATRIX_HEADER_LEN..];
+        let (prefix, aligned, suffix) = unsafe { data.align_to_mut::<f64>() };
+        if !prefix.is_empty() || !suffix.is_empty() || aligned.len() != self.rows * self.cols {
+            return Err(DatasetOutputError::InvalidState(
+                "projection matrix sink data region is not f64-aligned".into(),
+            ));
+        }
+        Ok(faer::MatMut::from_column_major_slice_mut(
+            aligned, self.rows, self.cols,
+        ))
+    }
+
+    pub fn finalize(self) -> Result<PathBuf, DatasetOutputError> {
+        self.mmap.flush()?;
+        write_projection_metadata(&self.metadata_path, self.rows, self.cols, self.kind)?;
+        Ok(self.metadata_path)
+    }
+}
 
 pub fn save_hwe_model(
     dataset: &GenotypeDataset,
@@ -747,6 +783,43 @@ pub fn save_projection_results(
     })
 }
 
+pub fn create_projection_matrix_sink(
+    dataset: &GenotypeDataset,
+    filename: &str,
+    rows: usize,
+    cols: usize,
+    kind: &'static str,
+) -> Result<ProjectionMatrixSink, DatasetOutputError> {
+    let path = dataset.output_path(filename);
+    prepare_output_path(&path)?;
+    let metadata_path = path.with_extension("metadata.json");
+    let matrix_bytes = rows
+        .checked_mul(cols)
+        .and_then(|len| len.checked_mul(std::mem::size_of::<f64>()))
+        .ok_or_else(|| {
+            DatasetOutputError::InvalidState("projection matrix byte count overflow".into())
+        })?;
+    let total_len = PROJECTION_MATRIX_HEADER_LEN
+        .checked_add(matrix_bytes)
+        .ok_or_else(|| {
+            DatasetOutputError::InvalidState("projection matrix file length overflow".into())
+        })?;
+
+    let file = File::create(&path)?;
+    file.set_len(total_len as u64)?;
+    let mut mmap = unsafe { MmapOptions::new().len(total_len).map_mut(&file)? };
+    write_projection_header_bytes(&mut mmap[..PROJECTION_MATRIX_HEADER_LEN], rows, cols)?;
+
+    Ok(ProjectionMatrixSink {
+        path,
+        metadata_path,
+        kind,
+        rows,
+        cols,
+        mmap,
+    })
+}
+
 fn write_projection_matrix(
     matrix_path: &Path,
     matrix: &faer::Mat<f64>,
@@ -756,31 +829,65 @@ fn write_projection_matrix(
     let metadata_path = matrix_path.with_extension("metadata.json");
 
     let mut writer = BufWriter::with_capacity(16 * 1024 * 1024, File::create(matrix_path)?);
-    writer.write_all(PROJECTION_MATRIX_MAGIC)?;
-    writer.write_all(&PROJECTION_MATRIX_VERSION.to_le_bytes())?;
-    writer.write_all(&(matrix.nrows() as u64).to_le_bytes())?;
-    writer.write_all(&(matrix.ncols() as u64).to_le_bytes())?;
+    write_projection_header(&mut writer, matrix.nrows(), matrix.ncols())?;
     for col in 0..matrix.ncols() {
         write_f64_slice(&mut writer, matrix.col_as_slice(col))?;
     }
     writer.flush()?;
 
-    prepare_output_path(&metadata_path)?;
+    write_projection_metadata(&metadata_path, matrix.nrows(), matrix.ncols(), kind)?;
+
+    Ok(metadata_path)
+}
+
+fn write_projection_header<W: Write>(
+    writer: &mut W,
+    rows: usize,
+    cols: usize,
+) -> Result<(), io::Error> {
+    writer.write_all(PROJECTION_MATRIX_MAGIC)?;
+    writer.write_all(&PROJECTION_MATRIX_VERSION.to_le_bytes())?;
+    writer.write_all(&(rows as u64).to_le_bytes())?;
+    writer.write_all(&(cols as u64).to_le_bytes())?;
+    writer.write_all(&0u32.to_le_bytes())
+}
+
+fn write_projection_header_bytes(
+    header: &mut [u8],
+    rows: usize,
+    cols: usize,
+) -> Result<(), DatasetOutputError> {
+    if header.len() != PROJECTION_MATRIX_HEADER_LEN {
+        return Err(DatasetOutputError::InvalidState(
+            "projection matrix header size mismatch".into(),
+        ));
+    }
+    let mut cursor = io::Cursor::new(header);
+    write_projection_header(&mut cursor, rows, cols)?;
+    Ok(())
+}
+
+fn write_projection_metadata(
+    metadata_path: &Path,
+    rows: usize,
+    cols: usize,
+    kind: &'static str,
+) -> Result<(), DatasetOutputError> {
+    prepare_output_path(metadata_path)?;
     let metadata = ProjectionMatrixMetadata {
         version: PROJECTION_MATRIX_VERSION,
         kind,
         layout: "column_major",
         dtype: "f64_le",
-        rows: matrix.nrows(),
-        cols: matrix.ncols(),
+        rows,
+        cols,
         row_order: "matches the input genotype dataset sample order",
     };
-    let file = File::create(&metadata_path)?;
+    let file = File::create(metadata_path)?;
     let mut metadata_writer = BufWriter::new(file);
     serde_json::to_writer_pretty(&mut metadata_writer, &metadata)?;
     metadata_writer.flush()?;
-
-    Ok(metadata_path)
+    Ok(())
 }
 
 #[cfg(target_endian = "little")]

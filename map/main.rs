@@ -1,8 +1,8 @@
 use super::fit::{FitOptions, HwePcaError, HwePcaModel, LdConfig, LdWindow};
 use super::io::{
     DatasetOutputError, GenotypeDataset, GenotypeIoError, OrderedSelectionPlan,
-    ProjectionOutputPaths, SelectionPlan, load_hwe_model, load_model_from_path, save_fit_summary,
-    save_hwe_model, save_projection_results, save_sample_manifest,
+    ProjectionOutputPaths, SelectionPlan, create_projection_matrix_sink, load_hwe_model,
+    load_model_from_path, save_fit_summary, save_hwe_model, save_sample_manifest,
 };
 use super::prefit::{self, BuiltinModelError};
 use super::progress::{fit_progress, projection_progress};
@@ -417,7 +417,23 @@ fn run_project(genotype_path: &Path, model_name: Option<&str>) -> Result<(), Map
     let options = ProjectionOptions::default();
     let projector = model.projector();
     let progress = projection_progress();
-    let result = projector.project_with_options_and_progress(&mut source, &options, &*progress)?;
+    let mut score_sink = create_projection_matrix_sink(
+        &dataset,
+        "projection_scores.bin",
+        dataset.n_samples(),
+        model.components(),
+        "scores",
+    )?;
+    {
+        let score_matrix = score_sink.as_mat_mut()?;
+        projector.project_into_with_options_and_progress(
+            &mut source,
+            score_matrix,
+            &options,
+            None,
+            &*progress,
+        )?;
+    }
 
     if let Some(outcome) = source.take_selection_outcome() {
         if !outcome.missing_keys.is_empty() {
@@ -434,12 +450,19 @@ fn run_project(genotype_path: &Path, model_name: Option<&str>) -> Result<(), Map
         }
     }
 
+    let scores = score_sink.path().to_path_buf();
+    let scores_metadata = score_sink.finalize()?;
     let ProjectionOutputPaths {
         scores,
         scores_metadata,
         alignment,
         alignment_metadata,
-    } = save_projection_results(&dataset, &result)?;
+    } = ProjectionOutputPaths {
+        scores,
+        scores_metadata,
+        alignment: None,
+        alignment_metadata: None,
+    };
 
     println!("Generated projection outputs:");
     println!("  • Scores    : {}", scores.display());
@@ -451,7 +474,7 @@ fn run_project(genotype_path: &Path, model_name: Option<&str>) -> Result<(), Map
         println!("  • Alignment metadata : {}", path.display());
     }
 
-    println!("Projection complete for {} samples", result.scores.nrows());
+    println!("Projection complete for {} samples", dataset.n_samples());
 
     Ok(())
 }
