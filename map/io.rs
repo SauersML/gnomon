@@ -508,7 +508,7 @@ const PROJECTION_MATRIX_MAGIC: &[u8; 8] = b"GNPRJ001";
 const PROJECTION_MATRIX_VERSION: u32 = 2;
 const PROJECTION_MATRIX_HEADER_LEN: usize = 32;
 const PROJECTION_CACHE_MAGIC: &[u8; 8] = b"GNPCCH01";
-const PROJECTION_CACHE_VERSION: u32 = 1;
+const PROJECTION_CACHE_VERSION: u32 = 2;
 const PROJECTION_CACHE_NO_BP_WINDOW: u64 = u64::MAX;
 
 pub struct ProjectionMatrixSink {
@@ -657,6 +657,8 @@ fn write_projection_cache(
         write_f64_slice(&mut writer, contiguous.as_slice())?;
     }
     write_f64_slice(&mut writer, model.component_weighted_norms_sq())?;
+    write_f64_slice(&mut writer, model.projection_packed_score_vectors())?;
+    write_f64_slice(&mut writer, model.projection_global_info_packed())?;
     if let Some(keys) = variant_keys {
         for key in keys {
             write_variant_key(&mut writer, key)?;
@@ -706,8 +708,19 @@ fn read_projection_cache(cache_path: &Path) -> Result<HwePcaModel, DatasetOutput
     let loadings_len = n_variants.checked_mul(components).ok_or_else(|| {
         DatasetOutputError::InvalidState("projection cache loadings length overflow".into())
     })?;
+    let score_vectors_len = loadings_len.checked_mul(3).ok_or_else(|| {
+        DatasetOutputError::InvalidState("projection cache score vector length overflow".into())
+    })?;
+    let packed_info_size = components
+        .checked_mul(components.saturating_add(1))
+        .map(|value| value / 2)
+        .ok_or_else(|| {
+            DatasetOutputError::InvalidState("projection cache packed info length overflow".into())
+        })?;
     let loadings_col_major = read_f64_vec(&mut reader, loadings_len)?;
     let component_weighted_norms_sq = read_f64_vec(&mut reader, components)?;
+    let projection_packed_score_vectors = read_f64_vec(&mut reader, score_vectors_len)?;
+    let projection_global_info_packed = read_f64_vec(&mut reader, packed_info_size)?;
     let variant_keys = if variant_key_count == 0 {
         None
     } else {
@@ -741,6 +754,8 @@ fn read_projection_cache(cache_path: &Path) -> Result<HwePcaModel, DatasetOutput
         loadings_col_major,
         components,
         component_weighted_norms_sq,
+        projection_packed_score_vectors,
+        projection_global_info_packed,
         variant_keys,
         ld,
         genome_build,
@@ -4456,5 +4471,36 @@ mod tests {
             .map(|chunk| f64::from_le_bytes(chunk.try_into().unwrap()))
             .collect();
         assert_eq!(values, vec![1.25, 2.5, 0.0, 0.0, -3.0, 0.0]);
+    }
+
+    #[test]
+    fn projection_cache_round_trip_preserves_precomputed_projection_artifacts() {
+        use crate::map::fit::{DenseBlockSource, HwePcaModel};
+        use std::io::BufWriter;
+
+        let dir = tempdir().unwrap();
+        let model_path = dir.path().join("hwe.json");
+        let data = vec![
+            0.0, 1.0, 2.0, //
+            1.0, 2.0, 0.0, //
+            2.0, 1.0, 0.0, //
+            1.0, 0.0, 2.0,
+        ];
+        let mut source = DenseBlockSource::new(&data, 3, 4).expect("dense source");
+        let model = HwePcaModel::fit_k(&mut source, 2).expect("fit model");
+
+        let mut writer = BufWriter::new(File::create(&model_path).expect("create model path"));
+        serde_json::to_writer(&mut writer, &model).expect("write json");
+        writer.flush().expect("flush json");
+
+        let reloaded = load_model_from_path(&model_path).expect("reload model");
+        assert_eq!(
+            reloaded.projection_packed_score_vectors(),
+            model.projection_packed_score_vectors()
+        );
+        assert_eq!(
+            reloaded.projection_global_info_packed(),
+            model.projection_global_info_packed()
+        );
     }
 }

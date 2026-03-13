@@ -20,6 +20,7 @@ use rayon::prelude::*;
 use std::error::Error;
 use std::mem::size_of;
 use std::path::Path;
+use std::simd::Simd;
 use std::sync::OnceLock;
 
 pub struct HwePcaProjector<'model> {
@@ -886,11 +887,12 @@ impl<'model> HwePcaProjector<'model> {
             .map_err(|e| HwePcaError::Source(Box::new(e)))?;
 
         let packed_info_size = packed_tri_size(components);
-        let mut global_info_packed = vec![0.0f64; packed_info_size];
         let scaler = self.model.scaler();
         let loadings = self.model.variant_loadings();
         let ld_weights = self.model.ld().map(|ld| ld.weights.as_slice());
         let normalization = self.model.component_weighted_norms_sq();
+        let projection_score_vectors = self.model.projection_packed_score_vectors();
+        let projection_global_info_packed = self.model.projection_global_info_packed();
         let par = faer::get_global_parallelism();
 
         progress.on_stage_start(ProjectionProgressStage::Projection, variant_hint);
@@ -906,11 +908,10 @@ impl<'model> HwePcaProjector<'model> {
                 n_samples,
                 expected_variants,
                 components,
+                projection_score_vectors,
                 scaler,
                 loadings,
                 ld_weights,
-                packed_info_size,
-                &mut global_info_packed,
                 &mut scores,
                 &mut missing_variants,
                 progress,
@@ -921,7 +922,7 @@ impl<'model> HwePcaProjector<'model> {
                     scores,
                     alignment_out,
                     &missing_info_storage,
-                    &global_info_packed,
+                    projection_global_info_packed,
                     normalization,
                     components,
                     packed_info_size,
@@ -931,7 +932,7 @@ impl<'model> HwePcaProjector<'model> {
                     scores,
                     alignment_out,
                     &missing_variants,
-                    &global_info_packed,
+                    projection_global_info_packed,
                     normalization,
                     loadings,
                     opts.on_zero_alignment,
@@ -942,6 +943,7 @@ impl<'model> HwePcaProjector<'model> {
             eprintln!(
                 "> Projection backend path: dense/streaming input (no packed hard-call source)"
             );
+            let mut global_info_packed = vec![0.0f64; packed_info_size];
             let mut missing_info_storage = vec![
                 0.0f64;
                 n_samples.checked_mul(packed_info_size).ok_or_else(
@@ -1644,11 +1646,10 @@ fn project_from_packed_hard_calls<P>(
     n_samples: usize,
     expected_variants: usize,
     components: usize,
+    packed_score_vectors: &[f64],
     scaler: &HweScaler,
     loadings: faer::MatRef<'_, f64>,
     ld_weights: Option<&[f64]>,
-    packed_info_size: usize,
-    global_info_packed: &mut [f64],
     scores: &mut MatMut<'_, f64>,
     missing_variants: &mut [Vec<u32>],
     progress: &P,
@@ -1666,6 +1667,15 @@ where
             "Projection variant dimension exceeds packed missingness index capacity",
         ));
     }
+    if packed_score_vectors.len()
+        < expected_variants
+            .saturating_mul(components)
+            .saturating_mul(3)
+    {
+        return Err(HwePcaError::InvalidInput(
+            "Projection model cache does not match fitted model dimensions",
+        ));
+    }
 
     let freqs = scaler.allele_frequencies();
     let scales = scaler.variant_scales();
@@ -1675,6 +1685,7 @@ where
         ));
     }
 
+    let packed_info_size = packed_tri_size(components);
     let weights_slice = ld_weights.unwrap_or(&[]);
     let block_variants = packed_projection_variant_block(components, n_samples, expected_variants);
     let sample_chunk = packed_projection_sample_chunk(n_samples);
@@ -1736,10 +1747,23 @@ where
     }
 
     let mut processed = 0usize;
-    let mut block_loading = vec![0.0f64; block_variants * components];
-    let mut block_coeffs = vec![0.0f64; block_variants * 3];
-    let mut block_info_contrib = vec![0.0f64; block_variants * packed_info_size];
+    let mut block_loading = if packed_cuda.is_some() {
+        vec![0.0f64; block_variants * components]
+    } else {
+        Vec::new()
+    };
+    let mut block_coeffs = if packed_cuda.is_some() {
+        vec![0.0f64; block_variants * 3]
+    } else {
+        Vec::new()
+    };
+    let mut block_info_contrib = if dense_missing_info_storage.is_some() {
+        vec![0.0f64; block_variants * packed_info_size]
+    } else {
+        Vec::new()
+    };
     let mut block_variant_bytes: Vec<&[u8]> = Vec::with_capacity(block_variants);
+    let mut block_swapped = vec![false; block_variants];
 
     while processed < expected_variants {
         let filled = (expected_variants - processed).min(block_variants);
@@ -1748,9 +1772,30 @@ where
         let coeff_len = filled * 3;
         let contrib_len = filled * packed_info_size;
         let packed_len = filled * packed_bytes_per_variant(n_samples);
-        block_loading[..load_len].fill(0.0);
-        block_coeffs[..coeff_len].fill(0.0);
-        block_info_contrib[..contrib_len].fill(0.0);
+        let score_len = filled * components * 3;
+        let block_score_vectors = &packed_score_vectors
+            [processed * components * 3..processed * components * 3 + score_len];
+        let needs_gpu_block = packed_cuda.is_some();
+        let needs_dense_missing_info = dense_missing_info_storage.is_some();
+        if needs_gpu_block {
+            if block_loading.len() < load_len {
+                block_loading.resize(load_len, 0.0);
+            } else {
+                block_loading[..load_len].fill(0.0);
+            }
+            if block_coeffs.len() < coeff_len {
+                block_coeffs.resize(coeff_len, 0.0);
+            } else {
+                block_coeffs[..coeff_len].fill(0.0);
+            }
+        }
+        if needs_dense_missing_info {
+            if block_info_contrib.len() < contrib_len {
+                block_info_contrib.resize(contrib_len, 0.0);
+            } else {
+                block_info_contrib[..contrib_len].fill(0.0);
+            }
+        }
 
         for j_local in 0..filled {
             let j_global = processed + j_local;
@@ -1758,46 +1803,42 @@ where
                 "VariantBlockSource terminated early during projection",
             ))?;
             block_variant_bytes.push(bytes);
+            let swapped = packed.match_kind(j_global) == MatchKind::Swap;
+            block_swapped[j_local] = swapped;
 
-            let mean = 2.0 * freqs[j_global];
-            let denom = scales[j_global];
-            let inv = if denom > 0.0 { denom.recip() } else { 0.0 };
-            let w = if j_global < weights_slice.len() {
-                weights_slice[j_global]
-            } else {
-                1.0
-            };
-            let coeff0 = (0.0 - mean) * inv * w;
-            let coeff1 = (1.0 - mean) * inv * w;
-            let coeff2 = (2.0 - mean) * inv * w;
-            if packed.match_kind(j_global) == MatchKind::Swap {
-                block_coeffs[j_local * 3] = coeff2;
-                block_coeffs[j_local * 3 + 1] = coeff1;
-                block_coeffs[j_local * 3 + 2] = coeff0;
-            } else {
-                block_coeffs[j_local * 3] = coeff0;
-                block_coeffs[j_local * 3 + 1] = coeff1;
-                block_coeffs[j_local * 3 + 2] = coeff2;
+            if needs_gpu_block {
+                let mean = 2.0 * freqs[j_global];
+                let denom = scales[j_global];
+                let inv = if denom > 0.0 { denom.recip() } else { 0.0 };
+                let weight = weights_slice.get(j_global).copied().unwrap_or(1.0);
+                let coeff0 = (0.0 - mean) * inv * weight;
+                let coeff1 = (1.0 - mean) * inv * weight;
+                let coeff2 = (2.0 - mean) * inv * weight;
+                if swapped {
+                    block_coeffs[j_local * 3] = coeff2;
+                    block_coeffs[j_local * 3 + 1] = coeff1;
+                    block_coeffs[j_local * 3 + 2] = coeff0;
+                } else {
+                    block_coeffs[j_local * 3] = coeff0;
+                    block_coeffs[j_local * 3 + 1] = coeff1;
+                    block_coeffs[j_local * 3 + 2] = coeff2;
+                }
+
+                let loading_row =
+                    &mut block_loading[j_local * components..(j_local + 1) * components];
+                for k in 0..components {
+                    loading_row[k] = loadings[(j_global, k)];
+                }
             }
 
-            let loading_row = &mut block_loading[j_local * components..(j_local + 1) * components];
-            for k in 0..components {
-                loading_row[k] = loadings[(j_global, k)];
-            }
-        }
-
-        for j_local in 0..filled {
-            populate_packed_info_contrib(
-                &block_loading,
-                components,
-                packed_info_size,
-                j_local,
-                &mut block_info_contrib,
-            );
-            let contrib =
-                &block_info_contrib[j_local * packed_info_size..(j_local + 1) * packed_info_size];
-            for idx in 0..packed_info_size {
-                global_info_packed[idx] += contrib[idx];
+            if needs_dense_missing_info {
+                populate_packed_info_contrib_from_model_row(
+                    loadings,
+                    components,
+                    j_global,
+                    &mut block_info_contrib
+                        [j_local * packed_info_size..(j_local + 1) * packed_info_size],
+                );
             }
         }
 
@@ -1942,10 +1983,10 @@ where
 
         if !used_gpu {
             if let Some(missing_info_storage) = dense_missing_info_storage.as_mut() {
-                accumulate_packed_cpu_block_row_major(
+                accumulate_packed_cpu_block_row_major_dense_missing(
                     &block_variant_bytes,
-                    &block_loading[..load_len],
-                    &block_coeffs[..coeff_len],
+                    block_score_vectors,
+                    &block_swapped[..filled],
                     &block_info_contrib[..contrib_len],
                     sample_chunk,
                     components,
@@ -1956,8 +1997,8 @@ where
             } else {
                 accumulate_packed_cpu_block_row_major_sparse_missing(
                     &block_variant_bytes,
-                    &block_loading[..load_len],
-                    &block_coeffs[..coeff_len],
+                    block_score_vectors,
+                    &block_swapped[..filled],
                     processed,
                     sample_chunk,
                     components,
@@ -2004,10 +2045,24 @@ where
     Ok(dense_missing_info_storage)
 }
 
-fn accumulate_packed_cpu_block_row_major(
+#[inline(always)]
+fn add_score_vector(dst: &mut [f64], src: &[f64]) {
+    debug_assert_eq!(dst.len(), src.len());
+    let (dst_chunks, dst_remainder) = dst.as_chunks_mut::<4>();
+    let (src_chunks, src_remainder) = src.as_chunks::<4>();
+    for (dst_chunk, src_chunk) in dst_chunks.iter_mut().zip(src_chunks.iter()) {
+        let sum = Simd::<f64, 4>::from_array(*dst_chunk) + Simd::<f64, 4>::from_array(*src_chunk);
+        *dst_chunk = sum.to_array();
+    }
+    for (dst, src) in dst_remainder.iter_mut().zip(src_remainder.iter()) {
+        *dst += *src;
+    }
+}
+
+fn accumulate_packed_cpu_block_row_major_dense_missing(
     block_variant_bytes: &[&[u8]],
-    block_loading: &[f64],
-    block_coeffs: &[f64],
+    block_score_vectors: &[f64],
+    block_swapped: &[bool],
     block_info_contrib: &[f64],
     sample_chunk: usize,
     components: usize,
@@ -2031,8 +2086,22 @@ fn accumulate_packed_cpu_block_row_major(
             for (variant, variant_bytes) in block_variant_bytes.iter().enumerate() {
                 debug_assert_eq!(variant_bytes.len(), packed_bytes_per_variant(samples));
                 let bytes = &variant_bytes[byte_start..byte_start + byte_len];
-                let coeffs = &block_coeffs[variant * 3..variant * 3 + 3];
-                let loading = &block_loading[variant * components..(variant + 1) * components];
+                let score_offset = variant * components * 3;
+                let score_vectors =
+                    &block_score_vectors[score_offset..score_offset + components * 3];
+                let (score0, score1, score2) = if block_swapped[variant] {
+                    (
+                        &score_vectors[components * 2..components * 3],
+                        &score_vectors[components..components * 2],
+                        &score_vectors[..components],
+                    )
+                } else {
+                    (
+                        &score_vectors[..components],
+                        &score_vectors[components..components * 2],
+                        &score_vectors[components * 2..components * 3],
+                    )
+                };
                 let contrib = &block_info_contrib
                     [variant * packed_info_size..(variant + 1) * packed_info_size];
 
@@ -2053,16 +2122,14 @@ fn accumulate_packed_cpu_block_row_major(
                             continue;
                         }
 
-                        let coeff = match code {
-                            0 => coeffs[0],
-                            2 => coeffs[1],
-                            3 => coeffs[2],
+                        let score_vector = match code {
+                            0 => score0,
+                            2 => score1,
+                            3 => score2,
                             _ => continue,
                         };
                         let dst = &mut score_chunk[score_offset..score_offset + components];
-                        for k in 0..components {
-                            dst[k] += coeff * loading[k];
-                        }
+                        add_score_vector(dst, score_vector);
                     }
                 }
             }
@@ -2071,8 +2138,8 @@ fn accumulate_packed_cpu_block_row_major(
 
 fn accumulate_packed_cpu_block_row_major_sparse_missing(
     block_variant_bytes: &[&[u8]],
-    block_loading: &[f64],
-    block_coeffs: &[f64],
+    block_score_vectors: &[f64],
+    block_swapped: &[bool],
     variant_offset: usize,
     sample_chunk: usize,
     components: usize,
@@ -2094,8 +2161,22 @@ fn accumulate_packed_cpu_block_row_major_sparse_missing(
             for (variant, variant_bytes) in block_variant_bytes.iter().enumerate() {
                 debug_assert_eq!(variant_bytes.len(), packed_bytes_per_variant(samples));
                 let bytes = &variant_bytes[byte_start..byte_start + byte_len];
-                let coeffs = &block_coeffs[variant * 3..variant * 3 + 3];
-                let loading = &block_loading[variant * components..(variant + 1) * components];
+                let score_offset = variant * components * 3;
+                let score_vectors =
+                    &block_score_vectors[score_offset..score_offset + components * 3];
+                let (score0, score1, score2) = if block_swapped[variant] {
+                    (
+                        &score_vectors[components * 2..components * 3],
+                        &score_vectors[components..components * 2],
+                        &score_vectors[..components],
+                    )
+                } else {
+                    (
+                        &score_vectors[..components],
+                        &score_vectors[components..components * 2],
+                        &score_vectors[components * 2..components * 3],
+                    )
+                };
                 let global_variant = (variant_offset + variant) as u32;
 
                 for (byte_idx, &byte) in bytes.iter().enumerate() {
@@ -2110,16 +2191,14 @@ fn accumulate_packed_cpu_block_row_major_sparse_missing(
                             continue;
                         }
 
-                        let coeff = match code {
-                            0 => coeffs[0],
-                            2 => coeffs[1],
-                            3 => coeffs[2],
+                        let score_vector = match code {
+                            0 => score0,
+                            2 => score1,
+                            3 => score2,
                             _ => continue,
                         };
                         let dst = &mut score_chunk[score_offset..score_offset + components];
-                        for k in 0..components {
-                            dst[k] += coeff * loading[k];
-                        }
+                        add_score_vector(dst, score_vector);
                     }
                 }
             }
@@ -2257,21 +2336,17 @@ fn projection_solve_sample_chunk(n_samples: usize) -> usize {
     }
 }
 
-fn populate_packed_info_contrib(
-    block_loading: &[f64],
+fn populate_packed_info_contrib_from_model_row(
+    loadings: faer::MatRef<'_, f64>,
     components: usize,
-    packed_info_size: usize,
     variant: usize,
-    block_info_contrib: &mut [f64],
+    contrib: &mut [f64],
 ) {
-    let loading_row = &block_loading[variant * components..(variant + 1) * components];
-    let contrib =
-        &mut block_info_contrib[variant * packed_info_size..(variant + 1) * packed_info_size];
     let mut idx = 0usize;
     for k in 0..components {
-        let l_jk = loading_row[k];
+        let l_jk = loadings[(variant, k)];
         for l in k..components {
-            contrib[idx] = l_jk * loading_row[l];
+            contrib[idx] = l_jk * loadings[(variant, l)];
             idx += 1;
         }
     }

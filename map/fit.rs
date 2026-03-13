@@ -1931,6 +1931,65 @@ unsafe fn sum_and_count_finite_avx(values: &[f64]) -> (f64, usize) {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct ProjectionModelCache {
+    packed_score_vectors: Vec<f64>,
+    global_info_packed: Vec<f64>,
+}
+
+fn projection_packed_tri_size(components: usize) -> usize {
+    components.saturating_mul(components.saturating_add(1)) / 2
+}
+
+fn build_projection_model_cache(
+    scaler: &HweScaler,
+    loadings: MatRef<'_, f64>,
+    ld: Option<&LdWeights>,
+) -> ProjectionModelCache {
+    let n_variants = loadings.nrows();
+    let components = loadings.ncols();
+    let packed_info_size = projection_packed_tri_size(components);
+    let mut packed_score_vectors = vec![0.0; n_variants * components * 3];
+    let mut global_info_packed = vec![0.0; packed_info_size];
+    let freqs = scaler.allele_frequencies();
+    let scales = scaler.variant_scales();
+    let weights = ld.map(|weights| weights.weights.as_slice()).unwrap_or(&[]);
+
+    for variant in 0..n_variants {
+        let mean = 2.0 * freqs[variant];
+        let denom = scales[variant];
+        let inv = if denom > 0.0 { denom.recip() } else { 0.0 };
+        let weight = weights.get(variant).copied().unwrap_or(1.0);
+        let coeffs = [
+            (0.0 - mean) * inv * weight,
+            (1.0 - mean) * inv * weight,
+            (2.0 - mean) * inv * weight,
+        ];
+        let score_offset = variant * components * 3;
+
+        for component in 0..components {
+            let loading = loadings[(variant, component)];
+            packed_score_vectors[score_offset + component] = coeffs[0] * loading;
+            packed_score_vectors[score_offset + components + component] = coeffs[1] * loading;
+            packed_score_vectors[score_offset + components * 2 + component] = coeffs[2] * loading;
+        }
+
+        let mut packed_idx = 0usize;
+        for row in 0..components {
+            let row_loading = loadings[(variant, row)];
+            for col in row..components {
+                global_info_packed[packed_idx] += row_loading * loadings[(variant, col)];
+                packed_idx += 1;
+            }
+        }
+    }
+
+    ProjectionModelCache {
+        packed_score_vectors,
+        global_info_packed,
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct HwePcaModel {
     n_samples: usize,
     n_variants: usize,
@@ -1944,6 +2003,7 @@ pub struct HwePcaModel {
     variant_keys: Option<Vec<VariantKey>>,
     ld: Option<LdWeights>,
     genome_build: Option<String>,
+    projection_cache: Arc<ProjectionModelCache>,
 }
 
 impl HwePcaModel {
@@ -2199,6 +2259,11 @@ impl HwePcaModel {
             &mut singular_values,
             sample_scores.as_mut(),
         );
+        let projection_cache = Arc::new(build_projection_model_cache(
+            &scaler,
+            loadings.as_ref(),
+            ld_weights.as_ref(),
+        ));
 
         Ok(Self {
             n_samples,
@@ -2213,6 +2278,7 @@ impl HwePcaModel {
             variant_keys: None,
             ld: ld_weights,
             genome_build: None,
+            projection_cache,
         })
     }
 
@@ -2307,6 +2373,14 @@ impl HwePcaModel {
         self.genome_build = build;
     }
 
+    pub(crate) fn projection_packed_score_vectors(&self) -> &[f64] {
+        &self.projection_cache.packed_score_vectors
+    }
+
+    pub(crate) fn projection_global_info_packed(&self) -> &[f64] {
+        &self.projection_cache.global_info_packed
+    }
+
     pub(crate) fn from_projection_binary_parts(
         n_samples: usize,
         n_variants: usize,
@@ -2315,6 +2389,8 @@ impl HwePcaModel {
         loadings_col_major: Vec<f64>,
         components: usize,
         component_weighted_norms_sq: Vec<f64>,
+        projection_packed_score_vectors: Vec<f64>,
+        projection_global_info_packed: Vec<f64>,
         variant_keys: Option<Vec<VariantKey>>,
         ld: Option<LdWeights>,
         genome_build: Option<String>,
@@ -2334,6 +2410,21 @@ impl HwePcaModel {
                 ld.as_ref().map(|weights| weights.weights.as_slice()),
             )
         };
+        let projection_cache = if projection_packed_score_vectors.len()
+            == n_variants * components * 3
+            && projection_global_info_packed.len() == projection_packed_tri_size(components)
+        {
+            Arc::new(ProjectionModelCache {
+                packed_score_vectors: projection_packed_score_vectors,
+                global_info_packed: projection_global_info_packed,
+            })
+        } else {
+            Arc::new(build_projection_model_cache(
+                &scaler,
+                loadings.as_ref(),
+                ld.as_ref(),
+            ))
+        };
 
         Ok(Self {
             n_samples,
@@ -2348,6 +2439,7 @@ impl HwePcaModel {
             variant_keys,
             ld,
             genome_build,
+            projection_cache,
         })
     }
 }
@@ -4930,6 +5022,11 @@ impl<'de> Deserialize<'de> for HwePcaModel {
                     ld.as_ref().map(|ld| ld.weights.as_slice()),
                 )
             };
+        let projection_cache = Arc::new(build_projection_model_cache(
+            &raw.scaler,
+            loadings.as_ref(),
+            ld.as_ref(),
+        ));
 
         Ok(HwePcaModel {
             n_samples: raw.n_samples,
@@ -4944,6 +5041,7 @@ impl<'de> Deserialize<'de> for HwePcaModel {
             variant_keys: raw.variant_keys,
             ld,
             genome_build: raw.genome_build,
+            projection_cache,
         })
     }
 }
