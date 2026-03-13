@@ -59,6 +59,7 @@ pub struct ProjectionResult {
 
 const DEFAULT_PROJECT_CUDA_MIN_WORK: usize = 50_000_000;
 const WLS_RIDGE: f64 = 1.0e-5;
+const SPARSE_MISSING_WOODBURY_MAX: usize = 1;
 const PROJECT_CUDA_UNPACK_KERNELS: &str = r#"
 extern "C" __global__ void unpack_weighted_plink(
     const unsigned char* packed,
@@ -1421,9 +1422,13 @@ fn solve_projection_with_sparse_missing_variants(
                 vec![0.0f64; components * components],
                 vec![0.0f64; components],
                 vec![0.0f64; components],
+                vec![0.0f64; SPARSE_MISSING_WOODBURY_MAX * components],
+                vec![0.0f64; SPARSE_MISSING_WOODBURY_MAX],
+                vec![0.0f64; SPARSE_MISSING_WOODBURY_MAX * SPARSE_MISSING_WOODBURY_MAX],
             )
         },
-        |(info_matrix, rhs, diag_mass), chunk_idx| {
+        |(info_matrix, rhs, diag_mass, low_missing_z, low_missing_rhs, low_missing_gram),
+         chunk_idx| {
             let scores_ptr = scores_ptr as *mut f64;
             let alignment_ptr = alignment_ptr.map(|ptr| ptr as *mut f64);
             let sample_start = chunk_idx * solve_chunk;
@@ -1442,8 +1447,6 @@ fn solve_projection_with_sparse_missing_variants(
                         components,
                     )
                 } else {
-                    info_matrix[..components * components]
-                        .copy_from_slice(&solve_base.base_info[..components * components]);
                     diag_mass[..components].copy_from_slice(&solve_base.global_diag[..components]);
                     for &variant in missing {
                         let variant = variant as usize;
@@ -1468,7 +1471,54 @@ fn solve_projection_with_sparse_missing_variants(
                         );
                         continue;
                     }
-                    solve_spd_lower_in_place(info_matrix, &mut rhs[..components], components)
+                    if solve_base.base_factor_ready && missing.len() <= SPARSE_MISSING_WOODBURY_MAX
+                    {
+                        let woodbury_solved = solve_projection_low_missing_with_woodbury(
+                            &solve_base.base_factor,
+                            &mut rhs[..components],
+                            missing,
+                            loadings,
+                            &mut low_missing_z[..missing.len() * components],
+                            &mut low_missing_rhs[..missing.len()],
+                            &mut low_missing_gram[..missing.len() * missing.len()],
+                            components,
+                        );
+                        if woodbury_solved {
+                            true
+                        } else {
+                            info_matrix[..components * components]
+                                .copy_from_slice(&solve_base.base_info[..components * components]);
+                            for &variant in missing {
+                                let variant = variant as usize;
+                                for row in 0..components {
+                                    let row_loading = loadings[(variant, row)];
+                                    for col in row..components {
+                                        info_matrix[col * components + row] -=
+                                            row_loading * loadings[(variant, col)];
+                                    }
+                                }
+                            }
+                            solve_spd_lower_in_place(
+                                info_matrix,
+                                &mut rhs[..components],
+                                components,
+                            )
+                        }
+                    } else {
+                        info_matrix[..components * components]
+                            .copy_from_slice(&solve_base.base_info[..components * components]);
+                        for &variant in missing {
+                            let variant = variant as usize;
+                            for row in 0..components {
+                                let row_loading = loadings[(variant, row)];
+                                for col in row..components {
+                                    info_matrix[col * components + row] -=
+                                        row_loading * loadings[(variant, col)];
+                                }
+                            }
+                        }
+                        solve_spd_lower_in_place(info_matrix, &mut rhs[..components], components)
+                    }
                 };
 
                 if solved {
@@ -1511,6 +1561,68 @@ fn solve_projection_with_sparse_missing_variants(
             }
         },
     );
+}
+
+fn solve_projection_low_missing_with_woodbury(
+    base_factor: &[f64],
+    rhs: &mut [f64],
+    missing: &[u32],
+    loadings: faer::MatRef<'_, f64>,
+    z_workspace: &mut [f64],
+    rhs_workspace: &mut [f64],
+    gram_workspace: &mut [f64],
+    components: usize,
+) -> bool {
+    let missing_len = missing.len();
+    debug_assert_eq!(z_workspace.len(), missing_len * components);
+    debug_assert_eq!(rhs_workspace.len(), missing_len);
+    debug_assert_eq!(gram_workspace.len(), missing_len * missing_len);
+
+    if !solve_cholesky_factor_in_place(base_factor, rhs, components) {
+        return false;
+    }
+
+    for (idx, &variant) in missing.iter().enumerate() {
+        let variant = variant as usize;
+        let z = &mut z_workspace[idx * components..(idx + 1) * components];
+        let mut rhs_dot = 0.0f64;
+        for k in 0..components {
+            let loading = loadings[(variant, k)];
+            z[k] = loading;
+            rhs_dot += loading * rhs[k];
+        }
+        rhs_workspace[idx] = rhs_dot;
+        if !solve_cholesky_factor_in_place(base_factor, z, components) {
+            return false;
+        }
+    }
+
+    for row in 0..missing_len {
+        let row_variant = missing[row] as usize;
+        let row_loading_start = row * missing_len;
+        for col in 0..=row {
+            let z = &z_workspace[col * components..(col + 1) * components];
+            let mut dot = 0.0f64;
+            for k in 0..components {
+                dot += loadings[(row_variant, k)] * z[k];
+            }
+            gram_workspace[row_loading_start + col] = if row == col { 1.0 - dot } else { -dot };
+        }
+    }
+
+    if !solve_spd_lower_in_place(gram_workspace, rhs_workspace, missing_len) {
+        return false;
+    }
+
+    for idx in 0..missing_len {
+        let coeff = rhs_workspace[idx];
+        let z = &z_workspace[idx * components..(idx + 1) * components];
+        for k in 0..components {
+            rhs[k] += coeff * z[k];
+        }
+    }
+
+    true
 }
 
 fn standardize_projection_block(
@@ -2993,6 +3105,10 @@ mod tests {
             *value = f64::NAN;
         }
     }
+
+    fn set_sample_variant_to_nan(data: &mut [f64], sample_idx: usize, variant_idx: usize) {
+        data[variant_idx * N_SAMPLES + sample_idx] = f64::NAN;
+    }
     #[test]
     fn renormalization_matches_baseline_without_missingness() {
         let model = fit_example_model();
@@ -3380,6 +3496,38 @@ mod tests {
         let model = fit_example_model();
         let mut data = sample_data();
         set_variant_to_nan(&mut data, 1);
+
+        let options = ProjectionOptions {
+            missing_axis_renormalization: true,
+            return_alignment: true,
+            on_zero_alignment: ZeroAlignmentAction::Zero,
+        };
+
+        let mut dense_source = DenseBlockSource::new(&data, N_SAMPLES, N_VARIANTS).expect("dense");
+        let dense = model
+            .projector()
+            .project_with_options(&mut dense_source, &options)
+            .expect("dense projection");
+
+        let mut packed_source = PackedDenseBlockSource::new(data, N_SAMPLES, N_VARIANTS);
+        let packed = model
+            .projector()
+            .project_with_options(&mut packed_source, &options)
+            .expect("packed projection");
+
+        assert_mats_close(&dense.scores, &packed.scores, 1e-10);
+        let dense_alignment = dense.alignment.expect("dense alignment");
+        let packed_alignment = packed.alignment.expect("packed alignment");
+        assert_mats_close(&dense_alignment, &packed_alignment, 1e-10);
+    }
+
+    #[test]
+    fn packed_hardcall_path_matches_dense_projection_with_multiple_missing_variants() {
+        let model = fit_example_model();
+        let mut data = sample_data();
+        set_variant_to_nan(&mut data, 0);
+        set_variant_to_nan(&mut data, 2);
+        set_sample_variant_to_nan(&mut data, 1, 1);
 
         let options = ProjectionOptions {
             missing_axis_renormalization: true,
