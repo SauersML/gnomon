@@ -441,18 +441,18 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
                   simp
                 norm_num [ h_diff ]
               simpa only [ h_jacobi ] using h_deriv_sum
-            simp +decide only [h_jacobi, Finset.mul_sum _ _ _]
+            simp +decide only [h_jacobi]
             simp +decide [ Finset.sum_mul _ _ _, Matrix.updateRow_apply ]
             rw [ Finset.sum_comm ]
             refine' Finset.sum_congr rfl fun i hi => _
-            rw [ Finset.sum_comm, Finset.sum_congr rfl ] ; intros ; simp +decide [ Finset.prod_ite, Finset.filter_ne', Finset.filter_eq' ] ; ring
-            rw [ Finset.sum_eq_single ( ( ‹Equiv.Perm m› : m → m ) i ) ] <;> simp +decide [ Finset.prod_ite, Finset.filter_ne', Finset.filter_eq' ] ; ring
-            intro j hj; simp +decide [ Pi.single_apply, hj ]
-            rw [ Finset.prod_eq_zero_iff.mpr ] <;> simp +decide [ hj ]
+            rw [ Finset.sum_comm, Finset.sum_congr rfl ] ; intros ; simp +decide [ Finset.prod_ite, Finset.filter_ne, Finset.filter_eq ] ; ring_nf
+            rw [ Finset.sum_eq_single ( ( ‹Equiv.Perm m› : m → m ) i ) ] <;> simp +decide [ Finset.prod_ite, Finset.filter_ne, Finset.filter_eq ] ; ring_nf
+            intro j hj; simp +decide [ Pi.single_apply ]
+            rw [ Finset.prod_eq_zero_iff.mpr ] <;> simp +decide
             exact ⟨ ( ‹Equiv.Perm m›.symm j ), by simp +decide, by simpa [ Equiv.symm_apply_eq ] using hj ⟩
           rw [ h_jacobi, Matrix.trace ]
           rw [ deriv_pi ]
-          · simp +decide [ Matrix.mul_apply, Finset.mul_sum _ _ _ ]
+          · simp +decide
             refine' Finset.sum_congr rfl fun i _ => Finset.sum_congr rfl fun j _ => _
             rw [ deriv_pi ]
             intro i; exact (by
@@ -460,14 +460,14 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
           · exact fun i => DifferentiableAt.comp rho ( differentiableAt_pi.1 hM_diff i ) differentiableAt_id
         apply h_jacobi
         exact differentiableAt_pi.2 fun i => differentiableAt_pi.2 fun j => DifferentiableAt.add ( differentiableAt_const _ ) ( DifferentiableAt.smul ( Real.differentiableAt_exp ) ( differentiableAt_const _ ) )
-      simp_all +decide [ Matrix.inv_def, mul_assoc, mul_left_comm, mul_comm, Matrix.trace_mul_comm ( Matrix.adjugate _ ) ]
+      simp_all +decide [ Matrix.inv_def, mul_left_comm, mul_comm, Matrix.trace_mul_comm ( Matrix.adjugate _ ) ]
       rw [ show deriv ( fun rho => A + Real.exp rho • B ) rho = Real.exp rho • B from ?_ ]
-      · by_cases h : Matrix.det ( A + Real.exp rho • B ) = 0 <;> simp_all +decide [ Matrix.trace_smul, mul_assoc, mul_comm, mul_left_comm ]
+      · by_cases h : Matrix.det ( A + Real.exp rho • B ) = 0 <;> simp_all +decide [ Matrix.trace_smul, mul_comm ]
         exact False.elim <| h_inv h
       · rw [ deriv_pi ] <;> norm_num [ Real.differentiableAt_exp, mul_comm ]
         ext i; rw [ deriv_pi ] <;> norm_num [ Real.differentiableAt_exp, mul_comm ]
-    by_cases h_det : DifferentiableAt ℝ ( fun rho => Matrix.det ( A + Real.exp rho • B ) ) rho <;> simp_all +decide [ Real.exp_ne_zero, mul_assoc, mul_comm, mul_left_comm ]
-    · convert HasDerivAt.deriv ( HasDerivAt.log ( h_det.hasDerivAt ) h_inv ) using 1 ; ring!
+    by_cases h_det : DifferentiableAt ℝ ( fun rho => Matrix.det ( A + Real.exp rho • B ) ) rho <;> simp_all +decide [ mul_comm ]
+    · convert HasDerivAt.deriv ( HasDerivAt.log ( h_det.hasDerivAt ) h_inv ) using 1 ; ring_nf!
       exact eq_div_of_mul_eq ( by aesop ) ( by linear_combination' h_det_step1.symm )
     · contrapose! h_det
       simp +decide [ Matrix.det_apply' ]
@@ -493,8 +493,8 @@ noncomputable def matrixInvAlg {α : Type*} [Fintype α] [DecidableEq α] (M : M
 theorem matrixInvAlg_eq_inv {α : Type*} [Fintype α] [DecidableEq α] (M : Matrix α α ℝ) :
     matrixInvAlg M = M⁻¹ := by
   by_cases h_det : M.det = 0
-  · simp [matrixInvAlg, Matrix.inv_def, h_det]
-  · simp [matrixInvAlg, Matrix.inv_def, h_det]
+  · simp [matrixInvAlg, Matrix.inv_def]
+  · simp [matrixInvAlg, Matrix.inv_def]
 
 theorem inv_mul_self_of_det_ne_zero {α : Type*} [Fintype α] [DecidableEq α]
     (M : Matrix α α ℝ) (h_det : M.det ≠ 0) : M⁻¹ * M = 1 := by
@@ -678,7 +678,7 @@ theorem rust_delta_correctness
     -(Hessian_fn S_basis X W rho (beta_hat rho))⁻¹ *
     ((Real.exp (rho i) • S_basis i) * beta_hat rho) := by
   unfold rust_delta_fn
-  simp [matrixInvAlg_eq_inv, neg_mul, Matrix.smul_mul]
+  simp [matrixInvAlg_eq_inv, Matrix.smul_mul]
 
 /-- Structural verification: `laml_gradient_validity`
 
@@ -740,9 +740,9 @@ by
           symm
           exact h_left
         _ = H⁻¹ * (- (Real.exp (rho i) • S_basis i) * beta_hat rho) := by
-          simp [H] using h_mul
+          rw [h_implicit]
         _ = -H⁻¹ * ((Real.exp (rho i) • S_basis i) * beta_hat rho) := by
-          simp [neg_mul]
+          exact neg_mul_eq_mul_neg (H⁻¹) ((Real.exp (rho i) • S_basis i) * beta_hat rho) |>.symm
     calc
       deriv (fun r => beta_hat (Function.update rho i r)) (rho i)
           = -H⁻¹ * ((Real.exp (rho i) • S_basis i) * beta_hat rho) := h_solved

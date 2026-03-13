@@ -1757,7 +1757,7 @@ theorem F_PC_lin_subset_F_full (k : ℕ) [Fintype (Fin k)] :
     unfold T sigma
     have ha0 : a ≠ 0 := ha.ne'
     field_simp [ha0]
-    ring
+    ring_nf
 
 theorem F_rawPRS_subset_F_PC_lin_subset_F_full (k : ℕ) [Fintype (Fin k)] :
     F_rawPRS k ⊆ F_PC_lin k ∧ F_PC_lin k ⊆ F_full k := by
