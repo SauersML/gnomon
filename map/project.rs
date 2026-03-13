@@ -14,6 +14,7 @@ use cudarc::driver::{
 };
 use cudarc::nvrtc::compile_ptx;
 use faer::linalg::matmul::matmul;
+use faer::prelude::ReborrowMut;
 use faer::{Accum, Mat, MatMut, Par};
 use rayon::prelude::*;
 use std::error::Error;
@@ -1174,154 +1175,140 @@ impl<'model> HwePcaProjector<'model> {
         let diag_indices: Vec<usize> = (0..components)
             .map(|k| packed_tri_index(components, k, k))
             .collect();
-        let mut row_scores = vec![0.0f64; n_samples * components];
-        for sample in 0..n_samples {
-            let row_offset = sample * components;
-            for k in 0..components {
-                row_scores[row_offset + k] = scores[(sample, k)];
-            }
-        }
-        let mut solved_alignment = if alignment_out.is_some() {
-            Some(vec![0.0f64; n_samples * components])
-        } else {
-            None
-        };
         let base_info = build_dense_lower_info_matrix(&global_info_packed, components, WLS_RIDGE);
+        let mut base_factor = base_info.clone();
+        let base_factor_ready = factorize_spd_lower_in_place(&mut base_factor, components);
+        let global_trace: f64 = diag_indices
+            .iter()
+            .map(|&idx| global_info_packed[idx])
+            .sum();
+        let base_alignment: Vec<f64> = diag_indices
+            .iter()
+            .enumerate()
+            .map(|(k, &diag_idx)| {
+                let mass = global_info_packed[diag_idx];
+                let denom = normalization.get(k).copied().unwrap_or(0.0);
+                if mass > 0.0 && denom > 0.0 {
+                    (mass / denom).sqrt()
+                } else {
+                    0.0
+                }
+            })
+            .collect();
 
         let zero_action = opts.on_zero_alignment;
-        if let Some(ref mut align_vec) = solved_alignment {
-            row_scores
-                .par_chunks_mut(components)
-                .zip(align_vec.par_chunks_mut(components))
-                .enumerate()
-                .for_each_init(
-                    || {
-                        (
-                            vec![0.0f64; components * components],
-                            vec![0.0f64; components],
+        let scores_ptr = {
+            let scores_col_major = scores
+                .rb_mut()
+                .try_as_col_major_mut()
+                .expect("projection output matrix must be contiguous column-major");
+            scores_col_major.as_ptr_mut() as usize
+        };
+        let alignment_ptr = alignment_out.as_mut().map(|alignment| {
+            let alignment_col_major = alignment
+                .rb_mut()
+                .try_as_col_major_mut()
+                .expect("projection alignment matrix must be contiguous column-major");
+            alignment_col_major.as_ptr_mut() as usize
+        });
+        let solve_chunk = projection_solve_sample_chunk(n_samples);
+        let solve_chunks = n_samples.div_ceil(solve_chunk);
+
+        (0..solve_chunks).into_par_iter().for_each_init(
+            || {
+                (
+                    vec![0.0f64; components * components],
+                    vec![0.0f64; components],
+                )
+            },
+            |(info_matrix, rhs), chunk_idx| {
+                let scores_ptr = scores_ptr as *mut f64;
+                let alignment_ptr = alignment_ptr.map(|ptr| ptr as *mut f64);
+                let sample_start = chunk_idx * solve_chunk;
+                let sample_end = (sample_start + solve_chunk).min(n_samples);
+
+                for sample in sample_start..sample_end {
+                    let info_offset = sample * packed_info_size;
+                    let mut missing_trace = 0.0f64;
+                    for &diag_idx in &diag_indices {
+                        missing_trace += missing_info_storage[info_offset + diag_idx];
+                    }
+                    let trace = global_trace - missing_trace;
+
+                    if trace <= WLS_RIDGE * (components as f64) {
+                        write_zero_projection_sample(
+                            scores_ptr,
+                            alignment_ptr,
+                            n_samples,
+                            components,
+                            sample,
+                            zero_action,
+                        );
+                        continue;
+                    }
+
+                    for k in 0..components {
+                        rhs[k] = unsafe { *scores_ptr.add(k * n_samples + sample) };
+                    }
+
+                    let solved = if missing_trace == 0.0 && base_factor_ready {
+                        solve_cholesky_factor_in_place(
+                            &base_factor,
+                            &mut rhs[..components],
+                            components,
                         )
-                    },
-                    |(info_matrix, rhs), (sample, (score_row, align_row))| {
-                        let info_offset = sample * packed_info_size;
-                        let mut trace = 0.0f64;
-                        for &diag_idx in &diag_indices {
-                            let mass = global_info_packed[diag_idx]
-                                - missing_info_storage[info_offset + diag_idx];
-                            trace += mass;
-                        }
-
-                        if trace <= WLS_RIDGE * (components as f64) {
-                            for k in 0..components {
-                                score_row[k] = match zero_action {
-                                    ZeroAlignmentAction::Zero => 0.0,
-                                    ZeroAlignmentAction::NaN => f64::NAN,
-                                };
-                                align_row[k] = 0.0;
-                            }
-                            return;
-                        }
-
+                    } else {
                         fill_sample_info_matrix(
                             info_matrix,
                             &base_info,
                             &missing_info_storage[info_offset..info_offset + packed_info_size],
                             components,
                         );
-                        rhs[..components].copy_from_slice(score_row);
+                        solve_spd_lower_in_place(info_matrix, &mut rhs[..components], components)
+                    };
 
-                        if solve_spd_lower_in_place(info_matrix, &mut rhs[..components], components)
-                        {
-                            for (k, &diag_idx) in diag_indices.iter().enumerate() {
-                                score_row[k] = rhs[k];
-                                let mass = global_info_packed[diag_idx]
-                                    - missing_info_storage[info_offset + diag_idx];
-                                let denom = normalization.get(k).copied().unwrap_or(0.0);
-                                align_row[k] = if mass > 0.0 && denom > 0.0 {
-                                    (mass / denom).sqrt()
-                                } else {
-                                    0.0
-                                };
-                            }
-                        } else {
-                            for k in 0..components {
-                                score_row[k] = match zero_action {
-                                    ZeroAlignmentAction::Zero => 0.0,
-                                    ZeroAlignmentAction::NaN => f64::NAN,
-                                };
-                                align_row[k] = 0.0;
+                    if solved {
+                        for k in 0..components {
+                            unsafe {
+                                *scores_ptr.add(k * n_samples + sample) = rhs[k];
                             }
                         }
-                    },
-                );
-        } else {
-            row_scores
-                .par_chunks_mut(components)
-                .enumerate()
-                .for_each_init(
-                    || {
-                        (
-                            vec![0.0f64; components * components],
-                            vec![0.0f64; components],
-                        )
-                    },
-                    |(info_matrix, rhs), (sample, score_row)| {
-                        let info_offset = sample * packed_info_size;
-                        let mut trace = 0.0f64;
-                        for &diag_idx in &diag_indices {
-                            let mass = global_info_packed[diag_idx]
-                                - missing_info_storage[info_offset + diag_idx];
-                            trace += mass;
-                        }
-
-                        if trace <= WLS_RIDGE * (components as f64) {
-                            for out in score_row.iter_mut() {
-                                *out = match zero_action {
-                                    ZeroAlignmentAction::Zero => 0.0,
-                                    ZeroAlignmentAction::NaN => f64::NAN,
-                                };
+                        if let Some(alignment_ptr) = alignment_ptr {
+                            if missing_trace == 0.0 {
+                                for (k, &value) in base_alignment.iter().enumerate() {
+                                    unsafe {
+                                        *alignment_ptr.add(k * n_samples + sample) = value;
+                                    }
+                                }
+                            } else {
+                                for (k, &diag_idx) in diag_indices.iter().enumerate() {
+                                    let mass = global_info_packed[diag_idx]
+                                        - missing_info_storage[info_offset + diag_idx];
+                                    let denom = normalization.get(k).copied().unwrap_or(0.0);
+                                    let value = if mass > 0.0 && denom > 0.0 {
+                                        (mass / denom).sqrt()
+                                    } else {
+                                        0.0
+                                    };
+                                    unsafe {
+                                        *alignment_ptr.add(k * n_samples + sample) = value;
+                                    }
+                                }
                             }
-                            return;
                         }
-
-                        fill_sample_info_matrix(
-                            info_matrix,
-                            &base_info,
-                            &missing_info_storage[info_offset..info_offset + packed_info_size],
+                    } else {
+                        write_zero_projection_sample(
+                            scores_ptr,
+                            alignment_ptr,
+                            n_samples,
                             components,
+                            sample,
+                            zero_action,
                         );
-                        rhs[..components].copy_from_slice(score_row);
-
-                        if solve_spd_lower_in_place(info_matrix, &mut rhs[..components], components)
-                        {
-                            score_row[..components].copy_from_slice(&rhs[..components]);
-                        } else {
-                            for out in score_row.iter_mut() {
-                                *out = match zero_action {
-                                    ZeroAlignmentAction::Zero => 0.0,
-                                    ZeroAlignmentAction::NaN => f64::NAN,
-                                };
-                            }
-                        }
-                    },
-                );
-        }
-
-        for sample in 0..n_samples {
-            let row_offset = sample * components;
-            for k in 0..components {
-                scores[(sample, k)] = row_scores[row_offset + k];
-            }
-        }
-        if let (Some(ref mut align_out), Some(align_vec)) =
-            (alignment_out.as_mut(), solved_alignment)
-        {
-            for sample in 0..n_samples {
-                let row_offset = sample * components;
-                for k in 0..components {
-                    align_out[(sample, k)] = align_vec[row_offset + k];
+                    }
                 }
-            }
-        }
+            },
+        );
 
         Ok(())
     }
@@ -1491,7 +1478,6 @@ where
     }
 
     let weights_slice = ld_weights.unwrap_or(&[]);
-    let mut scores_row_major = vec![0.0f64; n_samples * components];
     let block_variants = packed_projection_variant_block(components, n_samples, expected_variants);
     let sample_chunk = packed_projection_sample_chunk(n_samples);
     let total_work = n_samples
@@ -1515,6 +1501,7 @@ where
             }
         },
     };
+    let mut scores_row_major = vec![0.0f64; n_samples * components];
     let mut gpu_loadings_col_major = vec![0.0f32; block_variants * components];
     let mut gpu_coeffs = vec![0.0f32; block_variants * 3];
     let mut gpu_block_contrib = vec![0.0f32; block_variants * packed_info_size];
@@ -1745,7 +1732,7 @@ where
         }
 
         if !used_gpu {
-            accumulate_packed_cpu_block(
+            accumulate_packed_cpu_block_row_major(
                 &block_variant_bytes,
                 &block_loading[..load_len],
                 &block_coeffs[..coeff_len],
@@ -1789,7 +1776,7 @@ where
     Ok(())
 }
 
-fn accumulate_packed_cpu_block(
+fn accumulate_packed_cpu_block_row_major(
     block_variant_bytes: &[&[u8]],
     block_loading: &[f64],
     block_coeffs: &[f64],
@@ -1888,7 +1875,7 @@ fn fill_sample_info_matrix(
     }
 }
 
-fn solve_spd_lower_in_place(a: &mut [f64], b: &mut [f64], n: usize) -> bool {
+fn factorize_spd_lower_in_place(a: &mut [f64], n: usize) -> bool {
     for j in 0..n {
         let diag_offset = j * n + j;
         let mut diag = a[diag_offset];
@@ -1912,12 +1899,16 @@ fn solve_spd_lower_in_place(a: &mut [f64], b: &mut [f64], n: usize) -> bool {
         }
     }
 
+    true
+}
+
+fn solve_cholesky_factor_in_place(factor: &[f64], b: &mut [f64], n: usize) -> bool {
     for i in 0..n {
         let mut value = b[i];
         for k in 0..i {
-            value -= a[i * n + k] * b[k];
+            value -= factor[i * n + k] * b[k];
         }
-        let diag = a[i * n + i];
+        let diag = factor[i * n + i];
         if !diag.is_finite() || diag == 0.0 {
             return false;
         }
@@ -1927,9 +1918,9 @@ fn solve_spd_lower_in_place(a: &mut [f64], b: &mut [f64], n: usize) -> bool {
     for i in (0..n).rev() {
         let mut value = b[i];
         for k in (i + 1)..n {
-            value -= a[k * n + i] * b[k];
+            value -= factor[k * n + i] * b[k];
         }
-        let diag = a[i * n + i];
+        let diag = factor[i * n + i];
         if !diag.is_finite() || diag == 0.0 {
             return false;
         }
@@ -1937,6 +1928,48 @@ fn solve_spd_lower_in_place(a: &mut [f64], b: &mut [f64], n: usize) -> bool {
     }
 
     true
+}
+
+fn solve_spd_lower_in_place(a: &mut [f64], b: &mut [f64], n: usize) -> bool {
+    factorize_spd_lower_in_place(a, n) && solve_cholesky_factor_in_place(a, b, n)
+}
+
+fn write_zero_projection_sample(
+    scores_ptr: *mut f64,
+    alignment_ptr: Option<*mut f64>,
+    n_samples: usize,
+    components: usize,
+    sample: usize,
+    zero_action: ZeroAlignmentAction,
+) {
+    let score_value = match zero_action {
+        ZeroAlignmentAction::Zero => 0.0,
+        ZeroAlignmentAction::NaN => f64::NAN,
+    };
+    for component in 0..components {
+        unsafe {
+            *scores_ptr.add(component * n_samples + sample) = score_value;
+        }
+    }
+    if let Some(alignment_ptr) = alignment_ptr {
+        for component in 0..components {
+            unsafe {
+                *alignment_ptr.add(component * n_samples + sample) = 0.0;
+            }
+        }
+    }
+}
+
+fn projection_solve_sample_chunk(n_samples: usize) -> usize {
+    if n_samples >= 250_000 {
+        8192
+    } else if n_samples >= 50_000 {
+        4096
+    } else if n_samples >= 10_000 {
+        2048
+    } else {
+        512
+    }
 }
 
 fn populate_packed_info_contrib(
