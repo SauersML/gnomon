@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::OsString;
 use std::fmt;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -805,7 +805,12 @@ pub fn create_projection_matrix_sink(
             DatasetOutputError::InvalidState("projection matrix file length overflow".into())
         })?;
 
-    let file = File::create(&path)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)?;
     file.set_len(total_len as u64)?;
     let mut mmap = unsafe { MmapOptions::new().len(total_len).map_mut(&file)? };
     write_projection_header_bytes(&mut mmap[..PROJECTION_MATRIX_HEADER_LEN], rows, cols)?;
@@ -4415,5 +4420,41 @@ mod tests {
             (values[1] - 2.0).abs() < 1e-6,
             "Expected dosage 2.0 for swapped match (from 0.0)"
         );
+    }
+
+    #[test]
+    fn projection_matrix_sink_supports_mutable_mmap_output() {
+        let dir = tempdir().unwrap();
+        let dataset = GenotypeDataset::Variants(VcfLikeDataset {
+            input_path: dir.path().join("input.vcf"),
+            parts: Vec::new(),
+            sample_names: Arc::new(Vec::new()),
+            samples: Vec::new(),
+            variant_count: Arc::new(VariantCountTracker::new(Some(0))),
+            output_hint: OutputHint::LocalDirectory(dir.path().to_path_buf()),
+        });
+
+        let mut sink =
+            create_projection_matrix_sink(&dataset, "projection_scores.bin", 2, 3, "scores")
+                .expect("create sink");
+        {
+            let mut matrix = sink.as_mat_mut().expect("matrix view");
+            matrix[(0, 0)] = 1.25;
+            matrix[(1, 0)] = 2.5;
+            matrix[(0, 2)] = -3.0;
+        }
+        let metadata = sink.finalize().expect("finalize sink");
+        let scores = dataset.output_path("projection_scores.bin");
+
+        assert!(scores.exists(), "scores file should be written");
+        assert!(metadata.exists(), "metadata file should be written");
+
+        let bytes = fs::read(scores).expect("read scores");
+        let payload = &bytes[PROJECTION_MATRIX_HEADER_LEN..];
+        let values: Vec<f64> = payload
+            .chunks_exact(std::mem::size_of::<f64>())
+            .map(|chunk| f64::from_le_bytes(chunk.try_into().unwrap()))
+            .collect();
+        assert_eq!(values, vec![1.25, 2.5, 0.0, 0.0, -3.0, 0.0]);
     }
 }
