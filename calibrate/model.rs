@@ -2632,12 +2632,11 @@ mod tests {
                     degree,
                 },
                 pgs_range: (0.0, 1.0),
-                sum_to_zero_constraints: HashMap::from([
-                    ("pgs_main".to_string(), z_transform.clone()),
-                ]),
-                knot_vectors: HashMap::from([
-                    ("pgs".to_string(), knot_vector.clone()),
-                ]),
+                sum_to_zero_constraints: HashMap::from([(
+                    "pgs_main".to_string(),
+                    z_transform.clone(),
+                )]),
+                knot_vectors: HashMap::from([("pgs".to_string(), knot_vector.clone())]),
                 mcmc_enabled: false,
                 calibrator_enabled: false,
                 ..Default::default()
@@ -2735,12 +2734,11 @@ mod tests {
                     degree,
                 },
                 pgs_range: (0.0, 1.0),
-                sum_to_zero_constraints: HashMap::from([
-                    ("pgs_main".to_string(), z_transform.clone()),
-                ]),
-                knot_vectors: HashMap::from([
-                    ("pgs".to_string(), knot_vector.clone()),
-                ]),
+                sum_to_zero_constraints: HashMap::from([(
+                    "pgs_main".to_string(),
+                    z_transform.clone(),
+                )]),
+                knot_vectors: HashMap::from([("pgs".to_string(), knot_vector.clone())]),
                 calibrator_enabled: false,
                 ..Default::default()
             },
@@ -2835,12 +2833,11 @@ mod tests {
                     degree,
                 },
                 pgs_range: (0.0, 1.0),
-                sum_to_zero_constraints: HashMap::from([
-                    ("pgs_main".to_string(), z_transform.clone()),
-                ]),
-                knot_vectors: HashMap::from([
-                    ("pgs".to_string(), knot_vector.clone()),
-                ]),
+                sum_to_zero_constraints: HashMap::from([(
+                    "pgs_main".to_string(),
+                    z_transform.clone(),
+                )]),
+                knot_vectors: HashMap::from([("pgs".to_string(), knot_vector.clone())]),
                 calibrator_enabled: false,
                 ..Default::default()
             },

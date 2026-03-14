@@ -12,6 +12,8 @@ Required dependencies:
 Usage:
     python examples/convert_score.py
     python examples/convert_score.py --assembly GRCh38
+
+The example downloads public sample genomes into the output directory.
 """
 
 from __future__ import annotations
@@ -29,15 +31,22 @@ from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DATA_DIR = REPO_ROOT / "data"
 OUTPUT_DIR = Path(__file__).resolve().parent / "convert_score_output"
 
 PGS_IDS = ("PGS000007", "PGS000317", "PGS004869", "PGS000507")
 PGS_BASE_URL = "https://ftp.ebi.ac.uk/pub/databases/spot/pgs/scores"
 
-GENOME_FILES = (
-    ("genome_Joshua_Yoakem_v5_Full_20250129211749.txt", "Joshua_Yoakem"),
-    ("autosomal.txt", "LivingDNA_Autosomal"),
+SAMPLE_GENOMES = (
+    (
+        "https://github.com/SauersML/reagle/raw/refs/heads/main/data/kat_suricata/ancestrydna.txt",
+        "kat_suricata_ancestrydna",
+        "ancestrydna.txt",
+    ),
+    (
+        "https://raw.githubusercontent.com/SauersML/reagle/refs/heads/main/data/kat_suricata/23andme_genome_kat_suricata_v5_full_20171221130201.txt",
+        "kat_suricata_23andme_v5",
+        "23andme_genome_kat_suricata_v5_full_20171221130201.txt",
+    ),
 )
 
 
@@ -320,10 +329,14 @@ def main() -> None:
     score_cache.mkdir(parents=True, exist_ok=True)
     converted_dir = output_dir / "converted"
     converted_dir.mkdir(parents=True, exist_ok=True)
+    genome_cache = output_dir / "genomes"
+    genome_cache.mkdir(parents=True, exist_ok=True)
 
-    genomes = [(DATA_DIR / file_name, sample_id) for file_name, sample_id in GENOME_FILES if (DATA_DIR / file_name).exists()]
-    if len(genomes) < 2:
-        raise RuntimeError(f"Need at least 2 genome files in {DATA_DIR}")
+    genomes: list[tuple[Path, str]] = []
+    for url, sample_id, filename in SAMPLE_GENOMES:
+        genome_path = genome_cache / filename
+        stream_download(url, genome_path)
+        genomes.append((genome_path, sample_id))
 
     all_results: dict[str, dict[str, ScoreResult]] = {}
 

@@ -523,7 +523,10 @@ fn save_predictions_detailed(
     } else {
         let tail = "prediction\tstandard_error_mean\tmean_lower_95\tmean_upper_95";
         if has_cal {
-            writeln!(file, "sample_id\thull_signed_distance\tuncalibrated_prediction\t{tail}")?;
+            writeln!(
+                file,
+                "sample_id\thull_signed_distance\tuncalibrated_prediction\t{tail}"
+            )?;
         } else {
             writeln!(file, "sample_id\thull_signed_distance\t{tail}")?;
         }
@@ -555,7 +558,10 @@ fn save_predictions_detailed(
         } else {
             write_tsv_row(
                 &mut file,
-                &[&sample_ids[i] as &dyn std::fmt::Display, &signed_distance[i]],
+                &[
+                    &sample_ids[i] as &dyn std::fmt::Display,
+                    &signed_distance[i],
+                ],
                 has_cal.then_some(&uncalibrated as &dyn std::fmt::Display),
                 &[&prediction, &se_str, &lo_str, &hi_str],
             )?;

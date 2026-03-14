@@ -31,8 +31,6 @@ URL_RE = re.compile(r"^https?://\S+$")
 # Hardcoded source URLs for intersection/build-inference runs.
 SOURCE_URLS = [
     "https://raw.githubusercontent.com/psbaltar/rawDNA2vcf/master/filter/23andme_v4.tsv",
-    "https://github.com/SauersML/gnomon/raw/refs/heads/main/data/autosomal.txt",
-    "https://raw.githubusercontent.com/SauersML/gnomon/refs/heads/main/data/genome_Joshua_Yoakem_v5_Full_20250129211749.txt",
     "https://github.com/SauersML/reagle/raw/refs/heads/main/data/kat_suricata/ancestrydna.txt",
     "https://raw.githubusercontent.com/SauersML/reagle/refs/heads/main/data/kat_suricata/23andme_genome_kat_suricata_v5_full_20171221130201.txt",
     "https://github.com/SauersML/reagle/raw/refs/heads/main/data/christopher_smith/genome_Christopher_Smith_v5_Full_20230926164611.zip",

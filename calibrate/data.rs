@@ -142,13 +142,13 @@ mod internal {
         if series.null_count() > 0 {
             return Err(DataError::MissingValuesFound(column_name.to_string()));
         }
-        let casted = series.cast(&DataType::Float64).map_err(|_| {
-            DataError::ColumnWrongType {
+        let casted = series
+            .cast(&DataType::Float64)
+            .map_err(|_| DataError::ColumnWrongType {
                 column_name: column_name.to_string(),
                 expected_type: "f64 (numeric)",
                 found_type: format!("{:?}", series.dtype()),
-            }
-        })?;
+            })?;
         if casted.null_count() > 0 {
             return Err(DataError::ColumnWrongType {
                 column_name: column_name.to_string(),
