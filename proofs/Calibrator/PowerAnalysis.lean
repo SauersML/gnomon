@@ -545,9 +545,66 @@ theorem invest_in_undersampled (n_large n_small delta C : ℝ)
     With equal weights and diminishing returns, balanced allocation
     maximizes total utility. -/
 theorem balanced_allocation_maximizes_total_utility
-    (r2_A r2_B r2_A' r2_B' : ℝ)
-    (h_A_improves : r2_A ≤ r2_A') (h_B_improves : r2_B ≤ r2_B') :
-    r2_A + r2_B ≤ r2_A' + r2_B' := by linarith
+    (n delta C : ℝ)
+    (h_C : 0 < C) (h_delta : 0 < delta) (h_n_minus_delta : 0 ≤ n - delta) :
+    r2ScalingModel (n - delta) C + r2ScalingModel (n + delta) C < 2 * r2ScalingModel n C := by
+  unfold r2ScalingModel
+  have h1 : 0 < n - delta + C := by linarith
+  have h2 : 0 < n + delta + C := by linarith
+  have h3 : 0 < n + C := by linarith
+  have h_ne1 : n - delta + C ≠ 0 := by linarith
+  have h_ne2 : n + delta + C ≠ 0 := by linarith
+  have h_ne3 : n + C ≠ 0 := by linarith
+
+  have step1 : (n - delta) / (n - delta + C) = 1 - C / (n - delta + C) := by
+    calc (n - delta) / (n - delta + C) = (n - delta + C - C) / (n - delta + C) := by ring_nf
+      _ = 1 - C / (n - delta + C) := by
+        rw [sub_div, div_self h_ne1]
+
+  have step2 : (n + delta) / (n + delta + C) = 1 - C / (n + delta + C) := by
+    calc (n + delta) / (n + delta + C) = (n + delta + C - C) / (n + delta + C) := by ring_nf
+      _ = 1 - C / (n + delta + C) := by
+        rw [sub_div, div_self h_ne2]
+
+  have step3 : 2 * (n / (n + C)) = 2 - 2 * C / (n + C) := by
+    calc 2 * (n / (n + C)) = 2 * ((n + C - C) / (n + C)) := by ring_nf
+      _ = 2 * (1 - C / (n + C)) := by rw [sub_div, div_self h_ne3]
+      _ = 2 - 2 * C / (n + C) := by ring
+
+  rw [step1, step2, step3]
+
+  have h_sum : 1 - C / (n - delta + C) + (1 - C / (n + delta + C)) = 2 - C * (1 / (n - delta + C) + 1 / (n + delta + C)) := by
+    ring
+  rw [h_sum]
+
+  have h_ineq : 2 - 2 * C / (n + C) = 2 - C * (2 / (n + C)) := by ring
+  rw [h_ineq]
+
+  apply sub_lt_sub_left
+
+  have h_sum2 : 1 / (n - delta + C) + 1 / (n + delta + C) = (n + delta + C + (n - delta + C)) / ((n - delta + C) * (n + delta + C)) := by
+    rw [div_add_div _ _ h_ne1 h_ne2]
+    ring_nf
+
+  have h_simp_num : n + delta + C + (n - delta + C) = 2 * (n + C) := by ring
+
+  have h_simp_den : (n - delta + C) * (n + delta + C) = (n + C)^2 - delta^2 := by ring
+
+  have h_sum3 : 1 / (n - delta + C) + 1 / (n + delta + C) = 2 * (n + C) / ((n + C)^2 - delta^2) := by
+    rw [h_sum2, h_simp_num, h_simp_den]
+
+  apply mul_lt_mul_of_pos_left
+  · rw [h_sum3]
+    have h_prod_pos : 0 < (n + C)^2 - delta^2 := by
+      have h_prod : (n + C)^2 - delta^2 = (n - delta + C) * (n + delta + C) := by ring
+      rw [h_prod]
+      exact mul_pos h1 h2
+
+    have h_target : 2 / (n + C) < 2 * (n + C) / ((n + C)^2 - delta^2) := by
+      rw [div_lt_div_iff₀ h3 h_prod_pos]
+      nlinarith
+    exact h_target
+  · exact h_C
 
 end OptimalAllocation
 
