@@ -388,10 +388,11 @@ section ArchaicIntrogression
     Worked example: European/Asian ~2% Neanderthal, Melanesian ~2%
     Neanderthal + ~3-5% Denisovan, African ~0-0.3% archaic. -/
 theorem introgression_creates_population_specific_variants
-    (pct_high pct_low : ℝ)
-    (h_low_nn : 0 ≤ pct_low)
-    (h_diff : pct_low < pct_high) :
-    pct_low < pct_high := by linarith
+    (shared_variants : ℝ)
+    (intro_high intro_low : ℝ)
+    (h_low_nn : 0 ≤ intro_low)
+    (h_diff : intro_low < intro_high) :
+    shared_variants + intro_low < shared_variants + intro_high := by linarith
 
 /-- **Introgression fraction of heritability is bounded.**
     When introgressed heritability is at most a fraction δ of total

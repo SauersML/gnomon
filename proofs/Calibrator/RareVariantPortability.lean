@@ -384,12 +384,27 @@ theorem negative_selection_constraint
 /-- **The α model: E[β²] ∝ [p(1-p)]^(1+α).**
     α = 0: neutral (no relationship between MAF and effect)
     α = -1: LDAK (β² ∝ 1/[p(1-p)])
-    Higher α → rarer variants have larger effects → more population-specific signal. -/
+    Higher α → rarer variants have larger effects → more population-specific signal.
+
+    Here we prove the core mathematical mechanism: for α = -1, the expected variance
+    explained per variant is proportional to 1/[p(1-p)], which is strictly larger
+    for rarer variants, thus concentrating the genetic signal in rare variants
+    that are highly population-specific. -/
 theorem alpha_model_portability_impact
-    (α port : ℝ)
-    (h_relation : α < 0 → port < 1)
-    (h_negative : α < 0) :
-    port < 1 := h_relation h_negative
+    (p_common p_rare : ℝ)
+    (h_common_pos : 0 < p_common)
+    (h_common_le : p_common ≤ 1/2)
+    (h_rare_pos : 0 < p_rare)
+    (h_rare_lt : p_rare < p_common) :
+    1 / (p_common * (1 - p_common)) < 1 / (p_rare * (1 - p_rare)) := by
+  have h_rare_le : p_rare ≤ 1/2 := le_trans (le_of_lt h_rare_lt) h_common_le
+  have h_common_1 : 0 < 1 - p_common := by linarith
+  have h_rare_1 : 0 < 1 - p_rare := by linarith
+  have h_prod_common_pos : 0 < p_common * (1 - p_common) := mul_pos h_common_pos h_common_1
+  have h_prod_rare_pos : 0 < p_rare * (1 - p_rare) := mul_pos h_rare_pos h_rare_1
+  have h_prod_lt : p_rare * (1 - p_rare) < p_common * (1 - p_common) := by
+    nlinarith [sq_nonneg (p_common - 1/2), sq_nonneg (p_rare - 1/2)]
+  exact one_div_lt_one_div_of_lt h_prod_rare_pos h_prod_lt
 
 /-- **Rare variant PGS R² increases slowly with sample size.**
     For rare variants, R²_rare ∝ n × MAF × β².
