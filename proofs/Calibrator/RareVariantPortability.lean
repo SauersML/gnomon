@@ -384,12 +384,34 @@ theorem negative_selection_constraint
 /-- **The α model: E[β²] ∝ [p(1-p)]^(1+α).**
     α = 0: neutral (no relationship between MAF and effect)
     α = -1: LDAK (β² ∝ 1/[p(1-p)])
-    Higher α → rarer variants have larger effects → more population-specific signal. -/
+    Under strong negative selection (α < -1), rarer variants have larger
+    expected effect size multipliers. This concentrates genetic variance
+    in population-specific rare variants, reducing portability. -/
 theorem alpha_model_portability_impact
-    (α port : ℝ)
-    (h_relation : α < 0 → port < 1)
-    (h_negative : α < 0) :
-    port < 1 := h_relation h_negative
+    (α : ℝ) (h_strong_selection : α < -1)
+    (het_rare het_common : ℝ)
+    (h_rare_pos : 0 < het_rare) (h_rare_lt_common : het_rare < het_common) :
+    het_common ^ (1 + α) < het_rare ^ (1 + α) := by
+  have h_exp_neg : 1 + α < 0 := by linarith
+  have h_exp_pos : 0 < -(1 + α) := neg_pos.mpr h_exp_neg
+  have h_common_pos : 0 < het_common := lt_trans h_rare_pos h_rare_lt_common
+  -- z^y < x^y for y < 0 and 0 < x < z. We use x^(-y) < z^(-y) and invert.
+  have h_pow_lt : het_rare ^ (-(1 + α)) < het_common ^ (-(1 + α)) := by
+    exact Real.rpow_lt_rpow (le_of_lt h_rare_pos) h_rare_lt_common h_exp_pos
+  -- Now invert: 1 / het_common^(-(1+α)) < 1 / het_rare^(-(1+α))
+  have h_inv_lt : (het_common ^ (-(1 + α)))⁻¹ < (het_rare ^ (-(1 + α)))⁻¹ := by
+    rw [inv_lt_inv₀ (Real.rpow_pos_of_pos h_common_pos _) (Real.rpow_pos_of_pos h_rare_pos _)]
+    exact h_pow_lt
+  -- And rewrite x^(-y) = 1/x^y via x^y = x^(-(-y)) = (x^(-y))⁻¹
+  have h_rw_rare : het_rare ^ (1 + α) = (het_rare ^ (-(1 + α)))⁻¹ := by
+    rw [← Real.rpow_neg (le_of_lt h_rare_pos)]
+    congr 2
+    ring
+  have h_rw_common : het_common ^ (1 + α) = (het_common ^ (-(1 + α)))⁻¹ := by
+    rw [← Real.rpow_neg (le_of_lt h_common_pos)]
+    congr 2
+    ring
+  rwa [← h_rw_rare, ← h_rw_common] at h_inv_lt
 
 /-- **Rare variant PGS R² increases slowly with sample size.**
     For rare variants, R²_rare ∝ n × MAF × β².

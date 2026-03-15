@@ -380,18 +380,28 @@ end RecentExpansion
 
 section ArchaicIntrogression
 
+/-- **Introgressed genetic variance models.**
+    Returns the introgressed variance given a total variance `V_total` and an
+    introgression fraction `pct`. -/
+noncomputable def introgressedVariance (V_total pct : ℝ) : ℝ :=
+  pct * V_total
+
 /-- **Differential introgression creates population-specific variants.**
     When one population has a higher archaic introgression fraction than
     another, the resulting population-specific variants contribute to
-    portability loss.
+    portability loss. We model this by showing the introgressed variance
+    is strictly greater.
 
     Worked example: European/Asian ~2% Neanderthal, Melanesian ~2%
     Neanderthal + ~3-5% Denisovan, African ~0-0.3% archaic. -/
 theorem introgression_creates_population_specific_variants
-    (pct_high pct_low : ℝ)
+    (V_total pct_high pct_low : ℝ)
+    (h_V_pos : 0 < V_total)
     (h_low_nn : 0 ≤ pct_low)
     (h_diff : pct_low < pct_high) :
-    pct_low < pct_high := by linarith
+    introgressedVariance V_total pct_low < introgressedVariance V_total pct_high := by
+  unfold introgressedVariance
+  exact mul_lt_mul_of_pos_right h_diff h_V_pos
 
 /-- **Introgression fraction of heritability is bounded.**
     When introgressed heritability is at most a fraction δ of total
