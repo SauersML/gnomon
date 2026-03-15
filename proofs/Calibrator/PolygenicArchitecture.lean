@@ -445,12 +445,23 @@ theorem predicted_le_source (r2_source rg fst_ld bias_tech : ℝ)
     Traits can be classified by their architecture:
     - Highly polygenic, no selection → best portability
     - Moderately polygenic, weak selection → moderate portability
-    - Oligogenic or strong selection → poor portability -/
+    - Oligogenic or strong selection → poor portability
+
+    This is modelled by showing that smaller per-variant variance
+    (more polygenic) leads to better portability. -/
 theorem architecture_classification
-    (port_high_poly port_moderate port_oligo : ℝ)
-    (h₁ : port_oligo < port_moderate)
-    (h₂ : port_moderate < port_high_poly) :
-    port_oligo < port_high_poly := by linarith
+    (h2 V_E m_oligo m_poly : ℝ)
+    (h_h2 : 0 < h2) (h_VE : 0 < V_E)
+    (h_oligo : 0 < m_oligo) (h_poly : 0 < m_poly)
+    (h_more_loci : m_oligo < m_poly) :
+    (h2 / m_poly) / (h2 / m_poly + V_E) < (h2 / m_oligo) / (h2 / m_oligo + V_E) := by
+  have h_per_oligo : 0 < h2 / m_oligo := div_pos h_h2 h_oligo
+  have h_per_poly : 0 < h2 / m_poly := div_pos h_h2 h_poly
+  have h_less : h2 / m_poly < h2 / m_oligo := div_lt_div_of_pos_left h_h2 h_oligo h_more_loci
+  have h_den_poly : 0 < h2 / m_poly + V_E := add_pos h_per_poly h_VE
+  have h_den_oligo : 0 < h2 / m_oligo + V_E := add_pos h_per_oligo h_VE
+  rw [div_lt_div_iff₀ h_den_poly h_den_oligo]
+  nlinarith
 
 /-- **General portability upper bound from rg and Fst.**
     Traits with: (1) low r_g, (2) high FST at causal loci,
