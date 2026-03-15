@@ -431,10 +431,11 @@ theorem variance_decomposition
     If the increase in large-effect component exceeds the decrease
     in small-effect component, total variance increases. -/
 theorem variance_increase_sufficient
-    (vL_s vL_t vS_s vS_t : ℝ)
-    (_h_large_up : vL_s < vL_t)
-    (h_net : vL_t - vL_s > vS_s - vS_t) :
-    vL_s + vS_s < vL_t + vS_t := by linarith
+    {m : ℕ} (w_s w_t : Fin m → ℝ) (S : Finset (Fin m))
+    (h_net : (∑ i ∈ S, w_t i) - (∑ i ∈ S, w_s i) > (∑ i ∈ Sᶜ, w_s i) - (∑ i ∈ Sᶜ, w_t i)) :
+    ∑ i, w_s i < ∑ i, w_t i := by
+  rw [variance_decomposition w_s S, variance_decomposition w_t S]
+  linarith
 
 end Question6
 
