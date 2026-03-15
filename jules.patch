@@ -1,0 +1,13 @@
+diff --git a/proofs/Calibrator/PGSCalibrationTheory.lean b/proofs/Calibrator/PGSCalibrationTheory.lean
+index f148883..9422c2d 100644
+--- a/proofs/Calibrator/PGSCalibrationTheory.lean
++++ b/proofs/Calibrator/PGSCalibrationTheory.lean
+@@ -1141,7 +1141,7 @@ theorem positive_nri_iff_reclassifiedBandEventPrevalence_below_cohort_prevalence
+         (π * (1 - π)) * thresholdBandRate μevent threshold δ <
+           (π * (1 - π)) * thresholdBandRate μnonevent threshold δ := by
+       simpa [mul_assoc] using h_scaled
+-    exact lt_of_mul_lt_mul_left' h_scaled'
++    exact (mul_lt_mul_iff_of_pos_left h_scale_pos).mp h_scaled'
+ 
+ /-- **Finite-horizon longitudinal treatment model.**
+     `discount t` encodes the time value of health at follow-up time `t`. -/
