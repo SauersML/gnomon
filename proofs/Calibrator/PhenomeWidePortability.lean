@@ -298,10 +298,16 @@ theorem region_disproportionate_variance
 
     Worked example: For immune traits, ρ_baseline > 0.9 but pathogen-driven
     selection can reduce it substantially (e.g., WBC, lymphocyte count). -/
+
+noncomputable def post_selection_correlation (rho_baseline δ_selection : ℝ) : ℝ :=
+  rho_baseline - δ_selection
+
 theorem selection_reduces_effect_correlation
     (rho_baseline δ_selection : ℝ)
     (h_selection : 0 < δ_selection) :
-    rho_baseline - δ_selection < rho_baseline := by linarith
+    post_selection_correlation rho_baseline δ_selection < rho_baseline := by
+  dsimp [post_selection_correlation]
+  exact sub_lt_self rho_baseline h_selection
 
 /-- **Selection-driven portability falls below neutral expectation.**
     For any trait where observed portability is below a threshold and the
@@ -312,11 +318,17 @@ theorem selection_reduces_effect_correlation
     Worked example: WBC portability EUR→AFR is ~20-30% of source R²,
     while neutral prediction gives ~85%. The gap is from the Duffy null
     variant (DARC/ACKR1) with large frequency differences due to malaria selection. -/
+
+noncomputable def portability_gap (port_neutral port_observed : ℝ) : ℝ :=
+  port_neutral - port_observed
+
 theorem observed_portability_below_neutral
     (port_observed port_neutral threshold : ℝ)
     (h_observed : port_observed < threshold)
     (h_neutral : threshold < port_neutral) :
-    port_observed < port_neutral := by linarith
+    0 < portability_gap port_neutral port_observed := by
+  dsimp [portability_gap]
+  linarith
 
 /-- **Allele under selection contributes disproportionally to portability loss.**
     If a selected allele explains a fraction f of genetic variance
