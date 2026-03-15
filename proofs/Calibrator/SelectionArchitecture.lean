@@ -622,13 +622,24 @@ section ArchitecturePredictions
 
 /- **Trait classes can be ranked by regime-specific portability parameters.** -/
 
-/-- Portability ordering follows from any transitive ranking of regime-level
-    portability values. -/
+/-- **Exponential decay model of portability under selection.**
+    Portability decays exponentially with time t at a rate proportional to 2s. -/
+noncomputable def portabilityUnderSelection (s t : ℝ) : ℝ :=
+  Real.exp (- (2 * s * t))
+
+/-- Portability ordering follows from the selection coefficients.
+    Stronger selection coefficients lead to strictly lower portability
+    over the same positive time interval. -/
 theorem portability_ordering
-    (r2_high r2_mid r2_low : ℝ)
-    (h_high : r2_mid < r2_high)
-    (h_mid : r2_low < r2_mid) :
-    r2_low < r2_high := by linarith
+    (s_weak s_strong t : ℝ)
+    (h_strong : s_weak < s_strong)
+    (h_t : 0 < t) :
+    portabilityUnderSelection s_strong t < portabilityUnderSelection s_weak t := by
+  unfold portabilityUnderSelection
+  apply Real.exp_lt_exp.mpr
+  have h_2 : (0 : ℝ) < 2 := by linarith
+  have h_2t : 0 < 2 * t := mul_pos h_2 h_t
+  nlinarith
 
 /-- **Selection coefficient determines portability timescale.**
     The characteristic timescale for portability decay is 1/(2s) generations,
