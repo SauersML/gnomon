@@ -386,12 +386,20 @@ section ArchaicIntrogression
     portability loss.
 
     Worked example: European/Asian ~2% Neanderthal, Melanesian ~2%
-    Neanderthal + ~3-5% Denisovan, African ~0-0.3% archaic. -/
+    Neanderthal + ~3-5% Denisovan, African ~0-0.3% archaic.
+
+    This function computes the number of variants contributed by an introgressed population. -/
+noncomputable def expectedIntrogressedVariants (totalVariants : ℝ) (introgressionFraction : ℝ) : ℝ :=
+  totalVariants * introgressionFraction
+
 theorem introgression_creates_population_specific_variants
-    (pct_high pct_low : ℝ)
+    (totalVariants pct_high pct_low : ℝ)
+    (h_total_pos : 0 < totalVariants)
     (h_low_nn : 0 ≤ pct_low)
     (h_diff : pct_low < pct_high) :
-    pct_low < pct_high := by linarith
+    expectedIntrogressedVariants totalVariants pct_low < expectedIntrogressedVariants totalVariants pct_high := by
+  unfold expectedIntrogressedVariants
+  exact mul_lt_mul_of_pos_left h_diff h_total_pos
 
 /-- **Introgression fraction of heritability is bounded.**
     When introgressed heritability is at most a fraction δ of total
