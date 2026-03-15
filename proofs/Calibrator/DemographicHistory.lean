@@ -387,11 +387,22 @@ section ArchaicIntrogression
 
     Worked example: European/Asian ~2% Neanderthal, Melanesian ~2%
     Neanderthal + ~3-5% Denisovan, African ~0-0.3% archaic. -/
+
+-- Total introgressed variants given a percentage and total variants.
+noncomputable def introgressed_variants (pct total_variants : ℝ) : ℝ :=
+  pct * total_variants
+
 theorem introgression_creates_population_specific_variants
-    (pct_high pct_low : ℝ)
-    (h_low_nn : 0 ≤ pct_low)
+    (pct_high pct_low total_variants : ℝ)
+    (h_total_pos : 0 < total_variants)
     (h_diff : pct_low < pct_high) :
-    pct_low < pct_high := by linarith
+    introgressed_variants pct_low total_variants < introgressed_variants pct_high total_variants := by
+  dsimp [introgressed_variants]
+  exact mul_lt_mul_of_pos_right h_diff h_total_pos
+
+-- Introgressed heritability given an introgression percentage and total heritability.
+noncomputable def introgressed_heritability (intro_pct h2_total : ℝ) : ℝ :=
+  intro_pct * h2_total
 
 /-- **Introgression fraction of heritability is bounded.**
     When introgressed heritability is at most a fraction δ of total
@@ -400,13 +411,13 @@ theorem introgression_creates_population_specific_variants
     Worked example: For most traits, introgression contributes < 1%
     of total heritability. -/
 theorem introgression_gap_bounded
-    (h2_total h2_intro δ : ℝ)
+    (intro_pct h2_total δ : ℝ)
     (h_total : 0 < h2_total)
-    (h_δ_nn : 0 ≤ δ)
-    (h_small : h2_intro ≤ δ * h2_total)
-    (h_intro_nn : 0 ≤ h2_intro) :
-    h2_intro / h2_total ≤ δ := by
-  exact div_le_of_le_mul₀ (le_of_lt h_total) h_δ_nn h_small
+    (h_small : intro_pct ≤ δ) :
+    introgressed_heritability intro_pct h2_total / h2_total ≤ δ := by
+  dsimp [introgressed_heritability]
+  rw [mul_div_cancel_right₀ intro_pct (ne_of_gt h_total)]
+  exact h_small
 
 end ArchaicIntrogression
 
