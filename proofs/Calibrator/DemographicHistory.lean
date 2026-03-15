@@ -380,6 +380,12 @@ end RecentExpansion
 
 section ArchaicIntrogression
 
+/-- Model for the number or variance of introgressed variants.
+    Given a base total variance/variant count `total`, the introgressed component
+    is simply `total * intro_fraction`. -/
+noncomputable def introgressed_variants (total intro_fraction : ℝ) : ℝ :=
+  total * intro_fraction
+
 /-- **Differential introgression creates population-specific variants.**
     When one population has a higher archaic introgression fraction than
     another, the resulting population-specific variants contribute to
@@ -388,10 +394,14 @@ section ArchaicIntrogression
     Worked example: European/Asian ~2% Neanderthal, Melanesian ~2%
     Neanderthal + ~3-5% Denisovan, African ~0-0.3% archaic. -/
 theorem introgression_creates_population_specific_variants
-    (pct_high pct_low : ℝ)
+    (total_variants pct_high pct_low : ℝ)
+    (h_total : 0 < total_variants)
     (h_low_nn : 0 ≤ pct_low)
     (h_diff : pct_low < pct_high) :
-    pct_low < pct_high := by linarith
+    introgressed_variants total_variants pct_low <
+      introgressed_variants total_variants pct_high := by
+  dsimp [introgressed_variants]
+  exact mul_lt_mul_of_pos_left h_diff h_total
 
 /-- **Introgression fraction of heritability is bounded.**
     When introgressed heritability is at most a fraction δ of total
@@ -403,10 +413,9 @@ theorem introgression_gap_bounded
     (h2_total h2_intro δ : ℝ)
     (h_total : 0 < h2_total)
     (h_δ_nn : 0 ≤ δ)
-    (h_small : h2_intro ≤ δ * h2_total)
-    (h_intro_nn : 0 ≤ h2_intro) :
+    (h_small : h2_intro ≤ δ * h2_total) :
     h2_intro / h2_total ≤ δ := by
-  exact div_le_of_le_mul₀ (le_of_lt h_total) h_δ_nn h_small
+  exact (div_le_iff₀ h_total).mpr h_small
 
 end ArchaicIntrogression
 
