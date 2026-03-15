@@ -384,12 +384,42 @@ theorem negative_selection_constraint
 /-- **The α model: E[β²] ∝ [p(1-p)]^(1+α).**
     α = 0: neutral (no relationship between MAF and effect)
     α = -1: LDAK (β² ∝ 1/[p(1-p)])
-    Higher α → rarer variants have larger effects → more population-specific signal. -/
+    When 1 + α < 0 (i.e. α < -1), rarer variants have a larger expected effect size multiplier.
+    This creates more population-specific signal. -/
 theorem alpha_model_portability_impact
-    (α port : ℝ)
-    (h_relation : α < 0 → port < 1)
-    (h_negative : α < 0) :
-    port < 1 := h_relation h_negative
+    (p_rare p_common α : ℝ)
+    (h_rare_pos : 0 < p_rare) (h_rare_lt : p_rare < p_common)
+    (h_common_le : p_common ≤ 1/2) (h_alpha : α < -1) :
+    (p_common * (1 - p_common)) ^ (1 + α) < (p_rare * (1 - p_rare)) ^ (1 + α) := by
+  have h_common_lt_one : p_common < 1 := by linarith
+  have h_rare_lt_one : p_rare < 1 := by linarith
+  have h_pq_rare_pos : 0 < p_rare * (1 - p_rare) := mul_pos h_rare_pos (sub_pos.mpr h_rare_lt_one)
+  have h_pq_common_pos : 0 < p_common * (1 - p_common) :=
+    mul_pos (lt_trans h_rare_pos h_rare_lt) (sub_pos.mpr h_common_lt_one)
+  have h_pq_lt : p_rare * (1 - p_rare) < p_common * (1 - p_common) := by
+    nlinarith [sq_nonneg (p_common - 1/2), sq_nonneg (p_rare - 1/2)]
+  have h_exp_neg : 1 + α < 0 := by linarith
+  let y := 1 + α
+  have hy : y < 0 := h_exp_neg
+  have hw_pos : 0 < -y := neg_pos.mpr hy
+  have hx : 0 < p_rare * (1 - p_rare) := h_pq_rare_pos
+  have hxz : p_rare * (1 - p_rare) < p_common * (1 - p_common) := h_pq_lt
+  have h_rpow_lt : (p_rare * (1 - p_rare)) ^ (-y) < (p_common * (1 - p_common)) ^ (-y) :=
+    Real.rpow_lt_rpow (le_of_lt hx) hxz hw_pos
+  have h_rpow_x_pos : 0 < (p_rare * (1 - p_rare)) ^ (-y) := Real.rpow_pos_of_pos hx (-y)
+  have h_inv_lt : 1 / (p_common * (1 - p_common)) ^ (-y) < 1 / (p_rare * (1 - p_rare)) ^ (-y) :=
+    one_div_lt_one_div_of_lt h_rpow_x_pos h_rpow_lt
+  have h1 : (p_common * (1 - p_common)) ^ y = 1 / (p_common * (1 - p_common)) ^ (-y) := by
+    calc (p_common * (1 - p_common)) ^ y = (p_common * (1 - p_common)) ^ (-(-y)) := by rw [neg_neg]
+    _ = ((p_common * (1 - p_common)) ^ (-y))⁻¹ := Real.rpow_neg (le_of_lt (lt_trans hx hxz)) (-y)
+    _ = 1 / (p_common * (1 - p_common)) ^ (-y) := inv_eq_one_div _
+  have h2 : (p_rare * (1 - p_rare)) ^ y = 1 / (p_rare * (1 - p_rare)) ^ (-y) := by
+    calc (p_rare * (1 - p_rare)) ^ y = (p_rare * (1 - p_rare)) ^ (-(-y)) := by rw [neg_neg]
+    _ = ((p_rare * (1 - p_rare)) ^ (-y))⁻¹ := Real.rpow_neg (le_of_lt hx) (-y)
+    _ = 1 / (p_rare * (1 - p_rare)) ^ (-y) := inv_eq_one_div _
+  change (p_common * (1 - p_common)) ^ y < (p_rare * (1 - p_rare)) ^ y
+  rw [h1, h2]
+  exact h_inv_lt
 
 /-- **Rare variant PGS R² increases slowly with sample size.**
     For rare variants, R²_rare ∝ n × MAF × β².
