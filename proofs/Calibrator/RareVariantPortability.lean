@@ -384,12 +384,32 @@ theorem negative_selection_constraint
 /-- **The α model: E[β²] ∝ [p(1-p)]^(1+α).**
     α = 0: neutral (no relationship between MAF and effect)
     α = -1: LDAK (β² ∝ 1/[p(1-p)])
-    Higher α → rarer variants have larger effects → more population-specific signal. -/
+    When 1+α < 0 (i.e., α < -1), rarer variants have larger expected effect sizes.
+    Here we prove that when `α < -1` and `p_rare < p_common` (with `p_common ≤ 1/2`),
+    the expected effect variance multiplier `(p(1-p))^(1+α)` is strictly larger for
+    the rare variant than for the common variant. -/
+noncomputable def expected_effect_multiplier (p α : ℝ) : ℝ :=
+  (p * (1 - p)) ^ (1 + α)
+
 theorem alpha_model_portability_impact
-    (α port : ℝ)
-    (h_relation : α < 0 → port < 1)
-    (h_negative : α < 0) :
-    port < 1 := h_relation h_negative
+    (α p_rare p_common : ℝ)
+    (h_α_strong : α < -1)
+    (h_rare_pos : 0 < p_rare)
+    (h_rare_lt_common : p_rare < p_common)
+    (h_common_le_half : p_common ≤ 1 / 2) :
+    expected_effect_multiplier p_common α < expected_effect_multiplier p_rare α := by
+  unfold expected_effect_multiplier
+  have h_het_rare_pos : 0 < p_rare * (1 - p_rare) := by
+    apply mul_pos h_rare_pos
+    linarith
+  have h_het_common_pos : 0 < p_common * (1 - p_common) := by
+    apply mul_pos (by linarith)
+    linarith
+  have h_het_lt : p_rare * (1 - p_rare) < p_common * (1 - p_common) := by
+    have h_rare_le_half : p_rare ≤ 1 / 2 := by linarith
+    nlinarith [sq_nonneg (p_common - 1/2), sq_nonneg (p_rare - 1/2)]
+  have h_exp_neg : 1 + α < 0 := by linarith
+  exact Real.rpow_lt_rpow_of_exponent_neg h_het_rare_pos h_het_lt h_exp_neg
 
 /-- **Rare variant PGS R² increases slowly with sample size.**
     For rare variants, R²_rare ∝ n × MAF × β².
