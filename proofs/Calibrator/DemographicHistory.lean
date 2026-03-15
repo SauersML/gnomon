@@ -380,18 +380,38 @@ end RecentExpansion
 
 section ArchaicIntrogression
 
+/-- **Cumulative introgressed variants.**
+    Given an ancestral population size `N_0` and a constant introgression rate `r`,
+    the cumulative fraction of introgressed variants after time `t`
+    is modeled as `N_0 * (1 - exp(-r * t))`. -/
+noncomputable def introgression_variants (N_0 : ℝ) (introgression_rate : ℝ) (t : ℝ) : ℝ :=
+  N_0 * (1 - Real.exp (-introgression_rate * t))
+
 /-- **Differential introgression creates population-specific variants.**
     When one population has a higher archaic introgression fraction than
     another, the resulting population-specific variants contribute to
     portability loss.
 
+    This replaces a vacuous tautology with a proof that the cumulative
+    number of introgressed variants is strictly greater under a higher rate.
+
     Worked example: European/Asian ~2% Neanderthal, Melanesian ~2%
     Neanderthal + ~3-5% Denisovan, African ~0-0.3% archaic. -/
 theorem introgression_creates_population_specific_variants
-    (pct_high pct_low : ℝ)
-    (h_low_nn : 0 ≤ pct_low)
-    (h_diff : pct_low < pct_high) :
-    pct_low < pct_high := by linarith
+    (N_0 t r_high r_low : ℝ)
+    (hN : 0 < N_0)
+    (ht : 0 < t)
+    (h_low_nn : 0 ≤ r_low)
+    (h_diff : r_low < r_high) :
+    introgression_variants N_0 r_low t < introgression_variants N_0 r_high t := by
+  unfold introgression_variants
+  have h_r_diff : -r_high * t < -r_low * t := by
+    nlinarith
+  have h_exp_diff : Real.exp (-r_high * t) < Real.exp (-r_low * t) := by
+    exact Real.exp_lt_exp.mpr h_r_diff
+  have h_sub_diff : 1 - Real.exp (-r_low * t) < 1 - Real.exp (-r_high * t) := by
+    linarith
+  exact mul_lt_mul_of_pos_left h_sub_diff hN
 
 /-- **Introgression fraction of heritability is bounded.**
     When introgressed heritability is at most a fraction δ of total
