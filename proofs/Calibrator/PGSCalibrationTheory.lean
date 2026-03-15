@@ -909,7 +909,7 @@ theorem recalibration_needs_target_cohort
     h_events h_info h_target]
   unfold requiredTargetCohortSizeForRecalibration
   rw [div_le_iff₀ h_prev]
-  simp [mul_comm, mul_left_comm]
+  simp [mul_comm]
 
 /-- At fixed parameter count, per-event information, and target precision,
     lower event prevalence strictly increases the total target cohort size
@@ -1141,7 +1141,7 @@ theorem positive_nri_iff_reclassifiedBandEventPrevalence_below_cohort_prevalence
         (π * (1 - π)) * thresholdBandRate μevent threshold δ <
           (π * (1 - π)) * thresholdBandRate μnonevent threshold δ := by
       simpa [mul_assoc] using h_scaled
-    exact lt_of_mul_lt_mul_left' h_scaled'
+    exact (mul_lt_mul_iff_of_pos_left h_scale_pos).mp h_scaled'
 
 /-- **Finite-horizon longitudinal treatment model.**
     `discount t` encodes the time value of health at follow-up time `t`. -/
@@ -1598,7 +1598,7 @@ theorem abs_treatmentMargin_error_le_componentwise_calibration_bound
                               (predictedPath.treatmentBenefit t -
                                 truePath.treatmentBenefit t)) +
                             (-(predictedPath.treatmentHarm t -
-                              truePath.treatmentHarm t))| := by ring
+                              truePath.treatmentHarm t))| := by ring_nf
                       _ ≤
                           |(predictedPath.eventProb t - truePath.eventProb t) *
                               truePath.treatmentBenefit t +
