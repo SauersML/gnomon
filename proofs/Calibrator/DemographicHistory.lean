@@ -380,6 +380,9 @@ end RecentExpansion
 
 section ArchaicIntrogression
 
+noncomputable def introgressed_variants (total_variants pct : ℝ) : ℝ :=
+  total_variants * pct
+
 /-- **Differential introgression creates population-specific variants.**
     When one population has a higher archaic introgression fraction than
     another, the resulting population-specific variants contribute to
@@ -388,10 +391,12 @@ section ArchaicIntrogression
     Worked example: European/Asian ~2% Neanderthal, Melanesian ~2%
     Neanderthal + ~3-5% Denisovan, African ~0-0.3% archaic. -/
 theorem introgression_creates_population_specific_variants
-    (pct_high pct_low : ℝ)
-    (h_low_nn : 0 ≤ pct_low)
+    (total_variants pct_high pct_low : ℝ)
+    (h_total_pos : 0 < total_variants)
     (h_diff : pct_low < pct_high) :
-    pct_low < pct_high := by linarith
+    introgressed_variants total_variants pct_low < introgressed_variants total_variants pct_high := by
+  unfold introgressed_variants
+  exact mul_lt_mul_of_pos_left h_diff h_total_pos
 
 /-- **Introgression fraction of heritability is bounded.**
     When introgressed heritability is at most a fraction δ of total

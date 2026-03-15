@@ -386,10 +386,17 @@ theorem negative_selection_constraint
     α = -1: LDAK (β² ∝ 1/[p(1-p)])
     Higher α → rarer variants have larger effects → more population-specific signal. -/
 theorem alpha_model_portability_impact
-    (α port : ℝ)
-    (h_relation : α < 0 → port < 1)
-    (h_negative : α < 0) :
-    port < 1 := h_relation h_negative
+    (maf_rare maf_common α : ℝ)
+    (h_rare_pos : 0 < maf_rare)
+    (h_common_pos : 0 < maf_common)
+    (h_rare_lt_common : maf_rare < maf_common)
+    (h_alpha_neg : α < 0) :
+    (maf_rare / maf_common) ^ (1 + α) > maf_rare / maf_common := by
+  have h_ratio_pos : 0 < maf_rare / maf_common := div_pos h_rare_pos h_common_pos
+  have h_ratio_lt_one : maf_rare / maf_common < 1 := (div_lt_one h_common_pos).mpr h_rare_lt_common
+  have h_exp_lt_one : 1 + α < 1 := by linarith
+  nth_rw 2 [← Real.rpow_one (maf_rare / maf_common)]
+  exact Real.rpow_lt_rpow_of_exponent_gt h_ratio_pos h_ratio_lt_one h_exp_lt_one
 
 /-- **Rare variant PGS R² increases slowly with sample size.**
     For rare variants, R²_rare ∝ n × MAF × β².
