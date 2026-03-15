@@ -130,16 +130,22 @@ theorem chi_squared_nonneg {k : ℕ}
     Systematic positive residuals → model underestimates portability.
     Systematic negative residuals → model overestimates portability. -/
 theorem residual_sign_interpretation
-    (r2_observed r2_predicted : ℝ)
-    (h_positive_residual : r2_predicted < r2_observed) :
-    -- Model underestimates portability
-    0 < r2_observed - r2_predicted := by linarith
+    (r2_0 fst_d fst_0 r2_observed : ℝ)
+    (h_r2_0 : 0 < r2_0)
+    (h_fst_0 : fst_0 < 1)
+    (h_fst_d : fst_d < fst_0)
+    (h_positive_residual : r2_0 * ((1 - fst_0) / (1 - fst_d)) < r2_observed) :
+    0 < r2_observed - r2_0 * ((1 - fst_0) / (1 - fst_d)) := by
+  linarith
 
 theorem residual_negative_interpretation
-    (r2_observed r2_predicted : ℝ)
-    (h_negative_residual : r2_observed < r2_predicted) :
-    -- Model overestimates portability
-    r2_observed - r2_predicted < 0 := by linarith
+    (r2_0 fst_d fst_0 r2_observed : ℝ)
+    (h_r2_0 : 0 < r2_0)
+    (h_fst_0 : fst_0 < 1)
+    (h_fst_d : fst_d < fst_0)
+    (h_negative_residual : r2_observed < r2_0 * ((1 - fst_0) / (1 - fst_d))) :
+    r2_observed - r2_0 * ((1 - fst_0) / (1 - fst_d)) < 0 := by
+  linarith
 
 end GoodnessOfFit
 

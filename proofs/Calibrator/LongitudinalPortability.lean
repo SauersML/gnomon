@@ -128,10 +128,18 @@ section EnvironmentalEpochs
     If V_GxE > 0, then a PGS trained in environment E₁
     has reduced R² in environment E₂. -/
 theorem environment_change_reduces_r2
-    (r2_same_env r2_diff_env V_GxE : ℝ)
-    (h_reduction : r2_diff_env = r2_same_env - V_GxE)
-    (h_gxe : 0 < V_GxE) :
-    r2_diff_env < r2_same_env := by linarith
+    (V_G V_E V_GxE : ℝ)
+    (h_VG : 0 < V_G) (h_VE : 0 < V_E) (h_GxE : 0 < V_GxE) :
+    V_G / (V_G + V_E + V_GxE) < V_G / (V_G + V_E) := by
+  have denom_pos1 : 0 < V_G + V_E := add_pos h_VG h_VE
+  have denom_pos2 : 0 < V_G + V_E + V_GxE := add_pos denom_pos1 h_GxE
+  apply (div_lt_div_iff₀ denom_pos2 denom_pos1).mpr
+  have h_mul : V_G * (V_G + V_E) = V_G * (V_G + V_E) := rfl
+  calc
+    V_G * (V_G + V_E) < V_G * (V_G + V_E) + V_G * V_GxE := by
+      apply lt_add_of_pos_right
+      exact mul_pos h_VG h_GxE
+    _ = V_G * (V_G + V_E + V_GxE) := by ring
 
 /-- **Secular trends shift PGS distributions.**
     A secular trend (e.g., increasing height) shifts the
@@ -417,10 +425,17 @@ theorem temporal_split_more_conservative
     Changes in diagnostic criteria over time (e.g., ICD revisions)
     create apparent portability loss that is purely definitional. -/
 theorem diagnostic_change_creates_apparent_loss
-    (r2_consistent_def r2_changed_def : ℝ)
-    (h_reduced : r2_changed_def < r2_consistent_def)
-    (h_nn : 0 < r2_changed_def) :
-    0 < r2_consistent_def - r2_changed_def := by linarith
+    (V_A V_E rho : ℝ)
+    (h_VA : 0 < V_A) (h_VE : 0 < V_E)
+    (h_rho : 0 < rho) (h_rho_lt_one : rho < 1) :
+    let r2_consistent := V_A / (V_A + V_E)
+    let r2_changed := rho^2 * r2_consistent
+    r2_changed < r2_consistent := by
+  dsimp
+  have h_r2_pos : 0 < V_A / (V_A + V_E) := div_pos h_VA (add_pos h_VA h_VE)
+  have h_rho2_lt_one : rho^2 < 1 := by
+    nlinarith [h_rho, h_rho_lt_one]
+  exact mul_lt_of_lt_one_left h_r2_pos h_rho2_lt_one
 
 /-- **Genotype-phenotype map stability varies by trait.**
     Highly polygenic traits with small per-variant effects
@@ -431,11 +446,24 @@ theorem diagnostic_change_creates_apparent_loss
     Polygenic traits have many small effects → smaller max contribution.
     Oligogenic traits have few large effects → larger max contribution. -/
 theorem polygenic_more_temporally_stable
-    (max_contrib_poly max_contrib_oligo : ℝ)
-    (h_poly_small : 0 ≤ max_contrib_poly) (h_poly_le : max_contrib_poly ≤ 1)
-    (h_oligo_small : 0 ≤ max_contrib_oligo) (h_oligo_le : max_contrib_oligo ≤ 1)
-    (h_poly_more_even : max_contrib_poly < max_contrib_oligo) :
-    1 - max_contrib_oligo < 1 - max_contrib_poly := by linarith
+    (V M K : ℝ)
+    (h_V_pos : 0 < V)
+    (h_K_pos : 0 < K)
+    (h_K_lt_M : K < M) :
+    let max_contrib_poly := (V / M) / V
+    let max_contrib_oligo := (V / K) / V
+    1 - max_contrib_oligo < 1 - max_contrib_poly := by
+  dsimp
+  have h_M_pos : 0 < M := by linarith
+  have h_V_ne : V ≠ 0 := ne_of_gt h_V_pos
+  have h1 : (V / M) / V = 1 / M := by
+    rw [div_div, mul_comm, ←div_div, div_self h_V_ne, one_div]
+  have h2 : (V / K) / V = 1 / K := by
+    rw [div_div, mul_comm, ←div_div, div_self h_V_ne, one_div]
+  rw [h1, h2]
+  have h_ineq : 1 / M < 1 / K := by
+    exact one_div_lt_one_div_of_lt h_K_pos h_K_lt_M
+  linarith
 
 end CrossTemporalValidation
 
