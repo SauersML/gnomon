@@ -101,11 +101,25 @@ section CrossAncestryInstruments
     in another (target) because LD between instrument and causal variant differs.
     When the source F-statistic exceeds a threshold but the target falls below it,
     the target instrument is strictly weaker. -/
+
+noncomputable def f_stat_ancestry (n r2_ld maf : ℝ) : ℝ :=
+  n * r2_ld * maf * (1 - maf)
+
 theorem instrument_strength_varies
-    (f_stat_source f_stat_target threshold : ℝ)
-    (h_strong_source : threshold < f_stat_source)
-    (h_weak_target : f_stat_target < threshold) :
-    f_stat_target < f_stat_source := by linarith
+    (n r2_source r2_target maf : ℝ)
+    (h_n_pos : 0 < n) (h_maf_pos : 0 < maf) (h_maf_lt : maf < 1)
+    (h_r2_diff : r2_target < r2_source) :
+    f_stat_ancestry n r2_target maf < f_stat_ancestry n r2_source maf := by
+  dsimp [f_stat_ancestry]
+  have h_mul_pos : 0 < n * (maf * (1 - maf)) := by
+    apply mul_pos h_n_pos
+    apply mul_pos h_maf_pos
+    linarith
+  -- rearrange
+  have h1 : n * r2_target * maf * (1 - maf) = r2_target * (n * (maf * (1 - maf))) := by ring
+  have h2 : n * r2_source * maf * (1 - maf) = r2_source * (n * (maf * (1 - maf))) := by ring
+  rw [h1, h2]
+  apply mul_lt_mul_of_pos_right h_r2_diff h_mul_pos
 
 /-- **LD proxy instruments weaken across ancestry.**
     In MR, we often use a proxy SNP (in LD with causal SNP).
@@ -279,12 +293,19 @@ theorem environment_mediates_portability_mr
     Running MR across many phenotypes simultaneously reveals
     which causal pathways are conserved across ancestries
     and which are population-specific. -/
+
+noncomputable def conserved_fraction (n_conserved n_specific : ℝ) : ℝ :=
+  n_conserved / (n_conserved + n_specific)
+
 theorem mr_phewas_identifies_conserved_pathways
-    (n_conserved n_specific n_total : ℕ)
-    (h_sum : n_conserved + n_specific = n_total)
+    (n_conserved n_specific : ℝ)
     (h_some_conserved : 0 < n_conserved)
     (h_some_specific : 0 < n_specific) :
-    n_conserved < n_total := by omega
+    conserved_fraction n_conserved n_specific < 1 := by
+  dsimp [conserved_fraction]
+  have h_sum_pos : 0 < n_conserved + n_specific := by linarith
+  rw [div_lt_one h_sum_pos]
+  linarith
 
 end MRForPGSValidation
 
@@ -313,11 +334,16 @@ theorem collider_bias_from_selection
     Conditioning on disease status (case-control design)
     can create spurious associations between PGS and prognosis.
     This is more severe when PGS is ancestry-specific. -/
+
+noncomputable def biased_prognosis_effect (beta_true pgs_diagnosis_effect : ℝ) : ℝ :=
+  beta_true - pgs_diagnosis_effect
+
 theorem index_event_bias
-    (beta_prognosis_true beta_prognosis_biased pgs_diagnosis_effect : ℝ)
-    (h_bias : beta_prognosis_biased = beta_prognosis_true - pgs_diagnosis_effect)
+    (beta_true pgs_diagnosis_effect : ℝ)
     (h_effect : 0 < pgs_diagnosis_effect) :
-    beta_prognosis_biased < beta_prognosis_true := by linarith
+    biased_prognosis_effect beta_true pgs_diagnosis_effect < beta_true := by
+  dsimp [biased_prognosis_effect]
+  linarith
 
 /-- **Berkson's paradox in biobank studies.**
     Biobank participants are healthier and more educated than

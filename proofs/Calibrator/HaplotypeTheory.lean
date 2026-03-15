@@ -102,17 +102,17 @@ theorem more_haplotypes_in_afr
     frequency onto fewer haplotypes. If EUR has n_eur distinct haplotypes
     and AFR has n_afr > n_eur, then the max frequency in EUR (≥ 1/n_eur)
     exceeds the max frequency in AFR (= 1/n_afr under uniformity). -/
+noncomputable def max_haplotype_frequency (n_haplotypes : ℝ) : ℝ :=
+  1 / n_haplotypes
+
 theorem haplotype_frequency_more_uniform_afr
     (n_eur n_afr : ℝ)
     (h_eur_pos : 0 < n_eur)
-    (h_afr_pos : 0 < n_afr)
-    (h_more_diverse : n_eur < n_afr)
-    (max_freq_eur max_freq_afr : ℝ)
-    (h_afr_uniform : max_freq_afr = 1 / n_afr)
-    (h_eur_concentrated : 1 / n_eur ≤ max_freq_eur) :
-    max_freq_afr < max_freq_eur := by
-  have h1 : 1 / n_afr < 1 / n_eur := div_lt_div_of_pos_left one_pos h_eur_pos h_more_diverse
-  linarith
+    (_h_afr_pos : 0 < n_afr)
+    (h_more_diverse : n_eur < n_afr) :
+    max_haplotype_frequency n_afr < max_haplotype_frequency n_eur := by
+  dsimp [max_haplotype_frequency]
+  exact one_div_lt_one_div_of_lt h_eur_pos h_more_diverse
 
 /-- **Haplotype homozygosity.**
     H = Σ f_i² where f_i are haplotype frequencies.

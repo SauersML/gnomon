@@ -622,13 +622,17 @@ section ArchitecturePredictions
 
 /- **Trait classes can be ranked by regime-specific portability parameters.** -/
 
-/-- Portability ordering follows from any transitive ranking of regime-level
-    portability values. -/
+noncomputable def portability_by_regime (base_r2 regime_modifier : ℝ) : ℝ :=
+  base_r2 * regime_modifier
+
 theorem portability_ordering
-    (r2_high r2_mid r2_low : ℝ)
-    (h_high : r2_mid < r2_high)
-    (h_mid : r2_low < r2_mid) :
-    r2_low < r2_high := by linarith
+    (base_r2 mod_high mod_mid mod_low : ℝ)
+    (h_base : 0 < base_r2)
+    (h_high : mod_mid < mod_high)
+    (h_mid : mod_low < mod_mid) :
+    portability_by_regime base_r2 mod_low < portability_by_regime base_r2 mod_high := by
+  dsimp [portability_by_regime]
+  nlinarith
 
 /-- **Selection coefficient determines portability timescale.**
     The characteristic timescale for portability decay is 1/(2s) generations,

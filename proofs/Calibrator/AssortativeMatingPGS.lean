@@ -290,13 +290,16 @@ theorem AssortativeMatingModel.inflates_observed_h2 (m : AssortativeMatingModel)
   nlinarith [m.rh2_pos, mul_pos m.h2_pos m.rh2_pos]
 
 /-- Standalone version: AM inflates observed h2. -/
+
+noncomputable def observed_h2_under_am (h2_true r : ℝ) : ℝ :=
+  h2_true / (1 - r * h2_true)
+
 theorem am_inflates_observed_h2
-    (h2_true h2_observed r : ℝ)
-    (h_inflation : h2_observed = h2_true / (1 - r * h2_true))
+    (h2_true r : ℝ)
     (h_r : 0 < r) (h_r_le : r < 1)
     (h_h2 : 0 < h2_true) (h_h2_le : h2_true < 1) :
-    h2_true < h2_observed := by
-  rw [h_inflation]
+    h2_true < observed_h2_under_am h2_true r := by
+  dsimp [observed_h2_under_am]
   rw [lt_div_iff₀ (by nlinarith [mul_pos h_r h_h2])]
   nlinarith [mul_pos h_r h_h2, mul_pos h_h2 (mul_pos h_r h_h2)]
 
