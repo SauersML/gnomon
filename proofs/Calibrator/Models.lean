@@ -735,7 +735,7 @@ theorem sum_to_zero_after_projection
       _ = ∑ x_1, (B * Z) x x_1 * β x_1 * W x x := by
           refine Finset.sum_congr rfl ?_
           intro x_1 _
-          ring
+          ring_nf
   rw [h_swap]
   rw [Finset.sum_comm]
 
@@ -748,7 +748,7 @@ theorem sum_to_zero_after_projection
           = ∑ x, β y * ((B * Z) x y * W x x) := by
               refine Finset.sum_congr rfl ?_
               intro x _
-              ring
+              ring_nf
       _ = β y * ∑ x, (B * Z) x y * W x x := by
               simp [Finset.mul_sum]
   simp [h_factor]
@@ -845,7 +845,7 @@ lemma sum_mulVec_mul_eq_sum_mul_transpose_mulVec
   · intro _; simp
   · intro ⟨i, j⟩ _
     simp only [Equiv.prodComm_apply, Prod.swap_prod_mk]
-    ring
+    ring_nf
 
 /-- The penalty transforms as a congruence under reparameterization.
 
@@ -1520,7 +1520,7 @@ theorem F_resid_subset_F_PC_lin (k : ℕ) [Fintype (Fin k)] :
     rw [Finset.mul_sum]
     apply Finset.sum_congr rfl
     intro i hi
-    ring
+    ring_nf
   rw [hform s x]
   apply congrArg phiUnit
   calc
@@ -1548,7 +1548,7 @@ theorem F_PC_lin_subset_F_full (k : ℕ) [Fintype (Fin k)] :
     unfold T sigma
     have ha0 : a ≠ 0 := ha.ne'
     field_simp [ha0]
-    ring
+    ring_nf
 
 theorem F_rawPRS_subset_F_PC_lin_subset_F_full (k : ℕ) [Fintype (Fin k)] :
     F_rawPRS k ⊆ F_PC_lin k ∧ F_PC_lin k ⊆ F_full k := by

@@ -657,7 +657,7 @@ theorem laml_fixed_beta_gradient_is_exact
       (0.5 * Real.log (Matrix.det (Hessian_fn S_basis X W (Function.update rho i r) b)) +
       -0.5 * Real.log (Matrix.det (S_lambda_fn S_basis (Function.update rho i r))))) := by
     ext r
-    ring
+    ring_nf
   rw [h_sub_to_add, h_add1, h_add2, h_deriv_pen, h_deriv_log_H, h_deriv_log_S]
   simp [matrixInvAlg_eq_inv]
   rw [← h_b]
@@ -877,12 +877,12 @@ theorem bernoulliKLReal_nonneg (p q : ℝ) (hp0 : 0 < p) (hp1 : p < 1) (hq0 : 0 
     linarith [mul_le_mul_of_nonneg_left h2 (le_of_lt hp1_pos)]
   have h_log_inv1 : Real.log (p / q) = - Real.log (q / p) := by
     rw [Real.log_div (hp0.ne') (hq0.ne'), Real.log_div (hq0.ne') (hp0.ne')]
-    ring
+    ring_nf
   have h_log_inv2 : Real.log ((1 - p) / (1 - q)) = - Real.log ((1 - q) / (1 - p)) := by
     have h1p : 1 - p ≠ 0 := by linarith
     have h1q : 1 - q ≠ 0 := by linarith
     rw [Real.log_div h1p h1q, Real.log_div h1q h1p]
-    ring
+    ring_nf
   rw [h_log_inv1, h_log_inv2]
   calc
     p * -Real.log (q / p) + (1 - p) * -Real.log ((1 - q) / (1 - p))
@@ -1246,7 +1246,7 @@ theorem brierBernoulliRisk_eq_iff (η q : ℝ) :
     nlinarith [sq_eq_zero_iff.mp hsq]
   · intro h
     subst h
-    ring
+    ring_nf
 
 /-- Pointwise Bernoulli log-risk (cross-entropy form). -/
 noncomputable def logBernoulliRisk (η q : ℝ) : ℝ :=
@@ -1273,7 +1273,7 @@ theorem logBernoulliRisk_eq_iff (η q : ℝ)
     exact h_kl_zero_iff.mp hkl
   · intro hq
     subst hq
-    ring
+    ring_nf
 
 /-- Population log-risk alias: `R_log(q) = E[ℓ_log(Y,q(Z))]` with Bernoulli truth `η(Z)`. -/
 noncomputable def Rlog {Z : Type*} [MeasurableSpace Z] (μ : Measure Z)

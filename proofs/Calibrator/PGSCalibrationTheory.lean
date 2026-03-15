@@ -269,7 +269,7 @@ theorem auc_independent_of_calibration
         intro a b hab
         linarith)
   · unfold calibrationInTheLarge
-    ring
+    ring_nf
 
 /-- **Prevalence shift changes calibration.**
     Prevalence shift changes calibration: if prevalence changes from
@@ -909,7 +909,7 @@ theorem recalibration_needs_target_cohort
     h_events h_info h_target]
   unfold requiredTargetCohortSizeForRecalibration
   rw [div_le_iff₀ h_prev]
-  simp [mul_comm, mul_left_comm]
+  simp [mul_comm]
 
 /-- At fixed parameter count, per-event information, and target precision,
     lower event prevalence strictly increases the total target cohort size
@@ -1141,7 +1141,7 @@ theorem positive_nri_iff_reclassifiedBandEventPrevalence_below_cohort_prevalence
         (π * (1 - π)) * thresholdBandRate μevent threshold δ <
           (π * (1 - π)) * thresholdBandRate μnonevent threshold δ := by
       simpa [mul_assoc] using h_scaled
-    exact lt_of_mul_lt_mul_left' h_scaled'
+    exact (mul_lt_mul_iff_of_pos_left h_scale_pos).mp h_scaled'
 
 /-- **Finite-horizon longitudinal treatment model.**
     `discount t` encodes the time value of health at follow-up time `t`. -/
@@ -1240,7 +1240,7 @@ theorem qalyLoss_eq_qalyDecisionRegretMargin
         exact max_eq_right (by linarith)
       unfold qalyLoss qalyGainUnderDecision qalyDecisionRegretMargin
       rw [if_pos h_true, if_pos h_pred, if_pos h_pred, h_max]
-      ring
+      ring_nf
     · have h_true_nonpos : treatmentMargin model truePath ≤ 0 := not_lt.mp h_true
       have h_max :
           max (-treatmentMargin model truePath) 0 =
@@ -1248,7 +1248,7 @@ theorem qalyLoss_eq_qalyDecisionRegretMargin
         exact max_eq_left (by linarith)
       unfold qalyLoss qalyGainUnderDecision qalyDecisionRegretMargin
       rw [if_neg h_true, if_pos h_pred, if_pos h_pred, h_max]
-      ring
+      ring_nf
   · by_cases h_true : receivesTreatment model truePath
     · have h_max :
           max (treatmentMargin model truePath) 0 =
@@ -1256,13 +1256,13 @@ theorem qalyLoss_eq_qalyDecisionRegretMargin
         exact max_eq_left (le_of_lt h_true)
       unfold qalyLoss qalyGainUnderDecision qalyDecisionRegretMargin
       rw [if_pos h_true, if_neg h_pred, if_neg h_pred, h_max]
-      ring
+      ring_nf
     · have h_true_nonpos : treatmentMargin model truePath ≤ 0 := not_lt.mp h_true
       have h_max : max (treatmentMargin model truePath) 0 = 0 := by
         exact max_eq_right h_true_nonpos
       unfold qalyLoss qalyGainUnderDecision qalyDecisionRegretMargin
       rw [if_neg h_true, if_neg h_pred, if_neg h_pred, h_max]
-      ring
+      ring_nf
 
 /-- QALY loss is always nonnegative under the longitudinal regret model. -/
 theorem qalyLoss_nonneg
@@ -1303,12 +1303,12 @@ theorem qalyLoss_eq_zero_of_same_decision
   by_cases h_true : receivesTreatment model truePath
   · have h_pred : receivesTreatment model predictedPath := h_decision.mpr h_true
     rw [if_pos h_true, if_pos h_pred]
-    ring
+    ring_nf
   · have h_pred : ¬ receivesTreatment model predictedPath := by
       intro h_pred
       exact h_true (h_decision.mp h_pred)
     rw [if_neg h_true, if_neg h_pred]
-    ring
+    ring_nf
 
 /-- **A margin error smaller than the true decision margin preserves the
     treatment decision.**
@@ -1598,7 +1598,7 @@ theorem abs_treatmentMargin_error_le_componentwise_calibration_bound
                               (predictedPath.treatmentBenefit t -
                                 truePath.treatmentBenefit t)) +
                             (-(predictedPath.treatmentHarm t -
-                              truePath.treatmentHarm t))| := by ring
+                              truePath.treatmentHarm t))| := by ring_nf
                       _ ≤
                           |(predictedPath.eventProb t - truePath.eventProb t) *
                               truePath.treatmentBenefit t +
@@ -2201,7 +2201,7 @@ theorem qalyGainUnderDecision_threshold_eq_thresholdQalyGainUnderDecision
     unfold qalyGainUnderDecision
     rw [if_pos h_treat, treatmentMargin_thresholdClinicalPathway]
     simp [thresholdQalyGainUnderDecision, h, model.harm_eq_threshold]
-    ring
+    ring_nf
   · have h_not_treat :
         ¬ receivesTreatment (thresholdLongitudinalModel model)
           (thresholdClinicalPathway model decisionRisk) := by
@@ -2283,7 +2283,7 @@ theorem thresholdQalyLoss_eq_benefit_mul_thresholdDecisionRegretMargin
       have hmax : max (model.threshold - trueRisk) 0 = 0 := by
         exact max_eq_right (by linarith)
       rw [hmax]
-      ring
+      ring_nf
   · by_cases h_true_high : model.threshold < trueRisk
     · unfold thresholdDecisionRegretMargin
       rw [if_neg h_pred]
@@ -2303,7 +2303,7 @@ theorem thresholdQalyLoss_eq_benefit_mul_thresholdDecisionRegretMargin
       have hmax : max (trueRisk - model.threshold) 0 = 0 := by
         exact max_eq_right (by linarith)
       rw [hmax]
-      ring
+      ring_nf
 
 /-- Threshold-specialized QALY loss is always nonnegative. -/
 theorem thresholdQalyLoss_nonneg

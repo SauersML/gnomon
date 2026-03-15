@@ -300,7 +300,7 @@ theorem HardyWeinbergModel.genotypeProb_sum (h : HardyWeinbergModel) :
     (∑ g : DiploidGenotype, h.genotypeProb g) = 1 := by
   have hsum : h.refFreq + h.altFreq = 1 := by
     unfold HardyWeinbergModel.refFreq
-    ring
+    ring_nf
   have hrewrite :
       (∑ g : DiploidGenotype, h.genotypeProb g) =
         ∑ i : Fin 3, h.genotypeProb (DiploidGenotype.equivFin3.symm i) := by
@@ -324,7 +324,7 @@ theorem HardyWeinbergModel.expectedAltAlleleCount_eq
     h.expectedAltAlleleCount = 2 * h.altFreq := by
   have hsum : h.refFreq + h.altFreq = 1 := by
     unfold HardyWeinbergModel.refFreq
-    ring
+    ring_nf
   unfold HardyWeinbergModel.expectedAltAlleleCount
   have hrewrite :
       (∑ g : DiploidGenotype, altAlleleCount g * h.genotypeProb g) =
@@ -342,7 +342,7 @@ theorem HardyWeinbergModel.expectedAltAlleleCount_eq
         altAlleleCount DiploidGenotype.homAlt * h.altFreq ^ 2
         = 2 * (h.refFreq * h.altFreq) + 2 * h.altFreq ^ 2 := by
           simp [altAlleleCount]
-          ring
+          ring_nf
     _ 
         = 2 * h.altFreq * (h.refFreq + h.altFreq) := by ring
     _ = 2 * h.altFreq := by rw [hsum]; ring
@@ -362,7 +362,7 @@ theorem HardyWeinbergModel.genotypeVariance_eq
     h.genotypeVariance = 2 * h.altFreq * h.refFreq := by
   have hsum : h.refFreq + h.altFreq = 1 := by
     unfold HardyWeinbergModel.refFreq
-    ring
+    ring_nf
   unfold HardyWeinbergModel.genotypeVariance HardyWeinbergModel.centeredAltAlleleCount
   rw [h.expectedAltAlleleCount_eq]
   have hrewrite :
