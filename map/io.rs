@@ -502,11 +502,16 @@ struct ProjectionMatrixMetadata {
     rows: usize,
     cols: usize,
     row_order: &'static str,
+    row_ids_embedded: bool,
+    row_id_field: &'static str,
 }
 
 const PROJECTION_MATRIX_MAGIC: &[u8; 8] = b"GNPRJ001";
-const PROJECTION_MATRIX_VERSION: u32 = 2;
+const PROJECTION_MATRIX_VERSION: u32 = 3;
 const PROJECTION_MATRIX_HEADER_LEN: usize = 32;
+const PROJECTION_ROW_IDS_MAGIC: &[u8; 8] = b"GNPSID01";
+const PROJECTION_ROW_IDS_VERSION: u32 = 1;
+const PROJECTION_ROW_IDS_HEADER_LEN: usize = 32;
 const PROJECTION_CACHE_MAGIC: &[u8; 8] = b"GNPCCH01";
 const PROJECTION_CACHE_VERSION: u32 = 2;
 const PROJECTION_CACHE_NO_BP_WINDOW: u64 = u64::MAX;
@@ -517,6 +522,8 @@ pub struct ProjectionMatrixSink {
     kind: &'static str,
     rows: usize,
     cols: usize,
+    score_bytes: usize,
+    row_id_section: Vec<u8>,
     mmap: MmapMut,
 }
 
@@ -526,7 +533,12 @@ impl ProjectionMatrixSink {
     }
 
     pub fn as_mat_mut(&mut self) -> Result<faer::MatMut<'_, f64>, DatasetOutputError> {
-        let data = &mut self.mmap[PROJECTION_MATRIX_HEADER_LEN..];
+        let data_end = PROJECTION_MATRIX_HEADER_LEN
+            .checked_add(self.score_bytes)
+            .ok_or_else(|| {
+                DatasetOutputError::InvalidState("projection matrix data offset overflow".into())
+            })?;
+        let data = &mut self.mmap[PROJECTION_MATRIX_HEADER_LEN..data_end];
         let (prefix, aligned, suffix) = unsafe { data.align_to_mut::<f64>() };
         if !prefix.is_empty() || !suffix.is_empty() || aligned.len() != self.rows * self.cols {
             return Err(DatasetOutputError::InvalidState(
@@ -538,7 +550,18 @@ impl ProjectionMatrixSink {
         ))
     }
 
-    pub fn finalize(self) -> Result<PathBuf, DatasetOutputError> {
+    pub fn finalize(mut self) -> Result<PathBuf, DatasetOutputError> {
+        let row_id_offset = PROJECTION_MATRIX_HEADER_LEN
+            .checked_add(self.score_bytes)
+            .ok_or_else(|| {
+                DatasetOutputError::InvalidState("projection row-id offset overflow".into())
+            })?;
+        let row_id_end = row_id_offset
+            .checked_add(self.row_id_section.len())
+            .ok_or_else(|| {
+                DatasetOutputError::InvalidState("projection row-id section overflow".into())
+            })?;
+        self.mmap[row_id_offset..row_id_end].copy_from_slice(&self.row_id_section);
         self.mmap.flush()?;
         write_projection_metadata(&self.metadata_path, self.rows, self.cols, self.kind)?;
         Ok(self.metadata_path)
@@ -768,24 +791,17 @@ pub fn save_projection_results(
     result: &ProjectionResult,
 ) -> Result<ProjectionOutputPaths, DatasetOutputError> {
     let scores = result.scores.as_ref();
-    let samples = dataset.samples();
-
-    if samples.len() != scores.nrows() {
-        return Err(DatasetOutputError::InvalidState(format!(
-            "Projection scores contain {} rows but dataset has {} samples",
-            scores.nrows(),
-            samples.len()
-        )));
-    }
+    let row_id_section = build_projection_row_id_section(dataset, scores.nrows())?;
 
     let scores_path = dataset.output_path("projection_scores.bin");
-    let scores_metadata = write_projection_matrix(&scores_path, &result.scores, "scores")?;
+    let scores_metadata =
+        write_projection_matrix(&scores_path, &result.scores, "scores", &row_id_section)?;
 
     let mut alignment_path = None;
     let mut alignment_metadata = None;
     if let Some(alignment) = result.alignment.as_ref() {
         let path = dataset.output_path("projection_alignment.bin");
-        let metadata = write_projection_matrix(&path, alignment, "alignment")?;
+        let metadata = write_projection_matrix(&path, alignment, "alignment", &row_id_section)?;
         alignment_path = Some(path);
         alignment_metadata = Some(metadata);
     }
@@ -808,14 +824,11 @@ pub fn create_projection_matrix_sink(
     let path = dataset.output_path(filename);
     prepare_output_path(&path)?;
     let metadata_path = path.with_extension("metadata.json");
-    let matrix_bytes = rows
-        .checked_mul(cols)
-        .and_then(|len| len.checked_mul(std::mem::size_of::<f64>()))
-        .ok_or_else(|| {
-            DatasetOutputError::InvalidState("projection matrix byte count overflow".into())
-        })?;
+    let matrix_bytes = projection_matrix_score_bytes(rows, cols)?;
+    let row_id_section = build_projection_row_id_section(dataset, rows)?;
     let total_len = PROJECTION_MATRIX_HEADER_LEN
         .checked_add(matrix_bytes)
+        .and_then(|len| len.checked_add(row_id_section.len()))
         .ok_or_else(|| {
             DatasetOutputError::InvalidState("projection matrix file length overflow".into())
         })?;
@@ -836,6 +849,8 @@ pub fn create_projection_matrix_sink(
         kind,
         rows,
         cols,
+        score_bytes: matrix_bytes,
+        row_id_section,
         mmap,
     })
 }
@@ -844,6 +859,7 @@ fn write_projection_matrix(
     matrix_path: &Path,
     matrix: &faer::Mat<f64>,
     kind: &'static str,
+    row_id_section: &[u8],
 ) -> Result<PathBuf, DatasetOutputError> {
     prepare_output_path(matrix_path)?;
     let metadata_path = matrix_path.with_extension("metadata.json");
@@ -853,6 +869,7 @@ fn write_projection_matrix(
     for col in 0..matrix.ncols() {
         write_f64_slice(&mut writer, matrix.col_as_slice(col))?;
     }
+    writer.write_all(row_id_section)?;
     writer.flush()?;
 
     write_projection_metadata(&metadata_path, matrix.nrows(), matrix.ncols(), kind)?;
@@ -902,12 +919,88 @@ fn write_projection_metadata(
         rows,
         cols,
         row_order: "matches the input genotype dataset sample order",
+        row_ids_embedded: true,
+        row_id_field: "IID",
     };
     let file = File::create(metadata_path)?;
     let mut metadata_writer = BufWriter::new(file);
     serde_json::to_writer_pretty(&mut metadata_writer, &metadata)?;
     metadata_writer.flush()?;
     Ok(())
+}
+
+fn projection_matrix_score_bytes(rows: usize, cols: usize) -> Result<usize, DatasetOutputError> {
+    rows.checked_mul(cols)
+        .and_then(|len| len.checked_mul(std::mem::size_of::<f64>()))
+        .ok_or_else(|| {
+            DatasetOutputError::InvalidState("projection matrix byte count overflow".into())
+        })
+}
+
+fn build_projection_row_id_section(
+    dataset: &GenotypeDataset,
+    rows: usize,
+) -> Result<Vec<u8>, DatasetOutputError> {
+    let samples = dataset.samples();
+    if samples.len() != rows {
+        return Err(DatasetOutputError::InvalidState(format!(
+            "Projection matrix contains {} rows but dataset has {} samples",
+            rows,
+            samples.len()
+        )));
+    }
+    let row_ids: Vec<&str> = samples
+        .iter()
+        .map(|record| record.individual_id.as_str())
+        .collect();
+    build_projection_row_id_section_from_ids(&row_ids)
+}
+
+fn build_projection_row_id_section_from_ids(
+    row_ids: &[&str],
+) -> Result<Vec<u8>, DatasetOutputError> {
+    let string_bytes = row_ids.iter().try_fold(0usize, |acc, value| {
+        acc.checked_add(value.len()).ok_or_else(|| {
+            DatasetOutputError::InvalidState("projection row-id string table overflow".into())
+        })
+    })?;
+    let offsets_bytes = row_ids
+        .len()
+        .checked_add(1)
+        .and_then(|len| len.checked_mul(std::mem::size_of::<u64>()))
+        .ok_or_else(|| {
+            DatasetOutputError::InvalidState("projection row-id offset table overflow".into())
+        })?;
+    let total_len = PROJECTION_ROW_IDS_HEADER_LEN
+        .checked_add(offsets_bytes)
+        .and_then(|len| len.checked_add(string_bytes))
+        .ok_or_else(|| {
+            DatasetOutputError::InvalidState("projection row-id section length overflow".into())
+        })?;
+
+    let mut section = vec![0u8; total_len];
+    let mut cursor = io::Cursor::new(section.as_mut_slice());
+    cursor.write_all(PROJECTION_ROW_IDS_MAGIC)?;
+    cursor.write_all(&PROJECTION_ROW_IDS_VERSION.to_le_bytes())?;
+    cursor.write_all(&0u32.to_le_bytes())?;
+    cursor.write_all(&(row_ids.len() as u64).to_le_bytes())?;
+    cursor.write_all(&(string_bytes as u64).to_le_bytes())?;
+
+    let mut string_offset = 0u64;
+    cursor.write_all(&string_offset.to_le_bytes())?;
+    for value in row_ids {
+        string_offset = string_offset
+            .checked_add(value.len() as u64)
+            .ok_or_else(|| {
+                DatasetOutputError::InvalidState("projection row-id offset overflow".into())
+            })?;
+        cursor.write_all(&string_offset.to_le_bytes())?;
+    }
+    for value in row_ids {
+        cursor.write_all(value.as_bytes())?;
+    }
+
+    Ok(section)
 }
 
 #[cfg(target_endian = "little")]
@@ -4440,11 +4533,29 @@ mod tests {
     #[test]
     fn projection_matrix_sink_supports_mutable_mmap_output() {
         let dir = tempdir().unwrap();
+        let samples = vec![
+            SampleRecord {
+                family_id: "F1".to_string(),
+                individual_id: "SAMPLE_A".to_string(),
+                paternal_id: "0".to_string(),
+                maternal_id: "0".to_string(),
+                sex: "0".to_string(),
+                phenotype: "-9".to_string(),
+            },
+            SampleRecord {
+                family_id: "F2".to_string(),
+                individual_id: "SAMPLE_B".to_string(),
+                paternal_id: "0".to_string(),
+                maternal_id: "0".to_string(),
+                sex: "0".to_string(),
+                phenotype: "-9".to_string(),
+            },
+        ];
         let dataset = GenotypeDataset::Variants(VcfLikeDataset {
             input_path: dir.path().join("input.vcf"),
             parts: Vec::new(),
             sample_names: Arc::new(Vec::new()),
-            samples: Vec::new(),
+            samples,
             variant_count: Arc::new(VariantCountTracker::new(Some(0))),
             output_hint: OutputHint::LocalDirectory(dir.path().to_path_buf()),
         });
@@ -4465,12 +4576,46 @@ mod tests {
         assert!(metadata.exists(), "metadata file should be written");
 
         let bytes = fs::read(scores).expect("read scores");
-        let payload = &bytes[PROJECTION_MATRIX_HEADER_LEN..];
+        let payload_end = PROJECTION_MATRIX_HEADER_LEN + (2 * 3 * std::mem::size_of::<f64>());
+        let payload = &bytes[PROJECTION_MATRIX_HEADER_LEN..payload_end];
         let values: Vec<f64> = payload
             .chunks_exact(std::mem::size_of::<f64>())
             .map(|chunk| f64::from_le_bytes(chunk.try_into().unwrap()))
             .collect();
         assert_eq!(values, vec![1.25, 2.5, 0.0, 0.0, -3.0, 0.0]);
+
+        let row_id_section = &bytes[payload_end..];
+        assert_eq!(&row_id_section[..8], PROJECTION_ROW_IDS_MAGIC);
+        let count = u64::from_le_bytes(
+            row_id_section[16..24]
+                .try_into()
+                .expect("row-id count bytes"),
+        );
+        let string_bytes = u64::from_le_bytes(
+            row_id_section[24..32]
+                .try_into()
+                .expect("row-id string-bytes"),
+        );
+        assert_eq!(count, 2);
+        assert_eq!(string_bytes, ("SAMPLE_A".len() + "SAMPLE_B".len()) as u64);
+        let offsets_start = PROJECTION_ROW_IDS_HEADER_LEN;
+        let offsets_end = offsets_start + 3 * std::mem::size_of::<u64>();
+        let offsets: Vec<u64> = row_id_section[offsets_start..offsets_end]
+            .chunks_exact(std::mem::size_of::<u64>())
+            .map(|chunk| u64::from_le_bytes(chunk.try_into().expect("row-id offset")))
+            .collect();
+        assert_eq!(offsets, vec![0, 8, 16]);
+        let strings = &row_id_section[offsets_end..];
+        assert_eq!(strings, b"SAMPLE_ASAMPLE_B");
+
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(metadata).expect("read metadata")).unwrap();
+        assert_eq!(metadata["version"], PROJECTION_MATRIX_VERSION);
+        assert_eq!(metadata["kind"], "scores");
+        assert_eq!(metadata["rows"], 2);
+        assert_eq!(metadata["cols"], 3);
+        assert_eq!(metadata["row_ids_embedded"], true);
+        assert_eq!(metadata["row_id_field"], "IID");
     }
 
     #[test]

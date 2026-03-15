@@ -1,0 +1,174 @@
+name: Project Prefit Model Plots
+
+on:
+  workflow_dispatch:
+    inputs:
+      downsample_factor:
+        description: "Downsampling factor applied per superpopulation/subpopulation group (>=1)"
+        required: false
+        default: "1"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+
+jobs:
+  build:
+    name: Build release binary
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly
+
+      - name: Cache Rust dependencies and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          cache-targets: true
+          cache-all-crates: true
+          shared-key: project-prefit-model-plots
+
+      - name: Build release binary
+        run: cargo +nightly build --release --bin gnomon
+
+      - name: Upload release binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: gnomon-release-binary
+          path: target/release/gnomon
+          if-no-files-found: error
+
+  project-and-plot:
+    name: Project and plot (${{ matrix.label }})
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - model: hwe_1kg_hgdp_gsa_v2
+            label: gsa2
+            title: HGDP + 1KG projection with GSA v2 prefit model
+          - model: hwe_1kg_hgdp_gsa_v3
+            label: gsa3
+            title: HGDP + 1KG projection with GSA v3 prefit model
+          - model: hwe_1kg_hgdp_gda_v1
+            label: gda
+            title: HGDP + 1KG projection with GDA v1 prefit model
+          - model: hwe_1kg_hgdp_intersection
+            label: intersection
+            title: HGDP + 1KG projection with intersection prefit model
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: scripts/requirements-project-prefit.txt
+
+      - name: Install plotting dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r scripts/requirements-project-prefit.txt
+
+      - name: Download release binary
+        uses: actions/download-artifact@v4
+        with:
+          name: gnomon-release-binary
+          path: /tmp/gnomon-binary
+
+      - name: Install gnomon into runner path
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          install -m 0755 /tmp/gnomon-binary/gnomon "$HOME/.local/bin/gnomon"
+
+      - name: Project full dataset and render PCA plot
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$PWD"
+          OUT_DIR="$ROOT/artifacts/${{ matrix.label }}"
+          mkdir -p "$OUT_DIR"
+          cd "$OUT_DIR"
+
+          /usr/bin/time -f 'elapsed=%E\nuser=%U\nsys=%S\nmaxrss_kb=%M' \
+            "$HOME/.local/bin/gnomon" project \
+            "gs://gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/" \
+            --model "${{ matrix.model }}" \
+            2>&1 | tee project.log
+
+          python "$ROOT/scripts/plot_project_projection.py" \
+            --scores-bin phased_haplotypes_v2.projection_scores.bin \
+            --output-png pc1_pc2.png \
+            --output-tsv projection_scores_annotated.tsv \
+            --model-name "${{ matrix.title }}" \
+            --downsample-factor "${{ github.event.inputs.downsample_factor || '1' }}"
+
+      - name: Add workflow summary
+        run: |
+          {
+            echo "### ${{ matrix.title }}"
+            echo ""
+            echo "- Model key: \`${{ matrix.model }}\`"
+            echo "- Plot: \`artifacts/${{ matrix.label }}/pc1_pc2.png\`"
+            echo "- Annotated scores: \`artifacts/${{ matrix.label }}/projection_scores_annotated.tsv\`"
+            echo "- Raw projection: \`artifacts/${{ matrix.label }}/phased_haplotypes_v2.projection_scores.bin\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload model artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: project-prefit-${{ matrix.label }}
+          path: |
+            artifacts/${{ matrix.label }}/pc1_pc2.png
+            artifacts/${{ matrix.label }}/projection_scores_annotated.tsv
+            artifacts/${{ matrix.label }}/phased_haplotypes_v2.projection_scores.bin
+            artifacts/${{ matrix.label }}/phased_haplotypes_v2.projection_scores.metadata.json
+            artifacts/${{ matrix.label }}/sample_population_mapping.tsv
+            artifacts/${{ matrix.label }}/project.log
+          if-no-files-found: error
+
+  collect:
+    name: Collect all model artifacts
+    needs: project-and-plot
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Download per-model artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: project-prefit-*
+          path: collected
+          merge-multiple: false
+
+      - name: Summarize collected artifacts
+        run: |
+          {
+            echo "## Combined artifact bundle"
+            echo ""
+            find collected -type f | sort | sed 's/^/- `/' | sed 's/$/`/'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload combined artifact bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: project-prefit-all-models
+          path: collected
+          if-no-files-found: error
