@@ -281,27 +281,48 @@ theorem haplotype_pgs_at_least_snp
     Model: SNP PGS portability = base × r²_tag, haplotype PGS portability
     = base × r²_hap_tag, where r²_hap_tag > r²_tag because haplotypes
     directly capture the cis interaction. -/
+noncomputable def portability (base r2 : ℝ) : ℝ := base * r2
+
 theorem haplotype_pgs_more_portable_for_cis
     (base r2_tag r2_hap_tag : ℝ)
     (h_base : 0 < base)
     (h_tag_pos : 0 < r2_tag)
     (h_hap_better : r2_tag < r2_hap_tag) :
-    base * r2_tag < base * r2_hap_tag := by
+    portability base r2_tag < portability base r2_hap_tag := by
+  dsimp [portability]
   exact mul_lt_mul_of_pos_left h_hap_better h_base
 
 /-- **But haplotype PGS can overfit in training population.**
     With many rare haplotypes, the haplotype effects may be
     poorly estimated and population-specific.
     Model: overfitting penalty is proportional to the number of free parameters p.
-    Haplotype PGS has more parameters (p_hap > p_snp), so the cross-population
+    For k loci, SNPs have k parameters, but haplotypes have up to 2^k - 1 parameters.
+    Haplotype PGS has more parameters, so the cross-population
     gap (same - cross) is larger for haplotype PGS.
     gap = α × p where α > 0 is the per-parameter overfitting rate. -/
+noncomputable def overfittingPenalty (alpha : ℝ) (p : ℕ) : ℝ := alpha * p
+
 theorem haplotype_pgs_overfitting_risk
-    (alpha : ℝ) (p_snp p_hap : ℕ)
+    (alpha : ℝ) (k : ℕ)
     (h_alpha : 0 < alpha)
-    (h_more_params : p_snp < p_hap) :
-    alpha * p_snp < alpha * p_hap := by
-  have : (p_snp : ℝ) < (p_hap : ℝ) := Nat.cast_lt.mpr h_more_params
+    (hk : 1 < k) :
+    overfittingPenalty alpha k < overfittingPenalty alpha (2^k - 1) := by
+  dsimp [overfittingPenalty]
+  have h_more_params : k < 2^k - 1 := by
+    have h1 : k + 2 ≤ 2^k := by
+      induction' k, hk using Nat.le_induction with n hn ih
+      · norm_num
+      · calc
+          n + 1 + 2 = (n + 2) + 1 := by ring
+          _ ≤ 2^n + 1 := Nat.add_le_add_right ih 1
+          _ ≤ 2^n + 2^n := by
+            have h2 : 1 ≤ 2^n := Nat.one_le_two_pow
+            exact Nat.add_le_add_left h2 (2^n)
+          _ = 2 * 2^n := by ring
+          _ = 2^(n+1) := by ring
+    have h2 : 2^k - 1 + 1 = 2^k := Nat.sub_add_cancel (by linarith [Nat.one_le_two_pow (n := k)])
+    omega
+  have : (k : ℝ) < (2^k - 1 : ℕ) := Nat.cast_lt.mpr h_more_params
   exact mul_lt_mul_of_pos_left this h_alpha
 
 end HaplotypePGS
