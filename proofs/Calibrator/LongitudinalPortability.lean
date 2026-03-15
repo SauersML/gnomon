@@ -429,13 +429,20 @@ theorem diagnostic_change_creates_apparent_loss
     Model: stability = 1 - max_variant_contribution, where
     max_variant_contribution = max(β²_i) / Σ β²_i.
     Polygenic traits have many small effects → smaller max contribution.
-    Oligogenic traits have few large effects → larger max contribution. -/
+    Oligogenic traits have few large effects → larger max contribution.
+    Since stability is inversely related to max_variant_contribution,
+    the polygenic trait has strictly higher stability. -/
+noncomputable def pgs_temporal_stability (max_variant_contribution : ℝ) : ℝ :=
+  1 - max_variant_contribution
+
 theorem polygenic_more_temporally_stable
     (max_contrib_poly max_contrib_oligo : ℝ)
     (h_poly_small : 0 ≤ max_contrib_poly) (h_poly_le : max_contrib_poly ≤ 1)
     (h_oligo_small : 0 ≤ max_contrib_oligo) (h_oligo_le : max_contrib_oligo ≤ 1)
     (h_poly_more_even : max_contrib_poly < max_contrib_oligo) :
-    1 - max_contrib_oligo < 1 - max_contrib_poly := by linarith
+    pgs_temporal_stability max_contrib_oligo < pgs_temporal_stability max_contrib_poly := by
+  unfold pgs_temporal_stability
+  linarith
 
 end CrossTemporalValidation
 

@@ -124,22 +124,30 @@ theorem chi_squared_nonneg {k : ℕ}
   intro i _
   exact div_nonneg (sq_nonneg _) (le_of_lt (h_exp i))
 
-/-- **Residual analysis for portability model.**
-    If the neutral model predicts R²(d) = (1-Fst(d))/(1-Fst(0)),
-    the residual at distance d is: observed R² - predicted R².
-    Systematic positive residuals → model underestimates portability.
-    Systematic negative residuals → model overestimates portability. -/
+/-- **Residual of a portability model.**
+    If the neutral model predicts R²_pred, the residual is: R²_obs - R²_pred. -/
+noncomputable def portabilityResidual (r2_observed r2_predicted : ℝ) : ℝ :=
+  r2_observed - r2_predicted
+
+/-- **Positive residual interpretation.**
+    If the observed portability is strictly greater than the model prediction,
+    the residual is strictly positive, indicating the model underestimates portability. -/
 theorem residual_sign_interpretation
     (r2_observed r2_predicted : ℝ)
-    (h_positive_residual : r2_predicted < r2_observed) :
-    -- Model underestimates portability
-    0 < r2_observed - r2_predicted := by linarith
+    (h_underestimates : r2_predicted < r2_observed) :
+    0 < portabilityResidual r2_observed r2_predicted := by
+  unfold portabilityResidual
+  linarith
 
+/-- **Negative residual interpretation.**
+    If the observed portability is strictly less than the model prediction,
+    the residual is strictly negative, indicating the model overestimates portability. -/
 theorem residual_negative_interpretation
     (r2_observed r2_predicted : ℝ)
-    (h_negative_residual : r2_observed < r2_predicted) :
-    -- Model overestimates portability
-    r2_observed - r2_predicted < 0 := by linarith
+    (h_overestimates : r2_observed < r2_predicted) :
+    portabilityResidual r2_observed r2_predicted < 0 := by
+  unfold portabilityResidual
+  linarith
 
 end GoodnessOfFit
 
