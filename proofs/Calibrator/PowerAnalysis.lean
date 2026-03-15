@@ -543,11 +543,65 @@ theorem invest_in_undersampled (n_large n_small delta C : ℝ)
 /-- **Multi-ancestry GWAS sum of R² is maximized by balanced allocation.**
     Total utility = Σ_pop w_pop × R²_pop.
     With equal weights and diminishing returns, balanced allocation
-    maximizes total utility. -/
-theorem balanced_allocation_maximizes_total_utility
-    (r2_A r2_B r2_A' r2_B' : ℝ)
-    (h_A_improves : r2_A ≤ r2_A') (h_B_improves : r2_B ≤ r2_B') :
-    r2_A + r2_B ≤ r2_A' + r2_B' := by linarith
+    maximizes total utility.
+
+    This replaces a tautological sum inequality with a rigorous proof that for
+    a fixed total budget `2n`, the balanced allocation `(n, n)` achieves strictly
+    greater combined R² than an imbalanced allocation `(n - delta, n + delta)`
+    under the standard scaling model. -/
+theorem balanced_allocation_maximizes_total_utility (n delta C : ℝ)
+    (h_C : 0 < C) (h_delta : 0 < delta) (h_n_minus_delta : 0 ≤ n - delta) :
+    r2ScalingModel (n - delta) C + r2ScalingModel (n + delta) C <
+      2 * r2ScalingModel n C := by
+  unfold r2ScalingModel
+  have h1 : 0 < n - delta + C := by linarith
+  have h2 : 0 < n + delta + C := by linarith
+  have h3 : 0 < n + C := by linarith
+  have eq1 : (n - delta) / (n - delta + C) = 1 - C / (n - delta + C) := by
+    calc (n - delta) / (n - delta + C)
+      _ = (n - delta + C - C) / (n - delta + C) := by ring_nf
+      _ = (n - delta + C) / (n - delta + C) - C / (n - delta + C) := by rw [sub_div]
+      _ = 1 - C / (n - delta + C) := by rw [div_self (ne_of_gt h1)]
+  have eq2 : (n + delta) / (n + delta + C) = 1 - C / (n + delta + C) := by
+    calc (n + delta) / (n + delta + C)
+      _ = (n + delta + C - C) / (n + delta + C) := by ring_nf
+      _ = (n + delta + C) / (n + delta + C) - C / (n + delta + C) := by rw [sub_div]
+      _ = 1 - C / (n + delta + C) := by rw [div_self (ne_of_gt h2)]
+  have eq3 : n / (n + C) = 1 - C / (n + C) := by
+    calc n / (n + C)
+      _ = (n + C - C) / (n + C) := by ring_nf
+      _ = (n + C) / (n + C) - C / (n + C) := by rw [sub_div]
+      _ = 1 - C / (n + C) := by rw [div_self (ne_of_gt h3)]
+  rw [eq1, eq2, eq3]
+  have h_alg : 1 - C / (n - delta + C) + (1 - C / (n + delta + C)) < 2 * (1 - C / (n + C)) ↔
+      2 * (C / (n + C)) < C / (n - delta + C) + C / (n + delta + C) := by
+    constructor <;> intro h <;> linarith
+  rw [h_alg]
+  have h_alg2 : 2 * (C / (n + C)) = C * (2 / (n + C)) := by ring
+  have h_alg3 : C / (n - delta + C) + C / (n + delta + C) = C * (1 / (n - delta + C) + 1 / (n + delta + C)) := by ring
+  rw [h_alg2, h_alg3]
+  apply mul_lt_mul_of_pos_left _ h_C
+  have h_denom_mul : (n - delta + C) * (n + delta + C) = (n + C)^2 - delta^2 := by ring
+  have h_add_frac : 1 / (n - delta + C) + 1 / (n + delta + C) = (n + delta + C + (n - delta + C)) / ((n - delta + C) * (n + delta + C)) := by
+    rw [div_add_div _ _ (ne_of_gt h1) (ne_of_gt h2)]
+    ring_nf
+  rw [h_add_frac]
+  have h_num : n + delta + C + (n - delta + C) = 2 * (n + C) := by ring
+  rw [h_num, h_denom_mul]
+  have h_denom_pos : 0 < (n + C)^2 - delta^2 := by
+    calc 0 < (n - delta + C) * (n + delta + C) := mul_pos h1 h2
+         _ = (n + C)^2 - delta^2 := by ring
+  have hs1 : 2 / (n + C) = 2 * (n + C) / ((n + C) * (n + C)) := by
+    rw [div_eq_div_iff (ne_of_gt h3) (mul_ne_zero (ne_of_gt h3) (ne_of_gt h3))]
+    ring
+  rw [hs1]
+  have hs2 : (n + C) * (n + C) = (n + C)^2 := by ring
+  rw [hs2]
+  apply div_lt_div_of_pos_left
+  · exact mul_pos (by linarith) h3
+  · positivity
+  · have : delta^2 > 0 := by positivity
+    linarith
 
 end OptimalAllocation
 
