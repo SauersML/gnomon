@@ -545,9 +545,89 @@ theorem invest_in_undersampled (n_large n_small delta C : ℝ)
     With equal weights and diminishing returns, balanced allocation
     maximizes total utility. -/
 theorem balanced_allocation_maximizes_total_utility
-    (r2_A r2_B r2_A' r2_B' : ℝ)
-    (h_A_improves : r2_A ≤ r2_A') (h_B_improves : r2_B ≤ r2_B') :
-    r2_A + r2_B ≤ r2_A' + r2_B' := by linarith
+    (n delta C : ℝ)
+    (h_C : 0 < C) (h_delta : 0 < delta) (h_n : delta < n) :
+    r2ScalingModel (n - delta) C + r2ScalingModel (n + delta) C <
+    r2ScalingModel n C + r2ScalingModel n C := by
+  unfold r2ScalingModel
+  have h1 : 0 < n - delta + C := by linarith
+  have h2 : 0 < n + C := by linarith
+  have h3 : 0 < n + delta + C := by linarith
+  have h1_ne : n - delta + C ≠ 0 := by linarith
+  have h2_ne : n + C ≠ 0 := by linarith
+  have h3_ne : n + delta + C ≠ 0 := by linarith
+
+  have hr1 : (n - delta) / (n - delta + C) = 1 - C / (n - delta + C) := by
+    calc (n - delta) / (n - delta + C)
+      _ = (n - delta + C - C) / (n - delta + C) := by ring_nf
+      _ = (n - delta + C) / (n - delta + C) - C / (n - delta + C) := by ring
+      _ = 1 - C / (n - delta + C) := by rw [div_self h1_ne]
+
+  have hr2 : (n + delta) / (n + delta + C) = 1 - C / (n + delta + C) := by
+    calc (n + delta) / (n + delta + C)
+      _ = (n + delta + C - C) / (n + delta + C) := by ring_nf
+      _ = (n + delta + C) / (n + delta + C) - C / (n + delta + C) := by ring
+      _ = 1 - C / (n + delta + C) := by rw [div_self h3_ne]
+
+  have hr3 : n / (n + C) = 1 - C / (n + C) := by
+    calc n / (n + C)
+      _ = (n + C - C) / (n + C) := by ring_nf
+      _ = (n + C) / (n + C) - C / (n + C) := by ring
+      _ = 1 - C / (n + C) := by rw [div_self h2_ne]
+
+  rw [hr1, hr2, hr3]
+
+  -- We want: 1 - C/(n-delta+C) + (1 - C/(n+delta+C)) < 1 - C/(n+C) + (1 - C/(n+C))
+  -- 2 - (C/(n-delta+C) + C/(n+delta+C)) < 2 - 2C/(n+C)
+  -- So we need to prove: 2C/(n+C) < C/(n-delta+C) + C/(n+delta+C)
+  have goal_trans : 2 * (C / (n + C)) < C / (n - delta + C) + C / (n + delta + C) →
+                    1 - C / (n - delta + C) + (1 - C / (n + delta + C)) <
+                    1 - C / (n + C) + (1 - C / (n + C)) := by
+    intro h
+    calc 1 - C / (n - delta + C) + (1 - C / (n + delta + C))
+      _ = 2 - (C / (n - delta + C) + C / (n + delta + C)) := by ring
+      _ < 2 - 2 * (C / (n + C)) := by linarith
+      _ = 1 - C / (n + C) + (1 - C / (n + C)) := by ring
+
+  apply goal_trans
+
+  -- Prove 2 * (C / (n + C)) < C / (n - delta + C) + C / (n + delta + C)
+  -- Factor out C
+  have sum_fractions : C / (n - delta + C) + C / (n + delta + C) =
+                       C * (1 / (n - delta + C) + 1 / (n + delta + C)) := by ring
+  rw [sum_fractions]
+
+  have lhs_fraction : 2 * (C / (n + C)) = C * (2 / (n + C)) := by ring
+  rw [lhs_fraction]
+
+  -- Since C > 0, we just need to prove 2/(n+C) < 1/(n-delta+C) + 1/(n+delta+C)
+  have C_pos_mul : 2 / (n + C) < 1 / (n - delta + C) + 1 / (n + delta + C) →
+                   C * (2 / (n + C)) < C * (1 / (n - delta + C) + 1 / (n + delta + C)) := by
+    intro h
+    exact (mul_lt_mul_iff_of_pos_left h_C).mpr h
+
+  apply C_pos_mul
+
+  -- Now prove 2/(n+C) < 1/(n-delta+C) + 1/(n+delta+C)
+  have denom_pos : 0 < (n - delta + C) * (n + delta + C) := mul_pos h1 h3
+  have sum_fractions2 : 1 / (n - delta + C) + 1 / (n + delta + C) =
+                        (n + delta + C + (n - delta + C)) / ((n - delta + C) * (n + delta + C)) := by
+    rw [div_add_div _ _ h1_ne h3_ne]
+    ring_nf
+
+  rw [sum_fractions2]
+  have num_simp : n + delta + C + (n - delta + C) = 2 * (n + C) := by ring
+  rw [num_simp]
+
+  -- Prove 2/(n+C) < 2(n+C)/((n-delta+C)(n+delta+C))
+  rw [div_lt_div_iff₀ h2 denom_pos]
+
+  calc 2 * ((n - delta + C) * (n + delta + C))
+    _ = 2 * ((n + C)^2 - delta^2) := by ring
+    _ < 2 * (n + C)^2 := by
+      have h_delta_sq : 0 < delta^2 := sq_pos_of_pos h_delta
+      linarith
+    _ = (2 * (n + C)) * (n + C) := by ring
 
 end OptimalAllocation
 
