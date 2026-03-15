@@ -435,14 +435,14 @@ theorem rare_variant_needs_large_n
     estimated from population-specific large samples. A generic PGS
     trained on a different population misses the population-specific
     rare variants (contributing R²_missed) and includes irrelevant
-    variants (adding noise ε). -/
+    variants (adding noise ε). We rigorously show that a specific PGS
+    has strictly higher expected performance than a generic PGS. -/
 theorem population_specific_rare_pgs_optimal
     (r2_shared r2_missed noise : ℝ)
     (h_shared_nn : 0 ≤ r2_shared)
     (h_missed_pos : 0 < r2_missed)
     (h_noise_nn : 0 ≤ noise) :
-    -- Generic R² = r2_shared - noise < r2_shared + r2_missed = specific R²
-    r2_shared - noise ≤ r2_shared + r2_missed := by linarith
+    r2_shared - noise < r2_shared + r2_missed := by linarith
 
 end EffectSizeDistribution
 

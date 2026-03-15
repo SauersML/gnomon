@@ -189,13 +189,21 @@ section ConditionalIntervals
 
 /-- **Ancestry-stratified intervals are narrower than marginal intervals.**
     Within each ancestry group, the residual variance is smaller than
-    the overall residual variance (by the law of total variance). -/
+    the overall residual variance (by the law of total variance).
+    If we stratify into groups, the expected width of the prediction
+    interval is smaller since width is proportional to sqrt(variance). -/
 theorem stratified_intervals_narrower
-    (var_within var_between var_total : ℝ)
+    (z var_within var_between var_total : ℝ)
+    (hz : 0 < z)
     (h_decomp : var_total = var_within + var_between)
     (h_between_pos : 0 < var_between)
     (h_within_nn : 0 ≤ var_within) :
-    var_within < var_total := by linarith
+    2 * z * Real.sqrt var_within < 2 * z * Real.sqrt var_total := by
+  have h_total_pos : 0 < var_total := by linarith
+  have h_var_lt : var_within < var_total := by linarith
+  have h_sqrt_lt : Real.sqrt var_within < Real.sqrt var_total :=
+    Real.sqrt_lt_sqrt h_within_nn h_var_lt
+  exact mul_lt_mul_of_pos_left h_sqrt_lt (by positivity)
 
 /-- **Law of total variance for prediction intervals.**
     Var(ε) = E[Var(ε|A)] + Var(E[ε|A]).
@@ -518,13 +526,18 @@ theorem cross_population_info_loss
     Y_target → Genetics → PGS forms a Markov chain (DPI).
     Any post-processing of PGS cannot increase prediction quality.
     Since PGS is a deterministic function of genotypes, and R² is monotone
-    in mutual information, R²_PGS ≤ h²_SNP (the SNP heritability). -/
+    in mutual information, R²_PGS ≤ h²_SNP (the SNP heritability).
+    Therefore, the residual variance using the PGS is bounded below by
+    the irreducible genetic residual variance Var(Y)(1 - h²_SNP). -/
 theorem data_processing_inequality_portability
-    (h2_snp r2_pgs : ℝ)
+    (varY h2_snp r2_pgs : ℝ)
+    (h_varY : 0 < varY)
     (h_h2_pos : 0 < h2_snp) (h_h2_le : h2_snp ≤ 1)
     (h_r2_nn : 0 ≤ r2_pgs) (h_r2_le : r2_pgs ≤ h2_snp) :
-    -- The residual variance under PGS is at least as large as under full genetics
-    1 - h2_snp ≤ 1 - r2_pgs := by linarith
+    residualVariance varY h2_snp ≤ residualVariance varY r2_pgs := by
+  unfold residualVariance
+  apply mul_le_mul_of_nonneg_left _ (le_of_lt h_varY)
+  linarith
 
 end InformationTheoreticBounds
 

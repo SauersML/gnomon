@@ -291,32 +291,40 @@ theorem region_disproportionate_variance
   linarith
 
 /-- **Trait portability is bounded by effect correlation.**
-    For any trait under population-specific selection (e.g., pathogen-driven
-    for immune traits), the cross-population effect correlation ρ
-    is reduced from a baseline by δ_selection > 0. Given any baseline ρ₀,
-    the post-selection correlation ρ₀ - δ is strictly less than ρ₀.
+    For any trait under population-specific selection, the cross-population effect correlation ρ
+    is reduced. Since portability ratio scales quadratically with effect correlation ρ²,
+    a reduced correlation strictly reduces the portability upper bound.
 
     Worked example: For immune traits, ρ_baseline > 0.9 but pathogen-driven
     selection can reduce it substantially (e.g., WBC, lymphocyte count). -/
 theorem selection_reduces_effect_correlation
-    (rho_baseline δ_selection : ℝ)
-    (h_selection : 0 < δ_selection) :
-    rho_baseline - δ_selection < rho_baseline := by linarith
+    (rho_baseline rho_selection : ℝ)
+    (h_base_pos : 0 ≤ rho_baseline)
+    (h_sel_pos : 0 ≤ rho_selection)
+    (h_reduced : rho_selection < rho_baseline) :
+    rho_selection ^ 2 < rho_baseline ^ 2 := by
+  nlinarith
 
 /-- **Selection-driven portability falls below neutral expectation.**
-    For any trait where observed portability is below a threshold and the
-    neutral prediction exceeds that threshold, the trait's portability is
-    strictly below the neutral expectation. This gap indicates the presence
-    of non-neutral forces (e.g., directional selection, GxE interactions).
+    For a trait where the true portability is reduced by selection, it falls
+    below the neutral model prediction which only accounts for drift. We
+    model this by showing that if portability is defined as a product of
+    drift_retention and effect_correlation², and selection strictly reduces
+    effect_correlation from a neutral baseline of 1, then the observed
+    portability strictly falls below the neutral drift prediction.
 
     Worked example: WBC portability EUR→AFR is ~20-30% of source R²,
     while neutral prediction gives ~85%. The gap is from the Duffy null
     variant (DARC/ACKR1) with large frequency differences due to malaria selection. -/
 theorem observed_portability_below_neutral
-    (port_observed port_neutral threshold : ℝ)
-    (h_observed : port_observed < threshold)
-    (h_neutral : threshold < port_neutral) :
-    port_observed < port_neutral := by linarith
+    (drift_retention rho_selection : ℝ)
+    (h_drift_pos : 0 < drift_retention)
+    (h_sel_pos : 0 ≤ rho_selection)
+    (h_reduced : rho_selection < 1) :
+    drift_retention * rho_selection ^ 2 < drift_retention := by
+  have h_sq_lt_one : rho_selection ^ 2 < 1 := by
+    nlinarith
+  exact mul_lt_of_lt_one_right h_drift_pos h_sq_lt_one
 
 /-- **Allele under selection contributes disproportionally to portability loss.**
     If a selected allele explains a fraction f of genetic variance

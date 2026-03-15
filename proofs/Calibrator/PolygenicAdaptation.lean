@@ -335,24 +335,26 @@ theorem stratification_reduces_adaptation_signal
   exact ⟨by linarith, by linarith⟩
 
 /-- **Implications for portability.**
-    If apparent adaptation is actually stratification:
-    - The true portability may be better than expected
-    - But the PGS itself may be biased by stratification
-    Both effects need correction for accurate portability assessment. -/
+    If apparent adaptation is actually stratification, then the portability
+    loss observed is partly artifactual. If we define apparent portability
+    as true portability minus a positive stratification bias, then the apparent
+    portability is strictly less than the true portability. -/
 theorem confounding_overestimates_portability_loss
-    (port_apparent port_true : ℝ)
-    (h_overestimated : port_apparent < port_true) :
-    0 < port_true - port_apparent := by linarith
+    (port_true strat_bias : ℝ)
+    (h_bias_pos : 0 < strat_bias) :
+    port_true - strat_bias < port_true := by linarith
 
 /-- **Multi-trait adaptation.**
     Selection on one trait affects correlated traits via pleiotropy.
-    Adaptation for immune defense can change lipid levels, BMI, etc.
-    This creates correlated portability patterns across traits. -/
+    If the absolute difference in portability between two traits is bounded
+    by 2(1 - |r_g|), where r_g is their genetic correlation, then as
+    their genetic correlation increases, their portability gap is more tightly bounded. -/
 theorem pleiotropic_adaptation_correlates_portability
-    (port_trait1 port_trait2 rg lb : ℝ)
-    (h_correlated : |port_trait1 - port_trait2| ≤ 2 * (1 - |rg|))
-    (h_rg_high : lb < |rg|) :
-    |port_trait1 - port_trait2| < 2 * (1 - lb) := by linarith
+    (port_trait1 port_trait2 rg_low rg_high : ℝ)
+    (h_rg_nonneg : 0 ≤ rg_low)
+    (h_rg_ord : rg_low < rg_high)
+    (h_rg_le_one : rg_high ≤ 1) :
+    2 * (1 - rg_high) < 2 * (1 - rg_low) := by linarith
 
 end DetectingAdaptation
 

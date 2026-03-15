@@ -316,12 +316,18 @@ theorem portability_loss_decomposition
 
 /-- **Technical loss is fixable; genetic loss is fundamental.**
     WGS + diverse reference panels can eliminate technical loss.
-    Genetic loss requires new GWAS in target populations. -/
+    Genetic loss requires new GWAS in target populations.
+    If the technical loss is removed, the remaining portability loss is just
+    the genetic loss. We show that the portability under WGS (no technical loss)
+    is strictly greater than portability under array + imputation when
+    imputation accuracy is imperfect. -/
 theorem technical_loss_eliminable
-    (loss_with_tech loss_without_tech : ℝ)
-    (h_eliminated : loss_without_tech < loss_with_tech)
-    (h_nn : 0 ≤ loss_without_tech) :
-    0 ≤ loss_with_tech - loss_without_tech := by linarith
+    (r2_genetic r2_imputed : ℝ)
+    (h_gen_pos : 0 < r2_genetic)
+    (h_imp_pos : 0 ≤ r2_imputed)
+    (h_imp_lt : r2_imputed < 1) :
+    r2_genetic * r2_imputed < r2_genetic := by
+  exact mul_lt_of_lt_one_right h_gen_pos h_imp_lt
 
 end ArrayAscertainment
 
