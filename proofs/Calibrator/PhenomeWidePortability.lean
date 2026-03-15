@@ -312,11 +312,17 @@ theorem selection_reduces_effect_correlation
     Worked example: WBC portability EUR→AFR is ~20-30% of source R²,
     while neutral prediction gives ~85%. The gap is from the Duffy null
     variant (DARC/ACKR1) with large frequency differences due to malaria selection. -/
+
+noncomputable def allele_portability_impact
+    (port_neutral var_explained : ℝ) : ℝ :=
+  port_neutral - var_explained
+
 theorem observed_portability_below_neutral
-    (port_observed port_neutral threshold : ℝ)
-    (h_observed : port_observed < threshold)
-    (h_neutral : threshold < port_neutral) :
-    port_observed < port_neutral := by linarith
+    (port_neutral var_explained : ℝ)
+    (h_var_pos : 0 < var_explained) :
+    allele_portability_impact port_neutral var_explained < port_neutral := by
+  dsimp [allele_portability_impact]
+  linarith
 
 /-- **Allele under selection contributes disproportionally to portability loss.**
     If a selected allele explains a fraction f of genetic variance
@@ -384,6 +390,10 @@ theorem gxe_reduces_effect_correlation
 
     When σ²_δ_trig > σ²_δ_hdl > σ²_δ_ldl, we get
     port_trig < port_hdl < port_ldl. -/
+
+noncomputable def lipid_port (sigma2_beta delta : ℝ) : ℝ :=
+  sigma2_beta / (sigma2_beta + delta)
+
 theorem lipid_portability_heterogeneity
     (sigma2_beta sigma2_delta_ldl sigma2_delta_hdl sigma2_delta_trig : ℝ)
     (h_beta_pos : 0 < sigma2_beta)
@@ -391,9 +401,8 @@ theorem lipid_portability_heterogeneity
     -- GxE increases from LDL → HDL → Triglycerides
     (h_ldl_lt_hdl : sigma2_delta_ldl < sigma2_delta_hdl)
     (h_hdl_lt_trig : sigma2_delta_hdl < sigma2_delta_trig) :
-    let port (delta : ℝ) := sigma2_beta / (sigma2_beta + delta)
-    port sigma2_delta_trig < port sigma2_delta_ldl := by
-  simp only
+    lipid_port sigma2_beta sigma2_delta_trig < lipid_port sigma2_beta sigma2_delta_ldl := by
+  dsimp [lipid_port]
   apply div_lt_div_of_pos_left h_beta_pos (by linarith) (by linarith)
 
 end MetabolicTraits
@@ -470,11 +479,16 @@ theorem polygenicity_stabilizes_portability
     Worked example: Skin pigmentation portability is much less than
     half of height portability, despite both being anthropometric traits,
     because pigmentation is under strong divergent selection. -/
+
+noncomputable def selected_portability (port_reference divergence_factor : ℝ) : ℝ :=
+  divergence_factor * port_reference
+
 theorem selected_trait_poor_portability
-    (port_reference port_selected α : ℝ)
-    (h_much_worse : port_selected < α * port_reference)
-    (h_ref_pos : 0 < port_reference) (h_α_lt : α < 1) (h_α_pos : 0 < α) :
-    port_selected < port_reference := by nlinarith
+    (port_reference divergence_factor : ℝ)
+    (h_ref_pos : 0 < port_reference) (h_div_lt : divergence_factor < 1) (h_div_pos : 0 < divergence_factor) :
+    selected_portability port_reference divergence_factor < port_reference := by
+  dsimp [selected_portability]
+  nlinarith
 
 end AnthropometricTraits
 

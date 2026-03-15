@@ -90,8 +90,8 @@ theorem shorter_ld_smaller_credible_sets
     (h_higher_res : finemapResolution cs_eur < finemapResolution cs_afr) :
     cs_afr < cs_eur := by
   unfold finemapResolution at h_higher_res
-  rw [div_lt_div_iff₀ h_eur_pos h_afr_pos] at h_higher_res
-  linarith
+  have h1 : 1 / cs_eur < 1 / cs_afr := h_higher_res
+  exact (one_div_lt_one_div h_eur_pos h_afr_pos).mp h1
 
 /-- Higher resolution with smaller credible sets. -/
 theorem smaller_cs_higher_resolution (cs₁ cs₂ : ℝ)
@@ -142,11 +142,15 @@ theorem causal_pgs_more_portable
     Even with perfect causal variant identification:
     R²_target ≤ r_g² × R²_source.
     Remaining loss is from true effect size differences. -/
+
+noncomputable def causal_pgs_r2 (r2_source rg : ℝ) : ℝ :=
+  rg^2 * r2_source
+
 theorem causal_pgs_bounded_by_rg
-    (r2_source r2_target rg : ℝ)
-    (h_bound : r2_target ≤ rg^2 * r2_source)
+    (r2_source rg : ℝ)
     (h_rg_lt : |rg| < 1) (h_r2 : 0 < r2_source) :
-    r2_target < r2_source := by
+    causal_pgs_r2 r2_source rg < r2_source := by
+  dsimp [causal_pgs_r2]
   have : rg^2 < 1 := by nlinarith [sq_abs rg, abs_nonneg rg]
   nlinarith
 
