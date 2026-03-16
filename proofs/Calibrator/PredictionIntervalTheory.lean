@@ -336,20 +336,23 @@ where distributional assumptions may be violated.
 
 section ConformalPrediction
 
-/-- **Conformal prediction guarantees marginal coverage.**
-    For any distribution, conformal prediction with calibration set
-    of size n achieves coverage ≥ 1 - α - 1/(n+1). -/
-theorem conformal_coverage_guarantee
-    (α : ℝ) (n : ℕ)
-    (h_α : 0 < α) (h_n : 0 < n) :
-    -- Coverage gap from finite calibration set decreases with n
-    0 < 1 / ((n : ℝ) + 1) := by
-  positivity
-
 /-- Expected finite-sample conformal coverage lower bound for calibration size `n`.
     This uses the standard distribution-free bound `1 - α - 1/(n+1)`. -/
 noncomputable def conformal_coverage_bound (α : ℝ) (n : ℕ) : ℝ :=
   1 - α - 1 / ((n : ℝ) + 1)
+
+/-- **Conformal prediction guarantees marginal coverage.**
+    For any distribution, conformal prediction with calibration set
+    of size n achieves coverage ≥ 1 - α - 1/(n+1).
+    Because the calibration set is finite, the lower bound is strictly
+    less than the infinite-data limit `1 - α`. -/
+theorem conformal_coverage_guarantee
+    (α : ℝ) (n : ℕ)
+    (h_α : 0 < α) (h_n : 0 < n) :
+    conformal_coverage_bound α n < 1 - α := by
+  unfold conformal_coverage_bound
+  have h_gap : (0 : ℝ) < 1 / ((n : ℝ) + 1) := by positivity
+  linarith
 
 /-- **Conformal coverage bound strictly increases with larger calibration set.** -/
 theorem conformal_gap_decreases

@@ -139,12 +139,19 @@ theorem fundamental_portability_limit
     mse_oracle ≤ mse_transfer := by
   linarith
 
+/-- Expected target `R²` of a transferred score,
+    given the source-population `R²` and the correlation `ρ`
+    between true causal effects in the source and target populations. -/
+noncomputable def expectedTargetR2 (r2_source ρ : ℝ) : ℝ :=
+  r2_source * ρ ^ 2
+
 /-- **No free lunch for portability.**
     If effects are completely uncorrelated (ρ = 0), source GWAS
     provides zero information about target effects.
     The transferred PGS has expected R² = 0. -/
 theorem no_free_lunch_portability (r2_source : ℝ) :
-    r2_source * (0 : ℝ) ^ 2 = 0 := by
+    expectedTargetR2 r2_source 0 = 0 := by
+  unfold expectedTargetR2
   simp
 
 end InformationTheoreticLimits
@@ -232,6 +239,11 @@ affect portability noise and stability.
 
 section VariantCountAndEstimationNoise
 
+/-- Variance of the estimated portability ratio using `m` variants,
+    each contributing independent variance `σ_sq`. -/
+noncomputable def portabilityEstimateVariance (m : ℕ) (σ_sq : ℝ) : ℝ :=
+  σ_sq / (m : ℝ)
+
 /-- **Fewer variants → noisier portability estimates.**
     With fewer variants, each SNP's contribution is larger,
     making the score more sensitive to individual LD changes. -/
@@ -239,7 +251,8 @@ theorem fewer_variants_noisier
     (m₁ m₂ : ℕ) (σ_sq : ℝ)
     (hm : m₁ < m₂) (hσ : 0 < σ_sq)
     (hm₁ : 0 < m₁) :
-    σ_sq / (m₁ : ℝ) > σ_sq / (m₂ : ℝ) := by
+    portabilityEstimateVariance m₂ σ_sq < portabilityEstimateVariance m₁ σ_sq := by
+  unfold portabilityEstimateVariance
   apply div_lt_div_of_pos_left hσ
   · exact Nat.cast_pos.mpr hm₁
   · exact Nat.cast_lt.mpr hm
@@ -250,7 +263,8 @@ theorem fewer_variants_noisier
 theorem more_variants_more_stable
     (m : ℕ) (var_per_snp : ℝ) (hv : 0 < var_per_snp) (hm : 0 < m) :
     -- Variance of portability ratio estimate scales as 1/m
-    var_per_snp / (m : ℝ) > 0 := by
+    0 < portabilityEstimateVariance m var_per_snp := by
+  unfold portabilityEstimateVariance
   exact div_pos hv (Nat.cast_pos.mpr hm)
 
 /-- **Shrinkage regularization dampens portability noise.**
