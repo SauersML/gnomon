@@ -340,9 +340,11 @@ theorem stratification_reduces_adaptation_signal
     - But the PGS itself may be biased by stratification
     Both effects need correction for accurate portability assessment. -/
 theorem confounding_overestimates_portability_loss
-    (port_apparent port_true : ℝ)
-    (h_overestimated : port_apparent < port_true) :
-    0 < port_true - port_apparent := by linarith
+    (port_apparent port_true bias_confounding : ℝ)
+    (h_bias_pos : 0 < bias_confounding)
+    (h_apparent_eq : port_apparent = port_true - bias_confounding) :
+    port_apparent < port_true := by
+  linarith
 
 /-- **Multi-trait adaptation.**
     Selection on one trait affects correlated traits via pleiotropy.

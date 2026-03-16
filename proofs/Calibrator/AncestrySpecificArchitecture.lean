@@ -219,10 +219,12 @@ theorem gwas_h2_le_true (h2_true avg_r2_tag : ℝ)
     Source LD is tagged better in source-derived GWAS than target LD.
     This creates a technical portability artifact. -/
 theorem tagging_creates_portability_artifact
-    (h2_source_gwas h2_target_gwas h2_true : ℝ)
-    (h_source_better : h2_target_gwas < h2_source_gwas)
-    (h_true : h2_source_gwas ≤ h2_true) :
-    h2_target_gwas < h2_true := by linarith
+    (h2_true r2_tag_source r2_tag_target : ℝ)
+    (h_true_pos : 0 < h2_true)
+    (h_tag_diff : r2_tag_target < r2_tag_source) :
+    -- GWAS heritability is true heritability scaled by tagging fraction
+    h2_true * r2_tag_target < h2_true * r2_tag_source := by
+  exact mul_lt_mul_of_pos_left h_tag_diff h_true_pos
 
 end LDTagging
 

@@ -131,12 +131,16 @@ theorem more_correlated_more_informative
     is bounded below by the conditional entropy of target effects
     given source effects. No algorithm can beat this limit. -/
 theorem fundamental_portability_limit
-    (mse_transfer mse_oracle info_gap : ℝ)
-    -- Info gap from effect decorrelation
-    (h_gap : 0 ≤ info_gap)
-    -- Transfer MSE = oracle MSE + gap from missing information
-    (h_decomp : mse_transfer = mse_oracle + info_gap) :
-    mse_oracle ≤ mse_transfer := by
+    (mse_oracle h2_target rho_g : ℝ)
+    (_h_mse_oracle_nn : 0 ≤ mse_oracle)
+    (h_h2_pos : 0 < h2_target)
+    (h_rho_lt_one : rho_g < 1)
+    (_h_rho_nn : 0 ≤ rho_g) :
+    -- The transfer MSE (oracle plus the genetic correlation penalty)
+    -- is strictly greater than the oracle MSE.
+    mse_oracle < mse_oracle + h2_target * (1 - rho_g) := by
+  have h_gap : 0 < h2_target * (1 - rho_g) := by
+    apply mul_pos h_h2_pos (by linarith)
   linarith
 
 /-- **No free lunch for portability.**

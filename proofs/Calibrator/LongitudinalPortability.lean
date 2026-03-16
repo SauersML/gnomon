@@ -128,10 +128,15 @@ section EnvironmentalEpochs
     If V_GxE > 0, then a PGS trained in environment E₁
     has reduced R² in environment E₂. -/
 theorem environment_change_reduces_r2
-    (r2_same_env r2_diff_env V_GxE : ℝ)
-    (h_reduction : r2_diff_env = r2_same_env - V_GxE)
-    (h_gxe : 0 < V_GxE) :
-    r2_diff_env < r2_same_env := by linarith
+    (V_A V_GxE V_E : ℝ)
+    (h_A_pos : 0 < V_A)
+    (h_E_pos : 0 < V_E)
+    (h_gxe_pos : 0 < V_GxE) :
+    -- The R² in the new environment (with GxE reducing shared genetic variance)
+    -- is strictly less than the R² in the original environment.
+    (V_A - V_GxE) / (V_A + V_E) < V_A / (V_A + V_E) := by
+  have h_den : 0 < V_A + V_E := by linarith
+  exact (div_lt_div_iff₀ h_den h_den).mpr (by nlinarith)
 
 /-- **Secular trends shift PGS distributions.**
     A secular trend (e.g., increasing height) shifts the
