@@ -329,6 +329,7 @@ impl GenotypeDataset {
                 let original_indices = std::mem::take(&mut selection.indices);
                 let original_keys = std::mem::take(&mut selection.keys);
                 let original_kinds = std::mem::take(&mut selection.match_kinds);
+                let original_missing = std::mem::take(&mut selection.missing);
 
                 let mut matched = HashMap::with_capacity(original_keys.len());
                 for ((index, key), kind) in original_indices
@@ -339,21 +340,30 @@ impl GenotypeDataset {
                     matched.insert(key.clone(), (index, key, kind));
                 }
 
+                let mut missing = HashSet::with_capacity(original_missing.len());
+                for key in original_missing {
+                    missing.insert(key);
+                }
+
                 let mut ordered_indices = Vec::with_capacity(matched.len());
                 let mut ordered_keys = Vec::with_capacity(matched.len());
                 let mut ordered_kinds = Vec::with_capacity(matched.len());
+                let mut ordered_missing = Vec::new();
 
                 for key in keys {
                     if let Some((index, stored_key, kind)) = matched.remove(key) {
                         ordered_indices.push(index);
                         ordered_keys.push(stored_key);
                         ordered_kinds.push(kind);
+                    } else if missing.contains(key) {
+                        ordered_missing.push(key.clone());
                     }
                 }
 
                 selection.indices = ordered_indices;
                 selection.keys = ordered_keys;
                 selection.match_kinds = ordered_kinds;
+                selection.missing = ordered_missing;
                 Ok(selection)
             }
         }

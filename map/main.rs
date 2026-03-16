@@ -1,4 +1,4 @@
-use super::fit::{FitOptions, HwePcaError, HwePcaModel, LdConfig, LdWindow};
+use super::fit::{FitOptions, HwePcaError, HwePcaModel, LdConfig, LdWindow, VariantBlockSource};
 use super::io::{
     DatasetOutputError, GenotypeDataset, GenotypeIoError, OrderedSelectionPlan,
     ProjectionOutputPaths, SelectionPlan, create_projection_matrix_sink, load_hwe_model,
@@ -6,8 +6,9 @@ use super::io::{
 };
 use super::prefit::{self, BuiltinModelError};
 use super::progress::{fit_progress, projection_progress};
-use super::project::ProjectionOptions;
+use super::project::{GappedProjectionSource, ProjectionOptions};
 use super::variant_filter::{VariantFilter, VariantKey, VariantListError};
+use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -358,73 +359,89 @@ fn run_project(genotype_path: &Path, model_name: Option<&str>) -> Result<(), Map
         println!("Model genome build: {}", build);
     }
 
-    let mut selection_plan = SelectionPlan::All;
+    let mut source: Box<dyn VariantBlockSource<Error = GenotypeIoError>> =
+        if let Some(keys) = model.variant_keys() {
+            let selection_start = Instant::now();
+            let selection = dataset.select_variants_by_keys(keys)?;
+            let matched = selection.indices.len();
+            let missing = selection.missing.len();
 
-    if let Some(keys) = model.variant_keys() {
-        let selection_start = Instant::now();
-        match &dataset {
-            GenotypeDataset::Plink(_) | GenotypeDataset::Pgen(_) => {
-                let selection = dataset.select_variants_by_keys(keys)?;
-                if !selection.missing.is_empty() {
-                    return Err(MapDriverError::InvalidState(
-                        "Projection dataset is missing variants required by the model".into(),
-                    ));
-                }
-                if selection.indices.len() != model.n_variants() {
-                    return Err(MapDriverError::InvalidState(format!(
-                        "Model expects {} variants but matched {} in projection dataset",
-                        model.n_variants(),
-                        selection.indices.len()
-                    )));
-                }
-                println!(
-                    "Using stored variant subset with {} variants for projection",
-                    selection.indices.len()
-                );
-                if selection.indices.len() == model.n_variants()
-                    && selection
-                        .indices
-                        .iter()
-                        .enumerate()
-                        .all(|(expected, &actual)| expected == actual)
-                    && selection
-                        .match_kinds
-                        .iter()
-                        .all(|kind| *kind != super::variant_filter::MatchKind::Swap)
-                {
-                    selection_plan = SelectionPlan::All;
+            if matched == 0 {
+                return Err(MapDriverError::InvalidState(
+                    "Projection dataset does not overlap the model variant set".into(),
+                ));
+            }
+
+            println!(
+                "Model-key overlap: {matched} of {} variants{}",
+                model.n_variants(),
+                if missing > 0 {
+                    format!(" ({} absent in projection dataset)", missing)
                 } else {
-                    selection_plan = SelectionPlan::Ordered(OrderedSelectionPlan::new(
-                        selection.indices,
-                        selection.match_kinds,
-                    ));
+                    String::new()
                 }
-            }
-            GenotypeDataset::Variants(_) => {
-                println!(
-                    "Using stored variant subset with {} variants for projection",
-                    model.n_variants()
-                );
-                let filter = VariantFilter::from_keys(keys.iter().cloned());
-                selection_plan = SelectionPlan::ByKeys(Arc::new(filter));
-            }
-        }
-        println!(
-            "Variant selection time: {:.3}s",
-            selection_start.elapsed().as_secs_f64()
-        );
-    } else if let Some(known) = dataset.variant_count_hint()
-        && known > 0
-        && known != model.n_variants()
-    {
-        return Err(MapDriverError::InvalidState(format!(
-            "Model expects {} variants but dataset provides {}",
-            model.n_variants(),
-            known
-        )));
-    }
+            );
 
-    let mut source = dataset.block_source_with_plan(selection_plan)?;
+            let fast_path = missing == 0
+                && matched == model.n_variants()
+                && dataset.variant_count_hint() == Some(model.n_variants())
+                && selection
+                    .indices
+                    .iter()
+                    .enumerate()
+                    .all(|(expected, &actual)| expected == actual)
+                && selection
+                    .match_kinds
+                    .iter()
+                    .all(|kind| *kind != super::variant_filter::MatchKind::Swap);
+
+            let present_mask = if missing > 0 {
+                Some(projection_present_mask(keys, &selection.missing)?)
+            } else {
+                None
+            };
+
+            let source: Box<dyn VariantBlockSource<Error = GenotypeIoError>> = if fast_path {
+                println!("Using full model variant set without overlap remapping for projection");
+                Box::new(dataset.block_source_with_plan(SelectionPlan::All)?)
+            } else {
+                println!(
+                    "Using stored variant subset with {} matched variants for projection",
+                    matched
+                );
+                let ordered_plan = SelectionPlan::Ordered(OrderedSelectionPlan::new(
+                    selection.indices,
+                    selection.match_kinds,
+                ));
+                let inner = dataset.block_source_with_plan(ordered_plan)?;
+                if let Some(present_mask) = present_mask {
+                    Box::new(
+                        GappedProjectionSource::new(inner, present_mask)
+                            .map_err(MapDriverError::InvalidState)?,
+                    )
+                } else {
+                    Box::new(inner)
+                }
+            };
+
+            println!(
+                "Variant selection time: {:.3}s",
+                selection_start.elapsed().as_secs_f64()
+            );
+            source
+        } else if let Some(known) = dataset.variant_count_hint()
+            && known > 0
+            && known != model.n_variants()
+        {
+            return Err(MapDriverError::InvalidState(format!(
+                "Model expects {} variants but dataset provides {}",
+                model.n_variants(),
+                known
+            )));
+        } else {
+            Box::new(dataset.block_source_with_plan(SelectionPlan::All)?)
+        };
+
     let options = ProjectionOptions::default();
     let projector = model.projector();
     let progress = projection_progress();
@@ -439,7 +456,7 @@ fn run_project(genotype_path: &Path, model_name: Option<&str>) -> Result<(), Map
     {
         let score_matrix = score_sink.as_mat_mut()?;
         projector.project_into_with_options_and_progress(
-            &mut source,
+            &mut *source,
             score_matrix,
             &options,
             None,
@@ -450,21 +467,6 @@ fn run_project(genotype_path: &Path, model_name: Option<&str>) -> Result<(), Map
         "Projection compute time: {:.3}s",
         projection_start.elapsed().as_secs_f64()
     );
-
-    if let Some(outcome) = source.take_selection_outcome() {
-        if !outcome.missing_keys.is_empty() {
-            return Err(MapDriverError::InvalidState(
-                "Projection dataset is missing variants required by the model".into(),
-            ));
-        }
-        if outcome.matched_keys.len() != model.n_variants() {
-            return Err(MapDriverError::InvalidState(format!(
-                "Model expects {} variants but matched {} in projection dataset",
-                model.n_variants(),
-                outcome.matched_keys.len()
-            )));
-        }
-    }
 
     let finalize_start = Instant::now();
     let scores = score_sink.path().to_path_buf();
@@ -504,6 +506,34 @@ fn open_dataset(path: &Path) -> Result<GenotypeDataset, MapDriverError> {
     Ok(GenotypeDataset::open(path)?)
 }
 
+fn projection_present_mask(
+    requested_keys: &[VariantKey],
+    missing_keys: &[VariantKey],
+) -> Result<Vec<bool>, MapDriverError> {
+    if missing_keys.is_empty() {
+        return Ok(vec![true; requested_keys.len()]);
+    }
+
+    let missing_lookup: HashSet<_> = missing_keys.iter().collect();
+    let mut present_mask = Vec::with_capacity(requested_keys.len());
+    let mut matched_missing = 0usize;
+    for key in requested_keys {
+        let is_missing = missing_lookup.contains(key);
+        if is_missing {
+            matched_missing += 1;
+        }
+        present_mask.push(!is_missing);
+    }
+
+    if matched_missing != missing_lookup.len() {
+        return Err(MapDriverError::InvalidState(
+            "projection missing-variant set was not a subset of the model key set".into(),
+        ));
+    }
+
+    Ok(present_mask)
+}
+
 fn load_builtin_model(name: &str) -> Result<HwePcaModel, MapDriverError> {
     // Look up the model
     let model_info = prefit::lookup_model(name).ok_or_else(|| {
@@ -534,9 +564,10 @@ fn map_variant_list_error(path: &Path, err: VariantListError) -> MapDriverError 
 
 #[cfg(test)]
 mod tests {
+    use super::{projection_present_mask, run_project};
     use crate::map::fit::HwePcaModel;
     use crate::map::io::{
-        GenotypeDataset, ProjectionOutputPaths, load_hwe_model, save_hwe_model,
+        GenotypeDataset, ProjectionOutputPaths, SelectionPlan, load_hwe_model, save_hwe_model,
         save_projection_results,
     };
     use crate::map::project::ProjectionOptions;
@@ -571,9 +602,46 @@ mod tests {
     use std::io::{self, Cursor};
 
     const TEST_COMPONENTS: usize = 8;
+    const TEST_PROJECTION_MATRIX_HEADER_LEN: usize = 32;
     const HGDP_REMOTE_VARIANT_LIST: &str =
         "https://github.com/SauersML/genomic_pca/raw/refs/heads/main/data/GSAv2_hg38.tsv";
     const MANUAL_VARIANT_TARGET: usize = 128;
+
+    fn write_test_vcf(path: &Path, records: &[&str]) -> Result<(), Box<dyn Error>> {
+        let mut file = File::create(path)?;
+        writeln!(file, "##fileformat=VCFv4.2")?;
+        writeln!(
+            file,
+            "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">"
+        )?;
+        writeln!(
+            file,
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\tS3"
+        )?;
+        for record in records {
+            writeln!(file, "{record}")?;
+        }
+        Ok(())
+    }
+
+    fn read_projection_scores_column_major(
+        path: &Path,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Vec<f64>, Box<dyn Error>> {
+        let bytes = fs::read(path)?;
+        let payload_len = rows
+            .checked_mul(cols)
+            .and_then(|count| count.checked_mul(std::mem::size_of::<f64>()))
+            .ok_or("projection score payload size overflow")?;
+        let payload = bytes
+            .get(TEST_PROJECTION_MATRIX_HEADER_LEN..TEST_PROJECTION_MATRIX_HEADER_LEN + payload_len)
+            .ok_or("projection score payload shorter than expected")?;
+        Ok(payload
+            .chunks_exact(std::mem::size_of::<f64>())
+            .map(|chunk| f64::from_le_bytes(chunk.try_into().expect("f64 chunk")))
+            .collect())
+    }
 
     fn should_skip_remote_variant_test() -> bool {
         let (tx, rx) = mpsc::channel();
@@ -761,6 +829,103 @@ mod tests {
                 "projection alignment metadata was not written"
             );
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn projection_present_mask_handles_unordered_missing_keys() -> Result<(), Box<dyn Error>> {
+        let requested = vec![
+            VariantKey::new("1", 100),
+            VariantKey::new("1", 200),
+            VariantKey::new("1", 300),
+            VariantKey::new("1", 400),
+        ];
+        let missing = vec![VariantKey::new("1", 400), VariantKey::new("1", 100)];
+
+        let mask = projection_present_mask(&requested, &missing)?;
+        assert_eq!(mask, vec![false, true, true, false]);
+        Ok(())
+    }
+
+    #[test]
+    fn run_project_projects_with_structurally_missing_variants() -> Result<(), Box<dyn Error>> {
+        let dir = tempdir()?;
+        let train_path = dir.path().join("train.vcf");
+        let project_path = dir.path().join("project.vcf");
+
+        write_test_vcf(
+            &train_path,
+            &[
+                "1\t100\tv1\tA\tG\t.\tPASS\t.\tGT\t0/0\t0/1\t1/1",
+                "1\t200\tv2\tC\tT\t.\tPASS\t.\tGT\t0/1\t1/1\t0/0",
+                "1\t300\tv3\tG\tA\t.\tPASS\t.\tGT\t1/1\t0/1\t0/0",
+                "1\t400\tv4\tT\tC\t.\tPASS\t.\tGT\t0/1\t0/0\t1/1",
+            ],
+        )?;
+        write_test_vcf(
+            &project_path,
+            &[
+                "1\t100\tv1\tA\tG\t.\tPASS\t.\tGT\t0/0\t1/1\t0/1",
+                "1\t250\textra\tG\tT\t.\tPASS\t.\tGT\t0/1\t0/1\t0/1",
+                "1\t300\tv3\tG\tA\t.\tPASS\t.\tGT\t0/1\t1/1\t0/0",
+            ],
+        )?;
+
+        let train_dataset = GenotypeDataset::open(&train_path)?;
+        let mut fit_source = train_dataset.block_source()?;
+        let mut model = HwePcaModel::fit_k(&mut fit_source, 2)?;
+        let variant_keys = train_dataset.variant_keys_for_plan(&SelectionPlan::All)?;
+        model.set_variant_keys(Some(variant_keys));
+        let model_path = save_hwe_model(&train_dataset, &model)?;
+
+        let projection_dataset = GenotypeDataset::open(&project_path)?;
+        fs::copy(&model_path, projection_dataset.output_path("hwe.json"))?;
+
+        run_project(&project_path, None)?;
+
+        let scores_path = projection_dataset.output_path("projection_scores.bin");
+        let metadata_path = projection_dataset.output_path("projection_scores.metadata.json");
+        assert!(scores_path.exists(), "projection scores should be written");
+        assert!(
+            metadata_path.exists(),
+            "projection metadata should be written"
+        );
+        let stored_scores = read_projection_scores_column_major(
+            &scores_path,
+            projection_dataset.n_samples(),
+            model.components(),
+        )?;
+        assert_eq!(
+            stored_scores.len(),
+            projection_dataset.n_samples() * model.components()
+        );
+        assert!(
+            stored_scores.iter().all(|value| value.is_finite()),
+            "projected scores should be finite"
+        );
+        assert!(
+            stored_scores.iter().any(|value| value.abs() > 0.0),
+            "projected scores should carry non-zero signal"
+        );
+
+        let metadata: serde_json::Value = serde_json::from_slice(&fs::read(&metadata_path)?)?;
+        assert_eq!(
+            metadata["rows"].as_u64(),
+            Some(projection_dataset.n_samples() as u64)
+        );
+        assert_eq!(metadata["cols"].as_u64(), Some(model.components() as u64));
+
+        run_project(&project_path, None)?;
+        let rerun_scores = read_projection_scores_column_major(
+            &scores_path,
+            projection_dataset.n_samples(),
+            model.components(),
+        )?;
+        assert_eq!(
+            stored_scores, rerun_scores,
+            "projection rerun should be deterministic"
+        );
 
         Ok(())
     }

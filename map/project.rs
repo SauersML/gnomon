@@ -27,6 +27,173 @@ pub struct HwePcaProjector<'model> {
     model: &'model HwePcaModel,
 }
 
+pub(crate) struct GappedProjectionSource<S> {
+    inner: S,
+    present_mask: Vec<bool>,
+    model_variants: usize,
+    model_cursor: usize,
+    n_samples: usize,
+    inner_storage: Vec<f64>,
+    inner_quality: Vec<f64>,
+    block_quality: Vec<f64>,
+    buffered_variants: usize,
+    buffered_cursor: usize,
+}
+
+impl<S> GappedProjectionSource<S>
+where
+    S: VariantBlockSource,
+{
+    pub(crate) fn new(inner: S, present_mask: Vec<bool>) -> Result<Self, String> {
+        let matched = present_mask.iter().filter(|&&present| present).count();
+        let inner_variants = inner.n_variants();
+        if inner_variants != matched {
+            return Err(format!(
+                "gapped projection source expected {matched} matched variants but inner source reports {inner_variants}"
+            ));
+        }
+
+        Ok(Self {
+            n_samples: inner.n_samples(),
+            inner,
+            model_variants: present_mask.len(),
+            present_mask,
+            model_cursor: 0,
+            inner_storage: Vec::new(),
+            inner_quality: Vec::new(),
+            block_quality: Vec::new(),
+            buffered_variants: 0,
+            buffered_cursor: 0,
+        })
+    }
+
+    fn refill_inner(&mut self, max_variants: usize) -> Result<bool, S::Error> {
+        if self.buffered_cursor < self.buffered_variants {
+            return Ok(true);
+        }
+
+        let needed = self
+            .n_samples
+            .checked_mul(max_variants.max(1))
+            .unwrap_or(usize::MAX);
+        if self.inner_storage.len() < needed {
+            self.inner_storage.resize(needed, f64::NAN);
+        }
+
+        let filled = self
+            .inner
+            .next_block_into(max_variants.max(1), &mut self.inner_storage)?;
+        self.buffered_variants = filled;
+        self.buffered_cursor = 0;
+
+        if self.inner_quality.len() < filled {
+            self.inner_quality.resize(filled, 1.0);
+        }
+        if filled > 0 {
+            self.inner
+                .variant_quality(filled, &mut self.inner_quality[..filled]);
+        }
+
+        Ok(filled > 0)
+    }
+}
+
+impl<S> VariantBlockSource for GappedProjectionSource<S>
+where
+    S: VariantBlockSource,
+{
+    type Error = S::Error;
+
+    fn n_samples(&self) -> usize {
+        self.n_samples
+    }
+
+    fn n_variants(&self) -> usize {
+        self.model_variants
+    }
+
+    fn reset(&mut self) -> Result<(), Self::Error> {
+        self.inner.reset()?;
+        self.model_cursor = 0;
+        self.buffered_variants = 0;
+        self.buffered_cursor = 0;
+        Ok(())
+    }
+
+    fn next_block_into(
+        &mut self,
+        max_variants: usize,
+        storage: &mut [f64],
+    ) -> Result<usize, Self::Error> {
+        if max_variants == 0 || self.model_cursor >= self.model_variants {
+            return Ok(0);
+        }
+
+        if self.block_quality.len() < max_variants {
+            self.block_quality.resize(max_variants, 0.0);
+        }
+
+        let mut filled = 0usize;
+        while filled < max_variants && self.model_cursor < self.model_variants {
+            let remaining_output = max_variants - filled;
+            let mut missing_run = 0usize;
+            while self.model_cursor + missing_run < self.model_variants
+                && !self.present_mask[self.model_cursor + missing_run]
+                && missing_run < remaining_output
+            {
+                missing_run += 1;
+            }
+
+            if missing_run > 0 {
+                let start = filled * self.n_samples;
+                let end = start + missing_run * self.n_samples;
+                storage[start..end].fill(f64::NAN);
+                self.block_quality[filled..filled + missing_run].fill(0.0);
+                self.model_cursor += missing_run;
+                filled += missing_run;
+                continue;
+            }
+
+            if !self.refill_inner(remaining_output)? {
+                break;
+            }
+
+            let src_start = self.buffered_cursor * self.n_samples;
+            let src_end = src_start + self.n_samples;
+            let dst_start = filled * self.n_samples;
+            let dst_end = dst_start + self.n_samples;
+            storage[dst_start..dst_end].copy_from_slice(&self.inner_storage[src_start..src_end]);
+            self.block_quality[filled] = self.inner_quality[self.buffered_cursor];
+
+            self.buffered_cursor += 1;
+            self.model_cursor += 1;
+            filled += 1;
+        }
+
+        Ok(filled)
+    }
+
+    fn progress_bytes(&self) -> Option<(u64, Option<u64>)> {
+        self.inner.progress_bytes()
+    }
+
+    fn progress_variants(&self) -> Option<(usize, Option<usize>)> {
+        Some((
+            self.model_cursor.min(self.model_variants),
+            Some(self.model_variants),
+        ))
+    }
+
+    fn variant_quality(&self, filled: usize, storage: &mut [f64]) {
+        let limit = filled.min(storage.len()).min(self.block_quality.len());
+        storage[..limit].copy_from_slice(&self.block_quality[..limit]);
+    }
+
+    fn hard_call_packed(&mut self) -> Option<HardCallPacked<'_>> {
+        None
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum ZeroAlignmentAction {
     #[default]
@@ -748,7 +915,7 @@ impl HwePcaModel {
         opts: &ProjectionOptions,
     ) -> Result<ProjectionResult, HwePcaError>
     where
-        S: VariantBlockSource,
+        S: VariantBlockSource + ?Sized,
         S::Error: Error + Send + Sync + 'static,
     {
         let progress = NoopProjectionProgress;
@@ -759,7 +926,7 @@ impl HwePcaModel {
 impl<'model> HwePcaProjector<'model> {
     pub fn project<S>(&self, source: &mut S) -> Result<Mat<f64>, HwePcaError>
     where
-        S: VariantBlockSource,
+        S: VariantBlockSource + ?Sized,
         S::Error: Error + Send + Sync + 'static,
     {
         let options = ProjectionOptions::default();
@@ -773,7 +940,7 @@ impl<'model> HwePcaProjector<'model> {
         opts: &ProjectionOptions,
     ) -> Result<ProjectionResult, HwePcaError>
     where
-        S: VariantBlockSource,
+        S: VariantBlockSource + ?Sized,
         S::Error: Error + Send + Sync + 'static,
     {
         let progress = NoopProjectionProgress;
@@ -787,7 +954,7 @@ impl<'model> HwePcaProjector<'model> {
         progress: &P,
     ) -> Result<ProjectionResult, HwePcaError>
     where
-        S: VariantBlockSource,
+        S: VariantBlockSource + ?Sized,
         S::Error: Error + Send + Sync + 'static,
         P: ProjectionProgressObserver,
     {
@@ -816,7 +983,7 @@ impl<'model> HwePcaProjector<'model> {
         scores: MatMut<'_, f64>,
     ) -> Result<(), HwePcaError>
     where
-        S: VariantBlockSource,
+        S: VariantBlockSource + ?Sized,
         S::Error: Error + Send + Sync + 'static,
     {
         let options = ProjectionOptions::default();
@@ -833,7 +1000,7 @@ impl<'model> HwePcaProjector<'model> {
         progress: &P,
     ) -> Result<(), HwePcaError>
     where
-        S: VariantBlockSource,
+        S: VariantBlockSource + ?Sized,
         S::Error: Error + Send + Sync + 'static,
         P: ProjectionProgressObserver,
     {
@@ -3492,6 +3659,134 @@ mod tests {
     }
 
     #[test]
+    fn gapped_projection_source_preserves_missing_gaps_quality_and_reset() {
+        struct QualityDenseBlockSource {
+            data: Vec<f64>,
+            qualities: Vec<f64>,
+            n_samples: usize,
+            cursor: usize,
+            last_block_start: usize,
+        }
+
+        impl QualityDenseBlockSource {
+            fn new(data: Vec<f64>, qualities: Vec<f64>, n_samples: usize) -> Self {
+                assert_eq!(data.len(), qualities.len() * n_samples);
+                Self {
+                    data,
+                    qualities,
+                    n_samples,
+                    cursor: 0,
+                    last_block_start: 0,
+                }
+            }
+        }
+
+        impl VariantBlockSource for QualityDenseBlockSource {
+            type Error = Infallible;
+
+            fn n_samples(&self) -> usize {
+                self.n_samples
+            }
+
+            fn n_variants(&self) -> usize {
+                self.qualities.len()
+            }
+
+            fn reset(&mut self) -> Result<(), Self::Error> {
+                self.cursor = 0;
+                self.last_block_start = 0;
+                Ok(())
+            }
+
+            fn next_block_into(
+                &mut self,
+                max_variants: usize,
+                storage: &mut [f64],
+            ) -> Result<usize, Self::Error> {
+                if max_variants == 0 {
+                    return Ok(0);
+                }
+                let remaining = self.n_variants().saturating_sub(self.cursor);
+                if remaining == 0 {
+                    return Ok(0);
+                }
+                let filled = remaining.min(max_variants);
+                let start = self.cursor * self.n_samples;
+                let len = filled * self.n_samples;
+                storage[..len].copy_from_slice(&self.data[start..start + len]);
+                self.last_block_start = self.cursor;
+                self.cursor += filled;
+                Ok(filled)
+            }
+
+            fn variant_quality(&self, filled: usize, storage: &mut [f64]) {
+                let start = self.last_block_start;
+                let end = start + filled;
+                storage[..filled].copy_from_slice(&self.qualities[start..end]);
+            }
+        }
+
+        let inner = QualityDenseBlockSource::new(
+            vec![
+                10.0, 11.0, //
+                20.0, 21.0, //
+                30.0, 31.0,
+            ],
+            vec![0.25, 0.75, 0.5],
+            2,
+        );
+        let mut source =
+            GappedProjectionSource::new(inner, vec![false, true, false, true, true, false])
+                .expect("gapped source");
+
+        let mut storage = vec![0.0; 4];
+        let mut quality = vec![1.0; 2];
+
+        let filled = source.next_block_into(2, &mut storage).expect("block 1");
+        assert_eq!(filled, 2);
+        assert!(storage[0].is_nan() && storage[1].is_nan());
+        assert_eq!(&storage[2..4], &[10.0, 11.0]);
+        source.variant_quality(filled, &mut quality);
+        assert_eq!(quality, vec![0.0, 0.25]);
+
+        let filled = source.next_block_into(2, &mut storage).expect("block 2");
+        assert_eq!(filled, 2);
+        assert!(storage[0].is_nan() && storage[1].is_nan());
+        assert_eq!(&storage[2..4], &[20.0, 21.0]);
+        source.variant_quality(filled, &mut quality);
+        assert_eq!(quality, vec![0.0, 0.75]);
+
+        let filled = source.next_block_into(2, &mut storage).expect("block 3");
+        assert_eq!(filled, 2);
+        assert_eq!(&storage[0..2], &[30.0, 31.0]);
+        assert!(storage[2].is_nan() && storage[3].is_nan());
+        source.variant_quality(filled, &mut quality);
+        assert_eq!(quality, vec![0.5, 0.0]);
+
+        let filled = source.next_block_into(2, &mut storage).expect("eof");
+        assert_eq!(filled, 0);
+        assert!(source.hard_call_packed().is_none());
+
+        source.reset().expect("reset");
+        let mut full_storage = vec![0.0; 12];
+        let mut full_quality = vec![1.0; 6];
+        let filled = source
+            .next_block_into(6, &mut full_storage)
+            .expect("full block");
+        assert_eq!(filled, 6);
+        assert_eq!(source.progress_variants(), Some((6, Some(6))));
+        source.variant_quality(filled, &mut full_quality);
+
+        assert!(full_storage[0].is_nan() && full_storage[1].is_nan());
+        assert_eq!(&full_storage[2..4], &[10.0, 11.0]);
+        assert!(full_storage[4].is_nan() && full_storage[5].is_nan());
+        assert_eq!(&full_storage[6..8], &[20.0, 21.0]);
+        assert_eq!(&full_storage[8..10], &[30.0, 31.0]);
+        assert!(full_storage[10].is_nan() && full_storage[11].is_nan());
+        assert_eq!(full_quality, vec![0.0, 0.25, 0.0, 0.75, 0.5, 0.0]);
+    }
+
+    #[test]
     fn packed_hardcall_path_matches_dense_projection() {
         let model = fit_example_model();
         let mut data = sample_data();
@@ -3551,6 +3846,49 @@ mod tests {
         let dense_alignment = dense.alignment.expect("dense alignment");
         let packed_alignment = packed.alignment.expect("packed alignment");
         assert_mats_close(&dense_alignment, &packed_alignment, 1e-10);
+    }
+
+    #[test]
+    fn gapped_projection_source_matches_explicit_nan_variants() {
+        let model = fit_example_model();
+        let mut full_data = sample_data();
+        set_variant_to_nan(&mut full_data, 1);
+        set_variant_to_nan(&mut full_data, 3);
+
+        let options = ProjectionOptions {
+            missing_axis_renormalization: true,
+            return_alignment: true,
+            on_zero_alignment: ZeroAlignmentAction::Zero,
+        };
+
+        let mut explicit_source =
+            DenseBlockSource::new(&full_data, N_SAMPLES, N_VARIANTS).expect("explicit source");
+        let explicit = model
+            .projector()
+            .project_with_options(&mut explicit_source, &options)
+            .expect("explicit projection");
+
+        let reduced_data = vec![
+            full_data[0],
+            full_data[1],
+            full_data[2],
+            full_data[2 * N_SAMPLES],
+            full_data[2 * N_SAMPLES + 1],
+            full_data[2 * N_SAMPLES + 2],
+        ];
+        let inner =
+            DenseBlockSource::new(&reduced_data, N_SAMPLES, 2).expect("reduced dense source");
+        let mut gapped =
+            GappedProjectionSource::new(inner, vec![true, false, true, false]).expect("gapped");
+        let wrapped = model
+            .projector()
+            .project_with_options(&mut gapped, &options)
+            .expect("gapped projection");
+
+        assert_mats_close(&explicit.scores, &wrapped.scores, 1e-6);
+        let explicit_alignment = explicit.alignment.expect("explicit alignment");
+        let wrapped_alignment = wrapped.alignment.expect("wrapped alignment");
+        assert_mats_close(&explicit_alignment, &wrapped_alignment, 1e-12);
     }
 
     #[test]
