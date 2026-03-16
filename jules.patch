@@ -1,0 +1,57 @@
+diff --git a/proofs/Calibrator/GeneticArchitectureDiscovery.lean b/proofs/Calibrator/GeneticArchitectureDiscovery.lean
+index a515653..45747ea 100644
+--- a/proofs/Calibrator/GeneticArchitectureDiscovery.lean
++++ b/proofs/Calibrator/GeneticArchitectureDiscovery.lean
+@@ -356,26 +356,37 @@ theorem wgs_eliminates_ld_mismatch
+       port_ld_factor * port_effect_factor * port_env_factor := by
+   nlinarith [mul_pos h_eff h_env]
+ 
+-/-- **Rare variant PGS has poor cross-population portability.**
+-    Variants with MAF < 1% are mostly population-specific → zero shared signal. -/
++/-- **Rare variant PGS components dilute cross-population portability.**
++    Because rare variants are more population-specific than common variants
++    (`port_rare < port_common`), including them in a PGS increases within-population
++    variance but strictly decreases the overall portability ratio. -/
+ theorem rare_variant_pgs_poor_portability
+     (r2_common r2_rare port_common port_rare : ℝ)
+-    (h_common : 0 < port_common) (h_rare_zero : port_rare = 0)
+-    (h_r2_c : 0 < r2_common) (h_r2_r : 0 < r2_rare) :
+-    r2_common * port_common + r2_rare * port_rare =
+-      r2_common * port_common := by
+-  rw [h_rare_zero, mul_zero, add_zero]
++    (h_r2_c : 0 < r2_common) (h_r2_r : 0 < r2_rare)
++    (h_port_order : port_rare < port_common) :
++    (r2_common * port_common + r2_rare * port_rare) / (r2_common + r2_rare) <
++      port_common := by
++  have h_sum_pos : 0 < r2_common + r2_rare := add_pos h_r2_c h_r2_r
++  rw [div_lt_iff₀ h_sum_pos]
++  have h_mul_lt : r2_rare * port_rare < r2_rare * port_common :=
++    mul_lt_mul_of_pos_left h_port_order h_r2_r
++  linarith
+ 
+ /-- **Optimal PGS strategy combines common and rare variants.**
+-    Use common variants for portability (they're shared)
+-    and rare variants for within-population prediction only.
+-    R²_combined = R²_common + R²_rare (independent contributions).
+-    Since R²_rare > 0 for the discovery population, the combined
+-    score outperforms common-only within-population. -/
++    When combining independent common and rare variant scores,
++    the joint R² strictly exceeds the common-only R².
++    We model the R² of an equal-weighted linear combination S_c + S_r as:
++    R² = (V_c + V_r)² / ((V_c + V_r) V_Y). -/
+ theorem combined_strategy_optimal
+-    (R2_common R2_rare : ℝ)
+-    (h_common : 0 < R2_common) (h_rare : 0 < R2_rare) :
+-    R2_common < R2_common + R2_rare := by linarith
++    (Vc Vr VY : ℝ)
++    (hVc : 0 < Vc) (hVr : 0 < Vr) (hVY : 0 < VY) :
++    Vc / VY < (Vc + Vr) ^ 2 / ((Vc + Vr) * VY) := by
++  have h_sum : 0 < Vc + Vr := add_pos hVc hVr
++  have h_rhs : (Vc + Vr) ^ 2 / ((Vc + Vr) * VY) = (Vc + Vr) / VY := by
++    rw [sq]
++    exact mul_div_mul_left (Vc + Vr) VY (ne_of_gt h_sum)
++  rw [h_rhs]
++  exact (div_lt_div_iff₀ hVY hVY).mpr (by nlinarith)
+ 
+ end WGSAndRareVariants
+ 
