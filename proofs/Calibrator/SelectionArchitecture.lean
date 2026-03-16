@@ -135,17 +135,22 @@ theorem effect_correlation_increases_with_Ns
   rw [sub_lt_sub_iff_left]
   exact div_lt_div_of_pos_left one_pos (by linarith) (by linarith)
 
+/-- **Per-locus variance contribution.**
+    For a given total variance V, the contribution of each of m independent
+    loci is V / m. -/
+noncomputable def perLocusVariance (V : ℝ) (m : ℝ) : ℝ :=
+  V / m
+
 /-- **Highly polygenic traits have better portability.**
     When trait is highly polygenic (many small effects), each locus
     contributes little, and the overall signal is robust to per-locus changes.
-    This is essentially a law of large numbers argument. -/
+    The per-locus variance decreases strictly with the number of loci. -/
 theorem polygenicity_improves_portability
-    (m₁ m₂ : ℕ) (var_per_locus : ℝ)
-    (h_m₁ : 0 < m₁) (h_m₂ : 0 < m₂) (h_more : m₁ < m₂)
-    (h_var : 0 < var_per_locus) :
-    -- Variance of portability ratio estimate ∝ 1/m
-    var_per_locus / (m₂ : ℝ) < var_per_locus / (m₁ : ℝ) := by
-  exact div_lt_div_of_pos_left h_var (Nat.cast_pos.mpr h_m₁) (Nat.cast_lt.mpr h_more)
+    (V : ℝ) (h_V : 0 < V) :
+    StrictAntiOn (perLocusVariance V) (Set.Ioi 0) := by
+  intro m₁ hm₁ m₂ _ h_m
+  unfold perLocusVariance
+  exact div_lt_div_of_pos_left h_V hm₁ h_m
 
 /-- **Highly polygenic architecture: total heritability sums from small effects.**
     With M causal loci each contributing h²/M, the total heritability
@@ -646,13 +651,13 @@ theorem selection_determines_timescale
     - Trait B: h² = 0.5 from 10000 loci (highly polygenic)
     Trait B has better portability because each locus contributes less. -/
 theorem polygenic_more_portable_than_oligogenic
-    (h2 : ℝ) (m_oligo m_poly : ℕ)
+    (h2 : ℝ) (m_oligo m_poly : ℝ)
     (h_h2 : 0 < h2)
-    (h_oligo : 0 < m_oligo) (h_poly : 0 < m_poly)
+    (h_oligo : 0 < m_oligo)
     (h_more_loci : m_oligo < m_poly) :
-    -- Per-locus contribution is smaller for polygenic traits
-    h2 / (m_poly : ℝ) < h2 / (m_oligo : ℝ) := by
-  exact div_lt_div_of_pos_left h_h2 (Nat.cast_pos.mpr h_oligo) (Nat.cast_lt.mpr h_more_loci)
+    perLocusVariance h2 m_poly < perLocusVariance h2 m_oligo := by
+  have h_poly : 0 < m_poly := by linarith
+  exact polygenicity_improves_portability h2 h_h2 h_oligo h_poly h_more_loci
 
 end ArchitecturePredictions
 

@@ -372,6 +372,22 @@ theorem gxe_reduces_effect_correlation
   rw [div_lt_one (by linarith)]
   linarith
 
+/-- **Lipid trait portability function.**
+    Given genetic variance σ²_β and GxE variance δ,
+    portability is proportional to σ²_β / (σ²_β + δ). -/
+noncomputable def lipidPortability (sigma2_beta delta : ℝ) : ℝ :=
+  sigma2_beta / (sigma2_beta + delta)
+
+/-- **Lipid trait portability strictly decreases with GxE variance.** -/
+theorem lipid_portability_strictAnti
+    (sigma2_beta : ℝ) (h_beta_pos : 0 < sigma2_beta) :
+    StrictAntiOn (lipidPortability sigma2_beta) (Set.Ici 0) := by
+  intro d₁ hd₁ d₂ _ hd
+  unfold lipidPortability
+  apply div_lt_div_of_pos_left h_beta_pos
+  · linarith [Set.mem_Ici.mp hd₁]
+  · exact add_lt_add_left hd sigma2_beta
+
 /-- **Lipid trait portability varies by lipid type.**
     LDL: good portability (low GxE → σ²_δ small)
     HDL: moderate (moderate GxE with diet)
@@ -391,10 +407,14 @@ theorem lipid_portability_heterogeneity
     -- GxE increases from LDL → HDL → Triglycerides
     (h_ldl_lt_hdl : sigma2_delta_ldl < sigma2_delta_hdl)
     (h_hdl_lt_trig : sigma2_delta_hdl < sigma2_delta_trig) :
-    let port (delta : ℝ) := sigma2_beta / (sigma2_beta + delta)
-    port sigma2_delta_trig < port sigma2_delta_ldl := by
-  simp only
-  apply div_lt_div_of_pos_left h_beta_pos (by linarith) (by linarith)
+    lipidPortability sigma2_beta sigma2_delta_trig < lipidPortability sigma2_beta sigma2_delta_ldl := by
+  have h_hdl_nn : 0 ≤ sigma2_delta_hdl := by linarith
+  have h_trig_nn : 0 ≤ sigma2_delta_trig := by linarith
+  have step1 : lipidPortability sigma2_beta sigma2_delta_hdl < lipidPortability sigma2_beta sigma2_delta_ldl :=
+    lipid_portability_strictAnti sigma2_beta h_beta_pos h_ldl_nn h_hdl_nn h_ldl_lt_hdl
+  have step2 : lipidPortability sigma2_beta sigma2_delta_trig < lipidPortability sigma2_beta sigma2_delta_hdl :=
+    lipid_portability_strictAnti sigma2_beta h_beta_pos h_hdl_nn h_trig_nn h_hdl_lt_trig
+  exact lt_trans step2 step1
 
 end MetabolicTraits
 

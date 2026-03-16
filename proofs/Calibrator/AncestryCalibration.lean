@@ -150,16 +150,20 @@ section TransferLearning
     where ρ is the effect correlation and gap(ρ) captures
     the transfer efficiency. -/
 
-/-- **More target data reduces MSE monotonically.** -/
+/-- **Target-specific Mean Squared Error component for Transfer Learning.**
+    The target sample error term scales as gap(ρ) × σ² / n_T. -/
+noncomputable def transferMSE (σ_sq gap : ℝ) (n : ℝ) : ℝ :=
+  gap * σ_sq / n
+
+/-- **More target data reduces MSE monotonically.**
+    The target error term decreases strictly with sample size. -/
 theorem more_target_data_reduces_mse
-    (σ_sq gap : ℝ) (n₁ n₂ : ℕ)
-    (h_σ : 0 < σ_sq) (h_gap : 0 < gap)
-    (h_n₁ : 0 < n₁) (h_n₂ : 0 < n₂)
-    (h_more : n₁ < n₂) :
-    gap * σ_sq / (n₂ : ℝ) < gap * σ_sq / (n₁ : ℝ) := by
-  apply div_lt_div_of_pos_left (mul_pos h_gap h_σ)
-  · exact Nat.cast_pos.mpr h_n₁
-  · exact Nat.cast_lt.mpr h_more
+    (σ_sq gap : ℝ)
+    (h_σ : 0 < σ_sq) (h_gap : 0 < gap) :
+    StrictAntiOn (transferMSE σ_sq gap) (Set.Ioi 0) := by
+  intro n₁ hn₁ n₂ _ h_n
+  unfold transferMSE
+  apply div_lt_div_of_pos_left (mul_pos h_gap h_σ) hn₁ h_n
 
 /-- **Transfer is beneficial when source provides information.**
     The transferred estimator beats the target-only estimator when
