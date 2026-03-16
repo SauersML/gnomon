@@ -15,6 +15,9 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  PROJECT_PREFIT_INPUT: >-
+    gs://gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/hgdp1kgp_chr20.filtered.SNV_INDEL.phased.shapeit5.bcf
+  PROJECT_PREFIT_OUTPUT_STEM: hgdp1kgp_chr20.filtered.SNV_INDEL.phased.shapeit5
 
 jobs:
   build:
@@ -60,16 +63,16 @@ jobs:
         include:
           - model: hwe_1kg_hgdp_gsa_v2
             label: gsa2
-            title: HGDP + 1KG projection with GSA v2 prefit model
+            title: HGDP + 1KG chr20 projection with GSA v2 prefit model
           - model: hwe_1kg_hgdp_gsa_v3
             label: gsa3
-            title: HGDP + 1KG projection with GSA v3 prefit model
+            title: HGDP + 1KG chr20 projection with GSA v3 prefit model
           - model: hwe_1kg_hgdp_gda_v1
             label: gda
-            title: HGDP + 1KG projection with GDA v1 prefit model
+            title: HGDP + 1KG chr20 projection with GDA v1 prefit model
           - model: hwe_1kg_hgdp_intersection
             label: intersection
-            title: HGDP + 1KG projection with intersection prefit model
+            title: HGDP + 1KG chr20 projection with intersection prefit model
 
     steps:
       - name: Checkout repository
@@ -109,12 +112,12 @@ jobs:
 
           /usr/bin/time -f 'elapsed=%E\nuser=%U\nsys=%S\nmaxrss_kb=%M' \
             "$HOME/.local/bin/gnomon" project \
-            "gs://gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/" \
+            "${{ env.PROJECT_PREFIT_INPUT }}" \
             --model "${{ matrix.model }}" \
             2>&1 | tee project.log
 
           python "$ROOT/scripts/plot_project_projection.py" \
-            --scores-bin phased_haplotypes_v2.projection_scores.bin \
+            --scores-bin "${{ env.PROJECT_PREFIT_OUTPUT_STEM }}.projection_scores.bin" \
             --output-png pc1_pc2.png \
             --output-tsv projection_scores_annotated.tsv \
             --model-name "${{ matrix.title }}" \
@@ -128,7 +131,7 @@ jobs:
             echo "- Model key: \`${{ matrix.model }}\`"
             echo "- Plot: \`artifacts/${{ matrix.label }}/pc1_pc2.png\`"
             echo "- Annotated scores: \`artifacts/${{ matrix.label }}/projection_scores_annotated.tsv\`"
-            echo "- Raw projection: \`artifacts/${{ matrix.label }}/phased_haplotypes_v2.projection_scores.bin\`"
+            echo "- Raw projection: \`artifacts/${{ matrix.label }}/${{ env.PROJECT_PREFIT_OUTPUT_STEM }}.projection_scores.bin\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload model artifacts
@@ -138,8 +141,8 @@ jobs:
           path: |
             artifacts/${{ matrix.label }}/pc1_pc2.png
             artifacts/${{ matrix.label }}/projection_scores_annotated.tsv
-            artifacts/${{ matrix.label }}/phased_haplotypes_v2.projection_scores.bin
-            artifacts/${{ matrix.label }}/phased_haplotypes_v2.projection_scores.metadata.json
+            artifacts/${{ matrix.label }}/${{ env.PROJECT_PREFIT_OUTPUT_STEM }}.projection_scores.bin
+            artifacts/${{ matrix.label }}/${{ env.PROJECT_PREFIT_OUTPUT_STEM }}.projection_scores.metadata.json
             artifacts/${{ matrix.label }}/sample_population_mapping.tsv
             artifacts/${{ matrix.label }}/project.log
           if-no-files-found: error
