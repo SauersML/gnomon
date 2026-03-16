@@ -34,21 +34,6 @@ individual-level noise.
 
 section OverlapInflation
 
-/-- **R² inflation from complete overlap.**
-    If the validation sample IS the discovery sample,
-    the apparent R² converges to h²_SNP (not R²_PGS).
-    Inflation = h²_SNP / R²_true_PGS - 1. -/
-noncomputable def overlapInflation (r2_true r2_observed : ℝ) : ℝ :=
-  r2_observed / r2_true - 1
-
-/-- Inflation is positive when observed exceeds true. -/
-theorem overlap_inflation_positive (r2_true r2_observed : ℝ)
-    (h_true : 0 < r2_true) (h_inflated : r2_true < r2_observed) :
-    0 < overlapInflation r2_true r2_observed := by
-  unfold overlapInflation
-  rw [sub_pos, one_lt_div₀ h_true]
-  exact h_inflated
-
 /-- **Partial overlap inflation.**
     With fraction f of validation in discovery:
     R²_observed ≈ R²_true + f × (h² - R²_true) / n_GWAS.
@@ -73,6 +58,26 @@ theorem more_overlap_more_inflation (r2_true h2 f₁ f₂ : ℝ) (n_gwas : ℕ)
   have : f₁ * (h2 - r2_true) / ↑n_gwas < f₂ * (h2 - r2_true) / ↑n_gwas :=
     div_lt_div_of_pos_right (mul_lt_mul_of_pos_right h_f h_diff) h_cast
   linarith
+
+/-- **R² inflation from complete overlap.**
+    If the validation sample IS the discovery sample,
+    the apparent R² converges to h²_SNP (not R²_PGS).
+    Inflation = h²_SNP / R²_true_PGS - 1. -/
+noncomputable def overlapInflation (r2_true h2 f : ℝ) (n_gwas : ℕ) : ℝ :=
+  partialOverlapR2 r2_true h2 f n_gwas / r2_true - 1
+
+/-- Inflation is positive when observed exceeds true. -/
+theorem overlap_inflation_positive (r2_true h2 f : ℝ) (n_gwas : ℕ)
+    (h_true : 0 < r2_true) (h_h2 : r2_true < h2)
+    (h_f : 0 < f) (h_n : 0 < n_gwas) :
+    0 < overlapInflation r2_true h2 f n_gwas := by
+  unfold overlapInflation
+  have h_base : partialOverlapR2 r2_true h2 0 n_gwas = r2_true := no_overlap_unbiased r2_true h2 n_gwas
+  have h_inflated : partialOverlapR2 r2_true h2 0 n_gwas < partialOverlapR2 r2_true h2 f n_gwas :=
+    more_overlap_more_inflation r2_true h2 0 f n_gwas h_h2 h_n h_f
+  rw [h_base] at h_inflated
+  rw [sub_pos, one_lt_div₀ h_true]
+  exact h_inflated
 
 /-- **Inflation decreases with GWAS sample size.**
     Larger GWAS → less overfitting → less inflation. -/
