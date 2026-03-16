@@ -1,0 +1,27 @@
+diff --git a/proofs/Calibrator/RareVariantPortability.lean b/proofs/Calibrator/RareVariantPortability.lean
+index a32ebe0..be197ae 100644
+--- a/proofs/Calibrator/RareVariantPortability.lean
++++ b/proofs/Calibrator/RareVariantPortability.lean
+@@ -255,6 +255,11 @@ theorem common_component_more_portable
+         apply mul_nonneg (le_of_lt h_β2)
+         nlinarith [sq_nonneg (p_common - 1/2)]
+ 
++/-- **WGS PGS captures more variance.**
++    WGS captures both common and rare variants, giving a total R². -/
++noncomputable def wgsR2 (r2_common r2_rare : ℝ) : ℝ :=
++  r2_common + r2_rare
++
+ /-- **WGS PGS within-population outperforms array PGS.**
+     Within the discovery population, WGS PGS captures more variance
+     (including rare variant contributions). The WGS R² = R²_common + R²_rare
+@@ -263,7 +268,9 @@ theorem wgs_within_pop_better
+     (r2_common r2_rare : ℝ)
+     (h_common_nn : 0 ≤ r2_common)
+     (h_rare_pos : 0 < r2_rare) :
+-    r2_common < r2_common + r2_rare := by linarith
++    r2_common < wgsR2 r2_common r2_rare := by
++  unfold wgsR2
++  linarith
+ 
+ /-- **WGS PGS cross-population can be worse than array PGS.**
+     Because population-specific rare variants add noise in the
