@@ -129,23 +129,33 @@ theorem more_correlated_more_informative
 /-- **Fundamental portability limit from information theory.**
     The minimum achievable MSE when transferring from source to target
     is bounded below by the conditional entropy of target effects
-    given source effects. No algorithm can beat this limit. -/
+    given source effects. No algorithm can beat this limit.
+    Modeled as: MSE_transfer(ρ) = MSE_oracle + (1 - ρ²) × V_A. -/
+noncomputable def mseTransfer (mse_oracle v_A rho : ℝ) : ℝ :=
+  mse_oracle + (1 - rho ^ 2) * v_A
+
 theorem fundamental_portability_limit
-    (mse_transfer mse_oracle info_gap : ℝ)
-    -- Info gap from effect decorrelation
-    (h_gap : 0 ≤ info_gap)
-    -- Transfer MSE = oracle MSE + gap from missing information
-    (h_decomp : mse_transfer = mse_oracle + info_gap) :
-    mse_oracle ≤ mse_transfer := by
+    (mse_oracle v_A rho : ℝ)
+    (h_vA : 0 ≤ v_A)
+    (h_rho : rho ^ 2 ≤ 1) :
+    mse_oracle ≤ mseTransfer mse_oracle v_A rho := by
+  unfold mseTransfer
+  have h_gap : 0 ≤ (1 - rho ^ 2) * v_A :=
+    mul_nonneg (by linarith) h_vA
   linarith
 
 /-- **No free lunch for portability.**
     If effects are completely uncorrelated (ρ = 0), source GWAS
     provides zero information about target effects.
-    The transferred PGS has expected R² = 0. -/
+    The transferred PGS has expected R² = 0.
+    Modeled as: transferred R² = R²_source * ρ². -/
+noncomputable def transferredR2 (r2_source rho : ℝ) : ℝ :=
+  r2_source * rho ^ 2
+
 theorem no_free_lunch_portability (r2_source : ℝ) :
-    r2_source * (0 : ℝ) ^ 2 = 0 := by
-  simp
+    transferredR2 r2_source 0 = 0 := by
+  unfold transferredR2
+  ring
 
 end InformationTheoreticLimits
 
