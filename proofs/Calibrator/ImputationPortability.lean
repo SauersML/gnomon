@@ -318,10 +318,12 @@ theorem portability_loss_decomposition
     WGS + diverse reference panels can eliminate technical loss.
     Genetic loss requires new GWAS in target populations. -/
 theorem technical_loss_eliminable
-    (loss_with_tech loss_without_tech : ℝ)
-    (h_eliminated : loss_without_tech < loss_with_tech)
-    (h_nn : 0 ≤ loss_without_tech) :
-    0 ≤ loss_with_tech - loss_without_tech := by linarith
+    (loss_biological loss_technical : ℝ)
+    (_h_biological_nn : 0 ≤ loss_biological)
+    (h_technical_pos : 0 < loss_technical) :
+    -- The loss without technical artifacts is strictly less than the total loss
+    loss_biological < loss_biological + loss_technical := by
+  linarith
 
 end ArrayAscertainment
 
