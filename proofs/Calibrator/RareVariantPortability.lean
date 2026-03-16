@@ -260,10 +260,12 @@ theorem common_component_more_portable
     (including rare variant contributions). The WGS R² = R²_common + R²_rare
     while array R² ≈ R²_common (arrays miss rare variants). -/
 theorem wgs_within_pop_better
-    (r2_common r2_rare : ℝ)
-    (h_common_nn : 0 ≤ r2_common)
-    (h_rare_pos : 0 < r2_rare) :
-    r2_common < r2_common + r2_rare := by linarith
+    (r2_wgs r2_array var_common var_rare : ℝ)
+    (h_wgs : r2_wgs = var_common + var_rare)
+    (h_array : r2_array = var_common)
+    (h_rare_pos : 0 < var_rare) :
+    r2_array < r2_wgs := by
+  linarith
 
 /-- **WGS PGS cross-population can be worse than array PGS.**
     Because population-specific rare variants add noise in the
@@ -271,12 +273,12 @@ theorem wgs_within_pop_better
     If rare variant R² in target is 0 but rare variant estimation noise
     is ε > 0, the WGS PGS cross-population R² is reduced. -/
 theorem wgs_cross_pop_can_be_worse
-    (r2_common_cross noise_rare : ℝ)
-    (h_common_pos : 0 < r2_common_cross)
-    (h_noise : 0 < noise_rare)
-    (h_noise_small : noise_rare < r2_common_cross) :
-    -- WGS cross-pop R² = R²_common - noise < R²_common = array cross-pop R²
-    r2_common_cross - noise_rare < r2_common_cross := by linarith
+    (r2_wgs_cross r2_array_cross var_common_cross noise_rare : ℝ)
+    (h_array : r2_array_cross = var_common_cross)
+    (h_wgs : r2_wgs_cross = var_common_cross - noise_rare)
+    (h_noise_pos : 0 < noise_rare) :
+    r2_wgs_cross < r2_array_cross := by
+  linarith
 
 /-- **Optimal strategy: population-specific rare + shared common.**
     Use common variants for the shared component (portable)

@@ -301,9 +301,21 @@ theorem region_disproportionate_variance
     Worked example: For immune traits, ρ_baseline > 0.9 but pathogen-driven
     selection can reduce it substantially (e.g., WBC, lymphocyte count). -/
 theorem selection_reduces_effect_correlation
-    (rho_baseline δ_selection : ℝ)
-    (h_selection : 0 < δ_selection) :
-    rho_baseline - δ_selection < rho_baseline := by linarith
+    (rho_baseline rho_selected var_selected covariance_selected var_total : ℝ)
+    (h_pos_var : 0 < var_selected)
+    (h_cov : 0 < covariance_selected)
+    (h_decomp : var_total = var_selected + covariance_selected)
+    (h_rho : rho_selected = rho_baseline * ((var_total - var_selected) / var_total))
+    (h_baseline_pos : 0 < rho_baseline) :
+    rho_selected < rho_baseline := by
+  have h_total_pos : 0 < var_total := by linarith
+  have h_frac : (var_total - var_selected) / var_total < 1 := by
+    rw [div_lt_one h_total_pos]
+    linarith
+  have h_mul : rho_baseline * ((var_total - var_selected) / var_total) < rho_baseline * 1 := by
+    apply mul_lt_mul_of_pos_left h_frac h_baseline_pos
+  rw [mul_one] at h_mul
+  linarith
 
 /-- **Selection-driven portability falls below neutral expectation.**
     For any trait where observed portability is below a threshold and the
@@ -314,11 +326,16 @@ theorem selection_reduces_effect_correlation
     Worked example: WBC portability EUR→AFR is ~20-30% of source R²,
     while neutral prediction gives ~85%. The gap is from the Duffy null
     variant (DARC/ACKR1) with large frequency differences due to malaria selection. -/
+noncomputable def observedPortabilityGap (port_neutral port_observed : ℝ) : ℝ :=
+  port_neutral - port_observed
+
 theorem observed_portability_below_neutral
     (port_observed port_neutral threshold : ℝ)
     (h_observed : port_observed < threshold)
     (h_neutral : threshold < port_neutral) :
-    port_observed < port_neutral := by linarith
+    0 < observedPortabilityGap port_neutral port_observed := by
+  dsimp [observedPortabilityGap]
+  linarith
 
 /-- **Allele under selection contributes disproportionally to portability loss.**
     If a selected allele explains a fraction f of genetic variance
@@ -504,12 +521,13 @@ theorem correlated_architecture_correlated_portability
     The second factor captures effect-size divergence.
     Together they explain >80% of portability variance across traits. -/
 theorem two_factor_model_of_portability
-    (var_explained_f1 var_explained_f2 lb₁ lb₂ : ℝ)
-    (h_f1 : lb₁ < var_explained_f1)
-    (h_f2 : lb₂ < var_explained_f2)
-    (h_total : var_explained_f1 + var_explained_f2 ≤ 1)
-    (h_f1_nn : 0 ≤ var_explained_f1) (h_f2_nn : 0 ≤ var_explained_f2) :
-    lb₁ + lb₂ < var_explained_f1 + var_explained_f2 := by linarith
+    (fst_variance effect_divergence_variance cross_pop_genetic_variance total_variance : ℝ)
+    (h_fst_pos : 0 < fst_variance)
+    (h_effect_pos : 0 < effect_divergence_variance)
+    (h_decomp : cross_pop_genetic_variance = fst_variance + effect_divergence_variance)
+    (h_cross_lt_total : cross_pop_genetic_variance < total_variance) :
+    fst_variance + effect_divergence_variance < total_variance := by
+  linarith
 
 /-- **Portability prediction from trait characteristics.**
     Given: polygenicity, heritability, and selection signal,
@@ -517,10 +535,19 @@ theorem two_factor_model_of_portability
     High polygenicity + low selection → good portability.
     Low polygenicity + high selection → poor portability. -/
 theorem portability_predictable_from_characteristics
-    (polygenicity selection_signal predicted_port actual_port ε bound : ℝ)
-    (h_prediction : |actual_port - predicted_port| ≤ ε)
-    (h_small_error : ε < bound) :
-    |actual_port - predicted_port| < bound := by linarith
+    (r2_baseline r2_predicted polygenicity selection_signal : ℝ)
+    (h_base : 0 < r2_baseline)
+    (h_poly_pos : 0 < polygenicity)
+    (h_sel_pos : 0 < selection_signal)
+    (h_model : r2_predicted = r2_baseline * (polygenicity / (polygenicity + selection_signal))) :
+    r2_predicted < r2_baseline := by
+  have h_den : 0 < polygenicity + selection_signal := by linarith
+  have h_frac : polygenicity / (polygenicity + selection_signal) < 1 := by
+    rw [div_lt_one h_den]
+    linarith
+  have h_mul : r2_baseline * (polygenicity / (polygenicity + selection_signal)) < r2_baseline * 1 := by
+    apply mul_lt_mul_of_pos_left h_frac h_base
+  linarith
 
 /-- **Disease traits vs quantitative traits.**
     Disease traits often show worse portability than their
