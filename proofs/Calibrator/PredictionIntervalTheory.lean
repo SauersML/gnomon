@@ -187,24 +187,29 @@ section ConditionalIntervals
     σ²_ε(a) = Var(Y | ancestry = a) × (1 - R²(a)).
     This varies across ancestry groups. -/
 
+noncomputable def totalVarianceInterval (var_within var_between : ℝ) : ℝ :=
+  var_within + var_between
+
 /-- **Ancestry-stratified intervals are narrower than marginal intervals.**
     Within each ancestry group, the residual variance is smaller than
     the overall residual variance (by the law of total variance). -/
 theorem stratified_intervals_narrower
-    (var_within var_between var_total : ℝ)
-    (h_decomp : var_total = var_within + var_between)
+    (var_within var_between : ℝ)
     (h_between_pos : 0 < var_between)
     (h_within_nn : 0 ≤ var_within) :
-    var_within < var_total := by linarith
+    var_within < totalVarianceInterval var_within var_between := by
+  unfold totalVarianceInterval
+  linarith
 
 /-- **Law of total variance for prediction intervals.**
     Var(ε) = E[Var(ε|A)] + Var(E[ε|A]).
     The marginal interval width accounts for both components. -/
 theorem total_variance_decomposition
-    (within_var between_var total_var : ℝ)
-    (h_decomp : total_var = within_var + between_var)
+    (within_var between_var : ℝ)
     (h_w : 0 ≤ within_var) (h_b : 0 ≤ between_var) :
-    within_var ≤ total_var := by linarith
+    within_var ≤ totalVarianceInterval within_var between_var := by
+  unfold totalVarianceInterval
+  linarith
 
 /-- **Conditional intervals improve with ancestry precision (transitivity of
     the law of total variance).**
