@@ -61,7 +61,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
-          cache-targets: true
+          cache-targets: false
           cache-all-crates: true
           shared-key: project-prefit-model-plots
 
