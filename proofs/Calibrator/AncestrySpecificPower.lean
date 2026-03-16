@@ -403,20 +403,35 @@ one population and maximizing cross-population portability.
 
 section PowerPortabilityTradeoff
 
+/-- Expected prediction variance (power) in a source population,
+    which scales linearly with the sample size $n$. -/
+noncomputable def expectedSourcePower (n c : ℝ) : ℝ :=
+  n * c
+
+/-- Expected prediction variance (power) in a target population,
+    attenuated by the squared genetic correlation $\rho^2 < 1$. -/
+noncomputable def expectedTargetPower (n c ρ_sq : ℝ) : ℝ :=
+  n * c * ρ_sq
+
 /-- **Single-ancestry GWAS maximizes within-ancestry power.**
     With n total samples all in one ancestry:
     - Source R² ∝ n (full power in discovery population)
-    - Cross-population R² = n × ρ² where ρ² < 1 is portability ratio
+    - Cross-population R² = n × c × ρ² where ρ² < 1 is portability ratio
 
     We model cross-pop prediction as attenuated by ρ² and derive
-    that cross-pop R² is strictly less than within-pop R².
-    The inequality n × ρ² < n follows from ρ² < 1 and n > 0. -/
+    that cross-pop R² is strictly less than within-pop R². -/
 theorem single_ancestry_max_power
-    (n : ℝ) (ρ_sq : ℝ)
-    (h_n : 0 < n)
+    (n c ρ_sq : ℝ)
+    (h_n : 0 < n) (h_c : 0 < c)
     (h_ρ : 0 < ρ_sq) (h_ρ_lt : ρ_sq < 1) :
-    n * ρ_sq < n := by
+    expectedTargetPower n c ρ_sq < expectedSourcePower n c := by
+  unfold expectedTargetPower expectedSourcePower
+  have h_nc : 0 < n * c := mul_pos h_n h_c
   nlinarith
+
+/-- Expected prediction power given an allocation $\alpha$ of total budget $N$. -/
+noncomputable def allocatedPower (N α c : ℝ) : ℝ :=
+  α * N * c
 
 /-- **Multi-ancestry tradeoff: splitting budget.**
     With total budget N and two populations, allocate fraction α to pop1
@@ -431,15 +446,13 @@ theorem multi_ancestry_tradeoff
     (N c₁ c₂ α : ℝ)
     (h_N : 0 < N) (h_c₁ : 0 < c₁) (h_c₂ : 0 < c₂)
     (h_α_pos : 0 < α) (h_α_lt : α < 1) :
-    -- Multi-ancestry reduces best-pop R² (pop1 gets αN < N)
-    α * N * c₁ < N * c₁ ∧
-    -- Multi-ancestry creates nonzero worst-pop R² (pop2 gets (1-α)N > 0)
-    0 < (1 - α) * N * c₂ := by
+    allocatedPower N α c₁ < allocatedPower N 1 c₁ ∧
+    0 < allocatedPower N (1 - α) c₂ := by
   constructor
-  · -- α * N * c₁ < 1 * N * c₁ because α < 1 and N * c₁ > 0
+  · unfold allocatedPower
     have h_Nc : 0 < N * c₁ := mul_pos h_N h_c₁
     nlinarith
-  · -- (1 - α) * N * c₂ > 0 because 1 - α > 0 and N, c₂ > 0
+  · unfold allocatedPower
     have h_one_minus : 0 < 1 - α := by linarith
     positivity
 
