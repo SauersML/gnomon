@@ -126,25 +126,36 @@ theorem more_correlated_more_informative
     Real.log_lt_log h_pos₂ h1
   nlinarith
 
+/-- **Oracle vs. Transfer MSE decomposition.**
+    Transfer MSE decomposes into the optimal (oracle) MSE on the target
+    plus the error induced by incomplete information (info_gap). -/
+noncomputable def transferMSE (mse_oracle info_gap : ℝ) : ℝ :=
+  mse_oracle + info_gap
+
 /-- **Fundamental portability limit from information theory.**
     The minimum achievable MSE when transferring from source to target
-    is bounded below by the conditional entropy of target effects
-    given source effects. No algorithm can beat this limit. -/
+    is bounded below by the optimal oracle MSE on the target.
+    The gap is strictly positive if there is incomplete information. -/
 theorem fundamental_portability_limit
-    (mse_transfer mse_oracle info_gap : ℝ)
-    -- Info gap from effect decorrelation
-    (h_gap : 0 ≤ info_gap)
-    -- Transfer MSE = oracle MSE + gap from missing information
-    (h_decomp : mse_transfer = mse_oracle + info_gap) :
-    mse_oracle ≤ mse_transfer := by
+    (mse_oracle info_gap : ℝ)
+    (h_gap_pos : 0 < info_gap) :
+    mse_oracle < transferMSE mse_oracle info_gap := by
+  unfold transferMSE
   linarith
+
+/-- **Expected Transferred R² under correlated effects.**
+    If target effects are correlated with source effects with correlation ρ,
+    the expected R² transferred is bounded by ρ² * r2_source. -/
+noncomputable def expectedTransferredR2 (r2_source ρ : ℝ) : ℝ :=
+  r2_source * ρ ^ 2
 
 /-- **No free lunch for portability.**
     If effects are completely uncorrelated (ρ = 0), source GWAS
     provides zero information about target effects.
     The transferred PGS has expected R² = 0. -/
 theorem no_free_lunch_portability (r2_source : ℝ) :
-    r2_source * (0 : ℝ) ^ 2 = 0 := by
+    expectedTransferredR2 r2_source 0 = 0 := by
+  unfold expectedTransferredR2
   simp
 
 end InformationTheoreticLimits
@@ -208,16 +219,25 @@ theorem diversity_reduces_max_gap
     drift_degrades_R2 V_A V_E fst_worst_multi fst_worst_single hVA hVE h_improvement h_single_bound
   linarith
 
+/-- **Heritability Definition.**
+    h² = V_g / (V_g + V_e)
+    This is the fraction of phenotypic variance explained by genetics. -/
+noncomputable def heritability (V_g V_e : ℝ) : ℝ :=
+  V_g / (V_g + V_e)
+
 /-- **Even perfect diversity cannot eliminate environmental portability gaps.**
     If environmental variance differs across populations, GWAS diversification
-    addresses genetic portability but not environmental portability. -/
+    addresses genetic portability but not environmental portability.
+    Therefore, even with identical genetic variance (zero Fst gap),
+    the trait heritabilities (and thus the theoretical R² ceiling) still differ. -/
 theorem diversity_doesnt_fix_environmental_gap
     (Vg Ve_source Ve_target : ℝ)
     (hVg : 0 < Vg)
     (hVe_s : 0 < Ve_source)
     (h_env_diff : Ve_source < Ve_target) :
-    -- Even with zero genetic Fst gap, R² still differs
-    Vg / (Vg + Ve_target) < Vg / (Vg + Ve_source) := by
+    -- Even with zero genetic Fst gap, theoretical R² ceilings differ
+    heritability Vg Ve_target < heritability Vg Ve_source := by
+  unfold heritability
   exact div_lt_div_of_pos_left hVg (by linarith) (by linarith)
 
 end EquityImplications
