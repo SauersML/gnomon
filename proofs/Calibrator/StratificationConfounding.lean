@@ -323,19 +323,24 @@ theorem collider_attenuates_association (m : ColliderModel) :
     _ = m.β_G := by ring
 
 /-- **Differential ascertainment creates portability artifact.**
-    If source and target cohorts have different ascertainment patterns,
-    the apparent portability drop includes an ascertainment component. -/
+    If source and target cohorts have different ascertainment patterns
+    (e.g., target has higher environmental variance leading to stronger
+    collider bias), the observed association is more attenuated in the target. -/
 theorem differential_ascertainment_artifact
-    (r2_source_pop r2_target_pop r2_source_asc r2_target_asc : ℝ)
-    (h_source_asc : r2_source_asc < r2_source_pop)
-    (h_target_asc : r2_target_asc < r2_target_pop)
-    -- Different ascertainment severity
-    (h_diff_severity : r2_target_pop - r2_target_asc < r2_source_pop - r2_source_asc) :
-    -- Apparent portability drop is larger than true portability drop
-    r2_source_asc - r2_target_asc > r2_source_pop - r2_target_pop →
-      False := by
-  intro h
-  linarith
+    (m_source m_target : ColliderModel)
+    (h_same_β : m_source.β_G = m_target.β_G)
+    (h_same_G : m_source.σ2_G = m_target.σ2_G)
+    (h_diff_E : m_source.σ2_E < m_target.σ2_E) :
+    m_target.β_selected < m_source.β_selected := by
+  unfold ColliderModel.β_selected
+  rw [h_same_β, h_same_G]
+  have h_denom_s : 0 < m_target.σ2_G + m_source.σ2_E := by linarith [m_target.σ2_G_pos, m_source.σ2_E_pos]
+  have h_denom_t : 0 < m_target.σ2_G + m_target.σ2_E := by linarith [m_target.σ2_G_pos, m_target.σ2_E_pos]
+  have h_div : m_target.σ2_G / (m_target.σ2_G + m_target.σ2_E) <
+               m_target.σ2_G / (m_target.σ2_G + m_source.σ2_E) := by
+    rw [div_lt_div_iff₀ h_denom_t h_denom_s]
+    nlinarith [m_target.σ2_G_pos, h_diff_E]
+  exact mul_lt_mul_of_pos_left h_div m_target.β_G_pos
 
 end ColliderBias
 
@@ -515,16 +520,21 @@ theorem survivorship_attenuates_in_older (m : SurvivorshipAttenuationModel) :
     _ = m.r2_full := by ring
 
 /-- **Differential survivorship across populations creates portability artifact.**
-    If the target population has different age structure or mortality patterns,
-    survivorship bias contributes to apparent portability loss. -/
+    If the target population has stronger survivorship bias (more variance reduction),
+    its apparent R² will be more attenuated, leading to an apparent portability drop
+    even if the full birth cohorts had identical genetic architecture. -/
 theorem differential_survivorship_artifact
-    (r2_source_full r2_target_full Δ_surv_source Δ_surv_target : ℝ)
-    (h_surv_s : 0 ≤ Δ_surv_source) (h_surv_t : 0 ≤ Δ_surv_target)
-    (h_diff : Δ_surv_target > Δ_surv_source)
-    (h_obs_s : r2_source_full - Δ_surv_source > 0) :
-    (r2_source_full - Δ_surv_source) - (r2_target_full - Δ_surv_target) >
-      r2_source_full - r2_target_full := by
-  linarith
+    (m_source m_target : SurvivorshipAttenuationModel)
+    (h_same_full : m_source.r2_full = m_target.r2_full)
+    (h_same_birth : m_source.var_birth = m_target.var_birth)
+    (h_diff_surv : m_target.var_surv < m_source.var_surv) :
+    m_target.r2_surv < m_source.r2_surv := by
+  unfold SurvivorshipAttenuationModel.r2_surv
+  rw [h_same_full, h_same_birth]
+  have h_div : m_target.var_surv / m_target.var_birth < m_source.var_surv / m_target.var_birth := by
+    rw [div_lt_div_iff₀ m_target.var_birth_pos m_target.var_birth_pos]
+    nlinarith [m_target.var_birth_pos, h_diff_surv]
+  exact mul_lt_mul_of_pos_left h_div m_target.r2_full_pos
 
 end SurvivorshipBias
 
@@ -714,14 +724,41 @@ theorem weak_instrument_bias_increases
     linarith
   linarith
 
+/-- **MR effect estimate model.**
+    The observed MR estimate is the true causal effect plus a bias term
+    due to horizontal pleiotropy. For an instrument with effect β_inst
+    on the exposure and direct pleiotropic effect α_pleio on the outcome,
+    the bias is α_pleio / β_inst. -/
+structure MRModel where
+  /-- True causal effect -/
+  β_causal : ℝ
+  /-- Effect of instrument on exposure -/
+  β_inst : ℝ
+  /-- Direct pleiotropic effect on outcome -/
+  α_pleio : ℝ
+  /-- Instrument must be relevant -/
+  β_inst_ne : β_inst ≠ 0
+
+/-- Expected MR estimate for a given instrument -/
+noncomputable def MRModel.estimate (m : MRModel) : ℝ :=
+  m.β_causal + m.α_pleio / m.β_inst
+
 /-- **Horizontal pleiotropy patterns differ across populations.**
     If pleiotropic effects change across populations (due to different
     LD patterns or gene regulation), MR estimates are not portable. -/
 theorem pleiotropy_changes_invalidate_mr
-    (β_causal α_pleio_source α_pleio_target : ℝ)
-    (h_diff : α_pleio_source ≠ α_pleio_target) :
-    β_causal + α_pleio_source ≠ β_causal + α_pleio_target := by
-  intro h; exact h_diff (by linarith)
+    (m_source m_target : MRModel)
+    (h_same_causal : m_source.β_causal = m_target.β_causal)
+    (h_same_inst : m_source.β_inst = m_target.β_inst)
+    (h_diff_pleio : m_source.α_pleio ≠ m_target.α_pleio) :
+    m_source.estimate ≠ m_target.estimate := by
+  unfold MRModel.estimate
+  rw [h_same_causal, h_same_inst]
+  intro h
+  have h_eq : m_source.α_pleio / m_target.β_inst = m_target.α_pleio / m_target.β_inst := by linarith
+  have h_mul : (m_source.α_pleio / m_target.β_inst) * m_target.β_inst = (m_target.α_pleio / m_target.β_inst) * m_target.β_inst := by rw [h_eq]
+  rw [div_mul_cancel₀ _ m_target.β_inst_ne, div_mul_cancel₀ _ m_target.β_inst_ne] at h_mul
+  exact h_diff_pleio h_mul
 
 end MRPortability
 
