@@ -517,13 +517,20 @@ theorem survivorship_attenuates_in_older (m : SurvivorshipAttenuationModel) :
 /-- **Differential survivorship across populations creates portability artifact.**
     If the target population has different age structure or mortality patterns,
     survivorship bias contributes to apparent portability loss. -/
+noncomputable def apparentPortabilityLoss
+    (r2_source_full r2_target_full Δ_surv_source Δ_surv_target : ℝ) : ℝ :=
+  (r2_source_full - Δ_surv_source) - (r2_target_full - Δ_surv_target)
+
+noncomputable def truePortabilityLoss
+    (r2_source_full r2_target_full : ℝ) : ℝ :=
+  r2_source_full - r2_target_full
+
 theorem differential_survivorship_artifact
     (r2_source_full r2_target_full Δ_surv_source Δ_surv_target : ℝ)
-    (h_surv_s : 0 ≤ Δ_surv_source) (h_surv_t : 0 ≤ Δ_surv_target)
-    (h_diff : Δ_surv_target > Δ_surv_source)
-    (h_obs_s : r2_source_full - Δ_surv_source > 0) :
-    (r2_source_full - Δ_surv_source) - (r2_target_full - Δ_surv_target) >
-      r2_source_full - r2_target_full := by
+    (h_diff : Δ_surv_target > Δ_surv_source) :
+    apparentPortabilityLoss r2_source_full r2_target_full Δ_surv_source Δ_surv_target >
+      truePortabilityLoss r2_source_full r2_target_full := by
+  unfold apparentPortabilityLoss truePortabilityLoss
   linarith
 
 end SurvivorshipBias

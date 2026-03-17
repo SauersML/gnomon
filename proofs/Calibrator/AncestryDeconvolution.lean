@@ -348,10 +348,14 @@ theorem portability_gap_scales_with_fst
     for underrepresented groups must be larger than proportional
     to their population size (due to the LD mismatch penalty).
     If the LD penalty factor is k > 1, then n_needed = k × n_proportional. -/
+noncomputable def neededSampleSize (n_proportional k : ℝ) : ℝ :=
+  k * n_proportional
+
 theorem equitable_pgs_overinvestment
     (n_proportional k : ℝ)
     (h_nn : 0 < n_proportional) (h_k : 1 < k) :
-    n_proportional < k * n_proportional := by
+    n_proportional < neededSampleSize n_proportional k := by
+  unfold neededSampleSize
   nlinarith
 
 /-- **Universal portability is impossible.**
