@@ -67,6 +67,14 @@ theorem snp_h2_le_narrow_h2
   unfold snpH2 narrowSenseH2
   exact div_le_div_of_nonneg_right h_tagged (le_of_lt h_total)
 
+/-- Total phenotypic variance. -/
+noncomputable def totalPhenotypicVariance (V_A_tagged V_A_untagged V_D V_I V_E : ℝ) : ℝ :=
+  V_A_tagged + V_A_untagged + V_D + V_I + V_E
+
+/-- Twin heritability capturing all additive variance. -/
+noncomputable def twinHeritability (V_A_tagged V_A_untagged V_P : ℝ) : ℝ :=
+  (V_A_tagged + V_A_untagged) / V_P
+
 /-- **The missing heritability gap.**
     h²_twin - h²_SNP > 0 for most traits. This is the "missing heritability".
     It sets an upper bound on what PGS can achieve with current genotyping.
@@ -80,19 +88,17 @@ theorem missing_heritability_gap
     (V_A_tagged V_A_untagged V_D V_I V_E : ℝ)
     (h_tagged_nn : 0 ≤ V_A_tagged) (h_untagged_pos : 0 < V_A_untagged)
     (h_D : 0 ≤ V_D) (h_I : 0 ≤ V_I) (h_E : 0 ≤ V_E)
-    (h_total : 0 < V_A_tagged + V_A_untagged + V_D + V_I + V_E) :
-    let V_P := V_A_tagged + V_A_untagged + V_D + V_I + V_E
-    let h2_twin := (V_A_tagged + V_A_untagged) / V_P
-    let h2_snp := V_A_tagged / V_P
-    0 < h2_twin - h2_snp := by
-  simp only
+    (h_total : 0 < totalPhenotypicVariance V_A_tagged V_A_untagged V_D V_I V_E) :
+    0 < twinHeritability V_A_tagged V_A_untagged (totalPhenotypicVariance V_A_tagged V_A_untagged V_D V_I V_E) -
+        snpH2 V_A_tagged (totalPhenotypicVariance V_A_tagged V_A_untagged V_D V_I V_E) := by
+  unfold twinHeritability snpH2 totalPhenotypicVariance
   rw [show (V_A_tagged + V_A_untagged) / (V_A_tagged + V_A_untagged + V_D + V_I + V_E) -
     V_A_tagged / (V_A_tagged + V_A_untagged + V_D + V_I + V_E) =
     ((V_A_tagged + V_A_untagged) - V_A_tagged) / (V_A_tagged + V_A_untagged + V_D + V_I + V_E)
     from (sub_div _ _ _).symm]
   apply div_pos
   · linarith
-  · linarith
+  · exact h_total
 
 end HeritabilityDefinitions
 
