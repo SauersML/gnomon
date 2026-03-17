@@ -186,59 +186,86 @@ and the GWAS sample size.
 
 section PGSCeiling
 
+/-- **Variance Component Model for PGS Ceiling.**
+    Formalizes the structural variance components that constrain PGS R².
+    R² is bounded by the available tagged genetic variance, minus any losses
+    due to incomplete GWAS discovery power and imperfect cross-population portability. -/
+structure PGSCeilingModel where
+  /-- Total phenotypic variance -/
+  VP : ℝ
+  /-- Additive genetic variance tagged by genotyped SNPs -/
+  VA_tagged : ℝ
+  /-- Variance of causal signals not discovered due to finite GWAS power -/
+  V_undiscovered : ℝ
+  /-- Variance of discovered signals that fail to transport to the target population -/
+  V_nonportable : ℝ
+  /-- Phenotypic variance is positive -/
+  h_VP_pos : 0 < VP
+  /-- Tagged additive variance is non-negative and bounded by VP -/
+  h_VA_tagged_nn : 0 ≤ VA_tagged
+  h_VA_tagged_le : VA_tagged ≤ VP
+  /-- Losses are non-negative and bounded by the tagged variance -/
+  h_V_undiscovered_nn : 0 ≤ V_undiscovered
+  h_V_nonportable_nn : 0 ≤ V_nonportable
+  h_losses_bound : V_undiscovered + V_nonportable ≤ VA_tagged
+
+/-- **SNP Heritability in the Model.**
+    The maximum theoretical R² with infinite sample size in the source population. -/
+noncomputable def PGSCeilingModel.h2_snp (m : PGSCeilingModel) : ℝ :=
+  m.VA_tagged / m.VP
+
+/-- **Discovered Source R².**
+    R² achieved in the source population after finite-sample GWAS discovery. -/
+noncomputable def PGSCeilingModel.source_r2 (m : PGSCeilingModel) : ℝ :=
+  (m.VA_tagged - m.V_undiscovered) / m.VP
+
+/-- **Deployed Target R².**
+    R² achieved in the target population after both discovery and portability losses. -/
+noncomputable def PGSCeilingModel.target_r2 (m : PGSCeilingModel) : ℝ :=
+  (m.VA_tagged - m.V_undiscovered - m.V_nonportable) / m.VP
+
 /-- **PGS R² ceiling from heritability.**
-    R²_PGS ≤ h²_SNP. No PGS can explain more variance than what's
-    genetically tagged. The PGS explains a fraction f of tagged
-    additive variance, so R²_PGS = f × h²_SNP ≤ h²_SNP. -/
-theorem pgs_r2_ceiling_from_h2
-    (h2_snp f : ℝ)
-    (h_h2 : 0 < h2_snp)
-    (h_f_nn : 0 ≤ f) (h_f_le : f ≤ 1) :
-    h2_snp * f ≤ h2_snp := by
-  exact mul_le_of_le_one_right (le_of_lt h_h2) h_f_le
+    The discovered source R² is fundamentally bounded by the SNP heritability. -/
+theorem pgs_r2_ceiling_from_h2 (m : PGSCeilingModel) :
+    m.source_r2 ≤ m.h2_snp := by
+  unfold PGSCeilingModel.source_r2 PGSCeilingModel.h2_snp
+  apply div_le_div_of_nonneg_right
+  · linarith [m.h_V_undiscovered_nn]
+  · exact le_of_lt m.h_VP_pos
 
 /-- **PGS R² ceiling from GWAS power.**
-    R²_PGS ≤ h²_SNP × (1 - (1-power)^m)
-    where power is per-SNP GWAS power and m is number of causal SNPs.
-    With finite sample size, not all SNPs are discovered. -/
-theorem pgs_r2_ceiling_from_gwas_power
-    (h2_snp power_fraction : ℝ)
-    (h_h2 : 0 < h2_snp) (h_h2_le : h2_snp ≤ 1)
-    (h_power : 0 < power_fraction) (h_power_le : power_fraction ≤ 1) :
-    h2_snp * power_fraction ≤ h2_snp := by
-  exact mul_le_of_le_one_right (le_of_lt h_h2) h_power_le
+    If there is incomplete GWAS discovery power (V_undiscovered > 0),
+    the source R² is strictly less than the SNP heritability ceiling. -/
+theorem pgs_r2_ceiling_from_gwas_power (m : PGSCeilingModel)
+    (h_undiscovered_pos : 0 < m.V_undiscovered) :
+    m.source_r2 < m.h2_snp := by
+  unfold PGSCeilingModel.source_r2 PGSCeilingModel.h2_snp
+  apply div_lt_div_of_pos_right
+  · exact sub_lt_self _ h_undiscovered_pos
+  · exact m.h_VP_pos
 
 /-- **Portability further reduces the ceiling.**
-    R²_PGS_target ≤ h²_SNP × power_fraction × portability_ratio. -/
-theorem portability_reduces_ceiling
-    (h2_snp power_frac port_ratio : ℝ)
-    (h_h2 : 0 < h2_snp) (h_power : 0 < power_frac) (h_port : 0 < port_ratio)
-    (h_power_le : power_frac ≤ 1) (h_port_le : port_ratio ≤ 1) :
-    h2_snp * power_frac * port_ratio ≤ h2_snp := by
-  calc h2_snp * power_frac * port_ratio
-      ≤ h2_snp * 1 * 1 := by
-        apply mul_le_mul
-        · exact mul_le_mul_of_nonneg_left h_power_le (le_of_lt h_h2)
-        · exact h_port_le
-        · exact le_of_lt h_port
-        · exact mul_nonneg (le_of_lt h_h2) (by linarith)
-    _ = h2_snp := by ring
+    The deployed target R² is bounded by the discovered source R². -/
+theorem portability_reduces_ceiling (m : PGSCeilingModel) :
+    m.target_r2 ≤ m.source_r2 := by
+  unfold PGSCeilingModel.target_r2 PGSCeilingModel.source_r2
+  apply div_le_div_of_nonneg_right
+  · have : m.VA_tagged - m.V_undiscovered - m.V_nonportable = (m.VA_tagged - m.V_undiscovered) - m.V_nonportable := by ring
+    rw [this]
+    linarith [m.h_V_nonportable_nn]
+  · exact le_of_lt m.h_VP_pos
 
 /-- **The three-way ceiling decomposition.**
-    R²_target ≤ h² × (GWAS power) × (portability ratio).
-    Each factor is ≤ 1, and the product can be very small. -/
-theorem three_way_ceiling
-    (h2 gwas_power port_ratio target_r2 : ℝ)
-    (h_h2_le : h2 ≤ 1) (h_power_le : gwas_power ≤ 1)
-    (h_port_le : port_ratio ≤ 1)
-    (h_h2_nn : 0 ≤ h2) (h_power_nn : 0 ≤ gwas_power) (h_port_nn : 0 ≤ port_ratio)
-    (h_bound : target_r2 ≤ h2 * gwas_power * port_ratio) :
-    target_r2 ≤ 1 := by
-  have : h2 * gwas_power * port_ratio ≤ 1 := by
-    calc h2 * gwas_power * port_ratio
-        ≤ 1 * 1 * 1 := by nlinarith [mul_nonneg h_h2_nn h_power_nn]
-      _ = 1 := by ring
-  linarith
+    The final target R² is strictly bounded below 1 due to the cascade of
+    heritability limits, power limits, and portability losses. -/
+theorem three_way_ceiling (m : PGSCeilingModel) :
+    m.target_r2 ≤ 1 := by
+  unfold PGSCeilingModel.target_r2
+  have h_num : m.VA_tagged - m.V_undiscovered - m.V_nonportable ≤ m.VP := by
+    calc m.VA_tagged - m.V_undiscovered - m.V_nonportable
+        ≤ m.VA_tagged := by linarith [m.h_V_undiscovered_nn, m.h_V_nonportable_nn]
+      _ ≤ m.VP := m.h_VA_tagged_le
+  exact (div_le_one m.h_VP_pos).mpr h_num
 
 end PGSCeiling
 
