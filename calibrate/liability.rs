@@ -15,9 +15,7 @@ use gam::smooth::{
     TermCollectionSpec,
 };
 use gam::survival_location_scale::TimeBlockInput;
-use gam::survival_marginal_slope::{
-    SurvivalMarginalSlopeFitResult, SurvivalMarginalSlopeTermSpec,
-};
+use gam::survival_marginal_slope::{SurvivalMarginalSlopeFitResult, SurvivalMarginalSlopeTermSpec};
 use gam::{
     BernoulliMarginalSlopeFitRequest, FitRequest, FitResult, SurvivalMarginalSlopeFitRequest,
     fit_model,
@@ -190,7 +188,7 @@ pub fn fit_marginal_slope(
         _ => {
             return Err(EstimationError::InvalidSpecification(
                 "unexpected fit result variant".to_string(),
-            ))
+            ));
         }
     };
 
@@ -360,7 +358,7 @@ fn build_time_block(
         _ => {
             return Err(EstimationError::InvalidInput(
                 "expected BSpline1D metadata for time basis".to_string(),
-            ))
+            ));
         }
     };
 
@@ -470,7 +468,7 @@ pub fn fit_survival_marginal_slope(
         _ => {
             return Err(EstimationError::InvalidSpecification(
                 "unexpected fit result variant".to_string(),
-            ))
+            ));
         }
     };
 

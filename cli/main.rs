@@ -130,7 +130,6 @@ pub struct InferArgs {
     /// Path to trained model file (.toml)
     #[arg(long)]
     pub model: String,
-
 }
 
 #[derive(Args)]
@@ -455,9 +454,15 @@ fn save_predictions_detailed(
 
     // Write header
     if is_binary {
-        writeln!(file, "sample_id\thull_signed_distance\tlog_odds\tstandard_error_log_odds\tprediction\tprobability_lower_95\tprobability_upper_95")?;
+        writeln!(
+            file,
+            "sample_id\thull_signed_distance\tlog_odds\tstandard_error_log_odds\tprediction\tprobability_lower_95\tprobability_upper_95"
+        )?;
     } else {
-        writeln!(file, "sample_id\thull_signed_distance\tprediction\tstandard_error_mean\tmean_lower_95\tmean_upper_95")?;
+        writeln!(
+            file,
+            "sample_id\thull_signed_distance\tprediction\tstandard_error_mean\tmean_lower_95\tmean_upper_95"
+        )?;
     }
 
     // Write rows
@@ -505,7 +510,10 @@ fn save_survival_predictions(
     use std::io::Write;
 
     let mut file = std::fs::File::create(output_path)?;
-    writeln!(file, "sample_id\tage_entry\tage_exit\tcumulative_hazard_entry\tcumulative_hazard_exit\tcumulative_incidence_entry\tcumulative_incidence_exit\tconditional_risk\tlogit_risk\tlogit_risk_standard_error")?;
+    writeln!(
+        file,
+        "sample_id\tage_entry\tage_exit\tcumulative_hazard_entry\tcumulative_hazard_exit\tcumulative_incidence_entry\tcumulative_incidence_exit\tconditional_risk\tlogit_risk\tlogit_risk_standard_error"
+    )?;
 
     for idx in 0..prediction.conditional_risk.len() {
         let sample_id = (idx + 1).to_string();
@@ -632,6 +640,10 @@ enum Commands {
         /// Available models: hwe_1kg_hgdp_gsa_v2, hwe_1kg_hgdp_gsa_v3, hwe_1kg_hgdp_gda_v1, hwe_1kg_hgdp_intersection
         #[arg(long, value_name = "MODEL_NAME")]
         model: Option<String>,
+
+        /// Write a JSON manifest describing the exact projection outputs that were created
+        #[arg(long, value_name = "PATH")]
+        output_manifest: Option<PathBuf>,
     },
 
     /// Infer sample-level terms from genotype data
@@ -675,7 +687,8 @@ fn main() {
         Some(Commands::Project {
             genotype_path,
             model,
-        }) => run_map_project(genotype_path, model),
+            output_manifest,
+        }) => run_map_project(genotype_path, model, output_manifest),
         Some(Commands::Terms(args)) => run_terms(args),
         Some(Commands::Train(args)) => train(args),
         Some(Commands::Infer(args)) => infer(args),
@@ -784,10 +797,12 @@ fn run_map_fit(
 fn run_map_project(
     genotype_path: PathBuf,
     model: Option<String>,
+    output_manifest: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     map_cli::run(map_cli::MapCommand::Project {
         genotype_path,
         model,
+        output_manifest,
     })
     .map_err(|err| Box::new(err) as Box<dyn std::error::Error>)
 }

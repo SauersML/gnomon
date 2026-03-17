@@ -248,7 +248,7 @@ pub fn default_model_config_with_link(link: LinkFunction) -> ModelConfig {
             },
         ],
         pgs_range: (-3.0, 3.0),
-        mcmc_enabled: false,       // Disable MCMC for faster tests
+        mcmc_enabled: false, // Disable MCMC for faster tests
 
         ..Default::default()
     }

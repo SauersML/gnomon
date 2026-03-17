@@ -17,7 +17,6 @@ env:
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
   PROJECT_PREFIT_INPUT: >-
     gs://gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/hgdp1kgp_chr20.filtered.SNV_INDEL.phased.shapeit5.bcf
-  PROJECT_PREFIT_OUTPUT_STEM: hgdp1kgp_chr20.filtered.SNV_INDEL.phased.shapeit5
 
 jobs:
   project-and-plot:
@@ -74,7 +73,7 @@ jobs:
         run: |
           cargo +nightly build --release --bin gnomon
 
-      - name: Project full dataset and render PCA plot
+      - name: Project full dataset
         shell: bash
         run: |
           set -euo pipefail
@@ -87,10 +86,52 @@ jobs:
             "$ROOT/target/release/gnomon" project \
             "${{ env.PROJECT_PREFIT_INPUT }}" \
             --model "${{ matrix.model }}" \
+            --output-manifest project_outputs.json \
             2>&1 | tee project.log
 
+      - name: Validate projection outputs
+        id: projection_outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT_DIR="$PWD/artifacts/${{ matrix.label }}"
+          MANIFEST_PATH="$OUT_DIR/project_outputs.json"
+          if [[ ! -f "$MANIFEST_PATH" ]]; then
+            echo "Projection output manifest was not created: $MANIFEST_PATH" >&2
+            find "$OUT_DIR" -maxdepth 1 -type f | sort >&2
+            exit 1
+          fi
+
+          cd "$OUT_DIR"
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          from pathlib import Path
+
+          manifest_path = Path("project_outputs.json")
+          manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+          required = ("scores", "scores_metadata")
+          for key in required:
+              raw = manifest.get(key)
+              if not isinstance(raw, str) or not raw:
+                  raise SystemExit(f"Manifest entry {key!r} is missing or invalid: {raw!r}")
+              path = Path(raw)
+              if not path.is_file():
+                  raise SystemExit(f"Manifest entry {key!r} points to missing file: {path}")
+              print(f"{key}={path}")
+          print(f"manifest={manifest_path}")
+          PY
+
+      - name: Render PCA plot
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$PWD"
+          OUT_DIR="$ROOT/artifacts/${{ matrix.label }}"
+          cd "$OUT_DIR"
+
           python "$ROOT/scripts/plot_project_projection.py" \
-            --scores-bin "${{ env.PROJECT_PREFIT_OUTPUT_STEM }}.projection_scores.bin" \
+            --scores-bin "${{ steps.projection_outputs.outputs.scores }}" \
+            --metadata-json "${{ steps.projection_outputs.outputs.scores_metadata }}" \
             --output-png pc1_pc2.png \
             --output-tsv projection_scores_annotated.tsv \
             --model-name "${{ matrix.title }}" \
@@ -104,7 +145,7 @@ jobs:
             echo "- Model key: \`${{ matrix.model }}\`"
             echo "- Plot: \`artifacts/${{ matrix.label }}/pc1_pc2.png\`"
             echo "- Annotated scores: \`artifacts/${{ matrix.label }}/projection_scores_annotated.tsv\`"
-            echo "- Raw projection: \`artifacts/${{ matrix.label }}/${{ env.PROJECT_PREFIT_OUTPUT_STEM }}.projection_scores.bin\`"
+            echo "- Raw projection: \`artifacts/${{ matrix.label }}/${{ steps.projection_outputs.outputs.scores }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload model artifacts
@@ -114,8 +155,9 @@ jobs:
           path: |
             artifacts/${{ matrix.label }}/pc1_pc2.png
             artifacts/${{ matrix.label }}/projection_scores_annotated.tsv
-            artifacts/${{ matrix.label }}/${{ env.PROJECT_PREFIT_OUTPUT_STEM }}.projection_scores.bin
-            artifacts/${{ matrix.label }}/${{ env.PROJECT_PREFIT_OUTPUT_STEM }}.projection_scores.metadata.json
+            artifacts/${{ matrix.label }}/${{ steps.projection_outputs.outputs.scores }}
+            artifacts/${{ matrix.label }}/${{ steps.projection_outputs.outputs.scores_metadata }}
+            artifacts/${{ matrix.label }}/${{ steps.projection_outputs.outputs.manifest }}
             artifacts/${{ matrix.label }}/sample_population_mapping.tsv
             artifacts/${{ matrix.label }}/project.log
           if-no-files-found: error

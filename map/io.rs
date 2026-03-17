@@ -495,7 +495,7 @@ impl GenotypeDataset {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ProjectionOutputPaths {
     pub scores: PathBuf,
     pub scores_metadata: PathBuf,
@@ -822,6 +822,18 @@ pub fn save_projection_results(
         alignment: alignment_path,
         alignment_metadata,
     })
+}
+
+pub fn save_projection_output_manifest(
+    manifest_path: &Path,
+    outputs: &ProjectionOutputPaths,
+) -> Result<(), DatasetOutputError> {
+    prepare_output_path(manifest_path)?;
+    let mut writer = BufWriter::new(File::create(manifest_path)?);
+    serde_json::to_writer_pretty(&mut writer, outputs)?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
+    Ok(())
 }
 
 pub fn create_projection_matrix_sink(
@@ -1492,18 +1504,9 @@ impl PlinkDataset {
 
     pub fn output_path(&self, filename: &str) -> PathBuf {
         if is_remote_path(&self.bed_path) {
-            let stem = self
-                .bed_path
-                .file_stem()
-                .map(|s| s.to_os_string())
-                .unwrap_or_else(|| OsString::from("dataset"));
-            let mut local = PathBuf::from(stem);
-            local.set_extension(filename);
-            local
+            output_path_from_remote_input(&self.bed_path, filename)
         } else {
-            let mut local = self.bed_path.clone();
-            local.set_extension(filename);
-            local
+            output_path_from_local_input(&self.bed_path, filename)
         }
     }
 }
@@ -1680,9 +1683,7 @@ impl PgenDataset {
     }
 
     pub fn output_path(&self, filename: &str) -> PathBuf {
-        let mut local = self.pgen_path.clone();
-        local.set_extension(filename);
-        local
+        output_path_from_local_input(&self.pgen_path, filename)
     }
 }
 
@@ -2368,17 +2369,9 @@ impl VcfLikeDataset {
 
     pub fn output_path(&self, filename: &str) -> PathBuf {
         match &self.output_hint {
-            OutputHint::LocalFile(path) => {
-                let mut local = path.clone();
-                local.set_extension(filename);
-                local
-            }
+            OutputHint::LocalFile(path) => output_path_from_local_input(path, filename),
             OutputHint::LocalDirectory(dir) => dir.join(filename),
-            OutputHint::RemoteStem(stem) => {
-                let mut local = PathBuf::from(stem);
-                local.set_extension(filename);
-                local
-            }
+            OutputHint::RemoteStem(stem) => append_output_filename(Path::new(stem), filename),
         }
     }
 
@@ -3799,16 +3792,66 @@ fn compute_output_hint(path: &Path) -> OutputHint {
         if trimmed.is_empty() {
             return OutputHint::RemoteStem(OsString::from("dataset"));
         }
-        let stem = Path::new(&trimmed)
-            .file_stem()
-            .map(|s| s.to_os_string())
-            .unwrap_or_else(|| OsString::from("dataset"));
+        let stem = derive_output_stem_name(Path::new(&trimmed));
         OutputHint::RemoteStem(stem)
     } else if path.is_dir() {
         OutputHint::LocalDirectory(path.to_path_buf())
     } else {
         OutputHint::LocalFile(path.to_path_buf())
     }
+}
+
+fn output_path_from_local_input(path: &Path, filename: &str) -> PathBuf {
+    append_output_filename(&local_output_base_path(path), filename)
+}
+
+fn output_path_from_remote_input(path: &Path, filename: &str) -> PathBuf {
+    let stem = derive_output_stem_name(path);
+    append_output_filename(Path::new(&stem), filename)
+}
+
+fn local_output_base_path(path: &Path) -> PathBuf {
+    let stem = derive_output_stem_name(path);
+    match path.parent() {
+        Some(parent) => parent.join(&stem),
+        None => PathBuf::from(stem),
+    }
+}
+
+fn append_output_filename(base: &Path, filename: &str) -> PathBuf {
+    let mut name = base
+        .file_name()
+        .map(|segment| segment.to_os_string())
+        .unwrap_or_else(|| OsString::from("dataset"));
+    name.push(".");
+    name.push(filename);
+    match base.parent() {
+        Some(parent) => parent.join(name),
+        None => PathBuf::from(name),
+    }
+}
+
+fn derive_output_stem_name(path: &Path) -> OsString {
+    const COMPOUND_SUFFIXES: &[&str] = &[".vcf.bgz", ".vcf.gz", ".bcf.bgz", ".bcf.gz"];
+    const SIMPLE_SUFFIXES: &[&str] = &[
+        ".bed", ".bim", ".fam", ".pgen", ".pvar", ".psam", ".vcf", ".bcf",
+    ];
+
+    let Some(file_name) = path.file_name() else {
+        return OsString::from("dataset");
+    };
+    let file_name = file_name.to_string_lossy().into_owned();
+    let lower = file_name.to_ascii_lowercase();
+    for suffix in COMPOUND_SUFFIXES.iter().chain(SIMPLE_SUFFIXES.iter()) {
+        if lower.ends_with(suffix) && file_name.len() > suffix.len() {
+            return OsString::from(&file_name[..file_name.len() - suffix.len()]);
+        }
+    }
+    Path::new(&file_name)
+        .file_stem()
+        .filter(|stem| !stem.is_empty())
+        .map(|stem| stem.to_os_string())
+        .unwrap_or_else(|| OsString::from("dataset"))
 }
 
 fn create_variant_reader_for_file(
@@ -4626,6 +4669,62 @@ mod tests {
         assert_eq!(metadata["cols"], 3);
         assert_eq!(metadata["row_ids_embedded"], true);
         assert_eq!(metadata["row_id_field"], "IID");
+    }
+
+    #[test]
+    fn derive_output_stem_name_preserves_intermediate_suffixes() {
+        let stem = derive_output_stem_name(Path::new(
+            "hgdp1kgp_chr20.filtered.SNV_INDEL.phased.shapeit5.bcf",
+        ));
+        assert_eq!(
+            stem,
+            OsString::from("hgdp1kgp_chr20.filtered.SNV_INDEL.phased.shapeit5")
+        );
+    }
+
+    #[test]
+    fn derive_output_stem_name_strips_compound_variant_suffixes() {
+        let stem = derive_output_stem_name(Path::new("cohort.vcf.gz"));
+        assert_eq!(stem, OsString::from("cohort"));
+    }
+
+    #[test]
+    fn output_path_from_local_input_appends_output_suffix_after_dataset_stem() {
+        let path = output_path_from_local_input(
+            Path::new("/tmp/cohort.shapeit5.bcf"),
+            "projection_scores.metadata.json",
+        );
+        assert_eq!(
+            path,
+            PathBuf::from("/tmp/cohort.shapeit5.projection_scores.metadata.json")
+        );
+    }
+
+    #[test]
+    fn save_projection_output_manifest_writes_json_paths() {
+        let dir = tempdir().unwrap();
+        let manifest_path = dir.path().join("projection_outputs.json");
+        let outputs = ProjectionOutputPaths {
+            scores: PathBuf::from("cohort.shapeit5.projection_scores.bin"),
+            scores_metadata: PathBuf::from("cohort.shapeit5.projection_scores.metadata.json"),
+            alignment: None,
+            alignment_metadata: None,
+        };
+
+        save_projection_output_manifest(&manifest_path, &outputs).expect("write manifest");
+
+        let stored: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).expect("read manifest")).unwrap();
+        assert_eq!(
+            stored["scores"],
+            serde_json::Value::String("cohort.shapeit5.projection_scores.bin".to_string())
+        );
+        assert_eq!(
+            stored["scores_metadata"],
+            serde_json::Value::String(
+                "cohort.shapeit5.projection_scores.metadata.json".to_string()
+            )
+        );
     }
 
     #[test]

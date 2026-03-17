@@ -2,7 +2,8 @@ use super::fit::{FitOptions, HwePcaError, HwePcaModel, LdConfig, LdWindow, Varia
 use super::io::{
     DatasetOutputError, GenotypeDataset, GenotypeIoError, OrderedSelectionPlan,
     ProjectionOutputPaths, SelectionPlan, create_projection_matrix_sink, load_hwe_model,
-    load_model_from_path, save_fit_summary, save_hwe_model, save_sample_manifest,
+    load_model_from_path, save_fit_summary, save_hwe_model, save_projection_output_manifest,
+    save_sample_manifest,
 };
 use super::prefit::{self, BuiltinModelError};
 use super::progress::{fit_progress, projection_progress};
@@ -26,6 +27,7 @@ pub enum MapCommand {
     Project {
         genotype_path: PathBuf,
         model: Option<String>,
+        output_manifest: Option<PathBuf>,
     },
 }
 
@@ -118,7 +120,8 @@ pub fn run(command: MapCommand) -> Result<(), MapDriverError> {
         MapCommand::Project {
             genotype_path,
             model,
-        } => run_project(&genotype_path, model.as_deref()),
+            output_manifest,
+        } => run_project(&genotype_path, model.as_deref(), output_manifest.as_deref()),
     }
 }
 
@@ -316,7 +319,11 @@ fn run_fit(
     Ok(())
 }
 
-fn run_project(genotype_path: &Path, model_name: Option<&str>) -> Result<(), MapDriverError> {
+fn run_project(
+    genotype_path: &Path,
+    model_name: Option<&str>,
+    output_manifest: Option<&Path>,
+) -> Result<(), MapDriverError> {
     println!("=== Sample projection into PCA space ===");
     println!("Input genotype location: {}", genotype_path.display());
 
@@ -475,12 +482,7 @@ fn run_project(genotype_path: &Path, model_name: Option<&str>) -> Result<(), Map
         "Projection finalize time: {:.3}s",
         finalize_start.elapsed().as_secs_f64()
     );
-    let ProjectionOutputPaths {
-        scores,
-        scores_metadata,
-        alignment,
-        alignment_metadata,
-    } = ProjectionOutputPaths {
+    let outputs = ProjectionOutputPaths {
         scores,
         scores_metadata,
         alignment: None,
@@ -488,13 +490,20 @@ fn run_project(genotype_path: &Path, model_name: Option<&str>) -> Result<(), Map
     };
 
     println!("Generated projection outputs:");
-    println!("  • Scores    : {}", scores.display());
-    println!("  • Scores metadata : {}", scores_metadata.display());
-    if let Some(path) = alignment {
+    println!("  • Scores    : {}", outputs.scores.display());
+    println!(
+        "  • Scores metadata : {}",
+        outputs.scores_metadata.display()
+    );
+    if let Some(path) = outputs.alignment.as_ref() {
         println!("  • Alignment : {}", path.display());
     }
-    if let Some(path) = alignment_metadata {
+    if let Some(path) = outputs.alignment_metadata.as_ref() {
         println!("  • Alignment metadata : {}", path.display());
+    }
+    if let Some(manifest_path) = output_manifest {
+        save_projection_output_manifest(manifest_path, &outputs)?;
+        println!("  • Output manifest : {}", manifest_path.display());
     }
 
     println!("Projection complete for {} samples", dataset.n_samples());
@@ -882,7 +891,11 @@ mod tests {
         let projection_dataset = GenotypeDataset::open(&project_path)?;
         fs::copy(&model_path, projection_dataset.output_path("hwe.json"))?;
 
-        run_project(&project_path, None)?;
+        let manifest_path = project_path
+            .parent()
+            .expect("project path parent")
+            .join("project_outputs.json");
+        run_project(&project_path, None, Some(&manifest_path))?;
 
         let scores_path = projection_dataset.output_path("projection_scores.bin");
         let metadata_path = projection_dataset.output_path("projection_scores.metadata.json");
@@ -890,6 +903,15 @@ mod tests {
         assert!(
             metadata_path.exists(),
             "projection metadata should be written"
+        );
+        let manifest: serde_json::Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+        assert_eq!(
+            manifest["scores"].as_str(),
+            Some(scores_path.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            manifest["scores_metadata"].as_str(),
+            Some(metadata_path.to_string_lossy().as_ref())
         );
         let stored_scores = read_projection_scores_column_major(
             &scores_path,
@@ -916,7 +938,7 @@ mod tests {
         );
         assert_eq!(metadata["cols"].as_u64(), Some(model.components() as u64));
 
-        run_project(&project_path, None)?;
+        run_project(&project_path, None, None)?;
         let rerun_scores = read_projection_scores_column_major(
             &scores_path,
             projection_dataset.n_samples(),

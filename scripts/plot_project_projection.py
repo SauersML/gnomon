@@ -53,7 +53,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scores-bin", required=True, help="Path to projection_scores.bin")
     parser.add_argument(
         "--metadata-json",
-        help="Path to projection_scores.metadata.json (defaults to scores bin with .metadata.json)",
+        required=True,
+        help="Path to projection_scores.metadata.json",
     )
     parser.add_argument("--output-png", required=True, help="Output PNG path")
     parser.add_argument(
@@ -186,6 +187,11 @@ def _read_metadata(path: Path) -> dict[str, Any]:
     if metadata.get("row_id_field") != "IID":
         raise ValueError(f"Unsupported row ID field {metadata.get('row_id_field')!r}.")
     return metadata
+
+
+def _require_file(path: Path, label: str) -> None:
+    if not path.is_file():
+        raise FileNotFoundError(f"{label} not found: {path}")
 
 
 def _read_projection_binary(path: Path, rows: int, cols: int) -> tuple[np.ndarray, list[str]]:
@@ -455,14 +461,12 @@ def main() -> None:
     args = parse_args()
 
     scores_bin = Path(args.scores_bin)
-    metadata_json = (
-        Path(args.metadata_json)
-        if args.metadata_json
-        else scores_bin.with_suffix(".metadata.json")
-    )
+    metadata_json = Path(args.metadata_json)
     output_png = Path(args.output_png)
     output_tsv = Path(args.output_tsv) if args.output_tsv else None
 
+    _require_file(scores_bin, "Projection scores binary")
+    _require_file(metadata_json, "Projection metadata JSON")
     metadata = _read_metadata(metadata_json)
     rows = int(metadata["rows"])
     cols = int(metadata["cols"])
