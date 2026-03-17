@@ -580,37 +580,83 @@ with perfect power.
 
 section EffectSizeHeterogeneity
 
-/-- **Genetic correlation between ancestries.**
-    r_g < 1 means effect sizes are not perfectly correlated.
-    This sets an upper bound on cross-ancestry R². -/
-theorem genetic_correlation_bounds_portability
-    (r2_source r2_target rg : ℝ)
-    (h_bound : r2_target ≤ rg^2 * r2_source)
-    (h_rg : |rg| < 1) (h_r2 : 0 < r2_source) :
-    r2_target < r2_source := by
-  have : rg^2 < 1 := by nlinarith [sq_abs rg, abs_nonneg rg, sq_nonneg rg]
+/-- **Model for Cross-Ancestry Genetic Architecture.**
+    Formalizes the variance-covariance structure of effect sizes
+    across two populations, establishing the basis for genetic correlation. -/
+structure CrossAncestryGeneticModel where
+  /-- Additive variance in the source population -/
+  V_source : ℝ
+  /-- Additive variance in the target population -/
+  V_target : ℝ
+  /-- Genetic covariance between source and target populations -/
+  Cov_st : ℝ
+  /-- Positivity and Cauchy-Schwarz constraints -/
+  h_Vs_pos : 0 < V_source
+  h_Vt_pos : 0 < V_target
+  h_cs : Cov_st ^ 2 ≤ V_source * V_target
+
+/-- **Genetic Correlation.**
+    Derived from the covariance components of the genetic model. -/
+noncomputable def CrossAncestryGeneticModel.rg (m : CrossAncestryGeneticModel) : ℝ :=
+  m.Cov_st / Real.sqrt (m.V_source * m.V_target)
+
+/-- **Target R² Bound.**
+    The theoretical upper bound on target R² when predicting using source effects,
+    scaled relative to the source R² bound, is limited by rg².
+    This is modelled dynamically as `rg² * source_ceiling`. -/
+noncomputable def CrossAncestryGeneticModel.targetR2Bound (m : CrossAncestryGeneticModel) (source_ceiling : ℝ) : ℝ :=
+  m.rg ^ 2 * source_ceiling
+
+/-- **Genetic correlation sets an absolute upper bound on portability.**
+    If genetic correlation is imperfect (|rg| < 1), the expected target R²
+    will be strictly lower than the source R² ceiling. -/
+theorem genetic_correlation_bounds_portability (m : CrossAncestryGeneticModel) (source_ceiling : ℝ)
+    (h_imperfect_rg : |m.rg| < 1) (h_source_pos : 0 < source_ceiling) :
+    m.targetR2Bound source_ceiling < source_ceiling := by
+  unfold CrossAncestryGeneticModel.targetR2Bound
+  have h_rg2_lt_1 : m.rg ^ 2 < 1 := by
+    have h_abs : m.rg ^ 2 = |m.rg| * |m.rg| := by
+      calc m.rg ^ 2 = m.rg * m.rg := by ring
+        _ = |m.rg * m.rg| := by
+          have : 0 ≤ m.rg * m.rg := mul_self_nonneg m.rg
+          exact (abs_of_nonneg this).symm
+        _ = |m.rg| * |m.rg| := abs_mul _ _
+    nlinarith [abs_nonneg m.rg]
   nlinarith
 
-/-- **High genetic correlation implies good portability.**
-    When cross-population r_g is high (e.g., ~0.95), most of the
-    genetic architecture is shared. -/
-theorem high_rg_implies_good_portability
-    (rg lb r2_source : ℝ)
-    (h_rg : lb < rg) (h_lb_nn : 0 ≤ lb) (h_rg_le : rg ≤ 1)
-    (h_r2 : 0 < r2_source) :
-    lb^2 * r2_source < rg^2 * r2_source := by
-  have : lb ^ 2 < rg ^ 2 := by nlinarith [sq_nonneg (rg - lb)]
+/-- **High genetic correlation maintains higher portability.**
+    If genetic correlation is bounded below by a high value, the
+    target R² bound is correspondingly guaranteed to be higher. -/
+theorem high_rg_implies_good_portability (m : CrossAncestryGeneticModel) (source_ceiling lb : ℝ)
+    (h_lb_le_rg : lb ≤ |m.rg|) (h_lb_pos : 0 ≤ lb) (h_source_pos : 0 < source_ceiling) :
+    lb ^ 2 * source_ceiling ≤ m.targetR2Bound source_ceiling := by
+  unfold CrossAncestryGeneticModel.targetR2Bound
+  have h_lb2_le_rg2 : lb ^ 2 ≤ m.rg ^ 2 := by
+    have h_abs : m.rg ^ 2 = |m.rg| * |m.rg| := by
+      calc m.rg ^ 2 = m.rg * m.rg := by ring
+        _ = |m.rg * m.rg| := by
+          have : 0 ≤ m.rg * m.rg := mul_self_nonneg m.rg
+          exact (abs_of_nonneg this).symm
+        _ = |m.rg| * |m.rg| := abs_mul _ _
+    nlinarith [sq_nonneg lb, abs_nonneg m.rg, h_lb_le_rg]
   nlinarith
 
-/-- **Low r_g limits portability.**
-    When cross-population r_g is low (e.g., ~0.4), this severely limits
-    cross-population PGS for the affected traits. -/
-theorem low_rg_limits_portability
-    (rg ub r2_source : ℝ)
-    (h_rg : rg < ub) (h_rg_nn : 0 ≤ rg) (h_ub_nn : 0 ≤ ub)
-    (h_r2 : 0 < r2_source) :
-    rg^2 * r2_source < ub^2 * r2_source := by
-  have : rg ^ 2 < ub ^ 2 := by nlinarith [sq_nonneg (rg - ub)]
+/-- **Low genetic correlation severely limits portability.**
+    If genetic correlation is bounded above by a low value, the
+    target R² bound is strictly capped below that low ceiling. -/
+theorem low_rg_limits_portability (m : CrossAncestryGeneticModel) (source_ceiling ub : ℝ)
+    (h_rg_lt_ub : |m.rg| < ub) (h_source_pos : 0 < source_ceiling) :
+    m.targetR2Bound source_ceiling < ub ^ 2 * source_ceiling := by
+  unfold CrossAncestryGeneticModel.targetR2Bound
+  have h_rg2_lt_ub2 : m.rg ^ 2 < ub ^ 2 := by
+    have h_abs : m.rg ^ 2 = |m.rg| * |m.rg| := by
+      calc m.rg ^ 2 = m.rg * m.rg := by ring
+        _ = |m.rg * m.rg| := by
+          have : 0 ≤ m.rg * m.rg := mul_self_nonneg m.rg
+          exact (abs_of_nonneg this).symm
+        _ = |m.rg| * |m.rg| := abs_mul _ _
+    have h_ub_pos : 0 < ub := lt_of_le_of_lt (abs_nonneg m.rg) h_rg_lt_ub
+    nlinarith [abs_nonneg m.rg]
   nlinarith
 
 end EffectSizeHeterogeneity
