@@ -6,7 +6,6 @@ mod tests {
     use crate::calibrate::model::{
         BasisConfig, InteractionPenaltyKind, ModelFamily, PrincipalComponentConfig,
     };
-    use gam::estimate::internal;
     use ndarray::{Array, Array1, Array2, Zip};
     use rand::seq::SliceRandom;
     use rand::{RngExt, SeedableRng, rngs::StdRng};
@@ -145,7 +144,7 @@ mod tests {
             }],
             pgs_range: (-2.0, 2.0),
             mcmc_enabled: false,
-            calibrator_enabled: false,
+    
             ..Default::default()
         };
 
@@ -594,7 +593,7 @@ mod tests {
             }],
             pgs_range: (-2.0, 2.0),
             mcmc_enabled: false,
-            calibrator_enabled: false,
+    
             ..Default::default()
         };
 
@@ -784,7 +783,7 @@ mod tests {
             }],
             pgs_range: (-2.0, 2.0),
             mcmc_enabled: false,
-            calibrator_enabled: false,
+    
             ..Default::default()
         };
 
@@ -871,7 +870,7 @@ mod tests {
             }],
             pgs_range: (-2.0, 2.0),
             mcmc_enabled: false,
-            calibrator_enabled: false,
+    
             ..Default::default()
         };
 
@@ -954,7 +953,7 @@ mod tests {
             }],
             pgs_range: (-2.0, 2.0),
             mcmc_enabled: false,
-            calibrator_enabled: false,
+    
             ..Default::default()
         };
 
@@ -1674,7 +1673,7 @@ mod tests {
             ],
             pgs_range: (-2.0, 2.0),
             mcmc_enabled: false,
-            calibrator_enabled: false,
+    
             ..Default::default()
         };
 
@@ -1780,7 +1779,7 @@ mod tests {
             ],
             pgs_range: (-2.0, 2.0),
             mcmc_enabled: false,
-            calibrator_enabled: false,
+    
             ..Default::default()
         };
 
@@ -2921,7 +2920,7 @@ mod tests {
             ],
             pgs_range: (-3.0, 3.0),
             mcmc_enabled: false,
-            calibrator_enabled: false,
+    
             ..Default::default()
         };
 
@@ -3031,7 +3030,7 @@ mod tests {
             ],
             pgs_range: (-2.5, 2.5),
             mcmc_enabled: false,
-            calibrator_enabled: false,
+    
             ..Default::default()
         };
 
@@ -3235,7 +3234,7 @@ mod tests {
             },
             pgs_range: (-2.0, 2.0),
             mcmc_enabled: false,
-            calibrator_enabled: false,
+    
             ..Default::default()
         };
         // Clear PC configurations
@@ -3358,7 +3357,7 @@ mod tests {
             }],
             pgs_range: (-6.0, 6.0),
             mcmc_enabled: false,
-            calibrator_enabled: false,
+    
             ..Default::default()
         };
 
@@ -3490,7 +3489,7 @@ mod tests {
             }],
             pgs_range: (-3.0, 3.0),
             mcmc_enabled: false,
-            calibrator_enabled: false,
+    
             ..Default::default()
         };
 
@@ -3668,7 +3667,7 @@ mod tests {
             ],
             pgs_range: (-1.0, 1.0),
             mcmc_enabled: false,
-            calibrator_enabled: false,
+    
             ..Default::default()
         };
         // This creates way too many parameters for 30 data points
@@ -3780,7 +3779,7 @@ mod tests {
             }],
             pgs_range: (0.0, 1.0),
             mcmc_enabled: false,
-            calibrator_enabled: false,
+    
             ..Default::default()
         };
 
@@ -3889,7 +3888,7 @@ mod tests {
             }],
             pgs_range: (0.0, 1.0),
             mcmc_enabled: false,
-            calibrator_enabled: false,
+    
             ..Default::default()
         };
 
@@ -4027,7 +4026,7 @@ mod tests {
                 },
                 pgs_range: (-2.0, 2.0),
                 mcmc_enabled: false,
-                calibrator_enabled: false,
+        
                 ..Default::default()
             };
             simple_config.model_family = ModelFamily::Gam(link_function);
@@ -4161,7 +4160,7 @@ mod tests {
                 },
                 pgs_range: (-1.0, 1.0),
                 mcmc_enabled: false,
-                calibrator_enabled: false,
+        
                 ..Default::default()
             };
 
@@ -4331,7 +4330,7 @@ mod tests {
             }],
             pgs_range: (-2.0, 2.0),
             mcmc_enabled: false,
-            calibrator_enabled: false,
+    
             ..Default::default()
         };
 
@@ -4513,7 +4512,7 @@ mod tests {
             },
             pgs_range: (-1.0, 1.0),
             mcmc_enabled: false,
-            calibrator_enabled: false,
+    
             ..Default::default()
         };
 
@@ -4626,7 +4625,7 @@ mod tests {
             },
             pgs_range: (-1.0, 1.0),
             mcmc_enabled: false,
-            calibrator_enabled: false,
+    
             ..Default::default()
         };
 
@@ -5010,7 +5009,7 @@ fn run(link_function: LinkFunction) -> Result<(), Box<dyn std::error::Error>> {
         }],
         pgs_range: (-3.5, 3.5), // Use slightly wider ranges for robustness
         mcmc_enabled: false,
-        calibrator_enabled: false,
+
         ..Default::default()
     };
 
@@ -5111,7 +5110,7 @@ fn reparam_consistency_rho_vs_lambda_gaussian_identity() {
         },
         pgs_range: (-1.0, 1.0),
         mcmc_enabled: false,
-        calibrator_enabled: false,
+
         ..Default::default()
     };
 
@@ -5271,7 +5270,7 @@ fn test_laml_gradient_matches_finite_difference() {
         }],
         pgs_range: (-2.0, 2.0),
         mcmc_enabled: false,
-        calibrator_enabled: false,
+
         ..Default::default()
     };
 
@@ -5392,7 +5391,6 @@ fn test_objective_consistency_raw_vs_stabilized() {
         tol: 1e-6,
         max_iter: 100,
         nullspace_dims: vec![0, 0],
-        firth: Some(crate::calibrate::calibrator::FirthSpec::all_enabled()),
     };
 
     // Fit model and extract results for diagnostic purposes
@@ -5457,7 +5455,7 @@ fn test_hmc_integration_runs() {
         },
         pgs_range: (-2.0, 2.0),
         mcmc_enabled: true, // ENABLE MCMC
-        calibrator_enabled: false,
+
         ..Default::default()
     };
 
@@ -5574,7 +5572,7 @@ fn test_mcmc_end_to_end_with_disk_io() {
             degree: 3,
         },
         pgs_range: (-3.0, 3.0),
-        calibrator_enabled: false,
+
         ..Default::default()
     };
 

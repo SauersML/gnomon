@@ -81,10 +81,6 @@ pub struct TrainArgs {
     #[arg(long, default_value = "1e-3")]
     pub reml_convergence_tolerance: f64,
 
-    /// Disable the optional post-process calibration layer (enabled by default)
-    #[arg(long)]
-    pub no_calibration: bool,
-
     /// Guard delta for the survival age transform
     #[arg(long, default_value = "0.1")]
     pub survival_guard_delta: f64,
@@ -135,9 +131,6 @@ pub struct InferArgs {
     #[arg(long)]
     pub model: String,
 
-    /// Disable applying the post-process calibration layer (enabled by default)
-    #[arg(long)]
-    pub no_calibration: bool,
 }
 
 #[derive(Args)]
@@ -152,12 +145,6 @@ pub struct TermsArgs {
 }
 
 pub fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
-    if args.no_calibration {
-        println!("Post-process calibration disabled via --no-calibration flag.");
-    } else {
-        println!("Post-process calibration enabled (default).");
-    }
-
     match args.model_family {
         ModelFamilyCli::Gam => {
             if has_survival_columns(&args.training_data)? {
@@ -222,7 +209,6 @@ pub fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
                 pgs_basis_config,
                 pc_configs,
                 pgs_range,
-                calibrator_enabled: !args.no_calibration,
                 ..Default::default()
             };
 
@@ -297,7 +283,6 @@ fn train_survival_from_args(args: &TrainArgs) -> Result<(), Box<dyn std::error::
         max_iterations: args.max_iterations,
         reml_convergence_tolerance: args.reml_convergence_tolerance,
         reml_max_iterations: args.reml_max_iterations,
-        calibrator_enabled: !args.no_calibration,
         survival: Some(survival_config),
         ..Default::default()
     };
@@ -329,21 +314,6 @@ pub fn infer(args: InferArgs) -> Result<(), Box<dyn std::error::Error>> {
             let (eta, mean, signed_dist, se_eta_opt) =
                 model.predict_detailed(data.p.view(), data.sex.view(), data.pcs.view())?;
 
-            // Check if calibrator is available
-            let calibrated_mean_opt = if args.no_calibration {
-                println!("Skipping calibration via --no-calibration flag.");
-                None
-            } else if model.calibrator.is_some() {
-                println!("Calibrator detected. Generating calibrated predictions.");
-                // Get calibrated predictions but don't error if calibrator is missing
-                match model.predict_calibrated(data.p.view(), data.sex.view(), data.pcs.view()) {
-                    Ok(calibrated) => Some(calibrated),
-                    Err(_) => None,
-                }
-            } else {
-                None
-            };
-
             // Save predictions with required columns to hardcoded output path
             let output_path = "predictions.tsv";
             save_predictions_detailed(
@@ -353,7 +323,6 @@ pub fn infer(args: InferArgs) -> Result<(), Box<dyn std::error::Error>> {
                 &mean,
                 se_eta_opt.as_ref(),
                 *link_function,
-                calibrated_mean_opt.as_ref(),
                 output_path,
             )?;
             println!("Predictions saved to: {output_path}");
@@ -377,33 +346,8 @@ pub fn infer(args: InferArgs) -> Result<(), Box<dyn std::error::Error>> {
                 Some(&model.survival_companions),
             )?;
 
-            let calibrated_risk = if args.no_calibration {
-                println!("Skipping calibration via --no-calibration flag.");
-                None
-            } else if model
-                .survival
-                .as_ref()
-                .and_then(|artifacts| artifacts.calibrator.as_ref())
-                .is_some()
-            {
-                println!("Calibrator detected. Generating calibrated survival predictions.");
-                match model.predict_survival_calibrated(
-                    data.age_entry.view(),
-                    data.age_exit.view(),
-                    data.pgs.view(),
-                    data.sex.view(),
-                    data.pcs.view(),
-                    Some(&model.survival_companions),
-                ) {
-                    Ok(calibrated) => Some(calibrated),
-                    Err(_) => None,
-                }
-            } else {
-                None
-            };
-
             let output_path = "predictions.tsv";
-            save_survival_predictions(output_path, &data, &prediction, calibrated_risk.as_ref())?;
+            save_survival_predictions(output_path, &data, &prediction)?;
             println!("Predictions saved to: {output_path}");
         }
     }
@@ -502,40 +446,23 @@ fn save_predictions_detailed(
     mean: &Array1<f64>,
     se_eta_opt: Option<&Array1<f64>>,
     link: LinkFunction,
-    calibrated_mean_opt: Option<&Array1<f64>>,
     output_path: &str,
 ) -> Result<(), std::io::Error> {
     use std::io::Write;
 
     let mut file = std::fs::File::create(output_path)?;
-    let has_cal = calibrated_mean_opt.is_some();
     let is_binary = !matches!(link, LinkFunction::Identity);
 
     // Write header
     if is_binary {
-        let base = "sample_id\thull_signed_distance\tlog_odds\tstandard_error_log_odds";
-        let tail = "prediction\tprobability_lower_95\tprobability_upper_95";
-        if has_cal {
-            writeln!(file, "{base}\tuncalibrated_prediction\t{tail}")?;
-        } else {
-            writeln!(file, "{base}\t{tail}")?;
-        }
+        writeln!(file, "sample_id\thull_signed_distance\tlog_odds\tstandard_error_log_odds\tprediction\tprobability_lower_95\tprobability_upper_95")?;
     } else {
-        let tail = "prediction\tstandard_error_mean\tmean_lower_95\tmean_upper_95";
-        if has_cal {
-            writeln!(
-                file,
-                "sample_id\thull_signed_distance\tuncalibrated_prediction\t{tail}"
-            )?;
-        } else {
-            writeln!(file, "sample_id\thull_signed_distance\t{tail}")?;
-        }
+        writeln!(file, "sample_id\thull_signed_distance\tprediction\tstandard_error_mean\tmean_lower_95\tmean_upper_95")?;
     }
 
     // Write rows
     for i in 0..eta.len() {
-        let uncalibrated = mean[i];
-        let prediction = calibrated_mean_opt.map_or(uncalibrated, |cal| cal[i]);
+        let prediction = mean[i];
         let (se_str, lo_str, hi_str) = se_and_ci(
             se_eta_opt,
             i,
@@ -552,7 +479,7 @@ fn save_predictions_detailed(
                     &eta[i],
                     &se_str,
                 ],
-                has_cal.then_some(&uncalibrated as &dyn std::fmt::Display),
+                None,
                 &[&prediction, &lo_str, &hi_str],
             )?;
         } else {
@@ -562,7 +489,7 @@ fn save_predictions_detailed(
                     &sample_ids[i] as &dyn std::fmt::Display,
                     &signed_distance[i],
                 ],
-                has_cal.then_some(&uncalibrated as &dyn std::fmt::Display),
+                None,
                 &[&prediction, &se_str, &lo_str, &hi_str],
             )?;
         }
@@ -574,17 +501,11 @@ fn save_survival_predictions(
     output_path: &str,
     data: &SurvivalPredictionData,
     prediction: &SurvivalPrediction,
-    calibrated_risk: Option<&Array1<f64>>,
 ) -> Result<(), std::io::Error> {
     use std::io::Write;
 
     let mut file = std::fs::File::create(output_path)?;
-    let base_header = "sample_id\tage_entry\tage_exit\tcumulative_hazard_entry\tcumulative_hazard_exit\tcumulative_incidence_entry\tcumulative_incidence_exit\tconditional_risk\tlogit_risk\tlogit_risk_standard_error";
-    if calibrated_risk.is_some() {
-        writeln!(file, "{base_header}\tcalibrated_risk")?;
-    } else {
-        writeln!(file, "{base_header}")?;
-    }
+    writeln!(file, "sample_id\tage_entry\tage_exit\tcumulative_hazard_entry\tcumulative_hazard_exit\tcumulative_incidence_entry\tcumulative_incidence_exit\tconditional_risk\tlogit_risk\tlogit_risk_standard_error")?;
 
     for idx in 0..prediction.conditional_risk.len() {
         let sample_id = (idx + 1).to_string();
@@ -609,10 +530,7 @@ fn save_survival_predictions(
                 &se,
             ],
             None,
-            calibrated_risk
-                .map(|cal| -> Vec<&dyn std::fmt::Display> { vec![&cal[idx]] })
-                .unwrap_or_default()
-                .as_slice(),
+            &[],
         )?;
     }
 

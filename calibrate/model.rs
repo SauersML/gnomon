@@ -104,10 +104,6 @@ pub fn default_mcmc_enabled() -> bool {
     true
 }
 
-pub fn default_calibrator_enabled() -> bool {
-    true
-}
-
 /// The complete blueprint of a trained model.
 /// Contains all hyperparameters and structural information needed for prediction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -155,9 +151,6 @@ pub struct ModelConfig {
     /// When true, runs NUTS sampler to generate posterior samples stored in TrainedModel.
     #[serde(default)]
     pub mcmc_enabled: bool,
-    /// Enable post-process calibration when a calibrator is available.
-    #[serde(default = "default_calibrator_enabled")]
-    pub calibrator_enabled: bool,
     #[serde(default)]
     pub survival: Option<SurvivalModelConfig>,
 }
@@ -187,14 +180,13 @@ impl Default for ModelConfig {
             interaction_orth_alpha: HashMap::new(),
             pc_null_transforms: HashMap::new(),
             mcmc_enabled: true,
-            calibrator_enabled: true,
             survival: None,
         }
     }
 }
 
 impl ModelConfig {
-    /// Minimal configuration for external designs (calibrator adapter).
+    /// Minimal configuration for external designs.
     /// Only the fields used by PIRLS/REML are populated; others are left empty.
     pub fn external(
         link: LinkFunction,
@@ -204,8 +196,7 @@ impl ModelConfig {
     ) -> Self {
         ModelConfig {
             model_family: ModelFamily::Gam(link),
-            // Align PIRLS tolerance with external REML tolerance to avoid over-iterating
-            // on small calibrator fits where the outer loop is already coarse.
+            // Align PIRLS tolerance with external REML tolerance.
             convergence_tolerance: reml_tol,
             max_iterations: 500,
             reml_convergence_tolerance: reml_tol,
@@ -295,9 +286,6 @@ pub struct TrainedModel {
     /// Optional scale parameter (Gaussian identity link). Used for mean SE scaling when applicable.
     #[serde(default)]
     pub scale: Option<f64>,
-    /// Optional post-fit calibrator model
-    #[serde(default)]
-    pub calibrator: Option<crate::calibrate::calibrator::CalibratorModel>,
     /// Optional joint link calibration for single-index models.
     #[serde(default)]
     pub joint_link: Option<JointLinkModel>,
@@ -368,11 +356,6 @@ pub enum ModelError {
     ConstraintMissing(String),
     #[error("Coefficient vector for term '{0}' is missing from the model file.")]
     CoefficientMissing(String),
-
-    #[error(
-        "Calibrated prediction requested but no calibrator is present (disabled or missing from model)."
-    )]
-    CalibratorMissing,
 
     #[error("Estimation error: {0}")]
     EstimationError(#[from] crate::calibrate::estimate::EstimationError),
@@ -1186,65 +1169,6 @@ impl TrainedModel {
         }
     }
 
-    /// Predicts outcomes applying the optional post-process calibrator.
-    /// Baseline predictions are computed first, then the calibrator adjusts them.
-    pub fn predict_calibrated(
-        &self,
-        p_new: ArrayView1<f64>,
-        sex_new: ArrayView1<f64>,
-        pcs_new: ArrayView2<f64>,
-    ) -> Result<Array1<f64>, ModelError> {
-        if matches!(self.config.model_family, ModelFamily::Survival(_)) {
-            return Err(ModelError::UnsupportedForSurvival("predict_calibrated"));
-        }
-        // Stage: Compute baseline predictions
-        let link_function = self.ensure_gam_link("calibrated prediction")?;
-        if self.calibrator.is_none() {
-            return Err(ModelError::CalibratorMissing);
-        }
-
-        if link_function == LinkFunction::Logit
-            && self.mcmc_samples.is_some()
-            && self.joint_link.is_none()
-        {
-            let (x_new, signed_dist) = self.build_prediction_design(p_new, sex_new, pcs_new)?;
-            let mean_probs = self.mcmc_mean_logit_predictions(&x_new)?;
-            let pred_in = mean_probs.mapv(|p| {
-                let p = p.clamp(1e-8, 1.0 - 1e-8);
-                (p / (1.0 - p)).ln()
-            });
-            let se_eta_opt = self.compute_se_eta_from_hessian(&x_new, link_function);
-            let se_in = se_eta_opt.unwrap_or_else(|| Array1::zeros(x_new.nrows()));
-            let cal = self.calibrator.as_ref().unwrap();
-            let preds = crate::calibrate::calibrator::predict_calibrator(
-                cal,
-                pred_in.view(),
-                se_in.view(),
-                signed_dist.view(),
-            )?;
-            return Ok(preds);
-        }
-
-        let baseline = self.predict(p_new, sex_new, pcs_new)?;
-        let (eta, _, signed_dist, se_eta_opt) = self.predict_detailed(p_new, sex_new, pcs_new)?;
-        let cal = self.calibrator.as_ref().unwrap();
-        let pred_in = match link_function {
-            LinkFunction::Logit => eta.clone(),
-            LinkFunction::Probit => eta.clone(),
-            LinkFunction::CLogLog => eta.clone(),
-            LinkFunction::Identity => baseline.clone(),
-        };
-        let se_in = se_eta_opt.unwrap_or_else(|| Array1::zeros(pred_in.len()));
-
-        let preds = crate::calibrate::calibrator::predict_calibrator(
-            cal,
-            pred_in.view(),
-            se_in.view(),
-            signed_dist.view(),
-        )?;
-        Ok(preds)
-    }
-
     /// Returns the linear predictor (η = Xβ) for new data without applying the inverse link.
     ///
     /// This is useful for diagnostics and tests that want to validate design-matrix
@@ -1841,56 +1765,6 @@ impl TrainedModel {
             logit_risk_se,
             logit_risk_design: Some(gradient),
         })
-    }
-
-    pub fn predict_survival_calibrated(
-        &self,
-        age_entry: ArrayView1<f64>,
-        age_exit: ArrayView1<f64>,
-        p_new: ArrayView1<f64>,
-        sex_new: ArrayView1<f64>,
-        pcs_new: ArrayView2<f64>,
-        companion_registry: Option<&HashMap<String, SurvivalModelArtifacts>>,
-    ) -> Result<Array1<f64>, ModelError> {
-        if !matches!(self.config.model_family, ModelFamily::Survival(_)) {
-            return Err(ModelError::UnsupportedForSurvival(
-                "predict_survival_calibrated",
-            ));
-        }
-        let artifacts = self.survival_artifacts()?;
-        if artifacts.calibrator.is_none() {
-            return Err(ModelError::CalibratorMissing);
-        }
-
-        // Compute hull distance for ancestry-domain calibration
-        let signed_dist = if let Some(hull) = &self.hull {
-            let raw = internal::assemble_raw_from_p_and_pcs(p_new, pcs_new);
-            Some(hull.signed_distance_many(raw.view()))
-        } else {
-            None
-        };
-
-        let baseline = self.predict_survival(
-            age_entry,
-            age_exit,
-            p_new,
-            sex_new,
-            pcs_new,
-            SurvivalRiskType::Net,
-            companion_registry,
-        )?;
-        // logit_risk_design is required for calibration SE computation
-        let design = baseline.logit_risk_design.as_ref().ok_or_else(|| {
-            ModelError::DimensionMismatch("logit_risk_design is required for calibration".into())
-        })?;
-        artifacts
-            .apply_logit_risk_calibrator(
-                &baseline.conditional_risk,
-                baseline.logit_risk_se.as_ref(),
-                design,
-                signed_dist.as_ref(),
-            )
-            .map_err(ModelError::from)
     }
 
     /// Saves the trained model to a file in a human-readable TOML format.
@@ -2638,7 +2512,7 @@ mod tests {
                 )]),
                 knot_vectors: HashMap::from([("pgs".to_string(), knot_vector.clone())]),
                 mcmc_enabled: false,
-                calibrator_enabled: false,
+
                 ..Default::default()
             },
             coefficients: MappedCoefficients {
@@ -2655,7 +2529,7 @@ mod tests {
             hull: None,
             penalized_hessian: None,
             scale: None,
-            calibrator: None,
+
             joint_link: None,
             survival: None,
             survival_companions: HashMap::new(),
@@ -2739,7 +2613,7 @@ mod tests {
                     z_transform.clone(),
                 )]),
                 knot_vectors: HashMap::from([("pgs".to_string(), knot_vector.clone())]),
-                calibrator_enabled: false,
+
                 ..Default::default()
             },
             coefficients: MappedCoefficients {
@@ -2755,7 +2629,7 @@ mod tests {
             hull: None,
             penalized_hessian: None,
             scale: None,
-            calibrator: None,
+
             joint_link: None,
             survival: None,
             survival_companions: HashMap::new(),
@@ -2838,7 +2712,7 @@ mod tests {
                     z_transform.clone(),
                 )]),
                 knot_vectors: HashMap::from([("pgs".to_string(), knot_vector.clone())]),
-                calibrator_enabled: false,
+
                 ..Default::default()
             },
             coefficients: MappedCoefficients {
@@ -2854,7 +2728,7 @@ mod tests {
             hull: None,
             penalized_hessian: None,
             scale: None,
-            calibrator: None,
+
             joint_link: None,
             survival: None,
             survival_companions: HashMap::new(),
@@ -2949,7 +2823,7 @@ mod tests {
                     lower: Array2::eye(layout.combined_exit.ncols()),
                 },
             }),
-            calibrator: None,
+
             mcmc_samples: None,
             cross_covariance_to_primary: None,
         };
@@ -2962,7 +2836,7 @@ mod tests {
             reml_max_iterations: 20,
             pgs_range: (0.0, 1.0),
             mcmc_enabled: false,
-            calibrator_enabled: false,
+
             survival: Some(SurvivalModelConfig {
                 baseline_basis: BasisConfig {
                     num_knots: basis.knot_vector.len(),
@@ -2983,7 +2857,7 @@ mod tests {
             hull: None,
             penalized_hessian: None,
             scale: None,
-            calibrator: None,
+
             joint_link: None,
             survival: Some(artifacts),
             survival_companions: HashMap::new(),
@@ -3043,7 +2917,7 @@ mod tests {
                 }],
                 pgs_range: (-2.0, 2.0),
                 mcmc_enabled: false,
-                calibrator_enabled: false,
+
                 ..Default::default()
             },
             coefficients: MappedCoefficients {
@@ -3059,7 +2933,7 @@ mod tests {
             hull: None,
             penalized_hessian: None,
             scale: None,
-            calibrator: None,
+
             joint_link: None,
             survival: None,
             survival_companions: HashMap::new(),
@@ -3149,7 +3023,7 @@ mod tests {
             ],
             pgs_range: (0.0, 1.0),
             mcmc_enabled: false,
-            calibrator_enabled: false,
+
             ..Default::default()
         };
 
@@ -3230,7 +3104,7 @@ mod tests {
             }],
             pgs_range: (-1.0, 1.0),
             mcmc_enabled: false,
-            calibrator_enabled: false,
+
             ..Default::default()
         };
 
@@ -3291,7 +3165,7 @@ mod tests {
                 interaction_centering_means: interaction_centering_means.clone(),
                 interaction_orth_alpha: interaction_orth_alpha.clone(),
                 mcmc_enabled: false,
-                calibrator_enabled: false,
+
                 ..Default::default()
             },
             coefficients: MappedCoefficients {
@@ -3360,7 +3234,7 @@ mod tests {
             hull: None,
             penalized_hessian: None,
             scale: None,
-            calibrator: None,
+
             joint_link: None,
             survival: None,
             survival_companions: HashMap::new(),

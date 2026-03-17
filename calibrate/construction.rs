@@ -86,7 +86,7 @@ pub struct PenalizedBlock {
 }
 
 impl DomainLayout {
-    /// Minimal external layout for arbitrary design matrices used by the calibrator or adapters.
+    /// Minimal external layout for arbitrary design matrices used by adapters.
     /// Sets only the fields required by PIRLS and reparameterization.
     pub fn external(total_coeffs: usize, num_penalties: usize) -> Self {
         DomainLayout {
@@ -1735,7 +1735,7 @@ mod tests {
                 InteractionPenaltyKind::Isotropic
             },
             mcmc_enabled: false,
-            calibrator_enabled: false,
+
             ..Default::default()
         }
     }
@@ -1833,7 +1833,7 @@ mod tests {
             pc_configs,
             pgs_range,
             mcmc_enabled: false,
-            calibrator_enabled: false,
+
             ..Default::default()
         };
 
@@ -2361,7 +2361,7 @@ mod tests {
             hull: None,
             penalized_hessian: None,
             scale: None,
-            calibrator: None,
+
             joint_link: None,
             survival: None,
             survival_companions: HashMap::new(),
@@ -2450,7 +2450,7 @@ mod tests {
             pgs_range: (0.0, 1.0),
             interaction_penalty: kind,
             mcmc_enabled: false,
-            calibrator_enabled: false,
+
             ..Default::default()
         }
     }

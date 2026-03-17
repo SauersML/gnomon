@@ -1,4 +1,3 @@
-use crate::calibrate::calibrator::CalibratorModel;
 use crate::calibrate::estimate::EstimationError;
 use gam::basis::{
     BasisError, BasisOptions, Dense, KnotSource, SplineScratch, baseline_lambda_seed, create_basis,
@@ -106,10 +105,10 @@ pub enum SurvivalError {
     MissingPgsCovariate,
     #[error("time-varying interaction layout is inconsistent with stored coefficients")]
     InvalidTimeVaryingLayout,
+    #[error("integration failed: {0}")]
+    Integration(String),
     #[error("basis evaluation failed: {0}")]
     Basis(#[from] BasisError),
-    #[error("calibrator inference failed: {0}")]
-    Calibrator(String),
     #[error(
         "monotonicity violation: derivative {derivative} at age {age} fell below zero on the cached grid"
     )]
@@ -1719,8 +1718,6 @@ pub struct SurvivalModelArtifacts {
     /// smoothing prior), NOT frequentist confidence intervals. For heavily penalized terms,
     /// these intervals may be narrower than frequentist expectations.
     pub hessian_factor: Option<HessianFactor>,
-    #[serde(default)]
-    pub calibrator: Option<CalibratorModel>,
     /// Optional MCMC posterior samples for coefficient uncertainty quantification.
     /// Shape: (n_samples, n_coefficients). Used by crude risk calculations to properly
     /// propagate uncertainty through competing risk models.
@@ -2542,32 +2539,9 @@ pub fn calculate_crude_risk_quadrature<'a>(
             Ok((inst_hazard_d, hazard_d, hazard_m))
         },
     )
-    .map_err(|e| SurvivalError::Calibrator(e.to_string()))?;
+    .map_err(|e| SurvivalError::Integration(e.to_string()))?;
 
     Ok(result)
-}
-
-pub fn survival_calibrator_features(
-    risks: &Array1<f64>,
-    logit_design: &Array2<f64>,
-    hessian_factor: Option<&HessianFactor>,
-) -> Result<Array2<f64>, SurvivalError> {
-    let n = risks.len();
-    let mut features = Array2::zeros((n, 3)); // risk, se, 0.0
-
-    // Column 0: logit(risk)
-    for i in 0..n {
-        let p = risks[i].max(1e-12).min(1.0 - 1e-12);
-        features[[i, 0]] = (p / (1.0 - p)).ln();
-    }
-
-    // Column 1: SE of logit risk
-    if let Some(factor) = hessian_factor {
-        let se = delta_method_standard_errors(factor, logit_design)?;
-        features.column_mut(1).assign(&se);
-    }
-
-    Ok(features)
 }
 
 pub fn delta_method_standard_errors(
@@ -2892,64 +2866,6 @@ pub fn survival_score_matrix(
     Ok(score)
 }
 
-impl SurvivalModelArtifacts {
-    /// Apply the logit-risk calibrator to convert conditional risk to calibrated probabilities.
-    ///
-    /// # Arguments
-    /// * `conditional_risk` - Raw risk predictions
-    /// * `logit_risk_design` - Design matrix for delta-method SE computation
-    /// * `dist` - Optional signed distance to ancestry hull (negative = inside hull).
-    ///            If None, zeros are used (no distance adjustment).
-    pub fn apply_logit_risk_calibrator(
-        &self,
-        conditional_risk: &Array1<f64>,
-        logit_risk_se: Option<&Array1<f64>>,
-        logit_risk_design: &Array2<f64>,
-        dist: Option<&Array1<f64>>,
-    ) -> Result<Array1<f64>, SurvivalError> {
-        let cal = self
-            .calibrator
-            .as_ref()
-            .ok_or_else(|| SurvivalError::Calibrator("Missing calibrator".to_string()))?;
-
-        let n = conditional_risk.len();
-        let mut logit_risk = Array1::zeros(n);
-        for i in 0..n {
-            let p = conditional_risk[i].max(1e-12).min(1.0 - 1e-12);
-            logit_risk[i] = (p / (1.0 - p)).ln();
-        }
-
-        // Compute SE
-        let se = if let Some(se) = logit_risk_se {
-            se.to_owned()
-        } else if let Some(factor) = &self.hessian_factor {
-            delta_method_standard_errors(factor, logit_risk_design)?
-        } else {
-            Array1::zeros(n)
-        };
-
-        // Use provided distance or fall back to zeros
-        let dist_owned;
-        let dist_view = match dist {
-            Some(d) => d.view(),
-            None => {
-                dist_owned = Array1::zeros(n);
-                dist_owned.view()
-            }
-        };
-
-        // Predict
-        let preds = crate::calibrate::calibrator::predict_calibrator(
-            cal,
-            logit_risk.view(),
-            se.view(),
-            dist_view,
-        )
-        .map_err(|e| SurvivalError::Calibrator(e.to_string()))?;
-
-        Ok(preds)
-    }
-}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3013,9 +2929,6 @@ mod tests {
             assert_abs_diff_eq!(se[idx], expected, epsilon = 1e-10);
         }
     }
-
-    // survival_calibrator_features_clamps_leverage_and_uses_delta_se SKIPPED because
-    // survival_calibrator_features does not support leverage input yet.
 
     fn toy_training_data() -> SurvivalTrainingData {
         SurvivalTrainingData {
@@ -3255,12 +3168,6 @@ mod tests {
             (None, None) => {}
             _ => panic!("hessian factor mismatch"),
         }
-        assert_eq!(left.calibrator.is_some(), right.calibrator.is_some());
-        if let (Some(l), Some(r)) = (&left.calibrator, &right.calibrator) {
-            let left_json = serde_json::to_string(l).unwrap();
-            let right_json = serde_json::to_string(r).unwrap();
-            assert_eq!(left_json, right_json);
-        }
     }
 
     trait LogitExt {
@@ -3402,7 +3309,7 @@ mod tests {
             interaction_metadata,
             companion_models: Vec::new(),
             hessian_factor: None,
-            calibrator: None,
+
             mcmc_samples: None,
             cross_covariance_to_primary: None,
         };
@@ -3437,7 +3344,7 @@ mod tests {
             interaction_metadata: Vec::new(),
             companion_models,
             hessian_factor: None,
-            calibrator: None,
+
             mcmc_samples: None,
             cross_covariance_to_primary: None,
         };
@@ -3502,7 +3409,7 @@ mod tests {
             interaction_metadata: Vec::new(),
             companion_models,
             hessian_factor: None,
-            calibrator: None,
+
             mcmc_samples: None,
             cross_covariance_to_primary: None,
         };
@@ -3542,7 +3449,7 @@ mod tests {
             interaction_metadata: Vec::new(),
             companion_models,
             hessian_factor: None,
-            calibrator: None,
+
             mcmc_samples: None,
             cross_covariance_to_primary: None,
         };
@@ -3682,7 +3589,7 @@ mod tests {
             interaction_metadata,
             companion_models: Vec::new(),
             hessian_factor: None,
-            calibrator: None,
+
             mcmc_samples: None,
             cross_covariance_to_primary: None,
         };
@@ -3768,7 +3675,7 @@ mod tests {
             interaction_metadata,
             companion_models: Vec::new(),
             hessian_factor: None,
-            calibrator: None,
+
             mcmc_samples: None,
             cross_covariance_to_primary: None,
         };
@@ -4096,7 +4003,7 @@ mod tests {
             interaction_metadata: interaction_metadata.clone(),
             companion_models: Vec::new(),
             hessian_factor: None,
-            calibrator: None,
+
             mcmc_samples: None,
             cross_covariance_to_primary: None,
         };
@@ -4166,7 +4073,7 @@ mod tests {
             interaction_metadata,
             companion_models: Vec::new(),
             hessian_factor: None,
-            calibrator: None,
+
             mcmc_samples: None,
             cross_covariance_to_primary: None,
         };
@@ -4196,7 +4103,7 @@ mod tests {
             interaction_metadata: Vec::new(),
             companion_models: Vec::new(),
             hessian_factor: None,
-            calibrator: None,
+
             mcmc_samples: None,
             cross_covariance_to_primary: None,
         };
@@ -4248,7 +4155,7 @@ mod tests {
                     lower: Array2::<f64>::eye(layout.combined_exit.ncols()),
                 },
             }),
-            calibrator: None,
+
             mcmc_samples: None,
             cross_covariance_to_primary: None,
         };

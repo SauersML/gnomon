@@ -249,7 +249,7 @@ pub fn default_model_config_with_link(link: LinkFunction) -> ModelConfig {
         ],
         pgs_range: (-3.0, 3.0),
         mcmc_enabled: false,       // Disable MCMC for faster tests
-        calibrator_enabled: false, // Disable calibrator for faster tests
+
         ..Default::default()
     }
 }
@@ -266,7 +266,7 @@ pub fn minimal_model_config_logit() -> ModelConfig {
         },
         pgs_range: (-3.0, 3.0),
         mcmc_enabled: false,
-        calibrator_enabled: false,
+
         ..Default::default()
     }
 }
@@ -288,7 +288,7 @@ pub fn dummy_trained_model(config: ModelConfig) -> TrainedModel {
         hull: None,
         penalized_hessian: None,
         scale: None,
-        calibrator: None,
+
         joint_link: None,
         survival: None,
         survival_companions: HashMap::new(),

@@ -148,135 +148,10 @@ fn cross_covariance_primary_companion(
     Some(cov)
 }
 
-fn fit_survival_logit_calibrator(
-    bundle: &crate::calibrate::survival_data::SurvivalTrainingBundle,
-    config: &crate::calibrate::model::ModelConfig,
-    artifacts: &crate::calibrate::survival::SurvivalModelArtifacts,
-) -> Result<Option<crate::calibrate::calibrator::CalibratorModel>, EstimationError> {
-    use crate::calibrate::calibrator::{
-        CalibratorSpec, active_penalty_nullspace_dims, build_calibrator_design, fit_calibrator,
-    };
-    use crate::calibrate::model::ModelFamily;
-
-    if !config.calibrator_enabled {
-        return Ok(None);
-    }
-    if !matches!(config.model_family, ModelFamily::Survival(_)) {
-        return Ok(None);
-    }
-
-    let temp_model = crate::calibrate::model::TrainedModel {
-        config: config.clone(),
-        coefficients: crate::calibrate::model::MappedCoefficients::default(),
-        lambdas: Vec::new(),
-        hull: None,
-        penalized_hessian: None,
-        scale: None,
-        calibrator: None,
-        joint_link: None,
-        survival: Some(artifacts.clone()),
-        survival_companions: HashMap::new(),
-        mcmc_samples: None,
-        smoothing_correction: None,
-    };
-    let pred = temp_model
-        .predict_survival(
-            bundle.data.age_entry.view(),
-            bundle.data.age_exit.view(),
-            bundle.data.pgs.view(),
-            bundle.data.sex.view(),
-            bundle.data.pcs.view(),
-            crate::calibrate::model::SurvivalRiskType::Net,
-            None,
-        )
-        .map_err(|e| EstimationError::InvalidSpecification(e.to_string()))?;
-
-    let n = pred.logit_risk.len();
-    let se = pred
-        .logit_risk_se
-        .clone()
-        .unwrap_or_else(|| Array1::<f64>::zeros(n));
-    let dist = Array1::<f64>::zeros(n);
-    let fisher_weights = pred.conditional_risk.mapv(|p| (p * (1.0 - p)).max(1e-8));
-    let alo_features = crate::calibrate::alo::CalibratorFeatures {
-        pred: pred.logit_risk,
-        se,
-        dist,
-        pred_identity: pred.conditional_risk,
-        fisher_weights,
-    };
-
-    let cal_spec = CalibratorSpec {
-        link: gam::types::LinkFunction::Logit,
-        pred_basis: crate::calibrate::model::BasisConfig {
-            degree: 3,
-            num_knots: 5,
-        },
-        se_basis: crate::calibrate::model::BasisConfig {
-            degree: 3,
-            num_knots: 5,
-        },
-        dist_basis: crate::calibrate::model::BasisConfig {
-            degree: 3,
-            num_knots: 5,
-        },
-        penalty_order_pred: 2,
-        penalty_order_se: 2,
-        penalty_order_dist: 2,
-        distance_enabled: true,
-        distance_hinge: true,
-        prior_weights: None,
-        firth: CalibratorSpec::firth_default_for_link(gam::types::LinkFunction::Logit),
-    };
-    let (x_cal, penalties, schema, cal_offset) = build_calibrator_design(&alo_features, &cal_spec)?;
-    let penalty_nullspace_dims = active_penalty_nullspace_dims(&schema, &penalties);
-    let y = bundle.data.event_target.mapv(f64::from);
-    let (cal_beta, cal_lambdas, _cal_scale, _edf, _optim) = fit_calibrator(
-        y.view(),
-        bundle.data.sample_weight.view(),
-        x_cal.view(),
-        cal_offset.view(),
-        &penalties,
-        &penalty_nullspace_dims,
-        gam::types::LinkFunction::Logit,
-        &cal_spec,
-    )?;
-    Ok(Some(crate::calibrate::calibrator::CalibratorModel {
-        spec: cal_spec,
-        knots_pred: schema.knots_pred,
-        knots_se: schema.knots_se,
-        knots_dist: schema.knots_dist,
-        pred_constraint_transform: schema.pred_constraint_transform,
-        stz_se: schema.stz_se,
-        stz_dist: schema.stz_dist,
-        penalty_nullspace_dims: schema.penalty_nullspace_dims,
-        standardize_pred: schema.standardize_pred,
-        standardize_se: schema.standardize_se,
-        standardize_dist: schema.standardize_dist,
-        interaction_center_pred: Some(schema.interaction_center_pred),
-        se_log_space: schema.se_log_space,
-        se_wiggle_only_drop: schema.se_wiggle_only_drop,
-        dist_wiggle_only_drop: schema.dist_wiggle_only_drop,
-        lambda_pred: cal_lambdas[0],
-        lambda_pred_param: cal_lambdas[1],
-        lambda_se: cal_lambdas[2],
-        lambda_dist: cal_lambdas[3],
-        coefficients: cal_beta,
-        column_spans: schema.column_spans,
-        pred_param_range: schema.pred_param_range,
-        scale: None,
-        assumes_frequency_weights: true,
-    }))
-}
-
 pub fn train_model(
     data: &crate::calibrate::data::TrainingData,
     config: &crate::calibrate::model::ModelConfig,
 ) -> Result<crate::calibrate::model::TrainedModel, EstimationError> {
-    use crate::calibrate::calibrator::{
-        CalibratorModel, CalibratorSpec, active_penalty_nullspace_dims, build_calibrator_design,
-        fit_calibrator,
-    };
     use crate::calibrate::model::ModelFamily;
 
     let (
@@ -335,83 +210,6 @@ pub fn train_model(
     }
     let hull = build_peeled_hull(&raw_train, 3).ok();
 
-    let calibrator = if config.calibrator_enabled {
-        let alo_features = crate::calibrate::alo::compute_alo_features(
-            &fit,
-            data.y.view(),
-            raw_train.view(),
-            hull.as_ref(),
-            link,
-        )?;
-        let cal_spec = CalibratorSpec {
-            link,
-            pred_basis: crate::calibrate::model::BasisConfig {
-                degree: 3,
-                num_knots: 5,
-            },
-            se_basis: crate::calibrate::model::BasisConfig {
-                degree: 3,
-                num_knots: 5,
-            },
-            dist_basis: crate::calibrate::model::BasisConfig {
-                degree: 3,
-                num_knots: 5,
-            },
-            penalty_order_pred: 2,
-            penalty_order_se: 2,
-            penalty_order_dist: 2,
-            distance_enabled: true,
-            distance_hinge: true,
-            prior_weights: None,
-            firth: CalibratorSpec::firth_default_for_link(link),
-        };
-        let (x_cal, penalties, schema, cal_offset) =
-            build_calibrator_design(&alo_features, &cal_spec)?;
-        let penalty_nullspace_dims = active_penalty_nullspace_dims(&schema, &penalties);
-        let (cal_beta, cal_lambdas, cal_scale, _edf, _optim) = fit_calibrator(
-            data.y.view(),
-            data.weights.view(),
-            x_cal.view(),
-            cal_offset.view(),
-            &penalties,
-            &penalty_nullspace_dims,
-            link,
-            &cal_spec,
-        )?;
-        Some(CalibratorModel {
-            spec: cal_spec,
-            knots_pred: schema.knots_pred,
-            knots_se: schema.knots_se,
-            knots_dist: schema.knots_dist,
-            pred_constraint_transform: schema.pred_constraint_transform,
-            stz_se: schema.stz_se,
-            stz_dist: schema.stz_dist,
-            penalty_nullspace_dims: schema.penalty_nullspace_dims,
-            standardize_pred: schema.standardize_pred,
-            standardize_se: schema.standardize_se,
-            standardize_dist: schema.standardize_dist,
-            interaction_center_pred: Some(schema.interaction_center_pred),
-            se_log_space: schema.se_log_space,
-            se_wiggle_only_drop: schema.se_wiggle_only_drop,
-            dist_wiggle_only_drop: schema.dist_wiggle_only_drop,
-            lambda_pred: cal_lambdas[0],
-            lambda_pred_param: cal_lambdas[1],
-            lambda_se: cal_lambdas[2],
-            lambda_dist: cal_lambdas[3],
-            coefficients: cal_beta,
-            column_spans: schema.column_spans,
-            pred_param_range: schema.pred_param_range.clone(),
-            scale: if matches!(link, gam::types::LinkFunction::Identity) {
-                Some(cal_scale)
-            } else {
-                None
-            },
-            assumes_frequency_weights: true,
-        })
-    } else {
-        None
-    };
-
     let mut trained_config = config.clone();
     trained_config.sum_to_zero_constraints = sum_to_zero_constraints;
     trained_config.knot_vectors = knot_vectors;
@@ -442,104 +240,12 @@ pub fn train_model(
         hull,
         penalized_hessian: Some(fit.penalized_hessian.clone()),
         scale: Some(fit.scale),
-        calibrator,
+
         joint_link: None,
         survival: None,
         survival_companions: HashMap::new(),
         mcmc_samples,
         smoothing_correction: fit.smoothing_correction,
-    })
-}
-
-pub fn train_joint_model(
-    data: &crate::calibrate::data::TrainingData,
-    config: &crate::calibrate::model::ModelConfig,
-) -> Result<crate::calibrate::model::TrainedModel, EstimationError> {
-    use crate::calibrate::model::ModelFamily;
-    use gam::joint::{JointLinkGeometry, JointModelConfig};
-
-    let (
-        x,
-        s_list,
-        layout,
-        sum_to_zero_constraints,
-        knot_vectors,
-        range_transforms,
-        pc_null_transforms,
-        interaction_centering_means,
-        interaction_orth_alpha,
-        _penalty_structs,
-    ) = crate::calibrate::construction::build_design_and_penalty_matrices(data, config)?;
-
-    let link = match config.model_family {
-        ModelFamily::Gam(link) => link,
-        ModelFamily::Survival(_) => {
-            return Err(EstimationError::InvalidInput(
-                "train_joint_model expects GAM family".to_string(),
-            ));
-        }
-    };
-
-    let geometry = JointLinkGeometry {
-        n_link_knots: config.pgs_basis_config.num_knots.max(3),
-        degree: 3,
-    };
-    let mut joint_cfg = JointModelConfig::default();
-    joint_cfg.max_backfit_iter = config.max_iterations;
-    joint_cfg.backfit_tol = config.convergence_tolerance;
-    joint_cfg.max_reml_iter = config.reml_max_iterations as usize;
-    joint_cfg.reml_tol = config.reml_convergence_tolerance;
-    joint_cfg.firth_bias_reduction = config.firth_bias_reduction;
-
-    let result = gam::joint::fit_joint_model_engine(
-        data.y.view(),
-        data.weights.view(),
-        x.view(),
-        s_list.clone(),
-        link,
-        geometry,
-        joint_cfg,
-    )?;
-
-    let mut trained_config = config.clone();
-    trained_config.sum_to_zero_constraints = sum_to_zero_constraints;
-    trained_config.knot_vectors = knot_vectors;
-    trained_config.range_transforms = range_transforms;
-    trained_config.pc_null_transforms = pc_null_transforms;
-    trained_config.interaction_centering_means = interaction_centering_means;
-    trained_config.interaction_orth_alpha = interaction_orth_alpha;
-
-    let coefficients = crate::calibrate::model::map_coefficients(&result.beta_base, &layout)?;
-    let n = data.p.len();
-    let raw_dim = 1 + data.pcs.ncols();
-    let mut raw_train = Array2::<f64>::zeros((n, raw_dim));
-    raw_train.slice_mut(s![.., 0]).assign(&data.p);
-    if data.pcs.ncols() > 0 {
-        raw_train.slice_mut(s![.., 1..]).assign(&data.pcs);
-    }
-    let hull = build_peeled_hull(&raw_train, 3).ok();
-
-    let joint_link = crate::calibrate::model::JointLinkModel {
-        knot_range: result.knot_range,
-        knot_vector: result.knot_vector,
-        link_transform: result.link_transform,
-        beta_link: result.beta_link,
-        degree: result.degree,
-    };
-
-    Ok(crate::calibrate::model::TrainedModel {
-        config: trained_config,
-        coefficients,
-        lambdas: result.lambdas,
-        hull,
-        penalized_hessian: None,
-        scale: Some(1.0),
-        calibrator: None,
-        joint_link: Some(joint_link),
-        survival: None,
-        survival_companions: HashMap::new(),
-        mcmc_samples: None,
-        smoothing_correction: None,
     })
 }
 
@@ -627,7 +333,7 @@ pub fn train_survival_model(
         hull,
         penalized_hessian: Some(primary_hessian),
         scale: None,
-        calibrator: None,
+
         joint_link: None,
         survival: Some(primary_fit.artifacts),
         survival_companions,
@@ -906,7 +612,7 @@ fn fit_single_survival_model(
         None
     };
 
-    let mut artifacts = SurvivalModelArtifacts {
+    let artifacts = SurvivalModelArtifacts {
         coefficients: coefficient_vector,
         age_basis,
         time_varying_basis,
@@ -921,12 +627,10 @@ fn fit_single_survival_model(
         interaction_metadata,
         companion_models: Vec::new(),
         hessian_factor: build_expected_hessian_factor(&outcome.state.hessian),
-        calibrator: None,
+
         mcmc_samples,
         cross_covariance_to_primary: None,
     };
-    artifacts.calibrator = fit_survival_logit_calibrator(bundle, config, &artifacts)?;
-
     let lambdas = layout
         .penalties
         .blocks
