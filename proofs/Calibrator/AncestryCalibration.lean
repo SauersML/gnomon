@@ -111,12 +111,14 @@ theorem spline_error_improves_with_knots
     var₂ - var₁ > bias₁² - bias₂² ↔ bias₁² + var₁ < bias₂² + var₂,
     which is direct rearrangement. The real content is the model
     decomposition MSE = bias² + variance. -/
+noncomputable def expectedMSE (bias var : ℝ) : ℝ := bias ^ 2 + var
+
 theorem bias_variance_tradeoff
     (bias₁ bias₂ var₁ var₂ : ℝ)
-    (h_bias_improves : bias₂ ^ 2 < bias₁ ^ 2)
-    (h_var_worsens : var₁ < var₂)
     (h_var_dominates : var₂ - var₁ > bias₁ ^ 2 - bias₂ ^ 2) :
-    bias₁ ^ 2 + var₁ < bias₂ ^ 2 + var₂ := by linarith
+    expectedMSE bias₁ var₁ < expectedMSE bias₂ var₂ := by
+  unfold expectedMSE
+  linarith
 
 /-- **Spline R² is bounded by the signal-to-noise ratio.**
     R²_spline ≤ Var(E[ε²|d]) / Var(ε²).
