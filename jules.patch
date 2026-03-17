@@ -1,0 +1,32 @@
+diff --git a/proofs/Calibrator/OpenQuestions.lean b/proofs/Calibrator/OpenQuestions.lean
+index d4d36c6..2c6d156 100644
+--- a/proofs/Calibrator/OpenQuestions.lean
++++ b/proofs/Calibrator/OpenQuestions.lean
+@@ -350,18 +350,20 @@ theorem env_variance_lowers_r2
+     Vg / (Vg + Ve₂) < Vg / (Vg + Ve₁) := by
+   apply div_lt_div_of_pos_left hVg (by linarith) (by linarith)
+ 
++/-- The biased portability coefficient from marginal regression. -/
++noncomputable def naivePortabilityCoefficient (β_true β_ses ρ : ℝ) : ℝ :=
++  β_true + β_ses * ρ
++
+ /-- **Omitted variable bias in portability regression.**
+     If SES (β_s) correlates with genetic distance (correlation ρ),
+     the naive coefficient on distance absorbs the SES effect. -/
+ theorem omitted_variable_bias
+     (β_true β_ses ρ : ℝ)
+-    (h_ses : β_ses ≠ 0) (h_corr : ρ ≠ 0) :
+-    β_true + β_ses * ρ ≠ β_true := by
+-  intro h
+-  have : β_ses * ρ = 0 := by linarith
+-  rcases mul_eq_zero.mp this with h | h
+-  · exact h_ses h
+-  · exact h_corr h
++    (h_ses : 0 < β_ses) (h_corr : 0 < ρ) :
++    β_true < naivePortabilityCoefficient β_true β_ses ρ := by
++  unfold naivePortabilityCoefficient
++  have h_pos : 0 < β_ses * ρ := mul_pos h_ses h_corr
++  linarith
+ 
+ /-- **Portability drop decomposes into genetic + environmental parts.** -/
+ theorem portability_drop_decomp
