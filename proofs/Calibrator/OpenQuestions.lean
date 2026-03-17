@@ -350,25 +350,38 @@ theorem env_variance_lowers_r2
     Vg / (Vg + Ve₂) < Vg / (Vg + Ve₁) := by
   apply div_lt_div_of_pos_left hVg (by linarith) (by linarith)
 
+/-- The biased portability coefficient from marginal regression. -/
+noncomputable def naivePortabilityCoefficient (β_true β_ses ρ : ℝ) : ℝ :=
+  β_true + β_ses * ρ
+
 /-- **Omitted variable bias in portability regression.**
     If SES (β_s) correlates with genetic distance (correlation ρ),
     the naive coefficient on distance absorbs the SES effect. -/
 theorem omitted_variable_bias
     (β_true β_ses ρ : ℝ)
-    (h_ses : β_ses ≠ 0) (h_corr : ρ ≠ 0) :
-    β_true + β_ses * ρ ≠ β_true := by
-  intro h
-  have : β_ses * ρ = 0 := by linarith
-  rcases mul_eq_zero.mp this with h | h
-  · exact h_ses h
-  · exact h_corr h
+    (h_ses : 0 < β_ses) (h_corr : 0 < ρ) :
+    β_true < naivePortabilityCoefficient β_true β_ses ρ := by
+  unfold naivePortabilityCoefficient
+  have h_pos : 0 < β_ses * ρ := mul_pos h_ses h_corr
+  linarith
 
-/-- **Portability drop decomposes into genetic + environmental parts.** -/
+/-- Structural model for portability drop components. -/
+structure PortabilityComponents where
+  genetic_drop : ℝ
+  environmental_drop : ℝ
+
+/-- The total drop in portability is the sum of genetic and environmental components. -/
+noncomputable def total_portability_drop (comp : PortabilityComponents) : ℝ :=
+  comp.genetic_drop + comp.environmental_drop
+
+/-- **Portability drop decomposes into genetic + environmental parts.**
+    If the drop components are non-negative, the total drop bounds each component. -/
 theorem portability_drop_decomp
-    (r2s r2t Δg Δe : ℝ)
-    (h_eq : r2s - r2t = Δg + Δe)
-    (hΔg : 0 ≤ Δg) (hΔe : 0 ≤ Δe) :
-    Δg ≤ r2s - r2t ∧ Δe ≤ r2s - r2t := by
+    (comp : PortabilityComponents)
+    (hΔg : 0 ≤ comp.genetic_drop) (hΔe : 0 ≤ comp.environmental_drop) :
+    comp.genetic_drop ≤ total_portability_drop comp ∧
+    comp.environmental_drop ≤ total_portability_drop comp := by
+  unfold total_portability_drop
   constructor <;> linarith
 
 end Question4
@@ -380,19 +393,34 @@ end Question4
 
 section Question5
 
+/-- Structural components for modeling prediction error due to winner's curse and allelic turnover. -/
+structure PredictionErrorComponents where
+  β_true : ℝ
+  inflation_δ : ℝ
+  turnover_ρ : ℝ
+
+/-- GWAS estimate with inflation. -/
+noncomputable def gwas_estimate (comp : PredictionErrorComponents) : ℝ :=
+  comp.β_true + comp.inflation_δ
+
+/-- Target effect size after allelic turnover. -/
+noncomputable def target_effect (comp : PredictionErrorComponents) : ℝ :=
+  comp.turnover_ρ * comp.β_true
+
 /-- **Winner's curse prediction error model.**
-    GWAS estimate β_hat = β_true + δ (inflation).
-    Target effect β_t = ρ * β_true (turnover).
     Prediction error = β_hat - β_t = (1-ρ)*β + δ.
     Prediction error decomposes into turnover + inflation. -/
-theorem prediction_error_decomp (β δ ρ : ℝ) :
-    (β + δ) - ρ * β = (1 - ρ) * β + δ := by ring
+theorem prediction_error_decomp (comp : PredictionErrorComponents) :
+    gwas_estimate comp - target_effect comp = (1 - comp.turnover_ρ) * comp.β_true + comp.inflation_δ := by
+  unfold gwas_estimate target_effect
+  ring
 
-/-- Prediction error is positive when both components are positive. -/
+/-- Prediction error is strictly positive when both components are positive and there is turnover. -/
 theorem prediction_error_positive
-    (β δ ρ : ℝ) (hβ : 0 < β) (hδ : 0 < δ) (hρ : ρ ≤ 1) :
-    0 < (1 - ρ) * β + δ := by
-  have : 0 ≤ (1 - ρ) * β := mul_nonneg (by linarith) (le_of_lt hβ)
+    (comp : PredictionErrorComponents) (hβ : 0 < comp.β_true) (hδ : 0 < comp.inflation_δ) (hρ : comp.turnover_ρ ≤ 1) :
+    0 < gwas_estimate comp - target_effect comp := by
+  rw [prediction_error_decomp]
+  have : 0 ≤ (1 - comp.turnover_ρ) * comp.β_true := mul_nonneg (by linarith) (le_of_lt hβ)
   linarith
 
 /-- **Winner's curse is worse with more turnover.**
