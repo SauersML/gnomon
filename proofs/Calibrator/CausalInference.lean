@@ -437,24 +437,39 @@ theorem e_value_ge_one (rr : ℝ) (h_rr : 1 ≤ rr) :
 
 /-- **Sensitivity to LD reference mismatch.**
     Portability estimates are sensitive to the choice of LD reference.
-    Using in-sample LD vs. external reference can change R² by δ. -/
+    Using an external reference adds estimation noise `V_ld_mismatch`
+    compared to in-sample LD, reducing the apparent R². -/
 theorem ld_reference_sensitivity
-    (r2_in_sample r2_external delta : ℝ)
-    (h_diff : r2_in_sample = r2_external + delta)
-    (h_delta : 0 < |delta|) :
-    r2_in_sample ≠ r2_external := by
-  rw [h_diff]; intro h; have : delta = 0 := by linarith
-  exact absurd (this ▸ h_delta) (by simp)
+    (vSignal V_E V_ld_mismatch : ℝ)
+    (h_sig : 0 < vSignal) (h_VE : 0 < V_E) (h_mismatch : 0 < V_ld_mismatch) :
+    expectedR2 vSignal (V_E + V_ld_mismatch) < expectedR2 vSignal V_E := by
+  unfold expectedR2
+  have h_denom_in_sample : 0 < vSignal + V_E := by linarith
+  have h_denom_external : 0 < vSignal + (V_E + V_ld_mismatch) := by linarith
+  rw [div_lt_div_iff₀ h_denom_external h_denom_in_sample]
+  nlinarith
 
 /-- **Sensitivity to phenotype definition.**
-    Different phenotype definitions (self-report vs clinical,
-    ICD-9 vs ICD-10) can change portability estimates.
-    When the difference exceeds any threshold ε > 0, the estimates differ. -/
+    Different phenotype definitions (e.g., self-report vs clinical)
+    introduce an imperfect genetic correlation `rho_g` to the true trait.
+    The signal variance for the proxy phenotype is attenuated by `rho_g ^ 2`,
+    strictly reducing the expected portability R². -/
 theorem phenotype_definition_matters
-    (port_def1 port_def2 ε : ℝ) (h_ε : 0 < ε)
-    (h_large_diff : ε < |port_def1 - port_def2|) :
-    port_def1 ≠ port_def2 := by
-  intro h; rw [h, sub_self, abs_zero] at h_large_diff; linarith
+    (vSignal V_E rho_g : ℝ)
+    (h_sig : 0 < vSignal) (h_VE : 0 < V_E)
+    (h_rho_pos : 0 < rho_g) (h_rho_lt : rho_g < 1) :
+    expectedR2 (rho_g ^ 2 * vSignal) V_E < expectedR2 vSignal V_E := by
+  unfold expectedR2
+  have h_rho_sq_lt_one : rho_g ^ 2 < 1 := by
+    nlinarith
+  have h_proxy_sig_lt : rho_g ^ 2 * vSignal < vSignal := by
+    exact mul_lt_of_lt_one_left h_sig h_rho_sq_lt_one
+  have h_proxy_sig_pos : 0 < rho_g ^ 2 * vSignal := by
+    positivity
+  have h_denom_proxy : 0 < rho_g ^ 2 * vSignal + V_E := by linarith
+  have h_denom_true : 0 < vSignal + V_E := by linarith
+  rw [div_lt_div_iff₀ h_denom_proxy h_denom_true]
+  nlinarith
 
 end SensitivityAnalysis
 
