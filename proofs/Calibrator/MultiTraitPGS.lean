@@ -148,26 +148,54 @@ theorem pleiotropic_correlated_portability
 /-- **Mediated pleiotropy vs biological pleiotropy.**
     Mediated: A → B, so variant affects B through A.
     Portability of B is bounded by portability of A.
-    If the mediation fraction is α ∈ [0,1], then
-    port_B_mediated = α × port_A, so port_B ≤ port_A. -/
+    If the mediation fraction is α ∈ [0,1], then the expected R2
+    of the mediated trait is bounded by the expected R2 of the direct trait. -/
 theorem mediated_pleiotropy_portability_bound
-    (port_A α : ℝ)
+    (V_A V_E fst α : ℝ)
     (h_α_le : α ≤ 1)
-    (h_α_nn : 0 ≤ α)
-    (h_port_nn : 0 ≤ port_A) :
-    α * port_A ≤ port_A := by nlinarith
+    (h_α_pos : 0 < α)
+    (h_VA_pos : 0 < V_A)
+    (h_VE_pos : 0 < V_E)
+    (h_fst_le : fst ≤ 1) :
+    expectedR2 (α * V_A * (1 - fst)) V_E ≤ expectedR2 (V_A * (1 - fst)) V_E := by
+  have h_base_pos : 0 ≤ V_A * (1 - fst) := by
+    apply mul_nonneg
+    · exact le_of_lt h_VA_pos
+    · linarith
+  have h_lt : α * V_A * (1 - fst) < V_A * (1 - fst) ∨ α * V_A * (1 - fst) = V_A * (1 - fst) := by
+    have h_le : α * V_A * (1 - fst) ≤ V_A * (1 - fst) := by
+      calc α * V_A * (1 - fst)
+          = α * (V_A * (1 - fst)) := by ring
+        _ ≤ 1 * (V_A * (1 - fst)) := mul_le_mul_of_nonneg_right h_α_le h_base_pos
+        _ = V_A * (1 - fst) := one_mul _
+    exact eq_or_lt_of_le h_le |>.symm
+  rcases h_lt with h_strict | h_eq
+  · have h_alpha_nonneg : 0 ≤ α * V_A * (1 - fst) := by
+      apply mul_nonneg
+      · exact mul_nonneg (le_of_lt h_α_pos) (le_of_lt h_VA_pos)
+      · linarith
+    exact le_of_lt (expectedR2_strictMono_nonneg V_E _ _ h_VE_pos h_alpha_nonneg h_strict)
+  · rw [h_eq]
 
 /-- **Trait-specific genetic components are less portable.**
     The component of genetic variance unique to a trait (not shared
     via pleiotropy) is more likely to be affected by population-specific
-    selection. Shared components degrade by δ_shared, unique by δ_unique,
-    where δ_unique > δ_shared due to selection. -/
+    selection, yielding a higher Fst. Shared components degrade by fst_shared,
+    unique by fst_unique, where fst_unique > fst_shared. -/
 theorem unique_component_less_portable
-    (port_base δ_shared δ_unique : ℝ)
-    (h_selection : δ_shared < δ_unique)
-    (h_shared_nn : 0 < δ_shared)
-    (h_base : δ_unique < port_base) :
-    port_base - δ_unique < port_base - δ_shared := by linarith
+    (V_A V_E fst_shared fst_unique : ℝ)
+    (h_selection : fst_shared < fst_unique)
+    (h_unique_le : fst_unique ≤ 1)
+    (h_VA_pos : 0 < V_A)
+    (h_VE_pos : 0 < V_E) :
+    expectedR2 (V_A * (1 - fst_unique)) V_E < expectedR2 (V_A * (1 - fst_shared)) V_E := by
+  have h_val_unique_nn : 0 ≤ V_A * (1 - fst_unique) :=
+    mul_nonneg (le_of_lt h_VA_pos) (by linarith)
+  have h_lt : V_A * (1 - fst_unique) < V_A * (1 - fst_shared) := by
+    apply mul_lt_mul_of_pos_left
+    · linarith
+    · exact h_VA_pos
+  exact expectedR2_strictMono_nonneg V_E _ _ h_VE_pos h_val_unique_nn h_lt
 
 /-- **Decomposing trait heritability into shared and unique.**
     h²_trait = h²_shared + h²_unique where h²_shared comes from
@@ -178,10 +206,8 @@ theorem unique_component_less_portable
     overall portability > (port_shared + port_unique) / 2 (the unweighted average). -/
 theorem heritability_shared_dominates_portability
     (h2_shared h2_unique port_shared port_unique : ℝ)
-    (h_shared_pos : 0 < h2_shared) (h_unique_pos : 0 < h2_unique)
     (h_shared_larger : h2_unique < h2_shared)
-    (h_port_shared_better : port_unique < port_shared)
-    (h_ps_nn : 0 ≤ port_shared) (h_pu_nn : 0 ≤ port_unique) :
+    (h_port_shared_better : port_unique < port_shared) :
     (port_shared + port_unique) / 2 * (h2_shared + h2_unique) <
       h2_shared * port_shared + h2_unique * port_unique := by
   nlinarith [mul_pos (sub_pos.mpr h_shared_larger) (sub_pos.mpr h_port_shared_better)]
@@ -216,13 +242,13 @@ theorem rg_bounds_portability_ratio
 /-- **Traits with high cross-population r_g have good portability.**
     When r_g is high (e.g., ~0.95), R² portability is bounded by ~0.90. -/
 theorem high_cross_rg
-    (rg lb : ℝ) (h_rg : lb < rg) (h_lb_nn : 0 ≤ lb) (h_rg_le : rg ≤ 1) :
+    (rg lb : ℝ) (h_rg : lb < rg) (h_lb_nn : 0 ≤ lb) :
     lb^2 < rg^2 := by nlinarith [sq_nonneg (rg - lb)]
 
 /-- **Traits with low cross-population r_g have poor portability.**
     When r_g is low (e.g., ~0.3), R² portability is bounded by ~0.09. -/
 theorem low_cross_rg
-    (rg ub : ℝ) (h_rg : rg ≤ ub) (h_rg_nn : 0 ≤ rg) (h_ub_nn : 0 ≤ ub) :
+    (rg ub : ℝ) (h_rg : rg ≤ ub) (h_rg_nn : 0 ≤ rg) :
     rg^2 ≤ ub^2 := by nlinarith [sq_nonneg rg, sq_nonneg (rg - ub)]
 
 /-- **r_g can be underestimated due to power.**
