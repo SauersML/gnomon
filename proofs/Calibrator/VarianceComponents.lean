@@ -67,6 +67,10 @@ theorem snp_h2_le_narrow_h2
   unfold snpH2 narrowSenseH2
   exact div_le_div_of_nonneg_right h_tagged (le_of_lt h_total)
 
+/-- Twin heritability. Captures all additive variance. -/
+noncomputable def twinH2 (V_A_tagged V_A_untagged V_D V_I V_E : ℝ) : ℝ :=
+  (V_A_tagged + V_A_untagged) / (V_A_tagged + V_A_untagged + V_D + V_I + V_E)
+
 /-- **The missing heritability gap.**
     h²_twin - h²_SNP > 0 for most traits. This is the "missing heritability".
     It sets an upper bound on what PGS can achieve with current genotyping.
@@ -82,9 +86,8 @@ theorem missing_heritability_gap
     (h_D : 0 ≤ V_D) (h_I : 0 ≤ V_I) (h_E : 0 ≤ V_E)
     (h_total : 0 < V_A_tagged + V_A_untagged + V_D + V_I + V_E) :
     let V_P := V_A_tagged + V_A_untagged + V_D + V_I + V_E
-    let h2_twin := (V_A_tagged + V_A_untagged) / V_P
-    let h2_snp := V_A_tagged / V_P
-    0 < h2_twin - h2_snp := by
+    0 < twinH2 V_A_tagged V_A_untagged V_D V_I V_E - snpH2 V_A_tagged V_P := by
+  unfold twinH2 snpH2
   simp only
   rw [show (V_A_tagged + V_A_untagged) / (V_A_tagged + V_A_untagged + V_D + V_I + V_E) -
     V_A_tagged / (V_A_tagged + V_A_untagged + V_D + V_I + V_E) =
@@ -186,6 +189,10 @@ and the GWAS sample size.
 
 section PGSCeiling
 
+/-- Expected target R2 from a PGS. -/
+noncomputable def expectedPgsR2 (h2_snp power_fraction portability_ratio : ℝ) : ℝ :=
+  h2_snp * power_fraction * portability_ratio
+
 /-- **PGS R² ceiling from heritability.**
     R²_PGS ≤ h²_SNP. No PGS can explain more variance than what's
     genetically tagged. The PGS explains a fraction f of tagged
@@ -194,8 +201,11 @@ theorem pgs_r2_ceiling_from_h2
     (h2_snp f : ℝ)
     (h_h2 : 0 < h2_snp)
     (h_f_nn : 0 ≤ f) (h_f_le : f ≤ 1) :
-    h2_snp * f ≤ h2_snp := by
-  exact mul_le_of_le_one_right (le_of_lt h_h2) h_f_le
+    expectedPgsR2 h2_snp f 1 ≤ h2_snp := by
+  unfold expectedPgsR2
+  calc h2_snp * f * 1
+    _ = h2_snp * f := mul_one _
+    _ ≤ h2_snp := mul_le_of_le_one_right (le_of_lt h_h2) h_f_le
 
 /-- **PGS R² ceiling from GWAS power.**
     R²_PGS ≤ h²_SNP × (1 - (1-power)^m)
@@ -205,8 +215,11 @@ theorem pgs_r2_ceiling_from_gwas_power
     (h2_snp power_fraction : ℝ)
     (h_h2 : 0 < h2_snp) (h_h2_le : h2_snp ≤ 1)
     (h_power : 0 < power_fraction) (h_power_le : power_fraction ≤ 1) :
-    h2_snp * power_fraction ≤ h2_snp := by
-  exact mul_le_of_le_one_right (le_of_lt h_h2) h_power_le
+    expectedPgsR2 h2_snp power_fraction 1 ≤ h2_snp := by
+  unfold expectedPgsR2
+  calc h2_snp * power_fraction * 1
+    _ = h2_snp * power_fraction := mul_one _
+    _ ≤ h2_snp := mul_le_of_le_one_right (le_of_lt h_h2) h_power_le
 
 /-- **Portability further reduces the ceiling.**
     R²_PGS_target ≤ h²_SNP × power_fraction × portability_ratio. -/
@@ -214,7 +227,8 @@ theorem portability_reduces_ceiling
     (h2_snp power_frac port_ratio : ℝ)
     (h_h2 : 0 < h2_snp) (h_power : 0 < power_frac) (h_port : 0 < port_ratio)
     (h_power_le : power_frac ≤ 1) (h_port_le : port_ratio ≤ 1) :
-    h2_snp * power_frac * port_ratio ≤ h2_snp := by
+    expectedPgsR2 h2_snp power_frac port_ratio ≤ h2_snp := by
+  unfold expectedPgsR2
   calc h2_snp * power_frac * port_ratio
       ≤ h2_snp * 1 * 1 := by
         apply mul_le_mul
@@ -232,8 +246,9 @@ theorem three_way_ceiling
     (h_h2_le : h2 ≤ 1) (h_power_le : gwas_power ≤ 1)
     (h_port_le : port_ratio ≤ 1)
     (h_h2_nn : 0 ≤ h2) (h_power_nn : 0 ≤ gwas_power) (h_port_nn : 0 ≤ port_ratio)
-    (h_bound : target_r2 ≤ h2 * gwas_power * port_ratio) :
+    (h_bound : target_r2 ≤ expectedPgsR2 h2 gwas_power port_ratio) :
     target_r2 ≤ 1 := by
+  unfold expectedPgsR2 at h_bound
   have : h2 * gwas_power * port_ratio ≤ 1 := by
     calc h2 * gwas_power * port_ratio
         ≤ 1 * 1 * 1 := by nlinarith [mul_nonneg h_h2_nn h_power_nn]
@@ -252,15 +267,26 @@ on LD and population structure assumptions.
 
 section GREML
 
+/-- **GREML Estimate with LD Bias.**
+    Models GREML estimate with an explicit bias term. -/
+noncomputable def gremlEstimateLDBias (h2_true ld_bias : ℝ) : ℝ :=
+  h2_true + ld_bias
+
 /-- **GREML h² estimate depends on LD structure.**
     GREML estimates h²_SNP = trace(GRM⁻¹ × Σ_pheno) / n.
     When LD differs between training and evaluation, the estimate is biased. -/
 theorem greml_ld_sensitive
-    (h2_estimated h2_true ld_bias : ℝ)
-    (h_bias : h2_estimated = h2_true + ld_bias)
+    (h2_true ld_bias : ℝ)
     (h_ld_nonzero : ld_bias ≠ 0) :
-    h2_estimated ≠ h2_true := by
-  rw [h_bias]; intro h; apply h_ld_nonzero; linarith
+    gremlEstimateLDBias h2_true ld_bias ≠ h2_true := by
+  unfold gremlEstimateLDBias
+  intro h
+  apply h_ld_nonzero
+  linarith
+
+/-- **GREML estimate modeling tagged variance.** -/
+noncomputable def gremlTaggedEstimate (V_A V_P mean_tag_r2 : ℝ) : ℝ :=
+  (mean_tag_r2 * V_A) / V_P
 
 /-- **GREML underestimates h² when causal variants are poorly tagged.**
     The true SNP heritability is `V_A / V_P`, while GREML only captures
@@ -272,10 +298,10 @@ theorem greml_underestimates_with_poor_tagging
     (h_imperfect : mean_tag_r2 < 1)
     (h_VA_pos : 0 < V_A) (h_VP_pos : 0 < V_P) :
     let h2_true := V_A / V_P
-    let h2_greml := (mean_tag_r2 * V_A) / V_P
-    h2_true - h2_greml = ((1 - mean_tag_r2) * V_A) / V_P ∧
-      0 < h2_true - h2_greml := by
+    h2_true - gremlTaggedEstimate V_A V_P mean_tag_r2 = ((1 - mean_tag_r2) * V_A) / V_P ∧
+      0 < h2_true - gremlTaggedEstimate V_A V_P mean_tag_r2 := by
   simp only
+  unfold gremlTaggedEstimate
   rw [← sub_div]
   have h_gap :
       V_A - mean_tag_r2 * V_A = (1 - mean_tag_r2) * V_A := by
@@ -286,6 +312,10 @@ theorem greml_underestimates_with_poor_tagging
   · apply div_pos
     · nlinarith
     · exact h_VP_pos
+
+/-- **GREML estimate modeling stratified population structure.** -/
+noncomputable def gremlStratifiedEstimate (V_A V_strat V_P : ℝ) : ℝ :=
+  (V_A + V_strat) / V_P
 
 /-- **Population structure inflates GREML h² estimate.**
     Cryptic stratification in the GWAS sample creates a positive bias
@@ -307,9 +337,9 @@ theorem stratification_inflates_greml
     (h_total : 0 < V_A + V_strat + V_E) :
     let V_P := V_A + V_strat + V_E
     let h2_true := V_A / V_P
-    let h2_greml := (V_A + V_strat) / V_P
-    h2_true < h2_greml := by
+    h2_true < gremlStratifiedEstimate V_A V_strat V_P := by
   simp only
+  unfold gremlStratifiedEstimate
   exact div_lt_div_of_pos_right (by linarith) h_total
 
 end GREML
