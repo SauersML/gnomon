@@ -59,14 +59,14 @@ noncomputable def fStatistic (n : ℕ) (r2_ZX : ℝ) : ℝ :=
 
 /-- F-statistic increases with R². -/
 theorem f_stat_increases_with_r2 (n : ℕ) (r2₁ r2₂ : ℝ)
-    (h_n : 2 < n) (h_r2₁ : 0 < r2₁) (h_r2₂ : 0 < r2₂)
-    (h_r2₁_lt : r2₁ < 1) (h_r2₂_lt : r2₂ < 1)
+    (h_n : 2 < n) (h_r2₂_lt : r2₂ < 1)
     (h_lt : r2₁ < r2₂) :
     fStatistic n r2₁ < fStatistic n r2₂ := by
   unfold fStatistic
   have h_n_pos : (0 : ℝ) < n - 2 := by
     have : (2 : ℝ) < n := Nat.ofNat_lt_cast.mpr h_n
     linarith
+  have h_r2₁_lt : r2₁ < 1 := by linarith
   rw [div_lt_div_iff₀ (by linarith) (by linarith)]
   nlinarith
 
@@ -102,10 +102,12 @@ section CrossAncestryInstruments
     When the source F-statistic exceeds a threshold but the target falls below it,
     the target instrument is strictly weaker. -/
 theorem instrument_strength_varies
-    (f_stat_source f_stat_target threshold : ℝ)
-    (h_strong_source : threshold < f_stat_source)
-    (h_weak_target : f_stat_target < threshold) :
-    f_stat_target < f_stat_source := by linarith
+    (n : ℕ) (r2_source r2_target : ℝ)
+    (h_n : 2 < n)
+    (h_r2_source_lt : r2_source < 1)
+    (h_ld_weaker : r2_target < r2_source) :
+    fStatistic n r2_target < fStatistic n r2_source := by
+  exact f_stat_increases_with_r2 n r2_target r2_source h_n h_r2_source_lt h_ld_weaker
 
 /-- **LD proxy instruments weaken across ancestry.**
     In MR, we often use a proxy SNP (in LD with causal SNP).
@@ -169,11 +171,11 @@ section TwoSampleMR
 theorem cross_ancestry_mr_less_confounded
     (confound r_strat r_strat_cross : ℝ)
     (h_conf : 0 < confound)
-    (h_rs : 0 ≤ r_strat) (h_rc : 0 ≤ r_strat_cross)
+    (h_rc : 0 ≤ r_strat_cross)
     (h_cross_less : r_strat_cross < r_strat) :
     confound * r_strat_cross ^ 2 < confound * r_strat ^ 2 := by
   apply mul_lt_mul_of_pos_left _ h_conf
-  exact sq_lt_sq' (by linarith) h_cross_less
+  nlinarith
 
 /-- **But cross-ancestry MR has lower power.**
     Instruments are weaker in the target ancestry (shorter LD,
@@ -203,18 +205,12 @@ noncomputable def mrMSE (bias variance : ℝ) : ℝ :=
     When the bias reduction (in squared terms) exceeds the variance increase,
     cross-ancestry MSE is lower. -/
 theorem cross_better_when_bias_dominates
-    (bias_same bias_cross var_same var_cross : ℝ)
-    (h_less_bias : |bias_cross| < |bias_same|)
-    (h_more_var : var_same < var_cross)
-    (h_var_nn : 0 ≤ var_same)
-    (h_bias_dominates : bias_same ^ 2 - bias_cross ^ 2 > var_cross - var_same) :
+    (bias_same bias_cross var_same var_cross variance_penalty : ℝ)
+    (h_less_bias : bias_cross ^ 2 + variance_penalty < bias_same ^ 2)
+    (h_var_penalty : var_cross - var_same ≤ variance_penalty) :
     mrMSE bias_cross var_cross < mrMSE bias_same var_same := by
-  unfold mrMSE; linarith
-
-/- **IVW estimator for multiple instruments.**
-    β_IVW = Σ w_j β_j / Σ w_j
-    where w_j = 1/σ²_j and β_j are individual Wald ratios.
-    Cross-ancestry weights differ due to different σ²_j. -/
+  unfold mrMSE
+  linarith
 
 end TwoSampleMR
 
@@ -256,24 +252,38 @@ theorem mr_consistency_implies_causal_prediction
     the Wald ratio recovers the same causal effect in both populations,
     even when the first-stage coefficients differ due to LD differences. -/
 theorem valid_iv_ld_invariant
-    (beta_causal beta_ZX_eur beta_ZX_afr : ℝ)
+    (beta_causal beta_ZY_eur beta_ZX_eur beta_ZY_afr beta_ZX_afr : ℝ)
     (h_ZX_eur : beta_ZX_eur ≠ 0) (h_ZX_afr : beta_ZX_afr ≠ 0)
-    (h_eur_valid : beta_causal * beta_ZX_eur = beta_causal * beta_ZX_eur)
-    (h_afr_valid : beta_causal * beta_ZX_afr = beta_causal * beta_ZX_afr) :
-    waldRatio (beta_causal * beta_ZX_eur) beta_ZX_eur =
-      waldRatio (beta_causal * beta_ZX_afr) beta_ZX_afr := by
+    (h_eur_valid : beta_ZY_eur = beta_causal * beta_ZX_eur)
+    (h_afr_valid : beta_ZY_afr = beta_causal * beta_ZX_afr) :
+    waldRatio beta_ZY_eur beta_ZX_eur = waldRatio beta_ZY_afr beta_ZX_afr := by
   unfold waldRatio
-  rw [mul_div_cancel_right₀ _ h_ZX_eur, mul_div_cancel_right₀ _ h_ZX_afr]
+  rw [h_eur_valid, h_afr_valid, mul_div_cancel_right₀ _ h_ZX_eur, mul_div_cancel_right₀ _ h_ZX_afr]
+
+noncomputable def portabilityR2 (V_G V_E V_GxE : ℝ) : ℝ :=
+  V_G / (V_G + V_E + V_GxE)
+
+noncomputable def portabilityR2Adjusted (V_G V_E : ℝ) : ℝ :=
+  V_G / (V_G + V_E)
 
 /-- **Bidirectional MR for GxE.**
     MR can test whether environmental factors mediate the
     portability gap. If environment → portability loss,
     adjusting for environment should improve portability. -/
 theorem environment_mediates_portability_mr
-    (port_unadjusted port_adjusted : ℝ)
-    (h_improved : port_unadjusted < port_adjusted)
-    (h_nn : 0 < port_unadjusted) :
-    0 < port_adjusted - port_unadjusted := by linarith
+    (V_G V_E V_GxE : ℝ)
+    (h_G_pos : 0 < V_G) (h_E_pos : 0 < V_E) (h_GxE_pos : 0 < V_GxE) :
+    portabilityR2 V_G V_E V_GxE < portabilityR2Adjusted V_G V_E := by
+  unfold portabilityR2 portabilityR2Adjusted
+  apply (div_lt_div_iff₀ (by linarith) (by linarith)).mpr
+  have h1 : V_G * (V_G + V_E) < V_G * (V_G + V_E + V_GxE) := by
+    apply mul_lt_mul_of_pos_left
+    linarith
+    exact h_G_pos
+  exact h1
+
+noncomputable def conservedPathwayProportion (n_conserved n_total : ℕ) : ℝ :=
+  (n_conserved : ℝ) / (n_total : ℝ)
 
 /-- **MR-PheWAS for systematic portability analysis.**
     Running MR across many phenotypes simultaneously reveals
@@ -282,9 +292,14 @@ theorem environment_mediates_portability_mr
 theorem mr_phewas_identifies_conserved_pathways
     (n_conserved n_specific n_total : ℕ)
     (h_sum : n_conserved + n_specific = n_total)
-    (h_some_conserved : 0 < n_conserved)
-    (h_some_specific : 0 < n_specific) :
-    n_conserved < n_total := by omega
+    (h_some_specific : 0 < n_specific)
+    (h_some_conserved : 0 < n_conserved) :
+    conservedPathwayProportion n_conserved n_total < 1 := by
+  unfold conservedPathwayProportion
+  have h_total_pos : 0 < n_total := by omega
+  have h_total_pos_real : (0 : ℝ) < n_total := Nat.cast_pos.mpr h_total_pos
+  rw [div_lt_one h_total_pos_real]
+  exact Nat.cast_lt.mpr (by omega)
 
 end MRForPGSValidation
 
@@ -298,26 +313,50 @@ that can mimic or mask portability effects.
 
 section ColliderBias
 
+noncomputable def observedEffectWithColliderBias (beta_true cov_GU beta_U var_G : ℝ) : ℝ :=
+  beta_true + (cov_GU * beta_U) / var_G
+
 /-- **Survivorship creates collider bias.**
     If the study conditions on survival (e.g., hospital-based),
     and survival depends on both genetics and ancestry,
     the PGS-phenotype association is biased. -/
 theorem collider_bias_from_selection
-    (beta_true beta_observed selection_bias : ℝ)
-    (h_biased : beta_observed = beta_true + selection_bias)
-    (h_bias_nn : selection_bias ≠ 0) :
-    beta_observed ≠ beta_true := by
-  rw [h_biased]; intro h; apply h_bias_nn; linarith
+    (beta_true cov_GU beta_U var_G : ℝ)
+    (h_cov_nz : cov_GU ≠ 0)
+    (h_beta_U_nz : beta_U ≠ 0)
+    (h_var_G_pos : 0 < var_G) :
+    observedEffectWithColliderBias beta_true cov_GU beta_U var_G ≠ beta_true := by
+  unfold observedEffectWithColliderBias
+  intro h_eq
+  have h_zero : (cov_GU * beta_U) / var_G = 0 := by linarith
+  have h_num_zero : cov_GU * beta_U = 0 := by
+    exact (div_eq_zero_iff.mp h_zero).resolve_right (ne_of_gt h_var_G_pos)
+  cases mul_eq_zero.mp h_num_zero with
+  | inl h1 => exact h_cov_nz h1
+  | inr h2 => exact h_beta_U_nz h2
+
+noncomputable def biasedPrognosisEffect (beta_true cov_GE beta_E var_G : ℝ) : ℝ :=
+  beta_true + (cov_GE * beta_E) / var_G
 
 /-- **Index event bias in PGS studies.**
     Conditioning on disease status (case-control design)
     can create spurious associations between PGS and prognosis.
     This is more severe when PGS is ancestry-specific. -/
 theorem index_event_bias
-    (beta_prognosis_true beta_prognosis_biased pgs_diagnosis_effect : ℝ)
-    (h_bias : beta_prognosis_biased = beta_prognosis_true - pgs_diagnosis_effect)
-    (h_effect : 0 < pgs_diagnosis_effect) :
-    beta_prognosis_biased < beta_prognosis_true := by linarith
+    (beta_true cov_GE beta_E var_G : ℝ)
+    (h_cov_neg : cov_GE < 0)
+    (h_beta_E_pos : 0 < beta_E)
+    (h_var_G_pos : 0 < var_G) :
+    biasedPrognosisEffect beta_true cov_GE beta_E var_G < beta_true := by
+  unfold biasedPrognosisEffect
+  have h_neg : (cov_GE * beta_E) / var_G < 0 := by
+    apply div_neg_of_neg_of_pos
+    · exact mul_neg_of_neg_of_pos h_cov_neg h_beta_E_pos
+    · exact h_var_G_pos
+  linarith
+
+noncomputable def berksonObservedEffect (beta_pop cov_GE beta_E var_G : ℝ) : ℝ :=
+  beta_pop + (cov_GE * beta_E) / var_G
 
 /-- **Berkson's paradox in biobank studies.**
     Biobank participants are healthier and more educated than
@@ -328,10 +367,20 @@ theorem index_event_bias
     If bias_eur ≠ bias_afr, then β_biobank_eur ≠ β_biobank_afr even when
     the true population-level effect is the same. -/
 theorem berkson_paradox_ancestry_specific
-    (beta_population bias_eur bias_afr : ℝ)
-    (h_diff_bias : bias_eur ≠ bias_afr) :
-    beta_population + bias_eur ≠ beta_population + bias_afr := by
-  intro h; exact h_diff_bias (by linarith)
+    (beta_pop beta_E var_G cov_GE_eur cov_GE_afr : ℝ)
+    (h_var_G_pos : 0 < var_G)
+    (h_beta_E_nz : beta_E ≠ 0)
+    (h_cov_diff : cov_GE_eur ≠ cov_GE_afr) :
+    berksonObservedEffect beta_pop cov_GE_eur beta_E var_G ≠
+    berksonObservedEffect beta_pop cov_GE_afr beta_E var_G := by
+  unfold berksonObservedEffect
+  intro h_eq
+  have h_eq2 : (cov_GE_eur * beta_E) / var_G = (cov_GE_afr * beta_E) / var_G := by linarith
+  have h_eq3 : cov_GE_eur * beta_E = cov_GE_afr * beta_E := by
+    exact (div_left_inj' (ne_of_gt h_var_G_pos)).mp h_eq2
+  have h_eq4 : cov_GE_eur = cov_GE_afr := by
+    exact (mul_right_cancel₀ h_beta_E_nz h_eq3)
+  exact h_cov_diff h_eq4
 
 end ColliderBias
 

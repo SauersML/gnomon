@@ -1,0 +1,73 @@
+<<<<<<< SEARCH
+theorem f_stat_increases_with_r2 (n : ℕ) (r2₁ r2₂ : ℝ)
+    (h_n : 2 < n) (h_r2₁ : 0 < r2₁) (h_r2₂ : 0 < r2₂)
+    (h_r2₁_lt : r2₁ < 1) (h_r2₂_lt : r2₂ < 1)
+    (h_lt : r2₁ < r2₂) :
+    fStatistic n r2₁ < fStatistic n r2₂ := by
+  unfold fStatistic
+  have h_n_pos : (0 : ℝ) < n - 2 := by
+    have : (2 : ℝ) < n := Nat.ofNat_lt_cast.mpr h_n
+    linarith
+  rw [div_lt_div_iff₀ (by linarith) (by linarith)]
+  nlinarith
+=======
+theorem f_stat_increases_with_r2 (n : ℕ) (r2₁ r2₂ : ℝ)
+    (h_n : 2 < n) (h_r2₂_lt : r2₂ < 1)
+    (h_lt : r2₁ < r2₂) :
+    fStatistic n r2₁ < fStatistic n r2₂ := by
+  unfold fStatistic
+  have h_n_pos : (0 : ℝ) < n - 2 := by
+    have : (2 : ℝ) < n := Nat.ofNat_lt_cast.mpr h_n
+    linarith
+  have h_r2₁_lt : r2₁ < 1 := by linarith
+  rw [div_lt_div_iff₀ (by linarith) (by linarith)]
+  nlinarith
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+/-- **Instrument strength varies across ancestries.**
+    An instrument selected in one population (source) may be a weak instrument
+    in another (target) because LD between instrument and causal variant differs.
+    When the source F-statistic exceeds a threshold but the target falls below it,
+    the target instrument is strictly weaker. -/
+theorem instrument_strength_varies
+    (n : ℕ) (r2_source r2_target : ℝ)
+    (h_n : 2 < n)
+    (h_r2_target_pos : 0 < r2_target) (h_r2_source_lt : r2_source < 1)
+    (h_ld_weaker : r2_target < r2_source) :
+    fStatistic n r2_target < fStatistic n r2_source := by
+  have h_r2_target_lt : r2_target < 1 := lt_trans h_ld_weaker h_r2_source_lt
+  have h_r2_source_pos : 0 < r2_source := lt_trans h_r2_target_pos h_ld_weaker
+  exact f_stat_increases_with_r2 n r2_target r2_source h_n h_r2_target_pos h_r2_source_pos h_r2_target_lt h_r2_source_lt h_ld_weaker
+=======
+/-- **Instrument strength varies across ancestries.**
+    An instrument selected in one population (source) may be a weak instrument
+    in another (target) because LD between instrument and causal variant differs.
+    When the source F-statistic exceeds a threshold but the target falls below it,
+    the target instrument is strictly weaker. -/
+theorem instrument_strength_varies
+    (n : ℕ) (r2_source r2_target : ℝ)
+    (h_n : 2 < n)
+    (h_r2_source_lt : r2_source < 1)
+    (h_ld_weaker : r2_target < r2_source) :
+    fStatistic n r2_target < fStatistic n r2_source := by
+  exact f_stat_increases_with_r2 n r2_target r2_source h_n h_r2_source_lt h_ld_weaker
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+theorem cross_ancestry_mr_less_confounded
+    (confound r_strat r_strat_cross : ℝ)
+    (h_conf : 0 < confound)
+    (h_rs : 0 ≤ r_strat) (h_rc : 0 ≤ r_strat_cross)
+    (h_cross_less : r_strat_cross < r_strat) :
+    confound * r_strat_cross ^ 2 < confound * r_strat ^ 2 := by
+  apply mul_lt_mul_of_pos_left _ h_conf
+  nlinarith
+=======
+theorem cross_ancestry_mr_less_confounded
+    (confound r_strat r_strat_cross : ℝ)
+    (h_conf : 0 < confound)
+    (h_rc : 0 ≤ r_strat_cross)
+    (h_cross_less : r_strat_cross < r_strat) :
+    confound * r_strat_cross ^ 2 < confound * r_strat ^ 2 := by
+  apply mul_lt_mul_of_pos_left _ h_conf
+  nlinarith
+>>>>>>> REPLACE
