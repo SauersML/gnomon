@@ -1,0 +1,84 @@
+diff --git a/proofs/Calibrator/VarianceComponents.lean b/proofs/Calibrator/VarianceComponents.lean
+index a940b07..9518703 100644
+--- a/proofs/Calibrator/VarianceComponents.lean
++++ b/proofs/Calibrator/VarianceComponents.lean
+@@ -224,21 +224,22 @@ theorem portability_reduces_ceiling
+         · exact mul_nonneg (le_of_lt h_h2) (by linarith)
+     _ = h2_snp := by ring
+ 
++/-- **The three-way ceiling decomposition model.**
++    R²_target ≤ h² × (GWAS power) × (portability ratio). -/
++noncomputable def threeWayCeilingBound (h2_snp gwas_power port_ratio : ℝ) : ℝ :=
++  h2_snp * gwas_power * port_ratio
++
+ /-- **The three-way ceiling decomposition.**
+-    R²_target ≤ h² × (GWAS power) × (portability ratio).
+-    Each factor is ≤ 1, and the product can be very small. -/
++    Each factor is bounded by 1, so the expected R² target is bounded by 1. -/
+ theorem three_way_ceiling
+-    (h2 gwas_power port_ratio target_r2 : ℝ)
+-    (h_h2_le : h2 ≤ 1) (h_power_le : gwas_power ≤ 1)
+-    (h_port_le : port_ratio ≤ 1)
+-    (h_h2_nn : 0 ≤ h2) (h_power_nn : 0 ≤ gwas_power) (h_port_nn : 0 ≤ port_ratio)
+-    (h_bound : target_r2 ≤ h2 * gwas_power * port_ratio) :
+-    target_r2 ≤ 1 := by
+-  have : h2 * gwas_power * port_ratio ≤ 1 := by
+-    calc h2 * gwas_power * port_ratio
+-        ≤ 1 * 1 * 1 := by nlinarith [mul_nonneg h_h2_nn h_power_nn]
+-      _ = 1 := by ring
+-  linarith
++    (h2_snp gwas_power port_ratio : ℝ)
++    (h_h2_le : h2_snp ≤ 1) (h_power_le : gwas_power ≤ 1) (h_port_le : port_ratio ≤ 1)
++    (h_h2_nn : 0 ≤ h2_snp) (h_power_nn : 0 ≤ gwas_power) (h_port_nn : 0 ≤ port_ratio) :
++    threeWayCeilingBound h2_snp gwas_power port_ratio ≤ 1 := by
++  unfold threeWayCeilingBound
++  calc h2_snp * gwas_power * port_ratio
++      ≤ 1 * 1 * 1 := by nlinarith [mul_nonneg h_h2_nn h_power_nn]
++    _ = 1 := by ring
+ 
+ end PGSCeiling
+ 
+@@ -287,29 +288,27 @@ theorem greml_underestimates_with_poor_tagging
+     · nlinarith
+     · exact h_VP_pos
+ 
+-/-- **Population structure inflates GREML h² estimate.**
+-    Cryptic stratification in the GWAS sample creates a positive bias
+-    in the GRM-based h² estimate.
++/-- **GREML heritability estimate under stratification.**
++    When there is population structure, the GRM captures both true genetic
++    relatedness and stratification-induced correlations.
++    The GREML estimate inflates the numerator by the stratification variance. -/
++noncomputable def gremlStratificationEstimate (V_A V_strat V_P : ℝ) : ℝ :=
++  (V_A + V_strat) / V_P
+ 
+-    **Model:** GREML estimates h² = V_A / V_P by fitting a linear mixed
+-    model with a GRM kernel. When there is population structure, the GRM
+-    captures both true genetic relatedness and stratification-induced
+-    correlations. The GREML estimate becomes:
+-      h²_GREML = (V_A + V_strat) / (V_A + V_strat + V_E)
+-    while the true h² is:
+-      h²_true = V_A / (V_A + V_strat + V_E)
++/-- **True heritability definition.** -/
++noncomputable def trueHeritability (V_A V_P : ℝ) : ℝ :=
++  V_A / V_P
+ 
+-    We derive: h²_GREML > h²_true whenever V_strat > 0, because
+-    (V_A + V_strat)/V_P > V_A/V_P when V_P > 0. -/
++/-- **Population structure inflates GREML h² estimate.**
++    Cryptic stratification in the GWAS sample creates a positive bias
++    in the GRM-based h² estimate. -/
+ theorem stratification_inflates_greml
+     (V_A V_strat V_E : ℝ)
+     (h_VA : 0 ≤ V_A) (h_strat_pos : 0 < V_strat) (h_VE : 0 ≤ V_E)
+     (h_total : 0 < V_A + V_strat + V_E) :
+     let V_P := V_A + V_strat + V_E
+-    let h2_true := V_A / V_P
+-    let h2_greml := (V_A + V_strat) / V_P
+-    h2_true < h2_greml := by
+-  simp only
++    trueHeritability V_A V_P < gremlStratificationEstimate V_A V_strat V_P := by
++  simp only [trueHeritability, gremlStratificationEstimate]
+   exact div_lt_div_of_pos_right (by linarith) h_total
+ 
+ end GREML
