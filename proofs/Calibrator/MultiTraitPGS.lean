@@ -135,55 +135,93 @@ correlated portability patterns across traits.
 
 section Pleiotropy
 
+/-- **Bound on portability gap due to pleiotropy.**
+    If two traits share genetic architecture (captured by genetic correlation r_g),
+    their portability patterns are correlated. We model the gap between their
+    portability levels as bounded by a function of their genetic correlation. -/
+noncomputable def pleiotropicPortabilityBound (rg : ℝ) : ℝ :=
+  2 * (1 - |rg|)
+
 /-- **Horizontal pleiotropy creates correlated portability.**
-    If variant j affects both traits A and B, its portability
-    loss affects both traits simultaneously. -/
+    The gap in portability between two traits is constrained by their shared
+    genetic architecture. When genetic correlation is high, the upper bound
+    on their portability difference shrinks. -/
 theorem pleiotropic_correlated_portability
     (port_A port_B rg lb : ℝ)
-    (h_correlated : |port_A - port_B| ≤ 2 * (1 - |rg|))
+    (h_correlated : |port_A - port_B| ≤ pleiotropicPortabilityBound rg)
     (h_rg : lb < |rg|)
     (h_lb_nn : 0 ≤ lb) :
-    |port_A - port_B| < 2 * (1 - lb) := by linarith
+    |port_A - port_B| < pleiotropicPortabilityBound lb := by
+  unfold pleiotropicPortabilityBound at *
+  have h1 : 1 - |rg| < 1 - lb := by linarith
+  have h2 : 2 * (1 - |rg|) < 2 * (1 - lb) := by linarith
+  have h3 : |lb| = lb := abs_of_nonneg h_lb_nn
+  linarith
+
+/-- **Portability of a trait whose genetic effect is completely mediated.**
+    If trait B is completely mediated by trait A, with a mediation fraction `α`
+    representing the proportion of genetic variance acting through this pathway,
+    the portability of the mediated effect is bounded. -/
+noncomputable def mediatedPortability (port_A α : ℝ) : ℝ :=
+  α * port_A
 
 /-- **Mediated pleiotropy vs biological pleiotropy.**
-    Mediated: A → B, so variant affects B through A.
-    Portability of B is bounded by portability of A.
-    If the mediation fraction is α ∈ [0,1], then
-    port_B_mediated = α × port_A, so port_B ≤ port_A. -/
+    Mediated: A → B, so a variant affects B entirely through its effect on A.
+    The portability of the mediated trait B is bounded above by the portability
+    of the mediating trait A, scaled by the mediation fraction. -/
 theorem mediated_pleiotropy_portability_bound
     (port_A α : ℝ)
     (h_α_le : α ≤ 1)
     (h_α_nn : 0 ≤ α)
     (h_port_nn : 0 ≤ port_A) :
-    α * port_A ≤ port_A := by nlinarith
+    mediatedPortability port_A α ≤ port_A := by
+  unfold mediatedPortability
+  nlinarith
+
+/-- Portability of a shared genetic component, which experiences some decay `δ_shared`. -/
+noncomputable def sharedComponentPortability (port_base δ_shared : ℝ) : ℝ :=
+  port_base - δ_shared
+
+/-- Portability of a unique genetic component, which experiences decay `δ_unique`. -/
+noncomputable def uniqueComponentPortability (port_base δ_unique : ℝ) : ℝ :=
+  port_base - δ_unique
 
 /-- **Trait-specific genetic components are less portable.**
     The component of genetic variance unique to a trait (not shared
     via pleiotropy) is more likely to be affected by population-specific
-    selection. Shared components degrade by δ_shared, unique by δ_unique,
-    where δ_unique > δ_shared due to selection. -/
+    selection. Therefore, the unique component retains less portability than
+    the shared component. -/
 theorem unique_component_less_portable
     (port_base δ_shared δ_unique : ℝ)
     (h_selection : δ_shared < δ_unique)
     (h_shared_nn : 0 < δ_shared)
     (h_base : δ_unique < port_base) :
-    port_base - δ_unique < port_base - δ_shared := by linarith
+    uniqueComponentPortability port_base δ_unique <
+      sharedComponentPortability port_base δ_shared := by
+  unfold uniqueComponentPortability sharedComponentPortability
+  linarith
+
+/-- Overall portability of a trait composed of shared and unique genetic architectures,
+    weighted by their respective heritability components. -/
+noncomputable def overallPleiotropicPortability
+    (h2_shared h2_unique port_shared port_unique : ℝ) : ℝ :=
+  (h2_shared * port_shared + h2_unique * port_unique) / (h2_shared + h2_unique)
 
 /-- **Decomposing trait heritability into shared and unique.**
-    h²_trait = h²_shared + h²_unique where h²_shared comes from
-    pleiotropic loci. When the shared fraction dominates (h²_shared/h²_total > 1/2),
-    portability is primarily determined by the shared component.
-    Model: overall portability = (h²_shared × port_shared + h²_unique × port_unique) / h²_total.
-    If h²_shared > h²_unique and port_shared > port_unique, then
-    overall portability > (port_shared + port_unique) / 2 (the unweighted average). -/
+    When the shared heritability fraction dominates (h²_shared > h²_unique) and
+    the shared component is more portable, the overall weighted portability
+    strictly exceeds the unweighted average portability of the two components. -/
 theorem heritability_shared_dominates_portability
     (h2_shared h2_unique port_shared port_unique : ℝ)
     (h_shared_pos : 0 < h2_shared) (h_unique_pos : 0 < h2_unique)
     (h_shared_larger : h2_unique < h2_shared)
     (h_port_shared_better : port_unique < port_shared)
     (h_ps_nn : 0 ≤ port_shared) (h_pu_nn : 0 ≤ port_unique) :
-    (port_shared + port_unique) / 2 * (h2_shared + h2_unique) <
-      h2_shared * port_shared + h2_unique * port_unique := by
+    (port_shared + port_unique) / 2 <
+      overallPleiotropicPortability h2_shared h2_unique port_shared port_unique := by
+  unfold overallPleiotropicPortability
+  have h_sum_pos : 0 < h2_shared + h2_unique := by linarith
+  rw [lt_div_iff₀ h_sum_pos]
   nlinarith [mul_pos (sub_pos.mpr h_shared_larger) (sub_pos.mpr h_port_shared_better)]
 
 end Pleiotropy
