@@ -16,13 +16,38 @@ path = "shared/lib.rs"
 [[bin]]
 name = "gnomon"
 path = "cli/main.rs"
+required-features = ["map", "score", "calibrate", "terms"]
+
+[[bin]]
+name = "gnomon-score"
+path = "cli/main.rs"
+required-features = ["score"]
+
+[[bin]]
+name = "gnomon-map"
+path = "cli/main.rs"
+required-features = ["map"]
+
+[[bin]]
+name = "gnomon-terms"
+path = "cli/main.rs"
+required-features = ["terms"]
+
+[[bin]]
+name = "gnomon-calibrate"
+path = "cli/main.rs"
+required-features = ["calibrate"]
 
 [features]
-default = []
+default = ["map", "score", "calibrate", "terms"]
+map = []
+score = []
+terms = []
+calibrate = ["dep:gam", "dep:polars"]
 bench-path = []
 
 [dependencies]
-gam = "0.1.14"
+gam = { version = "0.1.14", optional = true }
 ahash = "0.8.12"
 clap = { version = "4.5.48", features = ["derive"] }
 memmap2 = "0.9.8"
@@ -44,7 +69,7 @@ ndarray = { version = "0.17.1", features = ["serde", "rayon"] }
 serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.17"
 toml = "0.9.7"
-polars = { version = "0.51.0", features = ["csv", "ndarray", "parquet"] }
+polars = { version = "0.51.0", features = ["csv", "ndarray", "parquet"], optional = true }
 wolfe_bfgs = "0.2.2"
 log = "0.4.28"
 faer = "0.23.2"
@@ -122,10 +147,12 @@ required-features = ["bench-path"]
 [[test]]
 name = "calibrate"
 path = "calibrate/tests/mod.rs"
+required-features = ["calibrate"]
 
 [[test]]
 name = "score"
 path = "score/tests/mod.rs"
+required-features = ["score"]
 
 # Run tests at release optimization level for maximum speed
 [profile.test]

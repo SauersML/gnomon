@@ -3,147 +3,520 @@
 #![deny(unused_imports)]
 #![deny(clippy::no_effect_underscore_binding)]
 
-use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
+#[cfg(feature = "calibrate")]
+use clap::ValueEnum;
+use clap::{Args, Parser};
+#[cfg(any(feature = "map", feature = "calibrate"))]
+use clap::{CommandFactory, Subcommand};
+#[cfg(feature = "calibrate")]
 use gam::probability::normal_cdf_approx;
-use ndarray::{Array1, ArrayView1};
-use std::collections::HashSet;
-use std::path::PathBuf;
-use std::process;
-
+#[cfg(feature = "calibrate")]
 use gnomon::calibrate::data::{load_prediction_data, load_training_data};
+#[cfg(feature = "calibrate")]
 use gnomon::calibrate::estimate::{train_model, train_survival_model};
+#[cfg(feature = "calibrate")]
 use gnomon::calibrate::model::BasisConfig;
+#[cfg(feature = "calibrate")]
 use gnomon::calibrate::model::SurvivalModelConfig;
+#[cfg(feature = "calibrate")]
 use gnomon::calibrate::model::SurvivalPrediction;
+#[cfg(feature = "calibrate")]
 use gnomon::calibrate::model::SurvivalRiskType;
+#[cfg(feature = "calibrate")]
 use gnomon::calibrate::model::SurvivalTimeVaryingConfig;
+#[cfg(feature = "calibrate")]
 use gnomon::calibrate::model::{LinkFunction, ModelConfig, ModelFamily, TrainedModel};
+#[cfg(feature = "calibrate")]
 use gnomon::calibrate::survival::SurvivalSpec;
+#[cfg(feature = "calibrate")]
 use gnomon::calibrate::survival_data::{
     SurvivalPredictionData, has_survival_columns, load_survival_prediction_data,
     load_survival_training_data,
 };
+#[cfg(feature = "map")]
 use gnomon::map::main as map_cli;
+#[cfg(feature = "map")]
 use gnomon::map::{DEFAULT_LD_WINDOW, LdWindow};
+#[cfg(feature = "terms")]
 use gnomon::terms::infer_sex_to_tsv;
+#[cfg(feature = "calibrate")]
+use ndarray::{Array1, ArrayView1};
+#[cfg(feature = "calibrate")]
+use std::collections::HashSet;
+#[cfg(any(feature = "score", feature = "map", feature = "terms"))]
+use std::path::PathBuf;
+use std::process;
 
+#[cfg(feature = "score")]
+#[path = "../score/main.rs"]
+mod score_main;
+
+#[cfg(feature = "score")]
+#[derive(Args)]
+struct ScoreArgs {
+    /// Path to a single score file or a directory containing multiple score files.
+    #[arg(value_name = "SCORE_PATH")]
+    score: PathBuf,
+
+    /// Path to a file containing a list of individual IDs (IIDs) to include.
+    #[arg(long)]
+    keep: Option<PathBuf>,
+
+    /// Path to genotype data (PLINK .bed/.bim/.fam prefix, VCF, BCF, or DTC text file)
+    #[arg(value_name = "GENOTYPE_PATH")]
+    input_path: PathBuf,
+
+    /// Reference genome FASTA (optional; auto-downloaded if not provided for DTC files)
+    #[arg(long)]
+    reference: Option<PathBuf>,
+
+    /// Force genome build (37 or 38); auto-detected if not provided
+    #[arg(long)]
+    build: Option<String>,
+
+    /// Reference panel VCF for strand harmonization
+    #[arg(long)]
+    panel: Option<PathBuf>,
+}
+
+#[cfg(feature = "map")]
+#[derive(Args)]
+struct FitArgs {
+    /// Path to PLINK .bed file or directory containing .bed files
+    #[arg(value_name = "GENOTYPE_PATH")]
+    genotype_path: PathBuf,
+
+    /// Optional variant list limiting SNVs used for PCA fitting
+    #[arg(long, value_name = "PATH")]
+    list: Option<PathBuf>,
+
+    /// Number of principal components to retain when fitting the HWE PCA model
+    #[arg(long, value_name = "N")]
+    components: usize,
+
+    /// Enable LD normalization when fitting the PCA model
+    #[arg(long)]
+    ld: bool,
+
+    /// LD window expressed as the number of sites (must be odd)
+    #[arg(
+        long = "sites_window",
+        value_name = "SITES",
+        requires = "ld",
+        conflicts_with = "bp_window"
+    )]
+    sites_window: Option<usize>,
+
+    /// LD window expressed as the total span in base pairs
+    #[arg(
+        long = "bp_window",
+        value_name = "BP",
+        requires = "ld",
+        conflicts_with = "sites_window"
+    )]
+    bp_window: Option<u64>,
+}
+
+#[cfg(feature = "map")]
+#[derive(Args)]
+struct ProjectArgs {
+    /// Path to PLINK .bed file or directory containing .bed files
+    #[arg(value_name = "GENOTYPE_PATH")]
+    genotype_path: PathBuf,
+
+    /// Use a built-in pre-trained model (downloads from GitHub if needed)
+    #[arg(long, value_name = "MODEL_NAME")]
+    model: Option<String>,
+
+    /// Write a JSON manifest describing the exact projection outputs that were created
+    #[arg(long, value_name = "PATH")]
+    output_manifest: Option<PathBuf>,
+}
+
+#[cfg(feature = "terms")]
+#[derive(Args)]
+struct TermsArgs {
+    /// Path to genotype dataset (PLINK .bed/.bim/.fam prefix or VCF/BCF file)
+    #[arg(value_name = "GENOTYPE_PATH")]
+    genotype_path: PathBuf,
+
+    /// Run sex inference on the provided genotype dataset
+    #[arg(long)]
+    sex: bool,
+}
+
+#[cfg(feature = "calibrate")]
 #[derive(Clone, ValueEnum)]
-pub enum ModelFamilyCli {
+enum ModelFamilyCli {
     Gam,
     Survival,
 }
 
+#[cfg(feature = "calibrate")]
 #[derive(Args)]
-pub struct TrainArgs {
+struct TrainArgs {
     #[arg(long, value_enum, default_value_t = ModelFamilyCli::Gam)]
-    pub model_family: ModelFamilyCli,
+    model_family: ModelFamilyCli,
 
     /// Path to training TSV file with phenotype,score,PC1,PC2,... columns
-    pub training_data: String,
+    training_data: String,
 
     /// Number of principal components to use from the data
     #[arg(long, value_name = "N")]
-    pub num_pcs: usize,
+    num_pcs: usize,
 
     /// Number of internal knots for PGS spline basis
     #[arg(long, default_value = "10")]
-    pub pgs_knots: usize,
+    pgs_knots: usize,
 
     /// Polynomial degree for PGS spline basis
     #[arg(long, default_value = "3")]
-    pub pgs_degree: usize,
+    pgs_degree: usize,
 
     /// Number of internal knots for PC spline bases
     #[arg(long, default_value = "5")]
-    pub pc_knots: usize,
+    pc_knots: usize,
 
-    /// Polynomial degree for PC spline bases  
+    /// Polynomial degree for PC spline bases
     #[arg(long, default_value = "2")]
-    pub pc_degree: usize,
+    pc_degree: usize,
 
     /// Order of the difference penalty matrix
     #[arg(long, default_value = "2")]
-    pub penalty_order: usize,
+    penalty_order: usize,
 
     /// Maximum number of P-IRLS iterations for the inner loop (per REML step)
     #[arg(long, default_value = "50")]
-    pub max_iterations: usize,
+    max_iterations: usize,
 
     /// Convergence tolerance for the P-IRLS inner loop deviance change
     #[arg(long, default_value = "1e-7")]
-    pub convergence_tolerance: f64,
+    convergence_tolerance: f64,
 
     /// Maximum number of iterations for the outer REML/BFGS optimization loop
     #[arg(long, default_value = "100")]
-    pub reml_max_iterations: u64,
+    reml_max_iterations: u64,
 
     /// Convergence tolerance for the gradient norm in the outer REML/BFGS loop
     #[arg(long, default_value = "1e-3")]
-    pub reml_convergence_tolerance: f64,
+    reml_convergence_tolerance: f64,
 
     /// Guard delta for the survival age transform
     #[arg(long, default_value = "0.1")]
-    pub survival_guard_delta: f64,
+    survival_guard_delta: f64,
 
     /// Number of internal knots for the survival baseline spline
     #[arg(long, default_value = "6")]
-    pub survival_baseline_knots: usize,
+    survival_baseline_knots: usize,
 
     /// Degree for the survival baseline spline
     #[arg(long, default_value = "3")]
-    pub survival_baseline_degree: usize,
+    survival_baseline_degree: usize,
 
     /// Grid size for the survival monotonicity penalty
     #[arg(long, default_value = "64")]
-    pub survival_monotonic_grid: usize,
+    survival_monotonic_grid: usize,
 
     /// Derivative guard threshold used inside the survival likelihood
     #[arg(long, default_value = "1e-8")]
-    pub survival_derivative_guard: f64,
+    survival_derivative_guard: f64,
 
     /// Use expected information instead of observed Hessian when fitting survival models
     #[arg(long)]
-    pub survival_expected_information: bool,
+    survival_expected_information: bool,
 
     /// Enable the optional time-varying PGS × age interaction
     #[arg(long)]
-    pub survival_enable_time_varying: bool,
+    survival_enable_time_varying: bool,
 
     /// Number of internal knots for the time-varying PGS spline
     #[arg(long, default_value = "5")]
-    pub survival_time_varying_pgs_knots: usize,
+    survival_time_varying_pgs_knots: usize,
 
     /// Degree for the time-varying PGS spline
     #[arg(long, default_value = "3")]
-    pub survival_time_varying_pgs_degree: usize,
+    survival_time_varying_pgs_degree: usize,
 
     /// Difference-penalty order for the time-varying PGS spline
     #[arg(long, default_value = "2")]
-    pub survival_time_varying_pgs_penalty_order: usize,
+    survival_time_varying_pgs_penalty_order: usize,
 }
 
+#[cfg(feature = "calibrate")]
 #[derive(Args)]
-pub struct InferArgs {
+struct InferArgs {
     /// Path to test TSV file with score,PC1,PC2,... columns (no phenotype needed)
-    pub test_data: String,
+    test_data: String,
 
     /// Path to trained model file (.toml)
     #[arg(long)]
-    pub model: String,
+    model: String,
 }
 
-#[derive(Args)]
-pub struct TermsArgs {
-    /// Path to genotype dataset (PLINK .bed/.bim/.fam prefix or VCF/BCF file)
-    #[arg(value_name = "GENOTYPE_PATH")]
-    pub genotype_path: PathBuf,
-
-    /// Run sex inference on the provided genotype dataset
-    #[arg(long)]
-    pub sex: bool,
+#[cfg(all(
+    feature = "map",
+    feature = "score",
+    feature = "calibrate",
+    feature = "terms"
+))]
+#[derive(Parser)]
+#[command(
+    name = "gnomon",
+    about = "High-performance polygenic score calculation and calibration toolkit",
+    long_about = "A comprehensive toolkit for calculating polygenic scores from genotype data \
+                 and training GAM models for score calibration."
+)]
+struct FullCli {
+    #[command(subcommand)]
+    command: Option<FullCommands>,
 }
 
-pub fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
+#[cfg(all(
+    feature = "map",
+    feature = "score",
+    feature = "calibrate",
+    feature = "terms"
+))]
+#[derive(Subcommand)]
+enum FullCommands {
+    /// Calculate raw polygenic scores
+    Score(ScoreArgs),
+    /// Fit an HWE PCA model
+    Fit(FitArgs),
+    /// Project samples using an existing HWE PCA model
+    Project(ProjectArgs),
+    /// Infer sample metadata terms
+    Terms(TermsArgs),
+    /// Train GAM calibration model
+    Train(TrainArgs),
+    /// Apply calibration model to new data
+    Infer(InferArgs),
+    /// Display version and build information
+    Version,
+}
+
+#[cfg(feature = "score")]
+#[derive(Parser)]
+#[command(
+    name = "gnomon-score",
+    about = "Calculate raw polygenic scores from genotype data"
+)]
+struct ScoreCli {
+    #[command(flatten)]
+    args: ScoreArgs,
+}
+
+#[cfg(feature = "map")]
+#[derive(Parser)]
+#[command(name = "gnomon-map", about = "Fit or project HWE PCA models")]
+struct MapCli {
+    #[command(subcommand)]
+    command: Option<MapCommands>,
+}
+
+#[cfg(feature = "map")]
+#[derive(Subcommand)]
+enum MapCommands {
+    Fit(FitArgs),
+    Project(ProjectArgs),
+}
+
+#[cfg(feature = "terms")]
+#[derive(Parser)]
+#[command(
+    name = "gnomon-terms",
+    about = "Infer sample metadata terms from genotype data"
+)]
+struct TermsCli {
+    #[command(flatten)]
+    args: TermsArgs,
+}
+
+#[cfg(feature = "calibrate")]
+#[derive(Parser)]
+#[command(name = "gnomon-calibrate", about = "Train or apply calibration models")]
+struct CalibrateCli {
+    #[command(subcommand)]
+    command: Option<CalibrateCommands>,
+}
+
+#[cfg(feature = "calibrate")]
+#[derive(Subcommand)]
+enum CalibrateCommands {
+    Train(TrainArgs),
+    Infer(InferArgs),
+}
+
+fn main() {
+    let result = dispatch_current_binary();
+    if let Err(err) = result {
+        eprintln!("Error: {err}");
+        process::exit(1);
+    }
+}
+
+fn dispatch_current_binary() -> Result<(), Box<dyn std::error::Error>> {
+    match env!("CARGO_BIN_NAME") {
+        #[cfg(all(
+            feature = "map",
+            feature = "score",
+            feature = "calibrate",
+            feature = "terms"
+        ))]
+        "gnomon" => run_full_entrypoint(),
+        #[cfg(feature = "score")]
+        "gnomon-score" => run_score_entrypoint(),
+        #[cfg(feature = "map")]
+        "gnomon-map" => run_map_entrypoint(),
+        #[cfg(feature = "terms")]
+        "gnomon-terms" => run_terms_entrypoint(),
+        #[cfg(feature = "calibrate")]
+        "gnomon-calibrate" => run_calibrate_entrypoint(),
+        other => Err(format!("unsupported binary '{other}' for this feature set").into()),
+    }
+}
+
+#[cfg(all(
+    feature = "map",
+    feature = "score",
+    feature = "calibrate",
+    feature = "terms"
+))]
+fn run_full_entrypoint() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = FullCli::parse();
+    match cli.command {
+        Some(FullCommands::Score(args)) => run_score(args),
+        Some(FullCommands::Fit(args)) => run_map_fit(args),
+        Some(FullCommands::Project(args)) => run_map_project(args),
+        Some(FullCommands::Terms(args)) => run_terms(args),
+        Some(FullCommands::Train(args)) => train(args),
+        Some(FullCommands::Infer(args)) => infer(args),
+        Some(FullCommands::Version) => {
+            print_version_info();
+            Ok(())
+        }
+        None => {
+            FullCli::command().print_help()?;
+            println!();
+            Ok(())
+        }
+    }
+}
+
+#[cfg(feature = "score")]
+fn run_score_entrypoint() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = ScoreCli::parse();
+    run_score(cli.args)
+}
+
+#[cfg(feature = "map")]
+fn run_map_entrypoint() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = MapCli::parse();
+    match cli.command {
+        Some(MapCommands::Fit(args)) => run_map_fit(args),
+        Some(MapCommands::Project(args)) => run_map_project(args),
+        None => {
+            MapCli::command().print_help()?;
+            println!();
+            Ok(())
+        }
+    }
+}
+
+#[cfg(feature = "terms")]
+fn run_terms_entrypoint() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = TermsCli::parse();
+    run_terms(cli.args)
+}
+
+#[cfg(feature = "calibrate")]
+fn run_calibrate_entrypoint() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = CalibrateCli::parse();
+    match cli.command {
+        Some(CalibrateCommands::Train(args)) => train(args),
+        Some(CalibrateCommands::Infer(args)) => infer(args),
+        None => {
+            CalibrateCli::command().print_help()?;
+            println!();
+            Ok(())
+        }
+    }
+}
+
+#[cfg(feature = "score")]
+fn run_score(args: ScoreArgs) -> Result<(), Box<dyn std::error::Error>> {
+    score_main::run_gnomon_with_args(
+        args.input_path,
+        args.score,
+        args.keep,
+        args.reference,
+        args.build,
+        args.panel,
+    )
+    .map_err(|err| err as Box<dyn std::error::Error>)
+}
+
+#[cfg(feature = "map")]
+fn run_map_fit(args: FitArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let ld_window = if args.ld {
+        if let Some(bp) = args.bp_window {
+            Some(LdWindow::BasePairs(bp))
+        } else {
+            let window = args.sites_window.unwrap_or(DEFAULT_LD_WINDOW);
+            if window == 0 {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "--sites_window must be at least 1",
+                )));
+            }
+            if window % 2 == 0 {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "--sites_window must be an odd number",
+                )));
+            }
+            Some(LdWindow::Sites(window))
+        }
+    } else {
+        None
+    };
+
+    map_cli::run(map_cli::MapCommand::Fit {
+        genotype_path: args.genotype_path,
+        variant_list: args.list,
+        components: args.components,
+        ld: ld_window,
+    })
+    .map_err(|err| Box::new(err) as Box<dyn std::error::Error>)
+}
+
+#[cfg(feature = "map")]
+fn run_map_project(args: ProjectArgs) -> Result<(), Box<dyn std::error::Error>> {
+    map_cli::run(map_cli::MapCommand::Project {
+        genotype_path: args.genotype_path,
+        model: args.model,
+        output_manifest: args.output_manifest,
+    })
+    .map_err(|err| Box::new(err) as Box<dyn std::error::Error>)
+}
+
+#[cfg(feature = "terms")]
+fn run_terms(args: TermsArgs) -> Result<(), Box<dyn std::error::Error>> {
+    if !args.sex {
+        return Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "No term inference selected. Use --sex to run sex inference.",
+        )));
+    }
+
+    let output_path = infer_sex_to_tsv(&args.genotype_path, None)
+        .map_err(|err| Box::new(err) as Box<dyn std::error::Error>)?;
+    println!("Sex inference results written to {}", output_path.display());
+    Ok(())
+}
+
+#[cfg(feature = "calibrate")]
+fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
     match args.model_family {
         ModelFamilyCli::Gam => {
             if has_survival_columns(&args.training_data)? {
@@ -224,6 +597,7 @@ pub fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[cfg(feature = "calibrate")]
 fn train_survival_from_args(args: &TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "Loading survival training data from: {}",
@@ -293,27 +667,24 @@ fn train_survival_from_args(args: &TrainArgs) -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
-pub fn infer(args: InferArgs) -> Result<(), Box<dyn std::error::Error>> {
+#[cfg(feature = "calibrate")]
+fn infer(args: InferArgs) -> Result<(), Box<dyn std::error::Error>> {
     println!("Loading model from: {}", args.model);
 
-    // Load trained model
     let model = TrainedModel::load(&args.model)?;
     let num_pcs = model.config.pc_configs.len();
     println!("Model expects {num_pcs} PCs");
 
     match &model.config.model_family {
         ModelFamily::Gam(link_function) => {
-            // Load test data
             println!("Loading test data from: {}", args.test_data);
             let data = load_prediction_data(&args.test_data, num_pcs)?;
             println!("Loaded {} samples for prediction", data.p.len());
 
-            // Make detailed predictions
             println!("Generating predictions with diagnostics...");
             let (eta, mean, signed_dist, se_eta_opt) =
                 model.predict_detailed(data.p.view(), data.sex.view(), data.pcs.view())?;
 
-            // Save predictions with required columns to hardcoded output path
             let output_path = "predictions.tsv";
             save_predictions_detailed(
                 &data.sample_ids,
@@ -354,25 +725,28 @@ pub fn infer(args: InferArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[cfg(feature = "calibrate")]
 fn detect_link_function(phenotype: &Array1<f64>) -> LinkFunction {
-    let unique_values: HashSet<_> = phenotype.iter().map(|&x| x as i64).collect();
-
+    let unique_values: HashSet<_> = phenotype.iter().map(|&value| value as i64).collect();
     if unique_values.len() == 2 {
-        // Binary case/control data
         LinkFunction::Logit
     } else {
-        // Continuous quantitative trait
         LinkFunction::Identity
     }
 }
 
+#[cfg(feature = "calibrate")]
 fn calculate_range(data: ArrayView1<f64>) -> (f64, f64) {
-    let min_val = data.iter().fold(f64::INFINITY, |a, &b| a.min(b));
-    let max_val = data.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+    let min_val = data
+        .iter()
+        .fold(f64::INFINITY, |acc, &value| acc.min(value));
+    let max_val = data
+        .iter()
+        .fold(f64::NEG_INFINITY, |acc, &value| acc.max(value));
     (min_val, max_val)
 }
 
-/// Write a TSV row, optionally inserting an extra column before the prediction column.
+#[cfg(feature = "calibrate")]
 fn write_tsv_row(
     file: &mut std::fs::File,
     base_fields: &[&dyn std::fmt::Display],
@@ -380,6 +754,7 @@ fn write_tsv_row(
     tail_fields: &[&dyn std::fmt::Display],
 ) -> Result<(), std::io::Error> {
     use std::io::Write;
+
     let mut first = true;
     for field in base_fields {
         if !first {
@@ -388,8 +763,8 @@ fn write_tsv_row(
         write!(file, "{field}")?;
         first = false;
     }
-    if let Some(uncal) = uncalibrated {
-        write!(file, "\t{uncal}")?;
+    if let Some(uncalibrated_value) = uncalibrated {
+        write!(file, "\t{uncalibrated_value}")?;
     }
     for field in tail_fields {
         write!(file, "\t{field}")?;
@@ -398,18 +773,20 @@ fn write_tsv_row(
     Ok(())
 }
 
+#[cfg(feature = "calibrate")]
 fn se_and_ci(
     se_eta_opt: Option<&Array1<f64>>,
-    i: usize,
-    eta_i: f64,
+    index: usize,
+    eta_value: f64,
     link: LinkFunction,
 ) -> (String, String, String) {
     let Some(se_eta) = se_eta_opt else {
         return ("NA".to_string(), "NA".to_string(), "NA".to_string());
     };
-    let se = se_eta[i];
-    let lo_eta = eta_i - 1.959964 * se;
-    let hi_eta = eta_i + 1.959964 * se;
+
+    let se = se_eta[index];
+    let lo_eta = eta_value - 1.959964 * se;
+    let hi_eta = eta_value + 1.959964 * se;
     match link {
         LinkFunction::Identity => (se.to_string(), lo_eta.to_string(), hi_eta.to_string()),
         LinkFunction::Logit => {
@@ -438,6 +815,7 @@ fn se_and_ci(
     }
 }
 
+#[cfg(feature = "calibrate")]
 fn save_predictions_detailed(
     sample_ids: &[String],
     signed_distance: &Array1<f64>,
@@ -452,7 +830,6 @@ fn save_predictions_detailed(
     let mut file = std::fs::File::create(output_path)?;
     let is_binary = !matches!(link, LinkFunction::Identity);
 
-    // Write header
     if is_binary {
         writeln!(
             file,
@@ -465,13 +842,12 @@ fn save_predictions_detailed(
         )?;
     }
 
-    // Write rows
-    for i in 0..eta.len() {
-        let prediction = mean[i];
+    for index in 0..eta.len() {
+        let prediction = mean[index];
         let (se_str, lo_str, hi_str) = se_and_ci(
             se_eta_opt,
-            i,
-            if is_binary { eta[i] } else { prediction },
+            index,
+            if is_binary { eta[index] } else { prediction },
             link,
         );
 
@@ -479,9 +855,9 @@ fn save_predictions_detailed(
             write_tsv_row(
                 &mut file,
                 &[
-                    &sample_ids[i] as &dyn std::fmt::Display,
-                    &signed_distance[i],
-                    &eta[i],
+                    &sample_ids[index] as &dyn std::fmt::Display,
+                    &signed_distance[index],
+                    &eta[index],
                     &se_str,
                 ],
                 None,
@@ -491,17 +867,19 @@ fn save_predictions_detailed(
             write_tsv_row(
                 &mut file,
                 &[
-                    &sample_ids[i] as &dyn std::fmt::Display,
-                    &signed_distance[i],
+                    &sample_ids[index] as &dyn std::fmt::Display,
+                    &signed_distance[index],
                 ],
                 None,
                 &[&prediction, &se_str, &lo_str, &hi_str],
             )?;
         }
     }
+
     Ok(())
 }
 
+#[cfg(feature = "calibrate")]
 fn save_survival_predictions(
     output_path: &str,
     data: &SurvivalPredictionData,
@@ -515,26 +893,26 @@ fn save_survival_predictions(
         "sample_id\tage_entry\tage_exit\tcumulative_hazard_entry\tcumulative_hazard_exit\tcumulative_incidence_entry\tcumulative_incidence_exit\tconditional_risk\tlogit_risk\tlogit_risk_standard_error"
     )?;
 
-    for idx in 0..prediction.conditional_risk.len() {
-        let sample_id = (idx + 1).to_string();
+    for index in 0..prediction.conditional_risk.len() {
+        let sample_id = (index + 1).to_string();
         let se = prediction
             .logit_risk_se
             .as_ref()
-            .map(|a| a[idx].to_string())
+            .map(|values| values[index].to_string())
             .unwrap_or_else(|| "NA".to_string());
 
         write_tsv_row(
             &mut file,
             &[
                 &sample_id as &dyn std::fmt::Display,
-                &data.age_entry[idx],
-                &data.age_exit[idx],
-                &prediction.cumulative_hazard_entry[idx],
-                &prediction.cumulative_hazard_exit[idx],
-                &prediction.cumulative_incidence_entry[idx],
-                &prediction.cumulative_incidence_exit[idx],
-                &prediction.conditional_risk[idx],
-                &prediction.logit_risk[idx],
+                &data.age_entry[index],
+                &data.age_exit[index],
+                &prediction.cumulative_hazard_entry[index],
+                &prediction.cumulative_hazard_exit[index],
+                &prediction.cumulative_incidence_entry[index],
+                &prediction.cumulative_incidence_exit[index],
+                &prediction.conditional_risk[index],
+                &prediction.logit_risk[index],
                 &se,
             ],
             None,
@@ -545,171 +923,12 @@ fn save_survival_predictions(
     Ok(())
 }
 
-// Import score functionality
-#[path = "../score/main.rs"]
-mod score_main;
-
-#[derive(Parser)]
-#[command(
-    name = "gnomon",
-    about = "High-performance polygenic score calculation and calibration toolkit",
-    long_about = "A comprehensive toolkit for calculating polygenic scores from genotype data \
-                 and training GAM models for score calibration."
-)]
-struct Cli {
-    #[command(subcommand)]
-    command: Option<Commands>,
-}
-
-#[derive(Subcommand)]
-enum Commands {
-    /// Calculate polygenic scores from genotype data
-    #[command(about = "Calculate raw polygenic scores")]
-    Score {
-        /// Path to score file or directory containing score files
-        #[arg(value_name = "SCORE_PATH")]
-        score: PathBuf,
-
-        /// Path to genotype data (PLINK .bed/.bim/.fam prefix, VCF, BCF, or DTC text file)
-        #[arg(value_name = "GENOTYPE_PATH")]
-        input_path: PathBuf,
-
-        /// Path to file containing list of individual IDs to include (optional)
-        #[arg(long)]
-        keep: Option<PathBuf>,
-
-        /// Reference genome FASTA (optional; auto-downloaded if not provided)
-        #[arg(long)]
-        reference: Option<PathBuf>,
-
-        /// Force genome build (37 or 38); auto-detected if not provided
-        #[arg(long)]
-        build: Option<String>,
-
-        /// Reference panel VCF for strand harmonization (flips alleles to match panel)
-        #[arg(long)]
-        panel: Option<PathBuf>,
-    },
-
-    /// Fit an HWE PCA model from the provided genotype dataset
-    #[command(about = "Fit an HWE PCA model")]
-    Fit {
-        /// Path to PLINK .bed file or directory containing .bed files
-        #[arg(value_name = "GENOTYPE_PATH")]
-        genotype_path: PathBuf,
-
-        /// Optional variant list limiting SNVs used for PCA fitting
-        #[arg(long, value_name = "PATH")]
-        list: Option<PathBuf>,
-
-        /// Number of principal components to retain when fitting the HWE PCA model
-        #[arg(long, value_name = "N")]
-        components: usize,
-
-        /// Enable LD normalization when fitting the PCA model
-        #[arg(long)]
-        ld: bool,
-
-        /// LD window expressed as the number of sites (must be odd)
-        #[arg(
-            long = "sites_window",
-            value_name = "SITES",
-            requires = "ld",
-            conflicts_with = "bp_window"
-        )]
-        sites_window: Option<usize>,
-
-        /// LD window expressed as the total span in base pairs
-        #[arg(
-            long = "bp_window",
-            value_name = "BP",
-            requires = "ld",
-            conflicts_with = "sites_window"
-        )]
-        bp_window: Option<u64>,
-    },
-
-    /// Project samples using an existing HWE PCA model
-    #[command(about = "Project samples using an existing HWE PCA model")]
-    Project {
-        /// Path to PLINK .bed file or directory containing .bed files
-        #[arg(value_name = "GENOTYPE_PATH")]
-        genotype_path: PathBuf,
-
-        /// Use a built-in pre-trained model (downloads from GitHub if needed)
-        /// Available models: hwe_1kg_hgdp_gsa_v2, hwe_1kg_hgdp_gsa_v3, hwe_1kg_hgdp_gda_v1, hwe_1kg_hgdp_intersection
-        #[arg(long, value_name = "MODEL_NAME")]
-        model: Option<String>,
-
-        /// Write a JSON manifest describing the exact projection outputs that were created
-        #[arg(long, value_name = "PATH")]
-        output_manifest: Option<PathBuf>,
-    },
-
-    /// Infer sample-level terms from genotype data
-    #[command(about = "Infer sample metadata terms (outputs: sex.tsv)")]
-    Terms(TermsArgs),
-
-    /// Train a GAM calibration model from training data
-    #[command(about = "Train GAM calibration model (outputs: model.toml)")]
-    Train(TrainArgs),
-
-    /// Apply trained calibration model to new data
-    #[command(about = "Apply calibration model to new data (outputs: predictions.tsv)")]
-    Infer(InferArgs),
-
-    /// Display version and build information
-    #[command(about = "Display version and build information")]
-    Version,
-}
-
-fn main() {
-    let cli = Cli::parse();
-    let Cli { command } = cli;
-
-    let result = match command {
-        Some(Commands::Score {
-            score,
-            input_path,
-            keep,
-            reference,
-            build,
-            panel,
-        }) => run_score(input_path, score, keep, reference, build, panel),
-        Some(Commands::Fit {
-            genotype_path,
-            list,
-            components,
-            ld,
-            sites_window,
-            bp_window,
-        }) => run_map_fit(genotype_path, list, components, ld, sites_window, bp_window),
-        Some(Commands::Project {
-            genotype_path,
-            model,
-            output_manifest,
-        }) => run_map_project(genotype_path, model, output_manifest),
-        Some(Commands::Terms(args)) => run_terms(args),
-        Some(Commands::Train(args)) => train(args),
-        Some(Commands::Infer(args)) => infer(args),
-        Some(Commands::Version) => {
-            print_version_info();
-            Ok(())
-        }
-        None => {
-            Cli::command().print_help().expect("print help");
-            println!();
-            Ok(())
-        }
-    };
-
-    if let Err(e) = result {
-        eprintln!("Error: {e}");
-        process::exit(1);
-    }
-}
-
-/// Format seconds into a human-readable duration like "2.4 hours ago"
+#[cfg(all(
+    feature = "map",
+    feature = "score",
+    feature = "calibrate",
+    feature = "terms"
+))]
 fn format_duration_ago(seconds: u64) -> String {
     const UNITS: &[(u64, &str)] = &[
         (365 * 24 * 3600, "years"),
@@ -719,6 +938,7 @@ fn format_duration_ago(seconds: u64) -> String {
         (3600, "hours"),
         (60, "minutes"),
     ];
+
     for &(threshold, label) in UNITS {
         if seconds >= threshold {
             return format!("{:.1} {label} ago", seconds as f64 / threshold as f64);
@@ -727,109 +947,34 @@ fn format_duration_ago(seconds: u64) -> String {
     format!("{seconds} seconds ago")
 }
 
+#[cfg(all(
+    feature = "map",
+    feature = "score",
+    feature = "calibrate",
+    feature = "terms"
+))]
 fn print_version_info() {
     let version = env!("CARGO_PKG_VERSION");
     let release_tag = option_env!("GNOMON_RELEASE_TAG");
     let build_timestamp: u64 = env!("GNOMON_BUILD_TIMESTAMP").parse().unwrap_or(0);
 
-    println!("gnomon {}", version);
+    println!("gnomon {version}");
 
     match release_tag {
-        Some(tag) => println!("Release: {}", tag),
+        Some(tag) => println!("Release: {tag}"),
         None => println!("Release: development build"),
     }
 
     if build_timestamp > 0 {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
+            .map(|duration| duration.as_secs())
             .unwrap_or(0);
 
         if now > build_timestamp {
-            let age = now - build_timestamp;
-            println!("Built: {}", format_duration_ago(age));
+            println!("Built: {}", format_duration_ago(now - build_timestamp));
         } else {
             println!("Built: just now");
         }
     }
-}
-
-fn run_map_fit(
-    genotype_path: PathBuf,
-    list: Option<PathBuf>,
-    components: usize,
-    ld: bool,
-    sites_window: Option<usize>,
-    bp_window: Option<u64>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let ld_window = if ld {
-        if let Some(bp) = bp_window {
-            Some(LdWindow::BasePairs(bp))
-        } else {
-            let window = sites_window.unwrap_or(DEFAULT_LD_WINDOW);
-            if window == 0 {
-                return Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "--sites_window must be at least 1",
-                )));
-            }
-            if window % 2 == 0 {
-                return Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "--sites_window must be an odd number",
-                )));
-            }
-            Some(LdWindow::Sites(window))
-        }
-    } else {
-        None
-    };
-
-    map_cli::run(map_cli::MapCommand::Fit {
-        genotype_path,
-        variant_list: list,
-        components,
-        ld: ld_window,
-    })
-    .map_err(|err| Box::new(err) as Box<dyn std::error::Error>)
-}
-
-fn run_map_project(
-    genotype_path: PathBuf,
-    model: Option<String>,
-    output_manifest: Option<PathBuf>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    map_cli::run(map_cli::MapCommand::Project {
-        genotype_path,
-        model,
-        output_manifest,
-    })
-    .map_err(|err| Box::new(err) as Box<dyn std::error::Error>)
-}
-
-fn run_terms(args: TermsArgs) -> Result<(), Box<dyn std::error::Error>> {
-    if !args.sex {
-        return Err(Box::new(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "No term inference selected. Use --sex to run sex inference.",
-        )));
-    }
-
-    let output_path = infer_sex_to_tsv(&args.genotype_path, None)
-        .map_err(|err| Box::new(err) as Box<dyn std::error::Error>)?;
-    println!("Sex inference results written to {}", output_path.display());
-    Ok(())
-}
-
-fn run_score(
-    input_path: PathBuf,
-    score: PathBuf,
-    keep: Option<PathBuf>,
-    reference: Option<PathBuf>,
-    build: Option<String>,
-    panel: Option<PathBuf>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Call the score calculation logic directly
-    score_main::run_gnomon_with_args(input_path, score, keep, reference, build, panel)
-        .map_err(|e| e as Box<dyn std::error::Error>)
 }
