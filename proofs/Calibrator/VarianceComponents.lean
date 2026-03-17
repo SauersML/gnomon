@@ -252,15 +252,32 @@ on LD and population structure assumptions.
 
 section GREML
 
+/-- Models the GREML estimate when the GRM captures both true additive variance
+    and variance due to LD differences. -/
+noncomputable def gremlLDEstimate (V_A V_LD V_P : ℝ) : ℝ :=
+  (V_A + V_LD) / V_P
+
+/-- The true SNP heritability. -/
+noncomputable def trueSNPHeritability (V_A V_P : ℝ) : ℝ :=
+  V_A / V_P
+
 /-- **GREML h² estimate depends on LD structure.**
     GREML estimates h²_SNP = trace(GRM⁻¹ × Σ_pheno) / n.
-    When LD differs between training and evaluation, the estimate is biased. -/
+    When LD differs between training and evaluation (V_LD ≠ 0),
+    the GREML estimate is biased. -/
 theorem greml_ld_sensitive
-    (h2_estimated h2_true ld_bias : ℝ)
-    (h_bias : h2_estimated = h2_true + ld_bias)
-    (h_ld_nonzero : ld_bias ≠ 0) :
-    h2_estimated ≠ h2_true := by
-  rw [h_bias]; intro h; apply h_ld_nonzero; linarith
+    (V_A V_LD V_P : ℝ)
+    (h_VP_pos : 0 < V_P)
+    (h_VLD_nonzero : V_LD ≠ 0) :
+    gremlLDEstimate V_A V_LD V_P ≠ trueSNPHeritability V_A V_P := by
+  unfold gremlLDEstimate trueSNPHeritability
+  intro h
+  have h_mul : V_A + V_LD = V_A := by
+    have h_eq : (V_A + V_LD) / V_P * V_P = V_A / V_P * V_P := by rw [h]
+    have hp : V_P ≠ 0 := ne_of_gt h_VP_pos
+    rwa [div_mul_cancel₀ (V_A + V_LD) hp, div_mul_cancel₀ V_A hp] at h_eq
+  apply h_VLD_nonzero
+  linarith
 
 /-- **GREML underestimates h² when causal variants are poorly tagged.**
     The true SNP heritability is `V_A / V_P`, while GREML only captures
