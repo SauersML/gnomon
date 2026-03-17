@@ -81,23 +81,32 @@ theorem disparity_increases_with_distance
     it adds benefit α × R²_eur to that group. The underserved group
     gets no PGS benefit, so the pre-existing disparity d₀ ≥ 0 grows
     to d₀ + α × R²_eur. -/
+noncomputable def postDeploymentDisparity (d₀ α r2_eur : ℝ) : ℝ :=
+  d₀ + α * r2_eur
+
 theorem deployment_amplifies_disparity
     (d₀ α r2_eur : ℝ)
-    (h_nn : 0 ≤ d₀)
     (h_α : 0 < α) (h_r2 : 0 < r2_eur) :
-    d₀ < d₀ + α * r2_eur := by
-  linarith [mul_pos h_α h_r2]
+    d₀ < postDeploymentDisparity d₀ α r2_eur := by
+  unfold postDeploymentDisparity
+  have h_gain : 0 < α * r2_eur := mul_pos h_α h_r2
+  linarith
 
 /-- **QALY gap from portability.**
     QALYs gained = γ × R² for a positive constant γ (QALYs per unit R²).
     The QALY gap between two populations is γ × (R²₁ - R²₂), which is
     positive when R²₁ > R²₂. Derived from the model, not assumed. -/
+noncomputable def qalyGap (γ r2₁ r2₂ : ℝ) : ℝ :=
+  γ * r2₁ - γ * r2₂
+
 theorem qaly_gap_proportional_to_r2_gap
     (γ r2₁ r2₂ : ℝ)
     (h_γ : 0 < γ) (h_gap : r2₂ < r2₁) :
-    0 < γ * r2₁ - γ * r2₂ := by
-  have : r2₁ - r2₂ > 0 := by linarith
-  nlinarith
+    0 < qalyGap γ r2₁ r2₂ := by
+  unfold qalyGap
+  have h_diff : 0 < r2₁ - r2₂ := sub_pos.mpr h_gap
+  calc 0 < γ * (r2₁ - r2₂) := mul_pos h_γ h_diff
+       _ = γ * r2₁ - γ * r2₂ := by ring
 
 end HealthDisparity
 

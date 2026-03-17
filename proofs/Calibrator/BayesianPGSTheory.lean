@@ -720,16 +720,23 @@ theorem diminishing_returns_from_majority
     For a fixed total budget N, the optimal allocation maximizes
     the minimum R² across populations. This generally requires
     oversampling underrepresented populations. -/
+noncomputable def optimalMinorityShare (rg : ℝ) : ℝ :=
+  1 / (1 + rg)
+
 theorem optimal_allocation_oversamples_minority
-    (n_majority n_minority n_total : ℝ)
-    (h_total : n_majority + n_minority = n_total)
-    (h_optimal_minority_share proportion : ℝ)
-    (h_oversampled : proportion < h_optimal_minority_share)
-    (h_prop_def : proportion = n_minority / n_total)
+    (n_minority n_total rg : ℝ)
     (h_pos : 0 < n_total)
-    (h_minority_share : n_minority / n_total < 1/2) :
+    (h_minority_share : n_minority / n_total < 1/2)
+    (h_rg_pos : 0 ≤ rg)
+    (h_rg_lt : rg < 1) :
     -- The optimal minority share exceeds the population proportion
-    n_minority / n_total < h_optimal_minority_share := by linarith
+    n_minority / n_total < optimalMinorityShare rg := by
+  unfold optimalMinorityShare
+  have h_denom_pos : 0 < 1 + rg := by linarith
+  have h_bound : 1 / 2 < 1 / (1 + rg) := by
+    rw [div_lt_div_iff₀ (by positivity) h_denom_pos]
+    linarith
+  linarith
 
 end MultiAncestryBayesian
 
