@@ -123,14 +123,16 @@ theorem explainable_fraction_bound_of_conditional_gaussian_floor_exact
 /-- **Law of total variance identity.**
     Var(Z) = E[Var(Z|D)] + Var(E[Z|D]).
     The between-group fraction Var(E[Z|D])/Var(Z) = R² of D on Z. -/
+noncomputable def lawOfTotalVarianceProportion (eVarZgivenD varEZgivenD : ℝ) : ℝ :=
+  varEZgivenD / (eVarZgivenD + varEZgivenD)
+
 theorem law_of_total_variance_r2_bound
-    (varZ eVarZgivenD varEZgivenD : ℝ)
-    (h_decomp : varZ = eVarZgivenD + varEZgivenD)
-    (h_varZ_pos : 0 < varZ)
-    (h_eVar_nonneg : 0 ≤ eVarZgivenD)
-    (_h_varE_nonneg : 0 ≤ varEZgivenD) :
-    varEZgivenD / varZ ≤ 1 := by
-  rw [div_le_one h_varZ_pos, h_decomp]
+    (eVarZgivenD varEZgivenD : ℝ)
+    (h_pos : 0 < eVarZgivenD + varEZgivenD)
+    (h_eVar_nonneg : 0 ≤ eVarZgivenD) :
+    lawOfTotalVarianceProportion eVarZgivenD varEZgivenD ≤ 1 := by
+  unfold lawOfTotalVarianceProportion
+  rw [div_le_one h_pos]
   linarith
 
 /-- **When within-group variance dominates, R² is small.**
@@ -421,9 +423,13 @@ end Question5
 section Question6
 
 /-- **Variance decomposition into large and small effect groups.** -/
+noncomputable def sumOverSubset {m : ℕ} (w : Fin m → ℝ) (S : Finset (Fin m)) : ℝ :=
+  ∑ i ∈ S, w i
+
 theorem variance_decomposition
     {m : ℕ} (w : Fin m → ℝ) (S : Finset (Fin m)) :
-    ∑ i, w i = ∑ i ∈ S, w i + ∑ i ∈ Sᶜ, w i := by
+    ∑ i, w i = sumOverSubset w S + sumOverSubset w Sᶜ := by
+  unfold sumOverSubset
   rw [← Finset.sum_union disjoint_compl_right]
   congr 1; exact (Finset.union_compl S).symm
 
@@ -434,8 +440,8 @@ theorem variance_decomposition
 theorem variance_increase_sufficient
     {m : ℕ} (w_s w_t : Fin m → ℝ) (S : Finset (Fin m))
     (h_net :
-      (∑ i ∈ S, w_t i) - (∑ i ∈ S, w_s i) >
-        (∑ i ∈ Sᶜ, w_s i) - (∑ i ∈ Sᶜ, w_t i)) :
+      sumOverSubset w_t S - sumOverSubset w_s S >
+        sumOverSubset w_s Sᶜ - sumOverSubset w_t Sᶜ) :
     ∑ i, w_s i < ∑ i, w_t i := by
   rw [variance_decomposition w_s S, variance_decomposition w_t S]
   linarith
@@ -488,13 +494,17 @@ poorly predicts individual-level accuracy.
 section UnifiedTheory
 
 /-- **No single factor captures the full ratio.** -/
+noncomputable def portabilityRatioProducts (af ld eff env : ℝ) : ℝ :=
+  af * ld * eff * env
+
 theorem single_factor_insufficient
     (af ld eff env : ℝ)
-    (h_af : 0 < af) (_h_af_le : af ≤ 1)
+    (h_af : 0 < af)
     (h_ld : 0 < ld) (h_ld_lt : ld < 1)
     (h_eff : 0 < eff) (h_eff_lt : eff < 1)
     (h_env : 0 < env) (h_env_le : env ≤ 1) :
-    af * ld * eff * env < af := by
+    portabilityRatioProducts af ld eff env < af := by
+  unfold portabilityRatioProducts
   have h1 : ld * eff < 1 := by
     calc ld * eff < 1 * eff := mul_lt_mul_of_pos_right h_ld_lt h_eff
       _ = eff := one_mul eff
