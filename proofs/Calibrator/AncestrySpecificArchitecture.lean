@@ -283,6 +283,10 @@ theorem gene_shared_variants_specific
   rw [div_lt_one (by linarith)]
   linarith
 
+/-- Total number of distinct signals at a locus across two populations. -/
+noncomputable def conditionalYield (n_signals_eur n_signals_afr n_shared : ℕ) : ℕ :=
+  n_signals_eur + n_signals_afr - n_shared
+
 /-- **Conditional analysis reveals heterogeneity.**
     Running conditional analysis (adjusting for lead SNP)
     may reveal secondary signals. If secondary signals are
@@ -300,12 +304,12 @@ theorem gene_shared_variants_specific
 theorem conditional_reveals_heterogeneity
     (n_signals_eur n_signals_afr n_shared : ℕ)
     (h_eur : 0 < n_signals_eur) (h_afr : 0 < n_signals_afr)
-    (h_some_shared : 0 < n_shared)
-    (h_shared_le_eur : n_shared ≤ n_signals_eur)
-    (h_shared_le_afr : n_shared ≤ n_signals_afr) :
+    (h_not_all_shared_eur : n_shared < n_signals_eur)
+    (h_not_all_shared_afr : n_shared < n_signals_afr) :
     -- The union of distinct signals exceeds either population alone
-    n_signals_eur ≤ n_signals_eur + n_signals_afr - n_shared ∧
-    n_signals_afr ≤ n_signals_eur + n_signals_afr - n_shared := by
+    n_signals_eur < conditionalYield n_signals_eur n_signals_afr n_shared ∧
+    n_signals_afr < conditionalYield n_signals_eur n_signals_afr n_shared := by
+  unfold conditionalYield
   omega
 
 end AllelicHeterogeneity

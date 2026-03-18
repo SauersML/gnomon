@@ -322,6 +322,10 @@ section DetectingAdaptation
     Tests whether the variance of trait-associated allele frequencies
     exceeds neutral expectation, accounting for population structure. -/
 
+/-- True adaptation signal after removing stratification bias. -/
+noncomputable def trueAdaptationSignal (signal_raw strat_bias : ℝ) : ℝ :=
+  signal_raw - strat_bias
+
 /-- **The height adaptation signal partially confounded.**
     Sohail et al. (2019) showed that much of the apparent height
     adaptation signal was due to residual stratification in UKBiobank.
@@ -331,8 +335,13 @@ theorem stratification_reduces_adaptation_signal
     (h_raw_pos : 0 < signal_raw) (h_bias_pos : 0 < strat_bias)
     (h_partial : strat_bias < signal_raw) :
     -- After removing stratification bias, signal is reduced but not eliminated
-    0 < signal_raw - strat_bias ∧ signal_raw - strat_bias < signal_raw := by
+    0 < trueAdaptationSignal signal_raw strat_bias ∧ trueAdaptationSignal signal_raw strat_bias < signal_raw := by
+  unfold trueAdaptationSignal
   exact ⟨by linarith, by linarith⟩
+
+/-- Portability loss bias from confounding. -/
+noncomputable def confoundingPortabilityBias (port_true port_apparent : ℝ) : ℝ :=
+  port_true - port_apparent
 
 /-- **Implications for portability.**
     If apparent adaptation is actually stratification:
@@ -342,7 +351,13 @@ theorem stratification_reduces_adaptation_signal
 theorem confounding_overestimates_portability_loss
     (port_apparent port_true : ℝ)
     (h_overestimated : port_apparent < port_true) :
-    0 < port_true - port_apparent := by linarith
+    0 < confoundingPortabilityBias port_true port_apparent := by
+  unfold confoundingPortabilityBias
+  linarith
+
+/-- Portability divergence between pleiotropically linked traits. -/
+noncomputable def pleiotropicPortabilityDivergence (port_trait1 port_trait2 : ℝ) : ℝ :=
+  |port_trait1 - port_trait2|
 
 /-- **Multi-trait adaptation.**
     Selection on one trait affects correlated traits via pleiotropy.
@@ -350,9 +365,11 @@ theorem confounding_overestimates_portability_loss
     This creates correlated portability patterns across traits. -/
 theorem pleiotropic_adaptation_correlates_portability
     (port_trait1 port_trait2 rg lb : ℝ)
-    (h_correlated : |port_trait1 - port_trait2| ≤ 2 * (1 - |rg|))
+    (h_correlated : pleiotropicPortabilityDivergence port_trait1 port_trait2 ≤ 2 * (1 - |rg|))
     (h_rg_high : lb < |rg|) :
-    |port_trait1 - port_trait2| < 2 * (1 - lb) := by linarith
+    pleiotropicPortabilityDivergence port_trait1 port_trait2 < 2 * (1 - lb) := by
+  unfold pleiotropicPortabilityDivergence at *
+  linarith
 
 end DetectingAdaptation
 
