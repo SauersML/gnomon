@@ -326,16 +326,22 @@ theorem collider_attenuates_association (m : ColliderModel) :
     If source and target cohorts have different ascertainment patterns,
     the apparent portability drop includes an ascertainment component. -/
 theorem differential_ascertainment_artifact
-    (r2_source_pop r2_target_pop r2_source_asc r2_target_asc : ℝ)
-    (h_source_asc : r2_source_asc < r2_source_pop)
-    (h_target_asc : r2_target_asc < r2_target_pop)
-    -- Different ascertainment severity
-    (h_diff_severity : r2_target_pop - r2_target_asc < r2_source_pop - r2_source_asc) :
-    -- Apparent portability drop is larger than true portability drop
-    r2_source_asc - r2_target_asc > r2_source_pop - r2_target_pop →
-      False := by
-  intro h
-  linarith
+    (m_source_pop m_target_pop m_source_asc m_target_asc : ColliderModel)
+    (h_source_eq : m_source_asc.β_G = m_source_pop.β_G)
+    (h_target_eq : m_target_asc.β_G = m_target_pop.β_G)
+    -- Both populations have the same true effect in population
+    (h_pop_eq : m_source_pop.β_G = m_target_pop.β_G)
+    -- Differential ascertainment (larger shrinkage in target due to smaller var ratios)
+    (h_diff : m_target_asc.σ2_G / (m_target_asc.σ2_G + m_target_asc.σ2_E) <
+              m_source_asc.σ2_G / (m_source_asc.σ2_G + m_source_asc.σ2_E)) :
+    -- Ascertainment gap implies apparent portability loss
+    m_target_asc.β_selected < m_source_asc.β_selected := by
+  unfold ColliderModel.β_selected
+  have h_eq : m_target_asc.β_G = m_source_asc.β_G := by
+    rw [h_target_eq, ← h_pop_eq, ← h_source_eq]
+  rw [h_eq]
+  have h_pos : 0 < m_source_asc.β_G := m_source_asc.β_G_pos
+  exact mul_lt_mul_of_pos_left h_diff h_pos
 
 end ColliderBias
 
@@ -518,12 +524,17 @@ theorem survivorship_attenuates_in_older (m : SurvivorshipAttenuationModel) :
     If the target population has different age structure or mortality patterns,
     survivorship bias contributes to apparent portability loss. -/
 theorem differential_survivorship_artifact
-    (r2_source_full r2_target_full Δ_surv_source Δ_surv_target : ℝ)
-    (h_surv_s : 0 ≤ Δ_surv_source) (h_surv_t : 0 ≤ Δ_surv_target)
-    (h_diff : Δ_surv_target > Δ_surv_source)
-    (h_obs_s : r2_source_full - Δ_surv_source > 0) :
-    (r2_source_full - Δ_surv_source) - (r2_target_full - Δ_surv_target) >
-      r2_source_full - r2_target_full := by
+    (m_source m_target : SurvivorshipAttenuationModel)
+    (h_r2_eq : m_source.r2_full = m_target.r2_full)
+    (h_diff : m_target.var_surv / m_target.var_birth < m_source.var_surv / m_source.var_birth) :
+    m_source.r2_surv - m_target.r2_surv > m_source.r2_full - m_target.r2_full := by
+  unfold SurvivorshipAttenuationModel.r2_surv
+  rw [h_r2_eq]
+  have h_sub_zero : m_target.r2_full - m_target.r2_full = 0 := sub_self _
+  rw [h_sub_zero]
+  have h_pos : 0 < m_target.r2_full := m_target.r2_full_pos
+  have h_mul_lt : m_target.r2_full * (m_target.var_surv / m_target.var_birth) < m_target.r2_full * (m_source.var_surv / m_source.var_birth) :=
+    mul_lt_mul_of_pos_left h_diff h_pos
   linarith
 
 end SurvivorshipBias
