@@ -108,6 +108,12 @@ theorem cross_ancestry_no_overlap_bias
     partialOverlapR2 r2_true h2 0 n_gwas = r2_true :=
   no_overlap_unbiased r2_true h2 n_gwas
 
+/-- **Apparent Portability Gap.**
+    The observed portability gap when same-ancestry R² is computed
+    on a sample with overlap fraction f. -/
+noncomputable def apparentPortabilityGap (r2_same_true h2 r2_cross f : ℝ) (n_gwas : ℕ) : ℝ :=
+  partialOverlapR2 r2_same_true h2 f n_gwas - r2_cross
+
 /-- **Same-ancestry R² is inflated relative to cross-ancestry.**
     Derived from the overfitting bias formula `partialOverlapR2`:
     same-ancestry R² with overlap fraction f > 0 exceeds true R²,
@@ -120,15 +126,14 @@ theorem apparent_portability_loss_includes_overlap
     (h_f_pos : 0 < f)
     (h_n : 0 < n_gwas)
     (h_real_gap : r2_cross < r2_same_true) :
-    let r2_same_with_overlap := partialOverlapR2 r2_same_true h2 f n_gwas
-    r2_cross < r2_same_with_overlap ∧
-    r2_same_with_overlap - r2_cross > r2_same_true - r2_cross := by
-  simp only
+    r2_cross < partialOverlapR2 r2_same_true h2 f n_gwas ∧
+    apparentPortabilityGap r2_same_true h2 r2_cross f n_gwas > r2_same_true - r2_cross := by
   have h_inflation : r2_same_true < partialOverlapR2 r2_same_true h2 f n_gwas := by
     have h0 := no_overlap_unbiased r2_same_true h2 n_gwas
     have hlt := more_overlap_more_inflation r2_same_true h2 0 f n_gwas h_h2 h_n h_f_pos
     rw [h0] at hlt
     exact hlt
+  unfold apparentPortabilityGap
   constructor
   · linarith
   · linarith
