@@ -1,0 +1,43 @@
+diff --git a/proofs/Calibrator/AncestryCalibration.lean b/proofs/Calibrator/AncestryCalibration.lean
+index 8e91f0b..d9402d7 100644
+--- a/proofs/Calibrator/AncestryCalibration.lean
++++ b/proofs/Calibrator/AncestryCalibration.lean
+@@ -42,23 +42,29 @@ theorem recalibration_slope_under_drift
+     ρ * (b_source * α) / (α ^ 2) = ρ * b_source / α := by
+   field_simp
+ 
++/-- **Recalibrated R².**
++    Proportion of variance explained after optimal recalibration,
++    given by the source R² multiplied by the squared effect correlation. -/
++noncomputable def recalibratedR2 (r2_source ρ_sq : ℝ) : ℝ :=
++  r2_source * ρ_sq
++
++/-- **Turnover Loss R².**
++    Non-recoverable R² loss due to effect turnover (changes in causal variants). -/
++noncomputable def turnoverLossR2 (r2_source ρ_sq : ℝ) : ℝ :=
++  r2_source * (1 - ρ_sq)
++
+ /-- **Recalibration recovers R² up to effect turnover limit.**
+     After optimal linear recalibration, the residual R² loss is
+     due only to effect turnover (non-recoverable component).
+ 
+-    Model: recalibrated R² = r2_source × ρ² (proportion of variance
+-    explained after drift attenuates effects by squared correlation ρ²).
+-    The turnover loss = r2_source × (1 - ρ²) is the non-recoverable part.
+-    These two components sum to r2_source by algebraic decomposition:
+-      r2_source × ρ² + r2_source × (1 - ρ²) = r2_source × (ρ² + 1 - ρ²) = r2_source. -/
++    The total source R² decomposes perfectly into the recalibrated R²
++    and the turnover loss. -/
+ theorem recalibration_recovers_up_to_turnover
+     (r2_source ρ_sq : ℝ)
+     (h_ρ : 0 ≤ ρ_sq) (h_ρ_le : ρ_sq ≤ 1)
+     (h_r2 : 0 < r2_source) :
+-    let r2_recalibrated := r2_source * ρ_sq
+-    let r2_loss_turnover := r2_source * (1 - ρ_sq)
+-    r2_recalibrated + r2_loss_turnover = r2_source := by
+-  simp only
++    recalibratedR2 r2_source ρ_sq + turnoverLossR2 r2_source ρ_sq = r2_source := by
++  unfold recalibratedR2 turnoverLossR2
+   ring
+ 
+ /-- **Recalibration cannot exceed oracle R².**
