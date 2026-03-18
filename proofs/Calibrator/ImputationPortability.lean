@@ -177,14 +177,25 @@ difficulty varies dramatically across populations.
 
 section RareVariantImputation
 
+/-- **Imputation performance ratio.**
+    The ratio of imputation r² for rare variants relative to common variants. -/
+noncomputable def imputationR2Ratio (r2_common r2_rare : ℝ) : ℝ :=
+  r2_rare / r2_common
+
 /-- **Imputation r² drops sharply for rare variants.**
     For MAF < 1%, r²_imp is often < 0.5 even with large reference panels.
     This means rare variant PGS components are very noisy. -/
 theorem rare_variant_poor_imputation
     (r2_common r2_rare : ℝ)
-    (h_much_worse : r2_rare < (1 / 2) * r2_common)
-    (h_common_good : 9 / 10 < r2_common) (h_common_le : r2_common ≤ 1) :
-    r2_rare < 1 / 2 := by nlinarith
+    (h_common_pos : 0 < r2_common)
+    (h_much_worse : imputationR2Ratio r2_common r2_rare < 1 / 2)
+    (h_common_le : r2_common ≤ 1) :
+    r2_rare < 1 / 2 := by
+  unfold imputationR2Ratio at h_much_worse
+  have h1 : r2_rare < (1 / 2) * r2_common := (div_lt_iff₀ h_common_pos).mp h_much_worse
+  have h2 : (1 / 2 : ℝ) * r2_common ≤ 1 / 2 := by
+    nlinarith
+  linarith
 
 /-- **Population specificity of rare variant imputation.**
     Rare variants are population-specific → they're only in the
