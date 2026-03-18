@@ -1,0 +1,42 @@
+diff --git a/proofs/Calibrator/AncestryCalibration.lean b/proofs/Calibrator/AncestryCalibration.lean
+index 8e91f0b..59f8032 100644
+--- a/proofs/Calibrator/AncestryCalibration.lean
++++ b/proofs/Calibrator/AncestryCalibration.lean
+@@ -111,12 +111,17 @@ theorem spline_error_improves_with_knots
+     var₂ - var₁ > bias₁² - bias₂² ↔ bias₁² + var₁ < bias₂² + var₂,
+     which is direct rearrangement. The real content is the model
+     decomposition MSE = bias² + variance. -/
++noncomputable def splineMSE (bias var : ℝ) : ℝ :=
++  bias ^ 2 + var
++
+ theorem bias_variance_tradeoff
+     (bias₁ bias₂ var₁ var₂ : ℝ)
+     (h_bias_improves : bias₂ ^ 2 < bias₁ ^ 2)
+     (h_var_worsens : var₁ < var₂)
+     (h_var_dominates : var₂ - var₁ > bias₁ ^ 2 - bias₂ ^ 2) :
+-    bias₁ ^ 2 + var₁ < bias₂ ^ 2 + var₂ := by linarith
++    splineMSE bias₁ var₁ < splineMSE bias₂ var₂ := by
++  unfold splineMSE
++  linarith
+ 
+ /-- **Spline R² is bounded by the signal-to-noise ratio.**
+     R²_spline ≤ Var(E[ε²|d]) / Var(ε²).
+@@ -270,12 +275,17 @@ theorem measurement_invariance_violation
+     Under the liability threshold model, the liability is continuous
+     but observed phenotype is binary. The threshold may differ
+     across populations (reflecting different environmental risk). -/
++noncomputable def liabilityDistanceToThreshold (mean threshold : ℝ) : ℝ :=
++  threshold - mean
++
+ theorem threshold_shift_changes_prevalence
+     (liability_mean₁ liability_mean₂ threshold : ℝ)
+     (h_mean_shift : liability_mean₁ < liability_mean₂) :
+     -- With fixed threshold, higher mean → higher prevalence
+     -- (proportion above threshold increases)
+-    threshold - liability_mean₂ < threshold - liability_mean₁ := by linarith
++    liabilityDistanceToThreshold liability_mean₂ threshold < liabilityDistanceToThreshold liability_mean₁ threshold := by
++  unfold liabilityDistanceToThreshold
++  linarith
+ 
+ /-- **Different prevalence → different R² even with same AUC.**
+     This is a key insight from Wang et al.: R² and AUC can disagree
