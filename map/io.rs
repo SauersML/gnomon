@@ -509,11 +509,56 @@ struct ProjectionMatrixMetadata {
     kind: &'static str,
     layout: &'static str,
     dtype: &'static str,
+    endianness: &'static str,
     rows: usize,
     cols: usize,
     row_order: &'static str,
     row_ids_embedded: bool,
     row_id_field: &'static str,
+    binary_schema: ProjectionBinarySchema,
+}
+
+#[derive(Serialize)]
+struct ProjectionBinarySchema {
+    file_extension: &'static str,
+    total_bytes: usize,
+    matrix_header: ProjectionSectionMetadata,
+    matrix_data: ProjectionSectionMetadata,
+    row_ids: ProjectionRowIdsMetadata,
+}
+
+#[derive(Serialize)]
+struct ProjectionSectionMetadata {
+    byte_offset: usize,
+    byte_length: usize,
+    description: String,
+    fields: Vec<ProjectionFieldMetadata>,
+}
+
+#[derive(Serialize)]
+struct ProjectionFieldMetadata {
+    name: &'static str,
+    byte_offset: usize,
+    byte_length: usize,
+    encoding: &'static str,
+    value: String,
+    description: String,
+}
+
+#[derive(Serialize)]
+struct ProjectionRowIdsMetadata {
+    byte_offset: usize,
+    byte_length: usize,
+    description: String,
+    magic_ascii: &'static str,
+    version: u32,
+    count: usize,
+    offsets_count: usize,
+    string_bytes: usize,
+    header_bytes: usize,
+    header: ProjectionSectionMetadata,
+    offsets_table: ProjectionSectionMetadata,
+    string_table: ProjectionSectionMetadata,
 }
 
 const PROJECTION_MATRIX_MAGIC: &[u8; 8] = b"GNPRJ001";
@@ -573,7 +618,13 @@ impl ProjectionMatrixSink {
             })?;
         self.mmap[row_id_offset..row_id_end].copy_from_slice(&self.row_id_section);
         self.mmap.flush()?;
-        write_projection_metadata(&self.metadata_path, self.rows, self.cols, self.kind)?;
+        write_projection_metadata(
+            &self.metadata_path,
+            self.rows,
+            self.cols,
+            self.kind,
+            &self.row_id_section,
+        )?;
         Ok(self.metadata_path)
     }
 }
@@ -894,7 +945,13 @@ fn write_projection_matrix(
     writer.write_all(row_id_section)?;
     writer.flush()?;
 
-    write_projection_metadata(&metadata_path, matrix.nrows(), matrix.ncols(), kind)?;
+    write_projection_metadata(
+        &metadata_path,
+        matrix.nrows(),
+        matrix.ncols(),
+        kind,
+        row_id_section,
+    )?;
 
     Ok(metadata_path)
 }
@@ -931,18 +988,22 @@ fn write_projection_metadata(
     rows: usize,
     cols: usize,
     kind: &'static str,
+    row_id_section: &[u8],
 ) -> Result<(), DatasetOutputError> {
     prepare_output_path(metadata_path)?;
+    let schema = build_projection_binary_schema(rows, cols, kind, row_id_section)?;
     let metadata = ProjectionMatrixMetadata {
         version: PROJECTION_MATRIX_VERSION,
         kind,
         layout: "column_major",
         dtype: "f64_le",
+        endianness: "little",
         rows,
         cols,
         row_order: "matches the input genotype dataset sample order",
         row_ids_embedded: true,
         row_id_field: "IID",
+        binary_schema: schema,
     };
     let file = File::create(metadata_path)?;
     let mut metadata_writer = BufWriter::new(file);
@@ -957,6 +1018,249 @@ fn projection_matrix_score_bytes(rows: usize, cols: usize) -> Result<usize, Data
         .ok_or_else(|| {
             DatasetOutputError::InvalidState("projection matrix byte count overflow".into())
         })
+}
+
+fn build_projection_binary_schema(
+    rows: usize,
+    cols: usize,
+    kind: &'static str,
+    row_id_section: &[u8],
+) -> Result<ProjectionBinarySchema, DatasetOutputError> {
+    let matrix_bytes = projection_matrix_score_bytes(rows, cols)?;
+    let matrix_data_offset = PROJECTION_MATRIX_HEADER_LEN;
+    let row_id_offset = matrix_data_offset
+        .checked_add(matrix_bytes)
+        .ok_or_else(|| {
+            DatasetOutputError::InvalidState("projection row-id offset overflow".into())
+        })?;
+    let row_ids = parse_projection_row_ids_metadata(row_id_offset, row_id_section)?;
+    let total_bytes = row_id_offset
+        .checked_add(row_id_section.len())
+        .ok_or_else(|| {
+            DatasetOutputError::InvalidState("projection matrix total length overflow".into())
+        })?;
+    let last_value_byte = matrix_bytes
+        .checked_sub(std::mem::size_of::<f64>())
+        .map(|delta| matrix_data_offset + delta);
+    let matrix_value_description = match last_value_byte {
+        Some(last_offset) => format!(
+            "Raw {kind} values as contiguous little-endian f64 numbers in column-major order. Element (row, col) is stored at byte offset {} + ((col * {} + row) * 8). The first element is column 0 row 0 and the last element begins at byte offset {}.",
+            matrix_data_offset, rows, last_offset
+        ),
+        None => format!(
+            "Raw {kind} values as contiguous little-endian f64 numbers in column-major order. The matrix has zero payload bytes because rows * cols == 0."
+        ),
+    };
+    Ok(ProjectionBinarySchema {
+        file_extension: "bin",
+        total_bytes,
+        matrix_header: ProjectionSectionMetadata {
+            byte_offset: 0,
+            byte_length: PROJECTION_MATRIX_HEADER_LEN,
+            description: "Fixed-size projection matrix header. Read this first to validate the file format and matrix dimensions.".to_string(),
+            fields: vec![
+                ProjectionFieldMetadata {
+                    name: "magic",
+                    byte_offset: 0,
+                    byte_length: 8,
+                    encoding: "ascii",
+                    value: String::from_utf8_lossy(PROJECTION_MATRIX_MAGIC).into_owned(),
+                    description: "File signature for gnomon projection matrices.".to_string(),
+                },
+                ProjectionFieldMetadata {
+                    name: "version",
+                    byte_offset: 8,
+                    byte_length: 4,
+                    encoding: "u32_le",
+                    value: PROJECTION_MATRIX_VERSION.to_string(),
+                    description: "Projection matrix format version.".to_string(),
+                },
+                ProjectionFieldMetadata {
+                    name: "rows",
+                    byte_offset: 12,
+                    byte_length: 8,
+                    encoding: "u64_le",
+                    value: rows.to_string(),
+                    description: "Number of matrix rows; this equals the number of projected samples.".to_string(),
+                },
+                ProjectionFieldMetadata {
+                    name: "cols",
+                    byte_offset: 20,
+                    byte_length: 8,
+                    encoding: "u64_le",
+                    value: cols.to_string(),
+                    description: "Number of matrix columns; this equals the number of projected components.".to_string(),
+                },
+                ProjectionFieldMetadata {
+                    name: "reserved",
+                    byte_offset: 28,
+                    byte_length: 4,
+                    encoding: "u32_le",
+                    value: "0".to_string(),
+                    description: "Reserved for future use; current writers always store zero.".to_string(),
+                },
+            ],
+        },
+        matrix_data: ProjectionSectionMetadata {
+            byte_offset: matrix_data_offset,
+            byte_length: matrix_bytes,
+            description: matrix_value_description,
+            fields: vec![
+                ProjectionFieldMetadata {
+                    name: "values",
+                    byte_offset: matrix_data_offset,
+                    byte_length: matrix_bytes,
+                    encoding: "f64_le[column_major]",
+                    value: format!("{} values", rows * cols),
+                    description: format!(
+                        "Dense {kind} matrix payload. Reconstruct shape as (rows, cols) using column-major order."
+                    ),
+                },
+            ],
+        },
+        row_ids,
+    })
+}
+
+fn parse_projection_row_ids_metadata(
+    row_id_offset: usize,
+    row_id_section: &[u8],
+) -> Result<ProjectionRowIdsMetadata, DatasetOutputError> {
+    if row_id_section.len() < PROJECTION_ROW_IDS_HEADER_LEN {
+        return Err(DatasetOutputError::InvalidState(
+            "projection row-id section shorter than header".into(),
+        ));
+    }
+    if &row_id_section[..8] != PROJECTION_ROW_IDS_MAGIC {
+        return Err(DatasetOutputError::InvalidState(
+            "projection row-id section magic mismatch".into(),
+        ));
+    }
+    let version = u32::from_le_bytes(row_id_section[8..12].try_into().map_err(|_| {
+        DatasetOutputError::InvalidState("projection row-id version bytes missing".into())
+    })?);
+    let count = usize::try_from(u64::from_le_bytes(
+        row_id_section[16..24].try_into().map_err(|_| {
+            DatasetOutputError::InvalidState("projection row-id count bytes missing".into())
+        })?,
+    ))
+    .map_err(|_| {
+        DatasetOutputError::InvalidState("projection row-id count exceeds usize".into())
+    })?;
+    let string_bytes = usize::try_from(u64::from_le_bytes(
+        row_id_section[24..32].try_into().map_err(|_| {
+            DatasetOutputError::InvalidState("projection row-id string byte count missing".into())
+        })?,
+    ))
+    .map_err(|_| {
+        DatasetOutputError::InvalidState("projection row-id string byte count exceeds usize".into())
+    })?;
+    let offsets_count = count.checked_add(1).ok_or_else(|| {
+        DatasetOutputError::InvalidState("projection row-id offsets count overflow".into())
+    })?;
+    let offsets_bytes = offsets_count
+        .checked_mul(std::mem::size_of::<u64>())
+        .ok_or_else(|| {
+            DatasetOutputError::InvalidState("projection row-id offsets byte count overflow".into())
+        })?;
+    let expected_len = PROJECTION_ROW_IDS_HEADER_LEN
+        .checked_add(offsets_bytes)
+        .and_then(|len| len.checked_add(string_bytes))
+        .ok_or_else(|| {
+            DatasetOutputError::InvalidState("projection row-id section length overflow".into())
+        })?;
+    if row_id_section.len() != expected_len {
+        return Err(DatasetOutputError::InvalidState(format!(
+            "projection row-id section length mismatch: expected {expected_len}, found {}",
+            row_id_section.len()
+        )));
+    }
+    let offsets_offset = row_id_offset + PROJECTION_ROW_IDS_HEADER_LEN;
+    let string_table_offset = offsets_offset + offsets_bytes;
+    Ok(ProjectionRowIdsMetadata {
+        byte_offset: row_id_offset,
+        byte_length: row_id_section.len(),
+        description: "Embedded row-ID section appended immediately after the numeric matrix payload. It stores one IID per matrix row.".to_string(),
+        magic_ascii: "GNPSID01",
+        version,
+        count,
+        offsets_count,
+        string_bytes,
+        header_bytes: PROJECTION_ROW_IDS_HEADER_LEN,
+        header: ProjectionSectionMetadata {
+            byte_offset: row_id_offset,
+            byte_length: PROJECTION_ROW_IDS_HEADER_LEN,
+            description: "Fixed-size row-ID header describing the appended IID string table.".to_string(),
+            fields: vec![
+                ProjectionFieldMetadata {
+                    name: "magic",
+                    byte_offset: row_id_offset,
+                    byte_length: 8,
+                    encoding: "ascii",
+                    value: "GNPSID01".to_string(),
+                    description: "File signature for the embedded row-ID section.".to_string(),
+                },
+                ProjectionFieldMetadata {
+                    name: "version",
+                    byte_offset: row_id_offset + 8,
+                    byte_length: 4,
+                    encoding: "u32_le",
+                    value: version.to_string(),
+                    description: "Row-ID section format version.".to_string(),
+                },
+                ProjectionFieldMetadata {
+                    name: "reserved",
+                    byte_offset: row_id_offset + 12,
+                    byte_length: 4,
+                    encoding: "u32_le",
+                    value: "0".to_string(),
+                    description: "Reserved for future use; current writers always store zero.".to_string(),
+                },
+                ProjectionFieldMetadata {
+                    name: "count",
+                    byte_offset: row_id_offset + 16,
+                    byte_length: 8,
+                    encoding: "u64_le",
+                    value: count.to_string(),
+                    description: "Number of embedded row IDs; this should equal `rows`.".to_string(),
+                },
+                ProjectionFieldMetadata {
+                    name: "string_bytes",
+                    byte_offset: row_id_offset + 24,
+                    byte_length: 8,
+                    encoding: "u64_le",
+                    value: string_bytes.to_string(),
+                    description: "Total byte length of the concatenated UTF-8 row-ID string table.".to_string(),
+                },
+            ],
+        },
+        offsets_table: ProjectionSectionMetadata {
+            byte_offset: offsets_offset,
+            byte_length: offsets_bytes,
+            description: "Little-endian u64 offsets into the row-ID UTF-8 string table. Length is count + 1 so each row ID can be sliced as [offsets[i], offsets[i + 1]).".to_string(),
+            fields: vec![ProjectionFieldMetadata {
+                name: "offsets",
+                byte_offset: offsets_offset,
+                byte_length: offsets_bytes,
+                encoding: "u64_le[count+1]",
+                value: format!("{offsets_count} offsets"),
+                description: "Offsets into the concatenated row-ID string table.".to_string(),
+            }],
+        },
+        string_table: ProjectionSectionMetadata {
+            byte_offset: string_table_offset,
+            byte_length: string_bytes,
+            description: "Concatenated UTF-8 bytes for every row ID with no separators or terminators.".to_string(),
+            fields: vec![ProjectionFieldMetadata {
+                name: "row_id_bytes",
+                byte_offset: string_table_offset,
+                byte_length: string_bytes,
+                encoding: "utf8_bytes",
+                value: format!("{string_bytes} bytes"),
+                description: "Slice with the offsets table to recover each IID string.".to_string(),
+            }],
+        },
+    })
 }
 
 fn build_projection_row_id_section(
@@ -4667,8 +4971,40 @@ mod tests {
         assert_eq!(metadata["kind"], "scores");
         assert_eq!(metadata["rows"], 2);
         assert_eq!(metadata["cols"], 3);
+        assert_eq!(metadata["endianness"], "little");
         assert_eq!(metadata["row_ids_embedded"], true);
         assert_eq!(metadata["row_id_field"], "IID");
+        assert_eq!(metadata["binary_schema"]["file_extension"], "bin");
+        assert_eq!(
+            metadata["binary_schema"]["matrix_header"]["byte_length"],
+            PROJECTION_MATRIX_HEADER_LEN as u64
+        );
+        assert_eq!(
+            metadata["binary_schema"]["matrix_header"]["fields"][0]["value"],
+            "GNPRJ001"
+        );
+        assert_eq!(
+            metadata["binary_schema"]["matrix_data"]["byte_offset"],
+            PROJECTION_MATRIX_HEADER_LEN as u64
+        );
+        assert_eq!(
+            metadata["binary_schema"]["matrix_data"]["fields"][0]["encoding"],
+            "f64_le[column_major]"
+        );
+        assert_eq!(
+            metadata["binary_schema"]["row_ids"]["magic_ascii"],
+            "GNPSID01"
+        );
+        assert_eq!(
+            metadata["binary_schema"]["row_ids"]["header"]["fields"][0]["value"],
+            "GNPSID01"
+        );
+        assert_eq!(metadata["binary_schema"]["row_ids"]["count"], 2);
+        assert_eq!(metadata["binary_schema"]["row_ids"]["offsets_count"], 3);
+        assert_eq!(
+            metadata["binary_schema"]["row_ids"]["string_bytes"],
+            ("SAMPLE_A".len() + "SAMPLE_B".len()) as u64
+        );
     }
 
     #[test]
