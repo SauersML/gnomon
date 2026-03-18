@@ -219,10 +219,13 @@ theorem gwas_h2_le_true (h2_true avg_r2_tag : ℝ)
     Source LD is tagged better in source-derived GWAS than target LD.
     This creates a technical portability artifact. -/
 theorem tagging_creates_portability_artifact
-    (h2_source_gwas h2_target_gwas h2_true : ℝ)
-    (h_source_better : h2_target_gwas < h2_source_gwas)
-    (h_true : h2_source_gwas ≤ h2_true) :
-    h2_target_gwas < h2_true := by linarith
+    (h2_true avg_r2_tag_source avg_r2_tag_target : ℝ)
+    (h_true_pos : 0 < h2_true)
+    (h_tag_diff : avg_r2_tag_target < avg_r2_tag_source)
+    (h_tag_le : avg_r2_tag_source ≤ 1) :
+    gwasHeritability h2_true avg_r2_tag_target < h2_true := by
+  unfold gwasHeritability
+  nlinarith
 
 end LDTagging
 
@@ -372,11 +375,28 @@ theorem fst_decreases_with_migration (m₁ m₂ Ne : ℝ)
     If both populations experience the same selective pressure
     (e.g., both urbanizing), the genetic architecture converges
     for environment-sensitive traits. -/
+noncomputable def geneticCorrelationAfterSelection (rg_before selection_correlation : ℝ) : ℝ :=
+  rg_before + (1 - rg_before) * selection_correlation
+
 theorem shared_selection_improves_portability
-    (rg_before rg_after : ℝ)
-    (h_improves : rg_before < rg_after)
-    (h_le : rg_after ≤ 1) :
-    rg_before < 1 := by linarith
+    (rg_before selection_correlation : ℝ)
+    (h_selection_pos : 0 < selection_correlation)
+    (h_selection_le : selection_correlation ≤ 1)
+    (h_rg_before_lt : rg_before < 1) :
+    rg_before < geneticCorrelationAfterSelection rg_before selection_correlation ∧
+    geneticCorrelationAfterSelection rg_before selection_correlation ≤ 1 := by
+  unfold geneticCorrelationAfterSelection
+  constructor
+  · have h_pos : 0 < (1 - rg_before) * selection_correlation := by
+      apply mul_pos
+      · linarith
+      · exact h_selection_pos
+    linarith
+  · have h_le : (1 - rg_before) * selection_correlation ≤ (1 - rg_before) * 1 := by
+      apply mul_le_mul_of_nonneg_left
+      · exact h_selection_le
+      · linarith
+    linarith
 
 /-!
 ### Derivation: portabilityFromArchitecture = rg² × (1 - Fst) × tagging_ratio

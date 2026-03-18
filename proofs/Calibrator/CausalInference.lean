@@ -115,11 +115,15 @@ section MediationAnalysis
 
 /-- **Total effect = Direct effect + Indirect effect.**
     TE = DE + IE (in the linear case). -/
+noncomputable def totalEffect (direct_effect indirect_effect : ℝ) : ℝ :=
+  direct_effect + indirect_effect
+
 theorem mediation_decomposition
-    (total_effect direct_effect indirect_effect : ℝ)
-    (h_decomp : total_effect = direct_effect + indirect_effect) :
+    (direct_effect indirect_effect : ℝ) :
     -- Indirect effect is the total minus direct
-    indirect_effect = total_effect - direct_effect := by linarith
+    indirect_effect = totalEffect direct_effect indirect_effect - direct_effect := by
+  unfold totalEffect
+  linarith
 
 /-- **Proportion mediated.**
     PM = IE / TE = indirect / total. -/
@@ -438,23 +442,40 @@ theorem e_value_ge_one (rr : ℝ) (h_rr : 1 ≤ rr) :
 /-- **Sensitivity to LD reference mismatch.**
     Portability estimates are sensitive to the choice of LD reference.
     Using in-sample LD vs. external reference can change R² by δ. -/
+noncomputable def r2WithMismatch (r2_external mismatch_penalty : ℝ) : ℝ :=
+  r2_external * (1 - mismatch_penalty)
+
 theorem ld_reference_sensitivity
-    (r2_in_sample r2_external delta : ℝ)
-    (h_diff : r2_in_sample = r2_external + delta)
-    (h_delta : 0 < |delta|) :
-    r2_in_sample ≠ r2_external := by
-  rw [h_diff]; intro h; have : delta = 0 := by linarith
-  exact absurd (this ▸ h_delta) (by simp)
+    (r2_external mismatch_penalty : ℝ)
+    (h_r2_pos : 0 < r2_external)
+    (h_penalty_pos : 0 < mismatch_penalty)
+    (h_penalty_lt : mismatch_penalty < 1) :
+    r2WithMismatch r2_external mismatch_penalty < r2_external := by
+  unfold r2WithMismatch
+  have h_bound : 1 - mismatch_penalty < 1 := by linarith
+  have h_mul := mul_lt_mul_of_pos_left h_bound h_r2_pos
+  rw [mul_one] at h_mul
+  exact h_mul
 
 /-- **Sensitivity to phenotype definition.**
     Different phenotype definitions (self-report vs clinical,
     ICD-9 vs ICD-10) can change portability estimates.
     When the difference exceeds any threshold ε > 0, the estimates differ. -/
+noncomputable def portabilityPhenotypeDef (base_heritability phenotype_correlation : ℝ) : ℝ :=
+  base_heritability * phenotype_correlation ^ 2
+
 theorem phenotype_definition_matters
-    (port_def1 port_def2 ε : ℝ) (h_ε : 0 < ε)
-    (h_large_diff : ε < |port_def1 - port_def2|) :
-    port_def1 ≠ port_def2 := by
-  intro h; rw [h, sub_self, abs_zero] at h_large_diff; linarith
+    (base_heritability phenotype_correlation : ℝ)
+    (h_base_pos : 0 < base_heritability)
+    (h_corr_pos : 0 < phenotype_correlation)
+    (h_corr_lt_one : phenotype_correlation < 1) :
+    portabilityPhenotypeDef base_heritability phenotype_correlation < base_heritability := by
+  unfold portabilityPhenotypeDef
+  have h_corr_sq_lt_one : phenotype_correlation ^ 2 < 1 := by
+    nlinarith
+  have h_mul := mul_lt_mul_of_pos_left h_corr_sq_lt_one h_base_pos
+  rw [mul_one] at h_mul
+  exact h_mul
 
 end SensitivityAnalysis
 
