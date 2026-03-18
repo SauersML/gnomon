@@ -252,15 +252,50 @@ on LD and population structure assumptions.
 
 section GREML
 
+structure GREMLModel where
+  V_A : ℝ
+  V_strat : ℝ
+  V_E : ℝ
+  mean_tag_r2 : ℝ
+  h_VA_pos : 0 < V_A
+  h_strat_nonneg : 0 ≤ V_strat
+  h_VE_pos : 0 < V_E
+  h_tag_pos : 0 < mean_tag_r2
+  h_tag_le_one : mean_tag_r2 ≤ 1
+
+noncomputable def gremlTrueH2 (m : GREMLModel) : ℝ :=
+  m.V_A / (m.V_A + m.V_strat + m.V_E)
+
+noncomputable def gremlEstimatedH2 (m : GREMLModel) : ℝ :=
+  (m.mean_tag_r2 * m.V_A + m.V_strat) / (m.V_A + m.V_strat + m.V_E)
+
+noncomputable def gremlLDBias (m : GREMLModel) : ℝ :=
+  (m.mean_tag_r2 - 1) * m.V_A / (m.V_A + m.V_strat + m.V_E)
+
+noncomputable def gremlStratificationBias (m : GREMLModel) : ℝ :=
+  m.V_strat / (m.V_A + m.V_strat + m.V_E)
+
+/-- **GREML h² estimate decomposes into true h² plus LD and stratification biases.** -/
+theorem greml_estimate_decomposition (m : GREMLModel) :
+    gremlEstimatedH2 m = gremlTrueH2 m + gremlLDBias m + gremlStratificationBias m := by
+  unfold gremlEstimatedH2 gremlTrueH2 gremlLDBias gremlStratificationBias
+  have h_denom : m.V_A + m.V_strat + m.V_E ≠ 0 := by linarith [m.h_VA_pos, m.h_strat_nonneg, m.h_VE_pos]
+  rw [← add_div, ← add_div]
+  congr 1
+  ring
+
 /-- **GREML h² estimate depends on LD structure.**
-    GREML estimates h²_SNP = trace(GRM⁻¹ × Σ_pheno) / n.
-    When LD differs between training and evaluation, the estimate is biased. -/
+    When LD differs between training and evaluation (mean_tag_r2 < 1)
+    and there is no stratification bias, the estimate is biased downward. -/
 theorem greml_ld_sensitive
-    (h2_estimated h2_true ld_bias : ℝ)
-    (h_bias : h2_estimated = h2_true + ld_bias)
-    (h_ld_nonzero : ld_bias ≠ 0) :
-    h2_estimated ≠ h2_true := by
-  rw [h_bias]; intro h; apply h_ld_nonzero; linarith
+    (m : GREMLModel) (h_no_strat : m.V_strat = 0) (h_imperfect_tagging : m.mean_tag_r2 < 1) :
+    gremlEstimatedH2 m < gremlTrueH2 m := by
+  unfold gremlEstimatedH2 gremlTrueH2
+  rw [h_no_strat]
+  simp only [add_zero]
+  have h_denom : 0 < m.V_A + m.V_E := by linarith [m.h_VA_pos, m.h_VE_pos]
+  apply div_lt_div_of_pos_right _ h_denom
+  nlinarith [m.h_VA_pos]
 
 /-- **GREML underestimates h² when causal variants are poorly tagged.**
     The true SNP heritability is `V_A / V_P`, while GREML only captures
@@ -268,24 +303,20 @@ theorem greml_ld_sensitive
     imperfect, the underestimation gap is exactly
     `((1 - mean_tag_r2) * V_A) / V_P > 0`. -/
 theorem greml_underestimates_with_poor_tagging
-    (V_A V_P mean_tag_r2 : ℝ)
-    (h_imperfect : mean_tag_r2 < 1)
-    (h_VA_pos : 0 < V_A) (h_VP_pos : 0 < V_P) :
-    let h2_true := V_A / V_P
-    let h2_greml := (mean_tag_r2 * V_A) / V_P
-    h2_true - h2_greml = ((1 - mean_tag_r2) * V_A) / V_P ∧
-      0 < h2_true - h2_greml := by
-  simp only
+    (m : GREMLModel) (h_no_strat : m.V_strat = 0) (h_imperfect : m.mean_tag_r2 < 1) :
+    gremlTrueH2 m - gremlEstimatedH2 m = ((1 - m.mean_tag_r2) * m.V_A) / (m.V_A + m.V_E) ∧
+      0 < gremlTrueH2 m - gremlEstimatedH2 m := by
+  unfold gremlTrueH2 gremlEstimatedH2
+  rw [h_no_strat]
+  simp only [add_zero]
   rw [← sub_div]
-  have h_gap :
-      V_A - mean_tag_r2 * V_A = (1 - mean_tag_r2) * V_A := by
-    ring
+  have h_gap : m.V_A - m.mean_tag_r2 * m.V_A = (1 - m.mean_tag_r2) * m.V_A := by ring
   rw [h_gap]
   constructor
   · rfl
   · apply div_pos
-    · nlinarith
-    · exact h_VP_pos
+    · nlinarith [m.h_VA_pos]
+    · linarith [m.h_VA_pos, m.h_VE_pos]
 
 /-- **Population structure inflates GREML h² estimate.**
     Cryptic stratification in the GWAS sample creates a positive bias
@@ -302,15 +333,14 @@ theorem greml_underestimates_with_poor_tagging
     We derive: h²_GREML > h²_true whenever V_strat > 0, because
     (V_A + V_strat)/V_P > V_A/V_P when V_P > 0. -/
 theorem stratification_inflates_greml
-    (V_A V_strat V_E : ℝ)
-    (h_VA : 0 ≤ V_A) (h_strat_pos : 0 < V_strat) (h_VE : 0 ≤ V_E)
-    (h_total : 0 < V_A + V_strat + V_E) :
-    let V_P := V_A + V_strat + V_E
-    let h2_true := V_A / V_P
-    let h2_greml := (V_A + V_strat) / V_P
-    h2_true < h2_greml := by
-  simp only
-  exact div_lt_div_of_pos_right (by linarith) h_total
+    (m : GREMLModel) (h_perfect_tagging : m.mean_tag_r2 = 1) (h_strat_pos : 0 < m.V_strat) :
+    gremlTrueH2 m < gremlEstimatedH2 m := by
+  unfold gremlTrueH2 gremlEstimatedH2
+  rw [h_perfect_tagging]
+  simp only [one_mul]
+  have h_denom : 0 < m.V_A + m.V_strat + m.V_E := by linarith [m.h_VA_pos, m.h_strat_nonneg, m.h_VE_pos]
+  apply div_lt_div_of_pos_right _ h_denom
+  linarith
 
 end GREML
 
@@ -364,6 +394,10 @@ noncomputable def liabilityScaleH2
     (h2_observed prevalence z_height : ℝ) : ℝ :=
   h2_observed * prevalence * (1 - prevalence) / z_height ^ 2
 
+noncomputable def liabilityToObservedScaleH2
+    (h2_liability prevalence z_height : ℝ) : ℝ :=
+  h2_liability * z_height ^ 2 / (prevalence * (1 - prevalence))
+
 /-- **Liability h² is larger than observed h² for rare diseases.**
     When prevalence K is small, K(1-K)/z² > 1 because z is large
     (the threshold is far in the tail). -/
@@ -387,15 +421,20 @@ theorem prevalence_confounds_h2_portability
     (h2_liability : ℝ) (K₁ K₂ z₁ z₂ : ℝ)
     (h_same_liability : 0 < h2_liability)
     (h_K1 : 0 < K₁) (h_K2 : 0 < K₂)
+    (h_K1_lt_1 : K₁ < 1) (h_K2_lt_1 : K₂ < 1)
     (h_z1 : 0 < z₁) (h_z2 : 0 < z₂)
-    (h_diff_prev : K₁ ≠ K₂)
-    (h_diff_z : z₁ ≠ z₂)
-    (h_diff_ratio : K₁ * (1 - K₁) / z₁ ^ 2 ≠ K₂ * (1 - K₂) / z₂ ^ 2) :
+    (h_diff_ratio : z₁ ^ 2 / (K₁ * (1 - K₁)) ≠ z₂ ^ 2 / (K₂ * (1 - K₂))) :
     -- Different observed h² even with same genetic architecture
-    liabilityScaleH2 1 K₁ z₁ ≠ liabilityScaleH2 1 K₂ z₂ := by
-  unfold liabilityScaleH2
-  simp
-  exact h_diff_ratio
+    liabilityToObservedScaleH2 h2_liability K₁ z₁ ≠ liabilityToObservedScaleH2 h2_liability K₂ z₂ := by
+  unfold liabilityToObservedScaleH2
+  intro h_eq
+  have h_mul_eq : h2_liability * (z₁ ^ 2 / (K₁ * (1 - K₁))) = h2_liability * (z₂ ^ 2 / (K₂ * (1 - K₂))) := by
+    calc h2_liability * (z₁ ^ 2 / (K₁ * (1 - K₁)))
+      _ = h2_liability * z₁ ^ 2 / (K₁ * (1 - K₁)) := by ring
+      _ = h2_liability * z₂ ^ 2 / (K₂ * (1 - K₂)) := h_eq
+      _ = h2_liability * (z₂ ^ 2 / (K₂ * (1 - K₂))) := by ring
+  have h_cancel := mul_left_cancel₀ h_same_liability.ne' h_mul_eq
+  exact h_diff_ratio h_cancel
 
 end LiabilityScale
 
