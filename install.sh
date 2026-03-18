@@ -35,6 +35,8 @@ log_success() { echo -e "${ICON_CHECK}  $1"; }
 log_error() { echo -e "${ICON_CROSS}  ${RED}$1${RESET}"; }
 log_header() { echo -e "\n${BOLD}${CYAN}=== $1 ===${RESET}\n"; }
 
+ORIGINAL_ARGS=("$@")
+
 print_usage() {
     cat <<EOF
 Usage: ./install.sh [--binary BINARY]
@@ -145,7 +147,7 @@ bootstrap_latest_installer() {
     exit $rc
 }
 
-bootstrap_latest_installer "$@"
+bootstrap_latest_installer "${ORIGINAL_ARGS[@]}"
 
 # --- 1. Detect Platform ---
 log_header "Detecting Platform"

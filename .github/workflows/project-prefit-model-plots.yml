@@ -69,9 +69,9 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r scripts/requirements-project-prefit.txt
 
-      - name: Build gnomon on the projection runner
+      - name: Build gnomon-map on the projection runner
         run: |
-          cargo +nightly build --release --bin gnomon
+          cargo +nightly build --release --no-default-features --features map --bin gnomon-map
 
       - name: Project full dataset
         shell: bash
@@ -83,7 +83,7 @@ jobs:
           cd "$OUT_DIR"
 
           /usr/bin/time -f 'elapsed=%E\nuser=%U\nsys=%S\nmaxrss_kb=%M' \
-            "$ROOT/target/release/gnomon" project \
+            "$ROOT/target/release/gnomon-map" project \
             "${{ env.PROJECT_PREFIT_INPUT }}" \
             --model "${{ matrix.model }}" \
             --output-manifest project_outputs.json \
