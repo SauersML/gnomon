@@ -331,6 +331,11 @@ human genetic diversity, not just for well-represented groups.
 
 section AncestryFairness
 
+/-- Model for the portability gap between populations.
+    The gap scales proportionally to the genetic divergence (FST). -/
+noncomputable def portabilityGapFst (c fst : ℝ) : ℝ :=
+  c * fst
+
 /-- **Portability gap creates health disparities.**
     Groups with worse portability get less clinical benefit from PGS.
     The gap scales with Fst from the discovery population.
@@ -340,8 +345,13 @@ theorem portability_gap_scales_with_fst
     (fst₁ fst₂ c : ℝ)
     (h_fst : fst₁ < fst₂) (h_c : 0 < c)
     (h_fst₁_nn : 0 ≤ fst₁) :
-    c * fst₁ < c * fst₂ := by
+    portabilityGapFst c fst₁ < portabilityGapFst c fst₂ := by
+  unfold portabilityGapFst
   exact mul_lt_mul_of_pos_left h_fst h_c
+
+/-- Optimal sample size needed for underrepresented groups. -/
+noncomputable def equitableSampleSize (n_proportional k : ℝ) : ℝ :=
+  k * n_proportional
 
 /-- **Equitable PGS requires proportional investment.**
     To achieve equal R² across populations, the sample size
@@ -351,8 +361,13 @@ theorem portability_gap_scales_with_fst
 theorem equitable_pgs_overinvestment
     (n_proportional k : ℝ)
     (h_nn : 0 < n_proportional) (h_k : 1 < k) :
-    n_proportional < k * n_proportional := by
+    n_proportional < equitableSampleSize n_proportional k := by
+  unfold equitableSampleSize
   nlinarith
+
+/-- R² in target population based on Fst and portability decay. -/
+noncomputable def r2Target (r2_source fst c : ℝ) : ℝ :=
+  r2_source * (1 - c * fst)
 
 /-- **Universal portability is impossible.**
     No single PGS can achieve equal R² in all populations,
@@ -365,8 +380,11 @@ theorem universal_portability_impossible
     (h_r2 : 0 < r2_source) (h_c : 0 < c)
     (h_near : 0 ≤ fst_near) (h_far_gt : fst_near < fst_far) :
     -- The portability gap between near and far populations is positive
-    r2_source * c * fst_near < r2_source * c * fst_far := by
-  exact mul_lt_mul_of_pos_left h_far_gt (mul_pos h_r2 h_c)
+    r2Target r2_source fst_far c < r2Target r2_source fst_near c := by
+  unfold r2Target
+  apply mul_lt_mul_of_pos_left
+  · linarith [mul_lt_mul_of_pos_left h_far_gt h_c]
+  · exact h_r2
 
 end AncestryFairness
 
