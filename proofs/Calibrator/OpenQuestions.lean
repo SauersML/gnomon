@@ -133,28 +133,38 @@ theorem law_of_total_variance_r2_bound
   rw [div_le_one h_varZ_pos, h_decomp]
   linarith
 
+structure ExplainedVarianceModel where
+  varZ : ℝ
+  eVarZgivenD : ℝ
+  varEZgivenD : ℝ
+  h_decomp : varZ = eVarZgivenD + varEZgivenD
+  h_varZ_pos : 0 < varZ
+  h_eVar_nonneg : 0 ≤ eVarZgivenD
+  h_varE_nonneg : 0 ≤ varEZgivenD
+
 /-- **When within-group variance dominates, R² is small.**
     If E[Var(Z|D)] ≥ (1 - δ)·Var(Z), then R²(Z,D) ≤ δ.
 
     Worked example: For height, Wang et al. find δ ≈ 0.005 (R² = 0.51%). -/
 theorem r2_small_when_within_dominates
-    (varZ eVarZgivenD varEZgivenD δ : ℝ)
-    (h_decomp : varZ = eVarZgivenD + varEZgivenD)
-    (h_varZ_pos : 0 < varZ)
-    (_h_eVar_nonneg : 0 ≤ eVarZgivenD)
-    (_h_varE_nonneg : 0 ≤ varEZgivenD)
-    (h_within_dominates : eVarZgivenD ≥ (1 - δ) * varZ)
+    (model : ExplainedVarianceModel)
+    (δ : ℝ)
+    (h_within_dominates : model.eVarZgivenD ≥ (1 - δ) * model.varZ)
     (_hδ_pos : 0 < δ) :
-    varEZgivenD / varZ ≤ δ := by
-  have h1 : varEZgivenD = varZ - eVarZgivenD := by linarith
-  rw [h1, sub_div, div_self (h_varZ_pos.ne')]
-  linarith [le_div_iff₀ h_varZ_pos |>.mpr (by linarith : (1 - δ) * varZ ≤ eVarZgivenD)]
+    model.varEZgivenD / model.varZ ≤ δ := by
+  have h1 : model.varEZgivenD = model.varZ - model.eVarZgivenD := by linarith [model.h_decomp]
+  rw [h1, sub_div, div_self (model.h_varZ_pos.ne')]
+  linarith [le_div_iff₀ model.h_varZ_pos |>.mpr (by linarith : (1 - δ) * model.varZ ≤ model.eVarZgivenD)]
+
+noncomputable def coefficientOfVariationSq (variance expected_value : ℝ) : ℝ :=
+  variance / (expected_value ^ 2)
 
 /-- **χ² coefficient of variation.**
     Squared prediction error ε² ~ σ² · χ²₁ has Var(ε²) = 2σ⁴ and E[ε²] = σ².
     So CV² = 2σ⁴/σ⁴ = 2, making individual errors inherently noisy. -/
 theorem squared_error_cv_is_two (sigma_sq : ℝ) (hσ : 0 < sigma_sq) :
-    2 * sigma_sq ^ 2 / sigma_sq ^ 2 = 2 := by
+    coefficientOfVariationSq (2 * sigma_sq ^ 2) sigma_sq = 2 := by
+  unfold coefficientOfVariationSq
   rw [mul_div_cancel_right₀]
   exact pow_ne_zero 2 (hσ.ne')
 

@@ -80,7 +80,8 @@ theorem admixed_r2_intermediate
     (h_AB : r2_B < r2_A) :
     -- With r2_cross = geometric mean, admixed R² is a weighted combination
     -- Simplification: when r2_cross = r2_B (lower bound)
-    r2_B < α ^ 2 * r2_A + (1 - α) ^ 2 * r2_B + 2 * α * (1 - α) * r2_B := by
+    r2_B < admixedR2 α r2_A r2_B r2_B := by
+  unfold admixedR2
   have h1 : 0 < α ^ 2 := sq_pos_of_pos h_α
   nlinarith [sq_nonneg (1 - α)]
 
@@ -182,24 +183,32 @@ theorem admixture_mapping_identifies_portability_loci
     n_overlap ≤ min n_gwas_hits n_admixture_hits := by
   exact le_min h_overlap_le_gwas h_overlap_le_admix
 
+noncomputable def admixturePower (n fst β : ℝ) : ℝ :=
+  n * fst * β ^ 2
+
 /-- **Admixture mapping power depends on Fst at the locus.**
     Power ∝ n × Fst_locus × β². High Fst loci are easier to detect
     and also the ones most responsible for portability loss. -/
 theorem admixture_power_proportional_to_fst
-    (n : ℝ) (fst β : ℝ)
+    (n fst β : ℝ)
     (h_n : 0 < n) (h_fst₁ : 0 < fst) (h_β : β ≠ 0) :
-    0 < n * fst * β ^ 2 := by
+    0 < admixturePower n fst β := by
+  unfold admixturePower
   exact mul_pos (mul_pos h_n h_fst₁) (sq_pos_of_ne_zero h_β)
+
+noncomputable def admixtureCorrection (Δβ fst_locus : ℝ) : ℝ :=
+  Δβ * fst_locus
 
 /-- **Admixture-informed portability correction.**
     At loci where admixture mapping detects a signal, we can
     use ancestry-specific effects to correct the PGS.
     The correction size is proportional to Δβ × Fst_locus. -/
 theorem correction_proportional_to_delta_beta_fst
-    (Δβ fst_locus correction : ℝ)
-    (h_correction : correction = Δβ * fst_locus)
+    (Δβ fst_locus : ℝ)
     (h_Δβ : 0 < Δβ) (h_fst : 0 < fst_locus) :
-    0 < correction := by rw [h_correction]; exact mul_pos h_Δβ h_fst
+    0 < admixtureCorrection Δβ fst_locus := by
+  unfold admixtureCorrection
+  exact mul_pos h_Δβ h_fst
 
 end AdmixtureMapping
 
@@ -231,6 +240,9 @@ theorem tractor_effective_n
     0 < α * n_admixed ∧ 0 < (1 - α) * n_admixed := by
   exact ⟨mul_pos h_α h_n, mul_pos (by linarith) h_n⟩
 
+noncomputable def waldTestStatistic (β_A β_B se : ℝ) : ℝ :=
+  ((β_A - β_B) / se) ^ 2
+
 /-- **Ancestry-specific effects test for portability.**
     If β_A = β_B at a locus, the locus is "portable" across ancestries.
     If β_A ≠ β_B, the locus contributes to portability loss. -/
@@ -238,7 +250,9 @@ theorem effect_heterogeneity_test
     (β_A β_B se : ℝ)
     (h_se : 0 < se) :
     -- Wald test statistic
-    0 ≤ ((β_A - β_B) / se) ^ 2 := sq_nonneg _
+    0 ≤ waldTestStatistic β_A β_B se := by
+  unfold waldTestStatistic
+  exact sq_nonneg _
 
 /-- **Multi-ancestry meta-analysis combines Tractor with standard GWAS.**
     Using Tractor effects from admixed samples + standard GWAS from
