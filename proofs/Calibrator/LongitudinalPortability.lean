@@ -496,6 +496,10 @@ theorem temporal_split_more_conservative
       ≤ r2_true * 1 := mul_le_mul_of_nonneg_left h_exp_le h_r2
     _ = r2_true := mul_one _
 
+/-- Apparent temporal loss due to definitional changes. -/
+noncomputable def apparentTemporalLoss (r2_consistent_def r2_changed_def : ℝ) : ℝ :=
+  r2_consistent_def - r2_changed_def
+
 /-- **Phenotype definition stability.**
     Changes in diagnostic criteria over time (e.g., ICD revisions)
     create apparent portability loss that is purely definitional. -/
@@ -503,7 +507,13 @@ theorem diagnostic_change_creates_apparent_loss
     (r2_consistent_def r2_changed_def : ℝ)
     (h_reduced : r2_changed_def < r2_consistent_def)
     (h_nn : 0 < r2_changed_def) :
-    0 < r2_consistent_def - r2_changed_def := by linarith
+    0 < apparentTemporalLoss r2_consistent_def r2_changed_def := by
+  unfold apparentTemporalLoss
+  linarith
+
+/-- Temporal stability index of a trait based on its maximum variant contribution. -/
+noncomputable def temporalStabilityIndex (max_variant_contribution : ℝ) : ℝ :=
+  1 - max_variant_contribution
 
 /-- **Genotype-phenotype map stability varies by trait.**
     Highly polygenic traits with small per-variant effects
@@ -518,7 +528,9 @@ theorem polygenic_more_temporally_stable
     (h_poly_small : 0 ≤ max_contrib_poly) (h_poly_le : max_contrib_poly ≤ 1)
     (h_oligo_small : 0 ≤ max_contrib_oligo) (h_oligo_le : max_contrib_oligo ≤ 1)
     (h_poly_more_even : max_contrib_poly < max_contrib_oligo) :
-    1 - max_contrib_oligo < 1 - max_contrib_poly := by linarith
+    temporalStabilityIndex max_contrib_oligo < temporalStabilityIndex max_contrib_poly := by
+  unfold temporalStabilityIndex
+  linarith
 
 end CrossTemporalValidation
 

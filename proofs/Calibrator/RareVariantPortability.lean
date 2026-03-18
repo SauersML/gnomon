@@ -255,6 +255,10 @@ theorem common_component_more_portable
         apply mul_nonneg (le_of_lt h_β2)
         nlinarith [sq_nonneg (p_common - 1/2)]
 
+/-- Total PGS variance captured using both common and rare components. -/
+noncomputable def combinedVariantR2 (r2_common r2_rare : ℝ) : ℝ :=
+  r2_common + r2_rare
+
 /-- **WGS PGS within-population outperforms array PGS.**
     Within the discovery population, WGS PGS captures more variance
     (including rare variant contributions). The WGS R² = R²_common + R²_rare
@@ -263,7 +267,9 @@ theorem wgs_within_pop_better
     (r2_common r2_rare : ℝ)
     (h_common_nn : 0 ≤ r2_common)
     (h_rare_pos : 0 < r2_rare) :
-    r2_common < r2_common + r2_rare := by linarith
+    r2_common < combinedVariantR2 r2_common r2_rare := by
+  unfold combinedVariantR2
+  linarith
 
 /-- **WGS PGS cross-population can be worse than array PGS.**
     Because population-specific rare variants add noise in the
@@ -287,7 +293,9 @@ theorem optimal_combined_strategy
     (r2_common r2_rare_local : ℝ)
     (h_common_nn : 0 ≤ r2_common)
     (h_rare_nn : 0 ≤ r2_rare_local) :
-    r2_common ≤ r2_common + r2_rare_local := by linarith
+    r2_common ≤ combinedVariantR2 r2_common r2_rare_local := by
+  unfold combinedVariantR2
+  linarith
 
 end WGSBasedPGS
 
@@ -366,6 +374,10 @@ variants, affecting both PGS construction and portability.
 
 section EffectSizeDistribution
 
+/-- Heterozygosity contribution of a variant. -/
+noncomputable def rareVariantHeterozygosity (maf : ℝ) : ℝ :=
+  2 * maf * (1 - maf)
+
 /-- **Negative selection constrains common variant effects.**
     E[|β|² | MAF] decreases with MAF because purifying selection
     removes large-effect alleles that reach high frequency.
@@ -378,7 +390,8 @@ theorem negative_selection_constraint
     (h_common_pos : 0 < maf_common) (h_common_lt : maf_common ≤ 1/2)
     (h_rare_maf : maf_rare < maf_common) :
     -- Heterozygosity is smaller for rarer variants (when both ≤ 1/2)
-    2 * maf_rare * (1 - maf_rare) < 2 * maf_common * (1 - maf_common) := by
+    rareVariantHeterozygosity maf_rare < rareVariantHeterozygosity maf_common := by
+  unfold rareVariantHeterozygosity
   nlinarith [sq_nonneg (maf_common - 1/2), sq_nonneg (maf_rare - 1/2)]
 
 /-- **The α model: E[β²] ∝ [p(1-p)]^(1+α).**
