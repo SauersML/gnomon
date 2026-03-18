@@ -35,6 +35,65 @@ log_success() { echo -e "${ICON_CHECK}  $1"; }
 log_error() { echo -e "${ICON_CROSS}  ${RED}$1${RESET}"; }
 log_header() { echo -e "\n${BOLD}${CYAN}=== $1 ===${RESET}\n"; }
 
+print_usage() {
+    cat <<EOF
+Usage: ./install.sh [--binary BINARY]
+
+BINARY can be one of:
+  gnomon
+  gnomon-map
+  gnomon-score
+  gnomon-terms
+  gnomon-calibrate
+
+Short names are also accepted:
+  map, score, terms, calibrate
+
+If no --binary option is provided, installs gnomon.
+EOF
+}
+
+normalize_binary_name() {
+    case "$1" in
+        ""|gnomon) echo "gnomon" ;;
+        map|gnomon-map) echo "gnomon-map" ;;
+        score|gnomon-score) echo "gnomon-score" ;;
+        terms|gnomon-terms) echo "gnomon-terms" ;;
+        calibrate|gnomon-calibrate) echo "gnomon-calibrate" ;;
+        *) return 1 ;;
+    esac
+}
+
+REQUESTED_BINARY="gnomon"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --binary)
+            if [ $# -lt 2 ]; then
+                log_error "--binary requires a value."
+                print_usage
+                exit 1
+            fi
+            REQUESTED_BINARY="$2"
+            shift 2
+            ;;
+        -h|--help)
+            print_usage
+            exit 0
+            ;;
+        *)
+            log_error "Unknown argument: $1"
+            print_usage
+            exit 1
+            ;;
+    esac
+done
+
+if ! BINARY_NAME="$(normalize_binary_name "$REQUESTED_BINARY")"; then
+    log_error "Unsupported binary selection: ${REQUESTED_BINARY}"
+    print_usage
+    exit 1
+fi
+
 # --- 0. Bootstrap Latest Installer Script ---
 # Raw GitHub content for branch refs can be stale due to caches.
 # To avoid running an outdated installer body, resolve main -> commit SHA
@@ -104,8 +163,8 @@ TARGET_ASSET=""
 case "$OS" in
     linux)
         case "$ARCH" in
-            x86_64)  TARGET_ASSET="gnomon-linux-x64.tar.gz" ;;
-            aarch64) TARGET_ASSET="gnomon-linux-arm64.tar.gz" ;;
+            x86_64)  TARGET_ASSET="${BINARY_NAME}-linux-x64.tar.gz" ;;
+            aarch64) TARGET_ASSET="${BINARY_NAME}-linux-arm64.tar.gz" ;;
             *)
                 log_error "Unsupported Linux architecture: $ARCH"
                 exit 1
@@ -114,8 +173,8 @@ case "$OS" in
         ;;
     darwin)
         case "$ARCH" in
-            x86_64) TARGET_ASSET="gnomon-macos-intel.tar.gz" ;;
-            arm64)  TARGET_ASSET="gnomon-macos-arm64.tar.gz" ;;
+            x86_64) TARGET_ASSET="${BINARY_NAME}-macos-intel.tar.gz" ;;
+            arm64)  TARGET_ASSET="${BINARY_NAME}-macos-arm64.tar.gz" ;;
             *)
                 log_error "Unsupported macOS architecture: $ARCH"
                 exit 1
@@ -137,8 +196,8 @@ case "$OS" in
         fi
 
         case "$ARCH" in
-            x86_64) TARGET_ASSET="gnomon-windows-x64.zip" ;;
-            aarch64|arm64) TARGET_ASSET="gnomon-windows-arm64.zip" ;;
+            x86_64) TARGET_ASSET="${BINARY_NAME}-windows-x64.zip" ;;
+            aarch64|arm64) TARGET_ASSET="${BINARY_NAME}-windows-arm64.zip" ;;
             *)
                 log_error "Unsupported Windows architecture: $ARCH"
                 exit 1
@@ -152,6 +211,7 @@ case "$OS" in
 esac
 
 log_success "Detected: ${BOLD}${OS}/${ARCH}${RESET}"
+log_info "Selected binary: ${BOLD}${BINARY_NAME}${RESET}"
 log_info "Target release asset: ${BOLD}${TARGET_ASSET}${RESET}"
 
 # --- 2. Find Latest Published Binary Release ---
@@ -209,7 +269,7 @@ fi
 log_info "Download URL: ${DOWNLOAD_URL}"
 
 # --- 3. Download & Install ---
-log_header "Installing gnomon"
+log_header "Installing ${BINARY_NAME}"
 
 TEMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TEMP_DIR"' EXIT
@@ -228,7 +288,7 @@ fi
 
 # Determine binary location after extraction.
 # The binary inside the tarball is named identically to the asset (minus extensions)
-# e.g. gnomon-macos-arm64.tar.gz -> gnomon-macos-arm64
+# e.g. gnomon-map-macos-arm64.tar.gz -> gnomon-map-macos-arm64
 if [[ "$TARGET_ASSET" == *.zip ]]; then
     INTERNAL_BIN_NAME="${TARGET_ASSET%.zip}.exe"
     DEST_BINARY_NAME="${BINARY_NAME}.exe"
@@ -278,14 +338,14 @@ INSTALLED_BIN="${INSTALL_DIR}/${DEST_BINARY_NAME}"
 
 # Test the binary directly from install path
 if [ -x "$INSTALLED_BIN" ] && "$INSTALLED_BIN" --help >/dev/null 2>&1; then
-    log_success "Successfully installed gnomon!"
+    log_success "Successfully installed ${BINARY_NAME}!"
 
-    # If another gnomon earlier in PATH shadows this install, update it too when writable.
-    PATH_BIN="$(command -v gnomon 2>/dev/null || true)"
+    # If another binary with the same name earlier in PATH shadows this install, update it too when writable.
+    PATH_BIN="$(command -v "$BINARY_NAME" 2>/dev/null || true)"
     if [ -n "$PATH_BIN" ] && [ "$PATH_BIN" != "$INSTALLED_BIN" ]; then
-        log_info "Detected another gnomon in PATH before ${INSTALL_DIR}: ${PATH_BIN}"
+        log_info "Detected another ${BINARY_NAME} in PATH before ${INSTALL_DIR}: ${PATH_BIN}"
 
-        # On Git Bash/Windows, `command -v gnomon` may return .../gnomon while the
+        # On Git Bash/Windows, `command -v` may return .../gnomon while the
         # installed file is .../gnomon.exe; these can be the exact same file.
         SAME_FILE=0
         if [ -e "$PATH_BIN" ] && [ -e "$INSTALLED_BIN" ] && [ "$PATH_BIN" -ef "$INSTALLED_BIN" ]; then
@@ -314,7 +374,7 @@ if [ -x "$INSTALLED_BIN" ] && "$INSTALLED_BIN" --help >/dev/null 2>&1; then
     
     # Check if install dir is in PATH
     if [[ ":$PATH:" == *":$INSTALL_DIR:"* ]]; then
-        echo -e "\n${ICON_ROCK}  ${BOLD}Run 'gnomon --help' to get started!${RESET}\n"
+        echo -e "\n${ICON_ROCK}  ${BOLD}Run '${BINARY_NAME} --help' to get started!${RESET}\n"
     else
         # Auto-add to PATH in shell config
         PATH_LINE="export PATH=\"${INSTALL_DIR}:\$PATH\""
@@ -327,7 +387,7 @@ if [ -x "$INSTALLED_BIN" ] && "$INSTALLED_BIN" --help >/dev/null 2>&1; then
         fi
         
         # Check if already in config (avoid duplicates)
-        if ! grep -q '.local/bin' "$SHELL_RC" 2>/dev/null; then
+        if ! grep -Fq "$INSTALL_DIR" "$SHELL_RC" 2>/dev/null; then
             echo "" >> "$SHELL_RC"
             echo "# Added by gnomon installer" >> "$SHELL_RC"
             echo "$PATH_LINE" >> "$SHELL_RC"
@@ -335,7 +395,7 @@ if [ -x "$INSTALLED_BIN" ] && "$INSTALLED_BIN" --help >/dev/null 2>&1; then
         fi
         
         echo -e "\n${ICON_ROCK}  ${BOLD}Restart your terminal or run: source ${SHELL_RC}${RESET}"
-        echo -e "    Then run: ${BOLD}gnomon --help${RESET}\n"
+        echo -e "    Then run: ${BOLD}${BINARY_NAME} --help${RESET}\n"
     fi
 else
     log_error "Binary installed but failed to run."

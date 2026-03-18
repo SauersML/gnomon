@@ -30,43 +30,37 @@ jobs:
           # MacOS ARM (Apple Silicon) - GH Actions uses M1
           - os: macos-14
             target: aarch64-apple-darwin
-            artifact_name: gnomon
-            asset_name: gnomon-macos-arm64
+            asset_suffix: macos-arm64
             cpu: apple-m1
 
           # MacOS Intel - use macos-15-intel which runs on Intel hardware
           - os: macos-15-intel
             target: x86_64-apple-darwin
-            artifact_name: gnomon
-            asset_name: gnomon-macos-intel
+            asset_suffix: macos-intel
             cpu: x86-64-v3
 
           # Linux x86_64 (ubuntu-22.04 for wider glibc compatibility)
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            artifact_name: gnomon
-            asset_name: gnomon-linux-x64
+            asset_suffix: linux-x64
             cpu: x86-64-v3
 
           # Linux ARM64 (ubuntu-22.04 for wider glibc compatibility)
           - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
-            artifact_name: gnomon
-            asset_name: gnomon-linux-arm64
+            asset_suffix: linux-arm64
             cpu: neoverse-n1
 
           # Windows x86_64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact_name: gnomon.exe
-            asset_name: gnomon-windows-x64
+            asset_suffix: windows-x64
             cpu: x86-64-v3
 
           # Windows ARM64 (native ARM runner)
           - os: windows-11-arm
             target: aarch64-pc-windows-msvc
-            artifact_name: gnomon.exe
-            asset_name: gnomon-windows-arm64
+            asset_suffix: windows-arm64
             cpu: cortex-a76
 
     steps:
@@ -94,7 +88,7 @@ jobs:
         shell: bash
         run: rm -f .cargo/config.toml
 
-      - name: Build
+      - name: Build and package binaries
         shell: bash
         env:
           # Use specific CPU target instead of 'native' to fix ring#2527 while keeping max optimization
@@ -102,35 +96,93 @@ jobs:
           GNOMON_SKIP_LINT_CHECKS: "1"
           # Embed commit-addressable release tag in binary for version command
           GNOMON_RELEASE_TAG: "main-${{ github.sha }}"
-        run: cargo +nightly build --release --target ${{ matrix.target }}
-
-
-      - name: Package (Unix)
-        if: runner.os != 'Windows'
-        shell: bash
+          TARGET: ${{ matrix.target }}
+          ASSET_SUFFIX: ${{ matrix.asset_suffix }}
+        id: build_binaries
         run: |
-          cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} ${{ matrix.asset_name }}
-          tar -czf ${{ matrix.asset_name }}.tar.gz ${{ matrix.asset_name }}
+          set +e
 
-      - name: Package (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          Copy-Item target/${{ matrix.target }}/release/${{ matrix.artifact_name }} -Destination ${{ matrix.asset_name }}.exe
-          Compress-Archive -Path ${{ matrix.asset_name }}.exe -DestinationPath ${{ matrix.asset_name }}.zip
+          mkdir -p dist
+          : > build-failures.txt
 
+          build_one() {
+            local binary_name="$1"
+            local feature_name="$2"
+            local asset_prefix="$3"
+            local source_name="$binary_name"
+            if [ "$RUNNER_OS" = "Windows" ]; then
+              source_name="${source_name}.exe"
+            fi
+
+            local build_cmd=(
+              cargo +nightly build --release --target "$TARGET"
+            )
+            if [ -n "$feature_name" ]; then
+              build_cmd+=(--no-default-features --features "$feature_name")
+            fi
+            build_cmd+=(--bin "$binary_name")
+
+            echo "::group::Build ${binary_name}"
+            "${build_cmd[@]}"
+            local build_status=$?
+            echo "::endgroup::"
+
+            if [ "$build_status" -ne 0 ]; then
+              echo "${binary_name}" >> build-failures.txt
+              return 0
+            fi
+
+            local asset_base="${asset_prefix}-${ASSET_SUFFIX}"
+            local source_path="target/${TARGET}/release/${source_name}"
+
+            if [ "$RUNNER_OS" = "Windows" ]; then
+              cp "$source_path" "dist/${asset_base}.exe"
+              powershell -NoLogo -NoProfile -Command \
+                "Compress-Archive -Path 'dist/${asset_base}.exe' -DestinationPath 'dist/${asset_base}.zip' -Force"
+              rm -f "dist/${asset_base}.exe"
+            else
+              cp "$source_path" "dist/${asset_base}"
+              tar -czf "dist/${asset_base}.tar.gz" -C dist "${asset_base}"
+              rm -f "dist/${asset_base}"
+            fi
+          }
+
+          build_one gnomon "" gnomon
+          build_one gnomon-map map gnomon-map
+          build_one gnomon-score score gnomon-score
+          build_one gnomon-terms terms gnomon-terms
+          build_one gnomon-calibrate calibrate gnomon-calibrate
+
+          if [ -s build-failures.txt ]; then
+            {
+              echo "failed=true"
+              echo "failed_binaries<<EOF"
+              cat build-failures.txt
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "failed=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Upload Artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.asset_name }}
-          path: |
-            ${{ matrix.asset_name }}.tar.gz
-            ${{ matrix.asset_name }}.zip
-          if-no-files-found: error
+          name: release-${{ matrix.asset_suffix }}
+          path: dist/*
+          if-no-files-found: ignore
+
+      - name: Fail if any binary build failed
+        if: steps.build_binaries.outputs.failed == 'true'
+        shell: bash
+        run: |
+          echo "The following binaries failed for ${{ matrix.target }}:"
+          echo "${{ steps.build_binaries.outputs.failed_binaries }}"
+          exit 1
 
   release:
     name: Create Release
     needs: build
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -141,6 +193,9 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: artifacts
+          pattern: release-*
+          merge-multiple: true
+          if-no-artifact-found: ignore
 
       - name: Display structure of downloaded files
         run: ls -R artifacts
@@ -150,8 +205,10 @@ jobs:
         run: echo "release_tag=main-${{ github.sha }}" >> $GITHUB_OUTPUT
 
       - name: Create Release
+        if: ${{ hashFiles('artifacts/*') != '' }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.release_tag }}
           name: Release ${{ steps.tag.outputs.release_tag }}
           files: artifacts/**/*
+          fail_on_unmatched_files: false
