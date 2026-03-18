@@ -1,0 +1,33 @@
+diff --git a/proofs/Calibrator/CausalInference.lean b/proofs/Calibrator/CausalInference.lean
+index f32ef5e..21bb2e2 100644
+--- a/proofs/Calibrator/CausalInference.lean
++++ b/proofs/Calibrator/CausalInference.lean
+@@ -437,14 +437,21 @@ theorem e_value_ge_one (rr : ℝ) (h_rr : 1 ≤ rr) :
+ 
+ /-- **Sensitivity to LD reference mismatch.**
+     Portability estimates are sensitive to the choice of LD reference.
+-    Using in-sample LD vs. external reference can change R² by δ. -/
++    Using an external reference adds LD mismatch variance, strictly reducing R². -/
++noncomputable def expectedR2WithLDMismatch (vSignal V_E V_mismatch : ℝ) : ℝ :=
++  vSignal / (vSignal + V_E + V_mismatch)
++
+ theorem ld_reference_sensitivity
+-    (r2_in_sample r2_external delta : ℝ)
+-    (h_diff : r2_in_sample = r2_external + delta)
+-    (h_delta : 0 < |delta|) :
+-    r2_in_sample ≠ r2_external := by
+-  rw [h_diff]; intro h; have : delta = 0 := by linarith
+-  exact absurd (this ▸ h_delta) (by simp)
++    (vSignal V_E V_mismatch : ℝ)
++    (h_sig : 0 < vSignal)
++    (h_VE : 0 < V_E)
++    (h_mismatch : 0 < V_mismatch) :
++    expectedR2WithLDMismatch vSignal V_E V_mismatch < expectedR2 vSignal V_E := by
++  unfold expectedR2WithLDMismatch expectedR2
++  have h_denom1 : 0 < vSignal + V_E + V_mismatch := by linarith
++  have h_denom2 : 0 < vSignal + V_E := by linarith
++  rw [div_lt_div_iff₀ h_denom1 h_denom2]
++  nlinarith
+ 
+ /-- **Sensitivity to phenotype definition.**
+     Different phenotype definitions (self-report vs clinical,
