@@ -353,23 +353,42 @@ theorem env_variance_lowers_r2
 /-- **Omitted variable bias in portability regression.**
     If SES (β_s) correlates with genetic distance (correlation ρ),
     the naive coefficient on distance absorbs the SES effect. -/
-theorem omitted_variable_bias
-    (β_true β_ses ρ : ℝ)
-    (h_ses : β_ses ≠ 0) (h_corr : ρ ≠ 0) :
-    β_true + β_ses * ρ ≠ β_true := by
+structure PortabilityRegressionModel where
+  beta_true : ℝ
+  beta_ses : ℝ
+  rho : ℝ
+  h_ses : beta_ses ≠ 0
+  h_corr : rho ≠ 0
+
+noncomputable def naiveCoefficient (m : PortabilityRegressionModel) : ℝ :=
+  m.beta_true + m.beta_ses * m.rho
+
+theorem omitted_variable_bias (m : PortabilityRegressionModel) :
+    naiveCoefficient m ≠ m.beta_true := by
   intro h
-  have : β_ses * ρ = 0 := by linarith
+  unfold naiveCoefficient at h
+  have : m.beta_ses * m.rho = 0 := by linarith
   rcases mul_eq_zero.mp this with h | h
-  · exact h_ses h
-  · exact h_corr h
+  · exact m.h_ses h
+  · exact m.h_corr h
 
 /-- **Portability drop decomposes into genetic + environmental parts.** -/
-theorem portability_drop_decomp
-    (r2s r2t Δg Δe : ℝ)
-    (h_eq : r2s - r2t = Δg + Δe)
-    (hΔg : 0 ≤ Δg) (hΔe : 0 ≤ Δe) :
-    Δg ≤ r2s - r2t ∧ Δe ≤ r2s - r2t := by
-  constructor <;> linarith
+structure PortabilityDropModel where
+  r2_source : ℝ
+  r2_target : ℝ
+  delta_g : ℝ
+  delta_e : ℝ
+  h_drop : r2_source - r2_target = delta_g + delta_e
+  h_g_nonneg : 0 ≤ delta_g
+  h_e_nonneg : 0 ≤ delta_e
+
+theorem portability_drop_decomp (m : PortabilityDropModel) :
+    m.delta_g ≤ m.r2_source - m.r2_target ∧ m.delta_e ≤ m.r2_source - m.r2_target := by
+  constructor
+  · rw [m.h_drop]
+    exact le_add_of_nonneg_right m.h_e_nonneg
+  · rw [m.h_drop]
+    exact le_add_of_nonneg_left m.h_g_nonneg
 
 end Question4
 
@@ -382,18 +401,36 @@ section Question5
 
 /-- **Winner's curse prediction error model.**
     GWAS estimate β_hat = β_true + δ (inflation).
-    Target effect β_t = ρ * β_true (turnover).
-    Prediction error = β_hat - β_t = (1-ρ)*β + δ.
-    Prediction error decomposes into turnover + inflation. -/
-theorem prediction_error_decomp (β δ ρ : ℝ) :
-    (β + δ) - ρ * β = (1 - ρ) * β + δ := by ring
+    Target effect β_t = ρ * β_true (turnover). -/
+structure WinnersCurseModel where
+  beta_true : ℝ
+  inflation : ℝ
+  turnover : ℝ
+  h_beta_pos : 0 < beta_true
+  h_inflation_pos : 0 < inflation
+  h_turnover_le_one : turnover ≤ 1
+
+noncomputable def gwasEstimate (m : WinnersCurseModel) : ℝ :=
+  m.beta_true + m.inflation
+
+noncomputable def targetEffect (m : WinnersCurseModel) : ℝ :=
+  m.turnover * m.beta_true
+
+noncomputable def predictionError (m : WinnersCurseModel) : ℝ :=
+  gwasEstimate m - targetEffect m
+
+theorem prediction_error_decomp (m : WinnersCurseModel) :
+    predictionError m = (1 - m.turnover) * m.beta_true + m.inflation := by
+  unfold predictionError gwasEstimate targetEffect
+  ring
 
 /-- Prediction error is positive when both components are positive. -/
-theorem prediction_error_positive
-    (β δ ρ : ℝ) (hβ : 0 < β) (hδ : 0 < δ) (hρ : ρ ≤ 1) :
-    0 < (1 - ρ) * β + δ := by
-  have : 0 ≤ (1 - ρ) * β := mul_nonneg (by linarith) (le_of_lt hβ)
-  linarith
+theorem prediction_error_positive (m : WinnersCurseModel) :
+    0 < predictionError m := by
+  rw [prediction_error_decomp]
+  have : 0 ≤ (1 - m.turnover) * m.beta_true :=
+    mul_nonneg (by linarith [m.h_turnover_le_one]) (le_of_lt m.h_beta_pos)
+  linarith [m.h_inflation_pos]
 
 /-- **Winner's curse is worse with more turnover.**
     Relative error = ((1-ρ)β + δ) / (ρβ). As ρ↓, this increases. -/
@@ -839,26 +876,32 @@ theorem prevalence_dominates_sensitivity_for_recall
     rwa [div_lt_div_iff₀ h_sens₂ h_cases₁] at h_sens_ratio
   simpa [mul_comm] using htp
 
+/-- **Disease Portability Metrics.** -/
+structure DiseasePortabilityMetrics where
+  prec_near : ℝ
+  prec_far : ℝ
+  rec_near : ℝ
+  rec_far : ℝ
+
+/-- Asthma pattern: both metrics decay. -/
+def AsthmaPattern (m : DiseasePortabilityMetrics) : Prop :=
+  m.prec_far < m.prec_near ∧ m.rec_far < m.rec_near
+
+/-- T2D pattern: precision constant, recall increases. -/
+def T2DPattern (m : DiseasePortabilityMetrics) : Prop :=
+  m.prec_near = m.prec_far ∧ m.rec_near < m.rec_far
+
 /-- **Asthma vs T2D portability difference.**
-    For asthma, precision and recall decay similarly → qualitatively similar.
-    For T2D, they diverge → qualitatively different.
-    The difference is driven by the prevalence-distance relationship. -/
-theorem different_diseases_different_portability_patterns
-    -- Asthma: both metrics decay
-    (prec_asthma_near prec_asthma_far : ℝ)
-    (rec_asthma_near rec_asthma_far : ℝ)
-    (h_prec_asthma_drops : prec_asthma_far < prec_asthma_near)
-    (h_rec_asthma_drops : rec_asthma_far < rec_asthma_near)
-    -- T2D: precision constant, recall increases
-    (prec_t2d_near prec_t2d_far : ℝ)
-    (rec_t2d_near rec_t2d_far : ℝ)
-    (h_prec_t2d_const : prec_t2d_near = prec_t2d_far)
-    (h_rec_t2d_up : rec_t2d_near < rec_t2d_far)
-    :
-    -- The diseases show qualitatively different portability patterns
-    (prec_asthma_far < prec_asthma_near ∧ rec_asthma_far < rec_asthma_near) ∧
-    (prec_t2d_near = prec_t2d_far ∧ rec_t2d_near < rec_t2d_far) :=
-  ⟨⟨h_prec_asthma_drops, h_rec_asthma_drops⟩, ⟨h_prec_t2d_const, h_rec_t2d_up⟩⟩
+    The diseases show qualitatively different portability patterns. -/
+theorem different_diseases_different_portability_patterns (m : DiseasePortabilityMetrics) :
+    AsthmaPattern m → ¬ T2DPattern m := by
+  intro h_asthma h_t2d
+  unfold AsthmaPattern at h_asthma
+  unfold T2DPattern at h_t2d
+  have h_prec_diff : m.prec_far < m.prec_far := by
+    calc m.prec_far < m.prec_near := h_asthma.1
+      _ = m.prec_far := h_t2d.1
+  exact (lt_self_iff_false _).mp h_prec_diff
 
 end DiseasePortability
 
@@ -879,15 +922,22 @@ section RecoverablePortability
 /-- **Mean shift is recoverable by re-calibration.**
     If the PGS has a mean shift μ across populations, adjusting the
     intercept recovers the correct calibration. -/
-theorem mean_shift_recoverable
-    (y_pred μ_shift : ℝ) :
-    y_pred - μ_shift + μ_shift = y_pred := by ring
+noncomputable def interceptRecalibration (pgs μ_shift : ℝ) : ℝ :=
+  pgs - μ_shift
+
+theorem mean_shift_recoverable (y_pred μ_shift : ℝ) :
+    interceptRecalibration (y_pred + μ_shift) μ_shift = y_pred := by
+  unfold interceptRecalibration
+  ring
 
 /-- **Slope change (shrinkage) is recoverable by re-calibration.**
     If the PGS slope changes from b to b·r, multiplying by 1/r recovers it. -/
-theorem slope_change_recoverable
-    (b r pgs : ℝ) (hr : r ≠ 0) :
-    (b * r * pgs) * (1 / r) = b * pgs := by
+noncomputable def slopeRecalibration (pgs r : ℝ) : ℝ :=
+  pgs * (1 / r)
+
+theorem slope_change_recoverable (b r pgs : ℝ) (hr : r ≠ 0) :
+    slopeRecalibration (b * r * pgs) r = b * pgs := by
+  unfold slopeRecalibration
   field_simp
 
 /-- **LD mismatch is NOT recoverable by linear re-calibration.**
