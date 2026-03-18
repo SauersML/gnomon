@@ -219,10 +219,12 @@ theorem gwas_h2_le_true (h2_true avg_r2_tag : ℝ)
     Source LD is tagged better in source-derived GWAS than target LD.
     This creates a technical portability artifact. -/
 theorem tagging_creates_portability_artifact
-    (h2_source_gwas h2_target_gwas h2_true : ℝ)
-    (h_source_better : h2_target_gwas < h2_source_gwas)
-    (h_true : h2_source_gwas ≤ h2_true) :
-    h2_target_gwas < h2_true := by linarith
+    (h2_true avg_r2_tag_source avg_r2_tag_target : ℝ)
+    (h_h2_pos : 0 < h2_true)
+    (h_source_better : avg_r2_tag_target < avg_r2_tag_source) :
+    gwasHeritability h2_true avg_r2_tag_target < gwasHeritability h2_true avg_r2_tag_source := by
+  unfold gwasHeritability
+  exact mul_lt_mul_of_pos_left h_source_better h_h2_pos
 
 end LDTagging
 
@@ -368,15 +370,30 @@ theorem fst_decreases_with_migration (m₁ m₂ Ne : ℝ)
   rw [div_lt_div_iff₀ (by nlinarith) (by nlinarith)]
   nlinarith
 
+/-- **Genetic correlation from shared and distinct variance components.**
+    Assuming equal total variance in both populations, rg = V_shared / (V_shared + V_distinct). -/
+noncomputable def geneticCorrelationArchitecture (v_shared v_distinct : ℝ) : ℝ :=
+  v_shared / (v_shared + v_distinct)
+
 /-- **Shared selection homogenizes architecture.**
     If both populations experience the same selective pressure
-    (e.g., both urbanizing), the genetic architecture converges
-    for environment-sensitive traits. -/
+    (e.g., both urbanizing), the shared genetic variance increases
+    and distinct genetic variance decreases, improving genetic correlation. -/
 theorem shared_selection_improves_portability
-    (rg_before rg_after : ℝ)
-    (h_improves : rg_before < rg_after)
-    (h_le : rg_after ≤ 1) :
-    rg_before < 1 := by linarith
+    (v_shared_before v_distinct_before : ℝ)
+    (v_shared_after v_distinct_after : ℝ)
+    (h_shared_pos : 0 < v_shared_before)
+    (h_distinct_pos : 0 < v_distinct_before)
+    (h_shared_inc : v_shared_before < v_shared_after)
+    (h_distinct_dec : v_distinct_after < v_distinct_before)
+    (h_distinct_after_pos : 0 < v_distinct_after) :
+    geneticCorrelationArchitecture v_shared_before v_distinct_before <
+    geneticCorrelationArchitecture v_shared_after v_distinct_after := by
+  unfold geneticCorrelationArchitecture
+  have h_denom_before : 0 < v_shared_before + v_distinct_before := by linarith
+  have h_denom_after : 0 < v_shared_after + v_distinct_after := by linarith
+  apply (div_lt_div_iff₀ h_denom_before h_denom_after).mpr
+  nlinarith
 
 /-!
 ### Derivation: portabilityFromArchitecture = rg² × (1 - Fst) × tagging_ratio
