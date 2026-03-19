@@ -1,0 +1,78 @@
+diff --git a/proofs/Calibrator/StatisticalGeneticsMethodology.lean b/proofs/Calibrator/StatisticalGeneticsMethodology.lean
+index 3250495..5c99435 100644
+--- a/proofs/Calibrator/StatisticalGeneticsMethodology.lean
++++ b/proofs/Calibrator/StatisticalGeneticsMethodology.lean
+@@ -234,6 +234,16 @@ theorem effective_n_pos (se : ℝ) (h_se : 0 < se) :
+     β̂_meta = Σ_k w_k β̂_k / Σ_k w_k where w_k = 1/SE_k².
+     This combines information across ancestries. -/
+ 
++/-- **Fixed effects meta-analysis variance.**
++    Assumes same β across populations (tau² = 0). -/
++noncomputable def fixedEffectsVariance (se_fixed : ℝ) : ℝ :=
++  se_fixed ^ 2
++
++/-- **Random effects meta-analysis variance.**
++    Allows β to vary with between-population variance tau². -/
++noncomputable def randomEffectsVariance (se_fixed tau_sq : ℝ) : ℝ :=
++  se_fixed ^ 2 + tau_sq
++
+ /-- **Fixed vs random effects meta-analysis.**
+     Fixed effects: assumes same β across populations (tau² = 0).
+     Random effects: allows β to vary with between-population variance tau².
+@@ -243,7 +253,8 @@ theorem random_effects_captures_heterogeneity
+     (se_fixed tau_sq : ℝ) -- fixed-effects SE and between-population variance
+     (h_se : 0 < se_fixed) (h_heterogeneous : 0 < tau_sq) :
+     -- Random effects SE² = fixed SE² + tau² > fixed SE²
+-    se_fixed ^ 2 < se_fixed ^ 2 + tau_sq := by
++    fixedEffectsVariance se_fixed < randomEffectsVariance se_fixed tau_sq := by
++  unfold fixedEffectsVariance randomEffectsVariance
+   linarith
+ 
+ end SummaryStatPGS
+@@ -333,6 +344,12 @@ section GeneticCorrelationMethods
+     Uses the LDAK model for LD-dependent architecture
+     and may give different ρ_g estimates than LDSC. -/
+ 
++/-- **Uncertainty range of multiple correlation estimates.**
++    Captures the irreducible uncertainty when different methods
++    give conflicting estimates of genetic correlation. -/
++noncomputable def correlationEstimateRange (rho_min rho_max : ℝ) : ℝ :=
++  rho_max - rho_min
++
+ /-- **Method comparison: different methods can give different ρ̂_g.**
+     This matters because ρ̂_g predicts portability.
+     When methods disagree, the range of estimates is positive,
+@@ -342,7 +359,9 @@ theorem method_disagreement_increases_uncertainty
+     (h_order : rho_popcorn < rho_ldsc)
+     (h_order₂ : rho_ldsc < rho_sumher) :
+     -- The range of estimates is strictly positive
+-    0 < rho_sumher - rho_popcorn := by linarith
++    0 < correlationEstimateRange rho_popcorn rho_sumher := by
++  unfold correlationEstimateRange
++  linarith
+ 
+ /-- **Genetic correlation varies across the genome.**
+     ρ_g estimated from different genomic regions can vary,
+@@ -358,6 +377,11 @@ theorem local_genetic_correlation_varies
+   rw [lt_div_iff₀ (by linarith : (0:ℝ) < w₁ + w₆)]
+   nlinarith
+ 
++/-- **Expected genetic correlation from Fst.**
++    Modeled as 1 - Fst under pure genetic drift. -/
++noncomputable def expectedGenCor (fst : ℝ) : ℝ :=
++  1 - fst
++
+ /-- **Genetic correlation is frequency-dependent.**
+     Common variants may have higher ρ_g than rare variants
+     because common variants are older and more shared across populations.
+@@ -369,7 +393,9 @@ theorem common_variants_higher_correlation
+     (h_fst_rare : 0 ≤ fst_rare) (h_fst_rare_lt : fst_rare < 1)
+     (h_older_less_diverged : fst_common < fst_rare) :
+     -- ρ_g ~ 1 - Fst, so lower Fst → higher correlation
+-    1 - fst_rare < 1 - fst_common := by linarith
++    expectedGenCor fst_rare < expectedGenCor fst_common := by
++  unfold expectedGenCor
++  linarith
+ 
+ end GeneticCorrelationMethods
+ 
