@@ -514,17 +514,36 @@ theorem survivorship_attenuates_in_older (m : SurvivorshipAttenuationModel) :
       < m.r2_full * 1 := by exact mul_lt_mul_of_pos_left h_ratio_lt_one m.r2_full_pos
     _ = m.r2_full := by ring
 
-/-- **Differential survivorship across populations creates portability artifact.**
-    If the target population has different age structure or mortality patterns,
-    survivorship bias contributes to apparent portability loss. -/
-theorem differential_survivorship_artifact
-    (r2_source_full r2_target_full Δ_surv_source Δ_surv_target : ℝ)
-    (h_surv_s : 0 ≤ Δ_surv_source) (h_surv_t : 0 ≤ Δ_surv_target)
-    (h_diff : Δ_surv_target > Δ_surv_source)
-    (h_obs_s : r2_source_full - Δ_surv_source > 0) :
-    (r2_source_full - Δ_surv_source) - (r2_target_full - Δ_surv_target) >
-      r2_source_full - r2_target_full := by
-  linarith
+/-- **Differential survivorship creates portability artifact.**
+    By extending the survivorship attenuation model to two populations,
+    we can show that if the target population has stronger survivorship bias
+    (a larger reduction in variance among survivors), the apparent portability
+    drop exceeds the true portability drop. -/
+structure TwoPopSurvivorshipModel where
+  source : SurvivorshipAttenuationModel
+  target : SurvivorshipAttenuationModel
+  /-- Same true R² at birth -/
+  equal_true_r2 : source.r2_full = target.r2_full
+  /-- Same birth variance -/
+  equal_birth_var : source.var_birth = target.var_birth
+  /-- Target population has stronger survivorship selection (lower variance among survivors) -/
+  stronger_survivorship_target : target.var_surv < source.var_surv
+
+/-- The observed portability drop between source and target survivor cohorts
+    is strictly positive (an artifact) even though true portability drop is zero. -/
+theorem differential_survivorship_artifact (m : TwoPopSurvivorshipModel) :
+    m.source.r2_surv - m.target.r2_surv > m.source.r2_full - m.target.r2_full := by
+  have true_drop_zero : m.source.r2_full - m.target.r2_full = 0 := sub_eq_zero.mpr m.equal_true_r2
+  rw [true_drop_zero]
+  unfold SurvivorshipAttenuationModel.r2_surv
+  have h_var_ratio : m.target.var_surv / m.target.var_birth < m.source.var_surv / m.source.var_birth := by
+    rw [m.equal_birth_var]
+    exact div_lt_div_of_pos_right m.stronger_survivorship_target m.target.var_birth_pos
+  have h_mul : m.target.r2_full * (m.target.var_surv / m.target.var_birth) <
+               m.source.r2_full * (m.source.var_surv / m.source.var_birth) := by
+    rw [← m.equal_true_r2]
+    exact mul_lt_mul_of_pos_left h_var_ratio m.source.r2_full_pos
+  exact sub_pos.mpr h_mul
 
 end SurvivorshipBias
 
