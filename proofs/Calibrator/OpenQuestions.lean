@@ -363,12 +363,34 @@ theorem omitted_variable_bias
   · exact h_ses h
   · exact h_corr h
 
+/-- **Genetic contribution to portability drop.** -/
+noncomputable def geneticPortabilityDrop (r2s_g r2t_g : ℝ) : ℝ :=
+  r2s_g - r2t_g
+
+/-- **Environmental contribution to portability drop.** -/
+noncomputable def environmentalPortabilityDrop (r2s_e r2t_e : ℝ) : ℝ :=
+  r2s_e - r2t_e
+
+/-- **Total portability drop.** -/
+noncomputable def totalPortabilityDrop (r2s_g r2s_e r2t_g r2t_e : ℝ) : ℝ :=
+  (r2s_g + r2s_e) - (r2t_g + r2t_e)
+
 /-- **Portability drop decomposes into genetic + environmental parts.** -/
 theorem portability_drop_decomp
-    (r2s r2t Δg Δe : ℝ)
-    (h_eq : r2s - r2t = Δg + Δe)
-    (hΔg : 0 ≤ Δg) (hΔe : 0 ≤ Δe) :
-    Δg ≤ r2s - r2t ∧ Δe ≤ r2s - r2t := by
+    (r2s_g r2s_e r2t_g r2t_e : ℝ) :
+    totalPortabilityDrop r2s_g r2s_e r2t_g r2t_e
+      = geneticPortabilityDrop r2s_g r2t_g + environmentalPortabilityDrop r2s_e r2t_e := by
+  unfold totalPortabilityDrop geneticPortabilityDrop environmentalPortabilityDrop
+  ring
+
+/-- **Bounds on components of portability drop.** -/
+theorem portability_drop_bounds
+    (r2s_g r2s_e r2t_g r2t_e : ℝ)
+    (hΔg : 0 ≤ geneticPortabilityDrop r2s_g r2t_g)
+    (hΔe : 0 ≤ environmentalPortabilityDrop r2s_e r2t_e) :
+    geneticPortabilityDrop r2s_g r2t_g ≤ totalPortabilityDrop r2s_g r2s_e r2t_g r2t_e ∧
+    environmentalPortabilityDrop r2s_e r2t_e ≤ totalPortabilityDrop r2s_g r2s_e r2t_g r2t_e := by
+  unfold totalPortabilityDrop geneticPortabilityDrop environmentalPortabilityDrop at *
   constructor <;> linarith
 
 end Question4
