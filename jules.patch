@@ -1,0 +1,26 @@
+diff --git a/proofs/Calibrator/AncestrySpecificArchitecture.lean b/proofs/Calibrator/AncestrySpecificArchitecture.lean
+index 1eaf552..e5612b3 100644
+--- a/proofs/Calibrator/AncestrySpecificArchitecture.lean
++++ b/proofs/Calibrator/AncestrySpecificArchitecture.lean
+@@ -219,10 +219,17 @@ theorem gwas_h2_le_true (h2_true avg_r2_tag : ℝ)
+     Source LD is tagged better in source-derived GWAS than target LD.
+     This creates a technical portability artifact. -/
+ theorem tagging_creates_portability_artifact
+-    (h2_source_gwas h2_target_gwas h2_true : ℝ)
+-    (h_source_better : h2_target_gwas < h2_source_gwas)
+-    (h_true : h2_source_gwas ≤ h2_true) :
+-    h2_target_gwas < h2_true := by linarith
++    (h2_true avg_r2_tag_source avg_r2_tag_target : ℝ)
++    (h_h2_pos : 0 < h2_true)
++    (h_tag_source_le_one : avg_r2_tag_source ≤ 1)
++    (h_target_worse : avg_r2_tag_target < avg_r2_tag_source) :
++    gwasHeritability h2_true avg_r2_tag_target < gwasHeritability h2_true avg_r2_tag_source ∧
++    gwasHeritability h2_true avg_r2_tag_source ≤ h2_true := by
++  unfold gwasHeritability
++  constructor
++  · exact mul_lt_mul_of_pos_left h_target_worse h_h2_pos
++  · have h : h2_true * avg_r2_tag_source ≤ h2_true * 1 := mul_le_mul_of_nonneg_left h_tag_source_le_one (le_of_lt h_h2_pos)
++    rwa [mul_one] at h
+ 
+ end LDTagging
+ 
