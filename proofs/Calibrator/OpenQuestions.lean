@@ -353,22 +353,33 @@ theorem env_variance_lowers_r2
 /-- **Omitted variable bias in portability regression.**
     If SES (β_s) correlates with genetic distance (correlation ρ),
     the naive coefficient on distance absorbs the SES effect. -/
+noncomputable def naiveCoefficient (β_true β_ses ρ : ℝ) : ℝ :=
+  β_true + β_ses * ρ
+
 theorem omitted_variable_bias
     (β_true β_ses ρ : ℝ)
     (h_ses : β_ses ≠ 0) (h_corr : ρ ≠ 0) :
-    β_true + β_ses * ρ ≠ β_true := by
+    naiveCoefficient β_true β_ses ρ ≠ β_true := by
   intro h
+  unfold naiveCoefficient at h
   have : β_ses * ρ = 0 := by linarith
-  rcases mul_eq_zero.mp this with h | h
-  · exact h_ses h
-  · exact h_corr h
+  rcases mul_eq_zero.mp this with h_ses_eq | h_corr_eq
+  · exact h_ses h_ses_eq
+  · exact h_corr h_corr_eq
 
 /-- **Portability drop decomposes into genetic + environmental parts.** -/
+noncomputable def r2DropModel (r2s Δg Δe : ℝ) : ℝ :=
+  r2s - (Δg + Δe)
+
+noncomputable def r2Drop (r2s r2t : ℝ) : ℝ :=
+  r2s - r2t
+
 theorem portability_drop_decomp
-    (r2s r2t Δg Δe : ℝ)
-    (h_eq : r2s - r2t = Δg + Δe)
+    (r2s Δg Δe : ℝ)
     (hΔg : 0 ≤ Δg) (hΔe : 0 ≤ Δe) :
-    Δg ≤ r2s - r2t ∧ Δe ≤ r2s - r2t := by
+    Δg ≤ r2Drop r2s (r2DropModel r2s Δg Δe) ∧
+    Δe ≤ r2Drop r2s (r2DropModel r2s Δg Δe) := by
+  unfold r2Drop r2DropModel
   constructor <;> linarith
 
 end Question4
@@ -385,13 +396,25 @@ section Question5
     Target effect β_t = ρ * β_true (turnover).
     Prediction error = β_hat - β_t = (1-ρ)*β + δ.
     Prediction error decomposes into turnover + inflation. -/
+noncomputable def gwasEstimate (β δ : ℝ) : ℝ :=
+  β + δ
+
+noncomputable def targetEffect (β ρ : ℝ) : ℝ :=
+  ρ * β
+
+noncomputable def predictionError (β_hat β_t : ℝ) : ℝ :=
+  β_hat - β_t
+
 theorem prediction_error_decomp (β δ ρ : ℝ) :
-    (β + δ) - ρ * β = (1 - ρ) * β + δ := by ring
+    predictionError (gwasEstimate β δ) (targetEffect β ρ) = (1 - ρ) * β + δ := by
+  unfold predictionError gwasEstimate targetEffect
+  ring
 
 /-- Prediction error is positive when both components are positive. -/
 theorem prediction_error_positive
     (β δ ρ : ℝ) (hβ : 0 < β) (hδ : 0 < δ) (hρ : ρ ≤ 1) :
-    0 < (1 - ρ) * β + δ := by
+    0 < predictionError (gwasEstimate β δ) (targetEffect β ρ) := by
+  rw [prediction_error_decomp]
   have : 0 ≤ (1 - ρ) * β := mul_nonneg (by linarith) (le_of_lt hβ)
   linarith
 
@@ -400,7 +423,10 @@ theorem prediction_error_positive
 theorem relative_error_increases_with_turnover
     (β δ ρ₁ ρ₂ : ℝ) (hβ : 0 < β) (hδ : 0 < δ)
     (hρ₁ : 0 < ρ₁) (hρ₂ : 0 < ρ₂) (hρ : ρ₂ < ρ₁) (_hρ₁_le : ρ₁ ≤ 1) :
-    ((1 - ρ₁) * β + δ) / (ρ₁ * β) < ((1 - ρ₂) * β + δ) / (ρ₂ * β) := by
+    predictionError (gwasEstimate β δ) (targetEffect β ρ₁) / targetEffect β ρ₁ <
+    predictionError (gwasEstimate β δ) (targetEffect β ρ₂) / targetEffect β ρ₂ := by
+  rw [prediction_error_decomp, prediction_error_decomp]
+  unfold targetEffect
   rw [div_lt_div_iff₀ (mul_pos hρ₁ hβ) (mul_pos hρ₂ hβ)]
   nlinarith [sq_nonneg β, sq_nonneg δ, mul_pos hρ₁ hβ, mul_pos hρ₂ hβ,
              mul_pos hβ hδ, mul_pos hρ₁ hδ, mul_pos hρ₂ hδ]
