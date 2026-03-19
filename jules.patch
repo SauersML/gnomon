@@ -1,0 +1,28 @@
+diff --git a/proofs/Calibrator/AncestryCalibration.lean b/proofs/Calibrator/AncestryCalibration.lean
+index 8e91f0b..f94a1da 100644
+--- a/proofs/Calibrator/AncestryCalibration.lean
++++ b/proofs/Calibrator/AncestryCalibration.lean
+@@ -97,6 +97,12 @@ theorem spline_error_improves_with_knots
+   apply pow_lt_pow_left₀ h_finer (le_of_lt h_pos)
+   norm_num
+ 
++/-- **Spline Mean Squared Error (MSE).**
++    The total prediction error of a spline estimator decomposed
++    into its structural bias and sampling variance components. -/
++noncomputable def splineMSE (bias var : ℝ) : ℝ :=
++  bias ^ 2 + var
++
+ /-- **Bias-variance tradeoff in spline calibration.**
+     More knots → less bias (better approximation)
+     More knots → more variance (overfitting)
+@@ -116,7 +122,9 @@ theorem bias_variance_tradeoff
+     (h_bias_improves : bias₂ ^ 2 < bias₁ ^ 2)
+     (h_var_worsens : var₁ < var₂)
+     (h_var_dominates : var₂ - var₁ > bias₁ ^ 2 - bias₂ ^ 2) :
+-    bias₁ ^ 2 + var₁ < bias₂ ^ 2 + var₂ := by linarith
++    splineMSE bias₁ var₁ < splineMSE bias₂ var₂ := by
++  unfold splineMSE
++  linarith
+ 
+ /-- **Spline R² is bounded by the signal-to-noise ratio.**
+     R²_spline ≤ Var(E[ε²|d]) / Var(ε²).
