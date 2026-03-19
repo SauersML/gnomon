@@ -38,12 +38,16 @@ section StratificationBias
 
 /-- Stratification bias is nonzero when ancestry correlates with both
     phenotype and genotype. -/
+noncomputable def stratificationBias (cov_anc_pheno cov_anc_geno var_geno : ℝ) : ℝ :=
+  cov_anc_pheno * cov_anc_geno / var_geno
+
 theorem stratification_bias_nonzero
     (cov_anc_pheno cov_anc_geno var_geno : ℝ)
     (h_pheno : cov_anc_pheno ≠ 0)
     (h_geno : cov_anc_geno ≠ 0)
     (h_var : 0 < var_geno) :
-    cov_anc_pheno * cov_anc_geno / var_geno ≠ 0 := by
+    stratificationBias cov_anc_pheno cov_anc_geno var_geno ≠ 0 := by
+  unfold stratificationBias
   apply div_ne_zero
   · exact mul_ne_zero h_pheno h_geno
   · exact h_var.ne'
@@ -325,16 +329,22 @@ theorem collider_attenuates_association (m : ColliderModel) :
 /-- **Differential ascertainment creates portability artifact.**
     If source and target cohorts have different ascertainment patterns,
     the apparent portability drop includes an ascertainment component. -/
+noncomputable def apparentPortabilityDrop (r2_source_asc r2_target_asc : ℝ) : ℝ :=
+  r2_source_asc - r2_target_asc
+
+noncomputable def truePortabilityDrop (r2_source_pop r2_target_pop : ℝ) : ℝ :=
+  r2_source_pop - r2_target_pop
+
 theorem differential_ascertainment_artifact
     (r2_source_pop r2_target_pop r2_source_asc r2_target_asc : ℝ)
-    (h_source_asc : r2_source_asc < r2_source_pop)
-    (h_target_asc : r2_target_asc < r2_target_pop)
+    (_h_source_asc : r2_source_asc < r2_source_pop)
+    (_h_target_asc : r2_target_asc < r2_target_pop)
     -- Different ascertainment severity
-    (h_diff_severity : r2_target_pop - r2_target_asc < r2_source_pop - r2_source_asc) :
+    (h_diff_severity : r2_source_pop - r2_source_asc < r2_target_pop - r2_target_asc) :
     -- Apparent portability drop is larger than true portability drop
-    r2_source_asc - r2_target_asc > r2_source_pop - r2_target_pop →
-      False := by
-  intro h
+    truePortabilityDrop r2_source_pop r2_target_pop <
+      apparentPortabilityDrop r2_source_asc r2_target_asc := by
+  unfold truePortabilityDrop apparentPortabilityDrop
   linarith
 
 end ColliderBias
@@ -517,13 +527,18 @@ theorem survivorship_attenuates_in_older (m : SurvivorshipAttenuationModel) :
 /-- **Differential survivorship across populations creates portability artifact.**
     If the target population has different age structure or mortality patterns,
     survivorship bias contributes to apparent portability loss. -/
+noncomputable def observedR2Survivorship (r2_full Δ_surv : ℝ) : ℝ :=
+  r2_full - Δ_surv
+
 theorem differential_survivorship_artifact
     (r2_source_full r2_target_full Δ_surv_source Δ_surv_target : ℝ)
-    (h_surv_s : 0 ≤ Δ_surv_source) (h_surv_t : 0 ≤ Δ_surv_target)
-    (h_diff : Δ_surv_target > Δ_surv_source)
-    (h_obs_s : r2_source_full - Δ_surv_source > 0) :
-    (r2_source_full - Δ_surv_source) - (r2_target_full - Δ_surv_target) >
-      r2_source_full - r2_target_full := by
+    (_h_surv_s : 0 ≤ Δ_surv_source) (_h_surv_t : 0 ≤ Δ_surv_target)
+    (h_diff : Δ_surv_source < Δ_surv_target)
+    (_h_obs_s : 0 < observedR2Survivorship r2_source_full Δ_surv_source) :
+    r2_source_full - r2_target_full <
+      observedR2Survivorship r2_source_full Δ_surv_source -
+      observedR2Survivorship r2_target_full Δ_surv_target := by
+  unfold observedR2Survivorship
   linarith
 
 end SurvivorshipBias
