@@ -567,15 +567,42 @@ theorem factor_lower_bounds_sum_strictly_below_total
     (_h_f1_nn : 0 ≤ var_explained_f1) (_h_f2_nn : 0 ≤ var_explained_f2) :
     lb₁ + lb₂ < var_explained_f1 + var_explained_f2 := by linarith
 
-/-- **A prediction error bound implies any looser tolerance bound.**
-    If `|actual - predicted| ≤ ε` and `ε < bound`, then the prediction error is
-    strictly below `bound`. This is only the final inequality step, not the
-    derivation of the predictor itself. -/
+/-- A model for predicting trait portability from its genetic architecture.
+    Traits with higher polygenicity and stronger selection signals tend to
+    have lower portability across populations. -/
+structure PortabilityPredictor where
+  baseline_portability : ℝ
+  polygenicity_penalty : ℝ
+  selection_penalty : ℝ
+  h_base_pos : 0 < baseline_portability
+  h_poly_nn : 0 ≤ polygenicity_penalty
+  h_sel_nn : 0 ≤ selection_penalty
+
+noncomputable def predictedPortabilityPhenome (p : PortabilityPredictor) : ℝ :=
+  p.baseline_portability - p.polygenicity_penalty - p.selection_penalty
+
+/-- **Prediction error is bounded by architecture penalties.**
+    If the actual portability is within the selection penalty of the
+    baseline minus polygenicity penalty, the overall prediction error
+    from the full model is bounded. -/
 theorem prediction_error_bounded_by_looser_tolerance
-    (_polygenicity _selection_signal predicted_port actual_port ε bound : ℝ)
-    (h_prediction : |actual_port - predicted_port| ≤ ε)
-    (h_small_error : ε < bound) :
-    |actual_port - predicted_port| < bound := by linarith
+    (p : PortabilityPredictor) (actual_port : ℝ)
+    (h_base_bound : |actual_port - (p.baseline_portability - p.polygenicity_penalty)| ≤ p.selection_penalty)
+    (h_sel_bound : p.selection_penalty < 0.05) :
+    |actual_port - predictedPortabilityPhenome p| < 0.1 := by
+  unfold predictedPortabilityPhenome
+  have : p.baseline_portability - p.polygenicity_penalty - p.selection_penalty =
+         (p.baseline_portability - p.polygenicity_penalty) - p.selection_penalty := by ring
+  rw [this]
+  have h_eq : actual_port - ((p.baseline_portability - p.polygenicity_penalty) - p.selection_penalty) =
+      (actual_port - (p.baseline_portability - p.polygenicity_penalty)) + p.selection_penalty := by ring
+  rw [h_eq]
+  have h_abs : |(actual_port - (p.baseline_portability - p.polygenicity_penalty)) + p.selection_penalty| ≤
+      |actual_port - (p.baseline_portability - p.polygenicity_penalty)| + |p.selection_penalty| := by
+    exact abs_add_le (actual_port - (p.baseline_portability - p.polygenicity_penalty)) p.selection_penalty
+  have h_sel_abs : |p.selection_penalty| = p.selection_penalty := abs_of_nonneg p.h_sel_nn
+  rw [h_sel_abs] at h_abs
+  linarith
 
 /-- **Disease traits vs quantitative traits.**
     Disease traits often show worse portability than their
