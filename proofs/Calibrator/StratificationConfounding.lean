@@ -322,19 +322,27 @@ theorem collider_attenuates_association (m : ColliderModel) :
       < m.β_G * 1 := by exact mul_lt_mul_of_pos_left h_ratio_lt_one m.β_G_pos
     _ = m.β_G := by ring
 
+/-- Apparent portability drop due to ascertainment bias. -/
+noncomputable def apparentPortabilityDrop (r2_source_asc r2_target_asc : ℝ) : ℝ :=
+  r2_source_asc - r2_target_asc
+
+/-- True portability drop. -/
+noncomputable def truePortabilityDrop (r2_source_pop r2_target_pop : ℝ) : ℝ :=
+  r2_source_pop - r2_target_pop
+
 /-- **Differential ascertainment creates portability artifact.**
     If source and target cohorts have different ascertainment patterns,
-    the apparent portability drop includes an ascertainment component. -/
+    the apparent portability drop includes an ascertainment component
+    and exceeds the true portability drop. -/
 theorem differential_ascertainment_artifact
     (r2_source_pop r2_target_pop r2_source_asc r2_target_asc : ℝ)
     (h_source_asc : r2_source_asc < r2_source_pop)
     (h_target_asc : r2_target_asc < r2_target_pop)
     -- Different ascertainment severity
-    (h_diff_severity : r2_target_pop - r2_target_asc < r2_source_pop - r2_source_asc) :
+    (h_diff_severity : r2_target_pop - r2_target_asc > r2_source_pop - r2_source_asc) :
     -- Apparent portability drop is larger than true portability drop
-    r2_source_asc - r2_target_asc > r2_source_pop - r2_target_pop →
-      False := by
-  intro h
+    apparentPortabilityDrop r2_source_asc r2_target_asc > truePortabilityDrop r2_source_pop r2_target_pop := by
+  unfold apparentPortabilityDrop truePortabilityDrop
   linarith
 
 end ColliderBias
@@ -522,8 +530,9 @@ theorem differential_survivorship_artifact
     (h_surv_s : 0 ≤ Δ_surv_source) (h_surv_t : 0 ≤ Δ_surv_target)
     (h_diff : Δ_surv_target > Δ_surv_source)
     (h_obs_s : r2_source_full - Δ_surv_source > 0) :
-    (r2_source_full - Δ_surv_source) - (r2_target_full - Δ_surv_target) >
-      r2_source_full - r2_target_full := by
+    apparentPortabilityDrop (r2_source_full - Δ_surv_source) (r2_target_full - Δ_surv_target) >
+      truePortabilityDrop r2_source_full r2_target_full := by
+  unfold apparentPortabilityDrop truePortabilityDrop
   linarith
 
 end SurvivorshipBias
@@ -714,14 +723,20 @@ theorem weak_instrument_bias_increases
     linarith
   linarith
 
+/-- MR estimate model under horizontal pleiotropy. -/
+noncomputable def mrEstimate (β_causal α_pleio : ℝ) : ℝ :=
+  β_causal + α_pleio
+
 /-- **Horizontal pleiotropy patterns differ across populations.**
     If pleiotropic effects change across populations (due to different
     LD patterns or gene regulation), MR estimates are not portable. -/
 theorem pleiotropy_changes_invalidate_mr
     (β_causal α_pleio_source α_pleio_target : ℝ)
     (h_diff : α_pleio_source ≠ α_pleio_target) :
-    β_causal + α_pleio_source ≠ β_causal + α_pleio_target := by
-  intro h; exact h_diff (by linarith)
+    mrEstimate β_causal α_pleio_source ≠ mrEstimate β_causal α_pleio_target := by
+  unfold mrEstimate
+  intro h
+  exact h_diff (add_left_cancel h)
 
 end MRPortability
 
