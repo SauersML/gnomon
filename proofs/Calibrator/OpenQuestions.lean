@@ -491,7 +491,7 @@ section UnifiedTheory
 theorem single_factor_insufficient
     (af ld eff env : ℝ)
     (h_af : 0 < af) (_h_af_le : af ≤ 1)
-    (h_ld : 0 < ld) (h_ld_lt : ld < 1)
+    (_h_ld : 0 < ld) (h_ld_lt : ld < 1)
     (h_eff : 0 < eff) (h_eff_lt : eff < 1)
     (h_env : 0 < env) (h_env_le : env ≤ 1) :
     af * ld * eff * env < af := by
@@ -557,8 +557,8 @@ theorem neutral_beats_immune
 theorem drift_only_overestimates_immune_portability
     (V_A V_E fstS fstT ρ : ℝ)
     (hVA : 0 < V_A) (hVE : 0 < V_E)
-    (hfstS : 0 ≤ fstS) (hfstT : fstT < 1)
-    (hfst : fstS < fstT)
+    (_hfstS : 0 ≤ fstS) (hfstT : fstT < 1)
+    (_hfst : fstS < fstT)
     (hρ_pos : 0 < ρ) (hρ_lt : ρ < 1) :
     expectedR2 (ρ ^ 2 * presentDayPGSVariance V_A fstT) V_E <
       expectedR2 (presentDayPGSVariance V_A fstT) V_E := by
