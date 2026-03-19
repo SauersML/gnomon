@@ -61,6 +61,13 @@ theorem recalibration_recovers_up_to_turnover
   simp only
   ring
 
+/-- **Recalibrated R²**
+    The theoretically achievable R² after optimal linear recalibration
+    is attenuated from the oracle R² by the squared cross-population
+    effect correlation ρ². -/
+noncomputable def recalibratedR2 (r2_oracle ρ_sq : ℝ) : ℝ :=
+  ρ_sq * r2_oracle
+
 /-- **Recalibration cannot exceed oracle R².**
     The best linear recalibration cannot exceed the R² achievable
     with a GWAS performed directly in the target population.
@@ -68,10 +75,14 @@ theorem recalibration_recovers_up_to_turnover
     effect correlation, so r2_recalib ≤ r2_oracle. -/
 theorem recalibration_bounded_by_oracle
     (r2_oracle ρ_sq : ℝ)
-    (h_oracle : 0 < r2_oracle) (h_oracle_le : r2_oracle ≤ 1)
-    (h_ρ_nn : 0 ≤ ρ_sq) (h_ρ_le : ρ_sq ≤ 1) :
-    ρ_sq * r2_oracle ≤ r2_oracle := by
-  nlinarith
+    (h_oracle : 0 < r2_oracle)
+    (_h_oracle_le : r2_oracle ≤ 1)
+    (_h_ρ_nn : 0 ≤ ρ_sq) (h_ρ_le : ρ_sq ≤ 1) :
+    recalibratedR2 r2_oracle ρ_sq ≤ r2_oracle := by
+  unfold recalibratedR2
+  have h_bound : ρ_sq * r2_oracle ≤ 1 * r2_oracle :=
+    mul_le_mul_of_nonneg_right h_ρ_le (le_of_lt h_oracle)
+  rwa [one_mul] at h_bound
 
 end LinearRecalibration
 

@@ -579,6 +579,12 @@ theorem am_ld_zero_under_random_mating (beta_i beta_j h2 : ℝ) :
   unfold amInducedLD
   simp [mul_zero, zero_mul, zero_div]
 
+/-- **Next Generation LD under Random Mating**
+    After one generation of random mating, AM-LD is halved because
+    recombination breaks cross-locus correlations. -/
+noncomputable def nextGenerationLD (ld_am : ℝ) : ℝ :=
+  (1 / 2 : ℝ) * ld_am
+
 /-- **AM-LD decays rapidly when mating becomes random.**
     After one generation of random mating, AM-LD is halved
     (recombination breaks cross-locus correlations each generation).
@@ -586,8 +592,11 @@ theorem am_ld_zero_under_random_mating (beta_i beta_j h2 : ℝ) :
     We prove: for any LD that has decayed below half, it is less than original. -/
 theorem am_ld_one_generation_decay
     (ld_am : ℝ) (h_pos : 0 < ld_am) :
-    (1 / 2 : ℝ) * ld_am < ld_am := by
-  nlinarith
+    nextGenerationLD ld_am < ld_am := by
+  unfold nextGenerationLD
+  have h_bound : (1 / 2 : ℝ) * ld_am < 1 * ld_am :=
+    mul_lt_mul_of_pos_right (by norm_num) h_pos
+  rwa [one_mul] at h_bound
 
 /-- **Cross-trait AM effect.**
     AM on a primary trait (e.g., education) with genetic correlation rg
