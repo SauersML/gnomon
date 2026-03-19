@@ -322,19 +322,27 @@ theorem collider_attenuates_association (m : ColliderModel) :
       < m.β_G * 1 := by exact mul_lt_mul_of_pos_left h_ratio_lt_one m.β_G_pos
     _ = m.β_G := by ring
 
+/-- Apparent portability drop due to ascertainment bias. -/
+noncomputable def apparentPortabilityDrop (r2_source_asc r2_target_asc : ℝ) : ℝ :=
+  r2_source_asc - r2_target_asc
+
+/-- True portability drop. -/
+noncomputable def truePortabilityDrop (r2_source_pop r2_target_pop : ℝ) : ℝ :=
+  r2_source_pop - r2_target_pop
+
 /-- **Differential ascertainment creates portability artifact.**
     If source and target cohorts have different ascertainment patterns,
-    the apparent portability drop includes an ascertainment component. -/
+    the apparent portability drop includes an ascertainment component
+    and exceeds the true portability drop. -/
 theorem differential_ascertainment_artifact
     (r2_source_pop r2_target_pop r2_source_asc r2_target_asc : ℝ)
     (h_source_asc : r2_source_asc < r2_source_pop)
     (h_target_asc : r2_target_asc < r2_target_pop)
     -- Different ascertainment severity
-    (h_diff_severity : r2_target_pop - r2_target_asc < r2_source_pop - r2_source_asc) :
+    (h_diff_severity : r2_target_pop - r2_target_asc > r2_source_pop - r2_source_asc) :
     -- Apparent portability drop is larger than true portability drop
-    r2_source_asc - r2_target_asc > r2_source_pop - r2_target_pop →
-      False := by
-  intro h
+    apparentPortabilityDrop r2_source_asc r2_target_asc > truePortabilityDrop r2_source_pop r2_target_pop := by
+  unfold apparentPortabilityDrop truePortabilityDrop
   linarith
 
 end ColliderBias
