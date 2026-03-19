@@ -219,10 +219,16 @@ theorem gwas_h2_le_true (h2_true avg_r2_tag : ℝ)
     Source LD is tagged better in source-derived GWAS than target LD.
     This creates a technical portability artifact. -/
 theorem tagging_creates_portability_artifact
-    (h2_source_gwas h2_target_gwas h2_true : ℝ)
-    (h_source_better : h2_target_gwas < h2_source_gwas)
-    (h_true : h2_source_gwas ≤ h2_true) :
-    h2_target_gwas < h2_true := by linarith
+    (h2_true tagging_source tagging_target : ℝ)
+    (h_h2_pos : 0 < h2_true)
+    (h_tag_source_le : tagging_source ≤ 1)
+    (h_tag_target_lt : tagging_target < tagging_source) :
+    gwasHeritability h2_true tagging_target < h2_true := by
+  unfold gwasHeritability
+  have h_target_lt_one : tagging_target < 1 := lt_of_lt_of_le h_tag_target_lt h_tag_source_le
+  calc h2_true * tagging_target
+    _ < h2_true * 1 := (mul_lt_mul_of_pos_left h_target_lt_one h_h2_pos)
+    _ = h2_true := mul_one h2_true
 
 end LDTagging
 
@@ -368,15 +374,23 @@ theorem fst_decreases_with_migration (m₁ m₂ Ne : ℝ)
   rw [div_lt_div_iff₀ (by nlinarith) (by nlinarith)]
   nlinarith
 
+/-- **Shared selection genetic correlation definition.**
+    The genetic correlation after shared selection is modeled as an improvement
+    factor moving closer to 1. -/
+noncomputable def sharedSelectionRg (rg_baseline selection_improvement : ℝ) : ℝ :=
+  rg_baseline + selection_improvement
+
 /-- **Shared selection homogenizes architecture.**
     If both populations experience the same selective pressure
     (e.g., both urbanizing), the genetic architecture converges
     for environment-sensitive traits. -/
 theorem shared_selection_improves_portability
-    (rg_before rg_after : ℝ)
-    (h_improves : rg_before < rg_after)
-    (h_le : rg_after ≤ 1) :
-    rg_before < 1 := by linarith
+    (rg_baseline selection_improvement : ℝ)
+    (h_improvement_pos : 0 < selection_improvement)
+    (h_le : sharedSelectionRg rg_baseline selection_improvement ≤ 1) :
+    rg_baseline < 1 := by
+  unfold sharedSelectionRg at h_le
+  linarith
 
 /-!
 ### Derivation: portabilityFromArchitecture = rg² × (1 - Fst) × tagging_ratio
