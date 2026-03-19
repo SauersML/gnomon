@@ -46,14 +46,19 @@ theorem genetic_correlation_bounded_mt
     -1 ≤ rg ∧ rg ≤ 1 := by
   exact ⟨by linarith [abs_nonneg rg, abs_le.mp h_bound |>.1], abs_le.mp h_bound |>.2⟩
 
-/-- **Genetic correlation is partially ancestry-specific.**
+/-- **Ancestry-specific genetic correlation.**
     r_g between traits A and B may differ between EUR and AFR
     due to different LD patterns and GxE. If LD and GxE introduce
     a nonzero perturbation δ, the ancestry-specific r_g differs. -/
+noncomputable def ancestrySpecificRg (rg_base δ : ℝ) : ℝ :=
+  rg_base + δ
+
+/-- **Genetic correlation is partially ancestry-specific.** -/
 theorem rg_ancestry_specific
     (rg_eur δ : ℝ)
     (h_delta_ne : δ ≠ 0) :
-    rg_eur ≠ rg_eur + δ := by
+    rg_eur ≠ ancestrySpecificRg rg_eur δ := by
+  unfold ancestrySpecificRg
   intro h
   have : δ = 0 := by linarith
   exact h_delta_ne this
