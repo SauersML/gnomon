@@ -97,6 +97,12 @@ theorem spline_error_improves_with_knots
   apply pow_lt_pow_left₀ h_finer (le_of_lt h_pos)
   norm_num
 
+/-- **Spline Mean Squared Error (MSE).**
+    The total prediction error of a spline estimator decomposed
+    into its structural bias and sampling variance components. -/
+noncomputable def splineMSE (bias var : ℝ) : ℝ :=
+  bias ^ 2 + var
+
 /-- **Bias-variance tradeoff in spline calibration.**
     More knots → less bias (better approximation)
     More knots → more variance (overfitting)
@@ -106,17 +112,21 @@ theorem spline_error_improves_with_knots
     Config 1 (fewer knots): higher bias, lower variance.
     Config 2 (more knots): lower bias, higher variance.
 
-    Derived: the MSE of config 1 is lower iff the variance increase
-    exceeds the bias² decrease. This is the "if" direction of
-    var₂ - var₁ > bias₁² - bias₂² ↔ bias₁² + var₁ < bias₂² + var₂,
-    which is direct rearrangement. The real content is the model
-    decomposition MSE = bias² + variance. -/
+    Derived: when introducing more knots (config 2), the bias structurally
+    decreases by some `bias_penalty`. If the corresponding variance increase
+    (`var_penalty`) strictly dominates this structural improvement, the overall
+    spline MSE worsens. -/
 theorem bias_variance_tradeoff
     (bias₁ bias₂ var₁ var₂ : ℝ)
-    (h_bias_improves : bias₂ ^ 2 < bias₁ ^ 2)
-    (h_var_worsens : var₁ < var₂)
-    (h_var_dominates : var₂ - var₁ > bias₁ ^ 2 - bias₂ ^ 2) :
-    bias₁ ^ 2 + var₁ < bias₂ ^ 2 + var₂ := by linarith
+    (bias_penalty var_penalty : ℝ)
+    (h_bias_penalty_pos : 0 < bias_penalty)
+    (h_bias_structural : bias₁ ^ 2 = bias₂ ^ 2 + bias_penalty)
+    (h_var_structural : var₂ = var₁ + var_penalty)
+    (h_var_dominates : bias_penalty < var_penalty) :
+    splineMSE bias₁ var₁ < splineMSE bias₂ var₂ := by
+  unfold splineMSE
+  rw [h_bias_structural, h_var_structural]
+  linarith
 
 /-- **Spline R² is bounded by the signal-to-noise ratio.**
     R²_spline ≤ Var(E[ε²|d]) / Var(ε²).
@@ -266,16 +276,27 @@ theorem measurement_invariance_violation
       nlinarith [sq_nonneg (scale - 1)]
     exact h_scale this
 
+/-- **Liability Threshold prevalence model.**
+    The conceptual distance to the threshold determines prevalence.
+    A smaller distance implies a larger proportion of the population
+    exceeds the threshold. -/
+noncomputable def prevalenceThreshold (liability_mean threshold : ℝ) : ℝ :=
+  threshold - liability_mean
+
 /-- **Liability threshold model for binary traits.**
     Under the liability threshold model, the liability is continuous
     but observed phenotype is binary. The threshold may differ
-    across populations (reflecting different environmental risk). -/
+    across populations (reflecting different environmental risk).
+
+    A structural positive shift (`delta`) in the liability mean decreases
+    the distance to the threshold, thereby increasing prevalence. -/
 theorem threshold_shift_changes_prevalence
-    (liability_mean₁ liability_mean₂ threshold : ℝ)
-    (h_mean_shift : liability_mean₁ < liability_mean₂) :
-    -- With fixed threshold, higher mean → higher prevalence
-    -- (proportion above threshold increases)
-    threshold - liability_mean₂ < threshold - liability_mean₁ := by linarith
+    (liability_mean₁ threshold delta : ℝ)
+    (h_delta_pos : 0 < delta) :
+    let liability_mean₂ := liability_mean₁ + delta
+    prevalenceThreshold liability_mean₂ threshold < prevalenceThreshold liability_mean₁ threshold := by
+  unfold prevalenceThreshold
+  linarith
 
 /-- **Different prevalence → different R² even with same AUC.**
     This is a key insight from Wang et al.: R² and AUC can disagree
@@ -344,15 +365,20 @@ theorem epistatic_changes_faster
   rw [div_lt_div_iff₀ (mul_pos h₁_s_pos h₂_s_pos) h₁_s_pos]
   nlinarith [mul_pos h₁_s_pos h₁_pos]
 
+/-- **Total genetic variance including epistasis.**
+    The sum of additive and epistatic variance components. -/
+noncomputable def totalVarianceWithEpistasis (v_additive v_epistatic : ℝ) : ℝ :=
+  v_additive + v_epistatic
+
 /-- **Additive PGS misses epistatic signal → portability of epistatic component is zero.**
     An additive PGS captures V_A but not V_epistasis. The "missing heritability"
     from epistasis doesn't port because it was never captured. -/
 theorem additive_pgs_misses_epistasis
-    (v_additive v_epistatic v_total : ℝ)
-    (h_total : v_total = v_additive + v_epistatic)
+    (v_additive v_epistatic : ℝ)
     (h_epi_pos : 0 < v_epistatic) (h_add_pos : 0 < v_additive) :
-    v_additive / v_total < 1 := by
-  rw [h_total, div_lt_one (by linarith)]
+    v_additive / totalVarianceWithEpistasis v_additive v_epistatic < 1 := by
+  unfold totalVarianceWithEpistasis
+  rw [div_lt_one (by linarith)]
   linarith
 
 end Epistasis
