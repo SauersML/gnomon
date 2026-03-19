@@ -721,15 +721,28 @@ theorem diminishing_returns_from_majority
     the minimum R² across populations. This generally requires
     oversampling underrepresented populations. -/
 theorem optimal_allocation_oversamples_minority
-    (n_majority n_minority n_total : ℝ)
+    (n_majority n_minority n_total rg pop_proportion : ℝ)
     (h_total : n_majority + n_minority = n_total)
-    (h_optimal_minority_share proportion : ℝ)
-    (h_oversampled : proportion < h_optimal_minority_share)
-    (h_prop_def : proportion = n_minority / n_total)
-    (h_pos : 0 < n_total)
-    (h_minority_share : n_minority / n_total < 1/2) :
-    -- The optimal minority share exceeds the population proportion
-    n_minority / n_total < h_optimal_minority_share := by linarith
+    (h_total_pos : 0 < n_total)
+    (h_pop_minority : pop_proportion < 1/2)
+    (h_rg_lt : rg^2 < 1)
+    (h_optimal : n_majority + rg^2 * n_minority = n_minority + rg^2 * n_majority) :
+    -- The optimal minority share in the sample exceeds the population proportion
+    pop_proportion < n_minority / n_total := by
+  have h1 : n_majority - rg^2 * n_majority = n_minority - rg^2 * n_minority := by linarith
+  have h2 : n_majority * (1 - rg^2) = n_minority * (1 - rg^2) := by calc
+    n_majority * (1 - rg^2) = n_majority - rg^2 * n_majority := by ring
+    _ = n_minority - rg^2 * n_minority := h1
+    _ = n_minority * (1 - rg^2) := by ring
+  have h3 : 1 - rg^2 ≠ 0 := by linarith
+  have h4 : n_majority = n_minority := mul_right_cancel₀ h3 h2
+  have h5 : n_minority = n_total / 2 := by linarith
+  have h7 : n_minority / n_total = 1 / 2 := by
+    calc n_minority / n_total = (n_total / 2) / n_total := by rw [h5]
+         _ = (n_total / n_total) / 2 := by ring
+         _ = 1 / 2 := by rw [div_self (ne_of_gt h_total_pos)]
+  rw [h7]
+  exact h_pop_minority
 
 end MultiAncestryBayesian
 
