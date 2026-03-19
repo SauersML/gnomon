@@ -34,27 +34,34 @@ individual-level noise.
 
 section OverlapInflation
 
-/-- **R² inflation from complete overlap.**
-    If the validation sample IS the discovery sample,
-    the apparent R² converges to h²_SNP (not R²_PGS).
-    Inflation = h²_SNP / R²_true_PGS - 1. -/
-noncomputable def overlapInflation (r2_true r2_observed : ℝ) : ℝ :=
-  r2_observed / r2_true - 1
-
-/-- Inflation is positive when observed exceeds true. -/
-theorem overlap_inflation_positive (r2_true r2_observed : ℝ)
-    (h_true : 0 < r2_true) (h_inflated : r2_true < r2_observed) :
-    0 < overlapInflation r2_true r2_observed := by
-  unfold overlapInflation
-  rw [sub_pos, one_lt_div₀ h_true]
-  exact h_inflated
-
 /-- **Partial overlap inflation.**
     With fraction f of validation in discovery:
     R²_observed ≈ R²_true + f × (h² - R²_true) / n_GWAS.
     The inflation is proportional to f. -/
 noncomputable def partialOverlapR2 (r2_true h2 : ℝ) (f : ℝ) (n_gwas : ℕ) : ℝ :=
   r2_true + f * (h2 - r2_true) / n_gwas
+
+/-- **R² inflation from complete overlap.**
+    If the validation sample IS the discovery sample,
+    the apparent R² converges to h²_SNP (not R²_PGS).
+    Inflation = R²_observed / R²_true - 1. -/
+noncomputable def overlapInflation (r2_true h2 f : ℝ) (n_gwas : ℕ) : ℝ :=
+  (partialOverlapR2 r2_true h2 f n_gwas) / r2_true - 1
+
+/-- Inflation is strictly positive when there is overlap and true R² < h². -/
+theorem overlap_inflation_positive (r2_true h2 f : ℝ) (n_gwas : ℕ)
+    (h_true : 0 < r2_true) (h_h2_gap : r2_true < h2)
+    (h_f_pos : 0 < f) (h_n_pos : 0 < n_gwas) :
+    0 < overlapInflation r2_true h2 f n_gwas := by
+  unfold overlapInflation partialOverlapR2
+  have h_gap_pos : 0 < h2 - r2_true := sub_pos.mpr h_h2_gap
+  have h_frac_pos : 0 < f * (h2 - r2_true) / n_gwas := by
+    apply div_pos
+    · exact mul_pos h_f_pos h_gap_pos
+    · exact Nat.cast_pos.mpr h_n_pos
+  rw [sub_pos]
+  rw [add_div, div_self (ne_of_gt h_true)]
+  exact lt_add_of_pos_right 1 (div_pos h_frac_pos h_true)
 
 /-- Zero overlap gives unbiased estimate. -/
 theorem no_overlap_unbiased (r2_true h2 : ℝ) (n_gwas : ℕ) :
@@ -221,15 +228,23 @@ section CrypticRelatedness
 /-- **Kinship-based inflation.**
     If individuals in validation are related to those in discovery
     (kinship coefficient K), the PGS benefits from shared
-    family-level environment and rare genetic variants. -/
-noncomputable def kinshipInflation (r2_true K h2_family : ℝ) : ℝ :=
-  r2_true + K * h2_family
+    family-level environment and rare genetic variants.
+    We model this as an effective sample overlap where the fraction
+    of overlap behaves proportionally to K. -/
+noncomputable def kinshipInflation (r2_true K h2_family : ℝ) (n_gwas : ℕ) : ℝ :=
+  partialOverlapR2 r2_true h2_family K n_gwas
 
-/-- Kinship inflation exceeds true R² when K > 0. -/
-theorem kinship_inflates (r2_true K h2_family : ℝ)
-    (h_K : 0 < K) (h_h2 : 0 < h2_family) :
-    r2_true < kinshipInflation r2_true K h2_family := by
-  unfold kinshipInflation; linarith [mul_pos h_K h_h2]
+/-- Kinship inflation exceeds true R² when K > 0 and true R² < family h². -/
+theorem kinship_inflates (r2_true K h2_family : ℝ) (n_gwas : ℕ)
+    (h_K : 0 < K) (h_h2_gap : r2_true < h2_family) (h_n_pos : 0 < n_gwas) :
+    r2_true < kinshipInflation r2_true K h2_family n_gwas := by
+  unfold kinshipInflation partialOverlapR2
+  have h_gap_pos : 0 < h2_family - r2_true := sub_pos.mpr h_h2_gap
+  have h_frac_pos : 0 < K * (h2_family - r2_true) / n_gwas := by
+    apply div_pos
+    · exact mul_pos h_K h_gap_pos
+    · exact Nat.cast_pos.mpr h_n_pos
+  linarith
 
 /-- **GRM-based exclusion: bias-variance tradeoff.**
     Removing individuals with GRM off-diagonal > threshold reduces
@@ -243,32 +258,61 @@ theorem kinship_inflates (r2_true K h2_family : ℝ)
     The tradeoff: stricter threshold → smaller inflation bound
     but fewer remaining samples for power. -/
 theorem grm_threshold_tradeoff
-    (r2_true h2_family K_strict K_lenient : ℝ)
+    (r2_true h2_family K_strict K_lenient : ℝ) (n_gwas : ℕ)
+    (h_gap : r2_true < h2_family)
     (h_strict_lt : K_strict < K_lenient)
-    (h_strict_pos : 0 < K_strict)
-    (h_lenient_pos : 0 < K_lenient)
-    (h_h2_pos : 0 < h2_family) :
+    (h_n_pos : 0 < n_gwas) :
     -- Stricter threshold gives smaller kinship inflation
-    kinshipInflation r2_true K_strict h2_family <
-      kinshipInflation r2_true K_lenient h2_family := by
-  unfold kinshipInflation
-  linarith [mul_lt_mul_of_pos_right h_strict_lt h_h2_pos]
+    kinshipInflation r2_true K_strict h2_family n_gwas <
+      kinshipInflation r2_true K_lenient h2_family n_gwas := by
+  unfold kinshipInflation partialOverlapR2
+  have h_gap_pos : 0 < h2_family - r2_true := sub_pos.mpr h_gap
+  have h_n_cast_pos : (0 : ℝ) < n_gwas := Nat.cast_pos.mpr h_n_pos
+  apply add_lt_add_left
+  apply div_lt_div_of_pos_right
+  · exact mul_lt_mul_of_pos_right h_strict_lt h_gap_pos
+  · exact h_n_cast_pos
 
 /-- **Cross-ancestry naturally avoids cryptic relatedness.**
     Individuals from different continental ancestries have
     near-zero kinship, eliminating kinship-based inflation.
-    When |K| < ε, the inflation |K × h²_family| < ε × h²_family,
-    so the bias is bounded by ε × h²_family. -/
+    When |K| < ε, the inflation component |K × (h² - R²) / n| < ε × 1 / 1 = ε,
+    so the bias is bounded by ε. -/
 theorem cross_ancestry_no_kinship_bias
-    (K_cross h2_family ε : ℝ)
+    (r2_true K_cross h2_family ε : ℝ) (n_gwas : ℕ)
     (h_ε_pos : 0 < ε)
     (h_K_small : |K_cross| < ε)
-    (h_h2_pos : 0 < h2_family) (h_h2_le : h2_family ≤ 1) :
-    |K_cross * h2_family| < ε := by
-  calc |K_cross * h2_family| = |K_cross| * |h2_family| := abs_mul _ _
-    _ = |K_cross| * h2_family := by rw [abs_of_pos h_h2_pos]
-    _ ≤ |K_cross| * 1 := by nlinarith [abs_nonneg K_cross]
-    _ = |K_cross| := mul_one _
+    (h_gap_pos : 0 ≤ h2_family - r2_true)
+    (h_gap_le : h2_family - r2_true ≤ 1)
+    (h_n_ge : 1 ≤ (n_gwas : ℝ)) :
+    |kinshipInflation r2_true K_cross h2_family n_gwas - r2_true| < ε := by
+  unfold kinshipInflation partialOverlapR2
+  have h_diff : r2_true + K_cross * (h2_family - r2_true) / ↑n_gwas - r2_true =
+                K_cross * (h2_family - r2_true) / ↑n_gwas := by ring
+  rw [h_diff]
+  have h_n_pos_strict : (0 : ℝ) < ↑n_gwas := by linarith
+  have h_abs : |K_cross * (h2_family - r2_true) / ↑n_gwas| =
+               |K_cross| * (h2_family - r2_true) / ↑n_gwas := by
+    rw [abs_div, abs_mul, abs_of_nonneg h_gap_pos, abs_of_pos h_n_pos_strict]
+  rw [h_abs]
+  have h1 : |K_cross| * (h2_family - r2_true) ≤ |K_cross| * 1 := by
+    exact mul_le_mul_of_nonneg_left h_gap_le (abs_nonneg K_cross)
+  have h_bound1 : |K_cross| * (h2_family - r2_true) / ↑n_gwas ≤ |K_cross| * 1 / ↑n_gwas := by
+    exact div_le_div_of_nonneg_right h1 (le_of_lt h_n_pos_strict)
+  have h_bound2 : |K_cross| * 1 / ↑n_gwas ≤ |K_cross| * 1 / 1 := by
+    have h_inv : 1 / (n_gwas : ℝ) ≤ 1 := by
+      rw [one_div, inv_le_one₀]
+      · exact h_n_ge
+      · exact h_n_pos_strict
+    calc |K_cross| * 1 / ↑n_gwas
+      _ = |K_cross| * (1 / ↑n_gwas) := by ring
+      _ ≤ |K_cross| * 1 := by
+        exact mul_le_mul_of_nonneg_left h_inv (abs_nonneg K_cross)
+      _ = |K_cross| * 1 / 1 := by ring
+  calc |K_cross| * (h2_family - r2_true) / ↑n_gwas
+    _ ≤ |K_cross| * 1 / ↑n_gwas := h_bound1
+    _ ≤ |K_cross| * 1 / 1 := h_bound2
+    _ = |K_cross| := by ring
     _ < ε := h_K_small
 
 end CrypticRelatedness

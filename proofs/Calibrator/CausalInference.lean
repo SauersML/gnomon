@@ -93,13 +93,107 @@ theorem selection_dominant_for_immune
 
 /-- **Interaction effects between pathways.**
     Pathways are not fully independent: LD changes interact
-    with MAF changes (LD × MAF interaction). -/
+    with MAF changes (LD × MAF interaction). Removing LD and MAF
+    differences simultaneously improves R² more than the sum of
+    their individual improvements due to non-linearities in expectedR2. -/
 theorem pathway_interactions_exist
-    (sum_individual total_with_interactions interaction : ℝ)
-    (h_interaction : total_with_interactions = sum_individual + interaction)
-    (h_nonzero : interaction ≠ 0) :
-    total_with_interactions ≠ sum_individual := by
-  rw [h_interaction]; intro h; apply h_nonzero; linarith
+    (vSignal V_E V_ld V_maf : ℝ)
+    (h_sig : 0 < vSignal) (h_VE : 0 < V_E)
+    (h_ld : 0 < V_ld) (h_maf : 0 < V_maf) :
+    let base_noise := V_E + V_ld + V_maf
+    let gain_ld := expectedR2 vSignal (V_E + V_maf) - expectedR2 vSignal base_noise
+    let gain_maf := expectedR2 vSignal (V_E + V_ld) - expectedR2 vSignal base_noise
+    let gain_both := expectedR2 vSignal V_E - expectedR2 vSignal base_noise
+    gain_ld + gain_maf < gain_both := by
+  simp only
+  unfold expectedR2
+  -- Algebraically, we want to show:
+  -- (v/(V_E + V_maf) - v/(V_E + V_ld + V_maf)) + (v/(V_E + V_ld) - v/(V_E + V_ld + V_maf))
+  -- < v/V_E - v/(V_E + V_ld + V_maf)
+  -- This is equivalent to:
+  -- v/(V_E + V_maf) + v/(V_E + V_ld) - v/(V_E + V_ld + V_maf) < v/V_E
+  have h1 : 0 < V_E := h_VE
+  have h2 : 0 < V_E + V_ld := by linarith
+  have h3 : 0 < V_E + V_maf := by linarith
+  have h4 : 0 < V_E + V_ld + V_maf := by linarith
+  -- Since expectedR2 is v / (v + noise) = 1 / (1 + noise/v),
+  -- let's do direct cross multiplication
+  -- Actually, the convexity of f(x) = v / (v+x) implies this interaction.
+  -- Rather than pure algebra, we can use the identity:
+  -- gain_both - (gain_ld + gain_maf) = v*V_ld*V_maf * (some positive stuff)
+  have h_base : vSignal / (vSignal + (V_E + V_ld + V_maf)) > 0 := div_pos h_sig (by linarith)
+  -- Left side
+  have lhs_eq : vSignal / (vSignal + (V_E + V_maf)) - vSignal / (vSignal + (V_E + V_ld + V_maf)) +
+                (vSignal / (vSignal + (V_E + V_ld)) - vSignal / (vSignal + (V_E + V_ld + V_maf))) =
+                vSignal * V_ld / ((vSignal + V_E + V_maf) * (vSignal + V_E + V_ld + V_maf)) +
+                vSignal * V_maf / ((vSignal + V_E + V_ld) * (vSignal + V_E + V_ld + V_maf)) := by
+    -- (v/(A) - v/(A+L)) + (v/(B) - v/(B+M))
+    -- where A = v+E+M, A+L = v+E+M+L
+    -- v/A - v/(A+L) = v*L / (A*(A+L))
+    have hA : 0 < vSignal + (V_E + V_maf) := by linarith
+    have hAL : 0 < vSignal + (V_E + V_ld + V_maf) := by linarith
+    have step1 : vSignal / (vSignal + (V_E + V_maf)) - vSignal / (vSignal + (V_E + V_ld + V_maf)) =
+                 vSignal * V_ld / ((vSignal + V_E + V_maf) * (vSignal + V_E + V_ld + V_maf)) := by
+      have hA_simp : vSignal + (V_E + V_maf) = vSignal + V_E + V_maf := by ring
+      have hAL_simp : vSignal + (V_E + V_ld + V_maf) = vSignal + V_E + V_ld + V_maf := by ring
+      rw [hA_simp, hAL_simp]
+      have : vSignal + V_E + V_ld + V_maf = (vSignal + V_E + V_maf) + V_ld := by ring
+      rw [this]
+      have step1_inner : vSignal / (vSignal + V_E + V_maf) - vSignal / ((vSignal + V_E + V_maf) + V_ld) =
+                         vSignal * V_ld / ((vSignal + V_E + V_maf) * ((vSignal + V_E + V_maf) + V_ld)) := by
+        field_simp [ne_of_gt (by linarith : 0 < vSignal + V_E + V_maf), ne_of_gt (by linarith : 0 < vSignal + V_E + V_maf + V_ld)]
+        ring
+      exact step1_inner
+    have hB : 0 < vSignal + (V_E + V_ld) := by linarith
+    have hBM : 0 < vSignal + (V_E + V_ld + V_maf) := by linarith
+    have step2 : vSignal / (vSignal + (V_E + V_ld)) - vSignal / (vSignal + (V_E + V_ld + V_maf)) =
+                 vSignal * V_maf / ((vSignal + V_E + V_ld) * (vSignal + V_E + V_ld + V_maf)) := by
+      have hB_simp : vSignal + (V_E + V_ld) = vSignal + V_E + V_ld := by ring
+      have hBM_simp : vSignal + (V_E + V_ld + V_maf) = vSignal + V_E + V_ld + V_maf := by ring
+      rw [hB_simp, hBM_simp]
+      field_simp [ne_of_gt (by linarith : 0 < vSignal + V_E + V_ld), ne_of_gt (by linarith : 0 < vSignal + V_E + V_ld + V_maf)]
+      ring
+    rw [step1, step2]
+  -- Right side
+  have rhs_eq : vSignal / (vSignal + V_E) - vSignal / (vSignal + (V_E + V_ld + V_maf)) =
+                vSignal * (V_ld + V_maf) / ((vSignal + V_E) * (vSignal + V_E + V_ld + V_maf)) := by
+    have hC : 0 < vSignal + V_E := by linarith
+    have hC_LM : 0 < vSignal + (V_E + V_ld + V_maf) := by linarith
+    have hC_LM_simp : vSignal + (V_E + V_ld + V_maf) = vSignal + V_E + V_ld + V_maf := by ring
+    rw [hC_LM_simp]
+    field_simp [ne_of_gt hC, ne_of_gt (by linarith : 0 < vSignal + V_E + V_ld + V_maf)]
+    ring
+  rw [lhs_eq, rhs_eq]
+  -- Now we compare:
+  -- v*L / (A*AL) + v*M / (B*BM) < v*(L+M) / (C*CLM)
+  -- Note AL = BM = CLM = vSignal + V_E + V_ld + V_maf
+  -- So we just need: v*L/A + v*M/B < v*(L+M)/C
+  -- where A = v+E+M, B = v+E+L, C = v+E
+  -- Since A > C and B > C, L/A < L/C and M/B < M/C
+  have hA : 0 < vSignal + V_E + V_maf := by linarith
+  have hB : 0 < vSignal + V_E + V_ld := by linarith
+  have hC : 0 < vSignal + V_E := by linarith
+  have hAL : 0 < vSignal + V_E + V_ld + V_maf := by linarith
+  have ineq1 : vSignal * V_ld / ((vSignal + V_E + V_maf) * (vSignal + V_E + V_ld + V_maf)) <
+               vSignal * V_ld / ((vSignal + V_E) * (vSignal + V_E + V_ld + V_maf)) := by
+    apply (div_lt_div_iff₀ (mul_pos hA hAL) (mul_pos hC hAL)).mpr
+    have h_num : 0 < vSignal * V_ld := mul_pos h_sig h_ld
+    have h_ineq : (vSignal + V_E) * (vSignal + V_E + V_ld + V_maf) < (vSignal + V_E + V_maf) * (vSignal + V_E + V_ld + V_maf) := by
+      apply mul_lt_mul_of_pos_right (by linarith) hAL
+    exact mul_lt_mul_of_pos_left h_ineq h_num
+  have ineq2 : vSignal * V_maf / ((vSignal + V_E + V_ld) * (vSignal + V_E + V_ld + V_maf)) <
+               vSignal * V_maf / ((vSignal + V_E) * (vSignal + V_E + V_ld + V_maf)) := by
+    apply (div_lt_div_iff₀ (mul_pos hB hAL) (mul_pos hC hAL)).mpr
+    have h_num : 0 < vSignal * V_maf := mul_pos h_sig h_maf
+    have h_ineq : (vSignal + V_E) * (vSignal + V_E + V_ld + V_maf) < (vSignal + V_E + V_ld) * (vSignal + V_E + V_ld + V_maf) := by
+      apply mul_lt_mul_of_pos_right (by linarith) hAL
+    exact mul_lt_mul_of_pos_left h_ineq h_num
+  have h_sum : vSignal * (V_ld + V_maf) / ((vSignal + V_E) * (vSignal + V_E + V_ld + V_maf)) =
+               vSignal * V_ld / ((vSignal + V_E) * (vSignal + V_E + V_ld + V_maf)) +
+               vSignal * V_maf / ((vSignal + V_E) * (vSignal + V_E + V_ld + V_maf)) := by
+    rw [mul_add, add_div]
+  rw [h_sum]
+  exact add_lt_add ineq1 ineq2
 
 end PathDecomposition
 
@@ -437,24 +531,39 @@ theorem e_value_ge_one (rr : ℝ) (h_rr : 1 ≤ rr) :
 
 /-- **Sensitivity to LD reference mismatch.**
     Portability estimates are sensitive to the choice of LD reference.
-    Using in-sample LD vs. external reference can change R² by δ. -/
+    Using an external LD reference introduces additional variance (V_ld_error)
+    compared to in-sample LD, which strictly decreases the expected R². -/
 theorem ld_reference_sensitivity
-    (r2_in_sample r2_external delta : ℝ)
-    (h_diff : r2_in_sample = r2_external + delta)
-    (h_delta : 0 < |delta|) :
-    r2_in_sample ≠ r2_external := by
-  rw [h_diff]; intro h; have : delta = 0 := by linarith
-  exact absurd (this ▸ h_delta) (by simp)
+    (vSignal V_E V_ld_error : ℝ)
+    (h_sig : 0 < vSignal) (h_VE : 0 < V_E) (h_error : 0 < V_ld_error) :
+    let r2_external := expectedR2 vSignal (V_E + V_ld_error)
+    let r2_in_sample := expectedR2 vSignal V_E
+    r2_external < r2_in_sample := by
+  simp only
+  unfold expectedR2
+  have h_denom_ext : 0 < vSignal + (V_E + V_ld_error) := by linarith
+  have h_denom_in : 0 < vSignal + V_E := by linarith
+  rw [div_lt_div_iff₀ h_denom_ext h_denom_in]
+  nlinarith
 
 /-- **Sensitivity to phenotype definition.**
     Different phenotype definitions (self-report vs clinical,
     ICD-9 vs ICD-10) can change portability estimates.
-    When the difference exceeds any threshold ε > 0, the estimates differ. -/
+    Broader definitions (e.g., self-report) often increase environmental
+    noise (V_noise) compared to strict definitions (e.g., clinical diagnosis),
+    leading to a measurable decrease in expected R². -/
 theorem phenotype_definition_matters
-    (port_def1 port_def2 ε : ℝ) (h_ε : 0 < ε)
-    (h_large_diff : ε < |port_def1 - port_def2|) :
-    port_def1 ≠ port_def2 := by
-  intro h; rw [h, sub_self, abs_zero] at h_large_diff; linarith
+    (vSignal V_E_clinical V_noise : ℝ)
+    (h_sig : 0 < vSignal) (h_VE : 0 < V_E_clinical) (h_noise : 0 < V_noise) :
+    let port_clinical := expectedR2 vSignal V_E_clinical
+    let port_self_report := expectedR2 vSignal (V_E_clinical + V_noise)
+    port_self_report < port_clinical := by
+  simp only
+  unfold expectedR2
+  have h_denom_sr : 0 < vSignal + (V_E_clinical + V_noise) := by linarith
+  have h_denom_cl : 0 < vSignal + V_E_clinical := by linarith
+  rw [div_lt_div_iff₀ h_denom_sr h_denom_cl]
+  nlinarith
 
 end SensitivityAnalysis
 
