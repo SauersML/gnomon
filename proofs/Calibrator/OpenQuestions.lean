@@ -385,25 +385,62 @@ section Question5
     Target effect β_t = ρ * β_true (turnover).
     Prediction error = β_hat - β_t = (1-ρ)*β + δ.
     Prediction error decomposes into turnover + inflation. -/
-theorem prediction_error_decomp (β δ ρ : ℝ) :
-    (β + δ) - ρ * β = (1 - ρ) * β + δ := by ring
+
+structure WinnersCurseModel where
+  beta_true : ℝ
+  inflation_delta : ℝ
+  turnover_rho : ℝ
+
+/-- GWAS estimate β_hat = β_true + δ (inflation). -/
+noncomputable def gwasEstimate (m : WinnersCurseModel) : ℝ :=
+  m.beta_true + m.inflation_delta
+
+/-- Target effect β_t = ρ * β_true (turnover). -/
+noncomputable def targetEffect (m : WinnersCurseModel) : ℝ :=
+  m.turnover_rho * m.beta_true
+
+/-- Prediction error = β_hat - β_t. -/
+noncomputable def predictionError (m : WinnersCurseModel) : ℝ :=
+  gwasEstimate m - targetEffect m
+
+/-- Prediction error decomposes into turnover + inflation. -/
+theorem prediction_error_decomp (m : WinnersCurseModel) :
+    predictionError m = (1 - m.turnover_rho) * m.beta_true + m.inflation_delta := by
+  unfold predictionError gwasEstimate targetEffect
+  ring
 
 /-- Prediction error is positive when both components are positive. -/
 theorem prediction_error_positive
-    (β δ ρ : ℝ) (hβ : 0 < β) (hδ : 0 < δ) (hρ : ρ ≤ 1) :
-    0 < (1 - ρ) * β + δ := by
-  have : 0 ≤ (1 - ρ) * β := mul_nonneg (by linarith) (le_of_lt hβ)
+    (m : WinnersCurseModel) (hβ : 0 < m.beta_true) (hδ : 0 < m.inflation_delta) (hρ : m.turnover_rho ≤ 1) :
+    0 < predictionError m := by
+  rw [prediction_error_decomp]
+  have : 0 ≤ (1 - m.turnover_rho) * m.beta_true := mul_nonneg (by linarith) (le_of_lt hβ)
   linarith
 
+/-- Relative prediction error. -/
+noncomputable def relativeError (m : WinnersCurseModel) : ℝ :=
+  predictionError m / targetEffect m
+
 /-- **Winner's curse is worse with more turnover.**
-    Relative error = ((1-ρ)β + δ) / (ρβ). As ρ↓, this increases. -/
+    Relative error increases as turnover ρ decreases. -/
 theorem relative_error_increases_with_turnover
-    (β δ ρ₁ ρ₂ : ℝ) (hβ : 0 < β) (hδ : 0 < δ)
-    (hρ₁ : 0 < ρ₁) (hρ₂ : 0 < ρ₂) (hρ : ρ₂ < ρ₁) (_hρ₁_le : ρ₁ ≤ 1) :
-    ((1 - ρ₁) * β + δ) / (ρ₁ * β) < ((1 - ρ₂) * β + δ) / (ρ₂ * β) := by
-  rw [div_lt_div_iff₀ (mul_pos hρ₁ hβ) (mul_pos hρ₂ hβ)]
-  nlinarith [sq_nonneg β, sq_nonneg δ, mul_pos hρ₁ hβ, mul_pos hρ₂ hβ,
-             mul_pos hβ hδ, mul_pos hρ₁ hδ, mul_pos hρ₂ hδ]
+    (m₁ m₂ : WinnersCurseModel)
+    (h_beta : m₁.beta_true = m₂.beta_true)
+    (h_delta : m₁.inflation_delta = m₂.inflation_delta)
+    (hβ : 0 < m₁.beta_true) (hδ : 0 < m₁.inflation_delta)
+    (hρ₁ : 0 < m₁.turnover_rho) (hρ₂ : 0 < m₂.turnover_rho)
+    (hρ : m₂.turnover_rho < m₁.turnover_rho) (_hρ₁_le : m₁.turnover_rho ≤ 1) :
+    relativeError m₁ < relativeError m₂ := by
+  unfold relativeError predictionError gwasEstimate targetEffect
+  have h_num1 : m₁.beta_true + m₁.inflation_delta - m₁.turnover_rho * m₁.beta_true = (1 - m₁.turnover_rho) * m₁.beta_true + m₁.inflation_delta := by ring
+  have h_num2 : m₂.beta_true + m₂.inflation_delta - m₂.turnover_rho * m₂.beta_true = (1 - m₂.turnover_rho) * m₂.beta_true + m₂.inflation_delta := by ring
+  rw [h_num1, h_num2]
+  rw [h_beta, h_delta]
+  have hβ₂ : 0 < m₂.beta_true := by linarith
+  have hδ₂ : 0 < m₂.inflation_delta := by linarith
+  rw [div_lt_div_iff₀ (mul_pos hρ₁ hβ₂) (mul_pos hρ₂ hβ₂)]
+  nlinarith [sq_nonneg m₂.beta_true, sq_nonneg m₂.inflation_delta, mul_pos hρ₁ hβ₂, mul_pos hρ₂ hβ₂,
+             mul_pos hβ₂ hδ₂, mul_pos hρ₁ hδ₂, mul_pos hρ₂ hδ₂]
 
 /-- **Heterozygosity increase → PGS variance increase at a single locus.** -/
 theorem het_increase_implies_locus_var_increase
