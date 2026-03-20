@@ -108,12 +108,17 @@ structure TwoPopBiasModel (p : ℕ) extends StratificationModel p where
 noncomputable def TwoPopBiasModel.varBiasTarget {p : ℕ} (m : TwoPopBiasModel p) : ℝ :=
   m.attenuation * m.toStratificationModel.varBias
 
+/-- Apparent portability drop between source and target populations. -/
+noncomputable def apparentPortabilityDropStratification {p : ℕ} (m : TwoPopBiasModel p) (r2_true : ℝ) : ℝ :=
+  (r2_true + m.toStratificationModel.varBias) - (r2_true + m.varBiasTarget)
+
+/-- True portability drop is 0 when the true causal R² is the same. -/
+noncomputable def truePortabilityDropStratification : ℝ := 0
+
 theorem spurious_portability_from_stratification {p : ℕ} (m : TwoPopBiasModel p)
     (r2_true : ℝ) (h_true_nn : 0 ≤ r2_true) :
-    -- Apparent portability drop (source_obs - target_obs) exceeds true drop (0)
-    (r2_true + m.toStratificationModel.varBias) -
-      (r2_true + m.varBiasTarget) > 0 := by
-  unfold TwoPopBiasModel.varBiasTarget
+    truePortabilityDropStratification < apparentPortabilityDropStratification m r2_true := by
+  unfold apparentPortabilityDropStratification truePortabilityDropStratification TwoPopBiasModel.varBiasTarget
   have hv := stratification_bias_variance_pos m.toStratificationModel
   have : m.attenuation * m.toStratificationModel.varBias < m.toStratificationModel.varBias := by
     rw [← mul_one m.toStratificationModel.varBias]
@@ -322,20 +327,36 @@ theorem collider_attenuates_association (m : ColliderModel) :
       < m.β_G * 1 := by exact mul_lt_mul_of_pos_left h_ratio_lt_one m.β_G_pos
     _ = m.β_G := by ring
 
+structure AscertainmentModel where
+  /-- Population R2 in source -/
+  r2_source_pop : ℝ
+  /-- Population R2 in target -/
+  r2_target_pop : ℝ
+  /-- Ascertained R2 in source -/
+  r2_source_asc : ℝ
+  /-- Ascertained R2 in target -/
+  r2_target_asc : ℝ
+  /-- Ascertainment attenuates R2 -/
+  h_source_asc : r2_source_asc < r2_source_pop
+  h_target_asc : r2_target_asc < r2_target_pop
+  /-- Different ascertainment severity -/
+  h_diff_severity : r2_target_pop - r2_target_asc < r2_source_pop - r2_source_asc
+
+/-- Apparent portability drop under differential ascertainment. -/
+noncomputable def apparentPortabilityDropAscertainment (m : AscertainmentModel) : ℝ :=
+  m.r2_source_asc - m.r2_target_asc
+
+/-- True portability drop in the underlying populations. -/
+noncomputable def truePortabilityDropAscertainment (m : AscertainmentModel) : ℝ :=
+  m.r2_source_pop - m.r2_target_pop
+
 /-- **Differential ascertainment creates portability artifact.**
     If source and target cohorts have different ascertainment patterns,
     the apparent portability drop includes an ascertainment component. -/
-theorem differential_ascertainment_artifact
-    (r2_source_pop r2_target_pop r2_source_asc r2_target_asc : ℝ)
-    (h_source_asc : r2_source_asc < r2_source_pop)
-    (h_target_asc : r2_target_asc < r2_target_pop)
-    -- Different ascertainment severity
-    (h_diff_severity : r2_target_pop - r2_target_asc < r2_source_pop - r2_source_asc) :
-    -- Apparent portability drop is larger than true portability drop
-    r2_source_asc - r2_target_asc > r2_source_pop - r2_target_pop →
-      False := by
-  intro h
-  linarith
+theorem differential_ascertainment_artifact (m : AscertainmentModel) :
+    apparentPortabilityDropAscertainment m < truePortabilityDropAscertainment m := by
+  unfold truePortabilityDropAscertainment apparentPortabilityDropAscertainment
+  linarith [m.h_diff_severity]
 
 end ColliderBias
 
@@ -514,17 +535,31 @@ theorem survivorship_attenuates_in_older (m : SurvivorshipAttenuationModel) :
       < m.r2_full * 1 := by exact mul_lt_mul_of_pos_left h_ratio_lt_one m.r2_full_pos
     _ = m.r2_full := by ring
 
+structure SurvivorshipBiasModel where
+  r2_source_full : ℝ
+  r2_target_full : ℝ
+  Δ_surv_source : ℝ
+  Δ_surv_target : ℝ
+  h_surv_s : 0 ≤ Δ_surv_source
+  h_surv_t : 0 ≤ Δ_surv_target
+  h_diff : Δ_surv_source < Δ_surv_target
+  h_obs_s : 0 < r2_source_full - Δ_surv_source
+
+/-- Apparent portability drop under differential survivorship. -/
+noncomputable def apparentPortabilityDropSurvivorship (m : SurvivorshipBiasModel) : ℝ :=
+  (m.r2_source_full - m.Δ_surv_source) - (m.r2_target_full - m.Δ_surv_target)
+
+/-- True portability drop without survivorship bias. -/
+noncomputable def truePortabilityDropSurvivorship (m : SurvivorshipBiasModel) : ℝ :=
+  m.r2_source_full - m.r2_target_full
+
 /-- **Differential survivorship across populations creates portability artifact.**
     If the target population has different age structure or mortality patterns,
     survivorship bias contributes to apparent portability loss. -/
-theorem differential_survivorship_artifact
-    (r2_source_full r2_target_full Δ_surv_source Δ_surv_target : ℝ)
-    (h_surv_s : 0 ≤ Δ_surv_source) (h_surv_t : 0 ≤ Δ_surv_target)
-    (h_diff : Δ_surv_target > Δ_surv_source)
-    (h_obs_s : r2_source_full - Δ_surv_source > 0) :
-    (r2_source_full - Δ_surv_source) - (r2_target_full - Δ_surv_target) >
-      r2_source_full - r2_target_full := by
-  linarith
+theorem differential_survivorship_artifact (m : SurvivorshipBiasModel) :
+    truePortabilityDropSurvivorship m < apparentPortabilityDropSurvivorship m := by
+  unfold truePortabilityDropSurvivorship apparentPortabilityDropSurvivorship
+  linarith [m.h_diff]
 
 end SurvivorshipBias
 
