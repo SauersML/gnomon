@@ -269,11 +269,20 @@ theorem valid_iv_ld_invariant
     MR can test whether environmental factors mediate the
     portability gap. If environment → portability loss,
     adjusting for environment should improve portability. -/
+structure EnvironmentalMediationModel where
+  (port_unadjusted : ℝ)
+  (env_mediation_effect : ℝ)
+  (h_med_pos : 0 < env_mediation_effect)
+  (h_base_pos : 0 < port_unadjusted)
+
+noncomputable def portAdjusted (model : EnvironmentalMediationModel) : ℝ :=
+  model.port_unadjusted + model.env_mediation_effect
+
 theorem environment_mediates_portability_mr
-    (port_unadjusted port_adjusted : ℝ)
-    (h_improved : port_unadjusted < port_adjusted)
-    (h_nn : 0 < port_unadjusted) :
-    0 < port_adjusted - port_unadjusted := by linarith
+    (model : EnvironmentalMediationModel) :
+    0 < portAdjusted model - model.port_unadjusted := by
+  unfold portAdjusted
+  linarith [model.h_med_pos]
 
 /-- **MR-PheWAS for systematic portability analysis.**
     Running MR across many phenotypes simultaneously reveals
@@ -302,22 +311,39 @@ section ColliderBias
     If the study conditions on survival (e.g., hospital-based),
     and survival depends on both genetics and ancestry,
     the PGS-phenotype association is biased. -/
+structure SurvivorshipSelectionModel where
+  (beta_true : ℝ)
+  (selection_bias : ℝ)
+
+noncomputable def betaObserved (model : SurvivorshipSelectionModel) : ℝ :=
+  model.beta_true + model.selection_bias
+
 theorem collider_bias_from_selection
-    (beta_true beta_observed selection_bias : ℝ)
-    (h_biased : beta_observed = beta_true + selection_bias)
-    (h_bias_nn : selection_bias ≠ 0) :
-    beta_observed ≠ beta_true := by
-  rw [h_biased]; intro h; apply h_bias_nn; linarith
+    (model : SurvivorshipSelectionModel)
+    (h_bias_nn : model.selection_bias ≠ 0) :
+    betaObserved model ≠ model.beta_true := by
+  unfold betaObserved
+  intro h
+  have : model.selection_bias = 0 := by linarith
+  exact h_bias_nn this
 
 /-- **Index event bias in PGS studies.**
     Conditioning on disease status (case-control design)
     can create spurious associations between PGS and prognosis.
     This is more severe when PGS is ancestry-specific. -/
+structure CaseControlModel where
+  (beta_prognosis_true : ℝ)
+  (pgs_diagnosis_effect : ℝ)
+  (h_effect : 0 < pgs_diagnosis_effect)
+
+noncomputable def betaPrognosisBiased (model : CaseControlModel) : ℝ :=
+  model.beta_prognosis_true - model.pgs_diagnosis_effect
+
 theorem index_event_bias
-    (beta_prognosis_true beta_prognosis_biased pgs_diagnosis_effect : ℝ)
-    (h_bias : beta_prognosis_biased = beta_prognosis_true - pgs_diagnosis_effect)
-    (h_effect : 0 < pgs_diagnosis_effect) :
-    beta_prognosis_biased < beta_prognosis_true := by linarith
+    (model : CaseControlModel) :
+    betaPrognosisBiased model < model.beta_prognosis_true := by
+  unfold betaPrognosisBiased
+  linarith [model.h_effect]
 
 /-- **Berkson's paradox in biobank studies.**
     Biobank participants are healthier and more educated than
@@ -327,11 +353,23 @@ theorem index_event_bias
     differs by ancestry (different participation rates and selection pressures).
     If bias_eur ≠ bias_afr, then β_biobank_eur ≠ β_biobank_afr even when
     the true population-level effect is the same. -/
+structure BiobankSelectionModel where
+  (beta_population : ℝ)
+  (bias_eur : ℝ)
+  (bias_afr : ℝ)
+  (h_diff_bias : bias_eur ≠ bias_afr)
+
+noncomputable def betaBiobank (beta_pop bias : ℝ) : ℝ :=
+  beta_pop + bias
+
 theorem berkson_paradox_ancestry_specific
-    (beta_population bias_eur bias_afr : ℝ)
-    (h_diff_bias : bias_eur ≠ bias_afr) :
-    beta_population + bias_eur ≠ beta_population + bias_afr := by
-  intro h; exact h_diff_bias (by linarith)
+    (model : BiobankSelectionModel) :
+    betaBiobank model.beta_population model.bias_eur ≠
+    betaBiobank model.beta_population model.bias_afr := by
+  unfold betaBiobank
+  intro h
+  have : model.bias_eur = model.bias_afr := by linarith
+  exact model.h_diff_bias this
 
 end ColliderBias
 
