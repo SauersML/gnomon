@@ -331,10 +331,8 @@ theorem differential_ascertainment_artifact
     (h_target_asc : r2_target_asc < r2_target_pop)
     -- Different ascertainment severity
     (h_diff_severity : r2_target_pop - r2_target_asc < r2_source_pop - r2_source_asc) :
-    -- Apparent portability drop is larger than true portability drop
-    r2_source_asc - r2_target_asc > r2_source_pop - r2_target_pop →
-      False := by
-  intro h
+    -- Apparent portability drop is smaller than true portability drop
+    r2_source_asc - r2_target_asc < r2_source_pop - r2_target_pop := by
   linarith
 
 end ColliderBias
