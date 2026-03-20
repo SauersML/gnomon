@@ -113,13 +113,17 @@ on PGS accuracy into direct and indirect effects.
 
 section MediationAnalysis
 
+/-- In the linear case, the total effect is the sum of direct and indirect effects. -/
+noncomputable def totalEffect (direct_effect indirect_effect : ℝ) : ℝ :=
+  direct_effect + indirect_effect
+
 /-- **Total effect = Direct effect + Indirect effect.**
     TE = DE + IE (in the linear case). -/
 theorem mediation_decomposition
-    (total_effect direct_effect indirect_effect : ℝ)
-    (h_decomp : total_effect = direct_effect + indirect_effect) :
-    -- Indirect effect is the total minus direct
-    indirect_effect = total_effect - direct_effect := by linarith
+    (direct_effect indirect_effect : ℝ) :
+    indirect_effect = totalEffect direct_effect indirect_effect - direct_effect := by
+  unfold totalEffect
+  ring
 
 /-- **Proportion mediated.**
     PM = IE / TE = indirect / total. -/
@@ -435,26 +439,53 @@ theorem e_value_ge_one (rr : ℝ) (h_rr : 1 ≤ rr) :
   have : 0 ≤ Real.sqrt (rr * (rr - 1)) := Real.sqrt_nonneg _
   linarith
 
+/-- Model for LD reference sensitivity.
+    Represents the discrepancy between true (external) and in-sample LD estimation. -/
+structure LDSensitivityModel where
+  r2_external : ℝ
+  delta : ℝ
+  h_delta : 0 < |delta|
+
+/-- Observed R² under the sensitivity model. -/
+noncomputable def r2InSample (m : LDSensitivityModel) : ℝ :=
+  m.r2_external + m.delta
+
 /-- **Sensitivity to LD reference mismatch.**
     Portability estimates are sensitive to the choice of LD reference.
-    Using in-sample LD vs. external reference can change R² by δ. -/
-theorem ld_reference_sensitivity
-    (r2_in_sample r2_external delta : ℝ)
-    (h_diff : r2_in_sample = r2_external + delta)
-    (h_delta : 0 < |delta|) :
-    r2_in_sample ≠ r2_external := by
-  rw [h_diff]; intro h; have : delta = 0 := by linarith
-  exact absurd (this ▸ h_delta) (by simp)
+    Using in-sample LD vs. external reference changes R² by a non-zero δ. -/
+theorem ld_reference_sensitivity (m : LDSensitivityModel) :
+    r2InSample m ≠ m.r2_external := by
+  unfold r2InSample
+  intro h
+  have : m.delta = 0 := by linarith
+  have h_abs := m.h_delta
+  rw [this, abs_zero] at h_abs
+  linarith
+
+/-- Model for differing phenotype definitions.
+    Captures how alternative definitions (e.g. self-report vs clinical)
+    diverge from a base definition by an error term ε and an extra difference. -/
+structure PhenotypeDefinitionModel where
+  base_def : ℝ
+  ε : ℝ
+  diff_gap : ℝ
+  h_ε : 0 < ε
+  h_gap : 0 ≤ diff_gap
+
+/-- Alternative phenotype definition derived from the base. -/
+noncomputable def altDef (m : PhenotypeDefinitionModel) : ℝ :=
+  m.base_def + m.ε + m.diff_gap
 
 /-- **Sensitivity to phenotype definition.**
     Different phenotype definitions (self-report vs clinical,
-    ICD-9 vs ICD-10) can change portability estimates.
-    When the difference exceeds any threshold ε > 0, the estimates differ. -/
-theorem phenotype_definition_matters
-    (port_def1 port_def2 ε : ℝ) (h_ε : 0 < ε)
-    (h_large_diff : ε < |port_def1 - port_def2|) :
-    port_def1 ≠ port_def2 := by
-  intro h; rw [h, sub_self, abs_zero] at h_large_diff; linarith
+    ICD-9 vs ICD-10) can change portability estimates. -/
+theorem phenotype_definition_matters (m : PhenotypeDefinitionModel) :
+    altDef m ≠ m.base_def := by
+  unfold altDef
+  intro h
+  have h_eps : 0 < m.ε := m.h_ε
+  have h_gap : 0 ≤ m.diff_gap := m.h_gap
+  linarith
 
 end SensitivityAnalysis
 

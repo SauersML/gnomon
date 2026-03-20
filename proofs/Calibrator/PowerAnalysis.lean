@@ -591,27 +591,47 @@ theorem genetic_correlation_bounds_portability
   have : rg^2 < 1 := by nlinarith [sq_abs rg, abs_nonneg rg, sq_nonneg rg]
   nlinarith
 
+/-- Model for cross-population portability scaling via genetic correlation. -/
+structure PortabilityModel where
+  r2_source : ℝ
+  rg : ℝ
+  h_r2 : 0 < r2_source
+  h_rg_nn : 0 ≤ rg
+  h_rg_le : rg ≤ 1
+
+/-- Theoretical cross-population portability under pure correlation scaling. -/
+noncomputable def crossPortability (m : PortabilityModel) : ℝ :=
+  m.rg^2 * m.r2_source
+
 /-- **High genetic correlation implies good portability.**
     When cross-population r_g is high (e.g., ~0.95), most of the
     genetic architecture is shared. -/
 theorem high_rg_implies_good_portability
-    (rg lb r2_source : ℝ)
-    (h_rg : lb < rg) (h_lb_nn : 0 ≤ lb) (h_rg_le : rg ≤ 1)
-    (h_r2 : 0 < r2_source) :
-    lb^2 * r2_source < rg^2 * r2_source := by
-  have : lb ^ 2 < rg ^ 2 := by nlinarith [sq_nonneg (rg - lb)]
-  nlinarith
+    (m_low m_high : PortabilityModel)
+    (h_same_r2 : m_low.r2_source = m_high.r2_source)
+    (h_rg_gt : m_low.rg < m_high.rg) :
+    crossPortability m_low < crossPortability m_high := by
+  unfold crossPortability
+  rw [h_same_r2]
+  have h_sq : m_low.rg ^ 2 < m_high.rg ^ 2 := by
+    nlinarith [sq_nonneg (m_high.rg - m_low.rg), m_low.h_rg_nn, m_high.h_rg_nn]
+  have h_r2_pos : 0 < m_high.r2_source := m_high.h_r2
+  exact mul_lt_mul_of_pos_right h_sq h_r2_pos
 
 /-- **Low r_g limits portability.**
     When cross-population r_g is low (e.g., ~0.4), this severely limits
     cross-population PGS for the affected traits. -/
 theorem low_rg_limits_portability
-    (rg ub r2_source : ℝ)
-    (h_rg : rg < ub) (h_rg_nn : 0 ≤ rg) (h_ub_nn : 0 ≤ ub)
-    (h_r2 : 0 < r2_source) :
-    rg^2 * r2_source < ub^2 * r2_source := by
-  have : rg ^ 2 < ub ^ 2 := by nlinarith [sq_nonneg (rg - ub)]
-  nlinarith
+    (m_low m_high : PortabilityModel)
+    (h_same_r2 : m_low.r2_source = m_high.r2_source)
+    (h_rg_lt : m_low.rg < m_high.rg) :
+    crossPortability m_low < crossPortability m_high := by
+  unfold crossPortability
+  rw [h_same_r2]
+  have h_sq : m_low.rg ^ 2 < m_high.rg ^ 2 := by
+    nlinarith [sq_nonneg (m_high.rg - m_low.rg), m_low.h_rg_nn, m_high.h_rg_nn]
+  have h_r2_pos : 0 < m_high.r2_source := m_high.h_r2
+  exact mul_lt_mul_of_pos_right h_sq h_r2_pos
 
 end EffectSizeHeterogeneity
 
