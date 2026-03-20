@@ -514,17 +514,32 @@ theorem survivorship_attenuates_in_older (m : SurvivorshipAttenuationModel) :
       < m.r2_full * 1 := by exact mul_lt_mul_of_pos_left h_ratio_lt_one m.r2_full_pos
     _ = m.r2_full := by ring
 
+/-- Difference between full R² and survivor R² -/
+noncomputable def SurvivorshipAttenuationModel.attenuationPenalty (m : SurvivorshipAttenuationModel) : ℝ :=
+  m.r2_full - m.r2_surv
+
 /-- **Differential survivorship across populations creates portability artifact.**
-    If the target population has different age structure or mortality patterns,
-    survivorship bias contributes to apparent portability loss. -/
+    If the target population has stronger survivorship bias (lower variance among survivors),
+    the apparent portability loss is larger than the true difference in birth R². -/
 theorem differential_survivorship_artifact
-    (r2_source_full r2_target_full Δ_surv_source Δ_surv_target : ℝ)
-    (h_surv_s : 0 ≤ Δ_surv_source) (h_surv_t : 0 ≤ Δ_surv_target)
-    (h_diff : Δ_surv_target > Δ_surv_source)
-    (h_obs_s : r2_source_full - Δ_surv_source > 0) :
-    (r2_source_full - Δ_surv_source) - (r2_target_full - Δ_surv_target) >
-      r2_source_full - r2_target_full := by
-  linarith
+    (m_source m_target : SurvivorshipAttenuationModel)
+    (h_same_birth_var : m_source.var_birth = m_target.var_birth)
+    (h_same_r2_full : m_source.r2_full = m_target.r2_full)
+    (h_target_more_bias : m_target.var_surv < m_source.var_surv) :
+    m_source.attenuationPenalty < m_target.attenuationPenalty := by
+  unfold SurvivorshipAttenuationModel.attenuationPenalty SurvivorshipAttenuationModel.r2_surv
+  have h_r2_pos : 0 < m_source.r2_full := m_source.r2_full_pos
+  have h_var_b_pos : 0 < m_source.var_birth := m_source.var_birth_pos
+  have h_ratio_lt : m_target.var_surv / m_source.var_birth < m_source.var_surv / m_source.var_birth := by
+    exact div_lt_div_of_pos_right h_target_more_bias h_var_b_pos
+  have h_target_term : m_target.r2_full * (m_target.var_surv / m_target.var_birth) = m_source.r2_full * (m_target.var_surv / m_source.var_birth) := by
+    rw [h_same_r2_full, h_same_birth_var]
+  have h_source_term : m_target.r2_full * (m_source.var_surv / m_source.var_birth) = m_source.r2_full * (m_source.var_surv / m_source.var_birth) := by
+    rw [h_same_r2_full]
+  rw [h_same_r2_full, h_target_term, h_source_term]
+  have h_mul_lt : m_source.r2_full * (m_target.var_surv / m_source.var_birth) < m_source.r2_full * (m_source.var_surv / m_source.var_birth) := by
+    exact mul_lt_mul_of_pos_left h_ratio_lt h_r2_pos
+  exact sub_lt_sub_left h_mul_lt m_target.r2_full
 
 end SurvivorshipBias
 
@@ -698,30 +713,59 @@ theorem instrument_strength_decreases (m : MRInstrumentModel)
   apply mul_lt_mul_of_pos_left h_het
   exact mul_pos m.n_pos (sq_pos_of_ne_zero m.β_inst_ne)
 
+/-- Weak instrument bias in MR -/
+noncomputable def weakInstBias (f_stat conf_bias : ℝ) : ℝ :=
+  (1 - 1 / f_stat) * conf_bias
+
 /-- **Weak instrument bias in MR.**
     Bias = (1 - 1/F) × confounding bias.
     As F decreases (weaker instrument), bias increases toward the
     confounded OLS estimate. -/
 theorem weak_instrument_bias_increases
-    (conf_bias : ℝ) (F₁ F₂ : ℝ)
+    (conf_bias : ℝ) (m : MRInstrumentModel)
     (h_conf : 0 < conf_bias)
-    (h_F₁ : 1 < F₁) (h_F₂ : 1 < F₂)
-    (h_weaker : F₂ < F₁) :
-    (1 - 1/F₂) * conf_bias < (1 - 1/F₁) * conf_bias := by
+    (h_F_source : 1 < m.fStat m.p_source)
+    (h_F_target : 1 < m.fStat m.p_target)
+    (h_weaker : m.fStat m.p_target < m.fStat m.p_source) :
+    weakInstBias (m.fStat m.p_target) conf_bias < weakInstBias (m.fStat m.p_source) conf_bias := by
+  unfold weakInstBias
   apply mul_lt_mul_of_pos_right _ h_conf
-  have h1 : 1/F₁ < 1/F₂ := by
-    rw [div_lt_div_iff₀ (by linarith) (by linarith)]
+  have h1 : 1 / m.fStat m.p_source < 1 / m.fStat m.p_target := by
+    have h_ps_pos : 0 < m.fStat m.p_source := by linarith
+    have h_pt_pos : 0 < m.fStat m.p_target := by linarith
+    rw [div_lt_div_iff₀ h_ps_pos h_pt_pos]
     linarith
-  linarith
+  have h2 : 1 - 1 / m.fStat m.p_target < 1 - 1 / m.fStat m.p_source := by linarith
+  exact h2
+
+/-- **Horizontal pleiotropy model.** -/
+structure MRPleiotropyModel where
+  /-- Causal effect of exposure on outcome -/
+  β_causal : ℝ
+  /-- Horizontal pleiotropy effect in source -/
+  α_pleio_source : ℝ
+  /-- Horizontal pleiotropy effect in target -/
+  α_pleio_target : ℝ
+  /-- Pleiotropy changes across populations -/
+  pleio_diff : α_pleio_source ≠ α_pleio_target
+
+/-- MR Estimate -/
+noncomputable def MRPleiotropyModel.estimateSource (m : MRPleiotropyModel) : ℝ :=
+  m.β_causal + m.α_pleio_source
+
+noncomputable def MRPleiotropyModel.estimateTarget (m : MRPleiotropyModel) : ℝ :=
+  m.β_causal + m.α_pleio_target
 
 /-- **Horizontal pleiotropy patterns differ across populations.**
     If pleiotropic effects change across populations (due to different
     LD patterns or gene regulation), MR estimates are not portable. -/
 theorem pleiotropy_changes_invalidate_mr
-    (β_causal α_pleio_source α_pleio_target : ℝ)
-    (h_diff : α_pleio_source ≠ α_pleio_target) :
-    β_causal + α_pleio_source ≠ β_causal + α_pleio_target := by
-  intro h; exact h_diff (by linarith)
+    (m : MRPleiotropyModel) :
+    m.estimateSource ≠ m.estimateTarget := by
+  unfold MRPleiotropyModel.estimateSource MRPleiotropyModel.estimateTarget
+  intro h
+  have h_diff : m.α_pleio_source = m.α_pleio_target := by linarith
+  exact m.pleio_diff h_diff
 
 end MRPortability
 
@@ -753,37 +797,45 @@ theorem r2_estimator_variance_pos (r2 : ℝ) (n : ℕ)
     · exact sq_pos_of_pos (by linarith)
   · exact Nat.cast_pos.mpr h_n
 
+/-- Minimal detectable difference in R² -/
+noncomputable def detectableEffectSize (var_sum n z_sum : ℝ) : ℝ :=
+  z_sum * Real.sqrt (var_sum / n)
+
 /-- **Power to detect portability difference.**
     To detect ΔR² = R²_source - R²_target at power 1-β with significance α,
-    need n ≈ (z_α + z_β)² × (Var₁ + Var₂) / ΔR²². -/
+    a larger sample size n reduces the minimal detectable effect size. -/
 theorem larger_sample_more_power
-    (var₁ var₂ Δr2 z_sum n₁ n₂ : ℝ)
-    (h_var : 0 < var₁ + var₂) (h_Δ : 0 < Δr2)
+    (var_sum z_sum n₁ n₂ : ℝ)
+    (h_var : 0 < var_sum)
     (h_z : 0 < z_sum)
     (h_n : n₁ < n₂) (h_n₁ : 0 < n₁) :
-    -- Larger sample → smaller required effect size (more power)
-    z_sum * Real.sqrt ((var₁ + var₂) / n₂) <
-      z_sum * Real.sqrt ((var₁ + var₂) / n₁) := by
+    detectableEffectSize var_sum n₂ z_sum < detectableEffectSize var_sum n₁ z_sum := by
+  unfold detectableEffectSize
   apply mul_lt_mul_of_pos_left _ h_z
   apply Real.sqrt_lt_sqrt
   · exact div_nonneg (le_of_lt h_var) (le_of_lt (by linarith : 0 < n₂))
   · exact div_lt_div_of_pos_left h_var h_n₁ h_n
 
-/-- **Small portability differences require large samples.**
-    When R² of the distance-on-error relationship is small, enormous
-    samples are needed to detect this reliably.
+/-- Required sample size for a given effect size -/
+noncomputable def requiredSampleSize (var_sum z_sum r2_effect : ℝ) : ℝ :=
+  (z_sum / r2_effect) ^ 2 * var_sum
 
-    Worked example: Wang et al.'s finding of R² ≈ 0.5% for
-    distance-on-error illustrates this. -/
+/-- **Small portability differences require large samples.**
+    When the effect size decreases, the required sample size increases. -/
 theorem small_effect_needs_large_n
-    (r2_effect n_required ub : ℝ)
-    (h_small : r2_effect ≤ ub) (h_ub_pos : 0 < ub)
-    (h_formula : n_required ≥ 1 / r2_effect)
-    (h_effect_pos : 0 < r2_effect) :
-    n_required ≥ 1 / ub := by
-  calc n_required ≥ 1 / r2_effect := h_formula
-    _ ≥ 1 / ub := by
-        exact div_le_div_of_nonneg_left (le_of_lt one_pos) h_effect_pos h_small
+    (var_sum z_sum r2_small r2_large : ℝ)
+    (h_var : 0 < var_sum)
+    (h_z : 0 < z_sum)
+    (h_small : r2_small < r2_large)
+    (h_small_pos : 0 < r2_small) :
+    requiredSampleSize var_sum z_sum r2_large < requiredSampleSize var_sum z_sum r2_small := by
+  unfold requiredSampleSize
+  apply mul_lt_mul_of_pos_right _ h_var
+  have h_large_pos : 0 < r2_large := by linarith
+  have h_div : z_sum / r2_large < z_sum / r2_small := by
+    exact div_lt_div_of_pos_left h_z h_small_pos h_small
+  have h_div_pos : 0 < z_sum / r2_large := div_pos h_z h_large_pos
+  nlinarith
 
 end PowerAnalysis
 
