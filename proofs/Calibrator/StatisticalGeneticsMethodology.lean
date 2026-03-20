@@ -333,16 +333,32 @@ section GeneticCorrelationMethods
     Uses the LDAK model for LD-dependent architecture
     and may give different ρ_g estimates than LDSC. -/
 
+/-- Model representing the gap between different genetic correlation estimates. -/
+structure GeneticCorrelationEstimates where
+  rho_popcorn : ℝ
+  ldsc_gap : ℝ
+  sumher_gap : ℝ
+  h_ldsc_gap : 0 < ldsc_gap
+  h_sumher_gap : 0 < sumher_gap
+
+/-- Define intermediate LDSC estimate based on gap. -/
+noncomputable def rhoLdsc (m : GeneticCorrelationEstimates) : ℝ :=
+  m.rho_popcorn + m.ldsc_gap
+
+/-- Define SumHer estimate based on LDSC estimate and extra gap. -/
+noncomputable def rhoSumher (m : GeneticCorrelationEstimates) : ℝ :=
+  rhoLdsc m + m.sumher_gap
+
 /-- **Method comparison: different methods can give different ρ̂_g.**
     This matters because ρ̂_g predicts portability.
-    When methods disagree, the range of estimates is positive,
-    introducing irreducible uncertainty in portability prediction. -/
-theorem method_disagreement_increases_uncertainty
-    (rho_ldsc rho_popcorn rho_sumher : ℝ)
-    (h_order : rho_popcorn < rho_ldsc)
-    (h_order₂ : rho_ldsc < rho_sumher) :
-    -- The range of estimates is strictly positive
-    0 < rho_sumher - rho_popcorn := by linarith
+    When methods disagree (represented by strictly positive gaps),
+    the overall range of estimates introduces irreducible uncertainty. -/
+theorem method_disagreement_increases_uncertainty (m : GeneticCorrelationEstimates) :
+    m.rho_popcorn < rhoSumher m := by
+  unfold rhoSumher rhoLdsc
+  have h1 : 0 < m.ldsc_gap := m.h_ldsc_gap
+  have h2 : 0 < m.sumher_gap := m.h_sumher_gap
+  linarith
 
 /-- **Genetic correlation varies across the genome.**
     ρ_g estimated from different genomic regions can vary,
