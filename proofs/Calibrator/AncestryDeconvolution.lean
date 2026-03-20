@@ -117,12 +117,19 @@ theorem lai_pgs_at_least_as_good
   · simp [min_eq_left hab]; nlinarith
   · simp [min_eq_right (le_of_lt hab)]; nlinarith
 
+/-- Expected scaling factor for LAI-PGS improvement given a local
+    ancestry inference error rate ε. -/
+noncomputable def laiImprovementFactor (ε : ℝ) : ℝ :=
+  1 - 2 * ε
+
 /-- **LAI accuracy required for improvement.**
     LAI-PGS only helps if local ancestry can be called accurately.
     With error rate ε in LAI, the improvement is proportional to (1-2ε). -/
 theorem lai_improvement_requires_accuracy
     (ε : ℝ) (h_ε : 0 ≤ ε) (h_ε_lt : ε < 1/2) :
-    0 < 1 - 2 * ε := by linarith
+    0 < laiImprovementFactor ε := by
+  unfold laiImprovementFactor
+  linarith
 
 /-- **LAI accuracy decreases with admixture time.**
     Older admixture → shorter ancestry tracts → harder to call.
@@ -152,7 +159,9 @@ theorem recent_admixture_benefits_more
     (h_recent_accurate : 0 ≤ ε_recent) (h_recent_lt : ε_recent < 1/2)
     (h_ancient_accurate : 0 ≤ ε_ancient) (h_ancient_lt : ε_ancient < 1/2)
     (h_recent_better_lai : ε_recent < ε_ancient) :
-    1 - 2 * ε_ancient < 1 - 2 * ε_recent := by linarith
+    laiImprovementFactor ε_ancient < laiImprovementFactor ε_recent := by
+  unfold laiImprovementFactor
+  linarith
 
 end LocalAncestryPGS
 

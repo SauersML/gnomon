@@ -219,10 +219,13 @@ theorem gwas_h2_le_true (h2_true avg_r2_tag : ℝ)
     Source LD is tagged better in source-derived GWAS than target LD.
     This creates a technical portability artifact. -/
 theorem tagging_creates_portability_artifact
-    (h2_source_gwas h2_target_gwas h2_true : ℝ)
-    (h_source_better : h2_target_gwas < h2_source_gwas)
-    (h_true : h2_source_gwas ≤ h2_true) :
-    h2_target_gwas < h2_true := by linarith
+    (h2_true avg_r2_source avg_r2_target : ℝ)
+    (h_h2 : 0 < h2_true)
+    (h_source_better : avg_r2_target < avg_r2_source)
+    (h_source_le : avg_r2_source ≤ 1) :
+    gwasHeritability h2_true avg_r2_target < gwasHeritability h2_true avg_r2_source := by
+  unfold gwasHeritability
+  exact mul_lt_mul_of_pos_left h_source_better h_h2
 
 end LDTagging
 
@@ -368,15 +371,28 @@ theorem fst_decreases_with_migration (m₁ m₂ Ne : ℝ)
   rw [div_lt_div_iff₀ (by nlinarith) (by nlinarith)]
   nlinarith
 
+/-- Genetic correlation as a function of shared selection.
+    Models the convergence of genetic architectures under shared
+    environmental/selective pressures. A higher shared pressure
+    increases the genetic correlation. -/
+noncomputable def geneticCorrelationUnderSelection
+    (baseline_rg shared_pressure : ℝ) : ℝ :=
+  baseline_rg + (1 - baseline_rg) * shared_pressure
+
 /-- **Shared selection homogenizes architecture.**
     If both populations experience the same selective pressure
     (e.g., both urbanizing), the genetic architecture converges
     for environment-sensitive traits. -/
 theorem shared_selection_improves_portability
-    (rg_before rg_after : ℝ)
-    (h_improves : rg_before < rg_after)
-    (h_le : rg_after ≤ 1) :
-    rg_before < 1 := by linarith
+    (baseline_rg pressure : ℝ)
+    (h_rg_lt : baseline_rg < 1)
+    (h_pressure_pos : 0 < pressure)
+    (h_pressure_le : pressure ≤ 1) :
+    baseline_rg < geneticCorrelationUnderSelection baseline_rg pressure := by
+  unfold geneticCorrelationUnderSelection
+  have h_diff_pos : 0 < 1 - baseline_rg := sub_pos.mpr h_rg_lt
+  have h_add_pos : 0 < (1 - baseline_rg) * pressure := mul_pos h_diff_pos h_pressure_pos
+  linarith
 
 /-!
 ### Derivation: portabilityFromArchitecture = rg² × (1 - Fst) × tagging_ratio
