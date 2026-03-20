@@ -265,26 +265,43 @@ theorem valid_iv_ld_invariant
   unfold waldRatio
   rw [mul_div_cancel_right₀ _ h_ZX_eur, mul_div_cancel_right₀ _ h_ZX_afr]
 
+structure EnvironmentMediationModel where
+  port_unadjusted : ℝ
+  port_adjusted : ℝ
+
+noncomputable def portabilityImprovement (m : EnvironmentMediationModel) : ℝ :=
+  m.port_adjusted - m.port_unadjusted
+
 /-- **Bidirectional MR for GxE.**
     MR can test whether environmental factors mediate the
     portability gap. If environment → portability loss,
     adjusting for environment should improve portability. -/
 theorem environment_mediates_portability_mr
-    (port_unadjusted port_adjusted : ℝ)
-    (h_improved : port_unadjusted < port_adjusted)
-    (h_nn : 0 < port_unadjusted) :
-    0 < port_adjusted - port_unadjusted := by linarith
+    (m : EnvironmentMediationModel)
+    (h_improved : m.port_unadjusted < m.port_adjusted)
+    (h_nn : 0 < m.port_unadjusted) :
+    0 < portabilityImprovement m := by
+  unfold portabilityImprovement
+  linarith
+
+structure MRPheWASModel where
+  n_conserved : ℕ
+  n_specific : ℕ
+
+def totalPathways (m : MRPheWASModel) : ℕ :=
+  m.n_conserved + m.n_specific
 
 /-- **MR-PheWAS for systematic portability analysis.**
     Running MR across many phenotypes simultaneously reveals
     which causal pathways are conserved across ancestries
     and which are population-specific. -/
 theorem mr_phewas_identifies_conserved_pathways
-    (n_conserved n_specific n_total : ℕ)
-    (h_sum : n_conserved + n_specific = n_total)
-    (h_some_conserved : 0 < n_conserved)
-    (h_some_specific : 0 < n_specific) :
-    n_conserved < n_total := by omega
+    (m : MRPheWASModel)
+    (h_some_conserved : 0 < m.n_conserved)
+    (h_some_specific : 0 < m.n_specific) :
+    m.n_conserved < totalPathways m := by
+  unfold totalPathways
+  omega
 
 end MRForPGSValidation
 
@@ -298,26 +315,54 @@ that can mimic or mask portability effects.
 
 section ColliderBias
 
+structure ColliderBiasModel where
+  beta_true : ℝ
+  selection_bias : ℝ
+
+noncomputable def observedBeta (m : ColliderBiasModel) : ℝ :=
+  m.beta_true + m.selection_bias
+
 /-- **Survivorship creates collider bias.**
     If the study conditions on survival (e.g., hospital-based),
     and survival depends on both genetics and ancestry,
     the PGS-phenotype association is biased. -/
 theorem collider_bias_from_selection
-    (beta_true beta_observed selection_bias : ℝ)
-    (h_biased : beta_observed = beta_true + selection_bias)
-    (h_bias_nn : selection_bias ≠ 0) :
-    beta_observed ≠ beta_true := by
-  rw [h_biased]; intro h; apply h_bias_nn; linarith
+    (m : ColliderBiasModel)
+    (h_bias_nn : m.selection_bias ≠ 0) :
+    observedBeta m ≠ m.beta_true := by
+  unfold observedBeta
+  intro h
+  apply h_bias_nn
+  linarith
+
+structure IndexEventModel where
+  beta_prognosis_true : ℝ
+  pgs_diagnosis_effect : ℝ
+
+noncomputable def biasedPrognosisBeta (m : IndexEventModel) : ℝ :=
+  m.beta_prognosis_true - m.pgs_diagnosis_effect
 
 /-- **Index event bias in PGS studies.**
     Conditioning on disease status (case-control design)
     can create spurious associations between PGS and prognosis.
     This is more severe when PGS is ancestry-specific. -/
 theorem index_event_bias
-    (beta_prognosis_true beta_prognosis_biased pgs_diagnosis_effect : ℝ)
-    (h_bias : beta_prognosis_biased = beta_prognosis_true - pgs_diagnosis_effect)
-    (h_effect : 0 < pgs_diagnosis_effect) :
-    beta_prognosis_biased < beta_prognosis_true := by linarith
+    (m : IndexEventModel)
+    (h_effect : 0 < m.pgs_diagnosis_effect) :
+    biasedPrognosisBeta m < m.beta_prognosis_true := by
+  unfold biasedPrognosisBeta
+  linarith
+
+structure BiobankSelectionModel where
+  beta_population : ℝ
+  bias_eur : ℝ
+  bias_afr : ℝ
+
+noncomputable def biobankBetaEur (m : BiobankSelectionModel) : ℝ :=
+  m.beta_population + m.bias_eur
+
+noncomputable def biobankBetaAfr (m : BiobankSelectionModel) : ℝ :=
+  m.beta_population + m.bias_afr
 
 /-- **Berkson's paradox in biobank studies.**
     Biobank participants are healthier and more educated than
@@ -328,10 +373,13 @@ theorem index_event_bias
     If bias_eur ≠ bias_afr, then β_biobank_eur ≠ β_biobank_afr even when
     the true population-level effect is the same. -/
 theorem berkson_paradox_ancestry_specific
-    (beta_population bias_eur bias_afr : ℝ)
-    (h_diff_bias : bias_eur ≠ bias_afr) :
-    beta_population + bias_eur ≠ beta_population + bias_afr := by
-  intro h; exact h_diff_bias (by linarith)
+    (m : BiobankSelectionModel)
+    (h_diff_bias : m.bias_eur ≠ m.bias_afr) :
+    biobankBetaEur m ≠ biobankBetaAfr m := by
+  unfold biobankBetaEur biobankBetaAfr
+  intro h
+  apply h_diff_bias
+  linarith
 
 end ColliderBias
 
