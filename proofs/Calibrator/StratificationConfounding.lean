@@ -322,20 +322,34 @@ theorem collider_attenuates_association (m : ColliderModel) :
       < m.β_G * 1 := by exact mul_lt_mul_of_pos_left h_ratio_lt_one m.β_G_pos
     _ = m.β_G := by ring
 
+/-- **Differential ascertainment model.**
+    Two cohorts drawn from populations with identical genetic architecture
+    but different ascertainment severity (modeled as different environmental variance
+    in the selected sample). -/
+structure DifferentialAscertainmentModel where
+  source : ColliderModel
+  target : ColliderModel
+  /-- Identical true genetic effect -/
+  equal_beta : source.β_G = target.β_G
+  /-- Identical genetic variance in selected sample -/
+  equal_var_G : source.σ2_G = target.σ2_G
+  /-- More severe ascertainment in target cohort leads to smaller environmental variance -/
+  more_severe_target : source.σ2_E < target.σ2_E
+
 /-- **Differential ascertainment creates portability artifact.**
-    If source and target cohorts have different ascertainment patterns,
-    the apparent portability drop includes an ascertainment component. -/
-theorem differential_ascertainment_artifact
-    (r2_source_pop r2_target_pop r2_source_asc r2_target_asc : ℝ)
-    (h_source_asc : r2_source_asc < r2_source_pop)
-    (h_target_asc : r2_target_asc < r2_target_pop)
-    -- Different ascertainment severity
-    (h_diff_severity : r2_target_pop - r2_target_asc < r2_source_pop - r2_source_asc) :
-    -- Apparent portability drop is larger than true portability drop
-    r2_source_asc - r2_target_asc > r2_source_pop - r2_target_pop →
-      False := by
-  intro h
-  linarith
+    If source and target cohorts have identical true architecture but different
+    ascertainment patterns, the apparent association is attenuated more in the
+    cohort with more severe ascertainment (smaller σ²_E relative to σ²_G). -/
+theorem differential_ascertainment_artifact (m : DifferentialAscertainmentModel) :
+    m.target.β_selected < m.source.β_selected := by
+  unfold ColliderModel.β_selected
+  rw [← m.equal_beta, ← m.equal_var_G]
+  have h_denom_s : 0 < m.source.σ2_G + m.source.σ2_E := add_pos m.source.σ2_G_pos m.source.σ2_E_pos
+  have h_denom_t : 0 < m.source.σ2_G + m.target.σ2_E := add_pos m.source.σ2_G_pos m.target.σ2_E_pos
+  have h_frac : m.source.σ2_G / (m.source.σ2_G + m.target.σ2_E) < m.source.σ2_G / (m.source.σ2_G + m.source.σ2_E) := by
+    apply div_lt_div_of_pos_left m.source.σ2_G_pos h_denom_s
+    linarith [m.more_severe_target]
+  exact mul_lt_mul_of_pos_left h_frac m.source.β_G_pos
 
 end ColliderBias
 
@@ -514,17 +528,32 @@ theorem survivorship_attenuates_in_older (m : SurvivorshipAttenuationModel) :
       < m.r2_full * 1 := by exact mul_lt_mul_of_pos_left h_ratio_lt_one m.r2_full_pos
     _ = m.r2_full := by ring
 
+/-- **Differential survivorship model.**
+    Models survivorship bias across source and target cohorts assuming identical
+    base R² and identical birth variance, but more severe survivorship bias
+    (lower variance among survivors) in the target cohort. -/
+structure DifferentialSurvivorshipModel where
+  source : SurvivorshipAttenuationModel
+  target : SurvivorshipAttenuationModel
+  /-- Identical true baseline prediction -/
+  equal_r2_full : source.r2_full = target.r2_full
+  /-- Identical baseline phenotypic variance -/
+  equal_var_birth : source.var_birth = target.var_birth
+  /-- More severe survivorship bias in target cohort (smaller variance among survivors) -/
+  more_severe_target : target.var_surv < source.var_surv
+
 /-- **Differential survivorship across populations creates portability artifact.**
-    If the target population has different age structure or mortality patterns,
-    survivorship bias contributes to apparent portability loss. -/
-theorem differential_survivorship_artifact
-    (r2_source_full r2_target_full Δ_surv_source Δ_surv_target : ℝ)
-    (h_surv_s : 0 ≤ Δ_surv_source) (h_surv_t : 0 ≤ Δ_surv_target)
-    (h_diff : Δ_surv_target > Δ_surv_source)
-    (h_obs_s : r2_source_full - Δ_surv_source > 0) :
-    (r2_source_full - Δ_surv_source) - (r2_target_full - Δ_surv_target) >
-      r2_source_full - r2_target_full := by
-  linarith
+    If the target population has different age structure or mortality patterns
+    causing more severe survivorship bias, it contributes to apparent portability loss
+    even if the true baseline architecture is identical. -/
+theorem differential_survivorship_artifact (m : DifferentialSurvivorshipModel) :
+    m.target.r2_surv < m.source.r2_surv := by
+  unfold SurvivorshipAttenuationModel.r2_surv
+  rw [← m.equal_r2_full, ← m.equal_var_birth]
+  have h_frac : m.target.var_surv / m.source.var_birth < m.source.var_surv / m.source.var_birth := by
+    rw [div_lt_div_iff₀ m.source.var_birth_pos m.source.var_birth_pos]
+    nlinarith [m.more_severe_target, m.source.var_birth_pos]
+  exact mul_lt_mul_of_pos_left h_frac m.source.r2_full_pos
 
 end SurvivorshipBias
 
