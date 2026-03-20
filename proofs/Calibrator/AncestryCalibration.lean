@@ -111,12 +111,21 @@ theorem spline_error_improves_with_knots
     var₂ - var₁ > bias₁² - bias₂² ↔ bias₁² + var₁ < bias₂² + var₂,
     which is direct rearrangement. The real content is the model
     decomposition MSE = bias² + variance. -/
+noncomputable def calibrationMSE (bias variance : ℝ) : ℝ :=
+  bias ^ 2 + variance
+
+/-- **Calibration improves MSE only if variance penalty is small.**
+    Adding splines reduces bias but increases variance.
+    If the variance penalty exceeds the bias reduction, the simpler model (config 1)
+    has lower MSE than the complex model (config 2). -/
 theorem bias_variance_tradeoff
     (bias₁ bias₂ var₁ var₂ : ℝ)
     (h_bias_improves : bias₂ ^ 2 < bias₁ ^ 2)
     (h_var_worsens : var₁ < var₂)
     (h_var_dominates : var₂ - var₁ > bias₁ ^ 2 - bias₂ ^ 2) :
-    bias₁ ^ 2 + var₁ < bias₂ ^ 2 + var₂ := by linarith
+    calibrationMSE bias₁ var₁ < calibrationMSE bias₂ var₂ := by
+  unfold calibrationMSE
+  linarith
 
 /-- **Spline R² is bounded by the signal-to-noise ratio.**
     R²_spline ≤ Var(E[ε²|d]) / Var(ε²).

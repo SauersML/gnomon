@@ -215,14 +215,25 @@ theorem gwas_h2_le_true (h2_true avg_r2_tag : ℝ)
   unfold gwasHeritability
   nlinarith
 
+/-- GWAS tagging captures a fraction of the true causal variance. -/
+noncomputable def gwasTaggingPortability (h2_true tagging_efficiency : ℝ) : ℝ :=
+  h2_true * tagging_efficiency
+
 /-- **Tagging efficiency varies by population.**
     Source LD is tagged better in source-derived GWAS than target LD.
     This creates a technical portability artifact. -/
 theorem tagging_creates_portability_artifact
-    (h2_source_gwas h2_target_gwas h2_true : ℝ)
-    (h_source_better : h2_target_gwas < h2_source_gwas)
-    (h_true : h2_source_gwas ≤ h2_true) :
-    h2_target_gwas < h2_true := by linarith
+    (h2_true tag_source tag_target : ℝ)
+    (h_true_pos : 0 < h2_true)
+    (h_tag_source : 0 < tag_source) (h_tag_source_le : tag_source ≤ 1)
+    (h_tag_target : 0 < tag_target)
+    (h_target_worse : tag_target < tag_source) :
+    gwasTaggingPortability h2_true tag_target < gwasTaggingPortability h2_true tag_source ∧
+    gwasTaggingPortability h2_true tag_source ≤ h2_true := by
+  unfold gwasTaggingPortability
+  constructor
+  · exact mul_lt_mul_of_pos_left h_target_worse h_true_pos
+  · exact mul_le_of_le_one_right (le_of_lt h_true_pos) h_tag_source_le
 
 end LDTagging
 
@@ -368,15 +379,33 @@ theorem fst_decreases_with_migration (m₁ m₂ Ne : ℝ)
   rw [div_lt_div_iff₀ (by nlinarith) (by nlinarith)]
   nlinarith
 
-/-- **Shared selection homogenizes architecture.**
+/-- **Genetic correlation under shared selection.**
     If both populations experience the same selective pressure
-    (e.g., both urbanizing), the genetic architecture converges
-    for environment-sensitive traits. -/
+    (e.g., both urbanizing), the correlation is pulled toward 1
+    proportionally to the strength of the shared pressure `s_shared`. -/
+noncomputable def geneticCorrelationUnderSharedSelection
+    (rg_initial s_shared : ℝ) : ℝ :=
+  rg_initial + (1 - rg_initial) * s_shared
+
+/-- **Shared selection homogenizes architecture.**
+    Given a positive shared selection pressure (0 < s < 1),
+    the genetic correlation strictly increases. -/
 theorem shared_selection_improves_portability
-    (rg_before rg_after : ℝ)
-    (h_improves : rg_before < rg_after)
-    (h_le : rg_after ≤ 1) :
-    rg_before < 1 := by linarith
+    (rg_initial s_shared : ℝ)
+    (h_rg_lt_one : rg_initial < 1)
+    (h_s_pos : 0 < s_shared)
+    (h_s_lt_one : s_shared < 1) :
+    rg_initial < geneticCorrelationUnderSharedSelection rg_initial s_shared ∧
+    geneticCorrelationUnderSharedSelection rg_initial s_shared < 1 := by
+  unfold geneticCorrelationUnderSharedSelection
+  have h_diff_pos : 0 < 1 - rg_initial := by linarith
+  constructor
+  · have h_add_pos : 0 < (1 - rg_initial) * s_shared := mul_pos h_diff_pos h_s_pos
+    linarith
+  · have h_le : rg_initial + (1 - rg_initial) * 1 = 1 := by ring
+    calc rg_initial + (1 - rg_initial) * s_shared
+      < rg_initial + (1 - rg_initial) * 1 := by nlinarith
+      _ = 1 := h_le
 
 /-!
 ### Derivation: portabilityFromArchitecture = rg² × (1 - Fst) × tagging_ratio
