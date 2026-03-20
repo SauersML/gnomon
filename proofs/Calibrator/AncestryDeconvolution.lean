@@ -195,11 +195,15 @@ theorem admixture_power_proportional_to_fst
     At loci where admixture mapping detects a signal, we can
     use ancestry-specific effects to correct the PGS.
     The correction size is proportional to Δβ × Fst_locus. -/
+noncomputable def admixtureCorrection (Δβ fst_locus : ℝ) : ℝ :=
+  Δβ * fst_locus
+
 theorem correction_proportional_to_delta_beta_fst
-    (Δβ fst_locus correction : ℝ)
-    (h_correction : correction = Δβ * fst_locus)
+    (Δβ fst_locus : ℝ)
     (h_Δβ : 0 < Δβ) (h_fst : 0 < fst_locus) :
-    0 < correction := by rw [h_correction]; exact mul_pos h_Δβ h_fst
+    0 < admixtureCorrection Δβ fst_locus := by
+  dsimp [admixtureCorrection]
+  exact mul_pos h_Δβ h_fst
 
 end AdmixtureMapping
 

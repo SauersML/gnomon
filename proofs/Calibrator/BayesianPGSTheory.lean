@@ -664,12 +664,13 @@ section MultiAncestryBayesian
 /-- **Genetic correlation determines information borrowing.**
     If rg = 1 (same effects), full information is shared.
     If rg = 0 (independent effects), no borrowing occurs. -/
+noncomputable def infoBorrowingGain (rg : ℝ) : ℝ := rg ^ 2
+
 theorem info_borrowing_proportional_to_rg
-    (rg info_gain : ℝ)
-    (h_relation : info_gain = rg ^ 2)
+    (rg : ℝ)
     (h_rg : 0 ≤ rg) (h_rg_le : rg ≤ 1) :
-    0 ≤ info_gain ∧ info_gain ≤ 1 := by
-  rw [h_relation]
+    0 ≤ infoBorrowingGain rg ∧ infoBorrowingGain rg ≤ 1 := by
+  dsimp [infoBorrowingGain]
   exact ⟨sq_nonneg _, by nlinarith [sq_nonneg rg]⟩
 
 /-- **Effective sample size in multi-ancestry setting.**
