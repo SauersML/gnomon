@@ -48,13 +48,20 @@ theorem total_loss_decomposition
   constructor <;> [skip; constructor <;> [skip; constructor <;> [skip; constructor]]] <;> linarith
 
 /-- **LD pathway is the largest contributor for most traits.**
-    For non-immune traits, LD mismatch accounts for >50% of portability loss. -/
+    For non-immune traits, LD mismatch accounts for >50% of portability loss.
+    We define the pathway proportion as the ratio of the LD variance drop
+    to the total variance drop, and prove that if the LD drop exceeds the sum
+    of all other drops, then the proportion exceeds 1/2. -/
+noncomputable def pathwayProportion (delta_pathway delta_total : ℝ) : ℝ :=
+  delta_pathway / delta_total
+
 theorem ld_dominant_pathway
-    (delta_total delta_LD : ℝ)
+    (delta_LD delta_MAF delta_effect delta_env delta_tech delta_total : ℝ)
+    (h_decomp : delta_total = delta_LD + delta_MAF + delta_effect + delta_env + delta_tech)
     (h_total : 0 < delta_total)
-    (h_LD_large : delta_total / 2 < delta_LD)
-    (h_LD_le : delta_LD ≤ delta_total) :
-    1 / 2 < delta_LD / delta_total := by
+    (h_LD_dom : delta_MAF + delta_effect + delta_env + delta_tech < delta_LD) :
+    1 / 2 < pathwayProportion delta_LD delta_total := by
+  unfold pathwayProportion
   rw [div_lt_div_iff₀ (by norm_num : (0:ℝ) < 2) h_total]
   linarith
 
@@ -114,27 +121,31 @@ on PGS accuracy into direct and indirect effects.
 section MediationAnalysis
 
 /-- **Total effect = Direct effect + Indirect effect.**
-    TE = DE + IE (in the linear case). -/
+    TE = DE + IE (in the linear case). We define the indirect effect structurally. -/
+noncomputable def indirectEffect (total_effect direct_effect : ℝ) : ℝ :=
+  total_effect - direct_effect
+
 theorem mediation_decomposition
-    (total_effect direct_effect indirect_effect : ℝ)
-    (h_decomp : total_effect = direct_effect + indirect_effect) :
-    -- Indirect effect is the total minus direct
-    indirect_effect = total_effect - direct_effect := by linarith
+    (total_effect direct_effect : ℝ) :
+    indirectEffect total_effect direct_effect = total_effect - direct_effect := by
+  unfold indirectEffect
+  rfl
 
 /-- **Proportion mediated.**
     PM = IE / TE = indirect / total. -/
-noncomputable def proportionMediated (indirect_effect total_effect : ℝ) : ℝ :=
-  indirect_effect / total_effect
+noncomputable def proportionMediated (total_effect direct_effect : ℝ) : ℝ :=
+  (indirectEffect total_effect direct_effect) / total_effect
 
-/-- Proportion mediated is in [0,1] when effects are nonneg and indirect ≤ total. -/
+/-- Proportion mediated is in [0,1] when direct effect is nonnegative and bounded by total effect. -/
 theorem proportion_mediated_in_unit
-    (ie te : ℝ)
-    (h_ie : 0 ≤ ie) (h_te : 0 < te) (h_le : ie ≤ te) :
-    0 ≤ proportionMediated ie te ∧ proportionMediated ie te ≤ 1 := by
-  unfold proportionMediated
+    (te de : ℝ)
+    (h_de_nn : 0 ≤ de) (h_te : 0 < te) (h_le : de ≤ te) :
+    0 ≤ proportionMediated te de ∧ proportionMediated te de ≤ 1 := by
+  unfold proportionMediated indirectEffect
   constructor
-  · exact div_nonneg h_ie (le_of_lt h_te)
-  · rw [div_le_one h_te]; exact h_le
+  · exact div_nonneg (sub_nonneg.mpr h_le) (le_of_lt h_te)
+  · rw [div_le_one h_te]
+    linarith
 
 /-- **LD mediates ancestry → PGS accuracy.**
     Ancestry → LD structure → PGS weights → Accuracy.

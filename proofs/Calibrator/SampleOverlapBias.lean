@@ -140,15 +140,21 @@ theorem apparent_portability_loss_includes_overlap
     by overlap bias, the apparent portability ratio is lower than the
     true ratio R²_cross / R²_same_true. -/
 theorem corrected_portability_better
-    (r2_cross r2_same_true overlap_bias : ℝ)
+    (r2_cross r2_same_true h2 f : ℝ) (n_gwas : ℕ)
     (h_cross_pos : 0 < r2_cross)
     (h_same_pos : 0 < r2_same_true)
-    (h_bias_pos : 0 < overlap_bias)
-    (h_cross_le : r2_cross < r2_same_true) :
+    (h_h2 : r2_same_true < h2)
+    (h_f_pos : 0 < f)
+    (h_n : 0 < n_gwas) :
     -- apparent portability < true portability
-    r2_cross / (r2_same_true + overlap_bias) < r2_cross / r2_same_true := by
+    r2_cross / partialOverlapR2 r2_same_true h2 f n_gwas < r2_cross / r2_same_true := by
+  have h_inflation : r2_same_true < partialOverlapR2 r2_same_true h2 f n_gwas := by
+    have h0 := no_overlap_unbiased r2_same_true h2 n_gwas
+    have hlt := more_overlap_more_inflation r2_same_true h2 0 f n_gwas h_h2 h_n h_f_pos
+    rw [h0] at hlt
+    exact hlt
   apply div_lt_div_of_pos_left h_cross_pos h_same_pos
-  linarith
+  exact h_inflation
 
 end CrossAncestryNoOverlap
 
