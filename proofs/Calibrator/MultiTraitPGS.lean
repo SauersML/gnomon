@@ -145,29 +145,58 @@ theorem pleiotropic_correlated_portability
     (h_lb_nn : 0 ≤ lb) :
     |port_A - port_B| < 2 * (1 - lb) := by linarith
 
+/-- A structural model of pleiotropy explicitly decomposing heritability
+    into shared (pleiotropic) and unique components, and defining portability. -/
+structure PleiotropyModel where
+  h2_shared : ℝ
+  h2_unique : ℝ
+  port_shared : ℝ
+  port_unique : ℝ
+  port_base : ℝ
+  alpha_mediated : ℝ
+  delta_shared : ℝ
+  delta_unique : ℝ
+  h_shared_pos : 0 < h2_shared
+  h_unique_pos : 0 < h2_unique
+  h_port_shared_nn : 0 ≤ port_shared
+  h_port_unique_nn : 0 ≤ port_unique
+  h_alpha_le : alpha_mediated ≤ 1
+  h_alpha_nn : 0 ≤ alpha_mediated
+  h_base_nn : 0 ≤ port_base
+  h_shared_nn : 0 < delta_shared
+  h_base_gt : delta_unique < port_base
+  h_selection : delta_shared < delta_unique
+
+/-- The overall portability is a weighted average of shared and unique portability
+    based on their respective heritability fractions. -/
+noncomputable def PleiotropyModel.overallPortability (m : PleiotropyModel) : ℝ :=
+  (m.h2_shared * m.port_shared + m.h2_unique * m.port_unique) / (m.h2_shared + m.h2_unique)
+
+/-- The structural portability after degradation. -/
+noncomputable def PleiotropyModel.degradedPortability (m : PleiotropyModel) (delta : ℝ) : ℝ :=
+  m.port_base - delta
+
 /-- **Mediated pleiotropy vs biological pleiotropy.**
     Mediated: A → B, so variant affects B through A.
     Portability of B is bounded by portability of A.
     If the mediation fraction is α ∈ [0,1], then
     port_B_mediated = α × port_A, so port_B ≤ port_A. -/
-theorem mediated_pleiotropy_portability_bound
-    (port_A α : ℝ)
-    (h_α_le : α ≤ 1)
-    (h_α_nn : 0 ≤ α)
-    (h_port_nn : 0 ≤ port_A) :
-    α * port_A ≤ port_A := by nlinarith
+theorem mediated_pleiotropy_portability_bound (m : PleiotropyModel) :
+    m.alpha_mediated * m.port_base ≤ m.port_base := by
+  have h_alpha := m.h_alpha_le
+  have h_base := m.h_base_nn
+  nlinarith
 
 /-- **Trait-specific genetic components are less portable.**
     The component of genetic variance unique to a trait (not shared
     via pleiotropy) is more likely to be affected by population-specific
     selection. Shared components degrade by δ_shared, unique by δ_unique,
     where δ_unique > δ_shared due to selection. -/
-theorem unique_component_less_portable
-    (port_base δ_shared δ_unique : ℝ)
-    (h_selection : δ_shared < δ_unique)
-    (h_shared_nn : 0 < δ_shared)
-    (h_base : δ_unique < port_base) :
-    port_base - δ_unique < port_base - δ_shared := by linarith
+theorem unique_component_less_portable (m : PleiotropyModel) :
+    m.degradedPortability m.delta_unique < m.degradedPortability m.delta_shared := by
+  unfold PleiotropyModel.degradedPortability
+  have h_sel := m.h_selection
+  linarith
 
 /-- **Decomposing trait heritability into shared and unique.**
     h²_trait = h²_shared + h²_unique where h²_shared comes from
@@ -176,14 +205,13 @@ theorem unique_component_less_portable
     Model: overall portability = (h²_shared × port_shared + h²_unique × port_unique) / h²_total.
     If h²_shared > h²_unique and port_shared > port_unique, then
     overall portability > (port_shared + port_unique) / 2 (the unweighted average). -/
-theorem heritability_shared_dominates_portability
-    (h2_shared h2_unique port_shared port_unique : ℝ)
-    (h_shared_pos : 0 < h2_shared) (h_unique_pos : 0 < h2_unique)
-    (h_shared_larger : h2_unique < h2_shared)
-    (h_port_shared_better : port_unique < port_shared)
-    (h_ps_nn : 0 ≤ port_shared) (h_pu_nn : 0 ≤ port_unique) :
-    (port_shared + port_unique) / 2 * (h2_shared + h2_unique) <
-      h2_shared * port_shared + h2_unique * port_unique := by
+theorem heritability_shared_dominates_portability (m : PleiotropyModel)
+    (h_shared_larger : m.h2_unique < m.h2_shared)
+    (h_port_shared_better : m.port_unique < m.port_shared) :
+    (m.port_shared + m.port_unique) / 2 < m.overallPortability := by
+  unfold PleiotropyModel.overallPortability
+  have h_total_pos : 0 < m.h2_shared + m.h2_unique := by linarith [m.h_shared_pos, m.h_unique_pos]
+  rw [lt_div_iff₀ h_total_pos]
   nlinarith [mul_pos (sub_pos.mpr h_shared_larger) (sub_pos.mpr h_port_shared_better)]
 
 end Pleiotropy
