@@ -273,21 +273,53 @@ section LDScoreRegression
     This directly estimates the genetic correlation
     that predicts PGS portability. -/
 
-/-- **Genetic correlation bounds portability ratio.**
-    The portability ratio R²_target / R²_source is bounded by ρ_g² × ld_adj.
-    Since |ρ_g| ≤ 1 implies ρ_g² ≤ 1, and ld_adj ∈ [0,1], the product
-    is at most 1. This gives the rg-based bound on portability.
+/-- A structural model of cross-ancestry genetics explicitly parameterizing
+    variances and covariances to bound portability. -/
+structure CrossAncestryGeneticModel where
+  var_g_source : ℝ
+  var_g_target : ℝ
+  cov_g : ℝ
+  ld_adj : ℝ
+  h_var_s_pos : 0 < var_g_source
+  h_var_t_pos : 0 < var_g_target
+  h_ld_nn : 0 ≤ ld_adj
+  h_ld_le : ld_adj ≤ 1
+  -- Cauchy-Schwarz bound on covariance (covariance matrix is PSD)
+  h_cov_sq_le : cov_g ^ 2 ≤ var_g_source * var_g_target
 
-    Derived from: ρ_g² ≤ 1 (since |ρ_g| ≤ 1) and ld_adj ≤ 1,
-    so the product ρ_g² × ld_adj ≤ 1. -/
-theorem genetic_correlation_predicts_portability
-    (rho_g ld_adj : ℝ)
-    (h_rho : 0 ≤ rho_g) (h_rho_le : rho_g ≤ 1)
-    (h_ld : 0 ≤ ld_adj) (h_ld_le : ld_adj ≤ 1) :
-    rho_g ^ 2 * ld_adj ≤ 1 := by
-  have h_sq : rho_g ^ 2 ≤ 1 := by nlinarith [sq_nonneg rho_g]
-  calc rho_g ^ 2 * ld_adj
-      ≤ 1 * 1 := mul_le_mul h_sq h_ld_le h_ld (by positivity)
+/-- Genetic correlation is the normalized covariance. -/
+noncomputable def CrossAncestryGeneticModel.rho_g (m : CrossAncestryGeneticModel) : ℝ :=
+  m.cov_g / Real.sqrt (m.var_g_source * m.var_g_target)
+
+/-- The target heritability fraction relative to source. -/
+noncomputable def CrossAncestryGeneticModel.target_ratio (m : CrossAncestryGeneticModel) : ℝ :=
+  m.var_g_target / m.var_g_source
+
+/-- The theoretical cross-ancestry portability ratio is defined as:
+    (Cov / V_s)^2 * (V_s / V_t) * ld_adj, which structurally aligns with ρ_g² * ld_adj. -/
+noncomputable def CrossAncestryGeneticModel.portability_ratio (m : CrossAncestryGeneticModel) : ℝ :=
+  m.rho_g ^ 2 * m.ld_adj
+
+/-- **Genetic correlation bounds portability ratio.**
+    The structural portability ratio is rigorously bounded by 1
+    due to the PSD constraints on the genetic variance-covariance structure
+    and the LD decay bound. -/
+theorem genetic_correlation_predicts_portability (m : CrossAncestryGeneticModel) :
+    m.portability_ratio ≤ 1 := by
+  unfold CrossAncestryGeneticModel.portability_ratio CrossAncestryGeneticModel.rho_g
+  have h_var_prod_pos : 0 < m.var_g_source * m.var_g_target :=
+    mul_pos m.h_var_s_pos m.h_var_t_pos
+  have h_rho_sq : (m.cov_g / Real.sqrt (m.var_g_source * m.var_g_target)) ^ 2 =
+      m.cov_g ^ 2 / (m.var_g_source * m.var_g_target) := by
+    rw [div_pow, Real.sq_sqrt (le_of_lt h_var_prod_pos)]
+  rw [h_rho_sq]
+  have h_cov_le_1 : m.cov_g ^ 2 / (m.var_g_source * m.var_g_target) ≤ 1 := by
+    rw [div_le_one h_var_prod_pos]
+    exact m.h_cov_sq_le
+  have h_cov_nn : 0 ≤ m.cov_g ^ 2 / (m.var_g_source * m.var_g_target) := by
+    exact div_nonneg (sq_nonneg _) (le_of_lt h_var_prod_pos)
+  calc m.cov_g ^ 2 / (m.var_g_source * m.var_g_target) * m.ld_adj
+      ≤ 1 * 1 := mul_le_mul h_cov_le_1 m.h_ld_le m.h_ld_nn zero_le_one
     _ = 1 := one_mul 1
 
 /-- **LDSC standard error for ρ_g.**
