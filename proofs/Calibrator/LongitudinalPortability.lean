@@ -496,14 +496,26 @@ theorem temporal_split_more_conservative
       ≤ r2_true * 1 := mul_le_mul_of_nonneg_left h_exp_le h_r2
     _ = r2_true := mul_one _
 
+/-- **Apparent portability loss from diagnostic changes.**
+    A phenotype definition change acts like adding independent
+    definitional noise, attenuating the valid variance by the
+    squared genetic correlation between old and new definitions. -/
+noncomputable def r2FromDiagnosticChange (r2_consistent r_g_def : ℝ) : ℝ :=
+  r2_consistent * r_g_def ^ 2
+
 /-- **Phenotype definition stability.**
     Changes in diagnostic criteria over time (e.g., ICD revisions)
     create apparent portability loss that is purely definitional. -/
 theorem diagnostic_change_creates_apparent_loss
-    (r2_consistent_def r2_changed_def : ℝ)
-    (h_reduced : r2_changed_def < r2_consistent_def)
-    (h_nn : 0 < r2_changed_def) :
-    0 < r2_consistent_def - r2_changed_def := by linarith
+    (r2_consistent r_g_def : ℝ)
+    (h_r2_pos : 0 < r2_consistent)
+    (h_rg_bound : |r_g_def| < 1) :
+    r2FromDiagnosticChange r2_consistent r_g_def < r2_consistent := by
+  unfold r2FromDiagnosticChange
+  have h_rg_sq : r_g_def ^ 2 < 1 := by nlinarith [sq_abs r_g_def, abs_nonneg r_g_def, sq_nonneg r_g_def]
+  calc r2_consistent * r_g_def ^ 2
+      < r2_consistent * 1 := mul_lt_mul_of_pos_left h_rg_sq h_r2_pos
+    _ = r2_consistent := mul_one r2_consistent
 
 /-- **Genotype-phenotype map stability varies by trait.**
     Highly polygenic traits with small per-variant effects
