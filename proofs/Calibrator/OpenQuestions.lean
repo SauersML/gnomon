@@ -350,25 +350,62 @@ theorem env_variance_lowers_r2
     Vg / (Vg + Ve₂) < Vg / (Vg + Ve₁) := by
   apply div_lt_div_of_pos_left hVg (by linarith) (by linarith)
 
+structure OmittedVariableModel where
+  beta_true : ℝ
+  beta_ses : ℝ
+  rho : ℝ
+
+noncomputable def naive_coefficient (m : OmittedVariableModel) : ℝ :=
+  m.beta_true + m.beta_ses * m.rho
+
 /-- **Omitted variable bias in portability regression.**
     If SES (β_s) correlates with genetic distance (correlation ρ),
     the naive coefficient on distance absorbs the SES effect. -/
 theorem omitted_variable_bias
-    (β_true β_ses ρ : ℝ)
-    (h_ses : β_ses ≠ 0) (h_corr : ρ ≠ 0) :
-    β_true + β_ses * ρ ≠ β_true := by
+    (m : OmittedVariableModel)
+    (h_ses : m.beta_ses ≠ 0) (h_corr : m.rho ≠ 0) :
+    naive_coefficient m ≠ m.beta_true := by
+  unfold naive_coefficient
   intro h
-  have : β_ses * ρ = 0 := by linarith
+  have : m.beta_ses * m.rho = 0 := by linarith
   rcases mul_eq_zero.mp this with h | h
   · exact h_ses h
   · exact h_corr h
 
+structure PortabilityVarianceModel where
+  Vg_s : ℝ
+  Ve_s : ℝ
+  Vg_t : ℝ
+  Ve_t : ℝ
+  Vg_s_pos : 0 < Vg_s
+  Ve_s_pos : 0 < Ve_s
+  Vg_t_pos : 0 < Vg_t
+  Ve_t_pos : 0 < Ve_t
+
+noncomputable def r2_src (m : PortabilityVarianceModel) : ℝ :=
+  m.Vg_s / (m.Vg_s + m.Ve_s)
+
+noncomputable def r2_tgt (m : PortabilityVarianceModel) : ℝ :=
+  m.Vg_t / (m.Vg_t + m.Ve_t)
+
+noncomputable def genetic_component_drop (m : PortabilityVarianceModel) : ℝ :=
+  m.Vg_s / (m.Vg_s + m.Ve_s) - m.Vg_t / (m.Vg_t + m.Ve_s)
+
+noncomputable def env_component_drop (m : PortabilityVarianceModel) : ℝ :=
+  m.Vg_t / (m.Vg_t + m.Ve_s) - m.Vg_t / (m.Vg_t + m.Ve_t)
+
+noncomputable def portability_drop (m : PortabilityVarianceModel) : ℝ :=
+  r2_src m - r2_tgt m
+
 /-- **Portability drop decomposes into genetic + environmental parts.** -/
 theorem portability_drop_decomp
-    (r2s r2t Δg Δe : ℝ)
-    (h_eq : r2s - r2t = Δg + Δe)
-    (hΔg : 0 ≤ Δg) (hΔe : 0 ≤ Δe) :
-    Δg ≤ r2s - r2t ∧ Δe ≤ r2s - r2t := by
+    (m : PortabilityVarianceModel)
+    (h_g_nonneg : 0 ≤ genetic_component_drop m)
+    (h_e_nonneg : 0 ≤ env_component_drop m) :
+    genetic_component_drop m ≤ portability_drop m ∧ env_component_drop m ≤ portability_drop m := by
+  have h_eq : portability_drop m = genetic_component_drop m + env_component_drop m := by
+    unfold portability_drop genetic_component_drop env_component_drop r2_src r2_tgt
+    ring
   constructor <;> linarith
 
 end Question4
@@ -380,19 +417,41 @@ end Question4
 
 section Question5
 
+structure PredictionErrorModel where
+  beta_true : ℝ
+  inflation : ℝ
+  turnover_rho : ℝ
+
+noncomputable def gwas_estimate (m : PredictionErrorModel) : ℝ :=
+  m.beta_true + m.inflation
+
+noncomputable def target_effect (m : PredictionErrorModel) : ℝ :=
+  m.turnover_rho * m.beta_true
+
+noncomputable def prediction_error (m : PredictionErrorModel) : ℝ :=
+  gwas_estimate m - target_effect m
+
+noncomputable def turnover_component (m : PredictionErrorModel) : ℝ :=
+  (1 - m.turnover_rho) * m.beta_true
+
 /-- **Winner's curse prediction error model.**
     GWAS estimate β_hat = β_true + δ (inflation).
     Target effect β_t = ρ * β_true (turnover).
     Prediction error = β_hat - β_t = (1-ρ)*β + δ.
     Prediction error decomposes into turnover + inflation. -/
-theorem prediction_error_decomp (β δ ρ : ℝ) :
-    (β + δ) - ρ * β = (1 - ρ) * β + δ := by ring
+theorem prediction_error_decomp (m : PredictionErrorModel) :
+    prediction_error m = turnover_component m + m.inflation := by
+  unfold prediction_error gwas_estimate target_effect turnover_component
+  ring
 
 /-- Prediction error is positive when both components are positive. -/
 theorem prediction_error_positive
-    (β δ ρ : ℝ) (hβ : 0 < β) (hδ : 0 < δ) (hρ : ρ ≤ 1) :
-    0 < (1 - ρ) * β + δ := by
-  have : 0 ≤ (1 - ρ) * β := mul_nonneg (by linarith) (le_of_lt hβ)
+    (m : PredictionErrorModel) (hβ : 0 < m.beta_true) (hδ : 0 < m.inflation) (hρ : m.turnover_rho ≤ 1) :
+    0 < prediction_error m := by
+  have h_comp : prediction_error m = turnover_component m + m.inflation := prediction_error_decomp m
+  rw [h_comp]
+  unfold turnover_component
+  have : 0 ≤ (1 - m.turnover_rho) * m.beta_true := mul_nonneg (by linarith) (le_of_lt hβ)
   linarith
 
 /-- **Winner's curse is worse with more turnover.**
