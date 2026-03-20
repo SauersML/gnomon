@@ -327,14 +327,12 @@ theorem collider_attenuates_association (m : ColliderModel) :
     the apparent portability drop includes an ascertainment component. -/
 theorem differential_ascertainment_artifact
     (r2_source_pop r2_target_pop r2_source_asc r2_target_asc : ℝ)
-    (h_source_asc : r2_source_asc < r2_source_pop)
-    (h_target_asc : r2_target_asc < r2_target_pop)
+    (_h_source_asc : r2_source_asc < r2_source_pop)
+    (_h_target_asc : r2_target_asc < r2_target_pop)
     -- Different ascertainment severity
-    (h_diff_severity : r2_target_pop - r2_target_asc < r2_source_pop - r2_source_asc) :
+    (h_diff_severity : r2_source_pop - r2_source_asc < r2_target_pop - r2_target_asc) :
     -- Apparent portability drop is larger than true portability drop
-    r2_source_asc - r2_target_asc > r2_source_pop - r2_target_pop →
-      False := by
-  intro h
+    r2_source_pop - r2_target_pop < r2_source_asc - r2_target_asc := by
   linarith
 
 end ColliderBias
@@ -514,17 +512,32 @@ theorem survivorship_attenuates_in_older (m : SurvivorshipAttenuationModel) :
       < m.r2_full * 1 := by exact mul_lt_mul_of_pos_left h_ratio_lt_one m.r2_full_pos
     _ = m.r2_full := by ring
 
+/-- **Age Structure Model for Survivorship Artifacts.** -/
+structure AgeStructureModel where
+  r2_source_full : ℝ
+  r2_target_full : ℝ
+  Δ_surv_source : ℝ
+  Δ_surv_target : ℝ
+  h_surv_s : 0 ≤ Δ_surv_source
+  h_surv_t : 0 ≤ Δ_surv_target
+  h_diff : Δ_surv_source < Δ_surv_target
+  h_obs_s : 0 < r2_source_full - Δ_surv_source
+
+/-- Apparent portability drop accounting for differential survivorship. -/
+noncomputable def AgeStructureModel.apparentDrop (m : AgeStructureModel) : ℝ :=
+  (m.r2_source_full - m.Δ_surv_source) - (m.r2_target_full - m.Δ_surv_target)
+
+/-- True portability drop without survivorship bias. -/
+noncomputable def AgeStructureModel.trueDrop (m : AgeStructureModel) : ℝ :=
+  m.r2_source_full - m.r2_target_full
+
 /-- **Differential survivorship across populations creates portability artifact.**
     If the target population has different age structure or mortality patterns,
     survivorship bias contributes to apparent portability loss. -/
-theorem differential_survivorship_artifact
-    (r2_source_full r2_target_full Δ_surv_source Δ_surv_target : ℝ)
-    (h_surv_s : 0 ≤ Δ_surv_source) (h_surv_t : 0 ≤ Δ_surv_target)
-    (h_diff : Δ_surv_target > Δ_surv_source)
-    (h_obs_s : r2_source_full - Δ_surv_source > 0) :
-    (r2_source_full - Δ_surv_source) - (r2_target_full - Δ_surv_target) >
-      r2_source_full - r2_target_full := by
-  linarith
+theorem differential_survivorship_artifact (m : AgeStructureModel) :
+    m.trueDrop < m.apparentDrop := by
+  unfold AgeStructureModel.trueDrop AgeStructureModel.apparentDrop
+  linarith [m.h_diff]
 
 end SurvivorshipBias
 
@@ -714,14 +727,28 @@ theorem weak_instrument_bias_increases
     linarith
   linarith
 
+/-- **Model of Horizontal Pleiotropy.** -/
+structure MRPleiotropyModel where
+  β_causal : ℝ
+  α_pleio_source : ℝ
+  α_pleio_target : ℝ
+  h_diff : α_pleio_source ≠ α_pleio_target
+
+/-- MR estimate in the source population. -/
+noncomputable def MRPleiotropyModel.mrEstimateSource (m : MRPleiotropyModel) : ℝ :=
+  m.β_causal + m.α_pleio_source
+
+/-- MR estimate in the target population. -/
+noncomputable def MRPleiotropyModel.mrEstimateTarget (m : MRPleiotropyModel) : ℝ :=
+  m.β_causal + m.α_pleio_target
+
 /-- **Horizontal pleiotropy patterns differ across populations.**
     If pleiotropic effects change across populations (due to different
     LD patterns or gene regulation), MR estimates are not portable. -/
-theorem pleiotropy_changes_invalidate_mr
-    (β_causal α_pleio_source α_pleio_target : ℝ)
-    (h_diff : α_pleio_source ≠ α_pleio_target) :
-    β_causal + α_pleio_source ≠ β_causal + α_pleio_target := by
-  intro h; exact h_diff (by linarith)
+theorem pleiotropy_changes_invalidate_mr (m : MRPleiotropyModel) :
+    m.mrEstimateSource ≠ m.mrEstimateTarget := by
+  unfold MRPleiotropyModel.mrEstimateSource MRPleiotropyModel.mrEstimateTarget
+  intro h; apply m.h_diff; linarith
 
 end MRPortability
 
