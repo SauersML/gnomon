@@ -91,15 +91,26 @@ theorem selection_dominant_for_immune
           nlinarith [sq_abs ρ, sq_nonneg ρ]
       _ = presentDayPGSVariance V_A fst := one_mul _
 
+/-- Structural model for pathway interactions. -/
+structure PathwayInteractionModel where
+  sum_individual : ℝ
+  interaction : ℝ
+
+/-- Total loss including interactions. -/
+noncomputable def totalWithInteractions (model : PathwayInteractionModel) : ℝ :=
+  model.sum_individual + model.interaction
+
 /-- **Interaction effects between pathways.**
     Pathways are not fully independent: LD changes interact
     with MAF changes (LD × MAF interaction). -/
 theorem pathway_interactions_exist
-    (sum_individual total_with_interactions interaction : ℝ)
-    (h_interaction : total_with_interactions = sum_individual + interaction)
-    (h_nonzero : interaction ≠ 0) :
-    total_with_interactions ≠ sum_individual := by
-  rw [h_interaction]; intro h; apply h_nonzero; linarith
+    (model : PathwayInteractionModel)
+    (h_nonzero : model.interaction ≠ 0) :
+    totalWithInteractions model ≠ model.sum_individual := by
+  unfold totalWithInteractions
+  intro h
+  apply h_nonzero
+  linarith
 
 end PathDecomposition
 
@@ -113,24 +124,33 @@ on PGS accuracy into direct and indirect effects.
 
 section MediationAnalysis
 
+/-- Structural model for mediation analysis. -/
+structure MediationModel where
+  total_effect : ℝ
+  direct_effect : ℝ
+
+/-- Derived indirect effect. -/
+noncomputable def indirectEffect (model : MediationModel) : ℝ :=
+  model.total_effect - model.direct_effect
+
 /-- **Total effect = Direct effect + Indirect effect.**
     TE = DE + IE (in the linear case). -/
 theorem mediation_decomposition
-    (total_effect direct_effect indirect_effect : ℝ)
-    (h_decomp : total_effect = direct_effect + indirect_effect) :
-    -- Indirect effect is the total minus direct
-    indirect_effect = total_effect - direct_effect := by linarith
+    (model : MediationModel) :
+    model.total_effect = model.direct_effect + indirectEffect model := by
+  unfold indirectEffect
+  ring
 
 /-- **Proportion mediated.**
     PM = IE / TE = indirect / total. -/
-noncomputable def proportionMediated (indirect_effect total_effect : ℝ) : ℝ :=
-  indirect_effect / total_effect
+noncomputable def proportionMediated (model : MediationModel) : ℝ :=
+  indirectEffect model / model.total_effect
 
 /-- Proportion mediated is in [0,1] when effects are nonneg and indirect ≤ total. -/
 theorem proportion_mediated_in_unit
-    (ie te : ℝ)
-    (h_ie : 0 ≤ ie) (h_te : 0 < te) (h_le : ie ≤ te) :
-    0 ≤ proportionMediated ie te ∧ proportionMediated ie te ≤ 1 := by
+    (model : MediationModel)
+    (h_ie : 0 ≤ indirectEffect model) (h_te : 0 < model.total_effect) (h_le : indirectEffect model ≤ model.total_effect) :
+    0 ≤ proportionMediated model ∧ proportionMediated model ≤ 1 := by
   unfold proportionMediated
   constructor
   · exact div_nonneg h_ie (le_of_lt h_te)
@@ -435,26 +455,55 @@ theorem e_value_ge_one (rr : ℝ) (h_rr : 1 ≤ rr) :
   have : 0 ≤ Real.sqrt (rr * (rr - 1)) := Real.sqrt_nonneg _
   linarith
 
+/-- Model for sensitivity analysis of LD reference mismatch. -/
+structure SensitivityAnalysisModel where
+  r2_in_sample : ℝ
+  r2_external : ℝ
+  ld_bias : ℝ
+
+/-- The derived difference in R² from LD reference mismatch. -/
+noncomputable def ldReferenceDelta (model : SensitivityAnalysisModel) : ℝ :=
+  model.r2_in_sample - model.r2_external
+
 /-- **Sensitivity to LD reference mismatch.**
     Portability estimates are sensitive to the choice of LD reference.
     Using in-sample LD vs. external reference can change R² by δ. -/
 theorem ld_reference_sensitivity
-    (r2_in_sample r2_external delta : ℝ)
-    (h_diff : r2_in_sample = r2_external + delta)
-    (h_delta : 0 < |delta|) :
-    r2_in_sample ≠ r2_external := by
-  rw [h_diff]; intro h; have : delta = 0 := by linarith
-  exact absurd (this ▸ h_delta) (by simp)
+    (model : SensitivityAnalysisModel)
+    (h_bias : 0 < |model.ld_bias|)
+    (h_match : ldReferenceDelta model = model.ld_bias) :
+    model.r2_in_sample ≠ model.r2_external := by
+  intro h_eq
+  have h_delta_zero : ldReferenceDelta model = 0 := by
+    unfold ldReferenceDelta
+    rw [h_eq, sub_self]
+  rw [h_delta_zero] at h_match
+  rw [← h_match] at h_bias
+  have h_abs_zero : |(0 : ℝ)| = 0 := abs_zero
+  rw [h_abs_zero] at h_bias
+  linarith
+
+/-- Model for phenotype definitions impact. -/
+structure PhenotypeDefinitionModel where
+  port_def1 : ℝ
+  port_def2 : ℝ
+
+/-- Derived absolute difference in portability due to phenotype mismatch. -/
+noncomputable def phenotypePortabilityDiff (model : PhenotypeDefinitionModel) : ℝ :=
+  |model.port_def1 - model.port_def2|
 
 /-- **Sensitivity to phenotype definition.**
     Different phenotype definitions (self-report vs clinical,
     ICD-9 vs ICD-10) can change portability estimates.
     When the difference exceeds any threshold ε > 0, the estimates differ. -/
 theorem phenotype_definition_matters
-    (port_def1 port_def2 ε : ℝ) (h_ε : 0 < ε)
-    (h_large_diff : ε < |port_def1 - port_def2|) :
-    port_def1 ≠ port_def2 := by
-  intro h; rw [h, sub_self, abs_zero] at h_large_diff; linarith
+    (model : PhenotypeDefinitionModel) (ε : ℝ) (h_ε : 0 < ε)
+    (h_large_diff : ε < phenotypePortabilityDiff model) :
+    model.port_def1 ≠ model.port_def2 := by
+  intro h_eq
+  unfold phenotypePortabilityDiff at h_large_diff
+  rw [h_eq, sub_self, abs_zero] at h_large_diff
+  linarith
 
 end SensitivityAnalysis
 

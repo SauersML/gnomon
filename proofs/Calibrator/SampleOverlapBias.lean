@@ -122,7 +122,7 @@ theorem apparent_portability_loss_includes_overlap
     (h_real_gap : r2_cross < r2_same_true) :
     let r2_same_with_overlap := partialOverlapR2 r2_same_true h2 f n_gwas
     r2_cross < r2_same_with_overlap ∧
-    r2_same_with_overlap - r2_cross > r2_same_true - r2_cross := by
+    r2_same_true - r2_cross < r2_same_with_overlap - r2_cross := by
   simp only
   have h_inflation : r2_same_true < partialOverlapR2 r2_same_true h2 f n_gwas := by
     have h0 := no_overlap_unbiased r2_same_true h2 n_gwas
@@ -143,8 +143,7 @@ theorem corrected_portability_better
     (r2_cross r2_same_true overlap_bias : ℝ)
     (h_cross_pos : 0 < r2_cross)
     (h_same_pos : 0 < r2_same_true)
-    (h_bias_pos : 0 < overlap_bias)
-    (h_cross_le : r2_cross < r2_same_true) :
+    (h_bias_pos : 0 < overlap_bias) :
     -- apparent portability < true portability
     r2_cross / (r2_same_true + overlap_bias) < r2_cross / r2_same_true := by
   apply div_lt_div_of_pos_left h_cross_pos h_same_pos
@@ -193,6 +192,10 @@ theorem jackknife_reduces_r2 (r2_full bias : ℝ)
     jackknifeR2 r2_full bias < r2_full := by
   unfold jackknifeR2; linarith
 
+/-- Structural bias expected from sample overlap. -/
+noncomputable def expectedOverlapBias (h2 r2_true f : ℝ) (n_gwas : ℕ) : ℝ :=
+  f * (h2 - r2_true) / n_gwas
+
 /-- **GWAS-by-subtraction identifies overlap bias from partial overlap model.**
     Using the `partialOverlapR2` formula: running GWAS on the full sample
     (overlap fraction f) and then on the excluded sample (overlap fraction 0)
@@ -201,10 +204,18 @@ theorem jackknife_reduces_r2 (r2_full bias : ℝ)
 theorem gwas_subtraction_estimates_bias
     (r2_true h2 f : ℝ) (n_gwas : ℕ)
     (h_h2 : r2_true < h2) (h_f : 0 < f) (h_n : 0 < n_gwas) :
+    0 < partialOverlapR2 r2_true h2 f n_gwas - partialOverlapR2 r2_true h2 0 n_gwas ∧
     partialOverlapR2 r2_true h2 f n_gwas - partialOverlapR2 r2_true h2 0 n_gwas =
-      f * (h2 - r2_true) / ↑n_gwas := by
-  unfold partialOverlapR2
-  ring
+      expectedOverlapBias h2 r2_true f n_gwas := by
+  unfold partialOverlapR2 expectedOverlapBias
+  have h_diff : 0 < h2 - r2_true := by linarith
+  have h_n_pos : (0 : ℝ) < ↑n_gwas := Nat.cast_pos.mpr h_n
+  have h_pos : 0 < f * (h2 - r2_true) / ↑n_gwas := div_pos (mul_pos h_f h_diff) h_n_pos
+  have h_calc : r2_true + f * (h2 - r2_true) / ↑n_gwas - (r2_true + 0 * (h2 - r2_true) / ↑n_gwas) = f * (h2 - r2_true) / ↑n_gwas := by ring
+  constructor
+  · rw [h_calc]
+    exact h_pos
+  · exact h_calc
 
 end LOOCorrections
 
@@ -245,8 +256,6 @@ theorem kinship_inflates (r2_true K h2_family : ℝ)
 theorem grm_threshold_tradeoff
     (r2_true h2_family K_strict K_lenient : ℝ)
     (h_strict_lt : K_strict < K_lenient)
-    (h_strict_pos : 0 < K_strict)
-    (h_lenient_pos : 0 < K_lenient)
     (h_h2_pos : 0 < h2_family) :
     -- Stricter threshold gives smaller kinship inflation
     kinshipInflation r2_true K_strict h2_family <
@@ -254,21 +263,34 @@ theorem grm_threshold_tradeoff
   unfold kinshipInflation
   linarith [mul_lt_mul_of_pos_right h_strict_lt h_h2_pos]
 
+/-- Structural model for cryptic relatedness inflation. -/
+structure CrypticRelatednessModel where
+  kinship_cross : ℝ
+  h2_family : ℝ
+  h_h2_pos : 0 < h2_family
+  h_h2_le : h2_family ≤ 1
+
+/-- Inflation term due to cryptic relatedness. -/
+noncomputable def kinshipInflationTerm (model : CrypticRelatednessModel) : ℝ :=
+  model.kinship_cross * model.h2_family
+
 /-- **Cross-ancestry naturally avoids cryptic relatedness.**
     Individuals from different continental ancestries have
     near-zero kinship, eliminating kinship-based inflation.
     When |K| < ε, the inflation |K × h²_family| < ε × h²_family,
     so the bias is bounded by ε × h²_family. -/
 theorem cross_ancestry_no_kinship_bias
-    (K_cross h2_family ε : ℝ)
-    (h_ε_pos : 0 < ε)
-    (h_K_small : |K_cross| < ε)
-    (h_h2_pos : 0 < h2_family) (h_h2_le : h2_family ≤ 1) :
-    |K_cross * h2_family| < ε := by
-  calc |K_cross * h2_family| = |K_cross| * |h2_family| := abs_mul _ _
-    _ = |K_cross| * h2_family := by rw [abs_of_pos h_h2_pos]
-    _ ≤ |K_cross| * 1 := by nlinarith [abs_nonneg K_cross]
-    _ = |K_cross| := mul_one _
+    (model : CrypticRelatednessModel) (ε : ℝ)
+    (h_K_small : |model.kinship_cross| < ε) :
+    |kinshipInflationTerm model| < ε := by
+  unfold kinshipInflationTerm
+  have h_abs_h2 : |model.h2_family| = model.h2_family := abs_of_pos model.h_h2_pos
+  have h_le : |model.kinship_cross| * model.h2_family ≤ |model.kinship_cross| * 1 :=
+    mul_le_mul_of_nonneg_left model.h_h2_le (abs_nonneg _)
+  calc |model.kinship_cross * model.h2_family| = |model.kinship_cross| * |model.h2_family| := abs_mul _ _
+    _ = |model.kinship_cross| * model.h2_family := by rw [h_abs_h2]
+    _ ≤ |model.kinship_cross| * 1 := h_le
+    _ = |model.kinship_cross| := mul_one _
     _ < ε := h_K_small
 
 end CrypticRelatedness
