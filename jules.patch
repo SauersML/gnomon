@@ -1,0 +1,26 @@
+diff --git a/proofs/Calibrator/CausalInference.lean b/proofs/Calibrator/CausalInference.lean
+index f32ef5e..6ad5614 100644
+--- a/proofs/Calibrator/CausalInference.lean
++++ b/proofs/Calibrator/CausalInference.lean
+@@ -113,13 +113,17 @@ on PGS accuracy into direct and indirect effects.
+ 
+ section MediationAnalysis
+ 
++/-- In the linear case, the total effect is the sum of direct and indirect effects. -/
++noncomputable def totalEffect (direct_effect indirect_effect : ℝ) : ℝ :=
++  direct_effect + indirect_effect
++
+ /-- **Total effect = Direct effect + Indirect effect.**
+     TE = DE + IE (in the linear case). -/
+ theorem mediation_decomposition
+-    (total_effect direct_effect indirect_effect : ℝ)
+-    (h_decomp : total_effect = direct_effect + indirect_effect) :
+-    -- Indirect effect is the total minus direct
+-    indirect_effect = total_effect - direct_effect := by linarith
++    (direct_effect indirect_effect : ℝ) :
++    indirect_effect = totalEffect direct_effect indirect_effect - direct_effect := by
++  unfold totalEffect
++  ring
+ 
+ /-- **Proportion mediated.**
+     PM = IE / TE = indirect / total. -/
