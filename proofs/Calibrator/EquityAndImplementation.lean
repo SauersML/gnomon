@@ -39,11 +39,14 @@ section HealthDisparity
     increasing in R². We model benefit = α × R² for a positive
     proportionality constant α (benefit per unit R²). When
     R²₁ < R²₂, the benefit in population 1 is strictly less. -/
+noncomputable def clinicalBenefit (α r2 : ℝ) : ℝ := α * r2
+
 theorem clinical_benefit_increases_with_r2
     (α r2₁ r2₂ : ℝ)
     (h_α : 0 < α)
     (h_r2 : r2₁ < r2₂) :
-    α * r2₁ < α * r2₂ := by
+    clinicalBenefit α r2₁ < clinicalBenefit α r2₂ := by
+  dsimp [clinicalBenefit]
   exact mul_lt_mul_of_pos_left h_r2 h_α
 
 /-- **Portability gap creates benefit gap.**
@@ -55,7 +58,8 @@ theorem portability_creates_benefit_gap
     (h_α : 0 < α)
     (h_r2_gap : r2_afr < r2_eur)
     (h_nn : 0 ≤ r2_afr) :
-    0 < α * r2_eur - α * r2_afr := by
+    0 < clinicalBenefit α r2_eur - clinicalBenefit α r2_afr := by
+  dsimp [clinicalBenefit]
   have : r2_eur - r2_afr > 0 := by linarith
   nlinarith
 
@@ -92,10 +96,13 @@ theorem deployment_amplifies_disparity
     QALYs gained = γ × R² for a positive constant γ (QALYs per unit R²).
     The QALY gap between two populations is γ × (R²₁ - R²₂), which is
     positive when R²₁ > R²₂. Derived from the model, not assumed. -/
+noncomputable def qalyGained (γ r2 : ℝ) : ℝ := γ * r2
+
 theorem qaly_gap_proportional_to_r2_gap
     (γ r2₁ r2₂ : ℝ)
     (h_γ : 0 < γ) (h_gap : r2₂ < r2₁) :
-    0 < γ * r2₁ - γ * r2₂ := by
+    0 < qalyGained γ r2₁ - qalyGained γ r2₂ := by
+  dsimp [qalyGained]
   have : r2₁ - r2₂ > 0 := by linarith
   nlinarith
 
