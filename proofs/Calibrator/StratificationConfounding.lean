@@ -322,19 +322,50 @@ theorem collider_attenuates_association (m : ColliderModel) :
       < m.β_G * 1 := by exact mul_lt_mul_of_pos_left h_ratio_lt_one m.β_G_pos
     _ = m.β_G := by ring
 
+/-- **Ascertainment model.**
+    Models the reduction in R² due to collider bias from ascertainment.
+    R²_asc = R²_pop * ascertainment_retention, where retention < 1. -/
+structure AscertainmentModel where
+  /-- Population R² -/
+  r2_pop : ℝ
+  /-- Fraction of R² retained after ascertainment -/
+  retention : ℝ
+  r2_pop_pos : 0 < r2_pop
+  retention_pos : 0 < retention
+  retention_lt_one : retention < 1
+
+/-- R² in the ascertained sample -/
+noncomputable def AscertainmentModel.r2_asc (m : AscertainmentModel) : ℝ :=
+  m.r2_pop * m.retention
+
+/-- Ascertainment strictly reduces R² -/
+theorem ascertainment_reduces_r2 (m : AscertainmentModel) :
+    m.r2_asc < m.r2_pop := by
+  unfold AscertainmentModel.r2_asc
+  calc m.r2_pop * m.retention
+      < m.r2_pop * 1 := mul_lt_mul_of_pos_left m.retention_lt_one m.r2_pop_pos
+    _ = m.r2_pop := mul_one _
+
+/-- **Two-population ascertainment model.**
+    Models source and target populations with potentially different
+    ascertainment severities (different retentions). -/
+structure TwoPopAscertainmentModel where
+  source : AscertainmentModel
+  target : AscertainmentModel
+
 /-- **Differential ascertainment creates portability artifact.**
-    If source and target cohorts have different ascertainment patterns,
-    the apparent portability drop includes an ascertainment component. -/
-theorem differential_ascertainment_artifact
-    (r2_source_pop r2_target_pop r2_source_asc r2_target_asc : ℝ)
-    (h_source_asc : r2_source_asc < r2_source_pop)
-    (h_target_asc : r2_target_asc < r2_target_pop)
-    -- Different ascertainment severity
-    (h_diff_severity : r2_target_pop - r2_target_asc < r2_source_pop - r2_source_asc) :
-    -- Apparent portability drop is larger than true portability drop
-    r2_source_asc - r2_target_asc > r2_source_pop - r2_target_pop →
-      False := by
-  intro h
+    If the source cohort has less severe ascertainment (higher retention)
+    than the target cohort, the apparent portability drop (R²_asc_source - R²_asc_target)
+    is larger than the true population portability drop (R²_pop_source - R²_pop_target),
+    even if the population R²s are identical. -/
+theorem differential_ascertainment_artifact (m : TwoPopAscertainmentModel)
+    (h_same_pop : m.source.r2_pop = m.target.r2_pop)
+    (h_diff_severity : m.target.retention < m.source.retention) :
+    (m.source.r2_asc - m.target.r2_asc) > (m.source.r2_pop - m.target.r2_pop) := by
+  unfold AscertainmentModel.r2_asc
+  rw [h_same_pop, sub_self]
+  have : m.target.r2_pop * m.target.retention < m.target.r2_pop * m.source.retention :=
+    mul_lt_mul_of_pos_left h_diff_severity m.target.r2_pop_pos
   linarith
 
 end ColliderBias
@@ -514,16 +545,24 @@ theorem survivorship_attenuates_in_older (m : SurvivorshipAttenuationModel) :
       < m.r2_full * 1 := by exact mul_lt_mul_of_pos_left h_ratio_lt_one m.r2_full_pos
     _ = m.r2_full := by ring
 
+/-- **Two-population survivorship attenuation model.**
+    Models survivorship attenuation in two populations. -/
+structure TwoPopSurvivorshipAttenuation where
+  source : SurvivorshipAttenuationModel
+  target : SurvivorshipAttenuationModel
+
 /-- **Differential survivorship across populations creates portability artifact.**
-    If the target population has different age structure or mortality patterns,
-    survivorship bias contributes to apparent portability loss. -/
-theorem differential_survivorship_artifact
-    (r2_source_full r2_target_full Δ_surv_source Δ_surv_target : ℝ)
-    (h_surv_s : 0 ≤ Δ_surv_source) (h_surv_t : 0 ≤ Δ_surv_target)
-    (h_diff : Δ_surv_target > Δ_surv_source)
-    (h_obs_s : r2_source_full - Δ_surv_source > 0) :
-    (r2_source_full - Δ_surv_source) - (r2_target_full - Δ_surv_target) >
-      r2_source_full - r2_target_full := by
+    If the target population has more severe survivorship bias (smaller variance ratio)
+    than the source population, it creates an apparent portability drop
+    even when the full-cohort R²s are identical. -/
+theorem differential_survivorship_artifact (m : TwoPopSurvivorshipAttenuation)
+    (h_same_r2 : m.source.r2_full = m.target.r2_full)
+    (h_diff_attenuation : m.target.var_surv / m.target.var_birth < m.source.var_surv / m.source.var_birth) :
+    (m.source.r2_surv - m.target.r2_surv) > (m.source.r2_full - m.target.r2_full) := by
+  unfold SurvivorshipAttenuationModel.r2_surv
+  rw [h_same_r2, sub_self]
+  have : m.target.r2_full * (m.target.var_surv / m.target.var_birth) < m.target.r2_full * (m.source.var_surv / m.source.var_birth) :=
+    mul_lt_mul_of_pos_left h_diff_attenuation m.target.r2_full_pos
   linarith
 
 end SurvivorshipBias
@@ -714,14 +753,37 @@ theorem weak_instrument_bias_increases
     linarith
   linarith
 
+/-- **MR Pleiotropy model.**
+    Models the causal effect and the horizontal pleiotropic effect of an instrument. -/
+structure MRPleiotropyModel where
+  /-- True causal effect of exposure on outcome -/
+  β_causal : ℝ
+  /-- Horizontal pleiotropic effect (independent of exposure) -/
+  α_pleio : ℝ
+
+/-- Apparent MR estimate is the sum of causal and pleiotropic effects -/
+noncomputable def MRPleiotropyModel.estimate (m : MRPleiotropyModel) : ℝ :=
+  m.β_causal + m.α_pleio
+
+/-- **Two-population MR model.**
+    Models an MR instrument across two populations.
+    The true causal effect is assumed shared, but pleiotropic paths may differ. -/
+structure TwoPopMRPleiotropyModel where
+  source : MRPleiotropyModel
+  target : MRPleiotropyModel
+  shared_causal : source.β_causal = target.β_causal
+
 /-- **Horizontal pleiotropy patterns differ across populations.**
-    If pleiotropic effects change across populations (due to different
-    LD patterns or gene regulation), MR estimates are not portable. -/
-theorem pleiotropy_changes_invalidate_mr
-    (β_causal α_pleio_source α_pleio_target : ℝ)
-    (h_diff : α_pleio_source ≠ α_pleio_target) :
-    β_causal + α_pleio_source ≠ β_causal + α_pleio_target := by
-  intro h; exact h_diff (by linarith)
+    If pleiotropic effects change across populations (e.g., due to different
+    LD patterns or gene regulation), apparent MR estimates are not portable
+    even if the true causal effect is identical. -/
+theorem pleiotropy_changes_invalidate_mr (m : TwoPopMRPleiotropyModel)
+    (h_diff_pleio : m.source.α_pleio ≠ m.target.α_pleio) :
+    m.source.estimate ≠ m.target.estimate := by
+  unfold MRPleiotropyModel.estimate
+  intro h
+  rw [m.shared_causal] at h
+  exact h_diff_pleio (by linarith)
 
 end MRPortability
 
