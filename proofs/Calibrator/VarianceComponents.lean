@@ -81,11 +81,9 @@ theorem missing_heritability_gap
     (h_tagged_nn : 0 ≤ V_A_tagged) (h_untagged_pos : 0 < V_A_untagged)
     (h_D : 0 ≤ V_D) (h_I : 0 ≤ V_I) (h_E : 0 ≤ V_E)
     (h_total : 0 < V_A_tagged + V_A_untagged + V_D + V_I + V_E) :
-    let V_P := V_A_tagged + V_A_untagged + V_D + V_I + V_E
-    let h2_twin := (V_A_tagged + V_A_untagged) / V_P
-    let h2_snp := V_A_tagged / V_P
-    0 < h2_twin - h2_snp := by
-  simp only
+    0 < narrowSenseH2 (V_A_tagged + V_A_untagged) V_D V_I V_E -
+      snpH2 V_A_tagged (V_A_tagged + V_A_untagged + V_D + V_I + V_E) := by
+  unfold narrowSenseH2 snpH2
   rw [show (V_A_tagged + V_A_untagged) / (V_A_tagged + V_A_untagged + V_D + V_I + V_E) -
     V_A_tagged / (V_A_tagged + V_A_untagged + V_D + V_I + V_E) =
     ((V_A_tagged + V_A_untagged) - V_A_tagged) / (V_A_tagged + V_A_untagged + V_D + V_I + V_E)
@@ -271,11 +269,8 @@ theorem greml_underestimates_with_poor_tagging
     (V_A V_P mean_tag_r2 : ℝ)
     (h_imperfect : mean_tag_r2 < 1)
     (h_VA_pos : 0 < V_A) (h_VP_pos : 0 < V_P) :
-    let h2_true := V_A / V_P
-    let h2_greml := (mean_tag_r2 * V_A) / V_P
-    h2_true - h2_greml = ((1 - mean_tag_r2) * V_A) / V_P ∧
-      0 < h2_true - h2_greml := by
-  simp only
+    (V_A / V_P) - ((mean_tag_r2 * V_A) / V_P) = ((1 - mean_tag_r2) * V_A) / V_P ∧
+      0 < (V_A / V_P) - ((mean_tag_r2 * V_A) / V_P) := by
   rw [← sub_div]
   have h_gap :
       V_A - mean_tag_r2 * V_A = (1 - mean_tag_r2) * V_A := by
@@ -305,11 +300,7 @@ theorem stratification_inflates_greml
     (V_A V_strat V_E : ℝ)
     (h_VA : 0 ≤ V_A) (h_strat_pos : 0 < V_strat) (h_VE : 0 ≤ V_E)
     (h_total : 0 < V_A + V_strat + V_E) :
-    let V_P := V_A + V_strat + V_E
-    let h2_true := V_A / V_P
-    let h2_greml := (V_A + V_strat) / V_P
-    h2_true < h2_greml := by
-  simp only
+    V_A / (V_A + V_strat + V_E) < (V_A + V_strat) / (V_A + V_strat + V_E) := by
   exact div_lt_div_of_pos_right (by linarith) h_total
 
 end GREML
