@@ -322,20 +322,48 @@ theorem collider_attenuates_association (m : ColliderModel) :
       < m.β_G * 1 := by exact mul_lt_mul_of_pos_left h_ratio_lt_one m.β_G_pos
     _ = m.β_G := by ring
 
+/-- **Ascertainment model.**
+    Models the difference between population R² and ascertainment R²
+    across source and target cohorts. -/
+structure AscertainmentModel where
+  /-- True population R² in source -/
+  r2_source_pop : ℝ
+  /-- True population R² in target -/
+  r2_target_pop : ℝ
+  /-- Ascertainment penalty in source (reduction in R²) -/
+  penalty_source : ℝ
+  /-- Ascertainment penalty in target (reduction in R²) -/
+  penalty_target : ℝ
+  penalty_source_pos : 0 < penalty_source
+  penalty_target_pos : 0 < penalty_target
+  /-- Source cohort has stronger ascertainment (larger penalty) -/
+  diff_severity : penalty_target < penalty_source
+
+/-- Ascertained R² in source cohort -/
+noncomputable def AscertainmentModel.r2_source_asc (m : AscertainmentModel) : ℝ :=
+  m.r2_source_pop - m.penalty_source
+
+/-- Ascertained R² in target cohort -/
+noncomputable def AscertainmentModel.r2_target_asc (m : AscertainmentModel) : ℝ :=
+  m.r2_target_pop - m.penalty_target
+
+/-- Apparent portability drop between ascertained cohorts -/
+noncomputable def AscertainmentModel.apparent_drop (m : AscertainmentModel) : ℝ :=
+  m.r2_source_asc - m.r2_target_asc
+
+/-- True portability drop between populations -/
+noncomputable def AscertainmentModel.true_drop (m : AscertainmentModel) : ℝ :=
+  m.r2_source_pop - m.r2_target_pop
+
 /-- **Differential ascertainment creates portability artifact.**
-    If source and target cohorts have different ascertainment patterns,
-    the apparent portability drop includes an ascertainment component. -/
-theorem differential_ascertainment_artifact
-    (r2_source_pop r2_target_pop r2_source_asc r2_target_asc : ℝ)
-    (h_source_asc : r2_source_asc < r2_source_pop)
-    (h_target_asc : r2_target_asc < r2_target_pop)
-    -- Different ascertainment severity
-    (h_diff_severity : r2_target_pop - r2_target_asc < r2_source_pop - r2_source_asc) :
-    -- Apparent portability drop is larger than true portability drop
-    r2_source_asc - r2_target_asc > r2_source_pop - r2_target_pop →
-      False := by
-  intro h
-  linarith
+    If source and target cohorts have different ascertainment patterns
+    (e.g., source has stronger ascertainment), the apparent portability
+    drop is strictly smaller than the true portability drop. -/
+theorem differential_ascertainment_artifact (m : AscertainmentModel) :
+    m.apparent_drop < m.true_drop := by
+  unfold AscertainmentModel.apparent_drop AscertainmentModel.true_drop
+  unfold AscertainmentModel.r2_source_asc AscertainmentModel.r2_target_asc
+  linarith [m.diff_severity]
 
 end ColliderBias
 
