@@ -431,17 +431,26 @@ section MetabolicTraits
                   = √(σ²_β / (σ²_β + σ²_δ))
 
     Since σ²_δ > 0, the denominator exceeds the numerator. -/
+noncomputable def gxePerfectCorrelation : ℝ := 1
+
+/-- The cross-population effect correlation under a GxE perturbation model. -/
+noncomputable def gxeEffectCorrelation (sigma2_beta sigma2_delta : ℝ) : ℝ :=
+  Real.sqrt (sigma2_beta / (sigma2_beta + sigma2_delta))
+
+/-- GxE reduces the correlation strictly below 1. -/
 theorem gxe_reduces_effect_correlation
     (sigma2_beta sigma2_delta : ℝ)
     (h_beta_pos : 0 < sigma2_beta) (h_delta_pos : 0 < sigma2_delta) :
-    let rho_genetics_only := (1 : ℝ)  -- no GxE means perfect correlation
-    let rho_with_gxe := Real.sqrt (sigma2_beta / (sigma2_beta + sigma2_delta))
-    rho_with_gxe < rho_genetics_only := by
-  simp only
+    gxeEffectCorrelation sigma2_beta sigma2_delta < gxePerfectCorrelation := by
+  unfold gxeEffectCorrelation gxePerfectCorrelation
   rw [show (1 : ℝ) = Real.sqrt 1 from (Real.sqrt_one).symm]
   apply Real.sqrt_lt_sqrt (by positivity)
   rw [div_lt_one (by linarith)]
   linarith
+
+/-- The scalar portability fraction for a given GxE variance. -/
+noncomputable def scalarPortabilityFraction (sigma2_beta delta : ℝ) : ℝ :=
+  sigma2_beta / (sigma2_beta + delta)
 
 /-- **Larger GxE variance lowers the scalar portability fraction.**
     In the scalar chart `port(delta) = σ²_β / (σ²_β + delta)`, a larger
@@ -455,9 +464,9 @@ theorem larger_gxe_variance_lowers_scalar_portability_fraction
     -- GxE increases from LDL → HDL → Triglycerides
     (h_ldl_lt_hdl : sigma2_delta_ldl < sigma2_delta_hdl)
     (h_hdl_lt_trig : sigma2_delta_hdl < sigma2_delta_trig) :
-    let port (delta : ℝ) := sigma2_beta / (sigma2_beta + delta)
-    port sigma2_delta_trig < port sigma2_delta_ldl := by
-  simp only
+    scalarPortabilityFraction sigma2_beta sigma2_delta_trig <
+    scalarPortabilityFraction sigma2_beta sigma2_delta_ldl := by
+  unfold scalarPortabilityFraction
   apply div_lt_div_of_pos_left h_beta_pos (by linarith) (by linarith)
 
 end MetabolicTraits
@@ -486,15 +495,15 @@ section AnthropometricTraits
     We model: ρ = 1 - δ where δ = c/n for some constant c.
     Then 1 - ρ² = 1 - (1-δ)² = 2δ - δ² < 2δ = 2c/n.
     For large n, this gap is small. -/
+noncomputable def neutralPortabilityGap (c : ℝ) (n : ℕ) : ℝ :=
+  1 - (1 - (c / (n : ℝ))) ^ 2
+
 theorem near_neutral_portability_highly_polygenic
     (c : ℝ) (n : ℕ)
     (h_c_pos : 0 < c) (_h_c_le : c ≤ 1)
     (h_n_large : 1 < n) :
-    let delta := c / n
-    let rho := 1 - delta
-    let gap := 1 - rho ^ 2  -- portability gap proportional to 1 - ρ²
-    gap < 2 * c / n := by
-  simp only
+    neutralPortabilityGap c n < 2 * c / n := by
+  unfold neutralPortabilityGap
   have h_n_pos : (0 : ℝ) < (n : ℝ) := Nat.cast_pos.mpr (by omega)
   -- gap = 1 - (1 - c/n)² = 2c/n - (c/n)²
   have h_expand : 1 - (1 - c / ↑n) ^ 2 = 2 * c / ↑n - (c / ↑n) ^ 2 := by ring
