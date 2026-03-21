@@ -37,14 +37,24 @@ section PathDecomposition
 /-- **Total portability loss decomposition.**
     Δ_total = Δ_LD + Δ_MAF + Δ_effect + Δ_env + Δ_technical
     Each component represents a distinct causal pathway. -/
+structure PortabilityLossComponents where
+  delta_LD : ℝ
+  delta_MAF : ℝ
+  delta_effect : ℝ
+  delta_env : ℝ
+  delta_tech : ℝ
+
+noncomputable def totalLoss (comp : PortabilityLossComponents) : ℝ :=
+  comp.delta_LD + comp.delta_MAF + comp.delta_effect + comp.delta_env + comp.delta_tech
+
 theorem total_loss_decomposition
-    (delta_total delta_LD delta_MAF delta_effect delta_env delta_tech : ℝ)
-    (h_decomp : delta_total = delta_LD + delta_MAF + delta_effect + delta_env + delta_tech)
-    (h_LD : 0 ≤ delta_LD) (h_MAF : 0 ≤ delta_MAF) (h_effect : 0 ≤ delta_effect)
-    (h_env : 0 ≤ delta_env) (h_tech : 0 ≤ delta_tech) :
-    delta_LD ≤ delta_total ∧ delta_MAF ≤ delta_total ∧
-    delta_effect ≤ delta_total ∧ delta_env ≤ delta_total ∧
-    delta_tech ≤ delta_total := by
+    (comp : PortabilityLossComponents)
+    (h_LD : 0 ≤ comp.delta_LD) (h_MAF : 0 ≤ comp.delta_MAF) (h_effect : 0 ≤ comp.delta_effect)
+    (h_env : 0 ≤ comp.delta_env) (h_tech : 0 ≤ comp.delta_tech) :
+    comp.delta_LD ≤ totalLoss comp ∧ comp.delta_MAF ≤ totalLoss comp ∧
+    comp.delta_effect ≤ totalLoss comp ∧ comp.delta_env ≤ totalLoss comp ∧
+    comp.delta_tech ≤ totalLoss comp := by
+  unfold totalLoss
   constructor <;> [skip; constructor <;> [skip; constructor <;> [skip; constructor]]] <;> linarith
 
 /-- **LD pathway is the largest contributor for most traits.**
@@ -113,24 +123,34 @@ on PGS accuracy into direct and indirect effects.
 
 section MediationAnalysis
 
+/-- **Mediation Model**
+    Captures direct and indirect effects in a linear mediation setting. -/
+structure MediationModel where
+  direct_effect : ℝ
+  indirect_effect : ℝ
+
+noncomputable def totalEffect (m : MediationModel) : ℝ :=
+  m.direct_effect + m.indirect_effect
+
 /-- **Total effect = Direct effect + Indirect effect.**
     TE = DE + IE (in the linear case). -/
 theorem mediation_decomposition
-    (total_effect direct_effect indirect_effect : ℝ)
-    (h_decomp : total_effect = direct_effect + indirect_effect) :
+    (m : MediationModel) :
     -- Indirect effect is the total minus direct
-    indirect_effect = total_effect - direct_effect := by linarith
+    m.indirect_effect = totalEffect m - m.direct_effect := by
+  unfold totalEffect
+  linarith
 
 /-- **Proportion mediated.**
     PM = IE / TE = indirect / total. -/
-noncomputable def proportionMediated (indirect_effect total_effect : ℝ) : ℝ :=
-  indirect_effect / total_effect
+noncomputable def proportionMediated (m : MediationModel) : ℝ :=
+  m.indirect_effect / totalEffect m
 
 /-- Proportion mediated is in [0,1] when effects are nonneg and indirect ≤ total. -/
 theorem proportion_mediated_in_unit
-    (ie te : ℝ)
-    (h_ie : 0 ≤ ie) (h_te : 0 < te) (h_le : ie ≤ te) :
-    0 ≤ proportionMediated ie te ∧ proportionMediated ie te ≤ 1 := by
+    (m : MediationModel)
+    (h_ie : 0 ≤ m.indirect_effect) (h_te : 0 < totalEffect m) (h_le : m.indirect_effect ≤ totalEffect m) :
+    0 ≤ proportionMediated m ∧ proportionMediated m ≤ 1 := by
   unfold proportionMediated
   constructor
   · exact div_nonneg h_ie (le_of_lt h_te)
@@ -438,22 +458,31 @@ theorem e_value_ge_one (rr : ℝ) (h_rr : 1 ≤ rr) :
 /-- **Sensitivity to LD reference mismatch.**
     Portability estimates are sensitive to the choice of LD reference.
     Using in-sample LD vs. external reference can change R² by δ. -/
+noncomputable def ldReferenceMismatchR2 (r2_external delta : ℝ) : ℝ :=
+  r2_external + delta
+
 theorem ld_reference_sensitivity
-    (r2_in_sample r2_external delta : ℝ)
-    (h_diff : r2_in_sample = r2_external + delta)
+    (r2_external delta : ℝ)
     (h_delta : 0 < |delta|) :
-    r2_in_sample ≠ r2_external := by
-  rw [h_diff]; intro h; have : delta = 0 := by linarith
-  exact absurd (this ▸ h_delta) (by simp)
+    ldReferenceMismatchR2 r2_external delta ≠ r2_external := by
+  unfold ldReferenceMismatchR2
+  intro h
+  have h_zero : delta = 0 := by linarith
+  have h_abs_zero : |delta| = 0 := by rw [h_zero, abs_zero]
+  linarith
 
 /-- **Sensitivity to phenotype definition.**
     Different phenotype definitions (self-report vs clinical,
     ICD-9 vs ICD-10) can change portability estimates.
     When the difference exceeds any threshold ε > 0, the estimates differ. -/
+noncomputable def phenotypeMismatchBias (port_def1 port_def2 : ℝ) : ℝ :=
+  |port_def1 - port_def2|
+
 theorem phenotype_definition_matters
     (port_def1 port_def2 ε : ℝ) (h_ε : 0 < ε)
-    (h_large_diff : ε < |port_def1 - port_def2|) :
+    (h_large_diff : ε < phenotypeMismatchBias port_def1 port_def2) :
     port_def1 ≠ port_def2 := by
+  unfold phenotypeMismatchBias at h_large_diff
   intro h; rw [h, sub_self, abs_zero] at h_large_diff; linarith
 
 end SensitivityAnalysis
