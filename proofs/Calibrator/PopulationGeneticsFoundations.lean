@@ -174,15 +174,20 @@ section EffectivePopulationSize
 noncomputable def neFromDiversity (π μ : ℝ) : ℝ :=
   π / (4 * μ)
 
+/-- **PGS Variance from Drift.**
+    Var(PGS_drift) = V_A × Fst ≈ V_A × t / (2Ne). -/
+noncomputable def pgsVarianceDrift (V_A t Ne : ℝ) : ℝ :=
+  V_A * t / (2 * Ne)
+
 /-- **Ne affects PGS variance.**
-    Var(PGS_drift) = V_A × Fst = V_A × t / (2Ne).
     Smaller Ne → faster drift → more PGS variance. -/
 theorem ne_affects_pgs_variance
     (V_A t Ne₁ Ne₂ : ℝ)
     (h_VA : 0 < V_A) (h_t : 0 < t)
     (h_Ne₁ : 0 < Ne₁) (h_Ne₂ : 0 < Ne₂)
     (h_smaller : Ne₁ < Ne₂) :
-    V_A * t / (2 * Ne₂) < V_A * t / (2 * Ne₁) := by
+    pgsVarianceDrift V_A t Ne₂ < pgsVarianceDrift V_A t Ne₁ := by
+  unfold pgsVarianceDrift
   exact div_lt_div_of_pos_left (mul_pos h_VA h_t) (by positivity) (by nlinarith)
 
 end EffectivePopulationSize
