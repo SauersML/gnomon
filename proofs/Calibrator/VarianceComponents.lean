@@ -301,15 +301,21 @@ theorem greml_underestimates_with_poor_tagging
 
     We derive: h²_GREML > h²_true whenever V_strat > 0, because
     (V_A + V_strat)/V_P > V_A/V_P when V_P > 0. -/
+noncomputable def stratifiedVP (V_A V_strat V_E : ℝ) : ℝ :=
+  V_A + V_strat + V_E
+
+noncomputable def trueHeritability (V_A V_strat V_E : ℝ) : ℝ :=
+  V_A / stratifiedVP V_A V_strat V_E
+
+noncomputable def gremlHeritability (V_A V_strat V_E : ℝ) : ℝ :=
+  (V_A + V_strat) / stratifiedVP V_A V_strat V_E
+
 theorem stratification_inflates_greml
     (V_A V_strat V_E : ℝ)
-    (h_VA : 0 ≤ V_A) (h_strat_pos : 0 < V_strat) (h_VE : 0 ≤ V_E)
-    (h_total : 0 < V_A + V_strat + V_E) :
-    let V_P := V_A + V_strat + V_E
-    let h2_true := V_A / V_P
-    let h2_greml := (V_A + V_strat) / V_P
-    h2_true < h2_greml := by
-  simp only
+    (_h_VA : 0 ≤ V_A) (h_strat_pos : 0 < V_strat) (_h_VE : 0 ≤ V_E)
+    (h_total : 0 < stratifiedVP V_A V_strat V_E) :
+    trueHeritability V_A V_strat V_E < gremlHeritability V_A V_strat V_E := by
+  unfold trueHeritability gremlHeritability
   exact div_lt_div_of_pos_right (by linarith) h_total
 
 end GREML

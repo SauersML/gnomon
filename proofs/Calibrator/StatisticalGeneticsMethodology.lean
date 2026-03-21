@@ -48,18 +48,18 @@ noncomputable def incrementalR2 (r2_full r2_covariates : ℝ) : ℝ :=
     We encode this as: the full model's R² is at least the
     covariate-only model's R², which is a consequence of OLS
     minimizing sum of squared residuals over a nested subspace. -/
+noncomputable def modelR2 (rss tss : ℝ) : ℝ :=
+  1 - rss / tss
+
 theorem incremental_r2_nonneg
     (rss_full rss_cov tss : ℝ)
     (h_tss : 0 < tss)
-    (h_rss_full : 0 ≤ rss_full)
-    (h_rss_cov : 0 ≤ rss_cov)
+    (_h_rss_full : 0 ≤ rss_full)
+    (_h_rss_cov : 0 ≤ rss_cov)
     -- Nested model property: full model has no more residual than submodel
     (h_nested : rss_full ≤ rss_cov) :
-    let r2_full := 1 - rss_full / tss
-    let r2_cov := 1 - rss_cov / tss
-    0 ≤ incrementalR2 r2_full r2_cov := by
-  simp only
-  unfold incrementalR2
+    0 ≤ incrementalR2 (modelR2 rss_full tss) (modelR2 rss_cov tss) := by
+  unfold modelR2 incrementalR2
   -- (1 - rss_full/tss) - (1 - rss_cov/tss) = (rss_cov - rss_full)/tss ≥ 0
   have : rss_cov / tss - rss_full / tss = (rss_cov - rss_full) / tss := by ring
   linarith [div_nonneg (by linarith : 0 ≤ rss_cov - rss_full) (le_of_lt h_tss)]
