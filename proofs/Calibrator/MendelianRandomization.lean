@@ -99,13 +99,16 @@ section CrossAncestryInstruments
 /-- **Instrument strength varies across ancestries.**
     An instrument selected in one population (source) may be a weak instrument
     in another (target) because LD between instrument and causal variant differs.
-    When the source F-statistic exceeds a threshold but the target falls below it,
-    the target instrument is strictly weaker. -/
+    Here we show that for a fixed sample size, a lower proportion of variance
+    explained (R²) in the target ancestry results in a weaker instrument
+    (lower F-statistic). -/
 theorem instrument_strength_varies
-    (f_stat_source f_stat_target threshold : ℝ)
-    (h_strong_source : threshold < f_stat_source)
-    (h_weak_target : f_stat_target < threshold) :
-    f_stat_target < f_stat_source := by linarith
+    (n : ℕ) (r2_source r2_target : ℝ)
+    (h_n : 2 < n) (h_r2_t : 0 < r2_target) (h_r2_s : 0 < r2_source)
+    (h_r2_t_lt : r2_target < 1) (h_r2_s_lt : r2_source < 1)
+    (h_ld_decay : r2_target < r2_source) :
+    fStatistic n r2_target < fStatistic n r2_source := by
+  exact f_stat_increases_with_r2 n r2_target r2_source h_n h_r2_t h_r2_s h_r2_t_lt h_r2_s_lt h_ld_decay
 
 /-- **LD proxy instruments weaken across ancestry.**
     In MR, we often use a proxy SNP (in LD with causal SNP).
@@ -125,26 +128,51 @@ theorem ld_proxy_weakens_cross_ancestry
   apply mul_lt_mul_of_pos_left h_ld_diff
   exact abs_pos.mpr h_beta
 
+/-- Model for population-specific horizontal pleiotropy. -/
+structure PleiotropyModel where
+  beta_causal : ℝ
+  alpha_eur : ℝ
+  alpha_afr : ℝ
+
+/-- Observed total effect is the sum of causal effect and horizontal pleiotropy. -/
+noncomputable def observedTotalEffect (model : PleiotropyModel) (is_eur : Bool) : ℝ :=
+  if is_eur then model.beta_causal + model.alpha_eur else model.beta_causal + model.alpha_afr
+
 /-- **Horizontal pleiotropy may be population-specific.**
     A variant may have pleiotropic effects in one ancestry
-    but not another, due to different LD partners. -/
-theorem population_specific_pleiotropy
-    (beta_direct_eur beta_direct_afr : ℝ)
-    (h_eur_pleio : beta_direct_eur ≠ 0)
-    (h_afr_no_pleio : beta_direct_afr = 0) :
-    beta_direct_eur ≠ beta_direct_afr := by
-  rw [h_afr_no_pleio]; exact h_eur_pleio
+    but not another, due to different LD partners. If the horizontal
+    pleiotropy differs across ancestries, the observed total effects
+    will differ, violating IV assumptions. -/
+theorem population_specific_pleiotropy (model : PleiotropyModel)
+    (h_diff_pleio : model.alpha_eur ≠ model.alpha_afr) :
+    observedTotalEffect model true ≠ observedTotalEffect model false := by
+  unfold observedTotalEffect
+  simp only [ite_true, ite_false, Bool.false_eq_true]
+  intro h
+  apply h_diff_pleio
+  exact add_left_cancel h
+
+/-- Model for MR estimate for outlier detection. -/
+structure MREstimateModel where
+  expected_effect : ℝ
+  observed_effect : ℝ
+
+/-- The residual of the MR estimate from the expected effect. -/
+noncomputable def mrResidual (model : MREstimateModel) : ℝ :=
+  model.observed_effect - model.expected_effect
 
 /-- **MR-PRESSO for cross-ancestry outlier detection.**
     Variants that are outliers in cross-ancestry MR analysis
     are likely to violate IV assumptions due to population-specific
-    pleiotropy or LD. -/
-theorem outlier_detection_identifies_violations
-    (residual threshold : ℝ)
-    (h_threshold : 0 ≤ threshold)
-    (h_outlier : threshold < |residual|) :
-    residual ≠ 0 := by
-  intro h; rw [h, abs_zero] at h_outlier; linarith
+    pleiotropy or LD. We prove that if the absolute residual strictly
+    exceeds 0, the observed effect differs from the expected valid effect. -/
+theorem outlier_detection_identifies_violations (model : MREstimateModel)
+    (h_outlier : 0 < |mrResidual model|) :
+    model.observed_effect ≠ model.expected_effect := by
+  unfold mrResidual at h_outlier
+  intro h
+  rw [h, sub_self, abs_zero] at h_outlier
+  linarith
 
 end CrossAncestryInstruments
 
@@ -279,12 +307,24 @@ theorem environment_mediates_portability_mr
     Running MR across many phenotypes simultaneously reveals
     which causal pathways are conserved across ancestries
     and which are population-specific. -/
+noncomputable def conservedProportion (n_conserved n_specific : ℕ) : ℝ :=
+  (n_conserved : ℝ) / (n_conserved + n_specific : ℝ)
+
+/-- If there are both conserved and specific pathways, the proportion
+    of conserved pathways is strictly between 0 and 1. -/
 theorem mr_phewas_identifies_conserved_pathways
-    (n_conserved n_specific n_total : ℕ)
-    (h_sum : n_conserved + n_specific = n_total)
+    (n_conserved n_specific : ℕ)
     (h_some_conserved : 0 < n_conserved)
     (h_some_specific : 0 < n_specific) :
-    n_conserved < n_total := by omega
+    0 < conservedProportion n_conserved n_specific ∧
+    conservedProportion n_conserved n_specific < 1 := by
+  unfold conservedProportion
+  constructor
+  · apply div_pos (by positivity) (by positivity)
+  · have h_pos : (0 : ℝ) < n_conserved + n_specific := by positivity
+    rw [div_lt_one h_pos]
+    have h_spec : (0 : ℝ) < n_specific := Nat.cast_pos.mpr h_some_specific
+    linarith
 
 end MRForPGSValidation
 
@@ -298,26 +338,37 @@ that can mimic or mask portability effects.
 
 section ColliderBias
 
+/-- Model for observational selection bias. -/
+structure SelectionBiasModel where
+  beta_true : ℝ
+  selection_bias : ℝ
+
+/-- Observed effect under selection bias. -/
+noncomputable def observedEffect (model : SelectionBiasModel) : ℝ :=
+  model.beta_true + model.selection_bias
+
 /-- **Survivorship creates collider bias.**
     If the study conditions on survival (e.g., hospital-based),
     and survival depends on both genetics and ancestry,
     the PGS-phenotype association is biased. -/
-theorem collider_bias_from_selection
-    (beta_true beta_observed selection_bias : ℝ)
-    (h_biased : beta_observed = beta_true + selection_bias)
-    (h_bias_nn : selection_bias ≠ 0) :
-    beta_observed ≠ beta_true := by
-  rw [h_biased]; intro h; apply h_bias_nn; linarith
+theorem collider_bias_from_selection (model : SelectionBiasModel)
+    (h_bias_nn : model.selection_bias ≠ 0) :
+    observedEffect model ≠ model.beta_true := by
+  unfold observedEffect
+  intro h
+  apply h_bias_nn
+  exact add_eq_left.mp h
 
 /-- **Index event bias in PGS studies.**
     Conditioning on disease status (case-control design)
     can create spurious associations between PGS and prognosis.
-    This is more severe when PGS is ancestry-specific. -/
-theorem index_event_bias
-    (beta_prognosis_true beta_prognosis_biased pgs_diagnosis_effect : ℝ)
-    (h_bias : beta_prognosis_biased = beta_prognosis_true - pgs_diagnosis_effect)
-    (h_effect : 0 < pgs_diagnosis_effect) :
-    beta_prognosis_biased < beta_prognosis_true := by linarith
+    This is more severe when PGS is ancestry-specific.
+    A positive diagnosis effect artificially lowers the observed prognosis. -/
+theorem index_event_bias (model : SelectionBiasModel)
+    (h_effect : model.selection_bias < 0) :
+    observedEffect model < model.beta_true := by
+  unfold observedEffect
+  linarith
 
 /-- **Berkson's paradox in biobank studies.**
     Biobank participants are healthier and more educated than
@@ -325,13 +376,18 @@ theorem index_event_bias
     differently across ancestries.
     Model: β_biobank = β_pop + selection_bias, where the selection bias
     differs by ancestry (different participation rates and selection pressures).
-    If bias_eur ≠ bias_afr, then β_biobank_eur ≠ β_biobank_afr even when
-    the true population-level effect is the same. -/
+    If the selection biases differ, the observed biobank effects differ even
+    when the true population-level effect is the same. -/
 theorem berkson_paradox_ancestry_specific
-    (beta_population bias_eur bias_afr : ℝ)
-    (h_diff_bias : bias_eur ≠ bias_afr) :
-    beta_population + bias_eur ≠ beta_population + bias_afr := by
-  intro h; exact h_diff_bias (by linarith)
+    (model_eur model_afr : SelectionBiasModel)
+    (h_same_true : model_eur.beta_true = model_afr.beta_true)
+    (h_diff_bias : model_eur.selection_bias ≠ model_afr.selection_bias) :
+    observedEffect model_eur ≠ observedEffect model_afr := by
+  unfold observedEffect
+  rw [h_same_true]
+  intro h
+  apply h_diff_bias
+  exact add_left_cancel h
 
 end ColliderBias
 
