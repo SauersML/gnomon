@@ -395,20 +395,42 @@ drops to `3/4`.
 
 This formalizes the biological point that equal source `R²` does not determine
 cross-population portability without locus-resolved transport state. -/
+structure PortabilityWitness where
+  sourceSignal : Fin 2 → ℝ
+  stableTransport : Fin 2 → ℝ
+  brokenTransport : Fin 2 → ℝ
+
+noncomputable def PortabilityWitness.sourceVariance (w : PortabilityWitness) : ℝ :=
+  ∑ l, w.sourceSignal l
+
+noncomputable def PortabilityWitness.stableTargetVariance (w : PortabilityWitness) : ℝ :=
+  ∑ l, w.sourceSignal l * w.stableTransport l
+
+noncomputable def PortabilityWitness.brokenTargetVariance (w : PortabilityWitness) : ℝ :=
+  ∑ l, w.sourceSignal l * w.brokenTransport l
+
+noncomputable def PortabilityWitness.sourceR2 (w : PortabilityWitness) : ℝ :=
+  TransportedMetrics.r2FromSignalVariance w.sourceVariance 1
+
+noncomputable def PortabilityWitness.stableTargetR2 (w : PortabilityWitness) : ℝ :=
+  TransportedMetrics.r2FromSignalVariance w.stableTargetVariance 1
+
+noncomputable def PortabilityWitness.brokenTargetR2 (w : PortabilityWitness) : ℝ :=
+  TransportedMetrics.r2FromSignalVariance w.brokenTargetVariance 1
+
 theorem same_source_r2_different_portability_two_locus_witness :
-    let sourceSignal : Fin 2 → ℝ := fun _ => 1
-    let stableTransport : Fin 2 → ℝ := fun _ => 1
-    let brokenTransport : Fin 2 → ℝ := fun i => if i = 0 then 1 else 0
-    let sourceVariance : ℝ := ∑ l, sourceSignal l
-    let stableTargetVariance : ℝ := ∑ l, sourceSignal l * stableTransport l
-    let brokenTargetVariance : ℝ := ∑ l, sourceSignal l * brokenTransport l
-    let sourceR2 := TransportedMetrics.r2FromSignalVariance sourceVariance 1
-    let stableTargetR2 := TransportedMetrics.r2FromSignalVariance stableTargetVariance 1
-    let brokenTargetR2 := TransportedMetrics.r2FromSignalVariance brokenTargetVariance 1
-    sourceR2 = stableTargetR2 ∧
-    brokenTargetR2 < stableTargetR2 ∧
-    brokenTargetR2 / sourceR2 = (3 : ℝ) / 4 := by
-  simp [TransportedMetrics.r2FromSignalVariance]
+    ∃ (w : PortabilityWitness),
+      w.sourceR2 = w.stableTargetR2 ∧
+      w.brokenTargetR2 < w.stableTargetR2 ∧
+      w.brokenTargetR2 / w.sourceR2 = (3 : ℝ) / 4 := by
+  use {
+    sourceSignal := fun _ => 1,
+    stableTransport := fun _ => 1,
+    brokenTransport := fun i => if i = 0 then 1 else 0
+  }
+  simp [PortabilityWitness.sourceR2, PortabilityWitness.stableTargetR2, PortabilityWitness.brokenTargetR2,
+        PortabilityWitness.sourceVariance, PortabilityWitness.stableTargetVariance, PortabilityWitness.brokenTargetVariance,
+        TransportedMetrics.r2FromSignalVariance]
   norm_num
 
 end SourceR2Insufficiency
