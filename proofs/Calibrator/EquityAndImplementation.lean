@@ -34,30 +34,42 @@ benefit across ancestry groups.
 
 section HealthDisparity
 
+/-- **Clinical Benefit Model.**
+    A model linking PGS variance explained (R²) to clinical benefit.
+    The parameter α represents the positive proportionality constant
+    (benefit per unit R²). -/
+structure ClinicalBenefitModel where
+  alpha : ℝ
+  h_alpha : 0 < alpha
+
+/-- **Expected Clinical Benefit.**
+    The expected net clinical benefit from a PGS with variance explained R². -/
+noncomputable def expectedBenefit (m : ClinicalBenefitModel) (r2 : ℝ) : ℝ :=
+  m.alpha * r2
+
 /-- **Clinical utility depends on PGS R².**
     The net clinical benefit from PGS-guided care is monotonically
-    increasing in R². We model benefit = α × R² for a positive
-    proportionality constant α (benefit per unit R²). When
-    R²₁ < R²₂, the benefit in population 1 is strictly less. -/
+    increasing in R². When R²₁ < R²₂, the benefit in population 1
+    is strictly less. -/
 theorem clinical_benefit_increases_with_r2
-    (α r2₁ r2₂ : ℝ)
-    (h_α : 0 < α)
+    (m : ClinicalBenefitModel)
+    (r2₁ r2₂ : ℝ)
     (h_r2 : r2₁ < r2₂) :
-    α * r2₁ < α * r2₂ := by
-  exact mul_lt_mul_of_pos_left h_r2 h_α
+    expectedBenefit m r2₁ < expectedBenefit m r2₂ := by
+  unfold expectedBenefit
+  exact mul_lt_mul_of_pos_left h_r2 m.h_alpha
 
 /-- **Portability gap creates benefit gap.**
-    If R²_EUR > R²_AFR and benefit = α × R² with α > 0, then
-    clinical benefit for EUR patients exceeds that for AFR patients.
-    The benefit gap α × (R²_EUR - R²_AFR) > 0 follows from the R² gap. -/
+    If R²_EUR > R²_AFR, then the clinical benefit for EUR patients
+    exceeds that for AFR patients. -/
 theorem portability_creates_benefit_gap
-    (α r2_eur r2_afr : ℝ)
-    (h_α : 0 < α)
-    (h_r2_gap : r2_afr < r2_eur)
-    (h_nn : 0 ≤ r2_afr) :
-    0 < α * r2_eur - α * r2_afr := by
+    (m : ClinicalBenefitModel)
+    (r2_eur r2_afr : ℝ)
+    (h_r2_gap : r2_afr < r2_eur) :
+    0 < expectedBenefit m r2_eur - expectedBenefit m r2_afr := by
+  unfold expectedBenefit
   have : r2_eur - r2_afr > 0 := by linarith
-  nlinarith
+  nlinarith [m.h_alpha]
 
 /-- **Disparity increases with Fst from discovery population.**
     Populations most genetically distant from the discovery
@@ -67,8 +79,8 @@ theorem portability_creates_benefit_gap
 theorem disparity_increases_with_distance
     (R2_source fst₁ fst₂ : ℝ)
     (h_R2 : 0 < R2_source)
-    (h_fst₁_pos : 0 < fst₁) (h_fst₁_lt : fst₁ < 1)
-    (h_fst₂_pos : 0 < fst₂) (h_fst₂_lt : fst₂ < 1)
+    (h_fst₁_lt : fst₁ < 1)
+    (h_fst₂_lt : fst₂ < 1)
     (h_fst : fst₁ < fst₂) :
     -- R² loss at fst₁ < R² loss at fst₂
     R2_source * (1 - (1 - fst₁) ^ 2) < R2_source * (1 - (1 - fst₂) ^ 2) := by
@@ -78,26 +90,40 @@ theorem disparity_increases_with_distance
 
 /-- **Existing health disparities may be amplified.**
     If PGS is deployed only for the well-served population (EUR),
-    it adds benefit α × R²_eur to that group. The underserved group
-    gets no PGS benefit, so the pre-existing disparity d₀ ≥ 0 grows
-    to d₀ + α × R²_eur. -/
+    it adds benefit for that group. The underserved group
+    gets no PGS benefit, so the pre-existing disparity d₀ ≥ 0 grows. -/
 theorem deployment_amplifies_disparity
-    (d₀ α r2_eur : ℝ)
+    (m : ClinicalBenefitModel)
+    (d₀ r2_eur : ℝ)
     (h_nn : 0 ≤ d₀)
-    (h_α : 0 < α) (h_r2 : 0 < r2_eur) :
-    d₀ < d₀ + α * r2_eur := by
-  linarith [mul_pos h_α h_r2]
+    (h_r2 : 0 < r2_eur) :
+    d₀ < d₀ + expectedBenefit m r2_eur := by
+  unfold expectedBenefit
+  linarith [mul_pos m.h_alpha h_r2]
+
+/-- **QALY Model.**
+    A model linking PGS variance explained (R²) to Quality-Adjusted Life Years (QALYs).
+    The parameter γ represents the positive proportionality constant. -/
+structure QALYModel where
+  gamma : ℝ
+  h_gamma : 0 < gamma
+
+/-- **Expected QALYs.**
+    The expected QALYs gained from a PGS with variance explained R². -/
+noncomputable def expectedQALYs (m : QALYModel) (r2 : ℝ) : ℝ :=
+  m.gamma * r2
 
 /-- **QALY gap from portability.**
-    QALYs gained = γ × R² for a positive constant γ (QALYs per unit R²).
-    The QALY gap between two populations is γ × (R²₁ - R²₂), which is
-    positive when R²₁ > R²₂. Derived from the model, not assumed. -/
+    The QALY gap between two populations is positive when R²₁ > R²₂.
+    Derived from the model, not assumed. -/
 theorem qaly_gap_proportional_to_r2_gap
-    (γ r2₁ r2₂ : ℝ)
-    (h_γ : 0 < γ) (h_gap : r2₂ < r2₁) :
-    0 < γ * r2₁ - γ * r2₂ := by
+    (m : QALYModel)
+    (r2₁ r2₂ : ℝ)
+    (h_gap : r2₂ < r2₁) :
+    0 < expectedQALYs m r2₁ - expectedQALYs m r2₂ := by
+  unfold expectedQALYs
   have : r2₁ - r2₂ > 0 := by linarith
-  nlinarith
+  nlinarith [m.h_gamma]
 
 end HealthDisparity
 
