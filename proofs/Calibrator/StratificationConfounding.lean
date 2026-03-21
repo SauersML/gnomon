@@ -322,20 +322,31 @@ theorem collider_attenuates_association (m : ColliderModel) :
       < m.β_G * 1 := by exact mul_lt_mul_of_pos_left h_ratio_lt_one m.β_G_pos
     _ = m.β_G := by ring
 
+/-- **Differential ascertainment model.**
+    Models ascertainment effects on R² in source and target populations,
+    where stronger ascertainment in the source population leads to a larger
+    drop from population R² to ascertained R². -/
+structure AscertainmentModel where
+  r2_source_pop : ℝ
+  r2_target_pop : ℝ
+  r2_source_asc : ℝ
+  r2_target_asc : ℝ
+  h_source_asc : r2_source_asc < r2_source_pop
+  h_target_asc : r2_target_asc < r2_target_pop
+  /-- Different ascertainment severity: greater loss of R² in source -/
+  h_diff_severity : r2_target_pop - r2_target_asc < r2_source_pop - r2_source_asc
+
 /-- **Differential ascertainment creates portability artifact.**
-    If source and target cohorts have different ascertainment patterns,
-    the apparent portability drop includes an ascertainment component. -/
-theorem differential_ascertainment_artifact
-    (r2_source_pop r2_target_pop r2_source_asc r2_target_asc : ℝ)
-    (h_source_asc : r2_source_asc < r2_source_pop)
-    (h_target_asc : r2_target_asc < r2_target_pop)
-    -- Different ascertainment severity
-    (h_diff_severity : r2_target_pop - r2_target_asc < r2_source_pop - r2_source_asc) :
-    -- Apparent portability drop is larger than true portability drop
-    r2_source_asc - r2_target_asc > r2_source_pop - r2_target_pop →
-      False := by
-  intro h
-  linarith
+    If source and target cohorts have different ascertainment patterns
+    (with source ascertainment creating a larger R² drop), then the
+    apparent portability drop (source to target in ascertained samples)
+    is strictly less than the true portability drop in the general populations.
+    This creates an artifact where portability appears better than it is,
+    or potentially negative (target > source). -/
+theorem differential_ascertainment_artifact (m : AscertainmentModel) :
+    -- Apparent portability drop is strictly less than true portability drop
+    m.r2_source_asc - m.r2_target_asc < m.r2_source_pop - m.r2_target_pop := by
+  linarith [m.h_diff_severity]
 
 end ColliderBias
 
