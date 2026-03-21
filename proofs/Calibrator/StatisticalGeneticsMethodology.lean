@@ -160,14 +160,19 @@ section CrossValidation
     If the GWAS sample overlaps with the evaluation sample,
     R² is biased upward by approximately p/n where p is the
     number of SNPs in the PGS. -/
-theorem overlap_bias
-    (p_snps n_overlap : ℝ)
+noncomputable def overlapBias (p_snps n_overlap : ℝ) : ℝ :=
+  p_snps / n_overlap
+
+/-- The evaluated R² with overlap is strictly greater than the true R²
+    due to the positive overfitting bias. -/
+theorem overlap_bias_inflates_r2
+    (r2_true r2_overlap p_snps n_overlap : ℝ)
     (h_p : 0 < p_snps) (h_n : 0 < n_overlap)
-    (h_n_large : p_snps < n_overlap) :
-    0 < p_snps / n_overlap ∧ p_snps / n_overlap < 1 := by
-  constructor
-  · exact div_pos h_p h_n
-  · rw [div_lt_one h_n]; exact h_n_large
+    (h_eval : r2_overlap = r2_true + overlapBias p_snps n_overlap) :
+    r2_true < r2_overlap := by
+  unfold overlapBias at h_eval
+  have h_bias_pos : 0 < p_snps / n_overlap := div_pos h_p h_n
+  linarith
 
 /- **Portability assessment requires population-specific validation.**
     R² must be evaluated in each target population separately.
@@ -178,13 +183,33 @@ theorem overlap_bias
     standard CV overestimates R² due to shared segments.
     Family-blocked CV is closer to the true R² because it removes
     the upward bias from family sharing, so its absolute error is smaller. -/
-theorem blocked_cv_less_biased
-    (r2_standard_cv r2_blocked_cv r2_true : ℝ)
-    (h_standard_biased : r2_true < r2_standard_cv)
-    (h_blocked_between : r2_true ≤ r2_blocked_cv)
-    (h_blocked_closer_to_true : r2_blocked_cv < r2_standard_cv) :
-    |r2_blocked_cv - r2_true| < |r2_standard_cv - r2_true| := by
-  rw [abs_of_nonneg (by linarith), abs_of_nonneg (by linarith)]
+structure CVBiasModel where
+  trueR2 : ℝ
+  baselineBias : ℝ
+  familySharingBias : ℝ
+  h_baseline_nonneg : 0 ≤ baselineBias
+  h_family_pos : 0 < familySharingBias
+
+noncomputable def standardCV (m : CVBiasModel) : ℝ :=
+  m.trueR2 + m.baselineBias + m.familySharingBias
+
+noncomputable def blockedCV (m : CVBiasModel) : ℝ :=
+  m.trueR2 + m.baselineBias
+
+theorem blocked_cv_less_biased (m : CVBiasModel) :
+    |blockedCV m - m.trueR2| < |standardCV m - m.trueR2| := by
+  have h_base := m.h_baseline_nonneg
+  have h_fam := m.h_family_pos
+  have h_blocked_diff : blockedCV m - m.trueR2 = m.baselineBias := by
+    unfold blockedCV
+    ring
+  have h_std_diff : standardCV m - m.trueR2 = m.baselineBias + m.familySharingBias := by
+    unfold standardCV
+    ring
+  rw [h_blocked_diff, h_std_diff]
+  rw [abs_of_nonneg h_base]
+  have h_pos : 0 ≤ m.baselineBias + m.familySharingBias := by linarith
+  rw [abs_of_nonneg h_pos]
   linarith
 
 /- **Time-split validation for discovery bias.**
@@ -384,32 +409,68 @@ The resulting target `R²` and target/source portability ratio change.
 
 section SourceR2Insufficiency
 
-/-- Concrete two-locus witness that source deployed `R²` does not determine
-target portability.
+/-- A locus transport model specifies the source signal variance at each locus
+and how that signal scales when transported to the target population. -/
+structure LocusTransport (k : ℕ) where
+  sourceSignal : Fin k → ℝ
+  transportScale : Fin k → ℝ
+  residualVariance : ℝ
+  h_residual_pos : 0 < residualVariance
+  h_signal_nonneg : ∀ i, 0 ≤ sourceSignal i
+  h_scale_nonneg : ∀ i, 0 ≤ transportScale i
 
-Both source loci contribute one unit of source signal, so the source deployed
-`R²` at residual scale `1` is `2/3`. If both loci transport perfectly, the
-target/source portability ratio is `1`. If one locus loses all transported
-signal while the other remains intact, the target/source portability ratio
-drops to `3/4`.
+noncomputable def sourceVariance {k : ℕ} (m : LocusTransport k) : ℝ :=
+  ∑ l, m.sourceSignal l
 
-This formalizes the biological point that equal source `R²` does not determine
-cross-population portability without locus-resolved transport state. -/
-theorem same_source_r2_different_portability_two_locus_witness :
-    let sourceSignal : Fin 2 → ℝ := fun _ => 1
-    let stableTransport : Fin 2 → ℝ := fun _ => 1
-    let brokenTransport : Fin 2 → ℝ := fun i => if i = 0 then 1 else 0
-    let sourceVariance : ℝ := ∑ l, sourceSignal l
-    let stableTargetVariance : ℝ := ∑ l, sourceSignal l * stableTransport l
-    let brokenTargetVariance : ℝ := ∑ l, sourceSignal l * brokenTransport l
-    let sourceR2 := TransportedMetrics.r2FromSignalVariance sourceVariance 1
-    let stableTargetR2 := TransportedMetrics.r2FromSignalVariance stableTargetVariance 1
-    let brokenTargetR2 := TransportedMetrics.r2FromSignalVariance brokenTargetVariance 1
-    sourceR2 = stableTargetR2 ∧
-    brokenTargetR2 < stableTargetR2 ∧
-    brokenTargetR2 / sourceR2 = (3 : ℝ) / 4 := by
-  simp [TransportedMetrics.r2FromSignalVariance]
-  norm_num
+noncomputable def targetVariance {k : ℕ} (m : LocusTransport k) : ℝ :=
+  ∑ l, m.sourceSignal l * m.transportScale l
+
+noncomputable def sourceR2 {k : ℕ} (m : LocusTransport k) : ℝ :=
+  TransportedMetrics.r2FromSignalVariance (sourceVariance m) m.residualVariance
+
+noncomputable def targetR2 {k : ℕ} (m : LocusTransport k) : ℝ :=
+  TransportedMetrics.r2FromSignalVariance (targetVariance m) m.residualVariance
+
+/-- Source deployed `R²` does not determine target portability: if the total source
+variance is the same, but one scenario scales perfectly while another loses signal
+at some loci, the target R² diverges despite identical source R². -/
+theorem identical_source_r2_different_portability {k : ℕ}
+    (m_stable m_broken : LocusTransport k)
+    (h_source_eq : m_stable.sourceSignal = m_broken.sourceSignal)
+    (h_resid_eq : m_stable.residualVariance = m_broken.residualVariance)
+    (h_broken_loss : targetVariance m_broken < targetVariance m_stable) :
+    sourceR2 m_stable = sourceR2 m_broken ∧
+    targetR2 m_broken < targetR2 m_stable := by
+  unfold sourceR2 targetR2 sourceVariance targetVariance
+  have h_var_eq : (∑ l, m_stable.sourceSignal l) = (∑ l, m_broken.sourceSignal l) := by
+    rw [h_source_eq]
+  constructor
+  · rw [h_var_eq, h_resid_eq]
+  · unfold TransportedMetrics.r2FromSignalVariance
+    rw [h_resid_eq]
+    have h1 : 0 ≤ targetVariance m_broken := by
+      unfold targetVariance
+      apply Finset.sum_nonneg
+      intro i _
+      exact mul_nonneg (m_broken.h_signal_nonneg i) (m_broken.h_scale_nonneg i)
+    have h2 : 0 < m_broken.residualVariance := m_broken.h_residual_pos
+    have h3 : 0 < targetVariance m_stable + m_broken.residualVariance := by linarith
+    have h4 : 0 < targetVariance m_broken + m_broken.residualVariance := by linarith
+    have h_diff : (targetVariance m_broken) * (targetVariance m_stable + m_broken.residualVariance) <
+                  (targetVariance m_stable) * (targetVariance m_broken + m_broken.residualVariance) := by
+      calc
+        targetVariance m_broken * (targetVariance m_stable + m_broken.residualVariance)
+          = targetVariance m_broken * targetVariance m_stable + targetVariance m_broken * m_broken.residualVariance := by ring
+        _ < targetVariance m_broken * targetVariance m_stable + targetVariance m_stable * m_broken.residualVariance := by
+          apply add_lt_add_left
+          exact mul_lt_mul_of_pos_right h_broken_loss h2
+        _ = targetVariance m_stable * targetVariance m_broken + targetVariance m_stable * m_broken.residualVariance := by ring
+        _ = targetVariance m_stable * (targetVariance m_broken + m_broken.residualVariance) := by ring
+    have h_div_lt_div : (targetVariance m_broken) / (targetVariance m_broken + m_broken.residualVariance) <
+                        (targetVariance m_stable) / (targetVariance m_stable + m_broken.residualVariance) := by
+      rw [div_lt_div_iff₀ h4 h3]
+      exact h_diff
+    exact h_div_lt_div
 
 end SourceR2Insufficiency
 
