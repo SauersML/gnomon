@@ -123,14 +123,24 @@ theorem explainable_fraction_bound_of_conditional_gaussian_floor_exact
 /-- **Law of total variance identity.**
     Var(Z) = E[Var(Z|D)] + Var(E[Z|D]).
     The between-group fraction Var(E[Z|D])/Var(Z) = R² of D on Z. -/
+structure VarianceDecomposition where
+  eVarZgivenD : ℝ
+  varEZgivenD : ℝ
+
+noncomputable def totalVarianceDecomp (v : VarianceDecomposition) : ℝ :=
+  v.eVarZgivenD + v.varEZgivenD
+
+noncomputable def explainedVarianceFraction (v : VarianceDecomposition) : ℝ :=
+  v.varEZgivenD / totalVarianceDecomp v
+
 theorem law_of_total_variance_r2_bound
-    (varZ eVarZgivenD varEZgivenD : ℝ)
-    (h_decomp : varZ = eVarZgivenD + varEZgivenD)
-    (h_varZ_pos : 0 < varZ)
-    (h_eVar_nonneg : 0 ≤ eVarZgivenD)
-    (_h_varE_nonneg : 0 ≤ varEZgivenD) :
-    varEZgivenD / varZ ≤ 1 := by
-  rw [div_le_one h_varZ_pos, h_decomp]
+    (v : VarianceDecomposition)
+    (h_varZ_pos : 0 < totalVarianceDecomp v)
+    (h_eVar_nonneg : 0 ≤ v.eVarZgivenD) :
+    explainedVarianceFraction v ≤ 1 := by
+  unfold explainedVarianceFraction
+  rw [div_le_one h_varZ_pos]
+  unfold totalVarianceDecomp
   linarith
 
 /-- **When within-group variance dominates, R² is small.**
@@ -138,17 +148,16 @@ theorem law_of_total_variance_r2_bound
 
     Worked example: For height, Wang et al. find δ ≈ 0.005 (R² = 0.51%). -/
 theorem r2_small_when_within_dominates
-    (varZ eVarZgivenD varEZgivenD δ : ℝ)
-    (h_decomp : varZ = eVarZgivenD + varEZgivenD)
-    (h_varZ_pos : 0 < varZ)
-    (_h_eVar_nonneg : 0 ≤ eVarZgivenD)
-    (_h_varE_nonneg : 0 ≤ varEZgivenD)
-    (h_within_dominates : eVarZgivenD ≥ (1 - δ) * varZ)
-    (_hδ_pos : 0 < δ) :
-    varEZgivenD / varZ ≤ δ := by
-  have h1 : varEZgivenD = varZ - eVarZgivenD := by linarith
-  rw [h1, sub_div, div_self (h_varZ_pos.ne')]
-  linarith [le_div_iff₀ h_varZ_pos |>.mpr (by linarith : (1 - δ) * varZ ≤ eVarZgivenD)]
+    (v : VarianceDecomposition) (δ : ℝ)
+    (h_var_pos : 0 < totalVarianceDecomp v)
+    (h_within_dominates : (1 - δ) * totalVarianceDecomp v ≤ v.eVarZgivenD) :
+    explainedVarianceFraction v ≤ δ := by
+  unfold explainedVarianceFraction
+  have h1 : v.varEZgivenD = totalVarianceDecomp v - v.eVarZgivenD := by
+    unfold totalVarianceDecomp
+    linarith
+  rw [h1, sub_div, div_self (h_var_pos.ne')]
+  linarith [le_div_iff₀ h_var_pos |>.mpr h_within_dominates]
 
 /-- **χ² coefficient of variation.**
     Squared prediction error ε² ~ σ² · χ²₁ has Var(ε²) = 2σ⁴ and E[ε²] = σ².

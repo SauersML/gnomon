@@ -302,22 +302,50 @@ section ColliderBias
     If the study conditions on survival (e.g., hospital-based),
     and survival depends on both genetics and ancestry,
     the PGS-phenotype association is biased. -/
+structure StudyDesignBias where
+  true_effect : ℝ
+  selection_bias : ℝ
+
+noncomputable def observedEffect (design : StudyDesignBias) : ℝ :=
+  design.true_effect + design.selection_bias
+
 theorem collider_bias_from_selection
-    (beta_true beta_observed selection_bias : ℝ)
-    (h_biased : beta_observed = beta_true + selection_bias)
-    (h_bias_nn : selection_bias ≠ 0) :
-    beta_observed ≠ beta_true := by
-  rw [h_biased]; intro h; apply h_bias_nn; linarith
+    (design : StudyDesignBias)
+    (h_bias_nn : design.selection_bias ≠ 0) :
+    observedEffect design ≠ design.true_effect := by
+  unfold observedEffect
+  intro h
+  have : design.selection_bias = 0 := by linarith
+  exact h_bias_nn this
+
+structure IndexEventBias where
+  true_prognosis_effect : ℝ
+  pgs_diagnosis_effect : ℝ
+
+noncomputable def biasedPrognosisEffect (bias : IndexEventBias) : ℝ :=
+  bias.true_prognosis_effect - bias.pgs_diagnosis_effect
 
 /-- **Index event bias in PGS studies.**
     Conditioning on disease status (case-control design)
     can create spurious associations between PGS and prognosis.
     This is more severe when PGS is ancestry-specific. -/
 theorem index_event_bias
-    (beta_prognosis_true beta_prognosis_biased pgs_diagnosis_effect : ℝ)
-    (h_bias : beta_prognosis_biased = beta_prognosis_true - pgs_diagnosis_effect)
-    (h_effect : 0 < pgs_diagnosis_effect) :
-    beta_prognosis_biased < beta_prognosis_true := by linarith
+    (bias : IndexEventBias)
+    (h_effect : 0 < bias.pgs_diagnosis_effect) :
+    biasedPrognosisEffect bias < bias.true_prognosis_effect := by
+  unfold biasedPrognosisEffect
+  linarith
+
+structure BerksonBias where
+  population_effect : ℝ
+  bias_eur : ℝ
+  bias_afr : ℝ
+
+noncomputable def observedEffectEur (bias : BerksonBias) : ℝ :=
+  bias.population_effect + bias.bias_eur
+
+noncomputable def observedEffectAfr (bias : BerksonBias) : ℝ :=
+  bias.population_effect + bias.bias_afr
 
 /-- **Berkson's paradox in biobank studies.**
     Biobank participants are healthier and more educated than
@@ -328,10 +356,13 @@ theorem index_event_bias
     If bias_eur ≠ bias_afr, then β_biobank_eur ≠ β_biobank_afr even when
     the true population-level effect is the same. -/
 theorem berkson_paradox_ancestry_specific
-    (beta_population bias_eur bias_afr : ℝ)
-    (h_diff_bias : bias_eur ≠ bias_afr) :
-    beta_population + bias_eur ≠ beta_population + bias_afr := by
-  intro h; exact h_diff_bias (by linarith)
+    (bias : BerksonBias)
+    (h_diff_bias : bias.bias_eur ≠ bias.bias_afr) :
+    observedEffectEur bias ≠ observedEffectAfr bias := by
+  unfold observedEffectEur observedEffectAfr
+  intro h
+  have : bias.bias_eur = bias.bias_afr := by linarith
+  exact h_diff_bias this
 
 end ColliderBias
 

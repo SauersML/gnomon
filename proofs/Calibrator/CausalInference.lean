@@ -34,17 +34,31 @@ each contributing a specific proportion of the total loss.
 
 section PathDecomposition
 
+structure PortabilityLossComponents where
+  ld_mismatch : ℝ
+  maf_differences : ℝ
+  effect_turnover : ℝ
+  environmental_shifts : ℝ
+  technical_artifacts : ℝ
+
+noncomputable def totalPortabilityLoss (c : PortabilityLossComponents) : ℝ :=
+  c.ld_mismatch + c.maf_differences + c.effect_turnover +
+  c.environmental_shifts + c.technical_artifacts
+
 /-- **Total portability loss decomposition.**
     Δ_total = Δ_LD + Δ_MAF + Δ_effect + Δ_env + Δ_technical
     Each component represents a distinct causal pathway. -/
 theorem total_loss_decomposition
-    (delta_total delta_LD delta_MAF delta_effect delta_env delta_tech : ℝ)
-    (h_decomp : delta_total = delta_LD + delta_MAF + delta_effect + delta_env + delta_tech)
-    (h_LD : 0 ≤ delta_LD) (h_MAF : 0 ≤ delta_MAF) (h_effect : 0 ≤ delta_effect)
-    (h_env : 0 ≤ delta_env) (h_tech : 0 ≤ delta_tech) :
-    delta_LD ≤ delta_total ∧ delta_MAF ≤ delta_total ∧
-    delta_effect ≤ delta_total ∧ delta_env ≤ delta_total ∧
-    delta_tech ≤ delta_total := by
+    (c : PortabilityLossComponents)
+    (h_LD : 0 ≤ c.ld_mismatch) (h_MAF : 0 ≤ c.maf_differences)
+    (h_effect : 0 ≤ c.effect_turnover) (h_env : 0 ≤ c.environmental_shifts)
+    (h_tech : 0 ≤ c.technical_artifacts) :
+    c.ld_mismatch ≤ totalPortabilityLoss c ∧
+    c.maf_differences ≤ totalPortabilityLoss c ∧
+    c.effect_turnover ≤ totalPortabilityLoss c ∧
+    c.environmental_shifts ≤ totalPortabilityLoss c ∧
+    c.technical_artifacts ≤ totalPortabilityLoss c := by
+  unfold totalPortabilityLoss
   constructor <;> [skip; constructor <;> [skip; constructor <;> [skip; constructor]]] <;> linarith
 
 /-- **LD pathway is the largest contributor for most traits.**
@@ -91,15 +105,24 @@ theorem selection_dominant_for_immune
           nlinarith [sq_abs ρ, sq_nonneg ρ]
       _ = presentDayPGSVariance V_A fst := one_mul _
 
+structure InteractingLossModel where
+  sum_individual_effects : ℝ
+  pathway_interaction : ℝ
+
+noncomputable def interactingTotalLoss (m : InteractingLossModel) : ℝ :=
+  m.sum_individual_effects + m.pathway_interaction
+
 /-- **Interaction effects between pathways.**
     Pathways are not fully independent: LD changes interact
     with MAF changes (LD × MAF interaction). -/
 theorem pathway_interactions_exist
-    (sum_individual total_with_interactions interaction : ℝ)
-    (h_interaction : total_with_interactions = sum_individual + interaction)
-    (h_nonzero : interaction ≠ 0) :
-    total_with_interactions ≠ sum_individual := by
-  rw [h_interaction]; intro h; apply h_nonzero; linarith
+    (m : InteractingLossModel)
+    (h_nonzero : m.pathway_interaction ≠ 0) :
+    interactingTotalLoss m ≠ m.sum_individual_effects := by
+  unfold interactingTotalLoss
+  intro h
+  have : m.pathway_interaction = 0 := by linarith
+  exact h_nonzero this
 
 end PathDecomposition
 
@@ -113,13 +136,21 @@ on PGS accuracy into direct and indirect effects.
 
 section MediationAnalysis
 
+structure MediationModel where
+  direct_effect : ℝ
+  indirect_effect : ℝ
+
+noncomputable def totalMediationEffect (m : MediationModel) : ℝ :=
+  m.direct_effect + m.indirect_effect
+
 /-- **Total effect = Direct effect + Indirect effect.**
     TE = DE + IE (in the linear case). -/
 theorem mediation_decomposition
-    (total_effect direct_effect indirect_effect : ℝ)
-    (h_decomp : total_effect = direct_effect + indirect_effect) :
+    (m : MediationModel) :
     -- Indirect effect is the total minus direct
-    indirect_effect = total_effect - direct_effect := by linarith
+    m.indirect_effect = totalMediationEffect m - m.direct_effect := by
+  unfold totalMediationEffect
+  linarith
 
 /-- **Proportion mediated.**
     PM = IE / TE = indirect / total. -/
