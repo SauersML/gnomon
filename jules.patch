@@ -1,0 +1,38 @@
+diff --git a/proofs/Calibrator/VarianceComponents.lean b/proofs/Calibrator/VarianceComponents.lean
+index a940b07..214dde0 100644
+--- a/proofs/Calibrator/VarianceComponents.lean
++++ b/proofs/Calibrator/VarianceComponents.lean
+@@ -67,6 +67,14 @@ theorem snp_h2_le_narrow_h2
+   unfold snpH2 narrowSenseH2
+   exact div_le_div_of_nonneg_right h_tagged (le_of_lt h_total)
+ 
++/-- True total narrow-sense heritability. -/
++noncomputable def trueH2 (V_A V_P : ℝ) : ℝ :=
++  V_A / V_P
++
++/-- Twin heritability captures both tagged and untagged additive variance. -/
++noncomputable def twinH2 (V_A_tagged V_A_untagged V_P : ℝ) : ℝ :=
++  (V_A_tagged + V_A_untagged) / V_P
++
+ /-- **The missing heritability gap.**
+     h²_twin - h²_SNP > 0 for most traits. This is the "missing heritability".
+     It sets an upper bound on what PGS can achieve with current genotyping.
+@@ -82,13 +90,11 @@ theorem missing_heritability_gap
+     (h_D : 0 ≤ V_D) (h_I : 0 ≤ V_I) (h_E : 0 ≤ V_E)
+     (h_total : 0 < V_A_tagged + V_A_untagged + V_D + V_I + V_E) :
+     let V_P := V_A_tagged + V_A_untagged + V_D + V_I + V_E
+-    let h2_twin := (V_A_tagged + V_A_untagged) / V_P
+-    let h2_snp := V_A_tagged / V_P
+-    0 < h2_twin - h2_snp := by
+-  simp only
+-  rw [show (V_A_tagged + V_A_untagged) / (V_A_tagged + V_A_untagged + V_D + V_I + V_E) -
+-    V_A_tagged / (V_A_tagged + V_A_untagged + V_D + V_I + V_E) =
+-    ((V_A_tagged + V_A_untagged) - V_A_tagged) / (V_A_tagged + V_A_untagged + V_D + V_I + V_E)
++    0 < twinH2 V_A_tagged V_A_untagged V_P - snpH2 V_A_tagged V_P := by
++  intro V_P
++  unfold twinH2 snpH2
++  rw [show (V_A_tagged + V_A_untagged) / V_P - V_A_tagged / V_P =
++    ((V_A_tagged + V_A_untagged) - V_A_tagged) / V_P
+     from (sub_div _ _ _).symm]
+   apply div_pos
+   · linarith
