@@ -161,37 +161,48 @@ theorem more_target_data_reduces_mse
   · exact Nat.cast_pos.mpr h_n₁
   · exact Nat.cast_lt.mpr h_more
 
+/-- Structural parameters for MSE decomposition. -/
+structure TransferLearningModel where
+  σ_sq : ℝ
+  bias_sq : ℝ
+  σ_extra_sq : ℝ
+  n_T : ℝ
+
+/-- Transfer model MSE (fixed bias, some variance). -/
+noncomputable def TransferLearningModel.mseTransfer (m : TransferLearningModel) : ℝ :=
+  m.σ_sq / m.n_T + m.bias_sq
+
+/-- Target-only MSE (no transfer bias, but higher variance from fresh estimation). -/
+noncomputable def TransferLearningModel.mseTarget (m : TransferLearningModel) : ℝ :=
+  (m.σ_sq + m.σ_extra_sq) / m.n_T
+
 /-- **Transfer is beneficial when source provides information.**
-    The transferred estimator beats the target-only estimator when
-    n_T is small relative to the information from source.
+    The transferred estimator beats the target-only estimator exactly when
+    n_T is small relative to the ratio of extra variance to transfer bias.
 
-    Model definitions:
-    - MSE_transfer = σ²/n_T + bias² (transfer bias is fixed, not sample-dependent)
-    - MSE_target = (σ² + σ²_extra)/n_T (target-only has extra variance from
-      estimating all effects de novo, but no transfer bias)
-
-    Derived: MSE_transfer < MSE_target ↔ bias² < σ²_extra/n_T.
+    Derived bidirectional equivalence: MSE_transfer < MSE_target ↔ n_T < σ²_extra / bias².
     When n_T is small, σ²_extra/n_T is large, so transfer wins.
     As n_T → ∞, σ²_extra/n_T → 0, so target-only wins (bias² > 0). -/
 theorem transfer_beats_target_only
-    (σ_sq bias_sq σ_extra_sq : ℝ) (n_T : ℝ)
-    (h_σ : 0 < σ_sq) (h_bias : 0 < bias_sq)
-    (h_extra : 0 < σ_extra_sq) (h_n : 0 < n_T)
-    (h_small_n : n_T < σ_extra_sq / bias_sq) :
-    let mse_transfer := σ_sq / n_T + bias_sq
-    let mse_target := (σ_sq + σ_extra_sq) / n_T
-    mse_transfer < mse_target := by
-  simp only
-  -- From h_small_n: n_T < σ_extra_sq / bias_sq
-  -- Multiply both sides by bias_sq > 0: n_T * bias_sq < σ_extra_sq
-  -- Divide by n_T > 0: bias_sq < σ_extra_sq / n_T
-  -- Then σ_sq/n_T + bias_sq < σ_sq/n_T + σ_extra_sq/n_T = (σ_sq + σ_extra_sq)/n_T
-  have h_prod : bias_sq * n_T < σ_extra_sq := by
-    rw [mul_comm]
-    exact (lt_div_iff₀ h_bias).mp h_small_n
-  have h_key : bias_sq < σ_extra_sq / n_T := by
-    exact (lt_div_iff₀ h_n).2 h_prod
-  rw [add_div]; linarith
+    (m : TransferLearningModel)
+    (h_σ : 0 < m.σ_sq) (h_bias : 0 < m.bias_sq)
+    (h_extra : 0 < m.σ_extra_sq) (h_n : 0 < m.n_T) :
+    m.mseTransfer < m.mseTarget ↔ m.n_T < m.σ_extra_sq / m.bias_sq := by
+  unfold TransferLearningModel.mseTransfer TransferLearningModel.mseTarget
+  rw [add_div]
+  constructor
+  · intro h_lt
+    have h_bias_lt : m.bias_sq < m.σ_extra_sq / m.n_T := by linarith
+    have h_prod : m.n_T * m.bias_sq < m.σ_extra_sq := by
+      have h1 : m.bias_sq * m.n_T < m.σ_extra_sq := (lt_div_iff₀ h_n).mp h_bias_lt
+      rwa [mul_comm]
+    exact (lt_div_iff₀ h_bias).mpr h_prod
+  · intro h_lt
+    have h_prod : m.bias_sq * m.n_T < m.σ_extra_sq := by
+      have h1 : m.n_T * m.bias_sq < m.σ_extra_sq := (lt_div_iff₀ h_bias).mp h_lt
+      rwa [mul_comm]
+    have h_bias_lt : m.bias_sq < m.σ_extra_sq / m.n_T := (lt_div_iff₀ h_n).mpr h_prod
+    linarith
 
 /-- **Critical sample size for transfer benefit.**
     Transfer learning helps when n_T < n_crit, where
