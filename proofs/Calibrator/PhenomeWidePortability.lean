@@ -368,25 +368,55 @@ theorem region_disproportionate_variance
     n_region_snps / n_total_snps < r2_region / r2_genome_wide := by
   linarith
 
-/-- **Subtracting a positive selection shift lowers a scalar effect-correlation
-coordinate.**
-    This is the exact scalar inequality `ρ₀ - δ < ρ₀` when `δ > 0`. It is a
-    bookkeeping lemma for downstream biological interpretations, not by itself
-    a mechanistic selection theorem. -/
-theorem positive_selection_shift_lowers_scalar_effect_correlation
-    (rho_baseline δ_selection : ℝ)
-    (h_selection : 0 < δ_selection) :
-    rho_baseline - δ_selection < rho_baseline := by linarith
+/-- Represents a trait subject to divergent selection, which penalizes
+    cross-population effect correlation. -/
+structure ImmuneSelectionModel where
+  rho_baseline : ℝ
+  selection_penalty : ℝ
+  h_rho_pos : 0 < rho_baseline
+  h_penalty_pos : 0 < selection_penalty
+  h_penalty_lt : selection_penalty < 1
 
-/-- **A threshold sandwich implies observed portability is below neutral.**
-    This is the literal transitivity fact `port_observed < threshold < port_neutral
-    -> port_observed < port_neutral`. It is useful as a small inference step,
-    but it is not by itself a mechanistic theorem about why the gap exists. -/
-theorem threshold_sandwich_implies_observed_portability_below_neutral
-    (port_observed port_neutral threshold : ℝ)
-    (h_observed : port_observed < threshold)
-    (h_neutral : threshold < port_neutral) :
-    port_observed < port_neutral := by linarith
+/-- The correlation of effects across populations is attenuated by selection. -/
+noncomputable def immuneEffectCorrelation (m : ImmuneSelectionModel) : ℝ :=
+  m.rho_baseline * (1 - m.selection_penalty)
+
+/-- **Selection shifts lower scalar effect correlation.**
+    A trait with a positive selection penalty has strictly lower effect
+    correlation than its baseline expectation. -/
+theorem positive_selection_shift_lowers_scalar_effect_correlation
+    (m : ImmuneSelectionModel) :
+    immuneEffectCorrelation m < m.rho_baseline := by
+  dsimp [immuneEffectCorrelation]
+  have h1 : m.rho_baseline * (1 - m.selection_penalty) = m.rho_baseline - m.rho_baseline * m.selection_penalty := by ring
+  rw [h1]
+  have h2 : 0 < m.rho_baseline * m.selection_penalty := mul_pos m.h_rho_pos m.h_penalty_pos
+  linarith
+
+/-- Defines the total portability of an immune trait under selection,
+    given its correlation and a neutral portability baseline. -/
+noncomputable def immunePortability (m : ImmuneSelectionModel) (port_neutral : ℝ) : ℝ :=
+  (immuneEffectCorrelation m) * port_neutral
+
+/-- **Selection causes observed portability to drop below neutral.**
+    If a trait undergoes selection such that its effect correlation drops below 1,
+    and the neutral portability is positive, the observed portability will be
+    strictly less than the neutral expectation. -/
+theorem selection_implies_observed_portability_below_neutral
+    (m : ImmuneSelectionModel) (port_neutral : ℝ)
+    (h_neutral_pos : 0 < port_neutral)
+    (h_baseline_le_one : m.rho_baseline ≤ 1) :
+    immunePortability m port_neutral < port_neutral := by
+  dsimp [immunePortability, immuneEffectCorrelation]
+  -- We know m.rho_baseline * (1 - m.selection_penalty) < m.rho_baseline
+  have h_corr_lt : m.rho_baseline * (1 - m.selection_penalty) < m.rho_baseline :=
+    positive_selection_shift_lowers_scalar_effect_correlation m
+  -- Which means it's strictly less than 1
+  have h_corr_lt_one : m.rho_baseline * (1 - m.selection_penalty) < 1 := by linarith
+  -- Since port_neutral > 0, multiplying by a number < 1 makes it smaller than port_neutral
+  have h_mul : m.rho_baseline * (1 - m.selection_penalty) * port_neutral < 1 * port_neutral :=
+    mul_lt_mul_of_pos_right h_corr_lt_one h_neutral_pos
+  rwa [one_mul] at h_mul
 
 /-- **A zero-portability component lowers a weighted portability average.**
     If a trait keeps only the `(1 - f)` fraction of its remaining portable
