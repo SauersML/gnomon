@@ -325,16 +325,36 @@ theorem collider_attenuates_association (m : ColliderModel) :
 /-- **Differential ascertainment creates portability artifact.**
     If source and target cohorts have different ascertainment patterns,
     the apparent portability drop includes an ascertainment component. -/
-theorem differential_ascertainment_artifact
-    (r2_source_pop r2_target_pop r2_source_asc r2_target_asc : ℝ)
-    (h_source_asc : r2_source_asc < r2_source_pop)
-    (h_target_asc : r2_target_asc < r2_target_pop)
-    -- Different ascertainment severity
-    (h_diff_severity : r2_target_pop - r2_target_asc < r2_source_pop - r2_source_asc) :
-    -- Apparent portability drop is larger than true portability drop
-    r2_source_asc - r2_target_asc > r2_source_pop - r2_target_pop →
-      False := by
-  intro h
+structure DifferentialAscertainmentModel where
+  source : ColliderModel
+  target : ColliderModel
+  /-- True effects are identical in both populations -/
+  same_true_beta : source.β_G = target.β_G
+  /-- Source ascertainment is more severe (attenuates association more)
+      than target ascertainment. -/
+  diff_severity : source.σ2_G / (source.σ2_G + source.σ2_E) < target.σ2_G / (target.σ2_G + target.σ2_E)
+
+noncomputable def DifferentialAscertainmentModel.apparentPortabilityDrop (m : DifferentialAscertainmentModel) : ℝ :=
+  m.source.β_selected - m.target.β_selected
+
+noncomputable def DifferentialAscertainmentModel.truePortabilityDrop (m : DifferentialAscertainmentModel) : ℝ :=
+  m.source.β_G - m.target.β_G
+
+/-- Under differential ascertainment, the apparent portability drop is distorted.
+    If the true effects are identical but source ascertainment is more severe,
+    the apparent drop is less than the true drop, creating a spurious artifact. -/
+theorem differential_ascertainment_artifact (m : DifferentialAscertainmentModel) :
+    m.apparentPortabilityDrop < m.truePortabilityDrop := by
+  unfold DifferentialAscertainmentModel.apparentPortabilityDrop
+  unfold DifferentialAscertainmentModel.truePortabilityDrop
+  unfold ColliderModel.β_selected
+  have h_same := m.same_true_beta
+  rw [h_same]
+  have h_sub_zero : m.target.β_G - m.target.β_G = 0 := sub_self _
+  rw [h_sub_zero]
+  have h_mul_lt : m.target.β_G * (m.source.σ2_G / (m.source.σ2_G + m.source.σ2_E)) <
+                  m.target.β_G * (m.target.σ2_G / (m.target.σ2_G + m.target.σ2_E)) := by
+    exact mul_lt_mul_of_pos_left m.diff_severity m.target.β_G_pos
   linarith
 
 end ColliderBias
