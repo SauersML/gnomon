@@ -217,12 +217,26 @@ theorem gwas_h2_le_true (h2_true avg_r2_tag : ℝ)
 
 /-- **Tagging efficiency varies by population.**
     Source LD is tagged better in source-derived GWAS than target LD.
-    This creates a technical portability artifact. -/
+    This creates a technical portability artifact where the target's GWAS
+    heritability is strictly less than the source's GWAS heritability and
+    the true heritability. -/
 theorem tagging_creates_portability_artifact
-    (h2_source_gwas h2_target_gwas h2_true : ℝ)
-    (h_source_better : h2_target_gwas < h2_source_gwas)
-    (h_true : h2_source_gwas ≤ h2_true) :
-    h2_target_gwas < h2_true := by linarith
+    (h2_true r2_tag_source r2_tag_target : ℝ)
+    (h_h2 : 0 < h2_true)
+    (h_tag_source_nonneg : 0 ≤ r2_tag_source)
+    (h_tag_source_le : r2_tag_source ≤ 1)
+    (h_source_better : r2_tag_target < r2_tag_source) :
+    gwasHeritability h2_true r2_tag_target < gwasHeritability h2_true r2_tag_source ∧
+    gwasHeritability h2_true r2_tag_target < h2_true := by
+  constructor
+  · unfold gwasHeritability
+    exact mul_lt_mul_of_pos_left h_source_better h_h2
+  · have h1 : gwasHeritability h2_true r2_tag_source ≤ h2_true :=
+      gwas_h2_le_true h2_true r2_tag_source (le_of_lt h_h2) h_tag_source_nonneg h_tag_source_le
+    have h2 : gwasHeritability h2_true r2_tag_target < gwasHeritability h2_true r2_tag_source := by
+      unfold gwasHeritability
+      exact mul_lt_mul_of_pos_left h_source_better h_h2
+    linarith
 
 end LDTagging
 
@@ -236,77 +250,110 @@ causal variants due to independent mutation and selection.
 
 section AllelicHeterogeneity
 
-/-- **Allelic heterogeneity reduces portability via variance decomposition.**
-    Total locus variance in source = V_shared + V_source_specific.
-    The tag SNP captures r²_tag of source total variance.
-    In target, only the shared component transfers: target variance
-    at the tag = r²_tag × V_shared = r²_tag × ρ × V_total,
-    where ρ = V_shared / V_total < 1 due to population-specific variants.
+/-- **Model for Allelic Heterogeneity.**
+    Models a genomic locus where variance is driven by both shared variants
+    and source-specific variants, and observed via a tag SNP. -/
+structure AllelicHeterogeneityModel where
+  v_shared : ℝ
+  v_source_specific : ℝ
+  r2_tag : ℝ
 
-    Derived: r2_causal * r2_tag * ρ < r2_causal * r2_tag because
-    multiplying the positive quantity r2_causal * r2_tag by ρ < 1
-    strictly reduces it. -/
+/-- Total causal locus variance in the source population. -/
+noncomputable def locusVarianceSource (m : AllelicHeterogeneityModel) : ℝ :=
+  m.v_shared + m.v_source_specific
+
+/-- Captured locus variance in the target population (only shared transfers). -/
+noncomputable def locusVarianceTargetCaptured (m : AllelicHeterogeneityModel) : ℝ :=
+  m.v_shared * m.r2_tag
+
+/-- Captured locus variance in the source population. -/
+noncomputable def locusVarianceSourceCaptured (m : AllelicHeterogeneityModel) : ℝ :=
+  locusVarianceSource m * m.r2_tag
+
+/-- **Allelic heterogeneity reduces portability via variance decomposition.**
+    The target population's captured variance is strictly less than the source's
+    because the tag SNP in the source captures both shared and source-specific variance,
+    but only the shared component transfers to the target. -/
 theorem allelic_heterogeneity_reduces_portability
-    (r2_causal r2_tag ρ : ℝ)
-    (h_causal : 0 < r2_causal) (h_tag : 0 < r2_tag) (h_tag_le : r2_tag ≤ 1)
-    (h_ρ : 0 < ρ) (h_ρ_lt : ρ < 1) :
-    r2_causal * r2_tag * ρ < r2_causal * r2_tag := by
-  have h_prod_pos : 0 < r2_causal * r2_tag := mul_pos h_causal h_tag
-  calc r2_causal * r2_tag * ρ
-      < r2_causal * r2_tag * 1 := by nlinarith
-    _ = r2_causal * r2_tag := mul_one _
+    (m : AllelicHeterogeneityModel)
+    (h_source_spec : 0 < m.v_source_specific)
+    (h_tag : 0 < m.r2_tag) :
+    locusVarianceTargetCaptured m < locusVarianceSourceCaptured m := by
+  unfold locusVarianceTargetCaptured locusVarianceSourceCaptured locusVarianceSource
+  have h_sum : m.v_shared < m.v_shared + m.v_source_specific := by linarith
+  exact mul_lt_mul_of_pos_right h_sum h_tag
+
+/-- **Model for Gene-Level Variance Across Populations.**
+    A gene may be important for a trait in all populations, but the specific
+    damaging variants differ because rare mutations are population-specific. -/
+structure GeneVarianceModel where
+  v_shared : ℝ
+  v_eur_specific : ℝ
+  v_afr_specific : ℝ
+
+/-- Gene-level variance in EUR population. -/
+noncomputable def geneVarianceEUR (m : GeneVarianceModel) : ℝ :=
+  m.v_shared + m.v_eur_specific
+
+/-- Gene-level variance in AFR population. -/
+noncomputable def geneVarianceAFR (m : GeneVarianceModel) : ℝ :=
+  m.v_shared + m.v_afr_specific
 
 /-- **Population-specific rare variants at shared loci.**
-    A gene may be important for a trait in all populations,
-    but the specific damaging variants differ because rare
-    mutations are recent and population-specific.
-
-    Model: gene-level variance = v_shared + v_pop_specific.
-    Both populations have positive gene-level variance (the gene
-    matters in both), but the population-specific components may differ.
-
-    Derived: both gene-level variances are strictly greater than
-    the shared component alone, demonstrating that population-specific
-    rare variants contribute genuine additional signal in each population.
-    A PGS trained in EUR captures v_shared + v_eur_specific but only
-    v_shared transfers to AFR, missing v_afr_specific entirely. -/
+    Both populations have positive gene-level variance (the gene matters in both),
+    but the population-specific components may differ.
+    A EUR-trained PGS captures only the shared variance in AFR, missing
+    the African-specific variance entirely, leading to a captured fraction < 1. -/
 theorem gene_shared_variants_specific
-    (v_shared v_eur_specific v_afr_specific : ℝ)
-    (h_shared : 0 < v_shared)
-    (h_eur : 0 < v_eur_specific) (h_afr : 0 < v_afr_specific) :
+    (m : GeneVarianceModel)
+    (h_shared_pos : 0 < m.v_shared)
+    (h_eur : 0 < m.v_eur_specific) (h_afr : 0 < m.v_afr_specific) :
     -- Each population's gene-level variance exceeds the shared component
-    v_shared < v_shared + v_eur_specific ∧
-    v_shared < v_shared + v_afr_specific ∧
+    m.v_shared < geneVarianceEUR m ∧
+    m.v_shared < geneVarianceAFR m ∧
     -- A EUR-trained PGS captures only v_shared in AFR, missing v_afr_specific
-    v_shared / (v_shared + v_afr_specific) < 1 := by
-  refine ⟨by linarith, by linarith, ?_⟩
-  rw [div_lt_one (by linarith)]
-  linarith
+    m.v_shared / geneVarianceAFR m < 1 := by
+  refine ⟨?_, ?_, ?_⟩
+  · unfold geneVarianceEUR; linarith
+  · unfold geneVarianceAFR; linarith
+  · unfold geneVarianceAFR
+    have h_denom : 0 < m.v_shared + m.v_afr_specific := by linarith
+    rw [div_lt_one h_denom]
+    linarith
+
+/-- **Model for Conditional Analysis of Independent Signals.**
+    Each population has independent signals at a locus, of which some are shared. -/
+structure ConditionalAnalysisModel where
+  n_eur_specific : ℕ
+  n_afr_specific : ℕ
+  n_shared : ℕ
+
+/-- Total signals found by conditional analysis in EUR. -/
+def totalSignalsEUR (m : ConditionalAnalysisModel) : ℕ :=
+  m.n_shared + m.n_eur_specific
+
+/-- Total signals found by conditional analysis in AFR. -/
+def totalSignalsAFR (m : ConditionalAnalysisModel) : ℕ :=
+  m.n_shared + m.n_afr_specific
+
+/-- Union of distinct signals across both populations. -/
+def totalDistinctSignals (m : ConditionalAnalysisModel) : ℕ :=
+  m.n_shared + m.n_eur_specific + m.n_afr_specific
 
 /-- **Conditional analysis reveals heterogeneity.**
-    Running conditional analysis (adjusting for lead SNP)
-    may reveal secondary signals. If secondary signals are
-    population-specific, this indicates allelic heterogeneity.
-
-    Model: each population has n_signals total independent signals
-    at a locus, of which n_shared are shared. The population-specific
-    signal count is n_signals - n_shared.
-
-    Derived: when both populations have signals and some are shared
-    (0 < n_shared ≤ min(n_eur, n_afr)), the union of distinct signals
-    (n_eur + n_afr - n_shared) exceeds each population's count alone,
-    proving that conditional analysis in either population alone
-    cannot discover all causal variants at this locus. -/
+    When both populations have signals and some are shared, the union of distinct
+    signals exceeds each population's count alone, proving that conditional analysis
+    in either population alone cannot discover all causal variants at this locus. -/
 theorem conditional_reveals_heterogeneity
-    (n_signals_eur n_signals_afr n_shared : ℕ)
-    (h_eur : 0 < n_signals_eur) (h_afr : 0 < n_signals_afr)
-    (h_some_shared : 0 < n_shared)
-    (h_shared_le_eur : n_shared ≤ n_signals_eur)
-    (h_shared_le_afr : n_shared ≤ n_signals_afr) :
+    (m : ConditionalAnalysisModel)
+    (h_eur : 0 < m.n_eur_specific)
+    (h_afr : 0 < m.n_afr_specific) :
     -- The union of distinct signals exceeds either population alone
-    n_signals_eur ≤ n_signals_eur + n_signals_afr - n_shared ∧
-    n_signals_afr ≤ n_signals_eur + n_signals_afr - n_shared := by
-  omega
+    totalSignalsEUR m < totalDistinctSignals m ∧
+    totalSignalsAFR m < totalDistinctSignals m := by
+  constructor
+  · unfold totalSignalsEUR totalDistinctSignals; omega
+  · unfold totalSignalsAFR totalDistinctSignals; omega
 
 end AllelicHeterogeneity
 
