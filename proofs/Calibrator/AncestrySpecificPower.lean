@@ -347,33 +347,50 @@ theorem discovered_variants_eur_biased
   have h_β_sq_pos : 0 < β ^ 2 := sq_pos_of_ne_zero h_β_ne
   exact mul_lt_mul_of_pos_right h_het_lt h_β_sq_pos
 
+/-- Structural model for discovery bias inflating apparent cross-population gap. -/
+structure DiscoveryBiasModel where
+  r2_causal : ℝ
+  r2_tag_bonus : ℝ
+  ρ_sq : ℝ
+
+/-- The total source R² is the portable causal part plus the population-specific tag bonus. -/
+noncomputable def DiscoveryBiasModel.r2_source (m : DiscoveryBiasModel) : ℝ :=
+  m.r2_causal + m.r2_tag_bonus
+
+/-- The target R² is the causal part attenuated by portability ρ². -/
+noncomputable def DiscoveryBiasModel.r2_target (m : DiscoveryBiasModel) : ℝ :=
+  m.r2_causal * m.ρ_sq
+
+/-- Apparent portability gap between source and target R². -/
+noncomputable def DiscoveryBiasModel.apparent_gap (m : DiscoveryBiasModel) : ℝ :=
+  m.r2_source - m.r2_target
+
+/-- True causal gap representing actual signal lost during cross-population transfer. -/
+noncomputable def DiscoveryBiasModel.true_causal_gap (m : DiscoveryBiasModel) : ℝ :=
+  m.r2_causal * (1 - m.ρ_sq)
+
 /-- **Discovery bias inflates apparent portability gap.**
-    Model definitions (let-bindings below):
+    Model definitions:
     - r²_source = r²_causal + r²_tag_bonus (source R² includes tagging bonus)
     - r²_target = r²_causal × ρ² (target gets only causal signal, attenuated)
     - apparent_gap = r²_source - r²_target
     - true_causal_gap = r²_causal × (1 - ρ²)
 
-    Algebraic derivation (verified by `ring`):
+    Algebraic derivation:
       apparent_gap = (r²_causal + r²_tag_bonus) - r²_causal × ρ²
                    = r²_causal - r²_causal × ρ² + r²_tag_bonus
                    = r²_causal × (1 - ρ²) + r²_tag_bonus
                    = true_causal_gap + r²_tag_bonus
 
-    The tag bonus inflates the apparent gap beyond the true causal gap.
-    This is a definitional identity: the proof content is the model
-    decomposition, not the algebra. -/
+    The tag bonus inflates the apparent gap beyond the true causal gap. -/
 theorem discovery_bias_inflates_source_r2
-    (r2_causal r2_tag_bonus ρ_sq : ℝ)
-    (h_causal_pos : 0 < r2_causal)
-    (h_bonus_pos : 0 < r2_tag_bonus)
-    (h_ρ_pos : 0 ≤ ρ_sq) (h_ρ_le : ρ_sq ≤ 1) :
-    let r2_source := r2_causal + r2_tag_bonus
-    let r2_target := r2_causal * ρ_sq
-    let apparent_gap := r2_source - r2_target
-    let true_causal_gap := r2_causal * (1 - ρ_sq)
-    apparent_gap = true_causal_gap + r2_tag_bonus := by
-  simp only
+    (m : DiscoveryBiasModel)
+    (h_causal_pos : 0 < m.r2_causal)
+    (h_bonus_pos : 0 < m.r2_tag_bonus)
+    (h_ρ_pos : 0 ≤ m.ρ_sq) (h_ρ_le : m.ρ_sq ≤ 1) :
+    m.apparent_gap = m.true_causal_gap + m.r2_tag_bonus := by
+  unfold DiscoveryBiasModel.apparent_gap DiscoveryBiasModel.true_causal_gap
+    DiscoveryBiasModel.r2_source DiscoveryBiasModel.r2_target
   ring
 
 /-- **Proportion of portable signal.**
