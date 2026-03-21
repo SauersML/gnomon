@@ -368,12 +368,7 @@ theorem discovery_bias_inflates_source_r2
     (h_causal_pos : 0 < r2_causal)
     (h_bonus_pos : 0 < r2_tag_bonus)
     (h_ρ_pos : 0 ≤ ρ_sq) (h_ρ_le : ρ_sq ≤ 1) :
-    let r2_source := r2_causal + r2_tag_bonus
-    let r2_target := r2_causal * ρ_sq
-    let apparent_gap := r2_source - r2_target
-    let true_causal_gap := r2_causal * (1 - ρ_sq)
-    apparent_gap = true_causal_gap + r2_tag_bonus := by
-  simp only
+    (r2_causal + r2_tag_bonus) - (r2_causal * ρ_sq) = r2_causal * (1 - ρ_sq) + r2_tag_bonus := by
   ring
 
 /-- **Proportion of portable signal.**
