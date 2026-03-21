@@ -118,18 +118,29 @@ theorem bias_variance_tradeoff
     (h_var_dominates : var₂ - var₁ > bias₁ ^ 2 - bias₂ ^ 2) :
     bias₁ ^ 2 + var₁ < bias₂ ^ 2 + var₂ := by linarith
 
+structure CalibrationModel where
+  signal_variance : ℝ
+  noise_variance : ℝ
+
+noncomputable def totalCalibrationVariance (model : CalibrationModel) : ℝ :=
+  model.signal_variance + model.noise_variance
+
 /-- **Spline R² is bounded by the signal-to-noise ratio.**
     R²_spline ≤ Var(E[ε²|d]) / Var(ε²).
 
     Worked example: Wang et al. find R² = 0.51% for height, illustrating
     that very little signal is explained by the spline. -/
 theorem spline_r2_upper_bound
-    (var_signal var_noise var_total : ℝ)
-    (h_total : var_total = var_signal + var_noise)
-    (h_total_pos : 0 < var_total)
-    (h_signal_nn : 0 ≤ var_signal) (h_noise_nn : 0 ≤ var_noise) :
-    var_signal / var_total ≤ 1 := by
-  rw [div_le_one h_total_pos, h_total]; linarith
+    (model : CalibrationModel)
+    (h_signal_nn : 0 ≤ model.signal_variance)
+    (h_noise_pos : 0 < model.noise_variance) :
+    model.signal_variance / totalCalibrationVariance model < 1 := by
+  have h_total_pos : 0 < totalCalibrationVariance model := by
+    unfold totalCalibrationVariance
+    linarith
+  rw [div_lt_one h_total_pos]
+  unfold totalCalibrationVariance
+  linarith
 
 end SplineCalibration
 
@@ -344,15 +355,26 @@ theorem epistatic_changes_faster
   rw [div_lt_div_iff₀ (mul_pos h₁_s_pos h₂_s_pos) h₁_s_pos]
   nlinarith [mul_pos h₁_s_pos h₁_pos]
 
+structure EpistasisArchitecture where
+  additive_variance : ℝ
+  epistatic_variance : ℝ
+
+noncomputable def totalArchitectureVariance (arch : EpistasisArchitecture) : ℝ :=
+  arch.additive_variance + arch.epistatic_variance
+
 /-- **Additive PGS misses epistatic signal → portability of epistatic component is zero.**
     An additive PGS captures V_A but not V_epistasis. The "missing heritability"
     from epistasis doesn't port because it was never captured. -/
 theorem additive_pgs_misses_epistasis
-    (v_additive v_epistatic v_total : ℝ)
-    (h_total : v_total = v_additive + v_epistatic)
-    (h_epi_pos : 0 < v_epistatic) (h_add_pos : 0 < v_additive) :
-    v_additive / v_total < 1 := by
-  rw [h_total, div_lt_one (by linarith)]
+    (arch : EpistasisArchitecture)
+    (h_epi_pos : 0 < arch.epistatic_variance)
+    (h_add_pos : 0 < arch.additive_variance) :
+    arch.additive_variance / totalArchitectureVariance arch < 1 := by
+  have h_total_pos : 0 < totalArchitectureVariance arch := by
+    unfold totalArchitectureVariance
+    linarith
+  rw [div_lt_one h_total_pos]
+  unfold totalArchitectureVariance
   linarith
 
 end Epistasis
