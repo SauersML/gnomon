@@ -322,19 +322,37 @@ theorem collider_attenuates_association (m : ColliderModel) :
       < m.β_G * 1 := by exact mul_lt_mul_of_pos_left h_ratio_lt_one m.β_G_pos
     _ = m.β_G := by ring
 
+/-- **Differential ascertainment model.**
+    Captures the parameters of a cross-population study where both
+    source and target cohorts undergo ascertainment bias, lowering R². -/
+structure DifferentialAscertainmentModel where
+  r2_source_pop : ℝ
+  r2_target_pop : ℝ
+  r2_source_asc : ℝ
+  r2_target_asc : ℝ
+  -- Ascertainment strictly reduces R² in both populations
+  h_source_asc : r2_source_asc < r2_source_pop
+  h_target_asc : r2_target_asc < r2_target_pop
+  -- The target population suffers less ascertainment penalty than the source
+  h_diff_severity : r2_target_pop - r2_target_asc < r2_source_pop - r2_source_asc
+
+/-- True population-level portability gap. -/
+noncomputable def DifferentialAscertainmentModel.trueGap (m : DifferentialAscertainmentModel) : ℝ :=
+  m.r2_source_pop - m.r2_target_pop
+
+/-- Apparent portability gap observed in the ascertained cohorts. -/
+noncomputable def DifferentialAscertainmentModel.apparentGap (m : DifferentialAscertainmentModel) : ℝ :=
+  m.r2_source_asc - m.r2_target_asc
+
 /-- **Differential ascertainment creates portability artifact.**
     If source and target cohorts have different ascertainment patterns,
-    the apparent portability drop includes an ascertainment component. -/
-theorem differential_ascertainment_artifact
-    (r2_source_pop r2_target_pop r2_source_asc r2_target_asc : ℝ)
-    (h_source_asc : r2_source_asc < r2_source_pop)
-    (h_target_asc : r2_target_asc < r2_target_pop)
-    -- Different ascertainment severity
-    (h_diff_severity : r2_target_pop - r2_target_asc < r2_source_pop - r2_source_asc) :
-    -- Apparent portability drop is larger than true portability drop
-    r2_source_asc - r2_target_asc > r2_source_pop - r2_target_pop →
-      False := by
-  intro h
+    the apparent portability gap differs from the true population gap.
+    Specifically, if target ascertainment penalty is smaller,
+    the apparent portability gap is strictly less than the true gap. -/
+theorem differential_ascertainment_artifact (m : DifferentialAscertainmentModel) :
+    m.apparentGap < m.trueGap := by
+  unfold DifferentialAscertainmentModel.apparentGap DifferentialAscertainmentModel.trueGap
+  have h_diff := m.h_diff_severity
   linarith
 
 end ColliderBias
@@ -514,16 +532,36 @@ theorem survivorship_attenuates_in_older (m : SurvivorshipAttenuationModel) :
       < m.r2_full * 1 := by exact mul_lt_mul_of_pos_left h_ratio_lt_one m.r2_full_pos
     _ = m.r2_full := by ring
 
+/-- **Differential survivorship model.**
+    Captures a scenario where age-structured mortality (survivorship bias)
+    differentially reduces the observed R² in the source and target cohorts. -/
+structure DifferentialSurvivorshipModel where
+  r2_source_full : ℝ
+  r2_target_full : ℝ
+  Δ_surv_source : ℝ
+  Δ_surv_target : ℝ
+  -- Survivorship bias penalties are non-negative
+  h_surv_s : 0 ≤ Δ_surv_source
+  h_surv_t : 0 ≤ Δ_surv_target
+  -- The target population suffers greater survivorship penalty (e.g., older cohort)
+  h_diff : Δ_surv_source < Δ_surv_target
+
+/-- True population-level portability gap (before survivorship bias). -/
+noncomputable def DifferentialSurvivorshipModel.trueGap (m : DifferentialSurvivorshipModel) : ℝ :=
+  m.r2_source_full - m.r2_target_full
+
+/-- Apparent portability gap observed in the age-structured cohorts. -/
+noncomputable def DifferentialSurvivorshipModel.apparentGap (m : DifferentialSurvivorshipModel) : ℝ :=
+  (m.r2_source_full - m.Δ_surv_source) - (m.r2_target_full - m.Δ_surv_target)
+
 /-- **Differential survivorship across populations creates portability artifact.**
-    If the target population has different age structure or mortality patterns,
-    survivorship bias contributes to apparent portability loss. -/
-theorem differential_survivorship_artifact
-    (r2_source_full r2_target_full Δ_surv_source Δ_surv_target : ℝ)
-    (h_surv_s : 0 ≤ Δ_surv_source) (h_surv_t : 0 ≤ Δ_surv_target)
-    (h_diff : Δ_surv_target > Δ_surv_source)
-    (h_obs_s : r2_source_full - Δ_surv_source > 0) :
-    (r2_source_full - Δ_surv_source) - (r2_target_full - Δ_surv_target) >
-      r2_source_full - r2_target_full := by
+    If the target population has different age structure or mortality patterns
+    that lead to greater survivorship bias, the apparent portability gap
+    will be strictly larger than the true population gap. -/
+theorem differential_survivorship_artifact (m : DifferentialSurvivorshipModel) :
+    m.trueGap < m.apparentGap := by
+  unfold DifferentialSurvivorshipModel.apparentGap DifferentialSurvivorshipModel.trueGap
+  have h_diff := m.h_diff
   linarith
 
 end SurvivorshipBias
