@@ -363,6 +363,25 @@ noncomputable def presentDayR2 (V_A V_E fst : ℝ) : ℝ :=
   let v := presentDayPGSVariance V_A fst
   v / (v + V_E)
 
+/-- Variance of a predictor evaluated over a DataGeneratingProcess. -/
+noncomputable def predictorVariance {k : ℕ} [Fintype (Fin k)] (dgp : DataGeneratingProcess k) (signal : Predictor k) : ℝ :=
+  let μ := dgp.jointMeasure
+  let mf : ℝ := ∫ pc, signal pc.1 pc.2 ∂μ
+  ∫ pc, (signal pc.1 pc.2 - mf) ^ 2 ∂μ
+
+/-- Variance of the true expectation function over a DataGeneratingProcess. -/
+noncomputable def expectationVariance {k : ℕ} [Fintype (Fin k)] (dgp : DataGeneratingProcess k) : ℝ :=
+  let μ := dgp.jointMeasure
+  let mg : ℝ := ∫ pc, dgp.trueExpectation pc.1 pc.2 ∂μ
+  ∫ pc, (dgp.trueExpectation pc.1 pc.2 - mg) ^ 2 ∂μ
+
+/-- Covariance between a predictor and the true expectation function over a DataGeneratingProcess. -/
+noncomputable def predictorExpectationCovariance {k : ℕ} [Fintype (Fin k)] (dgp : DataGeneratingProcess k) (signal : Predictor k) : ℝ :=
+  let μ := dgp.jointMeasure
+  let mf : ℝ := ∫ pc, signal pc.1 pc.2 ∂μ
+  let mg : ℝ := ∫ pc, dgp.trueExpectation pc.1 pc.2 ∂μ
+  ∫ pc, (signal pc.1 pc.2 - mf) * (dgp.trueExpectation pc.1 pc.2 - mg) ∂μ
+
 /-- Exact bridge theorem: the dashboard algebraic `presentDayR2` equals statistical
 `rsquared` when the relevant second-moment identities hold. -/
 theorem presentDayR2_eq_statistical_rsquared
@@ -370,21 +389,9 @@ theorem presentDayR2_eq_statistical_rsquared
     (dgp : DataGeneratingProcess k)
     (signal : Predictor k)
     (V_A V_E fst : ℝ)
-    (h_vf :
-      (let μ := dgp.jointMeasure
-       let mf : ℝ := ∫ pc, signal pc.1 pc.2 ∂μ
-       ∫ pc, (signal pc.1 pc.2 - mf) ^ 2 ∂μ) = presentDayPGSVariance V_A fst)
-    (h_vg :
-      (let μ := dgp.jointMeasure
-       let mg : ℝ := ∫ pc, dgp.trueExpectation pc.1 pc.2 ∂μ
-       ∫ pc, (dgp.trueExpectation pc.1 pc.2 - mg) ^ 2 ∂μ) =
-        presentDayPGSVariance V_A fst + V_E)
-    (h_cov :
-      (let μ := dgp.jointMeasure
-       let mf : ℝ := ∫ pc, signal pc.1 pc.2 ∂μ
-       let mg : ℝ := ∫ pc, dgp.trueExpectation pc.1 pc.2 ∂μ
-       ∫ pc, (signal pc.1 pc.2 - mf) * (dgp.trueExpectation pc.1 pc.2 - mg) ∂μ) =
-        presentDayPGSVariance V_A fst)
+    (h_vf : predictorVariance dgp signal = presentDayPGSVariance V_A fst)
+    (h_vg : expectationVariance dgp = presentDayPGSVariance V_A fst + V_E)
+    (h_cov : predictorExpectationCovariance dgp signal = presentDayPGSVariance V_A fst)
     (h_vsig_pos : 0 < presentDayPGSVariance V_A fst)
     (h_vtrue_pos : 0 < presentDayPGSVariance V_A fst + V_E) :
     presentDayR2 V_A V_E fst = rsquared dgp signal dgp.trueExpectation := by
@@ -400,6 +407,9 @@ theorem presentDayR2_eq_statistical_rsquared
       rsquared dgp signal dgp.trueExpectation = (presentDayPGSVariance V_A fst) ^ 2 /
           (presentDayPGSVariance V_A fst * (presentDayPGSVariance V_A fst + V_E)) := by
     unfold rsquared
+    unfold predictorVariance at h_vf
+    unfold expectationVariance at h_vg
+    unfold predictorExpectationCovariance at h_cov
     simp [h_vf, h_vg, h_cov, h_if_not]
   rw [h_rs]
   unfold presentDayR2
