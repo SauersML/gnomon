@@ -514,17 +514,41 @@ theorem survivorship_attenuates_in_older (m : SurvivorshipAttenuationModel) :
       < m.r2_full * 1 := by exact mul_lt_mul_of_pos_left h_ratio_lt_one m.r2_full_pos
     _ = m.r2_full := by ring
 
+/-- **Bi-Population Survivorship Model.**
+    A model to evaluate portability between two populations with potentially
+    different survivorship bias severity. -/
+structure BiPopulationSurvivorshipModel where
+  source : SurvivorshipAttenuationModel
+  target : SurvivorshipAttenuationModel
+  /-- The target population experiences more severe survivorship bias (greater variance reduction) -/
+  differential_bias : target.var_surv / target.var_birth < source.var_surv / source.var_birth
+
+/-- True portability gap based on the underlying birth-cohort R² -/
+noncomputable def BiPopulationSurvivorshipModel.truePortabilityGap (m : BiPopulationSurvivorshipModel) : ℝ :=
+  m.source.r2_full - m.target.r2_full
+
+/-- Apparent portability gap based on observed R² among survivors -/
+noncomputable def BiPopulationSurvivorshipModel.apparentPortabilityGap (m : BiPopulationSurvivorshipModel) : ℝ :=
+  m.source.r2_surv - m.target.r2_surv
+
 /-- **Differential survivorship across populations creates portability artifact.**
     If the target population has different age structure or mortality patterns,
     survivorship bias contributes to apparent portability loss. -/
-theorem differential_survivorship_artifact
-    (r2_source_full r2_target_full Δ_surv_source Δ_surv_target : ℝ)
-    (h_surv_s : 0 ≤ Δ_surv_source) (h_surv_t : 0 ≤ Δ_surv_target)
-    (h_diff : Δ_surv_target > Δ_surv_source)
-    (h_obs_s : r2_source_full - Δ_surv_source > 0) :
-    (r2_source_full - Δ_surv_source) - (r2_target_full - Δ_surv_target) >
-      r2_source_full - r2_target_full := by
-  linarith
+theorem differential_survivorship_artifact (m : BiPopulationSurvivorshipModel)
+    (h_equal_true : m.source.r2_full = m.target.r2_full) :
+    m.truePortabilityGap < m.apparentPortabilityGap := by
+  unfold BiPopulationSurvivorshipModel.truePortabilityGap
+  unfold BiPopulationSurvivorshipModel.apparentPortabilityGap
+  rw [h_equal_true, sub_self]
+  have h_source_surv_eq : m.source.r2_surv = m.source.r2_full * (m.source.var_surv / m.source.var_birth) := rfl
+  have h_target_surv_eq : m.target.r2_surv = m.target.r2_full * (m.target.var_surv / m.target.var_birth) := rfl
+  rw [h_source_surv_eq, h_target_surv_eq, h_equal_true]
+  have h_r2_pos : 0 < m.target.r2_full := m.target.r2_full_pos
+  -- 0 < r2_full * (source_ratio - target_ratio)
+  -- 0 < r2_full * source_ratio - r2_full * target_ratio
+  -- target_ratio < source_ratio
+  have : m.target.var_surv / m.target.var_birth < m.source.var_surv / m.source.var_birth := m.differential_bias
+  nlinarith [mul_lt_mul_of_pos_left this h_r2_pos]
 
 end SurvivorshipBias
 
