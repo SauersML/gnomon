@@ -34,29 +34,43 @@ benefit across ancestry groups.
 
 section HealthDisparity
 
+/-- Model for clinical utility mapping PGS R² to population benefit. -/
+structure ClinicalUtilityModel where
+  /-- The base benefit per unit of R² -/
+  α : ℝ
+  /-- Benefit scales positively with R² -/
+  h_α : 0 < α
+
+/-- Net clinical benefit is the model's alpha applied to the population R² -/
+noncomputable def ClinicalUtilityModel.benefit (m : ClinicalUtilityModel) (r2 : ℝ) : ℝ :=
+  m.α * r2
+
+
 /-- **Clinical utility depends on PGS R².**
     The net clinical benefit from PGS-guided care is monotonically
     increasing in R². We model benefit = α × R² for a positive
     proportionality constant α (benefit per unit R²). When
     R²₁ < R²₂, the benefit in population 1 is strictly less. -/
 theorem clinical_benefit_increases_with_r2
-    (α r2₁ r2₂ : ℝ)
-    (h_α : 0 < α)
+    (m : ClinicalUtilityModel) (r2₁ r2₂ : ℝ)
     (h_r2 : r2₁ < r2₂) :
-    α * r2₁ < α * r2₂ := by
-  exact mul_lt_mul_of_pos_left h_r2 h_α
+    m.benefit r2₁ < m.benefit r2₂ := by
+  unfold ClinicalUtilityModel.benefit
+  exact mul_lt_mul_of_pos_left h_r2 m.h_α
 
 /-- **Portability gap creates benefit gap.**
     If R²_EUR > R²_AFR and benefit = α × R² with α > 0, then
     clinical benefit for EUR patients exceeds that for AFR patients.
     The benefit gap α × (R²_EUR - R²_AFR) > 0 follows from the R² gap. -/
+
 theorem portability_creates_benefit_gap
-    (α r2_eur r2_afr : ℝ)
-    (h_α : 0 < α)
+    (m : ClinicalUtilityModel) (r2_eur r2_afr : ℝ)
     (h_r2_gap : r2_afr < r2_eur)
     (h_nn : 0 ≤ r2_afr) :
-    0 < α * r2_eur - α * r2_afr := by
+    0 < m.benefit r2_eur - m.benefit r2_afr := by
+  unfold ClinicalUtilityModel.benefit
   have : r2_eur - r2_afr > 0 := by linarith
+  have h_α : 0 < m.α := m.h_α
   nlinarith
 
 /-- **Disparity increases with Fst from discovery population.**
@@ -67,8 +81,8 @@ theorem portability_creates_benefit_gap
 theorem disparity_increases_with_distance
     (R2_source fst₁ fst₂ : ℝ)
     (h_R2 : 0 < R2_source)
-    (h_fst₁_pos : 0 < fst₁) (h_fst₁_lt : fst₁ < 1)
-    (h_fst₂_pos : 0 < fst₂) (h_fst₂_lt : fst₂ < 1)
+    (h_fst₁_lt : fst₁ < 1)
+    (h_fst₂_lt : fst₂ < 1)
     (h_fst : fst₁ < fst₂) :
     -- R² loss at fst₁ < R² loss at fst₂
     R2_source * (1 - (1 - fst₁) ^ 2) < R2_source * (1 - (1 - fst₂) ^ 2) := by
@@ -82,21 +96,31 @@ theorem disparity_increases_with_distance
     gets no PGS benefit, so the pre-existing disparity d₀ ≥ 0 grows
     to d₀ + α × R²_eur. -/
 theorem deployment_amplifies_disparity
-    (d₀ α r2_eur : ℝ)
-    (h_nn : 0 ≤ d₀)
-    (h_α : 0 < α) (h_r2 : 0 < r2_eur) :
-    d₀ < d₀ + α * r2_eur := by
+    (m : ClinicalUtilityModel) (d₀ r2_eur : ℝ)
+    (h_r2 : 0 < r2_eur) :
+    d₀ < d₀ + m.benefit r2_eur := by
+  unfold ClinicalUtilityModel.benefit
+  have h_α : 0 < m.α := m.h_α
   linarith [mul_pos h_α h_r2]
 
-/-- **QALY gap from portability.**
-    QALYs gained = γ × R² for a positive constant γ (QALYs per unit R²).
-    The QALY gap between two populations is γ × (R²₁ - R²₂), which is
-    positive when R²₁ > R²₂. Derived from the model, not assumed. -/
+/-- QALYs gained = γ × R² for a positive constant γ (QALYs per unit R²). -/
+structure QALYModel where
+  /-- QALYs per unit of R² -/
+  γ : ℝ
+  /-- Gamma is positive -/
+  h_γ : 0 < γ
+
+/-- The total QALYs gained from a PGS with accuracy R² -/
+noncomputable def QALYModel.qaly (m : QALYModel) (r2 : ℝ) : ℝ :=
+  m.γ * r2
+
 theorem qaly_gap_proportional_to_r2_gap
-    (γ r2₁ r2₂ : ℝ)
-    (h_γ : 0 < γ) (h_gap : r2₂ < r2₁) :
-    0 < γ * r2₁ - γ * r2₂ := by
+    (m : QALYModel) (r2₁ r2₂ : ℝ)
+    (h_gap : r2₂ < r2₁) :
+    0 < m.qaly r2₁ - m.qaly r2₂ := by
+  unfold QALYModel.qaly
   have : r2₁ - r2₂ > 0 := by linarith
+  have h_γ : 0 < m.γ := m.h_γ
   nlinarith
 
 end HealthDisparity
@@ -125,7 +149,6 @@ theorem chouldechova_impossibility
     (h_K₁ : 0 < K₁) (h_K₁' : K₁ < 1)
     (h_K₂ : 0 < K₂) (h_K₂' : K₂ < 1)
     (h_fpr : 0 < fpr) (h_fnr_lt : fnr < 1)
-    (h_fnr_nn : 0 ≤ fnr)
     -- PPV = K × (1-FNR) / (K × (1-FNR) + (1-K) × FPR)
     (h_ppv₁_def : ppv₁ = K₁ * (1 - fnr) / (K₁ * (1 - fnr) + (1 - K₁) * fpr))
     (h_ppv₂_def : ppv₂ = K₂ * (1 - fnr) / (K₂ * (1 - fnr) + (1 - K₂) * fpr)) :
@@ -296,9 +319,7 @@ section ClinicalImplementation
     (R² < cost / α), the net value is negative. -/
 theorem r2_threshold_for_utility
     (r2 α cost : ℝ)
-    (h_α : 0 < α) (h_cost : 0 < cost)
-    (h_r2_nn : 0 ≤ r2)
-    (h_below : r2 < cost / α) :
+    (h_α : 0 < α) (h_below : r2 < cost / α) :
     -- PGS net value is negative in this population
     α * r2 - cost < 0 := by
   have : r2 * α < cost := by rwa [lt_div_iff₀ h_α] at h_below
@@ -321,7 +342,6 @@ theorem r2_threshold_for_utility
 theorem validation_n_depends_on_r2
     (r2_source r2_target delta : ℝ)
     (h_r2_target_smaller : r2_target < r2_source)
-    (h_r2_source : 0 < r2_source) (h_r2_target : 0 < r2_target)
     (h_delta : 0 < delta)
     (h_r2_source_lt : r2_source < 1) (h_r2_target_lt : r2_target < 1) :
     -- n/R² = 4(1-R²)²/δ² is larger for the target (smaller R²)
