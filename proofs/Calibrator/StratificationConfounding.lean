@@ -516,15 +516,22 @@ theorem survivorship_attenuates_in_older (m : SurvivorshipAttenuationModel) :
 
 /-- **Differential survivorship across populations creates portability artifact.**
     If the target population has different age structure or mortality patterns,
-    survivorship bias contributes to apparent portability loss. -/
-theorem differential_survivorship_artifact
-    (r2_source_full r2_target_full Δ_surv_source Δ_surv_target : ℝ)
-    (h_surv_s : 0 ≤ Δ_surv_source) (h_surv_t : 0 ≤ Δ_surv_target)
-    (h_diff : Δ_surv_target > Δ_surv_source)
-    (h_obs_s : r2_source_full - Δ_surv_source > 0) :
-    (r2_source_full - Δ_surv_source) - (r2_target_full - Δ_surv_target) >
-      r2_source_full - r2_target_full := by
-  linarith
+    survivorship bias contributes to apparent portability loss.
+    We model this by comparing two populations with identical true R² but
+    different degrees of variance reduction due to survivorship. -/
+structure DifferentialSurvivorshipModel where
+  source : SurvivorshipAttenuationModel
+  target : SurvivorshipAttenuationModel
+  /-- True full-population R² is identical (no true portability loss) -/
+  same_full_r2 : source.r2_full = target.r2_full
+  /-- Target population undergoes stronger selection (greater variance reduction) -/
+  target_stronger_selection : target.var_surv / target.var_birth < source.var_surv / source.var_birth
+
+theorem differential_survivorship_artifact (m : DifferentialSurvivorshipModel) :
+    m.target.r2_surv < m.source.r2_surv := by
+  unfold SurvivorshipAttenuationModel.r2_surv
+  rw [m.same_full_r2]
+  exact mul_lt_mul_of_pos_left m.target_stronger_selection m.target.r2_full_pos
 
 end SurvivorshipBias
 
@@ -702,12 +709,16 @@ theorem instrument_strength_decreases (m : MRInstrumentModel)
     Bias = (1 - 1/F) × confounding bias.
     As F decreases (weaker instrument), bias increases toward the
     confounded OLS estimate. -/
+noncomputable def weakInstrumentConfoundingBias (conf_bias F : ℝ) : ℝ :=
+  (1 - 1 / F) * conf_bias
+
 theorem weak_instrument_bias_increases
-    (conf_bias : ℝ) (F₁ F₂ : ℝ)
+    (conf_bias F₁ F₂ : ℝ)
     (h_conf : 0 < conf_bias)
     (h_F₁ : 1 < F₁) (h_F₂ : 1 < F₂)
     (h_weaker : F₂ < F₁) :
-    (1 - 1/F₂) * conf_bias < (1 - 1/F₁) * conf_bias := by
+    weakInstrumentConfoundingBias conf_bias F₂ < weakInstrumentConfoundingBias conf_bias F₁ := by
+  unfold weakInstrumentConfoundingBias
   apply mul_lt_mul_of_pos_right _ h_conf
   have h1 : 1/F₁ < 1/F₂ := by
     rw [div_lt_div_iff₀ (by linarith) (by linarith)]
@@ -716,12 +727,28 @@ theorem weak_instrument_bias_increases
 
 /-- **Horizontal pleiotropy patterns differ across populations.**
     If pleiotropic effects change across populations (due to different
-    LD patterns or gene regulation), MR estimates are not portable. -/
+    LD patterns or gene regulation), MR estimates are not portable.
+    We model this using a generic MR setup with a shared causal effect
+    but potentially population-specific pleiotropic bias. -/
+structure PleiotropyModel where
+  /-- True causal effect (portable) -/
+  β_causal : ℝ
+  /-- Pleiotropic bias (population-specific) -/
+  α_pleio : ℝ
+
+/-- The observed MR estimate is the sum of the causal and pleiotropic effects -/
+noncomputable def PleiotropyModel.observed_effect (m : PleiotropyModel) : ℝ :=
+  m.β_causal + m.α_pleio
+
 theorem pleiotropy_changes_invalidate_mr
-    (β_causal α_pleio_source α_pleio_target : ℝ)
-    (h_diff : α_pleio_source ≠ α_pleio_target) :
-    β_causal + α_pleio_source ≠ β_causal + α_pleio_target := by
-  intro h; exact h_diff (by linarith)
+    (source target : PleiotropyModel)
+    (h_same_causal : source.β_causal = target.β_causal)
+    (h_diff_pleio : source.α_pleio ≠ target.α_pleio) :
+    source.observed_effect ≠ target.observed_effect := by
+  unfold PleiotropyModel.observed_effect
+  rw [h_same_causal]
+  intro h
+  exact h_diff_pleio (by linarith)
 
 end MRPortability
 
