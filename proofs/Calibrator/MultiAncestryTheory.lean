@@ -25,6 +25,10 @@ section GWASDiversity
 /- **GWAS sample genetic distance from target.**
     d_GWAS(target) = weighted distance from target individual to GWAS centroid. -/
 
+/-- Multi-ancestry GWAS fraction Fst calculation. -/
+noncomputable def multiAncestryFst (d₁ d₂ α : ℝ) : ℝ :=
+  (1 - α) * d₁ + α * d₂
+
 /-- **Multi-ancestry GWAS reduces effective Fst.**
     A multi-ancestry GWAS with fraction α from a second ancestry
     at Fst distance d₂ from the target (and the primary ancestry at
@@ -41,10 +45,8 @@ theorem multi_ancestry_reduces_fst
     (h_d₂_closer : d₂ < d₁)
     (h_d₁_le_one : d₁ ≤ 1)
     (h_α_pos : 0 < α) :
-    let fst_single := d₁
-    let fst_multi := (1 - α) * d₁ + α * d₂
-    presentDayR2 V_A V_E fst_multi > presentDayR2 V_A V_E fst_single := by
-  simp only
+    presentDayR2 V_A V_E (multiAncestryFst d₁ d₂ α) > presentDayR2 V_A V_E d₁ := by
+  unfold multiAncestryFst
   have h_multi_lt_single : (1 - α) * d₁ + α * d₂ < d₁ := by
     nlinarith
   simpa using
