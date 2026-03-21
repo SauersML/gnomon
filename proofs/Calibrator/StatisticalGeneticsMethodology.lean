@@ -395,20 +395,58 @@ drops to `3/4`.
 
 This formalizes the biological point that equal source `R²` does not determine
 cross-population portability without locus-resolved transport state. -/
-theorem same_source_r2_different_portability_two_locus_witness :
-    let sourceSignal : Fin 2 → ℝ := fun _ => 1
-    let stableTransport : Fin 2 → ℝ := fun _ => 1
-    let brokenTransport : Fin 2 → ℝ := fun i => if i = 0 then 1 else 0
-    let sourceVariance : ℝ := ∑ l, sourceSignal l
-    let stableTargetVariance : ℝ := ∑ l, sourceSignal l * stableTransport l
-    let brokenTargetVariance : ℝ := ∑ l, sourceSignal l * brokenTransport l
-    let sourceR2 := TransportedMetrics.r2FromSignalVariance sourceVariance 1
-    let stableTargetR2 := TransportedMetrics.r2FromSignalVariance stableTargetVariance 1
-    let brokenTargetR2 := TransportedMetrics.r2FromSignalVariance brokenTargetVariance 1
-    sourceR2 = stableTargetR2 ∧
-    brokenTargetR2 < stableTargetR2 ∧
-    brokenTargetR2 / sourceR2 = (3 : ℝ) / 4 := by
-  simp [TransportedMetrics.r2FromSignalVariance]
+structure TwoLocusTransportModel where
+  sourceSignal : Fin 2 → ℝ
+  stableTransport : Fin 2 → ℝ
+  brokenTransport : Fin 2 → ℝ
+
+/-- Total source signal variance. -/
+noncomputable def TwoLocusTransportModel.sourceVariance (m : TwoLocusTransportModel) : ℝ :=
+  ∑ l, m.sourceSignal l
+
+/-- Total target signal variance under stable transport. -/
+noncomputable def TwoLocusTransportModel.stableTargetVariance (m : TwoLocusTransportModel) : ℝ :=
+  ∑ l, m.sourceSignal l * m.stableTransport l
+
+/-- Total target signal variance under broken transport. -/
+noncomputable def TwoLocusTransportModel.brokenTargetVariance (m : TwoLocusTransportModel) : ℝ :=
+  ∑ l, m.sourceSignal l * m.brokenTransport l
+
+/-- R² in source population. -/
+noncomputable def TwoLocusTransportModel.sourceR2 (m : TwoLocusTransportModel) (residual : ℝ) : ℝ :=
+  TransportedMetrics.r2FromSignalVariance m.sourceVariance residual
+
+/-- R² in target population under stable transport. -/
+noncomputable def TwoLocusTransportModel.stableTargetR2 (m : TwoLocusTransportModel) (residual : ℝ) : ℝ :=
+  TransportedMetrics.r2FromSignalVariance m.stableTargetVariance residual
+
+/-- R² in target population under broken transport. -/
+noncomputable def TwoLocusTransportModel.brokenTargetR2 (m : TwoLocusTransportModel) (residual : ℝ) : ℝ :=
+  TransportedMetrics.r2FromSignalVariance m.brokenTargetVariance residual
+
+theorem same_source_r2_different_portability_two_locus_witness
+    (m : TwoLocusTransportModel)
+    (h_signal : ∀ i, m.sourceSignal i = 1)
+    (h_stable : ∀ i, m.stableTransport i = 1)
+    (h_broken0 : m.brokenTransport 0 = 1)
+    (h_broken1 : m.brokenTransport 1 = 0) :
+    m.sourceR2 1 = m.stableTargetR2 1 ∧
+    m.brokenTargetR2 1 < m.stableTargetR2 1 ∧
+    m.brokenTargetR2 1 / m.sourceR2 1 = (3 : ℝ) / 4 := by
+  have h_sv : m.sourceVariance = 2 := by
+    dsimp [TwoLocusTransportModel.sourceVariance]
+    rw [Fin.sum_univ_two, h_signal 0, h_signal 1]
+    norm_num
+  have h_stv : m.stableTargetVariance = 2 := by
+    dsimp [TwoLocusTransportModel.stableTargetVariance]
+    rw [Fin.sum_univ_two, h_signal 0, h_signal 1, h_stable 0, h_stable 1]
+    norm_num
+  have h_btv : m.brokenTargetVariance = 1 := by
+    dsimp [TwoLocusTransportModel.brokenTargetVariance]
+    rw [Fin.sum_univ_two, h_signal 0, h_signal 1, h_broken0, h_broken1]
+    norm_num
+  simp [TwoLocusTransportModel.sourceR2, TwoLocusTransportModel.stableTargetR2, TwoLocusTransportModel.brokenTargetR2,
+        TransportedMetrics.r2FromSignalVariance, h_sv, h_stv, h_btv]
   norm_num
 
 end SourceR2Insufficiency
