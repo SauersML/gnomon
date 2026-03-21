@@ -473,6 +473,18 @@ variants captured by GWAS.
 
 section AnthropometricTraits
 
+/-- Deviation of effect correlation from 1 under the infinitesimal model. -/
+noncomputable def infinitesimalDelta (c : ℝ) (n : ℕ) : ℝ :=
+  c / n
+
+/-- Effect correlation ρ under the infinitesimal model. -/
+noncomputable def infinitesimalRho (c : ℝ) (n : ℕ) : ℝ :=
+  1 - infinitesimalDelta c n
+
+/-- Portability gap proportional to 1 - ρ². -/
+noncomputable def infinitesimalGap (c : ℝ) (n : ℕ) : ℝ :=
+  1 - (infinitesimalRho c n) ^ 2
+
 /-- **Near-neutral portability for highly polygenic traits.**
     For highly polygenic traits under stabilizing selection toward
     a shared optimum, effect correlation ρ ≈ 1. The portability
@@ -490,11 +502,8 @@ theorem near_neutral_portability_highly_polygenic
     (c : ℝ) (n : ℕ)
     (h_c_pos : 0 < c) (_h_c_le : c ≤ 1)
     (h_n_large : 1 < n) :
-    let delta := c / n
-    let rho := 1 - delta
-    let gap := 1 - rho ^ 2  -- portability gap proportional to 1 - ρ²
-    gap < 2 * c / n := by
-  simp only
+    infinitesimalGap c n < 2 * c / n := by
+  unfold infinitesimalGap infinitesimalRho infinitesimalDelta
   have h_n_pos : (0 : ℝ) < (n : ℝ) := Nat.cast_pos.mpr (by omega)
   -- gap = 1 - (1 - c/n)² = 2c/n - (c/n)²
   have h_expand : 1 - (1 - c / ↑n) ^ 2 = 2 * c / ↑n - (c / ↑n) ^ 2 := by ring
