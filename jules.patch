@@ -1,0 +1,27 @@
+diff --git a/proofs/Calibrator/MendelianRandomization.lean b/proofs/Calibrator/MendelianRandomization.lean
+index 9b46550..24f7292 100644
+--- a/proofs/Calibrator/MendelianRandomization.lean
++++ b/proofs/Calibrator/MendelianRandomization.lean
+@@ -99,13 +99,16 @@ section CrossAncestryInstruments
+ /-- **Instrument strength varies across ancestries.**
+     An instrument selected in one population (source) may be a weak instrument
+     in another (target) because LD between instrument and causal variant differs.
+-    When the source F-statistic exceeds a threshold but the target falls below it,
+-    the target instrument is strictly weaker. -/
++    Here we show that for a fixed sample size, a lower proportion of variance
++    explained (R²) in the target ancestry results in a weaker instrument
++    (lower F-statistic). -/
+ theorem instrument_strength_varies
+-    (f_stat_source f_stat_target threshold : ℝ)
+-    (h_strong_source : threshold < f_stat_source)
+-    (h_weak_target : f_stat_target < threshold) :
+-    f_stat_target < f_stat_source := by linarith
++    (n : ℕ) (r2_source r2_target : ℝ)
++    (h_n : 2 < n) (h_r2_t : 0 < r2_target) (h_r2_s : 0 < r2_source)
++    (h_r2_t_lt : r2_target < 1) (h_r2_s_lt : r2_source < 1)
++    (h_ld_decay : r2_target < r2_source) :
++    fStatistic n r2_target < fStatistic n r2_source := by
++  exact f_stat_increases_with_r2 n r2_target r2_source h_n h_r2_t h_r2_s h_r2_t_lt h_r2_s_lt h_ld_decay
+ 
+ /-- **LD proxy instruments weaken across ancestry.**
+     In MR, we often use a proxy SNP (in LD with causal SNP).
