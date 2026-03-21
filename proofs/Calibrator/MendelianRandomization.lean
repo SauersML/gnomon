@@ -298,26 +298,83 @@ that can mimic or mask portability effects.
 
 section ColliderBias
 
+/-- Model for genetic and environmental effects on a selection process in MR. -/
+structure MRColliderModel where
+  beta_true : ℝ
+  genetic_effect_on_selection : ℝ
+  environment_effect_on_selection : ℝ
+  genetic_environment_covariance : ℝ
+
+/-- The amount of bias introduced by selection in MR. -/
+noncomputable def mrColliderBiasAmount (m : MRColliderModel) : ℝ :=
+  m.genetic_effect_on_selection * m.environment_effect_on_selection * m.genetic_environment_covariance
+
+/-- The observed genetic effect after selection bias in MR. -/
+noncomputable def mrObservedGeneticEffect (m : MRColliderModel) : ℝ :=
+  m.beta_true + mrColliderBiasAmount m
+
 /-- **Survivorship creates collider bias.**
     If the study conditions on survival (e.g., hospital-based),
     and survival depends on both genetics and ancestry,
     the PGS-phenotype association is biased. -/
 theorem collider_bias_from_selection
-    (beta_true beta_observed selection_bias : ℝ)
-    (h_biased : beta_observed = beta_true + selection_bias)
-    (h_bias_nn : selection_bias ≠ 0) :
-    beta_observed ≠ beta_true := by
-  rw [h_biased]; intro h; apply h_bias_nn; linarith
+    (m : MRColliderModel)
+    (h_g : m.genetic_effect_on_selection ≠ 0)
+    (h_e : m.environment_effect_on_selection ≠ 0)
+    (h_cov : m.genetic_environment_covariance ≠ 0) :
+    mrObservedGeneticEffect m ≠ m.beta_true := by
+  unfold mrObservedGeneticEffect mrColliderBiasAmount
+  intro h
+  have h_zero : m.genetic_effect_on_selection * m.environment_effect_on_selection * m.genetic_environment_covariance = 0 := by linarith
+  rcases mul_eq_zero.mp h_zero with h1 | h_cov_zero
+  · rcases mul_eq_zero.mp h1 with h_g_zero | h_e_zero
+    · exact h_g h_g_zero
+    · exact h_e h_e_zero
+  · exact h_cov h_cov_zero
+
+/-- Model for index event bias (conditioning on disease status). -/
+structure IndexEventModel where
+  beta_prognosis_true : ℝ
+  pgs_diagnosis_effect : ℝ
+  unmeasured_confounder_effect : ℝ
+
+/-- The amount of index event bias. -/
+noncomputable def indexEventBiasAmount (m : IndexEventModel) : ℝ :=
+  - m.pgs_diagnosis_effect * m.unmeasured_confounder_effect
+
+/-- The observed prognosis effect after index event bias. -/
+noncomputable def observedPrognosisEffect (m : IndexEventModel) : ℝ :=
+  m.beta_prognosis_true + indexEventBiasAmount m
 
 /-- **Index event bias in PGS studies.**
     Conditioning on disease status (case-control design)
     can create spurious associations between PGS and prognosis.
     This is more severe when PGS is ancestry-specific. -/
 theorem index_event_bias
-    (beta_prognosis_true beta_prognosis_biased pgs_diagnosis_effect : ℝ)
-    (h_bias : beta_prognosis_biased = beta_prognosis_true - pgs_diagnosis_effect)
-    (h_effect : 0 < pgs_diagnosis_effect) :
-    beta_prognosis_biased < beta_prognosis_true := by linarith
+    (m : IndexEventModel)
+    (h_diag : 0 < m.pgs_diagnosis_effect)
+    (h_conf : 0 < m.unmeasured_confounder_effect) :
+    observedPrognosisEffect m < m.beta_prognosis_true := by
+  unfold observedPrognosisEffect indexEventBiasAmount
+  nlinarith
+
+/-- Model for Berkson's paradox due to differential selection in biobanks. -/
+structure BerksonBiobankModel where
+  beta_population : ℝ
+  participation_rate_eur : ℝ
+  participation_rate_afr : ℝ
+  selection_pressure : ℝ
+
+/-- The amount of selection bias based on participation rate. -/
+noncomputable def biobankSelectionBias (participation_rate selection_pressure : ℝ) : ℝ :=
+  selection_pressure * (1 - participation_rate)
+
+/-- The observed biobank effect in a specific ancestry. -/
+noncomputable def observedBiobankEffect (m : BerksonBiobankModel) (is_eur : Bool) : ℝ :=
+  if is_eur then
+    m.beta_population + biobankSelectionBias m.participation_rate_eur m.selection_pressure
+  else
+    m.beta_population + biobankSelectionBias m.participation_rate_afr m.selection_pressure
 
 /-- **Berkson's paradox in biobank studies.**
     Biobank participants are healthier and more educated than
@@ -325,13 +382,26 @@ theorem index_event_bias
     differently across ancestries.
     Model: β_biobank = β_pop + selection_bias, where the selection bias
     differs by ancestry (different participation rates and selection pressures).
-    If bias_eur ≠ bias_afr, then β_biobank_eur ≠ β_biobank_afr even when
-    the true population-level effect is the same. -/
+    If participation rates differ across ancestry, the estimated PGS effect differs
+    even when the true population-level effect is the same. -/
 theorem berkson_paradox_ancestry_specific
-    (beta_population bias_eur bias_afr : ℝ)
-    (h_diff_bias : bias_eur ≠ bias_afr) :
-    beta_population + bias_eur ≠ beta_population + bias_afr := by
-  intro h; exact h_diff_bias (by linarith)
+    (m : BerksonBiobankModel)
+    (h_pressure : m.selection_pressure ≠ 0)
+    (h_diff_rates : m.participation_rate_eur ≠ m.participation_rate_afr) :
+    observedBiobankEffect m true ≠ observedBiobankEffect m false := by
+  unfold observedBiobankEffect biobankSelectionBias
+  intro h
+  have h1 : m.beta_population + m.selection_pressure * (1 - m.participation_rate_eur) = m.beta_population + m.selection_pressure * (1 - m.participation_rate_afr) := by
+    exact h
+  have h2 : m.selection_pressure * (1 - m.participation_rate_eur) = m.selection_pressure * (1 - m.participation_rate_afr) := by linarith
+  have h3 : m.selection_pressure - m.selection_pressure * m.participation_rate_eur = m.selection_pressure - m.selection_pressure * m.participation_rate_afr := by
+    calc
+      m.selection_pressure - m.selection_pressure * m.participation_rate_eur = m.selection_pressure * (1 - m.participation_rate_eur) := by ring
+      _ = m.selection_pressure * (1 - m.participation_rate_afr) := h2
+      _ = m.selection_pressure - m.selection_pressure * m.participation_rate_afr := by ring
+  have h4 : m.selection_pressure * m.participation_rate_eur = m.selection_pressure * m.participation_rate_afr := by linarith
+  have h5 : m.participation_rate_eur = m.participation_rate_afr := mul_left_cancel₀ h_pressure h4
+  exact h_diff_rates h5
 
 end ColliderBias
 
