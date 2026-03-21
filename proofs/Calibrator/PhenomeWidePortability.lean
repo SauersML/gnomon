@@ -350,6 +350,15 @@ neutral expectation, reflecting pathogen-driven divergent selection.
 
 section ImmuneTraits
 
+/-- Model of genomic region variance contribution. -/
+structure RegionVarianceModel where
+  r2_region : ℝ
+  r2_genome_wide : ℝ
+  n_region_snps : ℝ
+  n_total_snps : ℝ
+  h_r2_gw_pos : 0 < r2_genome_wide
+  h_snps_pos : 0 < n_total_snps
+
 /-- **Genomic region dominates trait architecture disproportionately.**
     A genomic region that occupies a small fraction of the genome can
     contribute a disproportionately large fraction of genetic variance
@@ -360,13 +369,18 @@ section ImmuneTraits
     Worked example: HLA region (~6p21) contains <1% of SNPs but >10%
     of immune trait variance due to balancing/diversifying selection. -/
 theorem region_disproportionate_variance
-    (r2_region r2_genome_wide n_region_snps n_total_snps bound : ℝ)
-    (h_snp_fraction : n_region_snps / n_total_snps < bound)
-    (h_var_fraction : bound < r2_region / r2_genome_wide)
-    (_h_r2_gw : 0 < r2_genome_wide) (_h_snps : 0 < n_total_snps) :
-    -- Region contributes more variance per SNP than genome average
-    n_region_snps / n_total_snps < r2_region / r2_genome_wide := by
+    (model : RegionVarianceModel)
+    (bound : ℝ)
+    (h_snp_fraction : model.n_region_snps / model.n_total_snps < bound)
+    (h_var_fraction : bound < model.r2_region / model.r2_genome_wide) :
+    model.n_region_snps / model.n_total_snps < model.r2_region / model.r2_genome_wide := by
   linarith
+
+/-- Model of selection shift reducing effect correlation. -/
+structure SelectionShiftModel where
+  rho_baseline : ℝ
+  δ_selection : ℝ
+  h_selection_pos : 0 < δ_selection
 
 /-- **Subtracting a positive selection shift lowers a scalar effect-correlation
 coordinate.**
@@ -374,31 +388,45 @@ coordinate.**
     bookkeeping lemma for downstream biological interpretations, not by itself
     a mechanistic selection theorem. -/
 theorem positive_selection_shift_lowers_scalar_effect_correlation
-    (rho_baseline δ_selection : ℝ)
-    (h_selection : 0 < δ_selection) :
-    rho_baseline - δ_selection < rho_baseline := by linarith
+    (model : SelectionShiftModel) :
+    model.rho_baseline - model.δ_selection < model.rho_baseline := by
+  linarith [model.h_selection_pos]
+
+/-- Model of portability gap analysis via a threshold sandwich. -/
+structure PortabilityThresholdModel where
+  port_observed : ℝ
+  port_neutral : ℝ
+  threshold : ℝ
+  h_observed_lt : port_observed < threshold
+  h_neutral_gt : threshold < port_neutral
 
 /-- **A threshold sandwich implies observed portability is below neutral.**
     This is the literal transitivity fact `port_observed < threshold < port_neutral
     -> port_observed < port_neutral`. It is useful as a small inference step,
     but it is not by itself a mechanistic theorem about why the gap exists. -/
 theorem threshold_sandwich_implies_observed_portability_below_neutral
-    (port_observed port_neutral threshold : ℝ)
-    (h_observed : port_observed < threshold)
-    (h_neutral : threshold < port_neutral) :
-    port_observed < port_neutral := by linarith
+    (model : PortabilityThresholdModel) :
+    model.port_observed < model.port_neutral := by
+  linarith [model.h_observed_lt, model.h_neutral_gt]
+
+/-- Model of a zero-portability component lowering the weighted average. -/
+structure ZeroPortabilityModel where
+  f : ℝ
+  port_rest : ℝ
+  h_f_pos : 0 < f
+  h_f_lt_one : f < 1
+  h_port_pos : 0 < port_rest
+  h_port_le_one : port_rest ≤ 1
 
 /-- **A zero-portability component lowers a weighted portability average.**
     If a trait keeps only the `(1 - f)` fraction of its remaining portable
     signal, then the resulting weighted average is strictly below the residual
     portability level whenever `0 < f < 1`. -/
 theorem zero_portability_component_lowers_weighted_average
-    (f port_rest : ℝ)
-    (h_f : 0 < f) (_h_f_le : f < 1)
-    (h_port : 0 < port_rest) (_h_port_le : port_rest ≤ 1) :
-    (1 - f) * port_rest < port_rest := by
-  have : 0 < f * port_rest := mul_pos h_f h_port
-  linarith [mul_comm f port_rest]
+    (model : ZeroPortabilityModel) :
+    (1 - model.f) * model.port_rest < model.port_rest := by
+  have : 0 < model.f * model.port_rest := mul_pos model.h_f_pos model.h_port_pos
+  linarith [mul_comm model.f model.port_rest]
 
 end ImmuneTraits
 
@@ -577,25 +605,27 @@ theorem prediction_error_bounded_by_looser_tolerance
     (h_small_error : ε < bound) :
     |actual_port - predicted_port| < bound := by linarith
 
-/-- **Disease traits vs quantitative traits.**
-    Disease traits often show worse portability than their
-    quantitative risk factors because:
-    1. Ascertainment bias in case-control studies (δ_ascertain)
-    2. Different disease prevalence across populations (δ_prev)
-    3. Liability threshold model nonlinearity (δ_threshold)
-    These additive losses degrade disease portability below risk factor portability. -/
-noncomputable def diseasePortability
-    (port_rf δ_ascertain δ_prev δ_threshold : ℝ) : ℝ :=
-  port_rf - (δ_ascertain + δ_prev + δ_threshold)
+/-- Model of disease traits exhibiting worse portability than quantitative traits.
+    Includes ascertainment bias, prevalence difference, and liability threshold nonlinearity. -/
+structure DiseasePortabilityModel where
+  port_rf : ℝ
+  δ_ascertain : ℝ
+  δ_prev : ℝ
+  δ_threshold : ℝ
+  h_asc_pos : 0 < δ_ascertain
+  h_prev_pos : 0 < δ_prev
+  h_thresh_pos : 0 < δ_threshold
+
+/-- Computes the final disease portability. -/
+noncomputable def diseasePortability (model : DiseasePortabilityModel) : ℝ :=
+  model.port_rf - (model.δ_ascertain + model.δ_prev + model.δ_threshold)
 
 /-- **Additive disease-specific loss lowers portability below the risk-factor
 baseline.** -/
-theorem additive_disease_loss_lowers_portability
-    (port_rf δ_ascertain δ_prev δ_threshold : ℝ)
-    (h_asc : 0 < δ_ascertain) (h_prev : 0 < δ_prev) (h_thresh : 0 < δ_threshold) :
-    diseasePortability port_rf δ_ascertain δ_prev δ_threshold < port_rf := by
+theorem additive_disease_loss_lowers_portability (model : DiseasePortabilityModel) :
+    diseasePortability model < model.port_rf := by
   dsimp [diseasePortability]
-  linarith
+  linarith [model.h_asc_pos, model.h_prev_pos, model.h_thresh_pos]
 
 /-- **Pearson `R²` is strictly below `1` under additive prediction noise.**
     For the scalar model `Y = aX + ε` with `σ²_ε > 0`, the induced

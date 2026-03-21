@@ -67,6 +67,14 @@ theorem snp_h2_le_narrow_h2
   unfold snpH2 narrowSenseH2
   exact div_le_div_of_nonneg_right h_tagged (le_of_lt h_total)
 
+/-- True total narrow-sense heritability. -/
+noncomputable def trueH2 (V_A V_P : ℝ) : ℝ :=
+  V_A / V_P
+
+/-- Twin heritability captures both tagged and untagged additive variance. -/
+noncomputable def twinH2 (V_A_tagged V_A_untagged V_P : ℝ) : ℝ :=
+  (V_A_tagged + V_A_untagged) / V_P
+
 /-- **The missing heritability gap.**
     h²_twin - h²_SNP > 0 for most traits. This is the "missing heritability".
     It sets an upper bound on what PGS can achieve with current genotyping.
@@ -82,13 +90,11 @@ theorem missing_heritability_gap
     (h_D : 0 ≤ V_D) (h_I : 0 ≤ V_I) (h_E : 0 ≤ V_E)
     (h_total : 0 < V_A_tagged + V_A_untagged + V_D + V_I + V_E) :
     let V_P := V_A_tagged + V_A_untagged + V_D + V_I + V_E
-    let h2_twin := (V_A_tagged + V_A_untagged) / V_P
-    let h2_snp := V_A_tagged / V_P
-    0 < h2_twin - h2_snp := by
-  simp only
-  rw [show (V_A_tagged + V_A_untagged) / (V_A_tagged + V_A_untagged + V_D + V_I + V_E) -
-    V_A_tagged / (V_A_tagged + V_A_untagged + V_D + V_I + V_E) =
-    ((V_A_tagged + V_A_untagged) - V_A_tagged) / (V_A_tagged + V_A_untagged + V_D + V_I + V_E)
+    0 < twinH2 V_A_tagged V_A_untagged V_P - snpH2 V_A_tagged V_P := by
+  intro V_P
+  unfold twinH2 snpH2
+  rw [show (V_A_tagged + V_A_untagged) / V_P - V_A_tagged / V_P =
+    ((V_A_tagged + V_A_untagged) - V_A_tagged) / V_P
     from (sub_div _ _ _).symm]
   apply div_pos
   · linarith
@@ -252,15 +258,29 @@ on LD and population structure assumptions.
 
 section GREML
 
+/-- GREML estimate when causal variants are poorly tagged. -/
+noncomputable def gremlH2PoorTagging (mean_tag_r2 V_A V_P : ℝ) : ℝ :=
+  (mean_tag_r2 * V_A) / V_P
+
+/-- GREML estimate with cryptic stratification bias. -/
+noncomputable def gremlH2Stratified (V_A V_strat V_P : ℝ) : ℝ :=
+  (V_A + V_strat) / V_P
+
+/-- GREML estimate with LD structural bias. -/
+noncomputable def gremlLDBiasedH2 (h2_true ld_bias : ℝ) : ℝ :=
+  h2_true + ld_bias
+
 /-- **GREML h² estimate depends on LD structure.**
     GREML estimates h²_SNP = trace(GRM⁻¹ × Σ_pheno) / n.
     When LD differs between training and evaluation, the estimate is biased. -/
 theorem greml_ld_sensitive
-    (h2_estimated h2_true ld_bias : ℝ)
-    (h_bias : h2_estimated = h2_true + ld_bias)
+    (h2_true ld_bias : ℝ)
     (h_ld_nonzero : ld_bias ≠ 0) :
-    h2_estimated ≠ h2_true := by
-  rw [h_bias]; intro h; apply h_ld_nonzero; linarith
+    gremlLDBiasedH2 h2_true ld_bias ≠ h2_true := by
+  unfold gremlLDBiasedH2
+  intro h
+  apply h_ld_nonzero
+  linarith
 
 /-- **GREML underestimates h² when causal variants are poorly tagged.**
     The true SNP heritability is `V_A / V_P`, while GREML only captures
@@ -271,11 +291,9 @@ theorem greml_underestimates_with_poor_tagging
     (V_A V_P mean_tag_r2 : ℝ)
     (h_imperfect : mean_tag_r2 < 1)
     (h_VA_pos : 0 < V_A) (h_VP_pos : 0 < V_P) :
-    let h2_true := V_A / V_P
-    let h2_greml := (mean_tag_r2 * V_A) / V_P
-    h2_true - h2_greml = ((1 - mean_tag_r2) * V_A) / V_P ∧
-      0 < h2_true - h2_greml := by
-  simp only
+    trueH2 V_A V_P - gremlH2PoorTagging mean_tag_r2 V_A V_P = ((1 - mean_tag_r2) * V_A) / V_P ∧
+      0 < trueH2 V_A V_P - gremlH2PoorTagging mean_tag_r2 V_A V_P := by
+  unfold trueH2 gremlH2PoorTagging
   rw [← sub_div]
   have h_gap :
       V_A - mean_tag_r2 * V_A = (1 - mean_tag_r2) * V_A := by
@@ -306,10 +324,9 @@ theorem stratification_inflates_greml
     (h_VA : 0 ≤ V_A) (h_strat_pos : 0 < V_strat) (h_VE : 0 ≤ V_E)
     (h_total : 0 < V_A + V_strat + V_E) :
     let V_P := V_A + V_strat + V_E
-    let h2_true := V_A / V_P
-    let h2_greml := (V_A + V_strat) / V_P
-    h2_true < h2_greml := by
-  simp only
+    trueH2 V_A V_P < gremlH2Stratified V_A V_strat V_P := by
+  intro V_P
+  unfold trueH2 gremlH2Stratified
   exact div_lt_div_of_pos_right (by linarith) h_total
 
 end GREML
