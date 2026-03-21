@@ -813,6 +813,20 @@ theorem f1_le_arithmetic_mean (p r : ℝ)
   rw [div_le_div_iff₀ (by linarith) (by norm_num)]
   nlinarith [sq_nonneg (p - r)]
 
+/-- **Domain model for disease portability shifts.**
+    Captures changes in both population prevalence and PGS sensitivity
+    between near (source) and far (target) ancestries. -/
+structure DiseasePortabilityModel where
+  prevalence_near : ℝ
+  prevalence_far : ℝ
+  sensitivity_near : ℝ
+  sensitivity_far : ℝ
+
+/-- The absolute number of true positives per unit population. -/
+noncomputable def truePositiveRate (m : DiseasePortabilityModel) (is_near : Bool) : ℝ :=
+  if is_near then m.prevalence_near * m.sensitivity_near
+  else m.prevalence_far * m.sensitivity_far
+
 /-- **Prevalence shift model for T2D.**
     T2D prevalence is higher in South Asian and African-descent populations
     than in European populations. This shifts the base rate for Bayesian calculations.
@@ -825,40 +839,45 @@ theorem f1_le_arithmetic_mean (p r : ℝ)
     The net effect on recall depends on whether the prevalence increase
     dominates the sensitivity decrease. We prove the sufficient condition. -/
 theorem prevalence_dominates_sensitivity_for_recall
-    (n_cases₁ n_cases₂ sens₁ sens₂ : ℝ)
-    (h_cases₁ : 0 < n_cases₁) (_h_cases₂ : 0 < n_cases₂)
-    (_h_sens₁ : 0 < sens₁) (h_sens₂ : 0 < sens₂)
-    (_h_sens₁_le : sens₁ ≤ 1) (_h_sens₂_le : sens₂ ≤ 1)
+    (m : DiseasePortabilityModel)
+    (h_cases₁ : 0 < m.prevalence_near) (h_sens₂ : 0 < m.sensitivity_far)
     -- More cases in target (prevalence is higher)
-    (_h_more_cases : n_cases₁ < n_cases₂)
+    (_h_more_cases : m.prevalence_near < m.prevalence_far)
     -- Sensitivity doesn't drop too much (prevalence effect dominates)
-    (h_sens_ratio : sens₁ / sens₂ < n_cases₂ / n_cases₁) :
+    (h_sens_ratio : m.sensitivity_near / m.sensitivity_far < m.prevalence_far / m.prevalence_near) :
     -- Then absolute true positives increase
-    n_cases₁ * sens₁ < n_cases₂ * sens₂ := by
-  have htp : sens₁ * n_cases₁ < n_cases₂ * sens₂ := by
+    truePositiveRate m true < truePositiveRate m false := by
+  have htp : m.sensitivity_near * m.prevalence_near < m.prevalence_far * m.sensitivity_far := by
     rwa [div_lt_div_iff₀ h_sens₂ h_cases₁] at h_sens_ratio
-  simpa [mul_comm] using htp
+  simpa [truePositiveRate, mul_comm] using htp
 
 /-- **Asthma vs T2D portability difference.**
     For asthma, precision and recall decay similarly → qualitatively similar.
     For T2D, they diverge → qualitatively different.
     The difference is driven by the prevalence-distance relationship. -/
 theorem different_diseases_different_portability_patterns
-    -- Asthma: both metrics decay
-    (prec_asthma_near prec_asthma_far : ℝ)
-    (rec_asthma_near rec_asthma_far : ℝ)
-    (h_prec_asthma_drops : prec_asthma_far < prec_asthma_near)
-    (h_rec_asthma_drops : rec_asthma_far < rec_asthma_near)
-    -- T2D: precision constant, recall increases
-    (prec_t2d_near prec_t2d_far : ℝ)
-    (rec_t2d_near rec_t2d_far : ℝ)
-    (h_prec_t2d_const : prec_t2d_near = prec_t2d_far)
-    (h_rec_t2d_up : rec_t2d_near < rec_t2d_far)
-    :
-    -- The diseases show qualitatively different portability patterns
-    (prec_asthma_far < prec_asthma_near ∧ rec_asthma_far < rec_asthma_near) ∧
-    (prec_t2d_near = prec_t2d_far ∧ rec_t2d_near < rec_t2d_far) :=
-  ⟨⟨h_prec_asthma_drops, h_rec_asthma_drops⟩, ⟨h_prec_t2d_const, h_rec_t2d_up⟩⟩
+    (asthma t2d : DiseasePortabilityModel)
+    -- Asthma: prevalence constant, sensitivity drops
+    (h_asthma_prev : asthma.prevalence_near = asthma.prevalence_far)
+    (h_asthma_sens : asthma.sensitivity_far < asthma.sensitivity_near)
+    (h_asthma_prev_pos : 0 < asthma.prevalence_near)
+    -- T2D: prevalence increases enough to dominate sensitivity drop
+    (h_t2d_prev : 0 < t2d.prevalence_near)
+    (h_t2d_sens_far : 0 < t2d.sensitivity_far)
+    (h_t2d_ratio : t2d.sensitivity_near / t2d.sensitivity_far < t2d.prevalence_far / t2d.prevalence_near) :
+    -- Asthma TP drops, T2D TP increases
+    (truePositiveRate asthma false < truePositiveRate asthma true) ∧
+    (truePositiveRate t2d true < truePositiveRate t2d false) := by
+  constructor
+  · unfold truePositiveRate
+    dsimp
+    rw [← h_asthma_prev]
+    exact mul_lt_mul_of_pos_left h_asthma_sens h_asthma_prev_pos
+  · unfold truePositiveRate
+    dsimp
+    have htp : t2d.sensitivity_near * t2d.prevalence_near < t2d.prevalence_far * t2d.sensitivity_far := by
+      rwa [div_lt_div_iff₀ h_t2d_sens_far h_t2d_prev] at h_t2d_ratio
+    simpa [mul_comm] using htp
 
 end DiseasePortability
 
@@ -876,18 +895,43 @@ We formalize which components of portability loss are recoverable.
 
 section RecoverablePortability
 
+/-- **Domain model for PGS recalibration.**
+    Captures adjustments to PGS predictions to recover calibration
+    across populations with mean or variance shifts. -/
+structure RecalibrationModel where
+  y_pred : ℝ
+  μ_shift : ℝ
+  b_shrinkage : ℝ
+
+/-- Applies a mean shift to the prediction. -/
+noncomputable def applyMeanShift (m : RecalibrationModel) : ℝ :=
+  m.y_pred + m.μ_shift
+
+/-- Applies slope shrinkage to the prediction. -/
+noncomputable def applySlopeShrinkage (m : RecalibrationModel) : ℝ :=
+  m.y_pred * m.b_shrinkage
+
+/-- Recalibrates a prediction by removing a known mean shift. -/
+noncomputable def recalibrateMean (shifted_pred μ_shift : ℝ) : ℝ :=
+  shifted_pred - μ_shift
+
+/-- Recalibrates a prediction by reversing a known slope shrinkage. -/
+noncomputable def recalibrateSlope (shrunk_pred b_shrinkage : ℝ) : ℝ :=
+  shrunk_pred / b_shrinkage
+
 /-- **Mean shift is recoverable by re-calibration.**
     If the PGS has a mean shift μ across populations, adjusting the
     intercept recovers the correct calibration. -/
-theorem mean_shift_recoverable
-    (y_pred μ_shift : ℝ) :
-    y_pred - μ_shift + μ_shift = y_pred := by ring
+theorem mean_shift_recoverable (m : RecalibrationModel) :
+    recalibrateMean (applyMeanShift m) m.μ_shift = m.y_pred := by
+  unfold recalibrateMean applyMeanShift
+  ring
 
 /-- **Slope change (shrinkage) is recoverable by re-calibration.**
     If the PGS slope changes from b to b·r, multiplying by 1/r recovers it. -/
-theorem slope_change_recoverable
-    (b r pgs : ℝ) (hr : r ≠ 0) :
-    (b * r * pgs) * (1 / r) = b * pgs := by
+theorem slope_change_recoverable (m : RecalibrationModel) (h : m.b_shrinkage ≠ 0) :
+    recalibrateSlope (applySlopeShrinkage m) m.b_shrinkage = m.y_pred := by
+  unfold recalibrateSlope applySlopeShrinkage
   field_simp
 
 /-- **LD mismatch is NOT recoverable by linear re-calibration.**
@@ -898,8 +942,6 @@ theorem ld_mismatch_not_linearly_recoverable
     (w_source : Fin 2 → ℝ)
     (σ_target : Matrix (Fin 2) (Fin 2) ℝ)
     (cross_target : Fin 2 → ℝ)
-    -- σ_target.mulVec is linear, so scaling w_source just scales the image
-    (_h_base_mismatch : σ_target.mulVec w_source ≠ cross_target)
     -- The image of the source direction doesn't align with cross_target
     -- (cross_target is not a scalar multiple of σ_target.mulVec w_source)
     (h_not_aligned : ∀ α : ℝ, α • σ_target.mulVec w_source ≠ cross_target) :
@@ -909,18 +951,30 @@ theorem ld_mismatch_not_linearly_recoverable
   rw [Matrix.mulVec_smul]
   exact h_not_aligned α
 
+/-- **Domain model for effect turnover between populations.**
+    Captures changes in the true genetic architecture between ancestries. -/
+structure EffectTurnoverModel where
+  β_source : ℝ
+  β_target : ℝ
+
+/-- The squared prediction error from applying source effects to a target population. -/
+noncomputable def geneticPredictionError (arch : EffectTurnoverModel) (pgs : ℝ) : ℝ :=
+  (arch.β_source * pgs - arch.β_target * pgs) ^ 2
+
 /-- **Effect turnover is NOT recoverable without target-population data.**
     If true effects change between populations, the source GWAS provides
     no information about the new effects. Only target GWAS data helps. -/
 theorem effect_turnover_requires_target_data
-    (β_source β_target : ℝ)
-    (h_different : β_source ≠ β_target) :
-    -- Any prediction using β_source has nonzero error for β_target
-    ∀ y : ℝ, β_source * y ≠ β_target * y ∨ y = 0 := by
-  intro y
-  by_cases hy : y = 0
-  · right; exact hy
-  · left; intro h; exact h_different (mul_right_cancel₀ hy h)
+    (arch : EffectTurnoverModel)
+    (h_turnover : arch.β_source ≠ arch.β_target) :
+    -- Any prediction using β_source has strictly positive squared error for β_target
+    ∀ pgs : ℝ, pgs ≠ 0 → 0 < geneticPredictionError arch pgs := by
+  intro pgs h_pgs
+  unfold geneticPredictionError
+  have h_diff : arch.β_source * pgs - arch.β_target * pgs ≠ 0 := by
+    rw [← sub_mul]
+    exact mul_ne_zero (sub_ne_zero.mpr h_turnover) h_pgs
+  exact sq_pos_of_ne_zero h_diff
 
 end RecoverablePortability
 
