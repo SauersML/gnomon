@@ -34,6 +34,19 @@ benefit across ancestry groups.
 
 section HealthDisparity
 
+/-- **Clinical Benefit Model.**
+    A model linking PGS variance explained (R²) to clinical benefit.
+    The parameter α represents the positive proportionality constant
+    (benefit per unit R²). -/
+structure ClinicalBenefitModel where
+  alpha : ℝ
+  h_alpha : 0 < alpha
+
+/-- **Expected Clinical Benefit.**
+    The expected net clinical benefit from a PGS with variance explained R². -/
+noncomputable def expectedBenefit (m : ClinicalBenefitModel) (r2 : ℝ) : ℝ :=
+  m.alpha * r2
+
 /-- **Clinical utility depends on PGS R².**
     The net clinical benefit from PGS-guided care is monotonically
     increasing in R². We model benefit = α × R² for a positive
