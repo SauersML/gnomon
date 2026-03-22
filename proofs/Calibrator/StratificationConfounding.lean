@@ -322,20 +322,39 @@ theorem collider_attenuates_association (m : ColliderModel) :
       < m.β_G * 1 := by exact mul_lt_mul_of_pos_left h_ratio_lt_one m.β_G_pos
     _ = m.β_G := by ring
 
+/-- **Multi-population collider model.**
+    Combines two collider models (source and target) to study differential
+    ascertainment bias. -/
+structure MultiPopColliderModel where
+  /-- Source population collider model -/
+  source : ColliderModel
+  /-- Target population collider model -/
+  target : ColliderModel
+  /-- True population R² in source -/
+  r2_source_pop : ℝ
+  /-- True population R² in target -/
+  r2_target_pop : ℝ
+  /-- Attenuation factor in source -/
+  atten_source : ℝ
+  /-- Attenuation factor in target -/
+  atten_target : ℝ
+  r2_source_pop_pos : 0 < r2_source_pop
+  r2_target_pop_pos : 0 < r2_target_pop
+  atten_pos_s : 0 < atten_source
+  atten_pos_t : 0 < atten_target
+  /-- Target has stronger ascertainment bias (lower attenuation factor) -/
+  h_diff_severity : atten_target < atten_source
+
 /-- **Differential ascertainment creates portability artifact.**
-    If source and target cohorts have different ascertainment patterns,
-    the apparent portability drop includes an ascertainment component. -/
+    If source and target cohorts have identical true population R² but
+    different ascertainment severities, the apparent target R² is lower
+    than the apparent source R². -/
 theorem differential_ascertainment_artifact
-    (r2_source_pop r2_target_pop r2_source_asc r2_target_asc : ℝ)
-    (h_source_asc : r2_source_asc < r2_source_pop)
-    (h_target_asc : r2_target_asc < r2_target_pop)
-    -- Different ascertainment severity
-    (h_diff_severity : r2_target_pop - r2_target_asc < r2_source_pop - r2_source_asc) :
-    -- Apparent portability drop is larger than true portability drop
-    r2_source_asc - r2_target_asc > r2_source_pop - r2_target_pop →
-      False := by
-  intro h
-  linarith
+    (m : MultiPopColliderModel)
+    (h_equal_pop_r2 : m.r2_source_pop = m.r2_target_pop) :
+    m.r2_target_pop * m.atten_target < m.r2_source_pop * m.atten_source := by
+  rw [← h_equal_pop_r2]
+  exact mul_lt_mul_of_pos_left m.h_diff_severity m.r2_source_pop_pos
 
 end ColliderBias
 
