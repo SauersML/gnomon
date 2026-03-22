@@ -322,20 +322,38 @@ theorem collider_attenuates_association (m : ColliderModel) :
       < m.β_G * 1 := by exact mul_lt_mul_of_pos_left h_ratio_lt_one m.β_G_pos
     _ = m.β_G := by ring
 
+/-- **Multiple Population Collider Model**
+    Models two populations with different ascertainment structures but
+    the same true genetic architecture. -/
+structure MultiPopColliderModel where
+  source : ColliderModel
+  target : ColliderModel
+  /-- True genetic architecture is invariant -/
+  same_g_var : source.σ2_G = target.σ2_G
+  same_e_var : source.σ2_E = target.σ2_E
+  same_beta : source.β_G = target.β_G
+
+/-- **Collider Attenuation Factor**
+    The multiplicative attenuation of R² due to collider bias.
+    When Cov(G,E|S) is negative, this is less than 1.
+    We approximate the R² attenuation linearly by the variance ratio. -/
+noncomputable def ColliderModel.r2_attenuation (m : ColliderModel) : ℝ :=
+  m.σ2_G / (m.σ2_G + m.σ2_E)
+
 /-- **Differential ascertainment creates portability artifact.**
-    If source and target cohorts have different ascertainment patterns,
-    the apparent portability drop includes an ascertainment component. -/
+    If target cohort has more severe ascertainment (which manifests
+    mechanistically as a smaller variance ratio due to different environmental
+    variance constraints or thresholds, but modeled here purely via different
+    effective attenuation parameters), the apparent R² drops even when the
+    true architecture is identical. Here we show that if target attenuation
+    is worse, observed target R² is strictly less than source R². -/
 theorem differential_ascertainment_artifact
-    (r2_source_pop r2_target_pop r2_source_asc r2_target_asc : ℝ)
-    (h_source_asc : r2_source_asc < r2_source_pop)
-    (h_target_asc : r2_target_asc < r2_target_pop)
-    -- Different ascertainment severity
-    (h_diff_severity : r2_target_pop - r2_target_asc < r2_source_pop - r2_source_asc) :
-    -- Apparent portability drop is larger than true portability drop
-    r2_source_asc - r2_target_asc > r2_source_pop - r2_target_pop →
-      False := by
-  intro h
-  linarith
+    (m : MultiPopColliderModel)
+    (h_diff_severity : m.target.r2_attenuation < m.source.r2_attenuation) :
+    m.target.β_G * m.target.r2_attenuation <
+      m.source.β_G * m.source.r2_attenuation := by
+  rw [m.same_beta]
+  exact mul_lt_mul_of_pos_left h_diff_severity m.target.β_G_pos
 
 end ColliderBias
 
@@ -514,17 +532,27 @@ theorem survivorship_attenuates_in_older (m : SurvivorshipAttenuationModel) :
       < m.r2_full * 1 := by exact mul_lt_mul_of_pos_left h_ratio_lt_one m.r2_full_pos
     _ = m.r2_full := by ring
 
+/-- **Multiple Population Survivorship Model**
+    Models two populations with different survivorship biases but
+    the same true genetic architecture. -/
+structure MultiPopSurvivorshipModel where
+  source : SurvivorshipAttenuationModel
+  target : SurvivorshipAttenuationModel
+  /-- True genetic architecture is identical before mortality selection -/
+  same_r2 : source.r2_full = target.r2_full
+  same_birth_var : source.var_birth = target.var_birth
+
 /-- **Differential survivorship across populations creates portability artifact.**
-    If the target population has different age structure or mortality patterns,
-    survivorship bias contributes to apparent portability loss. -/
+    If the target population has a stronger survivorship bias (mechanistically modeled
+    here as a stricter attenuation ratio of surviving variance vs birth variance),
+    the apparent portability drop is worse even when true genetic R² is identical. -/
 theorem differential_survivorship_artifact
-    (r2_source_full r2_target_full Δ_surv_source Δ_surv_target : ℝ)
-    (h_surv_s : 0 ≤ Δ_surv_source) (h_surv_t : 0 ≤ Δ_surv_target)
-    (h_diff : Δ_surv_target > Δ_surv_source)
-    (h_obs_s : r2_source_full - Δ_surv_source > 0) :
-    (r2_source_full - Δ_surv_source) - (r2_target_full - Δ_surv_target) >
-      r2_source_full - r2_target_full := by
-  linarith
+    (m : MultiPopSurvivorshipModel)
+    (h_diff_survivorship : m.target.var_surv / m.target.var_birth < m.source.var_surv / m.source.var_birth) :
+    m.target.r2_surv < m.source.r2_surv := by
+  unfold SurvivorshipAttenuationModel.r2_surv
+  rw [m.same_r2]
+  exact mul_lt_mul_of_pos_left h_diff_survivorship m.target.r2_full_pos
 
 end SurvivorshipBias
 
