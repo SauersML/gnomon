@@ -322,19 +322,33 @@ theorem collider_attenuates_association (m : ColliderModel) :
       < m.β_G * 1 := by exact mul_lt_mul_of_pos_left h_ratio_lt_one m.β_G_pos
     _ = m.β_G := by ring
 
+structure MultiPopColliderModel where
+  source : ColliderModel
+  target : ColliderModel
+  -- Assume target has more severe ascertainment bias
+  h_diff_severity : target.σ2_G / (target.σ2_G + target.σ2_E) < source.σ2_G / (source.σ2_G + source.σ2_E)
+
+noncomputable def apparent_portability_gap (m : MultiPopColliderModel) : ℝ :=
+  m.source.β_selected - m.target.β_selected
+
+noncomputable def true_portability_gap (m : MultiPopColliderModel) : ℝ :=
+  m.source.β_G - m.target.β_G
+
 /-- **Differential ascertainment creates portability artifact.**
     If source and target cohorts have different ascertainment patterns,
     the apparent portability drop includes an ascertainment component. -/
-theorem differential_ascertainment_artifact
-    (r2_source_pop r2_target_pop r2_source_asc r2_target_asc : ℝ)
-    (h_source_asc : r2_source_asc < r2_source_pop)
-    (h_target_asc : r2_target_asc < r2_target_pop)
-    -- Different ascertainment severity
-    (h_diff_severity : r2_target_pop - r2_target_asc < r2_source_pop - r2_source_asc) :
-    -- Apparent portability drop is larger than true portability drop
-    r2_source_asc - r2_target_asc > r2_source_pop - r2_target_pop →
-      False := by
-  intro h
+theorem differential_ascertainment_artifact (m : MultiPopColliderModel)
+    (h_same_base : m.source.β_G = m.target.β_G) :
+    true_portability_gap m < apparent_portability_gap m := by
+  unfold true_portability_gap apparent_portability_gap
+  unfold ColliderModel.β_selected
+  rw [h_same_base]
+  have h_sub_zero : m.target.β_G - m.target.β_G = 0 := sub_self _
+  rw [h_sub_zero]
+  have h_target_pos : 0 < m.target.β_G := m.target.β_G_pos
+  have h_ineq : m.target.β_G * (m.target.σ2_G / (m.target.σ2_G + m.target.σ2_E)) <
+                m.target.β_G * (m.source.σ2_G / (m.source.σ2_G + m.source.σ2_E)) := by
+    exact mul_lt_mul_of_pos_left m.h_diff_severity h_target_pos
   linarith
 
 end ColliderBias
@@ -514,16 +528,33 @@ theorem survivorship_attenuates_in_older (m : SurvivorshipAttenuationModel) :
       < m.r2_full * 1 := by exact mul_lt_mul_of_pos_left h_ratio_lt_one m.r2_full_pos
     _ = m.r2_full := by ring
 
+structure MultiPopSurvivorshipModel where
+  source : SurvivorshipAttenuationModel
+  target : SurvivorshipAttenuationModel
+  -- The target population has more severe survivorship bias (lower variance retained)
+  h_diff_severity : target.var_surv / target.var_birth < source.var_surv / source.var_birth
+
+noncomputable def apparent_survivorship_portability_drop (m : MultiPopSurvivorshipModel) : ℝ :=
+  m.source.r2_surv - m.target.r2_surv
+
+noncomputable def true_survivorship_portability_drop (m : MultiPopSurvivorshipModel) : ℝ :=
+  m.source.r2_full - m.target.r2_full
+
 /-- **Differential survivorship across populations creates portability artifact.**
     If the target population has different age structure or mortality patterns,
     survivorship bias contributes to apparent portability loss. -/
-theorem differential_survivorship_artifact
-    (r2_source_full r2_target_full Δ_surv_source Δ_surv_target : ℝ)
-    (h_surv_s : 0 ≤ Δ_surv_source) (h_surv_t : 0 ≤ Δ_surv_target)
-    (h_diff : Δ_surv_target > Δ_surv_source)
-    (h_obs_s : r2_source_full - Δ_surv_source > 0) :
-    (r2_source_full - Δ_surv_source) - (r2_target_full - Δ_surv_target) >
-      r2_source_full - r2_target_full := by
+theorem differential_survivorship_artifact (m : MultiPopSurvivorshipModel)
+    (h_same_base : m.source.r2_full = m.target.r2_full) :
+    true_survivorship_portability_drop m < apparent_survivorship_portability_drop m := by
+  unfold true_survivorship_portability_drop apparent_survivorship_portability_drop
+  unfold SurvivorshipAttenuationModel.r2_surv
+  rw [h_same_base]
+  have h_sub_zero : m.target.r2_full - m.target.r2_full = 0 := sub_self _
+  rw [h_sub_zero]
+  have h_target_pos : 0 < m.target.r2_full := m.target.r2_full_pos
+  have h_ineq : m.target.r2_full * (m.target.var_surv / m.target.var_birth) <
+                m.target.r2_full * (m.source.var_surv / m.source.var_birth) := by
+    exact mul_lt_mul_of_pos_left m.h_diff_severity h_target_pos
   linarith
 
 end SurvivorshipBias
