@@ -295,6 +295,28 @@ theorem education_cohort_effect
   rw [div_eq_div_iff h₁ h₂] at h
   nlinarith [mul_comm V_A V_E_old, mul_comm V_A V_E_young]
 
+/-- **Survivorship Selection Model.**
+    A structured model capturing survivorship bias in longitudinal studies. -/
+structure SurvivorshipSelectionModel where
+  /-- True underlying effect size of the genetic variant on the trait -/
+  beta_true : ℝ
+  /-- Selection intensity against the trait, $0 < s < 1$ -/
+  selection_intensity : ℝ
+  /-- Ensures there is a non-zero genetic effect -/
+  h_beta_true_ne_zero : beta_true ≠ 0
+  /-- Ensures selection intensity is strictly positive -/
+  h_selection_pos : 0 < selection_intensity
+  /-- Ensures selection intensity is strictly bounded below 1 -/
+  h_selection_lt_one : selection_intensity < 1
+
+/-- The attenuation factor caused by selection -/
+noncomputable def SurvivorshipSelectionModel.attenuation (m : SurvivorshipSelectionModel) : ℝ :=
+  1 - m.selection_intensity
+
+/-- The observed effect size among survivors -/
+noncomputable def SurvivorshipSelectionModel.beta_observed (m : SurvivorshipSelectionModel) : ℝ :=
+  m.beta_true * m.attenuation
+
 /-- **Survivorship bias in older cohorts.**
     PGS for mortality-related traits in older cohorts are biased
     by survivorship: only survivors are observed, creating
@@ -302,18 +324,21 @@ theorem education_cohort_effect
     Model: observed effect = true effect × attenuation, where
     attenuation = (1 - selection_intensity) and 0 < selection_intensity < 1.
     Therefore |β_observed| < |β_true|. -/
-theorem survivorship_bias_attenuates_pgs
-    (beta_true attenuation : ℝ)
-    (h_beta : beta_true ≠ 0)
-    (h_att_pos : 0 < attenuation) (h_att_lt : attenuation < 1) :
-    |beta_true * attenuation| < |beta_true| := by
+theorem survivorship_bias_attenuates_pgs (m : SurvivorshipSelectionModel) :
+    |m.beta_observed| < |m.beta_true| := by
+  have h_att_pos : 0 < m.attenuation := sub_pos.mpr m.h_selection_lt_one
+  have h_att_lt : m.attenuation < 1 := by
+    unfold SurvivorshipSelectionModel.attenuation
+    linarith [m.h_selection_pos]
+  unfold SurvivorshipSelectionModel.beta_observed
   rw [abs_mul]
-  calc |beta_true| * |attenuation|
-      < |beta_true| * 1 := by {
-        apply mul_lt_mul_of_pos_left _ (abs_pos.mpr h_beta)
-        rwa [abs_of_pos h_att_pos]
-      }
-    _ = |beta_true| := mul_one _
+  calc |m.beta_true| * |m.attenuation|
+      < |m.beta_true| * 1 := by
+        apply mul_lt_mul_of_pos_left
+        · rw [abs_of_pos h_att_pos]
+          exact h_att_lt
+        · exact abs_pos.mpr m.h_beta_true_ne_zero
+    _ = |m.beta_true| := mul_one _
 
 end CohortEffects
 

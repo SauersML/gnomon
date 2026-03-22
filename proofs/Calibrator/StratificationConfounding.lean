@@ -322,19 +322,31 @@ theorem collider_attenuates_association (m : ColliderModel) :
       < m.β_G * 1 := by exact mul_lt_mul_of_pos_left h_ratio_lt_one m.β_G_pos
     _ = m.β_G := by ring
 
+/-- **Multi-Population Collider Model.**
+    Captures differential ascertainment between a source and a target population. -/
+structure MultiPopColliderModel where
+  /-- Source population ascertainment model -/
+  source : ColliderModel
+  /-- Target population ascertainment model -/
+  target : ColliderModel
+
+/-- Apparent portability drop due to ascertainment differences. -/
+noncomputable def MultiPopColliderModel.apparent_portability_drop (m : MultiPopColliderModel) : ℝ :=
+  m.source.β_selected - m.target.β_selected
+
+/-- True portability drop in the base populations without ascertainment bias. -/
+noncomputable def MultiPopColliderModel.true_portability_drop (m : MultiPopColliderModel) : ℝ :=
+  m.source.β_G - m.target.β_G
+
 /-- **Differential ascertainment creates portability artifact.**
-    If source and target cohorts have different ascertainment patterns,
-    the apparent portability drop includes an ascertainment component. -/
-theorem differential_ascertainment_artifact
-    (r2_source_pop r2_target_pop r2_source_asc r2_target_asc : ℝ)
-    (h_source_asc : r2_source_asc < r2_source_pop)
-    (h_target_asc : r2_target_asc < r2_target_pop)
-    -- Different ascertainment severity
-    (h_diff_severity : r2_target_pop - r2_target_asc < r2_source_pop - r2_source_asc) :
-    -- Apparent portability drop is larger than true portability drop
-    r2_source_asc - r2_target_asc > r2_source_pop - r2_target_pop →
-      False := by
-  intro h
+    If source and target cohorts have different ascertainment patterns (e.g. source is
+    much more heavily ascertained, inducing a stronger attenuation), the apparent
+    portability drop may appear smaller (or larger) than the true drop, leading to
+    artifacts in transportability studies. -/
+theorem differential_ascertainment_artifact (m : MultiPopColliderModel)
+    (h_target_attenuation_less : m.target.β_G - m.target.β_selected < m.source.β_G - m.source.β_selected) :
+    m.apparent_portability_drop < m.true_portability_drop := by
+  unfold MultiPopColliderModel.apparent_portability_drop MultiPopColliderModel.true_portability_drop
   linarith
 
 end ColliderBias
