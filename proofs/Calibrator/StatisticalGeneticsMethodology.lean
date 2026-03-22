@@ -51,14 +51,11 @@ noncomputable def incrementalR2 (r2_full r2_covariates : ℝ) : ℝ :=
 theorem incremental_r2_nonneg
     (rss_full rss_cov tss : ℝ)
     (h_tss : 0 < tss)
-    (h_rss_full : 0 ≤ rss_full)
-    (h_rss_cov : 0 ≤ rss_cov)
+    (_h_rss_full : 0 ≤ rss_full)
+    (_h_rss_cov : 0 ≤ rss_cov)
     -- Nested model property: full model has no more residual than submodel
     (h_nested : rss_full ≤ rss_cov) :
-    let r2_full := 1 - rss_full / tss
-    let r2_cov := 1 - rss_cov / tss
-    0 ≤ incrementalR2 r2_full r2_cov := by
-  simp only
+    0 ≤ incrementalR2 (1 - rss_full / tss) (1 - rss_cov / tss) := by
   unfold incrementalR2
   -- (1 - rss_full/tss) - (1 - rss_cov/tss) = (rss_cov - rss_full)/tss ≥ 0
   have : rss_cov / tss - rss_full / tss = (rss_cov - rss_full) / tss := by ring
@@ -395,20 +392,40 @@ drops to `3/4`.
 
 This formalizes the biological point that equal source `R²` does not determine
 cross-population portability without locus-resolved transport state. -/
+structure TwoLocusTransportModel where
+  sourceSignal : Fin 2 → ℝ
+  transport : Fin 2 → ℝ
+
+noncomputable def TwoLocusTransportModel.sourceVariance (m : TwoLocusTransportModel) : ℝ :=
+  ∑ l, m.sourceSignal l
+
+noncomputable def TwoLocusTransportModel.targetVariance (m : TwoLocusTransportModel) : ℝ :=
+  ∑ l, m.sourceSignal l * m.transport l
+
+noncomputable def TwoLocusTransportModel.sourceR2 (m : TwoLocusTransportModel) : ℝ :=
+  TransportedMetrics.r2FromSignalVariance m.sourceVariance 1
+
+noncomputable def TwoLocusTransportModel.targetR2 (m : TwoLocusTransportModel) : ℝ :=
+  TransportedMetrics.r2FromSignalVariance m.targetVariance 1
+
 theorem same_source_r2_different_portability_two_locus_witness :
-    let sourceSignal : Fin 2 → ℝ := fun _ => 1
-    let stableTransport : Fin 2 → ℝ := fun _ => 1
-    let brokenTransport : Fin 2 → ℝ := fun i => if i = 0 then 1 else 0
-    let sourceVariance : ℝ := ∑ l, sourceSignal l
-    let stableTargetVariance : ℝ := ∑ l, sourceSignal l * stableTransport l
-    let brokenTargetVariance : ℝ := ∑ l, sourceSignal l * brokenTransport l
-    let sourceR2 := TransportedMetrics.r2FromSignalVariance sourceVariance 1
-    let stableTargetR2 := TransportedMetrics.r2FromSignalVariance stableTargetVariance 1
-    let brokenTargetR2 := TransportedMetrics.r2FromSignalVariance brokenTargetVariance 1
-    sourceR2 = stableTargetR2 ∧
-    brokenTargetR2 < stableTargetR2 ∧
-    brokenTargetR2 / sourceR2 = (3 : ℝ) / 4 := by
-  simp [TransportedMetrics.r2FromSignalVariance]
+    ∃ (stable broken : TwoLocusTransportModel),
+      stable.sourceR2 = broken.sourceR2 ∧
+      stable.sourceR2 = stable.targetR2 ∧
+      broken.targetR2 < stable.targetR2 ∧
+      broken.targetR2 / stable.sourceR2 = (3 : ℝ) / 4 := by
+  let stable : TwoLocusTransportModel := {
+    sourceSignal := fun _ => 1,
+    transport := fun _ => 1
+  }
+  let broken : TwoLocusTransportModel := {
+    sourceSignal := fun _ => 1,
+    transport := fun i => if i = 0 then 1 else 0
+  }
+  use stable, broken
+  unfold TwoLocusTransportModel.sourceR2 TwoLocusTransportModel.targetR2
+  unfold TwoLocusTransportModel.sourceVariance TwoLocusTransportModel.targetVariance
+  simp [TransportedMetrics.r2FromSignalVariance, stable, broken]
   norm_num
 
 end SourceR2Insufficiency
