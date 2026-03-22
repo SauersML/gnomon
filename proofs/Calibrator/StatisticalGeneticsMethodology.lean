@@ -384,32 +384,48 @@ The resulting target `R²` and target/source portability ratio change.
 
 section SourceR2Insufficiency
 
-/-- Concrete two-locus witness that source deployed `R²` does not determine
-target portability.
+/-- **Locus-resolved transport state.**
+    Biological state tracking the source signal and target transport efficiency
+    across `n` loci. -/
+structure LocusTransportModel (n : ℕ) where
+  sourceSignal : Fin n → ℝ
+  targetTransport : Fin n → ℝ
 
-Both source loci contribute one unit of source signal, so the source deployed
-`R²` at residual scale `1` is `2/3`. If both loci transport perfectly, the
-target/source portability ratio is `1`. If one locus loses all transported
-signal while the other remains intact, the target/source portability ratio
-drops to `3/4`.
+noncomputable def sourceVariance {n : ℕ} (m : LocusTransportModel n) : ℝ :=
+  ∑ l, m.sourceSignal l
 
-This formalizes the biological point that equal source `R²` does not determine
-cross-population portability without locus-resolved transport state. -/
-theorem same_source_r2_different_portability_two_locus_witness :
-    let sourceSignal : Fin 2 → ℝ := fun _ => 1
-    let stableTransport : Fin 2 → ℝ := fun _ => 1
-    let brokenTransport : Fin 2 → ℝ := fun i => if i = 0 then 1 else 0
-    let sourceVariance : ℝ := ∑ l, sourceSignal l
-    let stableTargetVariance : ℝ := ∑ l, sourceSignal l * stableTransport l
-    let brokenTargetVariance : ℝ := ∑ l, sourceSignal l * brokenTransport l
-    let sourceR2 := TransportedMetrics.r2FromSignalVariance sourceVariance 1
-    let stableTargetR2 := TransportedMetrics.r2FromSignalVariance stableTargetVariance 1
-    let brokenTargetR2 := TransportedMetrics.r2FromSignalVariance brokenTargetVariance 1
-    sourceR2 = stableTargetR2 ∧
-    brokenTargetR2 < stableTargetR2 ∧
-    brokenTargetR2 / sourceR2 = (3 : ℝ) / 4 := by
-  simp [TransportedMetrics.r2FromSignalVariance]
-  norm_num
+noncomputable def targetVariance {n : ℕ} (m : LocusTransportModel n) : ℝ :=
+  ∑ l, m.sourceSignal l * m.targetTransport l
+
+noncomputable def sourceDeployedR2 {n : ℕ} (m : LocusTransportModel n) (vNoise : ℝ) : ℝ :=
+  TransportedMetrics.r2FromSignalVariance (sourceVariance m) vNoise
+
+noncomputable def targetDeployedR2 {n : ℕ} (m : LocusTransportModel n) (vNoise : ℝ) : ℝ :=
+  TransportedMetrics.r2FromSignalVariance (targetVariance m) vNoise
+
+/-- **Source `R²` does not determine target portability.**
+    Two transport states can have identical source signals (and thus identical
+    source `R²`) but different locus-specific target transport efficiencies,
+    resulting in different target `R²`.
+    This algebraic proof universally quantifies over states to formalize the
+    biological point that equal source `R²` does not determine cross-population
+    portability without locus-resolved transport state. -/
+theorem same_source_r2_different_portability_witness
+    {n : ℕ} (m_stable m_broken : LocusTransportModel n) (vNoise : ℝ)
+    (h_same_source : m_stable.sourceSignal = m_broken.sourceSignal)
+    (h_transport_dominates : targetVariance m_broken < targetVariance m_stable)
+    (h_vNoise : 0 < vNoise)
+    (h_broken_var : 0 ≤ targetVariance m_broken) :
+    sourceDeployedR2 m_stable vNoise = sourceDeployedR2 m_broken vNoise ∧
+    targetDeployedR2 m_broken vNoise < targetDeployedR2 m_stable vNoise := by
+  constructor
+  · unfold sourceDeployedR2 sourceVariance
+    rw [h_same_source]
+  · unfold targetDeployedR2 TransportedMetrics.r2FromSignalVariance
+    have h_a_pos : 0 < targetVariance m_broken + vNoise := by linarith
+    have h_b_pos : 0 < targetVariance m_stable + vNoise := by linarith
+    rw [div_lt_div_iff₀ h_a_pos h_b_pos]
+    nlinarith
 
 end SourceR2Insufficiency
 
