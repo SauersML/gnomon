@@ -514,17 +514,21 @@ theorem survivorship_attenuates_in_older (m : SurvivorshipAttenuationModel) :
       < m.r2_full * 1 := by exact mul_lt_mul_of_pos_left h_ratio_lt_one m.r2_full_pos
     _ = m.r2_full := by ring
 
+structure MultiPopSurvivorshipModel where
+  source : SurvivorshipAttenuationModel
+  target : SurvivorshipAttenuationModel
+  r2_full_eq : source.r2_full = target.r2_full
+  stronger_truncation : target.var_surv / target.var_birth < source.var_surv / source.var_birth
+
 /-- **Differential survivorship across populations creates portability artifact.**
     If the target population has different age structure or mortality patterns,
     survivorship bias contributes to apparent portability loss. -/
 theorem differential_survivorship_artifact
-    (r2_source_full r2_target_full Δ_surv_source Δ_surv_target : ℝ)
-    (h_surv_s : 0 ≤ Δ_surv_source) (h_surv_t : 0 ≤ Δ_surv_target)
-    (h_diff : Δ_surv_target > Δ_surv_source)
-    (h_obs_s : r2_source_full - Δ_surv_source > 0) :
-    (r2_source_full - Δ_surv_source) - (r2_target_full - Δ_surv_target) >
-      r2_source_full - r2_target_full := by
-  linarith
+    (m : MultiPopSurvivorshipModel) :
+    m.target.r2_surv < m.source.r2_surv := by
+  unfold SurvivorshipAttenuationModel.r2_surv
+  rw [m.r2_full_eq]
+  exact mul_lt_mul_of_pos_left m.stronger_truncation m.target.r2_full_pos
 
 end SurvivorshipBias
 
@@ -714,14 +718,29 @@ theorem weak_instrument_bias_increases
     linarith
   linarith
 
+structure MRPleiotropyModel where
+  β_causal : ℝ
+  α_pleio : ℝ
+
+noncomputable def MRPleiotropyModel.observed_effect (m : MRPleiotropyModel) : ℝ :=
+  m.β_causal + m.α_pleio
+
+structure MultiPopMRPleiotropyModel where
+  source : MRPleiotropyModel
+  target : MRPleiotropyModel
+  causal_eq : source.β_causal = target.β_causal
+  pleio_diff : source.α_pleio ≠ target.α_pleio
+
 /-- **Horizontal pleiotropy patterns differ across populations.**
     If pleiotropic effects change across populations (due to different
     LD patterns or gene regulation), MR estimates are not portable. -/
 theorem pleiotropy_changes_invalidate_mr
-    (β_causal α_pleio_source α_pleio_target : ℝ)
-    (h_diff : α_pleio_source ≠ α_pleio_target) :
-    β_causal + α_pleio_source ≠ β_causal + α_pleio_target := by
-  intro h; exact h_diff (by linarith)
+    (m : MultiPopMRPleiotropyModel) :
+    m.source.observed_effect ≠ m.target.observed_effect := by
+  unfold MRPleiotropyModel.observed_effect
+  rw [m.causal_eq]
+  intro h
+  exact m.pleio_diff (by linarith)
 
 end MRPortability
 
