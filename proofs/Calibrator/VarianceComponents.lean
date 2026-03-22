@@ -224,21 +224,29 @@ theorem portability_reduces_ceiling
         · exact mul_nonneg (le_of_lt h_h2) (by linarith)
     _ = h2_snp := by ring
 
+/-- **The three-way ceiling model.**
+    Combines heritability, GWAS power, and cross-population portability. -/
+structure ThreeWayModel where
+  h2 : ℝ
+  power : ℝ
+  portability : ℝ
+
+/-- The maximum achievable R² under the three-way decomposition. -/
+noncomputable def pgsThreeWayCeiling (m : ThreeWayModel) : ℝ :=
+  m.h2 * m.power * m.portability
+
 /-- **The three-way ceiling decomposition.**
-    R²_target ≤ h² × (GWAS power) × (portability ratio).
+    The target R² ceiling is bounded by 1, constructed purely from the model
+    parameters, avoiding vacuously asserting the bound as a hypothesis.
     Each factor is ≤ 1, and the product can be very small. -/
-theorem three_way_ceiling
-    (h2 gwas_power port_ratio target_r2 : ℝ)
-    (h_h2_le : h2 ≤ 1) (h_power_le : gwas_power ≤ 1)
-    (h_port_le : port_ratio ≤ 1)
-    (h_h2_nn : 0 ≤ h2) (h_power_nn : 0 ≤ gwas_power) (h_port_nn : 0 ≤ port_ratio)
-    (h_bound : target_r2 ≤ h2 * gwas_power * port_ratio) :
-    target_r2 ≤ 1 := by
-  have : h2 * gwas_power * port_ratio ≤ 1 := by
-    calc h2 * gwas_power * port_ratio
-        ≤ 1 * 1 * 1 := by nlinarith [mul_nonneg h_h2_nn h_power_nn]
-      _ = 1 := by ring
-  linarith
+theorem three_way_ceiling (m : ThreeWayModel)
+    (h_h2_le : m.h2 ≤ 1) (h_power_le : m.power ≤ 1) (h_port_le : m.portability ≤ 1)
+    (h_h2_nn : 0 ≤ m.h2) (h_power_nn : 0 ≤ m.power) (h_port_nn : 0 ≤ m.portability) :
+    pgsThreeWayCeiling m ≤ 1 := by
+  unfold pgsThreeWayCeiling
+  calc m.h2 * m.power * m.portability
+      ≤ 1 * 1 * 1 := by nlinarith [mul_nonneg h_h2_nn h_power_nn]
+    _ = 1 := by ring
 
 end PGSCeiling
 
