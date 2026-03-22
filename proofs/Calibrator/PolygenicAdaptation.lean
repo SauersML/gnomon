@@ -334,15 +334,33 @@ theorem stratification_reduces_adaptation_signal
     0 < signal_raw - strat_bias ∧ signal_raw - strat_bias < signal_raw := by
   exact ⟨by linarith, by linarith⟩
 
+/-- **Model for portability loss due to stratification bias.** -/
+structure ConfoundedPortabilityModel where
+  /-- True portability of the polygenic score -/
+  port_true : ℝ
+  /-- Portability loss strictly caused by stratification bias -/
+  confound_bias : ℝ
+  /-- The true portability is positive -/
+  h_port_pos : 0 < port_true
+  /-- The confounding bias artificially degrades apparent portability -/
+  h_bias_pos : 0 < confound_bias
+
+/-- The apparent portability is the true portability minus the artifactual loss -/
+noncomputable def ConfoundedPortabilityModel.port_apparent (m : ConfoundedPortabilityModel) : ℝ :=
+  m.port_true - m.confound_bias
+
 /-- **Implications for portability.**
     If apparent adaptation is actually stratification:
     - The true portability may be better than expected
     - But the PGS itself may be biased by stratification
     Both effects need correction for accurate portability assessment. -/
 theorem confounding_overestimates_portability_loss
-    (port_apparent port_true : ℝ)
-    (h_overestimated : port_apparent < port_true) :
-    0 < port_true - port_apparent := by linarith
+    (m : ConfoundedPortabilityModel) :
+    m.port_apparent < m.port_true ∧ 0 < m.port_true - m.port_apparent := by
+  unfold ConfoundedPortabilityModel.port_apparent
+  constructor
+  · linarith [m.h_bias_pos]
+  · linarith [m.h_bias_pos]
 
 /-- **Multi-trait adaptation.**
     Selection on one trait affects correlated traits via pleiotropy.
