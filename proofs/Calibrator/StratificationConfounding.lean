@@ -322,20 +322,64 @@ theorem collider_attenuates_association (m : ColliderModel) :
       < m.β_G * 1 := by exact mul_lt_mul_of_pos_left h_ratio_lt_one m.β_G_pos
     _ = m.β_G := by ring
 
+/-- **Multi-population collider model.**
+    Captures differential ascertainment between source and target populations.
+    The target population has stronger collider bias (more severe ascertainment),
+    meaning the attenuation factor is smaller. -/
+structure MultiPopColliderModel where
+  source : ColliderModel
+  target : ColliderModel
+  -- The attenuation ratio is σ2_G / (σ2_G + σ2_E).
+  -- More severe ascertainment in target means smaller attenuation ratio.
+  target_more_severe :
+    target.σ2_G / (target.σ2_G + target.σ2_E) < source.σ2_G / (source.σ2_G + source.σ2_E)
+
 /-- **Differential ascertainment creates portability artifact.**
-    If source and target cohorts have different ascertainment patterns,
-    the apparent portability drop includes an ascertainment component. -/
-theorem differential_ascertainment_artifact
-    (r2_source_pop r2_target_pop r2_source_asc r2_target_asc : ℝ)
-    (h_source_asc : r2_source_asc < r2_source_pop)
-    (h_target_asc : r2_target_asc < r2_target_pop)
-    -- Different ascertainment severity
-    (h_diff_severity : r2_target_pop - r2_target_asc < r2_source_pop - r2_source_asc) :
-    -- Apparent portability drop is larger than true portability drop
-    r2_source_asc - r2_target_asc > r2_source_pop - r2_target_pop →
-      False := by
-  intro h
-  linarith
+    If the target cohort has more severe ascertainment (stronger collider bias),
+    the apparent association ratio between target and source is strictly less
+    than the true association ratio.
+    (β_selected_target / β_selected_source) < (β_G_target / β_G_source) -/
+theorem differential_ascertainment_artifact (m : MultiPopColliderModel) :
+    m.target.β_selected / m.source.β_selected < m.target.β_G / m.source.β_G := by
+  unfold ColliderModel.β_selected
+  -- target.β_G * target_ratio / (source.β_G * source_ratio) < target.β_G / source.β_G
+  -- Let R_t = target_ratio, R_s = source_ratio. We have R_t < R_s.
+  -- R_t / R_s < 1.
+  -- Multiplying by target.β_G / source.β_G gives the result.
+  have h_source_ratio_pos : 0 < m.source.σ2_G / (m.source.σ2_G + m.source.σ2_E) := by
+    apply div_pos m.source.σ2_G_pos
+    linarith [m.source.σ2_G_pos, m.source.σ2_E_pos]
+  have h_target_ratio_pos : 0 < m.target.σ2_G / (m.target.σ2_G + m.target.σ2_E) := by
+    apply div_pos m.target.σ2_G_pos
+    linarith [m.target.σ2_G_pos, m.target.σ2_E_pos]
+  have h_source_beta_pos : 0 < m.source.β_G := m.source.β_G_pos
+  have h_target_beta_pos : 0 < m.target.β_G := m.target.β_G_pos
+  have h_source_selected_pos : 0 < m.source.β_G * (m.source.σ2_G / (m.source.σ2_G + m.source.σ2_E)) :=
+    mul_pos h_source_beta_pos h_source_ratio_pos
+
+  -- Rewrite the left side
+  have h_lhs : (m.target.β_G * (m.target.σ2_G / (m.target.σ2_G + m.target.σ2_E))) /
+               (m.source.β_G * (m.source.σ2_G / (m.source.σ2_G + m.source.σ2_E))) =
+               (m.target.β_G / m.source.β_G) *
+               ((m.target.σ2_G / (m.target.σ2_G + m.target.σ2_E)) /
+                (m.source.σ2_G / (m.source.σ2_G + m.source.σ2_E))) := by ring
+
+  rw [h_lhs]
+
+  -- The ratio of ratios is < 1
+  have h_ratio_lt_one : (m.target.σ2_G / (m.target.σ2_G + m.target.σ2_E)) /
+                        (m.source.σ2_G / (m.source.σ2_G + m.source.σ2_E)) < 1 := by
+    rw [div_lt_one h_source_ratio_pos]
+    exact m.target_more_severe
+
+  -- Multiply by target.β_G / source.β_G
+  have h_beta_ratio_pos : 0 < m.target.β_G / m.source.β_G := div_pos h_target_beta_pos h_source_beta_pos
+
+  calc (m.target.β_G / m.source.β_G) *
+       ((m.target.σ2_G / (m.target.σ2_G + m.target.σ2_E)) /
+        (m.source.σ2_G / (m.source.σ2_G + m.source.σ2_E)))
+      < (m.target.β_G / m.source.β_G) * 1 := by exact mul_lt_mul_of_pos_left h_ratio_lt_one h_beta_ratio_pos
+    _ = m.target.β_G / m.source.β_G := by ring
 
 end ColliderBias
 
@@ -514,17 +558,53 @@ theorem survivorship_attenuates_in_older (m : SurvivorshipAttenuationModel) :
       < m.r2_full * 1 := by exact mul_lt_mul_of_pos_left h_ratio_lt_one m.r2_full_pos
     _ = m.r2_full := by ring
 
+/-- **Multi-population survivorship attenuation model.**
+    Captures differential survivorship between source and target populations.
+    The target population has stronger survivorship bias (more variance reduction),
+    meaning the variance ratio (survivors / birth) is smaller. -/
+structure MultiPopSurvivorshipModel where
+  source : SurvivorshipAttenuationModel
+  target : SurvivorshipAttenuationModel
+  -- More severe survivorship bias in target means a smaller variance ratio.
+  target_more_severe :
+    target.var_surv / target.var_birth < source.var_surv / source.var_birth
+
 /-- **Differential survivorship across populations creates portability artifact.**
-    If the target population has different age structure or mortality patterns,
-    survivorship bias contributes to apparent portability loss. -/
-theorem differential_survivorship_artifact
-    (r2_source_full r2_target_full Δ_surv_source Δ_surv_target : ℝ)
-    (h_surv_s : 0 ≤ Δ_surv_source) (h_surv_t : 0 ≤ Δ_surv_target)
-    (h_diff : Δ_surv_target > Δ_surv_source)
-    (h_obs_s : r2_source_full - Δ_surv_source > 0) :
-    (r2_source_full - Δ_surv_source) - (r2_target_full - Δ_surv_target) >
-      r2_source_full - r2_target_full := by
-  linarith
+    If the target population has stronger survivorship bias (e.g., higher mortality),
+    the apparent portability ratio (survivor R² ratio) is strictly less than
+    the true portability ratio (birth cohort R² ratio).
+    (R²_surv_target / R²_surv_source) < (R²_full_target / R²_full_source) -/
+theorem differential_survivorship_artifact (m : MultiPopSurvivorshipModel) :
+    m.target.r2_surv / m.source.r2_surv < m.target.r2_full / m.source.r2_full := by
+  unfold SurvivorshipAttenuationModel.r2_surv
+  -- target.r2_full * target_ratio / (source.r2_full * source_ratio)
+  -- = (target.r2_full / source.r2_full) * (target_ratio / source_ratio)
+  -- Since target_ratio < source_ratio, the second term is < 1.
+
+  have h_source_ratio_pos : 0 < m.source.var_surv / m.source.var_birth := by
+    apply div_pos m.source.var_surv_pos m.source.var_birth_pos
+
+  have h_lhs : (m.target.r2_full * (m.target.var_surv / m.target.var_birth)) /
+               (m.source.r2_full * (m.source.var_surv / m.source.var_birth)) =
+               (m.target.r2_full / m.source.r2_full) *
+               ((m.target.var_surv / m.target.var_birth) /
+                (m.source.var_surv / m.source.var_birth)) := by ring
+
+  rw [h_lhs]
+
+  have h_ratio_lt_one : (m.target.var_surv / m.target.var_birth) /
+                        (m.source.var_surv / m.source.var_birth) < 1 := by
+    rw [div_lt_one h_source_ratio_pos]
+    exact m.target_more_severe
+
+  have h_r2_ratio_pos : 0 < m.target.r2_full / m.source.r2_full := by
+    apply div_pos m.target.r2_full_pos m.source.r2_full_pos
+
+  calc (m.target.r2_full / m.source.r2_full) *
+       ((m.target.var_surv / m.target.var_birth) /
+        (m.source.var_surv / m.source.var_birth))
+      < (m.target.r2_full / m.source.r2_full) * 1 := by exact mul_lt_mul_of_pos_left h_ratio_lt_one h_r2_ratio_pos
+    _ = m.target.r2_full / m.source.r2_full := by ring
 
 end SurvivorshipBias
 
