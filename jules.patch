@@ -1,0 +1,95 @@
+diff --git a/proofs/Calibrator/StatisticalGeneticsMethodology.lean b/proofs/Calibrator/StatisticalGeneticsMethodology.lean
+index 3250495..74aa504 100644
+--- a/proofs/Calibrator/StatisticalGeneticsMethodology.lean
++++ b/proofs/Calibrator/StatisticalGeneticsMethodology.lean
+@@ -384,6 +384,32 @@ The resulting target `R²` and target/source portability ratio change.
+ 
+ section SourceR2Insufficiency
+ 
++/-- A generic state representing a two-locus architecture and a specific
++transport outcome to a target population. -/
++structure TwoLocusTransportState where
++  /-- Signal contributed by each locus in the source population. -/
++  sourceSignal : Fin 2 → ℝ
++  /-- Proportion of signal remaining in the target population per locus. -/
++  targetTransport : Fin 2 → ℝ
++  /-- Residual variance in both populations (assumed equal for this witness). -/
++  residualVariance : ℝ
++
++/-- The total deployed signal variance in the source population. -/
++noncomputable def sourceVariance (s : TwoLocusTransportState) : ℝ :=
++  ∑ l, s.sourceSignal l
++
++/-- The total deployed signal variance in the target population under the transport model. -/
++noncomputable def targetVariance (s : TwoLocusTransportState) : ℝ :=
++  ∑ l, s.sourceSignal l * s.targetTransport l
++
++/-- The deployed `R²` in the source population. -/
++noncomputable def sourceR2 (s : TwoLocusTransportState) : ℝ :=
++  TransportedMetrics.r2FromSignalVariance (sourceVariance s) s.residualVariance
++
++/-- The deployed `R²` in the target population. -/
++noncomputable def targetR2 (s : TwoLocusTransportState) : ℝ :=
++  TransportedMetrics.r2FromSignalVariance (targetVariance s) s.residualVariance
++
+ /-- Concrete two-locus witness that source deployed `R²` does not determine
+ target portability.
+ 
+@@ -394,22 +420,42 @@ signal while the other remains intact, the target/source portability ratio
+ drops to `3/4`.
+ 
+ This formalizes the biological point that equal source `R²` does not determine
+-cross-population portability without locus-resolved transport state. -/
++cross-population portability without locus-resolved transport state.
++This replaces the previous trivial inline witness with a structural model evaluation. -/
+ theorem same_source_r2_different_portability_two_locus_witness :
+-    let sourceSignal : Fin 2 → ℝ := fun _ => 1
+-    let stableTransport : Fin 2 → ℝ := fun _ => 1
+-    let brokenTransport : Fin 2 → ℝ := fun i => if i = 0 then 1 else 0
+-    let sourceVariance : ℝ := ∑ l, sourceSignal l
+-    let stableTargetVariance : ℝ := ∑ l, sourceSignal l * stableTransport l
+-    let brokenTargetVariance : ℝ := ∑ l, sourceSignal l * brokenTransport l
+-    let sourceR2 := TransportedMetrics.r2FromSignalVariance sourceVariance 1
+-    let stableTargetR2 := TransportedMetrics.r2FromSignalVariance stableTargetVariance 1
+-    let brokenTargetR2 := TransportedMetrics.r2FromSignalVariance brokenTargetVariance 1
+-    sourceR2 = stableTargetR2 ∧
+-    brokenTargetR2 < stableTargetR2 ∧
+-    brokenTargetR2 / sourceR2 = (3 : ℝ) / 4 := by
+-  simp [TransportedMetrics.r2FromSignalVariance]
+-  norm_num
++    ∃ (stable broken : TwoLocusTransportState),
++      -- Both models have the exact same source architecture and residual scale.
++      stable.sourceSignal = broken.sourceSignal ∧
++      stable.residualVariance = broken.residualVariance ∧
++      -- But their target environments differ in which loci transport.
++      stable.targetTransport ≠ broken.targetTransport ∧
++      -- The source `R²` is therefore identical.
++      sourceR2 stable = sourceR2 broken ∧
++      -- But the target `R²` differs, proving source `R²` is insufficient.
++      targetR2 broken < targetR2 stable ∧
++      -- And we can witness a specific structural degradation ratio.
++      targetR2 broken / sourceR2 broken = 3 / 4 := by
++  let stable : TwoLocusTransportState := {
++    sourceSignal := fun _ => 1
++    targetTransport := fun _ => 1
++    residualVariance := 1
++  }
++  let broken : TwoLocusTransportState := {
++    sourceSignal := fun _ => 1
++    targetTransport := fun i => if i = 0 then 1 else 0
++    residualVariance := 1
++  }
++  use stable, broken
++  refine ⟨rfl, rfl, ?_, rfl, ?_, ?_⟩
++  · intro h
++    have h0 : stable.targetTransport 1 = broken.targetTransport 1 := congrFun h 1
++    simp [stable, broken] at h0
++  · dsimp [sourceR2, targetR2, sourceVariance, targetVariance, TransportedMetrics.r2FromSignalVariance]
++    simp [broken]
++    norm_num
++  · dsimp [sourceR2, targetR2, sourceVariance, targetVariance, TransportedMetrics.r2FromSignalVariance]
++    simp [broken]
++    norm_num
+ 
+ end SourceR2Insufficiency
+ 
