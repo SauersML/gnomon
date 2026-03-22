@@ -839,26 +839,78 @@ theorem prevalence_dominates_sensitivity_for_recall
     rwa [div_lt_div_iff₀ h_sens₂ h_cases₁] at h_sens_ratio
   simpa [mul_comm] using htp
 
+noncomputable def diseasePrecision (tp fp : ℝ) : ℝ := tp / (tp + fp)
+noncomputable def diseaseRecall (tp fn : ℝ) : ℝ := tp / (tp + fn)
+
 /-- **Asthma vs T2D portability difference.**
     For asthma, precision and recall decay similarly → qualitatively similar.
     For T2D, they diverge → qualitatively different.
     The difference is driven by the prevalence-distance relationship. -/
 theorem different_diseases_different_portability_patterns
-    -- Asthma: both metrics decay
-    (prec_asthma_near prec_asthma_far : ℝ)
-    (rec_asthma_near rec_asthma_far : ℝ)
-    (h_prec_asthma_drops : prec_asthma_far < prec_asthma_near)
-    (h_rec_asthma_drops : rec_asthma_far < rec_asthma_near)
-    -- T2D: precision constant, recall increases
-    (prec_t2d_near prec_t2d_far : ℝ)
-    (rec_t2d_near rec_t2d_far : ℝ)
-    (h_prec_t2d_const : prec_t2d_near = prec_t2d_far)
-    (h_rec_t2d_up : rec_t2d_near < rec_t2d_far)
-    :
-    -- The diseases show qualitatively different portability patterns
-    (prec_asthma_far < prec_asthma_near ∧ rec_asthma_far < rec_asthma_near) ∧
-    (prec_t2d_near = prec_t2d_far ∧ rec_t2d_near < rec_t2d_far) :=
-  ⟨⟨h_prec_asthma_drops, h_rec_asthma_drops⟩, ⟨h_prec_t2d_const, h_rec_t2d_up⟩⟩
+    -- Asthma parameters
+    (tp_a_near tp_a_far fp_a_near fp_a_far fn_a_near fn_a_far : ℝ)
+    -- T2D parameters
+    (tp_t_near tp_t_far fp_t_near fp_t_far fn_t_near fn_t_far : ℝ)
+    -- Positivity assumptions
+    (htp_an : 0 < tp_a_near) (htp_af : 0 < tp_a_far)
+    (hfp_an : 0 < fp_a_near) (hfp_af : 0 < fp_a_far)
+    (hfn_an : 0 < fn_a_near) (hfn_af : 0 < fn_a_far)
+    (htp_tn : 0 < tp_t_near) (htp_tf : 0 < tp_t_far)
+    (hfp_tn : 0 < fp_t_near) (_hfp_tf : 0 < fp_t_far)
+    (hfn_tn : 0 < fn_t_near) (hfn_tf : 0 < fn_t_far)
+    -- Asthma: worse performance in far population
+    (_ha_tp : tp_a_far < tp_a_near)
+    (ha_fp : fp_a_near * tp_a_far < fp_a_far * tp_a_near)
+    (ha_fn : fn_a_near * tp_a_far < fn_a_far * tp_a_near)
+    -- T2D: prevalence shifts proportionally for positives, but sensitivity changes
+    (k : ℝ) (hk : 1 < k)
+    (ht_tp : tp_t_far = k * tp_t_near)
+    (ht_fp : fp_t_far = k * fp_t_near)
+    (ht_fn : fn_t_far < k * fn_t_near) :
+    (diseasePrecision tp_a_far fp_a_far < diseasePrecision tp_a_near fp_a_near ∧
+     diseaseRecall tp_a_far fn_a_far < diseaseRecall tp_a_near fn_a_near) ∧
+    (diseasePrecision tp_t_near fp_t_near = diseasePrecision tp_t_far fp_t_far ∧
+     diseaseRecall tp_t_near fn_t_near < diseaseRecall tp_t_far fn_t_far) := by
+  constructor
+  · constructor
+    · unfold diseasePrecision
+      have hc : 0 < tp_a_far + fp_a_far := add_pos htp_af hfp_af
+      have hd : 0 < tp_a_near + fp_a_near := add_pos htp_an hfp_an
+      have h3 : tp_a_far * (tp_a_near + fp_a_near) < tp_a_near * (tp_a_far + fp_a_far) := by
+        nlinarith
+      exact (div_lt_div_iff₀ hc hd).mpr h3
+    · unfold diseaseRecall
+      have hc : 0 < tp_a_far + fn_a_far := add_pos htp_af hfn_af
+      have hd : 0 < tp_a_near + fn_a_near := add_pos htp_an hfn_an
+      have h3 : tp_a_far * (tp_a_near + fn_a_near) < tp_a_near * (tp_a_far + fn_a_far) := by
+        nlinarith
+      exact (div_lt_div_iff₀ hc hd).mpr h3
+  · constructor
+    · unfold diseasePrecision
+      rw [ht_tp, ht_fp]
+      have hkn : k ≠ 0 := by linarith
+      have hd1 : k * tp_t_near + k * fp_t_near = k * (tp_t_near + fp_t_near) := by ring
+      rw [hd1]
+      have hc : 0 < tp_t_near + fp_t_near := add_pos htp_tn hfp_tn
+      have hk1 : tp_t_near / (tp_t_near + fp_t_near) = k * tp_t_near / (k * (tp_t_near + fp_t_near)) := by
+        rw [mul_div_mul_left _ _ hkn]
+      exact hk1
+    · unfold diseaseRecall
+      rw [ht_tp]
+      have hc : 0 < tp_t_near + fn_t_near := add_pos htp_tn hfn_tn
+      have hd : 0 < k * tp_t_near + fn_t_far := add_pos (mul_pos (by linarith) htp_tn) hfn_tf
+      have hcd : k * tp_t_near + fn_t_far < k * tp_t_near + k * fn_t_near := by linarith
+      have h1 : tp_t_near / (tp_t_near + fn_t_near) = k * tp_t_near / (k * (tp_t_near + fn_t_near)) := by
+        have hkn : k ≠ 0 := by linarith
+        rw [mul_div_mul_left _ _ hkn]
+      rw [h1]
+      have ha : 0 < k * tp_t_near := mul_pos (by linarith) htp_tn
+      have hd_pos : 0 < k * (tp_t_near + fn_t_near) := mul_pos (by linarith) hc
+      have ht_fn2 : k * (tp_t_near + fn_t_near) = k * tp_t_near + k * fn_t_near := by ring
+      have h3 : (k * tp_t_near) * (k * tp_t_near + fn_t_far) < (k * tp_t_near) * (k * (tp_t_near + fn_t_near)) := by
+        rw [ht_fn2]
+        nlinarith
+      exact (div_lt_div_iff₀ hd_pos hd).mpr h3
 
 end DiseasePortability
 
