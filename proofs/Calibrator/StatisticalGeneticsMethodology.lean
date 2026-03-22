@@ -337,39 +337,71 @@ section GeneticCorrelationMethods
     This matters because ρ̂_g predicts portability.
     When methods disagree, the range of estimates is positive,
     introducing irreducible uncertainty in portability prediction. -/
-theorem method_disagreement_increases_uncertainty
-    (rho_ldsc rho_popcorn rho_sumher : ℝ)
-    (h_order : rho_popcorn < rho_ldsc)
-    (h_order₂ : rho_ldsc < rho_sumher) :
+structure CorrelationMethodModel where
+  rho_popcorn : ℝ
+  rho_ldsc : ℝ
+  rho_sumher : ℝ
+  h_order : rho_popcorn < rho_ldsc
+  h_order₂ : rho_ldsc < rho_sumher
+
+/-- Defines the range of uncertainty across different correlation methods. -/
+noncomputable def uncertaintyRange (m : CorrelationMethodModel) : ℝ :=
+  m.rho_sumher - m.rho_popcorn
+
+theorem method_disagreement_increases_uncertainty (m : CorrelationMethodModel) :
     -- The range of estimates is strictly positive
-    0 < rho_sumher - rho_popcorn := by linarith
+    0 < uncertaintyRange m := by
+  unfold uncertaintyRange
+  linarith [m.h_order, m.h_order₂]
 
 /-- **Genetic correlation varies across the genome.**
     ρ_g estimated from different genomic regions can vary,
     reflecting locus-specific selection pressures.
     The genome-wide estimate is a weighted average of per-region estimates,
     so it falls between the extremes. -/
-theorem local_genetic_correlation_varies
-    (rho_chr1 rho_chr6 : ℝ) (w₁ w₆ : ℝ)
-    (h_chr6_lower : rho_chr6 < rho_chr1) -- HLA region has lower correlation
-    (h_w1 : 0 < w₁) (h_w6 : 0 < w₆) :
+structure LocalCorrelationModel where
+  rho_chr1 : ℝ
+  rho_chr6 : ℝ
+  w₁ : ℝ
+  w₆ : ℝ
+  h_chr6_lower : rho_chr6 < rho_chr1
+  h_w1 : 0 < w₁
+  h_w6 : 0 < w₆
+
+/-- Defines the genome-wide correlation as a weighted average. -/
+noncomputable def genomeWideCorrelation (m : LocalCorrelationModel) : ℝ :=
+  (m.w₁ * m.rho_chr1 + m.w₆ * m.rho_chr6) / (m.w₁ + m.w₆)
+
+theorem local_genetic_correlation_varies (m : LocalCorrelationModel) :
     -- Genome-wide weighted average is between the two regional estimates
-    rho_chr6 < (w₁ * rho_chr1 + w₆ * rho_chr6) / (w₁ + w₆) := by
-  rw [lt_div_iff₀ (by linarith : (0:ℝ) < w₁ + w₆)]
-  nlinarith
+    m.rho_chr6 < genomeWideCorrelation m := by
+  unfold genomeWideCorrelation
+  rw [lt_div_iff₀ (by linarith [m.h_w1, m.h_w6])]
+  nlinarith [m.h_w1, m.h_chr6_lower]
 
 /-- **Genetic correlation is frequency-dependent.**
     Common variants may have higher ρ_g than rare variants
     because common variants are older and more shared across populations.
     Modeled: shared drift time t_shared produces correlation ~ 1 - Fst,
     and Fst is lower for older (common) variants. -/
-theorem common_variants_higher_correlation
-    (fst_common fst_rare : ℝ)
-    (h_fst_common : 0 ≤ fst_common) (h_fst_common_lt : fst_common < 1)
-    (h_fst_rare : 0 ≤ fst_rare) (h_fst_rare_lt : fst_rare < 1)
-    (h_older_less_diverged : fst_common < fst_rare) :
+structure FstModel where
+  fst_common : ℝ
+  fst_rare : ℝ
+  h_fst_common : 0 ≤ fst_common
+  h_fst_common_lt : fst_common < 1
+  h_fst_rare : 0 ≤ fst_rare
+  h_fst_rare_lt : fst_rare < 1
+  h_older_less_diverged : fst_common < fst_rare
+
+/-- Defines genetic correlation functionally bounded by Fst. -/
+noncomputable def geneticCorrelationFromFst (fst : ℝ) : ℝ :=
+  1 - fst
+
+theorem common_variants_higher_correlation (m : FstModel) :
     -- ρ_g ~ 1 - Fst, so lower Fst → higher correlation
-    1 - fst_rare < 1 - fst_common := by linarith
+    geneticCorrelationFromFst m.fst_rare < geneticCorrelationFromFst m.fst_common := by
+  unfold geneticCorrelationFromFst
+  linarith [m.h_older_less_diverged]
 
 end GeneticCorrelationMethods
 
