@@ -514,16 +514,32 @@ theorem survivorship_attenuates_in_older (m : SurvivorshipAttenuationModel) :
       < m.r2_full * 1 := by exact mul_lt_mul_of_pos_left h_ratio_lt_one m.r2_full_pos
     _ = m.r2_full := by ring
 
+/-- **Differential Survivorship Model.**
+    A combined model mapping survivorship across source and target populations. -/
+structure DifferentialSurvivorshipModel where
+  source : SurvivorshipAttenuationModel
+  target : SurvivorshipAttenuationModel
+  /-- The true underlying R² is assumed equal in both populations. -/
+  true_r2_eq : source.r2_full = target.r2_full
+  /-- The target population is older or experiences more severe survivorship bias,
+      leading to a smaller retained variance ratio. -/
+  more_severe_target : target.var_surv / target.var_birth < source.var_surv / source.var_birth
+
 /-- **Differential survivorship across populations creates portability artifact.**
-    If the target population has different age structure or mortality patterns,
-    survivorship bias contributes to apparent portability loss. -/
-theorem differential_survivorship_artifact
-    (r2_source_full r2_target_full Δ_surv_source Δ_surv_target : ℝ)
-    (h_surv_s : 0 ≤ Δ_surv_source) (h_surv_t : 0 ≤ Δ_surv_target)
-    (h_diff : Δ_surv_target > Δ_surv_source)
-    (h_obs_s : r2_source_full - Δ_surv_source > 0) :
-    (r2_source_full - Δ_surv_source) - (r2_target_full - Δ_surv_target) >
-      r2_source_full - r2_target_full := by
+    If the target population experiences more severe survivorship bias (e.g., due to
+    different age structure or mortality patterns), the apparent portability loss
+    (difference in surviving R²) will be strictly positive even when the true R²
+    is identical across populations. -/
+theorem differential_survivorship_artifact (m : DifferentialSurvivorshipModel) :
+    m.source.r2_surv - m.target.r2_surv > 0 := by
+  unfold SurvivorshipAttenuationModel.r2_surv
+  rw [m.true_r2_eq]
+  have h_pos : 0 < m.target.r2_full := m.target.r2_full_pos
+  have h_lt : m.target.var_surv / m.target.var_birth < m.source.var_surv / m.source.var_birth :=
+    m.more_severe_target
+  have h_mul_lt : m.target.r2_full * (m.target.var_surv / m.target.var_birth) <
+                  m.target.r2_full * (m.source.var_surv / m.source.var_birth) :=
+    (mul_lt_mul_left h_pos).mpr h_lt
   linarith
 
 end SurvivorshipBias
