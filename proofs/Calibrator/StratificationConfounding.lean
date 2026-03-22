@@ -322,19 +322,33 @@ theorem collider_attenuates_association (m : ColliderModel) :
       < m.β_G * 1 := by exact mul_lt_mul_of_pos_left h_ratio_lt_one m.β_G_pos
     _ = m.β_G := by ring
 
+/-- A combined model for differential ascertainment across two populations. -/
+structure MultiPopColliderModel where
+  source : ColliderModel
+  target : ColliderModel
+
+noncomputable def ColliderModel.attenuation (m : ColliderModel) : ℝ :=
+  m.σ2_G / (m.σ2_G + m.σ2_E)
+
+noncomputable def MultiPopColliderModel.trueDrop (m : MultiPopColliderModel) : ℝ :=
+  m.source.β_G - m.target.β_G
+
+noncomputable def MultiPopColliderModel.apparentDrop (m : MultiPopColliderModel) : ℝ :=
+  m.source.β_selected - m.target.β_selected
+
 /-- **Differential ascertainment creates portability artifact.**
     If source and target cohorts have different ascertainment patterns,
     the apparent portability drop includes an ascertainment component. -/
-theorem differential_ascertainment_artifact
-    (r2_source_pop r2_target_pop r2_source_asc r2_target_asc : ℝ)
-    (h_source_asc : r2_source_asc < r2_source_pop)
-    (h_target_asc : r2_target_asc < r2_target_pop)
-    -- Different ascertainment severity
-    (h_diff_severity : r2_target_pop - r2_target_asc < r2_source_pop - r2_source_asc) :
-    -- Apparent portability drop is larger than true portability drop
-    r2_source_asc - r2_target_asc > r2_source_pop - r2_target_pop →
-      False := by
-  intro h
+theorem differential_ascertainment_artifact (m : MultiPopColliderModel)
+    (h_diff_severity : m.target.attenuation < m.source.attenuation)
+    (h_equal_true : m.source.β_G = m.target.β_G) :
+    m.trueDrop < m.apparentDrop := by
+  unfold MultiPopColliderModel.trueDrop MultiPopColliderModel.apparentDrop
+  unfold ColliderModel.β_selected ColliderModel.attenuation at *
+  rw [h_equal_true, sub_self]
+  have h_diff : m.target.β_G * (m.target.σ2_G / (m.target.σ2_G + m.target.σ2_E)) <
+                m.target.β_G * (m.source.σ2_G / (m.source.σ2_G + m.source.σ2_E)) := by
+    exact mul_lt_mul_of_pos_left h_diff_severity m.target.β_G_pos
   linarith
 
 end ColliderBias
