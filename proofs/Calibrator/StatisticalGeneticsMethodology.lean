@@ -384,6 +384,39 @@ The resulting target `R²` and target/source portability ratio change.
 
 section SourceR2Insufficiency
 
+/-- A simple model representing signal transport at two loci. -/
+structure TwoLocusTransportModel where
+  /-- The signal variance at each locus in the source population. -/
+  sourceSignal : Fin 2 → ℝ
+  /-- The proportion of signal preserved at each locus in the target population. -/
+  targetTransport : Fin 2 → ℝ
+
+/-- The total source signal variance across both loci. -/
+noncomputable def TwoLocusTransportModel.sourceVariance (m : TwoLocusTransportModel) : ℝ :=
+  ∑ l, m.sourceSignal l
+
+/-- The total target signal variance across both loci after transport. -/
+noncomputable def TwoLocusTransportModel.targetVariance (m : TwoLocusTransportModel) : ℝ :=
+  ∑ l, m.sourceSignal l * m.targetTransport l
+
+/-- The predictive R² in the source population at residual scale 1. -/
+noncomputable def TwoLocusTransportModel.sourceR2 (m : TwoLocusTransportModel) : ℝ :=
+  TransportedMetrics.r2FromSignalVariance m.sourceVariance 1
+
+/-- The predictive R² in the target population at residual scale 1. -/
+noncomputable def TwoLocusTransportModel.targetR2 (m : TwoLocusTransportModel) : ℝ :=
+  TransportedMetrics.r2FromSignalVariance m.targetVariance 1
+
+/-- A model where both loci transport perfectly. -/
+noncomputable def stableTransportModel : TwoLocusTransportModel where
+  sourceSignal := fun _ => 1
+  targetTransport := fun _ => 1
+
+/-- A model where one locus transports perfectly and the other loses all signal. -/
+noncomputable def brokenTransportModel : TwoLocusTransportModel where
+  sourceSignal := fun _ => 1
+  targetTransport := fun i => if i = 0 then 1 else 0
+
 /-- Concrete two-locus witness that source deployed `R²` does not determine
 target portability.
 
@@ -396,19 +429,14 @@ drops to `3/4`.
 This formalizes the biological point that equal source `R²` does not determine
 cross-population portability without locus-resolved transport state. -/
 theorem same_source_r2_different_portability_two_locus_witness :
-    let sourceSignal : Fin 2 → ℝ := fun _ => 1
-    let stableTransport : Fin 2 → ℝ := fun _ => 1
-    let brokenTransport : Fin 2 → ℝ := fun i => if i = 0 then 1 else 0
-    let sourceVariance : ℝ := ∑ l, sourceSignal l
-    let stableTargetVariance : ℝ := ∑ l, sourceSignal l * stableTransport l
-    let brokenTargetVariance : ℝ := ∑ l, sourceSignal l * brokenTransport l
-    let sourceR2 := TransportedMetrics.r2FromSignalVariance sourceVariance 1
-    let stableTargetR2 := TransportedMetrics.r2FromSignalVariance stableTargetVariance 1
-    let brokenTargetR2 := TransportedMetrics.r2FromSignalVariance brokenTargetVariance 1
-    sourceR2 = stableTargetR2 ∧
-    brokenTargetR2 < stableTargetR2 ∧
-    brokenTargetR2 / sourceR2 = (3 : ℝ) / 4 := by
-  simp [TransportedMetrics.r2FromSignalVariance]
+    stableTransportModel.sourceR2 = brokenTransportModel.sourceR2 ∧
+    stableTransportModel.sourceR2 = stableTransportModel.targetR2 ∧
+    brokenTransportModel.targetR2 < stableTransportModel.targetR2 ∧
+    brokenTransportModel.targetR2 / stableTransportModel.sourceR2 = (3 : ℝ) / 4 := by
+  dsimp [stableTransportModel, brokenTransportModel,
+         TwoLocusTransportModel.sourceR2, TwoLocusTransportModel.targetR2,
+         TwoLocusTransportModel.sourceVariance, TwoLocusTransportModel.targetVariance,
+         TransportedMetrics.r2FromSignalVariance]
   norm_num
 
 end SourceR2Insufficiency
