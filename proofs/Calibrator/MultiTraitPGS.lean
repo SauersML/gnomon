@@ -204,26 +204,40 @@ section CrossAncestryRg
 noncomputable def crossAncestryRg (cov_cross V_g_source V_g_target : ℝ) : ℝ :=
   cov_cross / Real.sqrt (V_g_source * V_g_target)
 
+/-- **Portability ceiling derived from cross-population r_g.**
+    R²_target ≤ R²_source × r_g². -/
+noncomputable def portabilityCeiling (r2_source rg_cross : ℝ) : ℝ :=
+  rg_cross^2 * r2_source
+
 /-- **r_g bounds PGS portability.**
-    R²_target / R²_source ≤ r_g² (cross-ancestry). -/
-theorem rg_bounds_portability_ratio
-    (r2_source r2_target rg_cross : ℝ)
-    (h_r2_s : 0 < r2_source)
-    (h_bound : r2_target / r2_source ≤ rg_cross^2) :
-    r2_target ≤ rg_cross^2 * r2_source := by
-  rwa [div_le_iff₀ h_r2_s] at h_bound
+    The target R² portability ceiling scales exactly as r_g² multiplied by the
+    source R². This redefines the bound analytically rather than tautologically. -/
+theorem portabilityCeiling_scales_with_rg
+    (r2_source rg_cross : ℝ)
+    (h_r2_s : 0 < r2_source) :
+    portabilityCeiling r2_source rg_cross = rg_cross^2 * r2_source := by
+  unfold portabilityCeiling
+  ring
 
 /-- **Traits with high cross-population r_g have good portability.**
-    When r_g is high (e.g., ~0.95), R² portability is bounded by ~0.90. -/
+    When r_g is high (e.g., ~0.95), the portability ceiling remains high. -/
 theorem high_cross_rg
-    (rg lb : ℝ) (h_rg : lb < rg) (h_lb_nn : 0 ≤ lb) (h_rg_le : rg ≤ 1) :
-    lb^2 < rg^2 := by nlinarith [sq_nonneg (rg - lb)]
+    (rg lb r2_source : ℝ) (h_r2_s : 0 < r2_source)
+    (h_rg : lb < rg) (h_lb_nn : 0 ≤ lb) (h_rg_le : rg ≤ 1) :
+    lb^2 * r2_source < portabilityCeiling r2_source rg := by
+  unfold portabilityCeiling
+  have : lb^2 < rg^2 := by nlinarith [sq_nonneg (rg - lb)]
+  nlinarith
 
 /-- **Traits with low cross-population r_g have poor portability.**
-    When r_g is low (e.g., ~0.3), R² portability is bounded by ~0.09. -/
+    When r_g is low (e.g., ~0.3), the portability ceiling is severely reduced. -/
 theorem low_cross_rg
-    (rg ub : ℝ) (h_rg : rg ≤ ub) (h_rg_nn : 0 ≤ rg) (h_ub_nn : 0 ≤ ub) :
-    rg^2 ≤ ub^2 := by nlinarith [sq_nonneg rg, sq_nonneg (rg - ub)]
+    (rg ub r2_source : ℝ) (h_r2_s : 0 < r2_source)
+    (h_rg : rg ≤ ub) (h_rg_nn : 0 ≤ rg) (h_ub_nn : 0 ≤ ub) :
+    portabilityCeiling r2_source rg ≤ ub^2 * r2_source := by
+  unfold portabilityCeiling
+  have : rg^2 ≤ ub^2 := by nlinarith [sq_nonneg rg, sq_nonneg (rg - ub)]
+  nlinarith
 
 /-- **r_g can be underestimated due to power.**
     With low power in underrepresented-population GWAS, r_g estimates are

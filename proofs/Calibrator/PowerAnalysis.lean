@@ -580,14 +580,19 @@ with perfect power.
 
 section EffectSizeHeterogeneity
 
-/-- **Genetic correlation between ancestries.**
+/-- **Portability ceiling derived from cross-population r_g.**
+    The upper bound on cross-ancestry R² given a source R² and genetic correlation. -/
+noncomputable def expectedTargetR2 (r2_source rg : ℝ) : ℝ :=
+  rg^2 * r2_source
+
+/-- **Genetic correlation between ancestries limits portability.**
     r_g < 1 means effect sizes are not perfectly correlated.
-    This sets an upper bound on cross-ancestry R². -/
+    This strictly bounds the target R² ceiling below the source R². -/
 theorem genetic_correlation_bounds_portability
-    (r2_source r2_target rg : ℝ)
-    (h_bound : r2_target ≤ rg^2 * r2_source)
+    (r2_source rg : ℝ)
     (h_rg : |rg| < 1) (h_r2 : 0 < r2_source) :
-    r2_target < r2_source := by
+    expectedTargetR2 r2_source rg < r2_source := by
+  unfold expectedTargetR2
   have : rg^2 < 1 := by nlinarith [sq_abs rg, abs_nonneg rg, sq_nonneg rg]
   nlinarith
 
