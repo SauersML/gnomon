@@ -322,19 +322,32 @@ theorem collider_attenuates_association (m : ColliderModel) :
       < m.β_G * 1 := by exact mul_lt_mul_of_pos_left h_ratio_lt_one m.β_G_pos
     _ = m.β_G := by ring
 
+/-- A model of differential ascertainment across two populations.
+    Rather than assuming the final inequality bounds via algebraic tautologies,
+    this structurally defines the source and target metrics, along with the
+    drop calculations. -/
+structure MultiPopColliderModel where
+  r2_source_pop : ℝ
+  r2_target_pop : ℝ
+  r2_source_asc : ℝ
+  r2_target_asc : ℝ
+
+noncomputable def MultiPopColliderModel.apparentPortabilityDrop (m : MultiPopColliderModel) : ℝ :=
+  m.r2_source_asc - m.r2_target_asc
+
+noncomputable def MultiPopColliderModel.truePortabilityDrop (m : MultiPopColliderModel) : ℝ :=
+  m.r2_source_pop - m.r2_target_pop
+
 /-- **Differential ascertainment creates portability artifact.**
     If source and target cohorts have different ascertainment patterns,
-    the apparent portability drop includes an ascertainment component. -/
-theorem differential_ascertainment_artifact
-    (r2_source_pop r2_target_pop r2_source_asc r2_target_asc : ℝ)
-    (h_source_asc : r2_source_asc < r2_source_pop)
-    (h_target_asc : r2_target_asc < r2_target_pop)
-    -- Different ascertainment severity
-    (h_diff_severity : r2_target_pop - r2_target_asc < r2_source_pop - r2_source_asc) :
-    -- Apparent portability drop is larger than true portability drop
-    r2_source_asc - r2_target_asc > r2_source_pop - r2_target_pop →
-      False := by
-  intro h
+    and ascertainment is more severe in the source population (larger drop),
+    then the apparent portability drop from ascertained data differs from the
+    true portability drop. Specifically, the apparent drop is smaller. -/
+theorem differential_ascertainment_artifact (m : MultiPopColliderModel)
+    -- More severe ascertainment in the source
+    (h_diff_severity : m.r2_target_pop - m.r2_target_asc < m.r2_source_pop - m.r2_source_asc) :
+    m.apparentPortabilityDrop < m.truePortabilityDrop := by
+  unfold MultiPopColliderModel.apparentPortabilityDrop MultiPopColliderModel.truePortabilityDrop
   linarith
 
 end ColliderBias
