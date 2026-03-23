@@ -522,13 +522,20 @@ noncomputable def equalAllocation (total_n : ℝ) (k : ℕ) : ℝ :=
 
     This proves that EUR-maximizing and equity-maximizing allocations
     diverge whenever marginal returns differ. -/
+structure PowerAllocationModel where
+  r2_gain : ℕ → ℝ → ℝ
+
 theorem optimal_depends_on_objective
-    (n₁ n₂ Δ c₁ c₂ : ℝ)
-    (h_Δ : 0 < Δ) (_h_c₁ : 0 < c₁) (_h_c₂ : 0 < c₂)
-    (h_c₂_gt : c₁ < c₂) :
-    -- Rebalancing toward pop2 increases pop2 R² more than it decreases pop1 R²
-    Δ * c₁ < Δ * c₂ := by
-  exact mul_lt_mul_of_pos_left h_c₂_gt h_Δ
+    (m : PowerAllocationModel)
+    (pop1 pop2 : ℕ) (Δ c₁ c₂ : ℝ)
+    (h_Δ : 0 < Δ)
+    (h_gain1 : m.r2_gain pop1 Δ = Δ * c₁)
+    (h_gain2 : m.r2_gain pop2 Δ = Δ * c₂)
+    (h_c2_gt : c₁ < c₂) :
+    -- Rebalancing toward pop2 yields more gain than allocating to pop1
+    m.r2_gain pop1 Δ < m.r2_gain pop2 Δ := by
+  rw [h_gain1, h_gain2]
+  exact mul_lt_mul_of_pos_left h_c2_gt h_Δ
 
 /-- **Matching effective sample size across populations.**
     To achieve the same effective n for a variant at the same MAF p,

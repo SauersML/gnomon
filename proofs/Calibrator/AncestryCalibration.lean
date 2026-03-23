@@ -97,26 +97,35 @@ theorem spline_error_improves_with_knots
   apply pow_lt_pow_left₀ h_finer (le_of_lt h_pos)
   norm_num
 
+/-- **Spline Calibration Model.**
+    Formalizes the bias and variance of a spline fit as a function of the number of knots. -/
+structure SplineCalibrationModel where
+  biasSq : ℕ → ℝ
+  variance : ℕ → ℝ
+
+/-- Mean Squared Error (MSE) of the spline calibration. -/
+noncomputable def splineMse (m : SplineCalibrationModel) (k : ℕ) : ℝ :=
+  m.biasSq k + m.variance k
+
 /-- **Bias-variance tradeoff in spline calibration.**
     More knots → less bias (better approximation)
     More knots → more variance (overfitting)
     Optimal: minimize bias² + variance = MSE.
 
-    Model: MSE(k knots) = bias(k)² + var(k).
+    Model: MSE(k knots) = biasSq(k) + var(k).
     Config 1 (fewer knots): higher bias, lower variance.
     Config 2 (more knots): lower bias, higher variance.
 
     Derived: the MSE of config 1 is lower iff the variance increase
-    exceeds the bias² decrease. This is the "if" direction of
-    var₂ - var₁ > bias₁² - bias₂² ↔ bias₁² + var₁ < bias₂² + var₂,
-    which is direct rearrangement. The real content is the model
-    decomposition MSE = bias² + variance. -/
+    exceeds the bias² decrease. -/
 theorem bias_variance_tradeoff
-    (bias₁ bias₂ var₁ var₂ : ℝ)
-    (h_bias_improves : bias₂ ^ 2 < bias₁ ^ 2)
-    (h_var_worsens : var₁ < var₂)
-    (h_var_dominates : var₂ - var₁ > bias₁ ^ 2 - bias₂ ^ 2) :
-    bias₁ ^ 2 + var₁ < bias₂ ^ 2 + var₂ := by linarith
+    (m : SplineCalibrationModel) (k_few k_many : ℕ)
+    (h_bias_improves : m.biasSq k_many < m.biasSq k_few)
+    (h_var_worsens : m.variance k_few < m.variance k_many)
+    (h_var_dominates : m.variance k_many - m.variance k_few > m.biasSq k_few - m.biasSq k_many) :
+    splineMse m k_few < splineMse m k_many := by
+  unfold splineMse
+  linarith
 
 /-- **Spline R² is bounded by the signal-to-noise ratio.**
     R²_spline ≤ Var(E[ε²|d]) / Var(ε²).
