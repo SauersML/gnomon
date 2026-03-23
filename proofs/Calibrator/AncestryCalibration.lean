@@ -270,12 +270,23 @@ theorem measurement_invariance_violation
     Under the liability threshold model, the liability is continuous
     but observed phenotype is binary. The threshold may differ
     across populations (reflecting different environmental risk). -/
+structure LiabilityThresholdModel where
+  mean : ℝ
+  threshold : ℝ
+
+noncomputable def liabilityDistance (m : LiabilityThresholdModel) : ℝ :=
+  m.threshold - m.mean
+
+/-- With fixed threshold, higher mean → higher prevalence
+    (proportion above threshold increases as distance to threshold decreases). -/
 theorem threshold_shift_changes_prevalence
-    (liability_mean₁ liability_mean₂ threshold : ℝ)
-    (h_mean_shift : liability_mean₁ < liability_mean₂) :
-    -- With fixed threshold, higher mean → higher prevalence
-    -- (proportion above threshold increases)
-    threshold - liability_mean₂ < threshold - liability_mean₁ := by linarith
+    (m₁ m₂ : LiabilityThresholdModel)
+    (h_same_threshold : m₁.threshold = m₂.threshold)
+    (h_mean_shift : m₁.mean < m₂.mean) :
+    liabilityDistance m₂ < liabilityDistance m₁ := by
+  dsimp [liabilityDistance]
+  rw [← h_same_threshold]
+  linarith
 
 /-- **Different prevalence → different R² even with same AUC.**
     This is a key insight from Wang et al.: R² and AUC can disagree
@@ -347,12 +358,27 @@ theorem epistatic_changes_faster
 /-- **Additive PGS misses epistatic signal → portability of epistatic component is zero.**
     An additive PGS captures V_A but not V_epistasis. The "missing heritability"
     from epistasis doesn't port because it was never captured. -/
-theorem additive_pgs_misses_epistasis
-    (v_additive v_epistatic v_total : ℝ)
-    (h_total : v_total = v_additive + v_epistatic)
-    (h_epi_pos : 0 < v_epistatic) (h_add_pos : 0 < v_additive) :
-    v_additive / v_total < 1 := by
-  rw [h_total, div_lt_one (by linarith)]
+structure EpistaticVarianceModel where
+  v_additive : ℝ
+  v_epistatic : ℝ
+  h_add_pos : 0 < v_additive
+  h_epi_pos : 0 < v_epistatic
+
+noncomputable def total_variance (m : EpistaticVarianceModel) : ℝ :=
+  m.v_additive + m.v_epistatic
+
+noncomputable def additive_heritability (m : EpistaticVarianceModel) : ℝ :=
+  m.v_additive / total_variance m
+
+theorem additive_pgs_misses_epistasis (m : EpistaticVarianceModel) :
+    additive_heritability m < 1 := by
+  dsimp [additive_heritability, total_variance]
+  have h_tot_pos : 0 < m.v_additive + m.v_epistatic := by
+    have h1 := m.h_add_pos
+    have h2 := m.h_epi_pos
+    linarith
+  rw [div_lt_one h_tot_pos]
+  have h2 := m.h_epi_pos
   linarith
 
 end Epistasis
