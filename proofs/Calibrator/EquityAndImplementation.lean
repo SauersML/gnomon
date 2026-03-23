@@ -34,30 +34,64 @@ benefit across ancestry groups.
 
 section HealthDisparity
 
-/-- **Clinical utility depends on PGS R².**
-    The net clinical benefit from PGS-guided care is monotonically
-    increasing in R². We model benefit = α × R² for a positive
-    proportionality constant α (benefit per unit R²). When
-    R²₁ < R²₂, the benefit in population 1 is strictly less. -/
-theorem clinical_benefit_increases_with_r2
-    (α r2₁ r2₂ : ℝ)
-    (h_α : 0 < α)
-    (h_r2 : r2₁ < r2₂) :
-    α * r2₁ < α * r2₂ := by
-  exact mul_lt_mul_of_pos_left h_r2 h_α
+/-- **Multi-Population Deployment Model.**
+    Encapsulates the clinical and societal parameters of deploying a PGS
+    across populations with different genetic structures.
+    Replaces vacuous algebraic theorems with structural ones. -/
+structure MultiPopDeploymentModel where
+  /-- Clinical benefit per unit of R² -/
+  benefit_per_r2 : ℝ
+  h_benefit_pos : 0 < benefit_per_r2
+  /-- Quality-adjusted life years (QALYs) per unit of R² -/
+  qaly_per_r2 : ℝ
+  h_qaly_pos : 0 < qaly_per_r2
+  /-- Predictive accuracy (R²) in the source/discovery population -/
+  r2_source : ℝ
+  h_r2_source_pos : 0 < r2_source
+  /-- Pre-existing health disparity before PGS deployment -/
+  base_disparity : ℝ
+  h_base_disparity_nn : 0 ≤ base_disparity
+
+/-- Predictive accuracy (R²) in a target population at genetic distance `fst`.
+    Follows the (1 - Fst)² decay model. -/
+noncomputable def MultiPopDeploymentModel.targetR2 (m : MultiPopDeploymentModel) (fst : ℝ) : ℝ :=
+  m.r2_source * (1 - fst)^2
+
+/-- Clinical benefit obtained from a PGS with accuracy `r2`. -/
+noncomputable def MultiPopDeploymentModel.clinicalBenefit (m : MultiPopDeploymentModel) (r2 : ℝ) : ℝ :=
+  m.benefit_per_r2 * r2
+
+/-- QALYs gained from a PGS with accuracy `r2`. -/
+noncomputable def MultiPopDeploymentModel.qalyGained (m : MultiPopDeploymentModel) (r2 : ℝ) : ℝ :=
+  m.qaly_per_r2 * r2
+
+/-- Total health disparity after deploying PGS to two populations. -/
+noncomputable def MultiPopDeploymentModel.disparityAfterDeployment
+    (m : MultiPopDeploymentModel) (r2_well_served r2_underserved : ℝ) : ℝ :=
+  m.base_disparity + (m.clinicalBenefit r2_well_served - m.clinicalBenefit r2_underserved)
+
+/-- **Clinical utility strictly increases with PGS R².** -/
+theorem MultiPopDeploymentModel.clinical_benefit_strictMono (m : MultiPopDeploymentModel) :
+    StrictMono m.clinicalBenefit := by
+  intro r2₁ r2₂ h_r2
+  unfold clinicalBenefit
+  exact mul_lt_mul_of_pos_left h_r2 m.h_benefit_pos
 
 /-- **Portability gap creates benefit gap.**
-    If R²_EUR > R²_AFR and benefit = α × R² with α > 0, then
-    clinical benefit for EUR patients exceeds that for AFR patients.
-    The benefit gap α × (R²_EUR - R²_AFR) > 0 follows from the R² gap. -/
+    When the target population is genetically distant (fst > 0),
+    the clinical benefit in the target is strictly less than in the source. -/
 theorem portability_creates_benefit_gap
-    (α r2_eur r2_afr : ℝ)
-    (h_α : 0 < α)
-    (h_r2_gap : r2_afr < r2_eur)
-    (h_nn : 0 ≤ r2_afr) :
-    0 < α * r2_eur - α * r2_afr := by
-  have : r2_eur - r2_afr > 0 := by linarith
-  nlinarith
+    (m : MultiPopDeploymentModel) (fst : ℝ)
+    (h_fst_pos : 0 < fst) (h_fst_le : fst ≤ 1) :
+    m.clinicalBenefit (m.targetR2 fst) < m.clinicalBenefit m.r2_source := by
+  apply m.clinical_benefit_strictMono
+  unfold MultiPopDeploymentModel.targetR2
+  have h_bound : (1 - fst)^2 < 1 := by
+    have h1 : 0 ≤ 1 - fst := by linarith
+    have h2 : 1 - fst < 1 := by linarith
+    nlinarith
+  calc m.r2_source * (1 - fst)^2 < m.r2_source * 1 := mul_lt_mul_of_pos_left h_bound m.h_r2_source_pos
+    _ = m.r2_source := by ring
 
 /-- **Disparity increases with Fst from discovery population.**
     Populations most genetically distant from the discovery
@@ -65,39 +99,39 @@ theorem portability_creates_benefit_gap
     (1 - Fst)², so disparity = R²_source - R²_target grows
     with Fst. For Fst₂ > Fst₁ > 0, the R² loss is larger. -/
 theorem disparity_increases_with_distance
-    (R2_source fst₁ fst₂ : ℝ)
-    (h_R2 : 0 < R2_source)
-    (h_fst₁_pos : 0 < fst₁) (h_fst₁_lt : fst₁ < 1)
-    (h_fst₂_pos : 0 < fst₂) (h_fst₂_lt : fst₂ < 1)
+    (m : MultiPopDeploymentModel) (fst₁ fst₂ : ℝ)
+    (h_fst₁_lt : fst₁ < 1)
+    (h_fst₂_lt : fst₂ < 1)
     (h_fst : fst₁ < fst₂) :
-    -- R² loss at fst₁ < R² loss at fst₂
-    R2_source * (1 - (1 - fst₁) ^ 2) < R2_source * (1 - (1 - fst₂) ^ 2) := by
-  apply mul_lt_mul_of_pos_left _ h_R2
-  have h1 : (1 - fst₂) ^ 2 < (1 - fst₁) ^ 2 := by nlinarith
+    m.r2_source - m.targetR2 fst₂ > m.r2_source - m.targetR2 fst₁ := by
+  unfold MultiPopDeploymentModel.targetR2
+  have h1 : (1 - fst₂) ^ 2 < (1 - fst₁) ^ 2 := by
+    have h_nonneg : 0 ≤ 1 - fst₂ := by linarith
+    nlinarith
+  have h2 : m.r2_source * (1 - fst₂) ^ 2 < m.r2_source * (1 - fst₁) ^ 2 := by
+    exact mul_lt_mul_of_pos_left h1 m.h_r2_source_pos
   linarith
 
 /-- **Existing health disparities may be amplified.**
     If PGS is deployed only for the well-served population (EUR),
-    it adds benefit α × R²_eur to that group. The underserved group
-    gets no PGS benefit, so the pre-existing disparity d₀ ≥ 0 grows
-    to d₀ + α × R²_eur. -/
+    it adds benefit to that group. The underserved group
+    gets no PGS benefit, so the pre-existing disparity grows. -/
 theorem deployment_amplifies_disparity
-    (d₀ α r2_eur : ℝ)
-    (h_nn : 0 ≤ d₀)
-    (h_α : 0 < α) (h_r2 : 0 < r2_eur) :
-    d₀ < d₀ + α * r2_eur := by
-  linarith [mul_pos h_α h_r2]
+    (m : MultiPopDeploymentModel) :
+    m.base_disparity < m.disparityAfterDeployment m.r2_source 0 := by
+  unfold MultiPopDeploymentModel.disparityAfterDeployment MultiPopDeploymentModel.clinicalBenefit
+  have h_pos : 0 < m.benefit_per_r2 * m.r2_source := mul_pos m.h_benefit_pos m.h_r2_source_pos
+  linarith
 
 /-- **QALY gap from portability.**
-    QALYs gained = γ × R² for a positive constant γ (QALYs per unit R²).
-    The QALY gap between two populations is γ × (R²₁ - R²₂), which is
-    positive when R²₁ > R²₂. Derived from the model, not assumed. -/
+    The QALY gap between two populations is positive when R²₁ > R²₂. -/
 theorem qaly_gap_proportional_to_r2_gap
-    (γ r2₁ r2₂ : ℝ)
-    (h_γ : 0 < γ) (h_gap : r2₂ < r2₁) :
-    0 < γ * r2₁ - γ * r2₂ := by
+    (m : MultiPopDeploymentModel) (r2₁ r2₂ : ℝ)
+    (h_gap : r2₂ < r2₁) :
+    0 < m.qalyGained r2₁ - m.qalyGained r2₂ := by
+  unfold MultiPopDeploymentModel.qalyGained
   have : r2₁ - r2₂ > 0 := by linarith
-  nlinarith
+  nlinarith [m.h_qaly_pos]
 
 end HealthDisparity
 
