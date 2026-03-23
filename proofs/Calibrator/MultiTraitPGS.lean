@@ -58,20 +58,40 @@ theorem rg_ancestry_specific
   have : δ = 0 := by linarith
   exact h_delta_ne this
 
+/-- A structural model for a 3x3 correlation matrix with equal pairwise correlations `r`. -/
+structure EqualCorrMatrixModel where
+  r : ℝ
+  h_bound : |r| ≤ 1
+  h_psd : 0 ≤ (1 - r)^2 * (1 + 2 * r)
+
+/-- The determinant of the 3x3 equal-correlation matrix. -/
+noncomputable def EqualCorrMatrixModel.det (m : EqualCorrMatrixModel) : ℝ :=
+  (1 - m.r)^2 * (1 + 2 * m.r)
+
 /-- **Equal-correlation PSD constraint.**
     For a 3×3 correlation matrix with equal pairwise correlation r,
     the determinant is (1-r)²(1+2r). PSD requires det ≥ 0, which
     (given |r| ≤ 1 so (1-r)² ≥ 0) is equivalent to 1 + 2r ≥ 0,
     i.e., r ≥ -1/2. This is a non-trivial constraint: not all
     pairwise-valid correlations give a valid correlation matrix. -/
-theorem rg_matrix_equal_corr_psd_constraint
-    (r : ℝ)
-    (h_bound : |r| ≤ 1)
-    (h_lower : -1/2 ≤ r) :
-    0 ≤ (1 - r)^2 * (1 + 2 * r) := by
-  apply mul_nonneg
-  · exact sq_nonneg _
+theorem rg_matrix_equal_corr_psd_constraint (m : EqualCorrMatrixModel) :
+    -1/2 ≤ m.r := by
+  have h_det : 0 ≤ (1 - m.r)^2 * (1 + 2 * m.r) := m.h_psd
+  have h_sq : 0 ≤ (1 - m.r)^2 := sq_nonneg (1 - m.r)
+  by_cases hr : m.r = 1
   · linarith
+  · have h_sq_pos : 0 < (1 - m.r)^2 := by
+      apply sq_pos_of_ne_zero
+      intro h
+      have : 1 - m.r = 0 := h
+      apply hr
+      linarith
+    have h_div : 0 ≤ (1 + 2 * m.r) := by
+      have h_det_comm : 0 ≤ (1 + 2 * m.r) * (1 - m.r)^2 := by
+        rw [mul_comm]
+        exact h_det
+      exact nonneg_of_mul_nonneg_left h_det_comm h_sq_pos
+    linarith
 
 end GeneticCorrelation
 
@@ -86,42 +106,78 @@ especially for low-heritability traits.
 
 section MultiTraitBLUP
 
+/-- A structural model for Multi-Trait GWAS borrowing. -/
+structure MultiTraitGWAS where
+  rg : ℝ
+  n_aux : ℝ
+  n_target : ℝ
+  h2_aux : ℝ
+  h2_target : ℝ
+  h_rg_nz : rg ≠ 0
+  h_n_aux_pos : 0 < n_aux
+  h_n_target_pos : 0 < n_target
+  h_h2_aux_pos : 0 < h2_aux
+  h_h2_target_pos : 0 < h2_target
+
 /-- **MTBLUP prediction improvement.**
     For a target trait with h² and genetic correlation r_g
     with an auxiliary trait:
     R²_multi / R²_single ≈ 1 + r_g² × (n_aux / n_target) × (h²_aux / h²_target)
     when auxiliary GWAS is much larger. -/
-noncomputable def mtblupImprovement (rg n_aux n_target h2_aux h2_target : ℝ) : ℝ :=
-  1 + rg^2 * (n_aux / n_target) * (h2_aux / h2_target)
+noncomputable def MultiTraitGWAS.mtblupImprovement (m : MultiTraitGWAS) : ℝ :=
+  1 + m.rg^2 * (m.n_aux / m.n_target) * (m.h2_aux / m.h2_target)
 
 /-- MTBLUP always improves over single-trait (when rg > 0 and aux is larger). -/
-theorem mtblup_improves (rg n_aux n_target h2_aux h2_target : ℝ)
-    (h_rg : rg ≠ 0) (h_n_aux : 0 < n_aux) (h_n_target : 0 < n_target)
-    (h_h2_aux : 0 < h2_aux) (h_h2_target : 0 < h2_target) :
-    1 < mtblupImprovement rg n_aux n_target h2_aux h2_target := by
-  unfold mtblupImprovement
-  linarith [sq_pos_of_ne_zero h_rg,
-            div_pos h_n_aux h_n_target,
-            div_pos h_h2_aux h_h2_target,
-            mul_pos (mul_pos (sq_pos_of_ne_zero h_rg) (div_pos h_n_aux h_n_target))
-                    (div_pos h_h2_aux h_h2_target)]
+theorem mtblup_improves (m : MultiTraitGWAS) :
+    1 < m.mtblupImprovement := by
+  have h_rg_sq : 0 < m.rg^2 := sq_pos_of_ne_zero m.h_rg_nz
+  have h_n_div : 0 < m.n_aux / m.n_target := div_pos m.h_n_aux_pos m.h_n_target_pos
+  have h_h2_div : 0 < m.h2_aux / m.h2_target := div_pos m.h_h2_aux_pos m.h_h2_target_pos
+  have h_term : 0 < m.rg^2 * (m.n_aux / m.n_target) * (m.h2_aux / m.h2_target) := by
+    exact mul_pos (mul_pos h_rg_sq h_n_div) h_h2_div
+  exact lt_add_of_pos_right 1 h_term
+
+/-- A structural model for MTBLUP Portability comparing source and target. -/
+structure MultiTraitPortabilityModel where
+  source : MultiTraitGWAS
+  target : MultiTraitGWAS
+  h_n_aux_eq : source.n_aux = target.n_aux
+  h_n_target_eq : source.n_target = target.n_target
+  h_h2_aux_eq : source.h2_aux = target.h2_aux
+  h_h2_target_eq : source.h2_target = target.h2_target
+  h_rg_pos_source : 0 < source.rg
+  h_rg_pos_target : 0 < target.rg
+  h_rg_less : target.rg < source.rg
 
 /-- **MTBLUP portability.**
     The multi-trait improvement is less portable when cross-ancestry
     genetic correlation is lower. If r_g_cross < r_g_same, then
     MTBLUP improvement is smaller in the target population.
-    Model: improvement ratio = 1 + r_g² × k where k = (n_aux/n_target)(h²_aux/h²_target).
     With r_g_cross < r_g_same, the cross-ancestry improvement is strictly smaller. -/
-theorem mtblup_portability_reduced
-    (rg_same rg_cross k : ℝ)
-    (h_rg_same_pos : 0 < rg_same)
-    (h_rg_cross_pos : 0 < rg_cross)
-    (h_rg_less : rg_cross < rg_same)
-    (h_k_pos : 0 < k) :
-    1 + rg_cross^2 * k < 1 + rg_same^2 * k := by
-  have h_sq : rg_cross^2 < rg_same^2 := by
-    exact sq_lt_sq' (by linarith) h_rg_less
-  linarith [mul_lt_mul_of_pos_right h_sq h_k_pos]
+theorem mtblup_portability_reduced (m : MultiTraitPortabilityModel) :
+    m.target.mtblupImprovement < m.source.mtblupImprovement := by
+  unfold MultiTraitGWAS.mtblupImprovement
+  have h_k_eq : (m.target.n_aux / m.target.n_target) * (m.target.h2_aux / m.target.h2_target) =
+                (m.source.n_aux / m.source.n_target) * (m.source.h2_aux / m.source.h2_target) := by
+    rw [m.h_n_aux_eq, m.h_n_target_eq, m.h_h2_aux_eq, m.h_h2_target_eq]
+  have h_target_term : m.target.rg^2 * (m.target.n_aux / m.target.n_target) * (m.target.h2_aux / m.target.h2_target) =
+                       m.target.rg^2 * ((m.source.n_aux / m.source.n_target) * (m.source.h2_aux / m.source.h2_target)) := by
+    calc m.target.rg^2 * (m.target.n_aux / m.target.n_target) * (m.target.h2_aux / m.target.h2_target)
+         _ = m.target.rg^2 * ((m.target.n_aux / m.target.n_target) * (m.target.h2_aux / m.target.h2_target)) := by ring
+         _ = m.target.rg^2 * ((m.source.n_aux / m.source.n_target) * (m.source.h2_aux / m.source.h2_target)) := by rw [h_k_eq]
+  have h_source_term : m.source.rg^2 * (m.source.n_aux / m.source.n_target) * (m.source.h2_aux / m.source.h2_target) =
+                       m.source.rg^2 * ((m.source.n_aux / m.source.n_target) * (m.source.h2_aux / m.source.h2_target)) := by ring
+  rw [h_target_term, h_source_term]
+  have h_sq : m.target.rg^2 < m.source.rg^2 := by
+    have h_neg_lt : -m.source.rg < m.target.rg := by linarith [m.h_rg_pos_source, m.h_rg_pos_target]
+    exact sq_lt_sq' h_neg_lt m.h_rg_less
+  have h_n_div : 0 < m.source.n_aux / m.source.n_target := div_pos m.source.h_n_aux_pos m.source.h_n_target_pos
+  have h_h2_div : 0 < m.source.h2_aux / m.source.h2_target := div_pos m.source.h_h2_aux_pos m.source.h_h2_target_pos
+  have h_k_pos : 0 < (m.source.n_aux / m.source.n_target) * (m.source.h2_aux / m.source.h2_target) := mul_pos h_n_div h_h2_div
+  have h_mul_lt : m.target.rg^2 * ((m.source.n_aux / m.source.n_target) * (m.source.h2_aux / m.source.h2_target)) <
+                  m.source.rg^2 * ((m.source.n_aux / m.source.n_target) * (m.source.h2_aux / m.source.h2_target)) := by
+    exact mul_lt_mul_of_pos_right h_sq h_k_pos
+  linarith
 
 end MultiTraitBLUP
 
