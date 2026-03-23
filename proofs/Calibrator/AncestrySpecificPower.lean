@@ -363,17 +363,31 @@ theorem discovered_variants_eur_biased
     The tag bonus inflates the apparent gap beyond the true causal gap.
     This is a definitional identity: the proof content is the model
     decomposition, not the algebra. -/
-theorem discovery_bias_inflates_source_r2
-    (r2_causal r2_tag_bonus ρ_sq : ℝ)
-    (h_causal_pos : 0 < r2_causal)
-    (h_bonus_pos : 0 < r2_tag_bonus)
-    (h_ρ_pos : 0 ≤ ρ_sq) (h_ρ_le : ρ_sq ≤ 1) :
-    let r2_source := r2_causal + r2_tag_bonus
-    let r2_target := r2_causal * ρ_sq
-    let apparent_gap := r2_source - r2_target
-    let true_causal_gap := r2_causal * (1 - ρ_sq)
-    apparent_gap = true_causal_gap + r2_tag_bonus := by
-  simp only
+structure DiscoveryBiasModel where
+  r2_causal : ℝ
+  r2_tag_bonus : ℝ
+  ρ_sq : ℝ
+  h_causal_pos : 0 < r2_causal
+  h_bonus_pos : 0 < r2_tag_bonus
+  h_ρ_pos : 0 ≤ ρ_sq
+  h_ρ_le : ρ_sq ≤ 1
+
+noncomputable def DiscoveryBiasModel.r2_source (m : DiscoveryBiasModel) : ℝ :=
+  m.r2_causal + m.r2_tag_bonus
+
+noncomputable def DiscoveryBiasModel.r2_target (m : DiscoveryBiasModel) : ℝ :=
+  m.r2_causal * m.ρ_sq
+
+noncomputable def DiscoveryBiasModel.apparent_gap (m : DiscoveryBiasModel) : ℝ :=
+  m.r2_source - m.r2_target
+
+noncomputable def DiscoveryBiasModel.true_causal_gap (m : DiscoveryBiasModel) : ℝ :=
+  m.r2_causal * (1 - m.ρ_sq)
+
+theorem discovery_bias_inflates_source_r2 (m : DiscoveryBiasModel) :
+    m.apparent_gap = m.true_causal_gap + m.r2_tag_bonus := by
+  unfold DiscoveryBiasModel.apparent_gap DiscoveryBiasModel.true_causal_gap
+         DiscoveryBiasModel.r2_source DiscoveryBiasModel.r2_target
   ring
 
 /-- **Proportion of portable signal.**
