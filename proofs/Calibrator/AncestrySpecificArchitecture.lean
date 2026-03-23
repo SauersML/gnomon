@@ -236,6 +236,89 @@ causal variants due to independent mutation and selection.
 
 section AllelicHeterogeneity
 
+/-- A structured model of allelic heterogeneity at a shared locus. -/
+structure GeneArchitectureModel where
+  v_shared : ℝ
+  v_pop1_specific : ℝ
+  v_pop2_specific : ℝ
+  n_signals_pop1 : ℕ
+  n_signals_pop2 : ℕ
+  n_shared : ℕ
+  r2_causal : ℝ
+  r2_tag : ℝ
+  h_shared : 0 < v_shared
+  h_pop1 : 0 < v_pop1_specific
+  h_pop2 : 0 < v_pop2_specific
+  h_causal : 0 < r2_causal
+  h_tag : 0 < r2_tag
+  h_tag_le : r2_tag ≤ 1
+  h_pop1_signals : 0 < n_signals_pop1
+  h_pop2_signals : 0 < n_signals_pop2
+  h_some_shared : 0 < n_shared
+  h_shared_le_pop1 : n_shared ≤ n_signals_pop1
+  h_shared_le_pop2 : n_shared ≤ n_signals_pop2
+
+namespace GeneArchitectureModel
+
+/-- Total variance in population 1. -/
+noncomputable def totalVariancePop1 (m : GeneArchitectureModel) : ℝ :=
+  m.v_shared + m.v_pop1_specific
+
+/-- Total variance in population 2. -/
+noncomputable def totalVariancePop2 (m : GeneArchitectureModel) : ℝ :=
+  m.v_shared + m.v_pop2_specific
+
+/-- The fraction of population 1 variance that is shared and portable. -/
+noncomputable def portableFractionPop1 (m : GeneArchitectureModel) : ℝ :=
+  m.v_shared / m.totalVariancePop1
+
+/-- Source variance captured by the tag SNP. -/
+noncomputable def sourceVarianceAtTag (m : GeneArchitectureModel) : ℝ :=
+  m.r2_causal * m.r2_tag
+
+/-- Target variance captured by the same tag SNP, attenuated by the portable fraction. -/
+noncomputable def targetVarianceAtTag (m : GeneArchitectureModel) : ℝ :=
+  m.sourceVarianceAtTag * m.portableFractionPop1
+
+/-- Total number of distinct signals across both populations (inclusion-exclusion). -/
+noncomputable def unionSignals (m : GeneArchitectureModel) : ℕ :=
+  m.n_signals_pop1 + m.n_signals_pop2 - m.n_shared
+
+theorem portable_fraction_lt_one (m : GeneArchitectureModel) :
+    m.portableFractionPop1 < 1 := by
+  unfold portableFractionPop1 totalVariancePop1
+  have h_pos : 0 < m.v_shared + m.v_pop1_specific := by linarith [m.h_shared, m.h_pop1]
+  rw [div_lt_one h_pos]
+  linarith [m.h_pop1]
+
+theorem target_variance_lt_source_variance (m : GeneArchitectureModel) :
+    m.targetVarianceAtTag < m.sourceVarianceAtTag := by
+  unfold targetVarianceAtTag sourceVarianceAtTag
+  have h_prod_pos : 0 < m.r2_causal * m.r2_tag := mul_pos m.h_causal m.h_tag
+  calc m.r2_causal * m.r2_tag * m.portableFractionPop1
+      < m.r2_causal * m.r2_tag * 1 := mul_lt_mul_of_pos_left m.portable_fraction_lt_one h_prod_pos
+    _ = m.r2_causal * m.r2_tag := mul_one _
+
+theorem gene_variance_bounds (m : GeneArchitectureModel) :
+    m.v_shared < m.totalVariancePop1 ∧
+    m.v_shared < m.totalVariancePop2 ∧
+    m.v_shared / m.totalVariancePop2 < 1 := by
+  unfold totalVariancePop1 totalVariancePop2
+  refine ⟨by linarith [m.h_pop1], by linarith [m.h_pop2], ?_⟩
+  have h_pos : 0 < m.v_shared + m.v_pop2_specific := by linarith [m.h_shared, m.h_pop2]
+  rw [div_lt_one h_pos]
+  linarith [m.h_pop2]
+
+theorem union_signals_bounds (m : GeneArchitectureModel) :
+    m.n_signals_pop1 ≤ m.unionSignals ∧
+    m.n_signals_pop2 ≤ m.unionSignals := by
+  unfold unionSignals
+  have h1 : m.n_shared ≤ m.n_signals_pop1 := m.h_shared_le_pop1
+  have h2 : m.n_shared ≤ m.n_signals_pop2 := m.h_shared_le_pop2
+  omega
+
+end GeneArchitectureModel
+
 /-- **Allelic heterogeneity reduces portability via variance decomposition.**
     Total locus variance in source = V_shared + V_source_specific.
     The tag SNP captures r²_tag of source total variance.
@@ -251,10 +334,37 @@ theorem allelic_heterogeneity_reduces_portability
     (h_causal : 0 < r2_causal) (h_tag : 0 < r2_tag) (h_tag_le : r2_tag ≤ 1)
     (h_ρ : 0 < ρ) (h_ρ_lt : ρ < 1) :
     r2_causal * r2_tag * ρ < r2_causal * r2_tag := by
-  have h_prod_pos : 0 < r2_causal * r2_tag := mul_pos h_causal h_tag
-  calc r2_causal * r2_tag * ρ
-      < r2_causal * r2_tag * 1 := by nlinarith
-    _ = r2_causal * r2_tag := mul_one _
+  -- We instantiate the structural theorem with a model designed to
+  -- exhibit the requested portable fraction ρ.
+  let m : GeneArchitectureModel := {
+    v_shared := ρ
+    v_pop1_specific := 1 - ρ
+    v_pop2_specific := 1 -- unused in this theorem
+    n_signals_pop1 := 1  -- unused
+    n_signals_pop2 := 1  -- unused
+    n_shared := 1        -- unused
+    r2_causal := r2_causal
+    r2_tag := r2_tag
+    h_shared := h_ρ
+    h_pop1 := by linarith
+    h_pop2 := by norm_num
+    h_causal := h_causal
+    h_tag := h_tag
+    h_tag_le := h_tag_le
+    h_pop1_signals := by norm_num
+    h_pop2_signals := by norm_num
+    h_some_shared := by norm_num
+    h_shared_le_pop1 := by norm_num
+    h_shared_le_pop2 := by norm_num
+  }
+  have h_frac : m.portableFractionPop1 = ρ := by
+    change ρ / (ρ + (1 - ρ)) = ρ
+    ring_nf
+  have h_bound := m.target_variance_lt_source_variance
+  change m.sourceVarianceAtTag * m.portableFractionPop1 < m.sourceVarianceAtTag at h_bound
+  rw [h_frac] at h_bound
+  change r2_causal * r2_tag * ρ < r2_causal * r2_tag at h_bound
+  exact h_bound
 
 /-- **Population-specific rare variants at shared loci.**
     A gene may be important for a trait in all populations,
@@ -279,9 +389,28 @@ theorem gene_shared_variants_specific
     v_shared < v_shared + v_afr_specific ∧
     -- A EUR-trained PGS captures only v_shared in AFR, missing v_afr_specific
     v_shared / (v_shared + v_afr_specific) < 1 := by
-  refine ⟨by linarith, by linarith, ?_⟩
-  rw [div_lt_one (by linarith)]
-  linarith
+  let m : GeneArchitectureModel := {
+    v_shared := v_shared
+    v_pop1_specific := v_eur_specific
+    v_pop2_specific := v_afr_specific
+    n_signals_pop1 := 1  -- unused
+    n_signals_pop2 := 1  -- unused
+    n_shared := 1        -- unused
+    r2_causal := 1       -- unused
+    r2_tag := 1          -- unused
+    h_shared := h_shared
+    h_pop1 := h_eur
+    h_pop2 := h_afr
+    h_causal := by norm_num
+    h_tag := by norm_num
+    h_tag_le := by norm_num
+    h_pop1_signals := by norm_num
+    h_pop2_signals := by norm_num
+    h_some_shared := by norm_num
+    h_shared_le_pop1 := by norm_num
+    h_shared_le_pop2 := by norm_num
+  }
+  exact m.gene_variance_bounds
 
 /-- **Conditional analysis reveals heterogeneity.**
     Running conditional analysis (adjusting for lead SNP)
@@ -306,7 +435,28 @@ theorem conditional_reveals_heterogeneity
     -- The union of distinct signals exceeds either population alone
     n_signals_eur ≤ n_signals_eur + n_signals_afr - n_shared ∧
     n_signals_afr ≤ n_signals_eur + n_signals_afr - n_shared := by
-  omega
+  let m : GeneArchitectureModel := {
+    v_shared := 1
+    v_pop1_specific := 1
+    v_pop2_specific := 1
+    n_signals_pop1 := n_signals_eur
+    n_signals_pop2 := n_signals_afr
+    n_shared := n_shared
+    r2_causal := 1
+    r2_tag := 1
+    h_shared := by norm_num
+    h_pop1 := by norm_num
+    h_pop2 := by norm_num
+    h_causal := by norm_num
+    h_tag := by norm_num
+    h_tag_le := by norm_num
+    h_pop1_signals := h_eur
+    h_pop2_signals := h_afr
+    h_some_shared := h_some_shared
+    h_shared_le_pop1 := h_shared_le_eur
+    h_shared_le_pop2 := h_shared_le_afr
+  }
+  exact m.union_signals_bounds
 
 end AllelicHeterogeneity
 
