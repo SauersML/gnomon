@@ -51,14 +51,22 @@ theorem recalibration_slope_under_drift
     The turnover loss = r2_source × (1 - ρ²) is the non-recoverable part.
     These two components sum to r2_source by algebraic decomposition:
       r2_source × ρ² + r2_source × (1 - ρ²) = r2_source × (ρ² + 1 - ρ²) = r2_source. -/
-theorem recalibration_recovers_up_to_turnover
-    (r2_source ρ_sq : ℝ)
-    (h_ρ : 0 ≤ ρ_sq) (h_ρ_le : ρ_sq ≤ 1)
-    (h_r2 : 0 < r2_source) :
-    let r2_recalibrated := r2_source * ρ_sq
-    let r2_loss_turnover := r2_source * (1 - ρ_sq)
-    r2_recalibrated + r2_loss_turnover = r2_source := by
-  simp only
+structure RecalibrationModel where
+  r2_source : ℝ
+  ρ_sq : ℝ
+  h_ρ : 0 ≤ ρ_sq
+  h_ρ_le : ρ_sq ≤ 1
+  h_r2 : 0 < r2_source
+
+noncomputable def RecalibrationModel.r2_recalibrated (m : RecalibrationModel) : ℝ :=
+  m.r2_source * m.ρ_sq
+
+noncomputable def RecalibrationModel.r2_loss_turnover (m : RecalibrationModel) : ℝ :=
+  m.r2_source * (1 - m.ρ_sq)
+
+theorem recalibration_recovers_up_to_turnover (m : RecalibrationModel) :
+    m.r2_recalibrated + m.r2_loss_turnover = m.r2_source := by
+  unfold RecalibrationModel.r2_recalibrated RecalibrationModel.r2_loss_turnover
   ring
 
 /-- **Recalibration cannot exceed oracle R².**
@@ -173,24 +181,35 @@ theorem more_target_data_reduces_mse
     Derived: MSE_transfer < MSE_target ↔ bias² < σ²_extra/n_T.
     When n_T is small, σ²_extra/n_T is large, so transfer wins.
     As n_T → ∞, σ²_extra/n_T → 0, so target-only wins (bias² > 0). -/
-theorem transfer_beats_target_only
-    (σ_sq bias_sq σ_extra_sq : ℝ) (n_T : ℝ)
-    (h_σ : 0 < σ_sq) (h_bias : 0 < bias_sq)
-    (h_extra : 0 < σ_extra_sq) (h_n : 0 < n_T)
-    (h_small_n : n_T < σ_extra_sq / bias_sq) :
-    let mse_transfer := σ_sq / n_T + bias_sq
-    let mse_target := (σ_sq + σ_extra_sq) / n_T
-    mse_transfer < mse_target := by
-  simp only
+structure TransferLearningModel where
+  σ_sq : ℝ
+  bias_sq : ℝ
+  σ_extra_sq : ℝ
+  n_T : ℝ
+  h_σ : 0 < σ_sq
+  h_bias : 0 < bias_sq
+  h_extra : 0 < σ_extra_sq
+  h_n : 0 < n_T
+  h_small_n : n_T < σ_extra_sq / bias_sq
+
+noncomputable def TransferLearningModel.mse_transfer (m : TransferLearningModel) : ℝ :=
+  m.σ_sq / m.n_T + m.bias_sq
+
+noncomputable def TransferLearningModel.mse_target (m : TransferLearningModel) : ℝ :=
+  (m.σ_sq + m.σ_extra_sq) / m.n_T
+
+theorem transfer_beats_target_only (m : TransferLearningModel) :
+    m.mse_transfer < m.mse_target := by
+  unfold TransferLearningModel.mse_transfer TransferLearningModel.mse_target
   -- From h_small_n: n_T < σ_extra_sq / bias_sq
   -- Multiply both sides by bias_sq > 0: n_T * bias_sq < σ_extra_sq
   -- Divide by n_T > 0: bias_sq < σ_extra_sq / n_T
   -- Then σ_sq/n_T + bias_sq < σ_sq/n_T + σ_extra_sq/n_T = (σ_sq + σ_extra_sq)/n_T
-  have h_prod : bias_sq * n_T < σ_extra_sq := by
+  have h_prod : m.bias_sq * m.n_T < m.σ_extra_sq := by
     rw [mul_comm]
-    exact (lt_div_iff₀ h_bias).mp h_small_n
-  have h_key : bias_sq < σ_extra_sq / n_T := by
-    exact (lt_div_iff₀ h_n).2 h_prod
+    exact (lt_div_iff₀ m.h_bias).mp m.h_small_n
+  have h_key : m.bias_sq < m.σ_extra_sq / m.n_T := by
+    exact (lt_div_iff₀ m.h_n).2 h_prod
   rw [add_div]; linarith
 
 /-- **Critical sample size for transfer benefit.**
