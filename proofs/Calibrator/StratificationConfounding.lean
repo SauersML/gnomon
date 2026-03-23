@@ -514,16 +514,47 @@ theorem survivorship_attenuates_in_older (m : SurvivorshipAttenuationModel) :
       < m.r2_full * 1 := by exact mul_lt_mul_of_pos_left h_ratio_lt_one m.r2_full_pos
     _ = m.r2_full := by ring
 
-/-- **Differential survivorship across populations creates portability artifact.**
-    If the target population has different age structure or mortality patterns,
-    survivorship bias contributes to apparent portability loss. -/
+/-- **Multi-population survivorship model.**
+    Models survivorship bias across source and target populations.
+    Assumes they share the same true baseline architecture (R² and variance at birth)
+    but have different levels of survivorship truncation. -/
+structure MultiPopSurvivorshipModel where
+  source : SurvivorshipAttenuationModel
+  target : SurvivorshipAttenuationModel
+  /-- Shared baseline architecture: true R² is the same -/
+  shared_r2 : source.r2_full = target.r2_full
+  /-- Shared baseline architecture: variance at birth is the same -/
+  shared_var_birth : source.var_birth = target.var_birth
+  /-- Differential survivorship: target has more variance truncation than source -/
+  target_more_truncated : target.var_surv < source.var_surv
+
+/-- The true gap in baseline R² between populations. -/
+noncomputable def MultiPopSurvivorshipModel.trueGap (m : MultiPopSurvivorshipModel) : ℝ :=
+  m.source.r2_full - m.target.r2_full
+
+/-- The observed gap in R² between populations due to survivorship bias. -/
+noncomputable def MultiPopSurvivorshipModel.obsGap (m : MultiPopSurvivorshipModel) : ℝ :=
+  m.source.r2_surv - m.target.r2_surv
+
+/-- **Differential survivorship creates portability artifact.**
+    If the target population has more severe survivorship bias (more variance truncation),
+    the observed portability gap is strictly greater than the true gap, even if the
+    true gap is zero. This replaces the previous vacuous definition with a structural proof. -/
 theorem differential_survivorship_artifact
-    (r2_source_full r2_target_full Δ_surv_source Δ_surv_target : ℝ)
-    (h_surv_s : 0 ≤ Δ_surv_source) (h_surv_t : 0 ≤ Δ_surv_target)
-    (h_diff : Δ_surv_target > Δ_surv_source)
-    (h_obs_s : r2_source_full - Δ_surv_source > 0) :
-    (r2_source_full - Δ_surv_source) - (r2_target_full - Δ_surv_target) >
-      r2_source_full - r2_target_full := by
+    (m : MultiPopSurvivorshipModel) :
+    m.trueGap < m.obsGap := by
+  unfold MultiPopSurvivorshipModel.trueGap MultiPopSurvivorshipModel.obsGap
+  unfold SurvivorshipAttenuationModel.r2_surv
+  have h_true_gap : m.source.r2_full - m.target.r2_full = 0 := by
+    rw [m.shared_r2, sub_self]
+  have h_frac : m.target.var_surv / m.target.var_birth < m.source.var_surv / m.source.var_birth := by
+    rw [m.shared_var_birth]
+    have h_pos : 0 < m.target.var_birth := m.target.var_birth_pos
+    exact (div_lt_div_iff_of_pos_right h_pos).mpr m.target_more_truncated
+  have h_mult : m.target.r2_full * (m.target.var_surv / m.target.var_birth) <
+                m.source.r2_full * (m.source.var_surv / m.source.var_birth) := by
+    rw [← m.shared_r2]
+    exact mul_lt_mul_of_pos_left h_frac m.source.r2_full_pos
   linarith
 
 end SurvivorshipBias
