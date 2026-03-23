@@ -322,19 +322,29 @@ theorem collider_attenuates_association (m : ColliderModel) :
       < m.β_G * 1 := by exact mul_lt_mul_of_pos_left h_ratio_lt_one m.β_G_pos
     _ = m.β_G := by ring
 
+/-- **Multi-population collider model.**
+    Captures differential ascertainment severity across populations. -/
+structure MultiPopColliderModel where
+  source : ColliderModel
+  target : ColliderModel
+  /-- True association is identical across populations -/
+  equal_true_β : source.β_G = target.β_G
+  /-- Target ascertainment is more severe (larger Environmental variance
+      relative to Genetic variance leading to smaller selection ratio) -/
+  target_more_severe : target.σ2_G / (target.σ2_G + target.σ2_E) < source.σ2_G / (source.σ2_G + source.σ2_E)
+
 /-- **Differential ascertainment creates portability artifact.**
-    If source and target cohorts have different ascertainment patterns,
-    the apparent portability drop includes an ascertainment component. -/
-theorem differential_ascertainment_artifact
-    (r2_source_pop r2_target_pop r2_source_asc r2_target_asc : ℝ)
-    (h_source_asc : r2_source_asc < r2_source_pop)
-    (h_target_asc : r2_target_asc < r2_target_pop)
-    -- Different ascertainment severity
-    (h_diff_severity : r2_target_pop - r2_target_asc < r2_source_pop - r2_source_asc) :
-    -- Apparent portability drop is larger than true portability drop
-    r2_source_asc - r2_target_asc > r2_source_pop - r2_target_pop →
-      False := by
-  intro h
+    If source and target cohorts have identical true associations, but
+    target has more severe ascertainment (stronger collider bias),
+    the apparent portability drop is inflated compared to the true (zero) drop. -/
+theorem differential_ascertainment_artifact (m : MultiPopColliderModel) :
+    m.source.β_selected - m.target.β_selected > m.source.β_G - m.target.β_G := by
+  unfold ColliderModel.β_selected
+  have h_eq : m.source.β_G - m.target.β_G = 0 := sub_eq_zero.mpr m.equal_true_β
+  rw [h_eq]
+  rw [m.equal_true_β]
+  have h_pos : 0 < m.target.β_G := m.target.β_G_pos
+  have h_ineq := mul_lt_mul_of_pos_left m.target_more_severe h_pos
   linarith
 
 end ColliderBias
@@ -514,16 +524,27 @@ theorem survivorship_attenuates_in_older (m : SurvivorshipAttenuationModel) :
       < m.r2_full * 1 := by exact mul_lt_mul_of_pos_left h_ratio_lt_one m.r2_full_pos
     _ = m.r2_full := by ring
 
+/-- **Multi-population survivorship model.**
+    Captures differential survivorship severity across populations. -/
+structure MultiPopSurvivorshipModel where
+  source : SurvivorshipAttenuationModel
+  target : SurvivorshipAttenuationModel
+  /-- Target has more severe survivorship bias (smaller variance ratio) -/
+  target_more_severe : target.var_surv / target.var_birth < source.var_surv / source.var_birth
+
 /-- **Differential survivorship across populations creates portability artifact.**
     If the target population has different age structure or mortality patterns,
-    survivorship bias contributes to apparent portability loss. -/
-theorem differential_survivorship_artifact
-    (r2_source_full r2_target_full Δ_surv_source Δ_surv_target : ℝ)
-    (h_surv_s : 0 ≤ Δ_surv_source) (h_surv_t : 0 ≤ Δ_surv_target)
-    (h_diff : Δ_surv_target > Δ_surv_source)
-    (h_obs_s : r2_source_full - Δ_surv_source > 0) :
-    (r2_source_full - Δ_surv_source) - (r2_target_full - Δ_surv_target) >
-      r2_source_full - r2_target_full := by
+    and experiences more severe survivorship bias (more variance reduction),
+    the apparent portability drop is inflated compared to the drop in the full birth cohort. -/
+theorem differential_survivorship_artifact (m : MultiPopSurvivorshipModel)
+    (h_eq_full : m.source.r2_full = m.target.r2_full) :
+    m.source.r2_surv - m.target.r2_surv > m.source.r2_full - m.target.r2_full := by
+  unfold SurvivorshipAttenuationModel.r2_surv
+  have h_eq : m.source.r2_full - m.target.r2_full = 0 := sub_eq_zero.mpr h_eq_full
+  rw [h_eq]
+  rw [h_eq_full]
+  have h_pos : 0 < m.target.r2_full := m.target.r2_full_pos
+  have h_ineq := mul_lt_mul_of_pos_left m.target_more_severe h_pos
   linarith
 
 end SurvivorshipBias
