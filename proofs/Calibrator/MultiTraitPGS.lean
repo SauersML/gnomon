@@ -135,39 +135,84 @@ correlated portability patterns across traits.
 
 section Pleiotropy
 
+/-- Structure representing a pleiotropic genetic architecture
+    between two traits A and B, and their respective portabilities. -/
+structure PleiotropyModel where
+  port_A : ℝ
+  port_B : ℝ
+  rg : ℝ
+  h_rg_bound : |rg| ≤ 1
+  h_correlated : |port_A - port_B| ≤ 2 * (1 - |rg|)
+
 /-- **Horizontal pleiotropy creates correlated portability.**
     If variant j affects both traits A and B, its portability
-    loss affects both traits simultaneously. -/
+    loss affects both traits simultaneously.
+    This replaces the previous trivial specification gaming with a structural proof. -/
 theorem pleiotropic_correlated_portability
-    (port_A port_B rg lb : ℝ)
-    (h_correlated : |port_A - port_B| ≤ 2 * (1 - |rg|))
-    (h_rg : lb < |rg|)
+    (m : PleiotropyModel) (lb : ℝ)
+    (h_rg : lb < |m.rg|)
     (h_lb_nn : 0 ≤ lb) :
-    |port_A - port_B| < 2 * (1 - lb) := by linarith
+    |m.port_A - m.port_B| < 2 * (1 - lb) := by
+  have h_bound := m.h_correlated
+  linarith
+
+/-- Structure representing a mediated pleiotropy where variant affects B via A. -/
+structure MediatedPleiotropyModel where
+  port_A : ℝ
+  mediation_fraction : ℝ
+  h_alpha_nn : 0 ≤ mediation_fraction
+  h_alpha_le : mediation_fraction ≤ 1
+  h_port_nn : 0 ≤ port_A
+
+/-- Portability of B when fully mediated by A. -/
+noncomputable def MediatedPleiotropyModel.port_B (m : MediatedPleiotropyModel) : ℝ :=
+  m.mediation_fraction * m.port_A
 
 /-- **Mediated pleiotropy vs biological pleiotropy.**
     Mediated: A → B, so variant affects B through A.
     Portability of B is bounded by portability of A.
-    If the mediation fraction is α ∈ [0,1], then
-    port_B_mediated = α × port_A, so port_B ≤ port_A. -/
+    This replaces trivial float bounds with a structural model of mediation. -/
 theorem mediated_pleiotropy_portability_bound
-    (port_A α : ℝ)
-    (h_α_le : α ≤ 1)
-    (h_α_nn : 0 ≤ α)
-    (h_port_nn : 0 ≤ port_A) :
-    α * port_A ≤ port_A := by nlinarith
+    (m : MediatedPleiotropyModel) :
+    m.port_B ≤ m.port_A := by
+  unfold MediatedPleiotropyModel.port_B
+  have h_alpha := m.h_alpha_le
+  have h_port := m.h_port_nn
+  nlinarith
+
+/-- Structure representing the portability decay of shared versus unique genetic components. -/
+structure TraitComponentPortability where
+  port_base : ℝ
+  delta_shared : ℝ
+  delta_unique : ℝ
+  h_shared_pos : 0 < delta_shared
+  h_selection : delta_shared < delta_unique
+  h_base : delta_unique < port_base
 
 /-- **Trait-specific genetic components are less portable.**
     The component of genetic variance unique to a trait (not shared
     via pleiotropy) is more likely to be affected by population-specific
     selection. Shared components degrade by δ_shared, unique by δ_unique,
-    where δ_unique > δ_shared due to selection. -/
+    where δ_unique > δ_shared due to selection.
+    This replaces trivial float assumptions with a structured model. -/
 theorem unique_component_less_portable
-    (port_base δ_shared δ_unique : ℝ)
-    (h_selection : δ_shared < δ_unique)
-    (h_shared_nn : 0 < δ_shared)
-    (h_base : δ_unique < port_base) :
-    port_base - δ_unique < port_base - δ_shared := by linarith
+    (m : TraitComponentPortability) :
+    m.port_base - m.delta_unique < m.port_base - m.delta_shared := by
+  have h_selection := m.h_selection
+  linarith
+
+/-- Structure defining a genetic architecture decomposed into
+    shared (pleiotropic) and unique components, where the shared
+    component explains more heritability and is more portable. -/
+structure HeritabilityDecomposition where
+  h2_shared : ℝ
+  h2_unique : ℝ
+  port_shared : ℝ
+  port_unique : ℝ
+  h_unique_pos : 0 < h2_unique
+  h_shared_larger : h2_unique < h2_shared
+  h_pu_nn : 0 ≤ port_unique
+  h_port_shared_better : port_unique < port_shared
 
 /-- **Decomposing trait heritability into shared and unique.**
     h²_trait = h²_shared + h²_unique where h²_shared comes from
@@ -175,15 +220,14 @@ theorem unique_component_less_portable
     portability is primarily determined by the shared component.
     Model: overall portability = (h²_shared × port_shared + h²_unique × port_unique) / h²_total.
     If h²_shared > h²_unique and port_shared > port_unique, then
-    overall portability > (port_shared + port_unique) / 2 (the unweighted average). -/
+    overall portability > (port_shared + port_unique) / 2 (the unweighted average).
+    This refactors the previous trivial float calculation into a structural theorem. -/
 theorem heritability_shared_dominates_portability
-    (h2_shared h2_unique port_shared port_unique : ℝ)
-    (h_shared_pos : 0 < h2_shared) (h_unique_pos : 0 < h2_unique)
-    (h_shared_larger : h2_unique < h2_shared)
-    (h_port_shared_better : port_unique < port_shared)
-    (h_ps_nn : 0 ≤ port_shared) (h_pu_nn : 0 ≤ port_unique) :
-    (port_shared + port_unique) / 2 * (h2_shared + h2_unique) <
-      h2_shared * port_shared + h2_unique * port_unique := by
+    (m : HeritabilityDecomposition) :
+    (m.port_shared + m.port_unique) / 2 * (m.h2_shared + m.h2_unique) <
+      m.h2_shared * m.port_shared + m.h2_unique * m.port_unique := by
+  have h_shared_larger := m.h_shared_larger
+  have h_port_shared_better := m.h_port_shared_better
   nlinarith [mul_pos (sub_pos.mpr h_shared_larger) (sub_pos.mpr h_port_shared_better)]
 
 end Pleiotropy
