@@ -46,17 +46,38 @@ theorem genetic_correlation_bounded_mt
     -1 ≤ rg ∧ rg ≤ 1 := by
   exact ⟨by linarith [abs_nonneg rg, abs_le.mp h_bound |>.1], abs_le.mp h_bound |>.2⟩
 
+/-- **Model for genetic covariance across ancestries.**
+    Captures the variance of traits A and B and their covariance
+    in two different populations (e.g., source and target). -/
+structure CrossAncestryCovarianceModel where
+  varA : ℝ
+  varB : ℝ
+  covSource : ℝ
+  covTarget : ℝ
+  h_varA_pos : 0 < varA
+  h_varB_pos : 0 < varB
+
+/-- **Genetic correlation in the source population.** -/
+noncomputable def rgSource (m : CrossAncestryCovarianceModel) : ℝ :=
+  m.covSource / Real.sqrt (m.varA * m.varB)
+
+/-- **Genetic correlation in the target population.** -/
+noncomputable def rgTarget (m : CrossAncestryCovarianceModel) : ℝ :=
+  m.covTarget / Real.sqrt (m.varA * m.varB)
+
 /-- **Genetic correlation is partially ancestry-specific.**
-    r_g between traits A and B may differ between EUR and AFR
-    due to different LD patterns and GxE. If LD and GxE introduce
-    a nonzero perturbation δ, the ancestry-specific r_g differs. -/
+    If LD and GxE attenuate the genetic covariance between traits A and B
+    in the target population compared to the source, the target
+    genetic correlation will be strictly lower. -/
 theorem rg_ancestry_specific
-    (rg_eur δ : ℝ)
-    (h_delta_ne : δ ≠ 0) :
-    rg_eur ≠ rg_eur + δ := by
-  intro h
-  have : δ = 0 := by linarith
-  exact h_delta_ne this
+    (m : CrossAncestryCovarianceModel)
+    (h_cov_attenuation : m.covTarget < m.covSource) :
+    rgTarget m < rgSource m := by
+  unfold rgTarget rgSource
+  have h_den_pos : 0 < Real.sqrt (m.varA * m.varB) := by
+    apply Real.sqrt_pos.mpr
+    exact mul_pos m.h_varA_pos m.h_varB_pos
+  exact (div_lt_div_iff_of_pos_right h_den_pos).mpr h_cov_attenuation
 
 /-- **Equal-correlation PSD constraint.**
     For a 3×3 correlation matrix with equal pairwise correlation r,
