@@ -1,0 +1,32 @@
+diff --git a/proofs/Calibrator/StatisticalGeneticsMethodology.lean b/proofs/Calibrator/StatisticalGeneticsMethodology.lean
+index 3250495..5b583c4 100644
+--- a/proofs/Calibrator/StatisticalGeneticsMethodology.lean
++++ b/proofs/Calibrator/StatisticalGeneticsMethodology.lean
+@@ -384,6 +384,27 @@ The resulting target `R²` and target/source portability ratio change.
+ 
+ section SourceR2Insufficiency
+ 
++/-- Generalized transport state modeling how signal transfers across loci. -/
++structure TransportState (ι : Type) [Fintype ι] where
++  sourceSignal : ι → ℝ
++  stableTransport : ι → ℝ
++  brokenTransport : ι → ℝ
++  residualVariance : ℝ
++  h_res_pos : 0 < residualVariance
++  h_source_nonneg : ∀ i, 0 ≤ sourceSignal i
++  h_stable_eq : ∑ i, sourceSignal i * stableTransport i = ∑ i, sourceSignal i
++  h_broken_lt : ∑ i, sourceSignal i * brokenTransport i < ∑ i, sourceSignal i * stableTransport i
++  h_broken_nonneg : 0 ≤ ∑ i, sourceSignal i * brokenTransport i
++
++noncomputable def TransportState.sourceVariance {ι : Type} [Fintype ι] (m : TransportState ι) : ℝ :=
++  ∑ i, m.sourceSignal i
++
++noncomputable def TransportState.stableTargetVariance {ι : Type} [Fintype ι] (m : TransportState ι) : ℝ :=
++  ∑ i, m.sourceSignal i * m.stableTransport i
++
++noncomputable def TransportState.brokenTargetVariance {ι : Type} [Fintype ι] (m : TransportState ι) : ℝ :=
++  ∑ i, m.sourceSignal i * m.brokenTransport i
++
+ /-- Concrete two-locus witness that source deployed `R²` does not determine
+ target portability.
+ 
