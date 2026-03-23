@@ -331,17 +331,48 @@ human genetic diversity, not just for well-represented groups.
 
 section AncestryFairness
 
+/-- Model for population genetic divergence and portability loss -/
+structure AncestryFairnessModel where
+  fst : ℝ
+  h_fst_nn : 0 ≤ fst
+
+/-- Model for required sample size investment across ancestries -/
+structure InvestmentModel where
+  n_proportional : ℝ
+  k : ℝ
+  h_n_pos : 0 < n_proportional
+  h_k_gt_one : 1 < k
+
+/-- Overall parameters for portability decay -/
+structure PortabilityModel where
+  r2_source : ℝ
+  c : ℝ
+  h_r2_pos : 0 < r2_source
+  h_c_pos : 0 < c
+
+/-- Computes the portability gap based on population Fst -/
+noncomputable def ancestryPortabilityGap (m : AncestryFairnessModel) (p : PortabilityModel) : ℝ :=
+  p.c * m.fst
+
+/-- Computes the required sample size investment, penalized by LD mismatch -/
+noncomputable def ancestryInvestmentRequired (inv : InvestmentModel) : ℝ :=
+  inv.k * inv.n_proportional
+
+/-- Computes the total portability loss in terms of R² -/
+noncomputable def ancestryPortabilityLoss (m : AncestryFairnessModel) (p : PortabilityModel) : ℝ :=
+  p.r2_source * p.c * m.fst
+
 /-- **Portability gap creates health disparities.**
     Groups with worse portability get less clinical benefit from PGS.
     The gap scales with Fst from the discovery population.
     Portability ≈ 1 - c × Fst for some constant c > 0, so higher Fst
     means lower portability (larger gap = 1 - portability). -/
 theorem portability_gap_scales_with_fst
-    (fst₁ fst₂ c : ℝ)
-    (h_fst : fst₁ < fst₂) (h_c : 0 < c)
-    (h_fst₁_nn : 0 ≤ fst₁) :
-    c * fst₁ < c * fst₂ := by
-  exact mul_lt_mul_of_pos_left h_fst h_c
+    (m₁ m₂ : AncestryFairnessModel) (p : PortabilityModel)
+    (h_fst : m₁.fst < m₂.fst) :
+    ancestryPortabilityGap m₁ p < ancestryPortabilityGap m₂ p := by
+  unfold ancestryPortabilityGap
+  exact mul_lt_mul_of_pos_left h_fst p.h_c_pos
 
 /-- **Equitable PGS requires proportional investment.**
     To achieve equal R² across populations, the sample size
@@ -349,10 +380,12 @@ theorem portability_gap_scales_with_fst
     to their population size (due to the LD mismatch penalty).
     If the LD penalty factor is k > 1, then n_needed = k × n_proportional. -/
 theorem equitable_pgs_overinvestment
-    (n_proportional k : ℝ)
-    (h_nn : 0 < n_proportional) (h_k : 1 < k) :
-    n_proportional < k * n_proportional := by
-  nlinarith
+    (inv : InvestmentModel) :
+    inv.n_proportional < ancestryInvestmentRequired inv := by
+  unfold ancestryInvestmentRequired
+  have h1 : 1 * inv.n_proportional < inv.k * inv.n_proportional :=
+    mul_lt_mul_of_pos_right inv.h_k_gt_one inv.h_n_pos
+  rwa [one_mul] at h1
 
 /-- **Universal portability is impossible.**
     No single PGS can achieve equal R² in all populations,
@@ -361,12 +394,11 @@ theorem equitable_pgs_overinvestment
     decaying as (1 - c × Fst), the max and min R² must differ
     when Fst values differ. -/
 theorem universal_portability_impossible
-    (r2_source fst_near fst_far c : ℝ)
-    (h_r2 : 0 < r2_source) (h_c : 0 < c)
-    (h_near : 0 ≤ fst_near) (h_far_gt : fst_near < fst_far) :
-    -- The portability gap between near and far populations is positive
-    r2_source * c * fst_near < r2_source * c * fst_far := by
-  exact mul_lt_mul_of_pos_left h_far_gt (mul_pos h_r2 h_c)
+    (m_near m_far : AncestryFairnessModel) (p : PortabilityModel)
+    (h_far_gt : m_near.fst < m_far.fst) :
+    ancestryPortabilityLoss m_near p < ancestryPortabilityLoss m_far p := by
+  unfold ancestryPortabilityLoss
+  exact mul_lt_mul_of_pos_left h_far_gt (mul_pos p.h_r2_pos p.h_c_pos)
 
 end AncestryFairness
 
