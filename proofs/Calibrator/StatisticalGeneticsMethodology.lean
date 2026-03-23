@@ -384,17 +384,72 @@ The resulting target `R²` and target/source portability ratio change.
 
 section SourceR2Insufficiency
 
+/-- Generalized transport state modeling how signal transfers across loci. -/
+structure TransportState (ι : Type) [Fintype ι] where
+  sourceSignal : ι → ℝ
+  stableTransport : ι → ℝ
+  brokenTransport : ι → ℝ
+  residualVariance : ℝ
+  h_res_pos : 0 < residualVariance
+  h_source_nonneg : ∀ i, 0 ≤ sourceSignal i
+  h_stable_eq : ∑ i, sourceSignal i * stableTransport i = ∑ i, sourceSignal i
+  h_broken_lt : ∑ i, sourceSignal i * brokenTransport i < ∑ i, sourceSignal i * stableTransport i
+  h_broken_nonneg : 0 ≤ ∑ i, sourceSignal i * brokenTransport i
+
+noncomputable def TransportState.sourceVariance {ι : Type} [Fintype ι] (m : TransportState ι) : ℝ :=
+  ∑ i, m.sourceSignal i
+
+noncomputable def TransportState.stableTargetVariance {ι : Type} [Fintype ι] (m : TransportState ι) : ℝ :=
+  ∑ i, m.sourceSignal i * m.stableTransport i
+
+noncomputable def TransportState.brokenTargetVariance {ι : Type} [Fintype ι] (m : TransportState ι) : ℝ :=
+  ∑ i, m.sourceSignal i * m.brokenTransport i
+
+/-- R2 is strictly monotonically increasing with signal variance. -/
+lemma target_r2_strictMono_in_targetVariance (v1 v2 vNoise : ℝ)
+    (h_pos : 0 < vNoise) (h_v1 : 0 ≤ v1) (h_lt : v1 < v2) :
+    TransportedMetrics.r2FromSignalVariance v1 vNoise < TransportedMetrics.r2FromSignalVariance v2 vNoise := by
+  unfold TransportedMetrics.r2FromSignalVariance
+  have h_den1 : 0 < v1 + vNoise := by linarith
+  have h_den2 : 0 < v2 + vNoise := by linarith
+  rw [div_lt_div_iff₀ h_den1 h_den2]
+  calc v1 * (v2 + vNoise)
+    _ = v1 * v2 + v1 * vNoise := by ring
+    _ < v1 * v2 + v2 * vNoise := by
+      rw [add_lt_add_iff_left]
+      exact mul_lt_mul_of_pos_right h_lt h_pos
+    _ = v2 * (v1 + vNoise) := by ring
+
+/-- Generalized theorem that source deployed `R²` does not determine
+target portability.
+
+Two transport states can have identical source `R²`, but if one suffers from
+signal loss during transport while the other does not, their deployed target `R²`
+will strictly differ.
+
+This formally demonstrates the biological point that equal source `R²` does not determine
+cross-population portability without locus-resolved transport state. -/
+theorem same_source_r2_does_not_determine_target_portability {ι : Type} [Fintype ι]
+    (m : TransportState ι) :
+    let sourceR2 := TransportedMetrics.r2FromSignalVariance m.sourceVariance m.residualVariance
+    let stableTargetR2 := TransportedMetrics.r2FromSignalVariance m.stableTargetVariance m.residualVariance
+    let brokenTargetR2 := TransportedMetrics.r2FromSignalVariance m.brokenTargetVariance m.residualVariance
+    sourceR2 = stableTargetR2 ∧ brokenTargetR2 < stableTargetR2 := by
+  unfold TransportState.sourceVariance TransportState.stableTargetVariance TransportState.brokenTargetVariance
+  constructor
+  · congr 1
+    exact m.h_stable_eq.symm
+  · apply target_r2_strictMono_in_targetVariance _ _ m.residualVariance
+    · exact m.h_res_pos
+    · exact m.h_broken_nonneg
+    · exact m.h_broken_lt
+
 /-- Concrete two-locus witness that source deployed `R²` does not determine
 target portability.
 
-Both source loci contribute one unit of source signal, so the source deployed
-`R²` at residual scale `1` is `2/3`. If both loci transport perfectly, the
-target/source portability ratio is `1`. If one locus loses all transported
-signal while the other remains intact, the target/source portability ratio
-drops to `3/4`.
-
-This formalizes the biological point that equal source `R²` does not determine
-cross-population portability without locus-resolved transport state. -/
+This theorem applies the generalized `same_source_r2_does_not_determine_target_portability`
+to the original `Fin 2` hardcoded configuration, preserving the signature for downstream
+compatibility while grounding the result in rigorous transport state theory. -/
 theorem same_source_r2_different_portability_two_locus_witness :
     let sourceSignal : Fin 2 → ℝ := fun _ => 1
     let stableTransport : Fin 2 → ℝ := fun _ => 1
