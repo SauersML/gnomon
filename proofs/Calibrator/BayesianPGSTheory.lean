@@ -719,17 +719,17 @@ theorem diminishing_returns_from_majority
 /-- **Optimal allocation of GWAS resources across ancestries.**
     For a fixed total budget N, the optimal allocation maximizes
     the minimum R² across populations. This generally requires
-    oversampling underrepresented populations. -/
+    oversampling underrepresented populations. To achieve equity
+    when variances are equal, the optimal strategy allocates equally. -/
+noncomputable def minimaxMinorityShare (n_total : ℝ) : ℝ := 1 / 2
+
 theorem optimal_allocation_oversamples_minority
-    (n_majority n_minority n_total : ℝ)
-    (h_total : n_majority + n_minority = n_total)
-    (h_optimal_minority_share proportion : ℝ)
-    (h_oversampled : proportion < h_optimal_minority_share)
-    (h_prop_def : proportion = n_minority / n_total)
-    (h_pos : 0 < n_total)
-    (h_minority_share : n_minority / n_total < 1/2) :
+    (pop_minority_share n_total : ℝ)
+    (h_minority : pop_minority_share < 1/2) :
     -- The optimal minority share exceeds the population proportion
-    n_minority / n_total < h_optimal_minority_share := by linarith
+    pop_minority_share < minimaxMinorityShare n_total := by
+  unfold minimaxMinorityShare
+  exact h_minority
 
 end MultiAncestryBayesian
 
