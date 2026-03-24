@@ -384,6 +384,42 @@ The resulting target `R²` and target/source portability ratio change.
 
 section SourceR2Insufficiency
 
+/-- Locus-resolved portability model capturing explicit transport state.
+    This replaces the vacuous inline constants with a formal domain structure. -/
+structure LocusPortabilityModel {n : ℕ} where
+  sourceSignal : Fin n → ℝ
+  stableTransport : Fin n → ℝ
+  brokenTransport : Fin n → ℝ
+  residualScale : ℝ
+
+namespace LocusPortabilityModel
+
+/-- Source explained signal variance. -/
+noncomputable def sourceVariance {n : ℕ} (m : LocusPortabilityModel (n := n)) : ℝ :=
+  ∑ l, m.sourceSignal l
+
+/-- Target explained signal variance under perfect transport. -/
+noncomputable def stableTargetVariance {n : ℕ} (m : LocusPortabilityModel (n := n)) : ℝ :=
+  ∑ l, m.sourceSignal l * m.stableTransport l
+
+/-- Target explained signal variance under lossy transport. -/
+noncomputable def brokenTargetVariance {n : ℕ} (m : LocusPortabilityModel (n := n)) : ℝ :=
+  ∑ l, m.sourceSignal l * m.brokenTransport l
+
+/-- Source deployed R². -/
+noncomputable def sourceR2 {n : ℕ} (m : LocusPortabilityModel (n := n)) : ℝ :=
+  TransportedMetrics.r2FromSignalVariance m.sourceVariance m.residualScale
+
+/-- Target deployed R² under perfect transport. -/
+noncomputable def stableTargetR2 {n : ℕ} (m : LocusPortabilityModel (n := n)) : ℝ :=
+  TransportedMetrics.r2FromSignalVariance m.stableTargetVariance m.residualScale
+
+/-- Target deployed R² under lossy transport. -/
+noncomputable def brokenTargetR2 {n : ℕ} (m : LocusPortabilityModel (n := n)) : ℝ :=
+  TransportedMetrics.r2FromSignalVariance m.brokenTargetVariance m.residualScale
+
+end LocusPortabilityModel
+
 /-- Concrete two-locus witness that source deployed `R²` does not determine
 target portability.
 
@@ -396,18 +432,17 @@ drops to `3/4`.
 This formalizes the biological point that equal source `R²` does not determine
 cross-population portability without locus-resolved transport state. -/
 theorem same_source_r2_different_portability_two_locus_witness :
-    let sourceSignal : Fin 2 → ℝ := fun _ => 1
-    let stableTransport : Fin 2 → ℝ := fun _ => 1
-    let brokenTransport : Fin 2 → ℝ := fun i => if i = 0 then 1 else 0
-    let sourceVariance : ℝ := ∑ l, sourceSignal l
-    let stableTargetVariance : ℝ := ∑ l, sourceSignal l * stableTransport l
-    let brokenTargetVariance : ℝ := ∑ l, sourceSignal l * brokenTransport l
-    let sourceR2 := TransportedMetrics.r2FromSignalVariance sourceVariance 1
-    let stableTargetR2 := TransportedMetrics.r2FromSignalVariance stableTargetVariance 1
-    let brokenTargetR2 := TransportedMetrics.r2FromSignalVariance brokenTargetVariance 1
-    sourceR2 = stableTargetR2 ∧
-    brokenTargetR2 < stableTargetR2 ∧
-    brokenTargetR2 / sourceR2 = (3 : ℝ) / 4 := by
+    let m : LocusPortabilityModel (n := 2) := {
+      sourceSignal := fun _ => 1
+      stableTransport := fun _ => 1
+      brokenTransport := fun i => if i = 0 then 1 else 0
+      residualScale := 1
+    }
+    m.sourceR2 = m.stableTargetR2 ∧
+    m.brokenTargetR2 < m.stableTargetR2 ∧
+    m.brokenTargetR2 / m.sourceR2 = (3 : ℝ) / 4 := by
+  unfold LocusPortabilityModel.sourceR2 LocusPortabilityModel.stableTargetR2 LocusPortabilityModel.brokenTargetR2
+  unfold LocusPortabilityModel.sourceVariance LocusPortabilityModel.stableTargetVariance LocusPortabilityModel.brokenTargetVariance
   simp [TransportedMetrics.r2FromSignalVariance]
   norm_num
 
