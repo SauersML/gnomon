@@ -384,6 +384,19 @@ The resulting target `R²` and target/source portability ratio change.
 
 section SourceR2Insufficiency
 
+/-- Defines locus-resolved transport state. -/
+structure TransportState {n : ℕ} where
+  sourceSignal : Fin n → ℝ
+  transport : Fin n → ℝ
+
+/-- Computes source variance. -/
+noncomputable def TransportState.sourceVariance {n : ℕ} (s : TransportState (n := n)) : ℝ :=
+  ∑ l, s.sourceSignal l
+
+/-- Computes target variance given transport state. -/
+noncomputable def TransportState.targetVariance {n : ℕ} (s : TransportState (n := n)) : ℝ :=
+  ∑ l, s.sourceSignal l * s.transport l
+
 /-- Concrete two-locus witness that source deployed `R²` does not determine
 target portability.
 
@@ -396,19 +409,19 @@ drops to `3/4`.
 This formalizes the biological point that equal source `R²` does not determine
 cross-population portability without locus-resolved transport state. -/
 theorem same_source_r2_different_portability_two_locus_witness :
-    let sourceSignal : Fin 2 → ℝ := fun _ => 1
-    let stableTransport : Fin 2 → ℝ := fun _ => 1
-    let brokenTransport : Fin 2 → ℝ := fun i => if i = 0 then 1 else 0
-    let sourceVariance : ℝ := ∑ l, sourceSignal l
-    let stableTargetVariance : ℝ := ∑ l, sourceSignal l * stableTransport l
-    let brokenTargetVariance : ℝ := ∑ l, sourceSignal l * brokenTransport l
-    let sourceR2 := TransportedMetrics.r2FromSignalVariance sourceVariance 1
-    let stableTargetR2 := TransportedMetrics.r2FromSignalVariance stableTargetVariance 1
-    let brokenTargetR2 := TransportedMetrics.r2FromSignalVariance brokenTargetVariance 1
+    let stableState : TransportState (n := 2) :=
+      { sourceSignal := fun _ => 1
+        transport := fun _ => 1 }
+    let brokenState : TransportState (n := 2) :=
+      { sourceSignal := fun _ => 1
+        transport := fun i => if i = 0 then 1 else 0 }
+    let sourceR2 := TransportedMetrics.r2FromSignalVariance stableState.sourceVariance 1
+    let stableTargetR2 := TransportedMetrics.r2FromSignalVariance stableState.targetVariance 1
+    let brokenTargetR2 := TransportedMetrics.r2FromSignalVariance brokenState.targetVariance 1
     sourceR2 = stableTargetR2 ∧
     brokenTargetR2 < stableTargetR2 ∧
     brokenTargetR2 / sourceR2 = (3 : ℝ) / 4 := by
-  simp [TransportedMetrics.r2FromSignalVariance]
+  dsimp [TransportState.sourceVariance, TransportState.targetVariance, TransportedMetrics.r2FromSignalVariance]
   norm_num
 
 end SourceR2Insufficiency
