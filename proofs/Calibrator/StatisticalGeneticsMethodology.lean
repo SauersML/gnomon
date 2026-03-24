@@ -395,6 +395,60 @@ drops to `3/4`.
 
 This formalizes the biological point that equal source `R²` does not determine
 cross-population portability without locus-resolved transport state. -/
+structure SourceTargetSignalModel (n : ℕ) where
+  sourceSignal : Fin n → ℝ
+  targetTransport1 : Fin n → ℝ
+  targetTransport2 : Fin n → ℝ
+  residualVariance : ℝ
+  h_res_pos : 0 < residualVariance
+  h_source_pos : ∀ i, 0 ≤ sourceSignal i
+  h_t1_bound : ∀ i, 0 ≤ targetTransport1 i ∧ targetTransport1 i ≤ 1
+  h_t2_bound : ∀ i, 0 ≤ targetTransport2 i ∧ targetTransport2 i ≤ 1
+  h_diff : ∃ i, sourceSignal i > 0 ∧ targetTransport2 i < targetTransport1 i
+  h_leq : ∀ i, targetTransport2 i ≤ targetTransport1 i
+
+noncomputable def sourceVariance {n : ℕ} (m : SourceTargetSignalModel n) : ℝ :=
+  ∑ l, m.sourceSignal l
+
+noncomputable def targetVariance1 {n : ℕ} (m : SourceTargetSignalModel n) : ℝ :=
+  ∑ l, m.sourceSignal l * m.targetTransport1 l
+
+noncomputable def targetVariance2 {n : ℕ} (m : SourceTargetSignalModel n) : ℝ :=
+  ∑ l, m.sourceSignal l * m.targetTransport2 l
+
+theorem target_variance_strict_ineq {n : ℕ} (m : SourceTargetSignalModel n) :
+    targetVariance2 m < targetVariance1 m := by
+  unfold targetVariance1 targetVariance2
+  apply Finset.sum_lt_sum
+  · intro i _
+    exact mul_le_mul_of_nonneg_left (m.h_leq i) (m.h_source_pos i)
+  · rcases m.h_diff with ⟨i, hi1, hi2⟩
+    use i, Finset.mem_univ i
+    exact (mul_lt_mul_iff_of_pos_left hi1).mpr hi2
+
+theorem same_source_r2_different_portability {n : ℕ} (m : SourceTargetSignalModel n)
+    (h_pos : 0 ≤ targetVariance2 m) :
+    let target1R2 := TransportedMetrics.r2FromSignalVariance (targetVariance1 m) m.residualVariance
+    let target2R2 := TransportedMetrics.r2FromSignalVariance (targetVariance2 m) m.residualVariance
+    target2R2 < target1R2 := by
+  intros target1R2 target2R2
+  unfold target1R2 target2R2
+  unfold TransportedMetrics.r2FromSignalVariance
+  have hv : targetVariance2 m < targetVariance1 m := target_variance_strict_ineq m
+  have h_denom1 : 0 < targetVariance1 m + m.residualVariance := by
+    apply add_pos_of_nonneg_of_pos
+    · exact le_trans h_pos (le_of_lt hv)
+    · exact m.h_res_pos
+  have h_denom2 : 0 < targetVariance2 m + m.residualVariance := add_pos_of_nonneg_of_pos h_pos m.h_res_pos
+  rw [div_lt_div_iff₀ h_denom2 h_denom1]
+  have h_ar : targetVariance2 m * m.residualVariance < targetVariance1 m * m.residualVariance :=
+    (mul_lt_mul_iff_of_pos_right m.h_res_pos).mpr hv
+  calc targetVariance2 m * (targetVariance1 m + m.residualVariance)
+      = targetVariance2 m * targetVariance1 m + targetVariance2 m * m.residualVariance := by ring
+    _ < targetVariance2 m * targetVariance1 m + targetVariance1 m * m.residualVariance := by linarith
+    _ = targetVariance1 m * (targetVariance2 m + m.residualVariance) := by ring
+
+/-- Corollary to preserve exact original theorem signature. -/
 theorem same_source_r2_different_portability_two_locus_witness :
     let sourceSignal : Fin 2 → ℝ := fun _ => 1
     let stableTransport : Fin 2 → ℝ := fun _ => 1
