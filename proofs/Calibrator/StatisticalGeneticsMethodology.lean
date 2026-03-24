@@ -384,6 +384,66 @@ The resulting target `R²` and target/source portability ratio change.
 
 section SourceR2Insufficiency
 
+/-- Structure representing transport of genetic signal from source to target across `n` loci. -/
+structure TransportState {n : ℕ} where
+  sourceSignal : Fin n → ℝ
+  stableTransport : Fin n → ℝ
+  brokenTransport : Fin n → ℝ
+  h_signal_nonneg : ∀ i, 0 ≤ sourceSignal i
+  h_stable_nonneg : ∀ i, 0 ≤ stableTransport i
+  h_broken_nonneg : ∀ i, 0 ≤ brokenTransport i
+  h_broken_le_stable : ∀ i, brokenTransport i ≤ stableTransport i
+  h_broken_lt_stable : ∃ i, brokenTransport i < stableTransport i ∧ 0 < sourceSignal i
+
+/-- Source variance. -/
+noncomputable def TransportState.sourceVariance {n : ℕ} (m : TransportState (n := n)) : ℝ :=
+  ∑ l, m.sourceSignal l
+
+/-- Stable target variance. -/
+noncomputable def TransportState.stableTargetVariance {n : ℕ} (m : TransportState (n := n)) : ℝ :=
+  ∑ l, m.sourceSignal l * m.stableTransport l
+
+/-- Broken target variance. -/
+noncomputable def TransportState.brokenTargetVariance {n : ℕ} (m : TransportState (n := n)) : ℝ :=
+  ∑ l, m.sourceSignal l * m.brokenTransport l
+
+/-- The R2 is strictly monotonically increasing with target variance. -/
+lemma target_r2_strictMono_in_targetVariance {v₁ v₂ : ℝ} (h_pos1 : 0 ≤ v₁) (h_lt : v₁ < v₂) :
+    v₁ / (v₁ + 1) < v₂ / (v₂ + 1) := by
+  have h1 : 0 < v₁ + 1 := by linarith
+  have h2 : 0 < v₂ + 1 := by linarith
+  rw [div_lt_div_iff₀ h1 h2]
+  calc v₁ * (v₂ + 1) = v₁ * v₂ + v₁ := by ring
+    _ < v₁ * v₂ + v₂ := add_lt_add_left h_lt _
+    _ = (v₁ + 1) * v₂ := by ring
+    _ = v₂ * (v₁ + 1) := mul_comm _ _
+
+/-- Target variance drops when transport is broken. -/
+lemma TransportState.broken_lt_stable_variance {n : ℕ} (m : TransportState (n := n)) :
+    m.brokenTargetVariance < m.stableTargetVariance := by
+  apply Finset.sum_lt_sum
+  · intro i _
+    exact mul_le_mul_of_nonneg_left (m.h_broken_le_stable i) (m.h_signal_nonneg i)
+  · rcases m.h_broken_lt_stable with ⟨i, h_lt, h_pos⟩
+    use i, Finset.mem_univ i
+    exact (mul_lt_mul_of_pos_left h_lt h_pos)
+
+lemma TransportState.broken_variance_nonneg {n : ℕ} (m : TransportState (n := n)) :
+    0 ≤ m.brokenTargetVariance := by
+  apply Finset.sum_nonneg
+  intro i _
+  exact mul_nonneg (m.h_signal_nonneg i) (m.h_broken_nonneg i)
+
+/-- General theorem: source R2 does not determine target portability.
+    If loci transport breaks, the deployed R2 strictly drops. -/
+theorem same_source_r2_different_portability {n : ℕ} (m : TransportState (n := n)) :
+    let stableTargetR2 := TransportedMetrics.r2FromSignalVariance m.stableTargetVariance 1
+    let brokenTargetR2 := TransportedMetrics.r2FromSignalVariance m.brokenTargetVariance 1
+    brokenTargetR2 < stableTargetR2 := by
+  intro stableTargetR2 brokenTargetR2
+  dsimp [stableTargetR2, brokenTargetR2, TransportedMetrics.r2FromSignalVariance]
+  apply target_r2_strictMono_in_targetVariance m.broken_variance_nonneg m.broken_lt_stable_variance
+
 /-- Concrete two-locus witness that source deployed `R²` does not determine
 target portability.
 
@@ -408,7 +468,24 @@ theorem same_source_r2_different_portability_two_locus_witness :
     sourceR2 = stableTargetR2 ∧
     brokenTargetR2 < stableTargetR2 ∧
     brokenTargetR2 / sourceR2 = (3 : ℝ) / 4 := by
-  simp [TransportedMetrics.r2FromSignalVariance]
+  let m : TransportState (n := 2) := {
+    sourceSignal := fun _ => 1
+    stableTransport := fun _ => 1
+    brokenTransport := fun i => if i = 0 then 1 else 0
+    h_signal_nonneg := by intro i; norm_num
+    h_stable_nonneg := by intro i; norm_num
+    h_broken_nonneg := by intro i; split_ifs <;> norm_num
+    h_broken_le_stable := by intro i; split_ifs <;> norm_num
+    h_broken_lt_stable := by
+      use 1
+      constructor
+      · change (if (1 : Fin 2) = 0 then 1 else 0 : ℝ) < 1
+        have h_neq : (1 : Fin 2) ≠ 0 := by decide
+        simp [h_neq]
+      · norm_num
+  }
+  have h_lt := same_source_r2_different_portability m
+  simp [TransportedMetrics.r2FromSignalVariance] at h_lt ⊢
   norm_num
 
 end SourceR2Insufficiency
