@@ -854,14 +854,16 @@ theorem precision_eq_prevalence_recall_fpr (c : ConfusionMatrix) :
   unfold precision
   rfl
 
+noncomputable def requiredFprForConstantPrecision (π p r : ℝ) : ℝ :=
+  π * r * (1 - p) / ((1 - π) * p)
+
 theorem constant_precision_construction
     {π p r : ℝ}
     (hnum : π * r ≠ 0)
     (hpi : 1 - π ≠ 0)
     (hp : p ≠ 0) :
-    (let f := π * r * (1 - p) / ((1 - π) * p);
-      (π * r) / (π * r + (1 - π) * f) = p) := by
-  dsimp
+    (π * r) / (π * r + (1 - π) * requiredFprForConstantPrecision π p r) = p := by
+  unfold requiredFprForConstantPrecision
   have hπ : π ≠ 0 := by
     intro h
     apply hnum
