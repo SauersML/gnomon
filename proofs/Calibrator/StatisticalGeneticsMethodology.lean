@@ -384,7 +384,103 @@ The resulting target `R²` and target/source portability ratio change.
 
 section SourceR2Insufficiency
 
-/-- Concrete two-locus witness that source deployed `R²` does not determine
+/-- Abstract mathematical model of locus-resolved transport across populations.
+It specifies source genetic signal and two possible target transport states
+(one more broken than the other), plus shared environmental noise. -/
+structure LocusTransportState {n : ℕ} where
+  sourceSignal : Fin n → ℝ
+  stableTransport : Fin n → ℝ
+  brokenTransport : Fin n → ℝ
+  noise : ℝ
+  h_noise : 0 < noise
+  h_signal_pos : ∀ i, 0 ≤ sourceSignal i
+  h_stable_pos : ∀ i, 0 ≤ stableTransport i
+  h_broken_pos : ∀ i, 0 ≤ brokenTransport i
+  h_broken_le : ∀ i, brokenTransport i ≤ stableTransport i
+  h_broken_lt : ∃ i, 0 < sourceSignal i ∧ brokenTransport i < stableTransport i
+
+namespace LocusTransportState
+
+noncomputable def sourceVariance {n : ℕ} (s : LocusTransportState (n := n)) : ℝ :=
+  ∑ i, s.sourceSignal i
+
+noncomputable def stableTargetVariance {n : ℕ} (s : LocusTransportState (n := n)) : ℝ :=
+  ∑ i, s.sourceSignal i * s.stableTransport i
+
+noncomputable def brokenTargetVariance {n : ℕ} (s : LocusTransportState (n := n)) : ℝ :=
+  ∑ i, s.sourceSignal i * s.brokenTransport i
+
+lemma broken_lt_stable {n : ℕ} (s : LocusTransportState (n := n)) :
+    s.brokenTargetVariance < s.stableTargetVariance := by
+  apply Finset.sum_lt_sum
+  · intro i _
+    exact mul_le_mul_of_nonneg_left (s.h_broken_le i) (s.h_signal_pos i)
+  · rcases s.h_broken_lt with ⟨i, hpos, hlt⟩
+    use i, Finset.mem_univ i
+    exact mul_lt_mul_of_pos_left hlt hpos
+
+lemma stable_nonneg {n : ℕ} (s : LocusTransportState (n := n)) :
+    0 ≤ s.stableTargetVariance := by
+  apply Finset.sum_nonneg
+  intro i _
+  exact mul_nonneg (s.h_signal_pos i) (s.h_stable_pos i)
+
+lemma broken_nonneg {n : ℕ} (s : LocusTransportState (n := n)) :
+    0 ≤ s.brokenTargetVariance := by
+  apply Finset.sum_nonneg
+  intro i _
+  exact mul_nonneg (s.h_signal_pos i) (s.h_broken_pos i)
+
+lemma stable_pos {n : ℕ} (s : LocusTransportState (n := n)) :
+    0 < s.stableTargetVariance := by
+  calc 0 ≤ s.brokenTargetVariance := s.broken_nonneg
+       _ < s.stableTargetVariance := s.broken_lt_stable
+
+end LocusTransportState
+
+/-- Helper lemma: `R²` from signal variance is strictly monotonic in signal variance. -/
+lemma target_r2_strictMono_in_targetVariance (vSignal1 vSignal2 vNoise : ℝ)
+    (h_noise : 0 < vNoise) (h_pos1 : 0 ≤ vSignal1) (h_pos2 : 0 ≤ vSignal2)
+    (h_lt : vSignal1 < vSignal2) :
+    TransportedMetrics.r2FromSignalVariance vSignal1 vNoise <
+    TransportedMetrics.r2FromSignalVariance vSignal2 vNoise := by
+  unfold TransportedMetrics.r2FromSignalVariance
+  apply (div_lt_div_iff₀ (by positivity) (by positivity)).mpr
+  have h1 : vSignal1 * vNoise < vSignal2 * vNoise := mul_lt_mul_of_pos_right h_lt h_noise
+  calc vSignal1 * (vSignal2 + vNoise)
+    _ = vSignal1 * vSignal2 + vSignal1 * vNoise := mul_add _ _ _
+    _ < vSignal1 * vSignal2 + vSignal2 * vNoise := add_lt_add_left h1 _
+    _ = vSignal2 * (vSignal1 + vNoise) := by ring
+
+/-- Structural proof that equal source `R²` does not determine target portability
+without locus-resolved transport state. For any valid abstract transport state
+where one transport is strictly worse than the other, the resulting target
+portability strictly drops, even if the source `R²` is the same. -/
+theorem same_source_r2_different_portability_structural
+    {n : ℕ} (s : LocusTransportState (n := n))
+    (h_source_eq_stable : s.sourceVariance = s.stableTargetVariance) :
+    let sourceR2 := TransportedMetrics.r2FromSignalVariance s.sourceVariance s.noise
+    let stableTargetR2 := TransportedMetrics.r2FromSignalVariance s.stableTargetVariance s.noise
+    let brokenTargetR2 := TransportedMetrics.r2FromSignalVariance s.brokenTargetVariance s.noise
+    sourceR2 = stableTargetR2 ∧
+    brokenTargetR2 < stableTargetR2 ∧
+    brokenTargetR2 / sourceR2 < 1 := by
+  intro sourceR2 stableTargetR2 brokenTargetR2
+  have h_eq : sourceR2 = stableTargetR2 := by
+    dsimp [sourceR2, stableTargetR2]
+    rw [h_source_eq_stable]
+  have h_broken_lt : brokenTargetR2 < stableTargetR2 := by
+    dsimp [brokenTargetR2, stableTargetR2]
+    exact target_r2_strictMono_in_targetVariance s.brokenTargetVariance s.stableTargetVariance s.noise
+      s.h_noise s.broken_nonneg s.stable_nonneg s.broken_lt_stable
+  refine ⟨h_eq, h_broken_lt, ?_⟩
+  rw [h_eq]
+  apply (div_lt_one ?_).mpr h_broken_lt
+  dsimp [stableTargetR2, TransportedMetrics.r2FromSignalVariance]
+  apply div_pos s.stable_pos
+  linarith [s.stable_pos, s.h_noise]
+
+/-- Concrete two-locus corollary that source deployed `R²` does not determine
 target portability.
 
 Both source loci contribute one unit of source signal, so the source deployed
@@ -393,8 +489,8 @@ target/source portability ratio is `1`. If one locus loses all transported
 signal while the other remains intact, the target/source portability ratio
 drops to `3/4`.
 
-This formalizes the biological point that equal source `R²` does not determine
-cross-population portability without locus-resolved transport state. -/
+This instantiates the abstract `LocusTransportState` to formalize the biological
+point that equal source `R²` does not determine cross-population portability. -/
 theorem same_source_r2_different_portability_two_locus_witness :
     let sourceSignal : Fin 2 → ℝ := fun _ => 1
     let stableTransport : Fin 2 → ℝ := fun _ => 1
@@ -408,8 +504,17 @@ theorem same_source_r2_different_portability_two_locus_witness :
     sourceR2 = stableTargetR2 ∧
     brokenTargetR2 < stableTargetR2 ∧
     brokenTargetR2 / sourceR2 = (3 : ℝ) / 4 := by
-  simp [TransportedMetrics.r2FromSignalVariance]
-  norm_num
+  intro sourceSignal stableTransport brokenTransport sourceVariance stableTargetVariance brokenTargetVariance sourceR2 stableTargetR2 brokenTargetR2
+  have h_eq : sourceR2 = stableTargetR2 := by
+    dsimp [sourceR2, stableTargetR2, TransportedMetrics.r2FromSignalVariance, sourceVariance, stableTargetVariance, sourceSignal, stableTransport]
+    norm_num
+  have h_lt : brokenTargetR2 < stableTargetR2 := by
+    dsimp [brokenTargetR2, stableTargetR2, TransportedMetrics.r2FromSignalVariance, brokenTargetVariance, stableTargetVariance, sourceSignal, stableTransport, brokenTransport]
+    norm_num
+  have h_div : brokenTargetR2 / sourceR2 = (3 : ℝ) / 4 := by
+    dsimp [brokenTargetR2, sourceR2, TransportedMetrics.r2FromSignalVariance, brokenTargetVariance, sourceVariance, sourceSignal, brokenTransport]
+    norm_num
+  exact ⟨h_eq, h_lt, h_div⟩
 
 end SourceR2Insufficiency
 
