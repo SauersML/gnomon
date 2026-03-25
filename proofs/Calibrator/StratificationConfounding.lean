@@ -514,17 +514,28 @@ theorem survivorship_attenuates_in_older (m : SurvivorshipAttenuationModel) :
       < m.r2_full * 1 := by exact mul_lt_mul_of_pos_left h_ratio_lt_one m.r2_full_pos
     _ = m.r2_full := by ring
 
+structure MultiPopSurvivorshipModel where
+  source : SurvivorshipAttenuationModel
+  target : SurvivorshipAttenuationModel
+  /-- Same full genetic architecture before selection -/
+  same_architecture : source.r2_full = target.r2_full
+  /-- Target population undergoes stronger selection/survivorship bias (lower variance retained) -/
+  stronger_selection : target.var_surv / target.var_birth < source.var_surv / source.var_birth
+
 /-- **Differential survivorship across populations creates portability artifact.**
     If the target population has different age structure or mortality patterns,
-    survivorship bias contributes to apparent portability loss. -/
-theorem differential_survivorship_artifact
-    (r2_source_full r2_target_full Δ_surv_source Δ_surv_target : ℝ)
-    (h_surv_s : 0 ≤ Δ_surv_source) (h_surv_t : 0 ≤ Δ_surv_target)
-    (h_diff : Δ_surv_target > Δ_surv_source)
-    (h_obs_s : r2_source_full - Δ_surv_source > 0) :
-    (r2_source_full - Δ_surv_source) - (r2_target_full - Δ_surv_target) >
-      r2_source_full - r2_target_full := by
-  linarith
+    survivorship bias contributes to apparent portability loss (difference > 0)
+    even when the true underlying genetic architecture is identical. -/
+theorem differential_survivorship_artifact (m : MultiPopSurvivorshipModel) :
+    m.source.r2_surv - m.target.r2_surv > m.source.r2_full - m.target.r2_full := by
+  have h_true_diff : m.source.r2_full - m.target.r2_full = 0 := sub_eq_zero.mpr m.same_architecture
+  rw [h_true_diff]
+  have h1 : 0 < m.source.r2_surv - m.target.r2_surv := by
+    rw [sub_pos]
+    unfold SurvivorshipAttenuationModel.r2_surv
+    rw [m.same_architecture]
+    exact mul_lt_mul_of_pos_left m.stronger_selection m.target.r2_full_pos
+  exact h1
 
 end SurvivorshipBias
 
@@ -698,30 +709,59 @@ theorem instrument_strength_decreases (m : MRInstrumentModel)
   apply mul_lt_mul_of_pos_left h_het
   exact mul_pos m.n_pos (sq_pos_of_ne_zero m.β_inst_ne)
 
+structure MRWeakInstrumentBiasModel where
+  /-- Confounding bias term -/
+  conf_bias : ℝ
+  conf_bias_pos : 0 < conf_bias
+  /-- F-statistic in source population -/
+  F_source : ℝ
+  F_source_gt_one : 1 < F_source
+  /-- F-statistic in target population -/
+  F_target : ℝ
+  F_target_gt_one : 1 < F_target
+  /-- Instrument is weaker in target (lower F-stat) -/
+  target_weaker : F_target < F_source
+
+/-- Bias due to weak instrument (towards the confounded estimate) -/
+noncomputable def MRWeakInstrumentBiasModel.bias (m : MRWeakInstrumentBiasModel) (F : ℝ) : ℝ :=
+  (1 - 1 / F) * m.conf_bias
+
 /-- **Weak instrument bias in MR.**
     Bias = (1 - 1/F) × confounding bias.
     As F decreases (weaker instrument), bias increases toward the
     confounded OLS estimate. -/
-theorem weak_instrument_bias_increases
-    (conf_bias : ℝ) (F₁ F₂ : ℝ)
-    (h_conf : 0 < conf_bias)
-    (h_F₁ : 1 < F₁) (h_F₂ : 1 < F₂)
-    (h_weaker : F₂ < F₁) :
-    (1 - 1/F₂) * conf_bias < (1 - 1/F₁) * conf_bias := by
-  apply mul_lt_mul_of_pos_right _ h_conf
-  have h1 : 1/F₁ < 1/F₂ := by
-    rw [div_lt_div_iff₀ (by linarith) (by linarith)]
-    linarith
+theorem weak_instrument_bias_increases (m : MRWeakInstrumentBiasModel) :
+    m.bias m.F_target < m.bias m.F_source := by
+  unfold MRWeakInstrumentBiasModel.bias
+  apply mul_lt_mul_of_pos_right _ m.conf_bias_pos
+  have h_source_pos : 0 < m.F_source := by linarith [m.F_source_gt_one]
+  have h_target_pos : 0 < m.F_target := by linarith [m.F_target_gt_one]
+  have h_inv_lt : 1 / m.F_source < 1 / m.F_target := by
+    rw [one_div_lt_one_div h_source_pos h_target_pos]
+    exact m.target_weaker
   linarith
+
+structure MRPleiotropyModel where
+  /-- True causal effect -/
+  β_causal : ℝ
+  /-- Pleiotropic effect in source -/
+  α_pleio_source : ℝ
+  /-- Pleiotropic effect in target -/
+  α_pleio_target : ℝ
+  /-- Pleiotropy differs across populations -/
+  pleio_diff : α_pleio_source ≠ α_pleio_target
 
 /-- **Horizontal pleiotropy patterns differ across populations.**
     If pleiotropic effects change across populations (due to different
     LD patterns or gene regulation), MR estimates are not portable. -/
-theorem pleiotropy_changes_invalidate_mr
-    (β_causal α_pleio_source α_pleio_target : ℝ)
-    (h_diff : α_pleio_source ≠ α_pleio_target) :
-    β_causal + α_pleio_source ≠ β_causal + α_pleio_target := by
-  intro h; exact h_diff (by linarith)
+theorem pleiotropy_changes_invalidate_mr (m : MRPleiotropyModel) :
+    m.β_causal + m.α_pleio_source ≠ m.β_causal + m.α_pleio_target := by
+  intro h
+  have h_eq : m.α_pleio_source = m.α_pleio_target := by
+    calc m.α_pleio_source = m.β_causal + m.α_pleio_source - m.β_causal := by ring
+      _ = m.β_causal + m.α_pleio_target - m.β_causal := by rw [h]
+      _ = m.α_pleio_target := by ring
+  exact m.pleio_diff h_eq
 
 end MRPortability
 
