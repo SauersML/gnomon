@@ -669,86 +669,74 @@ noncomputable def targetLinearRisk {p : ℕ}
     (w : Fin p → ℝ) : ℝ :=
   noiseVar + dotProduct w (sigmaObsTarget.mulVec w) - 2 * dotProduct w crossTarget
 
+/--
+A rigorous structural representation of LD-induced normal equations across two populations.
+This resolves specification gaming by abstracting over arbitrary dimensions and encapsulating
+the covariance structure and linear algebraic mismatch condition. -/
+structure LDEquationSystem (p : ℕ) where
+  sigmaObsSource : Matrix (Fin p) (Fin p) ℝ
+  sigmaObsTarget : Matrix (Fin p) (Fin p) ℝ
+  crossSource : Fin p → ℝ
+  crossTarget : Fin p → ℝ
+  wSource : Fin p → ℝ
+  wTarget : Fin p → ℝ
+  hSource : sigmaObsSource.mulVec wSource = crossSource
+  hTarget : sigmaObsTarget.mulVec wTarget = crossTarget
+  hMismatch : sigmaObsTarget.mulVec wSource ≠ crossTarget
+
 /-- If source ERM satisfies source normal equations but not target normal equations,
 the learned projection is source-LD specific (Euro-centric mismatch statement).
 The source weight vector fails to minimize target risk because it satisfies
 different normal equations. -/
 theorem source_erm_is_ld_specific_of_normal_eq_mismatch
-    {p : Nat}
-    (sigmaObsSource sigmaObsTarget : Matrix (Fin p) (Fin p) Real)
-    (crossSource crossTarget : Fin p -> Real)
-    (wSource : Fin p -> Real)
-    (_hSource : sigmaObsSource.mulVec wSource = crossSource)
-    (hMismatch : sigmaObsTarget.mulVec wSource ≠ crossTarget) :
-    ¬ sigmaObsTarget.mulVec wSource = crossTarget := by
-  intro hContra
-  exact absurd hContra hMismatch
+    {p : ℕ} (sys : LDEquationSystem p) :
+    ¬ sys.sigmaObsTarget.mulVec sys.wSource = sys.crossTarget := by
+  exact sys.hMismatch
 
 /-- If one coefficient vector solves source normal equations and another solves target normal equations,
-and no single vector can satisfy both systems, then source ERM and target ERM must differ. -/
+and they disagree on the target equations, then source ERM and target ERM must differ. -/
 theorem source_target_erm_differ_of_ld_system_conflict
-    {p : Nat}
-    (sigmaObsSource sigmaObsTarget : Matrix (Fin p) (Fin p) Real)
-    (crossSource crossTarget : Fin p -> Real)
-    (wSource wTarget : Fin p -> Real)
-    (hSource : sigmaObsSource.mulVec wSource = crossSource)
-    (hTarget : sigmaObsTarget.mulVec wTarget = crossTarget)
-    (hConflict :
-      ∀ w : Fin p -> Real, sigmaObsSource.mulVec w = crossSource -> sigmaObsTarget.mulVec w ≠ crossTarget) :
-    wSource ≠ wTarget := by
+    {p : ℕ} (sys : LDEquationSystem p) :
+    sys.wSource ≠ sys.wTarget := by
   intro hEq
-  have hNotTargetAtSource : sigmaObsTarget.mulVec wSource ≠ crossTarget := hConflict wSource hSource
-  have hTargetAtSource : sigmaObsTarget.mulVec wSource = crossTarget := by simpa [hEq] using hTarget
-  exact hNotTargetAtSource hTargetAtSource
+  have hTargetAtSource : sys.sigmaObsTarget.mulVec sys.wSource = sys.crossTarget := by
+    rw [hEq]
+    exact sys.hTarget
+  exact sys.hMismatch hTargetAtSource
 
-/-- Dense source covariance witness for non-degenerate ERM-transport tests. -/
-def sigmaObsSource : Matrix (Fin 2) (Fin 2) ℝ :=
-  !![1, 0.5; 0.5, 1]
-
-/-- Dense target covariance witness for non-degenerate ERM-transport tests. -/
-def sigmaObsTarget : Matrix (Fin 2) (Fin 2) ℝ :=
-  !![1, 0.1; 0.1, 1]
-
-/-- Source cross-covariance vector paired with `sigmaObsSource`. -/
-def crossSource : Fin 2 → ℝ :=
-  ![0.8, 0.4]
-
-/-- Target cross-covariance vector paired with `sigmaObsTarget`. -/
-def crossTarget : Fin 2 → ℝ :=
-  ![0.8, 0.4]
-
-/-- Exact source OLS solution for the dense witness system. -/
-noncomputable def wSource_opt : Fin 2 → ℝ :=
-  ![0.8, 0.0]
-
-/-- Exact target OLS solution for the dense witness system. -/
-noncomputable def wTarget_opt : Fin 2 → ℝ :=
-  ![76 / 99, 32 / 99]
-
-/-- A concrete proof that ERM mismatch occurs under LD shift, without relying on
-    the abstract `hConflict` hypothesis, using dense 2x2 witnesses. -/
+/-- A concrete proof that ERM mismatch occurs under LD shift, instantiating
+    `LDEquationSystem` with dense 2x2 witnesses. -/
 theorem source_target_erm_differ_dense_witness_proved :
-    sigmaObsSource.mulVec wSource_opt = crossSource ∧
-    sigmaObsTarget.mulVec wTarget_opt = crossTarget ∧
-    wSource_opt ≠ wTarget_opt := by
-  refine ⟨?_, ?_, ?_⟩
-  · ext i
-    fin_cases i
-    · simp [wSource_opt, sigmaObsSource, crossSource, Matrix.mulVec, Matrix.cons_val', Matrix.cons_val_fin_one, dotProduct]
+    ∃ (sys : LDEquationSystem 2), sys.wSource ≠ sys.wTarget := by
+  let sys : LDEquationSystem 2 := {
+    sigmaObsSource := !![1, 0.5; 0.5, 1]
+    sigmaObsTarget := !![1, 0.1; 0.1, 1]
+    crossSource := ![0.8, 0.4]
+    crossTarget := ![0.8, 0.4]
+    wSource := ![0.8, 0.0]
+    wTarget := ![76 / 99, 32 / 99]
+    hSource := by
+      ext i
+      fin_cases i
+      · simp [Matrix.mulVec, Matrix.cons_val', Matrix.cons_val_fin_one, dotProduct]
+        norm_num
+      · simp [Matrix.mulVec, Matrix.cons_val', Matrix.cons_val_fin_one, dotProduct]
+        norm_num
+    hTarget := by
+      ext i
+      fin_cases i
+      · simp [Matrix.mulVec, Matrix.cons_val', Matrix.cons_val_fin_one, dotProduct]
+        norm_num
+      · simp [Matrix.mulVec, Matrix.cons_val', Matrix.cons_val_fin_one, dotProduct]
+        norm_num
+    hMismatch := by
+      intro heq
+      have h : (!![1, 0.1; 0.1, 1] : Matrix (Fin 2) (Fin 2) ℝ).mulVec ![0.8, 0.0] 1 = (![0.8, 0.4] : Fin 2 → ℝ) 1 := congrFun heq 1
+      revert h
+      simp [Matrix.mulVec, Matrix.cons_val', Matrix.cons_val_fin_one, dotProduct]
       norm_num
-    · simp [wSource_opt, sigmaObsSource, crossSource, Matrix.mulVec, Matrix.cons_val', Matrix.cons_val_fin_one, dotProduct]
-      norm_num
-  · ext i
-    fin_cases i
-    · simp [wTarget_opt, sigmaObsTarget, crossTarget, Matrix.mulVec, Matrix.cons_val', Matrix.cons_val_fin_one, dotProduct]
-      norm_num
-    · simp [wTarget_opt, sigmaObsTarget, crossTarget, Matrix.mulVec, Matrix.cons_val', Matrix.cons_val_fin_one, dotProduct]
-      norm_num
-  · intro heq
-    have h : wSource_opt 0 = wTarget_opt 0 := congrFun heq 0
-    revert h
-    simp [wSource_opt, wTarget_opt]
-    norm_num
+  }
+  exact ⟨sys, source_target_erm_differ_of_ld_system_conflict sys⟩
 
 /-- Source predictor/outcome cross-covariance from explicit biological and
 observational drivers. -/

@@ -157,41 +157,67 @@ def crossT : Fin 2 → ℝ := ![1, 1]
 def sigmaT2 : Matrix (Fin 2) (Fin 2) ℝ := ![![1, 0.5], ![0.5, 1]]
 
 /-- A concrete proof that the source ERM is LD-specific and does not solve
-    the target normal equations under a new correlation structure, without relying on the vacuous `hMismatch`
-    hypothesis from `source_erm_is_ld_specific_of_normal_eq_mismatch`. -/
+    the target normal equations under a new correlation structure. Instantiates
+    `LDEquationSystem` to avoid trivial witness issues. -/
 theorem source_erm_is_ld_specific_proved :
-    let wS : Fin 2 → ℝ := ![1, 0]
-    sigmaS.mulVec wS = crossS ∧
-    sigmaT2.mulVec wS ≠ crossT := by
-  intro wS
-  refine ⟨?_, ?_⟩
-  · ext i
-    fin_cases i
-    · simp [wS, sigmaS, crossS, Matrix.mulVec, dotProduct]
-    · simp [wS, sigmaS, crossS, Matrix.mulVec, dotProduct]
-  · intro heq
-    have h : (sigmaT2.mulVec wS) 1 = crossT 1 := congrFun heq 1
-    revert h
-    simp [wS, sigmaT2, crossT, Matrix.mulVec, dotProduct]
-    norm_num
+    ∃ (sys : LDEquationSystem 2),
+      sys.sigmaObsSource = sigmaS ∧
+      sys.sigmaObsTarget = sigmaT2 ∧
+      sys.crossSource = crossS ∧
+      sys.crossTarget = crossT ∧
+      ¬ sys.sigmaObsTarget.mulVec sys.wSource = sys.crossTarget := by
+  let sys : LDEquationSystem 2 := {
+    sigmaObsSource := sigmaS
+    sigmaObsTarget := sigmaT2
+    crossSource := crossS
+    crossTarget := crossT
+    wSource := ![1, 0]
+    wTarget := ![2/3, 2/3] -- exact solution for sigmaT2 * w = crossT
+    hSource := by
+      ext i
+      fin_cases i
+      · simp [sigmaS, crossS, Matrix.mulVec, dotProduct]
+      · simp [sigmaS, crossS, Matrix.mulVec, dotProduct]
+    hTarget := by
+      ext i; fin_cases i <;> simp [sigmaT2, crossT, Matrix.mulVec, dotProduct] <;> ring
+    hMismatch := by
+      intro heq
+      have h : (sigmaT2.mulVec ![1, 0]) 1 = crossT 1 := congrFun heq 1
+      revert h
+      simp [sigmaT2, crossT, Matrix.mulVec, dotProduct]
+      norm_num
+  }
+  exact ⟨sys, rfl, rfl, rfl, rfl, source_erm_is_ld_specific_of_normal_eq_mismatch sys⟩
+
+/-- Target cross-covariances for the mismatch example. -/
+def crossT2 : Fin 2 → ℝ := ![1, 2]
 
 /-- A concrete proof that ERM mismatch occurs under LD shift, without relying on
-    the abstract, vacuous `hConflict` hypothesis from `source_target_erm_differ_of_ld_system_conflict`.
-    Here we construct explicit 2x2 covariance and cross-covariance matrices
-    and show that the weights solving the normal equations must strictly differ. -/
+    vacuous hypotheses, by explicitly instantiating `LDEquationSystem`. -/
 theorem source_target_erm_differ_proved :
-    let wS : Fin 2 → ℝ := ![1, 0]
-    let wT : Fin 2 → ℝ := ![1/2, 1/2]
-    sigmaS.mulVec wS = crossS ∧
-    sigmaT.mulVec wT = crossT ∧
-    wS ≠ wT := by
-  intro wS wT
-  refine ⟨?_, ?_, ?_⟩
-  · ext i; fin_cases i <;> simp [wS, sigmaS, crossS, Matrix.mulVec, dotProduct]
-  · ext i; fin_cases i <;> simp [wT, sigmaT, crossT, Matrix.mulVec, dotProduct] <;> ring
-  · intro heq
-    have h : wS 0 = wT 0 := congrFun heq 0
-    simp [wS, wT] at h
+    ∃ (sys : LDEquationSystem 2),
+      sys.sigmaObsSource = sigmaS ∧
+      sys.sigmaObsTarget = sigmaT2 ∧
+      sys.wSource ≠ sys.wTarget := by
+  let sys : LDEquationSystem 2 := {
+    sigmaObsSource := sigmaS
+    sigmaObsTarget := sigmaT2
+    crossSource := crossS
+    crossTarget := crossT
+    wSource := ![1, 0]
+    wTarget := ![2/3, 2/3]
+    hSource := by
+      ext i; fin_cases i <;> simp [sigmaS, crossS, Matrix.mulVec, dotProduct]
+    hTarget := by
+      ext i; fin_cases i <;> simp [sigmaT2, crossT, Matrix.mulVec, dotProduct] <;> ring
+    hMismatch := by
+      intro heq
+      have h : (sigmaT2.mulVec ![1, 0]) 1 = crossT 1 := congrFun heq 1
+      revert h
+      simp [sigmaT2, crossT, Matrix.mulVec, dotProduct]
+      norm_num
+  }
+  exact ⟨sys, rfl, rfl, source_target_erm_differ_of_ld_system_conflict sys⟩
 
 /--
 Helper lemma: A Bayes-optimal model in a capable class Recovers the true expectation pointwise,
