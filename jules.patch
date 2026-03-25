@@ -1,0 +1,72 @@
+diff --git a/proofs/Calibrator/StatisticalGeneticsMethodology.lean b/proofs/Calibrator/StatisticalGeneticsMethodology.lean
+index 3250495..1dd9d32 100644
+--- a/proofs/Calibrator/StatisticalGeneticsMethodology.lean
++++ b/proofs/Calibrator/StatisticalGeneticsMethodology.lean
+@@ -384,6 +384,33 @@ The resulting target `R²` and target/source portability ratio change.
+ 
+ section SourceR2Insufficiency
+ 
++/-- A locus-resolved transport state model for predicting portability.
++This structure generalizes cross-population genetic architecture by explicitly
++tracking locus-level signal and transport. -/
++structure LocusTransportModel {n : ℕ} where
++  sourceSignal : Fin n → ℝ
++  targetTransport : Fin n → ℝ
++
++namespace LocusTransportModel
++
++/-- The total source variance, aggregating locus-specific signals. -/
++noncomputable def sourceVariance {n : ℕ} (m : LocusTransportModel (n := n)) : ℝ :=
++  ∑ l, m.sourceSignal l
++
++/-- The total target variance, attenuating source signals by locus-specific transport. -/
++noncomputable def targetVariance {n : ℕ} (m : LocusTransportModel (n := n)) : ℝ :=
++  ∑ l, m.sourceSignal l * m.targetTransport l
++
++/-- The transported R² in the target population. -/
++noncomputable def targetR2 {n : ℕ} (m : LocusTransportModel (n := n)) (residual : ℝ) : ℝ :=
++  TransportedMetrics.r2FromSignalVariance m.targetVariance residual
++
++/-- The source R² for the deployed model. -/
++noncomputable def sourceR2 {n : ℕ} (m : LocusTransportModel (n := n)) (residual : ℝ) : ℝ :=
++  TransportedMetrics.r2FromSignalVariance m.sourceVariance residual
++
++end LocusTransportModel
++
+ /-- Concrete two-locus witness that source deployed `R²` does not determine
+ target portability.
+ 
+@@ -396,19 +423,20 @@ drops to `3/4`.
+ This formalizes the biological point that equal source `R²` does not determine
+ cross-population portability without locus-resolved transport state. -/
+ theorem same_source_r2_different_portability_two_locus_witness :
+-    let sourceSignal : Fin 2 → ℝ := fun _ => 1
+-    let stableTransport : Fin 2 → ℝ := fun _ => 1
+-    let brokenTransport : Fin 2 → ℝ := fun i => if i = 0 then 1 else 0
+-    let sourceVariance : ℝ := ∑ l, sourceSignal l
+-    let stableTargetVariance : ℝ := ∑ l, sourceSignal l * stableTransport l
+-    let brokenTargetVariance : ℝ := ∑ l, sourceSignal l * brokenTransport l
+-    let sourceR2 := TransportedMetrics.r2FromSignalVariance sourceVariance 1
+-    let stableTargetR2 := TransportedMetrics.r2FromSignalVariance stableTargetVariance 1
+-    let brokenTargetR2 := TransportedMetrics.r2FromSignalVariance brokenTargetVariance 1
+-    sourceR2 = stableTargetR2 ∧
+-    brokenTargetR2 < stableTargetR2 ∧
+-    brokenTargetR2 / sourceR2 = (3 : ℝ) / 4 := by
+-  simp [TransportedMetrics.r2FromSignalVariance]
++    let stableModel : LocusTransportModel (n := 2) := {
++      sourceSignal := fun _ => 1,
++      targetTransport := fun _ => 1
++    }
++    let brokenModel : LocusTransportModel (n := 2) := {
++      sourceSignal := fun _ => 1,
++      targetTransport := fun i => if i = 0 then 1 else 0
++    }
++    stableModel.sourceR2 1 = stableModel.targetR2 1 ∧
++    brokenModel.targetR2 1 < stableModel.targetR2 1 ∧
++    brokenModel.targetR2 1 / stableModel.sourceR2 1 = (3 : ℝ) / 4 := by
++  simp [LocusTransportModel.sourceR2, LocusTransportModel.targetR2,
++        LocusTransportModel.sourceVariance, LocusTransportModel.targetVariance,
++        TransportedMetrics.r2FromSignalVariance]
+   norm_num
+ 
+ end SourceR2Insufficiency
