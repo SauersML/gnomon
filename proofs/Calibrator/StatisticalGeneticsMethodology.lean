@@ -395,21 +395,99 @@ drops to `3/4`.
 
 This formalizes the biological point that equal source `R²` does not determine
 cross-population portability without locus-resolved transport state. -/
+structure MultiPopColliderModel (n : ℕ) where
+  sourceSignal : Fin n → ℝ
+  stableTransport : Fin n → ℝ
+  brokenTransport : Fin n → ℝ
+
+namespace MultiPopColliderModel
+
+noncomputable def sourceVariance {n : ℕ} (m : MultiPopColliderModel n) : ℝ :=
+  ∑ l, m.sourceSignal l
+
+noncomputable def stableTargetVariance {n : ℕ} (m : MultiPopColliderModel n) : ℝ :=
+  ∑ l, m.sourceSignal l * m.stableTransport l
+
+noncomputable def brokenTargetVariance {n : ℕ} (m : MultiPopColliderModel n) : ℝ :=
+  ∑ l, m.sourceSignal l * m.brokenTransport l
+
+noncomputable def sourceR2 {n : ℕ} (m : MultiPopColliderModel n) : ℝ :=
+  TransportedMetrics.r2FromSignalVariance m.sourceVariance 1
+
+noncomputable def stableTargetR2 {n : ℕ} (m : MultiPopColliderModel n) : ℝ :=
+  TransportedMetrics.r2FromSignalVariance m.stableTargetVariance 1
+
+noncomputable def brokenTargetR2 {n : ℕ} (m : MultiPopColliderModel n) : ℝ :=
+  TransportedMetrics.r2FromSignalVariance m.brokenTargetVariance 1
+
+end MultiPopColliderModel
+
+theorem target_r2_strictMono_in_targetVariance {n : ℕ} (m : MultiPopColliderModel n)
+    (h_pos_broken : 0 ≤ m.brokenTargetVariance)
+    (h_lt : m.brokenTargetVariance < m.stableTargetVariance) :
+    m.brokenTargetR2 < m.stableTargetR2 := by
+  unfold MultiPopColliderModel.brokenTargetR2 MultiPopColliderModel.stableTargetR2
+  unfold TransportedMetrics.r2FromSignalVariance
+  have h1 : 0 < m.brokenTargetVariance + 1 := by linarith
+  have h2 : 0 < m.stableTargetVariance + 1 := by linarith
+  have h_div : m.brokenTargetVariance / (m.brokenTargetVariance + 1) = 1 - 1 / (m.brokenTargetVariance + 1) := by
+    have h_self : (m.brokenTargetVariance + 1) / (m.brokenTargetVariance + 1) = 1 := div_self (ne_of_gt h1)
+    calc
+      m.brokenTargetVariance / (m.brokenTargetVariance + 1) = (m.brokenTargetVariance + 1 - 1) / (m.brokenTargetVariance + 1) := by ring_nf
+      _ = (m.brokenTargetVariance + 1) / (m.brokenTargetVariance + 1) - 1 / (m.brokenTargetVariance + 1) := by rw [sub_div]
+      _ = 1 - 1 / (m.brokenTargetVariance + 1) := by rw [h_self]
+  have h_div_stable : m.stableTargetVariance / (m.stableTargetVariance + 1) = 1 - 1 / (m.stableTargetVariance + 1) := by
+    have h_self : (m.stableTargetVariance + 1) / (m.stableTargetVariance + 1) = 1 := div_self (ne_of_gt h2)
+    calc
+      m.stableTargetVariance / (m.stableTargetVariance + 1) = (m.stableTargetVariance + 1 - 1) / (m.stableTargetVariance + 1) := by ring_nf
+      _ = (m.stableTargetVariance + 1) / (m.stableTargetVariance + 1) - 1 / (m.stableTargetVariance + 1) := by rw [sub_div]
+      _ = 1 - 1 / (m.stableTargetVariance + 1) := by rw [h_self]
+  rw [h_div, h_div_stable]
+  have h_den_lt : m.brokenTargetVariance + 1 < m.stableTargetVariance + 1 := by linarith
+  have h_inv_gt : 1 / (m.stableTargetVariance + 1) < 1 / (m.brokenTargetVariance + 1) := by
+    exact one_div_lt_one_div_of_lt h1 h_den_lt
+  linarith
+
 theorem same_source_r2_different_portability_two_locus_witness :
-    let sourceSignal : Fin 2 → ℝ := fun _ => 1
-    let stableTransport : Fin 2 → ℝ := fun _ => 1
-    let brokenTransport : Fin 2 → ℝ := fun i => if i = 0 then 1 else 0
-    let sourceVariance : ℝ := ∑ l, sourceSignal l
-    let stableTargetVariance : ℝ := ∑ l, sourceSignal l * stableTransport l
-    let brokenTargetVariance : ℝ := ∑ l, sourceSignal l * brokenTransport l
-    let sourceR2 := TransportedMetrics.r2FromSignalVariance sourceVariance 1
-    let stableTargetR2 := TransportedMetrics.r2FromSignalVariance stableTargetVariance 1
-    let brokenTargetR2 := TransportedMetrics.r2FromSignalVariance brokenTargetVariance 1
-    sourceR2 = stableTargetR2 ∧
-    brokenTargetR2 < stableTargetR2 ∧
-    brokenTargetR2 / sourceR2 = (3 : ℝ) / 4 := by
-  simp [TransportedMetrics.r2FromSignalVariance]
-  norm_num
+    ∃ (m : MultiPopColliderModel 2),
+      m.sourceR2 = m.stableTargetR2 ∧
+      m.brokenTargetR2 < m.stableTargetR2 ∧
+      m.brokenTargetR2 / m.sourceR2 = (3 : ℝ) / 4 := by
+  let h_m : MultiPopColliderModel 2 :=
+    { sourceSignal := fun _ => 1
+      stableTransport := fun _ => 1
+      brokenTransport := fun i => if i = 0 then 1 else 0 }
+  use h_m
+  have h_stable_var : h_m.stableTargetVariance = 2 := by
+    change ∑ l : Fin 2, h_m.sourceSignal l * h_m.stableTransport l = 2
+    change ∑ l : Fin 2, (1 : ℝ) * 1 = 2
+    simp
+  have h_broken_var : h_m.brokenTargetVariance = 1 := by
+    change ∑ l : Fin 2, h_m.sourceSignal l * h_m.brokenTransport l = 1
+    have h_0 : h_m.sourceSignal 0 * h_m.brokenTransport 0 = 1 := by
+      change 1 * (if (0 : Fin 2) = 0 then (1 : ℝ) else 0) = 1
+      simp
+    have h_1 : h_m.sourceSignal 1 * h_m.brokenTransport 1 = 0 := by
+      change 1 * (if (1 : Fin 2) = 0 then (1 : ℝ) else 0) = 0
+      simp
+    rw [Fin.sum_univ_two, h_0, h_1]
+    ring
+  have h_source_var : h_m.sourceVariance = 2 := by
+    change ∑ l : Fin 2, h_m.sourceSignal l = 2
+    change ∑ l : Fin 2, (1 : ℝ) = 2
+    simp
+  have h_lt : h_m.brokenTargetVariance < h_m.stableTargetVariance := by linarith
+  have h_pos_broken : 0 ≤ h_m.brokenTargetVariance := by linarith
+  have h_strict := target_r2_strictMono_in_targetVariance h_m h_pos_broken h_lt
+  constructor
+  · change TransportedMetrics.r2FromSignalVariance h_m.sourceVariance 1 = TransportedMetrics.r2FromSignalVariance h_m.stableTargetVariance 1
+    rw [h_source_var, h_stable_var]
+  · constructor
+    · exact h_strict
+    · change TransportedMetrics.r2FromSignalVariance h_m.brokenTargetVariance 1 / TransportedMetrics.r2FromSignalVariance h_m.sourceVariance 1 = 3 / 4
+      rw [h_broken_var, h_source_var]
+      change (1 / (1 + 1)) / (2 / (2 + 1)) = 3 / 4
+      norm_num
 
 end SourceR2Insufficiency
 
