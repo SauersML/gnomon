@@ -34,29 +34,64 @@ benefit across ancestry groups.
 
 section HealthDisparity
 
+/-- A domain-specific structure for clinical utility and health disparity modeling. -/
+structure ClinicalUtilityModel where
+  /-- Benefit proportionality constant (benefit per unit R²) -/
+  alpha : ℝ
+  /-- Cost of the PGS test/deployment -/
+  cost : ℝ
+  /-- QALYs gained per unit R² -/
+  gamma : ℝ
+  /-- Pre-existing health disparity or baseline risk difference -/
+  d0 : ℝ
+  h_alpha_pos : 0 < alpha
+  h_cost_pos : 0 < cost
+  h_gamma_pos : 0 < gamma
+  h_d0_nonneg : 0 ≤ d0
+
+namespace ClinicalUtilityModel
+
+/-- Computes the expected clinical benefit for a given R² value. -/
+noncomputable def benefit (m : ClinicalUtilityModel) (r2 : ℝ) : ℝ :=
+  m.alpha * r2
+
+/-- Computes the net value of PGS deployment for a given R² value. -/
+noncomputable def netValue (m : ClinicalUtilityModel) (r2 : ℝ) : ℝ :=
+  m.benefit r2 - m.cost
+
+/-- Computes the QALYs gained for a given R² value. -/
+noncomputable def qaly (m : ClinicalUtilityModel) (r2 : ℝ) : ℝ :=
+  m.gamma * r2
+
+/-- Computes the post-deployment disparity when only one group benefits. -/
+noncomputable def postDeploymentDisparity (m : ClinicalUtilityModel) (r2_deployed : ℝ) : ℝ :=
+  m.d0 + m.benefit r2_deployed
+
+end ClinicalUtilityModel
+
 /-- **Clinical utility depends on PGS R².**
     The net clinical benefit from PGS-guided care is monotonically
     increasing in R². We model benefit = α × R² for a positive
     proportionality constant α (benefit per unit R²). When
     R²₁ < R²₂, the benefit in population 1 is strictly less. -/
 theorem clinical_benefit_increases_with_r2
-    (α r2₁ r2₂ : ℝ)
-    (h_α : 0 < α)
+    (m : ClinicalUtilityModel) (r2₁ r2₂ : ℝ)
     (h_r2 : r2₁ < r2₂) :
-    α * r2₁ < α * r2₂ := by
-  exact mul_lt_mul_of_pos_left h_r2 h_α
+    m.benefit r2₁ < m.benefit r2₂ := by
+  unfold ClinicalUtilityModel.benefit
+  exact mul_lt_mul_of_pos_left h_r2 m.h_alpha_pos
 
 /-- **Portability gap creates benefit gap.**
     If R²_EUR > R²_AFR and benefit = α × R² with α > 0, then
     clinical benefit for EUR patients exceeds that for AFR patients.
     The benefit gap α × (R²_EUR - R²_AFR) > 0 follows from the R² gap. -/
 theorem portability_creates_benefit_gap
-    (α r2_eur r2_afr : ℝ)
-    (h_α : 0 < α)
-    (h_r2_gap : r2_afr < r2_eur)
-    (h_nn : 0 ≤ r2_afr) :
-    0 < α * r2_eur - α * r2_afr := by
+    (m : ClinicalUtilityModel) (r2_eur r2_afr : ℝ)
+    (h_r2_gap : r2_afr < r2_eur) :
+    0 < m.benefit r2_eur - m.benefit r2_afr := by
+  unfold ClinicalUtilityModel.benefit
   have : r2_eur - r2_afr > 0 := by linarith
+  have h_alpha := m.h_alpha_pos
   nlinarith
 
 /-- **Disparity increases with Fst from discovery population.**
@@ -67,8 +102,8 @@ theorem portability_creates_benefit_gap
 theorem disparity_increases_with_distance
     (R2_source fst₁ fst₂ : ℝ)
     (h_R2 : 0 < R2_source)
-    (h_fst₁_pos : 0 < fst₁) (h_fst₁_lt : fst₁ < 1)
-    (h_fst₂_pos : 0 < fst₂) (h_fst₂_lt : fst₂ < 1)
+    (h_fst₁_lt : fst₁ < 1)
+    (h_fst₂_lt : fst₂ < 1)
     (h_fst : fst₁ < fst₂) :
     -- R² loss at fst₁ < R² loss at fst₂
     R2_source * (1 - (1 - fst₁) ^ 2) < R2_source * (1 - (1 - fst₂) ^ 2) := by
@@ -82,21 +117,24 @@ theorem disparity_increases_with_distance
     gets no PGS benefit, so the pre-existing disparity d₀ ≥ 0 grows
     to d₀ + α × R²_eur. -/
 theorem deployment_amplifies_disparity
-    (d₀ α r2_eur : ℝ)
-    (h_nn : 0 ≤ d₀)
-    (h_α : 0 < α) (h_r2 : 0 < r2_eur) :
-    d₀ < d₀ + α * r2_eur := by
-  linarith [mul_pos h_α h_r2]
+    (m : ClinicalUtilityModel) (r2_eur : ℝ)
+    (h_r2 : 0 < r2_eur) :
+    m.d0 < m.postDeploymentDisparity r2_eur := by
+  unfold ClinicalUtilityModel.postDeploymentDisparity ClinicalUtilityModel.benefit
+  have h_alpha := m.h_alpha_pos
+  linarith [mul_pos h_alpha h_r2]
 
 /-- **QALY gap from portability.**
     QALYs gained = γ × R² for a positive constant γ (QALYs per unit R²).
     The QALY gap between two populations is γ × (R²₁ - R²₂), which is
     positive when R²₁ > R²₂. Derived from the model, not assumed. -/
 theorem qaly_gap_proportional_to_r2_gap
-    (γ r2₁ r2₂ : ℝ)
-    (h_γ : 0 < γ) (h_gap : r2₂ < r2₁) :
-    0 < γ * r2₁ - γ * r2₂ := by
+    (m : ClinicalUtilityModel) (r2₁ r2₂ : ℝ)
+    (h_gap : r2₂ < r2₁) :
+    0 < m.qaly r2₁ - m.qaly r2₂ := by
+  unfold ClinicalUtilityModel.qaly
   have : r2₁ - r2₂ > 0 := by linarith
+  have h_gamma := m.h_gamma_pos
   nlinarith
 
 end HealthDisparity
@@ -295,14 +333,14 @@ section ClinicalImplementation
     The net clinical value = α × R² - cost. When R² is small
     (R² < cost / α), the net value is negative. -/
 theorem r2_threshold_for_utility
-    (r2 α cost : ℝ)
-    (h_α : 0 < α) (h_cost : 0 < cost)
-    (h_r2_nn : 0 ≤ r2)
-    (h_below : r2 < cost / α) :
+    (m : ClinicalUtilityModel) (r2 : ℝ)
+    (h_below : r2 < m.cost / m.alpha) :
     -- PGS net value is negative in this population
-    α * r2 - cost < 0 := by
-  have : r2 * α < cost := by rwa [lt_div_iff₀ h_α] at h_below
-  linarith [mul_comm α r2]
+    m.netValue r2 < 0 := by
+  unfold ClinicalUtilityModel.netValue ClinicalUtilityModel.benefit
+  have h_alpha := m.h_alpha_pos
+  have : r2 * m.alpha < m.cost := by rwa [lt_div_iff₀ h_alpha] at h_below
+  linarith [mul_comm m.alpha r2]
 
 /- **Population-specific PGS report cards.**
     For each PGS, report: R², AUC, calibration, and portability ratio
@@ -321,9 +359,8 @@ theorem r2_threshold_for_utility
 theorem validation_n_depends_on_r2
     (r2_source r2_target delta : ℝ)
     (h_r2_target_smaller : r2_target < r2_source)
-    (h_r2_source : 0 < r2_source) (h_r2_target : 0 < r2_target)
     (h_delta : 0 < delta)
-    (h_r2_source_lt : r2_source < 1) (h_r2_target_lt : r2_target < 1) :
+    (h_r2_source_lt : r2_source < 1) :
     -- n/R² = 4(1-R²)²/δ² is larger for the target (smaller R²)
     4 * (1 - r2_source) ^ 2 / delta ^ 2 <
       4 * (1 - r2_target) ^ 2 / delta ^ 2 := by
