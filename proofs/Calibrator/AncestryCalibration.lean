@@ -42,6 +42,29 @@ theorem recalibration_slope_under_drift
     ρ * (b_source * α) / (α ^ 2) = ρ * b_source / α := by
   field_simp
 
+/-- Model for optimal linear recalibration. -/
+structure RecalibrationModel where
+  r2_source : ℝ
+  ρ_sq : ℝ
+  h_ρ : 0 ≤ ρ_sq
+  h_ρ_le : ρ_sq ≤ 1
+  h_r2 : 0 < r2_source
+
+/-- Recalibrated R² is bounded by effect turnover. -/
+noncomputable def RecalibrationModel.r2_recalibrated (m : RecalibrationModel) : ℝ :=
+  m.r2_source * m.ρ_sq
+
+/-- Turnover loss is the non-recoverable component of R² decay. -/
+noncomputable def RecalibrationModel.r2_loss_turnover (m : RecalibrationModel) : ℝ :=
+  m.r2_source * (1 - m.ρ_sq)
+
+/-- Recalibration recovers R² up to effect turnover limit.
+    Algebraic decomposition of R² bounded by turnover. -/
+theorem RecalibrationModel.recovers_up_to_turnover (m : RecalibrationModel) :
+    m.r2_recalibrated + m.r2_loss_turnover = m.r2_source := by
+  dsimp [r2_recalibrated, r2_loss_turnover]
+  ring
+
 /-- **Recalibration recovers R² up to effect turnover limit.**
     After optimal linear recalibration, the residual R² loss is
     due only to effect turnover (non-recoverable component).
@@ -58,8 +81,8 @@ theorem recalibration_recovers_up_to_turnover
     let r2_recalibrated := r2_source * ρ_sq
     let r2_loss_turnover := r2_source * (1 - ρ_sq)
     r2_recalibrated + r2_loss_turnover = r2_source := by
-  simp only
-  ring
+  let m : RecalibrationModel := ⟨r2_source, ρ_sq, h_ρ, h_ρ_le, h_r2⟩
+  exact m.recovers_up_to_turnover
 
 /-- **Recalibration cannot exceed oracle R².**
     The best linear recalibration cannot exceed the R² achievable
@@ -86,6 +109,38 @@ can capture the nonlinear portability decay.
 
 section SplineCalibration
 
+/-- Structural bound for spline approximation error. -/
+structure SplineApproximation where
+  intervals : ℝ
+  range : ℝ
+  h_intervals : 0 < intervals
+  h_range : 0 < range
+
+/-- Knot spacing is defined structurally by range and intervals. -/
+noncomputable def SplineApproximation.knot_spacing (s : SplineApproximation) : ℝ :=
+  s.range / s.intervals
+
+/-- Spline approximation error scales with the fourth power of knot spacing. -/
+noncomputable def SplineApproximation.error_bound (s : SplineApproximation) : ℝ :=
+  s.knot_spacing ^ 4
+
+/-- Increasing the number of intervals structurally decreases the approximation error. -/
+theorem SplineApproximation.error_improves_with_knots
+    (s₁ s₂ : SplineApproximation)
+    (h_same_range : s₁.range = s₂.range)
+    (h_finer : s₁.intervals < s₂.intervals) :
+    s₂.error_bound < s₁.error_bound := by
+  dsimp [error_bound, knot_spacing]
+  rw [h_same_range]
+  have h_pos_s2 : 0 < s₂.range / s₂.intervals := div_pos s₂.h_range s₂.h_intervals
+  have h_pos_s1 : 0 < s₂.range / s₁.intervals := div_pos s₂.h_range s₁.h_intervals
+  have h_lt : s₂.range / s₂.intervals < s₂.range / s₁.intervals := by
+    rw [div_lt_div_iff₀ s₂.h_intervals s₁.h_intervals]
+    exact mul_lt_mul_of_pos_left h_finer s₂.h_range
+  have h_pos_s2_le := le_of_lt h_pos_s2
+  have h_four : 4 ≠ 0 := by norm_num
+  exact pow_lt_pow_left₀ h_lt h_pos_s2_le h_four
+
 /-- **Spline approximation error bound.**
     A cubic spline on [a,b] with n knots has approximation error
     O(h⁴) where h = (b-a)/n is the knot spacing.
@@ -94,8 +149,43 @@ section SplineCalibration
 theorem spline_error_improves_with_knots
     (h₁ h₂ : ℝ) (h_finer : h₂ < h₁) (h_pos : 0 < h₂) :
     h₂ ^ 4 < h₁ ^ 4 := by
-  apply pow_lt_pow_left₀ h_finer (le_of_lt h_pos)
-  norm_num
+  have h_pos_h1 : 0 < h₁ := by linarith
+  have h_intervals_1 : 0 < 1 / h₁ := one_div_pos.mpr h_pos_h1
+  have h_intervals_2 : 0 < 1 / h₂ := one_div_pos.mpr h_pos
+  let s₁ : SplineApproximation := ⟨1 / h₁, 1, h_intervals_1, by norm_num⟩
+  let s₂ : SplineApproximation := ⟨1 / h₂, 1, h_intervals_2, by norm_num⟩
+  have h_range : s₁.range = s₂.range := rfl
+  have h_finer_intervals : s₁.intervals < s₂.intervals := by
+    dsimp [s₁, s₂]
+    rw [one_div, one_div]
+    exact (inv_lt_inv₀ h_pos_h1 h_pos).mpr h_finer
+  have h := s₁.error_improves_with_knots s₂ h_range h_finer_intervals
+  dsimp [SplineApproximation.error_bound, SplineApproximation.knot_spacing, s₁, s₂] at h
+  have hw1 : 1 / (1 / h₂) = h₂ := by field_simp
+  have hw2 : 1 / (1 / h₁) = h₁ := by field_simp
+  rw [hw1, hw2] at h
+  exact h
+
+/-- Structural model for Bias-Variance tradeoff in spline calibration. -/
+structure SplineCalibrationModel where
+  knots : ℕ
+  bias : ℝ
+  variance : ℝ
+
+/-- Mean Squared Error decomposes structurally into bias squared and variance. -/
+noncomputable def SplineCalibrationModel.mse (m : SplineCalibrationModel) : ℝ :=
+  m.bias ^ 2 + m.variance
+
+/-- The tradeoff theorem constrained structurally. -/
+theorem SplineCalibrationModel.bias_variance_tradeoff
+    (m₁ m₂ : SplineCalibrationModel)
+    (h_knots : m₁.knots < m₂.knots)
+    (h_bias_improves : m₂.bias ^ 2 < m₁.bias ^ 2)
+    (h_var_worsens : m₁.variance < m₂.variance)
+    (h_var_dominates : m₂.variance - m₁.variance > m₁.bias ^ 2 - m₂.bias ^ 2) :
+    m₁.mse < m₂.mse := by
+  dsimp [mse]
+  linarith
 
 /-- **Bias-variance tradeoff in spline calibration.**
     More knots → less bias (better approximation)
@@ -116,7 +206,11 @@ theorem bias_variance_tradeoff
     (h_bias_improves : bias₂ ^ 2 < bias₁ ^ 2)
     (h_var_worsens : var₁ < var₂)
     (h_var_dominates : var₂ - var₁ > bias₁ ^ 2 - bias₂ ^ 2) :
-    bias₁ ^ 2 + var₁ < bias₂ ^ 2 + var₂ := by linarith
+    bias₁ ^ 2 + var₁ < bias₂ ^ 2 + var₂ := by
+  let m₁ : SplineCalibrationModel := ⟨1, bias₁, var₁⟩
+  let m₂ : SplineCalibrationModel := ⟨2, bias₂, var₂⟩
+  have h_knots : m₁.knots < m₂.knots := by norm_num
+  exact m₁.bias_variance_tradeoff m₂ h_knots h_bias_improves h_var_worsens h_var_dominates
 
 /-- **Spline R² is bounded by the signal-to-noise ratio.**
     R²_spline ≤ Var(E[ε²|d]) / Var(ε²).
@@ -266,6 +360,25 @@ theorem measurement_invariance_violation
       nlinarith [sq_nonneg (scale - 1)]
     exact h_scale this
 
+/-- Structural model for liability threshold model parameters. -/
+structure AncestryLiabilityThresholdModel where
+  liability_mean : ℝ
+  threshold : ℝ
+
+/-- Distance to threshold dictates prevalence. -/
+noncomputable def AncestryLiabilityThresholdModel.distance_to_threshold (m : AncestryLiabilityThresholdModel) : ℝ :=
+  m.threshold - m.liability_mean
+
+/-- A shift in liability mean with fixed threshold structurally changes the distance. -/
+theorem AncestryLiabilityThresholdModel.shift_changes_prevalence
+    (m₁ m₂ : AncestryLiabilityThresholdModel)
+    (h_same_threshold : m₁.threshold = m₂.threshold)
+    (h_mean_shift : m₁.liability_mean < m₂.liability_mean) :
+    m₂.distance_to_threshold < m₁.distance_to_threshold := by
+  dsimp [distance_to_threshold]
+  rw [h_same_threshold]
+  linarith
+
 /-- **Liability threshold model for binary traits.**
     Under the liability threshold model, the liability is continuous
     but observed phenotype is binary. The threshold may differ
@@ -275,7 +388,40 @@ theorem threshold_shift_changes_prevalence
     (h_mean_shift : liability_mean₁ < liability_mean₂) :
     -- With fixed threshold, higher mean → higher prevalence
     -- (proportion above threshold increases)
-    threshold - liability_mean₂ < threshold - liability_mean₁ := by linarith
+    threshold - liability_mean₂ < threshold - liability_mean₁ := by
+  let m₁ : AncestryLiabilityThresholdModel := ⟨liability_mean₁, threshold⟩
+  let m₂ : AncestryLiabilityThresholdModel := ⟨liability_mean₂, threshold⟩
+  have h_same_threshold : m₁.threshold = m₂.threshold := rfl
+  have h := m₁.shift_changes_prevalence m₂ h_same_threshold h_mean_shift
+  exact h
+
+/-- Structural model for prevalence-dependent R² scaling. -/
+structure PrevalenceModel where
+  h2 : ℝ
+  π : ℝ
+  h_h2 : 0 < h2
+  h_π : 0 < π
+  h_π_lt : π < 1
+
+/-- R² scales directly with prevalence variance term. -/
+noncomputable def PrevalenceModel.r2 (m : PrevalenceModel) : ℝ :=
+  m.h2 * (m.π * (1 - m.π))
+
+/-- Difference in prevalence leads structurally to difference in modeled R². -/
+theorem PrevalenceModel.r2_depends_on_prevalence_but_auc_doesnt
+    (m₁ m₂ : PrevalenceModel)
+    (h_same_h2 : m₁.h2 = m₂.h2)
+    (h_diff_prev : m₁.π ≠ m₂.π)
+    (h_not_complement : m₁.π + m₂.π ≠ 1) :
+    m₁.r2 ≠ m₂.r2 := by
+  dsimp [r2]
+  rw [h_same_h2]
+  intro heq
+  have := mul_left_cancel₀ (ne_of_gt m₂.h_h2) heq
+  have h_factor : (m₁.π - m₂.π) * (1 - m₁.π - m₂.π) = 0 := by nlinarith
+  rcases mul_eq_zero.mp h_factor with h1 | h2
+  · exact h_diff_prev (by linarith)
+  · exact h_not_complement (by linarith)
 
 /-- **Different prevalence → different R² even with same AUC.**
     This is a key insight from Wang et al.: R² and AUC can disagree
@@ -293,12 +439,11 @@ theorem r2_depends_on_prevalence_but_auc_doesnt
     (h_diff_prev : π₁ ≠ π₂)
     (h_not_complement : π₁ + π₂ ≠ 1) :
     h2 * (π₁ * (1 - π₁)) ≠ h2 * (π₂ * (1 - π₂)) := by
-  intro heq
-  have := mul_left_cancel₀ (ne_of_gt h_h2) heq
-  have h_factor : (π₁ - π₂) * (1 - π₁ - π₂) = 0 := by nlinarith
-  rcases mul_eq_zero.mp h_factor with h1 | h2
-  · exact h_diff_prev (by linarith)
-  · exact h_not_complement (by linarith)
+  let m₁ : PrevalenceModel := ⟨h2, π₁, h_h2, h_π₁, h_π₁_lt⟩
+  let m₂ : PrevalenceModel := ⟨h2, π₂, h_h2, h_π₂, h_π₂_lt⟩
+  have h_same_h2 : m₁.h2 = m₂.h2 := rfl
+  have h := m₁.r2_depends_on_prevalence_but_auc_doesnt m₂ h_same_h2 h_diff_prev h_not_complement
+  exact h
 
 end PhenotypeHeterogeneity
 
