@@ -388,6 +388,29 @@ theorem threshold_sandwich_implies_observed_portability_below_neutral
     (h_neutral : threshold < port_neutral) :
     port_observed < port_neutral := by linarith
 
+structure ZeroPortabilityModel where
+  /-- Fraction of remaining portable signal that is lost (e.g. from a component with zero portability) -/
+  f : ℝ
+  /-- Residual portability level -/
+  port_rest : ℝ
+  h_f : 0 < f
+  h_f_le : f < 1
+  h_port : 0 < port_rest
+  h_port_le : port_rest ≤ 1
+
+noncomputable def ZeroPortabilityModel.weightedAverage (m : ZeroPortabilityModel) : ℝ :=
+  (1 - m.f) * m.port_rest
+
+/-- **A zero-portability component lowers a weighted portability average.**
+    If a trait keeps only the `(1 - f)` fraction of its remaining portable
+    signal, then the resulting weighted average is strictly below the residual
+    portability level. -/
+theorem ZeroPortabilityModel.lowers_average (m : ZeroPortabilityModel) :
+    m.weightedAverage < m.port_rest := by
+  unfold weightedAverage
+  have : 0 < m.f * m.port_rest := mul_pos m.h_f m.h_port
+  linarith [mul_comm m.f m.port_rest]
+
 /-- **A zero-portability component lowers a weighted portability average.**
     If a trait keeps only the `(1 - f)` fraction of its remaining portable
     signal, then the resulting weighted average is strictly below the residual
@@ -396,9 +419,15 @@ theorem zero_portability_component_lowers_weighted_average
     (f port_rest : ℝ)
     (h_f : 0 < f) (_h_f_le : f < 1)
     (h_port : 0 < port_rest) (_h_port_le : port_rest ≤ 1) :
-    (1 - f) * port_rest < port_rest := by
-  have : 0 < f * port_rest := mul_pos h_f h_port
-  linarith [mul_comm f port_rest]
+    (1 - f) * port_rest < port_rest :=
+  ZeroPortabilityModel.lowers_average {
+    f := f
+    port_rest := port_rest
+    h_f := h_f
+    h_f_le := _h_f_le
+    h_port := h_port
+    h_port_le := _h_port_le
+  }
 
 end ImmuneTraits
 
@@ -503,6 +532,38 @@ theorem near_neutral_portability_highly_polygenic
   have : 0 < (c / ↑n) ^ 2 := by positivity
   linarith
 
+structure EqualEffectArchitecture where
+  /-- Number of loci in the model -/
+  n_loci : ℕ
+  /-- Target threshold number of loci -/
+  n_threshold : ℕ
+  /-- Variance contributed by each single locus -/
+  per_locus_var : ℝ
+  /-- Total variance across all loci -/
+  total_var : ℝ
+  h_many : n_threshold < n_loci
+  h_thresh_pos : 0 < n_threshold
+  h_total : total_var = n_loci * per_locus_var
+  h_var_pos : 0 < per_locus_var
+
+/-- **Per-locus variance share is bounded by locus count in the equal-effect
+chart.**
+    If total variance is `n_loci * per_locus_var`, then each locus contributes
+    exactly `1 / n_loci` of the total, hence strictly less than `1 / n_threshold`
+    whenever `n_threshold < n_loci`. -/
+theorem EqualEffectArchitecture.variance_share_bounded (m : EqualEffectArchitecture) :
+    m.per_locus_var / m.total_var < 1 / m.n_threshold := by
+  rw [m.h_total]
+  rw [show m.per_locus_var / (↑m.n_loci * m.per_locus_var) = 1 / ↑m.n_loci from by
+    field_simp [ne_of_gt m.h_var_pos]]
+  have h_many' := m.h_many
+  have h_thresh_pos' := m.h_thresh_pos
+  have h_n_pos : (0 : ℝ) < ↑m.n_loci := Nat.cast_pos.mpr (by omega)
+  have h_t_pos : (0 : ℝ) < ↑m.n_threshold := Nat.cast_pos.mpr m.h_thresh_pos
+  rw [div_lt_div_iff₀ h_n_pos h_t_pos]
+  have : (m.n_threshold : ℝ) < (m.n_loci : ℝ) := by exact_mod_cast m.h_many
+  linarith
+
 /-- **Per-locus variance share is bounded by locus count in the equal-effect
 chart.**
     If total variance is `n_loci * per_locus_var`, then each locus contributes
@@ -515,15 +576,17 @@ theorem per_locus_variance_share_bounded_by_locus_count
     (h_total : total_var = n_loci * per_locus_var)
     (h_var_pos : 0 < per_locus_var) :
     -- Each locus contributes < 1/n_threshold of total variance
-    per_locus_var / total_var < 1 / n_threshold := by
-  rw [h_total]
-  rw [show per_locus_var / (↑n_loci * per_locus_var) = 1 / ↑n_loci from by
-    field_simp]
-  have h_n_pos : (0 : ℝ) < ↑n_loci := Nat.cast_pos.mpr (by omega)
-  have h_t_pos : (0 : ℝ) < ↑n_threshold := Nat.cast_pos.mpr h_thresh_pos
-  rw [div_lt_div_iff₀ h_n_pos h_t_pos]
-  have : (n_threshold : ℝ) < (n_loci : ℝ) := by exact_mod_cast h_many
-  linarith
+    per_locus_var / total_var < 1 / n_threshold :=
+  EqualEffectArchitecture.variance_share_bounded {
+    n_loci := n_loci
+    n_threshold := n_threshold
+    per_locus_var := per_locus_var
+    total_var := total_var
+    h_many := h_many
+    h_thresh_pos := h_thresh_pos
+    h_total := h_total
+    h_var_pos := h_var_pos
+  }
 
 /-- **An `α < 1` upper bound forces portability below the reference trait.**
     If `port_selected < α * port_reference` with `0 < α < 1`, then the selected
