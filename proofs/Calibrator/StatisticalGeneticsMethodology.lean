@@ -384,6 +384,58 @@ The resulting target `R²` and target/source portability ratio change.
 
 section SourceR2Insufficiency
 
+/-- Helper lemma extracting the algebraic core: target `R²` strictly increases
+with target signal variance for a fixed strictly positive noise floor. -/
+lemma target_r2_strictMono_in_targetVariance
+    (v1 v2 vNoise : ℝ)
+    (h_noise : 0 < vNoise)
+    (h_v1 : 0 ≤ v1)
+    (h_lt : v1 < v2) :
+    TransportedMetrics.r2FromSignalVariance v1 vNoise <
+    TransportedMetrics.r2FromSignalVariance v2 vNoise := by
+  unfold TransportedMetrics.r2FromSignalVariance
+  have h1 : 0 < v1 + vNoise := by linarith
+  have h2 : 0 < v2 + vNoise := by linarith
+  rw [div_lt_div_iff₀ h1 h2]
+  have h3 : v1 * (v2 + vNoise) = v1 * v2 + v1 * vNoise := by ring
+  have h4 : v2 * (v1 + vNoise) = v1 * v2 + v2 * vNoise := by ring
+  rw [h3, h4]
+  apply add_lt_add_left
+  exact mul_lt_mul_of_pos_right h_lt h_noise
+
+/-- Generalized locus-resolved transport state for arbitrary dimension `n`. -/
+structure TransportState {n : ℕ} where
+  sourceSignal : Fin n → ℝ
+  stableTransport : Fin n → ℝ
+  brokenTransport : Fin n → ℝ
+  residualVariance : ℝ
+
+noncomputable def TransportState.sourceVariance {n : ℕ} (s : TransportState (n := n)) : ℝ :=
+  ∑ l, s.sourceSignal l
+
+noncomputable def TransportState.stableTargetVariance {n : ℕ} (s : TransportState (n := n)) : ℝ :=
+  ∑ l, s.sourceSignal l * s.stableTransport l
+
+noncomputable def TransportState.brokenTargetVariance {n : ℕ} (s : TransportState (n := n)) : ℝ :=
+  ∑ l, s.sourceSignal l * s.brokenTransport l
+
+noncomputable def TransportState.sourceR2 {n : ℕ} (s : TransportState (n := n)) : ℝ :=
+  TransportedMetrics.r2FromSignalVariance s.sourceVariance s.residualVariance
+
+noncomputable def TransportState.stableTargetR2 {n : ℕ} (s : TransportState (n := n)) : ℝ :=
+  TransportedMetrics.r2FromSignalVariance s.stableTargetVariance s.residualVariance
+
+noncomputable def TransportState.brokenTargetR2 {n : ℕ} (s : TransportState (n := n)) : ℝ :=
+  TransportedMetrics.r2FromSignalVariance s.brokenTargetVariance s.residualVariance
+
+/-- General theorem: loss of transported variance structurally degrades `R²`. -/
+theorem TransportState.broken_lt_stable_r2 {n : ℕ} (s : TransportState (n := n))
+    (h_noise : 0 < s.residualVariance)
+    (h_pos : 0 ≤ s.brokenTargetVariance)
+    (h_lt : s.brokenTargetVariance < s.stableTargetVariance) :
+    s.brokenTargetR2 < s.stableTargetR2 := by
+  apply target_r2_strictMono_in_targetVariance _ _ _ h_noise h_pos h_lt
+
 /-- Concrete two-locus witness that source deployed `R²` does not determine
 target portability.
 
@@ -396,20 +448,37 @@ drops to `3/4`.
 This formalizes the biological point that equal source `R²` does not determine
 cross-population portability without locus-resolved transport state. -/
 theorem same_source_r2_different_portability_two_locus_witness :
-    let sourceSignal : Fin 2 → ℝ := fun _ => 1
-    let stableTransport : Fin 2 → ℝ := fun _ => 1
-    let brokenTransport : Fin 2 → ℝ := fun i => if i = 0 then 1 else 0
-    let sourceVariance : ℝ := ∑ l, sourceSignal l
-    let stableTargetVariance : ℝ := ∑ l, sourceSignal l * stableTransport l
-    let brokenTargetVariance : ℝ := ∑ l, sourceSignal l * brokenTransport l
-    let sourceR2 := TransportedMetrics.r2FromSignalVariance sourceVariance 1
-    let stableTargetR2 := TransportedMetrics.r2FromSignalVariance stableTargetVariance 1
-    let brokenTargetR2 := TransportedMetrics.r2FromSignalVariance brokenTargetVariance 1
-    sourceR2 = stableTargetR2 ∧
-    brokenTargetR2 < stableTargetR2 ∧
-    brokenTargetR2 / sourceR2 = (3 : ℝ) / 4 := by
-  simp [TransportedMetrics.r2FromSignalVariance]
-  norm_num
+    let s : TransportState (n := 2) := {
+      sourceSignal := fun _ => 1,
+      stableTransport := fun _ => 1,
+      brokenTransport := fun i => if i = 0 then 1 else 0,
+      residualVariance := 1
+    }
+    s.sourceR2 = s.stableTargetR2 ∧
+    s.brokenTargetR2 < s.stableTargetR2 ∧
+    s.brokenTargetR2 / s.sourceR2 = (3 : ℝ) / 4 := by
+  intro s
+  have h_noise : 0 < s.residualVariance := by norm_num
+  have h_pos : 0 ≤ s.brokenTargetVariance := by
+    dsimp [TransportState.brokenTargetVariance, s]
+    rw [Fin.sum_univ_two]
+    norm_num
+  have h_lt : s.brokenTargetVariance < s.stableTargetVariance := by
+    dsimp [TransportState.brokenTargetVariance, TransportState.stableTargetVariance, s]
+    rw [Fin.sum_univ_two, Fin.sum_univ_two]
+    norm_num
+  have h_ineq := s.broken_lt_stable_r2 h_noise h_pos h_lt
+  refine ⟨?_, ?_, ?_⟩
+  · unfold TransportState.sourceR2 TransportState.stableTargetR2 TransportState.sourceVariance TransportState.stableTargetVariance
+    dsimp [s]
+    rw [Fin.sum_univ_two, Fin.sum_univ_two]
+    norm_num
+  · exact h_ineq
+  · unfold TransportState.brokenTargetR2 TransportState.sourceR2 TransportState.brokenTargetVariance TransportState.sourceVariance
+    dsimp [s]
+    rw [Fin.sum_univ_two, Fin.sum_univ_two]
+    unfold TransportedMetrics.r2FromSignalVariance
+    norm_num
 
 end SourceR2Insufficiency
 
