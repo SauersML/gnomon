@@ -86,16 +86,48 @@ can capture the nonlinear portability decay.
 
 section SplineCalibration
 
+structure SplineCalibrationConfiguration where
+  knots : ℕ
+  intervalLength : ℝ
+  h_interval : 0 < intervalLength
+  h_knots_pos : 0 < knots
+
+noncomputable def SplineCalibrationConfiguration.knotSpacing (c : SplineCalibrationConfiguration) : ℝ :=
+  c.intervalLength / c.knots
+
+noncomputable def SplineCalibrationConfiguration.bias (c : SplineCalibrationConfiguration) (c_f : ℝ) : ℝ :=
+  c_f * c.knotSpacing ^ 4
+
+noncomputable def SplineCalibrationConfiguration.variance (c : SplineCalibrationConfiguration) (sigma_sq n : ℝ) : ℝ :=
+  c.knots * sigma_sq / n
+
+noncomputable def SplineCalibrationConfiguration.mse (c : SplineCalibrationConfiguration) (c_f sigma_sq n : ℝ) : ℝ :=
+  (c.bias c_f) ^ 2 + c.variance sigma_sq n
+
 /-- **Spline approximation error bound.**
     A cubic spline on [a,b] with n knots has approximation error
     O(h⁴) where h = (b-a)/n is the knot spacing.
     For the portability decay function, this means the spline
     can capture the nonlinear relationship well. -/
 theorem spline_error_improves_with_knots
-    (h₁ h₂ : ℝ) (h_finer : h₂ < h₁) (h_pos : 0 < h₂) :
-    h₂ ^ 4 < h₁ ^ 4 := by
-  apply pow_lt_pow_left₀ h_finer (le_of_lt h_pos)
-  norm_num
+    (c₁ c₂ : SplineCalibrationConfiguration)
+    (c_f : ℝ) (hc : 0 < c_f)
+    (h_finer : c₁.knots < c₂.knots)
+    (h_same_interval : c₁.intervalLength = c₂.intervalLength) :
+    c₂.bias c_f < c₁.bias c_f := by
+  unfold SplineCalibrationConfiguration.bias SplineCalibrationConfiguration.knotSpacing
+  apply mul_lt_mul_of_pos_left
+  · apply pow_lt_pow_left₀
+    · rw [h_same_interval]
+      have h1 : (c₂.knots : ℝ) > 0 := Nat.cast_pos.mpr c₂.h_knots_pos
+      have h2 : (c₁.knots : ℝ) > 0 := Nat.cast_pos.mpr c₁.h_knots_pos
+      apply div_lt_div_of_pos_left c₂.h_interval h2
+      exact Nat.cast_lt.mpr h_finer
+    · apply div_nonneg
+      · exact le_of_lt c₂.h_interval
+      · exact Nat.cast_nonneg c₂.knots
+    · decide
+  · exact hc
 
 /-- **Bias-variance tradeoff in spline calibration.**
     More knots → less bias (better approximation)
@@ -112,11 +144,14 @@ theorem spline_error_improves_with_knots
     which is direct rearrangement. The real content is the model
     decomposition MSE = bias² + variance. -/
 theorem bias_variance_tradeoff
-    (bias₁ bias₂ var₁ var₂ : ℝ)
-    (h_bias_improves : bias₂ ^ 2 < bias₁ ^ 2)
-    (h_var_worsens : var₁ < var₂)
-    (h_var_dominates : var₂ - var₁ > bias₁ ^ 2 - bias₂ ^ 2) :
-    bias₁ ^ 2 + var₁ < bias₂ ^ 2 + var₂ := by linarith
+    (c₁ c₂ : SplineCalibrationConfiguration)
+    (c_f sigma_sq n : ℝ)
+    (h_bias_improves : (c₂.bias c_f) ^ 2 < (c₁.bias c_f) ^ 2)
+    (h_var_worsens : c₁.variance sigma_sq n < c₂.variance sigma_sq n)
+    (h_var_dominates : c₂.variance sigma_sq n - c₁.variance sigma_sq n > (c₁.bias c_f) ^ 2 - (c₂.bias c_f) ^ 2) :
+    c₁.mse c_f sigma_sq n < c₂.mse c_f sigma_sq n := by
+  unfold SplineCalibrationConfiguration.mse
+  linarith
 
 /-- **Spline R² is bounded by the signal-to-noise ratio.**
     R²_spline ≤ Var(E[ε²|d]) / Var(ε²).
@@ -266,16 +301,27 @@ theorem measurement_invariance_violation
       nlinarith [sq_nonneg (scale - 1)]
     exact h_scale this
 
+structure LiabilityModel where
+  liability_mean : ℝ
+  threshold : ℝ
+
+noncomputable def LiabilityModel.distance_to_threshold (m : LiabilityModel) : ℝ :=
+  m.threshold - m.liability_mean
+
 /-- **Liability threshold model for binary traits.**
     Under the liability threshold model, the liability is continuous
     but observed phenotype is binary. The threshold may differ
     across populations (reflecting different environmental risk). -/
 theorem threshold_shift_changes_prevalence
-    (liability_mean₁ liability_mean₂ threshold : ℝ)
-    (h_mean_shift : liability_mean₁ < liability_mean₂) :
+    (m₁ m₂ : LiabilityModel)
+    (h_same_threshold : m₁.threshold = m₂.threshold)
+    (h_mean_shift : m₁.liability_mean < m₂.liability_mean) :
     -- With fixed threshold, higher mean → higher prevalence
     -- (proportion above threshold increases)
-    threshold - liability_mean₂ < threshold - liability_mean₁ := by linarith
+    m₂.distance_to_threshold < m₁.distance_to_threshold := by
+  unfold LiabilityModel.distance_to_threshold
+  rw [h_same_threshold]
+  linarith
 
 /-- **Different prevalence → different R² even with same AUC.**
     This is a key insight from Wang et al.: R² and AUC can disagree
