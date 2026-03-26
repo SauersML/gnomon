@@ -1,0 +1,20 @@
+diff --git a/proofs/Calibrator/StratificationConfounding.lean b/proofs/Calibrator/StratificationConfounding.lean
+index da6dadc..ba8a5c2 100644
+--- a/proofs/Calibrator/StratificationConfounding.lean
++++ b/proofs/Calibrator/StratificationConfounding.lean
+@@ -327,14 +327,10 @@ theorem collider_attenuates_association (m : ColliderModel) :
+     the apparent portability drop includes an ascertainment component. -/
+ theorem differential_ascertainment_artifact
+     (r2_source_pop r2_target_pop r2_source_asc r2_target_asc : ℝ)
+-    (h_source_asc : r2_source_asc < r2_source_pop)
+-    (h_target_asc : r2_target_asc < r2_target_pop)
+     -- Different ascertainment severity
+     (h_diff_severity : r2_target_pop - r2_target_asc < r2_source_pop - r2_source_asc) :
+     -- Apparent portability drop is larger than true portability drop
+-    r2_source_asc - r2_target_asc > r2_source_pop - r2_target_pop →
+-      False := by
+-  intro h
++    r2_source_asc - r2_target_asc < r2_source_pop - r2_target_pop := by
+   linarith
+ 
+ end ColliderBias
