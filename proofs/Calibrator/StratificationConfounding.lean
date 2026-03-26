@@ -332,9 +332,7 @@ theorem differential_ascertainment_artifact
     -- Different ascertainment severity
     (h_diff_severity : r2_target_pop - r2_target_asc < r2_source_pop - r2_source_asc) :
     -- Apparent portability drop is larger than true portability drop
-    r2_source_asc - r2_target_asc > r2_source_pop - r2_target_pop →
-      False := by
-  intro h
+    r2_source_asc - r2_target_asc < r2_source_pop - r2_target_pop := by
   linarith
 
 end ColliderBias
@@ -520,8 +518,7 @@ theorem survivorship_attenuates_in_older (m : SurvivorshipAttenuationModel) :
 theorem differential_survivorship_artifact
     (r2_source_full r2_target_full Δ_surv_source Δ_surv_target : ℝ)
     (h_surv_s : 0 ≤ Δ_surv_source) (h_surv_t : 0 ≤ Δ_surv_target)
-    (h_diff : Δ_surv_target > Δ_surv_source)
-    (h_obs_s : r2_source_full - Δ_surv_source > 0) :
+    (h_diff : Δ_surv_target > Δ_surv_source) :
     (r2_source_full - Δ_surv_source) - (r2_target_full - Δ_surv_target) >
       r2_source_full - r2_target_full := by
   linarith
