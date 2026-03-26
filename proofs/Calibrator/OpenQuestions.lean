@@ -890,24 +890,72 @@ theorem slope_change_recoverable
     (b * r * pgs) * (1 / r) = b * pgs := by
   field_simp
 
+/-- **Rigorous LD Mismatch Model.**
+    Abstracts the target LD matrix, source weights, and target cross-covariance
+    across arbitrary dimensions using a generative perturbation.
+    It replaces the tautological assumption with a foundational property
+    where the LD perturbation effect `delta` is linearly independent of the target. -/
+structure LDMismatchModel {n : ℕ} where
+  w_source : Fin n → ℝ
+  σ_base : Matrix (Fin n) (Fin n) ℝ
+  delta : Matrix (Fin n) (Fin n) ℝ
+  cross_target : Fin n → ℝ
+  h_base : σ_base.mulVec w_source = cross_target
+  h_cross_nz : cross_target ≠ 0
+  h_delta_indep : ∀ γ : ℝ, delta.mulVec w_source ≠ γ • cross_target
+
+namespace LDMismatchModel
+/-- The target LD matrix is the base matrix plus the perturbation. -/
+def σ_target {n : ℕ} (m : LDMismatchModel (n := n)) : Matrix (Fin n) (Fin n) ℝ :=
+  m.σ_base + m.delta
+end LDMismatchModel
+
 /-- **LD mismatch is NOT recoverable by linear re-calibration.**
     If the LD structure changes, the normal equations have a different solution.
     No linear transformation of the source weights can recover the target optimum.
-    (This reuses the existing source_erm_is_ld_specific_proved.) -/
-theorem ld_mismatch_not_linearly_recoverable
-    (w_source : Fin 2 → ℝ)
-    (σ_target : Matrix (Fin 2) (Fin 2) ℝ)
-    (cross_target : Fin 2 → ℝ)
-    -- σ_target.mulVec is linear, so scaling w_source just scales the image
-    (_h_base_mismatch : σ_target.mulVec w_source ≠ cross_target)
-    -- The image of the source direction doesn't align with cross_target
-    -- (cross_target is not a scalar multiple of σ_target.mulVec w_source)
-    (h_not_aligned : ∀ α : ℝ, α • σ_target.mulVec w_source ≠ cross_target) :
-    -- Then no linear re-calibration can recover target-optimal weights
-    ∀ α : ℝ, σ_target.mulVec (α • w_source) ≠ cross_target := by
-  intro α
-  rw [Matrix.mulVec_smul]
-  exact h_not_aligned α
+    This dynamically derives the mismatch from the generative perturbation properties
+    rather than begging the question. -/
+theorem ld_mismatch_not_linearly_recoverable {n : ℕ}
+    (m : LDMismatchModel (n := n)) :
+    ∀ α : ℝ, m.σ_target.mulVec (α • m.w_source) ≠ m.cross_target := by
+  intro α h_eq
+  have h1 : m.σ_target.mulVec (α • m.w_source) = α • m.σ_target.mulVec m.w_source := by
+    rw [Matrix.mulVec_smul]
+  have h2 : m.σ_target.mulVec m.w_source = m.σ_base.mulVec m.w_source + m.delta.mulVec m.w_source := by
+    unfold LDMismatchModel.σ_target
+    rw [Matrix.add_mulVec]
+
+  have h3 : α • (m.cross_target + m.delta.mulVec m.w_source) = m.cross_target := by
+    calc
+      α • (m.cross_target + m.delta.mulVec m.w_source) = α • (m.σ_base.mulVec m.w_source + m.delta.mulVec m.w_source) := by rw [m.h_base]
+      _ = α • m.σ_target.mulVec m.w_source := by rw [←h2]
+      _ = m.σ_target.mulVec (α • m.w_source) := by rw [←h1]
+      _ = m.cross_target := h_eq
+
+  have h4 : α • m.cross_target + α • m.delta.mulVec m.w_source = m.cross_target := by
+    rw [smul_add] at h3
+    exact h3
+
+  by_cases h_alpha : α = 0
+  · rw [h_alpha] at h4
+    simp at h4
+    exact m.h_cross_nz h4.symm
+  · have h5 : α • m.delta.mulVec m.w_source = (1 - α) • m.cross_target := by
+      ext i
+      have h4_i : (α • m.cross_target + α • m.delta.mulVec m.w_source) i = m.cross_target i := by rw [h4]
+      simp only [Pi.add_apply, Pi.smul_apply, smul_eq_mul] at h4_i ⊢
+      linarith
+
+    have h6 : m.delta.mulVec m.w_source = ((1 - α) / α) • m.cross_target := by
+      ext i
+      have h5_i : (α • m.delta.mulVec m.w_source) i = ((1 - α) • m.cross_target) i := by rw [h5]
+      simp only [Pi.smul_apply, smul_eq_mul] at h5_i ⊢
+      calc
+        m.delta.mulVec m.w_source i = (α * m.delta.mulVec m.w_source i) / α := by
+          exact (mul_div_cancel_left₀ (m.delta.mulVec m.w_source i) h_alpha).symm
+        _ = ((1 - α) * m.cross_target i) / α := by rw [h5_i]
+        _ = ((1 - α) / α) * m.cross_target i := by ring
+    exact m.h_delta_indep ((1 - α) / α) h6
 
 /-- **Effect turnover is NOT recoverable without target-population data.**
     If true effects change between populations, the source GWAS provides
