@@ -252,15 +252,32 @@ on LD and population structure assumptions.
 
 section GREML
 
+/-- **True SNP heritability.** -/
+noncomputable def trueHeritability (V_A V_P : ℝ) : ℝ :=
+  V_A / V_P
+
+/-- **GREML tagged estimate of heritability.** -/
+noncomputable def gremlTaggedEstimate (V_A V_P mean_tag_r2 : ℝ) : ℝ :=
+  (mean_tag_r2 * V_A) / V_P
+
+/-- **GREML stratified estimate of heritability.** -/
+noncomputable def gremlStratifiedEstimate (V_A V_strat V_P : ℝ) : ℝ :=
+  (V_A + V_strat) / V_P
+
 /-- **GREML h² estimate depends on LD structure.**
     GREML estimates h²_SNP = trace(GRM⁻¹ × Σ_pheno) / n.
     When LD differs between training and evaluation, the estimate is biased. -/
 theorem greml_ld_sensitive
-    (h2_estimated h2_true ld_bias : ℝ)
-    (h_bias : h2_estimated = h2_true + ld_bias)
-    (h_ld_nonzero : ld_bias ≠ 0) :
-    h2_estimated ≠ h2_true := by
-  rw [h_bias]; intro h; apply h_ld_nonzero; linarith
+    (V_A V_P mean_tag_r2_1 mean_tag_r2_2 : ℝ)
+    (h_VA_pos : 0 < V_A) (h_VP_pos : 0 < V_P)
+    (h_ld_diff : mean_tag_r2_1 ≠ mean_tag_r2_2) :
+    gremlTaggedEstimate V_A V_P mean_tag_r2_1 ≠ gremlTaggedEstimate V_A V_P mean_tag_r2_2 := by
+  unfold gremlTaggedEstimate
+  intro h
+  have h_eq : ((mean_tag_r2_1 * V_A) / V_P) * V_P = ((mean_tag_r2_2 * V_A) / V_P) * V_P := by rw [h]
+  rw [div_mul_cancel₀ _ h_VP_pos.ne', div_mul_cancel₀ _ h_VP_pos.ne'] at h_eq
+  have h_eq2 : mean_tag_r2_1 = mean_tag_r2_2 := mul_right_cancel₀ h_VA_pos.ne' h_eq
+  exact h_ld_diff h_eq2
 
 /-- **GREML underestimates h² when causal variants are poorly tagged.**
     The true SNP heritability is `V_A / V_P`, while GREML only captures
@@ -271,11 +288,9 @@ theorem greml_underestimates_with_poor_tagging
     (V_A V_P mean_tag_r2 : ℝ)
     (h_imperfect : mean_tag_r2 < 1)
     (h_VA_pos : 0 < V_A) (h_VP_pos : 0 < V_P) :
-    let h2_true := V_A / V_P
-    let h2_greml := (mean_tag_r2 * V_A) / V_P
-    h2_true - h2_greml = ((1 - mean_tag_r2) * V_A) / V_P ∧
-      0 < h2_true - h2_greml := by
-  simp only
+    trueHeritability V_A V_P - gremlTaggedEstimate V_A V_P mean_tag_r2 = ((1 - mean_tag_r2) * V_A) / V_P ∧
+      0 < trueHeritability V_A V_P - gremlTaggedEstimate V_A V_P mean_tag_r2 := by
+  unfold trueHeritability gremlTaggedEstimate
   rw [← sub_div]
   have h_gap :
       V_A - mean_tag_r2 * V_A = (1 - mean_tag_r2) * V_A := by
@@ -303,13 +318,10 @@ theorem greml_underestimates_with_poor_tagging
     (V_A + V_strat)/V_P > V_A/V_P when V_P > 0. -/
 theorem stratification_inflates_greml
     (V_A V_strat V_E : ℝ)
-    (h_VA : 0 ≤ V_A) (h_strat_pos : 0 < V_strat) (h_VE : 0 ≤ V_E)
+    (h_strat_pos : 0 < V_strat)
     (h_total : 0 < V_A + V_strat + V_E) :
-    let V_P := V_A + V_strat + V_E
-    let h2_true := V_A / V_P
-    let h2_greml := (V_A + V_strat) / V_P
-    h2_true < h2_greml := by
-  simp only
+    trueHeritability V_A (V_A + V_strat + V_E) < gremlStratifiedEstimate V_A V_strat (V_A + V_strat + V_E) := by
+  unfold trueHeritability gremlStratifiedEstimate
   exact div_lt_div_of_pos_right (by linarith) h_total
 
 end GREML
