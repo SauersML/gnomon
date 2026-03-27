@@ -162,12 +162,15 @@ theorem mediated_pleiotropy_portability_bound
     via pleiotropy) is more likely to be affected by population-specific
     selection. Shared components degrade by δ_shared, unique by δ_unique,
     where δ_unique > δ_shared due to selection. -/
+noncomputable def portableComponent (port_base δ : ℝ) : ℝ :=
+  port_base - δ
+
 theorem unique_component_less_portable
     (port_base δ_shared δ_unique : ℝ)
-    (h_selection : δ_shared < δ_unique)
-    (h_shared_nn : 0 < δ_shared)
-    (h_base : δ_unique < port_base) :
-    port_base - δ_unique < port_base - δ_shared := by linarith
+    (h_selection : δ_shared < δ_unique) :
+    portableComponent port_base δ_unique < portableComponent port_base δ_shared := by
+  unfold portableComponent
+  linarith
 
 /-- **Decomposing trait heritability into shared and unique.**
     h²_trait = h²_shared + h²_unique where h²_shared comes from
