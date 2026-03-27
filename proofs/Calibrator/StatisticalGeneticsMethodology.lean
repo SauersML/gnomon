@@ -1,6 +1,7 @@
 import Calibrator.Probability
 import Calibrator.PortabilityDrift
 import Calibrator.OpenQuestions
+import Calibrator.DGP
 
 namespace Calibrator
 
@@ -402,15 +403,79 @@ theorem same_source_r2_different_portability_two_locus_witness :
     let sourceVariance : ℝ := ∑ l, sourceSignal l
     let stableTargetVariance : ℝ := ∑ l, sourceSignal l * stableTransport l
     let brokenTargetVariance : ℝ := ∑ l, sourceSignal l * brokenTransport l
-    let sourceR2 := TransportedMetrics.r2FromSignalVariance sourceVariance 1
-    let stableTargetR2 := TransportedMetrics.r2FromSignalVariance stableTargetVariance 1
-    let brokenTargetR2 := TransportedMetrics.r2FromSignalVariance brokenTargetVariance 1
+    let sourceR2 := Calibrator.TransportedMetrics.r2FromSignalVariance sourceVariance 1
+    let stableTargetR2 := Calibrator.TransportedMetrics.r2FromSignalVariance stableTargetVariance 1
+    let brokenTargetR2 := Calibrator.TransportedMetrics.r2FromSignalVariance brokenTargetVariance 1
     sourceR2 = stableTargetR2 ∧
     brokenTargetR2 < stableTargetR2 ∧
     brokenTargetR2 / sourceR2 = (3 : ℝ) / 4 := by
-  simp [TransportedMetrics.r2FromSignalVariance]
+  simp [Calibrator.TransportedMetrics.r2FromSignalVariance]
   norm_num
 
 end SourceR2Insufficiency
 
 end Calibrator
+
+/-- Formal model capturing locus-resolved transport properties across arbitrary dimensions. -/
+structure TransportState (n : ℕ) where
+  sourceSignal : Fin n → ℝ
+  stableTransport : Fin n → ℝ
+  brokenTransport : Fin n → ℝ
+  h_signal_pos : ∀ i, 0 < sourceSignal i
+  h_transport_nonneg : ∀ i, 0 ≤ brokenTransport i
+  h_broken_le_stable : ∀ i, brokenTransport i ≤ stableTransport i
+  h_broken_lt_stable : ∃ i, brokenTransport i < stableTransport i
+
+namespace TransportState
+
+noncomputable def sourceVariance {n : ℕ} (t : TransportState n) : ℝ :=
+  ∑ l, t.sourceSignal l
+
+noncomputable def stableTargetVariance {n : ℕ} (t : TransportState n) : ℝ :=
+  ∑ l, t.sourceSignal l * t.stableTransport l
+
+noncomputable def brokenTargetVariance {n : ℕ} (t : TransportState n) : ℝ :=
+  ∑ l, t.sourceSignal l * t.brokenTransport l
+
+theorem broken_target_variance_lt_stable_target_variance {n : ℕ} (t : TransportState n) :
+    t.brokenTargetVariance < t.stableTargetVariance := by
+  dsimp [brokenTargetVariance, stableTargetVariance]
+  apply Finset.sum_lt_sum
+  · intro i _
+    have h1 := t.h_signal_pos i
+    have h2 := t.h_broken_le_stable i
+    nlinarith
+  · rcases t.h_broken_lt_stable with ⟨i, hi⟩
+    use i
+    constructor
+    · simp
+    · have hpos := t.h_signal_pos i
+      nlinarith
+
+theorem different_portability_of_different_transport {n : ℕ} (t : TransportState n) (resid : ℝ) (h_resid_pos : 0 < resid) :
+    let stableR2 := Calibrator.TransportedMetrics.r2FromSignalVariance t.stableTargetVariance resid
+    let brokenR2 := Calibrator.TransportedMetrics.r2FromSignalVariance t.brokenTargetVariance resid
+    brokenR2 < stableR2 := by
+  intro stableR2 brokenR2
+  dsimp [stableR2, brokenR2, Calibrator.TransportedMetrics.r2FromSignalVariance]
+  have h_broken_lt_stable := t.broken_target_variance_lt_stable_target_variance
+  have h_broken_nonneg : 0 ≤ t.brokenTargetVariance := by
+    dsimp [brokenTargetVariance]
+    apply Finset.sum_nonneg
+    intro i _
+    have h1 := t.h_signal_pos i
+    have h2 := t.h_transport_nonneg i
+    nlinarith
+  have h_stable_nonneg : 0 ≤ t.stableTargetVariance := by
+    linarith
+  have h_den1 : 0 < t.brokenTargetVariance + resid := by linarith
+  have h_den2 : 0 < t.stableTargetVariance + resid := by linarith
+  rw [div_lt_div_iff₀ h_den1 h_den2]
+  calc
+    t.brokenTargetVariance * (t.stableTargetVariance + resid)
+      = t.brokenTargetVariance * t.stableTargetVariance + t.brokenTargetVariance * resid := by ring
+    _ < t.brokenTargetVariance * t.stableTargetVariance + t.stableTargetVariance * resid := by
+      nlinarith
+    _ = t.stableTargetVariance * (t.brokenTargetVariance + resid) := by ring
+
+end TransportState
