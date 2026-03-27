@@ -255,12 +255,16 @@ section GREML
 /-- **GREML h² estimate depends on LD structure.**
     GREML estimates h²_SNP = trace(GRM⁻¹ × Σ_pheno) / n.
     When LD differs between training and evaluation, the estimate is biased. -/
+noncomputable def gremlEstimate (h2_true ld_bias : ℝ) : ℝ := h2_true + ld_bias
+
 theorem greml_ld_sensitive
-    (h2_estimated h2_true ld_bias : ℝ)
-    (h_bias : h2_estimated = h2_true + ld_bias)
+    (h2_true ld_bias : ℝ)
     (h_ld_nonzero : ld_bias ≠ 0) :
-    h2_estimated ≠ h2_true := by
-  rw [h_bias]; intro h; apply h_ld_nonzero; linarith
+    gremlEstimate h2_true ld_bias ≠ h2_true := by
+  unfold gremlEstimate
+  intro h
+  have : ld_bias = 0 := by linarith
+  exact h_ld_nonzero this
 
 /-- **GREML underestimates h² when causal variants are poorly tagged.**
     The true SNP heritability is `V_A / V_P`, while GREML only captures

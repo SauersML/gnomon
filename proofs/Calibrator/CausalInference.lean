@@ -94,12 +94,17 @@ theorem selection_dominant_for_immune
 /-- **Interaction effects between pathways.**
     Pathways are not fully independent: LD changes interact
     with MAF changes (LD × MAF interaction). -/
+noncomputable def totalWithInteractions (sum_individual interaction : ℝ) : ℝ :=
+  sum_individual + interaction
+
 theorem pathway_interactions_exist
-    (sum_individual total_with_interactions interaction : ℝ)
-    (h_interaction : total_with_interactions = sum_individual + interaction)
+    (sum_individual interaction : ℝ)
     (h_nonzero : interaction ≠ 0) :
-    total_with_interactions ≠ sum_individual := by
-  rw [h_interaction]; intro h; apply h_nonzero; linarith
+    totalWithInteractions sum_individual interaction ≠ sum_individual := by
+  unfold totalWithInteractions
+  intro h
+  have : interaction = 0 := by linarith
+  exact h_nonzero this
 
 end PathDecomposition
 
@@ -438,12 +443,16 @@ theorem e_value_ge_one (rr : ℝ) (h_rr : 1 ≤ rr) :
 /-- **Sensitivity to LD reference mismatch.**
     Portability estimates are sensitive to the choice of LD reference.
     Using in-sample LD vs. external reference can change R² by δ. -/
+noncomputable def r2InSample (r2_external delta : ℝ) : ℝ :=
+  r2_external + delta
+
 theorem ld_reference_sensitivity
-    (r2_in_sample r2_external delta : ℝ)
-    (h_diff : r2_in_sample = r2_external + delta)
+    (r2_external delta : ℝ)
     (h_delta : 0 < |delta|) :
-    r2_in_sample ≠ r2_external := by
-  rw [h_diff]; intro h; have : delta = 0 := by linarith
+    r2InSample r2_external delta ≠ r2_external := by
+  unfold r2InSample
+  intro h
+  have : delta = 0 := by linarith
   exact absurd (this ▸ h_delta) (by simp)
 
 /-- **Sensitivity to phenotype definition.**
