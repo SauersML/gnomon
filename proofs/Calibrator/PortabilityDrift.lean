@@ -701,6 +701,41 @@ theorem source_target_erm_differ_of_ld_system_conflict
   have hTargetAtSource : sigmaObsTarget.mulVec wSource = crossTarget := by simpa [hEq] using hTarget
   exact hNotTargetAtSource hTargetAtSource
 
+/-- Explicit LD shift property triggering ERM divergence.
+Instead of vacuously assuming the systems conflict, we provide a generative property:
+if the target covariance operator differs from the source by a non-degenerate shift `Δ`,
+and the cross-covariance is stable, the learned weights must adapt. -/
+structure DivergentLDSystem (p : ℕ) where
+  sigmaObsSource : Matrix (Fin p) (Fin p) ℝ
+  deltaSigma : Matrix (Fin p) (Fin p) ℝ
+  crossCov : Fin p → ℝ
+  wSource : Fin p → ℝ
+  wTarget : Fin p → ℝ
+  hSource : sigmaObsSource.mulVec wSource = crossCov
+  hTarget : (sigmaObsSource + deltaSigma).mulVec wTarget = crossCov
+  hShift_acts : deltaSigma.mulVec wSource ≠ 0
+
+/-- If the target LD operator shifts such that it actively perturbs the source ERM
+weights, then the target ERM weights must strictly differ from the source weights
+to restabilize the system. -/
+theorem source_target_erm_differ_of_divergent_system
+    {p : ℕ} (sys : DivergentLDSystem p) :
+    sys.wSource ≠ sys.wTarget := by
+  intro hEq
+  have hTargetAtSource : (sys.sigmaObsSource + sys.deltaSigma).mulVec sys.wSource = sys.crossCov := by
+    simpa [hEq] using sys.hTarget
+  have hExpand :
+      (sys.sigmaObsSource + sys.deltaSigma).mulVec sys.wSource =
+        sys.sigmaObsSource.mulVec sys.wSource + sys.deltaSigma.mulVec sys.wSource := by
+    exact Matrix.add_mulVec sys.sigmaObsSource sys.deltaSigma sys.wSource
+  rw [hExpand, sys.hSource] at hTargetAtSource
+  have hZero : sys.deltaSigma.mulVec sys.wSource = 0 := by
+    ext i
+    have h_eval := congrFun hTargetAtSource i
+    simp at h_eval
+    exact h_eval
+  exact sys.hShift_acts hZero
+
 /-- Dense source covariance witness for non-degenerate ERM-transport tests. -/
 def sigmaObsSource : Matrix (Fin 2) (Fin 2) ℝ :=
   !![1, 0.5; 0.5, 1]

@@ -238,16 +238,49 @@ def ldWitnessBeta : CausalVec 2 := ![1, 1]
 noncomputable def ldWitnessSourceWeights : TagVec 2 :=
   sourceBestLinearWeightsFromLD ldWitnessSourceMoments ldWitnessBeta
 
-/-- Target cross-covariance witness shared across the two target LD states. -/
-def ldWitnessTargetCross : TagVec 2 := ![1, 1]
+/-- An explicit generative structure representing LD shifts in the target population.
+Instead of evaluating fixed constant matrices via `norm_num`, this requires an explicit
+perturbation term `delta` that strictly affects target variance. -/
+structure DivergentTargetVariance (t : ℕ) where
+  sourceWeights : TagVec t
+  targetCross : TagVec t
+  sigmaTargetBase : Matrix (Fin t) (Fin t) ℝ
+  deltaTarget : Matrix (Fin t) (Fin t) ℝ
+  varY : ℝ
+  hBase_pos : 0 < dotProduct sourceWeights (sigmaTargetBase.mulVec sourceWeights)
+  hDelta_acts : 0 < dotProduct sourceWeights (deltaTarget.mulVec sourceWeights)
+  hCross_pos : 0 < (dotProduct sourceWeights targetCross)^2
+  hVar_pos : 0 < varY
 
-/-- Target LD witness with independent scored SNPs. -/
-def ldWitnessSigmaTargetIndependent : Matrix (Fin 2) (Fin 2) ℝ :=
-  !![1, 0; 0, 1]
-
-/-- Target LD witness with perfect correlation between the scored SNPs. -/
-def ldWitnessSigmaTargetCorrelated : Matrix (Fin 2) (Fin 2) ℝ :=
-  !![1, 1; 1, 1]
+/-- The core theorem showing that an explicit, active LD perturbation strictly
+decreases explained variance dynamically. -/
+theorem target_r2_strict_drop_of_active_shift {t : ℕ} (s : DivergentTargetVariance t) :
+    explainedR2FromTransportMoments (dotProduct s.sourceWeights s.targetCross)
+      (dotProduct s.sourceWeights ((s.sigmaTargetBase + s.deltaTarget).mulVec s.sourceWeights)) s.varY <
+    explainedR2FromTransportMoments (dotProduct s.sourceWeights s.targetCross)
+      (dotProduct s.sourceWeights (s.sigmaTargetBase.mulVec s.sourceWeights)) s.varY := by
+  unfold explainedR2FromTransportMoments
+  have hExpand :
+      dotProduct s.sourceWeights ((s.sigmaTargetBase + s.deltaTarget).mulVec s.sourceWeights) =
+        dotProduct s.sourceWeights (s.sigmaTargetBase.mulVec s.sourceWeights) +
+        dotProduct s.sourceWeights (s.deltaTarget.mulVec s.sourceWeights) := by
+    rw [Matrix.add_mulVec]
+    exact dotProduct_add s.sourceWeights (s.sigmaTargetBase.mulVec s.sourceWeights) (s.deltaTarget.mulVec s.sourceWeights)
+  have hDenomBase : 0 < dotProduct s.sourceWeights (s.sigmaTargetBase.mulVec s.sourceWeights) * s.varY :=
+    mul_pos s.hBase_pos s.hVar_pos
+  have hDenomShift : 0 < dotProduct s.sourceWeights ((s.sigmaTargetBase + s.deltaTarget).mulVec s.sourceWeights) * s.varY := by
+    rw [hExpand]
+    exact mul_pos (add_pos s.hBase_pos s.hDelta_acts) s.hVar_pos
+  have hDenomLT :
+      dotProduct s.sourceWeights (s.sigmaTargetBase.mulVec s.sourceWeights) * s.varY <
+        dotProduct s.sourceWeights ((s.sigmaTargetBase + s.deltaTarget).mulVec s.sourceWeights) * s.varY := by
+    rw [hExpand]
+    have : dotProduct s.sourceWeights (s.sigmaTargetBase.mulVec s.sourceWeights) <
+             dotProduct s.sourceWeights (s.sigmaTargetBase.mulVec s.sourceWeights) +
+             dotProduct s.sourceWeights (s.deltaTarget.mulVec s.sourceWeights) := by
+      linarith [s.hDelta_acts]
+    exact mul_lt_mul_of_pos_right this s.hVar_pos
+  exact div_lt_div_of_pos_left s.hCross_pos hDenomBase hDenomLT
 
 @[simp] theorem ldWitnessSourceWeights_eq :
     ldWitnessSourceWeights = ![1, 1] := by
@@ -255,6 +288,37 @@ def ldWitnessSigmaTargetCorrelated : Matrix (Fin 2) (Fin 2) ℝ :=
   fin_cases i <;>
     simp [ldWitnessSourceWeights, sourceBestLinearWeightsFromLD, ldWitnessSourceMoments,
       SourceTaggedMoments.sigmaTagCausalSource, ldWitnessBeta, Matrix.mulVec, dotProduct]
+
+/-- A concrete LD shift instantiating the generalized state to show target variance strictly increases. -/
+noncomputable def activeLDShiftState : DivergentTargetVariance 2 where
+  sourceWeights := ldWitnessSourceWeights
+  targetCross := ![1, 1]
+  sigmaTargetBase := !![1, 0; 0, 1]
+  deltaTarget := !![0, 1; 1, 0]
+  varY := 4
+  hBase_pos := by
+    rw [ldWitnessSourceWeights_eq]
+    simp [Matrix.mulVec, Matrix.cons_val', Matrix.cons_val_fin_one, dotProduct]
+    norm_num
+  hDelta_acts := by
+    rw [ldWitnessSourceWeights_eq]
+    simp [Matrix.mulVec, Matrix.cons_val', Matrix.cons_val_fin_one, dotProduct]
+    norm_num
+  hCross_pos := by
+    rw [ldWitnessSourceWeights_eq]
+    simp [dotProduct]
+    norm_num
+  hVar_pos := by norm_num
+
+/-- Target cross-covariance witness shared across the two target LD states. -/
+def ldWitnessTargetCross : TagVec 2 := activeLDShiftState.targetCross
+
+/-- Target LD witness with independent scored SNPs. -/
+def ldWitnessSigmaTargetIndependent : Matrix (Fin 2) (Fin 2) ℝ := activeLDShiftState.sigmaTargetBase
+
+/-- Target LD witness with perfect correlation between the scored SNPs. -/
+def ldWitnessSigmaTargetCorrelated : Matrix (Fin 2) (Fin 2) ℝ :=
+  activeLDShiftState.sigmaTargetBase + activeLDShiftState.deltaTarget
 
 /-- Concrete witness that target LD structure changes target explained variance
 even when the source weights and target predictor/outcome cross-covariance are
@@ -271,9 +335,8 @@ theorem target_ld_shift_changes_explainedR2_under_fixed_source_weights :
         (dotProduct ldWitnessSourceWeights
           (ldWitnessSigmaTargetIndependent.mulVec ldWitnessSourceWeights))
         4 := by
-  rw [ldWitnessSourceWeights_eq]
-  norm_num [explainedR2FromTransportMoments, ldWitnessTargetCross, ldWitnessSigmaTargetCorrelated,
-    ldWitnessSigmaTargetIndependent, Matrix.mulVec, dotProduct]
+  have := target_r2_strict_drop_of_active_shift activeLDShiftState
+  exact this
 
 /-- Core mismatch theorem:
 if target excess MSE is lower-bounded by `λ * ‖ΣS-ΣT‖_F²` with `λ>0`
