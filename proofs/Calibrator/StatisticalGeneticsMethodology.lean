@@ -218,16 +218,35 @@ noncomputable def zScore (beta se : ℝ) : ℝ := beta / se
     - PRS-CS: w_j = E[β_j | summary stats, LD]
     - LDpred: w_j = posterior mean from Bayesian model -/
 
+/-- **Formal Structure for Summary Statistic.**
+    Bundles the standard error, effective sample size,
+    and the proof that effective_n = 1 / se ^ 2. -/
+structure SummaryStatistic where
+  se : ℝ
+  effective_n : ℝ
+  h_se_pos : 0 < se
+  h_effective_n_eq : effective_n = 1 / se ^ 2
+
 /-- **Effective sample size from summary stats.**
     n_eff_j = (Z_j / β_true_j)² if β_true_j were known.
     In practice: n_eff = median over SNPs of 1/SE_j².
     This can differ from the reported GWAS n. -/
 noncomputable def effectiveSampleSizeSE (se : ℝ) : ℝ := 1 / se ^ 2
 
+theorem effectiveSampleSizeSE_eq (stat : SummaryStatistic) :
+    effectiveSampleSizeSE stat.se = 1 / stat.se ^ 2 := by
+  rfl
+
 /-- Effective sample size is positive. -/
 theorem effective_n_pos (se : ℝ) (h_se : 0 < se) :
     0 < effectiveSampleSizeSE se := by
   unfold effectiveSampleSizeSE
+  exact div_pos one_pos (sq_pos_of_pos h_se)
+
+theorem effective_n_pos_proved (stat : SummaryStatistic) :
+    0 < stat.effective_n := by
+  rw [stat.h_effective_n_eq]
+  have h_se := stat.h_se_pos
   exact div_pos one_pos (sq_pos_of_pos h_se)
 
 /- **Multi-ancestry meta-analysis of summary statistics.**
