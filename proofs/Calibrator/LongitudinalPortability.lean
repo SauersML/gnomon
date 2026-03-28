@@ -66,15 +66,34 @@ theorem portability_decreases_with_time (r2_initial lambda_total t₁ t₂ : ℝ
   apply Real.exp_lt_exp_of_lt
   nlinarith
 
+/-- **Formal Structure for Population Drift.**
+    Bundles the effective population size Ne, its drift decay rate,
+    and the proof that driftDecayRate = 1 / (2 * Ne). -/
+structure PopulationDrift where
+  Ne : ℝ
+  driftDecayRate : ℝ
+  h_Ne_pos : 0 < Ne
+  h_driftDecayRate_eq : driftDecayRate = 1 / (2 * Ne)
+
 /-- **Drift component of decay.**
     Under Wright-Fisher drift with Ne:
     λ_drift = 1/(2Ne) per generation. -/
 noncomputable def longitudinalDriftDecayRate (Ne : ℝ) : ℝ := 1 / (2 * Ne)
 
+theorem longitudinalDriftDecayRate_eq (pop : PopulationDrift) :
+    longitudinalDriftDecayRate pop.Ne = 1 / (2 * pop.Ne) := by
+  rfl
+
 /-- Drift decay rate is positive for positive Ne. -/
 theorem drift_decay_rate_pos (Ne : ℝ) (h : 0 < Ne) :
     0 < longitudinalDriftDecayRate Ne := by
   unfold longitudinalDriftDecayRate
+  positivity
+
+theorem drift_decay_rate_pos_proved (pop : PopulationDrift) :
+    0 < pop.driftDecayRate := by
+  rw [pop.h_driftDecayRate_eq]
+  have h := pop.h_Ne_pos
   positivity
 
 /-- **Larger populations drift slower.**
@@ -85,6 +104,15 @@ theorem larger_Ne_slower_drift (Ne₁ Ne₂ : ℝ)
   unfold longitudinalDriftDecayRate
   have h1' : 0 < 2 * Ne₁ := by positivity
   have h2' : 0 < 2 * Ne₂ := by positivity
+  apply (div_lt_div_iff₀ h2' h1').2
+  nlinarith
+
+theorem larger_Ne_slower_drift_proved (pop₁ pop₂ : PopulationDrift)
+    (h_lt : pop₁.Ne < pop₂.Ne) :
+    pop₂.driftDecayRate < pop₁.driftDecayRate := by
+  rw [pop₁.h_driftDecayRate_eq, pop₂.h_driftDecayRate_eq]
+  have h1' : 0 < 2 * pop₁.Ne := mul_pos (by norm_num) pop₁.h_Ne_pos
+  have h2' : 0 < 2 * pop₂.Ne := mul_pos (by norm_num) pop₂.h_Ne_pos
   apply (div_lt_div_iff₀ h2' h1').2
   nlinarith
 
