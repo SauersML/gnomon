@@ -411,6 +411,26 @@ theorem same_source_r2_different_portability_two_locus_witness :
   simp [TransportedMetrics.r2FromSignalVariance]
   norm_num
 
+/-- Abstract formalization that equal source R² does not uniquely identify
+    target R² under arbitrary transport states, generalized for any number of loci `n > 0`. -/
+theorem same_source_r2_different_portability_abstract {n : ℕ} (h_n : 0 < n) :
+    ∃ (sourceSignal stableTransport brokenTransport : Fin n → ℝ),
+      let sourceVariance : ℝ := ∑ l, sourceSignal l
+      let stableTargetVariance : ℝ := ∑ l, sourceSignal l * stableTransport l
+      let brokenTargetVariance : ℝ := ∑ l, sourceSignal l * brokenTransport l
+      let sourceR2 := TransportedMetrics.r2FromSignalVariance sourceVariance 1
+      let stableTargetR2 := TransportedMetrics.r2FromSignalVariance stableTargetVariance 1
+      let brokenTargetR2 := TransportedMetrics.r2FromSignalVariance brokenTargetVariance 1
+      sourceR2 = stableTargetR2 ∧
+      brokenTargetR2 < stableTargetR2 := by
+  use (fun _ => 1)
+  use (fun _ => 1)
+  use (fun _ => 0)
+  have h_pos : (0 : ℝ) < n := by exact Nat.cast_pos.mpr h_n
+  simp [TransportedMetrics.r2FromSignalVariance]
+  apply div_pos h_pos
+  linarith
+
 end SourceR2Insufficiency
 
 end Calibrator
