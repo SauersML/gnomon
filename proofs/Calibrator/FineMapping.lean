@@ -34,10 +34,22 @@ contain the causal variant with high probability.
 
 section CredibleSets
 
+/-- Formal structure for FineMap Resolution to prevent vacuous verification. -/
+structure FineMapContext where
+  cs_size : ℝ
+  resolution : ℝ
+  h_cs_pos : 0 < cs_size
+  h_res_eq : resolution = 1 / cs_size
+
 /-- **Credible set resolution.**
     Resolution = 1 / credible_set_size.
     Higher resolution → more precise causal variant identification. -/
 noncomputable def finemapResolution (cs_size : ℝ) : ℝ := 1 / cs_size
+
+theorem finemapResolution_eq (ctx : FineMapContext) :
+    ctx.resolution = finemapResolution ctx.cs_size := by
+  rw [ctx.h_res_eq]
+  rfl
 
 /-- **Credible set coverage.**
     A credible set is constructed by including variants in decreasing
@@ -67,12 +79,14 @@ theorem credible_set_coverage
     credible set (cs_large_n ≤ cs_small_n) with cs_large_n < cs_small_n,
     then the ratio of sizes is strictly less than 1. -/
 theorem credible_set_shrinks_with_power
-    (cs_small_n cs_large_n : ℝ)
-    (h_pos_large : 0 < cs_large_n)
-    (h_pos_small : 0 < cs_small_n)
-    (h_resolution : finemapResolution cs_small_n < finemapResolution cs_large_n) :
-    cs_large_n / cs_small_n < 1 := by
-  unfold finemapResolution at h_resolution
+    (ctx_small ctx_large : FineMapContext)
+    (h_resolution : ctx_small.resolution < ctx_large.resolution) :
+    ctx_large.cs_size / ctx_small.cs_size < 1 := by
+  have h_res_small := ctx_small.h_res_eq
+  have h_res_large := ctx_large.h_res_eq
+  rw [h_res_small, h_res_large] at h_resolution
+  have h_pos_small := ctx_small.h_cs_pos
+  have h_pos_large := ctx_large.h_cs_pos
   rw [div_lt_div_iff₀ h_pos_small h_pos_large] at h_resolution
   simp at h_resolution
   rw [div_lt_one h_pos_small]
@@ -85,20 +99,28 @@ theorem credible_set_shrinks_with_power
     With shorter LD, the fine-mapping resolution is higher,
     which implies a smaller credible set. -/
 theorem shorter_ld_smaller_credible_sets
-    (cs_eur cs_afr : ℝ)
-    (h_eur_pos : 0 < cs_eur) (h_afr_pos : 0 < cs_afr)
-    (h_higher_res : finemapResolution cs_eur < finemapResolution cs_afr) :
-    cs_afr < cs_eur := by
-  unfold finemapResolution at h_higher_res
+    (ctx_eur ctx_afr : FineMapContext)
+    (h_higher_res : ctx_eur.resolution < ctx_afr.resolution) :
+    ctx_afr.cs_size < ctx_eur.cs_size := by
+  have h_res_eur := ctx_eur.h_res_eq
+  have h_res_afr := ctx_afr.h_res_eq
+  rw [h_res_eur, h_res_afr] at h_higher_res
+  have h_eur_pos := ctx_eur.h_cs_pos
+  have h_afr_pos := ctx_afr.h_cs_pos
   rw [div_lt_div_iff₀ h_eur_pos h_afr_pos] at h_higher_res
   linarith
 
 /-- Higher resolution with smaller credible sets. -/
-theorem smaller_cs_higher_resolution (cs₁ cs₂ : ℝ)
-    (h₁ : 0 < cs₁) (h₂ : 0 < cs₂) (h_smaller : cs₁ < cs₂) :
-    finemapResolution cs₂ < finemapResolution cs₁ := by
-  unfold finemapResolution
-  exact div_lt_div_iff_of_pos_left one_pos h₂ h₁ |>.mpr h_smaller
+theorem smaller_cs_higher_resolution
+    (ctx₁ ctx₂ : FineMapContext)
+    (h_smaller : ctx₁.cs_size < ctx₂.cs_size) :
+    ctx₂.resolution < ctx₁.resolution := by
+  have h_res₁ := ctx₁.h_res_eq
+  have h_res₂ := ctx₂.h_res_eq
+  rw [h_res₁, h_res₂]
+  have h₁ := ctx₁.h_cs_pos
+  have h₂ := ctx₂.h_cs_pos
+  exact div_lt_div_iff_of_pos_left zero_lt_one h₂ h₁ |>.mpr h_smaller
 
 end CredibleSets
 
