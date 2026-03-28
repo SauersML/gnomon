@@ -34,10 +34,13 @@ contain the causal variant with high probability.
 
 section CredibleSets
 
-/-- **Credible set resolution.**
-    Resolution = 1 / credible_set_size.
-    Higher resolution → more precise causal variant identification. -/
-noncomputable def finemapResolution (cs_size : ℝ) : ℝ := 1 / cs_size
+/-- **Fine-mapping study.**
+    Contains credible set size and the associated resolution. -/
+structure FineMappingStudy where
+  cs_size : ℝ
+  resolution : ℝ
+  cs_size_pos : 0 < cs_size
+  resolution_eq : resolution = 1 / cs_size
 
 /-- **Credible set coverage.**
     A credible set is constructed by including variants in decreasing
@@ -49,11 +52,11 @@ noncomputable def finemapResolution (cs_size : ℝ) : ℝ := 1 / cs_size
 theorem credible_set_coverage
     {m : ℕ} (pip : Fin m → ℝ)
     (target_coverage : ℝ)
-    (h_pip_nonneg : ∀ i, 0 ≤ pip i)
-    (h_pip_sum : ∑ i, pip i = 1)
+    (_h_pip_nonneg : ∀ i, 0 ≤ pip i)
+    (_h_pip_sum : ∑ i, pip i = 1)
     (S : Finset (Fin m))
     (h_target_pos : 0 < target_coverage)
-    (h_target_le : target_coverage ≤ 1)
+    (_h_target_le : target_coverage ≤ 1)
     (h_credible : target_coverage ≤ ∑ i ∈ S, pip i) :
     0 < ∑ i ∈ S, pip i := by
   linarith
@@ -67,16 +70,15 @@ theorem credible_set_coverage
     credible set (cs_large_n ≤ cs_small_n) with cs_large_n < cs_small_n,
     then the ratio of sizes is strictly less than 1. -/
 theorem credible_set_shrinks_with_power
-    (cs_small_n cs_large_n : ℝ)
-    (h_pos_large : 0 < cs_large_n)
-    (h_pos_small : 0 < cs_small_n)
-    (h_resolution : finemapResolution cs_small_n < finemapResolution cs_large_n) :
-    cs_large_n / cs_small_n < 1 := by
-  unfold finemapResolution at h_resolution
-  rw [div_lt_div_iff₀ h_pos_small h_pos_large] at h_resolution
-  simp at h_resolution
-  rw [div_lt_one h_pos_small]
-  exact h_resolution
+    (study_small_n study_large_n : FineMappingStudy)
+    (h_resolution : study_small_n.resolution < study_large_n.resolution) :
+    study_large_n.cs_size / study_small_n.cs_size < 1 := by
+  have h_res := h_resolution
+  rw [study_small_n.resolution_eq, study_large_n.resolution_eq] at h_res
+  rw [div_lt_div_iff₀ study_small_n.cs_size_pos study_large_n.cs_size_pos] at h_res
+  simp at h_res
+  rw [div_lt_one study_small_n.cs_size_pos]
+  exact h_res
 
 /-- **LD affects credible set size.**
     In long-LD regions (EUR), credible sets are larger because
@@ -85,20 +87,20 @@ theorem credible_set_shrinks_with_power
     With shorter LD, the fine-mapping resolution is higher,
     which implies a smaller credible set. -/
 theorem shorter_ld_smaller_credible_sets
-    (cs_eur cs_afr : ℝ)
-    (h_eur_pos : 0 < cs_eur) (h_afr_pos : 0 < cs_afr)
-    (h_higher_res : finemapResolution cs_eur < finemapResolution cs_afr) :
-    cs_afr < cs_eur := by
-  unfold finemapResolution at h_higher_res
-  rw [div_lt_div_iff₀ h_eur_pos h_afr_pos] at h_higher_res
+    (study_eur study_afr : FineMappingStudy)
+    (h_higher_res : study_eur.resolution < study_afr.resolution) :
+    study_afr.cs_size < study_eur.cs_size := by
+  have h_res := h_higher_res
+  rw [study_eur.resolution_eq, study_afr.resolution_eq] at h_res
+  rw [div_lt_div_iff₀ study_eur.cs_size_pos study_afr.cs_size_pos] at h_res
   linarith
 
 /-- Higher resolution with smaller credible sets. -/
-theorem smaller_cs_higher_resolution (cs₁ cs₂ : ℝ)
-    (h₁ : 0 < cs₁) (h₂ : 0 < cs₂) (h_smaller : cs₁ < cs₂) :
-    finemapResolution cs₂ < finemapResolution cs₁ := by
-  unfold finemapResolution
-  exact div_lt_div_iff_of_pos_left one_pos h₂ h₁ |>.mpr h_smaller
+theorem smaller_cs_higher_resolution (study₁ study₂ : FineMappingStudy)
+    (h_smaller : study₁.cs_size < study₂.cs_size) :
+    study₂.resolution < study₁.resolution := by
+  rw [study₁.resolution_eq, study₂.resolution_eq]
+  exact div_lt_div_iff_of_pos_left one_pos study₂.cs_size_pos study₁.cs_size_pos |>.mpr h_smaller
 
 end CredibleSets
 
@@ -130,7 +132,7 @@ noncomputable def proxyInflation (beta_causal r2_ld : ℝ) : ℝ :=
 theorem causal_pgs_more_portable
     (beta r2_source r2_target : ℝ)
     (h_beta : 0 < beta)
-    (h_source_pos : 0 < r2_source) (h_source_lt : r2_source < 1)
+    (h_source_pos : 0 < r2_source) (_h_source_lt : r2_source < 1)
     (h_target_pos : 0 < r2_target) (h_target_lt : r2_target < r2_source) :
     -- The proxy inflation in target exceeds that in source
     0 < proxyInflation beta r2_target - proxyInflation beta r2_source := by
@@ -213,10 +215,10 @@ theorem multi_ancestry_narrows_cs
     higher resolution despite a smaller sample. -/
 theorem afr_efficient_for_fine_mapping
     (n_afr n_eur ld_afr ld_eur : ℝ)
-    (h_n_afr : 0 < n_afr) (h_n_eur : 0 < n_eur)
+    (_h_n_afr : 0 < n_afr) (_h_n_eur : 0 < n_eur)
     (h_ld_afr : 0 < ld_afr) (h_ld_eur : 0 < ld_eur)
-    (h_smaller_n : n_afr < n_eur)
-    (h_shorter_ld : ld_afr < ld_eur)
+    (_h_smaller_n : n_afr < n_eur)
+    (_h_shorter_ld : ld_afr < ld_eur)
     (h_ld_advantage : n_eur * ld_afr < n_afr * ld_eur) :
     -- AFR effective resolution exceeds EUR
     n_eur / ld_eur < n_afr / ld_afr := by
@@ -286,7 +288,7 @@ noncomputable def pipWeightedEffect (pip beta : ℝ) : ℝ := pip * beta
 
 /-- PIP weighting shrinks effect sizes. -/
 theorem pip_shrinks_effects (pip beta : ℝ)
-    (h_pip : 0 ≤ pip) (h_pip_lt : pip < 1) (h_beta : 0 < beta) :
+    (_h_pip : 0 ≤ pip) (h_pip_lt : pip < 1) (h_beta : 0 < beta) :
     pipWeightedEffect pip beta < beta := by
   unfold pipWeightedEffect; nlinarith
 
@@ -301,8 +303,8 @@ theorem pip_shrinks_effects (pip beta : ℝ)
 theorem pip_pgs_more_portable
     (beta_causal r2_ld pip : ℝ)
     (h_beta : 0 < beta_causal)
-    (h_r2 : 0 < r2_ld) (h_r2_lt : r2_ld < 1)
-    (h_pip_nn : 0 ≤ pip) (h_pip_lt : pip < 1) :
+    (h_r2 : 0 < r2_ld) (_h_r2_lt : r2_ld < 1)
+    (_h_pip_nn : 0 ≤ pip) (h_pip_lt : pip < 1) :
     -- PIP-weighted proxy error < unweighted proxy error
     -- Error = |proxy_effect × weight - beta_causal|
     -- Unweighted: proxyInflation beta r2 - beta = beta/r2 - beta = beta(1-r2)/r2
@@ -391,7 +393,7 @@ theorem functional_prior_concentrates_pips
     the portable fraction exceeds 1/2. -/
 theorem conserved_annotations_help_portability
     (h2_func h2_rest : ℝ)
-    (h_func_pos : 0 < h2_func)
+    (_h_func_pos : 0 < h2_func)
     (h_rest_pos : 0 < h2_rest)
     (h_func_dominant : h2_rest < h2_func) :
     -- More than half the heritability is in conserved (portable) regions
@@ -410,7 +412,7 @@ theorem conserved_annotations_help_portability
     is large. We prove: enrichment > 1 when f_causal > f_cat. -/
 theorem causal_enrichment_in_functional
     (f_causal f_cat : ℝ)
-    (h_causal_pos : 0 < f_causal)
+    (_h_causal_pos : 0 < f_causal)
     (h_cat_pos : 0 < f_cat)
     (h_enriched : f_cat < f_causal) :
     1 < f_causal / f_cat := by

@@ -51,8 +51,8 @@ noncomputable def incrementalR2 (r2_full r2_covariates : ℝ) : ℝ :=
 theorem incremental_r2_nonneg
     (rss_full rss_cov tss : ℝ)
     (h_tss : 0 < tss)
-    (h_rss_full : 0 ≤ rss_full)
-    (h_rss_cov : 0 ≤ rss_cov)
+    (_h_rss_full : 0 ≤ rss_full)
+    (_h_rss_cov : 0 ≤ rss_cov)
     -- Nested model property: full model has no more residual than submodel
     (h_nested : rss_full ≤ rss_cov) :
     let r2_full := 1 - rss_full / tss
@@ -112,8 +112,8 @@ noncomputable def r2StandardError (r2 n k : ℝ) : ℝ :=
 theorem r2_se_decreases_with_n
     (r2 k : ℝ) (n₁ n₂ : ℝ)
     (h_r2 : 0 < r2) (h_r2_lt : r2 < 1)
-    (h_k : 0 < k)
-    (h_n₁ : k + 1 < n₁) (h_n₂ : k + 1 < n₂)
+    (_h_k : 0 < k)
+    (h_n₁ : k + 1 < n₁) (_h_n₂ : k + 1 < n₂)
     (h_more : n₁ < n₂) :
     r2StandardError r2 n₂ k < r2StandardError r2 n₁ k := by
   unfold r2StandardError
@@ -218,17 +218,19 @@ noncomputable def zScore (beta se : ℝ) : ℝ := beta / se
     - PRS-CS: w_j = E[β_j | summary stats, LD]
     - LDpred: w_j = posterior mean from Bayesian model -/
 
-/-- **Effective sample size from summary stats.**
-    n_eff_j = (Z_j / β_true_j)² if β_true_j were known.
-    In practice: n_eff = median over SNPs of 1/SE_j².
-    This can differ from the reported GWAS n. -/
-noncomputable def effectiveSampleSizeSE (se : ℝ) : ℝ := 1 / se ^ 2
+/-- **Summary statistic.**
+    Contains standard error and corresponding effective sample size. -/
+structure SummaryStatistic where
+  se : ℝ
+  effective_n : ℝ
+  se_pos : 0 < se
+  effective_n_eq : effective_n = 1 / se ^ 2
 
 /-- Effective sample size is positive. -/
-theorem effective_n_pos (se : ℝ) (h_se : 0 < se) :
-    0 < effectiveSampleSizeSE se := by
-  unfold effectiveSampleSizeSE
-  exact div_pos one_pos (sq_pos_of_pos h_se)
+theorem effective_n_pos (stat : SummaryStatistic) :
+    0 < stat.effective_n := by
+  rw [stat.effective_n_eq]
+  exact div_pos one_pos (sq_pos_of_pos stat.se_pos)
 
 /- **Multi-ancestry meta-analysis of summary statistics.**
     β̂_meta = Σ_k w_k β̂_k / Σ_k w_k where w_k = 1/SE_k².
@@ -241,7 +243,7 @@ theorem effective_n_pos (se : ℝ) (h_se : 0 < se) :
     it adds tau² to the within-study variance. -/
 theorem random_effects_captures_heterogeneity
     (se_fixed tau_sq : ℝ) -- fixed-effects SE and between-population variance
-    (h_se : 0 < se_fixed) (h_heterogeneous : 0 < tau_sq) :
+    (_h_se : 0 < se_fixed) (h_heterogeneous : 0 < tau_sq) :
     -- Random effects SE² = fixed SE² + tau² > fixed SE²
     se_fixed ^ 2 < se_fixed ^ 2 + tau_sq := by
   linarith
@@ -295,7 +297,7 @@ theorem genetic_correlation_predicts_portability
     For well-powered GWAS: SE ∝ 1/√n, so larger n yields smaller SE. -/
 theorem ldsc_se_decreases_with_n
     (c : ℝ) (n₁ n₂ : ℝ)
-    (h_c : 0 < c) (h_n₁ : 0 < n₁) (h_n₂ : 0 < n₂)
+    (h_c : 0 < c) (h_n₁ : 0 < n₁) (_h_n₂ : 0 < n₂)
     (h_more : n₁ < n₂) :
     c / Real.sqrt n₂ < c / Real.sqrt n₁ := by
   apply div_lt_div_of_pos_left h_c
@@ -308,7 +310,7 @@ theorem ldsc_se_decreases_with_n
     yielding a smaller SE (fewer parameters → tighter estimate). -/
 theorem constrained_intercept_more_powerful
     (se_per_param : ℝ) (k : ℕ)
-    (h_se : 0 < se_per_param) (h_k : 0 < k) :
+    (h_se : 0 < se_per_param) (_h_k : 0 < k) :
     se_per_param * k < se_per_param * (k + 1) := by
   have : (k : ℝ) < (k : ℝ) + 1 := lt_add_one _
   exact mul_lt_mul_of_pos_left this h_se
@@ -365,8 +367,8 @@ theorem local_genetic_correlation_varies
     and Fst is lower for older (common) variants. -/
 theorem common_variants_higher_correlation
     (fst_common fst_rare : ℝ)
-    (h_fst_common : 0 ≤ fst_common) (h_fst_common_lt : fst_common < 1)
-    (h_fst_rare : 0 ≤ fst_rare) (h_fst_rare_lt : fst_rare < 1)
+    (_h_fst_common : 0 ≤ fst_common) (_h_fst_common_lt : fst_common < 1)
+    (_h_fst_rare : 0 ≤ fst_rare) (_h_fst_rare_lt : fst_rare < 1)
     (h_older_less_diverged : fst_common < fst_rare) :
     -- ρ_g ~ 1 - Fst, so lower Fst → higher correlation
     1 - fst_rare < 1 - fst_common := by linarith
