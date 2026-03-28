@@ -28,26 +28,33 @@ genetic distance. This classification reflects underlying biology.
 
 section TraitClassification
 
+/-- **Neutral scalar transport baseline model.**
+    Contains additional Fst, an LD factor, and their valid bounds. -/
+structure NeutralPortabilityModel where
+  fst_additional : ℝ
+  ld_factor : ℝ
+  fst_nonneg : 0 ≤ fst_additional
+  fst_le_one : fst_additional ≤ 1
+  ld_nonneg : 0 ≤ ld_factor
+  ld_le_one : ld_factor ≤ 1
+
 /-- **Neutral scalar transport baseline.**
     Under pure neutral drift with no selection or GxE, this file uses the
     coarse transport summary `(1 - Fst_additional) * ld_factor`.
 
     This is a trait-level scalar baseline for downstream comparisons, not a
     literal theorem that the deployed `R²` ratio equals this product. -/
-noncomputable def neutralPortabilityRatioLD (fst_additional ld_factor : ℝ) : ℝ :=
-  (1 - fst_additional) * ld_factor
+noncomputable def NeutralPortabilityModel.ratio (model : NeutralPortabilityModel) : ℝ :=
+  (1 - model.fst_additional) * model.ld_factor
 
 /-- Neutral ratio is in [0, 1] under valid parameters. -/
-theorem neutral_ratio_in_unit (fst ld : ℝ)
-    (h_fst : 0 ≤ fst) (h_fst1 : fst ≤ 1)
-    (h_ld : 0 ≤ ld) (h_ld1 : ld ≤ 1) :
-    0 ≤ neutralPortabilityRatioLD fst ld ∧
-      neutralPortabilityRatioLD fst ld ≤ 1 := by
-  unfold neutralPortabilityRatioLD
+theorem neutral_ratio_in_unit (model : NeutralPortabilityModel) :
+    0 ≤ model.ratio ∧ model.ratio ≤ 1 := by
+  unfold NeutralPortabilityModel.ratio
   constructor
-  · exact mul_nonneg (by linarith) h_ld
-  · calc (1 - fst) * ld ≤ 1 * 1 := by
-          apply mul_le_mul (by linarith) h_ld1 h_ld (by linarith)
+  · exact mul_nonneg (by linarith [model.fst_le_one]) model.ld_nonneg
+  · calc (1 - model.fst_additional) * model.ld_factor ≤ 1 * 1 := by
+          apply mul_le_mul (by linarith [model.fst_nonneg]) model.ld_le_one model.ld_nonneg (by linarith)
       _ = 1 := by ring
 
 /-!
