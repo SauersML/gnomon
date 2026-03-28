@@ -483,6 +483,21 @@ section OptimalAllocation
     This is a concave function of n, giving diminishing returns. -/
 noncomputable def r2ScalingModel (n C : ℝ) : ℝ := n / (n + C)
 
+/-- Formal structure for the R² scaling model. -/
+structure R2ScalingModel where
+  n : ℝ
+  C : ℝ
+  h_n_nonneg : 0 ≤ n
+  h_C_pos : 0 < C
+  r2 : ℝ
+  h_r2_eq : r2 = n / (n + C)
+
+/-- Compatibility theorem linking the structure back to the original `def`. -/
+theorem R2ScalingModel.r2_eq (m : R2ScalingModel) :
+    m.r2 = r2ScalingModel m.n m.C := by
+  rw [m.h_r2_eq]
+  rfl
+
 /-- R² scaling model is increasing in n. -/
 theorem r2_scaling_increasing (n₁ n₂ C : ℝ)
     (h_C : 0 < C) (h_n₁ : 0 ≤ n₁) (h_n₂ : 0 ≤ n₂) (h_n : n₁ < n₂) :
@@ -491,6 +506,14 @@ theorem r2_scaling_increasing (n₁ n₂ C : ℝ)
   rw [div_lt_div_iff₀ (by linarith) (by linarith)]
   nlinarith
 
+theorem r2_scaling_increasing_struct (m₁ m₂ : R2ScalingModel)
+    (h_C_eq : m₁.C = m₂.C) (h_n : m₁.n < m₂.n) :
+    m₁.r2 < m₂.r2 := by
+  have h1 := m₁.r2_eq
+  have h2 := m₂.r2_eq
+  rw [h1, h2, h_C_eq]
+  exact r2_scaling_increasing m₁.n m₂.n m₂.C m₂.h_C_pos m₁.h_n_nonneg m₂.h_n_nonneg h_n
+
 /-- R² scaling model is bounded by 1. -/
 theorem r2_scaling_bounded (n C : ℝ)
     (h_C : 0 < C) (h_n : 0 ≤ n) :
@@ -498,6 +521,11 @@ theorem r2_scaling_bounded (n C : ℝ)
   unfold r2ScalingModel
   rw [div_lt_one (by linarith)]
   linarith
+
+theorem r2_scaling_bounded_struct (m : R2ScalingModel) :
+    m.r2 < 1 := by
+  rw [m.r2_eq]
+  exact r2_scaling_bounded m.n m.C m.h_C_pos m.h_n_nonneg
 
 /-- **Diminishing returns from concavity of R²(n) = n/(n+C).**
     The second derivative d²R²/dn² = −2C/(n+C)³ < 0, so R² is concave.
@@ -529,6 +557,25 @@ theorem diminishing_returns (n₁ n₂ delta C : ℝ)
     nlinarith [mul_pos (show (0:ℝ) < n₂ - n₁ by linarith)
                         (show (0:ℝ) < n₁ + n₂ + delta + 2 * C by linarith)]
   nlinarith [h_num n₁, h_num n₂, mul_pos h_delta h_C, h_denom_lt]
+
+theorem diminishing_returns_struct
+    (m₁ m₂ m₁_delta m₂_delta : R2ScalingModel)
+    (h_C_eq : m₁.C = m₂.C)
+    (h_C_m₁ : m₁.C = m₁_delta.C)
+    (h_C_m₂ : m₂.C = m₂_delta.C)
+    (h_delta_eq : m₁_delta.n - m₁.n = m₂_delta.n - m₂.n)
+    (h_delta_pos : 0 < m₁_delta.n - m₁.n)
+    (h_n : m₁.n < m₂.n) :
+    m₂_delta.r2 - m₂.r2 < m₁_delta.r2 - m₁.r2 := by
+  have heq1 := m₁.r2_eq
+  have heq2 := m₂.r2_eq
+  have heqd1 := m₁_delta.r2_eq
+  have heqd2 := m₂_delta.r2_eq
+  rw [heq1, heq2, heqd1, heqd2, ← h_C_m₁, ← h_C_m₂, ← h_C_eq]
+  have hd_sub : m₁_delta.n = m₁.n + (m₁_delta.n - m₁.n) := by ring
+  have hd_sub2 : m₂_delta.n = m₂.n + (m₂_delta.n - m₂.n) := by ring
+  rw [hd_sub, hd_sub2, ← h_delta_eq]
+  exact diminishing_returns m₁.n m₂.n (m₁_delta.n - m₁.n) m₁.C m₁.h_C_pos m₁.h_n_nonneg m₂.h_n_nonneg h_delta_pos h_n
 
 /-- **Equal allocation is suboptimal when populations differ in size.**
     If population A already has a large GWAS and B has none,
