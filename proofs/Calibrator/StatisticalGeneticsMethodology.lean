@@ -384,6 +384,51 @@ The resulting target `R²` and target/source portability ratio change.
 
 section SourceR2Insufficiency
 
+open Calibrator
+
+structure TransportState {n : ℕ} where
+  sourceSignal : Fin n → ℝ
+  stableTransport : Fin n → ℝ
+  brokenTransport : Fin n → ℝ
+
+/-- A rigorous, generalized proof over arbitrary dimensions that source `R²`
+does not determine portability when locus-resolved transport states differ. -/
+theorem same_source_r2_different_portability_generalized {n : ℕ}
+    (ts : TransportState (n := n))
+    (h_broken_lt : ∑ l, ts.sourceSignal l * ts.brokenTransport l < ∑ l, ts.sourceSignal l * ts.stableTransport l)
+    (h_stable_eq : ∑ l, ts.sourceSignal l = ∑ l, ts.sourceSignal l * ts.stableTransport l)
+    (h_pos : 0 ≤ ∑ l, ts.sourceSignal l * ts.brokenTransport l)
+    (vE : ℝ) (h_vE_pos : 0 < vE) :
+    let sourceVariance := ∑ l, ts.sourceSignal l
+    let stableTargetVariance := ∑ l, ts.sourceSignal l * ts.stableTransport l
+    let brokenTargetVariance := ∑ l, ts.sourceSignal l * ts.brokenTransport l
+    let sourceR2 := TransportedMetrics.r2FromSignalVariance sourceVariance vE
+    let stableTargetR2 := TransportedMetrics.r2FromSignalVariance stableTargetVariance vE
+    let brokenTargetR2 := TransportedMetrics.r2FromSignalVariance brokenTargetVariance vE
+    sourceR2 = stableTargetR2 ∧
+    brokenTargetR2 < stableTargetR2 ∧
+    brokenTargetR2 / sourceR2 < 1 := by
+  intro sourceVariance stableTargetVariance brokenTargetVariance sourceR2 stableTargetR2 brokenTargetR2
+  dsimp [sourceR2, stableTargetR2, brokenTargetR2, sourceVariance, stableTargetVariance, brokenTargetVariance]
+  unfold TransportedMetrics.r2FromSignalVariance
+  have h1 : (∑ l, ts.sourceSignal l) / (∑ l, ts.sourceSignal l + vE) = (∑ l, ts.sourceSignal l * ts.stableTransport l) / (∑ l, ts.sourceSignal l * ts.stableTransport l + vE) := by
+    rw [h_stable_eq]
+  refine ⟨h1, ?_, ?_⟩
+  · have hd1 : 0 < ∑ l, ts.sourceSignal l * ts.stableTransport l + vE := by linarith
+    have hd2 : 0 < ∑ l, ts.sourceSignal l * ts.brokenTransport l + vE := by linarith
+    rw [div_lt_div_iff₀ hd2 hd1]
+    nlinarith
+  · rw [h1]
+    have hd1 : 0 < ∑ l, ts.sourceSignal l * ts.stableTransport l + vE := by linarith
+    have hd2 : 0 < ∑ l, ts.sourceSignal l * ts.brokenTransport l + vE := by linarith
+    have hn1 : 0 < ∑ l, ts.sourceSignal l * ts.stableTransport l := by linarith
+    have h_div_pos : 0 < (∑ l, ts.sourceSignal l * ts.stableTransport l) / (∑ l, ts.sourceSignal l * ts.stableTransport l + vE) := by apply div_pos hn1 hd1
+    rw [div_lt_one h_div_pos]
+    have h_equiv : (∑ l, ts.sourceSignal l * ts.brokenTransport l) / (∑ l, ts.sourceSignal l * ts.brokenTransport l + vE) < (∑ l, ts.sourceSignal l * ts.stableTransport l) / (∑ l, ts.sourceSignal l * ts.stableTransport l + vE) ↔ (∑ l, ts.sourceSignal l * ts.brokenTransport l) * (∑ l, ts.sourceSignal l * ts.stableTransport l + vE) < (∑ l, ts.sourceSignal l * ts.stableTransport l) * (∑ l, ts.sourceSignal l * ts.brokenTransport l + vE) := by
+      exact div_lt_div_iff₀ hd2 hd1
+    rw [h_equiv]
+    nlinarith
+
 /-- Concrete two-locus witness that source deployed `R²` does not determine
 target portability.
 
