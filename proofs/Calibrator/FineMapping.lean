@@ -39,6 +39,19 @@ section CredibleSets
     Higher resolution → more precise causal variant identification. -/
 noncomputable def finemapResolution (cs_size : ℝ) : ℝ := 1 / cs_size
 
+/-- Formal structure for fine-mapping resolution. -/
+structure FineMapResolution where
+  cs_size : ℝ
+  h_size_pos : 0 < cs_size
+  resolution : ℝ
+  h_res_eq : resolution = 1 / cs_size
+
+/-- Compatibility theorem linking the structure back to the original `def`. -/
+theorem FineMapResolution.resolution_eq (f : FineMapResolution) :
+    f.resolution = finemapResolution f.cs_size := by
+  rw [f.h_res_eq]
+  rfl
+
 /-- **Credible set coverage.**
     A credible set is constructed by including variants in decreasing
     order of posterior inclusion probability until their cumulative
@@ -78,6 +91,15 @@ theorem credible_set_shrinks_with_power
   rw [div_lt_one h_pos_small]
   exact h_resolution
 
+theorem credible_set_shrinks_with_power_struct
+    (small large : FineMapResolution)
+    (h_resolution : small.resolution < large.resolution) :
+    large.cs_size / small.cs_size < 1 := by
+  have hs := small.resolution_eq
+  have hl := large.resolution_eq
+  rw [hs, hl] at h_resolution
+  exact credible_set_shrinks_with_power small.cs_size large.cs_size large.h_size_pos small.h_size_pos h_resolution
+
 /-- **LD affects credible set size.**
     In long-LD regions (EUR), credible sets are larger because
     more variants are in high LD with the causal variant.
@@ -93,12 +115,30 @@ theorem shorter_ld_smaller_credible_sets
   rw [div_lt_div_iff₀ h_eur_pos h_afr_pos] at h_higher_res
   linarith
 
+theorem shorter_ld_smaller_credible_sets_struct
+    (eur afr : FineMapResolution)
+    (h_higher_res : eur.resolution < afr.resolution) :
+    afr.cs_size < eur.cs_size := by
+  have he := eur.resolution_eq
+  have ha := afr.resolution_eq
+  rw [he, ha] at h_higher_res
+  exact shorter_ld_smaller_credible_sets eur.cs_size afr.cs_size eur.h_size_pos afr.h_size_pos h_higher_res
+
 /-- Higher resolution with smaller credible sets. -/
 theorem smaller_cs_higher_resolution (cs₁ cs₂ : ℝ)
     (h₁ : 0 < cs₁) (h₂ : 0 < cs₂) (h_smaller : cs₁ < cs₂) :
     finemapResolution cs₂ < finemapResolution cs₁ := by
   unfold finemapResolution
   exact div_lt_div_iff_of_pos_left one_pos h₂ h₁ |>.mpr h_smaller
+
+theorem smaller_cs_higher_resolution_struct
+    (f₁ f₂ : FineMapResolution)
+    (h_smaller : f₁.cs_size < f₂.cs_size) :
+    f₂.resolution < f₁.resolution := by
+  have h1 := f₁.resolution_eq
+  have h2 := f₂.resolution_eq
+  rw [h1, h2]
+  exact smaller_cs_higher_resolution f₁.cs_size f₂.cs_size f₁.h_size_pos f₂.h_size_pos h_smaller
 
 end CredibleSets
 
