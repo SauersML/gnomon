@@ -150,24 +150,40 @@ theorem r2_small_when_within_dominates
   rw [h1, sub_div, div_self (h_varZ_pos.ne')]
   linarith [le_div_iff₀ h_varZ_pos |>.mpr (by linarith : (1 - δ) * varZ ≤ eVarZgivenD)]
 
+structure SquaredErrorModel where
+  sigma_sq : ℝ
+  h_pos : 0 < sigma_sq
+
+noncomputable def SquaredErrorModel.cv (m : SquaredErrorModel) : ℝ :=
+  2 * m.sigma_sq ^ 2 / m.sigma_sq ^ 2
+
 /-- **χ² coefficient of variation.**
     Squared prediction error ε² ~ σ² · χ²₁ has Var(ε²) = 2σ⁴ and E[ε²] = σ².
     So CV² = 2σ⁴/σ⁴ = 2, making individual errors inherently noisy. -/
-theorem squared_error_cv_is_two (sigma_sq : ℝ) (hσ : 0 < sigma_sq) :
-    2 * sigma_sq ^ 2 / sigma_sq ^ 2 = 2 := by
+theorem squared_error_cv_is_two (m : SquaredErrorModel) :
+    m.cv = 2 := by
+  unfold SquaredErrorModel.cv
   rw [mul_div_cancel_right₀]
-  exact pow_ne_zero 2 (hσ.ne')
+  exact pow_ne_zero 2 (m.h_pos.ne')
+
+structure SESGeneticModel where
+  r2_d : ℝ
+  r2_s : ℝ
+  B : ℝ
+  ε : ℝ
+  h_d_nonneg : 0 ≤ r2_d
+  h_s_nonneg : 0 ≤ r2_s
+  h_comparable : r2_d ≤ r2_s + ε
+  h_sum_bound : r2_d + r2_s ≤ B
+  hB_pos : 0 < B
 
 /-- **SES explains as much as genetic distance.**
     If both covariates explain comparable fractions and their total
     is bounded, each individual fraction must be small. -/
-theorem comparable_covariates_both_small
-    (r2_d r2_s B ε : ℝ)
-    (_h_d_nonneg : 0 ≤ r2_d) (_h_s_nonneg : 0 ≤ r2_s)
-    (h_comparable : r2_d ≤ r2_s + ε)
-    (h_sum_bound : r2_d + r2_s ≤ B)
-    (_hB_pos : 0 < B) :
-    r2_d ≤ (B + ε) / 2 := by
+theorem comparable_covariates_both_small (m : SESGeneticModel) :
+    m.r2_d ≤ (m.B + m.ε) / 2 := by
+  have h1 := m.h_comparable
+  have h2 := m.h_sum_bound
   linarith
 
 end Question1
@@ -380,30 +396,54 @@ end Question4
 
 section Question5
 
+structure WinnersCurseModel where
+  β : ℝ
+  δ : ℝ
+  ρ : ℝ
+  hβ : 0 < β
+  hδ : 0 < δ
+  hρ_pos : 0 < ρ
+  hρ_le_one : ρ ≤ 1
+
+noncomputable def WinnersCurseModel.prediction_error (m : WinnersCurseModel) : ℝ :=
+  (m.β + m.δ) - m.ρ * m.β
+
+noncomputable def WinnersCurseModel.relative_error (m : WinnersCurseModel) : ℝ :=
+  m.prediction_error / (m.ρ * m.β)
+
 /-- **Winner's curse prediction error model.**
     GWAS estimate β_hat = β_true + δ (inflation).
     Target effect β_t = ρ * β_true (turnover).
     Prediction error = β_hat - β_t = (1-ρ)*β + δ.
     Prediction error decomposes into turnover + inflation. -/
-theorem prediction_error_decomp (β δ ρ : ℝ) :
-    (β + δ) - ρ * β = (1 - ρ) * β + δ := by ring
+theorem prediction_error_decomp (m : WinnersCurseModel) :
+    m.prediction_error = (1 - m.ρ) * m.β + m.δ := by
+  unfold WinnersCurseModel.prediction_error
+  ring
 
 /-- Prediction error is positive when both components are positive. -/
-theorem prediction_error_positive
-    (β δ ρ : ℝ) (hβ : 0 < β) (hδ : 0 < δ) (hρ : ρ ≤ 1) :
-    0 < (1 - ρ) * β + δ := by
-  have : 0 ≤ (1 - ρ) * β := mul_nonneg (by linarith) (le_of_lt hβ)
-  linarith
+theorem prediction_error_positive (m : WinnersCurseModel) :
+    0 < m.prediction_error := by
+  rw [prediction_error_decomp m]
+  have : 0 ≤ (1 - m.ρ) * m.β := mul_nonneg (by linarith [m.hρ_le_one]) (le_of_lt m.hβ)
+  linarith [m.hδ]
 
 /-- **Winner's curse is worse with more turnover.**
     Relative error = ((1-ρ)β + δ) / (ρβ). As ρ↓, this increases. -/
 theorem relative_error_increases_with_turnover
-    (β δ ρ₁ ρ₂ : ℝ) (hβ : 0 < β) (hδ : 0 < δ)
-    (hρ₁ : 0 < ρ₁) (hρ₂ : 0 < ρ₂) (hρ : ρ₂ < ρ₁) (_hρ₁_le : ρ₁ ≤ 1) :
-    ((1 - ρ₁) * β + δ) / (ρ₁ * β) < ((1 - ρ₂) * β + δ) / (ρ₂ * β) := by
-  rw [div_lt_div_iff₀ (mul_pos hρ₁ hβ) (mul_pos hρ₂ hβ)]
-  nlinarith [sq_nonneg β, sq_nonneg δ, mul_pos hρ₁ hβ, mul_pos hρ₂ hβ,
-             mul_pos hβ hδ, mul_pos hρ₁ hδ, mul_pos hρ₂ hδ]
+    (m1 m2 : WinnersCurseModel) (h_same_β : m1.β = m2.β) (h_same_δ : m1.δ = m2.δ)
+    (h_turnover : m2.ρ < m1.ρ) :
+    m1.relative_error < m2.relative_error := by
+  unfold WinnersCurseModel.relative_error
+  rw [prediction_error_decomp m1, prediction_error_decomp m2]
+  rw [h_same_β, h_same_δ]
+  have hb : 0 < m2.β := m2.hβ
+  have hd : 0 < m2.δ := m2.hδ
+  have h1 : 0 < m1.ρ := m1.hρ_pos
+  have h2 : 0 < m2.ρ := m2.hρ_pos
+  rw [div_lt_div_iff₀ (mul_pos h1 hb) (mul_pos h2 hb)]
+  nlinarith [sq_nonneg m2.β, sq_nonneg m2.δ, mul_pos h1 hb, mul_pos h2 hb,
+             mul_pos hb hd, mul_pos h1 hd, mul_pos h2 hd]
 
 /-- **Heterozygosity increase → PGS variance increase at a single locus.** -/
 theorem het_increase_implies_locus_var_increase
@@ -449,23 +489,34 @@ end Question6
 
 section Question7
 
+structure BrierScoreModel where
+  π : ℝ
+  h_pos : 0 < π
+  h_lt_one : π < 1
+
+noncomputable def BrierScoreModel.uncertainty (m : BrierScoreModel) : ℝ :=
+  m.π * (1 - m.π)
+
 /-- **Brier score irreducible noise = π(1-π).**
     This varies with prevalence, making R² comparisons across groups misleading. -/
-theorem brier_uncertainty_formula (π : ℝ) :
-    π * (1 - π) = -(π - 1/2) ^ 2 + 1/4 := by ring
+theorem brier_uncertainty_formula (m : BrierScoreModel) :
+    m.uncertainty = -(m.π - 1/2) ^ 2 + 1/4 := by
+  unfold BrierScoreModel.uncertainty
+  ring
 
 /-- **Brier uncertainty is maximized at π = 1/2.** -/
-theorem brier_uncertainty_max_at_half (π : ℝ) :
-    π * (1 - π) ≤ 1/4 := by nlinarith [sq_nonneg (π - 1/2)]
+theorem brier_uncertainty_max_at_half (m : BrierScoreModel) :
+    m.uncertainty ≤ 1/4 := by
+  rw [brier_uncertainty_formula m]
+  nlinarith [sq_nonneg (m.π - 1/2)]
 
 /-- **Closer to 1/2 ↔ higher uncertainty.** -/
 theorem closer_to_half_more_uncertainty
-    (π₁ π₂ : ℝ)
-    (_h₁ : 0 < π₁) (_h₁' : π₁ < 1)
-    (_h₂ : 0 < π₂) (_h₂' : π₂ < 1)
-    (h_closer : (π₂ - 1/2) ^ 2 < (π₁ - 1/2) ^ 2) :
-    π₁ * (1 - π₁) < π₂ * (1 - π₂) := by
-  nlinarith [brier_uncertainty_formula π₁, brier_uncertainty_formula π₂]
+    (m1 m2 : BrierScoreModel)
+    (h_closer : (m2.π - 1/2) ^ 2 < (m1.π - 1/2) ^ 2) :
+    m1.uncertainty < m2.uncertainty := by
+  rw [brier_uncertainty_formula m1, brier_uncertainty_formula m2]
+  nlinarith
 
 /-- **Prediction interval width increases as R² decreases.** -/
 theorem interval_width_increases
@@ -876,18 +927,34 @@ We formalize which components of portability loss are recoverable.
 
 section RecoverablePortability
 
+structure RecoverablePortabilityModel where
+  y_pred : ℝ
+  μ_shift : ℝ
+  b : ℝ
+  r : ℝ
+  pgs : ℝ
+  hr : r ≠ 0
+
+noncomputable def RecoverablePortabilityModel.shifted_pgs (m : RecoverablePortabilityModel) : ℝ :=
+  m.y_pred - m.μ_shift
+
+noncomputable def RecoverablePortabilityModel.scaled_pgs (m : RecoverablePortabilityModel) : ℝ :=
+  m.b * m.r * m.pgs
+
 /-- **Mean shift is recoverable by re-calibration.**
     If the PGS has a mean shift μ across populations, adjusting the
     intercept recovers the correct calibration. -/
-theorem mean_shift_recoverable
-    (y_pred μ_shift : ℝ) :
-    y_pred - μ_shift + μ_shift = y_pred := by ring
+theorem mean_shift_recoverable (m : RecoverablePortabilityModel) :
+    m.shifted_pgs + m.μ_shift = m.y_pred := by
+  unfold RecoverablePortabilityModel.shifted_pgs
+  ring
 
 /-- **Slope change (shrinkage) is recoverable by re-calibration.**
     If the PGS slope changes from b to b·r, multiplying by 1/r recovers it. -/
-theorem slope_change_recoverable
-    (b r pgs : ℝ) (hr : r ≠ 0) :
-    (b * r * pgs) * (1 / r) = b * pgs := by
+theorem slope_change_recoverable (m : RecoverablePortabilityModel) :
+    m.scaled_pgs * (1 / m.r) = m.b * m.pgs := by
+  unfold RecoverablePortabilityModel.scaled_pgs
+  have h := m.hr
   field_simp
 
 /-- **LD mismatch is NOT recoverable by linear re-calibration.**
@@ -909,18 +976,21 @@ theorem ld_mismatch_not_linearly_recoverable
   rw [Matrix.mulVec_smul]
   exact h_not_aligned α
 
+structure EffectTurnoverModel where
+  β_source : ℝ
+  β_target : ℝ
+  h_different : β_source ≠ β_target
+
 /-- **Effect turnover is NOT recoverable without target-population data.**
     If true effects change between populations, the source GWAS provides
     no information about the new effects. Only target GWAS data helps. -/
-theorem effect_turnover_requires_target_data
-    (β_source β_target : ℝ)
-    (h_different : β_source ≠ β_target) :
+theorem effect_turnover_requires_target_data (m : EffectTurnoverModel) :
     -- Any prediction using β_source has nonzero error for β_target
-    ∀ y : ℝ, β_source * y ≠ β_target * y ∨ y = 0 := by
+    ∀ y : ℝ, m.β_source * y ≠ m.β_target * y ∨ y = 0 := by
   intro y
   by_cases hy : y = 0
   · right; exact hy
-  · left; intro h; exact h_different (mul_right_cancel₀ hy h)
+  · left; intro h; exact m.h_different (mul_right_cancel₀ hy h)
 
 end RecoverablePortability
 
