@@ -727,6 +727,12 @@ theorem bottleneck_worsens_portability
     fst_mismatch < fst_mismatch + bottleneckExcessLD Ne_b Ne_stable t_b := by
   linarith [bottleneck_excess_ld_pos Ne_b Ne_stable t_b hNb hNs h_bottle ht]
 
+noncomputable def targetR2_stable (R2_source fst : ℝ) : ℝ :=
+  R2_source * (1 - fst)
+
+noncomputable def targetR2_bottleneck (R2_source fst Ne_b Ne_stable : ℝ) (t_b : ℕ) : ℝ :=
+  R2_source * ((1 - fst) - bottleneckExcessLD Ne_b Ne_stable t_b)
+
 /-- **Portability ratio under bottleneck** is strictly worse than under stable demography.
     Derived: portability ∝ (1 - Fst) for stable populations. For bottlenecked populations,
     portability ∝ (1 - Fst) · (1 - excessLD_correction). Since bottleneckExcessLD > 0,
@@ -738,10 +744,9 @@ theorem bottleneck_reduces_portability_ratio
     (hR2 : 0 < R2_source)
     (hNb : 2 < Ne_b) (hNs : 2 < Ne_stable) (h_bottle : Ne_b < Ne_stable)
     (ht : 0 < t_b)
-    (hfst : 0 ≤ fst) (hfst1 : fst < 1)
-    (h_pen_bound : bottleneckExcessLD Ne_b Ne_stable t_b < 1 - fst) :
-    R2_source * ((1 - fst) - bottleneckExcessLD Ne_b Ne_stable t_b) <
-    R2_source * (1 - fst) := by
+    (hfst : 0 ≤ fst) (hfst1 : fst < 1) :
+    targetR2_bottleneck R2_source fst Ne_b Ne_stable t_b < targetR2_stable R2_source fst := by
+  unfold targetR2_bottleneck targetR2_stable
   apply mul_lt_mul_of_pos_left _ hR2
   linarith [bottleneck_excess_ld_pos Ne_b Ne_stable t_b hNb hNs h_bottle ht]
 
