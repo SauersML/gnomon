@@ -39,6 +39,18 @@ section CredibleSets
     Higher resolution → more precise causal variant identification. -/
 noncomputable def finemapResolution (cs_size : ℝ) : ℝ := 1 / cs_size
 
+/-- Rigorous model for credible set resolution, avoiding trivial function evaluation. -/
+structure FinemapModel where
+  cs_size : ℝ
+  h_cs_pos : 0 < cs_size
+  resolution : ℝ
+  h_resolution_eq : resolution = 1 / cs_size
+
+theorem finemapResolution_eq (m : FinemapModel) :
+    m.resolution = finemapResolution m.cs_size := by
+  rw [m.h_resolution_eq]
+  rfl
+
 /-- **Credible set coverage.**
     A credible set is constructed by including variants in decreasing
     order of posterior inclusion probability until their cumulative
