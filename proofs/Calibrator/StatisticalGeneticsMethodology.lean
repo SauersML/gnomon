@@ -224,10 +224,26 @@ noncomputable def zScore (beta se : ℝ) : ℝ := beta / se
     This can differ from the reported GWAS n. -/
 noncomputable def effectiveSampleSizeSE (se : ℝ) : ℝ := 1 / se ^ 2
 
+/-- Formal structure for effective sample size from SE.
+    Replaces vacuous standalone definition. -/
+structure EffectiveSampleSizeSEModel where
+  se : ℝ
+  h_pos : 0 < se
+  n_eff : ℝ
+  h_n_eff_eq : n_eff = 1 / se ^ 2
+
+/-- Compatibility theorem linking the structure to the original definition. -/
+theorem effectiveSampleSizeSEModel_eq (m : EffectiveSampleSizeSEModel) :
+    m.n_eff = effectiveSampleSizeSE m.se := by
+  rw [m.h_n_eff_eq]
+  rfl
+
 /-- Effective sample size is positive. -/
-theorem effective_n_pos (se : ℝ) (h_se : 0 < se) :
-    0 < effectiveSampleSizeSE se := by
+theorem effective_n_pos (m : EffectiveSampleSizeSEModel) :
+    0 < m.n_eff := by
+  rw [effectiveSampleSizeSEModel_eq m]
   unfold effectiveSampleSizeSE
+  have h_se := m.h_pos
   exact div_pos one_pos (sq_pos_of_pos h_se)
 
 /- **Multi-ancestry meta-analysis of summary statistics.**
