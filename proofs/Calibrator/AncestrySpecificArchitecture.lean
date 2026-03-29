@@ -219,10 +219,19 @@ theorem gwas_h2_le_true (h2_true avg_r2_tag : ℝ)
     Source LD is tagged better in source-derived GWAS than target LD.
     This creates a technical portability artifact. -/
 theorem tagging_creates_portability_artifact
-    (h2_source_gwas h2_target_gwas h2_true : ℝ)
-    (h_source_better : h2_target_gwas < h2_source_gwas)
-    (h_true : h2_source_gwas ≤ h2_true) :
-    h2_target_gwas < h2_true := by linarith
+    (h2_true r2_tag_source r2_tag_target : ℝ)
+    (h_h2_pos : 0 < h2_true)
+    (h_tag_better : r2_tag_target < r2_tag_source)
+    (h_source_le : r2_tag_source ≤ 1) :
+    gwasHeritability h2_true r2_tag_target < gwasHeritability h2_true r2_tag_source ∧
+    gwasHeritability h2_true r2_tag_source ≤ h2_true := by
+  unfold gwasHeritability
+  constructor
+  · exact mul_lt_mul_of_pos_left h_tag_better h_h2_pos
+  · have h_le : h2_true * r2_tag_source ≤ h2_true * 1 :=
+      mul_le_mul_of_nonneg_left h_source_le (le_of_lt h_h2_pos)
+    rw [mul_one] at h_le
+    exact h_le
 
 end LDTagging
 
@@ -368,16 +377,6 @@ theorem fst_decreases_with_migration (m₁ m₂ Ne : ℝ)
   rw [div_lt_div_iff₀ (by nlinarith) (by nlinarith)]
   nlinarith
 
-/-- **Shared selection homogenizes architecture.**
-    If both populations experience the same selective pressure
-    (e.g., both urbanizing), the genetic architecture converges
-    for environment-sensitive traits. -/
-theorem shared_selection_improves_portability
-    (rg_before rg_after : ℝ)
-    (h_improves : rg_before < rg_after)
-    (h_le : rg_after ≤ 1) :
-    rg_before < 1 := by linarith
-
 /-!
 ### Derivation: portabilityFromArchitecture = rg² × (1 - Fst) × tagging_ratio
 
@@ -451,6 +450,28 @@ theorem portabilityFromArchitecture_eq_rg_sq_mul_retention
       rg^2 * covarianceRetention (freqCorrFromFst fst) (ldOverlapFromSharedLD tagging_ratio) := by
   unfold portabilityFromArchitecture covarianceRetention freqCorrFromFst ldOverlapFromSharedLD
   ring
+
+/-- **Shared selection homogenizes architecture.**
+    If both populations experience the same selective pressure
+    (e.g., both urbanizing), the genetic architecture converges
+    for environment-sensitive traits, improving portability. -/
+theorem shared_selection_improves_portability
+    (rg_before rg_after fst tagging_ratio : ℝ)
+    (h_fst : fst < 1)
+    (h_tag_pos : 0 < tagging_ratio)
+    (h_rg_nonneg : 0 ≤ rg_before)
+    (h_improves : rg_before < rg_after) :
+    portabilityFromArchitecture rg_before fst tagging_ratio <
+    portabilityFromArchitecture rg_after fst tagging_ratio := by
+  unfold portabilityFromArchitecture
+  have h_rg_sq : rg_before ^ 2 < rg_after ^ 2 :=
+    sq_lt_sq.mpr (by
+      rw [abs_of_nonneg h_rg_nonneg, abs_of_pos (lt_of_le_of_lt h_rg_nonneg h_improves)]
+      exact h_improves)
+  have h_fst_pos : 0 < 1 - fst := sub_pos.mpr h_fst
+  have h_step1 : rg_before ^ 2 * (1 - fst) < rg_after ^ 2 * (1 - fst) :=
+    mul_lt_mul_of_pos_right h_rg_sq h_fst_pos
+  exact mul_lt_mul_of_pos_right h_step1 h_tag_pos
 
 /-- **Portability equals rg² × (1 - divergence), where divergence is derived.**
     covarianceDivergenceFromRetention fst tagging = 1 - (1-fst)×tagging,
