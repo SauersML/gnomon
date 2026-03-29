@@ -380,36 +380,84 @@ end Question4
 
 section Question5
 
+/-- **Winner's curse model structure.**
+    Formalizes the relationship between true effects, inflated estimates,
+    and allelic turnover across populations. -/
+structure WinnersCurseModel where
+  /-- True causal effect -/
+  β_true : ℝ
+  /-- Inflation due to winner's curse -/
+  δ : ℝ
+  /-- Turnover factor in target population -/
+  ρ : ℝ
+  β_pos : 0 < β_true
+  δ_pos : 0 < δ
+  ρ_pos : 0 < ρ
+  ρ_le_one : ρ ≤ 1
+
+/-- GWAS estimate with inflation -/
+noncomputable def WinnersCurseModel.β_hat (m : WinnersCurseModel) : ℝ :=
+  m.β_true + m.δ
+
+/-- Target population effect with turnover -/
+noncomputable def WinnersCurseModel.β_t (m : WinnersCurseModel) : ℝ :=
+  m.ρ * m.β_true
+
+/-- Prediction error -/
+noncomputable def WinnersCurseModel.pred_error (m : WinnersCurseModel) : ℝ :=
+  m.β_hat - m.β_t
+
 /-- **Winner's curse prediction error model.**
-    GWAS estimate β_hat = β_true + δ (inflation).
-    Target effect β_t = ρ * β_true (turnover).
-    Prediction error = β_hat - β_t = (1-ρ)*β + δ.
     Prediction error decomposes into turnover + inflation. -/
-theorem prediction_error_decomp (β δ ρ : ℝ) :
-    (β + δ) - ρ * β = (1 - ρ) * β + δ := by ring
+theorem prediction_error_decomp (m : WinnersCurseModel) :
+    m.pred_error = (1 - m.ρ) * m.β_true + m.δ := by
+  unfold WinnersCurseModel.pred_error WinnersCurseModel.β_hat WinnersCurseModel.β_t
+  ring
 
 /-- Prediction error is positive when both components are positive. -/
-theorem prediction_error_positive
-    (β δ ρ : ℝ) (hβ : 0 < β) (hδ : 0 < δ) (hρ : ρ ≤ 1) :
-    0 < (1 - ρ) * β + δ := by
-  have : 0 ≤ (1 - ρ) * β := mul_nonneg (by linarith) (le_of_lt hβ)
-  linarith
+theorem prediction_error_positive (m : WinnersCurseModel) :
+    0 < m.pred_error := by
+  rw [prediction_error_decomp m]
+  have : 0 ≤ (1 - m.ρ) * m.β_true := mul_nonneg (by linarith [m.ρ_le_one]) (le_of_lt m.β_pos)
+  linarith [m.δ_pos]
+
+/-- Relative prediction error -/
+noncomputable def WinnersCurseModel.rel_error (m : WinnersCurseModel) : ℝ :=
+  m.pred_error / m.β_t
 
 /-- **Winner's curse is worse with more turnover.**
-    Relative error = ((1-ρ)β + δ) / (ρβ). As ρ↓, this increases. -/
+    As ρ↓, relative error increases. -/
 theorem relative_error_increases_with_turnover
-    (β δ ρ₁ ρ₂ : ℝ) (hβ : 0 < β) (hδ : 0 < δ)
-    (hρ₁ : 0 < ρ₁) (hρ₂ : 0 < ρ₂) (hρ : ρ₂ < ρ₁) (_hρ₁_le : ρ₁ ≤ 1) :
-    ((1 - ρ₁) * β + δ) / (ρ₁ * β) < ((1 - ρ₂) * β + δ) / (ρ₂ * β) := by
-  rw [div_lt_div_iff₀ (mul_pos hρ₁ hβ) (mul_pos hρ₂ hβ)]
-  nlinarith [sq_nonneg β, sq_nonneg δ, mul_pos hρ₁ hβ, mul_pos hρ₂ hβ,
-             mul_pos hβ hδ, mul_pos hρ₁ hδ, mul_pos hρ₂ hδ]
+    (m₁ m₂ : WinnersCurseModel)
+    (h_beta : m₁.β_true = m₂.β_true)
+    (h_delta : m₁.δ = m₂.δ)
+    (h_turnover : m₂.ρ < m₁.ρ) :
+    m₁.rel_error < m₂.rel_error := by
+  unfold WinnersCurseModel.rel_error WinnersCurseModel.pred_error
+  unfold WinnersCurseModel.β_hat WinnersCurseModel.β_t
+  rw [h_beta, h_delta]
+  have h_rho1_pos : 0 < m₁.ρ := m₁.ρ_pos
+  have h_rho2_pos : 0 < m₂.ρ := m₂.ρ_pos
+  have h_beta2_pos : 0 < m₂.β_true := m₂.β_pos
+  have h_delta2_pos : 0 < m₂.δ := m₂.δ_pos
+  have h_denom1 : 0 < m₁.ρ * m₂.β_true := mul_pos h_rho1_pos h_beta2_pos
+  have h_denom2 : 0 < m₂.ρ * m₂.β_true := mul_pos h_rho2_pos h_beta2_pos
+  rw [div_lt_div_iff₀ h_denom1 h_denom2]
+  nlinarith [sq_nonneg m₂.β_true, sq_nonneg m₂.δ, h_denom1, h_denom2,
+             mul_pos h_beta2_pos h_delta2_pos, mul_pos h_rho1_pos h_delta2_pos, mul_pos h_rho2_pos h_delta2_pos]
+
+/-- Structure for tracking heterozygosity at a single locus -/
+structure LocusHetModel where
+  beta_sq : ℝ
+  H_s : ℝ
+  H_t : ℝ
+  beta_pos : 0 < beta_sq
 
 /-- **Heterozygosity increase → PGS variance increase at a single locus.** -/
 theorem het_increase_implies_locus_var_increase
-    (beta_sq H_s H_t : ℝ) (hβ : 0 < beta_sq) (hH : H_s < H_t) :
-    beta_sq * H_s < beta_sq * H_t := by
-  exact mul_lt_mul_of_pos_left hH hβ
+    (m : LocusHetModel) (hH : m.H_s < m.H_t) :
+    m.beta_sq * m.H_s < m.beta_sq * m.H_t := by
+  exact mul_lt_mul_of_pos_left hH m.beta_pos
 
 end Question5
 
