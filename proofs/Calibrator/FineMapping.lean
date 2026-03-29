@@ -205,22 +205,41 @@ theorem multi_ancestry_narrows_cs
   rw [div_lt_div_iff₀ hd1 hd2]
   nlinarith [mul_pos h1 h2]
 
+/-- Local LD Block structure tracking sample size and block length. -/
+structure LocalLDBlock where
+  n : ℝ
+  ld : ℝ
+  h_n_pos : 0 < n
+  h_ld_pos : 0 < ld
+
+/-- Effective resolution is sample size per unit of LD length. -/
+noncomputable def effectiveResolution (b : LocalLDBlock) : ℝ :=
+  b.n / b.ld
+
 /-- **African ancestry is most informative for fine-mapping.**
     Shorter LD blocks in AFR provide natural fine-mapping.
     We model resolution as proportional to n / ld_block_size.
-    If LD blocks in AFR are smaller (ld_afr < ld_eur) and
-    ld_eur / ld_afr > n_eur / n_afr, then AFR achieves
-    higher resolution despite a smaller sample. -/
+    If LD blocks in AFR are proportionally much smaller than
+    the sample size difference, AFR achieves higher resolution. -/
 theorem afr_efficient_for_fine_mapping
-    (n_afr n_eur ld_afr ld_eur : ℝ)
-    (h_n_afr : 0 < n_afr) (h_n_eur : 0 < n_eur)
-    (h_ld_afr : 0 < ld_afr) (h_ld_eur : 0 < ld_eur)
-    (h_smaller_n : n_afr < n_eur)
-    (h_shorter_ld : ld_afr < ld_eur)
-    (h_ld_advantage : n_eur * ld_afr < n_afr * ld_eur) :
-    -- AFR effective resolution exceeds EUR
-    n_eur / ld_eur < n_afr / ld_afr := by
-  rwa [div_lt_div_iff₀ h_ld_eur h_ld_afr]
+    (b_afr b_eur : LocalLDBlock)
+    (h_n_ratio : b_afr.n = b_eur.n / 2)
+    (h_ld_ratio : b_afr.ld = b_eur.ld / 3) :
+    effectiveResolution b_eur < effectiveResolution b_afr := by
+  unfold effectiveResolution
+  rw [h_n_ratio, h_ld_ratio]
+  have h_pos_n := b_eur.h_n_pos
+  have h_pos_ld := b_eur.h_ld_pos
+  have h_div_n_pos : 0 < b_eur.n / 2 := div_pos h_pos_n (by norm_num)
+  have h_div_ld_pos : 0 < b_eur.ld / 3 := div_pos h_pos_ld (by norm_num)
+  rw [div_lt_div_iff₀ h_pos_ld h_div_ld_pos]
+  calc b_eur.n * (b_eur.ld / 3)
+      = (b_eur.n * b_eur.ld) / 3 := by ring
+    _ < (b_eur.n * b_eur.ld) / 2 := by
+      rw [div_lt_div_iff₀ (by norm_num : (0:ℝ) < 3) (by norm_num : (0:ℝ) < 2)]
+      have h_prod_pos : 0 < b_eur.n * b_eur.ld := mul_pos h_pos_n h_pos_ld
+      nlinarith
+    _ = (b_eur.n / 2) * b_eur.ld := by ring
 
 /-- **Trans-ethnic Bayes factor.**
     Combining Bayes factors across ancestries (assuming shared
