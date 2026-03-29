@@ -211,6 +211,24 @@ theorem cross_better_when_bias_dominates
     mrMSE bias_cross var_cross < mrMSE bias_same var_same := by
   unfold mrMSE; linarith
 
+/-- Formal structure for MR Design to avoid vacuous specification gaming. -/
+structure MRDesign where
+  bias : ℝ
+  variance : ℝ
+
+noncomputable def MRDesign.mse (d : MRDesign) : ℝ :=
+  mrMSE d.bias d.variance
+
+/-- Structural version: Cross-ancestry MR is preferred when structural bias reduction
+dominates the variance penalty. -/
+theorem cross_ancestry_optimal_of_structural_parameters
+    (same cross : MRDesign)
+    (h_var_nn : 0 ≤ same.variance)
+    (h_bias_dominates : same.bias ^ 2 - cross.bias ^ 2 > cross.variance - same.variance) :
+    cross.mse < same.mse := by
+  unfold MRDesign.mse mrMSE
+  linarith
+
 /- **IVW estimator for multiple instruments.**
     β_IVW = Σ w_j β_j / Σ w_j
     where w_j = 1/σ²_j and β_j are individual Wald ratios.
@@ -264,6 +282,32 @@ theorem valid_iv_ld_invariant
       waldRatio (beta_causal * beta_ZX_afr) beta_ZX_afr := by
   unfold waldRatio
   rw [mul_div_cancel_right₀ _ h_ZX_eur, mul_div_cancel_right₀ _ h_ZX_afr]
+
+/-- Formal structure for an Instrumental Variable -/
+structure InstrumentalVariable where
+  causal_effect : ℝ
+  first_stage : ℝ
+  reduced_form : ℝ
+
+/-- A valid instrumental variable requires the reduced form to equal the causal effect times the first stage -/
+def InstrumentalVariable.IsValid (iv : InstrumentalVariable) : Prop :=
+  iv.reduced_form = iv.causal_effect * iv.first_stage
+
+/-- Structural version of LD invariance for valid IVs. -/
+theorem valid_iv_ld_invariant_struct
+    (iv_eur iv_afr : InstrumentalVariable)
+    (h_same_causal : iv_eur.causal_effect = iv_afr.causal_effect)
+    (h_fs_eur : iv_eur.first_stage ≠ 0)
+    (h_fs_afr : iv_afr.first_stage ≠ 0)
+    (h_valid_eur : iv_eur.IsValid)
+    (h_valid_afr : iv_afr.IsValid) :
+    waldRatio iv_eur.reduced_form iv_eur.first_stage =
+    waldRatio iv_afr.reduced_form iv_afr.first_stage := by
+  unfold InstrumentalVariable.IsValid at h_valid_eur h_valid_afr
+  unfold waldRatio
+  rw [h_valid_eur, h_valid_afr]
+  rw [mul_div_cancel_right₀ _ h_fs_eur, mul_div_cancel_right₀ _ h_fs_afr]
+  exact h_same_causal
 
 /-- **Bidirectional MR for GxE.**
     MR can test whether environmental factors mediate the
@@ -332,6 +376,25 @@ theorem berkson_paradox_ancestry_specific
     (h_diff_bias : bias_eur ≠ bias_afr) :
     beta_population + bias_eur ≠ beta_population + bias_afr := by
   intro h; exact h_diff_bias (by linarith)
+
+/-- Formal structure for collider selection in biobanks. -/
+structure ColliderSelectionModel where
+  beta_population : ℝ
+  selection_bias : ℝ
+
+noncomputable def ColliderSelectionModel.observed_beta (m : ColliderSelectionModel) : ℝ :=
+  m.beta_population + m.selection_bias
+
+/-- Structural version of Berkson's paradox: different selection bias produces different observed betas. -/
+theorem berkson_paradox_structural
+    (model_eur model_afr : ColliderSelectionModel)
+    (h_same_pop_effect : model_eur.beta_population = model_afr.beta_population)
+    (h_diff_bias : model_eur.selection_bias ≠ model_afr.selection_bias) :
+    model_eur.observed_beta ≠ model_afr.observed_beta := by
+  unfold ColliderSelectionModel.observed_beta
+  rw [h_same_pop_effect]
+  intro h
+  exact h_diff_bias (by linarith)
 
 end ColliderBias
 
