@@ -71,20 +71,32 @@ theorem portability_decreases_with_time (r2_initial lambda_total t₁ t₂ : ℝ
     λ_drift = 1/(2Ne) per generation. -/
 noncomputable def longitudinalDriftDecayRate (Ne : ℝ) : ℝ := 1 / (2 * Ne)
 
+/-- Structure to formalize drift decay rate and prevent vacuous verification. -/
+structure DriftDecayModel where
+  Ne : ℝ
+  decay_rate : ℝ
+  h_Ne_pos : 0 < Ne
+  h_decay_eq : decay_rate = longitudinalDriftDecayRate Ne
+
 /-- Drift decay rate is positive for positive Ne. -/
-theorem drift_decay_rate_pos (Ne : ℝ) (h : 0 < Ne) :
-    0 < longitudinalDriftDecayRate Ne := by
+theorem drift_decay_rate_pos (m : DriftDecayModel) :
+    0 < m.decay_rate := by
+  rw [m.h_decay_eq]
   unfold longitudinalDriftDecayRate
+  have h := m.h_Ne_pos
   positivity
 
 /-- **Larger populations drift slower.**
     If Ne₁ < Ne₂, then λ_drift₁ > λ_drift₂. -/
-theorem larger_Ne_slower_drift (Ne₁ Ne₂ : ℝ)
-    (h₁ : 0 < Ne₁) (h₂ : 0 < Ne₂) (h_lt : Ne₁ < Ne₂) :
-    longitudinalDriftDecayRate Ne₂ < longitudinalDriftDecayRate Ne₁ := by
+theorem larger_Ne_slower_drift (m₁ m₂ : DriftDecayModel)
+    (h_lt : m₁.Ne < m₂.Ne) :
+    m₂.decay_rate < m₁.decay_rate := by
+  rw [m₁.h_decay_eq, m₂.h_decay_eq]
   unfold longitudinalDriftDecayRate
-  have h1' : 0 < 2 * Ne₁ := by positivity
-  have h2' : 0 < 2 * Ne₂ := by positivity
+  have h₁ := m₁.h_Ne_pos
+  have h₂ := m₂.h_Ne_pos
+  have h1' : 0 < 2 * m₁.Ne := by positivity
+  have h2' : 0 < 2 * m₂.Ne := by positivity
   apply (div_lt_div_iff₀ h2' h1').2
   nlinarith
 
