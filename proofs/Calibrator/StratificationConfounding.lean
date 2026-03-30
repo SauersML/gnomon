@@ -518,12 +518,15 @@ theorem survivorship_attenuates_in_older (m : SurvivorshipAttenuationModel) :
     If the target population has different age structure or mortality patterns,
     survivorship bias contributes to apparent portability loss. -/
 theorem differential_survivorship_artifact
-    (r2_source_full r2_target_full Δ_surv_source Δ_surv_target : ℝ)
-    (h_surv_s : 0 ≤ Δ_surv_source) (h_surv_t : 0 ≤ Δ_surv_target)
-    (h_diff : Δ_surv_target > Δ_surv_source)
-    (h_obs_s : r2_source_full - Δ_surv_source > 0) :
-    (r2_source_full - Δ_surv_source) - (r2_target_full - Δ_surv_target) >
-      r2_source_full - r2_target_full := by
+    (m_source m_target : SurvivorshipAttenuationModel)
+    (h_same_birth_r2 : m_source.r2_full = m_target.r2_full)
+    (h_target_more_truncated : m_target.var_surv / m_target.var_birth < m_source.var_surv / m_source.var_birth) :
+    m_source.r2_surv - m_target.r2_surv > m_source.r2_full - m_target.r2_full := by
+  unfold SurvivorshipAttenuationModel.r2_surv
+  rw [h_same_birth_r2]
+  have h_r2_pos : 0 < m_target.r2_full := m_target.r2_full_pos
+  have h_lt : m_target.r2_full * (m_target.var_surv / m_target.var_birth) < m_target.r2_full * (m_source.var_surv / m_source.var_birth) := by
+    exact mul_lt_mul_of_pos_left h_target_more_truncated h_r2_pos
   linarith
 
 end SurvivorshipBias
@@ -698,30 +701,45 @@ theorem instrument_strength_decreases (m : MRInstrumentModel)
   apply mul_lt_mul_of_pos_left h_het
   exact mul_pos m.n_pos (sq_pos_of_ne_zero m.β_inst_ne)
 
+/-- Model for weak instrument bias in Mendelian Randomization. -/
+structure WeakInstrumentBiasModel where
+  conf_bias : ℝ
+  F₁ : ℝ
+  F₂ : ℝ
+  h_conf : 0 < conf_bias
+  h_F₁ : 1 < F₁
+  h_F₂ : 1 < F₂
+  h_weaker : F₂ < F₁
+
 /-- **Weak instrument bias in MR.**
     Bias = (1 - 1/F) × confounding bias.
     As F decreases (weaker instrument), bias increases toward the
     confounded OLS estimate. -/
 theorem weak_instrument_bias_increases
-    (conf_bias : ℝ) (F₁ F₂ : ℝ)
-    (h_conf : 0 < conf_bias)
-    (h_F₁ : 1 < F₁) (h_F₂ : 1 < F₂)
-    (h_weaker : F₂ < F₁) :
-    (1 - 1/F₂) * conf_bias < (1 - 1/F₁) * conf_bias := by
-  apply mul_lt_mul_of_pos_right _ h_conf
-  have h1 : 1/F₁ < 1/F₂ := by
-    rw [div_lt_div_iff₀ (by linarith) (by linarith)]
-    linarith
+    (m : WeakInstrumentBiasModel) :
+    (1 - 1/m.F₂) * m.conf_bias < (1 - 1/m.F₁) * m.conf_bias := by
+  apply mul_lt_mul_of_pos_right _ m.h_conf
+  have h1 : 1/m.F₁ < 1/m.F₂ := by
+    rw [div_lt_div_iff₀ (by linarith [m.h_F₁]) (by linarith [m.h_F₂])]
+    linarith [m.h_weaker]
   linarith
+
+/-- Model for Mendelian Randomization with horizontal pleiotropy across populations. -/
+structure PleiotropyModel where
+  β_causal : ℝ
+  α_pleio_source : ℝ
+  α_pleio_target : ℝ
+  h_diff : α_pleio_source ≠ α_pleio_target
 
 /-- **Horizontal pleiotropy patterns differ across populations.**
     If pleiotropic effects change across populations (due to different
     LD patterns or gene regulation), MR estimates are not portable. -/
 theorem pleiotropy_changes_invalidate_mr
-    (β_causal α_pleio_source α_pleio_target : ℝ)
-    (h_diff : α_pleio_source ≠ α_pleio_target) :
-    β_causal + α_pleio_source ≠ β_causal + α_pleio_target := by
-  intro h; exact h_diff (by linarith)
+    (m : PleiotropyModel) :
+    m.β_causal + m.α_pleio_source ≠ m.β_causal + m.α_pleio_target := by
+  intro h
+  have : m.α_pleio_source = m.α_pleio_target := by linarith
+  exact m.h_diff this
 
 end MRPortability
 
@@ -753,21 +771,42 @@ theorem r2_estimator_variance_pos (r2 : ℝ) (n : ℕ)
     · exact sq_pos_of_pos (by linarith)
   · exact Nat.cast_pos.mpr h_n
 
+/-- Model for statistical power to detect portability differences. -/
+structure PortabilityPowerModel where
+  var₁ : ℝ
+  var₂ : ℝ
+  Δr2 : ℝ
+  z_sum : ℝ
+  n₁ : ℝ
+  n₂ : ℝ
+  h_var : 0 < var₁ + var₂
+  h_Δ : 0 < Δr2
+  h_z : 0 < z_sum
+  h_n : n₁ < n₂
+  h_n₁ : 0 < n₁
+
 /-- **Power to detect portability difference.**
     To detect ΔR² = R²_source - R²_target at power 1-β with significance α,
     need n ≈ (z_α + z_β)² × (Var₁ + Var₂) / ΔR²². -/
 theorem larger_sample_more_power
-    (var₁ var₂ Δr2 z_sum n₁ n₂ : ℝ)
-    (h_var : 0 < var₁ + var₂) (h_Δ : 0 < Δr2)
-    (h_z : 0 < z_sum)
-    (h_n : n₁ < n₂) (h_n₁ : 0 < n₁) :
+    (m : PortabilityPowerModel) :
     -- Larger sample → smaller required effect size (more power)
-    z_sum * Real.sqrt ((var₁ + var₂) / n₂) <
-      z_sum * Real.sqrt ((var₁ + var₂) / n₁) := by
-  apply mul_lt_mul_of_pos_left _ h_z
+    m.z_sum * Real.sqrt ((m.var₁ + m.var₂) / m.n₂) <
+      m.z_sum * Real.sqrt ((m.var₁ + m.var₂) / m.n₁) := by
+  apply mul_lt_mul_of_pos_left _ m.h_z
   apply Real.sqrt_lt_sqrt
-  · exact div_nonneg (le_of_lt h_var) (le_of_lt (by linarith : 0 < n₂))
-  · exact div_lt_div_of_pos_left h_var h_n₁ h_n
+  · exact div_nonneg (le_of_lt m.h_var) (le_of_lt (by linarith [m.h_n, m.h_n₁] : 0 < m.n₂))
+  · exact div_lt_div_of_pos_left m.h_var m.h_n₁ m.h_n
+
+/-- Model for detecting portability differences requiring large samples. -/
+structure PowerModel where
+  r2_effect : ℝ
+  ub : ℝ
+  n_required : ℝ
+  h_small : r2_effect ≤ ub
+  h_ub_pos : 0 < ub
+  h_formula : n_required ≥ 1 / r2_effect
+  h_effect_pos : 0 < r2_effect
 
 /-- **Small portability differences require large samples.**
     When R² of the distance-on-error relationship is small, enormous
@@ -776,14 +815,11 @@ theorem larger_sample_more_power
     Worked example: Wang et al.'s finding of R² ≈ 0.5% for
     distance-on-error illustrates this. -/
 theorem small_effect_needs_large_n
-    (r2_effect n_required ub : ℝ)
-    (h_small : r2_effect ≤ ub) (h_ub_pos : 0 < ub)
-    (h_formula : n_required ≥ 1 / r2_effect)
-    (h_effect_pos : 0 < r2_effect) :
-    n_required ≥ 1 / ub := by
-  calc n_required ≥ 1 / r2_effect := h_formula
-    _ ≥ 1 / ub := by
-        exact div_le_div_of_nonneg_left (le_of_lt one_pos) h_effect_pos h_small
+    (m : PowerModel) :
+    m.n_required ≥ 1 / m.ub := by
+  calc m.n_required ≥ 1 / m.r2_effect := m.h_formula
+    _ ≥ 1 / m.ub := by
+        exact div_le_div_of_nonneg_left (le_of_lt one_pos) m.h_effect_pos m.h_small
 
 end PowerAnalysis
 
