@@ -58,6 +58,44 @@ theorem credible_set_coverage
     0 < ∑ i ∈ S, pip i := by
   linarith
 
+/-- **Formal Model of Credible Set Size.**
+    Models the credible set size as a function of LD radius and sample size.
+    With more power (larger sample size), the credible set shrinks. -/
+structure CredibleSetModel where
+  sample_size : ℝ
+  ld_radius : ℝ
+  cs_size : ℝ
+  h_n_pos : 0 < sample_size
+  h_ld_pos : 0 < ld_radius
+  h_cs_eq : cs_size = ld_radius / sample_size
+
+/-- **Credible set size inversely related to power (Formalized).**
+    With more power (larger n), the posterior concentrates on fewer variants,
+    yielding a strictly smaller credible set and higher resolution. -/
+theorem credible_set_shrinks_with_power_model
+    (m_small m_large : CredibleSetModel)
+    (h_same_ld : m_small.ld_radius = m_large.ld_radius)
+    (h_more_power : m_small.sample_size < m_large.sample_size) :
+    m_large.cs_size / m_small.cs_size < 1 ∧
+    finemapResolution m_small.cs_size < finemapResolution m_large.cs_size := by
+  have hs1 : m_small.cs_size = m_small.ld_radius / m_small.sample_size := m_small.h_cs_eq
+  have hl1 : m_large.cs_size = m_large.ld_radius / m_large.sample_size := m_large.h_cs_eq
+  have hp1 : 0 < m_small.sample_size := m_small.h_n_pos
+  have hp2 : 0 < m_large.sample_size := m_large.h_n_pos
+  have hld : 0 < m_small.ld_radius := m_small.h_ld_pos
+  have hld2 : 0 < m_large.ld_radius := m_large.h_ld_pos
+  rw [hs1, hl1]
+  unfold finemapResolution
+  constructor
+  · rw [h_same_ld]
+    have h1 : 0 < m_large.ld_radius / m_small.sample_size := div_pos hld2 hp1
+    rw [div_lt_one h1]
+    exact div_lt_div_of_pos_left hld2 hp1 h_more_power
+  · rw [one_div, one_div]
+    rw [h_same_ld]
+    rw [inv_lt_inv₀ (div_pos hld2 hp1) (div_pos hld2 hp2)]
+    exact div_lt_div_of_pos_left hld2 hp1 h_more_power
+
 /-- **Credible set size inversely related to power.**
     With more power (larger n), the posterior concentrates on
     fewer variants → smaller credible sets.
