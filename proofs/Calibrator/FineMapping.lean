@@ -39,6 +39,12 @@ section CredibleSets
     Higher resolution → more precise causal variant identification. -/
 noncomputable def finemapResolution (cs_size : ℝ) : ℝ := 1 / cs_size
 
+structure FinemapResolutionModel where
+  cs_size : ℝ
+  resolution : ℝ
+  h_cs_pos : 0 < cs_size
+  h_eq : resolution = finemapResolution cs_size
+
 /-- **Credible set coverage.**
     A credible set is constructed by including variants in decreasing
     order of posterior inclusion probability until their cumulative
@@ -67,16 +73,18 @@ theorem credible_set_coverage
     credible set (cs_large_n ≤ cs_small_n) with cs_large_n < cs_small_n,
     then the ratio of sizes is strictly less than 1. -/
 theorem credible_set_shrinks_with_power
-    (cs_small_n cs_large_n : ℝ)
-    (h_pos_large : 0 < cs_large_n)
-    (h_pos_small : 0 < cs_small_n)
-    (h_resolution : finemapResolution cs_small_n < finemapResolution cs_large_n) :
-    cs_large_n / cs_small_n < 1 := by
-  unfold finemapResolution at h_resolution
-  rw [div_lt_div_iff₀ h_pos_small h_pos_large] at h_resolution
-  simp at h_resolution
+    (m_small m_large : FinemapResolutionModel)
+    (h_resolution : m_small.resolution < m_large.resolution) :
+    m_large.cs_size / m_small.cs_size < 1 := by
+  have h_res := h_resolution
+  rw [m_small.h_eq, m_large.h_eq] at h_res
+  unfold finemapResolution at h_res
+  have h_pos_small := m_small.h_cs_pos
+  have h_pos_large := m_large.h_cs_pos
+  rw [div_lt_div_iff₀ h_pos_small h_pos_large] at h_res
+  simp at h_res
   rw [div_lt_one h_pos_small]
-  exact h_resolution
+  exact h_res
 
 /-- **LD affects credible set size.**
     In long-LD regions (EUR), credible sets are larger because
@@ -85,19 +93,26 @@ theorem credible_set_shrinks_with_power
     With shorter LD, the fine-mapping resolution is higher,
     which implies a smaller credible set. -/
 theorem shorter_ld_smaller_credible_sets
-    (cs_eur cs_afr : ℝ)
-    (h_eur_pos : 0 < cs_eur) (h_afr_pos : 0 < cs_afr)
-    (h_higher_res : finemapResolution cs_eur < finemapResolution cs_afr) :
-    cs_afr < cs_eur := by
-  unfold finemapResolution at h_higher_res
-  rw [div_lt_div_iff₀ h_eur_pos h_afr_pos] at h_higher_res
+    (m_eur m_afr : FinemapResolutionModel)
+    (h_higher_res : m_eur.resolution < m_afr.resolution) :
+    m_afr.cs_size < m_eur.cs_size := by
+  have h_res := h_higher_res
+  rw [m_eur.h_eq, m_afr.h_eq] at h_res
+  unfold finemapResolution at h_res
+  have h_eur_pos := m_eur.h_cs_pos
+  have h_afr_pos := m_afr.h_cs_pos
+  rw [div_lt_div_iff₀ h_eur_pos h_afr_pos] at h_res
   linarith
 
 /-- Higher resolution with smaller credible sets. -/
-theorem smaller_cs_higher_resolution (cs₁ cs₂ : ℝ)
-    (h₁ : 0 < cs₁) (h₂ : 0 < cs₂) (h_smaller : cs₁ < cs₂) :
-    finemapResolution cs₂ < finemapResolution cs₁ := by
+theorem smaller_cs_higher_resolution
+    (m₁ m₂ : FinemapResolutionModel)
+    (h_smaller : m₁.cs_size < m₂.cs_size) :
+    m₂.resolution < m₁.resolution := by
+  rw [m₁.h_eq, m₂.h_eq]
   unfold finemapResolution
+  have h₁ := m₁.h_cs_pos
+  have h₂ := m₂.h_cs_pos
   exact div_lt_div_iff_of_pos_left one_pos h₂ h₁ |>.mpr h_smaller
 
 end CredibleSets
@@ -119,6 +134,15 @@ section CausalVariantPortability
 noncomputable def proxyInflation (beta_causal r2_ld : ℝ) : ℝ :=
   beta_causal / r2_ld
 
+structure ProxyInflationModel where
+  beta_causal : ℝ
+  r2_ld : ℝ
+  inflation : ℝ
+  h_beta_pos : 0 < beta_causal
+  h_r2_pos : 0 < r2_ld
+  h_r2_lt : r2_ld < 1
+  h_eq : inflation = proxyInflation beta_causal r2_ld
+
 /-- **Causal variant PGS is more portable.**
     A proxy-based PGS inflates the causal effect by 1/r² (proxyInflation),
     and this inflation is population-specific. When the target population
@@ -128,14 +152,17 @@ noncomputable def proxyInflation (beta_causal r2_ld : ℝ) : ℝ :=
     proxy-source error. This proves the causal PGS (= β) is closer to
     the truth than the proxy PGS in the target. -/
 theorem causal_pgs_more_portable
-    (beta r2_source r2_target : ℝ)
-    (h_beta : 0 < beta)
-    (h_source_pos : 0 < r2_source) (h_source_lt : r2_source < 1)
-    (h_target_pos : 0 < r2_target) (h_target_lt : r2_target < r2_source) :
+    (m_source m_target : ProxyInflationModel)
+    (h_same_beta : m_source.beta_causal = m_target.beta_causal)
+    (h_target_lt : m_target.r2_ld < m_source.r2_ld) :
     -- The proxy inflation in target exceeds that in source
-    0 < proxyInflation beta r2_target - proxyInflation beta r2_source := by
+    0 < m_target.inflation - m_source.inflation := by
+  rw [m_source.h_eq, m_target.h_eq, h_same_beta]
   unfold proxyInflation
+  have h_source_pos := m_source.h_r2_pos
+  have h_target_pos := m_target.h_r2_pos
   rw [sub_pos, div_lt_div_iff₀ h_source_pos h_target_pos]
+  have h_beta := m_target.h_beta_pos
   nlinarith
 
 /-- **Portability with causal variants bounded by r_g.**
@@ -151,10 +178,13 @@ theorem causal_pgs_bounded_by_rg
   nlinarith
 
 /-- Proxy inflation exceeds true effect when r² < 1. -/
-theorem proxy_inflated (beta_causal r2_ld : ℝ)
-    (h_beta : 0 < beta_causal) (h_r2 : 0 < r2_ld) (h_r2_lt : r2_ld < 1) :
-    beta_causal < proxyInflation beta_causal r2_ld := by
+theorem proxy_inflated (m : ProxyInflationModel) :
+    m.beta_causal < m.inflation := by
+  rw [m.h_eq]
   unfold proxyInflation
+  have h_beta := m.h_beta_pos
+  have h_r2 := m.h_r2_pos
+  have h_r2_lt := m.h_r2_lt
   rw [lt_div_iff₀ h_r2]
   nlinarith
 
@@ -162,14 +192,19 @@ theorem proxy_inflated (beta_causal r2_ld : ℝ)
     If LD(proxy, causal) differs between source and target,
     the proxy-based PGS has different effective weights. -/
 theorem differential_proxy_inflation
-    (beta r2_source r2_target : ℝ)
-    (h_beta : 0 < beta) (h_source : 0 < r2_source) (h_target : 0 < r2_target)
-    (h_diff : r2_source ≠ r2_target) :
-    proxyInflation beta r2_source ≠ proxyInflation beta r2_target := by
+    (m_source m_target : ProxyInflationModel)
+    (h_same_beta : m_source.beta_causal = m_target.beta_causal)
+    (h_diff : m_source.r2_ld ≠ m_target.r2_ld) :
+    m_source.inflation ≠ m_target.inflation := by
+  rw [m_source.h_eq, m_target.h_eq, h_same_beta]
   unfold proxyInflation
   intro h
+  have h_source := m_source.h_r2_pos
+  have h_target := m_target.h_r2_pos
   rw [div_eq_div_iff h_source.ne' h_target.ne'] at h
-  have : r2_source = r2_target := by nlinarith
+  have : m_source.r2_ld = m_target.r2_ld := by
+    have h_beta := m_target.h_beta_pos
+    nlinarith
   exact h_diff this
 
 end CausalVariantPortability
@@ -299,19 +334,19 @@ theorem pip_shrinks_effects (pip beta : ℝ)
     inflated proxy effect, the PIP-weighted proxy is closer to the
     true causal effect than the unweighted proxy. -/
 theorem pip_pgs_more_portable
-    (beta_causal r2_ld pip : ℝ)
-    (h_beta : 0 < beta_causal)
-    (h_r2 : 0 < r2_ld) (h_r2_lt : r2_ld < 1)
-    (h_pip_nn : 0 ≤ pip) (h_pip_lt : pip < 1) :
+    (m : ProxyInflationModel) (pip : ℝ)
+    (_h_pip_nn : 0 ≤ pip) (h_pip_lt : pip < 1) :
     -- PIP-weighted proxy error < unweighted proxy error
     -- Error = |proxy_effect × weight - beta_causal|
     -- Unweighted: proxyInflation beta r2 - beta = beta/r2 - beta = beta(1-r2)/r2
     -- PIP-weighted: pip * proxyInflation beta r2 - beta
     -- We show: pip × (beta/r2) < beta/r2 (shrinkage helps)
-    pipWeightedEffect pip (proxyInflation beta_causal r2_ld) <
-      proxyInflation beta_causal r2_ld := by
+    pipWeightedEffect pip m.inflation < m.inflation := by
+  rw [m.h_eq]
   unfold pipWeightedEffect proxyInflation
-  have h_div_pos : 0 < beta_causal / r2_ld := div_pos h_beta h_r2
+  have h_beta := m.h_beta_pos
+  have h_r2 := m.h_r2_pos
+  have h_div_pos : 0 < m.beta_causal / m.r2_ld := div_pos h_beta h_r2
   nlinarith
 
 /- **SuSiE posterior for PGS.**
