@@ -34,10 +34,21 @@ contain the causal variant with high probability.
 
 section CredibleSets
 
+/-- **Credible Set Model.**
+    A formal representation of a fine-mapped credible set. -/
+structure CredibleSetModel where
+  /-- Number of variants in the credible set -/
+  size : ℝ
+  h_size_pos : 0 < size
+  /-- Coverage probability of the credible set -/
+  coverage : ℝ
+  h_cov_pos : 0 < coverage
+  h_cov_le_one : coverage ≤ 1
+
 /-- **Credible set resolution.**
     Resolution = 1 / credible_set_size.
     Higher resolution → more precise causal variant identification. -/
-noncomputable def finemapResolution (cs_size : ℝ) : ℝ := 1 / cs_size
+noncomputable def finemapResolution (m : CredibleSetModel) : ℝ := 1 / m.size
 
 /-- **Credible set coverage.**
     A credible set is constructed by including variants in decreasing
@@ -67,15 +78,13 @@ theorem credible_set_coverage
     credible set (cs_large_n ≤ cs_small_n) with cs_large_n < cs_small_n,
     then the ratio of sizes is strictly less than 1. -/
 theorem credible_set_shrinks_with_power
-    (cs_small_n cs_large_n : ℝ)
-    (h_pos_large : 0 < cs_large_n)
-    (h_pos_small : 0 < cs_small_n)
+    (cs_small_n cs_large_n : CredibleSetModel)
     (h_resolution : finemapResolution cs_small_n < finemapResolution cs_large_n) :
-    cs_large_n / cs_small_n < 1 := by
+    cs_large_n.size / cs_small_n.size < 1 := by
   unfold finemapResolution at h_resolution
-  rw [div_lt_div_iff₀ h_pos_small h_pos_large] at h_resolution
+  rw [div_lt_div_iff₀ cs_small_n.h_size_pos cs_large_n.h_size_pos] at h_resolution
   simp at h_resolution
-  rw [div_lt_one h_pos_small]
+  rw [div_lt_one cs_small_n.h_size_pos]
   exact h_resolution
 
 /-- **LD affects credible set size.**
@@ -85,20 +94,19 @@ theorem credible_set_shrinks_with_power
     With shorter LD, the fine-mapping resolution is higher,
     which implies a smaller credible set. -/
 theorem shorter_ld_smaller_credible_sets
-    (cs_eur cs_afr : ℝ)
-    (h_eur_pos : 0 < cs_eur) (h_afr_pos : 0 < cs_afr)
+    (cs_eur cs_afr : CredibleSetModel)
     (h_higher_res : finemapResolution cs_eur < finemapResolution cs_afr) :
-    cs_afr < cs_eur := by
+    cs_afr.size < cs_eur.size := by
   unfold finemapResolution at h_higher_res
-  rw [div_lt_div_iff₀ h_eur_pos h_afr_pos] at h_higher_res
+  rw [div_lt_div_iff₀ cs_eur.h_size_pos cs_afr.h_size_pos] at h_higher_res
   linarith
 
 /-- Higher resolution with smaller credible sets. -/
-theorem smaller_cs_higher_resolution (cs₁ cs₂ : ℝ)
-    (h₁ : 0 < cs₁) (h₂ : 0 < cs₂) (h_smaller : cs₁ < cs₂) :
+theorem smaller_cs_higher_resolution (cs₁ cs₂ : CredibleSetModel)
+    (h_smaller : cs₁.size < cs₂.size) :
     finemapResolution cs₂ < finemapResolution cs₁ := by
   unfold finemapResolution
-  exact div_lt_div_iff_of_pos_left one_pos h₂ h₁ |>.mpr h_smaller
+  exact div_lt_div_iff_of_pos_left one_pos cs₂.h_size_pos cs₁.h_size_pos |>.mpr h_smaller
 
 end CredibleSets
 
@@ -112,12 +120,39 @@ improves cross-ancestry PGS portability.
 
 section CausalVariantPortability
 
+/-- A generative model of a proxy variant in LD with a causal variant. -/
+structure ProxyModel where
+  beta_causal : ℝ
+  var_causal : ℝ
+  var_proxy : ℝ
+  cov_causal_proxy : ℝ
+  h_var_causal_pos : 0 < var_causal
+  h_var_proxy_pos : 0 < var_proxy
+  h_beta_pos : 0 < beta_causal
+  h_cov_pos : 0 < cov_causal_proxy
+  -- We assume r2 < 1 to reflect imperfect proxy
+  h_cov_lt_var : cov_causal_proxy ^ 2 < var_causal * var_proxy
+
+/-- LD r² between causal and proxy -/
+noncomputable def ProxyModel.r2_ld (m : ProxyModel) : ℝ :=
+  m.cov_causal_proxy ^ 2 / (m.var_causal * m.var_proxy)
+
+theorem ProxyModel.r2_pos (m : ProxyModel) : 0 < m.r2_ld := by
+  unfold r2_ld
+  apply div_pos (sq_pos_of_pos m.h_cov_pos)
+  apply mul_pos m.h_var_causal_pos m.h_var_proxy_pos
+
+theorem ProxyModel.r2_lt_one (m : ProxyModel) : m.r2_ld < 1 := by
+  unfold r2_ld
+  rw [div_lt_one (mul_pos m.h_var_causal_pos m.h_var_proxy_pos)]
+  exact m.h_cov_lt_var
+
 /-- **LD proxy inflation.**
     Using a proxy in LD with the causal variant inflates
     the apparent effect size by 1/r² where r² is LD.
     This inflation is population-specific. -/
-noncomputable def proxyInflation (beta_causal r2_ld : ℝ) : ℝ :=
-  beta_causal / r2_ld
+noncomputable def proxyInflation (m : ProxyModel) : ℝ :=
+  m.beta_causal / m.r2_ld
 
 /-- **Causal variant PGS is more portable.**
     A proxy-based PGS inflates the causal effect by 1/r² (proxyInflation),
@@ -128,14 +163,15 @@ noncomputable def proxyInflation (beta_causal r2_ld : ℝ) : ℝ :=
     proxy-source error. This proves the causal PGS (= β) is closer to
     the truth than the proxy PGS in the target. -/
 theorem causal_pgs_more_portable
-    (beta r2_source r2_target : ℝ)
-    (h_beta : 0 < beta)
-    (h_source_pos : 0 < r2_source) (h_source_lt : r2_source < 1)
-    (h_target_pos : 0 < r2_target) (h_target_lt : r2_target < r2_source) :
+    (m_src m_tgt : ProxyModel)
+    (h_beta_eq : m_src.beta_causal = m_tgt.beta_causal)
+    (h_target_lt : m_tgt.r2_ld < m_src.r2_ld) :
     -- The proxy inflation in target exceeds that in source
-    0 < proxyInflation beta r2_target - proxyInflation beta r2_source := by
+    0 < proxyInflation m_tgt - proxyInflation m_src := by
   unfold proxyInflation
-  rw [sub_pos, div_lt_div_iff₀ h_source_pos h_target_pos]
+  rw [h_beta_eq, sub_pos, div_lt_div_iff₀ m_src.r2_pos m_tgt.r2_pos]
+  have h1 := m_src.h_beta_pos
+  rw [h_beta_eq] at h1
   nlinarith
 
 /-- **Portability with causal variants bounded by r_g.**
@@ -151,25 +187,29 @@ theorem causal_pgs_bounded_by_rg
   nlinarith
 
 /-- Proxy inflation exceeds true effect when r² < 1. -/
-theorem proxy_inflated (beta_causal r2_ld : ℝ)
-    (h_beta : 0 < beta_causal) (h_r2 : 0 < r2_ld) (h_r2_lt : r2_ld < 1) :
-    beta_causal < proxyInflation beta_causal r2_ld := by
+theorem proxy_inflated (m : ProxyModel) :
+    m.beta_causal < proxyInflation m := by
   unfold proxyInflation
-  rw [lt_div_iff₀ h_r2]
+  rw [lt_div_iff₀ m.r2_pos]
+  have h_r2_lt_one := m.r2_lt_one
   nlinarith
 
 /-- **Cross-population LD change inflates proxy differently.**
     If LD(proxy, causal) differs between source and target,
     the proxy-based PGS has different effective weights. -/
 theorem differential_proxy_inflation
-    (beta r2_source r2_target : ℝ)
-    (h_beta : 0 < beta) (h_source : 0 < r2_source) (h_target : 0 < r2_target)
-    (h_diff : r2_source ≠ r2_target) :
-    proxyInflation beta r2_source ≠ proxyInflation beta r2_target := by
+    (m_src m_tgt : ProxyModel)
+    (h_beta_eq : m_src.beta_causal = m_tgt.beta_causal)
+    (h_diff : m_src.r2_ld ≠ m_tgt.r2_ld) :
+    proxyInflation m_src ≠ proxyInflation m_tgt := by
   unfold proxyInflation
   intro h
-  rw [div_eq_div_iff h_source.ne' h_target.ne'] at h
-  have : r2_source = r2_target := by nlinarith
+  have h_src_pos := m_src.r2_pos
+  have h_tgt_pos := m_tgt.r2_pos
+  rw [h_beta_eq] at h
+  rw [div_eq_div_iff h_src_pos.ne' h_tgt_pos.ne'] at h
+  have h_beta := m_tgt.h_beta_pos
+  have : m_src.r2_ld = m_tgt.r2_ld := by nlinarith
   exact h_diff this
 
 end CausalVariantPortability
@@ -205,6 +245,18 @@ theorem multi_ancestry_narrows_cs
   rw [div_lt_div_iff₀ hd1 hd2]
   nlinarith [mul_pos h1 h2]
 
+structure FineMappingLDModel where
+  /-- Sample size -/
+  n : ℝ
+  /-- Average LD block size -/
+  ld_size : ℝ
+  h_n_pos : 0 < n
+  h_ld_pos : 0 < ld_size
+
+/-- Effective fine-mapping resolution -/
+noncomputable def FineMappingLDModel.resolution (m : FineMappingLDModel) : ℝ :=
+  m.n / m.ld_size
+
 /-- **African ancestry is most informative for fine-mapping.**
     Shorter LD blocks in AFR provide natural fine-mapping.
     We model resolution as proportional to n / ld_block_size.
@@ -212,26 +264,52 @@ theorem multi_ancestry_narrows_cs
     ld_eur / ld_afr > n_eur / n_afr, then AFR achieves
     higher resolution despite a smaller sample. -/
 theorem afr_efficient_for_fine_mapping
-    (n_afr n_eur ld_afr ld_eur : ℝ)
-    (h_n_afr : 0 < n_afr) (h_n_eur : 0 < n_eur)
-    (h_ld_afr : 0 < ld_afr) (h_ld_eur : 0 < ld_eur)
-    (h_smaller_n : n_afr < n_eur)
-    (h_shorter_ld : ld_afr < ld_eur)
-    (h_ld_advantage : n_eur * ld_afr < n_afr * ld_eur) :
+    (m_afr m_eur : FineMappingLDModel)
+    (h_smaller_n : m_afr.n < m_eur.n)
+    (h_shorter_ld : m_afr.ld_size < m_eur.ld_size)
+    (h_ld_advantage : m_eur.n * m_afr.ld_size < m_afr.n * m_eur.ld_size) :
     -- AFR effective resolution exceeds EUR
-    n_eur / ld_eur < n_afr / ld_afr := by
-  rwa [div_lt_div_iff₀ h_ld_eur h_ld_afr]
+    m_eur.resolution < m_afr.resolution := by
+  unfold FineMappingLDModel.resolution
+  rwa [div_lt_div_iff₀ m_eur.h_ld_pos m_afr.h_ld_pos]
 
-/-- **Trans-ethnic Bayes factor.**
-    Combining Bayes factors across ancestries (assuming shared
-    causal variant) increases evidence for the true causal. -/
-noncomputable def combinedBayesFactor (bf₁ bf₂ : ℝ) : ℝ := bf₁ * bf₂
+/-- **Generative Multi-Ancestry Fine-Mapping Model.**
+    A formal representation of cross-ancestry Bayesian fine-mapping
+    using generative probabilities rather than axiomatic BFs. -/
+structure CrossAncestryFineMappingModel where
+  /-- Probability of data given causal model in ancestry 1 -/
+  p_D1_given_causal : ℝ
+  /-- Probability of data given null model in ancestry 1 -/
+  p_D1_given_null : ℝ
+  /-- Probability of data given causal model in ancestry 2 -/
+  p_D2_given_causal : ℝ
+  /-- Probability of data given null model in ancestry 2 -/
+  p_D2_given_null : ℝ
+  h_p1_pos : 0 < p_D1_given_causal
+  h_p1_null_pos : 0 < p_D1_given_null
+  h_p2_pos : 0 < p_D2_given_causal
+  h_p2_null_pos : 0 < p_D2_given_null
+
+noncomputable def bf_ancestry1 (m : CrossAncestryFineMappingModel) : ℝ :=
+  m.p_D1_given_causal / m.p_D1_given_null
+
+noncomputable def bf_ancestry2 (m : CrossAncestryFineMappingModel) : ℝ :=
+  m.p_D2_given_causal / m.p_D2_given_null
+
+/-- Combined BF assuming datasets are independent conditioned on the model -/
+noncomputable def combinedBayesFactor (m : CrossAncestryFineMappingModel) : ℝ :=
+  (m.p_D1_given_causal * m.p_D2_given_causal) / (m.p_D1_given_null * m.p_D2_given_null)
+
+theorem combined_bf_eq_prod (m : CrossAncestryFineMappingModel) :
+    combinedBayesFactor m = bf_ancestry1 m * bf_ancestry2 m := by
+  unfold combinedBayesFactor bf_ancestry1 bf_ancestry2
+  ring
 
 /-- Combined BF exceeds individual BFs when both > 1. -/
-theorem combined_bf_exceeds_individual (bf₁ bf₂ : ℝ)
-    (h₁ : 1 < bf₁) (h₂ : 1 < bf₂) :
-    bf₁ < combinedBayesFactor bf₁ bf₂ ∧ bf₂ < combinedBayesFactor bf₁ bf₂ := by
-  unfold combinedBayesFactor
+theorem combined_bf_exceeds_individual (m : CrossAncestryFineMappingModel)
+    (h₁ : 1 < bf_ancestry1 m) (h₂ : 1 < bf_ancestry2 m) :
+    bf_ancestry1 m < combinedBayesFactor m ∧ bf_ancestry2 m < combinedBayesFactor m := by
+  rw [combined_bf_eq_prod m]
   constructor
   · nlinarith
   · nlinarith
@@ -243,29 +321,31 @@ theorem combined_bf_exceeds_individual (bf₁ bf₂ : ℝ)
     populations. Variant B (tag) has high BF in source (due to LD) but
     low BF in target (LD broken). The combined BF for A exceeds that
     for B, enabling discrimination.
-    We model: BF_combined = BF_source × BF_target.
     For the causal variant A: both BFs > 1, so combined > each.
     For tag B: BF_target_B < 1 (no support without LD).
     Combined_A > Combined_B when BF_src_A × BF_tgt_A > BF_src_B × BF_tgt_B. -/
 theorem ld_discordance_identifies_causal
-    (bf_src_A bf_tgt_A bf_src_B bf_tgt_B : ℝ)
-    (h_A_src : 1 < bf_src_A) (h_A_tgt : 1 < bf_tgt_A)
-    (h_B_src : 0 < bf_src_B) (h_B_tgt : 0 < bf_tgt_B)
+    (m_A m_B : CrossAncestryFineMappingModel)
+    (h_A_src : 1 < bf_ancestry1 m_A) (h_A_tgt : 1 < bf_ancestry2 m_A)
+    (h_B_src : 0 < bf_ancestry1 m_B) (h_B_tgt : 0 < bf_ancestry2 m_B)
     -- Source BFs are similar (both have high GWAS signal due to LD)
-    (h_src_similar : bf_src_B ≤ bf_src_A)
+    (h_src_similar : bf_ancestry1 m_B ≤ bf_ancestry1 m_A)
     -- Target BF for tag B drops below 1 (LD broken)
-    (h_B_tgt_low : bf_tgt_B < 1) :
+    (h_B_tgt_low : bf_ancestry2 m_B < 1) :
     -- Combined BF for causal A exceeds combined BF for tag B
-    combinedBayesFactor bf_src_B bf_tgt_B < combinedBayesFactor bf_src_A bf_tgt_A := by
-  unfold combinedBayesFactor
-  have h_A_pos : 0 < bf_src_A := by linarith
-  -- B's combined: bf_src_B × bf_tgt_B < bf_src_B × 1 = bf_src_B ≤ bf_src_A < bf_src_A × bf_tgt_A
-  calc bf_src_B * bf_tgt_B
-      < bf_src_B * 1 := by nlinarith
-    _ = bf_src_B := mul_one _
-    _ ≤ bf_src_A := h_src_similar
-    _ = bf_src_A * 1 := (mul_one _).symm
-    _ < bf_src_A * bf_tgt_A := by nlinarith
+    combinedBayesFactor m_B < combinedBayesFactor m_A := by
+  rw [combined_bf_eq_prod m_A, combined_bf_eq_prod m_B]
+  have h_A_pos : 0 < bf_ancestry1 m_A := by linarith
+  have bf_src_A := bf_ancestry1 m_A
+  have bf_tgt_A := bf_ancestry2 m_A
+  have bf_src_B := bf_ancestry1 m_B
+  have bf_tgt_B := bf_ancestry2 m_B
+  calc bf_ancestry1 m_B * bf_ancestry2 m_B
+      < bf_ancestry1 m_B * 1 := by nlinarith
+    _ = bf_ancestry1 m_B := mul_one _
+    _ ≤ bf_ancestry1 m_A := h_src_similar
+    _ = bf_ancestry1 m_A * 1 := (mul_one _).symm
+    _ < bf_ancestry1 m_A * bf_ancestry2 m_A := by nlinarith
 
 end CrossAncestryFineMapping
 
@@ -299,19 +379,16 @@ theorem pip_shrinks_effects (pip beta : ℝ)
     inflated proxy effect, the PIP-weighted proxy is closer to the
     true causal effect than the unweighted proxy. -/
 theorem pip_pgs_more_portable
-    (beta_causal r2_ld pip : ℝ)
-    (h_beta : 0 < beta_causal)
-    (h_r2 : 0 < r2_ld) (h_r2_lt : r2_ld < 1)
+    (m : ProxyModel) (pip : ℝ)
     (h_pip_nn : 0 ≤ pip) (h_pip_lt : pip < 1) :
     -- PIP-weighted proxy error < unweighted proxy error
     -- Error = |proxy_effect × weight - beta_causal|
     -- Unweighted: proxyInflation beta r2 - beta = beta/r2 - beta = beta(1-r2)/r2
     -- PIP-weighted: pip * proxyInflation beta r2 - beta
     -- We show: pip × (beta/r2) < beta/r2 (shrinkage helps)
-    pipWeightedEffect pip (proxyInflation beta_causal r2_ld) <
-      proxyInflation beta_causal r2_ld := by
+    pipWeightedEffect pip (proxyInflation m) < proxyInflation m := by
   unfold pipWeightedEffect proxyInflation
-  have h_div_pos : 0 < beta_causal / r2_ld := div_pos h_beta h_r2
+  have h_div_pos : 0 < m.beta_causal / m.r2_ld := div_pos m.h_beta_pos m.r2_pos
   nlinarith
 
 /- **SuSiE posterior for PGS.**
@@ -329,18 +406,20 @@ theorem pip_pgs_more_portable
     We prove the key step: combined BF exceeds single BF, so
     PIP_multi = BF_combined / (1 + BF_combined) > BF₁ / (1 + BF₁). -/
 theorem multi_ancestry_susie_improves
-    (bf₁ bf₂ : ℝ)
-    (h_bf₁ : 1 < bf₁) (h_bf₂ : 1 < bf₂) :
-    -- PIP_single = bf₁/(1+bf₁) < bf₁*bf₂/(1+bf₁*bf₂) = PIP_multi
-    bf₁ / (1 + bf₁) < combinedBayesFactor bf₁ bf₂ / (1 + combinedBayesFactor bf₁ bf₂) := by
-  unfold combinedBayesFactor
-  have h_bf₁_pos : 0 < bf₁ := by linarith
-  have h_bf₂_pos : 0 < bf₂ := by linarith
-  have h_prod_pos : 0 < bf₁ * bf₂ := mul_pos h_bf₁_pos h_bf₂_pos
-  have h_d₁ : 0 < 1 + bf₁ := by linarith
-  have h_d₂ : 0 < 1 + bf₁ * bf₂ := by linarith
+    (m : CrossAncestryFineMappingModel)
+    (h_bf₁ : 1 < bf_ancestry1 m) (h_bf₂ : 1 < bf_ancestry2 m) :
+    -- PIP_single < PIP_multi
+    bf_ancestry1 m / (1 + bf_ancestry1 m) < combinedBayesFactor m / (1 + combinedBayesFactor m) := by
+  rw [combined_bf_eq_prod m]
+  have h_bf₁_pos : 0 < bf_ancestry1 m := by linarith
+  have h_bf₂_pos : 0 < bf_ancestry2 m := by linarith
+  have h_prod_pos : 0 < bf_ancestry1 m * bf_ancestry2 m := mul_pos h_bf₁_pos h_bf₂_pos
+  have h_d₁ : 0 < 1 + bf_ancestry1 m := by linarith
+  have h_d₂ : 0 < 1 + bf_ancestry1 m * bf_ancestry2 m := by linarith
   rw [div_lt_div_iff₀ h_d₁ h_d₂]
-  nlinarith [mul_pos h_bf₁_pos h_bf₂_pos]
+  have bf₁ := bf_ancestry1 m
+  have bf₂ := bf_ancestry2 m
+  nlinarith
 
 end PIPWeighting
 
