@@ -1,0 +1,98 @@
+<<<<<<< SEARCH
+/-- **Credible set resolution.**
+    Resolution = 1 / credible_set_size.
+    Higher resolution → more precise causal variant identification. -/
+noncomputable def finemapResolution (cs_size : ℝ) : ℝ := 1 / cs_size
+
+/-- **Credible set coverage.**
+=======
+/-- **Credible set resolution.**
+    Resolution = 1 / credible_set_size.
+    Higher resolution → more precise causal variant identification. -/
+noncomputable def finemapResolution (cs_size : ℝ) : ℝ := 1 / cs_size
+
+structure FineMapResolution where
+  cs_size : ℝ
+  resolution : ℝ
+  h_pos : 0 < cs_size
+  h_eq : resolution = finemapResolution cs_size
+
+/-- **Credible set coverage.**
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+theorem credible_set_shrinks_with_power
+    (cs_small_n cs_large_n : ℝ)
+    (h_pos_large : 0 < cs_large_n)
+    (h_pos_small : 0 < cs_small_n)
+    (h_resolution : finemapResolution cs_small_n < finemapResolution cs_large_n) :
+    cs_large_n / cs_small_n < 1 := by
+  unfold finemapResolution at h_resolution
+  rw [div_lt_div_iff₀ h_pos_small h_pos_large] at h_resolution
+  simp at h_resolution
+  rw [div_lt_one h_pos_small]
+  exact h_resolution
+
+/-- **LD affects credible set size.**
+    In long-LD regions (EUR), credible sets are larger because
+    more variants are in high LD with the causal variant.
+    In short-LD regions (AFR), credible sets are smaller.
+    With shorter LD, the fine-mapping resolution is higher,
+    which implies a smaller credible set. -/
+theorem shorter_ld_smaller_credible_sets
+    (cs_eur cs_afr : ℝ)
+    (h_eur_pos : 0 < cs_eur) (h_afr_pos : 0 < cs_afr)
+    (h_higher_res : finemapResolution cs_eur < finemapResolution cs_afr) :
+    cs_afr < cs_eur := by
+  unfold finemapResolution at h_higher_res
+  rw [div_lt_div_iff₀ h_eur_pos h_afr_pos] at h_higher_res
+  linarith
+
+/-- Higher resolution with smaller credible sets. -/
+theorem smaller_cs_higher_resolution (cs₁ cs₂ : ℝ)
+    (h₁ : 0 < cs₁) (h₂ : 0 < cs₂) (h_smaller : cs₁ < cs₂) :
+    finemapResolution cs₂ < finemapResolution cs₁ := by
+  unfold finemapResolution
+  exact div_lt_div_iff_of_pos_left one_pos h₂ h₁ |>.mpr h_smaller
+=======
+theorem credible_set_shrinks_with_power
+    (cs_small_n cs_large_n : FineMapResolution)
+    (h_resolution : cs_small_n.resolution < cs_large_n.resolution) :
+    cs_large_n.cs_size / cs_small_n.cs_size < 1 := by
+  have h_res := h_resolution
+  rw [cs_small_n.h_eq, cs_large_n.h_eq] at h_res
+  unfold finemapResolution at h_res
+  have h_pos_small := cs_small_n.h_pos
+  have h_pos_large := cs_large_n.h_pos
+  rw [div_lt_div_iff₀ h_pos_small h_pos_large] at h_res
+  simp at h_res
+  rw [div_lt_one h_pos_small]
+  exact h_res
+
+/-- **LD affects credible set size.**
+    In long-LD regions (EUR), credible sets are larger because
+    more variants are in high LD with the causal variant.
+    In short-LD regions (AFR), credible sets are smaller.
+    With shorter LD, the fine-mapping resolution is higher,
+    which implies a smaller credible set. -/
+theorem shorter_ld_smaller_credible_sets
+    (cs_eur cs_afr : FineMapResolution)
+    (h_higher_res : cs_eur.resolution < cs_afr.resolution) :
+    cs_afr.cs_size < cs_eur.cs_size := by
+  have h_res := h_higher_res
+  rw [cs_eur.h_eq, cs_afr.h_eq] at h_res
+  unfold finemapResolution at h_res
+  have h_eur_pos := cs_eur.h_pos
+  have h_afr_pos := cs_afr.h_pos
+  rw [div_lt_div_iff₀ h_eur_pos h_afr_pos] at h_res
+  linarith
+
+/-- Higher resolution with smaller credible sets. -/
+theorem smaller_cs_higher_resolution (cs₁ cs₂ : FineMapResolution)
+    (h_smaller : cs₁.cs_size < cs₂.cs_size) :
+    cs₂.resolution < cs₁.resolution := by
+  rw [cs₁.h_eq, cs₂.h_eq]
+  unfold finemapResolution
+  have h₁ := cs₁.h_pos
+  have h₂ := cs₂.h_pos
+  exact div_lt_div_iff_of_pos_left one_pos h₂ h₁ |>.mpr h_smaller
+>>>>>>> REPLACE

@@ -224,11 +224,19 @@ noncomputable def zScore (beta se : ℝ) : ℝ := beta / se
     This can differ from the reported GWAS n. -/
 noncomputable def effectiveSampleSizeSE (se : ℝ) : ℝ := 1 / se ^ 2
 
+structure EffectiveSampleSize where
+  se : ℝ
+  size : ℝ
+  h_pos : 0 < se
+  h_eq : size = effectiveSampleSizeSE se
+
 /-- Effective sample size is positive. -/
-theorem effective_n_pos (se : ℝ) (h_se : 0 < se) :
-    0 < effectiveSampleSizeSE se := by
+theorem effective_n_pos (se : EffectiveSampleSize) :
+    0 < se.size := by
+  rw [se.h_eq]
   unfold effectiveSampleSizeSE
-  exact div_pos one_pos (sq_pos_of_pos h_se)
+  have h := se.h_pos
+  exact div_pos one_pos (sq_pos_of_pos h)
 
 /- **Multi-ancestry meta-analysis of summary statistics.**
     β̂_meta = Σ_k w_k β̂_k / Σ_k w_k where w_k = 1/SE_k².
