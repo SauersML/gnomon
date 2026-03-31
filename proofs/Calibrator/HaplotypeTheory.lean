@@ -243,6 +243,18 @@ noncomputable def dosagePhaseMisspecificationError
     (1 - freq_cis) *
       (interaction_trans - averagePhaseInteraction freq_cis interaction_cis interaction_trans) ^ 2
 
+/-- **Phase predictor structure.**
+    A model that explicitly tracks the predicted effects for cis and trans
+    haplotype configurations. -/
+structure PhasePredictor where
+  pred_cis : ℝ
+  pred_trans : ℝ
+
+/-- The theoretically optimal phase predictor correctly specifies both
+    configuration effects exactly. -/
+noncomputable def optimalPhasePredictor (interaction_cis interaction_trans : ℝ) : PhasePredictor :=
+  { pred_cis := interaction_cis, pred_trans := interaction_trans }
+
 /-- A phase-aware haplotype predictor that tracks cis/trans configuration has no
 structural phase-misspecification error. -/
 noncomputable def haplotypePhasePredictionError : ℝ :=
