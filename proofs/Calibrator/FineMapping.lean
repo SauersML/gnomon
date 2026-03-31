@@ -192,6 +192,7 @@ theorem proxy_inflated (m : ProxyModel) :
   unfold proxyInflation
   rw [lt_div_iff₀ m.r2_pos]
   have h_r2_lt_one := m.r2_lt_one
+  have h_beta_pos := m.h_beta_pos
   nlinarith
 
 /-- **Cross-population LD change inflates proxy differently.**
