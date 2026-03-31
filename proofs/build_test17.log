@@ -1,0 +1,523 @@
+✔ [3262/3279] Built Mathlib.RingTheory.Polynomial.Bernstein (11s)
+✔ [3263/3279] Built Mathlib.Probability.Moments.Variance (16s)
+✔ [3264/3279] Built Mathlib.Probability.IdentDistrib (6.6s)
+✔ [3265/3285] Built Mathlib.Analysis.SpecialFunctions.Gaussian.FourierTransform (25s)
+✔ [3266/3287] Built Mathlib.Algebra.Polynomial.Module.AEval (31s)
+✔ [3267/3287] Built Mathlib.Probability.Moments.Basic (9.2s)
+✔ [3268/3291] Built Mathlib.Analysis.SpecialFunctions.Bernstein (20s)
+✔ [3269/3291] Built Mathlib.LinearAlgebra.AffineSpace.Simplex.Basic (11s)
+✔ [3270/3291] Built Mathlib.Topology.ContinuousMap.Weierstrass (6.1s)
+✔ [3271/3293] Built Mathlib.Analysis.Convex.Integral (10s)
+✔ [3272/3293] Built Mathlib.Algebra.Polynomial.Module.Basic (17s)
+✔ [3273/3293] Built Mathlib.MeasureTheory.Measure.Tilted (11s)
+✔ [3274/3293] Built Mathlib.Probability.ProbabilityMassFunction.Basic (7.0s)
+✔ [3275/3293] Built Mathlib.LinearAlgebra.AffineSpace.FiniteDimensional (17s)
+✔ [3276/3298] Built Mathlib.Probability.ProbabilityMassFunction.Monad (11s)
+✔ [3277/3298] Built Mathlib.MeasureTheory.Measure.LogLikelihoodRatio (11s)
+✔ [3278/3298] Built Mathlib.Analysis.Calculus.Taylor (21s)
+✔ [3279/3300] Built Mathlib.Control.Monad.Writer (2.9s)
+✔ [3280/3300] Built Mathlib.Analysis.Normed.Affine.AddTorsorBases (6.9s)
+✔ [3281/3301] Built Mathlib.Control.Lawful (2.4s)
+✔ [3282/3303] Built Mathlib.Analysis.Calculus.Deriv.Pi (7.7s)
+✔ [3283/3303] Built Mathlib.Control.Monad.Cont (6.8s)
+✔ [3284/3305] Built Mathlib.Control.ULiftable (4.3s)
+✔ [3285/3305] Built Mathlib.MeasureTheory.Function.ConditionalExpectation.Indicator (10s)
+✔ [3287/3317] Built Mathlib.Probability.ProbabilityMassFunction.Constructions (9.6s)
+✔ [3288/3317] Built Mathlib.Analysis.Convex.Between (31s)
+✔ [3289/3317] Built Mathlib.Topology.ContinuousMap.StoneWeierstrass (57s)
+✔ [3290/3317] Built Mathlib.Analysis.Normed.Affine.Convex (7.7s)
+✔ [3291/3317] Built Mathlib.MeasureTheory.VectorMeasure.Basic (17s)
+✔ [3292/3317] Built Mathlib.Analysis.SpecialFunctions.MulExpNegMulSqIntegral (10s)
+✔ [3293/3317] Built Mathlib.MeasureTheory.Measure.Complex (7.6s)
+✔ [3294/3317] Built Mathlib.Analysis.Convex.Continuous (11s)
+✔ [3295/3317] Built Mathlib.MeasureTheory.VectorMeasure.WithDensity (8.2s)
+✔ [3296/3317] Built Mathlib.MeasureTheory.VectorMeasure.Decomposition.Hahn (11s)
+✔ [3297/3317] Built Mathlib.MeasureTheory.Measure.Decomposition.IntegralRNDeriv (5.6s)
+✔ [3298/3317] Built Mathlib.MeasureTheory.Measure.FiniteMeasureExt (7.1s)
+✔ [3299/3317] Built Mathlib.MeasureTheory.VectorMeasure.Decomposition.Jordan (6.9s)
+✔ [3300/3317] Built Mathlib.InformationTheory.KullbackLeibler.KLFun (5.6s)
+✔ [3301/3317] Built Mathlib.InformationTheory.KullbackLeibler.Basic (7.4s)
+✔ [3302/3317] Built Mathlib.MeasureTheory.VectorMeasure.Decomposition.Lebesgue (10s)
+✔ [3303/3317] Built Mathlib.MeasureTheory.VectorMeasure.Decomposition.RadonNikodym (3.9s)
+✔ [3304/3317] Built Mathlib.MeasureTheory.Measure.CharacteristicFunction (19s)
+✔ [3305/3317] Built Mathlib.MeasureTheory.Function.ConditionalExpectation.Real (6.7s)
+✔ [3306/3317] Built Mathlib.Probability.Moments.ComplexMGF (8.1s)
+✔ [3307/3317] Built Mathlib.Probability.CondVar (7.1s)
+✔ [3308/3317] Built Mathlib.Probability.Moments.MGFAnalytic (6.4s)
+✔ [3309/3317] Built Mathlib.Probability.Distributions.Gaussian.Real (9.9s)
+ℹ [3310/3317] Built Calibrator.Probability (12s)
+info: Calibrator/Probability.lean:160:142: Try this:
+  ring_nf
+
+  The `ring` tactic failed to close the goal. Use `ring_nf` to obtain a normal form.
+
+  Note that `ring` works primarily in *commutative* rings. If you have a noncommutative ring, abelian group or module, consider using `noncomm_ring`, `abel` or `module` instead.
+info: Calibrator/Probability.lean:161:55: Try this:
+  ring_nf
+
+  The `ring` tactic failed to close the goal. Use `ring_nf` to obtain a normal form.
+
+  Note that `ring` works primarily in *commutative* rings. If you have a noncommutative ring, abelian group or module, consider using `noncomm_ring`, `abel` or `module` instead.
+⚠ [3311/3317] Built Calibrator.TransportIdentities (12s)
+warning: Calibrator/TransportIdentities.lean:170:25: This simp argument is unused:
+  mul_assoc
+
+Hint: Omit it from the simp argument list.
+  simp [smul_eq_mul, m̵u̵l̵_̵a̵s̵s̵o̵c̵,̵ ̵mul_left_comm]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: Calibrator/TransportIdentities.lean:184:48: This simp argument is unused:
+  ExpFunctional.eval_zero
+
+Hint: Omit it from the simp argument list.
+  simp [covariance_eq_expect_mul_sub_means,̵ ̵E̵x̵p̵F̵u̵n̵c̵t̵i̵o̵n̵a̵l̵.̵e̵v̵a̵l̵_̵z̵e̵r̵o̵]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: Calibrator/TransportIdentities.lean:197:0: automatically included section variable(s) unused in theorem `Calibrator.dot_add_left`:
+  [DecidableEq ι]
+consider restructuring your `variable` declarations so that the variables are not in scope or explicitly omit them:
+  omit [DecidableEq ι] in theorem ...
+
+Note: This linter can be disabled with `set_option linter.unusedSectionVars false`
+warning: Calibrator/TransportIdentities.lean:201:0: automatically included section variable(s) unused in theorem `Calibrator.dot_sub_left`:
+  [DecidableEq ι]
+consider restructuring your `variable` declarations so that the variables are not in scope or explicitly omit them:
+  omit [DecidableEq ι] in theorem ...
+
+Note: This linter can be disabled with `set_option linter.unusedSectionVars false`
+warning: Calibrator/TransportIdentities.lean:328:0: automatically included section variable(s) unused in theorem `Calibrator.matrix_mulVec_add`:
+  [DecidableEq J]
+consider restructuring your `variable` declarations so that the variables are not in scope or explicitly omit them:
+  omit [DecidableEq J] in theorem ...
+
+Note: This linter can be disabled with `set_option linter.unusedSectionVars false`
+warning: Calibrator/TransportIdentities.lean:349:8: This simp argument is unused:
+  dot
+
+Hint: Omit it from the simp argument list.
+  simp [d̵o̵t̵,̵ ̵mul_comm]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: Calibrator/TransportIdentities.lean:351:0: automatically included section variable(s) unused in theorem `Calibrator.crossCovVector_decomposition`:
+  [Fintype J]
+  [DecidableEq J]
+consider restructuring your `variable` declarations so that the variables are not in scope or explicitly omit them:
+  omit [Fintype J] [DecidableEq J] in theorem ...
+
+Note: This linter can be disabled with `set_option linter.unusedSectionVars false`
+warning: Calibrator/TransportIdentities.lean:382:57: This simp argument is unused:
+  mul_assoc
+
+Hint: Omit it from the simp argument list.
+  simp [dot, pow_two, Finset.sum_mul_sum, smul_eq_mul, mul_a̵s̵s̵o̵c̵,̵ ̵m̵u̵l_̵l̵eft_comm, mul_comm]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: Calibrator/TransportIdentities.lean:413:0: automatically included section variable(s) unused in theorem `Calibrator.secondMoment_eq_covariance_of_centered`:
+  [Fintype J]
+  [DecidableEq J]
+consider restructuring your `variable` declarations so that the variables are not in scope or explicitly omit them:
+  omit [Fintype J] [DecidableEq J] in theorem ...
+
+Note: This linter can be disabled with `set_option linter.unusedSectionVars false`
+warning: Calibrator/TransportIdentities.lean:453:44: This simp argument is unused:
+  mul_assoc
+
+Hint: Omit it from the simp argument list.
+  simp [dot, Finset.mul_sum, smul_eq_mul, mul_a̵s̵s̵o̵c̵,̵ ̵m̵u̵l_̵l̵eft_comm, mul_comm]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: Calibrator/TransportIdentities.lean:554:6: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+warning: Calibrator/TransportIdentities.lean:611:0: automatically included section variable(s) unused in theorem `Calibrator.transported_covariance_decomposes`:
+  [DecidableEq J]
+  [DecidableEq L]
+consider restructuring your `variable` declarations so that the variables are not in scope or explicitly omit them:
+  omit [DecidableEq J] [DecidableEq L] in theorem ...
+
+Note: This linter can be disabled with `set_option linter.unusedSectionVars false`
+warning: Calibrator/TransportIdentities.lean:621:0: automatically included section variable(s) unused in theorem `Calibrator.normalized_transport_as_weighted_average`:
+  [DecidableEq L]
+consider restructuring your `variable` declarations so that the variables are not in scope or explicitly omit them:
+  omit [DecidableEq L] in theorem ...
+
+Note: This linter can be disabled with `set_option linter.unusedSectionVars false`
+warning: Calibrator/TransportIdentities.lean:649:0: automatically included section variable(s) unused in theorem `Calibrator.normalized_transport_constant_factor`:
+  [DecidableEq L]
+consider restructuring your `variable` declarations so that the variables are not in scope or explicitly omit them:
+  omit [DecidableEq L] in theorem ...
+
+Note: This linter can be disabled with `set_option linter.unusedSectionVars false`
+warning: Calibrator/TransportIdentities.lean:791:5: unused variable `hvarY`
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+warning: Calibrator/TransportIdentities.lean:836:10: This simp argument is unused:
+  h
+
+Hint: Omit it from the simp argument list.
+  simp [h,̵ ̵h̵tp]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: Calibrator/TransportIdentities.lean:846:10: This simp argument is unused:
+  h
+
+Hint: Omit it from the simp argument list.
+  simp [h,̵ ̵h̵fp]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+ℹ [3312/3317] Built Calibrator.Models (14s)
+info: Calibrator/Models.lean:1551:4: Try this:
+  ring_nf
+
+  The `ring` tactic failed to close the goal. Use `ring_nf` to obtain a normal form.
+
+  Note that `ring` works primarily in *commutative* rings. If you have a noncommutative ring, abelian group or module, consider using `noncomm_ring`, `abel` or `module` instead.
+⚠ [3313/3317] Built Calibrator.Conclusions (32s)
+info: Calibrator/Conclusions.lean:448:141: Try this:
+  ring_nf
+
+  The `ring` tactic failed to close the goal. Use `ring_nf` to obtain a normal form.
+
+  Note that `ring` works primarily in *commutative* rings. If you have a noncommutative ring, abelian group or module, consider using `noncomm_ring`, `abel` or `module` instead.
+info: Calibrator/Conclusions.lean:449:150: Try this:
+  ring_nf
+
+  The `ring` tactic failed to close the goal. Use `ring_nf` to obtain a normal form.
+
+  Note that `ring` works primarily in *commutative* rings. If you have a noncommutative ring, abelian group or module, consider using `noncomm_ring`, `abel` or `module` instead.
+info: Calibrator/Conclusions.lean:470:87: Try this:
+  ring_nf!
+
+  The `ring!` tactic failed to close the goal. Use `ring_nf!` to obtain a normal form.
+
+  Note that `ring!` works primarily in *commutative* rings. If you have a noncommutative ring, abelian group or module, consider using `noncomm_ring`, `abel` or `module` instead.
+warning: Calibrator/Conclusions.lean:423:69: This simp argument is unused:
+  Matrix.mul_apply
+
+Hint: Omit it from the simp argument list.
+  simp +decide [̵ ̵M̵a̵t̵r̵i̵x̵.̵d̵e̵t̵_̵a̵p̵p̵l̵y̵'̵,̵ ̵M̵a̵t̵r̵i̵x̵.̵a̵d̵j̵u̵g̵a̵t̵e̵_̵a̵p̵p̵l̵y̵,̵ ̵M̵a̵t̵r̵i̵x̵.̵m̵u̵l̵_̵a̵p̵p̵l̵y̵ ̵]̵[̲M̲a̲t̲r̲i̲x̲.̲d̲e̲t̲_̲a̲p̲p̲l̲y̲'̲,̲ ̲M̲a̲t̲r̲i̲x̲.̲a̲d̲j̲u̲g̲a̲t̲e̲_̲a̲p̲p̲l̲y̲]̲
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: Calibrator/Conclusions.lean:448:100: This simp argument is unused:
+  Finset.filter_ne'
+
+Hint: Omit it from the simp argument list.
+  simp +decide [̵ ̵F̵i̵n̵s̵e̵t̵.̵p̵r̵o̵d̵_̵i̵t̵e̵,̵ ̵F̵i̵n̵s̵e̵t̵.̵f̵i̵l̵t̵e̵r̵_̵n̵e̵'̵,̵ ̵F̵i̵n̵s̵e̵t̵.̵f̵i̵l̵t̵e̵r̵_̵e̵q̵'̵ ̵]̵[̲F̲i̲n̲s̲e̲t̲.̲p̲r̲o̲d̲_̲i̲t̲e̲,̲
+  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲F̲i̲n̲s̲e̲t̲.̲f̲i̲l̲t̲e̲r̲_̲e̲q̲'̲]̲
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: Calibrator/Conclusions.lean:448:119: This simp argument is unused:
+  Finset.filter_eq'
+
+Hint: Omit it from the simp argument list.
+  simp +decide [̵ ̵F̵i̵n̵s̵e̵t̵.̵p̵r̵o̵d̵_̵i̵t̵e̵,̵ ̵F̵i̵n̵s̵e̵t̵.̵f̵i̵l̵t̵e̵r̵_̵n̵e̵'̵,̵ ̵F̵i̵n̵s̵e̵t̵.̵f̵i̵l̵t̵e̵r̵_̵e̵q̵'̵ ̵]̵[̲F̲i̲n̲s̲e̲t̲.̲p̲r̲o̲d̲_̲i̲t̲e̲,̲
+  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲F̲i̲n̲s̲e̲t̲.̲f̲i̲l̲t̲e̲r̲_̲n̲e̲'̲]̲
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: Calibrator/Conclusions.lean:449:92: This simp argument is unused:
+  Finset.prod_ite
+
+Hint: Omit it from the simp argument list.
+  simp +decide [̵ ̵F̵i̵n̵s̵e̵t̵.̵p̵r̵o̵d̵_̵i̵t̵e̵,̵ ̵F̵i̵n̵s̵e̵t̵.̵f̵i̵l̵t̵e̵r̵_̵n̵e̵'̵,̵ ̵F̵i̵n̵s̵e̵t̵.̵f̵i̵l̵t̵e̵r̵_̵e̵q̵'̵ ̵]̵[̲F̲i̲n̲s̲e̲t̲.̲f̲i̲l̲t̲e̲r̲_̲n̲e̲'̲,̲
+  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲F̲i̲n̲s̲e̲t̲.̲f̲i̲l̲t̲e̲r̲_̲e̲q̲'̲]̲
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: Calibrator/Conclusions.lean:450:56: This simp argument is unused:
+  hj
+
+Hint: Omit it from the simp argument list.
+  simp +decide [ ̵Pi.single_apply,̵ ̵h̵j̵ ̵]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: Calibrator/Conclusions.lean:451:66: This simp argument is unused:
+  hj
+
+Hint: Omit it from the simp argument list.
+  simp +decide ̵[̵ ̵h̵j̵ ̵]̵
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: Calibrator/Conclusions.lean:455:45: This simp argument is unused:
+  Finset.mul_sum _ _ _
+
+Hint: Omit it from the simp argument list.
+  simp +decide [̵ ̵M̵a̵t̵r̵i̵x̵.̵m̵u̵l̵_̵a̵p̵p̵l̵y̵,̵ ̵F̵i̵n̵s̵e̵t̵.̵m̵u̵l̵_̵s̵u̵m̵ ̵_̵ ̵_̵ ̵_̵ ̵]̵[̲M̲a̲t̲r̲i̲x̲.̲m̲u̲l̲_̲a̲p̲p̲l̲y̲]̲
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: Calibrator/Conclusions.lean:463:41: This simp argument is unused:
+  mul_assoc
+
+Hint: Omit it from the simp argument list.
+  simp_all +decide [̵ ̵M̵a̵t̵r̵i̵x̵.̵i̵n̵v̵_̵d̵e̵f̵,̵ ̵m̵u̵l̵_̵a̵s̵s̵o̵c̵,̵[̲M̲a̲t̲r̲i̲x̲.̲i̲n̲v̲_̲d̲e̲f̲,̲ mul_left_comm, mul_comm,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲Matrix.trace_mul_comm (̵ ̵M̵a̵t̵r̵i̵x̵.̵a̵d̵j̵u̵g̵a̵t̵e̵ ̵_̵ ̵)̵ ̵]̵(̲M̲a̲t̲r̲i̲x̲.̲a̲d̲j̲u̲g̲a̲t̲e̲ ̲_̲)̲]̲
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: Calibrator/Conclusions.lean:465:103: This simp argument is unused:
+  mul_assoc
+
+Hint: Omit it from the simp argument list.
+  simp_all +decide [̵ ̵M̵a̵t̵r̵i̵x̵.̵t̵r̵a̵c̵e̵_̵s̵m̵u̵l̵,̵ ̵m̵u̵l̵_̵a̵s̵s̵o̵c̵,̵[̲M̲a̲t̲r̲i̲x̲.̲t̲r̲a̲c̲e̲_̲s̲m̲u̲l̲,̲
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲mul_comm, m̵u̵l̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵ ̵]̵m̲u̲l̲_̲l̲e̲f̲t̲_̲c̲o̲m̲m̲]̲
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: Calibrator/Conclusions.lean:465:124: This simp argument is unused:
+  mul_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp_all +decide [̵ ̵M̵a̵t̵r̵i̵x̵.̵t̵r̵a̵c̵e̵_̵s̵m̵u̵l̵,̵[̲M̲a̲t̲r̲i̲x̲.̲t̲r̲a̲c̲e̲_̲s̲m̲u̲l̲,̲
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲mul_assoc, m̵u̵l̵_̵c̵o̵m̵m̵,̵ ̵m̵u̵l̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵ ̵]̵m̲u̲l̲_̲c̲o̲m̲m̲]̲
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: Calibrator/Conclusions.lean:469:118: This simp argument is unused:
+  Real.exp_ne_zero
+
+Hint: Omit it from the simp argument list.
+  simp_all +decide [̵ ̵R̵e̵a̵l̵.̵e̵x̵p̵_̵n̵e̵_̵z̵e̵r̵o̵,̵ ̵m̵u̵l̵_̵a̵s̵s̵o̵c̵,̵[̲m̲u̲l̲_̲a̲s̲s̲o̲c̲,̲
+  ̲  ̲ ̲ ̲ ̲ ̲mul_comm, m̵u̵l̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵ ̵]̵m̲u̲l̲_̲l̲e̲f̲t̲_̲c̲o̲m̲m̲]̲
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: Calibrator/Conclusions.lean:469:136: This simp argument is unused:
+  mul_assoc
+
+Hint: Omit it from the simp argument list.
+  simp_all +decide [̵ ̵R̵e̵a̵l̵.̵e̵x̵p̵_̵n̵e̵_̵z̵e̵r̵o̵,̵ ̵m̵u̵l̵_̵a̵s̵s̵o̵c̵,̵[̲R̲e̲a̲l̲.̲e̲x̲p̲_̲n̲e̲_̲z̲e̲r̲o̲,̲
+  ̲  ̲ ̲ ̲ ̲ ̲mul_comm, m̵u̵l̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵ ̵]̵m̲u̲l̲_̲l̲e̲f̲t̲_̲c̲o̲m̲m̲]̲
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: Calibrator/Conclusions.lean:469:157: This simp argument is unused:
+  mul_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp_all +decide [̵ ̵R̵e̵a̵l̵.̵e̵x̵p̵_̵n̵e̵_̵z̵e̵r̵o̵,̵[̲R̲e̲a̲l̲.̲e̲x̲p̲_̲n̲e̲_̲z̲e̲r̲o̲,̲
+  ̲  ̲ ̲ ̲ ̲ ̲mul_assoc, m̵u̵l̵_̵c̵o̵m̵m̵,̵ ̵m̵u̵l̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵ ̵]̵m̲u̲l̲_̲c̲o̲m̲m̲]̲
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: Calibrator/Conclusions.lean:497:40: This simp argument is unused:
+  h_det
+
+Hint: Omit it from the simp argument list.
+  simp [matrixInvAlg, Matrix.inv_def,̵ ̵h̵_̵d̵e̵t̵]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: Calibrator/Conclusions.lean:681:29: This simp argument is unused:
+  neg_mul
+
+Hint: Omit it from the simp argument list.
+  simp [matrixInvAlg_eq_inv, n̵e̵g̵_̵m̵u̵l̵,̵ ̵Matrix.smul_mul]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+⚠ [3314/3317] Built Calibrator.DGP (118s)
+warning: Calibrator/DGP.lean:737:33: This simp argument is unused:
+  zero_mul
+
+Hint: Omit it from the simp argument list.
+  simp only [mul_zero, add_zero, z̵e̵r̵o̵_̵m̵u̵l̵,̵ ̵mul_one] at h0 h1
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: Calibrator/DGP.lean:1547:29: This simp argument is unused:
+  ha_def
+
+Hint: Omit it from the simp argument list.
+  simp only [model', ha̵_̵d̵e̵f̵,̵ ̵h̵b_def] at h
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: Calibrator/DGP.lean:1547:37: This simp argument is unused:
+  hb_def
+
+Hint: Omit it from the simp argument list.
+  simp only [model', ha_def,̵ ̵h̵b̵_̵d̵e̵f̵] at h
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: Calibrator/DGP.lean:2313:6: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+warning: Calibrator/DGP.lean:2367:14: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+warning: Calibrator/DGP.lean:2233:55: This simp argument is unused:
+  mul_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [g, ParamIx.equivSum, mul_comm, mul_l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵m̵u̵l̵_̵assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: Calibrator/DGP.lean:2328:8: This simp argument is unused:
+  add_assoc
+
+Hint: Omit it from the simp argument list.
+  simp [mul_add, Finset.mul_sum, Finset.sum_add_distrib, a̵d̵d̵_̵a̵s̵s̵o̵c̵,̵ ̵add_left_comm, add_comm]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: Calibrator/DGP.lean:2328:19: This simp argument is unused:
+  add_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [mul_add, Finset.mul_sum, Finset.sum_add_distrib, add_assoc, a̵d̵d̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵add_comm]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: Calibrator/DGP.lean:2328:34: This simp argument is unused:
+  add_comm
+
+Hint: Omit it from the simp argument list.
+  simp [mul_add, Finset.mul_sum, Finset.sum_add_distrib, add_assoc, a̵d̵d̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵a̵d̵d̵_̵c̵o̵m̵m̵]̵a̲d̲d̲_̲l̲e̲f̲t̲_̲c̲o̲m̲m̲]̲
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: Calibrator/DGP.lean:2531:4: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+warning: Calibrator/DGP.lean:2542:6: Try `simp at this` instead of `simpa using this`
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+warning: Calibrator/DGP.lean:2694:66: This simp argument is unused:
+  Finset.sum_mul
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, F̵i̵n̵s̵e̵t̵.̵s̵u̵m̵_̵m̵u̵l̵,̵ ̵sub_eq_add_neg]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: Calibrator/DGP.lean:2853:66: This simp argument is unused:
+  Finset.sum_mul
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, F̵i̵n̵s̵e̵t̵.̵s̵u̵m̵_̵m̵u̵l̵,̵ ̵sub_eq_add_neg]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: Calibrator/DGP.lean:2938:47: This simp argument is unused:
+  Pi.sub_apply
+
+Hint: Omit it from the simp argument list.
+  simp [X, pointwiseNLL, hm.dist_gaussian, P̵i̵.̵s̵u̵b̵_̵a̵p̵p̵l̵y̵,̵ ̵h_lin]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: Calibrator/DGP.lean:2943:8: This simp argument is unused:
+  Finset.sum_ite_eq'
+
+Hint: Omit it from the simp argument list.
+  simp [S, Matrix.mulVec, dotProduct, Matrix.diagonal_apply, F̵i̵n̵s̵e̵t̵.̵s̵u̵m̵_̵i̵t̵e̵_̵e̵q̵'̵,̵ ̵Finset.sum_ite_eq]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: Calibrator/DGP.lean:2954:41: This simp argument is unused:
+  mul_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [h_diag, pow_two, mul_comm, mul_l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵m̵u̵l̵_̵assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: Calibrator/DGP.lean:3004:52: This simp argument is unused:
+  Finset.sum_add_distrib
+
+Hint: Omit it from the simp argument list.
+  simp [g, ParamIxSum, hsum_pc, hsum_int,̵ ̵F̵i̵n̵s̵e̵t̵.̵s̵u̵m̵_̵a̵d̵d̵_̵d̵i̵s̵t̵r̵i̵b̵]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: Calibrator/DGP.lean:3041:5: unused variable `h_lambda_nonneg`
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+warning: Calibrator/DGP.lean:3108:64: This simp argument is unused:
+  Finset.sum_mul
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, F̵i̵n̵s̵e̵t̵.̵s̵u̵m̵_̵m̵u̵l̵,̵ ̵sub_eq_add_neg]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: Calibrator/DGP.lean:3253:55: This simp argument is unused:
+  add_assoc
+
+Hint: Omit it from the simp argument list.
+  simp [h_base_zero, h_inter_zero, mul_comm, add_a̵s̵s̵o̵c̵,̵ ̵a̵d̵d̵_̵left_comm, add_comm]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: Calibrator/DGP.lean:3253:66: This simp argument is unused:
+  add_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [h_base_zero, h_inter_zero, mul_comm, add_assoc, a̵d̵d̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵add_comm]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: Calibrator/DGP.lean:3255:87: This simp argument is unused:
+  add_assoc
+
+Hint: Omit it from the simp argument list.
+  simp [rawDesignMatrix, packRawParams, Matrix.mulVec, dotProduct, mul_comm,̵ ̵a̵d̵d̵_̵a̵s̵s̵o̵c̵]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: Calibrator/DGP.lean:3496:35: This simp argument is unused:
+  add_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [normalizedDesignMatrix, packNormalizedParams, Matrix.mulVec, dotProduct, mul_comm,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲add_assoc, a̵d̵d̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵add_comm]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: Calibrator/DGP.lean:3496:50: This simp argument is unused:
+  add_comm
+
+Hint: Omit it from the simp argument list.
+  simp [normalizedDesignMatrix, packNormalizedParams, Matrix.mulVec, dotProduct, mul_comm,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲add_assoc, a̵d̵d̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵a̵d̵d̵_̵c̵o̵m̵m̵]̵a̲d̲d̲_̲l̲e̲f̲t̲_̲c̲o̲m̲m̲]̲
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: Calibrator/DGP.lean:3883:73: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+warning: Calibrator/DGP.lean:3981:10: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+warning: Calibrator/DGP.lean:3840:54: This simp argument is unused:
+  Finset.sum_mul
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, F̵i̵n̵s̵e̵t̵.̵s̵u̵m̵_̵m̵u̵l̵,̵ ̵sub_eq_add_neg]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: Calibrator/DGP.lean:3916:62: This simp argument is unused:
+  Finset.sum_mul
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, F̵i̵n̵s̵e̵t̵.̵s̵u̵m̵_̵m̵u̵l̵,̵ ̵sub_eq_add_neg]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: Calibrator/DGP.lean:3920:61: This simp argument is unused:
+  Matrix.mulVec_sub
+
+Hint: Omit it from the simp argument list.
+  simp [Matrix.mulVec_add, Matrix.mulVec_smul, M̵a̵t̵r̵i̵x̵.̵m̵u̵l̵V̵e̵c̵_̵s̵u̵b̵,̵ ̵Matrix.mulVec_neg, Pi.add_apply,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲Pi.sub_apply, Pi.neg_apply, Pi.smul_apply, smul_eq_mul, mul_add, add_mul,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲sub_eq_add_neg, hb']
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: Calibrator/DGP.lean:4328:41: This simp argument is unused:
+  mul_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [h_diag, pow_two, mul_comm, mul_l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵m̵u̵l̵_̵assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: Calibrator/DGP.lean:4529:66: This simp argument is unused:
+  Finset.sum_mul
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, F̵i̵n̵s̵e̵t̵.̵s̵u̵m̵_̵m̵u̵l̵,̵ ̵sub_eq_add_neg]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: Calibrator/DGP.lean:6087:8: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+warning: Calibrator/DGP.lean:6100:8: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+warning: Calibrator/DGP.lean:7174:2: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+✔ [3315/3317] Built Calibrator.PortabilityDrift (26s)
+⚠ [3316/3317] Built Calibrator.OpenQuestions (8.5s)
+warning: Calibrator/OpenQuestions.lean:494:5: unused variable `h_ld`
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+warning: Calibrator/OpenQuestions.lean:560:5: unused variable `hfstS`
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+warning: Calibrator/OpenQuestions.lean:561:5: unused variable `hfst`
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+✔ [3317/3317] Built Calibrator.HaplotypeTheory (6.7s)
+Build completed successfully (3317 jobs).
