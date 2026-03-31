@@ -39,6 +39,13 @@ section CredibleSets
     Higher resolution → more precise causal variant identification. -/
 noncomputable def finemapResolution (cs_size : ℝ) : ℝ := 1 / cs_size
 
+/-- Formalizes the resolution of a fine-mapping result. -/
+structure FineMappingResult where
+  size : ℝ
+  resolution : ℝ
+  h_size_pos : 0 < size
+  h_res : resolution = finemapResolution size
+
 /-- **Credible set coverage.**
     A credible set is constructed by including variants in decreasing
     order of posterior inclusion probability until their cumulative
@@ -67,12 +74,13 @@ theorem credible_set_coverage
     credible set (cs_large_n ≤ cs_small_n) with cs_large_n < cs_small_n,
     then the ratio of sizes is strictly less than 1. -/
 theorem credible_set_shrinks_with_power
-    (cs_small_n cs_large_n : ℝ)
-    (h_pos_large : 0 < cs_large_n)
-    (h_pos_small : 0 < cs_small_n)
-    (h_resolution : finemapResolution cs_small_n < finemapResolution cs_large_n) :
-    cs_large_n / cs_small_n < 1 := by
+    (res_small_n res_large_n : FineMappingResult)
+    (h_resolution : res_small_n.resolution < res_large_n.resolution) :
+    res_large_n.size / res_small_n.size < 1 := by
+  rw [res_small_n.h_res, res_large_n.h_res] at h_resolution
   unfold finemapResolution at h_resolution
+  have h_pos_small := res_small_n.h_size_pos
+  have h_pos_large := res_large_n.h_size_pos
   rw [div_lt_div_iff₀ h_pos_small h_pos_large] at h_resolution
   simp at h_resolution
   rw [div_lt_one h_pos_small]
@@ -85,11 +93,13 @@ theorem credible_set_shrinks_with_power
     With shorter LD, the fine-mapping resolution is higher,
     which implies a smaller credible set. -/
 theorem shorter_ld_smaller_credible_sets
-    (cs_eur cs_afr : ℝ)
-    (h_eur_pos : 0 < cs_eur) (h_afr_pos : 0 < cs_afr)
-    (h_higher_res : finemapResolution cs_eur < finemapResolution cs_afr) :
-    cs_afr < cs_eur := by
+    (res_eur res_afr : FineMappingResult)
+    (h_higher_res : res_eur.resolution < res_afr.resolution) :
+    res_afr.size < res_eur.size := by
+  rw [res_eur.h_res, res_afr.h_res] at h_higher_res
   unfold finemapResolution at h_higher_res
+  have h_eur_pos := res_eur.h_size_pos
+  have h_afr_pos := res_afr.h_size_pos
   rw [div_lt_div_iff₀ h_eur_pos h_afr_pos] at h_higher_res
   linarith
 
