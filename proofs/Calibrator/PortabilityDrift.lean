@@ -3475,28 +3475,36 @@ noncomputable def covarianceRetention (freq_corr ld_overlap : ℝ) : ℝ :=
 
 /-- Allele frequency correlation equals `1 - Fst`, where Fst measures the
     fraction of genetic variance due to population divergence. -/
-noncomputable def freqCorrFromFst (fst : ℝ) : ℝ := 1 - fst
+structure PopulationDivergence where
+  fst : ℝ
+  freqCorr : ℝ
+  h_eq : freqCorr = 1 - fst
+
+noncomputable def freqCorrFromFst (div : PopulationDivergence) : ℝ := div.freqCorr
+
+theorem freqCorrFromFst_eq (div : PopulationDivergence) : freqCorrFromFst div = 1 - div.fst := div.h_eq
 
 /-- LD overlap is directly the shared LD fraction (identity mapping, made
     explicit for clarity in the derivation chain). -/
 noncomputable def ldOverlapFromSharedLD (shared_ld : ℝ) : ℝ := shared_ld
 
 /-- Covariance retention in terms of Fst and shared_LD. -/
-theorem covarianceRetention_from_fst_ld (fst shared_ld : ℝ) :
-    covarianceRetention (freqCorrFromFst fst) (ldOverlapFromSharedLD shared_ld) =
-      (1 - fst) * shared_ld := by
-  unfold covarianceRetention freqCorrFromFst ldOverlapFromSharedLD
+theorem covarianceRetention_from_fst_ld (div : PopulationDivergence) (shared_ld : ℝ) :
+    covarianceRetention (freqCorrFromFst div) (ldOverlapFromSharedLD shared_ld) =
+      (1 - div.fst) * shared_ld := by
+  rw [freqCorrFromFst_eq]
+  unfold covarianceRetention ldOverlapFromSharedLD
   ring
 
 /-- **Covariance divergence derived from retention.**
     Divergence is `1 - retention`, which yields the multiplicative formula
     `1 - (1 - Fst) × shared_LD`. -/
-noncomputable def covarianceDivergenceFromRetention (fst shared_ld : ℝ) : ℝ :=
-  1 - covarianceRetention (freqCorrFromFst fst) (ldOverlapFromSharedLD shared_ld)
+noncomputable def covarianceDivergenceFromRetention (div : PopulationDivergence) (shared_ld : ℝ) : ℝ :=
+  1 - covarianceRetention (freqCorrFromFst div) (ldOverlapFromSharedLD shared_ld)
 
 /-- The derived divergence formula equals `1 - (1 - Fst) × shared_LD`. -/
-theorem covarianceDivergenceFromRetention_eq (fst shared_ld : ℝ) :
-    covarianceDivergenceFromRetention fst shared_ld = 1 - (1 - fst) * shared_ld := by
+theorem covarianceDivergenceFromRetention_eq (div : PopulationDivergence) (shared_ld : ℝ) :
+    covarianceDivergenceFromRetention div shared_ld = 1 - (1 - div.fst) * shared_ld := by
   unfold covarianceDivergenceFromRetention
   rw [covarianceRetention_from_fst_ld]
 
@@ -3523,9 +3531,9 @@ theorem covarianceDivergenceMutationDrift_eq (fst_drift shared_ld : ℝ) :
     `covarianceDivergenceMutationDrift`, confirming the multiplicative
     structure is not merely assumed but follows from the independence
     of allele frequency drift and LD decay. -/
-theorem covarianceDivergence_derivation_matches (fst shared_ld : ℝ) :
-    covarianceDivergenceFromRetention fst shared_ld =
-      covarianceDivergenceMutationDrift fst shared_ld := by
+theorem covarianceDivergence_derivation_matches (div : PopulationDivergence) (shared_ld : ℝ) :
+    covarianceDivergenceFromRetention div shared_ld =
+      covarianceDivergenceMutationDrift div.fst shared_ld := by
   rw [covarianceDivergenceFromRetention_eq, covarianceDivergenceMutationDrift_eq]
 
 /-- With perfect shared LD (shared_ld = 1), covariance divergence reduces to pure drift. -/

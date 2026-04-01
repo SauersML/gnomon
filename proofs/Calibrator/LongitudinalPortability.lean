@@ -69,22 +69,32 @@ theorem portability_decreases_with_time (r2_initial lambda_total t₁ t₂ : ℝ
 /-- **Drift component of decay.**
     Under Wright-Fisher drift with Ne:
     λ_drift = 1/(2Ne) per generation. -/
-noncomputable def longitudinalDriftDecayRate (Ne : ℝ) : ℝ := 1 / (2 * Ne)
+structure WrightFisherDrift where
+  Ne : ℝ
+  h_Ne_pos : 0 < Ne
+  decayRate : ℝ
+  h_decay_eq : decayRate = 1 / (2 * Ne)
+
+noncomputable def longitudinalDriftDecayRate (drift : WrightFisherDrift) : ℝ := drift.decayRate
+
+theorem longitudinalDriftDecayRate_eq (drift : WrightFisherDrift) :
+    longitudinalDriftDecayRate drift = 1 / (2 * drift.Ne) := drift.h_decay_eq
 
 /-- Drift decay rate is positive for positive Ne. -/
-theorem drift_decay_rate_pos (Ne : ℝ) (h : 0 < Ne) :
-    0 < longitudinalDriftDecayRate Ne := by
-  unfold longitudinalDriftDecayRate
+theorem drift_decay_rate_pos (drift : WrightFisherDrift) :
+    0 < longitudinalDriftDecayRate drift := by
+  rw [longitudinalDriftDecayRate_eq drift]
+  have h := drift.h_Ne_pos
   positivity
 
 /-- **Larger populations drift slower.**
     If Ne₁ < Ne₂, then λ_drift₁ > λ_drift₂. -/
-theorem larger_Ne_slower_drift (Ne₁ Ne₂ : ℝ)
-    (h₁ : 0 < Ne₁) (h₂ : 0 < Ne₂) (h_lt : Ne₁ < Ne₂) :
-    longitudinalDriftDecayRate Ne₂ < longitudinalDriftDecayRate Ne₁ := by
-  unfold longitudinalDriftDecayRate
-  have h1' : 0 < 2 * Ne₁ := by positivity
-  have h2' : 0 < 2 * Ne₂ := by positivity
+theorem larger_Ne_slower_drift (drift₁ drift₂ : WrightFisherDrift)
+    (h_lt : drift₁.Ne < drift₂.Ne) :
+    longitudinalDriftDecayRate drift₂ < longitudinalDriftDecayRate drift₁ := by
+  rw [longitudinalDriftDecayRate_eq drift₁, longitudinalDriftDecayRate_eq drift₂]
+  have h1' : 0 < 2 * drift₁.Ne := by have h := drift₁.h_Ne_pos; positivity
+  have h2' : 0 < 2 * drift₂.Ne := by have h := drift₂.h_Ne_pos; positivity
   apply (div_lt_div_iff₀ h2' h1').2
   nlinarith
 
