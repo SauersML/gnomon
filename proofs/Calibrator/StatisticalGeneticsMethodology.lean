@@ -222,13 +222,22 @@ noncomputable def zScore (beta se : ℝ) : ℝ := beta / se
     n_eff_j = (Z_j / β_true_j)² if β_true_j were known.
     In practice: n_eff = median over SNPs of 1/SE_j².
     This can differ from the reported GWAS n. -/
-noncomputable def effectiveSampleSizeSE (se : ℝ) : ℝ := 1 / se ^ 2
+structure StandardErrorStats where
+  se : ℝ
+  h_se_pos : 0 < se
+  effective_n : ℝ
+  h_eq : effective_n = 1 / se ^ 2
+
+noncomputable def effectiveSampleSizeSE (stats : StandardErrorStats) : ℝ := stats.effective_n
+
+theorem effectiveSampleSizeSE_eq (stats : StandardErrorStats) :
+    effectiveSampleSizeSE stats = 1 / stats.se ^ 2 := stats.h_eq
 
 /-- Effective sample size is positive. -/
-theorem effective_n_pos (se : ℝ) (h_se : 0 < se) :
-    0 < effectiveSampleSizeSE se := by
-  unfold effectiveSampleSizeSE
-  exact div_pos one_pos (sq_pos_of_pos h_se)
+theorem effective_n_pos (stats : StandardErrorStats) :
+    0 < effectiveSampleSizeSE stats := by
+  rw [effectiveSampleSizeSE_eq stats]
+  exact div_pos one_pos (sq_pos_of_pos stats.h_se_pos)
 
 /- **Multi-ancestry meta-analysis of summary statistics.**
     β̂_meta = Σ_k w_k β̂_k / Σ_k w_k where w_k = 1/SE_k².

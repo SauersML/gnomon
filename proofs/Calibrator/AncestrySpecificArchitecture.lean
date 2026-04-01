@@ -446,10 +446,11 @@ noncomputable def portabilityFromArchitecture
     drift and LD decay. This connects the architecture-level formula to the
     derivation chain: covarianceRetention → covarianceDivergenceFromRetention. -/
 theorem portabilityFromArchitecture_eq_rg_sq_mul_retention
-    (rg fst tagging_ratio : ℝ) :
-    portabilityFromArchitecture rg fst tagging_ratio =
-      rg^2 * covarianceRetention (freqCorrFromFst fst) (ldOverlapFromSharedLD tagging_ratio) := by
-  unfold portabilityFromArchitecture covarianceRetention freqCorrFromFst ldOverlapFromSharedLD
+    (rg : ℝ) (div : PopulationDivergence) (tagging_ratio : ℝ) :
+    portabilityFromArchitecture rg div.fst tagging_ratio =
+      rg^2 * covarianceRetention (freqCorrFromFst div) (ldOverlapFromSharedLD tagging_ratio) := by
+  rw [freqCorrFromFst_eq]
+  unfold portabilityFromArchitecture covarianceRetention ldOverlapFromSharedLD
   ring
 
 /-- **Portability equals rg² × (1 - divergence), where divergence is derived.**
@@ -457,11 +458,12 @@ theorem portabilityFromArchitecture_eq_rg_sq_mul_retention
     so retention = 1 - divergence = (1-fst)×tagging. This shows portability
     is rg² × (1 - covarianceDivergenceFromRetention). -/
 theorem portabilityFromArchitecture_from_divergence
-    (rg fst tagging_ratio : ℝ) :
-    portabilityFromArchitecture rg fst tagging_ratio =
-      rg^2 * (1 - covarianceDivergenceFromRetention fst tagging_ratio) := by
+    (rg : ℝ) (div : PopulationDivergence) (tagging_ratio : ℝ) :
+    portabilityFromArchitecture rg div.fst tagging_ratio =
+      rg^2 * (1 - covarianceDivergenceFromRetention div tagging_ratio) := by
   unfold portabilityFromArchitecture covarianceDivergenceFromRetention
-    covarianceRetention freqCorrFromFst ldOverlapFromSharedLD
+    covarianceRetention ldOverlapFromSharedLD
+  rw [freqCorrFromFst_eq]
   ring
 
 /-- Portability is bounded by rg². -/
