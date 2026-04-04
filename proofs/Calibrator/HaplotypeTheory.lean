@@ -243,10 +243,24 @@ noncomputable def dosagePhaseMisspecificationError
     (1 - freq_cis) *
       (interaction_trans - averagePhaseInteraction freq_cis interaction_cis interaction_trans) ^ 2
 
-/-- A phase-aware haplotype predictor that tracks cis/trans configuration has no
-structural phase-misspecification error. -/
-noncomputable def haplotypePhasePredictionError : ℝ :=
-  0
+structure HaplotypePhaseModel where
+  pred_cis : ℝ
+  pred_trans : ℝ
+
+/-- A phase-aware haplotype predictor that tracks cis/trans configuration explicitly
+models the structural phase effects. -/
+noncomputable def haplotypePhasePredictionError
+    (m : HaplotypePhaseModel) (freq_cis interaction_cis_actual interaction_trans_actual : ℝ) : ℝ :=
+  freq_cis * (m.pred_cis - interaction_cis_actual) ^ 2 +
+    (1 - freq_cis) * (m.pred_trans - interaction_trans_actual) ^ 2
+
+theorem haplotypePhasePredictionError_eq_zero
+    (m : HaplotypePhaseModel) (freq_cis interaction_cis_actual interaction_trans_actual : ℝ)
+    (h_cis : m.pred_cis = interaction_cis_actual)
+    (h_trans : m.pred_trans = interaction_trans_actual) :
+    haplotypePhasePredictionError m freq_cis interaction_cis_actual interaction_trans_actual = 0 := by
+  rw [haplotypePhasePredictionError, h_cis, h_trans, sub_self, sub_self]
+  ring
 
 /-- Transport bias from carrying a source-trained dosage approximation into a
 target population whose cis/trans configuration frequency differs. -/
@@ -255,11 +269,21 @@ noncomputable def dosageTransportBias
   |averagePhaseInteraction freq_cis_target interaction_cis interaction_trans -
     averagePhaseInteraction freq_cis_source interaction_cis interaction_trans|
 
-/-- A phase-aware haplotype model transports without this structural bias when
-the cis/trans effects themselves are portable and only configuration
-frequencies differ. -/
-noncomputable def haplotypeTransportBias : ℝ :=
-  0
+/-- A phase-aware haplotype model's transport bias depends on its predicted effects. -/
+noncomputable def haplotypeTransportBias
+    (m : HaplotypePhaseModel) (freq_cis_target interaction_cis_actual interaction_trans_actual : ℝ) : ℝ :=
+  |(freq_cis_target * m.pred_cis + (1 - freq_cis_target) * m.pred_trans) -
+    (freq_cis_target * interaction_cis_actual + (1 - freq_cis_target) * interaction_trans_actual)|
+
+theorem haplotypeTransportBias_eq_zero
+    (m : HaplotypePhaseModel) (freq_cis_target interaction_cis_actual interaction_trans_actual : ℝ)
+    (h_cis : m.pred_cis = interaction_cis_actual)
+    (h_trans : m.pred_trans = interaction_trans_actual) :
+    haplotypeTransportBias m freq_cis_target interaction_cis_actual interaction_trans_actual = 0 := by
+  rw [haplotypeTransportBias, h_cis, h_trans]
+  have h_sub : freq_cis_target * interaction_cis_actual + (1 - freq_cis_target) * interaction_trans_actual -
+    (freq_cis_target * interaction_cis_actual + (1 - freq_cis_target) * interaction_trans_actual) = 0 := by ring
+  rw [h_sub, abs_zero]
 
 /-- The dosage-only phase-misspecification error has the exact variance form
 `f(1-f)(δ_cis - δ_trans)^2`. -/
@@ -288,9 +312,12 @@ theorem compound_het_not_captured_by_dosage
     (freq_cis interaction_cis interaction_trans : ℝ)
     (h_freq : 0 < freq_cis ∧ freq_cis < 1)
     (h_phase_gap : interaction_cis ≠ interaction_trans) :
-    haplotypePhasePredictionError < dosagePhaseMisspecificationError freq_cis interaction_cis interaction_trans := by
+    let m : HaplotypePhaseModel := { pred_cis := interaction_cis, pred_trans := interaction_trans }
+    haplotypePhasePredictionError m freq_cis interaction_cis interaction_trans < dosagePhaseMisspecificationError freq_cis interaction_cis interaction_trans := by
+  intro m
   rcases h_freq with ⟨h_freq_pos, h_freq_lt_one⟩
-  rw [dosagePhaseMisspecificationError_eq, haplotypePhasePredictionError]
+  rw [dosagePhaseMisspecificationError_eq]
+  rw [haplotypePhasePredictionError_eq_zero m freq_cis interaction_cis interaction_trans rfl rfl]
   have h_gap_sq : 0 < (interaction_cis - interaction_trans) ^ 2 := by
     exact sq_pos_of_ne_zero (sub_ne_zero.mpr h_phase_gap)
   have h_mix : 0 < freq_cis * (1 - freq_cis) := by
@@ -334,9 +361,12 @@ section HaplotypePGS
 theorem haplotype_pgs_at_least_snp
     (freq_cis interaction_cis interaction_trans : ℝ)
     (h_freq_nonneg : 0 ≤ freq_cis) (h_freq_le_one : freq_cis ≤ 1) :
-    haplotypePhasePredictionError ≤
+    let m : HaplotypePhaseModel := { pred_cis := interaction_cis, pred_trans := interaction_trans }
+    haplotypePhasePredictionError m freq_cis interaction_cis interaction_trans ≤
       dosagePhaseMisspecificationError freq_cis interaction_cis interaction_trans := by
-  rw [dosagePhaseMisspecificationError_eq, haplotypePhasePredictionError]
+  intro m
+  rw [dosagePhaseMisspecificationError_eq]
+  rw [haplotypePhasePredictionError_eq_zero m freq_cis interaction_cis interaction_trans rfl rfl]
   have h_mix_nonneg : 0 ≤ freq_cis * (1 - freq_cis) := by
     exact mul_nonneg h_freq_nonneg (sub_nonneg.mpr h_freq_le_one)
   exact mul_nonneg h_mix_nonneg (sq_nonneg _)
@@ -350,9 +380,12 @@ theorem haplotype_pgs_more_portable_for_cis
     (freq_cis_source freq_cis_target interaction_cis interaction_trans : ℝ)
     (h_freq_shift : freq_cis_source ≠ freq_cis_target)
     (h_phase_gap : interaction_cis ≠ interaction_trans) :
-    haplotypeTransportBias < dosageTransportBias
+    let m : HaplotypePhaseModel := { pred_cis := interaction_cis, pred_trans := interaction_trans }
+    haplotypeTransportBias m freq_cis_target interaction_cis interaction_trans < dosageTransportBias
       freq_cis_source freq_cis_target interaction_cis interaction_trans := by
-  rw [dosageTransportBias_eq, haplotypeTransportBias]
+  intro m
+  rw [dosageTransportBias_eq]
+  rw [haplotypeTransportBias_eq_zero m freq_cis_target interaction_cis interaction_trans rfl rfl]
   exact mul_pos
     (abs_pos.mpr (sub_ne_zero.mpr h_freq_shift.symm))
     (abs_pos.mpr (sub_ne_zero.mpr h_phase_gap))
