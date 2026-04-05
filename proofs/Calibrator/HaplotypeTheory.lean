@@ -233,6 +233,18 @@ noncomputable def averagePhaseInteraction
     (freq_cis interaction_cis interaction_trans : ℝ) : ℝ :=
   freq_cis * interaction_cis + (1 - freq_cis) * interaction_trans
 
+/-- General structural error for any phase predictor (dosage or haplotype). -/
+noncomputable def phasePredictionError
+    (freq_cis interaction_cis interaction_trans pred_cis pred_trans : ℝ) : ℝ :=
+  freq_cis * (interaction_cis - pred_cis) ^ 2 +
+    (1 - freq_cis) * (interaction_trans - pred_trans) ^ 2
+
+/-- General transport bias between a source and target predictor. -/
+noncomputable def phaseTransportBias
+    (freq_cis_target interaction_cis interaction_trans pred_cis pred_trans : ℝ) : ℝ :=
+  |averagePhaseInteraction freq_cis_target interaction_cis interaction_trans -
+    averagePhaseInteraction freq_cis_target pred_cis pred_trans|
+
 /-- Structural error from using a dosage-only predictor that cannot distinguish
 cis from trans configurations. The best dosage-only predictor within a fixed
 dosage class uses the population-average interaction, leaving this residual
