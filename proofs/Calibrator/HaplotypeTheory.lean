@@ -261,6 +261,12 @@ frequencies differ. -/
 noncomputable def haplotypeTransportBias : ℝ :=
   0
 
+/-- Structural error when predicting true phase interactions with an arbitrary predictor. -/
+noncomputable def phasePredictionError
+    (freq_cis true_cis true_trans pred_cis pred_trans : ℝ) : ℝ :=
+  freq_cis * (true_cis - pred_cis) ^ 2 +
+    (1 - freq_cis) * (true_trans - pred_trans) ^ 2
+
 /-- The dosage-only phase-misspecification error has the exact variance form
 `f(1-f)(δ_cis - δ_trans)^2`. -/
 theorem dosagePhaseMisspecificationError_eq
