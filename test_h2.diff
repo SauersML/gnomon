@@ -1,0 +1,72 @@
+<<<<<<< SEARCH
+/-- **Haplotype PGS captures more variance than SNP PGS.**
+    Here the comparison is made on the explicit phase-misspecification error
+    surface from the previous section: a phase-aware haplotype score has zero
+    structural error, while a dosage-only SNP score has nonnegative error, and
+    strictly positive error whenever both cis and trans states occur and their
+    effects differ. -/
+theorem haplotype_pgs_at_least_snp
+    (freq_cis interaction_cis interaction_trans : ℝ)
+    (h_freq_nonneg : 0 ≤ freq_cis) (h_freq_le_one : freq_cis ≤ 1) :
+    haplotypePhasePredictionError ≤
+      dosagePhaseMisspecificationError freq_cis interaction_cis interaction_trans := by
+  rw [dosagePhaseMisspecificationError_eq, haplotypePhasePredictionError]
+  have h_mix_nonneg : 0 ≤ freq_cis * (1 - freq_cis) := by
+    exact mul_nonneg h_freq_nonneg (sub_nonneg.mpr h_freq_le_one)
+  exact mul_nonneg h_mix_nonneg (sq_nonneg _)
+
+/-- **Haplotype PGS portability can be better.**
+    If the causal mechanism acts through cis/trans haplotype configuration,
+    transporting a dosage-only approximation incurs structural bias whenever
+    the target phase-configuration frequency differs from the source. A
+    phase-aware haplotype model avoids this bias. -/
+theorem haplotype_pgs_more_portable_for_cis
+    (freq_cis_source freq_cis_target interaction_cis interaction_trans : ℝ)
+    (h_freq_shift : freq_cis_source ≠ freq_cis_target)
+    (h_phase_gap : interaction_cis ≠ interaction_trans) :
+    haplotypeTransportBias < dosageTransportBias
+      freq_cis_source freq_cis_target interaction_cis interaction_trans := by
+  rw [dosageTransportBias_eq, haplotypeTransportBias]
+  exact mul_pos
+    (abs_pos.mpr (sub_ne_zero.mpr h_freq_shift.symm))
+    (abs_pos.mpr (sub_ne_zero.mpr h_phase_gap))
+=======
+/-- **Haplotype PGS captures more variance than SNP PGS.**
+    Here the comparison is made on the explicit phase-misspecification error
+    surface from the previous section: a phase-aware haplotype score has zero
+    structural error, while a dosage-only SNP score has nonnegative error, and
+    strictly positive error whenever both cis and trans states occur and their
+    effects differ. -/
+theorem haplotype_pgs_at_least_snp
+    (freq_cis interaction_cis interaction_trans : ℝ)
+    (h_freq_nonneg : 0 ≤ freq_cis) (h_freq_le_one : freq_cis ≤ 1) :
+    haplotypePhasePredictionError freq_cis interaction_cis interaction_trans interaction_cis interaction_trans ≤
+      dosagePhaseMisspecificationError freq_cis interaction_cis interaction_trans := by
+  have h_zero : haplotypePhasePredictionError freq_cis interaction_cis interaction_trans interaction_cis interaction_trans = 0 := by
+    unfold haplotypePhasePredictionError
+    ring
+  rw [dosagePhaseMisspecificationError_eq, h_zero]
+  have h_mix_nonneg : 0 ≤ freq_cis * (1 - freq_cis) := by
+    exact mul_nonneg h_freq_nonneg (sub_nonneg.mpr h_freq_le_one)
+  exact mul_nonneg h_mix_nonneg (sq_nonneg _)
+
+/-- **Haplotype PGS portability can be better.**
+    If the causal mechanism acts through cis/trans haplotype configuration,
+    transporting a dosage-only approximation incurs structural bias whenever
+    the target phase-configuration frequency differs from the source. A
+    phase-aware haplotype model avoids this bias. -/
+theorem haplotype_pgs_more_portable_for_cis
+    (freq_cis_source freq_cis_target interaction_cis interaction_trans : ℝ)
+    (h_freq_shift : freq_cis_source ≠ freq_cis_target)
+    (h_phase_gap : interaction_cis ≠ interaction_trans) :
+    haplotypeTransportBias freq_cis_target interaction_cis interaction_trans interaction_cis interaction_trans < dosageTransportBias
+      freq_cis_source freq_cis_target interaction_cis interaction_trans := by
+  have h_zero : haplotypeTransportBias freq_cis_target interaction_cis interaction_trans interaction_cis interaction_trans = 0 := by
+    unfold haplotypeTransportBias
+    have h_abs : |(0:ℝ)| = 0 := abs_zero
+    rw [sub_self, h_abs]
+  rw [dosageTransportBias_eq, h_zero]
+  exact mul_pos
+    (abs_pos.mpr (sub_ne_zero.mpr h_freq_shift.symm))
+    (abs_pos.mpr (sub_ne_zero.mpr h_phase_gap))
+>>>>>>> REPLACE
