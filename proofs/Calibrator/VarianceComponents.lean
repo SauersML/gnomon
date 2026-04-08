@@ -186,27 +186,42 @@ and the GWAS sample size.
 
 section PGSCeiling
 
+/-- **Expected PGS R² model.**
+    Combines SNP heritability, GWAS power fraction, and portability ratio. -/
+noncomputable def expectedPGSR2 (h2_snp power_fraction portability_ratio : ℝ) : ℝ :=
+  h2_snp * power_fraction * portability_ratio
+
 /-- **PGS R² ceiling from heritability.**
     R²_PGS ≤ h²_SNP. No PGS can explain more variance than what's
     genetically tagged. The PGS explains a fraction f of tagged
     additive variance, so R²_PGS = f × h²_SNP ≤ h²_SNP. -/
 theorem pgs_r2_ceiling_from_h2
-    (h2_snp f : ℝ)
+    (h2_snp power_fraction portability_ratio : ℝ)
     (h_h2 : 0 < h2_snp)
-    (h_f_nn : 0 ≤ f) (h_f_le : f ≤ 1) :
-    h2_snp * f ≤ h2_snp := by
-  exact mul_le_of_le_one_right (le_of_lt h_h2) h_f_le
+    (h_power_nn : 0 ≤ power_fraction) (h_power_le : power_fraction ≤ 1)
+    (h_port_nn : 0 ≤ portability_ratio) (h_port_le : portability_ratio ≤ 1) :
+    expectedPGSR2 h2_snp power_fraction portability_ratio ≤ h2_snp := by
+  unfold expectedPGSR2
+  have h1 : power_fraction * portability_ratio ≤ 1 * 1 := mul_le_mul h_power_le h_port_le h_port_nn zero_le_one
+  rw [mul_one] at h1
+  have h_assoc : h2_snp * power_fraction * portability_ratio = h2_snp * (power_fraction * portability_ratio) := by ring
+  rw [h_assoc]
+  exact mul_le_of_le_one_right (le_of_lt h_h2) h1
 
 /-- **PGS R² ceiling from GWAS power.**
     R²_PGS ≤ h²_SNP × (1 - (1-power)^m)
     where power is per-SNP GWAS power and m is number of causal SNPs.
     With finite sample size, not all SNPs are discovered. -/
 theorem pgs_r2_ceiling_from_gwas_power
-    (h2_snp power_fraction : ℝ)
+    (h2_snp power_fraction portability_ratio : ℝ)
     (h_h2 : 0 < h2_snp) (h_h2_le : h2_snp ≤ 1)
-    (h_power : 0 < power_fraction) (h_power_le : power_fraction ≤ 1) :
-    h2_snp * power_fraction ≤ h2_snp := by
-  exact mul_le_of_le_one_right (le_of_lt h_h2) h_power_le
+    (h_power_nn : 0 ≤ power_fraction) (h_power_le : power_fraction ≤ 1)
+    (h_port_nn : 0 ≤ portability_ratio) (h_port_le : portability_ratio ≤ 1) :
+    expectedPGSR2 h2_snp power_fraction portability_ratio ≤ h2_snp * power_fraction := by
+  unfold expectedPGSR2
+  have h1 : h2_snp * power_fraction * portability_ratio ≤ h2_snp * power_fraction * 1 :=
+    mul_le_mul_of_nonneg_left h_port_le (mul_nonneg (le_of_lt h_h2) h_power_nn)
+  exact h1.trans (by rw [mul_one])
 
 /-- **Portability further reduces the ceiling.**
     R²_PGS_target ≤ h²_SNP × power_fraction × portability_ratio. -/
@@ -214,9 +229,10 @@ theorem portability_reduces_ceiling
     (h2_snp power_frac port_ratio : ℝ)
     (h_h2 : 0 < h2_snp) (h_power : 0 < power_frac) (h_port : 0 < port_ratio)
     (h_power_le : power_frac ≤ 1) (h_port_le : port_ratio ≤ 1) :
-    h2_snp * power_frac * port_ratio ≤ h2_snp := by
-  calc h2_snp * power_frac * port_ratio
+    expectedPGSR2 h2_snp power_frac port_ratio ≤ h2_snp := by
+  calc expectedPGSR2 h2_snp power_frac port_ratio
       ≤ h2_snp * 1 * 1 := by
+        unfold expectedPGSR2
         apply mul_le_mul
         · exact mul_le_mul_of_nonneg_left h_power_le (le_of_lt h_h2)
         · exact h_port_le
@@ -228,12 +244,12 @@ theorem portability_reduces_ceiling
     R²_target ≤ h² × (GWAS power) × (portability ratio).
     Each factor is ≤ 1, and the product can be very small. -/
 theorem three_way_ceiling
-    (h2 gwas_power port_ratio target_r2 : ℝ)
+    (h2 gwas_power port_ratio : ℝ)
     (h_h2_le : h2 ≤ 1) (h_power_le : gwas_power ≤ 1)
     (h_port_le : port_ratio ≤ 1)
-    (h_h2_nn : 0 ≤ h2) (h_power_nn : 0 ≤ gwas_power) (h_port_nn : 0 ≤ port_ratio)
-    (h_bound : target_r2 ≤ h2 * gwas_power * port_ratio) :
-    target_r2 ≤ 1 := by
+    (h_h2_nn : 0 ≤ h2) (h_power_nn : 0 ≤ gwas_power) (h_port_nn : 0 ≤ port_ratio) :
+    expectedPGSR2 h2 gwas_power port_ratio ≤ 1 := by
+  unfold expectedPGSR2
   have : h2 * gwas_power * port_ratio ≤ 1 := by
     calc h2 * gwas_power * port_ratio
         ≤ 1 * 1 * 1 := by nlinarith [mul_nonneg h_h2_nn h_power_nn]
