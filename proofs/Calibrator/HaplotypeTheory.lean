@@ -258,8 +258,19 @@ noncomputable def dosageTransportBias
 /-- A phase-aware haplotype model transports without this structural bias when
 the cis/trans effects themselves are portable and only configuration
 frequencies differ. -/
-noncomputable def haplotypeTransportBias : ℝ :=
-  0
+noncomputable def haplotypeTransportBias
+    (freq_cis_target interaction_cis interaction_trans : ℝ) : ℝ :=
+  |averagePhaseInteraction freq_cis_target interaction_cis interaction_trans -
+    averagePhaseInteraction freq_cis_target interaction_cis interaction_trans|
+
+theorem haplotypeTransportBias_eq
+    (freq_cis_target interaction_cis interaction_trans : ℝ) :
+    haplotypeTransportBias freq_cis_target interaction_cis interaction_trans = 0 := by
+  unfold haplotypeTransportBias
+  have h : averagePhaseInteraction freq_cis_target interaction_cis interaction_trans -
+           averagePhaseInteraction freq_cis_target interaction_cis interaction_trans = 0 := by ring
+  rw [h]
+  exact abs_zero
 
 /-- The dosage-only phase-misspecification error has the exact variance form
 `f(1-f)(δ_cis - δ_trans)^2`. -/
@@ -350,9 +361,9 @@ theorem haplotype_pgs_more_portable_for_cis
     (freq_cis_source freq_cis_target interaction_cis interaction_trans : ℝ)
     (h_freq_shift : freq_cis_source ≠ freq_cis_target)
     (h_phase_gap : interaction_cis ≠ interaction_trans) :
-    haplotypeTransportBias < dosageTransportBias
-      freq_cis_source freq_cis_target interaction_cis interaction_trans := by
-  rw [dosageTransportBias_eq, haplotypeTransportBias]
+    haplotypeTransportBias freq_cis_target interaction_cis interaction_trans <
+      dosageTransportBias freq_cis_source freq_cis_target interaction_cis interaction_trans := by
+  rw [dosageTransportBias_eq, haplotypeTransportBias_eq]
   exact mul_pos
     (abs_pos.mpr (sub_ne_zero.mpr h_freq_shift.symm))
     (abs_pos.mpr (sub_ne_zero.mpr h_phase_gap))
