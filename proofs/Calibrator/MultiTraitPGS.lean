@@ -46,17 +46,34 @@ theorem genetic_correlation_bounded_mt
     -1 ≤ rg ∧ rg ≤ 1 := by
   exact ⟨by linarith [abs_nonneg rg, abs_le.mp h_bound |>.1], abs_le.mp h_bound |>.2⟩
 
+/-- Two-locus covariance between trait A and trait B given causal effects and LD `rho`. -/
+noncomputable def twoLocusGeneticCovariance (bA1 bA2 bB1 bB2 rho : ℝ) : ℝ :=
+  bA1 * bB1 + bA2 * bB2 + rho * (bA1 * bB2 + bA2 * bB1)
+
+/-- Two-locus genetic variance for a trait. -/
+noncomputable def twoLocusGeneticVariance (b1 b2 rho : ℝ) : ℝ :=
+  twoLocusGeneticCovariance b1 b2 b1 b2 rho
+
+/-- Exact genetic correlation under a two-locus model. -/
+noncomputable def twoLocusGeneticCorrelation (bA1 bA2 bB1 bB2 rho : ℝ) : ℝ :=
+  geneticCorrelationMT
+    (twoLocusGeneticCovariance bA1 bA2 bB1 bB2 rho)
+    (twoLocusGeneticVariance bA1 bA2 rho)
+    (twoLocusGeneticVariance bB1 bB2 rho)
+
 /-- **Genetic correlation is partially ancestry-specific.**
-    r_g between traits A and B may differ between EUR and AFR
-    due to different LD patterns and GxE. If LD and GxE introduce
-    a nonzero perturbation δ, the ancestry-specific r_g differs. -/
+    r_g between traits A and B may differ between ancestries
+    due to different LD patterns, rigorously modeled via a two-locus framework. -/
 theorem rg_ancestry_specific
-    (rg_eur δ : ℝ)
-    (h_delta_ne : δ ≠ 0) :
-    rg_eur ≠ rg_eur + δ := by
-  intro h
-  have : δ = 0 := by linarith
-  exact h_delta_ne this
+    (rho_eur rho_afr : ℝ)
+    (h_rho : rho_eur ≠ rho_afr) :
+    twoLocusGeneticCorrelation 1 0 0 1 rho_eur ≠
+    twoLocusGeneticCorrelation 1 0 0 1 rho_afr := by
+  unfold twoLocusGeneticCorrelation twoLocusGeneticVariance twoLocusGeneticCovariance geneticCorrelationMT
+  set_option linter.unusedSimpArgs false in
+  simp only [mul_zero, mul_one, zero_mul, add_zero, zero_add, one_mul]
+  have h1 : Real.sqrt (1 * 1) = 1 := by simp
+  simp [h1, h_rho]
 
 /-- **Equal-correlation PSD constraint.**
     For a 3×3 correlation matrix with equal pairwise correlation r,
@@ -66,7 +83,7 @@ theorem rg_ancestry_specific
     pairwise-valid correlations give a valid correlation matrix. -/
 theorem rg_matrix_equal_corr_psd_constraint
     (r : ℝ)
-    (h_bound : |r| ≤ 1)
+    (_h_bound : |r| ≤ 1)
     (h_lower : -1/2 ≤ r) :
     0 ≤ (1 - r)^2 * (1 + 2 * r) := by
   apply mul_nonneg
@@ -111,16 +128,21 @@ theorem mtblup_improves (rg n_aux n_target h2_aux h2_target : ℝ)
     genetic correlation is lower. If r_g_cross < r_g_same, then
     MTBLUP improvement is smaller in the target population.
     Model: improvement ratio = 1 + r_g² × k where k = (n_aux/n_target)(h²_aux/h²_target).
-    With r_g_cross < r_g_same, the cross-ancestry improvement is strictly smaller. -/
+    With r_g_cross < r_g_same, the cross-ancestry improvement is strictly smaller,
+    proved explicitly over the underlying MTBLUP mechanism. -/
 theorem mtblup_portability_reduced
-    (rg_same rg_cross k : ℝ)
-    (h_rg_same_pos : 0 < rg_same)
+    (rg_same rg_cross n_aux n_target h2_aux h2_target : ℝ)
+    (_h_rg_same_pos : 0 < rg_same)
     (h_rg_cross_pos : 0 < rg_cross)
     (h_rg_less : rg_cross < rg_same)
-    (h_k_pos : 0 < k) :
-    1 + rg_cross^2 * k < 1 + rg_same^2 * k := by
-  have h_sq : rg_cross^2 < rg_same^2 := by
-    exact sq_lt_sq' (by linarith) h_rg_less
+    (h_n_aux_pos : 0 < n_aux) (h_n_target_pos : 0 < n_target)
+    (h_h2_aux_pos : 0 < h2_aux) (h_h2_target_pos : 0 < h2_target) :
+    mtblupImprovement rg_cross n_aux n_target h2_aux h2_target <
+    mtblupImprovement rg_same n_aux n_target h2_aux h2_target := by
+  unfold mtblupImprovement
+  have h_k_pos : 0 < (n_aux / n_target) * (h2_aux / h2_target) :=
+    mul_pos (div_pos h_n_aux_pos h_n_target_pos) (div_pos h_h2_aux_pos h_h2_target_pos)
+  have h_sq : rg_cross^2 < rg_same^2 := sq_lt_sq' (by linarith) h_rg_less
   linarith [mul_lt_mul_of_pos_right h_sq h_k_pos]
 
 end MultiTraitBLUP
@@ -135,39 +157,59 @@ correlated portability patterns across traits.
 
 section Pleiotropy
 
+noncomputable def decomposedPortability (h2_shared h2_unique port_shared port_unique : ℝ) : ℝ :=
+  (h2_shared * port_shared + h2_unique * port_unique) / (h2_shared + h2_unique)
+
 /-- **Horizontal pleiotropy creates correlated portability.**
     If variant j affects both traits A and B, its portability
-    loss affects both traits simultaneously. -/
+    loss affects both traits simultaneously, explicitly modeled
+    by their shared and unique variance components. -/
 theorem pleiotropic_correlated_portability
-    (port_A port_B rg lb : ℝ)
-    (h_correlated : |port_A - port_B| ≤ 2 * (1 - |rg|))
-    (h_rg : lb < |rg|)
-    (h_lb_nn : 0 ≤ lb) :
-    |port_A - port_B| < 2 * (1 - lb) := by linarith
+    (h2_shared h2_unique_A h2_unique_B port_shared port_unique_A port_unique_B : ℝ)
+    (_h_shared_pos : 0 < h2_shared)
+    (_h_unique_A_pos : 0 < h2_unique_A)
+    (_h_unique_B_pos : 0 < h2_unique_B)
+    (h_unique_eq : h2_unique_A = h2_unique_B) :
+    decomposedPortability h2_shared h2_unique_A port_shared port_unique_A -
+    decomposedPortability h2_shared h2_unique_B port_shared port_unique_B =
+    (h2_unique_A / (h2_shared + h2_unique_A)) * (port_unique_A - port_unique_B) := by
+  unfold decomposedPortability
+  rw [h_unique_eq]
+  ring
+
+noncomputable def expectedR2MT (var_pgs var_y cov_pgs_y : ℝ) : ℝ :=
+  (cov_pgs_y ^ 2) / (var_pgs * var_y)
 
 /-- **Mediated pleiotropy vs biological pleiotropy.**
     Mediated: A → B, so variant affects B through A.
-    Portability of B is bounded by portability of A.
-    If the mediation fraction is α ∈ [0,1], then
-    port_B_mediated = α × port_A, so port_B ≤ port_A. -/
+    Portability of B is structurally identical to portability of A
+    when variance and covariance strictly scale by the mediated effect. -/
 theorem mediated_pleiotropy_portability_bound
-    (port_A α : ℝ)
-    (h_α_le : α ≤ 1)
-    (h_α_nn : 0 ≤ α)
-    (h_port_nn : 0 ≤ port_A) :
-    α * port_A ≤ port_A := by nlinarith
+    (var_pgsA var_yA cov_pgsA_yA : ℝ)
+    (α : ℝ) (h_α_ne_zero : α ≠ 0) :
+    expectedR2MT (α^2 * var_pgsA) (α^2 * var_yA) (α^2 * cov_pgsA_yA) =
+    expectedR2MT var_pgsA var_yA cov_pgsA_yA := by
+  unfold expectedR2MT
+  have h_sq : (α^2 * cov_pgsA_yA)^2 = α^4 * cov_pgsA_yA^2 := by ring
+  have h_den : (α^2 * var_pgsA) * (α^2 * var_yA) = α^4 * (var_pgsA * var_yA) := by ring
+  rw [h_sq, h_den]
+  have h_a4 : α^4 ≠ 0 := pow_ne_zero 4 h_α_ne_zero
+  rw [mul_div_mul_left _ _ h_a4]
 
 /-- **Trait-specific genetic components are less portable.**
     The component of genetic variance unique to a trait (not shared
     via pleiotropy) is more likely to be affected by population-specific
-    selection. Shared components degrade by δ_shared, unique by δ_unique,
-    where δ_unique > δ_shared due to selection. -/
+    selection. When the unique component is strictly less portable,
+    the overall portability falls below the shared portability limit. -/
 theorem unique_component_less_portable
-    (port_base δ_shared δ_unique : ℝ)
-    (h_selection : δ_shared < δ_unique)
-    (h_shared_nn : 0 < δ_shared)
-    (h_base : δ_unique < port_base) :
-    port_base - δ_unique < port_base - δ_shared := by linarith
+    (h2_shared h2_unique port_shared port_unique : ℝ)
+    (h_shared_pos : 0 < h2_shared) (h_unique_pos : 0 < h2_unique)
+    (h_unique_worse : port_unique < port_shared) :
+    decomposedPortability h2_shared h2_unique port_shared port_unique < port_shared := by
+  unfold decomposedPortability
+  have h_sum_pos : 0 < h2_shared + h2_unique := add_pos h_shared_pos h_unique_pos
+  rw [div_lt_iff₀ h_sum_pos]
+  linarith [mul_lt_mul_of_pos_left h_unique_worse h_unique_pos]
 
 /-- **Decomposing trait heritability into shared and unique.**
     h²_trait = h²_shared + h²_unique where h²_shared comes from
@@ -180,11 +222,15 @@ theorem heritability_shared_dominates_portability
     (h2_shared h2_unique port_shared port_unique : ℝ)
     (h_shared_pos : 0 < h2_shared) (h_unique_pos : 0 < h2_unique)
     (h_shared_larger : h2_unique < h2_shared)
-    (h_port_shared_better : port_unique < port_shared)
-    (h_ps_nn : 0 ≤ port_shared) (h_pu_nn : 0 ≤ port_unique) :
-    (port_shared + port_unique) / 2 * (h2_shared + h2_unique) <
-      h2_shared * port_shared + h2_unique * port_unique := by
-  nlinarith [mul_pos (sub_pos.mpr h_shared_larger) (sub_pos.mpr h_port_shared_better)]
+    (h_port_shared_better : port_unique < port_shared) :
+    (port_shared + port_unique) / 2 < decomposedPortability h2_shared h2_unique port_shared port_unique := by
+  unfold decomposedPortability
+  have h_sum_pos : 0 < h2_shared + h2_unique := add_pos h_shared_pos h_unique_pos
+  rw [lt_div_iff₀ h_sum_pos]
+  have h_sub_h2 : 0 < h2_shared - h2_unique := sub_pos.mpr h_shared_larger
+  have h_sub_p : 0 < port_shared - port_unique := sub_pos.mpr h_port_shared_better
+  have h_mul_pos : 0 < (h2_shared - h2_unique) * (port_shared - port_unique) := mul_pos h_sub_h2 h_sub_p
+  linarith
 
 end Pleiotropy
 
@@ -216,13 +262,13 @@ theorem rg_bounds_portability_ratio
 /-- **Traits with high cross-population r_g have good portability.**
     When r_g is high (e.g., ~0.95), R² portability is bounded by ~0.90. -/
 theorem high_cross_rg
-    (rg lb : ℝ) (h_rg : lb < rg) (h_lb_nn : 0 ≤ lb) (h_rg_le : rg ≤ 1) :
+    (rg lb : ℝ) (h_rg : lb < rg) (_h_lb_nn : 0 ≤ lb) (_h_rg_le : rg ≤ 1) :
     lb^2 < rg^2 := by nlinarith [sq_nonneg (rg - lb)]
 
 /-- **Traits with low cross-population r_g have poor portability.**
     When r_g is low (e.g., ~0.3), R² portability is bounded by ~0.09. -/
 theorem low_cross_rg
-    (rg ub : ℝ) (h_rg : rg ≤ ub) (h_rg_nn : 0 ≤ rg) (h_ub_nn : 0 ≤ ub) :
+    (rg ub : ℝ) (h_rg : rg ≤ ub) (_h_rg_nn : 0 ≤ rg) (_h_ub_nn : 0 ≤ ub) :
     rg^2 ≤ ub^2 := by nlinarith [sq_nonneg rg, sq_nonneg (rg - ub)]
 
 /-- **r_g can be underestimated due to power.**
