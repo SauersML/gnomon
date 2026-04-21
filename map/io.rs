@@ -937,23 +937,52 @@ fn write_projection_matrix(
     prepare_output_path(matrix_path)?;
     let metadata_path = matrix_path.with_extension("metadata.json");
 
-    let mut writer = BufWriter::with_capacity(16 * 1024 * 1024, File::create(matrix_path)?);
-    write_projection_header(&mut writer, matrix.nrows(), matrix.ncols())?;
-    for col in 0..matrix.ncols() {
-        write_f64_slice(&mut writer, matrix.col_as_slice(col))?;
+    // Invalidate the pair up front: a crash anywhere below must leave at
+    // worst an orphan/partial .bin with no matching metadata, so the
+    // reader rebuilds instead of trusting a stale-but-plausible cache.
+    match fs::remove_file(&metadata_path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(DatasetOutputError::from(err)),
     }
-    writer.write_all(row_id_section)?;
-    writer.flush()?;
 
+    // Write .bin to a tmp sibling, fsync, then atomically rename.
+    let matrix_tmp = tmp_sibling_path(matrix_path);
+    {
+        let mut writer =
+            BufWriter::with_capacity(16 * 1024 * 1024, File::create(&matrix_tmp)?);
+        write_projection_header(&mut writer, matrix.nrows(), matrix.ncols())?;
+        for col in 0..matrix.ncols() {
+            write_f64_slice(&mut writer, matrix.col_as_slice(col))?;
+        }
+        writer.write_all(row_id_section)?;
+        writer.flush()?;
+        writer
+            .into_inner()
+            .map_err(|e| e.into_error())?
+            .sync_all()?;
+    }
+    fs::rename(&matrix_tmp, matrix_path)?;
+
+    // Write metadata last — its presence is the commit record for the pair.
+    let metadata_tmp = tmp_sibling_path(&metadata_path);
     write_projection_metadata(
-        &metadata_path,
+        &metadata_tmp,
         matrix.nrows(),
         matrix.ncols(),
         kind,
         row_id_section,
     )?;
+    File::open(&metadata_tmp)?.sync_all()?;
+    fs::rename(&metadata_tmp, &metadata_path)?;
 
     Ok(metadata_path)
+}
+
+fn tmp_sibling_path(path: &Path) -> PathBuf {
+    let mut raw = path.as_os_str().to_os_string();
+    raw.push(".tmp");
+    PathBuf::from(raw)
 }
 
 fn write_projection_header<W: Write>(
