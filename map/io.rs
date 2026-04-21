@@ -573,12 +573,14 @@ const PROJECTION_CACHE_NO_BP_WINDOW: u64 = u64::MAX;
 
 pub struct ProjectionMatrixSink {
     path: PathBuf,
+    tmp_path: PathBuf,
     metadata_path: PathBuf,
     kind: &'static str,
     rows: usize,
     cols: usize,
     score_bytes: usize,
     row_id_section: Vec<u8>,
+    file: File,
     mmap: MmapMut,
 }
 
@@ -617,7 +619,14 @@ impl ProjectionMatrixSink {
                 DatasetOutputError::InvalidState("projection row-id section overflow".into())
             })?;
         self.mmap[row_id_offset..row_id_end].copy_from_slice(&self.row_id_section);
+        // Flush mapped pages to disk, then release the mapping and fsync the
+        // underlying file so the tmp contents — including the file length
+        // set via set_len — are durable before we rename over the final path.
         self.mmap.flush()?;
+        drop(self.mmap);
+        self.file.sync_all()?;
+        drop(self.file);
+        fs::rename(&self.tmp_path, &self.path)?;
         write_projection_metadata(
             &self.metadata_path,
             self.rows,
@@ -897,6 +906,7 @@ pub fn create_projection_matrix_sink(
     let path = dataset.output_path(filename);
     prepare_output_path(&path)?;
     let metadata_path = path.with_extension("metadata.json");
+    let tmp_path = tmp_sibling_path(&path);
     let matrix_bytes = projection_matrix_score_bytes(rows, cols)?;
     let row_id_section = build_projection_row_id_section(dataset, rows)?;
     let total_len = PROJECTION_MATRIX_HEADER_LEN
@@ -906,24 +916,31 @@ pub fn create_projection_matrix_sink(
             DatasetOutputError::InvalidState("projection matrix file length overflow".into())
         })?;
 
+    // Invalidate the pair up front so any crash between here and the
+    // final rename leaves an orphan .bin, never a stale metadata that
+    // mismatches a freshly-written .bin.
+    remove_if_exists(&metadata_path)?;
+
     let file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(true)
-        .open(&path)?;
+        .open(&tmp_path)?;
     file.set_len(total_len as u64)?;
     let mut mmap = unsafe { MmapOptions::new().len(total_len).map_mut(&file)? };
     write_projection_header_bytes(&mut mmap[..PROJECTION_MATRIX_HEADER_LEN], rows, cols)?;
 
     Ok(ProjectionMatrixSink {
         path,
+        tmp_path,
         metadata_path,
         kind,
         rows,
         cols,
         score_bytes: matrix_bytes,
         row_id_section,
+        file,
         mmap,
     })
 }
@@ -940,11 +957,7 @@ fn write_projection_matrix(
     // Invalidate the pair up front: a crash anywhere below must leave at
     // worst an orphan/partial .bin with no matching metadata, so the
     // reader rebuilds instead of trusting a stale-but-plausible cache.
-    match fs::remove_file(&metadata_path) {
-        Ok(()) => {}
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-        Err(err) => return Err(DatasetOutputError::from(err)),
-    }
+    remove_if_exists(&metadata_path)?;
 
     // Write .bin to a tmp sibling, fsync, then atomically rename.
     let matrix_tmp = tmp_sibling_path(matrix_path);
@@ -964,17 +977,15 @@ fn write_projection_matrix(
     }
     fs::rename(&matrix_tmp, matrix_path)?;
 
-    // Write metadata last — its presence is the commit record for the pair.
-    let metadata_tmp = tmp_sibling_path(&metadata_path);
+    // Metadata write is atomic (tmp + fsync + rename) inside
+    // write_projection_metadata itself; its presence is the commit record.
     write_projection_metadata(
-        &metadata_tmp,
+        &metadata_path,
         matrix.nrows(),
         matrix.ncols(),
         kind,
         row_id_section,
     )?;
-    File::open(&metadata_tmp)?.sync_all()?;
-    fs::rename(&metadata_tmp, &metadata_path)?;
 
     Ok(metadata_path)
 }
@@ -983,6 +994,14 @@ fn tmp_sibling_path(path: &Path) -> PathBuf {
     let mut raw = path.as_os_str().to_os_string();
     raw.push(".tmp");
     PathBuf::from(raw)
+}
+
+fn remove_if_exists(path: &Path) -> Result<(), io::Error> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 fn write_projection_header<W: Write>(
@@ -1034,10 +1053,20 @@ fn write_projection_metadata(
         row_id_field: "IID",
         binary_schema: schema,
     };
-    let file = File::create(metadata_path)?;
-    let mut metadata_writer = BufWriter::new(file);
-    serde_json::to_writer_pretty(&mut metadata_writer, &metadata)?;
-    metadata_writer.flush()?;
+    // Write to a tmp sibling, fsync, then atomically rename over the final
+    // path so callers (and crash recoverers) never observe a half-written
+    // metadata file next to a completed .bin.
+    let tmp_path = tmp_sibling_path(metadata_path);
+    {
+        let mut metadata_writer = BufWriter::new(File::create(&tmp_path)?);
+        serde_json::to_writer_pretty(&mut metadata_writer, &metadata)?;
+        metadata_writer.flush()?;
+        metadata_writer
+            .into_inner()
+            .map_err(|e| e.into_error())?
+            .sync_all()?;
+    }
+    fs::rename(&tmp_path, metadata_path)?;
     Ok(())
 }
 
