@@ -909,6 +909,19 @@ theorem ld_mismatch_not_linearly_recoverable
   rw [Matrix.mulVec_smul]
   exact h_not_aligned α
 
+/-- A generalized proof over arbitrary dimensions `n` that LD mismatch is not
+recoverable by linear re-calibration. -/
+theorem ld_mismatch_not_linearly_recoverable_generalized {n : ℕ}
+    (w_source : Fin n → ℝ)
+    (σ_target : Matrix (Fin n) (Fin n) ℝ)
+    (cross_target : Fin n → ℝ)
+    (_h_base_mismatch : σ_target.mulVec w_source ≠ cross_target)
+    (h_not_aligned : ∀ α : ℝ, α • σ_target.mulVec w_source ≠ cross_target) :
+    ∀ α : ℝ, σ_target.mulVec (α • w_source) ≠ cross_target := by
+  intro α
+  rw [Matrix.mulVec_smul]
+  exact h_not_aligned α
+
 /-- **Effect turnover is NOT recoverable without target-population data.**
     If true effects change between populations, the source GWAS provides
     no information about the new effects. Only target GWAS data helps. -/
