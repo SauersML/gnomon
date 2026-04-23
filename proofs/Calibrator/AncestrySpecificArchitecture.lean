@@ -219,10 +219,18 @@ theorem gwas_h2_le_true (h2_true avg_r2_tag : ℝ)
     Source LD is tagged better in source-derived GWAS than target LD.
     This creates a technical portability artifact. -/
 theorem tagging_creates_portability_artifact
-    (h2_source_gwas h2_target_gwas h2_true : ℝ)
-    (h_source_better : h2_target_gwas < h2_source_gwas)
-    (h_true : h2_source_gwas ≤ h2_true) :
-    h2_target_gwas < h2_true := by linarith
+    (h2_true avg_r2_source avg_r2_target : ℝ)
+    (h_h2_pos : 0 < h2_true)
+    (_h_r2_source : 0 < avg_r2_source)
+    (_h_r2_target : 0 < avg_r2_target)
+    (h_target_worse : avg_r2_target < avg_r2_source)
+    (h_source_le : avg_r2_source ≤ 1) :
+    gwasHeritability h2_true avg_r2_target < gwasHeritability h2_true avg_r2_source ∧
+    gwasHeritability h2_true avg_r2_source ≤ h2_true := by
+  unfold gwasHeritability
+  constructor
+  · exact mul_lt_mul_of_pos_left h_target_worse h_h2_pos
+  · nlinarith
 
 end LDTagging
 
@@ -256,6 +264,22 @@ theorem allelic_heterogeneity_reduces_portability
       < r2_causal * r2_tag * 1 := by nlinarith
     _ = r2_causal * r2_tag := mul_one _
 
+/-- Gene-level variance component model. -/
+structure GeneVarianceModel where
+  v_shared : ℝ
+  v_pop_specific : ℝ
+  h_shared_pos : 0 < v_shared
+  h_specific_pos : 0 < v_pop_specific
+
+/-- Total variance captured by the gene in a specific population. -/
+noncomputable def totalGeneVariance (model : GeneVarianceModel) : ℝ :=
+  model.v_shared + model.v_pop_specific
+
+/-- Transferable fraction of variance when a PGS trained in a source population
+    is applied to a target population with different population-specific variants. -/
+noncomputable def transferableVarianceFraction (target_model : GeneVarianceModel) : ℝ :=
+  target_model.v_shared / totalGeneVariance target_model
+
 /-- **Population-specific rare variants at shared loci.**
     A gene may be important for a trait in all populations,
     but the specific damaging variants differ because rare
@@ -271,17 +295,25 @@ theorem allelic_heterogeneity_reduces_portability
     A PGS trained in EUR captures v_shared + v_eur_specific but only
     v_shared transfers to AFR, missing v_afr_specific entirely. -/
 theorem gene_shared_variants_specific
-    (v_shared v_eur_specific v_afr_specific : ℝ)
-    (h_shared : 0 < v_shared)
-    (h_eur : 0 < v_eur_specific) (h_afr : 0 < v_afr_specific) :
+    (model_eur model_afr : GeneVarianceModel)
+    (_h_same_shared : model_eur.v_shared = model_afr.v_shared) :
     -- Each population's gene-level variance exceeds the shared component
-    v_shared < v_shared + v_eur_specific ∧
-    v_shared < v_shared + v_afr_specific ∧
+    model_eur.v_shared < totalGeneVariance model_eur ∧
+    model_afr.v_shared < totalGeneVariance model_afr ∧
     -- A EUR-trained PGS captures only v_shared in AFR, missing v_afr_specific
-    v_shared / (v_shared + v_afr_specific) < 1 := by
-  refine ⟨by linarith, by linarith, ?_⟩
-  rw [div_lt_one (by linarith)]
-  linarith
+    transferableVarianceFraction model_afr < 1 := by
+  have h_eur_pos : 0 < model_eur.v_pop_specific := model_eur.h_specific_pos
+  have h_afr_pos : 0 < model_afr.v_pop_specific := model_afr.h_specific_pos
+  have h_shared_pos : 0 < model_afr.v_shared := model_afr.h_shared_pos
+  refine ⟨?_, ?_, ?_⟩
+  · unfold totalGeneVariance
+    linarith
+  · unfold totalGeneVariance
+    linarith
+  · unfold transferableVarianceFraction totalGeneVariance
+    have h_tot_pos : 0 < model_afr.v_shared + model_afr.v_pop_specific := by linarith
+    rw [div_lt_one h_tot_pos]
+    linarith
 
 /-- **Conditional analysis reveals heterogeneity.**
     Running conditional analysis (adjusting for lead SNP)
@@ -368,15 +400,26 @@ theorem fst_decreases_with_migration (m₁ m₂ Ne : ℝ)
   rw [div_lt_div_iff₀ (by nlinarith) (by nlinarith)]
   nlinarith
 
+/-- Models the genetic correlation between two populations under selection. -/
+noncomputable def geneticCorrelationWithSelection (rg_base selection_alignment : ℝ) : ℝ :=
+  rg_base + (1 - rg_base) * selection_alignment
+
 /-- **Shared selection homogenizes architecture.**
     If both populations experience the same selective pressure
     (e.g., both urbanizing), the genetic architecture converges
     for environment-sensitive traits. -/
 theorem shared_selection_improves_portability
-    (rg_before rg_after : ℝ)
-    (h_improves : rg_before < rg_after)
-    (h_le : rg_after ≤ 1) :
-    rg_before < 1 := by linarith
+    (rg_base selection_alignment : ℝ)
+    (h_rg : rg_base < 1)
+    (h_align_pos : 0 < selection_alignment)
+    (h_align_le : selection_alignment ≤ 1) :
+    rg_base < geneticCorrelationWithSelection rg_base selection_alignment ∧
+    geneticCorrelationWithSelection rg_base selection_alignment ≤ 1 := by
+  unfold geneticCorrelationWithSelection
+  constructor
+  · have : 0 < (1 - rg_base) * selection_alignment := mul_pos (by linarith) h_align_pos
+    linarith
+  · nlinarith
 
 /-!
 ### Derivation: portabilityFromArchitecture = rg² × (1 - Fst) × tagging_ratio
