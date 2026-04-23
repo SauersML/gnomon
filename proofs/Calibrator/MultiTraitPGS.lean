@@ -137,37 +137,58 @@ section Pleiotropy
 
 /-- **Horizontal pleiotropy creates correlated portability.**
     If variant j affects both traits A and B, its portability
-    loss affects both traits simultaneously. -/
+    loss affects both traits simultaneously.
+    We define the theoretical maximum portability difference
+    between two pleiotropic traits given their genetic correlation. -/
+noncomputable def maxPortabilityDifference (rg : ℝ) : ℝ := 2 * (1 - |rg|)
+
+/-- The maximum portability difference strictly decreases as the
+    magnitude of the genetic correlation increases. -/
 theorem pleiotropic_correlated_portability
-    (port_A port_B rg lb : ℝ)
-    (h_correlated : |port_A - port_B| ≤ 2 * (1 - |rg|))
+    (rg lb : ℝ)
     (h_rg : lb < |rg|)
     (h_lb_nn : 0 ≤ lb) :
-    |port_A - port_B| < 2 * (1 - lb) := by linarith
+    maxPortabilityDifference rg < maxPortabilityDifference lb := by
+  unfold maxPortabilityDifference
+  rw [abs_of_nonneg h_lb_nn]
+  linarith
 
 /-- **Mediated pleiotropy vs biological pleiotropy.**
     Mediated: A → B, so variant affects B through A.
-    Portability of B is bounded by portability of A.
+    Portability of B is determined by portability of A.
     If the mediation fraction is α ∈ [0,1], then
-    port_B_mediated = α × port_A, so port_B ≤ port_A. -/
+    port_B_mediated = α × port_A. -/
+noncomputable def mediatedPortability (port_A α : ℝ) : ℝ := α * port_A
+
+/-- Portability of the mediated trait is bounded by portability of the causal trait. -/
 theorem mediated_pleiotropy_portability_bound
     (port_A α : ℝ)
     (h_α_le : α ≤ 1)
     (h_α_nn : 0 ≤ α)
     (h_port_nn : 0 ≤ port_A) :
-    α * port_A ≤ port_A := by nlinarith
+    mediatedPortability port_A α ≤ port_A := by
+  unfold mediatedPortability
+  nlinarith
 
 /-- **Trait-specific genetic components are less portable.**
     The component of genetic variance unique to a trait (not shared
     via pleiotropy) is more likely to be affected by population-specific
     selection. Shared components degrade by δ_shared, unique by δ_unique,
     where δ_unique > δ_shared due to selection. -/
+noncomputable def sharedComponentPortability (port_base δ_shared : ℝ) : ℝ := port_base - δ_shared
+
+noncomputable def uniqueComponentPortability (port_base δ_unique : ℝ) : ℝ := port_base - δ_unique
+
+/-- The unique component portability is strictly less than the shared component portability
+    due to stronger population-specific selection. -/
 theorem unique_component_less_portable
     (port_base δ_shared δ_unique : ℝ)
     (h_selection : δ_shared < δ_unique)
     (h_shared_nn : 0 < δ_shared)
     (h_base : δ_unique < port_base) :
-    port_base - δ_unique < port_base - δ_shared := by linarith
+    uniqueComponentPortability port_base δ_unique < sharedComponentPortability port_base δ_shared := by
+  unfold uniqueComponentPortability sharedComponentPortability
+  linarith
 
 /-- **Decomposing trait heritability into shared and unique.**
     h²_trait = h²_shared + h²_unique where h²_shared comes from
