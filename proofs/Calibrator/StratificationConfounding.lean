@@ -322,20 +322,33 @@ theorem collider_attenuates_association (m : ColliderModel) :
       < m.β_G * 1 := by exact mul_lt_mul_of_pos_left h_ratio_lt_one m.β_G_pos
     _ = m.β_G := by ring
 
+/-- Multi-population ascertainment (collider) gap model. -/
+structure MultiPopColliderModel where
+  r2_source_pop : ℝ
+  r2_target_pop : ℝ
+  r2_source_asc : ℝ
+  r2_target_asc : ℝ
+  source_asc_drop : r2_source_asc < r2_source_pop
+  target_asc_drop : r2_target_asc < r2_target_pop
+  /-- Target ascertainment bias is more severe than source ascertainment bias -/
+  diff_severity : r2_source_pop - r2_source_asc < r2_target_pop - r2_target_asc
+
+/-- True portability gap. -/
+noncomputable def MultiPopColliderModel.true_gap (m : MultiPopColliderModel) : ℝ :=
+  m.r2_source_pop - m.r2_target_pop
+
+/-- Apparent portability gap under differential ascertainment. -/
+noncomputable def MultiPopColliderModel.apparent_gap (m : MultiPopColliderModel) : ℝ :=
+  m.r2_source_asc - m.r2_target_asc
+
 /-- **Differential ascertainment creates portability artifact.**
     If source and target cohorts have different ascertainment patterns,
     the apparent portability drop includes an ascertainment component. -/
-theorem differential_ascertainment_artifact
-    (r2_source_pop r2_target_pop r2_source_asc r2_target_asc : ℝ)
-    (h_source_asc : r2_source_asc < r2_source_pop)
-    (h_target_asc : r2_target_asc < r2_target_pop)
-    -- Different ascertainment severity
-    (h_diff_severity : r2_target_pop - r2_target_asc < r2_source_pop - r2_source_asc) :
-    -- Apparent portability drop is larger than true portability drop
-    r2_source_asc - r2_target_asc > r2_source_pop - r2_target_pop →
-      False := by
-  intro h
-  linarith
+theorem MultiPopColliderModel.differential_ascertainment_artifact
+    (m : MultiPopColliderModel) :
+    m.true_gap < m.apparent_gap := by
+  unfold true_gap apparent_gap
+  linarith [m.diff_severity]
 
 end ColliderBias
 
@@ -514,17 +527,33 @@ theorem survivorship_attenuates_in_older (m : SurvivorshipAttenuationModel) :
       < m.r2_full * 1 := by exact mul_lt_mul_of_pos_left h_ratio_lt_one m.r2_full_pos
     _ = m.r2_full := by ring
 
+/-- Survivorship gap model across source and target cohorts. -/
+structure SurvivorshipGapModel where
+  r2_source_full : ℝ
+  r2_target_full : ℝ
+  Δ_surv_source : ℝ
+  Δ_surv_target : ℝ
+  surv_s_nonneg : 0 ≤ Δ_surv_source
+  surv_t_nonneg : 0 ≤ Δ_surv_target
+  /-- Target population has more severe survivorship bias than source -/
+  diff_severity : Δ_surv_source < Δ_surv_target
+
+/-- Apparent portability gap under survivorship bias. -/
+noncomputable def SurvivorshipGapModel.apparent_gap (m : SurvivorshipGapModel) : ℝ :=
+  (m.r2_source_full - m.Δ_surv_source) - (m.r2_target_full - m.Δ_surv_target)
+
+/-- True portability gap. -/
+noncomputable def SurvivorshipGapModel.true_gap (m : SurvivorshipGapModel) : ℝ :=
+  m.r2_source_full - m.r2_target_full
+
 /-- **Differential survivorship across populations creates portability artifact.**
     If the target population has different age structure or mortality patterns,
     survivorship bias contributes to apparent portability loss. -/
-theorem differential_survivorship_artifact
-    (r2_source_full r2_target_full Δ_surv_source Δ_surv_target : ℝ)
-    (h_surv_s : 0 ≤ Δ_surv_source) (h_surv_t : 0 ≤ Δ_surv_target)
-    (h_diff : Δ_surv_target > Δ_surv_source)
-    (h_obs_s : r2_source_full - Δ_surv_source > 0) :
-    (r2_source_full - Δ_surv_source) - (r2_target_full - Δ_surv_target) >
-      r2_source_full - r2_target_full := by
-  linarith
+theorem SurvivorshipGapModel.differential_survivorship_artifact
+    (m : SurvivorshipGapModel) :
+    m.true_gap < m.apparent_gap := by
+  unfold true_gap apparent_gap
+  linarith [m.diff_severity]
 
 end SurvivorshipBias
 
