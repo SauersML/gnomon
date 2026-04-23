@@ -411,6 +411,47 @@ theorem same_source_r2_different_portability_two_locus_witness :
   simp [TransportedMetrics.r2FromSignalVariance]
   norm_num
 
+/-- Rigorous structural generalization of the two-locus witness.
+    This defines an arbitrary n-dimensional locus transport state
+    and proves that strict decreases in target signal variance
+    strictly decrease deployed target `R²`, holding source signal fixed. -/
+structure LocusTransportState (n : ℕ) where
+  sourceSignal : Fin n → ℝ
+  targetTransport : Fin n → ℝ
+
+noncomputable def LocusTransportState.sourceVariance {n : ℕ} (s : LocusTransportState n) : ℝ :=
+  ∑ l, s.sourceSignal l
+
+noncomputable def LocusTransportState.targetVariance {n : ℕ} (s : LocusTransportState n) : ℝ :=
+  ∑ l, s.sourceSignal l * s.targetTransport l
+
+noncomputable def LocusTransportState.targetR2 {n : ℕ} (s : LocusTransportState n) (residual : ℝ) : ℝ :=
+  TransportedMetrics.r2FromSignalVariance s.targetVariance residual
+
+theorem same_source_r2_different_portability_structural {n : ℕ}
+    (s_stable s_broken : LocusTransportState n)
+    (residual : ℝ)
+    (h_same_source : s_stable.sourceSignal = s_broken.sourceSignal)
+    (h_transport_diff : s_broken.targetVariance < s_stable.targetVariance)
+    (h_broken_var_pos : 0 ≤ s_broken.targetVariance)
+    (h_residual_pos : 0 < residual) :
+    s_stable.sourceVariance = s_broken.sourceVariance ∧
+    s_broken.targetR2 residual < s_stable.targetR2 residual := by
+  constructor
+  · rw [LocusTransportState.sourceVariance, LocusTransportState.sourceVariance, h_same_source]
+  · unfold LocusTransportState.targetR2 TransportedMetrics.r2FromSignalVariance
+    have h_stable_var_pos : 0 < s_stable.targetVariance := lt_of_le_of_lt h_broken_var_pos h_transport_diff
+    have h_denom_broken_pos : 0 < s_broken.targetVariance + residual := add_pos_of_nonneg_of_pos h_broken_var_pos h_residual_pos
+    have h_denom_stable_pos : 0 < s_stable.targetVariance + residual := add_pos h_stable_var_pos h_residual_pos
+    rw [div_lt_div_iff₀ h_denom_broken_pos h_denom_stable_pos]
+    calc s_broken.targetVariance * (s_stable.targetVariance + residual)
+      _ = s_broken.targetVariance * s_stable.targetVariance + s_broken.targetVariance * residual := mul_add _ _ _
+      _ < s_broken.targetVariance * s_stable.targetVariance + s_stable.targetVariance * residual := by
+        apply add_lt_add_left
+        exact mul_lt_mul_of_pos_right h_transport_diff h_residual_pos
+      _ = s_stable.targetVariance * s_broken.targetVariance + s_stable.targetVariance * residual := by rw [mul_comm s_broken.targetVariance s_stable.targetVariance]
+      _ = s_stable.targetVariance * (s_broken.targetVariance + residual) := (mul_add _ _ _).symm
+
 end SourceR2Insufficiency
 
 end Calibrator
