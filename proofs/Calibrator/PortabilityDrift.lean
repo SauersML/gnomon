@@ -669,38 +669,6 @@ noncomputable def targetLinearRisk {p : ℕ}
     (w : Fin p → ℝ) : ℝ :=
   noiseVar + dotProduct w (sigmaObsTarget.mulVec w) - 2 * dotProduct w crossTarget
 
-/-- If source ERM satisfies source normal equations but not target normal equations,
-the learned projection is source-LD specific (Euro-centric mismatch statement).
-The source weight vector fails to minimize target risk because it satisfies
-different normal equations. -/
-theorem source_erm_is_ld_specific_of_normal_eq_mismatch
-    {p : Nat}
-    (sigmaObsSource sigmaObsTarget : Matrix (Fin p) (Fin p) Real)
-    (crossSource crossTarget : Fin p -> Real)
-    (wSource : Fin p -> Real)
-    (_hSource : sigmaObsSource.mulVec wSource = crossSource)
-    (hMismatch : sigmaObsTarget.mulVec wSource ≠ crossTarget) :
-    ¬ sigmaObsTarget.mulVec wSource = crossTarget := by
-  intro hContra
-  exact absurd hContra hMismatch
-
-/-- If one coefficient vector solves source normal equations and another solves target normal equations,
-and no single vector can satisfy both systems, then source ERM and target ERM must differ. -/
-theorem source_target_erm_differ_of_ld_system_conflict
-    {p : Nat}
-    (sigmaObsSource sigmaObsTarget : Matrix (Fin p) (Fin p) Real)
-    (crossSource crossTarget : Fin p -> Real)
-    (wSource wTarget : Fin p -> Real)
-    (hSource : sigmaObsSource.mulVec wSource = crossSource)
-    (hTarget : sigmaObsTarget.mulVec wTarget = crossTarget)
-    (hConflict :
-      ∀ w : Fin p -> Real, sigmaObsSource.mulVec w = crossSource -> sigmaObsTarget.mulVec w ≠ crossTarget) :
-    wSource ≠ wTarget := by
-  intro hEq
-  have hNotTargetAtSource : sigmaObsTarget.mulVec wSource ≠ crossTarget := hConflict wSource hSource
-  have hTargetAtSource : sigmaObsTarget.mulVec wSource = crossTarget := by simpa [hEq] using hTarget
-  exact hNotTargetAtSource hTargetAtSource
-
 /-- Dense source covariance witness for non-degenerate ERM-transport tests. -/
 def sigmaObsSource : Matrix (Fin 2) (Fin 2) ℝ :=
   !![1, 0.5; 0.5, 1]
@@ -720,6 +688,44 @@ def crossTarget : Fin 2 → ℝ :=
 /-- Exact source OLS solution for the dense witness system. -/
 noncomputable def wSource_opt : Fin 2 → ℝ :=
   ![0.8, 0.0]
+
+/-- If source ERM satisfies source normal equations but not target normal equations,
+the learned projection is source-LD specific (Euro-centric mismatch statement).
+The source weight vector fails to minimize target risk because it satisfies
+different normal equations. This removes the vacuous verification and proves
+it directly for a non-degenerate witness system. -/
+theorem source_erm_is_ld_specific_of_normal_eq_mismatch :
+    sigmaObsSource.mulVec wSource_opt = crossSource ∧
+    sigmaObsTarget.mulVec wSource_opt ≠ crossTarget := by
+  refine ⟨?_, ?_⟩
+  · ext i
+    fin_cases i
+    · simp [wSource_opt, sigmaObsSource, crossSource, Matrix.mulVec, Matrix.cons_val', Matrix.cons_val_fin_one, dotProduct]
+      norm_num
+    · simp [wSource_opt, sigmaObsSource, crossSource, Matrix.mulVec, Matrix.cons_val', Matrix.cons_val_fin_one, dotProduct]
+      norm_num
+  · intro hEq
+    have h : (sigmaObsTarget.mulVec wSource_opt) 1 = crossTarget 1 := congrFun hEq 1
+    revert h
+    simp [wSource_opt, sigmaObsTarget, crossTarget, Matrix.mulVec, Matrix.cons_val', Matrix.cons_val_fin_one, dotProduct]
+    norm_num
+
+/-- If one coefficient vector solves source normal equations and another solves target normal equations,
+and no single vector can satisfy both systems, then source ERM and target ERM must differ. -/
+theorem source_target_erm_differ_of_ld_system_conflict
+    {p : Nat}
+    (sigmaObsSource sigmaObsTarget : Matrix (Fin p) (Fin p) Real)
+    (crossSource crossTarget : Fin p -> Real)
+    (wSource wTarget : Fin p -> Real)
+    (hSource : sigmaObsSource.mulVec wSource = crossSource)
+    (hTarget : sigmaObsTarget.mulVec wTarget = crossTarget)
+    (hConflict :
+      ∀ w : Fin p -> Real, sigmaObsSource.mulVec w = crossSource -> sigmaObsTarget.mulVec w ≠ crossTarget) :
+    wSource ≠ wTarget := by
+  intro hEq
+  have hNotTargetAtSource : sigmaObsTarget.mulVec wSource ≠ crossTarget := hConflict wSource hSource
+  have hTargetAtSource : sigmaObsTarget.mulVec wSource = crossTarget := by simpa [hEq] using hTarget
+  exact hNotTargetAtSource hTargetAtSource
 
 /-- Exact target OLS solution for the dense witness system. -/
 noncomputable def wTarget_opt : Fin 2 → ℝ :=
