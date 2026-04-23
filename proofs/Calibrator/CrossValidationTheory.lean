@@ -44,6 +44,16 @@ noncomputable def lopoMeanSquaredError
     (bias variance noise : ℝ) : ℝ :=
   bias ^ 2 + variance + noise
 
+theorem lopoMeanSquaredError_eq_zero_of_exact_fit
+    (bias variance noise : ℝ)
+    (hBias : bias = 0)
+    (hVar : variance = 0)
+    (hNoise : noise = 0) :
+    lopoMeanSquaredError bias variance noise = 0 := by
+  unfold lopoMeanSquaredError
+  rw [hBias, hVar, hNoise]
+  ring
+
 theorem lopoMeanSquaredError_nonneg
     (bias variance noise : ℝ)
     (hVariance : 0 ≤ variance)
