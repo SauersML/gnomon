@@ -395,6 +395,60 @@ drops to `3/4`.
 
 This formalizes the biological point that equal source `R²` does not determine
 cross-population portability without locus-resolved transport state. -/
+lemma target_r2_strictMono_in_targetVariance {v1 v2 vNoise : ℝ}
+    (hv : v1 < v2) (hv1_nonneg : 0 ≤ v1) (hn_pos : 0 < vNoise) :
+    TransportedMetrics.r2FromSignalVariance v1 vNoise < TransportedMetrics.r2FromSignalVariance v2 vNoise := by
+  unfold TransportedMetrics.r2FromSignalVariance
+  rw [div_lt_div_iff₀ (by linarith) (by linarith)]
+  nlinarith
+
+structure TransportState {n : ℕ} where
+  sourceSignal : Fin n → ℝ
+  transportA : Fin n → ℝ
+  transportB : Fin n → ℝ
+  h_signal_nonneg : ∀ i, 0 ≤ sourceSignal i
+  h_transport_A_nonneg : ∀ i, 0 ≤ transportA i
+  h_transport_B_nonneg : ∀ i, 0 ≤ transportB i
+  h_transport_B_le_A : ∀ i, transportB i ≤ transportA i
+  h_transport_B_lt_A : ∃ i, 0 < sourceSignal i ∧ transportB i < transportA i
+
+noncomputable def TransportState.sourceVariance {n : ℕ} (s : TransportState (n:=n)) : ℝ :=
+  ∑ i, s.sourceSignal i
+
+noncomputable def TransportState.targetVarianceA {n : ℕ} (s : TransportState (n:=n)) : ℝ :=
+  ∑ i, s.sourceSignal i * s.transportA i
+
+noncomputable def TransportState.targetVarianceB {n : ℕ} (s : TransportState (n:=n)) : ℝ :=
+  ∑ i, s.sourceSignal i * s.transportB i
+
+theorem transport_state_variance_strict_mono {n : ℕ} (s : TransportState (n:=n)) :
+    s.targetVarianceB < s.targetVarianceA := by
+  unfold TransportState.targetVarianceB TransportState.targetVarianceA
+  apply Finset.sum_lt_sum
+  · intro i _
+    have h1 : 0 ≤ s.sourceSignal i := s.h_signal_nonneg i
+    have h2 : s.transportB i ≤ s.transportA i := s.h_transport_B_le_A i
+    nlinarith
+  · rcases s.h_transport_B_lt_A with ⟨i, h_pos, h_lt⟩
+    use i
+    constructor
+    · exact Finset.mem_univ i
+    · nlinarith
+
+theorem same_source_r2_different_portability_generalized {n : ℕ} (s : TransportState (n:=n))
+    (vNoise : ℝ) (hn_pos : 0 < vNoise) :
+    TransportedMetrics.r2FromSignalVariance s.targetVarianceB vNoise <
+    TransportedMetrics.r2FromSignalVariance s.targetVarianceA vNoise := by
+  apply target_r2_strictMono_in_targetVariance
+  · exact transport_state_variance_strict_mono s
+  · unfold TransportState.targetVarianceB
+    apply Finset.sum_nonneg
+    intro i _
+    have h1 : 0 ≤ s.sourceSignal i := s.h_signal_nonneg i
+    have h2 : 0 ≤ s.transportB i := s.h_transport_B_nonneg i
+    nlinarith
+  · exact hn_pos
+
 theorem same_source_r2_different_portability_two_locus_witness :
     let sourceSignal : Fin 2 → ℝ := fun _ => 1
     let stableTransport : Fin 2 → ℝ := fun _ => 1
@@ -408,7 +462,20 @@ theorem same_source_r2_different_portability_two_locus_witness :
     sourceR2 = stableTargetR2 ∧
     brokenTargetR2 < stableTargetR2 ∧
     brokenTargetR2 / sourceR2 = (3 : ℝ) / 4 := by
-  simp [TransportedMetrics.r2FromSignalVariance]
+  let state : TransportState (n:=2) := {
+    sourceSignal := fun _ => 1
+    transportA := fun _ => 1
+    transportB := fun i => if i = 0 then 1 else 0
+    h_signal_nonneg := by intro i; norm_num
+    h_transport_A_nonneg := by intro i; norm_num
+    h_transport_B_nonneg := by intro i; split <;> norm_num
+    h_transport_B_le_A := by intro i; split <;> norm_num
+    h_transport_B_lt_A := by
+      use 1
+      norm_num
+  }
+  have h_gen := same_source_r2_different_portability_generalized state 1 (by norm_num)
+  unfold TransportedMetrics.r2FromSignalVariance
   norm_num
 
 end SourceR2Insufficiency
