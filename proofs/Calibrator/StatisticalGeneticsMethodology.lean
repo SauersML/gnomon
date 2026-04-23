@@ -411,6 +411,42 @@ theorem same_source_r2_different_portability_two_locus_witness :
   simp [TransportedMetrics.r2FromSignalVariance]
   norm_num
 
+structure ModelTransportState {n : ℕ} where
+  sourceSignal : Fin n → ℝ
+  stableTransport : Fin n → ℝ
+  brokenTransport : Fin n → ℝ
+  h_nonneg_signal : ∀ i, 0 ≤ sourceSignal i
+  h_nonneg_broken : ∀ i, 0 ≤ brokenTransport i
+  h_broken_le_stable : ∀ i, brokenTransport i ≤ stableTransport i
+  h_broken_lt_stable : ∃ i, brokenTransport i < stableTransport i ∧ 0 < sourceSignal i
+
+theorem same_source_r2_different_portability {n : ℕ} (mts : ModelTransportState (n := n))
+    (vResidual : ℝ) (h_vResidual : 0 < vResidual) :
+    let stableTargetVariance : ℝ := ∑ l, mts.sourceSignal l * mts.stableTransport l
+    let brokenTargetVariance : ℝ := ∑ l, mts.sourceSignal l * mts.brokenTransport l
+    TransportedMetrics.r2FromSignalVariance brokenTargetVariance vResidual <
+    TransportedMetrics.r2FromSignalVariance stableTargetVariance vResidual := by
+  intro stableTargetVariance brokenTargetVariance
+  have h_broken_lt_stable_var : brokenTargetVariance < stableTargetVariance := by
+    apply Finset.sum_lt_sum
+    · intro i _
+      exact mul_le_mul_of_nonneg_left (mts.h_broken_le_stable i) (mts.h_nonneg_signal i)
+    · rcases mts.h_broken_lt_stable with ⟨i, hi1, hi2⟩
+      use i
+      refine ⟨Finset.mem_univ i, ?_⟩
+      exact (mul_lt_mul_of_pos_left hi1 hi2)
+  have h_broken_nonneg : 0 ≤ brokenTargetVariance := by
+    apply Finset.sum_nonneg
+    intro i _
+    exact mul_nonneg (mts.h_nonneg_signal i) (mts.h_nonneg_broken i)
+  have h_stable_pos : 0 < stableTargetVariance := lt_of_le_of_lt h_broken_nonneg h_broken_lt_stable_var
+  unfold TransportedMetrics.r2FromSignalVariance
+  -- need to prove broken / (broken + vResidual) < stable / (stable + vResidual)
+  have denom_broken_pos : 0 < brokenTargetVariance + vResidual := by linarith
+  have denom_stable_pos : 0 < stableTargetVariance + vResidual := by linarith
+  rw [div_lt_div_iff₀ denom_broken_pos denom_stable_pos]
+  nlinarith
+
 end SourceR2Insufficiency
 
 end Calibrator
