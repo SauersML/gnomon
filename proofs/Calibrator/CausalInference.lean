@@ -34,17 +34,24 @@ each contributing a specific proportion of the total loss.
 
 section PathDecomposition
 
-/-- **Total portability loss decomposition.**
+/-- Total portability loss definition.
     Δ_total = Δ_LD + Δ_MAF + Δ_effect + Δ_env + Δ_technical
     Each component represents a distinct causal pathway. -/
+noncomputable def totalPortabilityLoss (delta_LD delta_MAF delta_effect delta_env delta_tech : ℝ) : ℝ :=
+  delta_LD + delta_MAF + delta_effect + delta_env + delta_tech
+
+/-- **Total portability loss decomposition.**
+    Each component pathway strictly bounds the total portability loss. -/
 theorem total_loss_decomposition
-    (delta_total delta_LD delta_MAF delta_effect delta_env delta_tech : ℝ)
-    (h_decomp : delta_total = delta_LD + delta_MAF + delta_effect + delta_env + delta_tech)
+    (delta_LD delta_MAF delta_effect delta_env delta_tech : ℝ)
     (h_LD : 0 ≤ delta_LD) (h_MAF : 0 ≤ delta_MAF) (h_effect : 0 ≤ delta_effect)
     (h_env : 0 ≤ delta_env) (h_tech : 0 ≤ delta_tech) :
-    delta_LD ≤ delta_total ∧ delta_MAF ≤ delta_total ∧
-    delta_effect ≤ delta_total ∧ delta_env ≤ delta_total ∧
-    delta_tech ≤ delta_total := by
+    delta_LD ≤ totalPortabilityLoss delta_LD delta_MAF delta_effect delta_env delta_tech ∧
+    delta_MAF ≤ totalPortabilityLoss delta_LD delta_MAF delta_effect delta_env delta_tech ∧
+    delta_effect ≤ totalPortabilityLoss delta_LD delta_MAF delta_effect delta_env delta_tech ∧
+    delta_env ≤ totalPortabilityLoss delta_LD delta_MAF delta_effect delta_env delta_tech ∧
+    delta_tech ≤ totalPortabilityLoss delta_LD delta_MAF delta_effect delta_env delta_tech := by
+  unfold totalPortabilityLoss
   constructor <;> [skip; constructor <;> [skip; constructor <;> [skip; constructor]]] <;> linarith
 
 /-- **LD pathway is the largest contributor for most traits.**
@@ -53,7 +60,7 @@ theorem ld_dominant_pathway
     (delta_total delta_LD : ℝ)
     (h_total : 0 < delta_total)
     (h_LD_large : delta_total / 2 < delta_LD)
-    (h_LD_le : delta_LD ≤ delta_total) :
+    (_h_LD_le : delta_LD ≤ delta_total) :
     1 / 2 < delta_LD / delta_total := by
   rw [div_lt_div_iff₀ (by norm_num : (0:ℝ) < 2) h_total]
   linarith
@@ -113,25 +120,32 @@ on PGS accuracy into direct and indirect effects.
 
 section MediationAnalysis
 
+/-- Total effect definition.
+    Total effect decomposes into direct and indirect. -/
+noncomputable def totalEffect (direct_effect indirect_effect : ℝ) : ℝ :=
+  direct_effect + indirect_effect
+
 /-- **Total effect = Direct effect + Indirect effect.**
     TE = DE + IE (in the linear case). -/
 theorem mediation_decomposition
-    (total_effect direct_effect indirect_effect : ℝ)
-    (h_decomp : total_effect = direct_effect + indirect_effect) :
+    (direct_effect indirect_effect : ℝ) :
     -- Indirect effect is the total minus direct
-    indirect_effect = total_effect - direct_effect := by linarith
+    indirect_effect = totalEffect direct_effect indirect_effect - direct_effect := by
+  unfold totalEffect
+  ring
 
 /-- **Proportion mediated.**
     PM = IE / TE = indirect / total. -/
-noncomputable def proportionMediated (indirect_effect total_effect : ℝ) : ℝ :=
-  indirect_effect / total_effect
+noncomputable def proportionMediated (direct_effect indirect_effect : ℝ) : ℝ :=
+  indirect_effect / totalEffect direct_effect indirect_effect
 
-/-- Proportion mediated is in [0,1] when effects are nonneg and indirect ≤ total. -/
+/-- Proportion mediated is in [0,1] when effects are nonneg. -/
 theorem proportion_mediated_in_unit
-    (ie te : ℝ)
-    (h_ie : 0 ≤ ie) (h_te : 0 < te) (h_le : ie ≤ te) :
-    0 ≤ proportionMediated ie te ∧ proportionMediated ie te ≤ 1 := by
-  unfold proportionMediated
+    (de ie : ℝ)
+    (h_de : 0 ≤ de) (h_ie : 0 ≤ ie) (h_te : 0 < totalEffect de ie) :
+    0 ≤ proportionMediated de ie ∧ proportionMediated de ie ≤ 1 := by
+  unfold proportionMediated totalEffect at *
+  have h_le : ie ≤ de + ie := by linarith
   constructor
   · exact div_nonneg h_ie (le_of_lt h_te)
   · rw [div_le_one h_te]; exact h_le
