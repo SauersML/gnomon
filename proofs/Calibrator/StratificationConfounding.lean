@@ -323,18 +323,31 @@ theorem collider_attenuates_association (m : ColliderModel) :
     _ = m.β_G := by ring
 
 /-- **Differential ascertainment creates portability artifact.**
-    If source and target cohorts have different ascertainment patterns,
-    the apparent portability drop includes an ascertainment component. -/
-theorem differential_ascertainment_artifact
-    (r2_source_pop r2_target_pop r2_source_asc r2_target_asc : ℝ)
-    (h_source_asc : r2_source_asc < r2_source_pop)
-    (h_target_asc : r2_target_asc < r2_target_pop)
-    -- Different ascertainment severity
-    (h_diff_severity : r2_target_pop - r2_target_asc < r2_source_pop - r2_source_asc) :
-    -- Apparent portability drop is larger than true portability drop
-    r2_source_asc - r2_target_asc > r2_source_pop - r2_target_pop →
-      False := by
-  intro h
+    If source and target cohorts have different ascertainment patterns (e.g. target is
+    more severely selected), the apparent drop in association includes an ascertainment component. -/
+structure TwoPopColliderModel where
+  /-- Source population model -/
+  source : ColliderModel
+  /-- Target population model -/
+  target : ColliderModel
+  /-- Ascertainment severity difference: target has more ascertainment bias
+      (larger drop from true β to selected β) than source -/
+  h_diff_severity : target.β_G - target.β_selected > source.β_G - source.β_selected
+
+/-- The observed difference in predictive association (source - target) under ascertainment -/
+noncomputable def TwoPopColliderModel.obsDiff (m : TwoPopColliderModel) : ℝ :=
+  m.source.β_selected - m.target.β_selected
+
+/-- The true difference in predictive association (source - target) in the population -/
+noncomputable def TwoPopColliderModel.trueDiff (m : TwoPopColliderModel) : ℝ :=
+  m.source.β_G - m.target.β_G
+
+/-- Apparent portability drop (obsDiff) is larger than true portability drop (trueDiff)
+    due to differential ascertainment severity. -/
+theorem differential_ascertainment_artifact (m : TwoPopColliderModel) :
+    m.obsDiff > m.trueDiff := by
+  unfold TwoPopColliderModel.obsDiff TwoPopColliderModel.trueDiff
+  have h := m.h_diff_severity
   linarith
 
 end ColliderBias
@@ -517,13 +530,29 @@ theorem survivorship_attenuates_in_older (m : SurvivorshipAttenuationModel) :
 /-- **Differential survivorship across populations creates portability artifact.**
     If the target population has different age structure or mortality patterns,
     survivorship bias contributes to apparent portability loss. -/
-theorem differential_survivorship_artifact
-    (r2_source_full r2_target_full Δ_surv_source Δ_surv_target : ℝ)
-    (h_surv_s : 0 ≤ Δ_surv_source) (h_surv_t : 0 ≤ Δ_surv_target)
-    (h_diff : Δ_surv_target > Δ_surv_source)
-    (h_obs_s : r2_source_full - Δ_surv_source > 0) :
-    (r2_source_full - Δ_surv_source) - (r2_target_full - Δ_surv_target) >
-      r2_source_full - r2_target_full := by
+structure TwoPopSurvivorshipModel where
+  /-- Survivorship model for source population -/
+  source : SurvivorshipAttenuationModel
+  /-- Survivorship model for target population -/
+  target : SurvivorshipAttenuationModel
+  /-- Target population experiences more severe survivorship bias
+      (larger drop in variance from birth to survival) than source -/
+  h_diff_severity : target.r2_full - target.r2_surv > source.r2_full - source.r2_surv
+
+/-- Observed difference in R² between source and target among survivors -/
+noncomputable def TwoPopSurvivorshipModel.obsDiff (m : TwoPopSurvivorshipModel) : ℝ :=
+  m.source.r2_surv - m.target.r2_surv
+
+/-- True difference in R² between source and target at birth -/
+noncomputable def TwoPopSurvivorshipModel.trueDiff (m : TwoPopSurvivorshipModel) : ℝ :=
+  m.source.r2_full - m.target.r2_full
+
+/-- Apparent portability drop (obsDiff) is larger than true portability drop (trueDiff)
+    due to differential survivorship severity. -/
+theorem differential_survivorship_artifact (m : TwoPopSurvivorshipModel) :
+    m.obsDiff > m.trueDiff := by
+  unfold TwoPopSurvivorshipModel.obsDiff TwoPopSurvivorshipModel.trueDiff
+  have h := m.h_diff_severity
   linarith
 
 end SurvivorshipBias
@@ -717,11 +746,50 @@ theorem weak_instrument_bias_increases
 /-- **Horizontal pleiotropy patterns differ across populations.**
     If pleiotropic effects change across populations (due to different
     LD patterns or gene regulation), MR estimates are not portable. -/
-theorem pleiotropy_changes_invalidate_mr
-    (β_causal α_pleio_source α_pleio_target : ℝ)
-    (h_diff : α_pleio_source ≠ α_pleio_target) :
-    β_causal + α_pleio_source ≠ β_causal + α_pleio_target := by
-  intro h; exact h_diff (by linarith)
+structure MRPleiotropyModel where
+  /-- True causal effect (shared) -/
+  β_causal : ℝ
+  /-- Instrument effect on exposure (shared for simplicity) -/
+  γ_inst : ℝ
+  /-- Pleiotropic effect on outcome in source -/
+  α_pleio_source : ℝ
+  /-- Pleiotropic effect on outcome in target -/
+  α_pleio_target : ℝ
+  /-- Instrument must have non-zero effect on exposure -/
+  h_inst_ne : γ_inst ≠ 0
+  /-- Pleiotropic effects differ across populations -/
+  h_diff_pleio : α_pleio_source ≠ α_pleio_target
+
+/-- Reduced form effect on outcome in source -/
+noncomputable def MRPleiotropyModel.GammaSource (m : MRPleiotropyModel) : ℝ :=
+  m.β_causal * m.γ_inst + m.α_pleio_source
+
+/-- Reduced form effect on outcome in target -/
+noncomputable def MRPleiotropyModel.GammaTarget (m : MRPleiotropyModel) : ℝ :=
+  m.β_causal * m.γ_inst + m.α_pleio_target
+
+/-- MR Estimate in source: Gamma / γ_inst -/
+noncomputable def MRPleiotropyModel.mrEstimateSource (m : MRPleiotropyModel) : ℝ :=
+  m.GammaSource / m.γ_inst
+
+/-- MR Estimate in target: Gamma / γ_inst -/
+noncomputable def MRPleiotropyModel.mrEstimateTarget (m : MRPleiotropyModel) : ℝ :=
+  m.GammaTarget / m.γ_inst
+
+/-- Differential pleiotropy invalidates the transportability of the MR estimate,
+    producing different causal estimates across populations. -/
+theorem pleiotropy_changes_invalidate_mr (m : MRPleiotropyModel) :
+    m.mrEstimateSource ≠ m.mrEstimateTarget := by
+  unfold MRPleiotropyModel.mrEstimateSource MRPleiotropyModel.mrEstimateTarget
+  unfold MRPleiotropyModel.GammaSource MRPleiotropyModel.GammaTarget
+  intro h
+  have h1 : (m.β_causal * m.γ_inst + m.α_pleio_source) / m.γ_inst * m.γ_inst =
+            (m.β_causal * m.γ_inst + m.α_pleio_target) / m.γ_inst * m.γ_inst := by
+    rw [h]
+  rw [div_mul_cancel₀ _ m.h_inst_ne, div_mul_cancel₀ _ m.h_inst_ne] at h1
+  have h_diff : m.α_pleio_source ≠ m.α_pleio_target := m.h_diff_pleio
+  have : m.α_pleio_source = m.α_pleio_target := by linarith [h1]
+  exact h_diff this
 
 end MRPortability
 
