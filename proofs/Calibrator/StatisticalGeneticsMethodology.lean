@@ -411,6 +411,100 @@ theorem same_source_r2_different_portability_two_locus_witness :
   simp [TransportedMetrics.r2FromSignalVariance]
   norm_num
 
+/-- General structure modeling locus-resolved transport state across arbitrary dimensions. -/
+structure TransportState (n : ℕ) where
+  sourceSignal : Fin n → ℝ
+  stableTransport : Fin n → ℝ
+  brokenTransport : Fin n → ℝ
+  h_stable_eq : ∀ i, stableTransport i = 1
+  h_broken_le : ∀ i, brokenTransport i ≤ stableTransport i
+  h_broken_lt : ∃ i, brokenTransport i < stableTransport i
+  h_broken_nonneg : ∀ i, 0 ≤ brokenTransport i
+  h_signal_pos : ∀ i, 0 < sourceSignal i
+
+namespace TransportState
+
+/-- Source variance given by sum of locus signals. -/
+noncomputable def sourceVariance {n : ℕ} (state : TransportState n) : ℝ :=
+  ∑ l, state.sourceSignal l
+
+/-- Target variance when all transport is stable. -/
+noncomputable def stableTargetVariance {n : ℕ} (state : TransportState n) : ℝ :=
+  ∑ l, state.sourceSignal l * state.stableTransport l
+
+/-- Target variance when some transport is broken. -/
+noncomputable def brokenTargetVariance {n : ℕ} (state : TransportState n) : ℝ :=
+  ∑ l, state.sourceSignal l * state.brokenTransport l
+
+/-- Source deployed R² at residual scale 1. -/
+noncomputable def sourceR2 {n : ℕ} (state : TransportState n) : ℝ :=
+  TransportedMetrics.r2FromSignalVariance state.sourceVariance 1
+
+/-- Stable target R² at residual scale 1. -/
+noncomputable def stableTargetR2 {n : ℕ} (state : TransportState n) : ℝ :=
+  TransportedMetrics.r2FromSignalVariance state.stableTargetVariance 1
+
+/-- Broken target R² at residual scale 1. -/
+noncomputable def brokenTargetR2 {n : ℕ} (state : TransportState n) : ℝ :=
+  TransportedMetrics.r2FromSignalVariance state.brokenTargetVariance 1
+
+/-- Stable target variance equals source variance. -/
+theorem stableTargetVariance_eq_sourceVariance {n : ℕ} (state : TransportState n) :
+    state.stableTargetVariance = state.sourceVariance := by
+  unfold stableTargetVariance sourceVariance
+  apply Finset.sum_congr rfl
+  intro i _
+  rw [state.h_stable_eq i, mul_one]
+
+/-- Stable target R² equals source R². -/
+theorem stableTargetR2_eq_sourceR2 {n : ℕ} (state : TransportState n) :
+    state.stableTargetR2 = state.sourceR2 := by
+  unfold stableTargetR2 sourceR2
+  rw [stableTargetVariance_eq_sourceVariance]
+
+/-- Broken target variance is strictly less than stable target variance. -/
+theorem brokenTargetVariance_lt_stableTargetVariance {n : ℕ} [NeZero n] (state : TransportState n) :
+    state.brokenTargetVariance < state.stableTargetVariance := by
+  unfold brokenTargetVariance stableTargetVariance
+  apply Finset.sum_lt_sum
+  · intro i _
+    exact mul_le_mul_of_nonneg_left (state.h_broken_le i) (le_of_lt (state.h_signal_pos i))
+  · rcases state.h_broken_lt with ⟨i, hi⟩
+    use i
+    constructor
+    · exact Finset.mem_univ i
+    · exact mul_lt_mul_of_pos_left hi (state.h_signal_pos i)
+
+/-- Broken target variance is non-negative. -/
+theorem brokenTargetVariance_nonneg {n : ℕ} (state : TransportState n) :
+    0 ≤ state.brokenTargetVariance := by
+  unfold brokenTargetVariance
+  apply Finset.sum_nonneg
+  intro i _
+  exact mul_nonneg (le_of_lt (state.h_signal_pos i)) (state.h_broken_nonneg i)
+
+/-- Stable target variance is strictly positive. -/
+theorem stableTargetVariance_pos {n : ℕ} [NeZero n] (state : TransportState n) :
+    0 < state.stableTargetVariance := by
+  calc 0 ≤ state.brokenTargetVariance := state.brokenTargetVariance_nonneg
+       _ < state.stableTargetVariance := state.brokenTargetVariance_lt_stableTargetVariance
+
+/-- Broken target R² is strictly less than stable target R². -/
+theorem brokenTargetR2_lt_stableTargetR2 {n : ℕ} [NeZero n] (state : TransportState n) :
+    state.brokenTargetR2 < state.stableTargetR2 := by
+  unfold brokenTargetR2 stableTargetR2 TransportedMetrics.r2FromSignalVariance
+  have h_broken_nonneg := state.brokenTargetVariance_nonneg
+  have h_stable_pos := state.stableTargetVariance_pos
+  have h_var_lt := state.brokenTargetVariance_lt_stableTargetVariance
+
+  have h_broken_denom_pos : 0 < state.brokenTargetVariance + 1 := by linarith
+  have h_stable_denom_pos : 0 < state.stableTargetVariance + 1 := by linarith
+
+  rw [div_lt_div_iff₀ h_broken_denom_pos h_stable_denom_pos]
+  nlinarith
+
+end TransportState
+
 end SourceR2Insufficiency
 
 end Calibrator
