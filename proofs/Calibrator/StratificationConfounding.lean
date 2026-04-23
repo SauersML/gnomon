@@ -324,17 +324,18 @@ theorem collider_attenuates_association (m : ColliderModel) :
 
 /-- **Differential ascertainment creates portability artifact.**
     If source and target cohorts have different ascertainment patterns,
-    the apparent portability drop includes an ascertainment component. -/
+    the apparent portability drop includes an ascertainment component.
+    Specifically, if the target population suffers a more severe ascertainment
+    penalty than the source (in terms of variance or R² lost to the collider),
+    the observed portability gap strictly exceeds the true population gap. -/
 theorem differential_ascertainment_artifact
     (r2_source_pop r2_target_pop r2_source_asc r2_target_asc : ℝ)
-    (h_source_asc : r2_source_asc < r2_source_pop)
-    (h_target_asc : r2_target_asc < r2_target_pop)
-    -- Different ascertainment severity
-    (h_diff_severity : r2_target_pop - r2_target_asc < r2_source_pop - r2_source_asc) :
+    (_h_source_asc : r2_source_asc < r2_source_pop)
+    (_h_target_asc : r2_target_asc < r2_target_pop)
+    -- Different ascertainment severity: target loses more R² to ascertainment than source
+    (h_diff_severity : r2_source_pop - r2_source_asc < r2_target_pop - r2_target_asc) :
     -- Apparent portability drop is larger than true portability drop
-    r2_source_asc - r2_target_asc > r2_source_pop - r2_target_pop →
-      False := by
-  intro h
+    r2_source_pop - r2_target_pop < r2_source_asc - r2_target_asc := by
   linarith
 
 end ColliderBias
@@ -514,16 +515,34 @@ theorem survivorship_attenuates_in_older (m : SurvivorshipAttenuationModel) :
       < m.r2_full * 1 := by exact mul_lt_mul_of_pos_left h_ratio_lt_one m.r2_full_pos
     _ = m.r2_full := by ring
 
+/-- A structured model for comparing survivorship bias between two populations. -/
+structure DifferentialSurvivorshipModel where
+  /-- The true underlying association R² in the source full population -/
+  r2_source_full : ℝ
+  /-- The true underlying association R² in the target full population -/
+  r2_target_full : ℝ
+  /-- R² attenuation penalty in the source population due to survivorship bias -/
+  Δ_surv_source : ℝ
+  /-- R² attenuation penalty in the target population due to survivorship bias -/
+  Δ_surv_target : ℝ
+
+/-- The observed portability gap between the surviving cohorts of the two populations. -/
+noncomputable def observedPortabilityGap (m : DifferentialSurvivorshipModel) : ℝ :=
+  (m.r2_source_full - m.Δ_surv_source) - (m.r2_target_full - m.Δ_surv_target)
+
+/-- The true baseline portability gap between the full, unselected populations. -/
+noncomputable def truePortabilityGap (m : DifferentialSurvivorshipModel) : ℝ :=
+  m.r2_source_full - m.r2_target_full
+
 /-- **Differential survivorship across populations creates portability artifact.**
-    If the target population has different age structure or mortality patterns,
-    survivorship bias contributes to apparent portability loss. -/
+    If the target population experiences more severe survivorship bias (e.g., due to
+    different age structure or mortality patterns) resulting in a larger R² attenuation penalty,
+    the observed portability gap strictly overestimates the true baseline portability gap. -/
 theorem differential_survivorship_artifact
-    (r2_source_full r2_target_full Δ_surv_source Δ_surv_target : ℝ)
-    (h_surv_s : 0 ≤ Δ_surv_source) (h_surv_t : 0 ≤ Δ_surv_target)
-    (h_diff : Δ_surv_target > Δ_surv_source)
-    (h_obs_s : r2_source_full - Δ_surv_source > 0) :
-    (r2_source_full - Δ_surv_source) - (r2_target_full - Δ_surv_target) >
-      r2_source_full - r2_target_full := by
+    (m : DifferentialSurvivorshipModel)
+    (h_diff : m.Δ_surv_source < m.Δ_surv_target) :
+    truePortabilityGap m < observedPortabilityGap m := by
+  unfold truePortabilityGap observedPortabilityGap
   linarith
 
 end SurvivorshipBias
