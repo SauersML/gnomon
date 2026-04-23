@@ -371,12 +371,17 @@ theorem fst_decreases_with_migration (m₁ m₂ Ne : ℝ)
 /-- **Shared selection homogenizes architecture.**
     If both populations experience the same selective pressure
     (e.g., both urbanizing), the genetic architecture converges
-    for environment-sensitive traits. -/
+    for environment-sensitive traits, increasing the genetic
+    correlation between them. -/
 theorem shared_selection_improves_portability
-    (rg_before rg_after : ℝ)
-    (h_improves : rg_before < rg_after)
-    (h_le : rg_after ≤ 1) :
-    rg_before < 1 := by linarith
+    (cov_before cov_after V_g_source V_g_target : ℝ)
+    (h_cov : cov_before < cov_after)
+    (h_Vs : 0 < V_g_source) (h_Vt : 0 < V_g_target) :
+    cov_before / Real.sqrt (V_g_source * V_g_target) <
+      cov_after / Real.sqrt (V_g_source * V_g_target) := by
+  have h_denom : 0 < Real.sqrt (V_g_source * V_g_target) :=
+    Real.sqrt_pos.mpr (mul_pos h_Vs h_Vt)
+  exact (div_lt_div_iff₀ h_denom h_denom).mpr (by nlinarith)
 
 /-!
 ### Derivation: portabilityFromArchitecture = rg² × (1 - Fst) × tagging_ratio
