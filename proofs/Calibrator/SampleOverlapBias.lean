@@ -130,8 +130,8 @@ theorem apparent_portability_loss_includes_overlap
     rw [h0] at hlt
     exact hlt
   constructor
-  · linarith
-  · linarith
+  · exact lt_trans h_real_gap h_inflation
+  · exact sub_lt_sub_right h_inflation r2_cross
 
 /-- **Correcting for overlap reveals true portability.**
     After removing overlap bias from same-ancestry R²,
@@ -140,15 +140,20 @@ theorem apparent_portability_loss_includes_overlap
     by overlap bias, the apparent portability ratio is lower than the
     true ratio R²_cross / R²_same_true. -/
 theorem corrected_portability_better
-    (r2_cross r2_same_true overlap_bias : ℝ)
+    (r2_cross r2_same_true h2 f : ℝ) (n_gwas : ℕ)
     (h_cross_pos : 0 < r2_cross)
     (h_same_pos : 0 < r2_same_true)
-    (h_bias_pos : 0 < overlap_bias)
+    (h_f_pos : 0 < f)
+    (h_n : 0 < n_gwas)
+    (h_h2 : r2_same_true < h2)
     (h_cross_le : r2_cross < r2_same_true) :
     -- apparent portability < true portability
-    r2_cross / (r2_same_true + overlap_bias) < r2_cross / r2_same_true := by
-  apply div_lt_div_of_pos_left h_cross_pos h_same_pos
-  linarith
+    r2_cross / partialOverlapR2 r2_same_true h2 f n_gwas < r2_cross / r2_same_true := by
+  have h_bias_pos : 0 < f * (h2 - r2_same_true) / ↑n_gwas :=
+    div_pos (mul_pos h_f_pos (by linarith)) (Nat.cast_pos.mpr h_n)
+  have h_overlap : partialOverlapR2 r2_same_true h2 f n_gwas = r2_same_true + f * (h2 - r2_same_true) / ↑n_gwas := rfl
+  rw [h_overlap]
+  exact (div_lt_div_iff₀ (by linarith) h_same_pos).mpr (by nlinarith)
 
 end CrossAncestryNoOverlap
 
@@ -199,8 +204,7 @@ theorem jackknife_reduces_r2 (r2_full bias : ℝ)
     yields a difference that exactly equals the bias term.
     Derived from the structural definition of `partialOverlapR2`. -/
 theorem gwas_subtraction_estimates_bias
-    (r2_true h2 f : ℝ) (n_gwas : ℕ)
-    (h_h2 : r2_true < h2) (h_f : 0 < f) (h_n : 0 < n_gwas) :
+    (r2_true h2 f : ℝ) (n_gwas : ℕ) :
     partialOverlapR2 r2_true h2 f n_gwas - partialOverlapR2 r2_true h2 0 n_gwas =
       f * (h2 - r2_true) / ↑n_gwas := by
   unfold partialOverlapR2
@@ -245,8 +249,6 @@ theorem kinship_inflates (r2_true K h2_family : ℝ)
 theorem grm_threshold_tradeoff
     (r2_true h2_family K_strict K_lenient : ℝ)
     (h_strict_lt : K_strict < K_lenient)
-    (h_strict_pos : 0 < K_strict)
-    (h_lenient_pos : 0 < K_lenient)
     (h_h2_pos : 0 < h2_family) :
     -- Stricter threshold gives smaller kinship inflation
     kinshipInflation r2_true K_strict h2_family <
@@ -261,7 +263,6 @@ theorem grm_threshold_tradeoff
     so the bias is bounded by ε × h²_family. -/
 theorem cross_ancestry_no_kinship_bias
     (K_cross h2_family ε : ℝ)
-    (h_ε_pos : 0 < ε)
     (h_K_small : |K_cross| < ε)
     (h_h2_pos : 0 < h2_family) (h_h2_le : h2_family ≤ 1) :
     |K_cross * h2_family| < ε := by
