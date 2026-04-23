@@ -97,6 +97,11 @@ theorem spline_error_improves_with_knots
   apply pow_lt_pow_left₀ h_finer (le_of_lt h_pos)
   norm_num
 
+/-- Expected MSE of a spline calibration curve, decomposed into squared bias
+    and variance components. -/
+noncomputable def splineMSE (bias variance : ℝ) : ℝ :=
+  bias ^ 2 + variance
+
 /-- **Bias-variance tradeoff in spline calibration.**
     More knots → less bias (better approximation)
     More knots → more variance (overfitting)
@@ -116,7 +121,9 @@ theorem bias_variance_tradeoff
     (h_bias_improves : bias₂ ^ 2 < bias₁ ^ 2)
     (h_var_worsens : var₁ < var₂)
     (h_var_dominates : var₂ - var₁ > bias₁ ^ 2 - bias₂ ^ 2) :
-    bias₁ ^ 2 + var₁ < bias₂ ^ 2 + var₂ := by linarith
+    splineMSE bias₁ var₁ < splineMSE bias₂ var₂ := by
+  unfold splineMSE
+  linarith
 
 /-- **Spline R² is bounded by the signal-to-noise ratio.**
     R²_spline ≤ Var(E[ε²|d]) / Var(ε²).
@@ -266,6 +273,12 @@ theorem measurement_invariance_violation
       nlinarith [sq_nonneg (scale - 1)]
     exact h_scale this
 
+/-- In the liability threshold model, the distance from the mean to the
+    threshold determines the prevalence (proportion of the distribution
+    above the threshold). A smaller distance implies a higher prevalence. -/
+noncomputable def liabilityThresholdDistance (mean threshold : ℝ) : ℝ :=
+  threshold - mean
+
 /-- **Liability threshold model for binary traits.**
     Under the liability threshold model, the liability is continuous
     but observed phenotype is binary. The threshold may differ
@@ -275,7 +288,10 @@ theorem threshold_shift_changes_prevalence
     (h_mean_shift : liability_mean₁ < liability_mean₂) :
     -- With fixed threshold, higher mean → higher prevalence
     -- (proportion above threshold increases)
-    threshold - liability_mean₂ < threshold - liability_mean₁ := by linarith
+    liabilityThresholdDistance liability_mean₂ threshold <
+      liabilityThresholdDistance liability_mean₁ threshold := by
+  unfold liabilityThresholdDistance
+  linarith
 
 /-- **Different prevalence → different R² even with same AUC.**
     This is a key insight from Wang et al.: R² and AUC can disagree
