@@ -536,4 +536,25 @@ theorem im_delta_strictAntiOn_proved :
     StrictAntiOn (fun M : ℝ => twoDemeIMEquilibriumDelta M) (Set.Ioi 0) :=
   twoDemeIMEquilibriumDelta_strictAntiOn
 
+
+/-- **Portability gap creates benefit gap.**
+    If R²_EUR > R²_AFR and benefit = α × R² with α > 0, then
+    clinical benefit for EUR patients exceeds that for AFR patients. -/
+theorem portability_creates_benefit_gap_proved
+    (m : ClinicalUtilityModel) (r2_eur r2_afr : ℝ)
+    (h_r2_gap : r2_afr < r2_eur) :
+    0 < m.benefit r2_eur - m.benefit r2_afr :=
+  portability_creates_benefit_gap m r2_eur r2_afr h_r2_gap
+
+/-- **Minimum R² for clinical utility.**
+    Below a threshold R², PGS does not improve clinical decisions.
+    The net clinical value = α × R² - cost. When R² is small
+    (R² < cost / α), the net value is negative. -/
+theorem r2_threshold_for_utility_proved
+    (m : ClinicalUtilityModel) (r2 : ℝ)
+    (h_below : r2 < m.cost / m.alpha) :
+    m.netValue r2 < 0 :=
+  r2_threshold_for_utility m r2 h_below
+
+
 end Calibrator
