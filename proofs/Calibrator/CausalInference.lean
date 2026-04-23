@@ -34,28 +34,54 @@ each contributing a specific proportion of the total loss.
 
 section PathDecomposition
 
+/-- Structural model for portability loss pathways. -/
+structure PortabilityLossModel where
+  loss_LD : ℝ
+  loss_MAF : ℝ
+  loss_effect : ℝ
+  loss_env : ℝ
+  loss_tech : ℝ
+  loss_interaction : ℝ
+  h_LD_nonneg : 0 ≤ loss_LD
+  h_MAF_nonneg : 0 ≤ loss_MAF
+  h_effect_nonneg : 0 ≤ loss_effect
+  h_env_nonneg : 0 ≤ loss_env
+  h_tech_nonneg : 0 ≤ loss_tech
+  h_interaction_nonneg : 0 ≤ loss_interaction
+
+/-- Total portability loss derived from causal pathways. -/
+noncomputable def totalPortabilityLoss (m : PortabilityLossModel) : ℝ :=
+  m.loss_LD + m.loss_MAF + m.loss_effect + m.loss_env + m.loss_tech + m.loss_interaction
+
 /-- **Total portability loss decomposition.**
-    Δ_total = Δ_LD + Δ_MAF + Δ_effect + Δ_env + Δ_technical
+    Δ_total = Δ_LD + Δ_MAF + Δ_effect + Δ_env + Δ_technical + Δ_interaction
     Each component represents a distinct causal pathway. -/
 theorem total_loss_decomposition
-    (delta_total delta_LD delta_MAF delta_effect delta_env delta_tech : ℝ)
-    (h_decomp : delta_total = delta_LD + delta_MAF + delta_effect + delta_env + delta_tech)
-    (h_LD : 0 ≤ delta_LD) (h_MAF : 0 ≤ delta_MAF) (h_effect : 0 ≤ delta_effect)
-    (h_env : 0 ≤ delta_env) (h_tech : 0 ≤ delta_tech) :
-    delta_LD ≤ delta_total ∧ delta_MAF ≤ delta_total ∧
-    delta_effect ≤ delta_total ∧ delta_env ≤ delta_total ∧
-    delta_tech ≤ delta_total := by
+    (m : PortabilityLossModel) :
+    m.loss_LD ≤ totalPortabilityLoss m ∧
+    m.loss_MAF ≤ totalPortabilityLoss m ∧
+    m.loss_effect ≤ totalPortabilityLoss m ∧
+    m.loss_env ≤ totalPortabilityLoss m ∧
+    m.loss_tech ≤ totalPortabilityLoss m := by
+  unfold totalPortabilityLoss
+  have h1 := m.h_LD_nonneg
+  have h2 := m.h_MAF_nonneg
+  have h3 := m.h_effect_nonneg
+  have h4 := m.h_env_nonneg
+  have h5 := m.h_tech_nonneg
+  have h6 := m.h_interaction_nonneg
   constructor <;> [skip; constructor <;> [skip; constructor <;> [skip; constructor]]] <;> linarith
 
 /-- **LD pathway is the largest contributor for most traits.**
     For non-immune traits, LD mismatch accounts for >50% of portability loss. -/
 theorem ld_dominant_pathway
-    (delta_total delta_LD : ℝ)
-    (h_total : 0 < delta_total)
-    (h_LD_large : delta_total / 2 < delta_LD)
-    (h_LD_le : delta_LD ≤ delta_total) :
-    1 / 2 < delta_LD / delta_total := by
-  rw [div_lt_div_iff₀ (by norm_num : (0:ℝ) < 2) h_total]
+    (m : PortabilityLossModel)
+    (h_LD_dominant : m.loss_MAF + m.loss_effect + m.loss_env + m.loss_tech + m.loss_interaction < m.loss_LD) :
+    1 / 2 < m.loss_LD / totalPortabilityLoss m := by
+  unfold totalPortabilityLoss
+  have h_total_pos : 0 < m.loss_LD + m.loss_MAF + m.loss_effect + m.loss_env + m.loss_tech + m.loss_interaction := by
+    linarith [m.h_LD_nonneg, m.h_MAF_nonneg, m.h_effect_nonneg, m.h_env_nonneg, m.h_tech_nonneg, m.h_interaction_nonneg]
+  rw [div_lt_div_iff₀ (by norm_num : (0:ℝ) < 2) h_total_pos]
   linarith
 
 /-- **Selection pathway dominates for immune traits.**
@@ -95,11 +121,11 @@ theorem selection_dominant_for_immune
     Pathways are not fully independent: LD changes interact
     with MAF changes (LD × MAF interaction). -/
 theorem pathway_interactions_exist
-    (sum_individual total_with_interactions interaction : ℝ)
-    (h_interaction : total_with_interactions = sum_individual + interaction)
-    (h_nonzero : interaction ≠ 0) :
-    total_with_interactions ≠ sum_individual := by
-  rw [h_interaction]; intro h; apply h_nonzero; linarith
+    (m : PortabilityLossModel)
+    (h_interact_pos : 0 < m.loss_interaction) :
+    m.loss_LD + m.loss_MAF + m.loss_effect + m.loss_env + m.loss_tech < totalPortabilityLoss m := by
+  unfold totalPortabilityLoss
+  linarith
 
 end PathDecomposition
 
