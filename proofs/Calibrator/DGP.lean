@@ -1035,22 +1035,48 @@ structure LDDecayMechanism (k : ℕ) where
 def decaySlope {k : ℕ} (mech : LDDecayMechanism k) (c : Fin k → ℝ) : ℝ :=
   mech.tagging_efficiency (mech.distance c)
 
-theorem ld_decay_implies_nonlinear_calibration_sketch {k : ℕ} [Fintype (Fin k)]
+theorem ld_decay_implies_nonlinear_calibration_proved {k : ℕ} [Fintype (Fin k)]
     (mech : LDDecayMechanism k)
-    (h_nonlin : ¬ ∃ a b, ∀ d ∈ Set.range mech.distance, mech.tagging_efficiency d = a + b * d) :
+    (lambda : ℝ) (h_lambda_pos : 0 < lambda)
+    (h_tagging : mech.tagging_efficiency = fun d => Real.exp (-lambda * d))
+    (c0 c1 c2 : Fin k → ℝ)
+    (hd0 : mech.distance c0 = 0)
+    (hd1 : mech.distance c1 = 1)
+    (hd2 : mech.distance c2 = 2) :
     ∀ (beta0 beta1 : ℝ),
       (fun c => beta0 + beta1 * mech.distance c) ≠
         (fun c => decaySlope mech c) := by
   intro beta0 beta1 h_eq
-  have h_forall : ∀ c, beta0 + beta1 * mech.distance c = mech.tagging_efficiency (mech.distance c) :=
-    fun c => congr_fun h_eq c
-
-  -- This contradicts h_nonlin
-  apply h_nonlin
-  use beta0, beta1
-  intro d hd
-  obtain ⟨c, hc⟩ := hd
-  rw [← hc, h_forall c]
+  have h0 := congr_fun h_eq c0
+  have h1 := congr_fun h_eq c1
+  have h2 := congr_fun h_eq c2
+  unfold decaySlope at h0 h1 h2
+  rw [h_tagging] at h0 h1 h2
+  rw [hd0] at h0
+  rw [hd1] at h1
+  rw [hd2] at h2
+  simp only [mul_zero, Real.exp_zero, mul_one, add_zero] at h0 h1 h2
+  have h_b1 : beta1 = Real.exp (-lambda) - beta0 := by linarith
+  have h_b0 : beta0 = 1 := by linarith
+  rw [h_b0] at h_b1
+  have h_2 : 1 + 2 * (Real.exp (-lambda) - 1) = Real.exp (-lambda * 2) := by linarith
+  have h_exp_sq : Real.exp (-lambda * 2) = (Real.exp (-lambda))^2 := by
+    rw [mul_comm, ← Real.exp_nat_mul]
+    norm_cast
+  rw [h_exp_sq] at h_2
+  have h_quad : (Real.exp (-lambda) - 1)^2 = 0 := by
+    calc (Real.exp (-lambda) - 1)^2
+      _ = (Real.exp (-lambda))^2 - 2 * Real.exp (-lambda) + 1 := by ring
+      _ = 1 + 2 * (Real.exp (-lambda) - 1) - 2 * Real.exp (-lambda) + 1 := by rw [← h_2]
+      _ = 0 := by ring
+  have h_exp_eq_one : Real.exp (-lambda) = 1 := by
+    have h_zero : Real.exp (-lambda) - 1 = 0 := sq_eq_zero_iff.mp h_quad
+    linarith
+  have h_lambda_zero : -lambda = 0 := by
+    have h_exp_zero : Real.exp 0 = 1 := Real.exp_zero
+    rw [← h_exp_zero] at h_exp_eq_one
+    exact Real.exp_injective h_exp_eq_one
+  linarith
 
 theorem optimal_slope_trace_variance {k : ℕ} [Fintype (Fin k)]
     (arch : GeneticArchitecture k) (c : Fin k → ℝ)
