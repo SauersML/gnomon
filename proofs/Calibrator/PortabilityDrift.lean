@@ -669,36 +669,35 @@ noncomputable def targetLinearRisk {p : ℕ}
     (w : Fin p → ℝ) : ℝ :=
   noiseVar + dotProduct w (sigmaObsTarget.mulVec w) - 2 * dotProduct w crossTarget
 
+structure LDMismatchModel where
+  p : ℕ
+  sigmaObsSource : Matrix (Fin p) (Fin p) ℝ
+  sigmaObsTarget : Matrix (Fin p) (Fin p) ℝ
+  crossSource : Fin p → ℝ
+  crossTarget : Fin p → ℝ
+  wSource : Fin p → ℝ
+  wTarget : Fin p → ℝ
+  hSource : sigmaObsSource.mulVec wSource = crossSource
+  hTarget : sigmaObsTarget.mulVec wTarget = crossTarget
+  hConflict : ∀ w : Fin p → ℝ, sigmaObsSource.mulVec w = crossSource → sigmaObsTarget.mulVec w ≠ crossTarget
+
 /-- If source ERM satisfies source normal equations but not target normal equations,
 the learned projection is source-LD specific (Euro-centric mismatch statement).
 The source weight vector fails to minimize target risk because it satisfies
 different normal equations. -/
 theorem source_erm_is_ld_specific_of_normal_eq_mismatch
-    {p : Nat}
-    (sigmaObsSource sigmaObsTarget : Matrix (Fin p) (Fin p) Real)
-    (crossSource crossTarget : Fin p -> Real)
-    (wSource : Fin p -> Real)
-    (_hSource : sigmaObsSource.mulVec wSource = crossSource)
-    (hMismatch : sigmaObsTarget.mulVec wSource ≠ crossTarget) :
-    ¬ sigmaObsTarget.mulVec wSource = crossTarget := by
-  intro hContra
-  exact absurd hContra hMismatch
+    (m : LDMismatchModel) :
+    ¬ m.sigmaObsTarget.mulVec m.wSource = m.crossTarget := by
+  exact m.hConflict m.wSource m.hSource
 
 /-- If one coefficient vector solves source normal equations and another solves target normal equations,
 and no single vector can satisfy both systems, then source ERM and target ERM must differ. -/
 theorem source_target_erm_differ_of_ld_system_conflict
-    {p : Nat}
-    (sigmaObsSource sigmaObsTarget : Matrix (Fin p) (Fin p) Real)
-    (crossSource crossTarget : Fin p -> Real)
-    (wSource wTarget : Fin p -> Real)
-    (hSource : sigmaObsSource.mulVec wSource = crossSource)
-    (hTarget : sigmaObsTarget.mulVec wTarget = crossTarget)
-    (hConflict :
-      ∀ w : Fin p -> Real, sigmaObsSource.mulVec w = crossSource -> sigmaObsTarget.mulVec w ≠ crossTarget) :
-    wSource ≠ wTarget := by
+    (m : LDMismatchModel) :
+    m.wSource ≠ m.wTarget := by
   intro hEq
-  have hNotTargetAtSource : sigmaObsTarget.mulVec wSource ≠ crossTarget := hConflict wSource hSource
-  have hTargetAtSource : sigmaObsTarget.mulVec wSource = crossTarget := by simpa [hEq] using hTarget
+  have hNotTargetAtSource : m.sigmaObsTarget.mulVec m.wSource ≠ m.crossTarget := m.hConflict m.wSource m.hSource
+  have hTargetAtSource : m.sigmaObsTarget.mulVec m.wSource = m.crossTarget := by simpa [hEq] using m.hTarget
   exact hNotTargetAtSource hTargetAtSource
 
 /-- Dense source covariance witness for non-degenerate ERM-transport tests. -/
