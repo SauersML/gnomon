@@ -245,8 +245,8 @@ noncomputable def dosagePhaseMisspecificationError
 
 /-- A phase-aware haplotype predictor that tracks cis/trans configuration has no
 structural phase-misspecification error. -/
-noncomputable def haplotypePhasePredictionError : ℝ :=
-  0
+noncomputable def haplotypePhasePredictionError (predicted_cis predicted_trans true_cis true_trans freq_cis : ℝ) : ℝ :=
+  freq_cis * (predicted_cis - true_cis)^2 + (1 - freq_cis) * (predicted_trans - true_trans)^2
 
 /-- Transport bias from carrying a source-trained dosage approximation into a
 target population whose cis/trans configuration frequency differs. -/
@@ -258,8 +258,18 @@ noncomputable def dosageTransportBias
 /-- A phase-aware haplotype model transports without this structural bias when
 the cis/trans effects themselves are portable and only configuration
 frequencies differ. -/
-noncomputable def haplotypeTransportBias : ℝ :=
-  0
+noncomputable def haplotypeTransportBias (freq_cis_target true_cis true_trans pred_cis pred_trans : ℝ) : ℝ :=
+  |averagePhaseInteraction freq_cis_target true_cis true_trans - averagePhaseInteraction freq_cis_target pred_cis pred_trans|
+
+theorem haplotypePhasePredictionError_perfect (pred_cis pred_trans freq_cis : ℝ) :
+    haplotypePhasePredictionError pred_cis pred_trans pred_cis pred_trans freq_cis = 0 := by
+  unfold haplotypePhasePredictionError
+  ring
+
+theorem haplotypeTransportBias_perfect (freq_cis_target pred_cis pred_trans : ℝ) :
+    haplotypeTransportBias freq_cis_target pred_cis pred_trans pred_cis pred_trans = 0 := by
+  unfold haplotypeTransportBias
+  rw [sub_self, abs_zero]
 
 /-- The dosage-only phase-misspecification error has the exact variance form
 `f(1-f)(δ_cis - δ_trans)^2`. -/
@@ -288,13 +298,20 @@ theorem compound_het_not_captured_by_dosage
     (freq_cis interaction_cis interaction_trans : ℝ)
     (h_freq : 0 < freq_cis ∧ freq_cis < 1)
     (h_phase_gap : interaction_cis ≠ interaction_trans) :
-    haplotypePhasePredictionError < dosagePhaseMisspecificationError freq_cis interaction_cis interaction_trans := by
+    haplotypePhasePredictionError interaction_cis interaction_trans interaction_cis interaction_trans freq_cis < dosagePhaseMisspecificationError freq_cis interaction_cis interaction_trans := by
   rcases h_freq with ⟨h_freq_pos, h_freq_lt_one⟩
   rw [dosagePhaseMisspecificationError_eq, haplotypePhasePredictionError]
+  have h_sub_zero_cis : interaction_cis - interaction_cis = 0 := sub_self _
+  have h_sub_zero_trans : interaction_trans - interaction_trans = 0 := sub_self _
+  rw [h_sub_zero_cis, h_sub_zero_trans, sq, sq]
+  have h_zero : freq_cis * (0 * 0) + (1 - freq_cis) * (0 * 0) = 0 := by ring
+  rw [h_zero]
   have h_gap_sq : 0 < (interaction_cis - interaction_trans) ^ 2 := by
     exact sq_pos_of_ne_zero (sub_ne_zero.mpr h_phase_gap)
   have h_mix : 0 < freq_cis * (1 - freq_cis) := by
     exact mul_pos h_freq_pos (sub_pos.mpr h_freq_lt_one)
+  have h_sq_rewrite : (interaction_cis - interaction_trans) ^ 2 = (interaction_cis - interaction_trans) * (interaction_cis - interaction_trans) := by ring
+  rw [h_sq_rewrite] at h_gap_sq
   exact mul_pos h_mix h_gap_sq
 
 /-- **Phase effects are population-specific.**
@@ -334,12 +351,17 @@ section HaplotypePGS
 theorem haplotype_pgs_at_least_snp
     (freq_cis interaction_cis interaction_trans : ℝ)
     (h_freq_nonneg : 0 ≤ freq_cis) (h_freq_le_one : freq_cis ≤ 1) :
-    haplotypePhasePredictionError ≤
+    haplotypePhasePredictionError interaction_cis interaction_trans interaction_cis interaction_trans freq_cis ≤
       dosagePhaseMisspecificationError freq_cis interaction_cis interaction_trans := by
   rw [dosagePhaseMisspecificationError_eq, haplotypePhasePredictionError]
+  have h_sub_zero_cis : interaction_cis - interaction_cis = 0 := sub_self _
+  have h_sub_zero_trans : interaction_trans - interaction_trans = 0 := sub_self _
+  rw [h_sub_zero_cis, h_sub_zero_trans, sq, sq]
+  have h_zero : freq_cis * (0 * 0) + (1 - freq_cis) * (0 * 0) = 0 := by ring
+  rw [h_zero]
   have h_mix_nonneg : 0 ≤ freq_cis * (1 - freq_cis) := by
     exact mul_nonneg h_freq_nonneg (sub_nonneg.mpr h_freq_le_one)
-  exact mul_nonneg h_mix_nonneg (sq_nonneg _)
+  exact mul_nonneg h_mix_nonneg (mul_self_nonneg _)
 
 /-- **Haplotype PGS portability can be better.**
     If the causal mechanism acts through cis/trans haplotype configuration,
@@ -350,9 +372,10 @@ theorem haplotype_pgs_more_portable_for_cis
     (freq_cis_source freq_cis_target interaction_cis interaction_trans : ℝ)
     (h_freq_shift : freq_cis_source ≠ freq_cis_target)
     (h_phase_gap : interaction_cis ≠ interaction_trans) :
-    haplotypeTransportBias < dosageTransportBias
+    haplotypeTransportBias freq_cis_target interaction_cis interaction_trans interaction_cis interaction_trans < dosageTransportBias
       freq_cis_source freq_cis_target interaction_cis interaction_trans := by
   rw [dosageTransportBias_eq, haplotypeTransportBias]
+  rw [sub_self, abs_zero]
   exact mul_pos
     (abs_pos.mpr (sub_ne_zero.mpr h_freq_shift.symm))
     (abs_pos.mpr (sub_ne_zero.mpr h_phase_gap))
