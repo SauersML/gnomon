@@ -1,9 +1,9 @@
 use super::fit::{FitOptions, HwePcaError, HwePcaModel, LdConfig, LdWindow, VariantBlockSource};
 use super::io::{
     DatasetOutputError, GenotypeDataset, GenotypeIoError, OrderedSelectionPlan,
-    ProjectionOutputPaths, SelectionPlan, create_projection_matrix_sink, load_hwe_model,
-    load_model_from_path, save_fit_summary, save_hwe_model, save_projection_output_manifest,
-    save_sample_manifest,
+    ProjectionOutputPaths, SelectionPlan, create_projection_matrix_sink,
+    create_projection_matrix_sink_at, load_hwe_model, load_model_from_path, save_fit_summary,
+    save_hwe_model, save_projection_output_manifest, save_sample_manifest,
 };
 use super::prefit::{self, BuiltinModelError};
 use super::progress::{fit_progress, projection_progress};
@@ -324,6 +324,37 @@ fn run_project(
     model_name: Option<&str>,
     output_manifest: Option<&Path>,
 ) -> Result<(), MapDriverError> {
+    run_project_inner(genotype_path, model_name, output_manifest, None)
+}
+
+/// Run the `project` subcommand against a pre-opened/cached PLINK fileset but
+/// write the projection outputs at a caller-supplied base path.
+///
+/// `projection_scores_path` is the absolute path for the `.bin` artifact; the
+/// companion `.metadata.json` is written alongside it. This lets `gnomon all`
+/// project from the converted PLINK cache while keeping the
+/// `projection_scores.bin` next to the original VCF (where pgsEngine expects
+/// it).
+pub fn run_project_with_output(
+    genotype_path: &Path,
+    model_name: Option<&str>,
+    output_manifest: Option<&Path>,
+    projection_scores_path: &Path,
+) -> Result<(), MapDriverError> {
+    run_project_inner(
+        genotype_path,
+        model_name,
+        output_manifest,
+        Some(projection_scores_path),
+    )
+}
+
+fn run_project_inner(
+    genotype_path: &Path,
+    model_name: Option<&str>,
+    output_manifest: Option<&Path>,
+    projection_scores_override: Option<&Path>,
+) -> Result<(), MapDriverError> {
     println!("=== Sample projection into PCA space ===");
     println!("Input genotype location: {}", genotype_path.display());
 
@@ -453,13 +484,23 @@ fn run_project(
     let projector = model.projector();
     let progress = projection_progress();
     let projection_start = Instant::now();
-    let mut score_sink = create_projection_matrix_sink(
-        &dataset,
-        "projection_scores.bin",
-        dataset.n_samples(),
-        model.components(),
-        "scores",
-    )?;
+    let mut score_sink = if let Some(target) = projection_scores_override {
+        create_projection_matrix_sink_at(
+            &dataset,
+            target,
+            dataset.n_samples(),
+            model.components(),
+            "scores",
+        )?
+    } else {
+        create_projection_matrix_sink(
+            &dataset,
+            "projection_scores.bin",
+            dataset.n_samples(),
+            model.components(),
+            "scores",
+        )?
+    };
     {
         let score_matrix = score_sink.as_mat_mut()?;
         projector.project_into_with_options_and_progress(

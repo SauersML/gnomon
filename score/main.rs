@@ -21,6 +21,7 @@ use gnomon::score::prepare;
 use gnomon::score::reformat;
 use gnomon::score::types::{GenomicRegion, PreparationResult};
 use natord::compare;
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::error::Error;
 use std::ffi::OsString;
@@ -402,31 +403,28 @@ fn run_preparation_phase(
     );
     let prep_phase_start = Instant::now();
 
-    let mut native_score_files = Vec::with_capacity(score_files.len());
-    // Track (label, source_path) for duplicate detection
-    let mut label_to_path: std::collections::HashMap<String, PathBuf> =
-        std::collections::HashMap::new();
-    let mut skip_summaries = Vec::new();
+    // Classify each source file serially (cheap: header sniff + mtime check).
+    // Files whose cached .gnomon.tsv is fresh are resolved here without using
+    // a worker slot. Files that truly need reformatting are queued for the
+    // parallel pass below.
+    enum Prep {
+        // (label, source path to push into native_score_files)
+        Resolved(String, PathBuf),
+        // (source path, destination .gnomon.tsv path) — needs parallel reformat
+        Pending(PathBuf, PathBuf),
+    }
 
+    let mut prep_items: Vec<(PathBuf, Prep)> = Vec::with_capacity(score_files.len());
     for score_file_path in score_files {
         match reformat::is_gnomon_native_format(score_file_path) {
             Ok(true) => {
-                // If a file is already in the native format, we assume it is correctly
-                // formatted. We still need to extract its label for duplicate detection.
                 let label = read_label_from_cached_file(score_file_path)?;
-                if let Some(existing_path) = label_to_path.get(&label) {
-                    return Err(format!(
-                        "Duplicate Score ID '{}' detected!\n  File 1: '{}'\n  File 2: '{}'\nPlease ensure each score file has a unique identifier.",
-                        label,
-                        existing_path.display(),
-                        score_file_path.display()
-                    ).into());
-                }
-                label_to_path.insert(label, score_file_path.clone());
-                native_score_files.push(score_file_path.clone());
+                prep_items.push((
+                    score_file_path.clone(),
+                    Prep::Resolved(label, score_file_path.clone()),
+                ));
             }
             Ok(false) => {
-                // Not in native format. Reformat it.
                 let output_dir = match score_file_path.parent() {
                     Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
                     _ => Path::new(".").to_path_buf(),
@@ -435,82 +433,99 @@ fn run_preparation_phase(
 
                 let new_path = score_file_path.with_extension("gnomon.tsv");
 
-                // Smart cache check: only reformat if source is newer than existing cache
                 let should_reformat = if new_path.exists() {
                     let source_meta = fs::metadata(score_file_path).and_then(|m| m.modified());
                     let cache_meta = fs::metadata(&new_path).and_then(|m| m.modified());
-
                     match (source_meta, cache_meta) {
                         (Ok(src_time), Ok(cache_time)) => src_time > cache_time,
-                        _ => true, // Fallback to safe reformat on any error
+                        _ => true,
                     }
                 } else {
                     true
                 };
 
-                let label = if should_reformat {
-                    eprintln!(
-                        "> Info: Score file '{}' is not in native format. Attempting conversion...",
-                        score_file_path.display()
-                    );
-
-                    match reformat::reformat_pgs_file(score_file_path, &new_path) {
-                        Ok(outcome) => {
-                            if outcome.wrote_output {
-                                eprintln!("> Success: Converted to '{}'.", new_path.display());
-                                if let Some(summary) = outcome.skip_summary {
-                                    skip_summaries.push(summary);
-                                }
-                                native_score_files.push(new_path.clone());
-                                outcome
-                                    .score_label
-                                    .ok_or_else(|| {
-                                        "Internal error: missing score label after successful conversion."
-                                            .to_string()
-                                    })?
-                            } else {
-                                if let Some(warning) = outcome.warning {
-                                    eprintln!("> Warning: {warning}");
-                                } else {
-                                    eprintln!(
-                                        "> Warning: Unsupported score format for '{}'; skipping.",
-                                        score_file_path.display()
-                                    );
-                                }
-                                continue;
-                            }
-                        }
-                        Err(e) => {
-                            return Err(Box::new(e));
-                        }
-                    }
+                if should_reformat {
+                    prep_items
+                        .push((score_file_path.clone(), Prep::Pending(score_file_path.clone(), new_path)));
                 } else {
                     eprintln!(
                         "> Info: Using cached converted file '{}'.",
                         new_path.display()
                     );
-                    native_score_files.push(new_path.clone());
-                    read_label_from_cached_file(&new_path)?
-                };
-
-                if let Some(existing_path) = label_to_path.get(&label) {
-                    return Err(format!(
-                        "Duplicate Score ID '{}' detected!\n  File 1: '{}'\n  File 2: '{}'\nPlease ensure each score file has a unique identifier.",
-                        label,
-                        existing_path.display(),
-                        score_file_path.display()
-                    ).into());
+                    let label = read_label_from_cached_file(&new_path)?;
+                    prep_items.push((score_file_path.clone(), Prep::Resolved(label, new_path)));
                 }
-                label_to_path.insert(label, score_file_path.clone());
             }
             Err(e) => {
-                // This is a lower-level I/O error from just trying to open the file.
                 return Err(format!(
                     "Error reading score file '{}': {}",
                     score_file_path.display(),
                     e
                 )
                 .into());
+            }
+        }
+    }
+
+    // Parallel reformat pass. The inner reformat already uses rayon; running
+    // files in parallel saturates all vCPUs when there are many small files.
+    // One entry per prep_items element; Ok(None) = skipped (unsupported format).
+    type ReformatRow = Option<(String, PathBuf, Option<reformat::SkipSummary>)>;
+    let reformat_results: Vec<Result<ReformatRow, reformat::ReformatError>> = prep_items
+        .par_iter()
+        .map(|(_, item)| match item {
+            Prep::Resolved(label, path) => Ok(Some((label.clone(), path.clone(), None))),
+            Prep::Pending(src, dst) => {
+                eprintln!(
+                    "> Info: Score file '{}' is not in native format. Attempting conversion...",
+                    src.display()
+                );
+                let outcome = reformat::reformat_pgs_file(src, dst)?;
+                if outcome.wrote_output {
+                    eprintln!("> Success: Converted to '{}'.", dst.display());
+                    let label = outcome.score_label.ok_or_else(|| {
+                        reformat::ReformatError::Io(io::Error::new(
+                            io::ErrorKind::Other,
+                            "Internal error: missing score label after successful conversion.",
+                        ))
+                    })?;
+                    Ok(Some((label, dst.clone(), outcome.skip_summary)))
+                } else {
+                    if let Some(warning) = outcome.warning {
+                        eprintln!("> Warning: {warning}");
+                    } else {
+                        eprintln!(
+                            "> Warning: Unsupported score format for '{}'; skipping.",
+                            src.display()
+                        );
+                    }
+                    Ok(None)
+                }
+            }
+        })
+        .collect();
+
+    // Serial post-pass: duplicate-label detection + accumulate outputs.
+    let mut native_score_files = Vec::with_capacity(prep_items.len());
+    let mut label_to_path: HashMap<String, PathBuf> = HashMap::new();
+    let mut skip_summaries = Vec::new();
+    for ((src_path, _), row) in prep_items.iter().zip(reformat_results.into_iter()) {
+        match row.map_err(Box::new)? {
+            None => continue,
+            Some((label, out_path, skip_summary)) => {
+                if let Some(existing_path) = label_to_path.get(&label) {
+                    return Err(format!(
+                        "Duplicate Score ID '{}' detected!\n  File 1: '{}'\n  File 2: '{}'\nPlease ensure each score file has a unique identifier.",
+                        label,
+                        existing_path.display(),
+                        src_path.display()
+                    ).into());
+                }
+                label_to_path.insert(label, src_path.clone());
+                if let Some(summary) = skip_summary {
+                    skip_summaries.push(summary);
+                }
+                native_score_files.push(out_path);
             }
         }
     }

@@ -200,6 +200,22 @@ pub fn infer_sex_to_tsv(
     Ok(default_output)
 }
 
+/// Identical to [`infer_sex_to_tsv`] but writes the sex TSV at an explicit
+/// caller-provided path instead of `dataset.output_path("sex.tsv")`. Used by
+/// `gnomon all` so that terms-driven sex inference run against a cached PLINK
+/// fileset still produces `*.sex.tsv` next to the original VCF.
+pub fn infer_sex_to_tsv_at(
+    genotype_path: &Path,
+    force_build: Option<GenomeBuild>,
+    output_path: &Path,
+) -> Result<PathBuf, SexInferenceError> {
+    let (_dataset, build, records) = infer_records(genotype_path, force_build, true)?;
+
+    write_results(output_path, &records, build)?;
+
+    Ok(output_path.to_path_buf())
+}
+
 pub fn infer_first_sample_sex(
     genotype_path: &Path,
     force_build: Option<GenomeBuild>,

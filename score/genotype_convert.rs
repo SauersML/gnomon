@@ -367,6 +367,16 @@ fn is_cache_valid(source_path: &Path, cache_dir: &Path) -> bool {
     cache_mtime > source_mtime
 }
 
+/// Options controlling how `ensure_plink_format_with_options` performs its work.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct EnsurePlinkOptions {
+    /// If true, skip the pre-conversion `infer_first_sample_sex` pass on VCF/BCF
+    /// inputs. The FAM file will then be written with `Sex::Unknown`. Callers that
+    /// run sex inference downstream (e.g. `gnomon all` invoking `terms`) can set
+    /// this to avoid a redundant whole-VCF scan.
+    pub skip_sex_inference: bool,
+}
+
 /// Ensures the input is in PLINK format, converting from VCF/BCF/DTC if necessary.
 ///
 /// # Arguments
@@ -383,6 +393,28 @@ pub fn ensure_plink_format(
     reference: Option<&Path>,
     build: Option<&str>,
     panel: Option<&Path>,
+) -> Result<PathBuf, Box<dyn Error + Send + Sync>> {
+    ensure_plink_format_with_options(
+        input_path,
+        reference,
+        build,
+        panel,
+        EnsurePlinkOptions::default(),
+    )
+}
+
+/// Variant of [`ensure_plink_format`] that accepts additional runtime options.
+///
+/// Behaves identically when `options` is left at its default; in particular,
+/// the cache directory, cache filenames, and PLINK prefix layout are unchanged,
+/// so a conversion produced with options is interchangeable with one produced
+/// by the plain `ensure_plink_format`.
+pub fn ensure_plink_format_with_options(
+    input_path: &Path,
+    reference: Option<&Path>,
+    build: Option<&str>,
+    panel: Option<&Path>,
+    options: EnsurePlinkOptions,
 ) -> Result<PathBuf, Box<dyn Error + Send + Sync>> {
     let format = detect_input_format(input_path).ok_or_else(|| {
         format!(
@@ -428,20 +460,29 @@ pub fn ensure_plink_format(
             };
 
             let assembly = build.unwrap_or("GRCh38").to_string();
-            let build_hint = parse_genome_build_hint(&assembly);
-            let inferred_sex = match infer_first_sample_sex(input_path, build_hint) {
-                Ok(Some(sex)) => {
-                    let convert_sex = to_convert_sex(sex);
-                    eprintln!("> Inferred sample sex from input: {:?}", convert_sex);
-                    convert_sex
-                }
-                Ok(None) => {
-                    eprintln!("> Sex inference produced no sample calls; defaulting to Unknown");
-                    Sex::Unknown
-                }
-                Err(err) => {
-                    eprintln!("> Sex inference unavailable ({err}); defaulting to Unknown");
-                    Sex::Unknown
+            let inferred_sex = if options.skip_sex_inference {
+                eprintln!(
+                    "> Skipping pre-conversion sex inference pass (sex will be written as Unknown; downstream `terms` pass will recompute)."
+                );
+                Sex::Unknown
+            } else {
+                let build_hint = parse_genome_build_hint(&assembly);
+                match infer_first_sample_sex(input_path, build_hint) {
+                    Ok(Some(sex)) => {
+                        let convert_sex = to_convert_sex(sex);
+                        eprintln!("> Inferred sample sex from input: {:?}", convert_sex);
+                        convert_sex
+                    }
+                    Ok(None) => {
+                        eprintln!(
+                            "> Sex inference produced no sample calls; defaulting to Unknown"
+                        );
+                        Sex::Unknown
+                    }
+                    Err(err) => {
+                        eprintln!("> Sex inference unavailable ({err}); defaulting to Unknown");
+                        Sex::Unknown
+                    }
                 }
             };
 
@@ -459,6 +500,7 @@ pub fn ensure_plink_format(
                 output_format: OutputFormat::Plink,
                 sample_id: "sample".to_string(),
                 assembly,
+                input_build: build.map(|b| b.to_string()),
                 include_reference_sites: false,
                 sex: Some(inferred_sex),
                 par_boundaries: None,
@@ -528,6 +570,7 @@ pub fn ensure_plink_format(
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_else(|| "sample".to_string()),
                 assembly,
+                input_build: build.map(|b| b.to_string()),
                 include_reference_sites: false,
                 sex: None,
                 par_boundaries: None,

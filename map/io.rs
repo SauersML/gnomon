@@ -903,7 +903,29 @@ pub fn create_projection_matrix_sink(
     cols: usize,
     kind: &'static str,
 ) -> Result<ProjectionMatrixSink, DatasetOutputError> {
-    let path = dataset.output_path(filename);
+    create_projection_matrix_sink_at(
+        dataset,
+        &dataset.output_path(filename),
+        rows,
+        cols,
+        kind,
+    )
+}
+
+/// Same as [`create_projection_matrix_sink`], but writes the matrix (and its
+/// companion `.metadata.json`) at a caller-supplied absolute path instead of
+/// deriving the output location from the dataset's own
+/// [`GenotypeDataset::output_path`]. Used by the `gnomon all` driver to keep
+/// projection outputs co-located with the original VCF input even when the
+/// underlying `GenotypeDataset` is the cached converted-PLINK fileset.
+pub fn create_projection_matrix_sink_at(
+    dataset: &GenotypeDataset,
+    output_path: &Path,
+    rows: usize,
+    cols: usize,
+    kind: &'static str,
+) -> Result<ProjectionMatrixSink, DatasetOutputError> {
+    let path = output_path.to_path_buf();
     prepare_output_path(&path)?;
     let metadata_path = path.with_extension("metadata.json");
     let tmp_path = tmp_sibling_path(&path);
@@ -4178,6 +4200,15 @@ fn local_output_base_path(path: &Path) -> PathBuf {
         Some(parent) => parent.join(&stem),
         None => PathBuf::from(stem),
     }
+}
+
+/// Derive the same output path a [`GenotypeDataset`] would produce for a
+/// local input at `input_path` and a given `filename`, without actually
+/// opening the dataset. This is used by the `gnomon all` driver so that the
+/// projection / sex outputs land next to the original VCF even when the
+/// actual compute reads from a cached converted-PLINK fileset.
+pub fn derive_local_output_path(input_path: &Path, filename: &str) -> PathBuf {
+    output_path_from_local_input(input_path, filename)
 }
 
 fn append_output_filename(base: &Path, filename: &str) -> PathBuf {
