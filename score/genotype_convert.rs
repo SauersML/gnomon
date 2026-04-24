@@ -11,6 +11,11 @@
 use convert_genome::cli::Sex;
 use convert_genome::input::InputFormat as ConvertInputFormat;
 use convert_genome::{ConversionConfig, OutputFormat, convert_dtc_file};
+
+// Re-export the underlying Sex enum so callers (e.g. `score/main.rs`) can
+// construct `EnsurePlinkOptions { inferred_sex: Some(...) }` without a
+// direct dependency on `convert_genome`.
+pub use convert_genome::cli::Sex as ConvertSex;
 use flate2::read::GzDecoder;
 use infer_sex::{GenomeBuild, InferredSex};
 use std::error::Error;
@@ -375,6 +380,13 @@ pub struct EnsurePlinkOptions {
     /// run sex inference downstream (e.g. `gnomon all` invoking `terms`) can set
     /// this to avoid a redundant whole-VCF scan.
     pub skip_sex_inference: bool,
+    /// Pre-computed sex to use instead of running `infer_first_sample_sex` on
+    /// VCF/BCF inputs. When `Some`, the VCF-scan is skipped and this value is
+    /// written into the FAM file directly. Takes precedence over
+    /// `skip_sex_inference`. Intended for pipelines (e.g. pgsEngine gather)
+    /// that already ran sex inference upstream on the pre-imputed VCF and
+    /// would otherwise pay the ~4min full-VCF scan again.
+    pub inferred_sex: Option<Sex>,
 }
 
 /// Ensures the input is in PLINK format, converting from VCF/BCF/DTC if necessary.
@@ -460,7 +472,13 @@ pub fn ensure_plink_format_with_options(
             };
 
             let assembly = build.unwrap_or("GRCh38").to_string();
-            let inferred_sex = if options.skip_sex_inference {
+            let inferred_sex = if let Some(preset) = options.inferred_sex {
+                eprintln!(
+                    "> Using caller-provided sex {:?}; skipping pre-conversion sex inference pass.",
+                    preset
+                );
+                preset
+            } else if options.skip_sex_inference {
                 eprintln!(
                     "> Skipping pre-conversion sex inference pass (sex will be written as Unknown; downstream `terms` pass will recompute)."
                 );

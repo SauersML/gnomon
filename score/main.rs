@@ -12,9 +12,10 @@
 #![deny(dead_code)]
 #![deny(unused_imports)]
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use gnomon::score::download;
 use gnomon::score::genotype_convert;
+use gnomon::score::genotype_convert::EnsurePlinkOptions;
 use gnomon::score::io::{gcs_billing_project_from_env, get_shared_runtime, load_adc_credentials};
 use gnomon::score::pipeline::{self, PipelineContext};
 use gnomon::score::prepare;
@@ -35,6 +36,21 @@ use std::time::Instant;
 // ========================================================================================
 //                              Command-line interface definition
 // ========================================================================================
+
+/// Pre-computed sex from an upstream pipeline step. When supplied on the
+/// command line via `--inferred-sex`, `gnomon score` skips its own full-VCF
+/// sex-inference scan during the VCF→PLINK conversion (a ~4min pass on a
+/// whole-genome imputed VCF) and writes the supplied value into the FAM file
+/// directly. Intended for callers (e.g. pgsEngine's `gather` stage) that
+/// already ran sex inference on a smaller upstream VCF and would otherwise
+/// pay the cost twice.
+#[derive(Copy, Clone, Debug, ValueEnum)]
+#[clap(rename_all = "lower")]
+pub enum InferredSexArg {
+    Male,
+    Female,
+    Unknown,
+}
 
 #[derive(Parser, Debug)]
 #[clap(
@@ -67,6 +83,14 @@ struct Args {
     /// Reference panel VCF for strand harmonization
     #[clap(long)]
     panel: Option<PathBuf>,
+
+    /// Pre-computed sample sex (`male`, `female`, or `unknown`). When set,
+    /// skips the VCF→PLINK step's internal `infer_first_sample_sex` scan
+    /// and writes the supplied value into the FAM file. Use this to avoid
+    /// a redundant ~4min whole-VCF sex scan when sex has already been
+    /// inferred upstream (e.g. on a smaller pre-imputed VCF).
+    #[clap(long, value_enum, value_name = "SEX")]
+    inferred_sex: Option<InferredSexArg>,
 }
 
 // ========================================================================================
@@ -76,7 +100,11 @@ struct Args {
 // Main function removed as it's now called through the main binary's subcommand system
 // and was causing dead_code warnings.
 
-/// Public interface for calling gnomon with explicit arguments
+/// Public interface for calling gnomon with explicit arguments.
+///
+/// Kept for backward compatibility with callers that don't have a
+/// pre-computed sex to pass in. Delegates to `run_gnomon_with_args_ex` with
+/// `inferred_sex = None` (preserves the original VCF-scan behavior).
 pub fn run_gnomon_with_args(
     input_path: PathBuf,
     score: PathBuf,
@@ -85,6 +113,21 @@ pub fn run_gnomon_with_args(
     build: Option<String>,
     panel: Option<PathBuf>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    run_gnomon_with_args_ex(input_path, score, keep, reference, build, panel, None)
+}
+
+/// Public interface for calling gnomon with explicit arguments, including a
+/// pre-computed sex to skip the internal VCF-scan sex inference. Pass `None`
+/// for `inferred_sex` to preserve the original full-scan behavior.
+pub fn run_gnomon_with_args_ex(
+    input_path: PathBuf,
+    score: PathBuf,
+    keep: Option<PathBuf>,
+    reference: Option<PathBuf>,
+    build: Option<String>,
+    panel: Option<PathBuf>,
+    inferred_sex: Option<InferredSexArg>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let args = Args {
         score,
         keep,
@@ -92,6 +135,7 @@ pub fn run_gnomon_with_args(
         reference,
         build,
         panel,
+        inferred_sex,
     };
     run_gnomon_impl(args)
 }
@@ -137,11 +181,24 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
     // --- Genotype Format Conversion (if needed) ---
     // Transparently convert VCF/BCF/DTC text to PLINK format before proceeding.
     // If --panel is provided, convert_genome will harmonize alleles to match the reference panel.
-    let effective_input_path = genotype_convert::ensure_plink_format(
+    //
+    // When the caller supplied `--inferred-sex`, plumb it through as a
+    // pre-computed value so the VCF→PLINK step skips its own
+    // `infer_first_sample_sex` pass (saves ~4min on whole-genome imputed VCFs).
+    let inferred_sex_override = args.inferred_sex.map(|s| match s {
+        InferredSexArg::Male => genotype_convert::ConvertSex::Male,
+        InferredSexArg::Female => genotype_convert::ConvertSex::Female,
+        InferredSexArg::Unknown => genotype_convert::ConvertSex::Unknown,
+    });
+    let effective_input_path = genotype_convert::ensure_plink_format_with_options(
         &args.input_path,
         args.reference.as_deref(),
         args.build.as_deref(),
         args.panel.as_deref(),
+        EnsurePlinkOptions {
+            skip_sex_inference: false,
+            inferred_sex: inferred_sex_override,
+        },
     )?;
 
     let fileset_prefixes = resolve_filesets(&effective_input_path)?;

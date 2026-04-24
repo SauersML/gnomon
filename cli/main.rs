@@ -51,6 +51,15 @@ use std::process;
 #[path = "../score/main.rs"]
 mod score_main;
 
+#[cfg(all(
+    feature = "map",
+    feature = "score",
+    feature = "calibrate",
+    feature = "terms"
+))]
+#[path = "all.rs"]
+mod all_cmd;
+
 #[cfg(feature = "score")]
 #[derive(Args)]
 struct ScoreArgs {
@@ -566,118 +575,16 @@ fn run_terms(args: TermsArgs) -> Result<(), Box<dyn std::error::Error>> {
     feature = "terms"
 ))]
 fn run_all(args: AllArgs) -> Result<(), Box<dyn std::error::Error>> {
-    use gnomon::map::io::derive_local_output_path;
-    use gnomon::map::main::run_project_with_output;
-    use gnomon::score::genotype_convert::{
-        EnsurePlinkOptions, InputFormat, detect_input_format, ensure_plink_format_with_options,
-    };
-    use gnomon::terms::infer_sex_to_tsv_at;
-    use std::time::Instant;
-
-    let overall = Instant::now();
-    let vcf_path = args.input_path.clone();
-
-    println!("=== gnomon all: unified score + project + terms ===");
-    println!("Input genotype path: {}", vcf_path.display());
-    println!("Score path: {}", args.score.display());
-    println!("Projection model: {}", args.model);
-
-    // --- Phase 1: ensure PLINK fileset (single VCF scan, cached for reuse) ---
-    let format = detect_input_format(&vcf_path).ok_or_else(|| {
-        format!(
-            "Could not determine input format for '{}' (expected PLINK/VCF/BCF/DTC).",
-            vcf_path.display()
-        )
-    })?;
-
-    let conv_start = Instant::now();
-    let plink_prefix = ensure_plink_format_with_options(
-        &vcf_path,
-        args.reference.as_deref(),
-        args.build.as_deref(),
-        args.panel.as_deref(),
-        EnsurePlinkOptions {
-            // Skip the in-conversion sex inference scan — `terms` below will
-            // compute per-sample sex directly from the cached PLINK fileset,
-            // so the VCF-level pre-inference pass would be pure overhead.
-            skip_sex_inference: matches!(format, InputFormat::Vcf | InputFormat::Bcf),
-        },
-    )
-    .map_err(|err| -> Box<dyn std::error::Error> { err })?;
-    println!(
-        "[all] ensure_plink_format: {:.2}s (prefix = {})",
-        conv_start.elapsed().as_secs_f64(),
-        plink_prefix.display()
-    );
-
-    // When the user passed a VCF/BCF we want score/project/terms outputs to
-    // land next to the original VCF so downstream consumers (pgsEngine) find
-    // them exactly where the standalone subcommands used to write them.
-    // Score already derives its own naming from the input path; for project
-    // and terms we compute the VCF-based output paths explicitly and feed
-    // them to the *_with_output / *_at entry points.
-    let input_is_vcf_like = matches!(format, InputFormat::Vcf | InputFormat::Bcf);
-
-    // --- Phase 2: score ---
-    // Passing the original VCF path here lets score hit the cache produced
-    // in Phase 1 (mtime-validated) and skip the conversion + its own sex
-    // inference scan entirely. Score derives its .sscore output filename from
-    // the VCF path, so layout is unchanged.
-    let score_start = Instant::now();
-    score_main::run_gnomon_with_args(
-        vcf_path.clone(),
-        args.score.clone(),
-        args.keep.clone(),
-        args.reference.clone(),
-        args.build.clone(),
-        args.panel.clone(),
-    )
-    .map_err(|err| err as Box<dyn std::error::Error>)?;
-    println!(
-        "[all] score phase: {:.2}s",
-        score_start.elapsed().as_secs_f64()
-    );
-
-    // --- Phase 3: project (against cached PLINK, outputs keyed to VCF) ---
-    let project_start = Instant::now();
-    let projection_scores_path = if input_is_vcf_like {
-        derive_local_output_path(&vcf_path, "projection_scores.bin")
-    } else {
-        derive_local_output_path(&plink_prefix, "projection_scores.bin")
-    };
-    run_project_with_output(
-        &plink_prefix,
-        Some(&args.model),
-        args.output_manifest.as_deref(),
-        &projection_scores_path,
-    )
-    .map_err(|err| Box::new(err) as Box<dyn std::error::Error>)?;
-    println!(
-        "[all] project phase: {:.2}s",
-        project_start.elapsed().as_secs_f64()
-    );
-
-    // --- Phase 4: terms (sex inference against cached PLINK, sex.tsv keyed to VCF) ---
-    let terms_start = Instant::now();
-    let sex_tsv_path = if input_is_vcf_like {
-        derive_local_output_path(&vcf_path, "sex.tsv")
-    } else {
-        derive_local_output_path(&plink_prefix, "sex.tsv")
-    };
-    let written = infer_sex_to_tsv_at(&plink_prefix, None, &sex_tsv_path)
-        .map_err(|err| Box::new(err) as Box<dyn std::error::Error>)?;
-    println!(
-        "[all] terms phase: {:.2}s (sex.tsv = {})",
-        terms_start.elapsed().as_secs_f64(),
-        written.display()
-    );
-
-    println!(
-        "[all] total wall time: {:.2}s",
-        overall.elapsed().as_secs_f64()
-    );
-
-    Ok(())
+    all_cmd::run(all_cmd::AllOptions {
+        score: args.score,
+        input_path: args.input_path,
+        model: args.model,
+        keep: args.keep,
+        reference: args.reference,
+        build: args.build,
+        panel: args.panel,
+        output_manifest: args.output_manifest,
+    })
 }
 
 #[cfg(feature = "calibrate")]
