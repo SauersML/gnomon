@@ -95,7 +95,7 @@ zstd = "0.13"
 dirs = "6.0"
 
 infer_sex = "0.1.0"
-convert_genome = { git = "https://github.com/SauersML/convert_genome", rev = "2648e85cf3194c3aff60c9cf3f53afae57bbcc35" }
+convert_genome = { git = "https://github.com/SauersML/convert_genome", rev = "2648e850db4bd0fcc48cd53c075536bd161f6757" }
 
 planus = "=1.1.1" # cf. https://github.com/pola-rs/polars/issues/24208
 
