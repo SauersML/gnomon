@@ -243,14 +243,21 @@ theorem differential_am_creates_portability_artifact
   unfold amInflationFactor
   apply div_lt_div_of_pos_left one_pos (by linarith) (by linarith)
 
+/-- **R² under Assortative Mating.**
+    The observed R² is the ratio of inflated PGS variance to total variance.
+    Total variance is inflated PGS variance plus environmental variance. -/
+noncomputable def r2WithAssortativeMating (v_pgs v_e α : ℝ) : ℝ :=
+  (α * v_pgs) / (α * v_pgs + v_e)
+
 /-- **AM affects both numerator and denominator of R².**
     R² = V_PGS / V_Y. AM inflates V_PGS by α and V_Y by less than α
     (because V_E doesn't change), so R² increases. -/
 theorem am_increases_r2
     (v_pgs v_e α : ℝ)
     (h_vpgs : 0 < v_pgs) (h_ve : 0 < v_e) (h_α : 1 < α) :
-    v_pgs / (v_pgs + v_e) < (α * v_pgs) / (α * v_pgs + v_e) := by
-  have h_d1 : 0 < v_pgs + v_e := by linarith
+    r2WithAssortativeMating v_pgs v_e 1 < r2WithAssortativeMating v_pgs v_e α := by
+  unfold r2WithAssortativeMating
+  have h_d1 : 0 < 1 * v_pgs + v_e := by linarith
   have h_d2 : 0 < α * v_pgs + v_e := by nlinarith
   rw [div_lt_div_iff₀ h_d1 h_d2]
   nlinarith [mul_pos h_vpgs h_ve]

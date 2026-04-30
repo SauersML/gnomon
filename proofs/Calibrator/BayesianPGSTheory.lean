@@ -661,23 +661,31 @@ section MultiAncestryBayesian
     P(β | data_EUR, data_AFR, ...) combines information across
     ancestries, weighted by sample size and genetic correlation. -/
 
-/-- **Genetic correlation determines information borrowing.**
-    If rg = 1 (same effects), full information is shared.
-    If rg = 0 (independent effects), no borrowing occurs. -/
-theorem info_borrowing_proportional_to_rg
-    (rg info_gain : ℝ)
-    (h_relation : info_gain = rg ^ 2)
-    (h_rg : 0 ≤ rg) (h_rg_le : rg ≤ 1) :
-    0 ≤ info_gain ∧ info_gain ≤ 1 := by
-  rw [h_relation]
-  exact ⟨sq_nonneg _, by nlinarith [sq_nonneg rg]⟩
-
 /-- **Effective sample size in multi-ancestry setting.**
     n_eff = n_target + Σ_k (rg_k² × n_k × h_k / h_target)
     where h_k is heritability in population k. -/
 noncomputable def multiAncestryEffectiveN
     (n_target rg n_other : ℝ) : ℝ :=
   n_target + rg ^ 2 * n_other
+
+/-- **Genetic correlation determines information borrowing.**
+    If rg = 1 (same effects), full information is shared.
+    If rg = 0 (independent effects), no borrowing occurs. -/
+theorem info_borrowing_proportional_to_rg
+    (rg n_other : ℝ)
+    (h_n_other : 0 < n_other)
+    (h_rg : 0 ≤ rg) (h_rg_le : rg ≤ 1) :
+    let info_gain := multiAncestryEffectiveN 0 rg n_other
+    0 ≤ info_gain ∧ info_gain ≤ n_other := by
+  intro info_gain
+  change 0 ≤ multiAncestryEffectiveN 0 rg n_other ∧ multiAncestryEffectiveN 0 rg n_other ≤ n_other
+  unfold multiAncestryEffectiveN
+  have h1 : 0 ≤ 0 + rg ^ 2 * n_other := by positivity
+  have h2 : 0 + rg ^ 2 * n_other ≤ n_other := by
+    rw [zero_add]
+    have h : rg ^ 2 ≤ 1 := by nlinarith [sq_nonneg rg]
+    nlinarith [mul_le_mul_of_nonneg_right h (le_of_lt h_n_other)]
+  exact ⟨h1, h2⟩
 
 /-- **Multi-ancestry PGS is at least as good as single-ancestry.**
     With well-specified models, combining data cannot hurt.
@@ -710,9 +718,14 @@ theorem multi_ancestry_effective_n_ge
     while adding Δn AFR samples contributes Δn directly.
     Since rg < 1, EUR samples contribute less. -/
 theorem diminishing_returns_from_majority
-    (Δn rg : ℝ)
+    (n_target n_other Δn rg : ℝ)
     (h_Δn : 0 < Δn) (h_rg_pos : 0 < rg) (h_rg_lt : rg < 1) :
-    rg ^ 2 * Δn < Δn := by
+    let n_eff_add_other := multiAncestryEffectiveN n_target rg (n_other + Δn)
+    let n_eff_add_target := multiAncestryEffectiveN (n_target + Δn) rg n_other
+    n_eff_add_other < n_eff_add_target := by
+  intro n_eff_add_other n_eff_add_target
+  change multiAncestryEffectiveN n_target rg (n_other + Δn) < multiAncestryEffectiveN (n_target + Δn) rg n_other
+  unfold multiAncestryEffectiveN
   have h_sq_lt : rg ^ 2 < 1 := by nlinarith [sq_abs rg, sq_nonneg rg]
   nlinarith
 
