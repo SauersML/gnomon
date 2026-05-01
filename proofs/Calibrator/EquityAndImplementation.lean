@@ -174,15 +174,28 @@ theorem equal_fpr_requires_different_thresholds
     for an aware policy is |t₁ - t₂| (threshold difference).
     When means differ and equal FPR requires different thresholds,
     both violations are positive. -/
-theorem no_fully_fair_policy
-    (μ₁ μ₂ σ : ℝ)
+theorem no_fully_fair_policy_proved
+    (μ₁ μ₂ σ t₁ t₂ : ℝ)
     (h_mu_diff : μ₁ ≠ μ₂)
     (h_sigma : 0 < σ) :
     -- Both policies have some fairness violation
-    0 < |μ₁ - μ₂| ∧ 0 < |μ₁ - μ₂| / σ := by
-  constructor
-  · exact abs_pos.mpr (sub_ne_zero.mpr h_mu_diff)
-  · exact div_pos (abs_pos.mpr (sub_ne_zero.mpr h_mu_diff)) h_sigma
+    0 < |(t₁ - μ₁) / σ - (t₂ - μ₂) / σ| + |t₁ - t₂| := by
+  by_contra h_le
+  push_neg at h_le
+  have h1 : |(t₁ - μ₁) / σ - (t₂ - μ₂) / σ| = 0 := by
+    linarith [abs_nonneg ((t₁ - μ₁) / σ - (t₂ - μ₂) / σ), abs_nonneg (t₁ - t₂)]
+  have h2 : |t₁ - t₂| = 0 := by
+    linarith [abs_nonneg ((t₁ - μ₁) / σ - (t₂ - μ₂) / σ), abs_nonneg (t₁ - t₂)]
+  have ht_eq : t₁ = t₂ := by
+    exact eq_of_abs_sub_eq_zero h2
+  have h_z_eq : (t₁ - μ₁) / σ = (t₂ - μ₂) / σ := by
+    exact eq_of_abs_sub_eq_zero h1
+  rw [ht_eq] at h_z_eq
+  have h_num : t₂ - μ₁ = t₂ - μ₂ := by
+    exact (div_eq_div_iff (ne_of_gt h_sigma) (ne_of_gt h_sigma)).mp h_z_eq |>
+      mul_right_cancel₀ (ne_of_gt h_sigma)
+  have h_mu_eq : μ₁ = μ₂ := by linarith
+  exact h_mu_diff h_mu_eq
 
 end FairnessImpossibility
 
