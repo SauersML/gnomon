@@ -475,10 +475,30 @@ noncomputable def polygenicAdaptationShift
 /-- **Under neutral drift, expected shift is zero.**
     E[Δpᵢ] = 0 under drift, so E[Δμ] = 0. -/
 theorem neutral_expected_shift_zero
-    {m : ℕ} (β : Fin m → ℝ) :
-    polygenicAdaptationShift β (fun _ => 0) = 0 := by
+    {m : ℕ} (β : Fin m → ℝ)
+    {Ω : Type*} (E : (Ω → ℝ) → ℝ)
+    (Δp : Fin m → Ω → ℝ)
+    (h_linear : ∀ (c : ℝ) (X : Ω → ℝ), E (fun ω => c * X ω) = c * E X)
+    (h_add : ∀ (X Y : Ω → ℝ), E (fun ω => X ω + Y ω) = E X + E Y)
+    (h_neutral : ∀ i, E (Δp i) = 0) :
+    E (fun ω => polygenicAdaptationShift β (fun i => Δp i ω)) = 0 := by
   unfold polygenicAdaptationShift
-  simp
+  have h_sum : ∀ (s : Finset (Fin m)), E (fun ω => ∑ i ∈ s, β i * Δp i ω) = ∑ i ∈ s, E (fun ω => β i * Δp i ω) := by
+    intro s
+    induction' s using Finset.induction_on with i s hi ih
+    · simp only [Finset.sum_empty]
+      have h_zero : (fun (ω : Ω) => (0 : ℝ)) = fun ω => 0 * 1 := by ext; ring
+      rw [h_zero, h_linear]
+      ring
+    · have h1 : (fun ω => ∑ j ∈ insert i s, β j * Δp j ω) = (fun ω => β i * Δp i ω + ∑ j ∈ s, β j * Δp j ω) := by
+        ext ω; rw [Finset.sum_insert hi]
+      rw [h1, h_add, ih]
+      rw [Finset.sum_insert hi]
+  rw [h_sum Finset.univ]
+  have h_terms : ∀ i, E (fun ω => β i * Δp i ω) = 0 := by
+    intro i
+    rw [h_linear, h_neutral i, mul_zero]
+  exact Finset.sum_eq_zero (fun i _ => h_terms i)
 
 /-- **Under selection, shift is nonzero and directional.**
     If selection favors higher trait values, Δpᵢ > 0 for positive-effect
