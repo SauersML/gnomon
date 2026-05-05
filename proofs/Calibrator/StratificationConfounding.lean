@@ -109,8 +109,7 @@ noncomputable def TwoPopBiasModel.varBiasTarget {p : ℕ} (m : TwoPopBiasModel p
   m.attenuation * m.toStratificationModel.varBias
 
 theorem spurious_portability_from_stratification {p : ℕ} (m : TwoPopBiasModel p)
-    (r2_true : ℝ) (h_true_nn : 0 ≤ r2_true) :
-    -- Apparent portability drop (source_obs - target_obs) exceeds true drop (0)
+    (r2_true : ℝ) :
     (r2_true + m.toStratificationModel.varBias) -
       (r2_true + m.varBiasTarget) > 0 := by
   unfold TwoPopBiasModel.varBiasTarget
@@ -119,6 +118,7 @@ theorem spurious_portability_from_stratification {p : ℕ} (m : TwoPopBiasModel 
     rw [← mul_one m.toStratificationModel.varBias]
     simpa [mul_assoc] using mul_lt_mul_of_pos_right m.atten_lt_one hv
   linarith
+
 
 /-- **PC correction model.**
     Ancestry covariance has eigenvalues λ₁ ≥ λ₂ ≥ ... ≥ λ_p > 0.
@@ -237,11 +237,14 @@ theorem am_inflation_gt_one (r : ℝ) (hr : 0 < r) (hr1 : r < 1) :
     even with identical genetic architecture. -/
 theorem differential_am_creates_portability_artifact
     (r_s r_t : ℝ)
-    (hrs : 0 < r_s) (hrt : 0 < r_t) (hrs1 : r_s < 1) (hrt1 : r_t < 1)
+    (h_r_s_lt_one : r_s < 1)
     (h_stronger : r_t < r_s) :
     amInflationFactor r_t < amInflationFactor r_s := by
   unfold amInflationFactor
-  apply div_lt_div_of_pos_left one_pos (by linarith) (by linarith)
+  have h1 : 0 < 1 - r_s := by linarith
+  have h2 : 0 < 1 - r_t := by linarith
+  rw [div_lt_div_iff₀ h2 h1]
+  linarith
 
 /-- **AM affects both numerator and denominator of R².**
     R² = V_PGS / V_Y. AM inflates V_PGS by α and V_Y by less than α
@@ -326,18 +329,24 @@ theorem collider_attenuates_association (m : ColliderModel) :
     If source and target cohorts have different ascertainment patterns,
     the apparent portability drop includes an ascertainment component. -/
 theorem differential_ascertainment_artifact
-    (r2_source_pop r2_target_pop r2_source_asc r2_target_asc : ℝ)
-    (h_source_asc : r2_source_asc < r2_source_pop)
-    (h_target_asc : r2_target_asc < r2_target_pop)
-    -- Different ascertainment severity
-    (h_diff_severity : r2_target_pop - r2_target_asc < r2_source_pop - r2_source_asc) :
-    -- Apparent portability drop is larger than true portability drop
-    r2_source_asc - r2_target_asc > r2_source_pop - r2_target_pop →
-      False := by
-  intro h
+    (source target : ColliderModel)
+    (h_same_G : source.β_G = target.β_G)
+    (h_same_var_G : source.σ2_G = target.σ2_G)
+    (h_diff_E : source.σ2_E < target.σ2_E) :
+    source.β_G - target.β_selected > source.β_G - source.β_selected := by
+  unfold ColliderModel.β_selected
+  rw [h_same_G, h_same_var_G]
+  have h_lt : target.β_G * (target.σ2_G / (target.σ2_G + target.σ2_E)) < target.β_G * (target.σ2_G / (target.σ2_G + source.σ2_E)) := by
+    apply mul_lt_mul_of_pos_left
+    · have h1 : 0 < target.σ2_G + source.σ2_E := by linarith [target.σ2_G_pos, source.σ2_E_pos]
+      have h2 : 0 < target.σ2_G + target.σ2_E := by linarith [target.σ2_G_pos, target.σ2_E_pos]
+      rw [div_lt_div_iff₀ h2 h1]
+      nlinarith [target.σ2_G_pos, h_diff_E]
+    · exact target.β_G_pos
   linarith
 
 end ColliderBias
+
 
 
 /-!
@@ -518,12 +527,14 @@ theorem survivorship_attenuates_in_older (m : SurvivorshipAttenuationModel) :
     If the target population has different age structure or mortality patterns,
     survivorship bias contributes to apparent portability loss. -/
 theorem differential_survivorship_artifact
-    (r2_source_full r2_target_full Δ_surv_source Δ_surv_target : ℝ)
-    (h_surv_s : 0 ≤ Δ_surv_source) (h_surv_t : 0 ≤ Δ_surv_target)
-    (h_diff : Δ_surv_target > Δ_surv_source)
-    (h_obs_s : r2_source_full - Δ_surv_source > 0) :
-    (r2_source_full - Δ_surv_source) - (r2_target_full - Δ_surv_target) >
-      r2_source_full - r2_target_full := by
+    (source target : SurvivorshipAttenuationModel)
+    (h_same_r2 : source.r2_full = target.r2_full)
+    (h_target_more_attenuated : target.var_surv / target.var_birth < source.var_surv / source.var_birth) :
+    source.r2_full - target.r2_surv > source.r2_full - source.r2_surv := by
+  unfold SurvivorshipAttenuationModel.r2_surv
+  rw [h_same_r2]
+  have h_lt : target.r2_full * (target.var_surv / target.var_birth) < target.r2_full * (source.var_surv / source.var_birth) := by
+    exact mul_lt_mul_of_pos_left h_target_more_attenuated target.r2_full_pos
   linarith
 
 end SurvivorshipBias
