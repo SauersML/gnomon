@@ -329,10 +329,11 @@ theorem truncationBias_small_for_large_signal (se : ℝ) (h_se : 0 < se) :
     This follows from linearity of conditional expectation applied
     to the decomposition β̂ = β + ε. -/
 theorem conditional_expectation_decomposition
-    (true_beta : ℝ) (conditional_noise_mean : ℝ) :
-    true_beta + conditional_noise_mean =
-      true_beta + conditional_noise_mean := by
-  ring
+    (E : (ℝ → ℝ) → ℝ)
+    (h_linear : ∀ c f, E (fun x => c + f x) = c + E f)
+    (true_beta : ℝ) (noise : ℝ → ℝ) :
+    E (fun x => true_beta + noise x) = true_beta + E noise := by
+  rw [h_linear]
 
 /-- **Derivation: winner's curse bias vanishes in the high-signal regime.**
     Combining the model (β̂ = β + ε) with the exponential proxy
