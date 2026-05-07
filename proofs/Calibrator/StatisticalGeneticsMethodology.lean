@@ -158,16 +158,20 @@ section CrossValidation
 
 /-- **Overfitting bias from sample overlap.**
     If the GWAS sample overlaps with the evaluation sample,
-    R² is biased upward by approximately p/n where p is the
-    number of SNPs in the PGS. -/
+    the observed R² is biased upward by approximately p/n where p is the
+    number of independent SNPs in the PGS. We model the biased R²
+    as R²_true + p/n. -/
 theorem overlap_bias
-    (p_snps n_overlap : ℝ)
+    (r2_true r2_obs p_snps n_overlap : ℝ)
     (h_p : 0 < p_snps) (h_n : 0 < n_overlap)
-    (h_n_large : p_snps < n_overlap) :
-    0 < p_snps / n_overlap ∧ p_snps / n_overlap < 1 := by
+    (h_n_large : p_snps < n_overlap)
+    (h_bias_model : r2_obs = r2_true + p_snps / n_overlap) :
+    r2_true < r2_obs ∧ r2_obs - r2_true < 1 := by
+  have h_bias_pos : 0 < p_snps / n_overlap := div_pos h_p h_n
+  have h_bias_lt_one : p_snps / n_overlap < 1 := (div_lt_one h_n).mpr h_n_large
   constructor
-  · exact div_pos h_p h_n
-  · rw [div_lt_one h_n]; exact h_n_large
+  · linarith
+  · linarith
 
 /- **Portability assessment requires population-specific validation.**
     R² must be evaluated in each target population separately.
@@ -336,13 +340,22 @@ section GeneticCorrelationMethods
 /-- **Method comparison: different methods can give different ρ̂_g.**
     This matters because ρ̂_g predicts portability.
     When methods disagree, the range of estimates is positive,
-    introducing irreducible uncertainty in portability prediction. -/
+    introducing irreducible uncertainty in portability prediction.
+    If the true correlation ρ_g_true lies within the range spanned by
+    the estimators, the maximum estimation error is at least half the range. -/
 theorem method_disagreement_increases_uncertainty
-    (rho_ldsc rho_popcorn rho_sumher : ℝ)
+    (rho_ldsc rho_popcorn rho_sumher rho_g_true : ℝ)
     (h_order : rho_popcorn < rho_ldsc)
-    (h_order₂ : rho_ldsc < rho_sumher) :
-    -- The range of estimates is strictly positive
-    0 < rho_sumher - rho_popcorn := by linarith
+    (h_order₂ : rho_ldsc < rho_sumher)
+    (h_true_bounds : rho_popcorn ≤ rho_g_true ∧ rho_g_true ≤ rho_sumher) :
+    (rho_sumher - rho_popcorn) / 2 ≤ max (rho_g_true - rho_popcorn) (rho_sumher - rho_g_true) := by
+  have h_range : rho_sumher - rho_popcorn = (rho_g_true - rho_popcorn) + (rho_sumher - rho_g_true) := by ring
+  -- The maximum of two numbers is >= their average
+  have h_max_avg : (rho_g_true - rho_popcorn) + (rho_sumher - rho_g_true) ≤ 2 * max (rho_g_true - rho_popcorn) (rho_sumher - rho_g_true) := by
+    calc (rho_g_true - rho_popcorn) + (rho_sumher - rho_g_true)
+      _ ≤ max (rho_g_true - rho_popcorn) (rho_sumher - rho_g_true) + max (rho_g_true - rho_popcorn) (rho_sumher - rho_g_true) := add_le_add (le_max_left _ _) (le_max_right _ _)
+      _ = 2 * max (rho_g_true - rho_popcorn) (rho_sumher - rho_g_true) := by ring
+  linarith
 
 /-- **Genetic correlation varies across the genome.**
     ρ_g estimated from different genomic regions can vary,

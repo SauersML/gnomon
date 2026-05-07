@@ -214,16 +214,37 @@ theorem rg_bounds_portability_ratio
   rwa [div_le_iff₀ h_r2_s] at h_bound
 
 /-- **Traits with high cross-population r_g have good portability.**
-    When r_g is high (e.g., ~0.95), R² portability is bounded by ~0.90. -/
+    When r_g is bounded below by a high value (e.g., ~0.95), R² portability
+    is bounded below by the square of that value if we assume the standard R² proportionality.
+    (Assuming r2_target / r2_source = rg_cross^2 for full shared genetic architecture). -/
 theorem high_cross_rg
-    (rg lb : ℝ) (h_rg : lb < rg) (h_lb_nn : 0 ≤ lb) (h_rg_le : rg ≤ 1) :
-    lb^2 < rg^2 := by nlinarith [sq_nonneg (rg - lb)]
+    (r2_source r2_target rg_cross lb : ℝ)
+    (h_r2_s : 0 < r2_source)
+    (h_rg : lb < rg_cross)
+    (h_lb_nn : 0 ≤ lb)
+    (h_rg_le : rg_cross ≤ 1)
+    (h_target_eq : r2_target / r2_source = rg_cross^2) :
+    lb^2 * r2_source < r2_target := by
+  have h_sq : lb^2 < rg_cross^2 := by nlinarith [sq_nonneg (rg_cross - lb)]
+  have h_mul : lb^2 * r2_source < rg_cross^2 * r2_source := (mul_lt_mul_iff_of_pos_right h_r2_s).mpr h_sq
+  have h_target_val : r2_target = rg_cross^2 * r2_source := (div_eq_iff h_r2_s.ne').mp h_target_eq
+  rwa [← h_target_val] at h_mul
 
 /-- **Traits with low cross-population r_g have poor portability.**
-    When r_g is low (e.g., ~0.3), R² portability is bounded by ~0.09. -/
+    When r_g is bounded above by a low value (e.g., ~0.3), R² portability
+    is bounded above by the square of that value. -/
 theorem low_cross_rg
-    (rg ub : ℝ) (h_rg : rg ≤ ub) (h_rg_nn : 0 ≤ rg) (h_ub_nn : 0 ≤ ub) :
-    rg^2 ≤ ub^2 := by nlinarith [sq_nonneg rg, sq_nonneg (rg - ub)]
+    (r2_source r2_target rg_cross ub : ℝ)
+    (h_r2_s : 0 < r2_source)
+    (h_rg : rg_cross ≤ ub)
+    (h_rg_nn : 0 ≤ rg_cross)
+    (h_ub_nn : 0 ≤ ub)
+    (h_target_upper_bound : r2_target / r2_source ≤ rg_cross^2) :
+    r2_target ≤ ub^2 * r2_source := by
+  have h1 : r2_target ≤ rg_cross^2 * r2_source := (div_le_iff₀ h_r2_s).mp h_target_upper_bound
+  have h2 : rg_cross^2 ≤ ub^2 := by nlinarith [sq_nonneg rg_cross, sq_nonneg (rg_cross - ub)]
+  have h3 : rg_cross^2 * r2_source ≤ ub^2 * r2_source := mul_le_mul_of_nonneg_right h2 (le_of_lt h_r2_s)
+  linarith
 
 /-- **r_g can be underestimated due to power.**
     With low power in underrepresented-population GWAS, r_g estimates are
