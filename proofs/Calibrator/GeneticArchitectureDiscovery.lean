@@ -303,8 +303,8 @@ section EffectEstimation
 /-- Expected one-locus linear-effect estimate under an additive estimation-error
 decomposition `β̂ = β_true + ε̄`, where `ε̄` is the mean estimation error. -/
 noncomputable def expectedLinearEffectEstimate
-    (β_true meanEstimationError : ℝ) : ℝ :=
-  β_true + meanEstimationError
+    (E : (ℝ → ℝ) → ℝ) (β_true : ℝ) (ε : ℝ → ℝ) : ℝ :=
+  E (fun ω => β_true + ε ω)
 
 /-- One-locus OLS effect-estimation variance under genotype variance `varX` and
 sample size `n`. -/
@@ -334,15 +334,19 @@ noncomputable def perCausalLocusSignal
     - at the same genotype variance, increasing `n` lowers the OLS effect
       estimation variance `σ² / (n × Var(X))`. -/
 theorem ols_unbiased
-    (β_true meanEstimationError σ2 varX n₁ n₂ : ℝ)
-    (h_mean_zero : meanEstimationError = 0)
+    (E : (ℝ → ℝ) → ℝ)
+    (h_linear : ∀ c f, E (fun ω => c + f ω) = c + E f)
+    (β_true σ2 varX n₁ n₂ : ℝ)
+    (ε : ℝ → ℝ)
+    (h_mean_zero : E ε = 0)
     (h_σ2 : 0 < σ2) (h_varX : 0 < varX)
     (h_n₁ : 0 < n₁) (h_n : n₁ < n₂) :
-    expectedLinearEffectEstimate β_true meanEstimationError = β_true ∧
+    expectedLinearEffectEstimate E β_true ε = β_true ∧
       olsEffectEstimationVariance σ2 varX n₂ <
         olsEffectEstimationVariance σ2 varX n₁ := by
   constructor
-  · simp [expectedLinearEffectEstimate, h_mean_zero]
+  · unfold expectedLinearEffectEstimate
+    rw [h_linear, h_mean_zero, add_zero]
   · unfold olsEffectEstimationVariance
     exact div_lt_div_of_pos_left h_σ2 (mul_pos h_n₁ h_varX)
       (by nlinarith)
