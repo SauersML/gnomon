@@ -100,26 +100,10 @@ struct Args {
 // Main function removed as it's now called through the main binary's subcommand system
 // and was causing dead_code warnings.
 
-/// Public interface for calling gnomon with explicit arguments.
-///
-/// Kept for backward compatibility with callers that don't have a
-/// pre-computed sex to pass in. Delegates to `run_gnomon_with_args_ex` with
-/// `inferred_sex = None` (preserves the original VCF-scan behavior).
-pub fn run_gnomon_with_args(
-    input_path: PathBuf,
-    score: PathBuf,
-    keep: Option<PathBuf>,
-    reference: Option<PathBuf>,
-    build: Option<String>,
-    panel: Option<PathBuf>,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
-    run_gnomon_with_args_ex(input_path, score, keep, reference, build, panel, None)
-}
-
 /// Public interface for calling gnomon with explicit arguments, including a
 /// pre-computed sex to skip the internal VCF-scan sex inference. Pass `None`
 /// for `inferred_sex` to preserve the original full-scan behavior.
-pub fn run_gnomon_with_args_ex(
+pub fn run_gnomon_with_args(
     input_path: PathBuf,
     score: PathBuf,
     keep: Option<PathBuf>,

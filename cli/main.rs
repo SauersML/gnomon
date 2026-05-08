@@ -86,6 +86,14 @@ struct ScoreArgs {
     /// Reference panel VCF for strand harmonization
     #[arg(long)]
     panel: Option<PathBuf>,
+
+    /// Pre-computed sample sex (`male`, `female`, or `unknown`). When set,
+    /// skips the VCF→PLINK step's internal full-VCF sex-inference scan and
+    /// writes the supplied value into the FAM file directly. Use this to
+    /// avoid a redundant ~4min whole-VCF sex scan when sex has already
+    /// been inferred upstream (e.g. on a smaller pre-imputed VCF).
+    #[arg(long, value_enum, value_name = "SEX")]
+    inferred_sex: Option<score_main::InferredSexArg>,
 }
 
 #[cfg(feature = "map")]
@@ -505,6 +513,7 @@ fn run_score(args: ScoreArgs) -> Result<(), Box<dyn std::error::Error>> {
         args.reference,
         args.build,
         args.panel,
+        args.inferred_sex,
     )
     .map_err(|err| err as Box<dyn std::error::Error>)
 }
