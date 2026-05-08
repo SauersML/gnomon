@@ -47,7 +47,7 @@ calibrate = ["dep:gam", "dep:polars"]
 bench-path = []
 
 [dependencies]
-gam = { version = "0.1.14", optional = true }
+gam = { version = "0.2.1", optional = true }
 ahash = "0.8.12"
 clap = { version = "4.5.48", features = ["derive"] }
 memmap2 = "0.9.8"

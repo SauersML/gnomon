@@ -1,646 +1,380 @@
-use faer::Side;
-use gam::basis::{BasisOptions, Dense, KnotSource, create_basis};
-pub use gam::estimate::{
-    EstimationError, ExternalOptimOptions, ExternalOptimResult, FitOptions, FitResult,
-    evaluate_external_cost_and_ridge, evaluate_external_gradients, fit_gam,
-    optimize_external_design,
+//! Thin training adapter over `gam::fit_model`.
+//!
+//! `train_model` runs the Bernoulli marginal-slope workflow (probit base
+//! link, score warp on, link wiggle off pending a CLI flag). `train_survival_model`
+//! runs the survival marginal-slope workflow with the time-block builders
+//! provided by `crate::calibrate::survival`. Both wrap the resulting
+//! `FitResult` in a `FittedModelPayload` so `TrainedModel::saved` can be
+//! serialized directly.
+
+use crate::calibrate::construction::{build_logslope_termspec, build_marginal_termspec};
+use crate::calibrate::data::TrainingData;
+use crate::calibrate::model::{ModelConfig, ModelFamily, TrainedModel};
+use crate::calibrate::survival::{build_time_block_input, build_time_wiggle_block_input};
+use crate::calibrate::survival_data::SurvivalTrainingBundle;
+
+use gam::families::bernoulli_marginal_slope::{
+    BernoulliMarginalSlopeTermSpec, DeviationBlockConfig, LatentZPolicy,
 };
-use gam::faer_ndarray::FaerCholesky;
-use gam::hmc;
-use gam::hull::build_peeled_hull;
-use gam::pirls::{self, PirlsStatus, WorkingModelPirlsOptions};
-use gam::types::Coefficients;
-use ndarray::{Array1, Array2, s};
-use std::collections::HashMap;
+use gam::families::custom_family::BlockwiseFitOptions;
+use gam::families::family_meta::inverse_link_to_binomial_family;
+use gam::families::lognormal_kernel::FrailtySpec;
+use gam::families::survival_marginal_slope::SurvivalMarginalSlopeTermSpec;
+use gam::families::bernoulli_marginal_slope::LatentMeasureKind;
+use gam::inference::model::{
+    DataSchema, FittedFamily, FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind,
+    SavedLatentZNormalization,
+};
+use gam::resource::ResourcePolicy;
+use gam::{
+    BernoulliMarginalSlopeFitRequest, FitRequest, FitResult, SurvivalMarginalSlopeFitRequest,
+    fit_model,
+};
+use gam::terms::smooth::SpatialLengthScaleOptimizationOptions;
+use gam::types::{InverseLink, LikelihoodFamily, LinkFunction};
 
-fn map_survival_error(err: crate::calibrate::survival::SurvivalError) -> EstimationError {
-    EstimationError::InvalidSpecification(err.to_string())
+use ndarray::{Array2, s};
+
+/// Errors surfaced by the training adapter.
+#[derive(Debug)]
+pub enum EstimationError {
+    Gam(String),
+    Domain(String),
 }
 
-fn build_combined_penalty_matrix(
-    s_list: &[Array2<f64>],
-    lambdas: &Array1<f64>,
-    p: usize,
-) -> Array2<f64> {
-    let mut penalty = Array2::<f64>::zeros((p, p));
-    for (idx, s) in s_list.iter().enumerate() {
-        let lambda = lambdas.get(idx).copied().unwrap_or(0.0);
-        if lambda == 0.0 {
-            continue;
+impl std::fmt::Display for EstimationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Gam(s) => write!(f, "gam error: {s}"),
+            Self::Domain(s) => write!(f, "domain error: {s}"),
         }
-        penalty = penalty + s.mapv(|v| v * lambda);
-    }
-    penalty
-}
-
-fn run_gam_nuts_if_enabled(
-    enabled: bool,
-    family: gam::types::LikelihoodFamily,
-    link: gam::types::LinkFunction,
-    firth_bias_reduction: bool,
-    x: ndarray::ArrayView2<'_, f64>,
-    y: ndarray::ArrayView1<'_, f64>,
-    weights: ndarray::ArrayView1<'_, f64>,
-    penalty_matrix: ndarray::ArrayView2<'_, f64>,
-    mode: ndarray::ArrayView1<'_, f64>,
-    hessian: ndarray::ArrayView2<'_, f64>,
-) -> Result<Option<Array2<f64>>, EstimationError> {
-    if !enabled {
-        return Ok(None);
-    }
-    if matches!(link, gam::types::LinkFunction::Probit) {
-        return Ok(None);
-    }
-    let config = hmc::NutsConfig::for_dimension(mode.len());
-    let inputs = hmc::FamilyNutsInputs::Glm(hmc::GlmFlatInputs {
-        x,
-        y,
-        weights,
-        penalty_matrix,
-        mode,
-        hessian,
-        firth_bias_reduction,
-    });
-    let nuts = hmc::run_nuts_sampling_flattened_family(family, inputs, &config).map_err(|err| {
-        EstimationError::InvalidSpecification(format!("NUTS sampling failed: {err}"))
-    })?;
-    Ok(Some(nuts.samples))
-}
-
-fn to_engine_survival_penalties(
-    penalties: &crate::calibrate::survival::PenaltyBlocks,
-) -> gam::survival::PenaltyBlocks {
-    let blocks = penalties
-        .blocks
-        .iter()
-        .map(|block| gam::survival::PenaltyBlock {
-            matrix: block.matrix.clone(),
-            lambda: block.lambda,
-            range: block.range.clone(),
-        })
-        .collect::<Vec<_>>();
-    gam::survival::PenaltyBlocks::new(blocks)
-}
-
-fn to_engine_survival_monotonicity(
-    monotonicity: &crate::calibrate::survival::MonotonicityPenalty,
-) -> gam::survival::MonotonicityPenalty {
-    let lambda = if monotonicity.derivative_design.nrows() == 0 {
-        0.0
-    } else {
-        1.0
-    };
-    gam::survival::MonotonicityPenalty {
-        lambda,
-        tolerance: 0.0,
     }
 }
 
-fn to_engine_survival_spec(
-    data: &crate::calibrate::survival::SurvivalTrainingData,
-) -> gam::survival::SurvivalSpec {
-    if data.event_competing.iter().any(|&v| v > 0) {
-        gam::survival::SurvivalSpec::Crude
-    } else {
-        gam::survival::SurvivalSpec::Net
+impl std::error::Error for EstimationError {}
+
+impl From<String> for EstimationError {
+    fn from(s: String) -> Self {
+        Self::Gam(s)
     }
 }
 
-fn build_expected_hessian_factor(
-    hessian: &Array2<f64>,
-) -> Option<crate::calibrate::survival::HessianFactor> {
-    let chol = hessian.clone().cholesky(Side::Lower).ok()?;
-    Some(crate::calibrate::survival::HessianFactor::Expected {
-        factor: crate::calibrate::survival::CholeskyFactor {
-            lower: chol.lower_triangular(),
+/// Fixed column layout: phenotype | pgs | sex | pc1..pck | weights.
+struct DataColumns {
+    pgs_col: usize,
+    sex_col: usize,
+    pc_cols: Vec<usize>,
+    matrix: Array2<f64>,
+}
+
+fn build_training_matrix(data: &TrainingData) -> DataColumns {
+    let n = data.y.len();
+    let n_pcs = data.pcs.ncols();
+    // 1 (phenotype) + 1 (pgs) + 1 (sex) + n_pcs + 1 (weights)
+    let ncols = 4 + n_pcs;
+    let mut matrix = Array2::<f64>::zeros((n, ncols));
+    matrix.slice_mut(s![.., 0]).assign(&data.y);
+    matrix.slice_mut(s![.., 1]).assign(&data.p);
+    matrix.slice_mut(s![.., 2]).assign(&data.sex);
+    if n_pcs > 0 {
+        matrix.slice_mut(s![.., 3..3 + n_pcs]).assign(&data.pcs);
+    }
+    matrix.slice_mut(s![.., 3 + n_pcs]).assign(&data.weights);
+    DataColumns {
+        pgs_col: 1,
+        sex_col: 2,
+        pc_cols: (3..3 + n_pcs).collect(),
+        matrix,
+    }
+}
+
+fn empty_data_schema() -> DataSchema {
+    DataSchema {
+        columns: Vec::new(),
+    }
+}
+
+fn default_blockwise_options() -> BlockwiseFitOptions {
+    BlockwiseFitOptions {
+        compute_covariance: true,
+        ..BlockwiseFitOptions::default()
+    }
+}
+
+/// Convert a Bernoulli marginal-slope FitResult into a serializable payload.
+fn bernoulli_payload_from_fit(
+    fit: gam::families::bernoulli_marginal_slope::BernoulliMarginalSlopeFitResult,
+    base_link: InverseLink,
+    frailty: FrailtySpec,
+) -> Result<FittedModelPayload, EstimationError> {
+    let frozen_marginal = gam::terms::smooth::freeze_term_collection_from_design(
+        &fit.marginalspec_resolved,
+        &fit.marginal_design,
+    )
+    .map_err(|e| EstimationError::Gam(e.to_string()))?;
+    let frozen_logslope = gam::terms::smooth::freeze_term_collection_from_design(
+        &fit.logslopespec_resolved,
+        &fit.logslope_design,
+    )
+    .map_err(|e| EstimationError::Gam(e.to_string()))?;
+
+    let likelihood = inverse_link_to_binomial_family(&base_link);
+    let mut payload = FittedModelPayload::new(
+        MODEL_PAYLOAD_VERSION,
+        "calibrate::bernoulli-marginal-slope".to_string(),
+        ModelKind::MarginalSlope,
+        FittedFamily::MarginalSlope {
+            likelihood,
+            base_link: Some(base_link.clone()),
+            frailty,
         },
-    })
+        likelihood.name().to_string(),
+    );
+    payload.unified = Some(fit.fit.clone());
+    payload.fit_result = Some(fit.fit);
+    payload.data_schema = Some(empty_data_schema());
+    payload.formula_logslope = Some("calibrate::logslope".to_string());
+    payload.z_column = Some("phenotype".to_string());
+    payload.latent_z_normalization = Some(SavedLatentZNormalization {
+        mean: fit.z_normalization.mean,
+        sd: fit.z_normalization.sd,
+    });
+    payload.latent_measure = Some(fit.latent_measure);
+    payload.marginal_baseline = Some(fit.baseline_marginal);
+    payload.logslope_baseline = Some(fit.baseline_logslope);
+    payload.resolved_termspec = Some(frozen_marginal);
+    payload.resolved_termspec_logslope = Some(frozen_logslope);
+    Ok(payload)
 }
 
-fn cross_covariance_primary_companion(
-    primary_samples: &Array2<f64>,
-    companion_samples: &Array2<f64>,
-) -> Option<Array2<f64>> {
-    let n = primary_samples.nrows().min(companion_samples.nrows());
-    if n < 2 {
-        return None;
-    }
-    let p_primary = primary_samples.ncols();
-    let p_companion = companion_samples.ncols();
+/// Convert a Survival marginal-slope FitResult into a serializable payload.
+fn survival_payload_from_fit(
+    fit: gam::families::survival_marginal_slope::SurvivalMarginalSlopeFitResult,
+    frailty: FrailtySpec,
+) -> Result<FittedModelPayload, EstimationError> {
+    let frozen_marginal = gam::terms::smooth::freeze_term_collection_from_design(
+        &fit.marginalspec_resolved,
+        &fit.marginal_design,
+    )
+    .map_err(|e| EstimationError::Gam(e.to_string()))?;
+    let frozen_logslope = gam::terms::smooth::freeze_term_collection_from_design(
+        &fit.logslopespec_resolved,
+        &fit.logslope_design,
+    )
+    .map_err(|e| EstimationError::Gam(e.to_string()))?;
 
-    let primary = primary_samples.slice(s![0..n, ..]).to_owned();
-    let companion = companion_samples.slice(s![0..n, ..]).to_owned();
-    let mean_primary = primary.mean_axis(ndarray::Axis(0))?;
-    let mean_companion = companion.mean_axis(ndarray::Axis(0))?;
-
-    let mut cov = Array2::<f64>::zeros((p_primary, p_companion));
-    for i in 0..n {
-        let row_p = &primary.row(i).to_owned() - &mean_primary;
-        let row_c = &companion.row(i).to_owned() - &mean_companion;
-        for r in 0..p_primary {
-            let pr = row_p[r];
-            for c in 0..p_companion {
-                cov[[r, c]] += pr * row_c[c];
-            }
-        }
-    }
-    cov.mapv_inplace(|v| v / ((n - 1) as f64));
-    Some(cov)
+    let mut payload = FittedModelPayload::new(
+        MODEL_PAYLOAD_VERSION,
+        "calibrate::survival-marginal-slope".to_string(),
+        ModelKind::Survival,
+        FittedFamily::Survival {
+            likelihood: LikelihoodFamily::RoystonParmar,
+            survival_likelihood: Some("marginal-slope".to_string()),
+            survival_distribution: Some("probit".to_string()),
+            frailty,
+        },
+        LikelihoodFamily::RoystonParmar.name().to_string(),
+    );
+    payload.unified = Some(fit.fit.clone());
+    payload.fit_result = Some(fit.fit);
+    payload.data_schema = Some(empty_data_schema());
+    payload.formula_logslope = Some("calibrate::logslope".to_string());
+    payload.z_column = Some("event_target".to_string());
+    payload.latent_z_normalization = Some(SavedLatentZNormalization {
+        mean: fit.z_normalization.mean,
+        sd: fit.z_normalization.sd,
+    });
+    payload.latent_measure = Some(LatentMeasureKind::StandardNormal);
+    payload.logslope_baseline = Some(fit.baseline_slope);
+    payload.resolved_termspec = Some(frozen_marginal);
+    payload.resolved_termspec_logslope = Some(frozen_logslope);
+    Ok(payload)
 }
 
 pub fn train_model(
-    data: &crate::calibrate::data::TrainingData,
-    config: &crate::calibrate::model::ModelConfig,
-) -> Result<crate::calibrate::model::TrainedModel, EstimationError> {
-    use crate::calibrate::model::ModelFamily;
-
-    let (
-        x,
-        s_list,
-        layout,
-        sum_to_zero_constraints,
-        knot_vectors,
-        range_transforms,
-        pc_null_transforms,
-        interaction_centering_means,
-        interaction_orth_alpha,
-        _penalty_structs,
-    ) = crate::calibrate::construction::build_design_and_penalty_matrices(data, config)?;
-
-    let link = match config.model_family {
-        ModelFamily::Gam(link) => link,
+    data: &TrainingData,
+    config: &ModelConfig,
+) -> Result<TrainedModel, EstimationError> {
+    let link = match &config.model_family {
+        ModelFamily::Gam(link) => *link,
         ModelFamily::Survival(_) => {
-            return Err(EstimationError::InvalidInput(
-                "train_model expects GAM family; use train_survival_model for survival".to_string(),
+            return Err(EstimationError::Domain(
+                "train_model expects a GAM family; use train_survival_model".to_string(),
             ));
         }
     };
-    let family = match link {
-        gam::types::LinkFunction::Identity => gam::types::LikelihoodFamily::GaussianIdentity,
-        gam::types::LinkFunction::Logit => gam::types::LikelihoodFamily::BinomialLogit,
-        gam::types::LinkFunction::Probit => gam::types::LikelihoodFamily::BinomialProbit,
-        gam::types::LinkFunction::CLogLog => gam::types::LikelihoodFamily::BinomialCLogLog,
-    };
-
-    let opts = FitOptions {
-        max_iter: config.reml_max_iterations as usize,
-        tol: config.reml_convergence_tolerance,
-        nullspace_dims: vec![0; s_list.len()],
-    };
-    let offset = Array1::<f64>::zeros(data.y.len());
-    let fit = fit_gam(
-        x.view(),
-        data.y.view(),
-        data.weights.view(),
-        offset.view(),
-        &s_list,
-        family,
-        &opts,
-    )?;
-
-    let pirls_cfg = crate::calibrate::model::to_engine_model_config(config)?;
-
-    // Build raw geometry matrix used by the predictor path: [PGS | PCs...]
-    let n = data.p.len();
-    let raw_dim = 1 + data.pcs.ncols();
-    let mut raw_train = Array2::<f64>::zeros((n, raw_dim));
-    raw_train.slice_mut(s![.., 0]).assign(&data.p);
-    if data.pcs.ncols() > 0 {
-        raw_train.slice_mut(s![.., 1..]).assign(&data.pcs);
+    if !matches!(link, LinkFunction::Probit | LinkFunction::Logit) {
+        // Identity / non-binary links are not yet wired through the marginal-slope
+        // workflow in this thin adapter. The workflow itself supports them via
+        // FitRequest::Standard / TransformationNormal; routing them lives in a
+        // follow-up.
+        return Err(EstimationError::Domain(format!(
+            "{link:?} link not yet wired in calibrate; only Probit/Logit (Bernoulli marginal-slope) supported"
+        )));
     }
-    let hull = build_peeled_hull(&raw_train, 3).ok();
 
-    let mut trained_config = config.clone();
-    trained_config.sum_to_zero_constraints = sum_to_zero_constraints;
-    trained_config.knot_vectors = knot_vectors;
-    trained_config.range_transforms = range_transforms;
-    trained_config.pc_null_transforms = pc_null_transforms;
-    trained_config.interaction_centering_means = interaction_centering_means;
-    trained_config.interaction_orth_alpha = interaction_orth_alpha;
+    let cols = build_training_matrix(data);
+    let pc_bases: Vec<_> = config.pc_configs.iter().map(|pc| pc.basis_config).collect();
+    let marginalspec = build_marginal_termspec(
+        cols.pgs_col,
+        cols.sex_col,
+        &cols.pc_cols,
+        &config.pgs_basis_config,
+        &pc_bases,
+    );
+    let logslopespec = build_logslope_termspec(cols.pgs_col);
 
-    let coefficients = crate::calibrate::model::map_coefficients(&fit.beta, &layout)?;
-    let penalty_matrix = build_combined_penalty_matrix(&s_list, &fit.lambdas, x.ncols());
-    let mcmc_samples = run_gam_nuts_if_enabled(
-        config.mcmc_enabled,
-        family,
-        link,
-        pirls_cfg.firth_bias_reduction,
-        x.view(),
-        data.y.view(),
-        data.weights.view(),
-        penalty_matrix.view(),
-        fit.beta.view(),
-        fit.penalized_hessian.view(),
-    )?;
+    let n = data.y.len();
+    let weights = data.weights.clone();
+    let y = data.y.clone();
+    // For binary phenotypes, pass y as the latent z; gam's LatentZPolicy default
+    // (frozen N(0,1) with WarnOnly diagnostics) accepts it and the marginal-slope
+    // calibration carries through. A future revision can route z through a CTN
+    // prefit (gam::families::transformation_normal::fit_transformation_normal).
+    let z = y.clone();
 
-    Ok(crate::calibrate::model::TrainedModel {
-        config: trained_config,
-        coefficients,
-        lambdas: fit.lambdas.to_vec(),
-        hull,
-        penalized_hessian: Some(fit.penalized_hessian.clone()),
-        scale: Some(fit.scale),
+    let base_link = InverseLink::Standard(LinkFunction::Probit);
+    let frailty = FrailtySpec::None;
+    // link_dev: link wiggle off by default pending a CLI flag.
+    let link_dev: Option<DeviationBlockConfig> = None;
+    let score_warp = Some(DeviationBlockConfig::triple_penalty_default());
 
-        joint_link: None,
-        survival: None,
-        survival_companions: HashMap::new(),
-        mcmc_samples,
-        smoothing_correction: fit.smoothing_correction,
+    let request = BernoulliMarginalSlopeFitRequest {
+        data: cols.matrix.view(),
+        spec: BernoulliMarginalSlopeTermSpec {
+            y,
+            weights,
+            z,
+            base_link: base_link.clone(),
+            marginalspec,
+            logslopespec,
+            marginal_offset: ndarray::Array1::<f64>::zeros(n),
+            logslope_offset: ndarray::Array1::<f64>::zeros(n),
+            frailty: frailty.clone(),
+            score_warp,
+            link_dev,
+            latent_z_policy: LatentZPolicy::default(),
+        },
+        options: default_blockwise_options(),
+        kappa_options: SpatialLengthScaleOptimizationOptions::default(),
+        policy: ResourcePolicy::default_library(),
+    };
+
+    let result = fit_model(FitRequest::BernoulliMarginalSlope(request))
+        .map_err(EstimationError::Gam)?;
+    let fit = match result {
+        FitResult::BernoulliMarginalSlope(fit) => fit,
+        _ => {
+            return Err(EstimationError::Gam(
+                "fit_model returned the wrong FitResult variant for BernoulliMarginalSlope"
+                    .to_string(),
+            ));
+        }
+    };
+
+    let saved = bernoulli_payload_from_fit(fit, base_link, frailty)?;
+    Ok(TrainedModel {
+        config: config.clone(),
+        saved,
     })
 }
 
 pub fn train_survival_model(
-    bundle: &crate::calibrate::survival_data::SurvivalTrainingBundle,
-    config: &crate::calibrate::model::ModelConfig,
-) -> Result<crate::calibrate::model::TrainedModel, EstimationError> {
-    use crate::calibrate::model::ModelFamily;
-    use crate::calibrate::survival::CompanionModelHandle;
-
+    bundle: &SurvivalTrainingBundle,
+    config: &ModelConfig,
+) -> Result<TrainedModel, EstimationError> {
+    let survival_spec = match &config.model_family {
+        ModelFamily::Survival(spec) => *spec,
+        ModelFamily::Gam(_) => {
+            return Err(EstimationError::Domain(
+                "train_survival_model expects a Survival family".to_string(),
+            ));
+        }
+    };
     let survival_cfg = config.survival.as_ref().ok_or_else(|| {
-        EstimationError::InvalidSpecification(
-            "missing survival config for survival training".to_string(),
-        )
+        EstimationError::Domain("ModelConfig.survival missing for survival training".to_string())
     })?;
-    let survival_spec = match config.model_family {
-        ModelFamily::Survival(spec) => spec,
+
+    let n = bundle.data.age_entry.len();
+    let n_pcs = bundle.data.pcs.ncols();
+    // Layout: pgs | sex | pc1..pck | sample_weight (no phenotype column —
+    // survival outcome is the (age_entry, age_exit, event_target) triple).
+    let ncols = 3 + n_pcs;
+    let mut matrix = Array2::<f64>::zeros((n, ncols));
+    matrix.slice_mut(s![.., 0]).assign(&bundle.data.pgs);
+    matrix.slice_mut(s![.., 1]).assign(&bundle.data.sex);
+    if n_pcs > 0 {
+        matrix
+            .slice_mut(s![.., 2..2 + n_pcs])
+            .assign(&bundle.data.pcs);
+    }
+    matrix
+        .slice_mut(s![.., 2 + n_pcs])
+        .assign(&bundle.data.sample_weight);
+    let pgs_col = 0usize;
+    let sex_col = 1usize;
+    let pc_cols: Vec<usize> = (2..2 + n_pcs).collect();
+
+    let pc_bases: Vec<_> = config.pc_configs.iter().map(|pc| pc.basis_config).collect();
+    let marginalspec =
+        build_marginal_termspec(pgs_col, sex_col, &pc_cols, &config.pgs_basis_config, &pc_bases);
+    let logslopespec = build_logslope_termspec(pgs_col);
+
+    let time_block = build_time_block_input(bundle, &survival_spec)
+        .map_err(EstimationError::Gam)?;
+    let timewiggle_enabled = survival_cfg.time_varying.is_some();
+    let timewiggle_block =
+        build_time_wiggle_block_input(timewiggle_enabled).map_err(EstimationError::Gam)?;
+
+    let event_target_f64 = bundle.data.event_target.mapv(|v| v as f64);
+    let weights = bundle.data.sample_weight.clone();
+    let z = event_target_f64.clone();
+
+    let base_link = InverseLink::Standard(LinkFunction::Probit);
+    let frailty = FrailtySpec::None;
+
+    let spec = SurvivalMarginalSlopeTermSpec {
+        age_entry: bundle.data.age_entry.clone(),
+        age_exit: bundle.data.age_exit.clone(),
+        event_target: event_target_f64,
+        weights,
+        z,
+        base_link: base_link.clone(),
+        marginalspec,
+        marginal_offset: ndarray::Array1::<f64>::zeros(n),
+        frailty: frailty.clone(),
+        derivative_guard: survival_spec.derivative_guard,
+        time_block,
+        timewiggle_block,
+        logslopespec,
+        logslope_offset: ndarray::Array1::<f64>::zeros(n),
+        score_warp: Some(DeviationBlockConfig::triple_penalty_default()),
+        link_dev: None,
+        latent_z_policy: LatentZPolicy::default(),
+    };
+
+    let request = SurvivalMarginalSlopeFitRequest {
+        data: matrix.view(),
+        spec,
+        options: default_blockwise_options(),
+        kappa_options: SpatialLengthScaleOptimizationOptions::default(),
+    };
+
+    let result =
+        fit_model(FitRequest::SurvivalMarginalSlope(request)).map_err(EstimationError::Gam)?;
+    let fit = match result {
+        FitResult::SurvivalMarginalSlope(fit) => fit,
         _ => {
-            return Err(EstimationError::InvalidInput(
-                "train_survival_model expects Survival model family".to_string(),
+            return Err(EstimationError::Gam(
+                "fit_model returned the wrong FitResult variant for SurvivalMarginalSlope"
+                    .to_string(),
             ));
         }
     };
 
-    let mut primary_fit = fit_single_survival_model(bundle, config, survival_cfg, survival_spec)?;
-    let mut survival_companions = HashMap::new();
-    let n = bundle.data.pgs.len();
-    let raw_dim = 1 + bundle.data.pcs.ncols();
-    let mut raw_train = Array2::<f64>::zeros((n, raw_dim));
-    raw_train.slice_mut(s![.., 0]).assign(&bundle.data.pgs);
-    if bundle.data.pcs.ncols() > 0 {
-        raw_train.slice_mut(s![.., 1..]).assign(&bundle.data.pcs);
-    }
-    let hull = build_peeled_hull(&raw_train, 3).ok();
-
-    if survival_cfg.model_competing_risk {
-        let mut mortality_bundle = crate::calibrate::survival_data::SurvivalTrainingBundle {
-            data: bundle.data.clone(),
-            age_transform: bundle.age_transform,
-        };
-        mortality_bundle.data.event_target = bundle.data.event_competing.clone();
-        mortality_bundle.data.event_competing =
-            Array1::<u8>::zeros(bundle.data.event_competing.len());
-
-        let mut mortality_fit =
-            fit_single_survival_model(&mortality_bundle, config, survival_cfg, survival_spec)?;
-        let cross_cov = match (
-            primary_fit.artifacts.mcmc_samples.as_ref(),
-            mortality_fit.artifacts.mcmc_samples.as_ref(),
-        ) {
-            (Some(primary_samples), Some(mortality_samples)) => {
-                cross_covariance_primary_companion(primary_samples, mortality_samples).or_else(
-                    || {
-                        Some(Array2::<f64>::zeros((
-                            primary_fit.artifacts.coefficients.len(),
-                            mortality_fit.artifacts.coefficients.len(),
-                        )))
-                    },
-                )
-            }
-            _ => Some(Array2::<f64>::zeros((
-                primary_fit.artifacts.coefficients.len(),
-                mortality_fit.artifacts.coefficients.len(),
-            ))),
-        };
-        mortality_fit.artifacts.cross_covariance_to_primary = cross_cov;
-
-        primary_fit
-            .artifacts
-            .companion_models
-            .push(CompanionModelHandle {
-                reference: "__internal_mortality".to_string(),
-                cif_horizons: Vec::new(),
-            });
-        survival_companions.insert("__internal_mortality".to_string(), mortality_fit.artifacts);
-    }
-
-    let primary_samples = primary_fit.artifacts.mcmc_samples.clone();
-    let primary_hessian = primary_fit.hessian.clone();
-
-    Ok(crate::calibrate::model::TrainedModel {
+    let saved = survival_payload_from_fit(fit, frailty)?;
+    Ok(TrainedModel {
         config: config.clone(),
-        coefficients: crate::calibrate::model::MappedCoefficients::default(),
-        lambdas: primary_fit.lambdas,
-        hull,
-        penalized_hessian: Some(primary_hessian),
-        scale: None,
-
-        joint_link: None,
-        survival: Some(primary_fit.artifacts),
-        survival_companions,
-        mcmc_samples: primary_samples,
-        smoothing_correction: None,
-    })
-}
-
-struct SurvivalFitResult {
-    artifacts: crate::calibrate::survival::SurvivalModelArtifacts,
-    lambdas: Vec<f64>,
-    hessian: Array2<f64>,
-}
-
-fn fit_single_survival_model(
-    bundle: &crate::calibrate::survival_data::SurvivalTrainingBundle,
-    config: &crate::calibrate::model::ModelConfig,
-    survival_cfg: &crate::calibrate::model::SurvivalModelConfig,
-    _survival_spec: crate::calibrate::survival::SurvivalSpec,
-) -> Result<SurvivalFitResult, EstimationError> {
-    use crate::calibrate::survival::{
-        BasisDescriptor, CovariateLayout, SurvivalLayoutBundle, SurvivalModelArtifacts,
-        TensorProductConfig, build_survival_layout,
-    };
-    use gam::families::royston_parmar::{RoystonParmarInputs, working_model_from_flattened};
-
-    let log_entry = bundle
-        .age_transform
-        .transform_array(&bundle.data.age_entry)
-        .map_err(map_survival_error)?;
-    let mut min_log = f64::INFINITY;
-    let mut max_log = f64::NEG_INFINITY;
-    for &v in log_entry.iter() {
-        min_log = min_log.min(v);
-        max_log = max_log.max(v);
-    }
-    if !min_log.is_finite() || !max_log.is_finite() {
-        return Err(EstimationError::InvalidSpecification(
-            "non-finite transformed age values".to_string(),
-        ));
-    }
-    if (max_log - min_log).abs() < 1e-9 {
-        max_log = min_log + 1e-6;
-    }
-    let (_, age_knots) = create_basis::<Dense>(
-        log_entry.view(),
-        KnotSource::Generate {
-            data_range: (min_log, max_log),
-            num_internal_knots: survival_cfg.baseline_basis.num_knots,
-        },
-        survival_cfg.baseline_basis.degree,
-        BasisOptions::value(),
-    )?;
-    let age_basis = BasisDescriptor {
-        knot_vector: age_knots,
-        degree: survival_cfg.baseline_basis.degree,
-    };
-
-    let time_varying_config = if let Some(tv) = survival_cfg.time_varying.as_ref() {
-        let mut min_pgs = f64::INFINITY;
-        let mut max_pgs = f64::NEG_INFINITY;
-        for &value in bundle.data.pgs.iter() {
-            min_pgs = min_pgs.min(value);
-            max_pgs = max_pgs.max(value);
-        }
-        if !min_pgs.is_finite() || !max_pgs.is_finite() || (max_pgs - min_pgs).abs() < 1e-12 {
-            None
-        } else {
-            let (_, pgs_knots) = create_basis::<Dense>(
-                bundle.data.pgs.view(),
-                KnotSource::Generate {
-                    data_range: (min_pgs, max_pgs),
-                    num_internal_knots: tv.pgs_basis.num_knots,
-                },
-                tv.pgs_basis.degree,
-                BasisOptions::value(),
-            )
-            .map_err(|e| EstimationError::InvalidSpecification(e.to_string()))?;
-            Some(TensorProductConfig {
-                label: tv.label.clone(),
-                pgs_basis: BasisDescriptor {
-                    knot_vector: pgs_knots,
-                    degree: tv.pgs_basis.degree,
-                },
-                pgs_penalty_order: tv.pgs_penalty_order,
-                lambda_age: tv.lambda_age,
-                lambda_pgs: tv.lambda_pgs,
-                lambda_null: tv.lambda_null,
-            })
-        }
-    } else {
-        None
-    };
-
-    let SurvivalLayoutBundle {
-        mut layout,
-        monotonicity,
-        mut penalty_descriptors,
-        interaction_metadata,
-        time_varying_basis,
-    } = build_survival_layout(
-        &bundle.data,
-        &age_basis,
-        survival_cfg.guard_delta,
-        config.penalty_order,
-        survival_cfg.monotonic_grid_size,
-        time_varying_config.as_ref(),
-    )
-    .map_err(map_survival_error)?;
-
-    let pirls_options = WorkingModelPirlsOptions {
-        max_iterations: config.max_iterations,
-        convergence_tolerance: config.convergence_tolerance,
-        max_step_halving: 20,
-        min_step_size: 1e-6,
-        firth_bias_reduction: false,
-    };
-
-    if !layout.penalties.blocks.is_empty() {
-        let heuristic_lambdas = layout
-            .penalties
-            .blocks
-            .iter()
-            .map(|block| block.lambda.max(1e-12))
-            .collect::<Vec<_>>();
-        let objective_with_gradient =
-            |rho: &Array1<f64>| -> Result<(f64, Array1<f64>), EstimationError> {
-                let mut eval_layout = layout.clone();
-                for (block, &rho_i) in eval_layout.penalties.blocks.iter_mut().zip(rho.iter()) {
-                    block.lambda = rho_i.exp();
-                }
-                let p = eval_layout.combined_exit.ncols();
-                let penalties = to_engine_survival_penalties(&eval_layout.penalties);
-                let mono = to_engine_survival_monotonicity(&monotonicity);
-                let spec = to_engine_survival_spec(&bundle.data);
-                let mut model = working_model_from_flattened(
-                    penalties,
-                    mono,
-                    spec,
-                    RoystonParmarInputs {
-                        age_entry: bundle.data.age_entry.view(),
-                        age_exit: bundle.data.age_exit.view(),
-                        event_target: bundle.data.event_target.view(),
-                        event_competing: bundle.data.event_competing.view(),
-                        weights: bundle.data.sample_weight.view(),
-                        x_entry: eval_layout.combined_entry.view(),
-                        x_exit: eval_layout.combined_exit.view(),
-                        x_derivative: eval_layout.combined_derivative_exit.view(),
-                    },
-                )
-                .map_err(|e| EstimationError::InvalidSpecification(e.to_string()))?;
-                let result = pirls::run_working_model_pirls(
-                    &mut model,
-                    Coefficients::zeros(p),
-                    &pirls_options,
-                    |_| {},
-                )?;
-                let beta_arr: Array1<f64> = result.beta.clone().into();
-                let (value, grad) =
-                    model.laml_objective_and_rho_gradient(&beta_arr, &result.state)?;
-                Ok((value, grad))
-            };
-        let seed_strategy = if layout.penalties.blocks.len() >= 10 {
-            gam::seeding::SeedStrategy::Light
-        } else {
-            gam::seeding::SeedStrategy::Exhaustive
-        };
-        let smooth_opts = gam::families::royston_parmar::SurvivalLambdaOptimizerOptions {
-            max_iter: config.reml_max_iterations as usize,
-            tol: config.reml_convergence_tolerance,
-            finite_diff_step: 1e-3,
-            seed_config: gam::seeding::SeedConfig {
-                strategy: seed_strategy,
-                bounds: (-12.0, 12.0),
-            },
-        };
-        let smooth_sol =
-            gam::families::royston_parmar::optimize_survival_lambdas_with_multistart_with_gradient(
-                layout.penalties.blocks.len(),
-                Some(heuristic_lambdas.as_slice()),
-                objective_with_gradient,
-                &smooth_opts,
-            )?;
-        for (block, &rho_i) in layout
-            .penalties
-            .blocks
-            .iter_mut()
-            .zip(smooth_sol.rho.iter())
-        {
-            block.lambda = rho_i.exp();
-        }
-        for (descriptor, &rho_i) in penalty_descriptors.iter_mut().zip(smooth_sol.rho.iter()) {
-            descriptor.lambda = rho_i.exp();
-        }
-    }
-
-    let p = layout.combined_exit.ncols();
-    let penalties = to_engine_survival_penalties(&layout.penalties);
-    let mono = to_engine_survival_monotonicity(&monotonicity);
-    let spec = to_engine_survival_spec(&bundle.data);
-    let mut model = working_model_from_flattened(
-        penalties,
-        mono,
-        spec,
-        RoystonParmarInputs {
-            age_entry: bundle.data.age_entry.view(),
-            age_exit: bundle.data.age_exit.view(),
-            event_target: bundle.data.event_target.view(),
-            event_competing: bundle.data.event_competing.view(),
-            weights: bundle.data.sample_weight.view(),
-            x_entry: layout.combined_entry.view(),
-            x_exit: layout.combined_exit.view(),
-            x_derivative: layout.combined_derivative_exit.view(),
-        },
-    )
-    .map_err(|e| EstimationError::InvalidSpecification(e.to_string()))?;
-    let outcome =
-        pirls::run_working_model_pirls(&mut model, Coefficients::zeros(p), &pirls_options, |_| {})?;
-
-    if matches!(outcome.status, PirlsStatus::Unstable) {
-        return Err(EstimationError::PirlsDidNotConverge {
-            max_iterations: config.max_iterations,
-            last_change: outcome.last_gradient_norm,
-        });
-    }
-
-    let coefficient_vector: Array1<f64> = outcome.beta.clone().into();
-    let static_ranges = (0..layout.static_covariates.ncols())
-        .map(|col| {
-            let mut min_val = f64::INFINITY;
-            let mut max_val = f64::NEG_INFINITY;
-            for &v in layout.static_covariates.column(col).iter() {
-                min_val = min_val.min(v);
-                max_val = max_val.max(v);
-            }
-            crate::calibrate::survival::ValueRange {
-                min: min_val,
-                max: max_val,
-            }
-        })
-        .collect();
-
-    let mcmc_samples = if config.mcmc_enabled {
-        let flat = hmc::SurvivalFlatInputs {
-            age_entry: bundle.data.age_entry.view(),
-            age_exit: bundle.data.age_exit.view(),
-            event_target: bundle.data.event_target.view(),
-            event_competing: bundle.data.event_competing.view(),
-            weights: bundle.data.sample_weight.view(),
-            x_entry: layout.combined_entry.view(),
-            x_exit: layout.combined_exit.view(),
-            x_derivative: layout.combined_derivative_exit.view(),
-        };
-        let penalties = to_engine_survival_penalties(&layout.penalties);
-        let mono = to_engine_survival_monotonicity(&monotonicity);
-        let spec = to_engine_survival_spec(&bundle.data);
-        let nuts_cfg = hmc::NutsConfig::for_dimension(coefficient_vector.len());
-        let survival_inputs = hmc::SurvivalNutsInputs {
-            flat,
-            penalties,
-            monotonicity: mono,
-            spec,
-            mode: coefficient_vector.view(),
-            hessian: outcome.state.hessian.view(),
-        };
-        let nuts = hmc::run_nuts_sampling_flattened_family(
-            gam::types::LikelihoodFamily::RoystonParmar,
-            hmc::FamilyNutsInputs::Survival(survival_inputs),
-            &nuts_cfg,
-        )
-        .map_err(|err| {
-            EstimationError::InvalidSpecification(format!("survival NUTS sampling failed: {err}"))
-        })?;
-        Some(nuts.samples)
-    } else {
-        None
-    };
-
-    let artifacts = SurvivalModelArtifacts {
-        coefficients: coefficient_vector,
-        age_basis,
-        time_varying_basis,
-        static_covariate_layout: CovariateLayout {
-            column_names: layout.static_covariate_names.clone(),
-            ranges: static_ranges,
-        },
-        penalties: penalty_descriptors,
-        age_transform: layout.age_transform.clone(),
-        reference_constraint: layout.reference_constraint.clone(),
-        monotonicity,
-        interaction_metadata,
-        companion_models: Vec::new(),
-        hessian_factor: build_expected_hessian_factor(&outcome.state.hessian),
-
-        mcmc_samples,
-        cross_covariance_to_primary: None,
-    };
-    let lambdas = layout
-        .penalties
-        .blocks
-        .iter()
-        .map(|b| b.lambda)
-        .collect::<Vec<_>>();
-
-    Ok(SurvivalFitResult {
-        artifacts,
-        lambdas,
-        hessian: outcome.state.hessian,
+        saved,
     })
 }

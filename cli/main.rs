@@ -9,7 +9,7 @@ use clap::{Args, Parser};
 #[cfg(any(feature = "map", feature = "calibrate"))]
 use clap::{CommandFactory, Subcommand};
 #[cfg(feature = "calibrate")]
-use gam::probability::normal_cdf_approx;
+use gam::probability::normal_cdf;
 #[cfg(feature = "calibrate")]
 use gnomon::calibrate::data::{load_prediction_data, load_training_data};
 #[cfg(feature = "calibrate")]
@@ -245,7 +245,7 @@ struct TrainArgs {
 
     /// Maximum number of iterations for the outer REML/BFGS optimization loop
     #[arg(long, default_value = "100")]
-    reml_max_iterations: u64,
+    reml_max_iterations: usize,
 
     /// Convergence tolerance for the gradient norm in the outer REML/BFGS loop
     #[arg(long, default_value = "1e-3")]
@@ -754,16 +754,19 @@ fn infer(args: InferArgs) -> Result<(), Box<dyn std::error::Error>> {
             println!("Loaded {} samples for prediction", data.p.len());
 
             println!("Generating predictions with diagnostics...");
-            let (eta, mean, signed_dist, se_eta_opt) =
+            let p =
                 model.predict_detailed(data.p.view(), data.sex.view(), data.pcs.view())?;
+            let signed_dist = p
+                .signed_dist
+                .unwrap_or_else(|| Array1::zeros(p.eta.len()));
 
             let output_path = "predictions.tsv";
             save_predictions_detailed(
                 &data.sample_ids,
                 &signed_dist,
-                &eta,
-                &mean,
-                se_eta_opt.as_ref(),
+                &p.eta,
+                &p.mean,
+                p.se_eta.as_ref(),
                 *link_function,
                 output_path,
             )?;
@@ -785,7 +788,6 @@ fn infer(args: InferArgs) -> Result<(), Box<dyn std::error::Error>> {
                 data.sex.view(),
                 data.pcs.view(),
                 SurvivalRiskType::Net,
-                Some(&model.survival_companions),
             )?;
 
             let output_path = "predictions.tsv";
@@ -872,8 +874,8 @@ fn se_and_ci(
         }
         LinkFunction::Probit => (
             se.to_string(),
-            normal_cdf_approx(lo_eta).clamp(0.0, 1.0).to_string(),
-            normal_cdf_approx(hi_eta).clamp(0.0, 1.0).to_string(),
+            normal_cdf(lo_eta).clamp(0.0, 1.0).to_string(),
+            normal_cdf(hi_eta).clamp(0.0, 1.0).to_string(),
         ),
         LinkFunction::CLogLog => {
             let lo_p = 1.0 - (-lo_eta.exp()).exp();
@@ -884,6 +886,7 @@ fn se_and_ci(
                 hi_p.clamp(0.0, 1.0).to_string(),
             )
         }
+        _ => ("NA".to_string(), "NA".to_string(), "NA".to_string()),
     }
 }
 
