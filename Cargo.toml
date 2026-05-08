@@ -145,11 +145,6 @@ harness = false
 required-features = ["bench-path"]
 
 [[test]]
-name = "calibrate"
-path = "calibrate/tests/mod.rs"
-required-features = ["calibrate"]
-
-[[test]]
 name = "score"
 path = "score/tests/mod.rs"
 required-features = ["score"]
