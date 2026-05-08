@@ -8,8 +8,10 @@
 //! Heavy lifting (PIRLS, REML, monotonicity, joint link, baseline
 //! construction, prediction) lives in gam.
 
+use gam::families::survival_construction::{
+    SurvivalTimeBasisConfig, build_survival_time_basis,
+};
 use gam::families::survival_location_scale::{TimeBlockInput, TimeWiggleBlockInput};
-use gam::linalg::matrix::DesignMatrix;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -208,54 +210,77 @@ pub fn validate_survival_inputs(
     Ok(())
 }
 
-/// Build a placeholder `TimeBlockInput` from the survival training bundle.
-///
-/// This wires the entry/exit age vectors into empty design matrices so the
-/// signature exists; estimate.rs fills the real B-spline designs once the
-/// gam workflow is wired (see `gam::main` survival path for the reference
-/// implementation we mirror).
+/// Hard-coded defaults for the survival time-basis. The marginal-slope
+/// fitter requires structural monotonicity, so we use an i-spline.
+const SURVIVAL_TIME_BASIS_DEGREE: usize = 3;
+const SURVIVAL_TIME_NUM_INTERNAL_KNOTS: usize = 8;
+const SURVIVAL_TIME_SMOOTH_LAMBDA: f64 = 1e-2;
+
+/// Build a `TimeBlockInput` from the survival training bundle by delegating
+/// to gam's canonical i-spline survival time-basis builder. The marginal-
+/// slope fitter requires `structural_monotonicity = true`, which is satisfied
+/// by the i-spline basis.
 pub fn build_time_block_input(
     bundle: &SurvivalTrainingBundle,
     spec: &SurvivalSpec,
 ) -> Result<TimeBlockInput, String> {
     let n = bundle.data.age_entry.len();
-    let _ = spec.derivative_guard; // reserved for the real builder
-    let zeros = Array2::<f64>::zeros((n, 0));
+    let cfg = SurvivalTimeBasisConfig::ISpline {
+        degree: SURVIVAL_TIME_BASIS_DEGREE,
+        knots: Array1::zeros(0),
+        keep_cols: Vec::new(),
+        smooth_lambda: SURVIVAL_TIME_SMOOTH_LAMBDA,
+    };
+    let build = build_survival_time_basis(
+        &bundle.data.age_entry,
+        &bundle.data.age_exit,
+        cfg,
+        Some((SURVIVAL_TIME_NUM_INTERNAL_KNOTS, SURVIVAL_TIME_SMOOTH_LAMBDA)),
+    )?;
+
+    let p_time = build.x_exit_time.ncols();
     let zero_vec = Array1::<f64>::zeros(n);
+    // gam's marginal-slope event term needs the derivative-offset to stay
+    // strictly above the derivative guard; the i-spline derivative design
+    // already enforces non-negative slopes, so a constant guard offset is
+    // enough to keep the closed-form q-geometry positive.
+    let derivative_offset_exit = Array1::<f64>::from_elem(n, spec.derivative_guard);
     Ok(TimeBlockInput {
-        design_entry: DesignMatrix::from(zeros.clone()),
-        design_exit: DesignMatrix::from(zeros.clone()),
-        design_derivative_exit: DesignMatrix::from(zeros),
+        design_entry: build.x_entry_time,
+        design_exit: build.x_exit_time,
+        design_derivative_exit: build.x_derivative_time,
         offset_entry: zero_vec.clone(),
-        offset_exit: zero_vec.clone(),
-        derivative_offset_exit: zero_vec,
+        offset_exit: zero_vec,
+        derivative_offset_exit,
         structural_monotonicity: true,
-        penalties: Vec::new(),
-        nullspace_dims: Vec::new(),
+        penalties: build.penalties,
+        nullspace_dims: build.nullspace_dims,
         initial_log_lambdas: None,
-        initial_beta: None,
+        initial_beta: Some(Array1::<f64>::zeros(p_time)),
     })
-    // TODO: build the real B-spline baseline on log-age using
-    // `gam::basis::create_basis` with `bundle.age_transform`, populate
-    // `design_entry/exit` from age_entry/age_exit views, derive
-    // `design_derivative_exit` analytically, and stack difference/derivative
-    // penalties to match the prepared survival time stack in
-    // `gam::main::PreparedSurvivalTimeStack`.
 }
+
+/// Hard-coded defaults for the survival time-wiggle block. Mirrors the
+/// degree / knot count chosen by gam's CLI when `--timewiggle` is on.
+const SURVIVAL_TIMEWIGGLE_DEGREE: usize = 3;
+const SURVIVAL_TIMEWIGGLE_NCOLS: usize = 8;
 
 /// Build the optional time-varying wiggle block.
 ///
-/// Returns `None` when no time-varying configuration was requested. Returns
-/// `Err` when configuration is requested but cannot yet be materialised in
-/// this iteration — the CLI/estimate path needs the signature, not the body.
+/// Returns `None` when no time-varying configuration was requested.
+/// Otherwise returns a `TimeWiggleBlockInput` with hard-coded defaults
+/// (8 internal knots, degree 3) on `[0, 1]` — gam re-evaluates the knot
+/// support against the working time grid internally.
 pub fn build_time_wiggle_block_input(
     enable: bool,
 ) -> Result<Option<TimeWiggleBlockInput>, String> {
     if !enable {
         return Ok(None);
     }
-    Err("time-varying block builder not yet implemented".to_string())
-    // TODO: when enabled, build a B-spline knot vector on log-age and a
-    // matching ncols using gnomon's `SurvivalTimeVaryingConfig`, then return
-    // `Some(TimeWiggleBlockInput { knots, degree, ncols })`.
+    let knots = Array1::linspace(0.0, 1.0, SURVIVAL_TIMEWIGGLE_NCOLS);
+    Ok(Some(TimeWiggleBlockInput {
+        knots,
+        degree: SURVIVAL_TIMEWIGGLE_DEGREE,
+        ncols: SURVIVAL_TIMEWIGGLE_NCOLS,
+    }))
 }

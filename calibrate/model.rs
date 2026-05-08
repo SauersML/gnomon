@@ -380,10 +380,26 @@ impl TrainedModel {
         col_map.insert(entry_name, n_cov);
         col_map.insert(exit_name, n_cov + 1);
 
+        // Crude (cause-specific competing-risk) survival prediction would
+        // need a companion-mortality model that gam's one-hazard predictor
+        // does not surface end-to-end (its CLI rejects `spec=crude` for the
+        // same reason). Refuse early with a clear error rather than
+        // panicking partway through prediction.
+        if matches!(risk_type, SurvivalRiskType::Crude) {
+            return Err(ModelError::Predict(
+                "crude (competing-risk) survival prediction is not supported by gam's \
+                 one-hazard predictor; refit / export a net survival model and combine \
+                 cause-specific hazards externally"
+                    .to_string(),
+            ));
+        }
+
         let model = gam::inference::model::FittedModel::from_payload(self.saved.clone());
         let primary_offset = Array1::<f64>::zeros(n);
         let noise_offset = Array1::<f64>::zeros(n);
-        let req = gam::families::survival_predict::SurvivalPredictRequest {
+
+        // Per-row exit cumulative hazard (one column at age_exit).
+        let exit_req = gam::families::survival_predict::SurvivalPredictRequest {
             model: &model,
             data: data.view(),
             col_map: &col_map,
@@ -392,18 +408,33 @@ impl TrainedModel {
             noise_offset: &noise_offset,
             time_grid: None,
         };
-        let result = gam::families::survival_predict::predict_survival(req)
+        let exit_result = gam::families::survival_predict::predict_survival(exit_req)
             .map_err(ModelError::Predict)?;
+        let cumulative_hazard_exit = exit_result.cumulative_hazard.column(0).to_owned();
 
-        // gam returns hazard/survival/cum_hazard on a per-row evaluation
-        // (one column when time_grid is None). Read column 0 for both entry
-        // and exit. NOTE: with time_grid=None gam evaluates only at age_exit
-        // per row. For now we approximate cumulative_hazard_entry = 0 (study
-        // entry is the natural baseline). A future iteration should pass an
-        // explicit time grid covering both entry and exit times if a
-        // non-zero entry hazard is required.
-        let cumulative_hazard_exit = result.cumulative_hazard.column(0).to_owned();
-        let cumulative_hazard_entry = Array1::<f64>::zeros(n);
+        // Per-row entry cumulative hazard. gam's predict_survival evaluates
+        // every row at `age_exit` (per_row_eval) when `time_grid` is None;
+        // to extract the hazard at each row's entry time we swap age_exit
+        // for age_entry in the predict matrix and call again. Calling twice
+        // is the idiomatic API surface here — gam doesn't expose a per-row
+        // grid.
+        let mut entry_data = data.clone();
+        for i in 0..n {
+            entry_data[[i, n_cov + 1]] = age_entry[i];
+        }
+        let entry_req = gam::families::survival_predict::SurvivalPredictRequest {
+            model: &model,
+            data: entry_data.view(),
+            col_map: &col_map,
+            training_headers: model.payload().training_headers.as_ref(),
+            primary_offset: &primary_offset,
+            noise_offset: &noise_offset,
+            time_grid: None,
+        };
+        let entry_result = gam::families::survival_predict::predict_survival(entry_req)
+            .map_err(ModelError::Predict)?;
+        let cumulative_hazard_entry = entry_result.cumulative_hazard.column(0).to_owned();
+
         let cumulative_incidence_entry =
             cumulative_hazard_entry.mapv(|c| 1.0 - (-c).exp());
         let cumulative_incidence_exit = cumulative_hazard_exit.mapv(|c| 1.0 - (-c).exp());
@@ -420,19 +451,9 @@ impl TrainedModel {
             (p / (1.0 - p)).ln()
         });
 
-        // Crude (cause-specific competing-risk) needs the companion mortality
-        // model surfaced via SavedModel — gam's SurvivalPredictResult does
-        // not expose that yet. v1: honor Net only.
-        match risk_type {
-            SurvivalRiskType::Net => {}
-            SurvivalRiskType::Crude => {
-                todo!(
-                    "Crude (competing-risk) survival prediction needs companion-model plumbing \
-                     that gam::families::survival_predict does not surface; revisit when gam \
-                     SurvivalPredictResult exposes the competing-risk hazards"
-                );
-            }
-        }
+        // Crude was rejected at the top of this function; only Net reaches
+        // here.
+        debug_assert!(matches!(risk_type, SurvivalRiskType::Net));
 
         Ok(SurvivalPrediction {
             cumulative_hazard_entry,
