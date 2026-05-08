@@ -150,13 +150,24 @@ theorem r2_small_when_within_dominates
   rw [h1, sub_div, div_self (h_varZ_pos.ne')]
   linarith [le_div_iff₀ h_varZ_pos |>.mpr (by linarith : (1 - δ) * varZ ≤ eVarZgivenD)]
 
+/-- **Squared coefficient of variation.** -/
+noncomputable def cv_sq {Ω : Type*} (E : ExpFunctional Ω) (Z : Ω → ℝ) : ℝ :=
+  variance E Z / (mean E Z)^2
+
 /-- **χ² coefficient of variation.**
     Squared prediction error ε² ~ σ² · χ²₁ has Var(ε²) = 2σ⁴ and E[ε²] = σ².
     So CV² = 2σ⁴/σ⁴ = 2, making individual errors inherently noisy. -/
-theorem squared_error_cv_is_two (sigma_sq : ℝ) (hσ : 0 < sigma_sq) :
-    2 * sigma_sq ^ 2 / sigma_sq ^ 2 = 2 := by
-  rw [mul_div_cancel_right₀]
-  exact pow_ne_zero 2 (hσ.ne')
+theorem squared_error_cv_is_two {Ω : Type*}
+    (E : ExpFunctional Ω)
+    (ε_sq : Ω → ℝ)
+    (σ_sq : ℝ)
+    (h_mean : mean E ε_sq = σ_sq)
+    (h_var : variance E ε_sq = 2 * σ_sq^2)
+    (hσ_pos : 0 < σ_sq) :
+    cv_sq E ε_sq = 2 := by
+  unfold cv_sq
+  rw [h_mean, h_var]
+  rw [mul_div_cancel_right₀ _ (pow_ne_zero 2 (ne_of_gt hσ_pos))]
 
 /-- **SES explains as much as genetic distance.**
     If both covariates explain comparable fractions and their total
