@@ -190,7 +190,9 @@ where
     }
 
     fn hard_call_packed(&mut self) -> Option<HardCallPacked<'_>> {
-        None
+        self.inner
+            .hard_call_packed()
+            .and_then(|packed| packed.with_model_gaps(&self.present_mask))
     }
 }
 
@@ -2042,6 +2044,7 @@ where
         Vec::new()
     };
     let mut block_variant_bytes: Vec<&[u8]> = Vec::with_capacity(block_variants);
+    let mut staged_packed_block = Vec::<u8>::new();
     let mut block_swapped = vec![false; block_variants];
 
     while processed < expected_variants {
@@ -2123,37 +2126,22 @@ where
 
         let mut used_gpu = false;
         let block_bytes_for_gpu = if packed_cuda.is_some() {
-            packed.slice(processed, filled)
+            if let Some(block_bytes) = packed.slice(processed, filled) {
+                Some(block_bytes)
+            } else {
+                if staged_packed_block.len() < packed_len {
+                    staged_packed_block.resize(packed_len, 0);
+                }
+                for (variant, bytes) in block_variant_bytes.iter().enumerate() {
+                    let start = variant * packed_bytes_per_variant(n_samples);
+                    let end = start + packed_bytes_per_variant(n_samples);
+                    staged_packed_block[start..end].copy_from_slice(bytes);
+                }
+                Some(&staged_packed_block[..packed_len])
+            }
         } else {
             None
         };
-        if packed_cuda.is_some() && block_bytes_for_gpu.is_none() {
-            if let Some(runtime) = packed_cuda.as_mut() {
-                if gpu_scores_active && !gpu_scores_flushed {
-                    let _ =
-                        runtime.copy_scores_to_host(n_samples, components, &mut scores_row_major);
-                    gpu_scores_flushed = true;
-                }
-                if gpu_missing_active {
-                    let _ = runtime.copy_missing_info_to_host(
-                        n_samples,
-                        packed_info_size,
-                        dense_missing_info_storage
-                            .as_mut()
-                            .expect("dense missing-info storage must exist when GPU is active"),
-                    );
-                    gpu_missing_active = false;
-                }
-            }
-            if !logged_cuda_fallback {
-                eprintln!(
-                    "> Projection backend switch: CPU (packed variant selection is not contiguous)"
-                );
-                logged_cuda_fallback = true;
-            }
-            packed_cuda = None;
-            gpu_scores_active = false;
-        }
         if let (Some(runtime), Some(block_bytes)) = (packed_cuda.as_mut(), block_bytes_for_gpu) {
             debug_assert_eq!(block_bytes.len(), packed_len);
 
@@ -3880,6 +3868,62 @@ mod tests {
             DenseBlockSource::new(&reduced_data, N_SAMPLES, 2).expect("reduced dense source");
         let mut gapped =
             GappedProjectionSource::new(inner, vec![true, false, true, false]).expect("gapped");
+        let wrapped = model
+            .projector()
+            .project_with_options(&mut gapped, &options)
+            .expect("gapped projection");
+
+        assert_mats_close(&explicit.scores, &wrapped.scores, 1e-6);
+        let explicit_alignment = explicit.alignment.expect("explicit alignment");
+        let wrapped_alignment = wrapped.alignment.expect("wrapped alignment");
+        assert_mats_close(&explicit_alignment, &wrapped_alignment, 1e-12);
+    }
+
+    #[test]
+    fn gapped_projection_source_preserves_packed_hardcall_path() {
+        let model = fit_example_model();
+        let mut full_data = sample_data();
+        set_variant_to_nan(&mut full_data, 1);
+        set_variant_to_nan(&mut full_data, 3);
+
+        let options = ProjectionOptions {
+            missing_axis_renormalization: true,
+            return_alignment: true,
+            on_zero_alignment: ZeroAlignmentAction::Zero,
+        };
+
+        let mut explicit_source =
+            DenseBlockSource::new(&full_data, N_SAMPLES, N_VARIANTS).expect("explicit source");
+        let explicit = model
+            .projector()
+            .project_with_options(&mut explicit_source, &options)
+            .expect("explicit projection");
+
+        let reduced_data = vec![
+            full_data[0],
+            full_data[1],
+            full_data[2],
+            full_data[2 * N_SAMPLES],
+            full_data[2 * N_SAMPLES + 1],
+            full_data[2 * N_SAMPLES + 2],
+        ];
+        let inner = PackedDenseBlockSource::new(reduced_data, N_SAMPLES, 2);
+        let mut gapped =
+            GappedProjectionSource::new(inner, vec![true, false, true, false]).expect("gapped");
+
+        let packed = gapped
+            .hard_call_packed()
+            .expect("gapped packed hard-call source");
+        assert_eq!(packed.n_variants(), N_VARIANTS);
+        assert!(
+            packed
+                .slice(1, 1)
+                .expect("gap bytes")
+                .iter()
+                .all(|&b| b == 0x55)
+        );
+        assert!(packed.slice(0, N_VARIANTS).is_none());
+
         let wrapped = model
             .projector()
             .project_with_options(&mut gapped, &options)

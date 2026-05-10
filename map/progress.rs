@@ -969,6 +969,163 @@ impl Drop for ConsoleProjectionProgress {
     }
 }
 
+fn projection_stage_label(stage: ProjectionProgressStage) -> &'static str {
+    match stage {
+        ProjectionProgressStage::Projection => "Projecting samples",
+    }
+}
+
+/// Periodic log-line projection progress for non-TTY/CI/Jupyter shells.
+///
+/// Throttled like `CiFitProgress`: at most one line per stage every
+/// `CI_LOG_INTERVAL`, or every `CI_LOG_PERCENT_THRESHOLD` percent of progress.
+pub struct CiProjectionProgress {
+    inner: Mutex<HashMap<ProjectionProgressStage, CiStageState>>,
+}
+
+impl CiProjectionProgress {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl Default for CiProjectionProgress {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ProjectionProgressObserver for CiProjectionProgress {
+    fn on_stage_start(&self, stage: ProjectionProgressStage, total_variants: usize) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.insert(stage, CiStageState::new(total_variants));
+        let label = projection_stage_label(stage);
+        if total_variants > 0 {
+            println!("[PCA] {label}... (0 / {total_variants} variants)");
+        } else {
+            println!("[PCA] {label}...");
+        }
+    }
+
+    fn on_stage_advance(&self, stage: ProjectionProgressStage, processed_variants: usize) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(state) = inner.get_mut(&stage) {
+            state.processed = processed_variants;
+            if state.should_log() {
+                let label = projection_stage_label(stage);
+                if let Some(total) = state.total {
+                    let percent = if total > 0 {
+                        (state.processed as f64 / total as f64) * 100.0
+                    } else {
+                        0.0
+                    };
+                    println!(
+                        "[PCA] {label}... {percent:.0}% ({} / {total} variants)",
+                        state.processed
+                    );
+                } else {
+                    println!("[PCA] {label}... {} variants", state.processed);
+                }
+                state.mark_logged();
+            }
+        }
+    }
+
+    fn on_stage_total(&self, stage: ProjectionProgressStage, total_variants: usize) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(state) = inner.get_mut(&stage)
+            && total_variants > 0
+        {
+            state.total = Some(total_variants);
+        }
+    }
+
+    fn on_stage_finish(&self, stage: ProjectionProgressStage) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(state) = inner.remove(&stage) {
+            let secs = state.started.elapsed().as_secs_f64();
+            let label = projection_stage_label(stage);
+            let count = state.total.unwrap_or(state.processed);
+            println!("[PCA] {label} complete ({count} variants, {secs:.1}s)");
+        }
+    }
+}
+
+/// Quiet projection progress: announce start and finish only.
+pub struct QuietProjectionProgress;
+
+impl QuietProjectionProgress {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for QuietProjectionProgress {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ProjectionProgressObserver for QuietProjectionProgress {
+    fn on_stage_start(&self, stage: ProjectionProgressStage, total_variants: usize) {
+        let label = projection_stage_label(stage);
+        if total_variants > 0 {
+            println!("[PCA] {label}... ({total_variants} variants)");
+        } else {
+            println!("[PCA] {label}...");
+        }
+    }
+
+    fn on_stage_finish(&self, stage: ProjectionProgressStage) {
+        let label = projection_stage_label(stage);
+        println!("[PCA] {label} complete.");
+    }
+}
+
+/// Adaptive projection progress that automatically selects the appropriate
+/// output mode based on the runtime environment.
+pub enum AdaptiveProjectionProgress {
+    Terminal(ConsoleProjectionProgress),
+    Ci(CiProjectionProgress),
+    Quiet(QuietProjectionProgress),
+}
+
+impl ProjectionProgressObserver for AdaptiveProjectionProgress {
+    fn on_stage_start(&self, stage: ProjectionProgressStage, total_variants: usize) {
+        match self {
+            Self::Terminal(p) => p.on_stage_start(stage, total_variants),
+            Self::Ci(p) => p.on_stage_start(stage, total_variants),
+            Self::Quiet(p) => p.on_stage_start(stage, total_variants),
+        }
+    }
+
+    fn on_stage_advance(&self, stage: ProjectionProgressStage, processed_variants: usize) {
+        match self {
+            Self::Terminal(p) => p.on_stage_advance(stage, processed_variants),
+            Self::Ci(p) => p.on_stage_advance(stage, processed_variants),
+            Self::Quiet(p) => p.on_stage_advance(stage, processed_variants),
+        }
+    }
+
+    fn on_stage_total(&self, stage: ProjectionProgressStage, total_variants: usize) {
+        match self {
+            Self::Terminal(p) => p.on_stage_total(stage, total_variants),
+            Self::Ci(p) => p.on_stage_total(stage, total_variants),
+            Self::Quiet(p) => p.on_stage_total(stage, total_variants),
+        }
+    }
+
+    fn on_stage_finish(&self, stage: ProjectionProgressStage) {
+        match self {
+            Self::Terminal(p) => p.on_stage_finish(stage),
+            Self::Ci(p) => p.on_stage_finish(stage),
+            Self::Quiet(p) => p.on_stage_finish(stage),
+        }
+    }
+}
+
 /// Adaptive progress observer that automatically selects the appropriate output
 /// mode based on the runtime environment.
 pub enum AdaptiveFitProgress {
@@ -1045,6 +1202,19 @@ pub fn fit_progress() -> Arc<AdaptiveFitProgress> {
     }
 }
 
-pub fn projection_progress() -> Arc<ConsoleProjectionProgress> {
-    Arc::new(ConsoleProjectionProgress::new())
+/// Create a projection progress observer appropriate for the current environment.
+///
+/// - In terminals: animated indicatif progress bar
+/// - In CI/Jupyter: periodic log lines (throttled to ~one per 10s or 5%)
+/// - In quiet mode: start/finish messages only
+pub fn projection_progress() -> Arc<AdaptiveProjectionProgress> {
+    match OutputMode::detect() {
+        OutputMode::Terminal => Arc::new(AdaptiveProjectionProgress::Terminal(
+            ConsoleProjectionProgress::new(),
+        )),
+        OutputMode::Ci => Arc::new(AdaptiveProjectionProgress::Ci(CiProjectionProgress::new())),
+        OutputMode::Quiet => Arc::new(AdaptiveProjectionProgress::Quiet(
+            QuietProjectionProgress::new(),
+        )),
+    }
 }

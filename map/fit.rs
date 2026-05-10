@@ -409,11 +409,14 @@ pub struct HardCallPacked<'a> {
     data: &'a [u8],
     bytes_per_variant: usize,
     physical_n_variants: usize,
-    selection: Option<&'a [usize]>,
-    match_kinds: Option<&'a [MatchKind]>,
+    selection: Option<Vec<usize>>,
+    match_kinds: Option<Vec<MatchKind>>,
+    missing_variant: Option<Vec<u8>>,
 }
 
 impl<'a> HardCallPacked<'a> {
+    const MISSING_VARIANT: usize = usize::MAX;
+
     pub(crate) fn new(data: &'a [u8], bytes_per_variant: usize, n_variants: usize) -> Self {
         Self {
             data,
@@ -421,6 +424,7 @@ impl<'a> HardCallPacked<'a> {
             physical_n_variants: n_variants,
             selection: None,
             match_kinds: None,
+            missing_variant: None,
         }
     }
 
@@ -435,23 +439,58 @@ impl<'a> HardCallPacked<'a> {
             data,
             bytes_per_variant,
             physical_n_variants,
-            selection: Some(selection),
-            match_kinds,
+            selection: Some(selection.to_vec()),
+            match_kinds: match_kinds.map(<[MatchKind]>::to_vec),
+            missing_variant: None,
         }
     }
 
-    pub(crate) fn slice(&self, start: usize, count: usize) -> Option<&'a [u8]> {
+    pub(crate) fn with_model_gaps(mut self, present_mask: &[bool]) -> Option<Self> {
+        let matched = present_mask.iter().filter(|&&present| present).count();
+        if matched != self.n_variants() {
+            return None;
+        }
+
+        let mut selection = Vec::with_capacity(present_mask.len());
+        let mut match_kinds = Vec::with_capacity(present_mask.len());
+        let mut inner_variant = 0usize;
+        for &present in present_mask {
+            if present {
+                selection.push(self.physical_variant(inner_variant)?);
+                match_kinds.push(self.match_kind(inner_variant));
+                inner_variant += 1;
+            } else {
+                selection.push(Self::MISSING_VARIANT);
+                match_kinds.push(MatchKind::Exact);
+            }
+        }
+
+        self.selection = Some(selection);
+        self.match_kinds = Some(match_kinds);
+        self.missing_variant = Some(vec![0x55; self.bytes_per_variant]);
+        Some(self)
+    }
+
+    pub(crate) fn slice(&self, start: usize, count: usize) -> Option<&[u8]> {
         if count == 0 {
             return Some(&self.data[..0]);
         }
-        let physical_start = if let Some(selection) = self.selection {
+        let physical_start = if let Some(selection) = self.selection.as_deref() {
             let end = start.checked_add(count)?;
             if end > selection.len() {
                 return None;
             }
             let base = *selection.get(start)?;
+            if base == Self::MISSING_VARIANT {
+                return if count == 1 {
+                    self.missing_variant.as_deref()
+                } else {
+                    None
+                };
+            }
             for offset in 1..count {
-                if selection[start + offset] != base + offset {
+                let physical = selection[start + offset];
+                if physical == Self::MISSING_VARIANT || physical != base + offset {
                     return None;
                 }
             }
@@ -473,14 +512,27 @@ impl<'a> HardCallPacked<'a> {
     }
 
     pub(crate) fn n_variants(&self) -> usize {
-        self.selection.map_or(self.physical_n_variants, |v| v.len())
+        self.selection
+            .as_deref()
+            .map_or(self.physical_n_variants, <[usize]>::len)
     }
 
     pub(crate) fn match_kind(&self, logical_variant: usize) -> MatchKind {
         self.match_kinds
+            .as_deref()
             .and_then(|kinds| kinds.get(logical_variant))
             .copied()
             .unwrap_or(MatchKind::Exact)
+    }
+
+    fn physical_variant(&self, logical_variant: usize) -> Option<usize> {
+        if let Some(selection) = self.selection.as_deref() {
+            selection.get(logical_variant).copied()
+        } else if logical_variant < self.physical_n_variants {
+            Some(logical_variant)
+        } else {
+            None
+        }
     }
 }
 
@@ -810,6 +862,7 @@ where
                 physical_n_variants: *n_variants,
                 selection: None,
                 match_kinds: None,
+                missing_variant: None,
             }),
             _ => None,
         }
