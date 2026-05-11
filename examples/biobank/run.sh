@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
-export PATH="$HOME/.local/bin:$PATH"
+export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
 export PYTHONUNBUFFERED=1
-export RUST_LOG="${RUST_LOG:-info}"
-export RUST_BACKTRACE="${RUST_BACKTRACE:-1}"
 
-command -v gnomon >/dev/null 2>&1 || bash "$HOME/gnomon/install.sh"
+# Build gnomon from this checkout so the panic-safe CUDA fallback in
+# score/cuda_backend.rs is what actually runs. Incremental rebuilds
+# are sub-second when nothing changed.
+command -v cargo >/dev/null 2>&1 \
+    || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --default-toolchain stable --profile minimal
+(cd "$HOME/gnomon" && cargo build --release --features 'map score calibrate terms' --bin gnomon)
+export GNOMON_BIN="$HOME/gnomon/target/release/gnomon"
 
-exec 2>&1
 uv run \
     --python 3.11 \
     --with gamfit \
