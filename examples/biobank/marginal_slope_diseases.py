@@ -43,10 +43,7 @@ PLINK_PREFIX = WORKDIR / "arrays"
 SEX_CACHE = Path.home() / ".aou_cache" / "sex_terms"
 NUM_PCS = 3
 DUCHON_CENTERS = 12  # > linear nullspace (d+1=4) in d=3
-N_TRAIN_CASES = 200
-N_TRAIN_CONTROLS = 200
-N_TEST_CASES = 200
-N_TEST_CONTROLS = 200
+TRAIN_FRACTION = 0.80  # per-class 80/20 split
 RNG_SEED = 0
 GNOMON_BIN = os.environ.get("GNOMON_BIN", "gnomon")
 PGS_ID_PATTERN = re.compile(r"^PGS\d{6}$")
@@ -350,13 +347,26 @@ def main() -> None:
             f"K={K:.6f}"
         )
 
-        n_te_case = min(N_TEST_CASES, max(0, len(case_idx) - N_TRAIN_CASES))
-        n_te_ctrl = min(N_TEST_CONTROLS, max(0, len(ctrl_idx) - N_TRAIN_CONTROLS))
-        train_pick = np.concatenate([case_idx[:N_TRAIN_CASES], ctrl_idx[:N_TRAIN_CONTROLS]])
-        test_pick = np.concatenate([
-            case_idx[N_TRAIN_CASES : N_TRAIN_CASES + n_te_case],
-            ctrl_idx[N_TRAIN_CONTROLS : N_TRAIN_CONTROLS + n_te_ctrl],
+        # Use ALL cases; subsample an equal number of controls (balanced); then
+        # per-class 80/20 train/test split so both splits stay 50/50 case/control.
+        n_cases = len(case_idx)
+        n_ctrl_sampled = min(n_cases, len(ctrl_idx))
+        ctrl_sampled = ctrl_idx[:n_ctrl_sampled]
+        n_train_per_class = int(round(n_cases * TRAIN_FRACTION))
+        n_train_ctrl = int(round(n_ctrl_sampled * TRAIN_FRACTION))
+        train_pick = np.concatenate([
+            case_idx[:n_train_per_class],
+            ctrl_sampled[:n_train_ctrl],
         ])
+        test_pick = np.concatenate([
+            case_idx[n_train_per_class:],
+            ctrl_sampled[n_train_ctrl:],
+        ])
+        print(
+            f"  split: balanced n={n_cases + n_ctrl_sampled:,}  "
+            f"train_cases={n_train_per_class:,} train_controls={n_train_ctrl:,}  "
+            f"test_cases={n_cases - n_train_per_class:,} test_controls={n_ctrl_sampled - n_train_ctrl:,}"
+        )
         train = df_full.loc[train_pick].reset_index(drop=True)
         test = df_full.loc[test_pick].reset_index(drop=True)
 

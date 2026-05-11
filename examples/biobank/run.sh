@@ -28,7 +28,7 @@ RESULTS="$RESULTS_DIR/biobank_run_${TS}.log"
   echo "results_file:     $RESULTS"
   echo
   echo "--- fit configuration (from script) ---"
-  grep -E '^(NUM_PCS|DUCHON_CENTERS|N_TRAIN_CASES|N_TRAIN_CONTROLS|N_TEST_CASES|N_TEST_CONTROLS|RNG_SEED) *=' \
+  grep -E '^(NUM_PCS|DUCHON_CENTERS|TRAIN_FRACTION|RNG_SEED) *=' \
       "$SCRIPT_DIR/marginal_slope_diseases.py"
   echo
   echo "--- diseases ---"
@@ -70,7 +70,7 @@ uv run \
   echo "=========================================================================="
   echo "=== SUMMARY (extracted)"
   echo "=========================================================================="
-  grep -E "^gamfit |^=== |^cohort:|^  pcs:|^  sex:|^  pgs:|^  snomed=|^  fit_spec:|^  PGS=|^  held-out" "$RESULTS" || echo "(no summary lines matched — fit likely failed; see full log above)"
+  grep -E "^gamfit |^=== |^cohort:|^  pcs:|^  sex:|^  pgs:|^  snomed=|^  split:|^  fit_spec:|^  PGS=|^  held-out" "$RESULTS" || echo "(no summary lines matched — fit likely failed; see full log above)"
   echo "=========================================================================="
   echo "Full log: $RESULTS"
 } | tee -a "$RESULTS"
