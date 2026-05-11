@@ -219,13 +219,13 @@ def fetch_cases(client: bigquery.Client, cdr: str, ancestor_id: int) -> set[str]
 # --- model -----------------------------------------------------------------
 
 def fit_marginal_slope(df: pd.DataFrame, num_pcs: int) -> gamfit.Model:
+    """Adds `prs_z` to `df` in place so predict() can reuse the same frame."""
     pcs = ", ".join(f"PC{i+1}" for i in range(num_pcs))
     duchon = f"duchon({pcs}, centers={DUCHON_CENTERS}, order=1, power=2, length_scale=1.0)"
-    z = (df["pgs"] - df["pgs"].mean()) / df["pgs"].std(ddof=0)
-    table = df[["case", "sex"] + [f"PC{i+1}" for i in range(num_pcs)]].copy()
-    table["prs_z"] = z.to_numpy()
+    df["prs_z"] = (df["pgs"] - df["pgs"].mean()) / df["pgs"].std(ddof=0)
+    cols = ["case", "sex", "prs_z"] + [f"PC{i+1}" for i in range(num_pcs)]
     return gamfit.fit(
-        table,
+        df[cols],
         f"case ~ {duchon} + sex",
         link="probit",
         z_column="prs_z",
