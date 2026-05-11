@@ -7,6 +7,8 @@ command -v gnomon >/dev/null 2>&1 || bash "$HOME/gnomon/install.sh"
 
 uv run \
     --python 3.11 \
+    --refresh-package gamfit \
+    --upgrade-package gamfit \
     --with gamfit \
     --with numpy \
     --with pandas \
