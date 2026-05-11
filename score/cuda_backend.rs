@@ -319,12 +319,26 @@ pub fn try_run_cuda(
         }
     };
 
-    let result = match &prep.pipeline_kind {
-        PipelineKind::SingleFile(path) => run_single_file_cuda(context, path, runtime)?,
-        PipelineKind::MultiFile(boundaries) => run_multi_file_cuda(context, boundaries, runtime)?,
-    };
+    // Wrap execution in catch_unwind so a panic from any cudarc layer — most
+    // commonly cudarc::nvrtc dlopen failing on hosts that have a CUDA driver
+    // and device files but no libnvrtc on the loader path — falls back to the
+    // CPU pipeline instead of aborting the process.
+    let cuda_result = catch_unwind(AssertUnwindSafe(|| match &prep.pipeline_kind {
+        PipelineKind::SingleFile(path) => run_single_file_cuda(context, path, runtime),
+        PipelineKind::MultiFile(boundaries) => run_multi_file_cuda(context, boundaries, runtime),
+    }));
 
-    Ok(Some(result))
+    match cuda_result {
+        Ok(Ok(scores)) => Ok(Some(scores)),
+        Ok(Err(e)) => Err(e),
+        Err(payload) => {
+            eprintln!(
+                "> Backend: CPU fallback (CUDA execution panicked: {})",
+                panic_payload_to_string(payload)
+            );
+            Ok(None)
+        }
+    }
 }
 
 fn cuda_driver_likely_available() -> bool {
