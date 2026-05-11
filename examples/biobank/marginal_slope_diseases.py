@@ -266,6 +266,8 @@ def metrics(y: np.ndarray, p: np.ndarray, K: float) -> dict[str, float]:
 # --- main ------------------------------------------------------------------
 
 def main() -> None:
+    print(f"gamfit version: {gamfit.__version__}")
+    print(f"gamfit build_info: {gamfit.build_info()}")
     diseases = {k: v for k, v in DISEASES.items() if PGS_ID_PATTERN.match(v["pgs"])}
     print(f"diseases with real PGS IDs: {list(diseases)}")
 
