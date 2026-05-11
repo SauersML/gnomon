@@ -36,11 +36,13 @@ DISEASES = {
         "icd10": ["J44.0", "J44.1", "J44.9"],
         "icd9": ["491", "492", "496"],
         "prevalence": 0.06,
+        "pgs": "PGS004536",  # Jung et al. metaPRS for J44; OR/SD=1.488 in UKB EUR.
     },
     "hypertension": {
         "icd10": ["I10", "I11", "I12", "I13", "I15"],
         "icd9": ["401", "402", "403", "404", "405"],
         "prevalence": 0.45,
+        "pgs": "PGSXXXXXX",  # TODO: pick a disease-only HTN PRS from the Catalog.
     },
     "obesity": {
         "icd10": [
@@ -49,6 +51,7 @@ DISEASES = {
         ],
         "icd9": ["278.00", "278.01", "278.03"],
         "prevalence": 0.42,
+        "pgs": "PGSXXXXXX",  # TODO: pick an obesity PRS from the Catalog.
     },
 }
 
@@ -133,23 +136,6 @@ def fetch_cases(icd10: list[str], icd9: list[str]) -> set[str]:
 
 # --- model ------------------------------------------------------------------
 
-def pick_best_pgs(df: pd.DataFrame, y: np.ndarray, pgs_cols: list[str]) -> tuple[str, float]:
-    scores = []
-    for c in pgs_cols:
-        x = df[c].to_numpy()
-        ok = np.isfinite(x)
-        if ok.sum() < 100 or y[ok].sum() < 50 or (1 - y[ok]).sum() < 50:
-            continue
-        try:
-            scores.append((roc_auc_score(y[ok], x[ok]), c))
-        except ValueError:
-            continue
-    if not scores:
-        raise RuntimeError("no PGS column had enough cases/controls")
-    scores.sort(reverse=True)
-    return scores[0][1], scores[0][0]
-
-
 def fit_marginal_slope(df: pd.DataFrame, pgs_col: str, num_pcs: int) -> gamfit.Model:
     pcs = ", ".join(f"PC{i+1}" for i in range(num_pcs))
     duchon = f"duchon({pcs}, centers={num_pcs + 1}, order=1, power=2, length_scale=1.0)"
@@ -195,25 +181,26 @@ def main() -> None:
     sex = load_sex()
     pgs = load_pgs_bulk()
     cohort = pcs.merge(sex, on="person_id").merge(pgs, on="person_id")
-    pgs_cols = [c for c in cohort.columns if c.endswith("_AVG")]
-    print(f"cohort: n={len(cohort):,}, pcs={NUM_PCS}, pgs_scores={len(pgs_cols)}")
+    print(f"cohort: n={len(cohort):,}, pcs={NUM_PCS}")
 
     for name, cfg in DISEASES.items():
         print(f"\n=== {name.upper()} ===")
+        pgs_id = cfg["pgs"]
+        col = f"{pgs_id}_AVG"
+        if col not in cohort.columns:
+            print(f"  [skip] {pgs_id} not present in the bulk score file")
+            continue
+
         cases = fetch_cases(cfg["icd10"], cfg["icd9"])
         y = cohort["person_id"].isin(cases).astype(int).to_numpy()
-        best_pgs, best_auc = pick_best_pgs(cohort, y, pgs_cols)
-        print(f"best PGS by single-feature AUROC: {best_pgs[:-4]}  (AUROC={best_auc:.4f})")
-
         df = cohort.copy()
         df["case"] = y
-        model = fit_marginal_slope(df, best_pgs, NUM_PCS)
+        model = fit_marginal_slope(df, col, NUM_PCS)
         p_hat = np.asarray(model.predict(df.drop(columns=["case"])), dtype=float)
         m = metrics(y, p_hat, cfg["prevalence"])
-        m["best_pgs"] = best_pgs[:-4]
         print(
-            f"  n={m['n']:,}  cases={m['cases']:,}  P={m['sample_prevalence']:.4f}  "
-            f"K={cfg['prevalence']:.3f}"
+            f"  PGS={pgs_id}  n={m['n']:,}  cases={m['cases']:,}  "
+            f"P={m['sample_prevalence']:.4f}  K={cfg['prevalence']:.3f}"
         )
         print(
             f"  AUROC={m['auroc']:.4f}  Nagelkerke R^2={m['nagelkerke_r2']:.4f}  "
