@@ -106,13 +106,14 @@ def load_pcs(num_pcs: int) -> pd.DataFrame:
     return df
 
 
-def load_pgs_bulk() -> pd.DataFrame:
-    path = _latest(WORKDIR, "arrays_pgs533_*.sscore")
-    df = pd.read_csv(path, sep="\t", dtype={0: str}, low_memory=False)
+def load_one_pgs(pgs_id: str) -> pd.DataFrame:
+    path = WORKDIR / f"arrays_{pgs_id}.sscore"
+    df = pd.read_csv(path, sep="\t", dtype={0: str})
     df = df.rename(columns={df.columns[0]: "person_id"})
     df["person_id"] = _canonical_id(df["person_id"])
-    n_scores = sum(c.endswith("_AVG") for c in df.columns)
-    print(f"  pgs:  n={len(df):,}  scores={n_scores}  e.g. {df['person_id'].head(3).tolist()}")
+    avg_col = next(c for c in df.columns if c.endswith("_AVG"))
+    df = df[["person_id", avg_col]].rename(columns={avg_col: "pgs"})
+    print(f"  pgs:  file={path.name}  n={len(df):,}")
     return df
 
 
@@ -162,10 +163,10 @@ def fetch_cases(client: bigquery.Client, cdr: str, ancestor_id: int) -> set[str]
 
 # --- model -----------------------------------------------------------------
 
-def fit_marginal_slope(df: pd.DataFrame, pgs_col: str, num_pcs: int) -> gamfit.Model:
+def fit_marginal_slope(df: pd.DataFrame, num_pcs: int) -> gamfit.Model:
     pcs = ", ".join(f"PC{i+1}" for i in range(num_pcs))
     duchon = f"duchon({pcs}, centers={num_pcs + 1}, order=1, power=2, length_scale=1.0)"
-    z = (df[pgs_col] - df[pgs_col].mean()) / df[pgs_col].std(ddof=0)
+    z = (df["pgs"] - df["pgs"].mean()) / df["pgs"].std(ddof=0)
     table = df[["case", "sex"] + [f"PC{i+1}" for i in range(num_pcs)]].copy()
     table["prs_z"] = z.to_numpy()
     return gamfit.fit(
@@ -202,26 +203,25 @@ def metrics(y: np.ndarray, p: np.ndarray, K: float) -> dict[str, float]:
 # --- main ------------------------------------------------------------------
 
 def main() -> None:
-    print("loading PCs, sex, and the 533-score bulk PGS file ...")
+    print("loading PCs and sex ...")
     pcs = load_pcs(NUM_PCS)
     sex = load_sex()
-    pgs = load_pgs_bulk()
-    cohort = pcs.merge(sex, on="person_id").merge(pgs, on="person_id")
-    print(f"cohort: n={len(cohort):,}")
+    base = pcs.merge(sex, on="person_id")
+    print(f"base: n={len(base):,}")
 
     cdr = os.environ["WORKSPACE_CDR"]
     client = bigquery.Client()
 
     for name, cfg in DISEASES.items():
         print(f"\n=== {name.upper()} ===")
-        col = f"{cfg['pgs']}_AVG"
+        pgs = load_one_pgs(cfg["pgs"])
+        df = base.merge(pgs, on="person_id")
         ancestor = lookup_snomed_concept(client, cdr, cfg["snomed_name"])
         cases = fetch_cases(client, cdr, ancestor)
         print(f"  snomed={cfg['snomed_name']!r}  concept_id={ancestor}  cases={len(cases):,}")
-        y = cohort["person_id"].isin(cases).astype(int).to_numpy()
-        df = cohort.copy()
-        df["case"] = y
-        model = fit_marginal_slope(df, col, NUM_PCS)
+        df["case"] = df["person_id"].isin(cases).astype(int)
+        y = df["case"].to_numpy()
+        model = fit_marginal_slope(df, NUM_PCS)
         p_hat = np.asarray(model.predict(df.drop(columns=["case"])), dtype=float)
         m = metrics(y, p_hat, cfg["prevalence"])
         print(
