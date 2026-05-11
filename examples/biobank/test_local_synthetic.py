@@ -79,17 +79,17 @@ def synth_cohort(rng: np.random.Generator, n: int, num_pcs: int,
 
 
 def fit_marginal_slope(train_df: pd.DataFrame, num_pcs: int) -> gamfit.Model:
-    """train_df is expected to already have a standardized `prs_z` column."""
+    """Plain binomial probit GAM — no marginal-slope kernel, so no score warp
+    and no link wiggle. `prs_z` enters as a linear term; PCs go through the
+    joint Duchon smooth. Anisotropy learning is off.
+    """
     pcs = ", ".join(f"PC{i+1}" for i in range(num_pcs))
     duchon = f"duchon({pcs}, centers={DUCHON_CENTERS}, order=0, power=2, length_scale=1.0)"
     cols = ["case", "sex", "prs_z"] + [f"PC{i+1}" for i in range(num_pcs)]
     return gamfit.fit(
         train_df[cols],
-        f"case ~ {duchon} + sex",
+        f"case ~ {duchon} + sex + prs_z",
         link="probit",
-        z_column="prs_z",
-        logslope_formula=duchon,
-        scale_dimensions=True,
     )
 
 
