@@ -24,7 +24,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-import gamfit
 import numpy as np
 import pandas as pd
 from google.cloud import bigquery
@@ -251,7 +250,7 @@ def fetch_cases(client: bigquery.Client, cdr: str, ancestor_id: int) -> set[str]
 
 # --- model -----------------------------------------------------------------
 
-def fit_marginal_slope(train_df: pd.DataFrame, num_pcs: int) -> gamfit.Model:
+def fit_marginal_slope(train_df: pd.DataFrame, num_pcs: int):  # -> gamfit.Model
     """Bernoulli marginal-slope probit GAM with joint Duchon over PCs in
     both the location and log-slope channels; sex linear; prs_z is the
     latent score (z_column) so its slope varies in PC space.
@@ -259,6 +258,7 @@ def fit_marginal_slope(train_df: pd.DataFrame, num_pcs: int) -> gamfit.Model:
     No linkwiggle(...) in either formula -> engine's score-warp / link-dev
     deviation blocks remain inactive in the protocol that this triggers.
     """
+    import gamfit  # lazy: lets the linear baseline import this module without dragging gamfit in
     pcs = ", ".join(f"PC{i+1}" for i in range(num_pcs))
     duchon = f"duchon({pcs}, centers={DUCHON_CENTERS}, order=1, power=2, length_scale=1.0)"
     formula = f"case ~ {duchon} + sex"
@@ -309,6 +309,7 @@ def metrics(y: np.ndarray, p: np.ndarray, K: float) -> dict[str, float]:
 # --- main ------------------------------------------------------------------
 
 def main() -> None:
+    import gamfit
     print(f"gamfit version: {gamfit.__version__}")
     print(f"gamfit build_info: {gamfit.build_info()}")
     diseases = {k: v for k, v in DISEASES.items() if PGS_ID_PATTERN.match(v["pgs"])}
