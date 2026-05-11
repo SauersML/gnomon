@@ -36,10 +36,10 @@ from sklearn.metrics import roc_auc_score
 NUM_PCS = 10
 DUCHON_CENTERS = 4 * NUM_PCS
 N_TOTAL = 20_000
-N_TRAIN_CASES = 100
-N_TRAIN_CONTROLS = 100
-N_TEST_CASES = 100
-N_TEST_CONTROLS = 100
+N_TRAIN_CASES = 200
+N_TRAIN_CONTROLS = 200
+N_TEST_CASES = 200
+N_TEST_CONTROLS = 200
 RNG_SEED = 0
 
 SCENARIOS = {
@@ -128,6 +128,7 @@ def fit_marginal_slope(train_df: pd.DataFrame, num_pcs: int) -> gamfit.Model:
         train_df[cols],
         f"case ~ {duchon} + sex + prs_z",
         link="probit",
+        scale_dimensions=True,
     )
 
 
