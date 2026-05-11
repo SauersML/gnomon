@@ -1,14 +1,6 @@
 #!/usr/bin/env bash
-# Bootstrap uv (if missing) and run the AoU marginal-slope disease script
-# with all required Python dependencies resolved on the fly.
 set -euo pipefail
-
-if ! command -v uv >/dev/null 2>&1; then
-    curl -LsSf https://astral.sh/uv/install.sh | sh
-    export PATH="$HOME/.local/bin:$PATH"
-fi
-
-SCRIPT_DIR="$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &>/dev/null && pwd )"
+export PATH="$HOME/.local/bin:$PATH"
 
 uv run \
     --python 3.11 \
@@ -21,4 +13,4 @@ uv run \
     --with google-cloud-bigquery \
     --with google-cloud-bigquery-storage \
     --with db-dtypes \
-    "$SCRIPT_DIR/marginal_slope_diseases.py"
+    "$(dirname -- "${BASH_SOURCE[0]}")/marginal_slope_diseases.py"

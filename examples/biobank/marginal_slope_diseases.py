@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """Fit Bernoulli marginal-slope GAMs on All of Us microarray data.
 
-Cases for each disease are every person with at least one
-`condition_occurrence` row whose `condition_concept_id` is a SNOMED
-descendant of the disease's parent concept (resolved via the OMOP/OHDSI
-`concept_ancestor` table). No ICD string matching, no count thresholds.
+For each disease the script:
+  1. Looks up the SNOMED standard Condition concept by name in the
+     OMOP/OHDSI `concept` table on the AoU CDR.
+  2. Pulls everyone whose `condition_occurrence.condition_concept_id`
+     descends from that concept via `concept_ancestor`.
+  3. Fits `case ~ duchon(PC1..PC10) + sex` with the hard-coded PGS
+     feeding the marginal-slope latent z, and the same joint anisotropic
+     Duchon smooth on the log-slope channel.
 
-For each disease we fit
-    case ~ duchon(PC1..PC10) + sex
-with the hard-coded PGS feeding the marginal-slope latent z, and the same
-joint anisotropic Duchon smooth on the log-slope channel. Reported:
-AUROC, Nagelkerke R^2, and Lee-2012 liability-scale R^2.
+Reported per disease: AUROC, Nagelkerke R^2, Lee-2012 liability R^2.
 """
 
 from __future__ import annotations
@@ -33,20 +33,17 @@ NUM_PCS = 10
 
 DISEASES = {
     "copd": {
-        # SNOMED 13645005 "Chronic obstructive lung disease"
-        "snomed_ancestor": 255573,
+        "snomed_name": "Chronic obstructive lung disease",
         "prevalence": 0.06,
         "pgs": "PGS004536",
     },
     "hypertension": {
-        # SNOMED 38341003 "Hypertensive disorder, systemic arterial"
-        "snomed_ancestor": 316866,
+        "snomed_name": "Hypertensive disorder, systemic arterial",
         "prevalence": 0.45,
         "pgs": "PGSXXXXXX",
     },
     "obesity": {
-        # SNOMED 414916001 "Obesity"
-        "snomed_ancestor": 433736,
+        "snomed_name": "Obesity",
         "prevalence": 0.42,
         "pgs": "PGSXXXXXX",
     },
@@ -63,14 +60,14 @@ def _latest(d: Path, glob: str) -> Path:
 
 
 def _canonical_id(s: pd.Series) -> pd.Series:
-    """Normalize PLINK / AoU person identifiers to the bare research_id."""
-    out = s.astype(str).str.strip()
-    split = out.str.split("_", n=1, expand=True)
-    if split.shape[1] == 2:
-        same = split[0] == split[1]
-        out = out.where(~same, split[1])
-    out = out.str.replace(r"\.0$", "", regex=True)
-    return out
+    return s.astype(str).str.strip()
+
+
+_SEX_MAP = {
+    "0": 0, "1": 1, "2": 0,
+    "f": 0, "female": 0, "m": 1, "male": 1,
+    "xx": 0, "xy": 1,
+}
 
 
 def load_sex() -> pd.DataFrame:
@@ -80,10 +77,10 @@ def load_sex() -> pd.DataFrame:
     sex_col = next(c for c in df.columns if "sex" in c.lower())
     out = pd.DataFrame({
         "person_id": _canonical_id(df[id_col]),
-        "sex": pd.to_numeric(df[sex_col], errors="coerce"),
+        "sex": df[sex_col].astype(str).str.strip().str.lower().map(_SEX_MAP),
     }).dropna()
-    out["sex"] = out["sex"].astype(int).clip(0, 1)
-    print(f"  sex:  n={len(out):,}  e.g. {out['person_id'].head(3).tolist()}")
+    out["sex"] = out["sex"].astype(int)
+    print(f"  sex:  file={path.name}  n={len(out):,}  e.g. {out['person_id'].head(3).tolist()}")
     return out
 
 
@@ -120,6 +117,30 @@ def load_pgs_bulk() -> pd.DataFrame:
 
 
 # --- cases -----------------------------------------------------------------
+
+def lookup_snomed_concept(client: bigquery.Client, cdr: str, name: str) -> int:
+    """Return the OMOP concept_id for a standard SNOMED Condition concept."""
+    sql = f"""
+    SELECT concept_id
+    FROM `{cdr}.concept`
+    WHERE vocabulary_id = 'SNOMED'
+      AND standard_concept = 'S'
+      AND domain_id = 'Condition'
+      AND LOWER(concept_name) = LOWER(@name)
+    ORDER BY concept_id
+    LIMIT 1
+    """
+    job = client.query(
+        sql,
+        job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("name", "STRING", name),
+        ]),
+    )
+    rows = list(job.result())
+    if not rows:
+        raise ValueError(f"no standard SNOMED Condition concept named {name!r}")
+    return int(rows[0]["concept_id"])
+
 
 def fetch_cases(client: bigquery.Client, cdr: str, ancestor_id: int) -> set[str]:
     """Persons with any condition concept descending from `ancestor_id`."""
@@ -186,14 +207,6 @@ def main() -> None:
     sex = load_sex()
     pgs = load_pgs_bulk()
     cohort = pcs.merge(sex, on="person_id").merge(pgs, on="person_id")
-    if cohort.empty:
-        sources = {"pcs": pcs, "sex": sex, "pgs": pgs}
-        for a in sources:
-            for b in sources:
-                if a < b:
-                    n = len(set(sources[a]["person_id"]) & set(sources[b]["person_id"]))
-                    print(f"  overlap {a}<->{b}: {n:,}")
-        raise RuntimeError("cohort merge produced 0 rows — ID formats differ across sources")
     print(f"cohort: n={len(cohort):,}")
 
     cdr = os.environ["WORKSPACE_CDR"]
@@ -202,11 +215,9 @@ def main() -> None:
     for name, cfg in DISEASES.items():
         print(f"\n=== {name.upper()} ===")
         col = f"{cfg['pgs']}_AVG"
-        if col not in cohort.columns:
-            print(f"  [skip] {cfg['pgs']} not present in bulk score file")
-            continue
-        cases = fetch_cases(client, cdr, cfg["snomed_ancestor"])
-        print(f"  cases: ancestor_concept_id={cfg['snomed_ancestor']}  n={len(cases):,}")
+        ancestor = lookup_snomed_concept(client, cdr, cfg["snomed_name"])
+        cases = fetch_cases(client, cdr, ancestor)
+        print(f"  snomed={cfg['snomed_name']!r}  concept_id={ancestor}  cases={len(cases):,}")
         y = cohort["person_id"].isin(cases).astype(int).to_numpy()
         df = cohort.copy()
         df["case"] = y
