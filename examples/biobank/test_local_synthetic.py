@@ -164,6 +164,8 @@ def metrics(y: np.ndarray, p: np.ndarray, K: float) -> dict[str, float]:
 
 
 def main() -> None:
+    print(f"gamfit version: {gamfit.__version__}")
+    print(f"gamfit build_info: {gamfit.build_info()}")
     rng = np.random.default_rng(RNG_SEED)
     for name, cfg in SCENARIOS.items():
         print(f"\n=== {name.upper()} (synthetic) ===")
