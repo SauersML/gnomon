@@ -70,7 +70,7 @@ uv run \
   echo "=========================================================================="
   echo "=== SUMMARY (extracted)"
   echo "=========================================================================="
-  grep -E "^=== |^cohort:|^  pcs:|^  sex:|^  pgs:|^  snomed=|^  PGS=|^  held-out" "$RESULTS" || echo "(no summary lines matched — fit likely failed; see full log above)"
+  grep -E "^gamfit |^=== |^cohort:|^  pcs:|^  sex:|^  pgs:|^  snomed=|^  fit_spec:|^  PGS=|^  held-out" "$RESULTS" || echo "(no summary lines matched — fit likely failed; see full log above)"
   echo "=========================================================================="
   echo "Full log: $RESULTS"
 } | tee -a "$RESULTS"

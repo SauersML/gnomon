@@ -43,10 +43,10 @@ N_TEST_CONTROLS = 200
 RNG_SEED = 0
 
 SCENARIOS = {
-    # pgs_effect is the true liability-scale slope per SD of standardized PGS.
-    # Under a probit liability model OR/SD ≈ exp(1.65 * pgs_effect), so:
-    #   copd-like         pgs_effect=0.30  -> OR/SD ≈ 1.65
-    #   hypertension-like pgs_effect=0.20  -> OR/SD ≈ 1.39
+    # `prevalence` here is the *target* prevalence used when synthesizing the
+    # cohort (threshold on the liability); the K passed to the Lee-2011
+    # transform is recomputed from the realized synthetic cohort (cases/n)
+    # so the metric uses the actually-observed prevalence, not a target.
     "copd-like":          {"prevalence": 0.06, "pgs_effect": 0.30},
     "hypertension-like":  {"prevalence": 0.45, "pgs_effect": 0.20},
 }
@@ -126,10 +126,15 @@ def fit_marginal_slope(train_df: pd.DataFrame, num_pcs: int) -> gamfit.Model:
     """
     pcs = ", ".join(f"PC{i+1}" for i in range(num_pcs))
     duchon = f"duchon({pcs}, centers={DUCHON_CENTERS}, order=1, power=2, length_scale=1.0)"
+    formula = f"case ~ {duchon} + sex"
     cols = ["case", "sex", "prs_z"] + [f"PC{i+1}" for i in range(num_pcs)]
+    print(f"  fit_spec: family=bernoulli marginal-slope  link=probit")
+    print(f"  fit_spec: formula={formula!r}")
+    print(f"  fit_spec: z_column='prs_z'  logslope_formula={duchon!r}")
+    print(f"  fit_spec: num_pcs={num_pcs}  duchon_centers={DUCHON_CENTERS}  n_train={len(train_df)}")
     return gamfit.fit(
         train_df[cols],
-        f"case ~ {duchon} + sex",
+        formula,
         link="probit",
         z_column="prs_z",
         logslope_formula=duchon,
@@ -172,7 +177,8 @@ def main() -> None:
         cohort = synth_cohort(rng, N_TOTAL, NUM_PCS, cfg["pgs_effect"], cfg["prevalence"])
         case_idx = rng.permutation(cohort.index[cohort["case"] == 1].to_numpy())
         ctrl_idx = rng.permutation(cohort.index[cohort["case"] == 0].to_numpy())
-        print(f"  synth: n={N_TOTAL:,}  cases={len(case_idx):,}  controls={len(ctrl_idx):,}")
+        K = len(case_idx) / max(1, len(case_idx) + len(ctrl_idx))
+        print(f"  synth: n={N_TOTAL:,}  cases={len(case_idx):,}  controls={len(ctrl_idx):,}  K={K:.6f}")
 
         n_te_case = min(N_TEST_CASES, max(0, len(case_idx) - N_TRAIN_CASES))
         n_te_ctrl = min(N_TEST_CONTROLS, max(0, len(ctrl_idx) - N_TRAIN_CONTROLS))
@@ -193,12 +199,12 @@ def main() -> None:
         predict_cols = ["sex", "prs_z"] + [f"PC{i+1}" for i in range(NUM_PCS)]
         pred = model.predict(test[predict_cols], return_type="dict")
         p_test = np.asarray(pred["mean"], dtype=float)
-        m = metrics(test["case"].to_numpy(), p_test, cfg["prevalence"])
+        m = metrics(test["case"].to_numpy(), p_test, K)
 
         print(
             f"  PGS effect (true)={cfg['pgs_effect']:.2f}  "
             f"train_n={len(train)}  test_n={m['n']}  test_cases={m['cases']}  "
-            f"P={m['P']:.4f}  K={cfg['prevalence']:.3f}"
+            f"P={m['P']:.4f}  K={K:.6f}"
         )
         print(
             f"  held-out  AUROC={m['auroc']:.4f}  "

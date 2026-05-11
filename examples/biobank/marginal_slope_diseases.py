@@ -54,21 +54,18 @@ PGS_ID_PATTERN = re.compile(r"^PGS\d{6}$")
 DISEASES = {
     "copd": {
         "snomed_name": "Chronic obstructive lung disease",
-        "prevalence": 0.06,
         # Jung et al. metaPRS for J44; OR/SD = 1.488 in UKB EUR. Not trained in AoU.
         "pgs": "PGS004536",
     },
     "hypertension": {
         # OMOP standard SNOMED concept_name for 38341003 in the AoU CDR.
         "snomed_name": "Hypertensive disorder",
-        "prevalence": 0.45,
         # Privé et al. 2022 sparse hypertension PRS; PGS-only AUROC 0.629 in
         # held-out UKB EUR. Not trained in AoU.
         "pgs": "PGS001320",
     },
     "obesity": {
         "snomed_name": "Obesity",
-        "prevalence": 0.42,
         # Kim et al. 2026 O_MetPRS_EUR; LDpred2 over multi-ancestry GWAS of 20
         # metabolic traits. OR=2.47, AUROC=0.728 for BMI>=30. AoU appears only
         # as an evaluation cohort, not training.
@@ -231,10 +228,15 @@ def fit_marginal_slope(train_df: pd.DataFrame, num_pcs: int) -> gamfit.Model:
     """
     pcs = ", ".join(f"PC{i+1}" for i in range(num_pcs))
     duchon = f"duchon({pcs}, centers={DUCHON_CENTERS}, order=1, power=2, length_scale=1.0)"
+    formula = f"case ~ {duchon} + sex"
     cols = ["case", "sex", "prs_z"] + [f"PC{i+1}" for i in range(num_pcs)]
+    print(f"  fit_spec: family=bernoulli marginal-slope  link=probit")
+    print(f"  fit_spec: formula={formula!r}")
+    print(f"  fit_spec: z_column='prs_z'  logslope_formula={duchon!r}")
+    print(f"  fit_spec: num_pcs={num_pcs}  duchon_centers={DUCHON_CENTERS}  n_train={len(train_df)}")
     return gamfit.fit(
         train_df[cols],
-        f"case ~ {duchon} + sex",
+        formula,
         link="probit",
         z_column="prs_z",
         logslope_formula=duchon,
@@ -301,9 +303,15 @@ def main() -> None:
         df_full["case"] = df_full["person_id"].isin(cases).astype(int)
         case_idx = rng.permutation(df_full.index[df_full["case"] == 1].to_numpy())
         ctrl_idx = rng.permutation(df_full.index[df_full["case"] == 0].to_numpy())
+        # Cohort prevalence: inferred from the actual merged cohort (PCs ∩ sex ∩
+        # PGS rows on disk), not a hardcoded literature number. Lee 2011 wants
+        # the population prevalence; for AoU we use the cohort prevalence as
+        # its best in-data estimate.
+        K = len(case_idx) / max(1, len(case_idx) + len(ctrl_idx))
         print(
             f"  snomed={cfg['snomed_name']!r}  concept_id={ancestor}  "
-            f"cases_in_cohort={len(case_idx):,}  controls_in_cohort={len(ctrl_idx):,}"
+            f"cases_in_cohort={len(case_idx):,}  controls_in_cohort={len(ctrl_idx):,}  "
+            f"K={K:.6f}"
         )
 
         n_te_case = min(N_TEST_CASES, max(0, len(case_idx) - N_TRAIN_CASES))
@@ -327,11 +335,11 @@ def main() -> None:
         predict_cols = ["sex", "prs_z"] + [f"PC{i+1}" for i in range(NUM_PCS)]
         pred = model.predict(test[predict_cols], return_type="dict")
         p_test = np.asarray(pred["mean"], dtype=float)
-        m = metrics(test["case"].to_numpy(), p_test, cfg["prevalence"])
+        m = metrics(test["case"].to_numpy(), p_test, K)
 
         print(
             f"  PGS={cfg['pgs']}  train_n={len(train):,}  test_n={m['n']:,}  "
-            f"test_cases={m['cases']:,}  P={m['P']:.4f}  K={cfg['prevalence']:.3f}"
+            f"test_cases={m['cases']:,}  P={m['P']:.4f}  K={K:.6f}"
         )
         print(
             f"  held-out  AUROC={m['auroc']:.4f}  "
