@@ -48,7 +48,10 @@ DISEASES = {
     "hypertension": {
         "snomed_name": "Hypertensive disorder, systemic arterial",
         "prevalence": 0.45,
-        "pgs": "PGSXXXXXX",
+        # PGS-only hypertension score from Privé et al. 2022 (269,704 UKB EUR;
+        # 91,884 cases / 177,820 controls). Catalog reports PGS-only AUROC
+        # 0.62908 in held-out UKB EUR. Not trained in AoU.
+        "pgs": "PGS001320",
     },
     "obesity": {
         "snomed_name": "Obesity",
