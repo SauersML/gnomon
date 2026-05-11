@@ -226,7 +226,7 @@ def fit_marginal_slope(train_df: pd.DataFrame, num_pcs: int) -> gamfit.Model:
     joint Duchon smooth. Anisotropy learning is off.
     """
     pcs = ", ".join(f"PC{i+1}" for i in range(num_pcs))
-    duchon = f"duchon({pcs}, centers={DUCHON_CENTERS}, order=1, power=2, length_scale=1.0)"
+    duchon = f"duchon({pcs}, centers={DUCHON_CENTERS}, order=0, power=2, length_scale=1.0)"
     cols = ["case", "sex", "prs_z"] + [f"PC{i+1}" for i in range(num_pcs)]
     return gamfit.fit(
         train_df[cols],
