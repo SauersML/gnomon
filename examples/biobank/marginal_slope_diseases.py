@@ -143,11 +143,7 @@ def ensure_scored(pgs_ids: list[str]) -> None:
         return
     score_arg = ",".join(missing)
     print(f"[score] running {GNOMON_BIN} score {score_arg} {PLINK_PREFIX}")
-    subprocess.run(
-        [GNOMON_BIN, "score", score_arg, str(PLINK_PREFIX)],
-        check=True,
-        env={**os.environ, "CUDA_VISIBLE_DEVICES": ""},
-    )
+    subprocess.run([GNOMON_BIN, "score", score_arg, str(PLINK_PREFIX)], check=True)
 
 
 def load_one_pgs(pgs_id: str) -> pd.DataFrame:
