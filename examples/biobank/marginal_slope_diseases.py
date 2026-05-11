@@ -42,7 +42,7 @@ WORKDIR = Path.home() / "aou-gpu-baremetal"
 PLINK_PREFIX = WORKDIR / "arrays"
 SEX_CACHE = Path.home() / ".aou_cache" / "sex_terms"
 NUM_PCS = 3
-DUCHON_CENTERS = 8  # > linear nullspace (d+1=4) in d=3; small for n=400
+DUCHON_CENTERS = 12  # > linear nullspace (d+1=4) in d=3
 N_TRAIN_CASES = 200
 N_TRAIN_CONTROLS = 200
 N_TEST_CASES = 200

@@ -6,9 +6,42 @@ export PYTHONUNBUFFERED=1
 command -v gnomon >/dev/null 2>&1 || bash "$HOME/gnomon/install.sh"
 
 SCRIPT_DIR="$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &>/dev/null && pwd )"
-RESULTS="$HOME/aou-gpu-baremetal/biobank_run_$(date -u +%Y%m%dT%H%M%SZ).log"
-mkdir -p "$(dirname "$RESULTS")"
+RESULTS_DIR="$HOME/aou-gpu-baremetal/biobank_results"
+mkdir -p "$RESULTS_DIR"
+TS=$(date -u +%Y%m%dT%H%M%SZ)
+RESULTS="$RESULTS_DIR/biobank_run_${TS}.log"
 
+# --- preamble ---------------------------------------------------------------
+{
+  echo "=========================================================================="
+  echo "biobank marginal-slope PRS validation run"
+  echo "=========================================================================="
+  echo "timestamp_utc:    $TS"
+  echo "host:             $(hostname)"
+  echo "user:             $(whoami)"
+  echo "git_rev:          $(git -C "$HOME/gnomon" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  echo "git_subject:      $(git -C "$HOME/gnomon" log -1 --format=%s 2>/dev/null || echo unknown)"
+  echo "gnomon_bin:       $(command -v gnomon)"
+  echo "gnomon_version:   $(gnomon --version 2>/dev/null | head -1 || echo unknown)"
+  echo "uv_version:       $(uv --version 2>/dev/null || echo unknown)"
+  echo "script:           $SCRIPT_DIR/marginal_slope_diseases.py"
+  echo "results_file:     $RESULTS"
+  echo
+  echo "--- fit configuration (from script) ---"
+  grep -E '^(NUM_PCS|DUCHON_CENTERS|N_TRAIN_CASES|N_TRAIN_CONTROLS|N_TEST_CASES|N_TEST_CONTROLS|RNG_SEED) *=' \
+      "$SCRIPT_DIR/marginal_slope_diseases.py"
+  echo
+  echo "--- diseases ---"
+  awk '/^DISEASES = \{/,/^\}/' "$SCRIPT_DIR/marginal_slope_diseases.py"
+  echo
+  echo "--- env ---"
+  echo "WORKSPACE_CDR:    ${WORKSPACE_CDR:-<unset>}"
+  echo "GOOGLE_PROJECT:   ${GOOGLE_PROJECT:-<unset>}"
+  echo "=========================================================================="
+  echo
+} | tee "$RESULTS"
+
+# --- the actual run ---------------------------------------------------------
 uv run \
     --python 3.11 \
     --refresh-package gamfit \
@@ -29,10 +62,15 @@ uv run \
     --with nvidia-cusparse-cu12 \
     --with nvidia-curand-cu12 \
     --with nvidia-nvjitlink-cu12 \
-    -- python -u "$SCRIPT_DIR/marginal_slope_diseases.py" 2>&1 | tee "$RESULTS"
+    -- python -u "$SCRIPT_DIR/marginal_slope_diseases.py" 2>&1 | tee -a "$RESULTS"
 
-echo
-echo "=========================================================================="
-echo "=== RESULTS FILE: $RESULTS"
-echo "=========================================================================="
-cat "$RESULTS"
+# --- extract just the summary lines ----------------------------------------
+{
+  echo
+  echo "=========================================================================="
+  echo "=== SUMMARY (extracted)"
+  echo "=========================================================================="
+  grep -E "^=== |^cohort:|^  pcs:|^  sex:|^  pgs:|^  snomed=|^  PGS=|^  held-out" "$RESULTS" || echo "(no summary lines matched — fit likely failed; see full log above)"
+  echo "=========================================================================="
+  echo "Full log: $RESULTS"
+} | tee -a "$RESULTS"
