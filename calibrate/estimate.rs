@@ -18,6 +18,9 @@ use gam::families::bernoulli_marginal_slope::{
 };
 use gam::families::custom_family::BlockwiseFitOptions;
 use gam::families::family_meta::inverse_link_to_binomial_family;
+use gam::families::gamlss::{
+    BlockwiseTermFitResult, GaussianLocationScaleFitResult, GaussianLocationScaleTermSpec,
+};
 use gam::families::lognormal_kernel::FrailtySpec;
 use gam::families::survival_marginal_slope::SurvivalMarginalSlopeTermSpec;
 use gam::families::bernoulli_marginal_slope::LatentMeasureKind;
@@ -27,14 +30,13 @@ use gam::inference::model::{
     SavedLatentZNormalization,
 };
 use gam::resource::ResourcePolicy;
-use gam::estimate::FitOptions;
 use gam::terms::smooth::{
     SpatialLengthScaleOptimizationOptions, TermCollectionSpec, freeze_term_collection_from_design,
 };
-use gam::types::{InverseLink, LikelihoodFamily, LinkFunction};
+use gam::types::{InverseLink, LikelihoodFamily, LinkFunction, WigglePenaltyConfig};
 use gam::{
-    BernoulliMarginalSlopeFitRequest, FitRequest, FitResult, StandardFitRequest,
-    SurvivalMarginalSlopeFitRequest, TransformationNormalFitRequest, fit_model,
+    BernoulliMarginalSlopeFitRequest, FitRequest, FitResult, GaussianLocationScaleFitRequest,
+    LinkWiggleConfig, SurvivalMarginalSlopeFitRequest, TransformationNormalFitRequest, fit_model,
 };
 
 use ndarray::{Array2, s};
@@ -105,28 +107,13 @@ fn default_blockwise_options() -> BlockwiseFitOptions {
     }
 }
 
-/// FitOptions tuned for Gaussian/Identity GAM via `FitRequest::Standard`,
-/// mirroring the canonical choices in `gam::main` for that family.
-fn default_gaussian_fit_options() -> FitOptions {
-    FitOptions {
-        latent_cloglog: None,
-        mixture_link: None,
-        optimize_mixture: false,
-        sas_link: None,
-        optimize_sas: false,
-        // Gaussian identity does not need posterior covariance for prediction
-        // (closed-form linear predictor); match gam::main's heuristic.
-        compute_inference: false,
-        max_iter: 200,
-        tol: 1e-7,
-        nullspace_dims: Vec::new(),
-        linear_constraints: None,
-        firth_bias_reduction: false,
-        adaptive_regularization: None,
-        penalty_shrinkage_floor: Some(1e-6),
-        rho_prior: Default::default(),
-        kronecker_penalty_system: None,
-        kronecker_factored: None,
+fn default_link_wiggle_config() -> LinkWiggleConfig {
+    let cfg = WigglePenaltyConfig::cubic_triple_operator_default();
+    LinkWiggleConfig {
+        degree: cfg.degree,
+        num_internal_knots: cfg.num_internal_knots,
+        penalty_orders: cfg.penalty_orders,
+        double_penalty: cfg.double_penalty,
     }
 }
 
@@ -205,32 +192,55 @@ fn ctn_prefit_latent_z(
     Ok(z)
 }
 
-/// Build a `FittedModelPayload` for an Identity-link (Gaussian) Standard fit.
-fn standard_gaussian_payload_from_fit(
-    fit: gam::estimate::UnifiedFitResult,
-    design: gam::terms::smooth::TermCollectionDesign,
-    resolvedspec: TermCollectionSpec,
+/// Build a `FittedModelPayload` for a Gaussian location-scale (GAMLSS) fit
+/// whose `μ` and `log σ` channels share the marginal Duchon-smooth layout and
+/// whose link wiggle (if present) carries the cubic triple-penalty block.
+fn gaussian_location_scale_payload_from_fit(
+    result: GaussianLocationScaleFitResult,
 ) -> Result<FittedModelPayload, EstimationError> {
-    let frozen = freeze_term_collection_from_design(&resolvedspec, &design)
+    let GaussianLocationScaleFitResult {
+        fit:
+            BlockwiseTermFitResult {
+                fit,
+                meanspec_resolved,
+                noisespec_resolved,
+                mean_design,
+                noise_design,
+            },
+        wiggle_knots,
+        wiggle_degree,
+        beta_link_wiggle,
+    } = result;
+    let frozen_mean = freeze_term_collection_from_design(&meanspec_resolved, &mean_design)
+        .map_err(|e| EstimationError::Gam(e.to_string()))?;
+    let frozen_noise = freeze_term_collection_from_design(&noisespec_resolved, &noise_design)
         .map_err(|e| EstimationError::Gam(e.to_string()))?;
     let likelihood = LikelihoodFamily::GaussianIdentity;
     let mut payload = FittedModelPayload::new(
         MODEL_PAYLOAD_VERSION,
-        "calibrate::standard-gaussian".to_string(),
-        ModelKind::Standard,
-        FittedFamily::Standard {
+        "calibrate::gaussian-location-scale".to_string(),
+        ModelKind::LocationScale,
+        FittedFamily::LocationScale {
             likelihood,
-            link: Some(LinkFunction::Identity),
-            latent_cloglog_state: None,
-            mixture_state: None,
-            sas_state: None,
+            base_link: Some(InverseLink::Standard(LinkFunction::Identity)),
         },
         likelihood.name().to_string(),
     );
     payload.unified = Some(fit.clone());
     payload.fit_result = Some(fit);
     payload.data_schema = Some(empty_data_schema());
-    payload.resolved_termspec = Some(frozen);
+    payload.resolved_termspec = Some(frozen_mean);
+    payload.resolved_termspec_noise = Some(frozen_noise);
+    payload.formula_noise = Some("calibrate::log_sigma".to_string());
+    if let Some(knots) = wiggle_knots {
+        payload.linkwiggle_knots = Some(knots.to_vec());
+    }
+    if let Some(degree) = wiggle_degree {
+        payload.linkwiggle_degree = Some(degree);
+    }
+    if let Some(beta) = beta_link_wiggle {
+        payload.beta_link_wiggle = Some(beta);
+    }
     Ok(payload)
 }
 
@@ -340,11 +350,11 @@ pub fn train_model(
     let pc_bases: Vec<_> = config.pc_configs.iter().map(|pc| pc.basis_config).collect();
 
     if matches!(link, LinkFunction::Identity) {
-        return train_gaussian_identity(data, config, &cols, &pc_bases);
+        return train_gaussian_location_scale(data, config, &cols, &pc_bases);
     }
     if !matches!(link, LinkFunction::Probit | LinkFunction::Logit) {
         return Err(EstimationError::Domain(format!(
-            "{link:?} link not yet wired in calibrate; supported: Identity (Gaussian Standard fit), Probit/Logit (Bernoulli marginal-slope)"
+            "{link:?} link not yet wired in calibrate; supported: Identity (Gaussian location-scale GAMLSS fit), Probit/Logit (Bernoulli marginal-slope)"
         )));
     }
 
@@ -419,14 +429,25 @@ pub fn train_model(
     })
 }
 
-/// Identity-link branch: a Gaussian additive model fitted via `FitRequest::Standard`.
-fn train_gaussian_identity(
+/// Identity-link branch: a GAMLSS Gaussian location-scale fit. The mean
+/// channel `μ(x)` and log-scale channel `log σ(x)` both use the marginal
+/// Duchon-smooth layout (PGS smooth + sex linear + per-PC smooths), with a
+/// shared cubic triple-penalty link wiggle so the conditional Gaussian can
+/// flex away from a strict additive form.
+fn train_gaussian_location_scale(
     data: &TrainingData,
     config: &ModelConfig,
     cols: &DataColumns,
     pc_bases: &[crate::calibrate::model::BasisConfig],
 ) -> Result<TrainedModel, EstimationError> {
-    let spec = build_marginal_termspec(
+    let meanspec = build_marginal_termspec(
+        cols.pgs_col,
+        cols.sex_col,
+        &cols.pc_cols,
+        &config.pgs_basis_config,
+        pc_bases,
+    );
+    let log_sigmaspec = build_marginal_termspec(
         cols.pgs_col,
         cols.sex_col,
         &cols.pc_cols,
@@ -434,28 +455,32 @@ fn train_gaussian_identity(
         pc_bases,
     );
     let n = data.y.len();
-    let request = StandardFitRequest {
+    let request = GaussianLocationScaleFitRequest {
         data: cols.matrix.view(),
-        y: data.y.clone(),
-        weights: data.weights.clone(),
-        offset: ndarray::Array1::<f64>::zeros(n),
-        spec,
-        family: LikelihoodFamily::GaussianIdentity,
-        options: default_gaussian_fit_options(),
+        spec: GaussianLocationScaleTermSpec {
+            y: data.y.clone(),
+            weights: data.weights.clone(),
+            meanspec,
+            log_sigmaspec,
+            mean_offset: ndarray::Array1::<f64>::zeros(n),
+            log_sigma_offset: ndarray::Array1::<f64>::zeros(n),
+        },
+        wiggle: Some(default_link_wiggle_config()),
+        options: default_blockwise_options(),
         kappa_options: SpatialLengthScaleOptimizationOptions::default(),
-        wiggle: None,
-        wiggle_options: None,
     };
-    let result = fit_model(FitRequest::Standard(request)).map_err(EstimationError::Gam)?;
+    let result =
+        fit_model(FitRequest::GaussianLocationScale(request)).map_err(EstimationError::Gam)?;
     let fit = match result {
-        FitResult::Standard(fit) => fit,
+        FitResult::GaussianLocationScale(fit) => fit,
         _ => {
             return Err(EstimationError::Gam(
-                "fit_model returned the wrong FitResult variant for Standard".to_string(),
+                "fit_model returned the wrong FitResult variant for GaussianLocationScale"
+                    .to_string(),
             ));
         }
     };
-    let saved = standard_gaussian_payload_from_fit(fit.fit, fit.design, fit.resolvedspec)?;
+    let saved = gaussian_location_scale_payload_from_fit(fit)?;
     Ok(TrainedModel {
         config: config.clone(),
         saved,
