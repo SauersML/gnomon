@@ -116,20 +116,23 @@ def synth_cohort(rng: np.random.Generator, n: int, num_pcs: int,
     })
 
 
-def fit_locscale(train_df: pd.DataFrame, num_pcs: int) -> gamfit.Model:
-    """Binomial location-scale (GAMLSS) probit GAM. Joint Duchon over PCs in
-    both the location and noise channels; sex and prs_z enter linearly.
-    Triggered by the `noise_formula` config key (gamfit 0.1.29 doesn't expose
-    it as a top-level kwarg yet)."""
+def fit_marginal_slope(train_df: pd.DataFrame, num_pcs: int) -> gamfit.Model:
+    """Bernoulli marginal-slope probit GAM with joint Duchon over PCs in
+    both the location and log-slope channels; sex linear; prs_z is the
+    latent score (z_column) so its slope varies in PC space.
+
+    No linkwiggle(...) in either formula -> engine's score-warp / link-dev
+    deviation blocks remain inactive in the protocol that this triggers.
+    """
     pcs = ", ".join(f"PC{i+1}" for i in range(num_pcs))
     duchon = f"duchon({pcs}, centers={DUCHON_CENTERS}, order=1, power=2, length_scale=1.0)"
-    formula = f"case ~ {duchon} + sex + prs_z"
     cols = ["case", "sex", "prs_z"] + [f"PC{i+1}" for i in range(num_pcs)]
     return gamfit.fit(
         train_df[cols],
-        formula,
+        f"case ~ {duchon} + sex",
         link="probit",
-        config={"noise_formula": formula.split("~", 1)[1].strip()},
+        z_column="prs_z",
+        logslope_formula=duchon,
     )
 
 
@@ -184,7 +187,7 @@ def main() -> None:
         train["prs_z"] = (train["pgs"] - pgs_mean) / pgs_std
         test["prs_z"] = (test["pgs"] - pgs_mean) / pgs_std
 
-        model = fit_locscale(train, NUM_PCS)
+        model = fit_marginal_slope(train, NUM_PCS)
         predict_cols = ["sex", "prs_z"] + [f"PC{i+1}" for i in range(NUM_PCS)]
         pred = model.predict(test[predict_cols], return_type="dict")
         p_test = np.asarray(pred["mean"], dtype=float)
