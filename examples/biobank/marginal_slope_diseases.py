@@ -52,26 +52,24 @@ GNOMON_BIN = os.environ.get("GNOMON_BIN", "gnomon")
 PGS_ID_PATTERN = re.compile(r"^PGS\d{6}$")
 
 DISEASES = {
+    # PGS IDs are the largest-training-cohort score per MONDO trait in the PGS
+    # Catalog. These are the same scores the AoU pipeline already ran, so the
+    # per-PGS arrays_<ID>.sscore files are already on disk and ensure_scored()
+    # will short-circuit instead of invoking gnomon.
     "copd": {
         "snomed_name": "Chronic obstructive lung disease",
         "prevalence": 0.06,
-        "pgs": "PGS004536",
+        "pgs": "PGS001783",  # MONDO_0005002, training cohort ~1.39M
     },
     "hypertension": {
         "snomed_name": "Hypertensive disorder, systemic arterial",
         "prevalence": 0.45,
-        # PGS-only hypertension score from Privé et al. 2022 (269,704 UKB EUR;
-        # 91,884 cases / 177,820 controls). Catalog reports PGS-only AUROC
-        # 0.62908 in held-out UKB EUR. Not trained in AoU.
-        "pgs": "PGS001320",
+        "pgs": "PGS004236",  # MONDO_0005044, training cohort ~1.10M
     },
     "obesity": {
         "snomed_name": "Obesity",
         "prevalence": 0.42,
-        # Kim et al. 2026 O_MetPRS_EUR; LDpred2 over multi-ancestry GWAS of 20
-        # metabolic traits. OR=2.47, AUROC=0.728 for BMI>=30 in the Catalog
-        # evaluation. AoU appears only as an evaluation cohort, not training.
-        "pgs": "PGS005331",
+        "pgs": "PGS005154",  # MONDO_0011122, training cohort ~845k
     },
 }
 
@@ -291,10 +289,8 @@ def main() -> None:
         ancestor = lookup_snomed_concept(client, cdr, cfg["snomed_name"])
         cases = fetch_cases(client, cdr, ancestor)
         df_full["case"] = df_full["person_id"].isin(cases).astype(int)
-        case_idx = df_full.index[df_full["case"] == 1].to_numpy()
-        ctrl_idx = df_full.index[df_full["case"] == 0].to_numpy()
-        rng.shuffle(case_idx)
-        rng.shuffle(ctrl_idx)
+        case_idx = rng.permutation(df_full.index[df_full["case"] == 1].to_numpy())
+        ctrl_idx = rng.permutation(df_full.index[df_full["case"] == 0].to_numpy())
         print(
             f"  snomed={cfg['snomed_name']!r}  concept_id={ancestor}  "
             f"cases_in_cohort={len(case_idx):,}  controls_in_cohort={len(ctrl_idx):,}"

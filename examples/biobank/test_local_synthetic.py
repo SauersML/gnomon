@@ -125,10 +125,8 @@ def main() -> None:
     for name, cfg in SCENARIOS.items():
         print(f"\n=== {name.upper()} (synthetic) ===")
         cohort = synth_cohort(rng, N_TOTAL, NUM_PCS, cfg["pgs_effect"], cfg["prevalence"])
-        case_idx = cohort.index[cohort["case"] == 1].to_numpy()
-        ctrl_idx = cohort.index[cohort["case"] == 0].to_numpy()
-        rng.shuffle(case_idx)
-        rng.shuffle(ctrl_idx)
+        case_idx = rng.permutation(cohort.index[cohort["case"] == 1].to_numpy())
+        ctrl_idx = rng.permutation(cohort.index[cohort["case"] == 0].to_numpy())
         print(f"  synth: n={N_TOTAL:,}  cases={len(case_idx):,}  controls={len(ctrl_idx):,}")
 
         n_te_case = min(N_TEST_CASES, max(0, len(case_idx) - N_TRAIN_CASES))
