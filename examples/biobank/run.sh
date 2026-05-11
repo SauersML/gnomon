@@ -19,5 +19,6 @@ uv run \
     --with scipy \
     --with scikit-learn \
     --with google-cloud-bigquery \
+    --with google-cloud-bigquery-storage \
     --with db-dtypes \
     "$SCRIPT_DIR/marginal_slope_diseases.py" "$@"

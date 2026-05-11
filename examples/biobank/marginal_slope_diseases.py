@@ -65,16 +65,30 @@ def _latest(pattern_dir: Path, glob: str) -> Path:
     return hits[-1]
 
 
+def _canonical_id(s: pd.Series) -> pd.Series:
+    """Normalize PLINK / AoU person identifiers to the bare research_id."""
+    out = s.astype(str).str.strip()
+    # PLINK FID_IID -> take the part after the underscore when both halves match
+    split = out.str.split("_", n=1, expand=True)
+    if split.shape[1] == 2:
+        same = split[0] == split[1]
+        out = out.where(~same, split[1])
+    # Strip trailing ".0" introduced by accidental float casts upstream.
+    out = out.str.replace(r"\.0$", "", regex=True)
+    return out
+
+
 def load_sex() -> pd.DataFrame:
     path = _latest(SEX_CACHE, "sex_*.tsv")
     df = pd.read_csv(path, sep="\t", dtype=str)
     id_col = next(c for c in df.columns if c.lower() in {"research_id", "sample_id", "iid", "person_id", "#iid"})
     sex_col = next(c for c in df.columns if "sex" in c.lower())
     out = pd.DataFrame({
-        "person_id": df[id_col].astype(str),
+        "person_id": _canonical_id(df[id_col]),
         "sex": pd.to_numeric(df[sex_col], errors="coerce"),
     }).dropna()
     out["sex"] = out["sex"].astype(int).clip(0, 1)
+    print(f"  sex: file={path.name} n={len(out):,} sample ids={out['person_id'].head(3).tolist()}")
     return out
 
 
@@ -99,7 +113,8 @@ def load_pcs(num_pcs: int) -> pd.DataFrame:
         blob = fh.read(string_bytes)
     ids = [blob[offsets[i]:offsets[i + 1]].decode() for i in range(count)]
     df = pd.DataFrame(data[:, :num_pcs], columns=[f"PC{i+1}" for i in range(num_pcs)])
-    df.insert(0, "person_id", ids)
+    df.insert(0, "person_id", _canonical_id(pd.Series(ids)))
+    print(f"  pcs: file={bin_path.name} n={len(df):,} sample ids={df['person_id'].head(3).tolist()}")
     return df
 
 
@@ -107,7 +122,8 @@ def load_pgs_bulk() -> pd.DataFrame:
     path = _latest(WORKDIR, "arrays_pgs533_*.sscore")
     df = pd.read_csv(path, sep="\t", dtype={0: str}, low_memory=False)
     df = df.rename(columns={df.columns[0]: "person_id"})
-    df["person_id"] = df["person_id"].astype(str)
+    df["person_id"] = _canonical_id(df["person_id"])
+    print(f"  pgs: file={path.name} n={len(df):,} cols={len(df.columns)} sample ids={df['person_id'].head(3).tolist()}")
     return df
 
 
@@ -181,6 +197,13 @@ def main() -> None:
     sex = load_sex()
     pgs = load_pgs_bulk()
     cohort = pcs.merge(sex, on="person_id").merge(pgs, on="person_id")
+    if cohort.empty:
+        sets = {"pcs": set(pcs["person_id"]), "sex": set(sex["person_id"]), "pgs": set(pgs["person_id"])}
+        for a in sets:
+            for b in sets:
+                if a < b:
+                    print(f"  overlap {a}<->{b}: {len(sets[a] & sets[b]):,}")
+        raise RuntimeError("cohort merge produced 0 rows — ID formats differ across sources")
     print(f"cohort: n={len(cohort):,}, pcs={NUM_PCS}")
 
     for name, cfg in DISEASES.items():
