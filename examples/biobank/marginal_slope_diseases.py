@@ -143,7 +143,14 @@ def ensure_scored(pgs_ids: list[str]) -> None:
         return
     score_arg = ",".join(missing)
     print(f"[score] running {GNOMON_BIN} score {score_arg} {PLINK_PREFIX}")
-    subprocess.run([GNOMON_BIN, "score", score_arg, str(PLINK_PREFIX)], check=True)
+    # AoU's CUDA image ships no libnvrtc, so gnomon's GPU path panics in cudarc
+    # before it can compile a kernel. CUDA_VISIBLE_DEVICES="" makes gnomon's
+    # cuda_driver_likely_available() return false and skip the GPU path entirely.
+    subprocess.run(
+        [GNOMON_BIN, "score", score_arg, str(PLINK_PREFIX)],
+        check=True,
+        env={**os.environ, "CUDA_VISIBLE_DEVICES": ""},
+    )
 
 
 def load_one_pgs(pgs_id: str) -> pd.DataFrame:
