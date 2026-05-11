@@ -52,24 +52,26 @@ GNOMON_BIN = os.environ.get("GNOMON_BIN", "gnomon")
 PGS_ID_PATTERN = re.compile(r"^PGS\d{6}$")
 
 DISEASES = {
-    # PGS IDs are the largest-training-cohort score per MONDO trait in the PGS
-    # Catalog. These are the same scores the AoU pipeline already ran, so the
-    # per-PGS arrays_<ID>.sscore files are already on disk and ensure_scored()
-    # will short-circuit instead of invoking gnomon.
     "copd": {
         "snomed_name": "Chronic obstructive lung disease",
         "prevalence": 0.06,
-        "pgs": "PGS001783",  # MONDO_0005002, training cohort ~1.39M
+        # Jung et al. metaPRS for J44; OR/SD = 1.488 in UKB EUR. Not trained in AoU.
+        "pgs": "PGS004536",
     },
     "hypertension": {
         "snomed_name": "Hypertensive disorder, systemic arterial",
         "prevalence": 0.45,
-        "pgs": "PGS004236",  # MONDO_0005044, training cohort ~1.10M
+        # Privé et al. 2022 sparse hypertension PRS; PGS-only AUROC 0.629 in
+        # held-out UKB EUR. Not trained in AoU.
+        "pgs": "PGS001320",
     },
     "obesity": {
         "snomed_name": "Obesity",
         "prevalence": 0.42,
-        "pgs": "PGS005154",  # MONDO_0011122, training cohort ~845k
+        # Kim et al. 2026 O_MetPRS_EUR; LDpred2 over multi-ancestry GWAS of 20
+        # metabolic traits. OR=2.47, AUROC=0.728 for BMI>=30. AoU appears only
+        # as an evaluation cohort, not training.
+        "pgs": "PGS005331",
     },
 }
 
@@ -224,7 +226,7 @@ def fit_marginal_slope(train_df: pd.DataFrame, num_pcs: int) -> gamfit.Model:
     joint Duchon smooth. Anisotropy learning is off.
     """
     pcs = ", ".join(f"PC{i+1}" for i in range(num_pcs))
-    duchon = f"duchon({pcs}, centers={DUCHON_CENTERS}, order=0, power=2, length_scale=1.0)"
+    duchon = f"duchon({pcs}, centers={DUCHON_CENTERS}, order=1, power=2, length_scale=1.0)"
     cols = ["case", "sex", "prs_z"] + [f"PC{i+1}" for i in range(num_pcs)]
     return gamfit.fit(
         train_df[cols],
