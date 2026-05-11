@@ -190,12 +190,21 @@ def load_one_pgs(pgs_id: str) -> pd.DataFrame:
             f"no sscore file in {WORKDIR} carries column {pgs_id}_AVG"
         )
     avg_col = f"{pgs_id}_AVG"
-    df = pd.read_csv(path, sep="\t", dtype={0: str}, low_memory=False)
-    df = df.rename(columns={df.columns[0]: "person_id"})
+    # Some hits are the 1+ GB bulk 533-PGS file; only read the id col + the
+    # one PGS column so the load is fast regardless of file width.
+    with path.open() as fh:
+        id_col = fh.readline().rstrip("\n").split("\t")[0]
+    print(f"  pgs:  file={path.name}  col={avg_col}  reading ...", flush=True)
+    df = pd.read_csv(
+        path,
+        sep="\t",
+        usecols=[id_col, avg_col],
+        dtype={id_col: str, avg_col: float},
+        low_memory=False,
+    )
+    df = df.rename(columns={id_col: "person_id", avg_col: "pgs"})
     df["person_id"] = _canonical_id(df["person_id"])
-    df = df[["person_id", avg_col]].rename(columns={avg_col: "pgs"})
-    df["pgs"] = pd.to_numeric(df["pgs"], errors="coerce")
-    print(f"  pgs:  file={path.name}  col={avg_col}  n={len(df):,}")
+    print(f"  pgs:  file={path.name}  col={avg_col}  n={len(df):,}", flush=True)
     return df
 
 
