@@ -16,11 +16,13 @@ Reported per disease: AUROC, Nagelkerke R^2, Lee-2012 liability R^2.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
 import struct
 import subprocess
+import sys
 import urllib.request
 from pathlib import Path
 
@@ -30,6 +32,13 @@ import pandas as pd
 from google.cloud import bigquery
 from scipy.stats import norm
 from sklearn.metrics import roc_auc_score
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    stream=sys.stdout,
+    force=True,
+)
 
 WORKDIR = Path.home() / "aou-gpu-baremetal"
 PLINK_PREFIX = WORKDIR / "arrays"

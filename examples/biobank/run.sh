@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
+export PYTHONUNBUFFERED=1
+export RUST_LOG="${RUST_LOG:-info}"
+export RUST_BACKTRACE="${RUST_BACKTRACE:-1}"
 
+exec 2>&1
 uv run \
     --python 3.11 \
     --with gamfit \
@@ -13,4 +17,4 @@ uv run \
     --with google-cloud-bigquery \
     --with google-cloud-bigquery-storage \
     --with db-dtypes \
-    "$(dirname -- "${BASH_SOURCE[0]}")/marginal_slope_diseases.py"
+    -- python -u "$(dirname -- "${BASH_SOURCE[0]}")/marginal_slope_diseases.py"
