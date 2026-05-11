@@ -142,16 +142,22 @@ def ensure_scored(pgs_ids: list[str]) -> None:
     if not missing:
         return
     score_arg = ",".join(missing)
-    # AoU's CUDA image ships no libnvrtc, so feed gnomon the one from the
-    # `nvidia-cuda-nvrtc-cu12` pip wheel (already installed in the uv env) as
-    # LD_LIBRARY_PATH on the score subprocess only.
-    import nvidia.cuda_nvrtc  # type: ignore[import-not-found]
-    nvrtc_lib = str(Path(nvidia.cuda_nvrtc.__path__[0]) / "lib")
+    # AoU's CUDA image ships only driver + cudart, so feed gnomon every CUDA
+    # runtime shared library shipped by the `nvidia-*-cu12` pip wheels via the
+    # score subprocess's LD_LIBRARY_PATH.
+    import nvidia  # type: ignore[import-not-found]
+    nv_libs = [
+        str(child / "lib")
+        for parent in nvidia.__path__
+        for child in Path(parent).iterdir()
+        if (child / "lib").is_dir()
+    ]
     env = {
         **os.environ,
-        "LD_LIBRARY_PATH": nvrtc_lib + ":" + os.environ.get("LD_LIBRARY_PATH", ""),
+        "LD_LIBRARY_PATH": ":".join([*nv_libs, os.environ.get("LD_LIBRARY_PATH", "")]),
     }
-    print(f"[score] running {GNOMON_BIN} score {score_arg} {PLINK_PREFIX}  (nvrtc={nvrtc_lib})")
+    print(f"[score] running {GNOMON_BIN} score {score_arg} {PLINK_PREFIX}")
+    print(f"[score] cuda libs: {nv_libs}")
     subprocess.run([GNOMON_BIN, "score", score_arg, str(PLINK_PREFIX)], check=True, env=env)
 
 

@@ -17,4 +17,10 @@ uv run \
     --with google-cloud-bigquery-storage \
     --with db-dtypes \
     --with nvidia-cuda-nvrtc-cu12 \
+    --with nvidia-cuda-runtime-cu12 \
+    --with nvidia-cublas-cu12 \
+    --with nvidia-cusolver-cu12 \
+    --with nvidia-cusparse-cu12 \
+    --with nvidia-curand-cu12 \
+    --with nvidia-nvjitlink-cu12 \
     -- python -u "$(dirname -- "${BASH_SOURCE[0]}")/marginal_slope_diseases.py"
