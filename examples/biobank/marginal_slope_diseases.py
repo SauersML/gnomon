@@ -17,7 +17,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shutil
 import struct
+import subprocess
+import urllib.request
 from pathlib import Path
 
 import gamfit
@@ -28,8 +32,12 @@ from scipy.stats import norm
 from sklearn.metrics import roc_auc_score
 
 WORKDIR = Path.home() / "aou-gpu-baremetal"
+PLINK_PREFIX = WORKDIR / "arrays"
 SEX_CACHE = Path.home() / ".aou_cache" / "sex_terms"
 NUM_PCS = 10
+DUCHON_CENTERS = 4 * NUM_PCS  # > polynomial nullspace dim (d+1) for Linear in d=10
+GNOMON_BIN = os.environ.get("GNOMON_BIN", "gnomon")
+PGS_ID_PATTERN = re.compile(r"^PGS\d{6}$")
 
 DISEASES = {
     "copd": {
@@ -106,6 +114,28 @@ def load_pcs(num_pcs: int) -> pd.DataFrame:
     return df
 
 
+def ensure_scored(pgs_ids: list[str]) -> None:
+    """Run a single `gnomon score` call for any PGS that lacks an sscore file."""
+    missing = [p for p in pgs_ids if not (WORKDIR / f"arrays_{p}.sscore").exists()]
+    if not missing:
+        return
+    print(f"[score] missing per-PGS sscore for: {missing}")
+    tmp = WORKDIR / ".gamfit_pgs_tmp"
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir()
+    for pgs in missing:
+        url = (
+            "https://ftp.ebi.ac.uk/pub/databases/spot/pgs/scores/"
+            f"{pgs}/ScoringFiles/Harmonized/{pgs}_hmPOS_GRCh38.txt.gz"
+        )
+        dst = tmp / f"{pgs}_hmPOS_GRCh38.txt.gz"
+        print(f"[score] downloading {url}")
+        urllib.request.urlretrieve(url, dst)
+    print(f"[score] running {GNOMON_BIN} score {tmp} {PLINK_PREFIX}")
+    subprocess.run([GNOMON_BIN, "score", str(tmp), str(PLINK_PREFIX)], check=True)
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
 def load_one_pgs(pgs_id: str) -> pd.DataFrame:
     path = WORKDIR / f"arrays_{pgs_id}.sscore"
     df = pd.read_csv(path, sep="\t", dtype={0: str})
@@ -165,7 +195,7 @@ def fetch_cases(client: bigquery.Client, cdr: str, ancestor_id: int) -> set[str]
 
 def fit_marginal_slope(df: pd.DataFrame, num_pcs: int) -> gamfit.Model:
     pcs = ", ".join(f"PC{i+1}" for i in range(num_pcs))
-    duchon = f"duchon({pcs}, centers={num_pcs + 1}, order=1, power=2, length_scale=1.0)"
+    duchon = f"duchon({pcs}, centers={DUCHON_CENTERS}, order=1, power=2, length_scale=1.0)"
     z = (df["pgs"] - df["pgs"].mean()) / df["pgs"].std(ddof=0)
     table = df[["case", "sex"] + [f"PC{i+1}" for i in range(num_pcs)]].copy()
     table["prs_z"] = z.to_numpy()
@@ -203,6 +233,11 @@ def metrics(y: np.ndarray, p: np.ndarray, K: float) -> dict[str, float]:
 # --- main ------------------------------------------------------------------
 
 def main() -> None:
+    diseases = {k: v for k, v in DISEASES.items() if PGS_ID_PATTERN.match(v["pgs"])}
+    print(f"diseases with real PGS IDs: {list(diseases)}")
+
+    ensure_scored([cfg["pgs"] for cfg in diseases.values()])
+
     print("loading PCs and sex ...")
     pcs = load_pcs(NUM_PCS)
     sex = load_sex()
@@ -212,7 +247,7 @@ def main() -> None:
     cdr = os.environ["WORKSPACE_CDR"]
     client = bigquery.Client()
 
-    for name, cfg in DISEASES.items():
+    for name, cfg in diseases.items():
         print(f"\n=== {name.upper()} ===")
         pgs = load_one_pgs(cfg["pgs"])
         df = base.merge(pgs, on="person_id")
