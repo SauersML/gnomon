@@ -184,7 +184,8 @@ def main() -> None:
 
         model = fit_marginal_slope(train, NUM_PCS)
         predict_cols = ["sex", "prs_z"] + [f"PC{i+1}" for i in range(NUM_PCS)]
-        p_test = np.asarray(model.predict(test[predict_cols]), dtype=float)
+        pred = model.predict(test[predict_cols], return_type="dict")
+        p_test = np.asarray(pred["mean"], dtype=float)
         m = metrics(test["case"].to_numpy(), p_test, cfg["prevalence"])
 
         print(
