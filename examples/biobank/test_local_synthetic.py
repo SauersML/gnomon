@@ -43,27 +43,65 @@ N_TEST_CONTROLS = 100
 RNG_SEED = 0
 
 SCENARIOS = {
-    "copd-like":          {"prevalence": 0.06, "pgs_effect": 0.6},
-    "hypertension-like":  {"prevalence": 0.45, "pgs_effect": 0.3},
-    "obesity-like":       {"prevalence": 0.42, "pgs_effect": 0.5},
+    # pgs_effect is the true liability-scale slope per SD of standardized PGS.
+    # Under a probit liability model OR/SD ≈ exp(1.65 * pgs_effect), so:
+    #   copd-like         pgs_effect=0.30  -> OR/SD ≈ 1.65
+    #   hypertension-like pgs_effect=0.20  -> OR/SD ≈ 1.39
+    "copd-like":          {"prevalence": 0.06, "pgs_effect": 0.30},
+    "hypertension-like":  {"prevalence": 0.45, "pgs_effect": 0.20},
 }
+
+# Rough All-of-Us-like ancestry composition for the four "EUR/AFR/AMR/EAS" buckets.
+ANCESTRY_FRACTIONS = np.array([0.70, 0.15, 0.10, 0.05])
 
 
 def synth_cohort(rng: np.random.Generator, n: int, num_pcs: int,
                  pgs_effect: float, prevalence: float) -> pd.DataFrame:
-    """Synthesize a cohort with PGS that depends on PCs+sex (stratification)
-    and a probit-scale liability that mixes PCs, sex, and the true PGS effect."""
-    pcs = rng.standard_normal((n, num_pcs))
+    """Multi-cluster ancestry mixture with realistic PC + PGS structure.
+
+    Top PCs separate the four ancestry clusters; deeper PCs decay to nearly
+    pure within-cluster noise. PGS has cluster-dependent mean (population
+    stratification) plus a per-person noise term. Liability is a probit-scale
+    mix of cluster baseline risk, PC effects that decay with PC index, sex,
+    the true PGS effect, and N(0,1) residual.
+    """
+    n_clusters = len(ANCESTRY_FRACTIONS)
+    cluster = rng.choice(n_clusters, size=n, p=ANCESTRY_FRACTIONS)
+
+    # Cluster centroids in PC space: PC1/PC2 strongly separate, PC3/PC4
+    # weakly separate, PC5+ essentially no ancestry signal.
+    centroids = np.zeros((n_clusters, num_pcs))
+    centroids[:, 0] = [1.5, -2.5, 0.8, -0.5]
+    if num_pcs >= 2:
+        centroids[:, 1] = [0.0, 1.2, -1.8, 0.3]
+    if num_pcs >= 3:
+        centroids[:, 2] = [0.3, -0.4, 0.1, 0.2]
+    if num_pcs >= 4:
+        centroids[:, 3] = [-0.1, 0.2, 0.3, -0.2]
+    if num_pcs >= 5:
+        centroids[:, 4:] = rng.standard_normal((n_clusters, num_pcs - 4)) * 0.05
+
+    # Within-cluster spread shrinks as PC index grows.
+    pc_sd = 1.0 / np.sqrt(np.arange(1, num_pcs + 1))
+    pc_sd /= pc_sd.mean()
+    pcs = centroids[cluster] + rng.standard_normal((n, num_pcs)) * pc_sd
+
     sex = rng.integers(0, 2, size=n)
 
-    pgs_loadings = rng.standard_normal(num_pcs) * 0.3
-    pgs_raw = pcs @ pgs_loadings + 0.15 * sex + rng.standard_normal(n)
+    # PGS: cluster-dependent mean (stratification) + sex tilt + noise, then
+    # standardized so prs_z is genuinely centered on the cohort.
+    cluster_pgs_mean = np.array([0.30, -0.40, 0.10, -0.20])
+    pgs_raw = cluster_pgs_mean[cluster] + 0.10 * sex + rng.standard_normal(n)
     pgs = (pgs_raw - pgs_raw.mean()) / pgs_raw.std()
 
-    pc_effects = rng.standard_normal(num_pcs) * 0.2
+    # Liability: cluster baseline + PC effects with decay + sex + PGS + noise.
+    cluster_liab_offset = np.array([0.0, 0.15, -0.05, 0.25])
+    pc_effect_scale = 1.0 / np.sqrt(np.arange(1, num_pcs + 1))
+    pc_effects = rng.standard_normal(num_pcs) * 0.20 * pc_effect_scale
     liability = (
-        pcs @ pc_effects
-        + 0.1 * sex
+        cluster_liab_offset[cluster]
+        + pcs @ pc_effects
+        + 0.10 * sex
         + pgs_effect * pgs
         + rng.standard_normal(n)
     )

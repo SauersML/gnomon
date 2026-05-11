@@ -65,14 +65,6 @@ DISEASES = {
         # held-out UKB EUR. Not trained in AoU.
         "pgs": "PGS001320",
     },
-    "obesity": {
-        "snomed_name": "Obesity",
-        "prevalence": 0.42,
-        # Kim et al. 2026 O_MetPRS_EUR; LDpred2 over multi-ancestry GWAS of 20
-        # metabolic traits. OR=2.47, AUROC=0.728 for BMI>=30. AoU appears only
-        # as an evaluation cohort, not training.
-        "pgs": "PGS005331",
-    },
 }
 
 
