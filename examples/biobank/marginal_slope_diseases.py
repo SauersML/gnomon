@@ -228,7 +228,6 @@ def fit_marginal_slope(train_df: pd.DataFrame, num_pcs: int) -> gamfit.Model:
         link="probit",
         z_column="prs_z",
         logslope_formula=duchon,
-        scale_dimensions=True,
     )
 
 
