@@ -142,15 +142,17 @@ def ensure_scored(pgs_ids: list[str]) -> None:
     if not missing:
         return
     score_arg = ",".join(missing)
-    print(f"[score] running {GNOMON_BIN} score {score_arg} {PLINK_PREFIX}")
-    # AoU's CUDA image ships no libnvrtc, so gnomon's GPU path panics in cudarc
-    # before it can compile a kernel. CUDA_VISIBLE_DEVICES="" makes gnomon's
-    # cuda_driver_likely_available() return false and skip the GPU path entirely.
-    subprocess.run(
-        [GNOMON_BIN, "score", score_arg, str(PLINK_PREFIX)],
-        check=True,
-        env={**os.environ, "CUDA_VISIBLE_DEVICES": ""},
-    )
+    # AoU's CUDA image ships no libnvrtc, so feed gnomon the one from the
+    # `nvidia-cuda-nvrtc-cu12` pip wheel (already installed in the uv env) as
+    # LD_LIBRARY_PATH on the score subprocess only.
+    import nvidia.cuda_nvrtc  # type: ignore[import-not-found]
+    nvrtc_lib = str(Path(nvidia.cuda_nvrtc.__path__[0]) / "lib")
+    env = {
+        **os.environ,
+        "LD_LIBRARY_PATH": nvrtc_lib + ":" + os.environ.get("LD_LIBRARY_PATH", ""),
+    }
+    print(f"[score] running {GNOMON_BIN} score {score_arg} {PLINK_PREFIX}  (nvrtc={nvrtc_lib})")
+    subprocess.run([GNOMON_BIN, "score", score_arg, str(PLINK_PREFIX)], check=True, env=env)
 
 
 def load_one_pgs(pgs_id: str) -> pd.DataFrame:
