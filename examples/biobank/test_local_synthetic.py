@@ -117,17 +117,20 @@ def synth_cohort(rng: np.random.Generator, n: int, num_pcs: int,
 
 
 def fit_marginal_slope(train_df: pd.DataFrame, num_pcs: int) -> gamfit.Model:
-    """Plain binomial probit GAM — no marginal-slope kernel, so no score warp
-    and no link wiggle. `prs_z` enters as a linear term; PCs go through the
-    joint Duchon smooth. Anisotropy learning is off.
+    """Bernoulli marginal-slope GAM. Score-warp and link-wiggle are gated by
+    the formula DSL (gamfit workflow.rs:270-278): they activate only when
+    `linkwiggle(...)` appears in the relevant formula, so omitting it here
+    leaves both score_warp and link_dev as None.
     """
     pcs = ", ".join(f"PC{i+1}" for i in range(num_pcs))
     duchon = f"duchon({pcs}, centers={DUCHON_CENTERS}, order=1, power=2, length_scale=1.0)"
     cols = ["case", "sex", "prs_z"] + [f"PC{i+1}" for i in range(num_pcs)]
     return gamfit.fit(
         train_df[cols],
-        f"case ~ {duchon} + sex + prs_z",
+        f"case ~ {duchon} + sex",
         link="probit",
+        z_column="prs_z",
+        logslope_formula=duchon,
         scale_dimensions=True,
     )
 
