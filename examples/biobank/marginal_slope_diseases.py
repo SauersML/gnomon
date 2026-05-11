@@ -130,15 +130,37 @@ def load_pcs(num_pcs: int) -> pd.DataFrame:
     return df
 
 
-def ensure_scored(pgs_ids: list[str]) -> None:
-    """Run a single `gnomon score` call for any PGS that lacks an sscore file.
+def _find_sscore_for(pgs_id: str) -> Path | None:
+    """Find any `arrays_*.sscore` whose header contains `{pgs_id}_AVG`.
 
-    Pass the PGS IDs comma-separated as the score arg; gnomon's own download
-    path (resolve_and_download_scores in score/download.rs) fetches the
-    PGS Catalog hmPOS_GRCh38 file, reformats it into its native .gnomon.tsv,
-    and writes the per-PGS sscore next to the PLINK fileset.
+    gnomon names per-PGS outputs differently depending on how `--score` is
+    invoked:
+      - directory of pre-downloaded score files -> `arrays_<PGS_ID>.sscore`
+      - inline comma-separated IDs              -> `arrays_pgs<N>_<hash>.sscore`
+    Filename matching alone would miss the second form, so we look at column
+    headers instead.
     """
-    missing = [p for p in pgs_ids if not (WORKDIR / f"arrays_{p}.sscore").exists()]
+    target = f"{pgs_id}_AVG"
+    for path in WORKDIR.glob("arrays_*.sscore"):
+        try:
+            with path.open() as fh:
+                header = fh.readline().rstrip("\n").split("\t")
+        except OSError:
+            continue
+        if target in header:
+            return path
+    return None
+
+
+def ensure_scored(pgs_ids: list[str]) -> None:
+    """Run a single `gnomon score` call for any PGS not yet scored on disk.
+
+    "Already scored" = some `arrays_*.sscore` in WORKDIR has a `<PGS>_AVG`
+    column. This catches both gnomon's per-PGS naming and the hashed inline
+    naming, so we don't re-score a file that's already there under a
+    different filename and trip gnomon's overwrite refusal.
+    """
+    missing = [p for p in pgs_ids if _find_sscore_for(p) is None]
     if not missing:
         return
     score_arg = ",".join(missing)
@@ -162,13 +184,18 @@ def ensure_scored(pgs_ids: list[str]) -> None:
 
 
 def load_one_pgs(pgs_id: str) -> pd.DataFrame:
-    path = WORKDIR / f"arrays_{pgs_id}.sscore"
-    df = pd.read_csv(path, sep="\t", dtype={0: str})
+    path = _find_sscore_for(pgs_id)
+    if path is None:
+        raise FileNotFoundError(
+            f"no sscore file in {WORKDIR} carries column {pgs_id}_AVG"
+        )
+    avg_col = f"{pgs_id}_AVG"
+    df = pd.read_csv(path, sep="\t", dtype={0: str}, low_memory=False)
     df = df.rename(columns={df.columns[0]: "person_id"})
     df["person_id"] = _canonical_id(df["person_id"])
-    avg_col = next(c for c in df.columns if c.endswith("_AVG"))
     df = df[["person_id", avg_col]].rename(columns={avg_col: "pgs"})
-    print(f"  pgs:  file={path.name}  n={len(df):,}")
+    df["pgs"] = pd.to_numeric(df["pgs"], errors="coerce")
+    print(f"  pgs:  file={path.name}  col={avg_col}  n={len(df):,}")
     return df
 
 
