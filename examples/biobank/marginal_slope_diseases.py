@@ -43,8 +43,10 @@ PLINK_PREFIX = WORKDIR / "arrays"
 SEX_CACHE = Path.home() / ".aou_cache" / "sex_terms"
 NUM_PCS = 10
 DUCHON_CENTERS = 4 * NUM_PCS  # > polynomial nullspace dim (d+1) for Linear in d=10
-N_CASES = 100
-N_CONTROLS = 100
+N_TRAIN_CASES = 100
+N_TRAIN_CONTROLS = 100
+N_TEST_CASES = 100
+N_TEST_CONTROLS = 100
 RNG_SEED = 0
 GNOMON_BIN = os.environ.get("GNOMON_BIN", "gnomon")
 PGS_ID_PATTERN = re.compile(r"^PGS\d{6}$")
@@ -218,14 +220,13 @@ def fetch_cases(client: bigquery.Client, cdr: str, ancestor_id: int) -> set[str]
 
 # --- model -----------------------------------------------------------------
 
-def fit_marginal_slope(df: pd.DataFrame, num_pcs: int) -> gamfit.Model:
-    """Adds `prs_z` to `df` in place so predict() can reuse the same frame."""
+def fit_marginal_slope(train_df: pd.DataFrame, num_pcs: int) -> gamfit.Model:
+    """train_df is expected to already have a standardized `prs_z` column."""
     pcs = ", ".join(f"PC{i+1}" for i in range(num_pcs))
-    duchon = f"duchon({pcs}, centers={DUCHON_CENTERS}, order=1, power=2, length_scale=1.0)"
-    df["prs_z"] = (df["pgs"] - df["pgs"].mean()) / df["pgs"].std(ddof=0)
+    duchon = f"duchon({pcs}, centers={DUCHON_CENTERS}, order=0, power=2, length_scale=1.0)"
     cols = ["case", "sex", "prs_z"] + [f"PC{i+1}" for i in range(num_pcs)]
     return gamfit.fit(
-        df[cols],
+        train_df[cols],
         f"case ~ {duchon} + sex",
         link="probit",
         z_column="prs_z",
@@ -235,6 +236,15 @@ def fit_marginal_slope(df: pd.DataFrame, num_pcs: int) -> gamfit.Model:
 
 
 def metrics(y: np.ndarray, p: np.ndarray, K: float) -> dict[str, float]:
+    """Held-out AUROC + Nagelkerke + Lee-2011 liability-scale R^2.
+
+    Lee, Wray, Goddard, Visscher (AJHG 2011, eq. 23) for ascertained case-control:
+
+        R^2_l = R^2_O * K^2 * (1-K)^2 / (z^2 * P * (1-P))
+
+    K is the population prevalence, P is the sample case proportion, and
+    z = phi(Phi^{-1}(K)) is the standard normal density at the liability threshold.
+    """
     eps = 1e-12
     p = np.clip(p, eps, 1 - eps)
     ll_full = float(np.sum(y * np.log(p) + (1 - y) * np.log1p(-p)))
@@ -244,7 +254,7 @@ def metrics(y: np.ndarray, p: np.ndarray, K: float) -> dict[str, float]:
     cox_snell = 1.0 - np.exp(2 * (ll_null - ll_full) / n)
     nagelkerke = cox_snell / (1.0 - np.exp(2 * ll_null / n))
     z = float(norm.pdf(norm.ppf(K)))
-    liability_r2 = nagelkerke * K * (1 - K) / (z ** 2 * P * (1 - P))
+    liability_r2 = nagelkerke * K**2 * (1 - K) ** 2 / (z**2 * P * (1 - P))
     return {
         "n": n,
         "cases": int(y.sum()),
@@ -276,33 +286,49 @@ def main() -> None:
 
     for name, cfg in diseases.items():
         print(f"\n=== {name.upper()} ===")
-        pgs = load_one_pgs(cfg["pgs"])
-        df = base.merge(pgs, on="person_id")
+        pgs_df = load_one_pgs(cfg["pgs"])
+        df_full = base.merge(pgs_df, on="person_id")
         ancestor = lookup_snomed_concept(client, cdr, cfg["snomed_name"])
         cases = fetch_cases(client, cdr, ancestor)
-        df["case"] = df["person_id"].isin(cases).astype(int)
-        case_idx = df.index[df["case"] == 1].to_numpy()
-        ctrl_idx = df.index[df["case"] == 0].to_numpy()
+        df_full["case"] = df_full["person_id"].isin(cases).astype(int)
+        case_idx = df_full.index[df_full["case"] == 1].to_numpy()
+        ctrl_idx = df_full.index[df_full["case"] == 0].to_numpy()
+        rng.shuffle(case_idx)
+        rng.shuffle(ctrl_idx)
         print(
             f"  snomed={cfg['snomed_name']!r}  concept_id={ancestor}  "
             f"cases_in_cohort={len(case_idx):,}  controls_in_cohort={len(ctrl_idx):,}"
         )
-        pick = np.concatenate([
-            rng.choice(case_idx, N_CASES, replace=False),
-            rng.choice(ctrl_idx, N_CONTROLS, replace=False),
+
+        n_te_case = min(N_TEST_CASES, max(0, len(case_idx) - N_TRAIN_CASES))
+        n_te_ctrl = min(N_TEST_CONTROLS, max(0, len(ctrl_idx) - N_TRAIN_CONTROLS))
+        train_pick = np.concatenate([case_idx[:N_TRAIN_CASES], ctrl_idx[:N_TRAIN_CONTROLS]])
+        test_pick = np.concatenate([
+            case_idx[N_TRAIN_CASES : N_TRAIN_CASES + n_te_case],
+            ctrl_idx[N_TRAIN_CONTROLS : N_TRAIN_CONTROLS + n_te_ctrl],
         ])
-        df = df.loc[pick].reset_index(drop=True)
-        y = df["case"].to_numpy()
-        model = fit_marginal_slope(df, NUM_PCS)
-        p_hat = np.asarray(model.predict(df.drop(columns=["case"])), dtype=float)
-        m = metrics(y, p_hat, cfg["prevalence"])
+        train = df_full.loc[train_pick].reset_index(drop=True)
+        test = df_full.loc[test_pick].reset_index(drop=True)
+
+        # Standardize PGS on training only, then apply the same shift/scale to test
+        # so we never mix test rows into the training statistics.
+        pgs_mean = float(train["pgs"].mean())
+        pgs_std = float(train["pgs"].std(ddof=0))
+        train["prs_z"] = (train["pgs"] - pgs_mean) / pgs_std
+        test["prs_z"] = (test["pgs"] - pgs_mean) / pgs_std
+
+        model = fit_marginal_slope(train, NUM_PCS)
+        predict_cols = ["sex", "prs_z"] + [f"PC{i+1}" for i in range(NUM_PCS)]
+        p_test = np.asarray(model.predict(test[predict_cols]), dtype=float)
+        m = metrics(test["case"].to_numpy(), p_test, cfg["prevalence"])
+
         print(
-            f"  PGS={cfg['pgs']}  n={m['n']:,}  cases={m['cases']:,}  "
-            f"P={m['P']:.4f}  K={cfg['prevalence']:.3f}"
+            f"  PGS={cfg['pgs']}  train_n={len(train):,}  test_n={m['n']:,}  "
+            f"test_cases={m['cases']:,}  P={m['P']:.4f}  K={cfg['prevalence']:.3f}"
         )
         print(
-            f"  AUROC={m['auroc']:.4f}  Nagelkerke R^2={m['nagelkerke_r2']:.4f}  "
-            f"liability R^2={m['liability_r2']:.4f}"
+            f"  held-out  AUROC={m['auroc']:.4f}  "
+            f"Nagelkerke R^2={m['nagelkerke_r2']:.4f}  liability R^2={m['liability_r2']:.4f}"
         )
 
 
