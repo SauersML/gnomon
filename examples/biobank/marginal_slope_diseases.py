@@ -41,8 +41,8 @@ logging.basicConfig(
 WORKDIR = Path.home() / "aou-gpu-baremetal"
 PLINK_PREFIX = WORKDIR / "arrays"
 SEX_CACHE = Path.home() / ".aou_cache" / "sex_terms"
-NUM_PCS = 10
-DUCHON_CENTERS = 4 * NUM_PCS  # > polynomial nullspace dim (d+1) for Linear in d=10
+NUM_PCS = 3
+DUCHON_CENTERS = 8  # > linear nullspace (d+1=4) in d=3; small for n=400
 N_TRAIN_CASES = 200
 N_TRAIN_CONTROLS = 200
 N_TEST_CASES = 200

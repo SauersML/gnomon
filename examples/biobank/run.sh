@@ -5,6 +5,10 @@ export PYTHONUNBUFFERED=1
 
 command -v gnomon >/dev/null 2>&1 || bash "$HOME/gnomon/install.sh"
 
+SCRIPT_DIR="$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &>/dev/null && pwd )"
+RESULTS="$HOME/aou-gpu-baremetal/biobank_run_$(date -u +%Y%m%dT%H%M%SZ).log"
+mkdir -p "$(dirname "$RESULTS")"
+
 uv run \
     --python 3.11 \
     --refresh-package gamfit \
@@ -25,4 +29,10 @@ uv run \
     --with nvidia-cusparse-cu12 \
     --with nvidia-curand-cu12 \
     --with nvidia-nvjitlink-cu12 \
-    -- python -u "$(dirname -- "${BASH_SOURCE[0]}")/marginal_slope_diseases.py"
+    -- python -u "$SCRIPT_DIR/marginal_slope_diseases.py" 2>&1 | tee "$RESULTS"
+
+echo
+echo "=========================================================================="
+echo "=== RESULTS FILE: $RESULTS"
+echo "=========================================================================="
+cat "$RESULTS"

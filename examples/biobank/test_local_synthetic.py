@@ -33,8 +33,8 @@ import pandas as pd
 from scipy.stats import norm
 from sklearn.metrics import roc_auc_score
 
-NUM_PCS = 10
-DUCHON_CENTERS = 4 * NUM_PCS
+NUM_PCS = 3
+DUCHON_CENTERS = 8  # > linear nullspace (d+1=4) in d=3; small for n=400
 N_TOTAL = 20_000
 N_TRAIN_CASES = 200
 N_TRAIN_CONTROLS = 200
