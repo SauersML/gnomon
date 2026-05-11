@@ -5,6 +5,8 @@ export PYTHONUNBUFFERED=1
 export RUST_LOG="${RUST_LOG:-info}"
 export RUST_BACKTRACE="${RUST_BACKTRACE:-1}"
 
+command -v gnomon >/dev/null 2>&1 || bash "$HOME/gnomon/install.sh"
+
 exec 2>&1
 uv run \
     --python 3.11 \

@@ -45,6 +45,9 @@ PLINK_PREFIX = WORKDIR / "arrays"
 SEX_CACHE = Path.home() / ".aou_cache" / "sex_terms"
 NUM_PCS = 10
 DUCHON_CENTERS = 4 * NUM_PCS  # > polynomial nullspace dim (d+1) for Linear in d=10
+N_CASES = 100
+N_CONTROLS = 100
+RNG_SEED = 0
 GNOMON_BIN = os.environ.get("GNOMON_BIN", "gnomon")
 PGS_ID_PATTERN = re.compile(r"^PGS\d{6}$")
 
@@ -262,14 +265,26 @@ def main() -> None:
     cdr = os.environ["WORKSPACE_CDR"]
     client = bigquery.Client()
 
+    rng = np.random.default_rng(RNG_SEED)
+
     for name, cfg in diseases.items():
         print(f"\n=== {name.upper()} ===")
         pgs = load_one_pgs(cfg["pgs"])
         df = base.merge(pgs, on="person_id")
         ancestor = lookup_snomed_concept(client, cdr, cfg["snomed_name"])
         cases = fetch_cases(client, cdr, ancestor)
-        print(f"  snomed={cfg['snomed_name']!r}  concept_id={ancestor}  cases={len(cases):,}")
         df["case"] = df["person_id"].isin(cases).astype(int)
+        case_idx = df.index[df["case"] == 1].to_numpy()
+        ctrl_idx = df.index[df["case"] == 0].to_numpy()
+        print(
+            f"  snomed={cfg['snomed_name']!r}  concept_id={ancestor}  "
+            f"cases_in_cohort={len(case_idx):,}  controls_in_cohort={len(ctrl_idx):,}"
+        )
+        pick = np.concatenate([
+            rng.choice(case_idx, N_CASES, replace=False),
+            rng.choice(ctrl_idx, N_CONTROLS, replace=False),
+        ])
+        df = df.loc[pick].reset_index(drop=True)
         y = df["case"].to_numpy()
         model = fit_marginal_slope(df, NUM_PCS)
         p_hat = np.asarray(model.predict(df.drop(columns=["case"])), dtype=float)
