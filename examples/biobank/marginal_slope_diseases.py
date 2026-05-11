@@ -59,7 +59,8 @@ DISEASES = {
         "pgs": "PGS004536",
     },
     "hypertension": {
-        "snomed_name": "Hypertensive disorder, systemic arterial",
+        # OMOP standard SNOMED concept_name for 38341003 in the AoU CDR.
+        "snomed_name": "Hypertensive disorder",
         "prevalence": 0.45,
         # Privé et al. 2022 sparse hypertension PRS; PGS-only AUROC 0.629 in
         # held-out UKB EUR. Not trained in AoU.
