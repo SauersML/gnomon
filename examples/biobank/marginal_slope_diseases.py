@@ -19,11 +19,9 @@ import json
 import logging
 import os
 import re
-import shutil
 import struct
 import subprocess
 import sys
-import urllib.request
 from pathlib import Path
 
 import gamfit
@@ -133,25 +131,19 @@ def load_pcs(num_pcs: int) -> pd.DataFrame:
 
 
 def ensure_scored(pgs_ids: list[str]) -> None:
-    """Run a single `gnomon score` call for any PGS that lacks an sscore file."""
+    """Run a single `gnomon score` call for any PGS that lacks an sscore file.
+
+    Pass the PGS IDs comma-separated as the score arg; gnomon's own download
+    path (resolve_and_download_scores in score/download.rs) fetches the
+    PGS Catalog hmPOS_GRCh38 file, reformats it into its native .gnomon.tsv,
+    and writes the per-PGS sscore next to the PLINK fileset.
+    """
     missing = [p for p in pgs_ids if not (WORKDIR / f"arrays_{p}.sscore").exists()]
     if not missing:
         return
-    print(f"[score] missing per-PGS sscore for: {missing}")
-    tmp = WORKDIR / ".gamfit_pgs_tmp"
-    shutil.rmtree(tmp, ignore_errors=True)
-    tmp.mkdir()
-    for pgs in missing:
-        url = (
-            "https://ftp.ebi.ac.uk/pub/databases/spot/pgs/scores/"
-            f"{pgs}/ScoringFiles/Harmonized/{pgs}_hmPOS_GRCh38.txt.gz"
-        )
-        dst = tmp / f"{pgs}_hmPOS_GRCh38.txt.gz"
-        print(f"[score] downloading {url}")
-        urllib.request.urlretrieve(url, dst)
-    print(f"[score] running {GNOMON_BIN} score {tmp} {PLINK_PREFIX}")
-    subprocess.run([GNOMON_BIN, "score", str(tmp), str(PLINK_PREFIX)], check=True)
-    shutil.rmtree(tmp, ignore_errors=True)
+    score_arg = ",".join(missing)
+    print(f"[score] running {GNOMON_BIN} score {score_arg} {PLINK_PREFIX}")
+    subprocess.run([GNOMON_BIN, "score", score_arg, str(PLINK_PREFIX)], check=True)
 
 
 def load_one_pgs(pgs_id: str) -> pd.DataFrame:
