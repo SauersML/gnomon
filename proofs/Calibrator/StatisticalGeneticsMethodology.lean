@@ -396,18 +396,19 @@ drops to `3/4`.
 This formalizes the biological point that equal source `R²` does not determine
 cross-population portability without locus-resolved transport state. -/
 theorem same_source_r2_different_portability_two_locus_witness :
-    let sourceSignal : Fin 2 → ℝ := fun _ => 1
-    let stableTransport : Fin 2 → ℝ := fun _ => 1
-    let brokenTransport : Fin 2 → ℝ := fun i => if i = 0 then 1 else 0
-    let sourceVariance : ℝ := ∑ l, sourceSignal l
-    let stableTargetVariance : ℝ := ∑ l, sourceSignal l * stableTransport l
-    let brokenTargetVariance : ℝ := ∑ l, sourceSignal l * brokenTransport l
-    let sourceR2 := TransportedMetrics.r2FromSignalVariance sourceVariance 1
-    let stableTargetR2 := TransportedMetrics.r2FromSignalVariance stableTargetVariance 1
-    let brokenTargetR2 := TransportedMetrics.r2FromSignalVariance brokenTargetVariance 1
-    sourceR2 = stableTargetR2 ∧
-    brokenTargetR2 < stableTargetR2 ∧
-    brokenTargetR2 / sourceR2 = (3 : ℝ) / 4 := by
+    ∃ (sourceSignal stableTransport brokenTransport : Fin 2 → ℝ),
+      let sourceVariance : ℝ := ∑ l, sourceSignal l
+      let stableTargetVariance : ℝ := ∑ l, sourceSignal l * stableTransport l
+      let brokenTargetVariance : ℝ := ∑ l, sourceSignal l * brokenTransport l
+      let sourceR2 := TransportedMetrics.r2FromSignalVariance sourceVariance 1
+      let stableTargetR2 := TransportedMetrics.r2FromSignalVariance stableTargetVariance 1
+      let brokenTargetR2 := TransportedMetrics.r2FromSignalVariance brokenTargetVariance 1
+      sourceR2 = stableTargetR2 ∧
+      brokenTargetR2 < stableTargetR2 ∧
+      brokenTargetR2 / sourceR2 = (3 : ℝ) / 4 := by
+  use (fun _ => 1)
+  use (fun _ => 1)
+  use (fun i => if i = 0 then 1 else 0)
   simp [TransportedMetrics.r2FromSignalVariance]
   norm_num
 
