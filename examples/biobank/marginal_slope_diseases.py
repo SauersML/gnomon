@@ -53,7 +53,10 @@ DISEASES = {
     "obesity": {
         "snomed_name": "Obesity",
         "prevalence": 0.42,
-        "pgs": "PGSXXXXXX",
+        # Kim et al. 2026 O_MetPRS_EUR; LDpred2 over multi-ancestry GWAS of 20
+        # metabolic traits. OR=2.47, AUROC=0.728 for BMI>=30 in the Catalog
+        # evaluation. AoU appears only as an evaluation cohort, not training.
+        "pgs": "PGS005331",
     },
 }
 
