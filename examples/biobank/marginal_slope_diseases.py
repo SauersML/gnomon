@@ -261,7 +261,12 @@ def fit_marginal_slope(train_df: pd.DataFrame, num_pcs: int):  # -> gamfit.Model
     """
     import gamfit  # lazy: lets the linear baseline import this module without dragging gamfit in
     pcs = ", ".join(f"PC{i+1}" for i in range(num_pcs))
-    duchon = f"duchon({pcs}, centers={DUCHON_CENTERS}, order=1, power=2, length_scale=1.0)"
+    # length_scale omitted on purpose: with an explicit fixed scale AND no
+    # anisotropy, gamfit logs "[BMS spatial] disabling κ/ψ optimization" and
+    # collapses the smooth to a fixed low-rank approximation (p ≡ 19, k ≡ 7
+    # regardless of num_pcs/centers). Letting gamfit estimate the kernel scale
+    # actually uses the extra centers and PCs.
+    duchon = f"duchon({pcs}, centers={DUCHON_CENTERS}, order=1, power=2)"
     formula = f"case ~ {duchon} + sex"
     cols = ["case", "sex", "prs_z"] + [f"PC{i+1}" for i in range(num_pcs)]
     print(f"  fit_spec: family=bernoulli marginal-slope  link=probit")
