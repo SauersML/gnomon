@@ -40,6 +40,7 @@ logging.basicConfig(
 WORKDIR = Path.home() / "aou-gpu-baremetal"
 PLINK_PREFIX = WORKDIR / "arrays"
 SEX_CACHE = Path.home() / ".aou_cache" / "sex_terms"
+FITS_DIR = WORKDIR / "biobank_fits"
 NUM_PCS = 3
 DUCHON_CENTERS = 12  # > linear nullspace (d+1=4) in d=3
 TRAIN_FRACTION = 0.80  # per-class 80/20 split
@@ -379,6 +380,29 @@ def main() -> None:
         test["prs_z"] = (test["pgs"] - pgs_mean) / pgs_std
 
         model = fit_marginal_slope(train, NUM_PCS)
+        FITS_DIR.mkdir(parents=True, exist_ok=True)
+        fit_path = FITS_DIR / f"{name}.gamfit"
+        meta_path = FITS_DIR / f"{name}.meta.json"
+        try:
+            model.save(str(fit_path))
+        except Exception as e:
+            print(f"  save: model.save failed ({e}); skipping persist")
+        else:
+            meta_path.write_text(json.dumps({
+                "disease": name,
+                "pgs": cfg["pgs"],
+                "snomed_name": cfg["snomed_name"],
+                "concept_id": ancestor,
+                "num_pcs": NUM_PCS,
+                "duchon_centers": DUCHON_CENTERS,
+                "train_fraction": TRAIN_FRACTION,
+                "rng_seed": RNG_SEED,
+                "pgs_mean": pgs_mean,
+                "pgs_std": pgs_std,
+                "K": K,
+                "n_train": int(len(train)),
+            }, indent=2))
+            print(f"  save: model -> {fit_path}  meta -> {meta_path}")
         predict_cols = ["sex", "prs_z"] + [f"PC{i+1}" for i in range(NUM_PCS)]
         pred = model.predict(test[predict_cols], return_type="dict")
         p_test = np.asarray(pred["mean"], dtype=float)

@@ -1,0 +1,128 @@
+# Notebook cell: plot the fitted PC-space surfaces for the three biobank diseases.
+#
+# Loads persisted fits from ~/aou-gpu-baremetal/biobank_fits/<disease>.gamfit
+# (written by examples/biobank/marginal_slope_diseases.py). If a fit is missing
+# it refits that disease only. Re-run run.sh once to populate the cache.
+
+# --- install kernel deps the run.sh uv env had (this kernel doesn't) ---
+import subprocess, sys as _sys
+subprocess.check_call([
+    _sys.executable, "-m", "pip", "install", "-q", "--upgrade",
+    "gamfit",
+    "google-cloud-bigquery", "google-cloud-bigquery-storage", "db-dtypes",
+    "matplotlib",
+])
+
+import json
+import os
+import sys
+from pathlib import Path
+
+# AoU sets WORKSPACE_CDR / GOOGLE_PROJECT in shell env; kernel may not inherit.
+def _import_aou_env():
+    import subprocess
+    for var in ("WORKSPACE_CDR", "GOOGLE_PROJECT"):
+        if os.environ.get(var):
+            continue
+        try:
+            val = subprocess.check_output(
+                ["bash", "-lc", f'printf %s "${var}"'], text=True, timeout=10,
+            ).strip()
+        except Exception:
+            val = ""
+        if val:
+            os.environ[var] = val
+_import_aou_env()
+os.environ.setdefault("GOOGLE_CLOUD_PROJECT", os.environ.get("GOOGLE_PROJECT", ""))
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.stats import norm
+
+sys.path.insert(0, str(Path.home() / "gnomon" / "examples" / "biobank"))
+import marginal_slope_diseases as _msd  # noqa: E402
+from marginal_slope_diseases import (  # noqa: E402
+    DISEASES, NUM_PCS, TRAIN_FRACTION, RNG_SEED,
+    load_pcs, load_sex, load_one_pgs, fit_marginal_slope,
+)
+# FITS_DIR was added in a later commit; fall back to the canonical path if the
+# on-disk module predates it.
+FITS_DIR = getattr(_msd, "FITS_DIR", Path.home() / "aou-gpu-baremetal" / "biobank_fits")
+
+import gamfit
+
+pcs = load_pcs(NUM_PCS)
+sex = load_sex()
+base = pcs.merge(sex, on="person_id")
+
+
+def load_fit(name):
+    fit_path = FITS_DIR / f"{name}.gamfit"
+    meta_path = FITS_DIR / f"{name}.meta.json"
+    if not (fit_path.exists() and meta_path.exists()):
+        raise FileNotFoundError(
+            f"no saved fit at {fit_path}. Push the marginal_slope_diseases.py edits, "
+            f"then re-run examples/biobank/run.sh to populate {FITS_DIR}."
+        )
+    print(f"  loading saved fit: {fit_path}")
+    return gamfit.load(str(fit_path)), json.loads(meta_path.read_text())
+
+
+def build_grid(df_for_range, n_grid=60, q_lo=0.02, q_hi=0.98):
+    pc1_lo, pc1_hi = np.quantile(df_for_range["PC1"], [q_lo, q_hi])
+    pc2_lo, pc2_hi = np.quantile(df_for_range["PC2"], [q_lo, q_hi])
+    pc3_med = float(df_for_range["PC3"].median())
+    pc1 = np.linspace(pc1_lo, pc1_hi, n_grid)
+    pc2 = np.linspace(pc2_lo, pc2_hi, n_grid)
+    P1, P2 = np.meshgrid(pc1, pc2, indexing="xy")
+    grid = pd.DataFrame({"PC1": P1.ravel(), "PC2": P2.ravel(), "PC3": pc3_med, "sex": 0})
+    return grid, P1, P2, pc3_med
+
+
+def get_eta(model, df, prs_z):
+    d = df.copy()
+    d["prs_z"] = float(prs_z)
+    pred = model.predict(d[["sex", "prs_z", "PC1", "PC2", "PC3"]], return_type="dict")
+    for key in ("linear_predictor", "eta", "link"):
+        if key in pred:
+            return np.asarray(pred[key], dtype=float)
+    p = np.clip(np.asarray(pred["mean"], dtype=float), 1e-9, 1 - 1e-9)
+    return norm.ppf(p)
+
+
+fig, axes = plt.subplots(len(DISEASES), 3, figsize=(15, 4.2 * len(DISEASES)), constrained_layout=True)
+if len(DISEASES) == 1:
+    axes = axes[np.newaxis, :]
+
+for row, (name, cfg) in enumerate(DISEASES.items()):
+    print(f"\n=== {name.upper()} ===")
+    model, meta = load_fit(name)
+    pgs_df = load_one_pgs(cfg["pgs"])
+    cohort = base.merge(pgs_df, on="person_id")
+    grid, P1, P2, pc3_med = build_grid(cohort)
+    eta0 = get_eta(model, grid, 0.0).reshape(P1.shape)
+    eta1 = get_eta(model, grid, 1.0).reshape(P1.shape)
+    slope = eta1 - eta0
+    log_slope = np.log(np.clip(slope, 1e-6, None))
+
+    ax = axes[row, 0]
+    cs = ax.contourf(P1, P2, eta0, levels=20, cmap="viridis")
+    ax.set_title(f"{name.upper()}: baseline η  (prs_z=0, PC3={pc3_med:.3f}, sex=0)")
+    ax.set_xlabel("PC1"); ax.set_ylabel("PC2"); fig.colorbar(cs, ax=ax, label="probit η")
+
+    ax = axes[row, 1]
+    cs = ax.contourf(P1, P2, slope, levels=20, cmap="magma")
+    ax.set_title(f"{name.upper()}: per-SD PGS slope  (Δη)")
+    ax.set_xlabel("PC1"); ax.set_ylabel("PC2"); fig.colorbar(cs, ax=ax, label="Δη / SD(PGS)")
+
+    ax = axes[row, 2]
+    cs = ax.contourf(P1, P2, log_slope, levels=20, cmap="cividis")
+    ax.set_title(f"{name.upper()}: log slope  (logslope smooth, +const)")
+    ax.set_xlabel("PC1"); ax.set_ylabel("PC2"); fig.colorbar(cs, ax=ax, label="log Δη")
+
+    print(f"  slope range: [{slope.min():.3f}, {slope.max():.3f}]  "
+          f"baseline η range: [{eta0.min():.3f}, {eta0.max():.3f}]")
+
+plt.suptitle("Fitted PC-space surfaces (rows: diseases; cols: baseline, per-SD slope, log-slope)", fontsize=12)
+plt.show()

@@ -3,9 +3,21 @@ set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 export PYTHONUNBUFFERED=1
 
-command -v gnomon >/dev/null 2>&1 || bash "$HOME/gnomon/install.sh"
-
 SCRIPT_DIR="$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &>/dev/null && pwd )"
+
+# --- self-update: pull latest, then re-exec the refreshed script ------------
+if [ -z "${GNOMON_RUN_REEXEC:-}" ] && git -C "$SCRIPT_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+  REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
+  echo "[run.sh] git pull --ff-only in $REPO_ROOT" >&2
+  if git -C "$REPO_ROOT" pull --ff-only; then
+    export GNOMON_RUN_REEXEC=1
+    exec bash "$0" "$@"
+  else
+    echo "[run.sh] git pull failed; continuing with on-disk code" >&2
+  fi
+fi
+
+command -v gnomon >/dev/null 2>&1 || bash "$HOME/gnomon/install.sh"
 RESULTS_DIR="$HOME/aou-gpu-baremetal/biobank_results"
 mkdir -p "$RESULTS_DIR"
 TS=$(date -u +%Y%m%dT%H%M%SZ)
