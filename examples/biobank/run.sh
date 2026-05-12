@@ -5,7 +5,26 @@ export PYTHONUNBUFFERED=1
 
 SCRIPT_DIR="$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &>/dev/null && pwd )"
 
+# --- kill any older biobank run still in flight -----------------------------
+# Match by the python entrypoint, not by run.sh -- prior runs may still be
+# blocking on a long gamfit fit even if their wrapper shell has exited.
+if [ -z "${GNOMON_RUN_REEXEC:-}" ]; then
+  MY_PID=$$
+  PIDS_TO_KILL=$(pgrep -f "python.*examples/biobank/marginal_slope_diseases\.py" 2>/dev/null \
+    | grep -v "^${MY_PID}$" || true)
+  if [ -n "$PIDS_TO_KILL" ]; then
+    echo "[run.sh] killing prior marginal_slope_diseases.py processes: $PIDS_TO_KILL" >&2
+    kill $PIDS_TO_KILL 2>/dev/null || true
+    sleep 2
+    for pid in $PIDS_TO_KILL; do
+      kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+    done
+  fi
+fi
+
 # --- self-update: pull latest, then re-exec the refreshed script ------------
+# `exec bash "$0"` reloads run.sh from disk *and* re-imports the python script
+# fresh on each python launch, so the latest code is what actually runs.
 if [ -z "${GNOMON_RUN_REEXEC:-}" ] && git -C "$SCRIPT_DIR" rev-parse --git-dir >/dev/null 2>&1; then
   REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
   echo "[run.sh] git pull --ff-only in $REPO_ROOT" >&2
