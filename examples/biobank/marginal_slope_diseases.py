@@ -41,8 +41,8 @@ WORKDIR = Path.home() / "aou-gpu-baremetal"
 PLINK_PREFIX = WORKDIR / "arrays"
 SEX_CACHE = Path.home() / ".aou_cache" / "sex_terms"
 FITS_DIR = WORKDIR / "biobank_fits"
-NUM_PCS = 3
-DUCHON_CENTERS = 12  # > linear nullspace (d+1=4) in d=3
+NUM_PCS = 8
+DUCHON_CENTERS = 24  # > linear nullspace (d+1=9) in d=8
 TRAIN_FRACTION = 0.80  # per-class 80/20 split
 RNG_SEED = 0
 GNOMON_BIN = os.environ.get("GNOMON_BIN", "gnomon")
