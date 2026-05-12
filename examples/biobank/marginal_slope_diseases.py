@@ -261,12 +261,21 @@ def fit_marginal_slope(train_df: pd.DataFrame, num_pcs: int):  # -> gamfit.Model
     """
     import gamfit  # lazy: lets the linear baseline import this module without dragging gamfit in
     pcs = ", ".join(f"PC{i+1}" for i in range(num_pcs))
-    # length_scale omitted on purpose: with an explicit fixed scale AND no
-    # anisotropy, gamfit logs "[BMS spatial] disabling κ/ψ optimization" and
-    # collapses the smooth to a fixed low-rank approximation (p ≡ 19, k ≡ 7
-    # regardless of num_pcs/centers). Letting gamfit estimate the kernel scale
-    # actually uses the extra centers and PCs.
-    duchon = f"duchon({pcs}, centers={DUCHON_CENTERS}, order=1, power=2)"
+    # `scale_dims=true` enables per-axis anisotropy, so the BMS family does NOT
+    # short-circuit κ/ψ optimization off (gam/src/families/bernoulli_marginal_slope.rs:16652,
+    # gam/src/terms/smooth.rs:1340 is_pure_duchon_aniso_term + :1371
+    # spatial_term_has_locked_kappa). With anisotropy active the term keeps the
+    # outer κ + ψ axes that scale with NUM_PCS and DUCHON_CENTERS.
+    # `length_scale=1.0` keeps the resolver in hybrid (non-pure) mode so it
+    # doesn't have to escalate the nullspace order to Degree(2); Linear keeps
+    # polynomial_cols=d+1 (9 in d=8), well below DUCHON_CENTERS.
+    # `power` omitted -> auto-escalated by the resolver to satisfy
+    # `2*(p+s) > d` (basis.rs:resolve_duchon_orders). At d=8, length_scale set,
+    # order=1 it lands at power=4 with stiffness operator order s=2.
+    duchon = (
+        f"duchon({pcs}, centers={DUCHON_CENTERS}, order=1, "
+        f"length_scale=1.0, scale_dims=true)"
+    )
     formula = f"case ~ {duchon} + sex"
     cols = ["case", "sex", "prs_z"] + [f"PC{i+1}" for i in range(num_pcs)]
     print(f"  fit_spec: family=bernoulli marginal-slope  link=probit")
