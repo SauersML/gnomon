@@ -25,7 +25,7 @@
 //! - Split IDs: if `ID != "."` → `ID__ALT=<ALT>`; else use
 //!   `chr:pos:ref:alt`.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -539,6 +539,7 @@ impl VariantPlan {
         let mut max_x_pos: u64 = 0;
         let mut saw_x_par37_only = false;
         let mut saw_x_par38_only = false;
+        let mut sorted_positions = PvarPositionSortState::default();
 
         while let Some(line) = pvar.next_line()? {
             let s = str::from_utf8(line)
@@ -587,6 +588,10 @@ impl VariantPlan {
             let pos = pos_raw
                 .parse::<u64>()
                 .map_err(|_| ioerr("Invalid POS in .pvar (expected integer)"))?;
+            if pos == 0 {
+                return Err(ioerr(".pvar POS must be positive"));
+            }
+            sorted_positions.observe(&chrom, pos, in_variants + 1)?;
             if chrom == "X" {
                 max_x_pos = max_x_pos.max(pos);
                 let in37 = in_any_range(pos, GRCH37_X_PAR);
@@ -708,6 +713,53 @@ impl VariantPlan {
 
 fn ioerr(msg: &str) -> PipelineError {
     PipelineError::Io(msg.to_string())
+}
+
+#[derive(Default)]
+struct PvarPositionSortState {
+    current_chromosome: String,
+    current_position: Option<u64>,
+    previous_positions_by_chrom: HashMap<String, u64>,
+}
+
+impl PvarPositionSortState {
+    #[inline]
+    fn observe(
+        &mut self,
+        chromosome: &str,
+        position: u64,
+        record: usize,
+    ) -> Result<(), PipelineError> {
+        if let Some(previous) = self.current_position
+            && self.current_chromosome == chromosome
+        {
+            if position < previous {
+                return Err(PipelineError::Io(format!(
+                    ".pvar variants are not position-sorted within chromosome {chromosome}: record {record} has position {position} after position {previous}"
+                )));
+            }
+            self.current_position = Some(position);
+            return Ok(());
+        }
+
+        if let Some(previous) = self.current_position {
+            self.previous_positions_by_chrom
+                .insert(self.current_chromosome.clone(), previous);
+        }
+
+        if let Some(&previous) = self.previous_positions_by_chrom.get(chromosome)
+            && position < previous
+        {
+            return Err(PipelineError::Io(format!(
+                ".pvar variants are not position-sorted within chromosome {chromosome}: record {record} has position {position} after position {previous}"
+            )));
+        }
+
+        self.current_chromosome.clear();
+        self.current_chromosome.push_str(chromosome);
+        self.current_position = Some(position);
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2570,6 +2622,37 @@ mod tests {
         }
     }
 
+    struct LineSource {
+        lines: Vec<&'static str>,
+        index: usize,
+        carry: Option<Box<[u8]>>,
+    }
+
+    impl LineSource {
+        fn new(lines: Vec<&'static str>) -> Self {
+            Self {
+                lines,
+                index: 0,
+                carry: None,
+            }
+        }
+    }
+
+    impl TextSource for LineSource {
+        fn len(&self) -> Option<u64> {
+            Some(self.lines.len() as u64)
+        }
+
+        fn next_line(&mut self) -> Result<Option<&[u8]>, PipelineError> {
+            let Some(line) = self.lines.get(self.index) else {
+                return Ok(None);
+            };
+            self.index += 1;
+            self.carry = Some(line.as_bytes().to_vec().into_boxed_slice());
+            Ok(self.carry.as_deref())
+        }
+    }
+
     fn encode_varint(mut v: u64) -> Vec<u8> {
         let mut out = Vec::new();
         loop {
@@ -2601,6 +2684,28 @@ mod tests {
     fn push_sid(buf: &mut Vec<u8>, sid: u32, bytes: usize) {
         let le = sid.to_le_bytes();
         buf.extend_from_slice(&le[..bytes]);
+    }
+
+    #[test]
+    fn pvar_plan_rejects_unsorted_positions_within_chromosome() {
+        let mut pvar = LineSource::new(vec![
+            "#CHROM\tPOS\tID\tREF\tALT",
+            "1\t200\tv1\tA\tG",
+            "1\t100\tv2\tC\tT",
+        ]);
+
+        let err = match VariantPlan::from_pvar(&mut pvar) {
+            Ok(_) => panic!("expected unsorted .pvar to fail"),
+            Err(err) => err,
+        };
+        match err {
+            PipelineError::Io(message) => {
+                assert!(message.contains("not position-sorted"));
+                assert!(message.contains("position 100"));
+                assert!(message.contains("position 200"));
+            }
+            other => panic!("expected PipelineError::Io, got {other:?}"),
+        }
     }
 
     #[test]

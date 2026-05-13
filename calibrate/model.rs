@@ -204,9 +204,9 @@ fn build_predict_data(
         } else if name == SEX_HEADER {
             data.column_mut(col_idx).assign(&sex);
         } else if let Some(stripped) = name.strip_prefix("PC") {
-            let pc_idx: usize = stripped.parse().map_err(|_| {
-                ModelError::Predict(format!("unrecognized PC header '{name}'"))
-            })?;
+            let pc_idx: usize = stripped
+                .parse()
+                .map_err(|_| ModelError::Predict(format!("unrecognized PC header '{name}'")))?;
             if pc_idx == 0 || pc_idx > pcs.ncols() {
                 return Err(ModelError::Predict(format!(
                     "training header '{name}' references PC{pc_idx} but predict data has {} PCs",
@@ -254,10 +254,7 @@ fn predict_eta_mean(
 
 fn config_sidecar_path(path: &str) -> std::path::PathBuf {
     let p = Path::new(path);
-    let mut name = p
-        .file_name()
-        .map(|s| s.to_os_string())
-        .unwrap_or_default();
+    let mut name = p.file_name().map(|s| s.to_os_string()).unwrap_or_default();
     name.push(".config.toml");
     p.with_file_name(name)
 }
@@ -346,10 +343,7 @@ impl TrainedModel {
         risk_type: SurvivalRiskType,
     ) -> Result<SurvivalPrediction, ModelError> {
         let n = p_new.len();
-        if age_entry.len() != n
-            || age_exit.len() != n
-            || sex_new.len() != n
-            || pcs_new.nrows() != n
+        if age_entry.len() != n || age_exit.len() != n || sex_new.len() != n || pcs_new.nrows() != n
         {
             return Err(ModelError::Predict(format!(
                 "predict_survival input length mismatch: n={n}",
@@ -435,8 +429,7 @@ impl TrainedModel {
             .map_err(ModelError::Predict)?;
         let cumulative_hazard_entry = entry_result.cumulative_hazard.column(0).to_owned();
 
-        let cumulative_incidence_entry =
-            cumulative_hazard_entry.mapv(|c| 1.0 - (-c).exp());
+        let cumulative_incidence_entry = cumulative_hazard_entry.mapv(|c| 1.0 - (-c).exp());
         let cumulative_incidence_exit = cumulative_hazard_exit.mapv(|c| 1.0 - (-c).exp());
 
         // Conditional risk = (CIF_exit - CIF_entry) / (1 - CIF_entry).
@@ -444,7 +437,11 @@ impl TrainedModel {
         for i in 0..n {
             let denom = 1.0 - cumulative_incidence_entry[i];
             let num = cumulative_incidence_exit[i] - cumulative_incidence_entry[i];
-            conditional_risk[i] = if denom > 0.0 { (num / denom).clamp(0.0, 1.0) } else { 0.0 };
+            conditional_risk[i] = if denom > 0.0 {
+                (num / denom).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
         }
         let logit_risk = conditional_risk.mapv(|p| {
             let p = p.clamp(1e-12, 1.0 - 1e-12);

@@ -166,8 +166,12 @@ impl VariantFilter {
     }
 
     pub fn match_status(&self, key: &VariantKey) -> Option<MatchKind> {
+        self.match_key(key).map(|(kind, _)| kind)
+    }
+
+    pub fn match_key(&self, key: &VariantKey) -> Option<(MatchKind, VariantKey)> {
         if self.unique.contains(key) {
-            return Some(MatchKind::Exact);
+            return Some((MatchKind::Exact, key.clone()));
         }
         if let Some((ref r, ref a)) = key.alleles {
             let wildcard = VariantKey {
@@ -176,7 +180,7 @@ impl VariantFilter {
                 alleles: None,
             };
             if self.unique.contains(&wildcard) {
-                return Some(MatchKind::Wildcard);
+                return Some((MatchKind::Wildcard, wildcard));
             }
 
             let swapped = VariantKey {
@@ -185,7 +189,7 @@ impl VariantFilter {
                 alleles: Some((a.clone(), r.clone())),
             };
             if self.unique.contains(&swapped) {
-                return Some(MatchKind::Swap);
+                return Some((MatchKind::Swap, swapped));
             }
         }
         None

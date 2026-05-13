@@ -111,6 +111,10 @@ struct FitArgs {
     #[arg(long, value_name = "N")]
     components: usize,
 
+    /// Minimum observed minor allele frequency retained for PCA fitting
+    #[arg(long = "maf", value_name = "MAF")]
+    maf: Option<f64>,
+
     /// Enable LD normalization when fitting the PCA model
     #[arg(long)]
     ld: bool,
@@ -520,6 +524,23 @@ fn run_score(args: ScoreArgs) -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(feature = "map")]
 fn run_map_fit(args: FitArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let maf = match args.maf {
+        Some(value) if value.is_finite() && (0.0..=0.5).contains(&value) => {
+            if value > 0.0 {
+                Some(value)
+            } else {
+                None
+            }
+        }
+        Some(_) => {
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "--maf must be a finite value between 0 and 0.5",
+            )));
+        }
+        None => None,
+    };
+
     let ld_window = if args.ld {
         if let Some(bp) = args.bp_window {
             Some(LdWindow::BasePairs(bp))
@@ -547,6 +568,7 @@ fn run_map_fit(args: FitArgs) -> Result<(), Box<dyn std::error::Error>> {
         genotype_path: args.genotype_path,
         variant_list: args.list,
         components: args.components,
+        maf,
         ld: ld_window,
     })
     .map_err(|err| Box::new(err) as Box<dyn std::error::Error>)
@@ -763,11 +785,8 @@ fn infer(args: InferArgs) -> Result<(), Box<dyn std::error::Error>> {
             println!("Loaded {} samples for prediction", data.p.len());
 
             println!("Generating predictions with diagnostics...");
-            let p =
-                model.predict_detailed(data.p.view(), data.sex.view(), data.pcs.view())?;
-            let signed_dist = p
-                .signed_dist
-                .unwrap_or_else(|| Array1::zeros(p.eta.len()));
+            let p = model.predict_detailed(data.p.view(), data.sex.view(), data.pcs.view())?;
+            let signed_dist = p.signed_dist.unwrap_or_else(|| Array1::zeros(p.eta.len()));
 
             let output_path = "predictions.tsv";
             save_predictions_detailed(

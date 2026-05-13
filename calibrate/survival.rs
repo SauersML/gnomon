@@ -8,9 +8,7 @@
 //! Heavy lifting (PIRLS, REML, monotonicity, joint link, baseline
 //! construction, prediction) lives in gam.
 
-use gam::families::survival_construction::{
-    SurvivalTimeBasisConfig, build_survival_time_basis,
-};
+use gam::families::survival_construction::{SurvivalTimeBasisConfig, build_survival_time_basis};
 use gam::families::survival_location_scale::{TimeBlockInput, TimeWiggleBlockInput};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use serde::{Deserialize, Serialize};
@@ -235,7 +233,10 @@ pub fn build_time_block_input(
         &bundle.data.age_entry,
         &bundle.data.age_exit,
         cfg,
-        Some((SURVIVAL_TIME_NUM_INTERNAL_KNOTS, SURVIVAL_TIME_SMOOTH_LAMBDA)),
+        Some((
+            SURVIVAL_TIME_NUM_INTERNAL_KNOTS,
+            SURVIVAL_TIME_SMOOTH_LAMBDA,
+        )),
     )?;
 
     let p_time = build.x_exit_time.ncols();
@@ -271,9 +272,7 @@ const SURVIVAL_TIMEWIGGLE_NCOLS: usize = 8;
 /// Otherwise returns a `TimeWiggleBlockInput` with hard-coded defaults
 /// (8 internal knots, degree 3) on `[0, 1]` — gam re-evaluates the knot
 /// support against the working time grid internally.
-pub fn build_time_wiggle_block_input(
-    enable: bool,
-) -> Result<Option<TimeWiggleBlockInput>, String> {
+pub fn build_time_wiggle_block_input(enable: bool) -> Result<Option<TimeWiggleBlockInput>, String> {
     if !enable {
         return Ok(None);
     }

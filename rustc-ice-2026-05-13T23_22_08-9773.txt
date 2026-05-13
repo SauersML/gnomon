@@ -1,0 +1,48 @@
+thread 'opt 5xqcqyrbk25ngcjts16p8k4ww' panicked at /rustc-dev/5fb2ff8611e5a4af4dc85977cfdecfbf3ffa6ade/compiler/rustc_codegen_ssa/src/back/write.rs:874:21:
+Error writing pre-lto-bitcode file `/Users/user/gnomon/target/debug/incremental/gnomon-1n5r04yc4d1ie/s-hii26901n6-1hk0rq0-working/5xqcqyrbk25ngcjts16p8k4ww.pre-lto.bc`: No space left on device (os error 28)
+stack backtrace:
+   0:        0x10fea0108 - <std[9cc4c893cee18bec]::backtrace::Backtrace>::create
+   1:        0x10dd88d10 - std[9cc4c893cee18bec]::panicking::update_hook::<alloc[5d28b7a812ec894f]::boxed::Box<rustc_driver_impl[fc5206be201ac562]::install_ice_hook::{closure#1}>>::{closure#0}
+   2:        0x10feb1738 - std[9cc4c893cee18bec]::panicking::panic_with_hook
+   3:        0x10fe9566c - std[9cc4c893cee18bec]::panicking::panic_handler::{closure#0}
+   4:        0x10fe8a078 - std[9cc4c893cee18bec]::sys::backtrace::__rust_end_short_backtrace::<std[9cc4c893cee18bec]::panicking::panic_handler::{closure#0}, !>
+   5:        0x10fe96c3c - __rustc[95885aad123ac653]::rust_begin_unwind
+   6:        0x112ecc240 - core[a080145138a3e8b5]::panicking::panic_fmt
+   7:        0x112f1c948 - rustc_codegen_ssa[402c2d526df8c60f]::back::write::execute_optimize_work_item::<rustc_codegen_llvm[8fd13ad70377cc9a]::LlvmCodegenBackend>::{closure#1}
+   8:        0x10d92d224 - std[9cc4c893cee18bec]::sys::backtrace::__rust_begin_short_backtrace::<<rustc_codegen_llvm[8fd13ad70377cc9a]::LlvmCodegenBackend as rustc_codegen_ssa[402c2d526df8c60f]::traits::backend::ExtraBackendMethods>::spawn_named_thread<rustc_codegen_ssa[402c2d526df8c60f]::back::write::spawn_work<rustc_codegen_llvm[8fd13ad70377cc9a]::LlvmCodegenBackend>::{closure#0}, ()>::{closure#0}, ()>
+   9:        0x10d95fe2c - <std[9cc4c893cee18bec]::thread::lifecycle::spawn_unchecked<<rustc_codegen_llvm[8fd13ad70377cc9a]::LlvmCodegenBackend as rustc_codegen_ssa[402c2d526df8c60f]::traits::backend::ExtraBackendMethods>::spawn_named_thread<rustc_codegen_ssa[402c2d526df8c60f]::back::write::spawn_work<rustc_codegen_llvm[8fd13ad70377cc9a]::LlvmCodegenBackend>::{closure#0}, ()>::{closure#0}, ()>::{closure#1} as core[a080145138a3e8b5]::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+  10:        0x10febc468 - <std[9cc4c893cee18bec]::sys::thread::unix::Thread>::new::thread_start
+  11:        0x189bedc08 - __pthread_cond_wait
+
+
+rustc version: 1.95.0-nightly (5fb2ff861 2026-02-21)
+platform: aarch64-apple-darwinthread 'opt bliqb8tkov2imhf4q4qkrzowc' panicked at /rustc-dev/5fb2ff8611e5a4af4dc85977cfdecfbf3ffa6ade/compiler/rustc_codegen_ssa/src/back/write.rs:874:21:
+Error writing pre-lto-bitcode file `/Users/user/gnomon/target/debug/incremental/gnomon-1n5r04yc4d1ie/s-hii26901n6-1hk0rq0-working/bliqb8tkov2imhf4q4qkrzowc.pre-lto.bc`: No space left on device (os error 28)
+stack backtrace:
+   0:        0x10fea0108 - <std[9cc4c893cee18bec]::backtrace::Backtrace>::create
+   1:        0x10dd88d10 - std[9cc4c893cee18bec]::panicking::update_hook::<alloc[5d28b7a812ec894f]::boxed::Box<rustc_driver_impl[fc5206be201ac562]::install_ice_hook::{closure#1}>>::{closure#0}
+   2:        0x10feb1738 - std[9cc4c893cee18bec]::panicking::panic_with_hook
+   3:        0x10fe9566c - std[9cc4c893cee18bec]::panicking::panic_handler::{closure#0}
+   4:        0x10fe8a078 - std[9cc4c893cee18bec]::sys::backtrace::__rust_end_short_backtrace::<std[9cc4c893cee18bec]::panicking::panic_handler::{closure#0}, !>
+   5:        0x10fe96c3c - __rustc[95885aad123ac653]::rust_begin_unwind
+   6:        0x112ecc240 - core[a080145138a3e8b5]::panicking::panic_fmt
+   7:        0x112f1c948 - rustc_codegen_ssa[402c2d526df8c60f]::back::write::execute_optimize_work_item::<rustc_codegen_llvm[8fd13ad70377cc9a]::LlvmCodegenBackend>::{closure#1}
+   8:        0x10d92d224 - std[9cc4c893cee18bec]::sys::backtrace::__rust_begin_short_backtrace::<<rustc_codegen_llvm[8fd13ad70377cc9a]::LlvmCodegenBackend as rustc_codegen_ssa[402c2d526df8c60f]::traits::backend::ExtraBackendMethods>::spawn_named_thread<rustc_codegen_ssa[402c2d526df8c60f]::back::write::spawn_work<rustc_codegen_llvm[8fd13ad70377cc9a]::LlvmCodegenBackend>::{closure#0}, ()>::{closure#0}, ()>
+   9:        0x10d95fe2c - <std[9cc4c893cee18bec]::thread::lifecycle::spawn_unchecked<<rustc_codegen_llvm[8fd13ad70377cc9a]::LlvmCodegenBackend as rustc_codegen_ssa[402c2d526df8c60f]::traits::backend::ExtraBackendMethods>::spawn_named_thread<rustc_codegen_ssa[402c2d526df8c60f]::back::write::spawn_work<rustc_codegen_llvm[8fd13ad70377cc9a]::LlvmCodegenBackend>::{closure#0}, ()>::{closure#0}, ()>::{closure#1} as core[a080145138a3e8b5]::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+  10:        0x10febc468 - <std[9cc4c893cee18bec]::sys::thread::unix::Thread>::new::thread_start
+  11:        0x189bedc08 - __pthread_cond_wait
+thread 'opt ewczxwfbjwhzxxrxtu2onrj4u' panicked at /rustc-dev/5fb2ff8611e5a4af4dc85977cfdecfbf3ffa6ade/compiler/rustc_codegen_ssa/src/back/write.rs:874:21:
+Error writing pre-lto-bitcode file `/Users/user/gnomon/target/debug/incremental/gnomon-1n5r04yc4d1ie/s-hii26901n6-1hk0rq0-working/ewczxwfbjwhzxxrxtu2onrj4u.pre-lto.bc`: No space left on device (os error 28)
+stack backtrace:
+   0:        0x10fea0108 - <std[9cc4c893cee18bec]::backtrace::Backtrace>::create
+   1:        0x10dd88d10 - std[9cc4c893cee18bec]::panicking::update_hook::<alloc[5d28b7a812ec894f]::boxed::Box<rustc_driver_impl[fc5206be201ac562]::install_ice_hook::{closure#1}>>::{closure#0}
+   2:        0x10feb1738 - std[9cc4c893cee18bec]::panicking::panic_with_hook
+   3:        0x10fe9566c - std[9cc4c893cee18bec]::panicking::panic_handler::{closure#0}
+   4:        0x10fe8a078 - std[9cc4c893cee18bec]::sys::backtrace::__rust_end_short_backtrace::<std[9cc4c893cee18bec]::panicking::panic_handler::{closure#0}, !>
+   5:        0x10fe96c3c - __rustc[95885aad123ac653]::rust_begin_unwind
+   6:        0x112ecc240 - core[a080145138a3e8b5]::panicking::panic_fmt
+   7:        0x112f1c948 - rustc_codegen_ssa[402c2d526df8c60f]::back::write::execute_optimize_work_item::<rustc_codegen_llvm[8fd13ad70377cc9a]::LlvmCodegenBackend>::{closure#1}
+   8:        0x10d92d224 - std[9cc4c893cee18bec]::sys::backtrace::__rust_begin_short_backtrace::<<rustc_codegen_llvm[8fd13ad70377cc9a]::LlvmCodegenBackend as rustc_codegen_ssa[402c2d526df8c60f]::traits::backend::ExtraBackendMethods>::spawn_named_thread<rustc_codegen_ssa[402c2d526df8c60f]::back::write::spawn_work<rustc_codegen_llvm[8fd13ad70377cc9a]::LlvmCodegenBackend>::{closure#0}, ()>::{closure#0}, ()>
+   9:        0x10d95fe2c - <std[9cc4c893cee18bec]::thread::lifecycle::spawn_unchecked<<rustc_codegen_llvm[8fd13ad70377cc9a]::LlvmCodegenBackend as rustc_codegen_ssa[402c2d526df8c60f]::traits::backend::ExtraBackendMethods>::spawn_named_thread<rustc_codegen_ssa[402c2d526df8c60f]::back::write::spawn_work<rustc_codegen_llvm[8fd13ad70377cc9a]::LlvmCodegenBackend>::{closure#0}, ()>::{closure#0}, ()>::{closure#1} as core[a080145138a3e8b5]::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+  10:        0x10febc468 - <std[9cc4c893cee18bec]::sys::thread::unix::Thread>::new::thread_start
+  11:        0x189bedc08 - __pthread_cond_wait

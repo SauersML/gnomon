@@ -62,6 +62,11 @@ git fetch origin && git reset --hard origin/main
 ```
 
 ```
+# Fit a PCA model using common variants only
+./target/release/gnomon fit path/to/genotypes --components 10 --maf 0.01
+```
+
+```
 # Infer sample sex
 ./target/release/gnomon terms --sex path/to/genotypes
 ```

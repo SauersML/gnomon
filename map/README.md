@@ -19,7 +19,7 @@ recomputing cohort-specific statistics.
 ## CLI entry points
 | Command | Purpose | Required input | Primary outputs |
 | --- | --- | --- | --- |
-| `gnomon fit --components <N> [--list PATH] [--ld] <GENOTYPE_PATH>` | Train a Hardy–Weinberg PCA model | Genotype source (PLINK trio or VCF/BCF files, local or remote) | `hwe.json`, `samples.tsv`, `hwe_summary.tsv` |
+| `gnomon fit --components <N> [--maf MAF] [--list PATH] [--ld] <GENOTYPE_PATH>` | Train a Hardy–Weinberg PCA model | Genotype source (PLINK trio or VCF/BCF files, local or remote) | `hwe.json`, `samples.tsv`, `hwe_summary.tsv` |
 | `gnomon project <GENOTYPE_PATH>` | Project samples with an existing `hwe.json` located next to the genotype data | Matching genotype source aligned to the model's variant set | `projection_scores.bin` plus `projection_scores.metadata.json` |
 
 Both commands print sample and variant counts, resolved source paths, and
@@ -43,6 +43,9 @@ Optional arguments:
   remote) should contain two whitespace-separated columns—chromosome and
   1-based position—with an optional header. Any variants that cannot be found
   are reported before the command exits.
+* `--maf <MAF>` – Retain only variants whose observed minor allele frequency in
+  the fitting cohort is at least `MAF`. The threshold must be between `0` and
+  `0.5`; filtering runs after `--list` selection and before LD weighting or PCA.
 * `--ld` – Enable linkage disequilibrium flattening. When present, LD weights
   use a default window of 51 variants unless `--sites_window <SITES>` (odd
   number of variants) or `--bp_window <BP>` (total genomic span in base pairs)
@@ -72,7 +75,10 @@ finer-grained monitoring is needed.
    variant density. Windows are truncated near dataset edges and validated
    before use. The resulting per-variant weights are saved inside the
    serialized model.
-4. Requested components beyond the intrinsic rank are clamped, and the driver
+4. `--maf` can remove rare or monomorphic variants before LD weighting and PCA;
+   saved model keys, scalers, loadings, and optional LD weights all use the
+   filtered variant set.
+5. Requested components beyond the intrinsic rank are clamped, and the driver
    reports the retained dimensionality.
 
 ### Outputs written next to the genotype source

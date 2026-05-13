@@ -486,8 +486,10 @@ fn run_preparation_phase(
                 };
 
                 if should_reformat {
-                    prep_items
-                        .push((score_file_path.clone(), Prep::Pending(score_file_path.clone(), new_path)));
+                    prep_items.push((
+                        score_file_path.clone(),
+                        Prep::Pending(score_file_path.clone(), new_path),
+                    ));
                 } else {
                     eprintln!(
                         "> Info: Using cached converted file '{}'.",

@@ -13,6 +13,7 @@ use crate::calibrate::model::{ModelConfig, ModelFamily, TrainedModel};
 use crate::calibrate::survival::{build_time_block_input, build_time_wiggle_block_input};
 use crate::calibrate::survival_data::SurvivalTrainingBundle;
 
+use gam::families::bernoulli_marginal_slope::LatentMeasureKind;
 use gam::families::bernoulli_marginal_slope::{
     BernoulliMarginalSlopeTermSpec, DeviationBlockConfig, LatentZPolicy,
 };
@@ -23,7 +24,6 @@ use gam::families::gamlss::{
 };
 use gam::families::lognormal_kernel::FrailtySpec;
 use gam::families::survival_marginal_slope::SurvivalMarginalSlopeTermSpec;
-use gam::families::bernoulli_marginal_slope::LatentMeasureKind;
 use gam::families::transformation_normal::TransformationNormalConfig;
 use gam::inference::model::{
     DataSchema, FittedFamily, FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind,
@@ -167,8 +167,8 @@ fn ctn_prefit_latent_z(
         warm_start: None,
     };
 
-    let result = fit_model(FitRequest::TransformationNormal(request))
-        .map_err(EstimationError::Gam)?;
+    let result =
+        fit_model(FitRequest::TransformationNormal(request)).map_err(EstimationError::Gam)?;
     let fit = match result {
         FitResult::TransformationNormal(fit) => fit,
         _ => {
@@ -410,8 +410,8 @@ pub fn train_model(
         policy: ResourcePolicy::default_library(),
     };
 
-    let result = fit_model(FitRequest::BernoulliMarginalSlope(request))
-        .map_err(EstimationError::Gam)?;
+    let result =
+        fit_model(FitRequest::BernoulliMarginalSlope(request)).map_err(EstimationError::Gam)?;
     let fit = match result {
         FitResult::BernoulliMarginalSlope(fit) => fit,
         _ => {
@@ -524,12 +524,17 @@ pub fn train_survival_model(
     let pc_cols: Vec<usize> = (2..2 + n_pcs).collect();
 
     let pc_bases: Vec<_> = config.pc_configs.iter().map(|pc| pc.basis_config).collect();
-    let marginalspec =
-        build_marginal_termspec(pgs_col, sex_col, &pc_cols, &config.pgs_basis_config, &pc_bases);
+    let marginalspec = build_marginal_termspec(
+        pgs_col,
+        sex_col,
+        &pc_cols,
+        &config.pgs_basis_config,
+        &pc_bases,
+    );
     let logslopespec = build_logslope_termspec(pgs_col);
 
-    let time_block = build_time_block_input(bundle, &survival_spec)
-        .map_err(EstimationError::Gam)?;
+    let time_block =
+        build_time_block_input(bundle, &survival_spec).map_err(EstimationError::Gam)?;
     let timewiggle_enabled = survival_cfg.time_varying.is_some();
     let timewiggle_block =
         build_time_wiggle_block_input(timewiggle_enabled).map_err(EstimationError::Gam)?;
