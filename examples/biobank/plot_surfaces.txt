@@ -57,14 +57,11 @@ sex = load_sex()
 base = pcs.merge(sex, on="person_id")
 
 
-def load_fit(name):
+def try_load_fit(name):
     fit_path = FITS_DIR / f"{name}.gamfit"
     meta_path = FITS_DIR / f"{name}.meta.json"
     if not (fit_path.exists() and meta_path.exists()):
-        raise FileNotFoundError(
-            f"no saved fit at {fit_path}. Push the marginal_slope_diseases.py edits, "
-            f"then re-run examples/biobank/run.sh to populate {FITS_DIR}."
-        )
+        return None
     print(f"  loading saved fit: {fit_path}")
     return gamfit.load(str(fit_path)), json.loads(meta_path.read_text())
 
@@ -91,13 +88,28 @@ def get_eta(model, df, prs_z):
     return norm.ppf(p)
 
 
-fig, axes = plt.subplots(len(DISEASES), 3, figsize=(15, 4.2 * len(DISEASES)), constrained_layout=True)
-if len(DISEASES) == 1:
+plottable = []
+for name, cfg in DISEASES.items():
+    print(f"\n=== {name.upper()} ===")
+    loaded = try_load_fit(name)
+    if loaded is None:
+        print(f"  skip: no saved fit in {FITS_DIR} for {name}. "
+              f"Run examples/biobank/run.sh to produce one.")
+        continue
+    plottable.append((name, cfg, loaded[0], loaded[1]))
+
+if not plottable:
+    raise FileNotFoundError(
+        f"no saved fits in {FITS_DIR}. Pull latest and run "
+        f"examples/biobank/run.sh to populate it."
+    )
+
+fig, axes = plt.subplots(len(plottable), 3, figsize=(15, 4.2 * len(plottable)), constrained_layout=True)
+if len(plottable) == 1:
     axes = axes[np.newaxis, :]
 
-for row, (name, cfg) in enumerate(DISEASES.items()):
-    print(f"\n=== {name.upper()} ===")
-    model, meta = load_fit(name)
+for row, (name, cfg, model, meta) in enumerate(plottable):
+    print(f"\n--- plot {name.upper()} ---")
     pgs_df = load_one_pgs(cfg["pgs"])
     cohort = base.merge(pgs_df, on="person_id")
     grid, P1, P2, pc3_med = build_grid(cohort)

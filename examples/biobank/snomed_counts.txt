@@ -1,0 +1,342 @@
+# Notebook cell: characterize standard OMOP concepts on the AoU CDR by
+# per-concept person coverage AND per-concept event count, across the
+# clinical domains. Then count the distinct concepts you'd end up choosing
+# if every fact-table event were mapped to its most specific ancestor that
+# still clears each of several person-count floors. Prints 6 example
+# concept names per band so you can see WHAT kind of thing each level
+# contains.
+#
+# Speed tricks
+# ------------
+#   * HLL_COUNT.INIT(person_id)+HLL_COUNT.MERGE replaces COUNT(DISTINCT)
+#     AND collapses each fact table to ONE row per fact_concept_id BEFORE
+#     joining concept_ancestor. The original query exploded raw event rows
+#     against ancestors (10x-100x blow-up). The HLL version reduces the
+#     ancestor join to ~|distinct fact concepts| rows. HLL is unbiased
+#     (~1.6% std error at default precision 15).
+#   * eligible-ancestor pre-filter: concept_ancestor is filtered to
+#     ancestors that are standard in the requested domain BEFORE joining
+#     anything else, so we never carry rows we'll throw away.
+#   * one combined query per domain: A (thresholds + examples) and B
+#     (specific-leaf mapping at four floors) share the same per_concept /
+#     ranked CTEs, so BQ computes them once.
+#   * one Python thread per domain via ThreadPoolExecutor: BQ jobs run in
+#     parallel across BQ slots AND we print results in completion order, so
+#     fast domains (Visit, Device) appear first while Measurement/
+#     Observation are still chewing.
+#
+# Definitions
+# -----------
+#   For a fact table (eg condition_occurrence), let fact_id be its
+#   <domain>_concept_id column.
+#   person count of C  = HLL distinct person_id over fact rows whose
+#                         fact_id descends from C in concept_ancestor
+#                         (which includes C itself at separation 0).
+#   event count of C   = total fact rows descending from C.
+# Eligibility filter on C: standard_concept='S' AND domain_id=<domain>.
+#
+# Specific-leaf-with-floor mapping
+# --------------------------------
+# For each distinct fact-table concept_id, pick the standard ancestor in
+# the same domain with the smallest min_levels_of_separation among
+# ancestors whose GLOBAL person count clears the floor. Per-event picks
+# are independent: each event uses the precomputed global counts and does
+# not condition on what other events resolve to. Ties broken by concept_id.
+
+import subprocess, sys as _sys
+subprocess.check_call([
+    _sys.executable, "-m", "pip", "install", "-q", "--upgrade",
+    "google-cloud-bigquery", "google-cloud-bigquery-storage", "db-dtypes",
+])
+
+import os
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from google.cloud import bigquery
+
+
+def _import_aou_env():
+    for var in ("WORKSPACE_CDR", "GOOGLE_PROJECT"):
+        if os.environ.get(var):
+            continue
+        try:
+            val = subprocess.check_output(
+                ["bash", "-lc", f'printf %s "${var}"'], text=True, timeout=10,
+            ).strip()
+        except Exception:
+            val = ""
+        if val:
+            os.environ[var] = val
+_import_aou_env()
+os.environ.setdefault("GOOGLE_CLOUD_PROJECT", os.environ.get("GOOGLE_PROJECT", ""))
+
+cdr = os.environ["WORKSPACE_CDR"]
+client = bigquery.Client()
+
+
+# (domain_id, fact_table, fact_concept_col)
+DOMAINS = [
+    ("Condition",   "condition_occurrence", "condition_concept_id"),
+    ("Drug",        "drug_exposure",        "drug_concept_id"),
+    ("Measurement", "measurement",          "measurement_concept_id"),
+    ("Procedure",   "procedure_occurrence", "procedure_concept_id"),
+    ("Observation", "observation",          "observation_concept_id"),
+    ("Device",      "device_exposure",      "device_concept_id"),
+    ("Visit",       "visit_occurrence",     "visit_concept_id"),
+]
+
+
+def unified_sql(domain: str, table: str, col: str) -> str:
+    """Combined A+B query for one domain.
+
+    Heavy CTEs (co_per_fact, ca_dom, per_concept, ranked) are computed
+    once; A's thresholds and B's per-floor picks both pull from them.
+    Returns a single row with all numbers + arrays.
+    """
+    return f"""
+    WITH co_per_fact AS (
+      -- ONE row per fact_id: an HLL sketch of distinct persons and an
+      -- event count. This is the heaviest scan; everything downstream
+      -- works off this small (~|distinct fact concepts|) result.
+      SELECT
+        {col} AS fact_id,
+        HLL_COUNT.INIT(CAST(person_id AS STRING)) AS sk,
+        COUNT(*) AS n_events
+      FROM `{cdr}.{table}`
+      WHERE {col} IS NOT NULL AND {col} != 0
+      GROUP BY fact_id
+    ),
+    eligible AS (
+      SELECT concept_id
+      FROM `{cdr}.concept`
+      WHERE standard_concept = 'S' AND domain_id = '{domain}'
+    ),
+    ca_dom AS (
+      -- concept_ancestor restricted to ancestors that are standard in
+      -- the requested domain. Drops everything else before any join.
+      SELECT
+        ca.descendant_concept_id AS desc_id,
+        ca.ancestor_concept_id   AS anc_id,
+        ca.min_levels_of_separation AS sep
+      FROM `{cdr}.concept_ancestor` AS ca
+      JOIN eligible AS e ON e.concept_id = ca.ancestor_concept_id
+    ),
+    per_concept AS (
+      -- Per ancestor: merge HLL sketches across descendants -> distinct
+      -- person count; sum events across descendants -> event count.
+      SELECT
+        ca.anc_id AS cid,
+        HLL_COUNT.MERGE(co.sk) AS n_persons,
+        SUM(co.n_events) AS n_events
+      FROM co_per_fact AS co
+      JOIN ca_dom AS ca ON ca.desc_id = co.fact_id
+      GROUP BY cid
+    ),
+    named AS (
+      SELECT pc.cid, pc.n_persons, pc.n_events, c.concept_name
+      FROM per_concept AS pc
+      JOIN `{cdr}.concept` AS c ON c.concept_id = pc.cid
+    ),
+    ranked AS (
+      -- Per (fact_id, candidate ancestor) row, plus the ancestor's
+      -- precomputed global person count. Reused for every floor below.
+      SELECT
+        co.fact_id,
+        ca.anc_id AS chosen,
+        ca.sep,
+        pc.n_persons
+      FROM co_per_fact AS co
+      JOIN ca_dom AS ca ON ca.desc_id = co.fact_id
+      JOIN per_concept AS pc ON pc.cid = ca.anc_id
+    ),
+    pick_50 AS (
+      SELECT fact_id, chosen FROM (
+        SELECT fact_id, chosen,
+               ROW_NUMBER() OVER (PARTITION BY fact_id
+                                  ORDER BY sep ASC, chosen ASC) AS rn
+        FROM ranked WHERE n_persons >= 50
+      ) WHERE rn = 1
+    ),
+    pick_100 AS (
+      SELECT fact_id, chosen FROM (
+        SELECT fact_id, chosen,
+               ROW_NUMBER() OVER (PARTITION BY fact_id
+                                  ORDER BY sep ASC, chosen ASC) AS rn
+        FROM ranked WHERE n_persons >= 100
+      ) WHERE rn = 1
+    ),
+    pick_500 AS (
+      SELECT fact_id, chosen FROM (
+        SELECT fact_id, chosen,
+               ROW_NUMBER() OVER (PARTITION BY fact_id
+                                  ORDER BY sep ASC, chosen ASC) AS rn
+        FROM ranked WHERE n_persons >= 500
+      ) WHERE rn = 1
+    ),
+    pick_1000 AS (
+      SELECT fact_id, chosen FROM (
+        SELECT fact_id, chosen,
+               ROW_NUMBER() OVER (PARTITION BY fact_id
+                                  ORDER BY sep ASC, chosen ASC) AS rn
+        FROM ranked WHERE n_persons >= 1000
+      ) WHERE rn = 1
+    ),
+    chosen_50   AS (SELECT DISTINCT chosen FROM pick_50),
+    chosen_100  AS (SELECT DISTINCT chosen FROM pick_100),
+    chosen_500  AS (SELECT DISTINCT chosen FROM pick_500),
+    chosen_1000 AS (SELECT DISTINCT chosen FROM pick_1000),
+    summary AS (
+      SELECT
+        COUNTIF(n_persons >=    1) AS p_ge_1,
+        COUNTIF(n_persons >=    5) AS p_ge_5,
+        COUNTIF(n_persons >=   50) AS p_ge_50,
+        COUNTIF(n_persons >=  100) AS p_ge_100,
+        COUNTIF(n_persons >=  500) AS p_ge_500,
+        COUNTIF(n_persons >= 1000) AS p_ge_1000,
+        COUNTIF(n_events  >=    1) AS e_ge_1,
+        COUNTIF(n_events  >=    5) AS e_ge_5,
+        COUNTIF(n_events  >=   50) AS e_ge_50,
+        COUNTIF(n_events  >=  100) AS e_ge_100,
+        COUNTIF(n_events  >=  500) AS e_ge_500,
+        COUNTIF(n_events  >= 1000) AS e_ge_1000,
+        COUNT(*)                                      AS n_concepts,
+        CAST(ROUND(AVG(n_persons)) AS INT64)          AS p_mean,
+        APPROX_QUANTILES(n_persons, 100)[OFFSET( 50)] AS p_p50,
+        APPROX_QUANTILES(n_persons, 100)[OFFSET( 90)] AS p_p90,
+        APPROX_QUANTILES(n_persons, 100)[OFFSET( 99)] AS p_p99,
+        MAX(n_persons)                                AS p_max,
+        CAST(ROUND(AVG(n_events)) AS INT64)           AS e_mean,
+        APPROX_QUANTILES(n_events,  100)[OFFSET( 50)] AS e_p50,
+        APPROX_QUANTILES(n_events,  100)[OFFSET( 90)] AS e_p90,
+        APPROX_QUANTILES(n_events,  100)[OFFSET( 99)] AS e_p99,
+        MAX(n_events)                                 AS e_max
+      FROM named
+    )
+    SELECT
+      s.*,
+      ARRAY(SELECT concept_name FROM named WHERE n_persons BETWEEN    1 AND    4
+            ORDER BY FARM_FINGERPRINT(concept_name) LIMIT 6) AS p_ex_1_5,
+      ARRAY(SELECT concept_name FROM named WHERE n_persons BETWEEN    5 AND   49
+            ORDER BY FARM_FINGERPRINT(concept_name) LIMIT 6) AS p_ex_5_50,
+      ARRAY(SELECT concept_name FROM named WHERE n_persons BETWEEN   50 AND   99
+            ORDER BY FARM_FINGERPRINT(concept_name) LIMIT 6) AS p_ex_50_100,
+      ARRAY(SELECT concept_name FROM named WHERE n_persons BETWEEN  100 AND  499
+            ORDER BY FARM_FINGERPRINT(concept_name) LIMIT 6) AS p_ex_100_500,
+      ARRAY(SELECT concept_name FROM named WHERE n_persons BETWEEN  500 AND  999
+            ORDER BY FARM_FINGERPRINT(concept_name) LIMIT 6) AS p_ex_500_1000,
+      ARRAY(SELECT concept_name FROM named WHERE n_persons >= 1000
+            ORDER BY FARM_FINGERPRINT(concept_name) LIMIT 6) AS p_ex_1000_inf,
+      ARRAY(SELECT concept_name FROM named WHERE n_events  BETWEEN    1 AND    4
+            ORDER BY FARM_FINGERPRINT(concept_name) LIMIT 6) AS e_ex_1_5,
+      ARRAY(SELECT concept_name FROM named WHERE n_events  BETWEEN    5 AND   49
+            ORDER BY FARM_FINGERPRINT(concept_name) LIMIT 6) AS e_ex_5_50,
+      ARRAY(SELECT concept_name FROM named WHERE n_events  BETWEEN   50 AND   99
+            ORDER BY FARM_FINGERPRINT(concept_name) LIMIT 6) AS e_ex_50_100,
+      ARRAY(SELECT concept_name FROM named WHERE n_events  BETWEEN  100 AND  499
+            ORDER BY FARM_FINGERPRINT(concept_name) LIMIT 6) AS e_ex_100_500,
+      ARRAY(SELECT concept_name FROM named WHERE n_events  BETWEEN  500 AND  999
+            ORDER BY FARM_FINGERPRINT(concept_name) LIMIT 6) AS e_ex_500_1000,
+      ARRAY(SELECT concept_name FROM named WHERE n_events  >= 1000
+            ORDER BY FARM_FINGERPRINT(concept_name) LIMIT 6) AS e_ex_1000_inf,
+      (SELECT COUNT(*) FROM (SELECT DISTINCT fact_id FROM co_per_fact)) AS n_event_concepts_total,
+      (SELECT COUNT(*) FROM chosen_50)   AS n_chosen_50,
+      (SELECT COUNT(*) FROM pick_50)     AS n_mapped_50,
+      (SELECT COUNT(*) FROM chosen_100)  AS n_chosen_100,
+      (SELECT COUNT(*) FROM pick_100)    AS n_mapped_100,
+      (SELECT COUNT(*) FROM chosen_500)  AS n_chosen_500,
+      (SELECT COUNT(*) FROM pick_500)    AS n_mapped_500,
+      (SELECT COUNT(*) FROM chosen_1000) AS n_chosen_1000,
+      (SELECT COUNT(*) FROM pick_1000)   AS n_mapped_1000,
+      ARRAY(SELECT c.concept_name FROM chosen_50 x JOIN `{cdr}.concept` c
+              ON c.concept_id = x.chosen
+            ORDER BY FARM_FINGERPRINT(c.concept_name) LIMIT 6) AS ex_50,
+      ARRAY(SELECT c.concept_name FROM chosen_100 x JOIN `{cdr}.concept` c
+              ON c.concept_id = x.chosen
+            ORDER BY FARM_FINGERPRINT(c.concept_name) LIMIT 6) AS ex_100,
+      ARRAY(SELECT c.concept_name FROM chosen_500 x JOIN `{cdr}.concept` c
+              ON c.concept_id = x.chosen
+            ORDER BY FARM_FINGERPRINT(c.concept_name) LIMIT 6) AS ex_500,
+      ARRAY(SELECT c.concept_name FROM chosen_1000 x JOIN `{cdr}.concept` c
+              ON c.concept_id = x.chosen
+            ORDER BY FARM_FINGERPRINT(c.concept_name) LIMIT 6) AS ex_1000
+    FROM summary s
+    """
+
+
+# --- print helpers ------------------------------------------------------
+def _i(v): return int(v) if v is not None else 0
+def _ex(arr): return ", ".join(f'"{n}"' for n in (arr or []))
+
+
+def print_domain(domain, table, col, row, elapsed):
+    print()
+    print("=" * 78)
+    print(f"DOMAIN={domain}   table={table}   col={col}   ({elapsed:.1f}s)")
+    print("(person counts via HLL_COUNT, ~1.6% std error at default precision)")
+    print("=" * 78)
+    if row is None:
+        print("  (no result)")
+        print("=" * 78)
+        return
+    print(f"  total standard {domain} concepts touched (>=1 event): {_i(row['n_concepts']):>10,}")
+    print()
+    print("  PERSON count per concept")
+    print(f"    >=   1: {_i(row['p_ge_1']):>10,}    e.g. {_ex(row['p_ex_1_5'])}")
+    print(f"    >=   5: {_i(row['p_ge_5']):>10,}    e.g. {_ex(row['p_ex_5_50'])}")
+    print(f"    >=  50: {_i(row['p_ge_50']):>10,}    e.g. {_ex(row['p_ex_50_100'])}")
+    print(f"    >= 100: {_i(row['p_ge_100']):>10,}    e.g. {_ex(row['p_ex_100_500'])}")
+    print(f"    >= 500: {_i(row['p_ge_500']):>10,}    e.g. {_ex(row['p_ex_500_1000'])}")
+    print(f"    >=1000: {_i(row['p_ge_1000']):>10,}    e.g. {_ex(row['p_ex_1000_inf'])}")
+    print(f"    distribution:  mean={_i(row['p_mean']):,}  p50={_i(row['p_p50']):,}  "
+          f"p90={_i(row['p_p90']):,}  p99={_i(row['p_p99']):,}  max={_i(row['p_max']):,}")
+    print()
+    print("  EVENT count per concept")
+    print(f"    >=   1: {_i(row['e_ge_1']):>10,}    e.g. {_ex(row['e_ex_1_5'])}")
+    print(f"    >=   5: {_i(row['e_ge_5']):>10,}    e.g. {_ex(row['e_ex_5_50'])}")
+    print(f"    >=  50: {_i(row['e_ge_50']):>10,}    e.g. {_ex(row['e_ex_50_100'])}")
+    print(f"    >= 100: {_i(row['e_ge_100']):>10,}    e.g. {_ex(row['e_ex_100_500'])}")
+    print(f"    >= 500: {_i(row['e_ge_500']):>10,}    e.g. {_ex(row['e_ex_500_1000'])}")
+    print(f"    >=1000: {_i(row['e_ge_1000']):>10,}    e.g. {_ex(row['e_ex_1000_inf'])}")
+    print(f"    distribution:  mean={_i(row['e_mean']):,}  p50={_i(row['e_p50']):,}  "
+          f"p90={_i(row['e_p90']):,}  p99={_i(row['e_p99']):,}  max={_i(row['e_max']):,}")
+    print()
+    print("  most-specific-eligible-ancestor mapping (per-event, independent picks)")
+    print(f"    event concepts seen in {table}: {_i(row['n_event_concepts_total']):,}")
+    for K, c, m, ex_key in [
+        (  50, row['n_chosen_50'],   row['n_mapped_50'],   'ex_50'),
+        ( 100, row['n_chosen_100'],  row['n_mapped_100'],  'ex_100'),
+        ( 500, row['n_chosen_500'],  row['n_mapped_500'],  'ex_500'),
+        (1000, row['n_chosen_1000'], row['n_mapped_1000'], 'ex_1000'),
+    ]:
+        print(f"    floor>={K:>4}-persons:  distinct concepts chosen = {_i(c):>7,}   "
+              f"events mapped = {_i(m):>7,}")
+        print(f"      e.g. {_ex(row[ex_key])}")
+    print("=" * 78)
+
+
+# --- run all domains in parallel ----------------------------------------
+def run_one(domain, table, col):
+    t_start = time.time()
+    sql = unified_sql(domain, table, col)
+    job = client.query(sql)
+    rows = list(job.result())
+    return domain, table, col, rows[0] if rows else None, time.time() - t_start
+
+
+print(f"submitting {len(DOMAINS)} domain queries in parallel "
+      f"(one HLL-based query per domain) ...")
+t0 = time.time()
+with ThreadPoolExecutor(max_workers=len(DOMAINS)) as ex:
+    futures = {ex.submit(run_one, d, t, c): (d, t, c) for d, t, c in DOMAINS}
+    for fut in as_completed(futures):
+        d, t, c = futures[fut]
+        try:
+            domain, table, col, row, elapsed = fut.result()
+            print_domain(domain, table, col, row, elapsed)
+        except Exception as e:
+            print()
+            print("=" * 78)
+            print(f"DOMAIN={d}   table={t}   col={c}   FAILED: {e}")
+            print("=" * 78)
+print()
+print(f"all domains done in {time.time() - t0:.1f}s wall")
