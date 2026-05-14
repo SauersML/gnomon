@@ -312,12 +312,37 @@ theorem individual_variation_dominates
     Too fine (exact PC coordinates) adds noise with small samples.
     Optimal depends on available calibration data. -/
 theorem optimal_granularity_tradeoff
-    (bias_coarse bias_fine variance_coarse variance_fine : ℝ)
-    (h_coarse_biased : bias_fine < bias_coarse)
-    (h_fine_variable : variance_coarse < variance_fine) :
-    -- Different regimes have different optima
-    bias_fine < bias_coarse ∧ variance_coarse < variance_fine :=
-  ⟨h_coarse_biased, h_fine_variable⟩
+    (bias_sq_coarse bias_sq_fine var_coarse_factor var_fine_factor : ℝ)
+    (h_bias : bias_sq_fine < bias_sq_coarse)
+    (h_var : var_coarse_factor < var_fine_factor) :
+    ∃ N_crit : ℝ, 0 < N_crit ∧
+      (∀ N_large, N_crit < N_large →
+        bias_sq_fine + var_fine_factor / N_large < bias_sq_coarse + var_coarse_factor / N_large) ∧
+      (∀ N_small, 0 < N_small → N_small < N_crit →
+        bias_sq_coarse + var_coarse_factor / N_small < bias_sq_fine + var_fine_factor / N_small) := by
+  use (var_fine_factor - var_coarse_factor) / (bias_sq_coarse - bias_sq_fine)
+  have h_num : 0 < var_fine_factor - var_coarse_factor := by linarith
+  have h_den : 0 < bias_sq_coarse - bias_sq_fine := by linarith
+  refine ⟨div_pos h_num h_den, ?_, ?_⟩
+  · intro N_large h_N
+    have h_N_pos : 0 < N_large := lt_trans (div_pos h_num h_den) h_N
+    have h1 : (var_fine_factor - var_coarse_factor) / (bias_sq_coarse - bias_sq_fine) < N_large := h_N
+    have h2 : (var_fine_factor - var_coarse_factor) < N_large * (bias_sq_coarse - bias_sq_fine) :=
+      (div_lt_iff₀ h_den).mp h1
+    have h3 : (var_fine_factor - var_coarse_factor) / N_large < bias_sq_coarse - bias_sq_fine :=
+      (div_lt_iff₀' h_N_pos).mpr h2
+    have h4 : var_fine_factor / N_large - var_coarse_factor / N_large = (var_fine_factor - var_coarse_factor) / N_large := by ring
+    rw [← h4] at h3
+    linarith
+  · intro N_small h_N_pos h_N
+    have h1 : N_small < (var_fine_factor - var_coarse_factor) / (bias_sq_coarse - bias_sq_fine) := h_N
+    have h2 : N_small * (bias_sq_coarse - bias_sq_fine) < var_fine_factor - var_coarse_factor :=
+      (lt_div_iff₀ h_den).mp h1
+    have h3 : bias_sq_coarse - bias_sq_fine < (var_fine_factor - var_coarse_factor) / N_small :=
+      (lt_div_iff₀' h_N_pos).mpr h2
+    have h4 : var_fine_factor / N_small - var_coarse_factor / N_small = (var_fine_factor - var_coarse_factor) / N_small := by ring
+    rw [← h4] at h3
+    linarith
 
 end ContinuousAncestry
 
