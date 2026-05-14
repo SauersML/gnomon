@@ -19,6 +19,10 @@ env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   GNOMON_SKIP_LINT_CHECKS: "1"
 
+concurrency:
+  group: build-release-all-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: write
 
@@ -115,6 +119,11 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           cargo +nightly install cargo-zigbuild --locked
 
+      - name: Enable vendored OpenSSL for old-glibc Linux builds
+        if: matrix.use_zig == true
+        shell: bash
+        run: cargo +nightly add openssl@0.10.79 --features vendored
+
       - name: Build and package binaries
         shell: bash
         env:
@@ -180,8 +189,9 @@ jobs:
             build_cmd+=(zigbuild)
           else
             build_cmd+=(build)
+            build_cmd+=(--locked)
           fi
-          build_cmd+=(--locked --release --target "$TARGET" --bin gnomon)
+          build_cmd+=(--release --target "$TARGET" --bin gnomon)
 
           echo "::group::Build release binaries"
           "${build_cmd[@]}"

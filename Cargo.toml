@@ -80,7 +80,6 @@ noodles-vcf = "0.81.0"
 noodles-bgzf = "0.43.0"
 reqwest = { version = "0.12.9", default-features = false, features = ["blocking", "rustls-tls-native-roots"] }
 rustls = { version = "0.23.36", features = ["ring"] }
-openssl = { version = "0.10.79", features = ["vendored"] }
 serde_json = "1.0.145"
 sysinfo = "0.30.12"
 ratatui = "0.30"
