@@ -18,6 +18,10 @@ on:
       - 'score/**'
       - '.github/workflows/convert-score.yml'
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+
 jobs:
   run-example:
     runs-on: ubuntu-latest

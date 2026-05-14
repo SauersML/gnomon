@@ -45,7 +45,7 @@ use ndarray::{Array1, ArrayView1};
 use std::collections::HashSet;
 #[cfg(any(feature = "score", feature = "map", feature = "terms"))]
 use std::path::PathBuf;
-use std::process;
+use std::{env, process};
 
 #[cfg(feature = "score")]
 #[path = "../score/main.rs"]
@@ -420,7 +420,21 @@ fn main() {
 }
 
 fn dispatch_current_binary() -> Result<(), Box<dyn std::error::Error>> {
-    match env!("CARGO_BIN_NAME") {
+    let binary_name = env::args_os()
+        .next()
+        .and_then(|path| {
+            std::path::PathBuf::from(path)
+                .file_name()
+                .map(|name| name.to_owned())
+        })
+        .and_then(|name| name.into_string().ok())
+        .ok_or("unable to determine binary name")?;
+
+    let binary_name = binary_name.strip_suffix(".exe").unwrap_or(&binary_name);
+    let entrypoint_name = release_entrypoint_name(binary_name)
+        .ok_or_else(|| format!("unsupported binary '{binary_name}' for this feature set"))?;
+
+    match entrypoint_name {
         #[cfg(all(
             feature = "map",
             feature = "score",
@@ -437,6 +451,52 @@ fn dispatch_current_binary() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(feature = "calibrate")]
         "gnomon-calibrate" => run_calibrate_entrypoint(),
         other => Err(format!("unsupported binary '{other}' for this feature set").into()),
+    }
+}
+
+fn release_entrypoint_name(binary_name: &str) -> Option<&'static str> {
+    match binary_name {
+        "gnomon"
+        | "gnomon-macos-arm64"
+        | "gnomon-macos-intel"
+        | "gnomon-linux-x64"
+        | "gnomon-linux-x64-v3"
+        | "gnomon-linux-arm64"
+        | "gnomon-windows-x64"
+        | "gnomon-windows-arm64" => Some("gnomon"),
+        "gnomon-map"
+        | "gnomon-map-macos-arm64"
+        | "gnomon-map-macos-intel"
+        | "gnomon-map-linux-x64"
+        | "gnomon-map-linux-x64-v3"
+        | "gnomon-map-linux-arm64"
+        | "gnomon-map-windows-x64"
+        | "gnomon-map-windows-arm64" => Some("gnomon-map"),
+        "gnomon-score"
+        | "gnomon-score-macos-arm64"
+        | "gnomon-score-macos-intel"
+        | "gnomon-score-linux-x64"
+        | "gnomon-score-linux-x64-v3"
+        | "gnomon-score-linux-arm64"
+        | "gnomon-score-windows-x64"
+        | "gnomon-score-windows-arm64" => Some("gnomon-score"),
+        "gnomon-terms"
+        | "gnomon-terms-macos-arm64"
+        | "gnomon-terms-macos-intel"
+        | "gnomon-terms-linux-x64"
+        | "gnomon-terms-linux-x64-v3"
+        | "gnomon-terms-linux-arm64"
+        | "gnomon-terms-windows-x64"
+        | "gnomon-terms-windows-arm64" => Some("gnomon-terms"),
+        "gnomon-calibrate"
+        | "gnomon-calibrate-macos-arm64"
+        | "gnomon-calibrate-macos-intel"
+        | "gnomon-calibrate-linux-x64"
+        | "gnomon-calibrate-linux-x64-v3"
+        | "gnomon-calibrate-linux-arm64"
+        | "gnomon-calibrate-windows-x64"
+        | "gnomon-calibrate-windows-arm64" => Some("gnomon-calibrate"),
+        _ => None,
     }
 }
 

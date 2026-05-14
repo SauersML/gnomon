@@ -1,6 +1,6 @@
 use super::fit::{
-    FitOptions, HwePcaError, HwePcaModel, LdConfig, LdWindow, StreamingMafFilterSource,
-    VariantBlockSource,
+    DEFAULT_BLOCK_WIDTH, DenseBlockSource, FitOptions, HwePcaError, HwePcaModel, LdConfig,
+    LdWindow, StreamingMafFilterSource, VariantBlockSource,
 };
 use super::io::{
     DatasetOutputError, GenotypeDataset, GenotypeIoError, OrderedSelectionPlan,
@@ -220,11 +220,8 @@ fn run_fit(
         }
     }
 
-    if maf.is_some() && matches!(ld, Some(LdWindow::BasePairs(_))) {
-        return Err(MapDriverError::InvalidState(
-            "MAF streaming cannot be combined with base-pair LD windows because retained positions are only known during the genotype stream".into(),
-        ));
-    }
+    let is_vcf_like = matches!(dataset, GenotypeDataset::Variants(_));
+    let materialize_vcf = is_vcf_like;
 
     let mut fit_options = FitOptions::default();
     if let Some(window_spec) = ld.clone() {
@@ -234,7 +231,7 @@ fn run_fit(
             ridge: None,
             variant_keys: None,
         };
-        if matches!(window_spec, LdWindow::BasePairs(_)) {
+        if matches!(window_spec, LdWindow::BasePairs(_)) && !materialize_vcf {
             let keys_arc = if let Some(existing) = &variant_keys {
                 Arc::clone(existing)
             } else {
@@ -247,9 +244,60 @@ fn run_fit(
     }
 
     let progress = fit_progress();
-    fit_options.cache_source = maf.is_some();
+    fit_options.cache_source = maf.is_some() && !is_vcf_like;
 
-    let (mut model, retained_indices, selection_outcome) = if let Some(min_maf) = maf {
+    let (mut model, retained_indices, selection_outcome, mut streamed_keys) = if materialize_vcf {
+        println!("Materializing retained VCF variants in RAM for single-pass fitting.");
+        let raw_source = dataset.block_source_with_plan(selection_plan.clone())?;
+        let (data, n_variants, keys, outcome) = if let Some(min_maf) = maf {
+            let mut source = StreamingMafFilterSource::new(raw_source, min_maf)?;
+            let materialized = materialize_fit_source(&mut source)?;
+            let outcome = source.inner_mut().take_selection_outcome();
+            (
+                materialized.data,
+                materialized.n_variants,
+                materialized.keys,
+                outcome,
+            )
+        } else {
+            let mut source = raw_source;
+            let materialized = materialize_fit_source(&mut source)?;
+            let outcome = source.take_selection_outcome();
+            (
+                materialized.data,
+                materialized.n_variants,
+                materialized.keys,
+                outcome,
+            )
+        };
+
+        let keys = keys.ok_or_else(|| {
+            MapDriverError::InvalidState(
+                "VCF materialization did not capture variant positions for base-pair LD".into(),
+            )
+        })?;
+        if keys.len() != n_variants {
+            return Err(MapDriverError::InvalidState(format!(
+                "VCF materialization captured {} keys for {n_variants} retained variants",
+                keys.len()
+            )));
+        }
+        if let Some(ld_config) = fit_options.ld.as_mut() {
+            if matches!(ld_config.window, Some(LdWindow::BasePairs(_))) {
+                ld_config.variant_keys = Some(Arc::new(keys.clone()));
+            }
+        }
+        let mut materialized_options = fit_options.clone();
+        materialized_options.cache_source = false;
+        let mut source = DenseBlockSource::new(&data, dataset.n_samples(), n_variants)?;
+        let model = HwePcaModel::fit_k_with_options_and_progress(
+            &mut source,
+            components,
+            &materialized_options,
+            &progress,
+        )?;
+        (model, None, outcome, Some(keys))
+    } else if let Some(min_maf) = maf {
         let raw_source = dataset.block_source_with_plan(selection_plan.clone())?;
         let mut source = StreamingMafFilterSource::new(raw_source, min_maf)?;
         let model = HwePcaModel::fit_k_with_options_and_progress(
@@ -259,8 +307,10 @@ fn run_fit(
             &progress,
         )?;
         let retained = source.retained_indices().to_vec();
+        let keys = source.take_variant_keys();
         let outcome = source.inner_mut().take_selection_outcome();
-        (model, Some(retained), outcome)
+        let retained_indices = if keys.is_some() { None } else { Some(retained) };
+        (model, retained_indices, outcome, keys)
     } else {
         let mut source = dataset.block_source_with_plan(selection_plan.clone())?;
         let model = HwePcaModel::fit_k_with_options_and_progress(
@@ -270,7 +320,8 @@ fn run_fit(
             &progress,
         )?;
         let outcome = source.take_selection_outcome();
-        (model, None, outcome)
+        let keys = source.take_variant_keys();
+        (model, None, outcome, keys)
     };
 
     if let Some(outcome) = selection_outcome {
@@ -292,7 +343,15 @@ fn run_fit(
                 "Variant list did not match any variants in the dataset".into(),
             ));
         }
-        variant_keys = Some(Arc::new(outcome.matched_keys));
+        if !(maf.is_some() && streamed_keys.is_some()) {
+            variant_keys = Some(Arc::new(outcome.matched_keys));
+        }
+    }
+
+    if variant_keys.is_none()
+        && let Some(keys) = streamed_keys.take()
+    {
+        variant_keys = Some(Arc::new(keys));
     }
 
     if variant_keys.is_none() {
@@ -358,6 +417,72 @@ fn run_fit(
     println!("  • Fit summary     : {}", summary_path.display());
 
     Ok(())
+}
+
+struct MaterializedFitSource {
+    data: Vec<f64>,
+    n_variants: usize,
+    keys: Option<Vec<VariantKey>>,
+}
+
+fn materialize_fit_source<S>(source: &mut S) -> Result<MaterializedFitSource, HwePcaError>
+where
+    S: VariantBlockSource + Send,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    let n_samples = source.n_samples();
+    let hint = source.n_variants();
+    let block_capacity = if hint > 0 {
+        DEFAULT_BLOCK_WIDTH.min(hint).max(1)
+    } else {
+        DEFAULT_BLOCK_WIDTH.max(1)
+    };
+    let mut block = vec![0.0f64; n_samples.saturating_mul(block_capacity)];
+    let mut data = Vec::with_capacity(n_samples.saturating_mul(hint));
+    let mut n_variants = 0usize;
+
+    source
+        .reset()
+        .map_err(|err| HwePcaError::Source(Box::new(err)))?;
+
+    loop {
+        let filled = source
+            .next_block_into(block_capacity, &mut block)
+            .map_err(|err| HwePcaError::Source(Box::new(err)))?;
+        if filled == 0 {
+            break;
+        }
+        let len = n_samples.checked_mul(filled).ok_or_else(|| {
+            HwePcaError::InvalidInput("materialized genotype matrix dimension overflow")
+        })?;
+        data.extend_from_slice(&block[..len]);
+        n_variants = n_variants
+            .checked_add(filled)
+            .ok_or(HwePcaError::InvalidInput(
+                "materialized variant count overflow",
+            ))?;
+    }
+
+    if n_variants == 0 {
+        return Err(HwePcaError::InvalidInput(
+            "VariantBlockSource yielded no variants",
+        ));
+    }
+
+    let keys = source.take_variant_keys();
+    if let Some(keys) = &keys
+        && keys.len() != n_variants
+    {
+        return Err(HwePcaError::InvalidInput(
+            "materialized variant key count does not match retained variants",
+        ));
+    }
+
+    Ok(MaterializedFitSource {
+        data,
+        n_variants,
+        keys,
+    })
 }
 
 fn retain_variant_keys_by_logical_indices(

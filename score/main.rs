@@ -182,14 +182,14 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
         )
     })?;
 
-    if input_format == InputFormat::Vcf {
-        if args.panel.is_some() {
-            return Err(
-                "--panel is only supported by the PLINK conversion path, not native VCF streaming."
-                    .into(),
-            );
-        }
+    let use_native_vcf = input_format == InputFormat::Vcf && args.panel.is_none();
+    if input_format == InputFormat::Vcf && args.panel.is_some() {
+        eprintln!(
+            "> --panel supplied; using PLINK conversion path so panel harmonization is applied."
+        );
+    }
 
+    if use_native_vcf {
         ensure_output_absent(&args.input_path, &out_suffix)?;
         let (resolved_score_files, score_regions_map) =
             resolve_score_files(&args.score, &score_arg_str, &args.input_path)?;

@@ -2,7 +2,6 @@ use crate::score::types::parse_chromosome_label;
 use crate::shared::files::{VariantCompression, VariantFormat, open_variant_source};
 use ahash::{AHashMap, AHashSet};
 use flate2::read::MultiGzDecoder;
-use noodles_bgzf::io::Reader as BgzfReader;
 use noodles_vcf::io::Reader as VcfReader;
 use noodles_vcf::variant::record::AlternateBases as _;
 use noodles_vcf::variant::record::samples::keys::key;
@@ -33,8 +32,8 @@ struct ScoreRule {
 #[derive(Debug, Clone, Copy)]
 struct MatchedRule {
     score_index: usize,
-    weight: f32,
-    effect_is_alt: bool,
+    intercept: f64,
+    alt_slope: f64,
 }
 
 type VariantKey = (u8, u32);
@@ -63,7 +62,8 @@ pub fn score_vcf_streaming(
             VcfReader::new(reader)
         }
         VariantCompression::Bgzf => {
-            let reader: Box<dyn BufRead + Send> = Box::new(BgzfReader::new(BufReader::new(source)));
+            let reader: Box<dyn BufRead + Send> =
+                Box::new(BufReader::new(MultiGzDecoder::new(source)));
             VcfReader::new(reader)
         }
     };
@@ -85,10 +85,10 @@ pub fn score_vcf_streaming(
     let mut sum_scores = vec![0.0f64; num_people * num_scores];
     let mut missing_counts = vec![0u32; num_people * num_scores];
     let mut score_variant_counts = vec![0u32; num_scores];
-    let mut matched_variant_keys: AHashSet<(VariantKey, usize)> = AHashSet::new();
+    let mut matched_variant_keys: AHashSet<(VariantKey, usize, usize)> = AHashSet::new();
 
     let mut record = noodles_vcf::Record::default();
-    let mut decoded = vec![None; all_samples.len()];
+    let mut decoded = vec![None; kept_indices.len()];
 
     while reader.read_record(&mut record)? != 0 {
         let chr = match parse_chromosome_label(record.reference_sequence_name()) {
@@ -121,28 +121,25 @@ pub fn score_vcf_streaming(
             }
 
             decoded.fill(None);
-            decode_vcf_record_gt_only(&record, alt_index, alt_alleles.len(), &mut decoded)?;
+            decode_vcf_record_best(
+                &record,
+                alt_index,
+                alt_alleles.len(),
+                &kept_indices,
+                &mut decoded,
+            )?;
 
-            let mut counted_scores = AHashSet::new();
             for rule in &matched_rules {
-                if counted_scores.insert(rule.score_index) {
-                    score_variant_counts[rule.score_index] += 1;
-                    matched_variant_keys.insert((key, rule.score_index));
-                }
+                score_variant_counts[rule.score_index] += 1;
+                matched_variant_keys.insert((key, alt_index, rule.score_index));
             }
 
-            for (out_person_idx, &sample_idx) in kept_indices.iter().enumerate() {
-                let dosage = decoded[sample_idx];
+            for (out_person_idx, dosage) in decoded.iter().copied().enumerate() {
                 for rule in &matched_rules {
                     let cell = out_person_idx * num_scores + rule.score_index;
                     match dosage {
                         Some(alt_dosage) => {
-                            let effect_dosage = if rule.effect_is_alt {
-                                alt_dosage
-                            } else {
-                                2.0 - alt_dosage
-                            };
-                            sum_scores[cell] += effect_dosage * rule.weight as f64;
+                            sum_scores[cell] += rule.intercept + rule.alt_slope * alt_dosage;
                         }
                         None => {
                             missing_counts[cell] += 1;
@@ -151,6 +148,14 @@ pub fn score_vcf_streaming(
                 }
             }
         }
+    }
+
+    if matched_variant_keys.is_empty() {
+        return Err(format!(
+            "No overlapping variants were found between '{}' and the score file(s).",
+            input_path.display()
+        )
+        .into());
     }
 
     Ok(NativeVcfScoreResult {
@@ -285,31 +290,35 @@ fn match_rules_for_allele(
     ref_allele: &str,
     alt_allele: &str,
 ) -> Vec<MatchedRule> {
-    let mut aggregate: BTreeMap<(usize, bool), f32> = BTreeMap::new();
+    let mut aggregate: BTreeMap<usize, (f64, f64)> = BTreeMap::new();
     for rule in rules {
         if rule.effect_allele == alt_allele && rule.other_allele == ref_allele {
-            *aggregate.entry((rule.score_index, true)).or_default() += rule.weight;
+            let (_, slope) = aggregate.entry(rule.score_index).or_default();
+            *slope += f64::from(rule.weight);
         } else if rule.effect_allele == ref_allele && rule.other_allele == alt_allele {
-            *aggregate.entry((rule.score_index, false)).or_default() += rule.weight;
+            let (intercept, slope) = aggregate.entry(rule.score_index).or_default();
+            *intercept += 2.0 * f64::from(rule.weight);
+            *slope -= f64::from(rule.weight);
         }
     }
 
     aggregate
         .into_iter()
-        .filter_map(|((score_index, effect_is_alt), weight)| {
-            (weight != 0.0).then_some(MatchedRule {
+        .filter_map(|(score_index, (intercept, alt_slope))| {
+            (intercept != 0.0 || alt_slope != 0.0).then_some(MatchedRule {
                 score_index,
-                weight,
-                effect_is_alt,
+                intercept,
+                alt_slope,
             })
         })
         .collect()
 }
 
-fn decode_vcf_record_gt_only(
+fn decode_vcf_record_best(
     record: &noodles_vcf::Record,
     alt_index: usize,
     alt_count: usize,
+    kept_indices: &[usize],
     dest: &mut [Option<f64>],
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let samples = record.samples();
@@ -338,9 +347,16 @@ fn decode_vcf_record_gt_only(
         None => return Err("VCF record is missing GT, DS, or GP FORMAT fields.".into()),
     };
 
+    let mut kept_cursor = 0usize;
     for (sample_idx, sample) in samples.iter().enumerate() {
-        if sample_idx >= dest.len() {
+        while kept_cursor < kept_indices.len() && kept_indices[kept_cursor] < sample_idx {
+            kept_cursor += 1;
+        }
+        if kept_cursor >= kept_indices.len() {
             break;
+        }
+        if kept_indices[kept_cursor] != sample_idx {
+            continue;
         }
 
         let mut ds_field = None;
@@ -361,20 +377,23 @@ fn decode_vcf_record_gt_only(
         if let Some(value) = ds_field
             && let Some(parsed) = parse_vcf_dosage_field(value, alt_index, alt_count)?
         {
-            dest[sample_idx] = Some(parsed);
+            dest[kept_cursor] = Some(parsed);
+            kept_cursor += 1;
             continue;
         }
         if let Some(value) = gp_field
             && let Some(parsed) = parse_vcf_gp(value, alt_index, alt_count)?
         {
-            dest[sample_idx] = Some(parsed);
+            dest[kept_cursor] = Some(parsed);
+            kept_cursor += 1;
             continue;
         }
         if let Some(value) = gt_field
             && let Some(parsed) = parse_vcf_genotype(value, alt_index)?
         {
-            dest[sample_idx] = Some(parsed);
+            dest[kept_cursor] = Some(parsed);
         }
+        kept_cursor += 1;
     }
 
     Ok(())
@@ -599,6 +618,117 @@ mod tests {
         assert_eq!(result.score_variant_counts, [2]);
         assert_eq!(result.missing_counts, [0, 0, 1]);
         assert_eq!(result.sum_scores, [0.0, 1.5, 2.0]);
+        assert_eq!(result.matched_variants, 2);
+    }
+
+    #[test]
+    fn native_vcf_keep_file_and_opposite_orientation_rows_are_scored_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vcf_path = dir.path().join("cohort.vcf");
+        let score_path = dir.path().join("score.gnomon.tsv");
+        let keep_path = dir.path().join("keep.txt");
+
+        {
+            let mut vcf = File::create(&vcf_path).expect("create vcf");
+            writeln!(vcf, "##fileformat=VCFv4.2").expect("write");
+            writeln!(
+                vcf,
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts1\ts2\ts3\ts4"
+            )
+            .expect("write");
+            writeln!(vcf, "1\t100\t.\tA\tG\t.\tPASS\t.\tGT\t0/0\t0/1\t1/1\t./.").expect("write");
+            writeln!(vcf, "1\t200\t.\tC\tT\t.\tPASS\t.\tGT\t1/1\t0/1\t0/0\t0/0").expect("write");
+        }
+
+        {
+            let mut score = File::create(&score_path).expect("create score");
+            writeln!(score, "variant_id\teffect_allele\tother_allele\tScoreA").expect("write");
+            writeln!(score, "1:100\tG\tA\t0.5").expect("write");
+            writeln!(score, "1:100\tA\tG\t1.0").expect("write");
+            writeln!(score, "1:200\tC\tT\t1.0").expect("write");
+        }
+
+        {
+            let mut keep = File::create(&keep_path).expect("create keep");
+            writeln!(keep, "s2").expect("write");
+            writeln!(keep, "s4").expect("write");
+        }
+
+        let result =
+            score_vcf_streaming(&vcf_path, &[score_path], Some(&keep_path)).expect("score");
+        assert_eq!(result.person_iids, vec!["s2", "s4"]);
+        assert_eq!(result.score_names, vec!["ScoreA"]);
+        assert_eq!(result.score_variant_counts, [2]);
+        assert_eq!(result.missing_counts, [0, 1]);
+        assert_eq!(result.sum_scores, [2.5, 2.0]);
+        assert_eq!(result.matched_variants, 2);
+    }
+
+    #[test]
+    fn native_vcf_multiallelic_gt_scores_each_alt_separately() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vcf_path = dir.path().join("cohort.vcf");
+        let score_path = dir.path().join("score.gnomon.tsv");
+
+        {
+            let mut vcf = File::create(&vcf_path).expect("create vcf");
+            writeln!(vcf, "##fileformat=VCFv4.2").expect("write");
+            writeln!(
+                vcf,
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts1\ts2\ts3"
+            )
+            .expect("write");
+            writeln!(vcf, "1\t100\t.\tA\tG,T\t.\tPASS\t.\tGT\t0/1\t0/2\t1/2").expect("write");
+        }
+
+        {
+            let mut score = File::create(&score_path).expect("create score");
+            writeln!(score, "variant_id\teffect_allele\tother_allele\tScoreA").expect("write");
+            writeln!(score, "1:100\tG\tA\t1.0").expect("write");
+            writeln!(score, "1:100\tT\tA\t10.0").expect("write");
+        }
+
+        let result = score_vcf_streaming(&vcf_path, &[score_path], None).expect("score");
+        assert_eq!(result.score_variant_counts, [2]);
+        assert_eq!(result.missing_counts, [0, 0, 0]);
+        assert_eq!(result.sum_scores, [1.0, 10.0, 11.0]);
+        assert_eq!(result.matched_variants, 2);
+    }
+
+    #[test]
+    fn native_vcf_multiallelic_ds_scores_alt_specific_values_without_gt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vcf_path = dir.path().join("cohort.vcf");
+        let score_path = dir.path().join("score.gnomon.tsv");
+
+        {
+            let mut vcf = File::create(&vcf_path).expect("create vcf");
+            writeln!(vcf, "##fileformat=VCFv4.2").expect("write");
+            writeln!(
+                vcf,
+                "##FORMAT=<ID=DS,Number=A,Type=Float,Description=\"Alternate allele dosage\">"
+            )
+            .expect("write");
+            writeln!(
+                vcf,
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts1\ts2"
+            )
+            .expect("write");
+            writeln!(vcf, "1\t100\t.\tA\tG,T\t.\tPASS\t.\tDS\t1.5,0.1\t0.2,1.6").expect("write");
+        }
+
+        {
+            let mut score = File::create(&score_path).expect("create score");
+            writeln!(score, "variant_id\teffect_allele\tother_allele\tScoreA").expect("write");
+            writeln!(score, "1:100\tG\tA\t1.0").expect("write");
+            writeln!(score, "1:100\tT\tA\t10.0").expect("write");
+        }
+
+        let result = score_vcf_streaming(&vcf_path, &[score_path], None).expect("score");
+        assert_eq!(result.score_variant_counts, [2]);
+        assert_eq!(result.missing_counts, [0, 0]);
+        assert!((result.sum_scores[0] - 2.5).abs() < 1e-12);
+        assert!((result.sum_scores[1] - 16.2).abs() < 1e-12);
         assert_eq!(result.matched_variants, 2);
     }
 }

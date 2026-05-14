@@ -19,10 +19,6 @@ env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   GNOMON_SKIP_LINT_CHECKS: "1"
 
-concurrency:
-  group: build-release-all-${{ github.ref }}
-  cancel-in-progress: true
-
 permissions:
   contents: write
 
@@ -185,7 +181,7 @@ jobs:
           else
             build_cmd+=(build)
           fi
-          build_cmd+=(--release --target "$TARGET" --bin gnomon)
+          build_cmd+=(--locked --release --target "$TARGET" --bin gnomon)
 
           echo "::group::Build release binaries"
           "${build_cmd[@]}"

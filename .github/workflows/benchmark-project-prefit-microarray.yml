@@ -17,6 +17,10 @@ on:
       - "scripts/benchmark_project_prefit_microarray.py"
       - ".github/workflows/benchmark-project-prefit-microarray.yml"
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1

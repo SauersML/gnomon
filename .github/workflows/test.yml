@@ -30,6 +30,10 @@ on:
       - 'map/*.rs'
   workflow_dispatch:  # Manual trigger
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
