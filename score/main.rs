@@ -15,8 +15,9 @@
 use clap::{Parser, ValueEnum};
 use gnomon::score::download;
 use gnomon::score::genotype_convert;
-use gnomon::score::genotype_convert::EnsurePlinkOptions;
+use gnomon::score::genotype_convert::{EnsurePlinkOptions, InputFormat, detect_input_format};
 use gnomon::score::io::{gcs_billing_project_from_env, get_shared_runtime, load_adc_credentials};
+use gnomon::score::native_vcf::{self, NativeVcfScoreResult};
 use gnomon::score::pipeline::{self, PipelineContext};
 use gnomon::score::prepare;
 use gnomon::score::reformat;
@@ -161,14 +162,83 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
     });
 
     let overall_start_time = Instant::now();
+    let score_arg_str = args.score.to_string_lossy().to_string();
+
+    // --- Output Naming & Safety Check ---
+    // For inline PGS lists, use a compact deterministic suffix to keep output names short.
+    let out_suffix = if !args.score.exists() && score_arg_str.contains("PGS") {
+        inline_pgs_output_suffix(&score_arg_str)
+    } else {
+        args.score
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "scores".to_string())
+    };
+
+    let input_format = detect_input_format(&args.input_path).ok_or_else(|| {
+        format!(
+            "Could not determine input format for '{}'. Expected PLINK (.bed/.bim/.fam), VCF (.vcf, .vcf.gz), BCF (.bcf), or DTC text (.txt).",
+            args.input_path.display()
+        )
+    })?;
+
+    if input_format == InputFormat::Vcf {
+        if args.panel.is_some() {
+            return Err(
+                "--panel is only supported by the PLINK conversion path, not native VCF streaming."
+                    .into(),
+            );
+        }
+
+        ensure_output_absent(&args.input_path, &out_suffix)?;
+        let (resolved_score_files, score_regions_map) =
+            resolve_score_files(&args.score, &score_arg_str, &args.input_path)?;
+
+        if resolved_score_files.is_empty() {
+            return Err("No score files were found or resolved.".into());
+        }
+
+        eprintln!("> Using native noodles-vcf streaming scorer for VCF input.");
+        eprintln!(
+            "> Normalizing and preparing {} score file(s)...",
+            resolved_score_files.len()
+        );
+        let prep_start = Instant::now();
+        let native_score_files = normalize_score_files(&resolved_score_files)?;
+        let native_result = native_vcf::score_vcf_streaming(
+            &args.input_path,
+            &native_score_files,
+            args.keep.as_deref(),
+        )?;
+        eprintln!(
+            "> Native VCF scoring complete in {:.2?}. Found {} individuals to score and {} overlapping score variants across {} score(s).",
+            prep_start.elapsed(),
+            native_result.person_iids.len(),
+            native_result.matched_variants,
+            native_result.score_names.len()
+        );
+
+        let score_regions_ref = if score_regions_map.is_empty() {
+            None
+        } else {
+            Some(&score_regions_map)
+        };
+        finalize_and_write_native_output(
+            &args.input_path,
+            &native_result,
+            score_regions_ref,
+            Some(&out_suffix),
+        )?;
+
+        eprintln!(
+            "\nSuccess! Total execution time: {:.2?}",
+            overall_start_time.elapsed()
+        );
+        return Ok(());
+    }
 
     // --- Genotype Format Conversion (if needed) ---
-    // Transparently convert VCF/BCF/DTC text to PLINK format before proceeding.
-    // If --panel is provided, convert_genome will harmonize alleles to match the reference panel.
-    //
-    // When the caller supplied `--inferred-sex`, plumb it through as a
-    // pre-computed value so the VCF→PLINK step skips its own
-    // `infer_first_sample_sex` pass (saves ~4min on whole-genome imputed VCFs).
+    // PLINK inputs continue directly; DTC/BCF inputs use the existing conversion path.
     let inferred_sex_override = args.inferred_sex.map(|s| match s {
         InferredSexArg::Male => genotype_convert::ConvertSex::Male,
         InferredSexArg::Female => genotype_convert::ConvertSex::Female,
@@ -186,165 +256,15 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
     )?;
 
     let fileset_prefixes = resolve_filesets(&effective_input_path)?;
-    let score_arg_str = args.score.to_string_lossy().to_string();
+    ensure_output_absent(&fileset_prefixes[0], &out_suffix)?;
 
-    // --- Output Naming & Safety Check ---
-    // For inline PGS lists, use a compact deterministic suffix to keep output names short.
-    let out_suffix = if !args.score.exists() && score_arg_str.contains("PGS") {
-        inline_pgs_output_suffix(&score_arg_str)
-    } else {
-        args.score
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "scores".to_string())
-    };
-
-    {
-        let output_prefix = &fileset_prefixes[0];
-        let (output_dir, mut out_stem) = if output_prefix.to_string_lossy().starts_with("gs://") {
-            let stem = output_prefix.file_name().map_or_else(
-                || std::ffi::OsString::from("gnomon_results"),
-                std::ffi::OsString::from,
-            );
-            (std::path::Path::new(".").to_path_buf(), stem)
-        } else {
-            let parent = output_prefix.parent();
-            // Handle both None and empty parent (Path::new("arrays").parent() == Some(""))
-            let dir = match parent {
-                Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-                _ => std::path::Path::new(".").to_path_buf(),
-            };
-            let stem = output_prefix
-                .file_name()
-                .unwrap_or_else(|| std::ffi::OsStr::new("gnomon_results"))
-                .to_os_string();
-            (dir, stem)
-        };
-
-        // Apply smart naming: cohort + "_" + score_name
-        out_stem.push("_");
-        out_stem.push(&out_suffix);
-
-        let mut output_path = output_dir.join(out_stem);
-        output_path.set_extension("sscore");
-
-        if output_path.exists() {
-            return Err(format!(
-                "Output file '{}' already exists. Gnomon will not overwrite it. Please remove it or rename it before running.",
-                output_path.display()
-            )
-            .into());
-        }
-    }
-
-    // --- Phase 1a: Score File Resolution ---
-    // This block resolves the --score argument into a definitive list of files.
-    let (resolved_score_files, score_regions_map): (Vec<PathBuf>, HashMap<String, GenomicRegion>) = {
-        if !args.score.exists() && score_arg_str.contains("PGS") {
-            let scores_cache_dir = {
-                let p0 = &fileset_prefixes[0];
-                let parent_local = p0
-                    .to_string_lossy()
-                    .starts_with("gs://")
-                    .then(|| Path::new(".").to_path_buf())
-                    .unwrap_or_else(|| match p0.parent() {
-                        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-                        _ => Path::new(".").to_path_buf(),
-                    });
-                parent_local.join("gnomon_score_cache")
-            };
-
-            let resolved =
-                download::resolve_and_download_scores(&score_arg_str, &scores_cache_dir)?;
-            (resolved.paths, resolved.regions)
-        } else {
-            let files: Vec<PathBuf> = if args.score.is_dir() {
-                // Single pass to collect files and build metadata maps
-                // Consolidating iterations improves performance by reducing I/O and vector traversals
-                let mut source_files: Vec<(PathBuf, String)> = Vec::new();
-                let mut cache_files: Vec<(PathBuf, String)> = Vec::new();
-                let mut source_mtimes: std::collections::HashMap<String, std::time::SystemTime> =
-                    std::collections::HashMap::new();
-
-                for entry in fs::read_dir(&args.score)? {
-                    let entry = match entry {
-                        Ok(e) => e,
-                        Err(_) => continue,
-                    };
-                    let path = entry.path();
-                    if !path.is_file() {
-                        continue;
-                    }
-
-                    let name = path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_default();
-
-                    if name.ends_with(".gnomon.tsv") {
-                        if let Some(stem) = name.strip_suffix(".gnomon.tsv") {
-                            cache_files.push((path, stem.to_string()));
-                        }
-                    } else {
-                        if let Some(stem) =
-                            path.file_stem().map(|s| s.to_string_lossy().to_string())
-                        {
-                            // Grab mtime eagerly for source files
-                            if let Ok(m) = fs::metadata(&path) {
-                                if let Ok(mtime) = m.modified() {
-                                    source_mtimes.insert(stem.clone(), mtime);
-                                }
-                            }
-                            source_files.push((path, stem));
-                        }
-                    }
-                }
-
-                let mut final_files = Vec::with_capacity(source_files.len() + cache_files.len());
-                let mut covered_stems = std::collections::HashSet::new();
-
-                // Process cache files first to determine which are fresh
-                for (path, stem) in cache_files {
-                    let keep_cache = match source_mtimes.get(&stem) {
-                        Some(&src_mtime) => {
-                            // Source exists, check if cache is fresh
-                            // Cache is fresh if it exists and is not older than source
-                            fs::metadata(&path)
-                                .and_then(|m| m.modified())
-                                .map(|cache_mtime| cache_mtime >= src_mtime)
-                                .unwrap_or(false)
-                        }
-                        None => true, // Orphan cache -> keep
-                    };
-
-                    if keep_cache {
-                        final_files.push(path);
-                        covered_stems.insert(stem);
-                    }
-                }
-
-                // Add source files that aren't covered by a fresh cache
-                for (path, stem) in source_files {
-                    if !covered_stems.contains(&stem) {
-                        final_files.push(path);
-                    }
-                }
-
-                final_files
-            } else {
-                vec![args.score.clone()]
-            };
-            (files, HashMap::new())
-        }
-    };
+    let (resolved_score_files, score_regions_map) =
+        resolve_score_files(&args.score, &score_arg_str, &fileset_prefixes[0])?;
 
     if resolved_score_files.is_empty() {
         return Err("No score files were found or resolved.".into());
     }
 
-    // --- Phase 1b: Preparation ---
-    // This phase is synchronous and CPU-bound. It parses all input files,
-    // reconciles variants, and produces a "computation blueprint".
     let score_regions_ref = if score_regions_map.is_empty() {
         None
     } else {
@@ -391,6 +311,300 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
         overall_start_time.elapsed()
     );
     Ok(())
+}
+
+fn ensure_output_absent(
+    output_prefix: &Path,
+    out_suffix: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let output_path = score_output_path(output_prefix, Some(out_suffix));
+    if output_path.exists() {
+        return Err(format!(
+            "Output file '{}' already exists. Gnomon will not overwrite it. Please remove it or rename it before running.",
+            output_path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn score_output_path(output_prefix: &Path, name_suffix: Option<&str>) -> PathBuf {
+    let (output_dir, mut out_stem) = if output_prefix.to_string_lossy().starts_with("gs://") {
+        let stem = output_prefix
+            .file_name()
+            .map_or_else(|| OsString::from("gnomon_results"), OsString::from);
+        (Path::new(".").to_path_buf(), stem)
+    } else {
+        let parent = output_prefix.parent();
+        let dir = match parent {
+            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+            _ => Path::new(".").to_path_buf(),
+        };
+        let stem = score_output_stem(output_prefix);
+        (dir, stem)
+    };
+
+    if let Some(suffix) = name_suffix {
+        out_stem.push("_");
+        out_stem.push(suffix);
+    }
+    let mut out_filename = out_stem;
+    out_filename.push(".sscore");
+    output_dir.join(out_filename)
+}
+
+fn score_output_stem(path: &Path) -> OsString {
+    const COMPOUND_SUFFIXES: &[&str] = &[".vcf.bgz", ".vcf.gz", ".bcf.bgz", ".bcf.gz"];
+    const SIMPLE_SUFFIXES: &[&str] = &[".bed", ".vcf", ".bcf"];
+
+    let Some(file_name) = path.file_name() else {
+        return OsString::from("gnomon_results");
+    };
+    let file_name = file_name.to_string_lossy();
+    let lower = file_name.to_ascii_lowercase();
+    for suffix in COMPOUND_SUFFIXES.iter().chain(SIMPLE_SUFFIXES.iter()) {
+        if lower.ends_with(suffix) && file_name.len() > suffix.len() {
+            return OsString::from(&file_name[..file_name.len() - suffix.len()]);
+        }
+    }
+
+    file_name.as_ref().into()
+}
+
+fn resolve_score_files(
+    score_arg: &Path,
+    score_arg_str: &str,
+    cache_anchor: &Path,
+) -> Result<(Vec<PathBuf>, HashMap<String, GenomicRegion>), Box<dyn Error + Send + Sync>> {
+    if !score_arg.exists() && score_arg_str.contains("PGS") {
+        let parent_local = cache_anchor
+            .to_string_lossy()
+            .starts_with("gs://")
+            .then(|| Path::new(".").to_path_buf())
+            .unwrap_or_else(|| match cache_anchor.parent() {
+                Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+                _ => Path::new(".").to_path_buf(),
+            });
+        let scores_cache_dir = parent_local.join("gnomon_score_cache");
+        let resolved = download::resolve_and_download_scores(score_arg_str, &scores_cache_dir)?;
+        return Ok((resolved.paths, resolved.regions));
+    }
+
+    let files: Vec<PathBuf> = if score_arg.is_dir() {
+        let mut source_files: Vec<(PathBuf, String)> = Vec::new();
+        let mut cache_files: Vec<(PathBuf, String)> = Vec::new();
+        let mut source_mtimes: std::collections::HashMap<String, std::time::SystemTime> =
+            std::collections::HashMap::new();
+
+        for entry in fs::read_dir(score_arg)? {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+
+            if name.ends_with(".gnomon.tsv") {
+                if let Some(stem) = name.strip_suffix(".gnomon.tsv") {
+                    cache_files.push((path, stem.to_string()));
+                }
+            } else if let Some(stem) = path.file_stem().map(|s| s.to_string_lossy().to_string()) {
+                if let Ok(m) = fs::metadata(&path)
+                    && let Ok(mtime) = m.modified()
+                {
+                    source_mtimes.insert(stem.clone(), mtime);
+                }
+                source_files.push((path, stem));
+            }
+        }
+
+        let mut final_files = Vec::with_capacity(source_files.len() + cache_files.len());
+        let mut covered_stems = std::collections::HashSet::new();
+
+        for (path, stem) in cache_files {
+            let keep_cache = match source_mtimes.get(&stem) {
+                Some(&src_mtime) => fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .map(|cache_mtime| cache_mtime >= src_mtime)
+                    .unwrap_or(false),
+                None => true,
+            };
+
+            if keep_cache {
+                final_files.push(path);
+                covered_stems.insert(stem);
+            }
+        }
+
+        for (path, stem) in source_files {
+            if !covered_stems.contains(&stem) {
+                final_files.push(path);
+            }
+        }
+
+        final_files
+    } else {
+        vec![score_arg.to_path_buf()]
+    };
+
+    Ok((files, HashMap::new()))
+}
+
+fn read_label_from_cached_file(path: &Path) -> Result<String, Box<dyn Error + Send + Sync>> {
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    for line in reader.lines() {
+        let line = line?;
+        if line.starts_with('#') {
+            continue;
+        }
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() >= 4 {
+            return Ok(cols[3].to_string());
+        }
+        return Err(format!("Invalid header in cached file '{}'", path.display()).into());
+    }
+    Err(format!("Empty cached file '{}'", path.display()).into())
+}
+
+fn normalize_score_files(
+    score_files: &[PathBuf],
+) -> Result<Vec<PathBuf>, Box<dyn Error + Send + Sync>> {
+    enum Prep {
+        Resolved(String, PathBuf),
+        Pending(PathBuf, PathBuf),
+    }
+
+    let mut prep_items: Vec<(PathBuf, Prep)> = Vec::with_capacity(score_files.len());
+    for score_file_path in score_files {
+        match reformat::is_gnomon_native_format(score_file_path) {
+            Ok(true) => {
+                let label = read_label_from_cached_file(score_file_path)?;
+                prep_items.push((
+                    score_file_path.clone(),
+                    Prep::Resolved(label, score_file_path.clone()),
+                ));
+            }
+            Ok(false) => {
+                let output_dir = match score_file_path.parent() {
+                    Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+                    _ => Path::new(".").to_path_buf(),
+                };
+                fs::create_dir_all(&output_dir)?;
+
+                let new_path = score_file_path.with_extension("gnomon.tsv");
+                let should_reformat = if new_path.exists() {
+                    let source_meta = fs::metadata(score_file_path).and_then(|m| m.modified());
+                    let cache_meta = fs::metadata(&new_path).and_then(|m| m.modified());
+                    match (source_meta, cache_meta) {
+                        (Ok(src_time), Ok(cache_time)) => src_time > cache_time,
+                        _ => true,
+                    }
+                } else {
+                    true
+                };
+
+                if should_reformat {
+                    prep_items.push((
+                        score_file_path.clone(),
+                        Prep::Pending(score_file_path.clone(), new_path),
+                    ));
+                } else {
+                    eprintln!(
+                        "> Info: Using cached converted file '{}'.",
+                        new_path.display()
+                    );
+                    let label = read_label_from_cached_file(&new_path)?;
+                    prep_items.push((score_file_path.clone(), Prep::Resolved(label, new_path)));
+                }
+            }
+            Err(e) => {
+                return Err(format!(
+                    "Error reading score file '{}': {}",
+                    score_file_path.display(),
+                    e
+                )
+                .into());
+            }
+        }
+    }
+
+    type ReformatRow = Option<(String, PathBuf, Option<reformat::SkipSummary>)>;
+    let reformat_results: Vec<Result<ReformatRow, reformat::ReformatError>> = prep_items
+        .par_iter()
+        .map(|(_, item)| match item {
+            Prep::Resolved(label, path) => Ok(Some((label.clone(), path.clone(), None))),
+            Prep::Pending(src, dst) => {
+                eprintln!(
+                    "> Info: Score file '{}' is not in native format. Attempting conversion...",
+                    src.display()
+                );
+                let outcome = reformat::reformat_pgs_file(src, dst)?;
+                if outcome.wrote_output {
+                    eprintln!("> Success: Converted to '{}'.", dst.display());
+                    let label = outcome.score_label.ok_or_else(|| {
+                        reformat::ReformatError::Io(io::Error::other(
+                            "Internal error: missing score label after successful conversion.",
+                        ))
+                    })?;
+                    Ok(Some((label, dst.clone(), outcome.skip_summary)))
+                } else {
+                    if let Some(warning) = outcome.warning {
+                        eprintln!("> Warning: {warning}");
+                    } else {
+                        eprintln!(
+                            "> Warning: Unsupported score format for '{}'; skipping.",
+                            src.display()
+                        );
+                    }
+                    Ok(None)
+                }
+            }
+        })
+        .collect();
+
+    let mut native_score_files = Vec::with_capacity(prep_items.len());
+    let mut label_to_path: HashMap<String, PathBuf> = HashMap::new();
+    let mut skip_summaries = Vec::new();
+    for ((src_path, _), row) in prep_items.iter().zip(reformat_results.into_iter()) {
+        match row.map_err(Box::new)? {
+            None => continue,
+            Some((label, out_path, skip_summary)) => {
+                if let Some(existing_path) = label_to_path.get(&label) {
+                    return Err(format!(
+                        "Duplicate Score ID '{}' detected!\n  File 1: '{}'\n  File 2: '{}'\nPlease ensure each score file has a unique identifier.",
+                        label,
+                        existing_path.display(),
+                        src_path.display()
+                    )
+                    .into());
+                }
+                label_to_path.insert(label, src_path.clone());
+                if let Some(summary) = skip_summary {
+                    skip_summaries.push(summary);
+                }
+                native_score_files.push(out_path);
+            }
+        }
+    }
+
+    reformat::emit_overall_skip_summary(&skip_summaries);
+    native_score_files.sort();
+    native_score_files.dedup();
+    if native_score_files.is_empty() {
+        return Err("No compatible score files remained after normalization. Scores that only provide dosage-specific weights ('dosage_0_weight', 'dosage_1_weight', 'dosage_2_weight') are currently unsupported.".into());
+    }
+
+    Ok(native_score_files)
 }
 
 /// **Helper 1:** Encapsulates the entire preparation and file normalization phase.
@@ -604,6 +818,38 @@ Scores that only provide dosage-specific weights \
     );
 
     Ok(Arc::new(prep))
+}
+
+fn finalize_and_write_native_output(
+    output_prefix: &Path,
+    result: &NativeVcfScoreResult,
+    score_regions: Option<&HashMap<String, GenomicRegion>>,
+    name_suffix: Option<&str>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let out_path = score_output_path(output_prefix, name_suffix);
+    if let Some(output_dir) = out_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(output_dir)?;
+    }
+
+    eprintln!(
+        "> Writing {} scores per person to {}",
+        result.score_names.len(),
+        out_path.display()
+    );
+    let output_start = Instant::now();
+
+    write_scores_to_file(
+        &out_path,
+        &result.person_iids,
+        &result.score_names,
+        &result.score_variant_counts,
+        &result.sum_scores,
+        &result.missing_counts,
+        score_regions,
+    )?;
+
+    eprintln!("> Final output written in {:.2?}", output_start.elapsed());
+    Ok(())
 }
 
 /// **Helper:** Handles the final file writing.

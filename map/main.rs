@@ -1,5 +1,5 @@
 use super::fit::{
-    DEFAULT_BLOCK_WIDTH, FitOptions, HardCallPacked, HwePcaError, HwePcaModel, LdConfig, LdWindow,
+    FitOptions, HwePcaError, HwePcaModel, LdConfig, LdWindow, StreamingMafFilterSource,
     VariantBlockSource,
 };
 use super::io::{
@@ -12,7 +12,6 @@ use super::prefit::{self, BuiltinModelError};
 use super::progress::{fit_progress, projection_progress};
 use super::project::{GappedProjectionSource, ProjectionOptions};
 use super::variant_filter::{VariantFilter, VariantKey, VariantListError};
-use rayon::prelude::*;
 use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -169,7 +168,9 @@ fn run_fit(
     }
     match maf {
         Some(min_maf) => {
-            println!("MAF filtering enabled: retaining variants with MAF >= {min_maf:.6}.")
+            println!(
+                "MAF filtering enabled: retaining variants with MAF >= {min_maf:.6} during the PCA stream."
+            )
         }
         None => println!("MAF filtering disabled (default)."),
     }
@@ -219,15 +220,10 @@ fn run_fit(
         }
     }
 
-    if let Some(min_maf) = maf {
-        let (filtered_plan, filtered_keys) = apply_maf_filter(
-            &dataset,
-            selection_plan.clone(),
-            variant_keys.as_deref(),
-            min_maf,
-        )?;
-        selection_plan = filtered_plan;
-        variant_keys = Some(Arc::new(filtered_keys));
+    if maf.is_some() && matches!(ld, Some(LdWindow::BasePairs(_))) {
+        return Err(MapDriverError::InvalidState(
+            "MAF streaming cannot be combined with base-pair LD windows because retained positions are only known during the genotype stream".into(),
+        ));
     }
 
     let mut fit_options = FitOptions::default();
@@ -250,16 +246,34 @@ fn run_fit(
         fit_options.ld = Some(ld_config);
     }
 
-    let mut source = dataset.block_source_with_plan(selection_plan.clone())?;
     let progress = fit_progress();
-    let mut model = HwePcaModel::fit_k_with_options_and_progress(
-        &mut source,
-        components,
-        &fit_options,
-        &progress,
-    )?;
+    fit_options.cache_source = maf.is_some();
 
-    if let Some(outcome) = source.take_selection_outcome() {
+    let (mut model, retained_indices, selection_outcome) = if let Some(min_maf) = maf {
+        let raw_source = dataset.block_source_with_plan(selection_plan.clone())?;
+        let mut source = StreamingMafFilterSource::new(raw_source, min_maf)?;
+        let model = HwePcaModel::fit_k_with_options_and_progress(
+            &mut source,
+            components,
+            &fit_options,
+            &progress,
+        )?;
+        let retained = source.retained_indices().to_vec();
+        let outcome = source.inner_mut().take_selection_outcome();
+        (model, Some(retained), outcome)
+    } else {
+        let mut source = dataset.block_source_with_plan(selection_plan.clone())?;
+        let model = HwePcaModel::fit_k_with_options_and_progress(
+            &mut source,
+            components,
+            &fit_options,
+            &progress,
+        )?;
+        let outcome = source.take_selection_outcome();
+        (model, None, outcome)
+    };
+
+    if let Some(outcome) = selection_outcome {
         if outcome.requested_unique > 0 {
             let matched = outcome.matched_keys.len();
             let missing = outcome.missing_keys.len();
@@ -281,18 +295,21 @@ fn run_fit(
         variant_keys = Some(Arc::new(outcome.matched_keys));
     }
 
-    // Note: Ensure the model ALWAYS has variant keys.
-    // If we haven't already extracted keys (via --list or --ld), do it now.
-    // This prevents "anonymous" models that can silently project onto wrong variants.
     if variant_keys.is_none() {
         println!("Extracting variant keys from dataset to ensure model portability...");
-        // If selection_plan is All, this might take a moment for VCFs, but it's required for safety.
         let keys = dataset.variant_keys_for_plan(&selection_plan)?;
         variant_keys = Some(Arc::new(keys));
     }
 
     if let Some(keys_arc) = variant_keys {
-        let keys = Arc::try_unwrap(keys_arc).unwrap_or_else(|arc| (*arc).clone());
+        let mut keys = Arc::try_unwrap(keys_arc).unwrap_or_else(|arc| (*arc).clone());
+        if let Some(retained) = retained_indices.as_deref() {
+            keys = retain_variant_keys_by_logical_indices(keys, retained)?;
+            println!(
+                "MAF filter retained {} variants in the PCA stream.",
+                retained.len()
+            );
+        }
         model.set_variant_keys(Some(keys));
     }
 
@@ -343,336 +360,21 @@ fn run_fit(
     Ok(())
 }
 
-fn apply_maf_filter(
-    dataset: &GenotypeDataset,
-    selection_plan: SelectionPlan,
-    known_keys: Option<&Vec<VariantKey>>,
-    min_maf: f64,
-) -> Result<(SelectionPlan, Vec<VariantKey>), MapDriverError> {
-    println!("Scanning selected variants for observed MAF >= {min_maf:.6}...");
-
-    let mut source = dataset.block_source_with_plan(selection_plan.clone())?;
-    let n_samples = source.n_samples();
-    let n_variants_hint = source.n_variants();
-    let block_capacity = if n_variants_hint > 0 {
-        DEFAULT_BLOCK_WIDTH.min(n_variants_hint).max(1)
-    } else {
-        DEFAULT_BLOCK_WIDTH.max(1)
-    };
-    let mut block_storage = vec![0.0f64; n_samples * block_capacity];
-    let mut retained_logical_indices = Vec::with_capacity(n_variants_hint);
-    let mut processed = 0usize;
-
-    if let Some(packed) = source.hard_call_packed() {
-        retained_logical_indices = retain_packed_maf_indices(&packed, n_samples, min_maf)?;
-        processed = packed.n_variants();
-        return finish_maf_filter(
-            dataset,
-            selection_plan,
-            known_keys,
-            source,
-            processed,
-            retained_logical_indices,
-        );
-    }
-
-    source.reset()?;
-    loop {
-        let filled = source.next_block_into(block_capacity, &mut block_storage)?;
-        if filled == 0 {
-            break;
-        }
-
-        for local_idx in 0..filled {
-            let start = local_idx * n_samples;
-            let end = start + n_samples;
-            let maf = observed_maf(&block_storage[start..end]);
-            if maf >= min_maf {
-                retained_logical_indices.push(processed + local_idx);
-            }
-        }
-
-        processed = processed.checked_add(filled).ok_or_else(|| {
-            MapDriverError::InvalidState("variant count overflow during MAF filtering".into())
+fn retain_variant_keys_by_logical_indices(
+    keys: Vec<VariantKey>,
+    retained_logical_indices: &[usize],
+) -> Result<Vec<VariantKey>, MapDriverError> {
+    let mut retained = Vec::with_capacity(retained_logical_indices.len());
+    for &logical_idx in retained_logical_indices {
+        let key = keys.get(logical_idx).ok_or_else(|| {
+            MapDriverError::InvalidState(format!(
+                "MAF-retained logical index {logical_idx} exceeded selected variant key count {}",
+                keys.len()
+            ))
         })?;
-    }
-
-    if processed == 0 {
-        return Err(MapDriverError::InvalidState(
-            "VariantBlockSource yielded no variants during MAF filtering".into(),
-        ));
-    }
-
-    finish_maf_filter(
-        dataset,
-        selection_plan,
-        known_keys,
-        source,
-        processed,
-        retained_logical_indices,
-    )
-}
-
-fn finish_maf_filter(
-    dataset: &GenotypeDataset,
-    selection_plan: SelectionPlan,
-    known_keys: Option<&Vec<VariantKey>>,
-    mut source: super::io::DatasetBlockSource,
-    processed: usize,
-    retained_logical_indices: Vec<usize>,
-) -> Result<(SelectionPlan, Vec<VariantKey>), MapDriverError> {
-    let keys_before_filter = if let Some(outcome) = source.take_selection_outcome() {
-        if outcome.requested_unique > 0 {
-            let matched = outcome.matched_keys.len();
-            let missing = outcome.missing_keys.len();
-            println!(
-                "Variant list matched {matched} of {} requested variants{}",
-                outcome.requested_unique,
-                if missing > 0 {
-                    format!(" ({} missing)", missing)
-                } else {
-                    String::from("")
-                }
-            );
-        }
-        outcome.matched_keys
-    } else if let Some(keys) = known_keys {
-        keys.clone()
-    } else {
-        dataset.variant_keys_for_plan(&selection_plan)?
-    };
-
-    if keys_before_filter.len() != processed {
-        return Err(MapDriverError::InvalidState(format!(
-            "MAF scan observed {processed} variants, but {} variant keys were available",
-            keys_before_filter.len()
-        )));
-    }
-
-    if retained_logical_indices.is_empty() {
-        return Err(MapDriverError::InvalidState(format!(
-            "MAF filter removed all {processed} selected variants"
-        )));
-    }
-
-    let mut filtered_keys = Vec::with_capacity(retained_logical_indices.len());
-    for &logical_idx in &retained_logical_indices {
-        filtered_keys.push(keys_before_filter[logical_idx].clone());
-    }
-
-    let removed = processed - retained_logical_indices.len();
-    println!(
-        "MAF filter retained {} of {processed} selected variants ({removed} removed).",
-        retained_logical_indices.len()
-    );
-
-    let filtered_plan =
-        restrict_selection_plan(selection_plan, &retained_logical_indices, &filtered_keys)?;
-    Ok((filtered_plan, filtered_keys))
-}
-
-fn retain_packed_maf_indices(
-    packed: &HardCallPacked<'_>,
-    n_samples: usize,
-    min_maf: f64,
-) -> Result<Vec<usize>, MapDriverError> {
-    let table = packed_maf_table();
-    let full_bytes = n_samples / 4;
-    let tail_samples = n_samples % 4;
-    let n_variants = packed.n_variants();
-    let chunk_size = 16_384usize;
-    let chunk_count = n_variants.div_ceil(chunk_size);
-
-    let chunks: Result<Vec<Vec<usize>>, MapDriverError> = (0..chunk_count)
-        .into_par_iter()
-        .map(|chunk_idx| {
-            let start = chunk_idx * chunk_size;
-            let end = (start + chunk_size).min(n_variants);
-            let mut retained = Vec::new();
-            for variant_idx in start..end {
-                if packed_variant_passes_maf(
-                    packed,
-                    variant_idx,
-                    table,
-                    full_bytes,
-                    tail_samples,
-                    min_maf,
-                )? {
-                    retained.push(variant_idx);
-                }
-            }
-            Ok(retained)
-        })
-        .collect();
-
-    let chunks = chunks?;
-    let retained_len = chunks.iter().map(Vec::len).sum();
-    let mut retained = Vec::with_capacity(retained_len);
-    for chunk in chunks {
-        retained.extend(chunk);
+        retained.push(key.clone());
     }
     Ok(retained)
-}
-
-fn packed_variant_passes_maf(
-    packed: &HardCallPacked<'_>,
-    variant_idx: usize,
-    table: &[PackedMafCounts; 256],
-    full_bytes: usize,
-    tail_samples: usize,
-    min_maf: f64,
-) -> Result<bool, MapDriverError> {
-    let Some(bytes) = packed.slice(variant_idx, 1) else {
-        return Err(MapDriverError::InvalidState(format!(
-            "MAF filter could not read packed genotype bytes for variant {variant_idx}"
-        )));
-    };
-
-    let mut allele_sum = 0u32;
-    let mut calls = 0u32;
-    for &byte in &bytes[..full_bytes] {
-        let counts = table[byte as usize];
-        allele_sum += counts.allele_sum as u32;
-        calls += counts.calls as u32;
-    }
-
-    if tail_samples > 0 {
-        let Some(&byte) = bytes.get(full_bytes) else {
-            return Err(MapDriverError::InvalidState(format!(
-                "MAF filter packed byte slice was truncated for variant {variant_idx}"
-            )));
-        };
-        for offset in 0..tail_samples {
-            let code = (byte >> (offset * 2)) & 0b11;
-            match code {
-                0 => calls += 1,
-                1 => {}
-                2 => {
-                    allele_sum += 1;
-                    calls += 1;
-                }
-                3 => {
-                    allele_sum += 2;
-                    calls += 1;
-                }
-                _ => unreachable!(),
-            }
-        }
-    }
-
-    if calls == 0 {
-        return Ok(false);
-    }
-
-    let allele_frequency = (allele_sum as f64) / (2.0 * calls as f64);
-    let maf = allele_frequency.min(1.0 - allele_frequency);
-    Ok(maf >= min_maf)
-}
-
-#[derive(Clone, Copy)]
-struct PackedMafCounts {
-    allele_sum: u8,
-    calls: u8,
-}
-
-fn packed_maf_table() -> &'static [PackedMafCounts; 256] {
-    static TABLE: std::sync::OnceLock<[PackedMafCounts; 256]> = std::sync::OnceLock::new();
-    TABLE.get_or_init(|| {
-        let mut table = [PackedMafCounts {
-            allele_sum: 0,
-            calls: 0,
-        }; 256];
-        for byte in 0u16..=255 {
-            let mut allele_sum = 0u8;
-            let mut calls = 0u8;
-            for offset in 0..4 {
-                let code = ((byte >> (offset * 2)) & 0b11) as u8;
-                match code {
-                    0 => calls += 1,
-                    1 => {}
-                    2 => {
-                        allele_sum += 1;
-                        calls += 1;
-                    }
-                    3 => {
-                        allele_sum += 2;
-                        calls += 1;
-                    }
-                    _ => unreachable!(),
-                }
-            }
-            table[byte as usize] = PackedMafCounts { allele_sum, calls };
-        }
-        table
-    })
-}
-
-fn observed_maf(values: &[f64]) -> f64 {
-    let mut sum = 0.0;
-    let mut calls = 0usize;
-    for &value in values {
-        if value.is_finite() {
-            sum += value;
-            calls += 1;
-        }
-    }
-
-    if calls == 0 {
-        return 0.0;
-    }
-
-    let allele_frequency = (sum / (2.0 * calls as f64)).clamp(0.0, 1.0);
-    allele_frequency.min(1.0 - allele_frequency)
-}
-
-fn restrict_selection_plan(
-    selection_plan: SelectionPlan,
-    retained_logical_indices: &[usize],
-    filtered_keys: &[VariantKey],
-) -> Result<SelectionPlan, MapDriverError> {
-    match selection_plan {
-        SelectionPlan::All => Ok(SelectionPlan::ByIndices(retained_logical_indices.to_vec())),
-        SelectionPlan::ByIndices(indices) => {
-            let mut filtered = Vec::with_capacity(retained_logical_indices.len());
-            for &logical_idx in retained_logical_indices {
-                let physical_idx = *indices.get(logical_idx).ok_or_else(|| {
-                    MapDriverError::InvalidState(format!(
-                        "MAF-retained logical index {logical_idx} exceeded selected variant count {}",
-                        indices.len()
-                    ))
-                })?;
-                filtered.push(physical_idx);
-            }
-            Ok(SelectionPlan::ByIndices(filtered))
-        }
-        SelectionPlan::Ordered(selection) => {
-            let mut filtered_indices = Vec::with_capacity(retained_logical_indices.len());
-            let mut filtered_match_kinds = Vec::with_capacity(retained_logical_indices.len());
-            for &logical_idx in retained_logical_indices {
-                let physical_idx = *selection.indices.get(logical_idx).ok_or_else(|| {
-                    MapDriverError::InvalidState(format!(
-                        "MAF-retained logical index {logical_idx} exceeded selected variant count {}",
-                        selection.indices.len()
-                    ))
-                })?;
-                let match_kind = *selection.match_kinds.get(logical_idx).ok_or_else(|| {
-                    MapDriverError::InvalidState(format!(
-                        "MAF-retained logical index {logical_idx} exceeded match-kind count {}",
-                        selection.match_kinds.len()
-                    ))
-                })?;
-                filtered_indices.push(physical_idx);
-                filtered_match_kinds.push(match_kind);
-            }
-            Ok(SelectionPlan::Ordered(OrderedSelectionPlan::new(
-                filtered_indices,
-                filtered_match_kinds,
-            )))
-        }
-        SelectionPlan::ByKeys(_) => Ok(SelectionPlan::ByKeys(Arc::new(VariantFilter::from_keys(
-            filtered_keys.iter().cloned(),
-        )))),
-    }
 }
 
 fn run_project(

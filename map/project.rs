@@ -3084,6 +3084,7 @@ mod tests {
                 ridge: Some(1.0e-3),
                 variant_keys: None,
             }),
+            ..FitOptions::default()
         };
         let progress = Arc::new(NoopFitProgress::default());
         HwePcaModel::fit_k_with_options_and_progress(

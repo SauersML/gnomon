@@ -93,7 +93,8 @@ fn compute_default_gram_budget_bytes() -> u64 {
 fn detect_total_memory_bytes() -> Option<u64> {
     let mut system = System::new_all();
     system.refresh_memory();
-    system.total_memory().checked_mul(1024)
+    let total = system.total_memory();
+    if total == 0 { None } else { Some(total) }
 }
 
 fn gram_matrix_budget_bytes() -> usize {
@@ -121,6 +122,7 @@ fn covariance_computation_mode(n: usize, budget_bytes: usize) -> CovarianceCompu
 #[derive(Clone, Debug, Default)]
 pub struct FitOptions {
     pub ld: Option<LdConfig>,
+    pub cache_source: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -249,6 +251,169 @@ impl FitOptions {
 
         Ok(Some(LdResolvedConfig { window, ridge }))
     }
+}
+
+pub struct StreamingMafFilterSource<S>
+where
+    S: VariantBlockSource,
+{
+    inner: S,
+    min_maf: f64,
+    n_samples: usize,
+    observed_variants: usize,
+    retained_indices: Vec<usize>,
+    inner_storage: Vec<f64>,
+    inner_quality: Vec<f64>,
+    block_quality: Vec<f64>,
+}
+
+impl<S> StreamingMafFilterSource<S>
+where
+    S: VariantBlockSource,
+{
+    pub fn new(inner: S, min_maf: f64) -> Result<Self, HwePcaError> {
+        if !(min_maf.is_finite() && (0.0..=0.5).contains(&min_maf)) {
+            return Err(HwePcaError::InvalidInput(
+                "MAF threshold must be finite and between 0 and 0.5",
+            ));
+        }
+        let n_samples = inner.n_samples();
+        let hint = inner.n_variants();
+        Ok(Self {
+            inner,
+            min_maf,
+            n_samples,
+            observed_variants: 0,
+            retained_indices: Vec::with_capacity(hint),
+            inner_storage: Vec::new(),
+            inner_quality: Vec::new(),
+            block_quality: Vec::new(),
+        })
+    }
+
+    pub fn inner_mut(&mut self) -> &mut S {
+        &mut self.inner
+    }
+
+    pub fn retained_indices(&self) -> &[usize] {
+        &self.retained_indices
+    }
+
+    fn ensure_workspaces(&mut self, max_variants: usize) {
+        let capacity = self.n_samples.saturating_mul(max_variants.max(1));
+        if self.inner_storage.len() < capacity {
+            self.inner_storage.resize(capacity, 0.0);
+        }
+        if self.inner_quality.len() < max_variants {
+            self.inner_quality.resize(max_variants, 1.0);
+        }
+        if self.block_quality.len() < max_variants {
+            self.block_quality.resize(max_variants, 1.0);
+        }
+    }
+}
+
+impl<S> VariantBlockSource for StreamingMafFilterSource<S>
+where
+    S: VariantBlockSource,
+{
+    type Error = S::Error;
+
+    fn n_samples(&self) -> usize {
+        self.n_samples
+    }
+
+    fn n_variants(&self) -> usize {
+        self.inner.n_variants()
+    }
+
+    fn reset(&mut self) -> Result<(), Self::Error> {
+        self.inner.reset()?;
+        self.observed_variants = 0;
+        self.retained_indices.clear();
+        self.block_quality.clear();
+        Ok(())
+    }
+
+    fn next_block_into(
+        &mut self,
+        max_variants: usize,
+        storage: &mut [f64],
+    ) -> Result<usize, Self::Error> {
+        if max_variants == 0 {
+            return Ok(0);
+        }
+
+        self.ensure_workspaces(max_variants);
+        let mut filled = 0usize;
+
+        while filled < max_variants {
+            let request = max_variants - filled;
+            let inner_filled = self
+                .inner
+                .next_block_into(request, &mut self.inner_storage[..])?;
+            if inner_filled == 0 {
+                break;
+            }
+
+            self.inner
+                .variant_quality(inner_filled, &mut self.inner_quality[..inner_filled]);
+
+            for local_idx in 0..inner_filled {
+                let src_start = local_idx * self.n_samples;
+                let src_end = src_start + self.n_samples;
+                let values = &self.inner_storage[src_start..src_end];
+                if observed_maf(values) < self.min_maf {
+                    self.observed_variants += 1;
+                    continue;
+                }
+
+                let dst_start = filled * self.n_samples;
+                let dst_end = dst_start + self.n_samples;
+                storage[dst_start..dst_end].copy_from_slice(values);
+                self.block_quality[filled] = self.inner_quality[local_idx];
+                self.retained_indices.push(self.observed_variants);
+                self.observed_variants += 1;
+                filled += 1;
+            }
+        }
+
+        Ok(filled)
+    }
+
+    fn progress_bytes(&self) -> Option<(u64, Option<u64>)> {
+        self.inner.progress_bytes()
+    }
+
+    fn progress_variants(&self) -> Option<(usize, Option<usize>)> {
+        self.inner.progress_variants()
+    }
+
+    fn variant_quality(&self, filled: usize, storage: &mut [f64]) {
+        let limit = filled.min(storage.len()).min(self.block_quality.len());
+        storage[..limit].copy_from_slice(&self.block_quality[..limit]);
+        for value in storage.iter_mut().take(filled).skip(limit) {
+            *value = 1.0;
+        }
+    }
+}
+
+fn observed_maf(values: &[f64]) -> f64 {
+    let mut sum = 0.0;
+    let mut calls = 0usize;
+    for &value in values {
+        if value.is_finite() {
+            sum += value;
+            calls += 1;
+        }
+    }
+
+    if calls == 0 {
+        return 0.0;
+    }
+
+    let allele_frequency = (sum / (2.0 * calls as f64)).clamp(0.0, 1.0);
+    allele_frequency.min(1.0 - allele_frequency)
 }
 
 fn compute_ld_bp_ranges(
@@ -2139,7 +2304,7 @@ impl HwePcaModel {
 
         let mut cached_source = CachedVariantBlockSource::new(
             source,
-            matches!(gram_mode, CovarianceComputationMode::Partial),
+            matches!(gram_mode, CovarianceComputationMode::Partial) || options.cache_source,
         );
         let source = &mut cached_source;
 

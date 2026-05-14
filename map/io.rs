@@ -186,6 +186,17 @@ pub struct SelectionOutcome {
     pub requested_unique: usize,
 }
 
+fn selected_model_key(
+    match_kind: MatchKind,
+    requested_key: &VariantKey,
+    observed_key: VariantKey,
+) -> VariantKey {
+    match match_kind {
+        MatchKind::Wildcard => observed_key,
+        MatchKind::Exact | MatchKind::Swap => requested_key.clone(),
+    }
+}
+
 impl GenotypeDataset {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, GenotypeIoError> {
         let path = path.as_ref();
@@ -1789,8 +1800,8 @@ impl PlinkDataset {
             let key = VariantKey::new_with_alleles(
                 &record.chromosome,
                 position,
-                &record.allele2,
                 &record.allele1,
+                &record.allele2,
             );
             keys.push(key);
         }
@@ -1858,14 +1869,14 @@ impl PlinkDataset {
             let key = VariantKey::new_with_alleles(
                 &record.chromosome,
                 position,
-                &record.allele2,
                 &record.allele1,
+                &record.allele2,
             );
             if let Some((status, requested_key)) = filter.match_key(&key)
-                && matched.insert(requested_key)
+                && matched.insert(requested_key.clone())
             {
                 indices.push(index);
-                keys.push(key);
+                keys.push(selected_model_key(status, &requested_key, key));
                 match_kinds.push(status);
             }
             index += 1;
@@ -1979,8 +1990,8 @@ impl PgenDataset {
             let key = VariantKey::new_with_alleles(
                 &record.chromosome,
                 position,
-                &record.allele2,
                 &record.allele1,
+                &record.allele2,
             );
             keys.push(key);
         }
@@ -2038,14 +2049,14 @@ impl PgenDataset {
             let key = VariantKey::new_with_alleles(
                 &record.chromosome,
                 position,
-                &record.allele2,
                 &record.allele1,
+                &record.allele2,
             );
             if let Some((status, requested_key)) = filter.match_key(&key)
-                && matched.insert(requested_key)
+                && matched.insert(requested_key.clone())
             {
                 indices.push(index);
-                keys.push(key);
+                keys.push(selected_model_key(status, &requested_key, key));
                 match_kinds.push(status);
             }
             index += 1;
@@ -2129,8 +2140,8 @@ fn select_plink_variant_records_by_keys(
         let key = VariantKey::new_with_alleles(
             &record.chromosome,
             position,
-            &record.allele2,
             &record.allele1,
+            &record.allele2,
         );
         let wildcard = VariantKey::new(&record.chromosome, position);
         let swap_key = key
@@ -2163,7 +2174,7 @@ fn select_plink_variant_records_by_keys(
             && matched_indices[slot].is_none()
         {
             matched_indices[slot] = Some(dataset_index);
-            matched_keys[slot] = Some(key);
+            matched_keys[slot] = Some(selected_model_key(kind, &unique_keys[slot], key));
             matched_kinds[slot] = kind;
         }
 
@@ -2833,10 +2844,10 @@ impl VcfLikeDataset {
                     let key =
                         VariantKey::new_with_alleles(&chrom, pos, &ref_allele, alt_allele.as_ref());
                     if let Some((status, requested_key)) = filter.match_key(&key)
-                        && matched.insert(requested_key)
+                        && matched.insert(requested_key.clone())
                     {
                         indices.push(record_idx);
-                        keys.push(key);
+                        keys.push(selected_model_key(status, &requested_key, key));
                         match_kinds.push(status);
                     }
                     record_idx += 1;
@@ -3557,7 +3568,7 @@ impl VcfLikeVariantBlockSource {
         })?;
 
         let formats = header.formats();
-        self.prefer_ds = formats.contains_key("DS");
+        self.prefer_ds = formats.contains_key("DS") || formats.contains_key("GP");
 
         let observed = header.sample_names();
         if observed.len() != self.sample_names.len()
@@ -3582,7 +3593,10 @@ impl VcfLikeVariantBlockSource {
         Ok(())
     }
 
-    fn read_next_variant(&mut self) -> Result<Option<(usize, usize)>, VariantIoError> {
+    fn read_next_variant(
+        &mut self,
+        cache_alt_alleles: bool,
+    ) -> Result<Option<(usize, usize)>, VariantIoError> {
         loop {
             if self.pending_alt_index > 0 && self.pending_alt_index <= self.current_alt_count {
                 let current_index = self.processed;
@@ -3590,7 +3604,6 @@ impl VcfLikeVariantBlockSource {
                 self.pending_alt_index += 1;
                 if self.pending_alt_index > self.current_alt_count {
                     self.pending_alt_index = 0;
-                    self.current_alt_count = 0;
                 }
                 self.processed = self.processed.saturating_add(1);
                 self.streamed_variants = self.streamed_variants.saturating_add(1);
@@ -3652,8 +3665,13 @@ impl VcfLikeVariantBlockSource {
 
             self.input_records = self.input_records.saturating_add(1);
             self.validate_current_variant_sorted()?;
-            self.load_current_alt_alleles()?;
-            self.current_alt_count = self.current_alt_alleles.len();
+            self.current_alt_count = if cache_alt_alleles {
+                self.load_current_alt_alleles()?;
+                self.current_alt_alleles.len()
+            } else {
+                self.current_alt_alleles.clear();
+                self.count_current_alt_alleles()?
+            };
             if self.current_alt_count == 0 {
                 continue;
             }
@@ -3680,6 +3698,10 @@ impl VariantBlockSource for VcfLikeVariantBlockSource {
         self.input_records = 0;
         self.stream_exhausted = false;
         self.sorted_positions.clear();
+        if !self.selection_finalized {
+            self.matched_keys.clear();
+            self.missing_keys = None;
+        }
         if matches!(self.selection_plan, SelectionPlan::ByKeys(_)) {
             self.matched_seen.clear();
         }
@@ -3848,7 +3870,7 @@ impl VcfLikeVariantBlockSource {
                     if quality.is_finite() {
                         return quality.clamp(0.0, 1.0);
                     }
-                    return 0.0; // Conservative fallback for NaN/Inf
+                    return 0.0; // Conservative value for NaN/Inf
                 }
                 // Try R2 (minimac, Michigan Imputation Server)
                 if let Some(quality) = Self::get_info_float(&info, header, "R2", alt_index) {
@@ -3967,6 +3989,35 @@ impl VcfLikeVariantBlockSource {
                 Ok(())
             }
             None => Ok(()),
+        }
+    }
+
+    fn count_current_alt_alleles(&self) -> Result<usize, VariantIoError> {
+        let mut count = 0usize;
+        match self.format {
+            Some(VariantFormat::Vcf) => {
+                for alt in self.vcf_record.alternate_bases().iter() {
+                    alt.map_err(|err| {
+                        VariantIoError::Decode(format!(
+                            "failed to read VCF alternate allele: {err}"
+                        ))
+                    })?;
+                    count += 1;
+                }
+                Ok(count)
+            }
+            Some(VariantFormat::Bcf) => {
+                for alt in self.bcf_record.alternate_bases().iter() {
+                    alt.map_err(|err| {
+                        VariantIoError::Decode(format!(
+                            "failed to read BCF alternate allele: {err}"
+                        ))
+                    })?;
+                    count += 1;
+                }
+                Ok(count)
+            }
+            None => Ok(0),
         }
     }
 
@@ -4106,7 +4157,8 @@ impl VcfLikeVariantBlockSource {
 
         let mut filled = 0usize;
         while filled < max_variants {
-            let Some((_, alt_index)) = self.read_next_variant()? else {
+            let collect_keys = !self.selection_finalized;
+            let Some((_, alt_index)) = self.read_next_variant(collect_keys)? else {
                 break;
             };
 
@@ -4117,6 +4169,9 @@ impl VcfLikeVariantBlockSource {
             // Store imputation quality for this variant
             self.block_quality
                 .push(self.current_variant_quality(alt_index));
+            if collect_keys && let Some(key) = self.current_variant_key_for_alt(alt_index)? {
+                self.matched_keys.push(key);
+            }
             filled += 1;
         }
 
@@ -4141,7 +4196,8 @@ impl VcfLikeVariantBlockSource {
         let mut filled = 0usize;
 
         while filled < max_variants && self.emitted + filled < target_total {
-            let Some((current_index, alt_index)) = self.read_next_variant()? else {
+            let collect_keys = !self.selection_finalized;
+            let Some((current_index, alt_index)) = self.read_next_variant(collect_keys)? else {
                 break;
             };
 
@@ -4161,6 +4217,9 @@ impl VcfLikeVariantBlockSource {
             // Store imputation quality for this variant
             self.block_quality
                 .push(self.current_variant_quality(alt_index));
+            if collect_keys && let Some(key) = self.current_variant_key_for_alt(alt_index)? {
+                self.matched_keys.push(key);
+            }
             filled += 1;
         }
 
@@ -4192,14 +4251,14 @@ impl VcfLikeVariantBlockSource {
         };
 
         while filled < max_variants && (target_total == 0 || self.emitted + filled < target_total) {
-            let Some((_, alt_index)) = self.read_next_variant()? else {
+            let Some((_, alt_index)) = self.read_next_variant(true)? else {
                 break;
             };
 
             if let Some(key) = self.current_variant_key_for_alt(alt_index)?
                 && let Some((status, requested_key)) = filter.match_key(&key)
             {
-                let is_new_match = self.matched_seen.insert(requested_key);
+                let is_new_match = self.matched_seen.insert(requested_key.clone());
                 if is_new_match {
                     let offset = filled * self.n_samples;
                     let dest = &mut storage[offset..offset + self.n_samples];
@@ -4218,7 +4277,8 @@ impl VcfLikeVariantBlockSource {
                         .push(self.current_variant_quality(alt_index));
 
                     if !self.selection_finalized {
-                        self.matched_keys.push(key);
+                        self.matched_keys
+                            .push(selected_model_key(status, &requested_key, key));
                     }
                     filled += 1;
                     if target_total > 0 && self.emitted + filled >= target_total {
@@ -4263,7 +4323,8 @@ impl VcfLikeVariantBlockSource {
     }
 
     pub fn take_selection_outcome(&mut self) -> Option<SelectionOutcome> {
-        if !matches!(self.selection_plan, SelectionPlan::ByKeys(_)) {
+        if self.matched_keys.is_empty() && !matches!(self.selection_plan, SelectionPlan::ByKeys(_))
+        {
             return None;
         }
         if !self.selection_finalized {
@@ -4483,9 +4544,18 @@ fn parse_vcf_dosage_field(
         .checked_sub(1)
         .ok_or_else(|| VariantIoError::Decode("ALT allele index must be one-based".to_string()))?;
 
-    if field.contains(',') {
-        let Some(value) = field.split(',').nth(allele_offset) else {
-            return Ok(None);
+    let mut dosage_values = field.split(',');
+    let first_value = dosage_values.next().unwrap_or_default();
+    if let Some(second_value) = dosage_values.next() {
+        let value = match allele_offset {
+            0 => first_value,
+            1 => second_value,
+            offset => {
+                let Some(value) = dosage_values.nth(offset - 2) else {
+                    return Ok(None);
+                };
+                value
+            }
         };
         return parse_numeric_str(value);
     }
@@ -4497,6 +4567,57 @@ fn parse_vcf_dosage_field(
             "multi-allelic dosage field is scalar for ALT allele index {alt_index}"
         )))
     }
+}
+
+fn parse_vcf_gp(
+    field: &str,
+    alt_index: usize,
+    alt_count: usize,
+) -> Result<Option<f64>, VariantIoError> {
+    if field == "." {
+        return Ok(None);
+    }
+    if alt_index == 0 || alt_index > alt_count {
+        return Err(VariantIoError::Decode(format!(
+            "ALT allele index {alt_index} is out of range for {alt_count} alternate alleles"
+        )));
+    }
+
+    let allele_count = alt_count + 1;
+    let expected_len = allele_count
+        .checked_mul(allele_count + 1)
+        .map(|n| n / 2)
+        .ok_or_else(|| VariantIoError::Decode("GP allele count overflow".to_string()))?;
+    let mut dosage = 0.0f64;
+    let mut idx = 0usize;
+    let mut parts = field.split(',');
+    for second in 0..allele_count {
+        for first in 0..=second {
+            let Some(part) = parts.next() else {
+                return Err(VariantIoError::Decode(format!(
+                    "GP field has {idx} values, expected {expected_len} for {alt_count} alternate alleles"
+                )));
+            };
+            if part == "." {
+                return Ok(None);
+            }
+            let probability = part
+                .parse::<f64>()
+                .map_err(|_| VariantIoError::Decode(format!("Invalid GP float: {part}")))?;
+            let copies = usize::from(first == alt_index) + usize::from(second == alt_index);
+            dosage += probability * copies as f64;
+            idx += 1;
+        }
+    }
+
+    if parts.next().is_some() {
+        let actual_len = expected_len + 1 + parts.count();
+        return Err(VariantIoError::Decode(format!(
+            "GP field has {actual_len} values, expected {expected_len} for {alt_count} alternate alleles"
+        )));
+    }
+
+    Ok(Some(dosage))
 }
 
 fn expected_dosage_from_gp_values(
@@ -4534,28 +4655,6 @@ fn expected_dosage_from_gp_values(
     Ok(dosage)
 }
 
-fn parse_vcf_gp(
-    s: &str,
-    alt_index: usize,
-    alt_count: usize,
-) -> Result<Option<f64>, VariantIoError> {
-    if s == "." {
-        return Ok(None);
-    }
-
-    let mut values = Vec::new();
-    for part in s.split(',') {
-        if part == "." {
-            return Ok(None);
-        }
-        let value = part
-            .parse::<f64>()
-            .map_err(|_| VariantIoError::Decode(format!("Invalid GP float: {part}")))?;
-        values.push(value);
-    }
-    expected_dosage_from_gp_values(&values, alt_index, alt_count).map(Some)
-}
-
 fn decode_vcf_record(
     record: &VcfRecord,
     alt_index: usize,
@@ -4588,10 +4687,15 @@ fn decode_vcf_record(
         }
     }
 
-    let Some(gt_idx) = gt_index else {
-        return Err(VariantIoError::Decode(
-            "VCF record is missing the required GT FORMAT field".to_string(),
-        ));
+    let dosage_format_present = prefer_ds && (ds_index.is_some() || gp_index.is_some());
+    let gt_idx = match gt_index {
+        Some(idx) => Some(idx),
+        None if dosage_format_present => None,
+        None => {
+            return Err(VariantIoError::Decode(
+                "VCF record is missing GT, DS, or GP FORMAT fields".to_string(),
+            ));
+        }
     };
 
     for (sample_idx, sample) in samples.iter().enumerate().take(n_samples) {
@@ -4608,7 +4712,7 @@ fn decode_vcf_record(
                     gp_field = Some(field);
                 }
             }
-            if idx == gt_idx {
+            if gt_idx == Some(idx) {
                 gt_field = Some(field);
             }
         }
@@ -4620,7 +4724,6 @@ fn decode_vcf_record(
                 dest[sample_idx] = parsed;
                 continue;
             }
-            // Fallback to GP if DS is missing but preferred
             if let Some(value) = gp_field
                 && let Some(parsed) = parse_vcf_gp(value, alt_index, alt_count)?
             {
@@ -4659,7 +4762,7 @@ fn decode_bcf_record(
     }
 
     let mut saw_gt = false;
-    let mut used_ds = false;
+    let mut used_dosage = false;
 
     for result in samples.series() {
         let series = result
@@ -4670,12 +4773,12 @@ fn decode_bcf_record(
 
         if prefer_ds && name == "DS" {
             decode_bcf_numeric_series(series, header, alt_index, alt_count, dest)?;
-            used_ds = true;
+            used_dosage = true;
         } else if prefer_ds && name == "GP" {
-            // Decode GP only if DS hasn't been used yet.
-            // Note: If DS comes later in the file, it will overwrite this GP value (which is correct behavior).
-            if !used_ds {
+            // Decode GP only until DS is available; DS has precedence when both exist.
+            if !used_dosage {
                 decode_bcf_gp_series(series, header, alt_index, alt_count, dest)?;
+                used_dosage = true;
             }
         } else if name == key::GENOTYPE {
             decode_bcf_genotype_series(series, header, alt_index, alt_count, dest)?;
@@ -4683,9 +4786,9 @@ fn decode_bcf_record(
         }
     }
 
-    if !saw_gt && !(prefer_ds && used_ds) {
+    if !saw_gt && !(prefer_ds && used_dosage) {
         return Err(VariantIoError::Decode(
-            "BCF record is missing the required GT FORMAT field".to_string(),
+            "BCF record is missing GT, DS, or GP FORMAT fields".to_string(),
         ));
     }
 
@@ -5379,6 +5482,9 @@ mod tests {
         assert_eq!(parse_vcf_genotype("1/2", 2).unwrap(), Some(1.0));
         assert_eq!(parse_vcf_genotype("2/2", 1).unwrap(), Some(0.0));
         assert_eq!(parse_vcf_genotype("2/2", 2).unwrap(), Some(2.0));
+        assert_eq!(parse_vcf_genotype("0/10", 10).unwrap(), Some(1.0));
+        assert_eq!(parse_vcf_genotype("10|10", 10).unwrap(), Some(2.0));
+        assert_eq!(parse_vcf_genotype("./10", 10).unwrap(), None);
     }
 
     #[test]
@@ -5450,6 +5556,87 @@ mod tests {
         assert_eq!(filled, 2);
         assert_eq!(&storage[..3], &[1.5, 0.2, 0.7]);
         assert_eq!(&storage[3..6], &[0.1, 1.6, 0.8]);
+    }
+
+    #[test]
+    fn vcf_multiallelic_gp_uses_alt_specific_expected_dosage_without_gt() {
+        use crate::map::fit::VariantBlockSource;
+
+        let dir = tempdir().unwrap();
+        let vcf_path = dir.path().join("multiallelic_gp.vcf");
+        let vcf_content = "\
+##fileformat=VCFv4.2
+##FORMAT=<ID=GP,Number=G,Type=Float,Description=\"Genotype probabilities\">
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\tS3
+1\t100\tvar1\tA\tG,T\t.\tPASS\t.\tGP\t0,1,0,0,0,0\t0,0,0,1,0,0\t0,0,0,0,1,0
+";
+        {
+            let mut file = File::create(&vcf_path).unwrap();
+            file.write_all(vcf_content.as_bytes()).unwrap();
+        }
+
+        let dataset = VcfLikeDataset::open(&vcf_path).unwrap();
+        let mut source = dataset.block_source().unwrap();
+        let mut storage = vec![0.0; 6];
+        let filled = source.next_block_into(2, &mut storage).unwrap();
+        assert_eq!(filled, 2);
+        assert_eq!(&storage[..3], &[1.0, 0.0, 1.0]);
+        assert_eq!(&storage[3..6], &[0.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn vcf_multiallelic_ds_decodes_without_gt() {
+        use crate::map::fit::VariantBlockSource;
+
+        let dir = tempdir().unwrap();
+        let vcf_path = dir.path().join("multiallelic_ds_only.vcf");
+        let vcf_content = "\
+##fileformat=VCFv4.2
+##FORMAT=<ID=DS,Number=A,Type=Float,Description=\"Alternate allele dosage\">
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2
+1\t100\tvar1\tA\tG,T\t.\tPASS\t.\tDS\t1.25,0.25\t0.5,1.75
+";
+        {
+            let mut file = File::create(&vcf_path).unwrap();
+            file.write_all(vcf_content.as_bytes()).unwrap();
+        }
+
+        let dataset = VcfLikeDataset::open(&vcf_path).unwrap();
+        let mut source = dataset.block_source().unwrap();
+        let mut storage = vec![0.0; 4];
+        let filled = source.next_block_into(2, &mut storage).unwrap();
+        assert_eq!(filled, 2);
+        assert_eq!(&storage[..2], &[1.25, 0.5]);
+        assert_eq!(&storage[2..4], &[0.25, 1.75]);
+    }
+
+    #[test]
+    fn vcf_swapped_key_selection_tracks_requested_key_as_matched() {
+        use crate::map::variant_filter::MatchKind;
+
+        let dir = tempdir().unwrap();
+        let vcf_path = dir.path().join("swapped.vcf");
+        let vcf_content = "\
+##fileformat=VCFv4.2
+##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1
+1\t100\tvar1\tA\tG\t.\tPASS\t.\tGT\t0/1
+";
+        {
+            let mut file = File::create(&vcf_path).unwrap();
+            file.write_all(vcf_content.as_bytes()).unwrap();
+        }
+
+        let requested_swap = VariantKey::new_with_alleles("1", 100, "G", "A");
+        let requested_missing = VariantKey::new_with_alleles("1", 100, "C", "T");
+        let filter = VariantFilter::from_keys([requested_swap.clone(), requested_missing.clone()]);
+        let dataset = VcfLikeDataset::open(&vcf_path).unwrap();
+        let selection = dataset.select_variants(&filter).unwrap();
+
+        assert_eq!(selection.indices, vec![0]);
+        assert_eq!(selection.keys, vec![requested_swap.clone()]);
+        assert_eq!(selection.match_kinds, vec![MatchKind::Swap]);
+        assert_eq!(selection.missing, vec![requested_missing]);
     }
 
     #[test]

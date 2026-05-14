@@ -6,6 +6,7 @@ pub mod download;
 pub mod genotype_convert;
 pub mod io;
 pub mod kernel;
+pub mod native_vcf;
 pub mod pipeline;
 pub mod prepare;
 pub mod reformat;

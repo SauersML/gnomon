@@ -42,7 +42,6 @@ Optional arguments:
 - `--max-iterations` / `--convergence-tolerance`: control the inner P-IRLS loop.
 - `--reml-max-iterations` / `--reml-convergence-tolerance`: control the outer REML
   optimization loop.
-- `--no-calibration`: disable the post-process calibration layer.
 
 ### `infer`
 Apply a previously trained calibration model to new samples and saves predictions
@@ -51,12 +50,3 @@ as `predictions.tsv`.
 Required arguments:
 - `test_data`: path to a TSV file with score and PC columns.
 - `--model <path>`: path to the trained model TOML file.
-
-Optional arguments:
-- `--no-calibration`: disable the post-process calibration layer when generating
-  predictions.
-
-## Calibration defaults
-
-Each invocation resets the global flag that enables calibration so that
-calibration is active unless explicitly disabled with `--no-calibration`.

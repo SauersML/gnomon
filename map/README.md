@@ -101,9 +101,9 @@ If we project onto a unit vector made only from the SNVs we have, missing SNVs d
 When projections encounter missing loci, gnomon keeps track of how much loading mass each sample retained on every component. That information can be exported via the library API by enabling `ProjectionOptions::return_alignment`, which produces `projection_alignment.bin` plus `projection_alignment.metadata.json`. Each value represents the squared-norm scaling factor applied to keep the projection axis at unit length. Values near `1` indicate a complete overlap with the training loci, while smaller values highlight PCs that lost signal because of missing variants. The CLI defaults to score output only, but the saved model always contains enough metadata to reconstruct alignment diagnostics when requested.
 
 ## Projection workflow
-* `gnomon project` loads `hwe.json`, reconstructs any stored variant subset, and
-  verifies that the projection dataset supplies every required locus.  A
-  mismatch fails fast instead of silently dropping variants.
+* `gnomon project` loads `hwe.json`, reconstructs any stored variant subset,
+  aligns projection variants by stored allele-aware keys, and fails only when
+  there is no overlap with the model variant set.
 * Projections reuse the block streaming interface, so missing loci are handled
   via the renormalization described above and the resulting scores share the
   training scale.

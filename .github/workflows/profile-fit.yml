@@ -141,10 +141,10 @@ jobs:
           echo "Sampling frequency: 50 Hz"
           echo "Timeout: 30 minutes hard cap"
 
-          STATUS=0
-          if ! timeout --signal=INT --kill-after=30s 30m perf record $CALLGRAPH -F 50 -e task-clock:u -z --no-buildid --no-buildid-cache -g -o "$PERF_DATA" -- target/profiling/gnomon --fit "gs://gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/hgdp1kgp_chr20.filtered.SNV_INDEL.phased.shapeit5.bcf" --components 16 --list "https://github.com/SauersML/genomic_pca/raw/refs/heads/main/data/GSAv2_hg38.tsv"; then
-            STATUS=$?
-          fi
+          set +e
+          timeout --signal=INT --kill-after=30s 30m perf record $CALLGRAPH -F 50 -e task-clock:u -z --no-buildid --no-buildid-cache -g -o "$PERF_DATA" -- target/profiling/gnomon fit "gs://gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/hgdp1kgp_chr20.filtered.SNV_INDEL.phased.shapeit5.bcf" --components 16 --list "https://github.com/SauersML/genomic_pca/raw/refs/heads/main/data/GSAv2_hg38.tsv"
+          STATUS=$?
+          set -e
 
           if [ "$STATUS" -eq 124 ]; then
             echo "::warning::perf recording stopped after 30 minutes (timeout)"
