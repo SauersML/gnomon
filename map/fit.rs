@@ -265,6 +265,7 @@ where
     inner_storage: Vec<f64>,
     inner_quality: Vec<f64>,
     block_quality: Vec<f64>,
+    retained_keys: Option<Vec<VariantKey>>,
 }
 
 impl<S> StreamingMafFilterSource<S>
@@ -288,6 +289,7 @@ where
             inner_storage: Vec::new(),
             inner_quality: Vec::new(),
             block_quality: Vec::new(),
+            retained_keys: Some(Vec::with_capacity(hint)),
         })
     }
 
@@ -332,6 +334,9 @@ where
         self.observed_variants = 0;
         self.retained_indices.clear();
         self.block_quality.clear();
+        if let Some(keys) = self.retained_keys.as_mut() {
+            keys.clear();
+        }
         Ok(())
     }
 
@@ -358,6 +363,7 @@ where
 
             self.inner
                 .variant_quality(inner_filled, &mut self.inner_quality[..inner_filled]);
+            let inner_keys = self.inner.block_variant_keys();
 
             for local_idx in 0..inner_filled {
                 let src_start = local_idx * self.n_samples;
@@ -373,6 +379,13 @@ where
                 storage[dst_start..dst_end].copy_from_slice(values);
                 self.block_quality[filled] = self.inner_quality[local_idx];
                 self.retained_indices.push(self.observed_variants);
+                if let (Some(keys), Some(inner_keys)) =
+                    (self.retained_keys.as_mut(), inner_keys.as_ref())
+                {
+                    if let Some(key) = inner_keys.get(local_idx) {
+                        keys.push(key.clone());
+                    }
+                }
                 self.observed_variants += 1;
                 filled += 1;
             }
@@ -395,6 +408,10 @@ where
         for value in storage.iter_mut().take(filled).skip(limit) {
             *value = 1.0;
         }
+    }
+
+    fn take_variant_keys(&mut self) -> Option<Vec<VariantKey>> {
+        self.retained_keys.take().filter(|keys| !keys.is_empty())
     }
 }
 
@@ -561,6 +578,14 @@ pub trait VariantBlockSource {
         for value in storage.iter_mut().take(filled) {
             *value = 1.0;
         }
+    }
+
+    fn block_variant_keys(&self) -> Option<&[VariantKey]> {
+        None
+    }
+
+    fn take_variant_keys(&mut self) -> Option<Vec<VariantKey>> {
+        None
     }
 
     /// Provides a packed 2-bit hard-call view of the data when available.
@@ -1015,6 +1040,14 @@ where
         }
     }
 
+    fn block_variant_keys(&self) -> Option<&[VariantKey]> {
+        self.source.block_variant_keys()
+    }
+
+    fn take_variant_keys(&mut self) -> Option<Vec<VariantKey>> {
+        self.source.take_variant_keys()
+    }
+
     fn hard_call_packed(&mut self) -> Option<HardCallPacked<'_>> {
         match &self.state {
             CacheState::ReadyHardCall {
@@ -1187,7 +1220,7 @@ fn data_offset(variant_idx: usize, n_samples: usize) -> usize {
 fn cache_budget_bytes() -> usize {
     match detect_total_memory_bytes() {
         Some(total) if total > 0 => {
-            let target = total.saturating_mul(1) / 3;
+            let target = total.saturating_mul(3) / 4;
             target.min(usize::MAX as u64) as usize
         }
         _ => 0,

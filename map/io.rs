@@ -1667,6 +1667,20 @@ impl VariantBlockSource for DatasetBlockSource {
         }
     }
 
+    fn block_variant_keys(&self) -> Option<&[VariantKey]> {
+        match self {
+            Self::Plink(_) => None,
+            Self::Variants(source) => source.block_variant_keys(),
+        }
+    }
+
+    fn take_variant_keys(&mut self) -> Option<Vec<VariantKey>> {
+        match self {
+            Self::Plink(_) => None,
+            Self::Variants(source) => source.take_variant_keys(),
+        }
+    }
+
     fn hard_call_packed(&mut self) -> Option<crate::map::fit::HardCallPacked<'_>> {
         match self {
             Self::Plink(source) => source.hard_call_packed(),
@@ -2902,6 +2916,8 @@ pub struct VcfLikeVariantBlockSource {
     /// Per-variant imputation quality scores (INFO/R²/DR2) for the current block.
     /// Values are in [0, 1] range where 1.0 = hard call, 0.0 = no information.
     block_quality: Vec<f64>,
+    block_keys: Vec<VariantKey>,
+    collected_keys: Vec<VariantKey>,
 }
 
 struct SpoolEntry {
@@ -3531,6 +3547,8 @@ impl VcfLikeVariantBlockSource {
             spool_entries: Vec::new(),
             spool_root: None,
             block_quality: Vec::new(),
+            block_keys: Vec::new(),
+            collected_keys: Vec::new(),
         };
         if !source.parts.is_empty() {
             source.open_part(0)?;
@@ -3698,11 +3716,13 @@ impl VariantBlockSource for VcfLikeVariantBlockSource {
         self.input_records = 0;
         self.stream_exhausted = false;
         self.sorted_positions.clear();
-        if !self.selection_finalized {
-            self.matched_keys.clear();
-            self.missing_keys = None;
-        }
+        self.block_keys.clear();
+        self.collected_keys.clear();
         if matches!(self.selection_plan, SelectionPlan::ByKeys(_)) {
+            if !self.selection_finalized {
+                self.matched_keys.clear();
+                self.missing_keys = None;
+            }
             self.matched_seen.clear();
         }
         for metrics in &self.metrics_per_part {
@@ -3782,6 +3802,22 @@ impl VariantBlockSource for VcfLikeVariantBlockSource {
         storage[..available].copy_from_slice(&self.block_quality[..available]);
         for value in storage.iter_mut().skip(available).take(limit - available) {
             *value = 1.0;
+        }
+    }
+
+    fn block_variant_keys(&self) -> Option<&[VariantKey]> {
+        if self.block_keys.is_empty() {
+            None
+        } else {
+            Some(&self.block_keys)
+        }
+    }
+
+    fn take_variant_keys(&mut self) -> Option<Vec<VariantKey>> {
+        if self.collected_keys.is_empty() {
+            None
+        } else {
+            Some(std::mem::take(&mut self.collected_keys))
         }
     }
 }
@@ -4154,24 +4190,25 @@ impl VcfLikeVariantBlockSource {
     ) -> Result<usize, VariantIoError> {
         // Clear and prepare quality storage for this block
         self.block_quality.clear();
+        self.block_keys.clear();
 
         let mut filled = 0usize;
         while filled < max_variants {
-            let collect_keys = !self.selection_finalized;
-            let Some((_, alt_index)) = self.read_next_variant(collect_keys)? else {
+            let Some((_, alt_index)) = self.read_next_variant(true)? else {
                 break;
             };
 
             let offset = filled * self.n_samples;
             let dest = &mut storage[offset..offset + self.n_samples];
             self.decode_current_variant(alt_index, dest)?;
+            if let Some(key) = self.current_variant_key_for_alt(alt_index)? {
+                self.block_keys.push(key.clone());
+                self.collected_keys.push(key);
+            }
 
             // Store imputation quality for this variant
             self.block_quality
                 .push(self.current_variant_quality(alt_index));
-            if collect_keys && let Some(key) = self.current_variant_key_for_alt(alt_index)? {
-                self.matched_keys.push(key);
-            }
             filled += 1;
         }
 
@@ -4191,13 +4228,13 @@ impl VcfLikeVariantBlockSource {
     ) -> Result<usize, VariantIoError> {
         // Clear and prepare quality storage for this block
         self.block_quality.clear();
+        self.block_keys.clear();
 
         let target_total = indices.len();
         let mut filled = 0usize;
 
         while filled < max_variants && self.emitted + filled < target_total {
-            let collect_keys = !self.selection_finalized;
-            let Some((current_index, alt_index)) = self.read_next_variant(collect_keys)? else {
+            let Some((current_index, alt_index)) = self.read_next_variant(true)? else {
                 break;
             };
 
@@ -4214,12 +4251,13 @@ impl VcfLikeVariantBlockSource {
             let offset = filled * self.n_samples;
             let dest = &mut storage[offset..offset + self.n_samples];
             self.decode_current_variant(alt_index, dest)?;
+            if let Some(key) = self.current_variant_key_for_alt(alt_index)? {
+                self.block_keys.push(key.clone());
+                self.collected_keys.push(key);
+            }
             // Store imputation quality for this variant
             self.block_quality
                 .push(self.current_variant_quality(alt_index));
-            if collect_keys && let Some(key) = self.current_variant_key_for_alt(alt_index)? {
-                self.matched_keys.push(key);
-            }
             filled += 1;
         }
 
@@ -4242,6 +4280,7 @@ impl VcfLikeVariantBlockSource {
     ) -> Result<usize, VariantIoError> {
         // Clear and prepare quality storage for this block
         self.block_quality.clear();
+        self.block_keys.clear();
 
         let mut filled = 0usize;
         let target_total = if self.selection_finalized {
@@ -4276,9 +4315,11 @@ impl VcfLikeVariantBlockSource {
                     self.block_quality
                         .push(self.current_variant_quality(alt_index));
 
+                    let model_key = selected_model_key(status, &requested_key, key);
+                    self.block_keys.push(model_key.clone());
+                    self.collected_keys.push(model_key.clone());
                     if !self.selection_finalized {
-                        self.matched_keys
-                            .push(selected_model_key(status, &requested_key, key));
+                        self.matched_keys.push(model_key);
                     }
                     filled += 1;
                     if target_total > 0 && self.emitted + filled >= target_total {
@@ -4323,8 +4364,7 @@ impl VcfLikeVariantBlockSource {
     }
 
     pub fn take_selection_outcome(&mut self) -> Option<SelectionOutcome> {
-        if self.matched_keys.is_empty() && !matches!(self.selection_plan, SelectionPlan::ByKeys(_))
-        {
+        if !matches!(self.selection_plan, SelectionPlan::ByKeys(_)) {
             return None;
         }
         if !self.selection_finalized {
