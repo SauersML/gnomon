@@ -93,12 +93,6 @@ jobs:
           toolchain: nightly
           targets: ${{ matrix.rust_target || matrix.target }}
 
-      - name: Install NVIDIA CUDA Toolkit
-        if: matrix.rust_target == 'x86_64-unknown-linux-gnu'
-        uses: Jimver/cuda-toolkit@v0.2.21
-        with:
-          cuda: '12.2.2'
-
       - name: Remove local cargo config
         # Prevent .cargo/config.toml's target-cpu=native from affecting release
         # builds or release cache keys.

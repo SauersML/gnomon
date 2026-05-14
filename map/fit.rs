@@ -1774,6 +1774,11 @@ fn standardize_column_simd_impl_lanes2(values: &mut [f64], mean: f64, inv: f64) 
     }
 }
 
+#[cfg(any(
+    target_feature = "avx",
+    target_arch = "aarch64",
+    target_arch = "wasm32"
+))]
 #[inline(always)]
 fn standardize_column_simd_impl_lanes4(values: &mut [f64], mean: f64, inv: f64) {
     let (chunks, remainder) = values.as_chunks_mut::<4>();
@@ -1927,6 +1932,11 @@ fn standardize_column_with_mask_simd_impl_lanes2(
     }
 }
 
+#[cfg(any(
+    target_feature = "avx",
+    target_arch = "aarch64",
+    target_arch = "wasm32"
+))]
 #[inline(always)]
 fn standardize_column_with_mask_simd_impl_lanes4(
     values: &mut [f64],
@@ -2132,6 +2142,11 @@ fn sum_and_count_finite_impl_lanes2(values: &[f64]) -> (f64, usize) {
     (sum, count)
 }
 
+#[cfg(any(
+    target_feature = "avx",
+    target_arch = "aarch64",
+    target_arch = "wasm32"
+))]
 #[inline(always)]
 fn sum_and_count_finite_impl_lanes4(values: &[f64]) -> (f64, usize) {
     let mut sum = 0.0;
