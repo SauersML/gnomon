@@ -8,6 +8,7 @@ on:
     paths:
       - 'Cargo.toml'
       - '**/*.rs'
+      - 'install.sh'
       - '.github/workflows/build-release-all.yml'
   workflow_dispatch:
 
@@ -39,17 +40,34 @@ jobs:
             asset_suffix: macos-intel
             cpu: x86-64-v3
 
-          # Linux x86_64 (ubuntu-22.04 for wider glibc compatibility)
+          # Linux x86_64 portable baseline. Build with Zig's glibc 2.17 sysroot
+          # so the default installer asset works on older HPC distributions.
           - os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
+            rust_target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-gnu.2.17
             asset_suffix: linux-x64
-            cpu: x86-64-v3
+            cpu: x86-64
+            use_zig: true
+            glibc_floor: "2.17"
 
-          # Linux ARM64 (ubuntu-22.04 for wider glibc compatibility)
+          # Linux x86_64 fast path. Same old-glibc floor, but compiled for
+          # x86-64-v3 machines and selected by the installer only when supported.
+          - os: ubuntu-22.04
+            rust_target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-gnu.2.17
+            asset_suffix: linux-x64-v3
+            cpu: x86-64-v3
+            use_zig: true
+            glibc_floor: "2.17"
+
+          # Linux ARM64 portable baseline with the same old-glibc floor.
           - os: ubuntu-22.04-arm
-            target: aarch64-unknown-linux-gnu
+            rust_target: aarch64-unknown-linux-gnu
+            target: aarch64-unknown-linux-gnu.2.17
             asset_suffix: linux-arm64
-            cpu: neoverse-n1
+            cpu: generic
+            use_zig: true
+            glibc_floor: "2.17"
 
           # Windows x86_64
           - os: windows-latest
@@ -70,18 +88,26 @@ jobs:
         uses: dtolnay/rust-toolchain@nightly
         with:
           toolchain: nightly
-          targets: ${{ matrix.target }}
+          targets: ${{ matrix.rust_target || matrix.target }}
 
       - name: Install NVIDIA CUDA Toolkit
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        if: matrix.rust_target == 'x86_64-unknown-linux-gnu'
         uses: Jimver/cuda-toolkit@v0.2.21
         with:
           cuda: '12.2.2'
 
+      - name: Install Zig linker for old-glibc Linux builds
+        if: matrix.use_zig == true
+        shell: bash
+        run: |
+          python3 -m pip install --user ziglang
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          cargo +nightly install cargo-zigbuild --locked
+
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
+          key: ${{ matrix.asset_suffix }}-${{ matrix.target }}
 
       - name: Remove local cargo config
         # Prevent .cargo/config.toml's target-cpu=native from interfering with release builds
@@ -97,13 +123,56 @@ jobs:
           # Embed commit-addressable release tag in binary for version command
           GNOMON_RELEASE_TAG: "main-${{ github.sha }}"
           TARGET: ${{ matrix.target }}
+          RUST_TARGET: ${{ matrix.rust_target || matrix.target }}
           ASSET_SUFFIX: ${{ matrix.asset_suffix }}
+          USE_ZIG: ${{ matrix.use_zig || false }}
+          GLIBC_FLOOR: ${{ matrix.glibc_floor || '' }}
         id: build_binaries
         run: |
           set +e
 
           mkdir -p dist
           : > build-failures.txt
+
+          artifact_target_dir() {
+            if [ -n "$RUST_TARGET" ]; then
+              printf '%s\n' "$RUST_TARGET"
+            else
+              printf '%s\n' "$TARGET"
+            fi
+          }
+
+          version_gt() {
+            [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n 1)" != "$1" ]
+          }
+
+          verify_glibc_floor() {
+            local source_path="$1"
+
+            if [ -z "$GLIBC_FLOOR" ] || [ "$RUNNER_OS" != "Linux" ]; then
+              return 0
+            fi
+
+            local max_glibc
+            max_glibc="$(
+              readelf --version-info "$source_path" 2>/dev/null \
+                | grep -o 'GLIBC_[0-9][0-9.]*' \
+                | sed 's/^GLIBC_//' \
+                | sort -V \
+                | tail -n 1
+            )"
+
+            if [ -z "$max_glibc" ]; then
+              echo "::error::Could not determine GLIBC version requirements for ${source_path}"
+              return 1
+            fi
+
+            echo "Maximum GLIBC requirement for ${source_path}: ${max_glibc}"
+            if version_gt "$max_glibc" "$GLIBC_FLOOR"; then
+              echo "::error::${source_path} requires GLIBC_${max_glibc}, above floor GLIBC_${GLIBC_FLOOR}"
+              return 1
+            fi
+          }
 
           build_one() {
             local binary_name="$1"
@@ -115,8 +184,14 @@ jobs:
             fi
 
             local build_cmd=(
-              cargo +nightly build --release --target "$TARGET"
+              cargo +nightly
             )
+            if [ "$USE_ZIG" = "true" ]; then
+              build_cmd+=(zigbuild)
+            else
+              build_cmd+=(build)
+            fi
+            build_cmd+=(--release --target "$TARGET")
             if [ -n "$feature_name" ]; then
               build_cmd+=(--no-default-features --features "$feature_name")
             fi
@@ -133,7 +208,20 @@ jobs:
             fi
 
             local asset_base="${asset_prefix}-${ASSET_SUFFIX}"
-            local source_path="target/${TARGET}/release/${source_name}"
+            local source_path="target/$(artifact_target_dir)/release/${source_name}"
+            if [ ! -f "$source_path" ] && [ "$RUST_TARGET" != "$TARGET" ]; then
+              source_path="target/${TARGET}/release/${source_name}"
+            fi
+            if [ ! -f "$source_path" ]; then
+              echo "::error::Built binary not found for ${binary_name}"
+              echo "${binary_name}" >> build-failures.txt
+              return 0
+            fi
+
+            if ! verify_glibc_floor "$source_path"; then
+              echo "${binary_name}" >> build-failures.txt
+              return 0
+            fi
 
             if [ "$RUNNER_OS" = "Windows" ]; then
               cp "$source_path" "dist/${asset_base}.exe"

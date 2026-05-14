@@ -141,7 +141,7 @@ bootstrap_latest_installer() {
     fi
 
     log_info "Refreshing installer from main commit ${sha}."
-    GNOMON_INSTALL_BOOTSTRAPPED=1 bash "$tmp_script" "$@"
+    GNOMON_INSTALL_BOOTSTRAPPED=1 GNOMON_INSTALL_MAIN_SHA="$sha" bash "$tmp_script" "$@"
     local rc=$?
     rm -f "$tmp_script"
     exit $rc
@@ -161,12 +161,44 @@ if [[ "$OS" == mingw* ]] || [[ "$OS" == msys* ]] || [[ "$OS" == cygwin* ]]; then
 fi
 
 TARGET_ASSET=""
+ASSET_CANDIDATES=()
+
+linux_x64_v3_supported() {
+    if [ ! -r /proc/cpuinfo ]; then
+        return 1
+    fi
+
+    local flags
+    flags="$(grep -m 1 '^flags[[:space:]]*:' /proc/cpuinfo 2>/dev/null || true)"
+    [ -n "$flags" ] || return 1
+
+    for required in avx avx2 fma bmi1 bmi2 movbe xsave; do
+        case " $flags " in
+            *" ${required} "*) ;;
+            *) return 1 ;;
+        esac
+    done
+
+    case " $flags " in
+        *" lzcnt "*|*" abm "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
 
 case "$OS" in
     linux)
         case "$ARCH" in
-            x86_64)  TARGET_ASSET="${BINARY_NAME}-linux-x64.tar.gz" ;;
-            aarch64) TARGET_ASSET="${BINARY_NAME}-linux-arm64.tar.gz" ;;
+            x86_64)
+                if linux_x64_v3_supported; then
+                    ASSET_CANDIDATES=(
+                        "${BINARY_NAME}-linux-x64-v3.tar.gz"
+                        "${BINARY_NAME}-linux-x64.tar.gz"
+                    )
+                else
+                    ASSET_CANDIDATES=("${BINARY_NAME}-linux-x64.tar.gz")
+                fi
+                ;;
+            aarch64) ASSET_CANDIDATES=("${BINARY_NAME}-linux-arm64.tar.gz") ;;
             *)
                 log_error "Unsupported Linux architecture: $ARCH"
                 exit 1
@@ -175,8 +207,8 @@ case "$OS" in
         ;;
     darwin)
         case "$ARCH" in
-            x86_64) TARGET_ASSET="${BINARY_NAME}-macos-intel.tar.gz" ;;
-            arm64)  TARGET_ASSET="${BINARY_NAME}-macos-arm64.tar.gz" ;;
+            x86_64) ASSET_CANDIDATES=("${BINARY_NAME}-macos-intel.tar.gz") ;;
+            arm64)  ASSET_CANDIDATES=("${BINARY_NAME}-macos-arm64.tar.gz") ;;
             *)
                 log_error "Unsupported macOS architecture: $ARCH"
                 exit 1
@@ -198,8 +230,8 @@ case "$OS" in
         fi
 
         case "$ARCH" in
-            x86_64) TARGET_ASSET="${BINARY_NAME}-windows-x64.zip" ;;
-            aarch64|arm64) TARGET_ASSET="${BINARY_NAME}-windows-arm64.zip" ;;
+            x86_64) ASSET_CANDIDATES=("${BINARY_NAME}-windows-x64.zip") ;;
+            aarch64|arm64) ASSET_CANDIDATES=("${BINARY_NAME}-windows-arm64.zip") ;;
             *)
                 log_error "Unsupported Windows architecture: $ARCH"
                 exit 1
@@ -212,16 +244,29 @@ case "$OS" in
         ;;
 esac
 
+TARGET_ASSET="${ASSET_CANDIDATES[0]}"
+
 log_success "Detected: ${BOLD}${OS}/${ARCH}${RESET}"
 log_info "Selected binary: ${BOLD}${BINARY_NAME}${RESET}"
-log_info "Target release asset: ${BOLD}${TARGET_ASSET}${RESET}"
+if [ "${#ASSET_CANDIDATES[@]}" -gt 1 ]; then
+    log_info "Compatible release assets: ${BOLD}${ASSET_CANDIDATES[*]}${RESET}"
+else
+    log_info "Target release asset: ${BOLD}${TARGET_ASSET}${RESET}"
+fi
 
 # --- 2. Find Latest Published Binary Release ---
 log_header "Checking Published Binary Releases"
 
-# Prefer the canonical latest-release endpoint for deterministic selection.
-# Fallback to scanning all releases only if latest is missing this platform asset.
-LATEST_API_URL="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest?_=$(date +%s)"
+# When bootstrapped from main, try the release built for that exact commit first.
+# If that release is not published yet, fall back to GitHub's latest release.
+# Only scan older releases when the latest release is not a main-* binary release.
+if [ -n "${GNOMON_INSTALL_MAIN_SHA:-}" ]; then
+    RELEASE_TAG="main-${GNOMON_INSTALL_MAIN_SHA}"
+    RELEASE_API_URL="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/tags/${RELEASE_TAG}?_=$(date +%s)"
+else
+    RELEASE_TAG=""
+    RELEASE_API_URL="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest?_=$(date +%s)"
+fi
 RELEASES_API_URL="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases?per_page=100&_=$(date +%s)"
 
 CURL_ARGS=(-sL --retry 5 --retry-delay 2 --retry-connrefused --connect-timeout 5 --max-time 20 -H "Cache-Control: no-cache" -H "Pragma: no-cache")
@@ -234,40 +279,87 @@ elif [ -n "$GH_TOKEN" ]; then
 fi
 
 DOWNLOAD_URL=""
-RELEASE_TAG=""
-log_info "Resolving latest published release with asset ${BOLD}${TARGET_ASSET}${RESET}."
-LATEST_RESPONSE="$(curl "${CURL_ARGS[@]}" "${LATEST_API_URL}" || true)"
-DOWNLOAD_URL="$(echo "$LATEST_RESPONSE" | \
-    grep "browser_download_url.*${TARGET_ASSET}" | \
-    cut -d '"' -f 4 | \
-    head -n 1)"
-RELEASE_TAG="$(echo "$LATEST_RESPONSE" | sed -n 's/^[[:space:]]*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+RELEASE_RESPONSE=""
 
-if [ -z "$DOWNLOAD_URL" ]; then
-    log_info "Latest release did not include ${TARGET_ASSET}. Falling back to release scan."
-    RELEASES_RESPONSE="$(curl "${CURL_ARGS[@]}" "${RELEASES_API_URL}" || true)"
-    DOWNLOAD_URL="$(echo "$RELEASES_RESPONSE" | \
-        grep "browser_download_url.*${TARGET_ASSET}" | \
-        cut -d '"' -f 4 | \
-        head -n 1)"
+select_download_url() {
+    DOWNLOAD_URL=""
+    for candidate in "${ASSET_CANDIDATES[@]}"; do
+        log_info "Looking for release asset ${BOLD}${candidate}${RESET}."
+        DOWNLOAD_URL="$(echo "$RELEASE_RESPONSE" | \
+            grep -F "browser_download_url" | \
+            grep -F "$candidate" | \
+            cut -d '"' -f 4 | \
+            head -n 1)"
+        if [ -n "$DOWNLOAD_URL" ]; then
+            TARGET_ASSET="$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+resolve_release_response() {
+    if [ -n "$RELEASE_TAG" ]; then
+        log_info "Resolving release ${BOLD}${RELEASE_TAG}${RESET}."
+    else
+        log_info "Resolving latest published release."
+    fi
+
+    RELEASE_RESPONSE="$(curl "${CURL_ARGS[@]}" "${RELEASE_API_URL}" || true)"
+    if [ -z "$RELEASE_TAG" ]; then
+        RELEASE_TAG="$(echo "$RELEASE_RESPONSE" | sed -n 's/^[[:space:]]*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+    fi
+}
+
+resolve_release_response
+select_download_url || true
+
+if [ -z "$DOWNLOAD_URL" ] && [ -n "${GNOMON_INSTALL_MAIN_SHA:-}" ]; then
+    log_info "Exact commit release did not provide a compatible asset; trying latest published release."
+    RELEASE_TAG=""
+    RELEASE_API_URL="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest?_=$(date +%s)"
+    resolve_release_response
+    select_download_url || true
 fi
 
 if [ -z "$DOWNLOAD_URL" ]; then
-    log_error "Could not find a download URL for ${TARGET_ASSET} in any release."
-    log_error "GitHub API Response Preview:"
-    echo "$LATEST_RESPONSE" | head -n 20
-    log_error "..."
-    log_error "Please check https://github.com/${REPO_OWNER}/${REPO_NAME}/releases manually."
-    exit 1
+    case "$RELEASE_TAG" in
+        main-*)
+            ;;
+        *)
+            log_info "Latest release is not a gnomon binary release; scanning published binary releases."
+            RELEASE_RESPONSE="$(curl "${CURL_ARGS[@]}" "${RELEASES_API_URL}" || true)"
+            select_download_url || true
+            if [ -n "$DOWNLOAD_URL" ]; then
+                RELEASE_TAG="$(echo "$DOWNLOAD_URL" | sed -n 's#.*/download/\([^/]*\)/.*#\1#p' | head -n 1)"
+            fi
+            ;;
+    esac
 fi
 
 if [ -z "$RELEASE_TAG" ]; then
-    RELEASE_TAG="$(echo "$DOWNLOAD_URL" | sed -n 's#.*/download/\([^/]*\)/.*#\1#p' | head -n 1)"
+    RELEASE_TAG="$(echo "$RELEASE_RESPONSE" | sed -n 's/^[[:space:]]*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
 fi
-log_success "Using latest published binary release."
+
+if [ -z "$DOWNLOAD_URL" ]; then
+    log_error "Could not find a compatible binary asset in the selected release."
+    log_error "Expected one of: ${ASSET_CANDIDATES[*]}"
+    log_error "GitHub API Response Preview:"
+    echo "$RELEASE_RESPONSE" | head -n 20
+    log_error "..."
+    if [ -n "$RELEASE_TAG" ]; then
+        log_error "Please check https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/tag/${RELEASE_TAG} manually."
+    else
+        log_error "Please check https://github.com/${REPO_OWNER}/${REPO_NAME}/releases manually."
+    fi
+    exit 1
+fi
+
+log_success "Using published binary release."
 if [ -n "$RELEASE_TAG" ]; then
     log_info "Selected release tag: ${BOLD}${RELEASE_TAG}${RESET}"
 fi
+log_info "Selected release asset: ${BOLD}${TARGET_ASSET}${RESET}"
 log_info "Download URL: ${DOWNLOAD_URL}"
 
 # --- 3. Download & Install ---
