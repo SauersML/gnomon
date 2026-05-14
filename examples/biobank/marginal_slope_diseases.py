@@ -29,7 +29,6 @@ import pandas as pd
 from google.cloud import bigquery
 from lifelines import CoxPHFitter
 from lifelines.utils import concordance_index
-from sklearn.linear_model import LinearRegression
 
 logging.basicConfig(
     level=logging.INFO,
@@ -343,24 +342,44 @@ def z_norm2(
     train_pcs: np.ndarray,
     test_pgs: np.ndarray,
     test_pcs: np.ndarray,
-    eps: float = 1e-6,
+    pgs_id: str = "PGS",
 ) -> tuple[np.ndarray, np.ndarray]:
-    """pgscatalog two-step PC-based normalization (eMERGE / pgsc_calc spec).
+    """pgscatalog-calc Z_norm2 via `pgs_adjust` (mean+var, 2-step, no pop labels).
 
-    Step 1 (mean):     mu_hat = OLS(PGS ~ PCs);  resid = PGS - mu_hat
-    Step 2 (variance): var_hat = OLS(resid^2 ~ PCs), clipped at `eps`;
-                       z      = resid / sqrt(var_hat)
+    Calls the upstream `pgscatalog.calc.lib._ancestry.tools.pgs_adjust` so the
+    adjustment is bit-for-bit identical to the pgsc_calc / eMERGE pipeline.
+    Regressions are fit on train (`ref_df`) and applied to both train and test
+    (`target_df`) with train coefficients only — no test leakage.
 
-    Regressions fit on train and applied to test using train coefficients
-    only. No population labels used — this is the continuous-ancestry form.
+    The pgs_adjust API requires `pop` columns even for continuous-ancestry
+    methods that ignore them, so we pass a constant dummy label. The Z_norm2
+    math itself does not consult them.
     """
-    mean_reg = LinearRegression().fit(train_pcs, train_pgs)
-    train_resid = train_pgs - mean_reg.predict(train_pcs)
-    test_resid = test_pgs - mean_reg.predict(test_pcs)
-    var_reg = LinearRegression().fit(train_pcs, train_resid ** 2)
-    train_var = np.maximum(var_reg.predict(train_pcs), eps)
-    test_var = np.maximum(var_reg.predict(test_pcs), eps)
-    return train_resid / np.sqrt(train_var), test_resid / np.sqrt(test_var)
+    from pgscatalog.calc.lib._ancestry.tools import pgs_adjust  # lazy: heavy import
+
+    n_pcs = train_pcs.shape[1]
+    pc_cols = [f"PC{i+1}" for i in range(n_pcs)]
+
+    def _frame(pgs: np.ndarray, pcs: np.ndarray) -> pd.DataFrame:
+        df = pd.DataFrame(pcs, columns=pc_cols)
+        df["pop"] = "all"
+        df[pgs_id] = pgs
+        return df
+
+    ref_df = _frame(train_pgs, train_pcs)
+    kwargs = dict(
+        ref_df=ref_df,
+        scorecols=[pgs_id],
+        ref_pop_col="pop",
+        target_pop_col="pop",
+        use_method=["mean+var"],
+        norm2_2step=True,
+        n_pcs=n_pcs,
+    )
+    _, adj_train, _ = pgs_adjust(target_df=_frame(train_pgs, train_pcs), **kwargs)
+    _, adj_test, _ = pgs_adjust(target_df=_frame(test_pgs, test_pcs), **kwargs)
+    z_col = f"Z_norm2|{pgs_id}"
+    return adj_train[z_col].to_numpy(), adj_test[z_col].to_numpy()
 
 
 def fit_baseline_cox(train_df: pd.DataFrame) -> CoxPHFitter:

@@ -85,6 +85,7 @@ uv run \
     --with scikit-learn \
     --with lifelines \
     --with tzdata \
+    --with pgscatalog.calc \
     --with google-cloud-bigquery \
     --with google-cloud-bigquery-storage \
     --with db-dtypes \
