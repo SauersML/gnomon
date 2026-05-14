@@ -7,6 +7,7 @@ on:
       - master
     paths:
       - 'Cargo.toml'
+      - 'Cargo.lock'
       - '**/*.rs'
       - 'install.sh'
       - '.github/workflows/build-release-all.yml'
@@ -14,6 +15,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   GNOMON_SKIP_LINT_CHECKS: "1"
 
@@ -106,7 +108,7 @@ jobs:
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.asset_suffix }}-${{ matrix.target }}-${{ matrix.cpu }}
+          key: ${{ matrix.asset_suffix }}-${{ matrix.target }}-${{ matrix.cpu }}-${{ hashFiles('Cargo.lock') }}
           cache-on-failure: true
 
       - name: Install Zig linker for old-glibc Linux builds
@@ -183,16 +185,16 @@ jobs:
           else
             build_cmd+=(build)
           fi
-          build_cmd+=(--release --target "$TARGET" --bins)
+          build_cmd+=(--release --target "$TARGET" --bin gnomon)
 
           echo "::group::Build release binaries"
           "${build_cmd[@]}"
           echo "::endgroup::"
 
           package_one() {
-            local binary_name="$1"
+            local source_binary_name="$1"
             local asset_prefix="$2"
-            local source_name="$binary_name"
+            local source_name="$source_binary_name"
             if [ "$RUNNER_OS" = "Windows" ]; then
               source_name="${source_name}.exe"
             fi
@@ -203,29 +205,31 @@ jobs:
               source_path="target/${TARGET}/release/${source_name}"
             fi
             if [ ! -f "$source_path" ]; then
-              echo "::error::Built binary not found for ${binary_name}"
+              echo "::error::Built binary not found for ${source_binary_name}"
               return 1
             fi
 
             verify_glibc_floor "$source_path"
 
             if [ "$RUNNER_OS" = "Windows" ]; then
-              cp "$source_path" "dist/${asset_base}.exe"
+              local packaged_binary="dist/${asset_base}.exe"
+              cp "$source_path" "$packaged_binary"
               powershell -NoLogo -NoProfile -Command \
-                "Compress-Archive -Path 'dist/${asset_base}.exe' -DestinationPath 'dist/${asset_base}.zip' -Force"
-              rm -f "dist/${asset_base}.exe"
+                "Compress-Archive -Path '${packaged_binary}' -DestinationPath 'dist/${asset_base}.zip' -Force"
+              rm -f "$packaged_binary"
             else
-              cp "$source_path" "dist/${asset_base}"
+              local packaged_binary="dist/${asset_base}"
+              cp "$source_path" "$packaged_binary"
               tar -czf "dist/${asset_base}.tar.gz" -C dist "${asset_base}"
-              rm -f "dist/${asset_base}"
+              rm -f "$packaged_binary"
             fi
           }
 
           package_one gnomon gnomon
-          package_one gnomon-map gnomon-map
-          package_one gnomon-score gnomon-score
-          package_one gnomon-terms gnomon-terms
-          package_one gnomon-calibrate gnomon-calibrate
+          package_one gnomon gnomon-map
+          package_one gnomon gnomon-score
+          package_one gnomon gnomon-terms
+          package_one gnomon gnomon-calibrate
       - name: Upload Artifact
         if: always()
         uses: actions/upload-artifact@v4
