@@ -36,6 +36,7 @@ uv run \
     --with pyarrow \
     --with scipy \
     --with scikit-learn \
+    --with lifelines \
     --with google-cloud-bigquery \
     --with google-cloud-bigquery-storage \
     --with db-dtypes \

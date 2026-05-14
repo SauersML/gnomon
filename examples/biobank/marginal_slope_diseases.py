@@ -27,8 +27,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from google.cloud import bigquery
-from scipy.stats import norm
-from sklearn.metrics import roc_auc_score
+from lifelines import CoxPHFitter
+from lifelines.utils import concordance_index
+from sklearn.linear_model import LinearRegression
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,8 +42,8 @@ WORKDIR = Path.home() / "aou-gpu-baremetal"
 PLINK_PREFIX = WORKDIR / "arrays"
 SEX_CACHE = Path.home() / ".aou_cache" / "sex_terms"
 FITS_DIR = WORKDIR / "biobank_fits"
-NUM_PCS = 8
-DUCHON_CENTERS = 24  # > linear nullspace (d+1=9) in d=8
+NUM_PCS = 10
+DUCHON_CENTERS = 30  # > linear nullspace (d+1=11) in d=10
 TRAIN_FRACTION = 0.80  # per-class 80/20 split
 RNG_SEED = 0
 GNOMON_BIN = os.environ.get("GNOMON_BIN", "gnomon")
@@ -231,14 +232,21 @@ def lookup_snomed_concept(client: bigquery.Client, cdr: str, name: str) -> int:
     return int(rows[0]["concept_id"])
 
 
-def fetch_cases(client: bigquery.Client, cdr: str, ancestor_id: int) -> set[str]:
-    """Persons with any condition concept descending from `ancestor_id`."""
+def fetch_cases(client: bigquery.Client, cdr: str, ancestor_id: int) -> pd.DataFrame:
+    """Per-case earliest qualifying condition date.
+
+    Returns columns `person_id` (str) and `event_date` (datetime64). The event
+    date is the earliest `condition_start_date` across any descendant concept,
+    which is what age-as-time-scale survival wants as the failure time.
+    """
     sql = f"""
-    SELECT DISTINCT CAST(co.person_id AS STRING) AS person_id
+    SELECT CAST(co.person_id AS STRING) AS person_id,
+           MIN(co.condition_start_date) AS event_date
     FROM `{cdr}.condition_occurrence` AS co
     JOIN `{cdr}.concept_ancestor` AS ca
       ON ca.descendant_concept_id = co.condition_concept_id
     WHERE ca.ancestor_concept_id = @ancestor
+    GROUP BY co.person_id
     """
     job = client.query(
         sql,
@@ -246,79 +254,133 @@ def fetch_cases(client: bigquery.Client, cdr: str, ancestor_id: int) -> set[str]
             bigquery.ScalarQueryParameter("ancestor", "INT64", ancestor_id),
         ]),
     )
-    return set(job.to_dataframe()["person_id"].astype(str))
+    df = job.to_dataframe()
+    df["person_id"] = _canonical_id(df["person_id"])
+    df["event_date"] = pd.to_datetime(df["event_date"])
+    return df
+
+
+def fetch_person_times(client: bigquery.Client, cdr: str) -> pd.DataFrame:
+    """Per-person birth date and observation-window bounds.
+
+    Returns columns `person_id`, `birth_datetime`, `obs_start`, `obs_end`.
+    `obs_start` is the earliest observation_period start; `obs_end` the latest
+    end. Used to build age-as-time-scale entry/exit for survival.
+    """
+    sql = f"""
+    SELECT CAST(p.person_id AS STRING) AS person_id,
+           p.birth_datetime,
+           MIN(op.observation_period_start_date) AS obs_start,
+           MAX(op.observation_period_end_date)   AS obs_end
+    FROM `{cdr}.person` AS p
+    JOIN `{cdr}.observation_period` AS op USING(person_id)
+    GROUP BY p.person_id, p.birth_datetime
+    """
+    df = client.query(sql).to_dataframe()
+    df["person_id"] = _canonical_id(df["person_id"])
+    df["birth_datetime"] = pd.to_datetime(df["birth_datetime"], utc=True).dt.tz_convert(None)
+    df["obs_start"] = pd.to_datetime(df["obs_start"])
+    df["obs_end"] = pd.to_datetime(df["obs_end"])
+    print(f"  times: n={len(df):,}  e.g. {df['person_id'].head(3).tolist()}")
+    return df
 
 
 # --- model -----------------------------------------------------------------
 
 def fit_marginal_slope(train_df: pd.DataFrame, num_pcs: int):  # -> gamfit.Model
-    """Bernoulli marginal-slope probit GAM with joint Duchon over PCs in
-    both the location and log-slope channels; sex linear; prs_z is the
-    latent score (z_column) so its slope varies in PC space.
+    """Survival marginal-slope GAM with joint Duchon over PCs in both the
+    baseline hazard surface and the log-slope (log-HR) channel; sex linear;
+    prs_z is the latent score (z_column) so its hazard ratio varies in PC space.
 
-    No linkwiggle(...) in either formula -> engine's score-warp / link-dev
-    deviation blocks remain inactive in the protocol that this triggers.
+    Age-as-time-scale: `Surv(entry_age, exit_age, event)` is left-truncated at
+    each person's age at AoU observation start.
     """
     import gamfit  # lazy: lets the linear baseline import this module without dragging gamfit in
     pcs = ", ".join(f"PC{i+1}" for i in range(num_pcs))
-    # `scale_dims=true` enables per-axis anisotropy, so the BMS family does NOT
-    # short-circuit κ/ψ optimization off (gam/src/families/bernoulli_marginal_slope.rs:16652,
-    # gam/src/terms/smooth.rs:1340 is_pure_duchon_aniso_term + :1371
-    # spatial_term_has_locked_kappa). With anisotropy active the term keeps the
-    # outer κ + ψ axes that scale with NUM_PCS and DUCHON_CENTERS.
-    # `length_scale=1.0` keeps the resolver in hybrid (non-pure) mode so it
-    # doesn't have to escalate the nullspace order to Degree(2); Linear keeps
-    # polynomial_cols=d+1 (9 in d=8), well below DUCHON_CENTERS.
-    # `power` omitted -> auto-escalated by the resolver to satisfy
-    # `2*(p+s) > d` (basis.rs:resolve_duchon_orders). At d=8, length_scale set,
-    # order=1 it lands at power=4 with stiffness operator order s=2.
+    # `scale_dims=true` enables per-axis anisotropy on the spatial Duchon, so
+    # the engine keeps the per-axis length-scale optimization active rather
+    # than collapsing to a pure isotropic Duchon. `length_scale=1.0` keeps the
+    # resolver in hybrid (non-pure) mode so it doesn't escalate the nullspace
+    # order; at d=NUM_PCS, order=1 the polynomial cols stay (d+1), well below
+    # DUCHON_CENTERS. `power` omitted -> auto-escalated to satisfy
+    # 2*(p+s) > d (basis.rs:resolve_duchon_orders).
     duchon = (
         f"duchon({pcs}, centers={DUCHON_CENTERS}, order=1, "
         f"length_scale=1.0, scale_dims=true)"
     )
-    formula = f"case ~ {duchon} + sex"
-    cols = ["case", "sex", "prs_z"] + [f"PC{i+1}" for i in range(num_pcs)]
-    print(f"  fit_spec: family=bernoulli marginal-slope  link=probit")
+    formula = f"Surv(entry_age, exit_age, event) ~ {duchon} + sex"
+    cols = ["entry_age", "exit_age", "event", "sex", "prs_z"] + [
+        f"PC{i+1}" for i in range(num_pcs)
+    ]
+    print(f"  fit_spec: family=survival marginal-slope")
     print(f"  fit_spec: formula={formula!r}")
     print(f"  fit_spec: z_column='prs_z'  logslope_formula={duchon!r}")
     print(f"  fit_spec: num_pcs={num_pcs}  duchon_centers={DUCHON_CENTERS}  n_train={len(train_df)}")
     return gamfit.fit(
         train_df[cols],
         formula,
-        link="probit",
+        survival_likelihood="marginal-slope",
         z_column="prs_z",
         logslope_formula=duchon,
     )
 
 
-def metrics(y: np.ndarray, p: np.ndarray, K: float) -> dict[str, float]:
-    """Held-out AUROC + Nagelkerke + Lee-2011 liability-scale R^2.
+def metrics(exit_: np.ndarray, event: np.ndarray, risk: np.ndarray) -> dict[str, float]:
+    """Harrell's C on a (exit, event, risk) triple.
 
-    Lee, Wray, Goddard, Visscher (AJHG 2011, eq. 23) for ascertained case-control:
-
-        R^2_l = R^2_O * K^2 * (1-K)^2 / (z^2 * P * (1-P))
-
-    K is the population prevalence, P is the sample case proportion, and
-    z = phi(Phi^{-1}(K)) is the standard normal density at the liability threshold.
+    `risk` is a per-row scalar where higher means greater predicted hazard.
     """
-    eps = 1e-12
-    p = np.clip(p, eps, 1 - eps)
-    ll_full = float(np.sum(y * np.log(p) + (1 - y) * np.log1p(-p)))
-    P = float(y.mean())
-    ll_null = float(np.sum(y * np.log(P) + (1 - y) * np.log1p(-P)))
-    n = len(y)
-    cox_snell = 1.0 - np.exp(2 * (ll_null - ll_full) / n)
-    nagelkerke = cox_snell / (1.0 - np.exp(2 * ll_null / n))
-    z = float(norm.pdf(norm.ppf(K)))
-    liability_r2 = nagelkerke * K**2 * (1 - K) ** 2 / (z**2 * P * (1 - P))
     return {
-        "n": n,
-        "cases": int(y.sum()),
-        "P": P,
-        "auroc": float(roc_auc_score(y, p)),
-        "nagelkerke_r2": float(nagelkerke),
-        "liability_r2": float(liability_r2),
+        "n": int(len(event)),
+        "n_events": int(event.sum()),
+        "median_exit_age": float(np.median(exit_)),
+        "concordance": float(concordance_index(exit_, -risk, event)),
     }
+
+
+def z_norm2(
+    train_pgs: np.ndarray,
+    train_pcs: np.ndarray,
+    test_pgs: np.ndarray,
+    test_pcs: np.ndarray,
+    eps: float = 1e-6,
+) -> tuple[np.ndarray, np.ndarray]:
+    """pgscatalog two-step PC-based normalization (eMERGE / pgsc_calc spec).
+
+    Step 1 (mean):     mu_hat = OLS(PGS ~ PCs);  resid = PGS - mu_hat
+    Step 2 (variance): var_hat = OLS(resid^2 ~ PCs), clipped at `eps`;
+                       z      = resid / sqrt(var_hat)
+
+    Regressions fit on train and applied to test using train coefficients
+    only. No population labels used — this is the continuous-ancestry form.
+    """
+    mean_reg = LinearRegression().fit(train_pcs, train_pgs)
+    train_resid = train_pgs - mean_reg.predict(train_pcs)
+    test_resid = test_pgs - mean_reg.predict(test_pcs)
+    var_reg = LinearRegression().fit(train_pcs, train_resid ** 2)
+    train_var = np.maximum(var_reg.predict(train_pcs), eps)
+    test_var = np.maximum(var_reg.predict(test_pcs), eps)
+    return train_resid / np.sqrt(train_var), test_resid / np.sqrt(test_var)
+
+
+def fit_baseline_cox(train_df: pd.DataFrame) -> CoxPHFitter:
+    """Cox PH on `(entry_age, exit_age, event) ~ z_norm2`, left-truncated."""
+    cph = CoxPHFitter()
+    cph.fit(
+        train_df[["entry_age", "exit_age", "event", "z_norm2"]],
+        duration_col="exit_age",
+        entry_col="entry_age",
+        event_col="event",
+    )
+    return cph
+
+
+def gam_risk(model, df: pd.DataFrame, num_pcs: int, horizon: float) -> np.ndarray:
+    """Per-row scalar risk from a gamfit survival model: cumulative hazard at
+    `horizon` evaluated on `df`'s covariates. Higher = greater hazard."""
+    predict_cols = ["sex", "prs_z"] + [f"PC{i+1}" for i in range(num_pcs)]
+    pred = model.predict(df[predict_cols])
+    return np.asarray(pred.cumulative_hazard_at([horizon]), dtype=float).reshape(-1)
 
 
 # --- main ------------------------------------------------------------------
@@ -341,6 +403,11 @@ def main() -> None:
     cdr = os.environ["WORKSPACE_CDR"]
     client = bigquery.Client()
 
+    print("loading person times (birth + observation period) ...")
+    times = fetch_person_times(client, cdr)
+    base = base.merge(times, on="person_id")
+    print(f"base (with times): n={len(base):,}")
+
     rng = np.random.default_rng(RNG_SEED)
 
     for name, cfg in diseases.items():
@@ -348,50 +415,78 @@ def main() -> None:
         pgs_df = load_one_pgs(cfg["pgs"])
         df_full = base.merge(pgs_df, on="person_id")
         ancestor = lookup_snomed_concept(client, cdr, cfg["snomed_name"])
-        cases = fetch_cases(client, cdr, ancestor)
-        df_full["case"] = df_full["person_id"].isin(cases).astype(int)
-        case_idx = rng.permutation(df_full.index[df_full["case"] == 1].to_numpy())
-        ctrl_idx = rng.permutation(df_full.index[df_full["case"] == 0].to_numpy())
-        # Cohort prevalence: inferred from the actual merged cohort (PCs ∩ sex ∩
-        # PGS rows on disk), not a hardcoded literature number. Lee 2011 wants
-        # the population prevalence; for AoU we use the cohort prevalence as
-        # its best in-data estimate.
-        K = len(case_idx) / max(1, len(case_idx) + len(ctrl_idx))
-        print(
-            f"  snomed={cfg['snomed_name']!r}  concept_id={ancestor}  "
-            f"cases_in_cohort={len(case_idx):,}  controls_in_cohort={len(ctrl_idx):,}  "
-            f"K={K:.6f}"
+        case_dates = fetch_cases(client, cdr, ancestor)
+        df_full = df_full.merge(case_dates, on="person_id", how="left")
+        df_full["event"] = df_full["event_date"].notna().astype(int)
+
+        # Age-as-time-scale (years). Entry: age at AoU obs-period start.
+        # Exit: age at first qualifying condition for events; age at obs-period
+        # end for censors. Left-truncation respected via `Surv(entry, exit, event)`.
+        days_per_year = 365.25
+        df_full["entry_age"] = (
+            (df_full["obs_start"] - df_full["birth_datetime"]).dt.days / days_per_year
+        )
+        exit_date = df_full["event_date"].fillna(df_full["obs_end"])
+        df_full["exit_age"] = (
+            (exit_date - df_full["birth_datetime"]).dt.days / days_per_year
         )
 
-        # Use ALL cases; subsample an equal number of controls (balanced); then
-        # per-class 80/20 train/test split so both splits stay 50/50 case/control.
-        n_cases = len(case_idx)
-        n_ctrl_sampled = min(n_cases, len(ctrl_idx))
-        ctrl_sampled = ctrl_idx[:n_ctrl_sampled]
-        n_train_per_class = int(round(n_cases * TRAIN_FRACTION))
-        n_train_ctrl = int(round(n_ctrl_sampled * TRAIN_FRACTION))
+        # Drop rows with non-positive or invalid intervals: missing birth/obs,
+        # prevalent cases whose event predates obs_start (entry >= exit), etc.
+        before = len(df_full)
+        df_full = df_full.dropna(subset=["entry_age", "exit_age"]).copy()
+        df_full = df_full[df_full["exit_age"] > df_full["entry_age"]].copy()
+        df_full = df_full[df_full["entry_age"] >= 0].copy()
+        dropped = before - len(df_full)
+        n_event = int(df_full["event"].sum())
+        n_censor = len(df_full) - n_event
+        K = n_event / max(1, len(df_full))
+        print(
+            f"  snomed={cfg['snomed_name']!r}  concept_id={ancestor}  "
+            f"events={n_event:,}  censors={n_censor:,}  K(crude)={K:.6f}  "
+            f"dropped_bad_intervals={dropped:,}"
+        )
+
+        # Per-class 80/20 split (events vs. censored), like the prior design but
+        # without balancing — survival uses censored controls natively. We keep
+        # all events and all censors, just split each group 80/20.
+        event_idx = rng.permutation(df_full.index[df_full["event"] == 1].to_numpy())
+        censor_idx = rng.permutation(df_full.index[df_full["event"] == 0].to_numpy())
+        n_train_event = int(round(len(event_idx) * TRAIN_FRACTION))
+        n_train_censor = int(round(len(censor_idx) * TRAIN_FRACTION))
         train_pick = np.concatenate([
-            case_idx[:n_train_per_class],
-            ctrl_sampled[:n_train_ctrl],
+            event_idx[:n_train_event], censor_idx[:n_train_censor],
         ])
         test_pick = np.concatenate([
-            case_idx[n_train_per_class:],
-            ctrl_sampled[n_train_ctrl:],
+            event_idx[n_train_event:], censor_idx[n_train_censor:],
         ])
         print(
-            f"  split: balanced n={n_cases + n_ctrl_sampled:,}  "
-            f"train_cases={n_train_per_class:,} train_controls={n_train_ctrl:,}  "
-            f"test_cases={n_cases - n_train_per_class:,} test_controls={n_ctrl_sampled - n_train_ctrl:,}"
+            f"  split: n={len(df_full):,}  "
+            f"train_events={n_train_event:,} train_censors={n_train_censor:,}  "
+            f"test_events={len(event_idx) - n_train_event:,} "
+            f"test_censors={len(censor_idx) - n_train_censor:,}"
         )
         train = df_full.loc[train_pick].reset_index(drop=True)
         test = df_full.loc[test_pick].reset_index(drop=True)
 
         # Standardize PGS on training only, then apply the same shift/scale to test
-        # so we never mix test rows into the training statistics.
+        # so we never mix test rows into the training statistics. `prs_z` is the
+        # GAM's latent z (a plain z-score on training). The baseline uses Z_norm2
+        # (PC-based ancestry-adjusted), built separately below.
         pgs_mean = float(train["pgs"].mean())
         pgs_std = float(train["pgs"].std(ddof=0))
         train["prs_z"] = (train["pgs"] - pgs_mean) / pgs_std
         test["prs_z"] = (test["pgs"] - pgs_mean) / pgs_std
+
+        # Z_norm2 baseline score: two-step PC regression (mean + variance),
+        # train-only fit, applied to both train and test.
+        pc_cols = [f"PC{i+1}" for i in range(NUM_PCS)]
+        z_tr, z_te = z_norm2(
+            train["pgs"].to_numpy(), train[pc_cols].to_numpy(),
+            test["pgs"].to_numpy(), test[pc_cols].to_numpy(),
+        )
+        train["z_norm2"] = z_tr
+        test["z_norm2"] = z_te
 
         model = fit_marginal_slope(train, NUM_PCS)
         FITS_DIR.mkdir(parents=True, exist_ok=True)
@@ -413,22 +508,58 @@ def main() -> None:
                 "rng_seed": RNG_SEED,
                 "pgs_mean": pgs_mean,
                 "pgs_std": pgs_std,
-                "K": K,
+                "K_crude": K,
                 "n_train": int(len(train)),
+                "survival_likelihood": "marginal-slope",
             }, indent=2))
             print(f"  save: model -> {fit_path}  meta -> {meta_path}")
-        predict_cols = ["sex", "prs_z"] + [f"PC{i+1}" for i in range(NUM_PCS)]
-        pred = model.predict(test[predict_cols], return_type="dict")
-        p_test = np.asarray(pred["mean"], dtype=float)
-        m = metrics(test["case"].to_numpy(), p_test, K)
+
+        # Survival predict returns a SurvivalPrediction; use cumulative hazard
+        # at a fixed horizon as the scalar risk score for concordance. The
+        # horizon is the max test exit age, computed once and reused for train
+        # and test so the two C-indices use a common hazard scale.
+        t_horizon = float(test["exit_age"].max())
+        gam_risk_train = gam_risk(model, train, NUM_PCS, t_horizon)
+        gam_risk_test = gam_risk(model, test, NUM_PCS, t_horizon)
+        gam_train_m = metrics(
+            train["exit_age"].to_numpy(), train["event"].to_numpy(), gam_risk_train,
+        )
+        gam_test_m = metrics(
+            test["exit_age"].to_numpy(), test["event"].to_numpy(), gam_risk_test,
+        )
+
+        # Z_norm2 + Cox PH baseline on the SAME train/test split.
+        print(
+            f"  baseline_spec: Cox PH on Z_norm2 (PC-based mean+var adjustment, "
+            f"no pop labels)"
+        )
+        cph = fit_baseline_cox(train)
+        coef = float(cph.params_["z_norm2"])
+        print(f"  baseline_coef: log_HR={coef:+.4f}  HR/SD={np.exp(coef):.4f}")
+        base_risk_train = cph.predict_partial_hazard(train[["z_norm2"]]).to_numpy()
+        base_risk_test = cph.predict_partial_hazard(test[["z_norm2"]]).to_numpy()
+        base_train_m = metrics(
+            train["exit_age"].to_numpy(), train["event"].to_numpy(), base_risk_train,
+        )
+        base_test_m = metrics(
+            test["exit_age"].to_numpy(), test["event"].to_numpy(), base_risk_test,
+        )
 
         print(
-            f"  PGS={cfg['pgs']}  train_n={len(train):,}  test_n={m['n']:,}  "
-            f"test_cases={m['cases']:,}  P={m['P']:.4f}  K={K:.6f}"
+            f"  PGS={cfg['pgs']}  train_n={len(train):,}  test_n={gam_test_m['n']:,}  "
+            f"test_events={gam_test_m['n_events']:,}  K(crude)={K:.6f}  "
+            f"median_exit_age={gam_test_m['median_exit_age']:.2f}  horizon={t_horizon:.2f}"
         )
         print(
-            f"  held-out  AUROC={m['auroc']:.4f}  "
-            f"Nagelkerke R^2={m['nagelkerke_r2']:.4f}  liability R^2={m['liability_r2']:.4f}"
+            f"  GAM       train_C={gam_train_m['concordance']:.4f}  "
+            f"test_C={gam_test_m['concordance']:.4f}"
+        )
+        print(
+            f"  baseline  train_C={base_train_m['concordance']:.4f}  "
+            f"test_C={base_test_m['concordance']:.4f}"
+        )
+        print(
+            f"  delta     test_C(GAM - baseline)={gam_test_m['concordance'] - base_test_m['concordance']:+.4f}"
         )
 
 
