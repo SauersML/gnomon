@@ -1,6 +1,7 @@
 import Calibrator.Probability
 import Calibrator.PortabilityDrift
 import Calibrator.OpenQuestions
+import Calibrator.TransportIdentities
 
 namespace Calibrator
 
@@ -328,11 +329,13 @@ theorem truncationBias_small_for_large_signal (se : ℝ) (h_se : 0 < se) :
 
     This follows from linearity of conditional expectation applied
     to the decomposition β̂ = β + ε. -/
-theorem conditional_expectation_decomposition
-    (true_beta : ℝ) (conditional_noise_mean : ℝ) :
-    true_beta + conditional_noise_mean =
-      true_beta + conditional_noise_mean := by
-  ring
+theorem conditional_expectation_decomposition (Ω : Type*)
+    (E : ExpFunctional Ω) (true_beta : ℝ) (noise : Ω → ℝ) :
+    E (fun ω => true_beta + noise ω) =
+      true_beta + E noise := by
+  have h_linear : E (fun ω => true_beta + noise ω) = E (fun ω => true_beta) + E noise := by
+    exact E.add_eval (fun _ => true_beta) noise
+  rw [h_linear, E.eval_const]
 
 /-- **Derivation: winner's curse bias vanishes in the high-signal regime.**
     Combining the model (β̂ = β + ε) with the exponential proxy
