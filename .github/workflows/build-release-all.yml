@@ -7,7 +7,6 @@ on:
       - master
     paths:
       - 'Cargo.toml'
-      - 'Cargo.lock'
       - '**/*.rs'
       - 'install.sh'
       - '.github/workflows/build-release-all.yml'
@@ -107,7 +106,7 @@ jobs:
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.asset_suffix }}-${{ matrix.target }}-${{ matrix.cpu }}-${{ hashFiles('Cargo.lock') }}
+          key: ${{ matrix.asset_suffix }}-${{ matrix.target }}-${{ matrix.cpu }}
           cache-on-failure: true
 
       - name: Install Zig linker for old-glibc Linux builds
@@ -184,7 +183,7 @@ jobs:
           else
             build_cmd+=(build)
           fi
-          build_cmd+=(--locked --release --target "$TARGET" --bins)
+          build_cmd+=(--release --target "$TARGET" --bins)
 
           echo "::group::Build release binaries"
           "${build_cmd[@]}"
