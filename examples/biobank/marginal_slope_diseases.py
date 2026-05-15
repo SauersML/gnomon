@@ -420,13 +420,21 @@ def load_genetic_ancestry_labels() -> pd.DataFrame:
         gsutil = shutil.which("gsutil")
         if gsutil is None:
             raise RuntimeError("gsutil not on PATH; cannot fetch ancestry preds")
+        # `gsutil cp` does a metadata stat first, which requires
+        # `storage.objects.list` on the bucket. The AoU pet service account is
+        # only granted `storage.objects.get`, so `cp` 403s on a bucket the pet
+        # SA can actually read. `gsutil cat` is a pure media GET — no list,
+        # no metadata — so it succeeds with only object-read permission.
         cmd = [gsutil]
         project = os.environ.get("GOOGLE_PROJECT")
         if project:
             cmd += ["-u", project]
-        cmd += ["cp", ANCESTRY_PREDS_URI, str(ANCESTRY_PREDS_CACHE)]
-        print(f"  gsutil cp {ANCESTRY_PREDS_URI} -> {ANCESTRY_PREDS_CACHE}")
-        subprocess.run(cmd, check=True)
+        cmd += ["cat", ANCESTRY_PREDS_URI]
+        print(f"  gsutil cat {ANCESTRY_PREDS_URI} -> {ANCESTRY_PREDS_CACHE}")
+        tmp = ANCESTRY_PREDS_CACHE.with_suffix(ANCESTRY_PREDS_CACHE.suffix + ".part")
+        with tmp.open("wb") as fh:
+            subprocess.run(cmd, stdout=fh, check=True)
+        tmp.replace(ANCESTRY_PREDS_CACHE)
     df = pd.read_csv(
         ANCESTRY_PREDS_CACHE,
         sep="\t",
