@@ -843,7 +843,8 @@ def main() -> None:
     print(f"gamfit build_info: {gamfit.build_info()}")
     diseases = {k: v for k, v in DISEASES.items() if PGS_ID_PATTERN.match(v["pgs"])}
     print(f"diseases with real PGS IDs: {list(diseases)}")
-    print(f"loso_axes: {list(LOSO_AXES)}")
+    active_axes = list(LOSO_AXES)
+    print(f"loso_axes: {active_axes}")
 
     ensure_scored([cfg["pgs"] for cfg in diseases.values()])
 
@@ -869,10 +870,15 @@ def main() -> None:
     print(f"base (with context): n={len(base):,}")
 
     print("loading AoU inferred genetic ancestry labels ...")
-    ancestry = load_genetic_ancestry_labels()
-    base = base.merge(ancestry, on="person_id", how="left")
-    base["ancestry_category"] = _clean_group_label(base["ancestry_category"]).str.upper()
-    print(f"base (with ancestry): n={len(base):,}")
+    try:
+        ancestry = load_genetic_ancestry_labels()
+    except AncestryUnavailable as exc:
+        print(f"  WARNING: ancestry labels unavailable -> dropping 'ancestry' LOSO axis. detail: {exc}")
+        active_axes = [a for a in active_axes if a != "ancestry"]
+    else:
+        base = base.merge(ancestry, on="person_id", how="left")
+        base["ancestry_category"] = _clean_group_label(base["ancestry_category"]).str.upper()
+        print(f"base (with ancestry): n={len(base):,}")
 
     rng = np.random.default_rng(RNG_SEED)
     pc_cols = [f"PC{i+1}" for i in range(NUM_PCS)]
@@ -952,7 +958,7 @@ def main() -> None:
         )
 
         print("  OOD: leave-one-group-out refits")
-        for axis in LOSO_AXES:
+        for axis in active_axes:
             run_loso_axis(
                 df_full,
                 axis_name=axis,
