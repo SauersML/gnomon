@@ -26,7 +26,6 @@ import shutil
 import struct
 import subprocess
 import sys
-from argparse import ArgumentParser, Namespace
 from pathlib import Path
 
 import numpy as np
@@ -56,6 +55,7 @@ MIN_LOSO_TRAIN_CENSORS = 50
 MIN_LOSO_TEST_EVENTS = 20
 MIN_LOSO_TEST_CENSORS = 20
 MIN_LOSO_TEST_N = 500
+LOSO_AXES = ("care_site", "census_region", "ancestry")
 LOSO_AXIS_TO_COLUMN = {
     "care_site": "care_site_group",
     "census_region": "census_region",
@@ -833,94 +833,17 @@ def run_loso_axis(
     )
 
 
-def parse_args() -> Namespace:
-    parser = ArgumentParser(
-        description="AoU biobank survival marginal-slope GAM + OOD validation"
-    )
-    parser.add_argument(
-        "--disease",
-        action="append",
-        choices=sorted(DISEASES),
-        help="Disease to run. May be repeated. Default: all diseases.",
-    )
-    parser.add_argument(
-        "--loso-axes",
-        default="care_site,census_region,ancestry",
-        help=(
-            "Comma-separated LOSO axes from "
-            f"{','.join(LOSO_AXIS_TO_COLUMN)}. Use 'none' to skip LOSO."
-        ),
-    )
-    parser.add_argument(
-        "--max-loso-care-sites",
-        type=int,
-        default=MAX_LOSO_CARE_SITES,
-        help="Number of largest eligible care-site folds to run.",
-    )
-    parser.add_argument(
-        "--min-loso-train-events",
-        type=int,
-        default=MIN_LOSO_TRAIN_EVENTS,
-        help="Minimum remaining training events for a LOSO fold.",
-    )
-    parser.add_argument(
-        "--min-loso-train-censors",
-        type=int,
-        default=MIN_LOSO_TRAIN_CENSORS,
-        help="Minimum remaining training censors for a LOSO fold.",
-    )
-    parser.add_argument(
-        "--min-loso-test-events",
-        type=int,
-        default=MIN_LOSO_TEST_EVENTS,
-        help="Minimum held-out events for a LOSO fold.",
-    )
-    parser.add_argument(
-        "--min-loso-test-censors",
-        type=int,
-        default=MIN_LOSO_TEST_CENSORS,
-        help="Minimum held-out censors for a LOSO fold.",
-    )
-    parser.add_argument(
-        "--min-loso-test-n",
-        type=int,
-        default=MIN_LOSO_TEST_N,
-        help="Minimum held-out rows for a LOSO fold.",
-    )
-    parser.add_argument(
-        "--score-loso-train",
-        action="store_true",
-        help="Also predict training rows for LOSO folds. Slow; held-out C is the OOD metric.",
-    )
-    args = parser.parse_args()
-    axes = []
-    if args.loso_axes.strip().lower() != "none":
-        for axis in args.loso_axes.split(","):
-            axis = axis.strip()
-            if not axis:
-                continue
-            if axis not in LOSO_AXIS_TO_COLUMN:
-                raise SystemExit(
-                    f"unknown LOSO axis {axis!r}; choices: {','.join(LOSO_AXIS_TO_COLUMN)}"
-                )
-            axes.append(axis)
-    args.loso_axes = axes
-    return args
-
-
 # --- main ------------------------------------------------------------------
 
 def main() -> None:
-    args = parse_args()
+    if len(sys.argv) != 1:
+        raise SystemExit("marginal_slope_diseases.py takes no arguments")
     import gamfit
     print(f"gamfit version: {gamfit.__version__}")
     print(f"gamfit build_info: {gamfit.build_info()}")
     diseases = {k: v for k, v in DISEASES.items() if PGS_ID_PATTERN.match(v["pgs"])}
-    if args.disease:
-        wanted = set(args.disease)
-        diseases = {k: v for k, v in diseases.items() if k in wanted}
     print(f"diseases with real PGS IDs: {list(diseases)}")
-    print(f"loso_axes: {args.loso_axes if args.loso_axes else '<none>'}")
+    print(f"loso_axes: {list(LOSO_AXES)}")
 
     ensure_scored([cfg["pgs"] for cfg in diseases.values()])
 
@@ -938,25 +861,18 @@ def main() -> None:
     base = base.merge(times, on="person_id")
     print(f"base (with times): n={len(base):,}")
 
-    if {"care_site", "census_region"} & set(args.loso_axes):
-        print("loading geography and care-site context ...")
-        context = fetch_person_context(client, cdr)
-        base = base.merge(context, on="person_id", how="left")
-        base["census_region"] = _clean_group_label(base["census_region"])
-        base["care_site_group"] = _clean_group_label(base["care_site_group"])
-        print(f"base (with context): n={len(base):,}")
+    print("loading geography and care-site context ...")
+    context = fetch_person_context(client, cdr)
+    base = base.merge(context, on="person_id", how="left")
+    base["census_region"] = _clean_group_label(base["census_region"])
+    base["care_site_group"] = _clean_group_label(base["care_site_group"])
+    print(f"base (with context): n={len(base):,}")
 
-    if "ancestry" in args.loso_axes:
-        print("loading AoU inferred genetic ancestry labels ...")
-        try:
-            ancestry = load_genetic_ancestry_labels()
-        except AncestryUnavailable as exc:
-            print(f"  WARNING: ancestry labels unavailable -> dropping 'ancestry' LOSO axis. detail: {exc}")
-            args.loso_axes = [a for a in args.loso_axes if a != "ancestry"]
-        else:
-            base = base.merge(ancestry, on="person_id", how="left")
-            base["ancestry_category"] = _clean_group_label(base["ancestry_category"]).str.upper()
-            print(f"base (with ancestry): n={len(base):,}")
+    print("loading AoU inferred genetic ancestry labels ...")
+    ancestry = load_genetic_ancestry_labels()
+    base = base.merge(ancestry, on="person_id", how="left")
+    base["ancestry_category"] = _clean_group_label(base["ancestry_category"]).str.upper()
+    print(f"base (with ancestry): n={len(base):,}")
 
     rng = np.random.default_rng(RNG_SEED)
     pc_cols = [f"PC{i+1}" for i in range(NUM_PCS)]
@@ -1035,22 +951,21 @@ def main() -> None:
             },
         )
 
-        if args.loso_axes:
-            print("  OOD: leave-one-group-out refits")
-        for axis in args.loso_axes:
+        print("  OOD: leave-one-group-out refits")
+        for axis in LOSO_AXES:
             run_loso_axis(
                 df_full,
                 axis_name=axis,
                 group_col=LOSO_AXIS_TO_COLUMN[axis],
                 pc_cols=pc_cols,
                 pgs_id=cfg["pgs"],
-                min_train_events=args.min_loso_train_events,
-                min_train_censors=args.min_loso_train_censors,
-                min_test_events=args.min_loso_test_events,
-                min_test_censors=args.min_loso_test_censors,
-                min_test_n=args.min_loso_test_n,
-                max_groups=args.max_loso_care_sites if axis == "care_site" else None,
-                score_train=args.score_loso_train,
+                min_train_events=MIN_LOSO_TRAIN_EVENTS,
+                min_train_censors=MIN_LOSO_TRAIN_CENSORS,
+                min_test_events=MIN_LOSO_TEST_EVENTS,
+                min_test_censors=MIN_LOSO_TEST_CENSORS,
+                min_test_n=MIN_LOSO_TEST_N,
+                max_groups=MAX_LOSO_CARE_SITES if axis == "care_site" else None,
+                score_train=False,
             )
 
 

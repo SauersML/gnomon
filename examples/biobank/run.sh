@@ -5,6 +5,11 @@ export PYTHONUNBUFFERED=1
 
 SCRIPT_DIR="$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &>/dev/null && pwd )"
 
+if [ "$#" -ne 0 ]; then
+  echo "run.sh takes no arguments; it always runs the full biobank validation." >&2
+  exit 2
+fi
+
 # --- kill any older biobank run still in flight -----------------------------
 # Match by the python entrypoint, not by run.sh -- prior runs may still be
 # blocking on a long gamfit fit even if their wrapper shell has exited.
@@ -59,9 +64,8 @@ RESULTS="$RESULTS_DIR/biobank_run_${TS}.log"
   echo "results_file:     $RESULTS"
   echo
   echo "--- fit configuration (from script) ---"
-  grep -E '^(NUM_PCS|DUCHON_CENTERS|TRAIN_FRACTION|RNG_SEED) *=' \
+  grep -E '^(NUM_PCS|DUCHON_CENTERS|TRAIN_FRACTION|RNG_SEED|MAX_LOSO_CARE_SITES|MIN_LOSO_) *=' \
       "$SCRIPT_DIR/marginal_slope_diseases.py"
-  echo "script_args:       ${*:-<none>}"
   echo
   echo "--- diseases ---"
   awk '/^DISEASES = \{/,/^\}/' "$SCRIPT_DIR/marginal_slope_diseases.py"
@@ -98,7 +102,7 @@ uv run \
     --with nvidia-cusparse-cu12 \
     --with nvidia-curand-cu12 \
     --with nvidia-nvjitlink-cu12 \
-    -- python -u "$SCRIPT_DIR/marginal_slope_diseases.py" "$@" 2>&1 | tee -a "$RESULTS"
+    -- python -u "$SCRIPT_DIR/marginal_slope_diseases.py" 2>&1 | tee -a "$RESULTS"
 
 # --- extract just the summary lines ----------------------------------------
 {
