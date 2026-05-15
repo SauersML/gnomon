@@ -17,6 +17,13 @@ noncomputable def cvPredictionError
     {k : ℕ} (predicted observed : Fin k → ℝ) : ℝ :=
   (∑ i, (predicted i - observed i) ^ 2) / k
 
+@[simp]
+theorem cvPredictionError_self_eq_zero
+    {k : ℕ} (f : Fin k → ℝ) :
+    cvPredictionError f f = 0 := by
+  unfold cvPredictionError
+  simp
+
 theorem cvPredictionError_nonneg
     {k : ℕ} (predicted observed : Fin k → ℝ) :
     0 ≤ cvPredictionError predicted observed := by
