@@ -62,13 +62,11 @@ LOSO_AXIS_TO_COLUMN = {
 }
 GNOMON_BIN = os.environ.get("GNOMON_BIN", "gnomon")
 PGS_ID_PATTERN = re.compile(r"^PGS\d{6}$")
-# Gnomon's projection_scores.bin places every sample in the PC space of the
-# `hwe_1kg_hgdp_gsa_v3` reference (1000 Genomes + HGDP), so the leading PCs
-# encode continental ancestry. We KMeans-cluster on those PCs to recover
-# ancestry-like groups for the LOSO axis, which sidesteps the controlled
-# bucket entirely. K=6 matches AoU's six reference labels.
-ANCESTRY_NUM_CLUSTERS = 6
-ANCESTRY_CLUSTER_PCS = 6
+ANCESTRY_PREDS_URI = (
+    "gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/aux/ancestry/"
+    "ancestry_preds.tsv"
+)
+ANCESTRY_PREDS_CACHE = WORKDIR / "ancestry_preds.tsv"
 
 DISEASES = {
     "copd": {
@@ -406,32 +404,48 @@ def fetch_person_context(client: bigquery.Client, cdr: str) -> pd.DataFrame:
     return df[["person_id", "state", "census_region", "care_site_group"]]
 
 
-def derive_ancestry_groups_from_pcs(base: pd.DataFrame) -> pd.Series:
-    """Cluster samples into ancestry-like groups using gnomon's reference PCs.
+def load_genetic_ancestry_labels() -> pd.DataFrame:
+    """Load AoU inferred genetic ancestry labels.
 
-    Gnomon projects every sample into the PC space of its `hwe_1kg_hgdp_gsa_v3`
-    HWE-PCA reference (1KG+HGDP), so the leading PCs are continental-ancestry
-    coordinates. We run KMeans on the first `ANCESTRY_CLUSTER_PCS` PCs with
-    `n_clusters=ANCESTRY_NUM_CLUSTERS` to recover groups suitable for the LOSO
-    axis. Cluster IDs are arbitrary integers, not AFR/EUR/etc. labels — that's
-    fine for hold-out validation, where only group membership matters.
+    Uses `ANCESTRY_PREDS_CACHE` if present; otherwise reads `ANCESTRY_PREDS_URI`
+    directly via fsspec/gcsfs with the requester-pays + workspace-project
+    storage options — the canonical AoU pattern (see
+    `SauersML/ferromic` `phewas/iox.py:load_ancestry_labels`) — and caches the
+    result locally for future runs. Any failure propagates and aborts the run.
+    AoU's labels are reference-panel-derived categories (`AFR`, `AMR`, `EAS`,
+    `EUR`, `MID`, `SAS`, and sometimes `OTH`), not self-reported race/ethnicity.
     """
-    from sklearn.cluster import KMeans  # lazy: only needed when this runs
-    cluster_cols = [f"PC{i+1}" for i in range(min(ANCESTRY_CLUSTER_PCS, NUM_PCS))]
-    X = base[cluster_cols].to_numpy()
-    km = KMeans(n_clusters=ANCESTRY_NUM_CLUSTERS, random_state=RNG_SEED, n_init=10)
-    labels = km.fit_predict(X)
-    series = pd.Series(
-        [f"K{lbl}" for lbl in labels],
-        index=base.index,
-        name="ancestry_category",
-    )
-    counts = series.value_counts().sort_index()
+    if ANCESTRY_PREDS_CACHE.exists() and ANCESTRY_PREDS_CACHE.stat().st_size > 0:
+        df = pd.read_csv(
+            ANCESTRY_PREDS_CACHE,
+            sep="\t",
+            usecols=["research_id", "ancestry_pred"],
+            dtype=str,
+        )
+    else:
+        print(f"  gcsfs GET {ANCESTRY_PREDS_URI} -> {ANCESTRY_PREDS_CACHE}")
+        df = pd.read_csv(
+            ANCESTRY_PREDS_URI,
+            sep="\t",
+            usecols=["research_id", "ancestry_pred"],
+            dtype=str,
+            storage_options={
+                "project": os.environ["GOOGLE_PROJECT"],
+                "requester_pays": True,
+            },
+        )
+        ANCESTRY_PREDS_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(ANCESTRY_PREDS_CACHE, sep="\t", index=False)
+    out = pd.DataFrame({
+        "person_id": _canonical_id(df["research_id"]),
+        "ancestry_category": _clean_group_label(df["ancestry_pred"]).str.upper(),
+    })
+    counts = out["ancestry_category"].value_counts().sort_index()
     print(
-        f"  ancestry (KMeans k={ANCESTRY_NUM_CLUSTERS} on {len(cluster_cols)} PCs): "
+        "  ancestry: "
         + " ".join(f"{k}={v:,}" for k, v in counts.items())
     )
-    return series
+    return out
 
 
 # --- model -----------------------------------------------------------------
@@ -818,8 +832,10 @@ def main() -> None:
     base["care_site_group"] = _clean_group_label(base["care_site_group"])
     print(f"base (with context): n={len(base):,}")
 
-    print("deriving ancestry groups from gnomon PCs ...")
-    base["ancestry_category"] = derive_ancestry_groups_from_pcs(base)
+    print("loading AoU inferred genetic ancestry labels ...")
+    ancestry = load_genetic_ancestry_labels()
+    base = base.merge(ancestry, on="person_id", how="left")
+    base["ancestry_category"] = _clean_group_label(base["ancestry_category"]).str.upper()
     print(f"base (with ancestry): n={len(base):,}")
 
     rng = np.random.default_rng(RNG_SEED)
