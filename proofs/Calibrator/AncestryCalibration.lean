@@ -201,16 +201,44 @@ theorem transfer_beats_target_only
     General statement: given any n_lo and n_hi where transfer beats target
     at n_lo but target beats transfer at n_hi, a crossover point exists
     in between. -/
+noncomputable def criticalSampleSize (bias_sq σ_extra_sq : ℝ) : ℝ :=
+  σ_extra_sq / bias_sq
+
 theorem critical_sample_size_exists
-    (mse_transfer mse_target : ℝ → ℝ) (n_lo n_hi : ℝ)
-    (h_transfer_decreasing : ∀ n₁ n₂ : ℝ, 0 < n₁ → n₁ < n₂ → mse_transfer n₂ < mse_transfer n₁)
-    (h_target_decreasing : ∀ n₁ n₂ : ℝ, 0 < n₁ → n₁ < n₂ → mse_target n₂ < mse_target n₁)
-    (h_lo_pos : 0 < n_lo) (h_range : n_lo < n_hi)
-    (h_small_n : mse_transfer n_lo < mse_target n_lo)
-    (h_large_n : mse_target n_hi < mse_transfer n_hi) :
-    -- There exists a crossover point
-    ∃ n_crit : ℝ, n_lo < n_crit ∧ n_crit < n_hi := by
-  exact ⟨(n_lo + n_hi) / 2, by linarith, by linarith⟩
+    (σ_sq bias_sq σ_extra_sq : ℝ)
+    (_h_σ : 0 < σ_sq) (h_bias : 0 < bias_sq) (h_extra : 0 < σ_extra_sq) :
+    let n_crit := criticalSampleSize bias_sq σ_extra_sq
+    let mse_transfer := fun n => σ_sq / n + bias_sq
+    let mse_target := fun n => (σ_sq + σ_extra_sq) / n
+    0 < n_crit ∧ mse_transfer n_crit = mse_target n_crit ∧
+    (∀ n, 0 < n → n < n_crit → mse_transfer n < mse_target n) ∧
+    (∀ n, n_crit < n → mse_target n < mse_transfer n) := by
+  intro n_crit mse_transfer mse_target
+  have h_crit_pos : 0 < n_crit := div_pos h_extra h_bias
+  refine ⟨h_crit_pos, ?_, ?_, ?_⟩
+  · dsimp [mse_transfer, mse_target, n_crit, criticalSampleSize]
+    have h1 : σ_extra_sq / bias_sq ≠ 0 := ne_of_gt h_crit_pos
+    rw [add_div]
+    congr 1
+    have h2 : σ_extra_sq ≠ 0 := ne_of_gt h_extra
+    rw [div_div_eq_mul_div σ_extra_sq σ_extra_sq bias_sq]
+    rw [mul_comm]
+    exact (mul_div_cancel_right₀ bias_sq h2).symm
+  · intro n hn h_lt
+    dsimp [mse_transfer, mse_target]
+    rw [add_div]
+    apply add_lt_add_left
+    have h1 : n * bias_sq < σ_extra_sq := (lt_div_iff₀ h_bias).mp h_lt
+    have h2 : bias_sq * n < σ_extra_sq := by rwa [mul_comm] at h1
+    exact (lt_div_iff₀ hn).mpr h2
+  · intro n h_gt
+    dsimp [mse_transfer, mse_target]
+    rw [add_div]
+    apply add_lt_add_left
+    have hn : 0 < n := lt_trans h_crit_pos h_gt
+    have h1 : σ_extra_sq < n * bias_sq := (div_lt_iff₀ h_bias).mp h_gt
+    have h2 : σ_extra_sq < bias_sq * n := by rwa [mul_comm] at h1
+    exact (div_lt_iff₀ hn).mpr h2
 
 /-- **Multi-ancestry meta-analysis is optimal.**
     Combining GWAS data from multiple ancestries via inverse-variance
