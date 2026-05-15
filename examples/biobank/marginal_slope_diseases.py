@@ -22,11 +22,9 @@ import json
 import logging
 import os
 import re
-import shutil
 import struct
 import subprocess
 import sys
-import urllib.parse
 from pathlib import Path
 
 import numpy as np
