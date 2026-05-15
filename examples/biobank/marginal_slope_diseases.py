@@ -26,6 +26,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import urllib.parse
 from pathlib import Path
 
 import numpy as np
@@ -417,23 +418,36 @@ def load_genetic_ancestry_labels() -> pd.DataFrame:
     """
     if not (ANCESTRY_PREDS_CACHE.exists() and ANCESTRY_PREDS_CACHE.stat().st_size > 0):
         ANCESTRY_PREDS_CACHE.parent.mkdir(parents=True, exist_ok=True)
-        gsutil = shutil.which("gsutil")
-        if gsutil is None:
-            raise RuntimeError("gsutil not on PATH; cannot fetch ancestry preds")
-        # `gsutil cp` does a metadata stat first, which requires
-        # `storage.objects.list` on the bucket. The AoU pet service account is
-        # only granted `storage.objects.get`, so `cp` 403s on a bucket the pet
-        # SA can actually read. `gsutil cat` is a pure media GET — no list,
-        # no metadata — so it succeeds with only object-read permission.
-        cmd = [gsutil]
-        project = os.environ.get("GOOGLE_PROJECT")
-        if project:
-            cmd += ["-u", project]
-        cmd += ["cat", ANCESTRY_PREDS_URI]
-        print(f"  gsutil cat {ANCESTRY_PREDS_URI} -> {ANCESTRY_PREDS_CACHE}")
+        gcloud = shutil.which("gcloud")
+        curl = shutil.which("curl")
+        if gcloud is None or curl is None:
+            raise RuntimeError("gcloud + curl required to fetch ancestry preds")
+        # `gsutil` / ADC resolve to the workspace pet service account, which is
+        # not on the AoU controlled-bucket grant. `gcloud auth print-access-token`
+        # emits a token for the active *user* identity (the researcher account
+        # that actually has the bucket grant), which we send to the GCS JSON
+        # API directly with `alt=media` — a single object GET, no list, no
+        # metadata stat. `userProject` covers requester-pays billing.
+        token = subprocess.check_output([gcloud, "auth", "print-access-token"], text=True).strip()
+        assert ANCESTRY_PREDS_URI.startswith("gs://")
+        bucket, _, obj = ANCESTRY_PREDS_URI[len("gs://"):].partition("/")
+        project = os.environ["GOOGLE_PROJECT"]
+        url = (
+            f"https://storage.googleapis.com/storage/v1/b/{bucket}/o/"
+            f"{urllib.parse.quote(obj, safe='')}?alt=media&userProject={project}"
+        )
         tmp = ANCESTRY_PREDS_CACHE.with_suffix(ANCESTRY_PREDS_CACHE.suffix + ".part")
-        with tmp.open("wb") as fh:
-            subprocess.run(cmd, stdout=fh, check=True)
+        print(f"  curl GET (user-token) {ANCESTRY_PREDS_URI} -> {ANCESTRY_PREDS_CACHE}")
+        subprocess.run(
+            [
+                curl, "-fsSL",
+                "-H", f"Authorization: Bearer {token}",
+                "-H", f"x-goog-user-project: {project}",
+                "-o", str(tmp),
+                url,
+            ],
+            check=True,
+        )
         tmp.replace(ANCESTRY_PREDS_CACHE)
     df = pd.read_csv(
         ANCESTRY_PREDS_CACHE,
