@@ -431,16 +431,24 @@ section MetabolicTraits
                   = √(σ²_β / (σ²_β + σ²_δ))
 
     Since σ²_δ > 0, the denominator exceeds the numerator. -/
+structure GeneEnvironmentModel where
+  sigma2_beta : ℝ
+  sigma2_delta : ℝ
+  h_beta_pos : 0 < sigma2_beta
+  h_delta_pos : 0 < sigma2_delta
+
+noncomputable def GeneEnvironmentModel.effectCorrelation (m : GeneEnvironmentModel) : ℝ :=
+  Real.sqrt (m.sigma2_beta / (m.sigma2_beta + m.sigma2_delta))
+
 theorem gxe_reduces_effect_correlation
-    (sigma2_beta sigma2_delta : ℝ)
-    (h_beta_pos : 0 < sigma2_beta) (h_delta_pos : 0 < sigma2_delta) :
-    let rho_genetics_only := (1 : ℝ)  -- no GxE means perfect correlation
-    let rho_with_gxe := Real.sqrt (sigma2_beta / (sigma2_beta + sigma2_delta))
-    rho_with_gxe < rho_genetics_only := by
-  simp only
-  rw [show (1 : ℝ) = Real.sqrt 1 from (Real.sqrt_one).symm]
+    (m : GeneEnvironmentModel) :
+    m.effectCorrelation < 1 := by
+  unfold GeneEnvironmentModel.effectCorrelation
+  rw [show (1 : ℝ) = Real.sqrt 1 from Real.sqrt_one.symm]
+  have h_beta := m.h_beta_pos
+  have h_delta := m.h_delta_pos
   apply Real.sqrt_lt_sqrt (by positivity)
-  rw [div_lt_one (by linarith)]
+  rw [div_lt_one (by positivity)]
   linarith
 
 /-- **Larger GxE variance lowers the scalar portability fraction.**
