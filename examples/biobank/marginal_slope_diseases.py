@@ -69,10 +69,6 @@ ANCESTRY_PREDS_URI = (
 )
 ANCESTRY_PREDS_CACHE = WORKDIR / "ancestry_preds.tsv"
 
-
-class AncestryUnavailable(RuntimeError):
-    """Ancestry labels could not be loaded (e.g., bucket access forbidden)."""
-
 DISEASES = {
     "copd": {
         "snomed_name": "Chronic obstructive lung disease",
@@ -409,65 +405,30 @@ def fetch_person_context(client: bigquery.Client, cdr: str) -> pd.DataFrame:
     return df[["person_id", "state", "census_region", "care_site_group"]]
 
 
-def _fetch_ancestry_preds_to_cache() -> Path:
-    """Materialize the AoU ancestry-preds TSV at `ANCESTRY_PREDS_CACHE`.
+def load_genetic_ancestry_labels() -> pd.DataFrame:
+    """Load AoU inferred genetic ancestry labels.
 
-    Tries (in order):
-      1. existing local cache file;
-      2. `gsutil cp` (uses the user's `gcloud` identity, which on AoU has bucket
-         access even when Application Default Credentials resolve to the
-         workspace pet service account that doesn't);
-      3. `gcsfs` via `pd.read_csv(storage_options=...)` as a last resort.
-    Raises `AncestryUnavailable` if every path fails.
+    Reads `ANCESTRY_PREDS_CACHE` if present; otherwise `gsutil cp`s the file
+    from `ANCESTRY_PREDS_URI` to that path, then reads it. No further
+    fallbacks — any failure to fetch or read the TSV propagates and aborts the
+    run. AoU's labels are reference-panel-derived categories (`AFR`, `AMR`,
+    `EAS`, `EUR`, `MID`, `SAS`, and sometimes `OTH`), not self-reported
+    race/ethnicity.
     """
-    if ANCESTRY_PREDS_CACHE.exists() and ANCESTRY_PREDS_CACHE.stat().st_size > 0:
-        return ANCESTRY_PREDS_CACHE
-    ANCESTRY_PREDS_CACHE.parent.mkdir(parents=True, exist_ok=True)
-    errors: list[str] = []
-    project = os.environ.get("GOOGLE_PROJECT")
-    gsutil = shutil.which("gsutil")
-    if gsutil:
+    if not (ANCESTRY_PREDS_CACHE.exists() and ANCESTRY_PREDS_CACHE.stat().st_size > 0):
+        ANCESTRY_PREDS_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        gsutil = shutil.which("gsutil")
+        if gsutil is None:
+            raise RuntimeError("gsutil not on PATH; cannot fetch ancestry preds")
         cmd = [gsutil]
+        project = os.environ.get("GOOGLE_PROJECT")
         if project:
             cmd += ["-u", project]
         cmd += ["cp", ANCESTRY_PREDS_URI, str(ANCESTRY_PREDS_CACHE)]
         print(f"  gsutil cp {ANCESTRY_PREDS_URI} -> {ANCESTRY_PREDS_CACHE}")
-        res = subprocess.run(cmd, capture_output=True, text=True)
-        if res.returncode == 0 and ANCESTRY_PREDS_CACHE.exists() and ANCESTRY_PREDS_CACHE.stat().st_size > 0:
-            return ANCESTRY_PREDS_CACHE
-        errors.append(f"gsutil cp failed (rc={res.returncode}): {res.stderr.strip().splitlines()[-1] if res.stderr.strip() else ''}")
-        ANCESTRY_PREDS_CACHE.unlink(missing_ok=True)
-    else:
-        errors.append("gsutil not on PATH")
-    storage_options: dict[str, object] = {"requester_pays": True}
-    if project:
-        storage_options["project"] = project
-    try:
-        df = pd.read_csv(
-            ANCESTRY_PREDS_URI,
-            sep="\t",
-            usecols=["research_id", "ancestry_pred"],
-            dtype=str,
-            storage_options=storage_options,
-        )
-    except (OSError, PermissionError) as exc:
-        errors.append(f"gcsfs: {type(exc).__name__}: {str(exc).splitlines()[0]}")
-        raise AncestryUnavailable("; ".join(errors)) from exc
-    df.to_csv(ANCESTRY_PREDS_CACHE, sep="\t", index=False)
-    return ANCESTRY_PREDS_CACHE
-
-
-def load_genetic_ancestry_labels() -> pd.DataFrame:
-    """Load AoU inferred genetic ancestry labels from the controlled GCS TSV.
-
-    AoU's labels are reference-panel-derived categories (`AFR`, `AMR`, `EAS`,
-    `EUR`, `MID`, `SAS`, and sometimes `OTH`), not self-reported race/ethnicity.
-    Raises `AncestryUnavailable` if the file can't be fetched (e.g., bucket
-    access forbidden by VPC service controls on a bare-metal box).
-    """
-    path = _fetch_ancestry_preds_to_cache()
+        subprocess.run(cmd, check=True)
     df = pd.read_csv(
-        path,
+        ANCESTRY_PREDS_CACHE,
         sep="\t",
         usecols=["research_id", "ancestry_pred"],
         dtype=str,
@@ -843,8 +804,7 @@ def main() -> None:
     print(f"gamfit build_info: {gamfit.build_info()}")
     diseases = {k: v for k, v in DISEASES.items() if PGS_ID_PATTERN.match(v["pgs"])}
     print(f"diseases with real PGS IDs: {list(diseases)}")
-    active_axes = list(LOSO_AXES)
-    print(f"loso_axes: {active_axes}")
+    print(f"loso_axes: {list(LOSO_AXES)}")
 
     ensure_scored([cfg["pgs"] for cfg in diseases.values()])
 
@@ -870,15 +830,10 @@ def main() -> None:
     print(f"base (with context): n={len(base):,}")
 
     print("loading AoU inferred genetic ancestry labels ...")
-    try:
-        ancestry = load_genetic_ancestry_labels()
-    except AncestryUnavailable as exc:
-        print(f"  WARNING: ancestry labels unavailable -> dropping 'ancestry' LOSO axis. detail: {exc}")
-        active_axes = [a for a in active_axes if a != "ancestry"]
-    else:
-        base = base.merge(ancestry, on="person_id", how="left")
-        base["ancestry_category"] = _clean_group_label(base["ancestry_category"]).str.upper()
-        print(f"base (with ancestry): n={len(base):,}")
+    ancestry = load_genetic_ancestry_labels()
+    base = base.merge(ancestry, on="person_id", how="left")
+    base["ancestry_category"] = _clean_group_label(base["ancestry_category"]).str.upper()
+    print(f"base (with ancestry): n={len(base):,}")
 
     rng = np.random.default_rng(RNG_SEED)
     pc_cols = [f"PC{i+1}" for i in range(NUM_PCS)]
@@ -958,7 +913,7 @@ def main() -> None:
         )
 
         print("  OOD: leave-one-group-out refits")
-        for axis in active_axes:
+        for axis in LOSO_AXES:
             run_loso_axis(
                 df_full,
                 axis_name=axis,
