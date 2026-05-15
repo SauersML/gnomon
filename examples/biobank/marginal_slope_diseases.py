@@ -409,52 +409,35 @@ def fetch_person_context(client: bigquery.Client, cdr: str) -> pd.DataFrame:
 def load_genetic_ancestry_labels() -> pd.DataFrame:
     """Load AoU inferred genetic ancestry labels.
 
-    Reads `ANCESTRY_PREDS_CACHE` if present; otherwise `gsutil cp`s the file
-    from `ANCESTRY_PREDS_URI` to that path, then reads it. No further
-    fallbacks — any failure to fetch or read the TSV propagates and aborts the
-    run. AoU's labels are reference-panel-derived categories (`AFR`, `AMR`,
-    `EAS`, `EUR`, `MID`, `SAS`, and sometimes `OTH`), not self-reported
-    race/ethnicity.
+    Uses `ANCESTRY_PREDS_CACHE` if present; otherwise reads `ANCESTRY_PREDS_URI`
+    directly via fsspec/gcsfs with the requester-pays + workspace-project
+    storage options — the canonical AoU pattern (see
+    `SauersML/ferromic` `phewas/iox.py:load_ancestry_labels`) — and caches the
+    result locally for future runs. Any failure propagates and aborts the run.
+    AoU's labels are reference-panel-derived categories (`AFR`, `AMR`, `EAS`,
+    `EUR`, `MID`, `SAS`, and sometimes `OTH`), not self-reported race/ethnicity.
     """
-    if not (ANCESTRY_PREDS_CACHE.exists() and ANCESTRY_PREDS_CACHE.stat().st_size > 0):
+    if ANCESTRY_PREDS_CACHE.exists() and ANCESTRY_PREDS_CACHE.stat().st_size > 0:
+        df = pd.read_csv(
+            ANCESTRY_PREDS_CACHE,
+            sep="\t",
+            usecols=["research_id", "ancestry_pred"],
+            dtype=str,
+        )
+    else:
+        print(f"  gcsfs GET {ANCESTRY_PREDS_URI} -> {ANCESTRY_PREDS_CACHE}")
+        df = pd.read_csv(
+            ANCESTRY_PREDS_URI,
+            sep="\t",
+            usecols=["research_id", "ancestry_pred"],
+            dtype=str,
+            storage_options={
+                "project": os.environ["GOOGLE_PROJECT"],
+                "requester_pays": True,
+            },
+        )
         ANCESTRY_PREDS_CACHE.parent.mkdir(parents=True, exist_ok=True)
-        gcloud = shutil.which("gcloud")
-        curl = shutil.which("curl")
-        if gcloud is None or curl is None:
-            raise RuntimeError("gcloud + curl required to fetch ancestry preds")
-        # `gsutil` / ADC resolve to the workspace pet service account, which is
-        # not on the AoU controlled-bucket grant. `gcloud auth print-access-token`
-        # emits a token for the active *user* identity (the researcher account
-        # that actually has the bucket grant), which we send to the GCS JSON
-        # API directly with `alt=media` — a single object GET, no list, no
-        # metadata stat. `userProject` covers requester-pays billing.
-        token = subprocess.check_output([gcloud, "auth", "print-access-token"], text=True).strip()
-        assert ANCESTRY_PREDS_URI.startswith("gs://")
-        bucket, _, obj = ANCESTRY_PREDS_URI[len("gs://"):].partition("/")
-        project = os.environ["GOOGLE_PROJECT"]
-        url = (
-            f"https://storage.googleapis.com/storage/v1/b/{bucket}/o/"
-            f"{urllib.parse.quote(obj, safe='')}?alt=media&userProject={project}"
-        )
-        tmp = ANCESTRY_PREDS_CACHE.with_suffix(ANCESTRY_PREDS_CACHE.suffix + ".part")
-        print(f"  curl GET (user-token) {ANCESTRY_PREDS_URI} -> {ANCESTRY_PREDS_CACHE}")
-        subprocess.run(
-            [
-                curl, "-fsSL",
-                "-H", f"Authorization: Bearer {token}",
-                "-H", f"x-goog-user-project: {project}",
-                "-o", str(tmp),
-                url,
-            ],
-            check=True,
-        )
-        tmp.replace(ANCESTRY_PREDS_CACHE)
-    df = pd.read_csv(
-        ANCESTRY_PREDS_CACHE,
-        sep="\t",
-        usecols=["research_id", "ancestry_pred"],
-        dtype=str,
-    )
+        df.to_csv(ANCESTRY_PREDS_CACHE, sep="\t", index=False)
     out = pd.DataFrame({
         "person_id": _canonical_id(df["research_id"]),
         "ancestry_category": _clean_group_label(df["ancestry_pred"]).str.upper(),
