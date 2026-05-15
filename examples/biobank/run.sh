@@ -86,6 +86,7 @@ uv run \
     --with lifelines \
     --with tzdata \
     --with pgscatalog.calc \
+    --with gcsfs \
     --with google-cloud-bigquery \
     --with google-cloud-bigquery-storage \
     --with db-dtypes \
@@ -104,7 +105,7 @@ uv run \
   echo "=========================================================================="
   echo "=== SUMMARY (extracted)"
   echo "=========================================================================="
-  grep -E "^gamfit |^=== |^cohort:|^  pcs:|^  sex:|^  pgs:|^  times:|^  snomed=|^  split:|^  fit_spec:|^  baseline_spec:|^  baseline_coef:|^  PGS=|^  GAM |^  baseline |^  delta |^  save:" "$RESULTS" || echo "(no summary lines matched — fit likely failed; see full log above)"
+  grep -E "^gamfit |^=== |^cohort:|^  pcs:|^  sex:|^  pgs:|^  times:|^  context:|^  ancestry:|^  snomed=|^  split:|^  fit_spec:|^  baseline_spec:|^  baseline_coef:|^  PGS=|^  OOD:|^  LOSO |^  GAM |^  baseline |^  delta |^  save:" "$RESULTS" || echo "(no summary lines matched — fit likely failed; see full log above)"
   echo "=========================================================================="
   echo "Full log: $RESULTS"
 } | tee -a "$RESULTS"

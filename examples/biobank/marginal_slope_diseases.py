@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-"""Fit Bernoulli marginal-slope GAMs on All of Us microarray data.
+"""Fit survival marginal-slope GAMs on All of Us microarray data.
 
 For each disease the script:
   1. Looks up the SNOMED standard Condition concept by name in the
      OMOP/OHDSI `concept` table on the AoU CDR.
   2. Pulls everyone whose `condition_occurrence.condition_concept_id`
      descends from that concept via `concept_ancestor`.
-  3. Fits `case ~ duchon(PC1..PC10) + sex` with the hard-coded PGS
-     feeding the marginal-slope latent z, and the same joint anisotropic
-     Duchon smooth on the log-slope channel.
+  3. Fits `Surv(entry_age, exit_age, event) ~ duchon(PC1..PC10) + sex`
+     with the hard-coded PGS feeding the marginal-slope latent z, and the
+     same joint anisotropic Duchon smooth on the log-slope channel.
+  4. Compares against a Z_norm2 + Cox PH baseline on the same split.
+  5. Runs leave-one-group-out OOD refits by care site, Census region, and
+     AoU inferred genetic ancestry category.
 
-Reported per disease: AUROC, Nagelkerke R^2, Lee-2012 liability R^2.
+Reported per disease: train/test Harrell's C and OOD held-out-group C.
 """
 
 from __future__ import annotations
@@ -45,8 +48,16 @@ NUM_PCS = 10
 DUCHON_CENTERS = 30  # > linear nullspace (d+1=11) in d=10
 TRAIN_FRACTION = 0.80  # per-class 80/20 split
 RNG_SEED = 0
+MAX_LOSO_CARE_SITES = 5
+MIN_LOSO_TRAIN_EVENTS = 50
+MIN_LOSO_TEST_EVENTS = 20
+MIN_LOSO_TEST_N = 500
 GNOMON_BIN = os.environ.get("GNOMON_BIN", "gnomon")
 PGS_ID_PATTERN = re.compile(r"^PGS\d{6}$")
+ANCESTRY_PREDS_URI = (
+    "gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/aux/ancestry/"
+    "ancestry_preds.tsv"
+)
 
 DISEASES = {
     "copd": {
@@ -284,6 +295,135 @@ def fetch_person_times(client: bigquery.Client, cdr: str) -> pd.DataFrame:
     return df
 
 
+STATE_TO_CENSUS_REGION = {
+    "CT": "Northeast", "ME": "Northeast", "MA": "Northeast", "NH": "Northeast",
+    "RI": "Northeast", "VT": "Northeast", "NJ": "Northeast", "NY": "Northeast",
+    "PA": "Northeast",
+    "IL": "Midwest", "IN": "Midwest", "MI": "Midwest", "OH": "Midwest",
+    "WI": "Midwest", "IA": "Midwest", "KS": "Midwest", "MN": "Midwest",
+    "MO": "Midwest", "NE": "Midwest", "ND": "Midwest", "SD": "Midwest",
+    "DE": "South", "FL": "South", "GA": "South", "MD": "South",
+    "NC": "South", "SC": "South", "VA": "South", "DC": "South",
+    "WV": "South", "AL": "South", "KY": "South", "MS": "South",
+    "TN": "South", "AR": "South", "LA": "South", "OK": "South",
+    "TX": "South",
+    "AZ": "West", "CO": "West", "ID": "West", "MT": "West",
+    "NV": "West", "NM": "West", "UT": "West", "WY": "West",
+    "AK": "West", "CA": "West", "HI": "West", "OR": "West",
+    "WA": "West",
+    "AS": "Territory", "GU": "Territory", "MP": "Territory", "PR": "Territory",
+    "VI": "Territory",
+}
+
+
+def _state_code(s: pd.Series) -> pd.Series:
+    return (
+        s.fillna("")
+        .astype(str)
+        .str.strip()
+        .str.upper()
+        .str.replace(r"^US-", "", regex=True)
+    )
+
+
+def _clean_group_label(s: pd.Series) -> pd.Series:
+    return (
+        s.fillna("unknown")
+        .astype(str)
+        .str.strip()
+        .str.replace(r"\s+", " ", regex=True)
+        .replace("", "unknown")
+    )
+
+
+def fetch_person_context(client: bigquery.Client, cdr: str) -> pd.DataFrame:
+    """Per-person OOD grouping context.
+
+    Geography comes from `person.location_id -> location.state`. Care-site OOD
+    uses the dominant visit-level care site rather than `person.care_site_id`,
+    because the latter is sparsely populated in many AoU CDRs.
+    """
+    sql = f"""
+    WITH visit_site_counts AS (
+      SELECT
+        CAST(vo.person_id AS STRING) AS person_id,
+        vo.care_site_id,
+        ANY_VALUE(cs.care_site_name) AS care_site_name,
+        COUNT(*) AS n_visits
+      FROM `{cdr}.visit_occurrence` AS vo
+      LEFT JOIN `{cdr}.care_site` AS cs
+        ON cs.care_site_id = vo.care_site_id
+      WHERE vo.care_site_id IS NOT NULL
+      GROUP BY vo.person_id, vo.care_site_id
+    ),
+    dominant_visit_site AS (
+      SELECT person_id, care_site_id, care_site_name
+      FROM visit_site_counts
+      QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY person_id
+        ORDER BY n_visits DESC, care_site_id
+      ) = 1
+    )
+    SELECT
+      CAST(p.person_id AS STRING) AS person_id,
+      l.state AS state,
+      CAST(COALESCE(dvs.care_site_id, p.care_site_id) AS STRING) AS care_site_id,
+      COALESCE(dvs.care_site_name, pcs.care_site_name) AS care_site_name
+    FROM `{cdr}.person` AS p
+    LEFT JOIN `{cdr}.location` AS l
+      ON l.location_id = p.location_id
+    LEFT JOIN `{cdr}.care_site` AS pcs
+      ON pcs.care_site_id = p.care_site_id
+    LEFT JOIN dominant_visit_site AS dvs
+      ON dvs.person_id = CAST(p.person_id AS STRING)
+    """
+    df = client.query(sql).to_dataframe()
+    df["person_id"] = _canonical_id(df["person_id"])
+    df["state"] = _state_code(df["state"])
+    df["census_region"] = df["state"].map(STATE_TO_CENSUS_REGION).fillna("unknown")
+    care_site_name = _clean_group_label(df["care_site_name"])
+    care_site_id = _clean_group_label(df["care_site_id"])
+    df["care_site_group"] = np.where(
+        care_site_id.eq("unknown"),
+        "unknown",
+        care_site_id + ":" + care_site_name,
+    )
+    print(
+        f"  context: n={len(df):,}  regions={df['census_region'].nunique():,}  "
+        f"care_sites={df['care_site_group'].nunique():,}"
+    )
+    return df[["person_id", "state", "census_region", "care_site_group"]]
+
+
+def load_genetic_ancestry_labels() -> pd.DataFrame:
+    """Load AoU inferred genetic ancestry labels from the controlled GCS TSV.
+
+    AoU's labels are reference-panel-derived categories (`AFR`, `AMR`, `EAS`,
+    `EUR`, `MID`, `SAS`, and sometimes `OTH`), not self-reported race/ethnicity.
+    """
+    storage_options = {"requester_pays": True}
+    project = os.environ.get("GOOGLE_PROJECT")
+    if project:
+        storage_options["project"] = project
+    df = pd.read_csv(
+        ANCESTRY_PREDS_URI,
+        sep="\t",
+        usecols=["research_id", "ancestry_pred"],
+        dtype=str,
+        storage_options=storage_options,
+    )
+    out = pd.DataFrame({
+        "person_id": _canonical_id(df["research_id"]),
+        "ancestry_category": _clean_group_label(df["ancestry_pred"]).str.upper(),
+    })
+    counts = out["ancestry_category"].value_counts().sort_index()
+    print(
+        "  ancestry: "
+        + " ".join(f"{k}={v:,}" for k, v in counts.items())
+    )
+    return out
+
+
 # --- model -----------------------------------------------------------------
 
 def fit_marginal_slope(train_df: pd.DataFrame, num_pcs: int):  # -> gamfit.Model
@@ -402,6 +542,188 @@ def gam_risk(model, df: pd.DataFrame, num_pcs: int, horizon: float) -> np.ndarra
     return np.asarray(pred.cumulative_hazard_at([horizon]), dtype=float).reshape(-1)
 
 
+def prepare_scores(
+    train: pd.DataFrame,
+    test: pd.DataFrame,
+    pc_cols: list[str],
+    pgs_id: str,
+) -> tuple[pd.DataFrame, pd.DataFrame, float, float]:
+    """Train-only PGS standardization for GAM plus train-only Z_norm2 baseline."""
+    train = train.copy()
+    test = test.copy()
+    pgs_mean = float(train["pgs"].mean())
+    pgs_std = float(train["pgs"].std(ddof=0))
+    train["prs_z"] = (train["pgs"] - pgs_mean) / pgs_std
+    test["prs_z"] = (test["pgs"] - pgs_mean) / pgs_std
+
+    z_tr, z_te = z_norm2(
+        train["pgs"].to_numpy(),
+        train[pc_cols].to_numpy(),
+        test["pgs"].to_numpy(),
+        test[pc_cols].to_numpy(),
+        pgs_id=pgs_id,
+    )
+    train["z_norm2"] = z_tr
+    test["z_norm2"] = z_te
+    return train, test, pgs_mean, pgs_std
+
+
+def evaluate_model_pair(
+    train: pd.DataFrame,
+    test: pd.DataFrame,
+    pc_cols: list[str],
+    pgs_id: str,
+    label: str,
+    save_info: dict[str, object] | None = None,
+) -> dict[str, float]:
+    """Fit GAM + Z_norm2 Cox baseline and print comparable C-index lines."""
+    train, test, pgs_mean, pgs_std = prepare_scores(train, test, pc_cols, pgs_id)
+
+    model = fit_marginal_slope(train, len(pc_cols))
+    if save_info is not None:
+        FITS_DIR.mkdir(parents=True, exist_ok=True)
+        disease = str(save_info["disease"])
+        fit_path = FITS_DIR / f"{disease}.gamfit"
+        meta_path = FITS_DIR / f"{disease}.meta.json"
+        try:
+            model.save(str(fit_path))
+        except Exception as e:
+            print(f"  save: model.save failed ({e}); skipping persist")
+        else:
+            meta = {
+                **save_info,
+                "num_pcs": len(pc_cols),
+                "duchon_centers": DUCHON_CENTERS,
+                "train_fraction": TRAIN_FRACTION,
+                "rng_seed": RNG_SEED,
+                "pgs_mean": pgs_mean,
+                "pgs_std": pgs_std,
+                "n_train": int(len(train)),
+                "survival_likelihood": "marginal-slope",
+            }
+            meta_path.write_text(json.dumps(meta, indent=2))
+            print(f"  save: model -> {fit_path}  meta -> {meta_path}")
+
+    t_horizon = float(test["exit_age"].max())
+    gam_risk_train = gam_risk(model, train, len(pc_cols), t_horizon)
+    gam_risk_test = gam_risk(model, test, len(pc_cols), t_horizon)
+    gam_train_m = metrics(
+        train["exit_age"].to_numpy(), train["event"].to_numpy(), gam_risk_train,
+    )
+    gam_test_m = metrics(
+        test["exit_age"].to_numpy(), test["event"].to_numpy(), gam_risk_test,
+    )
+
+    print(
+        f"  baseline_spec: Cox PH on Z_norm2 (PC-based mean+var adjustment, "
+        f"no pop labels)"
+    )
+    cph = fit_baseline_cox(train)
+    coef = float(cph.params_["z_norm2"])
+    print(f"  baseline_coef: log_HR={coef:+.4f}  HR/SD={np.exp(coef):.4f}")
+    base_risk_train = cph.predict_partial_hazard(train[["z_norm2"]]).to_numpy()
+    base_risk_test = cph.predict_partial_hazard(test[["z_norm2"]]).to_numpy()
+    base_train_m = metrics(
+        train["exit_age"].to_numpy(), train["event"].to_numpy(), base_risk_train,
+    )
+    base_test_m = metrics(
+        test["exit_age"].to_numpy(), test["event"].to_numpy(), base_risk_test,
+    )
+
+    print(
+        f"  {label}  train_n={len(train):,}  test_n={gam_test_m['n']:,}  "
+        f"test_events={gam_test_m['n_events']:,}  "
+        f"median_exit_age={gam_test_m['median_exit_age']:.2f}  horizon={t_horizon:.2f}"
+    )
+    print(
+        f"  GAM       train_C={gam_train_m['concordance']:.4f}  "
+        f"test_C={gam_test_m['concordance']:.4f}"
+    )
+    print(
+        f"  baseline  train_C={base_train_m['concordance']:.4f}  "
+        f"test_C={base_test_m['concordance']:.4f}"
+    )
+    delta = gam_test_m["concordance"] - base_test_m["concordance"]
+    print(f"  delta     test_C(GAM - baseline)={delta:+.4f}")
+    return {
+        "gam_train_c": gam_train_m["concordance"],
+        "gam_test_c": gam_test_m["concordance"],
+        "baseline_train_c": base_train_m["concordance"],
+        "baseline_test_c": base_test_m["concordance"],
+        "delta_test_c": delta,
+    }
+
+
+def loso_groups(
+    df: pd.DataFrame,
+    col: str,
+    max_groups: int | None = None,
+) -> list[str]:
+    """Eligible held-out groups, sorted by size and event-count constraints."""
+    known = df[col].notna() & df[col].astype(str).str.lower().ne("unknown")
+    summary = (
+        df[known]
+        .groupby(col, sort=False)
+        .agg(n=("event", "size"), events=("event", "sum"))
+        .reset_index()
+    )
+    summary = summary[
+        (summary["n"] >= MIN_LOSO_TEST_N)
+        & (summary["events"] >= MIN_LOSO_TEST_EVENTS)
+        & ((df["event"].sum() - summary["events"]) >= MIN_LOSO_TRAIN_EVENTS)
+    ]
+    summary = summary.sort_values(["n", "events"], ascending=False, kind="stable")
+    if max_groups is not None:
+        summary = summary.head(max_groups)
+    return [str(x) for x in summary[col].tolist()]
+
+
+def run_loso_axis(
+    df_full: pd.DataFrame,
+    axis_name: str,
+    group_col: str,
+    pc_cols: list[str],
+    pgs_id: str,
+    max_groups: int | None = None,
+) -> None:
+    """Leave one group out: refit both models on all other groups."""
+    groups = loso_groups(df_full, group_col, max_groups=max_groups)
+    print(
+        f"  LOSO axis={axis_name} col={group_col} groups={len(groups)} "
+        f"min_test_n={MIN_LOSO_TEST_N} min_test_events={MIN_LOSO_TEST_EVENTS}"
+    )
+    if not groups:
+        print(f"  LOSO axis={axis_name} skipped=no eligible groups")
+        return
+
+    deltas: list[float] = []
+    for group in groups:
+        holdout_mask = df_full[group_col].eq(group)
+        train = df_full.loc[~holdout_mask].reset_index(drop=True)
+        test = df_full.loc[holdout_mask].reset_index(drop=True)
+        group_short = group[:96]
+        print(
+            f"  LOSO fold axis={axis_name} holdout={group_short!r}  "
+            f"train_n={len(train):,} test_n={len(test):,} "
+            f"test_events={int(test['event'].sum()):,}"
+        )
+        result = evaluate_model_pair(
+            train,
+            test,
+            pc_cols,
+            pgs_id,
+            label=f"LOSO[{axis_name}] holdout={group_short!r}",
+        )
+        deltas.append(result["delta_test_c"])
+
+    print(
+        f"  LOSO summary axis={axis_name} folds={len(deltas)}  "
+        f"mean_delta={float(np.mean(deltas)):+.4f}  "
+        f"worst_delta={float(np.min(deltas)):+.4f}  "
+        f"best_delta={float(np.max(deltas)):+.4f}"
+    )
+
+
 # --- main ------------------------------------------------------------------
 
 def main() -> None:
@@ -427,7 +749,21 @@ def main() -> None:
     base = base.merge(times, on="person_id")
     print(f"base (with times): n={len(base):,}")
 
+    print("loading geography and care-site context ...")
+    context = fetch_person_context(client, cdr)
+    base = base.merge(context, on="person_id", how="left")
+    base["census_region"] = _clean_group_label(base["census_region"])
+    base["care_site_group"] = _clean_group_label(base["care_site_group"])
+    print(f"base (with context): n={len(base):,}")
+
+    print("loading AoU inferred genetic ancestry labels ...")
+    ancestry = load_genetic_ancestry_labels()
+    base = base.merge(ancestry, on="person_id", how="left")
+    base["ancestry_category"] = _clean_group_label(base["ancestry_category"]).str.upper()
+    print(f"base (with ancestry): n={len(base):,}")
+
     rng = np.random.default_rng(RNG_SEED)
+    pc_cols = [f"PC{i+1}" for i in range(NUM_PCS)]
 
     for name, cfg in diseases.items():
         print(f"\n=== {name.upper()} ===")
@@ -488,97 +824,43 @@ def main() -> None:
         train = df_full.loc[train_pick].reset_index(drop=True)
         test = df_full.loc[test_pick].reset_index(drop=True)
 
-        # Standardize PGS on training only, then apply the same shift/scale to test
-        # so we never mix test rows into the training statistics. `prs_z` is the
-        # GAM's latent z (a plain z-score on training). The baseline uses Z_norm2
-        # (PC-based ancestry-adjusted), built separately below.
-        pgs_mean = float(train["pgs"].mean())
-        pgs_std = float(train["pgs"].std(ddof=0))
-        train["prs_z"] = (train["pgs"] - pgs_mean) / pgs_std
-        test["prs_z"] = (test["pgs"] - pgs_mean) / pgs_std
-
-        # Z_norm2 baseline score: two-step PC regression (mean + variance),
-        # train-only fit, applied to both train and test.
-        pc_cols = [f"PC{i+1}" for i in range(NUM_PCS)]
-        z_tr, z_te = z_norm2(
-            train["pgs"].to_numpy(), train[pc_cols].to_numpy(),
-            test["pgs"].to_numpy(), test[pc_cols].to_numpy(),
-        )
-        train["z_norm2"] = z_tr
-        test["z_norm2"] = z_te
-
-        model = fit_marginal_slope(train, NUM_PCS)
-        FITS_DIR.mkdir(parents=True, exist_ok=True)
-        fit_path = FITS_DIR / f"{name}.gamfit"
-        meta_path = FITS_DIR / f"{name}.meta.json"
-        try:
-            model.save(str(fit_path))
-        except Exception as e:
-            print(f"  save: model.save failed ({e}); skipping persist")
-        else:
-            meta_path.write_text(json.dumps({
+        evaluate_model_pair(
+            train,
+            test,
+            pc_cols,
+            cfg["pgs"],
+            label=f"PGS={cfg['pgs']} random_split K(crude)={K:.6f}",
+            save_info={
                 "disease": name,
                 "pgs": cfg["pgs"],
                 "snomed_name": cfg["snomed_name"],
                 "concept_id": ancestor,
-                "num_pcs": NUM_PCS,
-                "duchon_centers": DUCHON_CENTERS,
-                "train_fraction": TRAIN_FRACTION,
-                "rng_seed": RNG_SEED,
-                "pgs_mean": pgs_mean,
-                "pgs_std": pgs_std,
                 "K_crude": K,
-                "n_train": int(len(train)),
-                "survival_likelihood": "marginal-slope",
-            }, indent=2))
-            print(f"  save: model -> {fit_path}  meta -> {meta_path}")
-
-        # Survival predict returns a SurvivalPrediction; use cumulative hazard
-        # at a fixed horizon as the scalar risk score for concordance. The
-        # horizon is the max test exit age, computed once and reused for train
-        # and test so the two C-indices use a common hazard scale.
-        t_horizon = float(test["exit_age"].max())
-        gam_risk_train = gam_risk(model, train, NUM_PCS, t_horizon)
-        gam_risk_test = gam_risk(model, test, NUM_PCS, t_horizon)
-        gam_train_m = metrics(
-            train["exit_age"].to_numpy(), train["event"].to_numpy(), gam_risk_train,
-        )
-        gam_test_m = metrics(
-            test["exit_age"].to_numpy(), test["event"].to_numpy(), gam_risk_test,
+            },
         )
 
-        # Z_norm2 + Cox PH baseline on the SAME train/test split.
-        print(
-            f"  baseline_spec: Cox PH on Z_norm2 (PC-based mean+var adjustment, "
-            f"no pop labels)"
+        print("  OOD: leave-one-group-out refits")
+        run_loso_axis(
+            df_full,
+            axis_name="care_site",
+            group_col="care_site_group",
+            pc_cols=pc_cols,
+            pgs_id=cfg["pgs"],
+            max_groups=MAX_LOSO_CARE_SITES,
         )
-        cph = fit_baseline_cox(train)
-        coef = float(cph.params_["z_norm2"])
-        print(f"  baseline_coef: log_HR={coef:+.4f}  HR/SD={np.exp(coef):.4f}")
-        base_risk_train = cph.predict_partial_hazard(train[["z_norm2"]]).to_numpy()
-        base_risk_test = cph.predict_partial_hazard(test[["z_norm2"]]).to_numpy()
-        base_train_m = metrics(
-            train["exit_age"].to_numpy(), train["event"].to_numpy(), base_risk_train,
+        run_loso_axis(
+            df_full,
+            axis_name="census_region",
+            group_col="census_region",
+            pc_cols=pc_cols,
+            pgs_id=cfg["pgs"],
         )
-        base_test_m = metrics(
-            test["exit_age"].to_numpy(), test["event"].to_numpy(), base_risk_test,
-        )
-
-        print(
-            f"  PGS={cfg['pgs']}  train_n={len(train):,}  test_n={gam_test_m['n']:,}  "
-            f"test_events={gam_test_m['n_events']:,}  K(crude)={K:.6f}  "
-            f"median_exit_age={gam_test_m['median_exit_age']:.2f}  horizon={t_horizon:.2f}"
-        )
-        print(
-            f"  GAM       train_C={gam_train_m['concordance']:.4f}  "
-            f"test_C={gam_test_m['concordance']:.4f}"
-        )
-        print(
-            f"  baseline  train_C={base_train_m['concordance']:.4f}  "
-            f"test_C={base_test_m['concordance']:.4f}"
-        )
-        print(
-            f"  delta     test_C(GAM - baseline)={gam_test_m['concordance'] - base_test_m['concordance']:+.4f}"
+        run_loso_axis(
+            df_full,
+            axis_name="ancestry",
+            group_col="ancestry_category",
+            pc_cols=pc_cols,
+            pgs_id=cfg["pgs"],
         )
 
 
