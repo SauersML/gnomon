@@ -25,6 +25,7 @@ import re
 import struct
 import subprocess
 import sys
+from argparse import ArgumentParser, Namespace
 from pathlib import Path
 
 import numpy as np
@@ -50,8 +51,15 @@ TRAIN_FRACTION = 0.80  # per-class 80/20 split
 RNG_SEED = 0
 MAX_LOSO_CARE_SITES = 5
 MIN_LOSO_TRAIN_EVENTS = 50
+MIN_LOSO_TRAIN_CENSORS = 50
 MIN_LOSO_TEST_EVENTS = 20
+MIN_LOSO_TEST_CENSORS = 20
 MIN_LOSO_TEST_N = 500
+LOSO_AXIS_TO_COLUMN = {
+    "care_site": "care_site_group",
+    "census_region": "census_region",
+    "ancestry": "ancestry_category",
+}
 GNOMON_BIN = os.environ.get("GNOMON_BIN", "gnomon")
 PGS_ID_PATTERN = re.compile(r"^PGS\d{6}$")
 ANCESTRY_PREDS_URI = (
@@ -507,6 +515,10 @@ def z_norm2(
         return df
 
     ref_df = _frame(train_pgs, train_pcs)
+    target_df = _frame(
+        np.concatenate([train_pgs, test_pgs]),
+        np.vstack([train_pcs, test_pcs]),
+    )
     kwargs = dict(
         ref_df=ref_df,
         scorecols=[pgs_id],
@@ -516,10 +528,12 @@ def z_norm2(
         norm2_2step=True,
         n_pcs=n_pcs,
     )
-    _, adj_train, _ = pgs_adjust(target_df=_frame(train_pgs, train_pcs), **kwargs)
-    _, adj_test, _ = pgs_adjust(target_df=_frame(test_pgs, test_pcs), **kwargs)
+    adj_train, adj_target, _ = pgs_adjust(target_df=target_df, **kwargs)
     z_col = f"Z_norm2|{pgs_id}"
-    return adj_train[z_col].to_numpy(), adj_test[z_col].to_numpy()
+    return (
+        adj_train[z_col].to_numpy(),
+        adj_target[z_col].to_numpy()[len(train_pgs):],
+    )
 
 
 def fit_baseline_cox(train_df: pd.DataFrame) -> CoxPHFitter:
@@ -553,6 +567,8 @@ def prepare_scores(
     test = test.copy()
     pgs_mean = float(train["pgs"].mean())
     pgs_std = float(train["pgs"].std(ddof=0))
+    if not np.isfinite(pgs_std) or pgs_std <= 0:
+        raise ValueError("training PGS has zero or invalid variance")
     train["prs_z"] = (train["pgs"] - pgs_mean) / pgs_std
     test["prs_z"] = (test["pgs"] - pgs_mean) / pgs_std
 
@@ -575,6 +591,7 @@ def evaluate_model_pair(
     pgs_id: str,
     label: str,
     save_info: dict[str, object] | None = None,
+    score_train: bool = True,
 ) -> dict[str, float]:
     """Fit GAM + Z_norm2 Cox baseline and print comparable C-index lines."""
     train, test, pgs_mean, pgs_std = prepare_scores(train, test, pc_cols, pgs_id)
@@ -605,14 +622,16 @@ def evaluate_model_pair(
             print(f"  save: model -> {fit_path}  meta -> {meta_path}")
 
     t_horizon = float(test["exit_age"].max())
-    gam_risk_train = gam_risk(model, train, len(pc_cols), t_horizon)
     gam_risk_test = gam_risk(model, test, len(pc_cols), t_horizon)
-    gam_train_m = metrics(
-        train["exit_age"].to_numpy(), train["event"].to_numpy(), gam_risk_train,
-    )
     gam_test_m = metrics(
         test["exit_age"].to_numpy(), test["event"].to_numpy(), gam_risk_test,
     )
+    gam_train_m = None
+    if score_train:
+        gam_risk_train = gam_risk(model, train, len(pc_cols), t_horizon)
+        gam_train_m = metrics(
+            train["exit_age"].to_numpy(), train["event"].to_numpy(), gam_risk_train,
+        )
 
     print(
         f"  baseline_spec: Cox PH on Z_norm2 (PC-based mean+var adjustment, "
@@ -621,34 +640,45 @@ def evaluate_model_pair(
     cph = fit_baseline_cox(train)
     coef = float(cph.params_["z_norm2"])
     print(f"  baseline_coef: log_HR={coef:+.4f}  HR/SD={np.exp(coef):.4f}")
-    base_risk_train = cph.predict_partial_hazard(train[["z_norm2"]]).to_numpy()
     base_risk_test = cph.predict_partial_hazard(test[["z_norm2"]]).to_numpy()
-    base_train_m = metrics(
-        train["exit_age"].to_numpy(), train["event"].to_numpy(), base_risk_train,
-    )
     base_test_m = metrics(
         test["exit_age"].to_numpy(), test["event"].to_numpy(), base_risk_test,
     )
+    base_train_m = None
+    if score_train:
+        base_risk_train = cph.predict_partial_hazard(train[["z_norm2"]]).to_numpy()
+        base_train_m = metrics(
+            train["exit_age"].to_numpy(), train["event"].to_numpy(), base_risk_train,
+        )
 
     print(
         f"  {label}  train_n={len(train):,}  test_n={gam_test_m['n']:,}  "
         f"test_events={gam_test_m['n_events']:,}  "
         f"median_exit_age={gam_test_m['median_exit_age']:.2f}  horizon={t_horizon:.2f}"
     )
-    print(
-        f"  GAM       train_C={gam_train_m['concordance']:.4f}  "
-        f"test_C={gam_test_m['concordance']:.4f}"
-    )
-    print(
-        f"  baseline  train_C={base_train_m['concordance']:.4f}  "
-        f"test_C={base_test_m['concordance']:.4f}"
-    )
+    if score_train:
+        assert gam_train_m is not None and base_train_m is not None
+        print(
+            f"  GAM       train_C={gam_train_m['concordance']:.4f}  "
+            f"test_C={gam_test_m['concordance']:.4f}"
+        )
+        print(
+            f"  baseline  train_C={base_train_m['concordance']:.4f}  "
+            f"test_C={base_test_m['concordance']:.4f}"
+        )
+    else:
+        print(f"  GAM       test_C={gam_test_m['concordance']:.4f}")
+        print(f"  baseline  test_C={base_test_m['concordance']:.4f}")
     delta = gam_test_m["concordance"] - base_test_m["concordance"]
     print(f"  delta     test_C(GAM - baseline)={delta:+.4f}")
     return {
-        "gam_train_c": gam_train_m["concordance"],
+        "gam_train_c": (
+            float("nan") if gam_train_m is None else gam_train_m["concordance"]
+        ),
         "gam_test_c": gam_test_m["concordance"],
-        "baseline_train_c": base_train_m["concordance"],
+        "baseline_train_c": (
+            float("nan") if base_train_m is None else base_train_m["concordance"]
+        ),
         "baseline_test_c": base_test_m["concordance"],
         "delta_test_c": delta,
     }
@@ -657,20 +687,30 @@ def evaluate_model_pair(
 def loso_groups(
     df: pd.DataFrame,
     col: str,
+    min_train_events: int,
+    min_train_censors: int,
+    min_test_events: int,
+    min_test_censors: int,
+    min_test_n: int,
     max_groups: int | None = None,
 ) -> list[str]:
     """Eligible held-out groups, sorted by size and event-count constraints."""
     known = df[col].notna() & df[col].astype(str).str.lower().ne("unknown")
+    total_events = int(df["event"].sum())
+    total_censors = int(len(df) - total_events)
     summary = (
         df[known]
         .groupby(col, sort=False)
         .agg(n=("event", "size"), events=("event", "sum"))
         .reset_index()
     )
+    summary["censors"] = summary["n"] - summary["events"]
     summary = summary[
-        (summary["n"] >= MIN_LOSO_TEST_N)
-        & (summary["events"] >= MIN_LOSO_TEST_EVENTS)
-        & ((df["event"].sum() - summary["events"]) >= MIN_LOSO_TRAIN_EVENTS)
+        (summary["n"] >= min_test_n)
+        & (summary["events"] >= min_test_events)
+        & (summary["censors"] >= min_test_censors)
+        & ((total_events - summary["events"]) >= min_train_events)
+        & ((total_censors - summary["censors"]) >= min_train_censors)
     ]
     summary = summary.sort_values(["n", "events"], ascending=False, kind="stable")
     if max_groups is not None:
@@ -684,13 +724,29 @@ def run_loso_axis(
     group_col: str,
     pc_cols: list[str],
     pgs_id: str,
+    min_train_events: int,
+    min_train_censors: int,
+    min_test_events: int,
+    min_test_censors: int,
+    min_test_n: int,
     max_groups: int | None = None,
+    score_train: bool = False,
 ) -> None:
     """Leave one group out: refit both models on all other groups."""
-    groups = loso_groups(df_full, group_col, max_groups=max_groups)
+    groups = loso_groups(
+        df_full,
+        group_col,
+        min_train_events=min_train_events,
+        min_train_censors=min_train_censors,
+        min_test_events=min_test_events,
+        min_test_censors=min_test_censors,
+        min_test_n=min_test_n,
+        max_groups=max_groups,
+    )
     print(
         f"  LOSO axis={axis_name} col={group_col} groups={len(groups)} "
-        f"min_test_n={MIN_LOSO_TEST_N} min_test_events={MIN_LOSO_TEST_EVENTS}"
+        f"min_test_n={min_test_n} min_test_events={min_test_events} "
+        f"min_test_censors={min_test_censors}"
     )
     if not groups:
         print(f"  LOSO axis={axis_name} skipped=no eligible groups")
@@ -713,6 +769,7 @@ def run_loso_axis(
             pc_cols,
             pgs_id,
             label=f"LOSO[{axis_name}] holdout={group_short!r}",
+            score_train=score_train,
         )
         deltas.append(result["delta_test_c"])
 
@@ -724,14 +781,94 @@ def run_loso_axis(
     )
 
 
+def parse_args() -> Namespace:
+    parser = ArgumentParser(
+        description="AoU biobank survival marginal-slope GAM + OOD validation"
+    )
+    parser.add_argument(
+        "--disease",
+        action="append",
+        choices=sorted(DISEASES),
+        help="Disease to run. May be repeated. Default: all diseases.",
+    )
+    parser.add_argument(
+        "--loso-axes",
+        default="care_site,census_region,ancestry",
+        help=(
+            "Comma-separated LOSO axes from "
+            f"{','.join(LOSO_AXIS_TO_COLUMN)}. Use 'none' to skip LOSO."
+        ),
+    )
+    parser.add_argument(
+        "--max-loso-care-sites",
+        type=int,
+        default=MAX_LOSO_CARE_SITES,
+        help="Number of largest eligible care-site folds to run.",
+    )
+    parser.add_argument(
+        "--min-loso-train-events",
+        type=int,
+        default=MIN_LOSO_TRAIN_EVENTS,
+        help="Minimum remaining training events for a LOSO fold.",
+    )
+    parser.add_argument(
+        "--min-loso-train-censors",
+        type=int,
+        default=MIN_LOSO_TRAIN_CENSORS,
+        help="Minimum remaining training censors for a LOSO fold.",
+    )
+    parser.add_argument(
+        "--min-loso-test-events",
+        type=int,
+        default=MIN_LOSO_TEST_EVENTS,
+        help="Minimum held-out events for a LOSO fold.",
+    )
+    parser.add_argument(
+        "--min-loso-test-censors",
+        type=int,
+        default=MIN_LOSO_TEST_CENSORS,
+        help="Minimum held-out censors for a LOSO fold.",
+    )
+    parser.add_argument(
+        "--min-loso-test-n",
+        type=int,
+        default=MIN_LOSO_TEST_N,
+        help="Minimum held-out rows for a LOSO fold.",
+    )
+    parser.add_argument(
+        "--score-loso-train",
+        action="store_true",
+        help="Also predict training rows for LOSO folds. Slow; held-out C is the OOD metric.",
+    )
+    args = parser.parse_args()
+    axes = []
+    if args.loso_axes.strip().lower() != "none":
+        for axis in args.loso_axes.split(","):
+            axis = axis.strip()
+            if not axis:
+                continue
+            if axis not in LOSO_AXIS_TO_COLUMN:
+                raise SystemExit(
+                    f"unknown LOSO axis {axis!r}; choices: {','.join(LOSO_AXIS_TO_COLUMN)}"
+                )
+            axes.append(axis)
+    args.loso_axes = axes
+    return args
+
+
 # --- main ------------------------------------------------------------------
 
 def main() -> None:
+    args = parse_args()
     import gamfit
     print(f"gamfit version: {gamfit.__version__}")
     print(f"gamfit build_info: {gamfit.build_info()}")
     diseases = {k: v for k, v in DISEASES.items() if PGS_ID_PATTERN.match(v["pgs"])}
+    if args.disease:
+        wanted = set(args.disease)
+        diseases = {k: v for k, v in diseases.items() if k in wanted}
     print(f"diseases with real PGS IDs: {list(diseases)}")
+    print(f"loso_axes: {args.loso_axes if args.loso_axes else '<none>'}")
 
     ensure_scored([cfg["pgs"] for cfg in diseases.values()])
 
@@ -749,18 +886,20 @@ def main() -> None:
     base = base.merge(times, on="person_id")
     print(f"base (with times): n={len(base):,}")
 
-    print("loading geography and care-site context ...")
-    context = fetch_person_context(client, cdr)
-    base = base.merge(context, on="person_id", how="left")
-    base["census_region"] = _clean_group_label(base["census_region"])
-    base["care_site_group"] = _clean_group_label(base["care_site_group"])
-    print(f"base (with context): n={len(base):,}")
+    if {"care_site", "census_region"} & set(args.loso_axes):
+        print("loading geography and care-site context ...")
+        context = fetch_person_context(client, cdr)
+        base = base.merge(context, on="person_id", how="left")
+        base["census_region"] = _clean_group_label(base["census_region"])
+        base["care_site_group"] = _clean_group_label(base["care_site_group"])
+        print(f"base (with context): n={len(base):,}")
 
-    print("loading AoU inferred genetic ancestry labels ...")
-    ancestry = load_genetic_ancestry_labels()
-    base = base.merge(ancestry, on="person_id", how="left")
-    base["ancestry_category"] = _clean_group_label(base["ancestry_category"]).str.upper()
-    print(f"base (with ancestry): n={len(base):,}")
+    if "ancestry" in args.loso_axes:
+        print("loading AoU inferred genetic ancestry labels ...")
+        ancestry = load_genetic_ancestry_labels()
+        base = base.merge(ancestry, on="person_id", how="left")
+        base["ancestry_category"] = _clean_group_label(base["ancestry_category"]).str.upper()
+        print(f"base (with ancestry): n={len(base):,}")
 
     rng = np.random.default_rng(RNG_SEED)
     pc_cols = [f"PC{i+1}" for i in range(NUM_PCS)]
@@ -789,7 +928,7 @@ def main() -> None:
         # Drop rows with non-positive or invalid intervals: missing birth/obs,
         # prevalent cases whose event predates obs_start (entry >= exit), etc.
         before = len(df_full)
-        df_full = df_full.dropna(subset=["entry_age", "exit_age"]).copy()
+        df_full = df_full.dropna(subset=["pgs", "entry_age", "exit_age"]).copy()
         df_full = df_full[df_full["exit_age"] > df_full["entry_age"]].copy()
         df_full = df_full[df_full["entry_age"] >= 0].copy()
         dropped = before - len(df_full)
@@ -839,29 +978,23 @@ def main() -> None:
             },
         )
 
-        print("  OOD: leave-one-group-out refits")
-        run_loso_axis(
-            df_full,
-            axis_name="care_site",
-            group_col="care_site_group",
-            pc_cols=pc_cols,
-            pgs_id=cfg["pgs"],
-            max_groups=MAX_LOSO_CARE_SITES,
-        )
-        run_loso_axis(
-            df_full,
-            axis_name="census_region",
-            group_col="census_region",
-            pc_cols=pc_cols,
-            pgs_id=cfg["pgs"],
-        )
-        run_loso_axis(
-            df_full,
-            axis_name="ancestry",
-            group_col="ancestry_category",
-            pc_cols=pc_cols,
-            pgs_id=cfg["pgs"],
-        )
+        if args.loso_axes:
+            print("  OOD: leave-one-group-out refits")
+        for axis in args.loso_axes:
+            run_loso_axis(
+                df_full,
+                axis_name=axis,
+                group_col=LOSO_AXIS_TO_COLUMN[axis],
+                pc_cols=pc_cols,
+                pgs_id=cfg["pgs"],
+                min_train_events=args.min_loso_train_events,
+                min_train_censors=args.min_loso_train_censors,
+                min_test_events=args.min_loso_test_events,
+                min_test_censors=args.min_loso_test_censors,
+                min_test_n=args.min_loso_test_n,
+                max_groups=args.max_loso_care_sites if axis == "care_site" else None,
+                score_train=args.score_loso_train,
+            )
 
 
 if __name__ == "__main__":

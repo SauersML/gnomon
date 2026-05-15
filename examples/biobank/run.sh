@@ -61,6 +61,7 @@ RESULTS="$RESULTS_DIR/biobank_run_${TS}.log"
   echo "--- fit configuration (from script) ---"
   grep -E '^(NUM_PCS|DUCHON_CENTERS|TRAIN_FRACTION|RNG_SEED) *=' \
       "$SCRIPT_DIR/marginal_slope_diseases.py"
+  echo "script_args:       ${*:-<none>}"
   echo
   echo "--- diseases ---"
   awk '/^DISEASES = \{/,/^\}/' "$SCRIPT_DIR/marginal_slope_diseases.py"
@@ -97,7 +98,7 @@ uv run \
     --with nvidia-cusparse-cu12 \
     --with nvidia-curand-cu12 \
     --with nvidia-nvjitlink-cu12 \
-    -- python -u "$SCRIPT_DIR/marginal_slope_diseases.py" 2>&1 | tee -a "$RESULTS"
+    -- python -u "$SCRIPT_DIR/marginal_slope_diseases.py" "$@" 2>&1 | tee -a "$RESULTS"
 
 # --- extract just the summary lines ----------------------------------------
 {
@@ -105,7 +106,7 @@ uv run \
   echo "=========================================================================="
   echo "=== SUMMARY (extracted)"
   echo "=========================================================================="
-  grep -E "^gamfit |^=== |^cohort:|^  pcs:|^  sex:|^  pgs:|^  times:|^  context:|^  ancestry:|^  snomed=|^  split:|^  fit_spec:|^  baseline_spec:|^  baseline_coef:|^  PGS=|^  OOD:|^  LOSO |^  GAM |^  baseline |^  delta |^  save:" "$RESULTS" || echo "(no summary lines matched — fit likely failed; see full log above)"
+  grep -E "^gamfit |^loso_axes:|^=== |^cohort:|^  pcs:|^  sex:|^  pgs:|^  times:|^  context:|^  ancestry:|^  snomed=|^  split:|^  fit_spec:|^  baseline_spec:|^  baseline_coef:|^  PGS=|^  OOD:|^  LOSO |^  GAM |^  baseline |^  delta |^  save:" "$RESULTS" || echo "(no summary lines matched — fit likely failed; see full log above)"
   echo "=========================================================================="
   echo "Full log: $RESULTS"
 } | tee -a "$RESULTS"
