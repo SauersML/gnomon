@@ -337,6 +337,40 @@ theorem differential_ascertainment_artifact
   intro h
   linarith
 
+/-- Ascertainment attenuation model where R² drops proportionally to the missing variance. -/
+structure AscertainmentAttenuationModel where
+  /-- True full-population R² -/
+  r2_pop : ℝ
+  /-- Attenuation factor from selection (0 < atten < 1) -/
+  atten : ℝ
+  atten_pos : 0 < atten
+  atten_lt_one : atten < 1
+  r2_pop_pos : 0 < r2_pop
+
+/-- Ascertained sample R² is strictly smaller than full population R² -/
+noncomputable def AscertainmentAttenuationModel.r2_asc (m : AscertainmentAttenuationModel) : ℝ :=
+  m.atten * m.r2_pop
+
+theorem ascertainment_attenuates_r2 (m : AscertainmentAttenuationModel) :
+    m.r2_asc < m.r2_pop := by
+  unfold AscertainmentAttenuationModel.r2_asc
+  calc m.atten * m.r2_pop < 1 * m.r2_pop := mul_lt_mul_of_pos_right m.atten_lt_one m.r2_pop_pos
+    _ = m.r2_pop := one_mul m.r2_pop
+
+/-- **Differential ascertainment creates apparent portability artifact (Structural).**
+    If the target cohort has more severe ascertainment (smaller attenuation factor)
+    than the source cohort, and true predictive power is identical, the observed
+    ascertained portability drops (i.e. `target.r2_asc < source.r2_asc`), creating
+    an apparent portability artifact from sampling structure alone. -/
+theorem differential_ascertainment_artifact_structural
+    (source target : AscertainmentAttenuationModel)
+    (h_eq_pop : source.r2_pop = target.r2_pop)
+    (h_diff_severity : target.atten < source.atten) :
+    target.r2_asc < source.r2_asc := by
+  unfold AscertainmentAttenuationModel.r2_asc
+  rw [h_eq_pop]
+  exact mul_lt_mul_of_pos_right h_diff_severity target.r2_pop_pos
+
 end ColliderBias
 
 
@@ -525,6 +559,19 @@ theorem differential_survivorship_artifact
     (r2_source_full - Δ_surv_source) - (r2_target_full - Δ_surv_target) >
       r2_source_full - r2_target_full := by
   linarith
+
+/-- **Differential survivorship across populations creates portability artifact (Structural).**
+    If the target population has more severe survivorship bias (greater reduction in variance
+    from birth to survival) than the source cohort, and true full-population predictive power
+    is identical, the observed surviving portability drops, creating an artifact. -/
+theorem differential_survivorship_artifact_structural
+    (source target : SurvivorshipAttenuationModel)
+    (h_eq_full : source.r2_full = target.r2_full)
+    (h_diff_var : target.var_surv / target.var_birth < source.var_surv / source.var_birth) :
+    target.r2_surv < source.r2_surv := by
+  unfold SurvivorshipAttenuationModel.r2_surv
+  rw [h_eq_full]
+  exact mul_lt_mul_of_pos_left h_diff_var target.r2_full_pos
 
 end SurvivorshipBias
 
