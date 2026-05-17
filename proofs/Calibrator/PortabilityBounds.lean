@@ -162,12 +162,27 @@ theorem expected_squared_error_given_x (bias σ_sq : ℝ) :
     bias ^ 2 + σ_sq ≥ σ_sq := by
   linarith [sq_nonneg bias]
 
+/-- **Variance components for expected squared error.** -/
+structure PredictionErrorModel where
+  bias : ℝ
+  σ_sq : ℝ
+  h_σ_pos : 0 < σ_sq
+
+/-- **Variance of squared error.**
+    Var((Y - Ŷ)² | X = x) = 4·bias²·σ² + 2·σ⁴. -/
+noncomputable def PredictionErrorModel.variance_of_squared_error (m : PredictionErrorModel) : ℝ :=
+  4 * m.bias ^ 2 * m.σ_sq + 2 * m.σ_sq ^ 2
+
 /-- **Variance of squared error given X = x.**
     Var((Y - Ŷ)² | X = x) ≈ 4·bias²·σ² + 2·σ⁴.
     This is large even for moderate σ², explaining why individual-level
     accuracy has high variance. -/
-theorem variance_of_squared_error_lower_bound (σ_sq : ℝ) (hσ : 0 < σ_sq) :
-    0 < 2 * σ_sq ^ 2 := by positivity
+theorem variance_of_squared_error_lower_bound (m : PredictionErrorModel) :
+    0 < m.variance_of_squared_error := by
+  unfold PredictionErrorModel.variance_of_squared_error
+  have h1 : 0 ≤ 4 * m.bias ^ 2 * m.σ_sq := mul_nonneg (mul_nonneg (by positivity) (sq_nonneg m.bias)) (le_of_lt m.h_σ_pos)
+  have h2 : 0 < 2 * m.σ_sq ^ 2 := mul_pos (by linarith) (sq_pos_of_pos m.h_σ_pos)
+  linarith
 
 /-- **Conditional variance is large relative to conditional mean squared.**
     For ε ~ N(0, σ²), we have E[ε²] = σ² and Var(ε²) = 2σ⁴.
