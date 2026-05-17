@@ -1,6 +1,7 @@
 import Calibrator.Probability
 import Calibrator.PortabilityDrift
 import Calibrator.OpenQuestions
+import Calibrator.TransportIdentities
 
 namespace Calibrator
 
@@ -51,12 +52,17 @@ theorem genetic_correlation_bounded_mt
     due to different LD patterns and GxE. If LD and GxE introduce
     a nonzero perturbation δ, the ancestry-specific r_g differs. -/
 theorem rg_ancestry_specific
-    (rg_eur δ : ℝ)
-    (h_delta_ne : δ ≠ 0) :
-    rg_eur ≠ rg_eur + δ := by
+    (E : ExpFunctional (ℝ × ℝ))
+    (rg_eur rg_afr : ℝ)
+    (G : (ℝ × ℝ) → ℝ)
+    (E_G_nonzero : E G ≠ 0)
+    (h_afr : rg_afr = rg_eur + E G) :
+    rg_eur ≠ rg_afr := by
   intro h
-  have : δ = 0 := by linarith
-  exact h_delta_ne this
+  have h2 : rg_afr - rg_eur = E G := by linarith
+  have h3 : rg_afr - rg_eur = 0 := by linarith
+  rw [h3] at h2
+  exact E_G_nonzero h2.symm
 
 /-- **Equal-correlation PSD constraint.**
     For a 3×3 correlation matrix with equal pairwise correlation r,
