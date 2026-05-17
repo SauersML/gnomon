@@ -322,20 +322,26 @@ theorem collider_attenuates_association (m : ColliderModel) :
       < m.β_G * 1 := by exact mul_lt_mul_of_pos_left h_ratio_lt_one m.β_G_pos
     _ = m.β_G := by ring
 
+structure TwoPopColliderModel where
+  source : ColliderModel
+  target : ColliderModel
+  same_beta : source.β_G = target.β_G
+  same_env : source.σ2_E = target.σ2_E
+
 /-- **Differential ascertainment creates portability artifact.**
     If source and target cohorts have different ascertainment patterns,
     the apparent portability drop includes an ascertainment component. -/
-theorem differential_ascertainment_artifact
-    (r2_source_pop r2_target_pop r2_source_asc r2_target_asc : ℝ)
-    (h_source_asc : r2_source_asc < r2_source_pop)
-    (h_target_asc : r2_target_asc < r2_target_pop)
-    -- Different ascertainment severity
-    (h_diff_severity : r2_target_pop - r2_target_asc < r2_source_pop - r2_source_asc) :
-    -- Apparent portability drop is larger than true portability drop
-    r2_source_asc - r2_target_asc > r2_source_pop - r2_target_pop →
-      False := by
-  intro h
-  linarith
+theorem differential_ascertainment_artifact (m : TwoPopColliderModel)
+    (h_diff_var : m.target.σ2_G < m.source.σ2_G) :
+    m.target.β_selected < m.source.β_selected := by
+  unfold ColliderModel.β_selected
+  rw [← m.same_beta, ← m.same_env]
+  have h_d1 : 0 < m.target.σ2_G + m.source.σ2_E := by linarith [m.target.σ2_G_pos, m.source.σ2_E_pos]
+  have h_d2 : 0 < m.source.σ2_G + m.source.σ2_E := by linarith [m.source.σ2_G_pos, m.source.σ2_E_pos]
+  apply mul_lt_mul_of_pos_left
+  · rw [div_lt_div_iff₀ h_d1 h_d2]
+    nlinarith [m.target.σ2_G_pos, m.source.σ2_E_pos, h_diff_var]
+  · exact m.source.β_G_pos
 
 end ColliderBias
 
