@@ -368,15 +368,32 @@ theorem fst_decreases_with_migration (m₁ m₂ Ne : ℝ)
   rw [div_lt_div_iff₀ (by nlinarith) (by nlinarith)]
   nlinarith
 
+/-- **Portability prediction from architecture parameters.**
+    Given M_eff, r_g, FST, and tagging efficiency,
+    we can predict R²_target / R²_source. -/
+noncomputable def portabilityFromArchitecture
+    (rg fst tagging_ratio : ℝ) : ℝ :=
+  rg^2 * (1 - fst) * tagging_ratio
+
 /-- **Shared selection homogenizes architecture.**
     If both populations experience the same selective pressure
     (e.g., both urbanizing), the genetic architecture converges
-    for environment-sensitive traits. -/
+    for environment-sensitive traits, improving portability. -/
 theorem shared_selection_improves_portability
-    (rg_before rg_after : ℝ)
+    (rg_before rg_after fst tagging_ratio : ℝ)
+    (h_pos : 0 ≤ rg_before)
     (h_improves : rg_before < rg_after)
-    (h_le : rg_after ≤ 1) :
-    rg_before < 1 := by linarith
+    (h_fst : fst < 1)
+    (h_tag_pos : 0 < tagging_ratio) :
+    portabilityFromArchitecture rg_before fst tagging_ratio <
+      portabilityFromArchitecture rg_after fst tagging_ratio := by
+  unfold portabilityFromArchitecture
+  have h_rg : rg_before ^ 2 < rg_after ^ 2 := by
+    nlinarith [sq_nonneg rg_before]
+  have h_fst_pos : 0 < 1 - fst := by linarith
+  have h1 : rg_before ^ 2 * (1 - fst) < rg_after ^ 2 * (1 - fst) :=
+    mul_lt_mul_of_pos_right h_rg h_fst_pos
+  exact mul_lt_mul_of_pos_right h1 h_tag_pos
 
 /-!
 ### Derivation: portabilityFromArchitecture = rg² × (1 - Fst) × tagging_ratio
@@ -432,13 +449,6 @@ This matches the already-derived `covarianceDivergenceFromRetention` in
 PortabilityDrift.lean, which shows divergence = 1 - (1 - Fst) × shared_LD,
 so retention = (1 - Fst) × shared_LD = (1 - Fst) × tagging_ratio.
 -/
-
-/-- **Portability prediction from architecture parameters.**
-    Given M_eff, r_g, FST, and tagging efficiency,
-    we can predict R²_target / R²_source. -/
-noncomputable def portabilityFromArchitecture
-    (rg fst tagging_ratio : ℝ) : ℝ :=
-  rg^2 * (1 - fst) * tagging_ratio
 
 /-- **portabilityFromArchitecture factors through covarianceRetention.**
     The (1 - Fst) × tagging_ratio component equals the covariance retention
