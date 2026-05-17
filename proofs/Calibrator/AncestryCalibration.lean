@@ -175,23 +175,27 @@ theorem more_target_data_reduces_mse
     As n_T → ∞, σ²_extra/n_T → 0, so target-only wins (bias² > 0). -/
 theorem transfer_beats_target_only
     (σ_sq bias_sq σ_extra_sq : ℝ) (n_T : ℝ)
-    (h_σ : 0 < σ_sq) (h_bias : 0 < bias_sq)
-    (h_extra : 0 < σ_extra_sq) (h_n : 0 < n_T)
-    (h_small_n : n_T < σ_extra_sq / bias_sq) :
+    (_h_σ : 0 < σ_sq) (h_bias : 0 < bias_sq)
+    (_h_extra : 0 < σ_extra_sq) (h_n : 0 < n_T) :
     let mse_transfer := σ_sq / n_T + bias_sq
     let mse_target := (σ_sq + σ_extra_sq) / n_T
-    mse_transfer < mse_target := by
-  simp only
-  -- From h_small_n: n_T < σ_extra_sq / bias_sq
-  -- Multiply both sides by bias_sq > 0: n_T * bias_sq < σ_extra_sq
-  -- Divide by n_T > 0: bias_sq < σ_extra_sq / n_T
-  -- Then σ_sq/n_T + bias_sq < σ_sq/n_T + σ_extra_sq/n_T = (σ_sq + σ_extra_sq)/n_T
-  have h_prod : bias_sq * n_T < σ_extra_sq := by
-    rw [mul_comm]
-    exact (lt_div_iff₀ h_bias).mp h_small_n
-  have h_key : bias_sq < σ_extra_sq / n_T := by
-    exact (lt_div_iff₀ h_n).2 h_prod
-  rw [add_div]; linarith
+    (n_T < σ_extra_sq / bias_sq ↔ mse_transfer < mse_target) := by
+  dsimp
+  constructor
+  · intro h_small_n
+    have h_prod : bias_sq * n_T < σ_extra_sq := by
+      rw [mul_comm]
+      exact (lt_div_iff₀ h_bias).mp h_small_n
+    have h_key : bias_sq < σ_extra_sq / n_T := by
+      exact (lt_div_iff₀ h_n).2 h_prod
+    rw [add_div]; linarith
+  · intro h_lt
+    rw [add_div] at h_lt
+    have h_key : bias_sq < σ_extra_sq / n_T := by linarith
+    have h_prod : n_T * bias_sq < σ_extra_sq := by
+      have : bias_sq * n_T < σ_extra_sq := (lt_div_iff₀ h_n).mp h_key
+      rwa [mul_comm] at this
+    exact (lt_div_iff₀ h_bias).mpr h_prod
 
 /-- **Critical sample size for transfer benefit.**
     Transfer learning helps when n_T < n_crit, where
