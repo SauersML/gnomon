@@ -322,20 +322,32 @@ theorem collider_attenuates_association (m : ColliderModel) :
       < m.β_G * 1 := by exact mul_lt_mul_of_pos_left h_ratio_lt_one m.β_G_pos
     _ = m.β_G := by ring
 
+/-- **Differential ascertainment models.**
+    Comparing two populations where one has stronger ascertainment severity
+    (modeled as differing non-genetic variance in the selected sample). -/
+structure TwoPopColliderModel where
+  source : ColliderModel
+  target : ColliderModel
+  /-- True genetic architecture is identical -/
+  same_β_G : source.β_G = target.β_G
+  same_σ2_G : source.σ2_G = target.σ2_G
+  /-- Target has stronger ascertainment severity (higher variance of unobserved factors) -/
+  h_diff_env : source.σ2_E < target.σ2_E
+
 /-- **Differential ascertainment creates portability artifact.**
     If source and target cohorts have different ascertainment patterns,
     the apparent portability drop includes an ascertainment component. -/
-theorem differential_ascertainment_artifact
-    (r2_source_pop r2_target_pop r2_source_asc r2_target_asc : ℝ)
-    (h_source_asc : r2_source_asc < r2_source_pop)
-    (h_target_asc : r2_target_asc < r2_target_pop)
-    -- Different ascertainment severity
-    (h_diff_severity : r2_target_pop - r2_target_asc < r2_source_pop - r2_source_asc) :
-    -- Apparent portability drop is larger than true portability drop
-    r2_source_asc - r2_target_asc > r2_source_pop - r2_target_pop →
-      False := by
-  intro h
-  linarith
+theorem differential_ascertainment_artifact (m : TwoPopColliderModel) :
+    m.target.β_selected < m.source.β_selected := by
+  unfold ColliderModel.β_selected
+  rw [m.same_β_G, m.same_σ2_G]
+  apply mul_lt_mul_of_pos_left
+  · have h_num_pos : 0 < m.target.σ2_G := m.target.σ2_G_pos
+    have h_denom_s_pos : 0 < m.target.σ2_G + m.source.σ2_E := by linarith [m.target.σ2_G_pos, m.source.σ2_E_pos]
+    have h_denom_t_pos : 0 < m.target.σ2_G + m.target.σ2_E := by linarith [m.target.σ2_G_pos, m.target.σ2_E_pos]
+    rw [div_lt_div_iff₀ h_denom_t_pos h_denom_s_pos]
+    nlinarith [m.h_diff_env]
+  · exact m.target.β_G_pos
 
 end ColliderBias
 
@@ -514,17 +526,29 @@ theorem survivorship_attenuates_in_older (m : SurvivorshipAttenuationModel) :
       < m.r2_full * 1 := by exact mul_lt_mul_of_pos_left h_ratio_lt_one m.r2_full_pos
     _ = m.r2_full := by ring
 
+/-- **Differential survivorship models.**
+    Comparing two populations where target has stronger survivorship truncation. -/
+structure TwoPopSurvivorshipModel where
+  source : SurvivorshipAttenuationModel
+  target : SurvivorshipAttenuationModel
+  /-- Base parameters are identical -/
+  same_r2 : source.r2_full = target.r2_full
+  same_var_birth : source.var_birth = target.var_birth
+  /-- Target has stronger survivorship truncation (lower variance) -/
+  h_diff_surv : target.var_surv < source.var_surv
+
 /-- **Differential survivorship across populations creates portability artifact.**
     If the target population has different age structure or mortality patterns,
     survivorship bias contributes to apparent portability loss. -/
-theorem differential_survivorship_artifact
-    (r2_source_full r2_target_full Δ_surv_source Δ_surv_target : ℝ)
-    (h_surv_s : 0 ≤ Δ_surv_source) (h_surv_t : 0 ≤ Δ_surv_target)
-    (h_diff : Δ_surv_target > Δ_surv_source)
-    (h_obs_s : r2_source_full - Δ_surv_source > 0) :
-    (r2_source_full - Δ_surv_source) - (r2_target_full - Δ_surv_target) >
-      r2_source_full - r2_target_full := by
-  linarith
+theorem differential_survivorship_artifact (m : TwoPopSurvivorshipModel) :
+    m.target.r2_surv < m.source.r2_surv := by
+  unfold SurvivorshipAttenuationModel.r2_surv
+  rw [m.same_r2, m.same_var_birth]
+  have h_r2_pos : 0 < m.target.r2_full := m.target.r2_full_pos
+  have h_var_birth_pos : 0 < m.target.var_birth := m.target.var_birth_pos
+  apply mul_lt_mul_of_pos_left
+  · exact div_lt_div_of_pos_right m.h_diff_surv h_var_birth_pos
+  · exact h_r2_pos
 
 end SurvivorshipBias
 
