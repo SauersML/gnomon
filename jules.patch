@@ -1,0 +1,23 @@
+diff --git a/proofs/Calibrator/StratificationConfounding.lean b/proofs/Calibrator/StratificationConfounding.lean
+index da6dadc..8630cd9 100644
+--- a/proofs/Calibrator/StratificationConfounding.lean
++++ b/proofs/Calibrator/StratificationConfounding.lean
+@@ -322,6 +322,18 @@ theorem collider_attenuates_association (m : ColliderModel) :
+       < m.β_G * 1 := by exact mul_lt_mul_of_pos_left h_ratio_lt_one m.β_G_pos
+     _ = m.β_G := by ring
+ 
++/-- **Differential ascertainment models.**
++    Comparing two populations where one has stronger ascertainment severity
++    (modeled as differing non-genetic variance in the selected sample). -/
++structure TwoPopColliderModel where
++  source : ColliderModel
++  target : ColliderModel
++  /-- True genetic architecture is identical -/
++  same_β_G : source.β_G = target.β_G
++  same_σ2_G : source.σ2_G = target.σ2_G
++  /-- Target has stronger ascertainment severity (higher variance of unobserved factors) -/
++  h_diff_env : source.σ2_E < target.σ2_E
++
+ /-- **Differential ascertainment creates portability artifact.**
+     If source and target cohorts have different ascertainment patterns,
+     the apparent portability drop includes an ascertainment component. -/
