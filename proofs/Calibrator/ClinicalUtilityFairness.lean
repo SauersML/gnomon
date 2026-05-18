@@ -975,6 +975,29 @@ theorem cost_effectiveness_threshold_exists
   rw [screeningQalyGain_eq_formula]
   nlinarith
 
+/-- **Strict Cost-Effectiveness Threshold (No Trivial Witnesses).**
+    This theorem replaces the trivial '0 sensitivity' evaluation above with a
+    rigorous existential proof: there exists a specific, non-trivial sensitivity
+    threshold strictly between 0 and 1 at which the QALY gain is exactly zero. -/
+theorem cost_effectiveness_threshold_exists_v2
+    (π benefit harm : ℝ)
+    (h_π : 0 < π) (h_π1 : π < 1)
+    (h_benefit : 0 < benefit) (h_harm : 0 < harm)
+    (h_ratio : harm * (1 - π) < benefit * π) :
+    ∃ (sens_thresh : ℝ),
+      0 < sens_thresh ∧ sens_thresh < 1 ∧
+      screeningQalyGain sens_thresh 0 π benefit harm = 0 := by
+  use (harm * (1 - π)) / (benefit * π)
+  have h_denom : 0 < benefit * π := mul_pos h_benefit h_π
+  have h_num : 0 < harm * (1 - π) := mul_pos h_harm (by linarith)
+  refine ⟨?_, ?_, ?_⟩
+  · exact div_pos h_num h_denom
+  · exact (div_lt_one h_denom).mpr h_ratio
+  · rw [screeningQalyGain_eq_formula]
+    have h1 : harm * (1 - π) / (benefit * π) * π * benefit = harm * (1 - π) / (benefit * π) * (benefit * π) := by ring
+    rw [h1, div_mul_cancel₀ _ (ne_of_gt h_denom)]
+    ring
+
 end CostEffectiveness
 
 
