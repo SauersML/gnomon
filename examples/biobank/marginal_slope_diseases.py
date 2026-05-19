@@ -30,7 +30,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from google.cloud import bigquery
-from lifelines import CoxPHFitter
 from lifelines.utils import concordance_index
 
 logging.basicConfig(
@@ -743,16 +742,38 @@ def z_norm2(
     )
 
 
-def fit_baseline_cox(train_df: pd.DataFrame) -> CoxPHFitter:
-    """Cox PH on `(entry_age, exit_age, event) ~ z_norm2`, left-truncated."""
-    cph = CoxPHFitter()
-    cph.fit(
-        train_df[["entry_age", "exit_age", "event", "z_norm2"]],
-        duration_col="exit_age",
-        entry_col="entry_age",
-        event_col="event",
-    )
-    return cph
+def fit_baseline_cox(
+    entry: np.ndarray,
+    exit_: np.ndarray,
+    event: np.ndarray,
+    z: np.ndarray,
+) -> float:
+    """Left-truncated Cox PH log-HR for a single covariate `z`. Returns β.
+
+    Uses `statsmodels.duration.hazard_regression.PHReg` -- the only fast
+    Python Cox PH that natively supports left-truncation via `entry=`.
+    sksurv's Cox PH doesn't accept entry times (right-censoring only), so
+    we'd silently bias log-HR on the AoU age-as-time-scale data; lifelines'
+    CoxPHFitter handles entry but its pure-Python risk-set loop takes
+    minutes on the n=300-400k LOSO folds.
+
+    `ties="breslow"` over Efron: identical to the GAM fit's likelihood
+    family and ~30% cheaper. Newton (default) is optimal for the scalar
+    Hessian. `tol=1e-5` over the default `1e-7`: Newton converges
+    quadratically so the last two iters move log-HR by O(1e-12), well below
+    any digit reported in `baseline_coef` or any change in concordance.
+    """
+    from statsmodels.duration.hazard_regression import PHReg  # lazy
+
+    z = np.asarray(z, dtype=np.float64).reshape(-1, 1)
+    result = PHReg(
+        endog=np.asarray(exit_, dtype=np.float64),
+        exog=z,
+        status=np.asarray(event, dtype=np.float64),
+        entry=np.asarray(entry, dtype=np.float64),
+        ties="breslow",
+    ).fit(method="newton", maxiter=30, tol=1e-5, disp=0)
+    return float(result.params[0])
 
 
 def gam_risk(
@@ -924,16 +945,22 @@ def evaluate_model_pair(
         f"  baseline_spec: Cox PH on Z_norm2 (PC-based mean+var adjustment, "
         f"no pop labels)"
     )
-    cph = fit_baseline_cox(train)
-    coef = float(cph.params_["z_norm2"])
+    coef = fit_baseline_cox(
+        train["entry_age"].to_numpy(),
+        train["exit_age"].to_numpy(),
+        train["event"].to_numpy(),
+        train["z_norm2"].to_numpy(),
+    )
     print(f"  baseline_coef: log_HR={coef:+.4f}  HR/SD={np.exp(coef):.4f}")
-    base_risk_test = cph.predict_partial_hazard(test[["z_norm2"]]).to_numpy()
+    # Partial hazard = exp(β z). Concordance is monotone-invariant, so the
+    # missing baseline-hazard centering term doesn't affect the C-index.
+    base_risk_test = np.exp(coef * test["z_norm2"].to_numpy())
     base_test_m = metrics(
         test["exit_age"].to_numpy(), test["event"].to_numpy(), base_risk_test,
     )
     base_train_m = None
     if score_train:
-        base_risk_train = cph.predict_partial_hazard(train[["z_norm2"]]).to_numpy()
+        base_risk_train = np.exp(coef * train["z_norm2"].to_numpy())
         base_train_m = metrics(
             train["exit_age"].to_numpy(), train["event"].to_numpy(), base_risk_train,
         )
