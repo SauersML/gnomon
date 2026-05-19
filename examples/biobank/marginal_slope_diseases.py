@@ -54,9 +54,14 @@ RNG_SEED = 0
 MAX_LOSO_CARE_SITES = 5
 MIN_LOSO_TRAIN_EVENTS = 50
 MIN_LOSO_TRAIN_CENSORS = 50
-MIN_LOSO_TEST_EVENTS = 20
-MIN_LOSO_TEST_CENSORS = 20
-MIN_LOSO_TEST_N = 500
+# Harrell's C standard error is roughly 0.5/sqrt(events); at 1000 events that
+# is ~0.016, the noise floor where a per-fold delta starts to be readable.
+# Folds below this -- e.g. COPD's EHR site 195 at 488 events, SE~0.023 -- gave
+# Δ test-C whose 95% CI crosses zero, so they add nothing to the mean LOSO
+# delta except variance. Bumped from 20 to drop those quietly.
+MIN_LOSO_TEST_EVENTS = 1000
+MIN_LOSO_TEST_CENSORS = 1000
+MIN_LOSO_TEST_N = 2000
 LOSO_AXES = ("care_site", "census_region", "ancestry")
 LOSO_AXIS_TO_COLUMN = {
     "care_site": "care_site_group",
@@ -92,21 +97,19 @@ ANCESTRY_PREDS_CACHE = WORKDIR / "ancestry_preds.tsv"
 DISEASES = {
     "copd": {
         "snomed_name": "Chronic obstructive lung disease",
-        # Jung et al. metaPRS for J44; OR/SD = 1.488 in UKB EUR. Not trained in AoU.
+        # Jung et al. metaPRS for J44. Not trained in AoU.
         "pgs": "PGS004536",
     },
     "hypertension": {
         # OMOP standard SNOMED concept_name for 38341003 in the AoU CDR.
         "snomed_name": "Hypertensive disorder",
-        # Privé et al. 2022 sparse hypertension PRS; PGS-only AUROC 0.629 in
-        # held-out UKB EUR. Not trained in AoU.
+        # Privé et al. 2022 sparse hypertension PRS. Not trained in AoU.
         "pgs": "PGS001320",
     },
     "obesity": {
         "snomed_name": "Obesity",
         # Kim et al. 2026 O_MetPRS_EUR; LDpred2 over multi-ancestry GWAS of 20
-        # metabolic traits. OR=2.47, AUROC=0.728 for BMI>=30. AoU appears only
-        # as an evaluation cohort, not training.
+        # metabolic traits. AoU appears only as an evaluation cohort, not training.
         "pgs": "PGS005331",
     },
 }
