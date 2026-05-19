@@ -455,49 +455,31 @@ fn dispatch_current_binary() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn release_entrypoint_name(binary_name: &str) -> Option<&'static str> {
-    match binary_name {
-        "gnomon"
-        | "gnomon-macos-arm64"
-        | "gnomon-macos-intel"
-        | "gnomon-linux-x64"
-        | "gnomon-linux-x64-v3"
-        | "gnomon-linux-arm64"
-        | "gnomon-windows-x64"
-        | "gnomon-windows-arm64" => Some("gnomon"),
-        "gnomon-map"
-        | "gnomon-map-macos-arm64"
-        | "gnomon-map-macos-intel"
-        | "gnomon-map-linux-x64"
-        | "gnomon-map-linux-x64-v3"
-        | "gnomon-map-linux-arm64"
-        | "gnomon-map-windows-x64"
-        | "gnomon-map-windows-arm64" => Some("gnomon-map"),
-        "gnomon-score"
-        | "gnomon-score-macos-arm64"
-        | "gnomon-score-macos-intel"
-        | "gnomon-score-linux-x64"
-        | "gnomon-score-linux-x64-v3"
-        | "gnomon-score-linux-arm64"
-        | "gnomon-score-windows-x64"
-        | "gnomon-score-windows-arm64" => Some("gnomon-score"),
-        "gnomon-terms"
-        | "gnomon-terms-macos-arm64"
-        | "gnomon-terms-macos-intel"
-        | "gnomon-terms-linux-x64"
-        | "gnomon-terms-linux-x64-v3"
-        | "gnomon-terms-linux-arm64"
-        | "gnomon-terms-windows-x64"
-        | "gnomon-terms-windows-arm64" => Some("gnomon-terms"),
-        "gnomon-calibrate"
-        | "gnomon-calibrate-macos-arm64"
-        | "gnomon-calibrate-macos-intel"
-        | "gnomon-calibrate-linux-x64"
-        | "gnomon-calibrate-linux-x64-v3"
-        | "gnomon-calibrate-linux-arm64"
-        | "gnomon-calibrate-windows-x64"
-        | "gnomon-calibrate-windows-arm64" => Some("gnomon-calibrate"),
+    match release_asset_base_name(binary_name) {
+        "gnomon" => Some("gnomon"),
+        "gnomon-map" => Some("gnomon-map"),
+        "gnomon-score" => Some("gnomon-score"),
+        "gnomon-terms" => Some("gnomon-terms"),
+        "gnomon-calibrate" => Some("gnomon-calibrate"),
         _ => None,
     }
+}
+
+fn release_asset_base_name(binary_name: &str) -> &str {
+    const RELEASE_SUFFIXES: [&str; 7] = [
+        "-linux-x64-v3",
+        "-linux-x64",
+        "-linux-arm64",
+        "-macos-arm64",
+        "-macos-intel",
+        "-windows-x64",
+        "-windows-arm64",
+    ];
+
+    RELEASE_SUFFIXES
+        .iter()
+        .find_map(|suffix| binary_name.strip_suffix(suffix))
+        .unwrap_or(binary_name)
 }
 
 #[cfg(all(
