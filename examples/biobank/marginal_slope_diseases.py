@@ -597,35 +597,6 @@ def gam_risk(model, df: pd.DataFrame, num_pcs: int, horizon: float) -> np.ndarra
     return np.asarray(pred.cumulative_hazard_at([horizon]), dtype=float).reshape(-1)
 
 
-def archive_stale_fit_cache(
-    fit_path: Path | None,
-    meta_path: Path | None,
-    reason: str,
-) -> None:
-    """Move an incompatible persisted fit aside without deleting it."""
-    if fit_path is None or not fit_path.exists():
-        return
-    stamp = pd.Timestamp.utcnow().strftime("%Y%m%dT%H%M%SZ")
-
-    def stale_path(path: Path) -> Path:
-        candidate = path.with_name(f"{path.stem}.stale-{stamp}{path.suffix}")
-        idx = 1
-        while candidate.exists():
-            candidate = path.with_name(
-                f"{path.stem}.stale-{stamp}.{idx}{path.suffix}"
-            )
-            idx += 1
-        return candidate
-
-    archived_fit = stale_path(fit_path)
-    fit_path.rename(archived_fit)
-    print(f"  cache: archived stale fit -> {archived_fit}  reason={reason}")
-    if meta_path is not None and meta_path.exists():
-        archived_meta = stale_path(meta_path)
-        meta_path.rename(archived_meta)
-        print(f"  cache: archived stale meta -> {archived_meta}")
-
-
 def save_fit_cache(
     model,
     fit_path: Path | None,
@@ -698,48 +669,31 @@ def evaluate_model_pair(
     """Fit GAM + Z_norm2 Cox baseline and print comparable C-index lines."""
     train, test, pgs_mean, pgs_std = prepare_scores(train, test, pc_cols, pgs_id)
 
-    fit_path: Path | None = None
-    meta_path: Path | None = None
+    # Fit. Resume is handled transparently by gamfit's persistent warm-start
+    # cache at `~/.cache/gam/warm/v1/`: on identical (training data, gamfit
+    # version) the outer (rho) and inner (beta) iterates from the prior fit
+    # are loaded and PIRLS converges in 1-2 cycles. We don't try to manage
+    # resume ourselves through `.gamfit` files — those are for artifact
+    # persistence, not resume, and they're a separate code path with a
+    # separate set of failure modes (e.g., the gamfit 0.1.69 marginal-slope
+    # save bug fixed in fa7f7b6c / 0.1.70).
+    model = fit_marginal_slope(train, len(pc_cols))
+
     if save_info is not None:
+        # Best-effort artifact write: prediction below uses the in-memory
+        # `model`, not the file, so a save failure (e.g., 0.1.69 omitting
+        # survival_time_* metadata) doesn't fail this run.
         FITS_DIR.mkdir(parents=True, exist_ok=True)
         disease = str(save_info["disease"])
-        fit_path = FITS_DIR / f"{disease}.gamfit"
-        meta_path = FITS_DIR / f"{disease}.meta.json"
-
-    model = None
-    model_from_cache = False
-    if fit_path is not None and fit_path.exists():
-        try:
-            import gamfit
-
-            model = gamfit.load(str(fit_path))
-            model_from_cache = True
-            print(f"  load: model <- {fit_path}")
-        except Exception as e:
-            reason = f"gamfit.load failed: {e}"
-            print(f"  load: {reason}; refitting")
-            archive_stale_fit_cache(fit_path, meta_path, reason)
-    if model is None:
-        model = fit_marginal_slope(train, len(pc_cols))
         save_fit_cache(
-            model, fit_path, meta_path, save_info, pc_cols, pgs_mean, pgs_std, len(train)
+            model,
+            FITS_DIR / f"{disease}.gamfit",
+            FITS_DIR / f"{disease}.meta.json",
+            save_info, pc_cols, pgs_mean, pgs_std, len(train),
         )
 
     t_horizon = float(test["exit_age"].max())
-    try:
-        gam_risk_test = gam_risk(model, test, len(pc_cols), t_horizon)
-    except Exception as e:
-        if not model_from_cache:
-            raise
-        reason = f"cached model predict failed: {e}"
-        print(f"  load: {reason}; refitting")
-        archive_stale_fit_cache(fit_path, meta_path, reason)
-        model = fit_marginal_slope(train, len(pc_cols))
-        model_from_cache = False
-        save_fit_cache(
-            model, fit_path, meta_path, save_info, pc_cols, pgs_mean, pgs_std, len(train)
-        )
-        gam_risk_test = gam_risk(model, test, len(pc_cols), t_horizon)
+    gam_risk_test = gam_risk(model, test, len(pc_cols), t_horizon)
     gam_test_m = metrics(
         test["exit_age"].to_numpy(), test["event"].to_numpy(), gam_risk_test,
     )
