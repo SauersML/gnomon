@@ -586,15 +586,58 @@ def fit_baseline_cox(train_df: pd.DataFrame) -> CoxPHFitter:
     return cph
 
 
-def gam_risk(model, df: pd.DataFrame, num_pcs: int, horizon: float) -> np.ndarray:
-    """Per-row scalar risk from a gamfit survival model: cumulative hazard at
-    `horizon` evaluated on `df`'s covariates. Higher = greater hazard.
+def gam_risk(
+    model, df: pd.DataFrame, num_pcs: int, horizon: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-row scalar risk + a kept-row mask.
 
-    Uses `survival_model_columns` so the predict-time schema can't drift
-    from the fit-time schema declared in `fit_marginal_slope`.
+    Returns `(risk, kept)` where `risk` is the cumulative hazard at `horizon`
+    for the rows where prediction succeeded and `kept` is a boolean mask
+    over the original `df` indices marking which rows are in `risk` (in the
+    same order). Callers should mask their `y` / `event` arrays with `kept`
+    before computing metrics.
+
+    Why a mask: gamfit's saved survival-marginal-slope predictor has a
+    self-consistency guard that rejects rows where the hazard underflows to
+    0 even when the linear predictor is positive. Rather than fail the
+    whole batch on a handful of edge-case test rows (e.g., a person whose
+    PC value is outside the train-set support), we bisect to locate the
+    offenders and drop them.
     """
-    pred = model.predict(df[survival_model_columns(num_pcs)])
-    return np.asarray(pred.cumulative_hazard_at([horizon]), dtype=float).reshape(-1)
+    from gamfit._exceptions import PredictionError  # lazy
+
+    cols = survival_model_columns(num_pcs)
+    n = len(df)
+    kept = np.ones(n, dtype=bool)
+    risk = np.full(n, np.nan, dtype=float)
+
+    def _predict_slice(start: int, end: int) -> None:
+        if start >= end:
+            return
+        sub = df.iloc[start:end]
+        try:
+            pred = model.predict(sub[cols])
+        except PredictionError as exc:
+            if end - start == 1:
+                # Single offender: drop it.
+                kept[start] = False
+                print(
+                    f"  predict: dropping row idx={start} "
+                    f"(person_id={df.iloc[start].get('person_id', '?')}) — {exc}"
+                )
+                return
+            mid = (start + end) // 2
+            _predict_slice(start, mid)
+            _predict_slice(mid, end)
+            return
+        values = np.asarray(pred.cumulative_hazard_at([horizon]), dtype=float).reshape(-1)
+        risk[start:end] = values
+
+    _predict_slice(0, n)
+
+    if not kept.all():
+        print(f"  predict: dropped {int((~kept).sum())} of {n} rows that tripped the guard")
+    return risk[kept], kept
 
 
 def save_fit_cache(
@@ -693,15 +736,19 @@ def evaluate_model_pair(
         )
 
     t_horizon = float(test["exit_age"].max())
-    gam_risk_test = gam_risk(model, test, len(pc_cols), t_horizon)
+    gam_risk_test, kept_test = gam_risk(model, test, len(pc_cols), t_horizon)
     gam_test_m = metrics(
-        test["exit_age"].to_numpy(), test["event"].to_numpy(), gam_risk_test,
+        test["exit_age"].to_numpy()[kept_test],
+        test["event"].to_numpy()[kept_test],
+        gam_risk_test,
     )
     gam_train_m = None
     if score_train:
-        gam_risk_train = gam_risk(model, train, len(pc_cols), t_horizon)
+        gam_risk_train, kept_train = gam_risk(model, train, len(pc_cols), t_horizon)
         gam_train_m = metrics(
-            train["exit_age"].to_numpy(), train["event"].to_numpy(), gam_risk_train,
+            train["exit_age"].to_numpy()[kept_train],
+            train["event"].to_numpy()[kept_train],
+            gam_risk_train,
         )
 
     print(
