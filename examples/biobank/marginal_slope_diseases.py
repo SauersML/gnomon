@@ -428,43 +428,85 @@ def _clean_group_label(s: pd.Series) -> pd.Series:
     )
 
 
-# State of residence and care-site provenance both live in AoU's `person_ext`
-# table, not in the OMOP-standard columns:
+# State of residence comes from `person_ext`; EHR site comes from the
+# per-row clinical extension tables:
 #
 # - `person_ext.state_of_residence_concept_id` holds the PPI PIIState_<XX>
 #   concept whose `concept_code` is `PIIState_<XX>`, or 2000000011 ("State
 #   information suppressed for privacy") when the participant's state has
 #   fewer than 200 enrollees. Curation writes it from `observation.
 #   value_source_concept_id` at `observation_source_concept_id = 1585249`
-#   (see all-of-us/curation create_person_ext_table.py). The earlier path
-#   here joined `observation.value_as_concept_id` -- that is the *standard*-
-#   mapped state concept whose code is not `PIIState_<XX>`, so the regex
-#   strip silently failed and the LOSO state axis collapsed to ~0 known.
+#   (see all-of-us/curation create_person_ext_table.py).
 #
-# - `person_ext.src_id` is the canonical "foreign key to the participant's
-#   source EHR site" (per the schema). Values look like `EHR site <NNN>`
-#   (a masked HPO identifier) for EHR-consented participants, NULL otherwise.
-#   `person.care_site_id` / `visit_occurrence.care_site_id` are nulled out
-#   under CT de-id, which is why the old query reported `care_site known=0`.
+# - `person_ext.src_id` is declared in the schema but is *not* reliably
+#   populated in the CDR (AoU's own controlled-tier QC --
+#   `controlled_tier_qc/check_controlled_tier_part2.py` -- identifies
+#   EHR-consented persons by UNION'ing across the six per-row `*_ext`
+#   tables, never via `person_ext`). The canonical EHR-site marker is
+#   `<row>_ext.src_id` matching `(?i)EHR site` (e.g. "EHR site 100"), a
+#   masked HPO identifier present on every EHR-uploaded row. We take the
+#   modal site per person across `visit_occurrence_ext` (semantically the
+#   "care site") and `condition_occurrence_ext` (broadest coverage for
+#   EHR-consented participants with few recorded visits).
 STATE_OBSERVATION_CONCEPT_ID = 1585249  # PII state-of-residence PPI concept
 
 
 def fetch_person_context(client: bigquery.Client, cdr: str) -> pd.DataFrame:
     """Per-person OOD grouping context (state, census region, EHR site).
 
-    Both columns come from `person_ext`. Rows whose state is generalized for
-    privacy (concept_id 2000000011, code != `PIIState_<XX>`) or whose EHR
-    site is missing fall through as "unknown" and are excluded by downstream
-    LOSO bucket-size thresholds.
+    State: `person_ext.state_of_residence_concept_id` joined to `concept`.
+    Rows generalized for privacy (concept_id 2000000011, code !=
+    `PIIState_<XX>`) fall through as "unknown".
+
+    Care site: modal `src_id` per person from `visit_occurrence_ext`
+    UNION ALL `condition_occurrence_ext`, restricted to values matching
+    `(?i)EHR site`. Participants without EHR consent (no matching rows in
+    either table) bucket as "unknown".
     """
     sql = f"""
+    WITH per_person_site_evidence AS (
+      SELECT
+        CAST(vo.person_id AS STRING) AS person_id,
+        ve.src_id,
+        COUNT(*) AS weight
+      FROM `{cdr}.visit_occurrence` AS vo
+      JOIN `{cdr}.visit_occurrence_ext` AS ve USING (visit_occurrence_id)
+      WHERE REGEXP_CONTAINS(ve.src_id, r'(?i)EHR site')
+      GROUP BY 1, 2
+
+      UNION ALL
+
+      SELECT
+        CAST(co.person_id AS STRING) AS person_id,
+        ce.src_id,
+        COUNT(*) AS weight
+      FROM `{cdr}.condition_occurrence` AS co
+      JOIN `{cdr}.condition_occurrence_ext` AS ce USING (condition_occurrence_id)
+      WHERE REGEXP_CONTAINS(ce.src_id, r'(?i)EHR site')
+      GROUP BY 1, 2
+    ),
+    site_totals AS (
+      SELECT person_id, src_id, SUM(weight) AS n
+      FROM per_person_site_evidence
+      GROUP BY 1, 2
+    ),
+    dominant_site AS (
+      SELECT person_id, src_id AS care_site_src_id
+      FROM site_totals
+      QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY person_id
+        ORDER BY n DESC, src_id
+      ) = 1
+    )
     SELECT
       CAST(pe.person_id AS STRING) AS person_id,
       c.concept_code AS state_concept_code,
-      pe.src_id AS care_site_src_id
+      ds.care_site_src_id AS care_site_src_id
     FROM `{cdr}.person_ext` AS pe
     LEFT JOIN `{cdr}.concept` AS c
       ON c.concept_id = pe.state_of_residence_concept_id
+    LEFT JOIN dominant_site AS ds
+      ON ds.person_id = CAST(pe.person_id AS STRING)
     """
     df = client.query(sql).to_dataframe()
     df["person_id"] = _canonical_id(df["person_id"])
@@ -475,11 +517,10 @@ def fetch_person_context(client: bigquery.Client, cdr: str) -> pd.DataFrame:
     state = code.str.extract(r"^PIIState_([A-Z]{2})$", expand=False).fillna("")
     df["state"] = np.where(state.ne(""), state.str.upper(), "UNKNOWN")
     df["census_region"] = df["state"].map(STATE_TO_CENSUS_REGION).fillna("unknown")
-    # `src_id` is sometimes "PPI/PM" (no EHR data) — bucket it as unknown so
-    # LOSO holdout groups represent actual EHR sites only.
+    # The SQL pre-filtered to matching `(?i)EHR site` values, so anything
+    # present is a real masked HPO id; NULLs mean no EHR evidence found.
     src = df["care_site_src_id"].fillna("").astype(str).str.strip()
-    is_ehr_site = src.str.lower().str.startswith("ehr site")
-    df["care_site_group"] = np.where(is_ehr_site, src, "unknown")
+    df["care_site_group"] = np.where(src.ne(""), src, "unknown")
 
     # --- diagnostics --------------------------------------------------------
     # When LOSO downstream reports `groups=0`, the user needs to see *why*:
