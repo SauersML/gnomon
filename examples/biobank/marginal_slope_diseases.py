@@ -614,26 +614,22 @@ def evaluate_model_pair(
     """Fit GAM + Z_norm2 Cox baseline and print comparable C-index lines."""
     train, test, pgs_mean, pgs_std = prepare_scores(train, test, pc_cols, pgs_id)
 
+    # gamfit 0.1.69's pyffi save path for survival-marginal-slope models omits
+    # `survival_time_basis` (see gam-pyffi build_survival_marginal_slope_ffi_payload
+    # vs. the transformation analogue), so the saved bytes can't be reloaded for
+    # predict — load+predict raises "saved survival model missing
+    # survival_time_basis". Until that ships fixed, always refit in-memory. We
+    # still write the .gamfit on first run for posterity, and the
+    # `not fit_path.exists()` guard means we never overwrite the existing file.
     fit_path: Path | None = None
     meta_path: Path | None = None
-    disease: str | None = None
     if save_info is not None:
         FITS_DIR.mkdir(parents=True, exist_ok=True)
         disease = str(save_info["disease"])
         fit_path = FITS_DIR / f"{disease}.gamfit"
         meta_path = FITS_DIR / f"{disease}.meta.json"
 
-    model = None
-    if fit_path is not None and fit_path.exists():
-        try:
-            import gamfit
-            model = gamfit.load(str(fit_path))
-            print(f"  load: model <- {fit_path}")
-        except Exception as e:
-            print(f"  load: gamfit.load failed ({e}); refitting")
-            model = None
-    if model is None:
-        model = fit_marginal_slope(train, len(pc_cols))
+    model = fit_marginal_slope(train, len(pc_cols))
     if (
         save_info is not None
         and fit_path is not None
