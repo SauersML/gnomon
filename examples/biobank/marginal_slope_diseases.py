@@ -418,16 +418,6 @@ STATE_TO_CENSUS_REGION = {
 }
 
 
-def _state_code(s: pd.Series) -> pd.Series:
-    return (
-        s.fillna("")
-        .astype(str)
-        .str.strip()
-        .str.upper()
-        .str.replace(r"^US-", "", regex=True)
-    )
-
-
 def _clean_group_label(s: pd.Series) -> pd.Series:
     return (
         s.fillna("unknown")
@@ -438,111 +428,65 @@ def _clean_group_label(s: pd.Series) -> pd.Series:
     )
 
 
-# AoU Controlled Tier stores state-of-residence in the *observation* table
-# (not in `location.state`, which is NULL for participants).
+# State of residence and care-site provenance both live in AoU's `person_ext`
+# table, not in the OMOP-standard columns:
 #
-#   observation.observation_source_concept_id = 1585249  -> state-of-residence
-#   observation.value_as_concept_id            -> PPI concept like "PIIState_NY"
+# - `person_ext.state_of_residence_concept_id` holds the PPI PIIState_<XX>
+#   concept whose `concept_code` is `PIIState_<XX>`, or 2000000011 ("State
+#   information suppressed for privacy") when the participant's state has
+#   fewer than 200 enrollees. Curation writes it from `observation.
+#   value_source_concept_id` at `observation_source_concept_id = 1585249`
+#   (see all-of-us/curation create_person_ext_table.py). The earlier path
+#   here joined `observation.value_as_concept_id` -- that is the *standard*-
+#   mapped state concept whose code is not `PIIState_<XX>`, so the regex
+#   strip silently failed and the LOSO state axis collapsed to ~0 known.
 #
-# See "Accessing geolocation data" in the AoU User Support docs. State values
-# below the privacy threshold (<=200 participants per state) are dropped, so
-# we still expect a sub-50 set of distinct state codes -- enough for LOSO.
-STATE_OBSERVATION_CONCEPT_ID = 1585249
+# - `person_ext.src_id` is the canonical "foreign key to the participant's
+#   source EHR site" (per the schema). Values look like `EHR site <NNN>`
+#   (a masked HPO identifier) for EHR-consented participants, NULL otherwise.
+#   `person.care_site_id` / `visit_occurrence.care_site_id` are nulled out
+#   under CT de-id, which is why the old query reported `care_site known=0`.
+STATE_OBSERVATION_CONCEPT_ID = 1585249  # PII state-of-residence PPI concept
 
 
 def fetch_person_context(client: bigquery.Client, cdr: str) -> pd.DataFrame:
-    """Per-person OOD grouping context.
+    """Per-person OOD grouping context (state, census region, EHR site).
 
-    State of residence: pulled from `observation` via the AoU-documented
-    state-of-residence concept (1585249). `value_as_concept_id` resolves to a
-    `PIIState_<XX>` PPI concept whose `concept_code` ends in the two-letter
-    state abbreviation. The legacy `location.state` path used to live here
-    returned NULL for every participant in the Controlled Tier, which is why
-    LOSO axes reported `groups=0`.
-
-    Care site: dominant visit-level care_site_id, falling back to
-    `person.care_site_id`. AoU also generalizes/suppresses care_site for some
-    participants, so this can still collapse to a single bucket.
+    Both columns come from `person_ext`. Rows whose state is generalized for
+    privacy (concept_id 2000000011, code != `PIIState_<XX>`) or whose EHR
+    site is missing fall through as "unknown" and are excluded by downstream
+    LOSO bucket-size thresholds.
     """
     sql = f"""
-    WITH state_obs AS (
-      SELECT
-        CAST(o.person_id AS STRING) AS person_id,
-        ANY_VALUE(c.concept_code) AS state_concept_code,
-        ANY_VALUE(c.concept_name) AS state_concept_name,
-        COUNT(*) AS n_state_rows
-      FROM `{cdr}.observation` AS o
-      LEFT JOIN `{cdr}.concept` AS c
-        ON c.concept_id = o.value_as_concept_id
-      WHERE o.observation_source_concept_id = {STATE_OBSERVATION_CONCEPT_ID}
-      GROUP BY o.person_id
-    ),
-    visit_site_counts AS (
-      SELECT
-        CAST(vo.person_id AS STRING) AS person_id,
-        vo.care_site_id,
-        ANY_VALUE(cs.care_site_name) AS care_site_name,
-        COUNT(*) AS n_visits
-      FROM `{cdr}.visit_occurrence` AS vo
-      LEFT JOIN `{cdr}.care_site` AS cs
-        ON cs.care_site_id = vo.care_site_id
-      WHERE vo.care_site_id IS NOT NULL
-      GROUP BY vo.person_id, vo.care_site_id
-    ),
-    dominant_visit_site AS (
-      SELECT person_id, care_site_id, care_site_name
-      FROM visit_site_counts
-      QUALIFY ROW_NUMBER() OVER (
-        PARTITION BY person_id
-        ORDER BY n_visits DESC, care_site_id
-      ) = 1
-    )
     SELECT
-      CAST(p.person_id AS STRING) AS person_id,
-      l.state AS legacy_location_state,
-      so.state_concept_code AS state_concept_code,
-      so.state_concept_name AS state_concept_name,
-      CAST(COALESCE(dvs.care_site_id, p.care_site_id) AS STRING) AS care_site_id,
-      COALESCE(dvs.care_site_name, pcs.care_site_name) AS care_site_name
-    FROM `{cdr}.person` AS p
-    LEFT JOIN `{cdr}.location` AS l
-      ON l.location_id = p.location_id
-    LEFT JOIN `{cdr}.care_site` AS pcs
-      ON pcs.care_site_id = p.care_site_id
-    LEFT JOIN dominant_visit_site AS dvs
-      ON dvs.person_id = CAST(p.person_id AS STRING)
-    LEFT JOIN state_obs AS so
-      ON so.person_id = CAST(p.person_id AS STRING)
+      CAST(pe.person_id AS STRING) AS person_id,
+      c.concept_code AS state_concept_code,
+      pe.src_id AS care_site_src_id
+    FROM `{cdr}.person_ext` AS pe
+    LEFT JOIN `{cdr}.concept` AS c
+      ON c.concept_id = pe.state_of_residence_concept_id
     """
     df = client.query(sql).to_dataframe()
     df["person_id"] = _canonical_id(df["person_id"])
 
-    # Prefer the observation-table state code (e.g. PIIState_NY -> "NY") and
-    # fall back to legacy `location.state` only if present.
+    # PIIState_<XX> -> "XX"; anything else (incl. the 2000000011 generalization
+    # whose code is "GeneralizedForPrivacy") becomes "UNKNOWN".
     code = df["state_concept_code"].fillna("").astype(str)
-    state_from_obs = code.str.replace("^PIIState_", "", regex=True).str.upper().str.strip()
-    df["state"] = np.where(
-        state_from_obs.ne("") & state_from_obs.ne("PIISTATE"),
-        state_from_obs,
-        _state_code(df["legacy_location_state"]),
-    )
+    state = code.str.extract(r"^PIIState_([A-Z]{2})$", expand=False).fillna("")
+    df["state"] = np.where(state.ne(""), state.str.upper(), "UNKNOWN")
     df["census_region"] = df["state"].map(STATE_TO_CENSUS_REGION).fillna("unknown")
-    care_site_name = _clean_group_label(df["care_site_name"])
-    care_site_id = _clean_group_label(df["care_site_id"])
-    df["care_site_group"] = np.where(
-        care_site_id.eq("unknown"),
-        "unknown",
-        care_site_id + ":" + care_site_name,
-    )
+    # `src_id` is sometimes "PPI/PM" (no EHR data) — bucket it as unknown so
+    # LOSO holdout groups represent actual EHR sites only.
+    src = df["care_site_src_id"].fillna("").astype(str).str.strip()
+    is_ehr_site = src.str.lower().str.startswith("ehr site")
+    df["care_site_group"] = np.where(is_ehr_site, src, "unknown")
 
     # --- diagnostics --------------------------------------------------------
     # When LOSO downstream reports `groups=0`, the user needs to see *why*:
     # how many people are "unknown" on each axis, and what the actual
     # populated buckets look like.
     n = len(df)
-    n_state_obs = int((state_from_obs != "").sum())
-    n_state_legacy = int((_state_code(df["legacy_location_state"]) != "UNKNOWN").sum())
-    n_state_final = int((df["state"].astype(str).str.upper() != "UNKNOWN").sum())
+    n_state_known = int((df["state"].astype(str).str.upper() != "UNKNOWN").sum())
     n_region_known = int(df["census_region"].astype(str).str.lower().ne("unknown").sum())
     n_care_known = int(df["care_site_group"].astype(str).str.lower().ne("unknown").sum())
 
@@ -552,8 +496,7 @@ def fetch_person_context(client: bigquery.Client, cdr: str) -> pd.DataFrame:
 
     print(f"  context: n={n:,}")
     print(
-        f"    state    : populated_via_obs={n_state_obs:,} populated_via_location={n_state_legacy:,} "
-        f"final_known={n_state_final:,} ({100.0*n_state_final/max(n,1):.1f}%)  "
+        f"    state    : known={n_state_known:,} ({100.0*n_state_known/max(n,1):.1f}%)  "
         f"distinct={df['state'].nunique():,}"
     )
     if not state_top.empty:
@@ -570,7 +513,7 @@ def fetch_person_context(client: bigquery.Client, cdr: str) -> pd.DataFrame:
     )
     if not care_top.empty:
         print(f"      top care sites: {dict(care_top)}")
-    if n_state_final == 0 and n_care_known == 0:
+    if n_state_known == 0 and n_care_known == 0:
         print("    [WARN] all LOSO context columns are 'unknown' -> no LOSO axes will run.")
 
     return df[["person_id", "state", "census_region", "care_site_group"]]
