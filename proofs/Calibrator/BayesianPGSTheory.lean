@@ -721,15 +721,32 @@ theorem diminishing_returns_from_majority
     the minimum R² across populations. This generally requires
     oversampling underrepresented populations. -/
 theorem optimal_allocation_oversamples_minority
-    (n_majority n_minority n_total : ℝ)
-    (h_total : n_majority + n_minority = n_total)
-    (h_optimal_minority_share proportion : ℝ)
-    (h_oversampled : proportion < h_optimal_minority_share)
-    (h_prop_def : proportion = n_minority / n_total)
+    (n_minority n_total rg opt_share : ℝ)
     (h_pos : 0 < n_total)
-    (h_minority_share : n_minority / n_total < 1/2) :
+    (h_rg_pos : 0 < rg) (h_rg_lt : rg < 1)
+    (h_minority_share : n_minority / n_total < 1/2)
+    (h_opt : multiAncestryEffectiveN (opt_share * n_total) rg ((1 - opt_share) * n_total) =
+             multiAncestryEffectiveN ((1 - opt_share) * n_total) rg (opt_share * n_total)) :
     -- The optimal minority share exceeds the population proportion
-    n_minority / n_total < h_optimal_minority_share := by linarith
+    n_minority / n_total < opt_share := by
+  unfold multiAncestryEffectiveN at h_opt
+  have h1 : opt_share * n_total - (1 - opt_share) * n_total = rg ^ 2 * (opt_share * n_total - (1 - opt_share) * n_total) := by linarith
+  have h2 : (opt_share * n_total - (1 - opt_share) * n_total) * (1 - rg ^ 2) = 0 := by linarith
+  have h3 : 1 - rg ^ 2 ≠ 0 := by
+    have h_rg2_lt : rg ^ 2 < 1 := by nlinarith [sq_pos_of_pos h_rg_pos, h_rg_lt]
+    linarith
+  have h4 : opt_share * n_total - (1 - opt_share) * n_total = 0 := by
+    cases mul_eq_zero.mp h2 with
+    | inl h => exact h
+    | inr h => contradiction
+  have h5 : 2 * opt_share * n_total = n_total := by linarith
+  have h6 : 2 * opt_share = 1 := by
+    calc 2 * opt_share = (2 * opt_share * n_total) / n_total := by
+          exact (mul_div_cancel_right₀ (2 * opt_share) (ne_of_gt h_pos)).symm
+      _ = n_total / n_total := by rw [h5]
+      _ = 1 := div_self (ne_of_gt h_pos)
+  have h7 : opt_share = 1/2 := by linarith
+  linarith
 
 end MultiAncestryBayesian
 
