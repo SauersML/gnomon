@@ -957,13 +957,17 @@ def main() -> None:
             f"dropped_bad_intervals={dropped:,}"
         )
 
-        # Per-class 80/20 split (events vs. censored), like the prior design but
-        # without balancing — survival uses censored controls natively. We keep
-        # all events and all censors, just split each group 80/20.
-        event_idx = rng.permutation(df_full.index[df_full["event"] == 1].to_numpy())
-        censor_idx = rng.permutation(df_full.index[df_full["event"] == 0].to_numpy())
-        n_train_event = int(round(len(event_idx) * TRAIN_FRACTION))
-        n_train_censor = int(round(len(censor_idx) * TRAIN_FRACTION))
+        # Balanced events:censors = 1:1, then 80/20 train/test per class.
+        # Survival likelihood *can* use every censor, but per-cycle PIRLS
+        # cost scales with n_train and statistical power is event-bound,
+        # so downsample censors to match event count up front.
+        event_idx_all = rng.permutation(df_full.index[df_full["event"] == 1].to_numpy())
+        censor_idx_all = rng.permutation(df_full.index[df_full["event"] == 0].to_numpy())
+        n_keep = min(len(event_idx_all), len(censor_idx_all))
+        event_idx = event_idx_all[:n_keep]
+        censor_idx = censor_idx_all[:n_keep]
+        n_train_event = int(round(n_keep * TRAIN_FRACTION))
+        n_train_censor = int(round(n_keep * TRAIN_FRACTION))
         train_pick = np.concatenate([
             event_idx[:n_train_event], censor_idx[:n_train_censor],
         ])
