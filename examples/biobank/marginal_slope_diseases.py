@@ -41,6 +41,10 @@ logging.basicConfig(
 )
 
 WORKDIR = Path.home() / "aou-gpu-baremetal"
+# Local PLINK1 bed/bim/fam, staged from
+#   gs://fc-aou-datasets-controlled/v8/microarray/plink/arrays.*
+# (see MICROARRAY_PLINK_PREFIX_URI). Egress-charged data, so the convention is
+# to download once into WORKDIR and reuse.
 PLINK_PREFIX = WORKDIR / "arrays"
 SEX_CACHE = Path.home() / ".aou_cache" / "sex_terms"
 FITS_DIR = WORKDIR / "biobank_fits"
@@ -62,10 +66,28 @@ LOSO_AXIS_TO_COLUMN = {
 }
 GNOMON_BIN = os.environ.get("GNOMON_BIN", "gnomon")
 PGS_ID_PATTERN = re.compile(r"^PGS\d{6}$")
+
+# AoU controlled CDR layout (per the "Controlled CDR Directory" doc and "How
+# the All of Us Genomic data are organized"):
+#   $WORKSPACE_CDR       BigQuery dataset    e.g. fc-aou-cdr-prod.C2024Q3R3
+#   $CDR_STORAGE_PATH    GCS root            gs://fc-aou-datasets-controlled/v8
+#   $GOOGLE_PROJECT      billing project     used for requester-pays GCS reads
+#
+# All of the file paths below are sub-paths of CDR_STORAGE_PATH so the script
+# follows the CDR version pinned by the workspace instead of hardcoding "v8".
+# When CDR_STORAGE_PATH is unset (e.g. running outside a workspace), we fall
+# back to the v8 paths documented at the time of writing.
+CDR_STORAGE_PATH = os.environ.get(
+    "CDR_STORAGE_PATH", "gs://fc-aou-datasets-controlled/v8"
+).rstrip("/")
 ANCESTRY_PREDS_URI = (
-    "gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/aux/ancestry/"
-    "ancestry_preds.tsv"
+    f"{CDR_STORAGE_PATH}/wgs/short_read/snpindel/aux/ancestry/ancestry_preds.tsv"
 )
+ADMIXTURE_Q_URI = (
+    f"{CDR_STORAGE_PATH}/wgs/short_read/snpindel/aux/admixture_estimates/"
+    "aou_admixture_estimates_rye_v8.Q"
+)
+MICROARRAY_PLINK_PREFIX_URI = f"{CDR_STORAGE_PATH}/microarray/plink/arrays"
 ANCESTRY_PREDS_CACHE = WORKDIR / "ancestry_preds.tsv"
 
 DISEASES = {
@@ -121,12 +143,12 @@ def load_sex() -> pd.DataFrame:
         "sex": df[sex_col].astype(str).str.strip().str.lower().map(_SEX_MAP),
     }).dropna()
     out["sex"] = out["sex"].astype(int)
-    print(f"  sex:  file={path.name}  n={len(out):,}  e.g. {out['person_id'].head(3).tolist()}")
+    print(f"  sex:  file={path.name}  n={len(out):,}")
     return out
 
 
-def load_pcs(num_pcs: int) -> pd.DataFrame:
-    """Read gnomon's `projection_scores.bin` (GNPRJ001/GNPSID01)."""
+def _load_pcs_from_gnomon(num_pcs: int) -> pd.DataFrame:
+    """Read gnomon's `projection_scores.bin` (GNPRJ001/GNPSID01) as a fallback."""
     bin_path = WORKDIR / "arrays.projection_scores.bin"
     meta = json.loads((WORKDIR / "arrays.projection_scores.metadata.json").read_text())
     rows, cols = int(meta["rows"]), int(meta["cols"])
@@ -143,7 +165,78 @@ def load_pcs(num_pcs: int) -> pd.DataFrame:
     ids = [blob[offsets[i]:offsets[i + 1]].decode() for i in range(count)]
     df = pd.DataFrame(data[:, :num_pcs], columns=[f"PC{i+1}" for i in range(num_pcs)])
     df.insert(0, "person_id", _canonical_id(pd.Series(ids)))
-    print(f"  pcs:  n={len(df):,}  e.g. {df['person_id'].head(3).tolist()}")
+    return df
+
+
+def _load_pcs_from_aou(num_pcs: int) -> pd.DataFrame | None:
+    """Pull the AoU-published 16 PCs from `ancestry_preds.tsv:pca_features`.
+
+    Per the "How the All of Us Genomic data are organized" doc (Table 9), the
+    ancestry preds TSV carries a `pca_features` Array[number] column of length
+    16 for every srWGS sample, produced by Hail's `hwe_normalized_pca` against
+    1KGP+HGDP training data. Using these instead of gnomon's locally-computed
+    PCs aligns the model with AoU's canonical genetic-similarity coordinates.
+
+    Returns None if `ANCESTRY_PREDS_CACHE` is missing or fetch from
+    `ANCESTRY_PREDS_URI` fails (e.g. workspace lacks bucket access -- the
+    same 403 that disables the ancestry LOSO axis). Caller falls back to
+    gnomon's projection scores.
+    """
+    if num_pcs > 16:
+        return None
+    src = None
+    if ANCESTRY_PREDS_CACHE.exists() and ANCESTRY_PREDS_CACHE.stat().st_size > 0:
+        src = ANCESTRY_PREDS_CACHE
+        df_raw = pd.read_csv(src, sep="\t", usecols=["research_id", "pca_features"], dtype=str)
+    else:
+        try:
+            print(f"  pcs (AoU): GET {ANCESTRY_PREDS_URI} -> {ANCESTRY_PREDS_CACHE}")
+            df_raw = pd.read_csv(
+                ANCESTRY_PREDS_URI,
+                sep="\t",
+                usecols=["research_id", "pca_features"],
+                dtype=str,
+                storage_options={
+                    "project": os.environ.get("GOOGLE_PROJECT", ""),
+                    "requester_pays": True,
+                },
+            )
+            ANCESTRY_PREDS_CACHE.parent.mkdir(parents=True, exist_ok=True)
+            df_raw.to_csv(ANCESTRY_PREDS_CACHE, sep="\t", index=False)
+            src = ANCESTRY_PREDS_URI
+        except Exception as exc:
+            print(f"  pcs (AoU): unavailable ({type(exc).__name__}: {exc}); "
+                  f"will fall back to gnomon projection scores")
+            return None
+
+    # pca_features is serialized as e.g. "[8.1232, 0.0123, ..., 0.001]" (16 floats).
+    parsed = df_raw["pca_features"].map(
+        lambda s: json.loads(s) if isinstance(s, str) and s.startswith("[") else None
+    )
+    mask = parsed.notna() & parsed.map(lambda v: isinstance(v, list) and len(v) >= num_pcs)
+    if not mask.any():
+        print("  pcs (AoU): no usable pca_features rows; falling back to gnomon")
+        return None
+    arr = np.array([v[:num_pcs] for v in parsed[mask].tolist()], dtype=float)
+    df = pd.DataFrame(arr, columns=[f"PC{i+1}" for i in range(num_pcs)])
+    df.insert(0, "person_id", _canonical_id(df_raw.loc[mask, "research_id"].reset_index(drop=True)))
+    print(f"  pcs (AoU): n={len(df):,}  src={src}  using top {num_pcs} of 16 PCs")
+    return df
+
+
+def load_pcs(num_pcs: int) -> pd.DataFrame:
+    """Load `num_pcs` PCs per participant.
+
+    Prefers AoU's official `pca_features` from `ancestry_preds.tsv` (the 16
+    PCs from `hwe_normalized_pca` against 1KGP+HGDP, packaged with the CDR);
+    falls back to gnomon's local `arrays.projection_scores.bin` if the AoU
+    file is unreachable (e.g. the same 403 that disables the ancestry LOSO
+    axis when the workspace can't read `fc-aou-datasets-controlled`).
+    """
+    df = _load_pcs_from_aou(num_pcs)
+    if df is None:
+        df = _load_pcs_from_gnomon(num_pcs)
+        print(f"  pcs (gnomon): n={len(df):,}  source=arrays.projection_scores.bin")
     return df
 
 
@@ -300,7 +393,7 @@ def fetch_person_times(client: bigquery.Client, cdr: str) -> pd.DataFrame:
     df["birth_datetime"] = pd.to_datetime(df["birth_datetime"], utc=True).dt.tz_convert(None)
     df["obs_start"] = pd.to_datetime(df["obs_start"])
     df["obs_end"] = pd.to_datetime(df["obs_end"])
-    print(f"  times: n={len(df):,}  e.g. {df['person_id'].head(3).tolist()}")
+    print(f"  times: n={len(df):,}")
     return df
 
 
@@ -345,15 +438,46 @@ def _clean_group_label(s: pd.Series) -> pd.Series:
     )
 
 
+# AoU Controlled Tier stores state-of-residence in the *observation* table
+# (not in `location.state`, which is NULL for participants).
+#
+#   observation.observation_source_concept_id = 1585249  -> state-of-residence
+#   observation.value_as_concept_id            -> PPI concept like "PIIState_NY"
+#
+# See "Accessing geolocation data" in the AoU User Support docs. State values
+# below the privacy threshold (<=200 participants per state) are dropped, so
+# we still expect a sub-50 set of distinct state codes -- enough for LOSO.
+STATE_OBSERVATION_CONCEPT_ID = 1585249
+
+
 def fetch_person_context(client: bigquery.Client, cdr: str) -> pd.DataFrame:
     """Per-person OOD grouping context.
 
-    Geography comes from `person.location_id -> location.state`. Care-site OOD
-    uses the dominant visit-level care site rather than `person.care_site_id`,
-    because the latter is sparsely populated in many AoU CDRs.
+    State of residence: pulled from `observation` via the AoU-documented
+    state-of-residence concept (1585249). `value_as_concept_id` resolves to a
+    `PIIState_<XX>` PPI concept whose `concept_code` ends in the two-letter
+    state abbreviation. The legacy `location.state` path used to live here
+    returned NULL for every participant in the Controlled Tier, which is why
+    LOSO axes reported `groups=0`.
+
+    Care site: dominant visit-level care_site_id, falling back to
+    `person.care_site_id`. AoU also generalizes/suppresses care_site for some
+    participants, so this can still collapse to a single bucket.
     """
     sql = f"""
-    WITH visit_site_counts AS (
+    WITH state_obs AS (
+      SELECT
+        CAST(o.person_id AS STRING) AS person_id,
+        ANY_VALUE(c.concept_code) AS state_concept_code,
+        ANY_VALUE(c.concept_name) AS state_concept_name,
+        COUNT(*) AS n_state_rows
+      FROM `{cdr}.observation` AS o
+      LEFT JOIN `{cdr}.concept` AS c
+        ON c.concept_id = o.value_as_concept_id
+      WHERE o.observation_source_concept_id = {STATE_OBSERVATION_CONCEPT_ID}
+      GROUP BY o.person_id
+    ),
+    visit_site_counts AS (
       SELECT
         CAST(vo.person_id AS STRING) AS person_id,
         vo.care_site_id,
@@ -375,7 +499,9 @@ def fetch_person_context(client: bigquery.Client, cdr: str) -> pd.DataFrame:
     )
     SELECT
       CAST(p.person_id AS STRING) AS person_id,
-      l.state AS state,
+      l.state AS legacy_location_state,
+      so.state_concept_code AS state_concept_code,
+      so.state_concept_name AS state_concept_name,
       CAST(COALESCE(dvs.care_site_id, p.care_site_id) AS STRING) AS care_site_id,
       COALESCE(dvs.care_site_name, pcs.care_site_name) AS care_site_name
     FROM `{cdr}.person` AS p
@@ -385,10 +511,21 @@ def fetch_person_context(client: bigquery.Client, cdr: str) -> pd.DataFrame:
       ON pcs.care_site_id = p.care_site_id
     LEFT JOIN dominant_visit_site AS dvs
       ON dvs.person_id = CAST(p.person_id AS STRING)
+    LEFT JOIN state_obs AS so
+      ON so.person_id = CAST(p.person_id AS STRING)
     """
     df = client.query(sql).to_dataframe()
     df["person_id"] = _canonical_id(df["person_id"])
-    df["state"] = _state_code(df["state"])
+
+    # Prefer the observation-table state code (e.g. PIIState_NY -> "NY") and
+    # fall back to legacy `location.state` only if present.
+    code = df["state_concept_code"].fillna("").astype(str)
+    state_from_obs = code.str.replace("^PIIState_", "", regex=True).str.upper().str.strip()
+    df["state"] = np.where(
+        state_from_obs.ne("") & state_from_obs.ne("PIISTATE"),
+        state_from_obs,
+        _state_code(df["legacy_location_state"]),
+    )
     df["census_region"] = df["state"].map(STATE_TO_CENSUS_REGION).fillna("unknown")
     care_site_name = _clean_group_label(df["care_site_name"])
     care_site_id = _clean_group_label(df["care_site_id"])
@@ -397,10 +534,45 @@ def fetch_person_context(client: bigquery.Client, cdr: str) -> pd.DataFrame:
         "unknown",
         care_site_id + ":" + care_site_name,
     )
+
+    # --- diagnostics --------------------------------------------------------
+    # When LOSO downstream reports `groups=0`, the user needs to see *why*:
+    # how many people are "unknown" on each axis, and what the actual
+    # populated buckets look like.
+    n = len(df)
+    n_state_obs = int((state_from_obs != "").sum())
+    n_state_legacy = int((_state_code(df["legacy_location_state"]) != "UNKNOWN").sum())
+    n_state_final = int((df["state"].astype(str).str.upper() != "UNKNOWN").sum())
+    n_region_known = int(df["census_region"].astype(str).str.lower().ne("unknown").sum())
+    n_care_known = int(df["care_site_group"].astype(str).str.lower().ne("unknown").sum())
+
+    state_top = df.loc[df["state"].astype(str).str.upper() != "UNKNOWN", "state"].value_counts().head(8)
+    region_top = df.loc[df["census_region"].astype(str).str.lower() != "unknown", "census_region"].value_counts()
+    care_top = df.loc[df["care_site_group"].astype(str).str.lower() != "unknown", "care_site_group"].value_counts().head(8)
+
+    print(f"  context: n={n:,}")
     print(
-        f"  context: n={len(df):,}  regions={df['census_region'].nunique():,}  "
-        f"care_sites={df['care_site_group'].nunique():,}"
+        f"    state    : populated_via_obs={n_state_obs:,} populated_via_location={n_state_legacy:,} "
+        f"final_known={n_state_final:,} ({100.0*n_state_final/max(n,1):.1f}%)  "
+        f"distinct={df['state'].nunique():,}"
     )
+    if not state_top.empty:
+        print(f"      top states: {dict(state_top)}")
+    print(
+        f"    region   : known={n_region_known:,} ({100.0*n_region_known/max(n,1):.1f}%)  "
+        f"distinct={df['census_region'].nunique():,}"
+    )
+    if not region_top.empty:
+        print(f"      regions: {dict(region_top)}")
+    print(
+        f"    care_site: known={n_care_known:,} ({100.0*n_care_known/max(n,1):.1f}%)  "
+        f"distinct={df['care_site_group'].nunique():,}"
+    )
+    if not care_top.empty:
+        print(f"      top care sites: {dict(care_top)}")
+    if n_state_final == 0 and n_care_known == 0:
+        print("    [WARN] all LOSO context columns are 'unknown' -> no LOSO axes will run.")
+
     return df[["person_id", "state", "census_region", "care_site_group"]]
 
 
@@ -415,19 +587,20 @@ def load_genetic_ancestry_labels() -> pd.DataFrame:
     AoU's labels are reference-panel-derived categories (`AFR`, `AMR`, `EAS`,
     `EUR`, `MID`, `SAS`, and sometimes `OTH`), not self-reported race/ethnicity.
     """
+    # Keep `pca_features` in the cache so `_load_pcs_from_aou` can reuse it.
+    cache_cols = ["research_id", "ancestry_pred", "pca_features"]
     if ANCESTRY_PREDS_CACHE.exists() and ANCESTRY_PREDS_CACHE.stat().st_size > 0:
-        df = pd.read_csv(
-            ANCESTRY_PREDS_CACHE,
-            sep="\t",
-            usecols=["research_id", "ancestry_pred"],
-            dtype=str,
-        )
+        # Older cache may not have pca_features; only require ancestry_pred.
+        df = pd.read_csv(ANCESTRY_PREDS_CACHE, sep="\t", dtype=str)
+        if "pca_features" not in df.columns:
+            df["pca_features"] = ""
+        df = df[["research_id", "ancestry_pred", "pca_features"]]
     else:
         print(f"  gcsfs GET {ANCESTRY_PREDS_URI} -> {ANCESTRY_PREDS_CACHE}")
         df = pd.read_csv(
             ANCESTRY_PREDS_URI,
             sep="\t",
-            usecols=["research_id", "ancestry_pred"],
+            usecols=cache_cols,
             dtype=str,
             storage_options={
                 "project": os.environ["GOOGLE_PROJECT"],
@@ -501,6 +674,7 @@ def fit_marginal_slope(train_df: pd.DataFrame, num_pcs: int):  # -> gamfit.Model
     print(f"  fit_spec: formula={formula!r}")
     print(f"  fit_spec: z_column='prs_z'  logslope_formula={duchon!r}")
     print(f"  fit_spec: num_pcs={num_pcs}  duchon_centers={DUCHON_CENTERS}  n_train={len(train_df)}")
+    print(f"  fit_spec: gamfit={gamfit.__version__}")
     return gamfit.fit(
         train_df[cols],
         formula,
@@ -621,10 +795,10 @@ def gam_risk(
             if end - start == 1:
                 # Single offender: drop it.
                 kept[start] = False
-                print(
-                    f"  predict: dropping row idx={start} "
-                    f"(person_id={df.iloc[start].get('person_id', '?')}) — {exc}"
-                )
+                # Don't log the person_id (individual-level); the positional
+                # index is enough for diagnostics across reruns on the same
+                # split.
+                print(f"  predict: dropping row at split-position {start} — {exc}")
                 return
             mid = (start + end) // 2
             _predict_slice(start, mid)
@@ -811,11 +985,31 @@ def loso_groups(
     min_test_censors: int,
     min_test_n: int,
     max_groups: int | None = None,
+    verbose: bool = True,
 ) -> list[str]:
-    """Eligible held-out groups, sorted by size and event-count constraints."""
+    """Eligible held-out groups, sorted by size and event-count constraints.
+
+    When `verbose`, prints a breakdown of how many candidate groups exist
+    before filtering and how many were rejected for each reason. This is the
+    diagnostic that previously got swallowed by the laconic "no eligible
+    groups" message.
+    """
+    n_rows = len(df)
+    raw_distinct = df[col].nunique(dropna=False)
     known = df[col].notna() & df[col].astype(str).str.lower().ne("unknown")
+    n_known = int(known.sum())
     total_events = int(df["event"].sum())
     total_censors = int(len(df) - total_events)
+    if verbose:
+        print(
+            f"  LOSO[{col}] candidates: n_rows={n_rows:,} known_rows={n_known:,} "
+            f"({100.0*n_known/max(n_rows,1):.1f}%) distinct_values={raw_distinct:,}"
+        )
+    if n_known == 0:
+        if verbose:
+            print(f"  LOSO[{col}] no known (non-'unknown') values; column is empty.")
+        return []
+
     summary = (
         df[known]
         .groupby(col, sort=False)
@@ -823,14 +1017,28 @@ def loso_groups(
         .reset_index()
     )
     summary["censors"] = summary["n"] - summary["events"]
-    summary = summary[
-        (summary["n"] >= min_test_n)
-        & (summary["events"] >= min_test_events)
-        & (summary["censors"] >= min_test_censors)
-        & ((total_events - summary["events"]) >= min_train_events)
-        & ((total_censors - summary["censors"]) >= min_train_censors)
-    ]
+
+    fail_n         = (summary["n"] < min_test_n)
+    fail_events    = (summary["events"] < min_test_events)
+    fail_censors   = (summary["censors"] < min_test_censors)
+    fail_train_ev  = ((total_events - summary["events"]) < min_train_events)
+    fail_train_cn  = ((total_censors - summary["censors"]) < min_train_censors)
+
+    if verbose:
+        print(
+            f"  LOSO[{col}] groups_before_filter={len(summary):,}  "
+            f"reject: n<{min_test_n}={int(fail_n.sum())} "
+            f"events<{min_test_events}={int(fail_events.sum())} "
+            f"censors<{min_test_censors}={int(fail_censors.sum())} "
+            f"train_events<{min_train_events}={int(fail_train_ev.sum())} "
+            f"train_censors<{min_train_censors}={int(fail_train_cn.sum())}"
+        )
+
+    summary = summary[~(fail_n | fail_events | fail_censors | fail_train_ev | fail_train_cn)]
     summary = summary.sort_values(["n", "events"], ascending=False, kind="stable")
+    if verbose and not summary.empty:
+        preview = summary.head(5)[[col, "n", "events", "censors"]].to_dict("records")
+        print(f"  LOSO[{col}] eligible (top 5 by size): {preview}")
     if max_groups is not None:
         summary = summary.head(max_groups)
     return [str(x) for x in summary[col].tolist()]
@@ -966,6 +1174,54 @@ def main() -> None:
 
     rng = np.random.default_rng(RNG_SEED)
     pc_cols = [f"PC{i+1}" for i in range(NUM_PCS)]
+
+    # --- pre-flight diagnostics: print upfront, aggregate-only, no row-level
+    # data. Tells the operator what LOSO axes will have anything to work with
+    # before any fits start.
+    print("\n=== PRE-FLIGHT DIAGNOSTICS ===")
+    print(f"base cohort           : n={len(base):,}")
+    print(f"PC columns            : {pc_cols}")
+    print(f"diseases to fit       : {list(diseases.keys())}")
+    print(f"LOSO axes (configured): {LOSO_AXES}")
+    print(f"LOSO axes (active)    : {active_axes}")
+    print(f"LOSO thresholds       : min_test_n={MIN_LOSO_TEST_N} "
+          f"min_test_events={MIN_LOSO_TEST_EVENTS} "
+          f"min_test_censors={MIN_LOSO_TEST_CENSORS} "
+          f"min_train_events={MIN_LOSO_TRAIN_EVENTS} "
+          f"min_train_censors={MIN_LOSO_TRAIN_CENSORS} "
+          f"max_groups={MAX_LOSO_CARE_SITES}")
+    for axis in active_axes:
+        col = LOSO_AXIS_TO_COLUMN[axis]
+        if col not in base.columns:
+            print(f"  axis={axis:<14} column={col:<24} status=MISSING (column not in base)")
+            continue
+        s = base[col].astype(str)
+        known_mask = s.notna() & s.str.lower().ne("unknown") & s.ne("")
+        n_known = int(known_mask.sum())
+        n_total = len(base)
+        distinct = int(s[known_mask].nunique())
+        pct = 100.0 * n_known / max(n_total, 1)
+        # Show only group sizes that meet the LOSO min_test_n threshold so we
+        # never emit a low-count bucket. Top 8 by population.
+        if n_known > 0:
+            vc = s[known_mask].value_counts()
+            big = vc[vc >= MIN_LOSO_TEST_N]
+            print(
+                f"  axis={axis:<14} column={col:<24} "
+                f"known={n_known:,} ({pct:.1f}%) distinct={distinct:,} "
+                f"buckets>={MIN_LOSO_TEST_N}: {len(big):,}"
+            )
+            if len(big) > 0:
+                preview = dict(big.head(8).items())
+                print(f"      top buckets (n>={MIN_LOSO_TEST_N}): {preview}")
+            else:
+                print(f"      no bucket has >={MIN_LOSO_TEST_N} people — axis will be empty downstream")
+        else:
+            print(
+                f"  axis={axis:<14} column={col:<24} "
+                f"known=0 ({pct:.1f}%)  -> axis will be skipped"
+            )
+    print("=== /PRE-FLIGHT ===\n")
 
     for name, cfg in diseases.items():
         print(f"\n=== {name.upper()} ===")
