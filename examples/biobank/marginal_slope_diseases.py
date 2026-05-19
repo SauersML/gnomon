@@ -44,8 +44,8 @@ WORKDIR = Path.home() / "aou-gpu-baremetal"
 PLINK_PREFIX = WORKDIR / "arrays"
 SEX_CACHE = Path.home() / ".aou_cache" / "sex_terms"
 FITS_DIR = WORKDIR / "biobank_fits"
-NUM_PCS = 10
-DUCHON_CENTERS = 30  # > linear nullspace (d+1=11) in d=10
+NUM_PCS = 3
+DUCHON_CENTERS = 10  # > linear nullspace (d+1=4) in d=3
 TRAIN_FRACTION = 0.80  # per-class 80/20 split
 RNG_SEED = 0
 MAX_LOSO_CARE_SITES = 5
