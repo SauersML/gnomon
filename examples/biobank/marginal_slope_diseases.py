@@ -574,6 +574,67 @@ def gam_risk(model, df: pd.DataFrame, num_pcs: int, horizon: float) -> np.ndarra
     return np.asarray(pred.cumulative_hazard_at([horizon]), dtype=float).reshape(-1)
 
 
+def archive_stale_fit_cache(
+    fit_path: Path | None,
+    meta_path: Path | None,
+    reason: str,
+) -> None:
+    """Move an incompatible persisted fit aside without deleting it."""
+    if fit_path is None or not fit_path.exists():
+        return
+    stamp = pd.Timestamp.utcnow().strftime("%Y%m%dT%H%M%SZ")
+
+    def stale_path(path: Path) -> Path:
+        candidate = path.with_name(f"{path.stem}.stale-{stamp}{path.suffix}")
+        idx = 1
+        while candidate.exists():
+            candidate = path.with_name(
+                f"{path.stem}.stale-{stamp}.{idx}{path.suffix}"
+            )
+            idx += 1
+        return candidate
+
+    archived_fit = stale_path(fit_path)
+    fit_path.rename(archived_fit)
+    print(f"  cache: archived stale fit -> {archived_fit}  reason={reason}")
+    if meta_path is not None and meta_path.exists():
+        archived_meta = stale_path(meta_path)
+        meta_path.rename(archived_meta)
+        print(f"  cache: archived stale meta -> {archived_meta}")
+
+
+def save_fit_cache(
+    model,
+    fit_path: Path | None,
+    meta_path: Path | None,
+    save_info: dict[str, object] | None,
+    pc_cols: list[str],
+    pgs_mean: float,
+    pgs_std: float,
+    train_n: int,
+) -> None:
+    if save_info is None or fit_path is None or meta_path is None:
+        return
+    try:
+        model.save(str(fit_path))
+    except Exception as e:
+        print(f"  save: model.save failed ({e}); skipping persist")
+        return
+    meta = {
+        **save_info,
+        "num_pcs": len(pc_cols),
+        "duchon_centers": DUCHON_CENTERS,
+        "train_fraction": TRAIN_FRACTION,
+        "rng_seed": RNG_SEED,
+        "pgs_mean": pgs_mean,
+        "pgs_std": pgs_std,
+        "n_train": int(train_n),
+        "survival_likelihood": "marginal-slope",
+    }
+    meta_path.write_text(json.dumps(meta, indent=2))
+    print(f"  save: model -> {fit_path}  meta -> {meta_path}")
+
+
 def prepare_scores(
     train: pd.DataFrame,
     test: pd.DataFrame,
@@ -614,13 +675,6 @@ def evaluate_model_pair(
     """Fit GAM + Z_norm2 Cox baseline and print comparable C-index lines."""
     train, test, pgs_mean, pgs_std = prepare_scores(train, test, pc_cols, pgs_id)
 
-    # gamfit 0.1.69's pyffi save path for survival-marginal-slope models omits
-    # `survival_time_basis` (see gam-pyffi build_survival_marginal_slope_ffi_payload
-    # vs. the transformation analogue), so the saved bytes can't be reloaded for
-    # predict — load+predict raises "saved survival model missing
-    # survival_time_basis". Until that ships fixed, always refit in-memory. We
-    # still write the .gamfit on first run for posterity, and the
-    # `not fit_path.exists()` guard means we never overwrite the existing file.
     fit_path: Path | None = None
     meta_path: Path | None = None
     if save_info is not None:
@@ -629,34 +683,40 @@ def evaluate_model_pair(
         fit_path = FITS_DIR / f"{disease}.gamfit"
         meta_path = FITS_DIR / f"{disease}.meta.json"
 
-    model = fit_marginal_slope(train, len(pc_cols))
-    if (
-        save_info is not None
-        and fit_path is not None
-        and meta_path is not None
-        and not fit_path.exists()
-    ):
+    model = None
+    model_from_cache = False
+    if fit_path is not None and fit_path.exists():
         try:
-            model.save(str(fit_path))
+            import gamfit
+
+            model = gamfit.load(str(fit_path))
+            model_from_cache = True
+            print(f"  load: model <- {fit_path}")
         except Exception as e:
-            print(f"  save: model.save failed ({e}); skipping persist")
-        else:
-            meta = {
-                **save_info,
-                "num_pcs": len(pc_cols),
-                "duchon_centers": DUCHON_CENTERS,
-                "train_fraction": TRAIN_FRACTION,
-                "rng_seed": RNG_SEED,
-                "pgs_mean": pgs_mean,
-                "pgs_std": pgs_std,
-                "n_train": int(len(train)),
-                "survival_likelihood": "marginal-slope",
-            }
-            meta_path.write_text(json.dumps(meta, indent=2))
-            print(f"  save: model -> {fit_path}  meta -> {meta_path}")
+            reason = f"gamfit.load failed: {e}"
+            print(f"  load: {reason}; refitting")
+            archive_stale_fit_cache(fit_path, meta_path, reason)
+    if model is None:
+        model = fit_marginal_slope(train, len(pc_cols))
+        save_fit_cache(
+            model, fit_path, meta_path, save_info, pc_cols, pgs_mean, pgs_std, len(train)
+        )
 
     t_horizon = float(test["exit_age"].max())
-    gam_risk_test = gam_risk(model, test, len(pc_cols), t_horizon)
+    try:
+        gam_risk_test = gam_risk(model, test, len(pc_cols), t_horizon)
+    except Exception as e:
+        if not model_from_cache:
+            raise
+        reason = f"cached model predict failed: {e}"
+        print(f"  load: {reason}; refitting")
+        archive_stale_fit_cache(fit_path, meta_path, reason)
+        model = fit_marginal_slope(train, len(pc_cols))
+        model_from_cache = False
+        save_fit_cache(
+            model, fit_path, meta_path, save_info, pc_cols, pgs_mean, pgs_std, len(train)
+        )
+        gam_risk_test = gam_risk(model, test, len(pc_cols), t_horizon)
     gam_test_m = metrics(
         test["exit_age"].to_numpy(), test["event"].to_numpy(), gam_risk_test,
     )
