@@ -641,17 +641,28 @@ def fit_marginal_slope(train_df: pd.DataFrame, num_pcs: int):  # -> gamfit.Model
     """
     import gamfit  # lazy: lets the linear baseline import this module without dragging gamfit in
     pcs = ", ".join(f"PC{i+1}" for i in range(num_pcs))
-    # `scale_dims=true` enables per-axis anisotropy on the spatial Duchon, so
-    # the engine keeps the per-axis length-scale optimization active rather
-    # than collapsing to a pure isotropic Duchon. `length_scale=1.0` keeps the
-    # resolver in hybrid (non-pure) mode so it doesn't escalate the nullspace
-    # order; at d=NUM_PCS, order=1 the polynomial cols stay (d+1), well below
-    # DUCHON_CENTERS. `power` omitted -> auto-escalated to satisfy
-    # 2*(p+s) > d (basis.rs:resolve_duchon_orders).
-    duchon = (
-        f"duchon({pcs}, centers={DUCHON_CENTERS}, order=1, "
-        f"length_scale=1.0, scale_dims=true)"
-    )
+    # Pure isotropic scale-free Duchon over the leading PCs. Both
+    # `length_scale` and `scale_dims` are omitted on purpose:
+    #
+    # * Omitting `length_scale` selects the polyharmonic spectrum
+    #   `||w||^(2(p+s))` (basis.rs: `pure = length_scale.is_none()`) -- the
+    #   canonical scale-free Duchon, recommended in docs/formulas.md for
+    #   PC-space smoothing.
+    # * Omitting `scale_dims` keeps `aniso_log_scales=None`, i.e. the kernel
+    #   uses the isotropic distance `r = ||x - c||` (basis.rs:1307,2810).
+    #   On the prior run with `scale_dims=true` the optimized per-axis
+    #   kappas landed at 0.88 / 1.04 / 1.09 -- <15% anisotropy, so we're
+    #   giving up almost nothing in expressivity, and we eliminate the
+    #   `build_psi_hyper_coords` / anisotropic-kappa code path where the
+    #   outer BFGS gradient previously exploded (|g| jumped 6 orders of
+    #   magnitude with the objective flat). Outer optimizer dim drops from
+    #   rho_dim+log_kappa_dim = 8+6 = 14 down to 8+0 = 8.
+    #
+    # At dim=NUM_PCS=3, order=1, max_op=2 (stiffness active),
+    # `resolve_duchon_orders` returns (Linear, s=1) -- the CPD gate
+    # `2s < d` is satisfied without escalation, so the polynomial nullspace
+    # stays at d+1 = 4 cols, well below DUCHON_CENTERS.
+    duchon = f"duchon({pcs}, centers={DUCHON_CENTERS}, order=1)"
     formula = f"Surv(entry_age, exit_age, event) ~ {duchon} + sex"
     cols = survival_model_columns(num_pcs)
     print(f"  fit_spec: family=survival marginal-slope")
