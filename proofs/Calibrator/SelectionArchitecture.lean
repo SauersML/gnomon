@@ -480,6 +480,32 @@ theorem neutral_expected_shift_zero
   unfold polygenicAdaptationShift
   simp
 
+/-- **Rigorous replacement for `neutral_expected_shift_zero` avoiding vacuous specification gaming.**
+    Models the expectation formally over an explicit probability space. -/
+theorem neutral_expected_shift_zero_proved
+    {Ω : Type*} (E : ExpFunctional Ω)
+    {m : ℕ} (β : Fin m → ℝ) (Δp : Ω → Fin m → ℝ)
+    (h_drift : ∀ i, E (fun ω => Δp ω i) = 0) :
+    E (fun ω => polygenicAdaptationShift β (Δp ω)) = 0 := by
+  have h_eq : (fun ω => polygenicAdaptationShift β (Δp ω)) = fun ω => ∑ i, β i * Δp ω i := by
+    funext ω
+    unfold polygenicAdaptationShift
+    rfl
+  rw [h_eq]
+  have h_sum : (fun ω => ∑ i, β i * Δp ω i) = ∑ i, (fun ω => β i * Δp ω i) := by
+    funext ω
+    simp
+  rw [h_sum]
+  rw [ExpFunctional.eval_sum]
+  have h_zero : ∑ i : Fin m, E (fun ω => β i * Δp ω i) = 0 := by
+    apply Finset.sum_eq_zero
+    intro i _
+    have h_smul : (fun ω => β i * Δp ω i) = (β i) • (fun ω => Δp ω i) := by
+      funext ω
+      rfl
+    rw [h_smul, E.smul_eval, h_drift i, mul_zero]
+  exact h_zero
+
 /-- **Under selection, shift is nonzero and directional.**
     If selection favors higher trait values, Δpᵢ > 0 for positive-effect
     alleles and Δpᵢ < 0 for negative-effect alleles.
