@@ -589,7 +589,7 @@ theorem laml_gradient_composition_verification
 
   have h_split : ∀ r, LAML_fn log_lik S_basis X W beta_hat (laml_u rho i r) = L1 r + L2 r - L3 r := by
     intro r
-    unfold LAML_fn
+    unfold LAML_fn LAML_explicit L1 L2 L3 laml_L1 laml_L2 laml_L3
     rfl
 
   rw [show (fun r => LAML_fn log_lik S_basis X W beta_hat (laml_u rho i r)) = fun r => L1 r + L2 r - L3 r by
