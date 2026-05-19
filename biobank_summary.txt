@@ -1,0 +1,313 @@
+# Paste into a notebook cell.  Reads the most recent biobank_run_*.log
+# under ~/aou-gpu-baremetal/biobank_results/ and prints everything you
+# need to interpret the run -- one self-contained text report.
+#
+# No deps beyond stdlib.  Streams the log; safe even for multi-GB files.
+
+from pathlib import Path
+from datetime import datetime, timezone
+import re
+
+RESULTS_DIR = Path.home() / "aou-gpu-baremetal" / "biobank_results"
+
+HEAD_BYTES = 256 * 1024
+TAIL_BYTES = 512 * 1024
+SMALL_LOG_CAP = 2 * 1024 * 1024
+
+
+def _iter_lines(path, size):
+    if size <= SMALL_LOG_CAP:
+        with open(path, "r", errors="replace", buffering=1 << 20) as fh:
+            yield from fh
+        return
+    with open(path, "rb", buffering=0) as fh:
+        head = fh.read(HEAD_BYTES)
+        fh.seek(-TAIL_BYTES, 2)
+        tail = fh.read(TAIL_BYTES)
+    h = head.decode("utf-8", errors="replace")
+    t = tail.decode("utf-8", errors="replace")
+    if "\n" in h: h = h[: h.rfind("\n") + 1]
+    if "\n" in t: t = t[t.find("\n") + 1 :]
+    yield from h.splitlines(keepends=True)
+    yield "\n--- [parser: skipped middle of large log] ---\n"
+    yield from t.splitlines(keepends=True)
+
+
+# Published reference values from the script comments.
+PUBLISHED = {
+    "COPD": {
+        "hr_sd": 1.488, "auroc": None,
+        "source": "Jung et al. metaPRS, UKB EUR (J44, OR/SD)",
+    },
+    "HYPERTENSION": {
+        "hr_sd": None, "auroc": 0.629,
+        "source": "Privé et al. 2022 sparse PRS, UKB EUR (PGS-only AUROC)",
+    },
+    "OBESITY": {
+        "hr_sd": None, "auroc": 0.728,
+        "source": "Kim 2026 O_MetPRS_EUR, BMI>=30 UKB EUR (OR=2.47, AUROC=0.728)",
+    },
+}
+
+# --- regexes (matched once per line, in priority order) --------------------
+
+RX = {
+    "ts":       re.compile(r"^timestamp_utc:\s*(\S+)"),
+    "git":      re.compile(r"^git_rev:\s*(\S+)"),
+    "subj":     re.compile(r"^git_subject:\s*(.+)$"),
+    "gamfit":   re.compile(r"^gamfit version:\s*(\S+)"),
+    "config":   re.compile(
+        r"^(NUM_PCS|DUCHON_CENTERS|TRAIN_FRACTION|RNG_SEED|MAX_LOSO_CARE_SITES|"
+        r"MIN_LOSO_TRAIN_EVENTS|MIN_LOSO_TRAIN_CENSORS|MIN_LOSO_TEST_EVENTS|"
+        r"MIN_LOSO_TEST_CENSORS|MIN_LOSO_TEST_N) *= *(\S+)"
+    ),
+    "loso_axes":re.compile(r"^loso_axes:\s*(.+)$"),
+    "header":   re.compile(r"^=== (\S+) ===\s*$"),
+    "pgs_file": re.compile(r"^  pgs:\s+file=(\S+).*?col=(\S+).*?n=([\d,]+)"),
+    "snomed_s": re.compile(
+        r"^  snomed='([^']+)'.*?events=([\d,]+)\s+censors=([\d,]+).*?K\(crude\)=([\d.]+)"
+    ),
+    "split_s":  re.compile(
+        r"^  split: n=([\d,]+)\s+train_events=([\d,]+)\s+train_censors=([\d,]+)"
+        r"\s+test_events=([\d,]+)\s+test_censors=([\d,]+)"
+    ),
+    "fit_fam":  re.compile(r"^  fit_spec: family=(.+)$"),
+    "fit_form": re.compile(r"^  fit_spec: formula='([^']+)'"),
+    "fit_logs": re.compile(r"^  fit_spec: z_column=.*?logslope_formula='([^']+)'"),
+    "fit_spec": re.compile(r"^  fit_spec: num_pcs=(\d+)\s+duchon_centers=(\d+)\s+n_train=(\d+)"),
+    "pgs_line": re.compile(
+        r"^  PGS=(\S+).*?train_n=([\d,]+)\s+test_n=([\d,]+)\s+test_events=([\d,]+)"
+        r".*?median_exit_age=([\d.]+).*?horizon=([\d.]+)"
+    ),
+    "gam_c":    re.compile(r"^  GAM\s+train_C=([\d.]+)\s+test_C=([\d.]+)"),
+    "base_c":   re.compile(r"^  baseline\s+train_C=([\d.]+)\s+test_C=([\d.]+)"),
+    "delta_c":  re.compile(r"^  delta\s+test_C\(GAM - baseline\)=([+\-]?[\d.]+)"),
+    "base_cf":  re.compile(r"^  baseline_coef:\s+log_HR=([+\-]?[\d.]+)\s+HR/SD=([\d.]+)"),
+    "drop_sum": re.compile(r"^  predict: dropped (\d+) of (\d+) rows"),
+    "save":     re.compile(r"^  save: model -> (\S+)"),
+    "loso_grp": re.compile(r"^  LOSO axis=(\S+) col=\S+ groups=(\d+)"),
+    "loso_skip":re.compile(r"^  LOSO axis=(\S+) skipped=(.+)$"),
+    "loso_res": re.compile(r"^  LOSO (\S+) holdout=(\S+) .*?test_C=([\d.]+)"),
+    "warn":     re.compile(r"\bWARNING:\s*(.+)$"),
+}
+
+
+def parse_log(path):
+    size = path.stat().st_size
+    mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+    info = {
+        "path": path, "size": size, "mtime": mtime,
+        "filename_ts": path.stem.replace("biobank_run_", ""),
+        "config": {},
+        "diseases": [],
+        "warnings": [],
+    }
+    cur = None
+    for line in _iter_lines(path, size):
+        if   (m := RX["ts"].match(line)):     info["filename_ts"] = m.group(1)
+        elif (m := RX["git"].match(line)):    info["git_rev"] = m.group(1)
+        elif (m := RX["subj"].match(line)):   info["git_subj"] = m.group(1).strip()
+        elif (m := RX["gamfit"].match(line)): info["gamfit"] = m.group(1)
+        elif (m := RX["config"].match(line)): info["config"][m.group(1)] = m.group(2)
+        elif (m := RX["loso_axes"].match(line)): info["loso_axes"] = m.group(1).strip()
+        elif (m := RX["header"].match(line)):
+            cur = {"disease": m.group(1), "loso": []}
+            info["diseases"].append(cur)
+        elif cur is not None:
+            if   (m := RX["pgs_file"].match(line)):
+                cur["pgs_file"] = m.group(1); cur["pgs_col"] = m.group(2); cur["pgs_n"] = m.group(3)
+            elif (m := RX["snomed_s"].match(line)):
+                cur["snomed"] = m.group(1)
+                cur["events"] = int(m.group(2).replace(",", ""))
+                cur["censors"] = int(m.group(3).replace(",", ""))
+                cur["K_crude"] = float(m.group(4))
+            elif (m := RX["split_s"].match(line)):
+                cur["split_n"] = int(m.group(1).replace(",", ""))
+                cur["train_events"]  = int(m.group(2).replace(",", ""))
+                cur["train_censors"] = int(m.group(3).replace(",", ""))
+                cur["test_events"]   = int(m.group(4).replace(",", ""))
+                cur["test_censors"]  = int(m.group(5).replace(",", ""))
+            elif (m := RX["fit_fam"].match(line)):  cur["family"] = m.group(1).strip()
+            elif (m := RX["fit_form"].match(line)): cur["formula"] = m.group(1)
+            elif (m := RX["fit_logs"].match(line)): cur["logslope_formula"] = m.group(1)
+            elif (m := RX["fit_spec"].match(line)):
+                cur["num_pcs"] = int(m.group(1))
+                cur["centers"] = int(m.group(2))
+                cur["n_train_fit"] = int(m.group(3))
+            elif (m := RX["pgs_line"].match(line)):
+                cur["pgs"] = m.group(1)
+                cur["train_n"] = int(m.group(2).replace(",", ""))
+                cur["test_n"]  = int(m.group(3).replace(",", ""))
+                cur["test_events_r"] = int(m.group(4).replace(",", ""))
+                cur["median_exit"] = float(m.group(5))
+                cur["horizon"] = float(m.group(6))
+            elif (m := RX["gam_c"].match(line)):
+                cur["gam_train_C"] = float(m.group(1)); cur["gam_test_C"] = float(m.group(2))
+            elif (m := RX["base_c"].match(line)):
+                cur["base_train_C"] = float(m.group(1)); cur["base_test_C"] = float(m.group(2))
+            elif (m := RX["delta_c"].match(line)):  cur["delta_C"] = float(m.group(1))
+            elif (m := RX["base_cf"].match(line)):
+                cur["base_logHR"] = float(m.group(1)); cur["base_HR_SD"] = float(m.group(2))
+            elif (m := RX["drop_sum"].match(line)):
+                cur["dropped"] = int(m.group(1)); cur["scored"] = int(m.group(2))
+            elif (m := RX["save"].match(line)):     cur["save_path"] = m.group(1)
+            elif (m := RX["loso_grp"].match(line)): cur["loso"].append({"axis": m.group(1), "groups": int(m.group(2))})
+            elif (m := RX["loso_skip"].match(line)) and cur["loso"]:
+                cur["loso"][-1]["skipped"] = m.group(2).strip()
+            elif (m := RX["loso_res"].match(line)):
+                cur["loso"].append({"axis": m.group(1), "holdout": m.group(2), "test_C": float(m.group(3))})
+        if (m := RX["warn"].search(line)):
+            msg = m.group(1).strip()
+            if msg not in info["warnings"]:
+                info["warnings"].append(msg)
+    return info
+
+
+def fmt_bytes(b):
+    if b < 1024: return f"{b} B"
+    if b < 1024**2: return f"{b/1024:,.1f} KB"
+    if b < 1024**3: return f"{b/1024**2:,.1f} MB"
+    return f"{b/1024**3:,.2f} GB"
+
+
+# --- print --------------------------------------------------------------
+
+logs = sorted(RESULTS_DIR.glob("biobank_run_*.log"))
+if not logs:
+    raise FileNotFoundError(f"no logs in {RESULTS_DIR}")
+log = logs[-1]
+info = parse_log(log)
+
+W = 88
+def hr(c="="): print(c * W)
+def hd(title): hr(); print(f"  {title}"); hr()
+
+hd("BIOBANK SURVIVAL RUN — full summary")
+print(f"  log file        : {info['path']}")
+print(f"  log size        : {fmt_bytes(info['size'])}")
+print(f"  start (UTC)     : {info.get('filename_ts','?')}")
+print(f"  end   (UTC)     : {info['mtime'].isoformat()}")
+try:
+    start = datetime.strptime(info['filename_ts'], '%Y%m%dT%H%M%SZ').replace(tzinfo=timezone.utc)
+    wall = (info['mtime'] - start).total_seconds()
+    print(f"  wall time       : {wall/60:.1f} min  ({wall:.0f} s)")
+except Exception:
+    pass
+print(f"  git_rev         : {info.get('git_rev','?')}")
+print(f"  git_subject     : {info.get('git_subj','?')}")
+print(f"  gamfit version  : {info.get('gamfit','?')}")
+if info.get("loso_axes"):
+    print(f"  loso_axes (cfg) : {info['loso_axes']}")
+if info.get("config"):
+    print(f"  fit config      :")
+    for k, v in info["config"].items():
+        print(f"      {k:<26} = {v}")
+
+if info["warnings"]:
+    print()
+    print(f"  warnings (deduped, {len(info['warnings'])}):")
+    for w in info["warnings"][:8]:
+        print(f"    !  {w}")
+    if len(info["warnings"]) > 8:
+        print(f"    ... ({len(info['warnings']) - 8} more)")
+
+# --- per disease --------------------------------------------------------
+
+if not info["diseases"]:
+    hd("NO DISEASE BLOCKS FOUND")
+    print("  run probably died in the preamble. see warnings above.")
+else:
+    completed = [d for d in info["diseases"] if "gam_test_C" in d and "base_test_C" in d]
+
+    for idx, d in enumerate(info["diseases"], 1):
+        name = d["disease"]
+        status = "COMPLETED" if ("gam_test_C" in d and "base_test_C" in d) else "INCOMPLETE"
+        hd(f"DISEASE {idx}/{len(info['diseases'])}  —  {name}  [{status}]")
+        print(f"  SNOMED        : {d.get('snomed','?')}")
+        print(f"  PGS           : {d.get('pgs', d.get('pgs_col','?'))}    file={d.get('pgs_file','?')}")
+
+        if "events" in d:
+            print(f"  cohort        : events={d['events']:,}   censors={d['censors']:,}   "
+                  f"K(crude)={d['K_crude']:.6f}")
+        if "split_n" in d:
+            print(f"  split (1:1)   : total={d['split_n']:,}")
+            print(f"                    train: events={d['train_events']:,}  censors={d['train_censors']:,}")
+            print(f"                    test : events={d['test_events']:,}  censors={d['test_censors']:,}")
+        if "family" in d:
+            print(f"  family        : {d['family']}")
+        if "num_pcs" in d:
+            print(f"  fit spec      : num_pcs={d['num_pcs']}  duchon_centers={d['centers']}  "
+                  f"n_train={d['n_train_fit']:,}")
+        if "formula" in d:
+            print(f"  formula       : {d['formula']}")
+        if "logslope_formula" in d:
+            print(f"  logslope      : {d['logslope_formula']}")
+
+        if "horizon" in d:
+            print(f"  horizon       : {d['horizon']:.2f}  (median exit age {d['median_exit']:.2f})")
+
+        if "dropped" in d:
+            pct = 100.0 * d["dropped"] / max(1, d["scored"])
+            print(f"  predict       : dropped {d['dropped']:,} of {d['scored']:,} rows  ({pct:.2f}% — predict-guard hits)")
+        if "save_path" in d:
+            print(f"  saved model   : {d['save_path']}")
+
+        if "gam_test_C" in d:
+            gtr = d["gam_train_C"]; gte = d["gam_test_C"]
+            btr = d["base_train_C"]; bte = d["base_test_C"]
+            dlt = d["delta_C"]
+            verdict = "GAM > baseline" if dlt > 0 else ("GAM < baseline" if dlt < 0 else "TIE")
+            print()
+            print(f"  RESULTS (C-index, higher = better, 0.5 = no info)")
+            print(f"  {'':<14}  {'train':>8}  {'test':>8}  {'gap':>8}")
+            print(f"    {'GAM':<12}  {gtr:>8.4f}  {gte:>8.4f}  {gtr - gte:>+8.4f}")
+            print(f"    {'baseline':<12}  {btr:>8.4f}  {bte:>8.4f}  {btr - bte:>+8.4f}")
+            print(f"    {'Δ (G - B)':<12}  {gtr-btr:>+8.4f}  {gte-bte:>+8.4f}")
+            print(f"  verdict       : {verdict}   (test Δ = {dlt:+.4f})")
+
+        if "base_HR_SD" in d:
+            pub = PUBLISHED.get(name, {})
+            pub_hr = pub.get("hr_sd")
+            pub_au = pub.get("auroc")
+            print()
+            print(f"  baseline coef : log_HR={d['base_logHR']:+.4f}   HR/SD={d['base_HR_SD']:.4f}")
+            if pub_hr is not None:
+                drop = (d['base_HR_SD'] - pub_hr) / pub_hr * 100.0
+                print(f"  vs published  : HR/SD AoU={d['base_HR_SD']:.3f}  vs  {pub_hr:.3f} (UKB EUR)  -> {drop:+.1f}% relative")
+            elif pub_au is not None:
+                print(f"  vs published  : AUROC reference={pub_au:.3f} (UKB EUR) — no HR comparison possible")
+            if pub.get("source"):
+                print(f"  reference     : {pub['source']}")
+
+        if d.get("loso"):
+            print()
+            print(f"  LOSO refits:")
+            for lo in d["loso"]:
+                if "test_C" in lo:
+                    print(f"    axis={lo['axis']:<14} holdout={lo['holdout']:<30} test_C={lo['test_C']:.4f}")
+                else:
+                    flag = lo.get("skipped", f"groups={lo.get('groups','?')}")
+                    print(f"    axis={lo['axis']:<14} {flag}")
+
+    # --- run-level rollup -----------------------------------------------
+
+    if completed:
+        hd("ROLLUP — completed diseases")
+        print(f"  {'disease':<14}  {'GAM test_C':>10}  {'base test_C':>11}  {'Δ':>8}  "
+              f"{'HR/SD':>7}  {'events':>8}  {'test_n':>8}")
+        for d in completed:
+            print(
+                f"  {d['disease'].title():<14}  "
+                f"{d['gam_test_C']:>10.4f}  {d['base_test_C']:>11.4f}  "
+                f"{d['delta_C']:>+8.4f}  {d.get('base_HR_SD', float('nan')):>7.3f}  "
+                f"{d.get('events', 0):>8,}  {d.get('test_n', d.get('split_n', 0)) :>8,}"
+            )
+        best = max(completed, key=lambda d: d["delta_C"])
+        worst = min(completed, key=lambda d: d["delta_C"])
+        avg_delta = sum(d["delta_C"] for d in completed) / len(completed)
+        print()
+        print(f"  best Δ        : {best['delta_C']:+.4f}  ({best['disease'].title()})")
+        print(f"  worst Δ       : {worst['delta_C']:+.4f}  ({worst['disease'].title()})")
+        print(f"  mean Δ        : {avg_delta:+.4f}  over {len(completed)} diseases")
+
+hr()

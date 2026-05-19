@@ -1,0 +1,305 @@
+# Paste into a notebook cell.  Data hardcoded from the
+# 20260519T175111Z run (gamfit 0.1.72, 3 PCs / 10 centers, 1:1 split).
+# Re-paste with updated dicts below as more diseases finish.
+
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
+
+# --- data -------------------------------------------------------------------
+
+RESULTS = [
+    {
+        "disease": "COPD",
+        "pgs": "PGS004536",
+        "K_crude": 0.0649,
+        "events": 26_583, "censors": 383_174,
+        "train_events": 21_266, "train_censors": 21_266,
+        "test_events": 5_317,  "test_censors": 5_317,
+        "gam_train_C": 0.5997, "gam_test_C": 0.5812,
+        "base_train_C": 0.5535, "base_test_C": 0.5430,
+        "delta_C": +0.0382,
+        "base_HR_SD": 1.1653,
+        "pub_HR_SD": 1.488,
+        "pub_label": "Jung et al. UKB EUR",
+        "predict_dropped": 11,
+        "predict_scored": 42_532,
+    },
+    # HYPERTENSION fit was still running when this was captured (cohort sizes
+    # known, metrics not). Uncomment + fill in once the run finishes.
+    # {
+    #     "disease": "Hypertension",
+    #     "pgs": "PGS001320",
+    #     "K_crude": 0.3308,
+    #     "events": 130_803, "censors": 264_624,
+    #     "train_events": 104_642, "train_censors": 104_642,
+    #     "test_events": 26_161,  "test_censors": 26_161,
+    #     "gam_train_C": ..., "gam_test_C": ...,
+    #     "base_train_C": ..., "base_test_C": ...,
+    #     "delta_C": ...,
+    #     "base_HR_SD": ...,
+    #     "pub_HR_SD": None,
+    #     "pub_label": "Privé 2022 UKB EUR (AUROC=0.629; no HR)",
+    #     "predict_dropped": ..., "predict_scored": ...,
+    # },
+]
+
+# Diseases for which the fit has finished and we have C-indices.
+COMPLETED = [r for r in RESULTS if "gam_test_C" in r and r.get("gam_test_C") is not None]
+
+
+# --- design system ----------------------------------------------------------
+
+C_GAM    = "#4C72B0"
+C_BASE   = "#C44E52"
+C_EVENT  = "#55A868"
+C_CENS   = "#CCB974"
+C_DROP   = "#8172B2"
+C_REF    = "#7F7F7F"
+C_GRID   = "#E5E5E5"
+C_AXIS   = "#3F3F3F"
+
+plt.rcParams.update({
+    "font.family": "DejaVu Sans",
+    "axes.edgecolor": C_AXIS, "axes.labelcolor": C_AXIS,
+    "axes.titlecolor": C_AXIS, "axes.titleweight": "semibold",
+    "axes.titlesize": 14, "axes.labelsize": 11,
+    "axes.spines.top": False, "axes.spines.right": False,
+    "xtick.color": C_AXIS, "ytick.color": C_AXIS,
+    "xtick.labelsize": 10, "ytick.labelsize": 10,
+    "legend.frameon": False, "legend.fontsize": 10,
+    "figure.dpi": 110, "savefig.dpi": 140,
+    "grid.color": C_GRID, "grid.linewidth": 0.8,
+})
+
+
+def value_label(ax, x, y, text, dy=0.005, color=C_AXIS, weight="semibold", **kw):
+    ax.text(x, y + dy, text, ha="center", va="bottom",
+            fontsize=10, color=color, fontweight=weight, **kw)
+
+
+# ============================================================================
+# FIG 1 — Test C-index head-to-head, per disease
+# ============================================================================
+
+fig, ax = plt.subplots(figsize=(max(7, 2 + 1.7 * len(COMPLETED)), 5))
+
+x = np.arange(len(COMPLETED))
+w = 0.36
+
+gam_vals  = [r["gam_test_C"]  for r in COMPLETED]
+base_vals = [r["base_test_C"] for r in COMPLETED]
+
+b1 = ax.bar(x - w/2, gam_vals,  width=w, color=C_GAM,  edgecolor="white", linewidth=1.2, label="Survival GAM")
+b2 = ax.bar(x + w/2, base_vals, width=w, color=C_BASE, edgecolor="white", linewidth=1.2, label="Z_norm2 + Cox PH baseline")
+
+for b in b1: value_label(ax, b.get_x() + b.get_width()/2, b.get_height(), f"{b.get_height():.3f}")
+for b in b2: value_label(ax, b.get_x() + b.get_width()/2, b.get_height(), f"{b.get_height():.3f}")
+
+ax.axhline(0.5, color=C_REF, lw=1.0, ls=":", zorder=0)
+ax.text(len(COMPLETED) - 0.5, 0.5, "  no info (0.5)", color=C_REF, va="center", fontsize=9)
+
+for i, r in enumerate(COMPLETED):
+    delta = r["delta_C"]
+    color = C_GAM if delta >= 0 else C_BASE
+    y_top = max(r["gam_test_C"], r["base_test_C"]) + 0.045
+    ax.annotate(f"Δ = {delta:+.4f}", xy=(i, y_top),
+                ha="center", va="bottom", color=color, fontweight="bold", fontsize=11)
+
+ax.set_xticks(x)
+ax.set_xticklabels([r["disease"] for r in COMPLETED], fontsize=11, fontweight="semibold")
+ax.set_ylabel("Held-out C-index", fontweight="semibold")
+ax.set_ylim(0.45, max(max(gam_vals), max(base_vals)) * 1.08 + 0.06)
+ax.yaxis.grid(True, alpha=0.6); ax.set_axisbelow(True)
+ax.set_title("Survival GAM vs. linear Cox PH baseline  —  held-out C-index", loc="left", pad=14)
+ax.legend(loc="lower right", bbox_to_anchor=(1, -0.18), ncol=2)
+fig.text(0.04, 0.92, "AoU All of Us  |  3 PCs, 10 Duchon centers  |  random 80/20, 1:1 events:censors",
+         color=C_REF, fontsize=10)
+fig.tight_layout()
+plt.show()
+
+
+# ============================================================================
+# FIG 2 — Train vs. test C-index scatter (overfit diagnostic)
+# ============================================================================
+
+fig, ax = plt.subplots(figsize=(6.5, 6))
+
+all_vals = []
+for r in COMPLETED:
+    ax.scatter(r["gam_train_C"], r["gam_test_C"], color=C_GAM,  s=140,
+               edgecolor="white", linewidth=1.5, zorder=3, label="_nolegend_")
+    ax.scatter(r["base_train_C"], r["base_test_C"], color=C_BASE, s=140,
+               edgecolor="white", linewidth=1.5, zorder=3, label="_nolegend_")
+    # arrow from GAM to baseline = "smoothing premium"
+    ax.annotate("", xy=(r["base_train_C"], r["base_test_C"]),
+                xytext=(r["gam_train_C"], r["gam_test_C"]),
+                arrowprops=dict(arrowstyle="->", color=C_REF, lw=1.0,
+                                connectionstyle="arc3,rad=0.15"))
+    ax.annotate(r["disease"],
+                xy=(r["gam_train_C"], r["gam_test_C"]),
+                xytext=(8, 8), textcoords="offset points",
+                color=C_AXIS, fontweight="semibold", fontsize=10)
+    all_vals.extend([r["gam_train_C"], r["gam_test_C"], r["base_train_C"], r["base_test_C"]])
+
+lo, hi = min(all_vals) - 0.02, max(all_vals) + 0.02
+ax.plot([lo, hi], [lo, hi], color=C_REF, ls="--", lw=1.0, zorder=1)
+ax.text(hi - 0.005, hi - 0.012, "y = x  (no overfit)", color=C_REF,
+        fontsize=9, ha="right", va="top")
+ax.set_xlim(lo, hi); ax.set_ylim(lo, hi); ax.set_aspect("equal")
+ax.set_xlabel("Train C-index", fontweight="semibold")
+ax.set_ylabel("Test C-index", fontweight="semibold")
+ax.grid(True, alpha=0.5); ax.set_axisbelow(True)
+ax.set_title("Train-vs-test C: distance below y=x = overfit gap", loc="left", pad=14)
+ax.legend(handles=[
+    Patch(facecolor=C_GAM, label="Survival GAM"),
+    Patch(facecolor=C_BASE, label="Z_norm2 + Cox PH"),
+], loc="lower right")
+fig.tight_layout()
+plt.show()
+
+
+# ============================================================================
+# FIG 3 — AoU baseline HR/SD vs published reference
+# ============================================================================
+
+fig, ax = plt.subplots(figsize=(max(6.5, 2 + 1.6 * len(COMPLETED)), 4.6))
+
+aou_hr = [r.get("base_HR_SD") for r in COMPLETED]
+pub_hr = [r.get("pub_HR_SD")  for r in COMPLETED]
+
+b_aou = ax.bar(x - w/2, [v if v is not None else 0 for v in aou_hr],
+               width=w, color=C_GAM, edgecolor="white", linewidth=1.2, label="AoU (this fit)")
+b_pub = ax.bar(x + w/2, [v if v is not None else 0 for v in pub_hr],
+               width=w, color=C_REF, edgecolor="white", linewidth=1.2, label="Published (UKB EUR)")
+
+for bb, vals in [(b_aou, aou_hr), (b_pub, pub_hr)]:
+    for b, v in zip(bb, vals):
+        if v is None or v == 0:
+            ax.text(b.get_x() + b.get_width()/2, 0.05, "n/a",
+                    ha="center", va="bottom", color=C_REF, fontsize=9)
+            continue
+        ax.text(b.get_x() + b.get_width()/2, v + 0.04, f"{v:.3f}",
+                ha="center", va="bottom", color=C_AXIS, fontweight="semibold", fontsize=10)
+
+# Drop-arrow per disease
+for i, r in enumerate(COMPLETED):
+    if r.get("pub_HR_SD") and r.get("base_HR_SD"):
+        pct = (r["base_HR_SD"] - r["pub_HR_SD"]) / r["pub_HR_SD"] * 100.0
+        ax.annotate(f"{pct:+.1f}%",
+                    xy=(i, max(r["base_HR_SD"], r["pub_HR_SD"]) + 0.18),
+                    ha="center", va="bottom", color=C_BASE,
+                    fontweight="bold", fontsize=11)
+
+ax.axhline(1.0, color=C_REF, lw=1.0, ls=":")
+ax.text(len(COMPLETED) - 0.5, 1.0, "  HR=1 (null)", color=C_REF, va="center", fontsize=9)
+ax.set_xticks(x)
+ax.set_xticklabels([r["disease"] for r in COMPLETED], fontsize=11, fontweight="semibold")
+ax.set_ylabel("Hazard ratio per 1-SD PRS", fontweight="semibold")
+ax.yaxis.grid(True, alpha=0.6); ax.set_axisbelow(True)
+ax.set_title("Linear-PRS effect size:  AoU vs. published UKB EUR", loc="left", pad=14)
+ax.legend(loc="upper right")
+fig.tight_layout()
+plt.show()
+
+
+# ============================================================================
+# FIG 4 — Cohort funnel: total -> kept (1:1) -> train/test events/censors
+# ============================================================================
+
+fig, ax = plt.subplots(figsize=(max(8, 2 + 2.0 * len(COMPLETED)), 5.5))
+
+bw = 0.30
+xs_total = x - bw
+xs_train = x
+xs_test  = x + bw
+
+total_events  = [r["events"]  for r in COMPLETED]
+total_censors = [r["censors"] for r in COMPLETED]
+tr_events     = [r["train_events"]  for r in COMPLETED]
+tr_censors    = [r["train_censors"] for r in COMPLETED]
+te_events     = [r["test_events"]  for r in COMPLETED]
+te_censors    = [r["test_censors"] for r in COMPLETED]
+
+ax.bar(xs_total, total_events,  width=bw, color=C_EVENT, edgecolor="white", linewidth=1.0, label="Events")
+ax.bar(xs_total, total_censors, width=bw, bottom=total_events, color=C_CENS,  edgecolor="white",
+       linewidth=1.0, label="Censors")
+ax.bar(xs_train, tr_events,  width=bw, color=C_EVENT, edgecolor="white", linewidth=1.0)
+ax.bar(xs_train, tr_censors, width=bw, bottom=tr_events, color=C_CENS, edgecolor="white", linewidth=1.0)
+ax.bar(xs_test,  te_events,  width=bw, color=C_EVENT, edgecolor="white", linewidth=1.0)
+ax.bar(xs_test,  te_censors, width=bw, bottom=te_events, color=C_CENS, edgecolor="white", linewidth=1.0)
+
+for i in range(len(COMPLETED)):
+    total = total_events[i] + total_censors[i]
+    train = tr_events[i] + tr_censors[i]
+    test  = te_events[i] + te_censors[i]
+    for xi, val, lbl in [(xs_total[i], total, "cohort"),
+                         (xs_train[i], train, "train"),
+                         (xs_test[i],  test,  "test")]:
+        ax.text(xi, val * 1.01, f"{val:,}", ha="center", va="bottom",
+                color=C_AXIS, fontsize=9, fontweight="semibold")
+        ax.text(xi, -total * 0.03, lbl, ha="center", va="top",
+                color=C_REF, fontsize=9)
+
+ax.set_xticks(x)
+ax.set_xticklabels([r["disease"] for r in COMPLETED], fontsize=12, fontweight="semibold", y=-0.06)
+ax.set_ylabel("Rows", fontweight="semibold")
+ax.yaxis.grid(True, alpha=0.6); ax.set_axisbelow(True)
+ax.set_title("Cohort -> 1:1 balanced -> 80/20 split", loc="left", pad=14)
+ax.legend(handles=[
+    Patch(facecolor=C_EVENT, label="Events (got disease)"),
+    Patch(facecolor=C_CENS,  label="Censors (didn't)"),
+], loc="upper right")
+ax.set_ylim(0, max(t + c for t, c in zip(total_events, total_censors)) * 1.10)
+fig.tight_layout()
+plt.show()
+
+
+# ============================================================================
+# FIG 5 — Detail: train vs test gap (overfit by disease, both models)
+# ============================================================================
+
+fig, ax = plt.subplots(figsize=(max(7, 2 + 1.6 * len(COMPLETED)), 4.6))
+
+gam_gap  = [r["gam_train_C"]  - r["gam_test_C"]  for r in COMPLETED]
+base_gap = [r["base_train_C"] - r["base_test_C"] for r in COMPLETED]
+
+b1 = ax.bar(x - w/2, gam_gap,  width=w, color=C_GAM,  edgecolor="white", linewidth=1.2, label="GAM")
+b2 = ax.bar(x + w/2, base_gap, width=w, color=C_BASE, edgecolor="white", linewidth=1.2, label="Baseline")
+for b in list(b1) + list(b2):
+    ax.text(b.get_x() + b.get_width()/2, b.get_height() + 0.0005,
+            f"{b.get_height():+.4f}",
+            ha="center", va="bottom", color=C_AXIS, fontsize=10, fontweight="semibold")
+
+ax.axhline(0, color=C_AXIS, lw=1.0)
+ax.set_xticks(x)
+ax.set_xticklabels([r["disease"] for r in COMPLETED], fontsize=11, fontweight="semibold")
+ax.set_ylabel("train C − test C  (positive = overfit)", fontweight="semibold")
+ax.yaxis.grid(True, alpha=0.6); ax.set_axisbelow(True)
+ax.set_title("Overfit gap per model", loc="left", pad=14)
+ax.legend(loc="upper right")
+fig.tight_layout()
+plt.show()
+
+
+# --- summary print ----------------------------------------------------------
+
+print()
+print("=" * 76)
+print("SUMMARY")
+print("=" * 76)
+for r in COMPLETED:
+    print(
+        f"  {r['disease']:<14}  PGS={r['pgs']}  K={r['K_crude']:.3f}  "
+        f"n_train={r['train_events']+r['train_censors']:,}  "
+        f"n_test={r['test_events']+r['test_censors']:,}"
+    )
+    print(f"    GAM       test_C = {r['gam_test_C']:.4f}   train_C = {r['gam_train_C']:.4f}")
+    print(f"    baseline  test_C = {r['base_test_C']:.4f}   train_C = {r['base_train_C']:.4f}")
+    print(f"    Δ (test)  = {r['delta_C']:+.4f}")
+    if r.get("pub_HR_SD"):
+        drop = (r["base_HR_SD"] - r["pub_HR_SD"]) / r["pub_HR_SD"] * 100
+        print(f"    HR/SD     AoU={r['base_HR_SD']:.3f}  vs published {r['pub_HR_SD']:.3f}  ({drop:+.1f}%)")
+    if r.get("predict_dropped"):
+        print(f"    predict   dropped {r['predict_dropped']}/{r['predict_scored']} rows  "
+              f"({100*r['predict_dropped']/r['predict_scored']:.2f}%)")
