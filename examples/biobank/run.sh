@@ -88,6 +88,7 @@ uv run \
     --with pyarrow \
     --with scipy \
     --with scikit-learn \
+    --with statsmodels \
     --with lifelines \
     --with tzdata \
     --with pgscatalog.calc \
