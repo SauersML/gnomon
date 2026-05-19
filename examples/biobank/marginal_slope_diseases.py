@@ -567,7 +567,9 @@ def fit_baseline_cox(train_df: pd.DataFrame) -> CoxPHFitter:
 def gam_risk(model, df: pd.DataFrame, num_pcs: int, horizon: float) -> np.ndarray:
     """Per-row scalar risk from a gamfit survival model: cumulative hazard at
     `horizon` evaluated on `df`'s covariates. Higher = greater hazard."""
-    predict_cols = ["sex", "prs_z"] + [f"PC{i+1}" for i in range(num_pcs)]
+    predict_cols = ["entry_age", "exit_age", "sex", "prs_z"] + [
+        f"PC{i+1}" for i in range(num_pcs)
+    ]
     pred = model.predict(df[predict_cols])
     return np.asarray(pred.cumulative_hazard_at([horizon]), dtype=float).reshape(-1)
 
@@ -612,12 +614,32 @@ def evaluate_model_pair(
     """Fit GAM + Z_norm2 Cox baseline and print comparable C-index lines."""
     train, test, pgs_mean, pgs_std = prepare_scores(train, test, pc_cols, pgs_id)
 
-    model = fit_marginal_slope(train, len(pc_cols))
+    fit_path: Path | None = None
+    meta_path: Path | None = None
+    disease: str | None = None
     if save_info is not None:
         FITS_DIR.mkdir(parents=True, exist_ok=True)
         disease = str(save_info["disease"])
         fit_path = FITS_DIR / f"{disease}.gamfit"
         meta_path = FITS_DIR / f"{disease}.meta.json"
+
+    model = None
+    if fit_path is not None and fit_path.exists():
+        try:
+            import gamfit
+            model = gamfit.load(str(fit_path))
+            print(f"  load: model <- {fit_path}")
+        except Exception as e:
+            print(f"  load: gamfit.load failed ({e}); refitting")
+            model = None
+    if model is None:
+        model = fit_marginal_slope(train, len(pc_cols))
+    if (
+        save_info is not None
+        and fit_path is not None
+        and meta_path is not None
+        and not fit_path.exists()
+    ):
         try:
             model.save(str(fit_path))
         except Exception as e:
