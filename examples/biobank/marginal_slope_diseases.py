@@ -450,6 +450,23 @@ def load_genetic_ancestry_labels() -> pd.DataFrame:
 
 # --- model -----------------------------------------------------------------
 
+def survival_model_columns(num_pcs: int) -> list[str]:
+    """Columns the survival marginal-slope fit and its predict path both see.
+
+    Single source of truth: `fit_marginal_slope` selects this subset of the
+    training frame before handing it to `gamfit.fit`, and `gam_risk` selects
+    the same subset before calling `model.predict`. Keeping fit-time and
+    predict-time schemas in one place avoids the class of bug where they
+    drift (e.g., predict missing `entry_age`/`exit_age` after a formula
+    change). `event` is included even at predict time: gamfit's predict
+    requires only that required columns be present, tolerates extras, and
+    both train and test frames already carry `event`.
+    """
+    return ["entry_age", "exit_age", "event", "sex", "prs_z"] + [
+        f"PC{i+1}" for i in range(num_pcs)
+    ]
+
+
 def fit_marginal_slope(train_df: pd.DataFrame, num_pcs: int):  # -> gamfit.Model
     """Survival marginal-slope GAM with joint Duchon over PCs in both the
     baseline hazard surface and the log-slope (log-HR) channel; sex linear;
@@ -457,6 +474,13 @@ def fit_marginal_slope(train_df: pd.DataFrame, num_pcs: int):  # -> gamfit.Model
 
     Age-as-time-scale: `Surv(entry_age, exit_age, event)` is left-truncated at
     each person's age at AoU observation start.
+
+    Re-running this on identical training data is near-instant thanks to
+    gamfit's persistent warm-start cache at `~/.cache/gam/warm/v1/`, which
+    auto-resumes the outer (rho) and inner (beta) iterates from the prior
+    fit. The cache is keyed on (gamfit version, n_rows, n_cols, likelihood,
+    link, y, weights, ...), so the only refits are: first fit on this data,
+    or first fit after a gamfit version bump.
     """
     import gamfit  # lazy: lets the linear baseline import this module without dragging gamfit in
     pcs = ", ".join(f"PC{i+1}" for i in range(num_pcs))
@@ -472,9 +496,7 @@ def fit_marginal_slope(train_df: pd.DataFrame, num_pcs: int):  # -> gamfit.Model
         f"length_scale=1.0, scale_dims=true)"
     )
     formula = f"Surv(entry_age, exit_age, event) ~ {duchon} + sex"
-    cols = ["entry_age", "exit_age", "event", "sex", "prs_z"] + [
-        f"PC{i+1}" for i in range(num_pcs)
-    ]
+    cols = survival_model_columns(num_pcs)
     print(f"  fit_spec: family=survival marginal-slope")
     print(f"  fit_spec: formula={formula!r}")
     print(f"  fit_spec: z_column='prs_z'  logslope_formula={duchon!r}")
@@ -566,11 +588,12 @@ def fit_baseline_cox(train_df: pd.DataFrame) -> CoxPHFitter:
 
 def gam_risk(model, df: pd.DataFrame, num_pcs: int, horizon: float) -> np.ndarray:
     """Per-row scalar risk from a gamfit survival model: cumulative hazard at
-    `horizon` evaluated on `df`'s covariates. Higher = greater hazard."""
-    predict_cols = ["entry_age", "exit_age", "sex", "prs_z"] + [
-        f"PC{i+1}" for i in range(num_pcs)
-    ]
-    pred = model.predict(df[predict_cols])
+    `horizon` evaluated on `df`'s covariates. Higher = greater hazard.
+
+    Uses `survival_model_columns` so the predict-time schema can't drift
+    from the fit-time schema declared in `fit_marginal_slope`.
+    """
+    pred = model.predict(df[survival_model_columns(num_pcs)])
     return np.asarray(pred.cumulative_hazard_at([horizon]), dtype=float).reshape(-1)
 
 
@@ -883,6 +906,19 @@ def main() -> None:
     import gamfit
     print(f"gamfit version: {gamfit.__version__}")
     print(f"gamfit build_info: {gamfit.build_info()}")
+    # The real "did the previous fit survive?" cache is gamfit's persistent
+    # warm-start store, not the .gamfit files in FITS_DIR. It auto-resumes
+    # any fit on identical (data, version) keys; reruns are typically a
+    # handful of PIRLS cycles instead of hundreds. .gamfit files are for
+    # artifact persistence (sharing the fitted model out-of-process) — they
+    # need gamfit >= 0.1.70 to roundtrip survival-marginal-slope correctly
+    # (the 0.1.69 pyffi save path omits survival_time_* metadata).
+    warm_cache_root = Path.home() / ".cache" / "gam" / "warm" / "v1"
+    print(
+        f"warm-start cache: {warm_cache_root} "
+        f"({'present' if warm_cache_root.exists() else 'will be created on first fit'})"
+    )
+    print(f"artifact cache:   {FITS_DIR}")
     diseases = {k: v for k, v in DISEASES.items() if PGS_ID_PATTERN.match(v["pgs"])}
     print(f"diseases with real PGS IDs: {list(diseases)}")
     active_axes = list(LOSO_AXES)
