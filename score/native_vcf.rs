@@ -304,12 +304,10 @@ fn match_rules_for_allele(
 
     aggregate
         .into_iter()
-        .filter_map(|(score_index, (intercept, alt_slope))| {
-            (intercept != 0.0 || alt_slope != 0.0).then_some(MatchedRule {
-                score_index,
-                intercept,
-                alt_slope,
-            })
+        .map(|(score_index, (intercept, alt_slope))| MatchedRule {
+            score_index,
+            intercept,
+            alt_slope,
         })
         .collect()
 }
@@ -662,6 +660,37 @@ mod tests {
         assert_eq!(result.missing_counts, [0, 1]);
         assert_eq!(result.sum_scores, [2.5, 2.0]);
         assert_eq!(result.matched_variants, 2);
+    }
+
+    #[test]
+    fn native_vcf_zero_net_matched_rows_still_count_in_denominator() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vcf_path = dir.path().join("cohort.vcf");
+        let score_path = dir.path().join("score.gnomon.tsv");
+
+        {
+            let mut vcf = File::create(&vcf_path).expect("create vcf");
+            writeln!(vcf, "##fileformat=VCFv4.2").expect("write");
+            writeln!(
+                vcf,
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts1\ts2"
+            )
+            .expect("write");
+            writeln!(vcf, "1\t100\t.\tA\tG\t.\tPASS\t.\tGT\t0/1\t./.").expect("write");
+        }
+
+        {
+            let mut score = File::create(&score_path).expect("create score");
+            writeln!(score, "variant_id\teffect_allele\tother_allele\tScoreA").expect("write");
+            writeln!(score, "1:100\tG\tA\t1.0").expect("write");
+            writeln!(score, "1:100\tG\tA\t-1.0").expect("write");
+        }
+
+        let result = score_vcf_streaming(&vcf_path, &[score_path], None).expect("score");
+        assert_eq!(result.score_variant_counts, [1]);
+        assert_eq!(result.missing_counts, [0, 1]);
+        assert_eq!(result.sum_scores, [0.0, 0.0]);
+        assert_eq!(result.matched_variants, 1);
     }
 
     #[test]
