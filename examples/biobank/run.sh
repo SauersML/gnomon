@@ -203,53 +203,6 @@ failure_diagnostics() {
 
 trap 'failure_diagnostics $?' ERR
 
-# `uv run --with ...` pulls several large wheels, including CUDA runtime
-# packages, and writes temporary files inside the client cache.  AoU home
-# directories can have much less free space than the attached workspace disk,
-# so keep uv, managed Python, XDG caches, and temporary files under
-# RUN_STATE_DIR and fail before the resolver starts if that volume is not
-# large enough.
-require_run_state_capacity \
-  "biobank run state" \
-  "$RUN_STATE_DIR" \
-  "$MIN_RUN_STATE_FREE_GIB" \
-  "$MIN_RUN_STATE_FREE_INODES"
-
-# If RUN_STATE_DIR secretly resolves back to $HOME's filesystem the cache
-# redirect is cosmetic -- a full home volume still ENOSPCs the resolver. Fail
-# loudly here instead of silently re-creating the original bug.
-if same_mount "$HOME" "$RUN_STATE_DIR"; then
-  {
-    echo "[run.sh] FATAL: $RUN_STATE_DIR shares a filesystem with \$HOME"
-    echo "[run.sh] (both on $(mount_of "$HOME")). Cache redirect would not help."
-    echo "[run.sh] Mount a separate workspace disk under $AOU_DISK_ROOT or"
-    echo "[run.sh] point RESULTS_DIR / RUN_STATE_DIR at a larger volume."
-    df -hP "$HOME" "$RUN_STATE_DIR"
-  } | tee -a "$RESULTS" >&2
-  failure_diagnostics 12
-fi
-
-# Reclaim the legacy uv cache once the new location is verified on a different
-# filesystem. This is the directory that filled up in past runs; leaving it
-# behind keeps starving $HOME for unrelated tools and gives a false sense the
-# redirect "worked". Only uv's own cache subtree is touched.
-LEGACY_UV_CACHE="$HOME/.cache/uv"
-if [ -d "$LEGACY_UV_CACHE" ] && ! same_mount "$LEGACY_UV_CACHE" "$UV_CACHE_DIR"; then
-  legacy_size="$(du -sh "$LEGACY_UV_CACHE" 2>/dev/null | awk '{print $1}')"
-  echo "[run.sh] reclaiming legacy uv cache at $LEGACY_UV_CACHE (${legacy_size:-?})" \
-    | tee -a "$RESULTS" >&2
-  rm -rf -- "$LEGACY_UV_CACHE" || true
-fi
-
-# Bound long-term growth of the redirected cache. `uv cache prune` removes
-# entries no environment resolves to; safe every invocation. UV_CACHE_DIR
-# (exported above) is authoritative -- do NOT pass --cache-dir here, since in
-# uv 0.11.x that flag does not reach every code path. Failure here is
-# non-fatal: a transient prune error must not block the real run.
-uv cache prune 2>&1 \
-  | sed 's/^/[run.sh][uv cache prune] /' \
-  | tee -a "$RESULTS" >&2 || true
-
 # --- preamble ---------------------------------------------------------------
 {
   echo "=========================================================================="
@@ -325,7 +278,9 @@ uv cache prune 2>&1 \
 # RUN_STATE_DIR and fail before the resolver starts if that volume is tight.
 {
   echo "--- uv cache maintenance ---"
-  uv cache prune
+  if ! uv cache prune; then
+    echo "[run.sh] warning: uv cache prune failed; continuing to capacity check"
+  fi
   echo
 } 2>&1 | tee -a "$RESULTS"
 
