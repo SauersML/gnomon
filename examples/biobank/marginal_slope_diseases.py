@@ -1092,6 +1092,81 @@ def predict_logit_binary(fit: dict[str, object], X: np.ndarray) -> np.ndarray:
     return np.asarray(result.predict(X_const), dtype=float)
 
 
+def _midrank(x: np.ndarray) -> np.ndarray:
+    """Average-rank tiebreaker (positions 1..n; ties get the mean of their
+    positions). Used by the Sun & Xu 2014 fast-DeLong algorithm.
+    """
+    x = np.asarray(x, dtype=np.float64)
+    n = len(x)
+    order = np.argsort(x, kind="stable")
+    sorted_x = x[order]
+    ranks = np.empty(n, dtype=np.float64)
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and sorted_x[j + 1] == sorted_x[i]:
+            j += 1
+        ranks[i : j + 1] = 0.5 * (i + j) + 1.0
+        i = j + 1
+    out = np.empty(n, dtype=np.float64)
+    out[order] = ranks
+    return out
+
+
+def fast_delong_auc(
+    scores: np.ndarray, y: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Sun & Xu (2014) fast DeLong — O(n log n) AUROC + covariance.
+
+    Returns:
+        aucs:  shape (K,) per-model AUROC.
+        cov:   shape (K, K) covariance matrix of AUROCs across models on
+               the *same* held-out rows. From this:
+                 SE(AUC_k)        = sqrt(cov[k, k])
+                 Var(AUC_k - AUC_j) = cov[k, k] + cov[j, j] - 2*cov[k, j]
+               i.e. paired Δ AUROC CIs come straight from `cov`.
+
+    `scores` may be 1-D (a single model) or 2-D (one row per model). All
+    models must be scored on the same `y`. Ties are handled by mid-rank.
+    """
+    scores = np.asarray(scores, dtype=np.float64)
+    if scores.ndim == 1:
+        scores = scores[None, :]
+    K, n = scores.shape
+    y = np.asarray(y).astype(bool)
+    pos = np.flatnonzero(y)
+    neg = np.flatnonzero(~y)
+    m = int(pos.size)
+    n0 = int(neg.size)
+    if m < 1 or n0 < 1:
+        return np.full(K, float("nan")), np.full((K, K), float("nan"))
+
+    V10 = np.empty((K, m), dtype=np.float64)
+    V01 = np.empty((K, n0), dtype=np.float64)
+    aucs = np.empty(K, dtype=np.float64)
+    for k in range(K):
+        sp = scores[k][pos]
+        sn = scores[k][neg]
+        rx = _midrank(sp)
+        ry = _midrank(sn)
+        rall = _midrank(np.concatenate([sp, sn]))
+        tx = rall[:m]
+        ty = rall[m:]
+        V10[k] = (tx - rx) / n0
+        V01[k] = 1.0 - (ty - ry) / m
+        aucs[k] = V10[k].mean()
+
+    if K == 1:
+        s10 = float(np.var(V10[0], ddof=1)) if m > 1 else 0.0
+        s01 = float(np.var(V01[0], ddof=1)) if n0 > 1 else 0.0
+        cov = np.array([[s10 / m + s01 / n0]], dtype=np.float64)
+    else:
+        S10 = np.cov(V10, ddof=1) if m > 1 else np.zeros((K, K))
+        S01 = np.cov(V01, ddof=1) if n0 > 1 else np.zeros((K, K))
+        cov = S10 / m + S01 / n0
+    return aucs, cov
+
+
 def binary_stats(y: np.ndarray, p: np.ndarray, population_prevalence: float | None) -> BinaryStats:
     from scipy.stats import norm
     from sklearn.metrics import (  # lazy: only needed after binary predictions exist
@@ -1362,7 +1437,20 @@ def survival_library_metrics(
             f"survival matrix shape {survival.shape} does not match "
             f"(n_test={len(test)}, n_times={len(times)})"
         )
-    tau = float(times[-1])
+    # IPCW C-index truncation time: 80th percentile of *observed event* ages
+    # in the held-out set, clipped to the interior of the metric grid.
+    # scikit-survival docs recommend a conservative percentile rather than
+    # max(times) because the IPCW weight 1/G(t) becomes unstable as the
+    # censoring KM hits zero at large ages. We never extrapolate past the
+    # training support, which `_survival_metric_times` already enforces.
+    event_times = test["exit_age"].to_numpy(dtype=np.float64)[
+        test["event"].to_numpy(dtype=bool)
+    ]
+    if event_times.size >= 1:
+        tau_candidate = float(np.quantile(event_times, 0.80))
+    else:
+        tau_candidate = float(times[-1])
+    tau = float(np.clip(tau_candidate, float(times[0]), float(times[-1])))
     c_ipcw = float(concordance_index_ipcw(train_y, test_y, risk, tau=tau)[0])
     c_ipcw_ci_low, c_ipcw_ci_high = bootstrap_ipcw_c_ci(train, test, risk, tau)
     _, mean_auc = cumulative_dynamic_auc(train_y, test_y, risk, times)
@@ -1587,14 +1675,60 @@ def evaluate_binary_model_pair(
         print(f"  binaryA     test {fmt_binary(A_test_m)}")
         print(f"  binaryB     test {fmt_binary(B_test_m)}")
 
+    # Paired DeLong (Sun & Xu 2014) on the same held-out rows: per-model AUROC
+    # SE/CI and paired Δ AUROC SE/CI (GAM minus each baseline). Single pass —
+    # all four models share the AUROC covariance matrix.
+    stack = np.vstack([gam_p_test, p_N_test, p_A_test, p_B_test])
+    aucs, cov = fast_delong_auc(stack, y_test)
+    Z975 = 1.959963984540054
+
+    def _auc_ci(k: int) -> tuple[float, float, float]:
+        se = float(np.sqrt(max(cov[k, k], 0.0)))
+        return se, max(0.0, float(aucs[k]) - Z975 * se), min(1.0, float(aucs[k]) + Z975 * se)
+
+    def _delta_ci(k: int, j: int) -> tuple[float, float, float, float]:
+        d = float(aucs[k] - aucs[j])
+        var = float(cov[k, k] + cov[j, j] - 2.0 * cov[k, j])
+        se = float(np.sqrt(max(var, 0.0)))
+        return d, se, d - Z975 * se, d + Z975 * se
+
+    gam_auc_se, gam_auc_lo, gam_auc_hi = _auc_ci(0)
+    N_auc_se, N_auc_lo, N_auc_hi = _auc_ci(1)
+    A_auc_se, A_auc_lo, A_auc_hi = _auc_ci(2)
+    B_auc_se, B_auc_lo, B_auc_hi = _auc_ci(3)
+    d_GAM_N = _delta_ci(0, 1)
+    d_GAM_A = _delta_ci(0, 2)
+    d_GAM_B = _delta_ci(0, 3)
+    d_A_N = _delta_ci(2, 1)
+    d_B_N = _delta_ci(3, 1)
+
+    print(
+        f"  binary_auroc_ci  GAM=[{gam_auc_lo:.4f},{gam_auc_hi:.4f}]"
+        f" N=[{N_auc_lo:.4f},{N_auc_hi:.4f}]"
+        f" A=[{A_auc_lo:.4f},{A_auc_hi:.4f}]"
+        f" B=[{B_auc_lo:.4f},{B_auc_hi:.4f}]"
+    )
+    print(
+        f"  binary_delta_auroc_ci  GAM-N={d_GAM_N[0]:+.4f}"
+        f" 95%CI=[{d_GAM_N[2]:+.4f},{d_GAM_N[3]:+.4f}] SE={d_GAM_N[1]:.4f}  "
+        f"GAM-A={d_GAM_A[0]:+.4f}"
+        f" 95%CI=[{d_GAM_A[2]:+.4f},{d_GAM_A[3]:+.4f}] SE={d_GAM_A[1]:.4f}  "
+        f"GAM-B={d_GAM_B[0]:+.4f}"
+        f" 95%CI=[{d_GAM_B[2]:+.4f},{d_GAM_B[3]:+.4f}] SE={d_GAM_B[1]:.4f}"
+    )
+    print(
+        f"  binary_prs_lift_ci  A-N={d_A_N[0]:+.4f}"
+        f" 95%CI=[{d_A_N[2]:+.4f},{d_A_N[3]:+.4f}]  "
+        f"B-N={d_B_N[0]:+.4f}"
+        f" 95%CI=[{d_B_N[2]:+.4f},{d_B_N[3]:+.4f}]  "
+        f"(PRS-incremental discrimination over age+sex nuisance)"
+    )
     print(
         "  binary_delta "
-        f"AUROC(GAM-N)={gam_test_m.auroc - N_test_m.auroc:+.4f}  "
-        f"AUROC(GAM-A)={gam_test_m.auroc - A_test_m.auroc:+.4f}  "
-        f"AUROC(GAM-B)={gam_test_m.auroc - B_test_m.auroc:+.4f}  "
         f"logloss(GAM-N)={gam_test_m.log_loss - N_test_m.log_loss:+.4f}  "
         f"Brier(GAM-N)={gam_test_m.brier - N_test_m.brier:+.4f}  "
-        f"Nagelkerke_R2(GAM-N)={gam_test_m.nagelkerke_r2 - N_test_m.nagelkerke_r2:+.4f}"
+        f"Nagelkerke_R2(GAM-N)={gam_test_m.nagelkerke_r2 - N_test_m.nagelkerke_r2:+.4f}  "
+        f"liability_R2(GAM-N)={gam_test_m.liability_r2 - N_test_m.liability_r2:+.4f}"
     )
 
     result: dict[str, float | int | str] = {
@@ -1604,12 +1738,42 @@ def evaluate_binary_model_pair(
         **_binary_fields("binary_nuisance_test", N_test_m),
         **_binary_fields("binary_baselineA_test", A_test_m),
         **_binary_fields("binary_baselineB_test", B_test_m),
-        "binary_delta_auroc_vs_nuisance": gam_test_m.auroc - N_test_m.auroc,
-        "binary_delta_auroc_vs_baselineA": gam_test_m.auroc - A_test_m.auroc,
-        "binary_delta_auroc_vs_baselineB": gam_test_m.auroc - B_test_m.auroc,
+        "binary_gam_test_auroc_se": gam_auc_se,
+        "binary_gam_test_auroc_ci_low": gam_auc_lo,
+        "binary_gam_test_auroc_ci_high": gam_auc_hi,
+        "binary_nuisance_test_auroc_se": N_auc_se,
+        "binary_nuisance_test_auroc_ci_low": N_auc_lo,
+        "binary_nuisance_test_auroc_ci_high": N_auc_hi,
+        "binary_baselineA_test_auroc_se": A_auc_se,
+        "binary_baselineA_test_auroc_ci_low": A_auc_lo,
+        "binary_baselineA_test_auroc_ci_high": A_auc_hi,
+        "binary_baselineB_test_auroc_se": B_auc_se,
+        "binary_baselineB_test_auroc_ci_low": B_auc_lo,
+        "binary_baselineB_test_auroc_ci_high": B_auc_hi,
+        "binary_delta_auroc_vs_nuisance": d_GAM_N[0],
+        "binary_delta_auroc_vs_nuisance_se": d_GAM_N[1],
+        "binary_delta_auroc_vs_nuisance_ci_low": d_GAM_N[2],
+        "binary_delta_auroc_vs_nuisance_ci_high": d_GAM_N[3],
+        "binary_delta_auroc_vs_baselineA": d_GAM_A[0],
+        "binary_delta_auroc_vs_baselineA_se": d_GAM_A[1],
+        "binary_delta_auroc_vs_baselineA_ci_low": d_GAM_A[2],
+        "binary_delta_auroc_vs_baselineA_ci_high": d_GAM_A[3],
+        "binary_delta_auroc_vs_baselineB": d_GAM_B[0],
+        "binary_delta_auroc_vs_baselineB_se": d_GAM_B[1],
+        "binary_delta_auroc_vs_baselineB_ci_low": d_GAM_B[2],
+        "binary_delta_auroc_vs_baselineB_ci_high": d_GAM_B[3],
+        "binary_baselineA_minus_nuisance_auroc": d_A_N[0],
+        "binary_baselineA_minus_nuisance_auroc_se": d_A_N[1],
+        "binary_baselineA_minus_nuisance_auroc_ci_low": d_A_N[2],
+        "binary_baselineA_minus_nuisance_auroc_ci_high": d_A_N[3],
+        "binary_baselineB_minus_nuisance_auroc": d_B_N[0],
+        "binary_baselineB_minus_nuisance_auroc_se": d_B_N[1],
+        "binary_baselineB_minus_nuisance_auroc_ci_low": d_B_N[2],
+        "binary_baselineB_minus_nuisance_auroc_ci_high": d_B_N[3],
         "binary_delta_log_loss_vs_nuisance": gam_test_m.log_loss - N_test_m.log_loss,
         "binary_delta_brier_vs_nuisance": gam_test_m.brier - N_test_m.brier,
         "binary_delta_nagelkerke_vs_nuisance": gam_test_m.nagelkerke_r2 - N_test_m.nagelkerke_r2,
+        "binary_delta_liability_r2_vs_nuisance": gam_test_m.liability_r2 - N_test_m.liability_r2,
     }
     if score_train:
         assert gam_train_m is not None and N_train_m is not None and A_train_m is not None and B_train_m is not None
