@@ -20,18 +20,19 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import struct
 import subprocess
 import sys
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from google.cloud import bigquery
-from lifelines.utils import concordance_index
 
 logging.basicConfig(
     level=logging.INFO,
@@ -163,6 +164,7 @@ LOSO_AXIS_TO_COLUMN = {
 }
 GNOMON_BIN = os.environ.get("GNOMON_BIN", "gnomon")
 PGS_ID_PATTERN = re.compile(r"^PGS\d{6}$")
+NORMAL_975 = 1.959963984540054
 
 # AoU controlled CDR layout (per the "Controlled CDR Directory" doc and "How
 # the All of Us Genomic data are organized"):
@@ -734,6 +736,199 @@ def load_genetic_ancestry_labels() -> pd.DataFrame:
 
 # --- model -----------------------------------------------------------------
 
+@dataclass(frozen=True)
+class CIndexStats:
+    n: int
+    n_events: int
+    median_exit_age: float
+    comparable_pairs: int
+    concordance: float
+    se: float
+    ci_low: float
+    ci_high: float
+    influence: np.ndarray
+
+
+class Fenwick:
+    """Small frequency tree for rank-count queries."""
+
+    def __init__(self, size: int):
+        self.n = int(size)
+        self.tree = np.zeros(self.n + 1, dtype=np.int64)
+
+    def add(self, idx: int, value: int = 1) -> None:
+        i = int(idx) + 1
+        while i <= self.n:
+            self.tree[i] += value
+            i += i & -i
+
+    def prefix(self, idx: int) -> int:
+        if idx < 0:
+            return 0
+        i = min(int(idx) + 1, self.n)
+        out = 0
+        while i > 0:
+            out += int(self.tree[i])
+            i -= i & -i
+        return out
+
+    def total(self) -> int:
+        return self.prefix(self.n - 1)
+
+    def equal(self, idx: int) -> int:
+        return self.prefix(idx) - self.prefix(idx - 1)
+
+    def greater(self, idx: int) -> int:
+        return self.total() - self.prefix(idx)
+
+
+def _add_same_time_contributions(
+    event_ranks: np.ndarray,
+    censor_ranks: np.ndarray,
+    event_pos: np.ndarray,
+    censor_pos: np.ndarray,
+    num_per_row: np.ndarray,
+    den_per_row: np.ndarray,
+    n_ranks: int,
+) -> None:
+    if len(event_pos) == 0 or len(censor_pos) == 0:
+        return
+
+    den_per_row[event_pos] += len(censor_pos)
+    den_per_row[censor_pos] += len(event_pos)
+
+    censor_tree = Fenwick(n_ranks)
+    for rank in censor_ranks:
+        censor_tree.add(int(rank))
+    for pos, rank in zip(event_pos, event_ranks):
+        r = int(rank)
+        num_per_row[pos] += censor_tree.prefix(r - 1) + 0.5 * censor_tree.equal(r)
+
+    event_tree = Fenwick(n_ranks)
+    for rank in event_ranks:
+        event_tree.add(int(rank))
+    for pos, rank in zip(censor_pos, censor_ranks):
+        r = int(rank)
+        num_per_row[pos] += event_tree.greater(r) + 0.5 * event_tree.equal(r)
+
+
+def harrell_c_stats(exit_: np.ndarray, event: np.ndarray, risk: np.ndarray) -> CIndexStats:
+    """Harrell's C plus a paired-ready IJ influence vector.
+
+    Comparable pairs follow the same convention used for survival C-indexes:
+    an event at an earlier time is comparable with every later row, and an
+    event tied in time is comparable with censored rows at that time. Higher
+    `risk` must rank before the event row's comparator.
+    """
+    exit_ = np.asarray(exit_, dtype=np.float64)
+    event = np.asarray(event, dtype=bool)
+    risk = np.asarray(risk, dtype=np.float64)
+    finite = np.isfinite(exit_) & np.isfinite(risk)
+    exit_ = exit_[finite]
+    event = event[finite]
+    risk = risk[finite]
+    n = int(len(exit_))
+    if n < 2:
+        raise ValueError("C-index needs at least two finite rows")
+
+    order = np.lexsort((~event, exit_))
+    times = exit_[order]
+    events = event[order]
+    ranks = np.searchsorted(np.unique(risk), risk, side="left").astype(np.int64)
+    sorted_ranks = ranks[order]
+    n_ranks = int(ranks.max()) + 1
+
+    num_per_sorted = np.zeros(n, dtype=np.float64)
+    den_per_sorted = np.zeros(n, dtype=np.float64)
+    past_events = Fenwick(n_ranks)
+
+    start = 0
+    while start < n:
+        end = start + 1
+        while end < n and times[end] == times[start]:
+            end += 1
+
+        group_pos = np.arange(start, end)
+        group_ranks = sorted_ranks[start:end]
+
+        past_n = past_events.total()
+        if past_n:
+            den_per_sorted[start:end] += past_n
+            for pos, rank in zip(group_pos, group_ranks):
+                r = int(rank)
+                num_per_sorted[pos] += past_events.greater(r) + 0.5 * past_events.equal(r)
+
+        event_mask = events[start:end]
+        event_pos = group_pos[event_mask]
+        censor_pos = group_pos[~event_mask]
+        _add_same_time_contributions(
+            group_ranks[event_mask],
+            group_ranks[~event_mask],
+            event_pos,
+            censor_pos,
+            num_per_sorted,
+            den_per_sorted,
+            n_ranks,
+        )
+
+        for rank in group_ranks[event_mask]:
+            past_events.add(int(rank))
+        start = end
+
+    comparable_pairs = int(round(den_per_sorted.sum() / 2.0))
+    if comparable_pairs == 0:
+        raise ValueError("no comparable pairs for C-index")
+    numerator = float(num_per_sorted.sum() / 2.0)
+    concordance = numerator / comparable_pairs
+
+    residual = num_per_sorted - concordance * den_per_sorted
+    influence_sorted = n * residual / comparable_pairs
+    se = float(math.sqrt(np.sum(influence_sorted**2) / (n * max(n - 1, 1))))
+    ci_low = max(0.0, concordance - NORMAL_975 * se)
+    ci_high = min(1.0, concordance + NORMAL_975 * se)
+
+    influence = np.empty(n, dtype=np.float64)
+    influence[order] = influence_sorted
+    return CIndexStats(
+        n=n,
+        n_events=int(event.sum()),
+        median_exit_age=float(np.median(exit_)),
+        comparable_pairs=comparable_pairs,
+        concordance=float(concordance),
+        se=se,
+        ci_low=float(ci_low),
+        ci_high=float(ci_high),
+        influence=influence,
+    )
+
+
+def paired_delta_ci(left: CIndexStats, right: CIndexStats) -> tuple[float, float, float, float]:
+    if left.n != right.n:
+        raise ValueError(f"paired delta needs aligned rows; got {left.n} and {right.n}")
+    delta = left.concordance - right.concordance
+    infl = left.influence - right.influence
+    n = left.n
+    se = float(math.sqrt(np.sum(infl**2) / (n * max(n - 1, 1))))
+    return (
+        float(delta),
+        se,
+        float(delta - NORMAL_975 * se),
+        float(delta + NORMAL_975 * se),
+    )
+
+
+def fmt_c(stats: CIndexStats) -> str:
+    return (
+        f"{stats.concordance:.4f} "
+        f"95%CI=[{stats.ci_low:.4f},{stats.ci_high:.4f}] "
+        f"SE={stats.se:.4f}"
+    )
+
+
+def fmt_delta(delta_ci: tuple[float, float, float, float]) -> str:
+    delta, se, lo, hi = delta_ci
+    return f"{delta:+.4f} 95%CI=[{lo:+.4f},{hi:+.4f}] SE={se:.4f}"
+
 def survival_model_columns(num_pcs: int) -> list[str]:
     """Columns the survival marginal-slope fit and its predict path both see.
 
@@ -806,17 +1001,12 @@ def fit_marginal_slope(train_df: pd.DataFrame, num_pcs: int):  # -> gamfit.Model
     )
 
 
-def metrics(exit_: np.ndarray, event: np.ndarray, risk: np.ndarray) -> dict[str, float]:
+def metrics(exit_: np.ndarray, event: np.ndarray, risk: np.ndarray) -> CIndexStats:
     """Harrell's C on a (exit, event, risk) triple.
 
     `risk` is a per-row scalar where higher means greater predicted hazard.
     """
-    return {
-        "n": int(len(event)),
-        "n_events": int(event.sum()),
-        "median_exit_age": float(np.median(exit_)),
-        "concordance": float(concordance_index(exit_, -risk, event)),
-    }
+    return harrell_c_stats(exit_, event, risk)
 
 
 def z_norm2(
@@ -1119,63 +1309,86 @@ def evaluate_model_pair(
         beta = np.array([coefs[n] for n in names])
         return np.exp(X @ beta)
 
-    A_test_m = metrics(test["exit_age"].to_numpy(), test["event"].to_numpy(),
-                        _risk(X_A_te, A_names, A_coefs))
-    B_test_m = metrics(test["exit_age"].to_numpy(), test["event"].to_numpy(),
-                        _risk(X_B_te, B_names, B_coefs))
+    test_exit = test["exit_age"].to_numpy()[kept_test]
+    test_event = test["event"].to_numpy()[kept_test]
+    A_test_m = metrics(test_exit, test_event, _risk(X_A_te[kept_test], A_names, A_coefs))
+    B_test_m = metrics(test_exit, test_event, _risk(X_B_te[kept_test], B_names, B_coefs))
     A_train_m = B_train_m = None
     if score_train:
-        A_train_m = metrics(train["exit_age"].to_numpy(),
-                             train["event"].to_numpy(),
-                             _risk(X_A_tr, A_names, A_coefs))
-        B_train_m = metrics(train["exit_age"].to_numpy(),
-                             train["event"].to_numpy(),
-                             _risk(X_B_tr, B_names, B_coefs))
+        A_train_m = metrics(
+            train["exit_age"].to_numpy()[kept_train],
+            train["event"].to_numpy()[kept_train],
+            _risk(X_A_tr[kept_train], A_names, A_coefs),
+        )
+        B_train_m = metrics(
+            train["exit_age"].to_numpy()[kept_train],
+            train["event"].to_numpy()[kept_train],
+            _risk(X_B_tr[kept_train], B_names, B_coefs),
+        )
 
-    # Keep legacy aliases so the downstream return dict and run-summary
-    # parsers keep working without churn.
-    base_test_m = A_test_m
-    base_train_m = A_train_m
+    delta_A_ci = paired_delta_ci(gam_test_m, A_test_m)
+    delta_B_ci = paired_delta_ci(gam_test_m, B_test_m)
 
     print(
-        f"  {label}  train_n={len(train):,}  test_n={gam_test_m['n']:,}  "
-        f"test_events={gam_test_m['n_events']:,}  "
-        f"median_exit_age={gam_test_m['median_exit_age']:.2f}  horizon={t_horizon:.2f}"
+        f"  {label}  train_n={len(train):,}  test_n={gam_test_m.n:,}  "
+        f"test_events={gam_test_m.n_events:,}  "
+        f"test_pairs={gam_test_m.comparable_pairs:,}  "
+        f"median_exit_age={gam_test_m.median_exit_age:.2f}  horizon={t_horizon:.2f}"
     )
     if score_train:
         assert gam_train_m is not None and A_train_m is not None and B_train_m is not None
-        print(f"  GAM        train_C={gam_train_m['concordance']:.4f}  "
-              f"test_C={gam_test_m['concordance']:.4f}")
-        print(f"  baselineA  train_C={A_train_m['concordance']:.4f}  "
-              f"test_C={A_test_m['concordance']:.4f}")
-        print(f"  baselineB  train_C={B_train_m['concordance']:.4f}  "
-              f"test_C={B_test_m['concordance']:.4f}")
+        print(f"  GAM        train_C={fmt_c(gam_train_m)}  test_C={fmt_c(gam_test_m)}")
+        print(f"  baselineA  train_C={fmt_c(A_train_m)}  test_C={fmt_c(A_test_m)}")
+        print(f"  baselineB  train_C={fmt_c(B_train_m)}  test_C={fmt_c(B_test_m)}")
     else:
-        print(f"  GAM        test_C={gam_test_m['concordance']:.4f}")
-        print(f"  baselineA  test_C={A_test_m['concordance']:.4f}")
-        print(f"  baselineB  test_C={B_test_m['concordance']:.4f}")
-    delta_A = gam_test_m["concordance"] - A_test_m["concordance"]
-    delta_B = gam_test_m["concordance"] - B_test_m["concordance"]
-    print(f"  delta      test_C(GAM-baselineA Z_norm2)={delta_A:+.4f}  "
-          f"(GAM-baselineB linear-PCs)={delta_B:+.4f}")
-    # Keep legacy single-baseline `delta` line so the snapshot parser still
-    # captures the headline number; treat baselineA as the canonical reference.
-    print(f"  delta     test_C(GAM - baseline)={delta_A:+.4f}")
+        print(f"  GAM        test_C={fmt_c(gam_test_m)}")
+        print(f"  baselineA  test_C={fmt_c(A_test_m)}")
+        print(f"  baselineB  test_C={fmt_c(B_test_m)}")
+    print(f"  delta      test_C(GAM-baselineA Z_norm2)={fmt_delta(delta_A_ci)}  "
+          f"(GAM-baselineB linear-PCs)={fmt_delta(delta_B_ci)}")
+
+    def _stats_fields(prefix: str, stats: CIndexStats) -> dict[str, float | int]:
+        return {
+            f"{prefix}_c": stats.concordance,
+            f"{prefix}_c_se": stats.se,
+            f"{prefix}_c_ci_low": stats.ci_low,
+            f"{prefix}_c_ci_high": stats.ci_high,
+            f"{prefix}_n": stats.n,
+            f"{prefix}_events": stats.n_events,
+            f"{prefix}_pairs": stats.comparable_pairs,
+        }
+
+    result: dict[str, float | int | str] = {
+        "label": label,
+        "pgs": pgs_id,
+        **_stats_fields("gam_test", gam_test_m),
+        **_stats_fields("baselineA_test", A_test_m),
+        **_stats_fields("baselineB_test", B_test_m),
+        "delta_test_c_vs_baselineA": delta_A_ci[0],
+        "delta_test_c_vs_baselineA_se": delta_A_ci[1],
+        "delta_test_c_vs_baselineA_ci_low": delta_A_ci[2],
+        "delta_test_c_vs_baselineA_ci_high": delta_A_ci[3],
+        "delta_test_c_vs_baselineB": delta_B_ci[0],
+        "delta_test_c_vs_baselineB_se": delta_B_ci[1],
+        "delta_test_c_vs_baselineB_ci_low": delta_B_ci[2],
+        "delta_test_c_vs_baselineB_ci_high": delta_B_ci[3],
+    }
+    if score_train:
+        assert gam_train_m is not None and A_train_m is not None and B_train_m is not None
+        result.update(_stats_fields("gam_train", gam_train_m))
+        result.update(_stats_fields("baselineA_train", A_train_m))
+        result.update(_stats_fields("baselineB_train", B_train_m))
+    else:
+        result.update({
+            "gam_train_c": float("nan"),
+            "baselineA_train_c": float("nan"),
+            "baselineB_train_c": float("nan"),
+        })
+    print("  RESULT " + json.dumps(result, sort_keys=True))
     return {
-        "gam_train_c": (
-            float("nan") if gam_train_m is None else gam_train_m["concordance"]
-        ),
-        "gam_test_c": gam_test_m["concordance"],
-        "baseline_train_c": (
-            float("nan") if base_train_m is None else base_train_m["concordance"]
-        ),
-        "baseline_test_c": A_test_m["concordance"],
-        "baselineB_train_c": (
-            float("nan") if B_train_m is None else B_train_m["concordance"]
-        ),
-        "baselineB_test_c": B_test_m["concordance"],
-        "delta_test_c": delta_A,
-        "delta_test_c_vs_baselineB": delta_B,
+        k: float(v)
+        for k, v in result.items()
+        if isinstance(v, (int, float)) and not isinstance(v, bool)
     }
 
 
