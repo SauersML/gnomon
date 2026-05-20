@@ -43,9 +43,9 @@ use gnomon::terms::infer_sex_to_tsv;
 use ndarray::{Array1, ArrayView1};
 #[cfg(feature = "calibrate")]
 use std::collections::HashSet;
+use std::env;
 #[cfg(any(feature = "score", feature = "map", feature = "terms"))]
 use std::path::PathBuf;
-use std::env;
 #[cfg(not(unix))]
 use std::process;
 

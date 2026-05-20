@@ -257,9 +257,9 @@ fi
 # --- 2. Find Latest Published Binary Release ---
 log_header "Checking Published Binary Releases"
 
-# When bootstrapped from main, try the release built for that exact commit first.
-# If that release is not published yet, fall back to GitHub's latest release.
-# Only scan older releases when the latest release is not a main-* binary release.
+# When a caller supplies GNOMON_INSTALL_MAIN_SHA, install exactly that
+# commit-addressed release. Silently substituting another main-* release
+# reintroduces fixed bugs under the freshly pulled source tree.
 if [ -n "${GNOMON_INSTALL_MAIN_SHA:-}" ]; then
     RELEASE_TAG="main-${GNOMON_INSTALL_MAIN_SHA}"
     RELEASE_API_URL="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/tags/${RELEASE_TAG}?_=$(date +%s)"
@@ -315,11 +315,10 @@ resolve_release_response
 select_download_url || true
 
 if [ -z "$DOWNLOAD_URL" ] && [ -n "${GNOMON_INSTALL_MAIN_SHA:-}" ]; then
-    log_info "Exact commit release did not provide a compatible asset; trying latest published release."
-    RELEASE_TAG=""
-    RELEASE_API_URL="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest?_=$(date +%s)"
-    resolve_release_response
-    select_download_url || true
+    log_error "Release ${RELEASE_TAG} did not provide a compatible asset."
+    log_error "Expected one of: ${ASSET_CANDIDATES[*]}"
+    log_error "Refusing to install a different release for explicit GNOMON_INSTALL_MAIN_SHA."
+    exit 1
 fi
 
 if [ -z "$DOWNLOAD_URL" ]; then

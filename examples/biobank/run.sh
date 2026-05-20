@@ -41,15 +41,23 @@ if [ -z "${GNOMON_RUN_REEXEC:-}" ] && git -C "$SCRIPT_DIR" rev-parse --git-dir >
   fi
 fi
 
-# Refresh the gnomon binary by downloading a published release.
-# install.sh resolves GNOMON_INSTALL_MAIN_SHA against the exact release
-# tag and falls back to the latest published release if that tag is
-# missing.
-if [ -d "$HOME/gnomon/.git" ]; then
-  export GNOMON_INSTALL_MAIN_SHA="$(git -C "$HOME/gnomon" rev-parse HEAD 2>/dev/null || true)"
-  echo "[run.sh] GNOMON_INSTALL_MAIN_SHA=$GNOMON_INSTALL_MAIN_SHA" >&2
+# Build the scorer from the just-pulled checkout. This validation run is
+# source-coupled: installing an older published release would silently re-run
+# the CUDA teardown bug that the current checkout may already have fixed.
+if [ ! -d "$HOME/gnomon/.git" ]; then
+  echo "[run.sh] expected a git checkout at $HOME/gnomon" >&2
+  exit 1
 fi
-bash "$HOME/gnomon/install.sh"
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "[run.sh] cargo is required so gnomon can be built from the checked-out source" >&2
+  exit 1
+fi
+GNOMON_HEAD_SHA="$(git -C "$HOME/gnomon" rev-parse HEAD)"
+echo "[run.sh] cargo install --path $HOME/gnomon --bin gnomon --root $HOME/.local (HEAD $GNOMON_HEAD_SHA)" >&2
+cargo install --path "$HOME/gnomon" --bin gnomon --locked --force --root "$HOME/.local" >&2
+mkdir -p "$HOME/.local/share/gnomon"
+printf '%s\n' "$GNOMON_HEAD_SHA" > "$HOME/.local/share/gnomon/installed-sha"
+hash -r
 AOU_DISK_ROOT="$HOME/aou-gpu-baremetal"
 RESULTS_DIR="$AOU_DISK_ROOT/biobank_results"
 RUN_STATE_DIR="$AOU_DISK_ROOT/gnomon_runtime/biobank"
