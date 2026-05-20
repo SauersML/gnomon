@@ -439,7 +439,6 @@ def ensure_scored(pgs_ids: list[str]) -> None:
     # there.
     for pgs_id in missing:
         print(f"[score] running {GNOMON_BIN} score {pgs_id} {PLINK_PREFIX}")
-        print(f"[score] cuda libs: {nv_libs}")
         result = subprocess.run(
             [GNOMON_BIN, "score", pgs_id, str(PLINK_PREFIX)], check=False, env=env,
         )
