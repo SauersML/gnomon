@@ -23,7 +23,7 @@ use std::process;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // --- Pipeline Tuning Parameters ---
 
@@ -64,6 +64,37 @@ fn create_progress_bar(len: u64, message: &str) -> ProgressBar {
     pb.set_message(message.to_string());
 
     pb
+}
+
+/// Emit periodic plain-text progress lines to stderr when stderr isn't
+/// a TTY (the subprocess case: callers pipe gnomon's output and don't
+/// see the indicatif bar). Returns whether a line was actually printed,
+/// so the caller can update its bookkeeping.
+fn maybe_emit_text_progress(
+    processed: u64,
+    total: u64,
+    last_print: &mut Instant,
+    last_pct: &mut u64,
+    interval: Duration,
+    pct_step: u64,
+) -> bool {
+    let pct = if total == 0 {
+        100
+    } else {
+        processed.saturating_mul(100) / total
+    };
+    let now = Instant::now();
+    let due_by_time = now.duration_since(*last_print) >= interval;
+    let due_by_pct = pct >= last_pct.saturating_add(pct_step);
+    if !(due_by_time || due_by_pct) {
+        return false;
+    }
+    eprintln!(
+        "> Progress: {processed}/{total} variants ({pct}%)"
+    );
+    *last_print = now;
+    *last_pct = pct;
+    true
 }
 
 // ========================================================================================
@@ -292,16 +323,41 @@ fn run_single_file_pipeline(
             let updater_thread_count = Arc::clone(&variants_processed_count);
             let updater_pb = pb.clone();
             let total_variants = variants_to_process;
+            let stderr_is_tty = std::io::stderr().is_terminal();
             s.spawn(move || {
+                // When stderr is a TTY, the indicatif bar handles user-facing
+                // progress. When it isn't (e.g. gnomon is run as a subprocess
+                // and stderr is a pipe), the bar's draw target is hidden, so
+                // emit periodic plain-text lines instead — otherwise the
+                // caller sees "> Decision Engine Strategy: ..." and then
+                // silence for the whole run.
+                let mut last_text_print = Instant::now();
+                let mut last_text_pct: u64 = 0;
+                if !stderr_is_tty {
+                    eprintln!("> Progress: 0/{total_variants} variants (0%)");
+                }
                 // This loop terminates when the number of processed items reaches the
                 // total, ensuring this thread finishes before the scope ends
                 while updater_thread_count.load(Ordering::Relaxed) < total_variants {
                     let processed = updater_thread_count.load(Ordering::Relaxed);
                     updater_pb.set_position(processed);
+                    if !stderr_is_tty {
+                        maybe_emit_text_progress(
+                            processed,
+                            total_variants,
+                            &mut last_text_print,
+                            &mut last_text_pct,
+                            Duration::from_secs(5),
+                            5,
+                        );
+                    }
                     thread::sleep(Duration::from_millis(200));
                 }
                 // Perform one final update to ensure the bar shows 100% completion.
                 updater_pb.set_position(updater_thread_count.load(Ordering::Relaxed));
+                if !stderr_is_tty {
+                    eprintln!("> Progress: {total_variants}/{total_variants} variants (100%)");
+                }
             });
 
             let mut local_spool_state = spool_state.take();
@@ -606,16 +662,37 @@ fn run_multi_file_pipeline(
             let updater_thread_count = Arc::clone(&variants_processed_count);
             let updater_pb = pb.clone();
             let total_variants = variants_to_process;
+            let stderr_is_tty = std::io::stderr().is_terminal();
             s.spawn(move || {
+                // See first updater thread: emit plain-text progress when
+                // stderr isn't a TTY so subprocess callers see something.
+                let mut last_text_print = Instant::now();
+                let mut last_text_pct: u64 = 0;
+                if !stderr_is_tty {
+                    eprintln!("> Progress: 0/{total_variants} variants (0%)");
+                }
                 // This loop terminates when the number of processed items reaches the
                 // total, ensuring this thread finishes before the scope ends
                 while updater_thread_count.load(Ordering::Relaxed) < total_variants {
                     let processed = updater_thread_count.load(Ordering::Relaxed);
                     updater_pb.set_position(processed);
+                    if !stderr_is_tty {
+                        maybe_emit_text_progress(
+                            processed,
+                            total_variants,
+                            &mut last_text_print,
+                            &mut last_text_pct,
+                            Duration::from_secs(5),
+                            5,
+                        );
+                    }
                     thread::sleep(Duration::from_millis(200));
                 }
                 // Perform one final update to ensure the bar shows 100% completion.
                 updater_pb.set_position(updater_thread_count.load(Ordering::Relaxed));
+                if !stderr_is_tty {
+                    eprintln!("> Progress: {total_variants}/{total_variants} variants (100%)");
+                }
             });
 
             let mut local_spool_state = spool_state.take();
