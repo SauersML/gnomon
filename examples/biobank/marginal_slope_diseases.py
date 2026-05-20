@@ -1513,7 +1513,7 @@ def run_loso_axis(
             label=f"LOSO[{axis_name}] holdout={group_short!r}",
             score_train=score_train,
         )
-        deltas.append(result["delta_test_c"])
+        deltas.append(result["delta_test_c_vs_baselineA"])
 
     print(
         f"  LOSO summary axis={axis_name} folds={len(deltas)}  "
