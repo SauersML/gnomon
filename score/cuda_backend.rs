@@ -848,23 +848,27 @@ fn run_cuda_pipeline(
     let mut spool_state = local_spool;
     support_guard.mark_completed();
 
-    // Tear down all CUDA resources here, while the heap is still in a known-good
-    // state and before we run the CPU-only complex variant resolver. Doing this
-    // explicitly (rather than at function return) keeps any cudarc/CUDA driver
-    // teardown side-effects strictly contained to the GPU phase: if anything in
-    // PinnedHostSlice / CudaSlice / CudaBlas drop misbehaves, it cannot corrupt
-    // the heap used by the parallel complex resolver or the final score writer.
-    drop(runtime.take());
-
-    // Finalise the GPU-phase progress bar and join its background log thread
-    // before the CPU-only complex resolver starts. Otherwise the fallback log
-    // thread keeps running through resolve_complex_variants, racing with the
-    // resolver's own progress bar and the "Complex variant resolution complete."
-    // eprintln on stderr, and only gets joined when run_cuda_pipeline returns —
-    // observed to interleave with cudarc/cuBLAS/libcudart at-exit teardown and
-    // surface as a glibc "double free or corruption (!prev)" abort just after
-    // the resolver finishes.
+    // ORDER MATTERS. Drop the progress-support guard *before* the CUDA runtime.
+    //
+    // `mark_completed` only sets a bool consulted at Drop time; the
+    // `fallback_log_handle` thread (start_pipeline_support, ~line 1008) does
+    // not observe it. That thread sits in a 2-second sleep loop and calls
+    // `eprintln!("> CUDA progress: ... ")` — which takes glibc stdio locks
+    // and allocates — until `progress_done` flips inside
+    // `finish_pipeline_support`, which only runs from `PipelineSupportGuard`'s
+    // Drop. If we drop `runtime` first, cudarc + cuBLAS + libcudart teardown
+    // (which itself goes through glibc malloc/free) races against the still-
+    // live log thread on the same heap, and glibc aborts with
+    // "double free or corruption (!prev)" — observed exactly between the last
+    // CUDA progress line and the complex-variant resolver banner.
+    //
+    // Dropping `support_guard` first joins both progress threads, after which
+    // the heap is quiescent and cudarc teardown runs without a concurrent
+    // writer. The earlier intent — tear CUDA down before the complex-variant
+    // resolver — is preserved: both drops still complete before the resolver
+    // starts a few lines below.
     drop(support_guard);
+    drop(runtime.take());
 
     if !prep_result.complex_rules.is_empty() {
         if should_spool {
