@@ -212,6 +212,40 @@ def test_read_sscore_empty_file_raises(tmp_path):
         read_sscore(p)
 
 
+def test_score_table_indexable_by_iid(tmp_path):
+    """ScoreTable supports `iid in t`, `t[iid]`, and `score_for`."""
+    p = tmp_path / "out.sscore"
+    _write_sscore(
+        p,
+        ["#FID", "IID", "PGS001_AVG", "PGS001_SUM", "PGS002_AVG", "PGS002_SUM"],
+        [
+            ["F", "S1", "0.10", "5.0", "0.20", "10.0"],
+            ["F", "S2", "0.15", "7.5", "0.25", "12.5"],
+        ],
+    )
+    t = read_sscore(p)
+    assert "S1" in t and "S2" in t and "S3" not in t
+    assert t.index_of("S2") == 1
+    assert t["S1"]["PGS001"]["avg"] == 0.10
+    assert t["S1"]["PGS002"]["sum"] == 10.0
+    assert t.score_for("S2", "PGS001") == 0.15
+    assert t.score_for("S2", "PGS002", kind="sum") == 12.5
+    with pytest.raises(KeyError):
+        t["nope"]
+    with pytest.raises(KeyError):
+        t.score_for("S1", "PGS999")
+    with pytest.raises(ValueError):
+        t.score_for("S1", "PGS001", kind="garbage")
+
+
+def test_score_table_missing_column_kind_raises(tmp_path):
+    p = tmp_path / "out.sscore"
+    _write_sscore(p, ["#FID", "IID", "PGS001_AVG"], [["F", "S1", "1.5"]])
+    t = read_sscore(p)
+    with pytest.raises(KeyError, match="'sum'"):
+        t.score_for("S1", "PGS001", kind="sum")
+
+
 def test_read_sscore_missing_iid_raises(tmp_path):
     p = tmp_path / "bad.sscore"
     p.write_text("#FID\tSAMPLE\tSCORE_AVG\nF\tS\t1.0\n")

@@ -151,6 +151,61 @@ class ScoreTable:
                 cols[f"{name}_{suffix}"] = [row[i] for row in matrix]
         return pd.DataFrame(cols)
 
+    # -- ergonomic accessors --------------------------------------------------
+
+    def index_of(self, iid: str) -> int:
+        """Return the row index for ``iid``. Raises KeyError if not present."""
+        try:
+            return self.iids.index(iid)
+        except ValueError as e:
+            raise KeyError(iid) from e
+
+    def __contains__(self, iid: object) -> bool:
+        return isinstance(iid, str) and iid in self.iids
+
+    def __getitem__(self, iid: str) -> Dict[str, Dict[str, Optional[float]]]:
+        """Look up one sample by IID.
+
+        Returns a dict shaped::
+
+            {score_name: {"avg": float | None, "sum": float | None, "denom": float | None}}
+
+        Each sub-value is ``None`` if the corresponding column was missing
+        from the .sscore file.
+        """
+        idx = self.index_of(iid)
+        out: Dict[str, Dict[str, Optional[float]]] = {}
+        for i, name in enumerate(self.score_names):
+            out[name] = {
+                "avg": self.avg[idx][i] if self.avg is not None else None,
+                "sum": self.sum[idx][i] if self.sum is not None else None,
+                "denom": self.denom[idx][i] if self.denom is not None else None,
+            }
+        return out
+
+    def score_for(self, iid: str, score_name: str, *, kind: str = "avg") -> float:
+        """Return one cell. ``kind`` is ``'avg'``, ``'sum'``, or ``'denom'``."""
+        kind = kind.lower()
+        matrix_map = {"avg": self.avg, "sum": self.sum, "denom": self.denom}
+        if kind not in matrix_map:
+            raise ValueError(f"kind must be 'avg', 'sum', or 'denom', got {kind!r}")
+        matrix = matrix_map[kind]
+        if matrix is None:
+            raise KeyError(
+                f"{kind!r} column not present in this .sscore file "
+                f"(file had columns: {self._available_kinds()})"
+            )
+        try:
+            col = self.score_names.index(score_name)
+        except ValueError as e:
+            raise KeyError(score_name) from e
+        return matrix[self.index_of(iid)][col]
+
+    def _available_kinds(self) -> Tuple[str, ...]:
+        return tuple(
+            k for k, v in (("avg", self.avg), ("sum", self.sum), ("denom", self.denom)) if v is not None
+        )
+
 
 def read_sscore(path: PathLike) -> ScoreTable:
     """Parse a ``.sscore`` file produced by ``gnomon score``."""
@@ -469,12 +524,40 @@ def score(
 ) -> ScoreResult:
     """Run ``gnomon score``.
 
-    ``score`` is either:
-      * A comma-separated list of PGS Catalog IDs: ``"PGS004536,PGS001320"``.
-      * A list/tuple of PGS IDs: ``["PGS004536", "PGS001320"]``.
-      * A path to a single score file or directory of score files.
+    Parameters
+    ----------
+    score : str | path | list of str
+        Either:
+          * A comma-separated list of PGS Catalog IDs (``"PGS004536,PGS001320"``).
+          * A list/tuple of PGS IDs (``["PGS004536", "PGS001320"]``).
+          * A path to a single score file or a directory of score files.
+    input_path : path-like
+        Genotype source — PLINK prefix, .vcf/.vcf.gz, .bcf, or DTC text.
+    keep, reference, build, panel, inferred_sex
+        Pre-supply these to skip the corresponding inference / download
+        steps inside the binary.
+    output_path : path-like, optional
+        Override where *the wrapper* looks for the output ``.sscore``.
+        The Rust binary always derives its own output path from the
+        SCORE + GENOTYPE positionals (see ``_expected_sscore_path``), so
+        this argument is purely a search hint — useful in tests or when
+        the path computation in this wrapper drifts from the CLI's. To
+        actually relocate gnomon's output, pre-stage the genotype prefix
+        in the destination directory instead.
+    extra_args
+        Forwarded verbatim to the CLI after the recognised flags.
+    timeout, env, cwd
+        Standard subprocess controls.
+    read_output : bool, default True
+        Parse the ``.sscore`` into a ``ScoreTable``. Set to False to
+        skip the parse — handy when scores are huge and you just want
+        the file path.
 
-    ``input_path`` is the genotype source (PLINK prefix, VCF, BCF, DTC).
+    Returns
+    -------
+    ScoreResult
+        ``output_path``, parsed ``scores`` (or an empty ``ScoreTable``
+        when ``read_output=False``), plus captured stdout/stderr/exit.
     """
     if isinstance(score, (list, tuple)):
         score_arg = ",".join(score)
