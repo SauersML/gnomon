@@ -3,7 +3,7 @@ requires = ["hatchling>=1.18"]
 build-backend = "hatchling.build"
 
 [project]
-name = "gnomon"
+name = "gnomon-pgs"
 version = "0.1.0"
 description = "Python wrapper for SauersML/gnomon (high-performance polygenic score engine)."
 readme = "README.md"
