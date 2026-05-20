@@ -162,28 +162,19 @@ impl<'a> Drop for BufferGuard<'a> {
     }
 }
 
-// Field order matters: Rust drops struct fields top-down, but cudarc
-// resources hold `Arc<CudaStream>` and `Arc<CudaContext>` internally, so
-// "raw" destruction of streams/context only happens once every Arc to
-// them is gone. Putting streams and the cuBLAS handle FIRST means their
-// runtime-owned Arc drops first (still alive due to slice refs), and
-// then once all CudaSlices drop their Arc<CudaStream>, the stream is
-// actually destroyed.
+// Field order is part of CUDA correctness here. Rust drops fields
+// top-to-bottom. cudarc device slices enqueue `cuMemFreeAsync` on their
+// owning streams when dropped, while `CudaBlas` calls `cublasDestroy`.
+// On the AoU T4 image, destroying cuBLAS after the stream has received a
+// backlog of async frees aborts in glibc with "double free or corruption
+// (!prev)" immediately after CUDA compute reaches 100%.
 //
-// The crucial property of this order: `blas` drops while the
-// compute_stream is still synchronised and clean (no pending
-// cuMemFreeAsync calls queued on it), so cublasDestroy does not race
-// against a stream that has accumulated a backlog of leaf-resource
-// frees. Inverting this -- dropping pinned/slice leaves first and the
-// blas/streams last -- empirically aborts with "double free or
-// corruption (!prev)" right after CUDA compute completes (observed on
-// the AoU bare-metal Turing T4 image, even on tiny single-PGS inputs).
+// Keep context, streams, and cuBLAS first so their runtime-owned Arcs are
+// released before the leaf allocations. The raw stream/context handles
+// still stay alive through the Arcs held by later CudaSlices, and those
+// slices can then queue their async frees onto valid streams.
 struct CudaRuntime {
-    // Held to keep the CUDA context alive for the lifetime of every
-    // resource below; not accessed directly, but dropping this Arc
-    // before everything else would mean each leaf resource's `Drop`
-    // would have to reconstruct context binding from its own Arc.
-    #[allow(dead_code)]
+    // Keeps the context alive until every resource below is gone.
     ctx: Arc<CudaContext>,
     compute_stream: Arc<CudaStream>,
     copy_stream: Arc<CudaStream>,
@@ -199,6 +190,17 @@ struct CudaRuntime {
     gpu_score_chunk_size: usize,
     pinned_staging: Vec<PinnedHostSlice<u8>>,
     pinned_reconciled: Vec<PinnedHostSlice<u32>>,
+}
+
+impl Drop for CudaRuntime {
+    fn drop(&mut self) {
+        // Drop runs before field teardown. Synchronise both streams while
+        // the context and cuBLAS handle are intact; then field order makes
+        // cublasDestroy happen before CudaSlice drops enqueue async frees.
+        let _ = self.ctx.bind_to_thread();
+        let _ = self.compute_stream.synchronize();
+        let _ = self.copy_stream.synchronize();
+    }
 }
 
 struct GpuChannels {
@@ -1488,6 +1490,26 @@ fn run_pending_compute_cuda(
             )
             .map_err(map_driver_err("Failed to copy count tile output to host"))?;
 
+        // The three `memcpy_dtoh` calls above issue `cuMemcpyDtoHAsync`.
+        // cudarc's host-slice implementation for `Vec<T>` / `[T]`
+        // returns `SyncOnDrop::Sync(None)`, so there is no implicit
+        // stream sync when the temporary host borrow is dropped. Without
+        // this explicit barrier, the CPU accumulation loop can read
+        // `host_tile_*_slots[work.slot]` while CUDA is still writing the
+        // same pages. That host read / DMA write race is timing-sensitive:
+        // compute-sanitizer slows the path enough that PGS001320 reaches
+        // output, while the normal run can abort immediately after the
+        // 100% progress line.
+        //
+        // Sync once after all three copies and proceed with complete
+        // host buffers.
+        runtime
+            .compute_stream
+            .synchronize()
+            .map_err(map_driver_err(
+                "Failed to synchronize compute stream after DtoH copies",
+            ))?;
+
         for person_idx in 0..dims.num_people {
             let src_base = person_idx * tile_scores;
             let dst_base = person_idx * dims.num_scores + score_offset;
@@ -1638,4 +1660,58 @@ fn checked_mul_usize(label: &str, a: usize, b: usize) -> Result<usize, PipelineE
     a.checked_mul(b).ok_or_else(|| {
         PipelineError::Compute(format!("{label} overflow: {a} * {b} exceeds usize::MAX"))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn cuda_runtime_field_order_keeps_cublas_teardown_before_async_frees() {
+        let source = include_str!("cuda_backend.rs");
+        let struct_start = source
+            .find("struct CudaRuntime {")
+            .expect("CudaRuntime struct must exist");
+        let after_start = &source[struct_start..];
+        let struct_end = after_start
+            .find("\n}\n\nimpl Drop for CudaRuntime")
+            .expect("CudaRuntime struct end must precede its Drop impl");
+        let body = &after_start[..struct_end];
+
+        let context_pos = body.find("ctx: Arc<CudaContext>").expect("ctx field");
+        let compute_stream_pos = body
+            .find("compute_stream: Arc<CudaStream>")
+            .expect("compute_stream field");
+        let copy_stream_pos = body
+            .find("copy_stream: Arc<CudaStream>")
+            .expect("copy_stream field");
+        let blas_pos = body.find("blas: CudaBlas").expect("blas field");
+        let kernel_pos = body
+            .find("unpack_kernel: CudaFunction")
+            .expect("kernel field");
+        let slice_pos = body
+            .find("sparse_weights: CudaSlice<f32>")
+            .expect("first CudaSlice field");
+        let pinned_pos = body
+            .find("pinned_staging: Vec<PinnedHostSlice<u8>>")
+            .expect("pinned field");
+
+        assert!(context_pos < compute_stream_pos);
+        assert!(compute_stream_pos < copy_stream_pos);
+        assert!(copy_stream_pos < blas_pos);
+        assert!(blas_pos < kernel_pos);
+        assert!(kernel_pos < slice_pos);
+        assert!(slice_pos < pinned_pos);
+    }
+
+    #[test]
+    fn cuda_runtime_is_dropped_after_progress_threads_are_joined() {
+        let source = include_str!("cuda_backend.rs");
+        let support_drop_pos = source
+            .find("drop(support_guard);\n    drop(runtime);")
+            .expect("CUDA support guard must be dropped immediately before runtime");
+        let resolver_pos = source
+            .find("if !prep_result.complex_rules.is_empty()")
+            .expect("complex resolver branch must exist");
+
+        assert!(support_drop_pos < resolver_pos);
+    }
 }
