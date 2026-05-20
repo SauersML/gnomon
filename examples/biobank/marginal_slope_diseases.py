@@ -848,22 +848,42 @@ def fit_marginal_slope(train_df: pd.DataFrame, num_pcs: int):  # -> gamfit.Model
     )
 
 
-# Single source of truth for the binary path's age-confounding basis.
+# Binary-path age handling — *idiomatic for each library*, not a single
+# shared basis.
 #
-# Standard PRS-evaluation age adjustment: a natural cubic spline on
-# `current_age` (df=4, knots placed at train-data quantiles by patsy's
-# `cr(..., df=4)`) plus linear z-scored `entry_age`. This matches the
-# Inouye/Khera-style frameworks used in clinical PRS papers and is
-# flexible enough to capture the exponential incidence-vs-age curve
-# without polynomial tail-wagging.
+# Disease incidence is non-linear in current_age (~exponential past
+# midlife), so both the Bernoulli marginal-slope GAM and the three
+# logistic baselines need a flexible age adjustment. The "proper correct"
+# way to do that is to let each framework use its native tool:
 #
-# The same five columns enter the binary GAM, both PRS logistic baselines
-# (A=Z_norm2, B=raw prs_z + linear PCs), and the age+sex-only nuisance
-# baseline (N). The spline knots are fit on train only and the *same
-# DesignInfo* is applied to test, so there is no leakage. The names are
-# fixed (`current_age_ns_1..4`, `entry_age_z`) regardless of split.
+# * GAM  — `smooth(current_age)`: gamfit's penalized 1-D smooth, with the
+#   effective degrees of freedom chosen by REML on the training data.
+#   This is what a GAM *is*; clamping it to a fixed-df basis would defeat
+#   the purpose of fitting a GAM.
+# * Logistic baselines (N, A, B) — `cr(current_age, df=4)`: a restricted
+#   natural cubic spline basis materialised once by patsy from the train
+#   data (knots at train quantiles) and applied to test via the same
+#   `DesignInfo`. Restricted cubic splines in logistic regression is the
+#   textbook clinical-model age adjustment (Harrell *RMS*, eMERGE/
+#   Inouye/Khera PRS validations).
+#
+# `entry_age` (z-scored on train) enters every model linearly. The AoU
+# enrollment-age distribution is close to uniform and at fixed current_age
+# the entry-age effect is essentially monotonic (controls obs-window
+# length), so there is no measurable nonlinearity to spline.
+#
+# The frames carry *both* representations: raw `current_age` (consumed by
+# gamfit's `smooth(...)`) and the patsy basis columns
+# `current_age_ns_1..4` (consumed by the logistic baselines as plain
+# numeric features). `_add_binary_age_features` materialises them in a
+# single train-only pass.
+#
+# This asymmetry shifts the GAM-minus-baseline interpretation from
+# "smoother PC interaction alone" to "GAM as a whole vs fixed-form
+# clinical models", which is the question PRS evaluation papers answer.
 BINARY_AGE_NS_DF = 4
-BINARY_AGE_FEATURES = ["entry_age_z"] + [
+GAM_AGE_FEATURES = ["entry_age_z", "current_age"]
+BASELINE_AGE_FEATURES = ["entry_age_z"] + [
     f"current_age_ns_{i+1}" for i in range(BINARY_AGE_NS_DF)
 ]
 
@@ -871,26 +891,29 @@ BINARY_AGE_FEATURES = ["entry_age_z"] + [
 def _add_binary_age_features(
     train: pd.DataFrame, test: pd.DataFrame
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Materialise the matched age basis on train (then apply to test).
+    """Add the train-only standardized age representations the binary path
+    needs.
 
-    Why these columns:
+    Produces three new columns on train and test:
 
-    * `current_age = (obs_end - birth)/365.25` and `entry_age = (obs_start
-      - birth)/365.25` are *label-independent* — they depend only on
-      enrollment dates and birth date, never on event status.
-    * `exit_age` (= event onset for cases, obs_end for censors) and
-      `followup_years = exit_age - entry_age` are *endogenous to the
-      outcome*: for cases they stop at diagnosis, for censors they run to
-      obs_end. Using either as a binary covariate would leak the label and
-      inflate every metric.
+    * `entry_age_z` — linear z-scored entry age (train mean/std). Used by
+      every model.
+    * `current_age` (already on the frame, passed through). Consumed by
+      the GAM's `smooth(current_age)`.
+    * `current_age_ns_1..4` — natural cubic spline basis from patsy's
+      `cr(current_age, df=4)`, knots fit on train and applied to test via
+      the same `DesignInfo`. Consumed by the logistic baselines as plain
+      numeric features.
 
-    Why a natural cubic spline (df=4) on current_age:
+    Why these columns and not `followup_years`/`exit_age`:
 
-    Disease incidence grows non-linearly with age (~exponential past
-    midlife). A natural cubic spline captures the shape with bounded tail
-    behaviour, is the textbook age adjustment in PRS-evaluation papers,
-    and — because we fit knots on train and apply the *same* knots to
-    test — gives every comparison model an identical, leakage-free basis.
+    `current_age = (obs_end - birth)/365.25` and `entry_age = (obs_start -
+    birth)/365.25` are *label-independent* — they depend only on
+    enrollment dates and birth date, never on event status. `exit_age` (=
+    event onset for cases, obs_end for censors) and `followup_years =
+    exit_age - entry_age` are *endogenous to the outcome*: for cases they
+    stop at diagnosis, for censors they run to obs_end. Using either as a
+    binary covariate would leak the label and inflate every metric.
     """
     from patsy import dmatrix  # lazy: statsmodels carries patsy
 
@@ -928,33 +951,40 @@ def _add_binary_age_features(
 
 
 def binary_model_columns(num_pcs: int) -> list[str]:
-    return ["event", "sex", "prs_z", *BINARY_AGE_FEATURES] + [
+    return ["event", "sex", "prs_z", *GAM_AGE_FEATURES] + [
         f"PC{i+1}" for i in range(num_pcs)
     ]
 
 
 def binary_predict_columns(num_pcs: int) -> list[str]:
-    return ["sex", "prs_z", *BINARY_AGE_FEATURES] + [
+    return ["sex", "prs_z", *GAM_AGE_FEATURES] + [
         f"PC{i+1}" for i in range(num_pcs)
     ]
 
 
 def fit_binary_marginal_slope(train_df: pd.DataFrame, num_pcs: int):  # -> gamfit.Model
-    """Bernoulli marginal-slope GAM for the cross-sectional binary outcome.
+    """Bernoulli marginal-slope GAM with REML-penalized smooth on
+    current_age.
 
-    The `BINARY_AGE_FEATURES` basis (natural cubic spline df=4 on
-    current_age + linear entry_age) enters as *linear additive* covariates
-    so every logistic baseline can match this GAM's age basis exactly.
-    The only structural difference between this model and
-    `evaluate_binary_model_pair`'s `baselineB` is how PC structure enters
-    the score (smooth `duchon` vs linear `PC1..PCk`), which is exactly
-    the comparison we want to make.
+    `smooth(current_age)` is gamfit's penalized 1-D smooth — the basis
+    dimension is internal to gamfit and the effective degrees of freedom
+    are chosen by marginal likelihood on the training data. `entry_age_z`
+    is linear. The PC structure enters through the same `duchon(PCs)`
+    smooth as in the survival path, and the `prs_z` log-OR varies as
+    `duchon(PCs)` (its `logslope_formula`).
+
+    The matched-flexibility comparator is `evaluate_binary_model_pair`'s
+    `baselineB`, which differs from this GAM only in (a) PC interaction
+    (linear `PC1..PCk` instead of smooth `duchon`) and (b) age (a fixed
+    `cr(current_age, df=4)` restricted cubic spline instead of a
+    REML-penalized smooth). The GAM-minus-baselineB delta is the
+    incremental discrimination of GAM-native PC smoothing plus
+    REML-tuned age flexibility over the textbook clinical-model setup.
     """
     import gamfit  # lazy
 
     duchon = pc_duchon_term(num_pcs)
-    age_terms = " + ".join(BINARY_AGE_FEATURES)
-    formula = f"event ~ {duchon} + sex + {age_terms}"
+    formula = f"event ~ {duchon} + sex + smooth(current_age) + entry_age_z"
     cols = binary_model_columns(num_pcs)
     print("  binary_fit_spec: family=bernoulli-marginal-slope  link=probit")
     print(f"  binary_fit_spec: formula={formula!r}")
@@ -1579,29 +1609,36 @@ def evaluate_binary_model_pair(
     population_prevalence: float | None,
     score_train: bool,
 ) -> dict[str, float]:
-    """Fit non-survival Bernoulli marginal-slope GAM and matched logistic
-    baselines on the same balanced split.
+    """Fit Bernoulli marginal-slope GAM and matched logistic baselines on
+    the same balanced split.
 
-    Every model shares the same age+sex nuisance basis (natural cubic
-    spline df=4 on `current_age` + linear `entry_age_z` + sex; see
-    `BINARY_AGE_FEATURES`), so the only structural difference between
-    models is how PRS / PC
-    information enters:
+    Each library uses *its native age handling* — the comparison is
+    "fairly framed clinical baseline vs fairly framed GAM", not "same
+    fixed basis everywhere":
 
-      * `binaryGAM` — Bernoulli marginal-slope GAM with `duchon(PC1..PCk)`
-        in the baseline-risk surface and the same `duchon(...)` in the
-        log-slope channel, with `prs_z` as the latent z.
-      * `binaryN`   — no PRS, no PCs. Ceiling that any PRS model must beat.
-      * `binaryA`   — `+ z_norm2` (pgsc_calc PC mean+var adjusted PRS).
-      * `binaryB`   — `+ prs_z + PC1..PCk` (raw PRS plus linear PC adjustment).
+      * `binaryGAM` — Bernoulli marginal-slope GAM with
+        `duchon(PC1..PCk)` in the baseline-risk surface, the same
+        `duchon(...)` in the log-slope channel (so `prs_z`'s log-OR
+        varies by ancestry), a REML-penalized `smooth(current_age)`, a
+        linear `entry_age_z`, and `sex`. Effective age df is chosen by
+        gamfit on training data.
+      * `binaryN` — logistic GLM on the matched clinical-baseline age
+        basis (`cr(current_age, df=4)` natural cubic spline + linear
+        `entry_age_z`) and `sex`, with *no PRS information*. The
+        age+sex-only ceiling.
+      * `binaryA` — `binaryN + z_norm2` (pgsc_calc PC mean+var adjusted
+        PRS, fit on train, applied to test).
+      * `binaryB` — `binaryN + prs_z + PC1..PCk` (train-z-scored PRS
+        plus linear PCs).
 
-    Discrimination is reported with AUROC, AP, log-loss, Brier, Nagelkerke
-    R², and Lee-style liability R² (using the supplied
-    `population_prevalence` since the 1:1 balanced split has sample
-    prevalence 0.5 even when the population prevalence K is much lower).
-    The PGS-incremental skill is the GAM-minus-baseline delta, which is
-    robust against any residual age confounding because the age basis is
-    identical across models.
+    Discrimination is reported with AUROC + paired-DeLong 95% CI, AP,
+    log-loss, Brier, Nagelkerke R², and Lee 2012 liability R² (taking
+    the supplied `population_prevalence` so the 1:1 balanced split's
+    sample prevalence of 0.5 is correctly mapped back to the population
+    scale). The headline `GAM−N` delta is the *clinical-utility* lift,
+    `A−N` and `B−N` are PRS-incremental lifts over age+sex alone, and
+    `GAM−B` isolates the value of the GAM-native smooth basis given the
+    same PRS and PC information.
     """
     train, test = _add_binary_age_features(train, test)
     y_train = train["event"].to_numpy()
@@ -1615,7 +1652,7 @@ def evaluate_binary_model_pair(
         gam_p_train = np.asarray(model.predict(train[binary_predict_columns(len(pc_cols))]), dtype=float)
         gam_train_m = binary_stats(y_train, gam_p_train, population_prevalence)
 
-    nuisance_names = [*BINARY_AGE_FEATURES, "sex"]
+    nuisance_names = [*BASELINE_AGE_FEATURES, "sex"]
     X_N_tr = train[nuisance_names].to_numpy()
     X_N_te = test[nuisance_names].to_numpy()
     N_fit = fit_logit_binary(y_train, X_N_tr, nuisance_names)
@@ -2318,9 +2355,11 @@ def main() -> None:
         # to the label) and `followup_years = exit_age - entry_age`, which
         # would be label-leaky if used as a binary covariate, `current_age`
         # depends only on birth_datetime and obs_end and is exogenous to the
-        # outcome. The binary GAM and its logistic baselines use the matched
-        # `BINARY_AGE_FEATURES` natural-cubic-spline-on-current_age + linear-
-        # entry_age basis.
+        # outcome. The binary path then materialises age features
+        # idiomatically per library: the GAM uses gamfit's REML-penalized
+        # `smooth(current_age)` and linear `entry_age_z`; the logistic
+        # baselines use a `cr(current_age, df=4)` restricted cubic spline
+        # basis (knots fit on train) plus linear `entry_age_z`.
         days_per_year = 365.25
         df_full["entry_age"] = (
             (df_full["obs_start"] - df_full["birth_datetime"]).dt.days / days_per_year
