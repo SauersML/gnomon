@@ -67,26 +67,22 @@ def locate_binary(override: Optional[PathLike] = None, *, name: str = "gnomon") 
 
     Resolution order:
       1. ``override`` argument.
-      2. ``$GNOMON_BIN`` env var (only when ``name`` is ``"gnomon"``).
-      3. ``name`` on ``PATH``.
+      2. ``name`` on ``PATH``.
+
+    No environment-variable indirection — pass ``binary=`` explicitly
+    when you want to use a non-PATH copy.
     """
     if override is not None:
         p = Path(override)
         if not p.exists():
             raise GnomonBinaryNotFound(f"gnomon binary not at {p}")
         return p
-    if name == "gnomon":
-        env = os.environ.get("GNOMON_BIN")
-        if env:
-            p = Path(env)
-            if not p.exists():
-                raise GnomonBinaryNotFound(f"$GNOMON_BIN -> nonexistent {p}")
-            return p
     which = shutil.which(name)
     if which:
         return Path(which)
     raise GnomonBinaryNotFound(
-        f"{name} not found. Install with: cargo install gnomon"
+        f"{name} not found. Install with `cargo install gnomon`, "
+        f"or pass binary=... explicitly."
     )
 
 

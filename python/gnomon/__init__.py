@@ -48,7 +48,7 @@ from ._api import (
     SscoreParseError,
     locate_binary,
 )
-from . import map, calibrate  # noqa: F401  (sub-namespaces)
+from . import map, calibrate
 
 __all__ = [
     "score",

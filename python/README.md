@@ -30,7 +30,8 @@ pip install gnomon
 cargo install gnomon
 ```
 
-Binary located via `binary=`, `$GNOMON_BIN`, or `PATH`.
+Binary located via `binary=` or PATH. No env-var indirection — pass
+`binary=` explicitly if it isn't on PATH.
 
 ## Subcommands
 

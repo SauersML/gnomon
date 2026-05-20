@@ -45,13 +45,18 @@ def _fake_binary(tmp_path: Path, body: str, name: str = "gnomon") -> Path:
     return p
 
 
+def _argv_log_path(fake_binary: Path) -> Path:
+    """Where a fake binary records the argv it was called with."""
+    return fake_binary.parent / "argv.json"
+
+
 _SCORE_FAKE = textwrap.dedent(
     """\
     #!/usr/bin/env python3
-    import json, os, pathlib, sys
+    import json, pathlib, sys
 
     argv = sys.argv[1:]
-    log = pathlib.Path(os.environ['GNOMON_ARGV_LOG'])
+    log = pathlib.Path(sys.argv[0]).parent / 'argv.json'
     log.write_text(json.dumps(argv))
 
     assert argv[0] == 'score', f'expected score subcmd, got {argv[0]!r}'
@@ -323,10 +328,9 @@ def test_inline_pgs_suffix_matches_rust_format():
     assert a != b
 
 
-def test_score_with_pgs_id_argv_and_output(tmp_path, monkeypatch):
+def test_score_with_pgs_id_argv_and_output(tmp_path):
     fake = _fake_binary(tmp_path, _SCORE_FAKE)
     geno = _make_genotype(tmp_path)
-    monkeypatch.setenv("GNOMON_ARGV_LOG", str(tmp_path / "argv.json"))
 
     r = score("PGS001,PGS002", geno, binary=fake)
     assert isinstance(r, ScoreResult)
@@ -342,10 +346,9 @@ def test_score_with_pgs_id_argv_and_output(tmp_path, monkeypatch):
     assert argv[2] == str(geno)
 
 
-def test_score_with_list_of_ids(tmp_path, monkeypatch):
+def test_score_with_list_of_ids(tmp_path):
     fake = _fake_binary(tmp_path, _SCORE_FAKE)
     geno = _make_genotype(tmp_path)
-    monkeypatch.setenv("GNOMON_ARGV_LOG", str(tmp_path / "argv.json"))
 
     r = score(["PGS001", "PGS002"], geno, binary=fake)
     argv = json.loads((tmp_path / "argv.json").read_text())
@@ -353,12 +356,11 @@ def test_score_with_list_of_ids(tmp_path, monkeypatch):
     assert r.output_path.exists()
 
 
-def test_score_with_file_path(tmp_path, monkeypatch):
+def test_score_with_file_path(tmp_path):
     fake = _fake_binary(tmp_path, _SCORE_FAKE)
     geno = _make_genotype(tmp_path)
     score_file = tmp_path / "myscore.weights.tsv"
     score_file.write_text("# weights\n")
-    monkeypatch.setenv("GNOMON_ARGV_LOG", str(tmp_path / "argv.json"))
 
     r = score(score_file, geno, binary=fake)
     # Expected output: geno_myscore.weights.sscore (using the score file stem).
@@ -366,12 +368,11 @@ def test_score_with_file_path(tmp_path, monkeypatch):
     assert r.output_path.exists()
 
 
-def test_score_passes_optional_flags(tmp_path, monkeypatch):
+def test_score_passes_optional_flags(tmp_path):
     fake = _fake_binary(tmp_path, _SCORE_FAKE)
     geno = _make_genotype(tmp_path)
     keep = tmp_path / "keep.txt"
     keep.write_text("S1\nS2\n")
-    monkeypatch.setenv("GNOMON_ARGV_LOG", str(tmp_path / "argv.json"))
 
     score(
         "PGS001",
@@ -398,7 +399,7 @@ def test_score_propagates_nonzero_exit(tmp_path):
     assert "simulated failure" in ei.value.stderr
 
 
-def test_score_missing_output_raises(tmp_path, monkeypatch):
+def test_score_missing_output_raises(tmp_path):
     # Fake that exits 0 but writes nothing.
     fake = _fake_binary(tmp_path, "#!/usr/bin/env python3\nprint('did nothing')\n")
     geno = _make_genotype(tmp_path)
@@ -406,10 +407,9 @@ def test_score_missing_output_raises(tmp_path, monkeypatch):
         score("PGS001", geno, binary=fake)
 
 
-def test_score_read_output_false_skips_parse(tmp_path, monkeypatch):
+def test_score_read_output_false_skips_parse(tmp_path):
     fake = _fake_binary(tmp_path, _SCORE_FAKE)
     geno = _make_genotype(tmp_path)
-    monkeypatch.setenv("GNOMON_ARGV_LOG", str(tmp_path / "argv.json"))
     r = score("PGS001", geno, binary=fake, read_output=False)
     assert r.output_path.exists()
     assert isinstance(r.scores, ScoreTable)
@@ -476,18 +476,17 @@ def test_map_fit_rejects_window_without_ld(tmp_path):
         gnomon_map.fit(geno, components=5, sites_window=101, binary=fake)
 
 
-def test_map_project_passes_model(tmp_path, monkeypatch):
+def test_map_project_passes_model(tmp_path):
     body = textwrap.dedent(
         """\
         #!/usr/bin/env python3
         import json, os, pathlib, sys
-        log = pathlib.Path(os.environ['GNOMON_ARGV_LOG'])
+        log = pathlib.Path(sys.argv[0]).parent / 'argv.json'
         log.write_text(json.dumps(sys.argv[1:]))
         """
     )
     fake = _fake_binary(tmp_path, body)
     geno = _make_genotype(tmp_path)
-    monkeypatch.setenv("GNOMON_ARGV_LOG", str(tmp_path / "argv.json"))
     gnomon_map.project(geno, model="hwe_1kg_hgdp_gsa_v3", binary=fake)
     argv = json.loads((tmp_path / "argv.json").read_text())
     assert argv[0] == "project"
@@ -499,16 +498,15 @@ def test_map_project_passes_model(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_calibrate_train_argv(tmp_path, monkeypatch):
+def test_calibrate_train_argv(tmp_path):
     body = textwrap.dedent(
         """\
         #!/usr/bin/env python3
         import json, os, pathlib, sys
-        pathlib.Path(os.environ['GNOMON_ARGV_LOG']).write_text(json.dumps(sys.argv[1:]))
+        (pathlib.Path(sys.argv[0]).parent / 'argv.json').write_text(json.dumps(sys.argv[1:]))
         """
     )
     fake = _fake_binary(tmp_path, body)
-    monkeypatch.setenv("GNOMON_ARGV_LOG", str(tmp_path / "argv.json"))
     data = tmp_path / "train.tsv"
     data.write_text("phenotype\tscore\tPC1\n0\t1.0\t0.5\n")
     gnomon_calibrate.train(data, num_pcs=4, binary=fake)
@@ -519,16 +517,15 @@ def test_calibrate_train_argv(tmp_path, monkeypatch):
     assert argv[argv.index("--model-family") + 1] == "gam"
 
 
-def test_calibrate_infer_argv(tmp_path, monkeypatch):
+def test_calibrate_infer_argv(tmp_path):
     body = textwrap.dedent(
         """\
         #!/usr/bin/env python3
         import json, os, pathlib, sys
-        pathlib.Path(os.environ['GNOMON_ARGV_LOG']).write_text(json.dumps(sys.argv[1:]))
+        (pathlib.Path(sys.argv[0]).parent / 'argv.json').write_text(json.dumps(sys.argv[1:]))
         """
     )
     fake = _fake_binary(tmp_path, body)
-    monkeypatch.setenv("GNOMON_ARGV_LOG", str(tmp_path / "argv.json"))
     test = tmp_path / "test.tsv"
     test.write_text("score\tPC1\n1.0\t0.5\n")
     model = tmp_path / "model.toml"
@@ -545,12 +542,12 @@ def test_calibrate_infer_argv(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_run_all_invokes_all_subcommand(tmp_path, monkeypatch):
+def test_run_all_invokes_all_subcommand(tmp_path):
     body = textwrap.dedent(
         """\
         #!/usr/bin/env python3
         import json, os, pathlib, sys
-        log = pathlib.Path(os.environ['GNOMON_ARGV_LOG'])
+        log = pathlib.Path(sys.argv[0]).parent / 'argv.json'
         log.write_text(json.dumps(sys.argv[1:]))
         argv = sys.argv[1:]
         # Write a real sscore so AllResult.score gets populated. Use the
@@ -574,7 +571,6 @@ def test_run_all_invokes_all_subcommand(tmp_path, monkeypatch):
         """
     )
     fake = _fake_binary(tmp_path, body)
-    monkeypatch.setenv("GNOMON_ARGV_LOG", str(tmp_path / "argv.json"))
     geno = _make_genotype(tmp_path)
     r = run_all("PGS001", geno, model="hwe_1kg_hgdp_gsa_v3", binary=fake)
     argv = json.loads((tmp_path / "argv.json").read_text())
@@ -589,14 +585,18 @@ def test_run_all_invokes_all_subcommand(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_locate_binary_env(monkeypatch, tmp_path):
+def test_locate_binary_override(tmp_path):
     fake = _fake_binary(tmp_path, "#!/usr/bin/env python3\nprint('hi')\n")
-    monkeypatch.setenv("GNOMON_BIN", str(fake))
-    assert locate_binary() == fake
+    assert locate_binary(fake) == fake
 
 
-def test_locate_binary_not_found(monkeypatch, tmp_path):
-    monkeypatch.delenv("GNOMON_BIN", raising=False)
+def test_locate_binary_override_missing_raises(tmp_path):
+    with pytest.raises(GnomonBinaryNotFound):
+        locate_binary(tmp_path / "no-such-binary")
+
+
+def test_locate_binary_not_on_path(monkeypatch, tmp_path):
+    # PATH only — no override, nothing on PATH.
     monkeypatch.setenv("PATH", str(tmp_path))
     with pytest.raises(GnomonBinaryNotFound):
         locate_binary()
