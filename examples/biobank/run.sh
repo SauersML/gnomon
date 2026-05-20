@@ -53,6 +53,15 @@ if [ ! -d "$HOME/gnomon/.git" ]; then
   exit 1
 fi
 unset GNOMON_INSTALL_MAIN_SHA
+# install.sh's `bootstrap_latest_installer` re-execs itself pinned to
+# the latest main SHA *regardless of whether that SHA has a release*.
+# When HEAD is newer than the most recent published release (the common
+# case for ~20 min after a push, while the build workflow is running)
+# the bootstrap pin hard-fails with "Refusing to install a different
+# release for explicit GNOMON_INSTALL_MAIN_SHA". Setting
+# GNOMON_INSTALL_BOOTSTRAPPED=1 skips that bootstrap and lets install.sh
+# fall through to the "latest published release" code path.
+export GNOMON_INSTALL_BOOTSTRAPPED=1
 echo "[run.sh] installing gnomon (latest published release) via install.sh" >&2
 if curl -fsSL "https://raw.githubusercontent.com/SauersML/gnomon/main/install.sh" | bash >&2; then
   :
