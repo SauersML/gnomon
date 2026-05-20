@@ -64,7 +64,7 @@ RESULTS="$RESULTS_DIR/biobank_run_${TS}.log"
   echo "results_file:     $RESULTS"
   echo
   echo "--- fit configuration (from script) ---"
-  grep -E '^(NUM_PCS|DUCHON_CENTERS|TRAIN_FRACTION|RNG_SEED|MAX_LOSO_CARE_SITES|MIN_LOSO_) *=' \
+  grep -E '^(NUM_PCS|DUCHON_CENTERS|TRAIN_FRACTION|RNG_SEED|MAX_LOSO_CARE_SITES|MIN_LOSO_|BOOTSTRAP_) *=' \
       "$SCRIPT_DIR/marginal_slope_diseases.py"
   echo
   echo "--- diseases ---"

@@ -1259,6 +1259,87 @@ def null_survival_matrix(train: pd.DataFrame, n_rows: int, times: np.ndarray) ->
     return np.tile(null_curve, (n_rows, 1))
 
 
+def _stratified_bootstrap_ci(
+    event_idx: np.ndarray,
+    censor_idx: np.ndarray,
+    statistic,
+) -> tuple[float, float]:
+    rng = np.random.default_rng(RNG_SEED)
+    values: list[float] = []
+    for _ in range(BOOTSTRAP_RESAMPLES):
+        sampled_events = rng.choice(event_idx, size=event_idx.size, replace=True)
+        sampled_censors = rng.choice(censor_idx, size=censor_idx.size, replace=True)
+        value = float(statistic(sampled_events, sampled_censors))
+        if np.isfinite(value):
+            values.append(value)
+    if not values:
+        return float("nan"), float("nan")
+    alpha = 100.0 * (1.0 - BOOTSTRAP_CONFIDENCE_LEVEL) / 2.0
+    low, high = np.percentile(np.asarray(values, dtype=np.float64), [alpha, 100.0 - alpha])
+    return float(low), float(high)
+
+
+def _ipcw_c_for_indices(
+    train_y,
+    event: np.ndarray,
+    exit_: np.ndarray,
+    risk: np.ndarray,
+    indices: np.ndarray,
+    tau: float,
+) -> float:
+    from sksurv.metrics import concordance_index_ipcw
+
+    idx = np.asarray(indices, dtype=np.int64)
+    test_y = _surv_array(event[idx], exit_[idx])
+    return float(concordance_index_ipcw(train_y, test_y, np.asarray(risk, dtype=np.float64)[idx], tau=tau)[0])
+
+
+def bootstrap_ipcw_c_ci(train: pd.DataFrame, test: pd.DataFrame, risk: np.ndarray, tau: float) -> tuple[float, float]:
+    train_y = _surv_array(train["event"].to_numpy(), train["exit_age"].to_numpy())
+    event = test["event"].to_numpy(dtype=bool)
+    exit_ = test["exit_age"].to_numpy(dtype=np.float64)
+    event_idx = np.flatnonzero(event)
+    censor_idx = np.flatnonzero(~event)
+    if event_idx.size == 0 or censor_idx.size == 0:
+        return float("nan"), float("nan")
+
+    def statistic(sampled_events: np.ndarray, sampled_censors: np.ndarray) -> float:
+        idx = np.concatenate([
+            np.asarray(sampled_events, dtype=np.int64),
+            np.asarray(sampled_censors, dtype=np.int64),
+        ])
+        return _ipcw_c_for_indices(train_y, event, exit_, risk, idx, tau)
+
+    return _stratified_bootstrap_ci(event_idx, censor_idx, statistic)
+
+
+def bootstrap_ipcw_delta_ci(
+    train: pd.DataFrame,
+    test: pd.DataFrame,
+    left_risk: np.ndarray,
+    right_risk: np.ndarray,
+    tau: float,
+) -> tuple[float, float]:
+    train_y = _surv_array(train["event"].to_numpy(), train["exit_age"].to_numpy())
+    event = test["event"].to_numpy(dtype=bool)
+    exit_ = test["exit_age"].to_numpy(dtype=np.float64)
+    event_idx = np.flatnonzero(event)
+    censor_idx = np.flatnonzero(~event)
+    if event_idx.size == 0 or censor_idx.size == 0:
+        return float("nan"), float("nan")
+
+    def statistic(sampled_events: np.ndarray, sampled_censors: np.ndarray) -> float:
+        idx = np.concatenate([
+            np.asarray(sampled_events, dtype=np.int64),
+            np.asarray(sampled_censors, dtype=np.int64),
+        ])
+        left = _ipcw_c_for_indices(train_y, event, exit_, left_risk, idx, tau)
+        right = _ipcw_c_for_indices(train_y, event, exit_, right_risk, idx, tau)
+        return left - right
+
+    return _stratified_bootstrap_ci(event_idx, censor_idx, statistic)
+
+
 def survival_library_metrics(
     train: pd.DataFrame,
     test: pd.DataFrame,
@@ -1280,9 +1361,10 @@ def survival_library_metrics(
         raise ValueError(
             f"survival matrix shape {survival.shape} does not match "
             f"(n_test={len(test)}, n_times={len(times)})"
-        )
+    )
     tau = float(times[-1])
     c_ipcw = float(concordance_index_ipcw(train_y, test_y, risk, tau=tau)[0])
+    c_ipcw_ci_low, c_ipcw_ci_high = bootstrap_ipcw_c_ci(train, test, risk, tau)
     _, mean_auc = cumulative_dynamic_auc(train_y, test_y, risk, times)
     ibs = float(integrated_brier_score(train_y, test_y, survival, times))
     null_ibs = float(
@@ -1299,6 +1381,8 @@ def survival_library_metrics(
         n_events=int(test["event"].sum()),
         median_exit_age=float(np.median(test["exit_age"].to_numpy(dtype=np.float64))),
         c_ipcw=c_ipcw,
+        c_ipcw_ci_low=c_ipcw_ci_low,
+        c_ipcw_ci_high=c_ipcw_ci_high,
         dynamic_auc_mean=float(mean_auc),
         ibs=ibs,
         null_ibs=null_ibs,
@@ -1312,7 +1396,9 @@ def survival_library_metrics(
 
 def fmt_survival(stats: SurvivalMetricStats) -> str:
     return (
-        f"C_ipcw={stats.c_ipcw:.4f}  iAUC={stats.dynamic_auc_mean:.4f}  "
+        f"C_ipcw={stats.c_ipcw:.4f} "
+        f"95%CI=[{stats.c_ipcw_ci_low:.4f},{stats.c_ipcw_ci_high:.4f}]  "
+        f"iAUC={stats.dynamic_auc_mean:.4f}  "
         f"IBS={stats.ibs:.5f}  R2_IBS={stats.r2_ibs:.4f}"
     )
 
@@ -1323,6 +1409,8 @@ def _survival_fields(prefix: str, stats: SurvivalMetricStats) -> dict[str, float
         f"{prefix}_events": stats.n_events,
         f"{prefix}_median_exit_age": stats.median_exit_age,
         f"{prefix}_c_ipcw": stats.c_ipcw,
+        f"{prefix}_c_ipcw_ci_low": stats.c_ipcw_ci_low,
+        f"{prefix}_c_ipcw_ci_high": stats.c_ipcw_ci_high,
         f"{prefix}_dynamic_auc_mean": stats.dynamic_auc_mean,
         f"{prefix}_ibs": stats.ibs,
         f"{prefix}_null_ibs": stats.null_ibs,
@@ -1653,17 +1741,19 @@ def evaluate_model_pair(
         metric_times = metric_times[valid_time]
         gam_surv_test = gam_surv_test[:, valid_time]
 
+    A_risk_test = _risk(X_A_te[kept_test], A_names, A_coefs)
+    B_risk_test = _risk(X_B_te[kept_test], B_names, B_coefs)
     A_test_m = survival_library_metrics(
         train,
         test_metric,
-        _risk(X_A_te[kept_test], A_names, A_coefs),
+        A_risk_test,
         cox_survival_matrix(A_fit, X_A_te[kept_test], metric_times),
         metric_times,
     )
     B_test_m = survival_library_metrics(
         train,
         test_metric,
-        _risk(X_B_te[kept_test], B_names, B_coefs),
+        B_risk_test,
         cox_survival_matrix(B_fit, X_B_te[kept_test], metric_times),
         metric_times,
     )
@@ -1718,6 +1808,12 @@ def evaluate_model_pair(
         )
     delta_A_c = gam_test_m.c_ipcw - A_test_m.c_ipcw
     delta_B_c = gam_test_m.c_ipcw - B_test_m.c_ipcw
+    delta_A_c_ci_low, delta_A_c_ci_high = bootstrap_ipcw_delta_ci(
+        train, test_metric, gam_risk_test, A_risk_test, gam_test_m.tau
+    )
+    delta_B_c_ci_low, delta_B_c_ci_high = bootstrap_ipcw_delta_ci(
+        train, test_metric, gam_risk_test, B_risk_test, gam_test_m.tau
+    )
     delta_A_ibs = gam_test_m.ibs - A_test_m.ibs
     delta_B_ibs = gam_test_m.ibs - B_test_m.ibs
     delta_A_r2 = gam_test_m.r2_ibs - A_test_m.r2_ibs
@@ -1740,8 +1836,10 @@ def evaluate_model_pair(
         print(f"  baselineB  test {fmt_survival(B_test_m)}")
     print(
         f"  delta      GAM-baselineA: ΔC_ipcw={delta_A_c:+.4f} "
+        f"95%CI=[{delta_A_c_ci_low:+.4f},{delta_A_c_ci_high:+.4f}] "
         f"ΔIBS={delta_A_ibs:+.5f} ΔR2_IBS={delta_A_r2:+.4f}  "
         f"GAM-baselineB: ΔC_ipcw={delta_B_c:+.4f} "
+        f"95%CI=[{delta_B_c_ci_low:+.4f},{delta_B_c_ci_high:+.4f}] "
         f"ΔIBS={delta_B_ibs:+.5f} ΔR2_IBS={delta_B_r2:+.4f}"
     )
     binary_result = evaluate_binary_model_pair(
@@ -1761,7 +1859,11 @@ def evaluate_model_pair(
         **_survival_fields("baselineA_test", A_test_m),
         **_survival_fields("baselineB_test", B_test_m),
         "delta_test_c_ipcw_vs_baselineA": delta_A_c,
+        "delta_test_c_ipcw_vs_baselineA_ci_low": delta_A_c_ci_low,
+        "delta_test_c_ipcw_vs_baselineA_ci_high": delta_A_c_ci_high,
         "delta_test_c_ipcw_vs_baselineB": delta_B_c,
+        "delta_test_c_ipcw_vs_baselineB_ci_low": delta_B_c_ci_low,
+        "delta_test_c_ipcw_vs_baselineB_ci_high": delta_B_c_ci_high,
         "delta_test_ibs_vs_baselineA": delta_A_ibs,
         "delta_test_ibs_vs_baselineB": delta_B_ibs,
         "delta_test_r2_ibs_vs_baselineA": delta_A_r2,
