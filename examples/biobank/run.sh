@@ -41,18 +41,53 @@ if [ -z "${GNOMON_RUN_REEXEC:-}" ] && git -C "$SCRIPT_DIR" rev-parse --git-dir >
   fi
 fi
 
-# Always refresh the gnomon binary to the release matching the freshly pulled
-# HEAD. The previous `command -v gnomon ... || install.sh` form only ran the
-# installer on first use, so any later release (e.g. one containing a fix for
-# the cudarc + cuBLAS atexit "double free or corruption" abort after a 100%
-# successful score) never reached the box. install.sh is idempotent and
-# honors GNOMON_INSTALL_MAIN_SHA to fetch the release built for this exact
-# commit, falling back to the latest published release if that SHA's release
-# is not up yet.
-if [ -d "$HOME/gnomon/.git" ]; then
-  export GNOMON_INSTALL_MAIN_SHA="$(git -C "$HOME/gnomon" rev-parse HEAD 2>/dev/null || true)"
+# Refresh the gnomon binary so it matches the freshly pulled HEAD.
+#
+# The previous `install.sh`-only path downloads whatever release GitHub
+# Actions has finished building, which can lag main by 10-20 minutes
+# after a push. During that window install.sh falls back to the most
+# recent built release -- an older binary that may still carry the very
+# bug the just-pushed commit is meant to fix (the cudarc + cuBLAS atexit
+# "double free or corruption (!prev)" abort after a 100% successful
+# score is the prototypical case).
+#
+# When a local clone and a working `cargo` are available -- the AoU
+# bare-metal setup is one such box -- we build from source instead. The
+# first build takes a few minutes, every subsequent run is an
+# incremental rebuild keyed off the on-disk source so reruns of run.sh
+# are near-instant. If cargo isn't available we fall back to install.sh
+# with GNOMON_INSTALL_MAIN_SHA pointed at HEAD so the installer prefers
+# the release built for the exact pulled commit.
+gnomon_install_from_source() {
+  if [ "${GNOMON_BUILD_FROM_SOURCE:-1}" != "1" ]; then
+    return 1
+  fi
+  if ! command -v cargo >/dev/null 2>&1; then
+    return 1
+  fi
+  if [ ! -d "$HOME/gnomon/.git" ]; then
+    return 1
+  fi
+  local head_sha
+  head_sha="$(git -C "$HOME/gnomon" rev-parse HEAD 2>/dev/null || echo unknown)"
+  echo "[run.sh] cargo install --path $HOME/gnomon --bin gnomon --root $HOME/.local (HEAD $head_sha)" >&2
+  if cargo install --path "$HOME/gnomon" --bin gnomon --locked --force --root "$HOME/.local" >&2; then
+    mkdir -p "$HOME/.local/share/gnomon"
+    printf '%s\n' "$head_sha" > "$HOME/.local/share/gnomon/installed-sha"
+    echo "[run.sh] built gnomon from source at $head_sha" >&2
+    return 0
+  fi
+  echo "[run.sh] cargo install failed; falling back to install.sh release download" >&2
+  return 1
+}
+
+if ! gnomon_install_from_source; then
+  if [ -d "$HOME/gnomon/.git" ]; then
+    export GNOMON_INSTALL_MAIN_SHA="$(git -C "$HOME/gnomon" rev-parse HEAD 2>/dev/null || true)"
+    echo "[run.sh] GNOMON_INSTALL_MAIN_SHA=$GNOMON_INSTALL_MAIN_SHA" >&2
+  fi
+  bash "$HOME/gnomon/install.sh"
 fi
-bash "$HOME/gnomon/install.sh"
 AOU_DISK_ROOT="$HOME/aou-gpu-baremetal"
 RESULTS_DIR="$AOU_DISK_ROOT/biobank_results"
 RUN_STATE_DIR="$AOU_DISK_ROOT/gnomon_runtime/biobank"
@@ -226,6 +261,8 @@ trap 'failure_diagnostics $?' ERR
   echo "git_subject:      $(git -C "$HOME/gnomon" log -1 --format=%s 2>/dev/null || echo unknown)"
   echo "gnomon_bin:       $(command -v gnomon)"
   echo "gnomon_version:   $(gnomon --version 2>/dev/null | head -1 || echo unknown)"
+  echo "gnomon_installed_sha: $(cat "$HOME/.local/share/gnomon/installed-sha" 2>/dev/null || echo unknown)"
+  echo "gnomon_head_sha:  $(git -C "$HOME/gnomon" rev-parse HEAD 2>/dev/null || echo unknown)"
   echo "uv_bin:           $(command -v uv)"
   echo "uv_version:       $(uv --version)"
   echo "uv_default_cache: $(env -u UV_CACHE_DIR uv cache dir 2>/dev/null || echo unknown)"
