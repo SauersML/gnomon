@@ -26,6 +26,7 @@ import re
 import struct
 import subprocess
 import sys
+import faulthandler
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,9 +41,21 @@ logging.basicConfig(
     stream=sys.stdout,
     force=True,
 )
+faulthandler.enable(file=sys.stderr, all_threads=True)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 HOME = Path.home()
+
+_CUDA_SONAME_FAMILIES = {
+    "libcuda",
+    "libcudart",
+    "libcublas",
+    "libcublasLt",
+    "libcusparse",
+    "libcusolver",
+    "libnvJitLink",
+    "libnvrtc",
+}
 
 
 def user_cache_root() -> Path:
@@ -51,6 +64,62 @@ def user_cache_root() -> Path:
     if xdg_cache_home:
         return Path(xdg_cache_home).expanduser()
     return HOME / ".cache"
+
+
+def cuda_library_family(basename: str) -> str | None:
+    stem = basename.split(".so", 1)[0]
+    return stem if stem in _CUDA_SONAME_FAMILIES else None
+
+
+def mapped_cuda_libraries() -> dict[str, list[str]]:
+    maps = Path("/proc/self/maps")
+    try:
+        content = maps.read_text()
+    except OSError:
+        return {}
+    grouped: dict[str, set[str]] = {}
+    for line in content.splitlines():
+        fields = line.split()
+        if not fields:
+            continue
+        raw_path = fields[-1]
+        if not raw_path.startswith("/"):
+            continue
+        family = cuda_library_family(Path(raw_path).name)
+        if family is None:
+            continue
+        grouped.setdefault(family, set()).add(raw_path)
+    return {family: sorted(paths) for family, paths in sorted(grouped.items())}
+
+
+def print_cuda_process_diagnostics(prefix: str) -> None:
+    print(f"{prefix} CUDA process maps:")
+    mapped = mapped_cuda_libraries()
+    if not mapped:
+        print(f"{prefix}   <none>")
+        return
+    for family, paths in mapped.items():
+        conflict = " CONFLICT" if len(paths) > 1 else ""
+        print(f"{prefix}   {family}:{conflict}")
+        for path in paths:
+            print(f"{prefix}     {path}")
+
+
+def print_gamfit_diagnostics(gamfit_module) -> None:
+    print("gamfit diagnostics:")
+    print(f"  module_file: {getattr(gamfit_module, '__file__', '<unknown>')}")
+    try:
+        print(gamfit_module.format_cuda_diagnostics())
+    except Exception as exc:
+        print(f"  cuda_diagnostics_error: {type(exc).__name__}: {exc}")
+    try:
+        info = gamfit_module.build_info()
+    except Exception as exc:
+        print(f"  build_info_error: {type(exc).__name__}: {exc}")
+        return
+    for key in ("available", "module", "crate", "engine_crate", "python_module", "version"):
+        if key in info:
+            print(f"  build_info.{key}: {info[key]}")
 
 
 def _dedup_paths(paths: list[Path]) -> list[Path]:
@@ -811,6 +880,37 @@ def survival_model_columns(num_pcs: int) -> list[str]:
     ]
 
 
+def print_fit_frame_diagnostics(df: pd.DataFrame, label: str) -> None:
+    print(f"  fit_frame[{label}]: rows={len(df):,} cols={len(df.columns)}")
+    print(f"  fit_frame[{label}]: columns={list(df.columns)}")
+    duplicate_columns = df.columns[df.columns.duplicated()].tolist()
+    print(f"  fit_frame[{label}]: duplicate_columns={duplicate_columns or '<none>'}")
+    for col in df.columns:
+        series = df[col]
+        nulls = int(series.isna().sum())
+        dtype = str(series.dtype)
+        if pd.api.types.is_numeric_dtype(series):
+            values = pd.to_numeric(series, errors="coerce").to_numpy(dtype=float, copy=False)
+            finite = np.isfinite(values)
+            finite_n = int(finite.sum())
+            if finite_n:
+                print(
+                    f"  fit_frame[{label}].{col}: dtype={dtype} null={nulls} "
+                    f"finite={finite_n:,}/{len(series):,} "
+                    f"min={float(np.nanmin(values)):.6g} "
+                    f"max={float(np.nanmax(values)):.6g} "
+                    f"mean={float(np.nanmean(values)):.6g}"
+                )
+            else:
+                print(
+                    f"  fit_frame[{label}].{col}: dtype={dtype} null={nulls} "
+                    f"finite=0/{len(series):,}"
+                )
+        else:
+            top = series.astype(str).value_counts(dropna=False).head(5).to_dict()
+            print(f"  fit_frame[{label}].{col}: dtype={dtype} null={nulls} top={top}")
+
+
 def pc_duchon_term(num_pcs: int) -> str:
     pcs = ", ".join(f"PC{i+1}" for i in range(num_pcs))
     # Pure isotropic scale-free Duchon over the leading PCs. Both
@@ -856,13 +956,16 @@ def fit_marginal_slope(train_df: pd.DataFrame, num_pcs: int):  # -> gamfit.Model
     duchon = pc_duchon_term(num_pcs)
     formula = f"Surv(entry_age, exit_age, event) ~ {duchon} + sex"
     cols = survival_model_columns(num_pcs)
+    model_df = train_df[cols]
     print("  fit_spec: family=survival marginal-slope")
     print(f"  fit_spec: formula={formula!r}")
     print(f"  fit_spec: z_column='prs_z'  logslope_formula={duchon!r}")
     print(f"  fit_spec: num_pcs={num_pcs}  duchon_centers={DUCHON_CENTERS}  n_train={len(train_df)}")
     print(f"  fit_spec: gamfit={gamfit.__version__}")
+    print_fit_frame_diagnostics(model_df, "survival_marginal_slope_train")
+    print_cuda_process_diagnostics("  fit_spec:")
     return gamfit.fit(
-        train_df[cols],
+        model_df,
         formula,
         survival_likelihood="marginal-slope",
         z_column="prs_z",
@@ -2251,6 +2354,7 @@ def main() -> None:
         raise SystemExit("marginal_slope_diseases.py takes no arguments")
     import gamfit
     print(f"gamfit version: {gamfit.__version__}")
+    print_gamfit_diagnostics(gamfit)
     # The real "did the previous fit survive?" cache is gamfit's persistent
     # warm-start store, not the .gamfit files in FITS_DIR. It auto-resumes
     # any fit on identical (data, version) keys; reruns are typically a
