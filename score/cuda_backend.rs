@@ -856,6 +856,16 @@ fn run_cuda_pipeline(
     // the heap used by the parallel complex resolver or the final score writer.
     drop(runtime.take());
 
+    // Finalise the GPU-phase progress bar and join its background log thread
+    // before the CPU-only complex resolver starts. Otherwise the fallback log
+    // thread keeps running through resolve_complex_variants, racing with the
+    // resolver's own progress bar and the "Complex variant resolution complete."
+    // eprintln on stderr, and only gets joined when run_cuda_pipeline returns —
+    // observed to interleave with cudarc/cuBLAS/libcudart at-exit teardown and
+    // surface as a glibc "double free or corruption (!prev)" abort just after
+    // the resolver finishes.
+    drop(support_guard);
+
     if !prep_result.complex_rules.is_empty() {
         if should_spool {
             let spool_file_path = spool_path
