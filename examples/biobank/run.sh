@@ -215,6 +215,41 @@ require_run_state_capacity \
   "$MIN_RUN_STATE_FREE_GIB" \
   "$MIN_RUN_STATE_FREE_INODES"
 
+# If RUN_STATE_DIR secretly resolves back to $HOME's filesystem the cache
+# redirect is cosmetic -- a full home volume still ENOSPCs the resolver. Fail
+# loudly here instead of silently re-creating the original bug.
+if same_mount "$HOME" "$RUN_STATE_DIR"; then
+  {
+    echo "[run.sh] FATAL: $RUN_STATE_DIR shares a filesystem with \$HOME"
+    echo "[run.sh] (both on $(mount_of "$HOME")). Cache redirect would not help."
+    echo "[run.sh] Mount a separate workspace disk under $AOU_DISK_ROOT or"
+    echo "[run.sh] point RESULTS_DIR / RUN_STATE_DIR at a larger volume."
+    df -hP "$HOME" "$RUN_STATE_DIR"
+  } | tee -a "$RESULTS" >&2
+  failure_diagnostics 12
+fi
+
+# Reclaim the legacy uv cache once the new location is verified on a different
+# filesystem. This is the directory that filled up in past runs; leaving it
+# behind keeps starving $HOME for unrelated tools and gives a false sense the
+# redirect "worked". Only uv's own cache subtree is touched.
+LEGACY_UV_CACHE="$HOME/.cache/uv"
+if [ -d "$LEGACY_UV_CACHE" ] && ! same_mount "$LEGACY_UV_CACHE" "$UV_CACHE_DIR"; then
+  legacy_size="$(du -sh "$LEGACY_UV_CACHE" 2>/dev/null | awk '{print $1}')"
+  echo "[run.sh] reclaiming legacy uv cache at $LEGACY_UV_CACHE (${legacy_size:-?})" \
+    | tee -a "$RESULTS" >&2
+  rm -rf -- "$LEGACY_UV_CACHE" || true
+fi
+
+# Bound long-term growth of the redirected cache. `uv cache prune` removes
+# entries no environment resolves to; safe every invocation. UV_CACHE_DIR
+# (exported above) is authoritative -- do NOT pass --cache-dir here, since in
+# uv 0.11.x that flag does not reach every code path. Failure here is
+# non-fatal: a transient prune error must not block the real run.
+uv cache prune 2>&1 \
+  | sed 's/^/[run.sh][uv cache prune] /' \
+  | tee -a "$RESULTS" >&2 || true
+
 # --- preamble ---------------------------------------------------------------
 {
   echo "=========================================================================="
@@ -301,13 +336,10 @@ require_run_state_capacity \
   "$MIN_RUN_STATE_FREE_INODES"
 
 # --- the actual run ---------------------------------------------------------
-# UV_CACHE_DIR is exported above; do NOT also pass --cache-dir. In uv 0.11.x
-# the CLI flag does not reach every cache-writing code path (the simple-index
-# HTTP client cache wrote to ~/.cache/uv even when --cache-dir was set, which
-# is the exact mechanism that produced the original "No space left on device"
-# on the small home partition). The env var is authoritative and propagates
-# to every child uv process; the flag is at best redundant and at worst a
-# load-bearing-looking line that silently does nothing.
+# UV_CACHE_DIR is exported above instead of repeated as a flag. The original
+# failure happened before Python started because uv used its default
+# HOME/.cache/uv client cache; the env var is authoritative for every uv cache
+# path in this process and any child uv process.
 uv run \
     --no-project \
     --python 3.11 \
