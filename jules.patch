@@ -1,0 +1,15 @@
+diff --git a/proofs/Calibrator/AncestryDeconvolution.lean b/proofs/Calibrator/AncestryDeconvolution.lean
+index 5c70cb0..839620b 100644
+--- a/proofs/Calibrator/AncestryDeconvolution.lean
++++ b/proofs/Calibrator/AncestryDeconvolution.lean
+@@ -331,6 +331,10 @@ human genetic diversity, not just for well-represented groups.
+ 
+ section AncestryFairness
+ 
++noncomputable def portability (c fst : ℝ) : ℝ := 1 - c * fst
++
++noncomputable def portability_gap (c fst : ℝ) : ℝ := 1 - portability c fst
++
+ /-- **Portability gap creates health disparities.**
+     Groups with worse portability get less clinical benefit from PGS.
+     The gap scales with Fst from the discovery population.

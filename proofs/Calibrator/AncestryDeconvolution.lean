@@ -331,6 +331,10 @@ human genetic diversity, not just for well-represented groups.
 
 section AncestryFairness
 
+noncomputable def portability (c fst : ℝ) : ℝ := 1 - c * fst
+
+noncomputable def portability_gap (c fst : ℝ) : ℝ := 1 - portability c fst
+
 /-- **Portability gap creates health disparities.**
     Groups with worse portability get less clinical benefit from PGS.
     The gap scales with Fst from the discovery population.
