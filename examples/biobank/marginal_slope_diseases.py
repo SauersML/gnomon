@@ -1077,37 +1077,65 @@ def evaluate_model_pair(
         )
 
     print(
-        f"  baseline_spec: Cox PH on Z_norm2 + sex (PC-based mean+var "
-        f"adjustment, no pop labels) -- matches GAM's `+ sex` term"
+        f"  baseline_spec: two left-truncated Cox PH benchmarks; both share "
+        f"`+ sex` with the GAM."
     )
-    coef_z, coef_sex = fit_baseline_cox(
-        train["entry_age"].to_numpy(),
-        train["exit_age"].to_numpy(),
-        train["event"].to_numpy(),
-        train["z_norm2"].to_numpy(),
-        train["sex"].to_numpy(),
-    )
+    entry_tr = train["entry_age"].to_numpy()
+    exit_tr  = train["exit_age"].to_numpy()
+    event_tr = train["event"].to_numpy()
+    sex_tr   = train["sex"].to_numpy()
+    sex_te   = test["sex"].to_numpy()
+
+    # Baseline A: Z_norm2 (PC mean+var adjusted PRS) + sex
+    X_A_tr = np.column_stack([train["z_norm2"].to_numpy(), sex_tr])
+    X_A_te = np.column_stack([test["z_norm2"].to_numpy(), sex_te])
+    A_names = ["z_norm2", "sex"]
+    A_coefs = fit_baseline_cox(entry_tr, exit_tr, event_tr, X_A_tr, A_names)
     print(
-        f"  baseline_coef: log_HR(z_norm2)={coef_z:+.4f}  HR/SD={np.exp(coef_z):.4f}  "
-        f"log_HR(sex)={coef_sex:+.4f}"
+        f"  baselineA   Cox PH on  z_norm2 + sex          "
+        f"log_HR(z_norm2)={A_coefs['z_norm2']:+.4f}  "
+        f"HR/SD={np.exp(A_coefs['z_norm2']):.4f}  "
+        f"log_HR(sex)={A_coefs['sex']:+.4f}"
     )
-    # Partial hazard = exp(β_z·z + β_sex·sex). Concordance is monotone-
-    # invariant, so the missing baseline-hazard centering term doesn't
-    # affect the C-index.
-    base_risk_test = np.exp(
-        coef_z * test["z_norm2"].to_numpy() + coef_sex * test["sex"].to_numpy()
+
+    # Baseline B: prs_z + sex + PC1..PC_k (linear PCs as Cox covariates)
+    X_B_tr = np.column_stack([
+        train["prs_z"].to_numpy(), sex_tr, train[pc_cols].to_numpy(),
+    ])
+    X_B_te = np.column_stack([
+        test["prs_z"].to_numpy(), sex_te, test[pc_cols].to_numpy(),
+    ])
+    B_names = ["prs_z", "sex", *pc_cols]
+    B_coefs = fit_baseline_cox(entry_tr, exit_tr, event_tr, X_B_tr, B_names)
+    pc_str = "  ".join(f"{c}={B_coefs[c]:+.3f}" for c in pc_cols)
+    print(
+        f"  baselineB   Cox PH on  prs_z + sex + {'+'.join(pc_cols)}  "
+        f"log_HR(prs_z)={B_coefs['prs_z']:+.4f}  "
+        f"HR/SD={np.exp(B_coefs['prs_z']):.4f}  "
+        f"log_HR(sex)={B_coefs['sex']:+.4f}  [{pc_str}]"
     )
-    base_test_m = metrics(
-        test["exit_age"].to_numpy(), test["event"].to_numpy(), base_risk_test,
-    )
-    base_train_m = None
+
+    def _risk(X, names, coefs):
+        beta = np.array([coefs[n] for n in names])
+        return np.exp(X @ beta)
+
+    A_test_m = metrics(test["exit_age"].to_numpy(), test["event"].to_numpy(),
+                        _risk(X_A_te, A_names, A_coefs))
+    B_test_m = metrics(test["exit_age"].to_numpy(), test["event"].to_numpy(),
+                        _risk(X_B_te, B_names, B_coefs))
+    A_train_m = B_train_m = None
     if score_train:
-        base_risk_train = np.exp(
-            coef_z * train["z_norm2"].to_numpy() + coef_sex * train["sex"].to_numpy()
-        )
-        base_train_m = metrics(
-            train["exit_age"].to_numpy(), train["event"].to_numpy(), base_risk_train,
-        )
+        A_train_m = metrics(train["exit_age"].to_numpy(),
+                             train["event"].to_numpy(),
+                             _risk(X_A_tr, A_names, A_coefs))
+        B_train_m = metrics(train["exit_age"].to_numpy(),
+                             train["event"].to_numpy(),
+                             _risk(X_B_tr, B_names, B_coefs))
+
+    # Keep legacy aliases so the downstream return dict and run-summary
+    # parsers keep working without churn.
+    base_test_m = A_test_m
+    base_train_m = A_train_m
 
     print(
         f"  {label}  train_n={len(train):,}  test_n={gam_test_m['n']:,}  "
@@ -1115,20 +1143,24 @@ def evaluate_model_pair(
         f"median_exit_age={gam_test_m['median_exit_age']:.2f}  horizon={t_horizon:.2f}"
     )
     if score_train:
-        assert gam_train_m is not None and base_train_m is not None
-        print(
-            f"  GAM       train_C={gam_train_m['concordance']:.4f}  "
-            f"test_C={gam_test_m['concordance']:.4f}"
-        )
-        print(
-            f"  baseline  train_C={base_train_m['concordance']:.4f}  "
-            f"test_C={base_test_m['concordance']:.4f}"
-        )
+        assert gam_train_m is not None and A_train_m is not None and B_train_m is not None
+        print(f"  GAM        train_C={gam_train_m['concordance']:.4f}  "
+              f"test_C={gam_test_m['concordance']:.4f}")
+        print(f"  baselineA  train_C={A_train_m['concordance']:.4f}  "
+              f"test_C={A_test_m['concordance']:.4f}")
+        print(f"  baselineB  train_C={B_train_m['concordance']:.4f}  "
+              f"test_C={B_test_m['concordance']:.4f}")
     else:
-        print(f"  GAM       test_C={gam_test_m['concordance']:.4f}")
-        print(f"  baseline  test_C={base_test_m['concordance']:.4f}")
-    delta = gam_test_m["concordance"] - base_test_m["concordance"]
-    print(f"  delta     test_C(GAM - baseline)={delta:+.4f}")
+        print(f"  GAM        test_C={gam_test_m['concordance']:.4f}")
+        print(f"  baselineA  test_C={A_test_m['concordance']:.4f}")
+        print(f"  baselineB  test_C={B_test_m['concordance']:.4f}")
+    delta_A = gam_test_m["concordance"] - A_test_m["concordance"]
+    delta_B = gam_test_m["concordance"] - B_test_m["concordance"]
+    print(f"  delta      test_C(GAM-baselineA Z_norm2)={delta_A:+.4f}  "
+          f"(GAM-baselineB linear-PCs)={delta_B:+.4f}")
+    # Keep legacy single-baseline `delta` line so the snapshot parser still
+    # captures the headline number; treat baselineA as the canonical reference.
+    print(f"  delta     test_C(GAM - baseline)={delta_A:+.4f}")
     return {
         "gam_train_c": (
             float("nan") if gam_train_m is None else gam_train_m["concordance"]
@@ -1137,8 +1169,13 @@ def evaluate_model_pair(
         "baseline_train_c": (
             float("nan") if base_train_m is None else base_train_m["concordance"]
         ),
-        "baseline_test_c": base_test_m["concordance"],
-        "delta_test_c": delta,
+        "baseline_test_c": A_test_m["concordance"],
+        "baselineB_train_c": (
+            float("nan") if B_train_m is None else B_train_m["concordance"]
+        ),
+        "baselineB_test_c": B_test_m["concordance"],
+        "delta_test_c": delta_A,
+        "delta_test_c_vs_baselineB": delta_B,
     }
 
 
