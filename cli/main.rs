@@ -45,7 +45,9 @@ use ndarray::{Array1, ArrayView1};
 use std::collections::HashSet;
 #[cfg(any(feature = "score", feature = "map", feature = "terms"))]
 use std::path::PathBuf;
-use std::{env, process};
+use std::env;
+#[cfg(not(unix))]
+use std::process;
 
 #[cfg(feature = "score")]
 #[path = "../score/main.rs"]
@@ -411,28 +413,57 @@ enum CalibrateCommands {
     Infer(InferArgs),
 }
 
-fn main() {
-    let result = dispatch_current_binary();
-    // Every entrypoint above writes and flushes its output artifacts inside
-    // its own `run_*` function, and any cudarc CudaRuntime has been explicitly
-    // torn down at the end of the CUDA pipeline stage. Skip the natural drop
-    // chain on the way out: on Linux the cudarc + cuBLAS + libcudart at-exit
-    // teardown is known to interleave with glibc and abort with "double free
-    // or corruption (!prev)" *after* every meaningful piece of work has
-    // finished, turning a successful run into a non-zero exit in any wrapper
-    // (Python `subprocess.run(..., check=True)`, `set -e` shells, CI). The
-    // kernel reclaims GPU memory, pinned host buffers, memmaps, and rayon
-    // thread-pool state at process exit.
+/// Terminate the process without running C++ static destructors or atexit
+/// handlers.
+///
+/// Background: every meaningful artifact has already been flushed to disk
+/// by the time `main` returns, and the CUDA runtime / cuBLAS handle has
+/// been explicitly torn down at the end of the GPU pipeline stage. What's
+/// left is the libcudart / cuBLAS / cudarc dlopen-based at-exit teardown,
+/// which on Linux occasionally interleaves with glibc and aborts the
+/// process with "double free or corruption (!prev)" *after* the run
+/// succeeded. Any wrapper using `subprocess.run(..., check=True)` or
+/// `set -e` sees that abort and reports a failure even though no scoring
+/// work was lost.
+///
+/// `std::process::exit` does NOT solve this: it calls libc `exit()`,
+/// which runs every `__attribute__((destructor))` and C++ static
+/// destructor registered by the loaded shared libraries — including the
+/// CUDA stack's. `_exit()` (POSIX) skips all of those: it closes file
+/// descriptors and terminates. We flush stdio explicitly first, since
+/// `_exit` doesn't.
+///
+/// On Windows we fall back to `process::exit` because the CUDA crash
+/// hasn't been reported there and Windows uses a different shutdown
+/// path entirely.
+fn terminate_skipping_atexit(code: i32) -> ! {
     use std::io::Write;
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
+
+    #[cfg(unix)]
+    {
+        // POSIX `_exit`: skip atexit handlers, C++ static destructors,
+        // and stdio cleanup. Kernel reclaims GPU memory, pinned host
+        // buffers, memmaps, and rayon thread-pool state.
+        unsafe extern "C" {
+            fn _exit(status: i32) -> !;
+        }
+        unsafe { _exit(code) }
+    }
+    #[cfg(not(unix))]
+    {
+        process::exit(code)
+    }
+}
+
+fn main() {
+    let result = dispatch_current_binary();
     match result {
-        Ok(()) => process::exit(0),
+        Ok(()) => terminate_skipping_atexit(0),
         Err(err) => {
             eprintln!("Error: {err}");
-            let _ = std::io::stdout().flush();
-            let _ = std::io::stderr().flush();
-            process::exit(1);
+            terminate_skipping_atexit(1);
         }
     }
 }
