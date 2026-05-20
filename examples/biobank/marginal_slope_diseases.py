@@ -163,6 +163,7 @@ LOSO_AXIS_TO_COLUMN = {
 GNOMON_BIN = os.environ.get("GNOMON_BIN", "gnomon")
 PGS_ID_PATTERN = re.compile(r"^PGS\d{6}$")
 STANDARD_NORMAL = NormalDist()
+Z_975 = STANDARD_NORMAL.inv_cdf(0.975)
 
 # AoU controlled CDR layout (per the "Controlled CDR Directory" doc and "How
 # the All of Us Genomic data are organized"):
@@ -1016,6 +1017,125 @@ def _add_same_time_contributions(
     for pos, rank in zip(censor_pos, censor_ranks):
         r = int(rank)
         num_per_row[pos] += event_tree.greater(r) + 0.5 * event_tree.equal(r)
+
+
+def metrics(exit_: np.ndarray, event: np.ndarray, risk: np.ndarray) -> CIndexStats:
+    """Harrell's C plus IJ standard error for aligned paired deltas."""
+    exit_ = np.asarray(exit_, dtype=np.float64)
+    event = np.asarray(event, dtype=bool)
+    risk = np.asarray(risk, dtype=np.float64)
+    finite = np.isfinite(exit_) & np.isfinite(risk)
+    exit_ = exit_[finite]
+    event = event[finite]
+    risk = risk[finite]
+    n = int(len(exit_))
+    if n < 2:
+        raise ValueError("C-index needs at least two finite rows")
+
+    order = np.lexsort((~event, exit_))
+    times = exit_[order]
+    events = event[order]
+    ranks = np.searchsorted(np.unique(risk), risk, side="left").astype(np.int64)
+    sorted_ranks = ranks[order]
+    n_ranks = int(ranks.max()) + 1
+
+    num_per_sorted = np.zeros(n, dtype=np.float64)
+    den_per_sorted = np.zeros(n, dtype=np.float64)
+    past_events = Fenwick(n_ranks)
+    future_rows = Fenwick(n_ranks)
+    for rank in sorted_ranks:
+        future_rows.add(int(rank))
+
+    start = 0
+    while start < n:
+        end = start + 1
+        while end < n and times[end] == times[start]:
+            end += 1
+        group_pos = np.arange(start, end)
+        group_ranks = sorted_ranks[start:end]
+        for rank in group_ranks:
+            future_rows.add(int(rank), -1)
+
+        past_n = past_events.total()
+        if past_n:
+            den_per_sorted[start:end] += past_n
+            for pos, rank in zip(group_pos, group_ranks):
+                r = int(rank)
+                num_per_sorted[pos] += past_events.greater(r) + 0.5 * past_events.equal(r)
+
+        event_mask = events[start:end]
+        event_pos = group_pos[event_mask]
+        censor_pos = group_pos[~event_mask]
+        _add_same_time_contributions(
+            group_ranks[event_mask],
+            group_ranks[~event_mask],
+            event_pos,
+            censor_pos,
+            num_per_sorted,
+            den_per_sorted,
+            n_ranks,
+        )
+
+        future_n = future_rows.total()
+        if future_n:
+            den_per_sorted[event_pos] += future_n
+            for pos, rank in zip(event_pos, group_ranks[event_mask]):
+                r = int(rank)
+                num_per_sorted[pos] += future_rows.prefix(r - 1) + 0.5 * future_rows.equal(r)
+
+        for rank in group_ranks[event_mask]:
+            past_events.add(int(rank))
+        start = end
+
+    comparable_pairs = int(round(den_per_sorted.sum() / 2.0))
+    if comparable_pairs == 0:
+        raise ValueError("no comparable pairs for C-index")
+    concordance = float((num_per_sorted.sum() / 2.0) / comparable_pairs)
+    residual = num_per_sorted - concordance * den_per_sorted
+    influence_sorted = n * residual / comparable_pairs
+    se = float(np.sqrt(np.sum(influence_sorted**2) / (n * max(n - 1, 1))))
+
+    influence = np.empty(n, dtype=np.float64)
+    influence[order] = influence_sorted
+    return CIndexStats(
+        n=n,
+        n_events=int(event.sum()),
+        median_exit_age=float(np.median(exit_)),
+        comparable_pairs=comparable_pairs,
+        concordance=concordance,
+        se=se,
+        ci_low=float(max(0.0, concordance - Z_975 * se)),
+        ci_high=float(min(1.0, concordance + Z_975 * se)),
+        influence=influence,
+    )
+
+
+def fmt_c(stats: CIndexStats) -> str:
+    return (
+        f"{stats.concordance:.4f} "
+        f"95%CI=[{stats.ci_low:.4f},{stats.ci_high:.4f}] "
+        f"SE={stats.se:.4f} pairs={stats.comparable_pairs:,}"
+    )
+
+
+def paired_delta_ci(left: CIndexStats, right: CIndexStats) -> tuple[float, float, float, float]:
+    if left.n != right.n:
+        raise ValueError(f"paired delta needs aligned rows; got {left.n} and {right.n}")
+    delta = left.concordance - right.concordance
+    infl = left.influence - right.influence
+    n = left.n
+    se = float(np.sqrt(np.sum(infl**2) / (n * max(n - 1, 1))))
+    return (
+        float(delta),
+        se,
+        float(delta - Z_975 * se),
+        float(delta + Z_975 * se),
+    )
+
+
+def fmt_delta(delta_ci: tuple[float, float, float, float]) -> str:
+    delta, se, lo, hi = delta_ci
+    return f"{delta:+.4f} 95%CI=[{lo:+.4f},{hi:+.4f}] SE={se:.4f}"
 
 
 def z_norm2(
