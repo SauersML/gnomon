@@ -425,7 +425,32 @@ def ensure_scored(pgs_ids: list[str]) -> None:
     }
     print(f"[score] running {GNOMON_BIN} score {score_arg} {PLINK_PREFIX}")
     print(f"[score] cuda libs: {nv_libs}")
-    subprocess.run([GNOMON_BIN, "score", score_arg, str(PLINK_PREFIX)], check=True, env=env)
+    # Validate by output presence, not by exit code. gnomon binaries built
+    # before commit 1896221e ("skip atexit handlers via _exit on unix")
+    # finish writing every `.sscore` output successfully and then abort
+    # during the cudarc / cuBLAS / libcudart atexit teardown, returning
+    # SIGABRT to the wrapper even though no scoring work was lost.
+    # install.sh keeps falling back to those binaries while a release
+    # containing the fix hasn't published yet, so check the on-disk
+    # outputs and only re-raise if they're actually missing.
+    result = subprocess.run(
+        [GNOMON_BIN, "score", score_arg, str(PLINK_PREFIX)], check=False, env=env,
+    )
+    still_missing = [p for p in missing if _find_sscore_for(p) is None]
+    if still_missing:
+        print(
+            f"[score] subprocess returned {result.returncode}; missing sscore "
+            f"outputs for: {still_missing}",
+            flush=True,
+        )
+        raise subprocess.CalledProcessError(result.returncode, result.args)
+    if result.returncode != 0:
+        print(
+            f"[score] subprocess returned {result.returncode} but every "
+            f"expected `.sscore` is present for {missing}; treating as "
+            "success (known cudarc atexit abort, fixed in gnomon >= 1896221e).",
+            flush=True,
+        )
 
 
 def load_one_pgs(pgs_id: str) -> pd.DataFrame:
