@@ -1361,7 +1361,7 @@ def survival_library_metrics(
         raise ValueError(
             f"survival matrix shape {survival.shape} does not match "
             f"(n_test={len(test)}, n_times={len(times)})"
-    )
+        )
     tau = float(times[-1])
     c_ipcw = float(concordance_index_ipcw(train_y, test_y, risk, tau=tau)[0])
     c_ipcw_ci_low, c_ipcw_ci_high = bootstrap_ipcw_c_ci(train, test, risk, tau)
