@@ -41,24 +41,20 @@ if [ -z "${GNOMON_RUN_REEXEC:-}" ] && git -C "$SCRIPT_DIR" rev-parse --git-dir >
   fi
 fi
 
-# Install the scorer via the official installer pinned to the just-pulled
-# HEAD SHA. This validation run is source-coupled: installing an older
-# published release would silently re-run a CUDA teardown bug that the
-# current checkout may already have fixed. The installer downloads a
-# pre-built binary from the matching GitHub release rather than building
-# from source — no cargo / rustc / build toolchain needed on the host.
+# Install the scorer via the official installer — always the latest
+# published release. No cargo / rustc / build toolchain needed on the
+# host. The script intentionally does NOT pin to the just-pulled HEAD
+# SHA: HEAD commonly outruns the published release by a few minutes
+# (the release workflow takes ~20 min after a push), and a pin to a
+# not-yet-released SHA hard-fails instead of falling back to the
+# nearest-newer published release.
 if [ ! -d "$HOME/gnomon/.git" ]; then
   echo "[run.sh] expected a git checkout at $HOME/gnomon" >&2
   exit 1
 fi
-GNOMON_HEAD_SHA="$(git -C "$HOME/gnomon" rev-parse HEAD)"
-export GNOMON_INSTALL_MAIN_SHA="$GNOMON_HEAD_SHA"
-echo "[run.sh] installing gnomon via install.sh pinned to HEAD $GNOMON_HEAD_SHA" >&2
-# The installer fetches its own copy of itself so it can self-update; we
-# pipe `curl | bash` to mirror the documented install path. If we're
-# offline / cannot reach github, fall back to the in-repo install.sh so
-# the run still succeeds. Either way, no cargo build.
-if curl -fsSL "https://raw.githubusercontent.com/SauersML/gnomon/${GNOMON_HEAD_SHA}/install.sh" | bash >&2; then
+unset GNOMON_INSTALL_MAIN_SHA
+echo "[run.sh] installing gnomon (latest published release) via install.sh" >&2
+if curl -fsSL "https://raw.githubusercontent.com/SauersML/gnomon/main/install.sh" | bash >&2; then
   :
 elif [ -x "$HOME/gnomon/install.sh" ]; then
   echo "[run.sh] network install failed; falling back to in-repo install.sh" >&2
@@ -67,6 +63,7 @@ else
   echo "[run.sh] could not install gnomon from network or in-repo install.sh" >&2
   exit 1
 fi
+GNOMON_HEAD_SHA="$(git -C "$HOME/gnomon" rev-parse HEAD)"
 mkdir -p "$HOME/.local/share/gnomon"
 printf '%s\n' "$GNOMON_HEAD_SHA" > "$HOME/.local/share/gnomon/installed-sha"
 hash -r
