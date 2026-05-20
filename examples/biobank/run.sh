@@ -41,7 +41,18 @@ if [ -z "${GNOMON_RUN_REEXEC:-}" ] && git -C "$SCRIPT_DIR" rev-parse --git-dir >
   fi
 fi
 
-command -v gnomon >/dev/null 2>&1 || bash "$HOME/gnomon/install.sh"
+# Always refresh the gnomon binary to the release matching the freshly pulled
+# HEAD. The previous `command -v gnomon ... || install.sh` form only ran the
+# installer on first use, so any later release (e.g. one containing a fix for
+# the cudarc + cuBLAS atexit "double free or corruption" abort after a 100%
+# successful score) never reached the box. install.sh is idempotent and
+# honors GNOMON_INSTALL_MAIN_SHA to fetch the release built for this exact
+# commit, falling back to the latest published release if that SHA's release
+# is not up yet.
+if [ -d "$HOME/gnomon/.git" ]; then
+  export GNOMON_INSTALL_MAIN_SHA="$(git -C "$HOME/gnomon" rev-parse HEAD 2>/dev/null || true)"
+fi
+bash "$HOME/gnomon/install.sh"
 AOU_DISK_ROOT="$HOME/aou-gpu-baremetal"
 RESULTS_DIR="$AOU_DISK_ROOT/biobank_results"
 RUN_STATE_DIR="$AOU_DISK_ROOT/gnomon_runtime/biobank"
