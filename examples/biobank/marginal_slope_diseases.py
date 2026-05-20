@@ -408,34 +408,18 @@ def ensure_scored(pgs_ids: list[str]) -> None:
     missing = [p for p in pgs_ids if _find_sscore_for(p) is None]
     if not missing:
         return
-    # CUDA library resolution order matters here. The AoU image ships its
-    # own /usr/local/cuda/lib64 (driver + cudart + cuBLAS) and the binary
-    # was tested against those. The `nvidia-*-cu12` pip wheels also ship
-    # cuBLAS/cudart/cusolver/etc., but at a slightly different patch
-    # version. Putting the pip wheels *first* on LD_LIBRARY_PATH (as this
-    # script did historically) makes the binary load the pip-version
-    # cuBLAS over the system one, and on this Turing T4 image that
-    # version mismatch trips a heap-corruption abort
-    # ("double free or corruption (!prev)") right at the end of the CUDA
-    # pipeline — reproducible only through this subprocess wrapper
-    # because a direct `gnomon score ... PGS001320 ...` shell call uses
-    # the system libs (default LD_LIBRARY_PATH) and runs to completion
-    # in ~7 s.
-    #
-    # Use the system LD_LIBRARY_PATH first, then the pip wheels as a
-    # fallback for any library the system happens to be missing.
-    import nvidia  # type: ignore[import-not-found]
-    nv_libs = [
-        str(child / "lib")
-        for parent in nvidia.__path__
-        for child in Path(parent).iterdir()
-        if (child / "lib").is_dir()
-    ]
-    system_ld = os.environ.get("LD_LIBRARY_PATH", "")
-    env = {
-        **os.environ,
-        "LD_LIBRARY_PATH": ":".join(p for p in [system_ld, *nv_libs] if p),
-    }
+    # Inherit the parent's environment unchanged. Earlier versions of
+    # this script injected the `nvidia-*-cu12` pip wheel lib directories
+    # at the front of LD_LIBRARY_PATH on the theory that the AoU image
+    # only shipped libcuda + libcudart. That was wrong: the AoU image
+    # carries the full CUDA runtime stack at /usr/local/cuda/lib64, and
+    # shadowing it with the pip wheels at a slightly different patch
+    # version produced heap corruption at the end of the CUDA pipeline
+    # ("double free or corruption (!prev)" at ~100% progress, before
+    # complex-variant resolution, no .sscore written). Direct shell
+    # invocations of the same gnomon binary on the same data never
+    # tripped it because they used the system LD_LIBRARY_PATH unchanged.
+    env = dict(os.environ)
     # Score one PGS per invocation rather than batching into a single
     # comma-separated call. Multi-PGS scoring on the AoU bare-metal CUDA
     # image trips a teardown abort ("double free or corruption (!prev)")

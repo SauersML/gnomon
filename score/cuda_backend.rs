@@ -333,6 +333,7 @@ pub fn try_run_cuda(
     let runtime = match init_cuda_runtime_safely(prep) {
         Ok(runtime) => {
             eprintln!("> Backend: CUDA");
+            report_loaded_cuda_libraries();
             runtime
         }
         Err(reason) => {
@@ -359,6 +360,79 @@ pub fn try_run_cuda(
                 panic_payload_to_string(payload)
             );
             Ok(None)
+        }
+    }
+}
+
+/// Print which CUDA shared libraries the process actually dlopened.
+///
+/// gnomon's release binary uses cudarc with `dynamic-loading`, which
+/// dlopens libcuda, libcudart, libcublas, libnvrtc at runtime based on
+/// the runtime linker's search order (LD_LIBRARY_PATH, system paths,
+/// ldconfig cache, …). Different CUDA library *versions* between the
+/// driver (system) and the runtime libs (e.g. pip-installed
+/// `nvidia-cublas-cu12`) are ABI-compatible enough to load but not
+/// always ABI-compatible enough to *run* — the symptom we've seen on
+/// AoU Turing T4 is "double free or corruption (!prev)" at the end of
+/// the CUDA pipeline when pip-wheel CUDA libs precede the system libs
+/// on LD_LIBRARY_PATH.
+///
+/// Printing the resolved library paths up front turns this from "spend
+/// a day in gdb" into "spot the wrong path in the run log".
+fn report_loaded_cuda_libraries() {
+    let proc_self_maps = match fs::read_to_string("/proc/self/maps") {
+        Ok(content) => content,
+        Err(_) => return, // not on a Linux that exposes /proc/self/maps
+    };
+    let mut cuda_libs: Vec<String> = Vec::new();
+    let mut seen: ahash::AHashSet<String> = ahash::AHashSet::new();
+    for line in proc_self_maps.lines() {
+        // Each /proc/self/maps line ends with the mapped path after the
+        // last whitespace run.
+        let path = match line.split_whitespace().last() {
+            Some(p) if p.starts_with('/') => p,
+            _ => continue,
+        };
+        let file_name = Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        let is_cuda = file_name.starts_with("libcuda")
+            || file_name.starts_with("libcudart")
+            || file_name.starts_with("libcublas")
+            || file_name.starts_with("libnvrtc");
+        if !is_cuda {
+            continue;
+        }
+        if seen.insert(path.to_string()) {
+            cuda_libs.push(path.to_string());
+        }
+    }
+    if cuda_libs.is_empty() {
+        return;
+    }
+    cuda_libs.sort();
+    eprintln!("> CUDA libs loaded:");
+    let mut wheel_paths: Vec<&str> = Vec::new();
+    for path in &cuda_libs {
+        eprintln!(">   {path}");
+        if path.contains("/site-packages/nvidia/") {
+            wheel_paths.push(path);
+        }
+    }
+    if !wheel_paths.is_empty() {
+        eprintln!(
+            "> WARNING: CUDA libs above include pip-wheel paths under \
+             site-packages/nvidia/. If those shadow the system CUDA \
+             stack (e.g. /usr/local/cuda/lib64), an ABI/version mismatch \
+             can corrupt the heap at the end of the CUDA pipeline."
+        );
+        eprintln!(
+            "> Fix: put your system CUDA paths first on LD_LIBRARY_PATH \
+             (or unset LD_LIBRARY_PATH and let the loader use its default)."
+        );
+        for path in wheel_paths {
+            eprintln!(">   pip-wheel: {path}");
         }
     }
 }
