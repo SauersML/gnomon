@@ -31,12 +31,11 @@ WORK_DIR="$(mktemp -d -t gnomon-capture-XXXXXX)"
 echo "[capture] work dir: $WORK_DIR" >&2
 
 # --- Get a working gdb -------------------------------------------------------
-# The AoU Jupyter image is Ubuntu 22.04 (glibc 2.35) and ships with no
-# gdb on PATH. Conda's cache directory is unwritable for our user, so
-# `conda install gdb` fails before it can fetch anything. Workaround:
-# grab the official Ubuntu `gdb` .deb from archive.ubuntu.com (or its
-# mirror), extract it locally with `dpkg-deb -x` — that doesn't need
-# root and skips all package-management bookkeeping.
+# The AoU Jupyter image ships no gdb. Conda's cache is unwritable for
+# the jupyter@ user, and the Ubuntu .deb depends on libbabeltrace +
+# libsource-highlight + libipt + libdebuginfod which aren't installed.
+# Use the truly-static x86_64 build from github.com/guyush1/gdb-static
+# instead — it bundles every dependency into one self-contained binary.
 GDB_BIN=""
 if command -v gdb >/dev/null 2>&1; then
   GDB_BIN="$(command -v gdb)"
@@ -44,50 +43,36 @@ if command -v gdb >/dev/null 2>&1; then
 fi
 
 if [ -z "$GDB_BIN" ]; then
-  if ! command -v dpkg-deb >/dev/null 2>&1; then
-    echo "[capture] no gdb on PATH and no dpkg-deb to extract one — bailing." >&2
+  STATIC_GDB_URL="https://github.com/guyush1/gdb-static/releases/download/v17.1-static/gdb-static-slim-x86_64.tar.gz"
+  echo "[capture] downloading static gdb from $STATIC_GDB_URL" >&2
+  mkdir -p "$WORK_DIR/gdb-static"
+  if ! curl -fsSL --retry 3 --connect-timeout 10 "$STATIC_GDB_URL" \
+      -o "$WORK_DIR/gdb-static.tar.gz"; then
+    echo "[capture] could not download static gdb tarball" >&2
     exit 1
   fi
-  echo "[capture] fetching Ubuntu gdb .deb and extracting into $WORK_DIR/gdb-deb" >&2
-  # Pin to a known 22.04 (jammy) build. The actual binary version varies
-  # by minor updates; try the latest mirror copy, fall back to a known
-  # archive URL.
-  GDB_DEB="$WORK_DIR/gdb.deb"
-  GDB_LIBC6="$WORK_DIR/libc6.deb"
-  # Try the 22.04 ports first (also serves x86_64 via the main archive).
-  for url in \
-    "http://archive.ubuntu.com/ubuntu/pool/main/g/gdb/gdb_12.1-0ubuntu1~22.04.2_amd64.deb" \
-    "http://archive.ubuntu.com/ubuntu/pool/main/g/gdb/gdb_12.1-0ubuntu1~22.04_amd64.deb" \
-    "http://mirrors.kernel.org/ubuntu/pool/main/g/gdb/gdb_12.1-0ubuntu1~22.04.2_amd64.deb" \
-    ; do
-    if curl -fsSL --retry 3 --connect-timeout 10 "$url" -o "$GDB_DEB"; then
-      echo "[capture] downloaded gdb deb from $url" >&2
-      break
-    fi
-    rm -f "$GDB_DEB"
-  done
-  if [ ! -s "$GDB_DEB" ]; then
-    echo "[capture] could not download an Ubuntu gdb .deb" >&2
+  tar -xzf "$WORK_DIR/gdb-static.tar.gz" -C "$WORK_DIR/gdb-static" || {
+    echo "[capture] static gdb tarball did not extract" >&2
+    exit 1
+  }
+  # The tarball lays out gdb/gdbserver binaries somewhere inside;
+  # grep for the gdb executable.
+  GDB_BIN="$(find "$WORK_DIR/gdb-static" -maxdepth 5 -type f -name 'gdb' -perm -u+x 2>/dev/null | head -n 1)"
+  if [ -z "$GDB_BIN" ]; then
+    GDB_BIN="$(find "$WORK_DIR/gdb-static" -maxdepth 5 -type f -name 'gdb' 2>/dev/null | head -n 1)"
+  fi
+  if [ -z "$GDB_BIN" ] || [ ! -f "$GDB_BIN" ]; then
+    echo "[capture] static gdb tarball did not contain a gdb binary; contents:" >&2
+    find "$WORK_DIR/gdb-static" -maxdepth 5 -type f 2>/dev/null | head -20 >&2
     exit 1
   fi
-  mkdir -p "$WORK_DIR/gdb-deb"
-  dpkg-deb -x "$GDB_DEB" "$WORK_DIR/gdb-deb"
-  GDB_BIN="$WORK_DIR/gdb-deb/usr/bin/gdb"
-  if [ ! -x "$GDB_BIN" ]; then
-    echo "[capture] extracted .deb did not contain usr/bin/gdb:" >&2
-    ls -la "$WORK_DIR/gdb-deb/usr/bin/" 2>/dev/null >&2 || true
-    exit 1
-  fi
-  # gdb depends on libsource-highlight + libgmp + libpython3.10; those
-  # are installed on every Ubuntu 22.04 base image. If the binary can't
-  # find them we'd error out loudly below.
+  chmod +x "$GDB_BIN"
 fi
 
 echo "[capture] using gdb: $GDB_BIN" >&2
 "$GDB_BIN" --version 2>&1 | head -1 >&2 || {
-  echo "[capture] gdb refuses to run — likely missing a shared library." >&2
-  ldd "$GDB_BIN" 2>&1 | grep -v '=>' | head -10 >&2 || true
-  ldd "$GDB_BIN" 2>&1 | grep 'not found' >&2 || true
+  echo "[capture] gdb refuses to run." >&2
+  ldd "$GDB_BIN" 2>&1 | head -10 >&2 || true
   exit 1
 }
 
