@@ -70,11 +70,17 @@ if [ -z "$GDB_BIN" ]; then
 fi
 
 echo "[capture] using gdb: $GDB_BIN" >&2
-"$GDB_BIN" --version 2>&1 | head -1 >&2 || {
-  echo "[capture] gdb refuses to run." >&2
-  ldd "$GDB_BIN" 2>&1 | head -10 >&2 || true
+# Probe gdb without piping into head — `set -o pipefail` + head closing
+# the pipe early would SIGPIPE gdb and make this look like a failure
+# even when gdb is healthy. Capture full output and grep for the
+# version string instead.
+GDB_VERSION_OUT="$("$GDB_BIN" --version 2>&1)" || true
+if ! printf '%s\n' "$GDB_VERSION_OUT" | head -1 | grep -q 'GNU gdb'; then
+  echo "[capture] gdb refuses to run; output was:" >&2
+  printf '%s\n' "$GDB_VERSION_OUT" | head -10 >&2
   exit 1
-}
+fi
+printf '%s\n' "$GDB_VERSION_OUT" | head -1 >&2
 
 # --- Run gnomon under gdb directly (no need to mess with core_pattern) ------
 # Running the program inside gdb means we don't depend on the kernel's
