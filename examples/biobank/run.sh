@@ -82,7 +82,7 @@ uv run \
     --python 3.11 \
     --refresh-package gamfit \
     --upgrade-package gamfit \
-    --with 'gamfit<0.1.84' \
+    --with gamfit \
     --with numpy \
     --with pandas \
     --with pyarrow \
