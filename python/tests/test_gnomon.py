@@ -58,18 +58,37 @@ _SCORE_FAKE = textwrap.dedent(
     score_arg = argv[1]
     input_path = pathlib.Path(argv[2])
     parent = input_path.parent or pathlib.Path('.')
-    stem = input_path.stem if input_path.suffix in {'.bed', '.vcf', '.bcf', '.gz', '.txt'} else input_path.name
+
+    # Mirror score::main::score_output_stem.
+    COMPOUND = ('.vcf.bgz', '.vcf.gz', '.bcf.bgz', '.bcf.gz')
+    SIMPLE = ('.bed', '.vcf', '.bcf')
+    name = input_path.name
+    lower = name.lower()
+    stem = name
+    for s in COMPOUND + SIMPLE:
+        if lower.endswith(s) and len(name) > len(s):
+            stem = name[:-len(s)]
+            break
+
+    def fnv1a64_hex8(b):
+        h = 0xCBF29CE484222325
+        for ch in b:
+            h ^= ch
+            h = (h * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+        return f'{h:016x}'[-8:]
+
+    spath = pathlib.Path(score_arg)
+    if not spath.exists() and 'PGS' in score_arg:
+        ids = [p.split('|', 1)[0].strip() for p in score_arg.split(',')]
+        ids = [i for i in ids if i.startswith('PGS')]
+        suffix = f'pgs{len(ids)}_{fnv1a64_hex8(score_arg.encode())}'
+        out = parent / f'{stem}_{suffix}.sscore'
+    elif spath.is_dir():
+        out = parent / f'{stem}.sscore'
+    else:
+        out = parent / f'{stem}_{spath.stem}.sscore'
 
     parts = [p.strip() for p in score_arg.split(',')]
-    if all(p.upper().startswith('PGS') for p in parts):
-        suffix = '-'.join(p.upper() for p in parts)
-        out = parent / f'{stem}_{suffix}.sscore'
-    else:
-        spath = pathlib.Path(score_arg)
-        if spath.is_dir():
-            out = parent / f'{stem}.sscore'
-        else:
-            out = parent / f'{stem}_{spath.stem}.sscore'
 
     # Write a small sscore: 2 samples, 2 scores when 2 IDs given.
     n_scores = max(1, len(parts))
@@ -205,6 +224,58 @@ def test_read_sscore_missing_iid_raises(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def test_expected_sscore_path_strips_compound_suffixes(tmp_path):
+    """Regression: paths like sample.vcf.gz used to be passed through
+    with only `.gz` stripped, producing `sample.vcf_<score>.sscore`.
+
+    The naming convention here must stay byte-identical to
+    score::main::score_output_stem + inline_pgs_output_suffix in the
+    Rust source; otherwise the wrapper looks for the wrong file after
+    a successful run.
+    """
+    from gnomon._api import _expected_sscore_path, _inline_pgs_output_suffix
+
+    # Stem stripping: every input shape should converge to "arrays".
+    pgs_suffix = _inline_pgs_output_suffix("PGS001")
+    for raw in (
+        "arrays",
+        "arrays.bed",
+        "arrays.vcf",
+        "arrays.bcf",
+        "arrays.vcf.gz",
+        "arrays.bcf.gz",
+        "arrays.vcf.bgz",
+        "arrays.bcf.bgz",
+    ):
+        got = _expected_sscore_path(Path("/d") / raw, "PGS001", score_exists=False)
+        assert str(got) == f"/d/arrays_{pgs_suffix}.sscore", (raw, got)
+
+    # Multiple inline PGS IDs share a single hash-based suffix.
+    multi_suffix = _inline_pgs_output_suffix("PGS001,PGS002")
+    got = _expected_sscore_path(Path("/d/arrays"), "PGS001,PGS002", score_exists=False)
+    assert str(got) == f"/d/arrays_{multi_suffix}.sscore"
+
+    # Score file path on disk: use the score file's stem.
+    score_file = tmp_path / "weights.tsv"
+    score_file.write_text("")
+    got = _expected_sscore_path(tmp_path / "data" / "arrays.bed", str(score_file))
+    assert got.name == "arrays_weights.sscore"
+
+
+def test_inline_pgs_suffix_matches_rust_format():
+    """Sanity-check on the inline_pgs_output_suffix format."""
+    from gnomon._api import _inline_pgs_output_suffix
+
+    suffix = _inline_pgs_output_suffix("PGS001,PGS002,PGS003")
+    assert suffix.startswith("pgs3_")
+    assert len(suffix) == len("pgs3_") + 8  # 8 hex chars
+
+    # Hash is sensitive to argument text — comma spacing matters.
+    a = _inline_pgs_output_suffix("PGS001,PGS002")
+    b = _inline_pgs_output_suffix("PGS001, PGS002")
+    assert a != b
+
+
 def test_score_with_pgs_id_argv_and_output(tmp_path, monkeypatch):
     fake = _fake_binary(tmp_path, _SCORE_FAKE)
     geno = _make_genotype(tmp_path)
@@ -212,7 +283,8 @@ def test_score_with_pgs_id_argv_and_output(tmp_path, monkeypatch):
 
     r = score("PGS001,PGS002", geno, binary=fake)
     assert isinstance(r, ScoreResult)
-    assert r.output_path == tmp_path / f"{geno.name}_PGS001-PGS002.sscore"
+    assert r.output_path.name.startswith(f"{geno.name}_pgs2_")
+    assert r.output_path.name.endswith(".sscore")
     assert r.output_path.exists()
     assert r.score_names == ("PGS001", "PGS002")
     assert r.n_samples == 2
@@ -434,10 +506,23 @@ def test_run_all_invokes_all_subcommand(tmp_path, monkeypatch):
         log = pathlib.Path(os.environ['GNOMON_ARGV_LOG'])
         log.write_text(json.dumps(sys.argv[1:]))
         argv = sys.argv[1:]
-        # Write a real sscore so AllResult.score gets populated.
+        # Write a real sscore so AllResult.score gets populated. Use the
+        # same inline-PGS naming convention the wrapper expects.
+        score_arg = argv[1]
         input_p = pathlib.Path(argv[2])
         stem = input_p.stem if input_p.suffix in {'.bed','.vcf','.bcf','.gz'} else input_p.name
-        out = input_p.parent / f'{stem}_PGS001.sscore'
+
+        def fnv1a64_hex8(b):
+            h = 0xCBF29CE484222325
+            for ch in b:
+                h ^= ch
+                h = (h * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+            return f'{h:016x}'[-8:]
+
+        ids = [p.split('|', 1)[0].strip() for p in score_arg.split(',')]
+        ids = [i for i in ids if i.startswith('PGS')]
+        suffix = f'pgs{len(ids)}_{fnv1a64_hex8(score_arg.encode())}'
+        out = input_p.parent / f'{stem}_{suffix}.sscore'
         out.write_text('#FID\\tIID\\tPGS001_AVG\\nFAM\\tS1\\t0.7\\n')
         """
     )

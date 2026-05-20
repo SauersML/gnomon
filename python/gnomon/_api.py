@@ -382,12 +382,26 @@ def _run(
 # We replicate this logic so the wrapper can locate the output file.
 
 
-_PGS_ID_RE = re.compile(r"^PGS\d{6}$", re.IGNORECASE)
+def _fnv1a64_hex8(data: bytes) -> str:
+    """8-hex-digit FNV-1a hash — byte-identical to score::main::fnv1a64_hex8."""
+    h = 0xCBF29CE484222325
+    for b in data:
+        h ^= b
+        h = (h * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return f"{h:016x}"[-8:]
 
 
-def _looks_like_pgs_arg(score_arg: str) -> bool:
-    parts = [p.strip() for p in score_arg.split(",")]
-    return bool(parts) and all(_PGS_ID_RE.match(p) for p in parts)
+def _inline_pgs_output_suffix(score_arg: str) -> str:
+    """Mirror score::main::inline_pgs_output_suffix."""
+    ids = []
+    for item in score_arg.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        first = item.split("|", 1)[0].strip()
+        if first.startswith("PGS"):
+            ids.append(first)
+    return f"pgs{len(ids)}_{_fnv1a64_hex8(score_arg.encode())}"
 
 
 _COMPOUND_INPUT_SUFFIXES = (".vcf.bgz", ".vcf.gz", ".bcf.bgz", ".bcf.gz")
@@ -406,17 +420,33 @@ def _score_output_stem(path: Path) -> str:
     return name
 
 
-def _expected_sscore_path(input_path: Path, score_arg: str) -> Path:
-    """Mirror score::main::score_output_path."""
+def _expected_sscore_path(
+    input_path: Path,
+    score_arg: str,
+    *,
+    score_exists: Optional[bool] = None,
+) -> Path:
+    """Mirror score::main::score_output_path byte-for-byte.
+
+    The Rust logic for the output filename is:
+      * If the SCORE argument does not exist on disk AND it contains
+        ``"PGS"`` somewhere in its text, use the inline-PGS suffix
+        ``pgs<count>_<fnv1a64_hex8>``.
+      * Otherwise, use the file stem of the SCORE argument
+        (or ``"scores"`` if the argument has no filename component).
+    """
     stem = _score_output_stem(input_path)
     parent = input_path.parent if str(input_path.parent) else Path(".")
-    if _looks_like_pgs_arg(score_arg):
-        suffix = "-".join(p.strip().upper() for p in score_arg.split(","))
-        return parent / f"{stem}_{suffix}.sscore"
+
     score_path = Path(score_arg)
-    if score_path.exists() and score_path.is_dir():
-        return parent / f"{stem}.sscore"
-    score_stem = score_path.stem
+    if score_exists is None:
+        score_exists = score_path.exists()
+
+    if not score_exists and "PGS" in score_arg:
+        suffix = _inline_pgs_output_suffix(score_arg)
+        return parent / f"{stem}_{suffix}.sscore"
+
+    score_stem = score_path.stem if score_path.name else "scores"
     return parent / f"{stem}_{score_stem}.sscore"
 
 

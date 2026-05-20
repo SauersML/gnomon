@@ -36,6 +36,27 @@ print(result.score_names)          # ('PGS004536', 'PGS001320', 'PGS005331')
 df = result.scores.to_pandas()
 ```
 
+## Shortcuts: avoid downloads and inference
+
+Every kwarg the upstream CLI exposes is on the Python API. You don't have
+to let gnomon download references or re-infer state you already know.
+
+```python
+gnomon.score(
+    "PGS004536,PGS001320",
+    "/data/cohort/arrays",
+    reference="/cache/hg38.fa",   # skip reference auto-download
+    build="38",                    # skip build auto-detection
+    panel="/cache/1kg_panel.vcf",  # supply your harmonisation panel
+    inferred_sex="male",           # skip the in-pipeline sex scan
+    keep="/data/keep.iids.txt",    # restrict to a sample subset
+)
+```
+
+`gnomon.terms`, `gnomon.run_all`, `gnomon.map.fit/project`,
+`gnomon.calibrate.train/infer` all expose the same precomputed-input
+kwargs.
+
 ## Subcommands
 
 ```python
