@@ -53,23 +53,50 @@ if [ "$REEXECUTED" -eq 0 ] && git -C "$SCRIPT_DIR" rev-parse --git-dir >/dev/nul
 fi
 
 # --- Install the scorer ------------------------------------------------------
-# Build the scorer from the checked-out source. Published releases are
-# asynchronous; accepting the most recent release can silently run an older
-# binary than the source that this script just pulled.
-if [ ! -d "$HOME/gnomon/.git" ]; then
-  echo "[run.sh] expected a git checkout at $HOME/gnomon" >&2
+# Download the most recently published linux-x64 release binary directly
+# from the GitHub Releases API and install it to ~/.local/bin/gnomon.
+# This path requires no cargo / rustc toolchain on the runner. We do not
+# pin to the checked-out HEAD SHA — releases are published asynchronously
+# (~20 min after each push while the build workflow runs), and pinning to
+# an unpublished SHA hard-fails. Accepting the latest published release
+# is the right trade-off for a runner that doesn't carry a Rust build
+# toolchain.
+INSTALL_DIR="$HOME/.local/bin"
+mkdir -p "$INSTALL_DIR" "$HOME/.local/share/gnomon"
+RELEASE_API="https://api.github.com/repos/SauersML/gnomon/releases/latest"
+RELEASE_JSON="$(curl -sL --retry 5 --retry-delay 2 --connect-timeout 5 --max-time 30 "$RELEASE_API")"
+RELEASE_TAG="$(printf '%s' "$RELEASE_JSON" \
+  | sed -n 's/^[[:space:]]*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' \
+  | head -n 1)"
+ASSET_URL="$(printf '%s' "$RELEASE_JSON" \
+  | grep -F 'browser_download_url' \
+  | grep -F 'gnomon-linux-x64-v3.tar.gz' \
+  | cut -d '"' -f 4 \
+  | head -n 1)"
+if [ -z "$ASSET_URL" ]; then
+  ASSET_URL="$(printf '%s' "$RELEASE_JSON" \
+    | grep -F 'browser_download_url' \
+    | grep -F 'gnomon-linux-x64.tar.gz' \
+    | cut -d '"' -f 4 \
+    | head -n 1)"
+fi
+if [ -z "$ASSET_URL" ]; then
+  echo "[run.sh] could not find a linux-x64 asset on the latest release" >&2
   exit 1
 fi
-if ! command -v cargo >/dev/null 2>&1; then
-  echo "[run.sh] cargo is required so gnomon can be built from the checked-out source" >&2
+echo "[run.sh] installing gnomon release $RELEASE_TAG from $ASSET_URL" >&2
+TMP_INSTALL="$(mktemp -d)"
+trap 'rm -rf "$TMP_INSTALL"' EXIT
+curl -fsSL --retry 5 --retry-delay 2 "$ASSET_URL" -o "$TMP_INSTALL/gnomon.tar.gz"
+tar -xzf "$TMP_INSTALL/gnomon.tar.gz" -C "$TMP_INSTALL"
+INSTALLED_BIN="$(find "$TMP_INSTALL" -maxdepth 3 -type f -name gnomon -perm -u+x | head -n 1)"
+if [ -z "$INSTALLED_BIN" ]; then
+  echo "[run.sh] extracted release did not contain a gnomon binary" >&2
   exit 1
 fi
-GNOMON_SOURCE_SHA="$(git -C "$HOME/gnomon" rev-parse HEAD)"
-mkdir -p "$HOME/.local/share/gnomon"
-echo "[run.sh] cargo install --path $HOME/gnomon --bin gnomon --root $HOME/.local (HEAD $GNOMON_SOURCE_SHA)" >&2
-cargo install --path "$HOME/gnomon" --bin gnomon --locked --force --root "$HOME/.local" >&2
-rm -f "$HOME/.local/share/gnomon/installed-release"
-printf '%s\n' "$GNOMON_SOURCE_SHA" > "$HOME/.local/share/gnomon/installed-sha"
+install -m 0755 "$INSTALLED_BIN" "$INSTALL_DIR/gnomon"
+printf '%s\n' "$RELEASE_TAG" > "$HOME/.local/share/gnomon/installed-release"
+git -C "$HOME/gnomon" rev-parse HEAD > "$HOME/.local/share/gnomon/installed-sha"
 hash -r
 AOU_DISK_ROOT="$HOME/aou-gpu-baremetal"
 RESULTS_DIR="$AOU_DISK_ROOT/biobank_results"
