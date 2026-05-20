@@ -4,6 +4,8 @@ export PATH="$HOME/.local/bin:$PATH"
 export PYTHONUNBUFFERED=1
 
 SCRIPT_DIR="$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &>/dev/null && pwd )"
+GAMFIT_MIN_VERSION="0.1.90"
+GAMFIT_SPEC="gamfit>=$GAMFIT_MIN_VERSION"
 
 for arg in "$@"; do
   case "$arg" in
@@ -244,6 +246,56 @@ cache_du() {
   fi
 }
 
+wait_for_gamfit_release() {
+  local attempts=40
+  local delay_seconds=30
+  local attempt=1
+  echo "--- gamfit resolver preflight ---"
+  while [ "$attempt" -le "$attempts" ]; do
+    echo "[run.sh] checking $GAMFIT_SPEC availability (attempt $attempt/$attempts)"
+    if uv run \
+        --no-project \
+        --python 3.11 \
+        --upgrade-package gamfit \
+        --with "$GAMFIT_SPEC" \
+        -- python - "$GAMFIT_MIN_VERSION" <<'PY'
+import re
+import sys
+
+import gamfit
+
+
+def parse_triplet(version: str) -> tuple[int, int, int]:
+    head = version.split("+", 1)[0].split("-", 1)[0]
+    values = []
+    for part in head.split(".")[:3]:
+        match = re.match(r"\d+", part)
+        values.append(int(match.group(0)) if match else 0)
+    while len(values) < 3:
+        values.append(0)
+    return values[0], values[1], values[2]
+
+
+minimum = parse_triplet(sys.argv[1])
+resolved = parse_triplet(gamfit.__version__)
+print(f"resolved gamfit {gamfit.__version__} from {gamfit.__file__}")
+if resolved < minimum:
+    raise SystemExit(f"resolved gamfit is older than required {sys.argv[1]}")
+PY
+    then
+      echo
+      return 0
+    fi
+    if [ "$attempt" -eq "$attempts" ]; then
+      echo "[run.sh] $GAMFIT_SPEC did not resolve after $attempt attempts" >&2
+      return 1
+    fi
+    echo "[run.sh] $GAMFIT_SPEC is not visible to uv yet; retrying in ${delay_seconds}s" >&2
+    sleep "$delay_seconds"
+    attempt=$((attempt + 1))
+  done
+}
+
 failure_diagnostics() {
   local exit_code="$1"
   trap - ERR
@@ -392,6 +444,8 @@ require_run_state_capacity \
   "$MIN_RUN_STATE_FREE_GIB" \
   "$MIN_RUN_STATE_FREE_INODES"
 
+wait_for_gamfit_release 2>&1 | tee -a "$RESULTS"
+
 # --- the actual run ---------------------------------------------------------
 # UV_CACHE_DIR is exported above instead of repeated as a flag. The original
 # failure happened before Python started because uv used its default
@@ -411,7 +465,7 @@ uv run \
     --no-project \
     --python 3.11 \
     --upgrade-package gamfit \
-    --with gamfit \
+    --with "$GAMFIT_SPEC" \
     --with numpy \
     --with pandas \
     --with pyarrow \
