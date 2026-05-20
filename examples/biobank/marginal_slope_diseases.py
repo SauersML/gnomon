@@ -48,7 +48,6 @@ faulthandler.enable(file=sys.stderr, all_threads=True)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 HOME = Path.home()
-REQUIRED_GAMFIT_VERSION = (0, 1, 90)
 
 _CUDA_SONAME_FAMILIES = {
     "libcuda",
@@ -124,28 +123,6 @@ def print_gamfit_diagnostics(gamfit_module) -> None:
     for key in ("available", "module", "crate", "engine_crate", "python_module", "version"):
         if key in info:
             print(f"  build_info.{key}: {info[key]}")
-
-
-def _parse_version_triplet(version: str) -> tuple[int, int, int]:
-    head = version.split("+", 1)[0].split("-", 1)[0]
-    values: list[int] = []
-    for part in head.split(".")[:3]:
-        match = re.match(r"\d+", part)
-        values.append(int(match.group(0)) if match else 0)
-    while len(values) < 3:
-        values.append(0)
-    return values[0], values[1], values[2]
-
-
-def require_fixed_gamfit(gamfit_module) -> None:
-    version = getattr(gamfit_module, "__version__", "0.0.0")
-    if _parse_version_triplet(version) < REQUIRED_GAMFIT_VERSION:
-        required = ".".join(str(part) for part in REQUIRED_GAMFIT_VERSION)
-        raise RuntimeError(
-            f"biobank survival marginal-slope requires gamfit >= {required}; found {version}. "
-            "Older wheels route the rho-only outer solve through first-order BFGS and fail "
-            "with a large REML/LAML gradient."
-        )
 
 
 def _dedup_paths(paths: list[Path]) -> list[Path]:
@@ -2590,14 +2567,11 @@ def main() -> None:
     import gamfit
     print(f"gamfit version: {gamfit.__version__}")
     print_gamfit_diagnostics(gamfit)
-    require_fixed_gamfit(gamfit)
     # The real "did the previous fit survive?" cache is gamfit's persistent
     # warm-start store, not the .gamfit files in FITS_DIR. It auto-resumes
     # any fit on identical (data, version) keys; reruns are typically a
     # handful of PIRLS cycles instead of hundreds. .gamfit files are for
-    # artifact persistence (sharing the fitted model out-of-process) — they
-    # need gamfit >= 0.1.70 to roundtrip survival-marginal-slope correctly
-    # (the 0.1.69 pyffi save path omits survival_time_* metadata).
+    # artifact persistence (sharing the fitted model out-of-process).
     warm_cache_root = user_cache_root() / "gam" / "warm" / "v1"
     print(
         f"warm-start cache: {warm_cache_root} "
