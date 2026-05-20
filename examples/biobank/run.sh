@@ -5,15 +5,26 @@ export PYTHONUNBUFFERED=1
 
 SCRIPT_DIR="$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &>/dev/null && pwd )"
 
-if [ "$#" -ne 0 ]; then
-  echo "run.sh takes no arguments; it always runs the full biobank validation." >&2
-  exit 2
-fi
+for arg in "$@"; do
+  case "$arg" in
+    --reexecuted) ;;
+    *)
+      echo "run.sh takes no arguments; it always runs the full biobank validation." >&2
+      exit 2
+      ;;
+  esac
+done
+
+REEXEC_FLAG="--reexecuted"
+REEXECUTED=0
+for arg in "$@"; do
+  [ "$arg" = "$REEXEC_FLAG" ] && REEXECUTED=1
+done
 
 # --- kill any older biobank run still in flight -----------------------------
 # Match by the python entrypoint, not by run.sh -- prior runs may still be
 # blocking on a long gamfit fit even if their wrapper shell has exited.
-if [ -z "${GNOMON_RUN_REEXEC:-}" ]; then
+if [ "$REEXECUTED" -eq 0 ]; then
   MY_PID=$$
   PIDS_TO_KILL=$(pgrep -f "python.*examples/biobank/marginal_slope_diseases\.py" 2>/dev/null \
     | grep -v "^${MY_PID}$" || true)
@@ -28,53 +39,71 @@ if [ -z "${GNOMON_RUN_REEXEC:-}" ]; then
 fi
 
 # --- self-update: pull latest, then re-exec the refreshed script ------------
-# `exec bash "$0"` reloads run.sh from disk *and* re-imports the python script
-# fresh on each python launch, so the latest code is what actually runs.
-if [ -z "${GNOMON_RUN_REEXEC:-}" ] && git -C "$SCRIPT_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+# `exec bash "$0" --reexecuted` reloads run.sh from disk so the latest
+# code is what actually runs. The `--reexecuted` flag (not an env var)
+# prevents an infinite re-exec loop.
+if [ "$REEXECUTED" -eq 0 ] && git -C "$SCRIPT_DIR" rev-parse --git-dir >/dev/null 2>&1; then
   REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
   echo "[run.sh] git pull --ff-only in $REPO_ROOT" >&2
   if git -C "$REPO_ROOT" pull --ff-only; then
-    export GNOMON_RUN_REEXEC=1
-    exec bash "$0" "$@"
+    exec bash "$0" "$REEXEC_FLAG"
   else
     echo "[run.sh] git pull failed; continuing with on-disk code" >&2
   fi
 fi
 
-# Install the scorer via the official installer — always the latest
-# published release. No cargo / rustc / build toolchain needed on the
-# host. The script intentionally does NOT pin to the just-pulled HEAD
-# SHA: HEAD commonly outruns the published release by a few minutes
-# (the release workflow takes ~20 min after a push), and a pin to a
-# not-yet-released SHA hard-fails instead of falling back to the
-# nearest-newer published release.
+# --- Install the scorer ------------------------------------------------------
+# Direct download of the latest gnomon binary release from GitHub. The
+# upstream install.sh has a self-bootstrap that pins to the latest main
+# SHA (whether or not it has a release), which hard-fails during the
+# 15-20 min window after a push while the build workflow is running.
+# Bypass install.sh entirely: hit /releases/latest, pick the linux-x64-v3
+# asset, extract it. No cargo, no env vars, no bootstrap hand-shake.
 if [ ! -d "$HOME/gnomon/.git" ]; then
   echo "[run.sh] expected a git checkout at $HOME/gnomon" >&2
   exit 1
 fi
-unset GNOMON_INSTALL_MAIN_SHA
-# install.sh's `bootstrap_latest_installer` re-execs itself pinned to
-# the latest main SHA *regardless of whether that SHA has a release*.
-# When HEAD is newer than the most recent published release (the common
-# case for ~20 min after a push, while the build workflow is running)
-# the bootstrap pin hard-fails with "Refusing to install a different
-# release for explicit GNOMON_INSTALL_MAIN_SHA". Setting
-# GNOMON_INSTALL_BOOTSTRAPPED=1 skips that bootstrap and lets install.sh
-# fall through to the "latest published release" code path.
-export GNOMON_INSTALL_BOOTSTRAPPED=1
-echo "[run.sh] installing gnomon (latest published release) via install.sh" >&2
-if curl -fsSL "https://raw.githubusercontent.com/SauersML/gnomon/main/install.sh" | bash >&2; then
-  :
-elif [ -x "$HOME/gnomon/install.sh" ]; then
-  echo "[run.sh] network install failed; falling back to in-repo install.sh" >&2
-  bash "$HOME/gnomon/install.sh" >&2
-else
-  echo "[run.sh] could not install gnomon from network or in-repo install.sh" >&2
+INSTALL_DIR="$HOME/.local/bin"
+mkdir -p "$INSTALL_DIR" "$HOME/.local/share/gnomon"
+
+install_gnomon_from_latest_release() {
+  local api_url="https://api.github.com/repos/SauersML/gnomon/releases/latest"
+  local response
+  response="$(curl -sL --retry 5 --retry-delay 2 --connect-timeout 5 --max-time 30 "$api_url")" || return 1
+  local tag asset_url
+  tag="$(echo "$response" | sed -n 's/^[[:space:]]*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+  asset_url="$(echo "$response" \
+    | grep -F "browser_download_url" \
+    | grep -F "gnomon-linux-x64-v3.tar.gz" \
+    | cut -d '"' -f 4 \
+    | head -n 1)"
+  if [ -z "$asset_url" ]; then
+    # Fall back to the non-v3 asset name.
+    asset_url="$(echo "$response" \
+      | grep -F "browser_download_url" \
+      | grep -F "gnomon-linux-x64.tar.gz" \
+      | cut -d '"' -f 4 \
+      | head -n 1)"
+  fi
+  [ -n "$asset_url" ] || return 1
+  echo "[run.sh] installing gnomon release $tag from $asset_url" >&2
+  local tmp
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  curl -fsSL --retry 5 --retry-delay 2 "$asset_url" -o "$tmp/gnomon.tar.gz" || return 1
+  tar -xzf "$tmp/gnomon.tar.gz" -C "$tmp" || return 1
+  local binary_path
+  binary_path="$(find "$tmp" -maxdepth 3 -type f -name gnomon -perm -u+x | head -n 1)"
+  [ -n "$binary_path" ] || return 1
+  install -m 0755 "$binary_path" "$INSTALL_DIR/gnomon"
+  printf '%s\n' "$tag" > "$HOME/.local/share/gnomon/installed-release"
+}
+
+if ! install_gnomon_from_latest_release; then
+  echo "[run.sh] could not download a published gnomon release" >&2
   exit 1
 fi
-GNOMON_HEAD_SHA="$(git -C "$HOME/gnomon" rev-parse HEAD)"
-mkdir -p "$HOME/.local/share/gnomon"
-printf '%s\n' "$GNOMON_HEAD_SHA" > "$HOME/.local/share/gnomon/installed-sha"
+git -C "$HOME/gnomon" rev-parse HEAD > "$HOME/.local/share/gnomon/installed-sha"
 hash -r
 AOU_DISK_ROOT="$HOME/aou-gpu-baremetal"
 RESULTS_DIR="$AOU_DISK_ROOT/biobank_results"
