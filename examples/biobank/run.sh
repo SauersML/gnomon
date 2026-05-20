@@ -53,28 +53,82 @@ if [ "$REEXECUTED" -eq 0 ] && git -C "$SCRIPT_DIR" rev-parse --git-dir >/dev/nul
 fi
 
 # --- Install the scorer ------------------------------------------------------
-# Build the scorer from this checkout. GitHub Releases are asynchronous and
-# can lag behind main; using "latest release" reintroduced the stale
-# main-b771190... binary and reproduced the CUDA teardown abort after 100%.
+# This run installs the gnomon binary from a GitHub Release. The AoU
+# runner has no Rust toolchain, so cargo-install is not available.
+#
+# Stale-release safety: instead of accepting whatever "latest release"
+# happens to be, we pick the release whose tag matches the most recent
+# scorer-affecting commit in the checkout. That commit is the one that
+# determined the binary's behavior, and a release tagged with that SHA
+# was produced by Build-and-Release after that exact commit landed —
+# guaranteed to contain the code the checkout describes.
+#
+# If no release for that scorer SHA exists yet (the typical
+# 15-20 min window after a push while the workflow is still building),
+# we error out with the build URL instead of silently installing an
+# older binary.
 if [ ! -d "$HOME/gnomon/.git" ]; then
   echo "[run.sh] expected a git checkout at $HOME/gnomon" >&2
-  exit 1
-fi
-if ! command -v cargo >/dev/null 2>&1; then
-  echo "[run.sh] cargo is required so gnomon can be built from the checked-out source" >&2
-  echo "[run.sh] refusing to install a potentially stale GitHub release" >&2
   exit 1
 fi
 INSTALL_DIR="$HOME/.local/bin"
 mkdir -p "$INSTALL_DIR" "$HOME/.local/share/gnomon"
 GNOMON_CHECKOUT_SHA="$(git -C "$HOME/gnomon" rev-parse HEAD)"
-GNOMON_REQUIRED_SCORER_SHA="$(git -C "$HOME/gnomon" log -1 --format=%H -- Cargo.toml Cargo.lock '*.rs' install.sh .github/workflows/build-release-all.yml)"
-GNOMON_INSTALL_MODE="source-build"
-GNOMON_INSTALLED_RELEASE="<none>"
-GNOMON_RELEASE_URL="<not-used>"
-echo "[run.sh] cargo install --path $HOME/gnomon --bin gnomon --root $HOME/.local (checkout $GNOMON_CHECKOUT_SHA; scorer $GNOMON_REQUIRED_SCORER_SHA)" >&2
-cargo install --path "$HOME/gnomon" --bin gnomon --locked --force --root "$HOME/.local" >&2
-rm -f "$HOME/.local/share/gnomon/installed-release"
+# Files that materially change the produced binary. Any other change
+# (docs, run.sh, examples) does NOT need a fresh build to be safe.
+GNOMON_REQUIRED_SCORER_SHA="$(git -C "$HOME/gnomon" log -1 --format=%H -- \
+  Cargo.toml Cargo.lock '*.rs' \
+  install.sh .github/workflows/build-release-all.yml)"
+echo "[run.sh] checkout: $GNOMON_CHECKOUT_SHA" >&2
+echo "[run.sh] required scorer SHA (last commit touching Rust/build): $GNOMON_REQUIRED_SCORER_SHA" >&2
+GNOMON_RELEASE_TAG="main-${GNOMON_REQUIRED_SCORER_SHA}"
+GNOMON_RELEASE_API="https://api.github.com/repos/SauersML/gnomon/releases/tags/${GNOMON_RELEASE_TAG}"
+GNOMON_RELEASE_JSON="$(curl -sL --retry 5 --retry-delay 2 --connect-timeout 5 --max-time 30 \
+  "$GNOMON_RELEASE_API")"
+GNOMON_RELEASE_URL="$(printf '%s' "$GNOMON_RELEASE_JSON" \
+  | grep -F 'browser_download_url' \
+  | grep -F 'gnomon-linux-x64-v3.tar.gz' \
+  | cut -d '"' -f 4 \
+  | head -n 1)"
+if [ -z "$GNOMON_RELEASE_URL" ]; then
+  GNOMON_RELEASE_URL="$(printf '%s' "$GNOMON_RELEASE_JSON" \
+    | grep -F 'browser_download_url' \
+    | grep -F 'gnomon-linux-x64.tar.gz' \
+    | cut -d '"' -f 4 \
+    | head -n 1)"
+fi
+if [ -z "$GNOMON_RELEASE_URL" ]; then
+  echo "[run.sh] release $GNOMON_RELEASE_TAG has no linux-x64 asset yet." >&2
+  echo "[run.sh] The Build-and-Release workflow may still be running." >&2
+  echo "[run.sh] Watch: https://github.com/SauersML/gnomon/actions/workflows/build-release-all.yml" >&2
+  echo "[run.sh] Refusing to install a different release for this checkout." >&2
+  exit 1
+fi
+GNOMON_INSTALL_MODE="github-release"
+GNOMON_INSTALLED_RELEASE="$GNOMON_RELEASE_TAG"
+echo "[run.sh] installing gnomon release $GNOMON_INSTALLED_RELEASE" >&2
+echo "[run.sh]   asset: $GNOMON_RELEASE_URL" >&2
+GNOMON_TMP_INSTALL="$(mktemp -d)"
+trap 'rm -rf "$GNOMON_TMP_INSTALL"' EXIT
+curl -fsSL --retry 5 --retry-delay 2 "$GNOMON_RELEASE_URL" -o "$GNOMON_TMP_INSTALL/gnomon.tar.gz"
+tar -xzf "$GNOMON_TMP_INSTALL/gnomon.tar.gz" -C "$GNOMON_TMP_INSTALL"
+GNOMON_INSTALLED_BIN=""
+for candidate in "$GNOMON_TMP_INSTALL"/gnomon* "$GNOMON_TMP_INSTALL"/*/gnomon* "$GNOMON_TMP_INSTALL"/*/*/gnomon*; do
+  [ -f "$candidate" ] || continue
+  case "$candidate" in
+    *.tar.gz|*.txt|*.md|*.json) continue ;;
+  esac
+  GNOMON_INSTALLED_BIN="$candidate"
+  break
+done
+if [ -z "$GNOMON_INSTALLED_BIN" ]; then
+  echo "[run.sh] extracted release contents:" >&2
+  ls -la "$GNOMON_TMP_INSTALL" >&2 || true
+  echo "[run.sh] extracted release did not contain a gnomon binary" >&2
+  exit 1
+fi
+install -m 0755 "$GNOMON_INSTALLED_BIN" "$INSTALL_DIR/gnomon"
+printf '%s\n' "$GNOMON_INSTALLED_RELEASE" > "$HOME/.local/share/gnomon/installed-release"
 printf '%s\n' "$GNOMON_CHECKOUT_SHA" > "$HOME/.local/share/gnomon/installed-sha"
 printf '%s\n' "$GNOMON_REQUIRED_SCORER_SHA" > "$HOME/.local/share/gnomon/required-scorer-sha"
 hash -r
