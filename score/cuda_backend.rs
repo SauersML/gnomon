@@ -27,7 +27,7 @@ use std::process;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DENSE_CHANNEL_BOUND: usize = 4096;
 const BUFFER_POOL_SIZE: usize = 16384;
@@ -213,7 +213,6 @@ struct GpuChannels {
 struct PipelineSupport {
     progress_done: Arc<AtomicBool>,
     progress_handle: Option<thread::JoinHandle<()>>,
-    fallback_log_handle: Option<thread::JoinHandle<()>>,
     pb: ProgressBar,
 }
 
@@ -731,11 +730,17 @@ fn run_cuda_pipeline(
 ) -> Result<(Vec<f64>, Vec<u32>), PipelineError> {
     let prep_result = &context.prep_result;
     let channels = create_gpu_channels(context);
+    let progress_counter = Arc::clone(&channels.variants_processed_count);
     let mut support_guard = PipelineSupportGuard::new(start_pipeline_support(
         prep_result.num_reconciled_variants as u64,
         Arc::clone(&channels.variants_processed_count),
         Arc::clone(&channels.buffer_pool),
     ));
+    let log_progress_to_stderr = support_guard
+        .support
+        .as_ref()
+        .map(|s| s.pb.is_hidden())
+        .unwrap_or(false);
 
     let has_complex = !prep_result.complex_rules.is_empty();
     let should_spool = has_complex
@@ -851,6 +856,8 @@ fn run_cuda_pipeline(
             prep_result,
             &mut runtime,
             Arc::clone(&channels.buffer_pool),
+            Arc::clone(&progress_counter),
+            log_progress_to_stderr,
         );
         let spool_result = producer_handle
             .join()
@@ -1010,9 +1017,21 @@ fn start_pipeline_support(
     _buffer_pool: Arc<ArrayQueue<Vec<u8>>>,
 ) -> PipelineSupport {
     let pb = create_progress_bar(total_variants, "Computing scores (CUDA)...");
-    let use_fallback_logs = pb.is_hidden();
+    // Only the indicatif progress bar gets a background tick thread, and
+    // only when stderr is a terminal (`pb.is_hidden() == false`). When
+    // stderr is a pipe -- the typical AoU bare-metal case where the
+    // biobank driver tees gnomon's output -- progress is printed from
+    // the main compute loop in `process_dense_stream_cuda` instead. The
+    // previous design spawned a separate "fallback log" thread that
+    // periodically called `eprintln!` from its own thread, and on the
+    // AoU image that pattern reliably tripped glibc's tcache
+    // consistency check during cudarc/cuBLAS teardown -- "double free
+    // or corruption (!prev)" between CUDA progress 100% and the
+    // complex-variant resolver banner, even on single-PGS / 4 000-
+    // variant inputs. With no background log thread there is no
+    // cross-thread tcache migration to race against teardown.
     let progress_done = Arc::new(AtomicBool::new(false));
-    let progress_handle = if use_fallback_logs {
+    let progress_handle = if pb.is_hidden() {
         None
     } else {
         let done_for_thread = Arc::clone(&progress_done);
@@ -1029,55 +1048,15 @@ fn start_pipeline_support(
         }))
     };
 
-    let fallback_log_handle = if use_fallback_logs {
-        let done_for_logs = Arc::clone(&progress_done);
-        let counter_for_logs = Arc::clone(&variants_processed_count);
-        Some(thread::spawn(move || {
-            let mut last_reported: Option<u64> = None;
-            while !done_for_logs.load(Ordering::Relaxed) {
-                let processed = counter_for_logs.load(Ordering::Relaxed);
-                if last_reported != Some(processed) {
-                    let pct = if total_variants == 0 {
-                        100.0
-                    } else {
-                        (processed as f64 * 100.0) / (total_variants as f64)
-                    };
-                    eprintln!(
-                        "> CUDA progress: {}/{} ({pct:.1}%)",
-                        processed, total_variants
-                    );
-                    last_reported = Some(processed);
-                }
-                thread::sleep(Duration::from_secs(2));
-            }
-            let processed = counter_for_logs.load(Ordering::Relaxed);
-            let pct = if total_variants == 0 {
-                100.0
-            } else {
-                (processed as f64 * 100.0) / (total_variants as f64)
-            };
-            eprintln!(
-                "> CUDA progress: {}/{} ({pct:.1}%)",
-                processed, total_variants
-            );
-        }))
-    } else {
-        None
-    };
-
     PipelineSupport {
         progress_done,
         progress_handle,
-        fallback_log_handle,
         pb,
     }
 }
 
 fn finish_pipeline_support(support: PipelineSupport, completed: bool) {
     support.progress_done.store(true, Ordering::Relaxed);
-    if let Some(handle) = support.fallback_log_handle {
-        let _ = handle.join();
-    }
     if let Some(handle) = support.progress_handle {
         let _ = handle.join();
     }
@@ -1094,9 +1073,36 @@ fn process_dense_stream_cuda(
     prep_result: &PreparationResult,
     runtime: &mut CudaRuntime,
     buffer_pool: Arc<ArrayQueue<Vec<u8>>>,
+    progress_counter: Arc<AtomicU64>,
+    log_progress_to_stderr: bool,
 ) -> Result<(Vec<f64>, Vec<u32>), PipelineError> {
     let dims = CudaDims::from_prep(prep_result)?;
     let result_size = dims.result_size()?;
+    let total_variants = prep_result.num_reconciled_variants as u64;
+    let mut last_logged_at = Instant::now();
+    let mut last_logged_value: Option<u64> = None;
+    let mut emit_progress_log = |force_final: bool| {
+        if !log_progress_to_stderr {
+            return;
+        }
+        let processed = progress_counter.load(Ordering::Relaxed);
+        let now = Instant::now();
+        let due = force_final
+            || (last_logged_value != Some(processed)
+                && now.duration_since(last_logged_at) >= Duration::from_secs(2));
+        if !due {
+            return;
+        }
+        let pct = if total_variants == 0 {
+            100.0
+        } else {
+            (processed as f64 * 100.0) / (total_variants as f64)
+        };
+        eprintln!("> CUDA progress: {processed}/{total_variants} ({pct:.1}%)");
+        last_logged_at = now;
+        last_logged_value = Some(processed);
+    };
+    emit_progress_log(true);
 
     let baseline = compute_cpu_precise_baseline(prep_result);
     let mut final_scores = Vec::with_capacity(result_size);
@@ -1222,6 +1228,8 @@ fn process_dense_stream_cuda(
 
         let slot = batch_counter % PIPELINE_SLOTS;
         batch_counter += 1;
+
+        emit_progress_log(false);
 
         if let Some(event) = &slot_last_copy_done[slot] {
             event
@@ -1351,6 +1359,8 @@ fn process_dense_stream_cuda(
         .compute_stream
         .synchronize()
         .map_err(map_driver_err("Failed to synchronize CUDA compute stream"))?;
+
+    emit_progress_log(true);
 
     Ok((final_scores, final_counts))
 }

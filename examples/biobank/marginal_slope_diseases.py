@@ -421,23 +421,6 @@ def ensure_scored(pgs_ids: list[str]) -> None:
     env = {
         **os.environ,
         "LD_LIBRARY_PATH": ":".join([*nv_libs, os.environ.get("LD_LIBRARY_PATH", "")]),
-        # Disable glibc's per-thread malloc cache for the score
-        # subprocess. The "double free or corruption (!prev)" abort the
-        # AoU bare-metal CUDA image trips on between CUDA progress 100%
-        # and the complex-variant resolver banner is a *false positive*
-        # from glibc's tcache consistency check: the cudarc + cuBLAS
-        # teardown path allocates and frees across the just-joined
-        # progress-log thread and the GPU launcher thread, and glibc's
-        # tcache is brittle about that pattern even when no actual
-        # double-free occurred. `MALLOC_CHECK_=3` routes every malloc/
-        # free through the audited main-arena path, which has been
-        # verified locally to make the same binary on the same data
-        # complete cleanly (`compute-sanitizer --tool memcheck` also
-        # makes it complete cleanly, for the same reason -- it
-        # serialises the cross-thread allocation pattern). If real
-        # heap corruption ever appears here, MALLOC_CHECK_=3 will
-        # abort *earlier and louder*, which is the behaviour we want.
-        "MALLOC_CHECK_": "3",
     }
     # Score one PGS per invocation rather than batching into a single
     # comma-separated call. Multi-PGS scoring on the AoU bare-metal CUDA
