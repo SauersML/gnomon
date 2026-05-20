@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Minimal CUDA/cuBLAS teardown reproducer without using gnomon.
+"""Minimal CUDA/cuBLAS loader/teardown reproducer without using gnomon.
 
 This models the failing mechanism from `gnomon score PGS001320` directly:
 
@@ -7,12 +7,15 @@ This models the failing mechanism from `gnomon score PGS001320` directly:
 2. Allocate the same class of large per-pipeline buffers with cuMemAllocAsync.
 3. Run three cuBLAS SGEMMs using the single-score PGS001320 shape.
 4. Synchronize the stream and print a 100% progress marker.
-5. Run two teardown orders in one process:
+5. Run isolated child processes for both CUDA userspace-library choices:
+   - system: libcublas resolved from the host loader path.
+   - wheel: pip-wheel CUDA libs loaded by absolute path from `nvidia-*` wheels.
+6. In each child, run two teardown orders:
    - fixed: enqueue cuMemFreeAsync for local buffers, then synchronize those frees.
    - bad: synchronize first, enqueue cuMemFreeAsync, then immediately destroy cuBLAS.
 
-If the issue is the CUDA/cuBLAS/cudarc async-free teardown path, the fixed pass
-should complete and the bad pass is the small mechanism-level repro.
+If the issue is the pip-wheel/system CUDA library mix, the wheel/bad child is
+the small mechanism-level repro.
 
 Run on the AoU CUDA host:
 
@@ -23,6 +26,7 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import subprocess
 import sys
 from pathlib import Path
 
@@ -35,16 +39,45 @@ PEOPLE = 447_278
 MEGA = 256
 TILE_SCORES = 1
 TRIALS = 1
+INTERNAL_CHILD_ARG = "__gnomon_cuda_teardown_child__"
 
 
-def _nvidia_lib_path(component: str, soname: str) -> str | None:
+def _nvidia_roots() -> list[Path]:
+    roots: list[Path] = []
     try:
         import nvidia  # type: ignore[import-not-found]
     except Exception:
-        return None
+        pass
+    else:
+        roots.extend(Path(p) for p in nvidia.__path__)
 
-    for parent in nvidia.__path__:
-        path = Path(parent) / component / "lib" / soname
+    home = Path.home()
+    archive_patterns = [
+        home / "aou-gpu-baremetal/gnomon_runtime/biobank/uv/archive-v0",
+        home / ".cache/uv/archive-v0",
+    ]
+    for archive_root in archive_patterns:
+        if not archive_root.exists():
+            continue
+        roots.extend(archive_root.glob("*/lib/python*/site-packages/nvidia"))
+
+    deduped: list[Path] = []
+    seen: set[Path] = set()
+    for root in roots:
+        try:
+            resolved = root.resolve()
+        except OSError:
+            continue
+        if resolved in seen or not resolved.exists():
+            continue
+        seen.add(resolved)
+        deduped.append(resolved)
+    return deduped
+
+
+def _nvidia_lib_path(component: str, soname: str) -> str | None:
+    for parent in _nvidia_roots():
+        path = parent / component / "lib" / soname
         if path.exists():
             return str(path)
     return None
@@ -54,10 +87,9 @@ def load_cuda() -> ctypes.CDLL:
     return ctypes.CDLL("libcuda.so.1", mode=ctypes.RTLD_GLOBAL)
 
 
-def load_cublas() -> ctypes.CDLL:
+def load_cublas_system() -> tuple[ctypes.CDLL, str]:
     candidates = [
         ctypes.util.find_library("cublas"),
-        _nvidia_lib_path("cublas", "libcublas.so.12"),
         "libcublas.so.12",
         "libcublas.so",
     ]
@@ -65,10 +97,27 @@ def load_cublas() -> ctypes.CDLL:
         if not candidate:
             continue
         try:
-            return ctypes.CDLL(candidate, mode=ctypes.RTLD_GLOBAL)
+            return ctypes.CDLL(candidate, mode=ctypes.RTLD_GLOBAL), candidate
         except OSError:
             pass
     raise OSError("could not load libcublas")
+
+
+def load_cublas_wheel() -> tuple[ctypes.CDLL, str]:
+    libs = [
+        ("nvjitlink", "libnvJitLink.so.12"),
+        ("cuda_runtime", "libcudart.so.12"),
+        ("cublas", "libcublasLt.so.12"),
+        ("cublas", "libcublas.so.12"),
+    ]
+    loaded: list[tuple[str, str]] = []
+    for component, soname in libs:
+        path = _nvidia_lib_path(component, soname)
+        if path is None:
+            raise OSError(f"could not find pip-wheel CUDA library {component}/{soname}")
+        ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
+        loaded.append((soname, path))
+    return ctypes.CDLL(loaded[-1][1], mode=ctypes.RTLD_GLOBAL), loaded[-1][1]
 
 
 def configure_symbols(cuda: ctypes.CDLL, cublas: ctypes.CDLL) -> None:
@@ -227,13 +276,19 @@ def run_gemm_triplet(
         )
 
 
-def run_case(mode: str) -> None:
+def run_case(loader: str, mode: str) -> None:
     cuda = load_cuda()
-    cublas = load_cublas()
+    if loader == "wheel":
+        cublas, cublas_path = load_cublas_wheel()
+    elif loader == "system":
+        cublas, cublas_path = load_cublas_system()
+    else:
+        raise RuntimeError(f"unknown loader mode: {loader}")
     configure_symbols(cuda, cublas)
 
     print(
-        f"\n=== {mode} teardown ===\n"
+        f"\n=== {loader} libs / {mode} teardown ===\n"
+        f"cublas: {cublas_path}\n"
         f"shape: people={PEOPLE} mega={MEGA} tile_scores={TILE_SCORES} trials={TRIALS}",
         flush=True,
     )
@@ -330,10 +385,48 @@ def run_case(mode: str) -> None:
     print(f"{mode} teardown completed without abort", flush=True)
 
 
+def child_main(loader: str, mode: str) -> int:
+    run_case(loader, mode)
+    return 0
+
+
+def run_child(loader: str, mode: str) -> int:
+    cmd = [sys.executable, __file__, INTERNAL_CHILD_ARG, loader, mode]
+    print(f"\n##### child: {loader} libs / {mode} teardown #####", flush=True)
+    result = subprocess.run(cmd, cwd=Path(__file__).resolve().parent.parent)
+    if result.returncode < 0:
+        print(
+            f"child {loader}/{mode} died from signal {-result.returncode}",
+            flush=True,
+        )
+    else:
+        print(f"child {loader}/{mode} exit={result.returncode}", flush=True)
+    return result.returncode
+
+
 def main() -> int:
-    run_case("fixed")
-    run_case("bad")
-    print("\nall teardown modes completed without abort", flush=True)
+    if len(sys.argv) == 4 and sys.argv[1] == INTERNAL_CHILD_ARG:
+        return child_main(sys.argv[2], sys.argv[3])
+    if len(sys.argv) != 1:
+        print("this script takes no arguments", file=sys.stderr)
+        return 2
+
+    cases = [
+        ("system", "fixed"),
+        ("system", "bad"),
+        ("wheel", "fixed"),
+        ("wheel", "bad"),
+    ]
+    failures = 0
+    for loader, mode in cases:
+        rc = run_child(loader, mode)
+        if rc != 0:
+            failures += 1
+
+    if failures:
+        print(f"\n{failures} child run(s) failed or aborted", flush=True)
+        return 1
+    print("\nall child runs completed without abort", flush=True)
     return 0
 
 
