@@ -410,8 +410,8 @@ require_run_state_capacity \
 uv run \
     --no-project \
     --python 3.11 \
-    --refresh-package gamfit \
-    --with 'gamfit==0.1.90' \
+    --upgrade-package gamfit \
+    --with gamfit \
     --with numpy \
     --with pandas \
     --with pyarrow \
