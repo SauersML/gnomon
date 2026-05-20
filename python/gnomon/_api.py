@@ -390,17 +390,32 @@ def _looks_like_pgs_arg(score_arg: str) -> bool:
     return bool(parts) and all(_PGS_ID_RE.match(p) for p in parts)
 
 
+_COMPOUND_INPUT_SUFFIXES = (".vcf.bgz", ".vcf.gz", ".bcf.bgz", ".bcf.gz")
+_SIMPLE_INPUT_SUFFIXES = (".bed", ".vcf", ".bcf")
+
+
+def _score_output_stem(path: Path) -> str:
+    """Mirror score::main::score_output_stem (Rust) byte-for-byte."""
+    name = path.name
+    if not name:
+        return "gnomon_results"
+    lower = name.lower()
+    for suffix in _COMPOUND_INPUT_SUFFIXES + _SIMPLE_INPUT_SUFFIXES:
+        if lower.endswith(suffix) and len(name) > len(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
 def _expected_sscore_path(input_path: Path, score_arg: str) -> Path:
     """Mirror score::main::score_output_path."""
-    stem = input_path.stem if input_path.suffix in {".bed", ".vcf", ".bcf", ".gz", ".txt"} else input_path.name
-    parent = input_path.parent if input_path.parent != Path("") else Path(".")
+    stem = _score_output_stem(input_path)
+    parent = input_path.parent if str(input_path.parent) else Path(".")
     if _looks_like_pgs_arg(score_arg):
         suffix = "-".join(p.strip().upper() for p in score_arg.split(","))
         return parent / f"{stem}_{suffix}.sscore"
     score_path = Path(score_arg)
     if score_path.exists() and score_path.is_dir():
         return parent / f"{stem}.sscore"
-    # Single score file.
     score_stem = score_path.stem
     return parent / f"{stem}_{score_stem}.sscore"
 

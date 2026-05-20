@@ -234,10 +234,7 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
             "\nSuccess! Total execution time: {:.2?}",
             overall_start_time.elapsed()
         );
-        use std::io::Write;
-        let _ = std::io::stdout().flush();
-        let _ = std::io::stderr().flush();
-        std::process::exit(0);
+        return Ok(());
     }
 
     // --- Genotype Format Conversion (if needed) ---
@@ -313,23 +310,7 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
         "\nSuccess! Total execution time: {:.2?}",
         overall_start_time.elapsed()
     );
-
-    // All output files have been written and flushed (their writers were
-    // dropped inside finalize_and_write_output) and the CudaRuntime was already
-    // explicitly torn down at the end of the CUDA pipeline stage. The natural
-    // drop chain from here is just bookkeeping the kernel will reclaim at
-    // process exit: the memmapped .bed (munmap), rayon thread-pool state, the
-    // Arc<PreparationResult>, etc. We have observed cudarc/cuBLAS and
-    // libcudart's own atexit handlers interleaving with these late drops on
-    // Linux and aborting the process with glibc's "double free or corruption
-    // (!prev)" *after* every meaningful piece of work has finished — which
-    // causes wrapper scripts (e.g. the biobank driver invoking gnomon via
-    // subprocess.run(..., check=True)) to treat a fully successful scoring
-    // run as a failure. Skip the drop chain and let the kernel do the cleanup.
-    use std::io::Write;
-    let _ = std::io::stdout().flush();
-    let _ = std::io::stderr().flush();
-    std::process::exit(0);
+    Ok(())
 }
 
 fn ensure_output_absent(

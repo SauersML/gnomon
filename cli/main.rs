@@ -413,9 +413,27 @@ enum CalibrateCommands {
 
 fn main() {
     let result = dispatch_current_binary();
-    if let Err(err) = result {
-        eprintln!("Error: {err}");
-        process::exit(1);
+    // Every entrypoint above writes and flushes its output artifacts inside
+    // its own `run_*` function, and any cudarc CudaRuntime has been explicitly
+    // torn down at the end of the CUDA pipeline stage. Skip the natural drop
+    // chain on the way out: on Linux the cudarc + cuBLAS + libcudart at-exit
+    // teardown is known to interleave with glibc and abort with "double free
+    // or corruption (!prev)" *after* every meaningful piece of work has
+    // finished, turning a successful run into a non-zero exit in any wrapper
+    // (Python `subprocess.run(..., check=True)`, `set -e` shells, CI). The
+    // kernel reclaims GPU memory, pinned host buffers, memmaps, and rayon
+    // thread-pool state at process exit.
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    match result {
+        Ok(()) => process::exit(0),
+        Err(err) => {
+            eprintln!("Error: {err}");
+            let _ = std::io::stdout().flush();
+            let _ = std::io::stderr().flush();
+            process::exit(1);
+        }
     }
 }
 
