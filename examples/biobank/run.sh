@@ -90,6 +90,7 @@ uv run \
     --with scikit-learn \
     --with scikit-survival \
     --with statsmodels \
+    --with patsy \
     --with tzdata \
     --with pgscatalog.calc \
     --with gcsfs \
