@@ -92,6 +92,22 @@ format_kib() {
   awk -v kib="$1" 'BEGIN {printf "%.1fGiB", kib / 1024 / 1024}'
 }
 
+mount_of() {
+  local path="$1"
+  while [ ! -e "$path" ] && [ "$path" != "/" ]; do
+    path="$(dirname "$path")"
+  done
+  df -P "$path" 2>/dev/null | awk 'NR == 2 {print $NF}'
+}
+
+same_mount() {
+  local left
+  local right
+  left="$(mount_of "$1")"
+  right="$(mount_of "$2")"
+  [ -n "$left" ] && [ "$left" = "$right" ]
+}
+
 require_run_state_capacity() {
   local label="$1"
   local path="$2"
@@ -111,6 +127,19 @@ require_run_state_capacity() {
       echo "[run.sh] insufficient free space for $label at $path"
       echo "[run.sh] required: ${required_gib}GiB; available: $(format_kib "$free_kib")"
       df -hP "$path"
+      # If a pre-redirection uv cache shares this filesystem, point at it
+      # explicitly: this run uses UV_CACHE_DIR=$RUN_STATE_DIR/uv, so anything
+      # under $HOME/.cache/uv is genuine stale state and is safe to drop.
+      if [ -d "$HOME/.cache/uv" ] && same_mount "$HOME/.cache/uv" "$path"; then
+        echo
+        echo "[run.sh] legacy uv cache at \$HOME/.cache/uv shares this filesystem:"
+        du -sh "$HOME/.cache/uv" 2>/dev/null || true
+        echo "[run.sh] this run does not use it (UV_CACHE_DIR=$UV_CACHE_DIR); free it with:"
+        echo "[run.sh]     UV_CACHE_DIR=\"\$HOME/.cache/uv\" uv cache clean"
+      fi
+      echo
+      echo "[run.sh] largest entries under \$HOME/.cache (cleanup candidates):"
+      du -sh "$HOME"/.cache/* 2>/dev/null | sort -hr | head -10 || true
     } | tee -a "$RESULTS" >&2
     failure_diagnostics 1
   fi
@@ -177,8 +206,9 @@ trap 'failure_diagnostics $?' ERR
 # `uv run --with ...` pulls several large wheels, including CUDA runtime
 # packages, and writes temporary files inside the client cache.  AoU home
 # directories can have much less free space than the attached workspace disk,
-# so keep both uv and XDG-style caches under RESULTS_DIR and fail before the
-# resolver starts if that volume is not large enough.
+# so keep uv, managed Python, XDG caches, and temporary files under
+# RUN_STATE_DIR and fail before the resolver starts if that volume is not
+# large enough.
 require_run_state_capacity \
   "biobank run state" \
   "$RUN_STATE_DIR" \
@@ -198,7 +228,8 @@ require_run_state_capacity \
   echo "gnomon_bin:       $(command -v gnomon)"
   echo "gnomon_version:   $(gnomon --version 2>/dev/null | head -1 || echo unknown)"
   echo "uv_bin:           $(command -v uv)"
-  echo "uv_version:       $(uv --version 2>/dev/null || echo unknown)"
+  echo "uv_version:       $(uv --version)"
+  echo "uv_default_cache: $(env -u UV_CACHE_DIR uv cache dir 2>/dev/null || echo unknown)"
   echo "uv_cache_dir:     $UV_CACHE_DIR"
   echo "uv_effective_cache: $(uv cache dir 2>/dev/null || echo unknown)"
   echo "uv_python_dir:    $UV_PYTHON_INSTALL_DIR"
@@ -206,11 +237,19 @@ require_run_state_capacity \
   echo "xdg_data_home:    $XDG_DATA_HOME"
   echo "tmpdir:           $TMPDIR"
   echo "run_state_dir:    $RUN_STATE_DIR"
+  echo "min_run_state_free: ${MIN_RUN_STATE_FREE_GIB}GiB and ${MIN_RUN_STATE_FREE_INODES} inodes"
   echo "script:           $SCRIPT_DIR/marginal_slope_diseases.py"
   echo "results_file:     $RESULTS"
   echo
+  echo "--- storage mechanism ---"
+  echo "uv defaults its client cache to HOME/.cache/uv; UV_CACHE_DIR moves all uv cache writes."
+  echo "uv-managed Python installs are moved with UV_PYTHON_INSTALL_DIR."
+  echo "gamfit warm-starts use XDG_CACHE_HOME/gam; XDG_CACHE_HOME moves the warm-start cache."
+  echo "TMPDIR keeps wheel/build temporary files on the same runtime disk."
+  echo
   echo "--- filesystem ---"
   path_usage "home" "$HOME"
+  path_usage "aou_disk" "$AOU_DISK_ROOT"
   path_usage "results" "$RESULTS_DIR"
   path_usage "run_state" "$RUN_STATE_DIR"
   path_usage "uv_cache" "$UV_CACHE_DIR"
@@ -219,6 +258,16 @@ require_run_state_capacity \
   path_usage "xdg_data" "$XDG_DATA_HOME"
   path_usage "tmpdir" "$TMPDIR"
   path_usage "system_tmp" "/tmp"
+  echo
+  echo "--- cache sizes ---"
+  cache_du "legacy_uv_cache" "$HOME/.cache/uv"
+  cache_du "legacy_gam_cache" "$HOME/.cache/gam"
+  cache_du "uv_cache" "$UV_CACHE_DIR"
+  cache_du "uv_python" "$UV_PYTHON_INSTALL_DIR"
+  cache_du "xdg_cache" "$XDG_CACHE_HOME"
+  cache_du "gamfit_cache" "$XDG_CACHE_HOME/gam"
+  cache_du "xdg_data" "$XDG_DATA_HOME"
+  cache_du "tmpdir" "$TMPDIR"
   echo
   echo "--- fit configuration (from script) ---"
   grep -E '^(NUM_PCS|DUCHON_CENTERS|TRAIN_FRACTION|RNG_SEED|MAX_LOSO_CARE_SITES|MIN_LOSO_|BOOTSTRAP_) *=' \
@@ -234,10 +283,34 @@ require_run_state_capacity \
   echo
 } | tee "$RESULTS"
 
+# `uv run --with ...` pulls several large wheels, including CUDA runtime
+# packages, and writes temporary files inside the client cache. AoU home
+# directories can have much less free space than the attached workspace disk,
+# so keep uv, uv-managed Python, XDG-style caches, and temp files under
+# RUN_STATE_DIR and fail before the resolver starts if that volume is tight.
+{
+  echo "--- uv cache maintenance ---"
+  uv cache prune
+  echo
+} 2>&1 | tee -a "$RESULTS"
+
+require_run_state_capacity \
+  "biobank run state" \
+  "$RUN_STATE_DIR" \
+  "$MIN_RUN_STATE_FREE_GIB" \
+  "$MIN_RUN_STATE_FREE_INODES"
+
 # --- the actual run ---------------------------------------------------------
-uv --cache-dir "$UV_CACHE_DIR" run \
+# UV_CACHE_DIR is exported above; do NOT also pass --cache-dir. In uv 0.11.x
+# the CLI flag does not reach every cache-writing code path (the simple-index
+# HTTP client cache wrote to ~/.cache/uv even when --cache-dir was set, which
+# is the exact mechanism that produced the original "No space left on device"
+# on the small home partition). The env var is authoritative and propagates
+# to every child uv process; the flag is at best redundant and at worst a
+# load-bearing-looking line that silently does nothing.
+uv run \
+    --no-project \
     --python 3.11 \
-    --refresh-package gamfit \
     --upgrade-package gamfit \
     --with gamfit \
     --with numpy \
