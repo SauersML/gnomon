@@ -6,7 +6,8 @@ Background banded by evaluation regime (random / leave-one-site-out /
 leave-one-region-out). Drop folds with events < 1000 (noise floor).
 
 Update the `ROWS` table after each `examples/biobank/run.sh` cycle and
-re-run. Output: ./all_results.png next to this script.
+re-run. If CI columns are present, horizontal intervals are drawn around the
+delta. Output: ./all_results.png next to this script.
 """
 from __future__ import annotations
 
@@ -23,7 +24,8 @@ mpl.rcParams.update({
     "axes.spines.left": False,
 })
 
-# (disease, regime, fold_label, GAM_test_C, base_test_C, test_events)
+# (disease, regime, fold_label, GAM_test_C, base_test_C, test_events,
+#  optional_delta_ci_low, optional_delta_ci_high)
 # Events>=1000 only -- folds below that are noise (SE on C ~ 0.5/sqrt(events)).
 ROWS = [
     ("COPD",         "Random", "Random",    0.5805, 0.5430,  5317),
@@ -74,11 +76,21 @@ REGIME_SHADE = {
 }
 
 
+def row_delta(row: tuple) -> float:
+    return float(row[3] - row[4])
+
+
+def row_delta_ci(row: tuple) -> tuple[float, float] | None:
+    if len(row) < 8 or row[6] is None or row[7] is None:
+        return None
+    return float(row[6]), float(row[7])
+
+
 def main() -> None:
     fig, ax = plt.subplots(figsize=(10.6, 10.8), dpi=160)
     n = len(ROWS)
     y = np.arange(n)[::-1]
-    deltas = np.array([r[3] - r[4] for r in ROWS])
+    deltas = np.array([row_delta(r) for r in ROWS])
     colors = [DISEASE_COLOR[r[0]] for r in ROWS]
 
     # 1) regime bands behind everything
@@ -100,6 +112,23 @@ def main() -> None:
     # 3) bars
     ax.barh(y, deltas, color=colors, edgecolor="white", linewidth=1.0,
             height=0.72, zorder=2)
+    for i, r in enumerate(ROWS):
+        ci = row_delta_ci(r)
+        if ci is None:
+            continue
+        lo, hi = ci
+        center = row_delta(r)
+        ax.errorbar(
+            center,
+            n - 1 - i,
+            xerr=[[center - lo], [hi - center]],
+            fmt="none",
+            ecolor="#111",
+            elinewidth=1.3,
+            capsize=3.0,
+            capthick=1.3,
+            zorder=4,
+        )
 
     # 4) zero reference line
     ax.axvline(0, color="#222", lw=1.0, zorder=3)
