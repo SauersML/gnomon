@@ -25,6 +25,7 @@ import re
 import struct
 import subprocess
 import sys
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -39,12 +40,104 @@ logging.basicConfig(
     force=True,
 )
 
-WORKDIR = Path.home() / "aou-gpu-baremetal"
-# Local PLINK1 bed/bim/fam, staged from
-#   gs://fc-aou-datasets-controlled/v8/microarray/plink/arrays.*
-# (see MICROARRAY_PLINK_PREFIX_URI). Egress-charged data, so the convention is
-# to download once into WORKDIR and reuse.
-PLINK_PREFIX = WORKDIR / "arrays"
+SCRIPT_DIR = Path(__file__).resolve().parent
+HOME = Path.home()
+
+
+def _dedup_paths(paths: list[Path]) -> list[Path]:
+    out: list[Path] = []
+    seen: set[Path] = set()
+    for path in paths:
+        try:
+            resolved = path.expanduser().resolve()
+        except OSError:
+            continue
+        if resolved in seen or not resolved.exists():
+            continue
+        seen.add(resolved)
+        out.append(resolved)
+    return out
+
+
+def _search_roots() -> list[Path]:
+    return _dedup_paths([Path.cwd(), SCRIPT_DIR, HOME])
+
+
+def _iter_files_with_suffix(suffix: str, max_depth: int = 4):
+    suffix = suffix.lower()
+    skip_dirs = {
+        ".git",
+        "__pycache__",
+        ".ipynb_checkpoints",
+        "node_modules",
+        "target",
+        "vendor",
+    }
+    for root in _search_roots():
+        queue = deque([(root, 0)])
+        while queue:
+            current, depth = queue.popleft()
+            try:
+                entries = sorted(
+                    current.iterdir(),
+                    key=lambda p: (not p.is_dir(), p.name.lower()),
+                )
+            except OSError:
+                continue
+            for entry in entries:
+                if entry.is_file() and entry.name.lower().endswith(suffix):
+                    yield entry
+            if depth >= max_depth:
+                continue
+            dirs = [
+                entry for entry in entries
+                if entry.is_dir() and entry.name not in skip_dirs
+            ]
+
+            def dir_priority(path: Path) -> tuple[int, str]:
+                name = path.name.lower()
+                if "plink" in name or "array" in name:
+                    return (0, name)
+                if "pgs" in name or "genotype" in name:
+                    return (1, name)
+                if "cache" in name:
+                    return (2, name)
+                return (3, name)
+
+            dirs.sort(key=dir_priority)
+            for directory in dirs:
+                queue.append((directory, depth + 1))
+
+
+def _plink_prefix_from_bed(bed: Path) -> Path | None:
+    prefix = bed.with_suffix("")
+    if not prefix.with_suffix(".bim").exists():
+        return None
+    if not prefix.with_suffix(".fam").exists():
+        return None
+    return prefix
+
+
+def find_plink_prefix() -> Path:
+    """Find the first local PLINK1 bed/bim/fam triplet by shallow BFS."""
+    for bed in _iter_files_with_suffix(".bed"):
+        prefix = _plink_prefix_from_bed(bed)
+        if prefix is None:
+            continue
+        print(f"plink: prefix={prefix}")
+        return prefix
+    roots = ", ".join(str(p) for p in _search_roots())
+    raise FileNotFoundError(
+        "could not find a local PLINK bed/bim/fam triplet under: "
+        f"{roots}"
+    )
+
+
+# Local PLINK1 bed/bim/fam, typically staged once from AoU controlled storage.
+# Discovery intentionally looks for an existing triplet instead of assuming any
+# particular cache or repository layout.
+PLINK_PREFIX = find_plink_prefix()
+WORKDIR = PLINK_PREFIX.parent
 SEX_CACHE = Path.home() / ".aou_cache" / "sex_terms"
 FITS_DIR = WORKDIR / "biobank_fits"
 NUM_PCS = 3
@@ -151,8 +244,9 @@ def load_sex() -> pd.DataFrame:
 
 def _load_pcs_from_gnomon(num_pcs: int) -> pd.DataFrame:
     """Read gnomon's `projection_scores.bin` (GNPRJ001/GNPSID01) as a fallback."""
-    bin_path = WORKDIR / "arrays.projection_scores.bin"
-    meta = json.loads((WORKDIR / "arrays.projection_scores.metadata.json").read_text())
+    bin_path = PLINK_PREFIX.with_name(f"{PLINK_PREFIX.name}.projection_scores.bin")
+    meta_path = PLINK_PREFIX.with_name(f"{PLINK_PREFIX.name}.projection_scores.metadata.json")
+    meta = json.loads(meta_path.read_text())
     rows, cols = int(meta["rows"]), int(meta["cols"])
     with bin_path.open("rb") as fh:
         assert fh.read(8) == b"GNPRJ001"
@@ -231,19 +325,50 @@ def load_pcs(num_pcs: int) -> pd.DataFrame:
 
     Prefers AoU's official `pca_features` from `ancestry_preds.tsv` (the 16
     PCs from `hwe_normalized_pca` against 1KGP+HGDP, packaged with the CDR);
-    falls back to gnomon's local `arrays.projection_scores.bin` if the AoU
-    file is unreachable (e.g. the same 403 that disables the ancestry LOSO
+    falls back to gnomon's local `<plink-prefix>.projection_scores.bin` if the
+    AoU file is unreachable (e.g. the same 403 that disables the ancestry LOSO
     axis when the workspace can't read `fc-aou-datasets-controlled`).
     """
     df = _load_pcs_from_aou(num_pcs)
     if df is None:
         df = _load_pcs_from_gnomon(num_pcs)
-        print(f"  pcs (gnomon): n={len(df):,}  source=arrays.projection_scores.bin")
+        print(
+            f"  pcs (gnomon): n={len(df):,}  "
+            f"source={PLINK_PREFIX.name}.projection_scores.bin"
+        )
     return df
 
 
+def _iter_sscore_files():
+    seen: set[Path] = set()
+    local_patterns = [
+        f"{PLINK_PREFIX.name}_*.sscore",
+        "arrays_*.sscore",
+        "*.sscore",
+    ]
+    for pattern in local_patterns:
+        for path in PLINK_PREFIX.parent.glob(pattern):
+            try:
+                resolved = path.resolve()
+            except OSError:
+                continue
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            yield path
+    for path in _iter_files_with_suffix(".sscore"):
+        try:
+            resolved = path.resolve()
+        except OSError:
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        yield path
+
+
 def _find_sscore_for(pgs_id: str) -> Path | None:
-    """Find any `arrays_*.sscore` whose header contains `{pgs_id}_AVG`.
+    """Find any `.sscore` whose header contains `{pgs_id}_AVG`.
 
     gnomon names per-PGS outputs differently depending on how `--score` is
     invoked:
@@ -253,7 +378,7 @@ def _find_sscore_for(pgs_id: str) -> Path | None:
     headers instead.
     """
     target = f"{pgs_id}_AVG"
-    for path in WORKDIR.glob("arrays_*.sscore"):
+    for path in _iter_sscore_files():
         try:
             with path.open() as fh:
                 header = fh.readline().rstrip("\n").split("\t")
@@ -267,7 +392,7 @@ def _find_sscore_for(pgs_id: str) -> Path | None:
 def ensure_scored(pgs_ids: list[str]) -> None:
     """Run a single `gnomon score` call for any PGS not yet scored on disk.
 
-    "Already scored" = some `arrays_*.sscore` in WORKDIR has a `<PGS>_AVG`
+    "Already scored" = some `.sscore` visible to the discovery scan has a `<PGS>_AVG`
     column. This catches both gnomon's per-PGS naming and the hashed inline
     naming, so we don't re-score a file that's already there under a
     different filename and trip gnomon's overwrite refusal.
@@ -299,7 +424,7 @@ def load_one_pgs(pgs_id: str) -> pd.DataFrame:
     path = _find_sscore_for(pgs_id)
     if path is None:
         raise FileNotFoundError(
-            f"no sscore file in {WORKDIR} carries column {pgs_id}_AVG"
+            f"no discovered sscore file carries column {pgs_id}_AVG"
         )
     avg_col = f"{pgs_id}_AVG"
     # Some hits are the 1+ GB bulk 533-PGS file; only read the id col + the
@@ -749,37 +874,41 @@ def fit_baseline_cox(
     entry: np.ndarray,
     exit_: np.ndarray,
     event: np.ndarray,
-    z: np.ndarray,
-    sex: np.ndarray,
-) -> tuple[float, float]:
-    """Left-truncated Cox PH baseline. Returns (β_z, β_sex).
+    X: np.ndarray,
+    names: list[str],
+) -> dict[str, float]:
+    """Generic left-truncated Cox PH baseline.
 
-    Fits `Surv(entry, exit, event) ~ z_norm2 + sex` so the GAM-vs-baseline
-    comparison is fair: the GAM formula also has `+ sex` as a linear term,
-    so the baseline must share that adjustment -- otherwise the GAM gets a
-    free C-stat advantage from a covariate the baseline doesn't see.
+    `X` is an `(n, p)` covariate matrix; `names` labels its columns. Returns
+    `{name: beta}` for every column.
+
+    This script calls it twice per fold so the GAM is benchmarked against
+    *two* sensible PRS-+-PC adjustment strategies:
+      A. `Z_norm2 + sex`                           -- PCs folded into the
+         PRS via train-only mean+var standardization (pgsc_calc style).
+      B. `prs_z + sex + PC1 + ... + PC_NUM_PCS`    -- raw train-z-scored
+         PRS plus PCs as linear additive Cox covariates.
+    Both share `+ sex` with the GAM so no model has an extra free covariate;
+    they differ only in how PC structure enters the score. The GAM's
+    `duchon(PC1..PC_NUM_PCS)` is the third, smooth, alternative.
 
     Uses `statsmodels.duration.hazard_regression.PHReg` -- the only fast
     Python Cox PH that natively supports left-truncation via `entry=`.
-    sksurv's Cox PH doesn't accept entry times (right-censoring only), so
-    we'd silently bias log-HR on the AoU age-as-time-scale data; lifelines'
-    CoxPHFitter handles entry but its pure-Python risk-set loop takes
-    minutes on the n=300-400k LOSO folds.
     """
     from statsmodels.duration.hazard_regression import PHReg  # lazy
 
-    X = np.column_stack([
-        np.asarray(z, dtype=np.float64),
-        np.asarray(sex, dtype=np.float64),
-    ])
     result = PHReg(
         endog=np.asarray(exit_, dtype=np.float64),
-        exog=X,
+        exog=np.asarray(X, dtype=np.float64),
         status=np.asarray(event, dtype=np.float64),
         entry=np.asarray(entry, dtype=np.float64),
         ties="breslow",
     ).fit(method="newton", maxiter=30, tol=1e-5, disp=0)
-    return float(result.params[0]), float(result.params[1])
+    if len(names) != len(result.params):
+        raise ValueError(
+            f"names length {len(names)} != coef length {len(result.params)}"
+        )
+    return {n: float(p) for n, p in zip(names, result.params)}
 
 
 def gam_risk(
