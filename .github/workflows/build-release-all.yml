@@ -20,7 +20,15 @@ env:
   GNOMON_SKIP_LINT_CHECKS: "1"
 
 concurrency:
-  group: build-release-all-${{ github.ref }}
+  # Scope the concurrency group by commit SHA, not branch ref, so a new
+  # push to main doesn't cancel the in-flight release build for the
+  # previous commit. Without this, a fast push cadence on main leaves
+  # the previous commit without any published release at all, and
+  # install.sh keeps falling back to a much older binary that may not
+  # contain the fix the just-pushed commit is meant to deliver. Re-runs
+  # of the same SHA (workflow_dispatch) still cancel-replace, which is
+  # the desired behaviour for manual retries.
+  group: build-release-all-${{ github.sha }}
   cancel-in-progress: true
 
 permissions:
