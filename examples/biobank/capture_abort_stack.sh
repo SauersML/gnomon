@@ -30,61 +30,66 @@ fi
 WORK_DIR="$(mktemp -d -t gnomon-capture-XXXXXX)"
 echo "[capture] work dir: $WORK_DIR" >&2
 
-# --- Download a static gdb ---------------------------------------------------
-# gdb-multiarch-12.0.50-1.cf12.x86_64 — Conda-Forge static-ish builds also
-# work; we try a couple of sources. If none reach, the user can stop here.
-GDB_BIN="$WORK_DIR/gdb"
+# --- Get a working gdb -------------------------------------------------------
+# The AoU Jupyter image is Ubuntu 22.04 (glibc 2.35) and ships with no
+# gdb on PATH. Conda's cache directory is unwritable for our user, so
+# `conda install gdb` fails before it can fetch anything. Workaround:
+# grab the official Ubuntu `gdb` .deb from archive.ubuntu.com (or its
+# mirror), extract it locally with `dpkg-deb -x` — that doesn't need
+# root and skips all package-management bookkeeping.
+GDB_BIN=""
 if command -v gdb >/dev/null 2>&1; then
   GDB_BIN="$(command -v gdb)"
   echo "[capture] using system gdb at $GDB_BIN" >&2
-else
-  echo "[capture] downloading static gdb" >&2
-  curl -fsSL --retry 3 \
-    "https://github.com/hugsy/gdb-static/releases/download/9.2/gdbserver_x86_64-musl_v9.2" \
-    -o "$WORK_DIR/gdbserver.attempt" 2>/dev/null || true
-  if [ ! -s "$WORK_DIR/gdbserver.attempt" ]; then
-    # Fallback: build gdb via micromamba if available; otherwise give up
-    # and tell the user what we needed.
-    if command -v micromamba >/dev/null 2>&1; then
-      micromamba install -y -p "$WORK_DIR/env" -c conda-forge gdb >&2
-      GDB_BIN="$WORK_DIR/env/bin/gdb"
-    elif command -v conda >/dev/null 2>&1; then
-      conda create -y -p "$WORK_DIR/env" -c conda-forge gdb >&2
-      GDB_BIN="$WORK_DIR/env/bin/gdb"
-    elif command -v pip >/dev/null 2>&1; then
-      # Last-ditch: use Python's `faulthandler`-style traceback — emit a
-      # Python-side LD_PRELOAD that prints a libunwind backtrace from the
-      # SIGABRT handler. Implemented inline below.
-      :
-    else
-      echo "[capture] no gdb, no conda, no pip — cannot install a debugger." >&2
-      echo "[capture] Install gdb on the runner manually (apt-get install gdb), " >&2
-      echo "[capture] or run this from a host that has it, and rerun." >&2
-      exit 1
-    fi
-  else
-    # gdbserver alone is not enough; we need the full gdb client. Drop
-    # the partial gdbserver and bail to conda.
-    rm -f "$WORK_DIR/gdbserver.attempt"
-    if command -v micromamba >/dev/null 2>&1; then
-      micromamba install -y -p "$WORK_DIR/env" -c conda-forge gdb >&2
-      GDB_BIN="$WORK_DIR/env/bin/gdb"
-    elif command -v conda >/dev/null 2>&1; then
-      conda create -y -p "$WORK_DIR/env" -c conda-forge gdb >&2
-      GDB_BIN="$WORK_DIR/env/bin/gdb"
-    else
-      echo "[capture] no static gdb available and no conda installed" >&2
-      exit 1
-    fi
-  fi
 fi
 
-if [ ! -x "$GDB_BIN" ]; then
-  echo "[capture] gdb still not available at $GDB_BIN" >&2
-  exit 1
+if [ -z "$GDB_BIN" ]; then
+  if ! command -v dpkg-deb >/dev/null 2>&1; then
+    echo "[capture] no gdb on PATH and no dpkg-deb to extract one — bailing." >&2
+    exit 1
+  fi
+  echo "[capture] fetching Ubuntu gdb .deb and extracting into $WORK_DIR/gdb-deb" >&2
+  # Pin to a known 22.04 (jammy) build. The actual binary version varies
+  # by minor updates; try the latest mirror copy, fall back to a known
+  # archive URL.
+  GDB_DEB="$WORK_DIR/gdb.deb"
+  GDB_LIBC6="$WORK_DIR/libc6.deb"
+  # Try the 22.04 ports first (also serves x86_64 via the main archive).
+  for url in \
+    "http://archive.ubuntu.com/ubuntu/pool/main/g/gdb/gdb_12.1-0ubuntu1~22.04.2_amd64.deb" \
+    "http://archive.ubuntu.com/ubuntu/pool/main/g/gdb/gdb_12.1-0ubuntu1~22.04_amd64.deb" \
+    "http://mirrors.kernel.org/ubuntu/pool/main/g/gdb/gdb_12.1-0ubuntu1~22.04.2_amd64.deb" \
+    ; do
+    if curl -fsSL --retry 3 --connect-timeout 10 "$url" -o "$GDB_DEB"; then
+      echo "[capture] downloaded gdb deb from $url" >&2
+      break
+    fi
+    rm -f "$GDB_DEB"
+  done
+  if [ ! -s "$GDB_DEB" ]; then
+    echo "[capture] could not download an Ubuntu gdb .deb" >&2
+    exit 1
+  fi
+  mkdir -p "$WORK_DIR/gdb-deb"
+  dpkg-deb -x "$GDB_DEB" "$WORK_DIR/gdb-deb"
+  GDB_BIN="$WORK_DIR/gdb-deb/usr/bin/gdb"
+  if [ ! -x "$GDB_BIN" ]; then
+    echo "[capture] extracted .deb did not contain usr/bin/gdb:" >&2
+    ls -la "$WORK_DIR/gdb-deb/usr/bin/" 2>/dev/null >&2 || true
+    exit 1
+  fi
+  # gdb depends on libsource-highlight + libgmp + libpython3.10; those
+  # are installed on every Ubuntu 22.04 base image. If the binary can't
+  # find them we'd error out loudly below.
 fi
+
 echo "[capture] using gdb: $GDB_BIN" >&2
-"$GDB_BIN" --version 2>&1 | head -1 >&2
+"$GDB_BIN" --version 2>&1 | head -1 >&2 || {
+  echo "[capture] gdb refuses to run — likely missing a shared library." >&2
+  ldd "$GDB_BIN" 2>&1 | grep -v '=>' | head -10 >&2 || true
+  ldd "$GDB_BIN" 2>&1 | grep 'not found' >&2 || true
+  exit 1
+}
 
 # --- Run gnomon under gdb directly (no need to mess with core_pattern) ------
 # Running the program inside gdb means we don't depend on the kernel's
