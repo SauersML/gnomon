@@ -89,8 +89,22 @@ TMP_INSTALL="$(mktemp -d)"
 trap 'rm -rf "$TMP_INSTALL"' EXIT
 curl -fsSL --retry 5 --retry-delay 2 "$ASSET_URL" -o "$TMP_INSTALL/gnomon.tar.gz"
 tar -xzf "$TMP_INSTALL/gnomon.tar.gz" -C "$TMP_INSTALL"
-INSTALLED_BIN="$(find "$TMP_INSTALL" -maxdepth 3 -type f -name gnomon -perm -u+x | head -n 1)"
+# The release tarball contains a single executable named after the
+# build (e.g. `gnomon-linux-x64-v3`), not `gnomon`. Pick the first
+# regular file that smells like an ELF binary; rename to `gnomon` on
+# install.
+INSTALLED_BIN=""
+for candidate in "$TMP_INSTALL"/gnomon* "$TMP_INSTALL"/*/gnomon* "$TMP_INSTALL"/*/*/gnomon*; do
+  [ -f "$candidate" ] || continue
+  case "$candidate" in
+    *.tar.gz|*.txt|*.md|*.json) continue ;;
+  esac
+  INSTALLED_BIN="$candidate"
+  break
+done
 if [ -z "$INSTALLED_BIN" ]; then
+  echo "[run.sh] extracted release contents:" >&2
+  ls -la "$TMP_INSTALL" >&2 || true
   echo "[run.sh] extracted release did not contain a gnomon binary" >&2
   exit 1
 fi
