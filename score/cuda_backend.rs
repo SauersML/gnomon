@@ -162,22 +162,28 @@ impl<'a> Drop for BufferGuard<'a> {
     }
 }
 
+// Field order matters: Rust drops struct fields top-down. We list the
+// "leaf" GPU resources first so they are released before the streams,
+// kernels, blas handle, and context they depend on. The context Arc is
+// listed last (and prefixed with `_`) so it lives until everything else
+// has finished dropping, guaranteeing every cuMemFree / cuEventDestroy /
+// cublasDestroy call still has a valid context to bind to.
 struct CudaRuntime {
-    _ctx: Arc<CudaContext>,
-    compute_stream: Arc<CudaStream>,
-    copy_stream: Arc<CudaStream>,
-    blas: CudaBlas,
-    unpack_kernel: CudaFunction,
-    build_batch_mats_kernel: CudaFunction,
+    pinned_staging: Vec<PinnedHostSlice<u8>>,
+    pinned_reconciled: Vec<PinnedHostSlice<u32>>,
     sparse_weights: CudaSlice<f32>,
     sparse_missing_corrections: CudaSlice<f32>,
     sparse_columns: CudaSlice<u32>,
     sparse_row_offsets: CudaSlice<u64>,
     output_map: CudaSlice<u32>,
+    blas: CudaBlas,
+    unpack_kernel: CudaFunction,
+    build_batch_mats_kernel: CudaFunction,
+    compute_stream: Arc<CudaStream>,
+    copy_stream: Arc<CudaStream>,
     mega_batch_variants: usize,
     gpu_score_chunk_size: usize,
-    pinned_staging: Vec<PinnedHostSlice<u8>>,
-    pinned_reconciled: Vec<PinnedHostSlice<u32>>,
+    _ctx: Arc<CudaContext>,
 }
 
 struct GpuChannels {
@@ -703,9 +709,10 @@ enum CudaInput {
 
 fn run_cuda_pipeline(
     context: &PipelineContext,
-    mut runtime: CudaRuntime,
+    runtime: CudaRuntime,
     input: CudaInput,
 ) -> Result<(Vec<f64>, Vec<u32>), PipelineError> {
+    let mut runtime = Some(runtime);
     let prep_result = &context.prep_result;
     let channels = create_gpu_channels(context);
     let mut support_guard = PipelineSupportGuard::new(start_pipeline_support(
@@ -826,7 +833,7 @@ fn run_cuda_pipeline(
         let compute_result = process_dense_stream_cuda(
             channels.dense_rx,
             prep_result,
-            &mut runtime,
+            runtime.as_mut().expect("runtime must exist during GPU stage"),
             Arc::clone(&channels.buffer_pool),
         );
         let spool_result = producer_handle
@@ -838,6 +845,14 @@ fn run_cuda_pipeline(
     })?;
     let mut spool_state = local_spool;
     support_guard.mark_completed();
+
+    // Tear down all CUDA resources here, while the heap is still in a known-good
+    // state and before we run the CPU-only complex variant resolver. Doing this
+    // explicitly (rather than at function return) keeps any cudarc/CUDA driver
+    // teardown side-effects strictly contained to the GPU phase: if anything in
+    // PinnedHostSlice / CudaSlice / CudaBlas drop misbehaves, it cannot corrupt
+    // the heap used by the parallel complex resolver or the final score writer.
+    drop(runtime.take());
 
     if !prep_result.complex_rules.is_empty() {
         if should_spool {
