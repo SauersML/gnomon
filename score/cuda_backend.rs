@@ -364,76 +364,121 @@ pub fn try_run_cuda(
     }
 }
 
-/// Print which CUDA shared libraries the process actually dlopened.
+/// Return the canonical CUDA library family name for a file basename,
+/// or `None` if the basename isn't a CUDA library we care about.
 ///
-/// gnomon's release binary uses cudarc with `dynamic-loading`, which
-/// dlopens libcuda, libcudart, libcublas, libnvrtc at runtime based on
-/// the runtime linker's search order (LD_LIBRARY_PATH, system paths,
-/// ldconfig cache, …). Different CUDA library *versions* between the
-/// driver (system) and the runtime libs (e.g. pip-installed
-/// `nvidia-cublas-cu12`) are ABI-compatible enough to load but not
-/// always ABI-compatible enough to *run* — the symptom we've seen on
-/// AoU Turing T4 is "double free or corruption (!prev)" at the end of
-/// the CUDA pipeline when pip-wheel CUDA libs precede the system libs
-/// on LD_LIBRARY_PATH.
-///
-/// Printing the resolved library paths up front turns this from "spend
-/// a day in gdb" into "spot the wrong path in the run log".
-fn report_loaded_cuda_libraries() {
-    let proc_self_maps = match fs::read_to_string("/proc/self/maps") {
-        Ok(content) => content,
-        Err(_) => return, // not on a Linux that exposes /proc/self/maps
+/// Families are matched on the basename's stem (everything before the
+/// first `.so`), so `libcublas.so.12.3.4.1` and `libcublas.so.12` both
+/// resolve to `libcublas`, while `libcublasLt.so.12` resolves to
+/// `libcublasLt` — a *separate* family despite the shared prefix.
+fn cuda_library_family(basename: &str) -> Option<&'static str> {
+    let stem = basename.split(".so").next()?;
+    match stem {
+        "libcuda" => Some("libcuda"),
+        "libcudart" => Some("libcudart"),
+        "libcublas" => Some("libcublas"),
+        "libcublasLt" => Some("libcublasLt"),
+        "libcusparse" => Some("libcusparse"),
+        "libcusolver" => Some("libcusolver"),
+        "libnvJitLink" => Some("libnvJitLink"),
+        "libnvrtc" => Some("libnvrtc"),
+        _ => None,
+    }
+}
+
+/// Walk `/proc/self/maps` and return CUDA libraries grouped by family.
+/// `BTreeMap`/`BTreeSet` give stable ordering in diagnostic output.
+/// Returns an empty map on non-Linux hosts (where `/proc/self/maps`
+/// doesn't exist) — callers treat that as "no conflicts to detect".
+fn cuda_library_mappings() -> std::collections::BTreeMap<&'static str, std::collections::BTreeSet<String>> {
+    let mut by_family: std::collections::BTreeMap<&'static str, std::collections::BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+    let Ok(maps) = fs::read_to_string("/proc/self/maps") else {
+        return by_family;
     };
-    let mut cuda_libs: Vec<String> = Vec::new();
-    let mut seen: ahash::AHashSet<String> = ahash::AHashSet::new();
-    for line in proc_self_maps.lines() {
-        // Each /proc/self/maps line ends with the mapped path after the
-        // last whitespace run.
-        let path = match line.split_whitespace().last() {
-            Some(p) if p.starts_with('/') => p,
-            _ => continue,
+    for line in maps.lines() {
+        let Some(path) = line.split_whitespace().last() else {
+            continue;
         };
-        let file_name = Path::new(path)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("");
-        let is_cuda = file_name.starts_with("libcuda")
-            || file_name.starts_with("libcudart")
-            || file_name.starts_with("libcublas")
-            || file_name.starts_with("libnvrtc");
-        if !is_cuda {
+        if !path.starts_with('/') {
             continue;
         }
-        if seen.insert(path.to_string()) {
-            cuda_libs.push(path.to_string());
+        let name = Path::new(path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        if let Some(family) = cuda_library_family(name) {
+            by_family.entry(family).or_default().insert(path.to_string());
         }
     }
-    if cuda_libs.is_empty() {
+    by_family
+}
+
+/// Detect whether more than one distinct file is mapped into the
+/// process for the same CUDA SONAME family.
+///
+/// This is the canonical failure mode behind the AoU "double free or
+/// corruption (!prev)" abort. glibc's dlopen deduplicates by
+/// `(device, inode)`, not by SONAME. When pip's `nvidia-*-cu12`
+/// wheels and the system CUDA toolkit are both reachable to the
+/// loader, an absolute-path `dlopen` of the wheel and a bare-name
+/// `dlopen("libcublas.so")` that walks `ld.so.cache` can succeed
+/// independently and leave *two distinct files* with the same SONAME
+/// permanently mapped. cuBLAS state then splits across two cuBLAS
+/// implementations whose internal allocators, struct layouts, and
+/// static initializers disagree — and the next `cublasDestroy`
+/// frees a chunk one allocator never owned, tripping glibc's malloc
+/// consistency check.
+///
+/// On `Ok(())`, mappings are consistent. On `Err`, the string is a
+/// multi-line, actionable report naming every conflicting path.
+fn detect_cuda_library_conflicts() -> Result<(), String> {
+    let by_family = cuda_library_mappings();
+    let conflicts: Vec<(&'static str, Vec<String>)> = by_family
+        .into_iter()
+        .filter(|(_, paths)| paths.len() > 1)
+        .map(|(family, paths)| (family, paths.into_iter().collect()))
+        .collect();
+    if conflicts.is_empty() {
+        return Ok(());
+    }
+    let mut msg = String::from(
+        "CUDA library conflict: multiple distinct files share a SONAME and \
+         coexist in this process. glibc dlopen deduplicates by (device, \
+         inode) not by SONAME, so all of the following are simultaneously \
+         mapped. cuBLAS handle state would split across them and the next \
+         cublasDestroy_v2 would abort with 'double free or corruption \
+         (!prev)'.",
+    );
+    for (family, paths) in &conflicts {
+        msg.push_str(&format!("\n  {family}:"));
+        for path in paths {
+            msg.push_str(&format!("\n    {path}"));
+        }
+    }
+    msg.push_str(
+        "\nKeep exactly one CUDA toolkit reachable to the loader: either the \
+         system toolkit (usually /usr/local/cuda*) or the pip nvidia-*-cu12 \
+         wheels, not both. Refusing to create cuBLAS handles to avoid \
+         crashing later.",
+    );
+    Err(msg)
+}
+
+/// Print every CUDA library currently mapped into the process, for
+/// post-init diagnostics. Pairs with `detect_cuda_library_conflicts`
+/// — by the time we call this, any conflict has already been
+/// rejected as a hard error.
+fn report_loaded_cuda_libraries() {
+    let by_family = cuda_library_mappings();
+    if by_family.is_empty() {
         return;
     }
-    cuda_libs.sort();
+    let mut all: Vec<String> = by_family.into_values().flatten().collect();
+    all.sort();
     eprintln!("> CUDA libs loaded:");
-    let mut wheel_paths: Vec<&str> = Vec::new();
-    for path in &cuda_libs {
+    for path in &all {
         eprintln!(">   {path}");
-        if path.contains("/site-packages/nvidia/") {
-            wheel_paths.push(path);
-        }
-    }
-    if !wheel_paths.is_empty() {
-        eprintln!(
-            "> WARNING: CUDA libs above include pip-wheel paths under \
-             site-packages/nvidia/. If those shadow the system CUDA \
-             stack (e.g. /usr/local/cuda/lib64), an ABI/version mismatch \
-             can corrupt the heap at the end of the CUDA pipeline."
-        );
-        eprintln!(
-            "> Fix: put your system CUDA paths first on LD_LIBRARY_PATH \
-             (or unset LD_LIBRARY_PATH and let the loader use its default)."
-        );
-        for path in wheel_paths {
-            eprintln!(">   pip-wheel: {path}");
-        }
     }
 }
 
@@ -723,6 +768,28 @@ impl CudaRuntime {
                 .map_err(|e| format!("Failed to allocate pinned reconciled-index buffer: {e:?}"))?;
             pinned_reconciled.push(pinned_indices);
         }
+
+        // Force-init cudarc's persistent libcublas handle BEFORE the
+        // conflict scan, so `/proc/self/maps` reflects every CUDA
+        // library that `CudaBlas::new` would touch. `culib()` caches
+        // the loaded `Library` in a `OnceLock` and never drops it, so
+        // unlike `is_culib_present()` (which dlopen→dlclose's its
+        // probe handles) the mapping is guaranteed to stick. The call
+        // panics with `panic_no_lib_found` when no candidate is
+        // dlopen'able — wrapped in catch_unwind so we degrade to CPU
+        // fallback instead of aborting the process.
+        match catch_unwind(AssertUnwindSafe(|| unsafe {
+            let _ = cudarc::cublas::sys::culib();
+        })) {
+            Ok(()) => {}
+            Err(payload) => {
+                return Err(format!(
+                    "cuBLAS library not loadable on this host ({})",
+                    panic_payload_to_string(payload)
+                ));
+            }
+        }
+        detect_cuda_library_conflicts()?;
 
         let blas = CudaBlas::new(compute_stream.clone())
             .map_err(|e| format!("Failed to initialize cuBLAS: {e:?}"))?;
