@@ -491,8 +491,14 @@ impl CudaRuntime {
             .new_stream()
             .map_err(|e| format!("Failed to create CUDA compute stream: {e:?}"))?;
 
-        let (free_mem, _) = cudarc::driver::result::mem_get_info()
+        let (free_mem, total_mem) = cudarc::driver::result::mem_get_info()
             .map_err(|e| format!("Failed to query device memory: {e:?}"))?;
+        eprintln!(
+            "> CUDA device memory: free={:.2} GiB / total={:.2} GiB ({:.1}% available)",
+            free_mem as f64 / (1024.0 * 1024.0 * 1024.0),
+            total_mem as f64 / (1024.0 * 1024.0 * 1024.0),
+            if total_mem == 0 { 0.0 } else { 100.0 * free_mem as f64 / total_mem as f64 },
+        );
 
         let static_bytes = prep
             .sparse_weights()
@@ -571,6 +577,12 @@ impl CudaRuntime {
         };
 
         let budget = (free_mem as f64 * 0.8) as usize;
+        eprintln!(
+            "> CUDA budget (80% of free): {:.2} GiB; static device buffers: {:.2} MiB; \
+             per-variant packed bytes: {bytes_per_variant}; people={num_people}, scores={num_scores}",
+            budget as f64 / (1024.0 * 1024.0 * 1024.0),
+            static_bytes as f64 / (1024.0 * 1024.0),
+        );
         let lane_groups = num_scores.div_ceil(MIN_SCORE_TILE_SIZE).max(1);
         let mut tile_candidates_lane_groups = Vec::with_capacity((usize::BITS as usize) + 1);
         tile_candidates_lane_groups.push(lane_groups);
@@ -582,6 +594,7 @@ impl CudaRuntime {
             p2 /= 2;
         }
         let mut selected: Option<(usize, usize)> = None;
+        let mut smallest_required: Option<(usize, usize, usize)> = None;
 
         for tile_lane_groups in tile_candidates_lane_groups {
             let score_tile = tile_lane_groups
@@ -609,12 +622,43 @@ impl CudaRuntime {
                     }
                     break;
                 }
+                // Track the cheapest (mega, score_tile, required) we considered, so
+                // we can tell the user how much VRAM the minimal viable layout would
+                // have needed when we end up falling back.
+                match smallest_required {
+                    None => smallest_required = Some((mega, score_tile, required)),
+                    Some((_, _, best)) if required < best => {
+                        smallest_required = Some((mega, score_tile, required));
+                    }
+                    _ => {}
+                }
                 mega /= 2;
             }
         }
 
-        let (mega, gpu_score_chunk_size) = selected
-            .ok_or_else(|| "Insufficient GPU memory for minimum CUDA workload".to_string())?;
+        let (mega, gpu_score_chunk_size) = selected.ok_or_else(|| {
+            let mut msg = format!(
+                "Insufficient GPU memory for minimum CUDA workload (budget {:.2} GiB = 80% of {:.2} GiB free)",
+                budget as f64 / (1024.0 * 1024.0 * 1024.0),
+                free_mem as f64 / (1024.0 * 1024.0 * 1024.0),
+            );
+            if let Some((m, t, req)) = smallest_required {
+                msg.push_str(&format!(
+                    "; smallest tile considered (mega={m}, score_tile={t}) needed {:.2} GiB, \
+                     short by {:.2} GiB",
+                    req as f64 / (1024.0 * 1024.0 * 1024.0),
+                    (req.saturating_sub(budget)) as f64 / (1024.0 * 1024.0 * 1024.0),
+                ));
+            }
+            if free_mem < total_mem / 2 {
+                msg.push_str(&format!(
+                    "; note: only {:.0}% of device memory is free — another process likely \
+                     holds an allocation",
+                    100.0 * free_mem as f64 / total_mem.max(1) as f64,
+                ));
+            }
+            msg
+        })?;
         eprintln!(
             "> CUDA tiling: mega_batch_variants={mega}, gpu_score_chunk_size={gpu_score_chunk_size}, vram_budget_bytes={budget}"
         );
