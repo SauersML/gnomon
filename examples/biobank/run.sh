@@ -41,29 +41,14 @@ if [ -z "${GNOMON_RUN_REEXEC:-}" ] && git -C "$SCRIPT_DIR" rev-parse --git-dir >
   fi
 fi
 
-# Refresh the gnomon binary by downloading a published release. We pin
-# to a *known-good* release SHA rather than HEAD because the CUDA
-# teardown path in the gnomon source has been actively unstable on the
-# AoU bare-metal box:
-#
-#   * cbd88218 binary:  single-PGS scoring exits 0 cleanly; multi-PGS
-#                       aborts AFTER all `.sscore` outputs are written
-#                       (atexit-handler double-free, harmless given the
-#                       per-PGS loop + output-presence check below).
-#   * a3bc69bf and b7711907 binaries: introduced a "heap-race" fix that
-#                       made even tiny single-PGS jobs abort *before*
-#                       writing any output, so the Python wrapper has
-#                       no way to recover.
-#
-# Until the underlying CUDA teardown bug is properly fixed in gnomon
-# source AND a release is built that contains the fix, stay on
-# cbd88218 -- it is the most recent release where every code path that
-# actually writes output completes successfully. install.sh resolves
-# `GNOMON_INSTALL_MAIN_SHA` against the exact release tag and only
-# falls back to "latest" if that tag is missing.
-GNOMON_PINNED_RELEASE_SHA="${GNOMON_PINNED_RELEASE_SHA:-cbd88218850c897b3f42c29ad54d37bb282ea042}"
-export GNOMON_INSTALL_MAIN_SHA="$GNOMON_PINNED_RELEASE_SHA"
-echo "[run.sh] GNOMON_INSTALL_MAIN_SHA=$GNOMON_INSTALL_MAIN_SHA (pinned to known-good release)" >&2
+# Refresh the gnomon binary by downloading a published release.
+# install.sh resolves GNOMON_INSTALL_MAIN_SHA against the exact release
+# tag and falls back to the latest published release if that tag is
+# missing.
+if [ -d "$HOME/gnomon/.git" ]; then
+  export GNOMON_INSTALL_MAIN_SHA="$(git -C "$HOME/gnomon" rev-parse HEAD 2>/dev/null || true)"
+  echo "[run.sh] GNOMON_INSTALL_MAIN_SHA=$GNOMON_INSTALL_MAIN_SHA" >&2
+fi
 bash "$HOME/gnomon/install.sh"
 AOU_DISK_ROOT="$HOME/aou-gpu-baremetal"
 RESULTS_DIR="$AOU_DISK_ROOT/biobank_results"
