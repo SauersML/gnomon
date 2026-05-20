@@ -1351,6 +1351,40 @@ fn process_dense_stream_cuda(
         )?);
     }
 
+    // Drain the streams *and then* explicitly free every per-batch
+    // device allocation that this function owns BEFORE returning, while
+    // we still have host control. cudarc's `CudaSlice<T>::drop` queues
+    // `cuMemFreeAsync` onto `compute_stream`; if we let these locals
+    // drop implicitly at function return, the queued frees outlive this
+    // function and land on `compute_stream` concurrently with cudarc's
+    // CudaRuntime teardown (cublasDestroy, then the runtime's own slice
+    // drops). Empirically that race trips glibc with "double free or
+    // corruption (!prev)" on the AoU Turing T4 image even for a single
+    // 4 289-variant score, where the pipeline finishes in 2 seconds —
+    // d29d7df2 reordered CudaRuntime fields to ameliorate it but did
+    // not eliminate the function-local source of the backlog.
+    //
+    // The correct fix is to drop the locals, then synchronise — so the
+    // sync waits for the cuMemFreeAsync queue this function generated,
+    // and nothing in the runtime's teardown path can race against it.
+    drop(host_tile_counts_slots);
+    drop(host_tile_corr_slots);
+    drop(host_tile_scores_slots);
+    drop(d_out_counts_slots);
+    drop(d_out_corr_slots);
+    drop(d_out_scores_slots);
+    drop(d_count_w);
+    drop(d_w_corr);
+    drop(d_w_eff);
+    drop(d_missing);
+    drop(d_dosage);
+    drop(d_reconciled_slots);
+    drop(d_packed_slots);
+    drop(slot_last_compute_done);
+    drop(slot_last_copy_done);
+    drop(pending);
+    drop(batch);
+
     runtime
         .copy_stream
         .synchronize()
