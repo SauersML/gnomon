@@ -53,65 +53,42 @@ if [ "$REEXECUTED" -eq 0 ] && git -C "$SCRIPT_DIR" rev-parse --git-dir >/dev/nul
 fi
 
 # --- Install the scorer ------------------------------------------------------
-# Download the most recently published linux-x64 release binary directly
-# from the GitHub Releases API and install it to ~/.local/bin/gnomon.
-# This path requires no cargo / rustc toolchain on the runner. We do not
-# pin to the checked-out HEAD SHA — releases are published asynchronously
-# (~20 min after each push while the build workflow runs), and pinning to
-# an unpublished SHA hard-fails. Accepting the latest published release
-# is the right trade-off for a runner that doesn't carry a Rust build
-# toolchain.
+# Build the scorer from this checkout. GitHub Releases are asynchronous and
+# can lag behind main; using "latest release" reintroduced the stale
+# main-b771190... binary and reproduced the CUDA teardown abort after 100%.
+if [ ! -d "$HOME/gnomon/.git" ]; then
+  echo "[run.sh] expected a git checkout at $HOME/gnomon" >&2
+  exit 1
+fi
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "[run.sh] cargo is required so gnomon can be built from the checked-out source" >&2
+  echo "[run.sh] refusing to install a potentially stale GitHub release" >&2
+  exit 1
+fi
 INSTALL_DIR="$HOME/.local/bin"
 mkdir -p "$INSTALL_DIR" "$HOME/.local/share/gnomon"
-RELEASE_API="https://api.github.com/repos/SauersML/gnomon/releases/latest"
-RELEASE_JSON="$(curl -sL --retry 5 --retry-delay 2 --connect-timeout 5 --max-time 30 "$RELEASE_API")"
-RELEASE_TAG="$(printf '%s' "$RELEASE_JSON" \
-  | sed -n 's/^[[:space:]]*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' \
-  | head -n 1)"
-ASSET_URL="$(printf '%s' "$RELEASE_JSON" \
-  | grep -F 'browser_download_url' \
-  | grep -F 'gnomon-linux-x64-v3.tar.gz' \
-  | cut -d '"' -f 4 \
-  | head -n 1)"
-if [ -z "$ASSET_URL" ]; then
-  ASSET_URL="$(printf '%s' "$RELEASE_JSON" \
-    | grep -F 'browser_download_url' \
-    | grep -F 'gnomon-linux-x64.tar.gz' \
-    | cut -d '"' -f 4 \
-    | head -n 1)"
-fi
-if [ -z "$ASSET_URL" ]; then
-  echo "[run.sh] could not find a linux-x64 asset on the latest release" >&2
-  exit 1
-fi
-echo "[run.sh] installing gnomon release $RELEASE_TAG from $ASSET_URL" >&2
-TMP_INSTALL="$(mktemp -d)"
-trap 'rm -rf "$TMP_INSTALL"' EXIT
-curl -fsSL --retry 5 --retry-delay 2 "$ASSET_URL" -o "$TMP_INSTALL/gnomon.tar.gz"
-tar -xzf "$TMP_INSTALL/gnomon.tar.gz" -C "$TMP_INSTALL"
-# The release tarball contains a single executable named after the
-# build (e.g. `gnomon-linux-x64-v3`), not `gnomon`. Pick the first
-# regular file that smells like an ELF binary; rename to `gnomon` on
-# install.
-INSTALLED_BIN=""
-for candidate in "$TMP_INSTALL"/gnomon* "$TMP_INSTALL"/*/gnomon* "$TMP_INSTALL"/*/*/gnomon*; do
-  [ -f "$candidate" ] || continue
-  case "$candidate" in
-    *.tar.gz|*.txt|*.md|*.json) continue ;;
-  esac
-  INSTALLED_BIN="$candidate"
-  break
-done
-if [ -z "$INSTALLED_BIN" ]; then
-  echo "[run.sh] extracted release contents:" >&2
-  ls -la "$TMP_INSTALL" >&2 || true
-  echo "[run.sh] extracted release did not contain a gnomon binary" >&2
-  exit 1
-fi
-install -m 0755 "$INSTALLED_BIN" "$INSTALL_DIR/gnomon"
-printf '%s\n' "$RELEASE_TAG" > "$HOME/.local/share/gnomon/installed-release"
-git -C "$HOME/gnomon" rev-parse HEAD > "$HOME/.local/share/gnomon/installed-sha"
+GNOMON_CHECKOUT_SHA="$(git -C "$HOME/gnomon" rev-parse HEAD)"
+GNOMON_REQUIRED_SCORER_SHA="$(git -C "$HOME/gnomon" log -1 --format=%H -- Cargo.toml Cargo.lock '*.rs' install.sh .github/workflows/build-release-all.yml)"
+GNOMON_INSTALL_MODE="source-build"
+GNOMON_INSTALLED_RELEASE="<none>"
+GNOMON_RELEASE_URL="<not-used>"
+echo "[run.sh] cargo install --path $HOME/gnomon --bin gnomon --root $HOME/.local (checkout $GNOMON_CHECKOUT_SHA; scorer $GNOMON_REQUIRED_SCORER_SHA)" >&2
+cargo install --path "$HOME/gnomon" --bin gnomon --locked --force --root "$HOME/.local" >&2
+rm -f "$HOME/.local/share/gnomon/installed-release"
+printf '%s\n' "$GNOMON_CHECKOUT_SHA" > "$HOME/.local/share/gnomon/installed-sha"
+printf '%s\n' "$GNOMON_REQUIRED_SCORER_SHA" > "$HOME/.local/share/gnomon/required-scorer-sha"
 hash -r
+if [ "$(command -v gnomon)" != "$INSTALL_DIR/gnomon" ]; then
+  echo "[run.sh] installed gnomon is not first on PATH: expected $INSTALL_DIR/gnomon, got $(command -v gnomon)" >&2
+  exit 1
+fi
+if command -v sha256sum >/dev/null 2>&1; then
+  GNOMON_BIN_SHA256="$(sha256sum "$INSTALL_DIR/gnomon" | awk '{print $1}')"
+elif command -v shasum >/dev/null 2>&1; then
+  GNOMON_BIN_SHA256="$(shasum -a 256 "$INSTALL_DIR/gnomon" | awk '{print $1}')"
+else
+  GNOMON_BIN_SHA256="<sha256-tool-missing>"
+fi
 AOU_DISK_ROOT="$HOME/aou-gpu-baremetal"
 RESULTS_DIR="$AOU_DISK_ROOT/biobank_results"
 RUN_STATE_DIR="$AOU_DISK_ROOT/gnomon_runtime/biobank"
@@ -245,6 +222,20 @@ failure_diagnostics() {
     echo "exit_code:         $exit_code"
     echo "timestamp_utc:     $(date -u +%Y%m%dT%H%M%SZ)"
     echo
+    echo "--- scorer provenance at failure ---"
+    echo "gnomon_bin:            $(command -v gnomon 2>/dev/null || echo '<missing>')"
+    echo "gnomon_install_mode:   ${GNOMON_INSTALL_MODE:-<unset>}"
+    echo "gnomon_checkout_sha:   ${GNOMON_CHECKOUT_SHA:-<unset>}"
+    echo "gnomon_required_sha:   ${GNOMON_REQUIRED_SCORER_SHA:-<unset>}"
+    echo "gnomon_installed_sha:  $(cat "$HOME/.local/share/gnomon/installed-sha" 2>/dev/null || echo '<missing>')"
+    echo "gnomon_required_file:  $(cat "$HOME/.local/share/gnomon/required-scorer-sha" 2>/dev/null || echo '<missing>')"
+    echo "gnomon_release_tag:    ${GNOMON_INSTALLED_RELEASE:-<unset>}"
+    echo "gnomon_release_url:    ${GNOMON_RELEASE_URL:-<unset>}"
+    echo "gnomon_sha256:         ${GNOMON_BIN_SHA256:-<unset>}"
+    echo "cargo_bin:             $(command -v cargo 2>/dev/null || echo '<missing>')"
+    echo "cargo_version:         $(cargo --version 2>/dev/null || echo '<missing>')"
+    echo "rustc_version:         $(rustc --version 2>/dev/null || echo '<missing>')"
+    echo
     echo "--- filesystem at failure ---"
     path_usage "home" "$HOME"
     path_usage "aou_disk" "$AOU_DISK_ROOT"
@@ -286,6 +277,17 @@ trap 'failure_diagnostics $?' ERR
   echo "gnomon_bin:       $(command -v gnomon)"
   echo "gnomon_version:   $(gnomon --version 2>/dev/null | head -1 || echo unknown)"
   echo "gnomon_head_sha:  $(git -C "$HOME/gnomon" rev-parse HEAD 2>/dev/null || echo unknown)"
+  echo "gnomon_install_mode: ${GNOMON_INSTALL_MODE:-<unset>}"
+  echo "gnomon_checkout_sha: ${GNOMON_CHECKOUT_SHA:-<unset>}"
+  echo "gnomon_required_scorer_sha: ${GNOMON_REQUIRED_SCORER_SHA:-<unset>}"
+  echo "gnomon_installed_sha_file: $(cat "$HOME/.local/share/gnomon/installed-sha" 2>/dev/null || echo '<missing>')"
+  echo "gnomon_required_sha_file:  $(cat "$HOME/.local/share/gnomon/required-scorer-sha" 2>/dev/null || echo '<missing>')"
+  echo "gnomon_installed_release: ${GNOMON_INSTALLED_RELEASE:-<unset>}"
+  echo "gnomon_release_url: ${GNOMON_RELEASE_URL:-<unset>}"
+  echo "gnomon_sha256:     ${GNOMON_BIN_SHA256:-<unset>}"
+  echo "cargo_bin:         $(command -v cargo 2>/dev/null || echo '<missing>')"
+  echo "cargo_version:     $(cargo --version 2>/dev/null || echo '<missing>')"
+  echo "rustc_version:     $(rustc --version 2>/dev/null || echo '<missing>')"
   echo "uv_bin:           $(command -v uv)"
   echo "uv_version:       $(uv --version)"
   echo "uv_default_cache: $(env -u UV_CACHE_DIR uv cache dir 2>/dev/null || echo unknown)"
