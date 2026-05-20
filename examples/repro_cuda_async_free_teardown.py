@@ -1,21 +1,25 @@
 #!/usr/bin/env python3
-"""Minimal CUDA/cuBLAS loader/teardown reproducer without using gnomon.
+"""Minimal CUDA/cuBLAS lifetime reproducers without using gnomon.
 
-This models the failing mechanism from `gnomon score PGS001320` directly:
+This models the CUDA lifetime bugs behind the AoU aborts directly:
 
 1. Create a CUDA context, one stream, and one cuBLAS handle bound to it.
 2. Allocate the same class of large per-pipeline buffers with cuMemAllocAsync.
 3. Run three cuBLAS SGEMMs using the single-score PGS001320 shape.
 4. Synchronize the stream and print a 100% progress marker.
-5. Run isolated child processes for both CUDA userspace-library choices:
+5. Queue device-to-host copies into heap buffers and compare:
+   - fixed: synchronize before freeing the host buffers.
+   - bad: free the host buffers while CUDA can still write them.
+6. Run isolated child processes for both CUDA userspace-library choices:
    - system: libcublas resolved from the host loader path.
    - wheel: pip-wheel CUDA libs loaded by absolute path from `nvidia-*` wheels.
-6. In each child, run two teardown orders:
+7. In each child, run two teardown orders:
    - fixed: enqueue cuMemFreeAsync for local buffers, then synchronize those frees.
    - bad: synchronize first, enqueue cuMemFreeAsync, then immediately destroy cuBLAS.
 
-If the issue is the pip-wheel/system CUDA library mix, the wheel/bad child is
-the small mechanism-level repro.
+The host-copy lifetime case is the small allocator-corruption repro: a CUDA
+stream owns a pending write into process heap memory, while the CPU frees that
+heap memory and hands it back to glibc.
 
 Run on the AoU CUDA host:
 
@@ -40,6 +44,8 @@ PEOPLE = 447_278
 MEGA = 256
 TILE_SCORES = 1
 TRIALS = 1
+HOST_RACE_BYTES = 4096
+HOST_RACE_COPIES = 2048
 INTERNAL_CHILD_ARG = "__gnomon_cuda_teardown_child__"
 
 
@@ -191,6 +197,24 @@ def configure_symbols(cuda: ctypes.CDLL, cublas: ctypes.CDLL) -> None:
     ]
     cuda.cuMemsetD8Async.restype = ctypes.c_int
 
+    cuda.cuMemcpyDtoHAsync_v2.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_ulonglong,
+        ctypes.c_size_t,
+        ctypes.c_void_p,
+    ]
+    cuda.cuMemcpyDtoHAsync_v2.restype = ctypes.c_int
+
+    cuda.cuMemHostRegister_v2.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_uint,
+    ]
+    cuda.cuMemHostRegister_v2.restype = ctypes.c_int
+
+    cuda.cuMemHostUnregister.argtypes = [ctypes.c_void_p]
+    cuda.cuMemHostUnregister.restype = ctypes.c_int
+
     cublas.cublasCreate_v2.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
     cublas.cublasCreate_v2.restype = ctypes.c_int
 
@@ -219,6 +243,72 @@ def configure_symbols(cuda: ctypes.CDLL, cublas: ctypes.CDLL) -> None:
     cublas.cublasSgemm_v2.restype = ctypes.c_int
 
 
+def configure_cuda_only_symbols(cuda: ctypes.CDLL) -> None:
+    cuda.cuInit.argtypes = [ctypes.c_uint]
+    cuda.cuInit.restype = ctypes.c_int
+
+    cuda.cuDeviceGet.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int]
+    cuda.cuDeviceGet.restype = ctypes.c_int
+
+    cuda.cuCtxCreate_v2.argtypes = [
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_uint,
+        ctypes.c_int,
+    ]
+    cuda.cuCtxCreate_v2.restype = ctypes.c_int
+
+    cuda.cuCtxSetCurrent.argtypes = [ctypes.c_void_p]
+    cuda.cuCtxSetCurrent.restype = ctypes.c_int
+
+    cuda.cuCtxDestroy_v2.argtypes = [ctypes.c_void_p]
+    cuda.cuCtxDestroy_v2.restype = ctypes.c_int
+
+    cuda.cuStreamCreate.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint]
+    cuda.cuStreamCreate.restype = ctypes.c_int
+
+    cuda.cuStreamSynchronize.argtypes = [ctypes.c_void_p]
+    cuda.cuStreamSynchronize.restype = ctypes.c_int
+
+    cuda.cuStreamDestroy_v2.argtypes = [ctypes.c_void_p]
+    cuda.cuStreamDestroy_v2.restype = ctypes.c_int
+
+    cuda.cuMemAllocAsync.argtypes = [
+        ctypes.POINTER(ctypes.c_ulonglong),
+        ctypes.c_size_t,
+        ctypes.c_void_p,
+    ]
+    cuda.cuMemAllocAsync.restype = ctypes.c_int
+
+    cuda.cuMemFreeAsync.argtypes = [ctypes.c_ulonglong, ctypes.c_void_p]
+    cuda.cuMemFreeAsync.restype = ctypes.c_int
+
+    cuda.cuMemsetD8Async.argtypes = [
+        ctypes.c_ulonglong,
+        ctypes.c_ubyte,
+        ctypes.c_size_t,
+        ctypes.c_void_p,
+    ]
+    cuda.cuMemsetD8Async.restype = ctypes.c_int
+
+    cuda.cuMemcpyDtoHAsync_v2.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_ulonglong,
+        ctypes.c_size_t,
+        ctypes.c_void_p,
+    ]
+    cuda.cuMemcpyDtoHAsync_v2.restype = ctypes.c_int
+
+    cuda.cuMemHostRegister_v2.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_uint,
+    ]
+    cuda.cuMemHostRegister_v2.restype = ctypes.c_int
+
+    cuda.cuMemHostUnregister.argtypes = [ctypes.c_void_p]
+    cuda.cuMemHostUnregister.restype = ctypes.c_int
+
+
 def check_cuda(code: int, what: str) -> None:
     if code != CUDA_SUCCESS:
         raise RuntimeError(f"{what} failed with CUresult={code}")
@@ -243,6 +333,19 @@ class DeviceAllocs:
         )
         check_cuda(
             self.cuda.cuMemsetD8Async(ptr, 0, nbytes, self.stream),
+            f"cuMemsetD8Async({name})",
+        )
+        self.ptrs.append((name, ptr, nbytes))
+        return ctypes.c_void_p(ptr.value)
+
+    def alloc_filled(self, name: str, nbytes: int, value: int) -> ctypes.c_void_p:
+        ptr = ctypes.c_ulonglong(0)
+        check_cuda(
+            self.cuda.cuMemAllocAsync(ctypes.byref(ptr), nbytes, self.stream),
+            f"cuMemAllocAsync({name}, {nbytes})",
+        )
+        check_cuda(
+            self.cuda.cuMemsetD8Async(ptr, value, nbytes, self.stream),
             f"cuMemsetD8Async({name})",
         )
         self.ptrs.append((name, ptr, nbytes))
@@ -414,18 +517,138 @@ def run_case(loader: str, mode: str, root_arg: str | None = None) -> None:
     print(f"{mode} teardown completed without abort", flush=True)
 
 
-def child_main(loader: str, mode: str, root_arg: str | None = None) -> int:
-    run_case(loader, mode, root_arg)
+class LibC:
+    def __init__(self) -> None:
+        self.libc = ctypes.CDLL(None)
+        self.libc.malloc.argtypes = [ctypes.c_size_t]
+        self.libc.malloc.restype = ctypes.c_void_p
+        self.libc.posix_memalign.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+        ]
+        self.libc.posix_memalign.restype = ctypes.c_int
+        self.libc.free.argtypes = [ctypes.c_void_p]
+        self.libc.free.restype = None
+        self.libc.memset.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t]
+        self.libc.memset.restype = ctypes.c_void_p
+
+    def malloc(self, nbytes: int) -> ctypes.c_void_p:
+        ptr = self.libc.malloc(nbytes)
+        if not ptr:
+            raise MemoryError(f"malloc({nbytes}) returned null")
+        return ctypes.c_void_p(ptr)
+
+    def page_aligned_alloc(self, nbytes: int) -> ctypes.c_void_p:
+        ptr = ctypes.c_void_p()
+        rc = self.libc.posix_memalign(ctypes.byref(ptr), 4096, nbytes)
+        if rc != 0 or not ptr.value:
+            raise MemoryError(f"posix_memalign(4096, {nbytes}) failed with rc={rc}")
+        return ptr
+
+    def free(self, ptr: ctypes.c_void_p) -> None:
+        self.libc.free(ptr)
+
+    def memset(self, ptr: ctypes.c_void_p, value: int, nbytes: int) -> None:
+        self.libc.memset(ptr, value, nbytes)
+
+
+def run_host_copy_lifetime_case(mode: str) -> None:
+    cuda = load_cuda()
+    configure_cuda_only_symbols(cuda)
+    libc = LibC()
+
+    print(
+        f"\n=== host DtoH lifetime / {mode} ===\n"
+        f"copies={HOST_RACE_COPIES} bytes_per_copy={HOST_RACE_BYTES}",
+        flush=True,
+    )
+
+    check_cuda(cuda.cuInit(0), "cuInit")
+    device = ctypes.c_int(0)
+    check_cuda(cuda.cuDeviceGet(ctypes.byref(device), 0), "cuDeviceGet")
+    ctx = ctypes.c_void_p()
+    check_cuda(cuda.cuCtxCreate_v2(ctypes.byref(ctx), 0, device), "cuCtxCreate_v2")
+    check_cuda(cuda.cuCtxSetCurrent(ctx), "cuCtxSetCurrent")
+
+    stream = ctypes.c_void_p()
+    check_cuda(
+        cuda.cuStreamCreate(ctypes.byref(stream), CU_STREAM_NON_BLOCKING),
+        "cuStreamCreate",
+    )
+
+    device_allocs = DeviceAllocs(cuda, stream)
+    src = device_allocs.alloc_filled("dtoh_source", HOST_RACE_BYTES, 0xA5)
+    check_cuda(cuda.cuStreamSynchronize(stream), "cuStreamSynchronize(after source fill)")
+
+    fixed_ptrs: list[ctypes.c_void_p] = []
+    try:
+        print("queue DtoH copies into malloc chunks", flush=True)
+        for i in range(HOST_RACE_COPIES):
+            host = libc.page_aligned_alloc(HOST_RACE_BYTES)
+            libc.memset(host, 0x5A, HOST_RACE_BYTES)
+            check_cuda(
+                cuda.cuMemHostRegister_v2(host, HOST_RACE_BYTES, 0),
+                f"cuMemHostRegister_v2(copy {i})",
+            )
+            check_cuda(
+                cuda.cuMemcpyDtoHAsync_v2(host, src.value, HOST_RACE_BYTES, stream),
+                f"cuMemcpyDtoHAsync_v2(copy {i})",
+            )
+            if mode == "fixed":
+                fixed_ptrs.append(host)
+            else:
+                libc.free(host)
+
+        if mode == "fixed":
+            print("fixed mode: synchronize before freeing host buffers", flush=True)
+            check_cuda(cuda.cuStreamSynchronize(stream), "cuStreamSynchronize(host copies)")
+            while fixed_ptrs:
+                host = fixed_ptrs.pop()
+                check_cuda(cuda.cuMemHostUnregister(host), "cuMemHostUnregister")
+                libc.free(host)
+        else:
+            print("bad mode: host buffers already freed; now drain CUDA writes", flush=True)
+            check_cuda(cuda.cuStreamSynchronize(stream), "cuStreamSynchronize(host copies)")
+            print("bad mode: pressure malloc tcache after CUDA wrote freed chunks", flush=True)
+            for _ in range(HOST_RACE_COPIES * 4):
+                ptr = libc.malloc(HOST_RACE_BYTES)
+                libc.free(ptr)
+
+        device_allocs.free_async_all()
+        check_cuda(cuda.cuStreamSynchronize(stream), "cuStreamSynchronize(device frees)")
+        check_cuda(cuda.cuStreamDestroy_v2(stream), "cuStreamDestroy_v2")
+        stream = ctypes.c_void_p()
+        check_cuda(cuda.cuCtxDestroy_v2(ctx), "cuCtxDestroy_v2")
+        ctx = ctypes.c_void_p()
+    finally:
+        while fixed_ptrs:
+            host = fixed_ptrs.pop()
+            cuda.cuMemHostUnregister(host)
+            libc.free(host)
+        if stream:
+            cuda.cuStreamDestroy_v2(stream)
+        if ctx:
+            cuda.cuCtxDestroy_v2(ctx)
+
+    print(f"host DtoH lifetime {mode} completed without abort", flush=True)
+
+
+def child_main(kind: str, mode: str, root_arg: str | None = None) -> int:
+    if kind == "host-copy":
+        run_host_copy_lifetime_case(mode)
+    else:
+        run_case(kind, mode, root_arg)
     return 0
 
 
-def run_child(loader: str, mode: str, root: Path | None = None) -> int:
-    cmd = [sys.executable, __file__, INTERNAL_CHILD_ARG, loader, mode]
-    label = loader
+def run_child(kind: str, mode: str, root: Path | None = None) -> int:
+    cmd = [sys.executable, __file__, INTERNAL_CHILD_ARG, kind, mode]
+    label = kind
     env = os.environ.copy()
     if root is not None:
         cmd.append(str(root))
-        label = f"{loader}:{root}"
+        label = f"{kind}:{root}"
         lib_dirs = _nvidia_lib_dirs(root)
         prior_ld = env.get("LD_LIBRARY_PATH", "")
         env["LD_LIBRARY_PATH"] = ":".join([*lib_dirs, prior_ld])
@@ -455,6 +678,8 @@ def main() -> int:
         print(f"  {root}", flush=True)
 
     cases: list[tuple[str, str, Path | None]] = [
+        ("host-copy", "fixed", None),
+        ("host-copy", "bad", None),
         ("system", "fixed", None),
         ("system", "bad", None),
     ]
