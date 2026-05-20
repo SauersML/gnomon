@@ -208,7 +208,12 @@ class ScoreTable:
 
 
 def read_sscore(path: PathLike) -> ScoreTable:
-    """Parse a ``.sscore`` file produced by ``gnomon score``."""
+    """Parse a ``.sscore`` file produced by ``gnomon score``.
+
+    Streams the TSV with the stdlib ``csv`` module — fast and dependency-
+    free for typical biobank-scale outputs (millions of rows, dozens of
+    scores). Missing values (``""``, ``NA``, ``nan``) become ``NaN``.
+    """
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(p)
@@ -389,7 +394,14 @@ def _run(
     env: Optional[Mapping[str, str]],
     cwd: Optional[PathLike],
     check: bool = True,
+    capture: bool = True,
 ) -> subprocess.CompletedProcess:
+    """Run the gnomon binary.
+
+    When ``capture=False``, stdout/stderr inherit from the parent so the
+    user sees live progress bars; the returned `CompletedProcess` then
+    has empty `.stdout`/`.stderr`.
+    """
     full_argv = [str(binary), *map(str, argv)]
     proc_env = dict(os.environ)
     if env:
@@ -397,7 +409,7 @@ def _run(
     try:
         completed = subprocess.run(
             full_argv,
-            capture_output=True,
+            capture_output=capture,
             text=True,
             timeout=timeout,
             check=False,
@@ -475,13 +487,17 @@ def _score_output_stem(path: Path) -> str:
     return name
 
 
-def _expected_sscore_path(
-    input_path: Path,
-    score_arg: str,
+def expected_sscore_path(
+    input_path: Union[str, os.PathLike],
+    score_arg: Union[str, os.PathLike, Sequence[str]],
     *,
     score_exists: Optional[bool] = None,
 ) -> Path:
-    """Mirror score::main::score_output_path byte-for-byte.
+    """Predict the ``.sscore`` path the gnomon CLI will write to.
+
+    Mirrors ``score::main::score_output_path`` byte-for-byte. Useful for
+    pre-flighting where the output will land, or for clean-up scripts
+    that need to enumerate produced files.
 
     The Rust logic for the output filename is:
       * If the SCORE argument does not exist on disk AND it contains
@@ -489,7 +505,34 @@ def _expected_sscore_path(
         ``pgs<count>_<fnv1a64_hex8>``.
       * Otherwise, use the file stem of the SCORE argument
         (or ``"scores"`` if the argument has no filename component).
+
+    Pass ``score_exists`` explicitly to skip the on-disk ``.exists()``
+    check (handy in dry-runs or when the score file is remote).
     """
+    input_p = Path(input_path)
+    if isinstance(score_arg, (list, tuple)):
+        score_text = ",".join(score_arg)
+    else:
+        score_text = str(score_arg)
+    return _expected_sscore_path_impl(input_p, score_text, score_exists=score_exists)
+
+
+def _expected_sscore_path(
+    input_path: Path,
+    score_arg: str,
+    *,
+    score_exists: Optional[bool] = None,
+) -> Path:
+    """Internal alias — kept for backwards compatibility with tests."""
+    return _expected_sscore_path_impl(input_path, score_arg, score_exists=score_exists)
+
+
+def _expected_sscore_path_impl(
+    input_path: Path,
+    score_arg: str,
+    *,
+    score_exists: Optional[bool] = None,
+) -> Path:
     stem = _score_output_stem(input_path)
     parent = input_path.parent if str(input_path.parent) else Path(".")
 
@@ -521,6 +564,7 @@ def score(
     env: Optional[Mapping[str, str]] = None,
     cwd: Optional[PathLike] = None,
     read_output: bool = True,
+    capture: bool = True,
 ) -> ScoreResult:
     """Run ``gnomon score``.
 
@@ -580,7 +624,7 @@ def score(
     if extra_args:
         argv += list(extra_args)
 
-    completed = _run(bin_path, argv, timeout=timeout, env=env, cwd=cwd)
+    completed = _run(bin_path, argv, timeout=timeout, env=env, cwd=cwd, capture=capture)
 
     expected = Path(output_path) if output_path else _expected_sscore_path(input_p, score_arg)
     if not expected.exists():

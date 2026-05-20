@@ -258,6 +258,19 @@ def test_read_sscore_missing_iid_raises(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def test_public_expected_sscore_path():
+    from gnomon import expected_sscore_path
+
+    p = expected_sscore_path("/d/arrays.vcf.gz", "PGS001,PGS002", score_exists=False)
+    assert p.parent == Path("/d")
+    assert p.name.startswith("arrays_pgs2_")
+    assert p.name.endswith(".sscore")
+
+    # List/tuple of IDs also accepted.
+    p2 = expected_sscore_path("/d/arrays.vcf.gz", ["PGS001", "PGS002"], score_exists=False)
+    assert p2 == p
+
+
 def test_expected_sscore_path_strips_compound_suffixes(tmp_path):
     """Regression: paths like sample.vcf.gz used to be passed through
     with only `.gz` stripped, producing `sample.vcf_<score>.sscore`.
