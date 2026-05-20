@@ -149,6 +149,11 @@ name = "score"
 path = "score/tests/mod.rs"
 required-features = ["score"]
 
+[[example]]
+name = "repro_cudarc_teardown"
+path = "examples/repro_cudarc_teardown.rs"
+required-features = ["score"]
+
 # Run tests at release optimization level for maximum speed
 [profile.test]
 opt-level = 3            # Same as release - maximum speed for numerical tests
