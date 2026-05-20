@@ -13,15 +13,14 @@ For each disease the script:
   5. Runs leave-one-group-out OOD refits by care site, Census region, and
      AoU inferred genetic ancestry category.
 
-Reported per disease: train/test survival C with 95% confidence intervals
-and OOD held-out-group C.
+Reported per disease: IPCW concordance, integrated Brier score, and Graf-style
+integrated-Brier pseudo-R^2 on held-out rows.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import math
 import os
 import re
 import struct
@@ -166,7 +165,7 @@ LOSO_AXIS_TO_COLUMN = {
 }
 GNOMON_BIN = os.environ.get("GNOMON_BIN", "gnomon")
 PGS_ID_PATTERN = re.compile(r"^PGS\d{6}$")
-Z_975 = NormalDist().inv_cdf(0.975)
+STANDARD_NORMAL = NormalDist()
 
 # AoU controlled CDR layout (per the "Controlled CDR Directory" doc and "How
 # the All of Us Genomic data are organized"):
@@ -745,198 +744,50 @@ class CIndexStats:
     median_exit_age: float
     comparable_pairs: int
     concordance: float
-    se: float
-    ci_low: float
-    ci_high: float
-    influence: np.ndarray
 
 
-class Fenwick:
-    """Small frequency tree for rank-count queries."""
-
-    def __init__(self, size: int):
-        self.n = int(size)
-        self.tree = np.zeros(self.n + 1, dtype=np.int64)
-
-    def add(self, idx: int, value: int = 1) -> None:
-        i = int(idx) + 1
-        while i <= self.n:
-            self.tree[i] += value
-            i += i & -i
-
-    def prefix(self, idx: int) -> int:
-        if idx < 0:
-            return 0
-        i = min(int(idx) + 1, self.n)
-        out = 0
-        while i > 0:
-            out += int(self.tree[i])
-            i -= i & -i
-        return out
-
-    def total(self) -> int:
-        return self.prefix(self.n - 1)
-
-    def equal(self, idx: int) -> int:
-        return self.prefix(idx) - self.prefix(idx - 1)
-
-    def greater(self, idx: int) -> int:
-        return self.total() - self.prefix(idx)
+@dataclass(frozen=True)
+class SurvivalMetricStats:
+    n: int
+    n_events: int
+    median_exit_age: float
+    c_ipcw: float
+    dynamic_auc_mean: float
+    ibs: float
+    null_ibs: float
+    r2_ibs: float
+    tau: float
+    ibs_start: float
+    ibs_stop: float
+    n_times: int
 
 
-def _add_same_time_contributions(
-    event_ranks: np.ndarray,
-    censor_ranks: np.ndarray,
-    event_pos: np.ndarray,
-    censor_pos: np.ndarray,
-    num_per_row: np.ndarray,
-    den_per_row: np.ndarray,
-    n_ranks: int,
-) -> None:
-    if len(event_pos) == 0 or len(censor_pos) == 0:
-        return
-
-    den_per_row[event_pos] += len(censor_pos)
-    den_per_row[censor_pos] += len(event_pos)
-
-    censor_tree = Fenwick(n_ranks)
-    for rank in censor_ranks:
-        censor_tree.add(int(rank))
-    for pos, rank in zip(event_pos, event_ranks):
-        r = int(rank)
-        num_per_row[pos] += censor_tree.prefix(r - 1) + 0.5 * censor_tree.equal(r)
-
-    event_tree = Fenwick(n_ranks)
-    for rank in event_ranks:
-        event_tree.add(int(rank))
-    for pos, rank in zip(censor_pos, censor_ranks):
-        r = int(rank)
-        num_per_row[pos] += event_tree.greater(r) + 0.5 * event_tree.equal(r)
+@dataclass(frozen=True)
+class CoxFit:
+    names: list[str]
+    coefs: dict[str, float]
+    result: object
 
 
-def harrell_c_stats(exit_: np.ndarray, event: np.ndarray, risk: np.ndarray) -> CIndexStats:
-    """Harrell's C plus a paired-ready IJ influence vector.
+@dataclass(frozen=True)
+class BinaryStats:
+    n: int
+    n_events: int
+    prevalence: float
+    auroc: float
+    average_precision: float
+    log_loss: float
+    brier: float
+    nagelkerke_r2: float
+    liability_r2: float
 
-    Comparable pairs follow the same convention used for survival C-indexes:
-    an event at an earlier time is comparable with every later row, and an
-    event tied in time is comparable with censored rows at that time. Higher
-    `risk` must rank before the event row's comparator.
-    """
-    exit_ = np.asarray(exit_, dtype=np.float64)
-    event = np.asarray(event, dtype=bool)
-    risk = np.asarray(risk, dtype=np.float64)
-    finite = np.isfinite(exit_) & np.isfinite(risk)
-    exit_ = exit_[finite]
-    event = event[finite]
-    risk = risk[finite]
-    n = int(len(exit_))
-    if n < 2:
-        raise ValueError("C-index needs at least two finite rows")
-
-    order = np.lexsort((~event, exit_))
-    times = exit_[order]
-    events = event[order]
-    ranks = np.searchsorted(np.unique(risk), risk, side="left").astype(np.int64)
-    sorted_ranks = ranks[order]
-    n_ranks = int(ranks.max()) + 1
-
-    num_per_sorted = np.zeros(n, dtype=np.float64)
-    den_per_sorted = np.zeros(n, dtype=np.float64)
-    past_events = Fenwick(n_ranks)
-
-    start = 0
-    while start < n:
-        end = start + 1
-        while end < n and times[end] == times[start]:
-            end += 1
-
-        group_pos = np.arange(start, end)
-        group_ranks = sorted_ranks[start:end]
-
-        past_n = past_events.total()
-        if past_n:
-            den_per_sorted[start:end] += past_n
-            for pos, rank in zip(group_pos, group_ranks):
-                r = int(rank)
-                num_per_sorted[pos] += past_events.greater(r) + 0.5 * past_events.equal(r)
-
-        event_mask = events[start:end]
-        event_pos = group_pos[event_mask]
-        censor_pos = group_pos[~event_mask]
-        _add_same_time_contributions(
-            group_ranks[event_mask],
-            group_ranks[~event_mask],
-            event_pos,
-            censor_pos,
-            num_per_sorted,
-            den_per_sorted,
-            n_ranks,
-        )
-
-        for rank in group_ranks[event_mask]:
-            past_events.add(int(rank))
-        start = end
-
-    comparable_pairs = int(round(den_per_sorted.sum() / 2.0))
-    if comparable_pairs == 0:
-        raise ValueError("no comparable pairs for C-index")
-    numerator = float(num_per_sorted.sum() / 2.0)
-    concordance = numerator / comparable_pairs
-
-    residual = num_per_sorted - concordance * den_per_sorted
-    influence_sorted = n * residual / comparable_pairs
-    se = float(math.sqrt(np.sum(influence_sorted**2) / (n * max(n - 1, 1))))
-    ci_low = max(0.0, concordance - Z_975 * se)
-    ci_high = min(1.0, concordance + Z_975 * se)
-
-    influence = np.empty(n, dtype=np.float64)
-    influence[order] = influence_sorted
-    return CIndexStats(
-        n=n,
-        n_events=int(event.sum()),
-        median_exit_age=float(np.median(exit_)),
-        comparable_pairs=comparable_pairs,
-        concordance=float(concordance),
-        se=se,
-        ci_low=float(ci_low),
-        ci_high=float(ci_high),
-        influence=influence,
-    )
-
-
-def paired_delta_ci(left: CIndexStats, right: CIndexStats) -> tuple[float, float, float, float]:
-    if left.n != right.n:
-        raise ValueError(f"paired delta needs aligned rows; got {left.n} and {right.n}")
-    delta = left.concordance - right.concordance
-    infl = left.influence - right.influence
-    n = left.n
-    se = float(math.sqrt(np.sum(infl**2) / (n * max(n - 1, 1))))
-    return (
-        float(delta),
-        se,
-        float(delta - Z_975 * se),
-        float(delta + Z_975 * se),
-    )
-
-
-def fmt_c(stats: CIndexStats) -> str:
-    return (
-        f"{stats.concordance:.4f} "
-        f"95%CI=[{stats.ci_low:.4f},{stats.ci_high:.4f}] "
-        f"SE={stats.se:.4f}"
-    )
-
-
-def fmt_delta(delta_ci: tuple[float, float, float, float]) -> str:
-    delta, se, lo, hi = delta_ci
-    return f"{delta:+.4f} 95%CI=[{lo:+.4f},{hi:+.4f}] SE={se:.4f}"
 
 def survival_model_columns(num_pcs: int) -> list[str]:
     """Columns the survival marginal-slope fit and its predict path both see.
 
     Single source of truth: `fit_marginal_slope` selects this subset of the
-    training frame before handing it to `gamfit.fit`, and `gam_risk` selects
-    the same subset before calling `model.predict`. Keeping fit-time and
+    training frame before handing it to `gamfit.fit`, and prediction helpers
+    select the same subset before calling `model.predict`. Keeping fit-time and
     predict-time schemas in one place avoids the class of bug where they
     drift (e.g., predict missing `entry_age`/`exit_age` after a formula
     change). `event` is included even at predict time: gamfit's predict
@@ -1007,12 +858,83 @@ def fit_marginal_slope(train_df: pd.DataFrame, num_pcs: int):  # -> gamfit.Model
     )
 
 
-def metrics(exit_: np.ndarray, event: np.ndarray, risk: np.ndarray) -> CIndexStats:
-    """Harrell's C on a (exit, event, risk) triple.
+def binary_model_columns(num_pcs: int) -> list[str]:
+    return ["event", "entry_age", "followup_years", "sex", "prs_z"] + [
+        f"PC{i+1}" for i in range(num_pcs)
+    ]
 
-    `risk` is a per-row scalar where higher means greater predicted hazard.
+
+def binary_predict_columns(num_pcs: int) -> list[str]:
+    return ["entry_age", "followup_years", "sex", "prs_z"] + [
+        f"PC{i+1}" for i in range(num_pcs)
+    ]
+
+
+def fit_binary_marginal_slope(train_df: pd.DataFrame, num_pcs: int):  # -> gamfit.Model
+    """Bernoulli marginal-slope analogue of the survival model.
+
+    The endpoint is observed diagnosis during the AoU observation window. Age
+    at entry and observed follow-up length are therefore nuisance structure, not
+    genetic signal; they stay in the location model so binary discrimination is
+    not just a proxy for being older or observed longer.
     """
-    return harrell_c_stats(exit_, event, risk)
+    import gamfit  # lazy
+
+    duchon = pc_duchon_term(num_pcs)
+    formula = f"event ~ {duchon} + sex + s(entry_age) + s(followup_years)"
+    cols = binary_model_columns(num_pcs)
+    print("  binary_fit_spec: family=bernoulli marginal-slope  link=probit")
+    print(f"  binary_fit_spec: formula={formula!r}")
+    print(f"  binary_fit_spec: z_column='prs_z'  logslope_formula={duchon!r}")
+    print(
+        f"  binary_fit_spec: num_pcs={num_pcs}  duchon_centers={DUCHON_CENTERS}  "
+        f"n_train={len(train_df)}"
+    )
+    print(f"  binary_fit_spec: gamfit={gamfit.__version__}")
+    return gamfit.fit(
+        train_df[cols],
+        formula,
+        link="probit",
+        z_column="prs_z",
+        logslope_formula=duchon,
+    )
+
+
+def metrics(exit_: np.ndarray, event: np.ndarray, risk: np.ndarray) -> CIndexStats:
+    from sksurv.metrics import concordance_index_censored
+
+    exit_ = np.asarray(exit_, dtype=np.float64)
+    event = np.asarray(event, dtype=bool)
+    risk = np.asarray(risk, dtype=np.float64)
+    finite = np.isfinite(exit_) & np.isfinite(risk)
+    exit_ = exit_[finite]
+    event = event[finite]
+    risk = risk[finite]
+    c, concordant, discordant, tied_risk, _tied_time = concordance_index_censored(
+        event, exit_, risk,
+    )
+    return CIndexStats(
+        n=int(len(exit_)),
+        n_events=int(event.sum()),
+        median_exit_age=float(np.median(exit_)),
+        comparable_pairs=int(concordant + discordant + tied_risk),
+        concordance=float(c),
+    )
+
+
+def fmt_c(stats: CIndexStats) -> str:
+    return f"{stats.concordance:.4f} pairs={stats.comparable_pairs:,}"
+
+
+def paired_delta_ci(left: CIndexStats, right: CIndexStats) -> tuple[float, float, float, float]:
+    return (left.concordance - right.concordance, float("nan"), float("nan"), float("nan"))
+
+
+def fmt_delta(delta_ci: tuple[float, float, float, float]) -> str:
+    delta, se, lo, hi = delta_ci
+    if not np.isfinite(se):
+        return f"{delta:+.4f}"
+    return f"{delta:+.4f} 95%CI=[{lo:+.4f},{hi:+.4f}] SE={se:.4f}"
 
 
 def z_norm2(
@@ -1072,7 +994,7 @@ def fit_baseline_cox(
     event: np.ndarray,
     X: np.ndarray,
     names: list[str],
-) -> dict[str, float]:
+) -> CoxFit:
     """Generic left-truncated Cox PH baseline.
 
     `X` is an `(n, p)` covariate matrix; `names` labels its columns. Returns
@@ -1104,7 +1026,11 @@ def fit_baseline_cox(
         raise ValueError(
             f"names length {len(names)} != coef length {len(result.params)}"
         )
-    return {n: float(p) for n, p in zip(names, result.params)}
+    return CoxFit(
+        names=list(names),
+        coefs={n: float(p) for n, p in zip(names, result.params)},
+        result=result,
+    )
 
 
 def _standardize_columns(
@@ -1125,20 +1051,18 @@ def _standardize_columns(
     return train, test
 
 
-def fit_logit_binary(
-    y: np.ndarray,
-    X: np.ndarray,
-    names: list[str],
-) -> dict[str, object]:
+def fit_logit_binary(y: np.ndarray, X: np.ndarray, names: list[str]) -> dict[str, object]:
     import statsmodels.api as sm  # lazy
 
-    X = np.asarray(X, dtype=np.float64)
-    y = np.asarray(y, dtype=np.float64)
-    X_const = sm.add_constant(X, has_constant="add")
-    result = sm.GLM(y, X_const, family=sm.families.Binomial()).fit(maxiter=100)
+    X_const = sm.add_constant(np.asarray(X, dtype=np.float64), has_constant="add")
+    result = sm.GLM(
+        np.asarray(y, dtype=np.float64),
+        X_const,
+        family=sm.families.Binomial(),
+    ).fit(maxiter=100)
     coefs = {"const": float(result.params[0])}
     coefs.update({n: float(p) for n, p in zip(names, result.params[1:])})
-    return {"result": result, "names": names, "coefs": coefs}
+    return {"result": result, "names": list(names), "coefs": coefs}
 
 
 def predict_logit_binary(fit: dict[str, object], X: np.ndarray) -> np.ndarray:
@@ -1149,23 +1073,80 @@ def predict_logit_binary(fit: dict[str, object], X: np.ndarray) -> np.ndarray:
     return np.asarray(result.predict(X_const), dtype=float)
 
 
-def gam_risk(
-    model, df: pd.DataFrame, num_pcs: int, horizon: float
-) -> tuple[np.ndarray, np.ndarray]:
-    """Per-row scalar risk + a kept-row mask.
+def binary_stats(y: np.ndarray, p: np.ndarray, population_prevalence: float | None) -> BinaryStats:
+    from sklearn.metrics import (  # lazy: only needed after binary predictions exist
+        average_precision_score,
+        brier_score_loss,
+        log_loss,
+        roc_auc_score,
+    )
 
-    Returns `(risk, kept)` where `risk` is the cumulative hazard at `horizon`
-    for the rows where prediction succeeded and `kept` is a boolean mask
-    over the original `df` indices marking which rows are in `risk` (in the
-    same order). Callers should mask their `y` / `event` arrays with `kept`
-    before computing metrics.
+    y = np.asarray(y, dtype=np.int64)
+    p = np.clip(np.asarray(p, dtype=np.float64), np.finfo(float).eps, 1.0 - np.finfo(float).eps)
+    prevalence = float(y.mean())
+    ll_model = -float(log_loss(y, p, labels=[0, 1], normalize=False))
+    null_p = np.repeat(prevalence, len(y))
+    ll_null = -float(log_loss(y, null_p, labels=[0, 1], normalize=False))
+    cox_snell = 1.0 - np.exp((2.0 / len(y)) * (ll_null - ll_model))
+    max_cox_snell = 1.0 - np.exp((2.0 / len(y)) * ll_null)
+    nagelkerke = cox_snell / max_cox_snell if max_cox_snell > 0 else float("nan")
+    liability_r2 = float("nan")
+    if population_prevalence is not None and 0.0 < population_prevalence < 1.0 and 0.0 < prevalence < 1.0:
+        z = float(STANDARD_NORMAL.pdf(STANDARD_NORMAL.inv_cdf(population_prevalence)))
+        if z > 0.0:
+            liability_r2 = float(
+                nagelkerke
+                * population_prevalence**2
+                * (1.0 - population_prevalence) ** 2
+                / (z**2 * prevalence * (1.0 - prevalence))
+            )
+    return BinaryStats(
+        n=int(len(y)),
+        n_events=int(y.sum()),
+        prevalence=prevalence,
+        auroc=float(roc_auc_score(y, p)),
+        average_precision=float(average_precision_score(y, p)),
+        log_loss=float(log_loss(y, p, labels=[0, 1])),
+        brier=float(brier_score_loss(y, p)),
+        nagelkerke_r2=float(nagelkerke),
+        liability_r2=float(liability_r2),
+    )
 
-    Why a mask: gamfit's saved survival-marginal-slope predictor has a
-    self-consistency guard that rejects rows where the hazard underflows to
-    0 even when the linear predictor is positive. Rather than fail the
-    whole batch on a handful of edge-case test rows (e.g., a person whose
-    PC value is outside the train-set support), we bisect to locate the
-    offenders and drop them.
+
+def fmt_binary(stats: BinaryStats) -> str:
+    return (
+        f"AUROC={stats.auroc:.4f}  AP={stats.average_precision:.4f}  "
+        f"logloss={stats.log_loss:.4f}  Brier={stats.brier:.4f}  "
+        f"Nagelkerke_R2={stats.nagelkerke_r2:.4f}  "
+        f"liability_R2={stats.liability_r2:.4f}"
+    )
+
+
+def _binary_fields(prefix: str, stats: BinaryStats) -> dict[str, float | int]:
+    return {
+        f"{prefix}_n": stats.n,
+        f"{prefix}_events": stats.n_events,
+        f"{prefix}_prevalence": stats.prevalence,
+        f"{prefix}_auroc": stats.auroc,
+        f"{prefix}_average_precision": stats.average_precision,
+        f"{prefix}_log_loss": stats.log_loss,
+        f"{prefix}_brier": stats.brier,
+        f"{prefix}_nagelkerke_r2": stats.nagelkerke_r2,
+        f"{prefix}_liability_r2": stats.liability_r2,
+    }
+
+
+def gam_survival_outputs(
+    model,
+    df: pd.DataFrame,
+    num_pcs: int,
+    times: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Risk and survival-probability matrix from gamfit survival prediction.
+
+    Returns `(risk_at_tau, survival_at_times, kept)`. If gamfit rejects an
+    edge-case row under its survival self-consistency guard, the row is dropped
+    and the caller evaluates all models on the same retained rows.
     """
     from gamfit._exceptions import PredictionError  # lazy
 
@@ -1173,6 +1154,7 @@ def gam_risk(
     n = len(df)
     kept = np.ones(n, dtype=bool)
     risk = np.full(n, np.nan, dtype=float)
+    survival = np.full((n, len(times)), np.nan, dtype=float)
 
     def _predict_slice(start: int, end: int) -> None:
         if start >= end:
@@ -1193,14 +1175,143 @@ def gam_risk(
             _predict_slice(start, mid)
             _predict_slice(mid, end)
             return
-        values = np.asarray(pred.cumulative_hazard_at([horizon]), dtype=float).reshape(-1)
-        risk[start:end] = values
+        survival[start:end, :] = np.asarray(pred.survival_at(times), dtype=float)
+        risk[start:end] = np.asarray(pred.cumulative_hazard_at([times[-1]]), dtype=float).reshape(-1)
 
     _predict_slice(0, n)
 
     if not kept.all():
         print(f"  predict: dropped {int((~kept).sum())} of {n} rows that tripped the guard")
-    return risk[kept], kept
+    return risk[kept], survival[kept, :], kept
+
+
+def _surv_array(event: np.ndarray, exit_: np.ndarray):
+    from sksurv.util import Surv  # lazy
+
+    return Surv.from_arrays(
+        event=np.asarray(event, dtype=bool),
+        time=np.asarray(exit_, dtype=np.float64),
+    )
+
+
+def _survival_metric_times(train_exit: np.ndarray, test_exit: np.ndarray) -> np.ndarray:
+    """Observed-age grid inside the train/test support for scikit-survival."""
+    train_exit = np.asarray(train_exit, dtype=np.float64)
+    test_exit = np.asarray(test_exit, dtype=np.float64)
+    finite_train = train_exit[np.isfinite(train_exit)]
+    finite_test = test_exit[np.isfinite(test_exit)]
+    if finite_train.size < 2 or finite_test.size < 2:
+        raise ValueError("survival metrics need at least two finite train and test times")
+    lo = float(np.min(finite_test))
+    hi = min(float(np.max(finite_train)), float(np.max(finite_test)))
+    lo = float(np.nextafter(lo, np.inf))
+    hi = float(np.nextafter(hi, -np.inf))
+    if not (np.isfinite(lo) and np.isfinite(hi) and lo < hi):
+        raise ValueError(f"invalid survival metric time grid: lower={lo}, upper={hi}")
+    observed = np.unique(finite_test[(finite_test > lo) & (finite_test < hi)])
+    if observed.size < 2:
+        return np.linspace(lo, hi, 2)
+    max_times = max(2, int(np.sqrt(finite_test.size)))
+    if observed.size <= max_times:
+        return observed
+    return np.unique(np.quantile(observed, np.linspace(0.0, 1.0, max_times)))
+
+
+def cox_survival_matrix(fit: CoxFit, X: np.ndarray, times: np.ndarray) -> np.ndarray:
+    base = fit.result.baseline_cumulative_hazard
+    if not base:
+        raise ValueError("Cox fit did not expose a baseline cumulative hazard")
+    base_times = np.asarray(base[0][0], dtype=np.float64)
+    base_cumhaz = np.asarray(base[0][1], dtype=np.float64)
+    H0 = np.interp(times, base_times, base_cumhaz, left=0.0, right=float(base_cumhaz[-1]))
+    beta = np.asarray([fit.coefs[n] for n in fit.names], dtype=np.float64)
+    partial_hazard = np.exp(np.asarray(X, dtype=np.float64) @ beta)
+    return np.exp(-np.outer(partial_hazard, H0))
+
+
+def null_survival_matrix(train: pd.DataFrame, n_rows: int, times: np.ndarray) -> np.ndarray:
+    from sksurv.nonparametric import SurvivalFunctionEstimator
+
+    estimator = SurvivalFunctionEstimator().fit(
+        _surv_array(train["event"].to_numpy(), train["exit_age"].to_numpy())
+    )
+    null_curve = np.asarray(estimator.predict_proba(times), dtype=np.float64)
+    return np.tile(null_curve, (n_rows, 1))
+
+
+def survival_library_metrics(
+    train: pd.DataFrame,
+    test: pd.DataFrame,
+    risk: np.ndarray,
+    survival: np.ndarray,
+    times: np.ndarray,
+) -> SurvivalMetricStats:
+    from sksurv.metrics import (
+        concordance_index_ipcw,
+        cumulative_dynamic_auc,
+        integrated_brier_score,
+    )
+
+    train_y = _surv_array(train["event"].to_numpy(), train["exit_age"].to_numpy())
+    test_y = _surv_array(test["event"].to_numpy(), test["exit_age"].to_numpy())
+    risk = np.asarray(risk, dtype=np.float64)
+    survival = np.asarray(survival, dtype=np.float64)
+    if survival.shape != (len(test), len(times)):
+        raise ValueError(
+            f"survival matrix shape {survival.shape} does not match "
+            f"(n_test={len(test)}, n_times={len(times)})"
+        )
+    tau = float(times[-1])
+    c_ipcw = float(concordance_index_ipcw(train_y, test_y, risk, tau=tau)[0])
+    _, mean_auc = cumulative_dynamic_auc(train_y, test_y, risk, times)
+    ibs = float(integrated_brier_score(train_y, test_y, survival, times))
+    null_ibs = float(
+        integrated_brier_score(
+            train_y,
+            test_y,
+            null_survival_matrix(train, len(test), times),
+            times,
+        )
+    )
+    r2_ibs = float(1.0 - ibs / null_ibs) if null_ibs > 0 else float("nan")
+    return SurvivalMetricStats(
+        n=int(len(test)),
+        n_events=int(test["event"].sum()),
+        median_exit_age=float(np.median(test["exit_age"].to_numpy(dtype=np.float64))),
+        c_ipcw=c_ipcw,
+        dynamic_auc_mean=float(mean_auc),
+        ibs=ibs,
+        null_ibs=null_ibs,
+        r2_ibs=r2_ibs,
+        tau=tau,
+        ibs_start=float(times[0]),
+        ibs_stop=float(times[-1]),
+        n_times=int(len(times)),
+    )
+
+
+def fmt_survival(stats: SurvivalMetricStats) -> str:
+    return (
+        f"C_ipcw={stats.c_ipcw:.4f}  iAUC={stats.dynamic_auc_mean:.4f}  "
+        f"IBS={stats.ibs:.5f}  R2_IBS={stats.r2_ibs:.4f}"
+    )
+
+
+def _survival_fields(prefix: str, stats: SurvivalMetricStats) -> dict[str, float | int]:
+    return {
+        f"{prefix}_n": stats.n,
+        f"{prefix}_events": stats.n_events,
+        f"{prefix}_median_exit_age": stats.median_exit_age,
+        f"{prefix}_c_ipcw": stats.c_ipcw,
+        f"{prefix}_dynamic_auc_mean": stats.dynamic_auc_mean,
+        f"{prefix}_ibs": stats.ibs,
+        f"{prefix}_null_ibs": stats.null_ibs,
+        f"{prefix}_r2_ibs": stats.r2_ibs,
+        f"{prefix}_tau": stats.tau,
+        f"{prefix}_ibs_start": stats.ibs_start,
+        f"{prefix}_ibs_stop": stats.ibs_stop,
+        f"{prefix}_n_times": stats.n_times,
+    }
 
 
 def save_fit_cache(
@@ -1263,17 +1374,146 @@ def prepare_scores(
     return train, test, pgs_mean, pgs_std
 
 
+def evaluate_binary_model_pair(
+    train: pd.DataFrame,
+    test: pd.DataFrame,
+    pc_cols: list[str],
+    pgs_id: str,
+    label: str,
+    population_prevalence: float | None,
+    score_train: bool,
+) -> dict[str, float]:
+    """Fit non-survival Bernoulli GAM and equivalent logistic baselines.
+
+    Baselines all include entry age, follow-up length, and sex. That nuisance
+    block is printed as `binaryN`; genetic models are evaluated by incremental
+    improvement over it as well as absolute binary metrics.
+    """
+    train, test = _standardize_columns(train, test, ["entry_age", "followup_years"])
+    y_train = train["event"].to_numpy()
+    y_test = test["event"].to_numpy()
+
+    model = fit_binary_marginal_slope(train, len(pc_cols))
+    gam_p_test = np.asarray(model.predict(test[binary_predict_columns(len(pc_cols))]), dtype=float)
+    gam_test_m = binary_stats(y_test, gam_p_test, population_prevalence)
+    gam_train_m = None
+    if score_train:
+        gam_p_train = np.asarray(model.predict(train[binary_predict_columns(len(pc_cols))]), dtype=float)
+        gam_train_m = binary_stats(y_train, gam_p_train, population_prevalence)
+
+    nuisance_names = ["entry_age_z", "followup_years_z", "sex"]
+    X_N_tr = train[nuisance_names].to_numpy()
+    X_N_te = test[nuisance_names].to_numpy()
+    N_fit = fit_logit_binary(y_train, X_N_tr, nuisance_names)
+    p_N_test = predict_logit_binary(N_fit, X_N_te)
+    N_test_m = binary_stats(y_test, p_N_test, population_prevalence)
+
+    A_names = [*nuisance_names, "z_norm2"]
+    X_A_tr = train[A_names].to_numpy()
+    X_A_te = test[A_names].to_numpy()
+    A_fit = fit_logit_binary(y_train, X_A_tr, A_names)
+    p_A_test = predict_logit_binary(A_fit, X_A_te)
+    A_test_m = binary_stats(y_test, p_A_test, population_prevalence)
+
+    B_names = [*nuisance_names, "prs_z", *pc_cols]
+    X_B_tr = train[B_names].to_numpy()
+    X_B_te = test[B_names].to_numpy()
+    B_fit = fit_logit_binary(y_train, X_B_tr, B_names)
+    p_B_test = predict_logit_binary(B_fit, X_B_te)
+    B_test_m = binary_stats(y_test, p_B_test, population_prevalence)
+
+    N_train_m = A_train_m = B_train_m = None
+    if score_train:
+        N_train_m = binary_stats(y_train, predict_logit_binary(N_fit, X_N_tr), population_prevalence)
+        A_train_m = binary_stats(y_train, predict_logit_binary(A_fit, X_A_tr), population_prevalence)
+        B_train_m = binary_stats(y_train, predict_logit_binary(B_fit, X_B_tr), population_prevalence)
+
+    A_coefs = A_fit["coefs"]
+    B_coefs = B_fit["coefs"]
+    print(
+        "  binary_baseline_spec: logistic GLM nuisance=(entry_age_z + "
+        "followup_years_z + sex); compare nuisance-only, +Z_norm2, and "
+        "+prs_z+linear PCs"
+    )
+    print(
+        f"  binary_baselineA: log_OR(z_norm2)={A_coefs['z_norm2']:+.4f}  "
+        f"OR/SD={np.exp(A_coefs['z_norm2']):.4f}"
+    )
+    pc_str = "  ".join(f"{c}={B_coefs[c]:+.3f}" for c in pc_cols)
+    print(
+        f"  binary_baselineB: log_OR(prs_z)={B_coefs['prs_z']:+.4f}  "
+        f"OR/SD={np.exp(B_coefs['prs_z']):.4f}  [{pc_str}]"
+    )
+    print(
+        f"  binary {label}  train_n={len(train):,}  test_n={gam_test_m.n:,}  "
+        f"test_events={gam_test_m.n_events:,}  test_P={gam_test_m.prevalence:.4f}  "
+        f"K_crude={population_prevalence if population_prevalence is not None else float('nan'):.6f}"
+    )
+    if score_train:
+        assert gam_train_m is not None and N_train_m is not None and A_train_m is not None and B_train_m is not None
+        print(f"  binaryGAM   train {fmt_binary(gam_train_m)}  test {fmt_binary(gam_test_m)}")
+        print(f"  binaryN     train {fmt_binary(N_train_m)}  test {fmt_binary(N_test_m)}")
+        print(f"  binaryA     train {fmt_binary(A_train_m)}  test {fmt_binary(A_test_m)}")
+        print(f"  binaryB     train {fmt_binary(B_train_m)}  test {fmt_binary(B_test_m)}")
+    else:
+        print(f"  binaryGAM   test {fmt_binary(gam_test_m)}")
+        print(f"  binaryN     test {fmt_binary(N_test_m)}")
+        print(f"  binaryA     test {fmt_binary(A_test_m)}")
+        print(f"  binaryB     test {fmt_binary(B_test_m)}")
+
+    print(
+        "  binary_delta "
+        f"AUROC(GAM-N)={gam_test_m.auroc - N_test_m.auroc:+.4f}  "
+        f"AUROC(GAM-A)={gam_test_m.auroc - A_test_m.auroc:+.4f}  "
+        f"AUROC(GAM-B)={gam_test_m.auroc - B_test_m.auroc:+.4f}  "
+        f"logloss(GAM-N)={gam_test_m.log_loss - N_test_m.log_loss:+.4f}  "
+        f"Brier(GAM-N)={gam_test_m.brier - N_test_m.brier:+.4f}  "
+        f"Nagelkerke_R2(GAM-N)={gam_test_m.nagelkerke_r2 - N_test_m.nagelkerke_r2:+.4f}"
+    )
+
+    result: dict[str, float | int | str] = {
+        "label": label,
+        "pgs": pgs_id,
+        **_binary_fields("binary_gam_test", gam_test_m),
+        **_binary_fields("binary_nuisance_test", N_test_m),
+        **_binary_fields("binary_baselineA_test", A_test_m),
+        **_binary_fields("binary_baselineB_test", B_test_m),
+        "binary_delta_auroc_vs_nuisance": gam_test_m.auroc - N_test_m.auroc,
+        "binary_delta_auroc_vs_baselineA": gam_test_m.auroc - A_test_m.auroc,
+        "binary_delta_auroc_vs_baselineB": gam_test_m.auroc - B_test_m.auroc,
+        "binary_delta_log_loss_vs_nuisance": gam_test_m.log_loss - N_test_m.log_loss,
+        "binary_delta_brier_vs_nuisance": gam_test_m.brier - N_test_m.brier,
+        "binary_delta_nagelkerke_vs_nuisance": gam_test_m.nagelkerke_r2 - N_test_m.nagelkerke_r2,
+    }
+    if score_train:
+        assert gam_train_m is not None and N_train_m is not None and A_train_m is not None and B_train_m is not None
+        result.update(_binary_fields("binary_gam_train", gam_train_m))
+        result.update(_binary_fields("binary_nuisance_train", N_train_m))
+        result.update(_binary_fields("binary_baselineA_train", A_train_m))
+        result.update(_binary_fields("binary_baselineB_train", B_train_m))
+    print("  BINARY_RESULT " + json.dumps(result, sort_keys=True))
+    return {
+        k: float(v)
+        for k, v in result.items()
+        if isinstance(v, (int, float)) and not isinstance(v, bool)
+    }
+
+
 def evaluate_model_pair(
     train: pd.DataFrame,
     test: pd.DataFrame,
     pc_cols: list[str],
     pgs_id: str,
     label: str,
+    population_prevalence: float | None = None,
     save_info: dict[str, object] | None = None,
     score_train: bool = True,
 ) -> dict[str, float]:
-    """Fit GAM + Z_norm2 Cox baseline and print comparable C-index lines."""
+    """Fit GAM + Cox baselines and print survival validation metrics."""
     train, test, pgs_mean, pgs_std = prepare_scores(train, test, pc_cols, pgs_id)
+    for frame in (train, test):
+        if "followup_years" not in frame.columns:
+            frame["followup_years"] = frame["exit_age"] - frame["entry_age"]
 
     # Fit. Resume is handled transparently by gamfit's persistent warm-start
     # cache at `~/.cache/gam/warm/v1/`: on identical (training data, gamfit
@@ -1298,22 +1538,6 @@ def evaluate_model_pair(
             save_info, pc_cols, pgs_mean, pgs_std, len(train),
         )
 
-    t_horizon = float(test["exit_age"].max())
-    gam_risk_test, kept_test = gam_risk(model, test, len(pc_cols), t_horizon)
-    gam_test_m = metrics(
-        test["exit_age"].to_numpy()[kept_test],
-        test["event"].to_numpy()[kept_test],
-        gam_risk_test,
-    )
-    gam_train_m = None
-    if score_train:
-        gam_risk_train, kept_train = gam_risk(model, train, len(pc_cols), t_horizon)
-        gam_train_m = metrics(
-            train["exit_age"].to_numpy()[kept_train],
-            train["event"].to_numpy()[kept_train],
-            gam_risk_train,
-        )
-
     print(
         f"  baseline_spec: two left-truncated Cox PH benchmarks; both share "
         f"`+ sex` with the GAM."
@@ -1328,7 +1552,8 @@ def evaluate_model_pair(
     X_A_tr = np.column_stack([train["z_norm2"].to_numpy(), sex_tr])
     X_A_te = np.column_stack([test["z_norm2"].to_numpy(), sex_te])
     A_names = ["z_norm2", "sex"]
-    A_coefs = fit_baseline_cox(entry_tr, exit_tr, event_tr, X_A_tr, A_names)
+    A_fit = fit_baseline_cox(entry_tr, exit_tr, event_tr, X_A_tr, A_names)
+    A_coefs = A_fit.coefs
     print(
         f"  baselineA   Cox PH on  z_norm2 + sex          "
         f"log_HR(z_norm2)={A_coefs['z_norm2']:+.4f}  "
@@ -1344,7 +1569,8 @@ def evaluate_model_pair(
         test["prs_z"].to_numpy(), sex_te, test[pc_cols].to_numpy(),
     ])
     B_names = ["prs_z", "sex", *pc_cols]
-    B_coefs = fit_baseline_cox(entry_tr, exit_tr, event_tr, X_B_tr, B_names)
+    B_fit = fit_baseline_cox(entry_tr, exit_tr, event_tr, X_B_tr, B_names)
+    B_coefs = B_fit.coefs
     pc_str = "  ".join(f"{c}={B_coefs[c]:+.3f}" for c in pc_cols)
     print(
         f"  baselineB   Cox PH on  prs_z + sex + {'+'.join(pc_cols)}  "
@@ -1357,80 +1583,191 @@ def evaluate_model_pair(
         beta = np.array([coefs[n] for n in names])
         return np.exp(X @ beta)
 
-    test_exit = test["exit_age"].to_numpy()[kept_test]
-    test_event = test["event"].to_numpy()[kept_test]
-    A_test_m = metrics(test_exit, test_event, _risk(X_A_te[kept_test], A_names, A_coefs))
-    B_test_m = metrics(test_exit, test_event, _risk(X_B_te[kept_test], B_names, B_coefs))
-    A_train_m = B_train_m = None
+    metric_times = _survival_metric_times(
+        train["exit_age"].to_numpy(),
+        test["exit_age"].to_numpy(),
+    )
+    gam_risk_test, gam_surv_test, kept_test = gam_survival_outputs(
+        model, test, len(pc_cols), metric_times
+    )
+    test_metric = test.loc[kept_test].reset_index(drop=True)
+    valid_time = (
+        (metric_times > float(test_metric["exit_age"].min()))
+        & (metric_times < min(float(test_metric["exit_age"].max()), float(train["exit_age"].max())))
+    )
+    if int(valid_time.sum()) < 2:
+        raise ValueError("fewer than two valid survival metric time points after prediction filtering")
+    if not bool(valid_time.all()):
+        metric_times = metric_times[valid_time]
+        gam_surv_test = gam_surv_test[:, valid_time]
+
+    A_test_m = survival_library_metrics(
+        train,
+        test_metric,
+        _risk(X_A_te[kept_test], A_names, A_coefs),
+        cox_survival_matrix(A_fit, X_A_te[kept_test], metric_times),
+        metric_times,
+    )
+    B_test_m = survival_library_metrics(
+        train,
+        test_metric,
+        _risk(X_B_te[kept_test], B_names, B_coefs),
+        cox_survival_matrix(B_fit, X_B_te[kept_test], metric_times),
+        metric_times,
+    )
+    gam_test_m = survival_library_metrics(train, test_metric, gam_risk_test, gam_surv_test, metric_times)
+    A_risk_test = _risk(X_A_te[kept_test], A_names, A_coefs)
+    B_risk_test = _risk(X_B_te[kept_test], B_names, B_coefs)
+    test_exit = test_metric["exit_age"].to_numpy()
+    test_event = test_metric["event"].to_numpy()
+    gam_harrell_test = metrics(test_exit, test_event, gam_risk_test)
+    A_harrell_test = metrics(test_exit, test_event, A_risk_test)
+    B_harrell_test = metrics(test_exit, test_event, B_risk_test)
+
+    gam_train_m = A_train_m = B_train_m = None
+    gam_harrell_train = A_harrell_train = B_harrell_train = None
     if score_train:
-        A_train_m = metrics(
-            train["exit_age"].to_numpy()[kept_train],
-            train["event"].to_numpy()[kept_train],
-            _risk(X_A_tr[kept_train], A_names, A_coefs),
+        train_times = _survival_metric_times(
+            train["exit_age"].to_numpy(),
+            train["exit_age"].to_numpy(),
         )
-        B_train_m = metrics(
-            train["exit_age"].to_numpy()[kept_train],
-            train["event"].to_numpy()[kept_train],
+        gam_risk_train, gam_surv_train, kept_train = gam_survival_outputs(
+            model, train, len(pc_cols), train_times
+        )
+        train_metric = train.loc[kept_train].reset_index(drop=True)
+        valid_train_time = (
+            (train_times > float(train_metric["exit_age"].min()))
+            & (train_times < float(train_metric["exit_age"].max()))
+        )
+        if int(valid_train_time.sum()) < 2:
+            raise ValueError("fewer than two valid train survival metric time points")
+        if not bool(valid_train_time.all()):
+            train_times = train_times[valid_train_time]
+            gam_surv_train = gam_surv_train[:, valid_train_time]
+        gam_train_m = survival_library_metrics(
+            train, train_metric, gam_risk_train, gam_surv_train, train_times
+        )
+        A_train_m = survival_library_metrics(
+            train,
+            train_metric,
+            _risk(X_A_tr[kept_train], A_names, A_coefs),
+            cox_survival_matrix(A_fit, X_A_tr[kept_train], train_times),
+            train_times,
+        )
+        B_train_m = survival_library_metrics(
+            train,
+            train_metric,
             _risk(X_B_tr[kept_train], B_names, B_coefs),
+            cox_survival_matrix(B_fit, X_B_tr[kept_train], train_times),
+            train_times,
+        )
+        train_exit = train_metric["exit_age"].to_numpy()
+        train_event = train_metric["event"].to_numpy()
+        gam_harrell_train = metrics(train_exit, train_event, gam_risk_train)
+        A_harrell_train = metrics(
+            train_exit, train_event, _risk(X_A_tr[kept_train], A_names, A_coefs)
+        )
+        B_harrell_train = metrics(
+            train_exit, train_event, _risk(X_B_tr[kept_train], B_names, B_coefs)
         )
 
-    delta_A_ci = paired_delta_ci(gam_test_m, A_test_m)
-    delta_B_ci = paired_delta_ci(gam_test_m, B_test_m)
+    delta_A_c = gam_test_m.c_ipcw - A_test_m.c_ipcw
+    delta_B_c = gam_test_m.c_ipcw - B_test_m.c_ipcw
+    delta_A_ibs = gam_test_m.ibs - A_test_m.ibs
+    delta_B_ibs = gam_test_m.ibs - B_test_m.ibs
+    delta_A_r2 = gam_test_m.r2_ibs - A_test_m.r2_ibs
+    delta_B_r2 = gam_test_m.r2_ibs - B_test_m.r2_ibs
+    delta_A_harrell_ci = paired_delta_ci(gam_harrell_test, A_harrell_test)
+    delta_B_harrell_ci = paired_delta_ci(gam_harrell_test, B_harrell_test)
 
     print(
         f"  {label}  train_n={len(train):,}  test_n={gam_test_m.n:,}  "
         f"test_events={gam_test_m.n_events:,}  "
-        f"test_pairs={gam_test_m.comparable_pairs:,}  "
-        f"median_exit_age={gam_test_m.median_exit_age:.2f}  horizon={t_horizon:.2f}"
+        f"median_exit_age={gam_test_m.median_exit_age:.2f}  "
+        f"metric_age_grid=[{gam_test_m.ibs_start:.2f},{gam_test_m.ibs_stop:.2f}] "
+        f"n_times={gam_test_m.n_times}"
     )
     if score_train:
         assert gam_train_m is not None and A_train_m is not None and B_train_m is not None
-        print(f"  GAM        train_C={fmt_c(gam_train_m)}  test_C={fmt_c(gam_test_m)}")
-        print(f"  baselineA  train_C={fmt_c(A_train_m)}  test_C={fmt_c(A_test_m)}")
-        print(f"  baselineB  train_C={fmt_c(B_train_m)}  test_C={fmt_c(B_test_m)}")
+        assert gam_harrell_train is not None and A_harrell_train is not None and B_harrell_train is not None
+        print(f"  GAM        train {fmt_survival(gam_train_m)}  test {fmt_survival(gam_test_m)}")
+        print(f"  baselineA  train {fmt_survival(A_train_m)}  test {fmt_survival(A_test_m)}")
+        print(f"  baselineB  train {fmt_survival(B_train_m)}  test {fmt_survival(B_test_m)}")
+        print(f"  GAM        train_Harrell_C={fmt_c(gam_harrell_train)}  test_Harrell_C={fmt_c(gam_harrell_test)}")
+        print(f"  baselineA  train_Harrell_C={fmt_c(A_harrell_train)}  test_Harrell_C={fmt_c(A_harrell_test)}")
+        print(f"  baselineB  train_Harrell_C={fmt_c(B_harrell_train)}  test_Harrell_C={fmt_c(B_harrell_test)}")
     else:
-        print(f"  GAM        test_C={fmt_c(gam_test_m)}")
-        print(f"  baselineA  test_C={fmt_c(A_test_m)}")
-        print(f"  baselineB  test_C={fmt_c(B_test_m)}")
-    print(f"  delta      test_C(GAM-baselineA Z_norm2)={fmt_delta(delta_A_ci)}  "
-          f"(GAM-baselineB linear-PCs)={fmt_delta(delta_B_ci)}")
+        print(f"  GAM        test {fmt_survival(gam_test_m)}")
+        print(f"  baselineA  test {fmt_survival(A_test_m)}")
+        print(f"  baselineB  test {fmt_survival(B_test_m)}")
+        print(f"  GAM        test_Harrell_C={fmt_c(gam_harrell_test)}")
+        print(f"  baselineA  test_Harrell_C={fmt_c(A_harrell_test)}")
+        print(f"  baselineB  test_Harrell_C={fmt_c(B_harrell_test)}")
+    print(
+        f"  delta      GAM-baselineA: ΔC_ipcw={delta_A_c:+.4f} "
+        f"ΔIBS={delta_A_ibs:+.5f} ΔR2_IBS={delta_A_r2:+.4f}  "
+        f"GAM-baselineB: ΔC_ipcw={delta_B_c:+.4f} "
+        f"ΔIBS={delta_B_ibs:+.5f} ΔR2_IBS={delta_B_r2:+.4f}"
+    )
+    print(
+        f"  delta      Harrell_C(GAM-baselineA)={fmt_delta(delta_A_harrell_ci)}  "
+        f"Harrell_C(GAM-baselineB)={fmt_delta(delta_B_harrell_ci)}"
+    )
 
-    def _stats_fields(prefix: str, stats: CIndexStats) -> dict[str, float | int]:
-        return {
-            f"{prefix}_c": stats.concordance,
-            f"{prefix}_c_se": stats.se,
-            f"{prefix}_c_ci_low": stats.ci_low,
-            f"{prefix}_c_ci_high": stats.ci_high,
-            f"{prefix}_n": stats.n,
-            f"{prefix}_events": stats.n_events,
-            f"{prefix}_pairs": stats.comparable_pairs,
-        }
+    binary_result = evaluate_binary_model_pair(
+        train,
+        test,
+        pc_cols,
+        pgs_id,
+        label=label,
+        population_prevalence=population_prevalence,
+        score_train=score_train,
+    )
 
     result: dict[str, float | int | str] = {
         "label": label,
         "pgs": pgs_id,
-        **_stats_fields("gam_test", gam_test_m),
-        **_stats_fields("baselineA_test", A_test_m),
-        **_stats_fields("baselineB_test", B_test_m),
-        "delta_test_c_vs_baselineA": delta_A_ci[0],
-        "delta_test_c_vs_baselineA_se": delta_A_ci[1],
-        "delta_test_c_vs_baselineA_ci_low": delta_A_ci[2],
-        "delta_test_c_vs_baselineA_ci_high": delta_A_ci[3],
-        "delta_test_c_vs_baselineB": delta_B_ci[0],
-        "delta_test_c_vs_baselineB_se": delta_B_ci[1],
-        "delta_test_c_vs_baselineB_ci_low": delta_B_ci[2],
-        "delta_test_c_vs_baselineB_ci_high": delta_B_ci[3],
+        **_survival_fields("gam_test", gam_test_m),
+        **_survival_fields("baselineA_test", A_test_m),
+        **_survival_fields("baselineB_test", B_test_m),
+        **_cindex_fields("harrell_gam_test", gam_harrell_test),
+        **_cindex_fields("harrell_baselineA_test", A_harrell_test),
+        **_cindex_fields("harrell_baselineB_test", B_harrell_test),
+        "delta_test_c_vs_baselineA": delta_A_c,
+        "delta_test_c_vs_baselineB": delta_B_c,
+        "delta_test_c_ipcw_vs_baselineA": delta_A_c,
+        "delta_test_c_ipcw_vs_baselineB": delta_B_c,
+        "delta_test_ibs_vs_baselineA": delta_A_ibs,
+        "delta_test_ibs_vs_baselineB": delta_B_ibs,
+        "delta_test_r2_ibs_vs_baselineA": delta_A_r2,
+        "delta_test_r2_ibs_vs_baselineB": delta_B_r2,
+        "delta_test_harrell_c_vs_baselineA": delta_A_harrell_ci[0],
+        "delta_test_harrell_c_vs_baselineA_se": delta_A_harrell_ci[1],
+        "delta_test_harrell_c_vs_baselineA_ci_low": delta_A_harrell_ci[2],
+        "delta_test_harrell_c_vs_baselineA_ci_high": delta_A_harrell_ci[3],
+        "delta_test_harrell_c_vs_baselineB": delta_B_harrell_ci[0],
+        "delta_test_harrell_c_vs_baselineB_se": delta_B_harrell_ci[1],
+        "delta_test_harrell_c_vs_baselineB_ci_low": delta_B_harrell_ci[2],
+        "delta_test_harrell_c_vs_baselineB_ci_high": delta_B_harrell_ci[3],
     }
+    result.update(binary_result)
     if score_train:
         assert gam_train_m is not None and A_train_m is not None and B_train_m is not None
-        result.update(_stats_fields("gam_train", gam_train_m))
-        result.update(_stats_fields("baselineA_train", A_train_m))
-        result.update(_stats_fields("baselineB_train", B_train_m))
+        assert gam_harrell_train is not None and A_harrell_train is not None and B_harrell_train is not None
+        result.update(_survival_fields("gam_train", gam_train_m))
+        result.update(_survival_fields("baselineA_train", A_train_m))
+        result.update(_survival_fields("baselineB_train", B_train_m))
+        result.update(_cindex_fields("harrell_gam_train", gam_harrell_train))
+        result.update(_cindex_fields("harrell_baselineA_train", A_harrell_train))
+        result.update(_cindex_fields("harrell_baselineB_train", B_harrell_train))
     else:
         result.update({
-            "gam_train_c": float("nan"),
-            "baselineA_train_c": float("nan"),
-            "baselineB_train_c": float("nan"),
+            "gam_train_c_ipcw": float("nan"),
+            "baselineA_train_c_ipcw": float("nan"),
+            "baselineB_train_c_ipcw": float("nan"),
+            "harrell_gam_train_c": float("nan"),
+            "harrell_baselineA_train_c": float("nan"),
+            "harrell_baselineB_train_c": float("nan"),
         })
     print("  RESULT " + json.dumps(result, sort_keys=True))
     return {
@@ -1559,15 +1896,16 @@ def run_loso_axis(
             pc_cols,
             pgs_id,
             label=f"LOSO[{axis_name}] holdout={group_short!r}",
+            population_prevalence=float(df_full["event"].mean()),
             score_train=score_train,
         )
-        deltas.append(result["delta_test_c_vs_baselineA"])
+        deltas.append(result["delta_test_c_ipcw_vs_baselineA"])
 
     print(
         f"  LOSO summary axis={axis_name} folds={len(deltas)}  "
-        f"mean_delta={float(np.mean(deltas)):+.4f}  "
-        f"worst_delta={float(np.min(deltas)):+.4f}  "
-        f"best_delta={float(np.max(deltas)):+.4f}"
+        f"mean_delta_C_ipcw={float(np.mean(deltas)):+.4f}  "
+        f"worst_delta_C_ipcw={float(np.min(deltas)):+.4f}  "
+        f"best_delta_C_ipcw={float(np.max(deltas)):+.4f}"
     )
 
 
@@ -1706,6 +2044,7 @@ def main() -> None:
         df_full["exit_age"] = (
             (exit_date - df_full["birth_datetime"]).dt.days / days_per_year
         )
+        df_full["followup_years"] = df_full["exit_age"] - df_full["entry_age"]
 
         # Drop rows with non-positive or invalid intervals: missing birth/obs,
         # prevalent cases whose event predates obs_start (entry >= exit), etc.
@@ -1755,6 +2094,7 @@ def main() -> None:
             pc_cols,
             cfg["pgs"],
             label=f"PGS={cfg['pgs']} random_split K(crude)={K:.6f}",
+            population_prevalence=K,
             save_info={
                 "disease": name,
                 "pgs": cfg["pgs"],

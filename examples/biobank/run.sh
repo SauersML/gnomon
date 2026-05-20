@@ -88,6 +88,7 @@ uv run \
     --with pyarrow \
     --with scipy \
     --with scikit-learn \
+    --with scikit-survival \
     --with statsmodels \
     --with tzdata \
     --with pgscatalog.calc \
@@ -110,7 +111,7 @@ uv run \
   echo "=========================================================================="
   echo "=== SUMMARY (extracted)"
   echo "=========================================================================="
-  grep -E "^gamfit |^loso_axes:|^=== |^cohort:|^  pcs:|^  sex:|^  pgs:|^  times:|^  context:|^  ancestry:|^  snomed=|^  split:|^  fit_spec:|^  baseline_spec:|^  baseline_coef:|^  PGS=|^  OOD:|^  LOSO |^  GAM |^  baseline |^  delta |^  RESULT |^  save:" "$RESULTS" || echo "(no summary lines matched — fit likely failed; see full log above)"
+  grep -E "^gamfit |^loso_axes:|^=== |^cohort:|^  pcs:|^  sex:|^  pgs:|^  times:|^  context:|^  ancestry:|^  snomed=|^  split:|^  fit_spec:|^  binary_fit_spec:|^  baseline_spec:|^  baselineA|^  baselineB|^  binary_baseline|^  PGS=|^  binary PGS=|^  OOD:|^  LOSO |^  GAM |^  baseline |^  binaryGAM |^  binaryN |^  binaryA |^  binaryB |^  delta |^  binary_delta |^  survival_metrics |^  RESULT |^  BINARY_RESULT |^  save:" "$RESULTS" || echo "(no summary lines matched — fit likely failed; see full log above)"
   echo "=========================================================================="
   echo "Full log: $RESULTS"
 } | tee -a "$RESULTS"
