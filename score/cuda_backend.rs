@@ -162,26 +162,43 @@ impl<'a> Drop for BufferGuard<'a> {
     }
 }
 
-// Field order matters: Rust drops struct fields top-down. We list the
-// "leaf" GPU resources first so they are released before the streams,
-// kernels, and cuBLAS handle they depend on. The streams themselves hold
-// `Arc<CudaContext>` internally, so the context outlives every GPU
-// resource here — no separate context field is needed.
+// Field order matters: Rust drops struct fields top-down, but cudarc
+// resources hold `Arc<CudaStream>` and `Arc<CudaContext>` internally, so
+// "raw" destruction of streams/context only happens once every Arc to
+// them is gone. Putting streams and the cuBLAS handle FIRST means their
+// runtime-owned Arc drops first (still alive due to slice refs), and
+// then once all CudaSlices drop their Arc<CudaStream>, the stream is
+// actually destroyed.
+//
+// The crucial property of this order: `blas` drops while the
+// compute_stream is still synchronised and clean (no pending
+// cuMemFreeAsync calls queued on it), so cublasDestroy does not race
+// against a stream that has accumulated a backlog of leaf-resource
+// frees. Inverting this -- dropping pinned/slice leaves first and the
+// blas/streams last -- empirically aborts with "double free or
+// corruption (!prev)" right after CUDA compute completes (observed on
+// the AoU bare-metal Turing T4 image, even on tiny single-PGS inputs).
 struct CudaRuntime {
-    pinned_staging: Vec<PinnedHostSlice<u8>>,
-    pinned_reconciled: Vec<PinnedHostSlice<u32>>,
+    // Held to keep the CUDA context alive for the lifetime of every
+    // resource below; not accessed directly, but dropping this Arc
+    // before everything else would mean each leaf resource's `Drop`
+    // would have to reconstruct context binding from its own Arc.
+    #[allow(dead_code)]
+    ctx: Arc<CudaContext>,
+    compute_stream: Arc<CudaStream>,
+    copy_stream: Arc<CudaStream>,
+    blas: CudaBlas,
+    unpack_kernel: CudaFunction,
+    build_batch_mats_kernel: CudaFunction,
     sparse_weights: CudaSlice<f32>,
     sparse_missing_corrections: CudaSlice<f32>,
     sparse_columns: CudaSlice<u32>,
     sparse_row_offsets: CudaSlice<u64>,
     output_map: CudaSlice<u32>,
-    blas: CudaBlas,
-    unpack_kernel: CudaFunction,
-    build_batch_mats_kernel: CudaFunction,
-    compute_stream: Arc<CudaStream>,
-    copy_stream: Arc<CudaStream>,
     mega_batch_variants: usize,
     gpu_score_chunk_size: usize,
+    pinned_staging: Vec<PinnedHostSlice<u8>>,
+    pinned_reconciled: Vec<PinnedHostSlice<u32>>,
 }
 
 struct GpuChannels {
@@ -587,12 +604,8 @@ impl CudaRuntime {
         let blas = CudaBlas::new(compute_stream.clone())
             .map_err(|e| format!("Failed to initialize cuBLAS: {e:?}"))?;
 
-        // `ctx` is intentionally not stored: every retained Arc<CudaStream>
-        // already holds a strong reference to it, so the context outlives
-        // each GPU resource owned by the runtime.
-        drop(ctx);
-
         Ok(Self {
+            ctx,
             compute_stream,
             copy_stream,
             blas,
@@ -711,10 +724,9 @@ enum CudaInput {
 
 fn run_cuda_pipeline(
     context: &PipelineContext,
-    runtime: CudaRuntime,
+    mut runtime: CudaRuntime,
     input: CudaInput,
 ) -> Result<(Vec<f64>, Vec<u32>), PipelineError> {
-    let mut runtime = Some(runtime);
     let prep_result = &context.prep_result;
     let channels = create_gpu_channels(context);
     let mut support_guard = PipelineSupportGuard::new(start_pipeline_support(
@@ -835,7 +847,7 @@ fn run_cuda_pipeline(
         let compute_result = process_dense_stream_cuda(
             channels.dense_rx,
             prep_result,
-            runtime.as_mut().expect("runtime must exist during GPU stage"),
+            &mut runtime,
             Arc::clone(&channels.buffer_pool),
         );
         let spool_result = producer_handle
@@ -848,27 +860,33 @@ fn run_cuda_pipeline(
     let mut spool_state = local_spool;
     support_guard.mark_completed();
 
-    // ORDER MATTERS. Drop the progress-support guard *before* the CUDA runtime.
+    // Tear CUDA down explicitly here, between the GPU compute phase and
+    // the CPU-only complex-variant resolver below, so:
     //
-    // `mark_completed` only sets a bool consulted at Drop time; the
-    // `fallback_log_handle` thread (start_pipeline_support, ~line 1008) does
-    // not observe it. That thread sits in a 2-second sleep loop and calls
-    // `eprintln!("> CUDA progress: ... ")` — which takes glibc stdio locks
-    // and allocates — until `progress_done` flips inside
-    // `finish_pipeline_support`, which only runs from `PipelineSupportGuard`'s
-    // Drop. If we drop `runtime` first, cudarc + cuBLAS + libcudart teardown
-    // (which itself goes through glibc malloc/free) races against the still-
-    // live log thread on the same heap, and glibc aborts with
-    // "double free or corruption (!prev)" — observed exactly between the last
-    // CUDA progress line and the complex-variant resolver banner.
+    //   * The log thread is joined and the progress bar finalised
+    //     (`drop(support_guard)`) BEFORE cudarc teardown begins. The
+    //     fallback log thread sleeps in 2-second intervals calling
+    //     `eprintln!` -- which takes the glibc stdio lock and
+    //     allocates -- and the runtime's internal cuBLAS / cudart
+    //     teardown also goes through glibc malloc/free. Joining first
+    //     quiesces the heap so cudarc teardown runs without a
+    //     concurrent writer.
     //
-    // Dropping `support_guard` first joins both progress threads, after which
-    // the heap is quiescent and cudarc teardown runs without a concurrent
-    // writer. The earlier intent — tear CUDA down before the complex-variant
-    // resolver — is preserved: both drops still complete before the resolver
-    // starts a few lines below.
+    //   * The runtime drops with its fields in the order declared at
+    //     the top of this file: ctx, streams, blas, kernels, slices,
+    //     pinned. That means `cublasDestroy` runs while the compute
+    //     stream is still synchronised and free of queued
+    //     `cuMemFreeAsync` calls. The streams' raw destruction
+    //     (`cuStreamDestroy`) only happens once the last `Arc<CudaStream>`
+    //     held by a slice drops, naturally serialising the GPU
+    //     teardown.
+    //
+    // Inverting either piece -- explicit drops gone, or leaf resources
+    // at the top of the struct -- has empirically aborted scoring with
+    // "double free or corruption (!prev)" right after CUDA compute
+    // completes on the AoU bare-metal Turing T4 image.
     drop(support_guard);
-    drop(runtime.take());
+    drop(runtime);
 
     if !prep_result.complex_rules.is_empty() {
         if should_spool {
