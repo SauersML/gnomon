@@ -42,15 +42,17 @@ if [ -z "${GNOMON_RUN_REEXEC:-}" ] && git -C "$SCRIPT_DIR" rev-parse --git-dir >
 fi
 
 command -v gnomon >/dev/null 2>&1 || bash "$HOME/gnomon/install.sh"
-RESULTS_DIR="$HOME/aou-gpu-baremetal/biobank_results"
-mkdir -p "$RESULTS_DIR"
-RUN_STATE_DIR="$RESULTS_DIR/run_state"
+AOU_DISK_ROOT="$HOME/aou-gpu-baremetal"
+RESULTS_DIR="$AOU_DISK_ROOT/biobank_results"
+RUN_STATE_DIR="$AOU_DISK_ROOT/gnomon_runtime/biobank"
 UV_CACHE_DIR="$RUN_STATE_DIR/uv"
 UV_PYTHON_INSTALL_DIR="$RUN_STATE_DIR/uv_python"
 XDG_CACHE_HOME="$RUN_STATE_DIR/xdg_cache"
 XDG_DATA_HOME="$RUN_STATE_DIR/xdg_data"
 TMPDIR="$RUN_STATE_DIR/tmp"
-mkdir -p "$UV_CACHE_DIR" "$UV_PYTHON_INSTALL_DIR" "$XDG_CACHE_HOME" "$XDG_DATA_HOME" "$TMPDIR"
+MIN_RUN_STATE_FREE_GIB=30
+MIN_RUN_STATE_FREE_INODES=200000
+mkdir -p "$RESULTS_DIR" "$UV_CACHE_DIR" "$UV_PYTHON_INSTALL_DIR" "$XDG_CACHE_HOME" "$XDG_DATA_HOME" "$TMPDIR"
 export UV_CACHE_DIR UV_PYTHON_INSTALL_DIR XDG_CACHE_HOME XDG_DATA_HOME TMPDIR
 TS=$(date -u +%Y%m%dT%H%M%SZ)
 RESULTS="$RESULTS_DIR/biobank_run_${TS}.log"
@@ -69,8 +71,8 @@ path_usage() {
   done
   if [ -e "$existing" ]; then
     printf '%-18s path=%s\n' "$label:" "$path"
-    df -h "$existing" | sed 's/^/  df: /'
-    df -i "$existing" 2>/dev/null | sed 's/^/  inode: /' || true
+    df -hP "$existing" | sed 's/^/  df: /'
+    df -ihP "$existing" 2>/dev/null | sed 's/^/  inode: /' || true
   else
     printf '%-18s path=%s (not found)\n' "$label:" "$path"
   fi
@@ -81,13 +83,25 @@ available_kib() {
   df -Pk "$path" | awk 'NR == 2 {print $4}'
 }
 
-require_free_space() {
+available_inodes() {
+  local path="$1"
+  df -Pi "$path" | awk 'NR == 2 {print $4}'
+}
+
+format_kib() {
+  awk -v kib="$1" 'BEGIN {printf "%.1fGiB", kib / 1024 / 1024}'
+}
+
+require_run_state_capacity() {
   local label="$1"
   local path="$2"
   local required_gib="$3"
+  local required_inodes="$4"
   local free_kib
-  free_kib="$(available_kib "$path")"
-  if [ -z "$free_kib" ]; then
+  local free_inodes
+  free_kib="$(available_kib "$path" 2>/dev/null || true)"
+  free_inodes="$(available_inodes "$path" 2>/dev/null || true)"
+  if [[ ! "$free_kib" =~ ^[0-9]+$ ]]; then
     echo "[run.sh] could not determine free space for $label at $path" | tee -a "$RESULTS" >&2
     failure_diagnostics 1
   fi
@@ -95,8 +109,16 @@ require_free_space() {
   if [ "$free_kib" -lt "$required_kib" ]; then
     {
       echo "[run.sh] insufficient free space for $label at $path"
-      echo "[run.sh] required: ${required_gib}GiB; available: $((free_kib / 1024 / 1024))GiB"
-      df -h "$path"
+      echo "[run.sh] required: ${required_gib}GiB; available: $(format_kib "$free_kib")"
+      df -hP "$path"
+    } | tee -a "$RESULTS" >&2
+    failure_diagnostics 1
+  fi
+  if [[ "$free_inodes" =~ ^[0-9]+$ ]] && [ "$free_inodes" -lt "$required_inodes" ]; then
+    {
+      echo "[run.sh] insufficient free inodes for $label at $path"
+      echo "[run.sh] required: ${required_inodes}; available: ${free_inodes}"
+      df -ihP "$path"
     } | tee -a "$RESULTS" >&2
     failure_diagnostics 1
   fi
@@ -108,6 +130,8 @@ cache_du() {
   if [ -e "$path" ]; then
     printf '%-18s ' "$label:"
     du -sh "$path" 2>/dev/null || true
+  else
+    printf '%-18s missing %s\n' "$label:" "$path"
   fi
 }
 
@@ -124,6 +148,7 @@ failure_diagnostics() {
     echo
     echo "--- filesystem at failure ---"
     path_usage "home" "$HOME"
+    path_usage "aou_disk" "$AOU_DISK_ROOT"
     path_usage "results" "$RESULTS_DIR"
     path_usage "run_state" "$RUN_STATE_DIR"
     path_usage "uv_cache" "$UV_CACHE_DIR"
@@ -135,9 +160,11 @@ failure_diagnostics() {
     echo
     echo "--- cache sizes ---"
     cache_du "legacy_uv_cache" "$HOME/.cache/uv"
+    cache_du "legacy_gam_cache" "$HOME/.cache/gam"
     cache_du "uv_cache" "$UV_CACHE_DIR"
     cache_du "uv_python" "$UV_PYTHON_INSTALL_DIR"
     cache_du "xdg_cache" "$XDG_CACHE_HOME"
+    cache_du "gamfit_cache" "$XDG_CACHE_HOME/gam"
     cache_du "xdg_data" "$XDG_DATA_HOME"
     cache_du "tmpdir" "$TMPDIR"
     echo "=========================================================================="
@@ -152,7 +179,11 @@ trap 'failure_diagnostics $?' ERR
 # directories can have much less free space than the attached workspace disk,
 # so keep both uv and XDG-style caches under RESULTS_DIR and fail before the
 # resolver starts if that volume is not large enough.
-require_free_space "biobank run state" "$RUN_STATE_DIR" 20
+require_run_state_capacity \
+  "biobank run state" \
+  "$RUN_STATE_DIR" \
+  "$MIN_RUN_STATE_FREE_GIB" \
+  "$MIN_RUN_STATE_FREE_INODES"
 
 # --- preamble ---------------------------------------------------------------
 {
