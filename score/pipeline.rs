@@ -89,9 +89,7 @@ fn maybe_emit_text_progress(
     if !(due_by_time || due_by_pct) {
         return false;
     }
-    eprintln!(
-        "> Progress: {processed}/{total} variants ({pct}%)"
-    );
+    eprintln!("> Progress: {processed}/{total} variants ({pct}%)");
     *last_print = now;
     *last_pct = pct;
     true

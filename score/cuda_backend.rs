@@ -33,9 +33,9 @@ const DENSE_CHANNEL_BOUND: usize = 4096;
 const BUFFER_POOL_SIZE: usize = 16384;
 const SPOOL_BUFFER_SIZE: usize = 8 * 1024 * 1024;
 const MIN_GPU_WORK: usize = 100_000;
-const MIN_MEGA_BATCH_VARIANTS: usize = 256;
+const MIN_MEGA_BATCH_VARIANTS: usize = 1;
 const MAX_MEGA_BATCH_VARIANTS: usize = 16384;
-const MIN_SCORE_TILE_SIZE: usize = 8;
+const MIN_SCORE_TILE_SIZE: usize = 1;
 const PIPELINE_SLOTS: usize = 2;
 
 fn create_progress_bar(len: u64, message: &str) -> ProgressBar {
@@ -497,7 +497,11 @@ impl CudaRuntime {
             "> CUDA device memory: free={:.2} GiB / total={:.2} GiB ({:.1}% available)",
             free_mem as f64 / (1024.0 * 1024.0 * 1024.0),
             total_mem as f64 / (1024.0 * 1024.0 * 1024.0),
-            if total_mem == 0 { 0.0 } else { 100.0 * free_mem as f64 / total_mem as f64 },
+            if total_mem == 0 {
+                0.0
+            } else {
+                100.0 * free_mem as f64 / total_mem as f64
+            },
         );
 
         let static_bytes = prep

@@ -41,11 +41,10 @@
 //! the bug is squarely in the cudarc / kernel / pinned-memory teardown
 //! path, not in cuBLAS-vs-system-driver ABI.
 
-use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
 use cudarc::cublas::sys::cublasOperation_t;
+use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PinnedHostSlice,
-    PushKernelArg,
+    CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PinnedHostSlice, PushKernelArg,
 };
 use cudarc::nvrtc::compile_ptx;
 use std::env;
@@ -84,11 +83,41 @@ impl Args {
         let mut it = env::args().skip(1);
         while let Some(flag) = it.next() {
             match flag.as_str() {
-                "--people" => a.people = it.next().ok_or("missing")?.parse().map_err(|e| format!("{e}"))?,
-                "--mega" => a.mega = it.next().ok_or("missing")?.parse().map_err(|e| format!("{e}"))?,
-                "--scores" => a.scores = it.next().ok_or("missing")?.parse().map_err(|e| format!("{e}"))?,
-                "--trials" => a.trials = it.next().ok_or("missing")?.parse().map_err(|e| format!("{e}"))?,
-                "--runs" => a.runs = it.next().ok_or("missing")?.parse().map_err(|e| format!("{e}"))?,
+                "--people" => {
+                    a.people = it
+                        .next()
+                        .ok_or("missing")?
+                        .parse()
+                        .map_err(|e| format!("{e}"))?
+                }
+                "--mega" => {
+                    a.mega = it
+                        .next()
+                        .ok_or("missing")?
+                        .parse()
+                        .map_err(|e| format!("{e}"))?
+                }
+                "--scores" => {
+                    a.scores = it
+                        .next()
+                        .ok_or("missing")?
+                        .parse()
+                        .map_err(|e| format!("{e}"))?
+                }
+                "--trials" => {
+                    a.trials = it
+                        .next()
+                        .ok_or("missing")?
+                        .parse()
+                        .map_err(|e| format!("{e}"))?
+                }
+                "--runs" => {
+                    a.runs = it
+                        .next()
+                        .ok_or("missing")?
+                        .parse()
+                        .map_err(|e| format!("{e}"))?
+                }
                 "--skip-sync" => a.skip_sync = true,
                 "-h" | "--help" => {
                     println!("see repro_cudarc_teardown.rs header for flags");
@@ -144,11 +173,17 @@ fn build_runtime(args: &Args) -> Result<Runtime, String> {
     );
 
     let ctx = CudaContext::new(0).map_err(|e| format!("CudaContext::new: {e:?}"))?;
-    let copy_stream = ctx.new_stream().map_err(|e| format!("copy_stream: {e:?}"))?;
-    let compute_stream = ctx.new_stream().map_err(|e| format!("compute_stream: {e:?}"))?;
+    let copy_stream = ctx
+        .new_stream()
+        .map_err(|e| format!("copy_stream: {e:?}"))?;
+    let compute_stream = ctx
+        .new_stream()
+        .map_err(|e| format!("compute_stream: {e:?}"))?;
 
     let ptx = compile_ptx(KERNEL_SRC).map_err(|e| format!("nvrtc: {e:?}"))?;
-    let module = ctx.load_module(ptx).map_err(|e| format!("load_module: {e:?}"))?;
+    let module = ctx
+        .load_module(ptx)
+        .map_err(|e| format!("load_module: {e:?}"))?;
     let scale_kernel = module
         .load_function("scale_in_place")
         .map_err(|e| format!("load_function: {e:?}"))?;
@@ -215,7 +250,10 @@ fn build_runtime(args: &Args) -> Result<Runtime, String> {
 
 fn run_workload(rt: &mut Runtime, args: &Args) -> Result<(), String> {
     for trial in 1..=args.trials {
-        eprintln!("[repro] trial {trial}/{}: launching scale_kernel", args.trials);
+        eprintln!(
+            "[repro] trial {trial}/{}: launching scale_kernel",
+            args.trials
+        );
         let n = (args.people * args.mega) as u64;
         let cfg = LaunchConfig::for_num_elems(n as u32);
         unsafe {
@@ -251,7 +289,8 @@ fn run_workload(rt: &mut Runtime, args: &Args) -> Result<(), String> {
         // device, like the real pipeline does each mega-batch.
         for slot in 0..rt.pinned_staging.len() {
             let host = &mut rt.pinned_staging[slot];
-            let slice: &mut [u8] = host.as_mut_slice()
+            let slice: &mut [u8] = host
+                .as_mut_slice()
                 .map_err(|e| format!("pinned as_mut_slice: {e:?}"))?;
             for (i, b) in slice.iter_mut().enumerate().take(1024) {
                 *b = (i & 0xff) as u8;
@@ -277,15 +316,25 @@ fn report_cuda_libs() {
             Some(p) if p.starts_with('/') => p,
             _ => continue,
         };
-        let name = std::path::Path::new(last).file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if name.starts_with("libcuda") || name.starts_with("libcudart")
-            || name.starts_with("libcublas") || name.starts_with("libnvrtc") {
+        let name = std::path::Path::new(last)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        if name.starts_with("libcuda")
+            || name.starts_with("libcudart")
+            || name.starts_with("libcublas")
+            || name.starts_with("libnvrtc")
+        {
             seen.insert(last.to_string());
         }
     }
     eprintln!("[repro] cuda libs loaded:");
     for p in &seen {
-        let tag = if p.contains("/site-packages/nvidia/") { "  <-- pip-wheel" } else { "" };
+        let tag = if p.contains("/site-packages/nvidia/") {
+            "  <-- pip-wheel"
+        } else {
+            ""
+        };
         eprintln!("[repro]   {p}{tag}");
     }
 }

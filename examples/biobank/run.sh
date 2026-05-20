@@ -53,10 +53,9 @@ if [ "$REEXECUTED" -eq 0 ] && git -C "$SCRIPT_DIR" rev-parse --git-dir >/dev/nul
 fi
 
 # --- Install the scorer ------------------------------------------------------
-# Install the latest published gnomon linux-x64 binary release. That's
-# the whole policy. No cargo, no SHA matching, no "refuse stale". If
-# the release lags HEAD by 15-20 min after a push, the run uses the
-# older binary — that's fine.
+# Install the published gnomon linux-x64 binary release for exactly the
+# checkout being run. Using "latest" here can silently benchmark stale scorer
+# code after run.sh pulls a newer commit.
 if [ ! -d "$HOME/gnomon/.git" ]; then
   echo "[run.sh] expected a git checkout at $HOME/gnomon" >&2
   exit 1
@@ -64,25 +63,24 @@ fi
 INSTALL_DIR="$HOME/.local/bin"
 mkdir -p "$INSTALL_DIR" "$HOME/.local/share/gnomon"
 GNOMON_CHECKOUT_SHA="$(git -C "$HOME/gnomon" rev-parse HEAD)"
+GNOMON_RELEASE_TAG="main-$GNOMON_CHECKOUT_SHA"
 GNOMON_RELEASE_JSON="$(curl -sL --retry 5 --retry-delay 2 --connect-timeout 5 --max-time 30 \
-  "https://api.github.com/repos/SauersML/gnomon/releases/latest")"
+  "https://api.github.com/repos/SauersML/gnomon/releases/tags/$GNOMON_RELEASE_TAG")"
 GNOMON_INSTALLED_RELEASE="$(printf '%s' "$GNOMON_RELEASE_JSON" \
   | sed -n 's/^[[:space:]]*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' \
   | head -n 1)"
+if [ "$GNOMON_INSTALLED_RELEASE" != "$GNOMON_RELEASE_TAG" ]; then
+  echo "[run.sh] exact gnomon release is missing: $GNOMON_RELEASE_TAG" >&2
+  echo "[run.sh] checkout is $GNOMON_CHECKOUT_SHA; wait for the release job for that commit, then rerun." >&2
+  exit 1
+fi
 GNOMON_RELEASE_URL="$(printf '%s' "$GNOMON_RELEASE_JSON" \
   | grep -F 'browser_download_url' \
   | grep -F 'gnomon-linux-x64-v3.tar.gz' \
   | cut -d '"' -f 4 \
   | head -n 1)"
 if [ -z "$GNOMON_RELEASE_URL" ]; then
-  GNOMON_RELEASE_URL="$(printf '%s' "$GNOMON_RELEASE_JSON" \
-    | grep -F 'browser_download_url' \
-    | grep -F 'gnomon-linux-x64.tar.gz' \
-    | cut -d '"' -f 4 \
-    | head -n 1)"
-fi
-if [ -z "$GNOMON_RELEASE_URL" ]; then
-  echo "[run.sh] could not find a linux-x64 asset on the latest gnomon release" >&2
+  echo "[run.sh] exact release $GNOMON_RELEASE_TAG does not contain gnomon-linux-x64-v3.tar.gz" >&2
   exit 1
 fi
 GNOMON_INSTALL_MODE="github-release"

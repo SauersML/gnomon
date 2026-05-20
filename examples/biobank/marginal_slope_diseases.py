@@ -147,7 +147,6 @@ def find_plink_prefix() -> Path:
 # particular cache or repository layout.
 PLINK_PREFIX = find_plink_prefix()
 WORKDIR = PLINK_PREFIX.parent
-SEX_CACHE = Path.home() / ".aou_cache" / "sex_terms"
 FITS_DIR = WORKDIR / "biobank_fits"
 NUM_PCS = 3
 DUCHON_CENTERS = 10  # > linear nullspace (d+1=4) in d=3
@@ -218,13 +217,6 @@ DISEASES = {
 
 # --- loaders ---------------------------------------------------------------
 
-def _latest(d: Path, glob: str) -> Path:
-    hits = sorted(d.glob(glob), key=lambda p: p.stat().st_mtime)
-    if not hits:
-        raise FileNotFoundError(f"no match for {d}/{glob}")
-    return hits[-1]
-
-
 def _canonical_id(s: pd.Series) -> pd.Series:
     return s.astype(str).str.strip()
 
@@ -237,7 +229,13 @@ _SEX_MAP = {
 
 
 def load_sex() -> pd.DataFrame:
-    path = _latest(SEX_CACHE, "sex_*.tsv")
+    path = PLINK_PREFIX.with_name(f"{PLINK_PREFIX.name}.sex.tsv")
+    if not path.exists():
+        cmd = [GNOMON_BIN, "terms", "--sex", str(PLINK_PREFIX)]
+        print(f"  sex: running {' '.join(cmd)}")
+        subprocess.run(cmd, check=True)
+    if not path.exists():
+        raise FileNotFoundError(f"gnomon terms did not write expected sex TSV: {path}")
     df = pd.read_csv(path, sep="\t", dtype=str)
     id_col = next(c for c in df.columns if c.lower() in {"research_id", "sample_id", "iid", "person_id", "#iid"})
     sex_col = next(c for c in df.columns if "sex" in c.lower())
@@ -408,54 +406,40 @@ def ensure_scored(pgs_ids: list[str]) -> None:
     missing = [p for p in pgs_ids if _find_sscore_for(p) is None]
     if not missing:
         return
-    # Inherit the parent's environment unchanged. Earlier versions of
-    # this script injected the `nvidia-*-cu12` pip wheel lib directories
-    # at the front of LD_LIBRARY_PATH on the theory that the AoU image
-    # only shipped libcuda + libcudart. That was wrong: the AoU image
-    # carries the full CUDA runtime stack at /usr/local/cuda/lib64, and
-    # shadowing it with the pip wheels at a slightly different patch
-    # version produced heap corruption at the end of the CUDA pipeline
-    # ("double free or corruption (!prev)" at ~100% progress, before
-    # complex-variant resolution, no .sscore written). Direct shell
-    # invocations of the same gnomon binary on the same data never
-    # tripped it because they used the system LD_LIBRARY_PATH unchanged.
-    env = dict(os.environ)
-    # Score one PGS per invocation rather than batching into a single
-    # comma-separated call. Multi-PGS scoring on the AoU bare-metal CUDA
-    # image trips a teardown abort ("double free or corruption (!prev)")
-    # in the cudarc / cuBLAS / libcudart cleanup path *during* the GPU
-    # pipeline -- the abort fires at ~99-100% CUDA progress, before
-    # complex-variant resolution and before any `.sscore` file is
-    # written. The single-PGS invocation does not hit it (verified by
-    # examples/repro_score_sigabrt.sh on the same binary on the same
-    # box, which exits cleanly with the same plink prefix). Each PGS
-    # therefore gets its own subprocess; per-PGS wall time is ~45s.
+    # Score every missing PGS in ONE gnomon invocation by joining the IDs
+    # with commas (gnomon score parses the SCORE_PATH argument as a
+    # comma-separated list of PGS Catalog IDs at score/main.rs:128-139).
+    # Single-call multi-PGS amortizes the ~1 s preparation, the ~7 s
+    # CUDA context init + NVRTC compile, and reuses the cuBLAS handle
+    # across all PGS, instead of paying those costs N times in a
+    # per-PGS subprocess loop.
     #
-    # We still validate by output presence so the cleaner-exit (libc
-    # _exit) builds that abort *after* writing all outputs are also
-    # accepted -- the fix in gnomon main >= 1896221e bypasses the
-    # atexit handlers entirely but until that release is on disk we
-    # need to tolerate a non-zero exit code as long as the file is
-    # there.
-    for pgs_id in missing:
-        print(f"[score] running {GNOMON_BIN} score {pgs_id} {PLINK_PREFIX}")
-        result = subprocess.run(
-            [GNOMON_BIN, "score", pgs_id, str(PLINK_PREFIX)], check=False, env=env,
+    # Earlier revisions of this script split each PGS into its own
+    # subprocess as a workaround for an AoU CUDA teardown abort
+    # ("double free or corruption (!prev)" at ~100% progress). If that
+    # bug resurfaces, this call will fail without writing all outputs
+    # — re-add a per-PGS loop here as a fallback.
+    score_arg = ",".join(missing)
+    env = dict(os.environ)
+    print(f"[score] running {GNOMON_BIN} score {score_arg} {PLINK_PREFIX}")
+    result = subprocess.run(
+        [GNOMON_BIN, "score", score_arg, str(PLINK_PREFIX)], check=False, env=env,
+    )
+    still_missing = [p for p in missing if _find_sscore_for(p) is None]
+    if still_missing:
+        print(
+            f"[score] subprocess returned {result.returncode} and the "
+            f"sscore output(s) for {still_missing} were not written",
+            flush=True,
         )
-        if _find_sscore_for(pgs_id) is None:
-            print(
-                f"[score] subprocess returned {result.returncode} and the "
-                f"expected sscore output for {pgs_id} was not written",
-                flush=True,
-            )
-            raise subprocess.CalledProcessError(result.returncode, result.args)
-        if result.returncode != 0:
-            print(
-                f"[score] subprocess returned {result.returncode} but the "
-                f"`.sscore` for {pgs_id} is on disk; treating as success "
-                f"(known cudarc atexit abort, fixed in gnomon >= 1896221e).",
-                flush=True,
-            )
+        raise subprocess.CalledProcessError(result.returncode, result.args)
+    if result.returncode != 0:
+        print(
+            f"[score] subprocess returned {result.returncode} but every "
+            f"requested `.sscore` is on disk; treating as success "
+            f"(known cudarc atexit abort, fixed in gnomon >= 1896221e).",
+            flush=True,
+        )
 
 
 def load_one_pgs(pgs_id: str) -> pd.DataFrame:
