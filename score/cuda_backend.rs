@@ -164,10 +164,9 @@ impl<'a> Drop for BufferGuard<'a> {
 
 // Field order matters: Rust drops struct fields top-down. We list the
 // "leaf" GPU resources first so they are released before the streams,
-// kernels, blas handle, and context they depend on. The context Arc is
-// listed last (and prefixed with `_`) so it lives until everything else
-// has finished dropping, guaranteeing every cuMemFree / cuEventDestroy /
-// cublasDestroy call still has a valid context to bind to.
+// kernels, and cuBLAS handle they depend on. The streams themselves hold
+// `Arc<CudaContext>` internally, so the context outlives every GPU
+// resource here — no separate context field is needed.
 struct CudaRuntime {
     pinned_staging: Vec<PinnedHostSlice<u8>>,
     pinned_reconciled: Vec<PinnedHostSlice<u32>>,
@@ -183,7 +182,6 @@ struct CudaRuntime {
     copy_stream: Arc<CudaStream>,
     mega_batch_variants: usize,
     gpu_score_chunk_size: usize,
-    _ctx: Arc<CudaContext>,
 }
 
 struct GpuChannels {
@@ -589,8 +587,12 @@ impl CudaRuntime {
         let blas = CudaBlas::new(compute_stream.clone())
             .map_err(|e| format!("Failed to initialize cuBLAS: {e:?}"))?;
 
+        // `ctx` is intentionally not stored: every retained Arc<CudaStream>
+        // already holds a strong reference to it, so the context outlives
+        // each GPU resource owned by the runtime.
+        drop(ctx);
+
         Ok(Self {
-            _ctx: ctx,
             compute_stream,
             copy_stream,
             blas,
