@@ -408,7 +408,6 @@ def ensure_scored(pgs_ids: list[str]) -> None:
     missing = [p for p in pgs_ids if _find_sscore_for(p) is None]
     if not missing:
         return
-    score_arg = ",".join(missing)
     # AoU's CUDA image ships only driver + cudart, so feed gnomon every CUDA
     # runtime shared library shipped by the `nvidia-*-cu12` pip wheels via the
     # score subprocess's LD_LIBRARY_PATH.
@@ -423,34 +422,43 @@ def ensure_scored(pgs_ids: list[str]) -> None:
         **os.environ,
         "LD_LIBRARY_PATH": ":".join([*nv_libs, os.environ.get("LD_LIBRARY_PATH", "")]),
     }
-    print(f"[score] running {GNOMON_BIN} score {score_arg} {PLINK_PREFIX}")
-    print(f"[score] cuda libs: {nv_libs}")
-    # Validate by output presence, not by exit code. gnomon binaries built
-    # before commit 1896221e ("skip atexit handlers via _exit on unix")
-    # finish writing every `.sscore` output successfully and then abort
-    # during the cudarc / cuBLAS / libcudart atexit teardown, returning
-    # SIGABRT to the wrapper even though no scoring work was lost.
-    # install.sh keeps falling back to those binaries while a release
-    # containing the fix hasn't published yet, so check the on-disk
-    # outputs and only re-raise if they're actually missing.
-    result = subprocess.run(
-        [GNOMON_BIN, "score", score_arg, str(PLINK_PREFIX)], check=False, env=env,
-    )
-    still_missing = [p for p in missing if _find_sscore_for(p) is None]
-    if still_missing:
-        print(
-            f"[score] subprocess returned {result.returncode}; missing sscore "
-            f"outputs for: {still_missing}",
-            flush=True,
+    # Score one PGS per invocation rather than batching into a single
+    # comma-separated call. Multi-PGS scoring on the AoU bare-metal CUDA
+    # image trips a teardown abort ("double free or corruption (!prev)")
+    # in the cudarc / cuBLAS / libcudart cleanup path *during* the GPU
+    # pipeline -- the abort fires at ~99-100% CUDA progress, before
+    # complex-variant resolution and before any `.sscore` file is
+    # written. The single-PGS invocation does not hit it (verified by
+    # examples/repro_score_sigabrt.sh on the same binary on the same
+    # box, which exits cleanly with the same plink prefix). Each PGS
+    # therefore gets its own subprocess; per-PGS wall time is ~45s.
+    #
+    # We still validate by output presence so the cleaner-exit (libc
+    # _exit) builds that abort *after* writing all outputs are also
+    # accepted -- the fix in gnomon main >= 1896221e bypasses the
+    # atexit handlers entirely but until that release is on disk we
+    # need to tolerate a non-zero exit code as long as the file is
+    # there.
+    for pgs_id in missing:
+        print(f"[score] running {GNOMON_BIN} score {pgs_id} {PLINK_PREFIX}")
+        print(f"[score] cuda libs: {nv_libs}")
+        result = subprocess.run(
+            [GNOMON_BIN, "score", pgs_id, str(PLINK_PREFIX)], check=False, env=env,
         )
-        raise subprocess.CalledProcessError(result.returncode, result.args)
-    if result.returncode != 0:
-        print(
-            f"[score] subprocess returned {result.returncode} but every "
-            f"expected `.sscore` is present for {missing}; treating as "
-            "success (known cudarc atexit abort, fixed in gnomon >= 1896221e).",
-            flush=True,
-        )
+        if _find_sscore_for(pgs_id) is None:
+            print(
+                f"[score] subprocess returned {result.returncode} and the "
+                f"expected sscore output for {pgs_id} was not written",
+                flush=True,
+            )
+            raise subprocess.CalledProcessError(result.returncode, result.args)
+        if result.returncode != 0:
+            print(
+                f"[score] subprocess returned {result.returncode} but the "
+                f"`.sscore` for {pgs_id} is on disk; treating as success "
+                f"(known cudarc atexit abort, fixed in gnomon >= 1896221e).",
+                flush=True,
+            )
 
 
 def load_one_pgs(pgs_id: str) -> pd.DataFrame:
