@@ -360,11 +360,11 @@ trap 'failure_diagnostics $?' ERR
   cache_du "tmpdir" "$TMPDIR"
   echo
   echo "--- fit configuration (from script) ---"
-  grep -E '^(NUM_PCS|DUCHON_CENTERS|TRAIN_FRACTION|RNG_SEED|MAX_LOSO_CARE_SITES|MIN_LOSO_|BOOTSTRAP_) *=' \
+  grep -E '^(NUM_PCS|DUCHON_CENTERS|TRAIN_FRACTION|RNG_SEED|MAX_LOSO_CARE_SITES|MIN_LOSO_|BOOTSTRAP_|TOP_N_DISEASES) *=' \
       "$SCRIPT_DIR/marginal_slope_diseases.py"
   echo
-  echo "--- diseases ---"
-  awk '/^DISEASES = \{/,/^\}/' "$SCRIPT_DIR/marginal_slope_diseases.py"
+  echo "--- snomed -> pgs candidate pool (runtime set = top-N most prevalent OHDSI-canonical intersection) ---"
+  awk '/^SNOMED_PGS_MAP[: ]/,/^\}/' "$SCRIPT_DIR/marginal_slope_diseases.py"
   echo
   echo "--- env ---"
   echo "WORKSPACE_CDR:    ${WORKSPACE_CDR:-<unset>}"
@@ -410,8 +410,7 @@ require_run_state_capacity \
 uv run \
     --no-project \
     --python 3.11 \
-    --upgrade-package gamfit \
-    --with gamfit \
+    --with 'gamfit==0.1.90' \
     --with numpy \
     --with pandas \
     --with pyarrow \

@@ -19,6 +19,7 @@ integrated-Brier pseudo-R^2 on held-out rows.
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import os
@@ -26,6 +27,8 @@ import re
 import struct
 import subprocess
 import sys
+import urllib.request
+import zipfile
 import faulthandler
 from collections import deque
 from dataclasses import dataclass
@@ -45,6 +48,7 @@ faulthandler.enable(file=sys.stderr, all_threads=True)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 HOME = Path.home()
+REQUIRED_GAMFIT_VERSION = (0, 1, 90)
 
 _CUDA_SONAME_FAMILIES = {
     "libcuda",
@@ -120,6 +124,28 @@ def print_gamfit_diagnostics(gamfit_module) -> None:
     for key in ("available", "module", "crate", "engine_crate", "python_module", "version"):
         if key in info:
             print(f"  build_info.{key}: {info[key]}")
+
+
+def _parse_version_triplet(version: str) -> tuple[int, int, int]:
+    head = version.split("+", 1)[0].split("-", 1)[0]
+    values: list[int] = []
+    for part in head.split(".")[:3]:
+        match = re.match(r"\d+", part)
+        values.append(int(match.group(0)) if match else 0)
+    while len(values) < 3:
+        values.append(0)
+    return values[0], values[1], values[2]
+
+
+def require_fixed_gamfit(gamfit_module) -> None:
+    version = getattr(gamfit_module, "__version__", "0.0.0")
+    if _parse_version_triplet(version) < REQUIRED_GAMFIT_VERSION:
+        required = ".".join(str(part) for part in REQUIRED_GAMFIT_VERSION)
+        raise RuntimeError(
+            f"biobank survival marginal-slope requires gamfit >= {required}; found {version}. "
+            "Older wheels route the rho-only outer solve through first-order BFGS and fail "
+            "with a large REML/LAML gradient."
+        )
 
 
 def _dedup_paths(paths: list[Path]) -> list[Path]:
@@ -263,25 +289,31 @@ ADMIXTURE_Q_URI = (
 MICROARRAY_PLINK_PREFIX_URI = f"{CDR_STORAGE_PATH}/microarray/plink/arrays"
 ANCESTRY_PREDS_CACHE = WORKDIR / "ancestry_preds.tsv"
 
-DISEASES = {
-    "copd": {
-        "snomed_name": "Chronic obstructive lung disease",
-        # Jung et al. metaPRS for J44. Not trained in AoU.
-        "pgs": "PGS004536",
-    },
-    "hypertension": {
-        # OMOP standard SNOMED concept_name for 38341003 in the AoU CDR.
-        "snomed_name": "Hypertensive disorder",
-        # Privé et al. 2022 sparse hypertension PRS. Not trained in AoU.
-        "pgs": "PGS001320",
-    },
-    "obesity": {
-        "snomed_name": "Obesity",
-        # Kim et al. 2026 O_MetPRS_EUR; LDpred2 over multi-ancestry GWAS of 20
-        # metabolic traits. AoU appears only as an evaluation cohort, not training.
-        "pgs": "PGS005331",
-    },
+# Curated SNOMED -> PGS map, keyed by SNOMED concept_code. The runtime
+# disease set is built by intersecting this map with the OHDSI Phenotype
+# Library's canonical Reference disease cohorts and then ranking the
+# intersection by case prevalence (descendant expansion via
+# `concept_ancestor`) in the active CDR; the top TOP_N_DISEASES survive.
+# Extending this map is the only thing needed to grow the runtime set.
+SNOMED_PGS_MAP: dict[str, dict[str, str]] = {
+    # COPD -- Jung et al. metaPRS for J44. Not trained in AoU.
+    "13645005": {"slug": "copd", "pgs": "PGS004536"},
+    # Hypertension -- Privé et al. 2022 sparse hypertension PRS. Not trained in AoU.
+    "38341003": {"slug": "hypertension", "pgs": "PGS001320"},
+    # Obesity -- Kim et al. 2026 O_MetPRS_EUR; LDpred2 over multi-ancestry GWAS.
+    "414916001": {"slug": "obesity", "pgs": "PGS005331"},
 }
+
+TOP_N_DISEASES = 15
+
+# OHDSI Phenotype Library: canonical Reference disease cohorts.
+SNOMED_DISEASE_CODE = "64572001"  # SNOMED root for 'Disease (disorder)'
+PL_ZIP_URL = "https://github.com/OHDSI/PhenotypeLibrary/archive/refs/heads/main.zip"
+PL_CACHE_DIR = (
+    Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache")))
+    / "ohdsi_phenotype_library"
+)
+PL_LOCAL_DIR = PL_CACHE_DIR / "PhenotypeLibrary-main"
 
 
 # --- loaders ---------------------------------------------------------------
@@ -536,30 +568,233 @@ def load_one_pgs(pgs_id: str) -> pd.DataFrame:
     return df
 
 
-# --- cases -----------------------------------------------------------------
+# --- OHDSI canonical disease extraction -------------------------------------
+# Pulls the OHDSI Phenotype Library and filters cohorts to canonical
+# disease phenotypes:
+#   (a) isReferenceCohort = 1
+#   (b) primary criterion is a ConditionOccurrence
+#   (c) the cohort's concept set has exactly one include and zero excludes
+#   (d) the include root descends from SNOMED 'Disease (disorder)'
+# These four filters together yield ~235-240 single-SNOMED-root disease
+# cohorts per OHDSI release. We then intersect with SNOMED_PGS_MAP and
+# rank the intersection by case prevalence in the active CDR.
 
-def lookup_snomed_concept(client: bigquery.Client, cdr: str, name: str) -> int:
-    """Return the OMOP concept_id for a standard SNOMED Condition concept."""
+def ensure_phenotype_library() -> Path:
+    """Download and extract OHDSI PhenotypeLibrary to PL_CACHE_DIR if missing."""
+    cohorts_dir = PL_LOCAL_DIR / "inst" / "cohorts"
+    if cohorts_dir.exists():
+        return PL_LOCAL_DIR
+    PL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"  ohdsi: downloading PhenotypeLibrary from {PL_ZIP_URL}")
+    with urllib.request.urlopen(PL_ZIP_URL) as resp:
+        data = resp.read()
+    print(f"  ohdsi: {len(data)/1e6:.1f} MB; extracting to {PL_CACHE_DIR}")
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        zf.extractall(PL_CACHE_DIR)
+    if not cohorts_dir.exists():
+        raise RuntimeError(f"OHDSI PhenotypeLibrary extraction failed: missing {cohorts_dir}")
+    return PL_LOCAL_DIR
+
+
+def _load_cohort_json(path: Path) -> dict:
+    raw = path.read_bytes()
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except UnicodeDecodeError:
+        return json.loads(raw.decode("latin-1"))
+
+
+def extract_ohdsi_canonical_disease_concepts(client: bigquery.Client, cdr: str) -> set[int]:
+    """Return the OMOP concept_id set of canonical OHDSI disease phenotype roots."""
+    pl_root = ensure_phenotype_library()
+    json_dir = pl_root / "inst" / "cohorts"
+    cohorts_csv = pl_root / "inst" / "Cohorts.csv"
+
+    meta = pd.read_csv(cohorts_csv)
+    meta["cohortId"] = meta["cohortId"].astype(int)
+    meta["isReferenceCohort"] = meta["isReferenceCohort"].fillna(0).astype(int)
+    ref_ids = sorted(meta.loc[meta["isReferenceCohort"] == 1, "cohortId"].tolist())
+    print(f"  ohdsi: cohorts={len(meta)} reference={len(ref_ids)}")
+
+    roots: set[int] = set()
+    skipped = {"non_condition_primary": 0, "multi_include_or_exclude": 0, "parse": 0}
+    for cid in ref_ids:
+        path = json_dir / f"{cid}.json"
+        try:
+            j = _load_cohort_json(path)
+        except Exception:
+            skipped["parse"] += 1
+            continue
+        codeset_id = None
+        for crit in j.get("PrimaryCriteria", {}).get("CriteriaList", []):
+            if "ConditionOccurrence" in crit:
+                codeset_id = crit["ConditionOccurrence"].get("CodesetId")
+                break
+        if codeset_id is None:
+            skipped["non_condition_primary"] += 1
+            continue
+        cs = next((c for c in j.get("ConceptSets", []) if c.get("id") == codeset_id), None)
+        if cs is None:
+            skipped["parse"] += 1
+            continue
+        items = cs.get("expression", {}).get("items", [])
+        incs = [it for it in items if not it.get("isExcluded")]
+        excs = [it for it in items if it.get("isExcluded")]
+        if len(incs) != 1 or len(excs) != 0:
+            skipped["multi_include_or_exclude"] += 1
+            continue
+        roots.add(int(incs[0]["concept"]["CONCEPT_ID"]))
+    print(f"  ohdsi: single-root condition cohorts={len(roots)} skipped={skipped}")
+
+    # Filter (d): include-root must descend from SNOMED 'Disease (disorder)'.
+    disease_root = lookup_snomed_code(client, cdr, SNOMED_DISEASE_CODE)
+    roots_arr = sorted(roots)
+    df = client.query(
+        f"""
+        WITH roots AS (SELECT concept_id FROM UNNEST(@roots) AS concept_id),
+             dis   AS (SELECT descendant_concept_id AS concept_id
+                       FROM `{cdr}.concept_ancestor`
+                       WHERE ancestor_concept_id = @disease_root)
+        SELECT r.concept_id, dis.concept_id IS NOT NULL AS is_disease
+        FROM roots r LEFT JOIN dis USING (concept_id)
+        """,
+        job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ArrayQueryParameter("roots", "INT64", roots_arr),
+            bigquery.ScalarQueryParameter("disease_root", "INT64", disease_root),
+        ]),
+    ).to_dataframe()
+    disease_roots = set(df.loc[df["is_disease"], "concept_id"].astype(int).tolist())
+    print(
+        f"  ohdsi: canonical disease phenotypes={len(disease_roots)} "
+        f"(dropped {len(roots) - len(disease_roots)} symptom-rooted)"
+    )
+    return disease_roots
+
+
+def lookup_snomed_code(client: bigquery.Client, cdr: str, code: str) -> int:
+    """Return the OMOP concept_id for a SNOMED standard concept by its concept_code."""
     sql = f"""
     SELECT concept_id
     FROM `{cdr}.concept`
-    WHERE vocabulary_id = 'SNOMED'
-      AND standard_concept = 'S'
-      AND domain_id = 'Condition'
-      AND LOWER(concept_name) = LOWER(@name)
+    WHERE vocabulary_id = 'SNOMED' AND standard_concept = 'S'
+      AND concept_code = @code
     ORDER BY concept_id
     LIMIT 1
     """
-    job = client.query(
+    rows = list(client.query(
         sql,
         job_config=bigquery.QueryJobConfig(query_parameters=[
-            bigquery.ScalarQueryParameter("name", "STRING", name),
+            bigquery.ScalarQueryParameter("code", "STRING", code),
         ]),
-    )
-    rows = list(job.result())
+    ).result())
     if not rows:
-        raise ValueError(f"no standard SNOMED Condition concept named {name!r}")
+        raise ValueError(f"no standard SNOMED concept with code {code!r}")
     return int(rows[0]["concept_id"])
+
+
+def resolve_snomed_codes(client: bigquery.Client, cdr: str, codes: list[str]) -> pd.DataFrame:
+    """Resolve SNOMED concept_codes to (concept_id, concept_name)."""
+    df = client.query(
+        f"""
+        SELECT concept_code, concept_id, concept_name
+        FROM `{cdr}.concept`
+        WHERE vocabulary_id = 'SNOMED' AND standard_concept = 'S'
+          AND concept_code IN UNNEST(@codes)
+        """,
+        job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ArrayQueryParameter("codes", "STRING", codes),
+        ]),
+    ).to_dataframe()
+    df["concept_id"] = df["concept_id"].astype(int)
+    return df
+
+
+def rank_disease_concepts_by_prevalence(
+    client: bigquery.Client, cdr: str, concept_ids: list[int]
+) -> pd.DataFrame:
+    """Distinct case count per ancestor concept_id, descending."""
+    if not concept_ids:
+        return pd.DataFrame(columns=["concept_id", "case_count"])
+    df = client.query(
+        f"""
+        SELECT ca.ancestor_concept_id AS concept_id,
+               COUNT(DISTINCT co.person_id) AS case_count
+        FROM `{cdr}.condition_occurrence` AS co
+        JOIN `{cdr}.concept_ancestor` AS ca
+          ON ca.descendant_concept_id = co.condition_concept_id
+        WHERE ca.ancestor_concept_id IN UNNEST(@ancestors)
+        GROUP BY ca.ancestor_concept_id
+        """,
+        job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ArrayQueryParameter("ancestors", "INT64", concept_ids),
+        ]),
+    ).to_dataframe()
+    df["concept_id"] = df["concept_id"].astype(int)
+    df["case_count"] = df["case_count"].astype(int)
+    return df.sort_values("case_count", ascending=False).reset_index(drop=True)
+
+
+def select_runtime_diseases(client: bigquery.Client, cdr: str) -> dict[str, dict]:
+    """Build the per-run diseases dict by intersecting OHDSI canonical disease
+    phenotypes with SNOMED_PGS_MAP and taking the top TOP_N_DISEASES by case
+    prevalence in the active CDR.
+    """
+    print("\n=== DISEASE SELECTION ===")
+    print(f"  snomed_pgs_map_size={len(SNOMED_PGS_MAP)}  top_n={TOP_N_DISEASES}")
+    mapped_codes = sorted(SNOMED_PGS_MAP.keys())
+    resolved = resolve_snomed_codes(client, cdr, mapped_codes)
+    resolved_codes = set(resolved["concept_code"].astype(str))
+    missing = [c for c in mapped_codes if c not in resolved_codes]
+    if missing:
+        raise ValueError(
+            f"SNOMED codes in SNOMED_PGS_MAP not resolvable in {cdr}.concept: {missing}"
+        )
+    code_to_id = dict(zip(resolved["concept_code"].astype(str), resolved["concept_id"]))
+    code_to_name = dict(zip(resolved["concept_code"].astype(str), resolved["concept_name"]))
+    print(f"  resolved {len(code_to_id)} SNOMED code(s) to OMOP concept_ids")
+
+    canonical = extract_ohdsi_canonical_disease_concepts(client, cdr)
+
+    mapped_ids = {int(code_to_id[c]): c for c in mapped_codes}
+    survivors = {cid: code for cid, code in mapped_ids.items() if cid in canonical}
+    dropped = [
+        (code, code_to_name[code]) for cid, code in mapped_ids.items() if cid not in canonical
+    ]
+    print(f"  mapped ∩ OHDSI-canonical: {len(survivors)}/{len(mapped_ids)}")
+    for code, name in dropped:
+        print(f"    dropped (not OHDSI-canonical disease): {code} {name!r}")
+
+    ranked = rank_disease_concepts_by_prevalence(client, cdr, list(survivors.keys()))
+    counts = dict(zip(ranked["concept_id"], ranked["case_count"]))
+    chosen_concept_ids: list[int] = []
+    for cid in ranked["concept_id"].tolist():
+        if cid in survivors:
+            chosen_concept_ids.append(int(cid))
+        if len(chosen_concept_ids) >= TOP_N_DISEASES:
+            break
+
+    diseases: dict[str, dict] = {}
+    print(f"  selected top-{len(chosen_concept_ids)} by prevalence:")
+    for cid in chosen_concept_ids:
+        code = survivors[cid]
+        cfg = SNOMED_PGS_MAP[code]
+        slug = cfg["slug"]
+        diseases[slug] = {
+            "snomed_code": code,
+            "concept_id": int(cid),
+            "snomed_name": code_to_name[code],
+            "pgs": cfg["pgs"],
+            "case_count": int(counts.get(cid, 0)),
+        }
+        print(
+            f"    {slug:<24}  concept_id={cid:>8}  cases={counts.get(cid, 0):>9,}  "
+            f"pgs={cfg['pgs']}  ({code_to_name[code]})"
+        )
+    print("=== /DISEASE SELECTION ===\n")
+    return diseases
+
+
+# --- cases -----------------------------------------------------------------
 
 
 def fetch_cases(client: bigquery.Client, cdr: str, ancestor_id: int) -> pd.DataFrame:
@@ -2355,6 +2590,7 @@ def main() -> None:
     import gamfit
     print(f"gamfit version: {gamfit.__version__}")
     print_gamfit_diagnostics(gamfit)
+    require_fixed_gamfit(gamfit)
     # The real "did the previous fit survive?" cache is gamfit's persistent
     # warm-start store, not the .gamfit files in FITS_DIR. It auto-resumes
     # any fit on identical (data, version) keys; reruns are typically a
@@ -2368,10 +2604,20 @@ def main() -> None:
         f"({'present' if warm_cache_root.exists() else 'will be created on first fit'})"
     )
     print(f"artifact cache:   {FITS_DIR}")
-    diseases = {k: v for k, v in DISEASES.items() if PGS_ID_PATTERN.match(v["pgs"])}
-    print(f"diseases with real PGS IDs: {list(diseases)}")
     active_axes = list(LOSO_AXES)
     print(f"loso_axes: {active_axes}")
+
+    cdr = os.environ["WORKSPACE_CDR"]
+    client = bigquery.Client()
+
+    diseases = select_runtime_diseases(client, cdr)
+    diseases = {k: v for k, v in diseases.items() if PGS_ID_PATTERN.match(v["pgs"])}
+    if not diseases:
+        raise SystemExit(
+            "no diseases survived OHDSI canonical ∩ SNOMED_PGS_MAP — extend "
+            "SNOMED_PGS_MAP or verify OHDSI extraction."
+        )
+    print(f"diseases with real PGS IDs: {list(diseases)}")
 
     ensure_scored([cfg["pgs"] for cfg in diseases.values()])
 
@@ -2380,9 +2626,6 @@ def main() -> None:
     sex = load_sex()
     base = pcs.merge(sex, on="person_id")
     print(f"base: n={len(base):,}")
-
-    cdr = os.environ["WORKSPACE_CDR"]
-    client = bigquery.Client()
 
     print("loading person times (birth + observation period) ...")
     times = fetch_person_times(client, cdr)
@@ -2467,7 +2710,7 @@ def main() -> None:
         print(f"\n=== {name.upper()} ===")
         pgs_df = load_one_pgs(cfg["pgs"])
         df_full = base.merge(pgs_df, on="person_id")
-        ancestor = lookup_snomed_concept(client, cdr, cfg["snomed_name"])
+        ancestor = int(cfg["concept_id"])
         case_dates = fetch_cases(client, cdr, ancestor)
         df_full = df_full.merge(case_dates, on="person_id", how="left")
         df_full["event"] = df_full["event_date"].notna().astype(int)
