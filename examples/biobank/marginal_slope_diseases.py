@@ -45,6 +45,14 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 HOME = Path.home()
 
 
+def user_cache_root() -> Path:
+    """Return the cache root used by Rust's `dirs::cache_dir()` on Linux."""
+    xdg_cache_home = os.environ.get("XDG_CACHE_HOME")
+    if xdg_cache_home:
+        return Path(xdg_cache_home).expanduser()
+    return HOME / ".cache"
+
+
 def _dedup_paths(paths: list[Path]) -> list[Path]:
     out: list[Path] = []
     seen: set[Path] = set()
@@ -824,7 +832,7 @@ def fit_marginal_slope(train_df: pd.DataFrame, num_pcs: int):  # -> gamfit.Model
     each person's age at AoU observation start.
 
     Re-running this on identical training data is near-instant thanks to
-    gamfit's persistent warm-start cache at `~/.cache/gam/warm/v1/`, which
+    gamfit's persistent warm-start cache at `XDG_CACHE_HOME/gam/warm/v1/`, which
     auto-resumes the outer (rho) and inner (beta) iterates from the prior
     fit. The cache is keyed on (gamfit version, n_rows, n_cols, likelihood,
     link, y, weights, ...), so the only refits are: first fit on this data,
@@ -1840,7 +1848,7 @@ def evaluate_model_pair(
     train, test, pgs_mean, pgs_std = prepare_scores(train, test, pc_cols, pgs_id)
 
     # Fit. Resume is handled transparently by gamfit's persistent warm-start
-    # cache at `~/.cache/gam/warm/v1/`: on identical (training data, gamfit
+    # cache at `XDG_CACHE_HOME/gam/warm/v1/`: on identical (training data, gamfit
     # version) the outer (rho) and inner (beta) iterates from the prior fit
     # are loaded and PIRLS converges in 1-2 cycles. We don't try to manage
     # resume ourselves through `.gamfit` files — those are for artifact
@@ -2236,7 +2244,7 @@ def main() -> None:
     # artifact persistence (sharing the fitted model out-of-process) — they
     # need gamfit >= 0.1.70 to roundtrip survival-marginal-slope correctly
     # (the 0.1.69 pyffi save path omits survival_time_* metadata).
-    warm_cache_root = Path.home() / ".cache" / "gam" / "warm" / "v1"
+    warm_cache_root = user_cache_root() / "gam" / "warm" / "v1"
     print(
         f"warm-start cache: {warm_cache_root} "
         f"({'present' if warm_cache_root.exists() else 'will be created on first fit'})"
