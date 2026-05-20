@@ -5,8 +5,6 @@
 #     "gamfit",
 #     "numpy",
 #     "pandas",
-#     "scipy",
-#     "scikit-learn",
 # ]
 # ///
 """Local sanity check for the biobank Bernoulli marginal-slope fit — no
@@ -30,8 +28,7 @@ from __future__ import annotations
 import gamfit
 import numpy as np
 import pandas as pd
-from scipy.stats import norm
-from sklearn.metrics import roc_auc_score
+from statistics import NormalDist
 
 NUM_PCS = 3
 DUCHON_CENTERS = 12  # > linear nullspace (d+1=4) in d=3
@@ -47,6 +44,8 @@ SCENARIOS = {
     "copd-like":          {"prevalence": 0.06, "pgs_effect": 0.30},
     "hypertension-like":  {"prevalence": 0.45, "pgs_effect": 0.20},
 }
+
+STANDARD_NORMAL = NormalDist()
 
 # Rough All-of-Us-like ancestry composition for the four "EUR/AFR/AMR/EAS" buckets.
 ANCESTRY_FRACTIONS = np.array([0.70, 0.15, 0.10, 0.05])
@@ -153,21 +152,40 @@ def metrics(y: np.ndarray, p: np.ndarray, K: float) -> dict[str, float]:
     n = len(y)
     cox_snell = 1.0 - np.exp(2 * (ll_null - ll_full) / n)
     nagelkerke = cox_snell / (1.0 - np.exp(2 * ll_null / n))
-    z = float(norm.pdf(norm.ppf(K)))
+    z = float(STANDARD_NORMAL.pdf(STANDARD_NORMAL.inv_cdf(K)))
     liability_r2 = nagelkerke * K**2 * (1 - K) ** 2 / (z**2 * P * (1 - P))
     return {
         "n": n,
         "cases": int(y.sum()),
         "P": P,
-        "auroc": float(roc_auc_score(y, p)),
+        "auroc": auroc(y, p),
         "nagelkerke_r2": float(nagelkerke),
         "liability_r2": float(liability_r2),
     }
 
 
+def auroc(y: np.ndarray, score: np.ndarray) -> float:
+    y = np.asarray(y, dtype=bool)
+    score = np.asarray(score, dtype=float)
+    order = np.argsort(score, kind="mergesort")
+    ranks = np.empty(len(score), dtype=float)
+    start = 0
+    while start < len(score):
+        end = start + 1
+        while end < len(score) and score[order[end]] == score[order[start]]:
+            end += 1
+        ranks[order[start:end]] = 0.5 * (start + 1 + end)
+        start = end
+    n_pos = int(y.sum())
+    n_neg = int((~y).sum())
+    if n_pos == 0 or n_neg == 0:
+        raise ValueError("AUROC needs at least one case and one control")
+    rank_sum_pos = float(ranks[y].sum())
+    return float((rank_sum_pos - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg))
+
+
 def main() -> None:
     print(f"gamfit version: {gamfit.__version__}")
-    print(f"gamfit build_info: {gamfit.build_info()}")
     rng = np.random.default_rng(RNG_SEED)
     for name, cfg in SCENARIOS.items():
         print(f"\n=== {name.upper()} (synthetic) ===")

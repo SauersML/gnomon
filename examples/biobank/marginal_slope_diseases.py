@@ -9,11 +9,12 @@ For each disease the script:
   3. Fits `Surv(entry_age, exit_age, event) ~ duchon(PC1..PC10) + sex`
      with the hard-coded PGS feeding the marginal-slope latent z, and the
      same joint anisotropic Duchon smooth on the log-slope channel.
-  4. Compares against a Z_norm2 + Cox PH baseline on the same split.
+  4. Compares against Z_norm2 and raw-PRS+PC Cox PH baselines on the same split.
   5. Runs leave-one-group-out OOD refits by care site, Census region, and
      AoU inferred genetic ancestry category.
 
-Reported per disease: train/test Harrell's C and OOD held-out-group C.
+Reported per disease: train/test survival C with 95% confidence intervals
+and OOD held-out-group C.
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ import sys
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
+from statistics import NormalDist
 
 import numpy as np
 import pandas as pd
@@ -164,7 +166,7 @@ LOSO_AXIS_TO_COLUMN = {
 }
 GNOMON_BIN = os.environ.get("GNOMON_BIN", "gnomon")
 PGS_ID_PATTERN = re.compile(r"^PGS\d{6}$")
-NORMAL_975 = 1.959963984540054
+Z_975 = NormalDist().inv_cdf(0.975)
 
 # AoU controlled CDR layout (per the "Controlled CDR Directory" doc and "How
 # the All of Us Genomic data are organized"):
@@ -884,8 +886,8 @@ def harrell_c_stats(exit_: np.ndarray, event: np.ndarray, risk: np.ndarray) -> C
     residual = num_per_sorted - concordance * den_per_sorted
     influence_sorted = n * residual / comparable_pairs
     se = float(math.sqrt(np.sum(influence_sorted**2) / (n * max(n - 1, 1))))
-    ci_low = max(0.0, concordance - NORMAL_975 * se)
-    ci_high = min(1.0, concordance + NORMAL_975 * se)
+    ci_low = max(0.0, concordance - Z_975 * se)
+    ci_high = min(1.0, concordance + Z_975 * se)
 
     influence = np.empty(n, dtype=np.float64)
     influence[order] = influence_sorted
@@ -912,8 +914,8 @@ def paired_delta_ci(left: CIndexStats, right: CIndexStats) -> tuple[float, float
     return (
         float(delta),
         se,
-        float(delta - NORMAL_975 * se),
-        float(delta + NORMAL_975 * se),
+        float(delta - Z_975 * se),
+        float(delta + Z_975 * se),
     )
 
 
@@ -946,22 +948,7 @@ def survival_model_columns(num_pcs: int) -> list[str]:
     ]
 
 
-def fit_marginal_slope(train_df: pd.DataFrame, num_pcs: int):  # -> gamfit.Model
-    """Survival marginal-slope GAM with joint Duchon over PCs in both the
-    baseline hazard surface and the log-slope (log-HR) channel; sex linear;
-    prs_z is the latent score (z_column) so its hazard ratio varies in PC space.
-
-    Age-as-time-scale: `Surv(entry_age, exit_age, event)` is left-truncated at
-    each person's age at AoU observation start.
-
-    Re-running this on identical training data is near-instant thanks to
-    gamfit's persistent warm-start cache at `~/.cache/gam/warm/v1/`, which
-    auto-resumes the outer (rho) and inner (beta) iterates from the prior
-    fit. The cache is keyed on (gamfit version, n_rows, n_cols, likelihood,
-    link, y, weights, ...), so the only refits are: first fit on this data,
-    or first fit after a gamfit version bump.
-    """
-    import gamfit  # lazy: lets the linear baseline import this module without dragging gamfit in
+def pc_duchon_term(num_pcs: int) -> str:
     pcs = ", ".join(f"PC{i+1}" for i in range(num_pcs))
     # Pure isotropic scale-free Duchon over the leading PCs. Both
     # `length_scale` and `scale_dims` are omitted on purpose:
@@ -984,7 +971,26 @@ def fit_marginal_slope(train_df: pd.DataFrame, num_pcs: int):  # -> gamfit.Model
     # `resolve_duchon_orders` returns (Linear, s=1) -- the CPD gate
     # `2s < d` is satisfied without escalation, so the polynomial nullspace
     # stays at d+1 = 4 cols, well below DUCHON_CENTERS.
-    duchon = f"duchon({pcs}, centers={DUCHON_CENTERS}, order=1)"
+    return f"duchon({pcs}, centers={DUCHON_CENTERS}, order=1)"
+
+
+def fit_marginal_slope(train_df: pd.DataFrame, num_pcs: int):  # -> gamfit.Model
+    """Survival marginal-slope GAM with joint Duchon over PCs in both the
+    baseline hazard surface and the log-slope (log-HR) channel; sex linear;
+    prs_z is the latent score (z_column) so its hazard ratio varies in PC space.
+
+    Age-as-time-scale: `Surv(entry_age, exit_age, event)` is left-truncated at
+    each person's age at AoU observation start.
+
+    Re-running this on identical training data is near-instant thanks to
+    gamfit's persistent warm-start cache at `~/.cache/gam/warm/v1/`, which
+    auto-resumes the outer (rho) and inner (beta) iterates from the prior
+    fit. The cache is keyed on (gamfit version, n_rows, n_cols, likelihood,
+    link, y, weights, ...), so the only refits are: first fit on this data,
+    or first fit after a gamfit version bump.
+    """
+    import gamfit  # lazy: lets the linear baseline import this module without dragging gamfit in
+    duchon = pc_duchon_term(num_pcs)
     formula = f"Surv(entry_age, exit_age, event) ~ {duchon} + sex"
     cols = survival_model_columns(num_pcs)
     print(f"  fit_spec: family=survival marginal-slope")
@@ -1099,6 +1105,48 @@ def fit_baseline_cox(
             f"names length {len(names)} != coef length {len(result.params)}"
         )
     return {n: float(p) for n, p in zip(names, result.params)}
+
+
+def _standardize_columns(
+    train: pd.DataFrame,
+    test: pd.DataFrame,
+    cols: list[str],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    train = train.copy()
+    test = test.copy()
+    for col in cols:
+        mean = float(train[col].mean())
+        std = float(train[col].std(ddof=0))
+        if not np.isfinite(std) or std <= 0:
+            raise ValueError(f"training column {col!r} has zero or invalid variance")
+        out_col = f"{col}_z"
+        train[out_col] = (train[col] - mean) / std
+        test[out_col] = (test[col] - mean) / std
+    return train, test
+
+
+def fit_logit_binary(
+    y: np.ndarray,
+    X: np.ndarray,
+    names: list[str],
+) -> dict[str, object]:
+    import statsmodels.api as sm  # lazy
+
+    X = np.asarray(X, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    X_const = sm.add_constant(X, has_constant="add")
+    result = sm.GLM(y, X_const, family=sm.families.Binomial()).fit(maxiter=100)
+    coefs = {"const": float(result.params[0])}
+    coefs.update({n: float(p) for n, p in zip(names, result.params[1:])})
+    return {"result": result, "names": names, "coefs": coefs}
+
+
+def predict_logit_binary(fit: dict[str, object], X: np.ndarray) -> np.ndarray:
+    import statsmodels.api as sm  # lazy
+
+    result = fit["result"]
+    X_const = sm.add_constant(np.asarray(X, dtype=np.float64), has_constant="add")
+    return np.asarray(result.predict(X_const), dtype=float)
 
 
 def gam_risk(
@@ -1530,7 +1578,6 @@ def main() -> None:
         raise SystemExit("marginal_slope_diseases.py takes no arguments")
     import gamfit
     print(f"gamfit version: {gamfit.__version__}")
-    print(f"gamfit build_info: {gamfit.build_info()}")
     # The real "did the previous fit survive?" cache is gamfit's persistent
     # warm-start store, not the .gamfit files in FITS_DIR. It auto-resumes
     # any fit on identical (data, version) keys; reruns are typically a
