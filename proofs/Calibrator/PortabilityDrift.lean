@@ -678,11 +678,13 @@ theorem source_erm_is_ld_specific_of_normal_eq_mismatch
     (sigmaObsSource sigmaObsTarget : Matrix (Fin p) (Fin p) Real)
     (crossSource crossTarget : Fin p -> Real)
     (wSource : Fin p -> Real)
-    (_hSource : sigmaObsSource.mulVec wSource = crossSource)
-    (hMismatch : sigmaObsTarget.mulVec wSource ≠ crossTarget) :
+    (hSource : sigmaObsSource.mulVec wSource = crossSource)
+    (hMismatch : sigmaObsSource.mulVec wSource - sigmaObsTarget.mulVec wSource ≠ crossSource - crossTarget) :
     ¬ sigmaObsTarget.mulVec wSource = crossTarget := by
   intro hContra
-  exact absurd hContra hMismatch
+  have h1 : sigmaObsSource.mulVec wSource - sigmaObsTarget.mulVec wSource = crossSource - crossTarget := by
+    rw [hSource, hContra]
+  exact hMismatch h1
 
 /-- If one coefficient vector solves source normal equations and another solves target normal equations,
 and no single vector can satisfy both systems, then source ERM and target ERM must differ. -/
@@ -693,13 +695,14 @@ theorem source_target_erm_differ_of_ld_system_conflict
     (wSource wTarget : Fin p -> Real)
     (hSource : sigmaObsSource.mulVec wSource = crossSource)
     (hTarget : sigmaObsTarget.mulVec wTarget = crossTarget)
-    (hConflict :
-      ∀ w : Fin p -> Real, sigmaObsSource.mulVec w = crossSource -> sigmaObsTarget.mulVec w ≠ crossTarget) :
+    (hMismatch : sigmaObsSource.mulVec wSource - sigmaObsTarget.mulVec wSource ≠ crossSource - crossTarget) : 
+      
     wSource ≠ wTarget := by
   intro hEq
-  have hNotTargetAtSource : sigmaObsTarget.mulVec wSource ≠ crossTarget := hConflict wSource hSource
-  have hTargetAtSource : sigmaObsTarget.mulVec wSource = crossTarget := by simpa [hEq] using hTarget
-  exact hNotTargetAtSource hTargetAtSource
+  have h1 : sigmaObsSource.mulVec wSource - sigmaObsTarget.mulVec wSource = crossSource - crossTarget := by
+    rw [hSource, hEq, hTarget]
+  exact hMismatch h1
+  
 
 /-- Dense source covariance witness for non-degenerate ERM-transport tests. -/
 def sigmaObsSource : Matrix (Fin 2) (Fin 2) ℝ :=
@@ -726,7 +729,7 @@ noncomputable def wTarget_opt : Fin 2 → ℝ :=
   ![76 / 99, 32 / 99]
 
 /-- A concrete proof that ERM mismatch occurs under LD shift, without relying on
-    the abstract `hConflict` hypothesis, using dense 2x2 witnesses. -/
+    the abstract `hMismatch` hypothesis, using dense 2x2 witnesses. -/
 theorem source_target_erm_differ_dense_witness_proved :
     sigmaObsSource.mulVec wSource_opt = crossSource ∧
     sigmaObsTarget.mulVec wTarget_opt = crossTarget ∧

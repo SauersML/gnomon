@@ -176,7 +176,7 @@ theorem source_erm_is_ld_specific_proved :
     norm_num
 
 /-- A concrete proof that ERM mismatch occurs under LD shift, without relying on
-    the abstract, vacuous `hConflict` hypothesis from `source_target_erm_differ_of_ld_system_conflict`.
+    the abstract, vacuous `hMismatch` hypothesis from `source_target_erm_differ_of_ld_system_conflict`.
     Here we construct explicit 2x2 covariance and cross-covariance matrices
     and show that the weights solving the normal equations must strictly differ. -/
 theorem source_target_erm_differ_proved :
