@@ -371,10 +371,11 @@ def _load_pcs_from_aou(num_pcs: int) -> pd.DataFrame | None:
     else:
         try:
             print(f"  pcs (AoU): GET {ANCESTRY_PREDS_URI} -> {ANCESTRY_PREDS_CACHE}")
-            df_raw = pd.read_csv(
+            # Cache all three columns so load_genetic_ancestry_labels can reuse the same file.
+            df_full = pd.read_csv(
                 ANCESTRY_PREDS_URI,
                 sep="\t",
-                usecols=["research_id", "pca_features"],
+                usecols=["research_id", "ancestry_pred", "pca_features"],
                 dtype=str,
                 storage_options={
                     "project": os.environ.get("GOOGLE_PROJECT", ""),
@@ -382,7 +383,8 @@ def _load_pcs_from_aou(num_pcs: int) -> pd.DataFrame | None:
                 },
             )
             ANCESTRY_PREDS_CACHE.parent.mkdir(parents=True, exist_ok=True)
-            df_raw.to_csv(ANCESTRY_PREDS_CACHE, sep="\t", index=False)
+            df_full.to_csv(ANCESTRY_PREDS_CACHE, sep="\t", index=False)
+            df_raw = df_full[["research_id", "pca_features"]]
             src = ANCESTRY_PREDS_URI
         except Exception as exc:
             print(f"  pcs (AoU): unavailable ({type(exc).__name__}: {exc}); "
@@ -1003,13 +1005,19 @@ def load_genetic_ancestry_labels() -> pd.DataFrame:
     """
     # Keep `pca_features` in the cache so `_load_pcs_from_aou` can reuse it.
     cache_cols = ["research_id", "ancestry_pred", "pca_features"]
+    have_usable_cache = False
     if ANCESTRY_PREDS_CACHE.exists() and ANCESTRY_PREDS_CACHE.stat().st_size > 0:
-        # Older cache may not have pca_features; only require ancestry_pred.
         df = pd.read_csv(ANCESTRY_PREDS_CACHE, sep="\t", dtype=str)
-        if "pca_features" not in df.columns:
-            df["pca_features"] = ""
-        df = df[["research_id", "ancestry_pred", "pca_features"]]
-    else:
+        if "ancestry_pred" in df.columns:
+            if "pca_features" not in df.columns:
+                df["pca_features"] = ""
+            df = df[["research_id", "ancestry_pred", "pca_features"]]
+            have_usable_cache = True
+        else:
+            # Cache was written by _load_pcs_from_aou before it learned to
+            # include ancestry_pred; refetch from the URI to repopulate.
+            print(f"  cache {ANCESTRY_PREDS_CACHE} lacks ancestry_pred; refetching")
+    if not have_usable_cache:
         print(f"  gcsfs GET {ANCESTRY_PREDS_URI} -> {ANCESTRY_PREDS_CACHE}")
         df = pd.read_csv(
             ANCESTRY_PREDS_URI,
