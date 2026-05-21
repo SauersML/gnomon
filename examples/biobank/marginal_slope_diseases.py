@@ -1031,9 +1031,12 @@ def load_genetic_ancestry_labels() -> pd.DataFrame:
         )
         ANCESTRY_PREDS_CACHE.parent.mkdir(parents=True, exist_ok=True)
         df.to_csv(ANCESTRY_PREDS_CACHE, sep="\t", index=False)
+    labels = _clean_group_label(df["ancestry_pred"]).str.upper()
+    # MID is too small to support its own LOSO fold; fold it into OTH.
+    labels = labels.where(labels != "MID", "OTH")
     out = pd.DataFrame({
         "person_id": _canonical_id(df["research_id"]),
-        "ancestry_category": _clean_group_label(df["ancestry_pred"]).str.upper(),
+        "ancestry_category": labels,
     })
     counts = out["ancestry_category"].value_counts().sort_index()
     print(
