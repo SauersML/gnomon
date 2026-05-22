@@ -1613,21 +1613,53 @@ def gam_survival_outputs(
     model,
     df: pd.DataFrame,
     num_pcs: int,
-    times: np.ndarray,
+    followup_times: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Risk and survival-probability matrix from gamfit survival prediction.
+    """Per-row risk and conditional survival on a follow-up time grid.
 
-    Returns `(risk_at_tau, survival_at_times, kept)`. If gamfit rejects an
-    edge-case row under its survival self-consistency guard, the row is dropped
-    and the caller evaluates all models on the same retained rows.
+    The GAM is fit on `Surv(entry_age, exit_age, event)`, i.e. left-truncated
+    age-as-time scale. sksurv's IPCW machinery ignores entry times, so we
+    convert age-scale predictions to follow-up scale before measuring
+    discrimination/calibration. The right quantity for each individual is the
+    conditional survival
+
+        S_cond_i(s | entry_i) = P(T_i > entry_i + s | T_i > entry_i)
+                              = S_i(entry_i + s) / S_i(entry_i),
+
+    paired against the right-censored follow-up time ``s = exit_i - entry_i``.
+
+    Implementation: gamfit's ``survival_at`` takes one 1-D age grid and
+    returns S(age|x) per row, so we batch-evaluate on a dense common age
+    grid covering every per-row prediction window, then per row linearly
+    interpolate to ages ``entry_i`` and ``entry_i + s_k``.
+
+    Returns ``(risk, surv_cond, kept)``:
+      * ``risk = -log S_cond_i(s_K)``  — monotone-in-hazard ranking score for
+        IPCW C / dynamic AUC; same ordering as the cumulative hazard accrued
+        during the follow-up window up to ``s_K``.
+      * ``surv_cond`` shape ``(n_kept, len(followup_times))``.
+      * ``kept`` is a bool mask over input rows that survived gamfit's
+        predict guard; all callers downstream must subset by ``kept``.
     """
     from gamfit._exceptions import PredictionError  # lazy
 
     cols = survival_model_columns(num_pcs)
     n = len(df)
+    entry = df["entry_age"].to_numpy(dtype=np.float64)
+    if not np.all(np.isfinite(entry)):
+        raise ValueError("entry_age has non-finite values")
+    if followup_times.size < 1:
+        raise ValueError("followup_times must have at least one point")
     kept = np.ones(n, dtype=bool)
-    risk = np.full(n, np.nan, dtype=float)
-    survival = np.full((n, len(times)), np.nan, dtype=float)
+
+    # Dense common age grid spans every per-row prediction window
+    # (entry_i, entry_i + s_K). 8x oversampling of the requested follow-up
+    # grid keeps per-row interpolation error in S well below ~1e-4 on the
+    # gamfit-emitted survival curve.
+    age_lo = float(np.min(entry))
+    age_hi = float(np.max(entry) + float(followup_times[-1]))
+    common_ages = np.linspace(age_lo, age_hi, max(200, 8 * len(followup_times)))
+    S_age = np.full((n, common_ages.size), np.nan, dtype=np.float64)
 
     def _predict_slice(start: int, end: int) -> None:
         if start >= end:
@@ -1648,14 +1680,33 @@ def gam_survival_outputs(
             _predict_slice(start, mid)
             _predict_slice(mid, end)
             return
-        survival[start:end, :] = np.asarray(pred.survival_at(times), dtype=float)
-        risk[start:end] = np.asarray(pred.cumulative_hazard_at([times[-1]]), dtype=float).reshape(-1)
+        S_age[start:end, :] = np.asarray(pred.survival_at(common_ages), dtype=np.float64)
 
     _predict_slice(0, n)
 
     if not kept.all():
         print(f"  predict: dropped {int((~kept).sum())} of {n} rows that tripped the guard")
-    return risk[kept], survival[kept, :], kept
+
+    keep_idx = np.flatnonzero(kept)
+    if keep_idx.size == 0:
+        return (
+            np.empty(0, dtype=np.float64),
+            np.empty((0, len(followup_times)), dtype=np.float64),
+            kept,
+        )
+    S_age_kept = S_age[keep_idx]
+    entry_kept = entry[keep_idx]
+
+    # Per-row interp to (entry_i, entry_i + s_1, ..., entry_i + s_K).
+    S_cond = np.empty((keep_idx.size, len(followup_times)), dtype=np.float64)
+    for i in range(keep_idx.size):
+        S_at_entry = float(np.interp(entry_kept[i], common_ages, S_age_kept[i]))
+        denom = max(S_at_entry, 1e-12)
+        S_target = np.interp(entry_kept[i] + followup_times, common_ages, S_age_kept[i])
+        S_cond[i] = np.clip(S_target / denom, 0.0, 1.0)
+
+    risk = -np.log(np.clip(S_cond[:, -1], 1e-12, 1.0))
+    return risk, S_cond, kept
 
 
 def _surv_array(event: np.ndarray, exit_: np.ndarray):
@@ -1667,48 +1718,107 @@ def _surv_array(event: np.ndarray, exit_: np.ndarray):
     )
 
 
-def _survival_metric_times(train_exit: np.ndarray, test_exit: np.ndarray) -> np.ndarray:
-    """Observed-age grid inside the train/test support for scikit-survival."""
-    train_exit = np.asarray(train_exit, dtype=np.float64)
-    test_exit = np.asarray(test_exit, dtype=np.float64)
-    finite_train = train_exit[np.isfinite(train_exit)]
-    finite_test = test_exit[np.isfinite(test_exit)]
+def _survival_metric_times(
+    train_followup: np.ndarray,
+    test_followup: np.ndarray,
+    test_event: np.ndarray | None = None,
+) -> np.ndarray:
+    """Quantile-spaced follow-up grid (years from entry) for sksurv metrics.
+
+    All sksurv estimators consume right-censored data with no entry time, so
+    age-scale left-truncated fits must be reduced to follow-up scale
+    (``s = exit_age - entry_age``) before discrimination/calibration is
+    measured. The grid lives strictly inside the intersection of train and
+    test follow-up support, where the IPCW censoring estimator
+    ``G(s) = P(C > s)`` stays finite. Quantile-spaced at test event
+    follow-ups so the Brier and AUC estimators integrate against a
+    well-supported axis.
+    """
+    train_followup = np.asarray(train_followup, dtype=np.float64)
+    test_followup = np.asarray(test_followup, dtype=np.float64)
+    finite_train = train_followup[np.isfinite(train_followup) & (train_followup > 0)]
+    finite_test = test_followup[np.isfinite(test_followup) & (test_followup > 0)]
     if finite_train.size < 2 or finite_test.size < 2:
-        raise ValueError("survival metrics need at least two finite train and test times")
+        raise ValueError("survival metrics need at least two finite positive follow-ups in train and test")
     lo = float(np.min(finite_test))
     hi = min(float(np.max(finite_train)), float(np.max(finite_test)))
     lo = float(np.nextafter(lo, np.inf))
     hi = float(np.nextafter(hi, -np.inf))
     if not (np.isfinite(lo) and np.isfinite(hi) and lo < hi):
-        raise ValueError(f"invalid survival metric time grid: lower={lo}, upper={hi}")
-    observed = np.unique(finite_test[(finite_test > lo) & (finite_test < hi)])
-    if observed.size < 2:
+        raise ValueError(f"invalid follow-up grid: lower={lo}, upper={hi}")
+    if test_event is None:
+        spine = finite_test
+    else:
+        event_mask = np.asarray(test_event, dtype=bool)
+        # event_mask aligns with the original test_followup; recover positions.
+        all_idx = np.isfinite(test_followup) & (test_followup > 0)
+        spine = test_followup[all_idx & event_mask]
+    spine = np.unique(spine[(spine > lo) & (spine < hi)])
+    if spine.size < 2:
         return np.linspace(lo, hi, 2)
     max_times = max(2, int(np.sqrt(finite_test.size)))
-    if observed.size <= max_times:
-        return observed
-    return np.unique(np.quantile(observed, np.linspace(0.0, 1.0, max_times)))
+    if spine.size <= max_times:
+        return spine
+    return np.unique(np.quantile(spine, np.linspace(0.0, 1.0, max_times)))
 
 
-def cox_survival_matrix(fit: CoxFit, X: np.ndarray, times: np.ndarray) -> np.ndarray:
+def cox_survival_matrix(
+    fit: CoxFit,
+    X: np.ndarray,
+    entry_age: np.ndarray,
+    followup_times: np.ndarray,
+) -> np.ndarray:
+    """Conditional S_cond_i(s | entry_i) on a follow-up time grid.
+
+    The statsmodels PHReg fit gives back the Breslow baseline cumulative
+    hazard ``H0(age)`` at the linear predictor 0. For individual i with
+    covariate vector x_i, the conditional cumulative hazard accrued during
+    the follow-up window is
+
+        H_cond_i(s) = (H0(entry_i + s) - H0(entry_i)) * exp(beta . x_i)
+
+    and the conditional survival is ``exp(-H_cond_i(s))``. This is the
+    canonical way to map a left-truncated age-scale Cox fit onto the
+    follow-up-from-entry scale that sksurv's right-censored metric
+    estimators expect.
+    """
     base = fit.result.baseline_cumulative_hazard
     if not base:
         raise ValueError("Cox fit did not expose a baseline cumulative hazard")
-    base_times = np.asarray(base[0][0], dtype=np.float64)
-    base_cumhaz = np.asarray(base[0][1], dtype=np.float64)
-    H0 = np.interp(times, base_times, base_cumhaz, left=0.0, right=float(base_cumhaz[-1]))
+    base_t = np.asarray(base[0][0], dtype=np.float64)
+    base_H = np.asarray(base[0][1], dtype=np.float64)
+    entry = np.asarray(entry_age, dtype=np.float64)
+    follow = np.asarray(followup_times, dtype=np.float64)
+    H0_entry = np.interp(entry, base_t, base_H, left=0.0, right=float(base_H[-1]))
+    target_ages = entry[:, None] + follow[None, :]
+    H0_target = np.interp(
+        target_ages.ravel(),
+        base_t, base_H, left=0.0, right=float(base_H[-1]),
+    ).reshape(target_ages.shape)
     beta = np.asarray([fit.coefs[n] for n in fit.names], dtype=np.float64)
-    partial_hazard = np.exp(np.asarray(X, dtype=np.float64) @ beta)
-    return np.exp(-np.outer(partial_hazard, H0))
+    eta = np.asarray(X, dtype=np.float64) @ beta
+    H_cond = np.clip((H0_target - H0_entry[:, None]) * np.exp(eta)[:, None], 0.0, None)
+    return np.exp(-H_cond)
 
 
-def null_survival_matrix(train: pd.DataFrame, n_rows: int, times: np.ndarray) -> np.ndarray:
+def null_survival_matrix(
+    train: pd.DataFrame,
+    n_rows: int,
+    followup_times: np.ndarray,
+) -> np.ndarray:
+    """KM null reference S(s) on follow-up time, broadcast to ``n_rows`` rows.
+
+    KM is fit on training (event, follow-up) — no covariates — so it is the
+    proper no-skill survival curve for the Brier null reference against which
+    each model's conditional S_cond_i(s) is compared.
+    """
     from sksurv.nonparametric import SurvivalFunctionEstimator
 
+    train_f = (train["exit_age"] - train["entry_age"]).to_numpy(dtype=np.float64)
     estimator = SurvivalFunctionEstimator().fit(
-        _surv_array(train["event"].to_numpy(), train["exit_age"].to_numpy())
+        _surv_array(train["event"].to_numpy(), train_f)
     )
-    null_curve = np.asarray(estimator.predict_proba(times), dtype=np.float64)
+    null_curve = np.asarray(estimator.predict_proba(followup_times), dtype=np.float64)
     return np.tile(null_curve, (n_rows, 1))
 
 
@@ -1735,7 +1845,7 @@ def _stratified_bootstrap_ci(
 def _ipcw_c_for_indices(
     train_y,
     event: np.ndarray,
-    exit_: np.ndarray,
+    followup: np.ndarray,
     risk: np.ndarray,
     indices: np.ndarray,
     tau: float,
@@ -1743,14 +1853,19 @@ def _ipcw_c_for_indices(
     from sksurv.metrics import concordance_index_ipcw
 
     idx = np.asarray(indices, dtype=np.int64)
-    test_y = _surv_array(event[idx], exit_[idx])
+    test_y = _surv_array(event[idx], followup[idx])
     return float(concordance_index_ipcw(train_y, test_y, np.asarray(risk, dtype=np.float64)[idx], tau=tau)[0])
 
 
+def _train_followup_surv(train: pd.DataFrame):
+    train_f = (train["exit_age"] - train["entry_age"]).to_numpy(dtype=np.float64)
+    return _surv_array(train["event"].to_numpy(), train_f)
+
+
 def bootstrap_ipcw_c_ci(train: pd.DataFrame, test: pd.DataFrame, risk: np.ndarray, tau: float) -> tuple[float, float]:
-    train_y = _surv_array(train["event"].to_numpy(), train["exit_age"].to_numpy())
+    train_y = _train_followup_surv(train)
     event = test["event"].to_numpy(dtype=bool)
-    exit_ = test["exit_age"].to_numpy(dtype=np.float64)
+    followup = (test["exit_age"] - test["entry_age"]).to_numpy(dtype=np.float64)
     event_idx = np.flatnonzero(event)
     censor_idx = np.flatnonzero(~event)
     if event_idx.size == 0 or censor_idx.size == 0:
@@ -1761,7 +1876,7 @@ def bootstrap_ipcw_c_ci(train: pd.DataFrame, test: pd.DataFrame, risk: np.ndarra
             np.asarray(sampled_events, dtype=np.int64),
             np.asarray(sampled_censors, dtype=np.int64),
         ])
-        return _ipcw_c_for_indices(train_y, event, exit_, risk, idx, tau)
+        return _ipcw_c_for_indices(train_y, event, followup, risk, idx, tau)
 
     return _stratified_bootstrap_ci(event_idx, censor_idx, statistic)
 
@@ -1773,9 +1888,9 @@ def bootstrap_ipcw_delta_ci(
     right_risk: np.ndarray,
     tau: float,
 ) -> tuple[float, float]:
-    train_y = _surv_array(train["event"].to_numpy(), train["exit_age"].to_numpy())
+    train_y = _train_followup_surv(train)
     event = test["event"].to_numpy(dtype=bool)
-    exit_ = test["exit_age"].to_numpy(dtype=np.float64)
+    followup = (test["exit_age"] - test["entry_age"]).to_numpy(dtype=np.float64)
     event_idx = np.flatnonzero(event)
     censor_idx = np.flatnonzero(~event)
     if event_idx.size == 0 or censor_idx.size == 0:
@@ -1786,8 +1901,8 @@ def bootstrap_ipcw_delta_ci(
             np.asarray(sampled_events, dtype=np.int64),
             np.asarray(sampled_censors, dtype=np.int64),
         ])
-        left = _ipcw_c_for_indices(train_y, event, exit_, left_risk, idx, tau)
-        right = _ipcw_c_for_indices(train_y, event, exit_, right_risk, idx, tau)
+        left = _ipcw_c_for_indices(train_y, event, followup, left_risk, idx, tau)
+        right = _ipcw_c_for_indices(train_y, event, followup, right_risk, idx, tau)
         return left - right
 
     return _stratified_bootstrap_ci(event_idx, censor_idx, statistic)
@@ -1797,48 +1912,65 @@ def survival_library_metrics(
     train: pd.DataFrame,
     test: pd.DataFrame,
     risk: np.ndarray,
-    survival: np.ndarray,
-    times: np.ndarray,
+    surv_cond: np.ndarray,
+    followup_times: np.ndarray,
+    tau_followup: float | None = None,
 ) -> SurvivalMetricStats:
+    """sksurv discrimination + calibration metrics on follow-up scale.
+
+    Both ``train`` and ``test`` must carry ``entry_age``, ``exit_age``, and
+    ``event``; the follow-up time ``s = exit_age - entry_age`` is what the
+    sksurv estimators see (right-censored, no entry). ``risk`` is a per-row
+    monotone-in-hazard ranking score (e.g. ``-log S_cond(s_K)``) and
+    ``surv_cond`` is the per-row conditional survival on ``followup_times``.
+
+    Returns a :class:`SurvivalMetricStats` with IPCW Harrell's C (Uno) plus
+    its bootstrap 95% CI, mean cumulative/dynamic AUC, integrated Brier
+    score, IBS under the KM null reference, and IPA pseudo R² =
+    ``1 - IBS / IBS_null``.
+    """
     from sksurv.metrics import (
         concordance_index_ipcw,
         cumulative_dynamic_auc,
         integrated_brier_score,
     )
 
-    train_y = _surv_array(train["event"].to_numpy(), train["exit_age"].to_numpy())
-    test_y = _surv_array(test["event"].to_numpy(), test["exit_age"].to_numpy())
+    train_f = (train["exit_age"] - train["entry_age"]).to_numpy(dtype=np.float64)
+    test_f = (test["exit_age"] - test["entry_age"]).to_numpy(dtype=np.float64)
+    train_y = _surv_array(train["event"].to_numpy(), train_f)
+    test_y = _surv_array(test["event"].to_numpy(), test_f)
     risk = np.asarray(risk, dtype=np.float64)
-    survival = np.asarray(survival, dtype=np.float64)
-    if survival.shape != (len(test), len(times)):
+    surv_cond = np.asarray(surv_cond, dtype=np.float64)
+    if surv_cond.shape != (len(test), len(followup_times)):
         raise ValueError(
-            f"survival matrix shape {survival.shape} does not match "
-            f"(n_test={len(test)}, n_times={len(times)})"
+            f"conditional survival shape {surv_cond.shape} does not match "
+            f"(n_test={len(test)}, n_times={len(followup_times)})"
         )
-    # IPCW C-index truncation time: 80th percentile of *observed event* ages
-    # in the held-out set, clipped to the interior of the metric grid.
-    # scikit-survival docs recommend a conservative percentile rather than
-    # max(times) because the IPCW weight 1/G(t) becomes unstable as the
-    # censoring KM hits zero at large ages. We never extrapolate past the
-    # training support, which `_survival_metric_times` already enforces.
-    event_times = test["exit_age"].to_numpy(dtype=np.float64)[
-        test["event"].to_numpy(dtype=bool)
-    ]
-    if event_times.size >= 1:
-        tau_candidate = float(np.quantile(event_times, 0.80))
+    # IPCW C-index truncation time: 80th percentile of *observed event*
+    # follow-up times in the held-out set, clipped to the interior of the
+    # follow-up metric grid. scikit-survival recommends a conservative
+    # percentile rather than max(times) because the IPCW weight 1/G(s)
+    # becomes unstable as the censoring KM approaches zero. The grid is
+    # already pre-restricted to the train/test follow-up overlap by
+    # ``_survival_metric_times``.
+    event_f = test_f[test["event"].to_numpy(dtype=bool)]
+    if tau_followup is not None:
+        tau_candidate = float(tau_followup)
+    elif event_f.size >= 1:
+        tau_candidate = float(np.quantile(event_f, 0.80))
     else:
-        tau_candidate = float(times[-1])
-    tau = float(np.clip(tau_candidate, float(times[0]), float(times[-1])))
+        tau_candidate = float(followup_times[-1])
+    tau = float(np.clip(tau_candidate, float(followup_times[0]), float(followup_times[-1])))
     c_ipcw = float(concordance_index_ipcw(train_y, test_y, risk, tau=tau)[0])
     c_ipcw_ci_low, c_ipcw_ci_high = bootstrap_ipcw_c_ci(train, test, risk, tau)
-    _, mean_auc = cumulative_dynamic_auc(train_y, test_y, risk, times)
-    ibs = float(integrated_brier_score(train_y, test_y, survival, times))
+    _, mean_auc = cumulative_dynamic_auc(train_y, test_y, risk, followup_times)
+    ibs = float(integrated_brier_score(train_y, test_y, surv_cond, followup_times))
     null_ibs = float(
         integrated_brier_score(
             train_y,
             test_y,
-            null_survival_matrix(train, len(test), times),
-            times,
+            null_survival_matrix(train, len(test), followup_times),
+            followup_times,
         )
     )
     r2_ibs = float(1.0 - ibs / null_ibs) if null_ibs > 0 else float("nan")
@@ -1854,9 +1986,9 @@ def survival_library_metrics(
         null_ibs=null_ibs,
         r2_ibs=r2_ibs,
         tau=tau,
-        ibs_start=float(times[0]),
-        ibs_stop=float(times[-1]),
-        n_times=int(len(times)),
+        ibs_start=float(followup_times[0]),
+        ibs_stop=float(followup_times[-1]),
+        n_times=int(len(followup_times)),
     )
 
 
@@ -2251,109 +2383,115 @@ def evaluate_model_pair(
         f"log_HR(sex)={B_coefs['sex']:+.4f}  [{pc_str}]"
     )
 
-    def _risk(X, names, coefs):
-        beta = np.array([coefs[n] for n in names])
-        return np.exp(X @ beta)
-
+    # Follow-up time scale for all sksurv metrics (left-truncation respected).
+    # gam_survival_outputs / cox_survival_matrix produce conditional survival
+    # S_cond_i(s | entry_i); ranking risk is -log S_cond(s_K), the per-row
+    # cumulative hazard accrued during the follow-up window.
+    train_followup = (train["exit_age"] - train["entry_age"]).to_numpy(dtype=np.float64)
+    test_followup = (test["exit_age"] - test["entry_age"]).to_numpy(dtype=np.float64)
     metric_times = _survival_metric_times(
-        train["exit_age"].to_numpy(),
-        test["exit_age"].to_numpy(),
+        train_followup,
+        test_followup,
+        test["event"].to_numpy(dtype=bool),
     )
     gam_risk_test, gam_surv_test, kept_test = gam_survival_outputs(
         model, test, len(pc_cols), metric_times
     )
     test_metric = test.loc[kept_test].reset_index(drop=True)
-    train_time_max = float(np.max(train["exit_age"].to_numpy(dtype=np.float64)))
-    support_mask = test_metric["exit_age"].to_numpy(dtype=np.float64) < np.nextafter(
-        train_time_max, -np.inf
-    )
+    train_followup_max = float(np.max(train_followup))
+    test_metric_followup = (
+        test_metric["exit_age"] - test_metric["entry_age"]
+    ).to_numpy(dtype=np.float64)
+    support_mask = test_metric_followup < np.nextafter(train_followup_max, -np.inf)
     if int(support_mask.sum()) < 2:
         raise ValueError("fewer than two held-out rows inside the training censoring support")
     if not bool(support_mask.all()):
         print(
             f"  survival_metrics: dropped {int((~support_mask).sum())} held-out rows "
-            "outside the training censoring support"
+            "outside the training follow-up censoring support"
         )
         test_metric = test_metric.loc[support_mask].reset_index(drop=True)
+        test_metric_followup = test_metric_followup[support_mask]
         gam_risk_test = gam_risk_test[support_mask]
         gam_surv_test = gam_surv_test[support_mask, :]
         kept_positions = np.flatnonzero(kept_test)[support_mask]
         kept_test = np.zeros_like(kept_test, dtype=bool)
         kept_test[kept_positions] = True
     valid_time = (
-        (metric_times > float(test_metric["exit_age"].min()))
-        & (metric_times < min(float(test_metric["exit_age"].max()), float(train["exit_age"].max())))
+        (metric_times > float(test_metric_followup.min()))
+        & (metric_times < min(float(test_metric_followup.max()), train_followup_max))
     )
     if int(valid_time.sum()) < 2:
-        raise ValueError("fewer than two valid survival metric time points after prediction filtering")
+        raise ValueError("fewer than two valid follow-up metric time points after prediction filtering")
     if not bool(valid_time.all()):
         metric_times = metric_times[valid_time]
         gam_surv_test = gam_surv_test[:, valid_time]
 
-    A_risk_test = _risk(X_A_te[kept_test], A_names, A_coefs)
-    B_risk_test = _risk(X_B_te[kept_test], B_names, B_coefs)
+    A_entry_te = test_metric["entry_age"].to_numpy(dtype=np.float64)
+    B_entry_te = A_entry_te  # same rows
+    A_surv_test = cox_survival_matrix(A_fit, X_A_te[kept_test], A_entry_te, metric_times)
+    B_surv_test = cox_survival_matrix(B_fit, X_B_te[kept_test], B_entry_te, metric_times)
+    # Per-row conditional cumulative hazard at the last follow-up time, same
+    # ranking-score convention as the GAM.
+    A_risk_test = -np.log(np.clip(A_surv_test[:, -1], 1e-12, 1.0))
+    B_risk_test = -np.log(np.clip(B_surv_test[:, -1], 1e-12, 1.0))
     A_test_m = survival_library_metrics(
-        train,
-        test_metric,
-        A_risk_test,
-        cox_survival_matrix(A_fit, X_A_te[kept_test], metric_times),
-        metric_times,
+        train, test_metric, A_risk_test, A_surv_test, metric_times,
     )
     B_test_m = survival_library_metrics(
-        train,
-        test_metric,
-        B_risk_test,
-        cox_survival_matrix(B_fit, X_B_te[kept_test], metric_times),
-        metric_times,
+        train, test_metric, B_risk_test, B_surv_test, metric_times,
     )
-    gam_test_m = survival_library_metrics(train, test_metric, gam_risk_test, gam_surv_test, metric_times)
+    gam_test_m = survival_library_metrics(
+        train, test_metric, gam_risk_test, gam_surv_test, metric_times,
+    )
     gam_train_m = A_train_m = B_train_m = None
     if score_train:
         train_times = _survival_metric_times(
-            train["exit_age"].to_numpy(),
-            train["exit_age"].to_numpy(),
+            train_followup,
+            train_followup,
+            train["event"].to_numpy(dtype=bool),
         )
         gam_risk_train, gam_surv_train, kept_train = gam_survival_outputs(
             model, train, len(pc_cols), train_times
         )
         train_metric = train.loc[kept_train].reset_index(drop=True)
-        train_support_mask = train_metric["exit_age"].to_numpy(dtype=np.float64) < np.nextafter(
-            float(train["exit_age"].max()), -np.inf
-        )
+        train_metric_followup = (
+            train_metric["exit_age"] - train_metric["entry_age"]
+        ).to_numpy(dtype=np.float64)
+        train_support_mask = train_metric_followup < np.nextafter(train_followup_max, -np.inf)
         if int(train_support_mask.sum()) < 2:
             raise ValueError("fewer than two train rows inside the training censoring support")
         if not bool(train_support_mask.all()):
             train_metric = train_metric.loc[train_support_mask].reset_index(drop=True)
+            train_metric_followup = train_metric_followup[train_support_mask]
             gam_risk_train = gam_risk_train[train_support_mask]
             gam_surv_train = gam_surv_train[train_support_mask, :]
             kept_train_positions = np.flatnonzero(kept_train)[train_support_mask]
             kept_train = np.zeros_like(kept_train, dtype=bool)
             kept_train[kept_train_positions] = True
         valid_train_time = (
-            (train_times > float(train_metric["exit_age"].min()))
-            & (train_times < float(train_metric["exit_age"].max()))
+            (train_times > float(train_metric_followup.min()))
+            & (train_times < float(train_metric_followup.max()))
         )
         if int(valid_train_time.sum()) < 2:
-            raise ValueError("fewer than two valid train survival metric time points")
+            raise ValueError("fewer than two valid train follow-up metric time points")
         if not bool(valid_train_time.all()):
             train_times = train_times[valid_train_time]
             gam_surv_train = gam_surv_train[:, valid_train_time]
         gam_train_m = survival_library_metrics(
-            train, train_metric, gam_risk_train, gam_surv_train, train_times
+            train, train_metric, gam_risk_train, gam_surv_train, train_times,
         )
+        A_entry_tr = train_metric["entry_age"].to_numpy(dtype=np.float64)
+        B_entry_tr = A_entry_tr
+        A_surv_train = cox_survival_matrix(A_fit, X_A_tr[kept_train], A_entry_tr, train_times)
+        B_surv_train = cox_survival_matrix(B_fit, X_B_tr[kept_train], B_entry_tr, train_times)
+        A_risk_train = -np.log(np.clip(A_surv_train[:, -1], 1e-12, 1.0))
+        B_risk_train = -np.log(np.clip(B_surv_train[:, -1], 1e-12, 1.0))
         A_train_m = survival_library_metrics(
-            train,
-            train_metric,
-            _risk(X_A_tr[kept_train], A_names, A_coefs),
-            cox_survival_matrix(A_fit, X_A_tr[kept_train], train_times),
-            train_times,
+            train, train_metric, A_risk_train, A_surv_train, train_times,
         )
         B_train_m = survival_library_metrics(
-            train,
-            train_metric,
-            _risk(X_B_tr[kept_train], B_names, B_coefs),
-            cox_survival_matrix(B_fit, X_B_tr[kept_train], train_times),
-            train_times,
+            train, train_metric, B_risk_train, B_surv_train, train_times,
         )
     delta_A_c = gam_test_m.c_ipcw - A_test_m.c_ipcw
     delta_B_c = gam_test_m.c_ipcw - B_test_m.c_ipcw
@@ -2371,8 +2509,8 @@ def evaluate_model_pair(
         f"  {label}  train_n={len(train):,}  test_n={gam_test_m.n:,}  "
         f"test_events={gam_test_m.n_events:,}  "
         f"median_exit_age={gam_test_m.median_exit_age:.2f}  "
-        f"metric_age_grid=[{gam_test_m.ibs_start:.2f},{gam_test_m.ibs_stop:.2f}] "
-        f"n_times={gam_test_m.n_times}"
+        f"metric_followup_grid=[{gam_test_m.ibs_start:.2f},{gam_test_m.ibs_stop:.2f}] yr "
+        f"tau={gam_test_m.tau:.2f} yr  n_times={gam_test_m.n_times}"
     )
     if score_train:
         assert gam_train_m is not None and A_train_m is not None and B_train_m is not None
