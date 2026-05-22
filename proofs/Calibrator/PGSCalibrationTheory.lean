@@ -2064,9 +2064,9 @@ theorem receivesTreatment_iff_of_margin_error_lt_abs_true_margin
       · exact not_lt.mp h_pred
     constructor
     · intro h_pred
-      exact False.elim ((not_lt_of_ge h_pred_nonpos) h_pred)
+      exact False.elim (not_le_of_gt h_pred h_pred_nonpos)
     · intro h_true'
-      exact False.elim ((not_lt_of_ge h_true_nonpos) h_true')
+      exact False.elim (not_le_of_gt h_true' h_true_nonpos)
 
 /-- **Exact pathway-margin stability implies zero QALY regret.**
     If the deployed pathway margin error is smaller than the absolute true
