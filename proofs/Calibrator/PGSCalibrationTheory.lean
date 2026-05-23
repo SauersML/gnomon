@@ -2068,6 +2068,45 @@ theorem receivesTreatment_iff_of_margin_error_lt_abs_true_margin
     · intro h_true'
       exact False.elim ((not_lt_of_ge h_true_nonpos) h_true')
 
+/-- **Bounded decision-regret margin.**
+    The decision regret margin is bounded by the magnitude of the difference
+    between the true and predicted treatment margins. -/
+theorem qalyDecisionRegretMargin_le_abs_margin_diff
+    {T : ℕ} (model : LongitudinalTreatmentModel T)
+    (truePath predictedPath : ClinicalPathway T) :
+    qalyDecisionRegretMargin model truePath predictedPath ≤
+      |treatmentMargin model truePath - treatmentMargin model predictedPath| := by
+  unfold qalyDecisionRegretMargin
+  split_ifs with h_pred
+  · -- Case: predicted positive
+    by_cases h_true : receivesTreatment model truePath
+    · -- Case: true positive, zero regret
+      have h_m_pos : 0 ≤ treatmentMargin model truePath := le_of_lt h_true
+      rw [max_eq_right (by linarith)]
+      exact abs_nonneg _
+    · -- Case: false positive, true margin is negative, we pay -trueMargin
+      have h_m_neg : treatmentMargin model truePath ≤ 0 := not_lt.mp h_true
+      have h_m_pred_pos : 0 < treatmentMargin model predictedPath := h_pred
+      rw [max_eq_left (by linarith)]
+      calc -treatmentMargin model truePath
+        ≤ treatmentMargin model predictedPath - treatmentMargin model truePath := by linarith
+        _ ≤ |treatmentMargin model truePath - treatmentMargin model predictedPath| := by
+          rw [abs_sub_comm]
+          exact le_abs_self _
+  · -- Case: predicted negative
+    by_cases h_true : receivesTreatment model truePath
+    · -- Case: false negative, true margin is positive, we pay trueMargin
+      have h_m_pos : 0 < treatmentMargin model truePath := h_true
+      have h_m_pred_neg : treatmentMargin model predictedPath ≤ 0 := not_lt.mp h_pred
+      rw [max_eq_left (by linarith)]
+      calc treatmentMargin model truePath
+        ≤ treatmentMargin model truePath - treatmentMargin model predictedPath := by linarith
+        _ ≤ |treatmentMargin model truePath - treatmentMargin model predictedPath| := le_abs_self _
+    · -- Case: true negative, zero regret
+      have h_m_neg : treatmentMargin model truePath ≤ 0 := not_lt.mp h_true
+      rw [max_eq_right (by linarith)]
+      exact abs_nonneg _
+
 /-- **Exact pathway-margin stability implies zero QALY regret.**
     If the deployed pathway margin error is smaller than the absolute true
     treatment margin, the deployed and oracle treatment decisions coincide. -/
