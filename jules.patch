@@ -1,0 +1,96 @@
+diff --git a/proofs/Calibrator/Conclusions.lean b/proofs/Calibrator/Conclusions.lean
+index 365bd57..d66547f 100644
+--- a/proofs/Calibrator/Conclusions.lean
++++ b/proofs/Calibrator/Conclusions.lean
+@@ -463,7 +463,7 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
+       simp_all +decide [ Matrix.inv_def, mul_assoc, mul_left_comm, mul_comm, Matrix.trace_mul_comm ( Matrix.adjugate _ ) ]
+       rw [ show deriv ( fun rho => A + Real.exp rho • B ) rho = Real.exp rho • B from ?_ ]
+       · by_cases h : Matrix.det ( A + Real.exp rho • B ) = 0 <;> simp_all +decide [ Matrix.trace_smul, mul_assoc, mul_comm, mul_left_comm ]
+-        exact False.elim <| h_inv h
++        contradiction
+       · rw [ deriv_pi ] <;> norm_num [ Real.differentiableAt_exp, mul_comm ]
+         ext i; rw [ deriv_pi ] <;> norm_num [ Real.differentiableAt_exp, mul_comm ]
+     by_cases h_det : DifferentiableAt ℝ ( fun rho => Matrix.det ( A + Real.exp rho • B ) ) rho <;> simp_all +decide [ Real.exp_ne_zero, mul_assoc, mul_comm, mul_left_comm ]
+diff --git a/proofs/Calibrator/PGSCalibrationTheory.lean b/proofs/Calibrator/PGSCalibrationTheory.lean
+index 1796286..78a2446 100644
+--- a/proofs/Calibrator/PGSCalibrationTheory.lean
++++ b/proofs/Calibrator/PGSCalibrationTheory.lean
+@@ -2068,6 +2068,45 @@ theorem receivesTreatment_iff_of_margin_error_lt_abs_true_margin
+     · intro h_true'
+       exact False.elim ((not_lt_of_ge h_true_nonpos) h_true')
+ 
++/-- **Bounded decision-regret margin.**
++    The decision regret margin is bounded by the magnitude of the difference
++    between the true and predicted treatment margins. -/
++theorem qalyDecisionRegretMargin_le_abs_margin_diff
++    {T : ℕ} (model : LongitudinalTreatmentModel T)
++    (truePath predictedPath : ClinicalPathway T) :
++    qalyDecisionRegretMargin model truePath predictedPath ≤
++      |treatmentMargin model truePath - treatmentMargin model predictedPath| := by
++  unfold qalyDecisionRegretMargin
++  split_ifs with h_pred
++  · -- Case: predicted positive
++    by_cases h_true : receivesTreatment model truePath
++    · -- Case: true positive, zero regret
++      have h_m_pos : 0 ≤ treatmentMargin model truePath := le_of_lt h_true
++      rw [max_eq_right (by linarith)]
++      exact abs_nonneg _
++    · -- Case: false positive, true margin is negative, we pay -trueMargin
++      have h_m_neg : treatmentMargin model truePath ≤ 0 := not_lt.mp h_true
++      have h_m_pred_pos : 0 < treatmentMargin model predictedPath := h_pred
++      rw [max_eq_left (by linarith)]
++      calc -treatmentMargin model truePath
++        ≤ treatmentMargin model predictedPath - treatmentMargin model truePath := by linarith
++        _ ≤ |treatmentMargin model truePath - treatmentMargin model predictedPath| := by
++          rw [abs_sub_comm]
++          exact le_abs_self _
++  · -- Case: predicted negative
++    by_cases h_true : receivesTreatment model truePath
++    · -- Case: false negative, true margin is positive, we pay trueMargin
++      have h_m_pos : 0 < treatmentMargin model truePath := h_true
++      have h_m_pred_neg : treatmentMargin model predictedPath ≤ 0 := not_lt.mp h_pred
++      rw [max_eq_left (by linarith)]
++      calc treatmentMargin model truePath
++        ≤ treatmentMargin model truePath - treatmentMargin model predictedPath := by linarith
++        _ ≤ |treatmentMargin model truePath - treatmentMargin model predictedPath| := le_abs_self _
++    · -- Case: true negative, zero regret
++      have h_m_neg : treatmentMargin model truePath ≤ 0 := not_lt.mp h_true
++      rw [max_eq_right (by linarith)]
++      exact abs_nonneg _
++
+ /-- **Exact pathway-margin stability implies zero QALY regret.**
+     If the deployed pathway margin error is smaller than the absolute true
+     treatment margin, the deployed and oracle treatment decisions coincide. -/
+diff --git a/proofs/Calibrator/StratificationConfounding.lean b/proofs/Calibrator/StratificationConfounding.lean
+index da6dadc..7e36572 100644
+--- a/proofs/Calibrator/StratificationConfounding.lean
++++ b/proofs/Calibrator/StratificationConfounding.lean
+@@ -329,12 +329,10 @@ theorem differential_ascertainment_artifact
+     (r2_source_pop r2_target_pop r2_source_asc r2_target_asc : ℝ)
+     (h_source_asc : r2_source_asc < r2_source_pop)
+     (h_target_asc : r2_target_asc < r2_target_pop)
+-    -- Different ascertainment severity
+-    (h_diff_severity : r2_target_pop - r2_target_asc < r2_source_pop - r2_source_asc) :
++    -- Target has more severe ascertainment drop than source
++    (h_diff_severity : r2_target_pop - r2_target_asc > r2_source_pop - r2_source_asc) :
+     -- Apparent portability drop is larger than true portability drop
+-    r2_source_asc - r2_target_asc > r2_source_pop - r2_target_pop →
+-      False := by
+-  intro h
++    r2_source_asc - r2_target_asc > r2_source_pop - r2_target_pop := by
+   linarith
+ 
+ end ColliderBias
+diff --git a/proofs/Calibrator/TransferLearningPGS.lean b/proofs/Calibrator/TransferLearningPGS.lean
+index 518b988..4292b8b 100644
+--- a/proofs/Calibrator/TransferLearningPGS.lean
++++ b/proofs/Calibrator/TransferLearningPGS.lean
+@@ -1435,7 +1435,7 @@ theorem optimalSourceShrinkageWeight_eq_closed_form
+           field_simp [hn_ne]
+         _ = 0 := h_zero
+     rcases mul_eq_zero.mp hmul with h0 | h0
+-    · exact False.elim (hn_ne h0)
++    · contradiction
+     · exact h0
+   unfold optimalSourceShrinkageWeight
+   field_simp [hn_ne, h_curv, h_denom]
