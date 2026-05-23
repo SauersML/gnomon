@@ -202,15 +202,31 @@ theorem transfer_beats_target_only
     at n_lo but target beats transfer at n_hi, a crossover point exists
     in between. -/
 theorem critical_sample_size_exists
-    (mse_transfer mse_target : ℝ → ℝ) (n_lo n_hi : ℝ)
-    (h_transfer_decreasing : ∀ n₁ n₂ : ℝ, 0 < n₁ → n₁ < n₂ → mse_transfer n₂ < mse_transfer n₁)
-    (h_target_decreasing : ∀ n₁ n₂ : ℝ, 0 < n₁ → n₁ < n₂ → mse_target n₂ < mse_target n₁)
-    (h_lo_pos : 0 < n_lo) (h_range : n_lo < n_hi)
-    (h_small_n : mse_transfer n_lo < mse_target n_lo)
-    (h_large_n : mse_target n_hi < mse_transfer n_hi) :
-    -- There exists a crossover point
-    ∃ n_crit : ℝ, n_lo < n_crit ∧ n_crit < n_hi := by
-  exact ⟨(n_lo + n_hi) / 2, by linarith, by linarith⟩
+    (σ_sq bias_sq σ_extra_sq : ℝ)
+    (_h_σ : 0 < σ_sq) (h_bias : 0 < bias_sq)
+    (_h_extra : 0 < σ_extra_sq) :
+    ∃ n_crit : ℝ, 0 < n_crit ∧
+      (∀ n_T : ℝ, 0 < n_T → n_T < n_crit → (σ_sq / n_T + bias_sq) < ((σ_sq + σ_extra_sq) / n_T)) ∧
+      (∀ n_T : ℝ, n_crit < n_T → ((σ_sq + σ_extra_sq) / n_T) < (σ_sq / n_T + bias_sq)) := by
+  use σ_extra_sq / bias_sq
+  refine ⟨by positivity, ?_, ?_⟩
+  · intro n_T h_n h_lt
+    have h_prod : bias_sq * n_T < σ_extra_sq := by
+      rw [mul_comm]
+      exact (lt_div_iff₀ h_bias).mp h_lt
+    have h_key : bias_sq < σ_extra_sq / n_T := (lt_div_iff₀ h_n).mpr h_prod
+    calc
+      σ_sq / n_T + bias_sq < σ_sq / n_T + σ_extra_sq / n_T := add_lt_add_left h_key _
+      _ = (σ_sq + σ_extra_sq) / n_T := by rw [add_div]
+  · intro n_T h_gt
+    have h_n : 0 < n_T := by
+      have h_pos : 0 < σ_extra_sq / bias_sq := by positivity
+      linarith
+    have h_prod : σ_extra_sq < bias_sq * n_T := (div_lt_iff₀' h_bias).mp h_gt
+    have h_key : σ_extra_sq / n_T < bias_sq := (div_lt_iff₀ h_n).mpr (by linarith)
+    calc
+      (σ_sq + σ_extra_sq) / n_T = σ_sq / n_T + σ_extra_sq / n_T := by rw [add_div]
+      _ < σ_sq / n_T + bias_sq := add_lt_add_left h_key _
 
 /-- **Multi-ancestry meta-analysis is optimal.**
     Combining GWAS data from multiple ancestries via inverse-variance
