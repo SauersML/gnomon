@@ -1,6 +1,7 @@
 import Calibrator.Probability
 import Calibrator.PortabilityDrift
 import Calibrator.OpenQuestions
+import Calibrator.TransportIdentities
 
 namespace Calibrator
 
@@ -148,6 +149,8 @@ has enormous within-group variance. We formalize the exact distribution.
 
 section IndividualErrorDistribution
 
+variable {Ω : Type*}
+
 /-- **Squared prediction error for Gaussian model.**
     If Y = μ(X) + ε, ε ~ N(0, σ²), and Ŷ = μ̂(X), then
     (Y - Ŷ)² = (μ - μ̂ + ε)² = (μ - μ̂)² + 2(μ - μ̂)ε + ε². -/
@@ -158,29 +161,75 @@ theorem squared_error_expansion (μ μ_hat ε : ℝ) :
 /-- **Expected squared error given X = x.**
     E[(Y - Ŷ)² | X = x] = (μ(x) - μ̂(x))² + σ².
     The first term is the squared bias, the second is irreducible noise. -/
-theorem expected_squared_error_given_x (bias σ_sq : ℝ) :
-    bias ^ 2 + σ_sq ≥ σ_sq := by
-  linarith [sq_nonneg bias]
+theorem expected_squared_error_given_x
+    (E : ExpFunctional Ω)
+    (μ μ_hat σ_sq : ℝ) (ε : Ω → ℝ)
+    (h_mean : E ε = 0)
+    (h_var : E (fun ω => (ε ω) ^ 2) = σ_sq) :
+    E (fun ω => (μ + ε ω - μ_hat) ^ 2) = (μ - μ_hat) ^ 2 + σ_sq := by
+  have h_expand : (fun ω => (μ + ε ω - μ_hat) ^ 2) =
+      (fun ω => (μ - μ_hat)^2) + (fun ω => 2*(μ - μ_hat)*ε ω) + (fun ω => (ε ω)^2) := by
+    funext ω
+    dsimp
+    ring
+  rw [h_expand]
+  rw [E.add_eval, E.add_eval]
+  rw [E.eval_const]
+  have h_term2 : E (fun ω => 2 * (μ - μ_hat) * ε ω) = 0 := by
+    have h_c : (fun ω => 2 * (μ - μ_hat) * ε ω) = (2 * (μ - μ_hat)) • ε := by
+      rfl
+    rw [h_c, E.smul_eval, h_mean, mul_zero]
+  rw [h_term2, h_var]
+  ring
 
 /-- **Variance of squared error given X = x.**
-    Var((Y - Ŷ)² | X = x) ≈ 4·bias²·σ² + 2·σ⁴.
-    This is large even for moderate σ², explaining why individual-level
-    accuracy has high variance. -/
-theorem variance_of_squared_error_lower_bound (σ_sq : ℝ) (hσ : 0 < σ_sq) :
-    0 < 2 * σ_sq ^ 2 := by positivity
+    For Gaussian noise, E[ε³] = 0 and E[ε⁴] = 3σ⁴.
+    Var((Y - Ŷ)² | X = x) = 4·bias²·σ² + 2·σ⁴. -/
+theorem variance_of_squared_error_lower_bound
+    (E : ExpFunctional Ω)
+    (bias σ_sq : ℝ) (ε : Ω → ℝ)
+    (h_mean : E ε = 0)
+    (h_var : E (fun ω => (ε ω) ^ 2) = σ_sq)
+    (h_skew : E (fun ω => (ε ω) ^ 3) = 0)
+    (h_kurtosis : E (fun ω => (ε ω) ^ 4) = 3 * σ_sq ^ 2) :
+    variance E (fun ω => (bias + ε ω) ^ 2) = 4 * bias ^ 2 * σ_sq + 2 * σ_sq ^ 2 := by
+  rw [variance_eq_expect_sq_sub_sq_mean]
+  have h_sq : (fun ω => (bias + ε ω) ^ 2) =
+      (fun ω => bias^2) + (fun ω => 2*bias*ε ω) + (fun ω => (ε ω)^2) := by
+    funext ω
+    dsimp
+    ring
+  have h_mean_sq : E (fun ω => (bias + ε ω) ^ 2) = bias^2 + σ_sq := by
+    rw [h_sq]
+    rw [E.add_eval, E.add_eval, E.eval_const]
+    have hc : (fun ω => 2 * bias * ε ω) = (2 * bias) • ε := rfl
+    rw [hc, E.smul_eval, h_mean, mul_zero, add_zero, h_var]
+  have h_sq_sq : (fun ω => ((bias + ε ω) ^ 2) ^ 2) =
+      (fun ω => bias^4) + (fun ω => 4*bias^3*ε ω) + (fun ω => 6*bias^2*(ε ω)^2) + (fun ω => 4*bias*(ε ω)^3) + (fun ω => (ε ω)^4) := by
+    funext ω
+    dsimp
+    ring
+  have h_mean_sq_sq : E (fun ω => ((bias + ε ω) ^ 2) ^ 2) = bias^4 + 6 * bias^2 * σ_sq + 3 * σ_sq^2 := by
+    rw [h_sq_sq]
+    rw [E.add_eval, E.add_eval, E.add_eval, E.add_eval]
+    rw [E.eval_const]
+    have hc1 : (fun ω => 4 * bias^3 * ε ω) = (4 * bias^3) • ε := rfl
+    rw [hc1, E.smul_eval, h_mean, mul_zero, add_zero]
+    have hc2 : (fun ω => 6 * bias^2 * (ε ω)^2) = (6 * bias^2) • (fun ω => (ε ω)^2) := rfl
+    rw [hc2, E.smul_eval, h_var]
+    have hc3 : (fun ω => 4 * bias * (ε ω)^3) = (4 * bias) • (fun ω => (ε ω)^3) := rfl
+    rw [hc3, E.smul_eval, h_skew, mul_zero, add_zero]
+    rw [h_kurtosis]
+  rw [h_mean_sq, h_mean_sq_sq]
+  ring
 
-/-- **Conditional variance is large relative to conditional mean squared.**
-    For ε ~ N(0, σ²), we have E[ε²] = σ² and Var(ε²) = 2σ⁴.
-    Therefore CV² = Var(ε²)/E[ε²]² = 2σ⁴/σ⁴ = 2.
-    Adding squared bias b² to the mean only reduces CV² (denominator grows faster),
-    but the variance term 2σ⁴ provides a lower bound on conditional-squared-error
-    variance regardless of bias.
-
-    We derive: Var(squared error) / E[squared error]² ≥ 2σ⁴/(b² + σ²)²,
-    and the conditional variance 4b²σ² + 2σ⁴ ≥ 2σ⁴ always. -/
-theorem high_cv_inevitable (σ_sq bias_sq : ℝ) (hσ : 0 < σ_sq) (hb : 0 ≤ bias_sq) :
-    -- Variance of squared error (4b²σ² + 2σ⁴) ≥ irreducible noise variance (2σ⁴)
-    4 * bias_sq * σ_sq + 2 * σ_sq ^ 2 ≥ 2 * σ_sq ^ 2 := by
+theorem high_cv_inevitable
+    (E : ExpFunctional Ω)
+    (bias σ_sq : ℝ) (ε : Ω → ℝ)
+    (h_var_sq_err : variance E (fun ω => (bias + ε ω) ^ 2) = 4 * bias ^ 2 * σ_sq + 2 * σ_sq ^ 2)
+    (hσ : 0 < σ_sq) (hb : 0 ≤ bias ^ 2) :
+    variance E (fun ω => (bias + ε ω) ^ 2) ≥ 2 * σ_sq ^ 2 := by
+  rw [h_var_sq_err]
   nlinarith [mul_nonneg hb (le_of_lt hσ)]
 
 /-- **Spline fit R² bounded above by noise-to-signal ratio.**
