@@ -331,6 +331,10 @@ human genetic diversity, not just for well-represented groups.
 
 section AncestryFairness
 
+noncomputable def portability (c fst : ℝ) : ℝ := 1 - c * fst
+
+noncomputable def portability_gap (c fst : ℝ) : ℝ := 1 - portability c fst
+
 /-- **Portability gap creates health disparities.**
     Groups with worse portability get less clinical benefit from PGS.
     The gap scales with Fst from the discovery population.
@@ -338,10 +342,11 @@ section AncestryFairness
     means lower portability (larger gap = 1 - portability). -/
 theorem portability_gap_scales_with_fst
     (fst₁ fst₂ c : ℝ)
-    (h_fst : fst₁ < fst₂) (h_c : 0 < c)
-    (h_fst₁_nn : 0 ≤ fst₁) :
-    c * fst₁ < c * fst₂ := by
-  exact mul_lt_mul_of_pos_left h_fst h_c
+    (h_fst : fst₁ < fst₂) (h_c : 0 < c) :
+    portability_gap c fst₁ < portability_gap c fst₂ := by
+  unfold portability_gap portability
+  have : c * fst₁ < c * fst₂ := mul_lt_mul_of_pos_left h_fst h_c
+  linarith
 
 /-- **Equitable PGS requires proportional investment.**
     To achieve equal R² across populations, the sample size
@@ -354,6 +359,9 @@ theorem equitable_pgs_overinvestment
     n_proportional < k * n_proportional := by
   nlinarith
 
+noncomputable def r2_in_pop (r2_source c fst : ℝ) : ℝ :=
+  r2_source * portability c fst
+
 /-- **Universal portability is impossible.**
     No single PGS can achieve equal R² in all populations,
     because genetic architecture genuinely differs (GxE, selection).
@@ -361,12 +369,14 @@ theorem equitable_pgs_overinvestment
     decaying as (1 - c × Fst), the max and min R² must differ
     when Fst values differ. -/
 theorem universal_portability_impossible
-    (r2_source fst_near fst_far c : ℝ)
+    (r2_source c fst_near fst_far : ℝ)
     (h_r2 : 0 < r2_source) (h_c : 0 < c)
-    (h_near : 0 ≤ fst_near) (h_far_gt : fst_near < fst_far) :
-    -- The portability gap between near and far populations is positive
-    r2_source * c * fst_near < r2_source * c * fst_far := by
-  exact mul_lt_mul_of_pos_left h_far_gt (mul_pos h_r2 h_c)
+    (h_far_gt : fst_near < fst_far) :
+    r2_in_pop r2_source c fst_far < r2_in_pop r2_source c fst_near := by
+  unfold r2_in_pop portability
+  have h_c_fst_near_lt : c * fst_near < c * fst_far := mul_lt_mul_of_pos_left h_far_gt h_c
+  have h_diff_near_gt : 1 - c * fst_far < 1 - c * fst_near := by linarith
+  exact mul_lt_mul_of_pos_left h_diff_near_gt h_r2
 
 end AncestryFairness
 
