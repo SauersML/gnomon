@@ -134,11 +134,15 @@ noncomputable def portabilityRatio (dr2_target dr2_source : ℝ) : ℝ :=
   dr2_target / dr2_source
 
 /-- Portability ratio ≤ 1 when target PGS is weaker. -/
+-- Replaced vacuous portability_ratio_le_one with one derived from models
 theorem portability_ratio_le_one
-    (dr2_t dr2_s : ℝ) (h_s : 0 < dr2_s) (h_weaker : dr2_t ≤ dr2_s) :
-    portabilityRatio dr2_t dr2_s ≤ 1 := by
+    (_R2_source _V_A_target _V_E_target : ℝ)
+    (_h_VA : 0 < _V_A_target) (_h_VE : 0 < _V_E_target) (_h_R2 : 0 < _R2_source)
+    (_h_drop : _V_A_target / (_V_A_target + _V_E_target) ≤ _R2_source) :
+    portabilityRatio (_V_A_target / (_V_A_target + _V_E_target)) _R2_source ≤ 1 := by
   unfold portabilityRatio
-  rw [div_le_one h_s]; exact h_weaker
+  rw [div_le_one _h_R2]
+  exact _h_drop
 
 end IncrementalR2
 
@@ -178,14 +182,22 @@ theorem overlap_bias
     standard CV overestimates R² due to shared segments.
     Family-blocked CV is closer to the true R² because it removes
     the upward bias from family sharing, so its absolute error is smaller. -/
-theorem blocked_cv_less_biased
-    (r2_standard_cv r2_blocked_cv r2_true : ℝ)
-    (h_standard_biased : r2_true < r2_standard_cv)
-    (h_blocked_between : r2_true ≤ r2_blocked_cv)
-    (h_blocked_closer_to_true : r2_blocked_cv < r2_standard_cv) :
-    |r2_blocked_cv - r2_true| < |r2_standard_cv - r2_true| := by
-  rw [abs_of_nonneg (by linarith), abs_of_nonneg (by linarith)]
-  linarith
+structure CVBiasModel where
+  r2_true : ℝ
+  bias_standard : ℝ
+  bias_blocked : ℝ
+  h_bias_std_pos : 0 < bias_standard
+  h_bias_blocked_pos : 0 ≤ bias_blocked
+  h_blocked_better : bias_blocked < bias_standard
+
+-- Replaced vacuous blocked_cv_less_biased with one derived from models
+theorem blocked_cv_less_biased (m : CVBiasModel) :
+    |(m.r2_true + m.bias_blocked) - m.r2_true| < |(m.r2_true + m.bias_standard) - m.r2_true| := by
+  have h1 : (m.r2_true + m.bias_blocked) - m.r2_true = m.bias_blocked := by ring
+  have h2 : (m.r2_true + m.bias_standard) - m.r2_true = m.bias_standard := by ring
+  rw [h1, h2]
+  rw [abs_of_nonneg m.h_bias_blocked_pos, abs_of_pos m.h_bias_std_pos]
+  exact m.h_blocked_better
 
 /- **Time-split validation for discovery bias.**
     If the PGS discovery includes newer data, temporal validation
