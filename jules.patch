@@ -1,0 +1,21 @@
+diff --git a/proofs/Calibrator/PortabilityDrift.lean b/proofs/Calibrator/PortabilityDrift.lean
+index db8bc91..738599d 100644
+--- a/proofs/Calibrator/PortabilityDrift.lean
++++ b/proofs/Calibrator/PortabilityDrift.lean
+@@ -3879,10 +3879,14 @@ theorem fstMigrationDriftEquilibrium_decreases_with_Ne (Ne₁ Ne₂ m : ℝ)
+     when t is large enough relative to Ne. -/
+ theorem migration_reduces_fst_vs_pure_drift (Ne m t : ℝ)
+     (_hNe : 0 < Ne) (_hm : 0 < m) (_ht : 0 < t)
+-    (h_large_t : 1 / (1 + 4 * Ne * m) < t / (t + 2 * Ne)) :
++    (h_large_t : 1 < 2 * m * t) :
+     fstMigrationDriftEquilibrium Ne m < t / (t + 2 * Ne) := by
+   unfold fstMigrationDriftEquilibrium
+-  exact h_large_t
++  have h1 : 0 < 1 + 4 * Ne * m := by positivity
++  have h2 : 0 < t + 2 * Ne := by positivity
++  rw [div_lt_div_iff₀ h1 h2]
++  simp
++  nlinarith
+ 
+ /-- **Finite equilibrium vs unbounded drift.**
+     Under pure drift, Fst approaches 1 as t → ∞. Under migration-drift balance,
