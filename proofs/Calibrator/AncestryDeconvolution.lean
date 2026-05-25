@@ -312,12 +312,15 @@ theorem individual_variation_dominates
     Too fine (exact PC coordinates) adds noise with small samples.
     Optimal depends on available calibration data. -/
 theorem optimal_granularity_tradeoff
-    (bias_coarse bias_fine variance_coarse variance_fine : ℝ)
-    (h_coarse_biased : bias_fine < bias_coarse)
-    (h_fine_variable : variance_coarse < variance_fine) :
-    -- Different regimes have different optima
-    bias_fine < bias_coarse ∧ variance_coarse < variance_fine :=
-  ⟨h_coarse_biased, h_fine_variable⟩
+    (mse : ℝ → ℝ) (c_min c_max : ℝ)
+    (h_range : c_min < c_max)
+    (h_coarse_biased : ∀ c, c_min < c → c < c_max → mse c < mse c_min)
+    (h_fine_variable : ∀ c, c_min < c → c < c_max → mse c < mse c_max) :
+    ∃ c_opt, c_min < c_opt ∧ c_opt < c_max ∧ mse c_opt < mse c_min ∧ mse c_opt < mse c_max := by
+  use (c_min + c_max) / 2
+  have h1 : c_min < (c_min + c_max) / 2 := by linarith
+  have h2 : (c_min + c_max) / 2 < c_max := by linarith
+  exact ⟨h1, h2, h_coarse_biased _ h1 h2, h_fine_variable _ h1 h2⟩
 
 end ContinuousAncestry
 
