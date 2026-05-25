@@ -311,6 +311,57 @@ cache_du() {
   fi
 }
 
+plink_triplet_exists() {
+  local prefix="$1"
+  [ -s "${prefix}.bed" ] && [ -s "${prefix}.bim" ] && [ -s "${prefix}.fam" ]
+}
+
+stage_plink_triplet_if_missing() {
+  local plink_dir="$RUN_STATE_DIR/plink"
+  local plink_prefix="$plink_dir/arrays"
+  local cdr_storage="${CDR_STORAGE_PATH:-gs://fc-aou-datasets-controlled/v8}"
+  cdr_storage="${cdr_storage%/}"
+  local remote_prefix="$cdr_storage/microarray/plink/arrays"
+  local project="${GOOGLE_PROJECT:-}"
+
+  if plink_triplet_exists "$plink_prefix"; then
+    echo "[run.sh] PLINK triplet already staged at $plink_prefix"
+    return 0
+  fi
+
+  mkdir -p "$plink_dir"
+  echo "[run.sh] staging AoU microarray PLINK triplet"
+  echo "[run.sh]   source: ${remote_prefix}.{bed,bim,fam}"
+  echo "[run.sh]   target: ${plink_prefix}.{bed,bim,fam}"
+
+  if [ -z "$project" ] && command -v gcloud >/dev/null 2>&1; then
+    project="$(gcloud config get-value project 2>/dev/null || true)"
+  fi
+
+  if command -v gsutil >/dev/null 2>&1; then
+    if [ -n "$project" ]; then
+      gsutil -m -u "$project" cp "${remote_prefix}.bed" "${remote_prefix}.bim" "${remote_prefix}.fam" "$plink_dir/"
+    else
+      gsutil -m cp "${remote_prefix}.bed" "${remote_prefix}.bim" "${remote_prefix}.fam" "$plink_dir/"
+    fi
+  elif command -v gcloud >/dev/null 2>&1; then
+    if [ -n "$project" ]; then
+      gcloud storage cp --billing-project "$project" "${remote_prefix}.bed" "${remote_prefix}.bim" "${remote_prefix}.fam" "$plink_dir/"
+    else
+      gcloud storage cp "${remote_prefix}.bed" "${remote_prefix}.bim" "${remote_prefix}.fam" "$plink_dir/"
+    fi
+  else
+    echo "[run.sh] cannot stage PLINK files: neither gsutil nor gcloud is installed"
+    return 1
+  fi
+
+  if ! plink_triplet_exists "$plink_prefix"; then
+    echo "[run.sh] PLINK staging failed: expected ${plink_prefix}.{bed,bim,fam}"
+    ls -lh "$plink_dir" || true
+    return 1
+  fi
+}
+
 failure_diagnostics() {
   local exit_code="$1"
   trap - ERR
