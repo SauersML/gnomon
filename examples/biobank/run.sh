@@ -316,6 +316,21 @@ plink_triplet_exists() {
   [ -s "${prefix}.bed" ] && [ -s "${prefix}.bim" ] && [ -s "${prefix}.fam" ]
 }
 
+mounted_plink_prefix() {
+  local candidate
+  for candidate in \
+    "$HOME/workspace/vwb-aou-datasets-controlled/v8/microarray/plink/arrays" \
+    "$HOME/workspace/aou-datasets-controlled/v8/microarray/plink/arrays" \
+    "$HOME/workspace/fc-aou-datasets-controlled/v8/microarray/plink/arrays" \
+    "/workspace/vwb-aou-datasets-controlled/v8/microarray/plink/arrays"; do
+    if plink_triplet_exists "$candidate"; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
 copy_gcs_object() {
   local src="$1"
   local dst="$2"
@@ -354,6 +369,19 @@ stage_plink_triplet_if_missing() {
   fi
 
   mkdir -p "$plink_dir"
+  local mounted_prefix
+  if mounted_prefix="$(mounted_plink_prefix)"; then
+    echo "[run.sh] PLINK triplet found in mounted workspace resource"
+    echo "[run.sh]   source: ${mounted_prefix}.{bed,bim,fam}"
+    echo "[run.sh]   target: ${plink_prefix}.{bed,bim,fam}"
+    local ext
+    for ext in bed bim fam; do
+      rm -f "${plink_prefix}.${ext}" "${plink_prefix}.${ext}.tmp"
+      ln -s "${mounted_prefix}.${ext}" "${plink_prefix}.${ext}"
+    done
+    return 0
+  fi
+
   echo "[run.sh] staging AoU microarray PLINK triplet"
   echo "[run.sh]   source: ${remote_prefix}.{bed,bim,fam}"
   echo "[run.sh]   target: ${plink_prefix}.{bed,bim,fam}"
