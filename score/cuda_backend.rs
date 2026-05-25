@@ -390,9 +390,12 @@ fn cuda_library_family(basename: &str) -> Option<&'static str> {
 /// `BTreeMap`/`BTreeSet` give stable ordering in diagnostic output.
 /// Returns an empty map on non-Linux hosts (where `/proc/self/maps`
 /// doesn't exist) — callers treat that as "no conflicts to detect".
-fn cuda_library_mappings() -> std::collections::BTreeMap<&'static str, std::collections::BTreeSet<String>> {
-    let mut by_family: std::collections::BTreeMap<&'static str, std::collections::BTreeSet<String>> =
-        std::collections::BTreeMap::new();
+fn cuda_library_mappings()
+-> std::collections::BTreeMap<&'static str, std::collections::BTreeSet<String>> {
+    let mut by_family: std::collections::BTreeMap<
+        &'static str,
+        std::collections::BTreeSet<String>,
+    > = std::collections::BTreeMap::new();
     let Ok(maps) = fs::read_to_string("/proc/self/maps") else {
         return by_family;
     };
@@ -408,7 +411,10 @@ fn cuda_library_mappings() -> std::collections::BTreeMap<&'static str, std::coll
             .and_then(|n| n.to_str())
             .unwrap_or("");
         if let Some(family) = cuda_library_family(name) {
-            by_family.entry(family).or_default().insert(path.to_string());
+            by_family
+                .entry(family)
+                .or_default()
+                .insert(path.to_string());
         }
     }
     by_family
@@ -524,8 +530,28 @@ fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
     "unknown panic payload".to_string()
 }
 
+fn preflight_cuda_dynamic_libraries() -> Result<(), String> {
+    if !unsafe { cudarc::nvrtc::sys::is_culib_present() } {
+        return Err(format!(
+            "NVRTC library not loadable; CUDA scoring requires libnvrtc for kernel compilation. \
+             Searched library names: {}",
+            cudarc::get_lib_name_candidates("nvrtc").join(", ")
+        ));
+    }
+    if !unsafe { cudarc::cublas::sys::is_culib_present() } {
+        return Err(format!(
+            "cuBLAS library not loadable; CUDA scoring requires cuBLAS for score matrix products. \
+             Searched library names: {}",
+            cudarc::get_lib_name_candidates("cublas").join(", ")
+        ));
+    }
+    Ok(())
+}
+
 impl CudaRuntime {
     fn new(prep: &PreparationResult) -> Result<Self, String> {
+        preflight_cuda_dynamic_libraries()?;
+
         let ctx = CudaContext::new(0).map_err(|e| format!("CUDA init failed: {e:?}"))?;
         ctx.bind_to_thread()
             .map_err(|e| format!("Failed to bind CUDA context: {e:?}"))?;
@@ -1946,5 +1972,39 @@ mod tests {
             .expect("complex resolver branch must exist");
 
         assert!(support_drop_pos < resolver_pos);
+    }
+
+    #[test]
+    fn cuda_dynamic_libraries_are_preflighted_before_nvrtc_compile() {
+        let source = include_str!("cuda_backend.rs");
+        let runtime_new_pos = source
+            .find("fn new(prep: &PreparationResult) -> Result<Self, String> {")
+            .expect("CudaRuntime::new must exist");
+        let after_runtime_new = &source[runtime_new_pos..];
+        let preflight_pos = after_runtime_new
+            .find("preflight_cuda_dynamic_libraries()?;")
+            .expect("CudaRuntime::new must preflight dynamic CUDA libraries");
+        let compile_pos = after_runtime_new
+            .find("compile_ptx(CUDA_KERNELS)")
+            .expect("CudaRuntime::new must compile CUDA kernels");
+
+        assert!(preflight_pos < compile_pos);
+    }
+
+    #[test]
+    fn cuda_preflight_uses_non_panicking_cudarc_probes() {
+        let source = include_str!("cuda_backend.rs");
+        let preflight_start = source
+            .find("fn preflight_cuda_dynamic_libraries()")
+            .expect("CUDA dynamic library preflight must exist");
+        let after_preflight_start = &source[preflight_start..];
+        let preflight_end = after_preflight_start
+            .find("\n}\n\nimpl CudaRuntime")
+            .expect("preflight function must precede CudaRuntime impl");
+        let body = &after_preflight_start[..preflight_end];
+
+        assert!(body.contains("cudarc::nvrtc::sys::is_culib_present()"));
+        assert!(body.contains("cudarc::cublas::sys::is_culib_present()"));
+        assert!(!body.contains("culib()"));
     }
 }

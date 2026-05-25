@@ -145,6 +145,74 @@ def _search_roots() -> list[Path]:
     return _dedup_paths([Path.cwd(), SCRIPT_DIR, HOME])
 
 
+def _python_cuda_lib_dirs() -> list[Path]:
+    """Find CUDA shared-library directories from Python nvidia wheels."""
+    nvidia_roots: list[Path] = []
+    try:
+        import nvidia
+    except Exception:
+        pass
+    else:
+        for raw_path in getattr(nvidia, "__path__", []):
+            nvidia_roots.append(Path(raw_path))
+    for raw_path in sys.path:
+        if not raw_path:
+            continue
+        nvidia_roots.append(Path(raw_path) / "nvidia")
+
+    lib_dirs: list[Path] = []
+    for root in _dedup_paths(nvidia_roots):
+        try:
+            children = list(root.iterdir())
+        except OSError:
+            continue
+        for child in children:
+            lib_dir = child / "lib"
+            if not lib_dir.is_dir():
+                continue
+            try:
+                has_shared_library = any(
+                    entry.is_file() and ".so" in entry.name
+                    for entry in lib_dir.iterdir()
+                )
+            except OSError:
+                continue
+            if has_shared_library:
+                lib_dirs.append(lib_dir)
+
+    order = {
+        "cuda_nvrtc": 0,
+        "cuda_runtime": 1,
+        "nvjitlink": 2,
+        "cublas": 3,
+        "cusparse": 4,
+        "cusolver": 5,
+    }
+    return sorted(
+        _dedup_paths(lib_dirs),
+        key=lambda path: (order.get(path.parent.name, 100), path.parent.name),
+    )
+
+
+def _gnomon_subprocess_env() -> dict[str, str]:
+    env = dict(os.environ)
+    cuda_lib_dirs = _python_cuda_lib_dirs()
+    if not cuda_lib_dirs:
+        return env
+
+    existing = [
+        Path(raw_path)
+        for raw_path in env.get("LD_LIBRARY_PATH", "").split(":")
+        if raw_path
+    ]
+    ld_paths = _dedup_paths([*cuda_lib_dirs, *existing])
+    env["LD_LIBRARY_PATH"] = ":".join(str(path) for path in ld_paths)
+    print("[score] CUDA library path for gnomon subprocess:", flush=True)
+    for path in cuda_lib_dirs:
+        print(f"[score]   {path}", flush=True)
+    return env
+
+
 def _iter_files_with_suffix(suffix: str, max_depth: int = 4):
     suffix = suffix.lower()
     skip_dirs = {
@@ -498,10 +566,9 @@ def ensure_scored(pgs_ids: list[str]) -> None:
     # Earlier revisions of this script split each PGS into its own
     # subprocess as a workaround for an AoU CUDA teardown abort
     # ("double free or corruption (!prev)" at ~100% progress). If that
-    # bug resurfaces, this call will fail without writing all outputs
-    # — re-add a per-PGS loop here as a fallback.
+    # bug resurfaces, this call will fail without writing all outputs.
     score_arg = ",".join(missing)
-    env = dict(os.environ)
+    env = _gnomon_subprocess_env()
     print(f"[score] running {GNOMON_BIN} score {score_arg} {PLINK_PREFIX}")
     result = subprocess.run(
         [GNOMON_BIN, "score", score_arg, str(PLINK_PREFIX)], check=False, env=env,
