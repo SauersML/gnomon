@@ -4,6 +4,52 @@ export PATH="$HOME/.local/bin:$PATH"
 export PYTHONUNBUFFERED=1
 
 SCRIPT_DIR="$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &>/dev/null && pwd )"
+GNOMON_REPO_URL="https://github.com/SauersML/gnomon.git"
+GNOMON_CHECKOUT_DIR=""
+
+resolve_gnomon_checkout() {
+  if git -C "$SCRIPT_DIR" rev-parse --show-toplevel >/dev/null 2>&1; then
+    git -C "$SCRIPT_DIR" rev-parse --show-toplevel
+    return 0
+  fi
+  if [ -d "$HOME/gnomon/.git" ]; then
+    printf '%s\n' "$HOME/gnomon"
+    return 0
+  fi
+  if ! command -v git >/dev/null 2>&1; then
+    echo "[run.sh] git is required to bootstrap $HOME/gnomon" >&2
+    return 1
+  fi
+  if [ -e "$HOME/gnomon" ]; then
+    echo "[run.sh] $HOME/gnomon exists but is not a git checkout" >&2
+    return 1
+  fi
+  echo "[run.sh] cloning gnomon into $HOME/gnomon" >&2
+  git clone "$GNOMON_REPO_URL" "$HOME/gnomon" >&2
+  printf '%s\n' "$HOME/gnomon"
+}
+
+install_uv_if_missing() {
+  if command -v uv >/dev/null 2>&1; then
+    return 0
+  fi
+  mkdir -p "$HOME/.local/bin"
+  echo "[run.sh] uv missing; installing uv into $HOME/.local/bin" >&2
+  if command -v curl >/dev/null 2>&1; then
+    curl -LsSf --retry 5 --retry-delay 2 https://astral.sh/uv/install.sh | sh
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO- https://astral.sh/uv/install.sh | sh
+  else
+    echo "[run.sh] cannot install uv: curl and wget are both missing" >&2
+    return 1
+  fi
+  export PATH="$HOME/.local/bin:$PATH"
+  hash -r
+  if ! command -v uv >/dev/null 2>&1; then
+    echo "[run.sh] uv install completed but uv is still not on PATH=$PATH" >&2
+    return 1
+  fi
+}
 
 MODE="both"
 REEXEC_FLAG="--reexecuted"
@@ -38,6 +84,8 @@ case "$MODE" in
 esac
 echo "[run.sh] mode=$MODE" >&2
 
+GNOMON_CHECKOUT_DIR="$(resolve_gnomon_checkout)"
+
 # --- kill any older biobank run still in flight -----------------------------
 # Match by the python entrypoint, not by run.sh -- prior runs may still be
 # blocking on a long gamfit fit even if their wrapper shell has exited.
@@ -59,10 +107,13 @@ fi
 # `exec bash "$0" --reexecuted` reloads run.sh from disk so the latest
 # code is what actually runs. The `--reexecuted` flag (not an env var)
 # prevents an infinite re-exec loop.
-if [ "$REEXECUTED" -eq 0 ] && git -C "$SCRIPT_DIR" rev-parse --git-dir >/dev/null 2>&1; then
-  REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
-  echo "[run.sh] git pull --ff-only in $REPO_ROOT" >&2
-  if git -C "$REPO_ROOT" pull --ff-only; then
+if [ "$REEXECUTED" -eq 0 ] && [ -n "$GNOMON_CHECKOUT_DIR" ] && [ -d "$GNOMON_CHECKOUT_DIR/.git" ]; then
+  echo "[run.sh] git pull --ff-only in $GNOMON_CHECKOUT_DIR" >&2
+  if git -C "$GNOMON_CHECKOUT_DIR" pull --ff-only; then
+    REFRESHED_SCRIPT="$GNOMON_CHECKOUT_DIR/examples/biobank/run.sh"
+    if [ -f "$REFRESHED_SCRIPT" ]; then
+      exec bash "$REFRESHED_SCRIPT" "$REEXEC_FLAG" --mode "$MODE"
+    fi
     exec bash "$0" "$REEXEC_FLAG" --mode "$MODE"
   else
     echo "[run.sh] git pull failed; continuing with on-disk code" >&2
@@ -74,13 +125,10 @@ fi
 # the whole policy. No cargo, no SHA matching, no "refuse stale". If
 # the release lags HEAD by 15-20 min after a push, the run uses the
 # older binary — that's fine.
-if [ ! -d "$HOME/gnomon/.git" ]; then
-  echo "[run.sh] expected a git checkout at $HOME/gnomon" >&2
-  exit 1
-fi
+GNOMON_CHECKOUT_DIR="$(resolve_gnomon_checkout)"
 INSTALL_DIR="$HOME/.local/bin"
 mkdir -p "$INSTALL_DIR" "$HOME/.local/share/gnomon"
-GNOMON_CHECKOUT_SHA="$(git -C "$HOME/gnomon" rev-parse HEAD)"
+GNOMON_CHECKOUT_SHA="$(git -C "$GNOMON_CHECKOUT_DIR" rev-parse HEAD)"
 GNOMON_RELEASE_JSON="$(curl -sL --retry 5 --retry-delay 2 --connect-timeout 5 --max-time 30 \
   "https://api.github.com/repos/SauersML/gnomon/releases/latest")"
 GNOMON_INSTALLED_RELEASE="$(printf '%s' "$GNOMON_RELEASE_JSON" \
@@ -154,10 +202,7 @@ export UV_CACHE_DIR UV_PYTHON_INSTALL_DIR XDG_CACHE_HOME XDG_DATA_HOME TMPDIR
 TS=$(date -u +%Y%m%dT%H%M%SZ)
 RESULTS="$RESULTS_DIR/biobank_run_${TS}.log"
 
-if ! command -v uv >/dev/null 2>&1; then
-  echo "[run.sh] uv is not on PATH after PATH=$PATH" | tee -a "$RESULTS" >&2
-  exit 127
-fi
+install_uv_if_missing
 
 path_usage() {
   local label="$1"
@@ -320,11 +365,12 @@ trap 'failure_diagnostics $?' ERR
   echo "timestamp_utc:    $TS"
   echo "host:             $(hostname)"
   echo "user:             $(whoami)"
-  echo "git_rev:          $(git -C "$HOME/gnomon" rev-parse --short HEAD 2>/dev/null || echo unknown)"
-  echo "git_subject:      $(git -C "$HOME/gnomon" log -1 --format=%s 2>/dev/null || echo unknown)"
+  echo "gnomon_checkout:  $GNOMON_CHECKOUT_DIR"
+  echo "git_rev:          $(git -C "$GNOMON_CHECKOUT_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  echo "git_subject:      $(git -C "$GNOMON_CHECKOUT_DIR" log -1 --format=%s 2>/dev/null || echo unknown)"
   echo "gnomon_bin:       $(command -v gnomon)"
   echo "gnomon_version:   $(gnomon --version 2>/dev/null | head -1 || echo unknown)"
-  echo "gnomon_head_sha:  $(git -C "$HOME/gnomon" rev-parse HEAD 2>/dev/null || echo unknown)"
+  echo "gnomon_head_sha:  $(git -C "$GNOMON_CHECKOUT_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
   echo "gnomon_install_mode: ${GNOMON_INSTALL_MODE:-<unset>}"
   echo "gnomon_checkout_sha: ${GNOMON_CHECKOUT_SHA:-<unset>}"
   echo "gnomon_installed_sha_file: $(cat "$HOME/.local/share/gnomon/installed-sha" 2>/dev/null || echo '<missing>')"
