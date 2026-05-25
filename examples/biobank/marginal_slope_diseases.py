@@ -2315,9 +2315,40 @@ def evaluate_model_pair(
     population_prevalence: float | None = None,
     save_info: dict[str, object] | None = None,
     score_train: bool = True,
+    mode: str = "both",
 ) -> dict[str, float]:
-    """Fit GAM + Cox baselines and print survival validation metrics."""
+    """Fit GAM + Cox baselines and print survival validation metrics.
+
+    `mode` selects which fits to run: ``"both"`` (default) runs the
+    survival marginal-slope GAM with Cox PH baselines *and* the binary
+    marginal-slope GAM with logistic baselines; ``"survival"`` skips the
+    binary path; ``"binary"`` skips the survival path (no Cox fits, no
+    sksurv metrics, no ``.gamfit`` artifact write).
+    """
     train, test, pgs_mean, pgs_std = prepare_scores(train, test, pc_cols, pgs_id)
+
+    if mode == "binary":
+        # Short-circuit: skip the survival GAM, Cox baselines, sksurv
+        # metrics, and artifact save entirely. `evaluate_binary_model_pair`
+        # is self-contained — it adds its own age features and fits its
+        # own logistic baselines.
+        if save_info is not None:
+            print("  save: skipped (mode=binary does not persist artifacts)")
+        binary_result = evaluate_binary_model_pair(
+            train, test, pc_cols, pgs_id,
+            label=label,
+            population_prevalence=population_prevalence,
+            score_train=score_train,
+        )
+        result: dict[str, float | int | str] = {
+            "label": label, "pgs": pgs_id, **binary_result,
+        }
+        print("  RESULT " + json.dumps(result, sort_keys=True))
+        return {
+            k: float(v)
+            for k, v in result.items()
+            if isinstance(v, (int, float)) and not isinstance(v, bool)
+        }
 
     # Fit. Resume is handled transparently by gamfit's persistent warm-start
     # cache at `XDG_CACHE_HOME/gam/warm/v1/`: on identical (training data, gamfit
@@ -2529,15 +2560,18 @@ def evaluate_model_pair(
         f"95%CI=[{delta_B_c_ci_low:+.4f},{delta_B_c_ci_high:+.4f}] "
         f"ΔIBS={delta_B_ibs:+.5f} ΔR2_IBS={delta_B_r2:+.4f}"
     )
-    binary_result = evaluate_binary_model_pair(
-        train,
-        test,
-        pc_cols,
-        pgs_id,
-        label=label,
-        population_prevalence=population_prevalence,
-        score_train=score_train,
-    )
+    if mode != "survival":
+        binary_result = evaluate_binary_model_pair(
+            train,
+            test,
+            pc_cols,
+            pgs_id,
+            label=label,
+            population_prevalence=population_prevalence,
+            score_train=score_train,
+        )
+    else:
+        binary_result = {}
 
     result: dict[str, float | int | str] = {
         "label": label,
@@ -2657,8 +2691,20 @@ def run_loso_axis(
     min_test_n: int,
     max_groups: int | None = None,
     score_train: bool = False,
+    mode: str = "both",
 ) -> None:
-    """Leave one group out: refit both models on all other groups."""
+    """Leave one group out: refit both models on all other groups.
+
+    `mode` is threaded into `evaluate_model_pair`. The LOSO summary
+    metric is the survival ΔC-ipcw vs baselineA when survival fits ran,
+    and the binary ΔAUROC vs baselineB when only binary fits ran.
+    """
+    if mode == "binary":
+        summary_key = "binary_delta_auroc_vs_baselineB"
+        summary_label = "binary_delta_auroc_GAM-B"
+    else:
+        summary_key = "delta_test_c_ipcw_vs_baselineA"
+        summary_label = "delta_C_ipcw"
     groups = loso_groups(
         df_full,
         group_col,
@@ -2697,22 +2743,39 @@ def run_loso_axis(
             label=f"LOSO[{axis_name}] holdout={group_short!r}",
             population_prevalence=float(df_full["event"].mean()),
             score_train=score_train,
+            mode=mode,
         )
-        deltas.append(result["delta_test_c_ipcw_vs_baselineA"])
+        deltas.append(result[summary_key])
 
     print(
         f"  LOSO summary axis={axis_name} folds={len(deltas)}  "
-        f"mean_delta_C_ipcw={float(np.mean(deltas)):+.4f}  "
-        f"worst_delta_C_ipcw={float(np.min(deltas)):+.4f}  "
-        f"best_delta_C_ipcw={float(np.max(deltas)):+.4f}"
+        f"mean_{summary_label}={float(np.mean(deltas)):+.4f}  "
+        f"worst_{summary_label}={float(np.min(deltas)):+.4f}  "
+        f"best_{summary_label}={float(np.max(deltas)):+.4f}"
     )
 
 
 # --- main ------------------------------------------------------------------
 
 def main() -> None:
-    if len(sys.argv) != 1:
-        raise SystemExit("marginal_slope_diseases.py takes no arguments")
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="Fit marginal-slope GAMs on All of Us microarray data.",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("both", "survival", "binary"),
+        default="both",
+        help=(
+            "Which fits to run per disease. 'both' (default): survival GAM "
+            "+ Cox baselines and binary GAM + logistic baselines. "
+            "'survival': skip the binary path. 'binary': skip the survival "
+            "GAM, Cox baselines, sksurv metrics, and .gamfit artifact write."
+        ),
+    )
+    args = parser.parse_args()
+    mode = args.mode
+    print(f"run mode: {mode}")
     import gamfit
     print(f"gamfit version: {gamfit.__version__}")
     print_gamfit_diagnostics(gamfit)
@@ -2923,6 +2986,7 @@ def main() -> None:
                 "concept_id": ancestor,
                 "K_crude": K,
             },
+            mode=mode,
         )
 
         print("  OOD: leave-one-group-out refits")
@@ -2940,6 +3004,7 @@ def main() -> None:
                 min_test_n=MIN_LOSO_TEST_N,
                 max_groups=MAX_LOSO_CARE_SITES if axis == "care_site" else None,
                 score_train=False,
+                mode=mode,
             )
 
 

@@ -5,21 +5,38 @@ export PYTHONUNBUFFERED=1
 
 SCRIPT_DIR="$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &>/dev/null && pwd )"
 
-for arg in "$@"; do
-  case "$arg" in
-    --reexecuted) ;;
+MODE="both"
+REEXEC_FLAG="--reexecuted"
+REEXECUTED=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --reexecuted)
+      REEXECUTED=1
+      shift
+      ;;
+    --mode)
+      [ $# -ge 2 ] || { echo "run.sh: --mode requires a value (both|survival|binary)" >&2; exit 2; }
+      MODE="$2"
+      shift 2
+      ;;
+    --mode=*)
+      MODE="${1#--mode=}"
+      shift
+      ;;
     *)
-      echo "run.sh takes no arguments; it always runs the full biobank validation." >&2
+      echo "run.sh: unknown argument $1 (allowed: --mode {both|survival|binary})" >&2
       exit 2
       ;;
   esac
 done
-
-REEXEC_FLAG="--reexecuted"
-REEXECUTED=0
-for arg in "$@"; do
-  [ "$arg" = "$REEXEC_FLAG" ] && REEXECUTED=1
-done
+case "$MODE" in
+  both|survival|binary) ;;
+  *)
+    echo "run.sh: --mode must be both|survival|binary (got '$MODE')" >&2
+    exit 2
+    ;;
+esac
+echo "[run.sh] mode=$MODE" >&2
 
 # --- kill any older biobank run still in flight -----------------------------
 # Match by the python entrypoint, not by run.sh -- prior runs may still be
@@ -46,7 +63,7 @@ if [ "$REEXECUTED" -eq 0 ] && git -C "$SCRIPT_DIR" rev-parse --git-dir >/dev/nul
   REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
   echo "[run.sh] git pull --ff-only in $REPO_ROOT" >&2
   if git -C "$REPO_ROOT" pull --ff-only; then
-    exec bash "$0" "$REEXEC_FLAG"
+    exec bash "$0" "$REEXEC_FLAG" --mode "$MODE"
   else
     echo "[run.sh] git pull failed; continuing with on-disk code" >&2
   fi
@@ -428,7 +445,7 @@ uv run \
     --with google-cloud-bigquery \
     --with google-cloud-bigquery-storage \
     --with db-dtypes \
-    -- python -u "$SCRIPT_DIR/marginal_slope_diseases.py" 2>&1 | tee -a "$RESULTS"
+    -- python -u "$SCRIPT_DIR/marginal_slope_diseases.py" --mode "$MODE" 2>&1 | tee -a "$RESULTS"
 
 # --- extract just the summary lines ----------------------------------------
 {
