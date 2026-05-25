@@ -11,7 +11,7 @@ use crossbeam_queue::ArrayQueue;
 use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
 use cudarc::driver::{
     CudaContext, CudaEvent, CudaFunction, CudaSlice, CudaStream, CudaView, CudaViewMut,
-    DriverError, LaunchConfig, PinnedHostSlice, PushKernelArg,
+    DriverError, LaunchConfig, PinnedHostSlice, PushKernelArg, sys as cuda_sys,
 };
 use cudarc::nvrtc::{Ptx, compile_ptx, result as nvrtc_result, sys as nvrtc_sys};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
@@ -34,7 +34,6 @@ const BUFFER_POOL_SIZE: usize = 16384;
 const SPOOL_BUFFER_SIZE: usize = 8 * 1024 * 1024;
 const MIN_GPU_WORK: usize = 100_000;
 const MIN_MEGA_BATCH_VARIANTS: usize = 1;
-const MAX_MEGA_BATCH_VARIANTS: usize = 16384;
 const MIN_SCORE_TILE_SIZE: usize = 1;
 const PIPELINE_SLOTS: usize = 2;
 
@@ -188,8 +187,92 @@ struct CudaRuntime {
     output_map: CudaSlice<u32>,
     mega_batch_variants: usize,
     gpu_score_chunk_size: usize,
+    unpack_block_size: u32,
+    build_block_size: u32,
+    device_info: CudaDeviceInfo,
     pinned_staging: Vec<PinnedHostSlice<u8>>,
     pinned_reconciled: Vec<PinnedHostSlice<u32>>,
+}
+
+struct CudaDeviceInfo {
+    name: String,
+    compute_capability: (i32, i32),
+    multiprocessors: i32,
+    max_threads_per_multiprocessor: i32,
+    max_threads_per_block: i32,
+    warp_size: i32,
+    concurrent_kernels: bool,
+    memory_clock_rate_khz: i32,
+    global_memory_bus_width_bits: i32,
+}
+
+impl CudaDeviceInfo {
+    fn query(ctx: &CudaContext) -> Result<Self, String> {
+        let name = ctx
+            .name()
+            .map_err(|e| format!("Failed to query CUDA device name: {e:?}"))?;
+        let compute_capability = ctx
+            .compute_capability()
+            .map_err(|e| format!("Failed to query CUDA compute capability: {e:?}"))?;
+        let attr = |attribute, label: &str| {
+            ctx.attribute(attribute)
+                .map_err(|e| format!("Failed to query CUDA device attribute {label}: {e:?}"))
+        };
+        Ok(Self {
+            name,
+            compute_capability,
+            multiprocessors: attr(
+                cuda_sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+                "multiprocessor_count",
+            )?,
+            max_threads_per_multiprocessor: attr(
+                cuda_sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR,
+                "max_threads_per_multiprocessor",
+            )?,
+            max_threads_per_block: attr(
+                cuda_sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
+                "max_threads_per_block",
+            )?,
+            warp_size: attr(
+                cuda_sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_WARP_SIZE,
+                "warp_size",
+            )?,
+            concurrent_kernels: attr(
+                cuda_sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_CONCURRENT_KERNELS,
+                "concurrent_kernels",
+            )? != 0,
+            memory_clock_rate_khz: attr(
+                cuda_sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE,
+                "memory_clock_rate",
+            )?,
+            global_memory_bus_width_bits: attr(
+                cuda_sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH,
+                "global_memory_bus_width",
+            )?,
+        })
+    }
+
+    fn theoretical_memory_bandwidth_gbps(&self) -> f64 {
+        if self.memory_clock_rate_khz <= 0 || self.global_memory_bus_width_bits <= 0 {
+            return 0.0;
+        }
+        (self.memory_clock_rate_khz as f64 * self.global_memory_bus_width_bits as f64) / 4_000_000.0
+    }
+
+    fn print(&self) {
+        eprintln!(
+            "> CUDA device: {} (sm_{}{}, SMs={}, warp={}, max_threads/block={}, max_threads/SM={}, concurrent_kernels={}, theoretical_mem_bw={:.1} GB/s)",
+            self.name,
+            self.compute_capability.0,
+            self.compute_capability.1,
+            self.multiprocessors,
+            self.warp_size,
+            self.max_threads_per_block,
+            self.max_threads_per_multiprocessor,
+            self.concurrent_kernels,
+            self.theoretical_memory_bandwidth_gbps(),
+        );
+    }
 }
 
 impl Drop for CudaRuntime {
@@ -287,6 +370,96 @@ struct PendingBatch {
     shape: BatchShape,
     packed_len: usize,
     copy_done_event: CudaEvent,
+}
+
+#[derive(Default)]
+struct CudaStats {
+    batches: u64,
+    score_tiles: u64,
+    variants: u64,
+    h2d_bytes: u64,
+    dtoh_bytes: u64,
+    gemm_flops: u128,
+    input_wait: Duration,
+    slot_wait: Duration,
+    host_pack: Duration,
+    h2d_enqueue: Duration,
+    gpu_wait: Duration,
+    gpu_stream_ms: f64,
+    cpu_accum: Duration,
+    teardown_sync: Duration,
+    total_wall: Duration,
+    max_batch_variants: usize,
+}
+
+impl CudaStats {
+    fn print(&self, dims: CudaDims, runtime: &CudaRuntime) {
+        let wall = self.total_wall.as_secs_f64();
+        let genotypes = self.variants as f64 * dims.num_people as f64;
+        let genotypes_per_sec = if wall > 0.0 { genotypes / wall } else { 0.0 };
+        let variants_per_sec = if wall > 0.0 {
+            self.variants as f64 / wall
+        } else {
+            0.0
+        };
+        let tflops = if self.gpu_stream_ms > 0.0 {
+            self.gemm_flops as f64 / (self.gpu_stream_ms / 1000.0) / 1.0e12
+        } else {
+            0.0
+        };
+        let h2d_gib = self.h2d_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+        let dtoh_gib = self.dtoh_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+        let bottlenecks = [
+            ("waiting for producer/input", self.input_wait),
+            ("waiting for slot reuse", self.slot_wait),
+            ("packing pinned host batches", self.host_pack),
+            ("enqueueing HtoD copies", self.h2d_enqueue),
+            ("waiting for GPU kernels/DtoH", self.gpu_wait),
+            ("CPU accumulation", self.cpu_accum),
+            ("CUDA teardown synchronization", self.teardown_sync),
+        ];
+        let (bottleneck, bottleneck_time) = bottlenecks
+            .into_iter()
+            .max_by(|(_, a), (_, b)| a.cmp(b))
+            .unwrap_or(("none", Duration::ZERO));
+
+        eprintln!(
+            "> CUDA scoring summary: wall={:.2}s, batches={}, score_tiles={}, max_batch_variants={}, variants/s={:.1}, genotypes/s={:.2}G",
+            wall,
+            self.batches,
+            self.score_tiles,
+            self.max_batch_variants,
+            variants_per_sec,
+            genotypes_per_sec / 1.0e9,
+        );
+        eprintln!(
+            "> CUDA data movement: HtoD={:.2} GiB, DtoH={:.2} GiB; GPU stream time={:.2}s, estimated SGEMM={:.2} TFLOP/s",
+            h2d_gib,
+            dtoh_gib,
+            self.gpu_stream_ms / 1000.0,
+            tflops,
+        );
+        eprintln!(
+            "> CUDA host timing: input_wait={:.2}s, slot_wait={:.2}s, pack={:.2}s, h2d_enqueue={:.2}s, gpu_wait={:.2}s, cpu_accum={:.2}s, teardown_sync={:.2}s",
+            self.input_wait.as_secs_f64(),
+            self.slot_wait.as_secs_f64(),
+            self.host_pack.as_secs_f64(),
+            self.h2d_enqueue.as_secs_f64(),
+            self.gpu_wait.as_secs_f64(),
+            self.cpu_accum.as_secs_f64(),
+            self.teardown_sync.as_secs_f64(),
+        );
+        eprintln!(
+            "> CUDA bottleneck: {bottleneck} ({:.2}s measured host wall); device='{}', sm_{}{}, SMs={}, mega_batch_variants={}, score_tile={}",
+            bottleneck_time.as_secs_f64(),
+            runtime.device_info.name,
+            runtime.device_info.compute_capability.0,
+            runtime.device_info.compute_capability.1,
+            runtime.device_info.multiprocessors,
+            runtime.mega_batch_variants,
+            runtime.gpu_score_chunk_size,
+        );
+    }
 }
 
 impl BatchShape {
@@ -555,6 +728,8 @@ impl CudaRuntime {
         let ctx = CudaContext::new(0).map_err(|e| format!("CUDA init failed: {e:?}"))?;
         ctx.bind_to_thread()
             .map_err(|e| format!("Failed to bind CUDA context: {e:?}"))?;
+        let device_info = CudaDeviceInfo::query(&ctx)?;
+        device_info.print();
         let copy_stream = ctx
             .new_stream()
             .map_err(|e| format!("Failed to create CUDA copy stream: {e:?}"))?;
@@ -658,6 +833,8 @@ impl CudaRuntime {
             budget as f64 / (1024.0 * 1024.0 * 1024.0),
             static_bytes as f64 / (1024.0 * 1024.0),
         );
+        let largest_candidate_mega = highest_power_of_two_le(prep.num_reconciled_variants.max(1))
+            .max(MIN_MEGA_BATCH_VARIANTS);
         let lane_groups = num_scores.div_ceil(MIN_SCORE_TILE_SIZE).max(1);
         let mut tile_candidates_lane_groups = Vec::with_capacity((usize::BITS as usize) + 1);
         tile_candidates_lane_groups.push(lane_groups);
@@ -676,7 +853,7 @@ impl CudaRuntime {
                 .checked_mul(MIN_SCORE_TILE_SIZE)
                 .ok_or_else(|| "CUDA score tile computation overflow".to_string())?
                 .min(num_scores.max(MIN_SCORE_TILE_SIZE));
-            let mut mega = MAX_MEGA_BATCH_VARIANTS;
+            let mut mega = largest_candidate_mega;
             while mega >= MIN_MEGA_BATCH_VARIANTS {
                 let required = estimate_required_bytes(mega, score_tile).ok_or_else(|| {
                     format!(
@@ -783,6 +960,10 @@ impl CudaRuntime {
         let build_batch_mats_kernel = module
             .load_function("build_batch_mats")
             .map_err(|e| format!("Failed to load build_batch_mats kernel: {e:?}"))?;
+        let unpack_block_size =
+            choose_kernel_block_size(&unpack_kernel, &device_info, "unpack_plink")?;
+        let build_block_size =
+            choose_kernel_block_size(&build_batch_mats_kernel, &device_info, "build_batch_mats")?;
         let max_packed = mega * prep.bytes_per_variant as usize;
         let mut pinned_staging = Vec::with_capacity(PIPELINE_SLOTS);
         let mut pinned_reconciled = Vec::with_capacity(PIPELINE_SLOTS);
@@ -834,6 +1015,9 @@ impl CudaRuntime {
             output_map,
             mega_batch_variants: mega,
             gpu_score_chunk_size,
+            unpack_block_size,
+            build_block_size,
+            device_info,
             pinned_staging,
             pinned_reconciled,
         })
@@ -1294,6 +1478,8 @@ fn process_dense_stream_cuda(
     let dims = CudaDims::from_prep(prep_result)?;
     let result_size = dims.result_size()?;
     let total_variants = prep_result.num_reconciled_variants as u64;
+    let total_wall_start = Instant::now();
+    let mut stats = CudaStats::default();
     let mut last_logged_at = Instant::now();
     let mut last_logged_value: Option<u64> = None;
     let mut emit_progress_log = |force_final: bool| {
@@ -1336,6 +1522,22 @@ fn process_dense_stream_cuda(
         dims.num_people,
         gpu_score_chunk_size,
     )?;
+    eprintln!(
+        "> CUDA scoring buffers: pipeline_slots={PIPELINE_SLOTS}, max_packed={:.2} MiB/slot, \
+         dosage_or_missing={:.2} GiB, weights_tile={:.2} MiB, output_tile={:.2} MiB/slot, \
+         unpack_block={}, build_block={}",
+        max_packed as f64 / (1024.0 * 1024.0),
+        checked_mul_usize("dosage buffer bytes", dims.num_people, mega)?
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| PipelineError::Compute(
+                "dosage buffer byte estimate overflow".to_string()
+            ))? as f64
+            / (1024.0 * 1024.0 * 1024.0),
+        max_weights_tile_elems as f64 * std::mem::size_of::<f32>() as f64 / (1024.0 * 1024.0),
+        max_tile_result_elems as f64 * std::mem::size_of::<f32>() as f64 / (1024.0 * 1024.0),
+        runtime.unpack_block_size,
+        runtime.build_block_size,
+    );
     let mut d_packed_slots: Vec<CudaSlice<u8>> = (0..PIPELINE_SLOTS)
         .map(|_| {
             runtime
@@ -1422,11 +1624,13 @@ fn process_dense_stream_cuda(
 
     loop {
         batch.clear();
+        let input_wait_start = Instant::now();
         match rx.recv() {
             Ok(Ok(first_item)) => batch.push(first_item),
             Ok(Err(e)) => return Err(e),
             Err(_) => break,
         }
+        stats.input_wait += input_wait_start.elapsed();
         while batch.len() < mega {
             match rx.try_recv() {
                 Ok(Ok(item)) => batch.push(item),
@@ -1447,16 +1651,21 @@ fn process_dense_stream_cuda(
         emit_progress_log(false);
 
         if let Some(event) = &slot_last_copy_done[slot] {
+            let wait_start = Instant::now();
             event
                 .synchronize()
                 .map_err(map_driver_err("Failed waiting for prior copy event"))?;
+            stats.slot_wait += wait_start.elapsed();
         }
         if let Some(event) = &slot_last_compute_done[slot] {
+            let wait_start = Instant::now();
             runtime.copy_stream.wait(event).map_err(map_driver_err(
                 "Copy stream failed waiting for compute event",
             ))?;
+            stats.slot_wait += wait_start.elapsed();
         }
 
+        let pack_start = Instant::now();
         let packed_len =
             checked_mul_usize("packed_len", shape.batch_len(), dims.bytes_per_variant)?;
         let pinned_slice = runtime.pinned_staging[slot]
@@ -1479,7 +1688,9 @@ fn process_dense_stream_cuda(
                 pool: &buffer_pool,
             });
         }
+        stats.host_pack += pack_start.elapsed();
 
+        let h2d_start = Instant::now();
         {
             let mut d_packed_view: CudaViewMut<'_, u8> =
                 d_packed_slots[slot].slice_mut(0..packed_len);
@@ -1500,6 +1711,12 @@ fn process_dense_stream_cuda(
                     "Failed to upload reconciled variant indices",
                 ))?;
         }
+        stats.h2d_enqueue += h2d_start.elapsed();
+        stats.h2d_bytes +=
+            packed_len as u64 + (shape.batch_len() as u64 * std::mem::size_of::<u32>() as u64);
+        stats.variants += shape.batch_len() as u64;
+        stats.batches += 1;
+        stats.max_batch_variants = stats.max_batch_variants.max(shape.batch_len());
         let copy_done_event = runtime
             .copy_stream
             .record_event(None)
@@ -1537,6 +1754,7 @@ fn process_dense_stream_cuda(
                 &mut host_tile_counts_slots,
                 &mut final_scores,
                 &mut final_counts,
+                &mut stats,
             )?);
         }
         pending = Some(current);
@@ -1563,6 +1781,7 @@ fn process_dense_stream_cuda(
             &mut host_tile_counts_slots,
             &mut final_scores,
             &mut final_counts,
+            &mut stats,
         )?);
     }
 
@@ -1600,6 +1819,7 @@ fn process_dense_stream_cuda(
     drop(pending);
     drop(batch);
 
+    let teardown_sync_start = Instant::now();
     runtime
         .copy_stream
         .synchronize()
@@ -1608,8 +1828,11 @@ fn process_dense_stream_cuda(
         .compute_stream
         .synchronize()
         .map_err(map_driver_err("Failed to synchronize CUDA compute stream"))?;
+    stats.teardown_sync += teardown_sync_start.elapsed();
 
     emit_progress_log(true);
+    stats.total_wall = total_wall_start.elapsed();
+    stats.print(dims, runtime);
 
     Ok((final_scores, final_counts))
 }
@@ -1634,6 +1857,7 @@ fn run_pending_compute_cuda(
     host_tile_counts_slots: &mut [Vec<f32>],
     final_scores: &mut [f64],
     final_counts: &mut [u32],
+    stats: &mut CudaStats,
 ) -> Result<CudaEvent, PipelineError> {
     runtime
         .compute_stream
@@ -1641,12 +1865,17 @@ fn run_pending_compute_cuda(
         .map_err(map_driver_err(
             "Compute stream failed waiting for copy event",
         ))?;
+    let gpu_start_event = runtime
+        .compute_stream
+        .record_event(None)
+        .map_err(map_driver_err("Failed to record CUDA work start event"))?;
+    let mut next_tile_start_event = Some(gpu_start_event);
+    let mut final_compute_done_event = None;
 
     let unpack_elems = work.shape.unpack_elems()?;
     let num_people_i32 = work.shape.dims.num_people_i32()?;
     let batch_len_i32 = checked_i32("batch_len", work.shape.batch_len())?;
     let bytes_per_variant_i32 = work.shape.dims.bytes_per_variant_i32()?;
-    let unpack_launch_elems = checked_u32("unpack kernel launch elements", unpack_elems)?;
     unsafe {
         runtime
             .compute_stream
@@ -1658,22 +1887,31 @@ fn run_pending_compute_cuda(
             .arg(&bytes_per_variant_i32)
             .arg(&mut d_dosage.slice_mut(0..unpack_elems))
             .arg(&mut d_missing.slice_mut(0..unpack_elems))
-            .launch(LaunchConfig::for_num_elems(unpack_launch_elems))
+            .launch(launch_config_for_num_elems(
+                unpack_elems,
+                runtime.unpack_block_size,
+            )?)
             .map_err(map_driver_err("Failed to launch unpack_plink kernel"))?;
     }
 
-    let build_launch_elems = checked_u32(
-        "build_batch_mats kernel launch elements",
-        work.shape.batch_len(),
-    )?;
     for score_offset in (0..dims.num_scores).step_by(runtime.gpu_score_chunk_size) {
         let tile_scores = (dims.num_scores - score_offset).min(runtime.gpu_score_chunk_size);
+        let tile_start_event = match next_tile_start_event.take() {
+            Some(event) => event,
+            None => runtime
+                .compute_stream
+                .record_event(None)
+                .map_err(map_driver_err("Failed to record CUDA tile start event"))?,
+        };
         let tile_scores_i32 = checked_i32("tile_scores", tile_scores)?;
         let score_offset_i32 = checked_i32("score_offset", score_offset)?;
         let weights_elems =
             checked_mul_usize("weights_elems", work.shape.batch_len(), tile_scores)?;
         let tile_result_elems =
             checked_mul_usize("tile_result_elems", dims.num_people, tile_scores)?;
+        stats.score_tiles += 1;
+        stats.gemm_flops +=
+            6u128 * dims.num_people as u128 * work.shape.batch_len() as u128 * tile_scores as u128;
 
         unsafe {
             runtime
@@ -1690,7 +1928,10 @@ fn run_pending_compute_cuda(
                 .arg(&mut d_w_eff.slice_mut(0..weights_elems))
                 .arg(&mut d_w_corr.slice_mut(0..weights_elems))
                 .arg(&mut d_count_w.slice_mut(0..weights_elems))
-                .launch(LaunchConfig::for_num_elems(build_launch_elems))
+                .launch(launch_config_for_num_elems(
+                    work.shape.batch_len(),
+                    runtime.build_block_size,
+                )?)
                 .map_err(map_driver_err("Failed to launch build_batch_mats kernel"))?;
         }
 
@@ -1748,6 +1989,13 @@ fn run_pending_compute_cuda(
                 &mut host_tile_counts_slots[work.slot][..tile_result_elems],
             )
             .map_err(map_driver_err("Failed to copy count tile output to host"))?;
+        stats.dtoh_bytes += (3 * tile_result_elems * std::mem::size_of::<f32>()) as u64;
+        let tile_done_event = runtime
+            .compute_stream
+            .record_event(None)
+            .map_err(map_driver_err(
+                "Failed to record CUDA tile completion event",
+            ))?;
 
         // The three `memcpy_dtoh` calls above issue `cuMemcpyDtoHAsync`.
         // cudarc's host-slice implementation for `Vec<T>` / `[T]`
@@ -1762,13 +2010,21 @@ fn run_pending_compute_cuda(
         //
         // Sync once after all three copies and proceed with complete
         // host buffers.
+        let gpu_wait_start = Instant::now();
         runtime
             .compute_stream
             .synchronize()
             .map_err(map_driver_err(
                 "Failed to synchronize compute stream after DtoH copies",
             ))?;
+        stats.gpu_wait += gpu_wait_start.elapsed();
+        stats.gpu_stream_ms += tile_start_event
+            .elapsed_ms(&tile_done_event)
+            .map_err(map_driver_err("Failed to measure CUDA tile elapsed time"))?
+            as f64;
+        final_compute_done_event = Some(tile_done_event);
 
+        let accum_start = Instant::now();
         for person_idx in 0..dims.num_people {
             let src_base = person_idx * tile_scores;
             let dst_base = person_idx * dims.num_scores + score_offset;
@@ -1780,12 +2036,11 @@ fn run_pending_compute_cuda(
                 final_counts[dst_idx] += host_tile_counts_slots[work.slot][src_idx].round() as u32;
             }
         }
+        stats.cpu_accum += accum_start.elapsed();
     }
 
-    runtime
-        .compute_stream
-        .record_event(None)
-        .map_err(map_driver_err("Failed to record compute completion event"))
+    final_compute_done_event
+        .ok_or_else(|| PipelineError::Compute("CUDA compute produced no score tiles".to_string()))
 }
 
 fn run_row_major_gemm(
@@ -1818,6 +2073,97 @@ fn run_row_major_gemm(
         blas.gemm(cfg, b, a, c)
             .map_err(|e| PipelineError::Compute(format!("cuBLAS GEMM failed: {e:?}")))
     }
+}
+
+fn choose_kernel_block_size(
+    kernel: &CudaFunction,
+    device: &CudaDeviceInfo,
+    label: &str,
+) -> Result<u32, String> {
+    let warp = u32::try_from(device.warp_size.max(1))
+        .map_err(|_| format!("Invalid CUDA warp size {}", device.warp_size))?;
+    let function_limit = kernel
+        .max_threads_per_block()
+        .map_err(|e| format!("Failed to query {label} max threads/block: {e:?}"))?;
+    let function_limit = u32::try_from(function_limit.max(1))
+        .map_err(|_| format!("Invalid {label} max threads/block {function_limit}"))?;
+    let device_limit = u32::try_from(device.max_threads_per_block.max(1)).map_err(|_| {
+        format!(
+            "Invalid CUDA max_threads_per_block {}",
+            device.max_threads_per_block
+        )
+    })?;
+    let max_block = function_limit.min(device_limit);
+    if max_block < warp {
+        return Err(format!(
+            "{label} allows only {max_block} threads/block, below CUDA warp size {warp}"
+        ));
+    }
+
+    let mut candidates = Vec::new();
+    let mut block = (warp * 4).min(max_block).max(warp);
+    while block <= max_block {
+        if block % warp == 0 {
+            candidates.push(block);
+        }
+        match block.checked_mul(2) {
+            Some(next) if next > block => block = next,
+            _ => break,
+        }
+    }
+    if candidates.last().copied() != Some(max_block) && max_block % warp == 0 {
+        candidates.push(max_block);
+    }
+
+    let mut best: Option<(u32, u32)> = None;
+    for block in candidates {
+        let active_blocks = kernel
+            .occupancy_max_active_blocks_per_multiprocessor(block, 0, None)
+            .map_err(|e| format!("Failed to query {label} occupancy for block={block}: {e:?}"))?;
+        let active_threads = active_blocks.saturating_mul(block);
+        match best {
+            None => best = Some((block, active_threads)),
+            Some((best_block, best_threads)) => {
+                if active_threads > best_threads
+                    || (active_threads == best_threads && block < best_block)
+                {
+                    best = Some((block, active_threads));
+                }
+            }
+        }
+    }
+
+    let (block, active_threads) =
+        best.ok_or_else(|| format!("No legal CUDA block size candidates for {label}"))?;
+    let active_blocks = if block == 0 {
+        0
+    } else {
+        active_threads / block
+    };
+    let occupancy_pct = if device.max_threads_per_multiprocessor <= 0 {
+        0.0
+    } else {
+        100.0 * active_threads as f64 / device.max_threads_per_multiprocessor as f64
+    };
+    eprintln!(
+        "> CUDA launch {label}: block_threads={block}, active_blocks/SM={active_blocks}, active_threads/SM={active_threads} ({occupancy_pct:.1}% occupancy cap)"
+    );
+    Ok(block)
+}
+
+fn launch_config_for_num_elems(n: usize, block_size: u32) -> Result<LaunchConfig, PipelineError> {
+    let block_size = block_size.max(1);
+    let grid_blocks = (n as u128).div_ceil(block_size as u128);
+    let grid_x = u32::try_from(grid_blocks).map_err(|_| {
+        PipelineError::Compute(format!(
+            "CUDA launch requires {grid_blocks} grid blocks for {n} elements at block size {block_size}, exceeding CUDA's x-grid limit"
+        ))
+    })?;
+    Ok(LaunchConfig {
+        grid_dim: (grid_x, 1, 1),
+        block_dim: (block_size, 1, 1),
+        shared_mem_bytes: 0,
+    })
 }
 
 #[inline]
@@ -1903,14 +2249,6 @@ fn checked_i32(label: &str, value: usize) -> Result<i32, PipelineError> {
     i32::try_from(value).map_err(|_| {
         PipelineError::Compute(format!(
             "{label}={value} exceeds i32::MAX required by CUDA/cuBLAS APIs"
-        ))
-    })
-}
-
-fn checked_u32(label: &str, value: usize) -> Result<u32, PipelineError> {
-    u32::try_from(value).map_err(|_| {
-        PipelineError::Compute(format!(
-            "{label}={value} exceeds u32::MAX required by CUDA launch config"
         ))
     })
 }
