@@ -1545,6 +1545,33 @@ def fast_delong_auc(
     return aucs, cov
 
 
+def _extract_binary_mean(prediction: object) -> np.ndarray:
+    """Coerce a gamfit bernoulli-marginal-slope `model.predict(...)` result to a
+    1-D probability vector.
+
+    Why: gamfit 0.1.124's `shape_prediction_response` only takes its 1-D
+    early-return branch when the predict payload's `model_class` equals
+    `"bernoulli marginal-slope"`. The Rust `PredictionPayload` does not emit
+    `model_class`, so the Python layer falls back to the serde-kebab-case
+    `model_kind` from the saved payload (`"marginal-slope"`), misses the
+    branch, and returns a 2-column pandas DataFrame containing both `eta` and
+    `mean`. We want just `mean`.
+    """
+    import pandas as pd
+
+    if isinstance(prediction, pd.DataFrame):
+        return np.asarray(prediction["mean"].to_numpy(), dtype=float)
+    arr = np.asarray(prediction, dtype=float)
+    if arr.ndim == 1:
+        return arr
+    if arr.ndim == 2 and arr.shape[1] == 2:
+        # ordered_prediction_column_values puts "eta" before "mean"
+        return arr[:, 1]
+    raise ValueError(
+        f"unexpected binary-GAM prediction shape {arr.shape}; expected 1-D or (n, 2)"
+    )
+
+
 def binary_stats(y: np.ndarray, p: np.ndarray, population_prevalence: float | None) -> BinaryStats:
     from scipy.stats import norm
     from sklearn.metrics import (  # lazy: only needed after binary predictions exist
@@ -2125,11 +2152,11 @@ def evaluate_binary_model_pair(
     y_test = test["event"].to_numpy()
 
     model = fit_binary_marginal_slope(train, len(pc_cols))
-    gam_p_test = np.asarray(model.predict(test[binary_predict_columns(len(pc_cols))]), dtype=float)
+    gam_p_test = _extract_binary_mean(model.predict(test[binary_predict_columns(len(pc_cols))]))
     gam_test_m = binary_stats(y_test, gam_p_test, population_prevalence)
     gam_train_m = None
     if score_train:
-        gam_p_train = np.asarray(model.predict(train[binary_predict_columns(len(pc_cols))]), dtype=float)
+        gam_p_train = _extract_binary_mean(model.predict(train[binary_predict_columns(len(pc_cols))]))
         gam_train_m = binary_stats(y_train, gam_p_train, population_prevalence)
 
     nuisance_names = [*BASELINE_AGE_FEATURES, "sex"]
