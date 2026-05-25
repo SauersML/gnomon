@@ -316,6 +316,30 @@ plink_triplet_exists() {
   [ -s "${prefix}.bed" ] && [ -s "${prefix}.bim" ] && [ -s "${prefix}.fam" ]
 }
 
+copy_gcs_object() {
+  local src="$1"
+  local dst="$2"
+  local project="$3"
+
+  if command -v gcloud >/dev/null 2>&1; then
+    if [ -n "$project" ]; then
+      gcloud storage cp --billing-project "$project" "$src" "$dst" && return 0
+    else
+      gcloud storage cp "$src" "$dst" && return 0
+    fi
+  fi
+
+  if command -v gsutil >/dev/null 2>&1; then
+    if [ -n "$project" ]; then
+      gsutil -u "$project" cp "$src" "$dst" && return 0
+    else
+      gsutil cp "$src" "$dst" && return 0
+    fi
+  fi
+
+  return 1
+}
+
 stage_plink_triplet_if_missing() {
   local plink_dir="$RUN_STATE_DIR/plink"
   local plink_prefix="$plink_dir/arrays"
@@ -350,16 +374,11 @@ stage_plink_triplet_if_missing() {
     local tmp="${dst}.tmp"
     rm -f "$tmp"
     echo "[run.sh]   copy $src"
-    if command -v gsutil >/dev/null 2>&1; then
-      if [ -n "$project" ]; then
-        gsutil -u "$project" cp "$src" "$tmp"
-      else
-        gsutil cp "$src" "$tmp"
-      fi
-    elif [ -n "$project" ]; then
-      gcloud storage cp --billing-project "$project" "$src" "$tmp"
-    else
-      gcloud storage cp "$src" "$tmp"
+    if ! copy_gcs_object "$src" "$tmp" "$project"; then
+      echo "[run.sh] failed to copy $src"
+      echo "[run.sh] service account may lack object read access, or CDR_STORAGE_PATH may point at the wrong controlled CDR root"
+      rm -f "$tmp"
+      return 1
     fi
     mv "$tmp" "$dst"
   done
