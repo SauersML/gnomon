@@ -1,6 +1,7 @@
 import Calibrator.Probability
 import Calibrator.PortabilityDrift
 import Calibrator.OpenQuestions
+import Calibrator.TransportIdentities
 
 namespace Calibrator
 
@@ -38,12 +39,12 @@ section StratificationBias
 
 /-- Stratification bias is nonzero when ancestry correlates with both
     phenotype and genotype. -/
-theorem stratification_bias_nonzero
-    (cov_anc_pheno cov_anc_geno var_geno : ℝ)
-    (h_pheno : cov_anc_pheno ≠ 0)
-    (h_geno : cov_anc_geno ≠ 0)
-    (h_var : 0 < var_geno) :
-    cov_anc_pheno * cov_anc_geno / var_geno ≠ 0 := by
+theorem stratification_bias_nonzero {Ω : Type*} (E : ExpFunctional Ω)
+    (A Y G : Ω → ℝ)
+    (h_pheno : covariance E A Y ≠ 0)
+    (h_geno : covariance E A G ≠ 0)
+    (h_var : 0 < variance E G) :
+    covariance E A Y * covariance E A G / variance E G ≠ 0 := by
   apply div_ne_zero
   · exact mul_ne_zero h_pheno h_geno
   · exact h_var.ne'
@@ -329,12 +330,10 @@ theorem differential_ascertainment_artifact
     (r2_source_pop r2_target_pop r2_source_asc r2_target_asc : ℝ)
     (h_source_asc : r2_source_asc < r2_source_pop)
     (h_target_asc : r2_target_asc < r2_target_pop)
-    -- Different ascertainment severity
-    (h_diff_severity : r2_target_pop - r2_target_asc < r2_source_pop - r2_source_asc) :
+    -- Target population has more severe ascertainment (larger drop)
+    (h_diff_severity : r2_source_pop - r2_source_asc < r2_target_pop - r2_target_asc) :
     -- Apparent portability drop is larger than true portability drop
-    r2_source_asc - r2_target_asc > r2_source_pop - r2_target_pop →
-      False := by
-  intro h
+    (r2_source_pop - r2_target_pop) < (r2_source_asc - r2_target_asc) := by
   linarith
 
 end ColliderBias
@@ -517,14 +516,23 @@ theorem survivorship_attenuates_in_older (m : SurvivorshipAttenuationModel) :
 /-- **Differential survivorship across populations creates portability artifact.**
     If the target population has different age structure or mortality patterns,
     survivorship bias contributes to apparent portability loss. -/
+structure TwoPopSurvivorshipModel where
+  source : SurvivorshipAttenuationModel
+  target : SurvivorshipAttenuationModel
+  /-- Target population experiences stronger relative survivorship truncation -/
+  stronger_truncation : target.var_surv / target.var_birth < source.var_surv / source.var_birth
+  /-- True PGS validity is equal across populations -/
+  equal_true_r2 : target.r2_full = source.r2_full
+
+/-- **Differential survivorship across populations creates portability artifact.**
+    If the target population has stronger survivorship truncation (e.g., higher mortality),
+    an apparent portability gap emerges even when true validity is identical. -/
 theorem differential_survivorship_artifact
-    (r2_source_full r2_target_full Δ_surv_source Δ_surv_target : ℝ)
-    (h_surv_s : 0 ≤ Δ_surv_source) (h_surv_t : 0 ≤ Δ_surv_target)
-    (h_diff : Δ_surv_target > Δ_surv_source)
-    (h_obs_s : r2_source_full - Δ_surv_source > 0) :
-    (r2_source_full - Δ_surv_source) - (r2_target_full - Δ_surv_target) >
-      r2_source_full - r2_target_full := by
-  linarith
+    (m : TwoPopSurvivorshipModel) :
+    m.target.r2_surv < m.source.r2_surv := by
+  unfold SurvivorshipAttenuationModel.r2_surv
+  rw [m.equal_true_r2]
+  exact mul_lt_mul_of_pos_left m.stronger_truncation m.source.r2_full_pos
 
 end SurvivorshipBias
 
@@ -717,11 +725,13 @@ theorem weak_instrument_bias_increases
 /-- **Horizontal pleiotropy patterns differ across populations.**
     If pleiotropic effects change across populations (due to different
     LD patterns or gene regulation), MR estimates are not portable. -/
-theorem pleiotropy_changes_invalidate_mr
-    (β_causal α_pleio_source α_pleio_target : ℝ)
-    (h_diff : α_pleio_source ≠ α_pleio_target) :
-    β_causal + α_pleio_source ≠ β_causal + α_pleio_target := by
-  intro h; exact h_diff (by linarith)
+theorem pleiotropy_changes_invalidate_mr {Ω : Type*} (E : ExpFunctional Ω)
+    (β_causal α_pleio_source α_pleio_target : Ω → ℝ)
+    (h_diff : E α_pleio_source ≠ E α_pleio_target) :
+    E (β_causal + α_pleio_source) ≠ E (β_causal + α_pleio_target) := by
+  rw [E.add_eval, E.add_eval]
+  intro h
+  exact h_diff (by linarith)
 
 end MRPortability
 
