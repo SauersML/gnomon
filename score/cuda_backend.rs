@@ -1988,12 +1988,13 @@ fn process_dense_stream_cuda(
         stats.variants += shape.batch_len() as u64;
         stats.batches += 1;
         stats.max_batch_variants = stats.max_batch_variants.max(shape.batch_len());
-        let copy_done_event = runtime
-            .copy_stream
-            .record_event(None)
-            .map_err(map_driver_err("Failed to record copy completion event"))?;
-        slot_last_copy_done[slot] = Some(runtime.copy_stream.record_event(None).map_err(
-            map_driver_err("Failed to record slot copy completion event"),
+        let copy_done_event = record_cuda_sync_event(
+            &runtime.copy_stream,
+            "Failed to record copy completion event",
+        )?;
+        slot_last_copy_done[slot] = Some(record_cuda_sync_event(
+            &runtime.copy_stream,
+            "Failed to record slot copy completion event",
         )?);
         drop(guards);
 
@@ -2157,10 +2158,10 @@ fn run_pending_compute_cuda(
         .map_err(map_driver_err(
             "Compute stream failed waiting for copy event",
         ))?;
-    let gpu_start_event = runtime
-        .compute_stream
-        .record_event(None)
-        .map_err(map_driver_err("Failed to record CUDA work start event"))?;
+    let gpu_start_event = record_cuda_timing_event(
+        &runtime.compute_stream,
+        "Failed to record CUDA work start event",
+    )?;
     let mut next_tile_start_event = Some(gpu_start_event);
     let mut final_compute_done_event = None;
 
@@ -2191,10 +2192,10 @@ fn run_pending_compute_cuda(
         let tile_scores = (dims.num_scores - score_offset).min(runtime.gpu_score_chunk_size);
         let tile_start_event = match next_tile_start_event.take() {
             Some(event) => event,
-            None => runtime
-                .compute_stream
-                .record_event(None)
-                .map_err(map_driver_err("Failed to record CUDA tile start event"))?,
+            None => record_cuda_timing_event(
+                &runtime.compute_stream,
+                "Failed to record CUDA tile start event",
+            )?,
         };
         let tile_scores_i32 = checked_i32("tile_scores", tile_scores)?;
         let score_offset_i32 = checked_i32("score_offset", score_offset)?;
@@ -2312,12 +2313,10 @@ fn run_pending_compute_cuda(
             .map_err(map_driver_err("Failed to copy count tile output to host"))?;
         stats.dtoh_bytes +=
             (tile_result_elems * (std::mem::size_of::<f32>() + std::mem::size_of::<u32>())) as u64;
-        let tile_done_event = runtime
-            .compute_stream
-            .record_event(None)
-            .map_err(map_driver_err(
-                "Failed to record CUDA tile completion event",
-            ))?;
+        let tile_done_event = record_cuda_timing_event(
+            &runtime.compute_stream,
+            "Failed to record CUDA tile completion event",
+        )?;
 
         // The `memcpy_dtoh` calls above issue `cuMemcpyDtoHAsync`.
         // cudarc's host-slice implementation for `Vec<T>` / `[T]`
@@ -2614,6 +2613,22 @@ fn map_driver_err(context: &'static str) -> impl FnOnce(DriverError) -> Pipeline
     move |e| PipelineError::Compute(format!("{context}: {e:?}"))
 }
 
+fn record_cuda_sync_event(
+    stream: &CudaStream,
+    context: &'static str,
+) -> Result<CudaEvent, PipelineError> {
+    stream.record_event(None).map_err(map_driver_err(context))
+}
+
+fn record_cuda_timing_event(
+    stream: &CudaStream,
+    context: &'static str,
+) -> Result<CudaEvent, PipelineError> {
+    stream
+        .record_event(Some(cuda_sys::CUevent_flags::CU_EVENT_DEFAULT))
+        .map_err(map_driver_err(context))
+}
+
 fn checked_i32(label: &str, value: usize) -> Result<i32, PipelineError> {
     i32::try_from(value).map_err(|_| {
         PipelineError::Compute(format!(
@@ -2721,5 +2736,30 @@ mod tests {
         assert!(body.contains("cudarc::nvrtc::sys::is_culib_present()"));
         assert!(body.contains("cudarc::cublas::sys::is_culib_present()"));
         assert!(!body.contains("culib()"));
+    }
+
+    #[test]
+    fn cuda_elapsed_time_events_are_created_with_timing_enabled() {
+        let source = include_str!("cuda_backend.rs");
+        let timing_helper_start = source
+            .find("fn record_cuda_timing_event(")
+            .expect("CUDA timing event helper must exist");
+        let after_timing_helper = &source[timing_helper_start..];
+        let timing_helper_end = after_timing_helper
+            .find("\n}\n\nfn checked_i32")
+            .expect("timing event helper must precede checked_i32");
+        let timing_helper_body = &after_timing_helper[..timing_helper_end];
+
+        assert!(
+            timing_helper_body
+                .contains(".record_event(Some(cuda_sys::CUevent_flags::CU_EVENT_DEFAULT))")
+        );
+
+        let elapsed_pos = source
+            .find(".elapsed_ms(&tile_done_event)")
+            .expect("CUDA tile elapsed timing must be recorded");
+        let before_elapsed = &source[..elapsed_pos];
+        assert!(before_elapsed.contains("let gpu_start_event = record_cuda_timing_event("));
+        assert!(before_elapsed.contains("let tile_done_event = record_cuda_timing_event("));
     }
 }
