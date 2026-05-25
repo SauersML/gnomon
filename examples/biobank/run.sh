@@ -36,14 +36,19 @@ install_uv_if_missing() {
   mkdir -p "$HOME/.local/bin"
   echo "[run.sh] uv missing; installing uv into $HOME/.local/bin" >&2
   if command -v curl >/dev/null 2>&1; then
-    curl -LsSf --retry 5 --retry-delay 2 https://astral.sh/uv/install.sh | sh
+    curl -LsSf --retry 5 --retry-delay 2 https://astral.sh/uv/install.sh \
+      | UV_INSTALL_DIR="$HOME/.local/bin" sh
   elif command -v wget >/dev/null 2>&1; then
-    wget -qO- https://astral.sh/uv/install.sh | sh
+    wget -qO- https://astral.sh/uv/install.sh \
+      | UV_INSTALL_DIR="$HOME/.local/bin" sh
   else
     echo "[run.sh] cannot install uv: curl and wget are both missing" >&2
     return 1
   fi
   export PATH="$HOME/.local/bin:$PATH"
+  if [ -n "${XDG_DATA_HOME:-}" ] && [ -d "$XDG_DATA_HOME/../bin" ]; then
+    export PATH="$XDG_DATA_HOME/../bin:$PATH"
+  fi
   hash -r
   if ! command -v uv >/dev/null 2>&1; then
     echo "[run.sh] uv install completed but uv is still not on PATH=$PATH" >&2
