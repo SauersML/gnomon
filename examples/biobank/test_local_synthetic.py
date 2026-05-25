@@ -18,8 +18,9 @@ For each scenario the script:
   2. takes 100 cases + 100 controls for *training* (no overlap with test),
   3. takes a disjoint 100 cases + 100 controls for *held-out test*,
   4. standardizes the PGS using training stats only (no leakage),
-  5. fits `case ~ duchon(PC1..PC10) + sex` with `prs_z` driving the
-     marginal-slope log-slope channel through the same Duchon smooth,
+  5. fits `case ~ duchon(PC1..PC10) + sex + linkwiggle()` with `prs_z`
+     driving the marginal-slope log-slope channel through the same Duchon
+     smooth plus logslope `linkwiggle()` score-warp,
   6. reports held-out AUROC, Nagelkerke R^2, and Lee-2011 liability R^2.
 
 Run:  uv run examples/biobank/test_local_synthetic.py
@@ -118,23 +119,24 @@ def fit_marginal_slope(train_df: pd.DataFrame, num_pcs: int) -> gamfit.Model:
     both the location and log-slope channels; sex linear; prs_z is the
     latent score (z_column) so its slope varies in PC space.
 
-    No linkwiggle(...) in either formula -> engine's score-warp / link-dev
-    deviation blocks remain inactive in the protocol that this triggers.
+    Main-formula `linkwiggle()` enables link-deviation; logslope-formula
+    `linkwiggle()` enables score-warp.
     """
     pcs = ", ".join(f"PC{i+1}" for i in range(num_pcs))
     duchon = f"duchon({pcs}, centers={DUCHON_CENTERS}, order=1, power=2, length_scale=1.0)"
-    formula = f"case ~ {duchon} + sex"
+    logslope_formula = f"{duchon} + linkwiggle()"
+    formula = f"case ~ {duchon} + sex + linkwiggle()"
     cols = ["case", "sex", "prs_z"] + [f"PC{i+1}" for i in range(num_pcs)]
     print("  fit_spec: family=bernoulli marginal-slope  link=probit")
     print(f"  fit_spec: formula={formula!r}")
-    print(f"  fit_spec: z_column='prs_z'  logslope_formula={duchon!r}")
+    print(f"  fit_spec: z_column='prs_z'  logslope_formula={logslope_formula!r}")
     print(f"  fit_spec: num_pcs={num_pcs}  duchon_centers={DUCHON_CENTERS}  n_train={len(train_df)}")
     return gamfit.fit(
         train_df[cols],
         formula,
         link="probit",
         z_column="prs_z",
-        logslope_formula=duchon,
+        logslope_formula=logslope_formula,
     )
 
 
