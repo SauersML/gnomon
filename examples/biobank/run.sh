@@ -338,22 +338,31 @@ stage_plink_triplet_if_missing() {
     project="$(gcloud config get-value project 2>/dev/null || true)"
   fi
 
-  if command -v gsutil >/dev/null 2>&1; then
-    if [ -n "$project" ]; then
-      gsutil -m -u "$project" cp "${remote_prefix}.bed" "${remote_prefix}.bim" "${remote_prefix}.fam" "$plink_dir/"
-    else
-      gsutil -m cp "${remote_prefix}.bed" "${remote_prefix}.bim" "${remote_prefix}.fam" "$plink_dir/"
-    fi
-  elif command -v gcloud >/dev/null 2>&1; then
-    if [ -n "$project" ]; then
-      gcloud storage cp --billing-project "$project" "${remote_prefix}.bed" "${remote_prefix}.bim" "${remote_prefix}.fam" "$plink_dir/"
-    else
-      gcloud storage cp "${remote_prefix}.bed" "${remote_prefix}.bim" "${remote_prefix}.fam" "$plink_dir/"
-    fi
-  else
+  if ! command -v gsutil >/dev/null 2>&1 && ! command -v gcloud >/dev/null 2>&1; then
     echo "[run.sh] cannot stage PLINK files: neither gsutil nor gcloud is installed"
     return 1
   fi
+
+  local ext
+  for ext in bed bim fam; do
+    local src="${remote_prefix}.${ext}"
+    local dst="${plink_prefix}.${ext}"
+    local tmp="${dst}.tmp"
+    rm -f "$tmp"
+    echo "[run.sh]   copy $src"
+    if command -v gsutil >/dev/null 2>&1; then
+      if [ -n "$project" ]; then
+        gsutil -u "$project" cp "$src" "$tmp"
+      else
+        gsutil cp "$src" "$tmp"
+      fi
+    elif [ -n "$project" ]; then
+      gcloud storage cp --billing-project "$project" "$src" "$tmp"
+    else
+      gcloud storage cp "$src" "$tmp"
+    fi
+    mv "$tmp" "$dst"
+  done
 
   if ! plink_triplet_exists "$plink_prefix"; then
     echo "[run.sh] PLINK staging failed: expected ${plink_prefix}.{bed,bim,fam}"
