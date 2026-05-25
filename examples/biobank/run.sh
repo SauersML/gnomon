@@ -511,6 +511,12 @@ require_run_state_capacity \
   "$MIN_RUN_STATE_FREE_GIB" \
   "$MIN_RUN_STATE_FREE_INODES"
 
+{
+  echo "--- PLINK staging ---"
+  stage_plink_triplet_if_missing
+  echo
+} 2>&1 | tee -a "$RESULTS"
+
 # --- the actual run ---------------------------------------------------------
 # UV_CACHE_DIR is exported above instead of repeated as a flag. The original
 # failure happened before Python started because uv used its default
