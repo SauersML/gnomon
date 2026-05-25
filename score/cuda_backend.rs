@@ -1,3 +1,4 @@
+use crate::score::checkpoint::ScoreCheckpointWriter;
 use crate::score::complex::{ComplexVariantResolver, resolve_complex_variants};
 use crate::score::decide::ComputePath;
 use crate::score::io;
@@ -56,6 +57,13 @@ fn create_progress_bar(len: u64, message: &str) -> ProgressBar {
 }
 
 const CUDA_KERNELS: &str = r#"
+__device__ __forceinline__ unsigned long long linear_thread_id() {
+    return (((unsigned long long)blockIdx.y * (unsigned long long)gridDim.x) +
+            (unsigned long long)blockIdx.x) *
+               (unsigned long long)blockDim.x +
+           (unsigned long long)threadIdx.x;
+}
+
 extern "C" __global__ void unpack_plink(
     const unsigned char* packed,
     const unsigned int* out_to_fam,
@@ -65,9 +73,7 @@ extern "C" __global__ void unpack_plink(
     float* dosage,
     float* missing
 ) {
-    unsigned long long idx =
-        (unsigned long long)blockIdx.x * (unsigned long long)blockDim.x +
-        (unsigned long long)threadIdx.x;
+    unsigned long long idx = linear_thread_id();
     unsigned long long total =
         (unsigned long long)num_people * (unsigned long long)batch_variants;
     if (idx >= total) return;
@@ -96,7 +102,21 @@ extern "C" __global__ void unpack_plink(
     missing[idx] = m;
 }
 
-extern "C" __global__ void build_batch_mats(
+extern "C" __global__ void zero_batch_mats(
+    unsigned long long total_elements,
+    float* out_effective,
+    float* out_missing_corr,
+    float* out_count
+) {
+    unsigned long long idx = linear_thread_id();
+    if (idx >= total_elements) return;
+
+    out_effective[idx] = 0.0f;
+    out_missing_corr[idx] = 0.0f;
+    out_count[idx] = 0.0f;
+}
+
+extern "C" __global__ void scatter_batch_mats(
     const float* sparse_weights,
     const float* sparse_missing_corrections,
     const unsigned int* sparse_columns,
@@ -109,21 +129,11 @@ extern "C" __global__ void build_batch_mats(
     float* out_missing_corr,
     float* out_count
 ) {
-    unsigned long long v =
-        (unsigned long long)blockIdx.x * (unsigned long long)blockDim.x +
-        (unsigned long long)threadIdx.x;
+    unsigned long long v = linear_thread_id();
     if (v >= (unsigned long long)batch_variants) return;
 
     unsigned int reconciled = reconciled_indices[v];
     size_t row_base = (size_t)v * (size_t)num_scores_tile;
-
-    // Dense row init for GEMM inputs.
-    for (int s = 0; s < num_scores_tile; ++s) {
-        size_t dst = row_base + (size_t)s;
-        out_effective[dst] = 0.0f;
-        out_missing_corr[dst] = 0.0f;
-        out_count[dst] = 0.0f;
-    }
 
     unsigned long long start = sparse_row_offsets[reconciled];
     unsigned long long end = sparse_row_offsets[reconciled + 1u];
@@ -137,6 +147,22 @@ extern "C" __global__ void build_batch_mats(
         out_missing_corr[dst] = -sparse_missing_corrections[p];
         out_count[dst] = 1.0f;
     }
+}
+
+extern "C" __global__ void combine_score_outputs(
+    const float* scores,
+    const float* missing_corr,
+    const float* missing_counts,
+    unsigned long long total_elements,
+    float* combined_scores,
+    unsigned int* rounded_counts
+) {
+    unsigned long long idx = linear_thread_id();
+    if (idx >= total_elements) return;
+
+    float count = missing_counts[idx];
+    combined_scores[idx] = scores[idx] + missing_corr[idx];
+    rounded_counts[idx] = (unsigned int)floorf(count + 0.5f);
 }
 
 "#;
@@ -179,7 +205,9 @@ struct CudaRuntime {
     copy_stream: Arc<CudaStream>,
     blas: CudaBlas,
     unpack_kernel: CudaFunction,
-    build_batch_mats_kernel: CudaFunction,
+    zero_batch_mats_kernel: CudaFunction,
+    scatter_batch_mats_kernel: CudaFunction,
+    combine_score_outputs_kernel: CudaFunction,
     sparse_weights: CudaSlice<f32>,
     sparse_missing_corrections: CudaSlice<f32>,
     sparse_columns: CudaSlice<u32>,
@@ -188,13 +216,16 @@ struct CudaRuntime {
     mega_batch_variants: usize,
     gpu_score_chunk_size: usize,
     unpack_block_size: u32,
-    build_block_size: u32,
+    zero_block_size: u32,
+    scatter_block_size: u32,
+    combine_block_size: u32,
     device_info: CudaDeviceInfo,
     pinned_staging: Vec<PinnedHostSlice<u8>>,
     pinned_reconciled: Vec<PinnedHostSlice<u32>>,
 }
 
 struct CudaDeviceInfo {
+    ordinal: usize,
     name: String,
     compute_capability: (i32, i32),
     multiprocessors: i32,
@@ -204,6 +235,8 @@ struct CudaDeviceInfo {
     concurrent_kernels: bool,
     memory_clock_rate_khz: i32,
     global_memory_bus_width_bits: i32,
+    max_grid_dim_x: i32,
+    max_grid_dim_y: i32,
 }
 
 impl CudaDeviceInfo {
@@ -219,6 +252,7 @@ impl CudaDeviceInfo {
                 .map_err(|e| format!("Failed to query CUDA device attribute {label}: {e:?}"))
         };
         Ok(Self {
+            ordinal: ctx.ordinal(),
             name,
             compute_capability,
             multiprocessors: attr(
@@ -249,6 +283,14 @@ impl CudaDeviceInfo {
                 cuda_sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH,
                 "global_memory_bus_width",
             )?,
+            max_grid_dim_x: attr(
+                cuda_sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X,
+                "max_grid_dim_x",
+            )?,
+            max_grid_dim_y: attr(
+                cuda_sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Y,
+                "max_grid_dim_y",
+            )?,
         })
     }
 
@@ -261,7 +303,8 @@ impl CudaDeviceInfo {
 
     fn print(&self) {
         eprintln!(
-            "> CUDA device: {} (sm_{}{}, SMs={}, warp={}, max_threads/block={}, max_threads/SM={}, concurrent_kernels={}, theoretical_mem_bw={:.1} GB/s)",
+            "> CUDA device: ordinal={} {} (sm_{}{}, SMs={}, warp={}, max_threads/block={}, max_threads/SM={}, max_grid={}x{}, concurrent_kernels={}, theoretical_mem_bw={:.1} GB/s)",
+            self.ordinal,
             self.name,
             self.compute_capability.0,
             self.compute_capability.1,
@@ -269,10 +312,28 @@ impl CudaDeviceInfo {
             self.warp_size,
             self.max_threads_per_block,
             self.max_threads_per_multiprocessor,
+            self.max_grid_dim_x,
+            self.max_grid_dim_y,
             self.concurrent_kernels,
             self.theoretical_memory_bandwidth_gbps(),
         );
     }
+}
+
+#[derive(Copy, Clone)]
+struct CudaTiling {
+    mega_batch_variants: usize,
+    score_tile: usize,
+    required_bytes: usize,
+}
+
+struct CudaDevicePlan {
+    ctx: Arc<CudaContext>,
+    device_info: CudaDeviceInfo,
+    free_mem: usize,
+    total_mem: usize,
+    budget: usize,
+    tiling: CudaTiling,
 }
 
 impl Drop for CudaRuntime {
@@ -369,6 +430,7 @@ struct PendingBatch {
     slot: usize,
     shape: BatchShape,
     packed_len: usize,
+    end_reconciled_exclusive: usize,
     copy_done_event: CudaEvent,
 }
 
@@ -721,14 +783,288 @@ fn preflight_cuda_dynamic_libraries() -> Result<(), String> {
     Ok(())
 }
 
+fn estimate_static_cuda_bytes(prep: &PreparationResult) -> Result<usize, String> {
+    prep.sparse_weights()
+        .len()
+        .checked_mul(std::mem::size_of::<f32>())
+        .and_then(|v| {
+            v.checked_add(
+                prep.sparse_missing_corrections()
+                    .len()
+                    .checked_mul(std::mem::size_of::<f32>())?,
+            )
+        })
+        .and_then(|v| {
+            v.checked_add(
+                prep.sparse_score_columns()
+                    .len()
+                    .checked_mul(std::mem::size_of::<u32>())?,
+            )
+        })
+        .and_then(|v| {
+            v.checked_add(
+                prep.sparse_row_offsets()
+                    .len()
+                    .checked_mul(std::mem::size_of::<u64>())?,
+            )
+        })
+        .and_then(|v| {
+            v.checked_add(
+                prep.output_idx_to_fam_idx
+                    .len()
+                    .checked_mul(std::mem::size_of::<u32>())?,
+            )
+        })
+        .ok_or_else(|| "CUDA memory estimate overflow: static device allocations".to_string())
+}
+
+fn estimate_cuda_required_bytes(
+    prep: &PreparationResult,
+    static_bytes: usize,
+    mega: usize,
+    tile_scores: usize,
+) -> Option<usize> {
+    let num_people = prep.num_people_to_score;
+    let bytes_per_variant = prep.bytes_per_variant as usize;
+    let tile_result = num_people.checked_mul(tile_scores)?;
+    let slot_packed = PIPELINE_SLOTS.checked_mul(mega.checked_mul(bytes_per_variant)?)?;
+    let slot_reconciled =
+        PIPELINE_SLOTS.checked_mul(mega.checked_mul(std::mem::size_of::<u32>())?)?;
+    let slot_outputs = PIPELINE_SLOTS
+        .checked_mul(5)?
+        .checked_mul(tile_result.checked_mul(std::mem::size_of::<f32>())?)?;
+
+    let d_dosage = num_people
+        .checked_mul(mega)?
+        .checked_mul(std::mem::size_of::<f32>())?;
+    let d_missing = num_people
+        .checked_mul(mega)?
+        .checked_mul(std::mem::size_of::<f32>())?;
+    let d_w_eff = mega
+        .checked_mul(tile_scores)?
+        .checked_mul(std::mem::size_of::<f32>())?;
+    let d_w_corr = mega
+        .checked_mul(tile_scores)?
+        .checked_mul(std::mem::size_of::<f32>())?;
+    let d_count_w = mega
+        .checked_mul(tile_scores)?
+        .checked_mul(std::mem::size_of::<f32>())?;
+
+    static_bytes
+        .checked_add(slot_packed)?
+        .checked_add(slot_reconciled)?
+        .checked_add(slot_outputs)?
+        .checked_add(d_dosage)?
+        .checked_add(d_missing)?
+        .checked_add(d_w_eff)?
+        .checked_add(d_w_corr)?
+        .checked_add(d_count_w)
+}
+
+fn select_cuda_tiling(
+    prep: &PreparationResult,
+    static_bytes: usize,
+    free_mem: usize,
+    total_mem: usize,
+) -> Result<(usize, CudaTiling), String> {
+    let budget = (free_mem as f64 * 0.8) as usize;
+    let num_scores = prep.score_names.len();
+    let largest_candidate_mega =
+        highest_power_of_two_le(prep.num_reconciled_variants.max(1)).max(MIN_MEGA_BATCH_VARIANTS);
+    let lane_groups = num_scores.div_ceil(MIN_SCORE_TILE_SIZE).max(1);
+    let mut tile_candidates_lane_groups = Vec::with_capacity((usize::BITS as usize) + 1);
+    tile_candidates_lane_groups.push(lane_groups);
+    let mut p2 = highest_power_of_two_le(lane_groups);
+    while p2 >= 1 {
+        if !tile_candidates_lane_groups.contains(&p2) {
+            tile_candidates_lane_groups.push(p2);
+        }
+        p2 /= 2;
+    }
+
+    let mut selected: Option<CudaTiling> = None;
+    let mut smallest_required: Option<CudaTiling> = None;
+    for tile_lane_groups in tile_candidates_lane_groups {
+        let score_tile = tile_lane_groups
+            .checked_mul(MIN_SCORE_TILE_SIZE)
+            .ok_or_else(|| "CUDA score tile computation overflow".to_string())?
+            .min(num_scores.max(MIN_SCORE_TILE_SIZE));
+        let mut mega = largest_candidate_mega;
+        while mega >= MIN_MEGA_BATCH_VARIANTS {
+            let required =
+                estimate_cuda_required_bytes(prep, static_bytes, mega, score_tile).ok_or_else(
+                    || {
+                        format!(
+                            "CUDA memory estimate overflow while evaluating mega-batch={mega}, score_tile={score_tile}"
+                        )
+                    },
+                )?;
+            let tiling = CudaTiling {
+                mega_batch_variants: mega,
+                score_tile,
+                required_bytes: required,
+            };
+            if required <= budget {
+                match selected {
+                    None => selected = Some(tiling),
+                    Some(best) => {
+                        if score_tile > best.score_tile
+                            || (score_tile == best.score_tile && mega > best.mega_batch_variants)
+                        {
+                            selected = Some(tiling);
+                        }
+                    }
+                }
+                break;
+            }
+            match smallest_required {
+                None => smallest_required = Some(tiling),
+                Some(best) if required < best.required_bytes => smallest_required = Some(tiling),
+                _ => {}
+            }
+            mega /= 2;
+        }
+    }
+
+    selected.map(|tiling| (budget, tiling)).ok_or_else(|| {
+        let mut msg = format!(
+            "insufficient memory for minimum CUDA workload (budget {:.2} GiB = 80% of {:.2} GiB free)",
+            budget as f64 / (1024.0 * 1024.0 * 1024.0),
+            free_mem as f64 / (1024.0 * 1024.0 * 1024.0),
+        );
+        if let Some(smallest) = smallest_required {
+            msg.push_str(&format!(
+                "; smallest tile considered (mega={}, score_tile={}) needed {:.2} GiB, short by {:.2} GiB",
+                smallest.mega_batch_variants,
+                smallest.score_tile,
+                smallest.required_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                smallest.required_bytes.saturating_sub(budget) as f64
+                    / (1024.0 * 1024.0 * 1024.0),
+            ));
+        }
+        if free_mem < total_mem / 2 {
+            msg.push_str(&format!(
+                "; only {:.0}% of device memory is free",
+                100.0 * free_mem as f64 / total_mem.max(1) as f64,
+            ));
+        }
+        msg
+    })
+}
+
+fn select_cuda_device_plan(
+    prep: &PreparationResult,
+    static_bytes: usize,
+) -> Result<CudaDevicePlan, String> {
+    let device_count = CudaContext::device_count()
+        .map_err(|e| format!("Failed to query CUDA device count: {e:?}"))?;
+    if device_count <= 0 {
+        return Err("CUDA reported zero visible devices".to_string());
+    }
+
+    let mut best: Option<CudaDevicePlan> = None;
+    let mut rejections = Vec::new();
+    for ordinal in 0..device_count as usize {
+        let ctx = match CudaContext::new(ordinal) {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                rejections.push(format!("ordinal {ordinal}: init failed: {e:?}"));
+                continue;
+            }
+        };
+        if let Err(e) = ctx.bind_to_thread() {
+            rejections.push(format!("ordinal {ordinal}: bind failed: {e:?}"));
+            continue;
+        }
+        let device_info = match CudaDeviceInfo::query(&ctx) {
+            Ok(info) => info,
+            Err(e) => {
+                rejections.push(format!("ordinal {ordinal}: {e}"));
+                continue;
+            }
+        };
+        let (free_mem, total_mem) = match ctx.mem_get_info() {
+            Ok(info) => info,
+            Err(e) => {
+                rejections.push(format!("ordinal {ordinal}: memory query failed: {e:?}"));
+                continue;
+            }
+        };
+        let (budget, tiling) = match select_cuda_tiling(prep, static_bytes, free_mem, total_mem) {
+            Ok(plan) => plan,
+            Err(e) => {
+                rejections.push(format!("ordinal {ordinal} {}: {e}", device_info.name));
+                continue;
+            }
+        };
+        let candidate = CudaDevicePlan {
+            ctx,
+            device_info,
+            free_mem,
+            total_mem,
+            budget,
+            tiling,
+        };
+        if best
+            .as_ref()
+            .map(|current| cuda_device_plan_is_better(&candidate, current))
+            .unwrap_or(true)
+        {
+            best = Some(candidate);
+        }
+    }
+
+    let selected = best.ok_or_else(|| {
+        if rejections.is_empty() {
+            "No CUDA device could be initialized".to_string()
+        } else {
+            format!(
+                "No visible CUDA device can run this workload:\n  {}",
+                rejections.join("\n  ")
+            )
+        }
+    })?;
+    selected
+        .ctx
+        .bind_to_thread()
+        .map_err(|e| format!("Failed to bind selected CUDA device: {e:?}"))?;
+    eprintln!(
+        "> CUDA device selection: chose ordinal {} from {} visible device(s)",
+        selected.device_info.ordinal, device_count
+    );
+    Ok(selected)
+}
+
+fn cuda_device_plan_is_better(candidate: &CudaDevicePlan, current: &CudaDevicePlan) -> bool {
+    let cand = (
+        candidate.tiling.score_tile,
+        candidate.tiling.mega_batch_variants,
+        candidate.free_mem,
+        candidate.device_info.multiprocessors,
+    );
+    let curr = (
+        current.tiling.score_tile,
+        current.tiling.mega_batch_variants,
+        current.free_mem,
+        current.device_info.multiprocessors,
+    );
+    cand > curr
+}
+
 impl CudaRuntime {
     fn new(prep: &PreparationResult) -> Result<Self, String> {
         preflight_cuda_dynamic_libraries()?;
 
-        let ctx = CudaContext::new(0).map_err(|e| format!("CUDA init failed: {e:?}"))?;
-        ctx.bind_to_thread()
-            .map_err(|e| format!("Failed to bind CUDA context: {e:?}"))?;
-        let device_info = CudaDeviceInfo::query(&ctx)?;
+        let static_bytes = estimate_static_cuda_bytes(prep)?;
+        let plan = select_cuda_device_plan(prep, static_bytes)?;
+        let CudaDevicePlan {
+            ctx,
+            device_info,
+            free_mem,
+            total_mem,
+            budget,
+            tiling,
+        } = plan;
         device_info.print();
         let copy_stream = ctx
             .new_stream()
@@ -737,8 +1073,6 @@ impl CudaRuntime {
             .new_stream()
             .map_err(|e| format!("Failed to create CUDA compute stream: {e:?}"))?;
 
-        let (free_mem, total_mem) = cudarc::driver::result::mem_get_info()
-            .map_err(|e| format!("Failed to query device memory: {e:?}"))?;
         eprintln!(
             "> CUDA device memory: free={:.2} GiB / total={:.2} GiB ({:.1}% available)",
             free_mem as f64 / (1024.0 * 1024.0 * 1024.0),
@@ -750,169 +1084,21 @@ impl CudaRuntime {
             },
         );
 
-        let static_bytes = prep
-            .sparse_weights()
-            .len()
-            .checked_mul(std::mem::size_of::<f32>())
-            .and_then(|v| {
-                v.checked_add(
-                    prep.sparse_missing_corrections()
-                        .len()
-                        .checked_mul(std::mem::size_of::<f32>())?,
-                )
-            })
-            .and_then(|v| {
-                v.checked_add(
-                    prep.sparse_score_columns()
-                        .len()
-                        .checked_mul(std::mem::size_of::<u32>())?,
-                )
-            })
-            .and_then(|v| {
-                v.checked_add(
-                    prep.sparse_row_offsets()
-                        .len()
-                        .checked_mul(std::mem::size_of::<u64>())?,
-                )
-            })
-            .and_then(|v| {
-                v.checked_add(
-                    prep.output_idx_to_fam_idx
-                        .len()
-                        .checked_mul(std::mem::size_of::<u32>())?,
-                )
-            })
-            .ok_or_else(|| {
-                "CUDA memory estimate overflow: static device allocations".to_string()
-            })?;
-
         let num_people = prep.num_people_to_score;
         let num_scores = prep.score_names.len();
         let bytes_per_variant = prep.bytes_per_variant as usize;
 
-        let estimate_required_bytes = |mega: usize, tile_scores: usize| -> Option<usize> {
-            let tile_result = num_people.checked_mul(tile_scores)?;
-            let slot_packed = PIPELINE_SLOTS.checked_mul(mega.checked_mul(bytes_per_variant)?)?;
-            let slot_reconciled =
-                PIPELINE_SLOTS.checked_mul(mega.checked_mul(std::mem::size_of::<u32>())?)?;
-            let slot_outputs = PIPELINE_SLOTS
-                .checked_mul(3)?
-                .checked_mul(tile_result.checked_mul(std::mem::size_of::<f32>())?)?;
-
-            let d_dosage = num_people
-                .checked_mul(mega)?
-                .checked_mul(std::mem::size_of::<f32>())?;
-            let d_missing = num_people
-                .checked_mul(mega)?
-                .checked_mul(std::mem::size_of::<f32>())?;
-            let d_w_eff = mega
-                .checked_mul(tile_scores)?
-                .checked_mul(std::mem::size_of::<f32>())?;
-            let d_w_corr = mega
-                .checked_mul(tile_scores)?
-                .checked_mul(std::mem::size_of::<f32>())?;
-            let d_count_w = mega
-                .checked_mul(tile_scores)?
-                .checked_mul(std::mem::size_of::<f32>())?;
-
-            static_bytes
-                .checked_add(slot_packed)?
-                .checked_add(slot_reconciled)?
-                .checked_add(slot_outputs)?
-                .checked_add(d_dosage)?
-                .checked_add(d_missing)?
-                .checked_add(d_w_eff)?
-                .checked_add(d_w_corr)?
-                .checked_add(d_count_w)
-        };
-
-        let budget = (free_mem as f64 * 0.8) as usize;
         eprintln!(
             "> CUDA budget (80% of free): {:.2} GiB; static device buffers: {:.2} MiB; \
              per-variant packed bytes: {bytes_per_variant}; people={num_people}, scores={num_scores}",
             budget as f64 / (1024.0 * 1024.0 * 1024.0),
             static_bytes as f64 / (1024.0 * 1024.0),
         );
-        let largest_candidate_mega = highest_power_of_two_le(prep.num_reconciled_variants.max(1))
-            .max(MIN_MEGA_BATCH_VARIANTS);
-        let lane_groups = num_scores.div_ceil(MIN_SCORE_TILE_SIZE).max(1);
-        let mut tile_candidates_lane_groups = Vec::with_capacity((usize::BITS as usize) + 1);
-        tile_candidates_lane_groups.push(lane_groups);
-        let mut p2 = highest_power_of_two_le(lane_groups);
-        while p2 >= 1 {
-            if !tile_candidates_lane_groups.contains(&p2) {
-                tile_candidates_lane_groups.push(p2);
-            }
-            p2 /= 2;
-        }
-        let mut selected: Option<(usize, usize)> = None;
-        let mut smallest_required: Option<(usize, usize, usize)> = None;
-
-        for tile_lane_groups in tile_candidates_lane_groups {
-            let score_tile = tile_lane_groups
-                .checked_mul(MIN_SCORE_TILE_SIZE)
-                .ok_or_else(|| "CUDA score tile computation overflow".to_string())?
-                .min(num_scores.max(MIN_SCORE_TILE_SIZE));
-            let mut mega = largest_candidate_mega;
-            while mega >= MIN_MEGA_BATCH_VARIANTS {
-                let required = estimate_required_bytes(mega, score_tile).ok_or_else(|| {
-                    format!(
-                        "CUDA memory estimate overflow while evaluating mega-batch={mega}, score_tile={score_tile}"
-                    )
-                })?;
-                if required <= budget {
-                    match selected {
-                        None => selected = Some((mega, score_tile)),
-                        Some((best_mega, best_tile)) => {
-                            // Prefer larger score tiles first (better GEMM shape), then larger mega-batches.
-                            if score_tile > best_tile
-                                || (score_tile == best_tile && mega > best_mega)
-                            {
-                                selected = Some((mega, score_tile));
-                            }
-                        }
-                    }
-                    break;
-                }
-                // Track the cheapest (mega, score_tile, required) we considered, so
-                // we can tell the user how much VRAM the minimal viable layout would
-                // have needed when we end up falling back.
-                match smallest_required {
-                    None => smallest_required = Some((mega, score_tile, required)),
-                    Some((_, _, best)) if required < best => {
-                        smallest_required = Some((mega, score_tile, required));
-                    }
-                    _ => {}
-                }
-                mega /= 2;
-            }
-        }
-
-        let (mega, gpu_score_chunk_size) = selected.ok_or_else(|| {
-            let mut msg = format!(
-                "Insufficient GPU memory for minimum CUDA workload (budget {:.2} GiB = 80% of {:.2} GiB free)",
-                budget as f64 / (1024.0 * 1024.0 * 1024.0),
-                free_mem as f64 / (1024.0 * 1024.0 * 1024.0),
-            );
-            if let Some((m, t, req)) = smallest_required {
-                msg.push_str(&format!(
-                    "; smallest tile considered (mega={m}, score_tile={t}) needed {:.2} GiB, \
-                     short by {:.2} GiB",
-                    req as f64 / (1024.0 * 1024.0 * 1024.0),
-                    (req.saturating_sub(budget)) as f64 / (1024.0 * 1024.0 * 1024.0),
-                ));
-            }
-            if free_mem < total_mem / 2 {
-                msg.push_str(&format!(
-                    "; note: only {:.0}% of device memory is free — another process likely \
-                     holds an allocation",
-                    100.0 * free_mem as f64 / total_mem.max(1) as f64,
-                ));
-            }
-            msg
-        })?;
+        let mega = tiling.mega_batch_variants;
+        let gpu_score_chunk_size = tiling.score_tile;
         eprintln!(
-            "> CUDA tiling: mega_batch_variants={mega}, gpu_score_chunk_size={gpu_score_chunk_size}, vram_budget_bytes={budget}"
+            "> CUDA tiling: mega_batch_variants={mega}, gpu_score_chunk_size={gpu_score_chunk_size}, required_bytes={}, vram_budget_bytes={budget}",
+            tiling.required_bytes
         );
 
         let sparse_weights = compute_stream
@@ -957,13 +1143,29 @@ impl CudaRuntime {
         let unpack_kernel = module
             .load_function("unpack_plink")
             .map_err(|e| format!("Failed to load unpack_plink kernel: {e:?}"))?;
-        let build_batch_mats_kernel = module
-            .load_function("build_batch_mats")
-            .map_err(|e| format!("Failed to load build_batch_mats kernel: {e:?}"))?;
+        let zero_batch_mats_kernel = module
+            .load_function("zero_batch_mats")
+            .map_err(|e| format!("Failed to load zero_batch_mats kernel: {e:?}"))?;
+        let scatter_batch_mats_kernel = module
+            .load_function("scatter_batch_mats")
+            .map_err(|e| format!("Failed to load scatter_batch_mats kernel: {e:?}"))?;
+        let combine_score_outputs_kernel = module
+            .load_function("combine_score_outputs")
+            .map_err(|e| format!("Failed to load combine_score_outputs kernel: {e:?}"))?;
         let unpack_block_size =
             choose_kernel_block_size(&unpack_kernel, &device_info, "unpack_plink")?;
-        let build_block_size =
-            choose_kernel_block_size(&build_batch_mats_kernel, &device_info, "build_batch_mats")?;
+        let zero_block_size =
+            choose_kernel_block_size(&zero_batch_mats_kernel, &device_info, "zero_batch_mats")?;
+        let scatter_block_size = choose_kernel_block_size(
+            &scatter_batch_mats_kernel,
+            &device_info,
+            "scatter_batch_mats",
+        )?;
+        let combine_block_size = choose_kernel_block_size(
+            &combine_score_outputs_kernel,
+            &device_info,
+            "combine_score_outputs",
+        )?;
         let max_packed = mega * prep.bytes_per_variant as usize;
         let mut pinned_staging = Vec::with_capacity(PIPELINE_SLOTS);
         let mut pinned_reconciled = Vec::with_capacity(PIPELINE_SLOTS);
@@ -1007,7 +1209,9 @@ impl CudaRuntime {
             copy_stream,
             blas,
             unpack_kernel,
-            build_batch_mats_kernel,
+            zero_batch_mats_kernel,
+            scatter_batch_mats_kernel,
+            combine_score_outputs_kernel,
             sparse_weights,
             sparse_missing_corrections,
             sparse_columns,
@@ -1016,7 +1220,9 @@ impl CudaRuntime {
             mega_batch_variants: mega,
             gpu_score_chunk_size,
             unpack_block_size,
-            build_block_size,
+            zero_block_size,
+            scatter_block_size,
+            combine_block_size,
             device_info,
             pinned_staging,
             pinned_reconciled,
@@ -1129,6 +1335,16 @@ fn run_cuda_pipeline(
 ) -> Result<(Vec<f64>, Vec<u32>), PipelineError> {
     let prep_result = &context.prep_result;
     let channels = create_gpu_channels(context);
+    let resume_from = context.checkpoint_completed_variants();
+    if resume_from > 0 {
+        eprintln!(
+            "> Resuming CUDA score computation from checkpoint at {}/{} variants.",
+            resume_from, prep_result.num_reconciled_variants
+        );
+        channels
+            .variants_processed_count
+            .store(resume_from as u64, Ordering::Relaxed);
+    }
     let progress_counter = Arc::clone(&channels.variants_processed_count);
     let mut support_guard = PipelineSupportGuard::new(start_pipeline_support(
         prep_result.num_reconciled_variants as u64,
@@ -1226,6 +1442,7 @@ fn run_cuda_pipeline(
                             pool,
                             counter,
                             |_| ComputePath::Pivot,
+                            resume_from,
                             spool_plan,
                         );
                     }
@@ -1242,6 +1459,7 @@ fn run_cuda_pipeline(
                             pool,
                             counter,
                             |_| ComputePath::Pivot,
+                            resume_from,
                             spool_plan,
                         );
                     }
@@ -1253,6 +1471,7 @@ fn run_cuda_pipeline(
         let compute_result = process_dense_stream_cuda(
             channels.dense_rx,
             prep_result,
+            context,
             &mut runtime,
             Arc::clone(&channels.buffer_pool),
             Arc::clone(&progress_counter),
@@ -1470,6 +1689,7 @@ fn finish_pipeline_support(support: PipelineSupport, completed: bool) {
 fn process_dense_stream_cuda(
     rx: Receiver<Result<WorkItem, PipelineError>>,
     prep_result: &PreparationResult,
+    context: &PipelineContext,
     runtime: &mut CudaRuntime,
     buffer_pool: Arc<ArrayQueue<Vec<u8>>>,
     progress_counter: Arc<AtomicU64>,
@@ -1480,6 +1700,17 @@ fn process_dense_stream_cuda(
     let total_variants = prep_result.num_reconciled_variants as u64;
     let total_wall_start = Instant::now();
     let mut stats = CudaStats::default();
+    let mut checkpoint_writer = match (
+        context.checkpoint_path.as_ref(),
+        context.checkpoint_fingerprint,
+    ) {
+        (Some(path), Some(fingerprint)) => Some(ScoreCheckpointWriter::new(
+            path.clone(),
+            fingerprint,
+            prep_result.num_reconciled_variants,
+        )),
+        _ => None,
+    };
     let mut last_logged_at = Instant::now();
     let mut last_logged_value: Option<u64> = None;
     let mut emit_progress_log = |force_final: bool| {
@@ -1511,6 +1742,21 @@ fn process_dense_stream_cuda(
         final_scores.extend_from_slice(&baseline);
     }
     let mut final_counts = vec![0u32; result_size];
+    if let Some(checkpoint) = context.checkpoint.as_ref() {
+        if checkpoint.sum_scores.len() != final_scores.len()
+            || checkpoint.missing_counts.len() != final_counts.len()
+        {
+            return Err(PipelineError::Compute(format!(
+                "Checkpoint accumulator shape mismatch: scores {} vs {}, counts {} vs {}.",
+                checkpoint.sum_scores.len(),
+                final_scores.len(),
+                checkpoint.missing_counts.len(),
+                final_counts.len()
+            )));
+        }
+        final_scores.copy_from_slice(&checkpoint.sum_scores);
+        final_counts.copy_from_slice(&checkpoint.missing_counts);
+    }
 
     let mega = runtime.mega_batch_variants;
     let gpu_score_chunk_size = runtime.gpu_score_chunk_size.max(MIN_SCORE_TILE_SIZE);
@@ -1525,7 +1771,7 @@ fn process_dense_stream_cuda(
     eprintln!(
         "> CUDA scoring buffers: pipeline_slots={PIPELINE_SLOTS}, max_packed={:.2} MiB/slot, \
          dosage_or_missing={:.2} GiB, weights_tile={:.2} MiB, output_tile={:.2} MiB/slot, \
-         unpack_block={}, build_block={}",
+         unpack_block={}, zero_block={}, scatter_block={}, combine_block={}",
         max_packed as f64 / (1024.0 * 1024.0),
         checked_mul_usize("dosage buffer bytes", dims.num_people, mega)?
             .checked_mul(std::mem::size_of::<f32>())
@@ -1536,7 +1782,9 @@ fn process_dense_stream_cuda(
         max_weights_tile_elems as f64 * std::mem::size_of::<f32>() as f64 / (1024.0 * 1024.0),
         max_tile_result_elems as f64 * std::mem::size_of::<f32>() as f64 / (1024.0 * 1024.0),
         runtime.unpack_block_size,
-        runtime.build_block_size,
+        runtime.zero_block_size,
+        runtime.scatter_block_size,
+        runtime.combine_block_size,
     );
     let mut d_packed_slots: Vec<CudaSlice<u8>> = (0..PIPELINE_SLOTS)
         .map(|_| {
@@ -1612,9 +1860,28 @@ fn process_dense_stream_cuda(
                 .map_err(map_driver_err("Failed to allocate output count buffer"))
         })
         .collect::<Result<_, _>>()?;
+    let mut d_out_combined_slots: Vec<CudaSlice<f32>> = (0..PIPELINE_SLOTS)
+        .map(|_| {
+            runtime
+                .compute_stream
+                .alloc_zeros::<f32>(max_tile_result_elems)
+                .map_err(map_driver_err(
+                    "Failed to allocate combined score output buffer",
+                ))
+        })
+        .collect::<Result<_, _>>()?;
+    let mut d_out_counts_u32_slots: Vec<CudaSlice<u32>> = (0..PIPELINE_SLOTS)
+        .map(|_| {
+            runtime
+                .compute_stream
+                .alloc_zeros::<u32>(max_tile_result_elems)
+                .map_err(map_driver_err(
+                    "Failed to allocate rounded output count buffer",
+                ))
+        })
+        .collect::<Result<_, _>>()?;
     let mut host_tile_scores_slots = vec![vec![0.0f32; max_tile_result_elems]; PIPELINE_SLOTS];
-    let mut host_tile_corr_slots = vec![vec![0.0f32; max_tile_result_elems]; PIPELINE_SLOTS];
-    let mut host_tile_counts_slots = vec![vec![0.0f32; max_tile_result_elems]; PIPELINE_SLOTS];
+    let mut host_tile_counts_slots = vec![vec![0u32; max_tile_result_elems]; PIPELINE_SLOTS];
 
     let mut batch: Vec<WorkItem> = Vec::with_capacity(mega);
     let mut pending: Option<PendingBatch> = None;
@@ -1643,6 +1910,10 @@ fn process_dense_stream_cuda(
         if batch_len == 0 {
             continue;
         }
+        let end_reconciled_exclusive = batch
+            .last()
+            .map(|item| item.reconciled_variant_index.0 as usize + 1)
+            .unwrap_or(0);
         let shape = BatchShape::from_counts(dims, batch_len)?;
 
         let slot = batch_counter % PIPELINE_SLOTS;
@@ -1730,11 +2001,13 @@ fn process_dense_stream_cuda(
             slot,
             shape,
             packed_len,
+            end_reconciled_exclusive,
             copy_done_event,
         };
 
         if let Some(prev) = pending.take() {
             let slot = prev.slot;
+            let completed = prev.end_reconciled_exclusive;
             slot_last_compute_done[slot] = Some(run_pending_compute_cuda(
                 runtime,
                 dims,
@@ -1749,19 +2022,28 @@ fn process_dense_stream_cuda(
                 &mut d_out_scores_slots,
                 &mut d_out_corr_slots,
                 &mut d_out_counts_slots,
+                &mut d_out_combined_slots,
+                &mut d_out_counts_u32_slots,
                 &mut host_tile_scores_slots,
-                &mut host_tile_corr_slots,
                 &mut host_tile_counts_slots,
                 &mut final_scores,
                 &mut final_counts,
                 &mut stats,
             )?);
+            maybe_save_cuda_checkpoint(
+                checkpoint_writer.as_mut(),
+                completed,
+                &final_scores,
+                &final_counts,
+                false,
+            )?;
         }
         pending = Some(current);
     }
 
     if let Some(last) = pending.take() {
         let slot = last.slot;
+        let completed = last.end_reconciled_exclusive;
         slot_last_compute_done[slot] = Some(run_pending_compute_cuda(
             runtime,
             dims,
@@ -1776,13 +2058,21 @@ fn process_dense_stream_cuda(
             &mut d_out_scores_slots,
             &mut d_out_corr_slots,
             &mut d_out_counts_slots,
+            &mut d_out_combined_slots,
+            &mut d_out_counts_u32_slots,
             &mut host_tile_scores_slots,
-            &mut host_tile_corr_slots,
             &mut host_tile_counts_slots,
             &mut final_scores,
             &mut final_counts,
             &mut stats,
         )?);
+        maybe_save_cuda_checkpoint(
+            checkpoint_writer.as_mut(),
+            completed,
+            &final_scores,
+            &final_counts,
+            true,
+        )?;
     }
 
     // Drain the streams *and then* explicitly free every per-batch
@@ -1802,8 +2092,9 @@ fn process_dense_stream_cuda(
     // sync waits for the cuMemFreeAsync queue this function generated,
     // and nothing in the runtime's teardown path can race against it.
     drop(host_tile_counts_slots);
-    drop(host_tile_corr_slots);
     drop(host_tile_scores_slots);
+    drop(d_out_counts_u32_slots);
+    drop(d_out_combined_slots);
     drop(d_out_counts_slots);
     drop(d_out_corr_slots);
     drop(d_out_scores_slots);
@@ -1852,9 +2143,10 @@ fn run_pending_compute_cuda(
     d_out_scores_slots: &mut [CudaSlice<f32>],
     d_out_corr_slots: &mut [CudaSlice<f32>],
     d_out_counts_slots: &mut [CudaSlice<f32>],
+    d_out_combined_slots: &mut [CudaSlice<f32>],
+    d_out_counts_u32_slots: &mut [CudaSlice<u32>],
     host_tile_scores_slots: &mut [Vec<f32>],
-    host_tile_corr_slots: &mut [Vec<f32>],
-    host_tile_counts_slots: &mut [Vec<f32>],
+    host_tile_counts_slots: &mut [Vec<u32>],
     final_scores: &mut [f64],
     final_counts: &mut [u32],
     stats: &mut CudaStats,
@@ -1890,6 +2182,7 @@ fn run_pending_compute_cuda(
             .launch(launch_config_for_num_elems(
                 unpack_elems,
                 runtime.unpack_block_size,
+                &runtime.device_info,
             )?)
             .map_err(map_driver_err("Failed to launch unpack_plink kernel"))?;
     }
@@ -1916,7 +2209,23 @@ fn run_pending_compute_cuda(
         unsafe {
             runtime
                 .compute_stream
-                .launch_builder(&runtime.build_batch_mats_kernel)
+                .launch_builder(&runtime.zero_batch_mats_kernel)
+                .arg(&checked_u64("weights_elems", weights_elems)?)
+                .arg(&mut d_w_eff.slice_mut(0..weights_elems))
+                .arg(&mut d_w_corr.slice_mut(0..weights_elems))
+                .arg(&mut d_count_w.slice_mut(0..weights_elems))
+                .launch(launch_config_for_num_elems(
+                    weights_elems,
+                    runtime.zero_block_size,
+                    &runtime.device_info,
+                )?)
+                .map_err(map_driver_err("Failed to launch zero_batch_mats kernel"))?;
+        }
+
+        unsafe {
+            runtime
+                .compute_stream
+                .launch_builder(&runtime.scatter_batch_mats_kernel)
                 .arg(&runtime.sparse_weights)
                 .arg(&runtime.sparse_missing_corrections)
                 .arg(&runtime.sparse_columns)
@@ -1930,9 +2239,10 @@ fn run_pending_compute_cuda(
                 .arg(&mut d_count_w.slice_mut(0..weights_elems))
                 .launch(launch_config_for_num_elems(
                     work.shape.batch_len(),
-                    runtime.build_block_size,
+                    runtime.scatter_block_size,
+                    &runtime.device_info,
                 )?)
-                .map_err(map_driver_err("Failed to launch build_batch_mats kernel"))?;
+                .map_err(map_driver_err("Failed to launch scatter_batch_mats kernel"))?;
         }
 
         run_row_major_gemm(
@@ -1966,30 +2276,42 @@ fn run_pending_compute_cuda(
             0.0f32,
         )?;
 
+        unsafe {
+            runtime
+                .compute_stream
+                .launch_builder(&runtime.combine_score_outputs_kernel)
+                .arg(&d_out_scores_slots[work.slot].slice(0..tile_result_elems))
+                .arg(&d_out_corr_slots[work.slot].slice(0..tile_result_elems))
+                .arg(&d_out_counts_slots[work.slot].slice(0..tile_result_elems))
+                .arg(&checked_u64("tile_result_elems", tile_result_elems)?)
+                .arg(&mut d_out_combined_slots[work.slot].slice_mut(0..tile_result_elems))
+                .arg(&mut d_out_counts_u32_slots[work.slot].slice_mut(0..tile_result_elems))
+                .launch(launch_config_for_num_elems(
+                    tile_result_elems,
+                    runtime.combine_block_size,
+                    &runtime.device_info,
+                )?)
+                .map_err(map_driver_err(
+                    "Failed to launch combine_score_outputs kernel",
+                ))?;
+        }
+
         runtime
             .compute_stream
             .memcpy_dtoh(
-                &d_out_scores_slots[work.slot].slice(0..tile_result_elems),
+                &d_out_combined_slots[work.slot].slice(0..tile_result_elems),
                 &mut host_tile_scores_slots[work.slot][..tile_result_elems],
             )
             .map_err(map_driver_err("Failed to copy score tile output to host"))?;
         runtime
             .compute_stream
             .memcpy_dtoh(
-                &d_out_corr_slots[work.slot].slice(0..tile_result_elems),
-                &mut host_tile_corr_slots[work.slot][..tile_result_elems],
-            )
-            .map_err(map_driver_err(
-                "Failed to copy correction tile output to host",
-            ))?;
-        runtime
-            .compute_stream
-            .memcpy_dtoh(
-                &d_out_counts_slots[work.slot].slice(0..tile_result_elems),
+                &d_out_counts_u32_slots[work.slot].slice(0..tile_result_elems),
                 &mut host_tile_counts_slots[work.slot][..tile_result_elems],
             )
             .map_err(map_driver_err("Failed to copy count tile output to host"))?;
-        stats.dtoh_bytes += (3 * tile_result_elems * std::mem::size_of::<f32>()) as u64;
+        stats.dtoh_bytes +=
+            (tile_result_elems * (std::mem::size_of::<f32>() + std::mem::size_of::<u32>())) as u64;
         let tile_done_event = runtime
             .compute_stream
             .record_event(None)
@@ -1997,7 +2319,7 @@ fn run_pending_compute_cuda(
                 "Failed to record CUDA tile completion event",
             ))?;
 
-        // The three `memcpy_dtoh` calls above issue `cuMemcpyDtoHAsync`.
+        // The `memcpy_dtoh` calls above issue `cuMemcpyDtoHAsync`.
         // cudarc's host-slice implementation for `Vec<T>` / `[T]`
         // returns `SyncOnDrop::Sync(None)`, so there is no implicit
         // stream sync when the temporary host borrow is dropped. Without
@@ -2031,9 +2353,8 @@ fn run_pending_compute_cuda(
             for j in 0..tile_scores {
                 let src_idx = src_base + j;
                 let dst_idx = dst_base + j;
-                final_scores[dst_idx] += host_tile_scores_slots[work.slot][src_idx] as f64
-                    + host_tile_corr_slots[work.slot][src_idx] as f64;
-                final_counts[dst_idx] += host_tile_counts_slots[work.slot][src_idx].round() as u32;
+                final_scores[dst_idx] += host_tile_scores_slots[work.slot][src_idx] as f64;
+                final_counts[dst_idx] += host_tile_counts_slots[work.slot][src_idx];
             }
         }
         stats.cpu_accum += accum_start.elapsed();
@@ -2041,6 +2362,25 @@ fn run_pending_compute_cuda(
 
     final_compute_done_event
         .ok_or_else(|| PipelineError::Compute("CUDA compute produced no score tiles".to_string()))
+}
+
+fn maybe_save_cuda_checkpoint(
+    writer: Option<&mut ScoreCheckpointWriter>,
+    completed_variants: usize,
+    final_scores: &[f64],
+    final_counts: &[u32],
+    force: bool,
+) -> Result<(), PipelineError> {
+    let Some(writer) = writer else {
+        return Ok(());
+    };
+    let wrote = writer
+        .maybe_save(completed_variants, final_scores, final_counts, force)
+        .map_err(|e| PipelineError::Io(format!("Failed to write score checkpoint: {e}")))?;
+    if wrote {
+        eprintln!("> Score checkpoint saved after {completed_variants} completed variants.");
+    }
+    Ok(())
 }
 
 fn run_row_major_gemm(
@@ -2151,16 +2491,45 @@ fn choose_kernel_block_size(
     Ok(block)
 }
 
-fn launch_config_for_num_elems(n: usize, block_size: u32) -> Result<LaunchConfig, PipelineError> {
+fn launch_config_for_num_elems(
+    n: usize,
+    block_size: u32,
+    device: &CudaDeviceInfo,
+) -> Result<LaunchConfig, PipelineError> {
     let block_size = block_size.max(1);
     let grid_blocks = (n as u128).div_ceil(block_size as u128);
-    let grid_x = u32::try_from(grid_blocks).map_err(|_| {
+    let max_grid_x = u32::try_from(device.max_grid_dim_x.max(1)).map_err(|_| {
         PipelineError::Compute(format!(
-            "CUDA launch requires {grid_blocks} grid blocks for {n} elements at block size {block_size}, exceeding CUDA's x-grid limit"
+            "CUDA device reported invalid max_grid_dim_x={}",
+            device.max_grid_dim_x
         ))
     })?;
+    let max_grid_y = u32::try_from(device.max_grid_dim_y.max(1)).map_err(|_| {
+        PipelineError::Compute(format!(
+            "CUDA device reported invalid max_grid_dim_y={}",
+            device.max_grid_dim_y
+        ))
+    })?;
+    let grid_x_u128 = grid_blocks.min(max_grid_x as u128).max(1);
+    let grid_y_u128 = grid_blocks.div_ceil(grid_x_u128).max(1);
+    let grid_x = u32::try_from(grid_x_u128).map_err(|_| {
+        PipelineError::Compute(format!(
+            "CUDA launch x-grid overflow for {n} elements at block size {block_size}"
+        ))
+    })?;
+    let grid_y = u32::try_from(grid_y_u128).map_err(|_| {
+        PipelineError::Compute(format!(
+            "CUDA launch requires {grid_blocks} grid blocks for {n} elements at block size {block_size}, exceeding CUDA's 2D grid limit"
+        ))
+    })?;
+    if grid_y > max_grid_y {
+        return Err(PipelineError::Compute(format!(
+            "CUDA launch requires grid {}x{} for {n} elements at block size {block_size}, exceeding device limit {}x{}",
+            grid_x, grid_y, max_grid_x, max_grid_y
+        )));
+    }
     Ok(LaunchConfig {
-        grid_dim: (grid_x, 1, 1),
+        grid_dim: (grid_x, grid_y, 1),
         block_dim: (block_size, 1, 1),
         shared_mem_bytes: 0,
     })
@@ -2249,6 +2618,14 @@ fn checked_i32(label: &str, value: usize) -> Result<i32, PipelineError> {
     i32::try_from(value).map_err(|_| {
         PipelineError::Compute(format!(
             "{label}={value} exceeds i32::MAX required by CUDA/cuBLAS APIs"
+        ))
+    })
+}
+
+fn checked_u64(label: &str, value: usize) -> Result<u64, PipelineError> {
+    u64::try_from(value).map_err(|_| {
+        PipelineError::Compute(format!(
+            "{label}={value} exceeds u64::MAX required by CUDA kernel APIs"
         ))
     })
 }

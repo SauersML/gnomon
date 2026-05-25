@@ -1,4 +1,5 @@
 pub mod batch;
+pub mod checkpoint;
 pub mod complex;
 pub mod cuda_backend;
 pub mod decide;

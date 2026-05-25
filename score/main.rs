@@ -13,6 +13,7 @@
 #![deny(unused_imports)]
 
 use clap::{Parser, ValueEnum};
+use gnomon::score::checkpoint;
 use gnomon::score::download;
 use gnomon::score::genotype_convert;
 use gnomon::score::genotype_convert::{EnsurePlinkOptions, InputFormat, detect_input_format};
@@ -277,11 +278,44 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
         args.keep.as_deref(),
         score_regions_ref,
     )?;
+    let output_path = score_output_path(&fileset_prefixes[0], Some(&out_suffix));
+    let checkpoint_path = checkpoint::checkpoint_path_for_output(&output_path);
+    let checkpoint_fingerprint = checkpoint::fingerprint_preparation(&prep_result);
+    let result_len = prep_result
+        .num_people_to_score
+        .checked_mul(prep_result.score_names.len())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Result size overflow while preparing score checkpoint.",
+            )
+        })?;
+    let resumed_checkpoint = checkpoint::load_checkpoint(
+        &checkpoint_path,
+        checkpoint_fingerprint,
+        result_len,
+        prep_result.num_reconciled_variants,
+    )?;
+    if let Some(checkpoint) = resumed_checkpoint.as_ref() {
+        eprintln!(
+            "> Loaded score checkpoint from {} ({} / {} variants complete).",
+            checkpoint_path.display(),
+            checkpoint.completed_variants,
+            prep_result.num_reconciled_variants
+        );
+    } else {
+        eprintln!("> Score checkpoint path: {}", checkpoint_path.display());
+    }
 
     // --- Phase 2: Resource Allocation ---
     // A read-only context is created, which allocates all necessary memory pools
     // for the pipeline to use.
-    let context = PipelineContext::new(Arc::clone(&prep_result));
+    let context = PipelineContext::with_checkpoint(
+        Arc::clone(&prep_result),
+        resumed_checkpoint,
+        checkpoint_path.clone(),
+        checkpoint_fingerprint,
+    );
     eprintln!("> Resource allocation complete.");
 
     // --- Phase 3: Pipeline Execution ---
@@ -305,6 +339,7 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
         score_regions_ref,
         Some(&out_suffix),
     )?;
+    checkpoint::remove_checkpoint(&checkpoint_path)?;
 
     eprintln!(
         "\nSuccess! Total execution time: {:.2?}",

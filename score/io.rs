@@ -133,6 +133,7 @@ pub fn producer_thread<'a, F>(
     buffer_pool: Arc<ArrayQueue<Vec<u8>>>,
     variants_processed_count: Arc<AtomicU64>,
     path_decider: F,
+    skip_reconciled_before: usize,
     mut spool: Option<SpoolPlan<'a>>,
 ) where
     F: Fn(&[u8]) -> ComputePath,
@@ -182,6 +183,10 @@ pub fn producer_thread<'a, F>(
                     send_error(err);
                     break;
                 }
+                if i < skip_reconciled_before {
+                    let _ = buffer_pool.push(buffer);
+                    continue;
+                }
 
                 let path = path_decider(&buffer);
 
@@ -217,6 +222,9 @@ pub fn producer_thread<'a, F>(
         }
         None => {
             for (i, &bim_row_idx) in prep_result.required_bim_indices.iter().enumerate() {
+                if i < skip_reconciled_before {
+                    continue;
+                }
                 let mut buffer = buffer_pool
                     .pop()
                     .unwrap_or_else(|| Vec::with_capacity(bytes_per_variant));
@@ -293,6 +301,7 @@ pub fn multi_file_producer_thread<'a, F>(
     buffer_pool: Arc<ArrayQueue<Vec<u8>>>,
     variants_processed_count: Arc<AtomicU64>,
     path_decider: F,
+    skip_reconciled_before: usize,
     mut spool: Option<SpoolPlan<'a>>,
 ) where
     F: Fn(&[u8]) -> ComputePath,
@@ -364,6 +373,10 @@ pub fn multi_file_producer_thread<'a, F>(
                     send_error(err);
                     return;
                 }
+                if i < skip_reconciled_before {
+                    let _ = buffer_pool.push(buffer);
+                    continue;
+                }
 
                 let path = path_decider(&buffer);
                 let reconciled_variant_index = match reconciled_index_from_usize(i) {
@@ -409,6 +422,9 @@ pub fn multi_file_producer_thread<'a, F>(
 
                 let local_index =
                     global_bim_row_index.0 - boundaries[current_fileset_idx].starting_global_index;
+                if i < skip_reconciled_before {
+                    continue;
+                }
                 let offset = 3 + local_index * bytes_per_variant;
                 let end = offset + bytes_per_variant;
 
