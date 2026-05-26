@@ -445,14 +445,30 @@ def _load_sex_from_aou(client: "bigquery.Client", cdr: str) -> pd.DataFrame | No
         return None
 
     n_total = len(df)
-    code_map = {8507: 1, 8532: 0}
-    text_map = {"male": 1, "m": 1, "female": 0, "f": 0}
+    # AoU uses PPI concept ids alongside the OMOP standards:
+    #   8507  = MALE   (OMOP standard)
+    #   8532  = FEMALE (OMOP standard)
+    #   45880669 = "SexAtBirth_Male"   (PPI, dominant in AoU)
+    #   45878463 = "SexAtBirth_Female" (PPI, dominant in AoU)
+    code_map = {8507: 1, 8532: 0, 45880669: 1, 45878463: 0}
+    # source_value strings observed in AoU CDR are "sexatbirth_male" /
+    # "sexatbirth_female" (lowercased). Accept any value containing "male"
+    # not preceded by "fe".
+    def _text_to_sex(s):
+        if not isinstance(s, str):
+            return None
+        s = s.strip().lower()
+        if "female" in s or s in ("f", "xx"):
+            return 0
+        if "male" in s or s in ("m", "xy"):
+            return 1
+        return None
     sex = df["gender_concept_id"].map(code_map)
     n_from_gender = int(sex.notna().sum())
     fill_sab_code = df["sex_at_birth_concept_id"].map(code_map)
     sex = sex.fillna(fill_sab_code)
     n_after_sab_code = int(sex.notna().sum())
-    fill_sab_text = df["sex_at_birth_source_value"].map(text_map)
+    fill_sab_text = df["sex_at_birth_source_value"].map(_text_to_sex)
     sex = sex.fillna(fill_sab_text)
     n_after_sab_text = int(sex.notna().sum())
 
