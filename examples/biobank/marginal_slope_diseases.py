@@ -419,7 +419,40 @@ _SEX_MAP = {
 }
 
 
-def load_sex() -> pd.DataFrame:
+def _load_sex_from_aou(client: "bigquery.Client", cdr: str) -> pd.DataFrame | None:
+    """Pull sex_at_birth from AoU's OMOP `person` table.
+
+    AoU records sex_at_birth per participant as an OMOP concept id (8507=MALE,
+    8532=FEMALE, others = unknown/skip/PMI-no-matching-concept). This is the
+    canonical source and is already populated for every CDR participant, so it
+    beats running `gnomon terms --sex` (which takes ~1h over 400k samples).
+    Returns None on any error so the caller can fall back.
+    """
+    try:
+        q = f"""
+            SELECT CAST(person_id AS STRING) AS person_id,
+                   sex_at_birth_concept_id
+            FROM `{cdr}.person`
+            WHERE sex_at_birth_concept_id IN (8507, 8532)
+        """
+        df = client.query(q).result().to_dataframe()
+    except Exception as exc:
+        print(f"  sex (AoU): unavailable ({type(exc).__name__}: {exc}); "
+              f"will fall back to gnomon terms --sex")
+        return None
+    out = pd.DataFrame({
+        "person_id": _canonical_id(df["person_id"]),
+        "sex": df["sex_at_birth_concept_id"].map({8507: 1, 8532: 0}).astype(int),
+    })
+    print(f"  sex (AoU): n={len(out):,}  src={cdr}.person.sex_at_birth_concept_id")
+    return out
+
+
+def load_sex(client: "bigquery.Client | None" = None, cdr: str | None = None) -> pd.DataFrame:
+    if client is not None and cdr:
+        df = _load_sex_from_aou(client, cdr)
+        if df is not None:
+            return df
     path = PLINK_PREFIX.with_name(f"{PLINK_PREFIX.name}.sex.tsv")
     if not path.exists():
         # Legacy cache from earlier script versions (~/.aou_cache/sex_terms/sex_*.tsv).
@@ -2944,7 +2977,7 @@ def main() -> None:
 
     print("loading PCs and sex ...")
     pcs = load_pcs(NUM_PCS)
-    sex = load_sex()
+    sex = load_sex(client=client, cdr=cdr)
     base = pcs.merge(sex, on="person_id")
     print(f"base: n={len(base):,}")
 
