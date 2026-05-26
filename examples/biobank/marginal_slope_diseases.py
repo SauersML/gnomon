@@ -325,9 +325,53 @@ BOOTSTRAP_CONFIDENCE_LEVEL = 0.95
 CDR_STORAGE_PATH = os.environ.get(
     "CDR_STORAGE_PATH", "gs://fc-aou-datasets-controlled/v8"
 ).rstrip("/")
-ANCESTRY_PREDS_URI = (
-    f"{CDR_STORAGE_PATH}/wgs/short_read/snpindel/aux/ancestry/ancestry_preds.tsv"
-)
+ANCESTRY_DIR_URI = f"{CDR_STORAGE_PATH}/wgs/short_read/snpindel/aux/ancestry"
+# AoU's "How the genomic data are organized" doc lists this file as bare
+# `ancestry_preds.tsv`, but the actual object shipped in v8 (both
+# `fc-aou-datasets-controlled` and the Verily Workbench mirror
+# `vwb-aou-datasets-controlled`) is build-prefixed, e.g.
+# `echo_v4_r2.ancestry_preds.tsv`. We resolve the real name lazily via
+# `_resolve_ancestry_preds_uri` so the URL works in both layouts.
+_DEFAULT_ANCESTRY_PREDS_URI = f"{ANCESTRY_DIR_URI}/ancestry_preds.tsv"
+_resolved_ancestry_preds_uri: str | None = None
+
+
+def _resolve_ancestry_preds_uri() -> str:
+    """Return the actual GCS URI for `*ancestry_preds.tsv` under the CDR.
+
+    Falls back to the documented bare-name path if a directory listing isn't
+    possible (e.g. gcsfs not importable, no bucket-level list permission).
+    The caller is still responsible for handling the eventual read error.
+    """
+    global _resolved_ancestry_preds_uri
+    if _resolved_ancestry_preds_uri is not None:
+        return _resolved_ancestry_preds_uri
+    try:
+        import gcsfs
+        fs = gcsfs.GCSFileSystem(
+            project=os.environ.get("GOOGLE_PROJECT", ""),
+            requester_pays=True,
+        )
+        matches = fs.glob(f"{ANCESTRY_DIR_URI}/*ancestry_preds.tsv")
+        # Prefer the bare name if present, else the build-prefixed file.
+        preferred = f"{ANCESTRY_DIR_URI.replace('gs://', '', 1)}/ancestry_preds.tsv"
+        chosen = next((m for m in matches if m.endswith(preferred)), None)
+        if chosen is None and matches:
+            chosen = matches[0]
+        if chosen:
+            uri = chosen if chosen.startswith("gs://") else f"gs://{chosen}"
+            _resolved_ancestry_preds_uri = uri
+            return uri
+    except Exception as exc:
+        print(f"  ancestry_preds: glob failed ({type(exc).__name__}: {exc}); "
+              f"using documented path {_DEFAULT_ANCESTRY_PREDS_URI}")
+    _resolved_ancestry_preds_uri = _DEFAULT_ANCESTRY_PREDS_URI
+    return _resolved_ancestry_preds_uri
+
+
+# Backwards-compatible name; callers read this and may also call
+# `_resolve_ancestry_preds_uri()` directly for the just-in-time resolution.
+ANCESTRY_PREDS_URI = _DEFAULT_ANCESTRY_PREDS_URI
 ADMIXTURE_Q_URI = (
     f"{CDR_STORAGE_PATH}/wgs/short_read/snpindel/aux/admixture_estimates/"
     "aou_admixture_estimates_rye_v8.Q"
@@ -439,10 +483,11 @@ def _load_pcs_from_aou(num_pcs: int) -> pd.DataFrame | None:
         df_raw = pd.read_csv(src, sep="\t", usecols=["research_id", "pca_features"], dtype=str)
     else:
         try:
-            print(f"  pcs (AoU): GET {ANCESTRY_PREDS_URI} -> {ANCESTRY_PREDS_CACHE}")
+            uri = _resolve_ancestry_preds_uri()
+            print(f"  pcs (AoU): GET {uri} -> {ANCESTRY_PREDS_CACHE}")
             # Cache all three columns so load_genetic_ancestry_labels can reuse the same file.
             df_full = pd.read_csv(
-                ANCESTRY_PREDS_URI,
+                uri,
                 sep="\t",
                 usecols=["research_id", "ancestry_pred", "pca_features"],
                 dtype=str,
@@ -1086,9 +1131,10 @@ def load_genetic_ancestry_labels() -> pd.DataFrame:
             # include ancestry_pred; refetch from the URI to repopulate.
             print(f"  cache {ANCESTRY_PREDS_CACHE} lacks ancestry_pred; refetching")
     if not have_usable_cache:
-        print(f"  gcsfs GET {ANCESTRY_PREDS_URI} -> {ANCESTRY_PREDS_CACHE}")
+        uri = _resolve_ancestry_preds_uri()
+        print(f"  gcsfs GET {uri} -> {ANCESTRY_PREDS_CACHE}")
         df = pd.read_csv(
-            ANCESTRY_PREDS_URI,
+            uri,
             sep="\t",
             usecols=cache_cols,
             dtype=str,
