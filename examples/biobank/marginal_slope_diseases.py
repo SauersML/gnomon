@@ -3065,9 +3065,37 @@ def main() -> None:
         print(f"\n=== {name.upper()} ===")
         pgs_df = load_one_pgs(cfg["pgs"])
         df_full = base.merge(pgs_df, on="person_id")
+        print(
+            f"  merge[base+pgs]: base={len(base):,} pgs={len(pgs_df):,} "
+            f"merged={len(df_full):,}"
+        )
+        if len(df_full) == 0:
+            base_ids = set(base["person_id"].head(5))
+            pgs_ids = set(pgs_df["person_id"].head(5))
+            print(f"    base sample person_id={sorted(base_ids)}")
+            print(f"    pgs  sample person_id={sorted(pgs_ids)}")
+            print(
+                f"    base dtype={base['person_id'].dtype} "
+                f"pgs dtype={pgs_df['person_id'].dtype}"
+            )
         ancestor = int(cfg["concept_id"])
         case_dates = fetch_cases(client, cdr, ancestor)
+        before_cases = len(df_full)
         df_full = df_full.merge(case_dates, on="person_id", how="left")
+        matched_cases = int(df_full["event_date"].notna().sum())
+        print(
+            f"  merge[+cases]: pre={before_cases:,} cases_returned={len(case_dates):,} "
+            f"matched={matched_cases:,}"
+        )
+        if matched_cases == 0 and len(case_dates) > 0 and before_cases > 0:
+            base_ids = set(df_full["person_id"].head(5))
+            case_ids = set(case_dates["person_id"].head(5))
+            print(f"    df_full sample person_id={sorted(base_ids)}")
+            print(f"    cases   sample person_id={sorted(case_ids)}")
+            print(
+                f"    df_full dtype={df_full['person_id'].dtype} "
+                f"cases dtype={case_dates['person_id'].dtype}"
+            )
         df_full["event"] = df_full["event_date"].notna().astype(int)
 
         # Age-as-time-scale (years). Entry: age at AoU obs-period start.
@@ -3099,13 +3127,26 @@ def main() -> None:
         # Drop rows with non-positive or invalid intervals: missing birth/obs,
         # prevalent cases whose event predates obs_start (entry >= exit), etc.
         before = len(df_full)
+        miss = {c: int(df_full[c].isna().sum()) for c in
+                ("pgs", "entry_age", "exit_age", "current_age",
+                 "birth_datetime", "obs_start", "obs_end")}
         df_full = df_full.dropna(
             subset=["pgs", "entry_age", "exit_age", "current_age"]
         ).copy()
+        after_dropna = len(df_full)
         df_full = df_full[df_full["exit_age"] > df_full["entry_age"]].copy()
+        after_exit_gt_entry = len(df_full)
         df_full = df_full[df_full["entry_age"] >= 0].copy()
+        after_entry_nonneg = len(df_full)
         df_full = df_full[df_full["current_age"] >= df_full["entry_age"]].copy()
         dropped = before - len(df_full)
+        print(
+            f"  filters: pre={before:,} "
+            f"after_dropna={after_dropna:,} "
+            f"after_exit>entry={after_exit_gt_entry:,} "
+            f"after_entry>=0={after_entry_nonneg:,} "
+            f"final={len(df_full):,}  na_counts={miss}"
+        )
         n_event = int(df_full["event"].sum())
         n_censor = len(df_full) - n_event
         K = n_event / max(1, len(df_full))
