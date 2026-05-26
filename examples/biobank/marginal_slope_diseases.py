@@ -420,31 +420,64 @@ _SEX_MAP = {
 
 
 def _load_sex_from_aou(client: "bigquery.Client", cdr: str) -> pd.DataFrame | None:
-    """Pull sex_at_birth from AoU's OMOP `person` table.
+    """Pull biological sex per participant from AoU's OMOP `person` table.
 
-    AoU records sex_at_birth per participant as an OMOP concept id (8507=MALE,
-    8532=FEMALE, others = unknown/skip/PMI-no-matching-concept). This is the
-    canonical source and is already populated for every CDR participant, so it
-    beats running `gnomon terms --sex` (which takes ~1h over 400k samples).
-    Returns None on any error so the caller can fall back.
+    Tries several columns in order of reliability:
+      1. `gender_concept_id` — OMOP standard, always 8507/8532 when populated.
+      2. `sex_at_birth_concept_id` — same 8507/8532 codes when AoU populates it.
+      3. `sex_at_birth_source_value` — raw text ("Male"/"Female"), used when
+         AoU uses non-standard / PMI custom concept ids upstream.
+
+    Returns None on any error so the caller can fall back to PLINK/gnomon.
     """
     try:
         q = f"""
             SELECT CAST(person_id AS STRING) AS person_id,
-                   sex_at_birth_concept_id
+                   gender_concept_id,
+                   sex_at_birth_concept_id,
+                   LOWER(sex_at_birth_source_value) AS sex_at_birth_source_value
             FROM `{cdr}.person`
-            WHERE sex_at_birth_concept_id IN (8507, 8532)
         """
         df = client.query(q).result().to_dataframe()
     except Exception as exc:
         print(f"  sex (AoU): unavailable ({type(exc).__name__}: {exc}); "
               f"will fall back to gnomon terms --sex")
         return None
+
+    n_total = len(df)
+    code_map = {8507: 1, 8532: 0}
+    text_map = {"male": 1, "m": 1, "female": 0, "f": 0}
+    sex = df["gender_concept_id"].map(code_map)
+    n_from_gender = int(sex.notna().sum())
+    fill_sab_code = df["sex_at_birth_concept_id"].map(code_map)
+    sex = sex.fillna(fill_sab_code)
+    n_after_sab_code = int(sex.notna().sum())
+    fill_sab_text = df["sex_at_birth_source_value"].map(text_map)
+    sex = sex.fillna(fill_sab_text)
+    n_after_sab_text = int(sex.notna().sum())
+
+    if n_after_sab_text == 0:
+        gc = df["gender_concept_id"].value_counts(dropna=False).head(5).to_dict()
+        sc = df["sex_at_birth_concept_id"].value_counts(dropna=False).head(5).to_dict()
+        sv = df["sex_at_birth_source_value"].value_counts(dropna=False).head(5).to_dict()
+        print(f"  sex (AoU): no usable values in {cdr}.person "
+              f"(rows={n_total:,}); top gender_concept_id={gc} "
+              f"sex_at_birth_concept_id={sc} sex_at_birth_source_value={sv}; "
+              f"falling back")
+        return None
+
+    keep = sex.notna()
     out = pd.DataFrame({
-        "person_id": _canonical_id(df["person_id"]),
-        "sex": df["sex_at_birth_concept_id"].map({8507: 1, 8532: 0}).astype(int),
+        "person_id": _canonical_id(df.loc[keep, "person_id"]),
+        "sex": sex[keep].astype(int).values,
     })
-    print(f"  sex (AoU): n={len(out):,}  src={cdr}.person.sex_at_birth_concept_id")
+    print(
+        f"  sex (AoU): n={len(out):,} of {n_total:,} "
+        f"(gender_concept_id={n_from_gender:,}, "
+        f"+sex_at_birth_concept_id={n_after_sab_code - n_from_gender:,}, "
+        f"+source_value={n_after_sab_text - n_after_sab_code:,})  "
+        f"src={cdr}.person"
+    )
     return out
 
 
