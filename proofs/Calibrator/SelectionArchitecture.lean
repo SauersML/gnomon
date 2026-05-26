@@ -475,10 +475,23 @@ noncomputable def polygenicAdaptationShift
 /-- **Under neutral drift, expected shift is zero.**
     E[Δpᵢ] = 0 under drift, so E[Δμ] = 0. -/
 theorem neutral_expected_shift_zero
-    {m : ℕ} (β : Fin m → ℝ) :
-    polygenicAdaptationShift β (fun _ => 0) = 0 := by
+    {Ω : Type*} (E : ExpFunctional Ω)
+    {m : ℕ} (β : Fin m → ℝ) (Δp : Fin m → Ω → ℝ)
+    (h_drift : ∀ i, E (Δp i) = 0) :
+    E (fun ω => polygenicAdaptationShift β (fun i => Δp i ω)) = 0 := by
   unfold polygenicAdaptationShift
-  simp
+  have h_sum : (fun ω => ∑ i, β i * Δp i ω) = ∑ i, (fun ω => β i * Δp i ω) := by
+    funext ω
+    simp only [Finset.sum_apply]
+  rw [h_sum, ExpFunctional.eval_sum]
+  apply Finset.sum_eq_zero
+  intro i _
+  have h_smul : (fun ω => β i * Δp i ω) = β i • Δp i := by
+    funext ω
+    rfl
+  rw [h_smul, E.smul_eval]
+  rw [h_drift i]
+  ring
 
 /-- **Under selection, shift is nonzero and directional.**
     If selection favors higher trait values, Δpᵢ > 0 for positive-effect
