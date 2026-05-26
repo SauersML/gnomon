@@ -449,20 +449,21 @@ def _load_sex_from_aou(client: "bigquery.Client", cdr: str) -> pd.DataFrame | No
 
 
 def load_sex(client: "bigquery.Client | None" = None, cdr: str | None = None) -> pd.DataFrame:
-    if client is not None and cdr:
-        df = _load_sex_from_aou(client, cdr)
-        if df is not None:
-            return df
+    # 1. Prefer any already-present gnomon-derived sex TSV (free, instant).
     path = PLINK_PREFIX.with_name(f"{PLINK_PREFIX.name}.sex.tsv")
     if not path.exists():
-        # Legacy cache from earlier script versions (~/.aou_cache/sex_terms/sex_*.tsv).
-        # Reuse it instead of re-running the ~hour-long sex scan.
         legacy_dir = Path.home() / ".aou_cache" / "sex_terms"
         legacy_hits = sorted(legacy_dir.glob("sex_*.tsv"), key=lambda p: p.stat().st_mtime) if legacy_dir.is_dir() else []
         if legacy_hits:
             legacy = legacy_hits[-1]
             print(f"  sex: reusing legacy cache {legacy}")
             path = legacy
+    # 2. Otherwise pull from AoU's OMOP person table (also instant; canonical).
+    if not path.exists() and client is not None and cdr:
+        df = _load_sex_from_aou(client, cdr)
+        if df is not None:
+            return df
+    # 3. Last resort — invoke gnomon terms --sex (slow, ~1h on full AoU).
     if not path.exists():
         cmd = [GNOMON_BIN, "terms", "--sex", str(PLINK_PREFIX)]
         print(f"  sex: running {' '.join(cmd)}")
