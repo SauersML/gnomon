@@ -395,21 +395,62 @@ drops to `3/4`.
 
 This formalizes the biological point that equal source `R²` does not determine
 cross-population portability without locus-resolved transport state. -/
+structure TransportScenario where
+  sourceSignal : Fin 2 → ℝ
+  targetTransport : Fin 2 → ℝ
+  residualNoise : ℝ
+
+noncomputable def scenarioR2 (s : TransportScenario) : ℝ :=
+  let vSignal := ∑ l, s.sourceSignal l * s.targetTransport l
+  TransportedMetrics.r2FromSignalVariance vSignal s.residualNoise
+
 theorem same_source_r2_different_portability_two_locus_witness :
-    let sourceSignal : Fin 2 → ℝ := fun _ => 1
-    let stableTransport : Fin 2 → ℝ := fun _ => 1
-    let brokenTransport : Fin 2 → ℝ := fun i => if i = 0 then 1 else 0
-    let sourceVariance : ℝ := ∑ l, sourceSignal l
-    let stableTargetVariance : ℝ := ∑ l, sourceSignal l * stableTransport l
-    let brokenTargetVariance : ℝ := ∑ l, sourceSignal l * brokenTransport l
-    let sourceR2 := TransportedMetrics.r2FromSignalVariance sourceVariance 1
-    let stableTargetR2 := TransportedMetrics.r2FromSignalVariance stableTargetVariance 1
-    let brokenTargetR2 := TransportedMetrics.r2FromSignalVariance brokenTargetVariance 1
-    sourceR2 = stableTargetR2 ∧
-    brokenTargetR2 < stableTargetR2 ∧
-    brokenTargetR2 / sourceR2 = (3 : ℝ) / 4 := by
-  simp [TransportedMetrics.r2FromSignalVariance]
-  norm_num
+  ∃ (stable broken : TransportScenario),
+    stable.sourceSignal = broken.sourceSignal ∧
+    stable.residualNoise = broken.residualNoise ∧
+    scenarioR2 stable = 2 / 3 ∧
+    scenarioR2 broken < scenarioR2 stable ∧
+    scenarioR2 broken / scenarioR2 stable = (3 : ℝ) / 4 := by
+  let stable : TransportScenario := {
+    sourceSignal := fun _ => 1
+    targetTransport := fun _ => 1
+    residualNoise := 1
+  }
+  let broken : TransportScenario := {
+    sourceSignal := fun _ => 1
+    targetTransport := fun i => if i = 0 then 1 else 0
+    residualNoise := 1
+  }
+  use stable, broken
+  refine ⟨rfl, rfl, ?_, ?_, ?_⟩
+  · dsimp [scenarioR2, TransportedMetrics.r2FromSignalVariance]
+    have h1 : (∑ l : Fin 2, (1 : ℝ) * 1) = 2 := by
+      rw [Fin.sum_univ_two]
+      norm_num
+    rw [h1]
+    norm_num
+  · dsimp [scenarioR2, TransportedMetrics.r2FromSignalVariance]
+    have h1 : (∑ l : Fin 2, stable.sourceSignal l * stable.targetTransport l) = 2 := by
+      dsimp [stable]
+      rw [Fin.sum_univ_two]
+      norm_num
+    have h2 : (∑ l : Fin 2, broken.sourceSignal l * broken.targetTransport l) = 1 := by
+      dsimp [broken]
+      rw [Fin.sum_univ_two]
+      simp
+    rw [h1, h2]
+    norm_num
+  · dsimp [scenarioR2, TransportedMetrics.r2FromSignalVariance]
+    have h1 : (∑ l : Fin 2, stable.sourceSignal l * stable.targetTransport l) = 2 := by
+      dsimp [stable]
+      rw [Fin.sum_univ_two]
+      norm_num
+    have h2 : (∑ l : Fin 2, broken.sourceSignal l * broken.targetTransport l) = 1 := by
+      dsimp [broken]
+      rw [Fin.sum_univ_two]
+      simp
+    rw [h1, h2]
+    norm_num
 
 end SourceR2Insufficiency
 
