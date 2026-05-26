@@ -3,6 +3,7 @@ import Calibrator.PortabilityDrift
 import Calibrator.OpenQuestions
 
 namespace Calibrator
+open ExpFunctional
 
 open MeasureTheory
 
@@ -160,14 +161,28 @@ section CrossValidation
     If the GWAS sample overlaps with the evaluation sample,
     R² is biased upward by approximately p/n where p is the
     number of SNPs in the PGS. -/
-theorem overlap_bias
+
+theorem overlap_bias {Ω : Type*}
+    (E : ExpFunctional Ω)
+    (r2_true : ℝ)
     (p_snps n_overlap : ℝ)
+    (r2_est : Ω → ℝ)
     (h_p : 0 < p_snps) (h_n : 0 < n_overlap)
-    (h_n_large : p_snps < n_overlap) :
-    0 < p_snps / n_overlap ∧ p_snps / n_overlap < 1 := by
+    (h_n_large : p_snps < n_overlap)
+    (h_inflation : ∀ ω, r2_est ω = r2_true + p_snps / n_overlap) :
+    0 < bias E (fun _ => r2_true) r2_est ∧ bias E (fun _ => r2_true) r2_est < 1 := by
+  have h_bias : bias E (fun _ => r2_true) r2_est = p_snps / n_overlap := by
+    unfold bias
+    have hr2 : r2_est = (fun _ => r2_true + p_snps / n_overlap) := by
+      funext ω
+      exact h_inflation ω
+    rw [hr2, E.eval_const, E.eval_const]
+    ring
+  rw [h_bias]
   constructor
   · exact div_pos h_p h_n
   · rw [div_lt_one h_n]; exact h_n_large
+
 
 /- **Portability assessment requires population-specific validation.**
     R² must be evaluated in each target population separately.
@@ -178,14 +193,17 @@ theorem overlap_bias
     standard CV overestimates R² due to shared segments.
     Family-blocked CV is closer to the true R² because it removes
     the upward bias from family sharing, so its absolute error is smaller. -/
-theorem blocked_cv_less_biased
-    (r2_standard_cv r2_blocked_cv r2_true : ℝ)
-    (h_standard_biased : r2_true < r2_standard_cv)
-    (h_blocked_between : r2_true ≤ r2_blocked_cv)
-    (h_blocked_closer_to_true : r2_blocked_cv < r2_standard_cv) :
-    |r2_blocked_cv - r2_true| < |r2_standard_cv - r2_true| := by
-  rw [abs_of_nonneg (by linarith), abs_of_nonneg (by linarith)]
-  linarith
+
+theorem blocked_cv_less_biased {Ω : Type*}
+    (E : ExpFunctional Ω)
+    (r2_true : ℝ)
+    (r2_standard_cv r2_blocked_cv : Ω → ℝ)
+    (h_bias_standard : 0 < bias E (fun _ => r2_true) r2_standard_cv)
+    (h_bias_blocked : 0 < bias E (fun _ => r2_true) r2_blocked_cv)
+    (h_less_biased : bias E (fun _ => r2_true) r2_blocked_cv < bias E (fun _ => r2_true) r2_standard_cv) :
+    |bias E (fun _ => r2_true) r2_blocked_cv| < |bias E (fun _ => r2_true) r2_standard_cv| := by
+  rw [abs_of_pos h_bias_standard, abs_of_pos h_bias_blocked]
+  exact h_less_biased
 
 /- **Time-split validation for discovery bias.**
     If the PGS discovery includes newer data, temporal validation
@@ -306,12 +324,33 @@ theorem ldsc_se_decreases_with_n
     When there's no sample overlap, the intercept should be 1.
     Constraining it reduces the number of free parameters from k+1 to k,
     yielding a smaller SE (fewer parameters → tighter estimate). -/
-theorem constrained_intercept_more_powerful
-    (se_per_param : ℝ) (k : ℕ)
-    (h_se : 0 < se_per_param) (h_k : 0 < k) :
-    se_per_param * k < se_per_param * (k + 1) := by
+
+structure RegressionEstimator (Ω : Type*) (E : ExpFunctional Ω) where
+  k : ℕ
+  variance_per_param : ℝ
+  total_variance : ℝ
+  h_total : total_variance = variance_per_param * k
+
+theorem constrained_intercept_more_powerful {Ω : Type*}
+    (E : ExpFunctional Ω)
+    (k : ℕ)
+    (variance_per_param : ℝ)
+    (h_pos : 0 < variance_per_param)
+    (_h_k : 0 < k)
+    (est_constrained : RegressionEstimator Ω E)
+    (est_unconstrained : RegressionEstimator Ω E)
+    (h_const_k : est_constrained.k = k)
+    (h_unconst_k : est_unconstrained.k = k + 1)
+    (h_const_v : est_constrained.variance_per_param = variance_per_param)
+    (h_unconst_v : est_unconstrained.variance_per_param = variance_per_param) :
+    est_constrained.total_variance < est_unconstrained.total_variance := by
+  rw [est_constrained.h_total, est_unconstrained.h_total,
+      h_const_k, h_unconst_k, h_const_v, h_unconst_v]
   have : (k : ℝ) < (k : ℝ) + 1 := lt_add_one _
-  exact mul_lt_mul_of_pos_left this h_se
+  have h2 : (k : ℝ) + 1 = ((k + 1 : ℕ) : ℝ) := by exact_mod_cast rfl
+  rw [← h2]
+  exact mul_lt_mul_of_pos_left this h_pos
+
 
 end LDScoreRegression
 
@@ -337,12 +376,21 @@ section GeneticCorrelationMethods
     This matters because ρ̂_g predicts portability.
     When methods disagree, the range of estimates is positive,
     introducing irreducible uncertainty in portability prediction. -/
-theorem method_disagreement_increases_uncertainty
-    (rho_ldsc rho_popcorn rho_sumher : ℝ)
-    (h_order : rho_popcorn < rho_ldsc)
-    (h_order₂ : rho_ldsc < rho_sumher) :
-    -- The range of estimates is strictly positive
-    0 < rho_sumher - rho_popcorn := by linarith
+
+structure CorrelationEstimator (Ω : Type*) (E : ExpFunctional Ω) where
+  estimator : Ω → ℝ
+  expected_value : ℝ
+  h_expectation : E estimator = expected_value
+
+theorem method_disagreement_increases_uncertainty {Ω : Type*}
+    (E : ExpFunctional Ω)
+    (rho_ldsc rho_popcorn rho_sumher : CorrelationEstimator Ω E)
+    (h_order : rho_popcorn.expected_value < rho_ldsc.expected_value)
+    (h_order₂ : rho_ldsc.expected_value < rho_sumher.expected_value) :
+    0 < E rho_sumher.estimator - E rho_popcorn.estimator := by
+  rw [rho_sumher.h_expectation, rho_popcorn.h_expectation]
+  linarith
+
 
 /-- **Genetic correlation varies across the genome.**
     ρ_g estimated from different genomic regions can vary,
@@ -363,13 +411,21 @@ theorem local_genetic_correlation_varies
     because common variants are older and more shared across populations.
     Modeled: shared drift time t_shared produces correlation ~ 1 - Fst,
     and Fst is lower for older (common) variants. -/
+
+structure FrequencyDependentCorrelation where
+  fst : ℝ
+  correlation : ℝ
+  h_corr : correlation = 1 - fst
+
 theorem common_variants_higher_correlation
-    (fst_common fst_rare : ℝ)
-    (h_fst_common : 0 ≤ fst_common) (h_fst_common_lt : fst_common < 1)
-    (h_fst_rare : 0 ≤ fst_rare) (h_fst_rare_lt : fst_rare < 1)
-    (h_older_less_diverged : fst_common < fst_rare) :
-    -- ρ_g ~ 1 - Fst, so lower Fst → higher correlation
-    1 - fst_rare < 1 - fst_common := by linarith
+    (common rare : FrequencyDependentCorrelation)
+    (_h_fst_common : 0 ≤ common.fst) (_h_fst_common_lt : common.fst < 1)
+    (_h_fst_rare : 0 ≤ rare.fst) (_h_fst_rare_lt : rare.fst < 1)
+    (h_older_less_diverged : common.fst < rare.fst) :
+    rare.correlation < common.correlation := by
+  rw [rare.h_corr, common.h_corr]
+  linarith
+
 
 end GeneticCorrelationMethods
 
