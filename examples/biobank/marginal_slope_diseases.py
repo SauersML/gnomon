@@ -422,6 +422,15 @@ _SEX_MAP = {
 def load_sex() -> pd.DataFrame:
     path = PLINK_PREFIX.with_name(f"{PLINK_PREFIX.name}.sex.tsv")
     if not path.exists():
+        # Legacy cache from earlier script versions (~/.aou_cache/sex_terms/sex_*.tsv).
+        # Reuse it instead of re-running the ~hour-long sex scan.
+        legacy_dir = Path.home() / ".aou_cache" / "sex_terms"
+        legacy_hits = sorted(legacy_dir.glob("sex_*.tsv"), key=lambda p: p.stat().st_mtime) if legacy_dir.is_dir() else []
+        if legacy_hits:
+            legacy = legacy_hits[-1]
+            print(f"  sex: reusing legacy cache {legacy}")
+            path = legacy
+    if not path.exists():
         cmd = [GNOMON_BIN, "terms", "--sex", str(PLINK_PREFIX)]
         print(f"  sex: running {' '.join(cmd)}")
         subprocess.run(cmd, check=True)
