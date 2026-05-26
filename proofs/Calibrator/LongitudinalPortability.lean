@@ -457,14 +457,27 @@ noncomputable def totalCost (c_retrain c_inaccuracy lambda T t_retrain : ℝ) : 
 /-- **Transfer learning reduces retraining cost.**
     Using the old PGS as a starting point (warm start) reduces
     the sample size needed for retraining. -/
-theorem transfer_reduces_sample_requirement
-    (n_full n_transfer : ℝ)
-    (h_less : n_transfer < n_full)
-    (h_nn : 0 < n_transfer) :
-    n_transfer / n_full < 1 := by
-  rw [div_lt_one (by linarith)]
-  exact h_less
+structure RetrainingTask where
+  target_precision : ℝ
+  noise_variance : ℝ
+  prior_precision : ℝ
 
+noncomputable def sampleSizeRequired (task : RetrainingTask) : ℝ :=
+  task.noise_variance * (task.target_precision - task.prior_precision)
+
+theorem transfer_reduces_sample_requirement
+    (task_full task_transfer : RetrainingTask)
+    (h_same_target : task_transfer.target_precision = task_full.target_precision)
+    (h_same_noise : task_transfer.noise_variance = task_full.noise_variance)
+    (h_full_prior : task_full.prior_precision = 0)
+    (h_transfer_prior : 0 < task_transfer.prior_precision)
+    (h_noise_pos : 0 < task_full.noise_variance) :
+    sampleSizeRequired task_transfer < sampleSizeRequired task_full := by
+  unfold sampleSizeRequired
+  rw [h_same_target, h_same_noise, h_full_prior, sub_zero]
+  have h_diff : task_full.target_precision - task_transfer.prior_precision < task_full.target_precision := by
+    linarith
+  exact mul_lt_mul_of_pos_left h_diff h_noise_pos
 end RetrainingStrategies
 
 
