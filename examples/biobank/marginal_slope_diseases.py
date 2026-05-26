@@ -501,6 +501,18 @@ def load_sex(client: "bigquery.Client | None" = None, cdr: str | None = None) ->
     # 1. Prefer any already-present gnomon-derived sex TSV (free, instant).
     path = PLINK_PREFIX.with_name(f"{PLINK_PREFIX.name}.sex.tsv")
     if not path.exists():
+        # The PLINK triplet may have been staged in a different directory than
+        # the one find_plink_prefix() picked; search common locations for any
+        # `*.sex.tsv` written next to a previous staging.
+        sidecar_candidates: list[Path] = []
+        for sidecar in _iter_files_with_suffix(".sex.tsv"):
+            sidecar_candidates.append(sidecar)
+        if sidecar_candidates:
+            sidecar_candidates.sort(key=lambda p: p.stat().st_mtime)
+            chosen = sidecar_candidates[-1]
+            print(f"  sex: reusing sidecar cache {chosen}")
+            path = chosen
+    if not path.exists():
         legacy_dir = Path.home() / ".aou_cache" / "sex_terms"
         legacy_hits = sorted(legacy_dir.glob("sex_*.tsv"), key=lambda p: p.stat().st_mtime) if legacy_dir.is_dir() else []
         if legacy_hits:
