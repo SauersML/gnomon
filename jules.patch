@@ -1,0 +1,112 @@
+diff --git a/proofs/Calibrator/EquityAndImplementation.lean b/proofs/Calibrator/EquityAndImplementation.lean
+index ec65f02..be22a91 100644
+--- a/proofs/Calibrator/EquityAndImplementation.lean
++++ b/proofs/Calibrator/EquityAndImplementation.lean
+@@ -2,6 +2,7 @@ import Calibrator.Probability
+ import Calibrator.PortabilityDrift
+ import Calibrator.ClinicalUtilityFairness
+ import Calibrator.OpenQuestions
++import Calibrator.TransportIdentities
+ 
+ namespace Calibrator
+ 
+@@ -40,10 +41,18 @@ section HealthDisparity
+     proportionality constant α (benefit per unit R²). When
+     R²₁ < R²₂, the benefit in population 1 is strictly less. -/
+ theorem clinical_benefit_increases_with_r2
+-    (α r2₁ r2₂ : ℝ)
+-    (h_α : 0 < α)
+-    (h_r2 : r2₁ < r2₂) :
+-    α * r2₁ < α * r2₂ := by
++    {Ω : Type*} (E : ExpFunctional Ω)
++    (α : ℝ) (h_α : 0 < α)
++    (r2_1 r2_2 : Ω → ℝ)
++    (h_r2 : E r2_1 < E r2_2) :
++    E (fun ω => α * r2_1 ω) < E (fun ω => α * r2_2 ω) := by
++  have H1 : (fun ω => α * r2_1 ω) = α • r2_1 := by
++    funext ω
++    simp [smul_eq_mul]
++  have H2 : (fun ω => α * r2_2 ω) = α • r2_2 := by
++    funext ω
++    simp [smul_eq_mul]
++  rw [H1, H2, E.smul_eval, E.smul_eval]
+   exact mul_lt_mul_of_pos_left h_r2 h_α
+ 
+ /-- **Portability gap creates benefit gap.**
+@@ -51,12 +60,19 @@ theorem clinical_benefit_increases_with_r2
+     clinical benefit for EUR patients exceeds that for AFR patients.
+     The benefit gap α × (R²_EUR - R²_AFR) > 0 follows from the R² gap. -/
+ theorem portability_creates_benefit_gap
+-    (α r2_eur r2_afr : ℝ)
+-    (h_α : 0 < α)
+-    (h_r2_gap : r2_afr < r2_eur)
+-    (h_nn : 0 ≤ r2_afr) :
+-    0 < α * r2_eur - α * r2_afr := by
+-  have : r2_eur - r2_afr > 0 := by linarith
++    {Ω : Type*} (E : ExpFunctional Ω)
++    (α : ℝ) (h_α : 0 < α)
++    (r2_eur r2_afr : Ω → ℝ)
++    (h_r2_gap : E r2_afr < E r2_eur) :
++    0 < E (fun ω => α * r2_eur ω - α * r2_afr ω) := by
++  have H : (fun ω => α * r2_eur ω - α * r2_afr ω) = α • (fun ω => r2_eur ω - r2_afr ω) := by
++    funext ω
++    simp only [Pi.smul_apply, smul_eq_mul]
++    ring
++  rw [H, E.smul_eval]
++  have h_sub : E (fun ω => r2_eur ω - r2_afr ω) = E r2_eur - E r2_afr := E.eval_sub r2_eur r2_afr
++  rw [h_sub]
++  have : E r2_eur - E r2_afr > 0 := by linarith
+   nlinarith
+ 
+ /-- **Disparity increases with Fst from discovery population.**
+@@ -82,21 +98,41 @@ theorem disparity_increases_with_distance
+     gets no PGS benefit, so the pre-existing disparity d₀ ≥ 0 grows
+     to d₀ + α × R²_eur. -/
+ theorem deployment_amplifies_disparity
+-    (d₀ α r2_eur : ℝ)
+-    (h_nn : 0 ≤ d₀)
+-    (h_α : 0 < α) (h_r2 : 0 < r2_eur) :
+-    d₀ < d₀ + α * r2_eur := by
+-  linarith [mul_pos h_α h_r2]
++    {Ω : Type*} (E : ExpFunctional Ω)
++    (h_eur h_afr : Ω → ℝ)
++    (benefit : Ω → ℝ)
++    (d₀ : ℝ)
++    (h_baseline : E (fun ω => h_eur ω - h_afr ω) = d₀)
++    (h_benefit_pos : 0 < E benefit) :
++    d₀ < E (fun ω => (h_eur ω + benefit ω) - h_afr ω) := by
++  have H1 : (fun ω => (h_eur ω + benefit ω) - h_afr ω) =
++            (fun ω => (h_eur ω - h_afr ω) + benefit ω) := by
++    funext ω
++    ring
++  rw [H1]
++  have H2 : E (fun ω => (h_eur ω - h_afr ω) + benefit ω) = E (fun ω => h_eur ω - h_afr ω) + E benefit := E.add_eval _ _
++  rw [H2]
++  rw [h_baseline]
++  linarith
+ 
+ /-- **QALY gap from portability.**
+     QALYs gained = γ × R² for a positive constant γ (QALYs per unit R²).
+     The QALY gap between two populations is γ × (R²₁ - R²₂), which is
+     positive when R²₁ > R²₂. Derived from the model, not assumed. -/
+ theorem qaly_gap_proportional_to_r2_gap
+-    (γ r2₁ r2₂ : ℝ)
+-    (h_γ : 0 < γ) (h_gap : r2₂ < r2₁) :
+-    0 < γ * r2₁ - γ * r2₂ := by
+-  have : r2₁ - r2₂ > 0 := by linarith
++    {Ω : Type*} (E : ExpFunctional Ω)
++    (γ : ℝ) (h_γ : 0 < γ)
++    (r2_1 r2_2 : Ω → ℝ)
++    (h_gap : E r2_2 < E r2_1) :
++    0 < E (fun ω => γ * r2_1 ω - γ * r2_2 ω) := by
++  have H : (fun ω => γ * r2_1 ω - γ * r2_2 ω) = γ • (fun ω => r2_1 ω - r2_2 ω) := by
++    funext ω
++    simp only [Pi.smul_apply, smul_eq_mul]
++    ring
++  rw [H, E.smul_eval]
++  have h_sub : E (fun ω => r2_1 ω - r2_2 ω) = E r2_1 - E r2_2 := E.eval_sub r2_1 r2_2
++  rw [h_sub]
++  have : E r2_1 - E r2_2 > 0 := by linarith
+   nlinarith
+ 
+ end HealthDisparity
