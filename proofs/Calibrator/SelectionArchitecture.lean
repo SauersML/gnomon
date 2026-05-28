@@ -1,6 +1,7 @@
 import Calibrator.Probability
 import Calibrator.PortabilityDrift
 import Calibrator.OpenQuestions
+import Calibrator.TransportIdentities
 
 namespace Calibrator
 
@@ -475,10 +476,25 @@ noncomputable def polygenicAdaptationShift
 /-- **Under neutral drift, expected shift is zero.**
     E[Δpᵢ] = 0 under drift, so E[Δμ] = 0. -/
 theorem neutral_expected_shift_zero
-    {m : ℕ} (β : Fin m → ℝ) :
-    polygenicAdaptationShift β (fun _ => 0) = 0 := by
+    {Ω : Type*} (E : ExpFunctional Ω)
+    {m : ℕ} (β : Fin m → ℝ) (Δp : Fin m → Ω → ℝ)
+    (h_drift : ∀ i, E (Δp i) = 0) :
+    E (fun ω => polygenicAdaptationShift β (fun i => Δp i ω)) = 0 := by
   unfold polygenicAdaptationShift
-  simp
+  have h_sum : (fun ω => ∑ i, β i * Δp i ω) = (fun ω => (∑ i, ((β i) • (Δp i))) ω) := by
+    funext ω
+    simp
+  rw [h_sum, ExpFunctional.eval_sum]
+  have h_eval : (∑ x : Fin m, E ((β x) • (Δp x))) = ∑ x : Fin m, β x * E (Δp x) := by
+    apply Finset.sum_congr rfl
+    intro i _
+    rw [E.smul_eval]
+  rw [h_eval]
+  have h_zero : (∑ x : Fin m, β x * E (Δp x)) = 0 := by
+    apply Finset.sum_eq_zero
+    intro i _
+    rw [h_drift i, mul_zero]
+  exact h_zero
 
 /-- **Under selection, shift is nonzero and directional.**
     If selection favors higher trait values, Δpᵢ > 0 for positive-effect
