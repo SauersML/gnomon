@@ -589,7 +589,8 @@ print(f"gamfit_version:   {gamfit_version}")
 
 try:
     import gamfit
-    print(f"gamfit_module:    {getattr(gamfit, \"__file__\", \"<unknown>\")}")
+    gamfit_module_path = getattr(gamfit, "__file__", "<unknown>")
+    print(f"gamfit_module:    {gamfit_module_path}")
     for attr in ("__version__", "GAM_VERSION", "GAM_SOLVER_VERSION", "gam_version"):
         if hasattr(gamfit, attr):
             print(f"gamfit.{attr}: {getattr(gamfit, attr)}")
@@ -611,21 +612,55 @@ for pkg in ("gam", "gam-solver", "gam_solver"):
   echo
 } 2>&1 | tee -a "$RESULTS"
 
+# --- CUDA runtime discovery -------------------------------------------------
+# gamfit dlopens libcublas/libcusolver/libcusparse at fit time. Two valid
+# sources: (a) system CUDA toolkit reachable via ld.so.cache or under
+# /usr/local/cuda*/lib64, or (b) NVIDIA pip wheels (nvidia-*-cu12) inside
+# the uv env. Mixing both can split cuBLAS handle state across two
+# implementations and crash with "double free or corruption (!prev)" at
+# cublasDestroy_v2 — score/cuda_backend.rs::detect_cuda_library_conflicts
+# guards against this in-process. To avoid that path entirely we pick
+# exactly one source per run: prefer the system toolkit if it actually
+# ships libcublas.so.12, otherwise fall back to pip wheels.
+CUDA_PIP_WHEELS=()
+cublas_path=""
+if command -v ldconfig >/dev/null 2>&1; then
+  cublas_path="$(ldconfig -p 2>/dev/null | awk '/libcublas\.so\.12/ {print $NF; exit}')"
+fi
+if [[ -z "$cublas_path" ]]; then
+  for cand in /usr/local/cuda*/lib64/libcublas.so.12 /usr/local/cuda*/targets/x86_64-linux/lib/libcublas.so.12; do
+    if [[ -e "$cand" ]]; then cublas_path="$cand"; break; fi
+  done
+fi
+if [[ -n "$cublas_path" ]]; then
+  cublas_dir="$(dirname "$cublas_path")"
+  if [[ ":$LD_LIBRARY_PATH:" != *":$cublas_dir:"* ]]; then
+    export LD_LIBRARY_PATH="$cublas_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  fi
+  CUDA_RUNTIME_SOURCE="system  libcublas=$cublas_path  LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
+else
+  CUDA_RUNTIME_SOURCE="pip-wheels (no system libcublas.so.12 found)"
+  CUDA_PIP_WHEELS=(
+    --with nvidia-cublas-cu12
+    --with nvidia-cusolver-cu12
+    --with nvidia-cusparse-cu12
+    --with nvidia-cuda-runtime-cu12
+    --with nvidia-cuda-nvrtc-cu12
+    --with nvidia-cuda-cupti-cu12
+    --with nvidia-nvjitlink-cu12
+  )
+fi
+{
+  echo "--- CUDA runtime discovery ---"
+  echo "cuda_source: $CUDA_RUNTIME_SOURCE"
+  echo
+} 2>&1 | tee -a "$RESULTS"
+
 # --- the actual run ---------------------------------------------------------
 # UV_CACHE_DIR is exported above instead of repeated as a flag. The original
 # failure happened before Python started because uv used its default
 # HOME/.cache/uv client cache; the env var is authoritative for every uv cache
 # path in this process and any child uv process.
-# NB: do NOT install `nvidia-*-cu12` pip wheels alongside the system
-# CUDA toolkit. The AoU bare-metal image ships a complete CUDA 12.3
-# stack at /usr/local/cuda-12.3, reachable to the dynamic loader via
-# ld.so.cache. Adding pip wheels with the same SONAMEs at different
-# paths leaves BOTH versions mapped into the gamfit / gnomon process
-# (glibc dlopen deduplicates by inode, not SONAME), which splits
-# cuBLAS handle state across two implementations and aborts the
-# process with "double free or corruption (!prev)" at the next
-# cublasDestroy_v2. See score/cuda_backend.rs::detect_cuda_library_conflicts
-# for the in-process guard that catches this if it ever recurs.
 # Do not pin Python package versions here. This runner must always ask uv for
 # the latest available packages, especially gamfit.
 uv run \
@@ -633,6 +668,7 @@ uv run \
     --python 3.11 \
     --upgrade-package gamfit \
     --with gamfit \
+    ${CUDA_PIP_WHEELS[@]+"${CUDA_PIP_WHEELS[@]}"} \
     --with numpy \
     --with pandas \
     --with pyarrow \
