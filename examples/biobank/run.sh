@@ -567,6 +567,44 @@ require_run_state_capacity \
   "$MIN_RUN_STATE_FREE_GIB" \
   "$MIN_RUN_STATE_FREE_INODES"
 
+# --- resolve and print gamfit / gam versions --------------------------------
+# Force uv to install the same gamfit the main run will use, then print the
+# gamfit package version and the bundled gam solver version it ships with.
+{
+  echo "--- gamfit / gam versions ---"
+  uv run \
+      --no-project \
+      --python 3.11 \
+      --upgrade-package gamfit \
+      --with gamfit \
+      -- python -u -c '
+import importlib.metadata as md
+import sys
+
+try:
+    gamfit_version = md.version("gamfit")
+except md.PackageNotFoundError:
+    gamfit_version = "<not installed>"
+print(f"gamfit_version:   {gamfit_version}")
+
+try:
+    import gamfit
+    print(f"gamfit_module:    {getattr(gamfit, \"__file__\", \"<unknown>\")}")
+    for attr in ("__version__", "GAM_VERSION", "GAM_SOLVER_VERSION", "gam_version"):
+        if hasattr(gamfit, attr):
+            print(f"gamfit.{attr}: {getattr(gamfit, attr)}")
+except Exception as exc:
+    print(f"gamfit_import_error: {exc!r}", file=sys.stderr)
+
+for pkg in ("gam", "gam-solver", "gam_solver"):
+    try:
+        print(f"{pkg}_version:    {md.version(pkg)}")
+    except md.PackageNotFoundError:
+        pass
+' || echo "[run.sh] warning: could not resolve gamfit/gam version"
+  echo
+} 2>&1 | tee -a "$RESULTS"
+
 {
   echo "--- PLINK staging ---"
   stage_plink_triplet_if_missing
