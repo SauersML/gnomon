@@ -36,17 +36,25 @@ section StratificationBias
     True effect: β. Stratification inflates to β̂ = β + b_confound.
     b_confound = Cov(ancestry, phenotype) * Cov(ancestry, genotype) / Var(genotype). -/
 
-/-- Stratification bias is nonzero when ancestry correlates with both
-    phenotype and genotype. -/
+/-- **Stratification bias effect.**
+    When ancestry correlates with both phenotype and genotype, the naive
+    regression estimate β̂ is inflated by confounding.
+    True effect: β. Stratification inflates to β̂ = β + b_confound.
+    b_confound = Cov(ancestry, phenotype) * Cov(ancestry, genotype) / Var(genotype). -/
+noncomputable def stratificationBias (cov_anc_pheno cov_anc_geno var_geno : ℝ) : ℝ :=
+  cov_anc_pheno * cov_anc_geno / var_geno
+
+/-- Stratification bias shifts the regression estimate away from the true effect. -/
 theorem stratification_bias_nonzero
-    (cov_anc_pheno cov_anc_geno var_geno : ℝ)
-    (h_pheno : cov_anc_pheno ≠ 0)
-    (h_geno : cov_anc_geno ≠ 0)
-    (h_var : 0 < var_geno) :
-    cov_anc_pheno * cov_anc_geno / var_geno ≠ 0 := by
-  apply div_ne_zero
-  · exact mul_ne_zero h_pheno h_geno
-  · exact h_var.ne'
+    (β_true cov_anc_pheno cov_anc_geno var_geno : ℝ)
+    (h_pheno_pos : 0 < cov_anc_pheno)
+    (h_geno_pos : 0 < cov_anc_geno)
+    (h_var_pos : 0 < var_geno) :
+    β_true < β_true + stratificationBias cov_anc_pheno cov_anc_geno var_geno := by
+  unfold stratificationBias
+  have h_bias_pos : 0 < cov_anc_pheno * cov_anc_geno / var_geno :=
+    div_pos (mul_pos h_pheno_pos h_geno_pos) h_var_pos
+  linarith
 
 /-- **Stratification bias model for p SNPs.**
     Each SNP i has true effect β_i and confounding bias b_i.
@@ -322,19 +330,25 @@ theorem collider_attenuates_association (m : ColliderModel) :
       < m.β_G * 1 := by exact mul_lt_mul_of_pos_left h_ratio_lt_one m.β_G_pos
     _ = m.β_G := by ring
 
-/-- **Differential ascertainment creates portability artifact.**
-    If source and target cohorts have different ascertainment patterns,
-    the apparent portability drop includes an ascertainment component. -/
+/-- **Differential ascertainment artifact decomposition.**
+    If source and target cohorts have different ascertainment patterns
+    (e.g., target population has stronger ascertainment bias), the observed
+    portability drop is composed of both the true portability loss and the
+    difference in ascertainment severity. -/
+noncomputable def differentialAscertainmentArtifact
+    (r2_source_pop r2_source_asc r2_target_pop r2_target_asc : ℝ) : ℝ :=
+  (r2_source_pop - r2_source_asc) - (r2_target_pop - r2_target_asc)
+
+/-- **Differential ascertainment inflates apparent portability loss.**
+    When the source GWAS retains more of the true population R² than the target GWAS
+    (i.e., target ascertainment penalty is larger), the observed difference in ascertained
+    R² strictly overestimates the true population R² difference. -/
 theorem differential_ascertainment_artifact
     (r2_source_pop r2_target_pop r2_source_asc r2_target_asc : ℝ)
-    (h_source_asc : r2_source_asc < r2_source_pop)
-    (h_target_asc : r2_target_asc < r2_target_pop)
-    -- Different ascertainment severity
-    (h_diff_severity : r2_target_pop - r2_target_asc < r2_source_pop - r2_source_asc) :
-    -- Apparent portability drop is larger than true portability drop
-    r2_source_asc - r2_target_asc > r2_source_pop - r2_target_pop →
-      False := by
-  intro h
+    (h_source_penalty : r2_source_asc < r2_source_pop)
+    (h_target_penalty : r2_target_asc < r2_target_pop)
+    (h_target_worse_ascertainment : r2_source_pop - r2_source_asc < r2_target_pop - r2_target_asc) :
+    r2_source_pop - r2_target_pop < r2_source_asc - r2_target_asc := by
   linarith
 
 end ColliderBias
@@ -519,11 +533,9 @@ theorem survivorship_attenuates_in_older (m : SurvivorshipAttenuationModel) :
     survivorship bias contributes to apparent portability loss. -/
 theorem differential_survivorship_artifact
     (r2_source_full r2_target_full Δ_surv_source Δ_surv_target : ℝ)
-    (h_surv_s : 0 ≤ Δ_surv_source) (h_surv_t : 0 ≤ Δ_surv_target)
-    (h_diff : Δ_surv_target > Δ_surv_source)
-    (h_obs_s : r2_source_full - Δ_surv_source > 0) :
-    (r2_source_full - Δ_surv_source) - (r2_target_full - Δ_surv_target) >
-      r2_source_full - r2_target_full := by
+    (h_diff : Δ_surv_source < Δ_surv_target) :
+    r2_source_full - r2_target_full <
+      (r2_source_full - Δ_surv_source) - (r2_target_full - Δ_surv_target) := by
   linarith
 
 end SurvivorshipBias
