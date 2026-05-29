@@ -460,10 +460,14 @@ theorem nei_fst_equilibrium_consistent (θ : ℝ) (hθ : 0 ≤ θ) :
   field_simp [hden]
   ring
 
+/-- Calculate the within-population heterozygosity share H_S / H_T. -/
+noncomputable def withinPopShare (H_S H_T : ℝ) : ℝ := H_S / H_T
+
 /-- **At mutation-drift equilibrium, the within-population share equals expectedHeterozygosity.**
     When H_T = 1, we have H_S / H_T = H_S = θ/(1+θ). -/
 theorem within_pop_share_eq_het (θ : ℝ) :
-    expectedHeterozygosity θ / 1 = expectedHeterozygosity θ := by
+    withinPopShare (expectedHeterozygosity θ) 1 = expectedHeterozygosity θ := by
+  unfold withinPopShare
   simp
 
 /-- **Heterozygosity determines Fst and vice versa.**

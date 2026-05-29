@@ -380,13 +380,24 @@ end Question4
 
 section Question5
 
+/-- **Winner's curse prediction error model components.** -/
+noncomputable def gwasEstimate (β_true δ : ℝ) : ℝ := β_true + δ
+
+noncomputable def targetEffect (β_true ρ : ℝ) : ℝ := ρ * β_true
+
+noncomputable def predictionError (β_hat β_t : ℝ) : ℝ := β_hat - β_t
+
+noncomputable def turnoverComponent (β_true ρ : ℝ) : ℝ := (1 - ρ) * β_true
+
 /-- **Winner's curse prediction error model.**
     GWAS estimate β_hat = β_true + δ (inflation).
     Target effect β_t = ρ * β_true (turnover).
     Prediction error = β_hat - β_t = (1-ρ)*β + δ.
     Prediction error decomposes into turnover + inflation. -/
 theorem prediction_error_decomp (β δ ρ : ℝ) :
-    (β + δ) - ρ * β = (1 - ρ) * β + δ := by ring
+    predictionError (gwasEstimate β δ) (targetEffect β ρ) = turnoverComponent β ρ + δ := by
+  unfold predictionError gwasEstimate targetEffect turnoverComponent
+  ring
 
 /-- Prediction error is positive when both components are positive. -/
 theorem prediction_error_positive
@@ -449,14 +460,21 @@ end Question6
 
 section Question7
 
+/-- Definition of Brier uncertainty for a given prevalence π. -/
+noncomputable def brierUncertainty (π : ℝ) : ℝ := π * (1 - π)
+
 /-- **Brier score irreducible noise = π(1-π).**
     This varies with prevalence, making R² comparisons across groups misleading. -/
 theorem brier_uncertainty_formula (π : ℝ) :
-    π * (1 - π) = -(π - 1/2) ^ 2 + 1/4 := by ring
+    brierUncertainty π = -(π - 1/2) ^ 2 + 1/4 := by
+  unfold brierUncertainty
+  ring
 
 /-- **Brier uncertainty is maximized at π = 1/2.** -/
 theorem brier_uncertainty_max_at_half (π : ℝ) :
-    π * (1 - π) ≤ 1/4 := by nlinarith [sq_nonneg (π - 1/2)]
+    brierUncertainty π ≤ 1/4 := by
+  unfold brierUncertainty
+  nlinarith [sq_nonneg (π - 1/2)]
 
 /-- **Closer to 1/2 ↔ higher uncertainty.** -/
 theorem closer_to_half_more_uncertainty
@@ -464,7 +482,7 @@ theorem closer_to_half_more_uncertainty
     (_h₁ : 0 < π₁) (_h₁' : π₁ < 1)
     (_h₂ : 0 < π₂) (_h₂' : π₂ < 1)
     (h_closer : (π₂ - 1/2) ^ 2 < (π₁ - 1/2) ^ 2) :
-    π₁ * (1 - π₁) < π₂ * (1 - π₂) := by
+    brierUncertainty π₁ < brierUncertainty π₂ := by
   nlinarith [brier_uncertainty_formula π₁, brier_uncertainty_formula π₂]
 
 /-- **Prediction interval width increases as R² decreases.** -/
@@ -876,19 +894,27 @@ We formalize which components of portability loss are recoverable.
 
 section RecoverablePortability
 
+/-- Apply a linear recalibration to a predictor. -/
+noncomputable def recalibrate (y_pred intercept slope : ℝ) : ℝ :=
+  slope * y_pred + intercept
+
 /-- **Mean shift is recoverable by re-calibration.**
     If the PGS has a mean shift μ across populations, adjusting the
     intercept recovers the correct calibration. -/
 theorem mean_shift_recoverable
     (y_pred μ_shift : ℝ) :
-    y_pred - μ_shift + μ_shift = y_pred := by ring
+    recalibrate (y_pred - μ_shift) μ_shift 1 = y_pred := by
+  unfold recalibrate
+  ring
 
 /-- **Slope change (shrinkage) is recoverable by re-calibration.**
     If the PGS slope changes from b to b·r, multiplying by 1/r recovers it. -/
 theorem slope_change_recoverable
     (b r pgs : ℝ) (hr : r ≠ 0) :
-    (b * r * pgs) * (1 / r) = b * pgs := by
+    recalibrate (b * r * pgs) 0 (1 / r) = b * pgs := by
+  unfold recalibrate
   field_simp
+  ring
 
 /-- **LD mismatch is NOT recoverable by linear re-calibration.**
     If the LD structure changes, the normal equations have a different solution.
