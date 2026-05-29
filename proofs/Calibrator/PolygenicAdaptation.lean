@@ -188,14 +188,15 @@ theorem stratification_confounds_overdispersion
     is strictly smaller than the naive value AND still positive (when
     the biases are less than the naive statistic). -/
 theorem corrections_reduce_signal
-    (stat_naive ld_bias ascertainment_bias : ℝ)
-    (h_naive_pos : 0 < stat_naive)
-    (h_ld : 0 < ld_bias) (h_asc : 0 < ascertainment_bias)
-    (h_partial : ld_bias + ascertainment_bias < stat_naive) :
+    (stat_true ld_bias ascertainment_bias : ℝ)
+    (h_true : 0 < stat_true)
+    (h_ld : 0 < ld_bias) (h_asc : 0 < ascertainment_bias) :
+    let stat_naive := stat_true + ld_bias + ascertainment_bias
     let stat_corrected := stat_naive - ld_bias - ascertainment_bias
-    0 < stat_corrected ∧ stat_corrected < stat_naive := by
-  simp only
-  exact ⟨by linarith, by linarith⟩
+    stat_corrected = stat_true ∧ stat_corrected < stat_naive := by
+  dsimp
+  refine ⟨by ring, ?_⟩
+  linarith
 
 end PGSOverdispersion
 
@@ -327,12 +328,14 @@ section DetectingAdaptation
     adaptation signal was due to residual stratification in UKBiobank.
     After correction, the signal was greatly reduced. -/
 theorem stratification_reduces_adaptation_signal
-    (signal_raw strat_bias : ℝ)
-    (h_raw_pos : 0 < signal_raw) (h_bias_pos : 0 < strat_bias)
-    (h_partial : strat_bias < signal_raw) :
-    -- After removing stratification bias, signal is reduced but not eliminated
-    0 < signal_raw - strat_bias ∧ signal_raw - strat_bias < signal_raw := by
-  exact ⟨by linarith, by linarith⟩
+    (signal_true strat_bias : ℝ)
+    (h_true_pos : 0 < signal_true) (h_bias_pos : 0 < strat_bias) :
+    let signal_raw := signal_true + strat_bias
+    let signal_corrected := signal_raw - strat_bias
+    signal_corrected = signal_true ∧ signal_corrected < signal_raw := by
+  dsimp
+  refine ⟨by ring, ?_⟩
+  linarith
 
 /-- **Implications for portability.**
     If apparent adaptation is actually stratification:

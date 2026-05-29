@@ -198,19 +198,55 @@ theorem transfer_beats_target_only
     n_crit depends on the portability ratio and source GWAS power.
     Beyond n_crit, target-only GWAS is sufficient.
 
-    General statement: given any n_lo and n_hi where transfer beats target
-    at n_lo but target beats transfer at n_hi, a crossover point exists
-    in between. -/
+    We explicitly calculate the crossover point based on the analytical
+    MSE expressions for transfer learning versus target-only estimators. -/
 theorem critical_sample_size_exists
-    (mse_transfer mse_target : ℝ → ℝ) (n_lo n_hi : ℝ)
-    (h_transfer_decreasing : ∀ n₁ n₂ : ℝ, 0 < n₁ → n₁ < n₂ → mse_transfer n₂ < mse_transfer n₁)
-    (h_target_decreasing : ∀ n₁ n₂ : ℝ, 0 < n₁ → n₁ < n₂ → mse_target n₂ < mse_target n₁)
-    (h_lo_pos : 0 < n_lo) (h_range : n_lo < n_hi)
-    (h_small_n : mse_transfer n_lo < mse_target n_lo)
-    (h_large_n : mse_target n_hi < mse_transfer n_hi) :
-    -- There exists a crossover point
-    ∃ n_crit : ℝ, n_lo < n_crit ∧ n_crit < n_hi := by
-  exact ⟨(n_lo + n_hi) / 2, by linarith, by linarith⟩
+    (_σ_sq bias_sq σ_extra_sq : ℝ)
+    (h_bias : 0 < bias_sq) (h_extra : 0 < σ_extra_sq) :
+    let n_crit := σ_extra_sq / bias_sq
+    let mse_transfer := fun (n_T : ℝ) => _σ_sq / n_T + bias_sq
+    let mse_target := fun (n_T : ℝ) => (_σ_sq + σ_extra_sq) / n_T
+    0 < n_crit ∧
+    ∀ n_T : ℝ, 0 < n_T →
+      (n_T < n_crit ↔ mse_transfer n_T < mse_target n_T) ∧
+      (n_crit < n_T ↔ mse_target n_T < mse_transfer n_T) := by
+  intro n_crit mse_transfer mse_target
+  have hn_crit_pos : 0 < n_crit := div_pos h_extra h_bias
+  refine ⟨hn_crit_pos, ?_⟩
+  intro n_T hn_T_pos
+  constructor
+  · constructor
+    · intro h_lt
+      dsimp [mse_transfer, mse_target]
+      have h1 : n_T * bias_sq < σ_extra_sq := (lt_div_iff₀ h_bias).mp h_lt
+      have h2 : bias_sq < σ_extra_sq / n_T := (lt_div_iff₀ hn_T_pos).mpr (by rwa [mul_comm] at h1)
+      calc
+        _σ_sq / n_T + bias_sq < _σ_sq / n_T + σ_extra_sq / n_T := add_lt_add_left h2 (_σ_sq / n_T)
+        _ = (_σ_sq + σ_extra_sq) / n_T := by rw [add_div]
+    · intro h_lt
+      dsimp [mse_transfer, mse_target] at h_lt
+      have h1 : _σ_sq / n_T + bias_sq < _σ_sq / n_T + σ_extra_sq / n_T := by rwa [add_div] at h_lt
+      have h2 : bias_sq < σ_extra_sq / n_T := (add_lt_add_iff_left (_σ_sq / n_T)).mp h1
+      have h3 : n_T * bias_sq < σ_extra_sq := by
+        have := (lt_div_iff₀ hn_T_pos).mp h2
+        rwa [mul_comm]
+      exact (lt_div_iff₀ h_bias).mpr h3
+  · constructor
+    · intro h_lt
+      dsimp [mse_transfer, mse_target]
+      have h1 : σ_extra_sq < n_T * bias_sq := (div_lt_iff₀ h_bias).mp h_lt
+      have h2 : σ_extra_sq / n_T < bias_sq := (div_lt_iff₀ hn_T_pos).mpr (by rwa [mul_comm])
+      calc
+        (_σ_sq + σ_extra_sq) / n_T = _σ_sq / n_T + σ_extra_sq / n_T := by rw [add_div]
+        _ < _σ_sq / n_T + bias_sq := add_lt_add_left h2 (_σ_sq / n_T)
+    · intro h_lt
+      dsimp [mse_transfer, mse_target] at h_lt
+      have h1 : _σ_sq / n_T + σ_extra_sq / n_T < _σ_sq / n_T + bias_sq := by rwa [add_div] at h_lt
+      have h2 : σ_extra_sq / n_T < bias_sq := (add_lt_add_iff_left (_σ_sq / n_T)).mp h1
+      have h3 : σ_extra_sq < n_T * bias_sq := by
+        have := (div_lt_iff₀ hn_T_pos).mp h2
+        rwa [mul_comm]
+      exact (div_lt_iff₀ h_bias).mpr h3
 
 /-- **Multi-ancestry meta-analysis is optimal.**
     Combining GWAS data from multiple ancestries via inverse-variance

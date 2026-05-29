@@ -1,0 +1,150 @@
+diff --git a/proofs/Calibrator/AncestryCalibration.lean b/proofs/Calibrator/AncestryCalibration.lean
+index 8e91f0b..e2432ab 100644
+--- a/proofs/Calibrator/AncestryCalibration.lean
++++ b/proofs/Calibrator/AncestryCalibration.lean
+@@ -198,19 +198,55 @@ theorem transfer_beats_target_only
+     n_crit depends on the portability ratio and source GWAS power.
+     Beyond n_crit, target-only GWAS is sufficient.
+ 
+-    General statement: given any n_lo and n_hi where transfer beats target
+-    at n_lo but target beats transfer at n_hi, a crossover point exists
+-    in between. -/
++    We explicitly calculate the crossover point based on the analytical
++    MSE expressions for transfer learning versus target-only estimators. -/
+ theorem critical_sample_size_exists
+-    (mse_transfer mse_target : ℝ → ℝ) (n_lo n_hi : ℝ)
+-    (h_transfer_decreasing : ∀ n₁ n₂ : ℝ, 0 < n₁ → n₁ < n₂ → mse_transfer n₂ < mse_transfer n₁)
+-    (h_target_decreasing : ∀ n₁ n₂ : ℝ, 0 < n₁ → n₁ < n₂ → mse_target n₂ < mse_target n₁)
+-    (h_lo_pos : 0 < n_lo) (h_range : n_lo < n_hi)
+-    (h_small_n : mse_transfer n_lo < mse_target n_lo)
+-    (h_large_n : mse_target n_hi < mse_transfer n_hi) :
+-    -- There exists a crossover point
+-    ∃ n_crit : ℝ, n_lo < n_crit ∧ n_crit < n_hi := by
+-  exact ⟨(n_lo + n_hi) / 2, by linarith, by linarith⟩
++    (_σ_sq bias_sq σ_extra_sq : ℝ)
++    (h_bias : 0 < bias_sq) (h_extra : 0 < σ_extra_sq) :
++    let n_crit := σ_extra_sq / bias_sq
++    let mse_transfer := fun (n_T : ℝ) => _σ_sq / n_T + bias_sq
++    let mse_target := fun (n_T : ℝ) => (_σ_sq + σ_extra_sq) / n_T
++    0 < n_crit ∧
++    ∀ n_T : ℝ, 0 < n_T →
++      (n_T < n_crit ↔ mse_transfer n_T < mse_target n_T) ∧
++      (n_crit < n_T ↔ mse_target n_T < mse_transfer n_T) := by
++  intro n_crit mse_transfer mse_target
++  have hn_crit_pos : 0 < n_crit := div_pos h_extra h_bias
++  refine ⟨hn_crit_pos, ?_⟩
++  intro n_T hn_T_pos
++  constructor
++  · constructor
++    · intro h_lt
++      dsimp [mse_transfer, mse_target]
++      have h1 : n_T * bias_sq < σ_extra_sq := (lt_div_iff₀ h_bias).mp h_lt
++      have h2 : bias_sq < σ_extra_sq / n_T := (lt_div_iff₀ hn_T_pos).mpr (by rwa [mul_comm] at h1)
++      calc
++        _σ_sq / n_T + bias_sq < _σ_sq / n_T + σ_extra_sq / n_T := add_lt_add_left h2 (_σ_sq / n_T)
++        _ = (_σ_sq + σ_extra_sq) / n_T := by rw [add_div]
++    · intro h_lt
++      dsimp [mse_transfer, mse_target] at h_lt
++      have h1 : _σ_sq / n_T + bias_sq < _σ_sq / n_T + σ_extra_sq / n_T := by rwa [add_div] at h_lt
++      have h2 : bias_sq < σ_extra_sq / n_T := (add_lt_add_iff_left (_σ_sq / n_T)).mp h1
++      have h3 : n_T * bias_sq < σ_extra_sq := by
++        have := (lt_div_iff₀ hn_T_pos).mp h2
++        rwa [mul_comm]
++      exact (lt_div_iff₀ h_bias).mpr h3
++  · constructor
++    · intro h_lt
++      dsimp [mse_transfer, mse_target]
++      have h1 : σ_extra_sq < n_T * bias_sq := (div_lt_iff₀ h_bias).mp h_lt
++      have h2 : σ_extra_sq / n_T < bias_sq := (div_lt_iff₀ hn_T_pos).mpr (by rwa [mul_comm])
++      calc
++        (_σ_sq + σ_extra_sq) / n_T = _σ_sq / n_T + σ_extra_sq / n_T := by rw [add_div]
++        _ < _σ_sq / n_T + bias_sq := add_lt_add_left h2 (_σ_sq / n_T)
++    · intro h_lt
++      dsimp [mse_transfer, mse_target] at h_lt
++      have h1 : _σ_sq / n_T + σ_extra_sq / n_T < _σ_sq / n_T + bias_sq := by rwa [add_div] at h_lt
++      have h2 : σ_extra_sq / n_T < bias_sq := (add_lt_add_iff_left (_σ_sq / n_T)).mp h1
++      have h3 : σ_extra_sq < n_T * bias_sq := by
++        have := (div_lt_iff₀ hn_T_pos).mp h2
++        rwa [mul_comm]
++      exact (div_lt_iff₀ h_bias).mpr h3
+ 
+ /-- **Multi-ancestry meta-analysis is optimal.**
+     Combining GWAS data from multiple ancestries via inverse-variance
+diff --git a/proofs/Calibrator/AncestryDeconvolution.lean b/proofs/Calibrator/AncestryDeconvolution.lean
+index 5c70cb0..7428244 100644
+--- a/proofs/Calibrator/AncestryDeconvolution.lean
++++ b/proofs/Calibrator/AncestryDeconvolution.lean
+@@ -222,14 +222,18 @@ section Tractor
+     This directly estimates the ancestry-specific effects needed
+     for portable PGS construction. -/
+ 
+-/-- **Tractor requires large admixed sample size.**
+-    Effective per-ancestry N ≈ α × N_admixed for ancestry proportion α.
+-    Both ancestry components need adequate N for stable estimation. -/
++/-- **Effective sample size partition in Tractor.**
++    If an admixed population has N individuals and average ancestry
++    proportion α for population A, the sum of effective sample sizes for
++    estimating population A's specific effect and population B's specific effect
++    equals the total sample size N. -/
+ theorem tractor_effective_n
+-    (n_admixed α : ℝ)
+-    (h_n : 0 < n_admixed) (h_α : 0 < α) (h_α1 : α < 1) :
+-    0 < α * n_admixed ∧ 0 < (1 - α) * n_admixed := by
+-  exact ⟨mul_pos h_α h_n, mul_pos (by linarith) h_n⟩
++    (n_admixed α : ℝ) :
++    let n_eff_A := α * n_admixed
++    let n_eff_B := (1 - α) * n_admixed
++    n_eff_A + n_eff_B = n_admixed := by
++  dsimp
++  ring
+ 
+ /-- **Ancestry-specific effects test for portability.**
+     If β_A = β_B at a locus, the locus is "portable" across ancestries.
+diff --git a/proofs/Calibrator/PolygenicAdaptation.lean b/proofs/Calibrator/PolygenicAdaptation.lean
+index 33f1010..b58f683 100644
+--- a/proofs/Calibrator/PolygenicAdaptation.lean
++++ b/proofs/Calibrator/PolygenicAdaptation.lean
+@@ -188,14 +188,15 @@ theorem stratification_confounds_overdispersion
+     is strictly smaller than the naive value AND still positive (when
+     the biases are less than the naive statistic). -/
+ theorem corrections_reduce_signal
+-    (stat_naive ld_bias ascertainment_bias : ℝ)
+-    (h_naive_pos : 0 < stat_naive)
+-    (h_ld : 0 < ld_bias) (h_asc : 0 < ascertainment_bias)
+-    (h_partial : ld_bias + ascertainment_bias < stat_naive) :
++    (stat_true ld_bias ascertainment_bias : ℝ)
++    (h_true : 0 < stat_true)
++    (h_ld : 0 < ld_bias) (h_asc : 0 < ascertainment_bias) :
++    let stat_naive := stat_true + ld_bias + ascertainment_bias
+     let stat_corrected := stat_naive - ld_bias - ascertainment_bias
+-    0 < stat_corrected ∧ stat_corrected < stat_naive := by
+-  simp only
+-  exact ⟨by linarith, by linarith⟩
++    stat_corrected = stat_true ∧ stat_corrected < stat_naive := by
++  dsimp
++  refine ⟨by ring, ?_⟩
++  linarith
+ 
+ end PGSOverdispersion
+ 
+@@ -327,12 +328,14 @@ section DetectingAdaptation
+     adaptation signal was due to residual stratification in UKBiobank.
+     After correction, the signal was greatly reduced. -/
+ theorem stratification_reduces_adaptation_signal
+-    (signal_raw strat_bias : ℝ)
+-    (h_raw_pos : 0 < signal_raw) (h_bias_pos : 0 < strat_bias)
+-    (h_partial : strat_bias < signal_raw) :
+-    -- After removing stratification bias, signal is reduced but not eliminated
+-    0 < signal_raw - strat_bias ∧ signal_raw - strat_bias < signal_raw := by
+-  exact ⟨by linarith, by linarith⟩
++    (signal_true strat_bias : ℝ)
++    (h_true_pos : 0 < signal_true) (h_bias_pos : 0 < strat_bias) :
++    let signal_raw := signal_true + strat_bias
++    let signal_corrected := signal_raw - strat_bias
++    signal_corrected = signal_true ∧ signal_corrected < signal_raw := by
++  dsimp
++  refine ⟨by ring, ?_⟩
++  linarith
+ 
+ /-- **Implications for portability.**
+     If apparent adaptation is actually stratification:
