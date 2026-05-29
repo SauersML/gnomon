@@ -567,12 +567,11 @@ theorem factor_lower_bounds_sum_strictly_below_total
     (_h_f1_nn : 0 ≤ var_explained_f1) (_h_f2_nn : 0 ≤ var_explained_f2) :
     lb₁ + lb₂ < var_explained_f1 + var_explained_f2 := by linarith
 
-/-- **A prediction error bound implies any looser tolerance bound.**
-    If `|actual - predicted| ≤ ε` and `ε < bound`, then the prediction error is
-    strictly below `bound`. This is only the final inequality step, not the
-    derivation of the predictor itself. -/
+/-- **Prediction error bounded by loose tolerance.**
+    If the prediction error is within `ε`, and `ε` is strictly less than `bound`,
+    the absolute error is strictly bounded by `bound`. -/
 theorem prediction_error_bounded_by_looser_tolerance
-    (_polygenicity _selection_signal predicted_port actual_port ε bound : ℝ)
+    (predicted_port actual_port ε bound : ℝ)
     (h_prediction : |actual_port - predicted_port| ≤ ε)
     (h_small_error : ε < bound) :
     |actual_port - predicted_port| < bound := by linarith
