@@ -222,14 +222,18 @@ section Tractor
     This directly estimates the ancestry-specific effects needed
     for portable PGS construction. -/
 
-/-- **Tractor requires large admixed sample size.**
-    Effective per-ancestry N ≈ α × N_admixed for ancestry proportion α.
-    Both ancestry components need adequate N for stable estimation. -/
+/-- **Effective sample size partition in Tractor.**
+    If an admixed population has N individuals and average ancestry
+    proportion α for population A, the sum of effective sample sizes for
+    estimating population A's specific effect and population B's specific effect
+    equals the total sample size N. -/
 theorem tractor_effective_n
-    (n_admixed α : ℝ)
-    (h_n : 0 < n_admixed) (h_α : 0 < α) (h_α1 : α < 1) :
-    0 < α * n_admixed ∧ 0 < (1 - α) * n_admixed := by
-  exact ⟨mul_pos h_α h_n, mul_pos (by linarith) h_n⟩
+    (n_admixed α : ℝ) :
+    let n_eff_A := α * n_admixed
+    let n_eff_B := (1 - α) * n_admixed
+    n_eff_A + n_eff_B = n_admixed := by
+  dsimp
+  ring
 
 /-- **Ancestry-specific effects test for portability.**
     If β_A = β_B at a locus, the locus is "portable" across ancestries.
