@@ -112,11 +112,15 @@ theorem spline_error_improves_with_knots
     which is direct rearrangement. The real content is the model
     decomposition MSE = bias² + variance. -/
 theorem bias_variance_tradeoff
-    (bias₁ bias₂ var₁ var₂ : ℝ)
-    (h_bias_improves : bias₂ ^ 2 < bias₁ ^ 2)
-    (h_var_worsens : var₁ < var₂)
-    (h_var_dominates : var₂ - var₁ > bias₁ ^ 2 - bias₂ ^ 2) :
-    bias₁ ^ 2 + var₁ < bias₂ ^ 2 + var₂ := by linarith
+    {Ω : Type*} (E : ExpFunctional Ω)
+    (Y S₁ S₂ : Ω → ℝ)
+    (h_var_dominates :
+      (variance E S₂ - 2 * covariance E Y S₂) - (variance E S₁ - 2 * covariance E Y S₁)
+        > (bias E Y S₁) ^ 2 - (bias E Y S₂) ^ 2) :
+    expMse E Y S₁ < expMse E Y S₂ := by
+  have mse1 := mse_eq_variance_add_variance_sub_two_cov_add_bias_sq E Y S₁
+  have mse2 := mse_eq_variance_add_variance_sub_two_cov_add_bias_sq E Y S₂
+  linarith
 
 /-- **Spline R² is bounded by the signal-to-noise ratio.**
     R²_spline ≤ Var(E[ε²|d]) / Var(ε²).
@@ -202,15 +206,37 @@ theorem transfer_beats_target_only
     at n_lo but target beats transfer at n_hi, a crossover point exists
     in between. -/
 theorem critical_sample_size_exists
-    (mse_transfer mse_target : ℝ → ℝ) (n_lo n_hi : ℝ)
-    (h_transfer_decreasing : ∀ n₁ n₂ : ℝ, 0 < n₁ → n₁ < n₂ → mse_transfer n₂ < mse_transfer n₁)
-    (h_target_decreasing : ∀ n₁ n₂ : ℝ, 0 < n₁ → n₁ < n₂ → mse_target n₂ < mse_target n₁)
-    (h_lo_pos : 0 < n_lo) (h_range : n_lo < n_hi)
-    (h_small_n : mse_transfer n_lo < mse_target n_lo)
-    (h_large_n : mse_target n_hi < mse_transfer n_hi) :
-    -- There exists a crossover point
-    ∃ n_crit : ℝ, n_lo < n_crit ∧ n_crit < n_hi := by
-  exact ⟨(n_lo + n_hi) / 2, by linarith, by linarith⟩
+    (σ_sq bias_sq σ_extra_sq : ℝ)
+    (_h_σ : 0 < σ_sq) (h_bias : 0 < bias_sq) (h_extra : 0 < σ_extra_sq) :
+    let mse_transfer (n : ℝ) := σ_sq / n + bias_sq
+    let mse_target (n : ℝ) := (σ_sq + σ_extra_sq) / n
+    let n_crit := σ_extra_sq / bias_sq
+    mse_transfer n_crit = mse_target n_crit ∧
+    (∀ n_T, 0 < n_T → n_T < n_crit → mse_transfer n_T < mse_target n_T) ∧
+    (∀ n_T, n_crit < n_T → mse_target n_T < mse_transfer n_T) := by
+  intro mse_transfer mse_target n_crit
+  have _h_n_crit_pos : 0 < n_crit := div_pos h_extra h_bias
+  refine ⟨?_, ?_, ?_⟩
+  · dsimp [mse_transfer, mse_target, n_crit]
+    have : σ_extra_sq / (σ_extra_sq / bias_sq) = bias_sq := by
+      rw [div_div_eq_mul_div, mul_comm, mul_div_cancel_right₀ _ (ne_of_gt h_extra)]
+    have h_add : (σ_sq + σ_extra_sq) / (σ_extra_sq / bias_sq) = σ_sq / (σ_extra_sq / bias_sq) + σ_extra_sq / (σ_extra_sq / bias_sq) := by exact add_div σ_sq σ_extra_sq (σ_extra_sq / bias_sq)
+    rw [h_add, this]
+  · intro n_T h_nT_pos h_lt
+    dsimp [mse_transfer, mse_target, n_crit] at h_lt ⊢
+    rw [add_div]
+    have h1 : n_T * bias_sq < σ_extra_sq := (lt_div_iff₀ h_bias).mp h_lt
+    have h1' : bias_sq * n_T < σ_extra_sq := by rwa [mul_comm] at h1
+    have h2 : bias_sq < σ_extra_sq / n_T := (lt_div_iff₀ h_nT_pos).mpr h1'
+    linarith
+  · intro n_T h_gt
+    dsimp [mse_transfer, mse_target, n_crit] at h_gt ⊢
+    rw [add_div]
+    have h_nT_pos : 0 < n_T := by linarith
+    have h1 : σ_extra_sq < n_T * bias_sq := (div_lt_iff₀ h_bias).mp h_gt
+    have h1' : σ_extra_sq < bias_sq * n_T := by rwa [mul_comm] at h1
+    have h2 : σ_extra_sq / n_T < bias_sq := (div_lt_iff₀ h_nT_pos).mpr h1'
+    linarith
 
 /-- **Multi-ancestry meta-analysis is optimal.**
     Combining GWAS data from multiple ancestries via inverse-variance
