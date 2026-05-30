@@ -1435,7 +1435,7 @@ theorem optimalSourceShrinkageWeight_eq_closed_form
           field_simp [hn_ne]
         _ = 0 := h_zero
     rcases mul_eq_zero.mp hmul with h0 | h0
-    · exact False.elim (hn_ne h0)
+    · contradiction
     · exact h0
   unfold optimalSourceShrinkageWeight
   field_simp [hn_ne, h_curv, h_denom]
