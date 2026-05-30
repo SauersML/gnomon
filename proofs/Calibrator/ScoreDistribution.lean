@@ -472,11 +472,17 @@ theorem external_vs_internal_differ
 theorem percentile_invariant_to_standardization
     (μ σ : ℝ) (h_σ : 0 < σ) :
     -- Standardization is strictly increasing → preserves order
-    ∀ pgs₁ pgs₂ : ℝ, pgs₁ < pgs₂ →
+    ∀ pgs₁ pgs₂ : ℝ, pgs₁ < pgs₂ ↔
       externallyStandardized pgs₁ μ σ < externallyStandardized pgs₂ μ σ := by
-  intro pgs₁ pgs₂ h
+  intro pgs₁ pgs₂
   unfold externallyStandardized
-  exact div_lt_div_of_pos_right (by linarith) h_σ
+  constructor
+  · intro h
+    exact div_lt_div_of_pos_right (sub_lt_sub_right h μ) h_σ
+  · intro h
+    have h_mul := mul_lt_mul_of_pos_right h h_σ
+    rw [div_mul_cancel₀ _ (ne_of_gt h_σ), div_mul_cancel₀ _ (ne_of_gt h_σ)] at h_mul
+    exact sub_lt_sub_iff_right μ |>.mp h_mul
 
 end Standardization
 
