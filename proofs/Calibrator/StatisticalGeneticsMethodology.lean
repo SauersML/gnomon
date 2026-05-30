@@ -1,10 +1,12 @@
 import Calibrator.Probability
 import Calibrator.PortabilityDrift
 import Calibrator.OpenQuestions
+import Calibrator.TransportIdentities
 
 namespace Calibrator
 
 open MeasureTheory
+open ExpFunctional
 
 /-!
 # Statistical Genetics Methodology for Portability Assessment
@@ -237,14 +239,35 @@ theorem effective_n_pos (se : ℝ) (h_se : 0 < se) :
 /-- **Fixed vs random effects meta-analysis.**
     Fixed effects: assumes same β across populations (tau² = 0).
     Random effects: allows β to vary with between-population variance tau².
-    When tau² > 0, the random effects SE is larger (wider CI) because
+    When tau² > 0, the random effects variance is larger (wider CI) because
     it adds tau² to the within-study variance. -/
 theorem random_effects_captures_heterogeneity
-    (se_fixed tau_sq : ℝ) -- fixed-effects SE and between-population variance
-    (h_se : 0 < se_fixed) (h_heterogeneous : 0 < tau_sq) :
-    -- Random effects SE² = fixed SE² + tau² > fixed SE²
-    se_fixed ^ 2 < se_fixed ^ 2 + tau_sq := by
-  linarith
+    {Ω : Type*} (E : ExpFunctional Ω)
+    (β_true β_est : Ω → ℝ) (β_mean : ℝ)
+    (tau_sq se_sq : ℝ)
+    (h_tau_sq : E (fun ω => (β_true ω - β_mean) ^ 2) = tau_sq)
+    (h_se_sq : E (fun ω => (β_est ω - β_true ω) ^ 2) = se_sq)
+    (h_cross : E (fun ω => (β_true ω - β_mean) * (β_est ω - β_true ω)) = 0)
+    (h_heterogeneous : 0 < tau_sq) :
+    E (fun ω => (β_est ω - β_mean) ^ 2) = se_sq + tau_sq ∧
+    se_sq < E (fun ω => (β_est ω - β_mean) ^ 2) := by
+  have h_expand : (fun ω => (β_est ω - β_mean) ^ 2) =
+      (fun ω => (β_est ω - β_true ω) ^ 2) +
+      (fun ω => (β_true ω - β_mean) ^ 2) +
+      (2 : ℝ) • (fun ω => (β_true ω - β_mean) * (β_est ω - β_true ω)) := by
+    funext ω
+    dsimp
+    ring
+  rw [h_expand]
+  rw [E.add_eval, E.add_eval]
+  rw [h_se_sq, h_tau_sq]
+  rw [E.smul_eval]
+  rw [h_cross]
+  have h_eq : se_sq + tau_sq + 2 * 0 = se_sq + tau_sq := by ring
+  rw [h_eq]
+  constructor
+  · rfl
+  · linarith
 
 end SummaryStatPGS
 
