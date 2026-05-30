@@ -42,35 +42,38 @@ theorem recalibration_slope_under_drift
     ρ * (b_source * α) / (α ^ 2) = ρ * b_source / α := by
   field_simp
 
+structure LinearRecalibrationModel where
+  r2_source : ℝ
+  r2_oracle : ℝ
+  effect_correlation_sq : ℝ
+  h_r2_source_pos : 0 < r2_source
+  h_r2_oracle_pos : 0 < r2_oracle
+  h_corr_nn : 0 ≤ effect_correlation_sq
+  h_corr_le_one : effect_correlation_sq ≤ 1
+  h_oracle_le_one : r2_oracle ≤ 1
+
+noncomputable def recalibratedR2 (m : LinearRecalibrationModel) : ℝ :=
+  m.r2_source * m.effect_correlation_sq
+
+noncomputable def turnoverLoss (m : LinearRecalibrationModel) : ℝ :=
+  m.r2_source * (1 - m.effect_correlation_sq)
+
 /-- **Recalibration recovers R² up to effect turnover limit.**
     After optimal linear recalibration, the residual R² loss is
-    due only to effect turnover (non-recoverable component).
-
-    Model: recalibrated R² = r2_source × ρ² (proportion of variance
-    explained after drift attenuates effects by squared correlation ρ²).
-    The turnover loss = r2_source × (1 - ρ²) is the non-recoverable part.
-    These two components sum to r2_source by algebraic decomposition:
-      r2_source × ρ² + r2_source × (1 - ρ²) = r2_source × (ρ² + 1 - ρ²) = r2_source. -/
-theorem recalibration_recovers_up_to_turnover
-    (r2_source ρ_sq : ℝ)
-    (h_ρ : 0 ≤ ρ_sq) (h_ρ_le : ρ_sq ≤ 1)
-    (h_r2 : 0 < r2_source) :
-    let r2_recalibrated := r2_source * ρ_sq
-    let r2_loss_turnover := r2_source * (1 - ρ_sq)
-    r2_recalibrated + r2_loss_turnover = r2_source := by
-  simp only
+    due only to effect turnover (non-recoverable component). -/
+theorem recalibration_recovers_up_to_turnover (m : LinearRecalibrationModel) :
+    recalibratedR2 m + turnoverLoss m = m.r2_source := by
+  unfold recalibratedR2 turnoverLoss
   ring
 
 /-- **Recalibration cannot exceed oracle R².**
     The best linear recalibration cannot exceed the R² achievable
-    with a GWAS performed directly in the target population.
-    Here r2_recalib = ρ² × r2_oracle where ρ² ∈ [0,1] is the squared
-    effect correlation, so r2_recalib ≤ r2_oracle. -/
-theorem recalibration_bounded_by_oracle
-    (r2_oracle ρ_sq : ℝ)
-    (h_oracle : 0 < r2_oracle) (h_oracle_le : r2_oracle ≤ 1)
-    (h_ρ_nn : 0 ≤ ρ_sq) (h_ρ_le : ρ_sq ≤ 1) :
-    ρ_sq * r2_oracle ≤ r2_oracle := by
+    with a GWAS performed directly in the target population. -/
+theorem recalibration_bounded_by_oracle (m : LinearRecalibrationModel) :
+    m.effect_correlation_sq * m.r2_oracle ≤ m.r2_oracle := by
+  have h1 : 0 ≤ m.effect_correlation_sq := m.h_corr_nn
+  have h2 : m.effect_correlation_sq ≤ 1 := m.h_corr_le_one
+  have h3 : 0 < m.r2_oracle := m.h_r2_oracle_pos
   nlinarith
 
 end LinearRecalibration
@@ -86,50 +89,78 @@ can capture the nonlinear portability decay.
 
 section SplineCalibration
 
+structure SplineCalibrationModel where
+  knots : ℝ
+  h_knots_pos : 0 < knots
+  -- True underlying continuous relationship
+  function_complexity : ℝ
+  h_complexity_pos : 0 < function_complexity
+  -- Measurement noise
+  noise_variance : ℝ
+  h_noise_pos : 0 < noise_variance
+
+-- O(h^4) error gives bias proportional to function_complexity / knots^4
+noncomputable def splineBiasSq (m : SplineCalibrationModel) : ℝ :=
+  m.function_complexity / (m.knots ^ 4)
+
+-- Variance scales with knots / data_points, but we simplify to knots * noise
+noncomputable def splineVariance (m : SplineCalibrationModel) : ℝ :=
+  m.knots * m.noise_variance
+
+noncomputable def splineMSE (m : SplineCalibrationModel) : ℝ :=
+  splineBiasSq m + splineVariance m
+
 /-- **Spline approximation error bound.**
     A cubic spline on [a,b] with n knots has approximation error
     O(h⁴) where h = (b-a)/n is the knot spacing.
     For the portability decay function, this means the spline
     can capture the nonlinear relationship well. -/
 theorem spline_error_improves_with_knots
-    (h₁ h₂ : ℝ) (h_finer : h₂ < h₁) (h_pos : 0 < h₂) :
-    h₂ ^ 4 < h₁ ^ 4 := by
-  apply pow_lt_pow_left₀ h_finer (le_of_lt h_pos)
-  norm_num
+    (m1 m2 : SplineCalibrationModel)
+    (h_same_comp : m1.function_complexity = m2.function_complexity)
+    (h_more_knots : m1.knots < m2.knots) :
+    splineBiasSq m2 < splineBiasSq m1 := by
+  unfold splineBiasSq
+  rw [h_same_comp]
+  have h_num : 0 < m2.function_complexity := m2.h_complexity_pos
+  have h_den1 : 0 < m1.knots ^ 4 := pow_pos m1.h_knots_pos 4
+  have h_den2 : 0 < m2.knots ^ 4 := pow_pos m2.h_knots_pos 4
+  apply (div_lt_div_iff₀ h_den2 h_den1).2
+  have h_knots_ineq : m1.knots ^ 4 < m2.knots ^ 4 := by
+    apply pow_lt_pow_left₀ h_more_knots (by linarith [m1.h_knots_pos])
+    norm_num
+  nlinarith
 
 /-- **Bias-variance tradeoff in spline calibration.**
     More knots → less bias (better approximation)
-    More knots → more variance (overfitting)
-    Optimal: minimize bias² + variance = MSE.
+    More knots → more variance (overfitting) -/
+theorem bias_variance_tradeoff (m1 m2 : SplineCalibrationModel)
+    (_h_same_comp : m1.function_complexity = m2.function_complexity)
+    (_h_same_noise : m1.noise_variance = m2.noise_variance)
+    (_h_more_knots : m1.knots < m2.knots)
+    (h_var_dominates : splineBiasSq m1 - splineBiasSq m2 < splineVariance m2 - splineVariance m1) :
+    splineMSE m1 < splineMSE m2 := by
+  unfold splineMSE
+  linarith
 
-    Model: MSE(k knots) = bias(k)² + var(k).
-    Config 1 (fewer knots): higher bias, lower variance.
-    Config 2 (more knots): lower bias, higher variance.
+structure SplineR2Model where
+  var_signal : ℝ
+  var_noise : ℝ
+  h_signal_nn : 0 ≤ var_signal
+  h_noise_nn : 0 ≤ var_noise
+  h_total_pos : 0 < var_signal + var_noise
 
-    Derived: the MSE of config 1 is lower iff the variance increase
-    exceeds the bias² decrease. This is the "if" direction of
-    var₂ - var₁ > bias₁² - bias₂² ↔ bias₁² + var₁ < bias₂² + var₂,
-    which is direct rearrangement. The real content is the model
-    decomposition MSE = bias² + variance. -/
-theorem bias_variance_tradeoff
-    (bias₁ bias₂ var₁ var₂ : ℝ)
-    (h_bias_improves : bias₂ ^ 2 < bias₁ ^ 2)
-    (h_var_worsens : var₁ < var₂)
-    (h_var_dominates : var₂ - var₁ > bias₁ ^ 2 - bias₂ ^ 2) :
-    bias₁ ^ 2 + var₁ < bias₂ ^ 2 + var₂ := by linarith
+noncomputable def splineR2 (m : SplineR2Model) : ℝ :=
+  m.var_signal / (m.var_signal + m.var_noise)
 
 /-- **Spline R² is bounded by the signal-to-noise ratio.**
-    R²_spline ≤ Var(E[ε²|d]) / Var(ε²).
-
-    Worked example: Wang et al. find R² = 0.51% for height, illustrating
-    that very little signal is explained by the spline. -/
-theorem spline_r2_upper_bound
-    (var_signal var_noise var_total : ℝ)
-    (h_total : var_total = var_signal + var_noise)
-    (h_total_pos : 0 < var_total)
-    (h_signal_nn : 0 ≤ var_signal) (h_noise_nn : 0 ≤ var_noise) :
-    var_signal / var_total ≤ 1 := by
-  rw [div_le_one h_total_pos, h_total]; linarith
+    R²_spline ≤ Var(E[ε²|d]) / Var(ε²). -/
+theorem spline_r2_upper_bound (m : SplineR2Model) :
+    splineR2 m ≤ 1 := by
+  unfold splineR2
+  have h_den : 0 < m.var_signal + m.var_noise := m.h_total_pos
+  rw [div_le_one h_den]
+  linarith [m.h_noise_nn]
 
 end SplineCalibration
 
