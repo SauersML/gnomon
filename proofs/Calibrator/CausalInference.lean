@@ -34,27 +34,43 @@ each contributing a specific proportion of the total loss.
 
 section PathDecomposition
 
+structure PortabilityLossModel where
+  delta_LD : ℝ
+  delta_MAF : ℝ
+  delta_effect : ℝ
+  delta_env : ℝ
+  delta_tech : ℝ
+  h_LD : 0 ≤ delta_LD
+  h_MAF : 0 ≤ delta_MAF
+  h_effect : 0 ≤ delta_effect
+  h_env : 0 ≤ delta_env
+  h_tech : 0 ≤ delta_tech
+
+noncomputable def totalLoss (m : PortabilityLossModel) : ℝ :=
+  m.delta_LD + m.delta_MAF + m.delta_effect + m.delta_env + m.delta_tech
+
 /-- **Total portability loss decomposition.**
     Δ_total = Δ_LD + Δ_MAF + Δ_effect + Δ_env + Δ_technical
     Each component represents a distinct causal pathway. -/
-theorem total_loss_decomposition
-    (delta_total delta_LD delta_MAF delta_effect delta_env delta_tech : ℝ)
-    (h_decomp : delta_total = delta_LD + delta_MAF + delta_effect + delta_env + delta_tech)
-    (h_LD : 0 ≤ delta_LD) (h_MAF : 0 ≤ delta_MAF) (h_effect : 0 ≤ delta_effect)
-    (h_env : 0 ≤ delta_env) (h_tech : 0 ≤ delta_tech) :
-    delta_LD ≤ delta_total ∧ delta_MAF ≤ delta_total ∧
-    delta_effect ≤ delta_total ∧ delta_env ≤ delta_total ∧
-    delta_tech ≤ delta_total := by
+theorem total_loss_decomposition (m : PortabilityLossModel) :
+    m.delta_LD ≤ totalLoss m ∧ m.delta_MAF ≤ totalLoss m ∧
+    m.delta_effect ≤ totalLoss m ∧ m.delta_env ≤ totalLoss m ∧
+    m.delta_tech ≤ totalLoss m := by
+  unfold totalLoss
+  have h1 : 0 ≤ m.delta_LD := m.h_LD
+  have h2 : 0 ≤ m.delta_MAF := m.h_MAF
+  have h3 : 0 ≤ m.delta_effect := m.h_effect
+  have h4 : 0 ≤ m.delta_env := m.h_env
+  have h5 : 0 ≤ m.delta_tech := m.h_tech
   constructor <;> [skip; constructor <;> [skip; constructor <;> [skip; constructor]]] <;> linarith
 
 /-- **LD pathway is the largest contributor for most traits.**
     For non-immune traits, LD mismatch accounts for >50% of portability loss. -/
 theorem ld_dominant_pathway
-    (delta_total delta_LD : ℝ)
-    (h_total : 0 < delta_total)
-    (h_LD_large : delta_total / 2 < delta_LD)
-    (h_LD_le : delta_LD ≤ delta_total) :
-    1 / 2 < delta_LD / delta_total := by
+    (m : PortabilityLossModel)
+    (h_total : 0 < totalLoss m)
+    (h_LD_large : totalLoss m / 2 < m.delta_LD) :
+    1 / 2 < m.delta_LD / totalLoss m := by
   rw [div_lt_div_iff₀ (by norm_num : (0:ℝ) < 2) h_total]
   linarith
 
@@ -91,15 +107,27 @@ theorem selection_dominant_for_immune
           nlinarith [sq_abs ρ, sq_nonneg ρ]
       _ = presentDayPGSVariance V_A fst := one_mul _
 
+structure PathwayModel where
+  ld_effect : ℝ
+  maf_effect : ℝ
+  ld_maf_interaction : ℝ
+
+noncomputable def independentPathways (m : PathwayModel) : ℝ :=
+  m.ld_effect + m.maf_effect
+
+noncomputable def interactingPathways (m : PathwayModel) : ℝ :=
+  m.ld_effect + m.maf_effect + m.ld_maf_interaction
+
 /-- **Interaction effects between pathways.**
     Pathways are not fully independent: LD changes interact
     with MAF changes (LD × MAF interaction). -/
-theorem pathway_interactions_exist
-    (sum_individual total_with_interactions interaction : ℝ)
-    (h_interaction : total_with_interactions = sum_individual + interaction)
-    (h_nonzero : interaction ≠ 0) :
-    total_with_interactions ≠ sum_individual := by
-  rw [h_interaction]; intro h; apply h_nonzero; linarith
+theorem pathway_interactions_exist (m : PathwayModel)
+    (h_interaction : m.ld_maf_interaction ≠ 0) :
+    interactingPathways m ≠ independentPathways m := by
+  unfold interactingPathways independentPathways
+  intro h
+  apply h_interaction
+  linarith
 
 end PathDecomposition
 
@@ -113,13 +141,21 @@ on PGS accuracy into direct and indirect effects.
 
 section MediationAnalysis
 
+structure LinearMediationModel where
+  alpha : ℝ -- Effect of ancestry on mediator
+  beta : ℝ  -- Effect of mediator on outcome
+  gamma : ℝ -- Direct effect of ancestry on outcome
+
+noncomputable def indirectEffect (m : LinearMediationModel) : ℝ := m.alpha * m.beta
+noncomputable def directEffect (m : LinearMediationModel) : ℝ := m.gamma
+noncomputable def totalEffect (m : LinearMediationModel) : ℝ := m.gamma + m.alpha * m.beta
+
 /-- **Total effect = Direct effect + Indirect effect.**
     TE = DE + IE (in the linear case). -/
-theorem mediation_decomposition
-    (total_effect direct_effect indirect_effect : ℝ)
-    (h_decomp : total_effect = direct_effect + indirect_effect) :
-    -- Indirect effect is the total minus direct
-    indirect_effect = total_effect - direct_effect := by linarith
+theorem mediation_decomposition (m : LinearMediationModel) :
+  totalEffect m = directEffect m + indirectEffect m := by
+  unfold totalEffect directEffect indirectEffect
+  ring
 
 /-- **Proportion mediated.**
     PM = IE / TE = indirect / total. -/
@@ -435,26 +471,60 @@ theorem e_value_ge_one (rr : ℝ) (h_rr : 1 ≤ rr) :
   have : 0 ≤ Real.sqrt (rr * (rr - 1)) := Real.sqrt_nonneg _
   linarith
 
+structure LDReferenceModel where
+  signal_variance : ℝ
+  true_noise : ℝ
+  reference_mismatch : ℝ
+  h_sig : 0 < signal_variance
+  h_noise : 0 < true_noise
+  h_mismatch : 0 < reference_mismatch
+
+noncomputable def inSampleR2 (m : LDReferenceModel) : ℝ :=
+  m.signal_variance / (m.signal_variance + m.true_noise)
+
+noncomputable def externalReferenceR2 (m : LDReferenceModel) : ℝ :=
+  m.signal_variance / (m.signal_variance + m.true_noise + m.reference_mismatch)
+
 /-- **Sensitivity to LD reference mismatch.**
     Portability estimates are sensitive to the choice of LD reference.
-    Using in-sample LD vs. external reference can change R² by δ. -/
-theorem ld_reference_sensitivity
-    (r2_in_sample r2_external delta : ℝ)
-    (h_diff : r2_in_sample = r2_external + delta)
-    (h_delta : 0 < |delta|) :
-    r2_in_sample ≠ r2_external := by
-  rw [h_diff]; intro h; have : delta = 0 := by linarith
-  exact absurd (this ▸ h_delta) (by simp)
+    Using an external reference adds mismatch noise, strictly reducing estimated R². -/
+theorem ld_reference_sensitivity (m : LDReferenceModel) :
+  externalReferenceR2 m < inSampleR2 m := by
+  unfold inSampleR2 externalReferenceR2
+  have h_den1 : 0 < m.signal_variance + m.true_noise := by linarith [m.h_sig, m.h_noise]
+  have h_den2 : 0 < m.signal_variance + m.true_noise + m.reference_mismatch := by linarith [m.h_sig, m.h_noise, m.h_mismatch]
+  apply (div_lt_div_iff₀ h_den2 h_den1).2
+  have h_sig : 0 < m.signal_variance := m.h_sig
+  have h_mismatch : 0 < m.reference_mismatch := m.h_mismatch
+  nlinarith
+
+structure PhenotypeModel where
+  genetic_variance : ℝ
+  env_variance : ℝ
+  measurement_error : ℝ
+  h_gen_pos : 0 < genetic_variance
+  h_env_pos : 0 < env_variance
+  h_err_nonneg : 0 ≤ measurement_error
+
+noncomputable def observedHeritability (m : PhenotypeModel) : ℝ :=
+  m.genetic_variance / (m.genetic_variance + m.env_variance + m.measurement_error)
 
 /-- **Sensitivity to phenotype definition.**
-    Different phenotype definitions (self-report vs clinical,
-    ICD-9 vs ICD-10) can change portability estimates.
-    When the difference exceeds any threshold ε > 0, the estimates differ. -/
+    A phenotype definition with larger measurement error strictly reduces
+    the observed heritability (and thus portability estimates based on it). -/
 theorem phenotype_definition_matters
-    (port_def1 port_def2 ε : ℝ) (h_ε : 0 < ε)
-    (h_large_diff : ε < |port_def1 - port_def2|) :
-    port_def1 ≠ port_def2 := by
-  intro h; rw [h, sub_self, abs_zero] at h_large_diff; linarith
+    (m1 m2 : PhenotypeModel)
+    (h_same_gen : m1.genetic_variance = m2.genetic_variance)
+    (h_same_env : m1.env_variance = m2.env_variance)
+    (h_err_diff : m1.measurement_error < m2.measurement_error) :
+    observedHeritability m2 < observedHeritability m1 := by
+  unfold observedHeritability
+  have h_num_pos : 0 < m1.genetic_variance := m1.h_gen_pos
+  have h_den1_pos : 0 < m1.genetic_variance + m1.env_variance + m1.measurement_error := by linarith [m1.h_gen_pos, m1.h_env_pos, m1.h_err_nonneg]
+  have h_den2_pos : 0 < m2.genetic_variance + m2.env_variance + m2.measurement_error := by linarith [m2.h_gen_pos, m2.h_env_pos, m2.h_err_nonneg]
+  rw [h_same_gen, h_same_env] at *
+  apply (div_lt_div_iff₀ h_den2_pos h_den1_pos).2
+  nlinarith [h_num_pos, h_err_diff]
 
 end SensitivityAnalysis
 
