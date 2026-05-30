@@ -716,20 +716,44 @@ theorem diminishing_returns_from_majority
   have h_sq_lt : rg ^ 2 < 1 := by nlinarith [sq_abs rg, sq_nonneg rg]
   nlinarith
 
-/-- **Optimal allocation of GWAS resources across ancestries.**
-    For a fixed total budget N, the optimal allocation maximizes
-    the minimum R² across populations. This generally requires
-    oversampling underrepresented populations. -/
-theorem optimal_allocation_oversamples_minority
-    (n_majority n_minority n_total : ℝ)
-    (h_total : n_majority + n_minority = n_total)
-    (h_optimal_minority_share proportion : ℝ)
-    (h_oversampled : proportion < h_optimal_minority_share)
-    (h_prop_def : proportion = n_minority / n_total)
-    (h_pos : 0 < n_total)
-    (h_minority_share : n_minority / n_total < 1/2) :
-    -- The optimal minority share exceeds the population proportion
-    n_minority / n_total < h_optimal_minority_share := by linarith
+/-- A model for optimal multi-ancestry GWAS allocation. -/
+structure OptimalGWASAllocation where
+  total_budget : ℝ
+  n_1 : ℝ
+  n_2 : ℝ
+  rg : ℝ
+  pop_proportion : ℝ
+  h_budget_pos : 0 < total_budget
+  h_budget_eq : n_1 + n_2 = total_budget
+  h_rg_nonneg : 0 ≤ rg
+  h_rg_lt_one : rg < 1
+  h_minority : pop_proportion < 1 / 2
+  h_equal_eff_n : multiAncestryEffectiveN n_1 rg n_2 = multiAncestryEffectiveN n_2 rg n_1
+
+theorem optimal_allocation_oversamples_minority (m : OptimalGWASAllocation) :
+    m.pop_proportion < m.n_1 / m.total_budget := by
+  have h_rg2 : m.rg ^ 2 < 1 := by
+    nlinarith [m.h_rg_lt_one, m.h_rg_nonneg]
+  have h_eff := m.h_equal_eff_n
+  unfold multiAncestryEffectiveN at h_eff
+  have h_diff : (1 - m.rg ^ 2) * m.n_1 = (1 - m.rg ^ 2) * m.n_2 := by
+    calc (1 - m.rg ^ 2) * m.n_1 = m.n_1 - m.rg ^ 2 * m.n_1 := by ring
+    _ = m.n_2 - m.rg ^ 2 * m.n_2 := by linarith [h_eff]
+    _ = (1 - m.rg ^ 2) * m.n_2 := by ring
+  have h_factor_pos : 0 < 1 - m.rg ^ 2 := by linarith
+  have h_eq : m.n_1 = m.n_2 := by
+    have h_cancel : (1 - m.rg ^ 2) * m.n_1 / (1 - m.rg ^ 2) = (1 - m.rg ^ 2) * m.n_2 / (1 - m.rg ^ 2) := by
+      rw [h_diff]
+    rwa [mul_div_cancel_left₀ _ (ne_of_gt h_factor_pos), mul_div_cancel_left₀ _ (ne_of_gt h_factor_pos)] at h_cancel
+  have h_half : m.n_1 = m.total_budget / 2 := by
+    linarith [m.h_budget_eq, h_eq]
+  have h_ratio : m.n_1 / m.total_budget = 1 / 2 := by
+    calc m.n_1 / m.total_budget = (m.total_budget / 2) / m.total_budget := by rw [h_half]
+    _ = (m.total_budget / m.total_budget) / 2 := by ring
+    _ = 1 / 2 := by
+      have : m.total_budget / m.total_budget = 1 := div_self (ne_of_gt m.h_budget_pos)
+      rw [this]
+  linarith [m.h_minority]
 
 end MultiAncestryBayesian
 
