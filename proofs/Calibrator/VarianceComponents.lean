@@ -379,23 +379,51 @@ theorem liability_h2_larger_for_rare
     h2_observed * (prevalence * (1 - prevalence) / z_height ^ 2) by ring]
   exact lt_mul_of_one_lt_right h_obs_pos h_conversion_gt_one
 
+structure LiabilityModel where
+  h2_liability : ℝ
+  h2_observed : ℝ
+  prevalence : ℝ
+  z_height : ℝ
+  h_liab_eq : liabilityScaleH2 h2_observed prevalence z_height = h2_liability
+
 /-- **Prevalence-dependent h² creates portability confusion.**
     Two populations with the same genetic architecture but different
     prevalence have different observed h², which can be mistaken
     for a portability effect. -/
 theorem prevalence_confounds_h2_portability
-    (h2_liability : ℝ) (K₁ K₂ z₁ z₂ : ℝ)
-    (h_same_liability : 0 < h2_liability)
-    (h_K1 : 0 < K₁) (h_K2 : 0 < K₂)
-    (h_z1 : 0 < z₁) (h_z2 : 0 < z₂)
-    (h_diff_prev : K₁ ≠ K₂)
-    (h_diff_z : z₁ ≠ z₂)
-    (h_diff_ratio : K₁ * (1 - K₁) / z₁ ^ 2 ≠ K₂ * (1 - K₂) / z₂ ^ 2) :
-    -- Different observed h² even with same genetic architecture
-    liabilityScaleH2 1 K₁ z₁ ≠ liabilityScaleH2 1 K₂ z₂ := by
-  unfold liabilityScaleH2
-  simp
-  exact h_diff_ratio
+    (m1 m2 : LiabilityModel)
+    (h_same_liability : m1.h2_liability = m2.h2_liability)
+    (h_diff_ratio : m1.prevalence * (1 - m1.prevalence) / m1.z_height ^ 2 ≠
+                    m2.prevalence * (1 - m2.prevalence) / m2.z_height ^ 2)
+    (h_h2_pos : 0 < m1.h2_liability) :
+    m1.h2_observed ≠ m2.h2_observed := by
+  intro h_eq
+  have h1 := m1.h_liab_eq
+  have h2 := m2.h_liab_eq
+  unfold liabilityScaleH2 at h1 h2
+  rw [h_eq] at h1
+  rw [h_same_liability] at h1
+  have h1_rw : m2.h2_observed * (m1.prevalence * (1 - m1.prevalence) / m1.z_height ^ 2) = m2.h2_liability := by
+    calc m2.h2_observed * (m1.prevalence * (1 - m1.prevalence) / m1.z_height ^ 2)
+      _ = m2.h2_observed * m1.prevalence * (1 - m1.prevalence) / m1.z_height ^ 2 := by ring
+      _ = m2.h2_liability := h1
+  have h2_rw : m2.h2_observed * (m2.prevalence * (1 - m2.prevalence) / m2.z_height ^ 2) = m2.h2_liability := by
+    calc m2.h2_observed * (m2.prevalence * (1 - m2.prevalence) / m2.z_height ^ 2)
+      _ = m2.h2_observed * m2.prevalence * (1 - m2.prevalence) / m2.z_height ^ 2 := by ring
+      _ = m2.h2_liability := h2
+  have h_eq_prod : m2.h2_observed * (m1.prevalence * (1 - m1.prevalence) / m1.z_height ^ 2) =
+                   m2.h2_observed * (m2.prevalence * (1 - m2.prevalence) / m2.z_height ^ 2) := by
+    rw [h1_rw, h2_rw]
+  have h_obs_nz : m2.h2_observed ≠ 0 := by
+    intro hz
+    have hz2 : m2.h2_observed * (m2.prevalence * (1 - m2.prevalence) / m2.z_height ^ 2) = 0 := by
+      rw [hz, zero_mul]
+    rw [h2_rw] at hz2
+    linarith
+  have h_diff_ratio_eq : m1.prevalence * (1 - m1.prevalence) / m1.z_height ^ 2 =
+                         m2.prevalence * (1 - m2.prevalence) / m2.z_height ^ 2 := by
+    apply mul_left_cancel₀ h_obs_nz h_eq_prod
+  exact h_diff_ratio h_diff_ratio_eq
 
 end LiabilityScale
 
