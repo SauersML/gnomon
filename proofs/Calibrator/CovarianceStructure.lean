@@ -341,13 +341,28 @@ theorem higher_ld_scores_ratio
   rw [div_lt_one (by linarith)]
   exact h_higher
 
+structure LDModel where
+  N : ℝ
+  h2 : ℝ
+  M : ℝ
+  ell : ℝ
+  a : ℝ
+  expected_chi2 : ℝ
+  h_chi2_eq : expected_chi2 = ldsrExpectedChi2 N h2 M ell a
+
 /-- LDSR expected χ² increases with LD score. -/
-theorem ldsr_increases_with_ell (N h2 M ell₁ ell₂ a : ℝ)
-    (h_N : 0 < N) (h_h2 : 0 < h2) (h_M : 0 < M)
-    (h_ell : ell₁ < ell₂) :
-    ldsrExpectedChi2 N h2 M ell₁ a < ldsrExpectedChi2 N h2 M ell₂ a := by
-  unfold ldsrExpectedChi2
-  have : 0 < N * h2 / M := div_pos (mul_pos h_N h_h2) h_M
+theorem ldsr_increases_with_ell
+    (m1 m2 : LDModel)
+    (h_same_params : m1.N = m2.N ∧ m1.h2 = m2.h2 ∧ m1.M = m2.M ∧ m1.a = m2.a)
+    (h_N : 0 < m1.N) (h_h2 : 0 < m1.h2) (h_M : 0 < m1.M)
+    (h_ell : m1.ell < m2.ell) :
+    m1.expected_chi2 < m2.expected_chi2 := by
+  have h1 := m1.h_chi2_eq
+  have h2 := m2.h_chi2_eq
+  rcases h_same_params with ⟨hN, hh2, hM, ha⟩
+  unfold ldsrExpectedChi2 at h1 h2
+  rw [h1, h2, ← hN, ← hh2, ← hM, ← ha]
+  have : 0 < m1.N * m1.h2 / m1.M := div_pos (mul_pos h_N h_h2) h_M
   nlinarith
 
 /-- **Cross-ancestry LDSR.**

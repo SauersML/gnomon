@@ -319,6 +319,12 @@ theorem index_event_bias
     (h_effect : 0 < pgs_diagnosis_effect) :
     beta_prognosis_biased < beta_prognosis_true := by linarith
 
+structure SelectionModel where
+  beta_pop : ℝ
+  bias : ℝ
+  beta_biobank : ℝ
+  h_biobank_eq : beta_biobank = beta_pop + bias
+
 /-- **Berkson's paradox in biobank studies.**
     Biobank participants are healthier and more educated than
     the general population. This selection affects PGS associations
@@ -328,10 +334,18 @@ theorem index_event_bias
     If bias_eur ≠ bias_afr, then β_biobank_eur ≠ β_biobank_afr even when
     the true population-level effect is the same. -/
 theorem berkson_paradox_ancestry_specific
-    (beta_population bias_eur bias_afr : ℝ)
-    (h_diff_bias : bias_eur ≠ bias_afr) :
-    beta_population + bias_eur ≠ beta_population + bias_afr := by
-  intro h; exact h_diff_bias (by linarith)
+    (eur afr : SelectionModel)
+    (h_same_pop : eur.beta_pop = afr.beta_pop)
+    (h_diff_bias : eur.bias ≠ afr.bias) :
+    eur.beta_biobank ≠ afr.beta_biobank := by
+  intro h_eq
+  have h_eur := eur.h_biobank_eq
+  have h_afr := afr.h_biobank_eq
+  have h_eur_sub : eur.bias = eur.beta_biobank - eur.beta_pop := by linarith
+  have h_afr_sub : afr.bias = afr.beta_biobank - afr.beta_pop := by linarith
+  rw [h_eq, h_same_pop] at h_eur_sub
+  rw [← h_eur_sub] at h_afr_sub
+  exact h_diff_bias h_afr_sub.symm
 
 end ColliderBias
 
