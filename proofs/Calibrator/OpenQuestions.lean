@@ -295,42 +295,32 @@ theorem binary_precision_formula_exact (c : ConfusionMatrix) :
     precision where recall changes and the induced false-positive rate changes
     exactly as required by the precision identity. -/
 theorem precision_recall_divergence_exists :
-    ∃ (π p r₁ r₂ f₁ f₂ : ℝ),
-      0 < π ∧ π < 1 ∧
-      0 < p ∧ p < 1 ∧
-      0 < r₁ ∧ r₁ < r₂ ∧ r₂ ≤ 1 ∧
-      f₁ = π * r₁ * (1 - p) / ((1 - π) * p) ∧
-      f₂ = π * r₂ * (1 - p) / ((1 - π) * p) ∧
-      (π * r₁) / (π * r₁ + (1 - π) * f₁) = p ∧
-      (π * r₂) / (π * r₂ + (1 - π) * f₂) = p := by
-  refine ⟨1 / 2, 1 / 2, 1 / 4, 1 / 3,
-    (1 / 2) * (1 / 4) * (1 - 1 / 2) / ((1 - 1 / 2) * (1 / 2)),
-    (1 / 2) * (1 / 3) * (1 - 1 / 2) / ((1 - 1 / 2) * (1 / 2)), ?_⟩
+    ∃ (c₁ c₂ : ConfusionMatrix),
+      ConfusionMatrix.prevalence c₁ = ConfusionMatrix.prevalence c₂ ∧
+      ConfusionMatrix.precision c₁ = ConfusionMatrix.precision c₂ ∧
+      ConfusionMatrix.recallRate c₁ < ConfusionMatrix.recallRate c₂ ∧
+      ConfusionMatrix.fpr c₁ < ConfusionMatrix.fpr c₂ := by
+  let c₁ : ConfusionMatrix := {
+    tp := 0.1, fp := 0.1, tn := 0.7, fn := 0.1,
+    tp_nonneg := by norm_num, fp_nonneg := by norm_num,
+    tn_nonneg := by norm_num, fn_nonneg := by norm_num,
+    mass_one := by norm_num
+  }
+  let c₂ : ConfusionMatrix := {
+    tp := 0.15, fp := 0.15, tn := 0.65, fn := 0.05,
+    tp_nonneg := by norm_num, fp_nonneg := by norm_num,
+    tn_nonneg := by norm_num, fn_nonneg := by norm_num,
+    mass_one := by norm_num
+  }
+  use c₁, c₂
+  dsimp [ConfusionMatrix.prevalence, ConfusionMatrix.precision, ConfusionMatrix.recallRate, ConfusionMatrix.fpr]
   constructor
   · norm_num
   constructor
   · norm_num
   constructor
   · norm_num
-  constructor
   · norm_num
-  constructor
-  · norm_num
-  constructor
-  · norm_num
-  constructor
-  · norm_num
-  constructor
-  · rfl
-  constructor
-  · rfl
-  constructor
-  · simpa using
-      (ConfusionMatrix.constant_precision_construction
-        (π := 1 / 2) (p := 1 / 2) (r := 1 / 4) (by norm_num) (by norm_num) (by norm_num))
-  · simpa using
-      (ConfusionMatrix.constant_precision_construction
-        (π := 1 / 2) (p := 1 / 2) (r := 1 / 3) (by norm_num) (by norm_num) (by norm_num))
 
 end Question3
 
@@ -843,22 +833,47 @@ theorem prevalence_dominates_sensitivity_for_recall
     For asthma, precision and recall decay similarly → qualitatively similar.
     For T2D, they diverge → qualitatively different.
     The difference is driven by the prevalence-distance relationship. -/
-theorem different_diseases_different_portability_patterns
-    -- Asthma: both metrics decay
-    (prec_asthma_near prec_asthma_far : ℝ)
-    (rec_asthma_near rec_asthma_far : ℝ)
-    (h_prec_asthma_drops : prec_asthma_far < prec_asthma_near)
-    (h_rec_asthma_drops : rec_asthma_far < rec_asthma_near)
-    -- T2D: precision constant, recall increases
-    (prec_t2d_near prec_t2d_far : ℝ)
-    (rec_t2d_near rec_t2d_far : ℝ)
-    (h_prec_t2d_const : prec_t2d_near = prec_t2d_far)
-    (h_rec_t2d_up : rec_t2d_near < rec_t2d_far)
-    :
-    -- The diseases show qualitatively different portability patterns
-    (prec_asthma_far < prec_asthma_near ∧ rec_asthma_far < rec_asthma_near) ∧
-    (prec_t2d_near = prec_t2d_far ∧ rec_t2d_near < rec_t2d_far) :=
-  ⟨⟨h_prec_asthma_drops, h_rec_asthma_drops⟩, ⟨h_prec_t2d_const, h_rec_t2d_up⟩⟩
+theorem different_diseases_different_portability_patterns :
+    ∃ (asthma_near asthma_far t2d_near t2d_far : ConfusionMatrix),
+      -- Asthma drops in both
+      (ConfusionMatrix.precision asthma_far < ConfusionMatrix.precision asthma_near ∧
+       ConfusionMatrix.recallRate asthma_far < ConfusionMatrix.recallRate asthma_near) ∧
+      -- T2D precision constant, recall increases
+      (ConfusionMatrix.precision t2d_near = ConfusionMatrix.precision t2d_far ∧
+       ConfusionMatrix.recallRate t2d_near < ConfusionMatrix.recallRate t2d_far) := by
+  let asthma_near : ConfusionMatrix := {
+    tp := 0.4, fp := 0.1, tn := 0.4, fn := 0.1,
+    tp_nonneg := by norm_num, fp_nonneg := by norm_num,
+    tn_nonneg := by norm_num, fn_nonneg := by norm_num,
+    mass_one := by norm_num
+  }
+  let asthma_far : ConfusionMatrix := {
+    tp := 0.2, fp := 0.2, tn := 0.3, fn := 0.3,
+    tp_nonneg := by norm_num, fp_nonneg := by norm_num,
+    tn_nonneg := by norm_num, fn_nonneg := by norm_num,
+    mass_one := by norm_num
+  }
+  let t2d_near : ConfusionMatrix := {
+    tp := 0.2, fp := 0.2, tn := 0.3, fn := 0.3,
+    tp_nonneg := by norm_num, fp_nonneg := by norm_num,
+    tn_nonneg := by norm_num, fn_nonneg := by norm_num,
+    mass_one := by norm_num
+  }
+  let t2d_far : ConfusionMatrix := {
+    tp := 0.4, fp := 0.4, tn := 0.1, fn := 0.1,
+    tp_nonneg := by norm_num, fp_nonneg := by norm_num,
+    tn_nonneg := by norm_num, fn_nonneg := by norm_num,
+    mass_one := by norm_num
+  }
+  use asthma_near, asthma_far, t2d_near, t2d_far
+  dsimp [ConfusionMatrix.precision, ConfusionMatrix.recallRate]
+  constructor
+  · constructor
+    · norm_num
+    · norm_num
+  · constructor
+    · norm_num
+    · norm_num
 
 end DiseasePortability
 
