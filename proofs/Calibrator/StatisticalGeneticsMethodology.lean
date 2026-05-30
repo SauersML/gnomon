@@ -135,10 +135,21 @@ noncomputable def portabilityRatio (dr2_target dr2_source : ℝ) : ℝ :=
 
 /-- Portability ratio ≤ 1 when target PGS is weaker. -/
 theorem portability_ratio_le_one
-    (dr2_t dr2_s : ℝ) (h_s : 0 < dr2_s) (h_weaker : dr2_t ≤ dr2_s) :
+    (dr2_s : ℝ) (rho_g ld_adj : ℝ)
+    (h_s : 0 < dr2_s)
+    (h_rho : -1 ≤ rho_g) (h_rho_le : rho_g ≤ 1)
+    (h_ld : 0 ≤ ld_adj) (h_ld_le : ld_adj ≤ 1) :
+    let dr2_t := dr2_s * (rho_g ^ 2 * ld_adj)
     portabilityRatio dr2_t dr2_s ≤ 1 := by
+  intro dr2_t
   unfold portabilityRatio
-  rw [div_le_one h_s]; exact h_weaker
+  have h_sq : rho_g ^ 2 ≤ 1 := by nlinarith [sq_nonneg rho_g]
+  have h_prod : rho_g ^ 2 * ld_adj ≤ 1 := by
+    calc rho_g ^ 2 * ld_adj
+        ≤ 1 * 1 := mul_le_mul h_sq h_ld_le h_ld (by positivity)
+      _ = 1 := one_mul 1
+  rw [div_le_one h_s]
+  exact mul_le_of_le_one_right (le_of_lt h_s) h_prod
 
 end IncrementalR2
 
@@ -178,14 +189,29 @@ theorem overlap_bias
     standard CV overestimates R² due to shared segments.
     Family-blocked CV is closer to the true R² because it removes
     the upward bias from family sharing, so its absolute error is smaller. -/
-theorem blocked_cv_less_biased
-    (r2_standard_cv r2_blocked_cv r2_true : ℝ)
-    (h_standard_biased : r2_true < r2_standard_cv)
-    (h_blocked_between : r2_true ≤ r2_blocked_cv)
-    (h_blocked_closer_to_true : r2_blocked_cv < r2_standard_cv) :
-    |r2_blocked_cv - r2_true| < |r2_standard_cv - r2_true| := by
-  rw [abs_of_nonneg (by linarith), abs_of_nonneg (by linarith)]
-  linarith
+structure BlockCVModel (Ω : Type*) where
+  E : ExpFunctional Ω
+  true_effect : ℝ
+  blocked_est : Ω → ℝ
+  confounding_bias : Ω → ℝ
+  h_blocked_unbiased : E blocked_est = true_effect
+  h_confounding_pos : 0 < E confounding_bias
+
+theorem blocked_cv_less_biased (Ω : Type*) (m : BlockCVModel Ω) :
+    let standard_est := fun ω => m.blocked_est ω + m.confounding_bias ω
+    |m.E standard_est - m.true_effect| > |m.E m.blocked_est - m.true_effect| := by
+  intro standard_est
+  have he1 : m.E standard_est = m.E m.blocked_est + m.E m.confounding_bias := by
+    exact m.E.add_eval m.blocked_est m.confounding_bias
+  have h_diff_blk : m.E m.blocked_est - m.true_effect = 0 := sub_eq_zero.mpr m.h_blocked_unbiased
+  have h_diff_std : m.E standard_est - m.true_effect = m.E m.confounding_bias := by
+    calc m.E standard_est - m.true_effect
+      _ = m.E m.blocked_est + m.E m.confounding_bias - m.true_effect := by rw [he1]
+      _ = m.true_effect + m.E m.confounding_bias - m.true_effect := by rw [m.h_blocked_unbiased]
+      _ = m.E m.confounding_bias := by ring
+  rw [h_diff_std, h_diff_blk, abs_zero, gt_iff_lt]
+  have h_pos : 0 < m.E m.confounding_bias := m.h_confounding_pos
+  exact abs_pos.mpr (ne_of_gt h_pos)
 
 /- **Time-split validation for discovery bias.**
     If the PGS discovery includes newer data, temporal validation
