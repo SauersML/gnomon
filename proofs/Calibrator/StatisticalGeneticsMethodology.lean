@@ -395,20 +395,55 @@ drops to `3/4`.
 
 This formalizes the biological point that equal source `R²` does not determine
 cross-population portability without locus-resolved transport state. -/
+structure TwoPopLocusModel (m : ℕ) where
+  sourceSignal : Fin m → ℝ
+  targetTransport : Fin m → ℝ
+  residualVariance : ℝ
+  h_signal_nonneg : ∀ i, 0 ≤ sourceSignal i
+  h_transport_bounded : ∀ i, 0 ≤ targetTransport i ∧ targetTransport i ≤ 1
+  h_res_pos : 0 < residualVariance
+
+noncomputable def TwoPopLocusModel.sourceVariance {m : ℕ} (model : TwoPopLocusModel m) : ℝ :=
+  ∑ i, model.sourceSignal i
+
+noncomputable def TwoPopLocusModel.targetVariance {m : ℕ} (model : TwoPopLocusModel m) : ℝ :=
+  ∑ i, model.sourceSignal i * model.targetTransport i
+
+noncomputable def TwoPopLocusModel.sourceR2 {m : ℕ} (model : TwoPopLocusModel m) : ℝ :=
+  TransportedMetrics.r2FromSignalVariance model.sourceVariance model.residualVariance
+
+noncomputable def TwoPopLocusModel.targetR2 {m : ℕ} (model : TwoPopLocusModel m) : ℝ :=
+  TransportedMetrics.r2FromSignalVariance model.targetVariance model.residualVariance
+
 theorem same_source_r2_different_portability_two_locus_witness :
-    let sourceSignal : Fin 2 → ℝ := fun _ => 1
-    let stableTransport : Fin 2 → ℝ := fun _ => 1
-    let brokenTransport : Fin 2 → ℝ := fun i => if i = 0 then 1 else 0
-    let sourceVariance : ℝ := ∑ l, sourceSignal l
-    let stableTargetVariance : ℝ := ∑ l, sourceSignal l * stableTransport l
-    let brokenTargetVariance : ℝ := ∑ l, sourceSignal l * brokenTransport l
-    let sourceR2 := TransportedMetrics.r2FromSignalVariance sourceVariance 1
-    let stableTargetR2 := TransportedMetrics.r2FromSignalVariance stableTargetVariance 1
-    let brokenTargetR2 := TransportedMetrics.r2FromSignalVariance brokenTargetVariance 1
-    sourceR2 = stableTargetR2 ∧
-    brokenTargetR2 < stableTargetR2 ∧
-    brokenTargetR2 / sourceR2 = (3 : ℝ) / 4 := by
-  simp [TransportedMetrics.r2FromSignalVariance]
+    ∃ (stable broken : TwoPopLocusModel 2),
+      stable.residualVariance = broken.residualVariance ∧
+      stable.sourceSignal = broken.sourceSignal ∧
+      stable.sourceR2 = broken.sourceR2 ∧
+      broken.targetR2 < stable.targetR2 ∧
+      broken.targetR2 / broken.sourceR2 = (3 : ℝ) / 4 := by
+  use {
+    sourceSignal := fun _ => 1,
+    targetTransport := fun _ => 1,
+    residualVariance := 1,
+    h_signal_nonneg := by intro i; positivity,
+    h_transport_bounded := by intro i; exact ⟨by positivity, by linarith⟩,
+    h_res_pos := by positivity
+  }
+  use {
+    sourceSignal := fun _ => 1,
+    targetTransport := fun i => if i = 0 then 1 else 0,
+    residualVariance := 1,
+    h_signal_nonneg := by intro i; positivity,
+    h_transport_bounded := by
+      intro i; split_ifs
+      · exact ⟨by positivity, by linarith⟩
+      · exact ⟨by positivity, by linarith⟩
+    h_res_pos := by positivity
+  }
+  simp [TwoPopLocusModel.sourceR2, TwoPopLocusModel.targetR2,
+        TwoPopLocusModel.sourceVariance, TwoPopLocusModel.targetVariance,
+        TransportedMetrics.r2FromSignalVariance]
   norm_num
 
 end SourceR2Insufficiency
