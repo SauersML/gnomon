@@ -160,14 +160,22 @@ section CrossValidation
     If the GWAS sample overlaps with the evaluation sample,
     R² is biased upward by approximately p/n where p is the
     number of SNPs in the PGS. -/
-theorem overlap_bias
-    (p_snps n_overlap : ℝ)
-    (h_p : 0 < p_snps) (h_n : 0 < n_overlap)
-    (h_n_large : p_snps < n_overlap) :
-    0 < p_snps / n_overlap ∧ p_snps / n_overlap < 1 := by
-  constructor
-  · exact div_pos h_p h_n
-  · rw [div_lt_one h_n]; exact h_n_large
+structure OverlapBiasModel where
+  p_snps : ℝ
+  n_overlap : ℝ
+  r2_true : ℝ
+  h_p : 0 < p_snps
+  h_n : 0 < n_overlap
+  h_r2_true : 0 ≤ r2_true
+
+noncomputable def apparentR2 (m : OverlapBiasModel) : ℝ :=
+  m.r2_true + m.p_snps / m.n_overlap
+
+theorem overlap_bias (m : OverlapBiasModel) :
+    m.r2_true < apparentR2 m := by
+  unfold apparentR2
+  have h_bias_pos : 0 < m.p_snps / m.n_overlap := div_pos m.h_p m.h_n
+  linarith
 
 /- **Portability assessment requires population-specific validation.**
     R² must be evaluated in each target population separately.
@@ -239,12 +247,55 @@ theorem effective_n_pos (se : ℝ) (h_se : 0 < se) :
     Random effects: allows β to vary with between-population variance tau².
     When tau² > 0, the random effects SE is larger (wider CI) because
     it adds tau² to the within-study variance. -/
-theorem random_effects_captures_heterogeneity
-    (se_fixed tau_sq : ℝ) -- fixed-effects SE and between-population variance
-    (h_se : 0 < se_fixed) (h_heterogeneous : 0 < tau_sq) :
-    -- Random effects SE² = fixed SE² + tau² > fixed SE²
-    se_fixed ^ 2 < se_fixed ^ 2 + tau_sq := by
-  linarith
+structure MetaAnalysisModel (k : ℕ) where
+  study_se : Fin k → ℝ
+  tau_sq : ℝ
+  h_se_pos : ∀ i, 0 < study_se i
+  h_tau_pos : 0 < tau_sq
+
+noncomputable def fixed_effects_weight {k : ℕ} (m : MetaAnalysisModel k) (i : Fin k) : ℝ :=
+  1 / (m.study_se i) ^ 2
+
+noncomputable def random_effects_weight {k : ℕ} (m : MetaAnalysisModel k) (i : Fin k) : ℝ :=
+  1 / ((m.study_se i) ^ 2 + m.tau_sq)
+
+theorem weight_inequality {k : ℕ} (m : MetaAnalysisModel k) (i : Fin k) :
+    random_effects_weight m i < fixed_effects_weight m i := by
+  unfold random_effects_weight fixed_effects_weight
+  have h1 : 0 < (m.study_se i) ^ 2 := sq_pos_of_pos (m.h_se_pos i)
+  have h2 : 0 < (m.study_se i) ^ 2 + m.tau_sq := by linarith [m.h_tau_pos]
+  apply div_lt_div_of_pos_left
+  · exact zero_lt_one
+  · exact h1
+  · linarith [m.h_tau_pos]
+
+noncomputable def fixed_effects_variance {k : ℕ} (m : MetaAnalysisModel k) : ℝ :=
+  1 / ∑ i, fixed_effects_weight m i
+
+noncomputable def random_effects_variance {k : ℕ} (m : MetaAnalysisModel k) : ℝ :=
+  1 / ∑ i, random_effects_weight m i
+
+theorem random_effects_captures_heterogeneity {k : ℕ} (m : MetaAnalysisModel k) [Nonempty (Fin k)] :
+    fixed_effects_variance m < random_effects_variance m := by
+  unfold fixed_effects_variance random_effects_variance
+  have h_sum_lt : ∑ i, random_effects_weight m i < ∑ i, fixed_effects_weight m i := by
+    apply Finset.sum_lt_sum
+    · intro i _
+      exact le_of_lt (weight_inequality m i)
+    · obtain ⟨i₀⟩ := id ‹Nonempty (Fin k)›
+      use i₀
+      constructor
+      · exact Finset.mem_univ i₀
+      · exact weight_inequality m i₀
+  have h_sum_re_pos : 0 < ∑ i, random_effects_weight m i := by
+    apply Finset.sum_pos
+    · intro i _
+      unfold random_effects_weight
+      have hz : 0 < (m.study_se i) ^ 2 := sq_pos_of_pos (m.h_se_pos i)
+      have : 0 < (m.study_se i) ^ 2 + m.tau_sq := by linarith [m.h_tau_pos]
+      exact one_div_pos.mpr this
+    · exact Finset.univ_nonempty
+  apply div_lt_div_of_pos_left zero_lt_one h_sum_re_pos h_sum_lt
 
 end SummaryStatPGS
 
