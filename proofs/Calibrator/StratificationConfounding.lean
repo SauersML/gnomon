@@ -769,6 +769,10 @@ theorem larger_sample_more_power
   · exact div_nonneg (le_of_lt h_var) (le_of_lt (by linarith : 0 < n₂))
   · exact div_lt_div_of_pos_left h_var h_n₁ h_n
 
+/-- Required sample size for a given effect size R². -/
+noncomputable def requiredSampleSize (r2 : ℝ) : ℝ :=
+  1 / r2
+
 /-- **Small portability differences require large samples.**
     When R² of the distance-on-error relationship is small, enormous
     samples are needed to detect this reliably.
@@ -776,14 +780,12 @@ theorem larger_sample_more_power
     Worked example: Wang et al.'s finding of R² ≈ 0.5% for
     distance-on-error illustrates this. -/
 theorem small_effect_needs_large_n
-    (r2_effect n_required ub : ℝ)
+    (r2_effect ub : ℝ)
     (h_small : r2_effect ≤ ub) (h_ub_pos : 0 < ub)
-    (h_formula : n_required ≥ 1 / r2_effect)
     (h_effect_pos : 0 < r2_effect) :
-    n_required ≥ 1 / ub := by
-  calc n_required ≥ 1 / r2_effect := h_formula
-    _ ≥ 1 / ub := by
-        exact div_le_div_of_nonneg_left (le_of_lt one_pos) h_effect_pos h_small
+    requiredSampleSize ub ≤ requiredSampleSize r2_effect := by
+  unfold requiredSampleSize
+  exact div_le_div_of_nonneg_left (le_of_lt one_pos) h_effect_pos h_small
 
 end PowerAnalysis
 
