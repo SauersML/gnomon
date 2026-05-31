@@ -157,17 +157,37 @@ theorem mediated_pleiotropy_portability_bound
     (h_port_nn : 0 ≤ port_A) :
     α * port_A ≤ port_A := by nlinarith
 
+structure PleiotropyModel (m : ℕ) where
+  -- Variance of shared components
+  var_shared : Fin m → ℝ
+  -- Variance of unique components
+  var_unique : Fin m → ℝ
+  -- Degradation of shared components
+  delta_shared : Fin m → ℝ
+  -- Degradation of unique components
+  delta_unique : Fin m → ℝ
+
+  h_var_shared_nn : ∀ i, 0 ≤ var_shared i
+  h_var_unique_nn : ∀ i, 0 ≤ var_unique i
+  h_delta_shared_nn : ∀ i, 0 ≤ delta_shared i
+  h_selection : ∀ i, delta_shared i < delta_unique i
+  h_base : ∀ i, delta_unique i < 1
+
+noncomputable def portable_shared_var (model : PleiotropyModel m) : ℝ :=
+  ∑ i, ((1 - model.delta_shared i) * model.var_shared i)
+
+noncomputable def portable_unique_var (model : PleiotropyModel m) : ℝ :=
+  ∑ i, ((1 - model.delta_unique i) * model.var_unique i)
+
 /-- **Trait-specific genetic components are less portable.**
     The component of genetic variance unique to a trait (not shared
     via pleiotropy) is more likely to be affected by population-specific
     selection. Shared components degrade by δ_shared, unique by δ_unique,
     where δ_unique > δ_shared due to selection. -/
-theorem unique_component_less_portable
-    (port_base δ_shared δ_unique : ℝ)
-    (h_selection : δ_shared < δ_unique)
-    (h_shared_nn : 0 < δ_shared)
-    (h_base : δ_unique < port_base) :
-    port_base - δ_unique < port_base - δ_shared := by linarith
+theorem unique_component_less_portable (m : ℕ) (model : PleiotropyModel m) (i : Fin m) :
+    1 - model.delta_unique i < 1 - model.delta_shared i := by
+  have h := model.h_selection i
+  linarith
 
 /-- **Decomposing trait heritability into shared and unique.**
     h²_trait = h²_shared + h²_unique where h²_shared comes from

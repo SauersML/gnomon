@@ -186,59 +186,138 @@ and the GWAS sample size.
 
 section PGSCeiling
 
+structure PGSCeilingModel (m : ℕ) where
+  true_var : Fin m → ℝ
+  captured_fraction : Fin m → ℝ
+
+  h_var_pos : ∀ i, 0 ≤ true_var i
+  h_frac_nonneg : ∀ i, 0 ≤ captured_fraction i
+  h_frac_le_one : ∀ i, captured_fraction i ≤ 1
+
+noncomputable def snp_h2 (model : PGSCeilingModel m) : ℝ :=
+  ∑ i, model.true_var i
+
+noncomputable def pgs_r2 (model : PGSCeilingModel m) : ℝ :=
+  ∑ i, (model.captured_fraction i * model.true_var i)
+
 /-- **PGS R² ceiling from heritability.**
     R²_PGS ≤ h²_SNP. No PGS can explain more variance than what's
     genetically tagged. The PGS explains a fraction f of tagged
     additive variance, so R²_PGS = f × h²_SNP ≤ h²_SNP. -/
-theorem pgs_r2_ceiling_from_h2
-    (h2_snp f : ℝ)
-    (h_h2 : 0 < h2_snp)
-    (h_f_nn : 0 ≤ f) (h_f_le : f ≤ 1) :
-    h2_snp * f ≤ h2_snp := by
-  exact mul_le_of_le_one_right (le_of_lt h_h2) h_f_le
+theorem pgs_r2_ceiling_from_h2 (m : ℕ) (model : PGSCeilingModel m) :
+    pgs_r2 model ≤ snp_h2 model := by
+  unfold pgs_r2 snp_h2
+  apply Finset.sum_le_sum
+  intro i _
+  have h_var := model.h_var_pos i
+  have h_frac := model.h_frac_le_one i
+  exact mul_le_of_le_one_left h_var h_frac
+
+structure GWASPowerCeilingModel (m : ℕ) where
+  true_var : Fin m → ℝ
+  power_fraction : Fin m → ℝ
+
+  h_var_pos : ∀ i, 0 ≤ true_var i
+  h_power_nn : ∀ i, 0 ≤ power_fraction i
+  h_power_le : ∀ i, power_fraction i ≤ 1
+
+noncomputable def power_snp_h2 (model : GWASPowerCeilingModel m) : ℝ :=
+  ∑ i, model.true_var i
+
+noncomputable def power_pgs_r2 (model : GWASPowerCeilingModel m) : ℝ :=
+  ∑ i, (model.power_fraction i * model.true_var i)
 
 /-- **PGS R² ceiling from GWAS power.**
     R²_PGS ≤ h²_SNP × (1 - (1-power)^m)
     where power is per-SNP GWAS power and m is number of causal SNPs.
     With finite sample size, not all SNPs are discovered. -/
-theorem pgs_r2_ceiling_from_gwas_power
-    (h2_snp power_fraction : ℝ)
-    (h_h2 : 0 < h2_snp) (h_h2_le : h2_snp ≤ 1)
-    (h_power : 0 < power_fraction) (h_power_le : power_fraction ≤ 1) :
-    h2_snp * power_fraction ≤ h2_snp := by
-  exact mul_le_of_le_one_right (le_of_lt h_h2) h_power_le
+theorem pgs_r2_ceiling_from_gwas_power (m : ℕ) (model : GWASPowerCeilingModel m) :
+    power_pgs_r2 model ≤ power_snp_h2 model := by
+  unfold power_pgs_r2 power_snp_h2
+  apply Finset.sum_le_sum
+  intro i _
+  have h_var := model.h_var_pos i
+  have h_frac := model.h_power_le i
+  exact mul_le_of_le_one_left h_var h_frac
+
+structure PGSPortabilityCeilingModel (m : ℕ) where
+  true_var : Fin m → ℝ
+  power_fraction : Fin m → ℝ
+  portability_ratio : Fin m → ℝ
+
+  h_var_pos : ∀ i, 0 ≤ true_var i
+  h_power_nn : ∀ i, 0 ≤ power_fraction i
+  h_power_le : ∀ i, power_fraction i ≤ 1
+  h_port_nn : ∀ i, 0 ≤ portability_ratio i
+  h_port_le : ∀ i, portability_ratio i ≤ 1
+
+noncomputable def port_snp_h2 (model : PGSPortabilityCeilingModel m) : ℝ :=
+  ∑ i, model.true_var i
+
+noncomputable def port_target_r2 (model : PGSPortabilityCeilingModel m) : ℝ :=
+  ∑ i, (model.power_fraction i * model.portability_ratio i * model.true_var i)
 
 /-- **Portability further reduces the ceiling.**
     R²_PGS_target ≤ h²_SNP × power_fraction × portability_ratio. -/
-theorem portability_reduces_ceiling
-    (h2_snp power_frac port_ratio : ℝ)
-    (h_h2 : 0 < h2_snp) (h_power : 0 < power_frac) (h_port : 0 < port_ratio)
-    (h_power_le : power_frac ≤ 1) (h_port_le : port_ratio ≤ 1) :
-    h2_snp * power_frac * port_ratio ≤ h2_snp := by
-  calc h2_snp * power_frac * port_ratio
-      ≤ h2_snp * 1 * 1 := by
-        apply mul_le_mul
-        · exact mul_le_mul_of_nonneg_left h_power_le (le_of_lt h_h2)
-        · exact h_port_le
-        · exact le_of_lt h_port
-        · exact mul_nonneg (le_of_lt h_h2) (by linarith)
-    _ = h2_snp := by ring
+theorem portability_reduces_ceiling (m : ℕ) (model : PGSPortabilityCeilingModel m) :
+    port_target_r2 model ≤ port_snp_h2 model := by
+  unfold port_target_r2 port_snp_h2
+  apply Finset.sum_le_sum
+  intro i _
+  have h_var := model.h_var_pos i
+  have h_frac1 := model.h_power_le i
+  have h_frac2 := model.h_port_le i
+  have h_frac1_nn := model.h_power_nn i
+  have h_frac2_nn := model.h_port_nn i
+  have h_prod_le : model.power_fraction i * model.portability_ratio i ≤ 1 := by
+    nlinarith
+  exact mul_le_of_le_one_left h_var h_prod_le
+
+structure PGSThreeWayCeilingModel (m : ℕ) where
+  true_var : Fin m → ℝ
+  power_fraction : Fin m → ℝ
+  portability_ratio : Fin m → ℝ
+  h2_ceiling : Fin m → ℝ
+
+  h_var_pos : ∀ i, 0 ≤ true_var i
+  h_power_nn : ∀ i, 0 ≤ power_fraction i
+  h_power_le : ∀ i, power_fraction i ≤ 1
+  h_port_nn : ∀ i, 0 ≤ portability_ratio i
+  h_port_le : ∀ i, portability_ratio i ≤ 1
+  h_h2_nn : ∀ i, 0 ≤ h2_ceiling i
+  h_h2_le : ∀ i, h2_ceiling i ≤ 1
+
+noncomputable def three_way_target_r2 (model : PGSThreeWayCeilingModel m) : ℝ :=
+  ∑ i, (model.h2_ceiling i * model.power_fraction i * model.portability_ratio i * model.true_var i)
+
+noncomputable def three_way_max_r2 (model : PGSThreeWayCeilingModel m) : ℝ :=
+  ∑ i, model.true_var i
 
 /-- **The three-way ceiling decomposition.**
     R²_target ≤ h² × (GWAS power) × (portability ratio).
     Each factor is ≤ 1, and the product can be very small. -/
-theorem three_way_ceiling
-    (h2 gwas_power port_ratio target_r2 : ℝ)
-    (h_h2_le : h2 ≤ 1) (h_power_le : gwas_power ≤ 1)
-    (h_port_le : port_ratio ≤ 1)
-    (h_h2_nn : 0 ≤ h2) (h_power_nn : 0 ≤ gwas_power) (h_port_nn : 0 ≤ port_ratio)
-    (h_bound : target_r2 ≤ h2 * gwas_power * port_ratio) :
-    target_r2 ≤ 1 := by
-  have : h2 * gwas_power * port_ratio ≤ 1 := by
-    calc h2 * gwas_power * port_ratio
-        ≤ 1 * 1 * 1 := by nlinarith [mul_nonneg h_h2_nn h_power_nn]
+theorem three_way_ceiling (m : ℕ) (model : PGSThreeWayCeilingModel m) :
+    three_way_target_r2 model ≤ three_way_max_r2 model := by
+  unfold three_way_target_r2 three_way_max_r2
+  apply Finset.sum_le_sum
+  intro i _
+  have h_var := model.h_var_pos i
+  have h1 := model.h_h2_le i
+  have h1_n := model.h_h2_nn i
+  have h2 := model.h_power_le i
+  have h2_n := model.h_power_nn i
+  have h3 := model.h_port_le i
+  have h3_n := model.h_port_nn i
+  have h_prod1 : model.h2_ceiling i * model.power_fraction i ≤ 1 := by
+    calc model.h2_ceiling i * model.power_fraction i
+      ≤ 1 * 1 := by nlinarith
       _ = 1 := by ring
-  linarith
+  have h_prod1_n : 0 ≤ model.h2_ceiling i * model.power_fraction i := by nlinarith
+  have h_prod_le : model.h2_ceiling i * model.power_fraction i * model.portability_ratio i ≤ 1 := by
+    calc model.h2_ceiling i * model.power_fraction i * model.portability_ratio i
+      ≤ 1 * 1 := by nlinarith
+      _ = 1 := by ring
+  exact mul_le_of_le_one_left h_var h_prod_le
 
 end PGSCeiling
 
