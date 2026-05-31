@@ -72,17 +72,32 @@ theorem cross_term_bounded
       _ = r2_A := mul_one _
       _ ≤ max r2_A r2_B := le_max_left _ _
 
+/-- Model of R² in an admixed population. -/
+structure AdmixedR2Model where
+  /-- Ancestry proportion of ancestry A. -/
+  alpha : ℝ
+  /-- R² for ancestry A component. -/
+  r2_A : ℝ
+  /-- R² for ancestry B component. -/
+  r2_B : ℝ
+  h_alpha_bounds : 0 < alpha ∧ alpha < 1
+  h_A_better : r2_B < r2_A
+
+/-- Expected R² assuming cross-term R² is at least r2_B. -/
+noncomputable def expected_admixed_r2 (m : AdmixedR2Model) : ℝ :=
+  (m.alpha ^ 2) * m.r2_A + ((1 - m.alpha) ^ 2) * m.r2_B + 2 * m.alpha * (1 - m.alpha) * m.r2_B
+
 /-- **Admixed R² is intermediate between ancestry-specific R²s.**
     For α ∈ (0,1), R²(α) is between R²_B and R²_A (when R²_A > R²_B). -/
 theorem admixed_r2_intermediate
-    (α r2_A r2_B : ℝ)
-    (h_α : 0 < α) (h_α1 : α < 1)
-    (h_AB : r2_B < r2_A) :
-    -- With r2_cross = geometric mean, admixed R² is a weighted combination
-    -- Simplification: when r2_cross = r2_B (lower bound)
-    r2_B < α ^ 2 * r2_A + (1 - α) ^ 2 * r2_B + 2 * α * (1 - α) * r2_B := by
-  have h1 : 0 < α ^ 2 := sq_pos_of_pos h_α
-  nlinarith [sq_nonneg (1 - α)]
+    (m : AdmixedR2Model) :
+    m.r2_B < expected_admixed_r2 m := by
+  dsimp [expected_admixed_r2]
+  have h1 : 0 < m.alpha ^ 2 := sq_pos_of_pos m.h_alpha_bounds.1
+  have h_alpha := m.h_alpha_bounds.1
+  have h_alpha1 := m.h_alpha_bounds.2
+  have h_AB := m.h_A_better
+  nlinarith [sq_nonneg (1 - m.alpha)]
 
 end GlobalVsLocalAncestry
 
@@ -170,36 +185,78 @@ section AdmixtureMapping
     At a causal locus, the phenotype correlates with local ancestry
     if the causal allele has different frequency across ancestries. -/
 
+/-- Model of loci discovered by different mapping strategies. -/
+structure MappingOverlapModel (Locus : Type) [DecidableEq Locus] where
+  /-- Set of loci discovered by standard GWAS. -/
+  gwas_hits : Finset Locus
+  /-- Set of loci discovered by admixture mapping. -/
+  admixture_hits : Finset Locus
+  /-- Loci that contribute to portability loss across ancestries. -/
+  portability_loci : Finset Locus
+  /-- The intersection of GWAS and admixture hits identifies portability loci. -/
+  h_intersection : gwas_hits ∩ admixture_hits ⊆ portability_loci
+
 /-- **Admixture mapping is complementary to GWAS.**
     GWAS finds SNP-trait associations; admixture mapping finds
     loci where ancestry matters. The intersection identifies
     loci contributing to portability loss. -/
 theorem admixture_mapping_identifies_portability_loci
-    (n_gwas_hits n_admixture_hits n_overlap n_portability_loci : ℕ)
-    (h_overlap_informative : n_overlap ≤ n_portability_loci)
-    (h_overlap_le_gwas : n_overlap ≤ n_gwas_hits)
-    (h_overlap_le_admix : n_overlap ≤ n_admixture_hits) :
-    n_overlap ≤ min n_gwas_hits n_admixture_hits := by
-  exact le_min h_overlap_le_gwas h_overlap_le_admix
+    {Locus : Type} [DecidableEq Locus]
+    (m : MappingOverlapModel Locus)
+    (l : Locus)
+    (h_gwas : l ∈ m.gwas_hits)
+    (h_admix : l ∈ m.admixture_hits) :
+    l ∈ m.portability_loci := by
+  apply m.h_intersection
+  exact Finset.mem_inter.mpr ⟨h_gwas, h_admix⟩
+
+/-- Model for admixture mapping power at a specific locus. -/
+structure AdmixtureLocusModel where
+  /-- Sample size. -/
+  n : ℝ
+  /-- Fixation index (Fst) at the locus between the admixing populations. -/
+  fst : ℝ
+  /-- Effect size of the locus. -/
+  beta : ℝ
+  h_n_pos : 0 < n
+  h_fst_pos : 0 < fst
+  h_beta_nz : beta ≠ 0
+
+/-- The statistical power proxy for admixture mapping. -/
+noncomputable def admixture_power_proxy (m : AdmixtureLocusModel) : ℝ :=
+  m.n * m.fst * (m.beta ^ 2)
 
 /-- **Admixture mapping power depends on Fst at the locus.**
     Power ∝ n × Fst_locus × β². High Fst loci are easier to detect
     and also the ones most responsible for portability loss. -/
 theorem admixture_power_proportional_to_fst
-    (n : ℝ) (fst β : ℝ)
-    (h_n : 0 < n) (h_fst₁ : 0 < fst) (h_β : β ≠ 0) :
-    0 < n * fst * β ^ 2 := by
-  exact mul_pos (mul_pos h_n h_fst₁) (sq_pos_of_ne_zero h_β)
+    (m : AdmixtureLocusModel) :
+    0 < admixture_power_proxy m := by
+  dsimp [admixture_power_proxy]
+  exact mul_pos (mul_pos m.h_n_pos m.h_fst_pos) (sq_pos_of_ne_zero m.h_beta_nz)
+
+/-- Model for ancestry-informed portability correction. -/
+structure PortabilityCorrectionModel where
+  /-- Difference in true marginal effect sizes between ancestries. -/
+  delta_beta : ℝ
+  /-- Local Fst at the correcting locus. -/
+  fst_locus : ℝ
+  h_delta_beta_pos : 0 < delta_beta
+  h_fst_pos : 0 < fst_locus
+
+/-- The estimated correction size for the PGS. -/
+noncomputable def pgs_correction_size (m : PortabilityCorrectionModel) : ℝ :=
+  m.delta_beta * m.fst_locus
 
 /-- **Admixture-informed portability correction.**
     At loci where admixture mapping detects a signal, we can
     use ancestry-specific effects to correct the PGS.
     The correction size is proportional to Δβ × Fst_locus. -/
 theorem correction_proportional_to_delta_beta_fst
-    (Δβ fst_locus correction : ℝ)
-    (h_correction : correction = Δβ * fst_locus)
-    (h_Δβ : 0 < Δβ) (h_fst : 0 < fst_locus) :
-    0 < correction := by rw [h_correction]; exact mul_pos h_Δβ h_fst
+    (m : PortabilityCorrectionModel) :
+    0 < pgs_correction_size m := by
+  dsimp [pgs_correction_size]
+  exact mul_pos m.h_delta_beta_pos m.h_fst_pos
 
 end AdmixtureMapping
 
@@ -222,14 +279,32 @@ section Tractor
     This directly estimates the ancestry-specific effects needed
     for portable PGS construction. -/
 
+/-- Model of ancestry-specific effective sample size in admixed populations (Tractor method). -/
+structure TractorSampleModel where
+  /-- Total sample size of the admixed cohort. -/
+  n_total : ℝ
+  /-- Global ancestry proportion for ancestry A. -/
+  alpha : ℝ
+  h_n_pos : 0 < n_total
+  h_alpha_bounds : 0 < alpha ∧ alpha < 1
+
+/-- Effective sample size for ancestry A component. -/
+noncomputable def effective_n_A (m : TractorSampleModel) : ℝ :=
+  m.alpha * m.n_total
+
+/-- Effective sample size for ancestry B component. -/
+noncomputable def effective_n_B (m : TractorSampleModel) : ℝ :=
+  (1 - m.alpha) * m.n_total
+
 /-- **Tractor requires large admixed sample size.**
     Effective per-ancestry N ≈ α × N_admixed for ancestry proportion α.
     Both ancestry components need adequate N for stable estimation. -/
 theorem tractor_effective_n
-    (n_admixed α : ℝ)
-    (h_n : 0 < n_admixed) (h_α : 0 < α) (h_α1 : α < 1) :
-    0 < α * n_admixed ∧ 0 < (1 - α) * n_admixed := by
-  exact ⟨mul_pos h_α h_n, mul_pos (by linarith) h_n⟩
+    (m : TractorSampleModel) :
+    0 < effective_n_A m ∧ 0 < effective_n_B m := by
+  constructor
+  · exact mul_pos m.h_alpha_bounds.1 m.h_n_pos
+  · exact mul_pos (sub_pos.mpr m.h_alpha_bounds.2) m.h_n_pos
 
 /-- **Ancestry-specific effects test for portability.**
     If β_A = β_B at a locus, the locus is "portable" across ancestries.
@@ -240,15 +315,26 @@ theorem effect_heterogeneity_test
     -- Wald test statistic
     0 ≤ ((β_A - β_B) / se) ^ 2 := sq_nonneg _
 
+/-- Model of multi-ancestry meta-analysis predictive power. -/
+structure MetaAnalysisModel where
+  /-- Predictive power (R²) using standard GWAS only. -/
+  r2_gwas_only : ℝ
+  /-- Predictive power using Tractor admixed GWAS only. -/
+  r2_tractor_only : ℝ
+  /-- Predictive power of the combined approach. -/
+  r2_combined : ℝ
+  /-- The combined model incorporates all information from the standard GWAS. -/
+  h_combined_best_gwas : r2_gwas_only ≤ r2_combined
+  /-- The combined model incorporates all information from the Tractor model. -/
+  h_combined_best_tractor : r2_tractor_only ≤ r2_combined
+
 /-- **Multi-ancestry meta-analysis combines Tractor with standard GWAS.**
     Using Tractor effects from admixed samples + standard GWAS from
     homogeneous samples gives the most portable PGS. -/
 theorem combined_tractor_gwas_optimal
-    (r2_gwas_only r2_tractor_only r2_combined : ℝ)
-    (h_combined_best_gwas : r2_gwas_only ≤ r2_combined)
-    (h_combined_best_tractor : r2_tractor_only ≤ r2_combined) :
-    max r2_gwas_only r2_tractor_only ≤ r2_combined := by
-  exact max_le h_combined_best_gwas h_combined_best_tractor
+    (m : MetaAnalysisModel) :
+    max m.r2_gwas_only m.r2_tractor_only ≤ m.r2_combined := by
+  exact max_le m.h_combined_best_gwas m.h_combined_best_tractor
 
 end Tractor
 
@@ -267,22 +353,31 @@ section ContinuousAncestry
     a discrete label. This better captures the continuous nature
     of human genetic variation. -/
 
+/-- Model representing PGS accuracy as a function of continuous genetic distance (PC space). -/
+structure ContinuousAncestryPgsModel where
+  /-- Base R² in the discovery centroid. -/
+  r2_source : ℝ
+  /-- Rate of decay per unit of genetic distance. -/
+  slope : ℝ
+  h_r2_pos : 0 < r2_source
+  h_slope_pos : 0 < slope
+
 /-- **PGS accuracy as a function of PC distance.**
     R²(d) where d is the PC distance from the training centroid.
     This is Wang et al.'s key finding (Open Question 1). -/
-noncomputable def r2AsFunction (r2_source slope d : ℝ) : ℝ :=
-  r2_source * (1 - slope * d)
+noncomputable def r2AsFunction (m : ContinuousAncestryPgsModel) (d : ℝ) : ℝ :=
+  m.r2_source * (1 - m.slope * d)
 
 /-- R² decreases with genetic distance. -/
 theorem r2_decreases_with_distance
-    (r2_source slope d₁ d₂ : ℝ)
-    (h_r2 : 0 < r2_source)
-    (h_slope : 0 < slope)
+    (m : ContinuousAncestryPgsModel)
+    (d₁ d₂ : ℝ)
     (h_d : d₁ < d₂) :
-    r2AsFunction r2_source slope d₂ < r2AsFunction r2_source slope d₁ := by
-  unfold r2AsFunction
-  apply mul_lt_mul_of_pos_left _ h_r2
-  nlinarith
+    r2AsFunction m d₂ < r2AsFunction m d₁ := by
+  dsimp [r2AsFunction]
+  apply mul_lt_mul_of_pos_left
+  · exact sub_lt_sub_left (mul_lt_mul_of_pos_left h_d m.h_slope_pos) 1
+  · exact m.h_r2_pos
 
 /-- **Within-group variation dominates between-group variation.**
     When the variance explained by between-group signal is small relative to the
@@ -331,17 +426,45 @@ human genetic diversity, not just for well-represented groups.
 
 section AncestryFairness
 
+/-- Model of the portability gap as a function of Fst. -/
+structure PortabilityGapModel where
+  /-- Scaling constant for the portability penalty. -/
+  c : ℝ
+  /-- Fst for the first target population. -/
+  fst₁ : ℝ
+  /-- Fst for the second target population. -/
+  fst₂ : ℝ
+  h_c_pos : 0 < c
+  h_fst_ord : fst₁ < fst₂
+  h_fst₁_nonneg : 0 ≤ fst₁
+
+/-- Portability gap in a target population compared to discovery. -/
+noncomputable def portability_gap (c fst : ℝ) : ℝ :=
+  c * fst
+
 /-- **Portability gap creates health disparities.**
     Groups with worse portability get less clinical benefit from PGS.
     The gap scales with Fst from the discovery population.
     Portability ≈ 1 - c × Fst for some constant c > 0, so higher Fst
     means lower portability (larger gap = 1 - portability). -/
 theorem portability_gap_scales_with_fst
-    (fst₁ fst₂ c : ℝ)
-    (h_fst : fst₁ < fst₂) (h_c : 0 < c)
-    (h_fst₁_nn : 0 ≤ fst₁) :
-    c * fst₁ < c * fst₂ := by
-  exact mul_lt_mul_of_pos_left h_fst h_c
+    (m : PortabilityGapModel) :
+    portability_gap m.c m.fst₁ < portability_gap m.c m.fst₂ := by
+  dsimp [portability_gap]
+  exact mul_lt_mul_of_pos_left m.h_fst_ord m.h_c_pos
+
+/-- Model of sample size requirements across populations to achieve equal PGS accuracy. -/
+structure SampleSizeEquivalenceModel where
+  /-- Base sample size required in the discovery (European) population. -/
+  n_discovery : ℝ
+  /-- Sample size required in the target (underrepresented) population. -/
+  n_target : ℝ
+  /-- The penalty factor due to LD differences and differing allele frequencies (k > 1). -/
+  ld_penalty : ℝ
+  h_n_discovery_pos : 0 < n_discovery
+  h_penalty_gt_one : 1 < ld_penalty
+  /-- The mathematical relationship: required target sample size is scaled by the penalty. -/
+  h_equivalence : n_target = ld_penalty * n_discovery
 
 /-- **Equitable PGS requires proportional investment.**
     To achieve equal R² across populations, the sample size
@@ -349,10 +472,29 @@ theorem portability_gap_scales_with_fst
     to their population size (due to the LD mismatch penalty).
     If the LD penalty factor is k > 1, then n_needed = k × n_proportional. -/
 theorem equitable_pgs_overinvestment
-    (n_proportional k : ℝ)
-    (h_nn : 0 < n_proportional) (h_k : 1 < k) :
-    n_proportional < k * n_proportional := by
-  nlinarith
+    (m : SampleSizeEquivalenceModel) :
+    m.n_discovery < m.n_target := by
+  rw [m.h_equivalence]
+  exact (lt_mul_iff_one_lt_left m.h_n_discovery_pos).mpr m.h_penalty_gt_one
+
+/-- Model representing the portability of a single PGS across multiple populations. -/
+structure UniversalPortabilityModel where
+  /-- Base R² in the discovery population. -/
+  r2_source : ℝ
+  /-- Decay constant. -/
+  c : ℝ
+  /-- Fst for a population genetically similar to the discovery population. -/
+  fst_near : ℝ
+  /-- Fst for a population genetically distant from the discovery population. -/
+  fst_far : ℝ
+  h_r2_pos : 0 < r2_source
+  h_c_pos : 0 < c
+  h_fst_near_nonneg : 0 ≤ fst_near
+  h_fst_far_gt : fst_near < fst_far
+
+/-- Expected R² in a target population as a function of Fst. -/
+noncomputable def expected_target_r2 (r2_source c fst : ℝ) : ℝ :=
+  r2_source * (1 - c * fst)
 
 /-- **Universal portability is impossible.**
     No single PGS can achieve equal R² in all populations,
@@ -361,12 +503,13 @@ theorem equitable_pgs_overinvestment
     decaying as (1 - c × Fst), the max and min R² must differ
     when Fst values differ. -/
 theorem universal_portability_impossible
-    (r2_source fst_near fst_far c : ℝ)
-    (h_r2 : 0 < r2_source) (h_c : 0 < c)
-    (h_near : 0 ≤ fst_near) (h_far_gt : fst_near < fst_far) :
-    -- The portability gap between near and far populations is positive
-    r2_source * c * fst_near < r2_source * c * fst_far := by
-  exact mul_lt_mul_of_pos_left h_far_gt (mul_pos h_r2 h_c)
+    (m : UniversalPortabilityModel) :
+    expected_target_r2 m.r2_source m.c m.fst_far < expected_target_r2 m.r2_source m.c m.fst_near := by
+  dsimp [expected_target_r2]
+  apply mul_lt_mul_of_pos_left
+  · apply sub_lt_sub_left
+    exact mul_lt_mul_of_pos_left m.h_fst_far_gt m.h_c_pos
+  · exact m.h_r2_pos
 
 end AncestryFairness
 
