@@ -1,0 +1,27 @@
+diff --git a/proofs/Calibrator/StratificationConfounding.lean b/proofs/Calibrator/StratificationConfounding.lean
+index da6dadc..1c3d5f0 100644
+--- a/proofs/Calibrator/StratificationConfounding.lean
++++ b/proofs/Calibrator/StratificationConfounding.lean
+@@ -775,15 +775,15 @@ theorem larger_sample_more_power
+ 
+     Worked example: Wang et al.'s finding of R² ≈ 0.5% for
+     distance-on-error illustrates this. -/
++noncomputable def requiredSampleSize (r2 : ℝ) : ℝ := 1 / r2
++
+ theorem small_effect_needs_large_n
+-    (r2_effect n_required ub : ℝ)
+-    (h_small : r2_effect ≤ ub) (h_ub_pos : 0 < ub)
+-    (h_formula : n_required ≥ 1 / r2_effect)
++    (r2_effect ub : ℝ)
++    (h_small : r2_effect ≤ ub) (_h_ub_pos : 0 < ub)
+     (h_effect_pos : 0 < r2_effect) :
+-    n_required ≥ 1 / ub := by
+-  calc n_required ≥ 1 / r2_effect := h_formula
+-    _ ≥ 1 / ub := by
+-        exact div_le_div_of_nonneg_left (le_of_lt one_pos) h_effect_pos h_small
++    requiredSampleSize ub ≤ requiredSampleSize r2_effect := by
++  unfold requiredSampleSize
++  exact div_le_div_of_nonneg_left (le_of_lt zero_lt_one) h_effect_pos h_small
+ 
+ end PowerAnalysis
+ 
