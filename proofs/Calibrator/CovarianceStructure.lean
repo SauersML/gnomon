@@ -350,21 +350,25 @@ theorem ldsr_increases_with_ell (N h2 M ell₁ ell₂ a : ℝ)
   have : 0 < N * h2 / M := div_pos (mul_pos h_N h_h2) h_M
   nlinarith
 
+/-- Cross-ancestry LDSR estimate. -/
+noncomputable def crossAncestryLDSREstimate (h2_true ell_discovery ell_reference : ℝ) : ℝ :=
+  h2_true * ell_discovery / ell_reference
+
 /-- **Cross-ancestry LDSR.**
     Using LD scores from population A to analyze GWAS from B
     produces biased h² estimates. The bias direction depends on
     whether LD_A > LD_B or LD_A < LD_B. -/
 theorem cross_ancestry_ldsr_biased
-    (h2_true h2_estimated ell_discovery ell_reference : ℝ)
-    (h_formula : h2_estimated = h2_true * ell_discovery / ell_reference)
+    (h2_true ell_discovery ell_reference : ℝ)
     (h_mismatch : ell_discovery ≠ ell_reference)
     (h_true : 0 < h2_true) (h_ref : 0 < ell_reference) :
-    h2_estimated ≠ h2_true := by
-  rw [h_formula]
+    crossAncestryLDSREstimate h2_true ell_discovery ell_reference ≠ h2_true := by
+  unfold crossAncestryLDSREstimate
   intro h
   apply h_mismatch
   have h_ne : h2_true ≠ 0 := h_true.ne'
-  field_simp at h
+  have href_ne : ell_reference ≠ 0 := h_ref.ne'
+  rw [div_eq_iff href_ne] at h
   nlinarith
 
 end LDScore
