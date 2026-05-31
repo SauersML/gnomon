@@ -186,59 +186,74 @@ and the GWAS sample size.
 
 section PGSCeiling
 
+open scoped BigOperators
+
+structure PolygenicCeilingModel (m : ℕ) where
+  tagged_variance : Fin m → ℝ
+  explained_fraction : Fin m → ℝ
+  gwas_power : Fin m → ℝ
+  portability_ratio : Fin m → ℝ
+  h_var_nonneg : ∀ i, 0 ≤ tagged_variance i
+  h_frac_nonneg : ∀ i, 0 ≤ explained_fraction i
+  h_frac_le_one : ∀ i, explained_fraction i ≤ 1
+  h_power_nonneg : ∀ i, 0 ≤ gwas_power i
+  h_power_le_one : ∀ i, gwas_power i ≤ 1
+  h_port_nonneg : ∀ i, 0 ≤ portability_ratio i
+  h_port_le_one : ∀ i, portability_ratio i ≤ 1
+
 /-- **PGS R² ceiling from heritability.**
     R²_PGS ≤ h²_SNP. No PGS can explain more variance than what's
     genetically tagged. The PGS explains a fraction f of tagged
     additive variance, so R²_PGS = f × h²_SNP ≤ h²_SNP. -/
-theorem pgs_r2_ceiling_from_h2
-    (h2_snp f : ℝ)
-    (h_h2 : 0 < h2_snp)
-    (h_f_nn : 0 ≤ f) (h_f_le : f ≤ 1) :
-    h2_snp * f ≤ h2_snp := by
-  exact mul_le_of_le_one_right (le_of_lt h_h2) h_f_le
+theorem pgs_r2_ceiling_from_h2 {m : ℕ} [Fintype (Fin m)]
+    (model : PolygenicCeilingModel m) :
+    (∑ i, model.tagged_variance i * model.explained_fraction i) ≤
+    (∑ i, model.tagged_variance i) := by
+  apply Finset.sum_le_sum
+  intro i _
+  exact mul_le_of_le_one_right (model.h_var_nonneg i) (model.h_frac_le_one i)
 
 /-- **PGS R² ceiling from GWAS power.**
     R²_PGS ≤ h²_SNP × (1 - (1-power)^m)
     where power is per-SNP GWAS power and m is number of causal SNPs.
     With finite sample size, not all SNPs are discovered. -/
-theorem pgs_r2_ceiling_from_gwas_power
-    (h2_snp power_fraction : ℝ)
-    (h_h2 : 0 < h2_snp) (h_h2_le : h2_snp ≤ 1)
-    (h_power : 0 < power_fraction) (h_power_le : power_fraction ≤ 1) :
-    h2_snp * power_fraction ≤ h2_snp := by
-  exact mul_le_of_le_one_right (le_of_lt h_h2) h_power_le
+theorem pgs_r2_ceiling_from_gwas_power {m : ℕ} [Fintype (Fin m)]
+    (model : PolygenicCeilingModel m) :
+    (∑ i, model.tagged_variance i * model.gwas_power i) ≤
+    (∑ i, model.tagged_variance i) := by
+  apply Finset.sum_le_sum
+  intro i _
+  exact mul_le_of_le_one_right (model.h_var_nonneg i) (model.h_power_le_one i)
 
 /-- **Portability further reduces the ceiling.**
     R²_PGS_target ≤ h²_SNP × power_fraction × portability_ratio. -/
-theorem portability_reduces_ceiling
-    (h2_snp power_frac port_ratio : ℝ)
-    (h_h2 : 0 < h2_snp) (h_power : 0 < power_frac) (h_port : 0 < port_ratio)
-    (h_power_le : power_frac ≤ 1) (h_port_le : port_ratio ≤ 1) :
-    h2_snp * power_frac * port_ratio ≤ h2_snp := by
-  calc h2_snp * power_frac * port_ratio
-      ≤ h2_snp * 1 * 1 := by
-        apply mul_le_mul
-        · exact mul_le_mul_of_nonneg_left h_power_le (le_of_lt h_h2)
-        · exact h_port_le
-        · exact le_of_lt h_port
-        · exact mul_nonneg (le_of_lt h_h2) (by linarith)
-    _ = h2_snp := by ring
+theorem portability_reduces_ceiling {m : ℕ} [Fintype (Fin m)]
+    (model : PolygenicCeilingModel m) :
+    (∑ i, model.tagged_variance i * model.gwas_power i * model.portability_ratio i) ≤
+    (∑ i, model.tagged_variance i) := by
+  apply Finset.sum_le_sum
+  intro i _
+  have h1 : model.tagged_variance i * model.gwas_power i * model.portability_ratio i ≤
+            model.tagged_variance i * model.gwas_power i * 1 := by
+    apply mul_le_mul_of_nonneg_left
+    · exact model.h_port_le_one i
+    · apply mul_nonneg (model.h_var_nonneg i) (model.h_power_nonneg i)
+  have h2 : model.tagged_variance i * model.gwas_power i * 1 ≤ model.tagged_variance i := by
+    rw [mul_one]
+    exact mul_le_of_le_one_right (model.h_var_nonneg i) (model.h_power_le_one i)
+  exact le_trans h1 h2
 
 /-- **The three-way ceiling decomposition.**
     R²_target ≤ h² × (GWAS power) × (portability ratio).
     Each factor is ≤ 1, and the product can be very small. -/
-theorem three_way_ceiling
-    (h2 gwas_power port_ratio target_r2 : ℝ)
-    (h_h2_le : h2 ≤ 1) (h_power_le : gwas_power ≤ 1)
-    (h_port_le : port_ratio ≤ 1)
-    (h_h2_nn : 0 ≤ h2) (h_power_nn : 0 ≤ gwas_power) (h_port_nn : 0 ≤ port_ratio)
-    (h_bound : target_r2 ≤ h2 * gwas_power * port_ratio) :
+theorem three_way_ceiling {m : ℕ} [Fintype (Fin m)]
+    (model : PolygenicCeilingModel m) (target_r2 : ℝ)
+    (h_sum_le_one : (∑ i, model.tagged_variance i) ≤ 1)
+    (h_bound : target_r2 ≤ ∑ i, model.tagged_variance i * model.gwas_power i * model.portability_ratio i) :
     target_r2 ≤ 1 := by
-  have : h2 * gwas_power * port_ratio ≤ 1 := by
-    calc h2 * gwas_power * port_ratio
-        ≤ 1 * 1 * 1 := by nlinarith [mul_nonneg h_h2_nn h_power_nn]
-      _ = 1 := by ring
-  linarith
+  have h_le : (∑ i, model.tagged_variance i * model.gwas_power i * model.portability_ratio i) ≤
+              ∑ i, model.tagged_variance i := portability_reduces_ceiling model
+  exact le_trans h_bound (le_trans h_le h_sum_le_one)
 
 end PGSCeiling
 
