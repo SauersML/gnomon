@@ -322,19 +322,36 @@ theorem collider_attenuates_association (m : ColliderModel) :
       < m.β_G * 1 := by exact mul_lt_mul_of_pos_left h_ratio_lt_one m.β_G_pos
     _ = m.β_G := by ring
 
+structure AscertainmentModel where
+  /-- Population R² -/
+  r2_pop : ℝ
+  /-- Ascertained R² -/
+  r2_asc : ℝ
+  /-- Ascertainment attenuates R² -/
+  h_atten : r2_asc < r2_pop
+
+/-- Ascertainment severity (R² drop due to ascertainment) -/
+noncomputable def AscertainmentModel.severity (m : AscertainmentModel) : ℝ :=
+  m.r2_pop - m.r2_asc
+
+/-- True portability drop between two populations -/
+noncomputable def truePortabilityDrop (source target : AscertainmentModel) : ℝ :=
+  source.r2_pop - target.r2_pop
+
+/-- Apparent portability drop observed in ascertained samples -/
+noncomputable def apparentPortabilityDrop (source target : AscertainmentModel) : ℝ :=
+  source.r2_asc - target.r2_asc
+
 /-- **Differential ascertainment creates portability artifact.**
-    If source and target cohorts have different ascertainment patterns,
-    the apparent portability drop includes an ascertainment component. -/
+    If target cohort has more severe ascertainment (larger R² drop)
+    than source cohort, the apparent portability drop is strictly
+    larger than the true portability drop. -/
 theorem differential_ascertainment_artifact
-    (r2_source_pop r2_target_pop r2_source_asc r2_target_asc : ℝ)
-    (h_source_asc : r2_source_asc < r2_source_pop)
-    (h_target_asc : r2_target_asc < r2_target_pop)
-    -- Different ascertainment severity
-    (h_diff_severity : r2_target_pop - r2_target_asc < r2_source_pop - r2_source_asc) :
-    -- Apparent portability drop is larger than true portability drop
-    r2_source_asc - r2_target_asc > r2_source_pop - r2_target_pop →
-      False := by
-  intro h
+    (source target : AscertainmentModel)
+    (h_diff_severity : source.severity < target.severity) :
+    truePortabilityDrop source target < apparentPortabilityDrop source target := by
+  unfold truePortabilityDrop apparentPortabilityDrop
+  unfold AscertainmentModel.severity at h_diff_severity
   linarith
 
 end ColliderBias
@@ -514,17 +531,36 @@ theorem survivorship_attenuates_in_older (m : SurvivorshipAttenuationModel) :
       < m.r2_full * 1 := by exact mul_lt_mul_of_pos_left h_ratio_lt_one m.r2_full_pos
     _ = m.r2_full := by ring
 
+/-- Survivorship severity (attenuation factor) -/
+noncomputable def SurvivorshipAttenuationModel.attenuation (m : SurvivorshipAttenuationModel) : ℝ :=
+  m.var_surv / m.var_birth
+
+/-- True portability drop -/
+noncomputable def trueSurvivorshipPortabilityDrop (source target : SurvivorshipAttenuationModel) : ℝ :=
+  source.r2_full - target.r2_full
+
+/-- Apparent portability drop -/
+noncomputable def apparentSurvivorshipPortabilityDrop (source target : SurvivorshipAttenuationModel) : ℝ :=
+  source.r2_surv - target.r2_surv
+
 /-- **Differential survivorship across populations creates portability artifact.**
-    If the target population has different age structure or mortality patterns,
-    survivorship bias contributes to apparent portability loss. -/
+    If the target population has stronger survivorship bias (lower attenuation factor, thus lower ratio),
+    the apparent portability drop is strictly larger than the true drop, assuming equal initial R². -/
 theorem differential_survivorship_artifact
-    (r2_source_full r2_target_full Δ_surv_source Δ_surv_target : ℝ)
-    (h_surv_s : 0 ≤ Δ_surv_source) (h_surv_t : 0 ≤ Δ_surv_target)
-    (h_diff : Δ_surv_target > Δ_surv_source)
-    (h_obs_s : r2_source_full - Δ_surv_source > 0) :
-    (r2_source_full - Δ_surv_source) - (r2_target_full - Δ_surv_target) >
-      r2_source_full - r2_target_full := by
-  linarith
+    (source target : SurvivorshipAttenuationModel)
+    (h_equal_r2 : source.r2_full = target.r2_full)
+    (h_stronger_bias_target : target.attenuation < source.attenuation) :
+    apparentSurvivorshipPortabilityDrop source target > trueSurvivorshipPortabilityDrop source target := by
+  unfold apparentSurvivorshipPortabilityDrop trueSurvivorshipPortabilityDrop SurvivorshipAttenuationModel.r2_surv SurvivorshipAttenuationModel.attenuation at *
+  rw [h_equal_r2]
+  have h_sub_zero : target.r2_full - target.r2_full = 0 := sub_self target.r2_full
+  rw [h_sub_zero]
+  -- We want to show: target.r2_full * source.attenuation - target.r2_full * target.attenuation > 0
+  have h_diff_pos : 0 < source.var_surv / source.var_birth - target.var_surv / target.var_birth := by linarith
+  have h_factored : target.r2_full * (source.var_surv / source.var_birth) - target.r2_full * (target.var_surv / target.var_birth) =
+    target.r2_full * (source.var_surv / source.var_birth - target.var_surv / target.var_birth) := by ring
+  rw [h_factored]
+  exact mul_pos target.r2_full_pos h_diff_pos
 
 end SurvivorshipBias
 
