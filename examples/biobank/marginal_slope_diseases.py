@@ -1378,6 +1378,32 @@ def pc_duchon_term(num_pcs: int) -> str:
     return f"duchon({pcs}, centers={DUCHON_CENTERS}, order=1)"
 
 
+def pc_marginal_surface_term_binary(num_pcs: int) -> str:
+    pcs = ", ".join(f"PC{i+1}" for i in range(num_pcs))
+    # TEMPORARY workaround for gam#531 (SauersML/gam): in the probit (binary)
+    # marginal-slope path the GLM marginal block ALWAYS carries an explicit
+    # intercept, and a pure scale-free `duchon` surface carries a polynomial
+    # nullspace whose CONSTANT column exactly duplicates that intercept. Both
+    # live in the same `marginal_surface` block, so the joint design is
+    # rank-deficient by exactly 1 -- an intra-block redundancy that cross-block
+    # gauge_priority cannot resolve and that gamfit's identifiability audit
+    # hard-halts. No formula-level centering reaches it today (adding explicit
+    # PC linear terms centers the linear nullspace but not the constant). The
+    # survival path is immune: its baseline hazard absorbs the constant, so
+    # there is no explicit intercept to collide with.
+    #
+    # A Matern kernel is strictly positive-definite -> NO polynomial nullspace,
+    # hence no constant column to collide with the intercept, so the marginal
+    # NUISANCE surface stays identifiable. `length_scale` defaults to 1.0 on
+    # auto-standardized inputs and `MaternIdentifiability::OrthogonalToParametric`
+    # keeps the kernel block orthogonal to the parametric block; omitting
+    # length_scale/scale_dims keeps kappa locked (no outer optimizer -- same
+    # fast path the duchon run used). Only the marginal (nuisance) baseline
+    # surface changes basis; the logslope channel -- the scientific target
+    # (PC-varying PRS log-OR) -- keeps the polyharmonic Duchon below.
+    return f"matern({pcs}, centers={DUCHON_CENTERS})"
+
+
 def fit_marginal_slope(train_df: pd.DataFrame, num_pcs: int):  # -> gamfit.Model
     """Survival marginal-slope GAM with joint Duchon over PCs in both the
     baseline hazard surface and the log-slope (log-HR) channel; sex linear;
@@ -1534,7 +1560,12 @@ def fit_binary_marginal_slope(train_df: pd.DataFrame, num_pcs: int):  # -> gamfi
     duchon = pc_duchon_term(num_pcs)
     logslope_formula = f"{duchon} + linkwiggle()"
     age_terms = " + ".join(BASELINE_AGE_FEATURES)
-    formula = f"event ~ {duchon} + sex + {age_terms} + linkwiggle()"
+    # Marginal nuisance surface uses a strictly-PD Matern (no polynomial
+    # nullspace) to stay identifiable against the probit intercept; the
+    # logslope target keeps the polyharmonic Duchon. See gam#531 and
+    # pc_marginal_surface_term_binary().
+    marginal_surface = pc_marginal_surface_term_binary(num_pcs)
+    formula = f"event ~ {marginal_surface} + sex + {age_terms} + linkwiggle()"
     cols = binary_model_columns(num_pcs)
     print("  binary_fit_spec: family=bernoulli-marginal-slope  link=probit")
     print(f"  binary_fit_spec: formula={formula!r}")
