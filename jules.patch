@@ -1,0 +1,228 @@
+diff --git a/proofs/Calibrator/MendelianRandomization.lean b/proofs/Calibrator/MendelianRandomization.lean
+index 9b46550..332de3d 100644
+--- a/proofs/Calibrator/MendelianRandomization.lean
++++ b/proofs/Calibrator/MendelianRandomization.lean
+@@ -1,3 +1,5 @@
++import Mathlib.Data.Finset.Basic
++import Mathlib.Data.Finset.Card
+ import Calibrator.Probability
+ import Calibrator.PortabilityDrift
+ import Calibrator.OpenQuestions
+@@ -99,13 +101,15 @@ section CrossAncestryInstruments
+ /-- **Instrument strength varies across ancestries.**
+     An instrument selected in one population (source) may be a weak instrument
+     in another (target) because LD between instrument and causal variant differs.
+-    When the source F-statistic exceeds a threshold but the target falls below it,
+-    the target instrument is strictly weaker. -/
++    When the source LD is stronger, the target instrument is strictly weaker. -/
+ theorem instrument_strength_varies
+-    (f_stat_source f_stat_target threshold : ℝ)
+-    (h_strong_source : threshold < f_stat_source)
+-    (h_weak_target : f_stat_target < threshold) :
+-    f_stat_target < f_stat_source := by linarith
++    (n : ℕ) (r2_source r2_target : ℝ)
++    (h_n : 2 < n)
++    (h_r2_source_pos : 0 < r2_source) (h_r2_target_pos : 0 < r2_target)
++    (h_r2_source_lt_one : r2_source < 1) (h_r2_target_lt_one : r2_target < 1)
++    (h_ld_diff : r2_target < r2_source) :
++    fStatistic n r2_target < fStatistic n r2_source := by
++  exact f_stat_increases_with_r2 n r2_target r2_source h_n h_r2_target_pos h_r2_source_pos h_r2_target_lt_one h_r2_source_lt_one h_ld_diff
+ 
+ /-- **LD proxy instruments weaken across ancestry.**
+     In MR, we often use a proxy SNP (in LD with causal SNP).
+@@ -125,15 +129,33 @@ theorem ld_proxy_weakens_cross_ancestry
+   apply mul_lt_mul_of_pos_left h_ld_diff
+   exact abs_pos.mpr h_beta
+ 
++structure MRModel where
++  beta_causal : ℝ
++  beta_ZX : ℝ
++  alpha_pleio : ℝ
++
++noncomputable def waldRatioPleio (m : MRModel) : ℝ :=
++  (m.beta_causal * m.beta_ZX + m.alpha_pleio) / m.beta_ZX
++
+ /-- **Horizontal pleiotropy may be population-specific.**
+     A variant may have pleiotropic effects in one ancestry
+     but not another, due to different LD partners. -/
+ theorem population_specific_pleiotropy
+-    (beta_direct_eur beta_direct_afr : ℝ)
+-    (h_eur_pleio : beta_direct_eur ≠ 0)
+-    (h_afr_no_pleio : beta_direct_afr = 0) :
+-    beta_direct_eur ≠ beta_direct_afr := by
+-  rw [h_afr_no_pleio]; exact h_eur_pleio
++    (m_eur m_afr : MRModel)
++    (h_causal : m_eur.beta_causal = m_afr.beta_causal)
++    (h_ZX : m_eur.beta_ZX = m_afr.beta_ZX)
++    (h_ZX_nz : m_eur.beta_ZX ≠ 0)
++    (h_pleio_diff : m_eur.alpha_pleio ≠ m_afr.alpha_pleio) :
++    waldRatioPleio m_eur ≠ waldRatioPleio m_afr := by
++  unfold waldRatioPleio
++  intro h
++  rw [h_causal, h_ZX] at h
++  have h1 : (m_afr.beta_causal * m_afr.beta_ZX + m_eur.alpha_pleio) / m_afr.beta_ZX * m_afr.beta_ZX =
++            (m_afr.beta_causal * m_afr.beta_ZX + m_afr.alpha_pleio) / m_afr.beta_ZX * m_afr.beta_ZX := by rw [h]
++  have h_afr_ZX_nz : m_afr.beta_ZX ≠ 0 := by rwa [←h_ZX]
++  rw [div_mul_cancel₀ _ h_afr_ZX_nz, div_mul_cancel₀ _ h_afr_ZX_nz] at h1
++  have h2 : m_eur.alpha_pleio = m_afr.alpha_pleio := by linarith
++  exact h_pleio_diff h2
+ 
+ /-- **MR-PRESSO for cross-ancestry outlier detection.**
+     Variants that are outliers in cross-ancestry MR analysis
+@@ -265,26 +287,47 @@ theorem valid_iv_ld_invariant
+   unfold waldRatio
+   rw [mul_div_cancel_right₀ _ h_ZX_eur, mul_div_cancel_right₀ _ h_ZX_afr]
+ 
++structure EnvPortabilityModel where
++  base_portability : ℝ
++  env_effect : ℝ
++  env_mismatch : ℝ
++
++noncomputable def portability (m : EnvPortabilityModel) : ℝ :=
++  m.base_portability - m.env_effect * m.env_mismatch
++
+ /-- **Bidirectional MR for GxE.**
+     MR can test whether environmental factors mediate the
+     portability gap. If environment → portability loss,
+     adjusting for environment should improve portability. -/
+ theorem environment_mediates_portability_mr
+-    (port_unadjusted port_adjusted : ℝ)
+-    (h_improved : port_unadjusted < port_adjusted)
+-    (h_nn : 0 < port_unadjusted) :
+-    0 < port_adjusted - port_unadjusted := by linarith
++    (m_unadj m_adj : EnvPortabilityModel)
++    (h_base : m_unadj.base_portability = m_adj.base_portability)
++    (h_effect : m_unadj.env_effect = m_adj.env_effect)
++    (h_effect_pos : 0 < m_unadj.env_effect)
++    (h_mismatch_reduction : m_adj.env_mismatch < m_unadj.env_mismatch) :
++    portability m_unadj < portability m_adj := by
++  unfold portability
++  rw [h_base, h_effect]
++  have : m_adj.env_effect * m_adj.env_mismatch < m_adj.env_effect * m_unadj.env_mismatch := by
++    exact mul_lt_mul_of_pos_left h_mismatch_reduction (by linarith)
++  linarith
+ 
+ /-- **MR-PheWAS for systematic portability analysis.**
+     Running MR across many phenotypes simultaneously reveals
+     which causal pathways are conserved across ancestries
+     and which are population-specific. -/
+ theorem mr_phewas_identifies_conserved_pathways
+-    (n_conserved n_specific n_total : ℕ)
+-    (h_sum : n_conserved + n_specific = n_total)
+-    (h_some_conserved : 0 < n_conserved)
+-    (h_some_specific : 0 < n_specific) :
+-    n_conserved < n_total := by omega
++    {α : Type*} (s : Finset α)
++    (is_conserved : α → Prop) [DecidablePred is_conserved]
++    (a : α) (ha : a ∈ s) (hna : ¬is_conserved a) :
++    (s.filter is_conserved).card < s.card := by
++  apply Finset.card_lt_card
++  constructor
++  · exact Finset.filter_subset is_conserved s
++  · intro h_sub
++    have h_in_filter : a ∈ s.filter is_conserved := h_sub ha
++    rw [Finset.mem_filter] at h_in_filter
++    exact hna h_in_filter.2
+ 
+ end MRForPGSValidation
+ 
+@@ -298,26 +341,63 @@ that can mimic or mask portability effects.
+ 
+ section ColliderBias
+ 
++structure SelectionBiasModel where
++  beta_true : ℝ
++  genetic_selection : ℝ
++  phenotype_selection : ℝ
++  selection_variance : ℝ
++
++noncomputable def observedEffect (m : SelectionBiasModel) : ℝ :=
++  m.beta_true - (m.genetic_selection * m.phenotype_selection) / m.selection_variance
++
+ /-- **Survivorship creates collider bias.**
+     If the study conditions on survival (e.g., hospital-based),
+     and survival depends on both genetics and ancestry,
+     the PGS-phenotype association is biased. -/
+ theorem collider_bias_from_selection
+-    (beta_true beta_observed selection_bias : ℝ)
+-    (h_biased : beta_observed = beta_true + selection_bias)
+-    (h_bias_nn : selection_bias ≠ 0) :
+-    beta_observed ≠ beta_true := by
+-  rw [h_biased]; intro h; apply h_bias_nn; linarith
++    (m : SelectionBiasModel)
++    (h_gen_sel : m.genetic_selection ≠ 0)
++    (h_pheno_sel : m.phenotype_selection ≠ 0)
++    (h_var : m.selection_variance ≠ 0) :
++    observedEffect m ≠ m.beta_true := by
++  unfold observedEffect
++  intro h
++  have h1 : (m.genetic_selection * m.phenotype_selection) / m.selection_variance = 0 := by linarith
++  have h2 : m.genetic_selection * m.phenotype_selection = 0 := by
++    exact (div_eq_zero_iff.mp h1).resolve_right (by exact h_var)
++  cases mul_eq_zero.mp h2 with
++  | inl h_g => exact h_gen_sel h_g
++  | inr h_p => exact h_pheno_sel h_p
++
++structure IndexEventModel where
++  beta_prognosis_true : ℝ
++  pgs_diagnosis_effect : ℝ
++  disease_incidence : ℝ
++
++noncomputable def indexEventBiasedEffect (m : IndexEventModel) : ℝ :=
++  m.beta_prognosis_true - m.pgs_diagnosis_effect * (1 - m.disease_incidence)
+ 
+ /-- **Index event bias in PGS studies.**
+     Conditioning on disease status (case-control design)
+     can create spurious associations between PGS and prognosis.
+     This is more severe when PGS is ancestry-specific. -/
+ theorem index_event_bias
+-    (beta_prognosis_true beta_prognosis_biased pgs_diagnosis_effect : ℝ)
+-    (h_bias : beta_prognosis_biased = beta_prognosis_true - pgs_diagnosis_effect)
+-    (h_effect : 0 < pgs_diagnosis_effect) :
+-    beta_prognosis_biased < beta_prognosis_true := by linarith
++    (m : IndexEventModel)
++    (h_pgs_pos : 0 < m.pgs_diagnosis_effect)
++    (h_incidence : m.disease_incidence < 1) :
++    indexEventBiasedEffect m < m.beta_prognosis_true := by
++  unfold indexEventBiasedEffect
++  have h_pos : 0 < m.pgs_diagnosis_effect * (1 - m.disease_incidence) :=
++    mul_pos h_pgs_pos (sub_pos.mpr h_incidence)
++  linarith
++
++structure BiobankSelectionModel where
++  beta_population : ℝ
++  participation_rate : ℝ
++  health_selection_pressure : ℝ
++
++noncomputable def biobankEffect (m : BiobankSelectionModel) : ℝ :=
++  m.beta_population + m.health_selection_pressure * (1 - m.participation_rate)
+ 
+ /-- **Berkson's paradox in biobank studies.**
+     Biobank participants are healthier and more educated than
+@@ -328,10 +408,22 @@ theorem index_event_bias
+     If bias_eur ≠ bias_afr, then β_biobank_eur ≠ β_biobank_afr even when
+     the true population-level effect is the same. -/
+ theorem berkson_paradox_ancestry_specific
+-    (beta_population bias_eur bias_afr : ℝ)
+-    (h_diff_bias : bias_eur ≠ bias_afr) :
+-    beta_population + bias_eur ≠ beta_population + bias_afr := by
+-  intro h; exact h_diff_bias (by linarith)
++    (m_eur m_afr : BiobankSelectionModel)
++    (h_beta : m_eur.beta_population = m_afr.beta_population)
++    (h_pressure : m_eur.health_selection_pressure = m_afr.health_selection_pressure)
++    (h_pressure_nz : m_eur.health_selection_pressure ≠ 0)
++    (h_part_diff : m_eur.participation_rate ≠ m_afr.participation_rate) :
++    biobankEffect m_eur ≠ biobankEffect m_afr := by
++  unfold biobankEffect
++  intro h
++  rw [h_beta, h_pressure] at h
++  have h1 : m_afr.health_selection_pressure * (1 - m_eur.participation_rate) =
++            m_afr.health_selection_pressure * (1 - m_afr.participation_rate) := by linarith
++  have h_afr_pressure_nz : m_afr.health_selection_pressure ≠ 0 := by rwa [←h_pressure]
++  have h2 : 1 - m_eur.participation_rate = 1 - m_afr.participation_rate := by
++    exact mul_left_cancel₀ h_afr_pressure_nz h1
++  have h3 : m_eur.participation_rate = m_afr.participation_rate := by linarith
++  exact h_part_diff h3
+ 
+ end ColliderBias
+ 
