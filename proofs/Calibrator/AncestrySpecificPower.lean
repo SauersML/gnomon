@@ -347,33 +347,35 @@ theorem discovered_variants_eur_biased
   have h_β_sq_pos : 0 < β ^ 2 := sq_pos_of_ne_zero h_β_ne
   exact mul_lt_mul_of_pos_right h_het_lt h_β_sq_pos
 
+/-- **Apparent gap in portability.**
+    The difference between source R² (causal + tag bonus) and target R² (attenuated causal). -/
+noncomputable def apparentGap (r2_causal r2_tag_bonus ρ_sq : ℝ) : ℝ :=
+  (r2_causal + r2_tag_bonus) - (r2_causal * ρ_sq)
+
+/-- **True causal gap in portability.**
+    The gap that would exist if we only looked at causal variants. -/
+noncomputable def trueCausalGap (r2_causal ρ_sq : ℝ) : ℝ :=
+  r2_causal * (1 - ρ_sq)
+
 /-- **Discovery bias inflates apparent portability gap.**
-    Model definitions (let-bindings below):
-    - r²_source = r²_causal + r²_tag_bonus (source R² includes tagging bonus)
-    - r²_target = r²_causal × ρ² (target gets only causal signal, attenuated)
-    - apparent_gap = r²_source - r²_target
-    - true_causal_gap = r²_causal × (1 - ρ²)
+    Model definitions:
+    - apparentGap = r²_source - r²_target
+    - trueCausalGap = r²_causal × (1 - ρ²)
 
     Algebraic derivation (verified by `ring`):
-      apparent_gap = (r²_causal + r²_tag_bonus) - r²_causal × ρ²
+      apparentGap = (r²_causal + r²_tag_bonus) - r²_causal × ρ²
                    = r²_causal - r²_causal × ρ² + r²_tag_bonus
                    = r²_causal × (1 - ρ²) + r²_tag_bonus
-                   = true_causal_gap + r²_tag_bonus
+                   = trueCausalGap + r²_tag_bonus
 
-    The tag bonus inflates the apparent gap beyond the true causal gap.
-    This is a definitional identity: the proof content is the model
-    decomposition, not the algebra. -/
+    The tag bonus inflates the apparent gap beyond the true causal gap. -/
 theorem discovery_bias_inflates_source_r2
     (r2_causal r2_tag_bonus ρ_sq : ℝ)
     (h_causal_pos : 0 < r2_causal)
     (h_bonus_pos : 0 < r2_tag_bonus)
     (h_ρ_pos : 0 ≤ ρ_sq) (h_ρ_le : ρ_sq ≤ 1) :
-    let r2_source := r2_causal + r2_tag_bonus
-    let r2_target := r2_causal * ρ_sq
-    let apparent_gap := r2_source - r2_target
-    let true_causal_gap := r2_causal * (1 - ρ_sq)
-    apparent_gap = true_causal_gap + r2_tag_bonus := by
-  simp only
+    apparentGap r2_causal r2_tag_bonus ρ_sq = trueCausalGap r2_causal ρ_sq + r2_tag_bonus := by
+  unfold apparentGap trueCausalGap
   ring
 
 /-- **Proportion of portable signal.**
