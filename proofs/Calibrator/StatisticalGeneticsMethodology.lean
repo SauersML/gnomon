@@ -395,6 +395,44 @@ drops to `3/4`.
 
 This formalizes the biological point that equal source `R²` does not determine
 cross-population portability without locus-resolved transport state. -/
+structure LocusTransportState {n : ℕ} where
+  sourceSignal : Fin n → ℝ
+  stableTransport : Fin n → ℝ
+  brokenTransport : Fin n → ℝ
+
+noncomputable def LocusTransportState.sourceVariance {n : ℕ} (s : LocusTransportState (n := n)) : ℝ :=
+  ∑ l, s.sourceSignal l
+
+noncomputable def LocusTransportState.stableTargetVariance {n : ℕ} (s : LocusTransportState (n := n)) : ℝ :=
+  ∑ l, s.sourceSignal l * s.stableTransport l
+
+noncomputable def LocusTransportState.brokenTargetVariance {n : ℕ} (s : LocusTransportState (n := n)) : ℝ :=
+  ∑ l, s.sourceSignal l * s.brokenTransport l
+
+noncomputable def LocusTransportState.sourceR2 {n : ℕ} (s : LocusTransportState (n := n)) : ℝ :=
+  TransportedMetrics.r2FromSignalVariance s.sourceVariance 1
+
+noncomputable def LocusTransportState.stableTargetR2 {n : ℕ} (s : LocusTransportState (n := n)) : ℝ :=
+  TransportedMetrics.r2FromSignalVariance s.stableTargetVariance 1
+
+noncomputable def LocusTransportState.brokenTargetR2 {n : ℕ} (s : LocusTransportState (n := n)) : ℝ :=
+  TransportedMetrics.r2FromSignalVariance s.brokenTargetVariance 1
+
+/-- A generalized property: when broken transport strictly reduces variance compared to stable transport,
+    the target deployed R² is strictly smaller. -/
+theorem locus_transport_determines_portability {n : ℕ} (s : LocusTransportState (n := n))
+    (h_pos_noise : 0 < (1 : ℝ))
+    (h_stable_nn : 0 ≤ s.stableTargetVariance)
+    (h_broken_nn : 0 ≤ s.brokenTargetVariance)
+    (h_broken_lt_stable : s.brokenTargetVariance < s.stableTargetVariance) :
+    s.brokenTargetR2 < s.stableTargetR2 := by
+  unfold LocusTransportState.brokenTargetR2 LocusTransportState.stableTargetR2
+  unfold TransportedMetrics.r2FromSignalVariance
+  have h_den_broken : 0 < s.brokenTargetVariance + 1 := by linarith
+  have h_den_stable : 0 < s.stableTargetVariance + 1 := by linarith
+  rw [div_lt_div_iff₀ h_den_broken h_den_stable]
+  nlinarith
+
 theorem same_source_r2_different_portability_two_locus_witness :
     let sourceSignal : Fin 2 → ℝ := fun _ => 1
     let stableTransport : Fin 2 → ℝ := fun _ => 1
@@ -408,8 +446,24 @@ theorem same_source_r2_different_portability_two_locus_witness :
     sourceR2 = stableTargetR2 ∧
     brokenTargetR2 < stableTargetR2 ∧
     brokenTargetR2 / sourceR2 = (3 : ℝ) / 4 := by
-  simp [TransportedMetrics.r2FromSignalVariance]
-  norm_num
+  let s : LocusTransportState (n := 2) :=
+    { sourceSignal := fun _ => 1,
+      stableTransport := fun _ => 1,
+      brokenTransport := fun i => if i = 0 then 1 else 0 }
+  have h_same : s.sourceR2 = s.stableTargetR2 := by
+    unfold LocusTransportState.sourceR2 LocusTransportState.stableTargetR2 LocusTransportState.sourceVariance LocusTransportState.stableTargetVariance s
+    simp [TransportedMetrics.r2FromSignalVariance]
+  have h_lt : s.brokenTargetR2 < s.stableTargetR2 := by
+    apply locus_transport_determines_portability
+    · norm_num
+    · unfold LocusTransportState.stableTargetVariance s; norm_num
+    · unfold LocusTransportState.brokenTargetVariance s; norm_num
+    · unfold LocusTransportState.brokenTargetVariance LocusTransportState.stableTargetVariance s; norm_num
+  have h_ratio : s.brokenTargetR2 / s.sourceR2 = (3 : ℝ) / 4 := by
+    unfold LocusTransportState.brokenTargetR2 LocusTransportState.sourceR2 LocusTransportState.brokenTargetVariance LocusTransportState.sourceVariance s
+    simp [TransportedMetrics.r2FromSignalVariance]
+    norm_num
+  exact ⟨h_same, h_lt, h_ratio⟩
 
 end SourceR2Insufficiency
 
