@@ -71,20 +71,33 @@ theorem portability_decreases_with_time (r2_initial lambda_total t₁ t₂ : ℝ
     λ_drift = 1/(2Ne) per generation. -/
 noncomputable def longitudinalDriftDecayRate (Ne : ℝ) : ℝ := 1 / (2 * Ne)
 
-/-- Drift decay rate is positive for positive Ne. -/
-theorem drift_decay_rate_pos (Ne : ℝ) (h : 0 < Ne) :
-    0 < longitudinalDriftDecayRate Ne := by
+structure PopulationDrift where
+  Ne : ℝ
+  h_Ne_pos : 0 < Ne
+  decayRate : ℝ
+  h_decayRate_eq : decayRate = 1 / (2 * Ne)
+
+theorem longitudinalDriftDecayRate_eq (p : PopulationDrift) :
+    p.decayRate = longitudinalDriftDecayRate p.Ne := by
+  rw [p.h_decayRate_eq]
   unfold longitudinalDriftDecayRate
+  rfl
+
+/-- Drift decay rate is positive for positive Ne. -/
+theorem drift_decay_rate_pos (p : PopulationDrift) :
+    0 < p.decayRate := by
+  rw [p.h_decayRate_eq]
+  have h := p.h_Ne_pos
   positivity
 
 /-- **Larger populations drift slower.**
     If Ne₁ < Ne₂, then λ_drift₁ > λ_drift₂. -/
-theorem larger_Ne_slower_drift (Ne₁ Ne₂ : ℝ)
-    (h₁ : 0 < Ne₁) (h₂ : 0 < Ne₂) (h_lt : Ne₁ < Ne₂) :
-    longitudinalDriftDecayRate Ne₂ < longitudinalDriftDecayRate Ne₁ := by
-  unfold longitudinalDriftDecayRate
-  have h1' : 0 < 2 * Ne₁ := by positivity
-  have h2' : 0 < 2 * Ne₂ := by positivity
+theorem larger_Ne_slower_drift (p₁ p₂ : PopulationDrift)
+    (h_lt : p₁.Ne < p₂.Ne) :
+    p₂.decayRate < p₁.decayRate := by
+  rw [p₁.h_decayRate_eq, p₂.h_decayRate_eq]
+  have h1' : 0 < 2 * p₁.Ne := by have h := p₁.h_Ne_pos; positivity
+  have h2' : 0 < 2 * p₂.Ne := by have h := p₂.h_Ne_pos; positivity
   apply (div_lt_div_iff₀ h2' h1').2
   nlinarith
 
@@ -124,14 +137,23 @@ PGS validity even within the same population over time.
 
 section EnvironmentalEpochs
 
+structure EnvContext where
+  r2 : ℝ
+  h_r2_nonneg : 0 ≤ r2
+  V_GxE : ℝ
+  h_gxe_pos : 0 < V_GxE
+  r2_diff : ℝ
+  h_reduction : r2_diff = r2 - V_GxE
+
 /-- **PGS validity in a changed environment.**
     If V_GxE > 0, then a PGS trained in environment E₁
     has reduced R² in environment E₂. -/
 theorem environment_change_reduces_r2
-    (r2_same_env r2_diff_env V_GxE : ℝ)
-    (h_reduction : r2_diff_env = r2_same_env - V_GxE)
-    (h_gxe : 0 < V_GxE) :
-    r2_diff_env < r2_same_env := by linarith
+    (e : EnvContext) :
+    e.r2_diff < e.r2 := by
+  have h_red := e.h_reduction
+  have h_gxe := e.h_gxe_pos
+  linarith
 
 /-- **Secular trends shift PGS distributions.**
     A secular trend (e.g., increasing height) shifts the
@@ -140,37 +162,68 @@ theorem environment_change_reduces_r2
 noncomputable def secularTrendBias (trend_rate t : ℝ) : ℝ :=
   trend_rate * t
 
+structure SecularTrend where
+  rate : ℝ
+  h_rate_pos : 0 < rate
+  t : ℝ
+  bias : ℝ
+  h_bias_eq : bias = rate * t
+
+theorem secularTrendBias_eq (s : SecularTrend) :
+    s.bias = secularTrendBias s.rate s.t := by
+  rw [s.h_bias_eq]
+  unfold secularTrendBias
+  rfl
+
 /-- Secular trend bias grows linearly with time. -/
-theorem secular_trend_grows (trend_rate t₁ t₂ : ℝ)
-    (h_rate : 0 < trend_rate) (h_t : t₁ < t₂) :
-    secularTrendBias trend_rate t₁ < secularTrendBias trend_rate t₂ := by
-  unfold secularTrendBias; nlinarith
+theorem secular_trend_grows (s₁ s₂ : SecularTrend)
+    (h_same_rate : s₁.rate = s₂.rate)
+    (h_t : s₁.t < s₂.t) :
+    s₁.bias < s₂.bias := by
+  rw [s₁.h_bias_eq, s₂.h_bias_eq, h_same_rate]
+  have h_rate := s₂.h_rate_pos
+  nlinarith
+
+structure HeritabilityModel where
+  V_A : ℝ
+  h_VA_pos : 0 < V_A
+  V_E : ℝ
+  h_VE_pos : 0 < V_E
+  h2 : ℝ
+  h_h2_eq : h2 = V_A / (V_A + V_E)
 
 /-- **Environmental variance can increase or decrease over time.**
     Changing environmental variance alters heritability and hence
     PGS predictive power. -/
 theorem changing_env_variance_changes_h2
-    (V_A V_E₁ V_E₂ : ℝ)
-    (h_VA : 0 < V_A) (h_VE₁ : 0 < V_E₁) (h_VE₂ : 0 < V_E₂)
-    (h_diff : V_E₁ ≠ V_E₂) :
-    V_A / (V_A + V_E₁) ≠ V_A / (V_A + V_E₂) := by
+    (m₁ m₂ : HeritabilityModel)
+    (h_same_VA : m₁.V_A = m₂.V_A)
+    (h_diff_VE : m₁.V_E ≠ m₂.V_E) :
+    m₁.h2 ≠ m₂.h2 := by
+  rw [m₁.h_h2_eq, m₂.h_h2_eq, h_same_VA]
   intro h
-  have h₁ : V_A + V_E₁ ≠ 0 := by linarith
-  have h₂ : V_A + V_E₂ ≠ 0 := by linarith
+  have h₁ : m₂.V_A + m₁.V_E ≠ 0 := by have h_pos1 := m₂.h_VA_pos; have h_pos2 := m₁.h_VE_pos; linarith
+  have h₂ : m₂.V_A + m₂.V_E ≠ 0 := by have h_pos1 := m₂.h_VA_pos; have h_pos2 := m₂.h_VE_pos; linarith
   rw [div_eq_div_iff h₁ h₂] at h
-  apply h_diff
-  nlinarith [mul_comm V_A V_E₁, mul_comm V_A V_E₂]
+  apply h_diff_VE
+  have h_va_ne_zero : m₂.V_A ≠ 0 := ne_of_gt m₂.h_VA_pos
+  replace h := mul_left_cancel₀ h_va_ne_zero h
+  linarith
 
 /-- **Industrialization effect on BMI PGS.**
     BMI heritability has changed with industrialization because
     environmental variance for nutrition has changed dramatically.
     PGS trained on modern cohorts may not apply to historical ones. -/
 theorem heritability_increases_when_env_equalizes
-    (V_A V_E_before V_E_after : ℝ)
-    (h_VA : 0 < V_A) (h_VE_b : 0 < V_E_before) (h_VE_a : 0 < V_E_after)
-    (h_reduced : V_E_after < V_E_before) :
-    V_A / (V_A + V_E_before) < V_A / (V_A + V_E_after) := by
-  rw [div_lt_div_iff₀ (by linarith) (by linarith)]
+    (m_before m_after : HeritabilityModel)
+    (h_same_VA : m_before.V_A = m_after.V_A)
+    (h_reduced : m_after.V_E < m_before.V_E) :
+    m_before.h2 < m_after.h2 := by
+  rw [m_before.h_h2_eq, m_after.h_h2_eq, h_same_VA]
+  have h₁ : 0 < m_after.V_A + m_before.V_E := by have h1 := m_after.h_VA_pos; have h2 := m_before.h_VE_pos; linarith
+  have h₂ : 0 < m_after.V_A + m_after.V_E := by have h1 := m_after.h_VA_pos; have h2 := m_after.h_VE_pos; linarith
+  rw [div_lt_div_iff₀ h₁ h₂]
+  have h_va := m_after.h_VA_pos
   nlinarith
 
 end EnvironmentalEpochs
