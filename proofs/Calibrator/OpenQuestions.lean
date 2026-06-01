@@ -487,26 +487,55 @@ poorly predicts individual-level accuracy.
 
 section UnifiedTheory
 
+structure PortabilityComponents (m : ℕ) where
+  af_factor : Fin m → ℝ
+  ld_factor : Fin m → ℝ
+  eff_factor : Fin m → ℝ
+  env_factor : Fin m → ℝ
+  h_af_pos : ∀ i, 0 < af_factor i
+  h_af_le : ∀ i, af_factor i ≤ 1
+  h_ld_pos : ∀ i, 0 < ld_factor i
+  h_ld_lt : ∀ i, ld_factor i < 1
+  h_eff_pos : ∀ i, 0 < eff_factor i
+  h_eff_lt : ∀ i, eff_factor i < 1
+  h_env_pos : ∀ i, 0 < env_factor i
+  h_env_le : ∀ i, env_factor i ≤ 1
+
 /-- **No single factor captures the full ratio.** -/
 theorem single_factor_insufficient
-    (af ld eff env : ℝ)
-    (h_af : 0 < af) (_h_af_le : af ≤ 1)
-    (h_ld : 0 < ld) (h_ld_lt : ld < 1)
-    (h_eff : 0 < eff) (h_eff_lt : eff < 1)
-    (h_env : 0 < env) (h_env_le : env ≤ 1) :
-    af * ld * eff * env < af := by
-  have h1 : ld * eff < 1 := by
-    calc ld * eff < 1 * eff := mul_lt_mul_of_pos_right h_ld_lt h_eff
-      _ = eff := one_mul eff
-      _ < 1 := h_eff_lt
-  have h2 : ld * eff * env < 1 := by
-    calc ld * eff * env < 1 * env := mul_lt_mul_of_pos_right h1 h_env
-      _ = env := one_mul env
-      _ ≤ 1 := h_env_le
-  calc af * ld * eff * env
-      = af * (ld * eff * env) := by ring
-    _ < af * 1 := mul_lt_mul_of_pos_left h2 h_af
-    _ = af := mul_one af
+    {m : ℕ} (p : PortabilityComponents m) (h_m : m ≠ 0) :
+    (∑ i : Fin m, p.af_factor i * p.ld_factor i * p.eff_factor i * p.env_factor i) < ∑ i : Fin m, p.af_factor i := by
+  apply Finset.sum_lt_sum
+  · intro i _
+    have h1 : p.ld_factor i * p.eff_factor i < 1 := by
+      calc p.ld_factor i * p.eff_factor i < 1 * p.eff_factor i := mul_lt_mul_of_pos_right (p.h_ld_lt i) (p.h_eff_pos i)
+        _ = p.eff_factor i := one_mul _
+        _ < 1 := p.h_eff_lt i
+    have h2 : p.ld_factor i * p.eff_factor i * p.env_factor i < 1 := by
+      calc p.ld_factor i * p.eff_factor i * p.env_factor i < 1 * p.env_factor i := mul_lt_mul_of_pos_right h1 (p.h_env_pos i)
+        _ = p.env_factor i := one_mul _
+        _ ≤ 1 := p.h_env_le i
+    calc p.af_factor i * p.ld_factor i * p.eff_factor i * p.env_factor i
+        = p.af_factor i * (p.ld_factor i * p.eff_factor i * p.env_factor i) := by ring
+      _ ≤ p.af_factor i * 1 := mul_le_mul_of_nonneg_left (le_of_lt h2) (le_of_lt (p.h_af_pos i))
+      _ = p.af_factor i := mul_one _
+  · have : Nonempty (Fin m) := Fin.pos_iff_nonempty.mp (Nat.pos_of_ne_zero h_m)
+    obtain ⟨i⟩ := this
+    use i
+    constructor
+    · exact Finset.mem_univ i
+    · have h1 : p.ld_factor i * p.eff_factor i < 1 := by
+        calc p.ld_factor i * p.eff_factor i < 1 * p.eff_factor i := mul_lt_mul_of_pos_right (p.h_ld_lt i) (p.h_eff_pos i)
+          _ = p.eff_factor i := one_mul _
+          _ < 1 := p.h_eff_lt i
+      have h2 : p.ld_factor i * p.eff_factor i * p.env_factor i < 1 := by
+        calc p.ld_factor i * p.eff_factor i * p.env_factor i < 1 * p.env_factor i := mul_lt_mul_of_pos_right h1 (p.h_env_pos i)
+          _ = p.env_factor i := one_mul _
+          _ ≤ 1 := p.h_env_le i
+      calc p.af_factor i * p.ld_factor i * p.eff_factor i * p.env_factor i
+          = p.af_factor i * (p.ld_factor i * p.eff_factor i * p.env_factor i) := by ring
+        _ < p.af_factor i * 1 := mul_lt_mul_of_pos_left h2 (p.h_af_pos i)
+        _ = p.af_factor i := mul_one _
 
 /-- **R² of genetic distance on portability is bounded by the AF variance fraction.** -/
 theorem genetic_distance_variance_bound
