@@ -1534,7 +1534,25 @@ def fit_binary_marginal_slope(train_df: pd.DataFrame, num_pcs: int):  # -> gamfi
     duchon = pc_duchon_term(num_pcs)
     logslope_formula = f"{duchon} + linkwiggle()"
     age_terms = " + ".join(BASELINE_AGE_FEATURES)
-    formula = f"event ~ {duchon} + sex + {age_terms} + linkwiggle()"
+    # Identifiability: the probit GLM marginal block always carries an explicit
+    # intercept, and `duchon(order=1)` carries a polynomial nullspace
+    # {1, PC1..PCd} whose CONSTANT column duplicates that intercept. The
+    # intercept and the duchon constant live in the SAME marginal block, so the
+    # joint design is rank-deficient by exactly 1 -- an intra-block redundancy
+    # cross-block gauge priority cannot resolve, which gamfit's identifiability
+    # audit now hard-halts (it was silently column-dropped before the hard-halt
+    # gate). The survival path never hits this: its baseline hazard absorbs the
+    # constant, so there is no explicit intercept to collide with. Fix without
+    # changing the model span: promote the duchon's low-order polynomial trend to
+    # EXPLICIT linear PC terms. Overlapping linear terms own those axes, so the
+    # marginal surface is residualised against [intercept | PC1..PCd] and keeps
+    # only its wiggly complement -- the redundant constant/linear directions then
+    # live in the parametric block exactly once (the audit's recommended
+    # "orthogonal-complement projection against earlier blocks"). Marginal channel
+    # only: the logslope duchon multiplies prs_z, so its constant is the global
+    # PRS log-OR (wanted, not redundant) and must stay uncentered.
+    pc_linear = " + ".join(f"PC{i + 1}" for i in range(num_pcs))
+    formula = f"event ~ {duchon} + {pc_linear} + sex + {age_terms} + linkwiggle()"
     cols = binary_model_columns(num_pcs)
     print("  binary_fit_spec: family=bernoulli-marginal-slope  link=probit")
     print(f"  binary_fit_spec: formula={formula!r}")
