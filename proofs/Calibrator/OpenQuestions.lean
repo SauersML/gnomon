@@ -341,14 +341,28 @@ end Question3
 
 section Question4
 
+/-- **Heritability Model.**
+    Captures the genetic (Vg) and environmental (Ve) variance components. -/
+structure HeritabilityModel where
+  (Vg Ve : ℝ)
+
+/-- Calculates the expected R² given a HeritabilityModel. -/
+noncomputable def expectedR2FromModel (m : HeritabilityModel) : ℝ :=
+  m.Vg / (m.Vg + m.Ve)
+
 /-- **R² decreases with environmental variance** even under identical genetics.
     R² = Vg/(Vg + Ve), so larger Ve → smaller R². -/
 theorem env_variance_lowers_r2
-    (Vg Ve₁ Ve₂ : ℝ)
-    (hVg : 0 < Vg) (hVe₁ : 0 < Ve₁) (_hVe₂ : 0 < Ve₂)
-    (h_more_env : Ve₁ < Ve₂) :
-    Vg / (Vg + Ve₂) < Vg / (Vg + Ve₁) := by
-  apply div_lt_div_of_pos_left hVg (by linarith) (by linarith)
+    (m1 m2 : HeritabilityModel)
+    (h_same_Vg : m1.Vg = m2.Vg)
+    (hVg : 0 < m1.Vg) (hVe1 : 0 < m1.Ve) (_hVe2 : 0 < m2.Ve)
+    (h_more_env : m1.Ve < m2.Ve) :
+    expectedR2FromModel m2 < expectedR2FromModel m1 := by
+  unfold expectedR2FromModel
+  have hVg2 : 0 < m2.Vg := by linarith
+  have h_m1 : m1.Vg / (m1.Vg + m1.Ve) = m2.Vg / (m2.Vg + m1.Ve) := by rw [h_same_Vg]
+  rw [h_m1]
+  apply div_lt_div_of_pos_left hVg2 (by linarith) (by linarith)
 
 /-- **Omitted variable bias in portability regression.**
     If SES (β_s) correlates with genetic distance (correlation ρ),
@@ -363,12 +377,29 @@ theorem omitted_variable_bias
   · exact h_ses h
   · exact h_corr h
 
-/-- **Portability drop decomposes into genetic + environmental parts.** -/
+/-- **Portability drop decomposition model.**
+    Captures the source R², target R², and the genetic (Δg) and
+    environmental (Δe) variance components of the drop. -/
+structure PortabilityDropModel where
+  (r2s r2t Δg Δe : ℝ)
+
+/-- The observed portability drop. -/
+noncomputable def portabilityDrop (m : PortabilityDropModel) : ℝ :=
+  m.r2s - m.r2t
+
+/-- The total decomposed drop from genetic and environmental sources. -/
+noncomputable def totalDecomposedDrop (m : PortabilityDropModel) : ℝ :=
+  m.Δg + m.Δe
+
+/-- **Portability drop decomposes into genetic + environmental parts.**
+    When the total decomposed drop equals the observed drop, each non-negative
+    component is bounded by the total observed drop. -/
 theorem portability_drop_decomp
-    (r2s r2t Δg Δe : ℝ)
-    (h_eq : r2s - r2t = Δg + Δe)
-    (hΔg : 0 ≤ Δg) (hΔe : 0 ≤ Δe) :
-    Δg ≤ r2s - r2t ∧ Δe ≤ r2s - r2t := by
+    (m : PortabilityDropModel)
+    (h_eq : portabilityDrop m = totalDecomposedDrop m)
+    (hΔg : 0 ≤ m.Δg) (hΔe : 0 ≤ m.Δe) :
+    m.Δg ≤ portabilityDrop m ∧ m.Δe ≤ portabilityDrop m := by
+  unfold portabilityDrop totalDecomposedDrop at *
   constructor <;> linarith
 
 end Question4
