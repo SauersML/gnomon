@@ -1,0 +1,99 @@
+diff --git a/proofs/Calibrator/StatisticalGeneticsMethodology.lean b/proofs/Calibrator/StatisticalGeneticsMethodology.lean
+index 3250495..89d5340 100644
+--- a/proofs/Calibrator/StatisticalGeneticsMethodology.lean
++++ b/proofs/Calibrator/StatisticalGeneticsMethodology.lean
+@@ -133,12 +133,26 @@ theorem r2_se_decreases_with_n
+ noncomputable def portabilityRatio (dr2_target dr2_source : ℝ) : ℝ :=
+   dr2_target / dr2_source
+ 
++structure PortabilityModel where
++  dr2_source : ℝ
++  dr2_target : ℝ
++  h2_source : ℝ
++  h2_target : ℝ
++  h_h2_drop : h2_target ≤ h2_source
++  capture_frac : ℝ
++  h_capture_pos : 0 ≤ capture_frac
++  h_source_eq : dr2_source = capture_frac * h2_source
++  h_target_eq : dr2_target = capture_frac * h2_target
++
+ /-- Portability ratio ≤ 1 when target PGS is weaker. -/
+ theorem portability_ratio_le_one
+-    (dr2_t dr2_s : ℝ) (h_s : 0 < dr2_s) (h_weaker : dr2_t ≤ dr2_s) :
+-    portabilityRatio dr2_t dr2_s ≤ 1 := by
++    (m : PortabilityModel) (h_s : 0 < m.dr2_source) :
++    portabilityRatio m.dr2_target m.dr2_source ≤ 1 := by
+   unfold portabilityRatio
+-  rw [div_le_one h_s]; exact h_weaker
++  have h_weaker : m.dr2_target ≤ m.dr2_source := by
++    rw [m.h_source_eq, m.h_target_eq]
++    exact mul_le_mul_of_nonneg_left m.h_h2_drop m.h_capture_pos
++  exact (div_le_one h_s).mpr h_weaker
+ 
+ end IncrementalR2
+ 
+@@ -160,14 +174,20 @@ section CrossValidation
+     If the GWAS sample overlaps with the evaluation sample,
+     R² is biased upward by approximately p/n where p is the
+     number of SNPs in the PGS. -/
++structure OverlapBiasModel where
++  p_snps : ℝ
++  n_overlap : ℝ
++  r2_true : ℝ
++  r2_apparent : ℝ
++  h_inflation : r2_apparent = r2_true + p_snps / n_overlap
++
+ theorem overlap_bias
+-    (p_snps n_overlap : ℝ)
+-    (h_p : 0 < p_snps) (h_n : 0 < n_overlap)
+-    (h_n_large : p_snps < n_overlap) :
+-    0 < p_snps / n_overlap ∧ p_snps / n_overlap < 1 := by
+-  constructor
+-  · exact div_pos h_p h_n
+-  · rw [div_lt_one h_n]; exact h_n_large
++    (m : OverlapBiasModel)
++    (hp : 0 < m.p_snps)
++    (hn : 0 < m.n_overlap) :
++    m.r2_true < m.r2_apparent := by
++  rw [m.h_inflation]
++  exact lt_add_of_pos_right m.r2_true (div_pos hp hn)
+ 
+ /- **Portability assessment requires population-specific validation.**
+     R² must be evaluated in each target population separately.
+@@ -178,14 +198,29 @@ theorem overlap_bias
+     standard CV overestimates R² due to shared segments.
+     Family-blocked CV is closer to the true R² because it removes
+     the upward bias from family sharing, so its absolute error is smaller. -/
++structure BlockCVModel where
++  true_r2 : ℝ
++  family_bias : ℝ
++  standard_bias : ℝ
++  blocked_bias : ℝ
++  h_family_pos : 0 < family_bias
++  h_standard_eq : standard_bias = family_bias
++  h_blocked_lt : blocked_bias < family_bias
++  h_blocked_nonneg : 0 ≤ blocked_bias
++
+ theorem blocked_cv_less_biased
+-    (r2_standard_cv r2_blocked_cv r2_true : ℝ)
+-    (h_standard_biased : r2_true < r2_standard_cv)
+-    (h_blocked_between : r2_true ≤ r2_blocked_cv)
+-    (h_blocked_closer_to_true : r2_blocked_cv < r2_standard_cv) :
+-    |r2_blocked_cv - r2_true| < |r2_standard_cv - r2_true| := by
+-  rw [abs_of_nonneg (by linarith), abs_of_nonneg (by linarith)]
+-  linarith
++    (m : BlockCVModel) :
++    |(m.true_r2 + m.blocked_bias) - m.true_r2| < |(m.true_r2 + m.standard_bias) - m.true_r2| := by
++  have h1 : m.true_r2 + m.blocked_bias - m.true_r2 = m.blocked_bias := by ring
++  have h2 : m.true_r2 + m.standard_bias - m.true_r2 = m.standard_bias := by ring
++  rw [h1, h2]
++  rw [abs_of_nonneg m.h_blocked_nonneg]
++  have h3 : 0 ≤ m.standard_bias := by
++    rw [m.h_standard_eq]
++    exact le_of_lt m.h_family_pos
++  rw [abs_of_nonneg h3]
++  rw [m.h_standard_eq]
++  exact m.h_blocked_lt
+ 
+ /- **Time-split validation for discovery bias.**
+     If the PGS discovery includes newer data, temporal validation
