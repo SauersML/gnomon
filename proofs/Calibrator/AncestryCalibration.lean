@@ -5,6 +5,8 @@ import Calibrator.OpenQuestions
 namespace Calibrator
 
 open MeasureTheory
+open scoped BigOperators
+
 
 /-!
 # Ancestry-Specific Calibration and Transfer Learning for PGS
@@ -344,15 +346,32 @@ theorem epistatic_changes_faster
   rw [div_lt_div_iff₀ (mul_pos h₁_s_pos h₂_s_pos) h₁_s_pos]
   nlinarith [mul_pos h₁_s_pos h₁_pos]
 
+structure EpistasisModel (m : ℕ) where
+  additive_vars : Fin m → ℝ
+  epistatic_vars : Fin m → Fin m → ℝ
+  h_add_pos : ∀ i, 0 ≤ additive_vars i
+  h_epi_pos : ∀ i j, 0 ≤ epistatic_vars i j
+  h_add_strict_pos : 0 < ∑ i, additive_vars i
+  h_epi_strict_pos : 0 < ∑ i, ∑ j, epistatic_vars i j
+
+def total_additive_variance {m : ℕ} (model : EpistasisModel m) : ℝ :=
+  ∑ i, model.additive_vars i
+
+def total_epistatic_variance {m : ℕ} (model : EpistasisModel m) : ℝ :=
+  ∑ i, ∑ j, model.epistatic_vars i j
+
+def total_variance {m : ℕ} (model : EpistasisModel m) : ℝ :=
+  total_additive_variance model + total_epistatic_variance model
+
 /-- **Additive PGS misses epistatic signal → portability of epistatic component is zero.**
     An additive PGS captures V_A but not V_epistasis. The "missing heritability"
     from epistasis doesn't port because it was never captured. -/
-theorem additive_pgs_misses_epistasis
-    (v_additive v_epistatic v_total : ℝ)
-    (h_total : v_total = v_additive + v_epistatic)
-    (h_epi_pos : 0 < v_epistatic) (h_add_pos : 0 < v_additive) :
-    v_additive / v_total < 1 := by
-  rw [h_total, div_lt_one (by linarith)]
+theorem additive_pgs_misses_epistasis {m : ℕ} (model : EpistasisModel m) :
+    total_additive_variance model / total_variance model < 1 := by
+  have h_epi_pos : 0 < total_epistatic_variance model := model.h_epi_strict_pos
+  have h_add_pos : 0 < total_additive_variance model := model.h_add_strict_pos
+  unfold total_variance
+  rw [div_lt_one (by linarith)]
   linarith
 
 end Epistasis
