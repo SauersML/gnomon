@@ -1,5 +1,6 @@
 import Calibrator.PortabilityDrift
 import Calibrator.SelectionArchitecture
+open scoped BigOperators
 
 namespace Calibrator
 
@@ -509,30 +510,61 @@ chart.**
     exactly `1 / n_loci` of the total, hence strictly less than `1 / n_threshold`
     whenever `n_threshold < n_loci`. This is a counting identity, not by itself
     a mechanistic portability theorem. -/
+
+
+structure VarianceShareModel where
+  n_loci : ℕ
+  h_loci_pos : 0 < n_loci
+  locus_var : Fin n_loci → ℝ
+  h_var_pos : ∀ i, 0 < locus_var i
+  h_equal_var : ∀ i j, locus_var i = locus_var j
+
 theorem per_locus_variance_share_bounded_by_locus_count
-    (n_loci n_threshold : ℕ) (per_locus_var total_var : ℝ)
-    (h_many : n_threshold < n_loci) (h_thresh_pos : 0 < n_threshold)
-    (h_total : total_var = n_loci * per_locus_var)
-    (h_var_pos : 0 < per_locus_var) :
-    -- Each locus contributes < 1/n_threshold of total variance
-    per_locus_var / total_var < 1 / n_threshold := by
-  rw [h_total]
-  rw [show per_locus_var / (↑n_loci * per_locus_var) = 1 / ↑n_loci from by
-    field_simp]
-  have h_n_pos : (0 : ℝ) < ↑n_loci := Nat.cast_pos.mpr (by omega)
+    (m : VarianceShareModel) (n_threshold : ℕ) (i : Fin m.n_loci)
+    (h_many : n_threshold < m.n_loci) (h_thresh_pos : 0 < n_threshold) :
+    m.locus_var i / (∑ j, m.locus_var j) < 1 / (n_threshold : ℝ) := by
+  have h_sum : ∑ j, m.locus_var j = m.n_loci * m.locus_var i := by
+    calc ∑ j, m.locus_var j = ∑ j : Fin m.n_loci, m.locus_var i := Finset.sum_congr rfl (fun j _ => m.h_equal_var j i)
+    _ = m.n_loci * m.locus_var i := by simp
+  rw [h_sum]
+  have h_pos : 0 < m.locus_var i := m.h_var_pos i
+  have h_ne : m.locus_var i ≠ 0 := ne_of_gt h_pos
+  rw [show m.locus_var i / (↑m.n_loci * m.locus_var i) = 1 / ↑m.n_loci from by field_simp]
+  have h_n_pos : (0 : ℝ) < ↑m.n_loci := Nat.cast_pos.mpr m.h_loci_pos
   have h_t_pos : (0 : ℝ) < ↑n_threshold := Nat.cast_pos.mpr h_thresh_pos
   rw [div_lt_div_iff₀ h_n_pos h_t_pos]
-  have : (n_threshold : ℝ) < (n_loci : ℝ) := by exact_mod_cast h_many
+  have : (n_threshold : ℝ) < (m.n_loci : ℝ) := by exact_mod_cast h_many
   linarith
 
 /-- **An `α < 1` upper bound forces portability below the reference trait.**
     If `port_selected < α * port_reference` with `0 < α < 1`, then the selected
     trait's portability is strictly below the reference portability. -/
+structure PolygenicSelectionModel where
+  k : ℕ
+  h_k_pos : 0 < k
+  effect_var_ref : Fin k → ℝ
+  effect_var_sel : Fin k → ℝ
+  h_var_ref_pos : ∀ i, 0 < effect_var_ref i
+
 theorem alpha_bound_forces_portability_below_reference
-    (port_reference port_selected α : ℝ)
-    (h_much_worse : port_selected < α * port_reference)
-    (h_ref_pos : 0 < port_reference) (h_α_lt : α < 1) (h_α_pos : 0 < α) :
-    port_selected < port_reference := by nlinarith
+    (m : PolygenicSelectionModel) (α : ℝ)
+    (h_much_worse : ∀ i, m.effect_var_sel i < α * m.effect_var_ref i)
+    (h_α_lt : α < 1) (_h_α_pos : 0 < α) :
+    (∑ i, m.effect_var_sel i) < ∑ i, m.effect_var_ref i := by
+  calc
+    (∑ i, m.effect_var_sel i) < ∑ i, α * m.effect_var_ref i := by
+      apply Finset.sum_lt_sum_of_nonempty
+      · exact Finset.univ_nonempty_iff.mpr ⟨⟨0, m.h_k_pos⟩⟩
+      · intro i _
+        exact h_much_worse i
+    _ = α * ∑ i, m.effect_var_ref i := by rw [← Finset.mul_sum]
+    _ < 1 * ∑ i, m.effect_var_ref i := by
+      apply mul_lt_mul_of_pos_right h_α_lt
+      apply Finset.sum_pos
+      · intro i _
+        exact m.h_var_ref_pos i
+      · exact Finset.univ_nonempty_iff.mpr ⟨⟨0, m.h_k_pos⟩⟩
+    _ = ∑ i, m.effect_var_ref i := one_mul _
 
 end AnthropometricTraits
 
@@ -549,33 +581,67 @@ section PhenomeWideStructure
 /-- **A bounded portability-correlation coordinate stays in `[-1,1]`.**
     If `|port_corr| ≤ |rg|` and `|rg| ≤ 1`, then `|port_corr| ≤ 1`. This is the
     exact boundedness fact used by any downstream interpretation. -/
+structure PortabilityCorrelationModel where
+  n_phenotypes : ℕ
+  port_A : Fin n_phenotypes → ℝ
+  port_B : Fin n_phenotypes → ℝ
+
 theorem bounded_portability_correlation_stays_within_unit_interval
-    (rg port_corr : ℝ)
-    (h_relation : |port_corr| ≤ |rg|)
-    (h_rg_bounded : |rg| ≤ 1) :
-    |port_corr| ≤ 1 := le_trans h_relation h_rg_bounded
+    (m : PortabilityCorrelationModel)
+    (h_var_pos : 0 < ∑ i, m.port_A i ^ 2 ∧ 0 < ∑ i, m.port_B i ^ 2) :
+    let cov := ∑ i, m.port_A i * m.port_B i
+    let var_A := ∑ i, m.port_A i ^ 2
+    let var_B := ∑ i, m.port_B i ^ 2
+    (cov / Real.sqrt (var_A * var_B)) ^ 2 ≤ 1 := by
+  intro cov var_A var_B
+  have h_cs : cov ^ 2 ≤ var_A * var_B := Finset.sum_mul_sq_le_sq_mul_sq Finset.univ m.port_A m.port_B
+  have h_den : 0 < var_A * var_B := mul_pos h_var_pos.1 h_var_pos.2
+  rw [div_pow, Real.sq_sqrt (le_of_lt h_den)]
+  exact (div_le_one h_den).mpr h_cs
 
 /-- **Lower bounds on two factor contributions imply a lower bound on their
 sum.**
     This is the exact additive lower-bound step `lb₁ < f₁` and `lb₂ < f₂`
     imply `lb₁ + lb₂ < f₁ + f₂`. -/
+structure MultiFactorModel where
+  k : ℕ
+  h_k_pos : 0 < k
+  var_explained : Fin k → ℝ
+  h_total : (∑ i, var_explained i) ≤ 1
+  h_nonneg : ∀ i, 0 ≤ var_explained i
+
 theorem factor_lower_bounds_sum_strictly_below_total
-    (var_explained_f1 var_explained_f2 lb₁ lb₂ : ℝ)
-    (h_f1 : lb₁ < var_explained_f1)
-    (h_f2 : lb₂ < var_explained_f2)
-    (_h_total : var_explained_f1 + var_explained_f2 ≤ 1)
-    (_h_f1_nn : 0 ≤ var_explained_f1) (_h_f2_nn : 0 ≤ var_explained_f2) :
-    lb₁ + lb₂ < var_explained_f1 + var_explained_f2 := by linarith
+    (m : MultiFactorModel) (lb : Fin m.k → ℝ)
+    (h_lb : ∀ i, lb i < m.var_explained i) :
+    (∑ i, lb i) < ∑ i, m.var_explained i := by
+  apply Finset.sum_lt_sum_of_nonempty
+  · exact Finset.univ_nonempty_iff.mpr ⟨⟨0, m.h_k_pos⟩⟩
+  · intro i _
+    exact h_lb i
 
 /-- **A prediction error bound implies any looser tolerance bound.**
     If `|actual - predicted| ≤ ε` and `ε < bound`, then the prediction error is
     strictly below `bound`. This is only the final inequality step, not the
     derivation of the predictor itself. -/
+structure PolygenicPortabilityModel where
+  n_loci : ℕ
+  h_n_pos : 0 < n_loci
+  actual_port : Fin n_loci → ℝ
+  predicted_port : Fin n_loci → ℝ
+  locus_error_bound : Fin n_loci → ℝ
+  h_error : ∀ i, |actual_port i - predicted_port i| ≤ locus_error_bound i
+
 theorem prediction_error_bounded_by_looser_tolerance
-    (_polygenicity _selection_signal predicted_port actual_port ε bound : ℝ)
-    (h_prediction : |actual_port - predicted_port| ≤ ε)
-    (h_small_error : ε < bound) :
-    |actual_port - predicted_port| < bound := by linarith
+    (m : PolygenicPortabilityModel)
+    (bound : ℝ)
+    (h_bound : ∑ i, m.locus_error_bound i < bound) :
+    |∑ i, m.actual_port i - ∑ i, m.predicted_port i| < bound := by
+  calc
+    |∑ i, m.actual_port i - ∑ i, m.predicted_port i|
+      = |∑ i, (m.actual_port i - m.predicted_port i)| := by rw [← Finset.sum_sub_distrib]
+    _ ≤ ∑ i, |m.actual_port i - m.predicted_port i| := Finset.abs_sum_le_sum_abs _ _
+    _ ≤ ∑ i, m.locus_error_bound i := Finset.sum_le_sum (fun i _ => m.h_error i)
+    _ < bound := h_bound
 
 /-- **Disease traits vs quantitative traits.**
     Disease traits often show worse portability than their
