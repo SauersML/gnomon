@@ -34,30 +34,63 @@ benefit across ancestry groups.
 
 section HealthDisparity
 
+structure HealthEconomicsModel (Ω : Type*) where
+  E : ExpFunctional Ω
+  -- Indicators for who is successfully targeted
+  targeted₁ : Ω → ℝ
+  targeted₂ : Ω → ℝ
+
+  -- The expected rate of targeted individuals corresponds to the predictive accuracy R²
+  r2₁ : ℝ
+  r2₂ : ℝ
+  h_r2₁ : E targeted₁ = r2₁
+  h_r2₂ : E targeted₂ = r2₂
+
+  -- The clinical benefit per targeted individual
+  γ : ℝ
+  h_γ : 0 < γ
+
+-- Expected clinical benefit in population
+noncomputable def expectedBenefit {Ω : Type*} (E : ExpFunctional Ω) (targeted : Ω → ℝ) (γ : ℝ) : ℝ :=
+  E (fun ω => γ * targeted ω)
+
+theorem expectedBenefit_eq_r2_mul_gamma {Ω : Type*} (m : HealthEconomicsModel Ω)
+  (targeted : Ω → ℝ) (r2 : ℝ) (h_r2 : m.E targeted = r2) :
+  expectedBenefit m.E targeted m.γ = m.γ * r2 := by
+  unfold expectedBenefit
+  have h_pull : (fun ω => m.γ * targeted ω) = m.γ • targeted := rfl
+  rw [h_pull, m.E.smul_eval m.γ targeted, h_r2]
+
 /-- **Clinical utility depends on PGS R².**
-    The net clinical benefit from PGS-guided care is monotonically
-    increasing in R². We model benefit = α × R² for a positive
-    proportionality constant α (benefit per unit R²). When
-    R²₁ < R²₂, the benefit in population 1 is strictly less. -/
-theorem clinical_benefit_increases_with_r2
-    (α r2₁ r2₂ : ℝ)
-    (h_α : 0 < α)
-    (h_r2 : r2₁ < r2₂) :
-    α * r2₁ < α * r2₂ := by
-  exact mul_lt_mul_of_pos_left h_r2 h_α
+    The net expected clinical benefit from PGS-guided care is monotonically
+    increasing in R². This is established structurally via expectations. -/
+theorem clinical_benefit_increases_with_r2 {Ω : Type*}
+    (m : HealthEconomicsModel Ω)
+    (h_r2 : m.r2₁ < m.r2₂) :
+    expectedBenefit m.E m.targeted₁ m.γ < expectedBenefit m.E m.targeted₂ m.γ := by
+  unfold expectedBenefit
+  have h_pull1 : (fun ω => m.γ * m.targeted₁ ω) = m.γ • m.targeted₁ := rfl
+  have h_pull2 : (fun ω => m.γ * m.targeted₂ ω) = m.γ • m.targeted₂ := rfl
+  rw [h_pull1, h_pull2]
+  rw [m.E.smul_eval, m.E.smul_eval]
+  rw [m.h_r2₁, m.h_r2₂]
+  exact mul_lt_mul_of_pos_left h_r2 m.h_γ
 
 /-- **Portability gap creates benefit gap.**
-    If R²_EUR > R²_AFR and benefit = α × R² with α > 0, then
-    clinical benefit for EUR patients exceeds that for AFR patients.
-    The benefit gap α × (R²_EUR - R²_AFR) > 0 follows from the R² gap. -/
-theorem portability_creates_benefit_gap
-    (α r2_eur r2_afr : ℝ)
-    (h_α : 0 < α)
-    (h_r2_gap : r2_afr < r2_eur)
-    (h_nn : 0 ≤ r2_afr) :
-    0 < α * r2_eur - α * r2_afr := by
-  have : r2_eur - r2_afr > 0 := by linarith
-  nlinarith
+    If R²₁ > R²₂ structurally, the expected clinical benefit
+    gap is strictly positive. -/
+theorem portability_creates_benefit_gap {Ω : Type*}
+    (m : HealthEconomicsModel Ω)
+    (h_r2_gap : m.r2₂ < m.r2₁) :
+    0 < expectedBenefit m.E m.targeted₁ m.γ - expectedBenefit m.E m.targeted₂ m.γ := by
+  unfold expectedBenefit
+  have h_pull1 : (fun ω => m.γ * m.targeted₁ ω) = m.γ • m.targeted₁ := rfl
+  have h_pull2 : (fun ω => m.γ * m.targeted₂ ω) = m.γ • m.targeted₂ := rfl
+  rw [h_pull1, h_pull2]
+  rw [m.E.smul_eval, m.E.smul_eval]
+  rw [m.h_r2₁, m.h_r2₂]
+  have : m.γ * m.r2₂ < m.γ * m.r2₁ := mul_lt_mul_of_pos_left h_r2_gap m.h_γ
+  linarith
 
 /-- **Disparity increases with Fst from discovery population.**
     Populations most genetically distant from the discovery
@@ -77,27 +110,28 @@ theorem disparity_increases_with_distance
   linarith
 
 /-- **Existing health disparities may be amplified.**
-    If PGS is deployed only for the well-served population (EUR),
-    it adds benefit α × R²_eur to that group. The underserved group
-    gets no PGS benefit, so the pre-existing disparity d₀ ≥ 0 grows
-    to d₀ + α × R²_eur. -/
-theorem deployment_amplifies_disparity
-    (d₀ α r2_eur : ℝ)
-    (h_nn : 0 ≤ d₀)
-    (h_α : 0 < α) (h_r2 : 0 < r2_eur) :
-    d₀ < d₀ + α * r2_eur := by
-  linarith [mul_pos h_α h_r2]
+    If PGS is deployed only for the well-served population,
+    it adds expected benefit to that group, amplifying pre-existing
+    disparity d₀. -/
+theorem deployment_amplifies_disparity {Ω : Type*}
+    (m : HealthEconomicsModel Ω)
+    (d₀ : ℝ)
+    (h_r2 : 0 < m.r2₁) :
+    d₀ < d₀ + expectedBenefit m.E m.targeted₁ m.γ := by
+  have h_benefit : 0 < expectedBenefit m.E m.targeted₁ m.γ := by
+    have h_eq := expectedBenefit_eq_r2_mul_gamma m m.targeted₁ m.r2₁ m.h_r2₁
+    rw [h_eq]
+    exact mul_pos m.h_γ h_r2
+  linarith
 
 /-- **QALY gap from portability.**
-    QALYs gained = γ × R² for a positive constant γ (QALYs per unit R²).
-    The QALY gap between two populations is γ × (R²₁ - R²₂), which is
-    positive when R²₁ > R²₂. Derived from the model, not assumed. -/
-theorem qaly_gap_proportional_to_r2_gap
-    (γ r2₁ r2₂ : ℝ)
-    (h_γ : 0 < γ) (h_gap : r2₂ < r2₁) :
-    0 < γ * r2₁ - γ * r2₂ := by
-  have : r2₁ - r2₂ > 0 := by linarith
-  nlinarith
+    The QALY gap between two populations is structurally derived from
+    the difference in expected successfully targeted individuals. -/
+theorem qaly_gap_proportional_to_r2_gap {Ω : Type*}
+    (m : HealthEconomicsModel Ω)
+    (h_gap : m.r2₂ < m.r2₁) :
+    0 < expectedBenefit m.E m.targeted₁ m.γ - expectedBenefit m.E m.targeted₂ m.γ := by
+  exact portability_creates_benefit_gap m h_gap
 
 end HealthDisparity
 
