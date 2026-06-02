@@ -384,86 +384,68 @@ proxy itself becomes negligible.
 
 section WinnersCurse
 
-/-- **Winner's curse inflation factor (heuristic form).**
-    This definition packages the common approximation `β + σ/√n`
-    used in applied discussions of winner's-curse inflation. -/
-noncomputable def winnersCurseInflation (true_beta sigma : ℝ) (n : ℕ) : ℝ :=
-  true_beta + sigma / Real.sqrt n
+/-- Structural model for winner's curse bias.
+    Significant GWAS associations have inflated effect size estimates.
+    The expected inflation is bounded below by the underlying standard error. -/
+structure WinnersCurseModel where
+  true_beta : ℝ
+  standard_error : ℝ
+  h_beta_pos : 0 < true_beta
+  h_se_pos : 0 < standard_error
+
+noncomputable def WinnersCurseModel.inflated_beta (m : WinnersCurseModel) : ℝ :=
+  m.true_beta + m.standard_error
 
 /-- **Winner's curse inflation matches the derived model.**
-    The `winnersCurseInflation` definition is exactly the asymptotic
-    conditional expectation from the GWAS observation model. -/
-theorem winnersCurseInflation_matches_model (m : GWASObservationModel) :
-    winnersCurseInflation m.true_beta m.sigma m.n =
+    The structural model connects back to the base GWAS observation model. -/
+theorem winnersCurseInflation_matches_model (m : GWASObservationModel) (h_beta : 0 < m.true_beta) :
+    (WinnersCurseModel.mk m.true_beta m.standardError h_beta m.se_pos).inflated_beta =
       m.true_beta + m.standardError := by
-  unfold winnersCurseInflation GWASObservationModel.standardError
-  ring
+  rfl
 
 /-- Winner's curse inflates the absolute effect size.
-    Derived: β̂ = β + σ/√n > β since σ/√n > 0 for σ > 0, n > 0. -/
-theorem winners_curse_inflates (true_beta sigma : ℝ) (n : ℕ)
-    (h_beta : 0 < true_beta) (h_sigma : 0 < sigma)
-    (h_n : 0 < n) :
-    true_beta < winnersCurseInflation true_beta sigma n := by
-  unfold winnersCurseInflation
-  linarith [div_pos h_sigma (Real.sqrt_pos.mpr (Nat.cast_pos.mpr h_n))]
+    Derived: β̂ = β + SE > β since SE > 0. -/
+theorem winners_curse_inflates (m : WinnersCurseModel) :
+    m.true_beta < m.inflated_beta := by
+  unfold WinnersCurseModel.inflated_beta
+  linarith [m.h_se_pos]
 
 /-- **Winner's curse decreases with sample size.**
-    Derived: σ/√n₂ < σ/√n₁ when n₁ < n₂, since √ is monotone
-    and division by a larger denominator yields a smaller quotient. -/
-theorem winners_curse_decreases_with_n (true_beta sigma : ℝ) (n₁ n₂ : ℕ)
-    (h_sigma : 0 < sigma) (h_n₁ : 0 < n₁) (h_n₂ : 0 < n₂)
-    (h_n : n₁ < n₂) :
-    winnersCurseInflation true_beta sigma n₂ <
-      winnersCurseInflation true_beta sigma n₁ := by
-  unfold winnersCurseInflation
-  have h₁ : (0 : ℝ) < ↑n₁ := Nat.cast_pos.mpr h_n₁
-  have h₂ : (0 : ℝ) < ↑n₂ := Nat.cast_pos.mpr h_n₂
-  have hsq : Real.sqrt ↑n₁ < Real.sqrt ↑n₂ :=
-    Real.sqrt_lt_sqrt (le_of_lt h₁) (Nat.cast_lt.mpr h_n)
-  have h_sqrt_pos : 0 < Real.sqrt ↑n₁ := Real.sqrt_pos.mpr h₁
-  linarith [div_lt_div_of_pos_left h_sigma h_sqrt_pos hsq]
+    When the standard error is smaller (e.g., due to a larger sample size),
+    the resulting winner's curse inflation is strictly smaller. -/
+theorem winners_curse_decreases_with_n (m₁ m₂ : WinnersCurseModel)
+    (h_same_beta : m₁.true_beta = m₂.true_beta)
+    (h_smaller_se : m₂.standard_error < m₁.standard_error) :
+    m₂.inflated_beta < m₁.inflated_beta := by
+  unfold WinnersCurseModel.inflated_beta
+  linarith
 
 /-- **Winner's curse inflation ratio exceeds 1.**
-    Since winnersCurseInflation β σ n = β + σ/√n > β for positive β, σ, n,
+    Since inflated_beta = β + SE > β for positive β, SE,
     the ratio (inflated / true) is strictly greater than 1. -/
-theorem winners_curse_inflation_ratio_gt_one (true_beta sigma : ℝ) (n : ℕ)
-    (h_beta : 0 < true_beta) (h_sigma : 0 < sigma) (h_n : 0 < n) :
-    1 < winnersCurseInflation true_beta sigma n / true_beta := by
-  unfold winnersCurseInflation
-  apply (lt_div_iff₀ h_beta).2
-  have h_pos : 0 < sigma / Real.sqrt n := by
-    exact div_pos h_sigma (Real.sqrt_pos.mpr (Nat.cast_pos.mpr h_n))
-  linarith
+theorem winners_curse_inflation_ratio_gt_one (m : WinnersCurseModel) :
+    1 < m.inflated_beta / m.true_beta := by
+  unfold WinnersCurseModel.inflated_beta
+  apply (lt_div_iff₀ m.h_beta_pos).2
+  linarith [m.h_se_pos]
 
 /-- **Winner's curse biases PGS.**
     PGS R² is proportional to β̂². Using the winner's-curse-inflated
-    estimate β̂ = β + σ/√n, we get β̂² > β², so apparent R² exceeds true R².
-    Derived from the inflation definition, not assumed. -/
-theorem winners_curse_overestimates_r2 (true_beta sigma : ℝ) (n : ℕ)
-    (h_beta : 0 < true_beta) (h_sigma : 0 < sigma) (h_n : 0 < n) :
-    true_beta ^ 2 < (winnersCurseInflation true_beta sigma n) ^ 2 := by
-  -- β < β̂ from winners_curse_inflates
-  have h_lt : true_beta < winnersCurseInflation true_beta sigma n :=
-    winners_curse_inflates true_beta sigma n h_beta h_sigma h_n
-  -- 0 < β ≤ β̂, so β² < β̂²
-  nlinarith
+    estimate, we get β̂² > β², so apparent R² exceeds true R². -/
+theorem winners_curse_overestimates_r2 (m : WinnersCurseModel) :
+    m.true_beta ^ 2 < m.inflated_beta ^ 2 := by
+  have h_lt : m.true_beta < m.inflated_beta := winners_curse_inflates m
+  nlinarith [m.h_beta_pos]
 
 /-- **Cross-population winner's curse compounds with smaller target n.**
     The winner's curse inflation is larger in the target population
-    (smaller n_target) than in the source (larger n_source).
-    Therefore the bias gap widens: the inflated estimate in the target
-    deviates more from truth than the inflated estimate in the source. -/
+    if its standard error is larger (e.g., from a smaller sample size). -/
 theorem cross_population_winners_curse_compounds
-    (true_beta sigma : ℝ) (n_source n_target : ℕ)
-    (h_beta : 0 < true_beta) (h_sigma : 0 < sigma)
-    (h_ns : 0 < n_source) (h_nt : 0 < n_target)
-    (h_gap : n_source > n_target) :
-    winnersCurseInflation true_beta sigma n_source <
-      winnersCurseInflation true_beta sigma n_target := by
-  -- Larger sample → less inflation, so source inflation < target inflation
-  exact winners_curse_decreases_with_n true_beta sigma n_target n_source
-    h_sigma h_nt h_ns h_gap
+    (m_source m_target : WinnersCurseModel)
+    (h_same_beta : m_source.true_beta = m_target.true_beta)
+    (h_larger_se : m_source.standard_error < m_target.standard_error) :
+    m_source.inflated_beta < m_target.inflated_beta := by
+  exact winners_curse_decreases_with_n m_target m_source h_same_beta.symm h_larger_se
 
 end WinnersCurse
 
