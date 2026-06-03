@@ -53,8 +53,7 @@ theorem clinical_benefit_increases_with_r2
 theorem portability_creates_benefit_gap
     (α r2_eur r2_afr : ℝ)
     (h_α : 0 < α)
-    (h_r2_gap : r2_afr < r2_eur)
-    (h_nn : 0 ≤ r2_afr) :
+    (h_r2_gap : r2_afr < r2_eur) :
     0 < α * r2_eur - α * r2_afr := by
   have : r2_eur - r2_afr > 0 := by linarith
   nlinarith
@@ -67,13 +66,19 @@ theorem portability_creates_benefit_gap
 theorem disparity_increases_with_distance
     (R2_source fst₁ fst₂ : ℝ)
     (h_R2 : 0 < R2_source)
-    (h_fst₁_pos : 0 < fst₁) (h_fst₁_lt : fst₁ < 1)
-    (h_fst₂_pos : 0 < fst₂) (h_fst₂_lt : fst₂ < 1)
+    (h_fst₁_pos : 0 < fst₁)
+    (h_fst₂_lt : fst₂ < 1)
     (h_fst : fst₁ < fst₂) :
     -- R² loss at fst₁ < R² loss at fst₂
     R2_source * (1 - (1 - fst₁) ^ 2) < R2_source * (1 - (1 - fst₂) ^ 2) := by
   apply mul_lt_mul_of_pos_left _ h_R2
-  have h1 : (1 - fst₂) ^ 2 < (1 - fst₁) ^ 2 := by nlinarith
+  have h_fst2_pos : 0 < fst₂ := by linarith
+  have h_fst1_lt : fst₁ < 1 := by linarith
+  have h_base1 : 0 < 1 - fst₁ := by linarith
+  have h_base2 : 0 < 1 - fst₂ := by linarith
+  have h1 : 1 - fst₂ < 1 - fst₁ := by linarith
+  have h2 : (1 - fst₂) ^ 2 < (1 - fst₁) ^ 2 := by
+    nlinarith
   linarith
 
 /-- **Existing health disparities may be amplified.**
@@ -83,7 +88,6 @@ theorem disparity_increases_with_distance
     to d₀ + α × R²_eur. -/
 theorem deployment_amplifies_disparity
     (d₀ α r2_eur : ℝ)
-    (h_nn : 0 ≤ d₀)
     (h_α : 0 < α) (h_r2 : 0 < r2_eur) :
     d₀ < d₀ + α * r2_eur := by
   linarith [mul_pos h_α h_r2]
