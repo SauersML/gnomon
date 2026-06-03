@@ -239,12 +239,42 @@ theorem effective_n_pos (se : ℝ) (h_se : 0 < se) :
     Random effects: allows β to vary with between-population variance tau².
     When tau² > 0, the random effects SE is larger (wider CI) because
     it adds tau² to the within-study variance. -/
-theorem random_effects_captures_heterogeneity
-    (se_fixed tau_sq : ℝ) -- fixed-effects SE and between-population variance
-    (h_se : 0 < se_fixed) (h_heterogeneous : 0 < tau_sq) :
-    -- Random effects SE² = fixed SE² + tau² > fixed SE²
-    se_fixed ^ 2 < se_fixed ^ 2 + tau_sq := by
-  linarith
+structure MetaAnalysisModel (k : ℕ) where
+  w : Fin k → ℝ
+  h_w_pos : ∀ i, 0 < w i
+  tau_sq : ℝ
+  h_tau_sq_pos : 0 < tau_sq
+  h_k_pos : 0 < k
+
+noncomputable def MetaAnalysisModel.fixedVariance {k : ℕ} (m : MetaAnalysisModel k) : ℝ :=
+  1 / ∑ i, m.w i
+
+noncomputable def MetaAnalysisModel.randomVariance {k : ℕ} (m : MetaAnalysisModel k) : ℝ :=
+  1 / ∑ i, (1 / (1 / m.w i + m.tau_sq))
+
+theorem random_effects_captures_heterogeneity {k : ℕ} (m : MetaAnalysisModel k) :
+    m.fixedVariance < m.randomVariance := by
+  have hk : Nonempty (Fin k) := Fin.pos_iff_nonempty.mp m.h_k_pos
+  have h_w_sum_pos : 0 < ∑ i, m.w i := Finset.sum_pos (fun i _ => m.h_w_pos i) Finset.univ_nonempty
+  have h_rw_sum_pos : 0 < ∑ i, (1 / (1 / m.w i + m.tau_sq)) := by
+    apply Finset.sum_pos
+    · intro i _
+      have hw : 0 < m.w i := m.h_w_pos i
+      have ht : 0 < m.tau_sq := m.h_tau_sq_pos
+      have : 0 < 1 / m.w i + m.tau_sq := by positivity
+      positivity
+    · exact Finset.univ_nonempty
+
+  apply one_div_lt_one_div_of_lt h_rw_sum_pos
+  apply Finset.sum_lt_sum_of_nonempty Finset.univ_nonempty
+  intro i _
+  have hw : 0 < m.w i := m.h_w_pos i
+  have ht : 0 < m.tau_sq := m.h_tau_sq_pos
+  have h1 : 0 < 1 / m.w i := by positivity
+  have h2 : 1 / m.w i < 1 / m.w i + m.tau_sq := by linarith
+  have h3 : 1 / (1 / m.w i + m.tau_sq) < 1 / (1 / m.w i) := one_div_lt_one_div_of_lt h1 h2
+  have h4 : 1 / (1 / m.w i) = m.w i := one_div_one_div (m.w i)
+  rwa [h4] at h3
 
 end SummaryStatPGS
 
@@ -333,22 +363,28 @@ section GeneticCorrelationMethods
     Uses the LDAK model for LD-dependent architecture
     and may give different ρ_g estimates than LDSC. -/
 
+/-- Uncertainty range from multiple estimates -/
+def uncertaintyRange (e1 e2 e3 : ℝ) : ℝ :=
+  max (max e1 e2) e3 - min (min e1 e2) e3
+
 /-- **Method comparison: different methods can give different ρ̂_g.**
     This matters because ρ̂_g predicts portability.
     When methods disagree, the range of estimates is positive,
     introducing irreducible uncertainty in portability prediction. -/
 theorem method_disagreement_increases_uncertainty
     (rho_ldsc rho_popcorn rho_sumher : ℝ)
-    (h_order : rho_popcorn < rho_ldsc)
-    (h_order₂ : rho_ldsc < rho_sumher) :
-    -- The range of estimates is strictly positive
-    0 < rho_sumher - rho_popcorn := by linarith
-
-/-- **Genetic correlation varies across the genome.**
-    ρ_g estimated from different genomic regions can vary,
-    reflecting locus-specific selection pressures.
-    The genome-wide estimate is a weighted average of per-region estimates,
-    so it falls between the extremes. -/
+    (h_diff : rho_popcorn < rho_ldsc) :
+    0 < uncertaintyRange rho_ldsc rho_popcorn rho_sumher := by
+  unfold uncertaintyRange
+  have h1 : min (min rho_ldsc rho_popcorn) rho_sumher ≤ rho_popcorn := by
+    calc min (min rho_ldsc rho_popcorn) rho_sumher
+      _ ≤ min rho_ldsc rho_popcorn := min_le_left _ _
+      _ ≤ rho_popcorn := min_le_right _ _
+  have h2 : rho_ldsc ≤ max (max rho_ldsc rho_popcorn) rho_sumher := by
+    calc rho_ldsc
+      _ ≤ max rho_ldsc rho_popcorn := le_max_left _ _
+      _ ≤ max (max rho_ldsc rho_popcorn) rho_sumher := le_max_left _ _
+  linarith
 theorem local_genetic_correlation_varies
     (rho_chr1 rho_chr6 : ℝ) (w₁ w₆ : ℝ)
     (h_chr6_lower : rho_chr6 < rho_chr1) -- HLA region has lower correlation
@@ -358,6 +394,9 @@ theorem local_genetic_correlation_varies
   rw [lt_div_iff₀ (by linarith : (0:ℝ) < w₁ + w₆)]
   nlinarith
 
+/-- Convert Fst to an expected genetic correlation proxy. -/
+def fst_to_rg (fst : ℝ) : ℝ := 1 - fst
+
 /-- **Genetic correlation is frequency-dependent.**
     Common variants may have higher ρ_g than rare variants
     because common variants are older and more shared across populations.
@@ -365,11 +404,10 @@ theorem local_genetic_correlation_varies
     and Fst is lower for older (common) variants. -/
 theorem common_variants_higher_correlation
     (fst_common fst_rare : ℝ)
-    (h_fst_common : 0 ≤ fst_common) (h_fst_common_lt : fst_common < 1)
-    (h_fst_rare : 0 ≤ fst_rare) (h_fst_rare_lt : fst_rare < 1)
     (h_older_less_diverged : fst_common < fst_rare) :
-    -- ρ_g ~ 1 - Fst, so lower Fst → higher correlation
-    1 - fst_rare < 1 - fst_common := by linarith
+    fst_to_rg fst_rare < fst_to_rg fst_common := by
+  unfold fst_to_rg
+  linarith
 
 end GeneticCorrelationMethods
 

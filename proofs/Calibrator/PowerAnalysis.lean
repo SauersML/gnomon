@@ -580,15 +580,20 @@ with perfect power.
 
 section EffectSizeHeterogeneity
 
+/-- **Expected target R² from genetic correlation.**
+    Given a source population R² and a cross-population genetic correlation r_g,
+    the expected upper bound on target R² is r_g² * r2_source. -/
+def expectedTargetR2 (rg r2_source : ℝ) := rg^2 * r2_source
+
 /-- **Genetic correlation between ancestries.**
     r_g < 1 means effect sizes are not perfectly correlated.
     This sets an upper bound on cross-ancestry R². -/
 theorem genetic_correlation_bounds_portability
-    (r2_source r2_target rg : ℝ)
-    (h_bound : r2_target ≤ rg^2 * r2_source)
+    (r2_source rg : ℝ)
     (h_rg : |rg| < 1) (h_r2 : 0 < r2_source) :
-    r2_target < r2_source := by
+    expectedTargetR2 rg r2_source < r2_source := by
   have : rg^2 < 1 := by nlinarith [sq_abs rg, abs_nonneg rg, sq_nonneg rg]
+  unfold expectedTargetR2
   nlinarith
 
 /-- **High genetic correlation implies good portability.**
@@ -596,10 +601,11 @@ theorem genetic_correlation_bounds_portability
     genetic architecture is shared. -/
 theorem high_rg_implies_good_portability
     (rg lb r2_source : ℝ)
-    (h_rg : lb < rg) (h_lb_nn : 0 ≤ lb) (h_rg_le : rg ≤ 1)
+    (h_rg : lb < rg) (h_lb_nn : 0 ≤ lb) (_h_rg_le : rg ≤ 1)
     (h_r2 : 0 < r2_source) :
-    lb^2 * r2_source < rg^2 * r2_source := by
+    expectedTargetR2 lb r2_source < expectedTargetR2 rg r2_source := by
   have : lb ^ 2 < rg ^ 2 := by nlinarith [sq_nonneg (rg - lb)]
+  unfold expectedTargetR2
   nlinarith
 
 /-- **Low r_g limits portability.**
@@ -607,10 +613,11 @@ theorem high_rg_implies_good_portability
     cross-population PGS for the affected traits. -/
 theorem low_rg_limits_portability
     (rg ub r2_source : ℝ)
-    (h_rg : rg < ub) (h_rg_nn : 0 ≤ rg) (h_ub_nn : 0 ≤ ub)
+    (h_rg : rg < ub) (h_rg_nn : 0 ≤ rg) (_h_ub_nn : 0 ≤ ub)
     (h_r2 : 0 < r2_source) :
-    rg^2 * r2_source < ub^2 * r2_source := by
+    expectedTargetR2 rg r2_source < expectedTargetR2 ub r2_source := by
   have : rg ^ 2 < ub ^ 2 := by nlinarith [sq_nonneg (rg - ub)]
+  unfold expectedTargetR2
   nlinarith
 
 end EffectSizeHeterogeneity
