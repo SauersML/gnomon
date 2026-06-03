@@ -69,6 +69,15 @@ pub fn run(opts: AllOptions) -> Result<(), Box<dyn std::error::Error>> {
     println!("Score path: {}", opts.score.display());
     println!("Projection model: {}", opts.model);
 
+    // Bring up Rayon's global thread pool ONCE, up front, before any phase
+    // touches a parallel primitive. The VCF→PLINK conversion in phase 1
+    // (`convert_genome`) runs `into_par_iter()`, which would otherwise lazily
+    // initialize the global pool with rayon's defaults; the later `score`
+    // phase's explicit `build_global()` would then race that and abort the
+    // process (the historical `gnomon all` SIGABRT). This idempotent helper
+    // configures the pool first and makes every subsequent init a no-op.
+    gnomon::parallel::init_global_thread_pool();
+
     // --- Phase 1: ensure PLINK fileset (single VCF scan, cached for reuse) ---
     let format = detect_input_format(&vcf_path).ok_or_else(|| -> Box<dyn std::error::Error> {
         format!(

@@ -4,6 +4,12 @@
 #![deny(unused_imports)]
 #![deny(clippy::no_effect_underscore_binding)]
 
+/// Centralized, idempotent Rayon global thread-pool initialization. Used by
+/// every Rayon-using phase (`score`, `project`, `terms`) so that the
+/// multi-phase `gnomon all` driver cannot abort on a racing `build_global()`.
+#[cfg(any(feature = "score", feature = "map", feature = "terms"))]
+pub mod parallel;
+
 #[cfg(any(feature = "score", feature = "map", feature = "terms"))]
 pub mod files;
 
