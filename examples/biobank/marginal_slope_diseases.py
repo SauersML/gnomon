@@ -1380,18 +1380,18 @@ def pc_duchon_term(num_pcs: int) -> str:
 
 def pc_marginal_surface_term_binary(num_pcs: int) -> str:
     pcs = ", ".join(f"PC{i+1}" for i in range(num_pcs))
-    # Polyharmonic Duchon marginal surface, sharing one basis with the logslope
-    # channel (the scientific target: PC-varying PRS log-OR).
+    # WORKAROUND for SauersML/gam#754 (sibling of the closed #531 audit FATAL).
+    # A scale-free Duchon surface leaves a polynomial nullspace unpenalized: its
+    # CONSTANT collided with the probit intercept (#531, now cleared by
+    # orthogonalization), but the surviving LINEAR PC directions are unpenalized
+    # AND unconstrained on a probit fit, so the marginal-block coefficient runs
+    # away (β→∞, λ→0) and the outer REML/ARC solve never converges (#754).
     #
-    # KNOWN gam-side issue in the probit binary path: the Duchon penalty leaves
-    # a polynomial nullspace unpenalized. Its CONSTANT direction collides with
-    # the GLM marginal block's explicit intercept (the audit FATAL of #531,
-    # closed); orthogonalization now clears that, but the surviving LINEAR PC
-    # directions are unpenalized AND unconstrained on a probit fit, so the outer
-    # REML/ARC solve fails to converge (β→∞, λ→0) -- SauersML/gam#754. The escape
-    # hatch is a strictly-PD Matern marginal (no polynomial nullspace); we keep
-    # Duchon here pending the gam-side fix so both channels share a basis.
-    return f"duchon({pcs}, centers={DUCHON_CENTERS})"
+    # A Matern kernel is strictly positive-definite -> NO polynomial nullspace,
+    # so the surface stays identifiable and the outer solve converges. nu
+    # defaults to 5/2; length_scale auto-set; centers matched to the Duchon run.
+    # Shared by both channels here. Revert to duchon once gam#754 lands.
+    return f"matern({pcs}, centers={DUCHON_CENTERS})"
 
 
 def fit_marginal_slope(train_df: pd.DataFrame, num_pcs: int):  # -> gamfit.Model
