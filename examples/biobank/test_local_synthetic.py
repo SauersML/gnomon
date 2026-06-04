@@ -21,7 +21,7 @@ For each scenario the script:
   5. fits `case ~ duchon(PC1..PC10) + sex` with `prs_z` driving the
      marginal-slope log-slope channel through the same Duchon smooth
      (no `linkwiggle()` either channel — both hang, SauersML/gam#683),
-  6. reports held-out AUROC, Nagelkerke R^2, and Lee-2011 liability R^2.
+  6. reports held-out AUROC and Lee-2011 liability-scale R^2.
 
 Run:  uv run examples/biobank/test_local_synthetic.py
 """
@@ -144,7 +144,7 @@ def fit_marginal_slope(train_df: pd.DataFrame, num_pcs: int) -> gamfit.Model:
 
 
 def metrics(y: np.ndarray, p: np.ndarray, K: float) -> dict[str, float]:
-    """Held-out AUROC + Nagelkerke + Lee-2011 liability-scale R^2.
+    """Held-out AUROC + Lee-2011 liability-scale R^2.
 
     Lee, Wray, Goddard, Visscher (AJHG 2011, eq. 23) for ascertained case-control:
 
@@ -165,7 +165,6 @@ def metrics(y: np.ndarray, p: np.ndarray, K: float) -> dict[str, float]:
         "cases": int(y.sum()),
         "P": P,
         "auroc": float(roc_auc_score(y, p)),
-        "nagelkerke_r2": float(nagelkerke),
         "liability_r2": float(liability_r2),
     }
 
@@ -221,7 +220,7 @@ def main() -> None:
         )
         print(
             f"  held-out  AUROC={m['auroc']:.4f}  "
-            f"Nagelkerke R^2={m['nagelkerke_r2']:.4f}  liability R^2={m['liability_r2']:.4f}"
+            f"liability R^2={m['liability_r2']:.4f}"
         )
 
 

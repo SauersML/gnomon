@@ -1281,7 +1281,6 @@ class SurvivalMetricStats:
     c_ipcw: float
     c_ipcw_ci_low: float
     c_ipcw_ci_high: float
-    dynamic_auc_mean: float
     ibs: float
     null_ibs: float
     r2_ibs: float
@@ -1305,9 +1304,7 @@ class BinaryStats:
     prevalence: float
     auroc: float
     average_precision: float
-    log_loss: float
     brier: float
-    nagelkerke_r2: float
     liability_r2: float
 
 
@@ -1471,10 +1468,14 @@ def fit_marginal_slope(train_df: pd.DataFrame, num_pcs: int):  # -> gamfit.Model
 # Both the GAM and the logistic baselines consume these same columns, so
 # age is a fully matched nuisance term and any GAM-vs-baseline delta
 # reflects PC/PRS treatment only.
+# NOTE: current_age_z2 (the age quadratic) is intentionally DROPPED — it is the
+# prime suspect for the probit marginal-slope outer-REML non-convergence
+# (SauersML/gam#754): an unpenalized quadratic near-separates on the 1:1
+# balanced sample, runaway β≈50. Linear current_age_z + birth_year_z kept.
+# Re-add once gam ridges the unpenalized parametric block (#754).
 BASELINE_AGE_FEATURES = [
     "entry_age_z",
     "current_age_z",
-    "current_age_z2",
     "birth_year_z",
 ]
 GAM_AGE_FEATURES = list(BASELINE_AGE_FEATURES)
@@ -1537,9 +1538,6 @@ def _add_binary_age_features(
             raise ValueError(f"training column {src!r} has zero or invalid variance")
         train[dst] = (train[src] - mean) / std
         test[dst] = (test[src] - mean) / std
-    # Quadratic curvature in current age (the nuisance the spline used to carry).
-    train["current_age_z2"] = train["current_age_z"] ** 2
-    test["current_age_z2"] = test["current_age_z"] ** 2
     return train, test
 
 
@@ -1857,9 +1855,7 @@ def binary_stats(y: np.ndarray, p: np.ndarray, population_prevalence: float | No
         prevalence=prevalence,
         auroc=float(roc_auc_score(y, p)),
         average_precision=float(average_precision_score(y, p)),
-        log_loss=float(log_loss(y, p, labels=[0, 1])),
         brier=float(brier_score_loss(y, p)),
-        nagelkerke_r2=float(nagelkerke),
         liability_r2=float(liability_r2),
     )
 
@@ -1867,8 +1863,7 @@ def binary_stats(y: np.ndarray, p: np.ndarray, population_prevalence: float | No
 def fmt_binary(stats: BinaryStats) -> str:
     return (
         f"AUROC={stats.auroc:.4f}  AP={stats.average_precision:.4f}  "
-        f"logloss={stats.log_loss:.4f}  Brier={stats.brier:.4f}  "
-        f"Nagelkerke_R2={stats.nagelkerke_r2:.4f}  "
+        f"Brier={stats.brier:.4f}  "
         f"liability_R2={stats.liability_r2:.4f}"
     )
 
@@ -1880,9 +1875,7 @@ def _binary_fields(prefix: str, stats: BinaryStats) -> dict[str, float | int]:
         f"{prefix}_prevalence": stats.prevalence,
         f"{prefix}_auroc": stats.auroc,
         f"{prefix}_average_precision": stats.average_precision,
-        f"{prefix}_log_loss": stats.log_loss,
         f"{prefix}_brier": stats.brier,
-        f"{prefix}_nagelkerke_r2": stats.nagelkerke_r2,
         f"{prefix}_liability_r2": stats.liability_r2,
     }
 
@@ -2209,7 +2202,6 @@ def survival_library_metrics(
     """
     from sksurv.metrics import (
         concordance_index_ipcw,
-        cumulative_dynamic_auc,
         integrated_brier_score,
     )
 
@@ -2241,7 +2233,6 @@ def survival_library_metrics(
     tau = float(np.clip(tau_candidate, float(followup_times[0]), float(followup_times[-1])))
     c_ipcw = float(concordance_index_ipcw(train_y, test_y, risk, tau=tau)[0])
     c_ipcw_ci_low, c_ipcw_ci_high = bootstrap_ipcw_c_ci(train, test, risk, tau)
-    _, mean_auc = cumulative_dynamic_auc(train_y, test_y, risk, followup_times)
     ibs = float(integrated_brier_score(train_y, test_y, surv_cond, followup_times))
     null_ibs = float(
         integrated_brier_score(
@@ -2259,7 +2250,6 @@ def survival_library_metrics(
         c_ipcw=c_ipcw,
         c_ipcw_ci_low=c_ipcw_ci_low,
         c_ipcw_ci_high=c_ipcw_ci_high,
-        dynamic_auc_mean=float(mean_auc),
         ibs=ibs,
         null_ibs=null_ibs,
         r2_ibs=r2_ibs,
@@ -2274,7 +2264,6 @@ def fmt_survival(stats: SurvivalMetricStats) -> str:
     return (
         f"C_ipcw={stats.c_ipcw:.4f} "
         f"95%CI=[{stats.c_ipcw_ci_low:.4f},{stats.c_ipcw_ci_high:.4f}]  "
-        f"iAUC={stats.dynamic_auc_mean:.4f}  "
         f"IBS={stats.ibs:.5f}  R2_IBS={stats.r2_ibs:.4f}"
     )
 
@@ -2287,7 +2276,6 @@ def _survival_fields(prefix: str, stats: SurvivalMetricStats) -> dict[str, float
         f"{prefix}_c_ipcw": stats.c_ipcw,
         f"{prefix}_c_ipcw_ci_low": stats.c_ipcw_ci_low,
         f"{prefix}_c_ipcw_ci_high": stats.c_ipcw_ci_high,
-        f"{prefix}_dynamic_auc_mean": stats.dynamic_auc_mean,
         f"{prefix}_ibs": stats.ibs,
         f"{prefix}_null_ibs": stats.null_ibs,
         f"{prefix}_r2_ibs": stats.r2_ibs,
@@ -2521,9 +2509,7 @@ def evaluate_binary_model_pair(
     )
     print(
         "  binary_delta "
-        f"logloss(GAM-N)={gam_test_m.log_loss - N_test_m.log_loss:+.4f}  "
         f"Brier(GAM-N)={gam_test_m.brier - N_test_m.brier:+.4f}  "
-        f"Nagelkerke_R2(GAM-N)={gam_test_m.nagelkerke_r2 - N_test_m.nagelkerke_r2:+.4f}  "
         f"liability_R2(GAM-N)={gam_test_m.liability_r2 - N_test_m.liability_r2:+.4f}"
     )
 
@@ -2566,9 +2552,7 @@ def evaluate_binary_model_pair(
         "binary_baselineB_minus_nuisance_auroc_se": d_B_N[1],
         "binary_baselineB_minus_nuisance_auroc_ci_low": d_B_N[2],
         "binary_baselineB_minus_nuisance_auroc_ci_high": d_B_N[3],
-        "binary_delta_log_loss_vs_nuisance": gam_test_m.log_loss - N_test_m.log_loss,
         "binary_delta_brier_vs_nuisance": gam_test_m.brier - N_test_m.brier,
-        "binary_delta_nagelkerke_vs_nuisance": gam_test_m.nagelkerke_r2 - N_test_m.nagelkerke_r2,
         "binary_delta_liability_r2_vs_nuisance": gam_test_m.liability_r2 - N_test_m.liability_r2,
     }
     if score_train:

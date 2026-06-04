@@ -22,8 +22,6 @@ METRICS = {
     "liability_pseudo_r2": {"label": "Liability-scale pseudo-R2", "higher_better": True},
     "bss": {"label": "Brier Skill Score (BSS)", "higher_better": True},
     "mae_true_risk": {"label": "MAE vs known true risk", "higher_better": False},
-    "rmse_true_risk": {"label": "RMSE vs known true risk", "higher_better": False},
-    "abs_slope_error": {"label": "Abs. true-slope error", "higher_better": False},
     "abs_prevalence_error": {"label": "Abs. prevalence error", "higher_better": False},
 }
 
@@ -302,8 +300,8 @@ def main() -> None:
     accuracy = accuracy.merge(cell_prev, on=["dem", "pheno", "seed"], how="left")
     accuracy = add_bss_column(accuracy, accuracy["cell_true_prevalence"])
 
-    global_metrics = ["auc", "liability_pseudo_r2", "bss", "mae_true_risk", "rmse_true_risk"]
-    group_metrics = ["auc", "liability_pseudo_r2", "bss", "abs_slope_error", "abs_prevalence_error", "mae_true_risk", "rmse_true_risk"]
+    global_metrics = ["auc", "liability_pseudo_r2", "bss", "mae_true_risk"]
+    group_metrics = ["auc", "liability_pseudo_r2", "bss", "abs_prevalence_error", "mae_true_risk"]
 
     tests = pd.concat(
         [

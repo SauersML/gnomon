@@ -146,7 +146,6 @@ def global_metrics(y: np.ndarray, p: np.ndarray, p_true: np.ndarray, true_liab: 
     out: dict[str, float] = {
         "brier": float(brier_score_loss(y, p)),
         "mae_true_risk": float(mean_absolute_error(p_true, p)),
-        "rmse_true_risk": float(root_mean_squared_error(p_true, p)),
     }
     out["auc"] = float(roc_auc_score(y, p)) if len(np.unique(y)) == 2 else float("nan")
     if len(np.unique(eta)) > 1 and len(np.unique(true_liab)) > 1:
@@ -172,8 +171,6 @@ def group_metrics(frame: pd.DataFrame, method: str, p: np.ndarray, group_col: st
         p_hat = sub["p_hat"].to_numpy()
         eta_hat = probit(p_hat)
         true_liab = sub["true_liab"].to_numpy()
-        derived_slope = slope_of_prediction(sub["p_hat"].to_numpy(), sub["PGS_z"].to_numpy())
-        true_slope = float(sub["true_slope_deme"].mean())
         pred_prev = float(sub["p_hat"].mean())
         true_prev = float(sub["p_true"].mean())
         auc = float(roc_auc_score(y, p_hat)) if len(np.unique(y)) == 2 else float("nan")
@@ -188,9 +185,6 @@ def group_metrics(frame: pd.DataFrame, method: str, p: np.ndarray, group_col: st
                 "group": group,
                 "dist_from_train": float(sub["dist_from_train"].mean()),
                 "n": int(len(sub)),
-                "known_true_slope": true_slope,
-                "derived_prediction_slope": derived_slope,
-                "abs_slope_error": abs(derived_slope - true_slope),
                 "known_true_prevalence": true_prev,
                 "derived_prediction_prevalence": pred_prev,
                 "prevalence_error": pred_prev - true_prev,
@@ -198,7 +192,6 @@ def group_metrics(frame: pd.DataFrame, method: str, p: np.ndarray, group_col: st
                 "auc": auc,
                 "liability_pseudo_r2": liability_pseudo_r2,
                 "mae_true_risk": float(mean_absolute_error(sub["p_true"], sub["p_hat"])),
-                "rmse_true_risk": float(root_mean_squared_error(sub["p_true"], sub["p_hat"])),
                 "brier": float(brier_score_loss(sub["y_binary"], sub["p_hat"])),
             }
         )

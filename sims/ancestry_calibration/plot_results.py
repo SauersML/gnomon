@@ -256,7 +256,6 @@ def main() -> None:
     )
     plot_group_metrics(
         [
-            ("abs_slope_error", "Abs. true-slope error"),
             ("abs_prevalence_error", "Abs. prevalence error"),
             ("mae_true_risk", "MAE vs known true risk"),
         ],
