@@ -1557,17 +1557,14 @@ def fit_binary_marginal_slope(train_df: pd.DataFrame, num_pcs: int):  # -> gamfi
     import gamfit  # lazy
 
     age_terms = " + ".join(BASELINE_AGE_FEATURES)
-    # Marginal nuisance surface uses a strictly-PD Matern (no polynomial
-    # nullspace) to stay identifiable against the probit intercept; the
-    # logslope target keeps the polyharmonic Duchon. See gam#531 and
-    # pc_marginal_surface_term_binary().
     # Both PC surfaces are SMOOTH and matched: the baseline-risk marginal and the
-    # prs_z log-OR (logslope) share the same matern PC surface — the PC-varying
-    # PRS effect is the whole point of the marginal-slope model. matern (not
-    # duchon) for probit identifiability (gam#531); no linkwiggle on either
-    # channel (both hang the BMS cell-moment path, gam#683). The BMS outer REML
-    # can fail to converge on this (gam#754) — that is a gam-side bug to fix, NOT
-    # a reason to linearize this model.
+    # prs_z log-OR (logslope) share the same polyharmonic duchon PC surface — the
+    # PC-varying PRS effect is the whole point of the marginal-slope model. The
+    # duchon constant vs probit intercept (gam#531) is cleared by
+    # orthogonalization, so the audit passes; no linkwiggle on either channel
+    # (both hang the BMS cell-moment path, gam#683). The BMS outer REML can fail
+    # to converge on this (gam#754) — that is a gam-side bug to fix, NOT a reason
+    # to linearize or down-basis this model.
     marginal_surface = pc_marginal_surface_term_binary(num_pcs)
     logslope_formula = marginal_surface
     formula = f"event ~ {marginal_surface} + sex + {age_terms}"
