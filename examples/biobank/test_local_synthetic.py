@@ -18,9 +18,9 @@ For each scenario the script:
   2. takes 100 cases + 100 controls for *training* (no overlap with test),
   3. takes a disjoint 100 cases + 100 controls for *held-out test*,
   4. standardizes the PGS using training stats only (no leakage),
-  5. fits `case ~ duchon(PC1..PC10) + sex + linkwiggle()` with `prs_z`
-     driving the marginal-slope log-slope channel through the same Duchon
-     smooth plus logslope `linkwiggle()` score-warp,
+  5. fits `case ~ duchon(PC1..PC10) + sex` with `prs_z` driving the
+     marginal-slope log-slope channel through the same Duchon smooth
+     (no `linkwiggle()` either channel — both hang, SauersML/gam#683),
   6. reports held-out AUROC, Nagelkerke R^2, and Lee-2011 liability R^2.
 
 Run:  uv run examples/biobank/test_local_synthetic.py
@@ -119,13 +119,16 @@ def fit_marginal_slope(train_df: pd.DataFrame, num_pcs: int) -> gamfit.Model:
     both the location and log-slope channels; sex linear; prs_z is the
     latent score (z_column) so its slope varies in PC space.
 
-    Main-formula `linkwiggle()` enables link-deviation; logslope-formula
-    `linkwiggle()` enables score-warp.
+    No `linkwiggle()` on either channel: link-deviation and logslope
+    score-warp both hang the BMS cell-moment path (SauersML/gam#683).
     """
     pcs = ", ".join(f"PC{i+1}" for i in range(num_pcs))
     duchon = f"duchon({pcs}, centers={DUCHON_CENTERS}, order=1, power=2, length_scale=1.0)"
-    logslope_formula = f"{duchon} + linkwiggle()"
-    formula = f"case ~ {duchon} + sex + linkwiggle()"
+    # No linkwiggle (link-deviation) / logslope linkwiggle (score-warp): both hang
+    # the BMS cell-moment path (SauersML/gam#683). Matched duchon+duchon is fine here
+    # on synthetic data; prod binary uses matern+matern (gam#531 forbids duchon-marginal).
+    logslope_formula = duchon
+    formula = f"case ~ {duchon} + sex"
     cols = ["case", "sex", "prs_z"] + [f"PC{i+1}" for i in range(num_pcs)]
     print("  fit_spec: family=bernoulli marginal-slope  link=probit")
     print(f"  fit_spec: formula={formula!r}")

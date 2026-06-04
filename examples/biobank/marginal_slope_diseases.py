@@ -6,10 +6,10 @@ For each disease the script:
      OMOP/OHDSI `concept` table on the AoU CDR.
   2. Pulls everyone whose `condition_occurrence.condition_concept_id`
      descends from that concept via `concept_ancestor`.
-  3. Fits `Surv(entry_age, exit_age, event) ~ duchon(PC1..PC10) + sex
-     + linkwiggle()` with the hard-coded PGS feeding the marginal-slope latent z,
-     the same isotropic Duchon smooth on the log-slope channel, and logslope
-     `linkwiggle()` for score-warp.
+  3. Fits `Surv(entry_age, exit_age, event) ~ duchon(PC1..PC10) + sex`
+     with the hard-coded PGS feeding the marginal-slope latent z and the same
+     isotropic Duchon smooth on the log-slope channel. No `linkwiggle()` on
+     either channel (link-deviation / score-warp both hang, SauersML/gam#683).
   4. Compares against Z_norm2 and raw-PRS+PC Cox PH baselines on the same split.
   5. Runs leave-one-group-out OOD refits by care site, Census region, and
      AoU inferred genetic ancestry category.
@@ -1408,8 +1408,8 @@ def fit_marginal_slope(train_df: pd.DataFrame, num_pcs: int):  # -> gamfit.Model
     """Survival marginal-slope GAM with joint Duchon over PCs in both the
     baseline hazard surface and the log-slope (log-HR) channel; sex linear;
     prs_z is the latent score (z_column) so its hazard ratio varies in PC space.
-    Main-formula `linkwiggle()` enables link-deviation; logslope-formula
-    `linkwiggle()` enables score-warp.
+    No `linkwiggle()` on either channel: link-deviation and logslope score-warp
+    both hang the BMS cell-moment path (SauersML/gam#683).
 
     Age-as-time-scale: `Surv(entry_age, exit_age, event)` is left-truncated at
     each person's age at AoU observation start.
@@ -1423,8 +1423,10 @@ def fit_marginal_slope(train_df: pd.DataFrame, num_pcs: int):  # -> gamfit.Model
     """
     import gamfit  # lazy: lets the linear baseline import this module without dragging gamfit in
     duchon = pc_duchon_term(num_pcs)
-    logslope_formula = f"{duchon} + linkwiggle()"
-    formula = f"Surv(entry_age, exit_age, event) ~ {duchon} + sex + linkwiggle()"
+    # No linkwiggle (link-deviation) or logslope linkwiggle (score-warp): both hang
+    # bernoulli/survival marginal-slope in the BMS cell-moment path (SauersML/gam#683).
+    logslope_formula = duchon
+    formula = f"Surv(entry_age, exit_age, event) ~ {duchon} + sex"
     cols = survival_model_columns(num_pcs)
     model_df = train_df[cols]
     print("  fit_spec: family=survival marginal-slope")
@@ -1456,9 +1458,9 @@ def fit_marginal_slope(train_df: pd.DataFrame, num_pcs: int):  # -> gamfit.Model
 # adjustment (Harrell *RMS*, eMERGE/Inouye/Khera PRS validations).
 #
 # With age matched, every GAM-vs-baseline delta reflects PC/PRS treatment and
-# the requested flexible marginal-slope deviations: `duchon(PCs)` smooth
-# interaction, PC-varying PRS log-OR (gamfit's `logslope_formula`),
-# link-deviation, and score-warp.
+# the requested flexible marginal-slope deviations: a smooth PC surface and a
+# PC-varying PRS log-OR (gamfit's `logslope_formula`). Link-deviation and
+# score-warp (`linkwiggle()`) are omitted — both hang (SauersML/gam#683).
 BINARY_AGE_NS_DF = 4
 # Both the GAM and the logistic baselines consume the same
 # `cr(current_age, df=4)` natural cubic spline columns as plain linear
@@ -1551,21 +1553,26 @@ def fit_binary_marginal_slope(train_df: pd.DataFrame, num_pcs: int):  # -> gamfi
     nuisance we adjust for, not a quantity we want gamfit to spend REML
     degrees of freedom estimating, and matching the basis makes every
     GAM-vs-baseline delta attributable to PC/PRS treatment alone. PCs
-    enter via `duchon(PCs)` and the `prs_z` log-OR varies as
-    `duchon(PCs)` (its `logslope_formula`). Main-formula `linkwiggle()`
-    enables link-deviation; logslope-formula `linkwiggle()` enables score-warp.
+    enter via `matern(PCs)` and the `prs_z` log-OR varies as the same
+    `matern(PCs)` surface (its `logslope_formula`) — matched basis, with
+    matern required on the marginal channel for probit identifiability
+    (gam#531). No `linkwiggle()` on either channel: link-deviation and
+    logslope score-warp both hang the BMS cell-moment path (SauersML/gam#683).
     """
     import gamfit  # lazy
 
-    duchon = pc_duchon_term(num_pcs)
-    logslope_formula = f"{duchon} + linkwiggle()"
     age_terms = " + ".join(BASELINE_AGE_FEATURES)
     # Marginal nuisance surface uses a strictly-PD Matern (no polynomial
     # nullspace) to stay identifiable against the probit intercept; the
     # logslope target keeps the polyharmonic Duchon. See gam#531 and
     # pc_marginal_surface_term_binary().
     marginal_surface = pc_marginal_surface_term_binary(num_pcs)
-    formula = f"event ~ {marginal_surface} + sex + {age_terms} + linkwiggle()"
+    # Matched matern logslope (matern marginal is required for probit identifiability,
+    # gam#531 — so duchon-marginal is out, hence matern on both channels). No linkwiggle
+    # link-deviation and no logslope linkwiggle score-warp: both hang the BMS
+    # cell-moment path (SauersML/gam#683).
+    logslope_formula = marginal_surface
+    formula = f"event ~ {marginal_surface} + sex + {age_terms}"
     cols = binary_model_columns(num_pcs)
     print("  binary_fit_spec: family=bernoulli-marginal-slope  link=probit")
     print(f"  binary_fit_spec: formula={formula!r}")
@@ -2352,17 +2359,17 @@ def evaluate_binary_model_pair(
     """Fit Bernoulli marginal-slope GAM and matched logistic baselines on
     the same balanced split.
 
-    Age handling is fixed across models; the GAM additionally enables the
-    marginal-slope flexible link-deviation and score-warp blocks:
+    Age handling is fixed across models; the GAM adds the marginal-slope
+    flexible PC surface and PC-varying log-slope:
 
       * `binaryGAM` — Bernoulli marginal-slope GAM with
-        `duchon(PC1..PCk)` in the baseline-risk surface, the same
-        `duchon(...)` in the log-slope channel (so `prs_z`'s log-OR
+        `matern(PC1..PCk)` in the baseline-risk surface, the same
+        `matern(...)` in the log-slope channel (so `prs_z`'s log-OR
         varies by ancestry), and the matched age nuisance basis
         (`cr(current_age, df=4)` linear columns + linear `entry_age_z`,
-        identical to baselines N/A/B) plus `sex`. Main-formula
-        `linkwiggle()` enables link-deviation; logslope-formula
-        `linkwiggle()` enables score-warp.
+        identical to baselines N/A/B) plus `sex`. matern is required on the
+        marginal channel for probit identifiability (gam#531); no
+        `linkwiggle()` link-deviation or score-warp (both hang, gam#683).
       * `binaryN` — logistic GLM on the matched age nuisance basis
         (`cr(current_age, df=4)` natural cubic spline + linear
         `entry_age_z`) and `sex`, with *no PRS information*. The
