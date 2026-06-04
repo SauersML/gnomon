@@ -32,7 +32,7 @@ use std::fmt::Write as FmtWrite;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Once};
+use std::sync::Arc;
 use std::time::Instant;
 
 // ========================================================================================
@@ -152,15 +152,13 @@ fn fnv1a64_hex8(bytes: &[u8]) -> String {
 // Function removed to eliminate dead code warnings
 
 /// Core implementation that takes args as parameter
-static RAYON_INIT: Once = Once::new();
-
 fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
     // Initialize the Rayon global thread pool to use all available cores.
-    RAYON_INIT.call_once(|| {
-        rayon::ThreadPoolBuilder::new()
-            .build_global()
-            .expect("failed to initialize Rayon global thread pool");
-    });
+    // Routed through the shared, idempotent helper so that the multi-phase
+    // `gnomon all` driver (where the VCF→PLINK conversion may have already
+    // brought up the global pool lazily) cannot abort on a racing
+    // `build_global()`.
+    gnomon::parallel::init_global_thread_pool();
 
     let overall_start_time = Instant::now();
     let score_arg_str = args.score.to_string_lossy().to_string();

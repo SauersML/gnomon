@@ -541,6 +541,11 @@ fn run_project_inner(
     println!("=== Sample projection into PCA space ===");
     println!("Input genotype location: {}", genotype_path.display());
 
+    // Idempotently ensure Rayon's global pool is up. Harmless if a prior phase
+    // already initialized it (e.g. `gnomon all`); required for the standalone
+    // `gnomon-map` binary, which otherwise relies on lazy initialization.
+    crate::parallel::init_global_thread_pool();
+
     let dataset = open_dataset(genotype_path)?;
     println!(
         "Resolved genotype data file: {}",

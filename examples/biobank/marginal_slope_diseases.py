@@ -1401,7 +1401,7 @@ def pc_marginal_surface_term_binary(num_pcs: int) -> str:
     # fast path the duchon run used). Only the marginal (nuisance) baseline
     # surface changes basis; the logslope channel -- the scientific target
     # (PC-varying PRS log-OR) -- keeps the polyharmonic Duchon below.
-    return f"matern({pcs}, centers={DUCHON_CENTERS})"
+    return f"duchon({pcs}, centers={DUCHON_CENTERS})"
 
 
 def fit_marginal_slope(train_df: pd.DataFrame, num_pcs: int):  # -> gamfit.Model

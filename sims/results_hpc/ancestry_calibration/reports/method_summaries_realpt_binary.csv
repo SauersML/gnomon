@@ -1,0 +1,145 @@
+source,metric,metric_label,method,n,mean,median,sd,dem,pheno
+global_test,auc,AUC,gamfit,4,0.6892150571842128,0.6887487643568231,0.028058137295816365,grid2d,phenoA
+global_test,auc,AUC,linpc,4,0.6648925499378551,0.6676927877056726,0.030115310464583,grid2d,phenoA
+global_test,auc,AUC,znorm,4,0.5429620473934991,0.5225955336975425,0.05398326742052234,grid2d,phenoA
+global_test,auc,AUC,gamfit,4,0.6831856671594576,0.6727661945178405,0.039262468453594684,grid2d,phenoB
+global_test,auc,AUC,linpc,4,0.6579817757218558,0.6476651558172022,0.038755075912554705,grid2d,phenoB
+global_test,auc,AUC,znorm,4,0.546977165843529,0.5251655420338346,0.051463319384575136,grid2d,phenoB
+global_test,auc,AUC,gamfit,4,0.687962738211065,0.6922316277863896,0.029156121934359108,serial1d,phenoA
+global_test,auc,AUC,linpc,4,0.6431605179770368,0.6385353067877335,0.04016716459613008,serial1d,phenoA
+global_test,auc,AUC,znorm,4,0.6120939539051231,0.6179213793496469,0.05491799864923352,serial1d,phenoA
+global_test,auc,AUC,gamfit,4,0.6840798191040665,0.6724931124023091,0.025010369416419893,serial1d,phenoB
+global_test,auc,AUC,linpc,4,0.6685078414616242,0.6566965896156549,0.0324781148919728,serial1d,phenoB
+global_test,auc,AUC,znorm,4,0.6227483018322929,0.6294144911012199,0.07206568618850871,serial1d,phenoB
+global_test,liability_pseudo_r2,Liability-scale pseudo-R2,gamfit,4,0.23548322659524118,0.1822110212162401,0.1576963603588826,grid2d,phenoA
+global_test,liability_pseudo_r2,Liability-scale pseudo-R2,linpc,4,0.19682203877773627,0.1544650140652833,0.14756221243655052,grid2d,phenoA
+global_test,liability_pseudo_r2,Liability-scale pseudo-R2,znorm,4,0.02867381217279355,0.0084695355982706,0.04656903061319704,grid2d,phenoA
+global_test,liability_pseudo_r2,Liability-scale pseudo-R2,gamfit,4,0.29595498228843475,0.23420585365977484,0.16314534192960087,grid2d,phenoB
+global_test,liability_pseudo_r2,Liability-scale pseudo-R2,linpc,4,0.23266141253441636,0.17773720674056614,0.15384167740669222,grid2d,phenoB
+global_test,liability_pseudo_r2,Liability-scale pseudo-R2,znorm,4,0.028668479529239194,0.0084616025692401,0.04656873175382427,grid2d,phenoB
+global_test,liability_pseudo_r2,Liability-scale pseudo-R2,gamfit,4,0.23618025062238668,0.2494521793610675,0.06491046576604415,serial1d,phenoA
+global_test,liability_pseudo_r2,Liability-scale pseudo-R2,linpc,4,0.2157133115622837,0.2369776834581895,0.07726902861107235,serial1d,phenoA
+global_test,liability_pseudo_r2,Liability-scale pseudo-R2,znorm,4,0.13291323179904382,0.13714305117385706,0.10101681415172269,serial1d,phenoA
+global_test,liability_pseudo_r2,Liability-scale pseudo-R2,gamfit,4,0.28656389201133703,0.2876639132677896,0.05330577373887292,serial1d,phenoB
+global_test,liability_pseudo_r2,Liability-scale pseudo-R2,linpc,4,0.25118561425284164,0.2724898297500553,0.06385670850666907,serial1d,phenoB
+global_test,liability_pseudo_r2,Liability-scale pseudo-R2,znorm,4,0.13285395129590777,0.13713543698328584,0.10094056209309954,serial1d,phenoB
+global_test,brier,Brier score,gamfit,4,0.13055809595938572,0.1383858087247747,0.019168791309511796,grid2d,phenoA
+global_test,brier,Brier score,linpc,4,0.13356408752209345,0.1421499814058971,0.020130270882773107,grid2d,phenoA
+global_test,brier,Brier score,znorm,4,0.13988265408324266,0.14846114533828406,0.023287693528526065,grid2d,phenoA
+global_test,brier,Brier score,gamfit,4,0.12712576942867862,0.1342540818980339,0.02128604021999458,grid2d,phenoB
+global_test,brier,Brier score,linpc,4,0.12963256066597392,0.1378931106618223,0.02233945418749522,grid2d,phenoB
+global_test,brier,Brier score,znorm,4,0.13569558472848356,0.14583870626254608,0.025000465959879967,grid2d,phenoB
+global_test,brier,Brier score,gamfit,4,0.14812430865443937,0.15335056165832328,0.02772415107854187,serial1d,phenoA
+global_test,brier,Brier score,linpc,4,0.15220380210527984,0.15930151338835286,0.028973712320094987,serial1d,phenoA
+global_test,brier,Brier score,znorm,4,0.1548455612654977,0.16016389014912874,0.029312038119953338,serial1d,phenoA
+global_test,brier,Brier score,gamfit,4,0.1393883419434179,0.14921345651017345,0.03277482051733738,serial1d,phenoB
+global_test,brier,Brier score,linpc,4,0.14075716485010897,0.15150432727883928,0.03347370440920344,serial1d,phenoB
+global_test,brier,Brier score,znorm,4,0.1444095823306264,0.1529508361671294,0.03607206295755317,serial1d,phenoB
+global_test,mae_true_risk,MAE vs known true risk,gamfit,4,0.11501850280588802,0.11113489722981784,0.01912018581633041,grid2d,phenoA
+global_test,mae_true_risk,MAE vs known true risk,linpc,4,0.12237991172493753,0.1207995985885856,0.020189207300328686,grid2d,phenoA
+global_test,mae_true_risk,MAE vs known true risk,znorm,4,0.1415777950407435,0.15049651600937192,0.022704709643236405,grid2d,phenoA
+global_test,mae_true_risk,MAE vs known true risk,gamfit,4,0.11452817814806718,0.11152249387534985,0.02086337925896506,grid2d,phenoB
+global_test,mae_true_risk,MAE vs known true risk,linpc,4,0.12092086747466237,0.1200198222883509,0.021736361923795505,grid2d,phenoB
+global_test,mae_true_risk,MAE vs known true risk,znorm,4,0.13845074847267372,0.14633163974340918,0.02420535400302979,grid2d,phenoB
+global_test,mae_true_risk,MAE vs known true risk,gamfit,4,0.13714920815722287,0.14235896017020688,0.02611395066931744,serial1d,phenoA
+global_test,mae_true_risk,MAE vs known true risk,linpc,4,0.14781412897315424,0.15797192513839742,0.0273604204062266,serial1d,phenoA
+global_test,mae_true_risk,MAE vs known true risk,znorm,4,0.15641571929024634,0.1635227969083914,0.03001300822007635,serial1d,phenoA
+global_test,mae_true_risk,MAE vs known true risk,gamfit,4,0.13306408131846248,0.1438973237589789,0.03120355771408321,serial1d,phenoB
+global_test,mae_true_risk,MAE vs known true risk,linpc,4,0.13638090850562257,0.15027417960375977,0.03273056108892038,serial1d,phenoB
+global_test,mae_true_risk,MAE vs known true risk,znorm,4,0.1470771777682173,0.1555973535831792,0.03872137801580419,serial1d,phenoB
+global_test,rmse_true_risk,RMSE vs known true risk,gamfit,4,0.15738257968103353,0.1524190790686008,0.023578734062454913,grid2d,phenoA
+global_test,rmse_true_risk,RMSE vs known true risk,linpc,4,0.1656379572916095,0.16371155763005252,0.024008584010334323,grid2d,phenoA
+global_test,rmse_true_risk,RMSE vs known true risk,znorm,4,0.18381875877851028,0.19157601384092254,0.02488366112062619,grid2d,phenoA
+global_test,rmse_true_risk,RMSE vs known true risk,gamfit,4,0.15562662281781653,0.15169374924773776,0.024491491506657533,grid2d,phenoB
+global_test,rmse_true_risk,RMSE vs known true risk,linpc,4,0.16299015399499478,0.16189693604518673,0.024826166498410417,grid2d,phenoB
+global_test,rmse_true_risk,RMSE vs known true risk,znorm,4,0.1803452184812076,0.18768552657791035,0.025335273763927652,grid2d,phenoB
+global_test,rmse_true_risk,RMSE vs known true risk,gamfit,4,0.18034640454850542,0.1887285977580085,0.030590512699144146,serial1d,phenoA
+global_test,rmse_true_risk,RMSE vs known true risk,linpc,4,0.1915447729138645,0.20565072842664822,0.032424551706643975,serial1d,phenoA
+global_test,rmse_true_risk,RMSE vs known true risk,znorm,4,0.19920362436738076,0.2097514842152956,0.03138653830093021,serial1d,phenoA
+global_test,rmse_true_risk,RMSE vs known true risk,gamfit,4,0.17528610779862847,0.18686204818575913,0.03417169494688936,serial1d,phenoB
+global_test,rmse_true_risk,RMSE vs known true risk,linpc,4,0.17940358185517488,0.19507201341133995,0.03610357812763527,serial1d,phenoB
+global_test,rmse_true_risk,RMSE vs known true risk,znorm,4,0.18913024140362766,0.19829733200739363,0.039173726347644405,serial1d,phenoB
+distance_bins,auc,AUC,gamfit,44,0.6088922478476753,0.600750403348602,0.07886563798563345,grid2d,phenoA
+distance_bins,auc,AUC,linpc,44,0.5959140411433521,0.5985057267599745,0.07920333550073015,grid2d,phenoA
+distance_bins,auc,AUC,znorm,44,0.5550522642148177,0.5402290039183681,0.07337505509261004,grid2d,phenoA
+distance_bins,auc,AUC,gamfit,44,0.605550105001359,0.6309989981258316,0.09961551871756598,grid2d,phenoB
+distance_bins,auc,AUC,linpc,44,0.5913245231877121,0.5988419927815406,0.07664309801826584,grid2d,phenoB
+distance_bins,auc,AUC,znorm,44,0.5610832980939691,0.5415296853102914,0.08093162469624766,grid2d,phenoB
+distance_bins,auc,AUC,gamfit,40,0.6162703570818486,0.6186374806052753,0.06734836925780943,serial1d,phenoA
+distance_bins,auc,AUC,linpc,40,0.6148105745476158,0.6138045513045514,0.06677267817053116,serial1d,phenoA
+distance_bins,auc,AUC,znorm,40,0.6137850486061798,0.6133898695175172,0.06619915125660891,serial1d,phenoA
+distance_bins,auc,AUC,gamfit,40,0.6333929000875481,0.6304546737971519,0.09223761296993564,serial1d,phenoB
+distance_bins,auc,AUC,linpc,40,0.6299683564346157,0.6293141699478622,0.09025848039734845,serial1d,phenoB
+distance_bins,auc,AUC,znorm,40,0.6303936092029415,0.6241214544828506,0.08883835807869182,serial1d,phenoB
+distance_bins,liability_pseudo_r2,Liability-scale pseudo-R2,gamfit,44,0.14904502081542004,0.10019621923856101,0.1432182446057547,grid2d,phenoA
+distance_bins,liability_pseudo_r2,Liability-scale pseudo-R2,linpc,44,0.12827344816186362,0.0914000278444548,0.13268573485602736,grid2d,phenoA
+distance_bins,liability_pseudo_r2,Liability-scale pseudo-R2,znorm,44,0.06477854735748788,0.0088928910234004,0.12542723741735437,grid2d,phenoA
+distance_bins,liability_pseudo_r2,Liability-scale pseudo-R2,gamfit,44,0.17321346021856013,0.1406010737794388,0.13404265387772163,grid2d,phenoB
+distance_bins,liability_pseudo_r2,Liability-scale pseudo-R2,linpc,44,0.13249562670862092,0.11179391272199515,0.1310935740381652,grid2d,phenoB
+distance_bins,liability_pseudo_r2,Liability-scale pseudo-R2,znorm,44,0.06473338564339226,0.0088845779269194,0.12535395037177366,grid2d,phenoB
+distance_bins,liability_pseudo_r2,Liability-scale pseudo-R2,gamfit,40,0.1542805477899939,0.16804795288654706,0.1215932437356094,serial1d,phenoA
+distance_bins,liability_pseudo_r2,Liability-scale pseudo-R2,linpc,40,0.15967708691218271,0.1625296417481023,0.12168353250346849,serial1d,phenoA
+distance_bins,liability_pseudo_r2,Liability-scale pseudo-R2,znorm,40,0.15995611649861324,0.16995277193551794,0.12196394104757038,serial1d,phenoA
+distance_bins,liability_pseudo_r2,Liability-scale pseudo-R2,gamfit,40,0.15627464210883207,0.16859954281533174,0.12100779786478413,serial1d,phenoB
+distance_bins,liability_pseudo_r2,Liability-scale pseudo-R2,linpc,40,0.15930854739478786,0.16254815189708455,0.12168725852830618,serial1d,phenoB
+distance_bins,liability_pseudo_r2,Liability-scale pseudo-R2,znorm,40,0.15987011641914356,0.1699615172637362,0.1218870969070549,serial1d,phenoB
+distance_bins,brier,Brier score,gamfit,44,0.1240299168936483,0.130021105241265,0.05638883520213746,grid2d,phenoA
+distance_bins,brier,Brier score,linpc,44,0.12714211033450745,0.13146296773192573,0.059370714364121877,grid2d,phenoA
+distance_bins,brier,Brier score,znorm,44,0.13562615022493796,0.1318137155537322,0.06109562654520341,grid2d,phenoA
+distance_bins,brier,Brier score,gamfit,44,0.12206821566470959,0.12718436973938813,0.0554298259061531,grid2d,phenoB
+distance_bins,brier,Brier score,linpc,44,0.12396399074436754,0.13253400515204955,0.05678427091282597,grid2d,phenoB
+distance_bins,brier,Brier score,znorm,44,0.13333276415834724,0.13151240252651497,0.059734803950233825,grid2d,phenoB
+distance_bins,brier,Brier score,gamfit,40,0.1481243086544394,0.1525641438223283,0.05510215057632347,serial1d,phenoA
+distance_bins,brier,Brier score,linpc,40,0.1522038021052798,0.1552650712732451,0.055759394081024004,serial1d,phenoA
+distance_bins,brier,Brier score,znorm,40,0.15484556126549767,0.1504922181793757,0.05426473171718678,serial1d,phenoA
+distance_bins,brier,Brier score,gamfit,40,0.13938834194341793,0.13823237509703268,0.05489532946413034,serial1d,phenoB
+distance_bins,brier,Brier score,linpc,40,0.14075716485010897,0.142249936404541,0.05513946879058826,serial1d,phenoB
+distance_bins,brier,Brier score,znorm,40,0.14440958233062637,0.13759962318060576,0.05353233041872955,serial1d,phenoB
+distance_bins,abs_slope_error,Abs. true-slope error,gamfit,44,0.2025398866855154,0.18282837626588627,0.13553257981773492,grid2d,phenoA
+distance_bins,abs_slope_error,Abs. true-slope error,linpc,44,0.15556958993193903,0.15796476589322334,0.11847255461947073,grid2d,phenoA
+distance_bins,abs_slope_error,Abs. true-slope error,znorm,44,0.14778631423569968,0.1029271066806629,0.14136601077197955,grid2d,phenoA
+distance_bins,abs_slope_error,Abs. true-slope error,gamfit,44,0.199735995795681,0.1928617541462369,0.1189866104601278,grid2d,phenoB
+distance_bins,abs_slope_error,Abs. true-slope error,linpc,44,0.14706209687686145,0.1259513325288171,0.10842384016769635,grid2d,phenoB
+distance_bins,abs_slope_error,Abs. true-slope error,znorm,44,0.14623732547704588,0.08703175161322475,0.13482044640625437,grid2d,phenoB
+distance_bins,abs_slope_error,Abs. true-slope error,gamfit,40,0.17449308640869413,0.1487686223957413,0.12019628620802687,serial1d,phenoA
+distance_bins,abs_slope_error,Abs. true-slope error,linpc,40,0.20070676050730069,0.2012142257355486,0.1322444079404465,serial1d,phenoA
+distance_bins,abs_slope_error,Abs. true-slope error,znorm,40,0.17204382013006142,0.139880305956495,0.14543237067018466,serial1d,phenoA
+distance_bins,abs_slope_error,Abs. true-slope error,gamfit,40,0.1581394654625285,0.15446230341695275,0.10773475428650732,serial1d,phenoB
+distance_bins,abs_slope_error,Abs. true-slope error,linpc,40,0.17494809704976877,0.16928628250465216,0.11794061185796259,serial1d,phenoB
+distance_bins,abs_slope_error,Abs. true-slope error,znorm,40,0.16733679634698298,0.14065285668462402,0.14689916335039618,serial1d,phenoB
+distance_bins,abs_prevalence_error,Abs. prevalence error,gamfit,44,0.018506215885529434,0.01633539713466155,0.014449467262400435,grid2d,phenoA
+distance_bins,abs_prevalence_error,Abs. prevalence error,linpc,44,0.03389179753434593,0.030928371242861998,0.0253691406366222,grid2d,phenoA
+distance_bins,abs_prevalence_error,Abs. prevalence error,znorm,44,0.07274925677423469,0.05261623275794915,0.05714882104898341,grid2d,phenoA
+distance_bins,abs_prevalence_error,Abs. prevalence error,gamfit,44,0.018155955424871077,0.01270224037013255,0.015997213994761627,grid2d,phenoB
+distance_bins,abs_prevalence_error,Abs. prevalence error,linpc,44,0.024046650891824724,0.021377500082378,0.019099580530141005,grid2d,phenoB
+distance_bins,abs_prevalence_error,Abs. prevalence error,znorm,44,0.06754690954741936,0.0461926696049577,0.056815187652415805,grid2d,phenoB
+distance_bins,abs_prevalence_error,Abs. prevalence error,gamfit,40,0.022311844132316676,0.017410715617987897,0.017620061609388102,serial1d,phenoA
+distance_bins,abs_prevalence_error,Abs. prevalence error,linpc,40,0.05807512421456534,0.0481617076770881,0.04078329219618594,serial1d,phenoA
+distance_bins,abs_prevalence_error,Abs. prevalence error,znorm,40,0.07543313435326165,0.0742323897138764,0.04584246588082238,serial1d,phenoA
+distance_bins,abs_prevalence_error,Abs. prevalence error,gamfit,40,0.022780214908066244,0.0182998036175289,0.019036370130097215,serial1d,phenoB
+distance_bins,abs_prevalence_error,Abs. prevalence error,linpc,40,0.03629566318765978,0.02280570356092975,0.03363355072321112,serial1d,phenoB
+distance_bins,abs_prevalence_error,Abs. prevalence error,znorm,40,0.062491276064004765,0.046799864591490256,0.047212836417431125,serial1d,phenoB
+distance_bins,mae_true_risk,MAE vs known true risk,gamfit,44,0.10843246026026568,0.1074497566793943,0.041625649871704605,grid2d,phenoA
+distance_bins,mae_true_risk,MAE vs known true risk,linpc,44,0.11415066575553032,0.11496881181942556,0.04493508639060208,grid2d,phenoA
+distance_bins,mae_true_risk,MAE vs known true risk,znorm,44,0.14415015775985246,0.1380807032416737,0.033264033740437175,grid2d,phenoA
+distance_bins,mae_true_risk,MAE vs known true risk,gamfit,44,0.10902413584119658,0.106293723049223,0.037165642424387475,grid2d,phenoB
+distance_bins,mae_true_risk,MAE vs known true risk,linpc,44,0.11324584247484433,0.1184584611999203,0.0413277626760156,grid2d,phenoB
+distance_bins,mae_true_risk,MAE vs known true risk,znorm,44,0.14167359009735123,0.1373587882947406,0.031491952590417524,grid2d,phenoB
+distance_bins,mae_true_risk,MAE vs known true risk,gamfit,40,0.1371492081572229,0.15718980476353864,0.04698335970549616,serial1d,phenoA
+distance_bins,mae_true_risk,MAE vs known true risk,linpc,40,0.1478141289731542,0.16355661034990276,0.045034852090042994,serial1d,phenoA
+distance_bins,mae_true_risk,MAE vs known true risk,znorm,40,0.1564157192902463,0.16277597976391794,0.034015296219302445,serial1d,phenoA
+distance_bins,mae_true_risk,MAE vs known true risk,gamfit,40,0.13306408131846248,0.14027471359068283,0.04507710421629809,serial1d,phenoB
+distance_bins,mae_true_risk,MAE vs known true risk,linpc,40,0.1363809085056226,0.15009561323247456,0.04539815231973086,serial1d,phenoB
+distance_bins,mae_true_risk,MAE vs known true risk,znorm,40,0.1470771777682173,0.15126985660475667,0.039564983841164234,serial1d,phenoB
+distance_bins,rmse_true_risk,RMSE vs known true risk,gamfit,44,0.14436756623511615,0.1437299389158263,0.04941183352628528,grid2d,phenoA
+distance_bins,rmse_true_risk,RMSE vs known true risk,linpc,44,0.1515894085571398,0.1507618862967497,0.0535279906080834,grid2d,phenoA
+distance_bins,rmse_true_risk,RMSE vs known true risk,znorm,44,0.17986342701456778,0.170941522958378,0.04612034519214075,grid2d,phenoA
+distance_bins,rmse_true_risk,RMSE vs known true risk,gamfit,44,0.14420380223108983,0.1430066521136518,0.04578533492590108,grid2d,phenoB
+distance_bins,rmse_true_risk,RMSE vs known true risk,linpc,44,0.1491829101955607,0.1519009598777163,0.05086456479023634,grid2d,phenoB
+distance_bins,rmse_true_risk,RMSE vs known true risk,znorm,44,0.17770238505549193,0.16805156764971274,0.043915414938523016,grid2d,phenoB
+distance_bins,rmse_true_risk,RMSE vs known true risk,gamfit,40,0.1747687730915033,0.19383898676936273,0.05245301864708033,serial1d,phenoA
+distance_bins,rmse_true_risk,RMSE vs known true risk,linpc,40,0.1864303739332805,0.20450971788718247,0.05283384085256927,serial1d,phenoA
+distance_bins,rmse_true_risk,RMSE vs known true risk,znorm,40,0.19594805502166385,0.20910306108307625,0.04557641972656071,serial1d,phenoA
+distance_bins,rmse_true_risk,RMSE vs known true risk,gamfit,40,0.17071874074301982,0.1828108436329482,0.050190505772607905,serial1d,phenoB
+distance_bins,rmse_true_risk,RMSE vs known true risk,linpc,40,0.17503716768317573,0.1860116143768972,0.05089190532715055,serial1d,phenoB
+distance_bins,rmse_true_risk,RMSE vs known true risk,znorm,40,0.18611470929437293,0.18874418763373524,0.04838413413014355,serial1d,phenoB
