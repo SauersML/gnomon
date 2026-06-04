@@ -23,18 +23,18 @@ global_test,liability_pseudo_r2,Liability-scale pseudo-R2,znorm,4,0.132913231799
 global_test,liability_pseudo_r2,Liability-scale pseudo-R2,gamfit,4,0.28656389201133703,0.2876639132677896,0.05330577373887292,serial1d,phenoB
 global_test,liability_pseudo_r2,Liability-scale pseudo-R2,linpc,4,0.25118561425284164,0.2724898297500553,0.06385670850666907,serial1d,phenoB
 global_test,liability_pseudo_r2,Liability-scale pseudo-R2,znorm,4,0.13285395129590777,0.13713543698328584,0.10094056209309954,serial1d,phenoB
-global_test,brier,Brier score,gamfit,4,0.13055809595938572,0.1383858087247747,0.019168791309511796,grid2d,phenoA
-global_test,brier,Brier score,linpc,4,0.13356408752209345,0.1421499814058971,0.020130270882773107,grid2d,phenoA
-global_test,brier,Brier score,znorm,4,0.13988265408324266,0.14846114533828406,0.023287693528526065,grid2d,phenoA
-global_test,brier,Brier score,gamfit,4,0.12712576942867862,0.1342540818980339,0.02128604021999458,grid2d,phenoB
-global_test,brier,Brier score,linpc,4,0.12963256066597392,0.1378931106618223,0.02233945418749522,grid2d,phenoB
-global_test,brier,Brier score,znorm,4,0.13569558472848356,0.14583870626254608,0.025000465959879967,grid2d,phenoB
-global_test,brier,Brier score,gamfit,4,0.14812430865443937,0.15335056165832328,0.02772415107854187,serial1d,phenoA
-global_test,brier,Brier score,linpc,4,0.15220380210527984,0.15930151338835286,0.028973712320094987,serial1d,phenoA
-global_test,brier,Brier score,znorm,4,0.1548455612654977,0.16016389014912874,0.029312038119953338,serial1d,phenoA
-global_test,brier,Brier score,gamfit,4,0.1393883419434179,0.14921345651017345,0.03277482051733738,serial1d,phenoB
-global_test,brier,Brier score,linpc,4,0.14075716485010897,0.15150432727883928,0.03347370440920344,serial1d,phenoB
-global_test,brier,Brier score,znorm,4,0.1444095823306264,0.1529508361671294,0.03607206295755317,serial1d,phenoB
+global_test,bss,Brier Skill Score (BSS),gamfit,4,0.05335668794141507,0.05923598466291896,0.021840915259695552,grid2d,phenoA
+global_test,bss,Brier Skill Score (BSS),linpc,4,0.032173835126574346,0.03419149557666379,0.016714527310391115,grid2d,phenoA
+global_test,bss,Brier Skill Score (BSS),znorm,4,-0.011294240241346842,-0.012738653122308485,0.012295381661551957,grid2d,phenoA
+global_test,bss,Brier Skill Score (BSS),gamfit,4,0.06279198502629046,0.05229649020166327,0.03459215483813445,grid2d,phenoB
+global_test,bss,Brier Skill Score (BSS),linpc,4,0.045295664553306136,0.03527454503688798,0.027209531594077484,grid2d,phenoB
+global_test,bss,Brier Skill Score (BSS),znorm,4,0.002891122038948868,0.004555946802124844,0.0047863623452369134,grid2d,phenoB
+global_test,bss,Brier Skill Score (BSS),gamfit,4,0.05527572058441854,0.046593166316617696,0.02800203783936269,serial1d,phenoA
+global_test,bss,Brier Skill Score (BSS),linpc,4,0.03023659134317444,0.02601561312758155,0.013450985968480558,serial1d,phenoA
+global_test,bss,Brier Skill Score (BSS),znorm,4,0.012767098609434951,0.01116884045445854,0.02507632626140191,serial1d,phenoA
+global_test,bss,Brier Skill Score (BSS),gamfit,4,0.07421366845094626,0.08091207277520374,0.03532518993740478,serial1d,phenoB
+global_test,bss,Brier Skill Score (BSS),linpc,4,0.06577565638649546,0.07035023030089949,0.03806899238632079,serial1d,phenoB
+global_test,bss,Brier Skill Score (BSS),znorm,4,0.04355262162992149,0.039505628654439295,0.03788993954100731,serial1d,phenoB
 global_test,mae_true_risk,MAE vs known true risk,gamfit,4,0.11501850280588802,0.11113489722981784,0.01912018581633041,grid2d,phenoA
 global_test,mae_true_risk,MAE vs known true risk,linpc,4,0.12237991172493753,0.1207995985885856,0.020189207300328686,grid2d,phenoA
 global_test,mae_true_risk,MAE vs known true risk,znorm,4,0.1415777950407435,0.15049651600937192,0.022704709643236405,grid2d,phenoA
@@ -83,18 +83,18 @@ distance_bins,liability_pseudo_r2,Liability-scale pseudo-R2,znorm,40,0.159956116
 distance_bins,liability_pseudo_r2,Liability-scale pseudo-R2,gamfit,40,0.15627464210883207,0.16859954281533174,0.12100779786478413,serial1d,phenoB
 distance_bins,liability_pseudo_r2,Liability-scale pseudo-R2,linpc,40,0.15930854739478786,0.16254815189708455,0.12168725852830618,serial1d,phenoB
 distance_bins,liability_pseudo_r2,Liability-scale pseudo-R2,znorm,40,0.15987011641914356,0.1699615172637362,0.1218870969070549,serial1d,phenoB
-distance_bins,brier,Brier score,gamfit,44,0.1240299168936483,0.130021105241265,0.05638883520213746,grid2d,phenoA
-distance_bins,brier,Brier score,linpc,44,0.12714211033450745,0.13146296773192573,0.059370714364121877,grid2d,phenoA
-distance_bins,brier,Brier score,znorm,44,0.13562615022493796,0.1318137155537322,0.06109562654520341,grid2d,phenoA
-distance_bins,brier,Brier score,gamfit,44,0.12206821566470959,0.12718436973938813,0.0554298259061531,grid2d,phenoB
-distance_bins,brier,Brier score,linpc,44,0.12396399074436754,0.13253400515204955,0.05678427091282597,grid2d,phenoB
-distance_bins,brier,Brier score,znorm,44,0.13333276415834724,0.13151240252651497,0.059734803950233825,grid2d,phenoB
-distance_bins,brier,Brier score,gamfit,40,0.1481243086544394,0.1525641438223283,0.05510215057632347,serial1d,phenoA
-distance_bins,brier,Brier score,linpc,40,0.1522038021052798,0.1552650712732451,0.055759394081024004,serial1d,phenoA
-distance_bins,brier,Brier score,znorm,40,0.15484556126549767,0.1504922181793757,0.05426473171718678,serial1d,phenoA
-distance_bins,brier,Brier score,gamfit,40,0.13938834194341793,0.13823237509703268,0.05489532946413034,serial1d,phenoB
-distance_bins,brier,Brier score,linpc,40,0.14075716485010897,0.142249936404541,0.05513946879058826,serial1d,phenoB
-distance_bins,brier,Brier score,znorm,40,0.14440958233062637,0.13759962318060576,0.05353233041872955,serial1d,phenoB
+distance_bins,bss,Brier Skill Score (BSS),gamfit,44,-0.00386933958644491,0.003499443504973776,0.12393660067187845,grid2d,phenoA
+distance_bins,bss,Brier Skill Score (BSS),linpc,44,-0.024636778789780676,-0.007894373827097678,0.12500999024485449,grid2d,phenoA
+distance_bins,bss,Brier Skill Score (BSS),znorm,44,-0.23235730482067185,-0.053338836364066555,0.7380442465478598,grid2d,phenoA
+distance_bins,bss,Brier Skill Score (BSS),gamfit,44,0.02865413050722525,0.04822935666245881,0.15357909926727334,grid2d,phenoB
+distance_bins,bss,Brier Skill Score (BSS),linpc,44,0.019088203314628505,0.015833681566440883,0.15248360326046803,grid2d,phenoB
+distance_bins,bss,Brier Skill Score (BSS),znorm,44,-0.17762256381496722,-0.04245609603345224,0.5135567411347777,grid2d,phenoB
+distance_bins,bss,Brier Skill Score (BSS),gamfit,40,-0.006600741994389333,-0.002391630432456493,0.0884593856578334,serial1d,phenoA
+distance_bins,bss,Brier Skill Score (BSS),linpc,40,-0.03841515628749552,-0.030821062897500084,0.10838507050221123,serial1d,phenoA
+distance_bins,bss,Brier Skill Score (BSS),znorm,40,-0.07482597810730099,-0.04987484476515147,0.16322763430968837,serial1d,phenoA
+distance_bins,bss,Brier Skill Score (BSS),gamfit,40,0.040765051857517255,0.03150373998507805,0.13337653108131847,serial1d,phenoB
+distance_bins,bss,Brier Skill Score (BSS),linpc,40,0.0298639465387525,0.01985568942135718,0.13235968927502145,serial1d,phenoB
+distance_bins,bss,Brier Skill Score (BSS),znorm,40,-0.013554904568189582,-0.019640404657123578,0.12877889306249635,serial1d,phenoB
 distance_bins,abs_slope_error,Abs. true-slope error,gamfit,44,0.2025398866855154,0.18282837626588627,0.13553257981773492,grid2d,phenoA
 distance_bins,abs_slope_error,Abs. true-slope error,linpc,44,0.15556958993193903,0.15796476589322334,0.11847255461947073,grid2d,phenoA
 distance_bins,abs_slope_error,Abs. true-slope error,znorm,44,0.14778631423569968,0.1029271066806629,0.14136601077197955,grid2d,phenoA

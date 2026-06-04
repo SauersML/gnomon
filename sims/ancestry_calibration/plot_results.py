@@ -33,6 +33,23 @@ DEM_LABELS = {
 }
 
 
+def add_bss(df: pd.DataFrame) -> pd.DataFrame:
+    """Derive the Brier Skill Score from raw Brier and each bin's true base rate.
+
+    BSS = 1 - Brier / [p_bar * (1 - p_bar)], p_bar = known_true_prevalence of the
+    distance bin. Higher is better. Undefined reference (p_bar in {0, 1}) yields NaN.
+    """
+    out = df.copy()
+    if "brier" not in out.columns or "known_true_prevalence" not in out.columns:
+        return out
+    p = pd.to_numeric(out["known_true_prevalence"], errors="coerce").to_numpy(float)
+    ref = p * (1.0 - p)
+    brier = pd.to_numeric(out["brier"], errors="coerce").to_numpy(float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        out["bss"] = np.where((ref > 0) & np.isfinite(brier), 1.0 - brier / ref, np.nan)
+    return out
+
+
 def bounded_ylim(values: pd.Series) -> tuple[float, float]:
     x = pd.to_numeric(values, errors="coerce").dropna().to_numpy(float)
     if x.size == 0:
@@ -90,6 +107,7 @@ def plot_group_metrics(metrics: list[tuple[str, str]], output: Path, title: str)
     df = df[df["method"].isin(METHOD_LABELS)]
     if df.empty:
         raise ValueError("no real-P+T distance-bin group metrics for phenoA")
+    df = add_bss(df)
 
     fig, axes = plt.subplots(len(metrics), 2, figsize=(12.8, 3.0 * len(metrics)), sharex=False)
     if len(metrics) == 1:
@@ -231,7 +249,7 @@ def main() -> None:
         [
             ("auc", "AUC"),
             ("liability_pseudo_r2", "Liability pseudo-R2"),
-            ("brier", "Brier score"),
+            ("bss", "Brier Skill Score (BSS)"),
         ],
         PLOTS_DIR / "figure2a_distance_discrimination.png",
         "Figure 2a: distance-bin discrimination metrics",

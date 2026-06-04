@@ -20,12 +20,53 @@ METHOD_LABELS = {
 METRICS = {
     "auc": {"label": "AUC", "higher_better": True},
     "liability_pseudo_r2": {"label": "Liability-scale pseudo-R2", "higher_better": True},
-    "brier": {"label": "Brier score", "higher_better": False},
+    "bss": {"label": "Brier Skill Score (BSS)", "higher_better": True},
     "mae_true_risk": {"label": "MAE vs known true risk", "higher_better": False},
     "rmse_true_risk": {"label": "RMSE vs known true risk", "higher_better": False},
     "abs_slope_error": {"label": "Abs. true-slope error", "higher_better": False},
     "abs_prevalence_error": {"label": "Abs. prevalence error", "higher_better": False},
 }
+
+
+def add_bss_column(df: pd.DataFrame, prevalence: pd.Series) -> pd.DataFrame:
+    """Derive Brier Skill Score from raw Brier and the true base rate.
+
+    BSS = 1 - Brier / [p_bar * (1 - p_bar)], where p_bar is the TRUE prevalence
+    (base rate) of the evaluation unit. Higher is better. Where the reference
+    Brier p_bar*(1-p_bar) is zero or the prevalence is unavailable, BSS is left
+    as NaN so downstream tests simply skip those (never fabricated).
+    """
+    out = df.copy()
+    if "brier" not in out.columns:
+        out["bss"] = np.nan
+        return out
+    p = pd.to_numeric(prevalence, errors="coerce").to_numpy(float)
+    ref = p * (1.0 - p)
+    brier = pd.to_numeric(out["brier"], errors="coerce").to_numpy(float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        bss = np.where((ref > 0) & np.isfinite(brier), 1.0 - brier / ref, np.nan)
+    out["bss"] = bss
+    return out
+
+
+def cell_true_prevalence(group: pd.DataFrame) -> pd.DataFrame:
+    """n-weighted mean of per-bin known_true_prevalence for each (dem, pheno, seed).
+
+    The global accuracy file carries no prevalence column, so the true base rate
+    of each (dem, pheno, seed) cell is reconstructed from the distance-bin rows
+    (prevalence is the simulated truth and is method-invariant, so any method's
+    bins suffice; we average over one method to avoid double counting)."""
+    bins = group[["dem", "pheno", "seed", "method", "dist_from_train", "n", "known_true_prevalence"]].copy()
+    bins = bins.dropna(subset=["known_true_prevalence", "n"])
+    # prevalence/n are method-invariant per bin; pick a single method per cell.
+    bins = bins.sort_values("method")
+    first_method = bins.groupby(["dem", "pheno", "seed"])["method"].transform("first")
+    bins = bins[bins["method"] == first_method]
+    bins["n"] = pd.to_numeric(bins["n"], errors="coerce")
+    bins["wp"] = bins["n"] * pd.to_numeric(bins["known_true_prevalence"], errors="coerce")
+    agg = bins.groupby(["dem", "pheno", "seed"], as_index=False).agg(wp=("wp", "sum"), n=("n", "sum"))
+    agg["cell_true_prevalence"] = agg["wp"] / agg["n"]
+    return agg[["dem", "pheno", "seed", "cell_true_prevalence"]]
 
 
 def unique_cols(columns: list[str]) -> list[str]:
@@ -253,8 +294,16 @@ def main() -> None:
     group = pd.read_csv(RESULTS_DIR / "group_metrics_realpt_binary.csv")
     group = group[(group["pgs_mode"] == "realpt") & (group["group_kind"] == "distance")]
 
-    global_metrics = ["auc", "liability_pseudo_r2", "brier", "mae_true_risk", "rmse_true_risk"]
-    group_metrics = ["auc", "liability_pseudo_r2", "brier", "abs_slope_error", "abs_prevalence_error", "mae_true_risk", "rmse_true_risk"]
+    # Brier Skill Score is derived from the raw Brier and the TRUE base rate.
+    # Distance bins use each bin's own known_true_prevalence; the global cell uses
+    # the n-weighted true prevalence reconstructed from that cell's distance bins.
+    group = add_bss_column(group, group["known_true_prevalence"])
+    cell_prev = cell_true_prevalence(group)
+    accuracy = accuracy.merge(cell_prev, on=["dem", "pheno", "seed"], how="left")
+    accuracy = add_bss_column(accuracy, accuracy["cell_true_prevalence"])
+
+    global_metrics = ["auc", "liability_pseudo_r2", "bss", "mae_true_risk", "rmse_true_risk"]
+    group_metrics = ["auc", "liability_pseudo_r2", "bss", "abs_slope_error", "abs_prevalence_error", "mae_true_risk", "rmse_true_risk"]
 
     tests = pd.concat(
         [
