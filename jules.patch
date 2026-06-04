@@ -1,0 +1,153 @@
+diff --git a/proofs/Calibrator/ClinicalUtilityFairness.lean b/proofs/Calibrator/ClinicalUtilityFairness.lean
+index c7f0336..582cfda 100644
+--- a/proofs/Calibrator/ClinicalUtilityFairness.lean
++++ b/proofs/Calibrator/ClinicalUtilityFairness.lean
+@@ -946,19 +946,32 @@ theorem qaly_gain_positive_condition
+     (lower specificity), QALY gain is strictly reduced.  Derived from qalyGain:
+     the benefit term shrinks (lower sens) and the harm term grows (lower spec). -/
+ theorem lower_portability_lower_cost_effectiveness
+-    (sens_s spec_s sens_t spec_t π benefit harm : ℝ)
+-    (h_sens : sens_t < sens_s) (h_spec : spec_t < spec_s)
++    (m : LiabilityThresholdModel) (T' μ_control r2_source r2_target π benefit harm : ℝ)
++    (h_r2 : r2_target < r2_source)
++    (h_r2_target : 0 ≤ r2_target)
++    (h_r2_source : r2_source ≤ 1)
++    (hPhi_mono : StrictMono Phi)
++    (hμ_control_neg : μ_control < 0)
++    (h_sens_num_nonneg :
++      0 ≤ Real.sqrt r2_target * Real.sqrt m.h_sq * m.case_mean - T')
++    (h_spec_num_nonneg :
++      0 ≤ T' - Real.sqrt r2_target * Real.sqrt m.h_sq * μ_control)
+     (h_π : 0 < π) (h_π1 : π < 1)
+     (h_benefit : 0 < benefit) (h_harm : 0 < harm)
+-    (h_sens_t : 0 ≤ sens_t) (h_spec_t : 0 ≤ spec_t)
+-    (h_spec_s1 : spec_s ≤ 1) :
+-    screeningQalyGain sens_t spec_t π benefit harm <
+-      screeningQalyGain sens_s spec_s π benefit harm := by
++    (h_sens_t : 0 ≤ sensFromR2 m r2_target T')
++    (h_spec_t : 0 ≤ specFromR2 m r2_target T' μ_control)
++    (h_spec_s1 : specFromR2 m r2_source T' μ_control ≤ 1) :
++    screeningQalyGain (sensFromR2 m r2_target T') (specFromR2 m r2_target T' μ_control) π benefit harm <
++      screeningQalyGain (sensFromR2 m r2_source T') (specFromR2 m r2_source T' μ_control) π benefit harm := by
++  have h_sens : sensFromR2 m r2_target T' < sensFromR2 m r2_source T' :=
++    sensFromR2_strictMono m T' r2_target r2_source hPhi_mono h_r2_target h_r2_source h_r2 h_sens_num_nonneg
++  have h_spec : specFromR2 m r2_target T' μ_control < specFromR2 m r2_source T' μ_control :=
++    specFromR2_strictMono m T' μ_control r2_target r2_source hPhi_mono hμ_control_neg h_r2_target h_r2_source h_r2 h_spec_num_nonneg
+   repeat rw [screeningQalyGain_eq_formula]
+-  have h1 : sens_t * π * benefit < sens_s * π * benefit := by
++  have h1 : sensFromR2 m r2_target T' * π * benefit < sensFromR2 m r2_source T' * π * benefit := by
+     apply mul_lt_mul_of_pos_right _ h_benefit
+     exact mul_lt_mul_of_pos_right h_sens h_π
+-  have h2 : (1 - spec_s) * (1 - π) * harm < (1 - spec_t) * (1 - π) * harm := by
++  have h2 : (1 - specFromR2 m r2_source T' μ_control) * (1 - π) * harm < (1 - specFromR2 m r2_target T' μ_control) * (1 - π) * harm := by
+     apply mul_lt_mul_of_pos_right _ h_harm
+     apply mul_lt_mul_of_pos_right _ (by linarith)
+     linarith
+@@ -996,14 +1009,22 @@ noncomputable def numberNeededToScreen (sens π : ℝ) : ℝ :=
+ 
+ /-- NNS is higher in the target population. -/
+ theorem nns_higher_in_target
+-    (sens_s sens_t π : ℝ)
+-    (h_sens_s : 0 < sens_s) (h_sens_t : 0 < sens_t)
++    (m : LiabilityThresholdModel) (T' r2_source r2_target π : ℝ)
++    (h_r2_gap : r2_target < r2_source)
++    (h_r2_target : 0 ≤ r2_target)
++    (h_r2_source : r2_source ≤ 1)
++    (hPhi_mono : StrictMono Phi)
++    (h_sens_num_nonneg :
++      0 ≤ Real.sqrt r2_target * Real.sqrt m.h_sq * m.case_mean - T')
+     (h_π : 0 < π)
+-    (h_lower : sens_t < sens_s) :
+-    numberNeededToScreen sens_s π < numberNeededToScreen sens_t π := by
++    (h_sens_pos : 0 < sensFromR2 m r2_target T') :
++    numberNeededToScreen (sensFromR2 m r2_source T') π <
++      numberNeededToScreen (sensFromR2 m r2_target T') π := by
++  have h_lower : sensFromR2 m r2_target T' < sensFromR2 m r2_source T' :=
++    sensFromR2_strictMono m T' r2_target r2_source hPhi_mono h_r2_target h_r2_source h_r2_gap h_sens_num_nonneg
+   unfold numberNeededToScreen
+-  apply div_lt_div_of_pos_left one_pos
+-  · exact mul_pos h_sens_t h_π
++  apply div_lt_div_of_pos_left zero_lt_one
++  · exact mul_pos h_sens_pos h_π
+   · exact mul_lt_mul_of_pos_right h_lower h_π
+ 
+ /-- **Population Attributable Fraction (PAF) from PGS-guided intervention.**
+@@ -1017,12 +1038,18 @@ noncomputable def populationAttributableFraction
+     When PGS is less accurate, the high-risk group is less enriched
+     for true cases → lower PAF → less population-level benefit. -/
+ theorem paf_lower_in_target
+-    (p_high_s p_high_t rr : ℝ)
++    (m : LiabilityThresholdModel) (T' r2_source r2_target rr : ℝ)
+     (h_rr : 1 < rr)
+-    (h_p_s : 0 < p_high_s) (h_p_t : 0 < p_high_t)
+-    (h_lower : p_high_t < p_high_s) :
+-    populationAttributableFraction p_high_t rr <
+-      populationAttributableFraction p_high_s rr := by
++    (h_r2_gap : r2_target < r2_source)
++    (h_r2_target : 0 ≤ r2_target)
++    (h_r2_source : r2_source ≤ 1)
++    (hPhi_mono : StrictMono Phi)
++    (h_sens_num_nonneg :
++      0 ≤ Real.sqrt r2_target * Real.sqrt m.h_sq * m.case_mean - T') :
++    populationAttributableFraction (sensFromR2 m r2_target T') rr <
++      populationAttributableFraction (sensFromR2 m r2_source T') rr := by
++  have h_lower : sensFromR2 m r2_target T' < sensFromR2 m r2_source T' :=
++    sensFromR2_strictMono m T' r2_target r2_source hPhi_mono h_r2_target h_r2_source h_r2_gap h_sens_num_nonneg
+   unfold populationAttributableFraction
+   apply mul_lt_mul_of_pos_right h_lower
+   rw [sub_pos, div_lt_one (by linarith)]; linarith
+@@ -1033,13 +1060,17 @@ theorem paf_lower_in_target
+     strictly positive.  Derived from the PAF definition: both populations
+     share the same intervention (same RR), but differ in enrichment. -/
+ theorem equity_gap_in_public_health
+-    (p_high_s p_high_t rr : ℝ)
++    (m : LiabilityThresholdModel) (T' r2_source r2_target rr : ℝ)
+     (h_rr : 1 < rr)
+-    (h_p_s : 0 < p_high_s) (h_p_t : 0 < p_high_t)
+-    (h_lower : p_high_t < p_high_s) :
+-    0 < populationAttributableFraction p_high_s rr -
+-        populationAttributableFraction p_high_t rr := by
+-  have h_paf := paf_lower_in_target p_high_s p_high_t rr h_rr h_p_s h_p_t h_lower
++    (h_r2_gap : r2_target < r2_source)
++    (h_r2_target : 0 ≤ r2_target)
++    (h_r2_source : r2_source ≤ 1)
++    (hPhi_mono : StrictMono Phi)
++    (h_sens_num_nonneg :
++      0 ≤ Real.sqrt r2_target * Real.sqrt m.h_sq * m.case_mean - T') :
++    0 < populationAttributableFraction (sensFromR2 m r2_source T') rr -
++        populationAttributableFraction (sensFromR2 m r2_target T') rr := by
++  have h_paf := paf_lower_in_target m T' r2_source r2_target rr h_rr h_r2_gap h_r2_target h_r2_source hPhi_mono h_sens_num_nonneg
+   linarith
+ 
+ end PopulationImpact
+@@ -1060,15 +1091,23 @@ section Recommendations
+     if diversification raises target sensitivity from sens_t to sens_t',
+     then NNS strictly decreases in the target population. -/
+ theorem diversification_is_optimal_equity_intervention
+-    (sens_t sens_t' π : ℝ)
+-    (h_sens_t : 0 < sens_t) (h_sens_t' : 0 < sens_t')
++    (m : LiabilityThresholdModel) (T' r2_target r2_target' π : ℝ)
++    (h_improves : r2_target < r2_target')
++    (h_r2_target : 0 ≤ r2_target)
++    (h_r2_target' : r2_target' ≤ 1)
++    (hPhi_mono : StrictMono Phi)
++    (h_sens_num_nonneg :
++      0 ≤ Real.sqrt r2_target * Real.sqrt m.h_sq * m.case_mean - T')
+     (h_π : 0 < π)
+-    (h_improves : sens_t < sens_t') :
+-    numberNeededToScreen sens_t' π < numberNeededToScreen sens_t π := by
++    (h_sens_pos : 0 < sensFromR2 m r2_target T') :
++    numberNeededToScreen (sensFromR2 m r2_target' T') π <
++      numberNeededToScreen (sensFromR2 m r2_target T') π := by
++  have h_sens_improves : sensFromR2 m r2_target T' < sensFromR2 m r2_target' T' :=
++    sensFromR2_strictMono m T' r2_target r2_target' hPhi_mono h_r2_target h_r2_target' h_improves h_sens_num_nonneg
+   unfold numberNeededToScreen
+-  apply div_lt_div_of_pos_left one_pos
+-  · exact mul_pos h_sens_t h_π
+-  · exact mul_lt_mul_of_pos_right h_improves h_π
++  apply div_lt_div_of_pos_left zero_lt_one
++  · exact mul_pos h_sens_pos h_π
++  · exact mul_lt_mul_of_pos_right h_sens_improves h_π
+ 
+ /-- **Marginal value of diverse samples is highest for underserved populations.**
+     If the underserved population has lower current sensitivity (sens_under < sens_served),
