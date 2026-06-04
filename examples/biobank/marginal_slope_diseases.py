@@ -290,7 +290,7 @@ PLINK_PREFIX = find_plink_prefix()
 WORKDIR = PLINK_PREFIX.parent
 FITS_DIR = WORKDIR / "biobank_fits"
 NUM_PCS = 3
-DUCHON_CENTERS = 10  # > linear nullspace (d+1=4) in d=3
+DUCHON_CENTERS = 20  # > linear nullspace (d+1=4) in d=3
 TRAIN_FRACTION = 0.80  # per-class 80/20 split
 RNG_SEED = 0
 MAX_LOSO_CARE_SITES = 5

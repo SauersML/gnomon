@@ -35,7 +35,7 @@ from scipy.stats import norm
 from sklearn.metrics import roc_auc_score
 
 NUM_PCS = 3
-DUCHON_CENTERS = 12  # > linear nullspace (d+1=4) in d=3
+DUCHON_CENTERS = 20  # > linear nullspace (d+1=4) in d=3
 N_TOTAL = 20_000
 TRAIN_FRACTION = 0.80  # per-class 80/20 split
 RNG_SEED = 0

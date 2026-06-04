@@ -168,7 +168,7 @@ def plot_group_metrics(metrics: list[tuple[str, str]], output: Path, title: str)
 def fit_gamfit_smoother(train: pd.DataFrame, grid: pd.DataFrame) -> pd.DataFrame:
     import gamfit
 
-    model = gamfit.fit(train, "value ~ matern(distance, centers=10)", family="gaussian")
+    model = gamfit.fit(train, "value ~ matern(distance, centers=20)", family="gaussian")
     pred = model.predict(grid)
     if isinstance(pred, pd.DataFrame):
         if "mean" not in pred.columns:
