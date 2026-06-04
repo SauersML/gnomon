@@ -1576,11 +1576,16 @@ def fit_binary_marginal_slope(train_df: pd.DataFrame, num_pcs: int):  # -> gamfi
     # logslope target keeps the polyharmonic Duchon. See gam#531 and
     # pc_marginal_surface_term_binary().
     marginal_surface = pc_marginal_surface_term_binary(num_pcs)
-    # Matched matern logslope (matern marginal is required for probit identifiability,
-    # gam#531 — so duchon-marginal is out, hence matern on both channels). No linkwiggle
-    # link-deviation and no logslope linkwiggle score-warp: both hang the BMS
-    # cell-moment path (SauersML/gam#683).
-    logslope_formula = marginal_surface
+    # WORKAROUND for SauersML/gam#754 (outer-REML non-convergence): the marginal
+    # PC surface and a *matched* (same-basis) logslope surface compete over an
+    # under-constrained direction — prs_z correlates with the PCs, so
+    # f_marginal(PC) trades off against prs_z·f_logslope(PC); the marginal
+    # surface's smoothest coefficient runs to ~50 and the outer solve never
+    # converges. Make the logslope a LOW-DIMENSIONAL LINEAR PC interaction
+    # (prs_z slope varies linearly in PC space) so it can't compete with the
+    # full marginal surface. No linkwiggle on either channel (both hang the BMS
+    # cell-moment path, gam#683). Revert to a matched smooth once gam#754 lands.
+    logslope_formula = " + ".join(f"PC{i+1}" for i in range(num_pcs))
     formula = f"event ~ {marginal_surface} + sex + {age_terms}"
     cols = binary_model_columns(num_pcs)
     print("  binary_fit_spec: family=bernoulli-marginal-slope  link=probit")

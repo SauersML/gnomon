@@ -24,10 +24,10 @@ import re
 
 import numpy as np
 import pandas as pd
-from scipy.stats import linregress, pearsonr
+from scipy.stats import pearsonr
 from scipy.stats import norm
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import brier_score_loss, mean_absolute_error, roc_auc_score, root_mean_squared_error
+from sklearn.metrics import brier_score_loss, mean_absolute_error, roc_auc_score
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RESULTS_DIR = REPO_ROOT / "sims" / "results_hpc" / "ancestry_calibration" / "results"
@@ -153,13 +153,6 @@ def global_metrics(y: np.ndarray, p: np.ndarray, p_true: np.ndarray, true_liab: 
     else:
         out["liability_pseudo_r2"] = float("nan")
     return out
-
-
-def slope_of_prediction(p: np.ndarray, pgs_z: np.ndarray) -> float:
-    eta = probit(p)
-    if len(np.unique(pgs_z)) < 2:
-        return float("nan")
-    return float(linregress(pgs_z, eta).slope)
 
 
 def group_metrics(frame: pd.DataFrame, method: str, p: np.ndarray, group_col: str, group_kind: str) -> list[dict[str, object]]:
