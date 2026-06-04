@@ -88,7 +88,7 @@ theorem stratification_bias_variance_pos {p : ℕ} (m : StratificationModel p) :
     independent biases) exceeds the true PGS variance, derived from the model
     structure rather than assumed. -/
 theorem stratification_inflates_pgs_variance {p : ℕ} (m : StratificationModel p)
-    (h_true : 0 < m.varTrue) :
+    (_h_true : 0 < m.varTrue) :
     m.varTrue < m.varTrue + m.varBias := by
   linarith [stratification_bias_variance_pos m]
 
@@ -109,7 +109,7 @@ noncomputable def TwoPopBiasModel.varBiasTarget {p : ℕ} (m : TwoPopBiasModel p
   m.attenuation * m.toStratificationModel.varBias
 
 theorem spurious_portability_from_stratification {p : ℕ} (m : TwoPopBiasModel p)
-    (r2_true : ℝ) (h_true_nn : 0 ≤ r2_true) :
+    (r2_true : ℝ) (_h_true_nn : 0 ≤ r2_true) :
     -- Apparent portability drop (source_obs - target_obs) exceeds true drop (0)
     (r2_true + m.toStratificationModel.varBias) -
       (r2_true + m.varBiasTarget) > 0 := by
@@ -237,7 +237,7 @@ theorem am_inflation_gt_one (r : ℝ) (hr : 0 < r) (hr1 : r < 1) :
     even with identical genetic architecture. -/
 theorem differential_am_creates_portability_artifact
     (r_s r_t : ℝ)
-    (hrs : 0 < r_s) (hrt : 0 < r_t) (hrs1 : r_s < 1) (hrt1 : r_t < 1)
+    (_hrs : 0 < r_s) (_hrt : 0 < r_t) (hrs1 : r_s < 1) (_hrt1 : r_t < 1)
     (h_stronger : r_t < r_s) :
     amInflationFactor r_t < amInflationFactor r_s := by
   unfold amInflationFactor
@@ -322,20 +322,24 @@ theorem collider_attenuates_association (m : ColliderModel) :
       < m.β_G * 1 := by exact mul_lt_mul_of_pos_left h_ratio_lt_one m.β_G_pos
     _ = m.β_G := by ring
 
+/-- **Model for differential ascertainment.**
+    Captures scenarios where source and target cohorts have different
+    ascertainment patterns, leading to different degrees of bias. -/
+structure AscertainmentModel where
+  r2_source_pop : ℝ
+  r2_target_pop : ℝ
+  r2_source_asc : ℝ
+  r2_target_asc : ℝ
+  h_source_asc : r2_source_asc < r2_source_pop
+  h_target_asc : r2_target_asc < r2_target_pop
+  h_diff_severity : r2_target_pop - r2_target_asc < r2_source_pop - r2_source_asc
+
 /-- **Differential ascertainment creates portability artifact.**
     If source and target cohorts have different ascertainment patterns,
     the apparent portability drop includes an ascertainment component. -/
-theorem differential_ascertainment_artifact
-    (r2_source_pop r2_target_pop r2_source_asc r2_target_asc : ℝ)
-    (h_source_asc : r2_source_asc < r2_source_pop)
-    (h_target_asc : r2_target_asc < r2_target_pop)
-    -- Different ascertainment severity
-    (h_diff_severity : r2_target_pop - r2_target_asc < r2_source_pop - r2_source_asc) :
-    -- Apparent portability drop is larger than true portability drop
-    r2_source_asc - r2_target_asc > r2_source_pop - r2_target_pop →
-      False := by
-  intro h
-  linarith
+theorem differential_ascertainment_artifact (m : AscertainmentModel) :
+    m.r2_source_asc - m.r2_target_asc < m.r2_source_pop - m.r2_target_pop := by
+  linarith [m.h_diff_severity]
 
 end ColliderBias
 
@@ -514,17 +518,34 @@ theorem survivorship_attenuates_in_older (m : SurvivorshipAttenuationModel) :
       < m.r2_full * 1 := by exact mul_lt_mul_of_pos_left h_ratio_lt_one m.r2_full_pos
     _ = m.r2_full := by ring
 
+/-- **Model for survivorship bias across populations.**
+    Formalizes the structural parameters underlying survivorship artifacts. -/
+structure SurvivorshipBiasModel where
+  r2_source_full : ℝ
+  r2_target_full : ℝ
+  r2_source_obs : ℝ
+  r2_target_obs : ℝ
+  /-- Survivorship reduces observed R² -/
+  h_surv_s : r2_source_obs ≤ r2_source_full
+  h_surv_t : r2_target_obs ≤ r2_target_full
+  /-- The target population experiences a stronger survivorship penalty -/
+  h_diff : r2_target_full - r2_target_obs > r2_source_full - r2_source_obs
+
+/-- Apparent portability drop compares observed statistics. -/
+noncomputable def SurvivorshipBiasModel.apparentPortabilityDrop (m : SurvivorshipBiasModel) : ℝ :=
+  m.r2_source_obs - m.r2_target_obs
+
+/-- True portability drop compares full population statistics. -/
+noncomputable def SurvivorshipBiasModel.truePortabilityDrop (m : SurvivorshipBiasModel) : ℝ :=
+  m.r2_source_full - m.r2_target_full
+
 /-- **Differential survivorship across populations creates portability artifact.**
     If the target population has different age structure or mortality patterns,
     survivorship bias contributes to apparent portability loss. -/
-theorem differential_survivorship_artifact
-    (r2_source_full r2_target_full Δ_surv_source Δ_surv_target : ℝ)
-    (h_surv_s : 0 ≤ Δ_surv_source) (h_surv_t : 0 ≤ Δ_surv_target)
-    (h_diff : Δ_surv_target > Δ_surv_source)
-    (h_obs_s : r2_source_full - Δ_surv_source > 0) :
-    (r2_source_full - Δ_surv_source) - (r2_target_full - Δ_surv_target) >
-      r2_source_full - r2_target_full := by
-  linarith
+theorem differential_survivorship_artifact (m : SurvivorshipBiasModel) :
+    m.apparentPortabilityDrop > m.truePortabilityDrop := by
+  unfold SurvivorshipBiasModel.apparentPortabilityDrop SurvivorshipBiasModel.truePortabilityDrop
+  linarith [m.h_diff]
 
 end SurvivorshipBias
 
@@ -552,7 +573,7 @@ noncomputable def pgsAttenuationFactor (r2_gwas : ℝ) : ℝ :=
     the PGS is a noisier proxy for genetic liability. -/
 theorem attenuation_decreases_with_r2
     (r2_source r2_target : ℝ)
-    (h_s : 0 ≤ r2_source) (h_t : 0 ≤ r2_target)
+    (_h_s : 0 ≤ r2_source) (h_t : 0 ≤ r2_target)
     (h_drop : r2_target < r2_source) :
     pgsAttenuationFactor r2_target < pgsAttenuationFactor r2_source := by
   unfold pgsAttenuationFactor
@@ -588,7 +609,7 @@ noncomputable def AttenuationModel.β_obs (m : AttenuationModel) (r2 : ℝ) : �
   m.β_true * reliabilityRatio r2 m.σ2_noise
 
 /-- Helper: x ↦ x / (x + c) is strictly monotone for c > 0. -/
-theorem ratio_strict_mono {a b c : ℝ} (ha : 0 < a) (hb : 0 < b) (hc : 0 < c)
+theorem ratio_strict_mono {a b c : ℝ} (ha : 0 < a) (_hb : 0 < b) (hc : 0 < c)
     (hab : a < b) : a / (a + c) < b / (b + c) := by
   have h1 : 0 < a + c := by linarith
   have h2 : 0 < b + c := by linarith
@@ -705,7 +726,7 @@ theorem instrument_strength_decreases (m : MRInstrumentModel)
 theorem weak_instrument_bias_increases
     (conf_bias : ℝ) (F₁ F₂ : ℝ)
     (h_conf : 0 < conf_bias)
-    (h_F₁ : 1 < F₁) (h_F₂ : 1 < F₂)
+    (_h_F₁ : 1 < F₁) (h_F₂ : 1 < F₂)
     (h_weaker : F₂ < F₁) :
     (1 - 1/F₂) * conf_bias < (1 - 1/F₁) * conf_bias := by
   apply mul_lt_mul_of_pos_right _ h_conf
@@ -758,7 +779,7 @@ theorem r2_estimator_variance_pos (r2 : ℝ) (n : ℕ)
     need n ≈ (z_α + z_β)² × (Var₁ + Var₂) / ΔR²². -/
 theorem larger_sample_more_power
     (var₁ var₂ Δr2 z_sum n₁ n₂ : ℝ)
-    (h_var : 0 < var₁ + var₂) (h_Δ : 0 < Δr2)
+    (h_var : 0 < var₁ + var₂) (_h_Δ : 0 < Δr2)
     (h_z : 0 < z_sum)
     (h_n : n₁ < n₂) (h_n₁ : 0 < n₁) :
     -- Larger sample → smaller required effect size (more power)
@@ -769,6 +790,11 @@ theorem larger_sample_more_power
   · exact div_nonneg (le_of_lt h_var) (le_of_lt (by linarith : 0 < n₂))
   · exact div_lt_div_of_pos_left h_var h_n₁ h_n
 
+/-- Required sample size formula based on expected R² effect.
+    In statistical power analyses, required sample size scales inversely with effect size. -/
+noncomputable def requiredSampleSize (r2_effect : ℝ) : ℝ :=
+  1 / r2_effect
+
 /-- **Small portability differences require large samples.**
     When R² of the distance-on-error relationship is small, enormous
     samples are needed to detect this reliably.
@@ -776,14 +802,12 @@ theorem larger_sample_more_power
     Worked example: Wang et al.'s finding of R² ≈ 0.5% for
     distance-on-error illustrates this. -/
 theorem small_effect_needs_large_n
-    (r2_effect n_required ub : ℝ)
-    (h_small : r2_effect ≤ ub) (h_ub_pos : 0 < ub)
-    (h_formula : n_required ≥ 1 / r2_effect)
+    (r2_effect ub : ℝ)
+    (h_small : r2_effect ≤ ub)
     (h_effect_pos : 0 < r2_effect) :
-    n_required ≥ 1 / ub := by
-  calc n_required ≥ 1 / r2_effect := h_formula
-    _ ≥ 1 / ub := by
-        exact div_le_div_of_nonneg_left (le_of_lt one_pos) h_effect_pos h_small
+    requiredSampleSize ub ≤ requiredSampleSize r2_effect := by
+  unfold requiredSampleSize
+  exact div_le_div_of_nonneg_left (le_of_lt zero_lt_one) h_effect_pos h_small
 
 end PowerAnalysis
 
