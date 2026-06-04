@@ -155,19 +155,39 @@ theorem squared_error_expansion (μ μ_hat ε : ℝ) :
     (μ + ε - μ_hat) ^ 2 = (μ - μ_hat) ^ 2 + 2 * (μ - μ_hat) * ε + ε ^ 2 := by
   ring
 
+/-- **Model of prediction errors.**
+    Formalizes the bias-variance decomposition of prediction errors at the individual level. -/
+structure PredictionErrorModel where
+  bias : ℝ
+  σ_sq : ℝ
+  hσ : 0 < σ_sq
+
+/-- Expected squared error given X = x. -/
+noncomputable def PredictionErrorModel.expectedSquaredError (m : PredictionErrorModel) : ℝ :=
+  m.bias ^ 2 + m.σ_sq
+
+/-- Variance of squared error given X = x. -/
+noncomputable def PredictionErrorModel.varianceOfSquaredError (m : PredictionErrorModel) : ℝ :=
+  4 * m.bias ^ 2 * m.σ_sq + 2 * m.σ_sq ^ 2
+
 /-- **Expected squared error given X = x.**
     E[(Y - Ŷ)² | X = x] = (μ(x) - μ̂(x))² + σ².
     The first term is the squared bias, the second is irreducible noise. -/
-theorem expected_squared_error_given_x (bias σ_sq : ℝ) :
-    bias ^ 2 + σ_sq ≥ σ_sq := by
-  linarith [sq_nonneg bias]
+theorem expected_squared_error_given_x (m : PredictionErrorModel) :
+    m.expectedSquaredError ≥ m.σ_sq := by
+  unfold PredictionErrorModel.expectedSquaredError
+  linarith [sq_nonneg m.bias]
 
 /-- **Variance of squared error given X = x.**
     Var((Y - Ŷ)² | X = x) ≈ 4·bias²·σ² + 2·σ⁴.
     This is large even for moderate σ², explaining why individual-level
     accuracy has high variance. -/
-theorem variance_of_squared_error_lower_bound (σ_sq : ℝ) (hσ : 0 < σ_sq) :
-    0 < 2 * σ_sq ^ 2 := by positivity
+theorem variance_of_squared_error_lower_bound (m : PredictionErrorModel) :
+    0 < m.varianceOfSquaredError := by
+  unfold PredictionErrorModel.varianceOfSquaredError
+  have h1 : 0 ≤ 4 * m.bias ^ 2 * m.σ_sq := mul_nonneg (by nlinarith) (le_of_lt m.hσ)
+  have h2 : 0 < 2 * m.σ_sq ^ 2 := by nlinarith [m.hσ]
+  linarith
 
 /-- **Conditional variance is large relative to conditional mean squared.**
     For ε ~ N(0, σ²), we have E[ε²] = σ² and Var(ε²) = 2σ⁴.
@@ -178,10 +198,22 @@ theorem variance_of_squared_error_lower_bound (σ_sq : ℝ) (hσ : 0 < σ_sq) :
 
     We derive: Var(squared error) / E[squared error]² ≥ 2σ⁴/(b² + σ²)²,
     and the conditional variance 4b²σ² + 2σ⁴ ≥ 2σ⁴ always. -/
-theorem high_cv_inevitable (σ_sq bias_sq : ℝ) (hσ : 0 < σ_sq) (hb : 0 ≤ bias_sq) :
+theorem high_cv_inevitable (m : PredictionErrorModel) :
     -- Variance of squared error (4b²σ² + 2σ⁴) ≥ irreducible noise variance (2σ⁴)
-    4 * bias_sq * σ_sq + 2 * σ_sq ^ 2 ≥ 2 * σ_sq ^ 2 := by
-  nlinarith [mul_nonneg hb (le_of_lt hσ)]
+    m.varianceOfSquaredError ≥ 2 * m.σ_sq ^ 2 := by
+  unfold PredictionErrorModel.varianceOfSquaredError
+  have hb_sq : 0 ≤ m.bias ^ 2 := sq_nonneg m.bias
+  nlinarith [mul_nonneg hb_sq (le_of_lt m.hσ)]
+
+/-- **Model for bounded variance components.**
+    Represents the variation in conditional bias relative to total phenotypic variance. -/
+structure SplineR2Model where
+  var_bias : ℝ
+  var_total : ℝ
+  δ : ℝ
+  h_total_pos : 0 < var_total
+  h_δ_nn : 0 ≤ δ
+  h_bias_small : var_bias ≤ δ * var_total
 
 /-- **Spline fit R² bounded above by noise-to-signal ratio.**
     A cubic spline fit of ε² on genetic distance d can explain at most
@@ -189,13 +221,9 @@ theorem high_cv_inevitable (σ_sq bias_sq : ℝ) (hσ : 0 < σ_sq) (hb : 0 ≤ b
     When σ² >> bias variation, this fraction is tiny.
 
     Worked example: Wang et al. find R² = 0.51% for height. -/
-theorem spline_r2_bounded_by_bias_variation
-    (var_bias var_total δ : ℝ)
-    (h_total_pos : 0 < var_total)
-    (h_δ_nn : 0 ≤ δ)
-    (h_bias_small : var_bias ≤ δ * var_total) :
-    var_bias / var_total ≤ δ := by
-  exact div_le_of_le_mul₀ (le_of_lt h_total_pos) h_δ_nn h_bias_small
+theorem spline_r2_bounded_by_bias_variation (m : SplineR2Model) :
+    m.var_bias / m.var_total ≤ m.δ := by
+  exact div_le_of_le_mul₀ (le_of_lt m.h_total_pos) m.h_δ_nn m.h_bias_small
 
 end IndividualErrorDistribution
 
