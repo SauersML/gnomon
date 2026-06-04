@@ -291,13 +291,6 @@ WORKDIR = PLINK_PREFIX.parent
 FITS_DIR = WORKDIR / "biobank_fits"
 NUM_PCS = 3
 DUCHON_CENTERS = 20  # > linear nullspace (d+1=4) in d=3
-# Matern (the gam#754 marginal workaround) has a FIXED length_scale=1, so too
-# many centers in the standardized 3-PC cloud overlap into linearly-dependent
-# basis columns -> intra-block rank deficiency -> audit FATAL. On this data the
-# kernel's numerical rank caps ~13 (≈16 centers); use a safe count well under
-# that. (Duchon is scale-free and does not over-parameterize, so it keeps 20.)
-# Tracked in SauersML/gam#755.
-MATERN_CENTERS = 10
 TRAIN_FRACTION = 0.80  # per-class 80/20 split
 RNG_SEED = 0
 MAX_LOSO_CARE_SITES = 5
@@ -1384,21 +1377,15 @@ def pc_duchon_term(num_pcs: int) -> str:
 
 def pc_marginal_surface_term_binary(num_pcs: int) -> str:
     pcs = ", ".join(f"PC{i+1}" for i in range(num_pcs))
-    # WORKAROUND for SauersML/gam#754 (sibling of the closed #531 audit FATAL).
-    # A scale-free Duchon surface leaves a polynomial nullspace unpenalized: its
-    # CONSTANT collided with the probit intercept (#531, now cleared by
-    # orthogonalization), but the surviving LINEAR PC directions are unpenalized
-    # AND unconstrained on a probit fit, so the marginal-block coefficient runs
-    # away (β→∞, λ→0) and the outer REML/ARC solve never converges (#754).
-    #
-    # A Matern kernel is strictly positive-definite -> NO polynomial nullspace,
-    # so the surface stays identifiable and the outer solve converges. nu
-    # defaults to 5/2; length_scale auto-set; centers matched to the Duchon run.
-    # Shared by both channels here. Revert to duchon once gam#754 lands.
-    # MATERN_CENTERS (not DUCHON_CENTERS): Matern over-parameterizes at high
-    # center counts on this data (fixed length_scale -> overlapping columns ->
-    # rank-deficient block -> audit FATAL). See gam#755.
-    return f"matern({pcs}, centers={MATERN_CENTERS})"
+    # Polyharmonic Duchon PC surface, shared by both channels (marginal baseline
+    # risk + prs_z logslope). Scale-free, so it does NOT over-parameterize at
+    # high center counts the way Matern does (gam#755) — it uses the full
+    # DUCHON_CENTERS. The duchon constant collided with the probit intercept
+    # (#531) but that is cleared by orthogonalization, so the audit passes.
+    # NOTE: the BMS outer REML can still fail to converge here (gam#754) — that
+    # is a gam-side bug; Matern does not avoid it either (basis-independent), so
+    # we use the scientifically-preferred Duchon.
+    return f"duchon({pcs}, centers={DUCHON_CENTERS})"
 
 
 def fit_marginal_slope(train_df: pd.DataFrame, num_pcs: int):  # -> gamfit.Model
@@ -1561,10 +1548,10 @@ def fit_binary_marginal_slope(train_df: pd.DataFrame, num_pcs: int):  # -> gamfi
     nuisance we adjust for, not a quantity we want gamfit to spend REML
     degrees of freedom estimating, and matching the basis makes every
     GAM-vs-baseline delta attributable to PC/PRS treatment alone. PCs
-    enter via `matern(PCs)` and the `prs_z` log-OR varies as the same
-    `matern(PCs)` surface (its `logslope_formula`) — matched basis, with
-    matern required on the marginal channel for probit identifiability
-    (gam#531). No `linkwiggle()` on either channel: link-deviation and
+    enter via `duchon(PCs)` and the `prs_z` log-OR varies as the same
+    `duchon(PCs)` surface (its `logslope_formula`) — matched smooth basis. The
+    duchon constant vs probit intercept (gam#531) is cleared by orthogonalization
+    so the audit passes. No `linkwiggle()` on either channel: link-deviation and
     logslope score-warp both hang the BMS cell-moment path (SauersML/gam#683).
     """
     import gamfit  # lazy
@@ -2364,12 +2351,12 @@ def evaluate_binary_model_pair(
     flexible PC surface and PC-varying log-slope:
 
       * `binaryGAM` — Bernoulli marginal-slope GAM with
-        `matern(PC1..PCk)` in the baseline-risk surface, the same
-        `matern(...)` in the log-slope channel (so `prs_z`'s log-OR
+        `duchon(PC1..PCk)` in the baseline-risk surface, the same
+        `duchon(...)` in the log-slope channel (so `prs_z`'s log-OR
         varies by ancestry), and the matched age nuisance basis
         (quadratic `current_age_z`/`current_age_z2` + linear `entry_age_z`,
-        identical to baselines N/A/B) plus `sex`. matern is required on the
-        marginal channel for probit identifiability (gam#531); no
+        identical to baselines N/A/B) plus `sex`. The duchon constant vs probit
+        intercept (gam#531) is cleared by orthogonalization; no
         `linkwiggle()` link-deviation or score-warp (both hang, gam#683).
       * `binaryN` — logistic GLM on the matched age nuisance basis
         (quadratic `current_age_z`/`current_age_z2` + linear
