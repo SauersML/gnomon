@@ -1380,27 +1380,17 @@ def pc_duchon_term(num_pcs: int) -> str:
 
 def pc_marginal_surface_term_binary(num_pcs: int) -> str:
     pcs = ", ".join(f"PC{i+1}" for i in range(num_pcs))
-    # TEMPORARY workaround for gam#531 (SauersML/gam): in the probit (binary)
-    # marginal-slope path the GLM marginal block ALWAYS carries an explicit
-    # intercept, and a pure scale-free `duchon` surface carries a polynomial
-    # nullspace whose CONSTANT column exactly duplicates that intercept. Both
-    # live in the same `marginal_surface` block, so the joint design is
-    # rank-deficient by exactly 1 -- an intra-block redundancy that cross-block
-    # gauge_priority cannot resolve and that gamfit's identifiability audit
-    # hard-halts. No formula-level centering reaches it today (adding explicit
-    # PC linear terms centers the linear nullspace but not the constant). The
-    # survival path is immune: its baseline hazard absorbs the constant, so
-    # there is no explicit intercept to collide with.
+    # Polyharmonic Duchon marginal surface, sharing one basis with the logslope
+    # channel (the scientific target: PC-varying PRS log-OR).
     #
-    # A Matern kernel is strictly positive-definite -> NO polynomial nullspace,
-    # hence no constant column to collide with the intercept, so the marginal
-    # NUISANCE surface stays identifiable. `length_scale` defaults to 1.0 on
-    # auto-standardized inputs and `MaternIdentifiability::OrthogonalToParametric`
-    # keeps the kernel block orthogonal to the parametric block; omitting
-    # length_scale/scale_dims keeps kappa locked (no outer optimizer -- same
-    # fast path the duchon run used). Only the marginal (nuisance) baseline
-    # surface changes basis; the logslope channel -- the scientific target
-    # (PC-varying PRS log-OR) -- keeps the polyharmonic Duchon below.
+    # KNOWN gam-side issue in the probit binary path: the Duchon penalty leaves
+    # a polynomial nullspace unpenalized. Its CONSTANT direction collides with
+    # the GLM marginal block's explicit intercept (the audit FATAL of #531,
+    # closed); orthogonalization now clears that, but the surviving LINEAR PC
+    # directions are unpenalized AND unconstrained on a probit fit, so the outer
+    # REML/ARC solve fails to converge (β→∞, λ→0) -- SauersML/gam#754. The escape
+    # hatch is a strictly-PD Matern marginal (no polynomial nullspace); we keep
+    # Duchon here pending the gam-side fix so both channels share a basis.
     return f"duchon({pcs}, centers={DUCHON_CENTERS})"
 
 
