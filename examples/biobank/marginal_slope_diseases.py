@@ -291,6 +291,13 @@ WORKDIR = PLINK_PREFIX.parent
 FITS_DIR = WORKDIR / "biobank_fits"
 NUM_PCS = 3
 DUCHON_CENTERS = 20  # > linear nullspace (d+1=4) in d=3
+# Matern (the gam#754 marginal workaround) has a FIXED length_scale=1, so too
+# many centers in the standardized 3-PC cloud overlap into linearly-dependent
+# basis columns -> intra-block rank deficiency -> audit FATAL. On this data the
+# kernel's numerical rank caps ~13 (≈16 centers); use a safe count well under
+# that. (Duchon is scale-free and does not over-parameterize, so it keeps 20.)
+# Tracked in SauersML/gam#755.
+MATERN_CENTERS = 10
 TRAIN_FRACTION = 0.80  # per-class 80/20 split
 RNG_SEED = 0
 MAX_LOSO_CARE_SITES = 5
@@ -1391,7 +1398,10 @@ def pc_marginal_surface_term_binary(num_pcs: int) -> str:
     # so the surface stays identifiable and the outer solve converges. nu
     # defaults to 5/2; length_scale auto-set; centers matched to the Duchon run.
     # Shared by both channels here. Revert to duchon once gam#754 lands.
-    return f"matern({pcs}, centers={DUCHON_CENTERS})"
+    # MATERN_CENTERS (not DUCHON_CENTERS): Matern over-parameterizes at high
+    # center counts on this data (fixed length_scale -> overlapping columns ->
+    # rank-deficient block -> audit FATAL). See gam#755.
+    return f"matern({pcs}, centers={MATERN_CENTERS})"
 
 
 def fit_marginal_slope(train_df: pd.DataFrame, num_pcs: int):  # -> gamfit.Model
