@@ -276,13 +276,19 @@ def write_markdown(tests: pd.DataFrame, summaries: pd.DataFrame, path: Path) -> 
         lines.append(show.to_markdown(index=False))
         lines.append("")
 
-    main = tests[(tests["pheno"] == "phenoA") & (tests["baseline"].isin(list(METHOD_LABELS)))].copy()
-    main = main.sort_values(["source", "dem", "metric", "baseline"])
-    top_table("Main phenotype: deme-varying environmental baseline risk", main)
+    if tests.empty or "pheno" not in tests.columns:
+        # no paired gamfit-vs-baseline contrasts available (e.g. gamfit failed to
+        # converge on every dataset). Report the per-method summaries only.
+        lines.append("\n_No paired gamfit-vs-baseline contrasts were available "
+                     "(gamfit produced no finite predictions in any scope).\n")
+    else:
+        main = tests[(tests["pheno"] == "phenoA") & (tests["baseline"].isin(list(METHOD_LABELS)))].copy()
+        main = main.sort_values(["source", "dem", "metric", "baseline"])
+        top_table("Main phenotype: deme-varying environmental baseline risk", main)
 
-    all_pheno = tests[tests["baseline"].isin(list(METHOD_LABELS))].copy()
-    all_pheno = all_pheno.sort_values(["source", "dem", "pheno", "metric", "baseline"])
-    top_table("All phenotypes", all_pheno)
+        all_pheno = tests[tests["baseline"].isin(list(METHOD_LABELS))].copy()
+        all_pheno = all_pheno.sort_values(["source", "dem", "pheno", "metric", "baseline"])
+        top_table("All phenotypes", all_pheno)
 
     lines.append("\n## Method-value summaries\n")
     show = summaries.copy()
