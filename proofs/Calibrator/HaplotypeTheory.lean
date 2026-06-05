@@ -171,16 +171,41 @@ theorem more_haplotypes_in_afr
 homozygosity and therefore a larger effective haplotype number. This theorem
 states that connection directly on the population frequency distributions,
 rather than via a hand-written inverse-count surrogate. -/
+theorem uniform_homozygosity_eq {α : Type*} [Fintype α]
+    (freq : α → ℝ)
+    (h_uniform : ∀ i, freq i = 1 / Fintype.card α)
+    (h_card_pos : 0 < (Fintype.card α : ℝ)) :
+    haplotypeHomozygosity freq = 1 / Fintype.card α := by
+  unfold haplotypeHomozygosity
+  calc
+    ∑ i : α, freq i ^ 2 = ∑ i : α, (1 / (Fintype.card α : ℝ)) ^ 2 := by
+      apply Finset.sum_congr rfl
+      intro x _
+      rw [h_uniform x]
+    _ = (Fintype.card α : ℝ) * (1 / (Fintype.card α : ℝ)) ^ 2 := by simp
+    _ = 1 / (Fintype.card α : ℝ) := by
+      field_simp [h_card_pos.ne']
+
 theorem haplotype_frequency_more_uniform_afr
     {α β : Type*} [Fintype α] [Fintype β]
     (freq_eur : α → ℝ) (freq_afr : β → ℝ)
     (h_afr_nonneg : ∀ i, 0 ≤ freq_afr i)
     (h_afr_sum : ∑ i, freq_afr i = 1)
-    (h_hom : haplotypeHomozygosity freq_afr < haplotypeHomozygosity freq_eur) :
+    (h_afr_uniform : ∀ i, freq_afr i = 1 / Fintype.card β)
+    (h_eur_uniform : ∀ i, freq_eur i = 1 / Fintype.card α)
+    (h_card_eur_pos : 0 < (Fintype.card α : ℝ))
+    (h_card : (Fintype.card α : ℝ) < (Fintype.card β : ℝ)) :
     haplotypeHomozygosity freq_afr < haplotypeHomozygosity freq_eur ∧
       effectiveHaplotypeNumber freq_eur < effectiveHaplotypeNumber freq_afr := by
-  exact ⟨h_hom, more_haplotypes_in_afr freq_eur freq_afr
-    h_afr_nonneg h_afr_sum h_hom⟩
+  have h_card_afr_pos : 0 < (Fintype.card β : ℝ) := lt_trans h_card_eur_pos h_card
+  have h_hom_afr : haplotypeHomozygosity freq_afr = 1 / Fintype.card β :=
+    uniform_homozygosity_eq freq_afr h_afr_uniform h_card_afr_pos
+  have h_hom_eur : haplotypeHomozygosity freq_eur = 1 / Fintype.card α :=
+    uniform_homozygosity_eq freq_eur h_eur_uniform h_card_eur_pos
+  have h_hom : haplotypeHomozygosity freq_afr < haplotypeHomozygosity freq_eur := by
+    rw [h_hom_afr, h_hom_eur]
+    exact div_lt_div_of_pos_left one_pos h_card_eur_pos h_card
+  exact ⟨h_hom, more_haplotypes_in_afr freq_eur freq_afr h_afr_nonneg h_afr_sum h_hom⟩
 
 end HaplotypeDiversity
 

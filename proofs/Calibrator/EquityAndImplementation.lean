@@ -81,23 +81,33 @@ theorem disparity_increases_with_distance
     it adds benefit α × R²_eur to that group. The underserved group
     gets no PGS benefit, so the pre-existing disparity d₀ ≥ 0 grows
     to d₀ + α × R²_eur. -/
+noncomputable def baselineDisparity (μ_eur μ_afr : ℝ) : ℝ :=
+  |μ_eur - μ_afr|
+
+noncomputable def updatedDisparity (μ_eur μ_afr α r2_eur : ℝ) : ℝ :=
+  baselineDisparity μ_eur μ_afr + α * r2_eur
+
 theorem deployment_amplifies_disparity
-    (d₀ α r2_eur : ℝ)
-    (h_nn : 0 ≤ d₀)
+    (μ_eur μ_afr α r2_eur : ℝ)
     (h_α : 0 < α) (h_r2 : 0 < r2_eur) :
-    d₀ < d₀ + α * r2_eur := by
-  linarith [mul_pos h_α h_r2]
+    baselineDisparity μ_eur μ_afr < updatedDisparity μ_eur μ_afr α r2_eur := by
+  unfold baselineDisparity updatedDisparity
+  have h_prod_pos : 0 < α * r2_eur := mul_pos h_α h_r2
+  exact lt_add_of_pos_right _ h_prod_pos
 
 /-- **QALY gap from portability.**
     QALYs gained = γ × R² for a positive constant γ (QALYs per unit R²).
     The QALY gap between two populations is γ × (R²₁ - R²₂), which is
     positive when R²₁ > R²₂. Derived from the model, not assumed. -/
+noncomputable def qalyGain (γ r2 : ℝ) : ℝ :=
+  γ * r2
+
 theorem qaly_gap_proportional_to_r2_gap
     (γ r2₁ r2₂ : ℝ)
     (h_γ : 0 < γ) (h_gap : r2₂ < r2₁) :
-    0 < γ * r2₁ - γ * r2₂ := by
-  have : r2₁ - r2₂ > 0 := by linarith
-  nlinarith
+    qalyGain γ r2₂ < qalyGain γ r2₁ := by
+  unfold qalyGain
+  exact mul_lt_mul_of_pos_left h_gap h_γ
 
 end HealthDisparity
 
@@ -119,18 +129,18 @@ section FairnessImpossibility
     2. Equal false negative rates (FNR₁ = FNR₂)
     3. Equal positive predictive values (PPV₁ = PPV₂)
     unless the classifier is perfect or trivial. -/
+noncomputable def ppvValue (K fnr fpr : ℝ) : ℝ :=
+  K * (1 - fnr) / (K * (1 - fnr) + (1 - K) * fpr)
+
 theorem chouldechova_impossibility
-    (fpr fnr ppv₁ ppv₂ K₁ K₂ : ℝ)
+    (fpr fnr K₁ K₂ : ℝ)
     (h_prev_diff : K₁ ≠ K₂)
     (h_K₁ : 0 < K₁) (h_K₁' : K₁ < 1)
     (h_K₂ : 0 < K₂) (h_K₂' : K₂ < 1)
     (h_fpr : 0 < fpr) (h_fnr_lt : fnr < 1)
-    (h_fnr_nn : 0 ≤ fnr)
-    -- PPV = K × (1-FNR) / (K × (1-FNR) + (1-K) × FPR)
-    (h_ppv₁_def : ppv₁ = K₁ * (1 - fnr) / (K₁ * (1 - fnr) + (1 - K₁) * fpr))
-    (h_ppv₂_def : ppv₂ = K₂ * (1 - fnr) / (K₂ * (1 - fnr) + (1 - K₂) * fpr)) :
-    ppv₁ ≠ ppv₂ := by
-  rw [h_ppv₁_def, h_ppv₂_def]
+    (h_fnr_nn : 0 ≤ fnr) :
+    ppvValue K₁ fnr fpr ≠ ppvValue K₂ fnr fpr := by
+  unfold ppvValue
   intro h
   apply h_prev_diff
   have h_sens : 0 < 1 - fnr := by linarith
@@ -148,22 +158,22 @@ theorem chouldechova_impossibility
     If we use a population-specific threshold to achieve equal FPR,
     the thresholds must differ, which means the treatment policies
     are ancestry-dependent. -/
+noncomputable def equalFprThreshold1 (mu₁ sigma₁ threshold₂ mu₂ sigma₂ : ℝ) : ℝ :=
+  (threshold₂ - mu₂) / sigma₂ * sigma₁ + mu₁
+
 theorem equal_fpr_requires_different_thresholds
-    (mu₁ mu₂ sigma₁ sigma₂ threshold₁ threshold₂ : ℝ)
+    (mu₁ mu₂ sigma₁ sigma₂ threshold₂ : ℝ)
     (h_mu_diff : mu₁ ≠ mu₂)
     (h_sigma₁ : 0 < sigma₁) (h_sigma₂ : 0 < sigma₂)
-    -- Equal FPR ↔ equal z-scores
-    (h_equal_z : (threshold₁ - mu₁) / sigma₁ = (threshold₂ - mu₂) / sigma₂)
     (h_sigma_eq : sigma₁ = sigma₂) :
-    threshold₁ ≠ threshold₂ := by
+    equalFprThreshold1 mu₁ sigma₁ threshold₂ mu₂ sigma₂ ≠ threshold₂ := by
   intro h_eq
-  apply h_mu_diff
-  rw [h_eq, h_sigma_eq] at h_equal_z
-  -- h_equal_z : (threshold₂ - mu₁) / sigma₂ = (threshold₂ - mu₂) / sigma₂
-  have h_eq₂ : (threshold₂ - mu₁) * sigma₂ = (threshold₂ - mu₂) * sigma₂ := by
-    rwa [div_eq_div_iff (ne_of_gt h_sigma₂) (ne_of_gt h_sigma₂)] at h_equal_z
-  have := mul_right_cancel₀ (ne_of_gt h_sigma₂) h_eq₂
-  linarith
+  unfold equalFprThreshold1 at h_eq
+  rw [h_sigma_eq] at h_eq
+  have h_eq2 : (threshold₂ - mu₂) / sigma₂ * sigma₂ + mu₁ = threshold₂ := h_eq
+  rw [div_mul_cancel₀ _ (ne_of_gt h_sigma₂)] at h_eq2
+  have h_mu_eq : mu₁ = mu₂ := by linarith
+  exact h_mu_diff h_mu_eq
 
 /-- **Group-blind vs group-aware PGS policies.**
     A group-blind policy (same threshold for all) violates
@@ -174,12 +184,19 @@ theorem equal_fpr_requires_different_thresholds
     for an aware policy is |t₁ - t₂| (threshold difference).
     When means differ and equal FPR requires different thresholds,
     both violations are positive. -/
+noncomputable def groupBlindCalibrationViolation (μ₁ μ₂ : ℝ) : ℝ :=
+  |μ₁ - μ₂|
+
+noncomputable def groupAwareTreatmentViolation (μ₁ μ₂ σ : ℝ) : ℝ :=
+  |μ₁ - μ₂| / σ
+
 theorem no_fully_fair_policy
     (μ₁ μ₂ σ : ℝ)
     (h_mu_diff : μ₁ ≠ μ₂)
     (h_sigma : 0 < σ) :
-    -- Both policies have some fairness violation
-    0 < |μ₁ - μ₂| ∧ 0 < |μ₁ - μ₂| / σ := by
+    0 < groupBlindCalibrationViolation μ₁ μ₂ ∧
+    0 < groupAwareTreatmentViolation μ₁ μ₂ σ := by
+  unfold groupBlindCalibrationViolation groupAwareTreatmentViolation
   constructor
   · exact abs_pos.mpr (sub_ne_zero.mpr h_mu_diff)
   · exact div_pos (abs_pos.mpr (sub_ne_zero.mpr h_mu_diff)) h_sigma
