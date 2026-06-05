@@ -7,11 +7,12 @@ training and never uses model_train for reported metrics.
 Methods:
 - gamfit marginal-slope, probit, Matern PC surface, default centers=20
 - PGS + PCs linear logistic model
-- z-norm logistic model, with deme mean/sd learned on model_train
+- znorm2: continuous PC-adjusted PGS z-score (mean and variance modelled as
+  linear functions of the PCs, no discrete population labels), then logistic
 
 Metrics:
 - global held-out discrimination: AUC, Brier, liability-scale R2
-- group held-out calibration/error by distance and deme, all against p_true
+- group held-out calibration/error by distance, all against p_true
 - individual absolute error for Figure 2b
 """
 from __future__ import annotations
@@ -26,17 +27,17 @@ import numpy as np
 import pandas as pd
 from scipy.stats import pearsonr
 from scipy.stats import norm
-from sklearn.linear_model import LogisticRegression
+from sklearn.linear_model import LinearRegression, LogisticRegression
 from sklearn.metrics import brier_score_loss, mean_absolute_error, roc_auc_score
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RESULTS_DIR = REPO_ROOT / "sims" / "results_hpc" / "ancestry_calibration" / "results"
 
-METHODS = ("gamfit", "linpc", "znorm")
+METHODS = ("gamfit", "linpc", "znorm2")
 CENTERS = 20
 FIT_JOBS = 6
 
-DATASET_RE = re.compile(r"^(serial1d|grid2d)_(phenoA|phenoB)_realpt_s(\d+)$")
+DATASET_RE = re.compile(r"^(serial1d|grid2d|admix)_(phenoA|phenoB)_realpt_s(\d+)$")
 
 
 def clip_prob(p: np.ndarray) -> np.ndarray:
@@ -91,21 +92,34 @@ def fit_linpc(train: pd.DataFrame, test: pd.DataFrame, pcs: list[str]) -> np.nda
     return logistic_fit_predict(train[features].to_numpy(), train["y_binary"].to_numpy(), test[features].to_numpy())
 
 
-def fit_znorm(train: pd.DataFrame, test: pd.DataFrame) -> np.ndarray:
-    stats = train.groupby("deme")["PGS_raw"].agg(["mean", "std"]).rename(columns={"mean": "mu", "std": "sd"})
-    missing = sorted(set(test["deme"]).difference(stats.index))
-    if missing:
-        raise ValueError(f"z-norm missing model_train rows for demes: {missing}")
+def fit_znorm2(train: pd.DataFrame, test: pd.DataFrame, pcs: list[str]) -> np.ndarray:
+    """Continuous PC-adjusted PGS z-score (PGS Catalog / Khera-2019 full adjustment).
 
-    def apply_z(frame: pd.DataFrame) -> np.ndarray:
-        mu = frame["deme"].map(stats["mu"]).to_numpy(dtype=float)
-        sd = frame["deme"].map(stats["sd"]).to_numpy(dtype=float)
-        if np.any(~np.isfinite(sd)) or np.any(sd <= 0):
-            raise ValueError("z-norm encountered non-positive model_train SD")
-        return (frame["PGS_raw"].to_numpy(dtype=float) - mu) / sd
+    Ancestry is treated as a continuum via the PCs: the raw PGS mean and variance
+    are each modelled as linear functions of the PCs (fit on model_train only), and
+    every individual is standardized by their PC-predicted mean and SD --
+    Z = (PGS_raw - mu_hat(PC)) / sd_hat(PC). No discrete population labels are used.
+    The standardized score is then passed through a logistic model of the outcome.
+    """
+    Xtr = train[pcs].to_numpy(dtype=float)
+    Xte = test[pcs].to_numpy(dtype=float)
+    raw_tr = train["PGS_raw"].to_numpy(dtype=float)
+    raw_te = test["PGS_raw"].to_numpy(dtype=float)
 
-    z_train = apply_z(train).reshape(-1, 1)
-    z_test = apply_z(test).reshape(-1, 1)
+    mean_model = LinearRegression().fit(Xtr, raw_tr)
+    mu_tr = mean_model.predict(Xtr)
+    mu_te = mean_model.predict(Xte)
+
+    resid_tr = raw_tr - mu_tr
+    # variance as a (non-negative) linear function of the PCs; floor to a small
+    # positive fraction of the global residual variance for numerical safety.
+    var_floor = max(float(np.var(resid_tr)) * 1e-4, 1e-12)
+    var_model = LinearRegression().fit(Xtr, resid_tr ** 2)
+    sd_tr = np.sqrt(np.clip(var_model.predict(Xtr), var_floor, None))
+    sd_te = np.sqrt(np.clip(var_model.predict(Xte), var_floor, None))
+
+    z_train = ((raw_tr - mu_tr) / sd_tr).reshape(-1, 1)
+    z_test = ((raw_te - mu_te) / sd_te).reshape(-1, 1)
     return logistic_fit_predict(z_train, train["y_binary"].to_numpy(), z_test)
 
 
@@ -141,8 +155,9 @@ def fit_gamfit(train: pd.DataFrame, test: pd.DataFrame, pcs: list[str]) -> np.nd
 
 
 def global_metrics(y: np.ndarray, p: np.ndarray, p_true: np.ndarray, true_liab: np.ndarray) -> dict[str, float]:
-    p = clip_prob(p)
-    eta = probit(p)
+    if not np.isfinite(p).all():   # method failed upstream (NaN sentinel) -> all metrics NaN
+        return {k: float("nan") for k in ("brier", "mae_true_risk", "auc", "liability_pseudo_r2")}
+    eta = probit(p)   # probit() clips internally only for finiteness; metrics use raw p
     out: dict[str, float] = {
         "brier": float(brier_score_loss(y, p)),
         "mae_true_risk": float(mean_absolute_error(p_true, p)),
@@ -156,6 +171,8 @@ def global_metrics(y: np.ndarray, p: np.ndarray, p_true: np.ndarray, true_liab: 
 
 
 def group_metrics(frame: pd.DataFrame, method: str, p: np.ndarray, group_col: str, group_kind: str) -> list[dict[str, object]]:
+    if not np.isfinite(p).all():   # method failed upstream -> no group rows
+        return []
     work = frame.copy()
     work["p_hat"] = clip_prob(p)
     rows: list[dict[str, object]] = []
@@ -200,10 +217,19 @@ def evaluate_dataset(path: Path, outdir: Path) -> dict[str, Path]:
     if train.empty or test.empty:
         raise ValueError(f"{path}: model_train/test split empty")
 
+    def _safe(name, fn):
+        # one method failing (e.g. gamfit _rust.IntegrationError at large N) must not
+        # kill the whole pool via an unpicklable exception; record NaN and continue.
+        try:
+            return np.asarray(fn(), dtype=float)
+        except Exception as e:
+            print(f"WARN {path.name}: method {name} failed -> NaN: {type(e).__name__}: {e}", flush=True)
+            return np.full(len(test), np.nan)
+
     predictions = {
-        "gamfit": fit_gamfit(train, test, pcs),
-        "linpc": fit_linpc(train, test, pcs),
-        "znorm": fit_znorm(train, test),
+        "gamfit": _safe("gamfit", lambda: fit_gamfit(train, test, pcs)),
+        "linpc": _safe("linpc", lambda: fit_linpc(train, test, pcs)),
+        "znorm2": _safe("znorm2", lambda: fit_znorm2(train, test, pcs)),
     }
 
     stem = path.stem.replace("_realpt", "")
@@ -228,7 +254,6 @@ def evaluate_dataset(path: Path, outdir: Path) -> dict[str, Path]:
                 {"dem": dem_name, "pheno": pheno, "method": method, "metric": metric, "value": value}
             )
         group_rows.extend(group_metrics(test, method, p, "dist_from_train", "distance"))
-        group_rows.extend(group_metrics(test, method, p, "deme", "deme"))
         pf = test[
             ["iid", "deme", "dist_from_train", "PGS_z", "y_binary", "p_true", "true_liab", "true_slope_deme"]
         ].copy()
@@ -253,11 +278,18 @@ def evaluate_dataset(path: Path, outdir: Path) -> dict[str, Path]:
 
 
 def main() -> None:
+    global CENTERS              # reassigned below from --centers
     parser = argparse.ArgumentParser()
     parser.add_argument("datasets", nargs="+", type=Path)
+    parser.add_argument("--run-tag", default="", help="output subdir for sweep isolation")
+    parser.add_argument("--centers", type=int, default=CENTERS, help="marginal-slope surface centers")
     args = parser.parse_args()
 
-    outdir = RESULTS_DIR
+    CENTERS = args.centers      # picked up by forked pool workers (surface formula)
+    if args.run_tag:
+        outdir = REPO_ROOT / "sims" / "results_hpc" / "ancestry_calibration" / args.run_tag / "results"
+    else:
+        outdir = RESULTS_DIR
     outdir.mkdir(parents=True, exist_ok=True)
     jobs = max(1, min(FIT_JOBS, len(args.datasets)))
     all_acc = []

@@ -24,15 +24,45 @@ PLOT = HERE / "plot_results.py"
 OUT = Path("sims/results_hpc/ancestry_calibration")
 
 DEMOGRAPHIES = ("serial1d", "grid2d")
-SEEDS = (1, 2, 3, 7)
+SEEDS = tuple(range(1, 21))  # 20 replicates: seed = inferential unit (power)
 CENTERS = 20
-CHUNKS = 20
-CHUNK_BP = 5_000_000
-THREADS_PER_GENERATION_JOB = 4
-PLINK_MEMORY_MB_PER_GENERATION_JOB = 48_000
-N_CAUSAL = 150
-GENERATE_JOBS = 6
-FIT_JOBS = 6
+CHUNKS = 200          # provenance; live values are gen_real_pt.DEFAULT_CHUNKS/_CHUNK_BP
+CHUNK_BP = 500_000
+# Live value is gen_real_pt.DEFAULT_THREADS; kept here for the cpu-budget formula.
+THREADS_PER_GENERATION_JOB = 8
+PLINK_MEMORY_MB_PER_GENERATION_JOB = 24_000  # provenance; live: gen_real_pt.DEFAULT_MEM_MB
+N_CAUSAL = 4500  # provenance only; must match gen_real_pt.N_CAUSAL
+# Peak RAM of ONE int8-streaming generate task: a chunk's int8 genotype matrix
+# (~8 GiB at biobank n) + its dosage view (~4 GiB) + the kept reservoirs (~6 GiB),
+# rounded up for slack. The job count is NOT hardcoded -- it is computed at launch
+# from whatever RAM and cores are actually free (the node is shared).
+GEN_TASK_PEAK_GIB = 22.0
+MEM_HEADROOM_FRAC = 0.70  # only spend this share of free RAM; leave room for others
+FIT_JOBS = 6  # provenance only; fit_binary runs as one process over all datasets
+
+
+def auto_generate_jobs(n_tasks: int) -> int:
+    """Pick the generate fan-out from currently-free RAM and cores, not a fixed
+    number: the node is shared, so the safe parallelism depends on who else is on it."""
+    mem_avail_gib = 64.0
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    mem_avail_gib = int(line.split()[1]) / (1024 ** 2)  # kB -> GiB
+                    break
+    except OSError:
+        pass
+    try:
+        free_cores = max(1, int((os.cpu_count() or 8) - os.getloadavg()[0]))
+    except OSError:
+        free_cores = os.cpu_count() or 8
+    by_mem = int((mem_avail_gib * MEM_HEADROOM_FRAC) // GEN_TASK_PEAK_GIB)
+    by_cpu = free_cores // THREADS_PER_GENERATION_JOB
+    jobs = max(1, min(n_tasks, by_mem, by_cpu))
+    print(f"auto generate jobs={jobs} (free RAM {mem_avail_gib:.0f} GiB -> {by_mem} by mem; "
+          f"free cores {free_cores} / {THREADS_PER_GENERATION_JOB} thr -> {by_cpu} by cpu)", flush=True)
+    return jobs
 
 
 def tail(path: Path, n: int = 80) -> str:
@@ -75,6 +105,7 @@ def main() -> None:
     data_dir.mkdir(parents=True, exist_ok=True)
     results_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
+    generate_jobs = auto_generate_jobs(len(DEMOGRAPHIES) * len(SEEDS))
 
     config = {
         "demographies": list(DEMOGRAPHIES),
@@ -94,13 +125,12 @@ def main() -> None:
             "distance-bin AUC",
             "distance-bin liability-scale pseudo-R2",
             "distance-bin Brier",
-            "distance/deme slope error vs known true slope",
             "distance/deme prevalence error vs known true prevalence",
             "mean absolute error vs p_true",
             "individual absolute error vs p_true",
         ],
         "parallelism": {
-            "generate_jobs": GENERATE_JOBS,
+            "generate_jobs": generate_jobs,
             "fit_jobs": FIT_JOBS,
             "threads_per_generation_job": THREADS_PER_GENERATION_JOB,
             "plink_memory_mb_per_generation_job": PLINK_MEMORY_MB_PER_GENERATION_JOB,
@@ -131,7 +161,7 @@ def main() -> None:
                     log_dir / f"{name}.log",
                 )
             )
-    run_many(generate_tasks, GENERATE_JOBS)
+    run_many(generate_tasks, generate_jobs)
 
     datasets = []
     for dem in DEMOGRAPHIES:

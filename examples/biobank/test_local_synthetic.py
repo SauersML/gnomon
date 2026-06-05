@@ -18,10 +18,10 @@ For each scenario the script:
   2. takes 100 cases + 100 controls for *training* (no overlap with test),
   3. takes a disjoint 100 cases + 100 controls for *held-out test*,
   4. standardizes the PGS using training stats only (no leakage),
-  5. fits `case ~ duchon(PC1..PC10) + sex` with `prs_z` driving the
+  5. fits `case ~ duchon(PC1..PC3) + sex` with `prs_z` driving the
      marginal-slope log-slope channel through the same Duchon smooth
      (no `linkwiggle()` either channel — both hang, SauersML/gam#683),
-  6. reports held-out AUROC and Lee-2011 liability-scale R^2.
+  6. reports held-out AUROC and Lee 2012 liability-scale R^2.
 
 Run:  uv run examples/biobank/test_local_synthetic.py
 """
@@ -42,7 +42,7 @@ RNG_SEED = 0
 
 SCENARIOS = {
     # `prevalence` here is the *target* prevalence used when synthesizing the
-    # cohort (threshold on the liability); the K passed to the Lee-2011
+    # cohort (threshold on the liability); the K passed to the Lee 2012
     # transform is recomputed from the realized synthetic cohort (cases/n)
     # so the metric uses the actually-observed prevalence, not a target.
     "copd-like":          {"prevalence": 0.06, "pgs_effect": 0.30},
@@ -144,7 +144,7 @@ def fit_marginal_slope(train_df: pd.DataFrame, num_pcs: int) -> gamfit.Model:
 
 
 def metrics(y: np.ndarray, p: np.ndarray, K: float) -> dict[str, float]:
-    """Held-out AUROC + Lee-2011 liability-scale R^2.
+    """Held-out AUROC + Lee 2012 liability-scale R^2.
 
     Lee, Wray, Goddard, Visscher (AJHG 2011, eq. 23) for ascertained case-control:
 

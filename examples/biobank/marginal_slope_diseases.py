@@ -6,7 +6,7 @@ For each disease the script:
      OMOP/OHDSI `concept` table on the AoU CDR.
   2. Pulls everyone whose `condition_occurrence.condition_concept_id`
      descends from that concept via `concept_ancestor`.
-  3. Fits `Surv(entry_age, exit_age, event) ~ duchon(PC1..PC10) + sex`
+  3. Fits `Surv(entry_age, exit_age, event) ~ duchon(PC1..PC3) + sex`
      with the hard-coded PGS feeding the marginal-slope latent z and the same
      isotropic Duchon smooth on the log-slope channel. No `linkwiggle()` on
      either channel (link-deviation / score-warp both hang, SauersML/gam#683).
@@ -543,28 +543,6 @@ def load_sex(client: "bigquery.Client | None" = None, cdr: str | None = None) ->
     return out
 
 
-def _load_pcs_from_gnomon(num_pcs: int) -> pd.DataFrame:
-    """Read gnomon's `projection_scores.bin` (GNPRJ001/GNPSID01) as a fallback."""
-    bin_path = PLINK_PREFIX.with_name(f"{PLINK_PREFIX.name}.projection_scores.bin")
-    meta_path = PLINK_PREFIX.with_name(f"{PLINK_PREFIX.name}.projection_scores.metadata.json")
-    meta = json.loads(meta_path.read_text())
-    rows, cols = int(meta["rows"]), int(meta["cols"])
-    with bin_path.open("rb") as fh:
-        assert fh.read(8) == b"GNPRJ001"
-        fh.read(4 + 8 + 8 + 4)
-        data = np.fromfile(fh, dtype="<f8", count=rows * cols).reshape(cols, rows).T
-        assert fh.read(8) == b"GNPSID01"
-        fh.read(4 + 4)
-        count = struct.unpack("<Q", fh.read(8))[0]
-        sb = struct.unpack("<Q", fh.read(8))[0]
-        offsets = np.frombuffer(fh.read(8 * (count + 1)), dtype="<u8")
-        blob = fh.read(sb)
-    ids = [blob[offsets[i]:offsets[i + 1]].decode() for i in range(count)]
-    df = pd.DataFrame(data[:, :num_pcs], columns=[f"PC{i+1}" for i in range(num_pcs)])
-    df.insert(0, "person_id", _canonical_id(pd.Series(ids)))
-    return df
-
-
 def _load_pcs_from_aou(num_pcs: int) -> pd.DataFrame | None:
     """Pull the AoU-published 16 PCs from `ancestry_preds.tsv:pca_features`.
 
@@ -625,20 +603,17 @@ def _load_pcs_from_aou(num_pcs: int) -> pd.DataFrame | None:
 
 
 def load_pcs(num_pcs: int) -> pd.DataFrame:
-    """Load `num_pcs` PCs per participant.
-
-    Prefers AoU's official `pca_features` from `ancestry_preds.tsv` (the 16
-    PCs from `hwe_normalized_pca` against 1KGP+HGDP, packaged with the CDR);
-    falls back to gnomon's local `<plink-prefix>.projection_scores.bin` if the
-    AoU file is unreachable (e.g. the same 403 that disables the ancestry LOSO
-    axis when the workspace can't read `fc-aou-datasets-controlled`).
+    """Load `num_pcs` PCs per participant from AoU's official `pca_features`
+    (the 16 PCs from `hwe_normalized_pca` against 1KGP+HGDP, packaged with the
+    CDR). No fallback: if the AoU file is unreachable we raise rather than
+    silently substitute gnomon's locally-projected PCs, which are a different
+    coordinate system and would make runs incomparable.
     """
     df = _load_pcs_from_aou(num_pcs)
     if df is None:
-        df = _load_pcs_from_gnomon(num_pcs)
-        print(
-            f"  pcs (gnomon): n={len(df):,}  "
-            f"source={PLINK_PREFIX.name}.projection_scores.bin"
+        raise RuntimeError(
+            "AoU pca_features unreachable; refusing to fall back to gnomon-projected "
+            "PCs (different coordinate system). Stage ancestry_preds.tsv and retry."
         )
     return df
 
@@ -1892,7 +1867,7 @@ def gam_survival_outputs(
 
     Returns ``(risk, surv_cond, kept)``:
       * ``risk = -log S_cond_i(s_K)``  — monotone-in-hazard ranking score for
-        IPCW C / dynamic AUC; same ordering as the cumulative hazard accrued
+        IPCW C; same ordering as the cumulative hazard accrued
         during the follow-up window up to ``s_K``.
       * ``surv_cond`` shape ``(n_kept, len(followup_times))``.
       * ``kept`` is a bool mask over input rows that survived gamfit's
@@ -2182,7 +2157,7 @@ def survival_library_metrics(
     ``surv_cond`` is the per-row conditional survival on ``followup_times``.
 
     Returns a :class:`SurvivalMetricStats` with IPCW Harrell's C (Uno) plus
-    its bootstrap 95% CI, mean cumulative/dynamic AUC, integrated Brier
+    its bootstrap 95% CI, integrated Brier
     score, IBS under the KM null reference, and IPA pseudo R² =
     ``1 - IBS / IBS_null``.
     """
@@ -2365,7 +2340,7 @@ def evaluate_binary_model_pair(
         plus linear PCs).
 
     Discrimination is reported with AUROC + paired-DeLong 95% CI, AP,
-    log-loss, Brier, Nagelkerke R², and Lee 2012 liability R² (taking
+    Brier and Lee 2012 liability R² (taking
     the supplied `population_prevalence` so the 1:1 balanced split's
     sample prevalence of 0.5 is correctly mapped back to the population
     scale). The headline `GAM−N` delta is the *clinical-utility* lift,
@@ -2555,6 +2530,35 @@ def evaluate_binary_model_pair(
     }
 
 
+# Per-individual eval emission for Figure 4b (eval_vs_distance.py). Default OFF:
+# set INDIVIDUAL_EVAL_DIR to a path to emit one CSV per held-out fold with
+# person_id, PCs, outcome, ancestry (if present), and F-hat_<method>(horizon).
+INDIVIDUAL_EVAL_DIR: str | None = None
+INDIVIDUAL_EVAL_HORIZON: float = 10.0
+
+
+def individual_eval_frame(test_metric, surv_by_method, metric_times, horizon, pc_cols):
+    """Per-individual held-out table for eval_vs_distance.run_biobank: predicted
+    P(diagnosis by `horizon`) = 1 - S_cond(horizon) for each model, plus PCs and
+    outcome (and ancestry if carried on the frame). Pure; no I/O."""
+    idx = int(np.argmin(np.abs(np.asarray(metric_times, dtype=float) - float(horizon))))
+    out = {
+        "person_id": test_metric["person_id"].to_numpy(),
+        "entry_age": test_metric["entry_age"].to_numpy(dtype=float),
+        "exit_age": test_metric["exit_age"].to_numpy(dtype=float),
+        "event": test_metric["event"].to_numpy().astype(int),
+    }
+    for pc in pc_cols:
+        out[pc] = test_metric[pc].to_numpy(dtype=float)
+    for anc in ("ancestry", "ancestry_category"):
+        if anc in test_metric.columns:
+            out["ancestry"] = test_metric[anc].astype(str).to_numpy()
+            break
+    for name, surv in surv_by_method.items():
+        out[f"Fhat_{name}"] = 1.0 - np.clip(np.asarray(surv)[:, idx], 0.0, 1.0)
+    return pd.DataFrame(out)
+
+
 def evaluate_model_pair(
     train: pd.DataFrame,
     test: pd.DataFrame,
@@ -2724,6 +2728,14 @@ def evaluate_model_pair(
     gam_test_m = survival_library_metrics(
         train, test_metric, gam_risk_test, gam_surv_test, metric_times,
     )
+    if INDIVIDUAL_EVAL_DIR is not None:                # Figure-4b input (opt-in)
+        os.makedirs(INDIVIDUAL_EVAL_DIR, exist_ok=True)
+        _safe = "".join(c if c.isalnum() else "_" for c in str(label))
+        individual_eval_frame(
+            test_metric,
+            {"gamfit": gam_surv_test, "znorm": A_surv_test, "linpc": B_surv_test},
+            metric_times, INDIVIDUAL_EVAL_HORIZON, pc_cols,
+        ).to_csv(os.path.join(INDIVIDUAL_EVAL_DIR, f"individual_eval_{_safe}.csv"), index=False)
     gam_train_m = A_train_m = B_train_m = None
     if score_train:
         train_times = _survival_metric_times(
@@ -3075,20 +3087,13 @@ def main() -> None:
     print(f"base (with context): n={len(base):,}")
 
     print("loading AoU inferred genetic ancestry labels ...")
-    try:
-        ancestry = load_genetic_ancestry_labels()
-    except Exception as exc:
-        # Bare-metal VMs sit outside the AoU VPC-SC perimeter, so the controlled
-        # bucket is unreachable. If a prior workbench-side `gsutil cp` hasn't
-        # staged ANCESTRY_PREDS_CACHE here, drop the `ancestry` LOSO axis and
-        # finish the rest of the run (random split + care_site + census_region).
-        first_line = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
-        print(f"  WARNING: ancestry labels unavailable -> dropping 'ancestry' LOSO axis. detail: {first_line}")
-        active_axes = [a for a in active_axes if a != "ancestry"]
-    else:
-        base = base.merge(ancestry, on="person_id", how="left")
-        base["ancestry_category"] = _clean_group_label(base["ancestry_category"]).str.upper()
-        print(f"base (with ancestry): n={len(base):,}")
+    # No fallback: the ancestry LOSO axis is the central generalization claim, so
+    # if labels are unavailable we fail loudly rather than silently dropping it
+    # and reporting a degraded run as if it were the full design.
+    ancestry = load_genetic_ancestry_labels()
+    base = base.merge(ancestry, on="person_id", how="left")
+    base["ancestry_category"] = _clean_group_label(base["ancestry_category"]).str.upper()
+    print(f"base (with ancestry): n={len(base):,}")
 
     rng = np.random.default_rng(RNG_SEED)
     pc_cols = [f"PC{i+1}" for i in range(NUM_PCS)]

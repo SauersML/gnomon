@@ -14,7 +14,7 @@ REPORTS_DIR = REPO_ROOT / "sims" / "results_hpc" / "ancestry_calibration" / "rep
 
 METHOD_LABELS = {
     "linpc": "PGS + PCs",
-    "znorm": "z-norm",
+    "znorm2": "PC-adjusted z-score",
 }
 
 METRICS = {
@@ -79,7 +79,7 @@ def paired_advantage(gamfit: pd.Series, baseline: pd.Series, metric: str) -> np.
 
 def bootstrap_ci(values: np.ndarray) -> tuple[float, float]:
     if values.size < 2 or np.allclose(values, values[0]):
-        return float(np.mean(values)), float(np.mean(values))
+        return float("nan"), float("nan")   # degenerate: no interval, do not fabricate a point CI
     res = stats.bootstrap(
         (values,),
         np.mean,
@@ -94,13 +94,13 @@ def bootstrap_ci(values: np.ndarray) -> tuple[float, float]:
 def signed_rank(values: np.ndarray, alternative: str = "greater") -> float:
     nonzero = values[~np.isclose(values, 0.0)]
     if nonzero.size == 0:
-        return 1.0
+        return float("nan")   # degenerate: no test, excluded from the BH family
     return float(stats.wilcoxon(nonzero, alternative=alternative, zero_method="wilcox").pvalue)
 
 
 def paired_t(values: np.ndarray, alternative: str = "greater") -> float:
     if values.size < 2 or np.allclose(values, values[0]):
-        return 1.0
+        return float("nan")
     return float(stats.ttest_1samp(values, popmean=0.0, alternative=alternative).pvalue)
 
 
@@ -109,7 +109,7 @@ def sign_test(values: np.ndarray, alternative: str = "greater") -> tuple[int, in
     wins = int(np.sum(nonzero > 0))
     n = int(nonzero.size)
     if n == 0:
-        return wins, n, 1.0
+        return wins, n, float("nan")
     return wins, n, float(stats.binomtest(wins, n, p=0.5, alternative=alternative).pvalue)
 
 
@@ -179,7 +179,12 @@ def collect_tests(
         "p_paired_t_two_sided",
         "p_wilcoxon_two_sided",
     ]:
-        out[f"q_bh_{p_col[2:]}"] = multipletests(out[p_col].to_numpy(float), method="fdr_bh")[1]
+        p = out[p_col].to_numpy(float)
+        q = np.full_like(p, np.nan)
+        m = np.isfinite(p)                       # degenerate (NaN) tests stay out of the BH family
+        if m.any():
+            q[m] = multipletests(p[m], method="fdr_bh")[1]
+        out[f"q_bh_{p_col[2:]}"] = q
     return out
 
 
@@ -268,11 +273,11 @@ def write_markdown(tests: pd.DataFrame, summaries: pd.DataFrame, path: Path) -> 
         lines.append(show.to_markdown(index=False))
         lines.append("")
 
-    main = tests[(tests["pheno"] == "phenoA") & (tests["baseline"].isin(["linpc", "znorm"]))].copy()
+    main = tests[(tests["pheno"] == "phenoA") & (tests["baseline"].isin(list(METHOD_LABELS)))].copy()
     main = main.sort_values(["source", "dem", "metric", "baseline"])
     top_table("Main phenotype: deme-varying environmental baseline risk", main)
 
-    all_pheno = tests[tests["baseline"].isin(["linpc", "znorm"])].copy()
+    all_pheno = tests[tests["baseline"].isin(list(METHOD_LABELS))].copy()
     all_pheno = all_pheno.sort_values(["source", "dem", "pheno", "metric", "baseline"])
     top_table("All phenotypes", all_pheno)
 
@@ -287,6 +292,15 @@ def write_markdown(tests: pd.DataFrame, summaries: pd.DataFrame, path: Path) -> 
 
 
 def main() -> None:
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--run-tag", default="", help="output subdir for sweep isolation")
+    args = ap.parse_args()
+    global RESULTS_DIR, REPORTS_DIR
+    if args.run_tag:
+        base = REPO_ROOT / "sims" / "results_hpc" / "ancestry_calibration" / args.run_tag
+        RESULTS_DIR = base / "results"
+        REPORTS_DIR = base / "reports"
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     accuracy = long_accuracy_to_wide(pd.read_csv(RESULTS_DIR / "accuracy_realpt_binary.csv"))
     group = pd.read_csv(RESULTS_DIR / "group_metrics_realpt_binary.csv")
@@ -312,11 +326,18 @@ def main() -> None:
                 metric_cols=global_metrics,
                 scope_cols=["dem", "pheno"],
             ),
+            # Seed-clustered: the independent replicate is the SEED, not the
+            # distance bin. Distance bins from one seed are spatially
+            # autocorrelated, so testing them as i.i.d. units pseudoreplicates
+            # and inflates significance. Average each metric over bins within a
+            # seed, then test across seeds. (The distance TREND is shown
+            # descriptively in Figure 2a.) Only abs_prevalence_error is unique
+            # to the group file; the rest are already tested at global scope.
             collect_tests(
                 group,
-                source="distance_bins",
-                unit_cols=["dem", "pheno", "seed", "dist_from_train"],
-                metric_cols=group_metrics,
+                source="calibration_by_seed",
+                unit_cols=["dem", "pheno", "seed"],
+                metric_cols=["abs_prevalence_error"],
                 scope_cols=["dem", "pheno"],
             ),
         ],
