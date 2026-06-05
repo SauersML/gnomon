@@ -130,11 +130,14 @@ def collect_tests(
             if not isinstance(scope_key, tuple):
                 scope_key = (scope_key,)
             for baseline in METHOD_LABELS:
-                wide = (
-                    scope_df[scope_df["method"].isin(["gamfit", baseline])]
-                    .pivot_table(index=unit_cols, columns="method", values=metric, aggfunc="mean")
-                    .dropna(subset=["gamfit", baseline])
+                wide = scope_df[scope_df["method"].isin(["gamfit", baseline])].pivot_table(
+                    index=unit_cols, columns="method", values=metric, aggfunc="mean"
                 )
+                # a method that failed on every dataset in this scope (e.g. gamfit
+                # all-NaN) leaves no column to pair on -> no paired contrast possible.
+                if "gamfit" not in wide.columns or baseline not in wide.columns:
+                    continue
+                wide = wide.dropna(subset=["gamfit", baseline])
                 if wide.empty:
                     continue
                 advantage = paired_advantage(wide["gamfit"], wide[baseline], metric)
