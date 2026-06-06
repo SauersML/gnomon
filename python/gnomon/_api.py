@@ -340,6 +340,51 @@ class ScoreResult:
 
 
 @dataclass(frozen=True)
+class SexMetrics:
+    """Per-sample sex-inference metrics, parsed from a ``.sex.tsv`` row.
+
+    These mirror the metric columns the gnomon CLI writes in
+    ``terms/sex.rs`` (``SEX_TSV_HEADER``):
+
+      ``IID  Build  Sex  Y_Density  X_AutoHet_Ratio  Composite_Index
+       Auto_Valid  Auto_Het  X_NonPAR_Valid  X_NonPAR_Het
+       Y_NonPAR_Valid  Y_PAR_Valid``
+
+    The string ``"NA"`` in any numeric column becomes ``None``.
+
+    ``composite_index`` is gnomon's single combined sex-discriminant statistic
+    (a continuous male/female separation score); it is surfaced as
+    :attr:`confidence` for callers that just want one number alongside the
+    call. The raw ratios (``y_density``, ``x_autosome_het_ratio``) and the
+    underlying counts let downstream code reproduce gnomon's thresholding or
+    apply its own QC without re-reading the TSV.
+    """
+
+    iid: str
+    sex: InferredSex
+    build: Optional[str] = None
+    y_density: Optional[float] = None
+    x_autosome_het_ratio: Optional[float] = None
+    composite_index: Optional[float] = None
+    auto_valid: Optional[int] = None
+    auto_het: Optional[int] = None
+    x_non_par_valid: Optional[int] = None
+    x_non_par_het: Optional[int] = None
+    y_non_par_valid: Optional[int] = None
+    y_par_valid: Optional[int] = None
+
+    @property
+    def confidence(self) -> Optional[float]:
+        """Alias for :attr:`composite_index` — gnomon's combined sex score.
+
+        gnomon does not emit a 0–1 probability; the composite index is the
+        closest single confidence-like statistic it computes. Returns
+        ``None`` when the column was ``NA`` (insufficient informative loci).
+        """
+        return self.composite_index
+
+
+@dataclass(frozen=True)
 class TermsResult:
     """Outcome of a ``gnomon terms`` run."""
 
@@ -349,6 +394,25 @@ class TermsResult:
     stderr: str
     returncode: int
     sex_table: Optional[Tuple[Tuple[str, str], ...]] = None
+    sex_metrics: Optional[Tuple[SexMetrics, ...]] = None
+    """Per-sample structured metrics parsed from the ``.sex.tsv`` columns.
+
+    ``None`` only when no TSV was produced (e.g. a single-sample dataset
+    where the call was recovered from stdout). For a single-sample run with
+    a TSV this is a 1-tuple; :attr:`metrics` returns that sole entry.
+    """
+
+    @property
+    def metrics(self) -> Optional[SexMetrics]:
+        """The sole :class:`SexMetrics` for a single-sample run, else ``None``.
+
+        Convenience for the common one-sample case (the pipeline's per-sample
+        VCFs). When the dataset has multiple samples, use
+        :attr:`sex_metrics` and index by IID.
+        """
+        if self.sex_metrics and len(self.sex_metrics) == 1:
+            return self.sex_metrics[0]
+        return None
 
 
 @dataclass(frozen=True)
@@ -657,6 +721,86 @@ _SEX_LINE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Compound suffixes the gnomon CLI strips when deriving an output stem
+# (mirrors ``derive_output_stem_name`` in ``map/io.rs``). Order matters:
+# the compound (two-dot) suffixes are tried before the simple ones.
+_TERMS_COMPOUND_SUFFIXES = (".vcf.bgz", ".vcf.gz", ".bcf.bgz", ".bcf.gz")
+_TERMS_SIMPLE_SUFFIXES = (
+    ".bed", ".bim", ".fam", ".pgen", ".pvar", ".psam", ".vcf", ".bcf",
+)
+
+
+def _terms_output_stem(path: Path) -> str:
+    """Derive the gnomon output stem for ``path``.
+
+    Byte-for-byte port of ``derive_output_stem_name`` in ``map/io.rs`` so the
+    wrapper finds the exact ``<stem>.sex.tsv`` the CLI writes (e.g.
+    ``sample.vcf.gz`` -> ``sample``, not ``sample.vcf``).
+    """
+    name = path.name
+    if not name:
+        return "dataset"
+    lower = name.lower()
+    for suffix in _TERMS_COMPOUND_SUFFIXES + _TERMS_SIMPLE_SUFFIXES:
+        if lower.endswith(suffix) and len(name) > len(suffix):
+            return name[: -len(suffix)]
+    stem = Path(name).stem
+    return stem if stem else "dataset"
+
+
+def _parse_float_or_none(s: str) -> Optional[float]:
+    s = s.strip()
+    if s in ("", "NA", "nan", "NaN", "."):
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _parse_int_or_none(s: str) -> Optional[int]:
+    s = s.strip()
+    if s in ("", "NA", "nan", "NaN", "."):
+        return None
+    try:
+        return int(s)
+    except ValueError:
+        f = _parse_float_or_none(s)
+        return int(f) if f is not None else None
+
+
+# Column order written by ``terms/sex.rs::SEX_TSV_HEADER``.
+_SEX_TSV_COLUMNS = (
+    "IID", "Build", "Sex", "Y_Density", "X_AutoHet_Ratio", "Composite_Index",
+    "Auto_Valid", "Auto_Het", "X_NonPAR_Valid", "X_NonPAR_Het",
+    "Y_NonPAR_Valid", "Y_PAR_Valid",
+)
+
+
+def _row_to_sex_metrics(row: Sequence[str]) -> SexMetrics:
+    """Build a :class:`SexMetrics` from one ``.sex.tsv`` data row.
+
+    Tolerates short rows (older CLI builds with fewer metric columns) by
+    defaulting any missing trailing column to ``None``.
+    """
+    def cell(i: int) -> str:
+        return row[i] if i < len(row) else ""
+
+    return SexMetrics(
+        iid=cell(0),
+        sex=_coerce_sex(cell(2)),
+        build=cell(1).strip() or None,
+        y_density=_parse_float_or_none(cell(3)),
+        x_autosome_het_ratio=_parse_float_or_none(cell(4)),
+        composite_index=_parse_float_or_none(cell(5)),
+        auto_valid=_parse_int_or_none(cell(6)),
+        auto_het=_parse_int_or_none(cell(7)),
+        x_non_par_valid=_parse_int_or_none(cell(8)),
+        x_non_par_het=_parse_int_or_none(cell(9)),
+        y_non_par_valid=_parse_int_or_none(cell(10)),
+        y_par_valid=_parse_int_or_none(cell(11)),
+    )
+
 
 def terms(
     genotype_path: PathLike,
@@ -680,35 +824,50 @@ def terms(
     completed = _run(bin_path, argv, timeout=timeout, env=env, cwd=cwd)
 
     # The CLI writes the sex TSV next to the genotype prefix as
-    # `<stem>_sex.tsv`. Resolve it.
-    stem = gp.stem if gp.suffix in {".bed", ".vcf", ".bcf", ".gz"} else gp.name
+    # `<stem>.sex.tsv` (see `terms/sex.rs::infer_sex_to_tsv` ->
+    # `dataset.output_path("sex.tsv")` and `map/io.rs::append_output_filename`,
+    # which joins `<base>.<filename>`). The historical `<stem>_sex.tsv`
+    # candidate is kept last as a defensive fallback only — the CLI never
+    # writes it. Resolve against the correct stem first.
+    stem = _terms_output_stem(gp)
     candidates = [
-        gp.parent / f"{stem}_sex.tsv",
         gp.parent / f"{stem}.sex.tsv",
-        gp.parent / f"{gp.name}_sex.tsv",
+        # Defensive fallbacks (never produced by the current CLI):
+        gp.parent / f"{gp.name}.sex.tsv",
+        gp.parent / f"{stem}_sex.tsv",
     ]
     out_path: Optional[Path] = next((c for c in candidates if c.exists()), None)
 
     sex_table: Optional[Tuple[Tuple[str, str], ...]] = None
+    sex_metrics: Optional[Tuple[SexMetrics, ...]] = None
     inferred: Optional[InferredSex] = None
     if out_path is not None:
         with open(out_path) as f:
             reader = csv.reader(f, delimiter="\t")
             rows: List[Tuple[str, str]] = []
+            metrics: List[SexMetrics] = []
             for row in reader:
+                if not row or row[0].lstrip("#").strip().upper() == "IID":
+                    # Header line. The first column header is "IID" (the CLI
+                    # writes it un-commented; tolerate a leading '#' too).
+                    continue
                 if not row or row[0].startswith("#"):
                     continue
                 if len(row) < 2:
                     continue
-                # Skip a header line if present (IID/FID/SEX in the second cell).
-                if row[1].strip().lower() in {"sex", "inferred_sex", "inferredsex"}:
-                    continue
-                rows.append((row[0], row[1]))
+                m = _row_to_sex_metrics(row)
+                metrics.append(m)
+                # The Sex call is column index 2 in the real CLI output
+                # (`IID  Build  Sex  ...`); fall back to column 1 only for a
+                # hypothetical 2-column file.
+                sex_str = m.sex.value if len(row) > 2 else row[1]
+                rows.append((row[0], sex_str))
             sex_table = tuple(rows)
-            if len(rows) == 1:
-                inferred = _coerce_sex(rows[0][1])
+            sex_metrics = tuple(metrics)
+            if len(metrics) == 1:
+                inferred = metrics[0].sex
     else:
-        # Single-sample dataset: try parsing stdout.
+        # Single-sample dataset with no TSV: try parsing stdout.
         for line in (completed.stdout or "").splitlines():
             m = _SEX_LINE_RE.match(line)
             if m:
@@ -719,6 +878,7 @@ def terms(
         inferred_sex=inferred,
         sex_output_path=out_path,
         sex_table=sex_table,
+        sex_metrics=sex_metrics,
         stdout=completed.stdout,
         stderr=completed.stderr,
         returncode=completed.returncode,

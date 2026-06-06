@@ -772,7 +772,7 @@ fn projection_present_mask(
     Ok(present_mask)
 }
 
-fn load_builtin_model(name: &str) -> Result<HwePcaModel, MapDriverError> {
+pub fn load_builtin_model(name: &str) -> Result<HwePcaModel, MapDriverError> {
     // Look up the model
     let model_info = prefit::lookup_model(name).ok_or_else(|| {
         let available = prefit::list_model_names().join(", ");
@@ -786,6 +786,55 @@ fn load_builtin_model(name: &str) -> Result<HwePcaModel, MapDriverError> {
 
     // Load the model
     load_model_from_path(&model_path).map_err(MapDriverError::from)
+}
+
+/// Resolve a built-in projection model by name and return the variant keys it
+/// was fit on, exactly as gnomon's own projection code resolves them.
+///
+/// This is the canonical source of a projection model's marker set. Callers
+/// (e.g. the pgsEngine site-subset builder) previously read a hand-rolled JSON
+/// sidecar (`~/.gnomon/models/<model>.json`) that may not exist; routing through
+/// gnomon's real model loader removes that drift and the resulting FileNotFound.
+///
+/// Returns an empty vector if the model carries no explicit variant keys
+/// (positional-only models). Use [`model_variant_keys_json`] for a stable,
+/// machine-readable serialization across the CLI boundary.
+pub fn model_variant_keys(name: &str) -> Result<Vec<VariantKey>, MapDriverError> {
+    let model = load_builtin_model(name)?;
+    Ok(model
+        .variant_keys()
+        .map(|keys| keys.to_vec())
+        .unwrap_or_default())
+}
+
+/// Serialize a built-in model's variant keys (plus a little metadata) to a JSON
+/// document suitable for emitting on stdout from the CLI.
+///
+/// Shape:
+/// ```json
+/// {
+///   "model": "<name>",
+///   "genome_build": "GRCh38" | null,
+///   "n_variants": <usize>,
+///   "variant_keys": [ { "chromosome": "1", "position": 12345,
+///                       "alleles": ["A", "G"] }, ... ]
+/// }
+/// ```
+pub fn model_variant_keys_json(name: &str) -> Result<String, MapDriverError> {
+    let model = load_builtin_model(name)?;
+    let keys: Vec<VariantKey> = model
+        .variant_keys()
+        .map(|keys| keys.to_vec())
+        .unwrap_or_default();
+    let doc = serde_json::json!({
+        "model": name,
+        "genome_build": model.genome_build(),
+        "n_variants": keys.len(),
+        "variant_keys": keys,
+    });
+    serde_json::to_string(&doc).map_err(|err| {
+        MapDriverError::InvalidState(format!("failed to serialize variant keys: {err}"))
+    })
 }
 
 fn map_variant_list_error(path: &Path, err: VariantListError) -> MapDriverError {

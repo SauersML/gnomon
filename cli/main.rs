@@ -156,6 +156,14 @@ struct ProjectArgs {
     output_manifest: Option<PathBuf>,
 }
 
+#[cfg(feature = "map")]
+#[derive(Args)]
+struct ModelKeysArgs {
+    /// Name of the built-in projection model to introspect (downloads if needed)
+    #[arg(value_name = "MODEL_NAME")]
+    model: String,
+}
+
 #[cfg(feature = "terms")]
 #[derive(Args)]
 struct TermsArgs {
@@ -349,6 +357,8 @@ enum FullCommands {
     Fit(FitArgs),
     /// Project samples using an existing HWE PCA model
     Project(ProjectArgs),
+    /// Print a built-in projection model's variant keys as JSON (to stdout)
+    ModelKeys(ModelKeysArgs),
     /// Infer sample metadata terms
     Terms(TermsArgs),
     /// Train GAM calibration model
@@ -385,6 +395,8 @@ struct MapCli {
 enum MapCommands {
     Fit(FitArgs),
     Project(ProjectArgs),
+    /// Print a built-in projection model's variant keys as JSON (to stdout)
+    ModelKeys(ModelKeysArgs),
 }
 
 #[cfg(feature = "terms")]
@@ -543,6 +555,7 @@ fn run_full_entrypoint() -> Result<(), Box<dyn std::error::Error>> {
         Some(FullCommands::Score(args)) => run_score(args),
         Some(FullCommands::Fit(args)) => run_map_fit(args),
         Some(FullCommands::Project(args)) => run_map_project(args),
+        Some(FullCommands::ModelKeys(args)) => run_model_keys(args),
         Some(FullCommands::Terms(args)) => run_terms(args),
         Some(FullCommands::Train(args)) => train(args),
         Some(FullCommands::Infer(args)) => infer(args),
@@ -571,6 +584,7 @@ fn run_map_entrypoint() -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Some(MapCommands::Fit(args)) => run_map_fit(args),
         Some(MapCommands::Project(args)) => run_map_project(args),
+        Some(MapCommands::ModelKeys(args)) => run_model_keys(args),
         None => {
             MapCli::command().print_help()?;
             println!();
@@ -673,6 +687,16 @@ fn run_map_project(args: ProjectArgs) -> Result<(), Box<dyn std::error::Error>> 
         output_manifest: args.output_manifest,
     })
     .map_err(|err| Box::new(err) as Box<dyn std::error::Error>)
+}
+
+#[cfg(feature = "map")]
+fn run_model_keys(args: ModelKeysArgs) -> Result<(), Box<dyn std::error::Error>> {
+    // Emit only the JSON document on stdout (model loading / download chatter
+    // goes to stderr inside the loader), so callers can parse stdout directly.
+    let json = map_cli::model_variant_keys_json(&args.model)
+        .map_err(|err| Box::new(err) as Box<dyn std::error::Error>)?;
+    println!("{json}");
+    Ok(())
 }
 
 #[cfg(feature = "terms")]

@@ -128,22 +128,52 @@ _FAILING = textwrap.dedent(
 )
 
 
-_TERMS_FAKE = textwrap.dedent(
+# Mirror of the *real* gnomon CLI sex-output contract:
+#   * filename is `<stem>.sex.tsv`  (NOT `<stem>_sex.tsv`)
+#     where `<stem>` strips compound suffixes like `.vcf.gz`
+#     (see `map/io.rs::derive_output_stem_name` + `append_output_filename`).
+#   * the TSV header has 12 columns: IID Build Sex <metrics...>
+#     (see `terms/sex.rs::SEX_TSV_HEADER`).
+# Keeping this fake faithful is the wrapper<->CLI contract test: if the Rust
+# output naming/columns change, these tests must change in lockstep.
+_SEX_TSV_HEADER = (
+    "IID\\tBuild\\tSex\\tY_Density\\tX_AutoHet_Ratio\\tComposite_Index\\t"
+    "Auto_Valid\\tAuto_Het\\tX_NonPAR_Valid\\tX_NonPAR_Het\\t"
+    "Y_NonPAR_Valid\\tY_PAR_Valid"
+)
+
+# Stem-derivation helper matching map/io.rs::derive_output_stem_name, defined as
+# a function inside the fake. Kept as real source lines (not an injected string)
+# so indentation stays valid.
+_STEM_FN = textwrap.dedent(
     """\
-    #!/usr/bin/env python3
-    import os, pathlib, sys
-    argv = sys.argv[1:]
-    assert argv[0] == 'terms'
-    gp = pathlib.Path(argv[1])
-    parent = gp.parent or pathlib.Path('.')
-    stem = gp.stem if gp.suffix in {'.bed', '.vcf', '.bcf', '.gz'} else gp.name
-    out = parent / f'{stem}_sex.tsv'
-    with open(out, 'w') as f:
-        f.write('IID\\tSEX\\n')
-        f.write('S1\\tfemale\\n')
-        f.write('S2\\tmale\\n')
-    print(f'Wrote sex table to {out}')
+    def stem_of(p):
+        name = p.name; low = name.lower()
+        for s in ['.vcf.bgz','.vcf.gz','.bcf.bgz','.bcf.gz','.bed','.bim','.fam','.pgen','.pvar','.psam','.vcf','.bcf']:
+            if low.endswith(s) and len(name) > len(s):
+                return name[:-len(s)]
+        return pathlib.Path(name).stem or 'dataset'
     """
+)
+
+_TERMS_FAKE = (
+    "#!/usr/bin/env python3\n"
+    "import os, pathlib, sys\n"
+    + _STEM_FN
+    + textwrap.dedent(
+        """\
+        argv = sys.argv[1:]
+        assert argv[0] == 'terms'
+        gp = pathlib.Path(argv[1])
+        parent = gp.parent or pathlib.Path('.')
+        out = parent / (stem_of(gp) + '.sex.tsv')
+        with open(out, 'w') as f:
+            f.write('{header}\\n')
+            f.write('S1\\tGRCh38\\tfemale\\t0.012\\t0.350\\t-1.20\\t1900\\t620\\t40\\t12\\t2\\t1\\n')
+            f.write('S2\\tGRCh38\\tmale\\t0.640\\t0.080\\t1.45\\t1950\\t90\\t38\\t1\\t30\\t1\\n')
+        print('Sex inference results written to ' + str(out), file=sys.stderr)
+        """
+    ).format(header=_SEX_TSV_HEADER)
 )
 
 
@@ -426,10 +456,77 @@ def test_terms_parses_sex_tsv(tmp_path):
     geno = _make_genotype(tmp_path)
     r = terms(geno, binary=fake)
     assert isinstance(r, TermsResult)
+    # Sex call comes from the *Sex* column (index 2), not Build (index 1).
     assert r.sex_table == (("S1", "female"), ("S2", "male"))
     # Multiple rows → no single 'inferred_sex'.
     assert r.inferred_sex is None
     assert r.sex_output_path is not None
+
+
+def test_terms_finds_dotted_sex_tsv_filename(tmp_path):
+    """The CLI writes `<stem>.sex.tsv`; the wrapper must resolve that name."""
+    fake = _fake_binary(tmp_path, _TERMS_FAKE)
+    geno = _make_genotype(tmp_path)
+    r = terms(geno, binary=fake)
+    assert r.sex_output_path is not None
+    assert r.sex_output_path.name == "geno.sex.tsv"
+    assert r.sex_output_path.exists()
+
+
+def test_terms_resolves_sex_tsv_for_compound_vcf_gz(tmp_path):
+    """`sample.vcf.gz` -> `sample.sex.tsv` (compound suffix stripped)."""
+    fake = _fake_binary(tmp_path, _TERMS_FAKE)
+    vcf = tmp_path / "sample.vcf.gz"
+    vcf.write_bytes(b"\x1f\x8b\x08\x00")  # gzip magic; content unused by fake
+    r = terms(vcf, binary=fake)
+    assert r.sex_output_path is not None
+    assert r.sex_output_path.name == "sample.sex.tsv"
+
+
+def test_terms_surfaces_structured_metrics(tmp_path):
+    fake = _fake_binary(tmp_path, _TERMS_FAKE)
+    geno = _make_genotype(tmp_path)
+    r = terms(geno, binary=fake)
+    assert r.sex_metrics is not None
+    assert len(r.sex_metrics) == 2
+    s1, s2 = r.sex_metrics
+    assert s1.iid == "S1"
+    assert s1.sex is InferredSex.FEMALE
+    assert s1.build == "GRCh38"
+    assert s1.y_density == 0.012
+    assert s1.x_autosome_het_ratio == 0.350
+    assert s1.composite_index == -1.20
+    assert s1.confidence == -1.20  # alias for composite_index
+    assert s1.auto_valid == 1900
+    assert s1.auto_het == 620
+    assert s1.y_non_par_valid == 2
+    assert s2.sex is InferredSex.MALE
+    assert s2.composite_index == 1.45
+
+
+def test_terms_metrics_na_becomes_none(tmp_path):
+    body = textwrap.dedent(
+        """\
+        #!/usr/bin/env python3
+        import pathlib, sys
+        gp = pathlib.Path(sys.argv[2])
+        parent = gp.parent or pathlib.Path('.')
+        out = parent / (gp.name + '.sex.tsv')
+        out.write_text(
+            '{header}\\n'
+            'S1\\tGRCh38\\tindeterminate\\tNA\\tNA\\tNA\\t0\\t0\\t0\\t0\\t0\\t0\\n'
+        )
+        """
+    ).format(header=_SEX_TSV_HEADER)
+    fake = _fake_binary(tmp_path, body)
+    geno = tmp_path / "single"
+    (tmp_path / "single.bed").write_bytes(b"\x6c\x1b\x01\x00")
+    r = terms(geno, binary=fake)
+    assert r.metrics is not None
+    assert r.metrics.y_density is None
+    assert r.metrics.composite_index is None
+    assert r.metrics.confidence is None
+    assert r.inferred_sex is InferredSex.UNKNOWN  # 'indeterminate' -> UNKNOWN
 
 
 def test_terms_single_sample_yields_single_call(tmp_path):
@@ -439,15 +536,20 @@ def test_terms_single_sample_yields_single_call(tmp_path):
         import pathlib, sys
         gp = pathlib.Path(sys.argv[2])
         parent = gp.parent or pathlib.Path('.')
-        stem = gp.stem if gp.suffix in {'.bed', '.vcf', '.bcf', '.gz'} else gp.name
-        out = parent / f'{stem}_sex.tsv'
-        out.write_text('IID\\tSEX\\nS1\\tfemale\\n')
+        out = parent / (gp.name + '.sex.tsv')
+        out.write_text(
+            '{header}\\n'
+            'S1\\tGRCh38\\tfemale\\t0.01\\t0.4\\t-1.0\\t100\\t30\\t5\\t2\\t1\\t0\\n'
+        )
         """
-    )
+    ).format(header=_SEX_TSV_HEADER)
     fake = _fake_binary(tmp_path, body)
     geno = _make_genotype(tmp_path)
     r = terms(geno, binary=fake)
     assert r.inferred_sex is InferredSex.FEMALE
+    # `metrics` convenience: the sole SexMetrics for a 1-sample run.
+    assert r.metrics is not None
+    assert r.metrics.sex is InferredSex.FEMALE
 
 
 def test_terms_requires_sex_for_now(tmp_path):
@@ -491,6 +593,72 @@ def test_map_project_passes_model(tmp_path):
     argv = json.loads((tmp_path / "argv.json").read_text())
     assert argv[0] == "project"
     assert argv[argv.index("--model") + 1] == "hwe_1kg_hgdp_gsa_v3"
+
+
+# ---------------------------------------------------------------------------
+# map.model_variant_keys()
+# ---------------------------------------------------------------------------
+
+
+# Mirrors the real `gnomon model-keys <name>` CLI contract: JSON on stdout,
+# loader chatter on stderr. Shape matches `map::main::model_variant_keys_json`.
+_MODEL_KEYS_FAKE = textwrap.dedent(
+    """\
+    #!/usr/bin/env python3
+    import json, pathlib, sys
+    argv = sys.argv[1:]
+    log = pathlib.Path(sys.argv[0]).parent / 'argv.json'
+    log.write_text(json.dumps(argv))
+    assert argv[0] == 'model-keys'
+    name = argv[1]
+    # Loader noise must go to stderr so stdout is pure JSON.
+    print('Using cached model: ' + name, file=sys.stderr)
+    doc = {
+        'model': name,
+        'genome_build': 'GRCh38',
+        'n_variants': 2,
+        'variant_keys': [
+            {'chromosome': '1', 'position': 12345, 'alleles': ['A', 'G']},
+            {'chromosome': 'X', 'position': 67890},
+        ],
+    }
+    print(json.dumps(doc))
+    """
+)
+
+
+def test_model_variant_keys_argv_and_parse(tmp_path):
+    fake = _fake_binary(tmp_path, _MODEL_KEYS_FAKE)
+    result = gnomon_map.model_variant_keys("hwe_1kg_hgdp_gsa_v3", binary=fake)
+    argv = json.loads((tmp_path / "argv.json").read_text())
+    assert argv == ["model-keys", "hwe_1kg_hgdp_gsa_v3"]
+    assert result.model == "hwe_1kg_hgdp_gsa_v3"
+    assert result.genome_build == "GRCh38"
+    assert len(result) == 2
+    keys = list(result)
+    assert keys[0] == gnomon_map.VariantKey(chromosome="1", position=12345, alleles=("A", "G"))
+    assert keys[1].chromosome == "X"
+    assert keys[1].position == 67890
+    assert keys[1].alleles is None
+
+
+def test_model_variant_keys_unparseable_raises(tmp_path):
+    body = textwrap.dedent(
+        """\
+        #!/usr/bin/env python3
+        import sys
+        print('not json at all')
+        """
+    )
+    fake = _fake_binary(tmp_path, body)
+    with pytest.raises(GnomonFailed):
+        gnomon_map.model_variant_keys("whatever", binary=fake)
+
+
+def test_model_variant_keys_propagates_cli_failure(tmp_path):
+    fake = _fake_binary(tmp_path, _FAILING)
+    with pytest.raises(GnomonFailed):
+        gnomon_map.model_variant_keys("unknown_model", binary=fake)
 
 
 # ---------------------------------------------------------------------------
