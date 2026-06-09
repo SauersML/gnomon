@@ -1,76 +1,68 @@
-"""Generate real-P+T portability datasets for the ancestry-calibration study.
+"""Generate the real-P+T ancestry-portability datasets for the study.
+
+Two custom non-affine msprime demographies (serial1d serial-founder chain, grid2d
+2-D stepping-stone), a shared-effect genetic liability, and a real PGS built by an
+actual GWAS + LD clumping (plink1.9 --clump r2<0.1, 250kb) + p-value thresholding
+(P+T) trained in ONE randomly chosen training deme, then scored genome-wide.
 
 Hard rules:
 - only serial1d and grid2d custom msprime demographies
-- real P+T only: GWAS + LD clump + p-threshold + score
-- binary outcome only
-- split is explicit and disjoint:
-  * pgs_train: large cohort from one training deme; trains P+T only
-  * model_train: all demes; fits risk models only
-  * test: all demes; reported results only
-- GWAS + P+T weights AND PGS standardization use split == "pgs_train" ONLY
-- binary ground truth is p_true
-- no within-deme/within-stratum AUC computed here (only GLOBAL pooled)
+- the training deme is chosen at RANDOM per seed (a real biobank's majority ancestry
+  is an arbitrary derived population, not the high-diversity founder)
+- the training ancestry has held-out test rows; downstream metrics use the *-deme-test
+  rows only (incl. the held-out training-ancestry test)
+- GWAS + P+T weights AND PGS standardization use split == "train-deme-fit" ONLY, with
+  the GWAS-vs-threshold-selection partition carved privately inside real_pt() so the
+  train-deme-test rows never leak
+- binary ground truth is p_true; survival ground truth is the admin-horizon risk
+- causal effects are SHARED across demes, so any portability decay is EMERGENT from
+  LD/allele-frequency drift -- never manufactured -- and is reported honestly
 
-Real P+T needs GWAS power:
-- large single-deme PGS training cohort
-- ~100 Mb of sequence as CHUNKS x CHUNK_BP independent segments (real LD for clumping)
-- PGS signal decay is EMERGENT from LD/AF drift (no rho floor); we verify it stays
-  non-degenerate and report it honestly.
+Three phenotypes per dataset exercise distinct confounds:
+- phenoA: deme-varying baseline risk (1-D linear gradient / 2-D per-deme random offset)
+- phenoB: constant baseline (drift in the genetic liability still shifts per-deme prevalence)
+- phenoC: drift-proof -- the liability is centered WITHIN each deme, so every deme has an
+  identical mean liability and prevalence; only the calibration slope can differ.
 
-Usage: gen_real_pt.py <dem: serial1d|grid2d> [seed]
-Writes to sims/results_hpc/ancestry_calibration/data/:
-<dem>_{phenoA,phenoB}_realpt_s<seed>.parquet (+ .csv, .sanity.tsv)
-and sidecar JSON files (GLOBAL/pooled diagnostics only).
+Usage: gen_real_pt.py <dem: serial1d|grid2d> <outdir> [seed]
+       [--chunks N] [--chunk-bp BP] [--threads T] [--mem-mb MB]
+Writes <outdir>/<dem>_{phenoA,phenoB,phenoC}_realpt.parquet (+ .csv, .sanity.tsv)
+  phenoA = deme-varying baseline (1-D linear / 2-D random); phenoB = constant baseline;
+  phenoC = drift-proof (per-deme-centered liability => identical prevalence across demes)
+and a sidecar <outdir>/<dem>_realpt.json (GLOBAL/pooled diagnostics only).
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
-# Single-threaded BLAS, set before numpy/BLAS loads: the genotype streaming forks a
-# ProcessPool, which corrupts a multithreaded BLAS threadpool in the parent and
-# deadlocks the subsequent PCA SVD. Fork-safety fix (plink threads unaffected; PCA
-# single-threaded is plenty fast), not a configuration knob.
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
 import shutil
 import subprocess
-import time
+import tempfile
 from pathlib import Path
 
 import msprime
 import numpy as np
 import pandas as pd
 from scipy.optimize import brentq
+from scipy.special import expit
 from scipy.stats import norm
 from sklearn.decomposition import PCA
 from sklearn.metrics import roc_auc_score
 from sklearn.preprocessing import StandardScaler
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-DATA_DIR = REPO_ROOT / "sims" / "results_hpc" / "ancestry_calibration" / "data"
 PLINK1 = "/common/software/install/migrated/plink/1.90b6.10/bin/plink"
 PLINK2 = "/users/0/sauer354/bin/plink2"
 
 MU = 1.25e-8
 RECOMB = 1.0e-8
-N_PGS_TRAIN = 100000       # large single-deme cohort for GWAS/P+T only (20x)
-N_MODEL_TRAIN = 500        # calibration/model-training rows per deme (2x)
-N_TEST = 500               # reported-test rows per deme (2x)
+NPER = 250                 # non-training demes (match synth)
+NPER_TRAIN = 5000          # large training deme for GWAS power (team-lead spec)
 PREV = 0.15
-SIGMA_E = 1.0              # environmental SD on the liability scale
+SIGMA_E = 1.0              # environmental SD on the liability scale (matches synth "normal")
 
-# Many small independent-LD chunks, processed in PARALLEL across the task's cores
-# (stream_geno auto-scales workers to the allocation). A chunk's genotype_matrix is
-# int32, so ~200 kb (~9e3 sites, ~10 GiB) lets several workers run concurrently.
-# 500 x 200 kb = the same ~100 Mb of sequence.
-DEFAULT_CHUNKS = 800
-DEFAULT_CHUNK_BP = 125_000
-DEFAULT_THREADS = 16      # plink threads; matches the per-task core allocation (-c16)
-DEFAULT_MEM_MB = 64_000   # plink --memory cap/job
-N_CAUSAL = 4500
+DEFAULT_CHUNKS = 20
+DEFAULT_CHUNK_BP = 5_000_000
 
 P_THRESHOLDS = [5e-8, 1e-6, 1e-4, 1e-3, 1e-2, 5e-2, 1e-1, 5e-1, 1.0]
 CLUMP_R2 = 0.1
@@ -78,12 +70,8 @@ CLUMP_KB = 250
 MIN_CLUMP_SNPS = 20
 
 
-# ---------------- demographies ----------------
-# These are stress-test human-scale demographies. The far-deme divergence is not
-# assigned directly; it is measured from the simulated common variants and written
-# to the sidecar as fst_train_vs_far.
-def dem_serial1d(D=10, N=3000, Nanc=10000, m=5e-4, split_step=500, T0=250, migration_scale=1.0):
-    m = m * migration_scale     # <1 = more isolation (harder portability), >1 = less
+# ---------------- demographies (serial-founder chain / stepping-stone grid) ----------------
+def dem_serial1d(train_deme=0, D=10, N=3000, Nanc=10000, m=1e-3, split_step=400, T0=200):
     d = msprime.Demography()
     for k in range(D):
         d.add_population(name=f"d{k}", initial_size=N)
@@ -99,15 +87,11 @@ def dem_serial1d(D=10, N=3000, Nanc=10000, m=5e-4, split_step=500, T0=250, migra
     tanc = T0 + (D - 1) * split_step + 500
     d.add_population_split(time=tanc, derived=["d0"], ancestral="ANC")
     d.sort_events()
-    train_deme = 0
     npc = 2
-    samples = {
-        f"d{k}": (N_PGS_TRAIN + N_MODEL_TRAIN + N_TEST if k == train_deme else N_MODEL_TRAIN + N_TEST)
-        for k in range(D)
-    }
+    samples = {f"d{k}": (NPER_TRAIN if k == train_deme else NPER) for k in range(D)}
     coord_list, dist_list = [], []
     for k in range(D):
-        n = N_PGS_TRAIN + N_MODEL_TRAIN + N_TEST if k == train_deme else N_MODEL_TRAIN + N_TEST
+        n = NPER_TRAIN if k == train_deme else NPER
         coord_list += [k] * n
         dist_list += [abs(k - train_deme)] * n
     coord = np.array(coord_list, dtype=float)
@@ -115,8 +99,10 @@ def dem_serial1d(D=10, N=3000, Nanc=10000, m=5e-4, split_step=500, T0=250, migra
     return d, samples, coord, dist, train_deme, npc
 
 
-def dem_grid2d(side=6, N=3000, Nanc=10000, m=2e-4, split_time=15000, migration_scale=1.0):
-    m = m * migration_scale     # <1 = more isolation (harder portability), >1 = less
+def dem_grid2d(train_deme=0, side=6, N=3000, Nanc=10000, m=3e-4):
+    # m lowered 1e-3 -> 3e-4 so far-corner Fst rises from ~0.09 toward the
+    # target far-Fst 0.2-0.25 (human "sorta distant" range). serial1d m=1e-3
+    # already gives far-Fst ~0.21. Achieved Fst is reported in the sidecar.
     d = msprime.Demography()
     nm = lambda r, c: f"d_{r}_{c}"
     for r in range(side):
@@ -131,25 +117,20 @@ def dem_grid2d(side=6, N=3000, Nanc=10000, m=2e-4, split_time=15000, migration_s
                     d.set_migration_rate(nm(r, c), nm(r2, c2), m)
                     d.set_migration_rate(nm(r2, c2), nm(r, c), m)
     d.add_population_split(
-        time=split_time,
+        time=4 * N,
         derived=[nm(r, c) for r in range(side) for c in range(side)],
         ancestral="ANC",
     )
     d.sort_events()
-    train_deme = 0
     npc = 3
     nd = side * side
     rc = np.array([(r, c) for r in range(side) for c in range(side)])
-    dist_per_deme = rc[:, 0] + rc[:, 1]
-    samples = {
-        nm(rc[i][0], rc[i][1]): (
-            N_PGS_TRAIN + N_MODEL_TRAIN + N_TEST if i == train_deme else N_MODEL_TRAIN + N_TEST
-        )
-        for i in range(nd)
-    }
+    tr, tc = rc[train_deme]
+    dist_per_deme = np.abs(rc[:, 0] - tr) + np.abs(rc[:, 1] - tc)   # Manhattan from train deme
+    samples = {nm(rc[i][0], rc[i][1]): (NPER_TRAIN if i == train_deme else NPER) for i in range(nd)}
     coord_list, dist_list = [], []
     for i in range(nd):
-        n = N_PGS_TRAIN + N_MODEL_TRAIN + N_TEST if i == train_deme else N_MODEL_TRAIN + N_TEST
+        n = NPER_TRAIN if i == train_deme else NPER
         coord_list += [i] * n
         dist_list += [int(dist_per_deme[i])] * n
     coord = np.array(coord_list, dtype=float)
@@ -157,58 +138,7 @@ def dem_grid2d(side=6, N=3000, Nanc=10000, m=2e-4, split_time=15000, migration_s
     return d, samples, coord, dist, train_deme, npc
 
 
-def dem_admix(migration_scale=1.0):
-    """stdpopsim HomSap AmericanAdmixture model: AFR/EUR/ASIA/ADMIX present-day
-    populations. GWAS/training population is EUR; all four are sampled. ADMIX is the
-    admixed (interpolation) target. migration_scale accepted for interface parity (the
-    published model is fixed; ignored)."""
-    import stdpopsim
-    m = stdpopsim.get_species("HomSap").get_demographic_model("AmericanAdmixture_4B18")
-    d = m.model
-    train_pop = "EUR"
-    npc = 3
-    # rough divergence-from-EUR ordering, only used for distance-bin grouping/plots
-    distmap = {"EUR": 0.0, "ADMIX": 1.0, "ASIA": 2.0, "AFR": 3.0}
-    samples, coord_list, dist_list = {}, [], []
-    for idx, p in enumerate(d.populations):          # demography population order = sample order
-        if p.name not in distmap:
-            continue
-        n = N_PGS_TRAIN + N_MODEL_TRAIN + N_TEST if p.name == train_pop else N_MODEL_TRAIN + N_TEST
-        samples[p.name] = n
-        coord_list += [idx] * n
-        dist_list += [distmap[p.name]] * n
-    coord = np.array(coord_list, dtype=float)
-    dist = np.array(dist_list, dtype=float)
-    train_deme = next(i for i, p in enumerate(d.populations) if p.name == train_pop)
-    return d, samples, coord, dist, train_deme, npc
-
-
-DEMS = {"serial1d": dem_serial1d, "grid2d": dem_grid2d, "admix": dem_admix}
-
-DEMOGRAPHY_NOTES = {
-    "serial1d": {
-        "model": "1-D serial-founder / nearest-neighbor stepping-stone",
-        "deme_size": 3000,
-        "ancestral_size": 10000,
-        "nearest_neighbor_migration": 5e-4,
-        "founder_interval_generations": 500,
-        "first_founder_time_generations": 250,
-    },
-    "grid2d": {
-        "model": "2-D nearest-neighbor stepping-stone grid",
-        "side_length": 6,
-        "deme_size": 3000,
-        "ancestral_size": 10000,
-        "nearest_neighbor_migration": 2e-4,
-        "common_ancestor_time_generations": 15000,
-    },
-    "admix": {
-        "model": "stdpopsim HomSap AmericanAdmixture_4B18 (AFR/EUR/ASIA/ADMIX)",
-        "training_population": "EUR",
-        "admixed_population": "ADMIX",
-        "source": "Browning et al. 2018 via stdpopsim 0.3.0",
-    },
-}
+DEMS = {"serial1d": dem_serial1d, "grid2d": dem_grid2d}
 
 
 def standardize(x):
@@ -226,31 +156,41 @@ def fst_pair(dos_a, dos_b):
     return float(num[keep].sum() / den[keep].sum())
 
 
-def make_split(coord, train_deme, rng):
-    """Canonical disjoint split.
+def harrell_c_index(time, event, score):
+    t = np.asarray(time, dtype=float)
+    e = np.asarray(event, dtype=bool)
+    s = np.asarray(score, dtype=float)
+    conc = 0.0
+    comp = 0.0
+    for i in range(len(t)):
+        if not e[i]:
+            continue
+        m = t[i] < t
+        if not np.any(m):
+            continue
+        diff = s[i] - s[m]
+        conc += float(np.sum(diff > 0)) + 0.5 * float(np.sum(diff == 0))
+        comp += float(np.sum(m))
+    return float(conc / comp) if comp else float("nan")
 
-    pgs_train: one large training-deme cohort for GWAS/P+T only.
-    model_train: all demes, used to fit risk models/calibration models.
-    test: all demes, used only for reported metrics.
-    """
+
+def make_split(coord, train_deme, rng):
+    """CANONICAL 4-level split (matches synth): every deme is split 50/50 into
+    fit/test -> {train-deme-fit, train-deme-test, other-deme-fit, other-deme-test}.
+    The real PGS (GWAS + P+T weights + PGS_z standardization) uses train-deme-fit ONLY.
+    All downstream metrics use the *-deme-test rows (incl. a held-out training-ancestry
+    test = train-deme-test). The internal GWAS-vs-threshold-selection partition is carved
+    privately from train-deme-fit inside real_pt(), so train-deme-test never leaks."""
     split = np.empty(coord.shape[0], dtype=object)
     split[:] = "unset"
     for dd in np.unique(coord):
         idx = np.where(coord == dd)[0]
         rng.shuffle(idx)
-        if dd == train_deme:
-            if len(idx) < N_PGS_TRAIN + N_MODEL_TRAIN + N_TEST:
-                raise RuntimeError(f"training deme has {len(idx)} rows, expected at least "
-                                   f"{N_PGS_TRAIN + N_MODEL_TRAIN + N_TEST}")
-            split[idx[:N_PGS_TRAIN]] = "pgs_train"
-            split[idx[N_PGS_TRAIN:N_PGS_TRAIN + N_MODEL_TRAIN]] = "model_train"
-            split[idx[N_PGS_TRAIN + N_MODEL_TRAIN:N_PGS_TRAIN + N_MODEL_TRAIN + N_TEST]] = "test"
-        else:
-            if len(idx) < N_MODEL_TRAIN + N_TEST:
-                raise RuntimeError(f"non-training deme {dd} has {len(idx)} rows, expected at least "
-                                   f"{N_MODEL_TRAIN + N_TEST}")
-            split[idx[:N_MODEL_TRAIN]] = "model_train"
-            split[idx[N_MODEL_TRAIN:N_MODEL_TRAIN + N_TEST]] = "test"
+        nfit = int(round(0.5 * len(idx)))
+        fit_idx, test_idx = idx[:nfit], idx[nfit:]
+        tag = "train" if dd == train_deme else "other"
+        split[fit_idx] = f"{tag}-deme-fit"
+        split[test_idx] = f"{tag}-deme-test"
     if np.any(split == "unset"):
         raise RuntimeError("unset splits remain")
     return split
@@ -272,9 +212,10 @@ def run(cmd, desc):
 def real_pt(geno_prefix, n_ind, coord, train_deme, y_binary, pcs, npc, split,
             workdir, threads, mem_mb):
     """Real GWAS + LD clump + P+T on the pre-built <geno_prefix> PLINK fileset.
-    GWAS in pgs_train rows only, on y_binary with PC covariates; LD clump with
-    plink1.9; choose best p-threshold on an internal pgs_train validation slice;
-    score genome-wide. model_train/test rows are untouched by P+T fitting.
+    GWAS in train-deme-fit (inner) rows only, on y_binary with PC covariates; LD clump
+    with plink1.9; choose best p-threshold on the held-out TRAIN-DEME cal rows (NOT the
+    GWAS rows -- in-sample selection overfits to the most-SNPs threshold); score
+    genome-wide. The 'test' rows of the training deme stay fully held out.
     Returns PGS_raw (n_ind,) and meta dict."""
     os.makedirs(workdir, exist_ok=True)
     prefix = geno_prefix
@@ -282,13 +223,14 @@ def real_pt(geno_prefix, n_ind, coord, train_deme, y_binary, pcs, npc, split,
     if mem_mb:
         common += ["--memory", str(mem_mb)]
 
-    # The real PGS uses pgs_train ONLY. P+T needs a held-out slice for p-threshold
+    # The real PGS uses train-deme-fit ONLY. P+T needs a held-out slice for p-threshold
     # selection (in-sample selection overfits to the most-SNPs threshold), so we carve an
-    # internal 80/20 partition PRIVATELY from pgs_train: GWAS on the inner 80%,
-    # threshold selection on the inner 20%. model_train/test are fully untouched here.
-    tf_idx = np.where(split == "pgs_train")[0]
+    # internal 80/20 partition PRIVATELY from train-deme-fit: GWAS on the inner 80%,
+    # threshold selection on the inner 20%. train-deme-test (and all *-deme-test) stay
+    # fully held out for downstream modeling -- nothing here ever touches them.
+    tf_idx = np.where(split == "train-deme-fit")[0]
     if tf_idx.size < 100:
-        raise RuntimeError(f"Too few pgs_train rows ({tf_idx.size})")
+        raise RuntimeError(f"Too few train-deme-fit rows ({tf_idx.size})")
     rng_int = np.random.default_rng(90210 + int(tf_idx.size))
     perm = rng_int.permutation(tf_idx)
     n_inner_fit = int(round(0.80 * perm.size))
@@ -296,7 +238,7 @@ def real_pt(geno_prefix, n_ind, coord, train_deme, y_binary, pcs, npc, split,
     sel_idx = np.sort(perm[n_inner_fit:])        # inner threshold-selection rows
     if sel_idx.size < 20:
         raise RuntimeError(f"Too few inner threshold-selection rows ({sel_idx.size})")
-    log(f"[P+T] pgs_train={tf_idx.size}: inner GWAS={fit_idx.size}, "
+    log(f"[P+T] train-deme-fit={tf_idx.size}: inner GWAS={fit_idx.size}, "
         f"inner threshold-selection={sel_idx.size}")
     keep_path = os.path.join(workdir, "fit.keep")
     with open(keep_path, "w") as f:
@@ -312,12 +254,12 @@ def real_pt(geno_prefix, n_ind, coord, train_deme, y_binary, pcs, npc, split,
         f.writelines("i{0}\ti{0}\t".format(i) + "\t".join(f"{pcs[i,k]:.6f}" for k in range(npc)) + "\n"
                      for i in fit_idx)
 
-    # GWAS: plink2 logistic, pgs_train inner rows, PC covariates
+    # GWAS: plink2 logistic, train-deme-fit inner rows, PC covariates, firth fallback
     gwas_prefix = os.path.join(workdir, "gwas")
     run([PLINK2, "--bfile", prefix, "--keep", keep_path, "--pheno", phe_path,
          "--pheno-name", "y", "--1", "--covar", cov_path, "--covar-variance-standardize",
-         "--glm", "hide-covar", "--allow-no-sex", "--allow-extra-chr",
-         *common, "--out", gwas_prefix], "GWAS (pgs_train inner)")
+         "--glm", "hide-covar", "firth-fallback", "--allow-no-sex",
+         *common, "--out", gwas_prefix], "GWAS (train-deme-fit inner)")
     glm = [p for p in os.listdir(workdir) if p.startswith("gwas.") and ".glm.logistic" in p]
     if not glm:
         raise RuntimeError(f"No GWAS logistic output; dir={os.listdir(workdir)}")
@@ -336,7 +278,7 @@ def real_pt(geno_prefix, n_ind, coord, train_deme, y_binary, pcs, npc, split,
     }).dropna(subset=["P", "EFF"])
     log(f"[P+T] GWAS usable rows = {len(gdf)}")
 
-    # LD clump with plink1.9 on the pgs_train inner-GWAS genotypes
+    # LD clump with plink1.9 on the train-deme-fit (inner GWAS) genotypes
     fit_bfile = os.path.join(workdir, "fit_geno")
     run([PLINK1, "--bfile", prefix, "--keep", keep_path, "--make-bed",
          "--allow-extra-chr", *common, "--out", fit_bfile], "subset fit bfile")
@@ -372,7 +314,7 @@ def real_pt(geno_prefix, n_ind, coord, train_deme, y_binary, pcs, npc, split,
     score_prefix = os.path.join(workdir, "scoreall")
     run([PLINK2, "--bfile", prefix, "--score", score_all, "1", "2", "3",
          "cols=+scoresums", "--q-score-range", rfile, qfile, "1", "2",
-         "--allow-no-sex", "--allow-extra-chr", *common, "--out", score_prefix], "score all thresholds")
+         "--allow-no-sex", *common, "--out", score_prefix], "score all thresholds")
 
     yb_sel = y_binary[sel_idx].astype(int)
     yb_fit = y_binary[fit_idx].astype(int)
@@ -397,7 +339,10 @@ def real_pt(geno_prefix, n_ind, coord, train_deme, y_binary, pcs, npc, split,
         n_snps = int((gdf["P"] <= thr).sum())
         if np.std(psel) < 1e-9 or len(np.unique(yb_sel)) < 2 or n_snps < 1:
             continue
-        auc = roc_auc_score(yb_sel, psel)
+        try:
+            auc = roc_auc_score(yb_sel, psel)
+        except Exception:
+            continue
         # orient per-threshold so AUC>=0.5 (sign learned on fit rows below)
         auc = max(auc, 1 - auc)
         sel_aucs[thr] = (round(auc, 4), n_snps)
@@ -406,15 +351,14 @@ def real_pt(geno_prefix, n_ind, coord, train_deme, y_binary, pcs, npc, split,
     if best is None:
         raise RuntimeError("No valid P+T threshold produced a non-degenerate cal PGS")
     best_thr, best_auc_sel, best_nsnps = best
-    log(f"[P+T] selected p<={best_thr:g} (internal pgs_train validation AUC={best_auc_sel:.4f}) n_snps={best_nsnps}")
-    log(f"[P+T] per-threshold internal validation AUC / n_snps: "
+    log(f"[P+T] selected p<={best_thr:g} (train-deme cal AUC={best_auc_sel:.4f}) n_snps={best_nsnps}")
+    log(f"[P+T] per-threshold train-deme-cal AUC / n_snps: "
         + ", ".join(f"{t:g}:{a}/{n}" for t, (a, n) in sorted(sel_aucs.items())))
     pgs_raw = pgs_by_thr[best_thr].copy()
     # orient so higher PGS = higher risk, using the GWAS (fit) rows
     if np.corrcoef(pgs_raw[fit_idx], yb_fit)[0, 1] < 0:
         pgs_raw = -pgs_raw
-    if not np.isfinite(pgs_raw).all():
-        raise ValueError(f"non-finite PGS for {int((~np.isfinite(pgs_raw)).sum())} individuals")
+    pgs_raw = np.where(np.isfinite(pgs_raw), pgs_raw, 0.0)
     meta = dict(best_p_threshold=float(best_thr), best_cal_auc=round(float(best_auc_sel), 4),
                 n_snps=int(best_nsnps), n_clumped=int(len(clumped)),
                 n_gwas_usable=int(len(gdf)), clump_r2=CLUMP_R2, clump_kb=CLUMP_KB,
@@ -424,64 +368,44 @@ def real_pt(geno_prefix, n_ind, coord, train_deme, y_binary, pcs, npc, split,
 
 
 def main():
-    global SIGMA_E, N_CAUSAL, DATA_DIR, N_MODEL_TRAIN     # reassigned below from CLI overrides
     ap = argparse.ArgumentParser()
-    ap.add_argument("dem", choices=["serial1d", "grid2d", "admix"])
+    ap.add_argument("dem", choices=["serial1d", "grid2d"])
+    ap.add_argument("outdir")
     ap.add_argument("seed", nargs="?", type=int, default=7)
-    # generation/plink knobs (CLI, not env vars) so chunk size / parallelism can be
-    # swept without editing constants; all default to the module DEFAULT_* values.
     ap.add_argument("--chunks", type=int, default=DEFAULT_CHUNKS)
     ap.add_argument("--chunk-bp", type=int, default=DEFAULT_CHUNK_BP)
-    ap.add_argument("--workers", type=int, default=0, help="0 = auto (allocated cores)")
-    ap.add_argument("--threads", type=int, default=DEFAULT_THREADS)
-    ap.add_argument("--mem-mb", type=int, default=DEFAULT_MEM_MB)
-    # scientific sweep knobs (CLI, not env vars); default to the module constants.
-    ap.add_argument("--sigma-e", type=float, default=SIGMA_E, help="env SD; h2=1/(1+sigma_e^2)")
-    ap.add_argument("--n-causal", type=int, default=N_CAUSAL)
-    ap.add_argument("--baseline-scale", type=float, default=1.0,
-                    help="multiplies the deme-varying environmental baseline (confounding strength)")
-    ap.add_argument("--migration-scale", type=float, default=1.0,
-                    help="multiplies nearest-neighbour migration (<1 = more isolation)")
-    ap.add_argument("--npc", type=int, default=0,
-                    help="override # PCs used by PGS+PCs and the gamfit surface (0 = demography default)")
-    ap.add_argument("--run-tag", default="", help="output subdir for isolating sweep experiments")
-    ap.add_argument("--n-model-train", type=int, default=N_MODEL_TRAIN,
-                    help="calibration-model training rows per deme")
+    ap.add_argument("--threads", type=int, default=1)
+    ap.add_argument("--mem-mb", type=int, default=8000)
+    ap.add_argument("--n-causal", type=int, default=150,
+                    help="number of causal SNPs (concentrated => GWAS-recoverable PGS)")
+    ap.add_argument("--tag", default="",
+                    help="filename suffix, e.g. '_s1' -> <dem>_<pheno>_realpt_s1.parquet "
+                         "(for multi-seed; empty = canonical unsuffixed files)")
     args = ap.parse_args()
-
-    # apply scientific overrides (module globals so all downstream references pick them up)
-    SIGMA_E = args.sigma_e
-    N_MODEL_TRAIN = args.n_model_train
-    N_CAUSAL = args.n_causal
-    if args.run_tag:
-        DATA_DIR = REPO_ROOT / "sims" / "results_hpc" / "ancestry_calibration" / args.run_tag / "data"
+    TAG = str(args.tag)
 
     dem_name = args.dem
-    outdir = DATA_DIR
+    outdir = Path(args.outdir)
     seed = args.seed
-    TAG = f"_s{seed}"
     outdir.mkdir(parents=True, exist_ok=True)
-    work_root = (outdir.parent / "_work").resolve()
-    work_root.mkdir(parents=True, exist_ok=True)
-    tag_clean = TAG.replace("/", "_") if TAG else "base"
     rng = np.random.default_rng(1000 + seed * 17)
 
     # STREAM the genome to <geno_prefix>.bed/.bim/.fam without ever holding the full
     # dense dosage matrix in RAM. Only PCA- and causal-candidate columns are retained
     # dense (a few thousand cols), so peak RAM is bounded regardless of total Mb.
     from stream_geno import simulate_stream
-    dG, samples, coord, dist, train_deme, npc = DEMS[dem_name](migration_scale=args.migration_scale)
-    if args.npc:
-        npc = min(args.npc, 6)              # PCA computes up to 6 components
+    # Training deme is RANDOM per seed (not the founder/source deme): a real biobank's
+    # majority ancestry is an arbitrary derived population, not the high-diversity founder.
+    n_demes_total = {"serial1d": 10, "grid2d": 36}[dem_name]
+    train_deme_pick = int(rng.integers(0, n_demes_total))
+    dG, samples, coord, dist, train_deme, npc = DEMS[dem_name](train_deme=train_deme_pick)
+    log(f"[{dem_name}] random training deme = {train_deme} (of {n_demes_total})")
     n_demes = len(np.unique(coord))
-    geno_dir = work_root / f"{dem_name}_seed{seed}_{tag_clean}_geno"
-    shutil.rmtree(geno_dir, ignore_errors=True)
-    geno_dir.mkdir(parents=True, exist_ok=True)
+    geno_dir = tempfile.mkdtemp(prefix=f"realpt_{dem_name}_geno_", dir=str(outdir))
     geno_prefix = os.path.join(geno_dir, "geno")
     st = simulate_stream(dG, samples, args.chunks, args.chunk_bp, RECOMB, MU, seed,
-                         geno_prefix, n_pca_keep=5000, n_causal_keep=max(N_CAUSAL * 8, 2000),
-                         log=lambda m: log(f"[{dem_name}] {m}"),
-                         workers=(args.workers or None))
+                         geno_prefix, n_pca_keep=5000, n_causal_keep=max(args.n_causal * 8, 2000),
+                         log=lambda m: log(f"[{dem_name}] {m}"))
     nI = st["n_ind"]
     if nI != coord.shape[0]:
         raise RuntimeError(f"individual count mismatch: bed {nI} vs coord {coord.shape[0]}")
@@ -490,58 +414,72 @@ def main():
     log(f"[{dem_name}] nInd={nI} nLoci={st['n_loci']} pca_kept={st['Xpca'].shape[1]} causal_pool={st['Xcausal'].shape[1]}")
 
     # PCs from genotypes (the reservoir-sampled common loci)
-    _t = time.time()
     pcs = PCA(min(6, st["Xpca"].shape[1]), svd_solver="randomized", random_state=0).fit_transform(
         StandardScaler().fit_transform(st["Xpca"]))
     pcs = StandardScaler().fit_transform(pcs)[:, :npc]
-    log(f"[{dem_name}] PCA done in {time.time()-_t:.0f}s")
 
     # True genetic liability. Synth uses a highly polygenic oracle (2000 candidates) and
     # fixes home accuracy by fiat (rho0=0.8). A REAL P+T PGS at finite GWAS n only carries
     # comparable home-deme signal if the architecture is GWAS-recoverable, so we use a
     # moderately concentrated architecture (n_causal causal SNPs). Liability is still
-    # standardized to N(0,1), so heritability semantics are stable; only the detectability
+    # standardized to N(0,1), so heritability semantics match synth; only the detectability
     # differs -- which is exactly what makes real-P+T the rigorous track. Causal SNPs are
     # drawn from the retained causal pool (a representative genome-wide common-variant set).
-    _t = time.time()
     Xc = st["Xcausal"]
-    nca = min(N_CAUSAL, Xc.shape[1])
+    nca = min(args.n_causal, Xc.shape[1])
     caus_local = rng.choice(Xc.shape[1], nca, replace=False)
     Gmat = StandardScaler(with_std=False).fit_transform(Xc[:, caus_local])
     beta = rng.normal(0, 1, nca)
     true_liab = standardize(Gmat @ beta)
-    log(f"[{dem_name}] liability done in {time.time()-_t:.0f}s")
 
-    _t = time.time()
     split = make_split(coord, train_deme, rng)
-    # per-deme baselines: phenoA varies by deme, phenoB is constant
+    is_train = coord == train_deme
+
+    # Per-deme baselines. phenoA = deme-varying baseline risk: for the 1-D chain a smooth
+    # LINEAR gradient across demes; for the 2-D grid an arbitrary per-deme RANDOM offset
+    # (a grid has no single ordering, so a gradient would be artificial). phenoB = constant
+    # baseline. phenoC (drift-proof) is built below. All baselines are mean-zero so the
+    # GLOBAL prevalence target is met by a single intercept solve.
     uq = np.unique(coord)
     udeme = (uq - uq.min()) / (uq.max() - uq.min() + 1e-12)
-    base_by_deme = args.baseline_scale * (0.45 * np.sin(2 * np.pi * udeme) + 0.25 * (udeme - 0.5))
-    base_by_deme -= base_by_deme.mean()
+    if dem_name == "serial1d":
+        base_by_deme = 0.8 * (udeme - 0.5)
+    else:
+        base_by_deme = rng.normal(0, 0.4, len(uq))
+    base_by_deme = base_by_deme - base_by_deme.mean()
     deme_to_baseA = {dd: b for dd, b in zip(uq, base_by_deme)}
     baseA = np.array([deme_to_baseA[c] for c in coord])
     baseB = np.zeros(nI)
 
+    # phenoC drift-proof liability: center the genetic liability WITHIN each deme so every
+    # deme has an identical mean liability (=> identical prevalence after one intercept
+    # solve). Drift in allele frequencies can still shift the PER-DEME mean genetic
+    # liability under phenoA/phenoB; phenoC removes that mean shift entirely, so the only
+    # thing that can differ across ancestries is the PGS->liability calibration SLOPE --
+    # never the base rate. (Demeaning by a per-deme constant leaves every within-deme
+    # covariance/variance unchanged, so true_slope_deme is identical across phenos.)
+    liab_demean = true_liab.copy()
+    for dd in uq:
+        mk = coord == dd
+        liab_demean[mk] = true_liab[mk] - true_liab[mk].mean()
+
     # ---- REAL P+T: build PGS once (on phenoA's y_binary, the realistic phenotype) ----
     # PGS is a property of genotype + the GWAS; reused for phenoB (same as deploying a
-    # trained PGS regardless of which baseline-shift defines the outcome.
+    # trained PGS regardless of which baseline-shift defines the outcome). Use synth's
+    # probit liability for the GWAS phenotype so the trait the GWAS sees matches synth.
     linA = baseA + true_liab
     c0A = brentq(lambda c: norm.cdf((c + linA) / SIGMA_E).mean() - PREV, -20, 20)
     yA = ((c0A + linA + rng.normal(0, SIGMA_E, nI)) > 0).astype(int)
-    log(f"[{dem_name}] split+pheno done in {time.time()-_t:.0f}s; entering P+T")
-    work = work_root / f"{dem_name}_seed{seed}_{tag_clean}_pt"
-    shutil.rmtree(work, ignore_errors=True)
-    work.mkdir(parents=True, exist_ok=True)
+    work = tempfile.mkdtemp(prefix=f"realpt_{dem_name}_", dir=str(outdir))
     try:
         PGS_raw, pt_meta = real_pt(geno_prefix, nI, coord, train_deme, yA, pcs, npc,
-                                   split, str(work), args.threads, args.mem_mb)
+                                   split, work, args.threads, args.mem_mb)
     finally:
         shutil.rmtree(work, ignore_errors=True)
         shutil.rmtree(geno_dir, ignore_errors=True)  # drop the big .bed once scored
-    # standardize PGS_z on PGS-training rows ONLY; no model_train/test leakage.
-    # PGS_raw is left as the raw plink score (no pooled standardization).
-    fitm = (split == "pgs_train")
+    PGS_raw = standardize(PGS_raw)
+    # standardize PGS_z on TRAIN-DEME-FIT rows ONLY (matches synth; no test leak)
+    fitm = (split == "train-deme-fit")
     tr_mean = float(PGS_raw[fitm].mean())
     tr_sd = float(PGS_raw[fitm].std())
     PGS_z = (PGS_raw - tr_mean) / (tr_sd + 1e-12)
@@ -564,42 +502,57 @@ def main():
     near_deme = uq[1] if len(uq) > 1 else uq[0]
     sidecar = {
         "dem": dem_name, "seed": seed, "train_deme": int(train_deme),
-        "n_total": int(nI),
-        "n_pgs_train": int(N_PGS_TRAIN),
-        "n_model_train_per_deme": int(N_MODEL_TRAIN),
-        "n_test_per_deme": int(N_TEST),
-        "split_counts": {str(k): int(v) for k, v in pd.Series(split).value_counts().sort_index().items()},
+        "n_total": int(nI), "n_per_deme": int(NPER), "n_per_deme_train": int(NPER_TRAIN),
         "npc": int(npc), "sigma_e": SIGMA_E, "prev_target": PREV,
-        "demography": DEMOGRAPHY_NOTES[dem_name],
         "pgs_train_mean": tr_mean, "pgs_train_sd": tr_sd, "pgs_mode": "realpt",
         "pgs_method": "real GWAS (plink2 logistic, PC covars) + plink1.9 LD clump "
                       f"(r2<{CLUMP_R2}, {CLUMP_KB}kb) + p-value thresholding; "
-                      "GWAS+weights on pgs_train only (inner 80/20 GWAS/threshold-select); "
-                      "model_train/test held out from P+T",
+                      "GWAS+weights on train-deme-fit only (inner 80/20 GWAS/threshold-select); "
+                      "train-deme-test held out",
         "params": {"mu": MU, "recomb": RECOMB, "n_chunks": int(args.chunks),
                    "chunk_bp": int(args.chunk_bp), "seqlen_bp": int(args.chunks * args.chunk_bp),
-                   "n_loci_total": int(st["n_loci"]), "n_loci_common": int(st["Xpca"].shape[1]),
-                   "n_causal": int(N_CAUSAL)},
+                   "n_loci_total": int(st["n_loci"]), "n_loci_common": int(st["Xpca"].shape[1])},
         "pt": pt_meta,
         "true_slope_by_deme": {int(d): round(v, 4) for d, v in true_slope_by_deme.items()},
         "fst_train_vs_near": round(fst_pair(st["Xpca"][coord == train_deme], st["Xpca"][coord == near_deme]), 5),
         "fst_train_vs_far": round(fst_pair(st["Xpca"][coord == train_deme], st["Xpca"][coord == far_deme]), 5),
         "far_deme": int(far_deme), "near_deme": int(near_deme),
         "phenos": {},
-        "truth_columns": ["true_liab", "true_slope_deme", "intercept_deme", "p_true"],
-        "metric_rule": "Use split == test rows only for reported metrics. Never compute within-bin AUC; "
-                       "stratify calibration/group metrics only.",
+        "truth_columns": ["true_liab", "true_slope_deme", "intercept_deme", "p_true",
+                          "true_hazard", "true_surv_at_admin", "surv_rate_true",
+                          "surv_risk_5y_true", "surv_risk_10y_true"],
+        "metric_rule": "Use *-deme-test rows only. Never compute within-deme AUC/C-index; "
+                       "stratify calibration only.",
     }
 
-    for pheno, base in [("phenoA", baseA), ("phenoB", baseB)]:
-        # Binary outcome via probit liability with environmental noise.
-        lin = base + true_liab
+    for pheno, base, liab in [("phenoA", baseA, true_liab),
+                              ("phenoB", baseB, true_liab),
+                              ("phenoC", np.zeros(nI), liab_demean)]:
+        # Binary outcome via probit liability with environmental noise (matches synth).
+        # phenoA: deme-varying baseline + genetic liability; phenoB: constant baseline +
+        # genetic liability; phenoC: no baseline + drift-proof (per-deme-centered) liability.
+        lin = base + liab
         c0 = brentq(lambda c: norm.cdf((c + lin) / SIGMA_E).mean() - PREV, -20, 20)
         intercept_deme = c0 + base                       # generative per-deme intercept
         p_true = norm.cdf((c0 + lin) / SIGMA_E)          # EXACT generative P(y=1)
         e = rng.normal(0, SIGMA_E, nI)
         L = c0 + lin + e
         y_binary = (L > 0).astype(int)
+
+        # Survival from the SAME liability: exponential baseline, hazard ~ exp(eta_surv).
+        eta_surv = lin - lin.mean()
+        lam = 0.02 * np.exp(eta_surv)                    # true individual hazard rate
+        true_haz = lam
+        t_event = rng.exponential(1.0 / np.clip(lam, 1e-9, None))
+        c_admin = float(np.quantile(t_event, 0.65))      # ~35% admin censoring
+        surv_time = np.minimum(t_event, c_admin)
+        surv_event = (t_event <= c_admin).astype(int)
+        true_surv_at_admin = np.exp(-lam * c_admin)
+        h5 = float(np.quantile(t_event, 0.30))
+        h10 = float(np.quantile(t_event, 0.60))
+        surv_rate_true = lam
+        surv_risk_5y_true = 1.0 - np.exp(-lam * h5)
+        surv_risk_10y_true = 1.0 - np.exp(-lam * h10)
 
         df = pd.DataFrame({
             "iid": np.arange(nI),
@@ -609,10 +562,18 @@ def main():
             "PGS_raw": PGS_raw,
             "PGS_z": PGS_z,
             "y_binary": y_binary,
-            "true_liab": true_liab,
+            "surv_time": surv_time,
+            "surv_event": surv_event,
+            "true_liab": liab,
             "true_slope_deme": true_slope_deme,
             "intercept_deme": intercept_deme,
             "p_true": p_true,
+            "true_hazard": true_haz,
+            "true_surv_at_admin": true_surv_at_admin,
+            "surv_rate_true": surv_rate_true,
+            "surv_risk_5y_true": surv_risk_5y_true,
+            "surv_risk_10y_true": surv_risk_10y_true,
+            "is_train": is_train,
             "split": split,
             "pgs_mode": "realpt",
         })
@@ -623,9 +584,10 @@ def main():
         df.to_parquet(path, index=False)
         df.to_csv(outdir / f"{dem_name}_{pheno}_realpt{TAG}.csv", index=False)
 
-        test = df[df["split"].astype(str) == "test"].copy()
+        test = df[df["split"].astype(str).str.endswith("-deme-test")].copy()
         pooled_auc = (roc_auc_score(test["y_binary"], test["PGS_raw"])
                       if test["y_binary"].nunique() > 1 else float("nan"))
+        pooled_c = harrell_c_index(test["surv_time"], test["surv_event"], test["PGS_raw"])
         per_deme = []
         for dd in uq:
             sub = test[test["deme"] == int(dd)]
@@ -642,6 +604,9 @@ def main():
                 "sd_pgs_raw_test": float(sub["PGS_raw"].std()),
                 "mean_p_true": float(sub["p_true"].mean()),
                 "binary_prevalence_test": float(sub["y_binary"].mean()),
+                "surv_risk_5y_mean_test": float(sub["surv_risk_5y_true"].mean()),
+                "surv_risk_10y_mean_test": float(sub["surv_risk_10y_true"].mean()),
+                "surv_event_rate_test": float(sub["surv_event"].mean()),
             })
         sanity = pd.DataFrame(per_deme).sort_values("dist")
         sanity_path = outdir / f"{dem_name}_{pheno}_realpt{TAG}.sanity.tsv"
@@ -650,11 +615,15 @@ def main():
             "path": str(path), "sanity_path": str(sanity_path), "n_test": int(len(test)),
             "p_true_range_test": [float(test["p_true"].min()), float(test["p_true"].max())],
             "binary_prevalence_test": float(test["y_binary"].mean()),
+            "surv_risk_5y_pooled": round(float(surv_risk_5y_true.mean()), 4),
+            "surv_risk_10y_pooled": round(float(surv_risk_10y_true.mean()), 4),
+            "surv_event_rate_test": float(test["surv_event"].mean()),
             "global_test_raw_pgs_auc_binary": float(pooled_auc),
+            "global_test_raw_pgs_cindex_survival": float(pooled_c),
         }
         log(f"[{dem_name}/{pheno}] wrote {path}")
         log(f"  test n={len(test)} prev={test['y_binary'].mean():.3f} "
-            f"raw_auc={pooled_auc:.3f}")
+            f"surv_event={test['surv_event'].mean():.3f} raw_auc={pooled_auc:.3f} raw_c={pooled_c:.3f}")
         log(sanity[["deme", "n_test", "is_training_ancestry", "dist", "true_slope_deme",
                     "corr_pgs_true_liab_test", "mean_pgs_raw_test", "binary_prevalence_test"]].to_string(index=False))
 

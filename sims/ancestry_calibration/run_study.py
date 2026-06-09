@@ -1,11 +1,17 @@
-"""Unified real-P+T ancestry-calibration simulation runner.
+"""Real-P+T ancestry-calibration study runner (the only sims entry point).
 
-This is the only simulation entry point used by sims/main.py. It runs:
-1. real P+T data generation for serial1d/grid2d
-2. binary risk-model fitting on model_train
-3. held-out test metrics for Figure 2
+Pipeline:
+  1. generate real-P+T data for serial1d + grid2d x seeds (3 phenotypes each)
+  2. fit binary recalibration models + ground-truth metrics (per dataset)
+  3. fit survival recalibration models + ground-truth metrics (per dataset)
+  4. aggregate the per-dataset CSVs into study-level tables
+  5. render the figures
 
-Only binary real-P+T data and metrics are produced here.
+Generation is RAM-bound (each streamed sim holds reservoirs + one chunk), so its
+fan-out is sized from currently-free RAM/cores. Fitting is light and fans out per
+dataset. The survival fit is run under a wall-clock timeout because gamfit survival
+marginal-slope can stall (gam#979); fit_survival flushes the Cox baselines before
+attempting gamfit, so a timeout still leaves the baselines on disk.
 """
 from __future__ import annotations
 
@@ -16,40 +22,34 @@ import subprocess
 import sys
 from pathlib import Path
 
-
 HERE = Path(__file__).resolve().parent
 GEN = HERE / "gen_real_pt.py"
-FIT = HERE / "fit_binary.py"
+FIT_BINARY = HERE / "fit_binary.py"
+FIT_SURVIVAL = HERE / "fit_survival.py"
+ANALYZE = HERE / "analyze_results.py"
 PLOT = HERE / "plot_results.py"
 OUT = Path("sims/results_hpc/ancestry_calibration")
 
 DEMOGRAPHIES = ("serial1d", "grid2d")
-SEEDS = tuple(range(1, 21))  # 20 replicates: seed = inferential unit (power)
-CENTERS = 20
-CHUNKS = 200          # provenance; live values are gen_real_pt.DEFAULT_CHUNKS/_CHUNK_BP
-CHUNK_BP = 500_000
-# Live value is gen_real_pt.DEFAULT_THREADS; kept here for the cpu-budget formula.
-THREADS_PER_GENERATION_JOB = 8
-PLINK_MEMORY_MB_PER_GENERATION_JOB = 24_000  # provenance; live: gen_real_pt.DEFAULT_MEM_MB
-N_CAUSAL = 4500  # provenance only; must match gen_real_pt.N_CAUSAL
-# Peak RAM of ONE int8-streaming generate task: a chunk's int8 genotype matrix
-# (~8 GiB at biobank n) + its dosage view (~4 GiB) + the kept reservoirs (~6 GiB),
-# rounded up for slack. The job count is NOT hardcoded -- it is computed at launch
-# from whatever RAM and cores are actually free (the node is shared).
-GEN_TASK_PEAK_GIB = 22.0
-MEM_HEADROOM_FRAC = 0.70  # only spend this share of free RAM; leave room for others
-FIT_JOBS = 6  # provenance only; fit_binary runs as one process over all datasets
+PHENOS = ("phenoA", "phenoB", "phenoC")
+SEEDS = tuple(range(1, 11))      # seed = inferential unit; averages out P+T threshold noise
+CENTERS = 12                     # gamfit marginal-slope surface centers (gam#979: keep modest)
+SURVIVAL_TIMEOUT_S = 1500        # cap a gamfit survival-MS stall; baselines already flushed
+
+GEN_TASK_PEAK_GIB = 22.0         # one streamed sim's peak RAM (reservoirs + a chunk)
+MEM_HEADROOM_FRAC = 0.70
+THREADS_PER_GEN_JOB = 1
+FIT_JOBS = 12
 
 
 def auto_generate_jobs(n_tasks: int) -> int:
-    """Pick the generate fan-out from currently-free RAM and cores, not a fixed
-    number: the node is shared, so the safe parallelism depends on who else is on it."""
+    """Size generation fan-out from currently-free RAM/cores (the node is shared)."""
     mem_avail_gib = 64.0
     try:
         with open("/proc/meminfo") as fh:
             for line in fh:
                 if line.startswith("MemAvailable:"):
-                    mem_avail_gib = int(line.split()[1]) / (1024 ** 2)  # kB -> GiB
+                    mem_avail_gib = int(line.split()[1]) / (1024 ** 2)
                     break
     except OSError:
         pass
@@ -58,135 +58,99 @@ def auto_generate_jobs(n_tasks: int) -> int:
     except OSError:
         free_cores = os.cpu_count() or 8
     by_mem = int((mem_avail_gib * MEM_HEADROOM_FRAC) // GEN_TASK_PEAK_GIB)
-    by_cpu = free_cores // THREADS_PER_GENERATION_JOB
-    jobs = max(1, min(n_tasks, by_mem, by_cpu))
-    print(f"auto generate jobs={jobs} (free RAM {mem_avail_gib:.0f} GiB -> {by_mem} by mem; "
-          f"free cores {free_cores} / {THREADS_PER_GENERATION_JOB} thr -> {by_cpu} by cpu)", flush=True)
+    jobs = max(1, min(n_tasks, by_mem, free_cores))
+    print(f"auto generate jobs={jobs} (free RAM {mem_avail_gib:.0f} GiB, free cores {free_cores})", flush=True)
     return jobs
 
 
-def tail(path: Path, n: int = 80) -> str:
-    if not path.exists():
-        return ""
-    lines = path.read_text(errors="replace").splitlines()
-    return "\n".join(lines[-n:])
-
-
-def run_logged(cmd: list[object], log_path: Path) -> None:
+def run_logged(cmd, log_path: Path, timeout=None) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    text_cmd = " ".join(str(c) for c in cmd)
-    print(f"+ {text_cmd}  > {log_path}", flush=True)
+    text = " ".join(str(c) for c in cmd)
+    print(f"+ {text}  > {log_path}", flush=True)
     with log_path.open("w", encoding="utf-8") as log:
-        log.write(f"+ {text_cmd}\n")
+        log.write(f"+ {text}\n")
         log.flush()
-        result = subprocess.run([str(c) for c in cmd], stdout=log, stderr=subprocess.STDOUT)
-    if result.returncode != 0:
-        raise RuntimeError(f"command failed rc={result.returncode}: {text_cmd}\n\nLog tail:\n{tail(log_path)}")
+        try:
+            r = subprocess.run([str(c) for c in cmd], stdout=log, stderr=subprocess.STDOUT, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            log.write(f"\nTIMEOUT after {timeout}s (partial results, if any, were flushed)\n")
+            print(f"  TIMEOUT {log_path.name} (non-fatal)", flush=True)
+            return
+    if r.returncode != 0:
+        # a single dataset/method failing must not abort the study
+        print(f"  WARN rc={r.returncode} {log_path.name} (non-fatal)", flush=True)
 
 
-def run_many(tasks: list[tuple[str, list[object], Path]], jobs: int) -> None:
+def run_many(tasks, jobs: int) -> None:
     if not tasks:
         return
     jobs = max(1, min(int(jobs), len(tasks)))
     print(f"running {len(tasks)} tasks with jobs={jobs}", flush=True)
     with ThreadPoolExecutor(max_workers=jobs) as pool:
-        futures = {pool.submit(run_logged, cmd, log_path): name for name, cmd, log_path in tasks}
+        futures = {pool.submit(run_logged, *t): t[1].name for t in tasks}
         for fut in as_completed(futures):
-            name = futures[fut]
             fut.result()
-            print(f"done {name}", flush=True)
+            print(f"done {futures[fut]}", flush=True)
 
 
 def main() -> None:
     out = OUT.resolve()
     data_dir = out / "data"
-    results_dir = out / "results"
+    res_b = out / "results" / "binary"
+    res_s = out / "results" / "survival"
     log_dir = out / "logs"
-    data_dir.mkdir(parents=True, exist_ok=True)
-    results_dir.mkdir(parents=True, exist_ok=True)
-    log_dir.mkdir(parents=True, exist_ok=True)
-    generate_jobs = auto_generate_jobs(len(DEMOGRAPHIES) * len(SEEDS))
+    env = dict(os.environ, OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1",
+               MKL_NUM_THREADS="1", RAYON_NUM_THREADS="1")
+    os.environ.update(env)
+    for d in (data_dir, res_b, res_s, log_dir):
+        d.mkdir(parents=True, exist_ok=True)
 
-    config = {
-        "demographies": list(DEMOGRAPHIES),
-        "seeds": list(SEEDS),
-        "centers": CENTERS,
-        "pgs": "real P+T only",
-        "outcome": "binary only",
-        "split": {
-            "pgs_train": "single training deme, large cohort, P+T only",
-            "model_train": "all demes, risk-model training only",
-            "test": "all demes, reported metrics only",
-        },
-        "metrics": [
-            "global AUC",
-            "global liability-scale pseudo-R2",
-            "global Brier",
-            "distance-bin AUC",
-            "distance-bin liability-scale pseudo-R2",
-            "distance-bin Brier",
-            "distance/deme prevalence error vs known true prevalence",
-            "mean absolute error vs p_true",
-            "individual absolute error vs p_true",
-        ],
-        "parallelism": {
-            "generate_jobs": generate_jobs,
-            "fit_jobs": FIT_JOBS,
-            "threads_per_generation_job": THREADS_PER_GENERATION_JOB,
-            "plink_memory_mb_per_generation_job": PLINK_MEMORY_MB_PER_GENERATION_JOB,
-            "detected_cpus": int(os.cpu_count() or 1),
-        },
-        "generation": {
-            "chunks": CHUNKS,
-            "chunk_bp": CHUNK_BP,
-            "n_causal": N_CAUSAL,
-        },
-    }
-    (out / "run_config.json").write_text(json.dumps(config, indent=2))
+    (out / "run_config.json").write_text(json.dumps({
+        "demographies": list(DEMOGRAPHIES), "phenotypes": list(PHENOS), "seeds": list(SEEDS),
+        "centers": CENTERS, "pgs": "real P+T only", "outcomes": ["binary", "survival"],
+        "methods_binary": ["gamfit", "linpc", "znorm", "calpred", "rawpgs"],
+        "methods_survival": ["gamfit", "linpc", "znorm", "rawpgs"],
+        "calibration": "ground-truth: probit slope + Brier Skill Score (Murphy reliability/resolution)",
+        "discrimination": "GLOBAL only (binary AUC / survival Harrell C); never within-stratum",
+    }, indent=2))
 
-    generate_tasks: list[tuple[str, list[object], Path]] = []
+    # 1. generation
+    gen_tasks = []
     for dem in DEMOGRAPHIES:
         for seed in SEEDS:
-            tag = f"_s{seed}"
-            name = f"generate_{dem}_s{seed}"
-            generate_tasks.append(
-                (
-                    name,
-                    [
-                        sys.executable,
-                        GEN,
-                        dem,
-                        seed,
-                    ],
-                    log_dir / f"{name}.log",
-                )
-            )
-    run_many(generate_tasks, generate_jobs)
+            cmd = [sys.executable, GEN, dem, data_dir, seed, "--tag", f"_s{seed}", "--threads", "1"]
+            gen_tasks.append((cmd, log_dir / f"gen_{dem}_s{seed}.log"))
+    run_many(gen_tasks, auto_generate_jobs(len(gen_tasks)))
 
+    # 2+3. fitting (per dataset, both arms)
     datasets = []
     for dem in DEMOGRAPHIES:
         for seed in SEEDS:
-            for pheno in ("phenoA", "phenoB"):
-                path = data_dir / f"{dem}_{pheno}_realpt_s{seed}.parquet"
-                if not path.exists():
-                    raise FileNotFoundError(path)
-                datasets.append(path)
+            for pheno in PHENOS:
+                p = data_dir / f"{dem}_{pheno}_realpt_s{seed}.parquet"
+                if p.exists():
+                    datasets.append((dem, pheno, seed, p))
+                else:
+                    print(f"WARN missing dataset {p}", flush=True)
 
-    run_logged(
-        [
-            sys.executable,
-            FIT,
-            *datasets,
-        ],
-        log_dir / "fit_binary.log",
-    )
-    run_logged(
-        [
-            sys.executable,
-            PLOT,
-        ],
-        log_dir / "plot_results.log",
-    )
+    fit_tasks = []
+    for dem, pheno, seed, p in datasets:
+        stem = f"{dem}_{pheno}_s{seed}"
+        fit_tasks.append((
+            [sys.executable, FIT_BINARY, "--data", p, "--dem", dem, "--pheno", pheno,
+             "--centers", CENTERS, "--out-acc", res_b / f"{stem}_acc.csv",
+             "--out-cal", res_b / f"{stem}_cal.csv", "--out-pred", res_b / f"{stem}_pred.parquet"],
+            log_dir / f"fitb_{stem}.log", None))
+        fit_tasks.append((
+            [sys.executable, FIT_SURVIVAL, "--data", p, "--dem", dem, "--pheno", pheno,
+             "--centers", CENTERS, "--out-acc", res_s / f"{stem}_acc.csv",
+             "--out-cal", res_s / f"{stem}_cal.csv"],
+            log_dir / f"fits_{stem}.log", SURVIVAL_TIMEOUT_S))
+    run_many(fit_tasks, FIT_JOBS)
+
+    # 4. aggregate + 5. plot
+    run_logged([sys.executable, ANALYZE], log_dir / "analyze.log")
+    run_logged([sys.executable, PLOT], log_dir / "plot.log")
 
 
 if __name__ == "__main__":

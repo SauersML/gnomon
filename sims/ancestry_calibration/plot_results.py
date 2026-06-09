@@ -1,273 +1,167 @@
-"""Plot real-P+T ancestry-calibration results.
+"""Render the study figures from the aggregated result tables.
 
-Inputs are the canonical outputs from fit_binary.py. Figures are real P+T only,
-binary only, and use the deme-varying environmental-baseline phenotype.
+Reads results/{accuracy,calibration}_{binary,survival}.csv and writes to figures/:
+  1) discrimination.png   -- GLOBAL discrimination (binary AUC, liability R2, Brier;
+                             survival Harrell C), 5 methods x (2 dem x 3 pheno).
+  2) calibration_bss.png  -- ancestry-stratified calibration via Brier Skill Score,
+                             held-out training-ancestry vs non-training populations.
+  3) bss_vs_distance.png  -- BSS decay with genetic distance from the training deme.
+  4) murphy.png           -- Murphy reliability (miscalibration) and resolution
+                             (discrimination) in the non-training populations.
+All mean +/- SD over seeds. Display order: gamfit, PGS+PCs, z-norm, CalPred, raw PGS.
 """
 from __future__ import annotations
 
 from pathlib import Path
 
-import matplotlib.pyplot as plt
-import numpy as np
-import pandas as pd
-from PIL import Image
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-RESULTS_DIR = REPO_ROOT / "sims" / "results_hpc" / "ancestry_calibration" / "results"
-PLOTS_DIR = REPO_ROOT / "sims" / "results_hpc" / "ancestry_calibration" / "plots"
+OUT = Path("sims/results_hpc/ancestry_calibration")
+RES = OUT / "results"
+FIG = OUT / "figures"
 
-PHENO = "phenoA"
-METHOD_LABELS = {
-    "gamfit": "Marginal-slope surface",
-    "linpc": "PGS + PCs",
-    "znorm2": "PC-adjusted z-score",
-}
-METHOD_COLORS = {
-    "gamfit": "#C0453B",
-    "linpc": "#3E5C76",
-    "znorm2": "#C99A3B",
-}
-DEM_LABELS = {
-    "serial1d": "1-D serial-founder",
-    "grid2d": "2-D stepping-stone",
-}
+WONG = {"gamfit": "#0072B2", "linpc": "#E69F00", "znorm": "#009E73",
+        "calpred": "#CC79A7", "rawpgs": "#999999"}
+MLAB = {"gamfit": "gamfit (marginal-slope)", "linpc": "PGS + PCs (linear)",
+        "znorm": "z-norm (PC-adjusted)", "calpred": "CalPred", "rawpgs": "PGS (unadjusted)"}
+MORD = ["gamfit", "linpc", "znorm", "calpred", "rawpgs"]
+PHORD = ["phenoA", "phenoB", "phenoC"]
+PHLAB = {"phenoA": "deme-varying baseline", "phenoB": "constant baseline",
+         "phenoC": "drift-proof (equal prevalence)"}
+DEMLAB = {"serial1d": "1-D chain", "grid2d": "2-D grid"}
+CELLS = [(d, p) for d in ["serial1d", "grid2d"] for p in PHORD]
 
 
-def add_bss(df: pd.DataFrame) -> pd.DataFrame:
-    """Derive the Brier Skill Score from raw Brier and each bin's true base rate.
-
-    BSS = 1 - Brier / [p_bar * (1 - p_bar)], p_bar = known_true_prevalence of the
-    distance bin. Higher is better. Undefined reference (p_bar in {0, 1}) yields NaN.
-    """
-    out = df.copy()
-    if "brier" not in out.columns or "known_true_prevalence" not in out.columns:
-        return out
-    p = pd.to_numeric(out["known_true_prevalence"], errors="coerce").to_numpy(float)
-    ref = p * (1.0 - p)
-    brier = pd.to_numeric(out["brier"], errors="coerce").to_numpy(float)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        out["bss"] = np.where((ref > 0) & np.isfinite(brier), 1.0 - brier / ref, np.nan)
-    return out
+def _read(name):
+    f = RES / name
+    return pd.read_csv(f) if f.exists() else pd.DataFrame()
 
 
-def bounded_ylim(values: pd.Series) -> tuple[float, float]:
-    x = pd.to_numeric(values, errors="coerce").dropna().to_numpy(float)
-    if x.size == 0:
-        return 0.0, 1.0
-    lo = float(np.nanmin(x))
-    hi = float(np.nanmax(x))
-    if np.isclose(lo, hi):
-        pad = max(abs(lo) * 0.08, 0.01)
-    else:
-        pad = (hi - lo) * 0.08
-    return lo - pad, hi + pad
+def _cellbars(ax, valfn, ylabel, title, hline=None, legend=False):
+    x = np.arange(len(CELLS))
+    w = 0.16
+    for i, m in enumerate(MORD):
+        mu = [valfn(d, p, m)[0] for d, p in CELLS]
+        sd = [valfn(d, p, m)[1] for d, p in CELLS]
+        ax.bar(x + (i - 2) * w, mu, w, yerr=sd, capsize=2, color=WONG[m],
+               label=MLAB[m], edgecolor="white", lw=0.4)
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"{DEMLAB[d]}\n{PHLAB[p]}" for d, p in CELLS], fontsize=7.5)
+    ax.set_ylabel(ylabel, fontsize=10)
+    ax.set_title(title, fontsize=11)
+    if hline is not None:
+        ax.axhline(hline, c="k", lw=0.8, ls="--")
+    ax.grid(axis="y", alpha=0.25)
+    for s in ("top", "right"):
+        ax.spines[s].set_visible(False)
+    if legend:
+        ax.legend(frameon=False, fontsize=8, loc="best", ncol=2)
 
 
-def save_opaque_png(fig: plt.Figure, output: Path) -> None:
-    fig.patch.set_facecolor("white")
-    fig.savefig(output, dpi=220, facecolor="white", transparent=False)
-    with Image.open(output) as image:
-        rgba = image.convert("RGBA")
-        white = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
-        white.alpha_composite(rgba)
-        white.convert("RGB").save(output)
+def _acc_valfn(acc, metric):
+    g = acc[acc.metric == metric].groupby(["dem", "pheno", "method"]).value.agg(["mean", "std"]).reset_index()
+
+    def fn(d, p, m):
+        r = g[(g.dem == d) & (g.pheno == p) & (g.method == m)]
+        return (float(r["mean"].iloc[0]), float(np.nan_to_num(r["std"].iloc[0]))) if len(r) else (np.nan, 0.0)
+    return fn
 
 
-def parse_seed_column(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    if "seed" not in out.columns:
-        raise ValueError("group-metrics frame has no 'seed' column; refusing to fabricate one")
-    out["seed"] = out["seed"].astype(int)
-    return out
+def _cal_valfn(cal, metric, binval):
+    sub = cal[(cal.metric == metric) & (cal.ancestry_bin_kind == "train_ancestry") & (cal.ancestry_bin == binval)]
+    g = sub.groupby(["dem", "pheno", "method"]).value.agg(["mean", "std"]).reset_index()
+
+    def fn(d, p, m):
+        r = g[(g.dem == d) & (g.pheno == p) & (g.method == m)]
+        return (float(r["mean"].iloc[0]), float(np.nan_to_num(r["std"].iloc[0]))) if len(r) else (np.nan, 0.0)
+    return fn
 
 
-def summarize_group(data: pd.DataFrame, metric: str) -> pd.DataFrame:
-    work = data[["dem", "method", "dist_from_train", "seed", metric]].copy()
-    work = work.rename(columns={metric: "value"})
-    work = work[np.isfinite(work["value"])]
-    grouped = (
-        work.groupby(["dem", "method", "dist_from_train"], as_index=False)
-        .agg(value=("value", "mean"), se=("value", lambda x: float(np.std(x, ddof=1) / np.sqrt(len(x))) if len(x) > 1 else 0.0))
-    )
-    return work, grouped
+def main():
+    FIG.mkdir(parents=True, exist_ok=True)
+    bacc, bcal = _read("accuracy_binary.csv"), _read("calibration_binary.csv")
+    sacc = _read("accuracy_survival.csv")
 
+    # 1) discrimination
+    fig, ax = plt.subplots(2, 2, figsize=(17, 10))
+    if not bacc.empty:
+        _cellbars(ax[0, 0], _acc_valfn(bacc, "auc"), "AUC (global)", "Binary discrimination — AUC",
+                  hline=0.5, legend=True)
+        _cellbars(ax[0, 1], _acc_valfn(bacc, "liability_r2"), "liability R2 (Lee 2011)",
+                  "Binary discrimination — liability-scale R2")
+        _cellbars(ax[1, 0], _acc_valfn(bacc, "brier"), "Brier (lower better)", "Binary — Brier score")
+    if not sacc.empty:
+        _cellbars(ax[1, 1], _acc_valfn(sacc, "cindex"), "Harrell's C (global)",
+                  "Survival discrimination — C-index", hline=0.5)
+    fig.suptitle("Real P+T PGS — GLOBAL discrimination (mean±SD over seeds)", fontsize=12, weight="bold", y=1.0)
+    plt.tight_layout()
+    fig.savefig(FIG / "discrimination.png", dpi=140, bbox_inches="tight")
+    plt.close(fig)
+    print("wrote discrimination.png")
 
-def plot_group_metrics(metrics: list[tuple[str, str]], output: Path, title: str) -> None:
-    group_path = RESULTS_DIR / "group_metrics_realpt_binary.csv"
-    if not group_path.exists():
-        raise FileNotFoundError(group_path)
-    df = pd.read_csv(group_path)
-    df = parse_seed_column(df)
-    df = df[(df["pgs_mode"] == "realpt") & (df["pheno"] == PHENO) & (df["group_kind"] == "distance")]
-    df = df[df["method"].isin(METHOD_LABELS)]
-    if df.empty:
-        raise ValueError("no real-P+T distance-bin group metrics for phenoA")
-    df = add_bss(df)
+    if bcal.empty:
+        print("PLOT_DONE (no binary calibration table)")
+        return
 
-    fig, axes = plt.subplots(len(metrics), 2, figsize=(12.8, 3.0 * len(metrics)), sharex=False)
-    if len(metrics) == 1:
-        axes = np.array([axes])
+    # 2) calibration BSS: training-ancestry vs non-training
+    fig, ax = plt.subplots(1, 2, figsize=(17, 5.5), sharey=True)
+    _cellbars(ax[0], _cal_valfn(bcal, "bss", "train_deme"), "Brier Skill Score (vs base rate)",
+              "Calibration — training-ancestry test (held out)", hline=0.0, legend=True)
+    _cellbars(ax[1], _cal_valfn(bcal, "bss", "other_deme"), "Brier Skill Score (vs base rate)",
+              "Calibration — non-training populations", hline=0.0)
+    fig.suptitle("Real P+T PGS — calibration skill (BSS>0 beats stratum base rate; emergent portability decay)",
+                 fontsize=12, weight="bold", y=1.0)
+    plt.tight_layout()
+    fig.savefig(FIG / "calibration_bss.png", dpi=140, bbox_inches="tight")
+    plt.close(fig)
+    print("wrote calibration_bss.png")
 
-    for row, (metric, label) in enumerate(metrics):
-        if metric not in df.columns:
-            raise ValueError(f"{group_path} lacks metric column {metric}")
-        points, lines = summarize_group(df, metric)
-        for col, dem in enumerate(["serial1d", "grid2d"]):
-            ax = axes[row, col]
-            ax.set_facecolor("white")
-            dpoints = points[points["dem"] == dem]
-            dlines = lines[lines["dem"] == dem]
-            for method in METHOD_LABELS:
-                pts = dpoints[dpoints["method"] == method]
-                ln = dlines[dlines["method"] == method].sort_values("dist_from_train")
-                if ln.empty:
+    # 3) BSS vs distance
+    dsub = bcal[(bcal.metric == "bss") & (bcal.ancestry_bin_kind == "dist_bin")]
+    if not dsub.empty:
+        fig, axes = plt.subplots(2, 3, figsize=(17, 9))
+        for j, (d, p) in enumerate(CELLS):
+            ax = axes[j // 3, j % 3]
+            cell = dsub[(dsub.dem == d) & (dsub.pheno == p)]
+            for m in MORD:
+                cm = cell[cell.method == m]
+                if cm.empty:
                     continue
-                color = METHOD_COLORS[method]
-                ax.scatter(pts["dist_from_train"], pts["value"], s=13, alpha=0.46, color=color, linewidths=0)
-                ax.plot(ln["dist_from_train"], ln["value"], color=color, linewidth=2.0, label=METHOD_LABELS[method])
-                if np.any(ln["se"] > 0):
-                    ax.fill_between(
-                        ln["dist_from_train"].to_numpy(float),
-                        (ln["value"] - ln["se"]).to_numpy(float),
-                        (ln["value"] + ln["se"]).to_numpy(float),
-                        color=color,
-                        alpha=0.14,
-                        linewidth=0,
-                    )
-            ax.set_title(DEM_LABELS[dem], fontsize=11, weight="bold")
-            ax.set_ylabel(label, labelpad=8)
-            ax.set_ylim(*bounded_ylim(dpoints["value"]))
-            ax.grid(True, color="#D4D9DE", linewidth=0.55)
-            ax.spines[["top", "right"]].set_visible(False)
-            if row == len(metrics) - 1:
-                ax.set_xlabel("Distance from training population centroid")
+                gg = cm.groupby("ancestry_bin").value.mean().reset_index()
+                gg["xb"] = range(len(gg))
+                ax.plot(gg["xb"], gg["value"], "o-", color=WONG[m], label=MLAB[m], ms=4, lw=1.5)
+            ax.axhline(0, c="k", lw=0.8, ls="--")
+            ax.set_title(f"{DEMLAB[d]} — {PHLAB[p]}", fontsize=10)
+            ax.set_xlabel("distance-from-training quantile bin")
+            ax.set_ylabel("BSS")
+            ax.grid(alpha=0.25)
+            for s in ("top", "right"):
+                ax.spines[s].set_visible(False)
+        axes[0, 0].legend(frameon=False, fontsize=7.5, loc="best")
+        fig.suptitle("Real P+T PGS — calibration skill (BSS) vs genetic distance from the training population",
+                     fontsize=12, weight="bold", y=1.0)
+        plt.tight_layout()
+        fig.savefig(FIG / "bss_vs_distance.png", dpi=140, bbox_inches="tight")
+        plt.close(fig)
+        print("wrote bss_vs_distance.png")
 
-    handles, labels = axes[0, 0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="lower center", ncol=3, frameon=False)
-    fig.suptitle(title, x=0.03, y=0.995, ha="left", fontsize=15, weight="bold")
-    fig.text(
-        0.03,
-        0.965,
-        "Real P+T PGS; phenotype has deme-varying environmental baseline risk plus genetic risk. Points are seed/bin values; lines are means.",
-        ha="left",
-        va="top",
-        fontsize=10,
-        color="#4D5358",
-    )
-    fig.tight_layout(rect=(0, 0.055, 1, 0.94))
-    output.parent.mkdir(parents=True, exist_ok=True)
-    save_opaque_png(fig, output)
+    # 4) Murphy reliability / resolution (non-training)
+    fig, ax = plt.subplots(1, 2, figsize=(17, 5.5))
+    _cellbars(ax[0], _cal_valfn(bcal, "reliability", "other_deme"),
+              "reliability (miscalibration, lower better)", "Murphy reliability — non-training", legend=True)
+    _cellbars(ax[1], _cal_valfn(bcal, "resolution", "other_deme"),
+              "resolution (higher better)", "Murphy resolution — non-training")
+    fig.suptitle("Real P+T PGS — Murphy decomposition of the Brier score (non-training ancestries)",
+                 fontsize=12, weight="bold", y=1.0)
+    plt.tight_layout()
+    fig.savefig(FIG / "murphy.png", dpi=140, bbox_inches="tight")
     plt.close(fig)
-
-
-def fit_gamfit_smoother(train: pd.DataFrame, grid: pd.DataFrame) -> pd.DataFrame:
-    import gamfit
-
-    model = gamfit.fit(train, "value ~ matern(distance, centers=20)", family="gaussian")
-    pred = model.predict(grid)
-    if isinstance(pred, pd.DataFrame):
-        if "mean" not in pred.columns:
-            raise ValueError(f"gamfit smoother prediction lacks mean column: {list(pred.columns)}")
-        out = pd.DataFrame({"distance": grid["distance"].to_numpy(float), "mean": pred["mean"].to_numpy(float)})
-        lower_cols = [c for c in pred.columns if c.lower() in {"lower", "lo", "lwr", "q025", "p025"}]
-        upper_cols = [c for c in pred.columns if c.lower() in {"upper", "hi", "upr", "q975", "p975"}]
-        if lower_cols and upper_cols:
-            out["lower"] = pred[lower_cols[0]].to_numpy(float)
-            out["upper"] = pred[upper_cols[0]].to_numpy(float)
-        return out
-    arr = np.asarray(pred, dtype=float)
-    if arr.ndim != 1:
-        raise ValueError(f"unexpected gamfit smoother prediction shape {arr.shape}")
-    return pd.DataFrame({"distance": grid["distance"].to_numpy(float), "mean": arr})
-
-
-def plot_individual_error_gamfit(output: Path) -> None:
-    indiv_path = RESULTS_DIR / "individual_errors_realpt_binary.csv"
-    if not indiv_path.exists():
-        raise FileNotFoundError(indiv_path)
-    df = pd.read_csv(indiv_path)
-    df = df[(df["pgs_mode"] == "realpt") & (df["pheno"] == PHENO) & (df["method"].isin(METHOD_LABELS))]
-    if df.empty:
-        raise ValueError("no real-P+T individual errors for phenoA")
-    df["value"] = np.abs(df["p_hat"] - df["p_true"])
-
-    # Fit smoothers to raw individual errors, but draw deterministic raw points
-    # subsampled only for rendering density.
-    fig, axes = plt.subplots(1, 2, figsize=(12.4, 4.8), sharey=False)
-    fig.patch.set_facecolor("white")
-    for ax, dem in zip(axes, ["serial1d", "grid2d"]):
-        ax.set_facecolor("white")
-        dem_df = df[df["dem"] == dem]
-        for method in METHOD_LABELS:
-            sub = dem_df[dem_df["method"] == method][["dist_from_train", "value"]].rename(
-                columns={"dist_from_train": "distance"}
-            )
-            if sub.empty:
-                continue
-            color = METHOD_COLORS[method]
-            raw = sub
-            if len(raw) > 8000:
-                raw = raw.sample(n=8000, random_state=20260604)
-            ax.scatter(raw["distance"], raw["value"], s=4, alpha=0.08, color=color, linewidths=0)
-            grid = pd.DataFrame({"distance": np.linspace(sub["distance"].min(), sub["distance"].max(), 160)})
-            smooth = fit_gamfit_smoother(sub, grid)
-            ax.plot(smooth["distance"], smooth["mean"], color=color, linewidth=2.1, label=METHOD_LABELS[method])
-            if {"lower", "upper"}.issubset(smooth.columns):
-                ax.fill_between(smooth["distance"], smooth["lower"], smooth["upper"], color=color, alpha=0.14, linewidth=0)
-        ax.set_title(DEM_LABELS[dem], fontsize=11, weight="bold")
-        ax.set_xlabel("Distance from training population centroid")
-        ax.set_ylabel("|p_hat - p_true|")
-        ax.set_ylim(*bounded_ylim(dem_df["value"]))
-        ax.grid(True, color="#D4D9DE", linewidth=0.55)
-        ax.spines[["top", "right"]].set_visible(False)
-    handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="lower center", ncol=3, frameon=False)
-    fig.suptitle("Real P+T: individual absolute risk error with gamfit smooths", x=0.03, ha="left", fontsize=15, weight="bold")
-    fig.text(
-        0.03,
-        0.925,
-        "Deme-varying environmental baseline risk plus genetic risk. Raw points are held-out test individuals; smooths are fit with gamfit.",
-        ha="left",
-        va="top",
-        fontsize=10,
-        color="#4D5358",
-    )
-    fig.tight_layout(rect=(0, 0.08, 1, 0.88))
-    output.parent.mkdir(parents=True, exist_ok=True)
-    save_opaque_png(fig, output)
-    plt.close(fig)
-
-
-def main() -> None:
-    import argparse
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--run-tag", default="", help="output subdir for sweep isolation")
-    args = ap.parse_args()
-    global RESULTS_DIR, PLOTS_DIR
-    if args.run_tag:
-        base = REPO_ROOT / "sims" / "results_hpc" / "ancestry_calibration" / args.run_tag
-        RESULTS_DIR = base / "results"
-        PLOTS_DIR = base / "plots"
-    PLOTS_DIR.mkdir(parents=True, exist_ok=True)
-    plot_group_metrics(
-        [
-            ("auc", "AUC"),
-            ("liability_pseudo_r2", "Liability pseudo-R2"),
-            ("bss", "Brier Skill Score (BSS)"),
-        ],
-        PLOTS_DIR / "figure2a_distance_discrimination.png",
-        "Figure 2a: distance-bin discrimination metrics",
-    )
-    plot_group_metrics(
-        [
-            ("abs_prevalence_error", "Abs. prevalence error"),
-            ("mae_true_risk", "MAE vs known true risk"),
-        ],
-        PLOTS_DIR / "figure2a_distance_calibration_truth.png",
-        "Figure 2a: distance-bin calibration metrics vs known truth",
-    )
-    plot_individual_error_gamfit(PLOTS_DIR / "figure2b_individual_error_gamfit_smooth.png")
-    print(f"wrote plots under {PLOTS_DIR}")
+    print("wrote murphy.png")
+    print("PLOT_DONE")
 
 
 if __name__ == "__main__":
