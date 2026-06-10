@@ -7,7 +7,8 @@ name = "gnomon-pgs"
 version = "0.1.0"
 description = "Python bindings for SauersML/gnomon (high-performance polygenic score engine)."
 readme = "README.md"
-license = { text = "AGPL-3.0-or-later" }
+license = "AGPL-3.0-or-later"
+license-files = ["LICENSE"]
 authors = [{ name = "SauersML" }]
 requires-python = ">=3.9"
 dependencies = []
