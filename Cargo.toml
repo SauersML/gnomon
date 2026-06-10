@@ -8,6 +8,7 @@ description = "A high-performance engine for polygenic scores."
 repository = "https://github.com/SauersML/gnomon/"
 keywords = ["bioinformatics", "genomics"]
 categories = ["science"]
+license = "AGPL-3.0-or-later"
 build = "shared/build.rs"
 
 [lib]
