@@ -67,12 +67,12 @@ jobs:
             --release
             --strip
             --out dist
-            --manifest-path python/pyproject.toml
+          working-directory: python
           manylinux: auto
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-linux-${{ matrix.platform.target }}
-          path: dist/*.whl
+          path: python/dist/*.whl
           if-no-files-found: error
 
   macos:
@@ -98,11 +98,11 @@ jobs:
             --release
             --strip
             --out dist
-            --manifest-path python/pyproject.toml
+          working-directory: python
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-macos-${{ matrix.platform.target }}
-          path: dist/*.whl
+          path: python/dist/*.whl
           if-no-files-found: error
 
   sdist:
@@ -116,11 +116,12 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           command: sdist
-          args: --out dist --manifest-path python/pyproject.toml
+          args: --out dist
+          working-directory: python
       - uses: actions/upload-artifact@v4
         with:
           name: sdist
-          path: dist/*.tar.gz
+          path: python/dist/*.tar.gz
           if-no-files-found: error
 
   release:
