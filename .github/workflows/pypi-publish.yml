@@ -42,6 +42,9 @@ env:
   CARGO_NET_RETRY: "10"
   CARGO_TERM_COLOR: always
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  # build.rs runs a "manual lint self-check" that needs a `grep` extern artifact
+  # and fails in the maturin/cross build; the release workflow skips it too.
+  GNOMON_SKIP_LINT_CHECKS: "1"
   # Wheels must be portable: override .cargo/config.toml's `target-cpu=native`
   # (which builds for the CI runner's CPU only and makes cpufeatures-using
   # crates panic at const-eval on macOS arm64). An explicit RUSTFLAGS env wins
