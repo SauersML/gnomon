@@ -914,29 +914,31 @@ section CostEffectiveness
     Condition (1) is a standard, independently meaningful epidemiological
     criterion (PPV > 50%), not a restatement of the conclusion. -/
 theorem qaly_gain_positive_condition
-    (sens spec π benefit harm : ℝ)
+    (m : LiabilityThresholdModel)
+    (T' μ_control r2 π benefit harm : ℝ)
+    (_h_r2 : 0 ≤ r2) (_h_r2_1 : r2 ≤ 1)
     (h_π : 0 < π) (h_π1 : π < 1)
-    (h_sens : 0 < sens) (h_sens1 : sens ≤ 1)
-    (h_spec : 0 < spec) (h_spec1 : spec < 1)
     (h_benefit : 0 < benefit) (h_harm : 0 < harm)
+    (_h_sens : 0 < sensFromR2 m r2 T') (_h_sens1 : sensFromR2 m r2 T' ≤ 1)
+    (_h_spec : 0 < specFromR2 m r2 T' μ_control) (_h_spec1 : specFromR2 m r2 T' μ_control < 1)
     -- True positive probability exceeds false positive probability
     -- (equivalent to positive predictive value > 50%, or LR+ × prevalence odds > 1)
-    (h_tp_dominates : (1 - spec) * (1 - π) < sens * π)
+    (h_tp_dominates : (1 - specFromR2 m r2 T' μ_control) * (1 - π) < sensFromR2 m r2 T' * π)
     -- Treatment benefit exceeds harm
     (h_bh : harm ≤ benefit) :
-    0 < screeningQalyGain sens spec π benefit harm := by
+    0 < screeningQalyGain (sensFromR2 m r2 T') (specFromR2 m r2 T' μ_control) π benefit harm := by
   rw [screeningQalyGain_eq_formula]
-  have h_prob_gap : 0 < sens * π - (1 - spec) * (1 - π) := by
+  have h_prob_gap : 0 < sensFromR2 m r2 T' * π - (1 - specFromR2 m r2 T' μ_control) * (1 - π) := by
     nlinarith
-  have h_lower_pos : 0 < harm * (sens * π - (1 - spec) * (1 - π)) := by
+  have h_lower_pos : 0 < harm * (sensFromR2 m r2 T' * π - (1 - specFromR2 m r2 T' μ_control) * (1 - π)) := by
     exact mul_pos h_harm h_prob_gap
-  have h_weight_nonneg : 0 ≤ sens * π := by
+  have h_weight_nonneg : 0 ≤ sensFromR2 m r2 T' * π := by
     positivity
   have h_lower_le :
-      harm * (sens * π - (1 - spec) * (1 - π)) ≤
-        screeningQalyGain sens spec π benefit harm := by
+      harm * (sensFromR2 m r2 T' * π - (1 - specFromR2 m r2 T' μ_control) * (1 - π)) ≤
+        screeningQalyGain (sensFromR2 m r2 T') (specFromR2 m r2 T' μ_control) π benefit harm := by
     rw [screeningQalyGain_eq_formula]
-    have h_gain_term_nonneg : 0 ≤ sens * π * (benefit - harm) := by
+    have h_gain_term_nonneg : 0 ≤ sensFromR2 m r2 T' * π * (benefit - harm) := by
       nlinarith
     nlinarith
   exact lt_of_lt_of_le h_lower_pos h_lower_le
@@ -946,19 +948,31 @@ theorem qaly_gain_positive_condition
     (lower specificity), QALY gain is strictly reduced.  Derived from qalyGain:
     the benefit term shrinks (lower sens) and the harm term grows (lower spec). -/
 theorem lower_portability_lower_cost_effectiveness
-    (sens_s spec_s sens_t spec_t π benefit harm : ℝ)
-    (h_sens : sens_t < sens_s) (h_spec : spec_t < spec_s)
+    (m : LiabilityThresholdModel)
+    (T' μ_control r2_s r2_t π benefit harm : ℝ)
+    (h_r2_t : 0 ≤ r2_t)
+    (h_r2_s : r2_s ≤ 1)
+    (h_r2_gap : r2_t < r2_s)
+    (hPhi_mono : StrictMono Phi)
+    (hμ_control_neg : μ_control < 0)
+    (h_sens_num_nonneg : 0 ≤ Real.sqrt r2_t * Real.sqrt m.h_sq * m.case_mean - T')
+    (h_spec_num_nonneg : 0 ≤ T' - Real.sqrt r2_t * Real.sqrt m.h_sq * μ_control)
     (h_π : 0 < π) (h_π1 : π < 1)
     (h_benefit : 0 < benefit) (h_harm : 0 < harm)
-    (h_sens_t : 0 ≤ sens_t) (h_spec_t : 0 ≤ spec_t)
-    (h_spec_s1 : spec_s ≤ 1) :
-    screeningQalyGain sens_t spec_t π benefit harm <
-      screeningQalyGain sens_s spec_s π benefit harm := by
+    (h_sens_t : 0 ≤ sensFromR2 m r2_t T')
+    (h_spec_t : 0 ≤ specFromR2 m r2_t T' μ_control)
+    (h_spec_s1 : specFromR2 m r2_s T' μ_control ≤ 1) :
+    screeningQalyGain (sensFromR2 m r2_t T') (specFromR2 m r2_t T' μ_control) π benefit harm <
+      screeningQalyGain (sensFromR2 m r2_s T') (specFromR2 m r2_s T' μ_control) π benefit harm := by
   repeat rw [screeningQalyGain_eq_formula]
-  have h1 : sens_t * π * benefit < sens_s * π * benefit := by
+  have h_sens : sensFromR2 m r2_t T' < sensFromR2 m r2_s T' := by
+    exact sensFromR2_strictMono m T' r2_t r2_s hPhi_mono h_r2_t h_r2_s h_r2_gap h_sens_num_nonneg
+  have h_spec : specFromR2 m r2_t T' μ_control < specFromR2 m r2_s T' μ_control := by
+    exact specFromR2_strictMono m T' μ_control r2_t r2_s hPhi_mono hμ_control_neg h_r2_t h_r2_s h_r2_gap h_spec_num_nonneg
+  have h1 : sensFromR2 m r2_t T' * π * benefit < sensFromR2 m r2_s T' * π * benefit := by
     apply mul_lt_mul_of_pos_right _ h_benefit
     exact mul_lt_mul_of_pos_right h_sens h_π
-  have h2 : (1 - spec_s) * (1 - π) * harm < (1 - spec_t) * (1 - π) * harm := by
+  have h2 : (1 - specFromR2 m r2_s T' μ_control) * (1 - π) * harm < (1 - specFromR2 m r2_t T' μ_control) * (1 - π) * harm := by
     apply mul_lt_mul_of_pos_right _ h_harm
     apply mul_lt_mul_of_pos_right _ (by linarith)
     linarith
@@ -996,15 +1010,25 @@ noncomputable def numberNeededToScreen (sens π : ℝ) : ℝ :=
 
 /-- NNS is higher in the target population. -/
 theorem nns_higher_in_target
-    (sens_s sens_t π : ℝ)
-    (h_sens_s : 0 < sens_s) (h_sens_t : 0 < sens_t)
+    (m : LiabilityThresholdModel)
+    (T' μ_control r2_s r2_t π : ℝ)
+    (h_r2_t : 0 ≤ r2_t)
+    (h_r2_s : r2_s ≤ 1)
+    (h_r2_gap : r2_t < r2_s)
+    (hPhi_mono : StrictMono Phi)
+    (_hμ_control_neg : μ_control < 0)
+    (h_sens_num_nonneg : 0 ≤ Real.sqrt r2_t * Real.sqrt m.h_sq * m.case_mean - T')
+    (_h_spec_num_nonneg : 0 ≤ T' - Real.sqrt r2_t * Real.sqrt m.h_sq * μ_control)
     (h_π : 0 < π)
-    (h_lower : sens_t < sens_s) :
-    numberNeededToScreen sens_s π < numberNeededToScreen sens_t π := by
+    (h_sens_t_pos : 0 < sensFromR2 m r2_t T') :
+    numberNeededToScreen (sensFromR2 m r2_s T') π < numberNeededToScreen (sensFromR2 m r2_t T') π := by
+  have h_sens : sensFromR2 m r2_t T' < sensFromR2 m r2_s T' := by
+    exact sensFromR2_strictMono m T' r2_t r2_s hPhi_mono h_r2_t h_r2_s h_r2_gap h_sens_num_nonneg
+  have h_sens_s_pos : 0 < sensFromR2 m r2_s T' := lt_trans h_sens_t_pos h_sens
   unfold numberNeededToScreen
   apply div_lt_div_of_pos_left one_pos
-  · exact mul_pos h_sens_t h_π
-  · exact mul_lt_mul_of_pos_right h_lower h_π
+  · exact mul_pos h_sens_t_pos h_π
+  · exact mul_lt_mul_of_pos_right h_sens h_π
 
 /-- **Population Attributable Fraction (PAF) from PGS-guided intervention.**
     PAF = P(disease | high risk) × P(high risk) × (1 - 1/RR)
@@ -1060,15 +1084,23 @@ section Recommendations
     if diversification raises target sensitivity from sens_t to sens_t',
     then NNS strictly decreases in the target population. -/
 theorem diversification_is_optimal_equity_intervention
-    (sens_t sens_t' π : ℝ)
-    (h_sens_t : 0 < sens_t) (h_sens_t' : 0 < sens_t')
+    (m : LiabilityThresholdModel)
+    (T' r2_t r2_t_new π : ℝ)
+    (h_r2_t : 0 ≤ r2_t)
+    (h_r2_t_new : r2_t_new ≤ 1)
+    (hPhi_mono : StrictMono Phi)
+    (h_sens_num_nonneg : 0 ≤ Real.sqrt r2_t * Real.sqrt m.h_sq * m.case_mean - T')
     (h_π : 0 < π)
-    (h_improves : sens_t < sens_t') :
-    numberNeededToScreen sens_t' π < numberNeededToScreen sens_t π := by
+    (h_improves : r2_t < r2_t_new)
+    (h_sens_t_pos : 0 < sensFromR2 m r2_t T') :
+    numberNeededToScreen (sensFromR2 m r2_t_new T') π < numberNeededToScreen (sensFromR2 m r2_t T') π := by
+  have h_sens : sensFromR2 m r2_t T' < sensFromR2 m r2_t_new T' := by
+    exact sensFromR2_strictMono m T' r2_t r2_t_new hPhi_mono h_r2_t h_r2_t_new h_improves h_sens_num_nonneg
+  have h_sens_t_new_pos : 0 < sensFromR2 m r2_t_new T' := lt_trans h_sens_t_pos h_sens
   unfold numberNeededToScreen
   apply div_lt_div_of_pos_left one_pos
-  · exact mul_pos h_sens_t h_π
-  · exact mul_lt_mul_of_pos_right h_improves h_π
+  · exact mul_pos h_sens_t_pos h_π
+  · exact mul_lt_mul_of_pos_right h_sens h_π
 
 /-- **Marginal value of diverse samples is highest for underserved populations.**
     If the underserved population has lower current sensitivity (sens_under < sens_served),
@@ -1080,42 +1112,56 @@ theorem diversification_is_optimal_equity_intervention
     scales with Δsens * π * benefit which is the same — but we prove a stronger
     structural result: the NNS improvement ratio is larger. -/
 theorem marginal_value_highest_for_underserved
-    (sens_under sens_served Δsens π : ℝ)
-    (h_under : 0 < sens_under) (h_served : 0 < sens_served)
-    (h_gap : sens_under < sens_served)
-    (h_Δ : 0 < Δsens)
-    (h_π : 0 < π) :
-    -- NNS improvement (old NNS - new NNS) is larger for the underserved population.
-    -- NNS = 1/(sens*π), so ΔNNS = 1/(sens*π) - 1/((sens+Δsens)*π)
-    -- = Δsens / (sens*(sens+Δsens)*π)
-    -- This is decreasing in sens, so underserved (lower sens) gets more improvement.
-    numberNeededToScreen sens_under π - numberNeededToScreen (sens_under + Δsens) π >
-    numberNeededToScreen sens_served π - numberNeededToScreen (sens_served + Δsens) π := by
+    (m : LiabilityThresholdModel)
+    (T' r2_under r2_served r2_under_new r2_served_new π : ℝ)
+    (h_r2_under : 0 ≤ r2_under) (h_r2_under_new : r2_under_new ≤ 1)
+    (h_r2_served : 0 ≤ r2_served) (h_r2_served_new : r2_served_new ≤ 1)
+    (hPhi_mono : StrictMono Phi)
+    (h_sens_num_nonneg_u : 0 ≤ Real.sqrt r2_under * Real.sqrt m.h_sq * m.case_mean - T')
+    (h_sens_num_nonneg_s : 0 ≤ Real.sqrt r2_served * Real.sqrt m.h_sq * m.case_mean - T')
+    (h_under_lt_served : r2_under < r2_served)
+    (h_under_improves : r2_under < r2_under_new)
+    (h_served_improves : r2_served < r2_served_new)
+    (h_equal_sens_gain : sensFromR2 m r2_under_new T' - sensFromR2 m r2_under T' =
+                         sensFromR2 m r2_served_new T' - sensFromR2 m r2_served T')
+    (h_π : 0 < π)
+    (h_sens_under_pos : 0 < sensFromR2 m r2_under T') :
+    numberNeededToScreen (sensFromR2 m r2_under T') π - numberNeededToScreen (sensFromR2 m r2_under_new T') π >
+    numberNeededToScreen (sensFromR2 m r2_served T') π - numberNeededToScreen (sensFromR2 m r2_served_new T') π := by
+  have h_sens_under_lt_served : sensFromR2 m r2_under T' < sensFromR2 m r2_served T' := by
+    have h_r2_served_le : r2_served ≤ 1 := by linarith
+    exact sensFromR2_strictMono m T' r2_under r2_served hPhi_mono h_r2_under h_r2_served_le h_under_lt_served h_sens_num_nonneg_u
+  have h_Δsens_pos : 0 < sensFromR2 m r2_under_new T' - sensFromR2 m r2_under T' := by
+    have h_u_lt_un : sensFromR2 m r2_under T' < sensFromR2 m r2_under_new T' := by
+      exact sensFromR2_strictMono m T' r2_under r2_under_new hPhi_mono h_r2_under h_r2_under_new h_under_improves h_sens_num_nonneg_u
+    linarith
+  have h_served_pos : 0 < sensFromR2 m r2_served T' := lt_trans h_sens_under_pos h_sens_under_lt_served
+  let Δsens := sensFromR2 m r2_under_new T' - sensFromR2 m r2_under T'
+  have h_under_new_eq : sensFromR2 m r2_under_new T' = sensFromR2 m r2_under T' + Δsens := by linarith
+  have h_served_new_eq : sensFromR2 m r2_served_new T' = sensFromR2 m r2_served T' + Δsens := by linarith
+  rw [h_under_new_eq, h_served_new_eq]
   unfold numberNeededToScreen
-  -- NNS(s) - NNS(s+Δ) = 1/(s*π) - 1/((s+Δ)*π) = Δ*π / (s*π * (s+Δ)*π)
-  -- = Δ / (s*(s+Δ)*π)
-  -- This is decreasing in s, so underserved (lower s) gets more NNS reduction.
-  have h_su_pos : 0 < sens_under + Δsens := by linarith
-  have h_ss_pos : 0 < sens_served + Δsens := by linarith
-  have hd_u : 0 < sens_under * π := mul_pos h_under h_π
-  have hd_su : 0 < (sens_under + Δsens) * π := mul_pos h_su_pos h_π
-  have hd_s : 0 < sens_served * π := mul_pos h_served h_π
-  have hd_ss : 0 < (sens_served + Δsens) * π := mul_pos h_ss_pos h_π
+  have h_su_pos : 0 < sensFromR2 m r2_under T' + Δsens := by linarith
+  have h_ss_pos : 0 < sensFromR2 m r2_served T' + Δsens := by linarith
+  have hd_u : 0 < sensFromR2 m r2_under T' * π := mul_pos h_sens_under_pos h_π
+  have hd_su : 0 < (sensFromR2 m r2_under T' + Δsens) * π := mul_pos h_su_pos h_π
+  have hd_s : 0 < sensFromR2 m r2_served T' * π := mul_pos h_served_pos h_π
+  have hd_ss : 0 < (sensFromR2 m r2_served T' + Δsens) * π := mul_pos h_ss_pos h_π
   rw [div_sub_div _ _ (ne_of_gt hd_u) (ne_of_gt hd_su),
       div_sub_div _ _ (ne_of_gt hd_s) (ne_of_gt hd_ss)]
   rw [gt_iff_lt]
   have h_num_under :
-      1 * ((sens_under + Δsens) * π) - sens_under * π * 1 = Δsens * π := by ring
+      1 * ((sensFromR2 m r2_under T' + Δsens) * π) - sensFromR2 m r2_under T' * π * 1 = Δsens * π := by ring
   have h_num_served :
-      1 * ((sens_served + Δsens) * π) - sens_served * π * 1 = Δsens * π := by ring
+      1 * ((sensFromR2 m r2_served T' + Δsens) * π) - sensFromR2 m r2_served T' * π * 1 = Δsens * π := by ring
   rw [h_num_served, h_num_under]
   have h_prod_lt :
-      sens_under * (sens_under + Δsens) <
-        sens_served * (sens_served + Δsens) := by
+      sensFromR2 m r2_under T' * (sensFromR2 m r2_under T' + Δsens) <
+        sensFromR2 m r2_served T' * (sensFromR2 m r2_served T' + Δsens) := by
     nlinarith
   have h_den_lt :
-      sens_under * π * ((sens_under + Δsens) * π) <
-        sens_served * π * ((sens_served + Δsens) * π) := by
+      sensFromR2 m r2_under T' * π * ((sensFromR2 m r2_under T' + Δsens) * π) <
+        sensFromR2 m r2_served T' * π * ((sensFromR2 m r2_served T' + Δsens) * π) := by
     nlinarith [h_prod_lt, sq_pos_of_pos h_π]
   exact div_lt_div_of_pos_left (show 0 < Δsens * π by positivity) (mul_pos hd_u hd_su) h_den_lt
 
@@ -1125,15 +1171,17 @@ theorem marginal_value_highest_for_underserved
     (more harm than benefit from screening).  This connects the R² gap
     to a concrete clinical consequence via the qalyGain definition. -/
 theorem minimum_sample_for_clinical_pgs
-    (sens spec π benefit harm : ℝ)
+    (m : LiabilityThresholdModel)
+    (T' μ_control r2 π benefit harm : ℝ)
+    (h_r2 : 0 ≤ r2) (h_r2_1 : r2 ≤ 1)
     (h_π : 0 < π) (h_π1 : π < 1)
     (h_benefit : 0 < benefit) (h_harm : 0 < harm)
-    (h_sens : 0 ≤ sens) (h_sens1 : sens ≤ 1)
-    (h_spec : 0 ≤ spec) (h_spec1 : spec ≤ 1)
+    (h_sens : 0 ≤ sensFromR2 m r2 T') (h_sens1 : sensFromR2 m r2 T' ≤ 1)
+    (h_spec : 0 ≤ specFromR2 m r2 T' μ_control) (h_spec1 : specFromR2 m r2 T' μ_control ≤ 1)
     -- The key clinical condition: discrimination is too poor, so
     -- false positive harm exceeds true positive benefit
-    (h_poor_disc : sens * π * benefit < (1 - spec) * (1 - π) * harm) :
-    screeningQalyGain sens spec π benefit harm < 0 := by
+    (h_poor_disc : sensFromR2 m r2 T' * π * benefit < (1 - specFromR2 m r2 T' μ_control) * (1 - π) * harm) :
+    screeningQalyGain (sensFromR2 m r2 T') (specFromR2 m r2 T' μ_control) π benefit harm < 0 := by
   rw [screeningQalyGain_eq_formula]
   linarith
 
