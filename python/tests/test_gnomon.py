@@ -26,9 +26,13 @@ from gnomon import (
     locate_binary,
     read_sscore,
     run_all,
-    score,
-    terms,
 )
+
+# These tests exercise the typed *subprocess* wrappers (they drive a fake
+# `gnomon` binary via the `binary=` kwarg). The top-level ``gnomon.score`` /
+# ``gnomon.terms`` names now bind to the native in-process extension when it is
+# built, so target the subprocess implementations explicitly here.
+from gnomon._api import score, terms
 import gnomon.map as gnomon_map
 import gnomon.calibrate as gnomon_calibrate
 

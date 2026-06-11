@@ -12,6 +12,10 @@ build = "shared/build.rs"
 
 [lib]
 path = "shared/lib.rs"
+# `rlib` keeps the `[[bin]]` targets and any Rust consumers building against the
+# library; `cdylib` produces the loadable Python extension module built by
+# maturin/PyO3 when the `python` feature is enabled.
+crate-type = ["cdylib", "rlib"]
 
 [[bin]]
 name = "gnomon"
@@ -45,6 +49,10 @@ score = []
 terms = []
 calibrate = ["dep:gam", "dep:polars"]
 bench-path = []
+# In-process Python bindings (PyO3). Pulls in the same `score`/`map`/`terms`
+# entry points the CLI uses and exposes them through a `#[pymodule]`. Built by
+# maturin into the `cdylib` to give `import gnomon` a native, in-process core.
+python = ["dep:pyo3", "score", "map", "terms"]
 
 [dependencies]
 gam = { version = "0.2.1", optional = true }
@@ -98,6 +106,11 @@ infer_sex = "0.1.0"
 convert_genome = { git = "https://github.com/SauersML/convert_genome", rev = "2648e850db4bd0fcc48cd53c075536bd161f6757" }
 
 planus = "=1.1.1" # cf. https://github.com/pola-rs/polars/issues/24208
+
+# PyO3 backs the in-process Python extension module (the `python` feature).
+# `extension-module` keeps the cdylib from linking libpython (manylinux/abi3),
+# and `abi3-py39` builds a single stable-ABI wheel usable on Python >= 3.9.
+pyo3 = { version = "0.26", features = ["extension-module", "abi3-py39"], optional = true }
 
 [profile.release]
 opt-level = 3
