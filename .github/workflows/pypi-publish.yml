@@ -42,12 +42,17 @@ env:
   CARGO_NET_RETRY: "10"
   CARGO_TERM_COLOR: always
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  # Wheels must be portable: override .cargo/config.toml's `target-cpu=native`
+  # (which builds for the CI runner's CPU only and makes cpufeatures-using
+  # crates panic at const-eval on macOS arm64). An explicit RUSTFLAGS env wins
+  # over .cargo/config [build].rustflags.
+  RUSTFLAGS: "-C strip=symbols"
 
 jobs:
   linux:
     runs-on: ${{ matrix.platform.runner }}
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
         platform:
           - { runner: ubuntu-24.04,     target: x86_64 }
@@ -69,6 +74,11 @@ jobs:
             --out dist
           working-directory: python
           manylinux: auto
+          # manylinux container lacks openssl headers; a transitive reqwest
+          # native-tls pull needs them to build openssl-sys.
+          before-script-linux: |
+            (command -v yum && yum install -y openssl-devel pkgconfig perl-core) || \
+            (command -v apt-get && apt-get update && apt-get install -y libssl-dev pkg-config) || true
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-linux-${{ matrix.platform.target }}
@@ -78,7 +88,7 @@ jobs:
   macos:
     runs-on: ${{ matrix.platform.runner }}
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
         platform:
           - { runner: macos-15-intel, target: x86_64 }
