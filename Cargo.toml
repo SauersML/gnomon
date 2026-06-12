@@ -170,3 +170,9 @@ required-features = ["score"]
 # Run tests at release optimization level for maximum speed
 [profile.test]
 opt-level = 3            # Same as release - maximum speed for numerical tests
+
+# A transitive reqwest pulls native-tls -> openssl-sys. On Linux (manylinux
+# wheel builds) there is no system libssl, so force a vendored/static OpenSSL
+# build via feature unification. Linux-only so macOS/Windows are unaffected.
+[target.'cfg(target_os = "linux")'.dependencies]
+openssl = { version = "0.10", features = ["vendored"] }
