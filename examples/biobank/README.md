@@ -20,7 +20,7 @@ the run:
 
 1. Resolves each disease to its SNOMED standard Condition concept and pulls every
    person whose `condition_occurrence` descends from it via `concept_ancestor`.
-2. Fits a marginal-slope GAM — `duchon(PC1..PC{NUM_PCS}) + sex` with the disease's
+2. Fits a marginal-slope GAM — `mjs(PC1..PC{NUM_PCS}) + sex` with the disease's
    PGS feeding the latent slope channel — in both a survival
    (`Surv(entry_age, exit_age, event)`) and a binary formulation.
 3. Compares against `Z_norm2` and raw-PRS + PC baselines (Cox PH / logistic) on the
@@ -58,6 +58,6 @@ Run from inside the All of Us workbench (or any environment with the controlled 
 ## Configuration
 
 The fit knobs live at the top of `marginal_slope_diseases.py`
-(`NUM_PCS`, `DUCHON_CENTERS`, `TRAIN_FRACTION`, `RNG_SEED`, `TOP_N_DISEASES`,
+(`NUM_PCS`, `MJS_CENTERS`, `TRAIN_FRACTION`, `RNG_SEED`, `TOP_N_DISEASES`,
 `SNOMED_PGS_MAP`, `LOSO_AXES`). `run.sh` echoes the active values into the log
 header at the start of every run.

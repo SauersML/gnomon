@@ -6,9 +6,9 @@ For each disease the script:
      OMOP/OHDSI `concept` table on the AoU CDR.
   2. Pulls everyone whose `condition_occurrence.condition_concept_id`
      descends from that concept via `concept_ancestor`.
-  3. Fits `Surv(entry_age, exit_age, event) ~ duchon(PC1..PC3) + sex`
+  3. Fits `Surv(entry_age, exit_age, event) ~ mjs(PC1..PC3) + sex`
      with the hard-coded PGS feeding the marginal-slope latent z and the same
-     isotropic Duchon smooth on the log-slope channel. No `linkwiggle()` on
+     measure-jet smooth on the log-slope channel. No `linkwiggle()` on
      either channel (link-deviation / score-warp both hang, SauersML/gam#683).
   4. Compares against Z_norm2 and raw-PRS+PC Cox PH baselines on the same split.
   5. Runs leave-one-group-out OOD refits by care site, Census region, and
@@ -290,7 +290,7 @@ PLINK_PREFIX = find_plink_prefix()
 WORKDIR = PLINK_PREFIX.parent
 FITS_DIR = WORKDIR / "biobank_fits"
 NUM_PCS = 3
-DUCHON_CENTERS = 20  # > linear nullspace (d+1=4) in d=3
+MJS_CENTERS = 20
 TRAIN_FRACTION = 0.80  # per-class 80/20 split
 RNG_SEED = 0
 MAX_LOSO_CARE_SITES = 5
@@ -1324,47 +1324,22 @@ def print_fit_frame_diagnostics(df: pd.DataFrame, label: str) -> None:
             print(f"  fit_frame[{label}].{col}: dtype={dtype} null={nulls} top={top}")
 
 
-def pc_duchon_term(num_pcs: int) -> str:
+def pc_mjs_term(num_pcs: int) -> str:
     pcs = ", ".join(f"PC{i+1}" for i in range(num_pcs))
-    # Pure isotropic scale-free Duchon over the leading PCs. Both
-    # `length_scale` and `scale_dims` are omitted on purpose:
-    #
-    # * Omitting `length_scale` selects the polyharmonic spectrum
-    #   `||w||^(2(p+s))` (basis.rs: `pure = length_scale.is_none()`) -- the
-    #   canonical scale-free Duchon, recommended in docs/formulas.md for
-    #   PC-space smoothing.
-    # * Omitting `scale_dims` keeps `aniso_log_scales=None`, i.e. the kernel
-    #   uses the isotropic distance `r = ||x - c||` (basis.rs:1307,2810).
-    #   On the prior run with `scale_dims=true` the optimized per-axis
-    #   kappas landed at 0.88 / 1.04 / 1.09 -- <15% anisotropy, so we're
-    #   giving up almost nothing in expressivity, and we eliminate the
-    #   `build_psi_hyper_coords` / anisotropic-kappa code path where the
-    #   outer BFGS gradient previously exploded (|g| jumped 6 orders of
-    #   magnitude with the objective flat). Outer optimizer dim drops from
-    #   rho_dim+log_kappa_dim = 8+6 = 14 down to 8+0 = 8.
-    #
-    # At dim=NUM_PCS=3, order=1, max_op=2 (stiffness active),
-    # `resolve_duchon_orders` returns (Linear, s=1) -- the CPD gate
-    # `2s < d` is satisfied without escalation, so the polynomial nullspace
-    # stays at d+1 = 4 cols, well below DUCHON_CENTERS.
-    return f"duchon({pcs}, centers={DUCHON_CENTERS}, order=1)"
+    # Measure-jet smooth over the leading PC support. We keep the realized
+    # Gaussian representer length scale fixed so the marginal and log-slope
+    # channels share one stable PC geometry rather than adding a design-moving
+    # length-scale dial to the coupled marginal-slope fit.
+    return f"mjs({pcs}, centers={MJS_CENTERS}, learn_length_scale=false)"
 
 
 def pc_marginal_surface_term_binary(num_pcs: int) -> str:
-    pcs = ", ".join(f"PC{i+1}" for i in range(num_pcs))
-    # Polyharmonic Duchon PC surface, shared by both channels (marginal baseline
-    # risk + prs_z logslope). Scale-free, so it does NOT over-parameterize at
-    # high center counts the way Matern does (gam#755) — it uses the full
-    # DUCHON_CENTERS. The duchon constant collided with the probit intercept
-    # (#531) but that is cleared by orthogonalization, so the audit passes.
-    # NOTE: the BMS outer REML can still fail to converge here (gam#754) — that
-    # is a gam-side bug; Matern does not avoid it either (basis-independent), so
-    # we use the scientifically-preferred Duchon.
-    return f"duchon({pcs}, centers={DUCHON_CENTERS})"
+    # Shared MJS PC surface for baseline risk and prs_z log-slope.
+    return pc_mjs_term(num_pcs)
 
 
 def fit_marginal_slope(train_df: pd.DataFrame, num_pcs: int):  # -> gamfit.Model
-    """Survival marginal-slope GAM with joint Duchon over PCs in both the
+    """Survival marginal-slope GAM with joint MJS over PCs in both the
     baseline hazard surface and the log-slope (log-HR) channel; sex linear;
     prs_z is the latent score (z_column) so its hazard ratio varies in PC space.
     No `linkwiggle()` on either channel: link-deviation and logslope score-warp
@@ -1381,17 +1356,17 @@ def fit_marginal_slope(train_df: pd.DataFrame, num_pcs: int):  # -> gamfit.Model
     or first fit after a gamfit version bump.
     """
     import gamfit  # lazy: lets the linear baseline import this module without dragging gamfit in
-    duchon = pc_duchon_term(num_pcs)
+    pc_surface = pc_mjs_term(num_pcs)
     # No linkwiggle (link-deviation) or logslope linkwiggle (score-warp): both hang
     # bernoulli/survival marginal-slope in the BMS cell-moment path (SauersML/gam#683).
-    logslope_formula = duchon
-    formula = f"Surv(entry_age, exit_age, event) ~ {duchon} + sex"
+    logslope_formula = pc_surface
+    formula = f"Surv(entry_age, exit_age, event) ~ {pc_surface} + sex"
     cols = survival_model_columns(num_pcs)
     model_df = train_df[cols]
     print("  fit_spec: family=survival marginal-slope")
     print(f"  fit_spec: formula={formula!r}")
     print(f"  fit_spec: z_column='prs_z'  logslope_formula={logslope_formula!r}")
-    print(f"  fit_spec: num_pcs={num_pcs}  duchon_centers={DUCHON_CENTERS}  n_train={len(train_df)}")
+    print(f"  fit_spec: num_pcs={num_pcs}  mjs_centers={MJS_CENTERS}  n_train={len(train_df)}")
     print(f"  fit_spec: gamfit={gamfit.__version__}")
     print_fit_frame_diagnostics(model_df, "survival_marginal_slope_train")
     print_cuda_process_diagnostics("  fit_spec:")
@@ -1523,23 +1498,20 @@ def fit_binary_marginal_slope(train_df: pd.DataFrame, num_pcs: int):  # -> gamfi
     nuisance we adjust for, not a quantity we want gamfit to spend REML
     degrees of freedom estimating, and matching the basis makes every
     GAM-vs-baseline delta attributable to PC/PRS treatment alone. PCs
-    enter via `duchon(PCs)` and the `prs_z` log-OR varies as the same
-    `duchon(PCs)` surface (its `logslope_formula`) — matched smooth basis. The
-    duchon constant vs probit intercept (gam#531) is cleared by orthogonalization
-    so the audit passes. No `linkwiggle()` on either channel: link-deviation and
+    enter via `mjs(PCs)` and the `prs_z` log-OR varies as the same
+    `mjs(PCs)` surface (its `logslope_formula`) — matched smooth basis. No
+    `linkwiggle()` on either channel: link-deviation and
     logslope score-warp both hang the BMS cell-moment path (SauersML/gam#683).
     """
     import gamfit  # lazy
 
     age_terms = " + ".join(BASELINE_AGE_FEATURES)
     # Both PC surfaces are SMOOTH and matched: the baseline-risk marginal and the
-    # prs_z log-OR (logslope) share the same polyharmonic duchon PC surface — the
+    # prs_z log-OR (logslope) share the same measure-jet PC surface — the
     # PC-varying PRS effect is the whole point of the marginal-slope model. The
-    # duchon constant vs probit intercept (gam#531) is cleared by
-    # orthogonalization, so the audit passes; no linkwiggle on either channel
-    # (both hang the BMS cell-moment path, gam#683). The BMS outer REML can fail
-    # to converge on this (gam#754) — that is a gam-side bug to fix, NOT a reason
-    # to linearize or down-basis this model.
+    # fixed MJS length scale keeps the coupled marginal/log-slope geometry
+    # stable; no linkwiggle on either channel (both hang the BMS cell-moment
+    # path, gam#683).
     marginal_surface = pc_marginal_surface_term_binary(num_pcs)
     logslope_formula = marginal_surface
     formula = f"event ~ {marginal_surface} + sex + {age_terms}"
@@ -1548,7 +1520,7 @@ def fit_binary_marginal_slope(train_df: pd.DataFrame, num_pcs: int):  # -> gamfi
     print(f"  binary_fit_spec: formula={formula!r}")
     print(f"  binary_fit_spec: z_column='prs_z'  logslope_formula={logslope_formula!r}")
     print(
-        f"  binary_fit_spec: num_pcs={num_pcs}  duchon_centers={DUCHON_CENTERS}  "
+        f"  binary_fit_spec: num_pcs={num_pcs}  mjs_centers={MJS_CENTERS}  "
         f"n_train={len(train_df)}"
     )
     print(f"  binary_fit_spec: gamfit={gamfit.__version__}")
@@ -1633,7 +1605,7 @@ def fit_baseline_cox(
          PRS plus PCs as linear additive Cox covariates.
     Both share `+ sex` with the GAM so no model has an extra free covariate;
     they differ only in how PC structure enters the score. The GAM's
-    `duchon(PC1..PC_NUM_PCS)` is the third, smooth, alternative.
+    `mjs(PC1..PC_NUM_PCS)` is the third, smooth, alternative.
 
     Uses `statsmodels.duration.hazard_regression.PHReg` -- the only fast
     Python Cox PH that natively supports left-truncation via `entry=`.
@@ -2267,7 +2239,7 @@ def save_fit_cache(
     meta = {
         **save_info,
         "num_pcs": len(pc_cols),
-        "duchon_centers": DUCHON_CENTERS,
+        "mjs_centers": MJS_CENTERS,
         "train_fraction": TRAIN_FRACTION,
         "rng_seed": RNG_SEED,
         "pgs_mean": pgs_mean,
@@ -2323,13 +2295,12 @@ def evaluate_binary_model_pair(
     flexible PC surface and PC-varying log-slope:
 
       * `binaryGAM` — Bernoulli marginal-slope GAM with
-        `duchon(PC1..PCk)` in the baseline-risk surface, the same
-        `duchon(...)` in the log-slope channel (so `prs_z`'s log-OR
+        `mjs(PC1..PCk)` in the baseline-risk surface, the same
+        `mjs(...)` in the log-slope channel (so `prs_z`'s log-OR
         varies by ancestry), and the matched age nuisance basis
         (quadratic `current_age_z`/`current_age_z2` + linear `entry_age_z`,
-        identical to baselines N/A/B) plus `sex`. The duchon constant vs probit
-        intercept (gam#531) is cleared by orthogonalization; no
-        `linkwiggle()` link-deviation or score-warp (both hang, gam#683).
+        identical to baselines N/A/B) plus `sex`. No `linkwiggle()`
+        link-deviation or score-warp (both hang, gam#683).
       * `binaryN` — logistic GLM on the matched age nuisance basis
         (quadratic `current_age_z`/`current_age_z2` + linear
         `entry_age_z`) and `sex`, with *no PRS information*. The
