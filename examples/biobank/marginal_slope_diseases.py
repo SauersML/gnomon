@@ -2530,35 +2530,6 @@ def evaluate_binary_model_pair(
     }
 
 
-# Per-individual eval emission for Figure 4b (eval_vs_distance.py). Default OFF:
-# set INDIVIDUAL_EVAL_DIR to a path to emit one CSV per held-out fold with
-# person_id, PCs, outcome, ancestry (if present), and F-hat_<method>(horizon).
-INDIVIDUAL_EVAL_DIR: str | None = None
-INDIVIDUAL_EVAL_HORIZON: float = 10.0
-
-
-def individual_eval_frame(test_metric, surv_by_method, metric_times, horizon, pc_cols):
-    """Per-individual held-out table for eval_vs_distance.run_biobank: predicted
-    P(diagnosis by `horizon`) = 1 - S_cond(horizon) for each model, plus PCs and
-    outcome (and ancestry if carried on the frame). Pure; no I/O."""
-    idx = int(np.argmin(np.abs(np.asarray(metric_times, dtype=float) - float(horizon))))
-    out = {
-        "person_id": test_metric["person_id"].to_numpy(),
-        "entry_age": test_metric["entry_age"].to_numpy(dtype=float),
-        "exit_age": test_metric["exit_age"].to_numpy(dtype=float),
-        "event": test_metric["event"].to_numpy().astype(int),
-    }
-    for pc in pc_cols:
-        out[pc] = test_metric[pc].to_numpy(dtype=float)
-    for anc in ("ancestry", "ancestry_category"):
-        if anc in test_metric.columns:
-            out["ancestry"] = test_metric[anc].astype(str).to_numpy()
-            break
-    for name, surv in surv_by_method.items():
-        out[f"Fhat_{name}"] = 1.0 - np.clip(np.asarray(surv)[:, idx], 0.0, 1.0)
-    return pd.DataFrame(out)
-
-
 def evaluate_model_pair(
     train: pd.DataFrame,
     test: pd.DataFrame,
@@ -2728,14 +2699,6 @@ def evaluate_model_pair(
     gam_test_m = survival_library_metrics(
         train, test_metric, gam_risk_test, gam_surv_test, metric_times,
     )
-    if INDIVIDUAL_EVAL_DIR is not None:                # Figure-4b input (opt-in)
-        os.makedirs(INDIVIDUAL_EVAL_DIR, exist_ok=True)
-        _safe = "".join(c if c.isalnum() else "_" for c in str(label))
-        individual_eval_frame(
-            test_metric,
-            {"gamfit": gam_surv_test, "znorm": A_surv_test, "linpc": B_surv_test},
-            metric_times, INDIVIDUAL_EVAL_HORIZON, pc_cols,
-        ).to_csv(os.path.join(INDIVIDUAL_EVAL_DIR, f"individual_eval_{_safe}.csv"), index=False)
     gam_train_m = A_train_m = B_train_m = None
     if score_train:
         train_times = _survival_metric_times(
