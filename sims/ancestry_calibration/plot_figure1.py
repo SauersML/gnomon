@@ -29,7 +29,7 @@ sys.path.insert(0, HERE)
 import gen_real_pt as G  # noqa: E402
 
 DATA = os.path.join(HERE, "..", "results_hpc", "ancestry_calibration", "data")
-OUTDIR = os.path.join(HERE, "..", "results_hpc", "ancestry_calibration", "plots")
+OUTDIR = os.path.join(HERE, "..", "results_hpc", "ancestry_calibration", "figures")
 os.makedirs(OUTDIR, exist_ok=True)
 
 plt.rcParams.update({

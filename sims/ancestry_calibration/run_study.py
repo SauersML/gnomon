@@ -5,7 +5,7 @@ Pipeline:
   2. fit binary recalibration models + ground-truth metrics (per dataset)
   3. fit survival recalibration models + ground-truth metrics (per dataset)
   4. aggregate the per-dataset CSVs into study-level tables
-  5. render the figures
+  5. render the figures (study-design Figure 1 + result figures)
 
 Generation is RAM-bound (each streamed sim holds reservoirs + one chunk), so its
 fan-out is sized from currently-free RAM/cores. Fitting is light and fans out per
@@ -28,6 +28,7 @@ FIT_BINARY = HERE / "fit_binary.py"
 FIT_SURVIVAL = HERE / "fit_survival.py"
 ANALYZE = HERE / "analyze_results.py"
 PLOT = HERE / "plot_results.py"
+PLOT_DESIGN = HERE / "plot_figure1.py"
 OUT = Path("sims/results_hpc/ancestry_calibration")
 
 DEMOGRAPHIES = ("serial1d", "grid2d")
@@ -148,8 +149,11 @@ def main() -> None:
             log_dir / f"fits_{stem}.log", SURVIVAL_TIMEOUT_S))
     run_many(fit_tasks, FIT_JOBS)
 
-    # 4. aggregate + 5. plot
+    # 4. aggregate + 5. figures (study-design Figure 1 + result figures).
+    # plot_figure1 needs demesdraw and the generated data; its step is non-fatal
+    # (run_logged), so a missing optional dep never aborts the study.
     run_logged([sys.executable, ANALYZE], log_dir / "analyze.log")
+    run_logged([sys.executable, PLOT_DESIGN], log_dir / "plot_figure1.log")
     run_logged([sys.executable, PLOT], log_dir / "plot.log")
 
 

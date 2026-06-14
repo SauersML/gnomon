@@ -4,8 +4,8 @@
 Mirrors fit_binary.py with Cox PH baselines and the gamfit survival
 marginal-slope:
   - gamfit  : gamfit survival marginal-slope, Surv(time,event), z=PGS_z,
-              surfaces = matern(PCs, centers=C). Known to stall/crash on some
-              builds (SauersML/gam#979); wrapped so its failure only drops its
+              surfaces = duchon(PCs, centers=C) (study default basis). Known to
+              stall/crash on some builds (SauersML/gam#979, #1040); wrapped so its failure only drops its
               own rows. When it runs we report its global C-index.
   - linpc   : Cox on PGS_z + linear PCs.
   - znorm   : Cox on the ancestry-adjusted z-score.
@@ -79,18 +79,24 @@ def fit_gamfit(fit_df, test_df, pccols, centers, c_admin):
     index (-> C-index) and leave admin-horizon risk undefined (calibration NaN)."""
     if gamfit is None:
         raise RuntimeError("gamfit not importable")
-    terms = f"matern({', '.join(pccols)}, centers={centers})"
+    terms = f"duchon({', '.join(pccols)}, centers={centers})"  # pure Duchon basis (study default)
     data_fit = {"time": fit_df["surv_time"].astype(float).values,
                 "event": fit_df["surv_event"].astype(float).values,
                 "z": fit_df["PGS_z"].astype(float).values}
-    data_te = {"z": test_df["PGS_z"].astype(float).values}
+    # Surv(time,event) predict frame needs time+event placeholders (gam#896: the
+    # surface is anchored to the model's TRAINING time support, so values are moot).
+    data_te = {"time": test_df["surv_time"].astype(float).values,
+               "event": test_df["surv_event"].astype(float).values,
+               "z": test_df["PGS_z"].astype(float).values}
     for c in pccols:
         data_fit[c] = fit_df[c].astype(float).values
         data_te[c] = test_df[c].astype(float).values
     model = gamfit.fit(data_fit, formula=f"Surv(time, event) ~ {terms}",
                        survival_likelihood="marginal-slope", z_column="z", logslope_formula=terms)
     pred = model.predict(data_te)
-    pi = np.asarray(getattr(pred, "to_numpy", lambda: pred)(), dtype=float).ravel()[:len(test_df)]
+    # risk_score_at(horizon) = per-row cumulative hazard (Harrell-C ordering).
+    horizon = float(fit_df["surv_time"].max())
+    pi = np.asarray(pred.risk_score_at(horizon), dtype=float).ravel()[:len(test_df)]
     return pi, None
 
 

@@ -3,7 +3,8 @@
 
 Recalibration methods, in display order:
   - gamfit  : bernoulli marginal-slope, link=probit, z=PGS_z, marginal and
-              log-slope surfaces = matern(PC1..PCk, centers=C). No wiggle.
+              log-slope surfaces = duchon(PC1..PCk, centers=C) (pure Duchon spline;
+              best per-deme marginal-slope recovery in the basis benchmark). No wiggle.
   - linpc   : logistic on PGS_z + linear PCs (no z x PC interaction).
   - znorm   : ancestry mean+log-variance adjustment of PGS_raw as OLS on the
               PCs, then logistic on the adjusted z-score.
@@ -107,7 +108,11 @@ def fit_calpred(fit_df, test_df, pccols):
 def fit_gamfit(fit_df, test_df, pccols, centers):
     if gamfit is None:
         raise RuntimeError("gamfit not importable")
-    terms = f"matern({', '.join(pccols)}, centers={centers})"
+    # Duchon (scale-free pure Duchon spline) is the default surface basis: on the
+    # ancestry-calibration benchmark it recovers the per-deme marginal slope markedly
+    # better than matern (slope-recovery corr ~0.77 vs ~0.47 over 8 sim datasets) at
+    # matern-level cost, and measure-jet is dominated (slower AND less accurate).
+    terms = f"duchon({', '.join(pccols)}, centers={centers})"
     data_fit = {"event": fit_df["y_binary"].astype(float).values, "z": fit_df["PGS_z"].astype(float).values}
     data_te = {"z": test_df["PGS_z"].astype(float).values}
     for c in pccols:
