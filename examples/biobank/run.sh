@@ -3,6 +3,29 @@ set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 export PYTHONUNBUFFERED=1
 
+detect_online_cpus() {
+  getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 1
+}
+
+# gamfit's marginal-slope row reductions do not benefit from every visible CPU
+# on large shared nodes. The biobank trace that motivated this cap ran with 303
+# process threads and spent ~50s inside tiny final Newton steps. Honor an
+# explicit caller setting, but default to the measured safe range.
+if [ -z "${RAYON_NUM_THREADS:-}" ]; then
+  ONLINE_CPUS="$(detect_online_cpus)"
+  if [ "$ONLINE_CPUS" -gt 16 ] 2>/dev/null; then
+    export RAYON_NUM_THREADS=16
+  else
+    export RAYON_NUM_THREADS="$ONLINE_CPUS"
+  fi
+fi
+
+# Keep BLAS/OpenMP libraries from multiplying the Rayon pool.
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+export BLIS_NUM_THREADS="${BLIS_NUM_THREADS:-1}"
+
 SCRIPT_DIR="$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &>/dev/null && pwd )"
 GNOMON_REPO_URL="https://github.com/SauersML/gnomon.git"
 GNOMON_CHECKOUT_DIR=""
@@ -505,6 +528,11 @@ trap 'failure_diagnostics $?' ERR
   echo "min_run_state_free: ${MIN_RUN_STATE_FREE_GIB}GiB and ${MIN_RUN_STATE_FREE_INODES} inodes"
   echo "script:           $SCRIPT_DIR/marginal_slope_diseases.py"
   echo "results_file:     $RESULTS"
+  echo "online_cpus:      $(detect_online_cpus)"
+  echo "rayon_threads:    ${RAYON_NUM_THREADS:-<unset>}"
+  echo "omp_threads:      ${OMP_NUM_THREADS:-<unset>}"
+  echo "openblas_threads: ${OPENBLAS_NUM_THREADS:-<unset>}"
+  echo "mkl_threads:      ${MKL_NUM_THREADS:-<unset>}"
   echo
   echo "--- storage mechanism ---"
   echo "uv defaults its client cache to HOME/.cache/uv; UV_CACHE_DIR moves all uv cache writes."
