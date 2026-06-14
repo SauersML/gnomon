@@ -1,7 +1,6 @@
 """Shared utilities for the ancestry-calibration study: dataset schema
 normalization, PC/PGS helpers, the z-norm ancestry adjustment, ancestry strata,
-and the ground-truth calibration metrics (calibration-vs-truth + Brier Skill
-Score with the Murphy reliability/resolution decomposition).
+and the ground-truth risk metrics.
 
 Both the binary and survival evaluators import from here, so the metric
 definitions live in exactly one place. Discrimination is arm-specific (binary
@@ -72,12 +71,14 @@ def probit(p) -> np.ndarray:
     return norm.ppf(clip01(p))
 
 
-def _slope_probit(p_true, p_pred) -> float:
-    """OLS slope of probit(p_true) on probit(p_pred); 1.0 iff p_pred == p_true."""
-    a, b = probit(p_true), probit(p_pred)
-    if np.std(b) < 1e-9:
+def _probit_risk_slope_ratio(p_true, p_pred) -> float:
+    """Direct slope ratio on the known probit-risk scale; 1.0 is ideal."""
+    true_z = probit(p_true)
+    pred_z = probit(p_pred)
+    true_sd = float(np.std(true_z))
+    if true_sd < 1e-9:
         return np.nan
-    return float(np.cov(b, a, bias=True)[0, 1] / np.var(b))
+    return float(np.std(pred_z) / true_sd)
 
 
 # --------------------------------------------------------------------------- #
@@ -133,57 +134,39 @@ def ancestry_bins(test_df: pd.DataFrame, n_dist_bins: int = 5):
 
 
 # --------------------------------------------------------------------------- #
-# ground-truth calibration metrics (shared by both arms)
+# ground-truth risk metrics (shared by both arms)
 # --------------------------------------------------------------------------- #
-def calib_vs_truth(p_true, p_pred) -> tuple[dict, int]:
-    """Calibration of predicted risk against the KNOWN generative risk on one
-    stratum (we control the simulation, so we never fit to the noisy outcome).
-    Probit slope is the principled summary (1.0 = calibrated); bias/rmse/mae
-    are reported alongside."""
+def risk_vs_truth(p_true, p_pred) -> tuple[dict, int]:
+    """Prediction error against the known generative risk on one stratum.
+
+    The probit slope ratio is derived directly from the known true risk and
+    predicted risk distributions. It is not a fitted regression slope.
+    """
     p_true = clip01(p_true)
     p_pred = clip01(p_pred)
     n = len(p_true)
-    keys = ("calib_bias", "calib_slope_probit", "abs_slope_minus_1_probit", "rmse", "mae")
+    keys = ("avg_pred_minus_true_risk", "probit_risk_slope_ratio", "rmse", "mae")
     if n < 10:
         return {k: np.nan for k in keys}, n
-    slope = _slope_probit(p_true, p_pred)
     return {
-        "calib_bias": float(np.mean(p_pred) - np.mean(p_true)),
-        "calib_slope_probit": slope,
-        "abs_slope_minus_1_probit": abs(slope - 1.0) if np.isfinite(slope) else np.nan,
+        "avg_pred_minus_true_risk": float(np.mean(p_pred) - np.mean(p_true)),
+        "probit_risk_slope_ratio": _probit_risk_slope_ratio(p_true, p_pred),
         "rmse": float(np.sqrt(np.mean((p_pred - p_true) ** 2))),
         "mae": float(np.mean(np.abs(p_pred - p_true))),
     }, n
 
 
-def calib_skill(y, p, n_bins: int = 10) -> dict:
-    """Brier Skill Score (vs the stratum base rate) and the Murphy decomposition
-    of the Brier score: Brier = reliability - resolution + uncertainty.
-    reliability = miscalibration (lower better); resolution = how far bin
-    outcome rates move from the base rate (higher better); BSS > 0 means the
-    predictions beat the stratum base rate."""
+def brier_skill(y, p) -> dict:
+    """Brier Skill Score versus the stratum base rate."""
     y = np.asarray(y, dtype=float)
     p = clip01(p)
     n = len(y)
-    keys = ("brier_y", "bss", "reliability", "resolution", "uncertainty")
+    keys = ("bss",)
     if n < 20 or y.min() == y.max():
         return {k: np.nan for k in keys}
     ybar = float(y.mean())
     unc = ybar * (1.0 - ybar)
     bs = float(np.mean((p - y) ** 2))
-    bins = np.linspace(0, 1, n_bins + 1)
-    idx = np.clip(np.digitize(p, bins[1:-1]), 0, n_bins - 1)
-    rel = res = 0.0
-    for b in range(n_bins):
-        m = idx == b
-        if m.any():
-            nb = int(m.sum())
-            rel += nb / n * (p[m].mean() - y[m].mean()) ** 2
-            res += nb / n * (y[m].mean() - ybar) ** 2
     return {
-        "brier_y": bs,
         "bss": float(1.0 - bs / unc) if unc > 0 else np.nan,
-        "reliability": float(rel),
-        "resolution": float(res),
-        "uncertainty": float(unc),
     }

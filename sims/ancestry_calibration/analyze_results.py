@@ -5,7 +5,7 @@ under results/:
   accuracy_binary.csv, calibration_binary.csv,
   accuracy_survival.csv, calibration_survival.csv   -- all seeds concatenated
   summary_table.csv  -- per (dem, pheno, method) mean+/-SD over seeds of the
-                        headline metrics: discrimination, and calibration BSS in
+                        headline metrics: discrimination, and BSS in
                         the held-out training-ancestry vs the other ancestries.
 """
 from __future__ import annotations

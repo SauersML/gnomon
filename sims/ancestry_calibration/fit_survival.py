@@ -13,10 +13,9 @@ marginal-slope:
 
 The data has ONLY administrative censoring at a single horizon c_admin (=
 max(surv_time)), so surv_event is exactly "failed by the admin horizon" and is
-fully observed. That lets the survival arm reuse the binary calibration suite at
-the admin horizon: predicted admin-horizon risk vs the known true admin risk
-(surv_risk_true), scored with calibration-vs-truth AND the Brier Skill Score /
-Murphy decomposition against the observed surv_event.
+fully observed. That lets the survival arm reuse the binary risk metrics at the
+admin horizon: predicted admin-horizon risk vs the known true admin risk
+(surv_risk_true), plus Brier Skill Score against the observed surv_event.
 
 DISCRIMINATION: Harrell's C on (surv_time, surv_event), GLOBAL only.
 CALIBRATION: per ancestry stratum, against ground truth (never within-stratum C).
@@ -76,7 +75,7 @@ def fit_znorm(fit_df, test_df, pccols, c_admin):
 def fit_gamfit(fit_df, test_df, pccols, centers, c_admin):
     """gamfit survival marginal-slope. predict() semantics for survival are not
     a stable probability, so we use its output only as a risk-ordering prognostic
-    index (-> C-index) and leave admin-horizon risk undefined (calibration NaN)."""
+    index (-> C-index) and leave admin-horizon risk undefined."""
     if gamfit is None:
         raise RuntimeError("gamfit not importable")
     terms = f"duchon({', '.join(pccols)}, centers={centers})"  # pure Duchon basis (study default)
@@ -155,9 +154,9 @@ def main():
 
         for bk, bl, mask in strata:
             if risk is None or risk_true_te is None:
-                continue  # gamfit survival: no calibrated risk (C-index only)
-            cm, n = common.calib_vs_truth(risk_true_te[mask], risk[mask])
-            sk = common.calib_skill(e_te[mask], risk[mask])
+                continue  # gamfit survival: no admin-horizon risk (C-index only)
+            cm, n = common.risk_vs_truth(risk_true_te[mask], risk[mask])
+            sk = common.brier_skill(e_te[mask], risk[mask])
             for metric, val in {**cm, **sk}.items():
                 cal_rows.append(dict(dem=args.dem, pheno=args.pheno, pgs_mode=args.pgs_mode,
                                      method=method, ancestry_bin_kind=bk, ancestry_bin=bl,

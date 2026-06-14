@@ -18,17 +18,19 @@ Hard rules:
 - causal effects are SHARED across demes, so any portability decay is EMERGENT from
   LD/allele-frequency drift -- never manufactured -- and is reported honestly
 
-Three phenotypes per dataset exercise distinct confounds:
-- phenoA: deme-varying baseline risk (1-D linear gradient / 2-D per-deme random offset)
+Four phenotypes per dataset exercise distinct confounds:
+- phenoA: affine deme-varying baseline risk in both demographies
+- phenoR: random per-deme baseline risk in both demographies
 - phenoB: constant baseline (drift in the genetic liability still shifts per-deme prevalence)
 - phenoC: drift-proof -- the liability is centered WITHIN each deme, so every deme has an
-  identical mean liability and prevalence; only the calibration slope can differ.
+  identical mean liability and prevalence; only the PGS-liability slope can differ.
 
 Usage: gen_real_pt.py <dem: serial1d|grid2d> <outdir> [seed]
        [--chunks N] [--chunk-bp BP] [--threads T] [--mem-mb MB]
-Writes <outdir>/<dem>_{phenoA,phenoB,phenoC}_realpt.parquet (+ .csv, .sanity.tsv)
-  phenoA = deme-varying baseline (1-D linear / 2-D random); phenoB = constant baseline;
-  phenoC = drift-proof (per-deme-centered liability => identical prevalence across demes)
+Writes <outdir>/<dem>_{phenoA,phenoR,phenoB,phenoC}_realpt.parquet (+ .csv, .sanity.tsv)
+  phenoA = affine baseline; phenoR = random per-deme baseline;
+  phenoB = constant baseline; phenoC = drift-proof
+  (per-deme-centered liability => identical prevalence across demes)
 and a sidecar <outdir>/<dem>_realpt.json (GLOBAL/pooled diagnostics only).
 """
 from __future__ import annotations
@@ -60,6 +62,8 @@ NPER = 250                 # non-training demes (match synth)
 NPER_TRAIN = 5000          # large training deme for GWAS power (team-lead spec)
 PREV = 0.15
 SIGMA_E = 1.0              # environmental SD on the liability scale (matches synth "normal")
+BASELINE_AFFINE_SPAN = 1.4 # large liability-scale range across the affine baseline
+BASELINE_RANDOM_SD = 0.7   # large liability-scale SD for random per-deme baselines
 
 DEFAULT_CHUNKS = 20
 DEFAULT_CHUNK_BP = 5_000_000
@@ -435,38 +439,49 @@ def main():
     split = make_split(coord, train_deme, rng)
     is_train = coord == train_deme
 
-    # Per-deme baselines. phenoA = deme-varying baseline risk: for the 1-D chain a smooth
-    # LINEAR gradient across demes; for the 2-D grid an arbitrary per-deme RANDOM offset
-    # (a grid has no single ordering, so a gradient would be artificial). phenoB = constant
-    # baseline. phenoC (drift-proof) is built below. All baselines are mean-zero so the
-    # GLOBAL prevalence target is met by a single intercept solve.
+    # Per-deme baselines. phenoA = affine deme-varying baseline risk in both
+    # demographies. phenoR = random per-deme baseline risk in both demographies.
+    # phenoB = constant baseline. phenoC (drift-proof) is built below. All
+    # baselines are mean-zero so the GLOBAL prevalence target is met by a single
+    # intercept solve.
     uq = np.unique(coord)
     udeme = (uq - uq.min()) / (uq.max() - uq.min() + 1e-12)
     if dem_name == "serial1d":
-        base_by_deme = 0.8 * (udeme - 0.5)
+        affine_by_deme = BASELINE_AFFINE_SPAN * (udeme - 0.5)
     else:
-        base_by_deme = rng.normal(0, 0.4, len(uq))
-    base_by_deme = base_by_deme - base_by_deme.mean()
-    deme_to_baseA = {dd: b for dd, b in zip(uq, base_by_deme)}
-    baseA = np.array([deme_to_baseA[c] for c in coord])
+        side = int(round(np.sqrt(len(uq))))
+        if side * side != len(uq):
+            raise RuntimeError(f"grid2d expected a square deme count, got {len(uq)}")
+        row = (uq.astype(int) // side).astype(float) / (side - 1)
+        col = (uq.astype(int) % side).astype(float) / (side - 1)
+        affine_by_deme = BASELINE_AFFINE_SPAN * (((row + col) * 0.5) - 0.5)
+    affine_by_deme = affine_by_deme - affine_by_deme.mean()
+    random_by_deme = rng.normal(0.0, BASELINE_RANDOM_SD, len(uq))
+    random_by_deme = random_by_deme - random_by_deme.mean()
+    deme_to_affine = {dd: b for dd, b in zip(uq, affine_by_deme)}
+    deme_to_random = {dd: b for dd, b in zip(uq, random_by_deme)}
+    baseA = np.array([deme_to_affine[c] for c in coord])
+    baseR = np.array([deme_to_random[c] for c in coord])
     baseB = np.zeros(nI)
 
     # phenoC drift-proof liability: center the genetic liability WITHIN each deme so every
     # deme has an identical mean liability (=> identical prevalence after one intercept
     # solve). Drift in allele frequencies can still shift the PER-DEME mean genetic
-    # liability under phenoA/phenoB; phenoC removes that mean shift entirely, so the only
-    # thing that can differ across ancestries is the PGS->liability calibration SLOPE --
-    # never the base rate. (Demeaning by a per-deme constant leaves every within-deme
-    # covariance/variance unchanged, so true_slope_deme is identical across phenos.)
+    # liability under phenoA/phenoR/phenoB; phenoC removes that mean shift
+    # entirely, so the only thing that can differ across ancestries is the
+    # PGS->liability SLOPE -- never the base rate. (Demeaning by a
+    # per-deme constant leaves every within-deme covariance/variance unchanged,
+    # so true_slope_deme is identical across phenos.)
     liab_demean = true_liab.copy()
     for dd in uq:
         mk = coord == dd
         liab_demean[mk] = true_liab[mk] - true_liab[mk].mean()
 
     # ---- REAL P+T: build PGS once (on phenoA's y_binary, the realistic phenotype) ----
-    # PGS is a property of genotype + the GWAS; reused for phenoB (same as deploying a
-    # trained PGS regardless of which baseline-shift defines the outcome). Use synth's
-    # probit liability for the GWAS phenotype so the trait the GWAS sees matches synth.
+    # PGS is a property of genotype + the GWAS; reused for the other phenotypes
+    # (same as deploying a trained PGS regardless of which baseline-shift defines
+    # the outcome). Use synth's probit liability for the GWAS phenotype so the
+    # trait the GWAS sees matches synth.
     linA = baseA + true_liab
     c0A = brentq(lambda c: norm.cdf((c + linA) / SIGMA_E).mean() - PREV, -20, 20)
     yA = ((c0A + linA + rng.normal(0, SIGMA_E, nI)) > 0).astype(int)
@@ -512,6 +527,10 @@ def main():
         "params": {"mu": MU, "recomb": RECOMB, "n_chunks": int(args.chunks),
                    "chunk_bp": int(args.chunk_bp), "seqlen_bp": int(args.chunks * args.chunk_bp),
                    "n_loci_total": int(st["n_loci"]), "n_loci_common": int(st["Xpca"].shape[1])},
+        "baseline_effects": {
+            "affine_span": BASELINE_AFFINE_SPAN,
+            "random_sd": BASELINE_RANDOM_SD,
+        },
         "pt": pt_meta,
         "true_slope_by_deme": {int(d): round(v, 4) for d, v in true_slope_by_deme.items()},
         "fst_train_vs_near": round(fst_pair(st["Xpca"][coord == train_deme], st["Xpca"][coord == near_deme]), 5),
@@ -522,15 +541,17 @@ def main():
                           "true_hazard", "true_surv_at_admin", "surv_rate_true",
                           "surv_risk_5y_true", "surv_risk_10y_true"],
         "metric_rule": "Use *-deme-test rows only. Never compute within-deme AUC/C-index; "
-                       "stratify calibration only.",
+                       "stratify risk metrics only.",
     }
 
     for pheno, base, liab in [("phenoA", baseA, true_liab),
+                              ("phenoR", baseR, true_liab),
                               ("phenoB", baseB, true_liab),
                               ("phenoC", np.zeros(nI), liab_demean)]:
         # Binary outcome via probit liability with environmental noise (matches synth).
-        # phenoA: deme-varying baseline + genetic liability; phenoB: constant baseline +
-        # genetic liability; phenoC: no baseline + drift-proof (per-deme-centered) liability.
+        # phenoA: affine baseline + genetic liability; phenoR: random per-deme
+        # baseline + genetic liability; phenoB: constant baseline + genetic
+        # liability; phenoC: no baseline + drift-proof liability.
         lin = base + liab
         c0 = brentq(lambda c: norm.cdf((c + lin) / SIGMA_E).mean() - PREV, -20, 20)
         intercept_deme = c0 + base                       # generative per-deme intercept

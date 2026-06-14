@@ -16,11 +16,11 @@ TEST-SET DISCIPLINE: models are FIT on the recalibration rows (split_role=='fit'
 spanning all ancestries) and ALL metrics are computed on the held-out rows
 (split_role=='test'). The P+T 'GWAS' rows never appear here.
 
-DISCRIMINATION (AUC, Brier, Nagelkerke and Lee-2011 liability R2) is on the real
+DISCRIMINATION (AUC, Brier, and Lee-2011 liability R2) is on the real
 outcome y_binary, GLOBAL only -- never within an ancestry stratum.
-CALIBRATION is against the known generative risk p_true, per ancestry stratum:
-calibration-vs-truth (probit slope, bias, rmse, mae) and the Brier Skill Score
-with the Murphy reliability/resolution decomposition.
+Risk accuracy is against the known generative risk p_true, per ancestry stratum:
+average prediction error, probit risk spread ratio, rmse, mae, and Brier Skill
+Score.
 """
 from __future__ import annotations
 
@@ -133,20 +133,6 @@ _FITTERS = {"linpc": fit_linpc, "znorm": fit_znorm, "calpred": fit_calpred, "raw
 # --------------------------------------------------------------------------- #
 # global discrimination on the real outcome
 # --------------------------------------------------------------------------- #
-def _nagelkerke_r2(y, p):
-    p = common.clip01(p)
-    y = np.asarray(y, dtype=float)
-    n = len(y)
-    pbar = y.mean()
-    if pbar <= 0 or pbar >= 1:
-        return np.nan
-    ll_full = np.sum(y * np.log(p) + (1 - y) * np.log(1 - p))
-    ll_null = np.sum(y * np.log(pbar) + (1 - y) * np.log(1 - pbar))
-    cox = 1.0 - np.exp((2.0 / n) * (ll_null - ll_full))
-    rmax = 1.0 - np.exp((2.0 / n) * ll_null)
-    return float(cox / rmax) if rmax > 0 else np.nan
-
-
 def _lee_liability_r2(y, p):
     """Lee et al. 2011 liability-scale R2; population sampling (P==K)."""
     p = common.clip01(p)
@@ -169,7 +155,6 @@ def global_discrimination(y, p):
         out["brier"] = float(brier_score_loss(y, common.clip01(p)))
     except Exception:  # noqa: BLE001
         out["brier"] = np.nan
-    out["nagelkerke_r2"] = _nagelkerke_r2(y, p)
     out["liability_r2"] = _lee_liability_r2(y, p)
     return out
 
@@ -216,8 +201,8 @@ def main():
             acc_rows.append(dict(dem=args.dem, pheno=args.pheno, pgs_mode=args.pgs_mode,
                                  method=method, metric=metric, value=val))
         for bk, bl, mask in strata:
-            cm, n = common.calib_vs_truth(p_true_te[mask], p[mask])
-            sk = common.calib_skill(y_te[mask], p[mask])
+            cm, n = common.risk_vs_truth(p_true_te[mask], p[mask])
+            sk = common.brier_skill(y_te[mask], p[mask])
             for metric, val in {**cm, **sk}.items():
                 cal_rows.append(dict(dem=args.dem, pheno=args.pheno, pgs_mode=args.pgs_mode,
                                      method=method, ancestry_bin_kind=bk, ancestry_bin=bl,

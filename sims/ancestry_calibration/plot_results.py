@@ -2,12 +2,10 @@
 
 Reads results/{accuracy,calibration}_{binary,survival}.csv and writes to figures/:
   1) discrimination.png   -- GLOBAL discrimination (binary AUC, liability R2, Brier;
-                             survival Harrell C), 5 methods x (2 dem x 3 pheno).
-  2) calibration_bss.png  -- ancestry-stratified calibration via Brier Skill Score,
+                             survival Harrell C), 5 methods x (2 dem x 4 pheno).
+  2) calibration_bss.png  -- ancestry-stratified Brier Skill Score,
                              held-out training-ancestry vs non-training populations.
   3) bss_vs_distance.png  -- BSS decay with genetic distance from the training deme.
-  4) murphy.png           -- Murphy reliability (miscalibration) and resolution
-                             (discrimination) in the non-training populations.
 All mean +/- SD over seeds. Display order: gamfit, PGS+PCs, z-norm, CalPred, raw PGS.
 """
 from __future__ import annotations
@@ -29,8 +27,9 @@ WONG = {"gamfit": "#0072B2", "linpc": "#E69F00", "znorm": "#009E73",
 MLAB = {"gamfit": "gamfit (marginal-slope)", "linpc": "PGS + PCs (linear)",
         "znorm": "z-norm (PC-adjusted)", "calpred": "CalPred", "rawpgs": "PGS (unadjusted)"}
 MORD = ["gamfit", "linpc", "znorm", "calpred", "rawpgs"]
-PHORD = ["phenoA", "phenoB", "phenoC"]
-PHLAB = {"phenoA": "deme-varying baseline", "phenoB": "constant baseline",
+PHORD = ["phenoA", "phenoR", "phenoB", "phenoC"]
+PHLAB = {"phenoA": "affine baseline", "phenoR": "random baseline",
+         "phenoB": "constant baseline",
          "phenoC": "drift-proof (equal prevalence)"}
 DEMLAB = {"serial1d": "1-D chain", "grid2d": "2-D grid"}
 CELLS = [(d, p) for d in ["serial1d", "grid2d"] for p in PHORD]
@@ -104,16 +103,16 @@ def main():
     print("wrote discrimination.png")
 
     if bcal.empty:
-        print("PLOT_DONE (no binary calibration table)")
+        print("PLOT_DONE (no binary risk table)")
         return
 
-    # 2) calibration BSS: training-ancestry vs non-training
+    # 2) BSS: training-ancestry vs non-training
     fig, ax = plt.subplots(1, 2, figsize=(17, 5.5), sharey=True)
     _cellbars(ax[0], _cal_valfn(bcal, "bss", "train_deme"), "Brier Skill Score (vs base rate)",
-              "Calibration — training-ancestry test (held out)", hline=0.0, legend=True)
+              "Training-ancestry test (held out)", hline=0.0, legend=True)
     _cellbars(ax[1], _cal_valfn(bcal, "bss", "other_deme"), "Brier Skill Score (vs base rate)",
-              "Calibration — non-training populations", hline=0.0)
-    fig.suptitle("Real P+T PGS — calibration skill (BSS>0 beats stratum base rate; emergent portability decay)",
+              "Non-training populations", hline=0.0)
+    fig.suptitle("Real P+T PGS — Brier Skill Score (BSS>0 beats stratum base rate; emergent portability decay)",
                  fontsize=12, weight="bold", y=1.0)
     plt.tight_layout()
     fig.savefig(FIG / "calibration_bss.png", dpi=140, bbox_inches="tight")
@@ -123,9 +122,9 @@ def main():
     # 3) BSS vs distance
     dsub = bcal[(bcal.metric == "bss") & (bcal.ancestry_bin_kind == "dist_bin")]
     if not dsub.empty:
-        fig, axes = plt.subplots(2, 3, figsize=(17, 9))
+        fig, axes = plt.subplots(2, 4, figsize=(20, 9))
         for j, (d, p) in enumerate(CELLS):
-            ax = axes[j // 3, j % 3]
+            ax = axes[j // 4, j % 4]
             cell = dsub[(dsub.dem == d) & (dsub.pheno == p)]
             for m in MORD:
                 cm = cell[cell.method == m]
@@ -142,25 +141,13 @@ def main():
             for s in ("top", "right"):
                 ax.spines[s].set_visible(False)
         axes[0, 0].legend(frameon=False, fontsize=7.5, loc="best")
-        fig.suptitle("Real P+T PGS — calibration skill (BSS) vs genetic distance from the training population",
+        fig.suptitle("Real P+T PGS — Brier Skill Score vs genetic distance from the training population",
                      fontsize=12, weight="bold", y=1.0)
         plt.tight_layout()
         fig.savefig(FIG / "bss_vs_distance.png", dpi=140, bbox_inches="tight")
         plt.close(fig)
         print("wrote bss_vs_distance.png")
 
-    # 4) Murphy reliability / resolution (non-training)
-    fig, ax = plt.subplots(1, 2, figsize=(17, 5.5))
-    _cellbars(ax[0], _cal_valfn(bcal, "reliability", "other_deme"),
-              "reliability (miscalibration, lower better)", "Murphy reliability — non-training", legend=True)
-    _cellbars(ax[1], _cal_valfn(bcal, "resolution", "other_deme"),
-              "resolution (higher better)", "Murphy resolution — non-training")
-    fig.suptitle("Real P+T PGS — Murphy decomposition of the Brier score (non-training ancestries)",
-                 fontsize=12, weight="bold", y=1.0)
-    plt.tight_layout()
-    fig.savefig(FIG / "murphy.png", dpi=140, bbox_inches="tight")
-    plt.close(fig)
-    print("wrote murphy.png")
     print("PLOT_DONE")
 
 

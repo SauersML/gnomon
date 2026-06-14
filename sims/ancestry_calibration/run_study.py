@@ -1,7 +1,7 @@
 """Real-P+T ancestry-calibration study runner (the only sims entry point).
 
 Pipeline:
-  1. generate real-P+T data for serial1d + grid2d x seeds (3 phenotypes each)
+  1. generate real-P+T data for serial1d + grid2d x seeds (4 phenotypes each)
   2. fit binary recalibration models + ground-truth metrics (per dataset)
   3. fit survival recalibration models + ground-truth metrics (per dataset)
   4. aggregate the per-dataset CSVs into study-level tables
@@ -32,7 +32,7 @@ PLOT_DESIGN = HERE / "plot_figure1.py"
 OUT = Path("sims/results_hpc/ancestry_calibration")
 
 DEMOGRAPHIES = ("serial1d", "grid2d")
-PHENOS = ("phenoA", "phenoB", "phenoC")
+PHENOS = ("phenoA", "phenoR", "phenoB", "phenoC")
 SEEDS = tuple(range(1, 11))      # seed = inferential unit; averages out P+T threshold noise
 CENTERS = 12                     # gamfit marginal-slope surface centers (gam#979: keep modest)
 SURVIVAL_TIMEOUT_S = 1500        # cap a gamfit survival-MS stall; baselines already flushed
@@ -111,7 +111,7 @@ def main() -> None:
         "centers": CENTERS, "pgs": "real P+T only", "outcomes": ["binary", "survival"],
         "methods_binary": ["gamfit", "linpc", "znorm", "calpred", "rawpgs"],
         "methods_survival": ["gamfit", "linpc", "znorm", "rawpgs"],
-        "calibration": "ground-truth: probit slope + Brier Skill Score (Murphy reliability/resolution)",
+        "risk_metrics": "ground-truth: average prediction error, probit risk spread ratio, RMSE, MAE, and Brier Skill Score",
         "discrimination": "GLOBAL only (binary AUC / survival Harrell C); never within-stratum",
     }, indent=2))
 
