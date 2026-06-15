@@ -6,7 +6,7 @@ For each disease the script:
      OMOP/OHDSI `concept` table on the AoU CDR.
   2. Pulls everyone whose `condition_occurrence.condition_concept_id`
      descends from that concept via `concept_ancestor`.
-  3. Fits `Surv(entry_age, exit_age, event) ~ duchon(PC1..PC3) + sex`
+  3. Fits `Surv(entry_age, exit_age, event) ~ duchon(PC1..PC{NUM_PCS}) + sex`
      with the hard-coded PGS feeding the marginal-slope latent z and the same
      pure Duchon smooth on the log-slope channel. No `linkwiggle()` on
      either channel (link-deviation / score-warp both hang, SauersML/gam#683).
@@ -289,8 +289,8 @@ def find_plink_prefix() -> Path:
 PLINK_PREFIX = find_plink_prefix()
 WORKDIR = PLINK_PREFIX.parent
 FITS_DIR = WORKDIR / "biobank_fits"
-NUM_PCS = 3
-DUCHON_CENTERS = 20
+NUM_PCS = 15
+DUCHON_CENTERS = 40
 TRAIN_FRACTION = 0.80  # per-class 80/20 split
 RNG_SEED = 0
 MAX_LOSO_CARE_SITES = 5
