@@ -268,12 +268,50 @@ def risk_vs_truth(p_true, p_pred) -> tuple[dict, int]:
     }, n
 
 
+def _wilson_ci(k: int, n: int, z: float = 1.959963984540054) -> tuple[float, float]:
+    """Wilson 95% interval for a binomial rate -- closed form, valid at small n."""
+    if n <= 0:
+        return np.nan, np.nan
+    phat = k / n
+    denom = 1.0 + z * z / n
+    center = (phat + z * z / (2 * n)) / denom
+    half = z * np.sqrt(phat * (1 - phat) / n + z * z / (4 * n * n)) / denom
+    return center - half, center + half
+
+
+def calibration_coverage(y, p_pred, bins: int = 10, min_per_bin: int = 20) -> float:
+    """Interval-coverage of calibration: split into equal-count predicted-risk
+    bins; a bin is 'covered' if its mean predicted risk lies inside the Wilson
+    95%% CI of its OBSERVED event rate. Returns the fraction of bins covered
+    (target ~0.95). Needs only outcomes + predictions (no model posterior).
+    Out-of-ancestry, overconfident/mis-scaled risks fall outside -> coverage drops."""
+    y = np.asarray(y).astype(int)
+    p = clip01(p_pred)
+    n = len(y)
+    if n < bins * min_per_bin or y.min() == y.max():
+        return np.nan
+    order = np.argsort(p)
+    edges = np.linspace(0, n, bins + 1).astype(int)
+    covered = total = 0
+    for b in range(bins):
+        idx = order[edges[b]:edges[b + 1]]
+        if len(idx) < min_per_bin:
+            continue
+        lo, hi = _wilson_ci(int(y[idx].sum()), len(idx))
+        if lo <= float(p[idx].mean()) <= hi:
+            covered += 1
+        total += 1
+    return float(covered / total) if total > 0 else np.nan
+
+
 def outcome_metrics(y, p_pred) -> dict:
     """Outcome-based accuracy/stratification on one stratum (needs the realized
     outcome, so these match what the biobank can compute on real data):
-    calibration slope + intercept, and the OBSERVED top-10%/20% risk ratios."""
+    calibration slope + intercept, the OBSERVED top-10%/20% risk ratios, and
+    calibration interval-coverage."""
     y = np.asarray(y).astype(int)
-    keys = ("calibration_slope", "calibration_intercept", "rr_top10_obs", "rr_top20_obs")
+    keys = ("calibration_slope", "calibration_intercept", "rr_top10_obs",
+            "rr_top20_obs", "calibration_coverage")
     if len(y) < 20 or y.min() == y.max():
         return {k: np.nan for k in keys}
     slope, intercept = calibration(y, p_pred)
@@ -282,6 +320,7 @@ def outcome_metrics(y, p_pred) -> dict:
         "calibration_intercept": intercept,
         "rr_top10_obs": _rr_top_obs(y, p_pred, 0.90),
         "rr_top20_obs": _rr_top_obs(y, p_pred, 0.80),
+        "calibration_coverage": calibration_coverage(y, p_pred),
     }
 
 

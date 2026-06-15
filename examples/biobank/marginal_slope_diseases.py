@@ -1464,6 +1464,7 @@ class BinaryStats:
     bss: float
     calibration_slope: float
     calibration_intercept: float
+    calibration_coverage: float
     rr_top10: float
     rr_top20: float
     frac_ge_2x: float
@@ -1943,6 +1944,43 @@ def _extract_binary_mean(prediction: object) -> np.ndarray:
     )
 
 
+def _wilson_ci(k: int, n: int, z: float = 1.959963984540054) -> tuple[float, float]:
+    """Wilson 95% interval for a binomial rate (closed form, valid at small n)."""
+    if n <= 0:
+        return float("nan"), float("nan")
+    phat = k / n
+    denom = 1.0 + z * z / n
+    center = (phat + z * z / (2 * n)) / denom
+    half = z * np.sqrt(phat * (1 - phat) / n + z * z / (4 * n * n)) / denom
+    return center - half, center + half
+
+
+def calibration_coverage(y: np.ndarray, p: np.ndarray, bins: int = 10,
+                         min_per_bin: int = 20) -> float:
+    """Interval-coverage of calibration (SAME definition as the simulation's
+    common.calibration_coverage): equal-count predicted-risk bins; a bin is
+    'covered' if its mean predicted risk falls in the Wilson 95% CI of its
+    observed event rate. Fraction of bins covered (target ~0.95); needs only
+    outcomes + predictions, no model posterior."""
+    y = np.asarray(y).astype(int)
+    p = np.clip(np.asarray(p, dtype=float), np.finfo(float).eps, 1.0 - np.finfo(float).eps)
+    n = len(y)
+    if n < bins * min_per_bin or y.min() == y.max():
+        return float("nan")
+    order = np.argsort(p)
+    edges = np.linspace(0, n, bins + 1).astype(int)
+    covered = total = 0
+    for b in range(bins):
+        idx = order[edges[b]:edges[b + 1]]
+        if len(idx) < min_per_bin:
+            continue
+        lo, hi = _wilson_ci(int(y[idx].sum()), len(idx))
+        if lo <= float(p[idx].mean()) <= hi:
+            covered += 1
+        total += 1
+    return float(covered / total) if total > 0 else float("nan")
+
+
 def binary_stats(y: np.ndarray, p: np.ndarray, population_prevalence: float | None) -> BinaryStats:
     from scipy.stats import norm
     from sklearn.linear_model import LogisticRegression
@@ -2033,6 +2071,7 @@ def binary_stats(y: np.ndarray, p: np.ndarray, population_prevalence: float | No
         bss=bss,
         calibration_slope=calibration_slope,
         calibration_intercept=calibration_intercept,
+        calibration_coverage=calibration_coverage(y, p),
         rr_top10=_rr_top(0.90),
         rr_top20=_rr_top(0.80),
         frac_ge_2x=_frac_ge(2.0),
@@ -2046,6 +2085,7 @@ def fmt_binary(stats: BinaryStats) -> str:
         f"Brier={stats.brier:.4f}  BSS={stats.bss:.4f}  "
         f"liability_R2={stats.liability_r2:.4f}  OR/SD={stats.or_per_sd:.3f}  "
         f"cal_slope={stats.calibration_slope:.3f}  cal_int={stats.calibration_intercept:+.3f}  "
+        f"cal_cov={stats.calibration_coverage:.2f}  "
         f"rr_top10={stats.rr_top10:.2f}  rr_top20={stats.rr_top20:.2f}  "
         f"frac>=2x={stats.frac_ge_2x:.3f}  frac>=3x={stats.frac_ge_3x:.3f}"
     )
@@ -2064,6 +2104,7 @@ def _binary_fields(prefix: str, stats: BinaryStats) -> dict[str, float | int]:
         f"{prefix}_bss": stats.bss,
         f"{prefix}_calibration_slope": stats.calibration_slope,
         f"{prefix}_calibration_intercept": stats.calibration_intercept,
+        f"{prefix}_calibration_coverage": stats.calibration_coverage,
         f"{prefix}_rr_top10": stats.rr_top10,
         f"{prefix}_rr_top20": stats.rr_top20,
         f"{prefix}_frac_ge_2x": stats.frac_ge_2x,
