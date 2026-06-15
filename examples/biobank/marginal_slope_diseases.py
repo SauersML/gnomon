@@ -3232,8 +3232,17 @@ def main() -> None:
     failures: list[tuple[str, str]] = []
     FIT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     force_refit = os.environ.get("ANC_FORCE_REFIT", "0") != "0"
+    # Phase control: BIOBANK_LOSO=0 does only the 80/20 in-distribution fit for
+    # every disease (fast breadth first); the default also runs the expensive
+    # leave-one-group-out refits. The two phases cache independently (the key
+    # uses the active axes, which are () when LOSO is off).
+    do_loso = os.environ.get("BIOBANK_LOSO", "1") != "0"
+    print(f"\nfit phase: 80/20 in-distribution"
+          + (" + LOSO out-of-distribution" if do_loso
+             else " ONLY (LOSO deferred; rerun with BIOBANK_LOSO=1 to add it)"))
     for name, cfg in diseases.items():
-        sig = disease_fit_cache_key(name, cfg, mode, active_axes, gamfit.__version__, cdr)
+        sig = disease_fit_cache_key(
+            name, cfg, mode, active_axes if do_loso else (), gamfit.__version__, cdr)
         cache_path = FIT_CACHE_DIR / f"{name}__{mode}__{sig}.log"
         if cache_path.exists() and cache_path.stat().st_size > 0 and not force_refit:
             print(f"\n=== {name.upper()} (CACHED fit reused, sig={sig}) ===")
@@ -3380,23 +3389,26 @@ def main() -> None:
                 mode=mode,
             )
 
-            print("  OOD: leave-one-group-out refits")
-            for axis in active_axes:
-                run_loso_axis(
-                    df_full,
-                    axis_name=axis,
-                    group_col=LOSO_AXIS_TO_COLUMN[axis],
-                    pc_cols=pc_cols,
-                    pgs_id=cfg["pgs"],
-                    min_train_events=MIN_LOSO_TRAIN_EVENTS,
-                    min_train_censors=MIN_LOSO_TRAIN_CENSORS,
-                    min_test_events=MIN_LOSO_TEST_EVENTS,
-                    min_test_censors=MIN_LOSO_TEST_CENSORS,
-                    min_test_n=MIN_LOSO_TEST_N,
-                    max_groups=MAX_LOSO_CARE_SITES if axis == "care_site" else None,
-                    score_train=False,
-                    mode=mode,
-                )
+            if do_loso:
+                print("  OOD: leave-one-group-out refits")
+                for axis in active_axes:
+                    run_loso_axis(
+                        df_full,
+                        axis_name=axis,
+                        group_col=LOSO_AXIS_TO_COLUMN[axis],
+                        pc_cols=pc_cols,
+                        pgs_id=cfg["pgs"],
+                        min_train_events=MIN_LOSO_TRAIN_EVENTS,
+                        min_train_censors=MIN_LOSO_TRAIN_CENSORS,
+                        min_test_events=MIN_LOSO_TEST_EVENTS,
+                        min_test_censors=MIN_LOSO_TEST_CENSORS,
+                        min_test_n=MIN_LOSO_TEST_N,
+                        max_groups=MAX_LOSO_CARE_SITES if axis == "care_site" else None,
+                        score_train=False,
+                        mode=mode,
+                    )
+            else:
+                print("  OOD: skipped (BIOBANK_LOSO=0 -- 80/20 in-distribution only)")
             # success: persist this disease's output so a rerun replays it
             # instead of recomputing the fit (ANC_FORCE_REFIT=1 overrides).
             sys.stdout = _real_stdout
