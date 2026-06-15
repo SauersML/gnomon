@@ -36,6 +36,7 @@ PHENOS = ("phenoA", "phenoR", "phenoB", "phenoC")
 SEEDS = tuple(range(1, 11))      # seed = inferential unit; averages out P+T threshold noise
 CENTERS = 12                     # gamfit marginal-slope surface centers (gam#979: keep modest)
 SURVIVAL_TIMEOUT_S = 1500        # cap a gamfit survival-MS stall; baselines already flushed
+RUN_SURVIVAL = os.environ.get("ANC_RUN_SURVIVAL", "1") != "0"  # survival is gam#979-stalled; skippable
 
 GEN_TASK_PEAK_GIB = 22.0         # one streamed sim's peak RAM (reservoirs + a chunk)
 MEM_HEADROOM_FRAC = 0.70
@@ -142,11 +143,14 @@ def main() -> None:
              "--centers", CENTERS, "--out-acc", res_b / f"{stem}_acc.csv",
              "--out-cal", res_b / f"{stem}_cal.csv", "--out-pred", res_b / f"{stem}_pred.parquet"],
             log_dir / f"fitb_{stem}.log", None))
-        fit_tasks.append((
-            [sys.executable, FIT_SURVIVAL, "--data", p, "--dem", dem, "--pheno", pheno,
-             "--centers", CENTERS, "--out-acc", res_s / f"{stem}_acc.csv",
-             "--out-cal", res_s / f"{stem}_cal.csv"],
-            log_dir / f"fits_{stem}.log", SURVIVAL_TIMEOUT_S))
+        if RUN_SURVIVAL:
+            fit_tasks.append((
+                [sys.executable, FIT_SURVIVAL, "--data", p, "--dem", dem, "--pheno", pheno,
+                 "--centers", CENTERS, "--out-acc", res_s / f"{stem}_acc.csv",
+                 "--out-cal", res_s / f"{stem}_cal.csv"],
+                log_dir / f"fits_{stem}.log", SURVIVAL_TIMEOUT_S))
+    if not RUN_SURVIVAL:
+        print("ANC_RUN_SURVIVAL=0: skipping survival arm (gam#979 stall)", flush=True)
     run_many(fit_tasks, FIT_JOBS)
 
     # 4. aggregate + 5. figures (study-design Figure 1 + result figures).
