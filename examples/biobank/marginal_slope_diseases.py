@@ -394,19 +394,43 @@ def print_cached_metrics_summary(mode: str) -> None:
     # that follow `test` anywhere on the line.
     pat = re.compile(rf"^\s*({'|'.join(map(re.escape, all_labels))})\s+.*?\btest\s+(.+)$", re.M)
     logs = sorted(glob.glob(str(FIT_CACHE_DIR / f"*__{mode}__*.log")))
+    pred_files = sorted(glob.glob(str(FIT_CACHE_DIR / f"*__{mode}__*.pred.npz")))
     per_disease: dict[str, dict[str, str]] = {}
+
+    # Preferred path: prediction sidecars. These let the startup board recompute
+    # the CURRENT metric definitions from a completed fit without refitting.
+    for pf in pred_files:
+        slug = Path(pf).name.split("__")[0]
+        rows = _cached_binary_prediction_rows(Path(pf)) if mode == "binary" else {}
+        if rows:
+            per_disease[slug] = rows
+
     for lf in logs:
         slug = Path(lf).name.split("__")[0]
+        if slug in per_disease:
+            continue
         try:
             txt = Path(lf).read_text()
         except OSError:
             continue
         d = per_disease.setdefault(slug, {})
+        # Structured JSON is preferred over formatted lines because it survives
+        # display-label changes and lets us fill the full current metric list.
+        for line in txt.splitlines():
+            if " BINARY_RESULT " not in line:
+                continue
+            try:
+                result = json.loads(line.split(" BINARY_RESULT ", 1)[1])
+            except (IndexError, json.JSONDecodeError):
+                continue
+            if mode == "binary":
+                d.update(_binary_result_rows(result))
         for label, metrics in pat.findall(txt):
-            d[alias_to_canon[label]] = metrics.strip()  # last wins (pass 2 if both)
+            d.setdefault(alias_to_canon[label], metrics.strip())  # JSON/pred rows win
     print(f"\n=== RESULTS SO FAR ({mode}): {len(per_disease)} disease(s) "
-          f"from {len(logs)} cached fit file(s) [{FIT_CACHE_DIR}] ===")
-    if not logs:
+          f"from {len(logs)} cached log(s), {len(pred_files)} prediction sidecar(s) "
+          f"[{FIT_CACHE_DIR}] ===")
+    if not logs and not pred_files:
         print("  (none yet -- nothing cached)")
     elif not any(per_disease.values()):
         print(f"  ({len(logs)} cache file(s) present but no method 'test' line "
@@ -2073,9 +2097,27 @@ def binary_stats(y: np.ndarray, p: np.ndarray, population_prevalence: float | No
             return float("nan")
         return float((y[flag].mean() + eps) / (y[~flag].mean() + eps))
 
-    def _frac_ge(k: float) -> float:  # % flagged at >= k x mean predicted risk
-        m = float(p.mean())
-        return float(np.mean(p >= k * m)) if m > 0.0 else float("nan")
+    # The biobank fits on a BALANCED (1:1 case-control) split, so predicted risks
+    # centre on ~0.5 and ">= k x the mean" (>= k*0.5) is unreachable -> frac would
+    # be a useless 0. Recalibrate predictions to the true population prevalence
+    # (an intercept offset on the logit, preserving ranking/spread) before the
+    # absolute-risk-threshold metrics, so "fraction at >= k-fold population risk"
+    # lands on the real risk scale. Falls back to the sample mean if no prevalence.
+    _ref = prevalence
+    _p_risk = p
+    if population_prevalence is not None and 0.0 < population_prevalence < 1.0:
+        _ref = float(population_prevalence)
+        try:
+            from scipy.optimize import brentq
+            from scipy.special import expit
+            _lpr = np.log(p / (1.0 - p))
+            _off = brentq(lambda a: float(np.mean(expit(a + _lpr))) - _ref, -25.0, 25.0)
+            _p_risk = expit(_off + _lpr)
+        except Exception:  # noqa: BLE001
+            _p_risk, _ref = p, float(p.mean())
+
+    def _frac_ge(k: float) -> float:  # % of population at >= k x the average risk
+        return float(np.mean(_p_risk >= k * _ref)) if _ref > 0.0 else float("nan")
 
     return BinaryStats(
         n=int(len(y)),
