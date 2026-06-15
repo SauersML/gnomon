@@ -370,9 +370,13 @@ def print_cached_metrics_summary(mode: str) -> None:
     import glob
 
     label = "GAM" if mode == "survival" else "binaryGAM"
-    pat = re.compile(rf"^\s*{label}\s+test\s+(.+)$", re.M)
+    # The metric line may be either "<label>  test <m>" or the combined
+    # "<label>  train <m>  test <m>", so match `test` anywhere after the label
+    # (not immediately after it) and capture the test metrics that follow.
+    pat = re.compile(rf"^\s*{label}\s+.*?\btest\s+(.+)$", re.M)
+    logs = sorted(glob.glob(str(FIT_CACHE_DIR / f"*__{mode}__*.log")))
     rows: dict[str, str] = {}
-    for lf in sorted(glob.glob(str(FIT_CACHE_DIR / f"*__{mode}__*.log"))):
+    for lf in logs:
         slug = Path(lf).name.split("__")[0]
         try:
             txt = Path(lf).read_text()
@@ -381,9 +385,13 @@ def print_cached_metrics_summary(mode: str) -> None:
         matches = pat.findall(txt)
         if matches:
             rows[slug] = matches[-1].strip()  # last (pass-2 if both present)
-    print(f"\n=== RESULTS SO FAR ({mode}): {len(rows)} finished fit(s) cached ===")
-    if not rows:
+    print(f"\n=== RESULTS SO FAR ({mode}): {len(rows)} disease(s) "
+          f"from {len(logs)} cached fit file(s) [{FIT_CACHE_DIR}] ===")
+    if not logs:
         print("  (none yet -- nothing cached)")
+    elif not rows:
+        print(f"  ({len(logs)} cache file(s) present but no '{label} ... test' "
+              f"line could be parsed -- format mismatch)")
     for slug in sorted(rows):
         print(f"  {slug:<26} {rows[slug]}")
     print("=== /RESULTS SO FAR ===")
