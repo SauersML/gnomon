@@ -361,6 +361,34 @@ def disease_fit_cache_key(
                  MIN_LOSO_TEST_CENSORS, MIN_LOSO_TEST_N, MAX_LOSO_CARE_SITES],
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def print_cached_metrics_summary(mode: str) -> None:
+    """Upfront board of the in-distribution (80/20) test metrics from every fit
+    already finished and cached, so a new run shows results-so-far before doing
+    any more work. Reads the GAM (marginal-slope) test line out of each cache log."""
+    import glob
+
+    label = "GAM" if mode == "survival" else "binaryGAM"
+    pat = re.compile(rf"^\s*{label}\s+test\s+(.+)$", re.M)
+    rows: dict[str, str] = {}
+    for lf in sorted(glob.glob(str(FIT_CACHE_DIR / f"*__{mode}__*.log"))):
+        slug = Path(lf).name.split("__")[0]
+        try:
+            txt = Path(lf).read_text()
+        except OSError:
+            continue
+        matches = pat.findall(txt)
+        if matches:
+            rows[slug] = matches[-1].strip()  # last (pass-2 if both present)
+    print(f"\n=== RESULTS SO FAR ({mode}): {len(rows)} finished fit(s) cached ===")
+    if not rows:
+        print("  (none yet -- nothing cached)")
+    for slug in sorted(rows):
+        print(f"  {slug:<26} {rows[slug]}")
+    print("=== /RESULTS SO FAR ===")
+
+
 BOOTSTRAP_RESAMPLES = 399
 BOOTSTRAP_CONFIDENCE_LEVEL = 0.95
 
@@ -3148,6 +3176,9 @@ def main() -> None:
             "SNOMED_PGS_MAP or verify OHDSI extraction."
         )
     print(f"diseases with real PGS IDs: {list(diseases)}")
+
+    # Upfront board: in-distribution test metrics for every fit finished so far.
+    print_cached_metrics_summary(mode)
 
     ensure_scored([cfg["pgs"] for cfg in diseases.values()])
 
