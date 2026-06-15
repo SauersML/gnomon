@@ -3231,23 +3231,20 @@ def main() -> None:
 
     failures: list[tuple[str, str]] = []
     FIT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    force_refit = os.environ.get("ANC_FORCE_REFIT", "0") != "0"
-    # Phase control: BIOBANK_LOSO=0 does only the 80/20 in-distribution fit for
-    # every disease (fast breadth first); the default also runs the expensive
-    # leave-one-group-out refits. The two phases cache independently (the key
-    # uses the active axes, which are () when LOSO is off).
-    do_loso = os.environ.get("BIOBANK_LOSO", "1") != "0"
-    print(f"\nfit phase: 80/20 in-distribution"
-          + (" + LOSO out-of-distribution" if do_loso
-             else " ONLY (LOSO deferred; rerun with BIOBANK_LOSO=1 to add it)"))
-    for name, cfg in diseases.items():
+
+    # Run every disease's 80/20 in-distribution fit first (pass 1), then every
+    # disease's leave-one-group-out refits (pass 2) -- breadth before the
+    # expensive out-of-distribution work. The two passes cache independently
+    # (the key uses the active axes, which are () when LOSO is off); in pass 2
+    # the 80/20 part rides the gamfit warm-start cache, so only LOSO is paid for.
+    def run_disease(name, cfg, do_loso):
         sig = disease_fit_cache_key(
             name, cfg, mode, active_axes if do_loso else (), gamfit.__version__, cdr)
         cache_path = FIT_CACHE_DIR / f"{name}__{mode}__{sig}.log"
-        if cache_path.exists() and cache_path.stat().st_size > 0 and not force_refit:
+        if cache_path.exists() and cache_path.stat().st_size > 0:
             print(f"\n=== {name.upper()} (CACHED fit reused, sig={sig}) ===")
             sys.stdout.write(cache_path.read_text())
-            continue
+            return
         _cap = io.StringIO()
         _real_stdout = sys.stdout
         sys.stdout = _Tee(_real_stdout, _cap)
@@ -3408,9 +3405,9 @@ def main() -> None:
                         mode=mode,
                     )
             else:
-                print("  OOD: skipped (BIOBANK_LOSO=0 -- 80/20 in-distribution only)")
+                print("  OOD: deferred to pass 2 (80/20 in-distribution only)")
             # success: persist this disease's output so a rerun replays it
-            # instead of recomputing the fit (ANC_FORCE_REFIT=1 overrides).
+            # instead of recomputing the fit (delete the cache file to force).
             sys.stdout = _real_stdout
             try:
                 # atomic: write a temp then rename, so a killed mid-write never
@@ -3429,9 +3426,20 @@ def main() -> None:
             failures.append((name, f"{type(exc).__name__}: {exc}"))
         finally:
             sys.stdout = _real_stdout
-    if failures:
-        print(f"\n=== {len(failures)} of {len(diseases)} disease(s) FAILED (run continued): "
-              + ", ".join(f"{n} [{e}]" for n, e in failures) + " ===")
+
+    # Pass 1: every disease's 80/20 in-distribution fit (breadth first).
+    print("\n=== PASS 1/2: 80/20 in-distribution fits for all diseases ===")
+    for name, cfg in diseases.items():
+        run_disease(name, cfg, do_loso=False)
+    # Pass 2: every disease's leave-one-group-out refits.
+    print("\n=== PASS 2/2: leave-one-group-out refits for all diseases ===")
+    for name, cfg in diseases.items():
+        run_disease(name, cfg, do_loso=True)
+
+    failed_names = sorted({n for n, _ in failures})
+    if failed_names:
+        print(f"\n=== {len(failed_names)} of {len(diseases)} disease(s) FAILED (run continued): "
+              + ", ".join(failed_names) + " ===")
     else:
         print(f"\n=== all {len(diseases)} disease(s) completed without a fatal error ===")
 
