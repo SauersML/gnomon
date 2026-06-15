@@ -1930,13 +1930,16 @@ def binary_stats(y: np.ndarray, p: np.ndarray, population_prevalence: float | No
     # OR per 1 SD of the standardized risk score (logit scale): canonical PGS
     # effect-size metric, defined identically to the simulation's `or_per_sd`.
     or_per_sd = float("nan")
-    if len(np.unique(y)) > 1:
-        score = np.log(p / (1.0 - p))
-        sd = float(score.std())
-        if sd > 1e-9:
-            zsc = ((score - score.mean()) / sd).reshape(-1, 1)
-            coef = LogisticRegression(C=1e6, max_iter=2000).fit(zsc, y).coef_[0][0]
-            or_per_sd = float(np.exp(coef))
+    try:
+        if len(np.unique(y)) > 1:
+            score = np.log(p / (1.0 - p))
+            sd = float(score.std())
+            if sd > 1e-9:
+                zsc = ((score - score.mean()) / sd).reshape(-1, 1)
+                coef = LogisticRegression(C=1e6, max_iter=2000).fit(zsc, y).coef_[0][0]
+                or_per_sd = float(np.exp(coef))
+    except Exception:  # noqa: BLE001 -- OR/SD must never break a fit (would block caching)
+        or_per_sd = float("nan")
     ll_model = -float(log_loss(y, p, labels=[0, 1], normalize=False))
     null_p = np.repeat(prevalence, len(y))
     ll_null = -float(log_loss(y, null_p, labels=[0, 1], normalize=False))
@@ -3474,6 +3477,10 @@ def main() -> None:
     print("\n=== PASS 2/2: leave-one-group-out refits for all diseases ===")
     for name, cfg in diseases.items():
         run_disease(name, cfg, do_loso=True)
+
+    # Final board: the cache now holds this run's fits too, so this always shows
+    # the just-finished results (the start-of-run board only sees prior runs).
+    print_cached_metrics_summary(mode)
 
     failed_names = sorted({n for n, _ in failures})
     if failed_names:
