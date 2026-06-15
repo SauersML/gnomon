@@ -394,7 +394,7 @@ SNOMED_PGS_MAP: dict[str, dict[str, str]] = {
     "414916001": {"slug": "obesity", "pgs": "PGS005331"},
 }
 
-TOP_N_DISEASES = 15
+TOP_N_DISEASES = 20
 
 # OHDSI Phenotype Library: canonical Reference disease cohorts.
 SNOMED_DISEASE_CODE = "64572001"  # SNOMED root for 'Disease (disorder)'
