@@ -385,13 +385,52 @@ ANCESTRY_PREDS_CACHE = WORKDIR / "ancestry_preds.tsv"
 # intersection by case prevalence (descendant expansion via
 # `concept_ancestor`) in the active CDR; the top TOP_N_DISEASES survive.
 # Extending this map is the only thing needed to grow the runtime set.
+#
+# Each PGS below was audited for the All-of-Us exclusion rule: a score is only
+# eligible if All of Us was NOT a score-development/training (or GWAS-discovery)
+# cohort -- AoU appearing solely as an external evaluation cohort is fine. SNOMED
+# codes are the standard concept_codes for each disease name; unresolvable codes
+# are skipped (non-fatal) and surfaced in the DISEASE SELECTION report.
 SNOMED_PGS_MAP: dict[str, dict[str, str]] = {
-    # COPD -- Jung et al. metaPRS for J44. Not trained in AoU.
-    "13645005": {"slug": "copd", "pgs": "PGS004536"},
-    # Hypertension -- Privé et al. 2022 sparse hypertension PRS. Not trained in AoU.
+    # Hypertension -- Privé et al. 2022 sparse hypertension PRS. Not AoU-trained.
     "38341003": {"slug": "hypertension", "pgs": "PGS001320"},
-    # Obesity -- Kim et al. 2026 O_MetPRS_EUR; LDpred2 over multi-ancestry GWAS.
+    # Hyperlipidemia -- Jung 2024 RFDiseasemetaPRS meta.E78 (lipoprotein disorders); UKB.
+    "55822004": {"slug": "hyperlipidemia", "pgs": "PGS004518"},
+    # Osteoarthritis -- INTERVENE MegaPRS knee OA (Jermy/INTERVENE); 1000G dev.
+    "396275006": {"slug": "osteoarthritis", "pgs": "PGS004883"},
+    # Heart disease (read as CAD) -- Patel 2023 GPS_Mult multi-ancestry; UKB tranche.
+    "56265001": {"slug": "heart_disease", "pgs": "PGS003725"},
+    # Sleep disorder -- Jung 2024 RFDiseasemetaPRS meta.G47; UKB.
+    "39898005": {"slug": "sleep_disorder", "pgs": "PGS004522"},
+    # Depressive disorder -- INTERVENE MegaPRS MDD; 1000G dev.
+    "35489007": {"slug": "depressive_disorder", "pgs": "PGS004885"},
+    # Obesity -- Kim et al. 2026 O_MetPRS_EUR; AoU external-test only.
     "414916001": {"slug": "obesity", "pgs": "PGS005331"},
+    # Gastroesophageal reflux disease -- Jung 2024 RFDiseasemetaPRS meta.K21; UKB.
+    "235595009": {"slug": "gerd", "pgs": "PGS004538"},
+    # Anemia (B12-deficiency anemia) -- Tanigawa snpnet GBE_HC608; UKB.
+    "271737000": {"slug": "anemia", "pgs": "PGS001305"},
+    # Major depressive disorder -- INTERVENE MegaPRS MDD (same score as depressive_disorder).
+    "370143000": {"slug": "major_depressive_disorder", "pgs": "PGS004885"},
+    # Drug dependence -- Hatoum PRSaddiction-rf multivariate addiction GWAS. Not AoU-trained.
+    "191816009": {"slug": "drug_dependence", "pgs": "PGS003849"},
+    # Type 2 diabetes -- D-PRISM D_T2DPRS EUR (PRS-CSx); AoU external-eval only.
+    "44054006": {"slug": "type_2_diabetes", "pgs": "PGS005371"},
+    # Cardiac arrhythmia (atrial fibrillation) -- Yuan AF PRS-CSx cross-population.
+    "698247007": {"slug": "cardiac_arrhythmia", "pgs": "PGS005313"},
+    # Allergic rhinitis -- Tanigawa snpnet GBE_HC1021; UKB.
+    "61582004": {"slug": "allergic_rhinitis", "pgs": "PGS001109"},
+    # Sleep apnea -- PRS_BMIadjOSA (PRS-CSs); FinnGen/MGBB/MVP, AoU only validation
+    # (NOT fully paper-verified -- final text was paywalled; flagged for re-check).
+    "73430006": {"slug": "sleep_apnea", "pgs": "PGS005219"},
+    # Malignant neoplastic disease -- INTERVENE MegaPRS AllCancers; 1000G dev.
+    "363346000": {"slug": "malignant_neoplasm", "pgs": "PGS004875"},
+    # Asthma -- INTERVENE MegaPRS Asthma; 1000G dev.
+    "195967001": {"slug": "asthma", "pgs": "PGS004877"},
+    # COPD -- Jung et al. metaPRS for J44. Not AoU-trained.
+    "13645005": {"slug": "copd", "pgs": "PGS004536"},
+    # No eligible PGS Catalog score (stay SKIP, surfaced in the top-N report):
+    # urinary tract infection, sinusitis, pharyngitis.
 }
 
 TOP_N_DISEASES = 20
@@ -932,16 +971,18 @@ def select_runtime_diseases(client: bigquery.Client, cdr: str) -> dict[str, dict
     resolved_codes = set(resolved["concept_code"].astype(str))
     missing = [c for c in mapped_codes if c not in resolved_codes]
     if missing:
-        raise ValueError(
-            f"SNOMED codes in SNOMED_PGS_MAP not resolvable in {cdr}.concept: {missing}"
-        )
+        # Non-fatal: one bad/non-standard SNOMED code must not abort the whole
+        # run. Skip it (and its disease) and surface it; everything else runs.
+        print(f"  WARNING: {len(missing)} SNOMED code(s) not resolvable in "
+              f"{cdr}.concept -- skipping: "
+              + ", ".join(f"{c} ({SNOMED_PGS_MAP[c]['slug']})" for c in missing))
     code_to_id = dict(zip(resolved["concept_code"].astype(str), resolved["concept_id"]))
     code_to_name = dict(zip(resolved["concept_code"].astype(str), resolved["concept_name"]))
     print(f"  resolved {len(code_to_id)} SNOMED code(s) to OMOP concept_ids")
 
     canonical = extract_ohdsi_canonical_disease_concepts(client, cdr)
 
-    mapped_ids = {int(code_to_id[c]): c for c in mapped_codes}
+    mapped_ids = {int(code_to_id[c]): c for c in mapped_codes if c in code_to_id}
     survivors = {cid: code for cid, code in mapped_ids.items() if cid in canonical}
     dropped = [
         (code, code_to_name[code]) for cid, code in mapped_ids.items() if cid not in canonical
