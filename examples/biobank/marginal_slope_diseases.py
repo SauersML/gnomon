@@ -3109,161 +3109,173 @@ def main() -> None:
             )
     print("=== /PRE-FLIGHT ===\n")
 
+    failures: list[tuple[str, str]] = []
     for name, cfg in diseases.items():
-        print(f"\n=== {name.upper()} ===")
-        pgs_df = load_one_pgs(cfg["pgs"])
-        df_full = base.merge(pgs_df, on="person_id")
-        print(
-            f"  merge[base+pgs]: base={len(base):,} pgs={len(pgs_df):,} "
-            f"merged={len(df_full):,}"
-        )
-        if len(df_full) == 0:
-            base_ids = set(base["person_id"].head(5))
-            pgs_ids = set(pgs_df["person_id"].head(5))
-            print(f"    base sample person_id={sorted(base_ids)}")
-            print(f"    pgs  sample person_id={sorted(pgs_ids)}")
+        try:
+            print(f"\n=== {name.upper()} ===")
+            pgs_df = load_one_pgs(cfg["pgs"])
+            df_full = base.merge(pgs_df, on="person_id")
             print(
-                f"    base dtype={base['person_id'].dtype} "
-                f"pgs dtype={pgs_df['person_id'].dtype}"
+                f"  merge[base+pgs]: base={len(base):,} pgs={len(pgs_df):,} "
+                f"merged={len(df_full):,}"
             )
-        ancestor = int(cfg["concept_id"])
-        case_dates = fetch_cases(client, cdr, ancestor)
-        before_cases = len(df_full)
-        df_full = df_full.merge(case_dates, on="person_id", how="left")
-        matched_cases = int(df_full["event_date"].notna().sum())
-        print(
-            f"  merge[+cases]: pre={before_cases:,} cases_returned={len(case_dates):,} "
-            f"matched={matched_cases:,}"
-        )
-        if matched_cases == 0 and len(case_dates) > 0 and before_cases > 0:
-            base_ids = set(df_full["person_id"].head(5))
-            case_ids = set(case_dates["person_id"].head(5))
-            print(f"    df_full sample person_id={sorted(base_ids)}")
-            print(f"    cases   sample person_id={sorted(case_ids)}")
+            if len(df_full) == 0:
+                base_ids = set(base["person_id"].head(5))
+                pgs_ids = set(pgs_df["person_id"].head(5))
+                print(f"    base sample person_id={sorted(base_ids)}")
+                print(f"    pgs  sample person_id={sorted(pgs_ids)}")
+                print(
+                    f"    base dtype={base['person_id'].dtype} "
+                    f"pgs dtype={pgs_df['person_id'].dtype}"
+                )
+            ancestor = int(cfg["concept_id"])
+            case_dates = fetch_cases(client, cdr, ancestor)
+            before_cases = len(df_full)
+            df_full = df_full.merge(case_dates, on="person_id", how="left")
+            matched_cases = int(df_full["event_date"].notna().sum())
             print(
-                f"    df_full dtype={df_full['person_id'].dtype} "
-                f"cases dtype={case_dates['person_id'].dtype}"
+                f"  merge[+cases]: pre={before_cases:,} cases_returned={len(case_dates):,} "
+                f"matched={matched_cases:,}"
             )
-        df_full["event"] = df_full["event_date"].notna().astype(int)
+            if matched_cases == 0 and len(case_dates) > 0 and before_cases > 0:
+                base_ids = set(df_full["person_id"].head(5))
+                case_ids = set(case_dates["person_id"].head(5))
+                print(f"    df_full sample person_id={sorted(base_ids)}")
+                print(f"    cases   sample person_id={sorted(case_ids)}")
+                print(
+                    f"    df_full dtype={df_full['person_id'].dtype} "
+                    f"cases dtype={case_dates['person_id'].dtype}"
+                )
+            df_full["event"] = df_full["event_date"].notna().astype(int)
 
-        # Age-as-time-scale (years). Entry: age at AoU obs-period start.
-        # Exit: age at first qualifying condition for events; age at obs-period
-        # end for censors. Left-truncation respected via `Surv(entry, exit, event)`.
-        #
-        # `current_age` (age at obs_end) is the fourth age column. Unlike
-        # `exit_age` (event onset for cases, obs_end for censors -- endogenous
-        # to the label) and `followup_years = exit_age - entry_age`, which
-        # would be label-leaky if used as a binary covariate, `current_age`
-        # depends only on birth_datetime and obs_end and is exogenous to the
-        # outcome. The binary path then materialises a single matched age
-        # basis used by every model — a quadratic in z-scored `current_age`
-        # (`current_age_z`, `current_age_z2`) plus linear `entry_age_z` —
-        # so age is held identical across the GAM and the logistic
-        # baselines.
-        days_per_year = 365.25
-        df_full["entry_age"] = (
-            (df_full["obs_start"] - df_full["birth_datetime"]).dt.days / days_per_year
-        )
-        exit_date = df_full["event_date"].fillna(df_full["obs_end"])
-        df_full["exit_age"] = (
-            (exit_date - df_full["birth_datetime"]).dt.days / days_per_year
-        )
-        df_full["current_age"] = (
-            (df_full["obs_end"] - df_full["birth_datetime"]).dt.days / days_per_year
-        )
+            # Age-as-time-scale (years). Entry: age at AoU obs-period start.
+            # Exit: age at first qualifying condition for events; age at obs-period
+            # end for censors. Left-truncation respected via `Surv(entry, exit, event)`.
+            #
+            # `current_age` (age at obs_end) is the fourth age column. Unlike
+            # `exit_age` (event onset for cases, obs_end for censors -- endogenous
+            # to the label) and `followup_years = exit_age - entry_age`, which
+            # would be label-leaky if used as a binary covariate, `current_age`
+            # depends only on birth_datetime and obs_end and is exogenous to the
+            # outcome. The binary path then materialises a single matched age
+            # basis used by every model — a quadratic in z-scored `current_age`
+            # (`current_age_z`, `current_age_z2`) plus linear `entry_age_z` —
+            # so age is held identical across the GAM and the logistic
+            # baselines.
+            days_per_year = 365.25
+            df_full["entry_age"] = (
+                (df_full["obs_start"] - df_full["birth_datetime"]).dt.days / days_per_year
+            )
+            exit_date = df_full["event_date"].fillna(df_full["obs_end"])
+            df_full["exit_age"] = (
+                (exit_date - df_full["birth_datetime"]).dt.days / days_per_year
+            )
+            df_full["current_age"] = (
+                (df_full["obs_end"] - df_full["birth_datetime"]).dt.days / days_per_year
+            )
 
-        # Drop rows with non-positive or invalid intervals: missing birth/obs,
-        # prevalent cases whose event predates obs_start (entry >= exit), etc.
-        before = len(df_full)
-        miss = {c: int(df_full[c].isna().sum()) for c in
-                ("pgs", "entry_age", "exit_age", "current_age",
-                 "birth_datetime", "obs_start", "obs_end")}
-        df_full = df_full.dropna(
-            subset=["pgs", "entry_age", "exit_age", "current_age"]
-        ).copy()
-        after_dropna = len(df_full)
-        df_full = df_full[df_full["exit_age"] > df_full["entry_age"]].copy()
-        after_exit_gt_entry = len(df_full)
-        df_full = df_full[df_full["entry_age"] >= 0].copy()
-        after_entry_nonneg = len(df_full)
-        df_full = df_full[df_full["current_age"] >= df_full["entry_age"]].copy()
-        dropped = before - len(df_full)
-        print(
-            f"  filters: pre={before:,} "
-            f"after_dropna={after_dropna:,} "
-            f"after_exit>entry={after_exit_gt_entry:,} "
-            f"after_entry>=0={after_entry_nonneg:,} "
-            f"final={len(df_full):,}  na_counts={miss}"
-        )
-        n_event = int(df_full["event"].sum())
-        n_censor = len(df_full) - n_event
-        K = n_event / max(1, len(df_full))
-        print(
-            f"  snomed={cfg['snomed_name']!r}  concept_id={ancestor}  "
-            f"events={n_event:,}  censors={n_censor:,}  K(crude)={K:.6f}  "
-            f"dropped_bad_intervals={dropped:,}"
-        )
+            # Drop rows with non-positive or invalid intervals: missing birth/obs,
+            # prevalent cases whose event predates obs_start (entry >= exit), etc.
+            before = len(df_full)
+            miss = {c: int(df_full[c].isna().sum()) for c in
+                    ("pgs", "entry_age", "exit_age", "current_age",
+                     "birth_datetime", "obs_start", "obs_end")}
+            df_full = df_full.dropna(
+                subset=["pgs", "entry_age", "exit_age", "current_age"]
+            ).copy()
+            after_dropna = len(df_full)
+            df_full = df_full[df_full["exit_age"] > df_full["entry_age"]].copy()
+            after_exit_gt_entry = len(df_full)
+            df_full = df_full[df_full["entry_age"] >= 0].copy()
+            after_entry_nonneg = len(df_full)
+            df_full = df_full[df_full["current_age"] >= df_full["entry_age"]].copy()
+            dropped = before - len(df_full)
+            print(
+                f"  filters: pre={before:,} "
+                f"after_dropna={after_dropna:,} "
+                f"after_exit>entry={after_exit_gt_entry:,} "
+                f"after_entry>=0={after_entry_nonneg:,} "
+                f"final={len(df_full):,}  na_counts={miss}"
+            )
+            n_event = int(df_full["event"].sum())
+            n_censor = len(df_full) - n_event
+            K = n_event / max(1, len(df_full))
+            print(
+                f"  snomed={cfg['snomed_name']!r}  concept_id={ancestor}  "
+                f"events={n_event:,}  censors={n_censor:,}  K(crude)={K:.6f}  "
+                f"dropped_bad_intervals={dropped:,}"
+            )
 
-        # Balanced events:censors = 1:1, then 80/20 train/test per class.
-        # Survival likelihood *can* use every censor, but per-cycle PIRLS
-        # cost scales with n_train and statistical power is event-bound,
-        # so downsample censors to match event count up front.
-        event_idx_all = rng.permutation(df_full.index[df_full["event"] == 1].to_numpy())
-        censor_idx_all = rng.permutation(df_full.index[df_full["event"] == 0].to_numpy())
-        n_keep = min(len(event_idx_all), len(censor_idx_all))
-        event_idx = event_idx_all[:n_keep]
-        censor_idx = censor_idx_all[:n_keep]
-        n_train_event = int(round(n_keep * TRAIN_FRACTION))
-        n_train_censor = int(round(n_keep * TRAIN_FRACTION))
-        train_pick = np.concatenate([
-            event_idx[:n_train_event], censor_idx[:n_train_censor],
-        ])
-        test_pick = np.concatenate([
-            event_idx[n_train_event:], censor_idx[n_train_censor:],
-        ])
-        print(
-            f"  split: n={len(df_full):,}  "
-            f"train_events={n_train_event:,} train_censors={n_train_censor:,}  "
-            f"test_events={len(event_idx) - n_train_event:,} "
-            f"test_censors={len(censor_idx) - n_train_censor:,}"
-        )
-        train = df_full.loc[train_pick].reset_index(drop=True)
-        test = df_full.loc[test_pick].reset_index(drop=True)
+            # Balanced events:censors = 1:1, then 80/20 train/test per class.
+            # Survival likelihood *can* use every censor, but per-cycle PIRLS
+            # cost scales with n_train and statistical power is event-bound,
+            # so downsample censors to match event count up front.
+            event_idx_all = rng.permutation(df_full.index[df_full["event"] == 1].to_numpy())
+            censor_idx_all = rng.permutation(df_full.index[df_full["event"] == 0].to_numpy())
+            n_keep = min(len(event_idx_all), len(censor_idx_all))
+            event_idx = event_idx_all[:n_keep]
+            censor_idx = censor_idx_all[:n_keep]
+            n_train_event = int(round(n_keep * TRAIN_FRACTION))
+            n_train_censor = int(round(n_keep * TRAIN_FRACTION))
+            train_pick = np.concatenate([
+                event_idx[:n_train_event], censor_idx[:n_train_censor],
+            ])
+            test_pick = np.concatenate([
+                event_idx[n_train_event:], censor_idx[n_train_censor:],
+            ])
+            print(
+                f"  split: n={len(df_full):,}  "
+                f"train_events={n_train_event:,} train_censors={n_train_censor:,}  "
+                f"test_events={len(event_idx) - n_train_event:,} "
+                f"test_censors={len(censor_idx) - n_train_censor:,}"
+            )
+            train = df_full.loc[train_pick].reset_index(drop=True)
+            test = df_full.loc[test_pick].reset_index(drop=True)
 
-        evaluate_model_pair(
-            train,
-            test,
-            pc_cols,
-            cfg["pgs"],
-            label=f"PGS={cfg['pgs']} random_split K(crude)={K:.6f}",
-            population_prevalence=K,
-            save_info={
-                "disease": name,
-                "pgs": cfg["pgs"],
-                "snomed_name": cfg["snomed_name"],
-                "concept_id": ancestor,
-                "K_crude": K,
-            },
-            mode=mode,
-        )
-
-        print("  OOD: leave-one-group-out refits")
-        for axis in active_axes:
-            run_loso_axis(
-                df_full,
-                axis_name=axis,
-                group_col=LOSO_AXIS_TO_COLUMN[axis],
-                pc_cols=pc_cols,
-                pgs_id=cfg["pgs"],
-                min_train_events=MIN_LOSO_TRAIN_EVENTS,
-                min_train_censors=MIN_LOSO_TRAIN_CENSORS,
-                min_test_events=MIN_LOSO_TEST_EVENTS,
-                min_test_censors=MIN_LOSO_TEST_CENSORS,
-                min_test_n=MIN_LOSO_TEST_N,
-                max_groups=MAX_LOSO_CARE_SITES if axis == "care_site" else None,
-                score_train=False,
+            evaluate_model_pair(
+                train,
+                test,
+                pc_cols,
+                cfg["pgs"],
+                label=f"PGS={cfg['pgs']} random_split K(crude)={K:.6f}",
+                population_prevalence=K,
+                save_info={
+                    "disease": name,
+                    "pgs": cfg["pgs"],
+                    "snomed_name": cfg["snomed_name"],
+                    "concept_id": ancestor,
+                    "K_crude": K,
+                },
                 mode=mode,
             )
+
+            print("  OOD: leave-one-group-out refits")
+            for axis in active_axes:
+                run_loso_axis(
+                    df_full,
+                    axis_name=axis,
+                    group_col=LOSO_AXIS_TO_COLUMN[axis],
+                    pc_cols=pc_cols,
+                    pgs_id=cfg["pgs"],
+                    min_train_events=MIN_LOSO_TRAIN_EVENTS,
+                    min_train_censors=MIN_LOSO_TRAIN_CENSORS,
+                    min_test_events=MIN_LOSO_TEST_EVENTS,
+                    min_test_censors=MIN_LOSO_TEST_CENSORS,
+                    min_test_n=MIN_LOSO_TEST_N,
+                    max_groups=MAX_LOSO_CARE_SITES if axis == "care_site" else None,
+                    score_train=False,
+                    mode=mode,
+                )
+        except Exception as exc:
+            import traceback
+            print(f"\n!!! DISEASE FAILED: {name} ({type(exc).__name__}: {exc}) -- continuing with next disease")
+            traceback.print_exc()
+            failures.append((name, f"{type(exc).__name__}: {exc}"))
+    if failures:
+        print(f"\n=== {len(failures)} of {len(diseases)} disease(s) FAILED (run continued): "
+              + ", ".join(f"{n} [{e}]" for n, e in failures) + " ===")
+    else:
+        print(f"\n=== all {len(diseases)} disease(s) completed without a fatal error ===")
 
 
 if __name__ == "__main__":
