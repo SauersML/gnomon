@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+from scipy.optimize import brentq
+from scipy.special import expit
 from scipy.stats import norm, pearsonr, spearmanr
 from sklearn.linear_model import LogisticRegression
 
@@ -155,14 +157,60 @@ def _tail_rmse_true(p_true, p_pred, q: float = 0.9) -> float:
     return float(np.sqrt(np.mean((p_pred[m] - p_true[m]) ** 2)))
 
 
-def _rr_top10_true(p_true, p_pred, q: float = 0.9) -> float:
-    """True-risk ratio of the top-decile-by-PREDICTED vs the rest: does flagging
-    the top 10% by score actually enrich for genuinely high true risk?
-    Higher = better high-risk identification (the canonical clinical PGS use)."""
+def _rr_top_true(p_true, p_pred, q: float) -> float:
+    """True-risk ratio of the top (1-q) fraction by PREDICTED score vs the rest:
+    does flagging the top X% by score actually enrich for genuinely high true
+    risk? Higher = better high-risk identification (the canonical clinical use)."""
     flag = p_pred >= float(np.quantile(p_pred, q))
     if flag.sum() < 3 or (~flag).sum() < 3:
         return np.nan
     return float((p_true[flag].mean() + EPS) / (p_true[~flag].mean() + EPS))
+
+
+def _rr_top_obs(y, p_pred, q: float) -> float:
+    """OBSERVED risk ratio of the top (1-q) fraction by score vs the rest -- the
+    clinical headline ('top X% carry N-fold the event rate'). Uses outcomes."""
+    y = np.asarray(y, dtype=float)
+    flag = p_pred >= float(np.quantile(p_pred, q))
+    if flag.sum() < 3 or (~flag).sum() < 3:
+        return np.nan
+    return float((y[flag].mean() + EPS) / (y[~flag].mean() + EPS))
+
+
+def _frac_ge_kx(p, k: float) -> float:
+    """Fraction of the stratum whose risk is >= k x the mean risk -- the size of
+    the >=k-fold-risk group. Invariant to multiplicative miscalibration; sensitive
+    to the spread of the risk distribution (which attenuates out-of-ancestry)."""
+    p = np.asarray(p, dtype=float)
+    m = float(np.mean(p))
+    if m <= 0:
+        return np.nan
+    return float(np.mean(p >= k * m))
+
+
+def calibration(y, p_pred) -> tuple[float, float]:
+    """(calibration slope, calibration-in-the-large intercept). Slope = b from the
+    logistic fit y ~ a + b*logit(p): 1 = right spread, <1 = predictions too
+    extreme, >1 = too compressed. Intercept = the offset a* solving
+    mean(sigmoid(a*+logit(p)))=mean(y) (slope fixed at 1): 0 = right average level,
+    >0 = under-predicts on average. nan if a stratum has one class."""
+    y = np.asarray(y).astype(int)
+    if len(np.unique(y)) < 2:
+        return np.nan, np.nan
+    lp = logit(p_pred)
+    slope = np.nan
+    if float(np.std(lp)) > 1e-9:
+        try:
+            slope = float(LogisticRegression(C=1e6, max_iter=2000)
+                          .fit(lp.reshape(-1, 1), y).coef_[0][0])
+        except Exception:  # noqa: BLE001
+            slope = np.nan
+    ybar = float(y.mean())
+    try:
+        intercept = float(brentq(lambda a: float(np.mean(expit(a + lp))) - ybar, -25.0, 25.0))
+    except Exception:  # noqa: BLE001
+        intercept = np.nan
+    return slope, intercept
 
 
 def or_per_sd(y, p_pred) -> float:
@@ -195,7 +243,9 @@ def risk_vs_truth(p_true, p_pred) -> tuple[dict, int]:
     p_pred = clip01(p_pred)
     n = len(p_true)
     keys = ("avg_pred_minus_true_risk", "probit_risk_slope_ratio", "rmse", "mae",
-            "spearman_true", "pearson_true", "r2_true", "tail_rmse_true", "rr_top10_true")
+            "spearman_true", "pearson_true", "r2_true", "tail_rmse_true",
+            "rr_top10_true", "rr_top20_true",
+            "frac_ge_2x_true", "frac_ge_3x_true", "frac_ge_2x_pred", "frac_ge_3x_pred")
     if n < 10:
         return {k: np.nan for k in keys}, n
     ss_tot = float(np.sum((p_true - p_true.mean()) ** 2))
@@ -208,8 +258,31 @@ def risk_vs_truth(p_true, p_pred) -> tuple[dict, int]:
         "pearson_true": _corr(pearsonr, p_pred, p_true),
         "r2_true": float(1.0 - np.sum((p_pred - p_true) ** 2) / ss_tot) if ss_tot > 0 else np.nan,
         "tail_rmse_true": _tail_rmse_true(p_true, p_pred),
-        "rr_top10_true": _rr_top10_true(p_true, p_pred),
+        # clinical risk-stratification -- two dual views, vs the ORACLE true risk:
+        "rr_top10_true": _rr_top_true(p_true, p_pred, 0.90),  # top 10% true-risk enrichment
+        "rr_top20_true": _rr_top_true(p_true, p_pred, 0.80),  # top 20%
+        "frac_ge_2x_true": _frac_ge_kx(p_true, 2.0),   # true size of the >=2x-risk group
+        "frac_ge_3x_true": _frac_ge_kx(p_true, 3.0),
+        "frac_ge_2x_pred": _frac_ge_kx(p_pred, 2.0),   # this method's estimate of it
+        "frac_ge_3x_pred": _frac_ge_kx(p_pred, 3.0),
     }, n
+
+
+def outcome_metrics(y, p_pred) -> dict:
+    """Outcome-based accuracy/stratification on one stratum (needs the realized
+    outcome, so these match what the biobank can compute on real data):
+    calibration slope + intercept, and the OBSERVED top-10%/20% risk ratios."""
+    y = np.asarray(y).astype(int)
+    keys = ("calibration_slope", "calibration_intercept", "rr_top10_obs", "rr_top20_obs")
+    if len(y) < 20 or y.min() == y.max():
+        return {k: np.nan for k in keys}
+    slope, intercept = calibration(y, p_pred)
+    return {
+        "calibration_slope": slope,
+        "calibration_intercept": intercept,
+        "rr_top10_obs": _rr_top_obs(y, p_pred, 0.90),
+        "rr_top20_obs": _rr_top_obs(y, p_pred, 0.80),
+    }
 
 
 def brier_skill(y, p) -> dict:

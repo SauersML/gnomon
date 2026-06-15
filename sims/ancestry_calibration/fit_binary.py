@@ -205,7 +205,8 @@ def main():
             cm, n = common.risk_vs_truth(p_true_te[mask], p[mask])
             sk = common.brier_skill(y_te[mask], p[mask])
             es = {"or_per_sd": common.or_per_sd(y_te[mask], p[mask])}
-            for metric, val in {**cm, **sk, **es}.items():
+            om = common.outcome_metrics(y_te[mask], p[mask])
+            for metric, val in {**cm, **sk, **es, **om}.items():
                 cal_rows.append(dict(dem=args.dem, pheno=args.pheno, pgs_mode=args.pgs_mode,
                                      method=method, ancestry_bin_kind=bk, ancestry_bin=bl,
                                      n=int(n), metric=metric, value=val))

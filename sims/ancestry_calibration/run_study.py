@@ -114,7 +114,8 @@ def main() -> None:
         "methods_survival": ["gamfit", "linpc", "znorm", "rawpgs"],
         "risk_metrics": "ground-truth vs p_true: average prediction error, probit risk spread ratio, "
                         "RMSE, MAE, Spearman/Pearson/R2 to true risk, high-risk-tail RMSE, "
-                        "top-decile true risk-ratio; plus Brier Skill Score and OR per SD",
+                        "top-10%/20% risk-ratio (true+observed), %-at->=2x/3x risk (true+predicted); "
+                        "plus Brier Skill Score, OR per SD, and calibration slope+intercept",
         "discrimination": "GLOBAL only (binary AUC / survival Harrell C); never within-stratum",
     }, indent=2))
 

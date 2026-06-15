@@ -1461,6 +1461,13 @@ class BinaryStats:
     brier: float
     liability_r2: float
     or_per_sd: float
+    bss: float
+    calibration_slope: float
+    calibration_intercept: float
+    rr_top10: float
+    rr_top20: float
+    frac_ge_2x: float
+    frac_ge_3x: float
 
 
 def survival_model_columns(num_pcs: int) -> list[str]:
@@ -1978,6 +1985,42 @@ def binary_stats(y: np.ndarray, p: np.ndarray, population_prevalence: float | No
                 * (1.0 - population_prevalence) ** 2
                 / (z**2 * prevalence * (1.0 - prevalence))
             )
+
+    # --- harmonized accuracy + clinical risk-stratification metrics; SAME
+    # definitions as the simulation's common.py (nan-guarded, never break a fit) -
+    eps = np.finfo(float).eps
+    # BSS: skill vs the base-rate Brier  (1 - Brier / [p_bar(1-p_bar)])
+    bss = float("nan")
+    unc = prevalence * (1.0 - prevalence)
+    if unc > 0.0:
+        bss = float(1.0 - float(brier_score_loss(y, p)) / unc)
+    # calibration slope (y ~ a + b*logit(p); b=1 ideal) and calibration-in-the-
+    # large intercept (offset slope=1; 0 ideal)
+    calibration_slope = float("nan")
+    calibration_intercept = float("nan")
+    try:
+        if len(np.unique(y)) > 1:
+            lp = np.log(p / (1.0 - p))
+            if float(lp.std()) > 1e-9:
+                calibration_slope = float(LogisticRegression(C=1e6, max_iter=2000)
+                                          .fit(lp.reshape(-1, 1), y).coef_[0][0])
+            from scipy.optimize import brentq
+            from scipy.special import expit
+            calibration_intercept = float(brentq(
+                lambda a: float(np.mean(expit(a + lp))) - prevalence, -25.0, 25.0))
+    except Exception:  # noqa: BLE001
+        pass
+
+    def _rr_top(q: float) -> float:  # observed risk ratio of top (1-q) vs rest
+        flag = p >= float(np.quantile(p, q))
+        if int(flag.sum()) < 3 or int((~flag).sum()) < 3:
+            return float("nan")
+        return float((y[flag].mean() + eps) / (y[~flag].mean() + eps))
+
+    def _frac_ge(k: float) -> float:  # % flagged at >= k x mean predicted risk
+        m = float(p.mean())
+        return float(np.mean(p >= k * m)) if m > 0.0 else float("nan")
+
     return BinaryStats(
         n=int(len(y)),
         n_events=int(y.sum()),
@@ -1987,14 +2030,24 @@ def binary_stats(y: np.ndarray, p: np.ndarray, population_prevalence: float | No
         brier=float(brier_score_loss(y, p)),
         liability_r2=float(liability_r2),
         or_per_sd=or_per_sd,
+        bss=bss,
+        calibration_slope=calibration_slope,
+        calibration_intercept=calibration_intercept,
+        rr_top10=_rr_top(0.90),
+        rr_top20=_rr_top(0.80),
+        frac_ge_2x=_frac_ge(2.0),
+        frac_ge_3x=_frac_ge(3.0),
     )
 
 
 def fmt_binary(stats: BinaryStats) -> str:
     return (
         f"AUROC={stats.auroc:.4f}  AP={stats.average_precision:.4f}  "
-        f"Brier={stats.brier:.4f}  "
-        f"liability_R2={stats.liability_r2:.4f}  OR/SD={stats.or_per_sd:.3f}"
+        f"Brier={stats.brier:.4f}  BSS={stats.bss:.4f}  "
+        f"liability_R2={stats.liability_r2:.4f}  OR/SD={stats.or_per_sd:.3f}  "
+        f"cal_slope={stats.calibration_slope:.3f}  cal_int={stats.calibration_intercept:+.3f}  "
+        f"rr_top10={stats.rr_top10:.2f}  rr_top20={stats.rr_top20:.2f}  "
+        f"frac>=2x={stats.frac_ge_2x:.3f}  frac>=3x={stats.frac_ge_3x:.3f}"
     )
 
 
@@ -2007,6 +2060,14 @@ def _binary_fields(prefix: str, stats: BinaryStats) -> dict[str, float | int]:
         f"{prefix}_average_precision": stats.average_precision,
         f"{prefix}_brier": stats.brier,
         f"{prefix}_liability_r2": stats.liability_r2,
+        f"{prefix}_or_per_sd": stats.or_per_sd,
+        f"{prefix}_bss": stats.bss,
+        f"{prefix}_calibration_slope": stats.calibration_slope,
+        f"{prefix}_calibration_intercept": stats.calibration_intercept,
+        f"{prefix}_rr_top10": stats.rr_top10,
+        f"{prefix}_rr_top20": stats.rr_top20,
+        f"{prefix}_frac_ge_2x": stats.frac_ge_2x,
+        f"{prefix}_frac_ge_3x": stats.frac_ge_3x,
     }
 
 
