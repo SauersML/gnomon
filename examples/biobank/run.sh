@@ -555,8 +555,19 @@ trap 'failure_diagnostics $?' ERR
 # RUN_STATE_DIR and fail before the resolver starts if that volume is tight.
 {
   echo "--- uv cache maintenance ---"
-  if ! uv cache prune; then
-    echo "[run.sh] warning: uv cache prune failed; continuing to capacity check"
+  # Pruning is housekeeping, not required for the run. `uv cache prune` BLOCKS
+  # indefinitely when another uv process holds the cache lock ("Cache is
+  # currently in-use, waiting for other uv processes to finish"), which can hang
+  # the whole run. Bound it with a timeout and treat timeout/failure as a
+  # (non-fatal) skip so cache maintenance can never hang or fail the run.
+  prune_rc=0
+  timeout 60 uv cache prune || prune_rc=$?
+  if [ "$prune_rc" -eq 0 ]; then
+    :
+  elif [ "$prune_rc" -eq 124 ]; then
+    echo "[run.sh] note: uv cache prune timed out on a busy cache lock; skipped (non-fatal)"
+  else
+    echo "[run.sh] warning: uv cache prune failed (rc=$prune_rc); continuing"
   fi
   echo
 } 2>&1 | tee -a "$RESULTS"
