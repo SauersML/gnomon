@@ -290,7 +290,7 @@ def find_plink_prefix() -> Path:
 PLINK_PREFIX = find_plink_prefix()
 WORKDIR = PLINK_PREFIX.parent
 FITS_DIR = WORKDIR / "biobank_fits"
-FIT_CACHE_DIR = FITS_DIR / "binary_fit_cache"
+FIT_CACHE_DIR = FITS_DIR / "fit_cache"
 NUM_PCS = 15
 DUCHON_CENTERS = 40
 TRAIN_FRACTION = 0.80  # per-class 80/20 split
@@ -313,11 +313,20 @@ GNOMON_BIN = os.environ.get("GNOMON_BIN", "gnomon")
 PGS_ID_PATTERN = re.compile(r"^PGS\d{6}$")
 
 
-class _Tee:
-    """Write to several streams at once (mirror disease output to a cache buffer)."""
+# Bump whenever the per-disease FIT or its REPORTED metrics change in a way the
+# cache key would not otherwise capture (e.g. adding OR/SD, changing a formula).
+# This invalidates every existing cache entry so stale output is never replayed.
+FIT_CACHE_VERSION = 2
 
-    def __init__(self, *streams):
-        self.streams = streams
+
+class _Tee:
+    """Write to several streams at once (mirror disease output to a cache buffer).
+    Delegates fd/tty queries to the real stream so subprocesses and faulthandler
+    that introspect stdout keep working while it is swapped."""
+
+    def __init__(self, real, *streams):
+        self.real = real
+        self.streams = (real,) + streams
 
     def write(self, s):
         for st in self.streams:
@@ -328,12 +337,22 @@ class _Tee:
         for st in self.streams:
             st.flush()
 
+    def fileno(self):
+        return self.real.fileno()
 
-def disease_fit_cache_key(name: str, cfg: dict, mode: str, axes, gamfit_version: str) -> str:
+    def isatty(self):
+        return self.real.isatty()
+
+
+def disease_fit_cache_key(
+    name: str, cfg: dict, mode: str, axes, gamfit_version: str, cdr: str
+) -> str:
     """Stable signature for one disease's fit + evaluation. Any change to the
-    PGS, fit geometry (PCs/centers), split, seed, mode, LOSO design, or gamfit
-    version yields a new key, so a stale fit is never silently reused."""
+    data source (CDR), PGS, fit geometry (PCs/centers), split, seed, mode, LOSO
+    design, gamfit version, or the cache schema version yields a new key, so a
+    stale fit is never silently reused."""
     payload = {
+        "cache_version": FIT_CACHE_VERSION, "cdr": cdr,
         "slug": name, "pgs": cfg.get("pgs"), "concept_id": cfg.get("concept_id"),
         "snomed": cfg.get("snomed_code"), "num_pcs": NUM_PCS, "centers": DUCHON_CENTERS,
         "train_fraction": TRAIN_FRACTION, "rng_seed": RNG_SEED, "mode": mode,
@@ -3214,9 +3233,9 @@ def main() -> None:
     FIT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     force_refit = os.environ.get("ANC_FORCE_REFIT", "0") != "0"
     for name, cfg in diseases.items():
-        sig = disease_fit_cache_key(name, cfg, mode, active_axes, gamfit.__version__)
+        sig = disease_fit_cache_key(name, cfg, mode, active_axes, gamfit.__version__, cdr)
         cache_path = FIT_CACHE_DIR / f"{name}__{mode}__{sig}.log"
-        if cache_path.exists() and not force_refit:
+        if cache_path.exists() and cache_path.stat().st_size > 0 and not force_refit:
             print(f"\n=== {name.upper()} (CACHED fit reused, sig={sig}) ===")
             sys.stdout.write(cache_path.read_text())
             continue
@@ -3382,7 +3401,11 @@ def main() -> None:
             # instead of recomputing the fit (ANC_FORCE_REFIT=1 overrides).
             sys.stdout = _real_stdout
             try:
-                cache_path.write_text(_cap.getvalue())
+                # atomic: write a temp then rename, so a killed mid-write never
+                # leaves a truncated cache that a later run would trust+replay.
+                tmp_path = cache_path.with_suffix(f".{os.getpid()}.tmp")
+                tmp_path.write_text(_cap.getvalue())
+                os.replace(tmp_path, cache_path)
                 print(f"  [fit-cache] saved {cache_path.name}")
             except OSError as e:
                 print(f"  [fit-cache] WARN could not save cache: {e}")
