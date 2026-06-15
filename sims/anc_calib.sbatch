@@ -1,11 +1,11 @@
 #!/bin/bash
 #SBATCH --job-name=anc_calib
-#SBATCH --partition=amd512
+#SBATCH --partition=msismall
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=48
-#SBATCH --mem=400G
-#SBATCH --time=12:00:00
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=64G
+#SBATCH --time=3:00:00
 #SBATCH --output=/projects/standard/hsiehph/sauer354/anc_calib_%j.out
 set -euo pipefail
 cd /projects/standard/hsiehph/sauer354/gnomon
