@@ -443,6 +443,92 @@ def print_cached_metrics_summary(mode: str) -> None:
     print("=== /RESULTS SO FAR ===")
 
 
+_BINARY_BOARD_METHODS: tuple[tuple[str, str], ...] = (
+    ("gamfit", "binary_gam_test"),
+    ("nuisance", "binary_nuisance_test"),
+    ("znorm", "binary_znorm_test"),
+    ("linpc", "binary_linpc_test"),
+)
+
+
+def _binary_stats_from_result(result: dict, prefix: str) -> str | None:
+    required = (
+        "auroc", "average_precision", "brier", "bss", "liability_r2",
+        "or_per_sd", "calibration_slope", "calibration_intercept",
+        "calibration_coverage", "rr_top10", "rr_top20", "frac_ge_2x",
+        "frac_ge_3x",
+    )
+    vals = {k: result.get(f"{prefix}_{k}") for k in required}
+    if not all(isinstance(v, (int, float)) for v in vals.values()):
+        return None
+    return (
+        f"AUROC={vals['auroc']:.4f}  AP={vals['average_precision']:.4f}  "
+        f"Brier={vals['brier']:.4f}  BSS={vals['bss']:.4f}  "
+        f"liability_R2={vals['liability_r2']:.4f}  OR/SD={vals['or_per_sd']:.3f}  "
+        f"cal_slope={vals['calibration_slope']:.3f}  "
+        f"cal_int={vals['calibration_intercept']:+.3f}  "
+        f"cal_cov={vals['calibration_coverage']:.2f}  "
+        f"rr_top10={vals['rr_top10']:.2f}  rr_top20={vals['rr_top20']:.2f}  "
+        f"frac>=2x={vals['frac_ge_2x']:.3f}  frac>=3x={vals['frac_ge_3x']:.3f}"
+    )
+
+
+def _binary_result_rows(result: dict) -> dict[str, str]:
+    rows: dict[str, str] = {}
+    for method, prefix in _BINARY_BOARD_METHODS:
+        line = _binary_stats_from_result(result, prefix)
+        if line is not None:
+            rows[method] = line
+    return rows
+
+
+def _cached_binary_prediction_rows(path: Path) -> dict[str, str]:
+    try:
+        with np.load(path, allow_pickle=False) as z:
+            y = z["y_test"].astype(np.int64)
+            population_prevalence = float(z["population_prevalence"][0])
+            preds = {
+                "gamfit": z["p_gamfit"],
+                "nuisance": z["p_nuisance"],
+                "znorm": z["p_znorm"],
+                "linpc": z["p_linpc"],
+            }
+    except Exception:  # noqa: BLE001 -- a bad sidecar must not break startup
+        return {}
+    return {
+        method: fmt_binary(binary_stats(y, pred, population_prevalence))
+        for method, pred in preds.items()
+    }
+
+
+def write_binary_prediction_sidecar(
+    path: Path | None,
+    y_test: np.ndarray,
+    method_preds: dict[str, np.ndarray],
+    population_prevalence: float | None,
+) -> None:
+    if path is None:
+        return
+    try:
+        tmp_path = path.with_suffix(f".{os.getpid()}.tmp.npz")
+        np.savez_compressed(
+            tmp_path,
+            y_test=np.asarray(y_test, dtype=np.int8),
+            population_prevalence=np.asarray(
+                [float(population_prevalence) if population_prevalence is not None else np.nan],
+                dtype=np.float64,
+            ),
+            p_gamfit=np.asarray(method_preds["gamfit"], dtype=np.float32),
+            p_nuisance=np.asarray(method_preds["nuisance"], dtype=np.float32),
+            p_znorm=np.asarray(method_preds["znorm"], dtype=np.float32),
+            p_linpc=np.asarray(method_preds["linpc"], dtype=np.float32),
+        )
+        os.replace(tmp_path, path)
+        print(f"  [fit-cache] saved prediction sidecar {path.name}")
+    except Exception as e:  # noqa: BLE001 -- sidecar persistence must never fail the fit
+        print(f"  [fit-cache] WARN could not save prediction sidecar: {e}")
+
+
 BOOTSTRAP_RESAMPLES = 399
 BOOTSTRAP_CONFIDENCE_LEVEL = 0.95
 
@@ -2139,124 +2225,6 @@ def binary_stats(y: np.ndarray, p: np.ndarray, population_prevalence: float | No
     )
 
 
-# Headline binary metrics that get per-method bootstrap CIs and paired deltas.
-# These are attributes of BinaryStats; the bootstrap re-runs the *exact*
-# `binary_stats` definition on each resample so no metric definition can drift.
-_CI_METRICS: tuple[str, ...] = (
-    "auroc",
-    "or_per_sd",
-    "bss",
-    "calibration_slope",
-    "calibration_coverage",
-    "rr_top10",
-    "rr_top20",
-    "frac_ge_2x",
-    "frac_ge_3x",
-)
-
-
-def binary_metric_cis(
-    y_test: np.ndarray,
-    method_preds: dict[str, np.ndarray],
-    population_prevalence: float | None,
-    *,
-    gamfit_key: str = "gamfit",
-    n_resamples: int = 400,
-    confidence_level: float = 0.95,
-) -> dict[str, float]:
-    """95% BCa bootstrap CIs for the headline binary metrics, computed ONCE on
-    the held-out test set (not per-LOSO-group).
-
-    For each method in `method_preds` and each metric in `_CI_METRICS`, resamples
-    the (y, p) rows and re-runs `binary_stats` so the bootstrapped statistic is
-    identical to the reported point estimate by construction. Also produces
-    paired gamfit-minus-baseline delta CIs (resampling the *same* row indices so
-    the pairing is preserved).
-
-    Returns a flat dict of keys:
-        binary_<method>_test_<metric>_ci_low / _ci_high
-        binary_delta_<metric>_gamfit-<method>_ci_low / _ci_high
-    Guarded: returns {} on ANY failure — must never break a fit/cache.
-    """
-    try:
-        from scipy.stats import bootstrap
-    except Exception:  # noqa: BLE001
-        return {}
-    out: dict[str, float] = {}
-    try:
-        y_arr = np.asarray(y_test, dtype=np.float64)
-        methods = {k: np.asarray(v, dtype=np.float64) for k, v in method_preds.items()}
-        n = int(y_arr.size)
-        if n < 10 or any(v.size != n for v in methods.values()):
-            return {}
-        rng = np.random.default_rng(0)
-
-        def _metric_fn(metric: str, p_arr: np.ndarray):
-            def _stat(idx: np.ndarray) -> float:
-                idx = np.asarray(idx, dtype=np.int64)
-                val = getattr(
-                    binary_stats(y_arr[idx], p_arr[idx], population_prevalence),
-                    metric,
-                )
-                return float(val) if np.isfinite(val) else np.nan
-            return _stat
-
-        index = np.arange(n)
-        # Per-method metric CIs.
-        for name, p_arr in methods.items():
-            for metric in _CI_METRICS:
-                try:
-                    res = bootstrap(
-                        (index,),
-                        _metric_fn(metric, p_arr),
-                        n_resamples=n_resamples,
-                        method="BCa",
-                        confidence_level=confidence_level,
-                        random_state=rng,
-                        vectorized=False,
-                    )
-                    lo = float(res.confidence_interval.low)
-                    hi = float(res.confidence_interval.high)
-                except Exception:  # noqa: BLE001
-                    lo = hi = float("nan")
-                out[f"binary_{name}_test_{metric}_ci_low"] = lo
-                out[f"binary_{name}_test_{metric}_ci_high"] = hi
-
-        # Paired gamfit-minus-baseline delta CIs.
-        p_gam = methods.get(gamfit_key)
-        if p_gam is not None:
-            for name, p_arr in methods.items():
-                if name == gamfit_key:
-                    continue
-                for metric in _CI_METRICS:
-                    def _delta_stat(idx: np.ndarray, _m=metric, _pb=p_arr) -> float:
-                        idx = np.asarray(idx, dtype=np.int64)
-                        yi = y_arr[idx]
-                        a = float(getattr(binary_stats(yi, p_gam[idx], population_prevalence), _m))
-                        b = float(getattr(binary_stats(yi, _pb[idx], population_prevalence), _m))
-                        d = a - b
-                        return d if np.isfinite(d) else np.nan
-                    try:
-                        res = bootstrap(
-                            (index,),
-                            _delta_stat,
-                            n_resamples=n_resamples,
-                            method="BCa",
-                            confidence_level=confidence_level,
-                            random_state=rng,
-                            vectorized=False,
-                        )
-                        lo = float(res.confidence_interval.low)
-                        hi = float(res.confidence_interval.high)
-                    except Exception:  # noqa: BLE001
-                        lo = hi = float("nan")
-                    out[f"binary_delta_{metric}_{gamfit_key}-{name}_ci_low"] = lo
-                    out[f"binary_delta_{metric}_{gamfit_key}-{name}_ci_high"] = hi
-    except Exception:  # noqa: BLE001 -- CIs must NEVER break a fit
-        return {}
-    return out
-
-
 def fmt_binary(stats: BinaryStats) -> str:
     return (
         f"AUROC={stats.auroc:.4f}  AP={stats.average_precision:.4f}  "
@@ -2777,6 +2745,7 @@ def evaluate_binary_model_pair(
     label: str,
     population_prevalence: float | None,
     score_train: bool,
+    prediction_cache_path: Path | None = None,
 ) -> dict[str, float]:
     """Fit Bernoulli marginal-slope GAM and matched logistic baselines on
     the same balanced split.
@@ -2841,6 +2810,18 @@ def evaluate_binary_model_pair(
     B_fit = fit_logit_binary(y_train, X_B_tr, B_names)
     p_B_test = predict_logit_binary(B_fit, X_B_te)
     B_test_m = binary_stats(y_test, p_B_test, population_prevalence)
+
+    write_binary_prediction_sidecar(
+        prediction_cache_path,
+        y_test,
+        {
+            "gamfit": gam_p_test,
+            "nuisance": p_N_test,
+            "znorm": p_A_test,
+            "linpc": p_B_test,
+        },
+        population_prevalence,
+    )
 
     N_train_m = A_train_m = B_train_m = None
     if score_train:
@@ -2935,22 +2916,6 @@ def evaluate_binary_model_pair(
         f"liability_R2(gamfit-nuisance)={gam_test_m.liability_r2 - N_test_m.liability_r2:+.4f}"
     )
 
-    # Per-metric 95% BCa bootstrap CIs on the held-out test set (computed ONCE
-    # here, never per-LOSO-group). Method keys match the binary_* field prefixes:
-    # gam_test / nuisance_test / znorm_test / linpc_test. Fully guarded — returns
-    # {} on any failure, so it can never break a fit or invalidate the cache.
-    metric_cis = binary_metric_cis(
-        y_test,
-        {
-            "gam": gam_p_test,
-            "nuisance": p_N_test,
-            "znorm": p_A_test,
-            "linpc": p_B_test,
-        },
-        population_prevalence,
-        gamfit_key="gam",
-    )
-
     result: dict[str, float | int | str] = {
         "label": label,
         "pgs": pgs_id,
@@ -2958,7 +2923,6 @@ def evaluate_binary_model_pair(
         **_binary_fields("binary_nuisance_test", N_test_m),
         **_binary_fields("binary_znorm_test", A_test_m),
         **_binary_fields("binary_linpc_test", B_test_m),
-        **metric_cis,
         "binary_gam_test_auroc_se": gam_auc_se,
         "binary_gam_test_auroc_ci_low": gam_auc_lo,
         "binary_gam_test_auroc_ci_high": gam_auc_hi,
@@ -3018,6 +2982,7 @@ def evaluate_model_pair(
     save_info: dict[str, object] | None = None,
     score_train: bool = True,
     mode: str = "both",
+    prediction_cache_path: Path | None = None,
 ) -> dict[str, float]:
     """Fit GAM + Cox baselines and print survival validation metrics.
 
@@ -3041,6 +3006,7 @@ def evaluate_model_pair(
             label=label,
             population_prevalence=population_prevalence,
             score_train=score_train,
+            prediction_cache_path=prediction_cache_path,
         )
         result: dict[str, float | int | str] = {
             "label": label, "pgs": pgs_id, **binary_result,
@@ -3271,6 +3237,7 @@ def evaluate_model_pair(
             label=label,
             population_prevalence=population_prevalence,
             score_train=score_train,
+            prediction_cache_path=prediction_cache_path,
         )
     else:
         binary_result = {}
@@ -3602,10 +3569,15 @@ def main() -> None:
         sig = disease_fit_cache_key(
             name, cfg, mode, active_axes if do_loso else (), gamfit.__version__, cdr)
         cache_path = FIT_CACHE_DIR / f"{name}__{mode}__{sig}.log"
+        pred_cache_path = FIT_CACHE_DIR / f"{name}__{mode}__{sig}.pred.npz"
         if cache_path.exists() and cache_path.stat().st_size > 0:
-            print(f"\n=== {name.upper()} (CACHED fit reused, sig={sig}) ===")
-            sys.stdout.write(cache_path.read_text())
-            return
+            if mode == "binary" and not pred_cache_path.exists():
+                print(f"\n=== {name.upper()} (legacy log cache lacks prediction sidecar; "
+                      f"refreshing metrics, sig={sig}) ===")
+            else:
+                print(f"\n=== {name.upper()} (CACHED fit reused, sig={sig}) ===")
+                sys.stdout.write(cache_path.read_text())
+                return
         _cap = io.StringIO()
         _real_stdout = sys.stdout
         sys.stdout = _Tee(_real_stdout, _cap)
@@ -3745,6 +3717,7 @@ def main() -> None:
                     "K_crude": K,
                 },
                 mode=mode,
+                prediction_cache_path=pred_cache_path,
             )
 
             if do_loso:
