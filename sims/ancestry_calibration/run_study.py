@@ -116,10 +116,16 @@ def main() -> None:
         "discrimination": "GLOBAL only (binary AUC / survival Harrell C); never within-stratum",
     }, indent=2))
 
-    # 1. generation
+    # 1. generation (skip a (dem, seed) whose full pheno set is already on disk;
+    #    set ANC_REGEN=1 to force a clean regeneration)
+    force_regen = os.environ.get("ANC_REGEN", "0") != "0"
     gen_tasks = []
     for dem in DEMOGRAPHIES:
         for seed in SEEDS:
+            cached = all((data_dir / f"{dem}_{ph}_realpt_s{seed}.parquet").exists() for ph in PHENOS)
+            if cached and not force_regen:
+                print(f"cache hit: {dem} s{seed} ({len(PHENOS)} phenos) — skipping generation", flush=True)
+                continue
             cmd = [sys.executable, GEN, dem, data_dir, seed, "--tag", f"_s{seed}", "--threads", "1"]
             gen_tasks.append((cmd, log_dir / f"gen_{dem}_s{seed}.log"))
     run_many(gen_tasks, auto_generate_jobs(len(gen_tasks)))
