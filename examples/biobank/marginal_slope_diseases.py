@@ -313,10 +313,12 @@ GNOMON_BIN = os.environ.get("GNOMON_BIN", "gnomon")
 PGS_ID_PATTERN = re.compile(r"^PGS\d{6}$")
 
 
-# Bump whenever the per-disease FIT or its REPORTED metrics change in a way the
-# cache key would not otherwise capture (e.g. adding OR/SD, changing a formula).
-# This invalidates every existing cache entry so stale output is never replayed.
-FIT_CACHE_VERSION = 3
+# Do NOT change this: it is part of the cache key, so changing it would throw
+# away every already-computed (expensive) fit. Cosmetic changes like renaming a
+# printed method label must NOT bump it -- the board reads old + new labels so a
+# rename never forces a refit. Only the real fit inputs (PGS, geometry, seed,
+# CDR, gamfit version) belong in the key.
+FIT_CACHE_VERSION = 2
 
 
 class _Tee:
@@ -370,13 +372,27 @@ def print_cached_metrics_summary(mode: str) -> None:
     every baseline), not just the GAM."""
     import glob
 
-    # Method labels as printed by the binary / survival evaluators.
-    methods = (["gamfit", "znorm", "linpc"] if mode == "survival"
-               else ["gamfit", "nuisance", "znorm", "linpc"])
+    # Canonical method -> every label it may appear under in a cache log (current
+    # names AND the historical ones), so a label rename NEVER invalidates a cache:
+    # old fits keep their old labels on disk and are still shown under the proper
+    # name. Order here is the display order.
+    if mode == "survival":
+        canon = [("gamfit", ["gamfit", "GAM"]),
+                 ("znorm", ["znorm", "baselineA"]),
+                 ("linpc", ["linpc", "baselineB"])]
+    else:
+        canon = [("gamfit", ["gamfit", "binaryGAM"]),
+                 ("nuisance", ["nuisance", "binaryN"]),
+                 ("znorm", ["znorm", "binaryA"]),
+                 ("linpc", ["linpc", "binaryB"])]
+    methods = [c for c, _ in canon]
+    alias_to_canon = {a: c for c, aliases in canon for a in aliases}
+    # longest-first so a longer alias is preferred over a prefix of it
+    all_labels = sorted(alias_to_canon, key=len, reverse=True)
     # The metric line may be "<label>  test <m>" or the combined
     # "<label>  train <m>  test <m>"; capture the label and the test-metrics
     # that follow `test` anywhere on the line.
-    pat = re.compile(rf"^\s*({'|'.join(methods)})\s+.*?\btest\s+(.+)$", re.M)
+    pat = re.compile(rf"^\s*({'|'.join(map(re.escape, all_labels))})\s+.*?\btest\s+(.+)$", re.M)
     logs = sorted(glob.glob(str(FIT_CACHE_DIR / f"*__{mode}__*.log")))
     per_disease: dict[str, dict[str, str]] = {}
     for lf in logs:
@@ -387,7 +403,7 @@ def print_cached_metrics_summary(mode: str) -> None:
             continue
         d = per_disease.setdefault(slug, {})
         for label, metrics in pat.findall(txt):
-            d[label] = metrics.strip()  # last wins (pass 2 if both present)
+            d[alias_to_canon[label]] = metrics.strip()  # last wins (pass 2 if both)
     print(f"\n=== RESULTS SO FAR ({mode}): {len(per_disease)} disease(s) "
           f"from {len(logs)} cached fit file(s) [{FIT_CACHE_DIR}] ===")
     if not logs:
