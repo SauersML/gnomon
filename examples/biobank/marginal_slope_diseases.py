@@ -880,6 +880,21 @@ def resolve_snomed_codes(client: bigquery.Client, cdr: str, codes: list[str]) ->
     return df
 
 
+def _concept_names(client: bigquery.Client, cdr: str, concept_ids: list[int]) -> dict[int, str]:
+    """Map OMOP concept_id -> concept_name for display (skipped-disease report)."""
+    ids = [int(c) for c in concept_ids]
+    if not ids:
+        return {}
+    df = client.query(
+        f"SELECT concept_id, concept_name FROM `{cdr}.concept` "
+        f"WHERE concept_id IN UNNEST(@ids)",
+        job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ArrayQueryParameter("ids", "INT64", ids),
+        ]),
+    ).to_dataframe()
+    return dict(zip(df["concept_id"].astype(int), df["concept_name"].astype(str)))
+
+
 def rank_disease_concepts_by_prevalence(
     client: bigquery.Client, cdr: str, concept_ids: list[int]
 ) -> pd.DataFrame:
@@ -935,11 +950,32 @@ def select_runtime_diseases(client: bigquery.Client, cdr: str) -> dict[str, dict
     for code, name in dropped:
         print(f"    dropped (not OHDSI-canonical disease): {code} {name!r}")
 
-    ranked = rank_disease_concepts_by_prevalence(client, cdr, list(survivors.keys()))
+    # Rank ALL OHDSI-canonical diseases by prevalence in one pass, so "top
+    # TOP_N_DISEASES" spans the full disease universe rather than just the
+    # PGS-mapped subset. This lets us surface, up front, which of the most
+    # prevalent diseases we are NOT scoring because no PGS is mapped.
+    ranked = rank_disease_concepts_by_prevalence(client, cdr, sorted(canonical))
     counts = dict(zip(ranked["concept_id"], ranked["case_count"]))
+
+    top_ids = [int(c) for c in ranked["concept_id"].tolist()[:TOP_N_DISEASES]]
+    top_names = _concept_names(client, cdr, top_ids)
+    n_run = sum(1 for cid in top_ids if cid in mapped_ids)
+    print(
+        f"  top-{TOP_N_DISEASES} most prevalent OHDSI-canonical diseases "
+        f"(running {n_run}, skipping {len(top_ids) - n_run} with no PGS):"
+    )
+    for cid in top_ids:
+        nm = top_names.get(cid, f"concept_id={cid}")
+        cases = counts.get(cid, 0)
+        if cid in mapped_ids:
+            cfg = SNOMED_PGS_MAP[mapped_ids[cid]]
+            print(f"    RUN   {nm:<42.42} cases={cases:>9,}  pgs={cfg['pgs']}")
+        else:
+            print(f"    SKIP  {nm:<42.42} cases={cases:>9,}  no PGS available -- not scored")
+
     chosen_concept_ids: list[int] = []
     for cid in ranked["concept_id"].tolist():
-        if cid in survivors:
+        if int(cid) in survivors:
             chosen_concept_ids.append(int(cid))
         if len(chosen_concept_ids) >= TOP_N_DISEASES:
             break
