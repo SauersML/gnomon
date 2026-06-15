@@ -316,7 +316,7 @@ PGS_ID_PATTERN = re.compile(r"^PGS\d{6}$")
 # Bump whenever the per-disease FIT or its REPORTED metrics change in a way the
 # cache key would not otherwise capture (e.g. adding OR/SD, changing a formula).
 # This invalidates every existing cache entry so stale output is never replayed.
-FIT_CACHE_VERSION = 2
+FIT_CACHE_VERSION = 3
 
 
 class _Tee:
@@ -371,8 +371,8 @@ def print_cached_metrics_summary(mode: str) -> None:
     import glob
 
     # Method labels as printed by the binary / survival evaluators.
-    methods = (["GAM", "baselineA", "baselineB"] if mode == "survival"
-               else ["binaryGAM", "binaryN", "binaryA", "binaryB"])
+    methods = (["gamfit", "znorm", "linpc"] if mode == "survival"
+               else ["gamfit", "nuisance", "znorm", "linpc"])
     # The metric line may be "<label>  test <m>" or the combined
     # "<label>  train <m>  test <m>"; capture the label and the test-metrics
     # that follow `test` anywhere on the line.
@@ -2488,27 +2488,27 @@ def evaluate_binary_model_pair(
     Age handling is fixed across models; the GAM adds the marginal-slope
     flexible PC surface and PC-varying log-slope:
 
-      * `binaryGAM` — Bernoulli marginal-slope GAM with
+      * `gamfit` — Bernoulli marginal-slope GAM with
         `duchon(PC1..PCk)` in the baseline-risk surface, the same
         `duchon(...)` in the log-slope channel (so `prs_z`'s log-OR
         varies by ancestry), and the matched age nuisance basis
         (quadratic `current_age_z`/`current_age_z2` + linear `entry_age_z`,
-        identical to baselines N/A/B) plus `sex`. No `linkwiggle()`
-        link-deviation or score-warp (both hang, gam#683).
-      * `binaryN` — logistic GLM on the matched age nuisance basis
+        identical to the nuisance/znorm/linpc baselines) plus `sex`. No
+        `linkwiggle()` link-deviation or score-warp (both hang, gam#683).
+      * `nuisance` — logistic GLM on the matched age nuisance basis
         (quadratic `current_age_z`/`current_age_z2` + linear
         `entry_age_z`) and `sex`, with *no PRS information*. The
         age+sex-only ceiling.
-      * `binaryA` — `binaryN + z_norm2` (pgsc_calc PC mean+var adjusted
+      * `znorm` — `nuisance + z_norm2` (pgsc_calc PC mean+var adjusted
         PRS, fit on train, applied to test).
-      * `binaryB` — `binaryN + prs_z + PC1..PCk` (train-z-scored PRS
+      * `linpc` — `nuisance + prs_z + PC1..PCk` (train-z-scored PRS
         plus linear PCs).
 
     Discrimination is reported with AUROC + paired-DeLong 95% CI, AP,
     Brier and Lee 2012 liability R² (taking
     the supplied `population_prevalence` so the 1:1 balanced split's
     sample prevalence of 0.5 is correctly mapped back to the population
-    scale). The headline `GAM−N` delta is the *clinical-utility* lift,
+    scale). The headline `gamfit−nuisance` delta is the *clinical-utility* lift,
     `A−N` and `B−N` are PRS-incremental lifts over age+sex alone, and
     `GAM−B` isolates the value of the GAM-native smooth basis given the
     same PRS and PC information.
@@ -2557,15 +2557,15 @@ def evaluate_binary_model_pair(
     print(
         "  binary_baseline_spec: logistic GLM nuisance=("
         + " + ".join(nuisance_names)
-        + "); compare nuisance-only (N), +Z_norm2 (A), and +prs_z+linear PCs (B)"
+        + "); compare nuisance (age+sex only), znorm (+Z_norm2), and linpc (+prs_z+linear PCs)"
     )
     print(
-        f"  binary_baselineA: log_OR(z_norm2)={A_coefs['z_norm2']:+.4f}  "
+        f"  znorm: log_OR(z_norm2)={A_coefs['z_norm2']:+.4f}  "
         f"OR/SD={np.exp(A_coefs['z_norm2']):.4f}"
     )
     pc_str = "  ".join(f"{c}={B_coefs[c]:+.3f}" for c in pc_cols)
     print(
-        f"  binary_baselineB: log_OR(prs_z)={B_coefs['prs_z']:+.4f}  "
+        f"  linpc: log_OR(prs_z)={B_coefs['prs_z']:+.4f}  "
         f"OR/SD={np.exp(B_coefs['prs_z']):.4f}  [{pc_str}]"
     )
     print(
@@ -2575,15 +2575,15 @@ def evaluate_binary_model_pair(
     )
     if score_train:
         assert gam_train_m is not None and N_train_m is not None and A_train_m is not None and B_train_m is not None
-        print(f"  binaryGAM   train {fmt_binary(gam_train_m)}  test {fmt_binary(gam_test_m)}")
-        print(f"  binaryN     train {fmt_binary(N_train_m)}  test {fmt_binary(N_test_m)}")
-        print(f"  binaryA     train {fmt_binary(A_train_m)}  test {fmt_binary(A_test_m)}")
-        print(f"  binaryB     train {fmt_binary(B_train_m)}  test {fmt_binary(B_test_m)}")
+        print(f"  gamfit    train {fmt_binary(gam_train_m)}  test {fmt_binary(gam_test_m)}")
+        print(f"  nuisance  train {fmt_binary(N_train_m)}  test {fmt_binary(N_test_m)}")
+        print(f"  znorm     train {fmt_binary(A_train_m)}  test {fmt_binary(A_test_m)}")
+        print(f"  linpc     train {fmt_binary(B_train_m)}  test {fmt_binary(B_test_m)}")
     else:
-        print(f"  binaryGAM   test {fmt_binary(gam_test_m)}")
-        print(f"  binaryN     test {fmt_binary(N_test_m)}")
-        print(f"  binaryA     test {fmt_binary(A_test_m)}")
-        print(f"  binaryB     test {fmt_binary(B_test_m)}")
+        print(f"  gamfit    test {fmt_binary(gam_test_m)}")
+        print(f"  nuisance  test {fmt_binary(N_test_m)}")
+        print(f"  znorm     test {fmt_binary(A_test_m)}")
+        print(f"  linpc     test {fmt_binary(B_test_m)}")
 
     # Paired DeLong (Sun & Xu 2014) on the same held-out rows: per-model AUROC
     # SE/CI and paired Δ AUROC SE/CI (GAM minus each baseline). Single pass —
@@ -2613,30 +2613,30 @@ def evaluate_binary_model_pair(
     d_B_N = _delta_ci(3, 1)
 
     print(
-        f"  binary_auroc_ci  GAM=[{gam_auc_lo:.4f},{gam_auc_hi:.4f}]"
-        f" N=[{N_auc_lo:.4f},{N_auc_hi:.4f}]"
-        f" A=[{A_auc_lo:.4f},{A_auc_hi:.4f}]"
-        f" B=[{B_auc_lo:.4f},{B_auc_hi:.4f}]"
+        f"  binary_auroc_ci  gamfit=[{gam_auc_lo:.4f},{gam_auc_hi:.4f}]"
+        f" nuisance=[{N_auc_lo:.4f},{N_auc_hi:.4f}]"
+        f" znorm=[{A_auc_lo:.4f},{A_auc_hi:.4f}]"
+        f" linpc=[{B_auc_lo:.4f},{B_auc_hi:.4f}]"
     )
     print(
-        f"  binary_delta_auroc_ci  GAM-N={d_GAM_N[0]:+.4f}"
+        f"  binary_delta_auroc_ci  gamfit-nuisance={d_GAM_N[0]:+.4f}"
         f" 95%CI=[{d_GAM_N[2]:+.4f},{d_GAM_N[3]:+.4f}] SE={d_GAM_N[1]:.4f}  "
-        f"GAM-A={d_GAM_A[0]:+.4f}"
+        f"gamfit-znorm={d_GAM_A[0]:+.4f}"
         f" 95%CI=[{d_GAM_A[2]:+.4f},{d_GAM_A[3]:+.4f}] SE={d_GAM_A[1]:.4f}  "
-        f"GAM-B={d_GAM_B[0]:+.4f}"
+        f"gamfit-linpc={d_GAM_B[0]:+.4f}"
         f" 95%CI=[{d_GAM_B[2]:+.4f},{d_GAM_B[3]:+.4f}] SE={d_GAM_B[1]:.4f}"
     )
     print(
-        f"  binary_prs_lift_ci  A-N={d_A_N[0]:+.4f}"
+        f"  binary_prs_lift_ci  znorm-nuisance={d_A_N[0]:+.4f}"
         f" 95%CI=[{d_A_N[2]:+.4f},{d_A_N[3]:+.4f}]  "
-        f"B-N={d_B_N[0]:+.4f}"
+        f"linpc-nuisance={d_B_N[0]:+.4f}"
         f" 95%CI=[{d_B_N[2]:+.4f},{d_B_N[3]:+.4f}]  "
         f"(PRS-incremental discrimination over age+sex nuisance)"
     )
     print(
         "  binary_delta "
-        f"Brier(GAM-N)={gam_test_m.brier - N_test_m.brier:+.4f}  "
-        f"liability_R2(GAM-N)={gam_test_m.liability_r2 - N_test_m.liability_r2:+.4f}"
+        f"Brier(gamfit-nuisance)={gam_test_m.brier - N_test_m.brier:+.4f}  "
+        f"liability_R2(gamfit-nuisance)={gam_test_m.liability_r2 - N_test_m.liability_r2:+.4f}"
     )
 
     result: dict[str, float | int | str] = {
@@ -2644,40 +2644,40 @@ def evaluate_binary_model_pair(
         "pgs": pgs_id,
         **_binary_fields("binary_gam_test", gam_test_m),
         **_binary_fields("binary_nuisance_test", N_test_m),
-        **_binary_fields("binary_baselineA_test", A_test_m),
-        **_binary_fields("binary_baselineB_test", B_test_m),
+        **_binary_fields("binary_znorm_test", A_test_m),
+        **_binary_fields("binary_linpc_test", B_test_m),
         "binary_gam_test_auroc_se": gam_auc_se,
         "binary_gam_test_auroc_ci_low": gam_auc_lo,
         "binary_gam_test_auroc_ci_high": gam_auc_hi,
         "binary_nuisance_test_auroc_se": N_auc_se,
         "binary_nuisance_test_auroc_ci_low": N_auc_lo,
         "binary_nuisance_test_auroc_ci_high": N_auc_hi,
-        "binary_baselineA_test_auroc_se": A_auc_se,
-        "binary_baselineA_test_auroc_ci_low": A_auc_lo,
-        "binary_baselineA_test_auroc_ci_high": A_auc_hi,
-        "binary_baselineB_test_auroc_se": B_auc_se,
-        "binary_baselineB_test_auroc_ci_low": B_auc_lo,
-        "binary_baselineB_test_auroc_ci_high": B_auc_hi,
+        "binary_znorm_test_auroc_se": A_auc_se,
+        "binary_znorm_test_auroc_ci_low": A_auc_lo,
+        "binary_znorm_test_auroc_ci_high": A_auc_hi,
+        "binary_linpc_test_auroc_se": B_auc_se,
+        "binary_linpc_test_auroc_ci_low": B_auc_lo,
+        "binary_linpc_test_auroc_ci_high": B_auc_hi,
         "binary_delta_auroc_vs_nuisance": d_GAM_N[0],
         "binary_delta_auroc_vs_nuisance_se": d_GAM_N[1],
         "binary_delta_auroc_vs_nuisance_ci_low": d_GAM_N[2],
         "binary_delta_auroc_vs_nuisance_ci_high": d_GAM_N[3],
-        "binary_delta_auroc_vs_baselineA": d_GAM_A[0],
-        "binary_delta_auroc_vs_baselineA_se": d_GAM_A[1],
-        "binary_delta_auroc_vs_baselineA_ci_low": d_GAM_A[2],
-        "binary_delta_auroc_vs_baselineA_ci_high": d_GAM_A[3],
-        "binary_delta_auroc_vs_baselineB": d_GAM_B[0],
-        "binary_delta_auroc_vs_baselineB_se": d_GAM_B[1],
-        "binary_delta_auroc_vs_baselineB_ci_low": d_GAM_B[2],
-        "binary_delta_auroc_vs_baselineB_ci_high": d_GAM_B[3],
-        "binary_baselineA_minus_nuisance_auroc": d_A_N[0],
-        "binary_baselineA_minus_nuisance_auroc_se": d_A_N[1],
-        "binary_baselineA_minus_nuisance_auroc_ci_low": d_A_N[2],
-        "binary_baselineA_minus_nuisance_auroc_ci_high": d_A_N[3],
-        "binary_baselineB_minus_nuisance_auroc": d_B_N[0],
-        "binary_baselineB_minus_nuisance_auroc_se": d_B_N[1],
-        "binary_baselineB_minus_nuisance_auroc_ci_low": d_B_N[2],
-        "binary_baselineB_minus_nuisance_auroc_ci_high": d_B_N[3],
+        "binary_delta_auroc_vs_znorm": d_GAM_A[0],
+        "binary_delta_auroc_vs_znorm_se": d_GAM_A[1],
+        "binary_delta_auroc_vs_znorm_ci_low": d_GAM_A[2],
+        "binary_delta_auroc_vs_znorm_ci_high": d_GAM_A[3],
+        "binary_delta_auroc_vs_linpc": d_GAM_B[0],
+        "binary_delta_auroc_vs_linpc_se": d_GAM_B[1],
+        "binary_delta_auroc_vs_linpc_ci_low": d_GAM_B[2],
+        "binary_delta_auroc_vs_linpc_ci_high": d_GAM_B[3],
+        "binary_znorm_minus_nuisance_auroc": d_A_N[0],
+        "binary_znorm_minus_nuisance_auroc_se": d_A_N[1],
+        "binary_znorm_minus_nuisance_auroc_ci_low": d_A_N[2],
+        "binary_znorm_minus_nuisance_auroc_ci_high": d_A_N[3],
+        "binary_linpc_minus_nuisance_auroc": d_B_N[0],
+        "binary_linpc_minus_nuisance_auroc_se": d_B_N[1],
+        "binary_linpc_minus_nuisance_auroc_ci_low": d_B_N[2],
+        "binary_linpc_minus_nuisance_auroc_ci_high": d_B_N[3],
         "binary_delta_brier_vs_nuisance": gam_test_m.brier - N_test_m.brier,
         "binary_delta_liability_r2_vs_nuisance": gam_test_m.liability_r2 - N_test_m.liability_r2,
     }
@@ -2685,8 +2685,8 @@ def evaluate_binary_model_pair(
         assert gam_train_m is not None and N_train_m is not None and A_train_m is not None and B_train_m is not None
         result.update(_binary_fields("binary_gam_train", gam_train_m))
         result.update(_binary_fields("binary_nuisance_train", N_train_m))
-        result.update(_binary_fields("binary_baselineA_train", A_train_m))
-        result.update(_binary_fields("binary_baselineB_train", B_train_m))
+        result.update(_binary_fields("binary_znorm_train", A_train_m))
+        result.update(_binary_fields("binary_linpc_train", B_train_m))
     print("  BINARY_RESULT " + json.dumps(result, sort_keys=True))
     return {
         k: float(v)
@@ -2779,7 +2779,7 @@ def evaluate_model_pair(
     A_fit = fit_baseline_cox(entry_tr, exit_tr, event_tr, X_A_tr, A_names)
     A_coefs = A_fit.coefs
     print(
-        f"  baselineA   Cox PH on  z_norm2 + sex          "
+        f"  znorm   Cox PH on  z_norm2 + sex          "
         f"log_HR(z_norm2)={A_coefs['z_norm2']:+.4f}  "
         f"HR/SD={np.exp(A_coefs['z_norm2']):.4f}  "
         f"log_HR(sex)={A_coefs['sex']:+.4f}"
@@ -2797,7 +2797,7 @@ def evaluate_model_pair(
     B_coefs = B_fit.coefs
     pc_str = "  ".join(f"{c}={B_coefs[c]:+.3f}" for c in pc_cols)
     print(
-        f"  baselineB   Cox PH on  prs_z + sex + {'+'.join(pc_cols)}  "
+        f"  linpc   Cox PH on  prs_z + sex + {'+'.join(pc_cols)}  "
         f"log_HR(prs_z)={B_coefs['prs_z']:+.4f}  "
         f"HR/SD={np.exp(B_coefs['prs_z']):.4f}  "
         f"log_HR(sex)={B_coefs['sex']:+.4f}  [{pc_str}]"
@@ -2934,18 +2934,18 @@ def evaluate_model_pair(
     )
     if score_train:
         assert gam_train_m is not None and A_train_m is not None and B_train_m is not None
-        print(f"  GAM        train {fmt_survival(gam_train_m)}  test {fmt_survival(gam_test_m)}")
-        print(f"  baselineA  train {fmt_survival(A_train_m)}  test {fmt_survival(A_test_m)}")
-        print(f"  baselineB  train {fmt_survival(B_train_m)}  test {fmt_survival(B_test_m)}")
+        print(f"  gamfit  train {fmt_survival(gam_train_m)}  test {fmt_survival(gam_test_m)}")
+        print(f"  znorm   train {fmt_survival(A_train_m)}  test {fmt_survival(A_test_m)}")
+        print(f"  linpc   train {fmt_survival(B_train_m)}  test {fmt_survival(B_test_m)}")
     else:
-        print(f"  GAM        test {fmt_survival(gam_test_m)}")
-        print(f"  baselineA  test {fmt_survival(A_test_m)}")
-        print(f"  baselineB  test {fmt_survival(B_test_m)}")
+        print(f"  gamfit  test {fmt_survival(gam_test_m)}")
+        print(f"  znorm   test {fmt_survival(A_test_m)}")
+        print(f"  linpc   test {fmt_survival(B_test_m)}")
     print(
-        f"  delta      GAM-baselineA: ΔC_ipcw={delta_A_c:+.4f} "
+        f"  delta      gamfit-znorm: ΔC_ipcw={delta_A_c:+.4f} "
         f"95%CI=[{delta_A_c_ci_low:+.4f},{delta_A_c_ci_high:+.4f}] "
         f"ΔIBS={delta_A_ibs:+.5f} ΔR2_IBS={delta_A_r2:+.4f}  "
-        f"GAM-baselineB: ΔC_ipcw={delta_B_c:+.4f} "
+        f"gamfit-linpc: ΔC_ipcw={delta_B_c:+.4f} "
         f"95%CI=[{delta_B_c_ci_low:+.4f},{delta_B_c_ci_high:+.4f}] "
         f"ΔIBS={delta_B_ibs:+.5f} ΔR2_IBS={delta_B_r2:+.4f}"
     )
@@ -2966,30 +2966,30 @@ def evaluate_model_pair(
         "label": label,
         "pgs": pgs_id,
         **_survival_fields("gam_test", gam_test_m),
-        **_survival_fields("baselineA_test", A_test_m),
-        **_survival_fields("baselineB_test", B_test_m),
-        "delta_test_c_ipcw_vs_baselineA": delta_A_c,
-        "delta_test_c_ipcw_vs_baselineA_ci_low": delta_A_c_ci_low,
-        "delta_test_c_ipcw_vs_baselineA_ci_high": delta_A_c_ci_high,
-        "delta_test_c_ipcw_vs_baselineB": delta_B_c,
-        "delta_test_c_ipcw_vs_baselineB_ci_low": delta_B_c_ci_low,
-        "delta_test_c_ipcw_vs_baselineB_ci_high": delta_B_c_ci_high,
-        "delta_test_ibs_vs_baselineA": delta_A_ibs,
-        "delta_test_ibs_vs_baselineB": delta_B_ibs,
-        "delta_test_r2_ibs_vs_baselineA": delta_A_r2,
-        "delta_test_r2_ibs_vs_baselineB": delta_B_r2,
+        **_survival_fields("znorm_test", A_test_m),
+        **_survival_fields("linpc_test", B_test_m),
+        "delta_test_c_ipcw_vs_znorm": delta_A_c,
+        "delta_test_c_ipcw_vs_znorm_ci_low": delta_A_c_ci_low,
+        "delta_test_c_ipcw_vs_znorm_ci_high": delta_A_c_ci_high,
+        "delta_test_c_ipcw_vs_linpc": delta_B_c,
+        "delta_test_c_ipcw_vs_linpc_ci_low": delta_B_c_ci_low,
+        "delta_test_c_ipcw_vs_linpc_ci_high": delta_B_c_ci_high,
+        "delta_test_ibs_vs_znorm": delta_A_ibs,
+        "delta_test_ibs_vs_linpc": delta_B_ibs,
+        "delta_test_r2_ibs_vs_znorm": delta_A_r2,
+        "delta_test_r2_ibs_vs_linpc": delta_B_r2,
     }
     result.update(binary_result)
     if score_train:
         assert gam_train_m is not None and A_train_m is not None and B_train_m is not None
         result.update(_survival_fields("gam_train", gam_train_m))
-        result.update(_survival_fields("baselineA_train", A_train_m))
-        result.update(_survival_fields("baselineB_train", B_train_m))
+        result.update(_survival_fields("znorm_train", A_train_m))
+        result.update(_survival_fields("linpc_train", B_train_m))
     else:
         result.update({
             "gam_train_c_ipcw": float("nan"),
-            "baselineA_train_c_ipcw": float("nan"),
-            "baselineB_train_c_ipcw": float("nan"),
+            "znorm_train_c_ipcw": float("nan"),
+            "linpc_train_c_ipcw": float("nan"),
         })
     print("  RESULT " + json.dumps(result, sort_keys=True))
     return {
@@ -3085,14 +3085,14 @@ def run_loso_axis(
     """Leave one group out: refit both models on all other groups.
 
     `mode` is threaded into `evaluate_model_pair`. The LOSO summary
-    metric is the survival ΔC-ipcw vs baselineA when survival fits ran,
-    and the binary ΔAUROC vs baselineB when only binary fits ran.
+    metric is the survival ΔC-ipcw vs znorm when survival fits ran,
+    and the binary ΔAUROC vs linpc when only binary fits ran.
     """
     if mode == "binary":
-        summary_key = "binary_delta_auroc_vs_baselineB"
-        summary_label = "binary_delta_auroc_GAM-B"
+        summary_key = "binary_delta_auroc_vs_linpc"
+        summary_label = "binary_delta_auroc_gamfit-linpc"
     else:
-        summary_key = "delta_test_c_ipcw_vs_baselineA"
+        summary_key = "delta_test_c_ipcw_vs_znorm"
         summary_label = "delta_C_ipcw"
     groups = loso_groups(
         df_full,
