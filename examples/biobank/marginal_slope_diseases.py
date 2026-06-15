@@ -20,6 +20,7 @@ integrated-Brier pseudo-R^2 on held-out rows.
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import logging
@@ -289,6 +290,7 @@ def find_plink_prefix() -> Path:
 PLINK_PREFIX = find_plink_prefix()
 WORKDIR = PLINK_PREFIX.parent
 FITS_DIR = WORKDIR / "biobank_fits"
+FIT_CACHE_DIR = FITS_DIR / "binary_fit_cache"
 NUM_PCS = 15
 DUCHON_CENTERS = 40
 TRAIN_FRACTION = 0.80  # per-class 80/20 split
@@ -309,6 +311,37 @@ LOSO_AXIS_TO_COLUMN = {
 }
 GNOMON_BIN = os.environ.get("GNOMON_BIN", "gnomon")
 PGS_ID_PATTERN = re.compile(r"^PGS\d{6}$")
+
+
+class _Tee:
+    """Write to several streams at once (mirror disease output to a cache buffer)."""
+
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, s):
+        for st in self.streams:
+            st.write(s)
+        return len(s)
+
+    def flush(self):
+        for st in self.streams:
+            st.flush()
+
+
+def disease_fit_cache_key(name: str, cfg: dict, mode: str, axes, gamfit_version: str) -> str:
+    """Stable signature for one disease's fit + evaluation. Any change to the
+    PGS, fit geometry (PCs/centers), split, seed, mode, LOSO design, or gamfit
+    version yields a new key, so a stale fit is never silently reused."""
+    payload = {
+        "slug": name, "pgs": cfg.get("pgs"), "concept_id": cfg.get("concept_id"),
+        "snomed": cfg.get("snomed_code"), "num_pcs": NUM_PCS, "centers": DUCHON_CENTERS,
+        "train_fraction": TRAIN_FRACTION, "rng_seed": RNG_SEED, "mode": mode,
+        "axes": list(axes), "gamfit": gamfit_version,
+        "loso": [MIN_LOSO_TRAIN_EVENTS, MIN_LOSO_TRAIN_CENSORS, MIN_LOSO_TEST_EVENTS,
+                 MIN_LOSO_TEST_CENSORS, MIN_LOSO_TEST_N, MAX_LOSO_CARE_SITES],
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
 BOOTSTRAP_RESAMPLES = 399
 BOOTSTRAP_CONFIDENCE_LEVEL = 0.95
 
@@ -3151,7 +3184,18 @@ def main() -> None:
     print("=== /PRE-FLIGHT ===\n")
 
     failures: list[tuple[str, str]] = []
+    FIT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    force_refit = os.environ.get("ANC_FORCE_REFIT", "0") != "0"
     for name, cfg in diseases.items():
+        sig = disease_fit_cache_key(name, cfg, mode, active_axes, gamfit.__version__)
+        cache_path = FIT_CACHE_DIR / f"{name}__{mode}__{sig}.log"
+        if cache_path.exists() and not force_refit:
+            print(f"\n=== {name.upper()} (CACHED fit reused, sig={sig}) ===")
+            sys.stdout.write(cache_path.read_text())
+            continue
+        _cap = io.StringIO()
+        _real_stdout = sys.stdout
+        sys.stdout = _Tee(_real_stdout, _cap)
         try:
             print(f"\n=== {name.upper()} ===")
             pgs_df = load_one_pgs(cfg["pgs"])
@@ -3307,11 +3351,22 @@ def main() -> None:
                     score_train=False,
                     mode=mode,
                 )
+            # success: persist this disease's output so a rerun replays it
+            # instead of recomputing the fit (ANC_FORCE_REFIT=1 overrides).
+            sys.stdout = _real_stdout
+            try:
+                cache_path.write_text(_cap.getvalue())
+                print(f"  [fit-cache] saved {cache_path.name}")
+            except OSError as e:
+                print(f"  [fit-cache] WARN could not save cache: {e}")
         except Exception as exc:
+            sys.stdout = _real_stdout
             import traceback
             print(f"\n!!! DISEASE FAILED: {name} ({type(exc).__name__}: {exc}) -- continuing with next disease")
             traceback.print_exc()
             failures.append((name, f"{type(exc).__name__}: {exc}"))
+        finally:
+            sys.stdout = _real_stdout
     if failures:
         print(f"\n=== {len(failures)} of {len(diseases)} disease(s) FAILED (run continued): "
               + ", ".join(f"{n} [{e}]" for n, e in failures) + " ===")
