@@ -112,7 +112,8 @@ def main() -> None:
         "centers": CENTERS, "pgs": "real P+T only", "outcomes": ["binary", "survival"],
         "methods_binary": ["gamfit", "linpc", "znorm", "calpred", "rawpgs"],
         "methods_survival": ["gamfit", "linpc", "znorm", "rawpgs"],
-        "risk_metrics": "ground-truth: average prediction error, probit risk spread ratio, RMSE, MAE, and Brier Skill Score",
+        "risk_metrics": "ground-truth vs p_true: average prediction error, probit risk spread ratio, "
+                        "RMSE, MAE, Spearman/Pearson/R2 to true risk, high-risk-tail RMSE; plus Brier Skill Score",
         "discrimination": "GLOBAL only (binary AUC / survival Harrell C); never within-stratum",
     }, indent=2))
 
