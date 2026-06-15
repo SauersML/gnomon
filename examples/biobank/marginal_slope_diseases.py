@@ -366,34 +366,40 @@ def disease_fit_cache_key(
 def print_cached_metrics_summary(mode: str) -> None:
     """Upfront board of the in-distribution (80/20) test metrics from every fit
     already finished and cached, so a new run shows results-so-far before doing
-    any more work. Reads the GAM (marginal-slope) test line out of each cache log."""
+    any more work. Reports EVERY method per disease (the marginal-slope GAM and
+    every baseline), not just the GAM."""
     import glob
 
-    label = "GAM" if mode == "survival" else "binaryGAM"
-    # The metric line may be either "<label>  test <m>" or the combined
-    # "<label>  train <m>  test <m>", so match `test` anywhere after the label
-    # (not immediately after it) and capture the test metrics that follow.
-    pat = re.compile(rf"^\s*{label}\s+.*?\btest\s+(.+)$", re.M)
+    # Method labels as printed by the binary / survival evaluators.
+    methods = (["GAM", "baselineA", "baselineB"] if mode == "survival"
+               else ["binaryGAM", "binaryN", "binaryA", "binaryB"])
+    # The metric line may be "<label>  test <m>" or the combined
+    # "<label>  train <m>  test <m>"; capture the label and the test-metrics
+    # that follow `test` anywhere on the line.
+    pat = re.compile(rf"^\s*({'|'.join(methods)})\s+.*?\btest\s+(.+)$", re.M)
     logs = sorted(glob.glob(str(FIT_CACHE_DIR / f"*__{mode}__*.log")))
-    rows: dict[str, str] = {}
+    per_disease: dict[str, dict[str, str]] = {}
     for lf in logs:
         slug = Path(lf).name.split("__")[0]
         try:
             txt = Path(lf).read_text()
         except OSError:
             continue
-        matches = pat.findall(txt)
-        if matches:
-            rows[slug] = matches[-1].strip()  # last (pass-2 if both present)
-    print(f"\n=== RESULTS SO FAR ({mode}): {len(rows)} disease(s) "
+        d = per_disease.setdefault(slug, {})
+        for label, metrics in pat.findall(txt):
+            d[label] = metrics.strip()  # last wins (pass 2 if both present)
+    print(f"\n=== RESULTS SO FAR ({mode}): {len(per_disease)} disease(s) "
           f"from {len(logs)} cached fit file(s) [{FIT_CACHE_DIR}] ===")
     if not logs:
         print("  (none yet -- nothing cached)")
-    elif not rows:
-        print(f"  ({len(logs)} cache file(s) present but no '{label} ... test' "
-              f"line could be parsed -- format mismatch)")
-    for slug in sorted(rows):
-        print(f"  {slug:<26} {rows[slug]}")
+    elif not any(per_disease.values()):
+        print(f"  ({len(logs)} cache file(s) present but no method 'test' line "
+              f"could be parsed -- format mismatch)")
+    for slug in sorted(per_disease):
+        print(f"  {slug}")
+        for label in methods:
+            if label in per_disease[slug]:
+                print(f"      {label:<11} {per_disease[slug][label]}")
     print("=== /RESULTS SO FAR ===")
 
 
