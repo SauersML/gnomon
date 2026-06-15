@@ -1364,6 +1364,7 @@ class SurvivalMetricStats:
     ibs_start: float
     ibs_stop: float
     n_times: int
+    hr_per_sd: float
 
 
 @dataclass(frozen=True)
@@ -1382,6 +1383,7 @@ class BinaryStats:
     average_precision: float
     brier: float
     liability_r2: float
+    or_per_sd: float
 
 
 def survival_model_columns(num_pcs: int) -> list[str]:
@@ -1859,6 +1861,7 @@ def _extract_binary_mean(prediction: object) -> np.ndarray:
 
 def binary_stats(y: np.ndarray, p: np.ndarray, population_prevalence: float | None) -> BinaryStats:
     from scipy.stats import norm
+    from sklearn.linear_model import LogisticRegression
     from sklearn.metrics import (  # lazy: only needed after binary predictions exist
         average_precision_score,
         brier_score_loss,
@@ -1869,6 +1872,16 @@ def binary_stats(y: np.ndarray, p: np.ndarray, population_prevalence: float | No
     y = np.asarray(y, dtype=np.int64)
     p = np.clip(np.asarray(p, dtype=np.float64), np.finfo(float).eps, 1.0 - np.finfo(float).eps)
     prevalence = float(y.mean())
+    # OR per 1 SD of the standardized risk score (logit scale): canonical PGS
+    # effect-size metric, defined identically to the simulation's `or_per_sd`.
+    or_per_sd = float("nan")
+    if len(np.unique(y)) > 1:
+        score = np.log(p / (1.0 - p))
+        sd = float(score.std())
+        if sd > 1e-9:
+            zsc = ((score - score.mean()) / sd).reshape(-1, 1)
+            coef = LogisticRegression(C=1e6, max_iter=2000).fit(zsc, y).coef_[0][0]
+            or_per_sd = float(np.exp(coef))
     ll_model = -float(log_loss(y, p, labels=[0, 1], normalize=False))
     null_p = np.repeat(prevalence, len(y))
     ll_null = -float(log_loss(y, null_p, labels=[0, 1], normalize=False))
@@ -1893,6 +1906,7 @@ def binary_stats(y: np.ndarray, p: np.ndarray, population_prevalence: float | No
         average_precision=float(average_precision_score(y, p)),
         brier=float(brier_score_loss(y, p)),
         liability_r2=float(liability_r2),
+        or_per_sd=or_per_sd,
     )
 
 
@@ -1900,7 +1914,7 @@ def fmt_binary(stats: BinaryStats) -> str:
     return (
         f"AUROC={stats.auroc:.4f}  AP={stats.average_precision:.4f}  "
         f"Brier={stats.brier:.4f}  "
-        f"liability_R2={stats.liability_r2:.4f}"
+        f"liability_R2={stats.liability_r2:.4f}  OR/SD={stats.or_per_sd:.3f}"
     )
 
 
@@ -2279,6 +2293,18 @@ def survival_library_metrics(
         )
     )
     r2_ibs = float(1.0 - ibs / null_ibs) if null_ibs > 0 else float("nan")
+    # HR per 1 SD of the standardized risk score: survival analog of OR/SD
+    # (univariate Cox on the test stratum). nan if it can't be estimated.
+    hr_per_sd = float("nan")
+    try:
+        from sksurv.linear_model import CoxPHSurvivalAnalysis
+
+        rsd = float(risk.std())
+        if rsd > 1e-9 and int(test["event"].sum()) >= 5:
+            zr = ((risk - risk.mean()) / rsd).reshape(-1, 1)
+            hr_per_sd = float(np.exp(CoxPHSurvivalAnalysis().fit(zr, test_y).coef_[0]))
+    except Exception:  # noqa: BLE001
+        hr_per_sd = float("nan")
     return SurvivalMetricStats(
         n=int(len(test)),
         n_events=int(test["event"].sum()),
@@ -2293,6 +2319,7 @@ def survival_library_metrics(
         ibs_start=float(followup_times[0]),
         ibs_stop=float(followup_times[-1]),
         n_times=int(len(followup_times)),
+        hr_per_sd=hr_per_sd,
     )
 
 
@@ -2300,7 +2327,7 @@ def fmt_survival(stats: SurvivalMetricStats) -> str:
     return (
         f"C_ipcw={stats.c_ipcw:.4f} "
         f"95%CI=[{stats.c_ipcw_ci_low:.4f},{stats.c_ipcw_ci_high:.4f}]  "
-        f"IBS={stats.ibs:.5f}  R2_IBS={stats.r2_ibs:.4f}"
+        f"IBS={stats.ibs:.5f}  R2_IBS={stats.r2_ibs:.4f}  HR/SD={stats.hr_per_sd:.3f}"
     )
 
 
