@@ -156,6 +156,7 @@ def global_discrimination(y, p):
     except Exception:  # noqa: BLE001
         out["brier"] = np.nan
     out["liability_r2"] = _lee_liability_r2(y, p)
+    out["or_per_sd"] = common.or_per_sd(y, p)
     return out
 
 
@@ -203,7 +204,8 @@ def main():
         for bk, bl, mask in strata:
             cm, n = common.risk_vs_truth(p_true_te[mask], p[mask])
             sk = common.brier_skill(y_te[mask], p[mask])
-            for metric, val in {**cm, **sk}.items():
+            es = {"or_per_sd": common.or_per_sd(y_te[mask], p[mask])}
+            for metric, val in {**cm, **sk, **es}.items():
                 cal_rows.append(dict(dem=args.dem, pheno=args.pheno, pgs_mode=args.pgs_mode,
                                      method=method, ancestry_bin_kind=bk, ancestry_bin=bl,
                                      n=int(n), metric=metric, value=val))

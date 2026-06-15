@@ -11,6 +11,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 from scipy.stats import norm, pearsonr, spearmanr
+from sklearn.linear_model import LogisticRegression
 
 EPS = 1e-6
 
@@ -154,6 +155,31 @@ def _tail_rmse_true(p_true, p_pred, q: float = 0.9) -> float:
     return float(np.sqrt(np.mean((p_pred[m] - p_true[m]) ** 2)))
 
 
+def _rr_top10_true(p_true, p_pred, q: float = 0.9) -> float:
+    """True-risk ratio of the top-decile-by-PREDICTED vs the rest: does flagging
+    the top 10% by score actually enrich for genuinely high true risk?
+    Higher = better high-risk identification (the canonical clinical PGS use)."""
+    flag = p_pred >= float(np.quantile(p_pred, q))
+    if flag.sum() < 3 or (~flag).sum() < 3:
+        return np.nan
+    return float((p_true[flag].mean() + EPS) / (p_true[~flag].mean() + EPS))
+
+
+def or_per_sd(y, p_pred) -> float:
+    """Odds ratio per 1 SD of the standardized risk score (logit scale) -- the
+    canonical PGS effect-size metric. Higher = stronger per-SD risk
+    stratification. Needs the outcome, so it is discrimination-flavoured (not a
+    vs-p_true oracle metric); nan if a stratum has one class or a constant score."""
+    y = np.asarray(y).astype(int)
+    z = logit(p_pred)
+    sd = float(np.std(z))
+    if len(np.unique(y)) < 2 or sd < 1e-9:
+        return np.nan
+    z = ((z - z.mean()) / sd).reshape(-1, 1)
+    coef = LogisticRegression(C=1e6, max_iter=2000).fit(z, y).coef_[0][0]
+    return float(np.exp(coef))
+
+
 def risk_vs_truth(p_true, p_pred) -> tuple[dict, int]:
     """Prediction error against the known generative risk on one stratum.
 
@@ -169,7 +195,7 @@ def risk_vs_truth(p_true, p_pred) -> tuple[dict, int]:
     p_pred = clip01(p_pred)
     n = len(p_true)
     keys = ("avg_pred_minus_true_risk", "probit_risk_slope_ratio", "rmse", "mae",
-            "spearman_true", "pearson_true", "r2_true", "tail_rmse_true")
+            "spearman_true", "pearson_true", "r2_true", "tail_rmse_true", "rr_top10_true")
     if n < 10:
         return {k: np.nan for k in keys}, n
     ss_tot = float(np.sum((p_true - p_true.mean()) ** 2))
@@ -182,6 +208,7 @@ def risk_vs_truth(p_true, p_pred) -> tuple[dict, int]:
         "pearson_true": _corr(pearsonr, p_pred, p_true),
         "r2_true": float(1.0 - np.sum((p_pred - p_true) ** 2) / ss_tot) if ss_tot > 0 else np.nan,
         "tail_rmse_true": _tail_rmse_true(p_true, p_pred),
+        "rr_top10_true": _rr_top10_true(p_true, p_pred),
     }, n
 
 
