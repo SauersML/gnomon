@@ -1945,9 +1945,27 @@ def _extract_binary_mean(prediction: object) -> np.ndarray:
 
 
 def _wilson_ci(k: int, n: int, z: float = 1.959963984540054) -> tuple[float, float]:
-    """Wilson 95% interval for a binomial rate (closed form, valid at small n)."""
+    """Wilson 95% interval for a binomial rate (trusted-lib backed).
+
+    Delegates to ``scipy.stats.binomtest(k, n).proportion_ci(method='wilson')``,
+    which is the standard Wilson score interval. The legacy ``z`` argument is
+    retained for signature compatibility; callers only ever pass the 95%
+    default (z=1.95996...), for which scipy's confidence_level=0.95 is exactly
+    equivalent. A non-default z falls back to the closed form so the contract
+    never silently changes.
+    """
     if n <= 0:
         return float("nan"), float("nan")
+    # scipy's Wilson interval is parameterized by confidence level, which maps
+    # 1:1 to the 95% default z. Use it for the (only) production path; keep the
+    # closed form for any non-95% z so behavior is identical to before.
+    if abs(z - 1.959963984540054) < 1e-9:
+        try:
+            from scipy.stats import binomtest
+            ci = binomtest(int(k), int(n)).proportion_ci(method="wilson")
+            return float(ci.low), float(ci.high)
+        except Exception:  # noqa: BLE001 -- never raise from a metric helper
+            pass
     phat = k / n
     denom = 1.0 + z * z / n
     center = (phat + z * z / (2 * n)) / denom
@@ -2077,6 +2095,124 @@ def binary_stats(y: np.ndarray, p: np.ndarray, population_prevalence: float | No
         frac_ge_2x=_frac_ge(2.0),
         frac_ge_3x=_frac_ge(3.0),
     )
+
+
+# Headline binary metrics that get per-method bootstrap CIs and paired deltas.
+# These are attributes of BinaryStats; the bootstrap re-runs the *exact*
+# `binary_stats` definition on each resample so no metric definition can drift.
+_CI_METRICS: tuple[str, ...] = (
+    "auroc",
+    "or_per_sd",
+    "bss",
+    "calibration_slope",
+    "calibration_coverage",
+    "rr_top10",
+    "rr_top20",
+    "frac_ge_2x",
+    "frac_ge_3x",
+)
+
+
+def binary_metric_cis(
+    y_test: np.ndarray,
+    method_preds: dict[str, np.ndarray],
+    population_prevalence: float | None,
+    *,
+    gamfit_key: str = "gamfit",
+    n_resamples: int = 400,
+    confidence_level: float = 0.95,
+) -> dict[str, float]:
+    """95% BCa bootstrap CIs for the headline binary metrics, computed ONCE on
+    the held-out test set (not per-LOSO-group).
+
+    For each method in `method_preds` and each metric in `_CI_METRICS`, resamples
+    the (y, p) rows and re-runs `binary_stats` so the bootstrapped statistic is
+    identical to the reported point estimate by construction. Also produces
+    paired gamfit-minus-baseline delta CIs (resampling the *same* row indices so
+    the pairing is preserved).
+
+    Returns a flat dict of keys:
+        binary_<method>_test_<metric>_ci_low / _ci_high
+        binary_delta_<metric>_gamfit-<method>_ci_low / _ci_high
+    Guarded: returns {} on ANY failure — must never break a fit/cache.
+    """
+    try:
+        from scipy.stats import bootstrap
+    except Exception:  # noqa: BLE001
+        return {}
+    out: dict[str, float] = {}
+    try:
+        y_arr = np.asarray(y_test, dtype=np.float64)
+        methods = {k: np.asarray(v, dtype=np.float64) for k, v in method_preds.items()}
+        n = int(y_arr.size)
+        if n < 10 or any(v.size != n for v in methods.values()):
+            return {}
+        rng = np.random.default_rng(0)
+
+        def _metric_fn(metric: str, p_arr: np.ndarray):
+            def _stat(idx: np.ndarray) -> float:
+                idx = np.asarray(idx, dtype=np.int64)
+                val = getattr(
+                    binary_stats(y_arr[idx], p_arr[idx], population_prevalence),
+                    metric,
+                )
+                return float(val) if np.isfinite(val) else np.nan
+            return _stat
+
+        index = np.arange(n)
+        # Per-method metric CIs.
+        for name, p_arr in methods.items():
+            for metric in _CI_METRICS:
+                try:
+                    res = bootstrap(
+                        (index,),
+                        _metric_fn(metric, p_arr),
+                        n_resamples=n_resamples,
+                        method="BCa",
+                        confidence_level=confidence_level,
+                        random_state=rng,
+                        vectorized=False,
+                    )
+                    lo = float(res.confidence_interval.low)
+                    hi = float(res.confidence_interval.high)
+                except Exception:  # noqa: BLE001
+                    lo = hi = float("nan")
+                out[f"binary_{name}_test_{metric}_ci_low"] = lo
+                out[f"binary_{name}_test_{metric}_ci_high"] = hi
+
+        # Paired gamfit-minus-baseline delta CIs.
+        p_gam = methods.get(gamfit_key)
+        if p_gam is not None:
+            for name, p_arr in methods.items():
+                if name == gamfit_key:
+                    continue
+                for metric in _CI_METRICS:
+                    def _delta_stat(idx: np.ndarray, _m=metric, _pb=p_arr) -> float:
+                        idx = np.asarray(idx, dtype=np.int64)
+                        yi = y_arr[idx]
+                        a = float(getattr(binary_stats(yi, p_gam[idx], population_prevalence), _m))
+                        b = float(getattr(binary_stats(yi, _pb[idx], population_prevalence), _m))
+                        d = a - b
+                        return d if np.isfinite(d) else np.nan
+                    try:
+                        res = bootstrap(
+                            (index,),
+                            _delta_stat,
+                            n_resamples=n_resamples,
+                            method="BCa",
+                            confidence_level=confidence_level,
+                            random_state=rng,
+                            vectorized=False,
+                        )
+                        lo = float(res.confidence_interval.low)
+                        hi = float(res.confidence_interval.high)
+                    except Exception:  # noqa: BLE001
+                        lo = hi = float("nan")
+                    out[f"binary_delta_{metric}_{gamfit_key}-{name}_ci_low"] = lo
+                    out[f"binary_delta_{metric}_{gamfit_key}-{name}_ci_high"] = hi
+    except Exception:  # noqa: BLE001 -- CIs must NEVER break a fit
+        return {}
+    return out
 
 
 def fmt_binary(stats: BinaryStats) -> str:
@@ -2757,6 +2893,22 @@ def evaluate_binary_model_pair(
         f"liability_R2(gamfit-nuisance)={gam_test_m.liability_r2 - N_test_m.liability_r2:+.4f}"
     )
 
+    # Per-metric 95% BCa bootstrap CIs on the held-out test set (computed ONCE
+    # here, never per-LOSO-group). Method keys match the binary_* field prefixes:
+    # gam_test / nuisance_test / znorm_test / linpc_test. Fully guarded — returns
+    # {} on any failure, so it can never break a fit or invalidate the cache.
+    metric_cis = binary_metric_cis(
+        y_test,
+        {
+            "gam": gam_p_test,
+            "nuisance": p_N_test,
+            "znorm": p_A_test,
+            "linpc": p_B_test,
+        },
+        population_prevalence,
+        gamfit_key="gam",
+    )
+
     result: dict[str, float | int | str] = {
         "label": label,
         "pgs": pgs_id,
@@ -2764,6 +2916,7 @@ def evaluate_binary_model_pair(
         **_binary_fields("binary_nuisance_test", N_test_m),
         **_binary_fields("binary_znorm_test", A_test_m),
         **_binary_fields("binary_linpc_test", B_test_m),
+        **metric_cis,
         "binary_gam_test_auroc_se": gam_auc_se,
         "binary_gam_test_auroc_ci_low": gam_auc_lo,
         "binary_gam_test_auroc_ci_high": gam_auc_hi,

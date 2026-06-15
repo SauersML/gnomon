@@ -12,8 +12,9 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import brentq
 from scipy.special import expit
-from scipy.stats import norm, pearsonr, spearmanr
+from scipy.stats import binomtest, norm, pearsonr, spearmanr
 from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import brier_score_loss
 
 EPS = 1e-6
 
@@ -269,14 +270,16 @@ def risk_vs_truth(p_true, p_pred) -> tuple[dict, int]:
 
 
 def _wilson_ci(k: int, n: int, z: float = 1.959963984540054) -> tuple[float, float]:
-    """Wilson 95% interval for a binomial rate -- closed form, valid at small n."""
-    if n <= 0:
+    """Wilson 95% interval for a binomial rate -- valid at small n. Delegates to
+    scipy.stats.binomtest(...).proportion_ci(method='wilson'), which is the
+    closed-form Wilson score interval; equivalent to the prior hand-coded formula
+    to machine precision. The ``z`` arg is retained for signature compatibility and
+    is mapped to the corresponding two-sided confidence level."""
+    if n <= 0 or k < 0 or k > n:
         return np.nan, np.nan
-    phat = k / n
-    denom = 1.0 + z * z / n
-    center = (phat + z * z / (2 * n)) / denom
-    half = z * np.sqrt(phat * (1 - phat) / n + z * z / (4 * n * n)) / denom
-    return center - half, center + half
+    conf = float(2.0 * norm.cdf(z) - 1.0)
+    ci = binomtest(int(k), int(n)).proportion_ci(method="wilson", confidence_level=conf)
+    return float(ci.low), float(ci.high)
 
 
 def calibration_coverage(y, p_pred, bins: int = 10, min_per_bin: int = 20) -> float:
@@ -334,7 +337,7 @@ def brier_skill(y, p) -> dict:
         return {k: np.nan for k in keys}
     ybar = float(y.mean())
     unc = ybar * (1.0 - ybar)
-    bs = float(np.mean((p - y) ** 2))
+    bs = float(brier_score_loss(y, p, pos_label=1))
     return {
         "bss": float(1.0 - bs / unc) if unc > 0 else np.nan,
     }
