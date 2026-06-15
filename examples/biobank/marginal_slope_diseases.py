@@ -973,12 +973,10 @@ def select_runtime_diseases(client: bigquery.Client, cdr: str) -> dict[str, dict
         else:
             print(f"    SKIP  {nm:<42.42} cases={cases:>9,}  no PGS available -- not scored")
 
-    chosen_concept_ids: list[int] = []
-    for cid in ranked["concept_id"].tolist():
-        if int(cid) in survivors:
-            chosen_concept_ids.append(int(cid))
-        if len(chosen_concept_ids) >= TOP_N_DISEASES:
-            break
+    # Run rule: a disease must be among the top-N most prevalent overall AND
+    # have a PGS (survivor = mapped ∩ OHDSI-canonical). Nothing outside the
+    # top-N runs -- the RUN lines above are exactly the chosen set.
+    chosen_concept_ids: list[int] = [cid for cid in top_ids if cid in survivors]
 
     diseases: dict[str, dict] = {}
     print(f"  selected top-{len(chosen_concept_ids)} by prevalence:")
