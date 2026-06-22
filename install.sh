@@ -110,6 +110,11 @@ bootstrap_latest_installer() {
     local sha=""
     local response=""
     local tmp_script=""
+    # A user-supplied GNOMON_INSTALL_MAIN_SHA is an explicit, strict pin: run the
+    # installer body from exactly that commit and target exactly its release.
+    # Without one, resolve main HEAD but let the body fall back to the latest
+    # available binary release (HEAD's release may not be published yet).
+    local pinned_sha="${GNOMON_INSTALL_MAIN_SHA:-}"
 
     local curl_args=(-fsSL --retry 5 --retry-delay 2 --retry-connrefused --connect-timeout 5 --max-time 20)
     if [ -n "$GITHUB_TOKEN" ]; then
@@ -118,8 +123,12 @@ bootstrap_latest_installer() {
         curl_args+=(-H "Authorization: token $GH_TOKEN")
     fi
 
-    response="$(curl "${curl_args[@]}" "$api_url" 2>/dev/null || true)"
-    sha="$(echo "$response" | sed -n 's/^[[:space:]]*"sha":[[:space:]]*"\([0-9a-f]\{40\}\)".*/\1/p' | head -n 1)"
+    if [ -n "$pinned_sha" ]; then
+        sha="$pinned_sha"
+    else
+        response="$(curl "${curl_args[@]}" "$api_url" 2>/dev/null || true)"
+        sha="$(echo "$response" | sed -n 's/^[[:space:]]*"sha":[[:space:]]*"\([0-9a-f]\{40\}\)".*/\1/p' | head -n 1)"
+    fi
 
     if [ -z "$sha" ]; then
         log_info "Could not resolve latest main commit SHA; continuing with current installer body."
@@ -141,7 +150,11 @@ bootstrap_latest_installer() {
     fi
 
     log_info "Refreshing installer from main commit ${sha}."
-    GNOMON_INSTALL_BOOTSTRAPPED=1 GNOMON_INSTALL_MAIN_SHA="$sha" bash "$tmp_script" "$@"
+    if [ -n "$pinned_sha" ]; then
+        GNOMON_INSTALL_BOOTSTRAPPED=1 GNOMON_INSTALL_MAIN_SHA="$sha" bash "$tmp_script" "$@"
+    else
+        GNOMON_INSTALL_BOOTSTRAPPED=1 GNOMON_INSTALL_BOOTSTRAP_SHA="$sha" bash "$tmp_script" "$@"
+    fi
     local rc=$?
     rm -f "$tmp_script"
     exit $rc
@@ -257,11 +270,16 @@ fi
 # --- 2. Find Latest Published Binary Release ---
 log_header "Checking Published Binary Releases"
 
-# When a caller supplies GNOMON_INSTALL_MAIN_SHA, install exactly that
-# commit-addressed release. Silently substituting another main-* release
-# reintroduces fixed bugs under the freshly pulled source tree.
-if [ -n "${GNOMON_INSTALL_MAIN_SHA:-}" ]; then
-    RELEASE_TAG="main-${GNOMON_INSTALL_MAIN_SHA}"
+# When a caller explicitly supplies GNOMON_INSTALL_MAIN_SHA, install exactly
+# that commit-addressed release and refuse to substitute another (silently
+# swapping in a different main-* release reintroduces fixed bugs). A
+# bootstrap-resolved SHA (GNOMON_INSTALL_BOOTSTRAP_SHA) merely points at main
+# HEAD, whose binary release may not be published yet, so it is allowed to fall
+# back to the latest available binary release.
+PINNED_SHA="${GNOMON_INSTALL_MAIN_SHA:-}"
+TARGET_SHA="${PINNED_SHA:-${GNOMON_INSTALL_BOOTSTRAP_SHA:-}}"
+if [ -n "$TARGET_SHA" ]; then
+    RELEASE_TAG="main-${TARGET_SHA}"
     RELEASE_API_URL="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/tags/${RELEASE_TAG}?_=$(date +%s)"
 else
     RELEASE_TAG=""
@@ -314,7 +332,7 @@ resolve_release_response() {
 resolve_release_response
 select_download_url || true
 
-if [ -z "$DOWNLOAD_URL" ] && [ -n "${GNOMON_INSTALL_MAIN_SHA:-}" ]; then
+if [ -z "$DOWNLOAD_URL" ] && [ -n "$PINNED_SHA" ]; then
     log_error "Release ${RELEASE_TAG} did not provide a compatible asset."
     log_error "Expected one of: ${ASSET_CANDIDATES[*]}"
     log_error "Refusing to install a different release for explicit GNOMON_INSTALL_MAIN_SHA."
@@ -322,18 +340,15 @@ if [ -z "$DOWNLOAD_URL" ] && [ -n "${GNOMON_INSTALL_MAIN_SHA:-}" ]; then
 fi
 
 if [ -z "$DOWNLOAD_URL" ]; then
-    case "$RELEASE_TAG" in
-        main-*)
-            ;;
-        *)
-            log_info "Latest release is not a gnomon binary release; scanning published binary releases."
-            RELEASE_RESPONSE="$(curl "${CURL_ARGS[@]}" "${RELEASES_API_URL}" || true)"
-            select_download_url || true
-            if [ -n "$DOWNLOAD_URL" ]; then
-                RELEASE_TAG="$(echo "$DOWNLOAD_URL" | sed -n 's#.*/download/\([^/]*\)/.*#\1#p' | head -n 1)"
-            fi
-            ;;
-    esac
+    # The resolved release (main HEAD, or "latest") has no compatible asset --
+    # e.g. its binary build has not published yet, or it is not a binary
+    # release. Fall back to the newest published release that does carry a
+    # compatible asset. Only reached when the SHA was not an explicit user pin.
+    log_info "Resolved release has no compatible asset; scanning recent published binary releases."
+    RELEASE_RESPONSE="$(curl "${CURL_ARGS[@]}" "${RELEASES_API_URL}" || true)"
+    if select_download_url; then
+        RELEASE_TAG="$(echo "$DOWNLOAD_URL" | sed -n 's#.*/download/\([^/]*\)/.*#\1#p' | head -n 1)"
+    fi
 fi
 
 if [ -z "$RELEASE_TAG" ]; then
