@@ -8,7 +8,11 @@ version = "0.1.0"
 description = "Python bindings for SauersML/gnomon (high-performance polygenic score engine)."
 readme = "README.md"
 license = "AGPL-3.0-or-later"
-license-files = ["LICENSE"]
+# The license file is the repo-root LICENSE, which maturin already includes via
+# the Cargo manifest (manifest-path = "../Cargo.toml"). Don't also declare a
+# python/LICENSE here: the sdist would map both to the same path and abort
+# ("LICENSE was already added"). The SPDX `license` expression above is the
+# canonical license metadata for the wheel.
 authors = [{ name = "SauersML" }]
 requires-python = ">=3.9"
 dependencies = []
