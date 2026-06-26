@@ -1442,19 +1442,26 @@ fn solve_projection_with_dense_missing_info(
 ) {
     let n_samples = scores.nrows();
     let solve_base = build_projection_solve_base(global_info_packed, normalization, components);
-    let scores_ptr = {
+    // faer matrices are column-major with `row_stride == 1`, but the column
+    // stride is padded for alignment and is NOT generally equal to `n_samples`.
+    // Index columns with the matrix's real column stride; assuming `n_samples`
+    // would write component k>=1 into inter-column padding (corrupting scores
+    // and leaving alignment zero) whenever `n_samples` is not faer-aligned.
+    let (scores_ptr, scores_col_stride) = {
         let scores_col_major = scores
             .rb_mut()
             .try_as_col_major_mut()
-            .expect("projection output matrix must be contiguous column-major");
-        scores_col_major.as_ptr_mut() as usize
+            .expect("projection output matrix must be column-major (row_stride == 1)");
+        let stride = scores_col_major.col_stride() as usize;
+        (scores_col_major.as_ptr_mut() as usize, stride)
     };
     let alignment_ptr = alignment_out.as_mut().map(|alignment| {
         let alignment_col_major = alignment
             .rb_mut()
             .try_as_col_major_mut()
-            .expect("projection alignment matrix must be contiguous column-major");
-        alignment_col_major.as_ptr_mut() as usize
+            .expect("projection alignment matrix must be column-major (row_stride == 1)");
+        let stride = alignment_col_major.col_stride() as usize;
+        (alignment_col_major.as_ptr_mut() as usize, stride)
     });
     let solve_chunk = projection_solve_sample_chunk(n_samples);
     let solve_chunks = n_samples.div_ceil(solve_chunk);
@@ -1468,7 +1475,8 @@ fn solve_projection_with_dense_missing_info(
         },
         |(info_matrix, rhs), chunk_idx| {
             let scores_ptr = scores_ptr as *mut f64;
-            let alignment_ptr = alignment_ptr.map(|ptr| ptr as *mut f64);
+            let align_col_stride = alignment_ptr.map(|(_, stride)| stride).unwrap_or(0);
+            let alignment_ptr = alignment_ptr.map(|(ptr, _)| ptr as *mut f64);
             let sample_start = chunk_idx * solve_chunk;
             let sample_end = (sample_start + solve_chunk).min(n_samples);
 
@@ -1483,8 +1491,9 @@ fn solve_projection_with_dense_missing_info(
                 if trace <= WLS_RIDGE * (components as f64) {
                     write_zero_projection_sample(
                         scores_ptr,
+                        scores_col_stride,
                         alignment_ptr,
-                        n_samples,
+                        align_col_stride,
                         components,
                         sample,
                         zero_action,
@@ -1493,7 +1502,7 @@ fn solve_projection_with_dense_missing_info(
                 }
 
                 for k in 0..components {
-                    rhs[k] = unsafe { *scores_ptr.add(k * n_samples + sample) };
+                    rhs[k] = unsafe { *scores_ptr.add(k * scores_col_stride + sample) };
                 }
 
                 let solved = if missing_trace == 0.0 && solve_base.base_factor_ready {
@@ -1515,14 +1524,14 @@ fn solve_projection_with_dense_missing_info(
                 if solved {
                     for k in 0..components {
                         unsafe {
-                            *scores_ptr.add(k * n_samples + sample) = rhs[k];
+                            *scores_ptr.add(k * scores_col_stride + sample) = rhs[k];
                         }
                     }
                     if let Some(alignment_ptr) = alignment_ptr {
                         if missing_trace == 0.0 {
                             for (k, &value) in solve_base.base_alignment.iter().enumerate() {
                                 unsafe {
-                                    *alignment_ptr.add(k * n_samples + sample) = value;
+                                    *alignment_ptr.add(k * align_col_stride + sample) = value;
                                 }
                             }
                         } else {
@@ -1536,7 +1545,7 @@ fn solve_projection_with_dense_missing_info(
                                     0.0
                                 };
                                 unsafe {
-                                    *alignment_ptr.add(k * n_samples + sample) = value;
+                                    *alignment_ptr.add(k * align_col_stride + sample) = value;
                                 }
                             }
                         }
@@ -1544,8 +1553,9 @@ fn solve_projection_with_dense_missing_info(
                 } else {
                     write_zero_projection_sample(
                         scores_ptr,
+                        scores_col_stride,
                         alignment_ptr,
-                        n_samples,
+                        align_col_stride,
                         components,
                         sample,
                         zero_action,
@@ -1568,19 +1578,23 @@ fn solve_projection_with_sparse_missing_variants(
     let n_samples = scores.nrows();
     let components = scores.ncols();
     let solve_base = build_projection_solve_base(global_info_packed, normalization, components);
-    let scores_ptr = {
+    // See `solve_projection_with_dense_missing_info`: index columns with the
+    // matrix's real (padded) column stride, not `n_samples`.
+    let (scores_ptr, scores_col_stride) = {
         let scores_col_major = scores
             .rb_mut()
             .try_as_col_major_mut()
-            .expect("projection output matrix must be contiguous column-major");
-        scores_col_major.as_ptr_mut() as usize
+            .expect("projection output matrix must be column-major (row_stride == 1)");
+        let stride = scores_col_major.col_stride() as usize;
+        (scores_col_major.as_ptr_mut() as usize, stride)
     };
     let alignment_ptr = alignment_out.as_mut().map(|alignment| {
         let alignment_col_major = alignment
             .rb_mut()
             .try_as_col_major_mut()
-            .expect("projection alignment matrix must be contiguous column-major");
-        alignment_col_major.as_ptr_mut() as usize
+            .expect("projection alignment matrix must be column-major (row_stride == 1)");
+        let stride = alignment_col_major.col_stride() as usize;
+        (alignment_col_major.as_ptr_mut() as usize, stride)
     });
     let solve_chunk = projection_solve_sample_chunk(n_samples);
     let solve_chunks = n_samples.div_ceil(solve_chunk);
@@ -1599,14 +1613,15 @@ fn solve_projection_with_sparse_missing_variants(
         |(info_matrix, rhs, diag_mass, low_missing_z, low_missing_rhs, low_missing_gram),
          chunk_idx| {
             let scores_ptr = scores_ptr as *mut f64;
-            let alignment_ptr = alignment_ptr.map(|ptr| ptr as *mut f64);
+            let align_col_stride = alignment_ptr.map(|(_, stride)| stride).unwrap_or(0);
+            let alignment_ptr = alignment_ptr.map(|(ptr, _)| ptr as *mut f64);
             let sample_start = chunk_idx * solve_chunk;
             let sample_end = (sample_start + solve_chunk).min(n_samples);
 
             for sample in sample_start..sample_end {
                 let missing = &missing_variants[sample];
                 for k in 0..components {
-                    rhs[k] = unsafe { *scores_ptr.add(k * n_samples + sample) };
+                    rhs[k] = unsafe { *scores_ptr.add(k * scores_col_stride + sample) };
                 }
 
                 let solved = if missing.is_empty() && solve_base.base_factor_ready {
@@ -1632,8 +1647,9 @@ fn solve_projection_with_sparse_missing_variants(
                     if trace <= WLS_RIDGE * (components as f64) {
                         write_zero_projection_sample(
                             scores_ptr,
+                            scores_col_stride,
                             alignment_ptr,
-                            n_samples,
+                            align_col_stride,
                             components,
                             sample,
                             zero_action,
@@ -1693,14 +1709,14 @@ fn solve_projection_with_sparse_missing_variants(
                 if solved {
                     for k in 0..components {
                         unsafe {
-                            *scores_ptr.add(k * n_samples + sample) = rhs[k];
+                            *scores_ptr.add(k * scores_col_stride + sample) = rhs[k];
                         }
                     }
                     if let Some(alignment_ptr) = alignment_ptr {
                         if missing.is_empty() {
                             for (k, &value) in solve_base.base_alignment.iter().enumerate() {
                                 unsafe {
-                                    *alignment_ptr.add(k * n_samples + sample) = value;
+                                    *alignment_ptr.add(k * align_col_stride + sample) = value;
                                 }
                             }
                         } else {
@@ -1712,7 +1728,7 @@ fn solve_projection_with_sparse_missing_variants(
                                     0.0
                                 };
                                 unsafe {
-                                    *alignment_ptr.add(k * n_samples + sample) = value;
+                                    *alignment_ptr.add(k * align_col_stride + sample) = value;
                                 }
                             }
                         }
@@ -1720,8 +1736,9 @@ fn solve_projection_with_sparse_missing_variants(
                 } else {
                     write_zero_projection_sample(
                         scores_ptr,
+                        scores_col_stride,
                         alignment_ptr,
-                        n_samples,
+                        align_col_stride,
                         components,
                         sample,
                         zero_action,
@@ -2567,8 +2584,9 @@ fn solve_spd_lower_in_place(a: &mut [f64], b: &mut [f64], n: usize) -> bool {
 
 fn write_zero_projection_sample(
     scores_ptr: *mut f64,
+    scores_col_stride: usize,
     alignment_ptr: Option<*mut f64>,
-    n_samples: usize,
+    align_col_stride: usize,
     components: usize,
     sample: usize,
     zero_action: ZeroAlignmentAction,
@@ -2579,13 +2597,13 @@ fn write_zero_projection_sample(
     };
     for component in 0..components {
         unsafe {
-            *scores_ptr.add(component * n_samples + sample) = score_value;
+            *scores_ptr.add(component * scores_col_stride + sample) = score_value;
         }
     }
     if let Some(alignment_ptr) = alignment_ptr {
         for component in 0..components {
             unsafe {
-                *alignment_ptr.add(component * n_samples + sample) = 0.0;
+                *alignment_ptr.add(component * align_col_stride + sample) = 0.0;
             }
         }
     }
