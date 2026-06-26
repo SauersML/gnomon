@@ -2461,6 +2461,18 @@ fn packed_bytes_per_variant(n_samples: usize) -> usize {
 }
 
 #[inline]
+/// Free GPU memory in bytes, or `None` if CUDA is unavailable. Guarded by the same
+/// driver + library preflight the projection gate uses, so it never triggers a
+/// `dlopen` abort on a CPU-only host.
+fn gpu_free_bytes() -> Option<usize> {
+    if !cuda_driver_likely_available() || projection_cuda_libraries_loadable().is_err() {
+        return None;
+    }
+    let ctx = CudaContext::new(0).ok()?;
+    let (free, _total) = ctx.mem_get_info().ok()?;
+    Some(free)
+}
+
 fn packed_projection_variant_block(
     components: usize,
     n_samples: usize,
@@ -2475,11 +2487,17 @@ fn packed_projection_variant_block(
         .saturating_mul(size_of::<f32>())
         .saturating_add(packed_bytes_per_variant(n_samples))
         .saturating_add(bytes_per_variant_host);
+    // Size the GPU staging block to the device's free memory so it never OOMs and
+    // still uses big blocks on big GPUs: an explicit GNOMON_PROJECT_CUDA_BLOCK_BYTES
+    // wins; otherwise take 60% of free VRAM (leaves headroom for loadings/scores
+    // buffers + driver/context overhead); otherwise a conservative 4 GiB fallback.
+    // ~9 GiB on a 16 GiB T4, ~24 GiB on a 40 GiB A100 — adaptive and safe.
     let staging_cap = std::env::var("GNOMON_PROJECT_CUDA_BLOCK_BYTES")
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|&value| value > 0)
-        .unwrap_or(10 * 1024 * 1024 * 1024usize);
+        .or_else(|| gpu_free_bytes().map(|free| free.saturating_mul(3) / 5))
+        .unwrap_or(4 * 1024 * 1024 * 1024usize);
     let mut block = (staging_cap / bytes_per_variant_gpu.max(1)).max(16);
     if n_samples < 50_000 {
         block = block.min(DEFAULT_BLOCK_WIDTH);
