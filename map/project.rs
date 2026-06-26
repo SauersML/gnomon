@@ -2479,7 +2479,7 @@ fn packed_projection_variant_block(
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|&value| value > 0)
-        .unwrap_or(6 * 1024 * 1024 * 1024usize);
+        .unwrap_or(10 * 1024 * 1024 * 1024usize);
     let mut block = (staging_cap / bytes_per_variant_gpu.max(1)).max(16);
     if n_samples < 50_000 {
         block = block.min(DEFAULT_BLOCK_WIDTH);
