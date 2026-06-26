@@ -1898,7 +1898,39 @@ fn projection_gpu_rejection_reason(total_work: usize) -> Option<String> {
     if !cuda_driver_likely_available() {
         return Some("no CUDA driver/device detected".to_string());
     }
+    if let Err(reason) = projection_cuda_libraries_loadable() {
+        return Some(reason);
+    }
     None
+}
+
+/// Non-panicking preflight that the CUDA runtime libraries the projection GEMM
+/// path needs (NVRTC for kernel compilation, cuBLAS for the matrix products) are
+/// actually loadable.
+///
+/// The driver device node (`/dev/nvidiactl`) can be present while the CUDA
+/// runtime libraries are absent from the loader path — e.g. a slim container
+/// where CUDA lives only inside a Python venv, or a GPU host that never had the
+/// CUDA toolkit installed. `cudarc` loads those libraries lazily via `dlopen` and
+/// aborts the process (SIGABRT, "Unable to dynamically load ...") on first use if
+/// they are missing, before any `Result` can be returned. `is_culib_present()`
+/// probes loadability without triggering that abort, so projection can fall back
+/// to the CPU backend with a clear reason instead of crashing. Mirrors the score
+/// backend's `preflight_cuda_dynamic_libraries`. See issue #2327.
+fn projection_cuda_libraries_loadable() -> Result<(), String> {
+    if !unsafe { cudarc::nvrtc::sys::is_culib_present() } {
+        return Err(format!(
+            "CUDA NVRTC library not loadable (searched: {})",
+            cudarc::get_lib_name_candidates("nvrtc").join(", ")
+        ));
+    }
+    if !unsafe { cudarc::cublas::sys::is_culib_present() } {
+        return Err(format!(
+            "CUDA cuBLAS library not loadable (searched: {})",
+            cudarc::get_lib_name_candidates("cublas").join(", ")
+        ));
+    }
+    Ok(())
 }
 
 fn project_cuda_min_work() -> usize {
