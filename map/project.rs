@@ -1139,6 +1139,9 @@ impl<'model> HwePcaProjector<'model> {
                 .saturating_mul(components);
             let mut cuda_rhs = match projection_gpu_rejection_reason(total_work) {
                 Some(reason) => {
+                    if project_cuda_required() {
+                        return Err(cuda_required_error(&reason));
+                    }
                     eprintln!("> Projection backend: CPU ({reason})");
                     None
                 }
@@ -1150,6 +1153,9 @@ impl<'model> HwePcaProjector<'model> {
                         Some(runtime)
                     }
                     Err(reason) => {
+                        if project_cuda_required() {
+                            return Err(cuda_required_error(&reason));
+                        }
                         eprintln!("> Projection backend: CPU (CUDA init failed: {reason})");
                         None
                     }
@@ -1885,6 +1891,24 @@ fn project_cuda_disabled() -> bool {
         .unwrap_or(false)
 }
 
+/// When `GNOMON_PROJECT_REQUIRE_CUDA` is set, a CPU fallback for the projection is
+/// a hard error instead of a silent (and potentially hours-long) CPU grind. Lets a
+/// caller that *expects* the GPU (e.g. a large biobank projection on a GPU node)
+/// fail fast with the reason rather than discovering CPU mode after the fact.
+fn project_cuda_required() -> bool {
+    std::env::var("GNOMON_PROJECT_REQUIRE_CUDA")
+        .ok()
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+/// Build the error returned when CUDA is required but unavailable.
+fn cuda_required_error(reason: &str) -> HwePcaError {
+    HwePcaError::Source(
+        format!("GNOMON_PROJECT_REQUIRE_CUDA is set but GPU projection is unavailable: {reason}").into(),
+    )
+}
+
 fn projection_gpu_rejection_reason(total_work: usize) -> Option<String> {
     let min_work = project_cuda_min_work();
     if total_work < min_work {
@@ -2024,6 +2048,9 @@ where
         .saturating_mul(components);
     let mut packed_cuda = match projection_gpu_rejection_reason(total_work) {
         Some(reason) => {
+            if project_cuda_required() {
+                return Err(cuda_required_error(&reason));
+            }
             eprintln!("> Projection backend: CPU ({reason})");
             None
         }
@@ -2035,6 +2062,9 @@ where
                 Some(runtime)
             }
             Err(reason) => {
+                if project_cuda_required() {
+                    return Err(cuda_required_error(&reason));
+                }
                 eprintln!("> Projection backend: CPU (CUDA init failed: {reason})");
                 None
             }
