@@ -236,8 +236,7 @@ extern "C" __global__ void unpack_weighted_plink(
     int num_people,
     int batch_variants,
     int bytes_per_variant,
-    float* out_matrix,
-    unsigned int* missing_flags
+    float* out_matrix
 ) {
     unsigned long long idx =
         (unsigned long long)blockIdx.x * (unsigned long long)blockDim.x +
@@ -257,61 +256,15 @@ extern "C" __global__ void unpack_weighted_plink(
     unsigned char gt = (b >> bit_shift) & 0x3u;
 
     float value = 0.0f;
-    unsigned char miss = 0u;
     if (gt == 0u) {
         value = coeffs[(size_t)variant * 3u + 0u];
     } else if (gt == 2u) {
         value = coeffs[(size_t)variant * 3u + 1u];
     } else if (gt == 3u) {
         value = coeffs[(size_t)variant * 3u + 2u];
-    } else if (gt == 1u) {
-        miss = 1u;
     }
 
     out_matrix[idx] = value;
-    if (miss != 0u) {
-        unsigned long long word = idx >> 5;
-        unsigned int bit = 1u << (idx & 31ull);
-        atomicOr(&missing_flags[word], bit);
-    }
-}
-
-extern "C" __global__ void clear_u32(
-    unsigned int* data,
-    unsigned long long n_words
-) {
-    unsigned long long idx =
-        (unsigned long long)blockIdx.x * (unsigned long long)blockDim.x +
-        (unsigned long long)threadIdx.x;
-    if (idx >= n_words) return;
-    data[idx] = 0u;
-}
-
-extern "C" __global__ void accumulate_missing_info(
-    const unsigned int* missing_flags,
-    const float* contrib,
-    int num_people,
-    int batch_variants,
-    int packed_info_size,
-    float* missing_info
-) {
-    unsigned long long idx =
-        (unsigned long long)blockIdx.x * (unsigned long long)blockDim.x +
-        (unsigned long long)threadIdx.x;
-    unsigned long long total =
-        (unsigned long long)num_people * (unsigned long long)batch_variants;
-    if (idx >= total) return;
-    unsigned long long word = idx >> 5;
-    unsigned int bit = 1u << (idx & 31ull);
-    if ((missing_flags[word] & bit) == 0u) return;
-
-    unsigned long long variant = idx / (unsigned long long)num_people;
-    unsigned long long person = idx % (unsigned long long)num_people;
-    size_t src_off = (size_t)variant * (size_t)packed_info_size;
-    size_t dst_off = (size_t)person * (size_t)packed_info_size;
-    for (int t = 0; t < packed_info_size; ++t) {
-        atomicAdd(&missing_info[dst_off + (size_t)t], contrib[src_off + (size_t)t]);
-    }
 }
 "#;
 
@@ -333,26 +286,17 @@ struct ProjectionCudaPacked {
     stream: std::sync::Arc<CudaStream>,
     blas: CudaBlas,
     unpack_kernel: CudaFunction,
-    clear_u32_kernel: CudaFunction,
-    missing_accum_kernel: CudaFunction,
     d_packed: Option<CudaSlice<u8>>,
     d_coeffs: Option<CudaSlice<f32>>,
     d_a: Option<CudaSlice<f32>>,
     d_b: Option<CudaSlice<f32>>,
     d_scores_accum: Option<CudaSlice<f32>>,
-    d_missing_flags: Option<CudaSlice<u32>>,
-    d_contrib: Option<CudaSlice<f32>>,
-    d_missing_info: Option<CudaSlice<f32>>,
     packed_cap: usize,
     coeffs_cap: usize,
     a_cap: usize,
     b_cap: usize,
     scores_cap: usize,
-    missing_flags_words_cap: usize,
-    contrib_cap: usize,
-    missing_info_cap: usize,
     h_scores: Vec<f32>,
-    h_missing_info: Vec<f32>,
 }
 
 impl ProjectionCudaPacked {
@@ -373,36 +317,22 @@ impl ProjectionCudaPacked {
         let unpack_kernel = module
             .load_function("unpack_weighted_plink")
             .map_err(|e| format!("Failed to load unpack_weighted_plink kernel: {e:?}"))?;
-        let missing_accum_kernel = module
-            .load_function("accumulate_missing_info")
-            .map_err(|e| format!("Failed to load accumulate_missing_info kernel: {e:?}"))?;
         Ok(Self {
             _ctx: ctx,
             stream,
             blas,
             unpack_kernel,
-            clear_u32_kernel: module
-                .load_function("clear_u32")
-                .map_err(|e| format!("Failed to load clear_u32 kernel: {e:?}"))?,
-            missing_accum_kernel,
             d_packed: None,
             d_coeffs: None,
             d_a: None,
             d_b: None,
             d_scores_accum: None,
-            d_missing_flags: None,
-            d_contrib: None,
-            d_missing_info: None,
             packed_cap: 0,
             coeffs_cap: 0,
             a_cap: 0,
             b_cap: 0,
             scores_cap: 0,
-            missing_flags_words_cap: 0,
-            contrib_cap: 0,
-            missing_info_cap: 0,
             h_scores: Vec::new(),
-            h_missing_info: Vec::new(),
         })
     }
 
@@ -454,63 +384,9 @@ impl ProjectionCudaPacked {
             );
             self.scores_cap = scores_len;
         }
-        let missing_words = missing_flag_words(a_len);
-        if self.missing_flags_words_cap < missing_words {
-            self.d_missing_flags = Some(
-                self.stream
-                    .alloc_zeros::<u32>(missing_words)
-                    .map_err(|e| format!("Failed to allocate missing-flag CUDA buffer: {e:?}"))?,
-            );
-            self.missing_flags_words_cap = missing_words;
-        }
         if self.h_scores.len() < scores_len {
             self.h_scores.resize(scores_len, 0.0);
         }
-        Ok(())
-    }
-
-    fn ensure_missing_capacity(
-        &mut self,
-        contrib_len: usize,
-        missing_info_len: usize,
-    ) -> Result<(), String> {
-        if self.contrib_cap < contrib_len {
-            self.d_contrib = Some(
-                self.stream
-                    .alloc_zeros::<f32>(contrib_len)
-                    .map_err(|e| format!("Failed to allocate contrib CUDA buffer: {e:?}"))?,
-            );
-            self.contrib_cap = contrib_len;
-        }
-        if self.missing_info_cap < missing_info_len {
-            self.d_missing_info = Some(
-                self.stream
-                    .alloc_zeros::<f32>(missing_info_len)
-                    .map_err(|e| format!("Failed to allocate missing-info CUDA buffer: {e:?}"))?,
-            );
-            self.missing_info_cap = missing_info_len;
-        }
-        if self.h_missing_info.len() < missing_info_len {
-            self.h_missing_info.resize(missing_info_len, 0.0);
-        }
-        Ok(())
-    }
-
-    fn init_missing_info(
-        &mut self,
-        n_samples: usize,
-        packed_info_size: usize,
-    ) -> Result<(), String> {
-        let missing_info_len = n_samples
-            .checked_mul(packed_info_size)
-            .ok_or_else(|| "projection CUDA overflow for missing_info".to_string())?;
-        self.ensure_missing_capacity(1, missing_info_len)?;
-        self.d_missing_info = Some(
-            self.stream
-                .alloc_zeros::<f32>(missing_info_len)
-                .map_err(|e| format!("Failed to zero-init missing-info CUDA buffer: {e:?}"))?,
-        );
-        self.missing_info_cap = missing_info_len;
         Ok(())
     }
 
@@ -562,18 +438,12 @@ impl ProjectionCudaPacked {
             .d_scores_accum
             .as_mut()
             .expect("score-accum CUDA buffer must be allocated");
-        let d_missing_flags = self
-            .d_missing_flags
-            .as_mut()
-            .expect("missing-flag CUDA buffer must be allocated");
 
         let mut d_packed_view = d_packed.slice_mut(0..packed.len());
         let mut d_coeffs_view = d_coeffs.slice_mut(0..coeffs.len());
         let mut d_b_view = d_b.slice_mut(0..b_len);
         let mut d_a_view = d_a.slice_mut(0..a_len);
         let mut d_scores_view = d_scores_accum.slice_mut(0..score_len);
-        let missing_words = missing_flag_words(a_len);
-        let mut d_missing_flags_view = d_missing_flags.slice_mut(0..missing_words);
 
         self.stream
             .memcpy_htod(packed, &mut d_packed_view)
@@ -584,19 +454,6 @@ impl ProjectionCudaPacked {
         self.stream
             .memcpy_htod(loadings_col_major, &mut d_b_view)
             .map_err(|e| format!("Failed to copy loadings to GPU: {e:?}"))?;
-
-        let missing_words_u32 = u32::try_from(missing_words)
-            .map_err(|_| format!("missing flag words too large: {missing_words}"))?;
-        let missing_words_u64 = u64::try_from(missing_words)
-            .map_err(|_| format!("missing flag words exceed u64: {missing_words}"))?;
-        unsafe {
-            self.stream
-                .launch_builder(&self.clear_u32_kernel)
-                .arg(&mut d_missing_flags_view)
-                .arg(&missing_words_u64)
-                .launch(LaunchConfig::for_num_elems(missing_words_u32))
-                .map_err(|e| format!("Failed to launch clear_u32 for missing flags: {e:?}"))?;
-        }
 
         let n_samples_i32 =
             i32::try_from(n_samples).map_err(|_| format!("n_samples too large: {n_samples}"))?;
@@ -615,7 +472,6 @@ impl ProjectionCudaPacked {
                 .arg(&filled_i32)
                 .arg(&bytes_per_variant_i32)
                 .arg(&mut d_a_view)
-                .arg(&mut d_missing_flags_view)
                 .launch(LaunchConfig::for_num_elems(unpack_elems_u32))
                 .map_err(|e| format!("Failed to launch unpack_weighted_plink: {e:?}"))?;
         }
@@ -641,97 +497,6 @@ impl ProjectionCudaPacked {
             self.blas
                 .gemm(cfg, &a_view, &b_view, &mut d_scores_view)
                 .map_err(|e| format!("projection cuBLAS GEMM failed: {e:?}"))?;
-        }
-        Ok(())
-    }
-
-    fn accumulate_missing_block(
-        &mut self,
-        block_contrib: &[f32],
-        n_samples: usize,
-        filled: usize,
-        packed_info_size: usize,
-    ) -> Result<(), String> {
-        let contrib_len = filled
-            .checked_mul(packed_info_size)
-            .ok_or_else(|| "projection CUDA overflow for contrib".to_string())?;
-        let missing_info_len = n_samples
-            .checked_mul(packed_info_size)
-            .ok_or_else(|| "projection CUDA overflow for missing_info".to_string())?;
-        self.ensure_missing_capacity(contrib_len, missing_info_len)?;
-        let d_contrib = self
-            .d_contrib
-            .as_mut()
-            .expect("contrib CUDA buffer must be allocated");
-        let d_missing_info = self
-            .d_missing_info
-            .as_mut()
-            .expect("missing-info CUDA buffer must be allocated");
-        let d_missing_flags = self
-            .d_missing_flags
-            .as_ref()
-            .expect("missing-flag CUDA buffer must be allocated");
-
-        let mut d_contrib_view = d_contrib.slice_mut(0..contrib_len);
-        self.stream
-            .memcpy_htod(block_contrib, &mut d_contrib_view)
-            .map_err(|e| format!("Failed to copy missing contrib to GPU: {e:?}"))?;
-
-        let n_samples_i32 =
-            i32::try_from(n_samples).map_err(|_| format!("n_samples too large: {n_samples}"))?;
-        let filled_i32 =
-            i32::try_from(filled).map_err(|_| format!("filled too large: {filled}"))?;
-        let packed_info_i32 = i32::try_from(packed_info_size)
-            .map_err(|_| format!("packed_info_size too large: {packed_info_size}"))?;
-        let elems = n_samples
-            .checked_mul(filled)
-            .ok_or_else(|| "projection CUDA overflow for missing launch".to_string())?;
-        let missing_words = missing_flag_words(elems);
-        let elems_u32 =
-            u32::try_from(elems).map_err(|_| format!("missing launch too large: {elems}"))?;
-
-        unsafe {
-            self.stream
-                .launch_builder(&self.missing_accum_kernel)
-                .arg(&d_missing_flags.slice(0..missing_words))
-                .arg(&d_contrib.slice(0..contrib_len))
-                .arg(&n_samples_i32)
-                .arg(&filled_i32)
-                .arg(&packed_info_i32)
-                .arg(&mut d_missing_info.slice_mut(0..missing_info_len))
-                .launch(LaunchConfig::for_num_elems(elems_u32))
-                .map_err(|e| format!("Failed to launch accumulate_missing_info: {e:?}"))?;
-        }
-        Ok(())
-    }
-
-    fn copy_missing_info_to_host(
-        &mut self,
-        n_samples: usize,
-        packed_info_size: usize,
-        out_f64: &mut [f64],
-    ) -> Result<(), String> {
-        let len = n_samples
-            .checked_mul(packed_info_size)
-            .ok_or_else(|| "projection CUDA overflow for missing-info dtoh".to_string())?;
-        let d_missing_info = self
-            .d_missing_info
-            .as_ref()
-            .ok_or_else(|| "missing-info CUDA buffer is not initialized".to_string())?;
-        if out_f64.len() < len {
-            return Err("missing_info_storage too small for dtoh".to_string());
-        }
-        if self.h_missing_info.len() < len {
-            self.h_missing_info.resize(len, 0.0);
-        }
-        self.stream
-            .memcpy_dtoh(
-                &d_missing_info.slice(0..len),
-                &mut self.h_missing_info[..len],
-            )
-            .map_err(|e| format!("Failed to copy missing-info from GPU: {e:?}"))?;
-        for i in 0..len {
-            out_f64[i] = self.h_missing_info[i] as f64;
         }
         Ok(())
     }
@@ -2043,6 +1808,9 @@ where
     let weights_slice = ld_weights.unwrap_or(&[]);
     let block_variants = packed_projection_variant_block(components, n_samples, expected_variants);
     let sample_chunk = packed_projection_sample_chunk(n_samples);
+    eprintln!(
+        "> Projection packed batch: {block_variants} variants/block; {sample_chunk} samples/chunk"
+    );
     let total_work = n_samples
         .saturating_mul(expected_variants)
         .saturating_mul(components);
@@ -2057,7 +1825,7 @@ where
         None => match ProjectionCudaPacked::new() {
             Ok(runtime) => {
                 eprintln!(
-                    "> Projection backend: GPU (CUDA fused decode + SGEMM + GPU missing-info accumulation; CPU solves remain active)"
+                    "> Projection backend: GPU (CUDA fused decode + SGEMM; packed-byte missing-info scan and CPU solves remain active)"
                 );
                 Some(runtime)
             }
@@ -2076,31 +1844,14 @@ where
         .map(|_| vec![0.0f64; n_samples * packed_info_size]);
     let mut gpu_loadings_col_major = vec![0.0f32; block_variants * components];
     let mut gpu_coeffs = vec![0.0f32; block_variants * 3];
-    let mut gpu_block_contrib = vec![0.0f32; block_variants * packed_info_size];
-    let mut gpu_missing_active = packed_cuda.is_some();
     let mut gpu_scores_active = packed_cuda.is_some();
     let mut gpu_scores_flushed = false;
     let mut logged_cuda_fallback = false;
-    if let Some(runtime) = packed_cuda.as_mut()
-        && runtime
-            .init_missing_info(n_samples, packed_info_size)
-            .is_err()
-    {
-        eprintln!(
-            "> Projection backend switch: CPU (failed to initialize GPU missing-info buffer)"
-        );
-        packed_cuda = None;
-        gpu_missing_active = false;
-        gpu_scores_active = false;
-        logged_cuda_fallback = true;
-        dense_missing_info_storage = None;
-    }
     if let Some(runtime) = packed_cuda.as_mut()
         && runtime.init_scores_accum(n_samples, components).is_err()
     {
         eprintln!("> Projection backend switch: CPU (failed to initialize GPU score accumulator)");
         packed_cuda = None;
-        gpu_missing_active = false;
         gpu_scores_active = false;
         logged_cuda_fallback = true;
         dense_missing_info_storage = None;
@@ -2240,12 +1991,6 @@ where
             for idx in 0..coeff_len {
                 gpu_coeffs[idx] = block_coeffs[idx] as f32;
             }
-            if gpu_block_contrib.len() < contrib_len {
-                gpu_block_contrib.resize(contrib_len, 0.0);
-            }
-            for idx in 0..contrib_len {
-                gpu_block_contrib[idx] = block_info_contrib[idx] as f32;
-            }
 
             match runtime.compute_scores_block(
                 block_bytes,
@@ -2256,45 +2001,16 @@ where
                 components,
             ) {
                 Ok(()) => {
-                    if gpu_missing_active {
-                        match runtime.accumulate_missing_block(
-                            &gpu_block_contrib[..contrib_len],
-                            n_samples,
-                            filled,
+                    if let Some(missing_info_storage) = dense_missing_info_storage.as_mut() {
+                        accumulate_packed_missing_info_only(
+                            &block_variant_bytes,
+                            &block_info_contrib[..contrib_len],
+                            sample_chunk,
                             packed_info_size,
-                        ) {
-                            Ok(()) => {
-                                used_gpu = true;
-                            }
-                            Err(_) => {
-                                if gpu_scores_active && !gpu_scores_flushed {
-                                    let _ = runtime.copy_scores_to_host(
-                                        n_samples,
-                                        components,
-                                        &mut scores_row_major,
-                                    );
-                                    gpu_scores_flushed = true;
-                                }
-                                let _ = runtime.copy_missing_info_to_host(
-                                    n_samples,
-                                    packed_info_size,
-                                    dense_missing_info_storage.as_mut().expect(
-                                        "dense missing-info storage must exist when GPU is active",
-                                    ),
-                                );
-                                if !logged_cuda_fallback {
-                                    eprintln!(
-                                        "> Projection backend switch: CPU (GPU missing-info accumulation failed during execution)"
-                                    );
-                                    logged_cuda_fallback = true;
-                                }
-                                gpu_missing_active = false;
-                                packed_cuda = None;
-                            }
-                        }
-                    } else {
-                        used_gpu = true;
+                            missing_info_storage,
+                        );
                     }
+                    used_gpu = true;
                 }
                 Err(_) => {
                     if gpu_scores_active && !gpu_scores_flushed {
@@ -2304,16 +2020,6 @@ where
                             &mut scores_row_major,
                         );
                         gpu_scores_flushed = true;
-                    }
-                    if gpu_missing_active {
-                        let _ = runtime.copy_missing_info_to_host(
-                            n_samples,
-                            packed_info_size,
-                            dense_missing_info_storage
-                                .as_mut()
-                                .expect("dense missing-info storage must exist when GPU is active"),
-                        );
-                        gpu_missing_active = false;
                     }
                     if !logged_cuda_fallback {
                         eprintln!(
@@ -2358,21 +2064,6 @@ where
         progress.on_stage_advance(ProjectionProgressStage::Projection, processed);
     }
 
-    if gpu_missing_active
-        && let Some(runtime) = packed_cuda.as_mut()
-        && runtime
-            .copy_missing_info_to_host(
-                n_samples,
-                packed_info_size,
-                dense_missing_info_storage
-                    .as_mut()
-                    .expect("dense missing-info storage must exist when GPU is active"),
-            )
-            .is_err()
-    {
-        // Fall back to whatever CPU accumulation already has (currently none for
-        // successful GPU runs). In this failure case we leave the existing values.
-    }
     if gpu_scores_active
         && !gpu_scores_flushed
         && let Some(runtime) = packed_cuda.as_mut()
@@ -2482,6 +2173,54 @@ fn accumulate_packed_cpu_block_row_major_dense_missing(
         });
 }
 
+fn accumulate_packed_missing_info_only(
+    block_variant_bytes: &[&[u8]],
+    block_info_contrib: &[f64],
+    sample_chunk: usize,
+    packed_info_size: usize,
+    missing_info_storage: &mut [f64],
+) {
+    let samples = missing_info_storage.len() / packed_info_size;
+    let chunk_missing = sample_chunk * packed_info_size;
+    let missing_masks = plink_missing_lane_masks();
+    missing_info_storage
+        .par_chunks_mut(chunk_missing)
+        .enumerate()
+        .for_each(|(chunk_idx, missing_chunk)| {
+            let sample_start = chunk_idx * sample_chunk;
+            let chunk_samples = missing_chunk.len() / packed_info_size;
+            let byte_start = sample_start >> 2;
+            let byte_len = packed_bytes_per_variant(chunk_samples);
+
+            for (variant, variant_bytes) in block_variant_bytes.iter().enumerate() {
+                debug_assert_eq!(variant_bytes.len(), packed_bytes_per_variant(samples));
+                let bytes = &variant_bytes[byte_start..byte_start + byte_len];
+                let contrib = &block_info_contrib
+                    [variant * packed_info_size..(variant + 1) * packed_info_size];
+
+                for (byte_idx, &byte) in bytes.iter().enumerate() {
+                    let sample_base = byte_idx << 2;
+                    let lanes = (chunk_samples - sample_base).min(4);
+                    let mut missing_mask = missing_masks[byte as usize];
+                    if lanes < 4 {
+                        missing_mask &= (1u8 << lanes) - 1;
+                    }
+                    while missing_mask != 0 {
+                        let lane = missing_mask.trailing_zeros() as usize;
+                        missing_mask &= missing_mask - 1;
+                        let sample = sample_base + lane;
+                        let missing_offset = sample * packed_info_size;
+                        let dst =
+                            &mut missing_chunk[missing_offset..missing_offset + packed_info_size];
+                        for idx in 0..packed_info_size {
+                            dst[idx] += contrib[idx];
+                        }
+                    }
+                }
+            }
+        });
+}
+
 fn accumulate_packed_cpu_block_row_major_sparse_missing(
     block_variant_bytes: &[&[u8]],
     block_score_vectors: &[f64],
@@ -2549,6 +2288,23 @@ fn accumulate_packed_cpu_block_row_major_sparse_missing(
                 }
             }
         });
+}
+
+fn plink_missing_lane_masks() -> &'static [u8; 256] {
+    static MASKS: OnceLock<[u8; 256]> = OnceLock::new();
+    MASKS.get_or_init(|| {
+        let mut masks = [0u8; 256];
+        for (byte, mask) in masks.iter_mut().enumerate() {
+            let mut value = 0u8;
+            for lane in 0..4 {
+                if ((byte as u8) >> (lane << 1)) & 0b11 == 1 {
+                    value |= 1 << lane;
+                }
+            }
+            *mask = value;
+        }
+        masks
+    })
 }
 
 fn build_dense_lower_info_matrix(
@@ -2705,10 +2461,6 @@ fn packed_bytes_per_variant(n_samples: usize) -> usize {
 }
 
 #[inline]
-fn missing_flag_words(total_entries: usize) -> usize {
-    (total_entries + 31) >> 5
-}
-
 fn packed_projection_variant_block(
     components: usize,
     n_samples: usize,
@@ -2718,16 +2470,20 @@ fn packed_projection_variant_block(
         return 1;
     }
     let packed_info_size = packed_tri_size(components);
-    let bytes_per_variant_meta = (components + packed_info_size + 3) * size_of::<f64>();
-    let target = if n_samples >= 200_000 {
-        256 * 1024
-    } else if n_samples >= 50_000 {
-        384 * 1024
-    } else {
-        512 * 1024
-    };
-    let mut block = (target / bytes_per_variant_meta.max(1)).max(16);
-    block = block.min(DEFAULT_BLOCK_WIDTH);
+    let bytes_per_variant_host = (components + packed_info_size + 3) * size_of::<f64>();
+    let bytes_per_variant_gpu = n_samples
+        .saturating_mul(size_of::<f32>())
+        .saturating_add(packed_bytes_per_variant(n_samples))
+        .saturating_add(bytes_per_variant_host);
+    let staging_cap = std::env::var("GNOMON_PROJECT_CUDA_BLOCK_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(6 * 1024 * 1024 * 1024usize);
+    let mut block = (staging_cap / bytes_per_variant_gpu.max(1)).max(16);
+    if n_samples < 50_000 {
+        block = block.min(DEFAULT_BLOCK_WIDTH);
+    }
     block.min(expected_variants)
 }
 
