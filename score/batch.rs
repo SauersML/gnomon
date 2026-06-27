@@ -472,23 +472,36 @@ fn pivot_tile(
                 let variant_byte_offset = variant_idx_in_batch as u64 * bytes_per_variant;
                 let source_byte_indices = U64xN::splat(variant_byte_offset) + person_byte_indices;
 
-                let packed_vals =
-                    U8xN::gather_or_default(variant_major_data, source_byte_indices.cast());
+                // Scalar loads instead of `U8xN::gather_or_default`: AVX2 has no
+                // u8 gather, so that intrinsic lowered to a per-lane bounds-mask
+                // plus a branch-per-lane scalarized gather (8 unpredictable
+                // branches + reassembly shuffles, ~30 insns). `get().unwrap_or(0)`
+                // keeps the exact OOB->0 semantics but compiles to 8 straight-line
+                // `movzbl` loads with perfectly-predicted in-bounds checks.
+                let src = source_byte_indices.to_array();
+                let mut packed = [0u8; SIMD_LANES];
+                for lane in 0..SIMD_LANES {
+                    packed[lane] = variant_major_data
+                        .get(src[lane] as usize)
+                        .copied()
+                        .unwrap_or(0);
+                }
+                let packed_vals = U8xN::from_array(packed);
                 let two_bit_genotypes = (packed_vals >> bit_shifts.cast()) & U8xN::splat(0b11);
 
                 let one = U8xN::splat(1);
+                let low_bit = two_bit_genotypes & one;
                 let term1 = (two_bit_genotypes >> U8xN::splat(1)) & one;
-                let term2 = (two_bit_genotypes & one) + one;
+                let term2 = low_bit + one;
                 let initial_dosages = term1 * term2;
 
-                let mut dosage_arr = initial_dosages.to_array();
-                let mut missing_mask = two_bit_genotypes.simd_eq(U8xN::splat(1)).to_bitmask();
-                while missing_mask != 0 {
-                    let lane = missing_mask.trailing_zeros() as usize;
-                    missing_mask &= missing_mask - 1;
-                    dosage_arr[lane] = 3;
-                }
-                dosage_vectors[i] = U8xN::from_array(dosage_arr);
+                // Branchless missing marker (genotype 0b01 -> dosage sentinel 3),
+                // replacing the data-dependent per-lane `while missing_mask` scan.
+                // `is_missing` is 1 exactly when genotype == 0b01 (high bit 0, low
+                // bit 1) and 0 otherwise; `initial_dosages` is already 0 there, so
+                // `+ is_missing*3` reproduces the old `dosage_arr[lane] = 3` exactly.
+                let is_missing = (one - term1) * low_bit;
+                dosage_vectors[i] = initial_dosages + is_missing * U8xN::splat(3);
             }
 
             // --- 2. Transpose the 8x8 block ---

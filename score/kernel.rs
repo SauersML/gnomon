@@ -17,6 +17,31 @@ pub type SimdVec = f32x8;
 pub const LANE_COUNT: usize = SimdVec::LEN;
 pub const MAX_KERNEL_ACCUMULATOR_LANES: usize = 8;
 
+/// Computes `acc + 2*w` for the dosage-2 (homozygous-alt) accumulation step.
+///
+/// `2*w` is exact in IEEE-754 (it only bumps the exponent), so for all finite,
+/// non-overflowing values `fma(w, 2, acc)` rounds identically to `acc + (w + w)`
+/// — the results are bit-for-bit equal. On targets with FMA this collapses the
+/// doubling and the accumulate into a single `vfmadd231ps` with a folded memory
+/// operand, halving the FP-add port pressure of the hot dosage-2 loop.
+///
+/// The `cfg` gate is mandatory: `mul_add` without the `fma` target feature
+/// lowers to a per-lane `fmaf` libm call (catastrophic in the hot loop), and
+/// the baseline PyPI wheel is built without `target-cpu`/`+fma`. The fallback
+/// path is exactly the original `acc + (w + w)`.
+#[inline(always)]
+fn accumulate_dosage_two(acc: SimdVec, w: SimdVec) -> SimdVec {
+    #[cfg(target_feature = "fma")]
+    {
+        use std::simd::StdFloat;
+        w.mul_add(SimdVec::splat(2.0), acc)
+    }
+    #[cfg(not(target_feature = "fma"))]
+    {
+        acc + (w + w)
+    }
+}
+
 // ========================================================================================
 //                            Public API & type definitions
 // ========================================================================================
@@ -140,8 +165,8 @@ pub fn accumulate_adjustments_for_person(
                     score_start,
                     i,
                 );
-                let adj = weights_vec + weights_vec;
-                *accumulator_buffer.get_unchecked_mut(i) += adj;
+                let acc = accumulator_buffer.get_unchecked_mut(i);
+                *acc = accumulate_dosage_two(*acc, weights_vec);
             }
         }
     }
@@ -202,8 +227,8 @@ pub fn accumulate_adjustments_for_person_lanes(
                     score_start,
                     i,
                 );
-                let adj = weights_vec + weights_vec;
-                *accumulator_buffer.get_unchecked_mut(i) += adj;
+                let acc = accumulator_buffer.get_unchecked_mut(i);
+                *acc = accumulate_dosage_two(*acc, weights_vec);
             }
         }
     }

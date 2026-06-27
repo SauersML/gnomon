@@ -1067,8 +1067,14 @@ pub fn resolve_complex_variants(
                             .original_person_index_for_output(output_person_idx)
                             .0;
 
+                        // Reused across all rules for this person: the old
+                        // `Vec::new()` inside the rule loop heap-allocated
+                        // num_people * num_rules times for a Vec that usually
+                        // holds a single interpretation. Hoisting + clear() drops
+                        // that to one allocation per person (per thread).
+                        let mut valid_interpretations = Vec::new();
                         for group_rule in &prep_result.complex_rules {
-                            let mut valid_interpretations = Vec::new();
+                            valid_interpretations.clear();
                             for context in &group_rule.possible_contexts {
                                 let packed_geno = match resolver.get_packed_genotype(
                                     prep_result.bytes_per_variant,

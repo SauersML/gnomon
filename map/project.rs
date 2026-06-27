@@ -238,33 +238,46 @@ extern "C" __global__ void unpack_weighted_plink(
     int bytes_per_variant,
     float* out_matrix
 ) {
-    unsigned long long idx =
+    // 2D grid: blockIdx.x indexes people (the fast / coalesced dimension),
+    // blockIdx.y indexes variants. The variant axis is grid-strided so a launch
+    // never needs gridDim.y to exceed the 65535 hardware cap.
+    //
+    // This replaces the flat-1D mapping (idx = person*... ; variant = idx /
+    // num_people), which forced a per-thread integer divide. GPUs have no
+    // hardware integer division, so NVRTC lowered `idx / num_people` to a
+    // ~20+ instruction software divide (verified in PTX). Indexing the two
+    // axes directly removes the divide entirely.
+    unsigned long long person =
         (unsigned long long)blockIdx.x * (unsigned long long)blockDim.x +
         (unsigned long long)threadIdx.x;
-    unsigned long long total =
-        (unsigned long long)num_people * (unsigned long long)batch_variants;
-    if (idx >= total) return;
+    if (person >= (unsigned long long)num_people) return;
 
-    unsigned long long variant = idx / (unsigned long long)num_people;
-    unsigned long long person = idx % (unsigned long long)num_people;
-
-    unsigned long long byte_idx = (unsigned long long)person >> 2;
+    // The person's genotype byte offset and bit shift are invariant across all
+    // variants, so decode them once and amortize over the grid-stride loop
+    // (the old one-element-per-thread mapping recomputed them every element).
+    unsigned long long byte_idx = person >> 2;
     int bit_shift = (int)((person & 3ull) << 1);
-    unsigned long long packed_offset =
-        variant * (unsigned long long)bytes_per_variant + byte_idx;
-    unsigned char b = packed[packed_offset];
-    unsigned char gt = (b >> bit_shift) & 0x3u;
 
-    float value = 0.0f;
-    if (gt == 0u) {
-        value = coeffs[(size_t)variant * 3u + 0u];
-    } else if (gt == 2u) {
-        value = coeffs[(size_t)variant * 3u + 1u];
-    } else if (gt == 3u) {
-        value = coeffs[(size_t)variant * 3u + 2u];
+    for (unsigned long long variant = blockIdx.y;
+         variant < (unsigned long long)batch_variants;
+         variant += (unsigned long long)gridDim.y) {
+        unsigned long long packed_offset =
+            variant * (unsigned long long)bytes_per_variant + byte_idx;
+        unsigned char b = packed[packed_offset];
+        unsigned char gt = (b >> bit_shift) & 0x3u;
+
+        float value = 0.0f;
+        if (gt == 0u) {
+            value = coeffs[(size_t)variant * 3u + 0u];
+        } else if (gt == 2u) {
+            value = coeffs[(size_t)variant * 3u + 1u];
+        } else if (gt == 3u) {
+            value = coeffs[(size_t)variant * 3u + 2u];
+        }
+
+        // Output layout is unchanged: column-major (variant-major) over people.
+        out_matrix[variant * (unsigned long long)num_people + person] = value;
     }
-
-    out_matrix[idx] = value;
 }
 "#;
 
@@ -461,8 +474,24 @@ impl ProjectionCudaPacked {
             i32::try_from(filled).map_err(|_| format!("filled too large: {filled}"))?;
         let bytes_per_variant_i32 = i32::try_from(packed_bytes_per_variant(n_samples))
             .map_err(|_| format!("bytes_per_variant too large for n_samples={n_samples}"))?;
-        let unpack_elems_u32 =
-            u32::try_from(a_len).map_err(|_| format!("unpack element count too large: {a_len}"))?;
+        // 2D launch matching the grid-strided `unpack_weighted_plink`: x covers
+        // people (256-wide, coalesced), y covers variants and is capped at the
+        // 65535 gridDim.y limit (the kernel's grid-stride loop handles any
+        // overflow).
+        let unpack_cfg = {
+            const UNPACK_BLOCK: u32 = 256;
+            let people_u32 =
+                u32::try_from(n_samples).map_err(|_| format!("n_samples too large: {n_samples}"))?;
+            let variants_u32 =
+                u32::try_from(filled).map_err(|_| format!("filled too large: {filled}"))?;
+            let grid_x = people_u32.div_ceil(UNPACK_BLOCK).max(1);
+            let grid_y = variants_u32.min(65_535).max(1);
+            LaunchConfig {
+                grid_dim: (grid_x, grid_y, 1),
+                block_dim: (UNPACK_BLOCK, 1, 1),
+                shared_mem_bytes: 0,
+            }
+        };
         unsafe {
             self.stream
                 .launch_builder(&self.unpack_kernel)
@@ -472,7 +501,7 @@ impl ProjectionCudaPacked {
                 .arg(&filled_i32)
                 .arg(&bytes_per_variant_i32)
                 .arg(&mut d_a_view)
-                .launch(LaunchConfig::for_num_elems(unpack_elems_u32))
+                .launch(unpack_cfg)
                 .map_err(|e| format!("Failed to launch unpack_weighted_plink: {e:?}"))?;
         }
 

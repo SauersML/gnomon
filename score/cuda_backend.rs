@@ -9,10 +9,11 @@ use crate::score::types::{
 use ahash::AHashMap;
 use crossbeam_channel::{Receiver, Sender, bounded};
 use crossbeam_queue::ArrayQueue;
-use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
+use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, result as cublas_result, sys as cublas_sys};
 use cudarc::driver::{
     CudaContext, CudaEvent, CudaFunction, CudaSlice, CudaStream, CudaView, CudaViewMut,
-    DriverError, LaunchConfig, PinnedHostSlice, PushKernelArg, sys as cuda_sys,
+    DevicePtr, DevicePtrMut, DriverError, LaunchConfig, PinnedHostSlice, PushKernelArg,
+    sys as cuda_sys,
 };
 use cudarc::nvrtc::{Ptx, compile_ptx, result as nvrtc_result, sys as nvrtc_sys};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
@@ -73,33 +74,52 @@ extern "C" __global__ void unpack_plink(
     float* dosage,
     float* missing
 ) {
-    unsigned long long idx = linear_thread_id();
-    unsigned long long total =
-        (unsigned long long)num_people * (unsigned long long)batch_variants;
-    if (idx >= total) return;
+    // 2D grid-strided mapping. x covers variants (the fast / coalesced axis:
+    // dosage & missing are person-major, idx = person*batch_variants + variant),
+    // y covers people. Both axes grid-stride, so the launch may clamp grid dims
+    // to the device limits and still cover the whole batch. This replaces the
+    // flat linear-id mapping that needed a per-thread integer divide AND modulo
+    // (idx / batch_variants, idx % batch_variants) — GPUs have no hardware
+    // integer division, so NVRTC lowered each to a ~20+ instruction software
+    // routine executed by every element.
+    unsigned long long variant_stride =
+        (unsigned long long)gridDim.x * (unsigned long long)blockDim.x;
+    unsigned long long variant0 =
+        (unsigned long long)blockIdx.x * (unsigned long long)blockDim.x +
+        (unsigned long long)threadIdx.x;
 
-    unsigned long long person = idx / (unsigned long long)batch_variants;
-    unsigned long long variant = idx % (unsigned long long)batch_variants;
+    for (unsigned long long person = blockIdx.y;
+         person < (unsigned long long)num_people;
+         person += (unsigned long long)gridDim.y) {
+        // The family index and bit position are invariant across variants:
+        // gather + decode them once per person instead of once per element.
+        unsigned int fam_idx = out_to_fam[person];
+        int byte_idx = (int)(fam_idx >> 2);
+        int bit_shift = (int)((fam_idx & 3u) << 1);
+        unsigned long long person_row = person * (unsigned long long)batch_variants;
 
-    unsigned int fam_idx = out_to_fam[person];
-    int byte_idx = (int)(fam_idx >> 2);
-    int bit_shift = (int)((fam_idx & 3u) << 1);
+        for (unsigned long long variant = variant0;
+             variant < (unsigned long long)batch_variants;
+             variant += variant_stride) {
+            unsigned char b =
+                packed[(size_t)variant * (size_t)bytes_per_variant + (size_t)byte_idx];
+            unsigned char gt = (b >> bit_shift) & 0x3u;
 
-    unsigned char b = packed[(size_t)variant * (size_t)bytes_per_variant + (size_t)byte_idx];
-    unsigned char gt = (b >> bit_shift) & 0x3u;
+            float d = 0.0f;
+            float m = 0.0f;
+            if (gt == 1u) {
+                m = 1.0f;
+            } else if (gt == 2u) {
+                d = 1.0f;
+            } else if (gt == 3u) {
+                d = 2.0f;
+            }
 
-    float d = 0.0f;
-    float m = 0.0f;
-    if (gt == 1u) {
-        m = 1.0f;
-    } else if (gt == 2u) {
-        d = 1.0f;
-    } else if (gt == 3u) {
-        d = 2.0f;
+            unsigned long long idx = person_row + variant;
+            dosage[idx] = d;
+            missing[idx] = m;
+        }
     }
-
-    dosage[idx] = d;
-    missing[idx] = m;
 }
 
 extern "C" __global__ void zero_batch_mats(
@@ -2180,8 +2200,9 @@ fn run_pending_compute_cuda(
             .arg(&bytes_per_variant_i32)
             .arg(&mut d_dosage.slice_mut(0..unpack_elems))
             .arg(&mut d_missing.slice_mut(0..unpack_elems))
-            .launch(launch_config_for_num_elems(
-                unpack_elems,
+            .launch(unpack_launch_config_2d(
+                work.shape.batch_len(),
+                work.shape.dims.num_people,
                 runtime.unpack_block_size,
                 &runtime.device_info,
             )?)
@@ -2246,16 +2267,32 @@ fn run_pending_compute_cuda(
                 .map_err(map_driver_err("Failed to launch scatter_batch_mats kernel"))?;
         }
 
-        run_row_major_gemm(
-            &runtime.blas,
-            dims.num_people,
-            work.shape.batch_len(),
-            tile_scores,
-            &d_dosage.slice(0..unpack_elems),
-            &d_w_eff.slice(0..weights_elems),
-            &mut d_out_scores_slots[work.slot],
-            0.0f32,
-        )?;
+        // Main score GEMM: dosage x effective-weights. Optionally on fp16 tensor
+        // cores (opt-in, default OFF) — same buffers/dims, fp32 accumulate.
+        if score_fp16_enabled() {
+            run_row_major_gemm_tensorcore(
+                &runtime.blas,
+                &runtime.compute_stream,
+                dims.num_people,
+                work.shape.batch_len(),
+                tile_scores,
+                &d_dosage.slice(0..unpack_elems),
+                &d_w_eff.slice(0..weights_elems),
+                &mut d_out_scores_slots[work.slot],
+                0.0f32,
+            )?;
+        } else {
+            run_row_major_gemm(
+                &runtime.blas,
+                dims.num_people,
+                work.shape.batch_len(),
+                tile_scores,
+                &d_dosage.slice(0..unpack_elems),
+                &d_w_eff.slice(0..weights_elems),
+                &mut d_out_scores_slots[work.slot],
+                0.0f32,
+            )?;
+        }
         run_row_major_gemm(
             &runtime.blas,
             dims.num_people,
@@ -2346,15 +2383,29 @@ fn run_pending_compute_cuda(
         final_compute_done_event = Some(tile_done_event);
 
         let accum_start = Instant::now();
-        for person_idx in 0..dims.num_people {
-            let src_base = person_idx * tile_scores;
-            let dst_base = person_idx * dims.num_scores + score_offset;
-            for j in 0..tile_scores {
-                let src_idx = src_base + j;
-                let dst_idx = dst_base + j;
-                final_scores[dst_idx] += host_tile_scores_slots[work.slot][src_idx] as f64;
-                final_counts[dst_idx] += host_tile_counts_slots[work.slot][src_idx];
-            }
+        // This per-tile accumulation is O(num_people * tile_scores) and runs
+        // once per (variant mega-batch x score tile). Single-threaded it was a
+        // serial Amdahl bottleneck that left every core but one — and the GPU,
+        // already synced above — idle. Each person owns a disjoint row of
+        // `final_scores`/`final_counts`, so it parallelizes cleanly over people.
+        {
+            use rayon::prelude::*;
+            let num_scores = dims.num_scores;
+            let scores_src = &host_tile_scores_slots[work.slot];
+            let counts_src = &host_tile_counts_slots[work.slot];
+            final_scores
+                .par_chunks_mut(num_scores)
+                .zip(final_counts.par_chunks_mut(num_scores))
+                .enumerate()
+                .for_each(|(person_idx, (score_row, count_row))| {
+                    let src_base = person_idx * tile_scores;
+                    let score_dst = &mut score_row[score_offset..score_offset + tile_scores];
+                    let count_dst = &mut count_row[score_offset..score_offset + tile_scores];
+                    for j in 0..tile_scores {
+                        score_dst[j] += scores_src[src_base + j] as f64;
+                        count_dst[j] += counts_src[src_base + j];
+                    }
+                });
         }
         stats.cpu_accum += accum_start.elapsed();
     }
@@ -2380,6 +2431,77 @@ fn maybe_save_cuda_checkpoint(
         eprintln!("> Score checkpoint saved after {completed_variants} completed variants.");
     }
     Ok(())
+}
+
+/// Opt-in (default OFF). When `GNOMON_SCORE_FP16=1`, the main dosage×weights
+/// score GEMM runs on fp16 tensor cores (fp32 accumulate) instead of the fp32
+/// CUDA cores. On a T4 that path is ~8x the FLOP throughput.
+///
+/// EXPERIMENTAL: this trades precision (the multiply rounds inputs to fp16; the
+/// accumulate stays fp32). Whether that is acceptable for a given PGS is a
+/// scientific decision — validate against the fp32 output on real data before
+/// relying on it. Default-off means the standard path is byte-for-byte unchanged.
+fn score_fp16_enabled() -> bool {
+    env::var("GNOMON_SCORE_FP16")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// fp16-tensor-core variant of [`run_row_major_gemm`]. Identical math layout
+/// (same m/n/k and leading dimensions, same f32 buffers and output) — only the
+/// cuBLAS compute mode changes to `CUBLAS_COMPUTE_32F_FAST_16F`, which keeps the
+/// f32 buffers but performs the inner products on fp16 tensor cores with fp32
+/// accumulation. Because the dims mirror `run_row_major_gemm` exactly, there is
+/// no transposed-stride hazard introduced here.
+///
+/// NOTE: untested on GPU hardware in this tree — gated behind [`score_fp16_enabled`]
+/// and must be validated in GPU CI before being trusted for production scores.
+fn run_row_major_gemm_tensorcore(
+    blas: &CudaBlas,
+    stream: &CudaStream,
+    m_rows: usize,
+    k_shared: usize,
+    n_cols: usize,
+    a: &CudaView<'_, f32>,
+    b: &CudaView<'_, f32>,
+    c: &mut CudaSlice<f32>,
+    beta: f32,
+) -> Result<(), PipelineError> {
+    use std::ffi::c_void;
+    // Mirrors run_row_major_gemm's transposed mapping: cuBLAS computes
+    // C(m=n_cols, n=m_rows) = B_eff(W) * A_eff(dosage), so gemm_ex's first
+    // operand is our `b` (weights, lda=n_cols), second is our `a` (lda=k_shared).
+    let m_i32 = checked_i32("gemm m (n_cols)", n_cols)?;
+    let n_i32 = checked_i32("gemm n (m_rows)", m_rows)?;
+    let k_i32 = checked_i32("gemm k (k_shared)", k_shared)?;
+    let alpha: f32 = 1.0;
+    let (a_ptr, _a_guard) = b.device_ptr(stream);
+    let (b_ptr, _b_guard) = a.device_ptr(stream);
+    let (c_ptr, _c_guard) = c.device_ptr_mut(stream);
+    unsafe {
+        cublas_result::gemm_ex(
+            *blas.handle(),
+            cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+            cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+            m_i32,
+            n_i32,
+            k_i32,
+            &alpha as *const f32 as *const c_void,
+            a_ptr as *const c_void,
+            cublas_sys::cudaDataType_t::CUDA_R_32F,
+            m_i32,
+            b_ptr as *const c_void,
+            cublas_sys::cudaDataType_t::CUDA_R_32F,
+            k_i32,
+            &beta as *const f32 as *const c_void,
+            c_ptr as *mut c_void,
+            cublas_sys::cudaDataType_t::CUDA_R_32F,
+            m_i32,
+            cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16F,
+            cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+        )
+        .map_err(|e| PipelineError::Compute(format!("cuBLAS GemmEx (fp16) failed: {e:?}")))
+    }
 }
 
 fn run_row_major_gemm(
@@ -2488,6 +2610,40 @@ fn choose_kernel_block_size(
         "> CUDA launch {label}: block_threads={block}, active_blocks/SM={active_blocks}, active_threads/SM={active_threads} ({occupancy_pct:.1}% occupancy cap)"
     );
     Ok(block)
+}
+
+/// 2D launch config for the grid-strided `unpack_plink` kernel: x = variants
+/// (block-wide, coalesced), y = people. Both grid dims are clamped to the
+/// device limits because the kernel grid-strides on both axes, so a clamped
+/// grid still covers the full (people × variants) batch.
+fn unpack_launch_config_2d(
+    batch_variants: usize,
+    num_people: usize,
+    block_size: u32,
+    device: &CudaDeviceInfo,
+) -> Result<LaunchConfig, PipelineError> {
+    let block_size = block_size.max(1);
+    let max_grid_x = u32::try_from(device.max_grid_dim_x.max(1)).map_err(|_| {
+        PipelineError::Compute(format!(
+            "CUDA device reported invalid max_grid_dim_x={}",
+            device.max_grid_dim_x
+        ))
+    })?;
+    let max_grid_y = u32::try_from(device.max_grid_dim_y.max(1)).map_err(|_| {
+        PipelineError::Compute(format!(
+            "CUDA device reported invalid max_grid_dim_y={}",
+            device.max_grid_dim_y
+        ))
+    })?;
+    let want_x = (batch_variants as u128)
+        .div_ceil(block_size as u128)
+        .clamp(1, max_grid_x as u128);
+    let want_y = (num_people as u128).clamp(1, max_grid_y as u128);
+    Ok(LaunchConfig {
+        grid_dim: (want_x as u32, want_y as u32, 1),
+        block_dim: (block_size, 1, 1),
+        shared_mem_bytes: 0,
+    })
 }
 
 fn launch_config_for_num_elems(
