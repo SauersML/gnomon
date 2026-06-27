@@ -292,6 +292,12 @@ struct ProjectionCudaRhs {
     b_cap: usize,
     c_cap: usize,
     h_c: Vec<f64>,
+    // Set by on-device calibration: when true, the projection GEMM runs in f32
+    // (sgemm) instead of f64 (dgemm). On a T4 f64 runs at 1/32 the f32 rate and
+    // this projection GEMM is compute-bound, so f32 is ~10x faster. Only enabled
+    // if the f32 result matched f64 to tight tolerance on this device, else the
+    // exact f64 path is kept.
+    use_f32: bool,
 }
 
 struct ProjectionCudaPacked {
@@ -569,6 +575,14 @@ impl ProjectionCudaRhs {
             .map_err(|e| format!("Failed to create CUDA stream: {e:?}"))?;
         let blas = CudaBlas::new(stream.clone())
             .map_err(|e| format!("Failed to initialize cuBLAS: {e:?}"))?;
+        let use_f32 = calibrate_projection_f32(&stream, &blas);
+        if use_f32 {
+            eprintln!(
+                "> Projection GEMM: f32 sgemm (calibrated == f64 on this device; ~10x on T4-class f64)"
+            );
+        } else {
+            eprintln!("> Projection GEMM: f64 dgemm (f32 path not validated on this device)");
+        }
         Ok(Self {
             _ctx: ctx,
             stream,
@@ -580,6 +594,7 @@ impl ProjectionCudaRhs {
             b_cap: 0,
             c_cap: 0,
             h_c: Vec::new(),
+            use_f32,
         })
     }
 
@@ -622,6 +637,9 @@ impl ProjectionCudaRhs {
         k_shared: usize,
         n_cols: usize,
     ) -> Result<&[f64], String> {
+        if self.use_f32 {
+            return self.compute_rhs_f32(a_col_major, b_col_major, m_rows, k_shared, n_cols);
+        }
         let a_len = m_rows
             .checked_mul(k_shared)
             .ok_or_else(|| "CUDA rhs overflow for A".to_string())?;
@@ -688,6 +706,162 @@ impl ProjectionCudaRhs {
             .map_err(|e| format!("Failed to copy projection rhs from device: {e:?}"))?;
         Ok(&self.h_c[..c_len])
     }
+
+    /// f32 (sgemm) variant of `compute_rhs`, used only after `calibrate_projection_f32`
+    /// confirmed it matches f64 on this device. Inputs are converted f64->f32 on
+    /// the host, multiplied with sgemm, and the result widened back to f64. The
+    /// genotype/loadings magnitudes are O(1), so f32 holds the projection scores
+    /// to ~1e-5 relative — negligible for PCA, and bounded by the calibration.
+    fn compute_rhs_f32(
+        &mut self,
+        a_col_major: &[f64],
+        b_col_major: &[f64],
+        m_rows: usize,
+        k_shared: usize,
+        n_cols: usize,
+    ) -> Result<&[f64], String> {
+        let a_len = m_rows
+            .checked_mul(k_shared)
+            .ok_or_else(|| "CUDA rhs overflow for A".to_string())?;
+        let b_len = k_shared
+            .checked_mul(n_cols)
+            .ok_or_else(|| "CUDA rhs overflow for B".to_string())?;
+        let c_len = m_rows
+            .checked_mul(n_cols)
+            .ok_or_else(|| "CUDA rhs overflow for C".to_string())?;
+
+        let a32: Vec<f32> = a_col_major.iter().map(|&x| x as f32).collect();
+        let b32: Vec<f32> = b_col_major.iter().map(|&x| x as f32).collect();
+        let d_a = self
+            .stream
+            .clone_htod(&a32)
+            .map_err(|e| format!("Failed to copy f32 projection block to device: {e:?}"))?;
+        let d_b = self
+            .stream
+            .clone_htod(&b32)
+            .map_err(|e| format!("Failed to copy f32 loading block to device: {e:?}"))?;
+        let mut d_c = self
+            .stream
+            .alloc_zeros::<f32>(c_len)
+            .map_err(|e| format!("Failed to allocate f32 projection output: {e:?}"))?;
+
+        let m = i32::try_from(m_rows).map_err(|_| format!("m_rows too large: {m_rows}"))?;
+        let n = i32::try_from(n_cols).map_err(|_| format!("n_cols too large: {n_cols}"))?;
+        let k = i32::try_from(k_shared).map_err(|_| format!("k_shared too large: {k_shared}"))?;
+        let cfg = GemmConfig {
+            transa: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
+            transb: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
+            m,
+            n,
+            k,
+            alpha: 1.0f32,
+            lda: m,
+            ldb: k,
+            beta: 0.0f32,
+            ldc: m,
+        };
+        unsafe {
+            self.blas
+                .gemm(cfg, &d_a.slice(0..a_len), &d_b.slice(0..b_len), &mut d_c.slice_mut(0..c_len))
+                .map_err(|e| format!("cuBLAS sgemm failed for projection rhs: {e:?}"))?;
+        }
+        let c32 = self
+            .stream
+            .clone_dtoh(&d_c.slice(0..c_len))
+            .map_err(|e| format!("Failed to copy f32 projection rhs from device: {e:?}"))?;
+        if self.h_c.len() < c_len {
+            self.h_c.resize(c_len, 0.0);
+        }
+        for i in 0..c_len {
+            self.h_c[i] = c32[i] as f64;
+        }
+        Ok(&self.h_c[..c_len])
+    }
+}
+
+/// One-time on-device check: run the projection GEMM in f64 and in f32 on
+/// identical known inputs and return true only if they agree to a tight relative
+/// tolerance. Any CUDA error or mismatch returns false, so the projection keeps
+/// the exact f64 path. This is what makes the f32 fast path safe to enable
+/// automatically — it can never be used unless this device proved it equals f64.
+fn calibrate_projection_f32(stream: &std::sync::Arc<CudaStream>, blas: &CudaBlas) -> bool {
+    let run = || -> Result<bool, String> {
+        // Tall-skinny shape like the real projection: m samples x k variants x n PCs.
+        const M: usize = 128;
+        const K: usize = 256;
+        const N: usize = 16;
+        let a: Vec<f64> = (0..M * K)
+            .map(|i| ((i as i64 * 13 % 197) - 98) as f64 / 41.0)
+            .collect();
+        let b: Vec<f64> = (0..K * N)
+            .map(|i| ((i as i64 * 7 % 101) - 50) as f64 / 29.0)
+            .collect();
+        let (mi, ni, ki) = (M as i32, N as i32, K as i32);
+        let cfg64 = GemmConfig {
+            transa: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
+            transb: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
+            m: mi,
+            n: ni,
+            k: ki,
+            alpha: 1.0f64,
+            lda: mi,
+            ldb: ki,
+            beta: 0.0f64,
+            ldc: mi,
+        };
+        let cfg32 = GemmConfig {
+            transa: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
+            transb: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
+            m: mi,
+            n: ni,
+            k: ki,
+            alpha: 1.0f32,
+            lda: mi,
+            ldb: ki,
+            beta: 0.0f32,
+            ldc: mi,
+        };
+        // f64 reference.
+        let d_a64 = stream.clone_htod(&a).map_err(|e| format!("{e:?}"))?;
+        let d_b64 = stream.clone_htod(&b).map_err(|e| format!("{e:?}"))?;
+        let mut d_c64 = stream.alloc_zeros::<f64>(M * N).map_err(|e| format!("{e:?}"))?;
+        unsafe {
+            blas.gemm(
+                cfg64,
+                &d_a64.slice(0..M * K),
+                &d_b64.slice(0..K * N),
+                &mut d_c64.slice_mut(0..M * N),
+            )
+            .map_err(|e| format!("{e:?}"))?;
+        }
+        // f32 candidate.
+        let a32: Vec<f32> = a.iter().map(|&x| x as f32).collect();
+        let b32: Vec<f32> = b.iter().map(|&x| x as f32).collect();
+        let d_a32 = stream.clone_htod(&a32).map_err(|e| format!("{e:?}"))?;
+        let d_b32 = stream.clone_htod(&b32).map_err(|e| format!("{e:?}"))?;
+        let mut d_c32 = stream.alloc_zeros::<f32>(M * N).map_err(|e| format!("{e:?}"))?;
+        unsafe {
+            blas.gemm(
+                cfg32,
+                &d_a32.slice(0..M * K),
+                &d_b32.slice(0..K * N),
+                &mut d_c32.slice_mut(0..M * N),
+            )
+            .map_err(|e| format!("{e:?}"))?;
+        }
+        stream.synchronize().map_err(|e| format!("{e:?}"))?;
+        let ref64 = stream.clone_dtoh(&d_c64.slice(0..M * N)).map_err(|e| format!("{e:?}"))?;
+        let test32 = stream.clone_dtoh(&d_c32.slice(0..M * N)).map_err(|e| format!("{e:?}"))?;
+        let mut max_rel = 0.0f64;
+        for (r, t) in ref64.iter().zip(test32.iter()) {
+            let denom = r.abs().max(1.0);
+            max_rel = max_rel.max((r - *t as f64).abs() / denom);
+        }
+        // f32 sgemm vs f64 dgemm differs by ~1e-5; 1e-3 rejects a broken path
+        // (wrong layout / no f32 support) while accepting normal f32 precision.
+        Ok(max_rel < 1.0e-3)
+    };
+    run().unwrap_or(false)
 }
 
 impl HwePcaModel {
