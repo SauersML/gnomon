@@ -1714,10 +1714,7 @@ fn projection_cuda_libraries_loadable() -> Result<(), String> {
 }
 
 fn project_cuda_min_work() -> usize {
-    std::env::var("GNOMON_PROJECT_CUDA_MIN_WORK")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(DEFAULT_PROJECT_CUDA_MIN_WORK)
+    DEFAULT_PROJECT_CUDA_MIN_WORK
 }
 
 fn cuda_driver_likely_available() -> bool {
@@ -2872,14 +2869,7 @@ fn accumulate_missing_info_from_present(
 }
 
 fn missing_scan_chunk_samples() -> usize {
-    static CHUNK: OnceLock<usize> = OnceLock::new();
-    *CHUNK.get_or_init(|| {
-        std::env::var("GNOMON_PROJECT_MISSING_CHUNK_SAMPLES")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|&value| value > 0)
-            .unwrap_or(256)
-    })
+    256
 }
 #[cfg(test)]
 mod tests {

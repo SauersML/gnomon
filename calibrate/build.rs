@@ -139,13 +139,6 @@ fn detect_total_memory_bytes() -> Option<u64> {
 }
 
 fn configure_linker_for_low_memory() {
-    if let Ok(value) = std::env::var("GNOMON_DISABLE_LOW_MEM_WORKAROUND") {
-        let normalized = value.trim().to_ascii_lowercase();
-        if matches!(normalized.as_str(), "1" | "true" | "yes") {
-            return;
-        }
-    }
-
     const TEN_GIB: u64 = 10u64 * 1024 * 1024 * 1024;
 
     match detect_total_memory_bytes() {
@@ -1097,9 +1090,18 @@ fn main() {
         .unwrap_or(0);
     println!("cargo:rustc-env=GNOMON_BUILD_TIMESTAMP={}", build_time);
 
-    // Capture release tag if provided by CI
-    if let Ok(release_tag) = std::env::var("GNOMON_RELEASE_TAG") {
-        println!("cargo:rustc-env=GNOMON_RELEASE_TAG={}", release_tag);
+    // Derive the release tag automatically from git (nearest tag, else short
+    // commit, with a -dirty suffix for uncommitted trees). No env var needed.
+    if let Some(release_tag) = std::process::Command::new("git")
+        .args(["describe", "--tags", "--always", "--dirty"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        println!("cargo:rustc-env=GNOMON_RELEASE_TAG={release_tag}");
     }
 
     // Skip lint checks during release builds or cross-compilation
