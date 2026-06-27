@@ -18,7 +18,7 @@ use crate::score::types::{
 };
 use crossbeam_queue::ArrayQueue;
 use std::error::Error;
-use std::simd::{Simd, cmp::SimdPartialEq, num::SimdUint};
+use std::simd::{Simd, cmp::SimdPartialEq, num::SimdFloat, num::SimdUint};
 
 // --- SIMD & Engine Tuning Parameters ---
 const SIMD_LANES: usize = 8;
@@ -194,22 +194,20 @@ fn accumulate_simd_lane(
     scores_offset: usize,
     num_scores: usize,
 ) {
-    let adj = adjustments_f32x8.to_array();
-
-    // This is the fast path for full 8-element chunks.
+    // Fast path for full 8-element chunks. Slicing once does a single range
+    // check, after which the 8 lanes are statically in bounds — so the widen +
+    // add vectorizes to 2x vcvtps2pd + 2x vaddpd instead of 8 scalar converts
+    // behind 8 separate bounds-check branches (the old unrolled scalar form
+    // re-checked every index against the slice length). Bit-identical: f32->f64
+    // widening is exact and the f64 adds are unchanged.
     if scores_offset + SIMD_LANES <= num_scores {
-        // Unrolled scalar loop - empirically fastest implementation
-        scores_out_slice[scores_offset] += adj[0] as f64;
-        scores_out_slice[scores_offset + 1] += adj[1] as f64;
-        scores_out_slice[scores_offset + 2] += adj[2] as f64;
-        scores_out_slice[scores_offset + 3] += adj[3] as f64;
-        scores_out_slice[scores_offset + 4] += adj[4] as f64;
-        scores_out_slice[scores_offset + 5] += adj[5] as f64;
-        scores_out_slice[scores_offset + 6] += adj[6] as f64;
-        scores_out_slice[scores_offset + 7] += adj[7] as f64;
+        let chunk = &mut scores_out_slice[scores_offset..scores_offset + SIMD_LANES];
+        let current = Simd::<f64, SIMD_LANES>::from_slice(chunk);
+        let widened: Simd<f64, SIMD_LANES> = adjustments_f32x8.cast();
+        (current + widened).copy_to_slice(chunk);
     } else {
-        // This is the scalar fallback for the tail end of the data (e.g., if there
-        // are 1-7 elements left).
+        // Scalar fallback for the 1-7 element tail.
+        let adj = adjustments_f32x8.to_array();
         let end = num_scores;
         for j in 0..(end - scores_offset) {
             scores_out_slice[scores_offset + j] += adj[j] as f64;
