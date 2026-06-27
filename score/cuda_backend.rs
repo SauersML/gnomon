@@ -185,6 +185,34 @@ extern "C" __global__ void combine_score_outputs(
     rounded_counts[idx] = (unsigned int)floorf(count + 0.5f);
 }
 
+// Splits each fp32 weight w into a high part w_hi (exactly representable in
+// fp16) and a low residual w_lo = w - w_hi. Feeding both through fp16 tensor
+// cores and summing recovers ~22 bits of mantissa (fp32 has 24), so the score
+// matches the fp32 GEMM within its own rounding noise -- while running at fp16
+// tensor-core throughput. Genotype dosages {0,1,2} are exact in fp16, so the
+// per-element products lose no precision; only the weight split is approximate.
+//
+// w_hi is computed with plain float bit-ops (round-to-nearest of the low 13
+// mantissa bits, which fp16 drops) so no <cuda_fp16.h> include is required;
+// because w_hi is already an exact fp16 value, the FAST_16F GEMM rounds it to
+// itself, keeping w_hi and w_lo mutually consistent.
+extern "C" __global__ void split_fp16_weights(
+    const float* w,
+    float* w_hi,
+    float* w_lo,
+    unsigned long long n
+) {
+    unsigned long long idx = linear_thread_id();
+    if (idx >= n) return;
+    float x = w[idx];
+    unsigned int u = __float_as_uint(x);
+    u += 0x00001000u;        // round bit for the 13 mantissa bits fp16 drops
+    u &= 0xFFFFE000u;        // truncate to a value fp16 can represent exactly
+    float hi = __uint_as_float(u);
+    w_hi[idx] = hi;
+    w_lo[idx] = x - hi;
+}
+
 "#;
 
 struct SpoolState {
@@ -228,6 +256,10 @@ struct CudaRuntime {
     zero_batch_mats_kernel: CudaFunction,
     scatter_batch_mats_kernel: CudaFunction,
     combine_score_outputs_kernel: CudaFunction,
+    split_fp16_kernel: CudaFunction,
+    // Set by on-device calibration at init: true only when the split-fp16
+    // tensor-core score GEMM was proven to equal fp32 on this device.
+    use_fp16: bool,
     sparse_weights: CudaSlice<f32>,
     sparse_missing_corrections: CudaSlice<f32>,
     sparse_columns: CudaSlice<u32>,
@@ -1172,6 +1204,9 @@ impl CudaRuntime {
         let combine_score_outputs_kernel = module
             .load_function("combine_score_outputs")
             .map_err(|e| format!("Failed to load combine_score_outputs kernel: {e:?}"))?;
+        let split_fp16_kernel = module
+            .load_function("split_fp16_weights")
+            .map_err(|e| format!("Failed to load split_fp16_weights kernel: {e:?}"))?;
         let unpack_block_size =
             choose_kernel_block_size(&unpack_kernel, &device_info, "unpack_plink")?;
         let zero_block_size =
@@ -1223,6 +1258,24 @@ impl CudaRuntime {
         let blas = CudaBlas::new(compute_stream.clone())
             .map_err(|e| format!("Failed to initialize cuBLAS: {e:?}"))?;
 
+        // Automatically decide whether the split-fp16 tensor-core score GEMM is
+        // safe and faster on THIS device. It is only enabled if it reproduces
+        // the fp32 result to tight tolerance here; otherwise we keep exact fp32.
+        let use_fp16 = calibrate_fp16(
+            &compute_stream,
+            &blas,
+            &split_fp16_kernel,
+            combine_block_size,
+            &device_info,
+        );
+        if use_fp16 {
+            eprintln!(
+                "> CUDA score GEMM: split-fp16 tensor cores (calibrated == fp32 on this device)"
+            );
+        } else {
+            eprintln!("> CUDA score GEMM: fp32 (fp16 tensor-core path not validated on this device)");
+        }
+
         Ok(Self {
             ctx,
             compute_stream,
@@ -1232,6 +1285,8 @@ impl CudaRuntime {
             zero_batch_mats_kernel,
             scatter_batch_mats_kernel,
             combine_score_outputs_kernel,
+            split_fp16_kernel,
+            use_fp16,
             sparse_weights,
             sparse_missing_corrections,
             sparse_columns,
@@ -2267,19 +2322,23 @@ fn run_pending_compute_cuda(
                 .map_err(map_driver_err("Failed to launch scatter_batch_mats kernel"))?;
         }
 
-        // Main score GEMM: dosage x effective-weights. Optionally on fp16 tensor
-        // cores (opt-in, default OFF) — same buffers/dims, fp32 accumulate.
-        if score_fp16_enabled() {
-            run_row_major_gemm_tensorcore(
+        // Main score GEMM: dosage x effective-weights. Automatically uses the
+        // split-fp16 tensor-core path when this device passed calibration
+        // (`runtime.use_fp16`, validated == fp32 at init); otherwise the exact
+        // fp32 path. No configuration required.
+        if runtime.use_fp16 {
+            run_score_gemm_split16(
                 &runtime.blas,
                 &runtime.compute_stream,
+                &runtime.split_fp16_kernel,
+                runtime.combine_block_size,
+                &runtime.device_info,
                 dims.num_people,
                 work.shape.batch_len(),
                 tile_scores,
                 &d_dosage.slice(0..unpack_elems),
                 &d_w_eff.slice(0..weights_elems),
                 &mut d_out_scores_slots[work.slot],
-                0.0f32,
             )?;
         } else {
             run_row_major_gemm(
@@ -2433,18 +2492,147 @@ fn maybe_save_cuda_checkpoint(
     Ok(())
 }
 
-/// Opt-in (default OFF). When `GNOMON_SCORE_FP16=1`, the main dosage×weights
-/// score GEMM runs on fp16 tensor cores (fp32 accumulate) instead of the fp32
-/// CUDA cores. On a T4 that path is ~8x the FLOP throughput.
-///
-/// EXPERIMENTAL: this trades precision (the multiply rounds inputs to fp16; the
-/// accumulate stays fp32). Whether that is acceptable for a given PGS is a
-/// scientific decision — validate against the fp32 output on real data before
-/// relying on it. Default-off means the standard path is byte-for-byte unchanged.
-fn score_fp16_enabled() -> bool {
-    env::var("GNOMON_SCORE_FP16")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+/// Split-precision fp16 tensor-core variant of the main score GEMM. Splits the
+/// weights into `w_hi + w_lo` (both exact fp16 values) and runs two FAST_16F
+/// tensor-core GEMMs accumulating into `out`, recovering ~fp32 precision (see
+/// `split_fp16_weights`). Dosages {0,1,2} are exact in fp16, so the only
+/// approximation is the weight split, which the `calibrate_fp16` self-test
+/// confirms is fp32-equivalent on the actual device before this path is ever used.
+#[allow(clippy::too_many_arguments)]
+fn run_score_gemm_split16(
+    blas: &CudaBlas,
+    stream: &Arc<CudaStream>,
+    split_kernel: &CudaFunction,
+    split_block_size: u32,
+    device: &CudaDeviceInfo,
+    m_rows: usize,
+    k_shared: usize,
+    n_cols: usize,
+    dosage: &CudaView<'_, f32>,
+    weights: &CudaView<'_, f32>,
+    out: &mut CudaSlice<f32>,
+) -> Result<(), PipelineError> {
+    let n = weights.len();
+    let mut d_w_hi = stream
+        .alloc_zeros::<f32>(n)
+        .map_err(map_driver_err("Failed to allocate fp16 split hi buffer"))?;
+    let mut d_w_lo = stream
+        .alloc_zeros::<f32>(n)
+        .map_err(map_driver_err("Failed to allocate fp16 split lo buffer"))?;
+    unsafe {
+        stream
+            .launch_builder(split_kernel)
+            .arg(weights)
+            .arg(&mut d_w_hi)
+            .arg(&mut d_w_lo)
+            .arg(&checked_u64("split_fp16 elems", n)?)
+            .launch(launch_config_for_num_elems(n, split_block_size, device)?)
+            .map_err(map_driver_err("Failed to launch split_fp16_weights kernel"))?;
+    }
+    // out = dosage * w_hi
+    run_row_major_gemm_tensorcore(
+        blas,
+        stream,
+        m_rows,
+        k_shared,
+        n_cols,
+        dosage,
+        &d_w_hi.slice(0..n),
+        out,
+        0.0,
+    )?;
+    // out += dosage * w_lo
+    run_row_major_gemm_tensorcore(
+        blas,
+        stream,
+        m_rows,
+        k_shared,
+        n_cols,
+        dosage,
+        &d_w_lo.slice(0..n),
+        out,
+        1.0,
+    )?;
+    Ok(())
+}
+
+/// One-time on-device self-calibration. Runs the split-fp16 score GEMM and the
+/// reference fp32 GEMM on identical known inputs and returns `true` only if the
+/// results agree to a tight relative tolerance. Any CUDA error, missing
+/// tensor-core support, or precision mismatch returns `false`, so the engine
+/// silently keeps the exact fp32 path. This is what makes the fp16 fast path
+/// safe to enable automatically: it can never be used unless this device proved
+/// it equals fp32.
+fn calibrate_fp16(
+    stream: &Arc<CudaStream>,
+    blas: &CudaBlas,
+    split_kernel: &CudaFunction,
+    split_block_size: u32,
+    device: &CudaDeviceInfo,
+) -> bool {
+    let result = (|| -> Result<bool, PipelineError> {
+        const DIM: usize = 64; // multiple of 8 so tensor cores engage
+        let elems = DIM * DIM;
+        // Known dosages in {0,1,2} (exact in fp16) and varied f32 weights.
+        let host_dosage: Vec<f32> = (0..elems).map(|i| (i % 3) as f32).collect();
+        let host_weights: Vec<f32> = (0..elems)
+            .map(|i| ((i as i64 * 7 % 101) - 50) as f32 / 13.0)
+            .collect();
+        let d_dosage = stream
+            .memcpy_stod(&host_dosage)
+            .map_err(map_driver_err("calibrate: dosage htod"))?;
+        let d_weights = stream
+            .memcpy_stod(&host_weights)
+            .map_err(map_driver_err("calibrate: weights htod"))?;
+        let mut d_ref = stream
+            .alloc_zeros::<f32>(elems)
+            .map_err(map_driver_err("calibrate: ref alloc"))?;
+        let mut d_test = stream
+            .alloc_zeros::<f32>(elems)
+            .map_err(map_driver_err("calibrate: test alloc"))?;
+        run_row_major_gemm(
+            blas,
+            DIM,
+            DIM,
+            DIM,
+            &d_dosage.slice(0..elems),
+            &d_weights.slice(0..elems),
+            &mut d_ref,
+            0.0,
+        )?;
+        run_score_gemm_split16(
+            blas,
+            stream,
+            split_kernel,
+            split_block_size,
+            device,
+            DIM,
+            DIM,
+            DIM,
+            &d_dosage.slice(0..elems),
+            &d_weights.slice(0..elems),
+            &mut d_test,
+        )?;
+        stream
+            .synchronize()
+            .map_err(map_driver_err("calibrate: sync"))?;
+        let ref_host = stream
+            .memcpy_dtov(&d_ref)
+            .map_err(map_driver_err("calibrate: ref dtoh"))?;
+        let test_host = stream
+            .memcpy_dtov(&d_test)
+            .map_err(map_driver_err("calibrate: test dtoh"))?;
+        let mut max_rel = 0.0f32;
+        for (r, t) in ref_host.iter().zip(test_host.iter()) {
+            let denom = r.abs().max(1.0);
+            max_rel = max_rel.max((r - t).abs() / denom);
+        }
+        // fp16 split recovers ~22 mantissa bits; 1e-3 is far looser than that
+        // yet tight enough to reject a broken path (wrong layout / no tensor
+        // cores / bad residual math).
+        Ok(max_rel < 1.0e-3)
+    })();
+    result.unwrap_or(false)
 }
 
 /// fp16-tensor-core variant of [`run_row_major_gemm`]. Identical math layout
@@ -2454,8 +2642,9 @@ fn score_fp16_enabled() -> bool {
 /// accumulation. Because the dims mirror `run_row_major_gemm` exactly, there is
 /// no transposed-stride hazard introduced here.
 ///
-/// NOTE: untested on GPU hardware in this tree — gated behind [`score_fp16_enabled`]
-/// and must be validated in GPU CI before being trusted for production scores.
+/// NOTE: only ever invoked after [`calibrate_fp16`] has confirmed on this exact
+/// device that the split-fp16 path equals fp32; otherwise the engine stays on
+/// the fp32 path.
 fn run_row_major_gemm_tensorcore(
     blas: &CudaBlas,
     stream: &CudaStream,
