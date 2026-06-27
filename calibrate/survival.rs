@@ -143,7 +143,6 @@ pub struct SurvivalPredictionInputs<'a> {
 /// from the `survival` module too — matches the spec.
 pub use crate::calibrate::survival_data::SurvivalTrainingBundle;
 
-#[allow(clippy::too_many_arguments)]
 pub fn validate_survival_inputs(
     age_entry: ArrayView1<f64>,
     age_exit: ArrayView1<f64>,

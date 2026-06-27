@@ -933,9 +933,6 @@ impl<'model> HwePcaProjector<'model> {
                 .saturating_mul(components);
             let mut cuda_rhs = match projection_gpu_rejection_reason(total_work) {
                 Some(reason) => {
-                    if project_cuda_required() {
-                        return Err(cuda_required_error(&reason));
-                    }
                     eprintln!("> Projection backend: CPU ({reason})");
                     None
                 }
@@ -947,9 +944,6 @@ impl<'model> HwePcaProjector<'model> {
                         Some(runtime)
                     }
                     Err(reason) => {
-                        if project_cuda_required() {
-                            return Err(cuda_required_error(&reason));
-                        }
                         eprintln!("> Projection backend: CPU (CUDA init failed: {reason})");
                         None
                     }
@@ -1673,35 +1667,6 @@ fn projection_block_budget_bytes(projected_samples: usize, components: usize) ->
     budget.clamp(lower, upper)
 }
 
-fn project_cuda_disabled() -> bool {
-    std::env::var("GNOMON_PROJECT_DISABLE_CUDA")
-        .ok()
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
-}
-
-/// When `GNOMON_PROJECT_REQUIRE_CUDA` is set, a CPU fallback for the projection is
-/// a hard error instead of a silent (and potentially hours-long) CPU grind. Lets a
-/// caller that *expects* the GPU (e.g. a large biobank projection on a GPU node)
-/// fail fast with the reason rather than discovering CPU mode after the fact.
-fn project_cuda_required() -> bool {
-    std::env::var("GNOMON_PROJECT_REQUIRE_CUDA")
-        .ok()
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false)
-}
-
-/// Build the error returned when CUDA is required but unavailable.
-fn cuda_required_error(reason: &str) -> HwePcaError {
-    HwePcaError::Source(
-        format!("GNOMON_PROJECT_REQUIRE_CUDA is set but GPU projection is unavailable: {reason}").into(),
-    )
-}
 
 fn projection_gpu_rejection_reason(total_work: usize) -> Option<String> {
     let min_work = project_cuda_min_work();
@@ -1709,9 +1674,6 @@ fn projection_gpu_rejection_reason(total_work: usize) -> Option<String> {
         return Some(format!(
             "workload below CUDA threshold ({total_work} < {min_work})"
         ));
-    }
-    if project_cuda_disabled() {
-        return Some("GNOMON_PROJECT_DISABLE_CUDA is set".to_string());
     }
     if !cuda_driver_likely_available() {
         return Some("no CUDA driver/device detected".to_string());
@@ -1845,9 +1807,6 @@ where
         .saturating_mul(components);
     let mut packed_cuda = match projection_gpu_rejection_reason(total_work) {
         Some(reason) => {
-            if project_cuda_required() {
-                return Err(cuda_required_error(&reason));
-            }
             eprintln!("> Projection backend: CPU ({reason})");
             None
         }
@@ -1859,9 +1818,6 @@ where
                 Some(runtime)
             }
             Err(reason) => {
-                if project_cuda_required() {
-                    return Err(cuda_required_error(&reason));
-                }
                 eprintln!("> Projection backend: CPU (CUDA init failed: {reason})");
                 None
             }
@@ -2517,15 +2473,12 @@ fn packed_projection_variant_block(
         .saturating_add(packed_bytes_per_variant(n_samples))
         .saturating_add(bytes_per_variant_host);
     // Size the GPU staging block to the device's free memory so it never OOMs and
-    // still uses big blocks on big GPUs: an explicit GNOMON_PROJECT_CUDA_BLOCK_BYTES
-    // wins; otherwise take 60% of free VRAM (leaves headroom for loadings/scores
-    // buffers + driver/context overhead); otherwise a conservative 4 GiB fallback.
+    // still uses big blocks on big GPUs: take 60% of free VRAM (leaves headroom for
+    // loadings/scores buffers + driver/context overhead); fall back to a
+    // conservative 4 GiB if free VRAM can't be queried.
     // ~9 GiB on a 16 GiB T4, ~24 GiB on a 40 GiB A100 — adaptive and safe.
-    let staging_cap = std::env::var("GNOMON_PROJECT_CUDA_BLOCK_BYTES")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|&value| value > 0)
-        .or_else(|| gpu_free_bytes().map(|free| free.saturating_mul(3) / 5))
+    let staging_cap = gpu_free_bytes()
+        .map(|free| free.saturating_mul(3) / 5)
         .unwrap_or(4 * 1024 * 1024 * 1024usize);
     let mut block = (staging_cap / bytes_per_variant_gpu.max(1)).max(16);
     if n_samples < 50_000 {

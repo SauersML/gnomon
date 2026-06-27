@@ -98,14 +98,8 @@ fn detect_total_memory_bytes() -> Option<u64> {
 }
 
 fn gram_matrix_budget_bytes() -> usize {
-    match std::env::var("GNOMON_GRAM_BUDGET_BYTES") {
-        Ok(value) => match value.parse::<u64>() {
-            Ok(parsed) if parsed == 0 => usize::MAX,
-            Ok(parsed) => (parsed.min(usize::MAX as u64)) as usize,
-            Err(_) => default_gram_budget_usize(),
-        },
-        Err(_) => default_gram_budget_usize(),
-    }
+    // Budget is auto-sized from detected system memory; see default_gram_budget_usize.
+    default_gram_budget_usize()
 }
 
 fn gram_matrix_size_bytes(n: usize) -> Option<usize> {

@@ -228,7 +228,6 @@ pub struct PreparationResult {
 impl PreparationResult {
     /// The constructor is crate-private, enforcing the "Airlock" pattern.
     /// Only the `prepare` module can construct this "proof token".
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         sparse_weights: Vec<f32>,
         sparse_missing_corrections: Vec<f32>,

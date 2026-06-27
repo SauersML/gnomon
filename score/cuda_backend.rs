@@ -1646,12 +1646,7 @@ fn run_cuda_pipeline(
                 let _ = fs::remove_file(&spool_file_path);
                 return Err(e);
             }
-            let keep_spool = env::var("GNOMON_KEEP_SPOOL")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
-            if !keep_spool {
-                let _ = fs::remove_file(&spool_file_path);
-            }
+            let _ = fs::remove_file(&spool_file_path);
         } else {
             let resolver = match &input {
                 CudaInput::Single { bed_source, .. } => {
@@ -2204,7 +2199,6 @@ fn process_dense_stream_cuda(
     Ok((final_scores, final_counts))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_pending_compute_cuda(
     runtime: &mut CudaRuntime,
     dims: CudaDims,
@@ -2498,7 +2492,6 @@ fn maybe_save_cuda_checkpoint(
 /// `split_fp16_weights`). Dosages {0,1,2} are exact in fp16, so the only
 /// approximation is the weight split, which the `calibrate_fp16` self-test
 /// confirms is fp32-equivalent on the actual device before this path is ever used.
-#[allow(clippy::too_many_arguments)]
 fn run_score_gemm_split16(
     blas: &CudaBlas,
     stream: &Arc<CudaStream>,
@@ -2579,10 +2572,10 @@ fn calibrate_fp16(
             .map(|i| ((i as i64 * 7 % 101) - 50) as f32 / 13.0)
             .collect();
         let d_dosage = stream
-            .memcpy_stod(&host_dosage)
+            .clone_htod(&host_dosage)
             .map_err(map_driver_err("calibrate: dosage htod"))?;
         let d_weights = stream
-            .memcpy_stod(&host_weights)
+            .clone_htod(&host_weights)
             .map_err(map_driver_err("calibrate: weights htod"))?;
         let mut d_ref = stream
             .alloc_zeros::<f32>(elems)
@@ -2617,10 +2610,10 @@ fn calibrate_fp16(
             .synchronize()
             .map_err(map_driver_err("calibrate: sync"))?;
         let ref_host = stream
-            .memcpy_dtov(&d_ref)
+            .clone_dtoh(&d_ref)
             .map_err(map_driver_err("calibrate: ref dtoh"))?;
         let test_host = stream
-            .memcpy_dtov(&d_test)
+            .clone_dtoh(&d_test)
             .map_err(map_driver_err("calibrate: test dtoh"))?;
         let mut max_rel = 0.0f32;
         for (r, t) in ref_host.iter().zip(test_host.iter()) {

@@ -15,7 +15,6 @@ use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use memmap2::{Mmap, MmapOptions};
 use num_cpus;
 use rayon::prelude::*;
-use std::env;
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::{BufWriter, IsTerminal, Write};
@@ -580,21 +579,11 @@ fn run_single_file_pipeline(
                 let _ = fs::remove_file(&spool_file_path);
                 return Err(e);
             }
-            let keep_spool = env::var("GNOMON_KEEP_SPOOL")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
-            if !keep_spool {
-                if let Err(e) = fs::remove_file(&spool_file_path) {
-                    eprintln!(
-                        "> Warning: Failed to delete complex spool {}: {}",
-                        spool_file_path.display(),
-                        e
-                    );
-                }
-            } else {
+            if let Err(e) = fs::remove_file(&spool_file_path) {
                 eprintln!(
-                    "> GNOMON_KEEP_SPOOL set; preserving complex spool at {}",
-                    spool_file_path.display()
+                    "> Warning: Failed to delete complex spool {}: {}",
+                    spool_file_path.display(),
+                    e
                 );
             }
         } else {
@@ -934,21 +923,11 @@ fn run_multi_file_pipeline(
                 let _ = fs::remove_file(&spool_file_path);
                 return Err(e);
             }
-            let keep_spool = env::var("GNOMON_KEEP_SPOOL")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
-            if !keep_spool {
-                if let Err(e) = fs::remove_file(&spool_file_path) {
-                    eprintln!(
-                        "> Warning: Failed to delete complex spool {}: {}",
-                        spool_file_path.display(),
-                        e
-                    );
-                }
-            } else {
+            if let Err(e) = fs::remove_file(&spool_file_path) {
                 eprintln!(
-                    "> GNOMON_KEEP_SPOOL set; preserving complex spool at {}",
-                    spool_file_path.display()
+                    "> Warning: Failed to delete complex spool {}: {}",
+                    spool_file_path.display(),
+                    e
                 );
             }
         } else {

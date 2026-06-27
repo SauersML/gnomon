@@ -124,14 +124,7 @@ fn install_stage_panic_hook() {
     }));
 }
 
-#[allow(clippy::collapsible_if)]
 fn detect_total_memory_bytes() -> Option<u64> {
-    if let Ok(forced) = std::env::var("GNOMON_FORCE_TOTAL_MEMORY_BYTES") {
-        if let Ok(parsed) = forced.trim().parse::<u64>() {
-            return Some(parsed);
-        }
-    }
-
     #[cfg(target_os = "linux")]
     {
         if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {

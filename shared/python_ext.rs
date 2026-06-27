@@ -55,7 +55,6 @@ fn parse_inferred_sex(value: Option<&str>) -> PyResult<Option<score_main::Inferr
     panel = None,
     inferred_sex = None,
 ))]
-#[allow(clippy::too_many_arguments)]
 fn score(
     py: Python<'_>,
     score: String,
