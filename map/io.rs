@@ -529,6 +529,9 @@ struct ProjectionMatrixMetadata {
     kind: &'static str,
     layout: &'static str,
     dtype: &'static str,
+    // Numeric mirror of the binary header's element_kind tag (byte offset 28), so
+    // the JSON sidecar and the authoritative binary header always agree.
+    element_kind: u32,
     endianness: &'static str,
     rows: usize,
     cols: usize,
@@ -584,6 +587,13 @@ struct ProjectionRowIdsMetadata {
 const PROJECTION_MATRIX_MAGIC: &[u8; 8] = b"GNPRJ001";
 const PROJECTION_MATRIX_VERSION: u32 = 3;
 const PROJECTION_MATRIX_HEADER_LEN: usize = 32;
+// Element-type tag stored in the header's trailing u32 (byte offset 28), which
+// earlier writers left as a reserved zero. Making the element type part of the
+// AUTHORITATIVE binary header -- not only the JSON sidecar -- means a reader can
+// never misinterpret the matrix bytes (e.g. decode f64 as f32) even if the
+// sidecar is absent, stale, or wrong. 0 = unspecified (legacy files); 1 = f64_le;
+// 2 is reserved for a future f32_le. gnomon always writes f64, hence F64_LE here.
+const PROJECTION_ELEMENT_KIND_F64_LE: u32 = 1;
 const PROJECTION_ROW_IDS_MAGIC: &[u8; 8] = b"GNPSID01";
 const PROJECTION_ROW_IDS_VERSION: u32 = 1;
 const PROJECTION_ROW_IDS_HEADER_LEN: usize = 32;
@@ -1048,7 +1058,8 @@ fn write_projection_header<W: Write>(
     writer.write_all(&PROJECTION_MATRIX_VERSION.to_le_bytes())?;
     writer.write_all(&(rows as u64).to_le_bytes())?;
     writer.write_all(&(cols as u64).to_le_bytes())?;
-    writer.write_all(&0u32.to_le_bytes())
+    // Self-describing element type (was a reserved zero in earlier writers).
+    writer.write_all(&PROJECTION_ELEMENT_KIND_F64_LE.to_le_bytes())
 }
 
 fn write_projection_header_bytes(
@@ -1080,6 +1091,7 @@ fn write_projection_metadata(
         kind,
         layout: "column_major",
         dtype: "f64_le",
+        element_kind: PROJECTION_ELEMENT_KIND_F64_LE,
         endianness: "little",
         rows,
         cols,
@@ -1185,12 +1197,12 @@ fn build_projection_binary_schema(
                     description: "Number of matrix columns; this equals the number of projected components.".to_string(),
                 },
                 ProjectionFieldMetadata {
-                    name: "reserved",
+                    name: "element_kind",
                     byte_offset: 28,
                     byte_length: 4,
                     encoding: "u32_le",
-                    value: "0".to_string(),
-                    description: "Reserved for future use; current writers always store zero.".to_string(),
+                    value: PROJECTION_ELEMENT_KIND_F64_LE.to_string(),
+                    description: "Self-describing matrix element type so readers never need the sidecar to decode the bytes correctly. 0 = unspecified (legacy); 1 = little-endian float64; 2 reserved for little-endian float32. gnomon always writes 1.".to_string(),
                 },
             ],
         },
@@ -5796,6 +5808,12 @@ mod tests {
             .collect();
         assert_eq!(values, vec![1.25, 2.5, 0.0, 0.0, -3.0, 0.0]);
 
+        // The header self-describes the element type at byte offset 28 so a reader can
+        // decode the matrix correctly without consulting the JSON sidecar at all.
+        let element_kind =
+            u32::from_le_bytes(bytes[28..32].try_into().expect("element_kind bytes"));
+        assert_eq!(element_kind, PROJECTION_ELEMENT_KIND_F64_LE);
+
         let row_id_section = &bytes[payload_end..];
         assert_eq!(&row_id_section[..8], PROJECTION_ROW_IDS_MAGIC);
         let count = u64::from_le_bytes(
@@ -5826,6 +5844,12 @@ mod tests {
         assert_eq!(metadata["kind"], "scores");
         assert_eq!(metadata["rows"], 2);
         assert_eq!(metadata["cols"], 3);
+        assert_eq!(metadata["dtype"], "f64_le");
+        assert_eq!(metadata["element_kind"], PROJECTION_ELEMENT_KIND_F64_LE);
+        assert_eq!(
+            metadata["binary_schema"]["matrix_header"]["fields"][4]["name"],
+            "element_kind"
+        );
         assert_eq!(metadata["endianness"], "little");
         assert_eq!(metadata["row_ids_embedded"], true);
         assert_eq!(metadata["row_id_field"], "IID");
