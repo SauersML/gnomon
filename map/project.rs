@@ -558,10 +558,41 @@ impl ProjectionCudaPacked {
         self.stream
             .memcpy_dtoh(&d_scores.slice(0..len), &mut self.h_scores[..len])
             .map_err(|e| format!("Failed to copy projection scores from GPU: {e:?}"))?;
-        for i in 0..len {
-            out_f64[i] += self.h_scores[i] as f64;
-        }
+        // The GEMM writes C column-major (ldc == n_samples), so the device buffer
+        // is laid out as [k * n_samples + sample]. The rest of the pipeline stores
+        // scores row-major ([sample * components + k]); reconcile the two here.
+        // Copying linearly would transpose-scramble every sample's components.
+        accumulate_col_major_scores_into_row_major(
+            &mut out_f64[..len],
+            &self.h_scores[..len],
+            n_samples,
+            components,
+        );
         Ok(())
+    }
+}
+
+/// Accumulates a cuBLAS **column-major** `n_samples × components` score block
+/// (element `(sample, k)` at `k * n_samples + sample`) into a **row-major** host
+/// buffer (`sample * components + k`).
+///
+/// The packed CUDA projection GEMM produces column-major output, while every
+/// other layer of the projection pipeline (CPU accumulation, the final copy into
+/// the score matrix, the serialized scores) is row-major. Without this transpose
+/// on copy-back, each sample would be assigned components drawn from unrelated
+/// offsets in the flattened column-major matrix — finite, large, structured, and
+/// biologically meaningless scores.
+fn accumulate_col_major_scores_into_row_major(
+    dst_row_major: &mut [f64],
+    src_col_major: &[f32],
+    n_samples: usize,
+    components: usize,
+) {
+    for sample in 0..n_samples {
+        let row = sample * components;
+        for k in 0..components {
+            dst_row_major[row + k] += src_col_major[k * n_samples + sample] as f64;
+        }
     }
 }
 
@@ -3063,6 +3094,38 @@ fn missing_scan_chunk_samples() -> usize {
 mod tests {
     use super::*;
     use std::convert::Infallible;
+
+    #[test]
+    fn col_major_gpu_scores_transpose_into_row_major() {
+        // GPU column-major scores for 3 samples × 2 components:
+        //   sample0 -> [10, 40], sample1 -> [20, 50], sample2 -> [30, 60]
+        // stored column-major as [PC1 column][PC2 column].
+        let n_samples = 3;
+        let components = 2;
+        let src_col_major = vec![
+            10.0f32, 20.0, 30.0, // PC1 for samples 0,1,2
+            40.0, 50.0, 60.0, // PC2 for samples 0,1,2
+        ];
+        let mut dst = vec![0.0f64; n_samples * components];
+        accumulate_col_major_scores_into_row_major(
+            &mut dst,
+            &src_col_major,
+            n_samples,
+            components,
+        );
+        // Row-major: sample*components + k.
+        assert_eq!(dst, vec![10.0, 40.0, 20.0, 50.0, 30.0, 60.0]);
+
+        // Accumulation must add, not overwrite (GPU blocks accumulate via beta=1).
+        accumulate_col_major_scores_into_row_major(
+            &mut dst,
+            &src_col_major,
+            n_samples,
+            components,
+        );
+        assert_eq!(dst, vec![20.0, 80.0, 40.0, 100.0, 60.0, 120.0]);
+    }
+
     use std::sync::Arc;
 
     use super::super::fit::{FitOptions, LdConfig, LdWindow};
