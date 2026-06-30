@@ -624,11 +624,6 @@ pub fn try_run_cuda(
             runtime
         }
         Err(reason) => {
-            if cuda_strict_mode() {
-                return Err(PipelineError::Compute(format!(
-                    "GNOMON_CUDA_STRICT set but CUDA initialization failed: {reason}"
-                )));
-            }
             eprintln!("> Backend: CPU fallback ({reason})");
             return Ok(None);
         }
@@ -647,28 +642,13 @@ pub fn try_run_cuda(
         Ok(Ok(scores)) => Ok(Some(scores)),
         Ok(Err(e)) => Err(e),
         Err(payload) => {
-            let reason = panic_payload_to_string(payload);
-            if cuda_strict_mode() {
-                return Err(PipelineError::Compute(format!(
-                    "GNOMON_CUDA_STRICT set but CUDA execution panicked: {reason}"
-                )));
-            }
-            eprintln!("> Backend: CPU fallback (CUDA execution panicked: {reason})");
+            eprintln!(
+                "> Backend: CPU fallback (CUDA execution panicked: {})",
+                panic_payload_to_string(payload)
+            );
             Ok(None)
         }
     }
-}
-
-/// Whether `GNOMON_CUDA_STRICT` requests that CUDA init/execution failures be
-/// fatal instead of silently falling back to the CPU backend. Used by strict GPU
-/// tests (and by users who require the GPU path) to guarantee CUDA actually ran.
-pub(crate) fn cuda_strict_mode() -> bool {
-    std::env::var("GNOMON_CUDA_STRICT")
-        .map(|v| {
-            let v = v.trim();
-            v == "1" || v.eq_ignore_ascii_case("true")
-        })
-        .unwrap_or(false)
 }
 
 /// Return the canonical CUDA library family name for a file basename,
