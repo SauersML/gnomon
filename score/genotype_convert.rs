@@ -349,12 +349,48 @@ fn get_cache_dir(input_path: &Path) -> PathBuf {
     parent.join(format!("{}.gnomon_cache", stem))
 }
 
-/// Checks if the cache is valid (source file not modified since conversion).
-fn is_cache_valid(source_path: &Path, cache_dir: &Path) -> bool {
+/// File recording the conversion parameters a cache was produced under.
+const CACHE_PARAMS_FILE: &str = "conversion_params.txt";
+
+/// Fingerprint of the conversion parameters that change the cached output.
+///
+/// The mtime check alone is unsafe: re-running the same input with a different
+/// genome build, strand-harmonization panel, or reference produces different
+/// genotypes, but the source file is untouched, so a stale cache would be
+/// silently reused. Including these in a fingerprint forces re-conversion when
+/// any of them changes. `build` is resolved through the same `GRCh38` default the
+/// conversion uses, so `None` and an explicit `GRCh38` share a cache.
+fn cache_params_fingerprint(
+    build: Option<&str>,
+    panel: Option<&Path>,
+    reference: Option<&Path>,
+) -> String {
+    let assembly = build.unwrap_or("GRCh38");
+    let panel = panel.map(|p| p.display().to_string()).unwrap_or_default();
+    let reference = reference.map(|p| p.display().to_string()).unwrap_or_default();
+    format!("v1\nbuild={assembly}\npanel={panel}\nreference={reference}\n")
+}
+
+/// Records the parameter fingerprint alongside a freshly written cache.
+fn write_cache_params(cache_dir: &Path, fingerprint: &str) {
+    let _ = fs::write(cache_dir.join(CACHE_PARAMS_FILE), fingerprint);
+}
+
+/// Checks if the cache is valid: the converted output exists, the source has not
+/// been modified since, and it was produced under the same conversion parameters.
+fn is_cache_valid(source_path: &Path, cache_dir: &Path, expected_fingerprint: &str) -> bool {
     let cache_bed = cache_dir.join("genotypes.bed");
 
     if !cache_bed.exists() {
         return false;
+    }
+
+    // Reject caches produced under different parameters (build/panel/reference).
+    // A missing params file means a pre-fingerprint cache of unknown provenance,
+    // which we conservatively treat as invalid.
+    match fs::read_to_string(cache_dir.join(CACHE_PARAMS_FILE)) {
+        Ok(found) if found == expected_fingerprint => {}
+        _ => return false,
     }
 
     // Compare modification times
@@ -450,8 +486,9 @@ pub fn ensure_plink_format_with_options(
             // Check cache validity
             let cache_dir = get_cache_dir(input_path);
             let cache_prefix = cache_dir.join("genotypes");
+            let cache_fingerprint = cache_params_fingerprint(build, panel, reference);
 
-            if is_cache_valid(input_path, &cache_dir) {
+            if is_cache_valid(input_path, &cache_dir, &cache_fingerprint) {
                 eprintln!(
                     "> Using cached PLINK conversion from '{}'",
                     cache_dir.display()
@@ -528,6 +565,7 @@ pub fn ensure_plink_format_with_options(
 
             // Run conversion
             convert_dtc_file(config)?;
+            write_cache_params(&cache_dir, &cache_fingerprint);
 
             eprintln!(
                 "> Conversion complete. Cache stored at '{}'",
@@ -540,8 +578,9 @@ pub fn ensure_plink_format_with_options(
             // Check cache validity
             let cache_dir = get_cache_dir(input_path);
             let cache_prefix = cache_dir.join("genotypes");
+            let cache_fingerprint = cache_params_fingerprint(build, panel, reference);
 
-            if is_cache_valid(input_path, &cache_dir) {
+            if is_cache_valid(input_path, &cache_dir, &cache_fingerprint) {
                 eprintln!(
                     "> Using cached PLINK conversion from '{}'",
                     cache_dir.display()
@@ -598,6 +637,7 @@ pub fn ensure_plink_format_with_options(
 
             // Run conversion
             convert_dtc_file(config)?;
+            write_cache_params(&cache_dir, &cache_fingerprint);
 
             eprintln!(
                 "> Conversion complete. Cache stored at '{}'",

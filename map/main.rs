@@ -5,7 +5,8 @@ use super::fit::{
 use super::io::{
     DatasetOutputError, GenotypeDataset, GenotypeIoError, OrderedSelectionPlan,
     ProjectionOutputPaths, SelectionPlan, create_projection_matrix_sink,
-    create_projection_matrix_sink_at, load_hwe_model, load_model_from_path, save_fit_summary,
+    create_projection_matrix_sink_at, load_hwe_model, load_projection_model_from_path,
+    save_fit_summary,
     save_hwe_model, save_projection_output_manifest, save_sample_manifest,
 };
 use super::prefit::{self, BuiltinModelError};
@@ -608,6 +609,38 @@ fn run_project_inner(
                 }
             );
 
+            // Break the overlap down by how each match was made. A run dominated
+            // by allele-swap or position-only matches hints at strand or
+            // build/coordinate mismatches even when the raw overlap count looks
+            // healthy.
+            let (mut exact, mut swap, mut wildcard) = (0usize, 0usize, 0usize);
+            for kind in &selection.match_kinds {
+                match kind {
+                    super::variant_filter::MatchKind::Exact => exact += 1,
+                    super::variant_filter::MatchKind::Swap => swap += 1,
+                    super::variant_filter::MatchKind::Wildcard => wildcard += 1,
+                }
+            }
+            println!(
+                "  Match kinds: {exact} exact, {swap} allele-swap, {wildcard} position-only"
+            );
+
+            // Warn (never fail) on a very low overlap: it can renormalize into an
+            // unstable, non-ancestry-like projection. Likely causes are a genome
+            // build / allele-strand mismatch or a stale PLINK/projection cache.
+            const LOW_OVERLAP_WARN_FRACTION: f64 = 0.10;
+            let overlap_fraction = matched as f64 / model.n_variants().max(1) as f64;
+            if overlap_fraction < LOW_OVERLAP_WARN_FRACTION {
+                eprintln!(
+                    "> WARNING: only {:.2}% of model variants overlap the projection \
+                     dataset ({matched} of {}). Low overlap can produce unstable, \
+                     non-ancestry-like projections — verify the genome build, allele \
+                     strand, and that no stale PLINK/projection cache is being reused.",
+                    100.0 * overlap_fraction,
+                    model.n_variants(),
+                );
+            }
+
             let fast_path = missing == 0
                 && matched == model.n_variants()
                 && dataset.variant_count_hint() == Some(model.n_variants())
@@ -704,6 +737,35 @@ fn run_project_inner(
         projection_start.elapsed().as_secs_f64()
     );
 
+    // Compact per-PC score distribution. Computed for free from the scores
+    // already in the sink (no extra allocation). An inflated standard deviation
+    // is the clearest signal of a degenerate projection (e.g. solved on too few
+    // shared variants), so surfacing it by default makes such runs obvious.
+    {
+        let score_matrix = score_sink.as_mat_mut()?;
+        let n = score_matrix.nrows();
+        if n > 0 {
+            println!("Per-PC projection score distribution (n={n}):");
+            for k in 0..score_matrix.ncols() {
+                let (mut sum, mut sum_sq) = (0.0f64, 0.0f64);
+                let (mut min, mut max) = (f64::INFINITY, f64::NEG_INFINITY);
+                for i in 0..n {
+                    let v = score_matrix[(i, k)];
+                    sum += v;
+                    sum_sq += v * v;
+                    min = min.min(v);
+                    max = max.max(v);
+                }
+                let mean = sum / n as f64;
+                let std = (sum_sq / n as f64 - mean * mean).max(0.0).sqrt();
+                println!(
+                    "  PC{:<2} mean={mean:+.4} std={std:.4} min={min:+.4} max={max:+.4}",
+                    k + 1
+                );
+            }
+        }
+    }
+
     let finalize_start = Instant::now();
     let scores = score_sink.path().to_path_buf();
     let scores_metadata = score_sink.finalize()?;
@@ -784,8 +846,18 @@ pub fn load_builtin_model(name: &str) -> Result<HwePcaModel, MapDriverError> {
     // Download if needed (prints its own progress messages)
     let model_path = prefit::ensure_model(model_info)?;
 
-    // Load the model
-    load_model_from_path(&model_path).map_err(MapDriverError::from)
+    // Load the model for projection (prefers the compact projection cache).
+    let mut model = load_projection_model_from_path(&model_path).map_err(MapDriverError::from)?;
+
+    // The registry knows each built-in model's genome build, but older model
+    // artifacts may not carry it inline. Inject it so the build is reported and
+    // available for downstream build-compatibility checks rather than silently
+    // defaulting to "unknown".
+    if model.genome_build().is_none() {
+        model.set_genome_build(Some(model_info.build.to_string()));
+    }
+
+    Ok(model)
 }
 
 /// Resolve a built-in projection model by name and return the variant keys it

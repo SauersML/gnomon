@@ -33,9 +33,17 @@ impl VariantKey {
         Self {
             chromosome,
             position,
-            alleles: Some((ref_allele.to_string(), alt_allele.to_string())),
+            alleles: Some((normalize_allele(ref_allele), normalize_allele(alt_allele))),
         }
     }
+}
+
+/// Normalizes an allele for hashing/comparison: trims surrounding whitespace and
+/// upper-cases. Chromosomes are already normalized to upper-case, so without this
+/// a model key carrying `A/G` and a dataset record carrying `a/g` would compare
+/// unequal and the variant would silently drop out of the projection overlap.
+fn normalize_allele(allele: &str) -> String {
+    allele.trim().to_ascii_uppercase()
 }
 
 // ... existing code ...
