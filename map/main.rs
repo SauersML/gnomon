@@ -5,7 +5,8 @@ use super::fit::{
 use super::io::{
     DatasetOutputError, GenotypeDataset, GenotypeIoError, OrderedSelectionPlan,
     ProjectionOutputPaths, SelectionPlan, create_projection_matrix_sink,
-    create_projection_matrix_sink_at, load_hwe_model, load_model_from_path, save_fit_summary,
+    create_projection_matrix_sink_at, load_hwe_model, load_projection_model_from_path,
+    save_fit_summary,
     save_hwe_model, save_projection_output_manifest, save_sample_manifest,
 };
 use super::prefit::{self, BuiltinModelError};
@@ -784,8 +785,8 @@ pub fn load_builtin_model(name: &str) -> Result<HwePcaModel, MapDriverError> {
     // Download if needed (prints its own progress messages)
     let model_path = prefit::ensure_model(model_info)?;
 
-    // Load the model
-    load_model_from_path(&model_path).map_err(MapDriverError::from)
+    // Load the model for projection (prefers the compact projection cache).
+    load_projection_model_from_path(&model_path).map_err(MapDriverError::from)
 }
 
 /// Resolve a built-in projection model by name and return the variant keys it

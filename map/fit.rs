@@ -2255,6 +2255,11 @@ pub struct HwePcaModel {
     n_variants: usize,
     scaler: HweScaler,
     eigenvalues: Vec<f64>,
+    /// Total variance of the standardized genotype matrix, i.e. the trace of the
+    /// covariance (the sum of the *entire* eigenvalue spectrum, not just the
+    /// retained components). Stored so `explained_variance_ratio` can normalize
+    /// against the full variance rather than only the kept PCs.
+    total_variance: f64,
     singular_values: Vec<f64>,
     sample_basis: Mat<f64>,
     sample_scores: Mat<f64>,
@@ -2395,12 +2400,22 @@ impl HwePcaModel {
                         let eigenvectors_mat = eig.U();
                         let n_eig = eigenvalues_diag.dim();
 
+                        // Only retain genuinely positive eigenvalues. Rank-deficient
+                        // data yields zero or tiny-negative numerical artifacts that
+                        // are not real principal components; the matrix-free and
+                        // dense-operator paths apply the same `EIGENVALUE_EPSILON`
+                        // filter, so the normal dense path must agree.
+                        let positive = (0..n_eig)
+                            .filter(|&i| eigenvalues_diag[i] > EIGENVALUE_EPSILON)
+                            .count();
+                        let keep = positive.min(target_components);
+
                         // Create index-value pairs for sorting (descending by eigenvalue)
                         let mut indexed_values: Vec<(usize, f64)> =
                             (0..n_eig).map(|i| (i, eigenvalues_diag[i])).collect();
 
-                        // Select top k components by eigenvalue magnitude
-                        let kept = select_top_k_desc(&mut indexed_values, target_components);
+                        // Select top `keep` positive components by eigenvalue magnitude
+                        let kept = select_top_k_desc(&mut indexed_values, keep);
 
                         // Extract selected values and vectors
                         let selected_values: Vec<f64> =
@@ -2502,7 +2517,7 @@ impl HwePcaModel {
         let (mut singular_values, mut sample_scores) =
             build_sample_scores(n_samples, &decomposition);
 
-        let mut loadings = compute_variant_loadings(
+        let (mut loadings, standardized_frobenius_sq) = compute_variant_loadings(
             source,
             &scaler,
             variant_count,
@@ -2513,6 +2528,13 @@ impl HwePcaModel {
             progress,
             par,
         )?;
+
+        // Total variance = trace(covariance) = ‖X‖²_F / (n−1), where X is the
+        // standardized (optionally LD-weighted) genotype matrix. The loadings
+        // pass standardizes every block exactly once in both the dense and
+        // matrix-free paths, so accumulating its Frobenius norm there yields the
+        // full-spectrum variance even when only the top components are solved.
+        let total_variance = standardized_frobenius_sq / (n_samples - 1) as f64;
 
         let component_weighted_norms_sq = renormalize_variant_loadings(
             loadings.as_mut(),
@@ -2530,6 +2552,7 @@ impl HwePcaModel {
             n_variants: variant_count,
             scaler,
             eigenvalues: decomposition.values,
+            total_variance,
             singular_values,
             sample_basis: decomposition.vectors,
             sample_scores,
@@ -2585,8 +2608,25 @@ impl HwePcaModel {
             .collect()
     }
 
+    /// Total variance of the data, i.e. the trace of the covariance (sum of the
+    /// full eigenvalue spectrum). Returns `0.0` for projection-only model stubs
+    /// loaded from the binary cache, which do not carry fit statistics.
+    pub fn total_variance(&self) -> f64 {
+        self.total_variance
+    }
+
+    /// Fraction of the **total** data variance captured by each retained PC.
+    ///
+    /// Normalizes against [`HwePcaModel::total_variance`] (the full spectrum), so
+    /// the ratios of a truncated fit sum to less than 1. Falls back to the sum of
+    /// the retained eigenvalues only when the total variance is unavailable
+    /// (legacy models predating the stored field, or projection-only stubs).
     pub fn explained_variance_ratio(&self) -> Vec<f64> {
-        let total: f64 = self.eigenvalues.iter().copied().sum();
+        let total = if self.total_variance > 0.0 {
+            self.total_variance
+        } else {
+            self.eigenvalues.iter().copied().sum()
+        };
         if total > 0.0 {
             self.eigenvalues
                 .iter()
@@ -2691,6 +2731,7 @@ impl HwePcaModel {
             n_variants,
             scaler,
             eigenvalues: vec![0.0; components],
+            total_variance: 0.0,
             singular_values: vec![0.0; components],
             sample_basis: Mat::zeros(0, components),
             sample_scores: Mat::zeros(0, components),
@@ -4022,6 +4063,23 @@ where
         .into_scaler()
         .expect("finalized statistics must produce a scaler");
 
+    // Convert the accumulated Gram matrix (X·Xᵀ) into the sample covariance
+    // (X·Xᵀ / (n−1)). Without this, downstream eigenvalues would be inflated by
+    // a factor of (n−1) and disagree with the matrix-free and dense-operator
+    // paths, which scale via `operator.scale`.
+    let covariance_scale = if n_samples > 1 {
+        1.0 / ((n_samples - 1) as f64)
+    } else {
+        1.0
+    };
+    if covariance_scale != 1.0 {
+        for col in 0..n_samples {
+            for row in 0..n_samples {
+                covariance[(row, col)] *= covariance_scale;
+            }
+        }
+    }
+
     // Mark Gram matrix stage as complete (it was done during the combined pass)
     progress.on_stage_start(FitProgressStage::GramMatrix, 0);
     progress.on_stage_finish(FitProgressStage::GramMatrix);
@@ -4969,7 +5027,7 @@ fn compute_variant_loadings<S, P>(
     ld_weights: Option<&[f64]>,
     progress: &Arc<P>,
     par: Par,
-) -> Result<Mat<f64>, HwePcaError>
+) -> Result<(Mat<f64>, f64), HwePcaError>
 where
     S: VariantBlockSource + Send,
     S::Error: Error + Send + Sync + 'static,
@@ -5084,6 +5142,9 @@ where
         let mut processed = 0usize;
         let buffer_ptrs_compute = buffer_ptrs;
         let mut loadings = loadings;
+        // Accumulates ‖X‖²_F over the standardized (LD-weighted) blocks, which
+        // equals trace(X·Xᵀ) and hence (n−1)·total_variance.
+        let mut standardized_frobenius_sq = 0.0f64;
         while let Ok(message) = filled_rx.recv() {
             match message {
                 PrefetchMessage::Data { id, filled, start } => {
@@ -5117,6 +5178,18 @@ where
                     }
 
                     let block_ref = block.as_ref();
+
+                    // Fold this block's squared Frobenius norm into the running
+                    // total variance before it is consumed by the loadings GEMM.
+                    for column in block_ref.col_iter() {
+                        let contiguous = column
+                            .try_as_col_major()
+                            .expect("standardized block column must be contiguous");
+                        for &value in contiguous.as_slice() {
+                            standardized_frobenius_sq += value * value;
+                        }
+                    }
+
                     let mut chunk = MatMut::from_column_major_slice_mut(
                         &mut chunk_storage[..filled * n_components],
                         filled,
@@ -5170,7 +5243,7 @@ where
 
         progress.on_stage_finish(FitProgressStage::Loadings);
 
-        Ok(loadings)
+        Ok((loadings, standardized_frobenius_sq))
     })
 }
 
@@ -5216,11 +5289,12 @@ impl Serialize for HwePcaModel {
     where
         S: Serializer,
     {
-        let mut state = serializer.serialize_struct("HwePcaModel", 12)?;
+        let mut state = serializer.serialize_struct("HwePcaModel", 13)?;
         state.serialize_field("n_samples", &self.n_samples)?;
         state.serialize_field("n_variants", &self.n_variants)?;
         state.serialize_field("scaler", &self.scaler)?;
         state.serialize_field("eigenvalues", &self.eigenvalues)?;
+        state.serialize_field("total_variance", &self.total_variance)?;
         state.serialize_field("singular_values", &self.singular_values)?;
         state.serialize_field(
             "sample_basis",
@@ -5253,6 +5327,8 @@ impl<'de> Deserialize<'de> for HwePcaModel {
             n_variants: usize,
             scaler: HweScaler,
             eigenvalues: Vec<f64>,
+            #[serde(default)]
+            total_variance: f64,
             singular_values: Vec<f64>,
             sample_basis: MatrixData,
             sample_scores: MatrixData,
@@ -5293,6 +5369,7 @@ impl<'de> Deserialize<'de> for HwePcaModel {
             n_variants: raw.n_variants,
             scaler: raw.scaler,
             eigenvalues: raw.eigenvalues,
+            total_variance: raw.total_variance,
             singular_values: raw.singular_values,
             sample_basis,
             sample_scores,

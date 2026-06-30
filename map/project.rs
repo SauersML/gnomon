@@ -2170,11 +2170,17 @@ where
                 }
                 Err(_) => {
                     if gpu_scores_active && !gpu_scores_flushed {
-                        let _ = runtime.copy_scores_to_host(
-                            n_samples,
-                            components,
-                            &mut scores_row_major,
-                        );
+                        // We must recover the scores already accumulated on the
+                        // device before the CPU resumes adding to them; a failed
+                        // copy would silently drop every prior GPU block, so it is
+                        // a hard error rather than a salvageable fallback.
+                        runtime
+                            .copy_scores_to_host(n_samples, components, &mut scores_row_major)
+                            .map_err(|_| {
+                                HwePcaError::InvalidInput(
+                                    "failed to copy GPU projection scores to host during CPU fallback",
+                                )
+                            })?;
                         gpu_scores_flushed = true;
                     }
                     if !logged_cuda_fallback {
@@ -2220,13 +2226,21 @@ where
         progress.on_stage_advance(ProjectionProgressStage::Projection, processed);
     }
 
-    if gpu_scores_active
-        && !gpu_scores_flushed
-        && let Some(runtime) = packed_cuda.as_mut()
-        && runtime
+    if gpu_scores_active && !gpu_scores_flushed {
+        // Final flush of device-accumulated scores. A failure here means
+        // `scores_row_major` never received the GPU results, so returning it
+        // would yield silently zeroed/partial projections — fail loudly instead.
+        let runtime = packed_cuda.as_mut().ok_or(HwePcaError::InvalidInput(
+            "GPU projection scores marked active without an initialized runtime",
+        ))?;
+        runtime
             .copy_scores_to_host(n_samples, components, &mut scores_row_major)
-            .is_ok()
-    {}
+            .map_err(|_| {
+                HwePcaError::InvalidInput(
+                    "failed to copy final GPU projection scores to host",
+                )
+            })?;
+    }
 
     for sample in 0..n_samples {
         let score_offset = sample * components;

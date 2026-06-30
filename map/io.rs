@@ -684,7 +684,33 @@ pub fn save_hwe_model(
     Ok(model_path)
 }
 
+/// Loads the **complete** fitted model from the JSON artifact.
+///
+/// This always reads the JSON file, so every field — eigenvalues, singular
+/// values, sample basis/scores, and total variance — is fully populated. Use
+/// this whenever those fit statistics matter (inspection, summaries, re-fitting).
+///
+/// Note: this deliberately ignores the `.project.bin` projection cache, which
+/// stores only the artifacts needed for projection and would otherwise hand back
+/// a stub with zeroed/empty fit metadata. For the projection hot path use
+/// [`load_projection_model_from_path`] instead.
 pub fn load_model_from_path(model_path: &Path) -> Result<HwePcaModel, DatasetOutputError> {
+    let file = File::open(model_path)?;
+    let reader = BufReader::new(file);
+    let model: HwePcaModel = serde_json::from_reader(reader)?;
+    Ok(model)
+}
+
+/// Loads a model for **projection**, preferring the compact `.project.bin`
+/// cache when present and falling back to the JSON model otherwise.
+///
+/// The returned model is guaranteed to carry the scaler, loadings, and packed
+/// projection artifacts, but — when served from the cache — its fit statistics
+/// (eigenvalues, singular values, sample basis/scores, total variance) are
+/// placeholders. Callers that need those must use [`load_model_from_path`].
+pub fn load_projection_model_from_path(
+    model_path: &Path,
+) -> Result<HwePcaModel, DatasetOutputError> {
     let cache_path = projection_cache_path(model_path);
     if cache_path.exists() {
         match read_projection_cache(&cache_path) {
@@ -695,16 +721,14 @@ pub fn load_model_from_path(model_path: &Path) -> Result<HwePcaModel, DatasetOut
         }
     }
 
-    let file = File::open(model_path)?;
-    let reader = BufReader::new(file);
-    let model: HwePcaModel = serde_json::from_reader(reader)?;
+    let model = load_model_from_path(model_path)?;
     let _ = write_projection_cache(model_path, &model);
     Ok(model)
 }
 
 pub fn load_hwe_model(dataset: &GenotypeDataset) -> Result<HwePcaModel, DatasetOutputError> {
     let model_path = dataset.output_path("hwe.json");
-    let model = load_model_from_path(&model_path)?;
+    let model = load_projection_model_from_path(&model_path)?;
 
     if let Some(keys) = model.variant_keys() {
         if keys.len() != model.n_variants() {
@@ -1597,6 +1621,7 @@ pub fn save_fit_summary(
     writeln!(writer, "metric\tvalue")?;
     writeln!(writer, "n_samples\t{}", model.n_samples())?;
     writeln!(writer, "n_variants\t{}", model.n_variants())?;
+    writeln!(writer, "total_variance\t{}", model.total_variance())?;
 
     for (idx, variance) in model.explained_variance().iter().copied().enumerate() {
         writeln!(writer, "explained_variance_PC{}\t{}", idx + 1, variance)?;
@@ -5962,7 +5987,17 @@ mod tests {
         serde_json::to_writer(&mut writer, &model).expect("write json");
         writer.flush().expect("flush json");
 
-        let reloaded = load_model_from_path(&model_path).expect("reload model");
+        // First load has no cache yet: reads JSON and warms `.project.bin`.
+        let warmed = load_projection_model_from_path(&model_path).expect("warm cache");
+        assert!(projection_cache_path(&model_path).exists());
+        assert_eq!(
+            warmed.projection_packed_score_vectors(),
+            model.projection_packed_score_vectors()
+        );
+
+        // Second load is served from the binary cache and must preserve the
+        // precomputed projection artifacts byte-for-byte.
+        let reloaded = load_projection_model_from_path(&model_path).expect("reload model");
         assert_eq!(
             reloaded.projection_packed_score_vectors(),
             model.projection_packed_score_vectors()
