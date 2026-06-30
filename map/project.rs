@@ -533,6 +533,15 @@ impl ProjectionCudaPacked {
                 .gemm(cfg, &a_view, &b_view, &mut d_scores_view)
                 .map_err(|e| format!("projection cuBLAS GEMM failed: {e:?}"))?;
         }
+        // Block-level barrier. The HtoD copies above are async and the host
+        // staging buffers (packed/coeffs/loadings) are reused for the next block;
+        // without this sync the CPU could overwrite them while the DMA is still
+        // reading. It also makes this block's accumulation into `d_scores_accum`
+        // fully committed (and surfaces any async kernel/GEMM error here), so the
+        // caller can treat each successful call as an atomic, completed block.
+        self.stream
+            .synchronize()
+            .map_err(|e| format!("Failed to synchronize projection score block: {e:?}"))?;
         Ok(())
     }
 
@@ -558,6 +567,12 @@ impl ProjectionCudaPacked {
         self.stream
             .memcpy_dtoh(&d_scores.slice(0..len), &mut self.h_scores[..len])
             .map_err(|e| format!("Failed to copy projection scores from GPU: {e:?}"))?;
+        // `memcpy_dtoh` issues cuMemcpyDtoHAsync and cudarc does not implicitly
+        // sync for an existing host slice, so we must barrier before reading
+        // `h_scores`, or the loop below races the in-flight DMA (stale/torn data).
+        self.stream
+            .synchronize()
+            .map_err(|e| format!("Failed to synchronize projection score DtoH: {e:?}"))?;
         // The GEMM writes C column-major (ldc == n_samples), so the device buffer
         // is laid out as [k * n_samples + sample]. The rest of the pipeline stores
         // scores row-major ([sample * components + k]); reconcile the two here.
@@ -593,6 +608,24 @@ fn accumulate_col_major_scores_into_row_major(
         for k in 0..components {
             dst_row_major[row + k] += src_col_major[k * n_samples + sample] as f64;
         }
+    }
+}
+
+impl Drop for ProjectionCudaPacked {
+    fn drop(&mut self) {
+        // cudarc enqueues device-buffer frees on the stream; tearing the context
+        // down while async work (copies/kernels/GEMM) is still in flight can
+        // corrupt CUDA/cuBLAS/glibc state. Bind the context and drain the stream
+        // first, matching the score backend's CudaRuntime::drop.
+        let _ = self._ctx.bind_to_thread();
+        let _ = self.stream.synchronize();
+    }
+}
+
+impl Drop for ProjectionCudaRhs {
+    fn drop(&mut self) {
+        let _ = self._ctx.bind_to_thread();
+        let _ = self.stream.synchronize();
     }
 }
 
@@ -735,6 +768,11 @@ impl ProjectionCudaRhs {
         self.stream
             .memcpy_dtoh(&d_c_ref.slice(0..c_len), &mut self.h_c[..c_len])
             .map_err(|e| format!("Failed to copy projection rhs from device: {e:?}"))?;
+        // Barrier before the caller reads `h_c`: the DtoH above is async and
+        // cudarc does not implicitly sync for an existing host slice.
+        self.stream
+            .synchronize()
+            .map_err(|e| format!("Failed to synchronize projection rhs DtoH: {e:?}"))?;
         Ok(&self.h_c[..c_len])
     }
 
@@ -800,6 +838,10 @@ impl ProjectionCudaRhs {
             .stream
             .clone_dtoh(&d_c.slice(0..c_len))
             .map_err(|e| format!("Failed to copy f32 projection rhs from device: {e:?}"))?;
+        // Barrier before reading the copied data: the DtoH is async on this stream.
+        self.stream
+            .synchronize()
+            .map_err(|e| format!("Failed to synchronize f32 projection rhs DtoH: {e:?}"))?;
         if self.h_c.len() < c_len {
             self.h_c.resize(c_len, 0.0);
         }
@@ -2032,7 +2074,11 @@ where
     let mut gpu_loadings_col_major = vec![0.0f32; block_variants * components];
     let mut gpu_coeffs = vec![0.0f32; block_variants * 3];
     let mut gpu_scores_active = packed_cuda.is_some();
-    let mut gpu_scores_flushed = false;
+    // Whether at least one block has been committed into the device score
+    // accumulator. Once true, a later GPU failure cannot be salvaged by CPU
+    // fallback (it would mix a partial device accumulator with CPU sums), so we
+    // fail hard; before it, falling back to CPU is safe (accumulator is zero).
+    let mut gpu_block_committed = false;
     let mut logged_cuda_fallback = false;
     if let Some(runtime) = packed_cuda.as_mut()
         && runtime.init_scores_accum(n_samples, components).is_err()
@@ -2198,25 +2244,25 @@ where
                         );
                     }
                     used_gpu = true;
+                    gpu_block_committed = true;
                 }
                 Err(_) => {
-                    if gpu_scores_active && !gpu_scores_flushed {
-                        // We must recover the scores already accumulated on the
-                        // device before the CPU resumes adding to them; a failed
-                        // copy would silently drop every prior GPU block, so it is
-                        // a hard error rather than a salvageable fallback.
-                        runtime
-                            .copy_scores_to_host(n_samples, components, &mut scores_row_major)
-                            .map_err(|_| {
-                                HwePcaError::InvalidInput(
-                                    "failed to copy GPU projection scores to host during CPU fallback",
-                                )
-                            })?;
-                        gpu_scores_flushed = true;
+                    // If earlier blocks already accumulated on the device, the
+                    // device accumulator holds a partial result that cannot be
+                    // safely merged with a CPU continuation (and recomputing the
+                    // failed block on CPU could double-count it). Fail loudly
+                    // rather than emit silently-wrong scores.
+                    if gpu_block_committed {
+                        return Err(HwePcaError::InvalidInput(
+                            "GPU projection failed mid-run after partial device accumulation; \
+                             refusing to fall back to CPU and produce inconsistent scores",
+                        ));
                     }
+                    // No GPU block has committed yet, so the device accumulator is
+                    // still zero: discard the GPU path and run entirely on CPU.
                     if !logged_cuda_fallback {
                         eprintln!(
-                            "> Projection backend switch: CPU (GPU score block compute failed during execution)"
+                            "> Projection backend switch: CPU (GPU score block compute failed before any block committed)"
                         );
                         logged_cuda_fallback = true;
                     }
@@ -2257,7 +2303,7 @@ where
         progress.on_stage_advance(ProjectionProgressStage::Projection, processed);
     }
 
-    if gpu_scores_active && !gpu_scores_flushed {
+    if gpu_scores_active {
         // Final flush of device-accumulated scores. A failure here means
         // `scores_row_major` never received the GPU results, so returning it
         // would yield silently zeroed/partial projections — fail loudly instead.
