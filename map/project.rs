@@ -320,19 +320,52 @@ struct ProjectionCudaPacked {
 
 impl ProjectionCudaPacked {
     fn new() -> Result<Self, String> {
-        let ctx = CudaContext::new(0).map_err(|e| format!("CUDA init failed: {e:?}"))?;
-        ctx.bind_to_thread()
-            .map_err(|e| format!("Failed to bind CUDA context: {e:?}"))?;
+        // Refuse to proceed if two distinct files share a CUDA SONAME in this
+        // process (the AoU "double free or corruption" abort class). Shared with
+        // the score backend.
+        crate::score::cuda_backend::detect_cuda_library_conflicts()?;
+        let ctx = select_projection_cuda_device()?;
         let stream = ctx
             .new_stream()
             .map_err(|e| format!("Failed to create CUDA stream: {e:?}"))?;
         let blas = CudaBlas::new(stream.clone())
             .map_err(|e| format!("Failed to initialize cuBLAS: {e:?}"))?;
+        // The packed path accumulates scores in f32 on the device. Only take it if
+        // this device proved f32 SGEMM matches f64 DGEMM (and the host reference);
+        // otherwise refuse so the caller falls back to the exact CPU path rather
+        // than emitting uncalibrated f32 PCA scores.
+        if !calibrate_projection_f32(&stream, &blas) {
+            return Err(
+                "packed projection f32 GEMM did not match f64 on this device; using CPU".to_string(),
+            );
+        }
         let ptx = compile_ptx(PROJECT_CUDA_UNPACK_KERNELS)
             .map_err(|e| format!("NVRTC compile failed for projection kernel: {e:?}"))?;
-        let module = ctx
-            .load_module(ptx)
-            .map_err(|e| format!("Failed to load projection CUDA module: {e:?}"))?;
+        let module = match ctx.load_module(ptx) {
+            Ok(module) => module,
+            Err(load_err)
+                if crate::score::cuda_backend::should_retry_with_cubin(load_err) =>
+            {
+                let (cc_major, cc_minor) = ctx
+                    .compute_capability()
+                    .map_err(|e| format!("Failed to query device compute capability: {e:?}"))?;
+                eprintln!(
+                    "> Projection CUDA module load rejected PTX ({:?}); retrying with CUBIN for sm_{}{}.",
+                    load_err.0, cc_major, cc_minor
+                );
+                let cubin = crate::score::cuda_backend::compile_cubin_for_device(
+                    PROJECT_CUDA_UNPACK_KERNELS,
+                    cc_major,
+                    cc_minor,
+                )?;
+                ctx.load_module(cudarc::nvrtc::Ptx::from_binary(cubin)).map_err(|e| {
+                    format!(
+                        "Failed to load projection CUDA module after CUBIN fallback (PTX error: {load_err:?}): {e:?}"
+                    )
+                })?
+            }
+            Err(e) => return Err(format!("Failed to load projection CUDA module: {e:?}")),
+        };
         let unpack_kernel = module
             .load_function("unpack_weighted_plink")
             .map_err(|e| format!("Failed to load unpack_weighted_plink kernel: {e:?}"))?;
@@ -631,9 +664,8 @@ impl Drop for ProjectionCudaRhs {
 
 impl ProjectionCudaRhs {
     fn new() -> Result<Self, String> {
-        let ctx = CudaContext::new(0).map_err(|e| format!("CUDA init failed: {e:?}"))?;
-        ctx.bind_to_thread()
-            .map_err(|e| format!("Failed to bind CUDA context: {e:?}"))?;
+        crate::score::cuda_backend::detect_cuda_library_conflicts()?;
+        let ctx = select_projection_cuda_device()?;
         let stream = ctx
             .new_stream()
             .map_err(|e| format!("Failed to create CUDA stream: {e:?}"))?;
@@ -930,9 +962,28 @@ fn calibrate_projection_f32(stream: &std::sync::Arc<CudaStream>, blas: &CudaBlas
             let denom = r.abs().max(1.0);
             max_rel = max_rel.max((r - *t as f64).abs() / denom);
         }
-        // f32 sgemm vs f64 dgemm differs by ~1e-5; 1e-3 rejects a broken path
-        // (wrong layout / no f32 support) while accepting normal f32 precision.
-        Ok(max_rel < 1.0e-3)
+        // Host f64 reference (cuBLAS column-major: C[i + j*M] = Σ_l A[i+l*M]·B[l+j*K]).
+        // The GPU-f64-vs-GPU-f32 check above cannot catch a host/GPU layout mismatch
+        // because both GPU paths share the same layout; comparing the GPU f64 result
+        // against an independent CPU computation does.
+        let mut cpu_ref = vec![0.0f64; M * N];
+        for j in 0..N {
+            for l in 0..K {
+                let b_lj = b[l + j * K];
+                for i in 0..M {
+                    cpu_ref[i + j * M] += a[i + l * M] * b_lj;
+                }
+            }
+        }
+        let mut max_rel_cpu = 0.0f64;
+        for (g, c) in ref64.iter().zip(cpu_ref.iter()) {
+            let denom = c.abs().max(1.0);
+            max_rel_cpu = max_rel_cpu.max((g - c).abs() / denom);
+        }
+        // f32 sgemm vs f64 dgemm differs by ~1e-5; 1e-3 rejects a broken f32 path
+        // (wrong layout / no f32 support). GPU f64 vs CPU f64 should match to ~1e-12;
+        // 1e-9 rejects a layout/correctness bug shared by both GPU paths.
+        Ok(max_rel < 1.0e-3 && max_rel_cpu < 1.0e-9)
     };
     run().unwrap_or(false)
 }
@@ -1183,7 +1234,7 @@ impl<'model> HwePcaProjector<'model> {
                     eprintln!("> Projection backend: CPU ({reason})");
                     None
                 }
-                None => match ProjectionCudaRhs::new() {
+                None => match init_projection_cuda_rhs_safely() {
                     Ok(runtime) => {
                         eprintln!(
                             "> Projection backend: GPU (CUDA RHS acceleration enabled; CPU solves remain active)"
@@ -1960,6 +2011,84 @@ fn projection_cuda_libraries_loadable() -> Result<(), String> {
     Ok(())
 }
 
+/// Select the visible CUDA device with the most free memory and return its bound
+/// context. Projection previously always used device 0, which can land on a
+/// busy/small GPU when a better one is present; this mirrors the score backend's
+/// multi-GPU selection (kept simple here: rank by free memory).
+fn select_projection_cuda_device() -> Result<std::sync::Arc<CudaContext>, String> {
+    let device_count = CudaContext::device_count()
+        .map_err(|e| format!("Failed to query CUDA device count: {e:?}"))?;
+    if device_count <= 0 {
+        return Err("CUDA reported zero visible devices".to_string());
+    }
+    let mut best: Option<(usize, usize, std::sync::Arc<CudaContext>)> = None;
+    let mut rejections = Vec::new();
+    for ordinal in 0..device_count as usize {
+        let ctx = match CudaContext::new(ordinal) {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                rejections.push(format!("ordinal {ordinal}: init failed: {e:?}"));
+                continue;
+            }
+        };
+        if let Err(e) = ctx.bind_to_thread() {
+            rejections.push(format!("ordinal {ordinal}: bind failed: {e:?}"));
+            continue;
+        }
+        let free_mem = match ctx.mem_get_info() {
+            Ok((free, _total)) => free,
+            Err(e) => {
+                rejections.push(format!("ordinal {ordinal}: memory query failed: {e:?}"));
+                continue;
+            }
+        };
+        if best.as_ref().map(|(_, bf, _)| free_mem > *bf).unwrap_or(true) {
+            best = Some((ordinal, free_mem, ctx));
+        }
+    }
+    let (ordinal, _free, ctx) = best.ok_or_else(|| {
+        if rejections.is_empty() {
+            "No CUDA device could be initialized".to_string()
+        } else {
+            format!(
+                "No visible CUDA device usable for projection:\n  {}",
+                rejections.join("\n  ")
+            )
+        }
+    })?;
+    ctx.bind_to_thread()
+        .map_err(|e| format!("Failed to bind selected CUDA device: {e:?}"))?;
+    eprintln!(
+        "> Projection CUDA device selection: chose ordinal {ordinal} of {device_count} visible device(s)"
+    );
+    Ok(ctx)
+}
+
+/// Panic-safe construction of the packed projection CUDA runtime. cudarc can
+/// panic (not just `Err`) on dynamic-load/driver problems; converting that into
+/// an `Err` lets projection degrade to CPU instead of aborting the process.
+fn init_projection_cuda_packed_safely() -> Result<ProjectionCudaPacked, String> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(ProjectionCudaPacked::new)) {
+        Ok(result) => result,
+        Err(payload) => Err(format!(
+            "projection CUDA init panicked ({})",
+            crate::score::cuda_backend::panic_payload_to_string(payload)
+        )),
+    }
+}
+
+/// Panic-safe construction of the RHS projection CUDA runtime. See
+/// [`init_projection_cuda_packed_safely`].
+fn init_projection_cuda_rhs_safely() -> Result<ProjectionCudaRhs, String> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(ProjectionCudaRhs::new)) {
+        Ok(result) => result,
+        Err(payload) => Err(format!(
+            "projection CUDA init panicked ({})",
+            crate::score::cuda_backend::panic_payload_to_string(payload)
+        )),
+    }
+}
+
 fn project_cuda_min_work() -> usize {
     DEFAULT_PROJECT_CUDA_MIN_WORK
 }
@@ -2054,7 +2183,7 @@ where
             eprintln!("> Projection backend: CPU ({reason})");
             None
         }
-        None => match ProjectionCudaPacked::new() {
+        None => match init_projection_cuda_packed_safely() {
             Ok(runtime) => {
                 eprintln!(
                     "> Projection backend: GPU (CUDA fused decode + SGEMM; packed-byte missing-info scan and CPU solves remain active)"
@@ -2715,9 +2844,19 @@ fn gpu_free_bytes() -> Option<usize> {
     if !cuda_driver_likely_available() || projection_cuda_libraries_loadable().is_err() {
         return None;
     }
-    let ctx = CudaContext::new(0).ok()?;
-    let (free, _total) = ctx.mem_get_info().ok()?;
-    Some(free)
+    // Report the max free memory across visible devices, matching
+    // `select_projection_cuda_device`, which picks the most-free GPU.
+    let device_count = CudaContext::device_count().ok()?;
+    let mut best: Option<usize> = None;
+    for ordinal in 0..device_count as usize {
+        if let Ok(ctx) = CudaContext::new(ordinal)
+            && ctx.bind_to_thread().is_ok()
+            && let Ok((free, _total)) = ctx.mem_get_info()
+        {
+            best = Some(best.map_or(free, |b| b.max(free)));
+        }
+    }
+    best
 }
 
 fn packed_projection_variant_block(

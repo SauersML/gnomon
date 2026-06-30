@@ -624,6 +624,11 @@ pub fn try_run_cuda(
             runtime
         }
         Err(reason) => {
+            if cuda_strict_mode() {
+                return Err(PipelineError::Compute(format!(
+                    "GNOMON_CUDA_STRICT set but CUDA initialization failed: {reason}"
+                )));
+            }
             eprintln!("> Backend: CPU fallback ({reason})");
             return Ok(None);
         }
@@ -642,13 +647,28 @@ pub fn try_run_cuda(
         Ok(Ok(scores)) => Ok(Some(scores)),
         Ok(Err(e)) => Err(e),
         Err(payload) => {
-            eprintln!(
-                "> Backend: CPU fallback (CUDA execution panicked: {})",
-                panic_payload_to_string(payload)
-            );
+            let reason = panic_payload_to_string(payload);
+            if cuda_strict_mode() {
+                return Err(PipelineError::Compute(format!(
+                    "GNOMON_CUDA_STRICT set but CUDA execution panicked: {reason}"
+                )));
+            }
+            eprintln!("> Backend: CPU fallback (CUDA execution panicked: {reason})");
             Ok(None)
         }
     }
+}
+
+/// Whether `GNOMON_CUDA_STRICT` requests that CUDA init/execution failures be
+/// fatal instead of silently falling back to the CPU backend. Used by strict GPU
+/// tests (and by users who require the GPU path) to guarantee CUDA actually ran.
+pub(crate) fn cuda_strict_mode() -> bool {
+    std::env::var("GNOMON_CUDA_STRICT")
+        .map(|v| {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true")
+        })
+        .unwrap_or(false)
 }
 
 /// Return the canonical CUDA library family name for a file basename,
@@ -725,7 +745,7 @@ fn cuda_library_mappings()
 ///
 /// On `Ok(())`, mappings are consistent. On `Err`, the string is a
 /// multi-line, actionable report naming every conflicting path.
-fn detect_cuda_library_conflicts() -> Result<(), String> {
+pub(crate) fn detect_cuda_library_conflicts() -> Result<(), String> {
     let by_family = cuda_library_mappings();
     let conflicts: Vec<(&'static str, Vec<String>)> = by_family
         .into_iter()
@@ -807,7 +827,7 @@ fn init_cuda_runtime_safely(prep: &PreparationResult) -> Result<CudaRuntime, Str
     }
 }
 
-fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
+pub(crate) fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
     if let Some(msg) = payload.downcast_ref::<&str>() {
         return (*msg).to_string();
     }
@@ -1107,6 +1127,32 @@ impl CudaRuntime {
     fn new(prep: &PreparationResult) -> Result<Self, String> {
         preflight_cuda_dynamic_libraries()?;
 
+        // The missing-variant count GEMM accumulates per (sample, score) into f32,
+        // which represents integers exactly only up to 2^24. If any single score
+        // draws from more than 2^24 variants, its missing count could be rounded
+        // incorrectly. Refuse CUDA in that (extreme) case so the CPU path produces
+        // exact counts. sparse_score_columns has one entry per variant→score
+        // contribution, so the per-column frequency is that score's variant count.
+        const F32_EXACT_INT_LIMIT: u64 = 1 << 24;
+        let max_variants_per_score = {
+            let mut counts: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+            let mut max = 0u64;
+            for &score_col in prep.sparse_score_columns() {
+                let entry = counts.entry(score_col).or_insert(0);
+                *entry += 1;
+                if *entry > max {
+                    max = *entry;
+                }
+            }
+            max
+        };
+        if max_variants_per_score > F32_EXACT_INT_LIMIT {
+            return Err(format!(
+                "a score draws from {max_variants_per_score} variants (> 2^24); f32 GPU \
+                 missing-count accumulation would be inexact — using the CPU backend"
+            ));
+        }
+
         let static_bytes = estimate_static_cuda_bytes(prep)?;
         let plan = select_cuda_device_plan(prep, static_bytes)?;
         let CudaDevicePlan {
@@ -1182,7 +1228,7 @@ impl CudaRuntime {
                     "> CUDA module load rejected PTX ({:?}); retrying with CUBIN for sm_{}{}.",
                     load_err.0, cc_major, cc_minor
                 );
-                let cubin = compile_cubin_for_device(cc_major, cc_minor)?;
+                let cubin = compile_cubin_for_device(CUDA_KERNELS, cc_major, cc_minor)?;
                 ctx.load_module(Ptx::from_binary(cubin)).map_err(|e| {
                     format!(
                         "Failed to load CUDA module after CUBIN fallback (original PTX load error: {load_err:?}): {e:?}"
@@ -1258,19 +1304,37 @@ impl CudaRuntime {
         let blas = CudaBlas::new(compute_stream.clone())
             .map_err(|e| format!("Failed to initialize cuBLAS: {e:?}"))?;
 
+        // The split-fp16 path keeps fp32's 8-bit exponent in w_hi but only fp16's
+        // value range survives the tensor-core multiply. Weights outside fp16's
+        // representable range (|w| > 65504) would overflow to inf, and non-finite
+        // weights are always unsafe. calibrate_fp16 only exercises synthetic
+        // weights, so guard against the actual weight matrix here before enabling.
+        let fp16_weight_range_ok = prep
+            .sparse_weights()
+            .iter()
+            .all(|&w| {
+                let w = w as f64;
+                w.is_finite() && w.abs() <= 65504.0
+            });
+
         // Automatically decide whether the split-fp16 tensor-core score GEMM is
         // safe and faster on THIS device. It is only enabled if it reproduces
         // the fp32 result to tight tolerance here; otherwise we keep exact fp32.
-        let use_fp16 = calibrate_fp16(
-            &compute_stream,
-            &blas,
-            &split_fp16_kernel,
-            combine_block_size,
-            &device_info,
-        );
+        let use_fp16 = fp16_weight_range_ok
+            && calibrate_fp16(
+                &compute_stream,
+                &blas,
+                &split_fp16_kernel,
+                combine_block_size,
+                &device_info,
+            );
         if use_fp16 {
             eprintln!(
                 "> CUDA score GEMM: split-fp16 tensor cores (calibrated == fp32 on this device)"
+            );
+        } else if !fp16_weight_range_ok {
+            eprintln!(
+                "> CUDA score GEMM: fp32 (weights outside fp16 range or non-finite; tensor-core path disabled)"
             );
         } else {
             eprintln!("> CUDA score GEMM: fp32 (fp16 tensor-core path not validated on this device)");
@@ -1305,7 +1369,7 @@ impl CudaRuntime {
     }
 }
 
-fn should_retry_with_cubin(load_err: DriverError) -> bool {
+pub(crate) fn should_retry_with_cubin(load_err: DriverError) -> bool {
     matches!(
         load_err.0,
         cudarc::driver::sys::CUresult::CUDA_ERROR_UNSUPPORTED_PTX_VERSION
@@ -1313,10 +1377,14 @@ fn should_retry_with_cubin(load_err: DriverError) -> bool {
     )
 }
 
-fn compile_cubin_for_device(cc_major: i32, cc_minor: i32) -> Result<Vec<u8>, String> {
+pub(crate) fn compile_cubin_for_device(
+    kernel_src: &str,
+    cc_major: i32,
+    cc_minor: i32,
+) -> Result<Vec<u8>, String> {
     let arch_flag = format!("--gpu-architecture=sm_{cc_major}{cc_minor}");
 
-    let src = CString::new(CUDA_KERNELS)
+    let src = CString::new(kernel_src)
         .map_err(|_| "CUDA kernel source contained interior NUL".to_string())?;
     let prog = nvrtc_result::create_program(src.as_c_str(), None)
         .map_err(|e| format!("NVRTC create_program failed for CUBIN fallback: {e:?}"))?;

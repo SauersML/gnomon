@@ -167,6 +167,49 @@ fn gpu_and_cpu_outputs_match_for_shared_scores_when_cuda_available() -> Result<(
 }
 
 #[test]
+fn cuda_strict_mode_forces_cuda_backend_when_present() -> Result<(), Box<dyn Error>> {
+    // Without GNOMON_CUDA_STRICT, a "gpu" test can silently pass on the CPU
+    // fallback. With it set, CUDA init/exec failures are fatal, so on a host
+    // that has a CUDA driver the run must actually select the CUDA backend.
+    if !cuda_driver_present() {
+        eprintln!(
+            "Skipping cuda_strict_mode_forces_cuda_backend_when_present: no CUDA driver detected"
+        );
+        return Ok(());
+    }
+
+    let tmp = tempdir()?;
+    let prefix = tmp.path().join("gpu_strict_cohort");
+    let n_people = 512usize;
+    let n_variants = 256usize;
+    write_test_plink_files(&prefix, n_people, n_variants)?;
+
+    let large_scores = 256usize;
+    assert!(n_people * large_scores >= CPU_FALLBACK_THRESHOLD);
+    let score_path = tmp.path().join("scores_large.tsv");
+    write_native_score_file(&score_path, n_variants, large_scores, "S", true)?;
+
+    let run = run_score_with_env(
+        &score_path,
+        &prefix,
+        tmp.path(),
+        &[("GNOMON_CUDA_STRICT", "1")],
+    )?;
+    assert!(
+        run.stderr.contains("> Backend: CUDA"),
+        "GNOMON_CUDA_STRICT must force the CUDA backend when a driver is present; stderr:\n{}",
+        run.stderr
+    );
+    assert!(
+        !run.stderr.contains("Backend: CPU fallback"),
+        "strict mode must not silently fall back to CPU; stderr:\n{}",
+        run.stderr
+    );
+
+    Ok(())
+}
+
+#[test]
 fn gpu_and_cpu_outputs_match_for_multifile_score_directory() -> Result<(), Box<dyn Error>> {
     if !cuda_driver_present() {
         eprintln!(
@@ -481,13 +524,25 @@ fn run_score(
     genotype_prefix: &Path,
     cwd: &Path,
 ) -> Result<ScoreRunOutput, Box<dyn Error>> {
+    run_score_with_env(score_path, genotype_prefix, cwd, &[])
+}
+
+fn run_score_with_env(
+    score_path: &Path,
+    genotype_prefix: &Path,
+    cwd: &Path,
+    env: &[(&str, &str)],
+) -> Result<ScoreRunOutput, Box<dyn Error>> {
     let exe = env!("CARGO_BIN_EXE_gnomon");
-    let output = Command::new(exe)
-        .current_dir(cwd)
+    let mut cmd = Command::new(exe);
+    cmd.current_dir(cwd)
         .arg("score")
         .arg(score_path)
-        .arg(genotype_prefix)
-        .output()?;
+        .arg(genotype_prefix);
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    let output = cmd.output()?;
 
     if !output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
