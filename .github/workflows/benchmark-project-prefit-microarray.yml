@@ -40,6 +40,14 @@ jobs:
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
 
+      - name: Remove local cargo config
+        # Prevent .cargo/config.toml's target-cpu=native from leaking into CI.
+        # On heterogeneous GitHub runners it makes proc-macros (e.g. thiserror)
+        # emit instructions a later runner lacks, crashing rustc with SIGILL
+        # (ring#2527). Drop it so the build below pins a portable target-cpu.
+        shell: bash
+        run: rm -f .cargo/config.toml
+
       - name: Cache Rust dependencies and build artifacts
         uses: Swatinem/rust-cache@v2
         with:
@@ -51,6 +59,9 @@ jobs:
       - name: Build release binary
         env:
           CARGO_INCREMENTAL: 0
+          # Specific CPU target instead of 'native': keeps SIMD optimization while
+          # staying portable across runners (avoids the ring#2527 SIGILL).
+          RUSTFLAGS: "-C target-cpu=x86-64-v3"
         run: cargo +nightly build --release
 
       - name: Upload release binary
