@@ -781,6 +781,9 @@ pub fn sort_native_file(input_path: &Path, output_path: &Path) -> Result<(), Ref
 
     for line_result in reader.lines() {
         let line = line_result.map_err(ReformatError::Io)?;
+        if line.trim().is_empty() {
+            continue;
+        }
         if !line.starts_with('#') {
             data_lines.push(line);
         } else {
@@ -793,6 +796,16 @@ pub fn sort_native_file(input_path: &Path, output_path: &Path) -> Result<(), Ref
     }
     // The gnomon-native header is the first data line.
     let header = data_lines.remove(0);
+    if !header.starts_with("variant_id\teffect_allele\tother_allele\t") {
+        return Err(ReformatError::Parse {
+            path: input_path.to_path_buf(),
+            line_number: header_lines.len() + 1,
+            line_content: header,
+            details:
+                "Invalid native score header; expected variant_id/effect_allele/other_allele/score."
+                    .to_string(),
+        });
+    }
 
     let mut lines_to_sort: Vec<SortableLine> = data_lines
         .into_par_iter()
@@ -1063,5 +1076,29 @@ chr_name\tchr_position\teffect_allele\tother_allele\tdosage_0_weight\tdosage_1_w
             !output_path.exists(),
             "no normalized output should be produced for skipped score"
         );
+    }
+
+    #[test]
+    fn sort_native_file_ignores_blank_lines_before_header() {
+        let tmp = tempdir().expect("tempdir");
+        let input_path = tmp.path().join("scores.gnomon.tsv");
+        let output_path = tmp.path().join("scores.sorted.gnomon.tsv");
+
+        let mut input = File::create(&input_path).expect("create input");
+        writeln!(
+            input,
+            "##synthetic=test\n\nvariant_id\teffect_allele\tother_allele\tSCORE\n1:200\tA\tG\t0.2\n1:100\tG\tA\t0.1"
+        )
+        .expect("write input");
+
+        sort_native_file(&input_path, &output_path).expect("sort native file");
+        let sorted = fs::read_to_string(&output_path).expect("read sorted output");
+        let lines: Vec<_> = sorted.lines().collect();
+
+        assert_eq!(lines[0], "##synthetic=test");
+        assert_eq!(lines[1], "variant_id\teffect_allele\tother_allele\tSCORE");
+        assert_eq!(lines[2], "1:100\tG\tA\t0.1");
+        assert_eq!(lines[3], "1:200\tA\tG\t0.2");
+        assert_eq!(lines.len(), 4);
     }
 }

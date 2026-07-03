@@ -1369,7 +1369,7 @@ impl KWayMergeIterator {
                 {
                     break;
                 }
-                if !header_line.starts_with("##") {
+                if !header_line.trim().is_empty() && !header_line.starts_with('#') {
                     break;
                 }
             }
