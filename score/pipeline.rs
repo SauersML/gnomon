@@ -1722,6 +1722,16 @@ impl<F: FnOnce()> Drop for ScopeGuard<F> {
 type ConsumerResult = Result<(Vec<f64>, Vec<u32>), PipelineError>;
 
 #[inline]
+fn reconciled_index_from_usize(i: usize) -> Result<ReconciledVariantIndex, PipelineError> {
+    let idx = u32::try_from(i).map_err(|_| {
+        PipelineError::Compute(format!(
+            "Reconciled variant index {i} exceeds u32::MAX; too many variants in one run."
+        ))
+    })?;
+    Ok(ReconciledVariantIndex(idx))
+}
+
+#[inline]
 fn checked_result_size(prep_result: &PreparationResult) -> Result<usize, PipelineError> {
     prep_result
         .num_people_to_score
