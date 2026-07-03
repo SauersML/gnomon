@@ -10,8 +10,8 @@ Required dependencies:
 - convert_genome
 
 Usage:
-    python examples/convert_score.py
-    python examples/convert_score.py --assembly GRCh38
+    python examples/misc/convert_score.py
+    python examples/misc/convert_score.py --assembly GRCh38
 
 The example downloads public sample genomes into the output directory.
 """
@@ -30,7 +30,7 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 OUTPUT_DIR = Path(__file__).resolve().parent / "convert_score_output"
 
 PGS_IDS = ("PGS000007", "PGS000317", "PGS004869", "PGS000507")

@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from examples import convert_score
+from examples.misc import convert_score
 
 
 def test_download_pgs_score_uses_cached_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
