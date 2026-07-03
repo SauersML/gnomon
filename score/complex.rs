@@ -288,12 +288,12 @@ mod tests {
     fn resolver_pipeline_uses_heterozygous_fallback_last() {
         let score_info = ScoreInfo {
             effect_allele: "T".to_string(),
-            other_allele: "G".to_string(),
+            other_allele: "A".to_string(),
             weight: 1.0,
             score_column_index: ScoreColumnIndex(0),
         };
-        let ctx_a = (BimRowIndex(10), "C".to_string(), "T".to_string());
-        let ctx_b = (BimRowIndex(11), "TA".to_string(), "T".to_string());
+        let ctx_a = (BimRowIndex(10), "A".to_string(), "T".to_string());
+        let ctx_b = (BimRowIndex(11), "A".to_string(), "T".to_string());
         let conflicting_interpretations = vec![(0b00, &ctx_a), (0b11, &ctx_b)];
         let context = ResolutionContext {
             score_info: &score_info,
@@ -359,27 +359,28 @@ mod tests {
     #[test]
     fn fallback_het_dosage_matches_inferred_allele_pair() {
         let ctx_a = (BimRowIndex(40), "C".to_string(), "T".to_string());
-        let ctx_b = (BimRowIndex(41), "TA".to_string(), "T".to_string());
+        let ctx_b = (BimRowIndex(41), "C".to_string(), "T".to_string());
         let conflicting_interpretations = vec![(0b00, &ctx_a), (0b11, &ctx_b)];
 
-        let score_info_zero = ScoreInfo {
+        let incompatible_score_info = ScoreInfo {
             effect_allele: "G".to_string(),
             other_allele: "A".to_string(),
             weight: 1.0,
             score_column_index: ScoreColumnIndex(0),
         };
-        let context_zero = ResolutionContext {
-            score_info: &score_info_zero,
+        let incompatible_context = ResolutionContext {
+            score_info: &incompatible_score_info,
             conflicting_interpretations: &conflicting_interpretations,
         };
-        let res_zero = Heuristic::FallbackOpposingHomozygousAsHet
-            .try_resolve(&context_zero)
-            .expect("fallback should resolve");
-        assert!((res_zero.chosen_dosage - 0.0).abs() < 1e-9);
+        assert!(
+            Heuristic::FallbackOpposingHomozygousAsHet
+                .try_resolve(&incompatible_context)
+                .is_none()
+        );
 
         let score_info_one = ScoreInfo {
             effect_allele: "C".to_string(),
-            other_allele: "A".to_string(),
+            other_allele: "T".to_string(),
             weight: 1.0,
             score_column_index: ScoreColumnIndex(0),
         };
@@ -394,7 +395,7 @@ mod tests {
 
         let score_info_t = ScoreInfo {
             effect_allele: "T".to_string(),
-            other_allele: "A".to_string(),
+            other_allele: "C".to_string(),
             weight: 1.0,
             score_column_index: ScoreColumnIndex(0),
         };
@@ -417,8 +418,8 @@ mod tests {
             score_column_index: ScoreColumnIndex(0),
         };
         let c1 = (BimRowIndex(50), "A".to_string(), "T".to_string()); // 00 => 0
-        let c2 = (BimRowIndex(51), "G".to_string(), "T".to_string()); // 10 => 1
-        let c3 = (BimRowIndex(52), "C".to_string(), "T".to_string()); // 11 => 2
+        let c2 = (BimRowIndex(51), "A".to_string(), "T".to_string()); // 10 => 1
+        let c3 = (BimRowIndex(52), "A".to_string(), "T".to_string()); // 11 => 2
         let conflicting_interpretations = vec![(0b00, &c1), (0b10, &c2), (0b11, &c3)];
         let context = ResolutionContext {
             score_info: &score_info,
@@ -441,8 +442,8 @@ mod tests {
         };
         // 00 + 11 should be consumed by the earlier opposing-homozygous fallback,
         // not by the average fallback.
-        let c1 = (BimRowIndex(60), "C".to_string(), "T".to_string());
-        let c2 = (BimRowIndex(61), "TA".to_string(), "T".to_string());
+        let c1 = (BimRowIndex(60), "A".to_string(), "T".to_string());
+        let c2 = (BimRowIndex(61), "A".to_string(), "T".to_string());
         let conflicting_interpretations = vec![(0b00, &c1), (0b11, &c2)];
         let context = ResolutionContext {
             score_info: &score_info,
@@ -472,9 +473,9 @@ mod tests {
         // - no unambiguous genotype from score allele set
         // - not a single heterozygous-vs-homozygous tie
         // - not opposing 00/11 fallback
-        // Dosages are 0 (00 with A/C) and 2 (00 with T/G), average = 1.0.
-        let c1 = (BimRowIndex(70), "A".to_string(), "C".to_string());
-        let c2 = (BimRowIndex(71), "T".to_string(), "G".to_string());
+        // Dosages are 0 (00 with A/T) and 2 (00 with T/A), average = 1.0.
+        let c1 = (BimRowIndex(70), "A".to_string(), "T".to_string());
+        let c2 = (BimRowIndex(71), "T".to_string(), "A".to_string());
         let conflicting_interpretations = vec![(0b00, &c1), (0b00, &c2)];
         let context = ResolutionContext {
             score_info: &score_info,
@@ -533,6 +534,12 @@ pub struct Resolution {
     pub method_used: Heuristic,
 }
 
+#[inline(always)]
+fn score_allele_pair_matches(score_info: &ScoreInfo, bim_a1: &str, bim_a2: &str) -> bool {
+    (score_info.effect_allele == bim_a1 && score_info.other_allele == bim_a2)
+        || (score_info.effect_allele == bim_a2 && score_info.other_allele == bim_a1)
+}
+
 impl Heuristic {
     /// The main dispatcher for the enum. It calls the appropriate private method
     /// for the specific heuristic variant.
@@ -572,7 +579,8 @@ impl Heuristic {
 
         if exact_matches.len() == 1 {
             let (packed_geno, (_, bim_a1, bim_a2)) = exact_matches[0];
-            let dosage = Self::calculate_dosage(*packed_geno, bim_a1, bim_a2, score_eff_allele);
+            let dosage =
+                Self::calculate_score_dosage(*packed_geno, bim_a1, bim_a2, context.score_info)?;
             Some(Resolution {
                 chosen_dosage: dosage,
                 method_used: *self,
@@ -617,12 +625,8 @@ impl Heuristic {
         // If we found exactly one interpretation with a matching allele structure, it's our winner.
         if matching_structure_interpretations.len() == 1 {
             let (packed_geno, (_, bim_a1, bim_a2)) = matching_structure_interpretations[0];
-            let dosage = Self::calculate_dosage(
-                *packed_geno,
-                bim_a1,
-                bim_a2,
-                &context.score_info.effect_allele,
-            );
+            let dosage =
+                Self::calculate_score_dosage(*packed_geno, bim_a1, bim_a2, context.score_info)?;
             Some(Resolution {
                 chosen_dosage: dosage,
                 method_used: *self,
@@ -652,7 +656,8 @@ impl Heuristic {
 
         if unambiguous_interpretations.len() == 1 {
             let (packed_geno, (_, bim_a1, bim_a2)) = unambiguous_interpretations[0];
-            let dosage = Self::calculate_dosage(packed_geno, bim_a1, bim_a2, score_eff_allele);
+            let dosage =
+                Self::calculate_score_dosage(packed_geno, bim_a1, bim_a2, context.score_info)?;
             Some(Resolution {
                 chosen_dosage: dosage,
                 method_used: *self,
@@ -670,14 +675,9 @@ impl Heuristic {
             .conflicting_interpretations
             .iter()
             .map(|(packed_geno, (_, bim_a1, bim_a2))| {
-                Self::calculate_dosage(
-                    *packed_geno,
-                    bim_a1,
-                    bim_a2,
-                    &context.score_info.effect_allele,
-                )
+                Self::calculate_score_dosage(*packed_geno, bim_a1, bim_a2, context.score_info)
             })
-            .collect();
+            .collect::<Option<Vec<_>>>()?;
 
         let first_dosage = dosages[0];
         if dosages.iter().all(|&d| (d - first_dosage).abs() < 1e-9) {
@@ -706,12 +706,8 @@ impl Heuristic {
 
         if heterozygous_calls.len() == 1 && homozygous_calls_exist {
             let (packed_geno, (_, bim_a1, bim_a2)) = heterozygous_calls[0];
-            let dosage = Self::calculate_dosage(
-                *packed_geno,
-                bim_a1,
-                bim_a2,
-                &context.score_info.effect_allele,
-            );
+            let dosage =
+                Self::calculate_score_dosage(*packed_geno, bim_a1, bim_a2, context.score_info)?;
             Some(Resolution {
                 chosen_dosage: dosage,
                 method_used: *self,
@@ -778,6 +774,12 @@ impl Heuristic {
 
         // Sanity check: is the effect allele even involved?
         let effect = &context.score_info.effect_allele;
+        let other = &context.score_info.other_allele;
+        if !((effect == *shortest && other == *longest)
+            || (effect == *longest && other == *shortest))
+        {
+            return None;
+        }
 
         // The inferred genotype is Short/Long.
         // If Effect == Short or Effect == Long, dosage is 1.0.
@@ -835,6 +837,12 @@ impl Heuristic {
         }
 
         let effect = context.score_info.effect_allele.as_str();
+        let other = context.score_info.other_allele.as_str();
+        if !((effect == allele_from_00 && other == allele_from_11)
+            || (effect == allele_from_11 && other == allele_from_00))
+        {
+            return None;
+        }
         let mut inferred_dosage = 0.0;
         if effect == allele_from_00 {
             inferred_dosage += 1.0;
@@ -862,13 +870,10 @@ impl Heuristic {
             .conflicting_interpretations
             .iter()
             .map(|(packed_geno, (_, bim_a1, bim_a2))| {
-                Self::calculate_dosage(
-                    *packed_geno,
-                    bim_a1,
-                    bim_a2,
-                    &context.score_info.effect_allele,
-                )
+                Self::calculate_score_dosage(*packed_geno, bim_a1, bim_a2, context.score_info)
             })
+            .collect::<Option<Vec<_>>>()?
+            .into_iter()
             .sum();
         let avg = sum / context.conflicting_interpretations.len() as f64;
         Some(Resolution {
@@ -881,7 +886,15 @@ impl Heuristic {
     /// This function is now fully safe and self-contained, returning 0.0 if the
     /// effect allele is not one of the two alleles from the BIM entry.
     #[inline(always)]
-    fn calculate_dosage(packed_geno: u8, bim_a1: &str, bim_a2: &str, effect_allele: &str) -> f64 {
+    fn calculate_score_dosage(
+        packed_geno: u8,
+        bim_a1: &str,
+        bim_a2: &str,
+        score_info: &ScoreInfo,
+    ) -> Option<f64> {
+        if !score_allele_pair_matches(score_info, bim_a1, bim_a2) {
+            return None;
+        }
         // Decodes the genotype with respect to the BIM alleles.
         let dosage_wrt_a1 = match packed_geno {
             0b00 => 2.0, // Homozygous for A1
@@ -890,16 +903,15 @@ impl Heuristic {
             _ => 0.0,    // Missing or invalid
         };
 
-        if bim_a1 == effect_allele {
+        if bim_a1 == score_info.effect_allele {
             // Case 1: The effect allele is A1. The dosage is the count of A1.
-            dosage_wrt_a1
-        } else if bim_a2 == effect_allele {
+            Some(dosage_wrt_a1)
+        } else if bim_a2 == score_info.effect_allele {
             // Case 2: The effect allele is A2. The dosage is the count of A2,
             // which is the inverse of the A1 count.
-            2.0 - dosage_wrt_a1
+            Some(2.0 - dosage_wrt_a1)
         } else {
-            // Case 3: The effect allele is neither A1 nor A2. The dosage must be 0.
-            0.0
+            None
         }
     }
 
@@ -1098,98 +1110,114 @@ pub fn resolve_complex_variants(
                                 }
                             }
 
-                            match valid_interpretations.len() {
-                                0 => {
-                                    let mut counted_cols = AHashSet::new();
-                                    for score_info in &group_rule.score_applications {
-                                        counted_cols.insert(score_info.score_column_index);
-                                    }
-                                    for &score_col_idx in counted_cols.iter() {
-                                        person_counts_slice[score_col_idx.0] += 1;
-                                    }
+                            for score_info in &group_rule.score_applications {
+                                let matching_interpretations: Vec<_> = valid_interpretations
+                                    .iter()
+                                    .copied()
+                                    .filter(|(_, context)| {
+                                        score_allele_pair_matches(score_info, &context.1, &context.2)
+                                    })
+                                    .collect();
+
+                                if matching_interpretations.is_empty() {
+                                    person_counts_slice[score_info.score_column_index.0] += 1;
+                                    continue;
                                 }
-                                1 => {
-                                    let (packed_geno, context) = valid_interpretations[0];
+
+                                if matching_interpretations.len() == 1 {
+                                    let (packed_geno, context) = matching_interpretations[0];
                                     let (_, bim_a1, bim_a2) = context;
-
-                                    for score_info in &group_rule.score_applications {
-                                        let effect_allele = &score_info.effect_allele;
-                                        if effect_allele != bim_a1 && effect_allele != bim_a2 {
-                                            continue;
-                                        }
-                                        let dosage = Heuristic::calculate_dosage(packed_geno, bim_a1, bim_a2, effect_allele);
-                                        person_scores_slice[score_info.score_column_index.0] += dosage * score_info.weight as f64;
+                                    if let Some(dosage) = Heuristic::calculate_score_dosage(
+                                        packed_geno, bim_a1, bim_a2, score_info,
+                                    ) {
+                                        person_scores_slice[score_info.score_column_index.0] +=
+                                            dosage * score_info.weight as f64;
+                                    } else {
+                                        person_counts_slice[score_info.score_column_index.0] += 1;
                                     }
+                                    continue;
                                 }
-                                _ => {
-                                    for score_info in &group_rule.score_applications {
-                                        let matching_interpretations: Vec<_> = valid_interpretations.iter().copied().filter(|(_, context)| {
-                                            score_info.effect_allele == context.1 || score_info.effect_allele == context.2
-                                        }).collect();
-                                        if matching_interpretations.is_empty() {
-                                            continue;
-                                        }
 
-                                        let context = ResolutionContext {
-                                            score_info,
-                                            conflicting_interpretations: &matching_interpretations,
+                                let context = ResolutionContext {
+                                    score_info,
+                                    conflicting_interpretations: &matching_interpretations,
+                                };
+
+                                if let Some(resolution) = pipeline.resolve(&context) {
+                                    person_scores_slice[score_info.score_column_index.0] +=
+                                        resolution.chosen_dosage * score_info.weight as f64;
+
+                                    let (count, samples) = local_collector
+                                        .entry(resolution.method_used)
+                                        .or_insert((0, Vec::new()));
+                                    *count += 1;
+                                    if samples.len() < 5 {
+                                        let resolution_method = match resolution.method_used {
+                                            Heuristic::ExactScoreAlleleMatch => ResolutionMethod::ExactScoreAlleleMatch { chosen_dosage: resolution.chosen_dosage },
+                                            Heuristic::PrioritizeUnambiguousGenotype => ResolutionMethod::PrioritizeUnambiguousGenotype { chosen_dosage: resolution.chosen_dosage },
+                                            Heuristic::PreferMatchingAlleleStructure => ResolutionMethod::PreferMatchingAlleleStructure { chosen_dosage: resolution.chosen_dosage },
+                                            Heuristic::ConsistentDosage => ResolutionMethod::ConsistentDosage { dosage: resolution.chosen_dosage },
+                                            Heuristic::PreferHeterozygous => ResolutionMethod::PreferHeterozygous { chosen_dosage: resolution.chosen_dosage },
+                                            Heuristic::IndelAnchorBase => ResolutionMethod::IndelAnchorBase { chosen_dosage: resolution.chosen_dosage },
+                                            Heuristic::FallbackOpposingHomozygousAsHet => ResolutionMethod::FallbackOpposingHomozygousAsHet { chosen_dosage: resolution.chosen_dosage },
+                                            Heuristic::FallbackAverageDosageAcrossConflicts => ResolutionMethod::FallbackAverageDosageAcrossConflicts { chosen_dosage: resolution.chosen_dosage },
                                         };
 
-                                        if let Some(resolution) = pipeline.resolve(&context) {
-                                            person_scores_slice[score_info.score_column_index.0] +=
-                                                resolution.chosen_dosage * score_info.weight as f64;
-
-                                            let (count, samples) = local_collector.entry(resolution.method_used).or_insert((0, Vec::new()));
-                                            *count += 1;
-                                            if samples.len() < 5 {
-                                                let resolution_method = match resolution.method_used {
-                                                    Heuristic::ExactScoreAlleleMatch => ResolutionMethod::ExactScoreAlleleMatch { chosen_dosage: resolution.chosen_dosage },
-                                                    Heuristic::PrioritizeUnambiguousGenotype => ResolutionMethod::PrioritizeUnambiguousGenotype { chosen_dosage: resolution.chosen_dosage },
-                                                    Heuristic::PreferMatchingAlleleStructure => ResolutionMethod::PreferMatchingAlleleStructure { chosen_dosage: resolution.chosen_dosage },
-                                                    Heuristic::ConsistentDosage => ResolutionMethod::ConsistentDosage { dosage: resolution.chosen_dosage },
-                                                    Heuristic::PreferHeterozygous => ResolutionMethod::PreferHeterozygous { chosen_dosage: resolution.chosen_dosage },
-                                                    Heuristic::IndelAnchorBase => ResolutionMethod::IndelAnchorBase { chosen_dosage: resolution.chosen_dosage },
-                                                    Heuristic::FallbackOpposingHomozygousAsHet => ResolutionMethod::FallbackOpposingHomozygousAsHet { chosen_dosage: resolution.chosen_dosage },
-                                                    Heuristic::FallbackAverageDosageAcrossConflicts => ResolutionMethod::FallbackAverageDosageAcrossConflicts { chosen_dosage: resolution.chosen_dosage },
-                                                };
-
-                                                let conflicts = valid_interpretations.iter().map(|(bits, ctx)| ConflictSource {
-                                                    bim_row: ctx.0,
-                                                    alleles: (ctx.1.clone(), ctx.2.clone()),
-                                                    genotype_bits: *bits,
-                                                }).collect();
-
-                                                samples.push(CriticalIntegrityWarningInfo {
-                                                    iid: prep_result.final_person_iids[person_output_idx].clone(),
-                                                    locus_chr_pos: group_rule.locus_chr_pos.clone(),
-                                                    score_name: prep_result.score_names[score_info.score_column_index.0].clone(),
-                                                    conflicts,
-                                                    resolution_method,
-                                                    score_effect_allele: score_info.effect_allele.clone(),
-                                                    score_other_allele: score_info.other_allele.clone(),
-                                                });
-                                            }
-                                        } else {
-                                            let conflicts = valid_interpretations.iter().map(|(bits, ctx)| ConflictSource {
+                                        let conflicts = matching_interpretations
+                                            .iter()
+                                            .map(|(bits, ctx)| ConflictSource {
                                                 bim_row: ctx.0,
                                                 alleles: (ctx.1.clone(), ctx.2.clone()),
                                                 genotype_bits: *bits,
-                                            }).collect();
+                                            })
+                                            .collect();
 
-                                            let data = FatalAmbiguityData {
-                                                iid: prep_result.final_person_iids[person_output_idx].clone(),
-                                                locus_chr_pos: group_rule.locus_chr_pos.clone(),
-                                                score_name: prep_result.score_names[score_info.score_column_index.0].clone(),
-                                                conflicts,
-                                            };
-
-                                            if fatal_error_flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
-                                                *fatal_error_slot.lock().unwrap() =
-                                                    Some(FatalError::Ambiguity(data));
-                                            }
-                                            return Err(());
-                                        }
+                                        samples.push(CriticalIntegrityWarningInfo {
+                                            iid: prep_result.final_person_iids[person_output_idx]
+                                                .clone(),
+                                            locus_chr_pos: group_rule.locus_chr_pos.clone(),
+                                            score_name: prep_result.score_names
+                                                [score_info.score_column_index.0]
+                                                .clone(),
+                                            conflicts,
+                                            resolution_method,
+                                            score_effect_allele: score_info.effect_allele.clone(),
+                                            score_other_allele: score_info.other_allele.clone(),
+                                        });
                                     }
+                                } else {
+                                    let conflicts = matching_interpretations
+                                        .iter()
+                                        .map(|(bits, ctx)| ConflictSource {
+                                            bim_row: ctx.0,
+                                            alleles: (ctx.1.clone(), ctx.2.clone()),
+                                            genotype_bits: *bits,
+                                        })
+                                        .collect();
+
+                                    let data = FatalAmbiguityData {
+                                        iid: prep_result.final_person_iids[person_output_idx]
+                                            .clone(),
+                                        locus_chr_pos: group_rule.locus_chr_pos.clone(),
+                                        score_name: prep_result.score_names
+                                            [score_info.score_column_index.0]
+                                            .clone(),
+                                        conflicts,
+                                    };
+
+                                    if fatal_error_flag
+                                        .compare_exchange(
+                                            false,
+                                            true,
+                                            Ordering::AcqRel,
+                                            Ordering::Relaxed,
+                                        )
+                                        .is_ok()
+                                    {
+                                        *fatal_error_slot.lock().unwrap() =
+                                            Some(FatalError::Ambiguity(data));
+                                    }
+                                    return Err(());
                                 }
                             }
                         }

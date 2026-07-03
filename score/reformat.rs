@@ -16,6 +16,9 @@ use std::num::ParseIntError;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use crate::score::types::parse_chromosome_label;
+use crate::shared::files::validate_plink_bed_header;
+
 // ========================================================================================
 //                                   Public API
 // ========================================================================================
@@ -647,10 +650,23 @@ pub fn reformat_pgs_file(
         else {
             return Ok(make_skip("Missing effect_weight value".to_string()));
         };
-        let oa_str = column_indices
+        let Some(oa_str) = column_indices
             .oa
             .and_then(|i| fields.get(i))
-            .map_or("N", |s| if s.is_empty() { "N" } else { *s });
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        else {
+            return Err(ReformatError::MissingColumns {
+                path: input_path.to_path_buf(),
+                line_number,
+                line_content: line.to_string(),
+                missing_column_name: "other_allele".to_string(),
+                column_diagnostics: Some(
+                    "Score rows must provide an explicit effect_allele/other_allele pair."
+                        .to_string(),
+                ),
+            });
+        };
 
         let variant_id = format!("{}:{}", key.0, key.1);
         let line_data = format!("{variant_id}\t{ea_str}\t{oa_str}\t{weight_str}");
@@ -919,6 +935,12 @@ pub fn sort_plink_fileset(
             details: "BED file is smaller than the 3-byte PLINK header.".to_string(),
         });
     }
+    validate_plink_bed_header(&mmap[..3], bed_path).map_err(|details| {
+        ReformatError::InvalidPlinkFileset {
+            path: bed_path.to_path_buf(),
+            details,
+        }
+    })?;
 
     let expected_bytes = 3 + keyed_lines.len() * bytes_per_variant;
     if mmap.len() < expected_bytes {
@@ -997,40 +1019,7 @@ struct SkipRecord {
 }
 
 fn parse_key(chr_str: &str, pos_str: &str) -> Result<(u8, u32), String> {
-    // First, check for special, non-numeric chromosome names case-insensitively.
-    if chr_str.eq_ignore_ascii_case("X") {
-        let pos_num: u32 = pos_str
-            .parse()
-            .map_err(|e: ParseIntError| format!("Invalid position '{pos_str}': {e}"))?;
-        return Ok((23, pos_num));
-    }
-    if chr_str.eq_ignore_ascii_case("Y") {
-        let pos_num: u32 = pos_str
-            .parse()
-            .map_err(|e: ParseIntError| format!("Invalid position '{pos_str}': {e}"))?;
-        return Ok((24, pos_num));
-    }
-    if chr_str.eq_ignore_ascii_case("MT") {
-        let pos_num: u32 = pos_str
-            .parse()
-            .map_err(|e: ParseIntError| format!("Invalid position '{pos_str}': {e}"))?;
-        return Ok((25, pos_num));
-    }
-
-    // Next, handle numeric chromosomes, stripping a potential "chr" prefix case-insensitively.
-    let number_part = if chr_str.len() >= 3 && chr_str[..3].eq_ignore_ascii_case("chr") {
-        &chr_str[3..]
-    } else {
-        chr_str
-    };
-
-    // Now, parse the remaining part.
-    let chr_num: u8 = number_part.parse().map_err(|_| {
-        format!(
-            "Invalid chromosome format '{chr_str}'. Expected a number, 'X', 'Y', 'MT', or 'chr' prefix."
-        )
-    })?;
-
+    let chr_num = parse_chromosome_label(chr_str)?;
     let pos_num: u32 = pos_str
         .parse()
         .map_err(|e: ParseIntError| format!("Invalid position '{pos_str}': {e}"))?;

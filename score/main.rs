@@ -208,6 +208,11 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
             &args.input_path,
             &native_score_files,
             args.keep.as_deref(),
+            if score_regions_map.is_empty() {
+                None
+            } else {
+                Some(&score_regions_map)
+            },
         )?;
         eprintln!(
             "> Native VCF scoring complete in {:.2?}. Found {} individuals to score and {} overlapping score variants across {} score(s).",
@@ -512,6 +517,69 @@ fn read_label_from_cached_file(path: &Path) -> Result<String, Box<dyn Error + Se
     Err(format!("Empty cached file '{}'", path.display()).into())
 }
 
+fn read_score_names_from_cached_file(
+    path: &Path,
+) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    for line in reader.lines() {
+        let line = line?;
+        if line.starts_with('#') {
+            continue;
+        }
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() >= 4
+            && cols[0] == "variant_id"
+            && cols[1] == "effect_allele"
+            && cols[2] == "other_allele"
+        {
+            return Ok(cols[3..].iter().map(|s| s.to_string()).collect());
+        }
+        return Err(format!("Invalid header in cached file '{}'", path.display()).into());
+    }
+    Err(format!("Empty cached file '{}'", path.display()).into())
+}
+
+fn sorted_native_score_path(path: &Path) -> PathBuf {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy())
+        .unwrap_or_else(|| "score".into());
+    parent.join(format!("{stem}.sorted.gnomon.tsv"))
+}
+
+fn sort_native_score_files(
+    native_score_files: Vec<PathBuf>,
+) -> Result<Vec<PathBuf>, Box<dyn Error + Send + Sync>> {
+    let mut sorted_files = Vec::with_capacity(native_score_files.len());
+    for path in native_score_files {
+        let sorted_path = sorted_native_score_path(&path);
+        let should_sort = if sorted_path.exists() {
+            let source_meta = fs::metadata(&path).and_then(|m| m.modified());
+            let sorted_meta = fs::metadata(&sorted_path).and_then(|m| m.modified());
+            match (source_meta, sorted_meta) {
+                (Ok(src_time), Ok(sorted_time)) => src_time > sorted_time,
+                _ => true,
+            }
+        } else {
+            true
+        };
+        if should_sort {
+            reformat::sort_native_file(&path, &sorted_path)?;
+        }
+        sorted_files.push(sorted_path);
+    }
+    sorted_files.sort();
+    sorted_files.dedup();
+    Ok(sorted_files)
+}
+
 fn normalize_score_files(
     score_files: &[PathBuf],
 ) -> Result<Vec<PathBuf>, Box<dyn Error + Send + Sync>> {
@@ -614,17 +682,19 @@ fn normalize_score_files(
     for ((src_path, _), row) in prep_items.iter().zip(reformat_results.into_iter()) {
         match row.map_err(Box::new)? {
             None => continue,
-            Some((label, out_path, skip_summary)) => {
-                if let Some(existing_path) = label_to_path.get(&label) {
-                    return Err(format!(
-                        "Duplicate Score ID '{}' detected!\n  File 1: '{}'\n  File 2: '{}'\nPlease ensure each score file has a unique identifier.",
-                        label,
-                        existing_path.display(),
-                        src_path.display()
-                    )
-                    .into());
+            Some((_label, out_path, skip_summary)) => {
+                for label in read_score_names_from_cached_file(&out_path)? {
+                    if let Some(existing_path) = label_to_path.get(&label) {
+                        return Err(format!(
+                            "Duplicate Score ID '{}' detected!\n  File 1: '{}'\n  File 2: '{}'\nPlease ensure each score column has a unique identifier.",
+                            label,
+                            existing_path.display(),
+                            src_path.display()
+                        )
+                        .into());
+                    }
+                    label_to_path.insert(label, src_path.clone());
                 }
-                label_to_path.insert(label, src_path.clone());
                 if let Some(summary) = skip_summary {
                     skip_summaries.push(summary);
                 }
@@ -640,7 +710,7 @@ fn normalize_score_files(
         return Err("No compatible score files remained after normalization. Scores that only provide dosage-specific weights ('dosage_0_weight', 'dosage_1_weight', 'dosage_2_weight') are currently unsupported.".into());
     }
 
-    Ok(native_score_files)
+    sort_native_score_files(native_score_files)
 }
 
 /// **Helper 1:** Encapsulates the entire preparation and file normalization phase.
@@ -805,16 +875,18 @@ fn run_preparation_phase(
     for ((src_path, _), row) in prep_items.iter().zip(reformat_results.into_iter()) {
         match row.map_err(Box::new)? {
             None => continue,
-            Some((label, out_path, skip_summary)) => {
-                if let Some(existing_path) = label_to_path.get(&label) {
-                    return Err(format!(
-                        "Duplicate Score ID '{}' detected!\n  File 1: '{}'\n  File 2: '{}'\nPlease ensure each score file has a unique identifier.",
-                        label,
-                        existing_path.display(),
-                        src_path.display()
-                    ).into());
+            Some((_label, out_path, skip_summary)) => {
+                for label in read_score_names_from_cached_file(&out_path)? {
+                    if let Some(existing_path) = label_to_path.get(&label) {
+                        return Err(format!(
+                            "Duplicate Score ID '{}' detected!\n  File 1: '{}'\n  File 2: '{}'\nPlease ensure each score column has a unique identifier.",
+                            label,
+                            existing_path.display(),
+                            src_path.display()
+                        ).into());
+                    }
+                    label_to_path.insert(label, src_path.clone());
                 }
-                label_to_path.insert(label, src_path.clone());
                 if let Some(summary) = skip_summary {
                     skip_summaries.push(summary);
                 }
@@ -835,6 +907,7 @@ Scores that only provide dosage-specific weights \
 ('dosage_0_weight', 'dosage_1_weight', 'dosage_2_weight') are currently unsupported."
             .into());
     }
+    let native_score_files = sort_native_score_files(native_score_files)?;
 
     // --- Run the main preparation logic with the fully normalized and sorted files ---
     let prep = prepare::prepare_for_computation(
@@ -996,7 +1069,14 @@ fn resolve_filesets(path: &Path) -> Result<Vec<PathBuf>, Box<dyn Error + Send + 
     let mut bed_files: Vec<PathBuf> = fs::read_dir(path)?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .filter(|p| p.is_file() && p.extension().is_some_and(|ext| ext == "bed"))
+        .filter(|p| {
+            p.is_file()
+                && p.extension().is_some_and(|ext| ext == "bed")
+                && !p
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .is_some_and(|stem| stem.ends_with(".sorted"))
+        })
         .collect();
 
     if bed_files.is_empty() {

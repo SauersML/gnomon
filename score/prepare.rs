@@ -207,6 +207,17 @@ fn apply_simple_score_assignment(entry: &mut SimpleScoreAssignment, weight: f32,
     }
 }
 
+#[inline(always)]
+fn allele_pair_matches(
+    effect_allele: &str,
+    other_allele: &str,
+    bim_a1: &str,
+    bim_a2: &str,
+) -> bool {
+    (effect_allele == bim_a1 && other_allele == bim_a2)
+        || (effect_allele == bim_a2 && other_allele == bim_a1)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LineReadOutcome {
     Pushed,
@@ -590,12 +601,8 @@ fn prepare_for_computation_with_retry(
                         key_complex_indices.insert(*bim_idx);
                     }
 
-                    let mut counted_cols: AHashSet<ScoreColumnIndex> = AHashSet::new();
                     for (score_col_idx, _, _, _) in &scores {
-                        counted_cols.insert(*score_col_idx);
-                    }
-                    for score_col in counted_cols {
-                        score_variant_counts[score_col.0] += 1;
+                        score_variant_counts[score_col_idx.0] += 1;
                     }
 
                     let chr_str = match key.0 {
@@ -1514,6 +1521,12 @@ impl KWayMergeIterator {
                         continue; // Line doesn't have the required three non-empty columns
                     }
                 };
+            if other_allele == "N" {
+                return Err(PrepError::Parse(format!(
+                    "Score file line {} has unknown other_allele 'N'. Scores must provide an explicit allele pair.",
+                    stream.file_line_number
+                )));
+            }
 
             let mut key_parts = variant_id.splitn(2, ':');
             let chr_str = key_parts.next().unwrap_or("");
@@ -1526,23 +1539,35 @@ impl KWayMergeIterator {
             ));
 
             for (i, weight_str) in parts.enumerate() {
-                if let Ok(weight) = weight_str.trim().parse::<f32>()
-                    && let Some(&score_column_index) = column_map.get(i)
-                {
-                    if let Some(filters) = region_filters {
-                        if let Some(Some(region)) = filters.get(score_column_index.0)
-                            && !region.contains(key)
-                        {
-                            continue;
-                        }
-                        if let Some(hit_flags) = region_hits.as_deref_mut() {
-                            hit_flags[score_column_index.0] = true;
-                        }
-                    } else if let Some(hit_flags) = region_hits.as_deref_mut() {
+                let weight_str = weight_str.trim();
+                if weight_str.is_empty() {
+                    continue;
+                }
+                let Some(&score_column_index) = column_map.get(i) else {
+                    continue;
+                };
+                let weight = weight_str.parse::<f32>().map_err(|err| {
+                    PrepError::Parse(format!(
+                        "Invalid weight '{}' in score file line {}, column {}: {}",
+                        weight_str,
+                        stream.file_line_number,
+                        i + 4,
+                        err
+                    ))
+                })?;
+                if let Some(filters) = region_filters {
+                    if let Some(Some(region)) = filters.get(score_column_index.0)
+                        && !region.contains(key)
+                    {
+                        continue;
+                    }
+                    if let Some(hit_flags) = region_hits.as_deref_mut() {
                         hit_flags[score_column_index.0] = true;
                     }
-                    stream.line_buffer.push_back((weight, score_column_index));
+                } else if let Some(hit_flags) = region_hits.as_deref_mut() {
+                    hit_flags[score_column_index.0] = true;
                 }
+                stream.line_buffer.push_back((weight, score_column_index));
             }
             if stream.line_buffer.is_empty() {
                 stream.current_line_info = None;
@@ -1611,16 +1636,34 @@ fn resolve_matches_for_score_line<'a>(
     let is_multiallelic_site = bim_records_for_position.len() > 1;
 
     if is_multiallelic_site {
-        let all_contexts_for_locus = bim_records_for_position.iter().collect();
-        return Ok(ReconciliationOutcome::Complex(all_contexts_for_locus));
+        let pair_contexts_for_locus: Vec<_> = bim_records_for_position
+            .iter()
+            .filter(|record_tuple| {
+                allele_pair_matches(
+                    score_record.effect_allele.as_ref(),
+                    score_record.other_allele.as_ref(),
+                    record_tuple.allele1.as_str(),
+                    record_tuple.allele2.as_str(),
+                )
+            })
+            .collect();
+        return if pair_contexts_for_locus.is_empty() {
+            Ok(ReconciliationOutcome::NotFound)
+        } else {
+            Ok(ReconciliationOutcome::Complex(pair_contexts_for_locus))
+        };
     }
 
     let mut simple_matches = BTreeMap::new();
     let effect_allele = score_record.effect_allele.as_ref();
+    let other_allele = score_record.other_allele.as_ref();
     for record_tuple in bim_records_for_position {
-        if record_tuple.allele1.as_str() == effect_allele
-            || record_tuple.allele2.as_str() == effect_allele
-        {
+        if allele_pair_matches(
+            effect_allele,
+            other_allele,
+            record_tuple.allele1.as_str(),
+            record_tuple.allele2.as_str(),
+        ) {
             simple_matches.insert(record_tuple.bim_row_index, record_tuple);
         }
     }
@@ -1708,7 +1751,15 @@ fn parse_fam_and_build_lookup(
                 });
             }
         } else {
+            let mut seen_iids = AHashSet::new();
             for (idx, iid) in iids.iter().enumerate() {
+                if !seen_iids.insert(iid.clone()) {
+                    return Err(PrepError::Parse(format!(
+                        "Duplicate IID '{}' in FAM file '{}'. gnomon requires unique output IIDs.",
+                        iid,
+                        fileset.fam.display()
+                    )));
+                }
                 let idx_u32 = u32::try_from(idx).map_err(|_| {
                     PrepError::Invariant(format!(
                         "FAM index {idx} exceeds u32::MAX while building lookup."
@@ -1791,9 +1842,9 @@ fn format_missing_ids_error(missing_ids: Vec<String>) -> String {
 /// Parses only the headers of multiple score files to quickly build a complete,
 /// sorted, and unique list of all score columns across all files.
 pub fn parse_score_file_headers_only(score_files: &[PathBuf]) -> Result<Vec<String>, PrepError> {
-    let all_score_names: BTreeSet<String> = score_files
+    let per_file_score_names: Vec<(PathBuf, Vec<String>)> = score_files
         .par_iter()
-        .map(|path| -> Result<Vec<String>, PrepError> {
+        .map(|path| -> Result<(PathBuf, Vec<String>), PrepError> {
             let file = File::open(path).map_err(|e| PrepError::Io(e, path.to_path_buf()))?;
             let mut reader = BufReader::new(file);
             let mut header_line = String::new();
@@ -1830,13 +1881,32 @@ pub fn parse_score_file_headers_only(score_files: &[PathBuf]) -> Result<Vec<Stri
                 .map(|s| s.to_string())
                 .collect();
 
-            Ok(score_names)
+            Ok((path.clone(), score_names))
         })
-        .collect::<Result<Vec<Vec<String>>, PrepError>>()?
-        .into_iter()
-        .flatten()
-        .collect();
+        .collect::<Result<Vec<_>, PrepError>>()?;
 
+    let mut owner_by_name = HashMap::<String, PathBuf>::new();
+    let mut all_score_names = Vec::new();
+    for (path, names) in per_file_score_names {
+        for name in names {
+            if name.is_empty() {
+                return Err(PrepError::Header(format!(
+                    "Empty score name in \"{}\".",
+                    path.display()
+                )));
+            }
+            if let Some(existing_path) = owner_by_name.insert(name.clone(), path.clone()) {
+                return Err(PrepError::Header(format!(
+                    "Duplicate Score ID '{}' detected.\n  File 1: '{}'\n  File 2: '{}'\nPlease ensure each score column has a unique identifier.",
+                    name,
+                    existing_path.display(),
+                    path.display()
+                )));
+            }
+            all_score_names.push(name);
+        }
+    }
+    all_score_names.sort();
     Ok(all_score_names.into_iter().collect())
 }
 

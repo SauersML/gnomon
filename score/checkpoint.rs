@@ -1,4 +1,4 @@
-use crate::score::types::PreparationResult;
+use crate::score::types::{FilesetBoundary, PipelineKind, PreparationResult};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -116,7 +116,80 @@ pub fn fingerprint_preparation(prep: &PreparationResult) -> [u8; 32] {
     for &correction in prep.sparse_missing_corrections() {
         hasher.update(correction.to_le_bytes());
     }
+    update_pipeline_identity(&mut hasher, &prep.pipeline_kind);
     hasher.finalize().into()
+}
+
+fn update_pipeline_identity(hasher: &mut Sha256, pipeline_kind: &PipelineKind) {
+    match pipeline_kind {
+        PipelineKind::SingleFile(bed_path) => {
+            hasher.update([0]);
+            update_path_identity(hasher, bed_path, true);
+            update_sibling_identity(hasher, bed_path, "bim");
+            update_sibling_identity(hasher, bed_path, "fam");
+        }
+        PipelineKind::MultiFile(boundaries) => {
+            hasher.update([1]);
+            update_usize(hasher, boundaries.len());
+            for boundary in boundaries {
+                update_fileset_boundary_identity(hasher, boundary);
+            }
+        }
+    }
+}
+
+fn update_fileset_boundary_identity(hasher: &mut Sha256, boundary: &FilesetBoundary) {
+    update_path_identity(hasher, &boundary.bed_path, true);
+    update_path_identity(hasher, &boundary.bim_path, false);
+    update_path_identity(hasher, &boundary.fam_path, false);
+    update_u64(hasher, boundary.starting_global_index);
+}
+
+fn update_sibling_identity(hasher: &mut Sha256, bed_path: &Path, extension: &str) {
+    update_path_identity(hasher, &bed_path.with_extension(extension), false);
+}
+
+fn update_path_identity(hasher: &mut Sha256, path: &Path, include_bed_header: bool) {
+    update_bytes(hasher, path.to_string_lossy().as_bytes());
+    match fs::metadata(path) {
+        Ok(metadata) => {
+            hasher.update([1]);
+            update_u64(hasher, metadata.len());
+            if let Ok(modified) = metadata.modified() {
+                update_system_time(hasher, modified);
+            } else {
+                hasher.update([0]);
+            }
+        }
+        Err(_) => {
+            hasher.update([0]);
+        }
+    }
+    if include_bed_header {
+        let mut header = [0u8; 3];
+        match File::open(path).and_then(|mut file| file.read_exact(&mut header)) {
+            Ok(()) => {
+                hasher.update([1]);
+                hasher.update(header);
+            }
+            Err(_) => {
+                hasher.update([0]);
+            }
+        }
+    }
+}
+
+fn update_system_time(hasher: &mut Sha256, time: SystemTime) {
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => {
+            hasher.update([1]);
+            update_u64(hasher, duration.as_secs());
+            hasher.update(duration.subsec_nanos().to_le_bytes());
+        }
+        Err(_) => {
+            hasher.update([0]);
+        }
+    }
 }
 
 pub fn load_checkpoint(

@@ -1,11 +1,10 @@
-use crate::score::types::parse_chromosome_label;
+use crate::score::types::{GenomicRegion, parse_chromosome_label};
 use crate::shared::files::{VariantCompression, VariantFormat, open_variant_source};
 use ahash::{AHashMap, AHashSet};
 use flate2::read::MultiGzDecoder;
 use noodles_vcf::io::Reader as VcfReader;
 use noodles_vcf::variant::record::AlternateBases as _;
 use noodles_vcf::variant::record::samples::keys::key;
-use std::collections::BTreeMap;
 use std::error::Error;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
@@ -32,8 +31,8 @@ struct ScoreRule {
 #[derive(Debug, Clone, Copy)]
 struct MatchedRule {
     score_index: usize,
-    intercept: f64,
-    alt_slope: f64,
+    weight: f64,
+    effect_is_ref: bool,
 }
 
 type VariantKey = (u8, u32);
@@ -42,9 +41,9 @@ pub fn score_vcf_streaming(
     input_path: &Path,
     native_score_files: &[PathBuf],
     keep: Option<&Path>,
+    score_regions: Option<&std::collections::HashMap<String, GenomicRegion>>,
 ) -> Result<NativeVcfScoreResult, Box<dyn Error + Send + Sync>> {
-    let score_names = parse_score_names(native_score_files)?;
-    let rules_by_key = load_score_rules(native_score_files)?;
+    let (score_names, rules_by_key) = load_score_rules(native_score_files, score_regions)?;
 
     let source = open_variant_source(input_path)?;
     if source.format() != VariantFormat::Vcf {
@@ -129,19 +128,44 @@ pub fn score_vcf_streaming(
                 &mut decoded,
             )?;
 
+            let mut counted_scores = AHashSet::new();
             for rule in &matched_rules {
-                score_variant_counts[rule.score_index] += 1;
-                matched_variant_keys.insert((key, alt_index, rule.score_index));
+                if counted_scores.insert(rule.score_index) {
+                    score_variant_counts[rule.score_index] += 1;
+                    matched_variant_keys.insert((key, alt_index, rule.score_index));
+                }
             }
 
             for (out_person_idx, dosage) in decoded.iter().copied().enumerate() {
-                for rule in &matched_rules {
-                    let cell = out_person_idx * num_scores + rule.score_index;
-                    match dosage {
-                        Some(alt_dosage) => {
-                            sum_scores[cell] += rule.intercept + rule.alt_slope * alt_dosage;
+                match dosage {
+                    Some(decoded_dosage) => {
+                        for rule in &matched_rules {
+                            let cell = out_person_idx * num_scores + rule.score_index;
+                            let effect_dosage = if rule.effect_is_ref {
+                                decoded_dosage
+                                    .ploidy
+                                    .map(|ploidy| ploidy as f64 - decoded_dosage.alt_dosage)
+                                    .ok_or_else(|| {
+                                        format!(
+                                            "Cannot score REF-effect rule for score '{}' at {}:{} from DS/GP dosage without genotype ploidy.",
+                                            score_names[rule.score_index],
+                                            record.reference_sequence_name(),
+                                            pos,
+                                        )
+                                    })?
+                            } else {
+                                decoded_dosage.alt_dosage
+                            };
+                            sum_scores[cell] += rule.weight * effect_dosage;
                         }
-                        None => {
+                    }
+                    None => {
+                        let mut counted_missing_scores = AHashSet::new();
+                        for rule in &matched_rules {
+                            if !counted_missing_scores.insert(rule.score_index) {
+                                continue;
+                            }
+                            let cell = out_person_idx * num_scores + rule.score_index;
                             missing_counts[cell] += 1;
                         }
                     }
@@ -168,46 +192,25 @@ pub fn score_vcf_streaming(
     })
 }
 
-fn parse_score_names(
-    native_score_files: &[PathBuf],
-) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
-    let mut names = Vec::with_capacity(native_score_files.len());
-    for path in native_score_files {
-        let mut reader = open_text_reader(path)?;
-        let mut line = String::new();
-        loop {
-            line.clear();
-            if reader.read_line(&mut line)? == 0 {
-                return Err(format!("Score file '{}' is empty.", path.display()).into());
-            }
-            if !line.starts_with('#') {
-                break;
-            }
-        }
-
-        let header: Vec<&str> = line.trim_end().split('\t').collect();
-        if header.len() < 4
-            || header[0] != "variant_id"
-            || header[1] != "effect_allele"
-            || header[2] != "other_allele"
-        {
-            return Err(format!(
-                "Invalid native score header in '{}'; expected variant_id/effect_allele/other_allele/score.",
-                path.display()
-            )
-            .into());
-        }
-        names.push(header[3].to_string());
-    }
-    Ok(names)
-}
-
 fn load_score_rules(
     native_score_files: &[PathBuf],
-) -> Result<AHashMap<VariantKey, Vec<ScoreRule>>, Box<dyn Error + Send + Sync>> {
+    score_regions: Option<&std::collections::HashMap<String, GenomicRegion>>,
+) -> Result<(Vec<String>, AHashMap<VariantKey, Vec<ScoreRule>>), Box<dyn Error + Send + Sync>> {
+    let headers = read_score_headers(native_score_files)?;
+    let mut score_names: Vec<String> = headers
+        .iter()
+        .flat_map(|header| header.score_names.iter().cloned())
+        .collect();
+    score_names.sort();
+    let score_name_to_index: AHashMap<String, usize> = score_names
+        .iter()
+        .enumerate()
+        .map(|(idx, name)| (name.clone(), idx))
+        .collect();
     let mut rules_by_key: AHashMap<VariantKey, Vec<ScoreRule>> = AHashMap::new();
 
-    for (score_index, path) in native_score_files.iter().enumerate() {
+    for header in &headers {
+        let path = &header.path;
         let mut reader = open_text_reader(path)?;
         let mut line = String::new();
         let mut line_number = 0u64;
@@ -220,8 +223,8 @@ fn load_score_rules(
                 continue;
             }
 
-            let mut fields = trimmed.split('\t');
-            let Some(variant_id) = fields.next() else {
+            let fields: Vec<&str> = trimmed.split('\t').collect();
+            let Some(&variant_id) = fields.first() else {
                 line.clear();
                 continue;
             };
@@ -229,12 +232,19 @@ fn load_score_rules(
                 line.clear();
                 continue;
             }
-            let effect_allele = fields.next().unwrap_or_default();
-            let other_allele = fields.next().unwrap_or_default();
-            let weight_text = fields.next().unwrap_or_default();
-            if effect_allele.is_empty() || other_allele.is_empty() || weight_text.is_empty() {
+            let effect_allele = fields.get(1).copied().unwrap_or_default();
+            let other_allele = fields.get(2).copied().unwrap_or_default();
+            if effect_allele.is_empty() || other_allele.is_empty() {
                 return Err(format!(
                     "Malformed native score row in '{}' at line {}.",
+                    path.display(),
+                    line_number
+                )
+                .into());
+            }
+            if other_allele == "N" {
+                return Err(format!(
+                    "Native score row in '{}' at line {} has unknown other_allele 'N'. Scores must provide an explicit allele pair.",
                     path.display(),
                     line_number
                 )
@@ -262,27 +272,114 @@ fn load_score_rules(
                     )
                 })?,
             );
-            let weight = weight_text.parse::<f32>().map_err(|err| {
-                format!(
-                    "Invalid weight in '{}' at line {}: {}",
-                    path.display(),
-                    line_number,
-                    err
-                )
-            })?;
+            for (column_offset, score_name) in header.score_names.iter().enumerate() {
+                let weight_text = fields.get(column_offset + 3).copied().unwrap_or_default();
+                if weight_text.trim().is_empty() {
+                    return Err(format!(
+                        "Missing weight for score '{}' in '{}' at line {}.",
+                        score_name,
+                        path.display(),
+                        line_number
+                    )
+                    .into());
+                }
+                let score_index = *score_name_to_index.get(score_name).ok_or_else(|| {
+                    format!(
+                        "Internal error: score '{}' from '{}' was not indexed.",
+                        score_name,
+                        path.display()
+                    )
+                })?;
+                if let Some(regions) = score_regions
+                    && let Some(region) = regions.get(score_name)
+                    && !region.contains(key)
+                {
+                    continue;
+                }
+                let weight = weight_text.parse::<f32>().map_err(|err| {
+                    format!(
+                        "Invalid weight for score '{}' in '{}' at line {}: {}",
+                        score_name,
+                        path.display(),
+                        line_number,
+                        err
+                    )
+                })?;
 
-            rules_by_key.entry(key).or_default().push(ScoreRule {
-                effect_allele: effect_allele.to_string(),
-                other_allele: other_allele.to_string(),
-                score_index,
-                weight,
-            });
+                rules_by_key.entry(key).or_default().push(ScoreRule {
+                    effect_allele: effect_allele.to_string(),
+                    other_allele: other_allele.to_string(),
+                    score_index,
+                    weight,
+                });
+            }
 
             line.clear();
         }
     }
 
-    Ok(rules_by_key)
+    Ok((score_names, rules_by_key))
+}
+
+#[derive(Debug)]
+struct NativeScoreHeader {
+    path: PathBuf,
+    score_names: Vec<String>,
+}
+
+fn read_score_headers(
+    native_score_files: &[PathBuf],
+) -> Result<Vec<NativeScoreHeader>, Box<dyn Error + Send + Sync>> {
+    let mut headers = Vec::with_capacity(native_score_files.len());
+    let mut seen_names: AHashMap<String, PathBuf> = AHashMap::new();
+    for path in native_score_files {
+        let mut reader = open_text_reader(path)?;
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if reader.read_line(&mut line)? == 0 {
+                return Err(format!("Score file '{}' is empty.", path.display()).into());
+            }
+            if !line.starts_with('#') {
+                break;
+            }
+        }
+
+        let header: Vec<&str> = line.trim_end().split('\t').collect();
+        if header.len() < 4
+            || header[0] != "variant_id"
+            || header[1] != "effect_allele"
+            || header[2] != "other_allele"
+        {
+            return Err(format!(
+                "Invalid native score header in '{}'; expected variant_id/effect_allele/other_allele/score.",
+                path.display()
+            )
+            .into());
+        }
+
+        let mut score_names = Vec::with_capacity(header.len() - 3);
+        for name in &header[3..] {
+            if name.is_empty() {
+                return Err(format!("Empty score name in '{}'.", path.display()).into());
+            }
+            if let Some(existing_path) = seen_names.insert((*name).to_string(), path.clone()) {
+                return Err(format!(
+                    "Duplicate Score ID '{}' detected!\n  File 1: '{}'\n  File 2: '{}'\nPlease ensure each score column has a unique identifier.",
+                    name,
+                    existing_path.display(),
+                    path.display()
+                )
+                .into());
+            }
+            score_names.push((*name).to_string());
+        }
+        headers.push(NativeScoreHeader {
+            path: path.clone(),
+            score_names,
+        });
+    }
+    Ok(headers)
 }
 
 fn match_rules_for_allele(
@@ -290,26 +387,47 @@ fn match_rules_for_allele(
     ref_allele: &str,
     alt_allele: &str,
 ) -> Vec<MatchedRule> {
-    let mut aggregate: BTreeMap<usize, (f64, f64)> = BTreeMap::new();
+    let mut aggregate: AHashMap<(usize, bool), f64> = AHashMap::new();
     for rule in rules {
         if rule.effect_allele == alt_allele && rule.other_allele == ref_allele {
-            let (_, slope) = aggregate.entry(rule.score_index).or_default();
-            *slope += f64::from(rule.weight);
+            *aggregate.entry((rule.score_index, false)).or_default() += f64::from(rule.weight);
         } else if rule.effect_allele == ref_allele && rule.other_allele == alt_allele {
-            let (intercept, slope) = aggregate.entry(rule.score_index).or_default();
-            *intercept += 2.0 * f64::from(rule.weight);
-            *slope -= f64::from(rule.weight);
+            *aggregate.entry((rule.score_index, true)).or_default() += f64::from(rule.weight);
         }
     }
 
-    aggregate
+    let mut matched: Vec<_> = aggregate
         .into_iter()
-        .map(|(score_index, (intercept, alt_slope))| MatchedRule {
+        .map(|((score_index, effect_is_ref), weight)| MatchedRule {
             score_index,
-            intercept,
-            alt_slope,
+            weight,
+            effect_is_ref,
         })
-        .collect()
+        .collect();
+    matched.sort_by_key(|rule| (rule.score_index, rule.effect_is_ref));
+    matched
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DecodedAltDosage {
+    alt_dosage: f64,
+    ploidy: Option<u8>,
+}
+
+impl DecodedAltDosage {
+    fn dosage_only(alt_dosage: f64) -> Self {
+        Self {
+            alt_dosage,
+            ploidy: None,
+        }
+    }
+
+    fn genotype(alt_dosage: f64, ploidy: u8) -> Self {
+        Self {
+            alt_dosage,
+            ploidy: Some(ploidy),
+        }
+    }
 }
 
 fn decode_vcf_record_best(
@@ -317,7 +435,7 @@ fn decode_vcf_record_best(
     alt_index: usize,
     alt_count: usize,
     kept_indices: &[usize],
-    dest: &mut [Option<f64>],
+    dest: &mut [Option<DecodedAltDosage>],
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let samples = record.samples();
     if samples.is_empty() {
@@ -375,14 +493,14 @@ fn decode_vcf_record_best(
         if let Some(value) = ds_field
             && let Some(parsed) = parse_vcf_dosage_field(value, alt_index, alt_count)?
         {
-            dest[kept_cursor] = Some(parsed);
+            dest[kept_cursor] = Some(DecodedAltDosage::dosage_only(parsed));
             kept_cursor += 1;
             continue;
         }
         if let Some(value) = gp_field
             && let Some(parsed) = parse_vcf_gp(value, alt_index, alt_count)?
         {
-            dest[kept_cursor] = Some(parsed);
+            dest[kept_cursor] = Some(DecodedAltDosage::dosage_only(parsed));
             kept_cursor += 1;
             continue;
         }
@@ -496,13 +614,13 @@ fn parse_numeric_str(text: &str) -> Result<Option<f64>, Box<dyn Error + Send + S
 fn parse_vcf_genotype(
     field: &str,
     alt_index: usize,
-) -> Result<Option<f64>, Box<dyn Error + Send + Sync>> {
+) -> Result<Option<DecodedAltDosage>, Box<dyn Error + Send + Sync>> {
     if field.is_empty() {
         return Ok(None);
     }
 
     let mut dosage = 0.0f64;
-    let mut seen = false;
+    let mut ploidy = 0u8;
     let bytes = field.as_bytes();
     let mut idx = 0;
     while idx < bytes.len() {
@@ -519,13 +637,17 @@ fn parse_vcf_genotype(
                 if allele == alt_index {
                     dosage += 1.0;
                 }
-                seen = true;
+                ploidy = ploidy.checked_add(1).ok_or("genotype ploidy overflow")?;
             }
             other => return Err(format!("unexpected byte {other} in genotype field").into()),
         }
     }
 
-    if seen { Ok(Some(dosage)) } else { Ok(None) }
+    if ploidy == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(DecodedAltDosage::genotype(dosage, ploidy)))
+    }
 }
 
 fn resolve_keep_indices(
@@ -583,6 +705,7 @@ fn open_text_reader(path: &Path) -> Result<Box<dyn BufRead>, Box<dyn Error + Sen
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::io::Write;
 
     #[test]
@@ -610,7 +733,7 @@ mod tests {
             writeln!(score, "1:200\tC\tT\t1.0").expect("write");
         }
 
-        let result = score_vcf_streaming(&vcf_path, &[score_path], None).expect("score");
+        let result = score_vcf_streaming(&vcf_path, &[score_path], None, None).expect("score");
         assert_eq!(result.person_iids, vec!["s1", "s2", "s3"]);
         assert_eq!(result.score_names, vec!["ScoreA"]);
         assert_eq!(result.score_variant_counts, [2]);
@@ -653,7 +776,7 @@ mod tests {
         }
 
         let result =
-            score_vcf_streaming(&vcf_path, &[score_path], Some(&keep_path)).expect("score");
+            score_vcf_streaming(&vcf_path, &[score_path], Some(&keep_path), None).expect("score");
         assert_eq!(result.person_iids, vec!["s2", "s4"]);
         assert_eq!(result.score_names, vec!["ScoreA"]);
         assert_eq!(result.score_variant_counts, [2]);
@@ -686,7 +809,7 @@ mod tests {
             writeln!(score, "1:100\tG\tA\t-1.0").expect("write");
         }
 
-        let result = score_vcf_streaming(&vcf_path, &[score_path], None).expect("score");
+        let result = score_vcf_streaming(&vcf_path, &[score_path], None, None).expect("score");
         assert_eq!(result.score_variant_counts, [1]);
         assert_eq!(result.missing_counts, [0, 1]);
         assert_eq!(result.sum_scores, [0.0, 0.0]);
@@ -717,7 +840,7 @@ mod tests {
             writeln!(score, "1:100\tT\tA\t10.0").expect("write");
         }
 
-        let result = score_vcf_streaming(&vcf_path, &[score_path], None).expect("score");
+        let result = score_vcf_streaming(&vcf_path, &[score_path], None, None).expect("score");
         assert_eq!(result.score_variant_counts, [2]);
         assert_eq!(result.missing_counts, [0, 0, 0]);
         assert_eq!(result.sum_scores, [1.0, 10.0, 11.0]);
@@ -753,11 +876,114 @@ mod tests {
             writeln!(score, "1:100\tT\tA\t10.0").expect("write");
         }
 
-        let result = score_vcf_streaming(&vcf_path, &[score_path], None).expect("score");
+        let result = score_vcf_streaming(&vcf_path, &[score_path], None, None).expect("score");
         assert_eq!(result.score_variant_counts, [2]);
         assert_eq!(result.missing_counts, [0, 0]);
         assert!((result.sum_scores[0] - 2.5).abs() < 1e-12);
         assert!((result.sum_scores[1] - 16.2).abs() < 1e-12);
         assert_eq!(result.matched_variants, 2);
+    }
+
+    #[test]
+    fn native_vcf_applies_score_regions_before_scoring() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vcf_path = dir.path().join("cohort.vcf");
+        let score_path = dir.path().join("score.gnomon.tsv");
+
+        {
+            let mut vcf = File::create(&vcf_path).expect("create vcf");
+            writeln!(vcf, "##fileformat=VCFv4.2").expect("write");
+            writeln!(
+                vcf,
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts1"
+            )
+            .expect("write");
+            writeln!(vcf, "1\t100\t.\tA\tG\t.\tPASS\t.\tGT\t0/1").expect("write");
+            writeln!(vcf, "1\t200\t.\tA\tG\t.\tPASS\t.\tGT\t0/1").expect("write");
+        }
+
+        {
+            let mut score = File::create(&score_path).expect("create score");
+            writeln!(score, "variant_id\teffect_allele\tother_allele\tScoreA").expect("write");
+            writeln!(score, "1:100\tG\tA\t1.0").expect("write");
+            writeln!(score, "1:200\tG\tA\t10.0").expect("write");
+        }
+
+        let mut regions = HashMap::new();
+        regions.insert(
+            "ScoreA".to_string(),
+            GenomicRegion {
+                chromosome: 1,
+                start: 100,
+                end: 100,
+            },
+        );
+        let result =
+            score_vcf_streaming(&vcf_path, &[score_path], None, Some(&regions)).expect("score");
+        assert_eq!(result.score_variant_counts, [1]);
+        assert_eq!(result.sum_scores, [1.0]);
+        assert_eq!(result.matched_variants, 1);
+    }
+
+    #[test]
+    fn native_vcf_scores_all_native_score_columns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vcf_path = dir.path().join("cohort.vcf");
+        let score_path = dir.path().join("score.gnomon.tsv");
+
+        {
+            let mut vcf = File::create(&vcf_path).expect("create vcf");
+            writeln!(vcf, "##fileformat=VCFv4.2").expect("write");
+            writeln!(
+                vcf,
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts1\ts2"
+            )
+            .expect("write");
+            writeln!(vcf, "1\t100\t.\tA\tG\t.\tPASS\t.\tGT\t0/1\t1/1").expect("write");
+        }
+
+        {
+            let mut score = File::create(&score_path).expect("create score");
+            writeln!(
+                score,
+                "variant_id\teffect_allele\tother_allele\tScoreA\tScoreB"
+            )
+            .expect("write");
+            writeln!(score, "1:100\tG\tA\t0.5\t2.0").expect("write");
+        }
+
+        let result = score_vcf_streaming(&vcf_path, &[score_path], None, None).expect("score");
+        assert_eq!(result.score_names, vec!["ScoreA", "ScoreB"]);
+        assert_eq!(result.score_variant_counts, [1, 1]);
+        assert_eq!(result.sum_scores, [0.5, 2.0, 1.0, 4.0]);
+    }
+
+    #[test]
+    fn native_vcf_ref_effect_haploid_gt_uses_observed_ploidy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vcf_path = dir.path().join("cohort.vcf");
+        let score_path = dir.path().join("score.gnomon.tsv");
+
+        {
+            let mut vcf = File::create(&vcf_path).expect("create vcf");
+            writeln!(vcf, "##fileformat=VCFv4.2").expect("write");
+            writeln!(
+                vcf,
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts_ref\ts_alt"
+            )
+            .expect("write");
+            writeln!(vcf, "X\t100\t.\tA\tG\t.\tPASS\t.\tGT\t0\t1").expect("write");
+        }
+
+        {
+            let mut score = File::create(&score_path).expect("create score");
+            writeln!(score, "variant_id\teffect_allele\tother_allele\tScoreA").expect("write");
+            writeln!(score, "X:100\tA\tG\t2.0").expect("write");
+        }
+
+        let result = score_vcf_streaming(&vcf_path, &[score_path], None, None).expect("score");
+        assert_eq!(result.score_variant_counts, [1]);
+        assert_eq!(result.missing_counts, [0, 0]);
+        assert_eq!(result.sum_scores, [2.0, 0.0]);
     }
 }

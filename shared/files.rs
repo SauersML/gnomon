@@ -244,23 +244,62 @@ pub fn open_bed_source(path: &Path) -> Result<BedSource, PipelineError> {
             .ok_or_else(|| PipelineError::Io("Invalid UTF-8 in path".to_string()))?;
         let (bucket, object) = parse_gcs_uri(uri)?;
         let remote = RemoteByteRangeSource::new(&bucket, &object)?;
-        Ok(BedSource::new(Arc::new(remote), None))
+        let source = BedSource::new(Arc::new(remote), None);
+        validate_bed_source_header(path, &source)?;
+        Ok(source)
     } else if is_http_path(path) {
         let url = path
             .to_str()
             .ok_or_else(|| PipelineError::Io("Invalid UTF-8 in path".to_string()))?;
         let remote = HttpByteRangeSource::new(url)?;
-        Ok(BedSource::new(Arc::new(remote), None))
+        let source = BedSource::new(Arc::new(remote), None);
+        validate_bed_source_header(path, &source)?;
+        Ok(source)
     } else {
         let file = File::open(path)
             .map_err(|e| PipelineError::Io(format!("Opening {}: {e}", path.display())))?;
         let mmap = unsafe { Mmap::map(&file).map_err(|e| PipelineError::Io(e.to_string()))? };
+        validate_plink_bed_header(&mmap[..mmap.len().min(3)], path).map_err(PipelineError::Io)?;
         #[cfg(unix)]
         mmap.advise(memmap2::Advice::Sequential)
             .map_err(|e| PipelineError::Io(e.to_string()))?;
         let mmap = Arc::new(mmap);
         let byte_source = Arc::new(MmapByteRangeSource::new(Arc::clone(&mmap)));
         Ok(BedSource::new(byte_source, Some(mmap)))
+    }
+}
+
+fn validate_bed_source_header(path: &Path, source: &BedSource) -> Result<(), PipelineError> {
+    let mut header = [0u8; 3];
+    source.read_at(0, &mut header)?;
+    validate_plink_bed_header(&header, path).map_err(PipelineError::Io)
+}
+
+pub fn validate_plink_bed_header(header: &[u8], path: &Path) -> Result<(), String> {
+    if header.len() < 3 {
+        return Err(format!(
+            "BED file '{}' is smaller than the 3-byte PLINK header.",
+            path.display()
+        ));
+    }
+    if header[0] != 0x6c || header[1] != 0x1b {
+        return Err(format!(
+            "BED file '{}' has invalid PLINK magic bytes [{:#04x}, {:#04x}].",
+            path.display(),
+            header[0],
+            header[1]
+        ));
+    }
+    match header[2] {
+        0x01 => Ok(()),
+        0x00 => Err(format!(
+            "BED file '{}' is individual-major; gnomon requires SNP-major PLINK .bed files.",
+            path.display()
+        )),
+        mode => Err(format!(
+            "BED file '{}' has invalid PLINK mode byte {mode:#04x}; expected SNP-major mode 0x01.",
+            path.display()
+        )),
     }
 }
 
