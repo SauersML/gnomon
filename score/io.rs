@@ -27,6 +27,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
 
 #[inline]
 fn reconciled_index_from_usize(i: usize) -> Result<ReconciledVariantIndex, PipelineError> {
@@ -47,6 +48,33 @@ pub struct SpoolPlan<'a> {
     pub file: &'a mut BufWriter<File>,
     pub offsets: &'a mut AHashMap<BimRowIndex, u64>,
     pub cursor: &'a mut u64,
+}
+
+fn pop_pooled_buffer(buffer_pool: &ArrayQueue<Vec<u8>>) -> Vec<u8> {
+    loop {
+        if let Some(buffer) = buffer_pool.pop() {
+            return buffer;
+        }
+        thread::yield_now();
+    }
+}
+
+fn prepare_pooled_buffer(
+    mut buffer: Vec<u8>,
+    bytes_per_variant: usize,
+) -> Result<Vec<u8>, PipelineError> {
+    buffer.clear();
+    if buffer.capacity() < bytes_per_variant {
+        buffer
+            .try_reserve_exact(bytes_per_variant - buffer.capacity())
+            .map_err(|e| {
+                PipelineError::Compute(format!(
+                    "Failed to reserve PLINK row buffer of {bytes_per_variant} bytes: {e}"
+                ))
+            })?;
+    }
+    buffer.resize(bytes_per_variant, 0);
+    Ok(buffer)
 }
 
 impl<'a> SpoolPlan<'a> {
@@ -153,14 +181,15 @@ pub fn producer_thread<'a, F>(
         Some(sp) => {
             let sp = sp;
             for (i, &bim_row_idx) in prep_result.required_bim_indices.iter().enumerate() {
-                let mut buffer = buffer_pool
-                    .pop()
-                    .unwrap_or_else(|| Vec::with_capacity(bytes_per_variant));
-                buffer.clear();
-                if buffer.capacity() < bytes_per_variant {
-                    buffer.reserve(bytes_per_variant - buffer.capacity());
-                }
-                buffer.resize(bytes_per_variant, 0);
+                let mut buffer =
+                    match prepare_pooled_buffer(pop_pooled_buffer(&buffer_pool), bytes_per_variant)
+                    {
+                        Ok(buffer) => buffer,
+                        Err(err) => {
+                            send_error(err);
+                            break;
+                        }
+                    };
 
                 let offset = 3 + bim_row_idx.0 * bytes_per_variant_u64;
                 let end = offset + bytes_per_variant_u64;
@@ -225,14 +254,15 @@ pub fn producer_thread<'a, F>(
                 if i < skip_reconciled_before {
                     continue;
                 }
-                let mut buffer = buffer_pool
-                    .pop()
-                    .unwrap_or_else(|| Vec::with_capacity(bytes_per_variant));
-                buffer.clear();
-                if buffer.capacity() < bytes_per_variant {
-                    buffer.reserve(bytes_per_variant - buffer.capacity());
-                }
-                buffer.resize(bytes_per_variant, 0);
+                let mut buffer =
+                    match prepare_pooled_buffer(pop_pooled_buffer(&buffer_pool), bytes_per_variant)
+                    {
+                        Ok(buffer) => buffer,
+                        Err(err) => {
+                            send_error(err);
+                            break;
+                        }
+                    };
 
                 let offset = 3 + bim_row_idx.0 * bytes_per_variant_u64;
                 let end = offset + bytes_per_variant_u64;
@@ -355,14 +385,16 @@ pub fn multi_file_producer_thread<'a, F>(
                     return;
                 }
 
-                let mut buffer = buffer_pool
-                    .pop()
-                    .unwrap_or_else(|| Vec::with_capacity(bytes_per_variant as usize));
-                buffer.clear();
-                if buffer.capacity() < bytes_per_variant as usize {
-                    buffer.reserve(bytes_per_variant as usize - buffer.capacity());
-                }
-                buffer.resize(bytes_per_variant as usize, 0);
+                let mut buffer = match prepare_pooled_buffer(
+                    pop_pooled_buffer(&buffer_pool),
+                    bytes_per_variant as usize,
+                ) {
+                    Ok(buffer) => buffer,
+                    Err(err) => {
+                        send_error(err);
+                        return;
+                    }
+                };
 
                 if let Err(err) = current_source.read_at(offset, buffer.as_mut_slice()) {
                     send_error(err);
@@ -438,14 +470,16 @@ pub fn multi_file_producer_thread<'a, F>(
                     return;
                 }
 
-                let mut buffer = buffer_pool
-                    .pop()
-                    .unwrap_or_else(|| Vec::with_capacity(bytes_per_variant as usize));
-                buffer.clear();
-                if buffer.capacity() < bytes_per_variant as usize {
-                    buffer.reserve(bytes_per_variant as usize - buffer.capacity());
-                }
-                buffer.resize(bytes_per_variant as usize, 0);
+                let mut buffer = match prepare_pooled_buffer(
+                    pop_pooled_buffer(&buffer_pool),
+                    bytes_per_variant as usize,
+                ) {
+                    Ok(buffer) => buffer,
+                    Err(err) => {
+                        send_error(err);
+                        return;
+                    }
+                };
 
                 if let Err(err) = current_source.read_at(offset, buffer.as_mut_slice()) {
                     send_error(err);

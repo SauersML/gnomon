@@ -2,7 +2,7 @@ use crate::score::checkpoint::ScoreCheckpointWriter;
 use crate::score::complex::{ComplexVariantResolver, resolve_complex_variants};
 use crate::score::decide::ComputePath;
 use crate::score::io;
-use crate::score::pipeline::{PipelineContext, PipelineError};
+use crate::score::pipeline::{PipelineContext, PipelineError, make_bed_buffer_pool};
 use crate::score::types::{
     BimRowIndex, FilesetBoundary, PipelineKind, PreparationResult, WorkItem,
 };
@@ -11,9 +11,8 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 use crossbeam_queue::ArrayQueue;
 use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, result as cublas_result, sys as cublas_sys};
 use cudarc::driver::{
-    CudaContext, CudaEvent, CudaFunction, CudaSlice, CudaStream, CudaView, CudaViewMut,
-    DevicePtr, DevicePtrMut, DriverError, LaunchConfig, PinnedHostSlice, PushKernelArg,
-    sys as cuda_sys,
+    CudaContext, CudaEvent, CudaFunction, CudaSlice, CudaStream, CudaView, CudaViewMut, DevicePtr,
+    DevicePtrMut, DriverError, LaunchConfig, PinnedHostSlice, PushKernelArg, sys as cuda_sys,
 };
 use cudarc::nvrtc::{Ptx, compile_ptx, result as nvrtc_result, sys as nvrtc_sys};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
@@ -31,8 +30,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const DENSE_CHANNEL_BOUND: usize = 4096;
-const BUFFER_POOL_SIZE: usize = 16384;
 const SPOOL_BUFFER_SIZE: usize = 8 * 1024 * 1024;
 const MIN_GPU_WORK: usize = 100_000;
 const MIN_MEGA_BATCH_VARIANTS: usize = 1;
@@ -752,8 +749,8 @@ pub(crate) fn detect_cuda_library_conflicts() -> Result<(), String> {
     msg.push_str(
         "\nKeep exactly one CUDA toolkit reachable to the loader: either the \
          system toolkit (usually /usr/local/cuda*) or the pip nvidia-*-cu12 \
-         wheels, not both. Refusing to create cuBLAS handles to avoid \
-         crashing later.",
+         wheels, not both. Skipping cuBLAS handle creation to avoid crashing \
+         later.",
     );
     Err(msg)
 }
@@ -1289,13 +1286,10 @@ impl CudaRuntime {
         // representable range (|w| > 65504) would overflow to inf, and non-finite
         // weights are always unsafe. calibrate_fp16 only exercises synthetic
         // weights, so guard against the actual weight matrix here before enabling.
-        let fp16_weight_range_ok = prep
-            .sparse_weights()
-            .iter()
-            .all(|&w| {
-                let w = w as f64;
-                w.is_finite() && w.abs() <= 65504.0
-            });
+        let fp16_weight_range_ok = prep.sparse_weights().iter().all(|&w| {
+            let w = w as f64;
+            w.is_finite() && w.abs() <= 65504.0
+        });
 
         // Automatically decide whether the split-fp16 tensor-core score GEMM is
         // safe and faster on THIS device. It is only enabled if it reproduces
@@ -1317,7 +1311,9 @@ impl CudaRuntime {
                 "> CUDA score GEMM: fp32 (weights outside fp16 range or non-finite; tensor-core path disabled)"
             );
         } else {
-            eprintln!("> CUDA score GEMM: fp32 (fp16 tensor-core path not validated on this device)");
+            eprintln!(
+                "> CUDA score GEMM: fp32 (fp16 tensor-core path not validated on this device)"
+            );
         }
 
         Ok(Self {
@@ -1457,7 +1453,7 @@ fn run_cuda_pipeline(
     input: CudaInput,
 ) -> Result<(Vec<f64>, Vec<u32>), PipelineError> {
     let prep_result = &context.prep_result;
-    let channels = create_gpu_channels(context);
+    let channels = create_gpu_channels(context)?;
     let resume_from = context.checkpoint_completed_variants();
     if resume_from > 0 {
         eprintln!(
@@ -1725,26 +1721,19 @@ enum CudaProducerInput {
     },
 }
 
-fn create_gpu_channels(context: &PipelineContext) -> GpuChannels {
-    let (dense_tx, dense_rx) = bounded::<Result<WorkItem, PipelineError>>(DENSE_CHANNEL_BOUND);
-
-    let buffer_pool = Arc::new(ArrayQueue::new(BUFFER_POOL_SIZE));
-    for _ in 0..BUFFER_POOL_SIZE {
-        buffer_pool
-            .push(Vec::with_capacity(
-                context.prep_result.bytes_per_variant as usize,
-            ))
-            .unwrap();
-    }
+fn create_gpu_channels(context: &PipelineContext) -> Result<GpuChannels, PipelineError> {
+    let channel_bound = context.work_channel_bound()?;
+    let (dense_tx, dense_rx) = bounded::<Result<WorkItem, PipelineError>>(channel_bound);
+    let buffer_pool = make_bed_buffer_pool(context)?;
 
     let variants_processed_count = Arc::new(AtomicU64::new(0));
 
-    GpuChannels {
+    Ok(GpuChannels {
         dense_rx,
         dense_tx,
         buffer_pool,
         variants_processed_count,
-    }
+    })
 }
 
 fn start_pipeline_support(

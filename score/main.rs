@@ -19,7 +19,7 @@ use gnomon::score::genotype_convert;
 use gnomon::score::genotype_convert::{EnsurePlinkOptions, InputFormat, detect_input_format};
 use gnomon::score::io::{gcs_billing_project_from_env, get_shared_runtime, load_adc_credentials};
 use gnomon::score::native_vcf::{self, NativeVcfScoreResult};
-use gnomon::score::pipeline::{self, PipelineContext};
+use gnomon::score::pipeline::{self, MemoryBudget, PipelineContext};
 use gnomon::score::prepare;
 use gnomon::score::reformat;
 use gnomon::score::types::{GenomicRegion, PreparationResult};
@@ -276,6 +276,8 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
         args.keep.as_deref(),
         score_regions_ref,
     )?;
+    let memory_budget = MemoryBudget::default();
+    pipeline::preflight_memory(&prep_result, memory_budget)?;
     let output_path = score_output_path(&fileset_prefixes[0], Some(&out_suffix));
     let checkpoint_path = checkpoint::checkpoint_path_for_output(&output_path);
     let checkpoint_fingerprint = checkpoint::fingerprint_preparation(&prep_result);
@@ -313,6 +315,7 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
         resumed_checkpoint,
         checkpoint_path.clone(),
         checkpoint_fingerprint,
+        memory_budget,
     );
     eprintln!("> Resource allocation complete.");
 
