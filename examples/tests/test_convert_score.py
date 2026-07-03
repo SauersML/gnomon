@@ -81,7 +81,7 @@ def test_download_pgs_score_does_not_mix_cached_assemblies(
     assert other_assembly.exists()
 
 
-def test_convert_genome_to_vcf_passes_requested_assembly(
+def test_convert_genome_to_vcf_uses_current_convert_genome_cli(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     genome_path = tmp_path / "genome.txt"
@@ -104,13 +104,13 @@ def test_convert_genome_to_vcf_passes_requested_assembly(
         "Sample",
         reference,
         output_dir,
-        "GRCh38",
     )
 
     assert vcf_path.exists()
     assert recorded
-    assert "--assembly" in recorded[0]
-    assert recorded[0][recorded[0].index("--assembly") + 1] == "GRCh38"
+    assert "--format" in recorded[0]
+    assert "vcf" in recorded[0]
+    assert "--assembly" not in recorded[0]
 
 
 def test_parser_exposes_assembly_flag() -> None:

@@ -207,7 +207,6 @@ def convert_genome_to_vcf(
     sample_id: str,
     reference: Path | None,
     output_dir: Path,
-    assembly: str,
 ) -> Path:
     start = time.monotonic()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -223,8 +222,6 @@ def convert_genome_to_vcf(
         str(vcf_path),
         "--format",
         "vcf",
-        "--assembly",
-        assembly,
     ]
     if reference is not None:
         cmd.extend(["--reference", str(reference)])
@@ -295,7 +292,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--assembly",
         choices=["GRCh37", "GRCh38"],
         default="GRCh37",
-        help="Target assembly for convert_genome output and harmonized score downloads.",
+        help="Assembly for harmonized score downloads and gnomon scoring.",
     )
     parser.add_argument(
         "--reference",
@@ -351,7 +348,6 @@ def main() -> None:
             sample_id,
             args.reference,
             converted_dir,
-            args.assembly,
         )
 
         sample_scores: dict[str, ScoreResult] = {}
