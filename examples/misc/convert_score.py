@@ -38,11 +38,6 @@ PGS_BASE_URL = "https://ftp.ebi.ac.uk/pub/databases/spot/pgs/scores"
 
 SAMPLE_GENOMES = (
     (
-        "https://github.com/SauersML/reagle/raw/refs/heads/main/data/kat_suricata/ancestrydna.txt",
-        "kat_suricata_ancestrydna",
-        "ancestrydna.txt",
-    ),
-    (
         "https://raw.githubusercontent.com/SauersML/reagle/refs/heads/main/data/kat_suricata/23andme_genome_kat_suricata_v5_full_20171221130201.txt",
         "kat_suricata_23andme_v5",
         "23andme_genome_kat_suricata_v5_full_20171221130201.txt",
