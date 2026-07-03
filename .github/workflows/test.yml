@@ -165,6 +165,13 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
+      - name: Free debug build tree before release builds
+        if: needs.detect_changes.outputs.rust == 'true'
+        shell: bash
+        run: |
+          rm -rf target/debug
+          df -h .
+
       - name: Inspect Assembly for Performance Analysis
         if: needs.detect_changes.outputs.rust == 'false'
         run: |
