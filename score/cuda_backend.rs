@@ -32,6 +32,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SPOOL_BUFFER_SIZE: usize = 8 * 1024 * 1024;
 const MIN_GPU_WORK: usize = 100_000;
+const MIN_GPU_VARIANT_SCORE_WORK: u128 = 100_000_000;
 const MIN_MEGA_BATCH_VARIANTS: usize = 1;
 const MIN_SCORE_TILE_SIZE: usize = 1;
 const PIPELINE_SLOTS: usize = 2;
@@ -600,11 +601,13 @@ pub fn try_run_cuda(
     context: &PipelineContext,
 ) -> Result<Option<(Vec<f64>, Vec<u32>)>, PipelineError> {
     let prep = &context.prep_result;
-    if prep
+    let output_cells = prep
         .num_people_to_score
-        .saturating_mul(prep.score_names.len())
-        < MIN_GPU_WORK
-    {
+        .saturating_mul(prep.score_names.len());
+    let variant_score_work = prep.num_people_to_score as u128
+        * prep.score_names.len() as u128
+        * prep.num_reconciled_variants as u128;
+    if output_cells < MIN_GPU_WORK && variant_score_work < MIN_GPU_VARIANT_SCORE_WORK {
         eprintln!("> Backend: CPU fallback (problem size below CUDA threshold)");
         return Ok(None);
     }

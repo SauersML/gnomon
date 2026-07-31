@@ -8,7 +8,7 @@
 // blueprint." It now uses a low-memory, high-throughput streaming merge-join
 // algorithm to handle genome-scale data.
 
-use crate::score::io::{TextSource, open_text_source};
+use crate::score::io::{TextSource, open_plink_text_source, open_text_source};
 use crate::score::pipeline::PipelineError;
 use crate::score::reformat;
 use crate::score::types::{
@@ -875,12 +875,44 @@ fn build_fileset_paths(prefixes: &[PathBuf]) -> Result<Vec<FilesetPaths>, PrepEr
     prefixes
         .iter()
         .map(|prefix| {
+            // A prefix may name either a PLINK 1.9 triple (.bed/.bim/.fam) or a
+            // PLINK 2 one (.pgen/.pvar/.psam). Everything downstream consumes
+            // the PLINK 1.9 shape; the PLINK 2 files are adapted on read.
             let bed = apply_extension(prefix, "bed")?;
+            if uses_pgen_fileset(prefix, &bed) {
+                return Ok(FilesetPaths {
+                    bed: apply_extension(prefix, "pgen")?,
+                    bim: apply_extension(prefix, "pvar")?,
+                    fam: apply_extension(prefix, "psam")?,
+                });
+            }
             let bim = apply_extension(prefix, "bim")?;
             let fam = apply_extension(prefix, "fam")?;
             Ok(FilesetPaths { bed, bim, fam })
         })
         .collect()
+}
+
+/// Whether `prefix` should be read as a PLINK 2 fileset.
+///
+/// PLINK 1.9 always wins when present, so existing filesets behave exactly as
+/// before and PLINK 2 is selected only when there is no `.bed` to read.
+/// Remote prefixes are probed by opening the `.bim`, which is metadata-only for
+/// the object stores we support — one request per fileset, not a download.
+fn uses_pgen_fileset(prefix: &Path, bed: &Path) -> bool {
+    if is_remote_path(prefix) {
+        let Ok(bim) = apply_extension(prefix, "bim") else {
+            return false;
+        };
+        return open_text_source(&bim).is_err();
+    }
+    !bed.is_file() && apply_extension(prefix, "pgen").is_ok_and(|p| p.is_file())
+}
+
+fn is_remote_path(path: &Path) -> bool {
+    path.to_str().is_some_and(|s| {
+        s.starts_with("gs://") || s.starts_with("http://") || s.starts_with("https://")
+    })
 }
 
 /// Builds the compacted spool index structures for the selected cohort subset.
@@ -1065,28 +1097,34 @@ mod tests {
     }
 }
 
-fn apply_extension(path: &Path, extension: &str) -> Result<PathBuf, PrepError> {
-    if let Some(path_str) = path.to_str() {
-        if path_str.starts_with("gs://") {
-            let mut new_path = path_str.to_string();
-            if let Some(dot_pos) = new_path.rfind('.') {
-                let slash_pos = new_path.rfind('/');
-                if slash_pos.is_none_or(|idx| idx < dot_pos) {
-                    new_path.truncate(dot_pos);
-                    new_path.push('.');
-                    new_path.push_str(extension);
-                    return Ok(PathBuf::from(new_path));
-                }
-            }
-            new_path.push('.');
-            new_path.push_str(extension);
-            Ok(PathBuf::from(new_path))
-        } else {
-            Ok(path.with_extension(extension))
-        }
-    } else {
-        Err(PrepError::Parse("Invalid UTF-8 in path".to_string()))
+/// The file extensions that make up a PLINK 1.9 or PLINK 2 fileset.
+pub const FILESET_EXTENSIONS: [&str; 6] =
+    ["bed", "bim", "fam", "pgen", "pvar", "psam"];
+
+/// Strips a trailing fileset extension, if present, leaving the shared prefix.
+///
+/// Only the extensions above are stripped. Fileset prefixes routinely contain
+/// dots of their own — All of Us ships `acaf_threshold.chr22.pgen`, whose
+/// prefix is `acaf_threshold.chr22` — so truncating at the last dot would turn
+/// a sibling lookup into `acaf_threshold.pvar` and silently miss the file.
+pub fn strip_fileset_extension(path_str: &str) -> &str {
+    if let Some((base, ext)) = path_str.rsplit_once('.')
+        && FILESET_EXTENSIONS.contains(&ext)
+        && !base.ends_with('/')
+    {
+        return base;
     }
+    path_str
+}
+
+fn apply_extension(path: &Path, extension: &str) -> Result<PathBuf, PrepError> {
+    let Some(path_str) = path.to_str() else {
+        return Err(PrepError::Parse("Invalid UTF-8 in path".to_string()));
+    };
+    Ok(PathBuf::from(format!(
+        "{}.{extension}",
+        strip_fileset_extension(path_str)
+    )))
 }
 
 fn map_pipeline_error(err: PipelineError, path: PathBuf) -> PrepError {
@@ -1272,7 +1310,7 @@ impl<'a> BimIterator<'a> {
             });
 
             self.current_path = fileset.bim.clone();
-            let reader = open_text_source(&fileset.bim)
+            let reader = open_plink_text_source(&fileset.bim)
                 .map_err(|e| map_pipeline_error(e, fileset.bim.clone()))?;
             self.current_reader = Some(reader);
             Ok(true)
@@ -1780,7 +1818,7 @@ fn parse_fam_and_build_lookup(
 
 fn read_fam_file(path: &Path) -> Result<Vec<String>, PrepError> {
     let mut source =
-        open_text_source(path).map_err(|e| map_pipeline_error(e, path.to_path_buf()))?;
+        open_plink_text_source(path).map_err(|e| map_pipeline_error(e, path.to_path_buf()))?;
     let mut iids = Vec::new();
     let mut line_number = 0usize;
 

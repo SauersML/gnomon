@@ -86,19 +86,15 @@ pub fn choose_run_strategy(ctx: &DecisionContext) -> RunStrategy {
             } else {
                 RunStrategy::UseSimpleTree
             }
-        } else if ctx.k_scores <= 70.7107_f32 {
-            RunStrategy::UseComplexTree
-        } else {
-            RunStrategy::UseComplexTree
-        }
-    } else if ctx.n_cohort <= 20_000.002_f32 {
-        if ctx.k_scores <= 15.8114_f32 {
-            RunStrategy::UseComplexTree
         } else {
             RunStrategy::UseComplexTree
         }
     } else {
-        RunStrategy::UseSimpleTree
+        // Large, unfiltered cohorts used to avoid the frequency scan because the
+        // old no-pivot kernel still walked every person. The packed zero-word
+        // kernel makes rare WGS variants dramatically cheaper, so density-aware
+        // dispatch now pays for itself at this scale.
+        RunStrategy::UseComplexTree
     }
 }
 
@@ -186,13 +182,30 @@ pub fn decide_path_with_freq(ctx: &DecisionContext) -> ComputePath {
     } else if ctx.subset_frac <= 0.2750_f32 {
         ComputePath::NoPivot
     } else if ctx.freq <= 0.0045_f32 {
-        if ctx.subset_frac <= 0.7500_f32 {
-            ComputePath::NoPivot
-        } else {
-            ComputePath::Pivot
-        }
+        ComputePath::NoPivot
     } else {
         ComputePath::Pivot
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn large_wgs_cohort_uses_density_aware_sparse_path() {
+        let mut context = DecisionContext {
+            n_cohort: 50_000.0,
+            k_scores: 1.0,
+            subset_frac: 1.0,
+            freq: 0.001,
+        };
+
+        assert_eq!(choose_run_strategy(&context), RunStrategy::UseComplexTree);
+        assert_eq!(decide_path_with_freq(&context), ComputePath::NoPivot);
+
+        context.freq = 0.1;
+        assert_eq!(decide_path_with_freq(&context), ComputePath::Pivot);
     }
 }
 

@@ -58,8 +58,8 @@ jobs:
       fail-fast: false
       matrix:
         platform:
-          - { runner: ubuntu-24.04,     target: x86_64 }
-          - { runner: ubuntu-24.04-arm, target: aarch64 }
+          - { runner: ubuntu-24.04,     target: x86_64,  rustflags: "-C strip=symbols -C target-cpu=x86-64-v3" }
+          - { runner: ubuntu-24.04-arm, target: aarch64, rustflags: "-C strip=symbols" }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -67,6 +67,8 @@ jobs:
           python-version: '3.x'
       - name: Build Linux wheels
         uses: PyO3/maturin-action@v1
+        env:
+          RUSTFLAGS: ${{ matrix.platform.rustflags }}
         with:
           command: build
           target: ${{ matrix.platform.target }}
@@ -94,8 +96,8 @@ jobs:
       fail-fast: false
       matrix:
         platform:
-          - { runner: macos-15-intel, target: x86_64 }
-          - { runner: macos-14, target: aarch64 }
+          - { runner: macos-15-intel, target: x86_64,  rustflags: "-C strip=symbols -C target-cpu=x86-64-v3" }
+          - { runner: macos-14,       target: aarch64, rustflags: "-C strip=symbols" }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -103,6 +105,8 @@ jobs:
           python-version: '3.x'
       - name: Build macOS wheels
         uses: PyO3/maturin-action@v1
+        env:
+          RUSTFLAGS: ${{ matrix.platform.rustflags }}
         with:
           command: build
           target: ${{ matrix.platform.target }}

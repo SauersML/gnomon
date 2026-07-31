@@ -22,7 +22,8 @@ use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, 
 use gnomon::batch;
 use gnomon::kernel;
 use gnomon::types::{
-    PersonSubset, PipelineKind, PreparationResult, ReconciledVariantIndex, ScoreColumnIndex,
+    BimRowIndex, OriginalPersonIndex, OutputPersonIndex, PersonSubset, PipelineKind,
+    PreparationResult, ReconciledVariantIndex,
 };
 
 use crossbeam_queue::ArrayQueue;
@@ -59,10 +60,15 @@ fn setup_benchmark_context(
         .expect("bytes per variant should fit into usize for benchmarking");
     let stride = (num_scores + kernel::LANE_COUNT - 1) / kernel::LANE_COUNT * kernel::LANE_COUNT;
 
-    let matrix_size = num_variants * stride;
-    let weights_matrix = vec![1.0f32; matrix_size];
-    let flip_mask_matrix = vec![0u8; matrix_size];
-    let variant_to_scores_map = vec![vec![ScoreColumnIndex(0)]; num_variants];
+    let matrix_size = num_variants * num_scores;
+    let sparse_weights = vec![1.0f32; matrix_size];
+    let sparse_missing_corrections = vec![0.0f32; matrix_size];
+    let sparse_score_columns: Vec<u32> = (0..num_variants)
+        .flat_map(|_| 0..num_scores as u32)
+        .collect();
+    let sparse_row_offsets: Vec<u64> = (0..=num_variants)
+        .map(|row| (row * num_scores) as u64)
+        .collect();
 
     // --- Subset logic ---
     let num_people_to_score = ((total_num_people as f32) * subset_percentage).round() as usize;
@@ -73,7 +79,9 @@ fn setup_benchmark_context(
             (0..total_num_people)
                 .map(|i| format!("IID_{}", i))
                 .collect(),
-            (0..total_num_people as u32).collect(),
+            (0..total_num_people as u32)
+                .map(OriginalPersonIndex)
+                .collect(),
         )
     } else {
         let mut rng = rand::thread_rng();
@@ -90,13 +98,16 @@ fn setup_benchmark_context(
                 .iter()
                 .map(|&i| format!("IID_{}", i))
                 .collect(),
-            fam_indices_to_keep,
+            fam_indices_to_keep
+                .into_iter()
+                .map(OriginalPersonIndex)
+                .collect(),
         )
     };
 
     let mut person_fam_to_output_idx = vec![None; total_num_people];
     for (output_idx, &fam_idx) in output_idx_to_fam_idx.iter().enumerate() {
-        person_fam_to_output_idx[fam_idx as usize] = Some(output_idx as u32);
+        person_fam_to_output_idx[fam_idx.0 as usize] = Some(OutputPersonIndex(output_idx as u32));
     }
     // --- End subset logic ---
 
@@ -124,15 +135,16 @@ fn setup_benchmark_context(
     let spool_bytes_per_variant = spool_compact_byte_index.len() as u64;
 
     let prep_result = PreparationResult::new(
-        weights_matrix,
-        flip_mask_matrix,
-        vec![0.0f32; num_variants * stride],
+        sparse_weights,
+        sparse_missing_corrections,
+        sparse_score_columns,
+        sparse_row_offsets,
         stride,
-        vec![],
+        vec![0.0; num_scores],
+        (0..num_variants as u64).map(BimRowIndex).collect(),
         vec![],
         (0..num_scores).map(|i| format!("score_{}", i)).collect(),
         vec![1; num_scores],
-        variant_to_scores_map,
         person_subset,
         final_person_iids,
         num_people_to_score,
@@ -144,7 +156,7 @@ fn setup_benchmark_context(
         bytes_per_variant,
         person_fam_to_output_idx,
         output_idx_to_fam_idx,
-        vec![],
+        vec![0; num_variants],
         spool_compact_byte_index,
         spool_dense_map,
         spool_bytes_per_variant,
@@ -240,7 +252,6 @@ fn benchmark_the_works(c: &mut Criterion) {
                             });
                         },
                     );
-
                     // --- 2. Benchmark person-major (pivot) path ---
                     let tile_pool = Arc::new(ArrayQueue::new(4));
                     let bytes_per_variant: usize = prep_result
@@ -256,10 +267,10 @@ fn benchmark_the_works(c: &mut Criterion) {
                     let reconciled_indices: Vec<_> = (0..PIVOT_PATH_BATCH_SIZE as u32)
                         .map(ReconciledVariantIndex)
                         .collect();
-                    let weights_for_batch = prep_result.weights_matrix().to_vec();
-                    let flips_for_batch = prep_result.flip_mask_matrix().to_vec();
+                    let weights_for_batch =
+                        vec![1.0f32; PIVOT_PATH_BATCH_SIZE * prep_result.stride()];
                     let missing_corrections_for_batch =
-                        prep_result.missing_correction_matrix().to_vec();
+                        vec![0.0f32; PIVOT_PATH_BATCH_SIZE * prep_result.stride()];
 
                     group.bench_function(
                         BenchmarkId::new(format!("Pivot__{}", id_str), freq),
@@ -270,7 +281,6 @@ fn benchmark_the_works(c: &mut Criterion) {
                                     batch::run_person_major_path(
                                         black_box(&batch_variant_data),
                                         black_box(&weights_for_batch),
-                                        black_box(&flips_for_batch),
                                         black_box(&missing_corrections_for_batch),
                                         black_box(&reconciled_indices),
                                         black_box(&prep_result),

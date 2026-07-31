@@ -52,11 +52,17 @@ pub struct VirtualPlink19 {
     /// Random-access virtual `.bed` (PLINK-1.9 bytes).
     pub bed: Arc<dyn ByteRangeSource>,
     build: GenomeBuild,
-    bim_lines: Vec<BimLine>,
+    /// Reopens the backing `.pvar` so `.bim` rows can be regenerated on demand
+    /// instead of held in memory. See `StreamingVirtualBim`.
+    pvar: PvarFactory,
     fam_rows: Vec<FamRow>,
     n_samples: usize,
     n_variants: usize,
 }
+
+/// Reopens a `.pvar` text stream. Boxed rather than a path so remote (`gs://`,
+/// http) sources work identically to local files.
+pub type PvarFactory = Arc<dyn Fn() -> Result<Box<dyn TextSource>, PipelineError> + Send + Sync>;
 
 impl VirtualPlink19 {
     /// Returns the inferred genome build (`"GRCh37"` or `"GRCh38"`).
@@ -79,13 +85,42 @@ impl VirtualPlink19 {
         self.n_variants
     }
 
-    pub fn bim_source(&self) -> Box<dyn TextSource> {
-        Box::new(VirtualBim::from_lines(self.bim_lines.clone()))
+    /// A fresh forward pass over the virtual `.bim`.
+    ///
+    /// Each call reopens the `.pvar` and regenerates rows as it goes; nothing
+    /// is retained between calls.
+    pub fn bim_source(&self) -> Result<Box<dyn TextSource>, PipelineError> {
+        Ok(Box::new(StreamingVirtualBim::new(
+            (self.pvar)()?,
+            Some(self.n_variants as u64),
+        )))
     }
 
     pub fn fam_source(&self) -> Box<dyn TextSource> {
         Box::new(VirtualFam::from_rows(self.fam_rows.clone()))
     }
+}
+
+/// A streaming virtual `.bim` over a `.pvar`, without touching the `.pgen`.
+///
+/// The transform is purely textual — split multiallelic ALTs, synthesise IDs,
+/// emit A1=ALT/A2=REF — so consumers that only need variant metadata (variant
+/// reconciliation, coverage QC) can avoid opening the genotype table at all.
+pub fn open_virtual_bim(pvar_path: &Path) -> Result<Box<dyn TextSource>, PipelineError> {
+    Ok(Box::new(StreamingVirtualBim::new(
+        open_text_source(pvar_path)?,
+        None,
+    )))
+}
+
+/// A virtual `.fam` over a `.psam`.
+///
+/// Sample counts are bounded by cohort size (hundreds of thousands), not
+/// variant count, so unlike the `.bim` this is materialized.
+pub fn open_virtual_fam(psam_path: &Path) -> Result<Box<dyn TextSource>, PipelineError> {
+    let mut psam = open_text_source(psam_path)?;
+    let info = PsamInfo::from_psam(&mut *psam)?;
+    Ok(Box::new(VirtualFam::from_rows(info.fam_rows)))
 }
 
 /// Open from filesystem paths. `.pvar` and `.psam` are opened with your existing
@@ -97,23 +132,28 @@ pub fn open_virtual_plink19_from_paths(
     pvar_path: &Path,
     psam_path: &Path,
 ) -> Result<VirtualPlink19, PipelineError> {
-    let mut pvar_for_plan = open_text_source(pvar_path)?;
     let mut psam_for_plan = open_text_source(psam_path)?;
     let pgen = Arc::new(LocalFileByteRangeSource::open(pgen_path)?);
+    let pvar_path = pvar_path.to_path_buf();
+    let pvar: PvarFactory = Arc::new(move || open_text_source(&pvar_path));
 
-    open_virtual_plink19_from_sources(pgen, &mut *pvar_for_plan, &mut *psam_for_plan)
+    open_virtual_plink19_from_sources(pgen, pvar, &mut *psam_for_plan)
 }
 
-/// Open from caller-provided sources. Callers may pass custom/remote-capable
-/// `ByteRangeSource` for `.pgen` and `TextSource`s for `.pvar/.psam`.
+/// Open from caller-provided sources. Callers may pass a custom/remote-capable
+/// `ByteRangeSource` for `.pgen` and a `TextSource` for `.psam`.
+///
+/// `.pvar` is supplied as a *factory* rather than a stream: it is read once to
+/// build the variant plan, and reopened whenever the virtual `.bim` is walked,
+/// so its rows never have to be held in memory.
 pub fn open_virtual_plink19_from_sources(
     pgen: Arc<dyn ByteRangeSource>,
-    pvar_for_plan: &mut dyn TextSource,
+    pvar: PvarFactory,
     psam_for_plan: &mut dyn TextSource,
 ) -> Result<VirtualPlink19, PipelineError> {
     let header = PgenHeader::parse(&*pgen)?;
     let psam_info = PsamInfo::from_psam(psam_for_plan)?;
-    let plan = VariantPlan::from_pvar(pvar_for_plan)?;
+    let plan = VariantPlan::from_pvar(&mut *pvar()?)?;
     let inferred_build = plan.inferred_build();
 
     if header.m_variants != 0 && header.m_variants as usize != plan.in_variants {
@@ -130,7 +170,6 @@ pub fn open_virtual_plink19_from_sources(
         )));
     }
 
-    let bim_lines = plan.bim_lines().to_vec();
     let fam_rows = psam_info.fam_rows.clone();
 
     let bed_source: Arc<dyn ByteRangeSource> = match header.mode {
@@ -165,7 +204,7 @@ pub fn open_virtual_plink19_from_sources(
     Ok(VirtualPlink19 {
         bed: bed_source,
         build: inferred_build,
-        bim_lines,
+        pvar,
         fam_rows,
         n_samples: psam_info.n_samples,
         n_variants: plan.out_variants,
@@ -433,8 +472,6 @@ struct VariantPlan {
     out_to_in: Vec<(u32, u16)>,
     /// Per-output variant haploidy behaviour.
     haploidy: Vec<HaploidyKind>,
-    /// BIM lines corresponding to each output variant.
-    bim_lines: Vec<BimLine>,
     /// ALT allele count per input variant.
     alts_per_in: Vec<u16>,
     build: GenomeBuild,
@@ -531,7 +568,6 @@ impl VariantPlan {
         let mut out_to_in: Vec<(u32, u16)> = Vec::with_capacity(1 << 20);
         let mut haploidy: Vec<HaploidyKind> = Vec::with_capacity(1 << 20);
         let mut per_variant: Vec<VariantRangeEntry> = Vec::with_capacity(1 << 16);
-        let mut bim_lines: Vec<BimLine> = Vec::with_capacity(1 << 20);
         let mut alts_per_in: Vec<u16> = Vec::with_capacity(1 << 16);
         let mut header_cols: Option<PvarCols> = None;
         let mut in_idx: u32 = 0;
@@ -577,7 +613,9 @@ impl VariantPlan {
             let id_raw = *fields
                 .get(cols.id)
                 .ok_or_else(|| ioerr(".pvar missing ID column"))?;
-            let ref_raw = *fields
+            // REF is validated by presence here; the value itself is only
+            // needed when the virtual .bim rows are streamed.
+            fields
                 .get(cols.refa)
                 .ok_or_else(|| ioerr(".pvar missing REF column"))?;
             let alt_raw = *fields
@@ -620,26 +658,24 @@ impl VariantPlan {
             }
 
             let out_start = out_to_in.len();
-            let mut alt_ord: u16 = 1;
-            for alt in alts.iter() {
+            for alt_ord in 1..=alts.len() as u16 {
                 out_to_in.push((in_idx, alt_ord));
                 haploidy.push(HaploidyKind::Diploid);
-                bim_lines.push(BimLine {
-                    chrom: chrom.clone(),
-                    pos,
-                    id: id_raw.to_string(),
-                    refa: ref_raw.to_string(),
-                    alt: (*alt).to_string(),
-                });
-                alt_ord += 1;
             }
             let out_end = out_to_in.len();
-            per_variant.push(VariantRangeEntry {
-                chrom,
-                pos,
-                out_start,
-                out_end,
-            });
+            // Autosomes are diploid under every build, so there is nothing to
+            // revisit once the build is known. Only the sex chromosomes and MT
+            // need their coordinates retained -- which keeps this buffer empty
+            // for the 22 autosomal filesets rather than holding a String per
+            // variant.
+            if !is_autosome(&chrom) {
+                per_variant.push(VariantRangeEntry {
+                    chrom,
+                    pos,
+                    out_start,
+                    out_end,
+                });
+            }
 
             alts_per_in.push(alts.len() as u16);
             in_idx += 1;
@@ -680,7 +716,6 @@ impl VariantPlan {
             out_variants: out_to_in.len(),
             out_to_in,
             haploidy,
-            bim_lines,
             alts_per_in,
             build,
         })
@@ -694,10 +729,6 @@ impl VariantPlan {
     #[inline]
     fn haploidy_of(&self, out_idx: usize) -> Option<HaploidyKind> {
         self.haploidy.get(out_idx).copied()
-    }
-
-    fn bim_lines(&self) -> &[BimLine] {
-        &self.bim_lines
     }
 
     #[inline]
@@ -810,6 +841,14 @@ fn is_symbolic_alt(alt: &str) -> bool {
 const GRCH37_X_PAR: &[(u64, u64)] = &[(60_001, 2_699_520), (154_931_044, 155_260_560)];
 const GRCH38_X_PAR: &[(u64, u64)] = &[(10_001, 2_781_479), (155_701_383, 156_030_895)];
 
+/// True for a normalized chromosome label that is a plain numbered autosome.
+///
+/// Autosomes are diploid under every genome build, so their ploidy never
+/// depends on which build we infer.
+fn is_autosome(chrom: &str) -> bool {
+    !chrom.is_empty() && chrom.bytes().all(|b| b.is_ascii_digit())
+}
+
 fn in_any_range(pos: u64, ranges: &[(u64, u64)]) -> bool {
     ranges
         .iter()
@@ -839,57 +878,132 @@ fn haploidy_for_variant(chrom: &str, pos: u64, build: GenomeBuild) -> HaploidyKi
 // Virtual .bim (TextSource): split multiallelic, A1=ALT, A2=REF, cM=0, stable IDs
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-#[derive(Clone)]
-struct BimLine {
-    chrom: String,
-    pos: u64,
-    id: String,
-    refa: String,
-    alt: String,
+/// Renders one virtual `.bim` row for a single (variant, ALT) pair.
+///
+/// PLINK 1.9 contract: `cM` is always 0, A1 is the ALT allele and A2 is REF.
+/// The ID is `<ID>__ALT=<ALT>` when the `.pvar` carries a real ID, and
+/// `chr:pos:ref:alt` otherwise — a multiallelic site splits into several rows,
+/// so the raw ID alone would not be unique.
+///
+/// Upstream coverage QC matches on ID *and* alleles, so this format is a
+/// compatibility contract, not an implementation detail: changing it silently
+/// turns matched variants into unmatched ones.
+fn format_bim_row(chrom: &str, id: &str, pos: u64, refa: &str, alt: &str) -> String {
+    let id_out = if id != "." && !id.is_empty() {
+        format!("{id}__ALT={alt}")
+    } else {
+        format!("{chrom}:{pos}:{refa}:{alt}")
+    };
+    format!("{chrom}\t{id_out}\t0\t{pos}\t{alt}\t{refa}")
 }
 
-#[derive(Clone)]
-struct VirtualBim {
-    lines: Vec<BimLine>,
-    next_idx: usize,
+/// Streaming virtual `.bim`: re-reads the `.pvar` and emits the split rows on
+/// the fly.
+///
+/// Materializing the rows instead would cost roughly 140 bytes per output
+/// variant — about 1.2 GB for a WGS chr1 at 8.45M variants, and ~10 GB if a
+/// genome-wide set of per-chromosome filesets were opened at once. Nothing
+/// downstream needs random access to the rows, only a single forward pass, so
+/// they are generated on demand and never retained.
+struct StreamingVirtualBim {
+    pvar: Box<dyn TextSource>,
+    cols: Option<PvarCols>,
+    /// Rows pending for the current `.pvar` line (one per ALT), reversed so
+    /// `pop` yields them in ALT order.
+    pending: Vec<String>,
     carry: Option<Box<[u8]>>,
+    total: Option<u64>,
 }
 
-impl VirtualBim {
-    fn from_lines(lines: Vec<BimLine>) -> Self {
+impl StreamingVirtualBim {
+    fn new(pvar: Box<dyn TextSource>, total: Option<u64>) -> Self {
         Self {
-            lines,
-            next_idx: 0,
+            pvar,
+            cols: None,
+            pending: Vec::new(),
             carry: None,
+            total,
         }
     }
-
-    fn format_line(entry: &BimLine) -> String {
-        let id_out = if entry.id != "." && !entry.id.is_empty() {
-            format!("{}__ALT={}", entry.id, entry.alt)
-        } else {
-            format!("{}:{}:{}:{}", entry.chrom, entry.pos, entry.refa, entry.alt)
-        };
-        format!(
-            "{}\t{}\t0\t{}\t{}\t{}",
-            entry.chrom, id_out, entry.pos, entry.alt, entry.refa
-        )
-    }
 }
 
-impl TextSource for VirtualBim {
+impl TextSource for StreamingVirtualBim {
     fn len(&self) -> Option<u64> {
-        Some(self.lines.len() as u64)
+        self.total
     }
 
     fn next_line(&mut self) -> Result<Option<&[u8]>, PipelineError> {
-        if self.next_idx >= self.lines.len() {
-            return Ok(None);
+        loop {
+            if let Some(row) = self.pending.pop() {
+                self.carry = Some(row.into_bytes().into_boxed_slice());
+                return Ok(self.carry.as_deref());
+            }
+
+            let Some(line) = self.pvar.next_line()? else {
+                return Ok(None);
+            };
+            let s = str::from_utf8(line)
+                .map_err(|e| PipelineError::Io(format!("Invalid UTF-8 in .pvar: {e}")))?;
+            let trimmed = s.trim();
+            if trimmed.is_empty() || trimmed.starts_with("##") {
+                continue;
+            }
+            if trimmed.starts_with('#') {
+                self.cols = Some(PvarCols::from_header_line(trimmed)?);
+                continue;
+            }
+
+            let fields: Vec<&str> = trimmed.split_whitespace().collect();
+            if fields.is_empty() {
+                continue;
+            }
+            let cols = match self.cols {
+                Some(cols) => cols,
+                None => {
+                    let derived = PvarCols::from_headerless(fields.len())?;
+                    self.cols = Some(derived);
+                    derived
+                }
+            };
+
+            let chrom = normalize_chrom(
+                fields
+                    .get(cols.chrom)
+                    .copied()
+                    .ok_or_else(|| ioerr(".pvar missing CHROM column"))?,
+            );
+            let pos = fields
+                .get(cols.pos)
+                .copied()
+                .ok_or_else(|| ioerr(".pvar missing POS column"))?
+                .parse::<u64>()
+                .map_err(|_| ioerr("Invalid POS in .pvar (expected integer)"))?;
+            let id = fields
+                .get(cols.id)
+                .copied()
+                .ok_or_else(|| ioerr(".pvar missing ID column"))?;
+            let refa = fields
+                .get(cols.refa)
+                .copied()
+                .ok_or_else(|| ioerr(".pvar missing REF column"))?;
+            let alt_raw = fields
+                .get(cols.alt)
+                .copied()
+                .ok_or_else(|| ioerr(".pvar missing ALT column"))?;
+
+            // Reversed, so `pop` above walks ALTs in order — matching the
+            // variant order the plan assigned during the indexing pass.
+            self.pending.extend(
+                alt_raw
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|a| !a.is_empty() && *a != ".")
+                    .map(|alt| format_bim_row(&chrom, id, pos, refa, alt))
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev(),
+            );
         }
-        let line = Self::format_line(&self.lines[self.next_idx]);
-        self.next_idx += 1;
-        self.carry = Some(line.into_bytes().into_boxed_slice());
-        Ok(self.carry.as_deref())
     }
 }
 
@@ -1096,6 +1210,7 @@ impl ByteRangeSource for VirtualBed {
 
         let mut written = 0usize;
         let mut sample_ploidy_buf: Vec<u8> = Vec::new();
+        let mut hard_buf: Vec<u8> = Vec::new();
 
         // 1) Serve the 3-byte header if requested.
         if offset < 3 {
@@ -1130,7 +1245,7 @@ impl ByteRangeSource for VirtualBed {
             // Fetch or produce the packed block for this out-variant.
             let mut cache_hit = false;
             {
-                let mut cache = self.cache.lock().unwrap();
+                let cache = self.cache.lock().unwrap();
                 if let Some(buf) = cache.get(out_idx) {
                     let start = within_block;
                     let end = start + to_copy;
@@ -1169,25 +1284,28 @@ impl ByteRangeSource for VirtualBed {
                     }
                 });
 
-                let mut hard = vec![255u8; self.n_samples]; // 255 = missing
-                decoder.decode_variant_hardcalls(in_idx, alt_ord, &mut hard, sample_ploidy)?;
+                // Reused across variants: a scoring run decodes millions of
+                // blocks, and two fresh sample-sized allocations per block is
+                // pure allocator traffic.
+                hard_buf.clear();
+                hard_buf.resize(self.n_samples, 255); // 255 = missing
+                decoder.decode_variant_hardcalls(in_idx, alt_ord, &mut hard_buf, sample_ploidy)?;
 
                 if let Some(kind) = haploidy_kind
                     && !matches!(kind, HaploidyKind::Diploid)
                 {
-                    enforce_haploidy(&mut hard, &self.sex_by_sample, kind);
+                    enforce_haploidy(&mut hard_buf, &self.sex_by_sample, kind);
                 }
 
-                // Pack to bytes and store in cache.
                 let mut block = vec![0u8; self.block_bytes];
-                Self::pack_to_block(&mut block, &hard);
+                Self::pack_to_block(&mut block, &hard_buf);
 
                 let mut cache = self.cache.lock().unwrap();
-                cache.put(out_idx, block.clone());
+                let stored = cache.put(out_idx, block);
 
                 let start = within_block;
                 let end = start + to_copy;
-                dst[written..written + to_copy].copy_from_slice(&block[start..end]);
+                dst[written..written + to_copy].copy_from_slice(&stored[start..end]);
             }
 
             written += to_copy;
@@ -1203,37 +1321,49 @@ impl ByteRangeSource for VirtualBed {
 // Tiny LRU for packed blocks
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+/// Fixed-capacity cache of packed variant blocks, keyed by out-variant index.
+///
+/// Lookups are hash-based rather than a linear scan of the MRU list: a scoring
+/// run performs one lookup per matched variant, and at millions of variants an
+/// O(capacity) scan per lookup is pure overhead.
 struct BlockCache {
     cap: usize,
-    // very small MRU list; simple Vec is fine for low capacity
-    vals: VecDeque<(usize, Vec<u8>)>, // (out_idx, block)
+    blocks: HashMap<usize, Vec<u8>>,
+    /// Insertion order, used to pick the eviction victim. Entries are appended
+    /// on insert only, so this stays in sync with `blocks` without any
+    /// move-to-back bookkeeping on the (common) hit path.
+    order: VecDeque<usize>,
 }
 
 impl BlockCache {
     fn new(cap: usize) -> Self {
         Self {
-            cap,
-            vals: VecDeque::new(),
+            cap: cap.max(1),
+            blocks: HashMap::with_capacity(cap.max(1)),
+            order: VecDeque::with_capacity(cap.max(1)),
         }
     }
 
-    fn get(&mut self, k: usize) -> Option<&Vec<u8>> {
-        if let Some(pos) = self.vals.iter().position(|(kk, _)| *kk == k) {
-            // move-to-back MRU
-            let pair = self.vals.remove(pos).unwrap();
-            self.vals.push_back(pair);
-            return self.vals.back().map(|(_, v)| v);
-        }
-        None
+    fn get(&self, k: usize) -> Option<&Vec<u8>> {
+        self.blocks.get(&k)
     }
 
-    fn put(&mut self, k: usize, v: Vec<u8>) {
-        if let Some(pos) = self.vals.iter().position(|(kk, _)| *kk == k) {
-            self.vals.remove(pos);
-        } else if self.vals.len() == self.cap {
-            let _ = self.vals.pop_front();
+    /// Inserts `v`, evicting the oldest entry when at capacity, and returns a
+    /// reference to the stored block so callers can copy out of it without
+    /// cloning the buffer they just built.
+    fn put(&mut self, k: usize, v: Vec<u8>) -> &[u8] {
+        if self.blocks.insert(k, v).is_none() {
+            self.order.push_back(k);
+            while self.order.len() > self.cap {
+                // Skip keys already evicted or re-inserted out of band.
+                if let Some(victim) = self.order.pop_front()
+                    && victim != k
+                {
+                    self.blocks.remove(&victim);
+                }
+            }
         }
-        self.vals.push_back((k, v));
+        &self.blocks[&k]
     }
 }
 
@@ -1868,12 +1998,92 @@ fn difflist_pairs(
     Ok(ids.into_iter().zip(vals.into_iter()).collect())
 }
 
+/// Record spacing of the sparse offset index. A lookup sums at most
+/// `OFFSET_STRIDE - 1` record lengths instead of walking to the start of the
+/// 2^16-record variant block, which would be up to 65535 additions per variant.
+/// The table itself costs `8 * m_variants / OFFSET_STRIDE` bytes — about 1 MB
+/// for a WGS chr1 with 8.45M variants.
+const OFFSET_STRIDE: usize = 64;
+
+/// Offset of the first fixed-width record body, past the header and the
+/// optional provisional-REF bitarray.
+fn fixhard_body_offset(hdr: &PgenHeader) -> Result<u64, PipelineError> {
+    let ref_flag_mode = (hdr.fmt_byte >> 6) & 0x03;
+    let mut base = 12u64 + 1; // 11-byte header + format byte
+    if ref_flag_mode == 3 {
+        base = base
+            .checked_add((hdr.m_variants as u64).div_ceil(8))
+            .ok_or_else(|| ioerr("Header overflow"))?;
+    }
+    Ok(base)
+}
+
+/// Precomputes the absolute file offset of every `OFFSET_STRIDE`-th record.
+///
+/// Record offsets are only recoverable by summing record lengths from the start
+/// of the enclosing 2^16-record variant block. Doing that per lookup makes
+/// sparse access quadratic in the block size; doing it once here makes every
+/// later lookup bounded by `OFFSET_STRIDE`.
+fn build_stride_offsets(hdr: &PgenHeader, n_samples: usize) -> Result<Vec<u64>, PipelineError> {
+    let m = hdr.m_variants as usize;
+    if m == 0 {
+        return Ok(Vec::new());
+    }
+    let entries = m.div_ceil(OFFSET_STRIDE);
+
+    match hdr.mode {
+        PgenMode::FixHard => {
+            let base = fixhard_body_offset(hdr)?;
+            let rec_len = n_samples.div_ceil(4) as u64;
+            Ok((0..entries)
+                .map(|k| base + (k * OFFSET_STRIDE) as u64 * rec_len)
+                .collect())
+        }
+        PgenMode::Var | PgenMode::VarIgnorable => {
+            if hdr.rec_lens.len() < m {
+                return Err(ioerr("Header record-length table is short"));
+            }
+            let mut out = Vec::with_capacity(entries);
+            let mut off = 0u64;
+            for idx in 0..m {
+                // Every 2^16 records the file gives an authoritative offset;
+                // restarting from it keeps this exact rather than cumulative.
+                if idx % 65536 == 0 {
+                    off = *hdr
+                        .block_offsets
+                        .get(idx >> 16)
+                        .ok_or_else(|| ioerr("Missing block offset"))?;
+                }
+                if idx % OFFSET_STRIDE == 0 {
+                    out.push(off);
+                }
+                off = off
+                    .checked_add(hdr.rec_lens[idx] as u64)
+                    .ok_or_else(|| ioerr("Record offset overflow"))?;
+            }
+            Ok(out)
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
 struct PgenDecoder {
     src: Arc<dyn ByteRangeSource>,
     hdr: PgenHeader,
     n: usize,
     scratch: Vec<u8>,
-    anchor_cats: Option<Vec<u8>>,
+    /// Absolute file offset of record `k * OFFSET_STRIDE`.
+    stride_offsets: Vec<u64>,
+    /// Raw (pre-projection) genotype categories of the LD anchor identified by
+    /// `anchor_idx`. An LD-compressed record diffs against the most recent
+    /// *non*-LD-compressed record in its block, so decoding record `i` out of
+    /// order requires locating and decoding that anchor rather than trusting
+    /// whatever was decoded last.
+    anchor_idx: Option<usize>,
+    anchor_cats: Vec<u8>,
+    /// Reused per-decode scratch so a scoring run doing millions of variant
+    /// reads does not allocate two sample-sized buffers per variant.
+    cats_buf: Vec<u8>,
     alt_counts: Vec<u16>,
 }
 
@@ -1907,12 +2117,17 @@ impl PgenDecoder {
             )));
         }
 
+        let stride_offsets = build_stride_offsets(&hdr, n_samples_from_psam)?;
+
         Ok(Self {
             src,
             hdr,
             n: n_samples_from_psam,
             scratch: Vec::new(),
-            anchor_cats: None,
+            stride_offsets,
+            anchor_idx: None,
+            anchor_cats: Vec::new(),
+            cats_buf: Vec::new(),
             alt_counts,
         })
     }
@@ -1921,24 +2136,20 @@ impl PgenDecoder {
         match self.hdr.mode {
             PgenMode::FixHard => {
                 let rec_len = self.n.div_ceil(4);
-                let ref_flag_mode = (self.hdr.fmt_byte >> 6) & 0x03;
-                let mut base = 12u64 + 1; // header + format byte
-                if ref_flag_mode == 3 {
-                    base = base
-                        .checked_add((self.hdr.m_variants as u64).div_ceil(8))
-                        .ok_or_else(|| ioerr("Header overflow"))?;
-                }
+                let base = fixhard_body_offset(&self.hdr)?;
                 Ok((base + (idx as u64) * (rec_len as u64), rec_len, 0))
             }
             PgenMode::Var | PgenMode::VarIgnorable => {
-                let block_idx = idx >> 16;
-                let block_off = *self
-                    .hdr
-                    .block_offsets
-                    .get(block_idx)
-                    .ok_or_else(|| ioerr("Missing block offset"))?;
-                let mut off = block_off;
-                let mut cursor = block_idx << 16;
+                // Start from the nearest indexed record rather than the start of
+                // the 2^16 variant block, so a lookup costs at most
+                // `OFFSET_STRIDE - 1` additions regardless of where in the block
+                // `idx` falls.
+                let anchor = idx / OFFSET_STRIDE;
+                let mut off = *self
+                    .stride_offsets
+                    .get(anchor)
+                    .ok_or_else(|| ioerr("Missing stride offset"))?;
+                let mut cursor = anchor * OFFSET_STRIDE;
                 while cursor < idx {
                     off += *self
                         .hdr
@@ -1964,6 +2175,72 @@ impl PgenDecoder {
         }
     }
 
+    /// Reads record `idx` into `self.scratch`, returning its byte length and
+    /// record type.
+    fn load_record(&mut self, idx: usize) -> Result<(usize, u8), PipelineError> {
+        let (off, len, rec_ty) = self.record_offset_len(idx)?;
+        if self.scratch.len() < len {
+            self.scratch.resize(len, 0);
+        }
+        self.src.read_at(off, &mut self.scratch[..len])?;
+        Ok((len, rec_ty))
+    }
+
+    /// Locates the record an LD-compressed record at `idx` diffs against: the
+    /// most recent record in the same 2^16 variant block whose main track is not
+    /// itself LD-compressed.
+    fn ld_anchor_index(&self, idx: usize) -> Result<usize, PipelineError> {
+        let block_start = idx & !0xffff;
+        let mut j = idx;
+        while j > block_start {
+            j -= 1;
+            let ty = *self
+                .hdr
+                .rec_types
+                .get(j)
+                .ok_or_else(|| ioerr("Missing rec_type while resolving LD anchor"))?;
+            if !matches!(ty & 0x07, 2 | 3) {
+                return Ok(j);
+            }
+        }
+        Err(ioerr(
+            "LD-compressed record has no anchor in its variant block",
+        ))
+    }
+
+    /// Ensures `self.anchor_cats` holds the raw categories of the LD anchor for
+    /// `target`, decoding that anchor record if it is not already cached.
+    ///
+    /// Sparse scoring runs touch variants in arbitrary order, so the anchor can
+    /// never be assumed to be whatever was decoded most recently.
+    fn ensure_anchor(&mut self, target: usize) -> Result<(), PipelineError> {
+        let anchor_idx = self.ld_anchor_index(target)?;
+        if self.anchor_idx == Some(anchor_idx) && self.anchor_cats.len() == self.n {
+            return Ok(());
+        }
+
+        // Invalidate first: if decoding fails midway we must not leave a stale
+        // index pointing at partially-written categories.
+        self.anchor_idx = None;
+
+        let (len, rec_ty) = self.load_record(anchor_idx)?;
+        let main_kind = rec_ty & 0x07;
+        if matches!(main_kind, 2 | 3) {
+            return Err(ioerr("LD anchor is itself LD-compressed"));
+        }
+        let n = self.n;
+        let mut cursor = 0usize;
+        let Self {
+            scratch,
+            anchor_cats,
+            ..
+        } = self;
+        decode_main_track_into(&scratch[..len], &mut cursor, n, main_kind, None, anchor_cats)?;
+
+        self.anchor_idx = Some(anchor_idx);
+        Ok(())
+    }
+
     fn decode_variant_hardcalls(
         &mut self,
         in_idx: u32,
@@ -1984,123 +2261,55 @@ impl PgenDecoder {
             return Err(ioerr("Variant index out of bounds"));
         }
 
-        let (off, len, rec_ty) = self.record_offset_len(idx)?;
-        if self.scratch.len() < len {
-            self.scratch.resize(len, 0);
+        let n = self.n;
+        let alt_count = self.alt_counts.get(idx).copied().unwrap_or(0);
+
+        // Peek at the record type first: an LD-compressed record needs its
+        // anchor decoded before we overwrite the scratch buffer with the target
+        // record.
+        let (_, _, rec_ty) = self.record_offset_len(idx)?;
+        let main_kind = rec_ty & 0x07;
+        if matches!(main_kind, 2 | 3) {
+            if (idx & 0xffff) == 0 {
+                return Err(ioerr("LD-compressed record at block start"));
+            }
+            self.ensure_anchor(idx)?;
         }
-        self.src.read_at(off, &mut self.scratch[..len])?;
-        let buf = &self.scratch[..len];
+
+        let (len, rec_ty) = self.load_record(idx)?;
         let mut cursor = 0usize;
 
-        let mut cats = vec![3u8; self.n];
-        let main_kind = rec_ty & 0x07;
-        match main_kind {
-            0 => {
-                let need = self.n.div_ceil(4);
-                if need > len {
-                    return Err(ioerr("Truncated type-0 main track"));
-                }
-                unpack_pgen2bit_to_categories(&buf[cursor..cursor + need], &mut cats, self.n);
-                cursor += need;
-            }
-            1 => {
-                if cursor >= len {
-                    return Err(ioerr("Truncated type-1 header byte"));
-                }
-                let pair = buf[cursor];
-                cursor += 1;
-                let (low, high) = match pair {
-                    1 => (0u8, 1),
-                    2 => (0, 2),
-                    3 => (0, 3),
-                    5 => (1, 2),
-                    6 => (1, 3),
-                    9 => (2, 3),
-                    _ => return Err(ioerr("Invalid 1-bit pair code")),
-                };
-                let idxs = read_bitarray_indices(buf, &mut cursor, self.n)?;
-                for i in 0..self.n {
-                    cats[i] = low;
-                }
-                for bit in idxs {
-                    if bit < self.n {
-                        cats[bit] = high;
-                    }
-                }
-                let pairs = difflist_pairs(buf, &mut cursor, self.n)?;
-                for (sid, val) in pairs {
-                    if (sid as usize) < self.n {
-                        cats[sid as usize] = val;
-                    }
-                }
-            }
-            2 | 3 => {
-                if (idx & 0xffff) == 0 {
-                    return Err(ioerr("LD-compressed record at block start"));
-                }
-                let anchor = self
-                    .anchor_cats
-                    .as_ref()
-                    .ok_or_else(|| ioerr("Missing LD anchor"))?
-                    .clone();
-                let mut base = anchor;
-                let pairs = difflist_pairs(buf, &mut cursor, self.n)?;
-                for (sid, val) in pairs {
-                    if (sid as usize) < self.n {
-                        base[sid as usize] = val;
-                    }
-                }
-                if main_kind == 3 {
-                    for c in &mut base {
-                        if *c == 0 {
-                            *c = 2;
-                        } else if *c == 2 {
-                            *c = 0;
-                        }
-                    }
-                }
-                cats.copy_from_slice(&base);
-            }
-            4 | 6 | 7 => {
-                let x = match main_kind {
-                    4 => 0u8,
-                    6 => 2,
-                    7 => 3,
-                    _ => unreachable!(),
-                };
-                for i in 0..self.n {
-                    cats[i] = x;
-                }
-                let pairs = difflist_pairs(buf, &mut cursor, self.n)?;
-                for (sid, val) in pairs {
-                    if (sid as usize) < self.n {
-                        cats[sid as usize] = val;
-                    }
-                }
-            }
-            _ => {
-                return Err(PipelineError::Io(format!(
-                    "Unsupported main-track type {}",
-                    main_kind
-                )));
-            }
-        }
+        // Disjoint field borrows: the record bytes, the anchor categories, and
+        // the category output buffer are all owned by `self`.
+        let Self {
+            scratch,
+            anchor_cats,
+            cats_buf,
+            ..
+        } = self;
+        let buf = &scratch[..len];
+        let anchor = if matches!(main_kind, 2 | 3) {
+            Some(anchor_cats.as_slice())
+        } else {
+            None
+        };
+        decode_main_track_into(buf, &mut cursor, n, main_kind, anchor, cats_buf)?;
+        let cats = cats_buf.as_mut_slice();
 
         let has_multiallelic = (rec_ty & 0b0000_1000) != 0;
-        let alt_count = self.alt_counts.get(idx).copied().unwrap_or(0);
-        let mut a1dosage = vec![255u8; self.n];
+        let mut a1dosage = vec![255u8; n];
         if has_multiallelic {
             apply_multiallelic_and_project(
                 buf,
                 &mut cursor,
-                self.n,
-                &mut cats,
+                n,
+                cats,
                 alt_count,
                 alt_ord_1b,
                 &mut a1dosage,
             )?;
         } else {
-            cats_to_a1dosage(&mut a1dosage, &cats);
+            cats_to_a1dosage(&mut a1dosage, cats);
         }
 
         if (rec_ty & 0b0001_0000) != 0 {
@@ -2167,7 +2376,7 @@ impl PgenDecoder {
             let b6 = (rec_ty & 0b0100_0000) != 0;
 
             if b5 && !b6 {
-                let ids = difflist_ids(buf, &mut cursor, self.n)?;
+                let ids = difflist_ids(buf, &mut cursor, n)?;
                 let cnt = ids.len();
                 let need = cnt * 2;
                 if cursor + need > len {
@@ -2177,7 +2386,7 @@ impl PgenDecoder {
                 }
                 if decode_dosage {
                     for (i, &sid) in ids.iter().enumerate() {
-                        if (sid as usize) < self.n {
+                        if (sid as usize) < n {
                             let v =
                                 u16::from_le_bytes([buf[cursor + 2 * i], buf[cursor + 2 * i + 1]]);
                             if a1dosage[sid as usize] == 255 && v != 65535 {
@@ -2196,14 +2405,14 @@ impl PgenDecoder {
                 cursor += need;
                 dosage_entries = cnt;
             } else if !b5 && b6 {
-                let need = self.n * 2;
+                let need = n * 2;
                 if cursor + need > len {
                     return Err(PipelineError::Io(format!(
                         "EOF in dense dosage values (variant #{idx})"
                     )));
                 }
                 if decode_dosage {
-                    for s in 0..self.n {
+                    for s in 0..n {
                         let v = u16::from_le_bytes([buf[cursor + 2 * s], buf[cursor + 2 * s + 1]]);
                         if a1dosage[s] == 255 && v != 65535 {
                             let pl = sample_ploidy.and_then(|p| p.get(s)).copied().unwrap_or(2);
@@ -2215,9 +2424,9 @@ impl PgenDecoder {
                     }
                 }
                 cursor += need;
-                dosage_entries = self.n;
+                dosage_entries = n;
             } else {
-                let present = read_bitarray_indices(buf, &mut cursor, self.n)?;
+                let present = read_bitarray_indices(buf, &mut cursor, n)?;
                 let cnt = present.len();
                 let need = cnt * 2;
                 if cursor + need > len {
@@ -2227,7 +2436,7 @@ impl PgenDecoder {
                 }
                 if decode_dosage {
                     for (i, &s) in present.iter().enumerate() {
-                        if s < self.n {
+                        if s < n {
                             let v =
                                 u16::from_le_bytes([buf[cursor + 2 * i], buf[cursor + 2 * i + 1]]);
                             if a1dosage[s] == 255 && v != 65535 {
@@ -2254,7 +2463,7 @@ impl PgenDecoder {
             let b5 = (rec_ty & 0b0010_0000) != 0;
             let b6 = (rec_ty & 0b0100_0000) != 0;
             if !b5 && b6 {
-                let need = self.n * 2;
+                let need = n * 2;
                 if cursor + need > len {
                     return Err(PipelineError::Io(format!(
                         "EOF in phased dense dosage values (variant #{idx})"
@@ -2301,13 +2510,109 @@ impl PgenDecoder {
             }
         }
 
-        if !matches!(main_kind, 2 | 3) {
-            self.anchor_cats = Some(cats.clone());
-        }
-
         dst.copy_from_slice(&a1dosage);
         Ok(())
     }
+}
+
+/// Fills `cats` with the raw 2-bit genotype categories encoded by the main data
+/// track at `cursor`, advancing `cursor` past it.
+///
+/// "Raw" means pre-projection: no multiallelic patching, ploidy coercion, or
+/// dosage overlay is applied. That is exactly the form an LD-compressed record
+/// diffs against, so the same output can be cached and reused as an anchor.
+fn decode_main_track_into(
+    buf: &[u8],
+    cursor: &mut usize,
+    n: usize,
+    main_kind: u8,
+    anchor: Option<&[u8]>,
+    cats: &mut Vec<u8>,
+) -> Result<(), PipelineError> {
+    let len = buf.len();
+    cats.clear();
+    cats.resize(n, 3);
+
+    match main_kind {
+        0 => {
+            let need = n.div_ceil(4);
+            if *cursor + need > len {
+                return Err(ioerr("Truncated type-0 main track"));
+            }
+            unpack_pgen2bit_to_categories(&buf[*cursor..*cursor + need], cats, n);
+            *cursor += need;
+        }
+        1 => {
+            if *cursor >= len {
+                return Err(ioerr("Truncated type-1 header byte"));
+            }
+            let pair = buf[*cursor];
+            *cursor += 1;
+            let (low, high) = match pair {
+                1 => (0u8, 1),
+                2 => (0, 2),
+                3 => (0, 3),
+                5 => (1, 2),
+                6 => (1, 3),
+                9 => (2, 3),
+                _ => return Err(ioerr("Invalid 1-bit pair code")),
+            };
+            let idxs = read_bitarray_indices(buf, cursor, n)?;
+            cats.fill(low);
+            for bit in idxs {
+                if bit < n {
+                    cats[bit] = high;
+                }
+            }
+            for (sid, val) in difflist_pairs(buf, cursor, n)? {
+                if (sid as usize) < n {
+                    cats[sid as usize] = val;
+                }
+            }
+        }
+        2 | 3 => {
+            let anchor = anchor.ok_or_else(|| ioerr("Missing LD anchor"))?;
+            if anchor.len() != n {
+                return Err(ioerr("LD anchor sample-count mismatch"));
+            }
+            cats.copy_from_slice(anchor);
+            for (sid, val) in difflist_pairs(buf, cursor, n)? {
+                if (sid as usize) < n {
+                    cats[sid as usize] = val;
+                }
+            }
+            if main_kind == 3 {
+                // Type 3 is "LD-compressed, inverted": the diff is patched in
+                // first, then REF/ALT homozygotes swap.
+                for c in cats.iter_mut() {
+                    if *c == 0 {
+                        *c = 2;
+                    } else if *c == 2 {
+                        *c = 0;
+                    }
+                }
+            }
+        }
+        4 | 6 | 7 => {
+            let x = match main_kind {
+                4 => 0u8,
+                6 => 2,
+                _ => 3,
+            };
+            cats.fill(x);
+            for (sid, val) in difflist_pairs(buf, cursor, n)? {
+                if (sid as usize) < n {
+                    cats[sid as usize] = val;
+                }
+            }
+        }
+        _ => {
+            return Err(PipelineError::Io(format!(
+                "Unsupported main-track type {main_kind}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn unpack_pgen2bit_to_categories(block: &[u8], dst: &mut [u8], n: usize) {
@@ -2858,14 +3163,7 @@ mod tests {
             rec_types: vec![0, 3],
             rec_lens: vec![rec0.len() as u32, rec1.len() as u32],
         };
-        let mut decoder = PgenDecoder {
-            src,
-            hdr,
-            n,
-            scratch: Vec::new(),
-            anchor_cats: None,
-            alt_counts: vec![1, 1],
-        };
+        let mut decoder = PgenDecoder::new(src, hdr, n, 2, vec![1, 1]).unwrap();
 
         let mut out0 = vec![0u8; n];
         decoder
@@ -2879,7 +3177,78 @@ mod tests {
             .unwrap();
         assert_eq!(out1, vec![0, 1, 2, 2, 0, 0, 255, 0]);
 
-        assert_eq!(decoder.anchor_cats.as_ref().unwrap(), &anchor_cats.to_vec());
+        // The type-3 record's anchor is record 0, decoded and cached on demand.
+        assert_eq!(decoder.anchor_idx, Some(0));
+        assert_eq!(decoder.anchor_cats, anchor_cats.to_vec());
+
+        // Re-reading in the opposite order must give the same answers: the
+        // anchor is resolved from the record table, not from decode history.
+        let mut again1 = vec![0u8; n];
+        decoder
+            .decode_variant_hardcalls(1, 1, &mut again1, None)
+            .unwrap();
+        assert_eq!(again1, out1);
+        let mut again0 = vec![0u8; n];
+        decoder
+            .decode_variant_hardcalls(0, 1, &mut again0, None)
+            .unwrap();
+        assert_eq!(again0, out0);
+    }
+
+    /// The sparse offset index must agree with a naive walk from the start of
+    /// the variant block, including at and around the stride boundaries.
+    #[test]
+    fn stride_offsets_match_naive_record_walk() {
+        let m = OFFSET_STRIDE * 3 + 7;
+        let rec_lens: Vec<u32> = (0..m).map(|i| 5 + (i as u32 * 7) % 23).collect();
+        let hdr = PgenHeader {
+            mode: PgenMode::Var,
+            m_variants: m as u32,
+            n_samples: 4,
+            fmt_byte: 0,
+            block_offsets: vec![1000],
+            rec_types: vec![0; m],
+            rec_lens: rec_lens.clone(),
+        };
+        let src: Arc<dyn ByteRangeSource> = Arc::new(VecSource::new(vec![]));
+        let decoder = PgenDecoder::new(src, hdr, 4, m, vec![1; m]).unwrap();
+
+        let mut expected = 1000u64;
+        for (idx, len) in rec_lens.iter().enumerate() {
+            let (got, got_len, _) = decoder.record_offset_len(idx).unwrap();
+            assert_eq!(got, expected, "offset mismatch at record {idx}");
+            assert_eq!(got_len, *len as usize);
+            expected += *len as u64;
+        }
+    }
+
+    /// An LD anchor is the nearest preceding non-LD record, regardless of how
+    /// many LD records sit between it and the target.
+    #[test]
+    fn ld_anchor_is_nearest_preceding_non_ld_record() {
+        let rec_types = vec![0u8, 2, 3, 2, 1, 2, 2, 4, 2];
+        let m = rec_types.len();
+        let hdr = PgenHeader {
+            mode: PgenMode::Var,
+            m_variants: m as u32,
+            n_samples: 4,
+            fmt_byte: 0,
+            block_offsets: vec![0],
+            rec_types,
+            rec_lens: vec![2; m],
+        };
+        let src: Arc<dyn ByteRangeSource> = Arc::new(VecSource::new(vec![]));
+        let decoder = PgenDecoder::new(src, hdr, 4, m, vec![1; m]).unwrap();
+
+        for (target, want) in [(1, 0), (2, 0), (3, 0), (5, 4), (6, 4), (8, 7)] {
+            assert_eq!(
+                decoder.ld_anchor_index(target).unwrap(),
+                want,
+                "anchor for record {target}"
+            );
+        }
+        // Record 0 begins the block, so it has nothing to diff against.
+        assert!(decoder.ld_anchor_index(0).is_err());
     }
 
     #[test]
@@ -2909,14 +3278,14 @@ mod tests {
             rec_lens: vec![],
         };
         let src: Arc<dyn ByteRangeSource> = Arc::new(VecSource::new(vec![]));
-        let decoder_plain = PgenDecoder {
-            src: Arc::clone(&src),
-            hdr: hdr_plain,
-            n: n_samples,
-            scratch: Vec::new(),
-            anchor_cats: None,
-            alt_counts: vec![0; m_variants as usize],
-        };
+        let decoder_plain = PgenDecoder::new(
+            Arc::clone(&src),
+            hdr_plain,
+            n_samples,
+            m_variants as usize,
+            vec![0; m_variants as usize],
+        )
+        .unwrap();
         let (off0, len0, ty0) = decoder_plain.record_offset_len(0).unwrap();
         assert_eq!(off0, 12 + 1);
         assert_eq!(len0, rec_len);
@@ -2933,14 +3302,14 @@ mod tests {
             rec_types: vec![],
             rec_lens: vec![],
         };
-        let decoder_ref = PgenDecoder {
+        let decoder_ref = PgenDecoder::new(
             src,
-            hdr: hdr_ref,
-            n: n_samples,
-            scratch: Vec::new(),
-            anchor_cats: None,
-            alt_counts: vec![0; m_variants as usize],
-        };
+            hdr_ref,
+            n_samples,
+            m_variants as usize,
+            vec![0; m_variants as usize],
+        )
+        .unwrap();
         let (off0_ref, len_ref, _) = decoder_ref.record_offset_len(0).unwrap();
         let expected_base = 12 + 1 + ((m_variants as u64 + 7) / 8);
         assert_eq!(off0_ref, expected_base);

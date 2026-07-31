@@ -2014,7 +2014,10 @@ impl PgenDataset {
     }
 
     pub fn variant_records(&self) -> Result<PlinkVariantRecordIter, PlinkIoError> {
-        let reader = self.virtual_plink.bim_source();
+        let reader = self
+            .virtual_plink
+            .bim_source()
+            .map_err(PlinkIoError::from)?;
         Ok(PlinkVariantRecordIter::from_source(
             self.pvar_path.clone(),
             reader,

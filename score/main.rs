@@ -1047,18 +1047,21 @@ fn resolve_filesets(path: &Path) -> Result<Vec<PathBuf>, Box<dyn Error + Send + 
 
     // --- ORIGINAL LOCAL LOGIC (unchanged) ---
     if !path.is_dir() {
-        let prefix = if path.extension().is_some() {
-            path.with_extension("")
-        } else {
-            path.to_path_buf()
-        };
+        // Strip only a genuine fileset extension: prefixes such as
+        // `acaf_threshold.chr22` carry dots of their own, and lopping off the
+        // last dot segment would look for `acaf_threshold.bed`.
+        let prefix = fileset_prefix(path);
 
-        if !prefix.with_extension("bed").is_file()
-            || !prefix.with_extension("bim").is_file()
-            || !prefix.with_extension("fam").is_file()
-        {
+        let has_bed = ["bed", "bim", "fam"]
+            .iter()
+            .all(|ext| prefix.with_extension(ext).is_file());
+        let has_pgen = ["pgen", "pvar", "psam"]
+            .iter()
+            .all(|ext| prefix.with_extension(ext).is_file());
+        if !has_bed && !has_pgen {
             return Err(format!(
-                "Input prefix '{}' does not correspond to a complete PLINK fileset (.bed, .bim, .fam).",
+                "Input prefix '{}' does not correspond to a complete PLINK fileset \
+                 (.bed/.bim/.fam or .pgen/.pvar/.psam).",
                 prefix.display()
             )
             .into());
@@ -1066,31 +1069,38 @@ fn resolve_filesets(path: &Path) -> Result<Vec<PathBuf>, Box<dyn Error + Send + 
         return Ok(vec![prefix]);
     }
 
-    let mut bed_files: Vec<PathBuf> = fs::read_dir(path)?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|p| {
-            p.is_file()
-                && p.extension().is_some_and(|ext| ext == "bed")
-                && !p
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .is_some_and(|stem| stem.ends_with(".sorted"))
-        })
-        .collect();
+    // A directory may hold either flavour of fileset (e.g. one .pgen per
+    // chromosome, which is how All of Us ships its callsets). `.bed` wins when
+    // both are present so existing layouts keep their current behaviour.
+    let mut bed_files: Vec<PathBuf> = collect_fileset_members(path, "bed")?;
+    let genotype_ext = if bed_files.is_empty() {
+        bed_files = collect_fileset_members(path, "pgen")?;
+        "pgen"
+    } else {
+        "bed"
+    };
 
     if bed_files.is_empty() {
-        return Err(format!("No .bed files found in directory '{}'.", path.display()).into());
+        return Err(format!(
+            "No .bed or .pgen files found in directory '{}'.",
+            path.display()
+        )
+        .into());
     }
 
     bed_files.sort_by(|a, b| compare(&a.to_string_lossy(), &b.to_string_lossy()));
 
     let mut prefixes = Vec::with_capacity(bed_files.len());
+    let (meta_a, meta_b) = if genotype_ext == "pgen" {
+        ("pvar", "psam")
+    } else {
+        ("bim", "fam")
+    };
     for bed_path in bed_files {
-        let prefix = bed_path.with_extension("");
-        if !prefix.with_extension("bim").is_file() || !prefix.with_extension("fam").is_file() {
+        let prefix = fileset_prefix(&bed_path);
+        if !prefix.with_extension(meta_a).is_file() || !prefix.with_extension(meta_b).is_file() {
             return Err(format!(
-                "Incomplete fileset for prefix '{}'. All .bed files in a directory must have corresponding .bim and .fam files.",
+                "Incomplete fileset for prefix '{}'. Every .{genotype_ext} file in a directory must have corresponding .{meta_a} and .{meta_b} files.",
                 prefix.display()
             )
             .into());
@@ -1098,6 +1108,34 @@ fn resolve_filesets(path: &Path) -> Result<Vec<PathBuf>, Box<dyn Error + Send + 
         prefixes.push(prefix);
     }
     Ok(prefixes)
+}
+
+/// Drops a trailing fileset extension, leaving the prefix its members share.
+fn fileset_prefix(path: &Path) -> PathBuf {
+    match path.to_str() {
+        Some(s) => PathBuf::from(gnomon::score::prepare::strip_fileset_extension(s)),
+        None => path.to_path_buf(),
+    }
+}
+
+/// Lists the genotype-table files of one flavour in a directory, skipping the
+/// `.sorted` intermediates gnomon writes itself.
+fn collect_fileset_members(
+    dir: &Path,
+    extension: &str,
+) -> Result<Vec<PathBuf>, Box<dyn Error + Send + Sync>> {
+    Ok(fs::read_dir(dir)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|p| {
+            p.is_file()
+                && p.extension().is_some_and(|ext| ext == extension)
+                && !p
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .is_some_and(|stem| stem.ends_with(".sorted"))
+        })
+        .collect())
 }
 
 fn is_gcs_uri_str(s: &str) -> bool {
@@ -1218,17 +1256,35 @@ fn resolve_gcs_filesets(uri: &str) -> Result<Vec<PathBuf>, Box<dyn Error + Send 
     };
 
     if !wants_dir_scan && !object.ends_with('/') {
-        let triad_prefix = if object.ends_with(".bed") {
-            object[..object.len() - 4].to_string()
-        } else {
-            object.clone()
+        let triad_prefix = match object.rsplit_once('.') {
+            Some((base, "bed" | "pgen")) => base.to_string(),
+            _ => object.clone(),
         };
 
-        for ext in ["bed", "bim", "fam"] {
-            let name = format!("{triad_prefix}.{ext}");
-            let _ = try_head(&control, &name)?;
+        // Probe PLINK 1.9 first, then PLINK 2. A HEAD per member is cheap and
+        // avoids a bucket listing, which requester-pays buckets charge for.
+        let mut last_err = None;
+        for triple in [["bed", "bim", "fam"], ["pgen", "pvar", "psam"]] {
+            let mut ok = true;
+            for ext in triple {
+                let name = format!("{triad_prefix}.{ext}");
+                if let Err(e) = try_head(&control, &name) {
+                    last_err = Some(e);
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                return Ok(vec![PathBuf::from(format!("gs://{bucket}/{triad_prefix}"))]);
+            }
         }
-        return Ok(vec![PathBuf::from(format!("gs://{bucket}/{triad_prefix}"))]);
+        return Err(last_err.unwrap_or_else(|| {
+            format!(
+                "gs://{bucket}/{triad_prefix} is not a complete PLINK fileset \
+                 (.bed/.bim/.fam or .pgen/.pvar/.psam)"
+            )
+            .into()
+        }));
     }
 
     let scan_prefix = if object.is_empty() || object.ends_with('/') {
@@ -1260,7 +1316,7 @@ fn resolve_gcs_filesets(uri: &str) -> Result<Vec<PathBuf>, Box<dyn Error + Send 
             continue;
         }
         if let Some((base, ext)) = name.rsplit_once('.') {
-            if ["bed", "bim", "fam"].contains(&ext) {
+            if ["bed", "bim", "fam", "pgen", "pvar", "psam"].contains(&ext) {
                 by_prefix
                     .entry(base.to_string())
                     .or_default()
@@ -1272,17 +1328,14 @@ fn resolve_gcs_filesets(uri: &str) -> Result<Vec<PathBuf>, Box<dyn Error + Send 
     let mut complete: Vec<String> = by_prefix
         .into_iter()
         .filter_map(|(base, exts)| {
-            if exts.contains("bed") && exts.contains("bim") && exts.contains("fam") {
-                Some(base)
-            } else {
-                None
-            }
+            let has = |t: [&str; 3]| t.iter().all(|e| exts.contains(*e));
+            (has(["bed", "bim", "fam"]) || has(["pgen", "pvar", "psam"])).then_some(base)
         })
         .collect();
 
     if complete.is_empty() {
         return Err(format!(
-            "No complete PLINK filesets (.bed/.bim/.fam) under gs://{bucket}/{scan_prefix}"
+            "No complete PLINK filesets (.bed/.bim/.fam or .pgen/.pvar/.psam) under gs://{bucket}/{scan_prefix}"
         )
         .into());
     }

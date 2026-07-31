@@ -4,6 +4,7 @@ use ahash::{AHashMap, AHashSet};
 use flate2::read::MultiGzDecoder;
 use noodles_vcf::io::Reader as VcfReader;
 use noodles_vcf::variant::record::AlternateBases as _;
+use noodles_vcf::variant::record::Samples as _;
 use noodles_vcf::variant::record::samples::keys::key;
 use std::error::Error;
 use std::fs::File;
@@ -24,6 +25,11 @@ pub struct NativeVcfScoreResult {
 struct ScoreRule {
     effect_allele: String,
     other_allele: String,
+    applications: Vec<ScoreApplication>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScoreApplication {
     score_index: usize,
     weight: f32,
 }
@@ -87,8 +93,6 @@ pub fn score_vcf_streaming(
     let mut matched_variant_keys: AHashSet<(VariantKey, usize, usize)> = AHashSet::new();
 
     let mut record = noodles_vcf::Record::default();
-    let mut decoded = vec![None; kept_indices.len()];
-
     while reader.read_record(&mut record)? != 0 {
         let chr = match parse_chromosome_label(record.reference_sequence_name()) {
             Ok(chr) => chr,
@@ -119,56 +123,58 @@ pub fn score_vcf_streaming(
                 continue;
             }
 
-            decoded.fill(None);
-            decode_vcf_record_best(
+            for_each_vcf_dosage_best(
                 &record,
                 alt_index,
                 alt_alleles.len(),
                 &kept_indices,
-                &mut decoded,
+                |out_person_idx, dosage| {
+                    match dosage {
+                        Some(decoded_dosage) => {
+                            for rule in &matched_rules {
+                                let cell = out_person_idx * num_scores + rule.score_index;
+                                let effect_dosage = if rule.effect_is_ref {
+                                    decoded_dosage
+                                        .ploidy
+                                        .map(|ploidy| {
+                                            ploidy as f64 - decoded_dosage.alt_dosage
+                                        })
+                                        .ok_or_else(|| {
+                                            format!(
+                                                "Cannot score REF-effect rule for score '{}' at {}:{} from DS/GP dosage without genotype ploidy.",
+                                                score_names[rule.score_index],
+                                                record.reference_sequence_name(),
+                                                pos,
+                                            )
+                                        })?
+                                } else {
+                                    decoded_dosage.alt_dosage
+                                };
+                                sum_scores[cell] += rule.weight * effect_dosage;
+                            }
+                        }
+                        None => {
+                            let mut previous_score = None;
+                            for rule in &matched_rules {
+                                if previous_score == Some(rule.score_index) {
+                                    continue;
+                                }
+                                let cell = out_person_idx * num_scores + rule.score_index;
+                                missing_counts[cell] += 1;
+                                previous_score = Some(rule.score_index);
+                            }
+                        }
+                    }
+                    Ok(())
+                },
             )?;
 
-            let mut counted_scores = AHashSet::new();
+            let mut previous_score = None;
             for rule in &matched_rules {
-                if counted_scores.insert(rule.score_index) {
+                if previous_score != Some(rule.score_index) {
                     score_variant_counts[rule.score_index] += 1;
                     matched_variant_keys.insert((key, alt_index, rule.score_index));
-                }
-            }
-
-            for (out_person_idx, dosage) in decoded.iter().copied().enumerate() {
-                match dosage {
-                    Some(decoded_dosage) => {
-                        for rule in &matched_rules {
-                            let cell = out_person_idx * num_scores + rule.score_index;
-                            let effect_dosage = if rule.effect_is_ref {
-                                decoded_dosage
-                                    .ploidy
-                                    .map(|ploidy| ploidy as f64 - decoded_dosage.alt_dosage)
-                                    .ok_or_else(|| {
-                                        format!(
-                                            "Cannot score REF-effect rule for score '{}' at {}:{} from DS/GP dosage without genotype ploidy.",
-                                            score_names[rule.score_index],
-                                            record.reference_sequence_name(),
-                                            pos,
-                                        )
-                                    })?
-                            } else {
-                                decoded_dosage.alt_dosage
-                            };
-                            sum_scores[cell] += rule.weight * effect_dosage;
-                        }
-                    }
-                    None => {
-                        let mut counted_missing_scores = AHashSet::new();
-                        for rule in &matched_rules {
-                            if !counted_missing_scores.insert(rule.score_index) {
-                                continue;
-                            }
-                            let cell = out_person_idx * num_scores + rule.score_index;
-                            missing_counts[cell] += 1;
-                        }
-                    }
+                    previous_score = Some(rule.score_index);
                 }
             }
         }
@@ -223,17 +229,14 @@ fn load_score_rules(
                 continue;
             }
 
-            let fields: Vec<&str> = trimmed.split('\t').collect();
-            let Some(&variant_id) = fields.first() else {
-                line.clear();
-                continue;
-            };
+            let mut fields = trimmed.split('\t');
+            let variant_id = fields.next().unwrap_or_default();
             if variant_id == "variant_id" {
                 line.clear();
                 continue;
             }
-            let effect_allele = fields.get(1).copied().unwrap_or_default();
-            let other_allele = fields.get(2).copied().unwrap_or_default();
+            let effect_allele = fields.next().unwrap_or_default();
+            let other_allele = fields.next().unwrap_or_default();
             if effect_allele.is_empty() || other_allele.is_empty() {
                 return Err(format!(
                     "Malformed native score row in '{}' at line {}.",
@@ -272,8 +275,9 @@ fn load_score_rules(
                     )
                 })?,
             );
-            for (column_offset, score_name) in header.score_names.iter().enumerate() {
-                let weight_text = fields.get(column_offset + 3).copied().unwrap_or_default();
+            let mut applications = Vec::with_capacity(header.score_names.len());
+            for score_name in &header.score_names {
+                let weight_text = fields.next().unwrap_or_default();
                 if weight_text.trim().is_empty() {
                     return Err(format!(
                         "Missing weight for score '{}' in '{}' at line {}.",
@@ -306,11 +310,16 @@ fn load_score_rules(
                     )
                 })?;
 
+                applications.push(ScoreApplication {
+                    score_index,
+                    weight,
+                });
+            }
+            if !applications.is_empty() {
                 rules_by_key.entry(key).or_default().push(ScoreRule {
                     effect_allele: effect_allele.to_string(),
                     other_allele: other_allele.to_string(),
-                    score_index,
-                    weight,
+                    applications,
                 });
             }
 
@@ -387,24 +396,40 @@ fn match_rules_for_allele(
     ref_allele: &str,
     alt_allele: &str,
 ) -> Vec<MatchedRule> {
-    let mut aggregate: AHashMap<(usize, bool), f64> = AHashMap::new();
+    let capacity = rules.iter().map(|rule| rule.applications.len()).sum();
+    let mut matched = Vec::with_capacity(capacity);
     for rule in rules {
-        if rule.effect_allele == alt_allele && rule.other_allele == ref_allele {
-            *aggregate.entry((rule.score_index, false)).or_default() += f64::from(rule.weight);
+        let effect_is_ref = if rule.effect_allele == alt_allele && rule.other_allele == ref_allele {
+            false
         } else if rule.effect_allele == ref_allele && rule.other_allele == alt_allele {
-            *aggregate.entry((rule.score_index, true)).or_default() += f64::from(rule.weight);
+            true
+        } else {
+            continue;
+        };
+        for application in &rule.applications {
+            matched.push(MatchedRule {
+                score_index: application.score_index,
+                weight: f64::from(application.weight),
+                effect_is_ref,
+            });
         }
     }
 
-    let mut matched: Vec<_> = aggregate
-        .into_iter()
-        .map(|((score_index, effect_is_ref), weight)| MatchedRule {
-            score_index,
-            weight,
-            effect_is_ref,
-        })
-        .collect();
     matched.sort_by_key(|rule| (rule.score_index, rule.effect_is_ref));
+    let mut unique_len = 0usize;
+    for read_idx in 0..matched.len() {
+        let rule = matched[read_idx];
+        if unique_len > 0
+            && matched[unique_len - 1].score_index == rule.score_index
+            && matched[unique_len - 1].effect_is_ref == rule.effect_is_ref
+        {
+            matched[unique_len - 1].weight += rule.weight;
+        } else {
+            matched[unique_len] = rule;
+            unique_len += 1;
+        }
+    }
+    matched.truncate(unique_len);
     matched
 }
 
@@ -430,15 +455,21 @@ impl DecodedAltDosage {
     }
 }
 
-fn decode_vcf_record_best(
+fn for_each_vcf_dosage_best<F>(
     record: &noodles_vcf::Record,
     alt_index: usize,
     alt_count: usize,
     kept_indices: &[usize],
-    dest: &mut [Option<DecodedAltDosage>],
-) -> Result<(), Box<dyn Error + Send + Sync>> {
+    mut visit: F,
+) -> Result<(), Box<dyn Error + Send + Sync>>
+where
+    F: FnMut(usize, Option<DecodedAltDosage>) -> Result<(), Box<dyn Error + Send + Sync>>,
+{
     let samples = record.samples();
     if samples.is_empty() {
+        for out_idx in 0..kept_indices.len() {
+            visit(out_idx, None)?;
+        }
         return Ok(());
     }
 
@@ -462,6 +493,30 @@ fn decode_vcf_record_best(
         None if ds_index.is_some() || gp_index.is_some() => None,
         None => return Err("VCF record is missing GT, DS, or GP FORMAT fields.".into()),
     };
+    let last_format_index = [ds_index, gp_index, gt_idx]
+        .into_iter()
+        .flatten()
+        .max()
+        .expect("at least one dosage FORMAT field was validated");
+
+    let scores_every_sample = kept_indices.len() == samples.len()
+        && kept_indices.first() == Some(&0)
+        && kept_indices.last().copied() == Some(samples.len() - 1);
+    if scores_every_sample {
+        for (out_idx, sample) in samples.iter().enumerate() {
+            let decoded = decode_vcf_sample(
+                sample.as_ref(),
+                ds_index,
+                gp_index,
+                gt_idx,
+                last_format_index,
+                alt_index,
+                alt_count,
+            )?;
+            visit(out_idx, decoded)?;
+        }
+        return Ok(());
+    }
 
     let mut kept_cursor = 0usize;
     for (sample_idx, sample) in samples.iter().enumerate() {
@@ -475,44 +530,71 @@ fn decode_vcf_record_best(
             continue;
         }
 
-        let mut ds_field = None;
-        let mut gp_field = None;
-        let mut gt_field = None;
-        for (idx, field) in sample.as_ref().split(':').enumerate() {
-            if ds_index == Some(idx) {
-                ds_field = Some(field);
-            }
-            if gp_index == Some(idx) {
-                gp_field = Some(field);
-            }
-            if gt_idx == Some(idx) {
-                gt_field = Some(field);
-            }
-        }
+        let decoded = decode_vcf_sample(
+            sample.as_ref(),
+            ds_index,
+            gp_index,
+            gt_idx,
+            last_format_index,
+            alt_index,
+            alt_count,
+        )?;
+        visit(kept_cursor, decoded)?;
+        kept_cursor += 1;
+    }
 
-        if let Some(value) = ds_field
-            && let Some(parsed) = parse_vcf_dosage_field(value, alt_index, alt_count)?
-        {
-            dest[kept_cursor] = Some(DecodedAltDosage::dosage_only(parsed));
-            kept_cursor += 1;
-            continue;
-        }
-        if let Some(value) = gp_field
-            && let Some(parsed) = parse_vcf_gp(value, alt_index, alt_count)?
-        {
-            dest[kept_cursor] = Some(DecodedAltDosage::dosage_only(parsed));
-            kept_cursor += 1;
-            continue;
-        }
-        if let Some(value) = gt_field
-            && let Some(parsed) = parse_vcf_genotype(value, alt_index)?
-        {
-            dest[kept_cursor] = Some(parsed);
-        }
+    while kept_cursor < kept_indices.len() {
+        visit(kept_cursor, None)?;
         kept_cursor += 1;
     }
 
     Ok(())
+}
+
+#[inline]
+fn decode_vcf_sample(
+    sample: &str,
+    ds_index: Option<usize>,
+    gp_index: Option<usize>,
+    gt_index: Option<usize>,
+    last_format_index: usize,
+    alt_index: usize,
+    alt_count: usize,
+) -> Result<Option<DecodedAltDosage>, Box<dyn Error + Send + Sync>> {
+    let mut ds_field = None;
+    let mut gp_field = None;
+    let mut gt_field = None;
+    for (idx, field) in sample.split(':').enumerate() {
+        if ds_index == Some(idx) {
+            ds_field = Some(field);
+        }
+        if gp_index == Some(idx) {
+            gp_field = Some(field);
+        }
+        if gt_index == Some(idx) {
+            gt_field = Some(field);
+        }
+        if idx == last_format_index {
+            break;
+        }
+    }
+
+    if let Some(value) = ds_field
+        && let Some(parsed) = parse_vcf_dosage_field(value, alt_index, alt_count)?
+    {
+        return Ok(Some(DecodedAltDosage::dosage_only(parsed)));
+    }
+    if let Some(value) = gp_field
+        && let Some(parsed) = parse_vcf_gp(value, alt_index, alt_count)?
+    {
+        return Ok(Some(DecodedAltDosage::dosage_only(parsed)));
+    }
+    if let Some(value) = gt_field
+        && let Some(parsed) = parse_vcf_genotype(value, alt_index)?
+    {
+        return Ok(Some(parsed));
+    }
+    Ok(None)
 }
 
 fn parse_vcf_dosage_field(

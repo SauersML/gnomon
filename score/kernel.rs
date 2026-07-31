@@ -25,18 +25,19 @@ pub const MAX_KERNEL_ACCUMULATOR_LANES: usize = 8;
 /// doubling and the accumulate into a single `vfmadd231ps` with a folded memory
 /// operand, halving the FP-add port pressure of the hot dosage-2 loop.
 ///
-/// The `cfg` gate is mandatory: `mul_add` without the `fma` target feature
-/// lowers to a per-lane `fmaf` libm call (catastrophic in the hot loop), and
-/// the baseline PyPI wheel is built without `target-cpu`/`+fma`. The fallback
-/// path is exactly the original `acc + (w + w)`.
+/// The `cfg` gate is mandatory on x86: `mul_add` without the `fma` target
+/// feature lowers to a per-lane `fmaf` libm call (catastrophic in the hot loop).
+/// Published x86 wheels and performance binaries target x86-64-v3 and take this
+/// path; portable baseline builds use the two-add implementation. AArch64 has
+/// fused scalar/vector FP in the baseline ISA and always takes the fused path.
 #[inline(always)]
 fn accumulate_dosage_two(acc: SimdVec, w: SimdVec) -> SimdVec {
-    #[cfg(target_feature = "fma")]
+    #[cfg(any(target_feature = "fma", target_arch = "aarch64"))]
     {
         use std::simd::StdFloat;
         w.mul_add(SimdVec::splat(2.0), acc)
     }
-    #[cfg(not(target_feature = "fma"))]
+    #[cfg(not(any(target_feature = "fma", target_arch = "aarch64")))]
     {
         acc + (w + w)
     }

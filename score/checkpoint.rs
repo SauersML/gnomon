@@ -125,8 +125,16 @@ fn update_pipeline_identity(hasher: &mut Sha256, pipeline_kind: &PipelineKind) {
         PipelineKind::SingleFile(bed_path) => {
             hasher.update([0]);
             update_path_identity(hasher, bed_path, true);
-            update_sibling_identity(hasher, bed_path, "bim");
-            update_sibling_identity(hasher, bed_path, "fam");
+            // A PLINK 2 fileset's metadata lives in .pvar/.psam, so hashing
+            // .bim/.fam would key the checkpoint on two files that do not
+            // exist -- making every pgen run look identical to every other.
+            let (meta_a, meta_b) = if crate::score::io::is_pgen_path(bed_path) {
+                ("pvar", "psam")
+            } else {
+                ("bim", "fam")
+            };
+            update_sibling_identity(hasher, bed_path, meta_a);
+            update_sibling_identity(hasher, bed_path, meta_b);
         }
         PipelineKind::MultiFile(boundaries) => {
             hasher.update([1]);
@@ -146,7 +154,16 @@ fn update_fileset_boundary_identity(hasher: &mut Sha256, boundary: &FilesetBound
 }
 
 fn update_sibling_identity(hasher: &mut Sha256, bed_path: &Path, extension: &str) {
-    update_path_identity(hasher, &bed_path.with_extension(extension), false);
+    // Not `with_extension`: fileset prefixes may contain dots of their own
+    // (`acaf_threshold.chr22`), which that would truncate.
+    let sibling = match bed_path.to_str() {
+        Some(s) => PathBuf::from(format!(
+            "{}.{extension}",
+            crate::score::prepare::strip_fileset_extension(s)
+        )),
+        None => bed_path.with_extension(extension),
+    };
+    update_path_identity(hasher, &sibling, false);
 }
 
 fn update_path_identity(hasher: &mut Sha256, path: &Path, include_bed_header: bool) {

@@ -238,6 +238,9 @@ impl std::fmt::Debug for BedSource {
 /// memory-mapped, while remote locations stream data directly from their
 /// backing storage.
 pub fn open_bed_source(path: &Path) -> Result<BedSource, PipelineError> {
+    if is_pgen_path(path) {
+        return open_pgen_as_bed_source(path);
+    }
     if is_gcs_path(path) {
         let uri = path
             .to_str()
@@ -267,6 +270,64 @@ pub fn open_bed_source(path: &Path) -> Result<BedSource, PipelineError> {
         let byte_source = Arc::new(MmapByteRangeSource::new(Arc::clone(&mmap)));
         Ok(BedSource::new(byte_source, Some(mmap)))
     }
+}
+
+/// True for a PLINK 2 genotype table (`.pgen`), local or remote.
+pub fn is_pgen_path(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| ext == "pgen")
+}
+
+/// Sibling `.pvar` / `.psam` for a `.pgen`, i.e. the rest of its fileset.
+///
+/// `Path::with_extension` is not used because a `gs://` URI is carried in a
+/// `Path` here and its bucket/object segments can contain dots.
+pub fn pgen_sidecar_paths(pgen: &Path) -> (PathBuf, PathBuf) {
+    let raw = pgen.to_string_lossy();
+    let stem = raw.strip_suffix(".pgen").unwrap_or(&raw);
+    (
+        PathBuf::from(format!("{stem}.pvar")),
+        PathBuf::from(format!("{stem}.psam")),
+    )
+}
+
+/// Opens a raw byte-range source for any supported location.
+fn open_byte_range_source(path: &Path) -> Result<Arc<dyn ByteRangeSource>, PipelineError> {
+    if is_gcs_path(path) {
+        let uri = path
+            .to_str()
+            .ok_or_else(|| PipelineError::Io("Invalid UTF-8 in path".to_string()))?;
+        let (bucket, object) = parse_gcs_uri(uri)?;
+        Ok(Arc::new(RemoteByteRangeSource::new(&bucket, &object)?))
+    } else if is_http_path(path) {
+        let url = path
+            .to_str()
+            .ok_or_else(|| PipelineError::Io("Invalid UTF-8 in path".to_string()))?;
+        Ok(Arc::new(HttpByteRangeSource::new(url)?))
+    } else {
+        let file = File::open(path)
+            .map_err(|e| PipelineError::Io(format!("Opening {}: {e}", path.display())))?;
+        let mmap = unsafe { Mmap::map(&file).map_err(|e| PipelineError::Io(e.to_string()))? };
+        Ok(Arc::new(MmapByteRangeSource::new(Arc::new(mmap))))
+    }
+}
+
+/// Presents a PLINK 2 fileset as a `BedSource`.
+///
+/// The `.pgen` is never localized: only the byte ranges of the variant records
+/// actually requested are fetched, which is the entire reason for reading PGEN
+/// rather than the equivalent `.bed` (a PGEN variant record is roughly an order
+/// of magnitude smaller than the fixed-stride `.bed` record it decodes to).
+fn open_pgen_as_bed_source(pgen_path: &Path) -> Result<BedSource, PipelineError> {
+    let (pvar_path, psam_path) = pgen_sidecar_paths(pgen_path);
+    let pgen = open_byte_range_source(pgen_path)?;
+    let mut psam = open_text_source(&psam_path)?;
+    let pvar_for_factory = pvar_path.clone();
+    let pvar: crate::adapt_plink2::PvarFactory =
+        Arc::new(move || open_text_source(&pvar_for_factory));
+
+    let virtual_plink =
+        crate::adapt_plink2::open_virtual_plink19_from_sources(pgen, pvar, &mut *psam)?;
+    Ok(BedSource::new(virtual_plink.bed_source(), None))
 }
 
 fn validate_bed_source_header(path: &Path, source: &BedSource) -> Result<(), PipelineError> {
@@ -606,6 +667,20 @@ pub fn open_text_source(path: &Path) -> Result<Box<dyn TextSource>, PipelineErro
         let file = File::open(path)
             .map_err(|e| PipelineError::Io(format!("Opening {}: {e}", path.display())))?;
         Ok(Box::new(LocalTextSource::new(path, file)?))
+    }
+}
+
+/// Opens a variant- or sample-metadata stream that may be backed by either
+/// PLINK 1.9 (`.bim` / `.fam`) or PLINK 2 (`.pvar` / `.psam`) files.
+///
+/// PLINK 2 inputs are transformed on the fly into their PLINK 1.9 equivalents,
+/// so callers consume one row format regardless of which fileset flavour the
+/// user supplied.
+pub fn open_plink_text_source(path: &Path) -> Result<Box<dyn TextSource>, PipelineError> {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("pvar") => crate::adapt_plink2::open_virtual_bim(path),
+        Some("psam") => crate::adapt_plink2::open_virtual_fam(path),
+        _ => open_text_source(path),
     }
 }
 

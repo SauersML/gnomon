@@ -87,14 +87,11 @@ pub fn run_person_major_path(
                     return;
                 }
 
-                // This temporary Vec holds the original FAM indices for only the people
-                // in the current block. This is a small, fast allocation.
-                let person_indices_in_block: Vec<OriginalPersonIndex> = prep_result
-                    .output_idx_to_fam_idx[person_output_start_idx..person_output_end_idx]
-                    .to_vec();
+                let person_indices_in_block = &prep_result.output_idx_to_fam_idx
+                    [person_output_start_idx..person_output_end_idx];
 
                 process_block(
-                    &person_indices_in_block,
+                    person_indices_in_block,
                     prep_result,
                     variant_major_data,
                     weights_for_batch,
@@ -156,8 +153,12 @@ fn process_block<'a>(
     let tile_size = person_indices_in_block.len() * variants_in_chunk;
 
     let mut tile = tile_pool.pop().unwrap_or_default();
-    tile.clear();
-    tile.resize(tile_size, EffectAlleleDosage::default());
+    // Every element is overwritten by `pivot_tile`. Preserve an already-correct
+    // length so repeated batches do not pointlessly clear and rewrite the whole
+    // person-major tile before writing it again.
+    if tile.len() != tile_size {
+        tile.resize(tile_size, EffectAlleleDosage::default());
+    }
 
     // This pivot function has a single, clear responsibility.
     pivot_tile(
@@ -572,20 +573,22 @@ fn transpose_8x8_u8(matrix: [U8xN; 8]) -> [U8xN; 8] {
 //                     ADAPTIVE DISPATCHER & variant-MAJOR PATH
 // ========================================================================================
 
-/// Calculates a fast proxy for non-reference allele frequency using `popcnt`.
+/// Classifies non-reference density for the path dispatcher using `popcnt`.
 ///
 /// This function is a key performance enabler. It leverages the `popcnt` (population
-/// count) CPU instruction, which is very fast. By viewing the byte slice as
-/// `u64` chunks, it minimizes loop iterations and lets the hardware do the heavy
-// lifting of counting set bits.
+/// count) CPU instruction, which is very fast. The decision tree's highest
+/// density threshold is 0.0894, so common variants stop scanning as soon as they
+/// cross it; only variants that may take the sparse path need an exact result.
 #[inline]
-pub fn assess_variant_density(variant_data: &[u8], total_people: usize) -> f32 {
+pub fn assess_variant_density_for_dispatch(variant_data: &[u8], total_people: usize) -> f32 {
     if total_people == 0 {
         return 0.0;
     }
 
     const CHUNK_SIZE: usize = std::mem::size_of::<u64>();
-    let mut set_bits: u32 = 0;
+    const HIGHEST_DISPATCH_THRESHOLD: f32 = 0.0894;
+    let dense_cutoff = (total_people as f32 * HIGHEST_DISPATCH_THRESHOLD) as u64;
+    let mut set_bits = 0u64;
 
     // Process full 8-byte chunks using `chunks_exact` for safety and performance.
     let chunks = variant_data.chunks_exact(CHUNK_SIZE);
@@ -593,12 +596,15 @@ pub fn assess_variant_density(variant_data: &[u8], total_people: usize) -> f32 {
     for chunk in chunks {
         // This conversion is safe because chunks_exact guarantees the slice length is CHUNK_SIZE.
         let val = u64::from_ne_bytes(chunk.try_into().unwrap());
-        set_bits += val.count_ones();
+        set_bits += u64::from(val.count_ones());
+        if set_bits > dense_cutoff {
+            return 1.0;
+        }
     }
 
     // Process the remainder byte by byte.
     for &byte in remainder {
-        set_bits += byte.count_ones();
+        set_bits += u64::from(byte.count_ones());
     }
 
     // Normalize by the number of people to get a comparable frequency.
@@ -622,6 +628,21 @@ pub fn run_variant_major_path(
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let num_scores = prep_result.score_names.len();
     let variant_view = prep_result.variant_csr_view(reconciled_variant_index);
+
+    if matches!(
+        &prep_result.person_subset,
+        crate::score::types::PersonSubset::All
+    ) {
+        run_variant_major_all_people(
+            variant_data,
+            prep_result.num_people_to_score,
+            num_scores,
+            variant_view,
+            partial_scores_out,
+            partial_missing_counts_out,
+        );
+        return Ok(());
+    }
 
     // --- Main Compute Loop ---
     // This single loop iterates only over the individuals we need to score.
@@ -687,6 +708,139 @@ pub fn run_variant_major_path(
     }
 
     Ok(())
+}
+
+/// Packed-byte fast path for the overwhelmingly common no-`--keep` case.
+///
+/// A zero PLINK byte represents four homozygous-reference calls. Skipping it as
+/// one unit is particularly valuable for WGS rare variants, while decoding the
+/// nonzero bytes four calls at a time also removes the output-to-FAM lookup,
+/// division, and source reload from the per-person loop.
+#[inline]
+fn run_variant_major_all_people(
+    variant_data: &[u8],
+    num_people: usize,
+    num_scores: usize,
+    variant_view: crate::score::types::VariantCsrView<'_>,
+    partial_scores_out: &mut [f64],
+    partial_missing_counts_out: &mut [u32],
+) {
+    let full_bytes = num_people / 4;
+    let packed_full_people = &variant_data[..full_bytes];
+    let chunks = packed_full_people.chunks_exact(std::mem::size_of::<u64>());
+    let trailing_bytes = chunks.remainder();
+    const DENSITY_SAMPLE_WORDS: usize = 64;
+    let sampled_words = chunks.clone().take(DENSITY_SAMPLE_WORDS);
+    let sampled_word_count = sampled_words.len();
+    let sampled_zero_words = sampled_words
+        .filter(|chunk| u64::from_ne_bytes((*chunk).try_into().unwrap()) == 0)
+        .count();
+    let use_zero_word_skip = sampled_zero_words * 4 >= sampled_word_count;
+
+    if use_zero_word_skip {
+        for (chunk_idx, chunk) in chunks.enumerate() {
+            let packed_word = u64::from_ne_bytes(chunk.try_into().unwrap());
+            if packed_word == 0 {
+                continue;
+            }
+            let byte_base = chunk_idx * std::mem::size_of::<u64>();
+            for (byte_offset, &packed_byte) in chunk.iter().enumerate() {
+                if packed_byte != 0 {
+                    apply_packed_byte(
+                        packed_byte,
+                        (byte_base + byte_offset) * 4,
+                        4,
+                        num_scores,
+                        variant_view,
+                        partial_scores_out,
+                        partial_missing_counts_out,
+                    );
+                }
+            }
+        }
+    } else {
+        for (byte_idx, &packed_byte) in packed_full_people[..full_bytes - trailing_bytes.len()]
+            .iter()
+            .enumerate()
+        {
+            if packed_byte != 0 {
+                apply_packed_byte(
+                    packed_byte,
+                    byte_idx * 4,
+                    4,
+                    num_scores,
+                    variant_view,
+                    partial_scores_out,
+                    partial_missing_counts_out,
+                );
+            }
+        }
+    }
+    let trailing_byte_base = full_bytes - trailing_bytes.len();
+    for (byte_offset, &packed_byte) in trailing_bytes.iter().enumerate() {
+        if packed_byte != 0 {
+            apply_packed_byte(
+                packed_byte,
+                (trailing_byte_base + byte_offset) * 4,
+                4,
+                num_scores,
+                variant_view,
+                partial_scores_out,
+                partial_missing_counts_out,
+            );
+        }
+    }
+
+    let tail_people = num_people % 4;
+    if tail_people != 0 {
+        let packed_byte = variant_data[full_bytes];
+        if packed_byte != 0 {
+            apply_packed_byte(
+                packed_byte,
+                full_bytes * 4,
+                tail_people,
+                num_scores,
+                variant_view,
+                partial_scores_out,
+                partial_missing_counts_out,
+            );
+        }
+    }
+}
+
+#[inline(always)]
+fn apply_packed_byte(
+    packed_byte: u8,
+    person_base: usize,
+    people_in_byte: usize,
+    num_scores: usize,
+    variant_view: crate::score::types::VariantCsrView<'_>,
+    partial_scores_out: &mut [f64],
+    partial_missing_counts_out: &mut [u32],
+) {
+    let mut remaining = packed_byte;
+    for lane in 0..people_in_byte {
+        let genotype = remaining & 0b11;
+        remaining >>= 2;
+        if genotype == 0 {
+            continue;
+        }
+
+        let scores_offset = (person_base + lane) * num_scores;
+        if genotype == 1 {
+            for contribution in variant_view.iter() {
+                let cell = scores_offset + contribution.score_column.0;
+                partial_missing_counts_out[cell] += 1;
+                partial_scores_out[cell] -= contribution.missing_correction as f64;
+            }
+        } else {
+            let dosage = if genotype == 2 { 1.0 } else { 2.0 };
+            for contribution in variant_view.iter() {
+                let cell = scores_offset + contribution.score_column.0;
+                partial_scores_out[cell] += contribution.weight as f64 * dosage;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -879,6 +1033,36 @@ mod tests {
         assert!((scores[2] - 3.0).abs() < 1e-9);
         assert!((scores[3] - (-2.0)).abs() < 1e-9);
         assert_eq!(missing, vec![0, 0, 0, 1]);
+    }
+
+    #[test]
+    fn run_variant_major_all_people_handles_word_skips_and_tail() {
+        let num_people = 101;
+        let prep = make_single_variant_prep_result(1.5, 2.0, num_people);
+        let mut variant_data = vec![0u8; num_people.div_ceil(4)];
+        let genotypes = [(3usize, 2u8), (32, 3), (99, 1), (100, 2)];
+        for &(person, genotype) in &genotypes {
+            variant_data[person / 4] |= genotype << ((person % 4) * 2);
+        }
+        let mut scores = vec![0.0f64; num_people];
+        let mut missing = vec![0u32; num_people];
+
+        run_variant_major_path(
+            &variant_data,
+            &prep,
+            &mut scores,
+            &mut missing,
+            ReconciledVariantIndex(0),
+        )
+        .expect("variant-major path should succeed");
+
+        assert_eq!(scores[3], 1.5);
+        assert_eq!(scores[32], 3.0);
+        assert_eq!(scores[99], -2.0);
+        assert_eq!(scores[100], 1.5);
+        assert_eq!(missing[99], 1);
+        assert_eq!(missing.iter().sum::<u32>(), 1);
+        assert_eq!(scores.iter().filter(|&&score| score != 0.0).count(), 4);
     }
 
     #[test]

@@ -132,14 +132,15 @@ impl<T: Send> Iterator for ChannelBatcher<T> {
                 let mut batch = Vec::with_capacity(self.batch_size);
                 batch.push(first_item);
 
-                // Greedily pull more items from the channel *without blocking* until
-                // the batch is full or the channel is momentarily empty.
+                // Fill the batch before yielding it. Dense execution amortizes its
+                // pivot and matrix setup over the entire tile; ending a batch merely
+                // because the producer is briefly slower can turn remote input into
+                // a stream of one-variant "batches" and destroy throughput.
                 while batch.len() < self.batch_size {
-                    match self.rx.try_recv() {
+                    match self.rx.recv() {
                         Ok(Ok(item)) => batch.push(item),
-                        // An error was sent down the channel. Stop and propagate it.
                         Ok(Err(e)) => return Some(Err(e)),
-                        // The channel is empty or disconnected. The current batch is finished.
+                        // The producer disconnected, so yield the final partial batch.
                         Err(_) => break,
                     }
                 }
@@ -721,7 +722,7 @@ fn run_single_file_pipeline(
                         }
                         RunStrategy::UseComplexTree => {
                             let path_decider = |variant_data: &[u8]| {
-                                let current_freq = batch::assess_variant_density(
+                                let current_freq = batch::assess_variant_density_for_dispatch(
                                     variant_data,
                                     run_ctx.n_cohort as usize,
                                 );
@@ -1119,7 +1120,7 @@ fn run_multi_file_pipeline(
                         }
                         RunStrategy::UseComplexTree => {
                             let path_decider = |variant_data: &[u8]| {
-                                let current_freq = batch::assess_variant_density(
+                                let current_freq = batch::assess_variant_density_for_dispatch(
                                     variant_data,
                                     run_ctx.n_cohort as usize,
                                 );
@@ -1642,6 +1643,22 @@ mod tests {
         assert_eq!(dir, Path::new("/tmp/project"));
         assert_eq!(stem, "cohort1");
     }
+
+    #[test]
+    fn channel_batcher_waits_for_a_full_dense_batch() {
+        let (tx, rx) = bounded(1);
+        tx.send(Ok(1u8)).unwrap();
+        let producer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            tx.send(Ok(2u8)).unwrap();
+            tx.send(Ok(3u8)).unwrap();
+        });
+
+        let mut batches = ChannelBatcher::new(rx, 3);
+        assert_eq!(batches.next().unwrap().unwrap(), vec![1, 2, 3]);
+        assert!(batches.next().is_none());
+        producer.join().unwrap();
+    }
 }
 
 /// A RAII guard that ensures a byte buffer is automatically returned to the shared
@@ -1957,6 +1974,9 @@ fn process_dense_stream(
                         Vec::with_capacity(
                             DENSE_BATCH_SIZE * (prep_result.bytes_per_variant as usize),
                         ),
+                        Vec::<f32>::new(),
+                        Vec::<f32>::new(),
+                        Vec::<ReconciledVariantIndex>::with_capacity(DENSE_BATCH_SIZE),
                     )
                 },
                 |mut acc, batch_result| {
@@ -1966,38 +1986,38 @@ fn process_dense_stream(
                         return Ok(acc);
                     }
 
-                    let reconciled_indices: Vec<ReconciledVariantIndex> =
-                        batch.iter().map(|wi| wi.reconciled_variant_index).collect();
+                    acc.5.clear();
+                    acc.5
+                        .extend(batch.iter().map(|wi| wi.reconciled_variant_index));
 
                     let concatenated_data = &mut acc.2;
                     concatenated_data.clear();
 
                     {
-                        // BufferGuard ensures all variant data buffers are returned to the pool,
-                        // even if an error occurs during computation.
-                        let guards: Vec<_> = batch
-                            .into_iter()
-                            .map(|wi| {
-                                concatenated_data.extend_from_slice(&wi.data);
-                                BufferGuard {
-                                    buffer: Some(wi.data),
-                                    pool: &buffer_pool,
-                                }
-                            })
-                            .collect();
+                        // The dense kernel reads the concatenated copy, so each source
+                        // buffer can return to the producer immediately after copying.
+                        // This removes a per-batch allocation and lets I/O overlap the
+                        // entire compute phase instead of waiting on 256 held buffers.
+                        for wi in batch {
+                            concatenated_data.extend_from_slice(&wi.data);
+                            drop(BufferGuard {
+                                buffer: Some(wi.data),
+                                pool: &buffer_pool,
+                            });
+                        }
 
                         let stride = prep_result.stride();
-                        let mut weights_for_batch = vec![0.0f32; reconciled_indices.len() * stride];
-                        let mut missing_corrections_for_batch =
-                            vec![0.0f32; reconciled_indices.len() * stride];
+                        let matrix_len = acc.5.len() * stride;
+                        acc.3.resize(matrix_len, 0.0f32);
+                        acc.3.fill(0.0);
+                        acc.4.resize(matrix_len, 0.0f32);
+                        acc.4.fill(0.0);
                         let mut canvas = DenseMiniBatchCanvas {
-                            weights: &mut weights_for_batch,
-                            missing_corrections: &mut missing_corrections_for_batch,
+                            weights: &mut acc.3,
+                            missing_corrections: &mut acc.4,
                             stride,
                         };
-                        for (batch_row_idx, &reconciled_idx) in
-                            reconciled_indices.iter().enumerate()
-                        {
+                        for (batch_row_idx, &reconciled_idx) in acc.5.iter().enumerate() {
                             let variant_view = prep_result.variant_csr_view(reconciled_idx);
                             for contribution in variant_view.iter() {
                                 let col = contribution.score_column.0;
@@ -2012,23 +2032,30 @@ fn process_dense_stream(
 
                         batch::run_person_major_path(
                             concatenated_data,
-                            &weights_for_batch,
-                            &missing_corrections_for_batch,
-                            &reconciled_indices,
+                            &acc.3,
+                            &acc.4,
+                            &acc.5,
                             prep_result,
                             &mut acc.0,
                             &mut acc.1,
                             &context.tile_pool,
                         )?;
-
-                        assert!(!guards.is_empty());
                     }
 
                     Ok::<_, PipelineError>(acc)
                 },
             )
             .try_reduce(
-                || (vec![0.0; result_size], vec![0; result_size], Vec::new()),
+                || {
+                    (
+                        vec![0.0; result_size],
+                        vec![0; result_size],
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                },
                 |mut a, b| {
                     a.0.par_iter_mut()
                         .zip(b.0)
@@ -2044,7 +2071,7 @@ fn process_dense_stream(
     // The `?` operator unwrapped the `Result` from the reduction. If the stream was
     // empty, `try_reduce` (on a `TryFold` iterator) returns the identity value, so
     // `final_result` correctly contains the initial empty vectors. We just need to destructure the tuple.
-    let (scores, counts, _) = final_result;
+    let (scores, counts, _, _, _, _) = final_result;
     Ok((scores, counts))
 }
 
@@ -2058,6 +2085,8 @@ fn process_dense_stream_bounded(
     let batch_size = bounded_dense_batch_size(context);
     let mut batch_iterator = ChannelBatcher::new(rx, batch_size);
     let mut concatenated_data = Vec::new();
+    let mut weights_for_batch = Vec::new();
+    let mut missing_corrections_for_batch = Vec::new();
 
     for batch_result in &mut batch_iterator {
         let batch = batch_result?;
@@ -2086,16 +2115,13 @@ fn process_dense_stream_bounded(
         }
 
         {
-            let guards: Vec<_> = batch
-                .into_iter()
-                .map(|wi| {
-                    concatenated_data.extend_from_slice(&wi.data);
-                    BufferGuard {
-                        buffer: Some(wi.data),
-                        pool: &buffer_pool,
-                    }
-                })
-                .collect();
+            for wi in batch {
+                concatenated_data.extend_from_slice(&wi.data);
+                drop(BufferGuard {
+                    buffer: Some(wi.data),
+                    pool: &buffer_pool,
+                });
+            }
 
             let stride = prep_result.stride();
             let matrix_len = reconciled_indices
@@ -2106,24 +2132,28 @@ fn process_dense_stream_bounded(
                         "Dense bounded weight matrix length overflow.".to_string(),
                     )
                 })?;
-            let mut weights_for_batch = Vec::new();
-            weights_for_batch
-                .try_reserve_exact(matrix_len)
-                .map_err(|e| {
-                    PipelineError::Compute(format!(
-                        "Failed to reserve dense bounded weight matrix ({matrix_len} cells): {e}"
-                    ))
-                })?;
+            if weights_for_batch.capacity() < matrix_len {
+                weights_for_batch
+                    .try_reserve_exact(matrix_len - weights_for_batch.capacity())
+                    .map_err(|e| {
+                        PipelineError::Compute(format!(
+                            "Failed to reserve dense bounded weight matrix ({matrix_len} cells): {e}"
+                        ))
+                    })?;
+            }
             weights_for_batch.resize(matrix_len, 0.0f32);
-            let mut missing_corrections_for_batch = Vec::new();
-            missing_corrections_for_batch
-                .try_reserve_exact(matrix_len)
-                .map_err(|e| {
-                    PipelineError::Compute(format!(
-                        "Failed to reserve dense bounded missing-correction matrix ({matrix_len} cells): {e}"
-                    ))
-                })?;
+            weights_for_batch.fill(0.0);
+            if missing_corrections_for_batch.capacity() < matrix_len {
+                missing_corrections_for_batch
+                    .try_reserve_exact(matrix_len - missing_corrections_for_batch.capacity())
+                    .map_err(|e| {
+                        PipelineError::Compute(format!(
+                            "Failed to reserve dense bounded missing-correction matrix ({matrix_len} cells): {e}"
+                        ))
+                    })?;
+            }
             missing_corrections_for_batch.resize(matrix_len, 0.0f32);
+            missing_corrections_for_batch.fill(0.0);
             let mut canvas = DenseMiniBatchCanvas {
                 weights: &mut weights_for_batch,
                 missing_corrections: &mut missing_corrections_for_batch,
@@ -2158,8 +2188,6 @@ fn process_dense_stream_bounded(
                     &context.tile_pool,
                 )?;
             }
-
-            assert!(!guards.is_empty());
         }
     }
 
