@@ -1243,6 +1243,21 @@ fn resolve_gcs_filesets(uri: &str) -> Result<Vec<PathBuf>, Box<dyn Error + Send 
         Ok(control) => control,
         Err(e) => {
             let e_msg = e.to_string();
+            // Do NOT downgrade to anonymous credentials when a billing project is
+            // configured. Anonymous credentials carry no quota project, so they cannot
+            // satisfy a Requester Pays bucket under any circumstances -- the retry can
+            // only fail, and it fails LATER, during a list or a metadata fetch, where the
+            // error names the object and says nothing about credentials having been
+            // silently swapped. That turns a clear authentication failure into an
+            // apparent genotype problem. The fallback is still the right behaviour for a
+            // public bucket, which is exactly the case where no project is set.
+            if user_project.is_some() {
+                return Err(Box::<dyn Error + Send + Sync>::from(format!(
+                    "Unable to initialize Cloud Storage clients with ADC credentials, and \
+                     a billing project is set (GOOGLE_PROJECT), so retrying anonymously \
+                     cannot succeed against a Requester Pays bucket: {e_msg}"
+                )));
+            }
             let anonymous_creds = AnonymousCredentials::new().build();
             match make_control(Some(anonymous_creds)) {
                 Ok(control) => control,
