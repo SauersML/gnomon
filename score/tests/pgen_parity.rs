@@ -176,3 +176,92 @@ fn virtual_bim_matches_real_bim_rows() {
         "virtual bim has more rows than the real bim"
     );
 }
+
+/// A `.pgen` must be read as scattered small ranges, not swept end to end.
+///
+/// This is the whole reason for reading PGEN instead of the equivalent `.bed`:
+/// a variant record is roughly an order of magnitude smaller than the
+/// fixed-stride `.bed` record it decodes to, but that only pays off if a run
+/// which touches a third of the variants also transfers about a third of the
+/// file. Counting bytes at the byte-range layer keeps the guarantee honest
+/// regardless of transport (local, `gs://`, http).
+#[test]
+fn scoring_a_subset_reads_only_part_of_the_pgen() {
+    use gnomon::files::ByteRangeSource;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Wraps a byte source and tallies how much is actually requested.
+    struct CountingSource {
+        inner: Vec<u8>,
+        bytes_read: Arc<AtomicU64>,
+    }
+
+    impl ByteRangeSource for CountingSource {
+        fn len(&self) -> u64 {
+            self.inner.len() as u64
+        }
+
+        fn read_at(&self, offset: u64, dst: &mut [u8]) -> Result<(), gnomon::pipeline::PipelineError> {
+            let start = offset as usize;
+            let end = start + dst.len();
+            if end > self.inner.len() {
+                return Err(gnomon::pipeline::PipelineError::Io("read past end".into()));
+            }
+            dst.copy_from_slice(&self.inner[start..end]);
+            self.bytes_read.fetch_add(dst.len() as u64, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    let dir = fixture_dir();
+    let pgen_bytes = std::fs::read(dir.join("ld_p.pgen")).expect("reading pgen");
+    let pgen_len = pgen_bytes.len() as u64;
+    let bytes_read = Arc::new(AtomicU64::new(0));
+
+    let source: Arc<dyn ByteRangeSource> = Arc::new(CountingSource {
+        inner: pgen_bytes,
+        bytes_read: Arc::clone(&bytes_read),
+    });
+
+    let pvar_path = dir.join("ld_p.pvar");
+    let pvar: gnomon::adapt_plink2::PvarFactory =
+        Arc::new(move || gnomon::files::open_text_source(&pvar_path));
+    let mut psam = gnomon::files::open_text_source(&dir.join("ld_p.psam")).expect("psam");
+
+    let vp = gnomon::adapt_plink2::open_virtual_plink19_from_sources(source, pvar, &mut *psam)
+        .expect("opening pgen from sources");
+
+    // Opening parses the header; measure only what the variant reads cost.
+    let after_open = bytes_read.load(Ordering::Relaxed);
+
+    let bed = vp.bed_source();
+    let bb = block_bytes();
+    let mut got = vec![0u8; bb];
+    let mut touched = 0u64;
+    for v in (0..N_VARIANTS).step_by(3) {
+        let off = 3 + v * bb;
+        bed.read_at(off as u64, &mut got).expect("virtual read");
+        touched += 1;
+    }
+
+    let variant_bytes = bytes_read.load(Ordering::Relaxed) - after_open;
+    let fraction_of_file = variant_bytes as f64 / pgen_len as f64;
+    let fraction_of_variants = touched as f64 / N_VARIANTS as f64;
+
+    // Reading a third of the variants must not mean reading the whole file.
+    // The bound is deliberately loose: LD-compressed records also pull in their
+    // anchor, so the bytes read legitimately exceed the variant fraction.
+    assert!(
+        fraction_of_file < 0.90,
+        "reading {:.0}% of variants transferred {:.0}% of the .pgen \
+         ({variant_bytes} of {pgen_len} bytes) -- ranges are not being honoured",
+        fraction_of_variants * 100.0,
+        fraction_of_file * 100.0,
+    );
+    eprintln!(
+        "read {:.1}% of variants -> {:.1}% of the .pgen ({variant_bytes}/{pgen_len} bytes)",
+        fraction_of_variants * 100.0,
+        fraction_of_file * 100.0
+    );
+}
