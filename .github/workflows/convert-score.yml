@@ -33,7 +33,6 @@ jobs:
         uses: dtolnay/rust-toolchain@nightly
 
       - name: Build local gnomon
-        env:
         run: cargo +nightly build --release
 
       - name: Install convert_genome
