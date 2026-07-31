@@ -10,7 +10,6 @@
 //! See `data/testdata/README.md` for how to regenerate it.
 
 use gnomon::adapt_plink2::open_virtual_plink19_from_paths;
-use gnomon::files::{ByteRangeSource, TextSource};
 use std::path::{Path, PathBuf};
 
 fn fixture_dir() -> PathBuf {

@@ -34,7 +34,6 @@ jobs:
 
       - name: Build local gnomon
         env:
-          GNOMON_SKIP_LINT_CHECKS: 1
         run: cargo +nightly build --release
 
       - name: Install convert_genome

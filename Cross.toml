@@ -1,5 +1,4 @@
 [build.env]
 passthrough = [
-    "GNOMON_SKIP_LINT_CHECKS",
     "RUSTFLAGS",
 ]

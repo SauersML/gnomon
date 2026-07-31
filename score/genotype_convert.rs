@@ -10,6 +10,9 @@
 
 use convert_genome::cli::Sex;
 use convert_genome::input::InputFormat as ConvertInputFormat;
+use convert_genome::conversion::{
+    DEFAULT_MAX_PARSE_ERROR_RATIO, DEFAULT_MIN_BUILD_CONFIDENCE, DEFAULT_MIN_EMITTED_VARIANTS,
+};
 use convert_genome::{ConversionConfig, OutputFormat, convert_dtc_file};
 
 // Re-export the underlying Sex enum so callers (e.g. `score/main.rs`) can
@@ -105,8 +108,9 @@ fn to_convert_sex(inferred: InferredSex) -> Sex {
 pub fn detect_input_format(path: &Path) -> Option<InputFormat> {
     let path_str = path.to_string_lossy().to_lowercase();
 
-    // Check for PLINK format (by extension or existence of .bed/.bim/.fam)
-    if path_str.ends_with(".bed") {
+    // Check for PLINK format (by extension or existence of the fileset).
+    // `.pgen` is PLINK 2's genotype table and is read through the same path.
+    if path_str.ends_with(".bed") || path_str.ends_with(".pgen") {
         return Some(InputFormat::Plink);
     }
 
@@ -115,15 +119,17 @@ pub fn detect_input_format(path: &Path) -> Option<InputFormat> {
         return Some(InputFormat::Dtc);
     }
 
-    // Check if it's a prefix pointing to PLINK files
+    // Check if it's a prefix pointing to a PLINK fileset, of either version.
     if !path_str.ends_with(".vcf") && !path_str.ends_with(".vcf.gz") && !path_str.ends_with(".bcf")
     {
-        // Check if PLINK files exist
-        let bed_path = path.with_extension("bed");
-        let bim_path = path.with_extension("bim");
-        let fam_path = path.with_extension("fam");
-
-        if bed_path.exists() && bim_path.exists() && fam_path.exists() {
+        // Not `with_extension`: a prefix may carry dots of its own
+        // (`acaf_threshold.chr22`), which that would truncate.
+        let stem = crate::score::prepare::strip_fileset_extension(&path.to_string_lossy())
+            .to_string();
+        let exists = |ext: &str| Path::new(&format!("{stem}.{ext}")).exists();
+        if (exists("bed") && exists("bim") && exists("fam"))
+            || (exists("pgen") && exists("pvar") && exists("psam"))
+        {
             return Some(InputFormat::Plink);
         }
     }
@@ -561,6 +567,14 @@ pub fn ensure_plink_format_with_options(
                 par_boundaries: None,
                 standardize: false,
                 panel: panel.map(|p| p.to_path_buf()),
+                // Clinical-safety gates: reject a conversion that silently
+                // produces almost nothing, cannot confidently identify the
+                // source build, or fails to parse much of its input. Upstream
+                // owns these thresholds, so track its defaults rather than
+                // pinning our own copies.
+                min_emitted_variants: DEFAULT_MIN_EMITTED_VARIANTS,
+                min_build_confidence: DEFAULT_MIN_BUILD_CONFIDENCE,
+                max_parse_error_ratio: DEFAULT_MAX_PARSE_ERROR_RATIO,
             };
 
             // Run conversion
@@ -633,6 +647,14 @@ pub fn ensure_plink_format_with_options(
                 par_boundaries: None,
                 standardize: false,
                 panel: panel.map(|p| p.to_path_buf()),
+                // Clinical-safety gates: reject a conversion that silently
+                // produces almost nothing, cannot confidently identify the
+                // source build, or fails to parse much of its input. Upstream
+                // owns these thresholds, so track its defaults rather than
+                // pinning our own copies.
+                min_emitted_variants: DEFAULT_MIN_EMITTED_VARIANTS,
+                min_build_confidence: DEFAULT_MIN_BUILD_CONFIDENCE,
+                max_parse_error_ratio: DEFAULT_MAX_PARSE_ERROR_RATIO,
             };
 
             // Run conversion

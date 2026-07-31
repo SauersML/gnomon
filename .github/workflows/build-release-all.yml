@@ -17,7 +17,6 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-  GNOMON_SKIP_LINT_CHECKS: "1"
 
 concurrency:
   # Scope the concurrency group by commit SHA, not branch ref, so a new
@@ -131,7 +130,6 @@ jobs:
         env:
           # Use specific CPU target instead of 'native' to fix ring#2527 while keeping max optimization
           RUSTFLAGS: "-C target-cpu=${{ matrix.cpu }}"
-          GNOMON_SKIP_LINT_CHECKS: "1"
           # Embed commit-addressable release tag in binary for version command
           GNOMON_RELEASE_TAG: "main-${{ github.sha }}"
           TARGET: ${{ matrix.target }}
