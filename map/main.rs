@@ -1307,20 +1307,78 @@ mod tests {
     const HGDP_FULL_DATASET: &str =
         "gs://gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/";
 
+    /// Finds an executable named `name` beneath a cargo profile directory.
+    ///
+    /// Cargo has placed built binaries directly in `<profile>/` and, on newer
+    /// toolchains, under `<profile>/build/<pkg>/<hash>/out/`. Checking both
+    /// keeps this working across layouts; the file must actually be executable,
+    /// since the profile root can also hold same-named metadata stubs.
+    fn find_executable(profile_dir: &Path, name: &str) -> Option<PathBuf> {
+        fn is_executable(path: &Path) -> bool {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::metadata(path)
+                    .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                    .unwrap_or(false)
+            }
+            #[cfg(not(unix))]
+            {
+                path.is_file()
+            }
+        }
+
+        let direct = profile_dir.join(name);
+        if is_executable(&direct) {
+            return Some(direct);
+        }
+
+        let build_dir = profile_dir.join("build");
+        let packages = std::fs::read_dir(&build_dir).ok()?;
+        let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+        for package in packages.flatten() {
+            let Ok(hashes) = std::fs::read_dir(package.path()) else {
+                continue;
+            };
+            for hash in hashes.flatten() {
+                let candidate = hash.path().join("out").join(name);
+                if !is_executable(&candidate) {
+                    continue;
+                }
+                let mtime = std::fs::metadata(&candidate)
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                if newest.as_ref().is_none_or(|(best, _)| mtime >= *best) {
+                    newest = Some((mtime, candidate));
+                }
+            }
+        }
+        newest.map(|(_, path)| path)
+    }
+
     fn gnomon_binary_path() -> Result<PathBuf, Box<dyn Error>> {
         use std::env;
 
         let current_exe = env::current_exe()?;
+
+        // Find `<target>/<profile>` by walking up until the parent directory is
+        // the cargo target directory. A fixed number of hops does not identify
+        // it: the test binary has lived at `<profile>/deps/<bin>` and, on newer
+        // toolchains, at `<profile>/build/<pkg>/<hash>/out/<bin>`. Counting hops
+        // picked the hash directory up as the profile name and produced
+        // `error: profile <hash> is not defined`.
         let binary_dir = current_exe
-            .parent()
-            .and_then(|deps| deps.parent())
+            .ancestors()
+            .find(|dir| {
+                dir.parent()
+                    .and_then(|parent| parent.file_name())
+                    .is_some_and(|name| name == "target")
+            })
             .ok_or_else(|| "unable to determine cargo target directory")?;
 
         let binary_name = format!("gnomon{}", env::consts::EXE_SUFFIX);
-        let binary_path = binary_dir.join(&binary_name);
-
-        if binary_path.exists() {
-            return Ok(binary_path);
+        if let Some(existing) = find_executable(binary_dir, &binary_name) {
+            return Ok(existing);
         }
 
         let target_dir = binary_dir
@@ -1366,10 +1424,14 @@ mod tests {
             .into());
         }
 
-        if binary_path.exists() {
-            Ok(binary_path)
+        if let Some(built) = find_executable(binary_dir, &binary_name) {
+            Ok(built)
         } else {
-            Err(format!("gnomon binary not found at {}", binary_path.display()).into())
+            Err(format!(
+                "gnomon binary '{binary_name}' not found under {}",
+                binary_dir.display()
+            )
+            .into())
         }
     }
 
