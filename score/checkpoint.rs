@@ -128,7 +128,7 @@ fn update_pipeline_identity(hasher: &mut Sha256, pipeline_kind: &PipelineKind) {
             // A PLINK 2 fileset's metadata lives in .pvar/.psam, so hashing
             // .bim/.fam would key the checkpoint on two files that do not
             // exist -- making every pgen run look identical to every other.
-            let (meta_a, meta_b) = if crate::score::io::is_pgen_path(bed_path) {
+            let (meta_a, meta_b) = if crate::files::is_pgen_path(bed_path) {
                 ("pvar", "psam")
             } else {
                 ("bim", "fam")

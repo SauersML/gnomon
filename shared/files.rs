@@ -26,6 +26,25 @@ use tokio::runtime::Runtime;
 pub const PROGRESS_UPDATE_BATCH_SIZE: u64 = 1024;
 
 const REMOTE_BLOCK_SIZE: usize = 8 * 1024 * 1024;
+
+/// Block size used when a remote object is read as a sparse set of small
+/// records rather than swept end to end -- notably a `.pgen`, where scoring
+/// touches only the variant records a score file matched.
+///
+/// Block size is the unit actually fetched, so it sets how many bytes are
+/// wasted around each wanted record. At the 8 MB default a scattered read
+/// pattern touches nearly every block and ends up transferring the whole
+/// object, which would give back exactly the advantage PGEN exists to provide.
+/// 256 KB is small enough to keep that waste bounded while still amortising
+/// per-request latency over a run of neighbouring records.
+const REMOTE_SPARSE_BLOCK_SIZE: usize = 256 * 1024;
+
+/// Keeps the cache's memory footprint roughly constant as block size shrinks,
+/// so smaller blocks buy more of them rather than less cache.
+fn cache_capacity_for(block_size: usize) -> usize {
+    let budget = REMOTE_BLOCK_SIZE * REMOTE_CACHE_CAPACITY;
+    (budget / block_size.max(1)).clamp(REMOTE_CACHE_CAPACITY, 512)
+}
 const REMOTE_CACHE_CAPACITY: usize = 8;
 const HTTP_USER_AGENT: &str = "gnomon-http-client/1.0";
 
@@ -291,18 +310,32 @@ pub fn pgen_sidecar_paths(pgen: &Path) -> (PathBuf, PathBuf) {
 }
 
 /// Opens a raw byte-range source for any supported location.
-fn open_byte_range_source(path: &Path) -> Result<Arc<dyn ByteRangeSource>, PipelineError> {
+///
+/// `sparse` selects the fetch granularity: set it when the caller will read
+/// scattered small records rather than sweep the object end to end.
+fn open_byte_range_source(
+    path: &Path,
+    sparse: bool,
+) -> Result<Arc<dyn ByteRangeSource>, PipelineError> {
     if is_gcs_path(path) {
         let uri = path
             .to_str()
             .ok_or_else(|| PipelineError::Io("Invalid UTF-8 in path".to_string()))?;
         let (bucket, object) = parse_gcs_uri(uri)?;
-        Ok(Arc::new(RemoteByteRangeSource::new(&bucket, &object)?))
+        Ok(Arc::new(if sparse {
+            RemoteByteRangeSource::with_sparse_reads(&bucket, &object)?
+        } else {
+            RemoteByteRangeSource::new(&bucket, &object)?
+        }))
     } else if is_http_path(path) {
         let url = path
             .to_str()
             .ok_or_else(|| PipelineError::Io("Invalid UTF-8 in path".to_string()))?;
-        Ok(Arc::new(HttpByteRangeSource::new(url)?))
+        Ok(Arc::new(if sparse {
+            HttpByteRangeSource::with_sparse_reads(url)?
+        } else {
+            HttpByteRangeSource::new(url)?
+        }))
     } else {
         let file = File::open(path)
             .map_err(|e| PipelineError::Io(format!("Opening {}: {e}", path.display())))?;
@@ -319,7 +352,8 @@ fn open_byte_range_source(path: &Path) -> Result<Arc<dyn ByteRangeSource>, Pipel
 /// of magnitude smaller than the fixed-stride `.bed` record it decodes to).
 fn open_pgen_as_bed_source(pgen_path: &Path) -> Result<BedSource, PipelineError> {
     let (pvar_path, psam_path) = pgen_sidecar_paths(pgen_path);
-    let pgen = open_byte_range_source(pgen_path)?;
+    // Sparse: scoring reads only the variant records a score file matched.
+    let pgen = open_byte_range_source(pgen_path, true)?;
     let mut psam = open_text_source(&psam_path)?;
     let pvar_for_factory = pvar_path.clone();
     let pvar: crate::adapt_plink2::PvarFactory =
@@ -1532,10 +1566,26 @@ struct RemoteByteRangeSource {
     user_project: Option<String>,
     len: u64,
     cache: Mutex<RemoteCache>,
+    /// Fetch granularity. See `REMOTE_SPARSE_BLOCK_SIZE`.
+    block_size: usize,
 }
 
 impl RemoteByteRangeSource {
     fn new(bucket: &str, object: &str) -> Result<Self, PipelineError> {
+        Self::with_block_size(bucket, object, REMOTE_BLOCK_SIZE)
+    }
+
+    /// Opens the object with a specific fetch granularity, for access patterns
+    /// that read scattered small records instead of sweeping the whole object.
+    fn with_sparse_reads(bucket: &str, object: &str) -> Result<Self, PipelineError> {
+        Self::with_block_size(bucket, object, REMOTE_SPARSE_BLOCK_SIZE)
+    }
+
+    fn with_block_size(
+        bucket: &str,
+        object: &str,
+        block_size: usize,
+    ) -> Result<Self, PipelineError> {
         let runtime = get_shared_runtime()?;
         let (mut storage, control) = Self::create_clients(&runtime, None)?;
         let bucket_path = format!("projects/_/buckets/{bucket}");
@@ -1587,7 +1637,8 @@ impl RemoteByteRangeSource {
             object: object.to_string(),
             user_project,
             len,
-            cache: Mutex::new(RemoteCache::new(REMOTE_CACHE_CAPACITY)),
+            cache: Mutex::new(RemoteCache::new(cache_capacity_for(block_size))),
+            block_size,
         })
     }
 
@@ -1649,7 +1700,7 @@ impl RemoteByteRangeSource {
 
     fn block_length(&self, start: u64) -> usize {
         let remaining = self.len.saturating_sub(start);
-        remaining.min(REMOTE_BLOCK_SIZE as u64) as usize
+        remaining.min(self.block_size as u64) as usize
     }
 
     fn ensure_block(&self, start: u64) -> Result<Arc<Vec<u8>>, PipelineError> {
@@ -1760,7 +1811,7 @@ impl ByteRangeSource for RemoteByteRangeSource {
         let mut remaining = dst.len();
         let mut cursor = 0usize;
         let mut current_offset = offset;
-        let block_size = REMOTE_BLOCK_SIZE as u64;
+        let block_size = self.block_size as u64;
 
         while remaining > 0 {
             let block_start = (current_offset / block_size) * block_size;
@@ -1780,7 +1831,9 @@ impl ByteRangeSource for RemoteByteRangeSource {
             remaining -= to_copy;
             current_offset += to_copy as u64;
 
-            if within_block + to_copy == block.len() {
+            // Read-ahead only pays off when the caller is sweeping the object.
+            // For sparse record reads it would double the bytes transferred.
+            if self.block_size == REMOTE_BLOCK_SIZE && within_block + to_copy == block.len() {
                 let next_start = block_start + block_size;
                 if next_start < self.len {
                     let _ = self.ensure_block(next_start);
@@ -1797,6 +1850,8 @@ struct HttpByteRangeSource {
     url: String,
     len: u64,
     cache: Mutex<RemoteCache>,
+    /// Fetch granularity. See `REMOTE_SPARSE_BLOCK_SIZE`.
+    block_size: usize,
 }
 
 struct HttpStreamingReader {
@@ -1861,6 +1916,15 @@ impl Read for HttpStreamingReader {
 
 impl HttpByteRangeSource {
     fn new(url: &str) -> Result<Self, PipelineError> {
+        Self::with_block_size(url, REMOTE_BLOCK_SIZE)
+    }
+
+    /// Opens the URL with a fetch granularity suited to scattered small reads.
+    fn with_sparse_reads(url: &str) -> Result<Self, PipelineError> {
+        Self::with_block_size(url, REMOTE_SPARSE_BLOCK_SIZE)
+    }
+
+    fn with_block_size(url: &str, block_size: usize) -> Result<Self, PipelineError> {
         ensure_rustls_provider();
         let client = Client::builder()
             .user_agent(HTTP_USER_AGENT)
@@ -1871,7 +1935,8 @@ impl HttpByteRangeSource {
             client,
             url: url.to_string(),
             len,
-            cache: Mutex::new(RemoteCache::new(REMOTE_CACHE_CAPACITY)),
+            cache: Mutex::new(RemoteCache::new(cache_capacity_for(block_size))),
+            block_size,
         })
     }
 
@@ -1929,7 +1994,7 @@ impl HttpByteRangeSource {
 
     fn block_length(&self, start: u64) -> usize {
         let remaining = self.len.saturating_sub(start);
-        remaining.min(REMOTE_BLOCK_SIZE as u64) as usize
+        remaining.min(self.block_size as u64) as usize
     }
 
     fn ensure_block(&self, start: u64) -> Result<Arc<Vec<u8>>, PipelineError> {
@@ -2026,7 +2091,7 @@ impl ByteRangeSource for HttpByteRangeSource {
         let mut remaining = dst.len();
         let mut cursor = 0usize;
         let mut current_offset = offset;
-        let block_size = REMOTE_BLOCK_SIZE as u64;
+        let block_size = self.block_size as u64;
 
         while remaining > 0 {
             let block_start = (current_offset / block_size) * block_size;

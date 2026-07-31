@@ -881,18 +881,24 @@ fn haploidy_for_variant(chrom: &str, pos: u64, build: GenomeBuild) -> HaploidyKi
 /// Renders one virtual `.bim` row for a single (variant, ALT) pair.
 ///
 /// PLINK 1.9 contract: `cM` is always 0, A1 is the ALT allele and A2 is REF.
-/// The ID is `<ID>__ALT=<ALT>` when the `.pvar` carries a real ID, and
-/// `chr:pos:ref:alt` otherwise — a multiallelic site splits into several rows,
-/// so the raw ID alone would not be unique.
 ///
-/// Upstream coverage QC matches on ID *and* alleles, so this format is a
-/// compatibility contract, not an implementation detail: changing it silently
-/// turns matched variants into unmatched ones.
-fn format_bim_row(chrom: &str, id: &str, pos: u64, refa: &str, alt: &str) -> String {
-    let id_out = if id != "." && !id.is_empty() {
-        format!("{id}__ALT={alt}")
-    } else {
-        format!("{chrom}:{pos}:{refa}:{alt}")
+/// ID selection matters for compatibility, not just cosmetics. A biallelic site
+/// keeps its `.pvar` ID verbatim, so the row is byte-identical to the one the
+/// equivalent `.bed`/`.bim` fileset would carry — a cohort scored via PGEN and
+/// via PLINK 1.9 then presents the same variant identifiers to any downstream
+/// coverage QC. Only a site that actually splits into several rows needs a
+/// disambiguating ID, since the raw one would no longer be unique:
+///   - `<ID>__ALT=<ALT>` when the `.pvar` carries an ID
+///   - `chr:pos:ref:alt` when it does not (`.`)
+///
+/// gnomon's own reconciliation keys on (chrom, pos, A1, A2) rather than ID, so
+/// this choice does not affect which variants gnomon matches.
+fn format_bim_row(chrom: &str, id: &str, pos: u64, refa: &str, alt: &str, split: bool) -> String {
+    let has_id = id != "." && !id.is_empty();
+    let id_out = match (has_id, split) {
+        (true, false) => id.to_string(),
+        (true, true) => format!("{id}__ALT={alt}"),
+        (false, _) => format!("{chrom}:{pos}:{refa}:{alt}"),
     };
     format!("{chrom}\t{id_out}\t0\t{pos}\t{alt}\t{refa}")
 }
@@ -991,16 +997,17 @@ impl TextSource for StreamingVirtualBim {
                 .copied()
                 .ok_or_else(|| ioerr(".pvar missing ALT column"))?;
 
+            let alts: Vec<&str> = alt_raw
+                .split(',')
+                .map(str::trim)
+                .filter(|a| !a.is_empty() && *a != ".")
+                .collect();
+            let split = alts.len() > 1;
             // Reversed, so `pop` above walks ALTs in order — matching the
             // variant order the plan assigned during the indexing pass.
             self.pending.extend(
-                alt_raw
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|a| !a.is_empty() && *a != ".")
-                    .map(|alt| format_bim_row(&chrom, id, pos, refa, alt))
-                    .collect::<Vec<_>>()
-                    .into_iter()
+                alts.into_iter()
+                    .map(|alt| format_bim_row(&chrom, id, pos, refa, alt, split))
                     .rev(),
             );
         }

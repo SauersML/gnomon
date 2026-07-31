@@ -146,9 +146,12 @@ fn virtual_bed_multi_block_reads_match() {
     assert_eq!(got, &bed[off..off + bb * span], "multi-block mismatch");
 }
 
-/// The virtual `.bim` must describe the same variants, in the same order, with
-/// A1=ALT / A2=REF. Coverage QC upstream matches on ID *and* alleles, so a
-/// drift in either would silently read as a zero-match run.
+/// For a biallelic cohort the virtual `.bim` must be field-for-field identical
+/// to the real one — same IDs, same A1/A2, same order.
+///
+/// This is the guarantee downstream coverage QC depends on: a cohort scored via
+/// PGEN and via PLINK 1.9 has to present the same variant identifiers, or the
+/// match rate reads as zero and the WGS data looks worse than it is.
 #[test]
 fn virtual_bim_matches_real_bim_rows() {
     let vp = open_fixture();
@@ -165,13 +168,7 @@ fn virtual_bim_matches_real_bim_rows() {
         let rf: Vec<&str> = real_line.split_whitespace().collect();
         let gf: Vec<&str> = got.split_whitespace().collect();
         assert_eq!(gf.len(), 6, "bim row {n} is not 6 columns: {got:?}");
-        // chrom, id, cm, pos
-        assert_eq!(gf[0], rf[0], "chrom mismatch at bim row {n}");
-        assert_eq!(gf[1], rf[1], "id mismatch at bim row {n}");
-        assert_eq!(gf[3], rf[3], "pos mismatch at bim row {n}");
-        // A1=ALT, A2=REF
-        assert_eq!(gf[4], rf[4], "A1 mismatch at bim row {n}");
-        assert_eq!(gf[5], rf[5], "A2 mismatch at bim row {n}");
+        assert_eq!(gf, rf, "bim row {n} differs from the real .bim");
         n += 1;
     }
     assert_eq!(n, N_VARIANTS);
