@@ -24,7 +24,8 @@ CONVENTION_SITE_BUDGET = 76        # measured; may decrease, never increase
 ISOLATED_MODULE_BUDGET = 19         # modules no theorem cross-relates to another
 UNDECLARED_BUDGET = 0               # empirical defs with no status marker
 UNRELATED_BUDGET = 70               # ratchets down
-MISSING_ARG_BUDGET = 0              # signatures omitting a dependency of the named quantity             # measured; ratchets down as siblings get related
+MISSING_ARG_BUDGET = 0              # signatures omitting a dependency of the named quantity
+OVERCLAIM_BUDGET = 0                # untested definitions whose docstring claims exactness             # measured; ratchets down as siblings get related
 
 def strip_comments(src: str) -> str:
     """Remove Lean block and line comments so prose cannot trip the guards."""
@@ -197,6 +198,27 @@ def main() -> int:
         bad.append(f"definitions omitting an argument the named quantity depends on: "
                    f"{len(missing)}, budget {MISSING_ARG_BUDGET}")
         bad.extend("    " + x for x in missing[:10])
+
+    # 3d-bis. Overclaiming. Two of the falsified definitions carried the word
+    #     "exact" in a docstring while being 26 percent wrong. A definition may
+    #     claim exactness or derivation, or it may be untested, but not both:
+    #     an untested definition has no standing to call itself exact.
+    overclaim = []
+    for f in lean_files():
+        raw = open(f).read()
+        for m in re.finditer(r"/--((?:(?!-/).)*)-/\s*\n(?:noncomputable )?def ([A-Za-z_0-9'.]+)", raw, re.S):
+            doc, name = m.group(1), m.group(2).split(".")[-1]
+            if "Empirical status: UNTESTED" not in doc:
+                continue
+            claim = re.search(r"\b(exact|exactly|derived from first principles|"
+                              r"the true |precisely)\b", doc, re.I)
+            if claim:
+                overclaim.append(f"{os.path.relpath(f, ROOT)}: `{name}` is UNTESTED but its "
+                                 f"docstring claims \"{claim.group(1)}\"")
+    if len(overclaim) > OVERCLAIM_BUDGET:
+        bad.append(f"untested definitions whose docstring claims exactness: "
+                   f"{len(overclaim)}, budget {OVERCLAIM_BUDGET}")
+        bad.extend("    " + x for x in overclaim[:10])
 
     # 3e. Cheap structural integrity, run before the build so that a broken
     #     rename or an unterminated comment fails in seconds rather than after a
