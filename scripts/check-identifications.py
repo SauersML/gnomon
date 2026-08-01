@@ -20,7 +20,7 @@ import re, sys, glob, os
 ROOT = os.path.join(os.path.dirname(__file__), "..", "proofs")
 
 SORRY_LEDGER: set[str] = set()      # name -> undischarged obligation, none yet
-CONVENTION_SITE_BUDGET = 101        # measured; may decrease, never increase
+CONVENTION_SITE_BUDGET = 100        # measured; may decrease, never increase
 ISOLATED_MODULE_BUDGET = 23         # modules no theorem cross-relates to another
 
 def strip_comments(src: str) -> str:
