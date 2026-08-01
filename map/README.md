@@ -169,3 +169,8 @@ sbatch scripts/msi-pc-proof-fast.sbatch
 Pass a leaf target such as `Calibrator.PCCorrectability.Phase` while iterating.
 The job deliberately preserves Lake's incremental state; using `lake -R` here
 forces a project-wide replay and defeats the fast path.
+
+`Threshold`, `Geometry`, and `Nonidentifiability` separate scalar definitions
+from the two proof families; `Overlap`, `Phase`, and `Frequency` are independent
+sibling leaves. Target the file being edited and reserve the umbrella target
+for final integration, avoiding recompilation of unrelated layers.
