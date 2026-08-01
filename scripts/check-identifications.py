@@ -20,7 +20,7 @@ import re, sys, glob, os
 ROOT = os.path.join(os.path.dirname(__file__), "..", "proofs")
 
 SORRY_LEDGER = set()                # name -> undischarged obligation, none yet
-CONVENTION_SITE_BUDGET = 76        # measured; may decrease, never increase
+CONVENTION_SITE_BUDGET = 43        # measured; may decrease, never increase
 ISOLATED_MODULE_BUDGET = 19         # modules no theorem cross-relates to another
 UNDECLARED_BUDGET = 0               # empirical defs with no status marker
 UNRELATED_BUDGET = 70               # ratchets down
@@ -71,7 +71,14 @@ def main() -> int:
 
     # convention drift
     defpat = re.compile(r'^(?:noncomputable )?def ([A-Za-z_0-9\'.]+)(.*?)(?=\n(?:/-|@\[|theorem |noncomputable |def |abbrev |structure |section |end |namespace ))', re.S | re.M)
-    mult = re.compile(r'(?<![\^A-Za-z_0-9.])([2-9]|[1-9][0-9]+)\s*\*|/\s*\(?\s*([2-9]|[1-9][0-9]+)\s*\*')
+    # A convention restatement is a 2 or a 4 adjacent to a population-genetic
+    # parameter: 2 Ne, 4 Ne mu, 2 p (1 - p). The 2 in a Gaussian density or in
+    # a quadratic expansion is not a ploidy convention, and tying it to `ploidy`
+    # would be wrong, so the pattern requires the neighbouring symbol.
+    POP = r"(?:Ne|N|N_b|N₀|N₁|mu|μ|m|m_rate|m_into|mig|p|p0|p₁|p₂|p_bar|maf|fst|freq|theta|θ|sigma_sq)"
+    mult = re.compile(r"(?<![\^A-Za-z_0-9.])[24]\s*\*\s*(?:\([^)]*\)|[A-Za-z_0-9.]*\.)?" + POP + r"\b"
+                      r"|/\s*\(\s*[24]\s*\*\s*(?:[A-Za-z_0-9.]*\.)?" + POP + r"\b"
+                      r"|\b(?:[A-Za-z_0-9]+\.)?" + POP + r"\s*\*\s*[24]\b")
     # Definitions that a Conventions theorem relates back to `ploidy` or to a
     # derived primitive are not loose restatements: their constant is forced.
     tied = set()
