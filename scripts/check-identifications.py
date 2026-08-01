@@ -15,6 +15,8 @@ Guards, in order of what they catch:
    The count is pinned; adding new inline restatements without relating them
    to `ploidy` in Conventions.lean fails, so the number can only go down.
 """
+from __future__ import annotations
+
 import re, sys, glob, os
 
 ROOT = os.path.join(os.path.dirname(__file__), "..", "proofs")
