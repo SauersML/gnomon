@@ -22,6 +22,8 @@ ROOT = os.path.join(os.path.dirname(__file__), "..", "proofs")
 SORRY_LEDGER: set[str] = set()      # name -> undischarged obligation, none yet
 CONVENTION_SITE_BUDGET = 99        # measured; may decrease, never increase
 ISOLATED_MODULE_BUDGET = 23         # modules no theorem cross-relates to another
+UNDECLARED_BUDGET = 0               # empirical defs with no status marker
+UNRELATED_BUDGET = 75               # measured; ratchets down as siblings get related
 
 def strip_comments(src: str) -> str:
     """Remove Lean block and line comments so prose cannot trip the guards."""
@@ -79,6 +81,67 @@ def main() -> int:
             body = re.sub(r'\^\s*[0-9]+', '', body)
             if mult.search(body):
                 sites += 1
+    # 3b. Undeclared empirical definitions. Every definition whose name carries
+    #     domain vocabulary, or whose body contains a modelling constant, is a
+    #     claim about an observable. It must declare an Empirical status, even
+    #     if that status is UNTESTED. Four of the seven falsifications found so
+    #     far were in definitions nobody had thought to check; the point of the
+    #     marker is that the unchecked ones are enumerable rather than silent.
+    DOMAIN = re.compile(r"fst|drift|selection|herit|linkage|allele|geno|migrat|coalesc|mutation|"
+                        r"epistat|domin|recomb|ancestr|spike|admix|haplo|polygenic|prevalence|"
+                        r"liability|penetrance|pgs|gwas|ld[A-Z_]|singleton|winners|power|ncp|effect", re.I)
+    undeclared = []
+    for f in lean_files():
+        raw = open(f).read().split("\n")
+        stripped = strip_comments(open(f).read()).split("\n")
+        for i, line in enumerate(stripped):
+            m = re.match(r"^(?:noncomputable )?def ([A-Za-z_0-9'.]+)", line)
+            if not m:
+                continue
+            short = m.group(1).split(".")[-1]
+            body = "\n".join(stripped[i:i + 6])
+            body = body.split(":=", 1)[1] if ":=" in body else ""
+            if not (DOMAIN.search(short) or mult.search(re.sub(r"\^\s*[0-9]+", "", body))):
+                continue
+            if "Empirical status:" not in "\n".join(raw[max(0, i - 14):i + 1]):
+                undeclared.append(f"{os.path.relpath(f, ROOT)}: `{short}` has no Empirical status")
+    if len(undeclared) > UNDECLARED_BUDGET:
+        bad.append(f"definitions making an empirical claim without an Empirical status marker: "
+                   f"{len(undeclared)}, budget {UNDECLARED_BUDGET}")
+        bad.extend("    " + u for u in undeclared[:8])
+
+    # 3c. Unrelated same-quantity definitions. Both of the two most recent
+    #     falsifications were a pair of definitions of one quantity that no
+    #     theorem ever related: amInflationFactor against amEquilibriumVariance,
+    #     and fstFromDrift against coalFst. Where two definitions share a domain
+    #     stem, some theorem should mention both, so that a disagreement is a
+    #     failed proof rather than two coexisting answers.
+    STEMS = ["Fst", "Inflation", "Power", "Bias", "Overlap", "Spike", "Retention", "Variance"]
+    defs_by_stem = {}
+    for f in lean_files():
+        body = strip_comments(open(f).read())
+        for m in re.finditer(r"^(?:noncomputable )?def ([A-Za-z_0-9'.]+)", body, re.M):
+            n = m.group(1).split(".")[-1]
+            for st in STEMS:
+                if st.lower() in n.lower():
+                    defs_by_stem.setdefault(st, set()).add(n)
+    all_stmts = []
+    for f in lean_files():
+        for b in re.split(r"\n(?=@\[simp\]\s*\n?theorem |theorem |private theorem )",
+                          strip_comments(open(f).read())):
+            if re.match(r"(?:@\[simp\]\s*)?(?:private )?theorem ", b) and ":=" in b:
+                all_stmts.append(b.split(":=", 1)[0])
+    unrelated = 0
+    for st, names in defs_by_stem.items():
+        for n in names:
+            if not any(re.search(r"\b" + re.escape(n) + r"\b", s) and
+                       any(re.search(r"\b" + re.escape(o) + r"\b", s) for o in names if o != n)
+                       for s in all_stmts):
+                unrelated += 1
+    if unrelated > UNRELATED_BUDGET:
+        bad.append(f"same-quantity definitions never related to a sibling by any theorem: "
+                   f"{unrelated}, budget {UNRELATED_BUDGET}")
+
     # 4. semantic isolation. A module that no theorem ever relates to another
     #    module cannot be contradicted by anything: a false definition inside it
     #    is consistent with the whole corpus. This is the condition that let two
@@ -117,6 +180,7 @@ def main() -> int:
             print("  " + b)
         return 1
     print(f"structural guards pass: convention sites {sites}/{CONVENTION_SITE_BUDGET}, "
+          f"undeclared {len(undeclared)}/{UNDECLARED_BUDGET}, unrelated {unrelated}/{UNRELATED_BUDGET}, "
           f"isolated modules {len(isolated)}/{ISOLATED_MODULE_BUDGET}, "
           f"sorry ledger {len(SORRY_LEDGER)}")
     return 0
