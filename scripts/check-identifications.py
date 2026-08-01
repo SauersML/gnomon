@@ -23,7 +23,7 @@ SORRY_LEDGER = set()                # name -> undischarged obligation, none yet
 CONVENTION_SITE_BUDGET = 0        # measured; may decrease, never increase
 ISOLATED_MODULE_BUDGET = 17         # modules no theorem cross-relates to another
 UNDECLARED_BUDGET = 0               # empirical defs with no status marker
-UNRELATED_BUDGET = 66               # ratchets down
+UNRELATED_BUDGET = 46               # ratchets down
 MISSING_ARG_BUDGET = 0              # signatures omitting a dependency of the named quantity
 OVERCLAIM_BUDGET = 0                # untested definitions whose docstring claims exactness             # measured; ratchets down as siblings get related
 
@@ -132,21 +132,30 @@ def main() -> int:
                    f"{len(undeclared)}, budget {UNDECLARED_BUDGET}")
         bad.extend("    " + u for u in undeclared[:8])
 
-    # 3c. Unrelated same-quantity definitions. Both of the two most recent
-    #     falsifications were a pair of definitions of one quantity that no
-    #     theorem ever related: amInflationFactor against amEquilibriumVariance,
-    #     and fstFromDrift against coalFst. Where two definitions share a domain
-    #     stem, some theorem should mention both, so that a disagreement is a
-    #     failed proof rather than two coexisting answers.
-    STEMS = ["Fst", "Inflation", "Power", "Bias", "Overlap", "Spike", "Retention", "Variance"]
-    defs_by_stem = {}
+    # 3c. Unrelated same-quantity definitions. Two definitions are the same
+    #     quantity when their bodies agree after renaming that definition's own
+    #     bound variables, and the shared body contains a constant or a named
+    #     function rather than being pure operator shape: `2 p (1 - p)` counts,
+    #     `a + b` does not. A group spanning two modules with no theorem
+    #     mentioning two of its members is a divergence nothing can detect,
+    #     which is how amInflationFactor and fstFromDrift survived.
+    bodypat = re.compile(r"^(?:noncomputable )?def ([A-Za-z_0-9'.]+)(.*?):=\s*\n?\s*(.+?)"
+                         r"(?=\n(?:@\[|theorem |noncomputable |def |abbrev |structure |section |end |namespace |/-))",
+                         re.S | re.M)
+    groups = {}
     for f in lean_files():
-        body = strip_comments(open(f).read())
-        for m in re.finditer(r"^(?:noncomputable )?def ([A-Za-z_0-9'.]+)", body, re.M):
-            n = m.group(1).split(".")[-1]
-            for st in STEMS:
-                if st.lower() in n.lower():
-                    defs_by_stem.setdefault(st, set()).add(n)
+        src = strip_comments(open(f).read())
+        mod = os.path.basename(f)[:-5]
+        for m in bodypat.finditer(src):
+            name, args, body = m.group(1), m.group(2), " ".join(m.group(3).split())
+            if len(body) > 80:
+                continue
+            bound = set(re.findall(r"[A-Za-z_][A-Za-z_0-9₀-₉']*", args))
+            norm = re.sub(r"[A-Za-z_][A-Za-z_0-9₀-₉'.]*",
+                          lambda t: "V" if t.group(0) in bound else t.group(0), body)
+            if not re.search(r"[0-9]|[A-Za-z_]{3,}", norm.replace("V", "")):
+                continue
+            groups.setdefault(norm, []).append((mod, name.split(".")[-1]))
     all_stmts = []
     for f in lean_files():
         for b in re.split(r"\n(?=@\[simp\]\s*\n?theorem |theorem |private theorem )",
@@ -154,13 +163,14 @@ def main() -> int:
             if re.match(r"(?:@\[simp\]\s*)?(?:private )?theorem ", b) and ":=" in b:
                 all_stmts.append(b.split(":=", 1)[0])
     unrelated = 0
-    for st, names in defs_by_stem.items():
-        if len(names) < 2:
+    for norm, members in groups.items():
+        if len({m for m, _ in members}) < 2:
             continue
+        names = [n for _, n in members]
         for n in names:
-            if not any(re.search(r"\b" + re.escape(n) + r"\b", s) and
-                       any(re.search(r"\b" + re.escape(o) + r"\b", s) for o in names if o != n)
-                       for s in all_stmts):
+            if not any(re.search(r"\b" + re.escape(n) + r"\b", st) and
+                       any(re.search(r"\b" + re.escape(o) + r"\b", st) for o in names if o != n)
+                       for st in all_stmts):
                 unrelated += 1
     if unrelated > UNRELATED_BUDGET:
         bad.append(f"same-quantity definitions never related to a sibling by any theorem: "
