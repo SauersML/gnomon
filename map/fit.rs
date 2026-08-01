@@ -1998,6 +1998,11 @@ fn standardize_column_simd_full(values: &mut [f64], mean: f64, inv: f64) {
 }
 
 #[cfg(test)]
+#[cfg(any(
+    target_feature = "avx",
+    target_arch = "aarch64",
+    target_arch = "wasm32"
+))]
 #[inline(always)]
 fn standardize_column_simd_full_lanes4(values: &mut [f64], mean: f64, inv: f64) {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -2017,7 +2022,10 @@ fn standardize_column_simd_full_lanes4(values: &mut [f64], mean: f64, inv: f64) 
 }
 
 #[cfg(test)]
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    target_feature = "avx"
+))]
 #[target_feature(enable = "avx")]
 /// # Safety
 /// Callers must guarantee AVX availability; runtime dispatch ensures that the
@@ -2045,6 +2053,11 @@ fn standardize_column_simd_full_impl_lanes2(values: &mut [f64], mean: f64, inv: 
 }
 
 #[cfg(test)]
+#[cfg(any(
+    target_feature = "avx",
+    target_arch = "aarch64",
+    target_arch = "wasm32"
+))]
 #[inline(always)]
 fn standardize_column_simd_full_impl_lanes4(values: &mut [f64], mean: f64, inv: f64) {
     let mean_simd = Simd::<f64, 4>::splat(mean);

@@ -164,6 +164,14 @@ struct ModelKeysArgs {
     model: String,
 }
 
+#[cfg(feature = "map")]
+#[derive(Args)]
+struct CorrectabilityArgs {
+    /// JSON design containing cohort size, subgroup size, marker classes, and optional PGS risk inputs
+    #[arg(value_name = "DESIGN_JSON")]
+    design: PathBuf,
+}
+
 #[cfg(feature = "terms")]
 #[derive(Args)]
 struct TermsArgs {
@@ -359,6 +367,8 @@ enum FullCommands {
     Project(ProjectArgs),
     /// Print a built-in projection model's variant keys as JSON (to stdout)
     ModelKeys(ModelKeysArgs),
+    /// Quantify frequency-resolved population-structure correctability
+    Correctability(CorrectabilityArgs),
     /// Infer sample metadata terms
     Terms(TermsArgs),
     /// Train GAM calibration model
@@ -397,6 +407,8 @@ enum MapCommands {
     Project(ProjectArgs),
     /// Print a built-in projection model's variant keys as JSON (to stdout)
     ModelKeys(ModelKeysArgs),
+    /// Quantify frequency-resolved population-structure correctability
+    Correctability(CorrectabilityArgs),
 }
 
 #[cfg(feature = "terms")]
@@ -556,6 +568,7 @@ fn run_full_entrypoint() -> Result<(), Box<dyn std::error::Error>> {
         Some(FullCommands::Fit(args)) => run_map_fit(args),
         Some(FullCommands::Project(args)) => run_map_project(args),
         Some(FullCommands::ModelKeys(args)) => run_model_keys(args),
+        Some(FullCommands::Correctability(args)) => run_correctability(args),
         Some(FullCommands::Terms(args)) => run_terms(args),
         Some(FullCommands::Train(args)) => train(args),
         Some(FullCommands::Infer(args)) => infer(args),
@@ -585,6 +598,7 @@ fn run_map_entrypoint() -> Result<(), Box<dyn std::error::Error>> {
         Some(MapCommands::Fit(args)) => run_map_fit(args),
         Some(MapCommands::Project(args)) => run_map_project(args),
         Some(MapCommands::ModelKeys(args)) => run_model_keys(args),
+        Some(MapCommands::Correctability(args)) => run_correctability(args),
         None => {
             MapCli::command().print_help()?;
             println!();
@@ -695,6 +709,14 @@ fn run_model_keys(args: ModelKeysArgs) -> Result<(), Box<dyn std::error::Error>>
     // goes to stderr inside the loader), so callers can parse stdout directly.
     let json = map_cli::model_variant_keys_json(&args.model)
         .map_err(|err| Box::new(err) as Box<dyn std::error::Error>)?;
+    println!("{json}");
+    Ok(())
+}
+
+#[cfg(feature = "map")]
+fn run_correctability(args: CorrectabilityArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let json = gnomon::map::correctability::calculate_json_file(&args.design)
+        .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
     println!("{json}");
     Ok(())
 }

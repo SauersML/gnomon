@@ -121,3 +121,40 @@ filtering), optional LD weights, and any variant key list.  Reloading verifies
 that saved metadata are internally consistent and that projection datasets
 match the recorded variant subset before computation begins, preventing
 mismatched cohorts from being processed.
+
+## Correctability diagnostic
+
+`gnomon-map correctability DESIGN_JSON` evaluates a specified ancestry axis
+against each available marker class. The input uses LD-adjusted effective
+marker counts, not raw SNP counts:
+
+```json
+{
+  "sample_size": 400000,
+  "subgroup_size": 1000,
+  "fitted_pcs": 40,
+  "marker_classes": [
+    {"name": "common", "effective_markers": 100000, "differentiation": 0.0001, "theoretical_pc_rank": 12},
+    {"name": "rare", "effective_markers": 1000000, "differentiation": 0.001, "theoretical_pc_rank": 3}
+  ],
+  "application": {
+    "susceptibility": 0.00001,
+    "expected_pgs_variants": 10000,
+    "effect_sd": 0.1,
+    "directional_amplification": 2.0,
+    "count_inflation": 0.0,
+    "confounder": 0.5,
+    "critical_signal": 3.85
+  }
+}
+```
+
+For each class the report gives the rank-one spike `2 F m_eff`, the BBP edge
+`sqrt(n / M_eff)`, the Johnstone–Paul overlap proxy above the edge, residual
+axis fraction, the minimum sufficient PC count (or that no PC count suffices),
+residual susceptibility `H'`, predicted standardized bias, and the critical
+confounder magnitude. It also reports the differentiation-matched
+frequency weights and total information `sum M_c F_c^2`. These are model-based
+design quantities: linkage, uncertainty in `F_c`, or violation of the rank-one
+spike model must be reflected in the effective marker counts or external error
+bounds rather than hidden by the calculator.

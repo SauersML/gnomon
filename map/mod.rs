@@ -1,3 +1,4 @@
+pub mod correctability;
 pub mod fit;
 pub mod io;
 pub mod main;
