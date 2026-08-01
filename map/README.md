@@ -149,7 +149,7 @@ marker counts, not raw SNP counts:
 }
 ```
 
-For each class the report gives the rank-one spike `2 F m_eff`, the BBP edge
+For each class the report gives the rank-one spike `4 F m_eff`, the BBP edge
 `sqrt(n / M_eff)`, the Johnstone–Paul overlap proxy above the edge, residual
 axis fraction, the minimum sufficient PC count (or that no PC count suffices),
 residual susceptibility `H'`, predicted standardized bias, and the critical
