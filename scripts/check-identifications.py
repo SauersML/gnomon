@@ -198,6 +198,23 @@ def main() -> int:
                    f"{len(missing)}, budget {MISSING_ARG_BUDGET}")
         bad.extend("    " + x for x in missing[:10])
 
+    # 3e. Cheap structural integrity, run before the build so that a broken
+    #     rename or an unterminated comment fails in seconds rather than after a
+    #     full elaboration. The "+/-" incident is the motivating case: text in a
+    #     status marker contained "/-", which opened a nested comment and left a
+    #     docstring unterminated.
+    for f in lean_files():
+        raw = open(f).read()
+        rel = os.path.relpath(f, ROOT)
+        if raw.count("/-") != raw.count("-/"):
+            bad.append(f"{rel}: unbalanced comment delimiters "
+                       f"({raw.count('/-')} open, {raw.count('-/')} close)")
+        if "namespace Calibrator" in raw and not raw.rstrip().endswith("end Calibrator"):
+            bad.append(f"{rel}: does not end with `end Calibrator`")
+        for imp in re.findall(r"^import (Calibrator[A-Za-z.]*)", raw, re.M):
+            if not os.path.exists(os.path.join(ROOT, imp.replace(".", "/") + ".lean")):
+                bad.append(f"{rel}: imports {imp}, which does not exist")
+
     # 4. semantic isolation. A module that no theorem ever relates to another
     #    module cannot be contradicted by anything: a false definition inside it
     #    is consistent with the whole corpus. This is the condition that let two
