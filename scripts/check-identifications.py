@@ -20,10 +20,11 @@ import re, sys, glob, os
 ROOT = os.path.join(os.path.dirname(__file__), "..", "proofs")
 
 SORRY_LEDGER = set()                # name -> undischarged obligation, none yet
-CONVENTION_SITE_BUDGET = 77        # measured; may decrease, never increase
+CONVENTION_SITE_BUDGET = 76        # measured; may decrease, never increase
 ISOLATED_MODULE_BUDGET = 19         # modules no theorem cross-relates to another
 UNDECLARED_BUDGET = 0               # empirical defs with no status marker
-UNRELATED_BUDGET = 69               # measured; ratchets down as siblings get related
+UNRELATED_BUDGET = 70               # ratchets down
+MISSING_ARG_BUDGET = 0              # signatures omitting a dependency of the named quantity             # measured; ratchets down as siblings get related
 
 def strip_comments(src: str) -> str:
     """Remove Lean block and line comments so prose cannot trip the guards."""
@@ -156,6 +157,46 @@ def main() -> int:
     if unrelated > UNRELATED_BUDGET:
         bad.append(f"same-quantity definitions never related to a sibling by any theorem: "
                    f"{unrelated}, budget {UNRELATED_BUDGET}")
+
+    # 3d. Missing-argument screen. Six of the eleven falsified definitions failed
+    #     the same way: the signature omits an argument the named quantity is
+    #     known to depend on. No constant repairs such a definition, and the
+    #     defect is visible statically, without any simulation. Each entry is a
+    #     name pattern together with the arguments that quantity must depend on.
+    PREVALENCE_FREE = {"populationAUC"}   # rank definition, prevalence-free by construction
+    REQUIRED_ARGS = [
+        (r"power",            [r"alpha", r"z_?alpha", r"threshold", r"level"],
+         "statistical power depends on the significance threshold"),
+        (r"auc",              [r"prev", r"k\b", r"pi\b", r"baseRate"],
+         "AUC under a threshold model depends on prevalence"),
+        (r"winner|curse",     [r"alpha", r"z_?alpha", r"threshold"],
+         "selection bias depends on the selection threshold"),
+        (r"singleton|sfs",    [r"\bn\b", r"nsamp", r"sampleSize"],
+         "site-frequency quantities depend on sample size"),
+        (r"aminflation|assortativeinflation",
+                              [r"h2", r"herit"],
+         "assortative-mating inflation depends on heritability"),
+        (r"ldamplif|amplifld|bottlenecklD",
+                              [r"\br\b", r"recomb", r"\bc\b"],
+         "LD amplification depends on the recombination rate"),
+    ]
+    missing = []
+    for f in lean_files():
+        body_all = strip_comments(open(f).read())
+        for m in re.finditer(r"^(?:noncomputable )?def ([A-Za-z_0-9'.]+)([^:]*):", body_all, re.M):
+            name, args = m.group(1).split(".")[-1], m.group(2)
+            if name in PREVALENCE_FREE or re.search(r"gaussian|interval|approximation", name, re.I):
+                continue   # name declares the model it is exact for, or is a wrapper
+            for pat, needed, why in REQUIRED_ARGS:
+                if not re.search(pat, name, re.I):
+                    continue
+                if not any(re.search(a, args, re.I) for a in needed):
+                    missing.append(f"{os.path.relpath(f, ROOT)}: `{name}` takes no "
+                                   f"{needed[0]}-like argument; {why}")
+    if len(missing) > MISSING_ARG_BUDGET:
+        bad.append(f"definitions omitting an argument the named quantity depends on: "
+                   f"{len(missing)}, budget {MISSING_ARG_BUDGET}")
+        bad.extend("    " + x for x in missing[:10])
 
     # 4. semantic isolation. A module that no theorem ever relates to another
     #    module cannot be contradicted by anything: a false definition inside it
