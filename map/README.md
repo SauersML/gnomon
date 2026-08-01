@@ -149,12 +149,19 @@ marker counts, not raw SNP counts:
 }
 ```
 
-For each class the report gives the rank-one spike `4 F m_eff`, the BBP edge
-`sqrt(n / M_eff)`, the Johnstone–Paul overlap proxy above the edge, residual
-axis fraction, the minimum sufficient PC count (or that no PC count suffices),
+For each class the report gives the rank-one spike `4 F m_eff`, with `F` on
+the Hudson `F_ST` scale, the BBP edge `sqrt(n / M_eff)`, and the
+Johnstone–Paul sample-PC overlap proxy above the edge. Sample-PC overlap is
+reported independently of whether that PC is among the requested covariates;
+the removed-axis and residual-axis fractions record what the requested PC set
+actually corrects. The report also gives the minimum sufficient PC count (or
+that no PC count suffices),
 residual susceptibility `H'`, predicted standardized bias, and the critical
 confounder magnitude. It also reports the differentiation-matched
-frequency weights and total information `sum M_c F_c^2`. These are model-based
+frequency weights and total information `sum M_c F_c^2`. The cross-class
+quantity is labeled an information index rather than a combined BBP overlap:
+the single-spike theorem does not identify an overlap curve for heterogeneous
+marker classes. These are model-based
 design quantities: linkage, uncertainty in `F_c`, or violation of the rank-one
 spike model must be reflected in the effective marker counts or external error
 bounds rather than hidden by the calculator.
