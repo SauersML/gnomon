@@ -214,6 +214,7 @@ fn load_score_rules(
         .map(|(idx, name)| (name.clone(), idx))
         .collect();
     let mut rules_by_key: AHashMap<VariantKey, Vec<ScoreRule>> = AHashMap::new();
+    let mut skipped_contigs = SkippedContigs::default();
 
     for header in &headers {
         let path = &header.path;
@@ -257,15 +258,16 @@ fn load_score_rules(
             let mut key_parts = variant_id.splitn(2, ':');
             let chr = key_parts.next().unwrap_or_default();
             let pos = key_parts.next().unwrap_or_default();
+            // Harmonized catalog files carry a handful of alt/random contigs that no
+            // primary-assembly VCF can match. Skip those rows with a summary instead of
+            // aborting a run over hundreds of otherwise-usable score files.
+            let Ok(chr_index) = parse_chromosome_label(chr) else {
+                skipped_contigs.record(path, line_number, chr);
+                line.clear();
+                continue;
+            };
             let key = (
-                parse_chromosome_label(chr).map_err(|err| {
-                    format!(
-                        "Invalid chromosome in '{}' at line {}: {}",
-                        path.display(),
-                        line_number,
-                        err
-                    )
-                })?,
+                chr_index,
                 pos.parse::<u32>().map_err(|err| {
                     format!(
                         "Invalid position in '{}' at line {}: {}",
@@ -327,7 +329,52 @@ fn load_score_rules(
         }
     }
 
+    skipped_contigs.report();
+
     Ok((score_names, rules_by_key))
+}
+
+/// Counts native score rows dropped for unsupported contigs, keeping a few examples
+/// so a pipeline can find the offending rows without re-scanning every score file.
+#[derive(Debug, Default)]
+struct SkippedContigs {
+    count: u64,
+    examples: Vec<String>,
+}
+
+impl SkippedContigs {
+    const MAX_EXAMPLES: usize = 5;
+
+    fn record(&mut self, path: &Path, line_number: u64, chromosome: &str) {
+        self.count += 1;
+        if self.examples.len() < Self::MAX_EXAMPLES {
+            self.examples.push(format!(
+                "{}:{} (chromosome '{}')",
+                path.display(),
+                line_number,
+                chromosome
+            ));
+        }
+    }
+
+    fn report(&self) {
+        if self.count == 0 {
+            return;
+        }
+        eprintln!(
+            "> Warning: Skipped {} native score row(s) on unsupported contigs (expected 1-22, X, Y, or MT).",
+            self.count
+        );
+        for example in &self.examples {
+            eprintln!(">   - {example}");
+        }
+        if self.count > self.examples.len() as u64 {
+            eprintln!(
+                ">   ... and {} more.",
+                self.count - self.examples.len() as u64
+            );
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -440,13 +487,6 @@ struct DecodedAltDosage {
 }
 
 impl DecodedAltDosage {
-    fn dosage_only(alt_dosage: f64) -> Self {
-        Self {
-            alt_dosage,
-            ploidy: None,
-        }
-    }
-
     fn genotype(alt_dosage: f64, ploidy: u8) -> Self {
         Self {
             alt_dosage,
@@ -579,15 +619,24 @@ fn decode_vcf_sample(
         }
     }
 
+    // DS/GP carry no ploidy of their own, but REF-effect rules need it to turn an
+    // ALT dosage into a REF dosage. When GT is also present, take the ploidy from
+    // there so imputed VCFs with GT:DS:GP score REF effects without stripping fields.
     if let Some(value) = ds_field
         && let Some(parsed) = parse_vcf_dosage_field(value, alt_index, alt_count)?
     {
-        return Ok(Some(DecodedAltDosage::dosage_only(parsed)));
+        return Ok(Some(DecodedAltDosage {
+            alt_dosage: parsed,
+            ploidy: gt_field.and_then(parse_vcf_genotype_ploidy),
+        }));
     }
     if let Some(value) = gp_field
         && let Some(parsed) = parse_vcf_gp(value, alt_index, alt_count)?
     {
-        return Ok(Some(DecodedAltDosage::dosage_only(parsed)));
+        return Ok(Some(DecodedAltDosage {
+            alt_dosage: parsed,
+            ploidy: gt_field.and_then(parse_vcf_genotype_ploidy),
+        }));
     }
     if let Some(value) = gt_field
         && let Some(parsed) = parse_vcf_genotype(value, alt_index)?
@@ -732,6 +781,35 @@ fn parse_vcf_genotype(
     }
 }
 
+/// Counts the allele slots in a `GT` field, including missing (`.`) slots.
+///
+/// Used only to recover ploidy for dosages decoded from `DS`/`GP`; a sample can be
+/// missing its genotype call and still carry a usable imputed dosage.
+fn parse_vcf_genotype_ploidy(field: &str) -> Option<u8> {
+    let bytes = field.as_bytes();
+    let mut ploidy = 0u8;
+    let mut idx = 0;
+    while idx < bytes.len() {
+        match bytes[idx] {
+            b'/' | b'|' => idx += 1,
+            b'.' => {
+                ploidy = ploidy.checked_add(1)?;
+                idx += 1;
+            }
+            b'0'..=b'9' => {
+                idx += 1;
+                while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+                    idx += 1;
+                }
+                ploidy = ploidy.checked_add(1)?;
+            }
+            _ => return None,
+        }
+    }
+
+    (ploidy > 0).then_some(ploidy)
+}
+
 fn resolve_keep_indices(
     keep: Option<&Path>,
     sample_names: &[String],
@@ -789,6 +867,74 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::io::Write;
+
+    #[test]
+    fn ref_effect_rules_use_gt_ploidy_alongside_ds_dosage() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vcf_path = dir.path().join("imputed.vcf");
+        let score_path = dir.path().join("score.gnomon.tsv");
+
+        {
+            let mut vcf = File::create(&vcf_path).expect("create vcf");
+            writeln!(vcf, "##fileformat=VCFv4.2").expect("write");
+            writeln!(
+                vcf,
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts1\ts2"
+            )
+            .expect("write");
+            writeln!(vcf, "1\t100\t.\tA\tG\t.\tPASS\t.\tGT:DS\t0/1:0.9\t1/1:1.8").expect("write");
+        }
+
+        {
+            let mut score = File::create(&score_path).expect("create score");
+            writeln!(score, "variant_id\teffect_allele\tother_allele\tScoreA").expect("write");
+            // The effect allele is the VCF REF, so scoring needs ploidy that DS lacks.
+            writeln!(score, "1:100\tA\tG\t1.0").expect("write");
+        }
+
+        let result = score_vcf_streaming(&vcf_path, &[score_path], None, None).expect("score");
+        assert_eq!(result.score_variant_counts, [1]);
+        assert!((result.sum_scores[0] - 1.1).abs() < 1e-9);
+        assert!((result.sum_scores[1] - 0.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn unsupported_score_contigs_are_skipped_not_fatal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vcf_path = dir.path().join("cohort.vcf");
+        let score_path = dir.path().join("score.gnomon.tsv");
+
+        {
+            let mut vcf = File::create(&vcf_path).expect("create vcf");
+            writeln!(vcf, "##fileformat=VCFv4.2").expect("write");
+            writeln!(
+                vcf,
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts1"
+            )
+            .expect("write");
+            writeln!(vcf, "1\t100\t.\tA\tG\t.\tPASS\t.\tGT\t0/1").expect("write");
+        }
+
+        {
+            let mut score = File::create(&score_path).expect("create score");
+            writeln!(score, "variant_id\teffect_allele\tother_allele\tScoreA").expect("write");
+            writeln!(score, "8_KI270821V1_ALT:557595\tG\tA\t2.0").expect("write");
+            writeln!(score, "1:100\tG\tA\t0.5").expect("write");
+        }
+
+        let result = score_vcf_streaming(&vcf_path, &[score_path], None, None).expect("score");
+        assert_eq!(result.score_variant_counts, [1]);
+        assert_eq!(result.sum_scores, [0.5]);
+    }
+
+    #[test]
+    fn genotype_ploidy_counts_missing_and_multi_digit_alleles() {
+        assert_eq!(parse_vcf_genotype_ploidy("0|1"), Some(2));
+        assert_eq!(parse_vcf_genotype_ploidy("./."), Some(2));
+        assert_eq!(parse_vcf_genotype_ploidy("1"), Some(1));
+        assert_eq!(parse_vcf_genotype_ploidy("10/11"), Some(2));
+        assert_eq!(parse_vcf_genotype_ploidy(""), None);
+    }
 
     #[test]
     fn native_vcf_stream_scores_gt_without_conversion() {

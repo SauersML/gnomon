@@ -347,6 +347,7 @@ pub fn reformat_pgs_file(
         ea: usize,         // effect_allele is mandatory
         ew: usize,         // effect_weight is mandatory
         oa: Option<usize>, // other_allele is optional
+        variant_description: Option<usize>,
         variant_id: Option<usize>,
         hm_variant_id: Option<usize>,
         rs_id: Option<usize>,
@@ -501,6 +502,7 @@ pub fn reformat_pgs_file(
             .get("other_allele")
             .or_else(|| header_map.get("hm_inferOtherAllele"))
             .copied(),
+        variant_description: header_map.get("variant_description").copied(),
         variant_id: header_map.get("variant_id").copied(),
         hm_variant_id: header_map
             .get("hm_variant_id")
@@ -650,22 +652,30 @@ pub fn reformat_pgs_file(
         else {
             return Ok(make_skip("Missing effect_weight value".to_string()));
         };
-        let Some(oa_str) = column_indices
+        let oa_str = match column_indices
             .oa
             .and_then(|i| fields.get(i))
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
-        else {
-            return Err(ReformatError::MissingColumns {
-                path: input_path.to_path_buf(),
-                line_number,
-                line_content: line.to_string(),
-                missing_column_name: "other_allele".to_string(),
-                column_diagnostics: Some(
-                    "Score rows must provide an explicit effect_allele/other_allele pair."
-                        .to_string(),
-                ),
-            });
+        {
+            Some(value) => value.to_string(),
+            // Some catalog rows leave other_allele/hm_inferOtherAllele blank but still
+            // spell the pair out in variant_description (e.g. `1:100:G:A`). Recover it
+            // when unambiguous; a row we cannot pin down is skipped, not fatal, so one
+            // bad row does not take down a whole score file.
+            None => match column_indices
+                .variant_description
+                .and_then(|i| fields.get(i))
+                .and_then(|value| other_allele_from_variant_description(value, ea_str))
+            {
+                Some(recovered) => recovered,
+                None => {
+                    return Ok(make_skip(
+                        "Missing other_allele, and variant_description did not yield an unambiguous non-effect allele"
+                            .to_string(),
+                    ));
+                }
+            },
         };
 
         let variant_id = format!("{}:{}", key.0, key.1);
@@ -770,6 +780,9 @@ pub fn reformat_pgs_file(
     })
 }
 
+/// How many skipped-contig rows to name before collapsing the rest into a count.
+const MAX_SKIPPED_CONTIG_EXAMPLES: usize = 5;
+
 /// Sorts a gnomon-native file that is not guaranteed to be sorted.
 pub fn sort_native_file(input_path: &Path, output_path: &Path) -> Result<(), ReformatError> {
     let file = File::open(input_path)?;
@@ -807,6 +820,8 @@ pub fn sort_native_file(input_path: &Path, output_path: &Path) -> Result<(), Ref
         });
     }
 
+    let skipped_contigs: Mutex<Vec<(usize, String)>> = Mutex::new(Vec::new());
+
     let mut lines_to_sort: Vec<SortableLine> = data_lines
         .into_par_iter()
         .enumerate()
@@ -823,21 +838,51 @@ pub fn sort_native_file(input_path: &Path, output_path: &Path) -> Result<(), Ref
             let chr_str = key_parts.next().unwrap_or("");
             let pos_str = key_parts.next().unwrap_or("");
 
-            // Call the decoupled parse_key function and map its simple error to our rich error type.
-            let key = parse_key(chr_str, pos_str).map_err(|details| ReformatError::Parse {
-                path: input_path.to_path_buf(),
-                line_number,
-                line_content: line.clone(),
-                details,
+            // Harmonized catalog rows land on alt/random contigs often enough that a
+            // whole-file abort is the wrong response: no primary-assembly genotype file
+            // can match them anyway. Drop those rows and summarize them below. A
+            // malformed position, by contrast, still means a broken file.
+            let Ok(chr_num) = parse_chromosome_label(chr_str) else {
+                if let Ok(mut guard) = skipped_contigs.lock() {
+                    guard.push((line_number, chr_str.to_string()));
+                }
+                return Ok(None);
+            };
+            let pos_num: u32 = pos_str.trim().parse().map_err(|e: ParseIntError| {
+                ReformatError::Parse {
+                    path: input_path.to_path_buf(),
+                    line_number,
+                    line_content: line.clone(),
+                    details: format!("Invalid position '{pos_str}': {e}"),
+                }
             })?;
 
             Ok(Some(SortableLine {
-                key,
+                key: (chr_num, pos_num),
                 line_data: line,
             }))
         })
         .filter_map(|result| result.transpose())
         .collect::<Result<_, ReformatError>>()?;
+
+    let mut skipped_contigs = skipped_contigs.into_inner().unwrap_or_default();
+    if !skipped_contigs.is_empty() {
+        skipped_contigs.sort_unstable();
+        eprintln!(
+            "> Warning: Skipped {} row(s) in '{}' on unsupported contigs (expected 1-22, X, Y, or MT).",
+            skipped_contigs.len(),
+            input_path.display()
+        );
+        for (line_number, chr) in skipped_contigs.iter().take(MAX_SKIPPED_CONTIG_EXAMPLES) {
+            eprintln!(">   - line {line_number}: chromosome '{chr}'");
+        }
+        if skipped_contigs.len() > MAX_SKIPPED_CONTIG_EXAMPLES {
+            eprintln!(
+                ">   ... and {} more.",
+                skipped_contigs.len() - MAX_SKIPPED_CONTIG_EXAMPLES
+            );
+        }
+    }
 
     lines_to_sort.par_sort_unstable_by_key(|item| item.key);
 
@@ -1031,6 +1076,42 @@ struct SkipRecord {
     reason: String,
 }
 
+/// Recovers the non-effect allele from a PGS Catalog `variant_description` whose final
+/// two colon-separated fields are the allele pair (e.g. `1:100:G:A`).
+///
+/// Only unambiguous cases resolve: both sides must be plain nucleotide sequences, they
+/// must differ, and the effect allele must match exactly one of them.
+fn other_allele_from_variant_description(description: &str, effect_allele: &str) -> Option<String> {
+    let parts: Vec<&str> = description.trim().split(':').collect();
+    if parts.len() < 4 {
+        return None;
+    }
+
+    let is_nucleotide_sequence = |allele: &str| {
+        !allele.is_empty()
+            && allele
+                .bytes()
+                .all(|b| matches!(b.to_ascii_uppercase(), b'A' | b'C' | b'G' | b'T'))
+    };
+
+    let first = parts[parts.len() - 2].trim();
+    let second = parts[parts.len() - 1].trim();
+    if !is_nucleotide_sequence(first)
+        || !is_nucleotide_sequence(second)
+        || first.eq_ignore_ascii_case(second)
+    {
+        return None;
+    }
+
+    if effect_allele.eq_ignore_ascii_case(first) {
+        Some(second.to_string())
+    } else if effect_allele.eq_ignore_ascii_case(second) {
+        Some(first.to_string())
+    } else {
+        None
+    }
+}
+
 fn parse_key(chr_str: &str, pos_str: &str) -> Result<(u8, u32), String> {
     let chr_num = parse_chromosome_label(chr_str)?;
     let pos_num: u32 = pos_str
@@ -1100,5 +1181,102 @@ chr_name\tchr_position\teffect_allele\tother_allele\tdosage_0_weight\tdosage_1_w
         assert_eq!(lines[2], "1:100\tG\tA\t0.1");
         assert_eq!(lines[3], "1:200\tA\tG\t0.2");
         assert_eq!(lines.len(), 4);
+    }
+
+    #[test]
+    fn sort_native_file_skips_unsupported_contigs() {
+        let tmp = tempdir().expect("tempdir");
+        let input_path = tmp.path().join("scores.gnomon.tsv");
+        let output_path = tmp.path().join("scores.sorted.gnomon.tsv");
+
+        let mut input = File::create(&input_path).expect("create input");
+        writeln!(
+            input,
+            "variant_id\teffect_allele\tother_allele\tSCORE\n\
+8_KI270821V1_ALT:557595\tA\tG\t0.3\n\
+1:200\tA\tG\t0.2\n\
+UN_KI270742V1:130471\tC\tT\t0.4\n\
+1:100\tG\tA\t0.1"
+        )
+        .expect("write input");
+
+        sort_native_file(&input_path, &output_path).expect("sort native file");
+        let sorted = fs::read_to_string(&output_path).expect("read sorted output");
+        let lines: Vec<_> = sorted.lines().collect();
+
+        assert_eq!(lines[0], "variant_id\teffect_allele\tother_allele\tSCORE");
+        assert_eq!(lines[1], "1:100\tG\tA\t0.1");
+        assert_eq!(lines[2], "1:200\tA\tG\t0.2");
+        assert_eq!(lines.len(), 3);
+    }
+
+    #[test]
+    fn sort_native_file_still_rejects_malformed_positions() {
+        let tmp = tempdir().expect("tempdir");
+        let input_path = tmp.path().join("scores.gnomon.tsv");
+        let output_path = tmp.path().join("scores.sorted.gnomon.tsv");
+
+        let mut input = File::create(&input_path).expect("create input");
+        writeln!(
+            input,
+            "variant_id\teffect_allele\tother_allele\tSCORE\n1:not_a_position\tA\tG\t0.2"
+        )
+        .expect("write input");
+
+        assert!(sort_native_file(&input_path, &output_path).is_err());
+    }
+
+    #[test]
+    fn other_allele_is_recovered_from_variant_description() {
+        assert_eq!(
+            other_allele_from_variant_description("1:100:G:A", "A").as_deref(),
+            Some("G")
+        );
+        assert_eq!(
+            other_allele_from_variant_description("chr1:100:G:A", "G").as_deref(),
+            Some("A")
+        );
+        // Effect allele matches neither side, so the pairing is not recoverable.
+        assert_eq!(
+            other_allele_from_variant_description("1:100:G:A", "T"),
+            None
+        );
+        // Not enough fields, and non-nucleotide alleles, stay unresolved.
+        assert_eq!(other_allele_from_variant_description("1:100", "A"), None);
+        assert_eq!(
+            other_allele_from_variant_description("1:100:N:A", "A"),
+            None
+        );
+    }
+
+    #[test]
+    fn reformat_recovers_other_allele_from_variant_description() {
+        let tmp = tempdir().expect("tempdir");
+        let input_path = tmp.path().join("PGS_DESC.txt");
+        let output_path = tmp.path().join("PGS_DESC.gnomon.tsv");
+
+        let mut input = File::create(&input_path).expect("create input");
+        writeln!(
+            input,
+            "###PGS CATALOG SCORING FILE - test\n\
+#format_version=2.0\n\
+#pgs_id=PGS_DESC\n\
+#genome_build=GRCh38\n\
+#HmPOS_build=GRCh38\n\
+chr_name\tchr_position\teffect_allele\tother_allele\tvariant_description\teffect_weight\n\
+1\t100\tA\t\t1:100:G:A\t0.5\n\
+1\t200\tT\t\tno_alleles_here\t0.7"
+        )
+        .expect("write input");
+
+        let outcome = reformat_pgs_file(&input_path, &output_path).expect("reformat outcome");
+        assert!(outcome.wrote_output, "recoverable row should be written");
+
+        let written = fs::read_to_string(&output_path).expect("read output");
+        let lines: Vec<_> = written.lines().collect();
+        assert_eq!(lines[lines.len() - 1], "1:100\tA\tG\t0.5");
+
+        let summary = outcome.skip_summary.expect("unrecoverable row is skipped");
+        assert_eq!(summary.skipped_count, 1);
     }
 }
