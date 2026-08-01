@@ -134,8 +134,8 @@ marker counts, not raw SNP counts:
   "subgroup_size": 1000,
   "fitted_pcs": 40,
   "marker_classes": [
-    {"name": "common", "effective_markers": 100000, "differentiation": 0.0001, "theoretical_pc_rank": 12},
-    {"name": "rare", "effective_markers": 1000000, "differentiation": 0.001, "theoretical_pc_rank": 3}
+    {"name": "common", "effective_independent_markers": 100000, "differentiation": 0.0001, "theoretical_pc_rank": 12},
+    {"name": "rare", "effective_independent_markers": 1000000, "differentiation": 0.001, "theoretical_pc_rank": 3}
   ],
   "application": {
     "susceptibility": 0.00001,
