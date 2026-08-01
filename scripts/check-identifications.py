@@ -20,7 +20,7 @@ import re, sys, glob, os
 ROOT = os.path.join(os.path.dirname(__file__), "..", "proofs")
 
 SORRY_LEDGER = set()                # name -> undischarged obligation, none yet
-CONVENTION_SITE_BUDGET = 79        # measured; may decrease, never increase
+CONVENTION_SITE_BUDGET = 77        # measured; may decrease, never increase
 ISOLATED_MODULE_BUDGET = 19         # modules no theorem cross-relates to another
 UNDECLARED_BUDGET = 0               # empirical defs with no status marker
 UNRELATED_BUDGET = 69               # measured; ratchets down as siblings get related
