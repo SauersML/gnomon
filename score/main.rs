@@ -1052,12 +1052,19 @@ fn resolve_filesets(path: &Path) -> Result<Vec<PathBuf>, Box<dyn Error + Send + 
         // last dot segment would look for `acaf_threshold.bed`.
         let prefix = fileset_prefix(path);
 
+        // APPEND the member extension; never `with_extension`, which REPLACES the
+        // last dot segment. The comment above is right that `acaf_threshold.chr22`
+        // carries a dot of its own -- and `with_extension("pgen")` on it yields
+        // `acaf_threshold.pgen`, precisely the file the comment warns against
+        // looking for. Every All of Us per-chromosome fileset has this shape, so
+        // scoring one exits in under a second with "does not correspond to a
+        // complete PLINK fileset" while all three members are sitting right there.
         let has_bed = ["bed", "bim", "fam"]
             .iter()
-            .all(|ext| prefix.with_extension(ext).is_file());
+            .all(|ext| fileset_member(&prefix, ext).is_file());
         let has_pgen = ["pgen", "pvar", "psam"]
             .iter()
-            .all(|ext| prefix.with_extension(ext).is_file());
+            .all(|ext| fileset_member(&prefix, ext).is_file());
         if !has_bed && !has_pgen {
             return Err(format!(
                 "Input prefix '{}' does not correspond to a complete PLINK fileset \
@@ -1098,7 +1105,9 @@ fn resolve_filesets(path: &Path) -> Result<Vec<PathBuf>, Box<dyn Error + Send + 
     };
     for bed_path in bed_files {
         let prefix = fileset_prefix(&bed_path);
-        if !prefix.with_extension(meta_a).is_file() || !prefix.with_extension(meta_b).is_file() {
+        if !fileset_member(&prefix, meta_a).is_file()
+            || !fileset_member(&prefix, meta_b).is_file()
+        {
             return Err(format!(
                 "Incomplete fileset for prefix '{}'. Every .{genotype_ext} file in a directory must have corresponding .{meta_a} and .{meta_b} files.",
                 prefix.display()
@@ -1111,6 +1120,18 @@ fn resolve_filesets(path: &Path) -> Result<Vec<PathBuf>, Box<dyn Error + Send + 
 }
 
 /// Drops a trailing fileset extension, leaving the prefix its members share.
+/// `prefix` + `.ext`, by APPENDING. Never `Path::with_extension`, which REPLACES
+/// the last dot segment: a per-chromosome fileset prefix such as
+/// `acaf_threshold.chr22` would become `acaf_threshold.pgen` and the fileset
+/// would be reported missing while all three members sit on disk. Every All of
+/// Us callset has that shape.
+fn fileset_member(prefix: &Path, ext: &str) -> PathBuf {
+    let mut s = prefix.to_path_buf().into_os_string();
+    s.push(".");
+    s.push(ext);
+    PathBuf::from(s)
+}
+
 fn fileset_prefix(path: &Path) -> PathBuf {
     match path.to_str() {
         Some(s) => PathBuf::from(gnomon::score::prepare::strip_fileset_extension(s)),
