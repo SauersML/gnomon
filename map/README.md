@@ -158,3 +158,14 @@ frequency weights and total information `sum M_c F_c^2`. These are model-based
 design quantities: linkage, uncertainty in `F_c`, or violation of the rank-one
 spike model must be reflected in the effective marker counts or external error
 bounds rather than hidden by the calculator.
+
+The corresponding Lean proof graph can be checked on MSI without rebuilding
+the full `Calibrator` library:
+
+```bash
+sbatch scripts/msi-pc-proof-fast.sbatch
+```
+
+Pass a leaf target such as `Calibrator.PCCorrectability.Phase` while iterating.
+The job deliberately preserves Lake's incremental state; using `lake -R` here
+forces a project-wide replay and defeats the fast path.
