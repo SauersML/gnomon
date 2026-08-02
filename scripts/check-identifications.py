@@ -542,13 +542,47 @@ def main() -> int:
     #     must therefore name its regime, so that a reader and a use site both see
     #     which data-generating process it assumes. `Calibrator.DriftRegime`
     #     exhibits the two regimes and proves they disagree at every positive time.
+    #     The screen this replaces could not fire. It walked the signature with
+    #     `[^:]*:[^:=]*:=`, which stops at the first colon inside a binder and
+    #     cannot cross the colon of the return type, so it matched only
+    #     definitions taking NO arguments -- of which the corpus has effectively
+    #     none. Measured on three shapes: `def f (Ne : ℝ) (t : ℕ) : ℝ :=` missed,
+    #     `def f (Ne : ℝ) : ℝ :=` missed, `def f : ℝ :=` matched. It had been
+    #     printing a passing zero all along, which is worse than no screen,
+    #     because a vacuous guard fills the hole with a false reassurance and
+    #     stops anyone looking. That is the same failure this file exists to
+    #     catch -- a check that could not have failed, passing -- and finding it
+    #     on the REGIME screen is the sharpest possible instance, since regime
+    #     declarations are exactly the modelling choices being made explicit.
+    #
+    #     The body is now located by the depth-aware separator scan used by the
+    #     under-delivery screen, which handles binders. On repair the screen
+    #     found three live sites carrying the falsified closed-population
+    #     retention with no Regime declared -- `neutralDriftFactor`,
+    #     `ldRetainedFraction`, `fstDerived` -- one leak with three outlets
+    #     rather than three omissions. All three now declare it.
+    def def_body(rest):
+        """Text after the definition's `:=`, at paren depth zero, so a colon or
+        a default value inside a binder is not mistaken for the separator."""
+        depth = 0
+        for i, ch in enumerate(rest):
+            if ch in "([{⟨":
+                depth += 1
+            elif ch in ")]}⟩":
+                depth -= 1
+            elif depth == 0 and rest[i:i + 2] == ":=":
+                return rest[i + 2:]
+        return ""
+
     regimeless = []
     for f in lean_files():
         raw = open(f).read()
         for m in re.finditer(r"/--((?:(?!-/).)*)-/\s*\n(?:noncomputable )?def "
-                             r"([A-Za-z_0-9'.]+)[^:]*:[^:=]*:=((?:(?!\n/--|\ntheorem|\nend ).)*)",
-                             raw, re.S):
-            doc, name, body = m.group(1), m.group(2).split(".")[-1], m.group(3)
+                             r"([A-Za-z_0-9'.]+)"
+                             r"((?:(?!\n/--|\n@\[|\ntheorem |\nnoncomputable |\ndef |\nabbrev |"
+                             r"\nstructure |\nsection |\nend |\nnamespace ).)*)", raw, re.S):
+            doc, name = m.group(1), m.group(2).split(".")[-1]
+            body = def_body(m.group(3))
             # the closed-population retention factor, raised to a power
             if re.search(r"\(\s*1\s*-\s*1\s*/\s*\(\s*2\s*\*[^)]*\)\s*\)\s*\^", body):
                 if "Regime:" not in doc:
