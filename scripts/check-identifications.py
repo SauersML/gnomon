@@ -46,15 +46,7 @@ import re, sys, glob, os
 
 ROOT = os.path.join(os.path.dirname(__file__), "..", "proofs")
 
-SORRY_LEDGER = {
-    # The detection/reconstruction frontier (ProjectionShiftBounds,
-    # MetricSpecificPortability). Three debts, each a standard computation with
-    # no genetic content; the biology-facing results do not depend on any of
-    # them.
-    "exists_threshold_set",                   # sort a finite family of reals, cut at rank k
-    "ldBandDetectionShare_eq_integral",       # ∫₀ᵃ (1 - 2ρ cos θ + ρ²) dθ = (1+ρ²)a - 2ρ sin a
-    "ldBandReconstructionShare_eq_integral",  # Poisson-kernel harmonic measure, arctan form
-}
+SORRY_LEDGER = set()                # name -> undischarged obligation, none yet
 CONVENTION_SITE_BUDGET = 0        # measured; may decrease, never increase
 ISOLATED_MODULE_BUDGET = 14         # modules no theorem cross-relates to another
 UNDECLARED_BUDGET = 0               # empirical defs with no status marker
@@ -66,6 +58,7 @@ OVERCLAIM_BUDGET = 0                # untested definitions whose docstring claim
 EQUILIBRIUM_BUDGET = 0              # equilibria stipulated as a closed form, never derived
 DUPLICATE_BODY_BUDGET = 0           # one body under two names in two files, tied by nothing
 REGIME_DECL_BUDGET = 0              # drift regimes baked into a body instead of a hypothesis
+UNDERDELIVERY_BUDGET = 0            # docstring attributes an identity the signature does not prove
 INHERITED_VALIDATION_BUDGET = None  # VALIDATED inherited from a sibling identity; pin on first run
 VACUOUS_VALIDATION_BUDGET = None    # VALIDATED with no recorded power; pin on first run
 
@@ -544,6 +537,128 @@ def main() -> int:
                    f"{len(regimeless)}, budget {REGIME_DECL_BUDGET}; name the "
                    f"data-generating assumption, see Calibrator.DriftRegime")
         bad.extend("    " + x for x in regimeless[:12])
+
+    # 3j-bis. Under-delivery: a docstring claiming more than the signature
+    #     proves. This is the mirror of the overclaim screen. That one catches a
+    #     docstring claiming more than the *evidence* supports; this one catches
+    #     a docstring claiming more than the *statement* delivers.
+    #
+    #     `missing_heritability_gap` asserted in prose "We prove that
+    #     h2_twin - h2_SNP = V_A_untagged / V_P > 0" above a conclusion that was
+    #     only `0 < h2_twin - h2_snp`. The theorem was true, the proof was
+    #     correct, and the compiler cannot see the gap, because the defect is in
+    #     the documentation of a correct theorem. It matters because people read
+    #     prose: a reader who takes the docstring at its word believes an
+    #     identity is available that no downstream proof can actually cite.
+    #
+    #     One principle: fire when a docstring ATTRIBUTES A DISPLAYED EQUATION TO
+    #     THIS DECLARATION and the declaration's conclusion contains no equation.
+    #     Everything else a docstring does with an `=` is legitimate -- setting up
+    #     a model, recalling a definition, running a chain of algebra whose net
+    #     claim is an inequality -- and the screen is written to under-fire rather
+    #     than to catch those. Measured over the corpus before the budget was set:
+    #     a looser first version reported fifteen sites, every one of which was a
+    #     false positive on inspection.
+    DISPLAYED_EQ = re.compile(r"(?<![:<>!≤≥≠])\s=\s")
+    COMPARATOR = re.compile(r"[<>≤≥≠⟺]")
+    # A passage labelled as the proof strategy describes intermediate steps, not
+    # what the declaration establishes.
+    STRATEGY = re.compile(r"^[\s*_]*(?:proof\s+strategy|proof\s+sketch|proof|"
+                          r"strategy|sketch|derivation|key\s+identity)\s*:", re.I)
+    # `derive` is deliberately absent from the verbs: deriving describes how a
+    # model was set up and fires on every docstring that recalls its own
+    # definitions. The exactness words exclude their non-identity uses -- "is
+    # exactly the point", "is exactly where", "is exactly one", "is exactly
+    # optimal" -- each of which was a false positive in the measured run.
+    ATTRIBUTION = [
+        r"\bwe\s+(?:prove|show|establish)\s+that\b",
+        r"\bthis\s+(?:proves|shows|establishes)\s+that\b",
+        r"\bis\s+(?:exactly|precisely)\b"
+        r"(?!\s+(?:the\s+point|where|when|how|why|what|which|one|two|three|"
+        r"optimal|minimal|maximal|because)\b)",
+        r"\bequals\s+exactly\b",
+    ]
+    OPENB, CLOSEB = "([{⟨", ")]}⟩"
+
+    def header_of(block):
+        """The declaration header: everything before the proof separator."""
+        m = re.search(r":=\s*by\b", block)
+        if m:
+            return block[:m.start()]
+        lines = block.split("\n")
+        out = [lines[0]]
+        for ln in lines[1:]:
+            if ln.strip() == "" or re.match(r"^ {4,}\S", ln):
+                out.append(ln)
+            else:
+                break
+        txt = "\n".join(out)
+        i = txt.rfind(":=")
+        return txt[:i] if i != -1 else txt
+
+    def goal_of(header):
+        """Everything after the last top-level `:`: the goal without binders.
+
+        Hypotheses carry equalities routinely, so the goal has to be separated
+        from them or every conditional theorem looks like it proves an identity.
+        A `:=` inside a `let` in the goal is not a binder colon."""
+        depth, pos = 0, -1
+        for i, ch in enumerate(header):
+            if ch in OPENB:
+                depth += 1
+            elif ch in CLOSEB:
+                depth -= 1
+            elif ch == ":" and depth == 0 and header[i:i + 2] != ":=":
+                pos = i
+        return header[pos + 1:] if pos >= 0 else header
+
+    def delivers_identity(goal):
+        """An `↔` counts: a characterisation delivered as an iff is equality of
+        propositions, not a one-sided bound."""
+        if "↔" in goal or "⟺" in goal:
+            return True
+        return re.search(r"(?<![:<>!])=(?!=)", goal) is not None
+
+    def attributed_identity(doc):
+        for s in re.split(r"(?<=\.)\s+", doc):
+            if STRATEGY.match(s.strip()):
+                continue
+            eq = DISPLAYED_EQ.search(s)
+            if not eq:
+                continue
+            # A comparator standing before the equation means the sentence is a
+            # chain whose net claim is the inequality, not the equation:
+            # "We show MSE(l*) < MSE(1) = sigma^2" claims a bound.
+            if COMPARATOR.search(s[:eq.start()]):
+                continue
+            if any(re.search(p, s, re.I) for p in ATTRIBUTION):
+                return " ".join(s.split())[:120]
+        return None
+
+    underdelivered = []
+    for f in lean_files():
+        raw = open(f).read()
+        for m in re.finditer(
+                r"/--((?:(?!-/).)*)-/\s*\n(?:@\[[^\]]*\]\s*\n)?(?:private )?theorem\s+"
+                r"([A-Za-z_0-9'.]+)", raw, re.S):
+            doc, name = m.group(1), m.group(2).split(".")[-1]
+            block = raw[m.end(2):]
+            nxt = re.search(r"\n(?=/--|@\[|theorem |noncomputable |def |abbrev |"
+                            r"structure |section |end |namespace )", block)
+            block = block[:nxt.start()] if nxt else block
+            if delivers_identity(goal_of(header_of(block))):
+                continue
+            claim = attributed_identity(doc)
+            if claim:
+                underdelivered.append(
+                    f"{os.path.relpath(f, ROOT)}:{raw[:m.start()].count(chr(10)) + 1}: "
+                    f"`{name}` claims an identity its conclusion does not state: "
+                    f"\"{claim}\"")
+    if len(underdelivered) > UNDERDELIVERY_BUDGET:
+        bad.append(f"docstrings attributing an identity the statement does not deliver: "
+                   f"{len(underdelivered)}, budget {UNDERDELIVERY_BUDGET}; state the "
+                   f"identity in the conclusion, or stop claiming it in the prose")
+        bad.extend("    " + x for x in underdelivered[:12])
 
     # 3k. Validation inherited from a sibling identity. Over-determination
     #     detects divergence between independently written formulas and is
