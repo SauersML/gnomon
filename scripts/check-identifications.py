@@ -386,6 +386,18 @@ def main() -> int:
         return {0} | {i for i in range(1, len(name))
                       if name[i - 1] in "_'" or name[i].isupper() or name[i].isdigit()}
 
+    def is_prop_shaped(sig, body):
+        """Prop-valued by shape, not by name.
+
+        Either the declared return type is `Prop`, or -- for a definition that
+        leaves the type to inference -- the body is a proposition rather than a
+        value: quantified, or an iff. A value-returning definition never starts
+        its body with a quantifier."""
+        if re.search(r":\s*Prop\s*$", sig.strip()):
+            return True
+        b = body.strip()
+        return b.startswith("∀") or b.startswith("∃") or "↔" in b.split("\n")[0]
+
     def names_an_equilibrium(short):
         low, starts = short.lower(), word_starts(short)
         return any(m.start() in starts
@@ -396,13 +408,14 @@ def main() -> int:
     for f in lean_files():
         src = strip_comments(open(f).read())
         rel = os.path.relpath(f, ROOT)
-        defs, bodies_here = [], {}
+        defs, bodies_here, sigs_here = [], {}, {}
         for m in re.finditer(r"^(?:noncomputable )?def ([A-Za-z_0-9'.]+)(.*?)(?=\n(?:@\[|theorem |"
                              r"noncomputable |def |abbrev |structure |section |end |namespace |/-))",
                              src, re.S | re.M):
             short = m.group(1).split(".")[-1]
             defs.append((short, src[:m.start()].count("\n") + 1))
             bodies_here[short] = m.group(2).split(":=", 1)[-1]
+            sigs_here[short] = m.group(2).split(":=", 1)[0]
         theorems = [(t.group(1).split(".")[-1], t.group(0).split(":=", 1)[0])
                     for t in re.finditer(r"^(?:@\[[^\]]*\]\s*\n)?(?:private )?theorem "
                                          r"([A-Za-z_0-9'.]+)(?:.*?)(?=\n(?:@\[|theorem |"
@@ -411,6 +424,16 @@ def main() -> int:
         allnames = {n for n, _ in defs}
         for short, line in defs:
             if not names_an_equilibrium(short):
+                continue
+            # A Prop-valued definition has no value to be a fixed point of. The
+            # obligation this screen enforces -- exhibit the one-step map and
+            # prove the quantity is its rest point -- is meaningful for a
+            # stipulated constant and meaningless for a predicate: `∀ x,
+            # jointGenotypeProb x = ∏ ...` states that a law factorises, and
+            # there is no map iterating it. Exempting by shape rather than by a
+            # name list matters, because a list is a place a genuinely
+            # stipulated equilibrium could be parked to make the screen quiet.
+            if is_prop_shaped(sigs_here.get(short, ""), bodies_here.get(short, "")):
                 continue
             # A quantity derived from an equilibrium is not itself stipulated:
             # the obligation to derive belongs to the definition it calls.
