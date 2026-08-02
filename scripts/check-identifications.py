@@ -23,7 +23,7 @@ SORRY_LEDGER = set()                # name -> undischarged obligation, none yet
 CONVENTION_SITE_BUDGET = 0        # measured; may decrease, never increase
 ISOLATED_MODULE_BUDGET = 14         # modules no theorem cross-relates to another
 UNDECLARED_BUDGET = 0               # empirical defs with no status marker
-UNRELATED_BUDGET = 34               # ratchets down
+UNRELATED_BUDGET = 20               # ratchets down
 MISSING_ARG_BUDGET = 0              # signatures omitting a dependency of the named quantity
 CONFLATION_BUDGET = 0               # one formula under names from different concept families
 CONVENTION_DECL_BUDGET = 0          # composable quantities with no declared convention
@@ -164,15 +164,30 @@ def main() -> int:
                           strip_comments(open(f).read())):
             if re.match(r"(?:@\[simp\]\s*)?(?:private )?theorem ", b) and ":=" in b:
                 all_stmts.append(b.split(":=", 1)[0])
+    # A definition tied to a shared primitive in Conventions is related in the
+    # stronger sense: its whole group is pinned to one object rather than to
+    # each other pairwise. Credit that, or the metric penalises exactly the
+    # refactor it exists to encourage.
+    primitives = set()
+    for f in lean_files():
+        if not f.endswith("Conventions.lean"):
+            continue
+        for m in re.finditer(r"^(?:noncomputable )?def ([A-Za-z_0-9'.]+)",
+                             strip_comments(open(f).read()), re.M):
+            primitives.add(m.group(1).split(".")[-1])
+
     unrelated = 0
     for norm, members in groups.items():
         if len({m for m, _ in members}) < 2:
             continue
         names = [n for _, n in members]
         for n in names:
-            if not any(re.search(r"\b" + re.escape(n) + r"\b", st) and
-                       any(re.search(r"\b" + re.escape(o) + r"\b", st) for o in names if o != n)
-                       for st in all_stmts):
+            tied = any(
+                re.search(r"\b" + re.escape(n) + r"\b", st) and
+                (any(re.search(r"\b" + re.escape(o) + r"\b", st) for o in names if o != n) or
+                 any(re.search(r"\b" + re.escape(pr) + r"\b", st) for pr in primitives))
+                for st in all_stmts)
+            if not tied:
                 unrelated += 1
     if unrelated > UNRELATED_BUDGET:
         bad.append(f"same-quantity definitions never related to a sibling by any theorem: "
