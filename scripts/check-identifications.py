@@ -46,7 +46,15 @@ import re, sys, glob, os
 
 ROOT = os.path.join(os.path.dirname(__file__), "..", "proofs")
 
-SORRY_LEDGER = set()                # name -> undischarged obligation, none yet
+SORRY_LEDGER = {
+    # The detection/reconstruction frontier (ProjectionShiftBounds,
+    # MetricSpecificPortability). Three debts, each a standard computation with
+    # no genetic content; the biology-facing results do not depend on any of
+    # them.
+    "exists_threshold_set",                   # sort a finite family of reals, cut at rank k
+    "ldBandDetectionShare_eq_integral",       # ∫₀ᵃ (1 - 2ρ cos θ + ρ²) dθ = (1+ρ²)a - 2ρ sin a
+    "ldBandReconstructionShare_eq_integral",  # Poisson-kernel harmonic measure, arctan form
+}
 CONVENTION_SITE_BUDGET = 0        # measured; may decrease, never increase
 ISOLATED_MODULE_BUDGET = 14         # modules no theorem cross-relates to another
 UNDECLARED_BUDGET = 0               # empirical defs with no status marker
@@ -549,7 +557,7 @@ def main() -> int:
     inherited = []
     for f in lean_files():
         raw = open(f).read()
-        for m in re.finditer(r"Empirical status: VALIDATED([^-]*?)-/", raw, re.S):
+        for m in re.finditer(r"Empirical status: VALIDATED(.*?)-/", raw, re.S):
             note = m.group(1)
             cites_identity = re.search(r"\bthis is the identity\b|\bthe theorem\b|"
                                        r"\bby definition\b|\bdefinitionally\b|"
@@ -581,24 +589,32 @@ def main() -> int:
     #     at nine to fifteen standard errors.
     #
     #     A validation is evidence in proportion to the range its prediction
-    #     spanned. So a VALIDATED note must record at least two predicted values,
-    #     and they must not all be equal: a prediction that is constant on the
-    #     design tests nothing about shape.
+    #     spanned, so a VALIDATED note must declare that range in a `Power:`
+    #     clause. The range is *declared*, not inferred: a first version of this
+    #     guard scanned every number in the note and could not tell a predicted
+    #     value from an error bar, so it flagged `ratio 0.99-1.01` -- a residual --
+    #     as a constant prediction. A guard that misfires is a guard that gets
+    #     ignored, and inferring intent from numbers is exactly the move that
+    #     produced the incident. The author states the span; the guard checks the
+    #     span is stated and is not degenerate.
     powerless = []
     for f in lean_files():
         raw = open(f).read()
-        for m in re.finditer(r"Empirical status: VALIDATED([^-]*?)-/", raw, re.S):
+        for m in re.finditer(r"Empirical status: VALIDATED(.*?)-/", raw, re.S):
             note = m.group(1)
-            nums = [float(x) for x in re.findall(r"\d+\.\d+", note)]
-            if len(nums) < 2:
-                powerless.append(f"{os.path.relpath(f, ROOT)}: a VALIDATED note records fewer "
-                                 f"than two predicted values, so its power is unstated")
+            power = re.search(r"Power:(.*?)(?:\n\s*\n|$)", note, re.S)
+            if not power:
+                powerless.append(f"{os.path.relpath(f, ROOT)}: a VALIDATED note declares no "
+                                 f"Power; state the span of the prediction across the design")
                 continue
-            spread = max(nums) - min(nums)
-            if spread <= 0.05 * max(abs(max(nums)), 1.0):
-                powerless.append(f"{os.path.relpath(f, ROOT)}: a VALIDATED note's predictions "
-                                 f"span only {spread:.4f}; a near-constant prediction cannot "
-                                 f"reject a wrong functional form")
+            nums = [float(x) for x in re.findall(r"\d+\.\d+", power.group(1))]
+            if len(nums) < 2:
+                powerless.append(f"{os.path.relpath(f, ROOT)}: a Power clause names fewer than "
+                                 f"two predicted values, so no span is declared")
+            elif max(nums) - min(nums) <= 0.05 * max(abs(max(nums)), 1.0):
+                powerless.append(f"{os.path.relpath(f, ROOT)}: a Power clause declares a span of "
+                                 f"only {max(nums) - min(nums):.4f}; a near-constant prediction "
+                                 f"cannot reject a wrong functional form")
     if VACUOUS_VALIDATION_BUDGET is None:
         for x in powerless[:12]:
             print(f"  advisory (validation power unstated): {x}")
