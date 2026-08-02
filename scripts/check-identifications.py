@@ -14,6 +14,14 @@ Guards, in order of what they catch:
    a definition is a restatement of a ploidy or coalescent-scaling convention.
    The count is pinned; adding new inline restatements without relating them
    to `ploidy` in Conventions.lean fails, so the number can only go down.
+
+4. Equilibria with no dynamic. A definition named for a rest point or a limit
+   must be derived as the fixed point of a process defined in the same file,
+   not stipulated as a closed form that no theorem can contradict.
+
+5. Duplicate bodies across files. Two definitions in different modules whose
+   bodies are alpha-equivalent are one quantity written twice; unless one calls
+   the other or a theorem equates them, fixing one leaves the other wrong.
 """
 import re, sys, glob, os
 
@@ -28,6 +36,8 @@ MISSING_ARG_BUDGET = 0              # signatures omitting a dependency of the na
 CONFLATION_BUDGET = 0               # one formula under names from different concept families
 CONVENTION_DECL_BUDGET = 0          # composable quantities with no declared convention
 OVERCLAIM_BUDGET = 0                # untested definitions whose docstring claims exactness             # measured; ratchets down as siblings get related
+EQUILIBRIUM_BUDGET = 0              # equilibria stipulated as a closed form, never derived
+DUPLICATE_BODY_BUDGET = 0           # one body under two names in two files, tied by nothing
 
 def strip_comments(src: str) -> str:
     """Remove Lean block and line comments so prose cannot trip the guards."""
@@ -332,6 +342,145 @@ def main() -> int:
         bad.extend("    " + x for x in conflated[:8])
 
 
+    # 3h. Equilibrium without a dynamic. `selectionMigrationEquilibrium s m =
+    #     s / (s + m)` was a stipulated closed form, wrong by 4 to 14x and
+    #     qualitatively wrong where the allele is lost, yet every theorem about
+    #     it was true: value-guards bound a quantity into (0,1) and order it the
+    #     right ways, and none of that can pin a constant. Only the process the
+    #     equilibrium is an equilibrium *of* can. So a definition named for a
+    #     limit or a rest point owes a theorem identifying it as the fixed point
+    #     of some other definition in the same file, in the shape of
+    #     `selectionMigrationEquilibrium_isFixedPoint`.
+    EQUILIBRIUM_CONCEPTS = ("equilibrium", "fixedpoint", "steadystate", "stationary",
+                            "limiting", "asymptotic", "balance", "equilibriumfreq")
+    FIXEDPOINT_MARKERS = ("isFixedPoint", "_fixedPoint", "_isLimit", "_tendsto")
+
+    def word_starts(name):
+        """Offsets at which a camelCase or underscore-separated word begins.
+
+        Substring matching alone reads `globalAncestry` as containing
+        `balance`, so a concept counts only where a word does."""
+        return {0} | {i for i in range(1, len(name))
+                      if name[i - 1] in "_'" or name[i].isupper() or name[i].isdigit()}
+
+    def names_an_equilibrium(short):
+        low, starts = short.lower(), word_starts(short)
+        return any(m.start() in starts
+                   for c in EQUILIBRIUM_CONCEPTS
+                   for m in re.finditer(re.escape(c), low))
+
+    stipulated = []
+    for f in lean_files():
+        src = strip_comments(open(f).read())
+        rel = os.path.relpath(f, ROOT)
+        defs, bodies_here = [], {}
+        for m in re.finditer(r"^(?:noncomputable )?def ([A-Za-z_0-9'.]+)(.*?)(?=\n(?:@\[|theorem |"
+                             r"noncomputable |def |abbrev |structure |section |end |namespace |/-))",
+                             src, re.S | re.M):
+            short = m.group(1).split(".")[-1]
+            defs.append((short, src[:m.start()].count("\n") + 1))
+            bodies_here[short] = m.group(2).split(":=", 1)[-1]
+        theorems = [(t.group(1).split(".")[-1], t.group(0).split(":=", 1)[0])
+                    for t in re.finditer(r"^(?:@\[[^\]]*\]\s*\n)?(?:private )?theorem "
+                                         r"([A-Za-z_0-9'.]+)(?:.*?)(?=\n(?:@\[|theorem |"
+                                         r"noncomputable |def |abbrev |structure |section |end |"
+                                         r"namespace |/-))", src, re.S | re.M)]
+        allnames = {n for n, _ in defs}
+        for short, line in defs:
+            if not names_an_equilibrium(short):
+                continue
+            # A quantity derived from an equilibrium is not itself stipulated:
+            # the obligation to derive belongs to the definition it calls.
+            body = bodies_here.get(short, "")
+            if any(o != short and names_an_equilibrium(o) and
+                   re.search(r"\b" + re.escape(o) + r"\b", body) for o in allnames):
+                continue
+            ok = False
+            for tname, stmt in theorems:
+                if not tname.startswith(short) or not any(k in tname for k in FIXEDPOINT_MARKERS):
+                    continue
+                if any(o != short and re.search(r"\b" + re.escape(o) + r"\b", stmt)
+                       for o in allnames):
+                    ok = True
+                    break
+            if not ok:
+                stipulated.append(f"{rel}:{line}  {short}  (no fixed-point theorem)")
+    if len(stipulated) > EQUILIBRIUM_BUDGET:
+        bad.append(f"equilibrium definitions with no theorem deriving them as the fixed point "
+                   f"of a process in the same file: {len(stipulated)}, budget {EQUILIBRIUM_BUDGET}; "
+                   f"define the one-step map and prove `<name>_isFixedPoint`")
+        bad.extend("    " + x for x in stipulated[:12])
+
+    # 3i. One body, two files. `t / (t + 2 Ne)`, `1 - (1 - 1/(2 Ne)) ^ t` and
+    #     `1 - exp (-tau)` were three definitions of F_ST living in three
+    #     modules, and two of them were wrong; repairing one left the other two
+    #     standing, because nothing in the corpus said they were the same
+    #     quantity. Alpha-equivalent bodies in different files are either one
+    #     quantity, and one of them should call the other, or they are two
+    #     quantities that happen to coincide, and a theorem should say so.
+    dupdef = re.compile(r"^(?:noncomputable )?def ([A-Za-z_0-9'.]+)(.*?):=\s*\n?\s*(.+?)"
+                        r"(?=\n(?:@\[|theorem |noncomputable |def |abbrev |structure |section |"
+                        r"end |namespace |/-))", re.S | re.M)
+    IDENT = r"[A-Za-z_][A-Za-z_0-9₀-₉']*"
+
+    def alpha_normal(args, body):
+        """Body with whitespace collapsed and binders renamed positionally.
+
+        Renaming is by order of first use in the body, not by order of
+        declaration, so `(m Ne)` and `(Ne m)` over the same formula normalise
+        together."""
+        bound, seen = set(re.findall(IDENT, args)), {}
+        def rename(t):
+            w = t.group(0)
+            if w in bound:
+                seen.setdefault(w, "V%d" % (len(seen) + 1))
+                return seen[w]
+            return w
+        return re.sub(IDENT, rename, " ".join(body.split()))
+
+    shapes = {}
+    for f in lean_files():
+        src = strip_comments(open(f).read())
+        rel = os.path.relpath(f, ROOT)
+        for m in dupdef.finditer(src):
+            name, args, body = m.group(1).split(".")[-1], m.group(2), m.group(3)
+            norm = alpha_normal(args, body)
+            # Pure operator shape is not a shared quantity: `a + b` coincides
+            # everywhere. Require a constant or a named function, as 3c does.
+            if not re.search(r"[0-9]|[A-Za-z_]{3,}", re.sub(r"\bV[0-9]+\b", "", norm)):
+                continue
+            shapes.setdefault(norm, []).append((rel, src[:m.start()].count("\n") + 1, name, body))
+    file_stmts = {}
+    for f in lean_files():
+        rel = os.path.relpath(f, ROOT)
+        for b in re.split(r"\n(?=@\[simp\]\s*\n?theorem |theorem |private theorem )",
+                          strip_comments(open(f).read())):
+            if re.match(r"(?:@\[simp\]\s*)?(?:private )?theorem ", b) and ":=" in b:
+                file_stmts.setdefault(rel, []).append(b.split(":=", 1)[0])
+    duplicates = []
+    for norm, members in sorted(shapes.items()):
+        for i in range(len(members)):
+            for j in range(i + 1, len(members)):
+                (fa, la, na, ba), (fb, lb, nb, bb) = members[i], members[j]
+                if fa == fb:
+                    continue
+                # Tied by definition: one is written in terms of the other.
+                if (re.search(r"\b" + re.escape(nb) + r"\b", ba) or
+                        re.search(r"\b" + re.escape(na) + r"\b", bb)):
+                    continue
+                # Tied by a theorem in one of the two files naming both.
+                if any(re.search(r"\b" + re.escape(na) + r"\b", st) and
+                       re.search(r"\b" + re.escape(nb) + r"\b", st)
+                       for st in file_stmts.get(fa, []) + file_stmts.get(fb, [])):
+                    continue
+                duplicates.append(f"{fa}:{la} {na}  ==  {fb}:{lb} {nb}")
+    duplicates.sort()
+    if len(duplicates) > DUPLICATE_BODY_BUDGET:
+        bad.append(f"alpha-equivalent definition bodies in different files tied by neither a "
+                   f"call nor a theorem: {len(duplicates)}, budget {DUPLICATE_BODY_BUDGET}; "
+                   f"make one call the other, or state the identity as a theorem")
+        bad.extend("    " + x for x in duplicates[:12])
+
     # 3e. Cheap structural integrity, run before the build so that a broken
     #     rename or an unterminated comment fails in seconds rather than after a
     #     full elaboration. The "+/-" incident is the motivating case: text in a
@@ -389,6 +538,8 @@ def main() -> int:
     print(f"structural guards pass: convention sites {sites}/{CONVENTION_SITE_BUDGET}, "
           f"undeclared {len(undeclared)}/{UNDECLARED_BUDGET}, conventions {len(undeclared_conv)}/{CONVENTION_DECL_BUDGET}, "
           f"unrelated {unrelated}/{UNRELATED_BUDGET}, "
+          f"stipulated equilibria {len(stipulated)}/{EQUILIBRIUM_BUDGET}, "
+          f"duplicate bodies {len(duplicates)}/{DUPLICATE_BODY_BUDGET}, "
           f"isolated modules {len(isolated)}/{ISOLATED_MODULE_BUDGET}, "
           f"sorry ledger {len(SORRY_LEDGER)}")
     return 0
