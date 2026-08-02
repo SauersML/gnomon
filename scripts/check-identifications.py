@@ -25,6 +25,7 @@ ISOLATED_MODULE_BUDGET = 14         # modules no theorem cross-relates to anothe
 UNDECLARED_BUDGET = 0               # empirical defs with no status marker
 UNRELATED_BUDGET = 34               # ratchets down
 MISSING_ARG_BUDGET = 0              # signatures omitting a dependency of the named quantity
+CONFLATION_BUDGET = 0               # one formula under names from different concept families
 CONVENTION_DECL_BUDGET = 0          # composable quantities with no declared convention
 OVERCLAIM_BUDGET = 0                # untested definitions whose docstring claims exactness             # measured; ratchets down as siblings get related
 
@@ -267,6 +268,53 @@ def main() -> int:
         bad.append(f"definitions taking an ambiguity-prone quantity with no declared "
                    f"convention: {len(undeclared_conv)}, budget {CONVENTION_DECL_BUDGET}")
         bad.extend("    " + x for x in undeclared_conv[:8])
+
+
+    # 3g. Naming conflation. One formula carrying names from different concept
+    #     families is how allelicVariance came about: 2p(1-p) is correctly the
+    #     genotype variance and correctly the HWE heterozygote frequency, and is
+    #     not the allelic variance, which is p(1-p). The r-squared-over-four
+    #     defect was inherited from that name, not slipped in the formula. Where
+    #     one body carries names from two families, each must say what it
+    #     denotes.
+    FAMILY = {
+        "variance": r"variance|var\b", "frequency": r"freq|maf|prop",
+        "heterozygosity": r"heteroz|het\b", "rate": r"rate",
+        "factor": r"factor|retention|decay", "fst": r"fst",
+    }
+    bodies = {}
+    for f in lean_files():
+        src = strip_comments(open(f).read())
+        for m in re.finditer(r"^(?:noncomputable )?def ([A-Za-z_0-9'.]+)(.*?):=\s*\n?\s*(.+?)"
+                             r"(?=\n(?:@\[|theorem |noncomputable |def |abbrev |structure |section |end |namespace |/-))",
+                             src, re.S | re.M):
+            name, args, body = m.group(1).split(".")[-1], m.group(2), " ".join(m.group(3).split())
+            if len(body) > 60:
+                continue
+            bound = set(re.findall(r"[A-Za-z_][A-Za-z_0-9₀-₉']*", args))
+            norm = re.sub(r"[A-Za-z_][A-Za-z_0-9₀-₉'.]*",
+                          lambda t: "V" if t.group(0) in bound else t.group(0), body)
+            if not re.search(r"[0-9]", norm):
+                continue
+            bodies.setdefault(norm, []).append((f, name))
+    conflated = []
+    for norm, members in bodies.items():
+        fams = {fam for _, n in members for fam, pat in FAMILY.items() if re.search(pat, n, re.I)}
+        if len(fams) < 2:
+            continue
+        for f, n in members:
+            doc = ""
+            raw = open(f).read()
+            dm = re.search(r"/--((?:(?!-/).)*)-/\s*\n(?:noncomputable )?def " + re.escape(n) + r"\b", raw, re.S)
+            if dm:
+                doc = dm.group(1)
+            if "Denotes:" not in doc:
+                conflated.append(f"{os.path.relpath(f, ROOT)}: `{n}` shares a formula with names "
+                                 f"from {sorted(fams)} and declares no Denotes")
+    if len(conflated) > CONFLATION_BUDGET:
+        bad.append(f"definitions sharing one formula across concept families with no Denotes "
+                   f"declaration: {len(conflated)}, budget {CONFLATION_BUDGET}")
+        bad.extend("    " + x for x in conflated[:8])
 
 
     # 3e. Cheap structural integrity, run before the build so that a broken
