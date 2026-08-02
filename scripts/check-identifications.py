@@ -22,6 +22,25 @@ Guards, in order of what they catch:
 5. Duplicate bodies across files. Two definitions in different modules whose
    bodies are alpha-equivalent are one quantity written twice; unless one calls
    the other or a theorem equates them, fixing one leaves the other wrong.
+
+6. Regimes baked into bodies. A definition whose value depends on an assumption
+   about the data-generating process -- closed population, no mutation, infinite
+   sites -- must name that assumption, because a formula carries no record of
+   the regime it was derived in and a use site cannot discharge what it cannot
+   see.
+
+7. Validation inherited from a sibling identity. Over-determination detects
+   divergence between formulas and is provably blind to a premise they share, so
+   a VALIDATED tag must cite a measurement against an observable, never another
+   definition. Guards 6 and 7 exist because one wrong number was certified five
+   times, each time by a cross-check that could not have failed.
+
+8. Validation with no power. A validation is evidence in proportion to the range
+   its prediction spanned; a design on which the prediction is constant cannot
+   reject a wrong functional form, however small the residual.
+
+Guards 6-8 are the subject of `Calibrator.DriftRegime`, which proves that 7 and 8
+are impossibilities rather than oversights.
 """
 import re, sys, glob, os
 
@@ -38,6 +57,9 @@ CONVENTION_DECL_BUDGET = 0          # composable quantities with no declared con
 OVERCLAIM_BUDGET = 0                # untested definitions whose docstring claims exactness             # measured; ratchets down as siblings get related
 EQUILIBRIUM_BUDGET = 0              # equilibria stipulated as a closed form, never derived
 DUPLICATE_BODY_BUDGET = 0           # one body under two names in two files, tied by nothing
+REGIME_DECL_BUDGET = 0              # drift regimes baked into a body instead of a hypothesis
+INHERITED_VALIDATION_BUDGET = None  # VALIDATED inherited from a sibling identity; pin on first run
+VACUOUS_VALIDATION_BUDGET = None    # VALIDATED with no recorded power; pin on first run
 
 def strip_comments(src: str) -> str:
     """Remove Lean block and line comments so prose cannot trip the guards."""
@@ -480,6 +502,111 @@ def main() -> int:
                    f"call nor a theorem: {len(duplicates)}, budget {DUPLICATE_BODY_BUDGET}; "
                    f"make one call the other, or state the identity as a theorem")
         bad.extend("    " + x for x in duplicates[:12])
+
+    # 3j. Regimes baked into bodies. Five definitions -- the within-population
+    #     heterozygosity loss, the F_ST read off it, the target heterozygosity,
+    #     the target PGS variance, and the neutral benchmark ratio -- were all
+    #     functions of one number, `(1 - 1/(2 Ne))^t`, the closed-population
+    #     no-mutation retention. Simulation at demographic equilibrium measures
+    #     that retention as 1.02 +- 0.02 where the formula predicts e^-2 = 0.135:
+    #     mutation replenishes diversity, so heterozygosity is stationary and the
+    #     cluster's "F_ST" is ~0 exactly where the measurable between-population
+    #     F_ST is 0.50. They are different quantities sharing a name.
+    #
+    #     The premise was invisible because it lived in a *body*, not in a
+    #     hypothesis. A definition carrying the closed-population retention factor
+    #     must therefore name its regime, so that a reader and a use site both see
+    #     which data-generating process it assumes. `Calibrator.DriftRegime`
+    #     exhibits the two regimes and proves they disagree at every positive time.
+    regimeless = []
+    for f in lean_files():
+        raw = open(f).read()
+        for m in re.finditer(r"/--((?:(?!-/).)*)-/\s*\n(?:noncomputable )?def "
+                             r"([A-Za-z_0-9'.]+)[^:]*:[^:=]*:=((?:(?!\n/--|\ntheorem|\nend ).)*)",
+                             raw, re.S):
+            doc, name, body = m.group(1), m.group(2).split(".")[-1], m.group(3)
+            # the closed-population retention factor, raised to a power
+            if re.search(r"\(\s*1\s*-\s*1\s*/\s*\(\s*2\s*\*[^)]*\)\s*\)\s*\^", body):
+                if "Regime:" not in doc:
+                    regimeless.append(
+                        f"{os.path.relpath(f, ROOT)}: `{name}` carries the closed-population "
+                        f"retention factor in its body and declares no Regime")
+    if len(regimeless) > REGIME_DECL_BUDGET:
+        bad.append(f"definitions encoding a drift regime with no declared Regime: "
+                   f"{len(regimeless)}, budget {REGIME_DECL_BUDGET}; name the "
+                   f"data-generating assumption, see Calibrator.DriftRegime")
+        bad.extend("    " + x for x in regimeless[:12])
+
+    # 3k. Validation inherited from a sibling identity. Over-determination
+    #     detects divergence between independently written formulas and is
+    #     provably blind to a premise they share
+    #     (`Calibrator.DriftRegime.crossChecks_blind_to_retention`): every identity
+    #     among members of a cluster holds at *every* value of the shared premise,
+    #     including the wrong one. So a VALIDATED tag may cite a measurement
+    #     against an observable, never a sibling formula. A validation note that
+    #     only names another definition is an inherited tag, and inherited tags are
+    #     what let one wrong number be certified five times.
+    inherited = []
+    for f in lean_files():
+        raw = open(f).read()
+        for m in re.finditer(r"Empirical status: VALIDATED([^-]*?)-/", raw, re.S):
+            note = m.group(1)
+            cites_identity = re.search(r"\bthis is the identity\b|\bthe theorem\b|"
+                                       r"\bby definition\b|\bdefinitionally\b|"
+                                       r"\balongside\b `?[A-Za-z_0-9']+`?", note, re.I)
+            cites_measurement = re.search(r"simulat|measur|against|observed|grid|"
+                                          r"coalescent|SLiM|panel|out-of-sample", note, re.I)
+            if cites_identity and not cites_measurement:
+                inherited.append(f"{os.path.relpath(f, ROOT)}: a VALIDATED note cites a sibling "
+                                 f"identity but no measurement: \"{note.strip()[:70]}\"")
+    #     Reported, not enforced, until the count is measured once and pinned:
+    #     these two guards are retroactive over twenty existing VALIDATED tags,
+    #     and failing the build on all of them at once would be noise rather than
+    #     signal. Pin INHERITED_VALIDATION_BUDGET to the first reported count and
+    #     ratchet it down, exactly as CONVENTION_SITE_BUDGET was.
+    if INHERITED_VALIDATION_BUDGET is None:
+        for x in inherited[:10]:
+            print(f"  advisory (inherited validation): {x}")
+    elif len(inherited) > INHERITED_VALIDATION_BUDGET:
+        bad.append(f"VALIDATED tags justified by a sibling identity rather than a measurement: "
+                   f"{len(inherited)}, budget {INHERITED_VALIDATION_BUDGET}")
+        bad.extend("    " + x for x in inherited[:10])
+
+    # 3l. Validation with no power. `neutralAFBenchmarkRatio` was recorded as
+    #     validated to 3.2 percent. The design was symmetric, so both sides of the
+    #     ratio collapsed to ~1 and the test could not have failed;
+    #     `Calibrator.DriftRegime.symmetric_design_has_no_power` proves that on any
+    #     symmetric design the ratio and its *square* are indistinguishable. On
+    #     asymmetric effective sizes the same formula is off by -37 to -74 percent,
+    #     at nine to fifteen standard errors.
+    #
+    #     A validation is evidence in proportion to the range its prediction
+    #     spanned. So a VALIDATED note must record at least two predicted values,
+    #     and they must not all be equal: a prediction that is constant on the
+    #     design tests nothing about shape.
+    powerless = []
+    for f in lean_files():
+        raw = open(f).read()
+        for m in re.finditer(r"Empirical status: VALIDATED([^-]*?)-/", raw, re.S):
+            note = m.group(1)
+            nums = [float(x) for x in re.findall(r"\d+\.\d+", note)]
+            if len(nums) < 2:
+                powerless.append(f"{os.path.relpath(f, ROOT)}: a VALIDATED note records fewer "
+                                 f"than two predicted values, so its power is unstated")
+                continue
+            spread = max(nums) - min(nums)
+            if spread <= 0.05 * max(abs(max(nums)), 1.0):
+                powerless.append(f"{os.path.relpath(f, ROOT)}: a VALIDATED note's predictions "
+                                 f"span only {spread:.4f}; a near-constant prediction cannot "
+                                 f"reject a wrong functional form")
+    if VACUOUS_VALIDATION_BUDGET is None:
+        for x in powerless[:12]:
+            print(f"  advisory (validation power unstated): {x}")
+    elif len(powerless) > VACUOUS_VALIDATION_BUDGET:
+        bad.append(f"VALIDATED tags whose design had no recorded power: {len(powerless)}, "
+                   f"budget {VACUOUS_VALIDATION_BUDGET}; record the spread of the prediction "
+                   f"across the design, see Calibrator.DriftRegime")
+        bad.extend("    " + x for x in powerless[:12])
 
     # 3e. Cheap structural integrity, run before the build so that a broken
     #     rename or an unterminated comment fails in seconds rather than after a
