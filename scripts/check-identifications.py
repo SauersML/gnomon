@@ -23,7 +23,7 @@ SORRY_LEDGER = set()                # name -> undischarged obligation, none yet
 CONVENTION_SITE_BUDGET = 0        # measured; may decrease, never increase
 ISOLATED_MODULE_BUDGET = 14         # modules no theorem cross-relates to another
 UNDECLARED_BUDGET = 0               # empirical defs with no status marker
-UNRELATED_BUDGET = 35               # ratchets down
+UNRELATED_BUDGET = 34               # ratchets down
 MISSING_ARG_BUDGET = 0              # signatures omitting a dependency of the named quantity
 CONVENTION_DECL_BUDGET = 0          # composable quantities with no declared convention
 OVERCLAIM_BUDGET = 0                # untested definitions whose docstring claims exactness             # measured; ratchets down as siblings get related
@@ -248,6 +248,8 @@ def main() -> int:
     AMBIGUOUS = [
         (r"\bD\b", "linkage disequilibrium: haplotype D or dosage covariance (differ by ploidy)"),
         (r"\bvar_tag\b|\bvar_causal\b", "variance: allelic p(1-p) or genotypic 2p(1-p)"),
+        (r"\bmaf\b|\bmaf_causal\b|\bmaf_tag\b",
+         "allele frequency: of the causal variant or of the tag, which differ once r < 1"),
     ]
     undeclared_conv = []
     for f in lean_files():
