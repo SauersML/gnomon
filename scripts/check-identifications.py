@@ -25,6 +25,7 @@ ISOLATED_MODULE_BUDGET = 14         # modules no theorem cross-relates to anothe
 UNDECLARED_BUDGET = 0               # empirical defs with no status marker
 UNRELATED_BUDGET = 35               # ratchets down
 MISSING_ARG_BUDGET = 0              # signatures omitting a dependency of the named quantity
+CONVENTION_DECL_BUDGET = 0          # composable quantities with no declared convention
 OVERCLAIM_BUDGET = 0                # untested definitions whose docstring claims exactness             # measured; ratchets down as siblings get related
 
 def strip_comments(src: str) -> str:
@@ -237,6 +238,35 @@ def main() -> int:
                    f"{len(overclaim)}, budget {OVERCLAIM_BUDGET}")
         bad.extend("    " + x for x in overclaim[:10])
 
+    # 3f. Convention declarations on composable quantities. A definition
+    #     producing a quantity and another consuming it can disagree about its
+    #     convention while both remain defensible alone, and Lean cannot object
+    #     because both are real-valued. ldCorrelationSq returned r-squared over
+    #     four when fed the D that admixtureLDTwoLocus produces, 350 lines apart
+    #     in one file. Any definition taking an ambiguity-prone argument must
+    #     state the convention it assumes.
+    AMBIGUOUS = [
+        (r"\bD\b", "linkage disequilibrium: haplotype D or dosage covariance (differ by ploidy)"),
+        (r"\bvar_tag\b|\bvar_causal\b", "variance: allelic p(1-p) or genotypic 2p(1-p)"),
+    ]
+    undeclared_conv = []
+    for f in lean_files():
+        raw = open(f).read()
+        for m in re.finditer(r"/--((?:(?!-/).)*)-/\s*\n(?:noncomputable )?def ([A-Za-z_0-9'.]+)([^:]*):",
+                             raw, re.S):
+            doc, name, args = m.group(1), m.group(2).split(".")[-1], m.group(3)
+            for pat, why in AMBIGUOUS:
+                if re.search(pat, args) and "Convention:" not in doc:
+                    undeclared_conv.append(
+                        f"{os.path.relpath(f, ROOT)}: `{name}` takes an ambiguity-prone "
+                        f"argument and declares no Convention; {why}")
+                    break
+    if len(undeclared_conv) > CONVENTION_DECL_BUDGET:
+        bad.append(f"definitions taking an ambiguity-prone quantity with no declared "
+                   f"convention: {len(undeclared_conv)}, budget {CONVENTION_DECL_BUDGET}")
+        bad.extend("    " + x for x in undeclared_conv[:8])
+
+
     # 3e. Cheap structural integrity, run before the build so that a broken
     #     rename or an unterminated comment fails in seconds rather than after a
     #     full elaboration. The "+/-" incident is the motivating case: text in a
@@ -292,7 +322,8 @@ def main() -> int:
             print("  " + b)
         return 1
     print(f"structural guards pass: convention sites {sites}/{CONVENTION_SITE_BUDGET}, "
-          f"undeclared {len(undeclared)}/{UNDECLARED_BUDGET}, unrelated {unrelated}/{UNRELATED_BUDGET}, "
+          f"undeclared {len(undeclared)}/{UNDECLARED_BUDGET}, conventions {len(undeclared_conv)}/{CONVENTION_DECL_BUDGET}, "
+          f"unrelated {unrelated}/{UNRELATED_BUDGET}, "
           f"isolated modules {len(isolated)}/{ISOLATED_MODULE_BUDGET}, "
           f"sorry ledger {len(SORRY_LEDGER)}")
     return 0
