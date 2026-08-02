@@ -1,0 +1,504 @@
+TRANSFER LAWS FOR PARAMETERIZED ATOMIC ENSEMBLES
+A program of open problems
+
+Standing instruction to the reader: nothing below is a request for a bound, a
+sufficient condition, or an asymptotic without a rate. Every problem asks for a
+CHARACTERIZATION -- an if-and-only-if, an exact law with its equality cases, or
+a proof that no such law exists together with the exact obstruction. A theorem
+that says "at most" is, for this program, a failed attempt at a theorem that
+says "exactly".
+
+
+================================================================================
+0. THE SETTING
+================================================================================
+
+Fix an integer d >= 2 and a parameter interval T (an open subinterval of R).
+
+A BUNDLE FAMILY is a map t |-> nu_t from T into probability laws on R such that
+each nu_t is supported on exactly d points, has mean zero and variance one, and
+the atom locations a_1(t) < ... < a_d(t) and masses p_1(t), ..., p_d(t) are real
+analytic in t. The name records the essential structure: the d atoms are NOT
+independently adjustable. They arrive as an indivisible bundle indexed by a
+single scalar, and every constraint on the family is a constraint on a curve in
+the (2d-2)-dimensional simplex of centered unit-variance d-atom laws, not on the
+simplex itself.
+
+The motivating example, and the one whose rigidity is already settled, is the
+BINOMIAL-2 FAMILY: d = 3, masses ((1-t)^2, 2t(1-t), t^2), atoms the standardized
+values of {0, 1, 2}. It should not be treated as the general case. Part of the
+point of what follows is to discover which of its properties are accidents of
+d = 3 and which are structural.
+
+A PANEL is a pair (mu, beta) where mu is a probability measure on T and beta is a
+measurable weight function on T, square-integrable against mu. A panel generates,
+for each n, an ensemble of n independent coordinates X_1, ..., X_n with
+t_i drawn i.i.d. from mu and X_i | t_i ~ nu_{t_i}, together with the READOUT
+
+    R_n = c_n * sum_i beta(t_i) X_i,     c_n chosen so Var R_n = 1.
+
+More generally an ADMISSIBLE DESIGN is a sequence of multilinear forms in the
+coordinates with unit variance, diverging minimum degree, and vanishing maximal
+influence; the linear readout is the degree-one case and should never be the
+only case considered.
+
+A TRANSFER is an ordered pair of panels (P, P') = ((mu, beta), (mu', beta)) --
+the same weight function read against two different parameter measures. A
+TARGET is a jointly distributed real variable Y coupled to the coordinates. An
+ACCURACY FUNCTIONAL A assigns to the joint law of (R, Y) a real number. The
+DEGRADATION is
+
+    D(P -> P'; A, design) = A(P') - A(P)   or its ratio, as the functional
+                                            dictates.
+
+Every problem below concerns the map from (P, P') to the degradation, and the
+overriding demand is that answers be stated in terms of functionals COMPUTABLE
+FROM THE INPUTS -- that is, from mu, mu', beta and the bundle family -- and
+delivering guarantees about OUTPUTS, the numbers an analyst actually reports.
+A characterization phrased in terms of quantities that can only be evaluated
+once the answer is known is not a characterization.
+
+Write U = X^2 - 1 for the centered square of a coordinate, and call the law of U
+the SECOND FLOOR. Iterating the normalized centered square generates the TOWER;
+the modulus laws of its floors, together with their two-jets and arithmetic
+types, generate the LADDER. The ladder is known to be reachable by admissible
+designs. The odd parts of the floors are known, in one regime, not to be.
+
+
+================================================================================
+1. THE REACHABLE ALGEBRA
+================================================================================
+
+PROBLEM 1. Determine exactly which functionals of a panel survive to the limit
+of admissible designs.
+
+Precisely: let L be the set of functionals F of (mu, beta) such that for every
+admissible design sequence, the limit law of the design depends on the panel
+only through F, and let A(L) be the algebra they generate. Characterize A(L).
+
+What a complete answer contains:
+  (a) an explicit countable generating ladder for A(L), with the generators
+      given as integrals against mu of explicit analytic functions of t;
+  (b) a proof of MINIMALITY -- for each generator, an admissible design and two
+      panels agreeing on all other generators and separated by that design;
+  (c) the exact finite truncations: for each degree k, the sub-algebra reachable
+      by designs of degree <= k, and a proof that the filtration is strict;
+  (d) an analytic formula expressing an arbitrary limit as a function of ladder
+      coordinates, with domain of convergence.
+
+Why this is hard. The reachability question is not a moment problem. Designs of
+diverging degree can amplify a functional by their coordinate count, so whether
+a functional survives is a competition between its size and the rate at which
+the design's own combinatorics grows -- and the two are linked, because the
+design's variance normalization is itself a functional of the panel. Existing
+technology answers this one functional at a time, by exhibiting a channel that
+reads it. The problem asks for the closure.
+
+Pre-registered failure mode. A proposed generating set will typically be
+verified by checking that each generator is readable and that a handful of
+non-generators are not. That establishes neither generation nor minimality. Any
+claimed answer must be attacked at (b) first.
+
+
+================================================================================
+2. RIGIDITY AND SURGERY: A CHEBYSHEV CRITERION
+================================================================================
+
+For a bundle family and a panel, let |U|_* denote the law of the absolute value
+of the second-floor variable, and consider the map
+
+    RHO :  mu  |-->  Law(|U|)   ...   (the modulus map)
+
+PROBLEM 2. Characterize the bundle families for which RHO is injective, and for
+those where it is not, classify its fibers completely.
+
+The two regimes have entirely different consequences and both occur. When RHO is
+injective, matching modulus data pins the panel, and every invariant of the panel
+is in principle recoverable from measurements that read only moduli. When RHO has
+nontrivial fibers, each fiber is a family of panels agreeing on all modulus data
+and differing in odd structure -- a SURGERY FAMILY -- and any measurement class
+confined to modulus data cannot separate its members.
+
+For the binomial-2 family RHO is injective, and the mechanism is instructive: the
+extreme atom dominates the others in absolute value, is strictly monotone in the
+parameter, and therefore the largest modulus present in a panel identifies the
+extreme parameter present and localizes its mass to a single bundle; the argument
+then recurses. The mass at the extreme atom has nobody to trade with.
+
+What a complete answer contains:
+  (a) a necessary and sufficient condition on the atom functions a_j(t) and mass
+      functions p_j(t) for injectivity. The natural conjecture is that it is a
+      Chebyshev-system condition on the family {|a_j|, p_j} together with a
+      DOMINATION-AND-MONOTONICITY hypothesis on the extreme atom, but the
+      conjecture is stated here only to be refuted or sharpened;
+  (b) when RHO is non-injective: the dimension of the generic fiber, an explicit
+      parameterization, and the exact set of functionals constant on fibers;
+  (c) the boundary of the two regimes -- a family where injectivity fails
+      marginally, and the mechanism of the failure;
+  (d) stability: does injectivity survive perturbation of the family? Is the
+      rigid locus open, closed, neither?
+
+Why this is hard. Injectivity of RHO is a statement about a nonlinear map on an
+infinite-dimensional space, and the finite-dimensional intuition is actively
+misleading -- a mixture appears to have enormous freedom, and the theorem is that
+the bundling destroys it. The known proof is a peeling argument depending on a
+domination property that most families will not have. The general case needs a
+criterion, not a peeling.
+
+Pre-registered failure mode. Numerical searches for fibers cluster modulus values
+under a tolerance. A tolerance can merge two distinct parameters whose modulus
+values agree to high precision while their SIGNS differ, manufacturing an
+apparent fiber out of a sign change near a zero of an atom function. Any
+computational evidence must be exact-arithmetic, and any claimed fiber must be
+exhibited symbolically.
+
+Pre-registered control. The reflection symmetry of a family (when present) makes
+RHO non-injective for trivial reasons. A search that does not detect the
+reflection fiber is not detecting fibers at all, and a null result from such a
+search is uninformative rather than negative.
+
+
+================================================================================
+3. THE NON-CRAMER FRONTIER: A RESONANCE CALCULUS
+================================================================================
+
+Every finitely supported law violates Cramer's condition. The characteristic
+function of an atomic law is Bohr almost periodic, hence recurrent, so
+limsup_{|s| -> infinity} |phi(s)| = 1 exactly, and this holds whether or not the
+law is lattice. The lattice/nonlattice distinction, which governs one part of the
+existing theory, is irrelevant to Cramer: nonlattice atomic laws fail it by
+recurrence rather than by periodicity.
+
+Consequently the entire Edgeworth apparatus -- expansions of window profiles with
+remainder o(b^{-1}) or better, uniform over designs -- is unavailable for bundle
+families. Every theorem whose proof passes through a smooth-density local limit
+expansion is, for these ensembles, unproved.
+
+PROBLEM 3. Build the replacement.
+
+What a complete answer contains:
+  (a) a local limit theorem for triangular arrays of parameter-dependent atomic
+      laws, with the remainder expressed in terms of the RECURRENCE SET
+        S(eps) = { s : |phi_mu(s)| > 1 - eps },
+      rather than assumed away;
+  (b) a trichotomy by the Diophantine type of the atom-location ratios --
+      rationally resonant, Liouville, and Diophantine-generic -- with the sharp
+      remainder exponent in each class and examples attaining it;
+  (c) a RESONANCE CORRECTION TERM: an explicit series indexed by the near-periods
+      of phi, reducing to the classical Edgeworth series when the recurrence set
+      is empty at every scale;
+  (d) uniformity over designs, stated as a hypothesis with a proof, since it is
+      the hypothesis on which everything downstream rests;
+  (e) the consequence for insertion-type estimates: whether a difference of two
+      panels can be bounded by finitely many matched integral moments as in the
+      smooth case, or whether resonance permits leakage that no finite matching
+      controls.
+
+Why this is hard. This is genuinely a problem in harmonic analysis and
+Diophantine approximation wearing a probabilistic costume. The recurrence set of
+an almost periodic function is not small, and its structure depends on the
+arithmetic of the atom locations, which for a bundle family VARIES WITH THE
+PARAMETER -- so a panel integrates over a continuum of arithmetic types. The
+right object may be a measure-theoretic statement about the distribution of
+Diophantine types under mu, in which case the answer will look more like an
+equidistribution theorem than like a limit theorem.
+
+The payoff, and why this problem is first in importance if not in order: (e) is
+the hypothesis under which every invisibility result in this program has been
+proved. If resonance permits leakage, invisibility fails exactly for the
+ensembles that arise in practice, and the whole picture inverts.
+
+
+================================================================================
+4. THE OBSERVABILITY CORRESPONDENCE
+================================================================================
+
+Let I be a complete invariant for a class of objects -- a map separating points.
+Let M be a class of admissible measurements, each a functional of the object.
+Say a quotient q of I is VISIBLE to M if every pair of objects separated by some
+measurement in M is separated by q, and INVISIBLE if no measurement in M
+separates two objects that q separates.
+
+There exist pairs (I, M) with I complete and a nontrivial quotient invisible:
+an invariant that determines the object and that no admissible measurement can
+read. This is the structural phenomenon the rest of this program keeps meeting,
+and it deserves a theory rather than instances.
+
+PROBLEM 4. Establish the correspondence between measurement classes and
+invariant quotients, in the generality of a Galois connection, and compute it.
+
+What a complete answer contains:
+  (a) the two maps -- M |-> its visible quotient, and q |-> the largest
+      measurement class blind to q -- shown to form a Galois connection, with
+      the closure operators identified on both sides;
+  (b) a characterization of the CLOSED measurement classes: which classes are of
+      the form "everything blind to q"? Equivalently, when is a blindness
+      phenomenon caused by a single invariant rather than by an accident of the
+      class?
+  (c) the computation of the correspondence for the tower/ladder pair: the
+      lattice of quotients of the tower invariant, the lattice of natural
+      measurement classes, and the explicit map between them;
+  (d) an obstruction theory: given q, a computable certificate that q is
+      invisible to M, and a computable certificate that it is visible -- so that
+      the question is decidable for the classes of interest;
+  (e) the GAP as an object in its own right. When a complete invariant has an
+      invisible quotient, the gap is a group or groupoid acting on the objects
+      and fixing all measurements. Identify it, and determine when it acts
+      freely.
+
+Why this is hard and why it is the most portable problem here. The phenomenon --
+a complete invariant with a provably unreadable part -- is not special to this
+setting. It is the general shape of a partial-identifiability theorem, and a
+correspondence theorem would apply wherever a classification meets a restricted
+observation class. The difficulty is that "measurement class" must be given
+enough structure to support a Galois theory without being narrowed to the point
+where the theory is trivially the subgroup correspondence of an obvious group
+action. Finding the right category is most of the problem, and it is the part
+that cannot be done by analogy.
+
+
+================================================================================
+5. THE EXACT DEGRADATION LAW
+================================================================================
+
+PROBLEM 5. Find the metric.
+
+Conjecture, stated to be proved or refuted: there is a metric D on the space of
+panels and a universal increasing function Phi, depending on the accuracy
+functional and the design class but NOT on the panels, such that for every
+transfer
+
+    degradation(P -> P')  =  Phi( D(P, P') )     EXACTLY,
+
+with the equality cases classified. Prove existence, prove uniqueness of D up to
+reparameterization, and compute both D and Phi.
+
+What a complete answer contains:
+  (a) D given in closed form as a functional of the two panels, computable from
+      inputs;
+  (b) the equality cases: which pairs of panels attain the law, and which
+      configurations are extremal;
+  (c) a proof of uniqueness, or an exact description of the family of metrics
+      satisfying the law -- since if D is not unique, the non-uniqueness is
+      itself a gauge freedom worth naming;
+  (d) the cocycle structure. Degradation along a composite transfer
+      P -> P' -> P'' should decompose; identify the cocycle, compute its
+      coboundaries, and exhibit the IRREDUCIBLE CLASS -- the part of degradation
+      that no reparameterization of the intermediate panel can remove;
+  (e) the geodesics of D, and their interpretation as optimal interpolating
+      panels.
+
+Why this is hard. An exact law, as opposed to two-sided bounds with matching
+order, is a strong demand and most transfer phenomena do not admit one. The
+interest is precisely in finding the largest class where the demand is met, so
+a complete answer includes the BOUNDARY: a characterization of the design
+classes and accuracy functionals for which no exact law can exist, with the
+obstruction exhibited.
+
+
+================================================================================
+6. CLASSIFICATION OF ACCURACY FUNCTIONALS BY TRANSFER BEHAVIOR
+================================================================================
+
+Different accuracy functionals disagree, under transfer, not merely in magnitude
+but in DIRECTION: there exist transfers along which one functional improves and
+another degrades. This is usually reported as a caution. It should be a theorem.
+
+PROBLEM 6. Classify accuracy functionals by their behavior under transfer.
+
+What a complete answer contains:
+  (a) the equivalence relation "A ~ A' iff A and A' induce the same ordering on
+      every pair of panels", and a complete set of invariants for it;
+  (b) the classification of functionals by EQUIVARIANCE TYPE under the natural
+      group actions -- rescaling of the readout, monotone reparameterization of
+      the target, and translation of any threshold the functional depends on --
+      with a theorem stating exactly which combinations of equivariance force
+      which orderings;
+  (c) the THRESHOLD SUBTLETY, isolated as its own theorem. A functional defined
+      through a threshold calibrated on the source panel and applied on the
+      target is not equivariant under rescaling of the readout, while a
+      correlation-type functional is. Determine the exact set of transfers along
+      which the two classes disagree in sign, as a function of the readout's
+      scale ratio and the target's base rate, and prove it sharp;
+  (d) an ORDER-REVERSAL THEOREM: given any two inequivalent functionals,
+      construct a transfer on which they disagree in direction, with the
+      construction explicit and the minimal such transfer identified;
+  (e) the partial order on functionals by "never disagrees in direction with",
+      and its maximal chains.
+
+Why this is hard. The classification is not a classification of functionals as
+maps -- it is a classification of their level-set geometry relative to the
+transfer flow, and two functionals with entirely different formulas can be
+equivalent while two nearly identical ones are not. Part (d) in particular asks
+for a construction, and constructions in this space have repeatedly turned out
+to be obstructed for reasons invisible at the level of the formulas.
+
+
+================================================================================
+7. THE SHARP CEILING ON EXPLAINING A SINGLE RESIDUAL
+================================================================================
+
+Let Y = f(X) + noise, let f-hat be an estimate, and consider the squared residual
+E = (Y - f-hat(X))^2 as a random variable. Let G be a sub-sigma-algebra
+(the "available covariates").
+
+PROBLEM 7. Compute
+    C(G) = sup over G-measurable g of the fraction of Var(E) explained by g,
+exactly, with the extremal g identified.
+
+This is a sharp-constant problem and it is the correct denominator for a large
+class of empirical claims. A reported explained fraction is uninterpretable
+without it: the same number can be nearly all of the achievable or nearly none,
+and the two readings support opposite conclusions.
+
+What a complete answer contains:
+  (a) C(G) in closed form for the ensembles of Section 0, as a functional of the
+      panel and the noise structure, with the extremal predictor exhibited;
+  (b) the CONDITIONAL NOISE FLOOR: the part of Var(E) that is irreducible for
+      information-theoretic rather than modeling reasons, separated cleanly from
+      the part that is merely unmodeled;
+  (c) the behavior of C(G) as the ensemble size diverges -- in particular whether
+      C(G) -> 0, so that ALL predictors of an individual residual become
+      asymptotically uninformative, or whether it stabilizes;
+  (d) the normalized statistic explained-fraction / C(G), its exact sampling
+      distribution or a sharp approximation with rate, and its behavior under
+      the transfers of Section 5;
+  (e) a comparison theorem: given two sub-sigma-algebras G_1, G_2, exact
+      conditions under which the normalized statistics are comparable -- since
+      comparing two raw explained fractions against different ceilings is the
+      error the whole problem exists to prevent.
+
+Why this is hard. The supremum is over an infinite-dimensional class and the
+extremal predictor is generically not the conditional expectation of E, because
+E is itself a squared quantity and the objective is a variance ratio rather than
+an L2 distance. Sharpness, with the extremal configuration exhibited, is the
+whole content; a bound is worth nothing here, because the entire use of the
+quantity is as a denominator.
+
+
+================================================================================
+8. THE INVERSE PROBLEM
+================================================================================
+
+PROBLEM 8. Given a prescribed degradation profile -- a function assigning to
+each panel in some family the degradation from a fixed source -- construct a
+bundle family, a source panel, and a weight function realizing it, or exhibit
+the obstruction.
+
+What a complete answer contains:
+  (a) a characterization of REALIZABLE profiles, as an explicit condition on the
+      prescribed function (monotonicity, convexity, growth, and whatever else the
+      answer turns out to require);
+  (b) a canonical construction realizing every realizable profile, with the
+      construction's freedom described -- the gauge group of the realization;
+  (c) the obstruction, for non-realizable profiles, as a computable invariant;
+  (d) MINIMAL realizations: among all panels realizing a profile, those minimal
+      in support size or in some natural complexity, with uniqueness where it
+      holds;
+  (e) the interaction with Problem 2: on rigid bundle families the realization
+      problem has less freedom than on flexible ones, and the exact loss of
+      freedom should be quantified rather than described.
+
+Why this is hard. Inverse problems of this type are usually either trivially
+solvable by taking enough support or obstructed for cohomological reasons, and
+which of the two obtains is not visible from the statement. The demand for
+canonical constructions, rather than existence, is what makes this a real
+problem: an existence proof by compactness would be a non-answer.
+
+
+================================================================================
+9. CAPSTONE: THE COMPLETE TRANSFER THEOREM
+================================================================================
+
+PROBLEM 9. Prove a single theorem of the following shape, or prove that no
+theorem of this shape exists and identify precisely what obstructs it.
+
+  For every bundle family satisfying [conditions to be discovered], every
+  admissible design class, and every accuracy functional in [class to be
+  characterized], there exist finitely many functionals F_1, ..., F_k of the
+  panel -- each computable from mu, beta and the family by an explicit integral
+  -- and an analytic function Psi such that
+
+      degradation(P -> P')  =  Psi( F_1(P), ..., F_k(P), F_1(P'), ..., F_k(P') )
+                               + R,
+
+  with R bounded by an explicit function of the ensemble size, sharp in the
+  sense that the exponent is attained; and no set of fewer than k functionals
+  suffices.
+
+The theorem must come with:
+  (a) the value of k, and the identification of the F_j;
+  (b) the domain: exactly which bundle families and which functionals are
+      covered, with a counterexample immediately outside it;
+  (c) EFFECTIVITY -- the F_j estimable from finite data with stated rates, since
+      a law in terms of unobservable functionals resolves nothing;
+  (d) the minimality proof, which is the part most likely to be wrong and should
+      be attacked first;
+  (e) the degenerate cases: which panels make Psi degenerate, and what the law
+      says there.
+
+A solution to Problem 9 subsumes the empirical questions this program cares
+about, not by addressing them individually but by leaving nothing for them to be
+exceptions to. That is the standard: the phenomena should fall out as corollaries
+of generality, not be solved one at a time and collected.
+
+
+================================================================================
+10. WHAT COUNTS AS A SOLUTION
+================================================================================
+
+For each problem, these are non-negotiable:
+
+EXACTNESS. An inequality is an answer only when accompanied by its equality
+cases and a proof of attainment. "Order-sharp" is not sharp.
+
+NECESSITY. A sufficient condition is half a theorem. Every characterization must
+run in both directions, and the reverse direction is where the work is.
+
+COMPUTABILITY FROM INPUTS. Every functional appearing in an answer must be an
+explicit functional of the given data. A law expressed in terms of quantities
+determined by the answer is circular, however analytic.
+
+RATES. Asymptotic statements require rates, and the rates require attainment
+examples.
+
+PRE-REGISTERED AUDIT POINTS. Any announced solution must state, IN THE
+ANNOUNCEMENT, the two or three steps on which it most depends and which a
+skeptical reader should attack first -- typically a uniformity hypothesis, an
+interchange of limits, or a step where the hardest case is claimed to reduce to
+the easiest. A proof whose author cannot name its weakest point has not been
+read carefully enough by its author.
+
+FALSIFIABILITY OF NEGATIVE CLAIMS. A claim that something is impossible, or
+invisible, or unreachable, must state what would have to exist for it to be
+false. An unfalsifiable impossibility claim is not a theorem; it is a place to
+put unfinished work.
+
+CONTROLS ON NULL RESULTS. A search that finds nothing is informative only if it
+is known to be capable of finding something. Every computational null must be
+accompanied by a positive control -- a configuration where the searched-for
+object provably exists and is found.
+
+
+================================================================================
+11. THE SHAPE OF THE ANSWER WE ARE HOPING FOR
+================================================================================
+
+The picture that would make this program complete, offered as a target rather
+than a conjecture:
+
+Panels form a space carrying a canonical metric. Degradation is an exact function
+of that metric. The metric decomposes into finitely many computable coordinates,
+which are precisely the reachable algebra of Problem 1. Bundle families split
+into a rigid class, where those coordinates determine the panel, and a flexible
+class, where the fibers are explicitly parameterized surgeries. The measurement
+classes form a lattice in Galois correspondence with quotients of the coordinate
+algebra, so that for any class one can compute what it can and cannot see.
+Accuracy functionals are classified by their behavior on this structure, and
+their disagreements are predicted rather than observed. The whole is effective:
+every coordinate is estimable, every rate is stated, and every negative result
+names its own refutation.
+
+Every one of the nine problems above is a piece of that picture. None of them is
+a step toward it that could be taken by extending an existing argument, which is
+the reason they are worth stating.

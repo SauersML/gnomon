@@ -1,0 +1,503 @@
+SIX PROBLEMS ON APPROXIMATION, COMPLEXITY, AND OPTIMAL METHOD
+=============================================================
+
+A fourth set, disjoint from the previous three. Those asked about spectra of
+structured ensembles, deterministic equivalents, estimation over reachable
+sets, and the quantitative theory of definitional rigidity. Nothing here
+touches any of them.
+
+These are of a different order of ambition, and deliberately so. The model is
+not "an open question in the area" but a question whose resolution creates an
+area: the existence of non-sofic groups, the Glimm-Effros dichotomy, the
+Connes embedding problem. Each asks whether a whole class of objects is
+approximable by, classifiable by, or constructible from a simpler class, and
+each has the property that BOTH answers are consequential. A yes gives a
+machine; a no gives a permanent obstruction and, with it, the knowledge to
+stop building machines that cannot exist.
+
+The set is split deliberately along an axis that matters more than the
+subject matter.
+
+Problems 1-3 and 6 are OBSTRUCTION problems. They ask what cannot be
+approximated, classified, or summarized. This is the kind of question the
+surrounding program has been generating on its own, because it is the kind
+that failure generates: a conjecture was stated, refuted by a channel nobody
+was tracking, restated with the channel added, and refuted again -- three
+cycles deep at the time of writing. Several of these ask, in different
+settings, whether that process terminates.
+
+Problems 4 and 5 are CONSTRUCTION problems, and they are the ones I would
+fund first. They ask not what is impossible but what is optimal: whether the
+best procedure for a task can be SYNTHESIZED rather than invented, and whether
+one representation of data can serve two purposes at once. Both are questions
+about method itself rather than about any particular method. Neither has, so
+far as I can determine, been posed as mathematics. They are here because a
+program that produces only obstructions eventually knows a great deal about
+what cannot be done and nothing about what to do, and because the single most
+valuable output either could have -- a procedure nobody would have thought of,
+arrived at by solving a variational problem rather than by having an idea --
+is not reachable from any obstruction theorem.
+
+
+------------------------------------------------------------------
+STANDING SETUP AND NOTATION
+------------------------------------------------------------------
+
+Throughout, nu is a probability law on R with mean 0 and variance 1, and
+x_1, x_2, ... are i.i.d. nu.
+
+A *design* of order d is a finite family S_d of subsets of [d] together with
+real coefficients (w_S) normalized so that sum_S w_S^2 = 1. It determines the
+multilinear form (a *chaos*)
+
+    f_d = sum_{S in S_d} w_S prod_{i in S} x_i .
+
+A sequence of designs is *admissible* if the maximal influence
+max_i sum_{S ni i} w_S^2 tends to 0 and the minimum degree tends to infinity.
+A design is *disjoint* if its sets are pairwise disjoint. Write L(D, nu) for
+the set of subsequential weak limits of f_d, Lambda_disj for the laws so
+arising from disjoint designs, and Lambda for the unrestricted analogue.
+
+The *hub energy of multiplicity j* is
+H_j(D) = sum_i ( sum_{S ni i} w_S )^j. H_2 governs the first known departure
+of Lambda from Lambda_disj; the H_j for j >= 3 are uncharted.
+
+A *nuisance class* K is a convex, weak-*-closed set of positive trace-class
+operators. An *experiment* is a family (P_theta)_{theta in Theta} of laws on a
+standard Borel space with (theta, A) -> P_theta(A) Borel.
+
+Known and deliberately excluded. The invariance-principle literature (Rotar,
+Mossel-O'Donnell-Oleszkiewicz, Nourdin-Peccati-Reinert) settles universality
+at BOUNDED degree under vanishing influences and is silent at degree tending
+to infinity, the only regime here. Gnedenko-Kolmogorov triangular-array
+calculus settles jump-free limits for INDEPENDENT arrays and is exactly what
+fails for dependent ones. Harrington-Kechris-Louveau settles the Glimm-Effros
+dichotomy for BOREL equivalence relations; Problem 2 is posed where that
+hypothesis is unavailable. Le Cam's asymptotic-equivalence theory supplies the
+vocabulary of Problems 4 and 5 and, as far as I can determine, none of their
+content: it characterizes when procedures TRANSFER between experiments, never
+how to produce one.
+
+
+==================================================================
+1. SOFICITY FOR DEPENDENT CHAOS
+==================================================================
+
+Sign-erasure phenomena say that for symmetric nu, every design's truncated
+second-moment structure is identical to that of its disjoint skeleton: the
+overlaps are invisible at second order, at every scale. Fourth order is a
+different matter -- there are designs whose fourth joint cumulant survives in
+the limit, and whose limit law is consequently a variance mixture rather than
+a Gaussian. A design looks disjoint through a second-order probe and does not
+look disjoint through a fourth-order one.
+
+That is the shape of a soficity question: an object is locally approximable by
+members of a simple class, and one asks whether it is globally a limit of
+them.
+
+Definition. Fix r. Two designs are *r-locally equivalent* if all their
+limiting joint cumulants of order at most r agree for every admissible nu. A
+design sequence is *soficly approximable* if for every r there is a disjoint
+design sequence r-locally equivalent to it.
+
+Q1a (soficity). Is every admissible design sequence soficly approximable? A
+    negative answer requires a design whose limiting cumulant profile is not
+    matched, at some finite order, by ANY disjoint design -- a "non-sofic
+    chaos".
+
+Q1b (the spectrum). Determine the closure of Lambda. Two candidate answers are
+    sharply different and both defensible: either Lambda-bar is exactly the
+    variance mixtures of centred Gaussians, so that dependence buys precisely
+    one new degree of freedom and nothing else, or it contains a law that is
+    not such a mixture, which is a new limit phenomenon for low-influence
+    forms.
+
+Q1c (finiteness of the obstruction theory). Is there a COUNTABLE family of
+    design functionals whose limits determine the limit law? The H_j are the
+    natural candidates. Prove that (H_j)_{j>=2} with the truncated variance
+    determine L(D, nu), or exhibit two admissible sequences agreeing in every
+    H_j and in truncated variance whose limit laws differ.
+
+Why it is hard, and why it is the right question. Both sides are live. For
+approximability: the sign-erasure argument is exact rather than asymptotic,
+and it is not clear what obstructs pushing it to higher order against a
+suitably chosen skeleton. Against: the known fourth-order counterexample is a
+random hypergraph tuned so that a Poisson overlap law survives in the limit,
+and an overlap law is an infinite-dimensional object that a disjoint design
+has no room to carry.
+
+Q1c is the operational question. A conjecture of the form "universality holds
+iff the coordinate law satisfies conditions C_1, ..., C_k" has been stated and
+refuted three times, each refutation supplying a new condition. Q1c asks
+whether that sequence terminates. A positive answer turns the conjecture into
+a theorem with a finite checklist. A negative answer says no such theorem
+exists, which is worth more than a fourth cycle.
+
+What a solution gives. Q1a resolved negatively produces the first object here
+that is not a perturbation of an independent one, and an invariant to name it
+by. Q1b gives the exact catalogue of limit laws for a class of forms currently
+believed to be Gaussian-or-degenerate. Q1c decides whether the classification
+programme can succeed at all.
+
+
+==================================================================
+2. DESCRIPTIVE COMPLEXITY IS MONOTONE UNDER GARBLING
+==================================================================
+
+Two theories of "how much an experiment tells you" exist and have never been
+connected. Le Cam's is quantitative and ordered by garbling: E is more
+informative than F if F is a stochastic transform of E. Descriptive set
+theory's is qualitative and ordered by Borel reducibility: the observational-
+equivalence relation of a family sits somewhere in smooth < E_0 < E_1 <
+E_{K_sigma} < analytic, and where it sits determines what kind of invariant
+can classify it.
+
+The conjecture is that these orders are compatible.
+
+Definition. For an experiment E, its *observational equivalence* Obs(E) on
+Theta is theta ~ theta' iff P_theta = P_theta'. For a Markov kernel M the
+*garbling* ME is (M P_theta). Write E >= F when F = ME for some M.
+
+Q2a (monotonicity). Does E >= F imply Obs(E) <=_B Obs(F): can garbling never
+    DECREASE descriptive complexity? Discarding information merges fibers, but
+    it also changes the parameterization, and Borel reducibility is not
+    monotone under arbitrary coarsening.
+
+Q2b (strictness). Exhibit E >= F with Obs(E) smooth and Obs(F) above E_0 -- a
+    single garbling that destroys classifiability outright. Conversely, is
+    there a deficiency bound: a limit on how far one garbling can raise
+    complexity, in terms of M?
+
+Q2c (dichotomy where it is unavailable). Observational equivalence for a
+    family that is not Borel-parameterized is analytic, and Glimm-Effros is
+    unavailable for analytic equivalence relations. Does the dichotomy
+    nevertheless hold for observational equivalence specifically -- is every
+    Obs(E) either smooth or above E_0 -- using the special structure (fibers
+    of a Borel map into a space of probability measures) that a general
+    analytic relation lacks?
+
+Why it is hard. Q2c is a restricted case of the analytic Glimm-Effros problem,
+open in general; the bet is that the restriction is what makes it tractable,
+since fibers of a Borel map into P(X) are far from arbitrary analytic classes.
+Q2a is hard structurally: reducibility asks for a map on PARAMETERS, garbling
+acts on DISTRIBUTIONS, and passing between them requires a measurable
+selection of parameters from laws -- which is exactly what fails when the
+relation is non-smooth. That circularity is the mathematical content.
+
+What a solution gives. A theory in which "this class is unidentifiable"
+becomes a quantity trackable through a processing chain rather than a verdict
+re-derived at each stage. Q2b's example would be the first demonstration that
+a data-reduction step can destroy classifiability -- not accuracy,
+classifiability. Monotonicity, if true, is the data-processing inequality for
+descriptive complexity and would be used as the ordinary one is.
+
+
+==================================================================
+3. IMITATION AS A CAPACITY
+==================================================================
+
+Let K be a nuisance class and consider detecting a rank-one perturbation
+against it. The decisive phenomenon is that a perturbation MIXED OVER A PRIOR
+can be exactly a member of K: the alternative is then a mixture of nulls, the
+experiments are identical, and no test separates them at any sample size. The
+obstruction is identifiability, not power, and no amount of estimation,
+splitting, or joint modelling touches it.
+
+Definition. The *imitation capacity* is
+
+    t*(K) = sup { lambda^2 : the lambda-mixed rank-one alternative lies in the
+                  closed convex hull of the null family } ,
+
+and K is *rigid* if t*(K) = 0. Unconstrained spectral classes have t* bounded
+away from 0; classes constrained by a transitive symmetry appear rigid,
+because averaging over the symmetry annihilates a delocalized perturbation.
+
+Q3a (variational formula). Express t*(K) via the extreme boundary of K.
+    Conjecture: rigidity holds iff the extreme points are the orbit closure of
+    a group acting transitively on the relevant sphere, so no extreme point
+    can carry a localized perturbation. Prove it, or find a rigid class with
+    no such symmetry.
+
+Q3b (duality). Is there a Hahn-Banach certificate: t*(K) = 0 iff some bounded
+    linear functional is nonnegative on K and strictly negative on every mixed
+    alternative? This converts every adaptive lower bound in the subject into
+    an explicit convex-duality computation and every rigidity claim into an
+    exhibited certificate.
+
+Q3c (capacitability). Is t* a Choquet capacity -- monotone, continuous along
+    increasing sequences, strongly subadditive? If so, capacitability yields
+    measurable selection of near-optimal imitators over analytic families of
+    nuisance classes: a general machine for composite lower bounds, each of
+    which is currently produced by hand.
+
+Why it is hard. Strong subadditivity is a genuine geometric demand -- that the
+ability to imitate over a union is controlled by the pieces and their
+intersection -- and mixing is global, with no obvious reason to respect it.
+Q3a is hard because rigidity is currently established only by explicit
+averaging tied to particular symmetries, and a characterization must handle
+classes whose extreme boundary is not a single orbit. Underlying both: convex
+hulls of covariance classes are badly behaved, and their extreme points are
+known in almost no case of interest.
+
+What a solution gives. A criterion, checkable from the class alone, saying
+whether adaptation over it is free or impossible -- BEFORE any procedure is
+designed. Current practice designs a procedure, fails to prove a guarantee,
+and then discovers the obstruction.
+
+
+==================================================================
+4. SYNTHESIS OF OPTIMAL PROCEDURES, AND THE COMPLETENESS OF THE
+   LOWER-BOUND CALCULUS
+==================================================================
+
+This subject determines optimal rates by a small, fixed catalogue of
+lower-bound arguments -- two-point testing, Assouad's cube, Fano and its
+metric-entropy relatives -- and determines optimal PROCEDURES by invention.
+The asymmetry is total: rates are derived, procedures are thought of. Nobody
+knows whether either half is complete, and the question has not been asked in
+a form that admits an answer, because "lower-bound method" and "procedure that
+someone might think of" are not mathematical objects.
+
+Making them into mathematical objects is the first half of this problem, and
+the reason it is on this list.
+
+Definition. Fix a class of *risk problems* -- tuples (Theta, (P_theta), loss,
+n) drawn from some effectively presented family -- and write R_n* for minimax
+risk. A *certificate calculus* C is a set of maps from problem descriptions to
+lower bounds, closed under the operations the subject actually uses:
+reduction to a subproblem, convexification, tensorization, and change of
+measure. C is *complete* on a class if for every problem in it,
+sup_{c in C} c(problem) matches R_n* up to absolute constants.
+
+Q4a (completeness of the calculus). Is the standard calculus complete for
+    problems with convex parameter set and convex loss? Or exhibit a problem
+    whose true minimax rate is strictly above everything the calculus can
+    certify, and PROVE the gap. Proving a gap means proving a statement about
+    all certificates at once, which is why this requires the formalization
+    above rather than being a question about any one bound.
+
+Q4b (synthesis). Minimax duality identifies the optimal procedure as Bayes
+    against a least-favourable prior when one exists. When does it exist, and
+    when is it computable from the problem description? Specifically: is there
+    a problem whose minimax risk is attained but for which NO optimal
+    procedure is computable from the description, in a fixed model of
+    computation? That is the exact statement that optimal method cannot be
+    synthesized in general, and it would be the first such statement.
+
+Q4c (the synthesis machine, the positive form). Characterize a class of
+    problems on which the least-favourable prior is the solution of an
+    explicitly computable convex program, so that the optimal procedure can be
+    OUTPUT rather than invented. Candidate class: problems whose likelihood
+    ratio depends on the nuisance only through a quadratic form -- the same
+    condition conjectured in Problem 6 to make thresholds order 1, which is
+    either a coincidence or the shadow of a single theorem.
+
+Q4d (what invention adds). If the calculus is incomplete, is the deficit
+    itself an invariant? Define the *certification gap* as the ratio of the
+    true rate to the best certifiable bound, and ask whether it is bounded on
+    natural classes, or whether it can be made arbitrarily large. A bounded
+    gap says the toolkit is essentially sufficient; an unbounded one says
+    there are problems whose difficulty is invisible to every argument the
+    subject knows how to make.
+
+Why it is hard, and why it is worth it. The obstacle is that a negative answer
+to Q4a is a meta-theorem: one must determine a true rate by means outside the
+calculus and then show the calculus cannot reach it, which requires the
+calculus to be closed under enough operations to be worth the name and still
+tractable enough to be bounded. That is the same difficulty faced in proving
+lower bounds against restricted proof systems, and the techniques there --
+interpolation, feasible-interpolation-style arguments, model-theoretic
+separations -- are the obvious place to look, though the analogy has not been
+attempted. Q4b is hard because computability of a least-favourable prior is a
+question about a fixed point of an infinite-dimensional saddle problem, and
+the standard existence proofs are non-constructive in a way that has never
+been analysed.
+
+What a solution gives. This is the problem whose positive resolution produces
+methods that nobody would have thought of. Q4c is literally a machine that
+takes a problem and returns the optimal procedure; even a narrow class would
+change practice, because the class would be characterized by a checkable
+condition rather than by whether anyone has had the idea. Q4a and Q4d answer a
+question every practitioner faces and nobody can currently answer: when a
+lower bound cannot be proved, is the bound false, or is the toolkit blind?
+Those are different situations demanding opposite responses, and at present
+they are indistinguishable.
+
+
+==================================================================
+5. SIMULTANEOUS OPTIMALITY: IS THERE A FREE REPRESENTATION?
+==================================================================
+
+Data is almost never used for one purpose. It is reduced once -- projected,
+whitened, pruned, embedded, summarized -- and the reduction is then used for
+detection, for estimation, and for prediction under conditions different from
+those it was built under. The reduction is invariably chosen for one of those
+tasks, or for none of them, and the cost to the others is not merely unknown
+but has no accepted definition.
+
+There is direct evidence the cost is real. For detecting a weak latent
+component against a structured background, detectability is governed by a
+normalized trace of the INVERSE background, which is dominated by the
+directions of smallest variance; reductions that discard low-variance
+directions -- the standard, near-universal preprocessing -- discard exactly
+the directions carrying detection power. The same reduction is close to
+optimal for reconstruction. So two tasks, one representation, opposite
+prescriptions.
+
+Definition. A *reduction* is a measurable map T from the sample space to a
+second standard Borel space. For a task t with optimal risk R_t(full data),
+the *efficiency* of T at t is eff_t(T) = R_t(full)/R_t(T), in [0,1]. A finite
+family of tasks is *co-optimizable* if there is a single T with eff_t(T) -> 1
+for every t in the family.
+
+Q5a (the uncertainty principle). Exhibit two tasks that are not
+    co-optimizable, with a quantitative trade-off: a bound
+    Phi(eff_1(T), eff_2(T)) <= 1 valid for every reduction T, with Phi
+    explicit and tight. Detection versus reconstruction against a structured
+    background is the candidate instance; the conjectured obstruction is the
+    angle, in the metric induced by the background, between the directions the
+    two tasks weight.
+
+Q5b (classification of the task lattice). Characterize which families of tasks
+    ARE co-optimizable. Conjecture: co-optimizability holds iff the tasks'
+    influence functions span a common invariant subspace of the nuisance
+    operator -- so that the obstruction is a genuine non-commutation, not a
+    matter of sample size or of cleverness. If so, co-optimizability becomes
+    checkable from the model before any reduction is built.
+
+Q5c (the optimal reduction, single task). Is the optimal reduction for a
+    single task always the solution of a convex program over the space of
+    Markov kernels? The space of reductions is not convex under composition,
+    which is the standard reason to expect no, but the RISK is affine in the
+    kernel, which is the standard reason to expect yes. Settling this decides
+    whether preprocessing can be optimized rather than chosen.
+
+Q5d (the price of modularity, quantitatively). Define the *modularity gap* of
+    a task family as the largest ratio, over families, between the risk of the
+    best single shared reduction and the product of the individually optimal
+    risks. Is it bounded on natural families? An unbounded modularity gap is
+    the statement that shared pipelines are not merely suboptimal but
+    unboundedly so, which no result currently asserts or denies.
+
+Why it is hard. Q5a demands a lower bound quantified over ALL measurable
+reductions, including non-linear and randomized ones, where the only general
+tool is data processing -- and data processing is too coarse, since it bounds
+each task separately and says nothing about the trade-off between them. What
+is needed is a joint data-processing inequality, an object that does not
+exist. Q5c is hard because the natural convexification changes the problem:
+the convex hull of reductions is the set of randomized reductions, and whether
+randomization helps here is itself open.
+
+What a solution gives. Q5a and Q5d put a number on a decision made constantly
+and never analysed: whether to build one representation or several. Q5b makes
+the decision checkable in advance. Q5c is the constructive half -- if the
+optimal reduction solves a convex program, then preprocessing joins the list
+of things that are computed rather than chosen, and the computed answer will
+in general not resemble anything currently used. Together with Problem 4 this
+is the constructive core of the set: Problem 4 synthesizes the procedure,
+Problem 5 synthesizes what it should be given.
+
+
+==================================================================
+6. THE ORDER OF A THRESHOLD
+==================================================================
+
+There is a clean theory of the minimal order of a continuous summary
+determining a functional: for a functional on a d-dimensional set of
+directions, the minimal order of a continuous uniform summary is the dimension
+of the span, and the obstruction is topological (invariance of domain) rather
+than set-theoretic, since a Borel isomorphism supplies a measurable summary of
+order 1.
+
+Detection thresholds are the case that matters, and they behave surprisingly.
+For a rank-one signal in noise with column structure K, the threshold is
+governed by a SINGLE scalar functional of K -- a normalized trace of the
+inverse -- and notably neither by the spectral edge nor by the participation
+ratio, the two functionals the subject has historically used. That is an
+order-1 summary of an infinite-dimensional nuisance parameter. Whether this is
+an accident of the model or an instance of a principle is unknown, and the
+answer decides whether "effective dimension" scalars can exist in general.
+
+Q6a (the one-parameter principle). Is there a class of detection problems in
+    which the threshold provably has order 1, and can it be characterized?
+    Candidate: exactly those problems whose likelihood ratio, after the
+    appropriate whitening, depends on the nuisance only through a quadratic
+    form. Note this is the same candidate class as Q4c.
+
+Q6b (infinite order). Exhibit a detection problem whose threshold has infinite
+    order: two sequences of nuisance structures agreeing in every continuous
+    scalar functional from a prescribed rich family, with different
+    thresholds. This is the definitive statement that no effective-sample-size
+    scalar exists in general.
+
+Q6c (order and topology). Is the order of a threshold a topological invariant
+    of the nuisance manifold, computable from the geometry of the class before
+    any analysis of the detection problem? The order theory for summaries is
+    topological in origin; the conjecture is that thresholds inherit that.
+
+Why it is hard. Q6b requires two structures indistinguishable by a rich family
+of functionals but distinguishable by a threshold, and a threshold is defined
+by an asymptotic optimization over tests, so the distinguishing quantity has
+no closed form. The standard route -- compute both and compare -- is
+unavailable exactly where the answer is interesting. Q6a is hard because a
+characterization must explain why the two functionals the subject has always
+used are both wrong for the one case that is fully solved.
+
+What a solution gives. Q6a is a licence: within the characterized class a
+scalar effective-dimension summary exists and can be sought. Q6b is a
+prohibition, and prohibitions here have been worth more than licences, because
+the effort spent searching for scalar summaries is large and, if Q6b holds,
+permanently wasted.
+
+
+------------------------------------------------------------------
+WHAT I VOUCH FOR
+------------------------------------------------------------------
+
+Relation to existing work. Problem 1 is a soficity question in a setting where
+soficity has not been asked; the local-to-global vocabulary is borrowed
+deliberately and the analogy is structural, not decorative. Problem 2 asks for
+a bridge between Le Cam theory and Borel reducibility that I have not found in
+either literature, and its hardest part is a restricted instance of the
+analytic Glimm-Effros problem, which is open. Problem 3 treats as a capacity
+an object that has not been treated as one; the rigidity it generalizes is
+established only in examples. Problem 4's Q4a is, to my knowledge, the first
+attempt to ask whether this subject's lower-bound toolkit is COMPLETE, and the
+right comparison is proof complexity rather than statistics -- a field where
+exactly this question, asked about restricted proof systems, produced decades
+of theory. Problem 5 has an adjacent literature (sufficiency, information
+bottleneck, sufficient dimension reduction) that treats single tasks; the
+joint question, and with it the joint data-processing inequality Q5a needs,
+appears absent. Problem 6 extends an order theory that exists for summaries to
+thresholds, where it does not.
+
+Two structural remarks that a solver should have. First, the candidate class
+in Q4c and the candidate class in Q6a are the same -- likelihood ratios
+depending on the nuisance through a quadratic form. Either that is a
+coincidence or there is one theorem behind both, and finding it may be easier
+than either problem separately. Second, Problems 4 and 5 compose: Q4c
+synthesizes the optimal procedure given the data, Q5c synthesizes the optimal
+reduction of the data, and the composite question -- synthesize both jointly,
+since the optimal reduction depends on the procedure and conversely -- is a
+fixed point that neither problem alone poses. I have not stated it as a
+seventh problem because I cannot make it precise without an answer to at least
+one of its halves, but it is the real target and both halves are worth solving
+for it.
+
+I cannot certify that all six are unsolved, and the risk is unevenly
+distributed. Q2c is open in the general case with certainty; whether the
+restriction to observational equivalence has been studied, I do not know. Q5c
+may exist in the sufficient-dimension-reduction or information-bottleneck
+literature under different hypotheses and should be searched before serious
+effort. Q1a, Q1c, Q3c, Q4a, Q4b and Q6b I would expect to be genuinely open.
+
+Ordering by expected difficulty, hardest first: Q4a, Q1b, Q2c, Q3c, Q6b, Q5a.
+Ordering by consequence if solved: Q4c, Q1c, Q5c, Q6b, Q4a, Q3b. Q4c and Q5c
+first because they are the only two entries on this list whose solution
+produces a method rather than a verdict, and because both are stated so that
+a positive answer is a construction one can run. Q1c and Q6b next because both
+are cases where the NEGATIVE answer is the more valuable one -- Q1c would end
+a classification programme that has failed three times, and Q6b would redirect
+a large and currently unfocused search. That two of the four highest-value
+entries are valuable for being negative is unusual, and worth stating plainly
+to anyone deciding what to attempt.
