@@ -197,8 +197,10 @@ def main() -> int:
 
         forbidden = [
             (r"\badmit\b", "contains `admit`"),
-            (r"(?m)^\s*(?:private\s+)?axiom\b", "declares a custom axiom"),
-            (r"(?m)^\s*(?:unsafe|partial)\b", "declares unsafe or partial code"),
+            (r"(?m)^\s*(?:(?:private|protected)\s+)*axiom\b",
+             "declares a custom axiom"),
+            (r"(?m)^\s*(?:(?:private|protected|noncomputable)\s+)*(?:unsafe|partial)\b",
+             "declares unsafe or partial code"),
             (r"\bnative_decide\b", "uses `native_decide`"),
             (r"\b(?:sorryAx|Lean\.ofReduceBool|Lean\.trustCompiler)\b",
              "references a forbidden proof/compiler axiom directly"),
