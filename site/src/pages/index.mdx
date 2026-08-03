@@ -49,10 +49,18 @@ the Hudson value.
 <div class="label">step 2 · calculate the additive variance the score explains in the target population</div>
 
 $V_A$ is the additive genetic variance that the score explains in the source
-population. The SNPs in a score, the single nucleotide polymorphisms it carries, rarely
-include the causal variants. Each SNP tags a causal variant through linkage
-disequilibrium instead, and $\rho^{2}$ is the fraction of
-that tagging which survives in the target population.
+population. The SNPs in a score, the single nucleotide polymorphisms it carries,
+rarely include the causal variants. Each SNP tags a causal variant through
+linkage disequilibrium instead, and $\rho^{2}$ is the fraction of that tagging
+which survives in the target population.
+
+You cannot read $\rho^{2}$ off a reference panel, because it depends on which
+causal variants the score's SNPs tag and on how that tagging changes between the
+two populations. You measure it instead: score one target cohort, measure the
+accuracy ratio against the source population, and that ratio bounds $\rho^{2}$
+from above once you divide out $1 - F_{ST}$. Wright-Fisher simulations of three
+demographies measured values from 0.50 to 1.06, so treat a value near 1 as a
+claim that needs its own measurement rather than a safe default.
 
 $$
 V_{\text{target}} = \rho^{2}\,(1 - F_{ST})\,V_A
