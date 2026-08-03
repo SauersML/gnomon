@@ -273,7 +273,7 @@ def main() -> int:
     if len(undeclared) > UNDECLARED_BUDGET:
         bad.append(f"definitions making an empirical claim without an Empirical status marker: "
                    f"{len(undeclared)}, budget {UNDECLARED_BUDGET}")
-        bad.extend("    " + u for u in undeclared[:8])
+        bad.extend("    " + u for u in undeclared)
 
     # 3c. Unrelated same-quantity definitions. Two definitions are the same
     #     quantity when their bodies agree after renaming that definition's own
@@ -372,7 +372,7 @@ def main() -> int:
     if len(missing) > MISSING_ARG_BUDGET:
         bad.append(f"definitions omitting an argument the named quantity depends on: "
                    f"{len(missing)}, budget {MISSING_ARG_BUDGET}")
-        bad.extend("    " + x for x in missing[:10])
+        bad.extend("    " + x for x in missing)
 
     # 3d-bis. Overclaiming. Two of the falsified definitions carried the word
     #     "exact" in a docstring while being 26 percent wrong. A definition may
@@ -393,7 +393,7 @@ def main() -> int:
     if len(overclaim) > OVERCLAIM_BUDGET:
         bad.append(f"untested definitions whose docstring claims exactness: "
                    f"{len(overclaim)}, budget {OVERCLAIM_BUDGET}")
-        bad.extend("    " + x for x in overclaim[:10])
+        bad.extend("    " + x for x in overclaim)
 
     # 3f. Convention declarations on composable quantities. A definition
     #     producing a quantity and another consuming it can disagree about its
@@ -423,7 +423,7 @@ def main() -> int:
     if len(undeclared_conv) > CONVENTION_DECL_BUDGET:
         bad.append(f"definitions taking an ambiguity-prone quantity with no declared "
                    f"convention: {len(undeclared_conv)}, budget {CONVENTION_DECL_BUDGET}")
-        bad.extend("    " + x for x in undeclared_conv[:8])
+        bad.extend("    " + x for x in undeclared_conv)
 
 
     # 3g. Naming conflation. One formula carrying names from different concept
@@ -470,7 +470,7 @@ def main() -> int:
     if len(conflated) > CONFLATION_BUDGET:
         bad.append(f"definitions sharing one formula across concept families with no Denotes "
                    f"declaration: {len(conflated)}, budget {CONFLATION_BUDGET}")
-        bad.extend("    " + x for x in conflated[:8])
+        bad.extend("    " + x for x in conflated)
 
 
     # 3h. Equilibrium without a dynamic. `selectionMigrationEquilibrium s m =
@@ -563,7 +563,7 @@ def main() -> int:
         bad.append(f"equilibrium definitions with no theorem deriving them as the fixed point "
                    f"of a process in the same file: {len(stipulated)}, budget {EQUILIBRIUM_BUDGET}; "
                    f"define the one-step map and prove `<name>_isFixedPoint`")
-        bad.extend("    " + x for x in stipulated[:12])
+        bad.extend("    " + x for x in stipulated)
 
     # 3i. One body, two files. `t / (t + 2 Ne)`, `1 - (1 - 1/(2 Ne)) ^ t` and
     #     `1 - exp (-tau)` were three definitions of F_ST living in three
@@ -685,7 +685,7 @@ def main() -> int:
         bad.append(f"alpha-equivalent definition bodies in different files tied by neither a "
                    f"call nor a theorem: {len(duplicates)}, budget {DUPLICATE_BODY_BUDGET}; "
                    f"make one call the other, or state the identity as a theorem")
-        bad.extend("    " + x for x in duplicates[:12])
+        bad.extend("    " + x for x in duplicates)
 
     # 3j. Regimes baked into bodies. Five definitions -- the within-population
     #     heterozygosity loss, the F_ST read off it, the target heterozygosity,
@@ -753,7 +753,7 @@ def main() -> int:
         bad.append(f"definitions encoding a drift regime with no declared Regime: "
                    f"{len(regimeless)}, budget {REGIME_DECL_BUDGET}; name the "
                    f"data-generating assumption, see Calibrator.DriftRegime")
-        bad.extend("    " + x for x in regimeless[:12])
+        bad.extend("    " + x for x in regimeless)
 
     # 3j-bis. Under-delivery: a docstring claiming more than the signature
     #     proves. This is the mirror of the overclaim screen. That one catches a
@@ -875,7 +875,7 @@ def main() -> int:
         bad.append(f"docstrings attributing an identity the statement does not deliver: "
                    f"{len(underdelivered)}, budget {UNDERDELIVERY_BUDGET}; state the "
                    f"identity in the conclusion, or stop claiming it in the prose")
-        bad.extend("    " + x for x in underdelivered[:12])
+        bad.extend("    " + x for x in underdelivered)
 
     # 3k. Validation inherited from a sibling identity. Over-determination
     #     detects divergence between independently written formulas and is
@@ -910,7 +910,7 @@ def main() -> int:
     elif len(inherited) > INHERITED_VALIDATION_BUDGET:
         bad.append(f"VALIDATED tags justified by a sibling identity rather than a measurement: "
                    f"{len(inherited)}, budget {INHERITED_VALIDATION_BUDGET}")
-        bad.extend("    " + x for x in inherited[:10])
+        bad.extend("    " + x for x in inherited)
 
     # 3l. Validation with no power. `neutralAFBenchmarkRatio` was recorded as
     #     validated to 3.2 percent. The design was symmetric, so both sides of the
@@ -954,7 +954,7 @@ def main() -> int:
         bad.append(f"VALIDATED tags whose design had no recorded power: {len(powerless)}, "
                    f"budget {VACUOUS_VALIDATION_BUDGET}; record the spread of the prediction "
                    f"across the design, see Calibrator.DriftRegime")
-        bad.extend("    " + x for x in powerless[:12])
+        bad.extend("    " + x for x in powerless)
 
     # 3e. Cheap structural integrity, run before the build so that a broken
     #     rename or an unterminated comment fails in seconds rather than after a
@@ -998,7 +998,7 @@ def main() -> int:
     isolated = sorted(m for m in all_mods if not linked.get(m))
     if len(isolated) > ISOLATED_MODULE_BUDGET:
         bad.append(f"semantically isolated modules rose to {len(isolated)}, budget "
-                   f"{ISOLATED_MODULE_BUDGET}: {', '.join(isolated[:6])}...; relate the new "
+                   f"{ISOLATED_MODULE_BUDGET}: {', '.join(isolated)}; relate the new "
                    f"module's quantities to an existing one so it can be contradicted")
 
     if sites > CONVENTION_SITE_BUDGET:
