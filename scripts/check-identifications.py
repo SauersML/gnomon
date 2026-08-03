@@ -235,29 +235,44 @@ def main() -> int:
             # Each is a ratchet, not a cleanup. They cost nothing to adopt and
             # each closes a way to make the kernel accept something without the
             # mathematics having been done.
-            (r"(?m)^\s*set_option\b",
+            (r"(?m)^[ \t]*set_option\b",
              "sets a compiler option in a proof module: `debug.skipKernelTC` "
              "stops the kernel from checking the declaration at all, "
              "`debug.byAsSorry` turns every `by` block into a sorry, and "
              "`autoImplicit true` re-enables inside one file the very thing "
              "lakefile.lean disables for the library"),
-            (r"(?m)^\s*(?:(?:scoped|local)\s+)*(?:notation|infixl|infixr|infix|prefix|postfix|notation3)\b",
+            (r"(?m)^[ \t]*(?:(?:scoped|local)[ \t]+)*(?:notation|infixl|infixr|infix|prefix|postfix|notation3)\b",
              "rebinds notation: `+`, `≤`, `∈` or `‖·‖` bound to a convenient "
              "operation leaves every theorem statement in the file reading as "
              "ordinary mathematics while elaborating to something else"),
-            (r"(?m)^\s*(?:(?:private|protected|noncomputable)\s+)*opaque\b",
+            (r"(?m)^[ \t]*(?:(?:private|protected|noncomputable)[ \t]+)*opaque\b",
              "declares an `opaque` constant, which asserts an inhabitant "
              "without giving one -- for a `Prop` that is an axiom under "
              "another keyword"),
-            (r"(?m)^\s*attribute\s*\[[^\]]*\binstance\b",
+            (r"(?m)^[ \t]*attribute[ \t]*\[[^\]\n]*\binstance\b",
              "registers an instance by attribute, which puts a proposition "
              "where typeclass synthesis will find it without any use site "
              "naming it"),
-            (r"(?m)^\s*(?:(?:local|scoped)\s+)*instance\b[^:]*:\s*Fact\b",
-             "declares a `Fact` instance: synthesis then supplies the "
-             "proposition silently, and the proof that uses it looks like "
+            # A `Fact` instance is banned only when it takes a PARAMETER. The
+            # distinction is the whole point, and the corpus has one instance on
+            # each side of it.
+            #
+            # `local instance : Fact (2 ≤ 2) := ⟨by decide⟩` in Calibrator.lean
+            # is closed and proved: it discharges the `[Fact (2 ≤ t)]` binders on
+            # the two-locus definitions in DGP at `t = 2`, and `decide` settles
+            # it outright. Nothing is being assumed, so there is nothing to
+            # launder, and banning it would delete a proof.
+            #
+            # A PARAMETERIZED `Fact` instance is the opposite: it takes the
+            # proposition, or something implying it, from its own argument and
+            # then hands it to synthesis. Every later `simp` and every later
+            # lemma application depends on it without any signature saying so,
+            # which is precisely the invisibility guard 3o exists to prevent.
+            (r"(?m)^[ \t]*(?:(?:local|scoped)[ \t]+)*instance\b[^\n]*[({\[][^\n]*:[ \t]*Fact\b",
+             "declares a parameterized `Fact` instance: synthesis then supplies "
+             "the proposition silently, and every proof that uses it looks like "
              "routine instance plumbing"),
-            (r"(?m)^\s*#(?:eval|reduce|print|check|exit)\b",
+            (r"(?m)^[ \t]*#(?:eval|reduce|print|check|exit)\b",
              "leaves an elaboration-time command in a proof module: `#eval` "
              "runs arbitrary `IO` while the file elaborates, which can rewrite "
              "the very artefacts a later step checks"),
