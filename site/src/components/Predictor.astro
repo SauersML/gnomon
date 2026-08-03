@@ -6,17 +6,17 @@
  * JavaScript. The script then recomputes on input and redraws one curve.
  */
 
-// Defaults match the worked example in section I.
+// Defaults match the worked example in the five-step chain.
 const d = {
   t: 400,        // generations since the split
   Ne: 10000,     // effective population size
   rho2: 0.8,     // fraction of tagging that survives
-  VA: 0.2,       // variance the score explains in the source population
-  VE: 0.8,       // residual variance
+  VA: 0.2,       // additive variance the score explains in the source population
+  VE: 0.8,       // residual liability variance
   K: 0.1,        // trait prevalence
 };
 
-// --- the chain, in the same order as section I -----------------------------
+// --- the chain, in the same order as the five steps ------------------------
 const erf = (x: number) => {
   const s = x < 0 ? -1 : 1;
   x = Math.abs(x);
@@ -51,7 +51,7 @@ const f = (x: number, n = 4) => (Number.isFinite(x) ? x.toFixed(n) : "—");
 ---
 
 <figure class="panel" id="predictor">
-  <figcaption class="panel-title">Move a slider to see how the input changes the AUC in the target population</figcaption>
+  <figcaption class="panel-title">Move a slider to see how each input changes the AUC in the target population</figcaption>
 
   <div class="panel-body">
     <div class="controls">
@@ -66,22 +66,22 @@ const f = (x: number, n = 4) => (Number.isFinite(x) ? x.toFixed(n) : "—");
         <input type="range" id="in-Ne" min="500" max="50000" step="100" value={d.Ne} />
       </label>
       <label>
-        <span>Fraction of LD tagging kept in the target population</span>
+        <span>Fraction of the LD tagging that the target population keeps</span>
         <b data-out="rho2">{d.rho2.toFixed(2)}</b>
         <input type="range" id="in-rho2" min="0.1" max="1" step="0.01" value={d.rho2} />
       </label>
       <label>
-        <span>Variance the score explains in the source population</span>
+        <span>Additive variance the score explains in the source population</span>
         <b data-out="VA">{d.VA.toFixed(2)}</b>
         <input type="range" id="in-VA" min="0.01" max="0.6" step="0.01" value={d.VA} />
       </label>
       <label>
-        <span>Variance the score does not explain</span>
+        <span>Residual liability variance</span>
         <b data-out="VE">{d.VE.toFixed(2)}</b>
         <input type="range" id="in-VE" min="0.2" max="1.4" step="0.01" value={d.VE} />
       </label>
       <label>
-        <span>Trait prevalence</span>
+        <span>Trait prevalence in the target population</span>
         <b data-out="K">{d.K.toFixed(3)}</b>
         <input type="range" id="in-K" min="0.005" max="0.5" step="0.005" value={d.K} />
       </label>
@@ -91,22 +91,22 @@ const f = (x: number, n = 4) => (Number.isFinite(x) ? x.toFixed(n) : "—");
       <div class="headline">
         <div class="big">
           <div class="big-value" data-out="kept">{f((r20 / r2src0) * 100, 1)}%</div>
-          <div class="big-key">of the source accuracy survives the transfer</div>
+          <div class="big-key">of the source-population R² survives in the target population</div>
         </div>
         <div class="big">
           <div class="big-value" data-out="auc">{f(auc0)}</div>
           <div class="big-key">AUC in the target population</div>
-          <div class="big-sub">source: <span data-out="aucSrc">{f(aucSrc0)}</span></div>
+          <div class="big-sub">source population: <span data-out="aucSrc">{f(aucSrc0)}</span></div>
         </div>
       </div>
       <dl class="steps">
         <div><dt>Hudson <i>F</i><sub>ST</sub></dt><dd data-out="fst">{f(fst0)}</dd></div>
-        <div><dt>Variance the score explains in the target</dt><dd data-out="vt">{f(vt0)}</dd></div>
-        <div><dt>Accuracy in the target population</dt><dd data-out="r2">{f(r20)}</dd></div>
+        <div><dt>Additive variance the score explains in the target</dt><dd data-out="vt">{f(vt0)}</dd></div>
+        <div><dt>R² on the liability scale in the target population</dt><dd data-out="r2">{f(r20)}</dd></div>
       </dl>
       <p class="regime" data-out="regime" hidden>
         The formula has no answer for these inputs. The score explains too much
-        of the liability for a trait this rare.
+        of the liability variance for a trait of this prevalence.
       </p>
     </div>
   </div>

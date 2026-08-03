@@ -1,0 +1,114 @@
+---
+/**
+ * Hudson F_ST after a clean population split, against the age of the split.
+ *
+ * The two curves are the closed form F_ST = t / (t + 2 N_e). The points are
+ * msprime coalescent simulations recorded in
+ * proofs/validation/popgen_defs/defs.json under check "split_fst": two
+ * independent replicates per cell, each a 2 Mb sequence with 40 diploids
+ * sampled from each of the two populations, scored with the Hudson ratio
+ * estimator. Nothing here is fitted.
+ */
+const measured = [
+  // N_e = 1000
+  { Ne: 1000, t: 50, fst: 0.012712083757081065 },
+  { Ne: 1000, t: 50, fst: 0.012045975345616954 },
+  { Ne: 1000, t: 100, fst: 0.07942023798142271 },
+  { Ne: 1000, t: 100, fst: 0.033536540258490836 },
+  { Ne: 1000, t: 250, fst: 0.10536200050830127 },
+  { Ne: 1000, t: 250, fst: 0.12061064439457347 },
+  { Ne: 1000, t: 500, fst: 0.23770416995565186 },
+  { Ne: 1000, t: 500, fst: 0.15078850570281385 },
+  { Ne: 1000, t: 1000, fst: 0.36710214808225106 },
+  { Ne: 1000, t: 1000, fst: 0.41620261776328615 },
+  { Ne: 1000, t: 2000, fst: 0.42730073267110025 },
+  { Ne: 1000, t: 2000, fst: 0.4861301768416911 },
+  { Ne: 1000, t: 4000, fst: 0.7030407837216243 },
+  { Ne: 1000, t: 4000, fst: 0.7118352128594078 },
+  // N_e = 5000
+  { Ne: 5000, t: 50, fst: 0.0026822954466417122 },
+  { Ne: 5000, t: 50, fst: 0.005592716634272859 },
+  { Ne: 5000, t: 100, fst: 0.01612382063361206 },
+  { Ne: 5000, t: 100, fst: 0.007341425822564734 },
+  { Ne: 5000, t: 250, fst: 0.02394118365544093 },
+  { Ne: 5000, t: 250, fst: 0.022428460879734317 },
+  { Ne: 5000, t: 500, fst: 0.0337728840850467 },
+  { Ne: 5000, t: 500, fst: 0.0480192344594662 },
+  { Ne: 5000, t: 1000, fst: 0.08073759966204679 },
+  { Ne: 5000, t: 1000, fst: 0.09304129790809863 },
+  { Ne: 5000, t: 2000, fst: 0.18930150088878062 },
+  { Ne: 5000, t: 2000, fst: 0.16569783325332857 },
+  { Ne: 5000, t: 4000, fst: 0.37325421076029963 },
+  { Ne: 5000, t: 4000, fst: 0.28083450560100215 },
+];
+
+const fst = (t: number, Ne: number) => t / (t + 2 * Ne);
+
+const W = 760, H = 340, L = 62, R = 22, T = 18, B = 48;
+const iw = W - L - R, ih = H - T - B;
+const lx = Math.log10;
+const x0 = lx(35), x1 = lx(6000), y0 = 0, y1 = 0.78;
+const X = (t: number) => L + ((lx(t) - x0) / (x1 - x0)) * iw;
+const Y = (v: number) => H - B - ((v - y0) / (y1 - y0)) * ih;
+
+const line = (Ne: number) => {
+  let d = "";
+  for (let i = 0; i <= 240; i++) {
+    const t = 10 ** (x0 + ((x1 - x0) * i) / 240);
+    d += (i ? "L" : "M") + X(t).toFixed(2) + " " + Y(fst(t, Ne)).toFixed(2);
+  }
+  return d;
+};
+
+const S = 5; // half-side of the square mark used for the larger population
+---
+
+<figure class="fig">
+  <figcaption class="fig-title">
+    Two populations diverge in allele frequency at the rate the split age and the
+    effective population size set
+  </figcaption>
+  <svg viewBox={`0 0 ${W} ${H}`} role="img"
+       aria-label="Hudson F-ST against the number of generations since two populations split, for effective sizes of one thousand and five thousand. Coalescent simulations sit on the curve t over t plus twice the effective size.">
+    {[0, 0.2, 0.4, 0.6].map((v) => (
+      <>
+        <line x1={L} x2={W - R} y1={Y(v)} y2={Y(v)} class="grid" />
+        <text x={L - 10} y={Y(v) + 4} class="tick" text-anchor="end">{v.toFixed(1)}</text>
+      </>
+    ))}
+    {[50, 100, 250, 500, 1000, 2000, 4000].map((t) => (
+      <text x={X(t)} y={H - B + 20} class="tick" text-anchor="middle">{t.toLocaleString()}</text>
+    ))}
+    <text x={L + iw / 2} y={H - 10} class="axis" text-anchor="middle">
+      generations since the two populations separated
+    </text>
+    <text x={16} y={T + ih / 2} class="axis" text-anchor="middle"
+          transform={`rotate(-90 16 ${T + ih / 2})`}>Hudson F<tspan baseline-shift="sub" font-size="0.78em">ST</tspan></text>
+
+    <path d={line(1000)} class="curve" />
+    <path d={line(5000)} class="curve" stroke-dasharray="7 5" />
+
+    {measured.filter((d) => d.Ne === 1000).map((d) => (
+      <circle cx={X(d.t)} cy={Y(d.fst)} r="5.5" class="dot" />
+    ))}
+    {measured.filter((d) => d.Ne === 5000).map((d) => (
+      <rect x={X(d.t) - S} y={Y(d.fst) - S} width={2 * S} height={2 * S} class="dot-quiet" />
+    ))}
+
+    <g class="legend">
+      <line x1={L + 14} x2={L + 42} y1={T + 12} y2={T + 12} class="curve" />
+      <circle cx={L + 28} cy={T + 12} r="5.5" class="dot" />
+      <text x={L + 50} y={T + 16} class="tick">effective size 1,000</text>
+      <line x1={L + 14} x2={L + 42} y1={T + 34} y2={T + 34} class="curve" stroke-dasharray="7 5" />
+      <rect x={L + 28 - S} y={T + 34 - S} width={2 * S} height={2 * S} class="dot-quiet" />
+      <text x={L + 50} y={T + 38} class="tick">effective size 5,000</text>
+    </g>
+  </svg>
+  <p class="fig-note">
+    Each mark is one msprime run of a two-population split: 40 diploids sampled
+    from each population over 2 megabases, with the Hudson ratio estimator
+    applied to every segregating site. Two runs per cell scatter widely because
+    the coalescent variance is large, and they scatter around the curve rather
+    than away from it. The curve carries no fitted number.
+  </p>
+</figure>

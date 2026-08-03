@@ -2,10 +2,11 @@
 /**
  * Calibration fits needed per cohort, against the reliability you need.
  *
- *   B = c tau / (p (1 - tau))
+ *   fits = 88 x reliability / (1 - reliability)
  *
- * One study reached reliability 0.153 with 16 fits. That point fixes c/p at
- * about 88, so the curve carries no other fitted number.
+ * A run of 16 fits reached reliability 0.153. That point fixes the ratio of
+ * one-fit noise variance to predictable variance at about 88, so the curve
+ * carries no other fitted number.
  */
 const C_OVER_P = 88;
 const B = (tau: number) => (C_OVER_P * tau) / (1 - tau);
@@ -37,7 +38,7 @@ for (let i = 0; i <= 400; i++) {
 <figure class="fig">
   <figcaption class="fig-title">The number of fits grows without limit as the reliability approaches 1</figcaption>
   <svg viewBox={`0 0 ${W} ${H}`} role="img"
-       aria-label="Calibration fits needed against reliability. The count rises steeply above reliability 0.8.">
+       aria-label="Calibration fits needed per cohort against the reliability those fits reach. The count rises steeply above reliability 0.8.">
     {[10, 100, 1000].map((v) => (
       <>
         <line x1={L} x2={W - R} y1={Y(v)} y2={Y(v)} class="grid" />
@@ -49,7 +50,7 @@ for (let i = 0; i <= 400; i++) {
     ))}
     <text x={L + iw / 2} y={H - 8} class="axis" text-anchor="middle">reliability you need from one cohort</text>
     <text x={16} y={T + ih / 2} class="axis" text-anchor="middle"
-          transform={`rotate(-90 16 ${T + ih / 2})`}>calibration fits</text>
+          transform={`rotate(-90 16 ${T + ih / 2})`}>calibration fits per cohort</text>
 
     <path d={path} class="curve" />
 
@@ -64,7 +65,7 @@ for (let i = 0; i <= 400; i++) {
   </svg>
   <p class="fig-note">
     Each further nine of reliability costs about ten times more fits. Sixteen
-    fits per cohort give a reliability of 0.153. Reliability 0.8 needs about 350
-    fits.
+    fits per cohort reach a reliability of 0.153, and a reliability of 0.8 needs
+    about 350 fits per cohort.
   </p>
 </figure>

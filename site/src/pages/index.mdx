@@ -2,8 +2,9 @@
 layout: ../layouts/Page.astro
 title: Polygenic score transfer
 subtitle: >-
-  A polygenic score loses accuracy in a population that did not train it. You
-  can predict the size of that loss before you run the study.
+  A polygenic score predicts less well in a population other than the one its
+  GWAS sampled. You can calculate how much AUC it loses before you collect the
+  target sample.
 ---
 
 import Predictor from '../components/Predictor.astro';
@@ -11,7 +12,7 @@ import CohortCurve from '../components/CohortCurve.astro';
 import ReliabilityCurve from '../components/ReliabilityCurve.astro';
 import Glossary from '../components/Glossary.astro';
 
-## How to predict the accuracy
+## How to predict the AUC
 
 Follow five steps to predict the AUC in the target population.
 
@@ -19,7 +20,7 @@ Follow five steps to predict the AUC in the target population.
 
 <div class="chain">
 <div class="step">
-<div class="label">step 1 · calculate the genetic distance</div>
+<div class="label">step 1 · calculate F<sub>ST</sub> between the source and the target population</div>
 
 $F_{ST}$ measures how far two populations have diverged in allele frequency.
 $t$ counts the generations since they separated, and $N_e$ is the effective
@@ -29,33 +30,33 @@ $$
 F_{ST} = \frac{t}{t + 2N_e}
 $$
 
-This $F_{ST}$ follows the Hudson convention, which is the quantity a coalescent
-simulation measures. The Nei $G_{ST}$ of the same two populations is a
-different number, smaller by up to a factor of two. Steps 2 to 5 need the
-Hudson value.
+This $F_{ST}$ follows the Hudson convention. The Nei $G_{ST}$ of the same two
+populations is a smaller number, by up to a factor of two. Steps 2 to 5 need
+the Hudson value.
 
 </div>
 <div class="step">
-<div class="label">step 2 · calculate the variance the score explains in the target population</div>
+<div class="label">step 2 · calculate the additive variance the score explains in the target population</div>
 
-$V_A$ is the variance that the score explains in the source population. The
-SNPs in a score rarely include the causal variants. They stand in for them
-through LD instead, and $\rho^{2}$ is the fraction of that LD which survives in
-the target population.
+$V_A$ is the additive genetic variance that the score explains in the source
+population. The SNPs in a score rarely include the causal variants. Each SNP
+tags a causal variant through LD instead, and $\rho^{2}$ is the fraction of
+that tagging which survives in the target population.
 
 $$
 V_{\text{target}} = \rho^{2}\,(1 - F_{ST})\,V_A
 $$
 
-Genetic distance and LD each reduce the variance the score explains. Neither
-number predicts the other.
+$F_{ST}$ and the lost LD tagging each reduce the additive variance the score
+explains. Neither one predicts the other.
 
 </div>
 <div class="step">
-<div class="label">step 3 · calculate the accuracy</div>
+<div class="label">step 3 · calculate R² on the liability scale</div>
 
-$R^{2}$ is the fraction of the liability that the score explains. $V_E$ is the
-variance that the score does not explain.
+$R^{2}$ is the fraction of the liability variance that the score explains in
+the target population. $V_E$ is the residual liability variance, which the
+score does not explain.
 
 $$
 R^{2}_{\text{target}} = \frac{V_{\text{target}}}{V_{\text{target}} + V_E}
@@ -63,23 +64,26 @@ $$
 
 </div>
 <div class="step">
-<div class="label">step 4 · calculate four numbers from the prevalence</div>
+<div class="label">step 4 · calculate the liability threshold and the case and control moments</div>
 
-$K$ is the trait prevalence. $T$ is the liability threshold that produces it.
-$i$ and $i_c$ are the mean liabilities among cases and among controls. $v_1$
-and $v_0$ are the score variances in those two groups **divided by $R^{2}$**:
-the variance of the score among cases is $R^{2}v_1$, not $v_1$. Step 5 uses the
-normalised form, so the $R^{2}$ cancels there.
+$K$ is the trait prevalence in the target population, and $T$ is the liability
+threshold that produces that prevalence. $i$ is the mean liability among cases
+and $i_c$ is the mean liability among controls.
 
 $$
 T = \Phi^{-1}(1-K), \qquad i = \frac{\varphi(T)}{K}, \qquad i_c = -\frac{iK}{1-K}
 $$
 
+$v_1$ and $v_0$ are the score variances among cases and among controls, each
+one **divided by $R^{2}$**: the score variance among cases is $R^{2}v_1$, not
+$v_1$. Step 5 uses the divided form, so the $R^{2}$ cancels there.
+
 $$
 v_1 = 1 - R^{2}\,i\,(i - T), \qquad v_0 = 1 - R^{2}\,i_c\,(i_c - T)
 $$
 
-The two variances differ. You need both of them in step 5.
+The score varies by a different amount among cases than among controls. Step 5
+needs both variances.
 
 </div>
 <div class="step" data-key>
@@ -91,44 +95,42 @@ $$
 
 Wray et al. 2010 published this formula. It contains no fitted number.
 
-We supplied a true $R^{2}$ and solved for the prevalence. The answer was 0.149.
-The true prevalence is 0.150.
+We supplied a true $R^{2}$, inverted the formula for the prevalence, and
+recovered 0.149. The true prevalence was 0.150.
 
-A formula that treats the two variances as equal is 0.068 AUC too low on binary
-traits.
+A version of this formula that sets $v_1 = v_0$ reports an AUC 0.068 too low on
+a binary trait.
 
 </div>
 </div>
 
-## The error has three parts
+## Three terms make up the effect-size error
 
-A polygenic score carries one effect size per SNP. The score loses accuracy
-in the target population when those effect sizes differ from the true effect
-sizes in the target population. The corpus proves that the accuracy lost is the
-squared effect-size error, weighted by the LD between SNPs in the target
-population.
+A polygenic score carries one effect size per SNP. The score loses accuracy in
+the target population when those effect sizes differ from the true effect sizes
+in the target population. We proved that the $R^{2}$ lost equals the squared
+effect-size error, weighted by the LD between SNPs in the target population.
 
-Three separate quantities contribute to that effect-size error, and each one
-falls with a different kind of data.
+Three terms make up that effect-size error, and each term falls with a
+different kind of data.
 
-**The source GWAS estimates each effect size with sampling error.** This part
-falls in proportion to one over the number of people in the source GWAS. A
-score that carries more SNPs has more effect sizes to estimate, so it pays
-more of this part.
+**The source GWAS estimates each effect size with sampling error.** This term
+falls in proportion to one over the GWAS sample size. A score that carries more
+SNPs has more effect sizes to estimate, so it pays more of this term.
 
-**The true effect sizes themselves differ between the two populations,** through
-allele frequency differences and through LD differences. Genotyped target
-cohorts measure that difference and correct for it. This part falls in
-proportion to one over the number of target cohorts. Each SNP needs its own
-correction, so a score that carries more SNPs again pays more.
+**The true effect sizes differ between the two populations,** through allele
+frequency differences and through LD differences. Genotyped target cohorts
+measure that effect-size difference and correct the score for it. This term
+falls in proportion to one over the number of target cohorts. Each SNP needs
+its own correction, so a score that carries more SNPs again pays more.
 
-**Some of the effect-size difference stays.** Target cohorts cannot estimate an
-effect size for a SNP they do not carry, or for a SNP they carry at too
-low a frequency to measure. This part does not fall with any amount of data.
+**A residual effect-size difference stays.** Target cohorts cannot estimate an
+effect size for a SNP they do not genotype, or for a SNP whose minor allele
+frequency is too low to measure. This term falls with no amount of data.
 
-A larger source GWAS reduces the first quantity only. It does nothing to the
-third. The next two rules apply to the second quantity, which is the only one
-you buy with target genotyping.
+A larger source GWAS reduces the sampling-error term only. It does nothing to
+the residual term. The next two rules apply to the between-population term,
+which is the only term that target genotyping reduces.
 
 ### How many target cohorts to collect
 
@@ -145,11 +147,11 @@ $$
 \text{best SNPs per cohort} \;\approx\; 3.3 \times \text{LD decay length}
 $$
 
-More separate cohorts reduce the error, and the error falls in proportion to
-one over the number of cohorts, because each cohort re-estimates the effect
-sizes independently. A cohort that holds fewer SNPs than about 3.3 LD decay
-lengths cannot estimate its own effect sizes, and past that point more cohorts
-raise the error again.
+More separate cohorts reduce the between-population term, and that term falls
+in proportion to one over the number of cohorts, because each cohort
+re-estimates the effect sizes independently. A cohort that holds fewer SNPs
+than about 3.3 LD decay lengths cannot estimate its own effect sizes, and past
+that point more cohorts raise the error again.
 
 The ratio stays between 3.27 and 3.50 across a factor of 1000 in the LD decay
 length, so this rule holds for other SNP densities.
@@ -161,77 +163,82 @@ same accuracy, because each SNP tags more of the genome.
 
 ### How many times to fit each cohort
 
-$$
-B \;\geq\; \frac{c}{p}\cdot\frac{\tau}{1-\tau}
-$$
-
-$B$ is the number of calibration fits for one cohort, each on a different
-subsample. $\tau$ is the reliability those fits achieve, between 0 and 1. The
-ratio $c/p$ is a property of the cohort and the trait: $c$ is the variance of a
-single fit and $p$ is the information one cohort carries.
-
-You do not need $c$ and $p$ separately. **Fit one cohort $B_0$ times, measure
-the reliability $\tau_0$ you get, and the ratio follows:**
+You fit the calibration of one cohort several times, each fit on a different
+subsample of that cohort. The reliability is the predictable variance divided
+by the predictable variance plus the estimation noise that survives the
+averaging of those fits. It runs from 0 to 1.
 
 $$
-\frac{c}{p} \;=\; B_0\,\frac{1-\tau_0}{\tau_0}
+\text{fits per cohort} \;\geq\; \frac{\text{noise variance of one fit}}{\text{predictable variance}}\cdot\frac{\text{reliability}}{1-\text{reliability}}
 $$
 
-Sixteen fits giving a reliability of 0.153 puts the ratio at about 88 for that
-cohort. The condition is exact in both directions, so it tells you when you
-have enough fits and when you do not.
+You do not need the two variances separately. **Fit one cohort a fixed number
+of times, measure the reliability you reach, and the ratio follows:**
 
-The cost grows very fast as $\tau$ approaches 1. Each further nine costs
-about ten times more fits.
+$$
+\frac{\text{noise variance of one fit}}{\text{predictable variance}} \;=\; \text{fits run}\times\frac{1-\text{reliability reached}}{\text{reliability reached}}
+$$
 
-Sixteen fits per cohort give a reliability of 0.153. Reliability 0.8 needs
-about 350 fits per cohort.
+Sixteen fits that reach a reliability of 0.153 put that ratio near 88 for that
+cohort. The condition holds in both directions, so it tells you when you have
+enough fits and when you do not.
+
+The cost grows fast as the reliability approaches 1. Each further nine of
+reliability costs about ten times more fits. Sixteen fits per cohort reach a
+reliability of 0.153, and a reliability of 0.8 needs about 350 fits per cohort.
 
 <ReliabilityCurve />
 
-## Two limits
+## Two limits on the AUC
 
-Two separate effects limit the accuracy. You can pay for the first one with
-more samples. No sample size removes the second one.
+Two effects limit the AUC in the target population. A larger sample removes the
+first one. No sample size removes the second one.
 
 <div class="pair">
 <div class="card">
 
-### Markers in perfect linkage disequilibrium
+### SNPs in perfect linkage disequilibrium
 
-Two SNPs in perfect LD carry the same information. Their LD $r^{2}$, which
-is a different quantity from the accuracy $R^{2}$ above, equals 1. LD pruning
-drops one SNP from every such pair.
+Two SNPs in perfect LD carry the same genotype information, and their LD
+$r^{2}$ equals 1. That $r^{2}$ is the squared correlation between two
+genotypes, and it is not the $R^{2}$ of steps 3 to 5, which is the fraction of
+the liability the score explains. LD pruning drops one SNP from every such
+pair.
 
 **Pruning at $r^{2}=1$ is not sufficient**, and an earlier version of this page
-said it was. The error becomes unremovable when some joint genotype cell has
-zero probability, and that can happen far below $r^{2}=1$: in an exact sweep
-over two-locus couplings, 56 of 72 configurations carrying a vanishing
-haplotype lost coverage at $r^{2}<1$, the worst at $r^{2}=1/81\approx0.012$.
-Complete linkage costs nothing at all unless the two loci have equal allele
-frequencies, and at $p=1/2$ it costs nothing even then.
+said it was. The residual effect-size difference appears once some joint
+genotype cell of a SNP pair carries zero probability, and that can happen far
+below $r^{2}=1$: in an exact sweep over two-locus couplings, 56 of 72
+configurations carrying a vanishing haplotype lost coverage at $r^{2}<1$, the
+worst at $r^{2}=1/81\approx0.012$. Complete linkage costs nothing at all unless
+the two loci have equal allele frequencies, and at allele frequency $1/2$ it
+costs nothing even then.
 
-So no $r^{2}$ threshold certifies that the unremovable part is zero. What the
-condition actually needs is a positive floor on every joint genotype cell.
+So no $r^{2}$ threshold certifies that the residual term is zero. The condition
+needs a positive floor on every joint genotype cell.
 <div class="caution">
 
-**CAUTION: Always quote the cost with this result.** Some differences between
-populations are cheap to measure and some are very expensive. A difference that
-appears only indirectly needs a sample size that grows as a power of how
-indirect it is. The exponent doubles with each step of indirectness, so the
-count grows without limit.
+**CAUTION: Always quote the sample size that a difference costs to measure.**
+Two populations can differ in the mean of a standardized genotype, in its
+variance, or only in a higher moment of it. Each further level of that moment
+tower doubles the moment order, and the sample size needed to estimate a level
+grows with the square of the scale of that level: of order $4\times10^{2}$
+people at the third level, $9\times10^{4}$ at the fourth, and $5\times10^{9}$
+at the fifth. Rare variants start higher up the tower. The squared scale of the
+first level is about 49 at minor allele frequency 0.01, against 1 at minor
+allele frequency 0.5.
 
-An expensive difference is a hard limit in a real study. Enough samples remove
-it in principle only.
+A difference that sits above the third level is a hard limit in a real study. A
+larger sample removes it in principle only.
 
 </div>
 
-Worse for practice, the population statement is about *positive* probability,
-and positive is not observable. At $p=1/2$ with 500,000 samples the rarest
-genotype cell is missed 22% of the time at $r^{2}=0.98$ and every time at
-$r^{2}\geq0.998$, where seeing it would need about $7\times10^{7}$ samples.
-The threshold that binds a real study is set by its sample size, not by
-$r^{2}$.
+Worse for practice, that condition asks for *positive* probability, and a
+positive probability is not observable. At allele frequency $1/2$ with 500,000
+samples the rarest genotype cell is missed 22% of the time at $r^{2}=0.98$ and
+every time at $r^{2}\geq0.998$, where seeing it would need about
+$7\times10^{7}$ samples. The sample size, not $r^{2}$, sets the threshold that
+binds a real study.
 
 And linkage is not even the dominant cause. At allele frequency $1/20$ with
 $r^{2}=0$ exactly — perfect linkage *equilibrium* — 500,000 samples lose a cell
@@ -244,26 +251,31 @@ backwards.
 
 ### Environment that changes with ancestry
 
-Environment often varies along the same axis as ancestry. When it does, a whole
-range of different genetic and environmental splits produces exactly the same
-result in every cohort. The results are equal, not close.
+Environmental exposure often varies across cohorts along the same gradient as
+ancestry does, and socioeconomic status is the usual example. Where the two
+gradients are collinear, a one-parameter family of splits between the genetic
+effect per unit of ancestry and the environmental effect per unit of exposure
+produces exactly the same calibration shift in every cohort. The shifts are
+equal, not close.
 
-No amount of cohort data separates the genetic part from the environmental
-part. This is true for AUC, sensitivity, PPV, and every other threshold
-measure.
+No number of cohorts separates the genetic effect from the environmental
+effect. Sensitivity, PPV, exceedance probability and quantile comparisons
+collapse together as well, so no threshold on the score separates the two
+effects either.
 
 <div class="caution">
 
-**CAUTION: Collect two cohorts that have the same genetic distance and
-different environments.** That pair separates the genetic part from the
-environmental part. Cohorts that differ only in genetic distance never separate
-them, whatever their number.
+**CAUTION: Collect two cohorts at the same nonzero $F_{ST}$ from the source
+population and with different environmental exposures.** Those two cohorts
+determine the split. Cohorts that differ only in $F_{ST}$ never determine it,
+however many you collect.
 
 </div>
 
-This result limits the rule on how many cohorts to collect. More cohorts
-reduce the genetic-distance part of the error. They reduce this part only when the
-environments differ.
+The cohort rule above still holds here, and more cohorts still reduce the
+between-population term. Those cohorts attribute none of that term to genetics
+rather than to environment unless their environmental exposures differ at
+matched $F_{ST}$.
 
 </div>
 </div>
@@ -277,7 +289,7 @@ except where the table states one.
 
 | What we predicted | Prediction | Measurement | Note |
 |---|---:|---:|---|
-| Hudson $F_{ST}$ from Nei $G_{ST}$ | exact | $3.6\times10^{-16}$ | 16 cells |
+| Hudson $F_{ST}$ from Nei $G_{ST}$ | exact | $3.6\times10^{-16}$ | 16 parameter settings |
 | AUC from $R^{2}$, true prevalence | — | RMSE $0.0126$ | no fitted number |
 | Information per cohort | $1.000$ | $1.035 / 1.013 / 1.029 / 0.984$ | four separate runs |
 | Information near perfect LD | a square law | exponent $1.9999$ | as the two SNPs approach perfect LD |
@@ -288,17 +300,18 @@ except where the table states one.
 
 </div>
 
-## What these laws leave out
+## What these formulas omit
 
-None of the three parts contains a term for environment. Socioeconomic
-measures can explain as much difference between individuals as genetic distance
-explains. The largest term is then outside every formula on this page.
+None of the three terms includes an environmental contribution. Where
+environmental exposure varies with ancestry, that exposure enters the same
+per-cohort calibration shift as drift does, and no formula on this page carries
+it separately.
 
-We proved that this gap exists, and the section on environment that changes
-with ancestry states it. The gap still restricts the value of the other
-results.
+We proved the non-identifiability that the section on environment states above.
+We did not measure how large the environmental contribution is, and nothing on
+this page bounds it.
 
-These laws also leave out admixture, assortative mating, ascertainment in the
-source GWAS, and any difference in allele frequency spectra beyond $F_{ST}$.
+These formulas also omit admixture, assortative mating, ascertainment in the
+source GWAS, and every allele frequency spectrum difference beyond $F_{ST}$.
 
 <Glossary />
