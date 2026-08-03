@@ -18,7 +18,7 @@
   --warn: #8a2f2f;
   --good: #2f6b46;
 
-  --measure: 42rem;
+  --measure: 100%;
   --serif: ui-serif, Georgia, "Iowan Old Style", "Palatino Linotype", Palatino, serif;
   --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
@@ -55,7 +55,7 @@ body {
 }
 
 .page {
-  max-width: 74rem;
+  max-width: 55rem;
   margin: 0 auto;
   padding: 4rem 1.6rem 6rem;
 }
