@@ -40,9 +40,18 @@ const auc = (r2: number, K: number) => {
   return Phi((i - ic) * Math.sqrt(rr) / Math.sqrt(v1 + v0));
 };
 
+// The target's phenotypic variance is (1 - F_ST) V_A + V_E, not V_target + V_E.
+// Lost LD tagging attenuates the score's covariance with the phenotype; it does
+// not remove that genetic variance from the phenotype. Putting rho2 in the
+// denominator too is the superseded `taggedDriftR2Ratio`, which Wright-Fisher
+// simulation found 15% to 112% high, always overstating portability
+// (proofs/validation/drift_diff/, written up at HumanDemography.lean:193-215).
+// The form below is `taggedDriftR2RatioCorrected`, HumanDemography.lean:226,
+// exact to 0.00000 in 12 of 12 replicates across two designs.
 const fst0 = d.t / (d.t + 2 * d.Ne);
 const vt0 = d.rho2 * (1 - fst0) * d.VA;
-const r20 = vt0 / (vt0 + d.VE);
+const vp0 = (1 - fst0) * d.VA + d.VE;
+const r20 = vt0 / vp0;
 const r2src0 = d.VA / (d.VA + d.VE);
 const auc0 = auc(r20, d.K);
 const aucSrc0 = auc(r2src0, d.K);
@@ -113,6 +122,40 @@ const f = (x: number, n = 4) => (Number.isFinite(x) ? x.toFixed(n) : "—");
 
   <svg id="predictor-plot" viewBox="0 0 760 260" role="img"
        aria-label="AUC against Hudson F-ST at the current settings"></svg>
+
+  <div class="provenance">
+    <p><b>What backs each number.</b> Two of the five steps are assumptions, and
+    the panel should not be read as if they were results.</p>
+    <ul>
+      <li><b>Step 1</b>, <i>F</i><sub>ST</sub> = <i>t</i>/(<i>t</i> + 2<i>N<sub>e</sub></i>).
+      A definition in the Lean corpus, not a theorem: nothing derives it from a
+      coalescent process. Coalescent simulation matches it to within Monte Carlo
+      noise, but at two replicates per cell, so per-cell errors run from −16% to
+      +97% and no error-barred test has been run.</li>
+      <li><b>Step 2</b>, the (1 − <i>F</i><sub>ST</sub>) factor and ρ².
+      <b>Assumptions.</b> No theorem derives either. The corpus records the
+      (1 − <i>F</i><sub>ST</sub>) step as vacuous, because that slot means a
+      branch quantity, 1 − <i>H</i><sub>target</sub>/<i>H</i><sub>source</sub>,
+      and the <i>F</i><sub>ST</sub> of step 1 is a pairwise one. Sister
+      populations lose heterozygosity by about the same amount, so simulation at
+      pairwise <i>F</i><sub>ST</sub> = 0.119 measured a variance retention of
+      0.99, not the 0.88 this step would predict — an eightfold overstatement of
+      the drift cost. ρ² is a free knob: the corpus never relates it to a
+      measurable except as a one-sided bound.</li>
+      <li><b>Step 3</b>, <i>R</i>² in the target. The tagging loss attenuates
+      the score's covariance with the phenotype but leaves that genetic variance
+      in the phenotype, so the denominator is
+      (1 − <i>F</i><sub>ST</sub>)<i>V<sub>A</sub></i> + <i>V<sub>E</sub></i>.
+      Wright–Fisher simulation reproduces this form exactly in 12 of 12
+      replicates.</li>
+      <li><b>Step 4</b>, the AUC. Wray et al. 2010, with no fitted number.
+      Graded against 400 simulated studies at a known prevalence: RMSE 0.0126,
+      which a freely fitted prevalence improves by only 8%.</li>
+      <li><b>Step 5</b>, the surviving fraction. A ratio of <i>R</i>², not of
+      correlations. The corresponding ratio of correlations is its square root
+      and is a larger number.</li>
+    </ul>
+  </div>
 </figure>
 
 <script>
@@ -191,7 +234,7 @@ const f = (x: number, n = 4) => (Number.isFinite(x) ? x.toFixed(n) : "—");
     for (let i = 0; i <= 240; i++) {
       const fst = (FMAX * i) / 240;
       const vt = v.rho2 * (1 - fst) * v.VA;
-      const a = auc(vt / (vt + v.VE), v.K);
+      const a = auc(vt / ((1 - fst) * v.VA + v.VE), v.K);
       if (!Number.isFinite(a)) continue;
       dPath += (dPath ? "L" : "M") + X(fst) + " " + Y(a);
     }
@@ -199,7 +242,7 @@ const f = (x: number, n = 4) => (Number.isFinite(x) ? x.toFixed(n) : "—");
 
     const fst = v.t / (v.t + 2 * v.Ne);
     const vt = v.rho2 * (1 - fst) * v.VA;
-    const a = auc(vt / (vt + v.VE), v.K);
+    const a = auc(vt / ((1 - fst) * v.VA + v.VE), v.K);
     if (fst <= FMAX && Number.isFinite(a)) {
       svg.appendChild(el("line", { x1: X(fst), x2: X(fst), y1: T, y2: H - B, class: "marker" }));
       svg.appendChild(el("circle", { cx: X(fst), cy: Y(a), r: 6, class: "dot" }));
@@ -210,7 +253,7 @@ const f = (x: number, n = 4) => (Number.isFinite(x) ? x.toFixed(n) : "—");
     const v = val();
     const fst = v.t / (v.t + 2 * v.Ne);
     const vt = v.rho2 * (1 - fst) * v.VA;
-    const r2 = vt / (vt + v.VE);
+    const r2 = vt / ((1 - fst) * v.VA + v.VE);
     const r2src = v.VA / (v.VA + v.VE);
     const a = auc(r2, v.K);
 
@@ -236,3 +279,17 @@ const f = (x: number, n = 4) => (Number.isFinite(x) ? x.toFixed(n) : "—");
   ids.forEach((k) => document.getElementById("in-" + k)!.addEventListener("input", update));
   update();
 </script>
+
+<style>
+  .provenance {
+    border-top: 1px solid var(--rule);
+    margin: 1.1rem 0 0;
+    padding: 0.9rem 0 0;
+    font: 400 14px/1.6 var(--sans);
+    color: var(--ink-2);
+  }
+  .provenance p { margin: 0 0 0.5rem; }
+  .provenance ul { margin: 0; padding-left: 1.15rem; }
+  .provenance li { margin: 0 0 0.4rem; }
+  .provenance b { color: var(--ink); }
+</style>
