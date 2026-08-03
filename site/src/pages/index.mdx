@@ -75,8 +75,8 @@ $$
 
 The denominator is the target population's whole liability variance, and lost
 LD tagging does not shrink it. Tagging loss attenuates the covariance between
-the score and the phenotype; the genetic variance it fails to capture stays in
-the phenotype. Dividing by $V_{\text{target}} + V_E$ instead cancels $\rho^{2}$
+the score and the phenotype. The genetic variance the score fails to capture
+stays in the phenotype. Dividing by $V_{\text{target}} + V_E$ instead cancels $\rho^{2}$
 out of the ratio and overstates how much accuracy transfers, by 15% to 112% in
 Wright-Fisher simulation.
 
@@ -128,15 +128,15 @@ a binary trait.
 
 <LiabilityAUCCurve />
 
-## Three terms make up the effect-size error
+## The effect-size error has three terms
 
 A polygenic score carries one effect size per SNP. The score loses accuracy in
 the target population when those effect sizes differ from the true effect sizes
 in the target population. We proved that the $R^{2}$ lost equals the squared
 effect-size error, weighted by the LD between SNPs in the target population.
 
-Three terms make up that effect-size error, and each term falls with a
-different kind of data.
+That effect-size error has three terms, and each term falls with a different
+kind of data.
 
 **The source GWAS estimates each effect size with sampling error.** This term
 falls in proportion to one over the GWAS sample size. A score that carries more
