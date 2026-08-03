@@ -35,10 +35,11 @@ CALIBRATION AND KNOWN LIMITS -- read before quoting a number.
               `positivity`, or `open ... in` have MORE proof than the projection and are
               probably not this defect. Inspect every hit before acting on it.
 
-  NOT EVERY HIT IS A DEFECT. `Identification.formula_eq_observable := i.derivation` is
-  correct BY DESIGN -- that module exists to make the derivation obligation unavoidable,
-  and its docstring says so. An accessor forwarding a nested field is plumbing. The defect
-  is a theorem whose NAME AND DOCSTRING claim a result that the field already asserts.
+  NOT EVERY HIT IS A DEFECT. An accessor forwarding a genuine model invariant can be
+  plumbing. The retired `Identification.formula_eq_observable := i.derivation` pattern,
+  however, is now forbidden: it accepted the desired scientific conclusion from a caller.
+  The defect is a theorem whose name and statement claim a result that a field already
+  asserts.
 
   The standard to apply, which no tool can apply for you: if replacing the proof body with
   the field yields the same theorem, there is no theorem.

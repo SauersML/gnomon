@@ -3,10 +3,9 @@
 
 Guards, in order of what they catch:
 
-1. sorry ledger. `sorry` is permitted only where an Identification records an
-   undischarged obligation, and every one must be listed in SORRY_LEDGER
-   below. An unlisted sorry fails. This makes honest debt cheap to declare and
-   impossible to accumulate silently.
+1. sorry ledger. Every admitted proof must be listed in `SORRY_LEDGER` below;
+   the production policy currently permits none. An unlisted `sorry` fails.
+   Scientific debt belongs in prose or an issue, never in a theorem parameter.
 
 2. Falsified claims. Nothing may remain marked Evidence.falsified.
 
@@ -193,7 +192,7 @@ def main() -> int:
                 bad.append(f"{rel}:{line}: sorry in `{owner}` is not in SORRY_LEDGER")
 
         if re.search(r'Evidence\.falsified', src):
-            bad.append(f"{rel}: an Identification is still marked falsified")
+            bad.append(f"{rel}: a production declaration is still marked falsified")
 
         forbidden = [
             (r"\badmit\b", "contains `admit`"),
