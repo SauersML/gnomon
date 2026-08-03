@@ -20,12 +20,13 @@ Follow five steps to predict the AUC in the target population.
 <div class="step">
 <div class="label">step 1 · calculate the genetic distance</div>
 
+$F_{ST}$ measures how far two populations have diverged in allele frequency.
+$t$ counts the generations since they separated, and $N_e$ is the effective
+size of each population over that period.
+
 $$
 F_{ST} = \frac{t}{t + 2N_e}
 $$
-
-$t$ counts the generations since the two populations separated. $N_e$ is the
-effective size of each population over that period.
 
 This $F_{ST}$ follows the Hudson convention, which is the quantity a coalescent
 simulation measures. The Nei $G_{ST}$ of the same two populations is a
@@ -36,14 +37,14 @@ Hudson value.
 <div class="step">
 <div class="label">step 2 · calculate the surviving signal</div>
 
+$V_A$ is the variance that the score explains in the source population. The
+markers in a score rarely include the causal variants. They stand in for them
+through LD instead, and $\rho^{2}$ is the fraction of that LD which survives in
+the target population.
+
 $$
 V_{\text{target}} = \rho^{2}\,(1 - F_{ST})\,V_A
 $$
-
-$V_A$ is the variance that the score explains in the source population. The
-markers in a score rarely include the causal variants. They stand in for them
-through LD instead. $\rho^{2}$ is the fraction of that LD which survives in the
-target population.
 
 Genetic distance and LD each remove signal. Neither number predicts the
 other.
@@ -52,15 +53,20 @@ other.
 <div class="step">
 <div class="label">step 3 · calculate the accuracy</div>
 
+$R^{2}$ is the fraction of the liability that the score explains. $V_E$ is the
+variance that the score does not explain.
+
 $$
 R^{2}_{\text{target}} = \frac{V_{\text{target}}}{V_{\text{target}} + V_E}
 $$
 
-$V_E$ is the variance that the score does not explain.
-
 </div>
 <div class="step">
 <div class="label">step 4 · calculate four numbers from the prevalence</div>
+
+$K$ is the trait prevalence. $T$ is the liability threshold that produces it.
+$i$ and $i_c$ are the mean liabilities among cases and among controls. $v_1$
+and $v_0$ are the score variances in those two groups.
 
 $$
 T = \Phi^{-1}(1-K), \qquad i = \frac{\varphi(T)}{K}, \qquad i_c = -\frac{iK}{1-K}
@@ -69,10 +75,6 @@ $$
 $$
 v_1 = 1 - R^{2}\,i\,(i - T), \qquad v_0 = 1 - R^{2}\,i_c\,(i_c - T)
 $$
-
-$K$ is the trait prevalence. $T$ is the liability threshold. $i$ and $i_c$ are
-the mean liabilities in cases and in controls. $v_1$ and $v_0$ are the score
-variances in cases and in controls.
 
 The two variances differ. You need both of them in step 5.
 
@@ -165,7 +167,8 @@ more samples. No sample size removes the second one.
 
 ### Markers in perfect linkage disequilibrium
 
-Two markers in perfect LD ($r^{2} = 1$) carry the same information. LD pruning
+Two markers in perfect LD carry the same information. Their LD $r^{2}$, which
+is a different quantity from the accuracy $R^{2}$ above, equals 1. LD pruning
 drops one marker from every such pair.
 
 **After pruning, the unremovable part of the error is zero.** The whole error
