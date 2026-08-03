@@ -1,0 +1,156 @@
+---
+/**
+ * Hover definitions for every symbol on the page.
+ *
+ * KaTeX renders each identifier as its own leaf span inside .katex-html, so a
+ * script can find those leaves by their text and attach a definition. The
+ * MathML layer beside it stays untouched, which keeps the equation readable to
+ * a screen reader.
+ *
+ * A symbol that appears in prose outside an equation gets the same treatment
+ * through the data-term attribute, so one glossary serves both.
+ */
+
+/** symbol -> [what it is, how to read it] */
+const TERMS: Record<string, [string, string]> = {
+  t: ["Generations since the two populations separated", "A generation is about 25 to 30 years in humans."],
+  N_e: ["Effective population size", "The size of an idealised population that loses heterozygosity at the same rate as the real one. It is smaller than the census size."],
+  F_ST: ["Hudson F-ST between the two populations", "The fraction of total genetic variance that lies between the populations rather than within them. Hudson convention."],
+  G_ST: ["Nei G-ST", "A different estimator of the same quantity. It is smaller than Hudson F-ST by up to a factor of two, so the two are not interchangeable."],
+  V_A: ["Additive genetic variance the score explains in the source population", "In units of the phenotypic variance."],
+  V_E: ["Variance the score does not explain", "Residual variance, including environment and the genetic variance the score misses."],
+  R2: ["Variance explained in the target population", "The squared correlation between the score and the phenotype. Not the LD r-squared."],
+  K: ["Trait prevalence", "The fraction of the population that has the disease."],
+  T: ["Liability threshold", "The point on the liability scale above which a person has the disease. Set by the prevalence."],
+  i: ["Mean liability of cases", "The selection intensity at the threshold."],
+  ic: ["Mean liability of controls", "Negative, because controls sit below the threshold."],
+  rho2: ["Fraction of LD tagging kept in the target population", "One when the target population has the same LD as the source. Less than one when the markers tag the causal variants less well."],
+  r2ld: ["LD r-squared between two markers", "One for markers in perfect linkage disequilibrium. This is not the variance explained."],
+  tau: ["Reliability of one cohort's calibration", "Between 0 and 1."],
+  B: ["Number of calibration fits for one cohort", "Each fit uses a different subsample."],
+  n: ["Number of people in the source GWAS", ""],
+  m: ["Number of separate target cohorts", ""],
+  AUC: ["Area under the ROC curve", "The chance that a random case scores above a random control. 0.5 is no discrimination."],
+};
+
+/** Rendered leaf text -> glossary key. Subscripts render as their own leaves,
+ *  so the script joins a base to its subscript before it looks a symbol up. */
+const MAP: Record<string, string> = {
+  t: "t", n: "n", m: "m", K: "K", T: "T", B: "B",
+  "N_e": "N_e", "F_ST": "F_ST", "G_ST": "G_ST",
+  "V_A": "V_A", "V_E": "V_E",
+  "R^2": "R2", "τ": "tau", "ρ^2": "rho2", "AUC": "AUC",
+};
+---
+
+<script is:inline define:vars={{ TERMS, MAP }}>
+  (() => {
+    const norm = (s) => s.replace(/−/g, "-").trim();
+
+    // A KaTeX leaf holds one glyph run. A base followed by a subscript group
+    // becomes "N_e", which is the form the glossary is keyed on.
+    function tokenOf(el) {
+      const base = norm(el.textContent || "");
+      if (!base) return null;
+      const sub = el.parentElement?.querySelector(".msupsub");
+      if (sub && el.parentElement?.firstElementChild === el) {
+        const s = norm(sub.textContent || "");
+        if (s) return base + (/^\d+$/.test(s) ? "^" + s : "_" + s);
+      }
+      return base;
+    }
+
+    let tip;
+    function ensureTip() {
+      if (tip) return tip;
+      tip = document.createElement("div");
+      tip.className = "gloss-tip";
+      tip.setAttribute("role", "tooltip");
+      tip.hidden = true;
+      document.body.appendChild(tip);
+      return tip;
+    }
+
+    function show(target, key) {
+      const [title, detail] = TERMS[key];
+      const t = ensureTip();
+      t.innerHTML = "";
+      const h = document.createElement("b");
+      h.textContent = title;
+      t.appendChild(h);
+      if (detail) {
+        const p = document.createElement("span");
+        p.textContent = detail;
+        t.appendChild(p);
+      }
+      t.hidden = false;
+      const r = target.getBoundingClientRect();
+      const tr = t.getBoundingClientRect();
+      let left = r.left + r.width / 2 - tr.width / 2 + window.scrollX;
+      left = Math.max(8, Math.min(left, window.innerWidth - tr.width - 8));
+      let top = r.top + window.scrollY - tr.height - 10;
+      if (r.top - tr.height - 10 < 0) top = r.bottom + window.scrollY + 10;
+      t.style.left = left + "px";
+      t.style.top = top + "px";
+    }
+
+    const hide = () => { if (tip) tip.hidden = true; };
+
+    function attach(el, key) {
+      el.classList.add("gloss");
+      el.tabIndex = 0;
+      el.setAttribute("aria-label", TERMS[key][0]);
+      el.addEventListener("mouseenter", () => show(el, key));
+      el.addEventListener("focus", () => show(el, key));
+      el.addEventListener("mouseleave", hide);
+      el.addEventListener("blur", hide);
+    }
+
+    // Symbols inside equations.
+    document.querySelectorAll(".katex-html .mord").forEach((el) => {
+      if (el.querySelector(".mord")) return; // not a leaf
+      const key = MAP[tokenOf(el) || ""];
+      if (key && TERMS[key]) attach(el, key);
+    });
+
+    // Symbols named in prose.
+    document.querySelectorAll("[data-term]").forEach((el) => {
+      const key = el.getAttribute("data-term");
+      if (key && TERMS[key]) attach(el, key);
+    });
+
+    document.addEventListener("scroll", hide, { passive: true });
+    document.addEventListener("keydown", (e) => { if (e.key === "Escape") hide(); });
+  })();
+</script>
+
+<style is:global>
+  .gloss {
+    cursor: help;
+    border-bottom: 1px dotted var(--rule-2);
+    border-radius: 2px;
+  }
+  .gloss:hover,
+  .gloss:focus-visible {
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+    outline: none;
+  }
+
+  .gloss-tip {
+    position: absolute;
+    z-index: 40;
+    max-width: 21rem;
+    display: grid;
+    gap: 0.3rem;
+    padding: 0.6rem 0.75rem;
+    background: var(--bg);
+    color: var(--ink-2);
+    border: 1px solid var(--rule-2);
+    border-radius: 7px;
+    box-shadow: 0 6px 22px rgb(0 0 0 / 14%);
+    font: 400 0.83rem/1.5 var(--sans);
+    pointer-events: none;
+  }
+  .gloss-tip b { color: var(--ink); font-weight: 620; }
+  .gloss-tip[hidden] { display: none; }
+</style>

@@ -9,6 +9,7 @@ subtitle: >-
 import Predictor from '../components/Predictor.astro';
 import CohortCurve from '../components/CohortCurve.astro';
 import ReliabilityCurve from '../components/ReliabilityCurve.astro';
+import Glossary from '../components/Glossary.astro';
 
 ## How to predict the accuracy
 
@@ -38,7 +39,7 @@ Hudson value.
 <div class="label">step 2 · calculate the variance the score explains in the target population</div>
 
 $V_A$ is the variance that the score explains in the source population. The
-markers in a score rarely include the causal variants. They stand in for them
+SNPs in a score rarely include the causal variants. They stand in for them
 through LD instead, and $\rho^{2}$ is the fraction of that LD which survives in
 the target population.
 
@@ -101,10 +102,10 @@ traits.
 
 ## The error has three parts
 
-A polygenic score carries one effect size per marker. The score loses accuracy
+A polygenic score carries one effect size per SNP. The score loses accuracy
 in the target population when those effect sizes differ from the true effect
 sizes in the target population. The corpus proves that the accuracy lost is the
-squared effect-size error, weighted by the LD between markers in the target
+squared effect-size error, weighted by the LD between SNPs in the target
 population.
 
 Three separate quantities contribute to that effect-size error, and each one
@@ -112,17 +113,17 @@ falls with a different kind of data.
 
 **The source GWAS estimates each effect size with sampling error.** This part
 falls in proportion to one over the number of people in the source GWAS. A
-score that carries more markers has more effect sizes to estimate, so it pays
+score that carries more SNPs has more effect sizes to estimate, so it pays
 more of this part.
 
 **The true effect sizes themselves differ between the two populations,** through
 allele frequency differences and through LD differences. Genotyped target
 cohorts measure that difference and correct for it. This part falls in
-proportion to one over the number of target cohorts. Each marker needs its own
-correction, so a score that carries more markers again pays more.
+proportion to one over the number of target cohorts. Each SNP needs its own
+correction, so a score that carries more SNPs again pays more.
 
 **Some of the effect-size difference stays.** Target cohorts cannot estimate an
-effect size for a marker they do not carry, or for a marker they carry at too
+effect size for a SNP they do not carry, or for a SNP they carry at too
 low a frequency to measure. This part does not fall with any amount of data.
 
 A larger source GWAS reduces the first quantity only. It does nothing to the
@@ -131,20 +132,30 @@ you buy with target genotyping.
 
 ### How many target cohorts to collect
 
+A target cohort is a group of people from the target population whom you
+genotype and phenotype, so that you can re-estimate the effect sizes in that
+population. Genotyping gives you a fixed total number of SNPs, and you choose
+how to divide those SNPs between cohorts.
+
+The LD decay length is the number of SNPs across which linkage disequilibrium
+stays high. Two SNPs closer together than this length are correlated, so the
+second one adds little information beyond the first.
+
 $$
-\text{best markers per cohort} \;\approx\; 3.3 \times \text{LD decay length}
+\text{best SNPs per cohort} \;\approx\; 3.3 \times \text{LD decay length}
 $$
 
-Take a fixed total number of genotyped markers. More separate target cohorts
-reduce the error, and the error drops in proportion to one over the cohort
-count. Each cohort must still contain enough markers for its own calibration.
-Past that point more cohorts make the error worse.
+More separate cohorts reduce the error, and the error falls in proportion to
+one over the number of cohorts, because each cohort re-estimates the effect
+sizes independently. A cohort that holds fewer SNPs than about 3.3 LD decay
+lengths cannot estimate its own effect sizes, and past that point more cohorts
+raise the error again.
 
-The LD decay length is measured in markers. The ratio stays between 3.27 and
-3.50 across a factor of 1000 in the LD decay length, so you can use this rule
-in other studies.
+The ratio stays between 3.27 and 3.50 across a factor of 1000 in the LD decay
+length, so this rule holds for other SNP densities.
 
-A longer LD decay length also reduces the error at a fixed marker count.
+A population with longer-range linkage disequilibrium needs fewer SNPs for the
+same accuracy, because each SNP tags more of the genome.
 
 <CohortCurve />
 
@@ -188,9 +199,9 @@ more samples. No sample size removes the second one.
 
 ### Markers in perfect linkage disequilibrium
 
-Two markers in perfect LD carry the same information. Their LD $r^{2}$, which
+Two SNPs in perfect LD carry the same information. Their LD $r^{2}$, which
 is a different quantity from the accuracy $R^{2}$ above, equals 1. LD pruning
-drops one marker from every such pair.
+drops one SNP from every such pair.
 
 **Pruning at $r^{2}=1$ is not sufficient**, and an earlier version of this page
 said it was. The error becomes unremovable when some joint genotype cell has
@@ -269,8 +280,8 @@ except where the table states one.
 | Hudson $F_{ST}$ from Nei $G_{ST}$ | exact | $3.6\times10^{-16}$ | 16 cells |
 | AUC from $R^{2}$, true prevalence | — | RMSE $0.0126$ | no fitted number |
 | Information per cohort | $1.000$ | $1.035 / 1.013 / 1.029 / 0.984$ | four separate runs |
-| Information near perfect LD | a square law | exponent $1.9999$ | as the markers approach copies |
-| Best markers per cohort | $3.3 \times$ LD decay length | agrees | across a factor of 1000 |
+| Information near perfect LD | a square law | exponent $1.9999$ | as the two SNPs approach perfect LD |
+| Best SNPs per cohort | $3.3 \times$ LD decay length | agrees | across a factor of 1000 |
 | $F_{ST}$ after a split, against msprime | $t/(t+2N_e)$ | $\lvert z\rvert \leq 0.89$ | 200 replicates, all cells within 1 SE |
 | Highest $F_{ST}$ a serial founder model reaches | $0.18497$ | $0.19248$ | 3.9% apart, no fitted number |
 | Brier score $=$ MSE $+$ base rate term | exact | $R^{2} = 0.994$ | leave-one-out, no fit |
@@ -289,3 +300,5 @@ results.
 
 These laws also leave out admixture, assortative mating, ascertainment in the
 source GWAS, and any difference in allele frequency spectra beyond $F_{ST}$.
+
+<Glossary />

@@ -18,7 +18,7 @@
   --warn: #8a2f2f;
   --good: #2f6b46;
 
-  --measure: 34rem;
+  --measure: 42rem;
   --serif: ui-serif, Georgia, "Iowan Old Style", "Palatino Linotype", Palatino, serif;
   --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
@@ -55,7 +55,7 @@ body {
 }
 
 .page {
-  max-width: 52rem;
+  max-width: 74rem;
   margin: 0 auto;
   padding: 4rem 1.6rem 6rem;
 }
@@ -280,6 +280,11 @@ th[align="right"], td[align="right"] {
   .page { max-width: none; padding: 0; }
   .colophon { break-inside: avoid; }
 }
+
+/* Prose stays at a readable measure. Everything a reader scans rather than
+   reads -- figures, the panel, tables, display equations -- uses the full
+   column, which is why the page is wider than the measure. */
+.fig, .panel, .table-wrap, .katex-display, .pair { max-width: none; }
 
 /* figures and the predictor ------------------------------------------------ */
 
