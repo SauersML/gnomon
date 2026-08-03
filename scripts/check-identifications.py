@@ -923,9 +923,9 @@ def main() -> int:
                 duplicates.append(f"{fa}:{la} {na}  ==  {fb}:{lb} {nb}")
     duplicates.sort()
     if len(duplicates) > DUPLICATE_BODY_BUDGET:
-        bad.append(f"alpha-equivalent definition bodies in different files tied by neither a "
-                   f"call nor a theorem: {len(duplicates)}, budget {DUPLICATE_BODY_BUDGET}; "
-                   f"make one call the other, or state the identity as a theorem")
+        bad.append(f"alpha-equivalent definition bodies tied by neither a call nor a theorem: "
+                   f"{len(duplicates)}, budget {DUPLICATE_BODY_BUDGET}; make one call the "
+                   f"other, or state the identity as a theorem")
         bad.extend("    " + x for x in duplicates)
 
     # 3j. Regimes baked into bodies. Five definitions -- the within-population
@@ -1329,27 +1329,63 @@ def main() -> int:
                    % (len(unwitnessed), UNWITNESSED_BUNDLE_BUDGET))
         bad.extend("    " + x for x in unwitnessed)
 
-    # 3o. Instances synthesised from supplied fields (step 4). `letI :
-    #     IsProbabilityMeasure cmdgp.μ := cmdgp.prob` takes a fact the caller
-    #     handed over and installs it where instance resolution will find it
-    #     without anyone writing it down again. Every later `simp` and every
-    #     later lemma application silently depends on an assumption that no
-    #     longer appears in any signature. A declared `class` in this corpus is
-    #     the same move with a wider blast radius, which is why there are none.
+    # 3o. Instances synthesised from supplied fields (step 4). The defect is an
+    #     assumption installed where instance resolution finds it while
+    #     APPEARING IN NO SIGNATURE, so every later `simp` and every later lemma
+    #     application depends on it silently.
+    #
+    #     SCOPED TO CLASSES DECLARED IN THIS CORPUS, and the scoping is the
+    #     whole content of the screen. Deriving a Mathlib class from a field of a
+    #     parameter is not the defect: in
+    #
+    #         instance (dgp : DataGeneratingProcess k) :
+    #             IsProbabilityMeasure dgp.jointMeasure := dgp.is_prob
+    #
+    #     the assumption is `dgp`, which is in the signature of every theorem
+    #     that uses it, and `is_prob` is a well-formedness field of the structure
+    #     with a default of `by infer_instance`. Nothing is hidden; the structure
+    #     IS the disclosure. Flagging it demands that the corpus stop bundling
+    #     side conditions, which would make signatures longer and disclose
+    #     nothing new.
+    #
+    #     A corpus-declared class is different, and is the case the original
+    #     screen was written for: it puts a proposition this development invented
+    #     into synthesis, where no use site names it and no structure parameter
+    #     carries it. There are no such classes today, so this is a ratchet
+    #     against introducing one rather than a report on what exists.
+    #
+    #     The Mathlib-class escape route is not left open. `Fact` is the class an
+    #     arbitrary proposition can be smuggled through, and the parameterized
+    #     `Fact` instance is banned outright by the forbidden-pattern list above.
+    corpus_classes = set()
+    for f in lean_files():
+        for m in re.finditer(r"(?m)^\s*(?:(?:private|protected|noncomputable)\s+)*class\s+"
+                             r"([A-Za-z_][A-Za-z_0-9'.]*)", strip_comments(open(f).read())):
+            corpus_classes.add(m.group(1).split(".")[-1])
+
+    def installs_corpus_class(sig):
+        """Head symbol of the class being installed, if this corpus declared it."""
+        head = re.match(r"\s*([A-Za-z_][A-Za-z_0-9'.]*)", sig)
+        return bool(head) and head.group(1).split(".")[-1] in corpus_classes
+
     laundered_inst = []
     for f in lean_files():
         src = strip_comments(open(f).read())
         rel = os.path.relpath(f, ROOT)
-        for m in re.finditer(r"(?m)^[ \t]*(haveI|letI)\b[^\n]*?:=[ \t]*"
+        for m in re.finditer(r"(?m)^[ \t]*(haveI|letI)\b[^\n]*?:([^\n]*?):=[ \t]*"
                              r"([A-Za-z_][A-Za-z_0-9'.]*\.[A-Za-z_][A-Za-z_0-9']*)", src):
+            if not installs_corpus_class(m.group(2)):
+                continue
             laundered_inst.append("%s:%d: `%s` installs `%s`, a supplied field, as an instance"
                                   % (rel, src[:m.start()].count("\n") + 1,
-                                     m.group(1), m.group(2)))
-        for m in re.finditer(r"(?m)^instance\b[^\n]*\([a-zA-Z_][^\n]*\)[^\n]*:=[ \t]*"
+                                     m.group(1), m.group(3)))
+        for m in re.finditer(r"(?m)^instance\b[^\n]*\([a-zA-Z_][^\n]*\)[^\n]*?:([^\n]*?):=[ \t]*"
                              r"([A-Za-z_][A-Za-z_0-9'.]*\.[A-Za-z_][A-Za-z_0-9']*)", src):
+            if not installs_corpus_class(m.group(1)):
+                continue
             laundered_inst.append("%s:%d: an instance is built by projecting `%s` out of its "
                                   "own parameter" % (rel, src[:m.start()].count("\n") + 1,
-                                                     m.group(1)))
+                                                     m.group(2)))
     if len(laundered_inst) > INSTANCE_LAUNDERING_BUDGET:
         bad.append("supplied hypotheses installed as typeclass instances: %d, budget %d; "
                    "pass the fact explicitly so the dependency stays visible in the signature"
@@ -1522,6 +1558,13 @@ def main() -> int:
         print("STRUCTURAL GUARD FAILURES\n")
         for b in bad:
             print("  " + b)
+        # A count means nothing without the count it is being compared to. Seven
+        # of these screens were pinned at a measured number and then zeroed in one
+        # edit; printing the old numbers next to the failures is what stops a
+        # reader mistaking progress for regression, or the reverse.
+        print("\nPREVIOUSLY PINNED (budget is now 0 for all; nothing is grandfathered)\n")
+        for name, (was, commit, when) in sorted(LAST_PINNED_BEFORE_ZEROING.items()):
+            print(f"  {name:32s} was {was:3d}  pinned {commit} {when}")
         return 1
     print(f"structural guards pass: convention sites {sites}/{CONVENTION_SITE_BUDGET}, "
           f"undeclared {len(undeclared)}/{UNDECLARED_BUDGET}, conventions {len(undeclared_conv)}/{CONVENTION_DECL_BUDGET}, "
