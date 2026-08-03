@@ -1,0 +1,45 @@
+---
+import 'katex/dist/katex.min.css';
+import '../styles/site.css';
+
+interface Frontmatter {
+  title: string;
+  subtitle?: string;
+  meta?: string;
+}
+// A markdown page passes its frontmatter under `frontmatter`; an .astro page
+// passes the same fields directly. Accept both so either can use this layout.
+const fm: Frontmatter = (Astro.props as any).frontmatter ?? (Astro.props as any);
+const { title, subtitle, meta } = fm;
+const built = new Date().toISOString().slice(0, 10);
+---
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>{title}</title>
+    {subtitle && <meta name="description" content={subtitle} />}
+  </head>
+  <body>
+    <main class="page">
+      <header class="masthead">
+        <h1>{title}</h1>
+        {subtitle && <p class="lede">{subtitle}</p>}
+        {meta && <p class="meta">{meta}</p>}
+      </header>
+      <slot />
+      <footer class="colophon">
+        <p>
+          Built {built} from <code>site/src/pages/</code>. TeX is rendered by
+          KaTeX at build time; this page ships no client JavaScript.
+        </p>
+        <p>
+          Every formula is machine-checked in <code>proofs/Calibrator</code>.
+          Result-level provenance is in <code>proofs/MATH_LEDGER.md</code>.
+        </p>
+      </footer>
+    </main>
+  </body>
+</html>
