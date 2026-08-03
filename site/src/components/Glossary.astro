@@ -31,6 +31,11 @@ const TERMS: Record<string, [string, string]> = {
   n: ["Number of people in the source GWAS", ""],
   m: ["Number of separate target cohorts", ""],
   AUC: ["Area under the ROC curve", "The chance that a random case scores above a random control. 0.5 is no discrimination."],
+  R2t: ["Additive genetic variance the score explains in the target population", "In units of the phenotypic variance."],
+  v1: ["Liability variance among cases", "Reduced below one, because selecting cases truncates the liability distribution."],
+  v0: ["Liability variance among controls", "Reduced below one for the same reason."],
+  cfit: ["Variance of a single calibration fit", "Larger when one cohort's effect sizes are noisier."],
+  pinfo: ["Information one target cohort carries", "Larger when the cohort holds more people and more SNPs."],
 };
 
 /** Rendered leaf text -> glossary key. Subscripts render as their own leaves,
@@ -40,25 +45,32 @@ const MAP: Record<string, string> = {
   "N_e": "N_e", "F_ST": "F_ST", "G_ST": "G_ST",
   "V_A": "V_A", "V_E": "V_E",
   "R^2": "R2", "τ": "tau", "ρ^2": "rho2", "AUC": "AUC",
+  "r^2": "r2ld", "V_target": "R2t", "i_c": "ic", "τ_0": "tau",
+  "v_1": "v1", "v_0": "v0",
+  i: "i", c: "cfit", p: "pinfo", "B_0": "B", "R_target^2": "R2t", "R_target2": "R2t",
 };
 ---
 
 <script is:inline define:vars={{ TERMS, MAP }}>
   (() => {
-    const norm = (s) => s.replace(/−/g, "-").trim();
+    const norm = (s) => s.replace(/\u200b/g, "").replace(/−/g, "-").trim();
 
     // A KaTeX leaf holds one glyph run. A base followed by a subscript group
     // becomes "N_e", which is the form the glossary is keyed on.
-    function tokenOf(el) {
+    function tokensOf(el) {
       const base = norm(el.textContent || "");
-      if (!base) return null;
+      if (!base) return [];
       const sub = el.parentElement?.querySelector(".msupsub");
       if (sub && el.parentElement?.firstElementChild === el) {
         const s = norm(sub.textContent || "");
-        if (s) return base + (/^\d+$/.test(s) ? "^" + s : "_" + s);
+        if (s) return [base + "_" + s, base + "^" + s, base];
       }
-      return base;
+      return [base];
     }
+    const keyOf = (el) => {
+      for (const t of tokensOf(el)) if (MAP[t] && TERMS[MAP[t]]) return MAP[t];
+      return null;
+    };
 
     let tip;
     function ensureTip() {
@@ -108,9 +120,11 @@ const MAP: Record<string, string> = {
 
     // Symbols inside equations.
     document.querySelectorAll(".katex-html .mord").forEach((el) => {
-      if (el.querySelector(".mord")) return; // not a leaf
-      const key = MAP[tokenOf(el) || ""];
-      if (key && TERMS[key]) attach(el, key);
+      if (el.querySelector(".mord")) return;          // not a leaf
+      if (el.closest(".msupsub")) return;             // part of a subscript
+      if (el.classList.contains("text")) return;      // a word, not a symbol
+      const key = keyOf(el);
+      if (key) attach(el, key);
     });
 
     // Symbols named in prose.
