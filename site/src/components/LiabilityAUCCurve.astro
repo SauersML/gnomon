@@ -1,0 +1,120 @@
+---
+/**
+ * AUC under the liability threshold model, against the variance the score
+ * explains, at four prevalences.
+ *
+ * The curves are the Wray et al. 2010 closed form written out in step 5. The
+ * points are simulations of the liability threshold model recorded in
+ * proofs/validation/differential/cluster/fam_auc_demography_split_results.json:
+ * the four "P0 CONTROL no structure" arms and the four C0a_true_r2_rows, each
+ * 200,000 people at prevalence 0.15. Those eight cells carry no per-deme mean
+ * shift, no per-deme liability baseline and no per-deme score variance, so the
+ * model the formula assumes holds exactly in them.
+ */
+const erf = (x: number) => {
+  const s = x < 0 ? -1 : 1;
+  x = Math.abs(x);
+  const a = [0.254829592, -0.284496736, 1.421413741, -1.453152027, 1.061405429];
+  const t = 1 / (1 + 0.3275911 * x);
+  return s * (1 - ((((a[4] * t + a[3]) * t + a[2]) * t + a[1]) * t + a[0]) * t * Math.exp(-x * x));
+};
+const Phi = (z: number) => 0.5 * (1 + erf(z / Math.SQRT2));
+const pdf = (x: number) => Math.exp(-0.5 * x * x) / Math.sqrt(2 * Math.PI);
+const PhiInv = (p: number) => {
+  let lo = -9, hi = 9;
+  for (let i = 0; i < 120; i++) { const m = (lo + hi) / 2; if (Phi(m) < p) lo = m; else hi = m; }
+  return (lo + hi) / 2;
+};
+const auc = (R2: number, K: number) => {
+  const T = PhiInv(1 - K), i = pdf(T) / K, ic = -i * K / (1 - K);
+  const v1 = 1 - R2 * i * (i - T), v0 = 1 - R2 * ic * (ic - T);
+  if (v1 <= 0 || v0 <= 0) return NaN;
+  return Phi(((i - ic) * Math.sqrt(R2)) / Math.sqrt(v1 + v0));
+};
+
+/** prevalence, dash pattern, label */
+const series = [
+  { K: 0.01, dash: "1 5", label: "K = 0.01" },
+  { K: 0.05, dash: "3 4", label: "K = 0.05" },
+  { K: 0.15, dash: "", label: "K = 0.15" },
+  { K: 0.5, dash: "9 5", label: "K = 0.50" },
+];
+
+/** (liability R-squared, empirical AUC) from the eight model-exact cells */
+const measured = [
+  { r2: 0.09982890250757347, auc: 0.6606853580392157 },
+  { r2: 0.10179030161144854, auc: 0.6643156403921568 },
+  { r2: 0.09926437802833440, auc: 0.6614857601960784 },
+  { r2: 0.10139933428055536, auc: 0.6635153374509803 },
+  { r2: 0.10011656469486063, auc: 0.6646710560784314 },
+  { r2: 0.09967916353539710, auc: 0.6625559411764705 },
+  { r2: 0.09915701960322035, auc: 0.6618615560784313 },
+  { r2: 0.10122175641532029, auc: 0.6648042694117647 },
+];
+
+const W = 760, H = 340, L = 62, R = 96, T = 18, B = 48;
+const iw = W - L - R, ih = H - T - B;
+const XMAX = 0.5, Y0 = 0.5, Y1 = 1.0;
+const X = (v: number) => L + (v / XMAX) * iw;
+const Y = (v: number) => H - B - ((v - Y0) / (Y1 - Y0)) * ih;
+
+const paths = series.map((s) => {
+  let d = "";
+  for (let i = 1; i <= 250; i++) {
+    const r2 = (XMAX * i) / 250;
+    const a = auc(r2, s.K);
+    if (!Number.isFinite(a)) continue;
+    d += (d ? "L" : "M") + X(r2).toFixed(2) + " " + Y(a).toFixed(2);
+  }
+  return { ...s, d, endY: Y(auc(XMAX, s.K)) };
+});
+---
+
+<figure class="fig">
+  <figcaption class="fig-title">
+    A rarer disease reaches a higher AUC from the same explained variance
+  </figcaption>
+  <svg viewBox={`0 0 ${W} ${H}`} role="img"
+       aria-label="AUC against the fraction of liability variance the score explains, drawn for prevalences of 1, 5, 15 and 50 percent. Eight liability threshold simulations at prevalence 15 percent sit on the matching curve.">
+    {[0.5, 0.6, 0.7, 0.8, 0.9, 1.0].map((v) => (
+      <>
+        <line x1={L} x2={W - R} y1={Y(v)} y2={Y(v)} class="grid" />
+        <text x={L - 10} y={Y(v) + 4} class="tick" text-anchor="end">{v.toFixed(1)}</text>
+      </>
+    ))}
+    {[0, 0.1, 0.2, 0.3, 0.4, 0.5].map((v) => (
+      <text x={X(v)} y={H - B + 20} class="tick" text-anchor="middle">{v.toFixed(1)}</text>
+    ))}
+    <text x={L + iw / 2} y={H - 10} class="axis" text-anchor="middle">
+      fraction of the liability variance the score explains
+    </text>
+    <text x={16} y={T + ih / 2} class="axis" text-anchor="middle"
+          transform={`rotate(-90 16 ${T + ih / 2})`}>AUC in the target population</text>
+
+    {paths.map((p) => (
+      <>
+        <path d={p.d} class="curve" stroke-dasharray={p.dash || undefined} />
+        <text x={W - R + 8} y={p.endY + 4} class="tick">{p.label}</text>
+      </>
+    ))}
+
+    {measured.map((d) => <circle cx={X(d.r2)} cy={Y(d.auc)} r="5" class="dot" />)}
+    <text x={X(0.105) + 12} y={Y(0.663) + 22} class="tick strong">
+      eight simulations at prevalence 0.15
+    </text>
+
+    <g class="legend">
+      <line x1={L + 14} x2={L + 42} y1={T + 12} y2={T + 12} class="curve" />
+      <text x={L + 50} y={T + 16} class="tick">closed form</text>
+      <circle cx={L + 28} cy={T + 32} r="5" class="dot" />
+      <text x={L + 50} y={T + 36} class="tick">simulation</text>
+    </g>
+  </svg>
+  <p class="fig-note">
+    K is the prevalence, the fraction of the population that has the disease.
+    The eight simulations draw 200,000 people each, score them, and count the
+    cases; the formula predicts every one of them to within 0.0025 AUC, with no
+    fitted number. Read the disagreement between the four curves as the reason a
+    published AUC means little until the paper states the prevalence.
+  </p>
+</figure>

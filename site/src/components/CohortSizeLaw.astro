@@ -1,0 +1,74 @@
+---
+/**
+ * Best SNPs per cohort, divided by the LD decay length, against the LD decay
+ * length.
+ *
+ * The horizontal line is the rule quoted above it: best SNPs per cohort is
+ * 3.3 times the LD decay length. The points are the ten measured optima in
+ * proofs/validation/differential/cluster/partition_curve_results.json under
+ * "general_optimum", one per correlation between neighbouring SNPs, where the
+ * LD decay length is one over one minus that correlation.
+ */
+const measured = [
+  { rho: 0.5, len: 2.0, best: 7, ratio: 3.5 },
+  { rho: 0.7, len: 3.333333333333333, best: 11, ratio: 3.3000000000000003 },
+  { rho: 0.8, len: 5.000000000000001, best: 17, ratio: 3.3999999999999995 },
+  { rho: 0.9, len: 10.000000000000002, best: 33, ratio: 3.2999999999999994 },
+  { rho: 0.95, len: 19.999999999999982, best: 66, ratio: 3.300000000000003 },
+  { rho: 0.98, len: 49.99999999999996, best: 164, ratio: 3.280000000000003 },
+  { rho: 0.99, len: 99.99999999999991, best: 328, ratio: 3.280000000000003 },
+  { rho: 0.995, len: 199.99999999999983, best: 655, ratio: 3.2750000000000026 },
+  { rho: 0.999, len: 999.9999999999991, best: 3272, ratio: 3.272000000000003 },
+  { rho: 0.9995, len: 2000.0000000002203, best: 6543, ratio: 3.2714999999996395 },
+];
+
+const RULE = 3.3;
+
+const W = 760, H = 300, L = 62, R = 24, T = 18, B = 48;
+const iw = W - L - R, ih = H - T - B;
+const lx = Math.log10;
+const x0 = lx(1.5), x1 = lx(3000), y0 = 3.15, y1 = 3.6;
+const X = (v: number) => L + ((lx(v) - x0) / (x1 - x0)) * iw;
+const Y = (v: number) => H - B - ((v - y0) / (y1 - y0)) * ih;
+---
+
+<figure class="fig">
+  <figcaption class="fig-title">
+    The best cohort holds 3.3 LD decay lengths of SNPs, over a thousandfold range
+    of LD decay length
+  </figcaption>
+  <svg viewBox={`0 0 ${W} ${H}`} role="img"
+       aria-label="Best SNPs per cohort divided by the LD decay length, against the LD decay length. Ten measured optima lie between 3.27 and 3.50 across LD decay lengths from 2 to 2000 SNPs.">
+    {[3.2, 3.3, 3.4, 3.5].map((v) => (
+      <>
+        <line x1={L} x2={W - R} y1={Y(v)} y2={Y(v)} class="grid" />
+        <text x={L - 10} y={Y(v) + 4} class="tick" text-anchor="end">{v.toFixed(1)}</text>
+      </>
+    ))}
+    {[2, 5, 10, 50, 100, 500, 1000, 2000].map((v) => (
+      <text x={X(v)} y={H - B + 20} class="tick" text-anchor="middle">{v.toLocaleString()}</text>
+    ))}
+    <text x={L + iw / 2} y={H - 10} class="axis" text-anchor="middle">
+      LD decay length, in SNPs
+    </text>
+    <text x={16} y={T + ih / 2} class="axis" text-anchor="middle"
+          transform={`rotate(-90 16 ${T + ih / 2})`}>best SNPs per cohort, per LD decay length</text>
+
+    <line x1={L} x2={W - R} y1={Y(RULE)} y2={Y(RULE)} class="curve" />
+    {measured.map((d) => <circle cx={X(d.len)} cy={Y(d.ratio)} r="5.5" class="dot" />)}
+
+    <g class="legend">
+      <line x1={W - R - 168} x2={W - R - 140} y1={T + 10} y2={T + 10} class="curve" />
+      <text x={W - R - 132} y={T + 14} class="tick">the rule, 3.3</text>
+      <circle cx={W - R - 154} cy={T + 30} r="5.5" class="dot" />
+      <text x={W - R - 132} y={T + 34} class="tick">measured optimum</text>
+    </g>
+  </svg>
+  <p class="fig-note">
+    The LD decay length here is one over one minus the correlation between
+    neighbouring SNPs, and it runs from 2 SNPs to 2,000. The best cohort holds 7
+    SNPs at the short end and 6,543 at the long end, and every ratio between
+    those two lies in 3.27 to 3.50. A population with longer-range linkage
+    disequilibrium therefore needs fewer SNPs per cohort for the same accuracy.
+  </p>
+</figure>
