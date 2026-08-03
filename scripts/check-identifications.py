@@ -1358,16 +1358,22 @@ def main() -> int:
         bad.append(f"convention restatement sites rose to {sites}, budget {CONVENTION_SITE_BUDGET}; "
                    f"relate the new constant to `ploidy` in Conventions.lean instead of inlining it")
 
-    if bad:
-        print("STRUCTURAL GUARD FAILURES\n")
-        for b in bad:
-            print("  " + b)
-        return 1
+    # The ledger prints before the guard verdict, and unconditionally. Printing
+    # it after the `return 1` made it dead code on exactly the runs that matter:
+    # a corpus with a failing guard is the one whose outstanding admissions a
+    # reader most needs to see, and `sorry` is the admission this corpus asks
+    # for in preference to a laundered premise. Debt that only lists itself when
+    # everything else is green is not enumerable.
     if admissions:
         print("TRANSPARENT ADMISSIONS (these declarations are incomplete)\n")
         for admission in admissions:
             print("  " + admission)
         print()
+    if bad:
+        print("STRUCTURAL GUARD FAILURES\n")
+        for b in bad:
+            print("  " + b)
+        return 1
     print(f"structural guards pass: convention sites {sites}/{CONVENTION_SITE_BUDGET}, "
           f"undeclared {len(undeclared)}/{UNDECLARED_BUDGET}, conventions {len(undeclared_conv)}/{CONVENTION_DECL_BUDGET}, "
           f"unrelated {unrelated}/{UNRELATED_BUDGET}, "
