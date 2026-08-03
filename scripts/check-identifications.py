@@ -23,6 +23,40 @@ Guards, in order of what they catch:
    bodies are alpha-equivalent are one quantity written twice; unless one calls
    the other or a theorem equates them, fixing one leaves the other wrong.
 
+DO NOT ADD A GUARD THAT DELETES DEFINITIONS BY REFERENCE COUNT. It was tried,
+   twice, and both times it removed correct work. Two failure modes, both proved
+   on 2026-02:
+
+   (a) WRONG ROOT. A scan walking `proofs/Calibrator/` cannot see
+       `proofs/Calibrator.lean`, the corpus root, which is a SIBLING of that
+       directory rather than a child. `decaySlope` was deleted as having "no use
+       anywhere"; its only consumer was a theorem in the root. `LDDecayMechanism`
+       was then deleted for having "lost its only consumer" -- the second
+       deletion inheriting the first's blind spot. The file list built below
+       includes `Calibrator.lean` explicitly for exactly this reason; do not
+       "simplify" it into a single recursive glob.
+
+   (b) UNREFERENCED BY DESIGN, which no reference count can detect.
+       `targetCorrectionCurvature` and `targetCorrectionOptimum` are applied by
+       nothing, AND THAT IS WHAT THEY ARE FOR: `sharedCorrectionConsensus` and
+       `sharedCorrectionSpread` take `curvature` and `optimum` as arbitrary
+       `ι → ℝ`, and these two say which functions the section is about. Their
+       section docstring claims the curvature weight is "forced rather than
+       stipulated" -- without them it is a free parameter, the spread law holds
+       for any weights whatsoever, and that sentence is false. A definition that
+       names which functions a section is ABOUT is unreferenced by design, so
+       every one of that category is a false positive waiting to be deleted.
+
+   Neither deletion broke the build, and that is the part to internalise. In (a)
+   Lean auto-binds an undefined bare name as an implicit variable, so the
+   consuming theorem kept elaborating as a claim about nothing. In (b) the
+   arguments were already abstract, so removing the definitions that gave them
+   meaning changed no type. ABSENCE OF A BUILD FAILURE IS NOT EVIDENCE THAT A
+   DELETION WAS SAFE. Before removing anything as unused, grep the FULL `proofs/`
+   tree -- root module and validation Python included -- and grep the PROSE, not
+   just the identifier: in both cases a docstring within a few lines of the
+   deletion site named the consumer outright.
+
 6. Regimes baked into bodies. A definition whose value depends on an assumption
    about the data-generating process -- closed population, no mutation, infinite
    sites -- must name that assumption, because a formula carries no record of
