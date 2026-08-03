@@ -3,8 +3,8 @@ layout: ../layouts/Page.astro
 title: Polygenic score transfer
 subtitle: >-
   A polygenic score predicts less well in a population other than the one its
-  GWAS sampled. You can calculate how much AUC it loses before you collect the
-  target sample.
+  genome-wide association study sampled. You can calculate how much accuracy it
+  loses before you collect the target sample.
 ---
 
 import Predictor from '../components/Predictor.astro';
@@ -22,7 +22,9 @@ import CoverageLossCurve from '../components/CoverageLossCurve.astro';
 
 ## How to predict the AUC
 
-Follow five steps to predict the AUC in the target population.
+Follow five steps to predict the AUC in the target population. The AUC is the
+area under the ROC curve: the chance that a random case scores above a random
+control, where 0.5 is no discrimination at all.
 
 <Predictor />
 
@@ -47,8 +49,9 @@ the Hudson value.
 <div class="label">step 2 · calculate the additive variance the score explains in the target population</div>
 
 $V_A$ is the additive genetic variance that the score explains in the source
-population. The SNPs in a score rarely include the causal variants. Each SNP
-tags a causal variant through LD instead, and $\rho^{2}$ is the fraction of
+population. The SNPs in a score, the single nucleotide polymorphisms it carries, rarely
+include the causal variants. Each SNP tags a causal variant through linkage
+disequilibrium instead, and $\rho^{2}$ is the fraction of
 that tagging which survives in the target population.
 
 $$
@@ -284,7 +287,8 @@ produces exactly the same calibration shift in every cohort. The shifts are
 equal, not close.
 
 No number of cohorts separates the genetic effect from the environmental
-effect. Sensitivity, PPV, exceedance probability and quantile comparisons
+effect. Sensitivity, positive predictive value, exceedance probability and quantile
+comparisons
 collapse together as well, so no threshold on the score separates the two
 effects either.
 
@@ -325,13 +329,13 @@ a stored file.
 | What we predicted | Prediction | Measurement | Note |
 |---|---:|---:|---|
 | Hudson $F_{ST}$ from Nei $G_{ST}$ | exact | $3.6\times10^{-16}$ | 16 parameter settings |
-| AUC from $R^{2}$, true prevalence | — | RMSE $0.0126$ | no fitted number |
+| AUC from $R^{2}$, true prevalence | — | root mean square error $0.0126$ | no fitted number |
 | Information per cohort | $1.000$ | $1.035 / 1.013 / 1.029 / 0.984$ | four cohort counts in one run, number in the git history only |
 | Information near perfect LD | a square law | exponent $1.9999$ | the local exponent at the smallest genotype-cell floor, number in the git history only |
 | Best SNPs per cohort | $3.3 \times$ LD decay length | agrees | across a factor of 1000 |
 | $F_{ST}$ after a split, against msprime | $t/(t+2N_e)$ | not stored | a commit message reports $\lvert z\rvert \leq 0.89$ over 200 replicates per cell, and no stored file holds it |
 | Highest $F_{ST}$ a serial founder model reaches | $0.18497$ | $0.19248$ | 3.9% apart, no fitted number |
-| Brier score $=$ MSE $+$ base rate term | exact | $R^{2} = 0.994$ | leave-one-out, no fit |
+| Brier score $=$ mean square error $+$ base rate term | exact | $R^{2} = 0.994$ | leave-one-out, no fit |
 
 </div>
 
