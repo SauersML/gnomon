@@ -15,9 +15,9 @@
  * curve starts at 1 and no constant is fitted.
  */
 const series = [
-  { share: 0.1, dash: "2 4", label: "10% unremovable" },
-  { share: 0.3, dash: "7 5", label: "30% unremovable" },
-  { share: 0.6, dash: "", label: "60% unremovable" },
+  { share: 0.1, dash: "2 4", label: "residual term 10%" },
+  { share: 0.3, dash: "7 5", label: "residual term 30%" },
+  { share: 0.6, dash: "", label: "residual term 60%" },
 ];
 
 const W = 760, H = 320, L = 62, R = 140, T = 18, B = 48;
@@ -39,8 +39,8 @@ const paths = series.map((s) => {
 
 <figure class="fig">
   <figcaption class="fig-title">
-    A larger source GWAS removes its own part of the effect-size error and
-    nothing else
+    A larger source GWAS removes its own term of the effect-size error and no
+    other term
   </figcaption>
   <svg viewBox={`0 0 ${W} ${H}`} role="img"
        aria-label="Effect-size error against source GWAS size, drawn for three shares of the error that no amount of data removes. Every curve falls steeply and then flattens onto its own share. The figure is the closed form and carries no simulated points.">
@@ -67,12 +67,13 @@ const paths = series.map((s) => {
     ))}
   </svg>
   <p class="fig-note">
-    The sampling error the source GWAS makes on each effect size falls in
-    proportion to one over the number of people it recruits, so a thousandfold
-    larger GWAS removes essentially all of it. The SNPs a target cohort cannot
-    estimate — the ones it does not carry, and the ones it carries at too low an
-    allele frequency to measure — set the height each curve flattens onto, and
-    recruiting for the source GWAS never lowers it. The three shares are stated
+    The sampling-error term falls in proportion to one over the GWAS sample
+    size, so a thousandfold larger source GWAS removes essentially all of it.
+    The residual term sets the height each curve flattens onto: a SNP the target
+    cohorts do not genotype, or genotype at too low a minor allele frequency to
+    measure, keeps its source effect size whatever the source GWAS costs. The
+    between-population term is not drawn here, because target cohorts rather
+    than source recruitment reduce it. The three residual shares are stated
     choices that show the shape; no simulation stands behind this figure.
   </p>
 </figure>

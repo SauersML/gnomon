@@ -11,6 +11,13 @@ import Predictor from '../components/Predictor.astro';
 import CohortCurve from '../components/CohortCurve.astro';
 import ReliabilityCurve from '../components/ReliabilityCurve.astro';
 import Glossary from '../components/Glossary.astro';
+import FstSplitCurve from '../components/FstSplitCurve.astro';
+import TransferCurve from '../components/TransferCurve.astro';
+import LiabilityAUCCurve from '../components/LiabilityAUCCurve.astro';
+import ErrorParts from '../components/ErrorParts.astro';
+import CohortSizeLaw from '../components/CohortSizeLaw.astro';
+import MeasurementAgreement from '../components/MeasurementAgreement.astro';
+import SerialFounderCurve from '../components/SerialFounderCurve.astro';
 
 ## How to predict the AUC
 
@@ -111,6 +118,12 @@ a binary trait.
 </div>
 </div>
 
+<FstSplitCurve />
+
+<TransferCurve />
+
+<LiabilityAUCCurve />
+
 ## Three terms make up the effect-size error
 
 A polygenic score carries one effect size per SNP. The score loses accuracy in
@@ -138,6 +151,8 @@ frequency is too low to measure. This term falls with no amount of data.
 A larger source GWAS reduces the sampling-error term only. It does nothing to
 the residual term. The next two rules apply to the between-population term,
 which is the only term that target genotyping reduces.
+
+<ErrorParts />
 
 ### How many target cohorts to collect
 
@@ -167,6 +182,8 @@ A population with longer-range linkage disequilibrium needs fewer SNPs for the
 same accuracy, because each SNP tags more of the genome.
 
 <CohortCurve />
+
+<CohortSizeLaw />
 
 ### How many times to fit each cohort
 
@@ -289,6 +306,8 @@ matched $F_{ST}$.
 
 ## What we measured
 
+<MeasurementAgreement />
+
 We fixed each prediction before the run. No prediction uses a fitted number,
 except where the table states one.
 
@@ -306,6 +325,8 @@ except where the table states one.
 | Brier score $=$ MSE $+$ base rate term | exact | $R^{2} = 0.994$ | leave-one-out, no fit |
 
 </div>
+
+<SerialFounderCurve />
 
 ## What these formulas omit
 

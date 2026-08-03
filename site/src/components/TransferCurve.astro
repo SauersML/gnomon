@@ -9,15 +9,16 @@
  * formulas.
  *
  *   V_target = rho^2 (1 - F_ST) V_A
- *   R^2      = V / (V + V_E)
+ *   R^2      = V_target / ((1 - F_ST) V_A + V_E)
  *
  * V_A = 0.2 and V_E = 0.8 are the worked example of the interactive panel, so
  * the source score explains a fifth of the liability before transfer.
  */
 const V_A = 0.2, V_E = 0.8;
-const r2 = (v: number) => v / (v + V_E);
-const r2Source = r2(V_A);
-const kept = (fst: number, rho2: number) => r2(rho2 * (1 - fst) * V_A) / r2Source;
+const r2Target = (fst: number, rho2: number) =>
+  (rho2 * (1 - fst) * V_A) / ((1 - fst) * V_A + V_E);
+const r2Source = V_A / (V_A + V_E);
+const kept = (fst: number, rho2: number) => r2Target(fst, rho2) / r2Source;
 
 /** surviving LD tagging, dash pattern, label */
 const series = [
@@ -79,11 +80,13 @@ const EXAMPLE = 400 / (400 + 2 * 10000);
     ))}
   </svg>
   <p class="fig-note">
-    Hudson F-ST enters the accuracy only through the factor one minus Hudson
-    F-ST, so a distance of 0.2 — larger than any pair of continental human
-    populations reaches — still leaves 83% of the accuracy standing. The
-    fraction of LD tagging that survives in the target population sets the rest,
-    and the two are independent. Both curves come from the formulas in steps 2
-    and 3; no simulation stands behind this figure.
+    Hudson F-ST shrinks the additive variance the score explains and the target
+    population's liability variance together, so it costs less than its size
+    suggests: a distance of 0.2, larger than any pair of continental human
+    populations reaches, still leaves 83% of the source accuracy standing. Lost
+    LD tagging multiplies the accuracy directly, so halving it halves the
+    accuracy. The two enter as a product and neither predicts the other. Every
+    curve comes from the formulas in steps 2 and 3; no simulation stands behind
+    this figure.
   </p>
 </figure>
