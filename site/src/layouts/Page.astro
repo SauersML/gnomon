@@ -11,7 +11,6 @@ interface Frontmatter {
 // passes the same fields directly. Accept both so either can use this layout.
 const fm: Frontmatter = (Astro.props as any).frontmatter ?? (Astro.props as any);
 const { title, subtitle, meta } = fm;
-const built = new Date().toISOString().slice(0, 10);
 ---
 <!doctype html>
 <html lang="en">
@@ -30,15 +29,6 @@ const built = new Date().toISOString().slice(0, 10);
         {meta && <p class="meta">{meta}</p>}
       </header>
       <slot />
-      <footer class="colophon">
-        <p>
-          We built this page on {built}. Lean proves every formula on this
-          page.
-        </p>
-        <p>
-          This page needs no JavaScript. A browser can open the file directly.
-        </p>
-      </footer>
     </main>
   </body>
 </html>

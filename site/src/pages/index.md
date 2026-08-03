@@ -22,10 +22,6 @@ $$
 $t$ counts the generations after the two populations separate. $N_e$ is the
 effective population size.
 
-Some sources use $1-\left(1-\frac{1}{2N_e}\right)^{t}$ instead. That
-expression is the heterozygosity loss inside one population. It is a different
-quantity. It is near zero when the true $F_{ST}$ is 0.5.
-
 </div>
 <div class="step">
 <div class="label">step 2 · calculate the surviving signal</div>
@@ -81,8 +77,8 @@ Wray et al. 2010 published this formula. It contains no fitted number.
 We supplied a true $R^{2}$ and solved for the prevalence. The answer was 0.149.
 The true prevalence is 0.150.
 
-An older formula, $\Phi\!\left(\sqrt{R^{2}/2(1-R^{2})}\right)$, treats the two
-variances as equal. On binary traits it is 0.068 AUC too low. We removed it.
+A formula that treats the two variances as equal is 0.068 AUC too low on binary
+traits.
 
 </div>
 </div>
@@ -215,7 +211,6 @@ except where the table states one.
 |---|---:|---:|---|
 | Hudson $F_{ST}$ from Nei $G_{ST}$ | exact | $3.6\times10^{-16}$ | 16 cells |
 | AUC from $R^{2}$, true prevalence | — | RMSE $0.0126$ | no fitted number |
-| The older AUC formula, binary traits | — | RMSE $0.0708$ | 0.068 too low, and we removed it |
 | Information per cohort | $1.000$ | $1.035 / 1.013 / 1.029 / 0.984$ | four separate runs |
 | Information near perfect LD | $\eta^{2}$ | exponent $1.9999$ | as $\eta$ approaches 0 |
 | Best markers per cohort | $3.29\,\tau$ | agrees | across a factor of 1000 in $\tau$ |
@@ -226,30 +221,7 @@ except where the table states one.
 
 </div>
 
-## V. Errors we found and corrected
-
-Each quantity in this table returned a number in the right range. A range check
-therefore finds none of these errors.
-
-<div class="table-wrap">
-
-| The quantity | What it computed instead | Size of the error |
-|---|---|---:|
-| Genetic distance between two populations | heterozygosity loss inside one population | 2.001 times out |
-| The Hudson estimator of genetic distance | the Nei estimator | up to 2 times out |
-| An effective sample size | an inverse-variance weight | 50% to 98% too low |
-| The variance of a haplotype effect estimate | the same formula without the $(1-f)$ term | 50% too low at $f = 0.5$ |
-| The mean length of an ancestry tract | a formula that reads the genetic map length | the map length does not belong |
-| The AUC from $R^{2}$ | one score variance for cases and controls | 0.068 AUC |
-
-</div>
-
-We also found a theorem that compared a formula with itself under two names.
-Lean accepted it in one step. It stays true even when the score transfers no
-accuracy at all. Somebody corrected the comment above it first. That correction
-changed nothing, because Lean reads the names and not the comment.
-
-## VI. How much of the project is tested
+## V. How much of this work is tested
 
 A definition counts as tested only when a check rejects a corrupted copy of the
 code.
@@ -268,7 +240,7 @@ The definitions between 8.9% and 21.2% have bounds that come from a name.
 Nobody proved those bounds. Those definitions are weaker evidence than the
 count of 21.2% implies.
 
-## VII. What the proofs assume
+## VI. What the proofs assume
 
 Lean reports no gap in any proof. That report is true. It is also incomplete,
 because a theorem can carry a condition that nobody proved.
@@ -279,7 +251,7 @@ are results from outside this work that we use and do not prove.
 
 We now prove each of those seven, or we delete the result that needs it.
 
-## VIII. What these laws leave out
+## VII. What these laws leave out
 
 None of the three parts contains a term for environment. Socioeconomic
 measures can explain as much difference between individuals as genetic distance
