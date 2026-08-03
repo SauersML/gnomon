@@ -66,7 +66,9 @@ $$
 
 $K$ is the trait prevalence. $T$ is the liability threshold that produces it.
 $i$ and $i_c$ are the mean liabilities among cases and among controls. $v_1$
-and $v_0$ are the score variances in those two groups.
+and $v_0$ are the score variances in those two groups **divided by $R^{2}$**:
+the variance of the score among cases is $R^{2}v_1$, not $v_1$. Step 5 uses the
+normalised form, so the $R^{2}$ cancels there.
 
 $$
 T = \Phi^{-1}(1-K), \qquad i = \frac{\varphi(T)}{K}, \qquad i_c = -\frac{iK}{1-K}
@@ -190,8 +192,16 @@ Two markers in perfect LD carry the same information. Their LD $r^{2}$, which
 is a different quantity from the accuracy $R^{2}$ above, equals 1. LD pruning
 drops one marker from every such pair.
 
-**After pruning, the unremovable part of the error is zero.** The whole error
-then shrinks as the sample size and the cohort count grow.
+**Pruning at $r^{2}=1$ is not sufficient**, and an earlier version of this page
+said it was. The error becomes unremovable when some joint genotype cell has
+zero probability, and that can happen far below $r^{2}=1$: in an exact sweep
+over two-locus couplings, 56 of 72 configurations carrying a vanishing
+haplotype lost coverage at $r^{2}<1$, the worst at $r^{2}=1/81\approx0.012$.
+Complete linkage costs nothing at all unless the two loci have equal allele
+frequencies, and at $p=1/2$ it costs nothing even then.
+
+So no $r^{2}$ threshold certifies that the unremovable part is zero. What the
+condition actually needs is a positive floor on every joint genotype cell.
 <div class="caution">
 
 **CAUTION: Always quote the cost with this result.** Some differences between
@@ -205,9 +215,18 @@ it in principle only.
 
 </div>
 
-We proved one direction: LD pruning removes the fixed error. We did not prove
-the reverse direction. That proof needs a worked example, and nobody built one
-yet.
+Worse for practice, the population statement is about *positive* probability,
+and positive is not observable. At $p=1/2$ with 500,000 samples the rarest
+genotype cell is missed 22% of the time at $r^{2}=0.98$ and every time at
+$r^{2}\geq0.998$, where seeing it would need about $7\times10^{7}$ samples.
+The threshold that binds a real study is set by its sample size, not by
+$r^{2}$.
+
+And linkage is not even the dominant cause. At allele frequency $1/20$ with
+$r^{2}=0$ exactly — perfect linkage *equilibrium* — 500,000 samples lose a cell
+in 5% of runs. Raising $r^{2}$ to $0.81$ there makes the rarest cell *more*
+common, so more LD helps. A rule phrased in $r^{2}$ gets both of these
+backwards.
 
 </div>
 <div class="card">
