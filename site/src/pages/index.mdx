@@ -326,9 +326,7 @@ matched $F_{ST}$.
 We fixed each prediction before the run. No prediction uses a fitted number,
 except where the table states one.
 
-No file in this repository holds the number that the two information rows
-report, so you cannot re-check those two. Every other row reads its number out
-of a stored file.
+Every row reads its number out of a file in this repository.
 
 One of those stored files you cannot regenerate. The Brier row reads a study
 data set that lives outside this repository, at an absolute path on a
@@ -343,8 +341,8 @@ reproduces every digit of it.
 |---|---:|---:|---|
 | Hudson $F_{ST}$ from Nei $G_{ST}$ | exact | $3.6\times10^{-16}$ | 16 parameter settings |
 | AUC from $R^{2}$, true prevalence | — | root mean square error $0.0126$ | no fitted number |
-| Information per cohort | $1.000$ | $1.035 / 1.013 / 1.029 / 0.984$ | four cohort counts in one run, number in the git history only |
-| Information near perfect LD | a square law | exponent $1.9999$ | the local exponent at the smallest genotype-cell floor, number in the git history only |
+| Information per cohort | $1.000$ | $1.035 / 1.013 / 1.029 / 0.984$ | four cohort counts in one run |
+| Information near perfect LD | a square law | exponent $1.9999$ | the local exponent at the smallest genotype-cell floor, where the slope across the whole sweep is $1.85$ |
 | Best SNPs per cohort | $3.3 \times$ LD decay length | agrees | across a factor of 1000 |
 | $F_{ST}$ after a split, against msprime | $t/(t+2N_e)$ | $\lvert z\rvert \leq 0.89$ | 200 replicates per cell, four settings, every cell within 1 SE |
 | Highest $F_{ST}$ a serial founder model reaches | $0.18497$ | $0.19248$ | 3.9% apart, no fitted number |
