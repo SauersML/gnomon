@@ -115,6 +115,57 @@ def strip_comments(src: str) -> str:
         i += 1
     return "".join(out)
 
+BLOCK_OPEN = re.compile(r"[ \t]*(?:noncomputable[ \t]+)?(namespace|section|mutual)\b[ \t]*([^\s]*)[ \t]*$")
+BLOCK_CLOSE = re.compile(r"[ \t]*end\b[ \t]*([A-Za-z_0-9'À-￿.]*)[ \t]*$")
+
+def block_structure_errors(src: str):
+    """Match `namespace`/`section`/`mutual` openers against their `end`s.
+
+    An earlier form of this guard asked whether the file's last line was
+    literally `end Calibrator`. That is only one of several correct ways to
+    close the namespace: `end Calibrator.CertificateGrading` closes
+    `namespace Calibrator.CertificateGrading`, and a matched inner `end Foo`
+    followed by `end Calibrator` is equally correct. Both were reported as
+    failures, which is how the guard came to flag every `BundleRigidity`
+    module and one file got restructured to satisfy the guard rather than the
+    language. What the check is actually for is a namespace that is opened and
+    never closed, so it tracks a stack instead of inspecting the last line.
+    """
+    stack, errors = [], []
+    for n, line in enumerate(src.splitlines(), 1):
+        m = BLOCK_OPEN.match(line)
+        if m:
+            stack.append((m.group(1), m.group(2), n))
+            continue
+        m = BLOCK_CLOSE.match(line)
+        if not m:
+            continue
+        name = m.group(1)
+        if not stack:
+            shown = f"`end {name}`" if name else "a bare `end`"
+            errors.append(f"line {n}: {shown} closes nothing that is open")
+            continue
+        if not name:
+            # A bare `end` closes an anonymous `section` or a `mutual` block.
+            stack.pop()
+            continue
+        # `end A.B` closes a single `namespace A.B`, or a run of frames whose
+        # names concatenate to it.
+        depth, acc = None, []
+        for k in range(len(stack) - 1, -1, -1):
+            acc.insert(0, stack[k][1])
+            if ".".join(x for x in acc if x) == name:
+                depth = k
+                break
+        if depth is None:
+            opened = ", ".join(f"{k} {nm}".strip() for k, nm, _ in stack) or "nothing"
+            errors.append(f"line {n}: `end {name}` matches no open block (open here: {opened})")
+            continue
+        del stack[depth:]
+    for kind, name, n in stack:
+        errors.append(f"line {n}: `{kind} {name}`".rstrip() + " is never closed")
+    return errors
+
 def lean_files():
     return (glob.glob(os.path.join(ROOT, "Calibrator", "*.lean")) +
             glob.glob(os.path.join(ROOT, "Calibrator", "*", "*.lean")) +
@@ -841,8 +892,8 @@ def main() -> int:
         if raw.count("/-") != raw.count("-/"):
             bad.append(f"{rel}: unbalanced comment delimiters "
                        f"({raw.count('/-')} open, {raw.count('-/')} close)")
-        if "namespace Calibrator" in raw and not raw.rstrip().endswith("end Calibrator"):
-            bad.append(f"{rel}: does not end with `end Calibrator`")
+        for err in block_structure_errors(strip_comments(raw)):
+            bad.append(f"{rel}: {err}")
         for imp in re.findall(r"^import (Calibrator[A-Za-z.]*)", raw, re.M):
             if not os.path.exists(os.path.join(ROOT, imp.replace(".", "/") + ".lean")):
                 bad.append(f"{rel}: imports {imp}, which does not exist")
