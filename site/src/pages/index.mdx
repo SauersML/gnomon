@@ -230,8 +230,8 @@ genotypes, and it is not the $R^{2}$ of steps 3 to 5, which is the fraction of
 the liability the score explains. LD pruning drops one SNP from every such
 pair.
 
-**Pruning at $r^{2}=1$ is not sufficient**, and an earlier version of this page
-said it was. The residual effect-size difference appears once some joint
+**Pruning at $r^{2}=1$ is not sufficient.** The residual effect-size
+difference appears once some joint
 genotype cell of a SNP pair carries zero probability, and that can happen far
 below $r^{2}=1$: in an exact sweep over two-locus couplings, 56 of 72
 configurations carrying a vanishing haplotype lost coverage at $r^{2}<1$, the
@@ -314,10 +314,11 @@ matched $F_{ST}$.
 We fixed each prediction before the run. No prediction uses a fitted number,
 except where the table states one.
 
-Three rows carry the note "result file not stored" or "not stored". We ran
-those simulations and we kept the numbers, but we do not keep their output
-files, so you cannot re-check those three numbers against stored data. Every
-other row reads its number out of a file in this repository.
+No file in this repository holds the number that three of these rows report,
+so you cannot re-check those three. The two information rows repeat a number
+that appears only in the git history, and the $F_{ST}$ row repeats a number
+that appears only in a commit message. Every other row reads its number out of
+a stored file.
 
 <div class="table-wrap">
 
@@ -325,10 +326,10 @@ other row reads its number out of a file in this repository.
 |---|---:|---:|---|
 | Hudson $F_{ST}$ from Nei $G_{ST}$ | exact | $3.6\times10^{-16}$ | 16 parameter settings |
 | AUC from $R^{2}$, true prevalence | — | RMSE $0.0126$ | no fitted number |
-| Information per cohort | $1.000$ | $1.035 / 1.013 / 1.029 / 0.984$ | four cohort counts in one run, result file not stored |
-| Information near perfect LD | a square law | exponent $1.9999$ | the local exponent at the smallest genotype-cell floor, result file not stored |
+| Information per cohort | $1.000$ | $1.035 / 1.013 / 1.029 / 0.984$ | four cohort counts in one run, number in the git history only |
+| Information near perfect LD | a square law | exponent $1.9999$ | the local exponent at the smallest genotype-cell floor, number in the git history only |
 | Best SNPs per cohort | $3.3 \times$ LD decay length | agrees | across a factor of 1000 |
-| $F_{ST}$ after a split, against msprime | $t/(t+2N_e)$ | not stored | one run reported $\lvert z\rvert \leq 0.89$ over 200 replicates per cell, and we store no output from it |
+| $F_{ST}$ after a split, against msprime | $t/(t+2N_e)$ | not stored | a commit message reports $\lvert z\rvert \leq 0.89$ over 200 replicates per cell, and no stored file holds it |
 | Highest $F_{ST}$ a serial founder model reaches | $0.18497$ | $0.19248$ | 3.9% apart, no fitted number |
 | Brier score $=$ MSE $+$ base rate term | exact | $R^{2} = 0.994$ | leave-one-out, no fit |
 

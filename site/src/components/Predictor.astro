@@ -43,7 +43,7 @@ const auc = (r2: number, K: number) => {
 // The target's phenotypic variance is (1 - F_ST) V_A + V_E, not V_target + V_E.
 // Lost LD tagging attenuates the score's covariance with the phenotype; it does
 // not remove that genetic variance from the phenotype. Putting rho2 in the
-// denominator too is the superseded `taggedDriftR2Ratio`, which Wright-Fisher
+// denominator too gives `taggedDriftR2Ratio`, which Wright-Fisher
 // simulation found 15% to 112% high, always overstating portability
 // (proofs/validation/drift_diff/, written up at HumanDemography.lean:193-215).
 // The form below is `taggedDriftR2RatioCorrected`, HumanDemography.lean:226,
