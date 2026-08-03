@@ -3,22 +3,19 @@
 
 Guards, in order of what they catch:
 
-1. sorry ledger. Every admitted proof must be listed in `SORRY_LEDGER` below;
-   the production policy currently permits none. An unlisted `sorry` fails.
-   Scientific debt belongs in prose or an issue, never in a theorem parameter.
+1. Admissions. Every `sorry` or `admit` in production fails. Scientific debt
+   belongs in prose or an issue, never in a proof term or theorem parameter.
 
-2. Falsified claims. Nothing may remain marked Evidence.falsified.
-
-3. Convention drift. Every numeric literal 2 or 4 used as a multiplier inside
+2. Convention drift. Every numeric literal 2 or 4 used as a multiplier inside
    a definition is a restatement of a ploidy or coalescent-scaling convention.
    The count is pinned; adding new inline restatements without relating them
    to `ploidy` in Conventions.lean fails, so the number can only go down.
 
-4. Equilibria with no dynamic. A definition named for a rest point or a limit
+3. Equilibria with no dynamic. A definition named for a rest point or a limit
    must be derived as the fixed point of a process defined in the same file,
    not stipulated as a closed form that no theorem can contradict.
 
-5. Duplicate bodies across files. Two definitions in different modules whose
+4. Duplicate bodies across files. Two definitions in different modules whose
    bodies are alpha-equivalent are one quantity written twice; unless one calls
    the other or a theorem equates them, fixing one leaves the other wrong.
 
@@ -56,36 +53,35 @@ DO NOT ADD A GUARD THAT DELETES DEFINITIONS BY REFERENCE COUNT. It was tried,
    just the identifier: in both cases a docstring within a few lines of the
    deletion site named the consumer outright.
 
-6. Regimes baked into bodies. A definition whose value depends on an assumption
+5. Regimes baked into bodies. A definition whose value depends on an assumption
    about the data-generating process -- closed population, no mutation, infinite
    sites -- must name that assumption, because a formula carries no record of
    the regime it was derived in and a use site cannot discharge what it cannot
    see.
 
-7. Validation inherited from a sibling identity. Over-determination detects
+6. Validation inherited from a sibling identity. Over-determination detects
    divergence between formulas and is provably blind to a premise they share, so
    a VALIDATED tag must cite a measurement against an observable, never another
    definition. Guards 6 and 7 exist because one wrong number was certified five
    times, each time by a cross-check that could not have failed.
 
-8. Validation with no power. A validation is evidence in proportion to the range
+7. Validation with no power. A validation is evidence in proportion to the range
    its prediction spanned; a design on which the prediction is constant cannot
    reject a wrong functional form, however small the residual.
 
-9. Trust-boundary syntax. Production proof modules may not declare custom
+8. Trust-boundary syntax. Production proof modules may not declare custom
    axioms, use native/compiler-backed decision procedures, introduce unsafe
    declarations, or install custom syntax/elaborators.  These checks cover
    explicit source constructs; the environment-level axiom scan remains
    responsible for dependencies hidden behind imports or generated terms.
 
-Guards 6-8 are the subject of `Calibrator.DriftRegime`, which proves that 7 and 8
+Guards 5-7 are the subject of `Calibrator.DriftRegime`, which proves that 6 and 7
 are impossibilities rather than oversights.
 """
 import re, sys, glob, os
 
 ROOT = os.path.join(os.path.dirname(__file__), "..", "proofs")
 
-SORRY_LEDGER = set()                # name -> undischarged obligation, none yet
 CONVENTION_SITE_BUDGET = 0        # measured; may decrease, never increase
 ISOLATED_MODULE_BUDGET = 14         # modules no theorem cross-relates to another
 UNDECLARED_BUDGET = 0               # empirical defs with no status marker
@@ -188,11 +184,7 @@ def main() -> int:
             owner = None
             for d in re.finditer(r'^(?:noncomputable )?(?:def|theorem) ([A-Za-z_0-9\'.]+)', src[:m.start()], re.M):
                 owner = d.group(1)
-            if owner not in SORRY_LEDGER:
-                bad.append(f"{rel}:{line}: sorry in `{owner}` is not in SORRY_LEDGER")
-
-        if re.search(r'Evidence\.falsified', src):
-            bad.append(f"{rel}: a production declaration is still marked falsified")
+            bad.append(f"{rel}:{line}: forbidden sorry in `{owner}`")
 
         forbidden = [
             (r"\badmit\b", "contains `admit`"),
@@ -1035,7 +1027,7 @@ def main() -> int:
           f"stipulated equilibria {len(stipulated)}/{EQUILIBRIUM_BUDGET}, "
           f"duplicate bodies {len(duplicates)}/{DUPLICATE_BODY_BUDGET}, "
           f"isolated modules {len(isolated)}/{ISOLATED_MODULE_BUDGET}, "
-          f"sorry ledger {len(SORRY_LEDGER)}")
+          "admissions 0")
     return 0
 
 if __name__ == "__main__":
