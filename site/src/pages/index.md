@@ -221,37 +221,7 @@ except where the table states one.
 
 </div>
 
-## V. How much of this work is tested
-
-A definition counts as tested only when a check rejects a corrupted copy of the
-code.
-
-<div class="stats">
-<div class="stat"><div class="value">21.2%</div><div class="key">tested overall</div><div class="sub">259 of 1219</div></div>
-<div class="stat"><div class="value">8.9%</div><div class="key">against a proved bound</div><div class="sub">108 definitions</div></div>
-<div class="stat"><div class="value">30.5%</div><div class="key">of the reachable set</div><div class="sub">857 are reachable</div></div>
-<div class="stat"><div class="value">80%</div><div class="key">checks that can fail</div><div class="sub">110 of 137</div></div>
-</div>
-
-The project cannot reach 100%. Some definitions are pure names, and some are
-integrals. No automatic check reads either kind.
-
-The definitions between 8.9% and 21.2% have bounds that come from a name.
-Nobody proved those bounds. Those definitions are weaker evidence than the
-count of 21.2% implies.
-
-## VI. What the proofs assume
-
-Lean reports no gap in any proof. That report is true. It is also incomplete,
-because a theorem can carry a condition that nobody proved.
-
-We counted every such condition. Most are ordinary limits on the inputs, such
-as a prevalence between 0 and 1. Those are correct and they must stay. Seven
-are results from outside this work that we use and do not prove.
-
-We now prove each of those seven, or we delete the result that needs it.
-
-## VII. What these laws leave out
+## V. What these laws leave out
 
 None of the three parts contains a term for environment. Socioeconomic
 measures can explain as much difference between individuals as genetic distance

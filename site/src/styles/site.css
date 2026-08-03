@@ -264,30 +264,6 @@ th[align="right"], td[align="right"] {
 .card h3 { margin-top: 0; font-size: 1.02rem; }
 .card p { max-width: none; }
 
-.stats {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 0.9rem;
-  margin: 1.3rem 0;
-}
-
-.stat {
-  background: var(--bg-2);
-  border: 1px solid var(--rule);
-  border-radius: 8px;
-  padding: 0.85rem 1rem;
-}
-
-.stat .value {
-  font: 600 1.8rem/1.05 var(--sans);
-  letter-spacing: -0.03em;
-  color: var(--accent-2);
-  font-variant-numeric: tabular-nums;
-}
-
-.stat .key { font-size: 0.79rem; line-height: 1.35; color: var(--ink-2); margin-top: 0.25rem; }
-.stat .sub { font: 0.73rem/1.35 var(--mono); color: var(--ink-3); margin-top: 0.15rem; }
-
 .terms {
   display: flex;
   flex-wrap: wrap;
@@ -303,8 +279,7 @@ th[align="right"], td[align="right"] {
 /* responsive -------------------------------------------------------------- */
 
 @media (max-width: 760px) {
-  .pair, .stats { grid-template-columns: 1fr; }
-  .stats { grid-template-columns: repeat(2, 1fr); }
+  .pair { grid-template-columns: 1fr; }
   .page { padding: 2.6rem 1.15rem 4rem; }
 }
 
