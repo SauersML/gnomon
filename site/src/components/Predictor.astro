@@ -45,7 +45,7 @@ const auc = (r2: number, K: number) => {
 // not remove that genetic variance from the phenotype. Putting rho2 in the
 // denominator too gives `taggedDriftR2Ratio`, which Wright-Fisher
 // simulation found 15% to 112% high, always overstating portability
-// (proofs/validation/drift_diff/, written up at HumanDemography.lean:193-215).
+// (proofs/validation/empirical/drift_diff/, written up at HumanDemography.lean:193-215).
 // The form below is `taggedDriftR2RatioCorrected`, HumanDemography.lean:226,
 // exact to 0.00000 in 12 of 12 replicates across two designs.
 const fst0 = d.t / (d.t + 2 * d.Ne);
