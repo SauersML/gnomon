@@ -330,6 +330,13 @@ No file in this repository holds the number that the two information rows
 report, so you cannot re-check those two. Every other row reads its number out
 of a stored file.
 
+One of those stored files you cannot regenerate. The Brier row reads a study
+data set that lives outside this repository, at an absolute path on a
+filesystem you almost certainly do not have, so the stored number is the only
+copy. The serial founder row beside it comes from the same file and does not
+have that problem: it is an exact 56-state calculation, and a fresh run
+reproduces every digit of it.
+
 <div class="table-wrap">
 
 | What we predicted | Prediction | Measurement | Note |
@@ -341,7 +348,7 @@ of a stored file.
 | Best SNPs per cohort | $3.3 \times$ LD decay length | agrees | across a factor of 1000 |
 | $F_{ST}$ after a split, against msprime | $t/(t+2N_e)$ | $\lvert z\rvert \leq 0.89$ | 200 replicates per cell, four settings, every cell within 1 SE |
 | Highest $F_{ST}$ a serial founder model reaches | $0.18497$ | $0.19248$ | 3.9% apart, no fitted number |
-| Brier score $=$ mean square error $+$ base rate term | exact | $R^{2} = 0.994$ | leave-one-out, no fit |
+| Brier score $=$ mean square error $+$ base rate term | exact | $R^{2} = 0.994$ | leave-one-out, no fit, and the run reads study data that this repository does not contain |
 
 </div>
 
