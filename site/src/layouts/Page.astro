@@ -32,12 +32,11 @@ const built = new Date().toISOString().slice(0, 10);
       <slot />
       <footer class="colophon">
         <p>
-          Built {built} from <code>site/src/pages/</code>. TeX is rendered by
-          KaTeX at build time; this page ships no client JavaScript.
+          We built this page on {built}. Lean proves every formula on this
+          page.
         </p>
         <p>
-          Every formula is machine-checked in <code>proofs/Calibrator</code>.
-          Result-level provenance is in <code>proofs/MATH_LEDGER.md</code>.
+          This page needs no JavaScript. A browser can open the file directly.
         </p>
       </footer>
     </main>
