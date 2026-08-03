@@ -8,6 +8,15 @@ Guards, in order of what they catch:
    statement, a laundered premise, or a hidden axiom. `admit` remains forbidden
    so the corpus has one explicit spelling for unresolved proof obligations.
 
+   The rule is: `sorry` is FREE TO WRITE and BUYS NOTHING. Free to write,
+   because a guard that fails the build on an admission while passing a
+   weakened statement has made honesty the most expensive option on the board
+   and will get what it pays for; `AxiomScan.admissible` records the same
+   decision at the kernel. Buys nothing, because guards 3m, 3n and 3p ignore
+   admitted declarations when deciding what has been established or inhabited.
+   Without that second half, `def witness : Bundle := sorry` would discharge
+   three screens at once by writing down the very assumption they look for.
+
 2. Convention drift. Every numeric literal 2 or 4 used as a multiplier inside
    a definition is a restatement of a ploidy or coalescent-scaling convention.
    The count is pinned; adding new inline restatements without relating them
@@ -117,6 +126,7 @@ LAUNDERED_PROP_BUDGET = 16          # named propositions only ever assumed, neve
 UNWITNESSED_BUNDLE_BUDGET = 38      # assumption bundles no concrete construction satisfies
 INSTANCE_LAUNDERING_BUDGET = 2      # supplied fields turned into silently-binding instances
 UNCONDITIONAL_NAME_BUDGET = 35      # conditional results named as though unconditional
+DOMAIN_NAMED_ARITHMETIC_BUDGET = 90 # genetics in the name, free reals in the goal; ratchets down
 
 def strip_comments(src: str) -> str:
     """Remove Lean block and line comments so prose cannot trip the guards."""
@@ -1067,14 +1077,44 @@ def main() -> int:
     # Everything a declaration can *produce*: the goal of a theorem, or the
     # return type of a definition or instance. A name that never appears in one
     # of these positions is never established, only ever required.
+    # A declaration whose body is `sorry` PRODUCES NOTHING, and must not be
+    # counted below. Guard 1 reports such a declaration as an admission and
+    # AxiomScan lets it through deliberately, because an enumerable debt beats a
+    # laundered premise. That decision has a matching obligation right here: if
+    # an admission also DISCHARGED an inhabitation obligation, then the cheapest
+    # edit available -- `def witness : Bundle := sorry` -- would clear 3m, 3n and
+    # 3p at a stroke, and would do it by writing down exactly the assumption the
+    # three screens exist to find. Permitting the admission and letting it settle
+    # the question are different decisions. The first is what lets this corpus be
+    # honest about what it has not proved; the second would make `sorry` the
+    # laundering instrument rather than the alternative to it.
+    #
+    # So: `sorry` is free to write, and buys nothing.
+    admitted = set()
+    for f in lean_files():
+        src = strip_comments(open(f).read())
+        for m in re.finditer(r"^(?:noncomputable )?(?:(?:private|protected) )*"
+                             r"(?:def|abbrev|instance|theorem) ([A-Za-z_0-9'.]+)"
+                             r"((?:(?!\n\S).)*)", src, re.S | re.M):
+            if re.search(r"\bsorry\b", m.group(2)):
+                admitted.add(m.group(1).split(".")[-1])
+
     produced = set()
     for f in lean_files():
         src = strip_comments(open(f).read())
         for m in re.finditer(r"^(?:noncomputable )?(?:(?:private|protected) )*"
-                             r"(?:def|abbrev|instance) [A-Za-z_0-9'.]*((?:(?!\n\S).)*)",
+                             r"(?:def|abbrev|instance) ([A-Za-z_0-9'.]*)((?:(?!\n\S).)*)",
                              src, re.S | re.M):
-            produced.update(re.findall(IDENT, goal_of(m.group(1).split(":=")[0])))
+            # Two tests, because anonymous `instance : Bundle := sorry` has no
+            # name to look up and would otherwise slip past the set.
+            if m.group(1).split(".")[-1] in admitted:
+                continue
+            if re.search(r"\bsorry\b", m.group(2)):
+                continue
+            produced.update(re.findall(IDENT, goal_of(m.group(2).split(":=")[0])))
     for _tname, stmt in global_theorems:
+        if _tname in admitted:
+            continue
         produced.update(re.findall(IDENT, goal_of(stmt)))
 
     assumed_by = {}
@@ -1242,7 +1282,12 @@ def main() -> int:
         domain_named_arithmetic.append(
             "`%s` names genetics but its goal mentions no constant this corpus "
             "defines" % tname)
-    if len(domain_named_arithmetic) > DOMAIN_NAMED_ARITHMETIC_BUDGET:
+    if DOMAIN_NAMED_ARITHMETIC_BUDGET is None:
+        print(f"  advisory (genetics-asserting names on domain-free statements): "
+              f"{len(domain_named_arithmetic)}")
+        for x in domain_named_arithmetic[:12]:
+            print(f"    {x}")
+    elif len(domain_named_arithmetic) > DOMAIN_NAMED_ARITHMETIC_BUDGET:
         bad.append("genetics-asserting names on domain-free statements: %d, budget %d; "
                    "either state the theorem about a defined quantity or name it for "
                    "the arithmetic it does"
