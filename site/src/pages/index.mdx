@@ -59,8 +59,15 @@ the target population. $V_E$ is the residual liability variance, which the
 score does not explain.
 
 $$
-R^{2}_{\text{target}} = \frac{V_{\text{target}}}{V_{\text{target}} + V_E}
+R^{2}_{\text{target}} = \frac{V_{\text{target}}}{(1 - F_{ST})V_A + V_E}
 $$
+
+The denominator is the target population's whole liability variance, and lost
+LD tagging does not shrink it. Tagging loss attenuates the covariance between
+the score and the phenotype; the genetic variance it fails to capture stays in
+the phenotype. Dividing by $V_{\text{target}} + V_E$ instead cancels $\rho^{2}$
+out of the ratio and overstates how much accuracy transfers, by 15% to 112% in
+Wright-Fisher simulation.
 
 </div>
 <div class="step">
