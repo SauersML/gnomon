@@ -549,9 +549,25 @@ def main() -> int:
     #     quantity. Alpha-equivalent bodies in different files are either one
     #     quantity, and one of them should call the other, or they are two
     #     quantities that happen to coincide, and a theorem should say so.
-    dupdef = re.compile(r"^(?:noncomputable )?def ([A-Za-z_0-9'.]+)(.*?):=\s*\n?\s*(.+?)"
-                        r"(?=\n(?:@\[|theorem |noncomputable |def |abbrev |structure |section |"
-                        r"end |namespace |/-))", re.S | re.M)
+    #
+    #     Equation-style definitions need their own pattern, and the reason is
+    #     a defect this check had until it was measured. `def f ... | 0 => a |
+    #     n+1 => b` has no `:=` at all, so the value-style pattern below used to
+    #     run its non-greedy signature group forward across the match arms until
+    #     it found the *next* `:=` in the file -- typically the one in the
+    #     `@[simp] theorem f_nil ... := rfl` that follows -- and recorded the
+    #     definition's body as `rfl`. Four definitions in this corpus landed on
+    #     that single token (`Pop.pair`, `altSum`, `ldRecurrence`,
+    #     `driftLDTrajectory`) and were reported as five mutual duplicates, and
+    #     the real bodies of all nineteen equation-style definitions were never
+    #     compared with anything. A guard that cannot see a body must not report
+    #     on it, so the arms are now the body.
+    valuedef = re.compile(r"^(?:noncomputable )?def ([A-Za-z_0-9'.]+)"
+                          r"((?:(?!\n[ \t]*\|).)*?):=\s*\n?\s*(.+?)"
+                          r"(?=\n(?:@\[|theorem |noncomputable |def |abbrev |structure |section |"
+                          r"end |namespace |/-))", re.S | re.M)
+    eqndef = re.compile(r"^(?:noncomputable )?def ([A-Za-z_0-9'.]+)"
+                        r"((?:(?!\n[ \t]*\|)(?!:=).)*?)\n((?:[ \t]*\|[^\n]*\n?)+)", re.M)
     IDENT = r"[A-Za-z_][A-Za-z_0-9₀-₉']*"
 
     def alpha_normal(args, body):
@@ -573,7 +589,7 @@ def main() -> int:
     for f in lean_files():
         src = strip_comments(open(f).read())
         rel = os.path.relpath(f, ROOT)
-        for m in dupdef.finditer(src):
+        for m in list(valuedef.finditer(src)) + list(eqndef.finditer(src)):
             name, args, body = m.group(1).split(".")[-1], m.group(2), m.group(3)
             norm = alpha_normal(args, body)
             # Pure operator shape is not a shared quantity: `a + b` coincides
