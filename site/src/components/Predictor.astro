@@ -178,8 +178,13 @@ const f = (x: number, n = 4) => (Number.isFinite(x) ? x.toFixed(n) : "—");
       lab.textContent = fst.toFixed(2);
       svg.appendChild(lab);
     }
+    // SVG has no TeX, so the subscript is a tspan rather than "F_ST".
     const xl = el("text", { x: L + iw / 2, y: H - 6, class: "axis", "text-anchor": "middle" });
-    xl.textContent = "Hudson F_ST between the two populations";
+    xl.appendChild(document.createTextNode("Hudson F"));
+    const sub = el("tspan", { "baseline-shift": "sub", "font-size": "0.78em" });
+    sub.textContent = "ST";
+    xl.appendChild(sub);
+    xl.appendChild(document.createTextNode(" between the two populations"));
     svg.appendChild(xl);
 
     let dPath = "";
