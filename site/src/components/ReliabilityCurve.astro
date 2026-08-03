@@ -60,12 +60,21 @@ for (let i = 0; i <= 400; i++) {
         <text x={X(m.tau) + 10} y={Y(B(m.tau)) - 8} class="tick">{Math.round(B(m.tau))} fits</text>
       </>
     ))}
-    <circle cx={X(measured.tau)} cy={Y(measured.B)} r="6.5" class="dot" />
+    <circle cx={X(measured.tau)} cy={Y(measured.B)} r="6.5" class="dot">
+      <title>Measured: 16 fits reached a reliability of 0.153</title>
+    </circle>
     <text x={X(measured.tau) + 12} y={Y(measured.B) + 5} class="tick strong">16 fits, reliability 0.153</text>
   </svg>
   <p class="fig-note">
     Each further nine of reliability costs about ten times more fits. Sixteen
     fits per cohort reach a reliability of 0.153, and a reliability of 0.8 needs
     about 350 fits per cohort.
+  </p>
+  <p class="fig-note">
+    One measurement sets this curve. The filled point is that measurement, and
+    it fixes the ratio of the fit variance to the information one cohort
+    carries. The three open points are read off the curve and nobody measured
+    them. A cohort with a different ratio needs its own measurement, so treat
+    the fit counts here as the shape of the law rather than as a budget.
   </p>
 </figure>

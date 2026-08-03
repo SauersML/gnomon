@@ -320,10 +320,10 @@ except where the table states one.
 |---|---:|---:|---|
 | Hudson $F_{ST}$ from Nei $G_{ST}$ | exact | $3.6\times10^{-16}$ | 16 parameter settings |
 | AUC from $R^{2}$, true prevalence | — | RMSE $0.0126$ | no fitted number |
-| Information per cohort | $1.000$ | $1.035 / 1.013 / 1.029 / 0.984$ | four separate runs |
-| Information near perfect LD | a square law | exponent $1.9999$ | as the two SNPs approach perfect LD |
+| Information per cohort | $1.000$ | $1.035 / 1.013 / 1.029 / 0.984$ | four cohort counts in one run, result file not stored |
+| Information near perfect LD | a square law | exponent $1.9999$ | the local exponent at the smallest genotype-cell floor, result file not stored |
 | Best SNPs per cohort | $3.3 \times$ LD decay length | agrees | across a factor of 1000 |
-| $F_{ST}$ after a split, against msprime | $t/(t+2N_e)$ | $\lvert z\rvert \leq 0.89$ | 200 replicates, all cells within 1 SE |
+| $F_{ST}$ after a split, against msprime | $t/(t+2N_e)$ | not stored | one run reported $\lvert z\rvert \leq 0.89$ over 200 replicates per cell, and we store no output from it |
 | Highest $F_{ST}$ a serial founder model reaches | $0.18497$ | $0.19248$ | 3.9% apart, no fitted number |
 | Brier score $=$ MSE $+$ base rate term | exact | $R^{2} = 0.994$ | leave-one-out, no fit |
 
