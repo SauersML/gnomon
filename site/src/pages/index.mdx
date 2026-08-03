@@ -6,10 +6,16 @@ subtitle: >-
   can predict the size of that loss before you run the study.
 ---
 
+import Predictor from '../components/Predictor.astro';
+import CohortCurve from '../components/CohortCurve.astro';
+import ReliabilityCurve from '../components/ReliabilityCurve.astro';
+
 ## I. How to predict the accuracy
 
 Follow five steps to predict the AUC in the target population. Read sections
 II and III for the limits on these five steps.
+
+<Predictor />
 
 <div class="chain">
 <div class="step">
@@ -19,8 +25,8 @@ $$
 F_{ST} = \frac{t}{t + 2N_e}
 $$
 
-$t$ counts the generations after the two populations separate. $N_e$ is the
-effective population size.
+$t$ counts the generations since the two populations separated. $N_e$ is the
+effective size of each population over that period.
 
 </div>
 <div class="step">
@@ -30,11 +36,13 @@ $$
 V_{\text{target}} = \rho^{2}\,(1 - F_{ST})\,V_A
 $$
 
-$V_A$ is the variance that the score explains in the source population.
-$\rho^{2}$ is the part of the tagging that survives in the target population.
+$V_A$ is the variance that the score explains in the source population. The
+markers in a score rarely include the causal variants. They stand in for them
+through LD instead. $\rho^{2}$ is the fraction of that LD which survives in the
+target population.
 
-Genetic distance and tagging each remove signal. One number does not predict
-the other.
+Genetic distance and LD each remove signal. Neither number predicts the
+other.
 
 </div>
 <div class="step">
@@ -44,7 +52,7 @@ $$
 R^{2}_{\text{target}} = \frac{V_{\text{target}}}{V_{\text{target}} + V_E}
 $$
 
-$V_E$ is the residual variance.
+$V_E$ is the variance that the score does not explain.
 
 </div>
 <div class="step">
@@ -95,9 +103,11 @@ $$
 <span><b>r⊥²</b> the fixed error</span>
 </div>
 
-Each part shrinks with a different kind of data. $n$ is the source sample size.
-$m$ counts the separate target cohorts. $p_i$ is the information from one
-cohort.
+Each part shrinks with a different kind of data. $n$ is the number of people in
+the source GWAS. $d_0$ counts the parameters the source model fits. $m$ counts
+the separate target cohorts. $p_i$ is how much one cohort tells you about the
+transfer. $r_\perp$ is the part of the error that no data removes.
+$\tilde\varepsilon^{2}$ sets the overall scale.
 
 A bigger source GWAS reduces the first part only. It does nothing to the third
 part.
@@ -105,7 +115,7 @@ part.
 ### How many target cohorts to collect
 
 $$
-n'^{*} \approx 3.29\,\tau, \qquad \mathrm{Risk}^{*} \approx \frac{16.11}{N\tau}
+n'^{*} \approx 3.29\,\ell, \qquad \mathrm{Risk}^{*} \approx \frac{16.11}{N\ell}
 $$
 
 Take a fixed total number of genotyped markers. More separate cohorts reduce
@@ -113,11 +123,17 @@ the error, and the error drops as $1/m$. Each cohort must still contain enough
 markers for its own calibration. Past that point more cohorts make the error
 worse.
 
-The best cohort contains about 3.3 LD decay lengths of markers. The ratio
-$n'^{*}/\tau$ stays between 3.27 and 3.50 across a factor of 1000 in $\tau$.
-You can therefore use this rule in other studies.
+$n'^{*}$ is the number of markers to genotype in one cohort. $\ell$ is the LD
+decay length, measured in markers. $N$ is the total number of markers across
+every cohort.
+
+The best cohort therefore holds about 3.3 LD decay lengths of markers. The
+ratio $n'^{*}/\ell$ stays between 3.27 and 3.50 across a factor of 1000 in
+$\ell$, so you can use this rule in other studies.
 
 A longer LD decay length also reduces the error at a fixed marker count.
+
+<CohortCurve />
 
 ### How many times to fit each cohort
 
@@ -126,15 +142,20 @@ $$
 $$
 
 $B$ is the number of separate calibration fits for one cohort. Each fit uses a
-different subsample of that cohort. $\tau$ is the reliability you need. The
-condition is exact in both directions. You therefore know when you have enough
-fits and when you do not.
+different subsample of that cohort. $\tau$ is the reliability you need, between
+0 and 1. The ratio $c/p$ depends on the cohort and on the trait. One
+measurement fixes it, and the study below fixes it at about 88.
+
+The condition is exact in both directions. You therefore know when you have
+enough fits and when you do not.
 
 The cost grows very fast as $\tau$ approaches 1. Each further nine costs
 about ten times more fits.
 
 One study fitted each cohort 16 times and reached a reliability of 0.153. That
 study needed about 350 fits per cohort for a reliability of 0.8.
+
+<ReliabilityCurve />
 
 ## III. Two limits
 
@@ -159,8 +180,9 @@ size and the cohort count grow.
 
 **CAUTION: Always quote the cost with this result.** Some differences between
 populations are cheap to measure and some are very expensive. The expensive
-ones need about $(C/\eta)^{2k}$ samples, where $k$ counts how indirectly the
-difference appears in the data. The count grows without limit as $k$ grows.
+ones need about $(C/\eta)^{2k}$ samples. Here $k$ counts how indirectly the
+difference appears in the data, and $C$ is a constant of the marker set. The
+sample count grows without limit as $k$ grows.
 
 An expensive difference is a hard limit in a real study. Enough samples remove
 it in principle only.
@@ -213,7 +235,7 @@ except where the table states one.
 | AUC from $R^{2}$, true prevalence | — | RMSE $0.0126$ | no fitted number |
 | Information per cohort | $1.000$ | $1.035 / 1.013 / 1.029 / 0.984$ | four separate runs |
 | Information near perfect LD | $\eta^{2}$ | exponent $1.9999$ | as $\eta$ approaches 0 |
-| Best markers per cohort | $3.29\,\tau$ | agrees | across a factor of 1000 in $\tau$ |
+| Best markers per cohort | $3.29\,\ell$ | agrees | across a factor of 1000 in $\ell$ |
 | Curvature at the long-memory edge | $-\frac{3}{2}\delta$ | $10^{-7}$ | the geometry is flat |
 | $F_{ST}$ after a split, against msprime | $t/(t+2N_e)$ | $\lvert z\rvert \leq 0.89$ | 200 replicates, all cells within 1 SE |
 | Highest $F_{ST}$ a serial founder model reaches | $0.18497$ | $0.19248$ | 3.9% apart, no fitted number |

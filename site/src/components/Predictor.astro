@@ -1,0 +1,233 @@
+---
+/**
+ * The five-step chain, computed live.
+ *
+ * The server renders the default numbers, so the panel reads correctly with no
+ * JavaScript. The script then recomputes on input and redraws one curve.
+ */
+
+// Defaults match the worked example in section I.
+const d = {
+  t: 400,        // generations since the split
+  Ne: 10000,     // effective population size
+  rho2: 0.8,     // fraction of tagging that survives
+  VA: 0.2,       // variance the score explains in the source population
+  VE: 0.8,       // residual variance
+  K: 0.1,        // trait prevalence
+};
+
+// --- the chain, in the same order as section I -----------------------------
+const erf = (x: number) => {
+  const s = x < 0 ? -1 : 1;
+  x = Math.abs(x);
+  const a = [0.254829592, -0.284496736, 1.421413741, -1.453152027, 1.061405429];
+  const t = 1 / (1 + 0.3275911 * x);
+  const y = 1 - ((((a[4] * t + a[3]) * t + a[2]) * t + a[1]) * t + a[0]) * t * Math.exp(-x * x);
+  return s * y;
+};
+const Phi = (z: number) => 0.5 * (1 + erf(z / Math.SQRT2));
+const pdf = (x: number) => Math.exp(-0.5 * x * x) / Math.sqrt(2 * Math.PI);
+const PhiInv = (p: number) => {
+  let lo = -9, hi = 9;
+  for (let i = 0; i < 120; i++) { const m = (lo + hi) / 2; if (Phi(m) < p) lo = m; else hi = m; }
+  return (lo + hi) / 2;
+};
+const auc = (r2: number, K: number) => {
+  const rr = Math.min(Math.max(r2, 0), 0.999999);
+  const T = PhiInv(1 - K), i = pdf(T) / K, ic = -i * K / (1 - K);
+  const v1 = 1 - rr * i * (i - T), v0 = 1 - rr * ic * (ic - T);
+  if (v1 <= 0 || v0 <= 0) return NaN;
+  return Phi((i - ic) * Math.sqrt(rr) / Math.sqrt(v1 + v0));
+};
+
+const fst0 = d.t / (d.t + 2 * d.Ne);
+const vt0 = d.rho2 * (1 - fst0) * d.VA;
+const r20 = vt0 / (vt0 + d.VE);
+const r2src0 = d.VA / (d.VA + d.VE);
+const auc0 = auc(r20, d.K);
+const aucSrc0 = auc(r2src0, d.K);
+
+const f = (x: number, n = 4) => (Number.isFinite(x) ? x.toFixed(n) : "—");
+---
+
+<figure class="panel" id="predictor">
+  <figcaption class="panel-title">Change an input to see the effect on the AUC</figcaption>
+
+  <div class="panel-body">
+    <div class="controls">
+      <label>
+        <span>Generations since the two populations separated</span>
+        <b data-out="t">{d.t}</b>
+        <input type="range" id="in-t" min="0" max="4000" step="10" value={d.t} />
+      </label>
+      <label>
+        <span>Effective size of each population</span>
+        <b data-out="Ne">{d.Ne.toLocaleString()}</b>
+        <input type="range" id="in-Ne" min="500" max="50000" step="100" value={d.Ne} />
+      </label>
+      <label>
+        <span>Fraction of LD tagging kept in the target population</span>
+        <b data-out="rho2">{d.rho2.toFixed(2)}</b>
+        <input type="range" id="in-rho2" min="0.1" max="1" step="0.01" value={d.rho2} />
+      </label>
+      <label>
+        <span>Variance the score explains in the source population</span>
+        <b data-out="VA">{d.VA.toFixed(2)}</b>
+        <input type="range" id="in-VA" min="0.01" max="0.6" step="0.01" value={d.VA} />
+      </label>
+      <label>
+        <span>Variance the score does not explain</span>
+        <b data-out="VE">{d.VE.toFixed(2)}</b>
+        <input type="range" id="in-VE" min="0.2" max="1.4" step="0.01" value={d.VE} />
+      </label>
+      <label>
+        <span>Trait prevalence</span>
+        <b data-out="K">{d.K.toFixed(3)}</b>
+        <input type="range" id="in-K" min="0.005" max="0.5" step="0.005" value={d.K} />
+      </label>
+    </div>
+
+    <div class="readout">
+      <div class="headline">
+        <div class="big">
+          <div class="big-value" data-out="kept">{f((r20 / r2src0) * 100, 1)}%</div>
+          <div class="big-key">of the source accuracy survives the transfer</div>
+        </div>
+        <div class="big">
+          <div class="big-value" data-out="auc">{f(auc0)}</div>
+          <div class="big-key">AUC in the target population</div>
+          <div class="big-sub">source: <span data-out="aucSrc">{f(aucSrc0)}</span></div>
+        </div>
+      </div>
+      <dl class="steps">
+        <div><dt>Genetic distance</dt><dd data-out="fst">{f(fst0)}</dd></div>
+        <div><dt>Signal in the target population</dt><dd data-out="vt">{f(vt0)}</dd></div>
+        <div><dt>Accuracy in the target population</dt><dd data-out="r2">{f(r20)}</dd></div>
+      </dl>
+      <p class="regime" data-out="regime" hidden>
+        The formula has no answer for these inputs. The score explains too much
+        of the liability for a trait this rare.
+      </p>
+    </div>
+  </div>
+
+  <svg id="predictor-plot" viewBox="0 0 760 260" role="img"
+       aria-label="AUC against genetic distance at the current settings"></svg>
+</figure>
+
+<script>
+  const $ = (s: string) => document.querySelector(s) as HTMLElement;
+  const out = (k: string) => document.querySelectorAll<HTMLElement>(`[data-out="${k}"]`);
+
+  const erf = (x: number) => {
+    const s = x < 0 ? -1 : 1;
+    x = Math.abs(x);
+    const a = [0.254829592, -0.284496736, 1.421413741, -1.453152027, 1.061405429];
+    const t = 1 / (1 + 0.3275911 * x);
+    return s * (1 - ((((a[4] * t + a[3]) * t + a[2]) * t + a[1]) * t + a[0]) * t * Math.exp(-x * x));
+  };
+  const Phi = (z: number) => 0.5 * (1 + erf(z / Math.SQRT2));
+  const pdf = (x: number) => Math.exp(-0.5 * x * x) / Math.sqrt(2 * Math.PI);
+  const PhiInv = (p: number) => {
+    let lo = -9, hi = 9;
+    for (let i = 0; i < 120; i++) { const m = (lo + hi) / 2; if (Phi(m) < p) lo = m; else hi = m; }
+    return (lo + hi) / 2;
+  };
+  const auc = (r2: number, K: number) => {
+    const rr = Math.min(Math.max(r2, 0), 0.999999);
+    const T = PhiInv(1 - K), i = pdf(T) / K, ic = -i * K / (1 - K);
+    const v1 = 1 - rr * i * (i - T), v0 = 1 - rr * ic * (ic - T);
+    if (v1 <= 0 || v0 <= 0) return NaN;
+    return Phi((i - ic) * Math.sqrt(rr) / Math.sqrt(v1 + v0));
+  };
+
+  const NS = "http://www.w3.org/2000/svg";
+  const el = (n: string, a: Record<string, string | number> = {}) => {
+    const e = document.createElementNS(NS, n);
+    for (const k in a) e.setAttribute(k, String(a[k]));
+    return e;
+  };
+
+  const ids = ["t", "Ne", "rho2", "VA", "VE", "K"] as const;
+  const val = () => Object.fromEntries(
+    ids.map((k) => [k, Number((document.getElementById("in-" + k) as HTMLInputElement).value)])
+  ) as Record<typeof ids[number], number>;
+
+  const fmt = (x: number, n = 4) => (Number.isFinite(x) ? x.toFixed(n) : "—");
+
+  function draw(v: ReturnType<typeof val>) {
+    const svg = document.getElementById("predictor-plot")!;
+    svg.innerHTML = "";
+    const L = 54, R = 18, T = 16, B = 40, W = 760, H = 260;
+    const iw = W - L - R, ih = H - T - B;
+    const FMAX = 0.3;
+    const r2src = v.VA / (v.VA + v.VE);
+    const aMin = 0.5, aMax = Math.max(0.62, auc(r2src, v.K) || 0.7);
+    const X = (fst: number) => L + (fst / FMAX) * iw;
+    const Y = (a: number) => H - B - ((a - aMin) / (aMax - aMin)) * ih;
+
+    for (let i = 0; i <= 4; i++) {
+      const a = aMin + (i / 4) * (aMax - aMin);
+      svg.appendChild(el("line", { x1: L, x2: W - R, y1: Y(a), y2: Y(a), class: "grid" }));
+      const lab = el("text", { x: L - 9, y: Y(a) + 4, class: "tick", "text-anchor": "end" });
+      lab.textContent = a.toFixed(2);
+      svg.appendChild(lab);
+    }
+    for (const fst of [0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3]) {
+      const lab = el("text", { x: X(fst), y: H - B + 20, class: "tick", "text-anchor": "middle" });
+      lab.textContent = fst.toFixed(2);
+      svg.appendChild(lab);
+    }
+    const xl = el("text", { x: L + iw / 2, y: H - 6, class: "axis", "text-anchor": "middle" });
+    xl.textContent = "genetic distance between the two populations";
+    svg.appendChild(xl);
+
+    let dPath = "";
+    for (let i = 0; i <= 240; i++) {
+      const fst = (FMAX * i) / 240;
+      const vt = v.rho2 * (1 - fst) * v.VA;
+      const a = auc(vt / (vt + v.VE), v.K);
+      if (!Number.isFinite(a)) continue;
+      dPath += (dPath ? "L" : "M") + X(fst) + " " + Y(a);
+    }
+    svg.appendChild(el("path", { d: dPath, class: "curve" }));
+
+    const fst = v.t / (v.t + 2 * v.Ne);
+    const vt = v.rho2 * (1 - fst) * v.VA;
+    const a = auc(vt / (vt + v.VE), v.K);
+    if (fst <= FMAX && Number.isFinite(a)) {
+      svg.appendChild(el("line", { x1: X(fst), x2: X(fst), y1: T, y2: H - B, class: "marker" }));
+      svg.appendChild(el("circle", { cx: X(fst), cy: Y(a), r: 6, class: "dot" }));
+    }
+  }
+
+  function update() {
+    const v = val();
+    const fst = v.t / (v.t + 2 * v.Ne);
+    const vt = v.rho2 * (1 - fst) * v.VA;
+    const r2 = vt / (vt + v.VE);
+    const r2src = v.VA / (v.VA + v.VE);
+    const a = auc(r2, v.K);
+
+    const show: Record<string, string> = {
+      t: String(v.t),
+      Ne: v.Ne.toLocaleString(),
+      rho2: v.rho2.toFixed(2),
+      VA: v.VA.toFixed(2),
+      VE: v.VE.toFixed(2),
+      K: v.K.toFixed(3),
+      fst: fmt(fst),
+      vt: fmt(vt),
+      r2: fmt(r2),
+      kept: fmt((r2 / r2src) * 100, 1) + "%",
+      auc: fmt(a),
+      aucSrc: fmt(auc(r2src, v.K)),
+    };
+    for (const k in show) out(k).forEach((n) => (n.textContent = show[k]));
+    $(".regime").hidden = Number.isFinite(a);
+    draw(v);
+  }
+
+  ids.forEach((k) => document.getElementById("in-" + k)!.addEventListener("input", update));
+  update();
+</script>

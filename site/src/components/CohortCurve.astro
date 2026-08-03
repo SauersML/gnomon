@@ -1,0 +1,88 @@
+---
+/**
+ * Error against the number of target cohorts, at a fixed total marker count.
+ *
+ * The curve is the closed form. The points are simulation. Both are computed
+ * here at build time, so the figure carries no runtime cost.
+ *
+ *   g(rho, n) = (1+rho)/(1-rho) - 2 rho (1 - rho^n) / (n (1-rho)^2)
+ *   Sigma(n)  = amp g(rho, n) + s2
+ *   p(n)      = 0.5 ( amp dg/drho / Sigma(n) )^2
+ *   risk(m)   = n' / (N p(n')),  n' = N/m
+ */
+const RHO = 0.9;      // correlation between neighbouring markers
+const N = 131072;     // total markers across all cohorts
+const AMP = 1, S2 = 1;
+
+const g = (n: number) =>
+  (1 + RHO) / (1 - RHO) - (2 * RHO * (1 - RHO ** n)) / (n * (1 - RHO) ** 2);
+const dg = (n: number) =>
+  2 / (1 - RHO) ** 2 -
+  (2 / n) * ((1 - (n + 1) * RHO ** n) * (1 - RHO) + 2 * RHO * (1 - RHO ** n)) / (1 - RHO) ** 3;
+const p = (n: number) => 0.5 * ((AMP * dg(n)) / (AMP * g(n) + S2)) ** 2;
+const risk = (m: number) => { const n = N / m; return n / (N * p(n)); };
+
+// One scale factor puts the closed form on the same axis as the simulation.
+const SCALE = 1.45e-5 / risk(2048);
+
+const measured = [
+  { m: 32, y: 7.72e-4 },
+  { m: 512, y: 4.2e-5 },
+  { m: 2048, y: 1.5e-5 },
+  { m: 16384, y: 2.53e-5 },
+];
+
+const W = 760, H = 320, L = 66, R = 20, T = 18, B = 46;
+const iw = W - L - R, ih = H - T - B;
+const lx = Math.log10;
+const x0 = lx(20), x1 = lx(3e4), y0 = lx(8e-6), y1 = lx(1.2e-3);
+const X = (m: number) => L + ((lx(m) - x0) / (x1 - x0)) * iw;
+const Y = (v: number) => H - B - ((lx(v) - y0) / (y1 - y0)) * ih;
+
+let path = "";
+for (let i = 0; i <= 300; i++) {
+  const m = 10 ** (x0 + ((x1 - x0) * i) / 300);
+  path += (i ? "L" : "M") + X(m).toFixed(2) + " " + Y(risk(m) * SCALE).toFixed(2);
+}
+
+// The minimum of the closed form, found on the same grid.
+let best = { m: 0, y: Infinity };
+for (let i = 0; i <= 3000; i++) {
+  const m = 10 ** (x0 + ((x1 - x0) * i) / 3000);
+  const y = risk(m) * SCALE;
+  if (y < best.y) best = { m, y };
+}
+---
+
+<figure class="fig">
+  <figcaption class="fig-title">More cohorts reduce the error, until each cohort is too small</figcaption>
+  <svg viewBox={`0 0 ${W} ${H}`} role="img"
+       aria-label="Error against the number of cohorts. The error falls, reaches a minimum near two thousand cohorts, then rises.">
+    {[1e-5, 1e-4, 1e-3].map((v) => (
+      <>
+        <line x1={L} x2={W - R} y1={Y(v)} y2={Y(v)} class="grid" />
+        <text x={L - 10} y={Y(v) + 4} class="tick" text-anchor="end">{v.toExponential(0).replace("e-", "e−")}</text>
+      </>
+    ))}
+    {[32, 512, 2048, 16384].map((m) => (
+      <text x={X(m)} y={H - B + 20} class="tick" text-anchor="middle">{m.toLocaleString()}</text>
+    ))}
+    <text x={L + iw / 2} y={H - 8} class="axis" text-anchor="middle">number of separate target cohorts</text>
+
+    <line x1={X(best.m)} x2={X(best.m)} y1={T} y2={H - B} class="marker" />
+    <path d={path} class="curve" />
+    {measured.map((d) => <circle cx={X(d.m)} cy={Y(d.y)} r="6" class="dot" />)}
+
+    <g class="legend">
+      <line x1={W - R - 150} x2={W - R - 122} y1={T + 10} y2={T + 10} class="curve" />
+      <text x={W - R - 114} y={T + 14} class="tick">closed form</text>
+      <circle cx={W - R - 136} cy={T + 32} r="5" class="dot" />
+      <text x={W - R - 114} y={T + 36} class="tick">simulation</text>
+    </g>
+  </svg>
+  <p class="fig-note">
+    The best cohort holds about 3.3 LD decay lengths of markers. Below that size
+    each cohort cannot fit its own calibration, and more cohorts make the error
+    worse.
+  </p>
+</figure>

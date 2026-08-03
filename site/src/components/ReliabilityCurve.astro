@@ -1,0 +1,70 @@
+---
+/**
+ * Calibration fits needed per cohort, against the reliability you need.
+ *
+ *   B = c tau / (p (1 - tau))
+ *
+ * One study reached reliability 0.153 with 16 fits. That point fixes c/p at
+ * about 88, so the curve carries no other fitted number.
+ */
+const C_OVER_P = 88;
+const B = (tau: number) => (C_OVER_P * tau) / (1 - tau);
+
+const measured = { tau: 0.153, B: 16 };
+const marks = [
+  { tau: 0.5, label: "0.5" },
+  { tau: 0.8, label: "0.8" },
+  { tau: 0.9, label: "0.9" },
+];
+
+const W = 760, H = 320, L = 62, R = 96, T = 18, B_ = 46;
+const iw = W - L - R, ih = H - T - B_;
+const TMAX = 0.96;
+const ly = (v: number) => Math.log10(Math.max(v, 8));
+const y0 = ly(8), y1 = ly(2600);
+const X = (t: number) => L + (t / TMAX) * iw;
+const Y = (v: number) => H - B_ - ((ly(v) - y0) / (y1 - y0)) * ih;
+
+let path = "";
+for (let i = 0; i <= 400; i++) {
+  const t = (TMAX * i) / 400;
+  const b = B(t);
+  if (b < 8) continue;
+  path += (path ? "L" : "M") + X(t).toFixed(2) + " " + Y(b).toFixed(2);
+}
+---
+
+<figure class="fig">
+  <figcaption class="fig-title">The last part of the reliability costs the most</figcaption>
+  <svg viewBox={`0 0 ${W} ${H}`} role="img"
+       aria-label="Calibration fits needed against reliability. The count rises steeply above reliability 0.8.">
+    {[10, 100, 1000].map((v) => (
+      <>
+        <line x1={L} x2={W - R} y1={Y(v)} y2={Y(v)} class="grid" />
+        <text x={L - 10} y={Y(v) + 4} class="tick" text-anchor="end">{v}</text>
+      </>
+    ))}
+    {[0.2, 0.4, 0.6, 0.8, 0.9].map((t) => (
+      <text x={X(t)} y={H - B_ + 20} class="tick" text-anchor="middle">{t.toFixed(1)}</text>
+    ))}
+    <text x={L + iw / 2} y={H - 8} class="axis" text-anchor="middle">reliability you need from one cohort</text>
+    <text x={16} y={T + ih / 2} class="axis" text-anchor="middle"
+          transform={`rotate(-90 16 ${T + ih / 2})`}>calibration fits</text>
+
+    <path d={path} class="curve" />
+
+    {marks.map((m) => (
+      <>
+        <circle cx={X(m.tau)} cy={Y(B(m.tau))} r="5" class="dot-quiet" />
+        <text x={X(m.tau) + 10} y={Y(B(m.tau)) - 8} class="tick">{Math.round(B(m.tau))} fits</text>
+      </>
+    ))}
+    <circle cx={X(measured.tau)} cy={Y(measured.B)} r="6.5" class="dot" />
+    <text x={X(measured.tau) + 12} y={Y(measured.B) + 5} class="tick strong">one study used 16</text>
+  </svg>
+  <p class="fig-note">
+    Each further nine of reliability costs about ten times more fits. A study
+    that fits each cohort 16 times reaches reliability 0.153. Reliability 0.8
+    needs about 350 fits.
+  </p>
+</figure>

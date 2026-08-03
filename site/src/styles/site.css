@@ -287,3 +287,124 @@ th[align="right"], td[align="right"] {
   .page { max-width: none; padding: 0; }
   .colophon { break-inside: avoid; }
 }
+
+/* figures and the predictor ------------------------------------------------ */
+
+.fig, .panel {
+  margin: 1.8rem 0;
+  background: var(--bg-2);
+  border: 1px solid var(--rule);
+  border-radius: 10px;
+  padding: 1.1rem 1.2rem 1rem;
+}
+
+.fig-title, .panel-title {
+  font: 600 0.95rem/1.4 var(--sans);
+  color: var(--ink);
+  margin-bottom: 0.9rem;
+  letter-spacing: -0.005em;
+}
+
+.fig svg, .panel svg { display: block; width: 100%; height: auto; overflow: visible; }
+
+.fig-note {
+  font-size: 0.87rem;
+  line-height: 1.6;
+  color: var(--ink-3);
+  margin: 0.7rem 0 0;
+  max-width: none;
+}
+
+svg .grid   { stroke: var(--rule); stroke-width: 1; }
+svg .curve  { fill: none; stroke: var(--accent-2); stroke-width: 2.4; stroke-linecap: round; }
+svg .dot    { fill: var(--accent); stroke: var(--bg-2); stroke-width: 2; }
+svg .dot-quiet { fill: var(--ink-3); stroke: var(--bg-2); stroke-width: 2; }
+svg .marker { stroke: var(--ink-3); stroke-width: 1.2; stroke-dasharray: 4 4; }
+svg .tick   { font: 400 11px var(--mono); fill: var(--ink-3); }
+svg .tick.strong { fill: var(--ink-2); font-weight: 600; }
+svg .axis   { font: 400 12px var(--sans); fill: var(--ink-3); }
+
+/* the interactive panel */
+
+.panel-body {
+  display: grid;
+  grid-template-columns: 1.05fr 1fr;
+  gap: 1.4rem;
+  align-items: start;
+  margin-bottom: 0.8rem;
+}
+
+.controls label {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: baseline;
+  gap: 0 0.6rem;
+  margin: 0 0 0.75rem;
+  font: 400 0.84rem/1.4 var(--sans);
+  color: var(--ink-2);
+}
+
+.controls label > input { grid-column: 1 / -1; margin-top: 0.3rem; }
+.controls label b {
+  font: 600 0.9rem/1 var(--mono);
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+
+input[type="range"] {
+  width: 100%;
+  height: 20px;
+  accent-color: var(--accent-2);
+  cursor: pointer;
+}
+
+.readout .big {
+  border-bottom: 1px solid var(--rule);
+  padding-bottom: 0.7rem;
+  margin-bottom: 0.7rem;
+}
+
+.big-value {
+  font: 600 2.5rem/1 var(--sans);
+  letter-spacing: -0.035em;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+}
+
+.big-key { font-size: 0.88rem; color: var(--ink-2); margin-top: 0.25rem; }
+.big-sub { font: 0.78rem/1.4 var(--mono); color: var(--ink-3); margin-top: 0.15rem; }
+
+.steps { margin: 0; display: grid; gap: 0.32rem; }
+.steps > div { display: flex; justify-content: space-between; gap: 1rem; }
+.steps dt { font-size: 0.84rem; color: var(--ink-2); }
+.steps dd {
+  margin: 0;
+  font: 500 0.86rem/1.5 var(--mono);
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+
+.regime {
+  font-size: 0.84rem;
+  line-height: 1.55;
+  color: var(--warn);
+  margin: 0.7rem 0 0;
+  max-width: none;
+}
+
+@media (max-width: 760px) {
+  .panel-body { grid-template-columns: 1fr; }
+}
+
+.headline {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+  border-bottom: 1px solid var(--rule);
+  padding-bottom: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+.headline .big-value { font-size: 2.1rem; }
+.headline .big:first-child .big-value { color: var(--accent); }
+.headline .big:last-child .big-value { color: var(--accent-2); }
+@media (max-width: 520px) { .headline { grid-template-columns: 1fr; } }
