@@ -73,6 +73,12 @@ DO NOT ADD A GUARD THAT DELETES DEFINITIONS BY REFERENCE COUNT. It was tried,
    its prediction spanned; a design on which the prediction is constant cannot
    reject a wrong functional form, however small the residual.
 
+9. Trust-boundary syntax. Production proof modules may not declare custom
+   axioms, use native/compiler-backed decision procedures, introduce unsafe
+   declarations, or install custom syntax/elaborators.  These checks cover
+   explicit source constructs; the environment-level axiom scan remains
+   responsible for dependencies hidden behind imports or generated terms.
+
 Guards 6-8 are the subject of `Calibrator.DriftRegime`, which proves that 7 and 8
 are impossibilities rather than oversights.
 """
@@ -188,6 +194,22 @@ def main() -> int:
 
         if re.search(r'Evidence\.falsified', src):
             bad.append(f"{rel}: an Identification is still marked falsified")
+
+        forbidden = [
+            (r"\badmit\b", "contains `admit`"),
+            (r"(?m)^\s*(?:private\s+)?axiom\b", "declares a custom axiom"),
+            (r"(?m)^\s*(?:unsafe|partial)\b", "declares unsafe or partial code"),
+            (r"\bnative_decide\b", "uses `native_decide`"),
+            (r"\b(?:sorryAx|Lean\.ofReduceBool|Lean\.trustCompiler)\b",
+             "references a forbidden proof/compiler axiom directly"),
+            (r"\b(?:implemented_by|csimp)\b",
+             "changes the compiler implementation or simplification path"),
+            (r"(?m)^\s*(?:syntax|macro|macro_rules|elab|elab_rules|initialize|builtin_initialize|run_cmd|run_tac)\b",
+             "installs custom syntax, elaboration, or initialization code"),
+        ]
+        for pattern, reason in forbidden:
+            if re.search(pattern, src):
+                bad.append(f"{rel}: {reason}")
 
     # convention drift
     defpat = re.compile(r'^(?:noncomputable )?def ([A-Za-z_0-9\'.]+)(.*?)(?=\n(?:/-|@\[|theorem |noncomputable |def |abbrev |structure |section |end |namespace ))', re.S | re.M)
