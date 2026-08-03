@@ -3,8 +3,10 @@
 
 Guards, in order of what they catch:
 
-1. Admissions. Every `sorry` or `admit` in production fails. Scientific debt
-   belongs in prose or an issue, never in a proof term or theorem parameter.
+1. Admissions. Every `sorry` is reported with its owning declaration. A visible
+   admission is incomplete mathematics, but it is preferable to a weakened
+   statement, a laundered premise, or a hidden axiom. `admit` remains forbidden
+   so the corpus has one explicit spelling for unresolved proof obligations.
 
 2. Convention drift. Every numeric literal 2 or 4 used as a multiplier inside
    a definition is a restatement of a ploidy or coalescent-scaling convention.
@@ -69,7 +71,22 @@ DO NOT ADD A GUARD THAT DELETES DEFINITIONS BY REFERENCE COUNT. It was tried,
    its prediction spanned; a design on which the prediction is constant cannot
    reject a wrong functional form, however small the residual.
 
-8. Trust-boundary syntax. Production proof modules may not declare custom
+8. Laundered assumptions. An unproved proposition can be made to look proved
+   without a `sorry` and without an axiom: name it as a theorem, pass it as an
+   ordinary argument, bundle it into a setup structure, project that structure's
+   fields into local instances so they bind silently, and give the wrapper an
+   unconditional-sounding name. `#print axioms` stays clean through all five
+   moves, because an assumption discharged by the caller is invisible to a scan
+   that reads only the proof term. Four screens ask instead whether anything can
+   ever satisfy the hypothesis: a proposition never concluded (3m), a bundle
+   never inhabited (3n), a supplied field installed as an instance (3o), and a
+   result whose name hides what it rests on (3p). Each count is pinned at what
+   was measured and ratchets down, so the corpus cannot acquire new ones.
+
+   Prefer `sorry`. An admission is a debt this corpus can enumerate; a laundered
+   premise is a debt it cannot, and guard 1 exists to keep the first cheap.
+
+9. Trust-boundary syntax. Production proof modules may not declare custom
    axioms, use native/compiler-backed decision procedures, introduce unsafe
    declarations, or install custom syntax/elaborators.  These checks cover
    explicit source constructs; the environment-level axiom scan remains
@@ -96,6 +113,10 @@ REGIME_DECL_BUDGET = 0              # drift regimes baked into a body instead of
 UNDERDELIVERY_BUDGET = 0            # docstring attributes an identity the signature does not prove
 INHERITED_VALIDATION_BUDGET = None  # VALIDATED inherited from a sibling identity; pin on first run
 VACUOUS_VALIDATION_BUDGET = None    # VALIDATED with no recorded power; pin on first run
+LAUNDERED_PROP_BUDGET = 16          # named propositions only ever assumed, never established
+UNWITNESSED_BUNDLE_BUDGET = 38      # assumption bundles no concrete construction satisfies
+INSTANCE_LAUNDERING_BUDGET = 2      # supplied fields turned into silently-binding instances
+UNCONDITIONAL_NAME_BUDGET = 35      # conditional results named as though unconditional
 
 def strip_comments(src: str) -> str:
     """Remove Lean block and line comments so prose cannot trip the guards."""
@@ -174,6 +195,7 @@ def lean_files():
 
 def main() -> int:
     bad = []
+    admissions = []
 
     for f in lean_files():
         src = strip_comments(open(f).read())
@@ -184,7 +206,7 @@ def main() -> int:
             owner = None
             for d in re.finditer(r'^(?:noncomputable )?(?:def|theorem) ([A-Za-z_0-9\'.]+)', src[:m.start()], re.M):
                 owner = d.group(1)
-            bad.append(f"{rel}:{line}: forbidden sorry in `{owner}`")
+            admissions.append(f"{rel}:{line}: sorry in `{owner}`")
 
         forbidden = [
             (r"\badmit\b", "contains `admit`"),
@@ -199,6 +221,37 @@ def main() -> int:
              "changes the compiler implementation or simplification path"),
             (r"(?m)^\s*(?:syntax|macro|macro_rules|elab|elab_rules|initialize|builtin_initialize|run_cmd|run_tac)\b",
              "installs custom syntax, elaboration, or initialization code"),
+            # --- Below: patterns with ZERO occurrences in the corpus when added.
+            # Each is a ratchet, not a cleanup. They cost nothing to adopt and
+            # each closes a way to make the kernel accept something without the
+            # mathematics having been done.
+            (r"(?m)^\s*set_option\b",
+             "sets a compiler option in a proof module: `debug.skipKernelTC` "
+             "stops the kernel from checking the declaration at all, "
+             "`debug.byAsSorry` turns every `by` block into a sorry, and "
+             "`autoImplicit true` re-enables inside one file the very thing "
+             "lakefile.lean disables for the library"),
+            (r"(?m)^\s*(?:(?:scoped|local)\s+)*(?:notation|infixl|infixr|infix|prefix|postfix|notation3)\b",
+             "rebinds notation: `+`, `≤`, `∈` or `‖·‖` bound to a convenient "
+             "operation leaves every theorem statement in the file reading as "
+             "ordinary mathematics while elaborating to something else"),
+            (r"(?m)^\s*(?:(?:private|protected|noncomputable)\s+)*opaque\b",
+             "declares an `opaque` constant, which asserts an inhabitant "
+             "without giving one -- for a `Prop` that is an axiom under "
+             "another keyword"),
+            (r"(?m)^\s*attribute\s*\[[^\]]*\binstance\b",
+             "registers an instance by attribute, which puts a proposition "
+             "where typeclass synthesis will find it without any use site "
+             "naming it"),
+            (r"(?m)^\s*(?:(?:local|scoped)\s+)*instance\b[^:]*:\s*Fact\b",
+             "declares a `Fact` instance: synthesis then supplies the "
+             "proposition silently, and the proof that uses it looks like "
+             "routine instance plumbing"),
+            (r"(?m)^\s*#(?:eval|reduce|print|check|exit)\b",
+             "leaves an elaboration-time command in a proof module: `#eval` "
+             "runs arbitrary `IO` while the file elaborates, which can rewrite "
+             "the very artefacts a later step checks"),
+            (r"@\[\s*extern\b", "binds a declaration to an external implementation"),
             (r"\b(?:exact|apply|rw|simp|try)\?",
              "leaves an exploratory suggestion tactic in production"),
             (r"(?m)^\s*hint\b", "leaves the exploratory `hint` command in production"),
@@ -970,6 +1023,232 @@ def main() -> int:
                    f"across the design, see Calibrator.DriftRegime")
         bad.extend("    " + x for x in powerless)
 
+    # 3m. Assumptions laundered into hypotheses. A proposition the corpus cannot
+    #     prove can be made to look proved in five moves, none of which is a
+    #     `sorry` and none of which declares an axiom:
+    #
+    #       1. name the unproved proposition as a `theorem`;
+    #       2. pass it as an ordinary argument, so `#print axioms` stays clean;
+    #       3. bundle the hard facts of a construction into a setup structure;
+    #       4. project that structure's fields into local typeclass instances,
+    #          so they bind silently at every use site;
+    #       5. give the conditional wrapper an unconditional-sounding name and
+    #          a docstring to match.
+    #
+    #     The axiom scan is clean at every step, and that is the point of the
+    #     technique: an assumption discharged by the caller is invisible to a
+    #     scan that reads only the proof term. `AxiomScan.lean` cannot see this
+    #     and never could; it is not a weaker version of these guards, it is
+    #     blind to them by construction.
+    #
+    #     The load-bearing question is not whether a hypothesis is stated -- it
+    #     always is -- but whether anything can ever satisfy it.
+    #     `IsSymmetricBilinearMatrix` is assumed by fourteen theorems in
+    #     QuadraticShift, and no matrix anywhere in the corpus is proved to
+    #     satisfy it. Second-moment matrices really are symmetric, so that one
+    #     is almost certainly honest; but were the predicate unsatisfiable, all
+    #     fourteen theorems would be vacuously true, every proof would still
+    #     elaborate, and no scan in this repository would say a word. A named
+    #     proposition that is only ever consumed -- never concluded by a
+    #     theorem, never established for a concrete object -- is an axiom with
+    #     better manners, and is counted here as one.
+    #
+    #     A `sorry` is preferred to any of this. An admission is a debt this
+    #     corpus can enumerate; a laundered hypothesis is a debt it cannot.
+    prop_defs = {}
+    for f in lean_files():
+        src = strip_comments(open(f).read())
+        rel = os.path.relpath(f, ROOT)
+        for m in re.finditer(r"^(?:noncomputable )?(?:(?:private|protected) )*(?:def|abbrev) "
+                             r"([A-Za-z_0-9'.]+)((?:(?!\n\S).)*)", src, re.S | re.M):
+            if re.search(r":\s*Prop\b", m.group(2).split(":=")[0]):
+                prop_defs[m.group(1).split(".")[-1]] = (rel, src[:m.start()].count("\n") + 1)
+
+    # Everything a declaration can *produce*: the goal of a theorem, or the
+    # return type of a definition or instance. A name that never appears in one
+    # of these positions is never established, only ever required.
+    produced = set()
+    for f in lean_files():
+        src = strip_comments(open(f).read())
+        for m in re.finditer(r"^(?:noncomputable )?(?:(?:private|protected) )*"
+                             r"(?:def|abbrev|instance) [A-Za-z_0-9'.]*((?:(?!\n\S).)*)",
+                             src, re.S | re.M):
+            produced.update(re.findall(IDENT, goal_of(m.group(1).split(":=")[0])))
+    for _tname, stmt in global_theorems:
+        produced.update(re.findall(IDENT, goal_of(stmt)))
+
+    assumed_by = {}
+    for tname, stmt in global_theorems:
+        goal = goal_of(stmt)
+        for tok in set(re.findall(IDENT, stmt[:len(stmt) - len(goal)])):
+            if tok in prop_defs:
+                assumed_by.setdefault(tok, []).append(tname)
+
+    laundered = sorted(
+        "%s:%d  `%s` is assumed by %d theorem(s) and established by nothing"
+        % (prop_defs[p][0], prop_defs[p][1], p, len(ts))
+        for p, ts in assumed_by.items() if p not in produced)
+    if len(laundered) > LAUNDERED_PROP_BUDGET:
+        bad.append("named propositions only ever assumed, never established: %d, budget %d; "
+                   "prove one concrete object satisfies it, or admit it with `sorry` so the "
+                   "debt is enumerable" % (len(laundered), LAUNDERED_PROP_BUDGET))
+        bad.extend("    " + x for x in laundered)
+
+    # 3n. Assumption bundles nothing satisfies (step 3 of the recipe). A
+    #     structure whose fields are propositions is a conjunction of
+    #     hypotheses wearing a noun for a name. Taken as an argument it reads
+    #     like a model; if no construction ever produces one, the theorems
+    #     quantifying over it say nothing, and the wider the bundle the less
+    #     they say. The obligation is inhabitation: exhibit one.
+    RELATION = re.compile(r"∀|∃|↔|≤|≥|≠|<|>|(?<![:<>=!])=(?!=)|\bProp\b")
+    bundles = {}
+    for f in lean_files():
+        src = strip_comments(open(f).read())
+        rel = os.path.relpath(f, ROOT)
+        for m in re.finditer(r"^structure ([A-Za-z_0-9'.]+)[^\n]*\n((?:[ \t]+[^\n]*\n)+)",
+                             src, re.M):
+            fields = []
+            for line in m.group(2).split("\n"):
+                fm = re.match(r"\s+([A-Za-z_0-9']+)\s*:(.*)", line)
+                if fm and RELATION.search(fm.group(2)):
+                    fields.append(fm.group(1))
+            if fields:
+                bundles[m.group(1).split(".")[-1]] = (rel, src[:m.start()].count("\n") + 1,
+                                                      len(fields))
+    unwitnessed = sorted(
+        "%s:%d  `%s` bundles %d hypothesis field(s) and is never constructed"
+        % (v[0], v[1], k, v[2])
+        for k, v in bundles.items() if k not in produced)
+    if len(unwitnessed) > UNWITNESSED_BUNDLE_BUDGET:
+        bad.append("hypothesis bundles no construction ever satisfies: %d, budget %d; "
+                   "build one concrete instance, or the theorems over it are vacuous"
+                   % (len(unwitnessed), UNWITNESSED_BUNDLE_BUDGET))
+        bad.extend("    " + x for x in unwitnessed)
+
+    # 3o. Instances synthesised from supplied fields (step 4). `letI :
+    #     IsProbabilityMeasure cmdgp.μ := cmdgp.prob` takes a fact the caller
+    #     handed over and installs it where instance resolution will find it
+    #     without anyone writing it down again. Every later `simp` and every
+    #     later lemma application silently depends on an assumption that no
+    #     longer appears in any signature. A declared `class` in this corpus is
+    #     the same move with a wider blast radius, which is why there are none.
+    laundered_inst = []
+    for f in lean_files():
+        src = strip_comments(open(f).read())
+        rel = os.path.relpath(f, ROOT)
+        for m in re.finditer(r"(?m)^[ \t]*(haveI|letI)\b[^\n]*?:=[ \t]*"
+                             r"([A-Za-z_][A-Za-z_0-9'.]*\.[A-Za-z_][A-Za-z_0-9']*)", src):
+            laundered_inst.append("%s:%d: `%s` installs `%s`, a supplied field, as an instance"
+                                  % (rel, src[:m.start()].count("\n") + 1,
+                                     m.group(1), m.group(2)))
+        for m in re.finditer(r"(?m)^instance\b[^\n]*\([a-zA-Z_][^\n]*\)[^\n]*:=[ \t]*"
+                             r"([A-Za-z_][A-Za-z_0-9'.]*\.[A-Za-z_][A-Za-z_0-9']*)", src):
+            laundered_inst.append("%s:%d: an instance is built by projecting `%s` out of its "
+                                  "own parameter" % (rel, src[:m.start()].count("\n") + 1,
+                                                     m.group(1)))
+    if len(laundered_inst) > INSTANCE_LAUNDERING_BUDGET:
+        bad.append("supplied hypotheses installed as typeclass instances: %d, budget %d; "
+                   "pass the fact explicitly so the dependency stays visible in the signature"
+                   % (len(laundered_inst), INSTANCE_LAUNDERING_BUDGET))
+        bad.extend("    " + x for x in laundered_inst)
+
+    # 3p. Unconditional names on conditional results (step 5). The four screens
+    #     above are all defeated by the same follow-up: once the assumption is
+    #     in a binder, the theorem may be called anything at all. A result
+    #     resting on a proposition nothing establishes, or on a bundle nothing
+    #     inhabits, has to say so where a reader will see it -- in the name, or
+    #     in an `Assumes:` clause of the docstring.
+    CONDITIONAL_NAME = re.compile(r"(?:^|_)(?:of|assuming|given|under|conditional|"
+                                  r"when|if|requires)(?:_|$)", re.I)
+    #     Scoped to unestablished propositions, not to bundles. Taking a model
+    #     structure as a parameter is this corpus's ordinary way of stating what
+    #     a theorem is about, and demanding `_of_` in all 162 such names would
+    #     be noise -- and a guard that misfires is a guard that gets ignored.
+    #     The bundles are already answerable to 3n, which asks the sharper
+    #     question of whether anything inhabits them.
+    unproven = set(p for p, _ in assumed_by.items() if p not in produced)
+    docs = {}
+    for f in lean_files():
+        raw = open(f).read()
+        for m in re.finditer(r"/--((?:(?!-/).)*)-/\s*\n(?:@\[[^\]]*\]\s*\n)?(?:private )?"
+                             r"theorem\s+([A-Za-z_0-9'.]+)", raw, re.S):
+            docs[m.group(2).split(".")[-1]] = m.group(1)
+    misnamed = []
+    for tname, stmt in global_theorems:
+        goal = goal_of(stmt)
+        rests_on = sorted(set(re.findall(IDENT, stmt[:len(stmt) - len(goal)])) & unproven)
+        if not rests_on:
+            continue
+        if CONDITIONAL_NAME.search(tname) or "Assumes:" in docs.get(tname, ""):
+            continue
+        misnamed.append("`%s` rests on %s, which nothing establishes, and neither its name "
+                        "nor an `Assumes:` clause says so" % (tname, ", ".join(rests_on[:3])))
+    if len(misnamed) > UNCONDITIONAL_NAME_BUDGET:
+        bad.append("conditional results named as though unconditional: %d, budget %d; "
+                   "name the assumption in the theorem or declare `Assumes:` in its docstring"
+                   % (len(misnamed), UNCONDITIONAL_NAME_BUDGET))
+        bad.extend("    " + x for x in misnamed)
+
+    # 3q. Genetics in the name, arithmetic in the statement. Guard 3p asks
+    #     whether a theorem rests on a named proposition nothing establishes.
+    #     It is blind to the commoner shape: the assumption is not a named
+    #     proposition at all but a bare inequality between free reals, and the
+    #     genetics lives only in the identifier.
+    #
+    #     `functional_equivalence_aids_portability` proved `b^2 < k * b^2`.
+    #     `coding_more_portable_than_regulatory` proved that squaring is
+    #     monotone on the nonnegatives, with the entire biological step -- that
+    #     purifying selection makes coding effects more correlated -- supplied
+    #     as the hypothesis `rg_regulatory < rg_coding`.
+    #     `matched_panel_optimal` proved `x * m <= x`. In each case the goal
+    #     mentions no constant this corpus defines, so nothing in the statement
+    #     can be read as being about genetics, and the name is doing work the
+    #     mathematics does not support.
+    #
+    #     The test is exactly that: a goal whose identifiers are disjoint from
+    #     the corpus's own vocabulary, under a name containing a domain word.
+    #     It fires on the name because the name is what gets cited, indexed and
+    #     rendered on the site -- several of the theorems found this way had
+    #     docstrings that already admitted the content was trivial, which
+    #     reached nobody reading a theorem list.
+    #
+    #     Pinned, not zero. The survivors are grandfathered so the budget can
+    #     ratchet down as they are renamed; what it forbids is adding more.
+    DOMAIN_WORD = re.compile(
+        r"portab|drift|heritab|genetic|genom|variant|locus|loci|allele|pgs|"
+        r"ancestr|gwas|snp|calibrat|imputation|selection|polygenic|epistas|"
+        r"cohort|population|panel|fst|prevalence|phenotype|trait|marker|"
+        r"burden|gene_|_gene|kinship|admixture|coalescent|bottleneck|founder|"
+        r"heterozyg|linkage|haplotype|ld_|_ld_|_ld$", re.I)
+    corpus_vocab = set(global_defs)
+    for f in lean_files():
+        src = strip_comments(open(f).read())
+        for m in re.finditer(r"^(?:noncomputable )?(?:abbrev|structure|inductive|class) "
+                             r"([A-Za-z_0-9'.]+)", src, re.M):
+            corpus_vocab.add(m.group(1).split(".")[-1])
+        # structure fields: indented `name :` lines inside a structure block
+        for m in re.finditer(r"^(?:noncomputable )?structure [^\n]*\n((?:[ \t]+[^\n]*\n)+)",
+                             src, re.M):
+            for fm in re.finditer(r"^[ \t]+([A-Za-z_][A-Za-z_0-9'₀-₉]*)[ \t]*:",
+                                  m.group(1), re.M):
+                corpus_vocab.add(fm.group(1))
+    domain_named_arithmetic = []
+    for tname, stmt in global_theorems:
+        if not DOMAIN_WORD.search(tname):
+            continue
+        goal = goal_of(stmt)
+        if set(re.findall(IDENT, goal)) & corpus_vocab:
+            continue
+        domain_named_arithmetic.append(
+            "`%s` names genetics but its goal mentions no constant this corpus "
+            "defines" % tname)
+    if len(domain_named_arithmetic) > DOMAIN_NAMED_ARITHMETIC_BUDGET:
+        bad.append("genetics-asserting names on domain-free statements: %d, budget %d; "
+                   "either state the theorem about a defined quantity or name it for "
+                   "the arithmetic it does"
+                   % (len(domain_named_arithmetic), DOMAIN_NAMED_ARITHMETIC_BUDGET))
+        bad.extend("    " + x for x in domain_named_arithmetic)
+
     # 3e. Cheap structural integrity, run before the build so that a broken
     #     rename or an unterminated comment fails in seconds rather than after a
     #     full elaboration. The "+/-" incident is the motivating case: text in a
@@ -1024,13 +1303,18 @@ def main() -> int:
         for b in bad:
             print("  " + b)
         return 1
+    if admissions:
+        print("TRANSPARENT ADMISSIONS (these declarations are incomplete)\n")
+        for admission in admissions:
+            print("  " + admission)
+        print()
     print(f"structural guards pass: convention sites {sites}/{CONVENTION_SITE_BUDGET}, "
           f"undeclared {len(undeclared)}/{UNDECLARED_BUDGET}, conventions {len(undeclared_conv)}/{CONVENTION_DECL_BUDGET}, "
           f"unrelated {unrelated}/{UNRELATED_BUDGET}, "
           f"stipulated equilibria {len(stipulated)}/{EQUILIBRIUM_BUDGET}, "
           f"duplicate bodies {len(duplicates)}/{DUPLICATE_BODY_BUDGET}, "
           f"isolated modules {len(isolated)}/{ISOLATED_MODULE_BUDGET}, "
-          "admissions 0")
+          f"admissions {len(admissions)} (reported, not trusted)")
     return 0
 
 if __name__ == "__main__":
