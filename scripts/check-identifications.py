@@ -199,6 +199,9 @@ def main() -> int:
              "changes the compiler implementation or simplification path"),
             (r"(?m)^\s*(?:syntax|macro|macro_rules|elab|elab_rules|initialize|builtin_initialize|run_cmd|run_tac)\b",
              "installs custom syntax, elaboration, or initialization code"),
+            (r"\b(?:exact|apply|rw|simp|try)\?",
+             "leaves an exploratory suggestion tactic in production"),
+            (r"(?m)^\s*hint\b", "leaves the exploratory `hint` command in production"),
         ]
         for pattern, reason in forbidden:
             if re.search(pattern, src):
