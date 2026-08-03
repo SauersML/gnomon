@@ -604,6 +604,45 @@ def main() -> int:
                           strip_comments(open(f).read())):
             if re.match(r"(?:@\[simp\]\s*)?(?:private )?theorem ", b) and ":=" in b:
                 file_stmts.setdefault(rel, []).append(b.split(":=", 1)[0])
+    # The tying theorem does not have to live in either of the two files, and
+    # requiring that was this check asking for the wrong thing. What the check
+    # is protecting is that divergence between two bodies becomes a compile
+    # error, and a theorem in any module importing both files delivers exactly
+    # that. Demanding one of the two files instead forced a choice between
+    # adding an import purely to satisfy a guard and putting the statement in a
+    # module where it does not belong -- and for ten pairs it made the check
+    # unsatisfiable, because neither file imports the other and no third module
+    # was allowed to speak. `Conventions` is where several of these belong.
+    # So: accept a theorem naming both, in any file whose transitive imports
+    # include both. Reachability, not residence.
+    imports = {}
+    for f in lean_files():
+        rel = os.path.relpath(f, ROOT)
+        imports[rel] = [m.replace(".", "/") + ".lean" for m in
+                        re.findall(r"^import (Calibrator\.[\w.]+)", open(f).read(), re.M)]
+
+    def visible_from(rel):
+        seen, stack = {rel}, list(imports.get(rel, []))
+        while stack:
+            x = stack.pop()
+            if x in seen:
+                continue
+            seen.add(x)
+            stack += imports.get(x, [])
+        return seen
+
+    visible = {rel: visible_from(rel) for rel in imports}
+
+    def tied_by_theorem(fa, na, fb, nb):
+        for rel, stmts in file_stmts.items():
+            if fa not in visible.get(rel, ()) or fb not in visible.get(rel, ()):
+                continue
+            for st in stmts:
+                if (re.search(r"\b" + re.escape(na) + r"\b", st) and
+                        re.search(r"\b" + re.escape(nb) + r"\b", st)):
+                    return True
+        return False
+
     duplicates = []
     for norm, members in sorted(shapes.items()):
         for i in range(len(members)):
@@ -615,10 +654,7 @@ def main() -> int:
                 if (re.search(r"\b" + re.escape(nb) + r"\b", ba) or
                         re.search(r"\b" + re.escape(na) + r"\b", bb)):
                     continue
-                # Tied by a theorem in one of the two files naming both.
-                if any(re.search(r"\b" + re.escape(na) + r"\b", st) and
-                       re.search(r"\b" + re.escape(nb) + r"\b", st)
-                       for st in file_stmts.get(fa, []) + file_stmts.get(fb, [])):
+                if tied_by_theorem(fa, na, fb, nb):
                     continue
                 duplicates.append(f"{fa}:{la} {na}  ==  {fb}:{lb} {nb}")
     duplicates.sort()
