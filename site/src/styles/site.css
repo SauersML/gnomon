@@ -264,18 +264,6 @@ th[align="right"], td[align="right"] {
 .card h3 { margin-top: 0; font-size: 1.02rem; }
 .card p { max-width: none; }
 
-.terms {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.4rem 1.6rem;
-  font: 0.83rem/1.5 var(--sans);
-  color: var(--ink-3);
-  margin: -0.4rem 0 1.2rem;
-  justify-content: center;
-}
-
-.terms b { color: var(--ink-2); font-weight: 600; font-family: var(--mono); }
-
 /* responsive -------------------------------------------------------------- */
 
 @media (max-width: 760px) {

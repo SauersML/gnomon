@@ -100,7 +100,7 @@ const f = (x: number, n = 4) => (Number.isFinite(x) ? x.toFixed(n) : "—");
         </div>
       </div>
       <dl class="steps">
-        <div><dt>Genetic distance</dt><dd data-out="fst">{f(fst0)}</dd></div>
+        <div><dt>Hudson <i>F</i><sub>ST</sub></dt><dd data-out="fst">{f(fst0)}</dd></div>
         <div><dt>Signal in the target population</dt><dd data-out="vt">{f(vt0)}</dd></div>
         <div><dt>Accuracy in the target population</dt><dd data-out="r2">{f(r20)}</dd></div>
       </dl>
@@ -112,7 +112,7 @@ const f = (x: number, n = 4) => (Number.isFinite(x) ? x.toFixed(n) : "—");
   </div>
 
   <svg id="predictor-plot" viewBox="0 0 760 260" role="img"
-       aria-label="AUC against genetic distance at the current settings"></svg>
+       aria-label="AUC against Hudson F-ST at the current settings"></svg>
 </figure>
 
 <script>
@@ -179,7 +179,7 @@ const f = (x: number, n = 4) => (Number.isFinite(x) ? x.toFixed(n) : "—");
       svg.appendChild(lab);
     }
     const xl = el("text", { x: L + iw / 2, y: H - 6, class: "axis", "text-anchor": "middle" });
-    xl.textContent = "genetic distance between the two populations";
+    xl.textContent = "Hudson F_ST between the two populations";
     svg.appendChild(xl);
 
     let dPath = "";

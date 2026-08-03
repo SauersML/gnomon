@@ -10,10 +10,9 @@ import Predictor from '../components/Predictor.astro';
 import CohortCurve from '../components/CohortCurve.astro';
 import ReliabilityCurve from '../components/ReliabilityCurve.astro';
 
-## I. How to predict the accuracy
+## How to predict the accuracy
 
-Follow five steps to predict the AUC in the target population. Read sections
-II and III for the limits on these five steps.
+Follow five steps to predict the AUC in the target population.
 
 <Predictor />
 
@@ -27,6 +26,11 @@ $$
 
 $t$ counts the generations since the two populations separated. $N_e$ is the
 effective size of each population over that period.
+
+This $F_{ST}$ follows the Hudson convention, which is the quantity a coalescent
+simulation measures. The Nei $G_{ST}$ of the same two populations is a
+different number, smaller by up to a factor of two. Steps 2 to 5 need the
+Hudson value.
 
 </div>
 <div class="step">
@@ -91,31 +95,30 @@ traits.
 </div>
 </div>
 
-## II. The error has three parts
+## The error has three parts
+
+Each part shrinks with a different kind of data.
 
 $$
-\mathrm{Risk} = \tilde\varepsilon^{2}\left[\frac{d_0}{2n} + \sum_i \frac{1}{2\,m\,p_i} + r_\perp^{2}\right]
+\mathrm{Risk} \;\propto\; \underbrace{\frac{\text{parameters}}{2 \times \text{people in the source GWAS}}}_{\text{a larger GWAS reduces this}}
 $$
 
-<div class="terms">
-<span><b>d₀/2n</b> source GWAS size</span>
-<span><b>Σ 1/2mpᵢ</b> number of target cohorts</span>
-<span><b>r⊥²</b> the fixed error</span>
-</div>
+$$
++\; \underbrace{\frac{1}{2 \times \text{cohorts} \times \text{information per cohort}}}_{\text{more separate cohorts reduce this}}
+\;+\; \underbrace{(\text{unremovable part})^{2}}_{\text{neither reduces this}}
+$$
 
-Each part shrinks with a different kind of data. $n$ is the number of people in
-the source GWAS. $d_0$ counts the parameters the source model fits. $m$ counts
-the separate target cohorts. $p_i$ is how much one cohort tells you about the
-transfer. $r_\perp$ is the part of the error that no data removes.
-$\tilde\varepsilon^{2}$ sets the overall scale.
+"Parameters" counts what the source model fits. "Information per cohort" is how
+much one target cohort tells you about the transfer. The third part is the
+error that stays whatever data you collect.
 
-A bigger source GWAS reduces the first part only. It does nothing to the third
-part.
+A larger source GWAS therefore reduces the first part only. It does nothing to
+the third part.
 
 ### How many target cohorts to collect
 
 $$
-n'^{*} \approx 3.29\,\ell, \qquad \mathrm{Risk}^{*} \approx \frac{16.11}{N\ell}
+\text{best markers per cohort} \;\approx\; 3.3 \times \text{LD decay length}
 $$
 
 Take a fixed total number of genotyped markers. More separate cohorts reduce
@@ -123,13 +126,9 @@ the error, and the error drops as $1/m$. Each cohort must still contain enough
 markers for its own calibration. Past that point more cohorts make the error
 worse.
 
-$n'^{*}$ is the number of markers to genotype in one cohort. $\ell$ is the LD
-decay length, measured in markers. $N$ is the total number of markers across
-every cohort.
-
-The best cohort therefore holds about 3.3 LD decay lengths of markers. The
-ratio $n'^{*}/\ell$ stays between 3.27 and 3.50 across a factor of 1000 in
-$\ell$, so you can use this rule in other studies.
+The LD decay length is measured in markers. The ratio stays between 3.27 and
+3.50 across a factor of 1000 in the LD decay length, so you can use this rule
+in other studies.
 
 A longer LD decay length also reduces the error at a fixed marker count.
 
@@ -138,13 +137,12 @@ A longer LD decay length also reduces the error at a fixed marker count.
 ### How many times to fit each cohort
 
 $$
-\mathrm{reliability} \geq \tau \quad\Longleftrightarrow\quad B \geq \frac{c\,\tau}{p\,(1-\tau)}
+\text{fits needed} \;=\; 88 \times \frac{\text{reliability}}{1 - \text{reliability}}
 $$
 
-$B$ is the number of separate calibration fits for one cohort. Each fit uses a
-different subsample of that cohort. $\tau$ is the reliability you need, between
-0 and 1. The ratio $c/p$ depends on the cohort and on the trait. One
-measurement fixes it, and the study below fixes it at about 88.
+A fit uses one subsample of the cohort. Reliability runs from 0 to 1. The
+constant 88 depends on the cohort and on the trait, and one measurement fixes
+it.
 
 The condition is exact in both directions. You therefore know when you have
 enough fits and when you do not.
@@ -152,12 +150,12 @@ enough fits and when you do not.
 The cost grows very fast as $\tau$ approaches 1. Each further nine costs
 about ten times more fits.
 
-One study fitted each cohort 16 times and reached a reliability of 0.153. That
-study needed about 350 fits per cohort for a reliability of 0.8.
+Sixteen fits per cohort give a reliability of 0.153. Reliability 0.8 needs
+about 350 fits per cohort.
 
 <ReliabilityCurve />
 
-## III. Two limits
+## Two limits
 
 Two separate effects limit the accuracy. You can pay for the first one with
 more samples. No sample size removes the second one.
@@ -165,24 +163,24 @@ more samples. No sample size removes the second one.
 <div class="pair">
 <div class="card">
 
-### Limit 1 · markers that copy each other
+### Markers in perfect linkage disequilibrium
 
 $$
-r_\perp = 0 \quad\Longleftrightarrow\quad \eta > 0
+\text{unremovable part} = 0 \quad\Longleftrightarrow\quad \text{no pair of markers is in perfect LD}
 $$
 
-$\eta$ measures how far the markers are from perfect LD. LD pruning removes any
-marker that another marker predicts exactly. After pruning, $\eta$ is more than
-zero and the fixed error is zero. The whole error then shrinks as the sample
-size and the cohort count grow.
+Two markers in perfect LD ($r^{2} = 1$) carry the same information. LD pruning
+drops one marker from every such pair. After pruning, the unremovable part of
+the error is zero. The whole error then
+shrinks as the sample size and the cohort count grow.
 
 <div class="caution">
 
 **CAUTION: Always quote the cost with this result.** Some differences between
-populations are cheap to measure and some are very expensive. The expensive
-ones need about $(C/\eta)^{2k}$ samples. Here $k$ counts how indirectly the
-difference appears in the data, and $C$ is a constant of the marker set. The
-sample count grows without limit as $k$ grows.
+populations are cheap to measure and some are very expensive. A difference that
+appears only indirectly needs a sample size that grows as a power of how
+indirect it is. The exponent doubles with each step of indirectness, so the
+count grows without limit.
 
 An expensive difference is a hard limit in a real study. Enough samples remove
 it in principle only.
@@ -196,7 +194,7 @@ yet.
 </div>
 <div class="card">
 
-### Limit 2 · environment that changes with ancestry
+### Environment that changes with ancestry
 
 Environment often varies along the same axis as ancestry. When it does, a whole
 range of different genetic and environmental splits produces exactly the same
@@ -215,14 +213,14 @@ them, whatever their number.
 
 </div>
 
-This result limits the rule in section II. More cohorts reduce the
-genetic-distance part of the error. They reduce this part only when the
+This result limits the rule on how many cohorts to collect. More cohorts
+reduce the genetic-distance part of the error. They reduce this part only when the
 environments differ.
 
 </div>
 </div>
 
-## IV. What we measured
+## What we measured
 
 We fixed each prediction before the run. No prediction uses a fitted number,
 except where the table states one.
@@ -234,23 +232,23 @@ except where the table states one.
 | Hudson $F_{ST}$ from Nei $G_{ST}$ | exact | $3.6\times10^{-16}$ | 16 cells |
 | AUC from $R^{2}$, true prevalence | — | RMSE $0.0126$ | no fitted number |
 | Information per cohort | $1.000$ | $1.035 / 1.013 / 1.029 / 0.984$ | four separate runs |
-| Information near perfect LD | $\eta^{2}$ | exponent $1.9999$ | as $\eta$ approaches 0 |
-| Best markers per cohort | $3.29\,\ell$ | agrees | across a factor of 1000 in $\ell$ |
-| Curvature at the long-memory edge | $-\frac{3}{2}\delta$ | $10^{-7}$ | the geometry is flat |
+| Information near perfect LD | a square law | exponent $1.9999$ | as the markers approach copies |
+| Best markers per cohort | $3.3 \times$ LD decay length | agrees | across a factor of 1000 |
 | $F_{ST}$ after a split, against msprime | $t/(t+2N_e)$ | $\lvert z\rvert \leq 0.89$ | 200 replicates, all cells within 1 SE |
 | Highest $F_{ST}$ a serial founder model reaches | $0.18497$ | $0.19248$ | 3.9% apart, no fitted number |
 | Brier score $=$ MSE $+$ base rate term | exact | $R^{2} = 0.994$ | leave-one-out, no fit |
 
 </div>
 
-## V. What these laws leave out
+## What these laws leave out
 
 None of the three parts contains a term for environment. Socioeconomic
 measures can explain as much difference between individuals as genetic distance
 explains. The largest term is then outside every formula on this page.
 
-We proved that this gap exists. Section III describes it as limit 2. The gap
-still restricts the value of the other results.
+We proved that this gap exists, and the section on environment that changes
+with ancestry states it. The gap still restricts the value of the other
+results.
 
 These laws also leave out admixture, assortative mating, ascertainment in the
 source GWAS, and any difference in allele frequency spectra beyond $F_{ST}$.
