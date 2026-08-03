@@ -254,6 +254,10 @@ th[align="right"], td[align="right"] {
   margin: 1.2rem 0;
 }
 
+/* A grid item defaults to min-width:auto, so wide content -- a long equation,
+   a table -- pushes the column past its track instead of scrolling inside it. */
+.pair > * { min-width: 0; }
+
 .card {
   background: var(--bg-2);
   border: 1px solid var(--rule);
@@ -261,7 +265,8 @@ th[align="right"], td[align="right"] {
   padding: 1rem 1.2rem;
 }
 
-.card h3 { margin-top: 0; font-size: 1.02rem; }
+.card h3 { margin-top: 0; font-size: 1.02rem; line-height: 1.3; }
+.card .katex-display { overflow-x: auto; overflow-y: hidden; }
 .card p { max-width: none; }
 
 /* responsive -------------------------------------------------------------- */

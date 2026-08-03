@@ -121,10 +121,10 @@ $$
 \text{best markers per cohort} \;\approx\; 3.3 \times \text{LD decay length}
 $$
 
-Take a fixed total number of genotyped markers. More separate cohorts reduce
-the error, and the error drops as $1/m$. Each cohort must still contain enough
-markers for its own calibration. Past that point more cohorts make the error
-worse.
+Take a fixed total number of genotyped markers. More separate target cohorts
+reduce the error, and the error drops in proportion to one over the cohort
+count. Each cohort must still contain enough markers for its own calibration.
+Past that point more cohorts make the error worse.
 
 The LD decay length is measured in markers. The ratio stays between 3.27 and
 3.50 across a factor of 1000 in the LD decay length, so you can use this rule
@@ -165,15 +165,11 @@ more samples. No sample size removes the second one.
 
 ### Markers in perfect linkage disequilibrium
 
-$$
-\text{unremovable part} = 0 \quad\Longleftrightarrow\quad \text{no pair of markers is in perfect LD}
-$$
-
 Two markers in perfect LD ($r^{2} = 1$) carry the same information. LD pruning
-drops one marker from every such pair. After pruning, the unremovable part of
-the error is zero. The whole error then
-shrinks as the sample size and the cohort count grow.
+drops one marker from every such pair.
 
+**After pruning, the unremovable part of the error is zero.** The whole error
+then shrinks as the sample size and the cohort count grow.
 <div class="caution">
 
 **CAUTION: Always quote the cost with this result.** Some differences between
