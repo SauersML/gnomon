@@ -93,13 +93,15 @@ const paths = series.map((s) => ({
     </g>
   </svg>
   <p class="fig-note">
-    A pair of SNPs at minor allele frequency 1/20 in linkage equilibrium leaves
-    its rarest joint genotype at probability 6.25 in a million, and 500,000
-    people still miss it in 5% of runs. Raising the LD r² to 0.81 raises that
-    rarest genotype to 22.6 in a million and no run of 500,000 misses it, so a
-    rule that prunes every pair above an LD r² threshold would drop the pair
-    that a study can actually observe. At r² = 0.98 the
-    rarest genotype falls to 2.3 in ten million and five million people still
-    miss it in 59% of runs.
+    Every percentage in this note counts replicate draws rather than the bound:
+    the two agree here to within a few points, and the curve above draws the
+    bound while the circles draw the draws. A pair of SNPs at minor allele
+    frequency 1/20 in linkage equilibrium leaves its rarest joint genotype at
+    probability 6.25 in a million, and 500,000 people still miss it in 5% of
+    200 draws. Raising the LD r² to 0.81 raises that rarest genotype to 22.6 in
+    a million and no draw of 500,000 misses it, so a rule that prunes every pair
+    above an LD r² threshold would drop the pair that a study can actually
+    observe. At r² = 0.98 the rarest genotype falls to 2.3 in ten million and
+    five million people still miss it in 59% of draws.
   </p>
 </figure>
