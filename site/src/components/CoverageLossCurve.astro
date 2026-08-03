@@ -1,0 +1,105 @@
+---
+/**
+ * How often a study of a given size never observes one of the nine joint
+ * genotype cells of a SNP pair, at minor allele frequency 1/20.
+ *
+ * Both series are read from proofs/validation/ld_coverage_boundary/results.json,
+ * block "finite_sample_rare_allele": the curve joins the analytic upper bound
+ * on that probability at the five sample sizes it records, and the points are
+ * the fraction of 200 replicate draws in which some genotype cell went
+ * unobserved. Nothing is fitted and nothing is interpolated beyond the segments
+ * between recorded sample sizes.
+ */
+const N = [1000, 10000, 100000, 500000, 5000000];
+
+const series = [
+  {
+    r2: "0",
+    label: "LD r² = 0",
+    dash: "",
+    bound: [1.0, 1.0, 0.5352603831806316, 0.04393650455241727, 2.6807420628858863e-14],
+    empirical: [1.0, 0.955, 0.525, 0.05, 0.0],
+  },
+  {
+    r2: "0.81",
+    label: "LD r² = 0.81",
+    dash: "7 5",
+    bound: [1.0, 1.0, 0.209479735307242, 2.5211001583288903e-5, 2.0259607898535387e-49],
+    empirical: [1.0, 0.965, 0.195, 0.0, 0.0],
+  },
+  {
+    r2: "0.9801",
+    label: "LD r² = 0.98",
+    dash: "2 4",
+    bound: [1.0, 1.0, 1.0, 1.0, 0.647278941499435],
+    empirical: [1.0, 1.0, 1.0, 1.0, 0.585],
+  },
+];
+
+const W = 760, H = 330, L = 62, R = 116, T = 18, B = 48;
+const iw = W - L - R, ih = H - T - B;
+const lx = Math.log10;
+const x0 = lx(700), x1 = lx(8e6);
+const X = (v: number) => L + ((lx(v) - x0) / (x1 - x0)) * iw;
+const Y = (v: number) => H - B - v * ih;
+
+const paths = series.map((s) => ({
+  ...s,
+  d: s.bound.map((b, i) => (i ? "L" : "M") + X(N[i]).toFixed(2) + " " + Y(b).toFixed(2)).join(""),
+  endY: Y(s.bound[s.bound.length - 1]),
+}));
+---
+
+<figure class="fig">
+  <figcaption class="fig-title">
+    At a low minor allele frequency, more linkage disequilibrium can make a
+    genotype cell easier to observe rather than harder
+  </figcaption>
+  <svg viewBox={`0 0 ${W} ${H}`} role="img"
+       aria-label="Probability that a study never observes one of the nine joint genotype cells of a SNP pair, against sample size, at minor allele frequency one twentieth, for LD r-squared of 0, 0.81 and 0.98. The 0.81 curve falls below the 0 curve; the 0.98 curve stays at one until five million samples.">
+    {[0, 0.25, 0.5, 0.75, 1].map((v) => (
+      <>
+        <line x1={L} x2={W - R} y1={Y(v)} y2={Y(v)} class="grid" />
+        <text x={L - 10} y={Y(v) + 4} class="tick" text-anchor="end">{(v * 100).toFixed(0)}%</text>
+      </>
+    ))}
+    {N.map((v) => (
+      <text x={X(v)} y={H - B + 20} class="tick" text-anchor="middle">
+        {v >= 1e6 ? v / 1e6 + "M" : v / 1000 + "k"}
+      </text>
+    ))}
+    <text x={L + iw / 2} y={H - 10} class="axis" text-anchor="middle">
+      people genotyped
+    </text>
+    <text x={16} y={T + ih / 2} class="axis" text-anchor="middle"
+          transform={`rotate(-90 16 ${T + ih / 2})`}>runs that miss a genotype cell</text>
+
+    {paths.map((p) => (
+      <>
+        <path d={p.d} class="curve" stroke-dasharray={p.dash || undefined} />
+        <text x={W - R + 8} y={p.endY + 4} class="tick">{p.label}</text>
+      </>
+    ))}
+
+    {series.map((s) =>
+      s.empirical.map((e, i) => <circle cx={X(N[i])} cy={Y(e)} r="5" class="dot" />)
+    )}
+
+    <g class="legend">
+      <line x1={L + 14} x2={L + 42} y1={T + 12} y2={T + 12} class="curve" />
+      <text x={L + 50} y={T + 16} class="tick">upper bound on the probability</text>
+      <circle cx={L + 28} cy={T + 32} r="5" class="dot" />
+      <text x={L + 50} y={T + 36} class="tick">200 replicate draws</text>
+    </g>
+  </svg>
+  <p class="fig-note">
+    A pair of SNPs at minor allele frequency 1/20 in linkage equilibrium leaves
+    its rarest joint genotype at probability 6.25 in a million, and 500,000
+    people still miss it in 5% of runs. Raising the LD r² to 0.81 raises that
+    rarest genotype to 22.6 in a million and no run of 500,000 misses it, so a
+    rule that prunes every pair above an LD r² threshold would drop the pair
+    that a study can actually observe. At r² = 0.98 the
+    rarest genotype falls to 2.3 in ten million and five million people still
+    miss it in 59% of runs.
+  </p>
+</figure>
