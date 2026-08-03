@@ -494,6 +494,11 @@ def main() -> int:
         return {0} | {i for i in range(1, len(name))
                       if name[i - 1] in "_'" or name[i].isupper() or name[i].isdigit()}
 
+    def word_ends(name):
+        """Offsets immediately after camelCase or underscore-delimited words."""
+        return {len(name)} | {i for i in range(1, len(name))
+                             if name[i] in "_'" or name[i].isupper() or name[i].isdigit()}
+
     def is_prop_shaped(sig, body):
         """Prop-valued by shape, not by name.
 
@@ -507,10 +512,29 @@ def main() -> int:
         return b.startswith("∀") or b.startswith("∃") or "↔" in b.split("\n")[0]
 
     def names_an_equilibrium(short):
-        low, starts = short.lower(), word_starts(short)
-        return any(m.start() in starts
+        low, starts, ends = short.lower(), word_starts(short), word_ends(short)
+        return any(m.start() in starts and m.end() in ends
                    for c in EQUILIBRIUM_CONCEPTS
                    for m in re.finditer(re.escape(c), low))
+
+    # A fixed-point theorem may live downstream of the primitive it pins.  That
+    # is common in an acyclic import graph: DGP owns the formula while
+    # PopulationGeneticsFoundations owns the process interpretation.  Requiring
+    # both declarations in one file reports the correct architecture as a
+    # defect.  Reachability is already checked by Lean elaboration, so search
+    # all theorem signatures just as the duplicate-body guard does.
+    global_defs = set()
+    global_theorems = []
+    for f in lean_files():
+        src = strip_comments(open(f).read())
+        global_defs.update(m.group(1).split(".")[-1] for m in re.finditer(
+            r"^(?:noncomputable )?def ([A-Za-z_0-9'.]+)", src, re.M))
+        global_theorems.extend(
+            (t.group(1).split(".")[-1], t.group(0).split(":=", 1)[0])
+            for t in re.finditer(r"^(?:@\[[^\]]*\]\s*\n)?(?:private )?theorem "
+                                 r"([A-Za-z_0-9'.]+)(?:.*?)(?=\n(?:@\[|theorem |"
+                                 r"noncomputable |def |abbrev |structure |section |end |"
+                                 r"namespace |/-))", src, re.S | re.M))
 
     stipulated = []
     for f in lean_files():
@@ -524,11 +548,6 @@ def main() -> int:
             defs.append((short, src[:m.start()].count("\n") + 1))
             bodies_here[short] = m.group(2).split(":=", 1)[-1]
             sigs_here[short] = m.group(2).split(":=", 1)[0]
-        theorems = [(t.group(1).split(".")[-1], t.group(0).split(":=", 1)[0])
-                    for t in re.finditer(r"^(?:@\[[^\]]*\]\s*\n)?(?:private )?theorem "
-                                         r"([A-Za-z_0-9'.]+)(?:.*?)(?=\n(?:@\[|theorem |"
-                                         r"noncomputable |def |abbrev |structure |section |end |"
-                                         r"namespace |/-))", src, re.S | re.M)]
         allnames = {n for n, _ in defs}
         for short, line in defs:
             if not names_an_equilibrium(short):
@@ -550,11 +569,11 @@ def main() -> int:
                    re.search(r"\b" + re.escape(o) + r"\b", body) for o in allnames):
                 continue
             ok = False
-            for tname, stmt in theorems:
+            for tname, stmt in global_theorems:
                 if not tname.startswith(short) or not any(k in tname for k in FIXEDPOINT_MARKERS):
                     continue
                 if any(o != short and re.search(r"\b" + re.escape(o) + r"\b", stmt)
-                       for o in allnames):
+                       for o in global_defs):
                     ok = True
                     break
             if not ok:
