@@ -108,25 +108,62 @@ import re, sys, glob, os
 
 ROOT = os.path.join(os.path.dirname(__file__), "..", "proofs")
 
-CONVENTION_SITE_BUDGET = 0        # measured; may decrease, never increase
-ISOLATED_MODULE_BUDGET = 14         # modules no theorem cross-relates to another
+# Every budget is 0. Nothing is grandfathered: a screen that permits N existing
+# instances of the defect it names is a screen that has agreed to the defect,
+# and "it was already there" is not a standard. A count above 0 fails the build.
+CONVENTION_SITE_BUDGET = 0          # ploidy/coalescent constants restated inline
+ISOLATED_MODULE_BUDGET = 0          # modules no theorem cross-relates to another
 UNDECLARED_BUDGET = 0               # empirical defs with no status marker
-UNRELATED_BUDGET = 20               # ratchets down
+UNRELATED_BUDGET = 0                # same-quantity siblings no theorem relates
 MISSING_ARG_BUDGET = 0              # signatures omitting a dependency of the named quantity
 CONFLATION_BUDGET = 0               # one formula under names from different concept families
 CONVENTION_DECL_BUDGET = 0          # composable quantities with no declared convention
-OVERCLAIM_BUDGET = 0                # untested definitions whose docstring claims exactness             # measured; ratchets down as siblings get related
+OVERCLAIM_BUDGET = 0                # untested definitions whose docstring claims exactness
 EQUILIBRIUM_BUDGET = 0              # equilibria stipulated as a closed form, never derived
-DUPLICATE_BODY_BUDGET = 0           # one body under two names in two files, tied by nothing
+DUPLICATE_BODY_BUDGET = 0           # one body under two names, tied by nothing
 REGIME_DECL_BUDGET = 0              # drift regimes baked into a body instead of a hypothesis
 UNDERDELIVERY_BUDGET = 0            # docstring attributes an identity the signature does not prove
 INHERITED_VALIDATION_BUDGET = None  # VALIDATED inherited from a sibling identity; pin on first run
 VACUOUS_VALIDATION_BUDGET = None    # VALIDATED with no recorded power; pin on first run
-LAUNDERED_PROP_BUDGET = 16          # named propositions only ever assumed, never established
-UNWITNESSED_BUNDLE_BUDGET = 38      # assumption bundles no concrete construction satisfies
-INSTANCE_LAUNDERING_BUDGET = 2      # supplied fields turned into silently-binding instances
-UNCONDITIONAL_NAME_BUDGET = 35      # conditional results named as though unconditional
-DOMAIN_NAMED_ARITHMETIC_BUDGET = 90 # genetics in the name, free reals in the goal; ratchets down
+LAUNDERED_PROP_BUDGET = 0           # named propositions only ever assumed, never established
+UNWITNESSED_BUNDLE_BUDGET = 0       # assumption bundles no concrete construction satisfies
+INSTANCE_LAUNDERING_BUDGET = 0      # supplied fields turned into silently-binding instances
+UNCONDITIONAL_NAME_BUDGET = 0       # conditional results named as though unconditional
+DOMAIN_NAMED_ARITHMETIC_BUDGET = 0  # genetics in the name, free reals in the goal
+
+# THE RECORD THE ZEROING WOULD OTHERWISE HAVE DESTROYED.
+#
+# Seven of the budgets above were not always 0. They were pinned at a MEASURED
+# count and ratcheted downwards, and the guard's own header still describes that
+# discipline: each count "pinned at what was measured", so "the corpus cannot
+# acquire new ones". Those numbers were the measurement. Setting them all to 0
+# in a single edit enforces the right standard and destroys the record at the
+# same time, and without the record nobody can read a later run: 7 unwitnessed
+# bundles is excellent progress from 38 and a bad regression from 0, and the
+# number alone does not say which.
+#
+# So the standard is 0 and the history is kept here. Each entry is the last value
+# the budget carried before the zeroing, and the commit that set it.
+#
+# Two of the seven have since been genuinely cleared to 0 -- LAUNDERED_PROP from
+# 16, UNCONDITIONAL_NAME from 35. That is only visible because the old numbers
+# are written down.
+LAST_PINNED_BEFORE_ZEROING = {
+    "ISOLATED_MODULE_BUDGET":         (14, "ee0302c8", "2026-08-01"),
+    "UNRELATED_BUDGET":               (20, "c1881cb4", "2026-08-01"),
+    "LAUNDERED_PROP_BUDGET":          (16, "cfcff551", "2026-08-03"),
+    "UNWITNESSED_BUNDLE_BUDGET":      (38, "cfcff551", "2026-08-03"),
+    "INSTANCE_LAUNDERING_BUDGET":     (2,  "cfcff551", "2026-08-03"),
+    "UNCONDITIONAL_NAME_BUDGET":      (35, "cfcff551", "2026-08-03"),
+    "DOMAIN_NAMED_ARITHMETIC_BUDGET": (90, "12e5ce63", "2026-08-03"),
+}
+# CONVENTION_SITE_BUDGET and ISOLATED_MODULE_BUDGET have a longer history worth
+# keeping, because it is the evidence that a 0 here is reachable rather than
+# rhetorical. Convention sites were ratcheted 101, 100, 99, 93, 86, 79, 77, 76,
+# 43, 37, 29, 15, 7, 0 across fourteen commits on 2026-08-01, each decrement made
+# after the count had actually reached it, and the guard passed at 0. Isolated
+# modules went 23, 22, 21, 19, 17, 15, 14 over the same day and passed at 14.
+# Both have since regressed, which is what the screens are for.
 
 def strip_comments(src: str) -> str:
     """Remove Lean block and line comments so prose cannot trip the guards."""
@@ -197,6 +234,27 @@ def block_structure_errors(src: str):
     for kind, name, n in stack:
         errors.append(f"line {n}: `{kind} {name}`".rstrip() + " is never closed")
     return errors
+
+def preceding_docstring(lines, i):
+    """The whole `/-- ... -/` block attached to the declaration on line `i`.
+
+    The status may be declared anywhere in a docstring, and these run to forty
+    lines, so a fixed lookback window reports a declared status as missing and
+    invites a second, contradictory marker next to the first. The block is
+    delimited, so read the delimiters."""
+    j = i - 1
+    while j >= 0 and (not lines[j].strip() or lines[j].lstrip().startswith("@[")):
+        j -= 1
+    if j < 0 or not lines[j].rstrip().endswith("-/"):
+        return ""
+    end = j
+    while j >= 0 and "/--" not in lines[j]:
+        # A `/-! -/` section header is not this declaration's docstring, and
+        # walking past it would borrow the status of whatever precedes it.
+        if "/-!" in lines[j] or "-/" in lines[j] and j != end:
+            return ""
+        j -= 1
+    return "\n".join(lines[max(0, j):end + 1])
 
 def lean_files():
     return (glob.glob(os.path.join(ROOT, "Calibrator", "*.lean")) +
@@ -325,9 +383,42 @@ def main() -> int:
     #     if that status is UNTESTED. Four of the seven falsifications found so
     #     far were in definitions nobody had thought to check; the point of the
     #     marker is that the unchecked ones are enumerable rather than silent.
+    #     The `ld` alternative CANNOT live in the case-insensitive pattern, and
+    #     putting it there manufactured findings for as long as it was there.
+    #     `ld[A-Z_]` is meant to catch linkage disequilibrium where the name
+    #     spells it as a word: `ldDecay`, `sharedLDRetention`, `ld_overlap`.
+    #     Under `re.I` the `[A-Z_]` class also matches lowercase, so the branch
+    #     degenerates to "an l followed by a d, anywhere in the name" and fires
+    #     in the middle of ordinary English. Every match it produced that way was
+    #     mid-word and had nothing to do with linkage disequilibrium:
+    #
+    #       criticaLDEgree        Condensation.criticalDegree
+    #       totaLDIploid...       FoldedSpectrum.totalDiploidCovarianceMomentInformation
+    #       spectraLDIstance...   GenerativePortabilityLaw.historySpectralDistanceSq
+    #       residuaLDIscreteness  ScoreDistribution.residualDiscreteness
+    #
+    #     A screen that invents its own findings is worse than a screen that
+    #     misses some: the inventions cost a reader the time to refute them and
+    #     teach everyone to discount the real ones. Marking those four with an
+    #     Empirical status would have recorded a claim about linkage
+    #     disequilibrium that none of them makes.
+    #
+    #     Dropping `re.I` alone is NOT the fix, and measuring said so. Bare
+    #     `ld[A-Z_]` still matches every `threshold` followed by a capital --
+    #     `thresholdQalyLoss`, `thresholdBandRate`, nine of them -- because
+    #     "threshold" ends in the letters l, d. And it misses the eleven names
+    #     that END in `LD` (`admixtureLD`, `bottleneckExcessLD`,
+    #     `sourceTruthR2SharedLD`), since it requires a character after.
+    #
+    #     What the branch wants is `LD` as a word: the lowercase prefix at the
+    #     start of a name, or the uppercase pair standing as its own camelCase
+    #     segment. Written case-sensitively, and as a separate pattern rather
+    #     than an inline `(?-i:...)` scope, which needs Python 3.11 and would
+    #     fail on the cluster's 3.6.
     DOMAIN = re.compile(r"fst|drift|selection|herit|linkage|allele|geno|migrat|coalesc|mutation|"
                         r"epistat|domin|recomb|ancestr|spike|admix|haplo|polygenic|prevalence|"
-                        r"liability|penetrance|pgs|gwas|ld[A-Z_]|singleton|winners|power|ncp|effect", re.I)
+                        r"liability|penetrance|pgs|gwas|singleton|winners|power|ncp|effect", re.I)
+    DOMAIN_CASED = re.compile(r"^ld|(?:^|[a-z0-9])LD(?=[A-Z_]|$)")
     undeclared = []
     for f in lean_files():
         raw = open(f).read().split("\n")
@@ -339,9 +430,10 @@ def main() -> int:
             short = m.group(1).split(".")[-1]
             body = "\n".join(stripped[i:i + 6])
             body = body.split(":=", 1)[1] if ":=" in body else ""
-            if not (DOMAIN.search(short) or mult.search(re.sub(r"\^\s*[0-9]+", "", body))):
+            if not (DOMAIN.search(short) or DOMAIN_CASED.search(short) or
+                    mult.search(re.sub(r"\^\s*[0-9]+", "", body))):
                 continue
-            if "Empirical status:" not in "\n".join(raw[max(0, i - 14):i + 1]):
+            if "Empirical status:" not in preceding_docstring(raw, i):
                 undeclared.append(f"{os.path.relpath(f, ROOT)}: `{short}` has no Empirical status")
     if len(undeclared) > UNDECLARED_BUDGET:
         bad.append(f"definitions making an empirical claim without an Empirical status marker: "
@@ -758,18 +850,75 @@ def main() -> int:
                     return True
         return False
 
+    # Hub ties, which this check used to report as violations. 3c already credits
+    # a definition tied to a shared primitive in Conventions, and says why: a
+    # group pinned to one object is related in the stronger sense, and refusing
+    # the credit "penalises exactly the refactor it exists to encourage." This
+    # check demanded a theorem naming BOTH members and therefore did precisely
+    # that. `Conventions.geometricDecay` is the worked example: `(1 - r)^t` lives
+    # under four names, and the file proves `ldDecayPerGeneration`,
+    # `admixtureLDDecay` and `discreteRecombinationSurvival` each equal to the
+    # hub. That is the collapse this guard asks for, done properly -- three
+    # theorems rather than the six pairwise ones, and a divergence in any
+    # spelling still fails one of them -- and it was being reported as three
+    # unrelated duplications.
+    #
+    # The credit requires the SAME primitive on both sides. Two definitions
+    # related to two DIFFERENT Conventions primitives are not tied to each other
+    # by anything, and accepting that would let any pair through on the strength
+    # of each half being documented somewhere.
+    hub_cache = {}
+
+    def hub_primitives(f, n):
+        """Conventions primitives this definition is equated to by a visible theorem."""
+        key = (f, n)
+        if key in hub_cache:
+            return hub_cache[key]
+        hubs = set()
+        for rel, stmts in file_stmts.items():
+            if f not in visible.get(rel, ()):
+                continue
+            for st in stmts:
+                if not re.search(r"\b" + re.escape(n) + r"\b", st):
+                    continue
+                for pr in primitives:
+                    if pr != n and re.search(r"\b" + re.escape(pr) + r"\b", st):
+                        hubs.add(pr)
+        hub_cache[key] = hubs
+        return hubs
+
     duplicates = []
     for norm, members in sorted(shapes.items()):
         for i in range(len(members)):
             for j in range(i + 1, len(members)):
                 (fa, la, na, ba), (fb, lb, nb, bb) = members[i], members[j]
-                if fa == fb:
+                # Same-file pairs were skipped outright, and that was this check
+                # blind to its own worst case. The premise of the screen is that
+                # one quantity under two names diverges when only one copy is
+                # repaired; nothing about that premise needs the two names to be
+                # in different modules, and a duplicate inside one file is the
+                # TIGHTER defect, because the two bodies sit where a single
+                # reader and a single edit can see both and still miss it.
+                # Measured on the corpus when the skip was removed: `HorizonCurve`
+                # defines the Kronecker delta on `Fin 2` twice, as `stayKernel`
+                # and as `agreement`, and `UnifiedBiology` does the same as
+                # `persistentTransition` and `contextMatchQuality`. Both were
+                # invisible while the five CROSS-file pairings of those very
+                # definitions were reported. A check that reports the weaker
+                # instance and hides the stronger one produces a count people
+                # trust, which is worse than no count.
+                #
+                # Only an entry paired with itself is skipped now.
+                if fa == fb and na == nb and la == lb:
                     continue
                 # Tied by definition: one is written in terms of the other.
                 if (re.search(r"\b" + re.escape(nb) + r"\b", ba) or
                         re.search(r"\b" + re.escape(na) + r"\b", bb)):
                     continue
                 if tied_by_theorem(fa, na, fb, nb):
+                    continue
+                # Tied through a shared Conventions hub, as 3c already credits.
+                if hub_primitives(fa, na) & hub_primitives(fb, nb):
                     continue
                 duplicates.append(f"{fa}:{la} {na}  ==  {fb}:{lb} {nb}")
     duplicates.sort()
