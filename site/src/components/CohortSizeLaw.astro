@@ -68,7 +68,10 @@ const Y = (v: number) => H - B - ((v - y0) / (y1 - y0)) * ih;
     The LD decay length here is one over one minus the correlation between
     neighbouring SNPs, and it runs from 2 SNPs to 2,000. The best cohort holds 7
     SNPs at the short end and 6,543 at the long end, and every ratio between
-    those two lies in 3.27 to 3.50. A population with longer-range linkage
-    disequilibrium therefore needs fewer SNPs per cohort for the same accuracy.
+    those two lies in 3.27 to 3.50. Across the same sweep the product of the
+    total SNP count, the LD decay length and the error stays between 15.2 and
+    16.1, so a population with longer-range linkage disequilibrium needs fewer
+    SNPs in total for the same accuracy even though each of its cohorts holds
+    more.
   </p>
 </figure>

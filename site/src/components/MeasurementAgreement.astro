@@ -1,0 +1,88 @@
+---
+/**
+ * How closely each measurement met its prediction, in units of the prediction.
+ *
+ * Only rows whose predicted and measured numbers both sit in this repository
+ * appear here, and each number is the worst case over its cells rather than an
+ * average.
+ *
+ *   Hudson from Nei      proofs/validation/popgen_defs/defs.json, check
+ *                        "hudson_vs_neigst": largest rel_err over 16 allele
+ *                        frequency pairs, 3.608e-16.
+ *   Best SNPs per cohort proofs/validation/differential/cluster/
+ *                        partition_curve_results.json, "general_optimum":
+ *                        largest departure of n_star_over_tau from 3.3 over ten
+ *                        LD decay lengths, (3.5 - 3.3) / 3.3.
+ *   Serial founder       proofs/validation/differential/cluster/
+ *                        fam_serial_founder_results.json,
+ *                        "cand5_far_rel_err", 0.03905.
+ */
+const rows = [
+  {
+    label: "Hudson F-ST recovered from Nei G-ST",
+    detail: "16 allele frequency pairs, worst case",
+    value: 3.608224830031760e-16,
+    text: "3.6e−16",
+  },
+  {
+    label: "Serial founder ceiling at the far end of the chain",
+    detail: "predicted 0.18497, exact 0.19248",
+    value: 0.03905008176646783,
+    text: "3.9%",
+  },
+  {
+    label: "Best SNPs per cohort against 3.3 LD decay lengths",
+    detail: "10 LD decay lengths over a factor of 1000, worst case",
+    value: (3.5 - 3.3) / 3.3,
+    text: "6.1%",
+  },
+];
+
+const W = 760, H = 250, L = 30, R = 30, T = 26, B = 52;
+const iw = W - L - R;
+const lx = Math.log10;
+const x0 = -17, x1 = 0;
+const X = (v: number) => L + ((lx(v) - x0) / (x1 - x0)) * iw;
+const ROW = (i: number) => T + 46 + i * 52;
+const decades = [-16, -12, -8, -4, 0];
+---
+
+<figure class="fig">
+  <figcaption class="fig-title">
+    Three predictions met their measurements, one at machine precision and two
+    within a few per cent
+  </figcaption>
+  <svg viewBox={`0 0 ${W} ${H}`} role="img"
+       aria-label="Relative disagreement between prediction and measurement for three results, on a logarithmic scale. The Hudson to Nei identity agrees to four parts in ten quadrillion; the serial founder ceiling to 3.9 per cent; the best SNPs per cohort to 6.1 per cent.">
+    {decades.map((d) => (
+      <>
+        <line x1={X(10 ** d)} x2={X(10 ** d)} y1={T} y2={H - B + 6} class="grid" />
+        <text x={X(10 ** d)} y={H - B + 24} class="tick" text-anchor="middle">
+          {d === 0 ? "1" : (10 ** d).toExponential(0).replace("e-", "e−")}
+        </text>
+      </>
+    ))}
+    <text x={L + iw / 2} y={H - 10} class="axis" text-anchor="middle">
+      measurement minus prediction, divided by the prediction
+    </text>
+
+    {rows.map((r, i) => (
+      <>
+        <line x1={L} x2={X(r.value)} y1={ROW(i)} y2={ROW(i)} class="marker" />
+        <circle cx={X(r.value)} cy={ROW(i)} r="6" class="dot" />
+        <text x={L} y={ROW(i) - 12} class="tick strong">{r.label}</text>
+        <text x={L} y={ROW(i) + 18} class="tick">{r.detail}</text>
+        <text x={X(r.value) + 12} y={ROW(i) + 4} class="tick strong">{r.text}</text>
+      </>
+    ))}
+  </svg>
+  <p class="fig-note">
+    The first row is an algebraic identity between two estimators of the same
+    genetic distance, so it agrees to the last bit a double holds. The other two
+    are predictions about a population that a separate calculation then
+    measured, and a few per cent is what they achieved with no fitted number.
+    The remaining rows of the table state their agreement as a root mean squared
+    error or a correlation rather than a relative departure, so they do not
+    belong on this axis.
+  </p>
+</figure>

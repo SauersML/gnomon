@@ -1,0 +1,83 @@
+---
+/**
+ * Hudson F_ST between the first deme and the k-th, along a serial founder chain
+ * of ten demes.
+ *
+ * Every number here is read from
+ * proofs/validation/differential/cluster/fam_serial_founder_results.json,
+ * section A_serial_founder. The demography is ten demes of 3,000 chromosomes,
+ * founded 400 generations apart from an ancestor of 10,000, with migration
+ * 0.001 between neighbours.
+ *
+ * "exact" is the expected pairwise coalescence time integrated from the
+ * pair-state Markov chain of that demography to machine precision, so it needs
+ * no simulator. The two candidate curves are closed forms in the demographic
+ * parameters, each evaluated with no fitted number.
+ */
+const rows = [
+  { k: 1, exact: 0.03927479005057244, ceiling: 0.07659465339963727, pure: 0.06449301496838222 },
+  { k: 2, exact: 0.07303810007167633, ceiling: 0.12245762974686548, pure: 0.12482668095705252 },
+  { k: 3, exact: 0.10099297613769442, ceiling: 0.1499485835814122, pure: 0.18126924692201807 },
+  { k: 4, exact: 0.12376469109634591, ceiling: 0.16613499625590766, pure: 0.2340716616353512 },
+  { k: 5, exact: 0.14261563425214852, ceiling: 0.17536934781681898, pure: 0.2834686894262106 },
+  { k: 6, exact: 0.15885024019317662, ceiling: 0.18042325921770525, pure: 0.32967995396436056 },
+  { k: 7, exact: 0.17336286647345334, ceiling: 0.18305759029060695, pure: 0.3729109147269437 },
+  { k: 8, exact: 0.18631084574432555, ceiling: 0.1843586042295336, pure: 0.41335378048996807 },
+  { k: 9, exact: 0.192481575584186, ceiling: 0.18496515431908497, pure: 0.4511883639059734 },
+];
+
+const W = 760, H = 330, L = 62, R = 150, T = 18, B = 48;
+const iw = W - L - R, ih = H - T - B;
+const YMAX = 0.48;
+const X = (k: number) => L + ((k - 1) / 8) * iw;
+const Y = (v: number) => H - B - (v / YMAX) * ih;
+
+const poly = (key: "ceiling" | "pure") =>
+  rows.map((r, i) => (i ? "L" : "M") + X(r.k).toFixed(2) + " " + Y(r[key]).toFixed(2)).join("");
+
+const last = rows[rows.length - 1];
+---
+
+<figure class="fig">
+  <figcaption class="fig-title">
+    A serial founder chain climbs towards a ceiling, and one closed form finds
+    that ceiling while another runs away from it
+  </figcaption>
+  <svg viewBox={`0 0 ${W} ${H}`} role="img"
+       aria-label="Hudson F-ST between the first deme and the k-th along a ten-deme serial founder chain. The exact coalescent values flatten near 0.19; a founder-ceiling formula flattens near 0.185 and a pure founder formula keeps rising past 0.45.">
+    {[0, 0.1, 0.2, 0.3, 0.4].map((v) => (
+      <>
+        <line x1={L} x2={W - R} y1={Y(v)} y2={Y(v)} class="grid" />
+        <text x={L - 10} y={Y(v) + 4} class="tick" text-anchor="end">{v.toFixed(1)}</text>
+      </>
+    ))}
+    {rows.map((r) => (
+      <text x={X(r.k)} y={H - B + 20} class="tick" text-anchor="middle">{r.k}</text>
+    ))}
+    <text x={L + iw / 2} y={H - 10} class="axis" text-anchor="middle">
+      demes between the two populations along the chain
+    </text>
+    <text x={16} y={T + ih / 2} class="axis" text-anchor="middle"
+          transform={`rotate(-90 16 ${T + ih / 2})`}>Hudson F<tspan baseline-shift="sub" font-size="0.78em">ST</tspan></text>
+
+    <path d={poly("pure")} class="curve" stroke-dasharray="2 5" />
+    <text x={W - R + 8} y={Y(last.pure) + 4} class="tick">founder effect alone</text>
+
+    <path d={poly("ceiling")} class="curve" />
+    <text x={W - R + 8} y={Y(last.ceiling) - 8} class="tick">founder effect with migration</text>
+
+    {rows.map((r) => <circle cx={X(r.k)} cy={Y(r.exact)} r="5.5" class="dot" />)}
+    <text x={W - R + 8} y={Y(last.exact) + 14} class="tick strong">exact coalescent</text>
+  </svg>
+  <p class="fig-note">
+    Migration between neighbouring demes stops the founder effect from
+    accumulating, so Hudson F-ST flattens instead of growing with every founding
+    event. At the far end of the chain the ceiling formula predicts 0.18497 and
+    the exact calculation gives 0.19248, which is 3.9% apart with no fitted
+    number. A formula that counts founder events and ignores migration reaches
+    0.45 and is wrong by more than a factor of two. Neither candidate fits the
+    whole chain: the ceiling formula misses the nearest pair of demes by 95%,
+    and the run that produced these numbers recorded no closed form as
+    delivered.
+  </p>
+</figure>

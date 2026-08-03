@@ -1,0 +1,78 @@
+---
+/**
+ * The effect-size error against the size of the source GWAS, at three shares of
+ * the error that no amount of data removes.
+ *
+ * THIS FIGURE CARRIES NO SIMULATED POINTS. It draws the shape of the
+ * decomposition stated above it: the sampling part falls in proportion to one
+ * over the number of people in the source GWAS, and the part that no target
+ * cohort can estimate does not fall at all. The three shares are stated
+ * choices, not measurements, and the curve for each is
+ *
+ *   error(x) = (1 - share) / x + share
+ *
+ * with x the source GWAS size relative to the smallest one drawn, so every
+ * curve starts at 1 and no constant is fitted.
+ */
+const series = [
+  { share: 0.1, dash: "2 4", label: "10% unremovable" },
+  { share: 0.3, dash: "7 5", label: "30% unremovable" },
+  { share: 0.6, dash: "", label: "60% unremovable" },
+];
+
+const W = 760, H = 320, L = 62, R = 140, T = 18, B = 48;
+const iw = W - L - R, ih = H - T - B;
+const lx = Math.log10;
+const x0 = 0, x1 = 3; // 1x to 1000x
+const X = (v: number) => L + ((lx(v) - x0) / (x1 - x0)) * iw;
+const Y = (v: number) => H - B - v * ih;
+
+const paths = series.map((s) => {
+  let d = "";
+  for (let i = 0; i <= 240; i++) {
+    const x = 10 ** (x0 + ((x1 - x0) * i) / 240);
+    d += (i ? "L" : "M") + X(x).toFixed(2) + " " + Y((1 - s.share) / x + s.share).toFixed(2);
+  }
+  return { ...s, d, endY: Y(s.share) };
+});
+---
+
+<figure class="fig">
+  <figcaption class="fig-title">
+    A larger source GWAS removes its own part of the effect-size error and
+    nothing else
+  </figcaption>
+  <svg viewBox={`0 0 ${W} ${H}`} role="img"
+       aria-label="Effect-size error against source GWAS size, drawn for three shares of the error that no amount of data removes. Every curve falls steeply and then flattens onto its own share. The figure is the closed form and carries no simulated points.">
+    {[0, 0.25, 0.5, 0.75, 1].map((v) => (
+      <>
+        <line x1={L} x2={W - R} y1={Y(v)} y2={Y(v)} class="grid" />
+        <text x={L - 10} y={Y(v) + 4} class="tick" text-anchor="end">{v.toFixed(2)}</text>
+      </>
+    ))}
+    {[1, 3, 10, 30, 100, 300, 1000].map((v) => (
+      <text x={X(v)} y={H - B + 20} class="tick" text-anchor="middle">{v}×</text>
+    ))}
+    <text x={L + iw / 2} y={H - 10} class="axis" text-anchor="middle">
+      people in the source GWAS, against the smallest study drawn
+    </text>
+    <text x={16} y={T + ih / 2} class="axis" text-anchor="middle"
+          transform={`rotate(-90 16 ${T + ih / 2})`}>squared effect-size error</text>
+
+    {paths.map((p) => (
+      <>
+        <path d={p.d} class="curve" stroke-dasharray={p.dash || undefined} />
+        <text x={W - R + 8} y={p.endY + 4} class="tick">{p.label}</text>
+      </>
+    ))}
+  </svg>
+  <p class="fig-note">
+    The sampling error the source GWAS makes on each effect size falls in
+    proportion to one over the number of people it recruits, so a thousandfold
+    larger GWAS removes essentially all of it. The SNPs a target cohort cannot
+    estimate — the ones it does not carry, and the ones it carries at too low an
+    allele frequency to measure — set the height each curve flattens onto, and
+    recruiting for the source GWAS never lowers it. The three shares are stated
+    choices that show the shape; no simulation stands behind this figure.
+  </p>
+</figure>
