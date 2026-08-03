@@ -55,7 +55,7 @@ for (let i = 0; i <= 3000; i++) {
 ---
 
 <figure class="fig">
-  <figcaption class="fig-title">More cohorts reduce the error, until each cohort is too small</figcaption>
+  <figcaption class="fig-title">More cohorts reduce the error, until each cohort holds too few markers to calibrate</figcaption>
   <svg viewBox={`0 0 ${W} ${H}`} role="img"
        aria-label="Error against the number of cohorts. The error falls, reaches a minimum near two thousand cohorts, then rises.">
     {[1e-5, 1e-4, 1e-3].map((v) => (
