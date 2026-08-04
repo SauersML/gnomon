@@ -269,16 +269,11 @@ def risk_vs_truth(p_true, p_pred) -> tuple[dict, int]:
     }, n
 
 
-def _wilson_ci(k: int, n: int, z: float = 1.959963984540054) -> tuple[float, float]:
-    """Wilson 95% interval for a binomial rate -- valid at small n. Delegates to
-    scipy.stats.binomtest(...).proportion_ci(method='wilson'), which is the
-    closed-form Wilson score interval; equivalent to the prior hand-coded formula
-    to machine precision. The ``z`` arg is retained for signature compatibility and
-    is mapped to the corresponding two-sided confidence level."""
+def _wilson_ci(k: int, n: int) -> tuple[float, float]:
+    """Wilson 95% interval for a binomial rate, including at small ``n``."""
     if n <= 0 or k < 0 or k > n:
         return np.nan, np.nan
-    conf = float(2.0 * norm.cdf(z) - 1.0)
-    ci = binomtest(int(k), int(n)).proportion_ci(method="wilson", confidence_level=conf)
+    ci = binomtest(int(k), int(n)).proportion_ci(method="wilson")
     return float(ci.low), float(ci.high)
 
 

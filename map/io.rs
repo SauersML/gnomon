@@ -587,12 +587,9 @@ struct ProjectionRowIdsMetadata {
 const PROJECTION_MATRIX_MAGIC: &[u8; 8] = b"GNPRJ001";
 const PROJECTION_MATRIX_VERSION: u32 = 3;
 const PROJECTION_MATRIX_HEADER_LEN: usize = 32;
-// Element-type tag stored in the header's trailing u32 (byte offset 28), which
-// earlier writers left as a reserved zero. Making the element type part of the
-// AUTHORITATIVE binary header -- not only the JSON sidecar -- means a reader can
-// never misinterpret the matrix bytes (e.g. decode f64 as f32) even if the
-// sidecar is absent, stale, or wrong. 0 = unspecified (legacy files); 1 = f64_le;
-// 2 is reserved for a future f32_le. gnomon always writes f64, hence F64_LE here.
+// Element-type tag stored in the header's trailing u32 (byte offset 28). The
+// authoritative binary header prevents a reader from decoding f64 bytes as f32
+// when the sidecar is absent or stale. 1 = f64_le; 2 is reserved for f32_le.
 const PROJECTION_ELEMENT_KIND_F64_LE: u32 = 1;
 const PROJECTION_ROW_IDS_MAGIC: &[u8; 8] = b"GNPSID01";
 const PROJECTION_ROW_IDS_VERSION: u32 = 1;
@@ -1226,7 +1223,7 @@ fn build_projection_binary_schema(
                     byte_length: 4,
                     encoding: "u32_le",
                     value: PROJECTION_ELEMENT_KIND_F64_LE.to_string(),
-                    description: "Self-describing matrix element type so readers never need the sidecar to decode the bytes correctly. 0 = unspecified (legacy); 1 = little-endian float64; 2 reserved for little-endian float32. gnomon always writes 1.".to_string(),
+                    description: "Self-describing matrix element type: 1 = little-endian float64; 2 is reserved for little-endian float32. gnomon writes 1.".to_string(),
                 },
             ],
         },

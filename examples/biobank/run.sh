@@ -239,22 +239,6 @@ format_kib() {
   awk -v kib="$1" 'BEGIN {printf "%.1fGiB", kib / 1024 / 1024}'
 }
 
-mount_of() {
-  local path="$1"
-  while [ ! -e "$path" ] && [ "$path" != "/" ]; do
-    path="$(dirname "$path")"
-  done
-  df -P "$path" 2>/dev/null | awk 'NR == 2 {print $NF}'
-}
-
-same_mount() {
-  local left
-  local right
-  left="$(mount_of "$1")"
-  right="$(mount_of "$2")"
-  [ -n "$left" ] && [ "$left" = "$right" ]
-}
-
 require_run_state_capacity() {
   local label="$1"
   local path="$2"
@@ -274,16 +258,6 @@ require_run_state_capacity() {
       echo "[run.sh] insufficient free space for $label at $path"
       echo "[run.sh] required: ${required_gib}GiB; available: $(format_kib "$free_kib")"
       df -hP "$path"
-      # If a pre-redirection uv cache shares this filesystem, point at it
-      # explicitly: this run uses UV_CACHE_DIR=$RUN_STATE_DIR/uv, so anything
-      # under $HOME/.cache/uv is genuine stale state and is safe to drop.
-      if [ -d "$HOME/.cache/uv" ] && same_mount "$HOME/.cache/uv" "$path"; then
-        echo
-        echo "[run.sh] legacy uv cache at \$HOME/.cache/uv shares this filesystem:"
-        du -sh "$HOME/.cache/uv" 2>/dev/null || true
-        echo "[run.sh] this run does not use it (UV_CACHE_DIR=$UV_CACHE_DIR); free it with:"
-        echo "[run.sh]     UV_CACHE_DIR=\"\$HOME/.cache/uv\" uv cache clean"
-      fi
       echo
       echo "[run.sh] largest entries under \$HOME/.cache (cleanup candidates):"
       du -sh "$HOME"/.cache/* 2>/dev/null | sort -hr | head -10 || true

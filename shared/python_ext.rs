@@ -2,8 +2,8 @@
 //!
 //! This module exposes the same entry points the `gnomon` CLI dispatches to
 //! (`score`, `project`, `terms`, `model`) as a native `#[pymodule]`, plus one
-//! standalone helper (`infer_sex`) that the subprocess wrapper cannot offer
-//! without running a full CLI invocation and re-parsing the written TSV. PyO3
+//! standalone helper (`infer_sex`) that returns a call without writing and
+//! re-parsing a TSV. PyO3
 //! loads the compiled `cdylib` directly into the host Python process, so
 //! `import gnomon` runs the Rust engine in-process: there is no subprocess to
 //! the `gnomon` binary and no `install.sh` step.
@@ -143,10 +143,8 @@ fn terms(py: Python<'_>, genotype_path: String, sex: bool) -> PyResult<String> {
 /// directly (no TSV written).
 ///
 /// This is the standalone analog of the `infer_sex`/`detect_build` helpers in
-/// the convert_genome spike: the subprocess wrapper cannot return a sex call
-/// without running the full `terms` subcommand and re-parsing the written sex
-/// TSV. Returns `"male"`, `"female"`, `"indeterminate"`, or `None` when the
-/// dataset has no samples.
+/// the convert_genome spike. Returns `"male"`, `"female"`, `"indeterminate"`,
+/// or `None` when the dataset has no samples.
 #[pyfunction]
 #[pyo3(name = "infer_sex", signature = (genotype_path))]
 fn infer_sex_first(py: Python<'_>, genotype_path: String) -> PyResult<Option<&'static str>> {

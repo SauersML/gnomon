@@ -483,7 +483,7 @@ def run_impossible_diploid_test(workdir: Path, gnomon_path: Path, run_cmd_func):
 
     # Otherwise fail with a clear hint
     if "conflicting genotype data" in stderr:
-        print("   > Observed legacy fatal error. Update required to ensure ambiguity is resolved.")
+        print("   > Ambiguity remained fatal; resolution is required.")
     else:
         print("   > Expected explicit ambiguity resolution with exit code 0; conditions not met.")
     print("\n❌ Impossible Diploid Test FAILED.")

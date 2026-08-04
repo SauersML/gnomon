@@ -2631,19 +2631,13 @@ impl HwePcaModel {
     /// Fraction of the **total** data variance captured by each retained PC.
     ///
     /// Normalizes against [`HwePcaModel::total_variance`] (the full spectrum), so
-    /// the ratios of a truncated fit sum to less than 1. Falls back to the sum of
-    /// the retained eigenvalues only when the total variance is unavailable
-    /// (legacy models predating the stored field, or projection-only stubs).
+    /// the ratios of a truncated fit sum to less than 1. Projection-only models
+    /// carry no fit variance and therefore report zero ratios.
     pub fn explained_variance_ratio(&self) -> Vec<f64> {
-        let total = if self.total_variance > 0.0 {
-            self.total_variance
-        } else {
-            self.eigenvalues.iter().copied().sum()
-        };
-        if total > 0.0 {
+        if self.total_variance > 0.0 {
             self.eigenvalues
                 .iter()
-                .map(|&lambda| lambda / total)
+                .map(|&lambda| lambda / self.total_variance)
                 .collect()
         } else {
             vec![0.0; self.eigenvalues.len()]

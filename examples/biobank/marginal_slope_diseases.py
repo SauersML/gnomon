@@ -771,13 +771,6 @@ def load_sex(client: "bigquery.Client | None" = None, cdr: str | None = None) ->
             chosen = sidecar_candidates[-1]
             print(f"  sex: reusing sidecar cache {chosen}")
             path = chosen
-    if not path.exists():
-        legacy_dir = Path.home() / ".aou_cache" / "sex_terms"
-        legacy_hits = sorted(legacy_dir.glob("sex_*.tsv"), key=lambda p: p.stat().st_mtime) if legacy_dir.is_dir() else []
-        if legacy_hits:
-            legacy = legacy_hits[-1]
-            print(f"  sex: reusing legacy cache {legacy}")
-            path = legacy
     # 2. Otherwise pull from AoU's OMOP person table (also instant; canonical).
     if not path.exists() and client is not None and cdr:
         df = _load_sex_from_aou(client, cdr)
@@ -2054,33 +2047,14 @@ def _extract_binary_mean(prediction: object) -> np.ndarray:
     )
 
 
-def _wilson_ci(k: int, n: int, z: float = 1.959963984540054) -> tuple[float, float]:
-    """Wilson 95% interval for a binomial rate (trusted-lib backed).
-
-    Delegates to ``scipy.stats.binomtest(k, n).proportion_ci(method='wilson')``,
-    which is the standard Wilson score interval. The legacy ``z`` argument is
-    retained for signature compatibility; callers only ever pass the 95%
-    default (z=1.95996...), for which scipy's confidence_level=0.95 is exactly
-    equivalent. A non-default z falls back to the closed form so the contract
-    never silently changes.
-    """
+def _wilson_ci(k: int, n: int) -> tuple[float, float]:
+    """Wilson 95% interval for a binomial rate."""
     if n <= 0:
         return float("nan"), float("nan")
-    # scipy's Wilson interval is parameterized by confidence level, which maps
-    # 1:1 to the 95% default z. Use it for the (only) production path; keep the
-    # closed form for any non-95% z so behavior is identical to before.
-    if abs(z - 1.959963984540054) < 1e-9:
-        try:
-            from scipy.stats import binomtest
-            ci = binomtest(int(k), int(n)).proportion_ci(method="wilson")
-            return float(ci.low), float(ci.high)
-        except Exception:  # noqa: BLE001 -- never raise from a metric helper
-            pass
-    phat = k / n
-    denom = 1.0 + z * z / n
-    center = (phat + z * z / (2 * n)) / denom
-    half = z * np.sqrt(phat * (1 - phat) / n + z * z / (4 * n * n)) / denom
-    return center - half, center + half
+    from scipy.stats import binomtest
+
+    ci = binomtest(int(k), int(n)).proportion_ci(method="wilson")
+    return float(ci.low), float(ci.high)
 
 
 def calibration_coverage(y: np.ndarray, p: np.ndarray, bins: int = 10,
@@ -3572,7 +3546,7 @@ def main() -> None:
         pred_cache_path = FIT_CACHE_DIR / f"{name}__{mode}__{sig}.pred.npz"
         if cache_path.exists() and cache_path.stat().st_size > 0:
             if mode == "binary" and not pred_cache_path.exists():
-                print(f"\n=== {name.upper()} (legacy log cache lacks prediction sidecar; "
+                print(f"\n=== {name.upper()} (incomplete cache lacks prediction sidecar; "
                       f"refreshing metrics, sig={sig}) ===")
             else:
                 print(f"\n=== {name.upper()} (CACHED fit reused, sig={sig}) ===")

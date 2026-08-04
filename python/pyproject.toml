@@ -29,16 +29,11 @@ classifiers = [
 Homepage = "https://github.com/SauersML/gnomon"
 Issues = "https://github.com/SauersML/gnomon/issues"
 
-[project.optional-dependencies]
-pandas = ["pandas>=1.5"]
-test = ["pytest>=7"]
-
 [tool.maturin]
 # The Rust crate lives at the repo root; build the `python` feature into the
 # `cdylib`, which produces the native in-process extension module imported as
-# `gnomon._gnomon`. `python-source = "."` makes the adjacent `gnomon/` directory
-# the Python package, so the pure-Python wrapper modules ship in the same wheel
-# and the compiled extension is dropped in alongside them.
+# `gnomon._gnomon`. `python-source = "."` puts the package initializer beside
+# that extension in the wheel.
 manifest-path = "../Cargo.toml"
 module-name = "gnomon._gnomon"
 python-source = "."

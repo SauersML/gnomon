@@ -81,8 +81,7 @@ def filter_noise(logs):
 def get_run_info():
     """
     Retrieves status and logs.
-    First checks for local environment variables provided by the workflow.
-    Falls back to fetching from GitHub API (legacy behavior, or for manual runs).
+    Reads the local status and log path supplied by the workflow.
     """
     print("\n--- Getting Run Info ---")
     
