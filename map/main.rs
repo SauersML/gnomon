@@ -31,6 +31,9 @@ pub enum MapCommand {
         /// Optional file of individual IDs (one IID per line) restricting the
         /// fit to a sample subset — a within-ancestry PCA, for instance.
         keep: Option<PathBuf>,
+        /// Optional cap on how many variants the fit reads, taken as an evenly
+        /// spaced subsample of whatever the variant selection left.
+        markers: Option<usize>,
         components: usize,
         maf: Option<f64>,
         ld: Option<LdWindow>,
@@ -126,6 +129,7 @@ pub fn run(command: MapCommand) -> Result<(), MapDriverError> {
             genotype_path,
             variant_list,
             keep,
+            markers,
             components,
             maf,
             ld,
@@ -133,6 +137,7 @@ pub fn run(command: MapCommand) -> Result<(), MapDriverError> {
             &genotype_path,
             variant_list.as_deref(),
             keep.as_deref(),
+            markers,
             components,
             maf,
             ld,
@@ -149,6 +154,7 @@ fn run_fit(
     genotype_path: &Path,
     variant_list: Option<&Path>,
     keep: Option<&Path>,
+    markers: Option<usize>,
     components: usize,
     maf: Option<f64>,
     ld: Option<LdWindow>,
@@ -275,6 +281,16 @@ fn run_fit(
                 selection_plan = SelectionPlan::ByKeys(Arc::new(filter));
             }
         }
+    }
+
+    // Thinning is applied last, so it composes with `--list`: the marker budget
+    // subsamples whatever the variant selection left rather than competing with
+    // it. An evenly spaced stride is deliberate — a contiguous prefix would fit
+    // the PCA to one end of the genome, and a random draw would make the model
+    // depend on a seed for no benefit, since variant order is already arbitrary
+    // with respect to ancestry.
+    if let Some(budget) = markers {
+        selection_plan = thin_selection_plan(&dataset, selection_plan, budget)?;
     }
 
     let is_vcf_like = matches!(dataset, GenotypeDataset::Variants(_));
@@ -494,6 +510,101 @@ fn run_fit(
     println!("  • Score metadata  : {}", scores_metadata_path.display());
 
     Ok(())
+}
+
+/// Caps the fit's variant count by taking an evenly spaced subsample.
+///
+/// Fitting a PCA basis does not need every marker: the leading axes are a
+/// property of the cohort, and a few hundred thousand markers estimate them as
+/// well as several million while costing proportionally less in every stage —
+/// I/O, decode, covariance and loadings all scale linearly in the variant count.
+/// What thinning does *not* do is shrink the model's usefulness for projection
+/// beyond the markers it kept, so a thinned model can only project onto the
+/// variants it was fitted on.
+///
+/// Two interactions are worth stating. With `--list`, thinning applies to the
+/// already-selected set, so the budget is honoured rather than fought over. With
+/// `--ld --sites_window`, thinned variants are no longer genomic neighbours, so
+/// a window counted in *sites* spans a far larger stretch of sequence than it
+/// appears to; `--bp_window` keeps its meaning and is the right pairing.
+fn thin_selection_plan(
+    dataset: &GenotypeDataset,
+    plan: SelectionPlan,
+    budget: usize,
+) -> Result<SelectionPlan, MapDriverError> {
+    if budget == 0 {
+        return Err(MapDriverError::InvalidState(
+            "--markers must retain at least one variant".into(),
+        ));
+    }
+
+    // Evenly spaced positions across `available`, inclusive of both ends, chosen
+    // by exact integer arithmetic so the same request always yields the same
+    // markers on every machine.
+    fn stride_indices(available: usize, budget: usize) -> Vec<usize> {
+        (0..budget)
+            .map(|slot| slot.saturating_mul(available) / budget)
+            .collect()
+    }
+
+    match plan {
+        SelectionPlan::All => {
+            let available = dataset.n_variants();
+            if available == 0 || available <= budget {
+                println!(
+                    "Marker budget {budget} is at or above the {available} available variants;                      using all of them."
+                );
+                return Ok(SelectionPlan::All);
+            }
+            println!("Marker budget: fitting on {budget} of {available} variants.");
+            Ok(SelectionPlan::ByIndices(stride_indices(available, budget)))
+        }
+        SelectionPlan::ByIndices(indices) => {
+            if indices.len() <= budget {
+                return Ok(SelectionPlan::ByIndices(indices));
+            }
+            println!(
+                "Marker budget: fitting on {budget} of {} selected variants.",
+                indices.len()
+            );
+            let picked = stride_indices(indices.len(), budget)
+                .into_iter()
+                .map(|slot| indices[slot])
+                .collect();
+            Ok(SelectionPlan::ByIndices(picked))
+        }
+        SelectionPlan::Ordered(selection) => {
+            if selection.indices.len() <= budget {
+                return Ok(SelectionPlan::Ordered(selection));
+            }
+            println!(
+                "Marker budget: fitting on {budget} of {} matched variants.",
+                selection.indices.len()
+            );
+            let slots = stride_indices(selection.indices.len(), budget);
+            let indices = slots.iter().map(|&slot| selection.indices[slot]).collect();
+            let match_kinds = slots
+                .iter()
+                .map(|&slot| selection.match_kinds[slot])
+                .collect();
+            Ok(SelectionPlan::Ordered(OrderedSelectionPlan::new(
+                indices,
+                match_kinds,
+            )))
+        }
+        SelectionPlan::ByKeys(filter) => {
+            // A key-matched stream has no index to stride over: which variants
+            // exist is only known once the file has been read, which is the very
+            // cost the budget exists to avoid. Refusing is better than silently
+            // ignoring the flag.
+            let _ = filter;
+            Err(MapDriverError::InvalidState(
+                "--markers needs an indexed genotype source (PLINK/PGEN); for a streamed \
+                 VCF/BCF, thin the variant list passed to --list instead"
+                    .into(),
+            ))
+        }
+    }
 }
 
 /// Wraps a dataset block source so the fit sees only the retained sample rows.

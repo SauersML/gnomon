@@ -125,6 +125,87 @@ def run_fit(binary: Path, data: Path, components: int, extra: list[str]) -> dict
     return {"seconds": elapsed, "notes": notes}
 
 
+
+def read_scores_bin(path: Path):
+    """Read a gnomon GNPRJ001 score matrix: (row_ids, scores).
+
+    The container is self-describing on purpose — the row IDs travel inside the
+    same artifact as the numbers, so a score matrix can never be silently paired
+    with the wrong sample list.
+    """
+    raw = path.read_bytes()
+    if raw[:8] != b"GNPRJ001":
+        raise ValueError(f"{path} is not a GNPRJ001 matrix")
+    rows = int.from_bytes(raw[12:20], "little")
+    cols = int.from_bytes(raw[20:28], "little")
+    header_len = 32
+    data_bytes = rows * cols * 8
+    scores = np.frombuffer(raw[header_len:header_len + data_bytes], dtype="<f8")
+    # Column-major on disk.
+    scores = scores.reshape(cols, rows).T
+
+    ids_offset = header_len + data_bytes
+    if raw[ids_offset:ids_offset + 8] != b"GNPSID01":
+        raise ValueError("row-id section missing or malformed")
+    count = int.from_bytes(raw[ids_offset + 16:ids_offset + 24], "little")
+    offsets_at = ids_offset + 32
+    offsets = np.frombuffer(raw[offsets_at:offsets_at + 8 * (count + 1)], dtype="<u8")
+    strings_at = offsets_at + 8 * (count + 1)
+    blob = raw[strings_at:]
+    row_ids = [blob[offsets[i]:offsets[i + 1]].decode() for i in range(count)]
+    return row_ids, scores
+
+
+def verify_structure(prefix: Path, components: int) -> int:
+    """Check that the fit recovered the structure the data was built with.
+
+    A solver can converge, report tiny residuals, and still be wrong — every
+    numerical certificate in the fit is a statement about the operator it was
+    handed, not about whether the answer means anything. The generated cohort has
+    known population labels, so the leading PCs must separate them. This is the
+    end-to-end check that unit tests on synthetic operators cannot make.
+
+    The statistic is the between-population share of variance along each PC
+    (a one-way ANOVA eta-squared). Under the generated Fst the leading axes
+    should carry a large share; a PC that separates nothing has a share near the
+    noise floor of 1/(populations-1).
+    """
+    scores_path = prefix.parent / f"{prefix.name}.hwe_scores.bin"
+    if not scores_path.exists():
+        # `fit` writes next to the genotype file; tolerate either layout.
+        scores_path = prefix.parent / "hwe_scores.bin"
+    row_ids, scores = read_scores_bin(scores_path)
+
+    labels = {}
+    with open(f"{prefix}.fam") as fam:
+        for line in fam:
+            fields = line.split()
+            labels[fields[1]] = fields[0]
+
+    groups = np.array([labels[iid] for iid in row_ids])
+    distinct = sorted(set(groups))
+    print(f"{len(row_ids)} samples, {scores.shape[1]} PCs, "
+          f"{len(distinct)} populations")
+
+    recovered = 0
+    for pc in range(min(components, scores.shape[1])):
+        column = scores[:, pc]
+        grand = column.mean()
+        between = sum(np.sum(groups == g) * (column[groups == g].mean() - grand) ** 2
+                      for g in distinct)
+        total = np.sum((column - grand) ** 2)
+        share = between / total if total > 0 else 0.0
+        flag = "structure" if share > 0.25 else "noise"
+        if share > 0.25:
+            recovered += 1
+        print(f"  PC{pc + 1}: between-population variance share {share:6.3f}  {flag}")
+
+    # K populations span a (K-1)-dimensional mean space, so that many PCs should
+    # carry real structure and the rest should not.
+    expected = len(distinct) - 1
+    print(f"structured PCs recovered: {recovered} (expected about {expected})")
+    return 0 if recovered >= expected else 1
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -144,12 +225,19 @@ def main(argv: list[str]) -> int:
     run.add_argument("--components", type=int, default=20)
     run.add_argument("--extra", nargs=argparse.REMAINDER, default=[])
 
+    check = sub.add_parser("verify", help="check the fit recovered the planted structure")
+    check.add_argument("--data", required=True, type=Path, help="PLINK prefix")
+    check.add_argument("--components", type=int, default=20)
+
     args = parser.parse_args(argv)
 
     if args.command == "generate":
         write_plink(args.out, args.samples, args.variants,
                     args.populations, args.fst, args.seed)
         return 0
+
+    if args.command == "verify":
+        return verify_structure(args.data, args.components)
 
     result = run_fit(args.binary, args.data, args.components, args.extra)
     print(f"seconds={result['seconds']:.1f}")

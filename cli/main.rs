@@ -115,6 +115,13 @@ struct FitArgs {
     #[arg(long, value_name = "PATH")]
     keep: Option<PathBuf>,
 
+    /// Cap the number of variants the fit reads, as an evenly spaced subsample.
+    /// Every fit stage scales linearly in the variant count, and the leading
+    /// axes are estimated well before the last marker is read. Applies after
+    /// --list, and needs an indexed source (PLINK/PGEN).
+    #[arg(long, value_name = "N")]
+    markers: Option<usize>,
+
     /// Number of principal components to retain when fitting the HWE PCA model
     #[arg(long, value_name = "N")]
     components: usize,
@@ -693,6 +700,7 @@ fn run_map_fit(args: FitArgs) -> Result<(), Box<dyn std::error::Error>> {
         genotype_path: args.genotype_path,
         variant_list: args.list,
         keep: args.keep,
+        markers: args.markers,
         components: args.components,
         maf,
         ld: ld_window,
