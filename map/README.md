@@ -51,6 +51,17 @@ Optional arguments:
   computed from the retained samples alone — a within-ancestry PCA needs no
   pre-subset callset. Retained samples keep their dataset order, and
   `samples.tsv` plus the score rows list exactly those samples.
+* `--markers <N>` – Cap the variants the fit reads, as an evenly spaced
+  subsample of whatever `--list` left. Every stage scales linearly in the
+  variant count while the leading axes are estimated well before the last
+  marker is read: on the benchmark cohort, a quarter of the markers ran 2.5×
+  faster and still recovered every structured component (between-population
+  variance 0.977 against 0.994 on the full set). The stride is exact integer
+  arithmetic, not a random draw, so the same request selects the same markers
+  everywhere. A thinned model can only project onto the markers it kept. Needs
+  an indexed source (PLINK/PGEN) — a streamed VCF has no index to stride over —
+  and pairs with `--bp_window` rather than `--sites_window`, since thinned
+  variants are no longer genomic neighbours.
 * `--maf <MAF>` – Retain only variants whose observed minor allele frequency in
   the fitting cohort is at least `MAF`. The threshold must be between `0` and
   `0.5`; filtering runs after `--list` and `--keep` selection and before LD
@@ -151,6 +162,39 @@ Lanczos: every pass advances every requested component at once.
   eigenspace and "the first exactly `k` PCs" is not a well-conditioned object.
   The solver widens its guard band rather than spending more passes on a
   distinction the data does not support.
+
+### What this costs, measured
+
+On a synthetic cohort with five populations at Fst 0.02 — 250,000 samples by
+20,000 variants, PLINK, 20 components, one machine, identical data — comparing
+the vector-at-a-time solver against the block solver
+(`scripts/bench_fit_solver.py` generates the cohort and runs both):
+
+| | wall clock | CPU | peak RSS | structure recovered |
+| --- | --- | --- | --- | --- |
+| vector-at-a-time | >31 min, still in covariance | 100% (one core) | 3.2 GB | — |
+| block Krylov | **2 min 34 s**, all stages | 2157% (~21 cores) | 11.8 GB | 4/4 PCs, 0.994 |
+| block Krylov, `--markers 5000` | **1 min 01 s** | 2011% | 10.2 GB | 4/4 PCs, 0.977 |
+
+Two things in that table matter more than the ratio. The old solver pins one
+core no matter how many are available — one column per pass leaves nothing to
+parallelize — while a block is a GEMM, which is why the same work spreads across
+twenty. And the memory is the honest cost of the trade: most of the difference
+is the two `n × tile_width` f64 decode tiles, 8.2 GB at this sample count, plus
+the retained Krylov basis.
+
+"Structure recovered" is the check that the numbers mean anything. Five
+populations span a four-dimensional space of means, so exactly four components
+should carry between-population variance and the rest should be noise; the
+figure is that share on the leading axes. Residuals and subspace deltas are
+statements about the operator the solver was handed, not about whether the
+answer is the right one, so the fit is also checked against the structure the
+cohort was built with (`bench_fit_solver.py verify`).
+
+A caveat worth stating: at this size the genotypes sit in page cache, so the
+comparison is dominated by decode and arithmetic rather than by disk. Block
+Krylov's advantage grows when reads actually reach storage, because that is the
+cost that scales with pass count.
 
 ### The starting vector is not the all-ones vector
 
