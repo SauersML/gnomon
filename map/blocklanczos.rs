@@ -500,31 +500,48 @@ pub fn block_krylov_eigen<Op: BlockOperator>(
             let mut coefficients = Mat::<f64>::zeros(dim, guard);
             copy_into(&mut coefficients, s.as_ref(), dim, guard);
 
+            // Compared on the leading columns the two iterations have in
+            // common, not on an exact column-count match. `certified` is
+            // cluster-aware, so it moves as Ritz values settle around the
+            // requested boundary — and requiring the counts to be equal made
+            // any movement fall through to infinity, which left `subspace_ok`
+            // permanently false and meant convergence could never be declared
+            // at all. Measured on a 250k-sample fit: `subspace_delta` came out
+            // infinite after eight passes, so the run reported non-convergence
+            // no matter how small its residuals were.
+            //
+            // The leading Ritz vectors are the stable part of both subspaces,
+            // so comparing `min(prior, current)` of them is the meaningful
+            // question — is the subspace we keep re-finding the same one — and
+            // it stays well defined while the guard band breathes.
             let subspace_delta = match &previous {
                 PreviousTop::Coefficients {
                     s: prior,
                     dim: prior_dim,
-                } if prior.ncols() == certified && *prior_dim <= dim => {
+                } if *prior_dim <= dim && prior.ncols() > 0 => {
+                    let shared_cols = prior.ncols().min(certified);
                     // `K_new`'s leading `prior_dim` columns are `K_old`, so
                     // truncating the new coefficients to those rows expresses
                     // both subspaces in the same basis.
                     let shared = coefficients
                         .as_ref()
-                        .subcols(0, certified)
+                        .subcols(0, shared_cols)
                         .subrows(0, *prior_dim);
-                    1.0 - mev(prior.as_ref(), shared, par)
+                    1.0 - mev(prior.as_ref().subcols(0, shared_cols), shared, par)
                 }
-                PreviousTop::Lifted(prior) if prior.ncols() == certified => {
+                PreviousTop::Lifted(prior) if prior.ncols() > 0 => {
+                    let shared_cols = prior.ncols().min(certified);
                     let lifted = lift_ritz_vectors(
                         &blocks,
-                        coefficients.as_ref().subcols(0, certified),
-                        certified,
+                        coefficients.as_ref().subcols(0, shared_cols),
+                        shared_cols,
                         width,
                         n,
                         par,
                     );
-                    1.0 - mev(prior.as_ref(), lifted.as_ref(), par)
+                    1.0 - mev(prior.as_ref().subcols(0, shared_cols), lifted.as_ref(), par)
                 }
+                // Only the first iteration has nothing to compare against.
                 _ => f64::INFINITY,
             };
             let mut carried = Mat::<f64>::zeros(dim, certified);
@@ -1157,7 +1174,7 @@ mod tests {
     /// reflector is as general a basis as a Haar-random one for this purpose.
     ///
     /// `spectrum` must be non-increasing, so that eigenvalue `i` and
-    /// [`ReflectedSpectrum::eigenvector`]`(i)` are the `i`-th largest pair.
+    /// `eigenvector(i)` are the `i`-th largest pair.
     struct ReflectedSpectrum {
         spectrum: Vec<f64>,
         reflector: Vec<f64>,
@@ -1171,7 +1188,7 @@ mod tests {
             square += raw[(row, 0)] * raw[(row, 0)];
         }
         let inv = square.sqrt().recip();
-        let reflector = (0..n).map(|row| raw[(row, 0)] * inv).collect();
+        let reflector: Vec<f64> = (0..n).map(|row| raw[(row, 0)] * inv).collect();
         ReflectedSpectrum {
             spectrum,
             reflector,
@@ -1419,7 +1436,12 @@ mod tests {
         }
         let op = reflected(spectrum.clone(), 19);
 
-        let params = BlockKrylovParams::auto(6, n, 1 << 30);
+        let mut params = BlockKrylovParams::auto(6, n, 1 << 30);
+        // Comfortably above the 1e-5 gap being planted and comfortably below the
+        // 0.6 gap on the far side of the pair, so which columns land in the
+        // cluster is decided by the spectrum rather than by how far the Ritz
+        // values have converged.
+        params.cluster_gap = 1e-2;
         let outcome = block_krylov_eigen(&op, 6, params, Par::Seq).expect("solver runs");
 
         assert!(outcome.truncation_splits_cluster);
@@ -1557,8 +1579,10 @@ mod tests {
         // Two exact duplicates: one inside a panel, one across a panel boundary,
         // since those take different paths through the blocking.
         for row in 0..n {
-            block[(row, 5)] = block[(row, 2)];
-            block[(row, 13)] = block[(row, 3)];
+            let inside = block[(row, 2)];
+            let across = block[(row, 3)];
+            block[(row, 5)] = inside;
+            block[(row, 13)] = across;
         }
         let original = block.clone();
 
@@ -1659,6 +1683,36 @@ mod tests {
                 "start column {col} carries a constant component: sum={sum}"
             );
         }
+    }
+
+    #[test]
+    fn the_subspace_criterion_can_actually_be_satisfied() {
+        // Regression: the subspace test used to require the certified column
+        // count to be identical between iterations. That count is
+        // cluster-aware, so it moves while the Ritz values settle, and any
+        // movement left the delta at infinity — which made `subspace_ok`
+        // permanently false and convergence unreachable regardless of how
+        // small the residuals were. A 250k-sample fit reported
+        // `subspace_delta = inf` after eight passes because of this.
+        //
+        // A clean, well-separated spectrum must therefore both converge and
+        // report a finite subspace delta.
+        let op = reflected(geometric(600, 0.86, 1.0), 41);
+
+        let params = BlockKrylovParams::auto(8, op.dim(), 1 << 30);
+        let outcome = block_krylov_eigen(&op, 8, params, Par::Seq).expect("solver runs");
+
+        assert!(
+            outcome.subspace_delta.is_finite(),
+            "subspace delta must be measurable after more than one iteration, got {}",
+            outcome.subspace_delta
+        );
+        assert!(
+            outcome.converged,
+            "a well-separated spectrum must be able to converge: \
+             residual {}, subspace delta {}",
+            outcome.max_relative_residual, outcome.subspace_delta
+        );
     }
 
     #[test]
