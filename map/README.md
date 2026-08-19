@@ -182,6 +182,29 @@ the vector-at-a-time solver against the block solver
 | block Krylov | **2 min 34 s**, all stages | 2157% (~21 cores) | 11.8 GB | 4/4 PCs, 0.994 |
 | block Krylov, `--markers 5000` | **1 min 01 s** | 2011% | 10.2 GB | 4/4 PCs, 0.977 |
 
+Asking for more components than the data contains changes the picture, and the
+fit says so rather than pretending otherwise. The same cohort has four real
+axes (five populations), so:
+
+| request | wall clock | passes | converged | worst residual | gap at the boundary |
+| --- | --- | --- | --- | --- | --- |
+| `--components 4` | 2 min 04 s | 5 | **yes** | 2.2e-9 | 0.990 |
+| `--components 20` | 2 min 51 s | 8 | no | 3.4e-2 | 0.0014 |
+
+At k=4 the boundary between PC4 and PC5 is a 99% gap — a clean separation — and
+the solve converges to nine digits. At k=20 the sixteen requested axes past the
+structure are degenerate noise with near-identical eigenvalues, the boundary gap
+collapses to 0.0014, and no amount of iteration can individually resolve them.
+That is a property of the question, not a defect in the answer, which is why the
+fit records `converged`, the residual and the boundary gap instead of silently
+returning twenty equally confident-looking components.
+
+Note also that the per-pass cost barely moved between those two runs (~17.7 s
+against ~17.1 s) while the block width went from 12 to 30. The dominant cost per
+pass is decoding and standardizing genotypes, not the block GEMM — which is why
+oversampling is close to free, and why the remaining performance work is in the
+decode path rather than in the linear algebra.
+
 Two things in that table matter more than the ratio. The old solver pins one
 core no matter how many are available — one column per pass leaves nothing to
 parallelize — while a block is a GEMM, which is why the same work spreads across
