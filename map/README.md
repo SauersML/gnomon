@@ -113,6 +113,67 @@ finer-grained monitoring is needed.
   samples back through `gnomon project` to recover them is neither necessary nor
   the same quantity. Row order matches `samples.tsv`.
 
+## The eigensolver, and why it is block-structured
+
+The fit's expensive resource is **a traversal of the genotype data**, not
+arithmetic. Everything in the solver follows from that.
+
+`gnomon` never forms the sample covariance `C = XXᵀ/(n−1)` in the streaming
+regime; it exposes only the product `Q ↦ CQ`, evaluated as `X(XᵀQ)` one variant
+tile at a time. Crucially that product costs **one pass whether `Q` has one
+column or fifty** — the pass is spent reading and standardizing genotypes, and
+the extra columns ride along inside the same tile.
+
+A vector-at-a-time Krylov method throws that away. It grows its search space by
+one column per operator application, so a 64-dimensional Krylov space costs 64
+whole-genome passes before restarts, spending the expensive resource to buy the
+cheap one. `map/blocklanczos.rs` replaces it with an adaptive randomized block
+Lanczos: every pass advances every requested component at once.
+
+* **Oversampling.** The block is `k + min(32, max(8, k/2))` columns wide. The
+  guard band beyond `k` is what makes `θ_{k+1}` observable, and extra columns
+  are paid for *inside* a pass while extra depth costs a whole new one.
+* **The projection is free.** The block recurrence's own coefficients assemble
+  `T = KᵀCK` directly, so Rayleigh–Ritz is an eigendecomposition of a few
+  hundred rows — no genotype access at all.
+* **Convergence is measured, not assumed.** The Lanczos identity
+  `CK = KT + Q_{j+1}B_jE_jᵀ` gives every Ritz pair's exact residual
+  `‖Cu − θu‖ = ‖B_j·s_tail‖` from the trailing block, again with no extra pass.
+  That is what makes an adaptive pass count possible instead of a fixed
+  iteration count chosen for someone else's dataset.
+* **Subspaces, not vectors.** Near-degenerate components rotate freely within
+  their eigenspace, so a per-vector test can report failure forever on a
+  subspace that has in fact settled. A second criterion tracks the mean
+  explained variance between successive top-`k` bases, which is invariant to
+  that rotation. Both must pass.
+* **A clustered `k/k+1` boundary is reported, not papered over.** When
+  `θ_k ≈ θ_{k+1}` the requested truncation cuts through a near-degenerate
+  eigenspace and "the first exactly `k` PCs" is not a well-conditioned object.
+  The solver widens its guard band rather than spending more passes on a
+  distinction the data does not support.
+
+### The starting vector is not the all-ones vector
+
+Every variant column is centered on its own observed allele frequency, with
+missing calls landing on zero, so each standardized column sums to zero:
+`Xᵀ1 = 0`, and therefore `C·1 = 0` **exactly**. The all-ones vector is precisely
+the sample covariance's null direction, and a Krylov sequence seeded with it —
+`1, C1, C²1, …` — is identically zero in exact arithmetic. Seeding with it
+"works" only because rounding leaves a little noise for the first application to
+amplify into a generic direction, which is a property of the floating-point
+error rather than of the algorithm. The start block is drawn from a fixed
+pseudo-random stream with the constant direction projected out, and the stream is
+fixed so that a fit reproduces bit-for-bit across runs and machines.
+
+### Memory follows the same logic
+
+A tile is `n_samples × tile_width` f64s and the operator holds two of them, so a
+fixed tile width that is reasonable at a thousand samples reserves gigabytes at
+half a million. Tile width is therefore derived from the sample count and the
+machine's memory, and deliberately *not* from measured throughput — two machines
+with the same memory must tile identically, or the same data would produce
+different arithmetic.
+
 ## High-dimensionality projection
 Because the biobank and the single individual are standardized on the same reference, the input feature scaling is consistent. However, projecting onto the fitted biobank principal components inherently subjects new data to spectral shrinkage, placing them in a compressed variance space relative to the training set. Attempting to reverse this requires estimating the genome's effective independent dimensionality, which is obscured by linkage disequilibrium. Consequently, gnomon avoids de-shrinkage or OADP/AP rotations, preferring a stable projection over the risk of inaccurate coordinate re-inflation and needless perturbation.
 

@@ -40,13 +40,42 @@ use sysinfo::System;
 
 pub const HWE_VARIANCE_EPSILON: f64 = 1.0e-12;
 pub const HWE_SCALE_FLOOR: f64 = 1.0e-6;
-const POPCOUNT_MAX_COLS: usize = 8;
+/// Right-hand-side columns handled per pass of the packed hard-call kernel.
+///
+/// Not a ceiling on block width: wider right-hand sides are processed in
+/// chunks of this many columns. It bounds the small on-stack projection buffer
+/// and how often the packed bytes are re-walked in the scatter phase.
+///
+/// `PACKED_RHS_MAX_COLS` keeps production below one chunk, so the chunk loop
+/// runs exactly once there. It stays anyway: the kernel is correct at any
+/// width, and `packed_hard_call_kernel_matches_the_general_path` exercises it
+/// across a chunk boundary so the loop cannot rot behind the gate.
+const PACKED_RHS_CHUNK_COLS: usize = 32;
+/// Widest right-hand side that still takes the packed hard-call kernel.
+///
+/// A throughput gate, not a correctness one — see the dispatch in
+/// [`StandardizedCovarianceOp::apply`].
+const PACKED_RHS_MAX_COLS: usize = 8;
 pub const EIGENVALUE_EPSILON: f64 = 1.0e-9;
 pub const DEFAULT_BLOCK_WIDTH: usize = 2_048;
 const DENSE_EIGEN_FALLBACK_THRESHOLD: usize = 64;
 const MAX_PARTIAL_COMPONENTS: usize = 512;
-const FALLBACK_GRAM_BUDGET_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// Pool assumed when the machine refuses to report its own memory.
+const FALLBACK_MEMORY_POOL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MIN_GRAM_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
+const MIN_KRYLOV_BASIS_BYTES: u64 = 256 * 1024 * 1024;
+const MIN_STREAMING_TILE_BYTES: u64 = 256 * 1024 * 1024;
+/// Samples above which the dense reference is never selected, whatever the work
+/// estimate says: past this its n³ eigendecomposition is minutes to hours and
+/// its n×n allocation is hundreds of megabytes duplicating data the streaming
+/// path never materializes at all.
+const DENSE_REFERENCE_MAX_SAMPLES: usize = 4_096;
+/// Flops per n³ for a symmetric eigendecomposition (tridiagonalization plus the
+/// QR sweep, with eigenvectors). Order-of-magnitude is all this needs to be.
+const DENSE_EIGEN_FLOPS_PER_CUBE: f64 = 10.0;
+/// Genome passes a converged block-Krylov solve typically needs. `min_passes`
+/// is 2 and `max_passes` 24; four is the middle of what actually converges.
+const ESTIMATED_KRYLOV_PASSES: f64 = 4.0;
 pub const DEFAULT_LD_WINDOW: usize = 51;
 const DEFAULT_LD_RIDGE: f64 = 1.0e-3;
 const MIN_LD_WEIGHT: f64 = 1.0e-6;
@@ -70,49 +99,198 @@ enum CovarianceComputationMode {
     Partial,
 }
 
-fn default_gram_budget_usize() -> usize {
-    default_gram_budget_bytes()
-        .min(usize::MAX as u64)
-        .try_into()
-        .unwrap()
+/// One memory pool for the whole fit, cut into named shares.
+///
+/// Every consumer used to size itself against its own fraction of *total* RAM:
+/// the Gram matrix took 75%, the source cache another 75%, the Krylov basis an
+/// eighth, the streaming tiles another eighth. Each obeyed its own budget and
+/// all four together could still exceed the machine — and none of them knew
+/// that the sample basis, the scores, the loadings, the LD ring buffer, the
+/// source mmaps, their page cache and allocator slack are resident at the same
+/// time. Independent budgets that do not know about each other are not budgets.
+///
+/// So: one pool, apportioned once, from *available* rather than total memory —
+/// what is free now is what a fit can actually spend — with a deliberate slice
+/// left unapportioned for everything this plan does not name.
+///
+/// Measured once per process, deliberately. Availability drifts while a fit
+/// runs, and a plan that re-measured would hand the same fit different tile
+/// widths at different moments — different tilings mean different summation
+/// order, and a fit that is not reproducible run to run is not a fit.
+struct FitMemoryPlan {
+    /// Dense n×n covariance. Only the small-problem reference path spends it.
+    gram_bytes: usize,
+    /// Opportunistic 2-bit or dense source cache. It buys speed and nothing
+    /// else, so it takes the largest share and is the first to be denied.
+    source_cache_bytes: usize,
+    /// Retained block-Krylov basis before a restart is forced.
+    krylov_basis_bytes: usize,
+    /// The streaming operator's two decode tiles plus its projection temp.
+    streaming_tile_bytes: usize,
 }
 
-fn default_gram_budget_bytes() -> u64 {
-    static DEFAULT_GRAM_BUDGET_BYTES: OnceLock<u64> = OnceLock::new();
+/// Fraction of available memory the plan is allowed to apportion at all. The
+/// remainder is headroom for the allocations no budget here can size.
+const FIT_POOL_PERCENT_OF_AVAILABLE: u64 = 70;
+// Shares of that pool, in percent, summing to 100.
+const GRAM_SHARE_PERCENT: u64 = 15;
+const SOURCE_CACHE_SHARE_PERCENT: u64 = 45;
+const KRYLOV_BASIS_SHARE_PERCENT: u64 = 25;
+const STREAMING_TILE_SHARE_PERCENT: u64 = 15;
 
-    *DEFAULT_GRAM_BUDGET_BYTES.get_or_init(compute_default_gram_budget_bytes)
+fn fit_memory_plan() -> &'static FitMemoryPlan {
+    static PLAN: OnceLock<FitMemoryPlan> = OnceLock::new();
+    PLAN.get_or_init(compute_fit_memory_plan)
 }
 
-fn compute_default_gram_budget_bytes() -> u64 {
-    match detect_total_memory_bytes() {
-        Some(total) if total > 0 => {
-            let target = total.saturating_mul(3) / 4;
-            target.max(MIN_GRAM_BUDGET_BYTES).min(total).max(1)
+fn compute_fit_memory_plan() -> FitMemoryPlan {
+    let (pool, cache_allowed) = match detect_memory_bytes() {
+        Some((total, available)) => {
+            // `available` already discounts what other processes hold; clamp it
+            // to `total` in case the two are reported inconsistently.
+            let usable = available.clamp(1, total);
+            (
+                usable.saturating_mul(FIT_POOL_PERCENT_OF_AVAILABLE) / 100,
+                true,
+            )
         }
-        _ => FALLBACK_GRAM_BUDGET_BYTES,
+        // Nothing measurable: assume a modest pool and refuse to cache the
+        // source, the one share whose overshoot buys only speed.
+        None => (FALLBACK_MEMORY_POOL_BYTES, false),
+    };
+
+    let share = |percent: u64, floor: u64| -> usize {
+        let bytes = (pool.saturating_mul(percent) / 100).max(floor);
+        bytes.min(usize::MAX as u64) as usize
+    };
+
+    FitMemoryPlan {
+        gram_bytes: share(GRAM_SHARE_PERCENT, MIN_GRAM_BUDGET_BYTES),
+        source_cache_bytes: if cache_allowed {
+            share(SOURCE_CACHE_SHARE_PERCENT, 0)
+        } else {
+            0
+        },
+        krylov_basis_bytes: share(KRYLOV_BASIS_SHARE_PERCENT, MIN_KRYLOV_BASIS_BYTES),
+        streaming_tile_bytes: share(STREAMING_TILE_SHARE_PERCENT, MIN_STREAMING_TILE_BYTES),
     }
 }
 
-fn detect_total_memory_bytes() -> Option<u64> {
+/// `(total, available)` bytes, or `None` when the platform reports neither.
+///
+/// A platform that reports a total but no availability is treated as "all of it
+/// is available": zero there means "unsupported", not "the machine is full".
+fn detect_memory_bytes() -> Option<(u64, u64)> {
     let mut system = System::new_all();
     system.refresh_memory();
     let total = system.total_memory();
-    if total == 0 { None } else { Some(total) }
+    if total == 0 {
+        return None;
+    }
+    let available = system.available_memory();
+    Some((total, if available == 0 { total } else { available }))
 }
 
 fn gram_matrix_budget_bytes() -> usize {
-    // Budget is auto-sized from detected system memory; see default_gram_budget_usize.
-    default_gram_budget_usize()
+    fit_memory_plan().gram_bytes
+}
+
+fn cache_budget_bytes() -> usize {
+    fit_memory_plan().source_cache_bytes
+}
+
+/// Byte budget for the retained block-Krylov basis.
+///
+/// The basis is `n × (block_width × depth)` f64s — for 500k samples, a 60-wide
+/// block and depth 4 that is ~0.9 GiB, which is a good trade against re-reading
+/// millions of variants. It is still bounded, because "a good trade" stops
+/// being true if the basis becomes the largest object in the process; past the
+/// budget the solver restarts from its current Ritz block instead of growing.
+fn krylov_basis_budget_bytes() -> usize {
+    fit_memory_plan().krylov_basis_bytes
+}
+
+fn streaming_tile_budget_bytes() -> usize {
+    fit_memory_plan().streaming_tile_bytes
 }
 
 fn gram_matrix_size_bytes(n: usize) -> Option<usize> {
     n.checked_mul(n)?.checked_mul(core::mem::size_of::<f64>())
 }
 
-fn covariance_computation_mode(n: usize, budget_bytes: usize) -> CovarianceComputationMode {
-    match gram_matrix_size_bytes(n) {
-        Some(bytes) if bytes <= budget_bytes => CovarianceComputationMode::Dense,
-        _ => CovarianceComputationMode::Partial,
+/// Chooses between forming the covariance and never forming it.
+///
+/// The old question — "does 8n² fit in a fraction of RAM?" — is the wrong one.
+/// At 100k samples the Gram is 74.5 GiB, which "fits" a 128 GiB machine, and
+/// the fit then spends O(p·n²) forming it and O(n³) decomposing it: an
+/// allocation that succeeds and a computation that never finishes.
+///
+/// Dense is a *reference* path — the exact, direct solve that the iterative one
+/// is checked against — so it is chosen on estimated **work**:
+///
+/// * dense costs `p·n²/2` to accumulate the symmetric Gram plus ~`10n³` to
+///   eigendecompose it;
+/// * the block solver never forms `C` at all: each pass streams the genome
+///   through two GEMMs of width `b` (`Xᵀq`, then `X(Xᵀq)`), costing
+///   `passes·2·p·n·b`.
+///
+/// Those cross at a few hundred samples for biobank-scale `p`, which is why
+/// dense must stop being selected long before it stops fitting in memory.
+/// Memory feasibility remains necessary — it is simply no longer sufficient.
+fn covariance_computation_mode(
+    n_samples: usize,
+    n_variants_hint: usize,
+    components: usize,
+    gram_budget_bytes: usize,
+) -> CovarianceComputationMode {
+    let Some(gram_bytes) = gram_matrix_size_bytes(n_samples) else {
+        return CovarianceComputationMode::Partial;
+    };
+    if gram_bytes > gram_budget_bytes || n_samples > DENSE_REFERENCE_MAX_SAMPLES {
+        return CovarianceComputationMode::Partial;
+    }
+
+    // At this size the whole Gram is tens of kilobytes and its decomposition is
+    // microseconds. The flop model below is asymptotic and says nothing useful
+    // here — fixed per-pass overheads dominate both routes — so the direct
+    // solve simply wins, and small fits stay off the knife edge where a change
+    // of constant would flip them onto the iterative path.
+    if n_samples <= DENSE_EIGEN_FALLBACK_THRESHOLD {
+        return CovarianceComputationMode::Dense;
+    }
+
+    let n = n_samples as f64;
+    // The same oversampling rule the solver will actually use, asked rather
+    // than re-derived, so the estimate cannot drift away from the solver.
+    let block_width = BlockKrylovParams::auto(components, n_samples, krylov_basis_budget_bytes())
+        .block_width as f64;
+
+    // Both streaming work and Gram accumulation are linear in the variant
+    // count, so per-variant is the form in which `p` cancels.
+    let dense_accumulation_per_variant = 0.5 * n * n;
+    let streaming_per_variant = ESTIMATED_KRYLOV_PASSES * 2.0 * n * block_width;
+
+    if n_variants_hint == 0 {
+        // A source that will not say how many variants it has (a streaming VCF
+        // before it has been counted) leaves the O(n³) eigendecomposition
+        // unpriceable — but not the rest. Dropping that term can only flatter
+        // dense, so deciding on the p-free half alone is the most generous
+        // answer that is still honest.
+        return if dense_accumulation_per_variant <= streaming_per_variant {
+            CovarianceComputationMode::Dense
+        } else {
+            CovarianceComputationMode::Partial
+        };
+    }
+
+    let p = n_variants_hint as f64;
+    let dense_flops = p * dense_accumulation_per_variant + DENSE_EIGEN_FLOPS_PER_CUBE * n * n * n;
+    let streaming_flops = p * streaming_per_variant;
+
+    if dense_flops <= streaming_flops {
+        CovarianceComputationMode::Dense
+    } else {
+        CovarianceComputationMode::Partial
     }
 }
 
@@ -935,7 +1113,10 @@ where
         let n_variants = source.n_variants();
         let bytes_per_variant = bytes_per_variant(n_samples);
         let packed_capacity = bytes_per_variant.saturating_mul(n_variants);
-        let state = if !enable_cache || n_samples == 0 {
+        let state = if !enable_cache
+            || n_samples == 0
+            || packed_capacity > cache_budget_bytes()
+        {
             CacheState::Disabled
         } else {
             CacheState::BuildingHardCall {
@@ -960,6 +1141,15 @@ where
         }
         let bytes_per_variant = bytes_per_variant(self.n_samples);
         let packed_capacity = bytes_per_variant.saturating_mul(self.n_variants);
+        // The dense fallback has always had a byte budget; the 2-bit path had
+        // none, so a biobank-scale fit would ask for the whole packed genotype
+        // matrix up front -- 200k samples x 1M variants is ~50 GiB -- and die
+        // in the allocator rather than degrade. Re-reading the source is slower
+        // than caching it, but it finishes.
+        if packed_capacity > cache_budget_bytes() {
+            self.state = CacheState::Disabled;
+            return;
+        }
         self.state = CacheState::BuildingHardCall {
             packed: Vec::with_capacity(packed_capacity),
             bytes_per_variant,
@@ -1377,16 +1567,6 @@ impl DenseCacheBuilder {
 
 fn data_offset(variant_idx: usize, n_samples: usize) -> usize {
     variant_idx.saturating_mul(n_samples)
-}
-
-fn cache_budget_bytes() -> usize {
-    match detect_total_memory_bytes() {
-        Some(total) if total > 0 => {
-            let target = total.saturating_mul(3) / 4;
-            target.min(usize::MAX as u64) as usize
-        }
-        _ => 0,
-    }
 }
 
 pub struct DenseBlockSource<'a> {
@@ -2430,6 +2610,79 @@ fn build_projection_model_cache(
     }
 }
 
+/// Which route produced the eigenpairs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FitSolver {
+    /// The covariance was formed and decomposed exactly.
+    Dense,
+    /// Adaptive randomized block Lanczos over the streaming operator.
+    BlockKrylov,
+}
+
+/// How the eigensolver terminated, recorded on the model and serialized with it.
+///
+/// A fit that ran out of passes short of its tolerance used to leave a line on
+/// stderr and an artifact byte-indistinguishable from a converged one. In a
+/// scientific pipeline that is the dangerous failure: the scores are wrong by an
+/// unknown amount, the file says nothing, and whoever reads it a year later has
+/// no way to find out. Everything needed to judge the solve therefore travels
+/// with the solve.
+///
+/// The measured quantities are `Option` because a route that does not measure
+/// one must say so. Reporting an unmeasured residual as `0.0` would read as
+/// "perfectly converged", which is the same lie in a different font.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct FitDiagnostics {
+    pub solver: FitSolver,
+    /// Whether every stopping criterion was met. `false` means the components
+    /// are the best estimate available, not a finished answer.
+    pub converged: bool,
+    /// Passes over the genome, i.e. applications of the streaming operator.
+    pub passes: usize,
+    /// Worst relative Ritz residual `‖Cu − θu‖ / θ` over the returned pairs.
+    #[serde(default)]
+    pub max_relative_residual: Option<f64>,
+    /// `1 − MEV` between the final two top-k Ritz subspaces.
+    #[serde(default)]
+    pub subspace_delta: Option<f64>,
+    /// `(θ_k − θ_{k+1}) / θ_k` at the requested boundary, when it was observed.
+    /// A small gap means PC k and PC k+1 are not individually identified, which
+    /// no amount of extra iteration fixes.
+    #[serde(default)]
+    pub boundary_gap: Option<f64>,
+    /// Times the Krylov basis was restarted under its memory budget.
+    pub restarts: usize,
+}
+
+impl FitDiagnostics {
+    /// The dense reference path decomposes the covariance directly: there is no
+    /// iteration to report, nothing left to converge, and exactly one traversal
+    /// of the genome behind the answer.
+    fn exact_dense() -> Self {
+        Self {
+            solver: FitSolver::Dense,
+            converged: true,
+            passes: 1,
+            max_relative_residual: None,
+            subspace_delta: None,
+            boundary_gap: None,
+            restarts: 0,
+        }
+    }
+
+    /// The in-core partial solve over an already-formed Gram: still one genome
+    /// pass, but the eigenpairs themselves come from an iteration that can stop
+    /// short of the requested count.
+    fn dense_partial(converged: bool) -> Self {
+        Self {
+            solver: FitSolver::Dense,
+            converged,
+            ..Self::exact_dense()
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct HwePcaModel {
     n_samples: usize,
@@ -2449,6 +2702,10 @@ pub struct HwePcaModel {
     variant_keys: Option<Vec<VariantKey>>,
     ld: Option<LdWeights>,
     genome_build: Option<String>,
+    /// How the eigensolve terminated. `None` on projection-only stubs and on
+    /// models deserialized from files written before this was recorded, which
+    /// is exactly the population whose convergence is genuinely unknown.
+    diagnostics: Option<FitDiagnostics>,
     projection_cache: Arc<ProjectionModelCache>,
 }
 
@@ -2521,10 +2778,16 @@ impl HwePcaModel {
 
         let ld_config = options.resolved_ld(ld_hint)?;
 
-        // Determine whether to use dense or matrix-free path based on memory budget
+        // Dense or matrix-free is a question about work, not about whether an
+        // n×n allocation happens to fit; see `covariance_computation_mode`.
         let gram_budget = gram_matrix_budget_bytes();
         let gram_bytes = gram_matrix_size_bytes(n_samples);
-        let gram_mode = covariance_computation_mode(n_samples, gram_budget);
+        let gram_mode = covariance_computation_mode(
+            n_samples,
+            n_variants_hint,
+            target_components,
+            gram_budget,
+        );
 
         let mut cached_source = CachedVariantBlockSource::new(
             source,
@@ -2532,20 +2795,33 @@ impl HwePcaModel {
         );
         let source = &mut cached_source;
 
-        // Compute LD weights first if requested (applies to both paths)
-        let (ld_weights_arc, ld_weights) = if let Some(ld_cfg) = ld_config {
-            let (_, _, ld_weights_computed) = compute_stats_and_ld_weights(
-                source,
-                block_capacity,
-                ld_cfg,
-                n_variants_hint,
-                progress,
-                par,
-            )?;
+        // Compute LD weights first if requested (applies to both paths).
+        //
+        // That pass streams every variant through a `VariantStatsCache`, so it
+        // ends holding exactly the scaler and observed-variant count the fit
+        // needs next — same source, same block width, same variant order, same
+        // `ensure_statistics` arithmetic, and the source cache it warmed serves
+        // both. Recomputing them costs a second full traversal of the genome to
+        // arrive at a bit-identical answer, which at 500k variants is not a
+        // micro-optimization but a whole redundant read of the dataset.
+        let (ld_weights_arc, ld_weights, ld_pass_stats) = if let Some(ld_cfg) = ld_config {
+            let (ld_scaler, ld_observed_variants, ld_weights_computed) =
+                compute_stats_and_ld_weights(
+                    source,
+                    block_capacity,
+                    ld_cfg,
+                    n_variants_hint,
+                    progress,
+                    par,
+                )?;
             let ld_arc = Arc::<[f64]>::from(ld_weights_computed.weights.clone().into_boxed_slice());
-            (Some(ld_arc), Some(ld_weights_computed))
+            (
+                Some(ld_arc),
+                Some(ld_weights_computed),
+                Some((ld_scaler, ld_observed_variants)),
+            )
         } else {
-            (None, None)
+            (None, None, None)
         };
 
         // Reset source after LD computation
@@ -2558,7 +2834,13 @@ impl HwePcaModel {
         // Choose between dense and matrix-free paths
         let (decomposition, scaler, observed_variants) = match gram_mode {
             CovarianceComputationMode::Dense => {
-                // PATH A: Dense - Use fused pass for small/medium datasets
+                // PATH A: Dense - the exact reference solve, for problems small
+                // enough that forming C is the cheaper way to get it.
+                //
+                // This path does not reuse `ld_pass_stats`: it recomputes the
+                // statistics inside the traversal it has to make anyway to
+                // accumulate the covariance, so there is no pass to save, and
+                // the fused loop stays a single self-contained pass.
                 let (scaler, observed_variants, covariance) =
                     compute_stats_and_covariance_blockwise(
                         source,
@@ -2606,6 +2888,7 @@ impl HwePcaModel {
                         Eigenpairs {
                             values: selected_values,
                             vectors: selected_vectors,
+                            diagnostics: Some(FitDiagnostics::exact_dense()),
                         }
                     }
                     Err(e) => {
@@ -2621,23 +2904,31 @@ impl HwePcaModel {
             CovarianceComputationMode::Partial => {
                 // PATH B: Matrix-free - For biobank-scale datasets
                 log::info!(
-                    "Using matrix-free eigensolver (Gram matrix would require {} bytes)",
+                    "Using matrix-free eigensolver (forming the Gram matrix would take {} bytes \
+                     and O(p·n²) work)",
                     gram_bytes.unwrap_or(usize::MAX)
                 );
 
-                // First pass: compute statistics only
-                progress.on_stage_start(FitProgressStage::AlleleStatistics, n_variants_hint);
-                let stats_progress = StageProgressHandle::new(
-                    Arc::clone(progress),
-                    FitProgressStage::AlleleStatistics,
-                );
-                let (scaler, observed_variants) = compute_variant_statistics(
-                    source,
-                    block_capacity,
-                    par,
-                    stats_progress,
-                    n_variants_hint,
-                )?;
+                // Statistics: reused from the LD pass when there was one,
+                // computed in a pass of their own when there was not.
+                let (scaler, observed_variants) = match ld_pass_stats {
+                    Some(stats) => stats,
+                    None => {
+                        progress
+                            .on_stage_start(FitProgressStage::AlleleStatistics, n_variants_hint);
+                        let stats_progress = StageProgressHandle::new(
+                            Arc::clone(progress),
+                            FitProgressStage::AlleleStatistics,
+                        );
+                        compute_variant_statistics(
+                            source,
+                            block_capacity,
+                            par,
+                            stats_progress,
+                            n_variants_hint,
+                        )?
+                    }
+                };
 
                 // Setup matrix-free operator
                 let operator = StandardizedCovarianceOp::new(
@@ -2738,6 +3029,7 @@ impl HwePcaModel {
             variant_keys: None,
             ld: ld_weights,
             genome_build: None,
+            diagnostics: decomposition.diagnostics,
             projection_cache,
         })
     }
@@ -2840,6 +3132,15 @@ impl HwePcaModel {
         self.genome_build.as_deref()
     }
 
+    /// How the eigensolve that produced this model terminated.
+    ///
+    /// `None` means the record is genuinely unavailable — a projection-only
+    /// stub, or a model serialized before fits carried one — and specifically
+    /// *not* that the fit converged.
+    pub fn fit_diagnostics(&self) -> Option<&FitDiagnostics> {
+        self.diagnostics.as_ref()
+    }
+
     pub fn set_genome_build(&mut self, build: Option<String>) {
         self.genome_build = build;
     }
@@ -2911,6 +3212,10 @@ impl HwePcaModel {
             variant_keys,
             ld,
             genome_build,
+            // A projection-only stub carries loadings and nothing about the fit
+            // that produced them; inventing a convergence record here would be
+            // asserting something this constructor cannot know.
+            diagnostics: None,
             projection_cache,
         })
     }
@@ -3084,10 +3389,24 @@ where
             return;
         }
 
-        if rhs.ncols() <= POPCOUNT_MAX_COLS {
-            if self.try_apply_hardcall_packed(out.rb_mut(), rhs) {
-                return;
-            }
+        // Narrow right-hand sides only — a throughput gate, not a correctness
+        // one. The packed kernel is a serial walk over variants with no rayon
+        // anywhere in it; what it buys is never materializing an f64 tile, and
+        // that only pays while there are a handful of columns to project. The
+        // general path below decodes a tile and hands it to faer's `matmul`
+        // with `par`, which is parallel across every core.
+        //
+        // Past a few columns the trade reverses decisively: a block solver
+        // asking for ~30 columns would run 30× the per-pass work on one core
+        // while the tile path spreads the same work over all of them. A
+        // measured baseline fit sat at 104% CPU — one core — for exactly this
+        // reason. Enabling the packed kernel for wide blocks is a pessimization.
+        //
+        // The real fix is to parallelize the kernel over disjoint sample ranges
+        // (a reduction to form the projection, then a disjoint scatter), after
+        // which this gate can go. Until then it stays.
+        if rhs.ncols() <= PACKED_RHS_MAX_COLS && self.try_apply_hardcall_packed(out.rb_mut(), rhs) {
+            return;
         }
 
         let block_len = self.n_samples * self.block_capacity;
@@ -3290,6 +3609,10 @@ where
 struct Eigenpairs {
     values: Vec<f64>,
     vectors: Mat<f64>,
+    /// How these pairs were obtained. `None` only on the degenerate returns
+    /// where no solve was attempted at all — every one of which leaves the
+    /// values empty and so ends the fit in an error before a model exists.
+    diagnostics: Option<FitDiagnostics>,
 }
 
 #[derive(Debug)]
@@ -3331,55 +3654,38 @@ impl<'a> LinOp<f64> for DenseSymmetricOp<'a> {
 /// A tile is `n_samples × block_capacity` f64s, and the covariance operator
 /// holds **two** of them (the prefetch double-buffer) plus a projection temp.
 /// At the historical fixed 2048 that is ~3.3 GiB per buffer at 200k samples and
-/// ~8 GiB at 500k — scratch alone, before the Krylov basis. Tiles exist to
-/// amortize per-block overhead, which 256 variants already does; past that the
-/// width buys nothing and costs resident memory that the solver has better uses
-/// for.
+/// ~8 GiB at 500k — scratch alone, before the Krylov basis.
 ///
-/// The result is a pure function of `(n_samples, n_variants_hint)` and machine
-/// memory — deliberately *not* of measured throughput, so two machines with the
-/// same memory produce the same tiling and therefore the same arithmetic.
+/// The tile exists only to amortize per-block overhead, and there is nothing
+/// mathematically special about any particular width: the arithmetic is
+/// identical whatever the tiling. So the budget decides, all the way down. A
+/// former floor of 256 variants meant 2M samples still demanded ~7.6 GiB of
+/// scratch on a machine whose plan said it could afford a tenth of that; the
+/// only real floor is one variant, because a zero-width tile makes no progress.
+///
+/// The result is a pure function of `(n_samples, n_variants_hint)` and the fit
+/// memory plan — deliberately *not* of measured throughput, so two machines
+/// with the same memory produce the same tiling and the same arithmetic.
 fn adaptive_block_capacity(n_samples: usize, n_variants_hint: usize) -> usize {
-    const MIN_BLOCK_WIDTH: usize = 256;
-
     let cap = if n_samples == 0 {
         DEFAULT_BLOCK_WIDTH
     } else {
-        // Two decode buffers plus a projection temp; keep the trio inside an
-        // eighth of memory, matching the Krylov basis budget so the two cannot
-        // together claim the machine.
-        let budget = krylov_basis_budget_bytes();
+        // Two decode buffers plus a projection temp, inside the streaming-tile
+        // share of the one fit-level pool.
+        let budget = streaming_tile_budget_bytes();
         let bytes_per_variant = n_samples.saturating_mul(std::mem::size_of::<f64>());
         let affordable = if bytes_per_variant == 0 {
             DEFAULT_BLOCK_WIDTH
         } else {
             (budget / 3) / bytes_per_variant
         };
-        affordable.clamp(MIN_BLOCK_WIDTH, DEFAULT_BLOCK_WIDTH)
+        affordable.min(DEFAULT_BLOCK_WIDTH)
     };
 
     if n_variants_hint > 0 {
         min(cap.max(1), n_variants_hint)
     } else {
         cap.max(1)
-    }
-}
-
-/// Byte budget for the retained block-Krylov basis.
-///
-/// The basis is `n × (block_width × depth)` f64s — for 500k samples, a 60-wide
-/// block and depth 4 that is ~0.9 GiB, which is a good trade against re-reading
-/// millions of variants. It is still bounded, because "a good trade" stops
-/// being true if the basis becomes the largest object in the process; past the
-/// budget the solver restarts from its current Ritz block instead of growing.
-fn krylov_basis_budget_bytes() -> usize {
-    const FLOOR: usize = 256 * 1024 * 1024;
-    match detect_total_memory_bytes() {
-        Some(total) if total > 0 => {
-            let eighth = (total / 8).min(usize::MAX as u64) as usize;
-            eighth.max(FLOOR)
-        }
-        _ => FLOOR,
     }
 }
 
@@ -3457,6 +3763,7 @@ where
         return Ok(Eigenpairs {
             values: Vec::new(),
             vectors: Mat::zeros(0, 0),
+            diagnostics: None,
         });
     }
 
@@ -3465,6 +3772,7 @@ where
         return Ok(Eigenpairs {
             values: Vec::new(),
             vectors: Mat::zeros(n, 0),
+            diagnostics: None,
         });
     }
 
@@ -3473,6 +3781,7 @@ where
         return Ok(Eigenpairs {
             values: Vec::new(),
             vectors: Mat::zeros(n, 0),
+            diagnostics: None,
         });
     }
 
@@ -3505,6 +3814,19 @@ where
             other => HwePcaError::Eigen(other.to_string()),
         })?;
 
+    // The whole termination record, carried out with the eigenpairs so that the
+    // serialized model can answer "did this converge?" long after the warning
+    // below has scrolled off somebody's terminal.
+    let diagnostics = Some(FitDiagnostics {
+        solver: FitSolver::BlockKrylov,
+        converged: outcome.converged,
+        passes: outcome.passes,
+        max_relative_residual: Some(outcome.max_relative_residual),
+        subspace_delta: Some(outcome.subspace_delta),
+        boundary_gap: outcome.boundary_gap,
+        restarts: outcome.restarts,
+    });
+
     if !outcome.converged {
         // An unconverged subspace is reported as such rather than handed back
         // as though it were a finished fit.
@@ -3528,6 +3850,7 @@ where
         return Ok(Eigenpairs {
             values: Vec::new(),
             vectors: Mat::zeros(n, 0),
+            diagnostics,
         });
     }
 
@@ -3540,7 +3863,11 @@ where
         }
     }
 
-    Ok(Eigenpairs { values, vectors })
+    Ok(Eigenpairs {
+        values,
+        vectors,
+        diagnostics,
+    })
 }
 
 fn compute_covariance_eigenpairs_dense<S, P>(
@@ -3561,6 +3888,7 @@ where
         return Ok(Eigenpairs {
             values: Vec::new(),
             vectors: Mat::zeros(n, 0),
+            diagnostics: None,
         });
     }
 
@@ -3579,6 +3907,7 @@ where
             return Ok(Eigenpairs {
                 values: Vec::new(),
                 vectors: Mat::zeros(n, 0),
+                diagnostics: Some(FitDiagnostics::exact_dense()),
             });
         }
 
@@ -3598,7 +3927,11 @@ where
             }
         }
 
-        return Ok(Eigenpairs { values, vectors });
+        return Ok(Eigenpairs {
+            values,
+            vectors,
+            diagnostics: Some(FitDiagnostics::exact_dense()),
+        });
     }
 
     mirror_lower_to_upper(&mut covariance);
@@ -3640,6 +3973,7 @@ where
             return Ok(Eigenpairs {
                 values: Vec::new(),
                 vectors: Mat::zeros(n, 0),
+                diagnostics: Some(FitDiagnostics::dense_partial(false)),
             });
         }
 
@@ -3660,13 +3994,26 @@ where
             }
         }
 
+        // Retrying with a wider target is what the loop is for; giving up
+        // because the ceiling was reached is a fit that returned fewer
+        // components than were asked for, and the model must say so.
+        let diagnostics = Some(FitDiagnostics::dense_partial(keep >= top_k));
+
         if keep >= top_k || target >= upper_target {
-            return Ok(Eigenpairs { values, vectors });
+            return Ok(Eigenpairs {
+                values,
+                vectors,
+                diagnostics,
+            });
         }
 
         let next_target = (target * 2).min(upper_target);
         if next_target == target {
-            return Ok(Eigenpairs { values, vectors });
+            return Ok(Eigenpairs {
+                values,
+                vectors,
+                diagnostics,
+            });
         }
 
         target = next_target;
@@ -3979,11 +4326,44 @@ where
                 None => break,
             };
 
-            let mut proj = [0.0f64; POPCOUNT_MAX_COLS];
-            for col in 0..ncols {
-                let mut sum0 = 0.0f64;
-                let mut sum1 = 0.0f64;
-                let mut sum2 = 0.0f64;
+            // Wide right-hand sides are taken a chunk at a time so the
+            // projection buffer stays on the stack and the scatter phase walks
+            // the variant's bytes once per chunk rather than once per column.
+            let mut chunk_start = 0usize;
+            while chunk_start < ncols {
+                let chunk = (ncols - chunk_start).min(PACKED_RHS_CHUNK_COLS);
+                let mut proj = [0.0f64; PACKED_RHS_CHUNK_COLS];
+
+                for local in 0..chunk {
+                    let col = chunk_start + local;
+                    let mut sum0 = 0.0f64;
+                    let mut sum1 = 0.0f64;
+                    let mut sum2 = 0.0f64;
+
+                    let mut sample_idx = 0usize;
+                    for &byte in variant_bytes {
+                        if sample_idx >= n_samples {
+                            break;
+                        }
+                        let codes = &code_table[byte as usize];
+                        for offset in 0..4 {
+                            let idx = sample_idx + offset;
+                            if idx >= n_samples {
+                                break;
+                            }
+                            let val = rhs[(idx, col)];
+                            match codes[offset] {
+                                0 => sum0 += val,
+                                2 => sum1 += val,
+                                3 => sum2 += val,
+                                _ => {}
+                            }
+                        }
+                        sample_idx += 4;
+                    }
+
+                    proj[local] = (z0 * sum0 + z1 * sum1 + z2 * sum2) * coeff;
+                }
 
                 let mut sample_idx = 0usize;
                 for &byte in variant_bytes {
@@ -3996,45 +4376,22 @@ where
                         if idx >= n_samples {
                             break;
                         }
-                        let val = rhs[(idx, col)];
-                        match codes[offset] {
-                            0 => sum0 += val,
-                            2 => sum1 += val,
-                            3 => sum2 += val,
-                            _ => {}
+                        let z = match codes[offset] {
+                            0 => z0,
+                            2 => z1,
+                            3 => z2,
+                            _ => 0.0,
+                        };
+                        if z != 0.0 {
+                            for local in 0..chunk {
+                                out[(idx, chunk_start + local)] += z * proj[local];
+                            }
                         }
                     }
                     sample_idx += 4;
                 }
 
-                let p = (z0 * sum0 + z1 * sum1 + z2 * sum2) * coeff;
-                proj[col] = p;
-            }
-
-            let mut sample_idx = 0usize;
-            for &byte in variant_bytes {
-                if sample_idx >= n_samples {
-                    break;
-                }
-                let codes = &code_table[byte as usize];
-                for offset in 0..4 {
-                    let idx = sample_idx + offset;
-                    if idx >= n_samples {
-                        break;
-                    }
-                    let z = match codes[offset] {
-                        0 => z0,
-                        2 => z1,
-                        3 => z2,
-                        _ => 0.0,
-                    };
-                    if z != 0.0 {
-                        for col in 0..ncols {
-                            out[(idx, col)] += z * proj[col];
-                        }
-                    }
-                }
-                sample_idx += 4;
+                chunk_start += chunk;
             }
         }
 
@@ -4719,14 +5076,15 @@ struct LdWindowScratch {
 struct LdThreadScratch {
     window: LdWindowScratch,
     mask_f64: Mat<f64>,
+    /// Elementwise squares of the window's standardized genotypes, so the
+    /// pair-restricted sums of squares are one GEMM against the mask.
+    values_sq: Mat<f64>,
     gram: Mat<f64>,
     counts: Mat<f64>,
     sums: Mat<f64>,
     squared_sums: Mat<f64>,
     system: Mat<f64>,
     rhs: Mat<f64>,
-    sums_vec: Vec<f64>,
-    squared_vec: Vec<f64>,
 }
 
 impl LdThreadScratch {
@@ -4737,14 +5095,13 @@ impl LdThreadScratch {
                 masks: vec![0u8; n_samples * window_capacity],
             },
             mask_f64: Mat::zeros(n_samples, window_capacity),
+            values_sq: Mat::zeros(n_samples, window_capacity),
             gram: Mat::zeros(window_capacity, window_capacity),
             counts: Mat::zeros(window_capacity, window_capacity),
             sums: Mat::zeros(window_capacity, window_capacity),
             squared_sums: Mat::zeros(window_capacity, window_capacity),
             system: Mat::zeros(window_capacity, window_capacity),
             rhs: Mat::zeros(window_capacity, 1),
-            sums_vec: vec![0.0; window_capacity],
-            squared_vec: vec![0.0; window_capacity],
         }
     }
 }
@@ -4946,6 +5303,30 @@ fn assign_ready_weights<P: FitProgressObserver>(
     Ok(())
 }
 
+/// LD weight for the window's centre variant, on the **complete-pairs**
+/// convention: every statistic feeding a pair `(i, j)` is restricted to the
+/// samples where `i` and `j` are *both* observed.
+///
+/// Missing standardized genotypes are exactly zero, which is what makes this
+/// cheap. Writing `V` for the window's standardized values (zero where missing)
+/// and `M` for its 0/1 presence mask, every quantity the correlation needs is a
+/// GEMM whose sum silently drops the samples the pair does not share:
+///
+/// ```text
+/// gram[(i, j)]         = (VᵀV)[i, j]      = Σ_{s ∈ Aᵢ∩Aⱼ} vᵢ(s)·vⱼ(s)
+/// counts[(i, j)]       = (MᵀM)[i, j]      = |Aᵢ ∩ Aⱼ|
+/// sums[(i, j)]         = (VᵀM)[i, j]      = Σ_{s ∈ Aᵢ∩Aⱼ} vᵢ(s)
+/// squared_sums[(i, j)] = ((V∘V)ᵀM)[i, j]  = Σ_{s ∈ Aᵢ∩Aⱼ} vᵢ(s)²
+/// ```
+///
+/// The last two used to be computed once per variant over *all* of that
+/// variant's own observations and then reused unchanged for every partner. For
+/// markers missing in the same samples that is the same number; for markers
+/// missing in *different* samples it is not, and the result was a Pearson
+/// correlation whose cross-product and count came from the intersection while
+/// its centring and scaling came from the union — neither the complete-pairs
+/// correlation nor the mean-imputed one, and biased toward zero in proportion
+/// to how much the two markers' missingness patterns disagree.
 fn compute_ld_weight(
     ring: &LdRingBuffer,
     start: usize,
@@ -4963,14 +5344,29 @@ fn compute_ld_weight(
         .mask_f64
         .as_mut()
         .submatrix_mut(0, 0, ring.n_samples(), window_len);
+    let mut values_sq = scratch
+        .values_sq
+        .as_mut()
+        .submatrix_mut(0, 0, ring.n_samples(), window_len);
     for col in 0..window_len {
         let src = &masks[col * ring.n_samples()..(col + 1) * ring.n_samples()];
         let dst = mask_mat.rb_mut().col_mut(col);
         for (dst, &src_val) in dst.iter_mut().zip(src.iter()) {
             *dst = src_val as f64;
         }
+
+        let values_slice = values
+            .col(col)
+            .try_as_col_major()
+            .expect("LD window column must be contiguous")
+            .as_slice();
+        let dst = values_sq.rb_mut().col_mut(col);
+        for (dst, &src_val) in dst.iter_mut().zip(values_slice.iter()) {
+            *dst = src_val * src_val;
+        }
     }
     let mask_view = mask_mat.as_ref();
+    let values_sq_view = values_sq.as_ref();
 
     let mut gram = scratch
         .gram
@@ -5000,42 +5396,33 @@ fn compute_ld_weight(
         par,
     );
 
-    let sums_vec = &mut scratch.sums_vec[..window_len];
-    let squared_vec = &mut scratch.squared_vec[..window_len];
-
-    for col in 0..window_len {
-        let values_slice = values
-            .col(col)
-            .try_as_col_major()
-            .expect("LD window column must be contiguous")
-            .as_slice();
-        let mask_slice = &masks[col * ring.n_samples()..(col + 1) * ring.n_samples()];
-        let mut sum = 0.0;
-        let mut sq_sum = 0.0;
-        for (&value, &mask) in values_slice.iter().zip(mask_slice.iter()) {
-            if mask != 0 {
-                sum += value;
-                sq_sum += value * value;
-            }
-        }
-        sums_vec[col] = sum;
-        squared_vec[col] = sq_sum;
-    }
-
     let mut sums = scratch
         .sums
         .as_mut()
         .submatrix_mut(0, 0, window_len, window_len);
+    sums.fill(0.0);
+    matmul(
+        sums.as_mut(),
+        Accum::Replace,
+        values.transpose(),
+        mask_view,
+        1.0,
+        par,
+    );
+
     let mut squared_sums = scratch
         .squared_sums
         .as_mut()
         .submatrix_mut(0, 0, window_len, window_len);
-    for row in 0..window_len {
-        for col in 0..window_len {
-            sums[(row, col)] = sums_vec[col];
-            squared_sums[(row, col)] = squared_vec[col];
-        }
-    }
+    squared_sums.fill(0.0);
+    matmul(
+        squared_sums.as_mut(),
+        Accum::Replace,
+        values_sq_view.transpose(),
+        mask_view,
+        1.0,
+        par,
+    );
 
     let mut system = scratch
         .system
@@ -5132,6 +5519,15 @@ fn collect_ready_jobs(
     Ok(jobs)
 }
 
+/// Solves the ridge-regularized LD system for one window's centre variant.
+///
+/// Every argument is on the complete-pairs convention established by
+/// [`compute_ld_weight`], and the recentring below is only valid on it:
+/// `counts[(i, j)]` is the number of samples where `i` and `j` are both
+/// observed, and `sums`/`squared_sums` are *asymmetric* — row `i`, column `j`
+/// holds variant `i`'s statistic over exactly that shared set. Passing
+/// whole-variant sums here instead would recentre an intersection cross-product
+/// by union-scale moments.
 fn solve_ld_window_from_stats(
     gram: MatRef<'_, f64>,
     sums: MatRef<'_, f64>,
@@ -5154,18 +5550,21 @@ fn solve_ld_window_from_stats(
             for j in 0..i {
                 let count = counts[(i, j)];
                 let value = if count.is_finite() && count >= 2.0 {
-                    let sum_x = sums[(i, j)];
-                    let sum_y = sums[(j, i)];
-                    let cov = gram[(i, j)] - (sum_x * sum_y) / count;
-                    let var_x = squared_sums[(i, j)] - (sum_x * sum_x) / count;
-                    let var_y = squared_sums[(j, i)] - (sum_y * sum_y) / count;
+                    // Row-major reading of the asymmetric statistics: `(i, j)`
+                    // is variant `i` over the shared samples, `(j, i)` is
+                    // variant `j` over the same shared samples.
+                    let sum_i = sums[(i, j)];
+                    let sum_j = sums[(j, i)];
+                    let cov = gram[(i, j)] - (sum_i * sum_j) / count;
+                    let var_i = squared_sums[(i, j)] - (sum_i * sum_i) / count;
+                    let var_j = squared_sums[(j, i)] - (sum_j * sum_j) / count;
 
-                    if !cov.is_finite() || !var_x.is_finite() || !var_y.is_finite() {
+                    if !cov.is_finite() || !var_i.is_finite() || !var_j.is_finite() {
                         0.0
-                    } else if var_x <= 0.0 || var_y <= 0.0 {
+                    } else if var_i <= 0.0 || var_j <= 0.0 {
                         0.0
                     } else {
-                        let corr = (cov / (var_x * var_y).sqrt()).clamp(-1.0, 1.0);
+                        let corr = (cov / (var_i * var_j).sqrt()).clamp(-1.0, 1.0);
                         if !corr.is_finite() {
                             0.0
                         } else if count <= 2.0 {
@@ -5573,7 +5972,7 @@ impl Serialize for HwePcaModel {
     where
         S: Serializer,
     {
-        let mut state = serializer.serialize_struct("HwePcaModel", 13)?;
+        let mut state = serializer.serialize_struct("HwePcaModel", 14)?;
         state.serialize_field("n_samples", &self.n_samples)?;
         state.serialize_field("n_variants", &self.n_variants)?;
         state.serialize_field("scaler", &self.scaler)?;
@@ -5596,6 +5995,7 @@ impl Serialize for HwePcaModel {
         state.serialize_field("variant_keys", &self.variant_keys)?;
         state.serialize_field("ld", &self.ld)?;
         state.serialize_field("genome_build", &self.genome_build)?;
+        state.serialize_field("fit_diagnostics", &self.diagnostics)?;
         state.end()
     }
 }
@@ -5625,6 +6025,10 @@ impl<'de> Deserialize<'de> for HwePcaModel {
             ld: Option<LdWeights>,
             #[serde(default)]
             genome_build: Option<String>,
+            /// Absent from every `hwe.json` written before fits recorded their
+            /// convergence; `default` is what keeps those files loading.
+            #[serde(default)]
+            fit_diagnostics: Option<FitDiagnostics>,
         }
 
         let raw = ModelData::deserialize(deserializer)?;
@@ -5662,6 +6066,7 @@ impl<'de> Deserialize<'de> for HwePcaModel {
             variant_keys: raw.variant_keys,
             ld,
             genome_build: raw.genome_build,
+            diagnostics: raw.fit_diagnostics,
             projection_cache,
         })
     }
@@ -5985,6 +6390,239 @@ mod tests {
         assert!(max_diff < 1.0e-9, "max difference was {max_diff}");
     }
 
+    /// Standardizes a raw genotype matrix the way the fit does, keeping the
+    /// presence mask alongside: missing calls standardize to exactly zero, which
+    /// is what lets a Gram carry pair-restricted cross-products.
+    fn standardize_with_mask(
+        data: &[f64],
+        n_samples: usize,
+        scaler: &HweScaler,
+    ) -> (Vec<Vec<f64>>, Vec<Vec<bool>>) {
+        let n_variants = data.len() / n_samples;
+        let mut values = Vec::with_capacity(n_variants);
+        let mut observed = Vec::with_capacity(n_variants);
+        for variant in 0..n_variants {
+            let mean = 2.0 * scaler.allele_frequencies()[variant];
+            let denom = scaler.variant_scales()[variant].max(HWE_SCALE_FLOOR);
+            let inv = if denom > 0.0 { denom.recip() } else { 0.0 };
+            let mut column = Vec::with_capacity(n_samples);
+            let mut mask = Vec::with_capacity(n_samples);
+            for sample in 0..n_samples {
+                let raw = data[variant * n_samples + sample];
+                if raw.is_finite() {
+                    column.push((raw - mean) * inv);
+                    mask.push(true);
+                } else {
+                    column.push(0.0);
+                    mask.push(false);
+                }
+            }
+            values.push(column);
+            observed.push(mask);
+        }
+        (values, observed)
+    }
+
+    /// Independent complete-pairs LD weight for one window.
+    ///
+    /// Deliberately shares no code with `compute_ld_weight`: it gathers each
+    /// pair's jointly observed samples by hand and computes that pair's Pearson
+    /// correlation from those samples alone. `compute_reference_ld_weights`
+    /// above cannot serve here — it drives the very ring buffer and GEMMs under
+    /// test, so it agrees with whatever convention the production statistics
+    /// happen to use, including an inconsistent one.
+    fn reference_complete_pairs_weight(
+        standardized: &[Vec<f64>],
+        observed: &[Vec<bool>],
+        window: &[usize],
+        center: usize,
+        ridge: f64,
+    ) -> f64 {
+        let size = window.len();
+        let mut system = Mat::<f64>::zeros(size, size);
+        for i in 0..size {
+            system[(i, i)] = 1.0 + ridge;
+            for j in 0..i {
+                let values_i = &standardized[window[i]];
+                let values_j = &standardized[window[j]];
+                let mask_i = &observed[window[i]];
+                let mask_j = &observed[window[j]];
+                let shared: Vec<usize> = (0..values_i.len())
+                    .filter(|&sample| mask_i[sample] && mask_j[sample])
+                    .collect();
+                let count = shared.len() as f64;
+
+                let value = if count > 2.0 {
+                    let sum_i: f64 = shared.iter().map(|&s| values_i[s]).sum();
+                    let sum_j: f64 = shared.iter().map(|&s| values_j[s]).sum();
+                    let cross: f64 = shared.iter().map(|&s| values_i[s] * values_j[s]).sum();
+                    let square_i: f64 = shared.iter().map(|&s| values_i[s] * values_i[s]).sum();
+                    let square_j: f64 = shared.iter().map(|&s| values_j[s] * values_j[s]).sum();
+
+                    let cov = cross - sum_i * sum_j / count;
+                    let var_i = square_i - sum_i * sum_i / count;
+                    let var_j = square_j - sum_j * sum_j / count;
+
+                    if var_i <= 0.0 || var_j <= 0.0 {
+                        0.0
+                    } else {
+                        let corr = (cov / (var_i * var_j).sqrt()).clamp(-1.0, 1.0);
+                        let unbiased = ((count - 1.0) * corr * corr - 1.0) / (count - 2.0);
+                        unbiased.clamp(0.0, 1.0)
+                    }
+                } else {
+                    0.0
+                };
+
+                system[(i, j)] = value;
+                system[(j, i)] = value;
+            }
+        }
+
+        let rhs = Mat::<f64>::from_fn(size, 1, |_, _| 1.0);
+        let factor = FaerLlt::new(system.as_ref(), Side::Lower)
+            .expect("reference LD system must be positive definite");
+        let solution = factor.solve(rhs.as_ref());
+        let weight_sq = solution[(center, 0)];
+        if !weight_sq.is_finite() || weight_sq <= 0.0 {
+            1.0
+        } else {
+            weight_sq.sqrt().max(MIN_LD_WEIGHT)
+        }
+    }
+
+    /// Runs `compute_ld_weights` over `data` and checks every weight against the
+    /// complete-pairs reference, given the windows the streaming schedule
+    /// produces.
+    ///
+    /// `windows[c]` is the set of variant indices that variant `c`'s weight is
+    /// solved from. Weights are assigned as soon as a variant's window is fully
+    /// buffered, so the leading variants are solved from truncated windows —
+    /// that is the production schedule, and pinning it here keeps this test
+    /// about the *statistics* rather than about the window geometry.
+    fn assert_ld_weights_match_complete_pairs(
+        data: &[f64],
+        n_samples: usize,
+        window_size: usize,
+        windows: &[&[usize]],
+    ) {
+        let n_variants = data.len() / n_samples;
+        assert_eq!(windows.len(), n_variants);
+
+        let mut source = DenseBlockSource::new(data, n_samples, n_variants).expect("dense source");
+        let stats_progress = StageProgressHandle::new(
+            Arc::new(NoopFitProgress),
+            FitProgressStage::AlleleStatistics,
+        );
+        let (scaler, observed_variants) = compute_variant_statistics(
+            &mut source,
+            n_variants,
+            Par::Seq,
+            stats_progress,
+            n_variants,
+        )
+        .expect("variant statistics");
+        assert_eq!(observed_variants, n_variants);
+
+        let config = LdResolvedConfig {
+            window: LdResolvedWindow::Sites { size: window_size },
+            ridge: DEFAULT_LD_RIDGE,
+        };
+        let progress = Arc::new(NoopFitProgress);
+        let weights = compute_ld_weights(
+            &mut source,
+            &scaler,
+            n_variants,
+            n_variants,
+            config,
+            n_variants,
+            &progress,
+            Par::Seq,
+        )
+        .expect("ld weights")
+        .weights;
+
+        let (standardized, observed) = standardize_with_mask(data, n_samples, &scaler);
+
+        for (variant, &window) in windows.iter().enumerate() {
+            let center = window
+                .iter()
+                .position(|&index| index == variant)
+                .expect("a variant's window must contain that variant");
+            let expected = reference_complete_pairs_weight(
+                &standardized,
+                &observed,
+                window,
+                center,
+                DEFAULT_LD_RIDGE,
+            );
+            assert!(
+                (weights[variant] - expected).abs() < 1.0e-9,
+                "variant {variant}: weight {} but complete-pairs reference is {expected}",
+                weights[variant]
+            );
+        }
+
+        // Agreement is only worth something if some pair actually correlated:
+        // a window whose off-diagonals are all zero solves to this baseline
+        // whatever convention produced them, and would pass vacuously.
+        let isolated = (1.0f64 / (1.0 + DEFAULT_LD_RIDGE)).sqrt();
+        assert!(
+            weights
+                .iter()
+                .any(|weight| (weight - isolated).abs() > 1.0e-6),
+            "no pair in this dataset correlated, so the comparison proves nothing"
+        );
+    }
+
+    #[test]
+    fn ld_weights_use_only_jointly_observed_samples() {
+        // Every marker is missing somewhere different, which is the whole
+        // point: under a shared missingness pattern, per-variant sums and
+        // pair-restricted sums coincide and nothing here could fail.
+        //
+        // Variants 0 and 1 carry the same genotypes on the six samples they
+        // share, so their complete-pairs correlation is exactly ±1 whatever
+        // their disjoint samples do. Statistics taken over each variant's own
+        // observations cannot see that: they scale an intersection
+        // cross-product by union-wide moments and report something smaller.
+        const N_SAMPLES: usize = 10;
+        let nan = f64::NAN;
+        let data: Vec<f64> = vec![
+            nan, nan, 0.0, 1.0, 2.0, 1.0, 0.0, 2.0, 1.0, 0.0, // variant 0
+            2.0, 1.0, 0.0, 1.0, 2.0, 1.0, 0.0, 2.0, nan, nan, // variant 1
+            0.0, 1.0, 2.0, 2.0, nan, 0.0, 1.0, 1.0, 2.0, 0.0, // variant 2
+            1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, // variant 3
+        ];
+        assert_eq!(data.len(), N_SAMPLES * 4);
+
+        // A two-site window keeps every solved system 2×2 — trivially positive
+        // definite for any correlation, so the reference never has to guess at
+        // a factorization failure. The ring holds two variants and slides.
+        let windows: [&[usize]; 4] = [&[0], &[0, 1], &[1, 2], &[2, 3]];
+        assert_ld_weights_match_complete_pairs(&data, N_SAMPLES, 2, &windows);
+    }
+
+    #[test]
+    fn ld_weights_survive_barely_overlapping_markers() {
+        // Variants 0 and 1 share only four samples out of twelve, and agree
+        // exactly on those four. Statistics taken over each variant's own
+        // observations describe two mostly disjoint sets of people and say
+        // nothing about the four who are in both; the correlation between the
+        // markers has to come from those four and nowhere else.
+        const N_SAMPLES: usize = 12;
+        let nan = f64::NAN;
+        let data: Vec<f64> = vec![
+            0.0, 1.0, 2.0, 1.0, 2.0, 0.0, 1.0, 2.0, nan, nan, nan, nan, // variant 0
+            nan, nan, nan, nan, 2.0, 0.0, 1.0, 2.0, 2.0, 0.0, 1.0, 2.0, // variant 1
+            1.0, 0.0, 2.0, 1.0, 0.0, 2.0, 1.0, 0.0, 2.0, 1.0, 0.0, 2.0, // variant 2
+        ];
+        assert_eq!(data.len(), N_SAMPLES * 3);
+
+        let windows: [&[usize]; 3] = [&[0], &[0, 1], &[1, 2]];
+        assert_ld_weights_match_complete_pairs(&data, N_SAMPLES, 2, &windows);
+    }
+
     #[test]
     fn bp_window_treated_as_total_span() {
         let keys = vec![
@@ -6039,6 +6677,7 @@ mod tests {
         let eigenpairs = Eigenpairs {
             values: vec![-1.0e-12, 0.5],
             vectors: Mat::from_fn(n_samples, 2, |row, col| if row == col { 1.0 } else { 0.0 }),
+            diagnostics: None,
         };
 
         let (singular_values, scores) = build_sample_scores(n_samples, &eigenpairs);
@@ -6170,6 +6809,141 @@ mod tests {
         data
     }
 
+    /// Builds a streaming covariance operator over `source`, pinning the
+    /// progress-observer type parameter that `StandardizedCovarianceOp` carries
+    /// only as a `PhantomData` and therefore cannot infer.
+    fn covariance_operator<S>(
+        source: &mut S,
+        block_capacity: usize,
+        observed_variants: usize,
+        scaler: HweScaler,
+    ) -> StandardizedCovarianceOp<'_, S, NoopFitProgress>
+    where
+        S: VariantBlockSource + Send,
+        S::Error: Error + Send + Sync + 'static,
+    {
+        StandardizedCovarianceOp::new(
+            source,
+            block_capacity,
+            observed_variants,
+            observed_variants,
+            scaler,
+            None,
+        )
+    }
+
+    /// The packed 2-bit kernel must compute the same operator application as
+    /// the general f64 tile path it is an optimization of.
+    ///
+    /// The kernel walks its right-hand side in chunks of
+    /// `PACKED_RHS_CHUNK_COLS`, so the widths that matter straddle a chunk
+    /// boundary: 32 fills a chunk exactly, 33 leaves a one-column remainder,
+    /// and 1 is the single-column case the kernel has to keep reproducing.
+    ///
+    /// It is called here directly rather than through `apply`, which gates the
+    /// packed path at `PACKED_RHS_MAX_COLS` for throughput. The gate decides
+    /// *when* the kernel runs; this test decides whether it is right, and the
+    /// two should not be entangled — a chunk-loop off-by-one that only shows up
+    /// at width 33 must not be able to hide behind a gate at 8.
+    #[test]
+    fn packed_hard_call_kernel_matches_the_general_path() {
+        const N_SAMPLES: usize = 37;
+        const N_VARIANTS: usize = 23;
+        const BLOCK_CAPACITY: usize = 8;
+
+        // 37 samples is deliberately not a multiple of four, so the last packed
+        // byte carries padding the kernel has to stop short of; the scattered
+        // missing calls exercise the 2-bit "missing" code on both paths.
+        let mut data = synthetic_genotypes(N_SAMPLES, N_VARIANTS);
+        for (index, value) in data.iter_mut().enumerate() {
+            if index % 17 == 5 {
+                *value = f64::NAN;
+            }
+        }
+
+        let mut stats_source =
+            DenseBlockSource::new(&data, N_SAMPLES, N_VARIANTS).expect("dense source");
+        let stats_progress = StageProgressHandle::new(
+            Arc::new(NoopFitProgress),
+            FitProgressStage::AlleleStatistics,
+        );
+        let (scaler, observed_variants) = compute_variant_statistics(
+            &mut stats_source,
+            BLOCK_CAPACITY,
+            Par::Seq,
+            stats_progress,
+            N_VARIANTS,
+        )
+        .expect("variant statistics");
+        assert_eq!(observed_variants, N_VARIANTS);
+
+        // General path: a source with no packed view at all, so the operator
+        // decodes f64 tiles and multiplies them with faer.
+        let mut general_source =
+            DenseBlockSource::new(&data, N_SAMPLES, N_VARIANTS).expect("dense source");
+        let general = covariance_operator(
+            &mut general_source,
+            BLOCK_CAPACITY,
+            observed_variants,
+            scaler.clone(),
+        );
+
+        // Packed path: the same genotypes behind the 2-bit cache, warmed by one
+        // full traversal so `hard_call_packed` has something to hand out.
+        let mut packed_source =
+            DenseBlockSource::new(&data, N_SAMPLES, N_VARIANTS).expect("dense source");
+        let mut packed_cache = CachedVariantBlockSource::new(&mut packed_source, true);
+        let _ = drain_source(&mut packed_cache, BLOCK_CAPACITY);
+        assert!(
+            packed_cache.hard_call_packed().is_some(),
+            "the 2-bit cache must be warm, or this test compares the general path with itself"
+        );
+        let packed = covariance_operator(
+            &mut packed_cache,
+            BLOCK_CAPACITY,
+            observed_variants,
+            scaler,
+        );
+
+        for &ncols in &[1usize, 8, 31, 32, 33, 40] {
+            let rhs = Mat::<f64>::from_fn(N_SAMPLES, ncols, |row, col| {
+                ((row * 7 + col * 13) % 11) as f64 - 5.0
+            });
+
+            let mut general_out = Mat::<f64>::zeros(N_SAMPLES, ncols);
+            let mut mem = MemBuffer::new(general.apply_scratch(ncols, Par::Seq));
+            {
+                let stack = MemStack::new(&mut mem);
+                general.apply(general_out.as_mut(), rhs.as_ref(), Par::Seq, stack);
+            }
+
+            // `apply` zeroes `out` before dispatching and the kernel only ever
+            // accumulates, so the caller owns the zeroing either way.
+            let mut packed_out = Mat::<f64>::zeros(N_SAMPLES, ncols);
+            assert!(
+                packed.try_apply_hardcall_packed(packed_out.as_mut(), rhs.as_ref()),
+                "packed kernel refused a {ncols}-column right-hand side"
+            );
+
+            let mut scale = 0.0f64;
+            let mut max_diff = 0.0f64;
+            for row in 0..N_SAMPLES {
+                for col in 0..ncols {
+                    let expected = general_out[(row, col)];
+                    scale = scale.max(expected.abs());
+                    max_diff = max_diff.max((expected - packed_out[(row, col)]).abs());
+                }
+            }
+
+            // Not bit-for-bit: faer's blocked GEMM and the kernel's sequential
+            // accumulation sum the same terms in different orders.
+            assert!(
+                max_diff <= 1.0e-10 * scale.max(1.0),
+                "width {ncols}: packed and general paths differ by {max_diff} (magnitude {scale})"
+            );
+        }
+    }
+
     #[test]
     fn tile_width_shrinks_as_the_cohort_grows() {
         // Small cohorts keep the wide tile: the buffers are trivial and wider
@@ -6185,9 +6959,54 @@ mod tests {
             "tile width must not grow with the sample count: {narrow} vs {wide}"
         );
 
-        // The variant hint still bounds it, and it never reaches zero.
+        // The variant hint still bounds it.
         assert_eq!(adaptive_block_capacity(1_000, 7), 7);
-        assert!(adaptive_block_capacity(usize::MAX / 16, 0) >= 1);
+
+        // And when the budget affords nothing at all the answer is one variant,
+        // not a hard floor of 256 that would demand gigabytes of scratch the
+        // plan just said the machine does not have. One is the only real floor:
+        // a zero-width tile makes no progress.
+        assert_eq!(adaptive_block_capacity(usize::MAX / 16, 0), 1);
+    }
+
+    #[test]
+    fn dense_covariance_is_reserved_for_small_problems() {
+        let budget = gram_matrix_budget_bytes();
+
+        // The reference path is still chosen where it belongs: a handful of
+        // samples, where forming C outright is the cheaper way to get it and
+        // the exact solve is what the iterative path is checked against.
+        assert_eq!(
+            covariance_computation_mode(12, 40, 3, budget),
+            CovarianceComputationMode::Dense
+        );
+
+        // 100k samples is the case that motivated this: 8n² is 74.5 GiB, which
+        // "fits" a large machine, and forming it costs O(p·n²) followed by an
+        // O(n³) eigendecomposition. Fitting is not a reason to choose it.
+        assert_eq!(
+            covariance_computation_mode(100_000, 500_000, 20, usize::MAX),
+            CovarianceComputationMode::Partial
+        );
+
+        // Even well inside the memory budget, dense loses on work long before
+        // it loses on bytes.
+        assert_eq!(
+            covariance_computation_mode(2_000, 500_000, 20, usize::MAX),
+            CovarianceComputationMode::Partial
+        );
+
+        // A source that cannot report its variant count is still decided on
+        // work, not waved through: the count cancels out of the accumulation
+        // comparison, so the answer does not depend on knowing it.
+        assert_eq!(
+            covariance_computation_mode(12, 0, 3, budget),
+            CovarianceComputationMode::Dense
+        );
+        assert_eq!(
+            covariance_computation_mode(4_000, 0, 20, usize::MAX),
+            CovarianceComputationMode::Partial
+        );
     }
 
     #[test]

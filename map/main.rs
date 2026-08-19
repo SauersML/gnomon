@@ -10,7 +10,7 @@ use super::io::{
     save_sample_manifest,
 };
 use super::prefit::{self, BuiltinModelError};
-use super::progress::{fit_progress, projection_progress};
+use super::progress::{AdaptiveFitProgress, fit_progress, projection_progress};
 use super::project::{GappedProjectionSource, ProjectionOptions};
 use super::variant_filter::{VariantFilter, VariantKey, VariantListError};
 use std::collections::{HashMap, HashSet};
@@ -20,6 +20,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
+use sysinfo::System;
 
 /// High-level commands that can be executed within the `map` module.
 #[derive(Debug)]
@@ -221,6 +222,13 @@ fn run_fit(
 
     let mut variant_keys: Option<Arc<Vec<VariantKey>>> = None;
     let mut selection_plan = SelectionPlan::All;
+    // Upper bound on the variants the fit will retain, as far as it is knowable
+    // before a single genotype is read. It is what lets the VCF path refuse a
+    // hopeless in-RAM copy without paying for a pass to discover the size. A
+    // PLINK/PGEN fileset knows its own count; a VCF does not, and reports
+    // `None` here until something has read it end to end, so this bound is an
+    // optimization and never the thing that enforces the budget.
+    let mut variant_upper_bound: Option<usize> = dataset.variant_count_hint();
 
     if let Some(list_path) = variant_list {
         let filter = VariantFilter::from_file(list_path)
@@ -259,13 +267,17 @@ fn run_fit(
                 println!(
                     "Variant list contains {requested} unique variants; streaming match will be reported during fit",
                 );
+                // Each requested key is emitted at most once (the streaming
+                // match de-duplicates on first hit), so the list length is a
+                // genuine ceiling on the retained count even though the file's
+                // own variant count is still unknown.
+                variant_upper_bound = Some(requested);
                 selection_plan = SelectionPlan::ByKeys(Arc::new(filter));
             }
         }
     }
 
     let is_vcf_like = matches!(dataset, GenotypeDataset::Variants(_));
-    let materialize_vcf = is_vcf_like;
 
     let mut fit_options = FitOptions::default();
     if let Some(window_spec) = ld.clone() {
@@ -275,7 +287,7 @@ fn run_fit(
             ridge: None,
             variant_keys: None,
         };
-        if matches!(window_spec, LdWindow::BasePairs(_)) && !materialize_vcf {
+        if matches!(window_spec, LdWindow::BasePairs(_)) && !is_vcf_like {
             let keys_arc = if let Some(existing) = &variant_keys {
                 Arc::clone(existing)
             } else {
@@ -290,60 +302,62 @@ fn run_fit(
     let progress = fit_progress();
     fit_options.cache_source = maf.is_some() && !is_vcf_like;
 
-    let (mut model, retained_indices, selection_outcome, mut streamed_keys) = if materialize_vcf {
-        println!("Materializing retained VCF variants in RAM for single-pass fitting.");
+    let (mut model, retained_indices, selection_outcome, mut streamed_keys) = if is_vcf_like {
+        // Re-reading a VCF is expensive and the solver wants several passes, so
+        // a dense copy in RAM is the right call for every VCF that fits. It is
+        // also n_samples × n_variants × 8 B, which is 1.0 TiB at 200k samples
+        // and 700k variants: the plan decides against the budget, and the scan
+        // enforces the same budget again against the retained count that no VCF
+        // can report before it has been read.
+        let plan = VcfMaterializationPlan::new(
+            fit_n_samples,
+            variant_upper_bound,
+            matches!(ld, Some(LdWindow::BasePairs(_))),
+        );
         let raw_source = subset_samples(
             dataset.block_source_with_plan(selection_plan.clone())?,
             keep_indices.as_deref(),
         )?;
-        let (data, n_variants, keys, outcome) = if let Some(min_maf) = maf {
+        if let Some(min_maf) = maf {
             let mut source = StreamingMafFilterSource::new(raw_source, min_maf)?;
-            let materialized = materialize_fit_source(&mut source)?;
+            let (model, scanned_keys) = fit_vcf_source(
+                &mut source,
+                components,
+                &fit_options,
+                &progress,
+                fit_n_samples,
+                &plan,
+            )?;
+            // Whichever path ran, the keys are the post-MAF list in stream
+            // order, which is why `retained_indices` stays `None` here exactly
+            // as it did on the materialized path: there is nothing left to
+            // subset. The scan takes the filter's key list when it runs, so the
+            // source is asked only when it did not.
+            let keys = match scanned_keys {
+                Some(keys) => Some(keys),
+                None => source.take_variant_keys(),
+            };
+            let retained = source.retained_indices().to_vec();
             let outcome = source.inner_mut().inner_mut().take_selection_outcome();
-            (
-                materialized.data,
-                materialized.n_variants,
-                materialized.keys,
-                outcome,
-            )
+            let retained_indices = if keys.is_some() { None } else { Some(retained) };
+            (model, retained_indices, outcome, keys)
         } else {
             let mut source = raw_source;
-            let materialized = materialize_fit_source(&mut source)?;
+            let (model, scanned_keys) = fit_vcf_source(
+                &mut source,
+                components,
+                &fit_options,
+                &progress,
+                fit_n_samples,
+                &plan,
+            )?;
+            let keys = match scanned_keys {
+                Some(keys) => Some(keys),
+                None => source.take_variant_keys(),
+            };
             let outcome = source.inner_mut().take_selection_outcome();
-            (
-                materialized.data,
-                materialized.n_variants,
-                materialized.keys,
-                outcome,
-            )
-        };
-
-        let keys = keys.ok_or_else(|| {
-            MapDriverError::InvalidState(
-                "VCF materialization did not capture variant positions for base-pair LD".into(),
-            )
-        })?;
-        if keys.len() != n_variants {
-            return Err(MapDriverError::InvalidState(format!(
-                "VCF materialization captured {} keys for {n_variants} retained variants",
-                keys.len()
-            )));
+            (model, None, outcome, keys)
         }
-        if let Some(ld_config) = fit_options.ld.as_mut() {
-            if matches!(ld_config.window, Some(LdWindow::BasePairs(_))) {
-                ld_config.variant_keys = Some(Arc::new(keys.clone()));
-            }
-        }
-        let mut materialized_options = fit_options.clone();
-        materialized_options.cache_source = false;
-        let mut source = DenseBlockSource::new(&data, fit_n_samples, n_variants)?;
-        let model = HwePcaModel::fit_k_with_options_and_progress(
-            &mut source,
-            components,
-            &materialized_options,
-            &progress,
-        )?;
-        (model, None, outcome, Some(keys))
     } else if let Some(min_maf) = maf {
         let raw_source = subset_samples(
             dataset.block_source_with_plan(selection_plan.clone())?,
@@ -585,13 +599,148 @@ fn format_id_sample(ids: &[&str]) -> String {
     }
 }
 
-struct MaterializedFitSource {
-    data: Vec<f64>,
-    n_variants: usize,
-    keys: Option<Vec<VariantKey>>,
+/// Share of *available* memory a dense in-RAM copy of the retained genotypes
+/// may occupy.
+///
+/// A third, where the Gram and source-cache budgets in `fit.rs` take three
+/// quarters, because this copy is neither the only nor the last large
+/// allocation the fit makes. The block-Krylov basis (an eighth of memory), the
+/// Gram matrix when the dense covariance path is taken, and every pass's block
+/// buffers all have to live beside it. And when the retained variant count is
+/// not known up front — which is every VCF read without a variant list — the
+/// copy is *grown* rather than reserved, and `Vec` growth holds the old and the
+/// new buffer at once. A copy allowed to reach a third of memory therefore
+/// still peaks at half of it, which is the number this fraction is chosen for.
+const VCF_MATERIALIZATION_BUDGET_NUMERATOR: u64 = 1;
+const VCF_MATERIALIZATION_BUDGET_DENOMINATOR: u64 = 3;
+
+/// Budget used when the platform reports no memory at all. Matching the score
+/// pipeline's fallback rather than guessing high: on a machine that will not
+/// say how much memory it has, an optimistic budget is indistinguishable from
+/// the OOM this whole path exists to avoid.
+const VCF_MATERIALIZATION_FALLBACK_BUDGET_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// Bytes a dense `f64` copy of an `n_samples × n_variants` genotype matrix
+/// occupies.
+///
+/// Computed in `u128` because this product is precisely the quantity that
+/// overflows the moment the decision matters: the whole point of the caller is
+/// to weigh terabyte-scale numbers, and a wrapped `usize` would report a
+/// comfortable fit for a matrix that cannot be allocated at all.
+fn materialized_matrix_bytes(n_samples: usize, n_variants: usize) -> u128 {
+    (n_samples as u128)
+        .saturating_mul(n_variants as u128)
+        .saturating_mul(std::mem::size_of::<f64>() as u128)
 }
 
-fn materialize_fit_source<S>(source: &mut S) -> Result<MaterializedFitSource, HwePcaError>
+/// Bytes the in-RAM copy of a VCF's retained genotypes is allowed.
+///
+/// Derived from *available* rather than total memory: the fit is not the only
+/// thing on the machine, and on a shared node the difference between the two is
+/// the difference between a fit that finishes and a fit that is killed. This is
+/// the operating system's own view, so a cgroup that is not reflected in it
+/// (an unusual container configuration) can still under-report pressure — the
+/// scan's incremental ceiling is what keeps that from becoming an OOM.
+fn vcf_materialization_budget_bytes() -> u128 {
+    let mut system = System::new_all();
+    system.refresh_memory();
+    let available = system.available_memory();
+    let budget = if available > 0 {
+        available.saturating_mul(VCF_MATERIALIZATION_BUDGET_NUMERATOR)
+            / VCF_MATERIALIZATION_BUDGET_DENOMINATOR
+    } else {
+        VCF_MATERIALIZATION_FALLBACK_BUDGET_BYTES
+    };
+    u128::from(budget.max(1))
+}
+
+fn format_gib(bytes: u128) -> String {
+    format!("{:.1} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+}
+
+/// Prints why the fit is about to get slower.
+///
+/// The alternative to a slower fit here is not a faster fit; it is the
+/// allocator killing the process on exactly the datasets the streaming solver
+/// was written to serve. A user who is never told why a run takes longer will
+/// eventually go looking for the OOM instead.
+fn announce_streaming_fallback() {
+    println!(
+        "Streaming the VCF for every solver pass instead. Memory stays bounded, but the fit is slower: the solver takes several whole-genome passes and each one re-reads and re-decodes the input."
+    );
+}
+
+/// How a VCF fit should get at its genotypes, decided before any are read.
+struct VcfMaterializationPlan {
+    /// Ceiling on the dense in-RAM copy.
+    budget_bytes: u128,
+    /// Retained variants at most, when that is knowable without reading the
+    /// input; `None` for a VCF whose own count is still unknown.
+    variant_upper_bound: Option<usize>,
+    /// Whether the scan may hold genotypes at all. False once the bound above
+    /// has already proved the copy cannot fit, which also keeps the scan from
+    /// *reserving* the terabyte it would then have to give straight back.
+    attempt: bool,
+    /// Whether the scan must run even when it may not hold genotypes, because
+    /// a base-pair LD window needs one position per streamed variant and only
+    /// a pass over the stream can produce that list.
+    scan_anyway: bool,
+}
+
+impl VcfMaterializationPlan {
+    fn new(
+        n_samples: usize,
+        variant_upper_bound: Option<usize>,
+        needs_variant_positions: bool,
+    ) -> Self {
+        let budget_bytes = vcf_materialization_budget_bytes();
+        let attempt = match variant_upper_bound {
+            Some(bound) => materialized_matrix_bytes(n_samples, bound) <= budget_bytes,
+            None => true,
+        };
+        Self {
+            budget_bytes,
+            variant_upper_bound,
+            attempt,
+            scan_anyway: needs_variant_positions,
+        }
+    }
+}
+
+/// What one scan of a VCF's retained genotypes left behind.
+enum VcfFitSource {
+    /// The whole retained matrix fit the budget and is held in RAM.
+    Materialized {
+        data: Vec<f64>,
+        n_variants: usize,
+        keys: Option<Vec<VariantKey>>,
+    },
+    /// The matrix did not fit. The scan still ran to the end of the stream, so
+    /// the count and the keys are exact — only the genotypes were dropped.
+    Oversized {
+        n_variants: usize,
+        keys: Option<Vec<VariantKey>>,
+        required_bytes: u128,
+    },
+}
+
+/// Reads the retained genotypes once, keeping them only while they fit
+/// `budget_bytes`.
+///
+/// The budget is checked against the copy's size *before* each block is
+/// appended, so the buffer never exceeds it — which is the only enforcement
+/// that works for a VCF, because the retained variant count is not knowable
+/// until this scan has finished. When the ceiling is reached the partial copy
+/// is handed straight back to the allocator and the scan reads on: the count
+/// and the variant keys are worth a completed pass on their own. They give the
+/// streaming fit an honest `n_variants` hint (which is what lets `fit.rs` size
+/// its own source cache instead of guessing from zero), the exact post-filter
+/// key list for the model, and a finalized variant-list selection outcome.
+fn scan_vcf_fit_source<S>(
+    source: &mut S,
+    budget_bytes: u128,
+    store_genotypes: bool,
+) -> Result<VcfFitSource, HwePcaError>
 where
     S: VariantBlockSource + Send,
     S::Error: std::error::Error + Send + Sync + 'static,
@@ -604,7 +753,16 @@ where
         DEFAULT_BLOCK_WIDTH.max(1)
     };
     let mut block = vec![0.0f64; n_samples.saturating_mul(block_capacity)];
-    let mut data = Vec::with_capacity(n_samples.saturating_mul(hint));
+    // Reserved up front only when the caller has already established that the
+    // whole matrix fits. The hint is the variant list's length for a keyed
+    // selection, so reserving on it unconditionally is itself a way to die in
+    // the allocator before a single genotype has been read.
+    let mut data = if store_genotypes {
+        Vec::with_capacity(n_samples.saturating_mul(hint))
+    } else {
+        Vec::new()
+    };
+    let mut storing = store_genotypes;
     let mut n_variants = 0usize;
 
     source
@@ -621,12 +779,23 @@ where
         let len = n_samples.checked_mul(filled).ok_or_else(|| {
             HwePcaError::InvalidInput("materialized genotype matrix dimension overflow")
         })?;
-        data.extend_from_slice(&block[..len]);
-        n_variants = n_variants
+        let scanned = n_variants
             .checked_add(filled)
             .ok_or(HwePcaError::InvalidInput(
                 "materialized variant count overflow",
             ))?;
+        if storing {
+            if materialized_matrix_bytes(n_samples, scanned) > budget_bytes {
+                // Released before reading on, not at the end of the scan: the
+                // rest of the pass must not run while holding the allocation
+                // that was just judged unaffordable.
+                storing = false;
+                data = Vec::new();
+            } else {
+                data.extend_from_slice(&block[..len]);
+            }
+        }
+        n_variants = scanned;
     }
 
     if n_variants == 0 {
@@ -644,11 +813,173 @@ where
         ));
     }
 
-    Ok(MaterializedFitSource {
-        data,
-        n_variants,
-        keys,
-    })
+    if storing {
+        Ok(VcfFitSource::Materialized {
+            data,
+            n_variants,
+            keys,
+        })
+    } else {
+        Ok(VcfFitSource::Oversized {
+            n_variants,
+            keys,
+            required_bytes: materialized_matrix_bytes(n_samples, n_variants),
+        })
+    }
+}
+
+/// Points a base-pair LD window at the positions of the variants the fit will
+/// actually see.
+///
+/// A sites window needs no positions at all, and a base-pair window resolved
+/// against any list other than the streamed one weights the wrong sites, so
+/// this is set from the scan that produced the stream and from nothing else.
+fn set_bp_ld_variant_keys(options: &mut FitOptions, keys: &[VariantKey]) {
+    if let Some(ld_config) = options.ld.as_mut()
+        && matches!(ld_config.window, Some(LdWindow::BasePairs(_)))
+    {
+        ld_config.variant_keys = Some(Arc::new(keys.to_vec()));
+    }
+}
+
+/// Fits a VCF-like source, copying the retained genotypes into RAM when they
+/// fit the budget and streaming the input on every solver pass when they do
+/// not.
+///
+/// Both paths leave the same model metadata behind: the returned keys are the
+/// variants the fit saw, in stream order and after MAF filtering, and the
+/// caller's selection outcome is finalized either way because both paths reach
+/// the end of the stream at least once. The difference is only where the
+/// genotypes come from on the second and later passes.
+fn fit_vcf_source<S>(
+    source: &mut S,
+    components: usize,
+    fit_options: &FitOptions,
+    progress: &Arc<AdaptiveFitProgress>,
+    n_samples: usize,
+    plan: &VcfMaterializationPlan,
+) -> Result<(HwePcaModel, Option<Vec<VariantKey>>), MapDriverError>
+where
+    S: VariantBlockSource + Send,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    if plan.attempt {
+        println!(
+            "Materializing retained VCF variants in RAM for single-pass fitting (budget {}).",
+            format_gib(plan.budget_bytes)
+        );
+    } else if plan.scan_anyway {
+        println!(
+            "Scanning the VCF once for the variant positions the base-pair LD window needs; genotypes are not held in RAM."
+        );
+    }
+
+    let scan = if plan.attempt || plan.scan_anyway {
+        Some(scan_vcf_fit_source(source, plan.budget_bytes, plan.attempt)?)
+    } else {
+        None
+    };
+    let scan_reached_end = scan.is_some();
+
+    let streamed_keys = match scan {
+        Some(VcfFitSource::Materialized {
+            data,
+            n_variants,
+            keys,
+        }) => {
+            let keys = keys.ok_or_else(|| {
+                MapDriverError::InvalidState(
+                    "VCF materialization did not capture variant positions for base-pair LD".into(),
+                )
+            })?;
+            if keys.len() != n_variants {
+                return Err(MapDriverError::InvalidState(format!(
+                    "VCF materialization captured {} keys for {n_variants} retained variants",
+                    keys.len()
+                )));
+            }
+            let mut materialized_options = fit_options.clone();
+            materialized_options.cache_source = false;
+            set_bp_ld_variant_keys(&mut materialized_options, &keys);
+            let mut dense = DenseBlockSource::new(&data, n_samples, n_variants)?;
+            let model = HwePcaModel::fit_k_with_options_and_progress(
+                &mut dense,
+                components,
+                &materialized_options,
+                progress,
+            )?;
+            return Ok((model, Some(keys)));
+        }
+        Some(VcfFitSource::Oversized {
+            n_variants,
+            keys,
+            required_bytes,
+        }) => {
+            println!(
+                "Retained VCF genotypes would need {} in RAM ({n_samples} samples × {n_variants} variants × 8 B), above the {} materialization budget.",
+                format_gib(required_bytes),
+                format_gib(plan.budget_bytes)
+            );
+            announce_streaming_fallback();
+            keys
+        }
+        None => {
+            let bound = plan.variant_upper_bound.unwrap_or(0);
+            println!(
+                "Retained VCF genotypes would need up to {} in RAM ({n_samples} samples × at most {bound} variants × 8 B), above the {} materialization budget.",
+                format_gib(materialized_matrix_bytes(n_samples, bound)),
+                format_gib(plan.budget_bytes)
+            );
+            announce_streaming_fallback();
+            None
+        }
+    };
+
+    let mut streaming_options = fit_options.clone();
+    match streamed_keys.as_deref() {
+        Some(keys) => set_bp_ld_variant_keys(&mut streaming_options, keys),
+        // Only the scan can supply positions for a streamed fit, and it is run
+        // whenever the window is in base pairs — so reaching here means the
+        // stream yielded no positions at all, and weighting by distance is not
+        // something to guess at.
+        None if plan.scan_anyway => {
+            return Err(MapDriverError::InvalidState(
+                "streamed VCF fit did not capture variant positions for base-pair LD".into(),
+            ));
+        }
+        None => {}
+    }
+
+    if scan_reached_end {
+        // The scan left the stream at EOF; the fit expects to start from the
+        // first variant, as it does for a source it opened itself.
+        source
+            .reset()
+            .map_err(|err| HwePcaError::Source(Box::new(err)))?;
+    }
+
+    let model = HwePcaModel::fit_k_with_options_and_progress(
+        source,
+        components,
+        &streaming_options,
+        progress,
+    )?;
+
+    // The scan and the fit walk the same deterministic stream, so a divergence
+    // here is a bug and not a data condition — and a silent one, because a model
+    // whose keys do not line up with its loadings does not fail, it projects
+    // wrong answers onto every cohort it is ever applied to.
+    if let Some(keys) = streamed_keys.as_ref()
+        && keys.len() != model.n_variants()
+    {
+        return Err(MapDriverError::InvalidState(format!(
+            "streamed VCF fit observed {} variants but the scan captured {} keys",
+            model.n_variants(),
+            keys.len()
+        )));
+    }
+
+    Ok((model, streamed_keys))
 }
 
 fn retain_variant_keys_by_logical_indices(
