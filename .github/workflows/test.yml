@@ -14,6 +14,10 @@ on:
       - 'map/**'
       - 'map/**/*.rs'
       - 'map/*.rs'
+      # Documentation-only changes do not need the Rust suite. Negative
+      # patterns are applied in order, so this trims markdown out of the
+      # directory globs above without narrowing them for source.
+      - '!**/*.md'
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened]
@@ -28,6 +32,10 @@ on:
       - 'map/**'
       - 'map/**/*.rs'
       - 'map/*.rs'
+      # Documentation-only changes do not need the Rust suite. Negative
+      # patterns are applied in order, so this trims markdown out of the
+      # directory globs above without narrowing them for source.
+      - '!**/*.md'
   workflow_dispatch:  # Manual trigger
 
 concurrency:

@@ -10,6 +10,8 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "map/**"
+      # Same reasoning as test.yml: a README change should not start a benchmark.
+      - "!**/*.md"
       - "scripts/benchmark_project_prefit_microarray.py"
       - ".github/workflows/benchmark-project-prefit-microarray.yml"
   pull_request:
@@ -17,6 +19,8 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "map/**"
+      # Same reasoning as test.yml: a README change should not start a benchmark.
+      - "!**/*.md"
       - "scripts/benchmark_project_prefit_microarray.py"
       - ".github/workflows/benchmark-project-prefit-microarray.yml"
 

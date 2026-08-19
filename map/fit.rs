@@ -5683,8 +5683,16 @@ fn compute_component_weighted_norms_sq(
         let mut compensation = 0.0f64;
 
         if n_weights > 0 {
-            let mut idx = 0usize;
-            zip!(column_ref).for_each(|unzip!(value)| {
+            // Indexed explicitly rather than counting inside a `zip!` closure.
+            // Pairing weights[i] with the i-th entry by incrementing a counter
+            // per visit is only correct if the traversal happens to run in
+            // index order; nothing in the API promises that, and if it ever
+            // vectorized or reordered, every LD weight would land on the wrong
+            // variant — quietly, and with entirely plausible-looking output.
+            let contiguous = column_ref
+                .try_as_col_major()
+                .expect("loading columns are contiguous");
+            for (idx, value) in contiguous.as_slice().iter().enumerate() {
                 let weight = if idx < n_weights { weights[idx] } else { 1.0 };
                 let weighted = weight * *value;
                 let square = weighted * weighted;
@@ -5692,8 +5700,7 @@ fn compute_component_weighted_norms_sq(
                 let t = sum + y;
                 compensation = (t - sum) - y;
                 sum = t;
-                idx += 1;
-            });
+            }
         } else {
             zip!(column_ref).for_each(|unzip!(value)| {
                 let square = *value * *value;
@@ -5962,6 +5969,7 @@ where
         // Accumulates ‖X‖²_F over the standardized (LD-weighted) blocks, which
         // equals trace(X·Xᵀ) and hence (n−1)·total_variance.
         let mut standardized_frobenius_sq = 0.0f64;
+        let mut frobenius_compensation = 0.0f64;
         // Accumulates BᵀB = (n−1)·Uᵀ·C·U, the covariance restricted to the
         // subspace the eigensolver returned.
         let mut restricted_gram = Mat::zeros(n_components, n_components);
@@ -6001,12 +6009,25 @@ where
 
                     // Fold this block's squared Frobenius norm into the running
                     // total variance before it is consumed by the loadings GEMM.
+                    //
+                    // Compensated, because this is the longest sum in the fit:
+                    // one term per genotype, so ~1e11 additions at 250k samples
+                    // by 500k variants, all non-negative and so all pushing the
+                    // running total in the same direction. It is also the
+                    // denominator of every explained-variance ratio, which is
+                    // the number a reader actually interprets, and it is
+                    // cheaper to compensate here than to explain a ratio that
+                    // drifts with cohort size.
                     for column in block_ref.col_iter() {
                         let contiguous = column
                             .try_as_col_major()
                             .expect("standardized block column must be contiguous");
                         for &value in contiguous.as_slice() {
-                            standardized_frobenius_sq += value * value;
+                            let term = value * value;
+                            let y = term - frobenius_compensation;
+                            let t = standardized_frobenius_sq + y;
+                            frobenius_compensation = (t - standardized_frobenius_sq) - y;
+                            standardized_frobenius_sq = t;
                         }
                     }
 
@@ -7079,6 +7100,46 @@ mod tests {
                 "width {ncols}: packed and general paths differ by {max_diff} (magnitude {scale})"
             );
         }
+    }
+
+    #[test]
+    fn ld_weighted_norms_pair_each_weight_with_its_own_variant() {
+        // This path is only reachable through a deserialization fallback, so it
+        // had no test at all — and it used to pair weights with entries by
+        // incrementing a counter inside a traversal closure, which is correct
+        // only if the traversal runs in index order. A mispairing there is
+        // invisible: every weight is plausible, the norms stay positive, and
+        // only the projector's alignment is quietly wrong.
+        //
+        // The weights below are chosen so that any permutation gives a
+        // different answer: with loadings [1, 2, 3] on one component and
+        // weights [1, 10, 100], the weighted square sum is
+        // 1 + 400 + 90000 = 90401, and no reordering of those weights
+        // reproduces it.
+        let mut loadings = Mat::<f64>::zeros(3, 1);
+        loadings[(0, 0)] = 1.0;
+        loadings[(1, 0)] = 2.0;
+        loadings[(2, 0)] = 3.0;
+
+        let weights = [1.0f64, 10.0, 100.0];
+        let norms = compute_component_weighted_norms_sq(loadings.as_ref(), Some(&weights));
+
+        assert_eq!(norms.len(), 1);
+        assert!(
+            (norms[0] - 90401.0).abs() < 1e-9,
+            "weights must pair with their own variants: got {}",
+            norms[0]
+        );
+
+        // Unweighted is the same sum with every weight at one, which is also
+        // what the fit path itself asks for.
+        let plain = compute_component_weighted_norms_sq(loadings.as_ref(), None);
+        assert!((plain[0] - 14.0).abs() < 1e-12, "got {}", plain[0]);
+
+        // Fewer weights than variants: the shortfall is treated as weight one
+        // rather than reading out of bounds.
+        let short = compute_component_weighted_norms_sq(loadings.as_ref(), Some(&weights[..2]));
+        assert!((short[0] - (1.0 + 400.0 + 9.0)).abs() < 1e-9, "got {}", short[0]);
     }
 
     #[test]
