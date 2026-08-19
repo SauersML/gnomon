@@ -17,7 +17,7 @@ use faer::linalg::{temp_mat_scratch, temp_mat_uninit};
 use faer::mat::AsMatMut;
 use faer::matrix_free::LinOp;
 use faer::matrix_free::eigen::{
-    PartialEigenInfo, PartialEigenParams, partial_eigen_scratch, partial_self_adjoint_eigen,
+    PartialEigenParams, partial_eigen_scratch, partial_self_adjoint_eigen,
 };
 use faer::prelude::ReborrowMut;
 use faer::{
