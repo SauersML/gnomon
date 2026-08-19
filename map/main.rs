@@ -1,20 +1,22 @@
 use super::fit::{
     DEFAULT_BLOCK_WIDTH, DenseBlockSource, FitOptions, HwePcaError, HwePcaModel, LdConfig,
-    LdWindow, StreamingMafFilterSource, VariantBlockSource,
+    LdWindow, SampleSubsetSource, StreamingMafFilterSource, VariantBlockSource,
 };
 use super::io::{
-    DatasetOutputError, GenotypeDataset, GenotypeIoError, OrderedSelectionPlan,
-    ProjectionOutputPaths, SelectionPlan, create_projection_matrix_sink,
+    DatasetBlockSource, DatasetOutputError, GenotypeDataset, GenotypeIoError, OrderedSelectionPlan,
+    ProjectionOutputPaths, SampleRecord, SelectionPlan, create_projection_matrix_sink,
     create_projection_matrix_sink_at, load_hwe_model, load_projection_model_from_path,
-    save_fit_summary,
-    save_hwe_model, save_projection_output_manifest, save_sample_manifest,
+    save_fit_scores, save_fit_summary, save_hwe_model, save_projection_output_manifest,
+    save_sample_manifest,
 };
 use super::prefit::{self, BuiltinModelError};
 use super::progress::{fit_progress, projection_progress};
 use super::project::{GappedProjectionSource, ProjectionOptions};
 use super::variant_filter::{VariantFilter, VariantKey, VariantListError};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -25,6 +27,9 @@ pub enum MapCommand {
     Fit {
         genotype_path: PathBuf,
         variant_list: Option<PathBuf>,
+        /// Optional file of individual IDs (one IID per line) restricting the
+        /// fit to a sample subset — a within-ancestry PCA, for instance.
+        keep: Option<PathBuf>,
         components: usize,
         maf: Option<f64>,
         ld: Option<LdWindow>,
@@ -119,10 +124,18 @@ pub fn run(command: MapCommand) -> Result<(), MapDriverError> {
         MapCommand::Fit {
             genotype_path,
             variant_list,
+            keep,
             components,
             maf,
             ld,
-        } => run_fit(&genotype_path, variant_list.as_deref(), components, maf, ld),
+        } => run_fit(
+            &genotype_path,
+            variant_list.as_deref(),
+            keep.as_deref(),
+            components,
+            maf,
+            ld,
+        ),
         MapCommand::Project {
             genotype_path,
             model,
@@ -134,6 +147,7 @@ pub fn run(command: MapCommand) -> Result<(), MapDriverError> {
 fn run_fit(
     genotype_path: &Path,
     variant_list: Option<&Path>,
+    keep: Option<&Path>,
     components: usize,
     maf: Option<f64>,
     ld: Option<LdWindow>,
@@ -156,6 +170,35 @@ fn run_fit(
         dataset.n_samples(),
         variant_display
     );
+
+    // Resolved before anything reads genotypes: every downstream statistic —
+    // allele frequencies, the MAF screen, LD weights, the covariance — is
+    // computed from the retained rows alone, which is what makes this a fit on
+    // the subset rather than a whole-cohort fit that is later filtered.
+    let keep_indices = match keep {
+        Some(keep_path) => {
+            let indices = resolve_keep_indices(keep_path, dataset.samples())?;
+            println!(
+                "Sample keep list {}: retaining {} of {} samples for the fit.",
+                keep_path.display(),
+                indices.len(),
+                dataset.n_samples()
+            );
+            Some(indices)
+        }
+        None => None,
+    };
+    let retained_records: Option<Vec<SampleRecord>> = keep_indices.as_ref().map(|indices| {
+        indices
+            .iter()
+            .map(|&idx| dataset.samples()[idx].clone())
+            .collect()
+    });
+    let retained_samples: &[SampleRecord] = match retained_records.as_deref() {
+        Some(records) => records,
+        None => dataset.samples(),
+    };
+    let fit_n_samples = retained_samples.len();
 
     println!("Requested principal components: {components}");
     match &ld {
@@ -249,11 +292,14 @@ fn run_fit(
 
     let (mut model, retained_indices, selection_outcome, mut streamed_keys) = if materialize_vcf {
         println!("Materializing retained VCF variants in RAM for single-pass fitting.");
-        let raw_source = dataset.block_source_with_plan(selection_plan.clone())?;
+        let raw_source = subset_samples(
+            dataset.block_source_with_plan(selection_plan.clone())?,
+            keep_indices.as_deref(),
+        )?;
         let (data, n_variants, keys, outcome) = if let Some(min_maf) = maf {
             let mut source = StreamingMafFilterSource::new(raw_source, min_maf)?;
             let materialized = materialize_fit_source(&mut source)?;
-            let outcome = source.inner_mut().take_selection_outcome();
+            let outcome = source.inner_mut().inner_mut().take_selection_outcome();
             (
                 materialized.data,
                 materialized.n_variants,
@@ -263,7 +309,7 @@ fn run_fit(
         } else {
             let mut source = raw_source;
             let materialized = materialize_fit_source(&mut source)?;
-            let outcome = source.take_selection_outcome();
+            let outcome = source.inner_mut().take_selection_outcome();
             (
                 materialized.data,
                 materialized.n_variants,
@@ -290,7 +336,7 @@ fn run_fit(
         }
         let mut materialized_options = fit_options.clone();
         materialized_options.cache_source = false;
-        let mut source = DenseBlockSource::new(&data, dataset.n_samples(), n_variants)?;
+        let mut source = DenseBlockSource::new(&data, fit_n_samples, n_variants)?;
         let model = HwePcaModel::fit_k_with_options_and_progress(
             &mut source,
             components,
@@ -299,7 +345,10 @@ fn run_fit(
         )?;
         (model, None, outcome, Some(keys))
     } else if let Some(min_maf) = maf {
-        let raw_source = dataset.block_source_with_plan(selection_plan.clone())?;
+        let raw_source = subset_samples(
+            dataset.block_source_with_plan(selection_plan.clone())?,
+            keep_indices.as_deref(),
+        )?;
         let mut source = StreamingMafFilterSource::new(raw_source, min_maf)?;
         let model = HwePcaModel::fit_k_with_options_and_progress(
             &mut source,
@@ -309,18 +358,21 @@ fn run_fit(
         )?;
         let retained = source.retained_indices().to_vec();
         let keys = source.take_variant_keys();
-        let outcome = source.inner_mut().take_selection_outcome();
+        let outcome = source.inner_mut().inner_mut().take_selection_outcome();
         let retained_indices = if keys.is_some() { None } else { Some(retained) };
         (model, retained_indices, outcome, keys)
     } else {
-        let mut source = dataset.block_source_with_plan(selection_plan.clone())?;
+        let mut source = subset_samples(
+            dataset.block_source_with_plan(selection_plan.clone())?,
+            keep_indices.as_deref(),
+        )?;
         let model = HwePcaModel::fit_k_with_options_and_progress(
             &mut source,
             components,
             &fit_options,
             &progress,
         )?;
-        let outcome = source.take_selection_outcome();
+        let outcome = source.inner_mut().take_selection_outcome();
         let keys = source.take_variant_keys();
         (model, None, outcome, keys)
     };
@@ -408,16 +460,129 @@ fn run_fit(
         println!("Note: dataset provides only {retained} positive principal components.");
     }
 
+    if model.n_samples() != fit_n_samples {
+        return Err(MapDriverError::InvalidState(format!(
+            "fit produced {} sample rows but {fit_n_samples} samples were retained",
+            model.n_samples()
+        )));
+    }
+
     let model_path = save_hwe_model(&dataset, &model)?;
-    let manifest_path = save_sample_manifest(&dataset)?;
+    let manifest_path = save_sample_manifest(&dataset, retained_samples)?;
     let summary_path = save_fit_summary(&dataset, &model)?;
+    let (scores_path, scores_metadata_path) = save_fit_scores(&dataset, &model, retained_samples)?;
 
     println!("Generated output artifacts:");
     println!("  • Model JSON      : {}", model_path.display());
     println!("  • Sample manifest : {}", manifest_path.display());
     println!("  • Fit summary     : {}", summary_path.display());
+    println!("  • Sample scores   : {}", scores_path.display());
+    println!("  • Score metadata  : {}", scores_metadata_path.display());
 
     Ok(())
+}
+
+/// Wraps a dataset block source so the fit sees only the retained sample rows.
+///
+/// With no `--keep` the wrapper is the identity: it forwards every call,
+/// including the packed hard-call fast path, so the unsubset fit reads exactly
+/// as it did before.
+fn subset_samples(
+    source: DatasetBlockSource,
+    keep_indices: Option<&[usize]>,
+) -> Result<SampleSubsetSource<DatasetBlockSource>, MapDriverError> {
+    match keep_indices {
+        Some(indices) => Ok(SampleSubsetSource::new(source, indices.to_vec())?),
+        None => Ok(SampleSubsetSource::passthrough(source)),
+    }
+}
+
+/// Resolves a `--keep` file of individual IDs into dataset row positions.
+///
+/// The file format matches `gnomon score --keep`: one IID per line, blank lines
+/// ignored. Unknown IIDs are an error rather than a silent drop — a keep list
+/// that half-matches almost always means the wrong list, and a PCA fit on a
+/// silently truncated cohort looks perfectly healthy in every output. The
+/// returned positions are sorted, so the retained samples stay in dataset order.
+fn resolve_keep_indices(
+    keep_path: &Path,
+    samples: &[SampleRecord],
+) -> Result<Vec<usize>, MapDriverError> {
+    let file = File::open(keep_path)?;
+    let mut requested: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for line in BufReader::new(file).lines() {
+        let line = line?;
+        let iid = line.trim();
+        if iid.is_empty() {
+            continue;
+        }
+        if seen.insert(iid.to_string()) {
+            requested.push(iid.to_string());
+        }
+    }
+
+    if requested.is_empty() {
+        return Err(MapDriverError::InvalidState(format!(
+            "Keep file {} lists no individual IDs",
+            keep_path.display()
+        )));
+    }
+
+    // Duplicated IIDs are tracked rather than overwritten: resolving one to
+    // whichever row happened to land last would quietly fit on the wrong rows.
+    let mut position: HashMap<&str, usize> = HashMap::with_capacity(samples.len());
+    let mut ambiguous: HashSet<&str> = HashSet::new();
+    for (idx, record) in samples.iter().enumerate() {
+        if position.insert(record.individual_id.as_str(), idx).is_some() {
+            ambiguous.insert(record.individual_id.as_str());
+        }
+    }
+
+    let mut indices = Vec::with_capacity(requested.len());
+    let mut missing: Vec<&str> = Vec::new();
+    let mut duplicated: Vec<&str> = Vec::new();
+    for iid in &requested {
+        if ambiguous.contains(iid.as_str()) {
+            duplicated.push(iid.as_str());
+            continue;
+        }
+        match position.get(iid.as_str()) {
+            Some(&idx) => indices.push(idx),
+            None => missing.push(iid.as_str()),
+        }
+    }
+
+    if !duplicated.is_empty() {
+        return Err(MapDriverError::InvalidState(format!(
+            "Keep file {} requests {} individual ID(s) that appear more than once in the dataset: {}",
+            keep_path.display(),
+            duplicated.len(),
+            format_id_sample(&duplicated)
+        )));
+    }
+
+    if !missing.is_empty() {
+        return Err(MapDriverError::InvalidState(format!(
+            "{} individual(s) from keep file {} were not found in the dataset: {}",
+            missing.len(),
+            keep_path.display(),
+            format_id_sample(&missing)
+        )));
+    }
+
+    indices.sort_unstable();
+    Ok(indices)
+}
+
+fn format_id_sample(ids: &[&str]) -> String {
+    const SAMPLE_SIZE: usize = 5;
+    let shown = ids.iter().take(SAMPLE_SIZE).copied().collect::<Vec<_>>();
+    if ids.len() > SAMPLE_SIZE {
+        format!("[{}, ...]", shown.join(", "))
+    } else {
+        format!("[{}]", shown.join(", "))
+    }
 }
 
 struct MaterializedFitSource {
@@ -923,11 +1088,11 @@ fn map_variant_list_error(path: &Path, err: VariantListError) -> MapDriverError 
 
 #[cfg(test)]
 mod tests {
-    use super::{projection_present_mask, run_project};
+    use super::{projection_present_mask, resolve_keep_indices, run_project};
     use crate::map::fit::HwePcaModel;
     use crate::map::io::{
-        GenotypeDataset, ProjectionOutputPaths, SelectionPlan, load_hwe_model, save_hwe_model,
-        save_projection_results,
+        GenotypeDataset, ProjectionOutputPaths, SampleRecord, SelectionPlan, load_hwe_model,
+        save_hwe_model, save_projection_results,
     };
     use crate::map::project::ProjectionOptions;
     use crate::map::variant_filter::{VariantFilter, VariantKey, VariantSelection};
@@ -962,6 +1127,69 @@ mod tests {
 
     const TEST_COMPONENTS: usize = 8;
     const TEST_PROJECTION_MATRIX_HEADER_LEN: usize = 32;
+
+    fn sample_records(iids: &[&str]) -> Vec<SampleRecord> {
+        iids.iter()
+            .map(|iid| SampleRecord {
+                family_id: (*iid).to_string(),
+                individual_id: (*iid).to_string(),
+                paternal_id: "0".to_string(),
+                maternal_id: "0".to_string(),
+                sex: "0".to_string(),
+                phenotype: "-9".to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn keep_file_resolves_to_sorted_dataset_positions() -> Result<(), Box<dyn Error>> {
+        let dir = tempdir()?;
+        let keep_path = dir.path().join("keep.txt");
+        // Out of dataset order, with a blank line, padding, and a repeat.
+        fs::write(&keep_path, "s3\n\n  s1  \ns3\n")?;
+
+        let samples = sample_records(&["s0", "s1", "s2", "s3", "s4"]);
+        let indices = resolve_keep_indices(&keep_path, &samples)?;
+
+        assert_eq!(
+            indices,
+            vec![1, 3],
+            "retained rows must be de-duplicated and left in dataset order"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn keep_file_rejects_unknown_empty_and_ambiguous_requests() -> Result<(), Box<dyn Error>> {
+        let dir = tempdir()?;
+        let samples = sample_records(&["s0", "s1"]);
+
+        let missing_path = dir.path().join("missing.txt");
+        fs::write(&missing_path, "s1\ns7\n")?;
+        let err = resolve_keep_indices(&missing_path, &samples)
+            .expect_err("an ID absent from the dataset must not be silently dropped");
+        assert!(
+            err.to_string().contains("s7"),
+            "error should name the missing ID: {err}"
+        );
+
+        let empty_path = dir.path().join("empty.txt");
+        fs::write(&empty_path, "\n   \n")?;
+        assert!(
+            resolve_keep_indices(&empty_path, &samples).is_err(),
+            "a keep file with no IDs leaves nothing to fit"
+        );
+
+        let duplicated = sample_records(&["s0", "s1", "s1"]);
+        let dup_path = dir.path().join("dup.txt");
+        fs::write(&dup_path, "s1\n")?;
+        assert!(
+            resolve_keep_indices(&dup_path, &duplicated).is_err(),
+            "an IID that names two dataset rows is ambiguous, not a coin flip"
+        );
+
+        Ok(())
+    }
     const HGDP_REMOTE_VARIANT_LIST: &str =
         "https://github.com/SauersML/genomic_pca/raw/refs/heads/main/data/GSAv2_hg38.tsv";
     const MANUAL_VARIANT_TARGET: usize = 128;

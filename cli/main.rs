@@ -109,6 +109,12 @@ struct FitArgs {
     #[arg(long, value_name = "PATH")]
     list: Option<PathBuf>,
 
+    /// Path to a file containing a list of individual IDs (IIDs) to include.
+    /// The PCA is then fitted on that subset alone — allele frequencies, the
+    /// MAF screen and LD weights all come from the retained samples.
+    #[arg(long, value_name = "PATH")]
+    keep: Option<PathBuf>,
+
     /// Number of principal components to retain when fitting the HWE PCA model
     #[arg(long, value_name = "N")]
     components: usize,
@@ -686,6 +692,7 @@ fn run_map_fit(args: FitArgs) -> Result<(), Box<dyn std::error::Error>> {
     map_cli::run(map_cli::MapCommand::Fit {
         genotype_path: args.genotype_path,
         variant_list: args.list,
+        keep: args.keep,
         components: args.components,
         maf,
         ld: ld_window,

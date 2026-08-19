@@ -19,7 +19,7 @@ recomputing cohort-specific statistics.
 ## CLI entry points
 | Command | Purpose | Required input | Primary outputs |
 | --- | --- | --- | --- |
-| `gnomon fit --components <N> [--maf MAF] [--list PATH] [--ld] <GENOTYPE_PATH>` | Train a Hardy–Weinberg PCA model | Genotype source (PLINK trio or VCF/BCF files, local or remote) | `hwe.json`, `samples.tsv`, `hwe_summary.tsv` |
+| `gnomon fit --components <N> [--maf MAF] [--list PATH] [--keep PATH] [--ld] <GENOTYPE_PATH>` | Train a Hardy–Weinberg PCA model | Genotype source (PLINK trio or VCF/BCF files, local or remote) | `hwe.json`, `samples.tsv`, `hwe_summary.tsv`, `hwe_scores.bin` plus `hwe_scores.metadata.json` |
 | `gnomon project <GENOTYPE_PATH>` | Project samples with an existing `hwe.json` located next to the genotype data | Matching genotype source aligned to the model's variant set | `projection_scores.bin` plus `projection_scores.metadata.json` |
 
 Both commands print sample and variant counts, resolved source paths, and
@@ -43,9 +43,18 @@ Optional arguments:
   remote) should contain two whitespace-separated columns—chromosome and
   1-based position—with an optional header. Any variants that cannot be found
   are reported before the command exits.
+* `--keep <PATH>` – Restrict fitting to a sample subset. The file holds one
+  individual ID (`IID`) per line, the same format `gnomon score --keep` takes;
+  blank lines are ignored and an ID that is not in the dataset is an error, not
+  a silent drop. The subset is applied before anything else reads genotypes, so
+  allele frequencies, the `--maf` screen, LD weights and the covariance are all
+  computed from the retained samples alone — a within-ancestry PCA needs no
+  pre-subset callset. Retained samples keep their dataset order, and
+  `samples.tsv` plus the score rows list exactly those samples.
 * `--maf <MAF>` – Retain only variants whose observed minor allele frequency in
   the fitting cohort is at least `MAF`. The threshold must be between `0` and
-  `0.5`; filtering runs after `--list` selection and before LD weighting or PCA.
+  `0.5`; filtering runs after `--list` and `--keep` selection and before LD
+  weighting or PCA.
 * `--ld` – Enable linkage disequilibrium flattening. When present, LD weights
   use a default window of 51 variants unless `--sites_window <SITES>` (odd
   number of variants) or `--bp_window <BP>` (total genomic span in base pairs)
@@ -78,7 +87,11 @@ finer-grained monitoring is needed.
 4. `--maf` can remove rare or monomorphic variants before LD weighting and PCA;
    saved model keys, scalers, loadings, and optional LD weights all use the
    filtered variant set.
-5. Requested components beyond the intrinsic rank are clamped, and the driver
+5. `--keep` narrows the sample rows the stream yields, so every statistic above
+   is estimated within the subset. The packed hard-call fast path cannot express
+   a row subset, so a `--keep` fit reads through the `f64` streaming path (the
+   in-memory source cache still repacks the retained rows when it is enabled).
+6. Requested components beyond the intrinsic rank are clamped, and the driver
    reports the retained dimensionality.
 
 ### Outputs written next to the genotype source
@@ -87,9 +100,18 @@ finer-grained monitoring is needed.
   `(chromosome, position)` keys that identify the variant subset when filtering
   was enabled.
 * **`samples.tsv`** – Tab-delimited manifest built from `.fam` content or the
-  VCF/BCF sample list (`FID`, `IID`, `PAT`, `MAT`, `SEX`, `PHENOTYPE`).
+  VCF/BCF sample list (`FID`, `IID`, `PAT`, `MAT`, `SEX`, `PHENOTYPE`), listing
+  the samples the fit actually used — the whole cohort unless `--keep` narrowed
+  it.
 * **`hwe_summary.tsv`** – Key/value table with overall counts, per-component
   explained variance, and explained-variance ratios.
+* **`hwe_scores.bin`** (+ **`hwe_scores.metadata.json`**) – The fitted samples'
+  own PC scores, in the same self-contained matrix container `gnomon project`
+  writes (column-major `f64`, `IID` row IDs embedded, `kind = "scores"`), so the
+  same readers work on both. These are the fit's scores, so they carry none of
+  the spectral shrinkage a projection imposes; round-tripping the training
+  samples back through `gnomon project` to recover them is neither necessary nor
+  the same quantity. Row order matches `samples.tsv`.
 
 ## High-dimensionality projection
 Because the biobank and the single individual are standardized on the same reference, the input feature scaling is consistent. However, projecting onto the fitted biobank principal components inherently subjects new data to spectral shrinkage, placing them in a compressed variance space relative to the training set. Attempting to reverse this requires estimating the genome's effective independent dimensionality, which is obscured by linkage disequilibrium. Consequently, gnomon avoids de-shrinkage or OADP/AP rotations, preferring a stable projection over the risk of inaccurate coordinate re-inflation and needless perturbation.

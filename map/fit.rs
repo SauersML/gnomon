@@ -1,3 +1,6 @@
+use super::blocklanczos::{
+    BlockKrylovError, BlockKrylovParams, BlockOperator, block_krylov_eigen,
+};
 use super::progress::{
     FitProgressObserver, FitProgressStage, NoopFitProgress, StageProgressHandle,
 };
@@ -425,6 +428,171 @@ fn observed_maf(values: &[f64]) -> f64 {
 
     let allele_frequency = (sum / (2.0 * calls as f64)).clamp(0.0, 1.0);
     allele_frequency.min(1.0 - allele_frequency)
+}
+
+/// Restricts a [`VariantBlockSource`] to a subset of the dataset's sample rows.
+///
+/// Blocks are laid out column-major per variant
+/// (`storage[variant * n_samples + sample]`), so a row subset is a per-variant
+/// gather of the retained positions. Wrapping happens above the raw dataset
+/// source and below the MAF filter, which is what makes `--keep` mean
+/// "fit the PCA on these samples only": allele frequencies, the MAF screen, LD
+/// weights and the covariance are all computed from the retained rows alone.
+///
+/// [`SampleSubsetSource::passthrough`] is the identity case used when no subset
+/// was requested; it forwards every call — including the packed hard-call fast
+/// path — to the inner source untouched, so the unsubset fit is byte-identical
+/// to one that never saw this wrapper.
+pub struct SampleSubsetSource<S>
+where
+    S: VariantBlockSource,
+{
+    inner: S,
+    /// `None` means "keep every sample", i.e. identity passthrough.
+    indices: Option<Vec<usize>>,
+    inner_n_samples: usize,
+    n_samples: usize,
+    inner_storage: Vec<f64>,
+}
+
+impl<S> SampleSubsetSource<S>
+where
+    S: VariantBlockSource,
+{
+    /// Wraps `inner` without dropping any sample.
+    pub fn passthrough(inner: S) -> Self {
+        let n_samples = inner.n_samples();
+        Self {
+            inner,
+            indices: None,
+            inner_n_samples: n_samples,
+            n_samples,
+            inner_storage: Vec::new(),
+        }
+    }
+
+    /// Wraps `inner`, retaining only the rows at `indices`.
+    ///
+    /// `indices` are positions in the dataset's own sample order and must be
+    /// strictly increasing, which both rules out duplicates and keeps the
+    /// retained rows in dataset order.
+    pub fn new(inner: S, indices: Vec<usize>) -> Result<Self, HwePcaError> {
+        if indices.is_empty() {
+            return Err(HwePcaError::InvalidInput(
+                "sample subset must retain at least one sample",
+            ));
+        }
+        if indices.windows(2).any(|pair| pair[1] <= pair[0]) {
+            return Err(HwePcaError::InvalidInput(
+                "sample subset indices must be strictly increasing",
+            ));
+        }
+        let inner_n_samples = inner.n_samples();
+        if indices.last().copied().unwrap_or(0) >= inner_n_samples {
+            return Err(HwePcaError::InvalidInput(
+                "sample subset index exceeds the dataset sample count",
+            ));
+        }
+        let n_samples = indices.len();
+        Ok(Self {
+            inner,
+            indices: Some(indices),
+            inner_n_samples,
+            n_samples,
+            inner_storage: Vec::new(),
+        })
+    }
+
+    pub fn inner_mut(&mut self) -> &mut S {
+        &mut self.inner
+    }
+}
+
+impl<S> VariantBlockSource for SampleSubsetSource<S>
+where
+    S: VariantBlockSource,
+{
+    type Error = S::Error;
+
+    fn n_samples(&self) -> usize {
+        self.n_samples
+    }
+
+    fn n_variants(&self) -> usize {
+        self.inner.n_variants()
+    }
+
+    fn reset(&mut self) -> Result<(), Self::Error> {
+        self.inner.reset()
+    }
+
+    fn next_block_into(
+        &mut self,
+        max_variants: usize,
+        storage: &mut [f64],
+    ) -> Result<usize, Self::Error> {
+        if self.indices.is_none() {
+            return self.inner.next_block_into(max_variants, storage);
+        }
+        if max_variants == 0 {
+            return Ok(0);
+        }
+
+        let capacity = self.inner_n_samples.saturating_mul(max_variants);
+        if self.inner_storage.len() < capacity {
+            self.inner_storage.resize(capacity, 0.0);
+        }
+
+        let filled = self
+            .inner
+            .next_block_into(max_variants, &mut self.inner_storage[..])?;
+
+        let indices = match self.indices.as_deref() {
+            Some(indices) => indices,
+            None => return Ok(filled),
+        };
+        for local_idx in 0..filled {
+            let src_start = local_idx * self.inner_n_samples;
+            let src = &self.inner_storage[src_start..src_start + self.inner_n_samples];
+            let dst_start = local_idx * self.n_samples;
+            let dst = &mut storage[dst_start..dst_start + self.n_samples];
+            for (out, &row) in dst.iter_mut().zip(indices.iter()) {
+                *out = src[row];
+            }
+        }
+
+        Ok(filled)
+    }
+
+    fn progress_bytes(&self) -> Option<(u64, Option<u64>)> {
+        self.inner.progress_bytes()
+    }
+
+    fn progress_variants(&self) -> Option<(usize, Option<usize>)> {
+        self.inner.progress_variants()
+    }
+
+    fn variant_quality(&self, filled: usize, storage: &mut [f64]) {
+        self.inner.variant_quality(filled, storage);
+    }
+
+    fn block_variant_keys(&self) -> Option<&[VariantKey]> {
+        self.inner.block_variant_keys()
+    }
+
+    fn take_variant_keys(&mut self) -> Option<Vec<VariantKey>> {
+        self.inner.take_variant_keys()
+    }
+
+    fn hard_call_packed(&mut self) -> Option<HardCallPacked<'_>> {
+        if self.indices.is_some() {
+            // The packed view addresses samples by their physical position in
+            // the dataset's 2-bit rows; there is no way to express a row subset
+            // in it, so a subset fit takes the f64 streaming path instead.
+            return None;
+        }
+        self.inner.hard_call_packed()
+    }
 }
 
 fn compute_ld_bp_ranges(
@@ -2338,11 +2506,7 @@ impl HwePcaModel {
 
         let parallelism_guard = ParallelismGuard::new();
         let par = parallelism_guard.active_parallelism();
-        let block_capacity = if n_variants_hint > 0 {
-            min(DEFAULT_BLOCK_WIDTH.max(1), n_variants_hint)
-        } else {
-            DEFAULT_BLOCK_WIDTH.max(1)
-        };
+        let block_capacity = adaptive_block_capacity(n_samples, n_variants_hint);
         let ld_hint = if n_variants_hint > 0 {
             n_variants_hint
         } else if let Some(keys) = options
@@ -3162,6 +3326,120 @@ impl<'a> LinOp<f64> for DenseSymmetricOp<'a> {
     }
 }
 
+/// Variants per streamed tile, sized from the sample count rather than fixed.
+///
+/// A tile is `n_samples × block_capacity` f64s, and the covariance operator
+/// holds **two** of them (the prefetch double-buffer) plus a projection temp.
+/// At the historical fixed 2048 that is ~3.3 GiB per buffer at 200k samples and
+/// ~8 GiB at 500k — scratch alone, before the Krylov basis. Tiles exist to
+/// amortize per-block overhead, which 256 variants already does; past that the
+/// width buys nothing and costs resident memory that the solver has better uses
+/// for.
+///
+/// The result is a pure function of `(n_samples, n_variants_hint)` and machine
+/// memory — deliberately *not* of measured throughput, so two machines with the
+/// same memory produce the same tiling and therefore the same arithmetic.
+fn adaptive_block_capacity(n_samples: usize, n_variants_hint: usize) -> usize {
+    const MIN_BLOCK_WIDTH: usize = 256;
+
+    let cap = if n_samples == 0 {
+        DEFAULT_BLOCK_WIDTH
+    } else {
+        // Two decode buffers plus a projection temp; keep the trio inside an
+        // eighth of memory, matching the Krylov basis budget so the two cannot
+        // together claim the machine.
+        let budget = krylov_basis_budget_bytes();
+        let bytes_per_variant = n_samples.saturating_mul(std::mem::size_of::<f64>());
+        let affordable = if bytes_per_variant == 0 {
+            DEFAULT_BLOCK_WIDTH
+        } else {
+            (budget / 3) / bytes_per_variant
+        };
+        affordable.clamp(MIN_BLOCK_WIDTH, DEFAULT_BLOCK_WIDTH)
+    };
+
+    if n_variants_hint > 0 {
+        min(cap.max(1), n_variants_hint)
+    } else {
+        cap.max(1)
+    }
+}
+
+/// Byte budget for the retained block-Krylov basis.
+///
+/// The basis is `n × (block_width × depth)` f64s — for 500k samples, a 60-wide
+/// block and depth 4 that is ~0.9 GiB, which is a good trade against re-reading
+/// millions of variants. It is still bounded, because "a good trade" stops
+/// being true if the basis becomes the largest object in the process; past the
+/// budget the solver restarts from its current Ritz block instead of growing.
+fn krylov_basis_budget_bytes() -> usize {
+    const FLOOR: usize = 256 * 1024 * 1024;
+    match detect_total_memory_bytes() {
+        Some(total) if total > 0 => {
+            let eighth = (total / 8).min(usize::MAX as u64) as usize;
+            eighth.max(FLOOR)
+        }
+        _ => FLOOR,
+    }
+}
+
+/// Adapts the streaming covariance operator to the block-Krylov solver.
+///
+/// `LinOp::apply` cannot return a `Result` (faer's signature has no room for
+/// one), so the streaming operator signals failure by panicking with
+/// [`OperatorError`] and stashing the real error. This adapter is where that
+/// convention is converted back into a `Result` for the solver.
+struct StreamingBlockOperator<'a, 'b, S, P>
+where
+    S: VariantBlockSource + Send,
+    S::Error: Error + Send + Sync + 'static,
+    P: FitProgressObserver + Send + Sync + 'static,
+{
+    inner: &'a StandardizedCovarianceOp<'b, S, P>,
+    par: Par,
+}
+
+impl<S, P> BlockOperator for StreamingBlockOperator<'_, '_, S, P>
+where
+    S: VariantBlockSource + Send,
+    S::Error: Error + Send + Sync + 'static,
+    P: FitProgressObserver + Send + Sync + 'static,
+{
+    type Error = HwePcaError;
+
+    fn dim(&self) -> usize {
+        self.inner.n_samples()
+    }
+
+    fn apply_block(
+        &self,
+        out: MatMut<'_, f64>,
+        q: MatRef<'_, f64>,
+    ) -> Result<(), Self::Error> {
+        let scratch = self.inner.apply_scratch(q.ncols(), self.par);
+        let mut mem = MemBuffer::new(scratch);
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let stack = MemStack::new(&mut mem);
+            self.inner.apply(out, q, self.par, stack);
+        }));
+
+        match result {
+            Ok(()) => Ok(()),
+            Err(payload) => {
+                if payload.downcast_ref::<OperatorError>().is_some() {
+                    return Err(self.inner.take_error().unwrap_or_else(|| {
+                        HwePcaError::Eigen(
+                            "covariance operator aborted with an internal error".into(),
+                        )
+                    }));
+                }
+                std::panic::resume_unwind(payload);
+            }
+        }
+    }
+}
+
 fn compute_covariance_eigenpairs<S, P>(
     operator: &StandardizedCovarianceOp<'_, S, P>,
     par: Par,
@@ -3207,57 +3485,62 @@ where
         return compute_covariance_eigenpairs_dense(operator, par, desired, progress);
     }
 
-    let normalization = (n as f64).sqrt();
-    let v0 = Col::from_fn(n, |_| 1.0 / normalization);
-    let mut target = desired.min(upper_target).max(1);
+    // Block Krylov: one genome pass advances every requested component at once.
+    //
+    // The operator already applies `C` to an entire block of sample-space
+    // vectors in a single streamed pass over the variants, so growing the
+    // Krylov space by one column per pass — which is what a vector-at-a-time
+    // Arnoldi does — spends the expensive resource (a genome traversal) to buy
+    // the cheap one (a matrix-vector product). See `super::blocklanczos`.
+    let requested = desired.min(upper_target).max(1);
+    let params = BlockKrylovParams::auto(requested, n, krylov_basis_budget_bytes());
+    let block_operator = StreamingBlockOperator {
+        inner: operator,
+        par,
+    };
 
-    loop {
-        let params = partial_solver_params(n, target);
-        let (info, eigvals, eigvecs) = run_partial_eigensolver(operator, target, par, &v0, params)?;
+    let outcome =
+        block_krylov_eigen(&block_operator, requested, params, par).map_err(|err| match err {
+            BlockKrylovError::Operator(inner) => inner,
+            other => HwePcaError::Eigen(other.to_string()),
+        })?;
 
-        let n_converged = info.n_converged_eigen.min(target);
-
-        let positive = eigvals
-            .iter()
-            .take(n_converged)
-            .filter(|&&v| v > EIGENVALUE_EPSILON)
-            .count();
-
-        if positive == 0 {
-            return Ok(Eigenpairs {
-                values: Vec::new(),
-                vectors: Mat::zeros(n, 0),
-            });
-        }
-
-        let keep = positive.min(desired);
-        let mut ordering = Vec::with_capacity(n_converged);
-        for idx in 0..n_converged {
-            ordering.push((idx, eigvals[idx]));
-        }
-
-        let mid = select_top_k_desc(&mut ordering, keep);
-
-        let mut values = Vec::with_capacity(mid);
-        let mut vectors = Mat::zeros(n, mid);
-        for (out_idx, (src_idx, value)) in ordering[..mid].iter().copied().enumerate() {
-            values.push(value);
-            for row in 0..n {
-                vectors[(row, out_idx)] = eigvecs[(row, src_idx)];
-            }
-        }
-
-        if keep >= desired || target >= upper_target {
-            return Ok(Eigenpairs { values, vectors });
-        }
-
-        let next_target = (target * 2).min(upper_target);
-        if next_target == target {
-            return Ok(Eigenpairs { values, vectors });
-        }
-
-        target = next_target;
+    if !outcome.converged {
+        // An unconverged subspace is reported as such rather than handed back
+        // as though it were a finished fit.
+        eprintln!(
+            "warning: PCA eigensolver stopped after {} covariance passes without reaching its \
+             tolerance (worst relative Ritz residual {:.3e}, subspace change {:.3e}); the \
+             reported components are the best available estimate.",
+            outcome.passes, outcome.max_relative_residual, outcome.subspace_delta
+        );
     }
+
+    // Ritz values arrive in descending order, so the positive prefix is the
+    // usable spectrum.
+    let positive = outcome
+        .values
+        .iter()
+        .take_while(|value| **value > EIGENVALUE_EPSILON)
+        .count();
+    let keep = positive.min(desired);
+    if keep == 0 {
+        return Ok(Eigenpairs {
+            values: Vec::new(),
+            vectors: Mat::zeros(n, 0),
+        });
+    }
+
+    let mut values = Vec::with_capacity(keep);
+    let mut vectors = Mat::zeros(n, keep);
+    for idx in 0..keep {
+        values.push(outcome.values[idx]);
+        for row in 0..n {
+            vectors[(row, idx)] = outcome.vectors[(row, idx)];
+        }
+    }
+
+    Ok(Eigenpairs { values, vectors })
 }
 
 fn compute_covariance_eigenpairs_dense<S, P>(
@@ -3324,8 +3607,7 @@ where
     let upper_target = n.min(MAX_PARTIAL_COMPONENTS.max(top_k));
     let mut target = top_k.min(upper_target).max(1);
 
-    let normalization = (n as f64).sqrt();
-    let v0 = Col::from_fn(n, |_| 1.0 / normalization);
+    let v0 = krylov_seed_vector(n);
     let op = DenseSymmetricOp { matrix: gram };
 
     loop {
@@ -3760,6 +4042,60 @@ where
     }
 }
 
+/// Deterministic starting vector for the Krylov eigensolvers.
+///
+/// The all-ones vector is **not** a usable seed here. Every variant column is
+/// centered on its own observed mean (`allele_freq = mean(non-missing)/2`, with
+/// missing calls landing on zero after centering), so each standardized column
+/// sums to zero: `Xᵀ1 = 0`, and therefore `C·1 = X(Xᵀ1)/(n-1) = 0` exactly. The
+/// all-ones vector is precisely the sample covariance's null direction, so in
+/// exact arithmetic the Krylov sequence `1, C1, C²1, …` is identically zero and
+/// carries no information about the leading eigenspace at all. Seeding with it
+/// only ever worked because rounding leaves ~ε of noise for the first operator
+/// application to amplify into a generic direction — a property of the floating
+/// point error, not of the algorithm.
+///
+/// Instead: a fixed-stream pseudo-random vector with its mean removed, so the
+/// known null direction is excluded by construction and the first application
+/// does real work. The stream is an inline SplitMix64 rather than `rand`, so a
+/// fit stays bit-for-bit reproducible across runs, machines and dependency
+/// bumps — reproducibility is why this is not simply seeded from entropy.
+fn krylov_seed_vector(n: usize) -> Col<f64> {
+    let mut state: u64 = 0x243F_6A88_85A3_08D3; // fixed seed: reproducible fits
+    let mut values = Vec::with_capacity(n);
+    for _ in 0..n {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        // Top 53 bits -> [0, 1) exactly representable, then shifted to [-1, 1).
+        let unit = (z >> 11) as f64 / (1u64 << 53) as f64;
+        values.push(unit.mul_add(2.0, -1.0));
+    }
+
+    if n > 0 {
+        let mean = values.iter().sum::<f64>() / n as f64;
+        for value in values.iter_mut() {
+            *value -= mean;
+        }
+    }
+
+    let norm_sq: f64 = values.iter().map(|v| v * v).sum();
+    if norm_sq > 0.0 {
+        let inv = norm_sq.sqrt().recip();
+        for value in values.iter_mut() {
+            *value *= inv;
+        }
+    } else if let Some(first) = values.first_mut() {
+        // n == 1: mean removal zeroes the only entry. Any unit vector will do,
+        // and this case never reaches a partial solve (max_rank is 0).
+        *first = 1.0;
+    }
+
+    Col::from_fn(n, |idx| values[idx])
+}
+
 fn partial_solver_params(n: usize, target: usize) -> PartialEigenParams {
     let mut params = PartialEigenParams::default();
     let max_available = n.saturating_sub(1);
@@ -3770,65 +4106,6 @@ fn partial_solver_params(n: usize, target: usize) -> PartialEigenParams {
     }
     params.max_restarts = 2048;
     params
-}
-
-fn run_partial_eigensolver<S, P>(
-    operator: &StandardizedCovarianceOp<'_, S, P>,
-    target: usize,
-    par: Par,
-    v0: &Col<f64>,
-    params: PartialEigenParams,
-) -> Result<(PartialEigenInfo, Vec<f64>, Mat<f64>), HwePcaError>
-where
-    S: VariantBlockSource + Send,
-    S::Error: Error + Send + Sync + 'static,
-    P: FitProgressObserver + Send + Sync + 'static,
-{
-    let n = operator.n_samples();
-    let mut eigvecs = Mat::zeros(n, target);
-    let mut eigvals = vec![0.0f64; target];
-
-    // The partial eigensolver can increase its working subspace dimension up to
-    // `params.max_dim` during restarts. The scratch allocator must therefore be
-    // sized for the worst-case dimension rather than the requested target, or
-    // faer's internal workspace requests will overflow the provided buffer.
-    let scratch = partial_eigen_scratch(operator, params.max_dim, par, params);
-    let mut mem = MemBuffer::new(scratch);
-
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        let stack = MemStack::new(&mut mem);
-        partial_self_adjoint_eigen(
-            eigvecs.as_mut(),
-            &mut eigvals,
-            operator,
-            v0.as_ref(),
-            f64::EPSILON * 128.0,
-            par,
-            stack,
-            params,
-        )
-    }));
-
-    let info = match result {
-        Ok(info) => info,
-        Err(payload) => {
-            if payload.downcast_ref::<OperatorError>().is_some() {
-                let err = operator.take_error().unwrap_or_else(|| {
-                    HwePcaError::Eigen(
-                        "matrix-free eigensolver aborted with an internal error".into(),
-                    )
-                });
-                return Err(err);
-            }
-            std::panic::resume_unwind(payload);
-        }
-    };
-
-    if let Some(err) = operator.take_error() {
-        return Err(err);
-    }
-
-    Ok((info, eigvals, eigvecs))
 }
 
 fn compute_variant_statistics<S, P>(
@@ -5857,6 +6134,184 @@ mod tests {
 
         let expected = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
         assert_eq!(block_data, expected);
+    }
+
+    fn drain_source<S>(source: &mut S, block_width: usize) -> Vec<f64>
+    where
+        S: VariantBlockSource,
+        S::Error: fmt::Debug,
+    {
+        let n_samples = source.n_samples();
+        let mut block = vec![0.0f64; n_samples * block_width];
+        let mut collected = Vec::new();
+        loop {
+            let filled = source
+                .next_block_into(block_width, &mut block)
+                .expect("block read");
+            if filled == 0 {
+                break;
+            }
+            collected.extend_from_slice(&block[..filled * n_samples]);
+        }
+        collected
+    }
+
+    /// Column-major genotype matrix with a fixed pseudo-random pattern, so both
+    /// sides of an equivalence test see byte-identical inputs.
+    fn synthetic_genotypes(n_samples: usize, n_variants: usize) -> Vec<f64> {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut data = Vec::with_capacity(n_samples * n_variants);
+        for _ in 0..n_samples * n_variants {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            data.push(((state >> 33) % 3) as f64);
+        }
+        data
+    }
+
+    #[test]
+    fn tile_width_shrinks_as_the_cohort_grows() {
+        // Small cohorts keep the wide tile: the buffers are trivial and wider
+        // tiles amortize per-block overhead.
+        assert_eq!(adaptive_block_capacity(1_000, 0), DEFAULT_BLOCK_WIDTH);
+
+        // A biobank-scale cohort must not silently reserve gigabytes per
+        // decode buffer just because the width was a compile-time constant.
+        let wide = adaptive_block_capacity(1_000, 0);
+        let narrow = adaptive_block_capacity(2_000_000, 0);
+        assert!(
+            narrow <= wide,
+            "tile width must not grow with the sample count: {narrow} vs {wide}"
+        );
+
+        // The variant hint still bounds it, and it never reaches zero.
+        assert_eq!(adaptive_block_capacity(1_000, 7), 7);
+        assert!(adaptive_block_capacity(usize::MAX / 16, 0) >= 1);
+    }
+
+    #[test]
+    fn sample_subset_source_gathers_requested_rows() {
+        // 4 samples × 3 variants, column-major per variant.
+        let data: Vec<f64> = vec![
+            10.0, 11.0, 12.0, 13.0, 20.0, 21.0, 22.0, 23.0, 30.0, 31.0, 32.0, 33.0,
+        ];
+        let inner = DenseBlockSource::new(&data, 4, 3).expect("dense source");
+        let mut source = SampleSubsetSource::new(inner, vec![1, 3]).expect("subset source");
+
+        assert_eq!(source.n_samples(), 2);
+        assert_eq!(source.n_variants(), 3);
+
+        // Block width 2 so the gather runs across more than one block.
+        let gathered = drain_source(&mut source, 2);
+        assert_eq!(
+            gathered,
+            vec![11.0, 13.0, 21.0, 23.0, 31.0, 33.0],
+            "subset must keep the requested rows, in dataset order, per variant"
+        );
+
+        source.reset().expect("reset");
+        assert_eq!(drain_source(&mut source, 3), gathered, "reset must rewind");
+    }
+
+    #[test]
+    fn sample_subset_passthrough_is_the_identity() {
+        let data = synthetic_genotypes(5, 7);
+        let inner = DenseBlockSource::new(&data, 5, 7).expect("dense source");
+        let mut source = SampleSubsetSource::passthrough(inner);
+
+        assert_eq!(source.n_samples(), 5);
+        assert_eq!(drain_source(&mut source, 4), data);
+    }
+
+    #[test]
+    fn sample_subset_rejects_malformed_index_sets() {
+        let data = synthetic_genotypes(4, 2);
+        let make = || DenseBlockSource::new(&data, 4, 2).expect("dense source");
+
+        assert!(
+            SampleSubsetSource::new(make(), Vec::new()).is_err(),
+            "an empty subset leaves nothing to fit"
+        );
+        assert!(
+            SampleSubsetSource::new(make(), vec![2, 1]).is_err(),
+            "out-of-order indices would scramble the sample order"
+        );
+        assert!(
+            SampleSubsetSource::new(make(), vec![1, 1]).is_err(),
+            "a duplicated row would be counted twice in every statistic"
+        );
+        assert!(
+            SampleSubsetSource::new(make(), vec![0, 4]).is_err(),
+            "an index past the last sample must not read out of bounds"
+        );
+    }
+
+    #[test]
+    fn subset_fit_matches_a_fit_on_the_pre_subset_matrix() {
+        const N_SAMPLES: usize = 12;
+        const N_VARIANTS: usize = 40;
+        const COMPONENTS: usize = 3;
+        let keep: [usize; 7] = [0, 2, 3, 5, 8, 9, 11];
+
+        let full = synthetic_genotypes(N_SAMPLES, N_VARIANTS);
+
+        // What a caller would otherwise have to materialize with plink2 first.
+        let mut pre_subset = Vec::with_capacity(keep.len() * N_VARIANTS);
+        for variant in 0..N_VARIANTS {
+            for &row in keep.iter() {
+                pre_subset.push(full[variant * N_SAMPLES + row]);
+            }
+        }
+
+        let mut subset_source = SampleSubsetSource::new(
+            DenseBlockSource::new(&full, N_SAMPLES, N_VARIANTS).expect("dense source"),
+            keep.to_vec(),
+        )
+        .expect("subset source");
+        let subset_model =
+            HwePcaModel::fit_k(&mut subset_source, COMPONENTS).expect("subset fit succeeds");
+
+        let mut reference_source =
+            DenseBlockSource::new(&pre_subset, keep.len(), N_VARIANTS).expect("dense source");
+        let reference_model =
+            HwePcaModel::fit_k(&mut reference_source, COMPONENTS).expect("reference fit succeeds");
+
+        assert_eq!(subset_model.n_samples(), keep.len());
+        assert_eq!(subset_model.components(), reference_model.components());
+
+        for (subset, reference) in subset_model
+            .explained_variance()
+            .iter()
+            .zip(reference_model.explained_variance())
+        {
+            assert!(
+                (subset - reference).abs() <= 1e-10 * reference.abs().max(1.0),
+                "eigenvalues diverged: {subset} vs {reference}"
+            );
+        }
+
+        // Scores are compared per component up to an overall sign, which is the
+        // only freedom an eigenvector has.
+        let subset_scores = subset_model.sample_scores();
+        let reference_scores = reference_model.sample_scores();
+        assert_eq!(subset_scores.nrows(), reference_scores.nrows());
+        for component in 0..subset_model.components() {
+            let mut max_delta = f64::INFINITY;
+            for sign in [1.0f64, -1.0] {
+                let delta = (0..subset_scores.nrows())
+                    .map(|row| {
+                        (subset_scores[(row, component)] - sign * reference_scores[(row, component)])
+                            .abs()
+                    })
+                    .fold(0.0f64, f64::max);
+                max_delta = max_delta.min(delta);
+            }
+            assert!(
+                max_delta <= 1e-8,
+                "component {component} scores diverged by {max_delta}"
+            );
+        }
     }
 
     const TEST_VCF_URL: &str = "https://raw.githubusercontent.com/SauersML/genomic_pca/refs/heads/main/tests/chr22_chunk.vcf.gz";

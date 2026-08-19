@@ -916,13 +916,14 @@ pub fn save_projection_results(
 
     let scores_path = dataset.output_path("projection_scores.bin");
     let scores_metadata =
-        write_projection_matrix(&scores_path, &result.scores, "scores", &row_id_section)?;
+        write_projection_matrix(&scores_path, scores, "scores", &row_id_section)?;
 
     let mut alignment_path = None;
     let mut alignment_metadata = None;
     if let Some(alignment) = result.alignment.as_ref() {
         let path = dataset.output_path("projection_alignment.bin");
-        let metadata = write_projection_matrix(&path, alignment, "alignment", &row_id_section)?;
+        let metadata =
+            write_projection_matrix(&path, alignment.as_ref(), "alignment", &row_id_section)?;
         alignment_path = Some(path);
         alignment_metadata = Some(metadata);
     }
@@ -1014,7 +1015,7 @@ pub fn create_projection_matrix_sink_at(
 
 fn write_projection_matrix(
     matrix_path: &Path,
-    matrix: &faer::Mat<f64>,
+    matrix: faer::MatRef<'_, f64>,
     kind: &'static str,
     row_id_section: &[u8],
 ) -> Result<PathBuf, DatasetOutputError> {
@@ -1031,8 +1032,13 @@ fn write_projection_matrix(
     {
         let mut writer = BufWriter::with_capacity(16 * 1024 * 1024, File::create(&matrix_tmp)?);
         write_projection_header(&mut writer, matrix.nrows(), matrix.ncols())?;
-        for col in 0..matrix.ncols() {
-            write_f64_slice(&mut writer, matrix.col_as_slice(col))?;
+        for column in matrix.col_iter() {
+            let contiguous = column.try_as_col_major().ok_or_else(|| {
+                DatasetOutputError::InvalidState(
+                    "projection matrix columns must be contiguous".into(),
+                )
+            })?;
+            write_f64_slice(&mut writer, contiguous.as_slice())?;
         }
         writer.write_all(row_id_section)?;
         writer.flush()?;
@@ -1583,14 +1589,22 @@ fn read_string_with_len<R: Read>(reader: &mut R, len: usize) -> Result<String, D
     })
 }
 
-pub fn save_sample_manifest(dataset: &GenotypeDataset) -> Result<PathBuf, DatasetOutputError> {
+/// Writes the manifest of the samples a fit actually used.
+///
+/// `samples` is the retained sample set in dataset order — every sample unless
+/// `--keep` narrowed it — so the manifest's row order is exactly the row order
+/// of the model's sample scores.
+pub fn save_sample_manifest(
+    dataset: &GenotypeDataset,
+    samples: &[SampleRecord],
+) -> Result<PathBuf, DatasetOutputError> {
     let manifest_path = dataset.output_path("samples.tsv");
     prepare_output_path(&manifest_path)?;
     let mut writer = BufWriter::new(File::create(&manifest_path)?);
 
     writeln!(writer, "FID\tIID\tPAT\tMAT\tSEX\tPHENOTYPE")?;
 
-    for record in dataset.samples() {
+    for record in samples {
         writeln!(
             writer,
             "{}\t{}\t{}\t{}\t{}\t{}",
@@ -1605,6 +1619,42 @@ pub fn save_sample_manifest(dataset: &GenotypeDataset) -> Result<PathBuf, Datase
 
     writer.flush()?;
     Ok(manifest_path)
+}
+
+/// Writes the fitted model's per-sample PC scores as a binary matrix artifact.
+///
+/// The container is the same `GNPRJ001` format `projection_scores.bin` uses —
+/// column-major f64, `kind = "scores"`, IID row-id section — so every existing
+/// reader works on it unchanged. The scores are the fit's own sample scores
+/// (`U·S` in the fit's metric), *not* a re-projection: they carry no spectral
+/// shrinkage, which is exactly why re-running `project` over the training
+/// samples to recover them is both wasteful and a slightly different quantity.
+///
+/// Rows follow `samples`, the fit's retained sample set in dataset order.
+pub fn save_fit_scores(
+    dataset: &GenotypeDataset,
+    model: &HwePcaModel,
+    samples: &[SampleRecord],
+) -> Result<(PathBuf, PathBuf), DatasetOutputError> {
+    let scores = model.sample_scores();
+    if scores.nrows() != samples.len() {
+        return Err(DatasetOutputError::InvalidState(format!(
+            "fitted model carries {} score rows but {} samples were retained",
+            scores.nrows(),
+            samples.len()
+        )));
+    }
+
+    let row_ids: Vec<&str> = samples
+        .iter()
+        .map(|record| record.individual_id.as_str())
+        .collect();
+    let row_id_section = build_projection_row_id_section_from_ids(&row_ids)?;
+
+    let scores_path = dataset.output_path("hwe_scores.bin");
+    let metadata_path = write_projection_matrix(&scores_path, scores, "scores", &row_id_section)?;
+
+    Ok((scores_path, metadata_path))
 }
 
 pub fn save_fit_summary(

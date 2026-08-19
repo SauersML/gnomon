@@ -1,3 +1,4 @@
+pub mod blocklanczos;
 pub mod correctability;
 pub mod fit;
 pub mod io;
