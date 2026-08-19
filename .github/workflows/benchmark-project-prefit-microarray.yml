@@ -3,6 +3,9 @@ name: Benchmark Project Prefit Microarray
 on:
   workflow_dispatch:
   push:
+    # See release-fit.yml: without a branch filter this heavy benchmark runs
+    # on every branch push and starves the test workflow for runners.
+    branches: [main]
     paths:
       - "Cargo.toml"
       - "Cargo.lock"

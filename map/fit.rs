@@ -2982,20 +2982,25 @@ impl HwePcaModel {
             ));
         }
 
-        let (mut singular_values, mut sample_scores) =
-            build_sample_scores(n_samples, &decomposition);
-
-        let (mut loadings, standardized_frobenius_sq) = compute_variant_loadings(
-            source,
-            &scaler,
-            variant_count,
-            block_capacity,
-            decomposition.vectors.as_ref(),
-            &singular_values,
-            ld_weights_arc.as_deref(),
-            progress,
-            par,
-        )?;
+        // One last traversal of the genome, and every number the model stores is
+        // derived from what that traversal saw.
+        //
+        // The pass forms `B = Xᵀ·U`, the cross-product of each variant with the
+        // sample basis the eigensolver returned, and — out of the same blocks,
+        // for no extra genotype read — the small `k×k` Gram `BᵀB`, which is
+        // `(n−1)·Uᵀ·C·U`: the covariance restricted to the returned subspace,
+        // written in that subspace's own coordinates.
+        let (mut loadings, restricted_gram, standardized_frobenius_sq) =
+            compute_loading_cross_products(
+                source,
+                &scaler,
+                variant_count,
+                block_capacity,
+                decomposition.vectors.as_ref(),
+                ld_weights_arc.as_deref(),
+                progress,
+                par,
+            )?;
 
         // Total variance = trace(covariance) = ‖X‖²_F / (n−1), where X is the
         // standardized (optionally LD-weighted) genotype matrix. The loadings
@@ -3004,11 +3009,63 @@ impl HwePcaModel {
         // full-spectrum variance even when only the top components are solved.
         let total_variance = standardized_frobenius_sq / (n_samples - 1) as f64;
 
-        let component_weighted_norms_sq = renormalize_variant_loadings(
-            loadings.as_mut(),
-            &mut singular_values,
-            sample_scores.as_mut(),
-        );
+        // Rayleigh-Ritz: diagonalize that restricted covariance and rotate the
+        // basis onto its eigenvectors.
+        //
+        // An iterative solve stops at *a* basis for the top subspace, not at the
+        // eigenvectors inside it; the dense route returns eigenvectors, but of a
+        // covariance accumulated in a different pass from this one. Either way
+        // `Uᵀ·C·U` is only approximately diagonal on arrival, and its
+        // off-diagonal mass is precisely the error. Rotating by its eigenvectors
+        // annihilates that mass against the genotypes streamed *here*, so the
+        // eigenvalues, singular values, scores and loadings assembled below all
+        // describe one and the same matrix instead of three nearby ones.
+        let (eigenvalues, rotation) = rayleigh_ritz_rotation(restricted_gram.as_ref(), n_samples)?;
+        if eigenvalues.is_empty() {
+            return Err(HwePcaError::Eigen(
+                "No component survived the final refinement against the streamed genotypes; \
+                 increase cohort size or review input data"
+                    .into(),
+            ));
+        }
+
+        // The rotation refines the pairs the solver produced; it says nothing
+        // about how that solve terminated, so its record travels unaltered.
+        let diagnostics = decomposition.diagnostics;
+        let refined = Eigenpairs {
+            values: eigenvalues,
+            vectors: rotate_columns(decomposition.vectors, rotation.as_ref(), block_capacity, par),
+            diagnostics,
+        };
+        loadings = rotate_columns(loadings, rotation.as_ref(), block_capacity, par);
+
+        // σ_i = √((n−1)·λ_i) and scores = U·Σ, both read off the refined
+        // eigenvalues, so `λ_i = σ_i²/(n−1)` holds for the quantities stored
+        // rather than for a canonical set computed on demand beside them.
+        let (singular_values, sample_scores) = build_sample_scores(n_samples, &refined);
+
+        // V_i = B_i/σ_i. `‖B_i‖² = (n−1)·λ_i = σ_i²` and `B_iᵀ·B_j = 0` off the
+        // diagonal, both by construction, because `B` was just rotated into the
+        // eigenbasis of `BᵀB`: the columns come out orthonormal, not merely unit
+        // length, and there is nothing left for a rescaling pass to fix.
+        //
+        // The `EIGENVALUE_EPSILON` filter above guarantees `σ_i > 0`; the zero
+        // branch is what stops a component that somehow slipped past it from
+        // becoming a column of infinities.
+        for (column, &sigma) in loadings.col_iter_mut().zip(singular_values.iter()) {
+            let inverse = if sigma > 0.0 { sigma.recip() } else { 0.0 };
+            zip!(column).for_each(|unzip!(value)| {
+                *value *= inverse;
+            });
+        }
+
+        // Euclidean, deliberately: this is the denominator the projector divides
+        // the per-axis mass in `global_info_packed` by, and that matrix is
+        // `Σ_j L_j·L_jᵀ` with no LD weight anywhere in it. Orthonormal columns
+        // put every entry at 1 to rounding; measuring it rather than asserting it
+        // keeps the pair consistent for any component the σ guard zeroed out.
+        let component_weighted_norms_sq =
+            compute_component_weighted_norms_sq(loadings.as_ref(), None);
         let projection_cache = Arc::new(build_projection_model_cache(
             &scaler,
             loadings.as_ref(),
@@ -3019,17 +3076,17 @@ impl HwePcaModel {
             n_samples,
             n_variants: variant_count,
             scaler,
-            eigenvalues: decomposition.values,
+            eigenvalues: refined.values,
             total_variance,
             singular_values,
-            sample_basis: decomposition.vectors,
+            sample_basis: refined.vectors,
             sample_scores,
             loadings,
             component_weighted_norms_sq,
             variant_keys: None,
             ld: ld_weights,
             genome_build: None,
-            diagnostics: decomposition.diagnostics,
+            diagnostics: refined.diagnostics,
             projection_cache,
         })
     }
@@ -3054,27 +3111,22 @@ impl HwePcaModel {
         &self.eigenvalues
     }
 
-    /// Returns the singular values after renormalizing the variant loadings.
+    /// Singular values of the standardized genotype matrix: `σ_i = √((n−1)·λ_i)`.
     ///
-    /// These values remain consistent with [`HwePcaModel::variant_loadings`] and
-    /// [`HwePcaModel::sample_scores`] after the post-fit rescaling step. Use
-    /// [`HwePcaModel::canonical_singular_values`] or [`HwePcaModel::explained_variance`]
-    /// when deriving explained variance in the classical PCA metric.
+    /// One notion of singular value, consistent with everything else the model
+    /// carries. [`HwePcaModel::sample_scores`] is `sample_basis()·Σ`,
+    /// [`HwePcaModel::variant_loadings`] scaled back up by `Σ` is the
+    /// cross-product `Xᵀ·sample_basis()`, and `explained_variance()[i]` is
+    /// exactly `σ_i²/(n−1)`.
+    ///
+    /// There was a second accessor here for the "canonical" values, because a
+    /// post-fit rescaling of the loadings multiplied these and left the
+    /// eigenvalues alone, breaking that last identity and forcing two
+    /// incompatible answers to the same question to coexist. The final
+    /// Rayleigh-Ritz rotation removed the need for the rescaling, and with it
+    /// the need for the second answer.
     pub fn singular_values(&self) -> &[f64] {
         &self.singular_values
-    }
-
-    /// Returns the canonical singular values that satisfy σ²/(n−1)=λ.
-    pub fn canonical_singular_values(&self) -> Vec<f64> {
-        let scale = self.n_samples.saturating_sub(1) as f64;
-        if scale == 0.0 {
-            return vec![0.0; self.eigenvalues.len()];
-        }
-
-        self.eigenvalues
-            .iter()
-            .map(|&lambda| (lambda * scale).max(0.0).sqrt())
-            .collect()
     }
 
     /// Total variance of the data, i.e. the trace of the covariance (sum of the
@@ -5663,67 +5715,149 @@ fn compute_component_weighted_norms_sq(
     norms_sq
 }
 
-fn renormalize_variant_loadings(
-    mut loadings: MatMut<'_, f64>,
-    singular_values: &mut [f64],
-    mut sample_scores: MatMut<'_, f64>,
-) -> Vec<f64> {
-    // Note: We normalize loadings in Euclidean space so that Σ(L²) = 1.
-    // This Euclidean orthonormality ensures that the WLS projection (which minimizes error in weighted space)
-    // simplifies to the Standard Projection (s = Σ x·w·L) when q=1, because LHS = Σ L L^T = I.
-    // We pass `None` for weights to force Euclidean normalization.
-    let mut norms_sq = compute_component_weighted_norms_sq(loadings.as_ref(), None);
+/// Diagonalizes the covariance restricted to the fitted subspace, returning its
+/// eigenvalues and the rotation that carries the solver's basis onto them.
+///
+/// `restricted_gram` is `BᵀB` for `B = Xᵀ·U`, which is `(n−1)·Uᵀ·C·U`. Its
+/// eigenvectors are the Ritz vectors of `C` within the subspace `U` spans, and
+/// its eigenvalues are `(n−1)·λ`. Scaling a matrix by a positive constant moves
+/// no eigenvector, so the Gram is decomposed exactly as accumulated and only the
+/// *reported* eigenvalues are divided down: one multiply per component instead
+/// of a `k×k` rescale, and no rounding inserted ahead of the decomposition.
+///
+/// Ordering and filtering follow the eigensolvers upstream exactly — descending,
+/// keeping only components whose covariance eigenvalue clears
+/// `EIGENVALUE_EPSILON`. A returned subspace really can be rank-deficient: more
+/// components can be requested than the data has, and a Ritz value that was
+/// positive against one pass's covariance can fail against this one. Such a
+/// component has no variance behind it and therefore no singular value to divide
+/// its loadings by, so it is dropped here rather than carried as a column of
+/// noise scaled up by an arbitrarily small σ.
+fn rayleigh_ritz_rotation(
+    restricted_gram: MatRef<'_, f64>,
+    n_samples: usize,
+) -> Result<(Vec<f64>, Mat<f64>), HwePcaError> {
+    let width = restricted_gram.ncols();
+    let eig = restricted_gram
+        .self_adjoint_eigen(Side::Lower)
+        .map_err(|err| {
+            HwePcaError::Eigen(format!("Rayleigh-Ritz eigendecomposition failed: {err:?}"))
+        })?;
+    let diag = eig.S();
+    let basis = eig.U();
 
-    for (component, norm_sq) in norms_sq.iter_mut().enumerate() {
-        let norm = (*norm_sq).sqrt();
-        if !(norm.is_finite() && norm > 0.0) {
-            *norm_sq = 0.0;
-            continue;
+    // The fit rejects cohorts smaller than two samples long before this runs;
+    // the floor is here only so the reciprocal is always defined.
+    let inverse_scale = (n_samples.saturating_sub(1).max(1) as f64).recip();
+    let mut ordering: Vec<(usize, f64)> = (0..width)
+        .map(|idx| (idx, diag[idx] * inverse_scale))
+        .collect();
+    let keep = ordering
+        .iter()
+        .filter(|entry| entry.1 > EIGENVALUE_EPSILON)
+        .count();
+    let mid = select_top_k_desc(&mut ordering, keep);
+
+    let mut values = Vec::with_capacity(mid);
+    let mut rotation = Mat::zeros(width, mid);
+    for (out_idx, (src_idx, value)) in ordering[..mid].iter().copied().enumerate() {
+        values.push(value);
+        for row in 0..width {
+            rotation[(row, out_idx)] = basis[(row, src_idx)];
         }
-
-        let inv = norm.recip();
-        let column_mut = loadings.rb_mut().col_mut(component);
-        zip!(column_mut).for_each(|unzip!(value)| {
-            *value *= inv;
-        });
-
-        singular_values[component] *= norm;
-
-        let score_col = sample_scores.rb_mut().col_mut(component);
-        zip!(score_col).for_each(|unzip!(value)| {
-            *value *= norm;
-        });
-
-        *norm_sq = 1.0;
     }
 
-    norms_sq
+    Ok((values, rotation))
 }
 
-fn compute_variant_loadings<S, P>(
+/// Applies `matrix ← matrix·rotation` in place, one row block at a time.
+///
+/// The two matrices a fit rotates are the two largest things it holds: the `n×k`
+/// sample basis and the `p×k` variant cross-products. Multiplying either into a
+/// freshly allocated result would double the larger of them at the one moment
+/// both are resident, which at biobank `p` is gigabytes. A row block, though,
+/// reads only the rows it is about to overwrite, so a `row_chunk×k` scratch copy
+/// is the entire extra cost.
+///
+/// `rotation` never has more columns than `matrix` does, so the product is
+/// written back over a prefix of the columns it was read from; anything past
+/// `rotation.ncols()` is stale afterwards and the narrowing copy at the end
+/// discards it. `row_chunk` is a blocking granularity and nothing more — any
+/// positive value gives the same answer up to summation order inside the GEMM.
+fn rotate_columns(
+    mut matrix: Mat<f64>,
+    rotation: MatRef<'_, f64>,
+    row_chunk: usize,
+    par: Par,
+) -> Mat<f64> {
+    let rows = matrix.nrows();
+    let width = matrix.ncols();
+    let kept = rotation.ncols();
+    debug_assert_eq!(rotation.nrows(), width);
+    debug_assert!(kept <= width);
+
+    if rows > 0 && width > 0 && kept > 0 {
+        let chunk = row_chunk.clamp(1, rows);
+        let mut scratch = Mat::zeros(chunk, width);
+        let mut start = 0usize;
+        while start < rows {
+            let take = chunk.min(rows - start);
+            scratch
+                .as_mut()
+                .submatrix_mut(0, 0, take, width)
+                .copy_from(matrix.as_ref().submatrix(start, 0, take, width));
+            matmul(
+                matrix.as_mut().submatrix_mut(start, 0, take, kept),
+                Accum::Replace,
+                scratch.as_ref().submatrix(0, 0, take, width),
+                rotation,
+                1.0,
+                par,
+            );
+            start += take;
+        }
+    }
+
+    if kept == width {
+        return matrix;
+    }
+
+    let rotated = matrix.as_ref();
+    Mat::from_fn(rows, kept, |row, col| rotated[(row, col)])
+}
+
+/// Streams the genotypes once to form `B = Xᵀ·U` and, from the same blocks,
+/// `BᵀB`.
+///
+/// `B` is not yet the variant loadings: dividing its columns by σ is deferred
+/// until after the Rayleigh-Ritz rotation, because the σ that makes the division
+/// exact — the one for which `‖B_i‖ = σ_i` — is the one the rotation produces,
+/// not the one the eigensolver arrived with. Scaling here and correcting later
+/// is what forced the model to carry two different sets of singular values.
+///
+/// `BᵀB` accumulates block by block out of the chunk already computed for the
+/// loadings, so the restricted covariance costs one `k`-wide GEMM per block and
+/// not one additional read of the genome. The returned scalar is `‖X‖²_F` over
+/// the standardized (optionally LD-weighted) blocks.
+fn compute_loading_cross_products<S, P>(
     source: &mut S,
     scaler: &HweScaler,
     expected_variants: usize,
     block_capacity: usize,
     sample_basis: MatRef<'_, f64>,
-    singular_values: &[f64],
     ld_weights: Option<&[f64]>,
     progress: &Arc<P>,
     par: Par,
-) -> Result<(Mat<f64>, f64), HwePcaError>
+) -> Result<(Mat<f64>, Mat<f64>, f64), HwePcaError>
 where
     S: VariantBlockSource + Send,
     S::Error: Error + Send + Sync + 'static,
     P: FitProgressObserver + Send + Sync + 'static,
 {
     let n_samples = source.n_samples();
-    let n_components = singular_values.len();
+    let n_components = sample_basis.ncols();
     let loadings = Mat::zeros(expected_variants, n_components);
     let mut chunk_storage = vec![0.0f64; block_capacity * n_components];
-    let inverse_singular: Vec<f64> = singular_values
-        .iter()
-        .map(|&sigma| if sigma > 0.0 { 1.0 / sigma } else { 0.0 })
-        .collect();
 
     progress.on_stage_start(FitProgressStage::Loadings, expected_variants);
 
@@ -5828,6 +5962,9 @@ where
         // Accumulates ‖X‖²_F over the standardized (LD-weighted) blocks, which
         // equals trace(X·Xᵀ) and hence (n−1)·total_variance.
         let mut standardized_frobenius_sq = 0.0f64;
+        // Accumulates BᵀB = (n−1)·Uᵀ·C·U, the covariance restricted to the
+        // subspace the eigensolver returned.
+        let mut restricted_gram = Mat::zeros(n_components, n_components);
         while let Ok(message) = filled_rx.recv() {
             match message {
                 PrefetchMessage::Data { id, filled, start } => {
@@ -5888,16 +6025,16 @@ where
                         par,
                     );
 
-                    {
-                        let chunk_view = chunk.as_mut();
-                        for (column, &inv_sigma) in
-                            chunk_view.col_iter_mut().zip(inverse_singular.iter())
-                        {
-                            zip!(column).for_each(|unzip!(value)| {
-                                *value *= inv_sigma;
-                            });
-                        }
-                    }
+                    // Fold this block's contribution to BᵀB in while the chunk is
+                    // still in cache, before it is copied out to `loadings`.
+                    matmul(
+                        restricted_gram.as_mut(),
+                        Accum::Add,
+                        chunk.as_ref().transpose(),
+                        chunk.as_ref(),
+                        1.0,
+                        par,
+                    );
 
                     loadings
                         .submatrix_mut(start, 0, filled, n_components)
@@ -5926,7 +6063,7 @@ where
 
         progress.on_stage_finish(FitProgressStage::Loadings);
 
-        Ok((loadings, standardized_frobenius_sq))
+        Ok((loadings, restricted_gram, standardized_frobenius_sq))
     })
 }
 
@@ -7130,6 +7267,181 @@ mod tests {
                 max_delta <= 1e-8,
                 "component {component} scores diverged by {max_delta}"
             );
+        }
+    }
+
+    /// A cohort small enough to check by hand and wide enough to be full rank.
+    ///
+    /// Standardization centres every variant column, so the row space of X lives
+    /// in the `n−1` dimensions orthogonal to the all-ones vector; 40 columns
+    /// drawn over 9 samples span all of it. Fitting `n−1` components therefore
+    /// gives a decomposition that is exact rather than truncated, which is what
+    /// lets the reconstruction below be an equality instead of a projection.
+    const INVARIANT_SAMPLES: usize = 9;
+    const INVARIANT_VARIANTS: usize = 40;
+
+    fn invariant_fit() -> HwePcaModel {
+        let data = synthetic_genotypes(INVARIANT_SAMPLES, INVARIANT_VARIANTS);
+        let mut source = DenseBlockSource::new(&data, INVARIANT_SAMPLES, INVARIANT_VARIANTS)
+            .expect("dense source");
+        HwePcaModel::fit_k(&mut source, INVARIANT_SAMPLES - 1).expect("fit succeeds")
+    }
+
+    /// Rebuilds the standardized matrix the fit decomposed, from the same
+    /// deterministic genotypes and through the model's own scaler, so both sides
+    /// of every comparison below mean the same X.
+    fn standardized_matrix(model: &HwePcaModel) -> Vec<f64> {
+        let mut standardized = synthetic_genotypes(INVARIANT_SAMPLES, INVARIANT_VARIANTS);
+        {
+            let mut block = MatMut::from_column_major_slice_mut(
+                &mut standardized,
+                INVARIANT_SAMPLES,
+                INVARIANT_VARIANTS,
+            );
+            model
+                .scaler()
+                .standardize_block(block.as_mut(), 0..INVARIANT_VARIANTS, Par::Seq);
+        }
+        standardized
+    }
+
+    /// `VᵀV = I` — off-diagonals included.
+    ///
+    /// This is the assertion the old fit could not have passed. Normalizing each
+    /// loading column to unit length, which is what it did, constrains only the
+    /// diagonal and says nothing whatever about the rest of the matrix; a doc
+    /// comment there called the result "Euclidean orthonormality", which column
+    /// normalization does not give you. It holds now because `V = B·Σ⁻¹` for a
+    /// `B` already rotated into the eigenbasis of `BᵀB`, so the off-diagonals are
+    /// zero by construction rather than by hope.
+    #[test]
+    fn variant_loadings_are_orthonormal_not_merely_unit_length() {
+        let model = invariant_fit();
+        let loadings = model.variant_loadings();
+        let components = model.components();
+        assert!(components > 0);
+
+        for left in 0..components {
+            for right in 0..components {
+                let dot: f64 = (0..loadings.nrows())
+                    .map(|row| loadings[(row, left)] * loadings[(row, right)])
+                    .sum();
+                let expected = if left == right { 1.0 } else { 0.0 };
+                assert!(
+                    (dot - expected).abs() < 1.0e-9,
+                    "VᵀV[{left},{right}] = {dot}, expected {expected}"
+                );
+            }
+        }
+    }
+
+    /// `UᵀU = I`. The rotation is orthogonal, so it cannot have cost the sample
+    /// basis the orthonormality the eigensolver handed it.
+    #[test]
+    fn sample_basis_stays_orthonormal_through_the_rotation() {
+        let model = invariant_fit();
+        let basis = model.sample_basis();
+        let components = model.components();
+        assert_eq!(basis.nrows(), INVARIANT_SAMPLES);
+
+        for left in 0..components {
+            for right in 0..components {
+                let dot: f64 = (0..basis.nrows())
+                    .map(|row| basis[(row, left)] * basis[(row, right)])
+                    .sum();
+                let expected = if left == right { 1.0 } else { 0.0 };
+                assert!(
+                    (dot - expected).abs() < 1.0e-9,
+                    "UᵀU[{left},{right}] = {dot}, expected {expected}"
+                );
+            }
+        }
+    }
+
+    /// `λ_i = σ_i²/(n−1)` for every retained component.
+    ///
+    /// The rescaling this replaced multiplied the singular values by a per-column
+    /// norm and left the eigenvalues untouched, which is exactly how the model
+    /// ended up needing two different accessors for "the singular values". One
+    /// set now, and it satisfies the identity the other set existed to satisfy.
+    #[test]
+    fn eigenvalues_and_singular_values_describe_one_decomposition() {
+        let model = invariant_fit();
+        let scale = (model.n_samples() - 1) as f64;
+        assert_eq!(model.singular_values().len(), model.components());
+        assert_eq!(model.explained_variance().len(), model.components());
+
+        for (idx, (&lambda, &sigma)) in model
+            .explained_variance()
+            .iter()
+            .zip(model.singular_values().iter())
+            .enumerate()
+        {
+            let implied = sigma * sigma / scale;
+            assert!(
+                (implied - lambda).abs() <= 1.0e-12 * lambda.abs().max(1.0),
+                "component {idx}: λ = {lambda} but σ²/(n−1) = {implied}"
+            );
+        }
+    }
+
+    /// `Xᵀ·U = V·Σ`: the loadings really are the variant cross-products divided
+    /// by the singular values.
+    ///
+    /// The right-hand side comes from the model; the left is multiplied out here
+    /// from the genotypes, so this ties the stored pieces to the data rather than
+    /// only to each other. It holds at any rank, unlike the reconstruction below.
+    #[test]
+    fn loadings_scale_back_to_the_variant_cross_products() {
+        let model = invariant_fit();
+        let standardized = standardized_matrix(&model);
+        let basis = model.sample_basis();
+        let loadings = model.variant_loadings();
+
+        for variant in 0..INVARIANT_VARIANTS {
+            for component in 0..model.components() {
+                let cross: f64 = (0..INVARIANT_SAMPLES)
+                    .map(|sample| {
+                        let entry = standardized[variant * INVARIANT_SAMPLES + sample];
+                        entry * basis[(sample, component)]
+                    })
+                    .sum();
+                let stored = loadings[(variant, component)] * model.singular_values()[component];
+                assert!(
+                    (cross - stored).abs() <= 1.0e-9 * cross.abs().max(1.0),
+                    "variant {variant}, component {component}: XᵀU = {cross} but V·Σ = {stored}"
+                );
+            }
+        }
+    }
+
+    /// `U·Σ·Vᵀ = X`. With every component retained there is no residual left for
+    /// the truncation to hide in, so scores, loadings and singular values have to
+    /// reproduce the standardized matrix they were derived from, entry by entry.
+    #[test]
+    fn scores_and_loadings_reconstruct_the_standardized_matrix() {
+        let model = invariant_fit();
+        assert_eq!(
+            model.components(),
+            INVARIANT_SAMPLES - 1,
+            "reconstruction is only an equality when the fit spans the whole row space"
+        );
+
+        let standardized = standardized_matrix(&model);
+        let scores = model.sample_scores();
+        let loadings = model.variant_loadings();
+
+        for variant in 0..INVARIANT_VARIANTS {
+            for sample in 0..INVARIANT_SAMPLES {
+                let reconstructed: f64 = (0..model.components())
+                    .map(|component| scores[(sample, component)] * loadings[(variant, component)])
+                    .sum();
+                let expected = standardized[variant * INVARIANT_SAMPLES + sample];
+                assert!(
+                    (reconstructed - expected).abs() <= 1.0e-9 * expected.abs().max(1.0),
+                    "X[{sample},{variant}] reconstructed as {reconstructed}, expected {expected}"
+                );
+            }
         }
     }
 

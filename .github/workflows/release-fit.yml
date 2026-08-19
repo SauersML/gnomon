@@ -8,6 +8,11 @@ on:
         required: false
         default: '1'
   push:
+    # Branch filter, like every other push-triggered workflow here. Without it
+    # this fires a full fit-and-plot run on pushes to ANY branch -- including
+    # short-lived work branches -- which queues heavy jobs ahead of the test
+    # workflow on the same shared runners.
+    branches: [main]
     paths:
       - 'map/**/*.rs'
 

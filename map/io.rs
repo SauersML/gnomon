@@ -1679,6 +1679,31 @@ pub fn save_fit_summary(
         writeln!(writer, "explained_variance_ratio_PC{}\t{}", idx + 1, ratio)?;
     }
 
+    // How the solve terminated, alongside what it produced. The model JSON
+    // already carries this, but the summary is the file a person actually
+    // opens, and "did this converge" should not require parsing a megabyte of
+    // JSON to answer. A fit that stopped short of its tolerance is otherwise
+    // indistinguishable here from one that did not.
+    if let Some(diagnostics) = model.fit_diagnostics() {
+        writeln!(writer, "solver\t{:?}", diagnostics.solver)?;
+        writeln!(writer, "converged\t{}", diagnostics.converged)?;
+        writeln!(writer, "genome_passes\t{}", diagnostics.passes)?;
+        writeln!(writer, "restarts\t{}", diagnostics.restarts)?;
+        // Absent rather than zero when a route does not measure a quantity:
+        // printing 0.0 for an unmeasured residual reads as perfect convergence.
+        if let Some(residual) = diagnostics.max_relative_residual {
+            writeln!(writer, "max_relative_residual\t{residual}")?;
+        }
+        if let Some(delta) = diagnostics.subspace_delta {
+            writeln!(writer, "subspace_delta\t{delta}")?;
+        }
+        if let Some(gap) = diagnostics.boundary_gap {
+            // A small gap means PC k and PC k+1 are not individually
+            // identified, so the truncation cuts a near-degenerate eigenspace.
+            writeln!(writer, "boundary_gap_k_to_k_plus_1\t{gap}")?;
+        }
+    }
+
     writer.flush()?;
     Ok(summary_path)
 }
