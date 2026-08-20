@@ -1,6 +1,6 @@
 use super::fit::{
-    DEFAULT_BLOCK_WIDTH, DenseBlockSource, FitOptions, HwePcaError, HwePcaModel, LdConfig,
-    LdWindow, SampleSubsetSource, StreamingMafFilterSource, VariantBlockSource,
+    DEFAULT_BLOCK_WIDTH, DenseBlockSource, FitOptions, HardCallPacked, HwePcaError, HwePcaModel,
+    LdConfig, LdWindow, SampleSubsetSource, StreamingMafFilterSource, VariantBlockSource,
 };
 use super::io::{
     DatasetBlockSource, DatasetOutputError, GenotypeDataset, GenotypeIoError, OrderedSelectionPlan,
@@ -13,6 +13,7 @@ use super::prefit::{self, BuiltinModelError};
 use super::progress::{AdaptiveFitProgress, fit_progress, projection_progress};
 use super::project::{GappedProjectionSource, ProjectionOptions};
 use super::variant_filter::{VariantFilter, VariantKey, VariantListError};
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::File;
@@ -346,13 +347,18 @@ fn run_fit(
             Some(keys) => (**keys).clone(),
             None => dataset.variant_keys_for_plan(&selection_plan)?,
         };
-        let raw_source = subset_samples(
+        let mut raw_source = subset_samples(
             dataset.block_source_with_plan(selection_plan.clone())?,
             keep_indices.as_deref(),
         )?;
-        let mut source = StreamingMafFilterSource::new(raw_source, min_maf)?;
-        scan_maf_filter(&mut source)?;
-        let retained = source.retained_indices().to_vec();
+        let retained = match scan_packed_maf_filter(&mut raw_source, min_maf)? {
+            Some(retained) => retained,
+            None => {
+                let mut source = StreamingMafFilterSource::new(raw_source, min_maf)?;
+                scan_maf_filter(&mut source)?;
+                source.retained_indices().to_vec()
+            }
+        };
         if retained.is_empty() {
             return Err(MapDriverError::InvalidState(format!(
                 "MAF filter {min_maf:.6} removed every selected variant"
@@ -712,6 +718,57 @@ fn retain_selection_plan_by_logical_indices(
             "cannot apply indexed MAF positions to a key-streamed source".into(),
         )),
     }
+}
+
+fn packed_maf_retained_indices(
+    packed: &HardCallPacked<'_>,
+    n_samples: usize,
+    min_maf: f64,
+) -> Option<Vec<usize>> {
+    let retained: Option<Vec<bool>> = (0..packed.n_variants())
+        .into_par_iter()
+        .map(|variant| {
+            let (sum, _, calls) = packed.moments(variant, n_samples)?;
+            let maf = if calls == 0 {
+                0.0
+            } else {
+                let frequency = (sum / (2.0 * calls as f64)).clamp(0.0, 1.0);
+                frequency.min(1.0 - frequency)
+            };
+            Some(maf >= min_maf)
+        })
+        .collect();
+    Some(
+        retained?
+            .into_iter()
+            .enumerate()
+            .filter_map(|(variant, keep)| keep.then_some(variant))
+            .collect(),
+    )
+}
+
+fn scan_packed_maf_filter<S>(
+    source: &mut S,
+    min_maf: f64,
+) -> Result<Option<Vec<usize>>, MapDriverError>
+where
+    S: VariantBlockSource + Send,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    let n_samples = source.n_samples();
+    source
+        .reset()
+        .map_err(|err| HwePcaError::Source(Box::new(err)))?;
+    let Some(packed) = source.hard_call_packed() else {
+        return Ok(None);
+    };
+    packed_maf_retained_indices(&packed, n_samples, min_maf)
+        .map(Some)
+        .ok_or_else(|| {
+            MapDriverError::InvalidState(
+                "packed hard-call source contains an invalid variant selection".into(),
+            )
+        })
 }
 
 /// Completes the one MAF pass needed to turn an indexed source into a retained
@@ -1681,10 +1738,10 @@ fn map_variant_list_error(path: &Path, err: VariantListError) -> MapDriverError 
 #[cfg(test)]
 mod tests {
     use super::{
-        MapCommand, MapDriverError, projection_present_mask, resolve_keep_indices,
-        retain_selection_plan_by_logical_indices, run, run_project,
+        MapCommand, MapDriverError, packed_maf_retained_indices, projection_present_mask,
+        resolve_keep_indices, retain_selection_plan_by_logical_indices, run, run_project,
     };
-    use crate::map::fit::HwePcaModel;
+    use crate::map::fit::{HardCallPacked, HwePcaModel};
     use crate::map::io::{
         GenotypeDataset, OrderedSelectionPlan, ProjectionOutputPaths, SampleRecord, SelectionPlan,
         load_hwe_model, save_hwe_model, save_projection_results,
@@ -1754,6 +1811,21 @@ mod tests {
             error,
             MapDriverError::InvalidState(message) if message == "--threads must be at least 1"
         ));
+    }
+
+    #[test]
+    fn packed_maf_scan_handles_missing_calls_selection_and_swaps() {
+        let bytes = [0x00, 0x78, 0xff, 0x55];
+        let selection = [2, 1, 3, 0];
+        let kinds = [
+            MatchKind::Exact,
+            MatchKind::Swap,
+            MatchKind::Exact,
+            MatchKind::Swap,
+        ];
+        let packed = HardCallPacked::new_selected(&bytes, 1, bytes.len(), &selection, Some(&kinds));
+
+        assert_eq!(packed_maf_retained_indices(&packed, 4, 0.05), Some(vec![1]));
     }
 
     #[test]

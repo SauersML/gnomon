@@ -71,7 +71,10 @@ Optional arguments:
   `0.5`; filtering runs after `--list` and `--keep` selection and before LD
   weighting or PCA. Indexed PLINK/PGEN inputs are screened once and then reopened
   through the retained physical-marker selection, so repeated PCA passes keep
-  the packed hard-call path instead of recomputing MAF on every traversal.
+  the packed hard-call path instead of recomputing MAF on every traversal. With
+  all samples retained, MAF is counted directly from the packed 2-bit hard
+  calls; `--keep` deliberately uses the decoded retained rows because the
+  fitting cohort, not the full callset, defines the observed MAF.
 * `--ld` – Enable linkage disequilibrium flattening. When present, LD weights
   use a default window of 51 variants unless `--sites_window <SITES>` (odd
   number of variants) or `--bp_window <BP>` (total genomic span in base pairs)
@@ -229,12 +232,14 @@ The following runs used the same five-population PLINK1 microarray cohort, the
 same physical marker lists, four pinned AMD EPYC Milan cores, warm page cache,
 and four requested PCs. PLINK2 was v2.0.0-a.7.4LM AVX2 AMD and ran `--pca
 approx allele-wts 4 --threads 4`; gnomon ran `fit --components 4 --threads 4
---markers N`.
+--markers N`. The MAF row instead applies `--maf 0.05` to the complete
+20,000-marker input in both programs.
 
 | samples × markers | gnomon wall | PLINK2 wall | gnomon peak RSS | PLINK2 peak RSS |
 | --- | ---: | ---: | ---: | ---: |
 | 250,000 × 10,000 | **16.76 s** | 25.10 s | **3.50 GB** | 6.05 GB |
 | 250,000 × 20,000 | **31.75 s** | 48.10 s | **3.50 GB** | 6.06 GB |
+| 250,000 × 19,751 (`--maf 0.05`) | **32.46 s** | 47.77 s | **3.50 GB** | 6.06 GB |
 | 500,000 × 10,000 | **37.91 s** | 57.37 s | **5.80 GB** | 12.09 GB |
 
 That is a 33.2% wall-clock lead at 10,000 markers and 34.0% at 20,000, while
@@ -243,6 +248,11 @@ lead is 33.9% with 52.0% less memory. The comparison is shape-matched:
 PLINK2's `--extract` list contains exactly the variants selected by gnomon's
 deterministic stride in the 10,000-marker run; the 20,000-marker run uses the
 complete dataset in both programs.
+
+Packed MAF screening is 21.0% faster than gnomon's previous decoded screen
+(41.11 s) and preserves byte-identical model and score artifacts. The matched
+MAF-filtered run is 32.0% faster than PLINK2 while using 42% less peak memory;
+both retain the same 19,751 physical markers.
 
 The 500,000-row case is explicitly a scaling stress test: it duplicates the
 250,000 statistically generated sample rows, preserving the same packed-call
@@ -259,6 +269,8 @@ between-population variance shares were 0.994, 0.994, 0.994, and 0.994.
 Changing the tile width from 2,048 to 1,024 to 512 produced bit-identical score
 artifacts, and direct packed-statistics counting produced model and score
 artifacts that were bit-identical to the decoded-statistics implementation.
+The MAF-filtered score comparison likewise produced canonical correlations of
+1.000000 on all four axes.
 
 Four cores are deliberate for this matrix shape. The covariance products have
 few output columns and a 250,000-row reduction, so adding threads eventually

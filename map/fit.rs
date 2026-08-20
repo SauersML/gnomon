@@ -1283,6 +1283,20 @@ impl<'a> HardCallPacked<'a> {
             .unwrap_or(MatchKind::Exact)
     }
 
+    pub(crate) fn moments(
+        &self,
+        logical_variant: usize,
+        n_samples: usize,
+    ) -> Option<(f64, f64, usize)> {
+        self.slice(logical_variant, 1).map(|bytes| {
+            packed_variant_moments(
+                bytes,
+                n_samples,
+                self.match_kind(logical_variant) == MatchKind::Swap,
+            )
+        })
+    }
+
     fn physical_variant(&self, logical_variant: usize) -> Option<usize> {
         if let Some(selection) = self.selection.as_deref() {
             selection.get(logical_variant).copied()
@@ -5013,15 +5027,7 @@ where
             ));
         }
 
-        let compute = |variant: usize| {
-            packed.slice(variant, 1).map(|bytes| {
-                packed_variant_moments(
-                    bytes,
-                    n_samples,
-                    packed.match_kind(variant) == MatchKind::Swap,
-                )
-            })
-        };
+        let compute = |variant: usize| packed.moments(variant, n_samples);
         let moments: Option<Vec<_>> = if n_variants >= 32 && par.degree() > 1 {
             (0..n_variants).into_par_iter().map(compute).collect()
         } else {
