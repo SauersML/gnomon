@@ -236,6 +236,7 @@ approx allele-wts 4 --threads 4`; gnomon ran `fit --components 4 --threads 4
 | --- | ---: | ---: | ---: | ---: |
 | 250,000 × 10,000 | **16.76 s** | 25.10 s | **3.50 GB** | 6.05 GB |
 | 250,000 × 20,000 | **31.75 s** | 48.10 s | **3.50 GB** | 6.06 GB |
+| 250,000 × 20,000 (2% missing calls) | **32.36 s** | 48.35 s | **3.50 GB** | 6.06 GB |
 | 250,000 × 19,751 (`--maf 0.05`) | **32.46 s** | 47.77 s | **3.50 GB** | 6.06 GB |
 | 100,000 kept from 250,000 × 20,000 | **17.59 s** | 20.84 s | **2.24 GB** | 2.44 GB |
 | 500,000 × 10,000 | **37.91 s** | 57.37 s | **5.80 GB** | 12.09 GB |
@@ -251,6 +252,14 @@ Packed MAF screening is 21.0% faster than gnomon's previous decoded screen
 (41.11 s) and preserves byte-identical model and score artifacts. The matched
 MAF-filtered run is 32.0% faster than PLINK2 while using 42% less peak memory;
 both retain the same 19,751 physical markers.
+
+Missing calls do not turn into a hidden slow path or a different PCA. The 2%
+row above deterministically marks exactly 5,000 of 250,000 calls missing at
+every variant while preserving the complete panel's planted structure
+(`scripts/bench_fit_solver.py generate --missing-rate 0.02`). Gnomon is 33.1%
+faster with 42% less memory; all four canonical correlations with PLINK2 are
+0.999999999999, and both programs report identical between-population variance
+shares on every axis (0.99367–0.99392).
 
 The matched `--keep` row retains the same deterministic 100,000 sample IDs in
 both programs. Direct packed-row selection cut gnomon's previous decoded-gather

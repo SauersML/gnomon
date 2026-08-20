@@ -18,6 +18,7 @@ and every iterative solver "converges" on noise, which would flatter any change.
 
 Usage:
   bench_fit_solver.py generate --out DIR [--samples N] [--variants M]
+                               [--missing-rate RATE]
   bench_fit_solver.py run --binary PATH --data DIR/prefix [--components K]
 """
 
@@ -45,8 +46,10 @@ PLINK_BED_MAGIC = bytes([0x6C, 0x1B, 0x01])
 
 
 def write_plink(prefix: Path, samples: int, variants: int, populations: int,
-                fst: float, seed: int) -> None:
+                fst: float, seed: int, missing_rate: float) -> None:
     """Write a .bed/.bim/.fam trio with Balding-Nichols population structure."""
+    if not 0.0 <= missing_rate < 1.0:
+        raise ValueError("missing_rate must be in [0, 1)")
     rng = np.random.default_rng(seed)
     assignment = rng.integers(0, populations, size=samples)
 
@@ -84,6 +87,22 @@ def write_plink(prefix: Path, samples: int, variants: int, populations: int,
             dosage = rng.binomial(2, freq).astype(np.uint8)
 
             codes = code_for_dosage[dosage]
+            if missing_rate > 0.0:
+                # An exact, deterministic per-variant rate makes two benchmark
+                # runs comparable without letting Bernoulli noise change the
+                # number of observed calls. Evenly spaced rows avoid deleting
+                # one contiguous population block; the rotating offset prevents
+                # every marker from dropping the same samples. This touches only
+                # the packed codes—the genotype RNG stream stays identical to a
+                # complete-call panel generated with the same seed.
+                missing_count = round(samples * missing_rate)
+                if missing_count > 0:
+                    missing_rows = (
+                        (np.arange(missing_count, dtype=np.int64) * samples)
+                        // missing_count
+                        + variant * 37
+                    ) % samples
+                    codes[missing_rows] = 0b01
             # Pack four samples per byte, lowest sample in the lowest bit pair.
             padded = np.zeros(bytes_per_variant * 4, dtype=np.uint8)
             padded[:samples] = codes
@@ -101,7 +120,8 @@ def write_plink(prefix: Path, samples: int, variants: int, populations: int,
 
     size_gb = (3 + bytes_per_variant * variants) / 1e9
     print(f"wrote {prefix}.bed  {samples} samples x {variants} variants "
-          f"({size_gb:.2f} GB) in {time.time() - t0:.0f}s", file=sys.stderr)
+          f"({size_gb:.2f} GB, missing rate {missing_rate:.3%}) "
+          f"in {time.time() - t0:.0f}s", file=sys.stderr)
 
 
 def run_fit(binary: Path, data: Path, components: int, extra: list[str]) -> dict:
@@ -218,6 +238,8 @@ def main(argv: list[str]) -> int:
     gen.add_argument("--populations", type=int, default=DEFAULT_POPULATIONS)
     gen.add_argument("--fst", type=float, default=DEFAULT_FST)
     gen.add_argument("--seed", type=int, default=20260819)
+    gen.add_argument("--missing-rate", type=float, default=0.0,
+                     help="exact deterministic missing-call fraction per variant")
 
     run = sub.add_parser("run", help="time one fit")
     run.add_argument("--binary", required=True, type=Path)
@@ -233,7 +255,7 @@ def main(argv: list[str]) -> int:
 
     if args.command == "generate":
         write_plink(args.out, args.samples, args.variants,
-                    args.populations, args.fst, args.seed)
+                    args.populations, args.fst, args.seed, args.missing_rate)
         return 0
 
     if args.command == "verify":
