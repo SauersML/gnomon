@@ -5504,11 +5504,24 @@ fn plink_standardized_code_values(mean: f64, inv: f64, weight: f64, swap: bool) 
 }
 
 #[inline(always)]
-fn decode_plink_variant_standardized_codes(
+fn plink_standardized_byte_table(code_values: &[f64; 4]) -> [[f64; 4]; 256] {
+    std::array::from_fn(|byte| {
+        let byte = byte as u8;
+        [
+            code_values[(byte & 0b11) as usize],
+            code_values[((byte >> 2) & 0b11) as usize],
+            code_values[((byte >> 4) & 0b11) as usize],
+            code_values[((byte >> 6) & 0b11) as usize],
+        ]
+    })
+}
+
+#[inline(always)]
+fn decode_plink_variant_standardized_bytes(
     bytes: &[u8],
     dest: &mut [f64],
     n_samples: usize,
-    code_values: &[f64; 4],
+    byte_table: &[[f64; 4]; 256],
 ) {
     debug_assert!(dest.len() >= n_samples);
     debug_assert!(bytes.len() >= n_samples.div_ceil(4));
@@ -5516,17 +5529,12 @@ fn decode_plink_variant_standardized_codes(
     let (full_dest, tail_dest) = dest[..n_samples].as_chunks_mut::<4>();
     let full_bytes = full_dest.len();
     for (&byte, chunk) in bytes[..full_bytes].iter().zip(full_dest) {
-        chunk[0] = code_values[(byte & 0b11) as usize];
-        chunk[1] = code_values[((byte >> 2) & 0b11) as usize];
-        chunk[2] = code_values[((byte >> 4) & 0b11) as usize];
-        chunk[3] = code_values[((byte >> 6) & 0b11) as usize];
+        chunk.copy_from_slice(&byte_table[byte as usize]);
     }
 
     if !tail_dest.is_empty() {
-        let byte = bytes[full_bytes];
-        for (offset, value) in tail_dest.iter_mut().enumerate() {
-            *value = code_values[((byte >> (offset * 2)) & 0b11) as usize];
-        }
+        let decoded = &byte_table[bytes[full_bytes] as usize];
+        tail_dest.copy_from_slice(&decoded[..tail_dest.len()]);
     }
 }
 
@@ -5538,17 +5546,30 @@ fn decode_plink_variant_standardized_rows(
     sample_byte_masks: Option<&[u8]>,
     code_values: &[f64; 4],
 ) {
+    let byte_table = plink_standardized_byte_table(code_values);
     let Some(masks) = sample_byte_masks else {
-        decode_plink_variant_standardized_codes(bytes, dest, physical_n_samples, code_values);
+        decode_plink_variant_standardized_bytes(bytes, dest, physical_n_samples, &byte_table);
         return;
     };
 
     debug_assert!(dest.len() <= physical_n_samples);
     debug_assert!(bytes.len() >= physical_n_samples.div_ceil(4));
-    let valid = for_each_packed_masked_code(bytes, masks, dest.len(), |logical, code| {
-        dest[logical] = code_values[code as usize];
-    });
-    debug_assert!(valid.is_some());
+    let mut logical = 0usize;
+    for (&byte, &mask) in bytes.iter().zip(masks) {
+        if mask == 0b1111 {
+            dest[logical..logical + 4].copy_from_slice(&byte_table[byte as usize]);
+            logical += 4;
+        } else {
+            let mut retained = mask;
+            while retained != 0 {
+                let lane = retained.trailing_zeros() as usize;
+                retained &= retained - 1;
+                dest[logical] = byte_table[byte as usize][lane];
+                logical += 1;
+            }
+        }
+    }
+    debug_assert_eq!(logical, dest.len());
 }
 
 #[inline]
@@ -5973,8 +5994,55 @@ mod tests {
 
             let mut actual = vec![99.0; codes.len()];
             let code_values = plink_standardized_code_values(mean, inv, weight, swap);
-            decode_plink_variant_standardized_codes(&bytes, &mut actual, codes.len(), &code_values);
+            let byte_table = plink_standardized_byte_table(&code_values);
+            decode_plink_variant_standardized_bytes(
+                &bytes,
+                &mut actual,
+                codes.len(),
+                &byte_table,
+            );
             assert_eq!(actual, expected, "weight={weight}, swap={swap}");
+        }
+    }
+
+    #[test]
+    fn standardized_plink_byte_table_covers_every_code_mask_and_tail() {
+        let code_values = [-3.5, 0.0, 1.25, 7.75];
+        let byte_table = plink_standardized_byte_table(&code_values);
+
+        for raw_byte in 0u16..=u8::MAX as u16 {
+            let byte = raw_byte as u8;
+            for n_samples in 0..=4 {
+                let mut decoded = vec![99.0; n_samples + 1];
+                decode_plink_variant_standardized_bytes(
+                    &[byte],
+                    &mut decoded,
+                    n_samples,
+                    &byte_table,
+                );
+                for (sample, &actual) in decoded.iter().take(n_samples).enumerate() {
+                    let code = ((byte >> (sample * 2)) & 0b11) as usize;
+                    assert_eq!(actual, code_values[code]);
+                }
+                assert_eq!(decoded[n_samples], 99.0);
+            }
+
+            for mask in 0u8..=0b1111 {
+                let retained = mask.count_ones() as usize;
+                let mut decoded = vec![99.0; retained];
+                decode_plink_variant_standardized_rows(
+                    &[byte],
+                    &mut decoded,
+                    4,
+                    Some(&[mask]),
+                    &code_values,
+                );
+                let expected: Vec<f64> = (0..4)
+                    .filter(|lane| mask & (1 << lane) != 0)
+                    .map(|lane| code_values[((byte >> (lane * 2)) & 0b11) as usize])
+                    .collect();
+                assert_eq!(decoded, expected, "byte={byte:#04x}, mask={mask:#06b}");
+            }
         }
     }
 
