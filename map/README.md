@@ -219,15 +219,22 @@ roughly **63% of all cycles in thread-barrier spin**, not arithmetic:
 A thread sweep confirms it from the outside — the same fit, same data, only the
 core count changing:
 
-| cores | wall clock | CPU | against 4 cores |
+| cores | wall clock | CPU | against the best |
 | ---: | ---: | ---: | --- |
-| 4 | 111.1 s | 228% | — |
-| 8 | 110.6 s | 397% | 0.4% faster |
-| 16 | 117.4 s | 771% | 5.6% **slower** |
-| 32 | 124.3 s | 1589% | 11.8% **slower** |
+| 2 | 120.1 s | 152% | 11.2% slower |
+| 4 | **107.9 s** | 233% | best |
+| 8 | 109.8 s | 400% | 1.7% slower |
+| 16 | 115.2 s | 768% | 6.7% **slower** |
+| 32 | 126.0 s | 1568% | 16.7% **slower** |
 
-Past about eight cores the fit anti-scales: CPU consumption doubles at every
-step and wall clock gets worse. The cause is the shape of the work, not the
+(Measured on an otherwise idle machine with each run pinned to its own core
+range. An earlier version of this table was taken while a long baseline run held
+cores on the same socket; the numbers moved by only a few percent, but the
+uncontrolled ones should not be quoted.)
+
+Going from two cores to four does buy something real — 1.11x for twice the
+hardware, about 55% efficiency — and then it stops. Past four cores the fit
+anti-scales: CPU consumption doubles at every step and wall clock gets worse. The cause is the shape of the work, not the
 amount of it. Parallelism is applied *inside* each variant tile, and one of the
 two products per tile is `T = Xᵀ Q` — an output of roughly `tile × components`
 (2048 × 12) drawn from a reduction `n_samples` deep (250,000). There is almost
