@@ -26,7 +26,7 @@ RESULTS_CSV = ROOT / "project_scaling.csv"
 PLOT_PNG = ROOT / "project_scaling.png"
 REALISTIC_RESULTS_CSV = ROOT / "project_scaling_realistic.csv"
 REALISTIC_PLOT_PNG = ROOT / "project_scaling_realistic.png"
-GNOMON = Path.home() / ".local" / "bin" / "gnomon"
+GNOMON = Path.home() / ".local" / "bin" / "gnomon-map"
 COUNTS = [1, 4, 16, 64, 256, 512, 1024]
 REPEATS = 1
 
