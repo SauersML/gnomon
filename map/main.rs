@@ -35,6 +35,10 @@ pub enum MapCommand {
         /// spaced subsample of whatever the variant selection left.
         markers: Option<usize>,
         components: usize,
+        /// Optional worker count for a fit-local Rayon pool. Keeping this on
+        /// the command makes thread control explicit instead of relying on a
+        /// process environment variable that schedulers may not propagate.
+        threads: Option<usize>,
         maf: Option<f64>,
         ld: Option<LdWindow>,
     },
@@ -131,17 +135,37 @@ pub fn run(command: MapCommand) -> Result<(), MapDriverError> {
             keep,
             markers,
             components,
+            threads,
             maf,
             ld,
-        } => run_fit(
-            &genotype_path,
-            variant_list.as_deref(),
-            keep.as_deref(),
-            markers,
-            components,
-            maf,
-            ld,
-        ),
+        } => {
+            let fit = || {
+                run_fit(
+                    &genotype_path,
+                    variant_list.as_deref(),
+                    keep.as_deref(),
+                    markers,
+                    components,
+                    maf,
+                    ld,
+                )
+            };
+            match threads {
+                Some(0) => Err(MapDriverError::InvalidState(
+                    "--threads must be at least 1".into(),
+                )),
+                Some(threads) => rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .map_err(|err| {
+                        MapDriverError::InvalidState(format!(
+                            "failed to create {threads}-thread fit pool: {err}"
+                        ))
+                    })?
+                    .install(fit),
+                None => fit(),
+            }
+        }
         MapCommand::Project {
             genotype_path,
             model,
@@ -177,6 +201,7 @@ fn run_fit(
         dataset.n_samples(),
         variant_display
     );
+    println!("Fit worker threads: {}", rayon::current_num_threads());
 
     // Resolved before anything reads genotypes: every downstream statistic —
     // allele frequencies, the MAF screen, LD weights, the covariance — is
@@ -1656,8 +1681,8 @@ fn map_variant_list_error(path: &Path, err: VariantListError) -> MapDriverError 
 #[cfg(test)]
 mod tests {
     use super::{
-        projection_present_mask, resolve_keep_indices, retain_selection_plan_by_logical_indices,
-        run_project,
+        MapCommand, MapDriverError, projection_present_mask, resolve_keep_indices,
+        retain_selection_plan_by_logical_indices, run, run_project,
     };
     use crate::map::fit::HwePcaModel;
     use crate::map::io::{
@@ -1709,6 +1734,26 @@ mod tests {
                 phenotype: "-9".to_string(),
             })
             .collect()
+    }
+
+    #[test]
+    fn fit_rejects_zero_worker_threads_before_opening_input() {
+        let error = run(MapCommand::Fit {
+            genotype_path: PathBuf::from("input-must-not-be-opened.bed"),
+            variant_list: None,
+            keep: None,
+            markers: None,
+            components: 4,
+            threads: Some(0),
+            maf: None,
+            ld: None,
+        })
+        .expect_err("zero worker threads must be rejected");
+
+        assert!(matches!(
+            error,
+            MapDriverError::InvalidState(message) if message == "--threads must be at least 1"
+        ));
     }
 
     #[test]

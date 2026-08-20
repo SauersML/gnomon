@@ -44,6 +44,8 @@ use ndarray::{Array1, ArrayView1};
 #[cfg(feature = "calibrate")]
 use std::collections::HashSet;
 use std::env;
+#[cfg(feature = "map")]
+use std::num::NonZeroUsize;
 #[cfg(any(feature = "score", feature = "map", feature = "terms"))]
 use std::path::PathBuf;
 #[cfg(not(unix))]
@@ -125,6 +127,10 @@ struct FitArgs {
     /// Number of principal components to retain when fitting the HWE PCA model
     #[arg(long, value_name = "N")]
     components: usize,
+
+    /// Number of worker threads used by the fit
+    #[arg(long, value_name = "N")]
+    threads: Option<NonZeroUsize>,
 
     /// Minimum observed minor allele frequency retained for PCA fitting
     #[arg(long = "maf", value_name = "MAF")]
@@ -702,6 +708,7 @@ fn run_map_fit(args: FitArgs) -> Result<(), Box<dyn std::error::Error>> {
         keep: args.keep,
         markers: args.markers,
         components: args.components,
+        threads: args.threads.map(NonZeroUsize::get),
         maf,
         ld: ld_window,
     })
