@@ -32,32 +32,32 @@ pub struct BuiltinModel {
 pub const BUILTIN_MODELS: &[BuiltinModel] = &[
     BuiltinModel {
         name: "hwe_1kg_hgdp_gsa_v2",
-        url: "https://github.com/SauersML/gnomon/releases/download/models-v1/hwe_1kg_hgdp_gsa_v2.json.zst",
-        sha256: "d9f7badd9e70a4c0a5ab3dd9242c6bb72abd88ece9fd3e6953197c299c34ea4c",
+        url: "https://github.com/SauersML/gnomon/releases/download/models-v2/hwe_1kg_hgdp_gsa_v2.json.zst",
+        sha256: "0eea94658eeee0f7636ca6649a53f4cf1eb9eb654b91ed5f5968547aed748eb0",
         build: "GRCh38",
         components: 20,
         variants: 650_000,
     },
     BuiltinModel {
         name: "hwe_1kg_hgdp_gsa_v3",
-        url: "https://github.com/SauersML/gnomon/releases/download/models-v1/hwe_1kg_hgdp_gsa_v3.json.zst",
-        sha256: "7797520466dae6c53d76b787e59951104c13827c4e64e76f236a4c32c56984c0",
+        url: "https://github.com/SauersML/gnomon/releases/download/models-v2/hwe_1kg_hgdp_gsa_v3.json.zst",
+        sha256: "0cd910f034a4cff806243cb3414b9691303141cdbe764a32e96e498b569d165d",
         build: "GRCh38",
         components: 20,
         variants: 654_000,
     },
     BuiltinModel {
         name: "hwe_1kg_hgdp_gda_v1",
-        url: "https://github.com/SauersML/gnomon/releases/download/models-v1/hwe_1kg_hgdp_gda_v1.json.zst",
-        sha256: "52a7b7d2369c51b926bf00f3b5b156660f2cccca3a963c91c521c6bcacfd0b94",
+        url: "https://github.com/SauersML/gnomon/releases/download/models-v2/hwe_1kg_hgdp_gda_v1.json.zst",
+        sha256: "17cf0b12b44e63b25d4ce0d626a33c5975937ee3457b4975aab54b5cf873315d",
         build: "GRCh38",
         components: 20,
         variants: 1_900_000,
     },
     BuiltinModel {
         name: "hwe_1kg_hgdp_intersection",
-        url: "https://github.com/SauersML/gnomon/releases/download/models-v1/hwe_1kg_hgdp_intersection.json.zst",
-        sha256: "bbbd08402d8d9e8eda8a3481511300fc222409a2874274622b8d7ee33aff22ad",
+        url: "https://github.com/SauersML/gnomon/releases/download/models-v2/hwe_1kg_hgdp_intersection.json.zst",
+        sha256: "5728c2b342fe381e95c36b755cf99aba0803790f981b4667b062d380f44951a5",
         build: "GRCh38",
         components: 20,
         variants: 56_331,
@@ -335,5 +335,14 @@ mod tests {
         assert!(names.contains(&"hwe_1kg_hgdp_gsa_v3"));
         assert!(names.contains(&"hwe_1kg_hgdp_gda_v1")); // GDA is still available via release
         assert!(names.contains(&"hwe_1kg_hgdp_intersection"));
+    }
+
+    #[test]
+    fn builtin_models_use_the_projection_only_schema_release() {
+        for model in BUILTIN_MODELS {
+            assert!(model.url.contains("/releases/download/models-v2/"));
+            assert_eq!(model.sha256.len(), 64);
+            assert!(model.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        }
     }
 }

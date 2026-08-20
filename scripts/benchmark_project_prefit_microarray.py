@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 
 MODEL_NAME = "hwe_1kg_hgdp_gsa_v3"
 MODEL_URL = (
-    "https://github.com/SauersML/gnomon/releases/download/models-v1/"
+    "https://github.com/SauersML/gnomon/releases/download/models-v2/"
     "hwe_1kg_hgdp_gsa_v3.json.zst"
 )
 ROOT = Path("/tmp/gnomon_project_prefit_microarray")
