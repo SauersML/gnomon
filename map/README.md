@@ -19,7 +19,7 @@ recomputing cohort-specific statistics.
 ## CLI entry points
 | Command | Purpose | Required input | Primary outputs |
 | --- | --- | --- | --- |
-| `gnomon fit --components <N> [--threads N] [--maf MAF] [--list PATH] [--keep PATH] [--ld] <GENOTYPE_PATH>` | Train a Hardy–Weinberg PCA model | Genotype source (PLINK trio or VCF/BCF files, local or remote) | `hwe.json`, `samples.tsv`, `hwe_summary.tsv`, `hwe_scores.bin` plus `hwe_scores.metadata.json` |
+| `gnomon fit --components <N> [--threads N] [--allow-unconverged] [--maf MAF] [--list PATH] [--keep PATH] [--ld] <GENOTYPE_PATH>` | Train a Hardy–Weinberg PCA model | Genotype source (PLINK trio or VCF/BCF files, local or remote) | `hwe.json`, `samples.tsv`, `hwe_summary.tsv`, `hwe_scores.bin` plus `hwe_scores.metadata.json` |
 | `gnomon project <GENOTYPE_PATH>` | Project samples with an existing `hwe.json` located next to the genotype data | Matching genotype source aligned to the model's variant set | `projection_scores.bin` plus `projection_scores.metadata.json` |
 
 Both commands print sample and variant counts, resolved source paths, and
@@ -75,6 +75,12 @@ Optional arguments:
   all samples retained, MAF is counted directly from the packed 2-bit hard
   calls; `--keep` deliberately uses the decoded retained rows because the
   fitting cohort, not the full callset, defines the observed MAF.
+* `--allow-unconverged` – Emit the solver's best available model when its
+  bounded pass budget is exhausted. This never labels the result converged:
+  `hwe.json` and `hwe_summary.tsv` retain the measured residual, subspace
+  change, boundary gap and `converged=false`. Use it when a requested boundary
+  lies inside a nearly degenerate ancestry/noise cluster and a fixed component
+  count is operationally required; without it, an unconverged fit is refused.
 * `--ld` – Enable linkage disequilibrium flattening. When present, LD weights
   use a default window of 51 variants unless `--sites_window <SITES>` (odd
   number of variants) or `--bp_window <BP>` (total genomic span in base pairs)
@@ -186,36 +192,24 @@ Lanczos: every pass advances every requested component at once.
 ### What this costs, measured
 
 On a synthetic cohort with five populations at Fst 0.02 — 250,000 samples by
-20,000 variants, PLINK, 20 components, one machine, identical data — comparing
-the vector-at-a-time solver against the block solver
-(`scripts/bench_fit_solver.py` generates the cohort and runs both):
+20,000 variants, PLINK, one machine and four pinned AMD EPYC Milan cores — the
+current complete fits measure:
 
-| | wall clock | CPU | peak RSS | structure recovered |
-| --- | --- | --- | --- | --- |
-| vector-at-a-time | >31 min, still in covariance | 100% (one core) | 3.2 GB | — |
-| block Krylov | **2 min 34 s**, all stages | 2157% (~21 cores) | 11.8 GB | 4/4 PCs, 0.994 |
-| block Krylov, `--markers 5000` | **1 min 01 s** | 2011% | 10.2 GB | 4/4 PCs, 0.977 |
-
-Asking for more components than the data contains changes the picture, and the
-fit says so rather than pretending otherwise. The same cohort has four real
-axes (five populations), so:
-
-| request | wall clock | passes | converged | worst residual | gap at the boundary |
-| --- | --- | --- | --- | --- | --- |
-| `--components 4` | 2 min 04 s | 5 | **yes** | 2.2e-9 | 0.990 |
-| `--components 20` | 2 min 51 s | 8 | no | 3.4e-2 | 0.0014 |
+| request | wall clock | peak RSS | passes | converged | worst residual | gap at the boundary |
+| --- | ---: | ---: | ---: | --- | ---: | ---: |
+| `--components 4` | **31.75 s** | 3.50 GB | 5 | **yes** | 2.2e-9 | 0.990 |
+| `--components 20 --allow-unconverged` | **79.14 s** | 4.45 GB | 8 | no | 3.4e-2 | 0.0014 |
 
 At k=4 the boundary between PC4 and PC5 is a 99% gap — a clean separation — and
 the solve converges to nine digits. At k=20 the sixteen requested axes past the
 structure are degenerate noise with near-identical eigenvalues, the boundary gap
 collapses to 0.0014, and no amount of iteration can individually resolve them.
 That is a property of the question, not a defect in the answer, which is why the
-fit records `converged`, the residual and the boundary gap instead of silently
-returning twenty equally confident-looking components.
-
-Note also that the per-pass cost barely moved between those two runs (~17.7 s
-against ~17.1 s) while the block width went from 12 to 30. Oversampling is
-therefore close to free — but the reason is not that the GEMM is cheap.
+fit requires `--allow-unconverged` for this fixed-width best-effort model and
+records `converged=false`, the residual, subspace change and boundary gap in
+both model and summary. The leading four axes remain exact as a subspace: their
+canonical correlations against the strict four-component fit are
+1.000000000000 on all four axes.
 
 ### Current PLINK2 comparison
 
@@ -253,6 +247,14 @@ Packed MAF screening is 21.0% faster than gnomon's previous decoded screen
 (41.11 s) and preserves byte-identical model and score artifacts. The matched
 MAF-filtered run is 32.0% faster than PLINK2 while using 42% less peak memory;
 both retain the same 19,751 physical markers.
+
+The realistic 20-PC request widens the gap. Gnomon completed the full
+250,000 × 20,000 fit, including refinement, loadings and all model/score
+artifacts, in 79.14 s at 4.45 GB. The matched PLINK2 run did not complete its
+PCA within a 180 s bound and had reached only random projection 17/21, with no
+eigenvector artifact written. Using that timeout only as a lower bound, gnomon
+is at least 56.0% faster for this request; no PLINK2 memory claim is made for an
+incomplete run.
 
 The 500,000-row case is explicitly a scaling stress test: it duplicates the
 250,000 statistically generated sample rows, preserving the same packed-call

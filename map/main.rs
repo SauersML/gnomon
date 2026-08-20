@@ -40,6 +40,9 @@ pub enum MapCommand {
         /// the command makes thread control explicit instead of relying on a
         /// process environment variable that schedulers may not propagate.
         threads: Option<usize>,
+        /// Accept the solver's best available estimate at its bounded pass
+        /// limit. Diagnostics still mark the resulting model unconverged.
+        allow_unconverged: bool,
         maf: Option<f64>,
         ld: Option<LdWindow>,
     },
@@ -137,19 +140,21 @@ pub fn run(command: MapCommand) -> Result<(), MapDriverError> {
             markers,
             components,
             threads,
+            allow_unconverged,
             maf,
             ld,
         } => {
             let fit = || {
-                run_fit(
-                    &genotype_path,
-                    variant_list.as_deref(),
-                    keep.as_deref(),
+                run_fit(FitRequest {
+                    genotype_path: &genotype_path,
+                    variant_list: variant_list.as_deref(),
+                    keep: keep.as_deref(),
                     markers,
                     components,
+                    allow_unconverged,
                     maf,
                     ld,
-                )
+                })
             };
             match threads {
                 Some(0) => Err(MapDriverError::InvalidState(
@@ -175,15 +180,28 @@ pub fn run(command: MapCommand) -> Result<(), MapDriverError> {
     }
 }
 
-fn run_fit(
-    genotype_path: &Path,
-    variant_list: Option<&Path>,
-    keep: Option<&Path>,
+struct FitRequest<'a> {
+    genotype_path: &'a Path,
+    variant_list: Option<&'a Path>,
+    keep: Option<&'a Path>,
     markers: Option<usize>,
     components: usize,
+    allow_unconverged: bool,
     maf: Option<f64>,
     ld: Option<LdWindow>,
-) -> Result<(), MapDriverError> {
+}
+
+fn run_fit(request: FitRequest<'_>) -> Result<(), MapDriverError> {
+    let FitRequest {
+        genotype_path,
+        variant_list,
+        keep,
+        markers,
+        components,
+        allow_unconverged,
+        maf,
+        ld,
+    } = request;
     println!("=== HWE PCA model fitting ===");
     println!("Input genotype location: {}", genotype_path.display());
 
@@ -379,7 +397,15 @@ fn run_fit(
     // not filter a second time.
     let streaming_maf = if is_vcf_like { maf } else { None };
 
-    let mut fit_options = FitOptions::default();
+    let mut fit_options = FitOptions {
+        allow_unconverged,
+        ..FitOptions::default()
+    };
+    if allow_unconverged {
+        println!(
+            "Best-effort eigensolver output enabled; convergence diagnostics remain attached to the model."
+        );
+    }
     if let Some(window_spec) = ld.clone() {
         println!("Computing LD normalization weights (local best-diagonal).");
         let mut ld_config = LdConfig {
@@ -1802,6 +1828,7 @@ mod tests {
             markers: None,
             components: 4,
             threads: Some(0),
+            allow_unconverged: false,
             maf: None,
             ld: None,
         })

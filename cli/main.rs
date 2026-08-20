@@ -132,6 +132,11 @@ struct FitArgs {
     #[arg(long, value_name = "N")]
     threads: Option<NonZeroUsize>,
 
+    /// Emit the best available model when the eigensolver reaches its pass
+    /// limit. The model and summary remain explicitly marked unconverged.
+    #[arg(long)]
+    allow_unconverged: bool,
+
     /// Minimum observed minor allele frequency retained for PCA fitting
     #[arg(long = "maf", value_name = "MAF")]
     maf: Option<f64>,
@@ -709,6 +714,7 @@ fn run_map_fit(args: FitArgs) -> Result<(), Box<dyn std::error::Error>> {
         markers: args.markers,
         components: args.components,
         threads: args.threads.map(NonZeroUsize::get),
+        allow_unconverged: args.allow_unconverged,
         maf,
         ld: ld_window,
     })

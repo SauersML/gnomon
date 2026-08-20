@@ -3097,8 +3097,9 @@ fn require_converged(
     Err(HwePcaError::Eigen(format!(
         "PCA eigensolver stopped after {} covariance passes without reaching its tolerance \
          (worst relative Ritz residual {}, subspace change {}); refusing to build a model on an \
-         unconverged subspace. Set FitOptions::allow_unconverged to accept the best available \
-         estimate, which is recorded as unconverged in the model's fit diagnostics.",
+         unconverged subspace. Pass --allow-unconverged in the CLI or set \
+         FitOptions::allow_unconverged to accept the best available estimate, which is recorded \
+         as unconverged in the model's fit diagnostics.",
         diagnostics.passes,
         describe(diagnostics.max_relative_residual),
         describe(diagnostics.subspace_delta),
@@ -7662,7 +7663,7 @@ mod tests {
             .expect_err("an unconverged subspace must not become a model by default");
         let message = err.to_string();
         assert!(
-            message.contains("allow_unconverged"),
+            message.contains("--allow-unconverged"),
             "the refusal must name its opt-in; it said: {message}"
         );
         assert!(
