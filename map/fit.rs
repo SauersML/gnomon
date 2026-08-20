@@ -916,13 +916,13 @@ where
     }
 
     fn hard_call_packed(&mut self) -> Option<HardCallPacked<'_>> {
-        if self.indices.is_some() {
-            // The packed view addresses samples by their physical position in
-            // the dataset's 2-bit rows; there is no way to express a row subset
-            // in it, so a subset fit takes the f64 streaming path instead.
-            return None;
+        match self.indices.as_deref() {
+            Some(indices) => self
+                .inner
+                .hard_call_packed()
+                .map(|packed| packed.with_sample_selection(indices)),
+            None => self.inner.hard_call_packed(),
         }
-        self.inner.hard_call_packed()
     }
 }
 
@@ -1169,6 +1169,7 @@ pub struct HardCallPacked<'a> {
     physical_n_variants: usize,
     selection: Option<Vec<usize>>,
     match_kinds: Option<Vec<MatchKind>>,
+    sample_selection: Option<Vec<usize>>,
     missing_variant: Option<Vec<u8>>,
 }
 
@@ -1182,6 +1183,7 @@ impl<'a> HardCallPacked<'a> {
             physical_n_variants: n_variants,
             selection: None,
             match_kinds: None,
+            sample_selection: None,
             missing_variant: None,
         }
     }
@@ -1199,8 +1201,14 @@ impl<'a> HardCallPacked<'a> {
             physical_n_variants,
             selection: Some(selection.to_vec()),
             match_kinds: match_kinds.map(<[MatchKind]>::to_vec),
+            sample_selection: None,
             missing_variant: None,
         }
+    }
+
+    pub(crate) fn with_sample_selection(mut self, selection: &[usize]) -> Self {
+        self.sample_selection = Some(selection.to_vec());
+        self
     }
 
     pub(crate) fn with_model_gaps(mut self, present_mask: &[bool]) -> Option<Self> {
@@ -1283,18 +1291,21 @@ impl<'a> HardCallPacked<'a> {
             .unwrap_or(MatchKind::Exact)
     }
 
+    pub(crate) fn sample_selection(&self) -> Option<&[usize]> {
+        self.sample_selection.as_deref()
+    }
+
     pub(crate) fn moments(
         &self,
         logical_variant: usize,
         n_samples: usize,
     ) -> Option<(f64, f64, usize)> {
-        self.slice(logical_variant, 1).map(|bytes| {
-            packed_variant_moments(
-                bytes,
-                n_samples,
-                self.match_kind(logical_variant) == MatchKind::Swap,
-            )
-        })
+        let bytes = self.slice(logical_variant, 1)?;
+        let swapped = self.match_kind(logical_variant) == MatchKind::Swap;
+        match self.sample_selection() {
+            Some(selection) => packed_variant_moments_selected(bytes, selection, swapped),
+            None => Some(packed_variant_moments(bytes, n_samples, swapped)),
+        }
     }
 
     fn physical_variant(&self, logical_variant: usize) -> Option<usize> {
@@ -1685,6 +1696,7 @@ where
                 physical_n_variants: *n_variants,
                 selection: None,
                 match_kinds: None,
+                sample_selection: None,
                 missing_variant: None,
             }),
             CacheState::Disabled => self.source.hard_call_packed(),
@@ -1849,6 +1861,39 @@ fn packed_variant_moments(bytes: &[u8], n_samples: usize, swap: bool) -> (f64, f
     let sum = ones + 2 * twos;
     let sum_sq = ones + 4 * twos;
     (sum as f64, sum_sq as f64, calls)
+}
+
+fn packed_variant_moments_selected(
+    bytes: &[u8],
+    sample_selection: &[usize],
+    swap: bool,
+) -> Option<(f64, f64, usize)> {
+    let mut ones = 0usize;
+    let mut twos = 0usize;
+    let mut calls = 0usize;
+    for &physical in sample_selection {
+        let &byte = bytes.get(physical / 4)?;
+        match (byte >> ((physical % 4) * 2)) & 0b11 {
+            0 => calls += 1,
+            1 => {}
+            2 => {
+                ones += 1;
+                calls += 1;
+            }
+            3 => {
+                twos += 1;
+                calls += 1;
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    if swap {
+        twos = calls - ones - twos;
+    }
+    let sum = ones + 2 * twos;
+    let sum_sq = ones + 4 * twos;
+    Some((sum as f64, sum_sq as f64, calls))
 }
 
 struct DenseCacheBuilder {
@@ -4828,6 +4873,8 @@ where
         let max_variants = self.observed_variants.min(packed.n_variants());
         let max_variants = max_variants.min(freqs.len()).min(scales.len());
         let code_table = hard_call_code_table();
+        let sample_selection = packed.sample_selection();
+        debug_assert!(sample_selection.is_none_or(|selection| selection.len() == n_samples));
 
         for variant_idx in 0..max_variants {
             let mean = 2.0 * freqs[variant_idx];
@@ -4876,43 +4923,49 @@ where
                     let mut sum1 = 0.0f64;
                     let mut sum2 = 0.0f64;
 
-                    let mut sample_idx = 0usize;
-                    for &byte in variant_bytes {
-                        if sample_idx >= n_samples {
-                            break;
-                        }
-                        let codes = &code_table[byte as usize];
-                        for offset in 0..4 {
-                            let idx = sample_idx + offset;
-                            if idx >= n_samples {
-                                break;
-                            }
+                    if let Some(selection) = sample_selection {
+                        for (idx, &physical) in selection.iter().enumerate() {
+                            let byte = variant_bytes[physical / 4];
+                            let code = code_table[byte as usize][physical % 4];
                             let val = rhs[(idx, col)];
-                            match codes[offset] {
+                            match code {
                                 0 => sum0 += val,
                                 2 => sum1 += val,
                                 3 => sum2 += val,
                                 _ => {}
                             }
                         }
-                        sample_idx += 4;
+                    } else {
+                        let mut sample_idx = 0usize;
+                        for &byte in variant_bytes {
+                            if sample_idx >= n_samples {
+                                break;
+                            }
+                            let codes = &code_table[byte as usize];
+                            for offset in 0..4 {
+                                let idx = sample_idx + offset;
+                                if idx >= n_samples {
+                                    break;
+                                }
+                                let val = rhs[(idx, col)];
+                                match codes[offset] {
+                                    0 => sum0 += val,
+                                    2 => sum1 += val,
+                                    3 => sum2 += val,
+                                    _ => {}
+                                }
+                            }
+                            sample_idx += 4;
+                        }
                     }
 
                     proj[local] = (z0 * sum0 + z1 * sum1 + z2 * sum2) * coeff;
                 }
 
-                let mut sample_idx = 0usize;
-                for &byte in variant_bytes {
-                    if sample_idx >= n_samples {
-                        break;
-                    }
-                    let codes = &code_table[byte as usize];
-                    for offset in 0..4 {
-                        let idx = sample_idx + offset;
-                        if idx >= n_samples {
-                            break;
-                        }
-                        let z = match codes[offset] {
+                if let Some(selection) = sample_selection {
+                    for (idx, &physical) in selection.iter().enumerate() {
+                        let byte = variant_bytes[physical / 4];
+                        let z = match code_table[byte as usize][physical % 4] {
                             0 => z0,
                             2 => z1,
                             3 => z2,
@@ -4924,7 +4977,32 @@ where
                             }
                         }
                     }
-                    sample_idx += 4;
+                } else {
+                    let mut sample_idx = 0usize;
+                    for &byte in variant_bytes {
+                        if sample_idx >= n_samples {
+                            break;
+                        }
+                        let codes = &code_table[byte as usize];
+                        for offset in 0..4 {
+                            let idx = sample_idx + offset;
+                            if idx >= n_samples {
+                                break;
+                            }
+                            let z = match codes[offset] {
+                                0 => z0,
+                                2 => z1,
+                                3 => z2,
+                                _ => 0.0,
+                            };
+                            if z != 0.0 {
+                                for local in 0..chunk {
+                                    out[(idx, chunk_start + local)] += z * proj[local];
+                                }
+                            }
+                        }
+                        sample_idx += 4;
+                    }
                 }
 
                 chunk_start += chunk;
@@ -7867,6 +7945,21 @@ mod tests {
                 let expected_sum_sq = expected.iter().map(|value| value * value).sum::<f64>();
                 let actual = packed_variant_moments(&packed, n_samples, swap);
                 assert_eq!(actual, (expected_sum, expected_sum_sq, expected.len()));
+
+                let selection: Vec<usize> =
+                    (0..n_samples).filter(|sample| sample % 3 != 1).collect();
+                let selected: Vec<f64> = selection
+                    .iter()
+                    .map(|&sample| values[sample])
+                    .filter(|value| value.is_finite())
+                    .map(|value| if swap { 2.0 - value } else { value })
+                    .collect();
+                let selected_sum = selected.iter().sum::<f64>();
+                let selected_sum_sq = selected.iter().map(|value| value * value).sum::<f64>();
+                assert_eq!(
+                    packed_variant_moments_selected(&packed, &selection, swap),
+                    Some((selected_sum, selected_sum_sq, selected.len()))
+                );
             }
         }
     }
@@ -7944,6 +8037,7 @@ mod tests {
         bytes_per_variant: usize,
         n_variants: usize,
         match_kinds: Option<Vec<MatchKind>>,
+        sample_selection: Option<Vec<usize>>,
     }
 
     impl<'a> DirectPackedSource<'a> {
@@ -7963,6 +8057,7 @@ mod tests {
                 bytes_per_variant,
                 n_variants,
                 match_kinds: None,
+                sample_selection: None,
             }
         }
 
@@ -7971,13 +8066,23 @@ mod tests {
             self.match_kinds = Some(match_kinds);
             self
         }
+
+        fn with_sample_selection(mut self, sample_selection: Vec<usize>) -> Self {
+            assert!(!sample_selection.is_empty());
+            assert!(sample_selection.windows(2).all(|pair| pair[0] < pair[1]));
+            assert!(sample_selection.last().copied().unwrap() < self.inner.n_samples());
+            self.sample_selection = Some(sample_selection);
+            self
+        }
     }
 
     impl VariantBlockSource for DirectPackedSource<'_> {
         type Error = Infallible;
 
         fn n_samples(&self) -> usize {
-            self.inner.n_samples()
+            self.sample_selection
+                .as_deref()
+                .map_or_else(|| self.inner.n_samples(), <[usize]>::len)
         }
 
         fn n_variants(&self) -> usize {
@@ -7993,7 +8098,19 @@ mod tests {
             max_variants: usize,
             storage: &mut [f64],
         ) -> Result<usize, Self::Error> {
-            self.inner.next_block_into(max_variants, storage)
+            let Some(selection) = self.sample_selection.as_deref() else {
+                return self.inner.next_block_into(max_variants, storage);
+            };
+            let physical_n_samples = self.inner.n_samples();
+            let mut physical = vec![0.0; physical_n_samples * max_variants];
+            let filled = self.inner.next_block_into(max_variants, &mut physical)?;
+            for variant in 0..filled {
+                for (logical, &sample) in selection.iter().enumerate() {
+                    storage[variant * selection.len() + logical] =
+                        physical[variant * physical_n_samples + sample];
+                }
+            }
+            Ok(filled)
         }
 
         fn hard_call_packed(&mut self) -> Option<HardCallPacked<'_>> {
@@ -8003,6 +8120,7 @@ mod tests {
                 physical_n_variants: self.n_variants,
                 selection: None,
                 match_kinds: self.match_kinds.clone(),
+                sample_selection: self.sample_selection.clone(),
                 missing_variant: None,
             })
         }
@@ -8088,6 +8206,80 @@ mod tests {
             }
         }
         assert!(max_diff < 1.0e-9, "max difference was {max_diff}");
+    }
+
+    #[test]
+    fn direct_packed_operator_applies_selected_sample_rows() {
+        const PHYSICAL_SAMPLES: usize = 37;
+        const N_VARIANTS: usize = 13;
+        let sample_selection: Vec<usize> = (0..PHYSICAL_SAMPLES)
+            .filter(|sample| sample % 3 != 1)
+            .collect();
+        let n_samples = sample_selection.len();
+        let mut physical = synthetic_genotypes(PHYSICAL_SAMPLES, N_VARIANTS);
+        for (index, value) in physical.iter_mut().enumerate() {
+            if index % 29 == 7 {
+                *value = f64::NAN;
+            }
+        }
+        let mut selected = Vec::with_capacity(n_samples * N_VARIANTS);
+        for variant in 0..N_VARIANTS {
+            for &sample in &sample_selection {
+                selected.push(physical[variant * PHYSICAL_SAMPLES + sample]);
+            }
+        }
+
+        let mut stats_source =
+            DenseBlockSource::new(&selected, n_samples, N_VARIANTS).expect("stats source");
+        let stats_progress = StageProgressHandle::new(
+            Arc::new(NoopFitProgress),
+            FitProgressStage::AlleleStatistics,
+        );
+        let (scaler, _, observed) = compute_variant_statistics(
+            &mut stats_source,
+            N_VARIANTS,
+            Par::Seq,
+            stats_progress,
+            N_VARIANTS,
+        )
+        .expect("variant statistics");
+
+        let mut general_source =
+            DenseBlockSource::new(&selected, n_samples, N_VARIANTS).expect("general source");
+        let general =
+            covariance_operator(&mut general_source, N_VARIANTS, observed, scaler.clone());
+
+        let mut direct = DirectPackedSource::new(&physical, PHYSICAL_SAMPLES, N_VARIANTS)
+            .with_sample_selection(sample_selection);
+        let mut cached = CachedVariantBlockSource::new(&mut direct, true);
+        let packed = covariance_operator(&mut cached, N_VARIANTS, observed, scaler);
+
+        let rhs = Mat::<f64>::from_fn(n_samples, 5, |row, col| {
+            ((row * 11 + col * 7) % 13) as f64 - 6.0
+        });
+        let mut expected = Mat::<f64>::zeros(n_samples, 5);
+        let mut mem = MemBuffer::new(general.apply_scratch(rhs.ncols(), Par::Seq));
+        general.apply(
+            expected.as_mut(),
+            rhs.as_ref(),
+            Par::Seq,
+            MemStack::new(&mut mem),
+        );
+
+        let mut actual = Mat::<f64>::zeros(n_samples, 5);
+        assert!(packed.try_apply_hardcall_packed(actual.as_mut(), rhs.as_ref()));
+        let mut scale = 0.0f64;
+        let mut max_diff = 0.0f64;
+        for col in 0..rhs.ncols() {
+            for row in 0..n_samples {
+                scale = scale.max(expected[(row, col)].abs());
+                max_diff = max_diff.max((expected[(row, col)] - actual[(row, col)]).abs());
+            }
+        }
+        assert!(
+            max_diff <= 1.0e-10 * scale.max(1.0),
+            "selected packed rows differ by {max_diff} (magnitude {scale})"
+        );
     }
 
     /// Builds a streaming covariance operator over `source`, pinning the

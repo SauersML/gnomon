@@ -54,7 +54,10 @@ Optional arguments:
   allele frequencies, the `--maf` screen, LD weights and the covariance are all
   computed from the retained samples alone — a within-ancestry PCA needs no
   pre-subset callset. Retained samples keep their dataset order, and
-  `samples.tsv` plus the score rows list exactly those samples.
+  `samples.tsv` plus the score rows list exactly those samples. Indexed PLINK
+  hard calls keep their physical row indices, so statistics and narrow-block
+  covariance read the retained 2-bit calls directly instead of decoding every
+  full-cohort row into a temporary matrix first.
 * `--markers <N>` – Cap the variants the fit reads, as an evenly spaced
   subsample of whatever `--list` left. Every stage scales linearly in the
   variant count while the leading axes are estimated well before the last
@@ -72,9 +75,9 @@ Optional arguments:
   weighting or PCA. Indexed PLINK/PGEN inputs are screened once and then reopened
   through the retained physical-marker selection, so repeated PCA passes keep
   the packed hard-call path instead of recomputing MAF on every traversal. With
-  all samples retained, MAF is counted directly from the packed 2-bit hard
-  calls; `--keep` deliberately uses the decoded retained rows because the
-  fitting cohort, not the full callset, defines the observed MAF.
+  MAF is counted directly from the packed 2-bit hard calls, including only the
+  physical rows selected by `--keep`; the fitting cohort, not the full callset,
+  therefore defines the observed MAF without materializing decoded genotypes.
 * `--allow-unconverged` – Emit the solver's best available model when its
   bounded pass budget is exhausted. This never labels the result converged:
   `hwe.json` and `hwe_summary.tsv` retain the measured residual, subspace
@@ -234,6 +237,7 @@ approx allele-wts 4 --threads 4`; gnomon ran `fit --components 4 --threads 4
 | 250,000 × 10,000 | **16.76 s** | 25.10 s | **3.50 GB** | 6.05 GB |
 | 250,000 × 20,000 | **31.75 s** | 48.10 s | **3.50 GB** | 6.06 GB |
 | 250,000 × 19,751 (`--maf 0.05`) | **32.46 s** | 47.77 s | **3.50 GB** | 6.06 GB |
+| 100,000 kept from 250,000 × 20,000 | **17.59 s** | 20.84 s | **2.24 GB** | 2.44 GB |
 | 500,000 × 10,000 | **37.91 s** | 57.37 s | **5.80 GB** | 12.09 GB |
 
 That is a 33.2% wall-clock lead at 10,000 markers and 34.0% at 20,000, while
@@ -247,6 +251,15 @@ Packed MAF screening is 21.0% faster than gnomon's previous decoded screen
 (41.11 s) and preserves byte-identical model and score artifacts. The matched
 MAF-filtered run is 32.0% faster than PLINK2 while using 42% less peak memory;
 both retain the same 19,751 physical markers.
+
+The matched `--keep` row retains the same deterministic 100,000 sample IDs in
+both programs. Direct packed-row selection cut gnomon's previous decoded-gather
+path from 38.84 s to 17.59 s (54.7%) and from 3.75 GB to 2.24 GB while producing
+byte-identical model and score artifacts. It is 15.6% faster than PLINK2 with
+8.1% less peak memory, and the four score-subspace canonical correlations are
+1.000000000000. With `--maf 0.05` added, both programs retained the same 19,748
+within-cohort markers; gnomon completed in 20.08 s versus PLINK2's 20.60 s and
+again matched all four score axes at 1.000000000000.
 
 The realistic 20-PC request widens the gap. Gnomon completed the full
 250,000 × 20,000 fit, including refinement, loadings and all model/score

@@ -847,14 +847,24 @@ fn fit_scan_block_capacity(n_samples: usize, n_variants_hint: usize) -> usize {
 ///
 /// With no `--keep` the wrapper is the identity: it forwards every call,
 /// including the packed hard-call fast path, so the unsubset fit reads exactly
-/// as it did before.
+/// as it did before. PLINK/PGEN receives the physical row selection directly,
+/// preserving packed statistics, packed covariance and fused selected-row
+/// decoding; streamed variant sources keep the generic gather wrapper.
 fn subset_samples(
     source: DatasetBlockSource,
     keep_indices: Option<&[usize]>,
 ) -> Result<SampleSubsetSource<DatasetBlockSource>, MapDriverError> {
-    match keep_indices {
-        Some(indices) => Ok(SampleSubsetSource::new(source, indices.to_vec())?),
-        None => Ok(SampleSubsetSource::passthrough(source)),
+    match (source, keep_indices) {
+        (DatasetBlockSource::Plink(mut source), Some(indices)) => {
+            source
+                .select_samples(indices.to_vec())
+                .map_err(GenotypeIoError::from)?;
+            Ok(SampleSubsetSource::passthrough(DatasetBlockSource::Plink(
+                source,
+            )))
+        }
+        (source, Some(indices)) => Ok(SampleSubsetSource::new(source, indices.to_vec())?),
+        (source, None) => Ok(SampleSubsetSource::passthrough(source)),
     }
 }
 
@@ -1853,6 +1863,22 @@ mod tests {
         let packed = HardCallPacked::new_selected(&bytes, 1, bytes.len(), &selection, Some(&kinds));
 
         assert_eq!(packed_maf_retained_indices(&packed, 4, 0.05), Some(vec![1]));
+
+        let one_sample =
+            HardCallPacked::new_selected(&bytes, 1, bytes.len(), &selection, Some(&kinds))
+                .with_sample_selection(&[0]);
+        assert_eq!(
+            packed_maf_retained_indices(&one_sample, 1, 0.05),
+            Some(vec![])
+        );
+
+        let two_samples =
+            HardCallPacked::new_selected(&bytes, 1, bytes.len(), &selection, Some(&kinds))
+                .with_sample_selection(&[0, 1]);
+        assert_eq!(
+            packed_maf_retained_indices(&two_samples, 2, 0.05),
+            Some(vec![1])
+        );
     }
 
     #[test]
