@@ -304,6 +304,7 @@ fn covariance_computation_mode(
 pub struct FitOptions {
     pub ld: Option<LdConfig>,
     pub cache_source: bool,
+    pub(crate) precomputed_variant_statistics: Option<PrecomputedVariantStatistics>,
     /// Accept a fit whose eigensolver stopped short of its tolerance.
     ///
     /// The default refuses, and the default is the honest answer: an
@@ -319,6 +320,51 @@ pub struct FitOptions {
     /// model either way, so a best-effort artifact still records
     /// `converged: false` for whoever reads it later.
     pub allow_unconverged: bool,
+}
+
+/// Variant moments already computed against the exact sample and marker stream
+/// the fit will consume. Indexed FIT QC produces these while deciding which
+/// markers survive, so carrying them into the matrix-free fit removes a
+/// redundant packed BED pass without changing any floating-point arithmetic.
+#[derive(Clone, Debug)]
+pub(crate) struct PrecomputedVariantStatistics {
+    n_samples: usize,
+    scaler: HweScaler,
+    standardized_sums_sq: Vec<f64>,
+}
+
+impl PrecomputedVariantStatistics {
+    pub(crate) fn from_moments(n_samples: usize, moments: &[(f64, f64, usize)]) -> Self {
+        let mut frequencies = Vec::with_capacity(moments.len());
+        let mut scales = Vec::with_capacity(moments.len());
+        let mut standardized_sums_sq = Vec::with_capacity(moments.len());
+        for &(sum, sum_sq, calls) in moments {
+            let (frequency, scale, standardized_sum_sq) =
+                finalize_variant_moments(sum, sum_sq, calls);
+            frequencies.push(frequency);
+            scales.push(scale);
+            standardized_sums_sq.push(standardized_sum_sq);
+        }
+        Self {
+            n_samples,
+            scaler: HweScaler::new(frequencies, scales),
+            standardized_sums_sq,
+        }
+    }
+
+    fn matches(&self, n_samples: usize, n_variants: usize) -> bool {
+        self.n_samples == n_samples
+            && self.scaler.variant_scales().len() == n_variants
+            && self.standardized_sums_sq.len() == n_variants
+    }
+
+    fn cloned_parts(&self) -> (HweScaler, Vec<f64>, usize) {
+        (
+            self.scaler.clone(),
+            self.standardized_sums_sq.clone(),
+            self.standardized_sums_sq.len(),
+        )
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2082,21 +2128,42 @@ fn packed_variant_moments_selected(
     let mut ones = 0usize;
     let mut twos = 0usize;
     let mut calls = 0usize;
-    for_each_packed_masked_code(bytes, sample_byte_masks, n_samples, |_, code| {
-        match code {
-            0 => calls += 1,
-            1 => {}
-            2 => {
-                ones += 1;
-                calls += 1;
+    let mut selected = 0usize;
+    let moment_table = hard_call_moment_table();
+    if sample_byte_masks.len() < bytes.len() {
+        return None;
+    }
+    for (&byte, &selection_mask) in bytes.iter().zip(sample_byte_masks) {
+        selected += selection_mask.count_ones() as usize;
+        if selection_mask == 0b1111 {
+            let [byte_ones, byte_twos, byte_calls] = moment_table[byte as usize];
+            ones += byte_ones as usize;
+            twos += byte_twos as usize;
+            calls += byte_calls as usize;
+        } else {
+            let mut retained = selection_mask;
+            while retained != 0 {
+                let lane = retained.trailing_zeros() as usize;
+                retained &= retained - 1;
+                match (byte >> (lane * 2)) & 0b11 {
+                    0 => calls += 1,
+                    1 => {}
+                    2 => {
+                        ones += 1;
+                        calls += 1;
+                    }
+                    3 => {
+                        twos += 1;
+                        calls += 1;
+                    }
+                    _ => unreachable!(),
+                }
             }
-            3 => {
-                twos += 1;
-                calls += 1;
-            }
-            _ => unreachable!(),
         }
-    })?;
+    }
+    if selected != n_samples {
+        return None;
+    }
 
     if swap {
         twos = calls - ones - twos;
@@ -3631,9 +3698,25 @@ impl HwePcaModel {
 
                 // Statistics: reused from the LD pass when there was one,
                 // computed in a pass of their own when there was not.
-                let (scaler, standardized_sums_sq, observed_variants) = match ld_pass_stats {
-                    Some(stats) => stats,
-                    None => {
+                let (scaler, standardized_sums_sq, observed_variants) = match (
+                    ld_pass_stats,
+                    options.precomputed_variant_statistics.as_ref(),
+                ) {
+                    (Some(stats), _) => stats,
+                    (None, Some(stats)) if stats.matches(n_samples, n_variants_hint) => {
+                        progress
+                            .on_stage_start(FitProgressStage::AlleleStatistics, n_variants_hint);
+                        progress
+                            .on_stage_advance(FitProgressStage::AlleleStatistics, n_variants_hint);
+                        progress.on_stage_finish(FitProgressStage::AlleleStatistics);
+                        stats.cloned_parts()
+                    }
+                    (None, Some(_)) => {
+                        return Err(HwePcaError::InvalidInput(
+                            "precomputed variant statistics do not match the fit source",
+                        ));
+                    }
+                    (None, None) => {
                         progress
                             .on_stage_start(FitProgressStage::AlleleStatistics, n_variants_hint);
                         let stats_progress = StageProgressHandle::new(
@@ -8278,6 +8361,24 @@ mod tests {
 
         let selected = packed.with_sample_selection(&[0, 3, 5]);
         assert_eq!(selected.sample_missing_counts(3), Some(vec![2, 2, 1]));
+    }
+
+    #[test]
+    fn precomputed_variant_statistics_preserve_exact_moment_finalization() {
+        let moments = [(3.0, 5.0, 2), (0.0, 0.0, 0), (4.0, 6.0, 3)];
+        let statistics = PrecomputedVariantStatistics::from_moments(7, &moments);
+        assert!(statistics.matches(7, moments.len()));
+        assert!(!statistics.matches(8, moments.len()));
+
+        let (scaler, standardized_sums_sq, observed) = statistics.cloned_parts();
+        assert_eq!(observed, moments.len());
+        for (variant, &(sum, sum_sq, calls)) in moments.iter().enumerate() {
+            let (frequency, scale, standardized_sum_sq) =
+                finalize_variant_moments(sum, sum_sq, calls);
+            assert_eq!(scaler.allele_frequencies()[variant], frequency);
+            assert_eq!(scaler.variant_scales()[variant], scale);
+            assert_eq!(standardized_sums_sq[variant], standardized_sum_sq);
+        }
     }
 
     #[test]

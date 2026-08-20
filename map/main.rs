@@ -1,7 +1,7 @@
 use super::fit::{
     DEFAULT_BLOCK_WIDTH, DenseBlockSource, FitOptions, HardCallPacked, HwePcaError, HwePcaModel,
-    LdConfig, LdWindow, SampleSubsetSource, StreamingVariantFilterSource, VariantBlockSource,
-    variant_moments_pass_qc,
+    LdConfig, LdWindow, PrecomputedVariantStatistics, SampleSubsetSource,
+    StreamingVariantFilterSource, VariantBlockSource, variant_moments_pass_qc,
 };
 use super::io::{
     DatasetBlockSource, DatasetOutputError, GenotypeDataset, GenotypeIoError, OrderedSelectionPlan,
@@ -423,6 +423,7 @@ fn run_fit(request: FitRequest<'_>) -> Result<(), MapDriverError> {
     let fit_n_samples = retained_samples.len();
 
     let is_vcf_like = matches!(dataset, GenotypeDataset::Variants(_));
+    let mut precomputed_variant_statistics = None;
 
     // Indexed sources can turn the joint MAF/call-rate result into a new
     // physical selection plan. Paying this one screening pass up front has two
@@ -439,7 +440,10 @@ fn run_fit(request: FitRequest<'_>) -> Result<(), MapDriverError> {
             keep_indices.as_deref(),
         )?;
         let retained = match scan_packed_variant_filter(&mut raw_source, maf, geno)? {
-            Some(retained) => retained,
+            Some(scan) => {
+                precomputed_variant_statistics = Some(scan.statistics);
+                scan.retained
+            }
             None => {
                 let mut source = StreamingVariantFilterSource::new(raw_source, maf, geno)?;
                 scan_variant_filter(&mut source)?;
@@ -468,6 +472,7 @@ fn run_fit(request: FitRequest<'_>) -> Result<(), MapDriverError> {
 
     let mut fit_options = FitOptions {
         allow_unconverged,
+        precomputed_variant_statistics,
         ..FitOptions::default()
     };
     if allow_unconverged {
@@ -929,39 +934,53 @@ fn compose_sample_selection(
     Ok(Some(composed))
 }
 
+struct PackedVariantFilterScan {
+    retained: Vec<usize>,
+    statistics: PrecomputedVariantStatistics,
+}
+
+fn packed_variant_filter_scan(
+    packed: &HardCallPacked<'_>,
+    n_samples: usize,
+    min_maf: Option<f64>,
+    max_missing_rate: Option<f64>,
+) -> Option<PackedVariantFilterScan> {
+    let moments: Option<Vec<(f64, f64, usize)>> = (0..packed.n_variants())
+        .into_par_iter()
+        .map(|variant| packed.moments(variant, n_samples))
+        .collect();
+    let moments = moments?;
+    let mut retained = Vec::with_capacity(moments.len());
+    let mut retained_moments = Vec::with_capacity(moments.len());
+    for (variant, moments) in moments.into_iter().enumerate() {
+        let (sum, _, calls) = moments;
+        if variant_moments_pass_qc(sum, calls, n_samples, min_maf, max_missing_rate) {
+            retained.push(variant);
+            retained_moments.push(moments);
+        }
+    }
+    Some(PackedVariantFilterScan {
+        retained,
+        statistics: PrecomputedVariantStatistics::from_moments(n_samples, &retained_moments),
+    })
+}
+
+#[cfg(test)]
 fn packed_variant_filter_retained_indices(
     packed: &HardCallPacked<'_>,
     n_samples: usize,
     min_maf: Option<f64>,
     max_missing_rate: Option<f64>,
 ) -> Option<Vec<usize>> {
-    let retained: Option<Vec<bool>> = (0..packed.n_variants())
-        .into_par_iter()
-        .map(|variant| {
-            let (sum, _, calls) = packed.moments(variant, n_samples)?;
-            Some(variant_moments_pass_qc(
-                sum,
-                calls,
-                n_samples,
-                min_maf,
-                max_missing_rate,
-            ))
-        })
-        .collect();
-    Some(
-        retained?
-            .into_iter()
-            .enumerate()
-            .filter_map(|(variant, keep)| keep.then_some(variant))
-            .collect(),
-    )
+    packed_variant_filter_scan(packed, n_samples, min_maf, max_missing_rate)
+        .map(|scan| scan.retained)
 }
 
 fn scan_packed_variant_filter<S>(
     source: &mut S,
     min_maf: Option<f64>,
     max_missing_rate: Option<f64>,
-) -> Result<Option<Vec<usize>>, MapDriverError>
+) -> Result<Option<PackedVariantFilterScan>, MapDriverError>
 where
     S: VariantBlockSource + Send,
     S::Error: std::error::Error + Send + Sync + 'static,
@@ -973,7 +992,7 @@ where
     let Some(packed) = source.hard_call_packed() else {
         return Ok(None);
     };
-    packed_variant_filter_retained_indices(&packed, n_samples, min_maf, max_missing_rate)
+    packed_variant_filter_scan(&packed, n_samples, min_maf, max_missing_rate)
         .map(Some)
         .ok_or_else(|| {
             MapDriverError::InvalidState(
