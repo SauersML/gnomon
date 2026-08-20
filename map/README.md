@@ -212,11 +212,12 @@ therefore close to free — but the reason is not that the GEMM is cheap.
 
 ### Current PLINK2 comparison
 
-The local PLINK reader maps the `.bed` payload once and decodes selected variant
-columns in parallel. It does not turn an evenly spaced `--markers` selection
-into thousands of tiny `pread` calls. A 512-variant streaming tile is the
-measured throughput/memory knee for this workload; the adaptive memory plan can
-still reduce it for larger cohorts.
+The local PLINK reader maps the `.bed` payload once, decodes selected variant
+columns in parallel, and applies HWE standardization during that decode. It does
+not turn an evenly spaced `--markers` selection into thousands of tiny `pread`
+calls or make a second memory pass over each decoded tile. A 512-variant
+streaming tile is the measured throughput/memory knee for this workload; the
+adaptive memory plan can still reduce it for larger cohorts.
 
 The following runs used the same five-population PLINK1 microarray cohort, the
 same physical marker lists, four pinned AMD EPYC Milan cores, warm page cache,
@@ -225,11 +226,11 @@ allele-wts 4 --threads 4`; gnomon ran `fit --components 4 --markers N`.
 
 | samples × markers | gnomon wall | PLINK2 wall | gnomon peak RSS | PLINK2 peak RSS |
 | --- | ---: | ---: | ---: | ---: |
-| 250,000 × 2,000 | **8.01 s** | 10.91 s | **2.53 GB** | 6.12 GB |
-| 250,000 × 5,000 | **17.56 s** | 23.44 s | **2.90 GB** | 6.12 GB |
+| 250,000 × 2,000 | **5.34 s** | 10.91 s | **2.50 GB** | 6.12 GB |
+| 250,000 × 5,000 | **11.12 s** | 23.44 s | **2.78 GB** | 6.12 GB |
 
-That is a 26.6% wall-clock lead at 2,000 markers and 25.1% at 5,000, while using
-59% and 53% less peak memory respectively. The comparison is shape-matched:
+That is a 51.1% wall-clock lead at 2,000 markers and 52.6% at 5,000, while using
+59% and 55% less peak memory respectively. The comparison is shape-matched:
 PLINK2's `--extract` list contains exactly the variants selected by gnomon's
 deterministic stride, rather than giving either program an easier matrix.
 

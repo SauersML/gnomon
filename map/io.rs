@@ -1765,6 +1765,28 @@ impl VariantBlockSource for DatasetBlockSource {
         }
     }
 
+    fn next_standardized_block_into(
+        &mut self,
+        max_variants: usize,
+        storage: &mut [f64],
+        allele_frequencies: &[f64],
+        variant_scales: &[f64],
+        ld_weights: Option<&[f64]>,
+    ) -> Result<Option<usize>, Self::Error> {
+        match self {
+            Self::Plink(source) => source
+                .next_standardized_block_into(
+                    max_variants,
+                    storage,
+                    allele_frequencies,
+                    variant_scales,
+                    ld_weights,
+                )
+                .map_err(GenotypeIoError::from),
+            Self::Variants(_) => Ok(None),
+        }
+    }
+
     fn progress_bytes(&self) -> Option<(u64, Option<u64>)> {
         match self {
             Self::Plink(_) => None,
@@ -2693,6 +2715,114 @@ impl VariantBlockSource for PlinkVariantBlockSource {
             self.cursor += ncols;
             Ok(ncols)
         }
+    }
+
+    fn next_standardized_block_into(
+        &mut self,
+        max_variants: usize,
+        storage: &mut [f64],
+        allele_frequencies: &[f64],
+        variant_scales: &[f64],
+        ld_weights: Option<&[f64]>,
+    ) -> Result<Option<usize>, Self::Error> {
+        if max_variants == 0 {
+            return Ok(Some(0));
+        }
+
+        let logical_variants = self.n_variants();
+        let remaining = logical_variants.saturating_sub(self.cursor);
+        if remaining == 0 {
+            return Ok(Some(0));
+        }
+        let ncols = remaining.min(max_variants);
+        if allele_frequencies.len() < ncols || variant_scales.len() < ncols {
+            return Err(PlinkIoError::InvalidHeader(format!(
+                "PLINK fused decode needs {ncols} variant statistics, found {} frequencies and {} scales",
+                allele_frequencies.len(),
+                variant_scales.len()
+            )));
+        }
+        if ld_weights.is_some_and(|weights| weights.len() < ncols) {
+            return Err(PlinkIoError::InvalidHeader(format!(
+                "PLINK fused decode needs {ncols} LD weights"
+            )));
+        }
+
+        let nrows = self.n_samples;
+        let output_len = nrows.checked_mul(ncols).ok_or_else(|| {
+            PlinkIoError::InvalidHeader("PLINK fused decode output length overflow".into())
+        })?;
+        if storage.len() < output_len {
+            return Err(PlinkIoError::InvalidHeader(format!(
+                "PLINK fused decode storage is too small: need {output_len} values, found {}",
+                storage.len()
+            )));
+        }
+
+        let total_bytes = self
+            .bytes_per_variant
+            .checked_mul(self.total_variants)
+            .ok_or_else(|| {
+                PlinkIoError::InvalidHeader("PLINK BED payload length overflow".into())
+            })?;
+        let Some(data) = self.bed.mmap_slice(PLINK_HEADER_LEN as usize, total_bytes) else {
+            return Ok(None);
+        };
+
+        let cursor = self.cursor;
+        let selection = self.selection.as_deref();
+        let kinds = match self.match_kinds.as_deref() {
+            Some(values) => Some(values.get(cursor..cursor + ncols).ok_or_else(|| {
+                PlinkIoError::InvalidHeader(
+                    "PLINK allele-match list is shorter than selection".into(),
+                )
+            })?),
+            None => None,
+        };
+        if let Some(indices) = selection
+            && let Some(&invalid) = indices[cursor..cursor + ncols]
+                .iter()
+                .find(|&&index| index >= self.total_variants)
+        {
+            return Err(PlinkIoError::InvalidHeader(format!(
+                "variant index {invalid} exceeds dataset bounds ({})",
+                self.total_variants
+            )));
+        }
+
+        let bytes_per_variant = self.bytes_per_variant;
+        if nrows > 0 {
+            storage[..output_len]
+                .par_chunks_mut(nrows)
+                .enumerate()
+                .for_each(|(logical, dest)| {
+                    let physical = selection
+                        .map(|indices| indices[cursor + logical])
+                        .unwrap_or(cursor + logical);
+                    let start = physical * bytes_per_variant;
+                    let bytes = &data[start..start + bytes_per_variant];
+                    let frequency = allele_frequencies[logical];
+                    let scale = variant_scales[logical].max(crate::map::fit::HWE_SCALE_FLOOR);
+                    let inv = if scale > 0.0 { scale.recip() } else { 0.0 };
+                    let weight = ld_weights
+                        .and_then(|weights| weights.get(logical))
+                        .copied()
+                        .unwrap_or(1.0);
+                    let swap = kinds.is_some_and(|values| values[logical] == MatchKind::Swap);
+                    decode_plink_variant_standardized(
+                        bytes,
+                        dest,
+                        nrows,
+                        2.0 * frequency,
+                        inv,
+                        weight,
+                        swap,
+                    );
+                });
+        }
+
+        self.cursor += ncols;
+        Ok(Some(ncols))
     }
 
     fn progress_variants(&self) -> Option<(usize, Option<usize>)> {
@@ -5226,16 +5356,73 @@ fn parse_vcf_genotype(field: &str, alt_index: usize) -> Result<Option<f64>, Vari
 }
 
 fn decode_plink_variant(bytes: &[u8], dest: &mut [f64], n_samples: usize, table: &[[f64; 4]; 256]) {
-    let mut sample_idx = 0usize;
-    for &byte in bytes {
-        if sample_idx >= n_samples {
-            break;
-        }
+    debug_assert!(dest.len() >= n_samples);
+    debug_assert!(bytes.len() >= n_samples.div_ceil(4));
+
+    let (full_dest, tail_dest) = dest[..n_samples].as_chunks_mut::<4>();
+    let full_bytes = full_dest.len();
+    for (&byte, chunk) in bytes[..full_bytes].iter().zip(full_dest) {
         let decoded = &table[byte as usize];
-        let remaining = n_samples - sample_idx;
-        let take = remaining.min(4);
-        dest[sample_idx..sample_idx + take].copy_from_slice(&decoded[..take]);
-        sample_idx += take;
+        chunk[0] = decoded[0];
+        chunk[1] = decoded[1];
+        chunk[2] = decoded[2];
+        chunk[3] = decoded[3];
+    }
+
+    if !tail_dest.is_empty() {
+        let decoded = &table[bytes[full_bytes] as usize];
+        match tail_dest {
+            [a] => *a = decoded[0],
+            [a, b] => (*a, *b) = (decoded[0], decoded[1]),
+            [a, b, c] => (*a, *b, *c) = (decoded[0], decoded[1], decoded[2]),
+            _ => unreachable!("a PLINK byte contains at most three tail samples"),
+        }
+    }
+}
+
+#[inline(always)]
+fn decode_plink_variant_standardized(
+    bytes: &[u8],
+    dest: &mut [f64],
+    n_samples: usize,
+    mean: f64,
+    inv: f64,
+    weight: f64,
+    swap: bool,
+) {
+    debug_assert!(dest.len() >= n_samples);
+    debug_assert!(bytes.len() >= n_samples.div_ceil(4));
+
+    let transform = |raw: f64| {
+        let value = (raw - mean) * inv;
+        if (weight - 1.0).abs() < f64::EPSILON {
+            value
+        } else {
+            value * weight
+        }
+    };
+    let mut zero = transform(0.0);
+    let one = transform(1.0);
+    let mut two = transform(2.0);
+    if swap {
+        std::mem::swap(&mut zero, &mut two);
+    }
+    let code_values = [zero, 0.0, one, two];
+
+    let (full_dest, tail_dest) = dest[..n_samples].as_chunks_mut::<4>();
+    let full_bytes = full_dest.len();
+    for (&byte, chunk) in bytes[..full_bytes].iter().zip(full_dest) {
+        chunk[0] = code_values[(byte & 0b11) as usize];
+        chunk[1] = code_values[((byte >> 2) & 0b11) as usize];
+        chunk[2] = code_values[((byte >> 4) & 0b11) as usize];
+        chunk[3] = code_values[((byte >> 6) & 0b11) as usize];
+    }
+
+    if !tail_dest.is_empty() {
+        let byte = bytes[full_bytes];
+        for (offset, value) in tail_dest.iter_mut().enumerate() {
+            *value = code_values[((byte >> (offset * 2)) & 0b11) as usize];
+        }
     }
 }
 
@@ -5615,6 +5802,65 @@ mod tests {
     }
 
     #[test]
+    fn plink_table_decoder_handles_full_groups_and_every_tail_width() {
+        let codes = [0u8, 2, 3, 1, 2, 0, 1, 3, 3];
+        let expected = [0.0, 1.0, 2.0, f64::NAN, 1.0, 0.0, f64::NAN, 2.0, 2.0];
+
+        for n_samples in 0..=codes.len() {
+            let bytes = pack_plink_codes(&codes[..n_samples]);
+            let mut decoded = vec![99.0; n_samples + 3];
+            decode_plink_variant(&bytes, &mut decoded, n_samples, decode_table());
+
+            for sample in 0..n_samples {
+                if expected[sample].is_nan() {
+                    assert!(decoded[sample].is_nan(), "sample {sample}, n={n_samples}");
+                } else {
+                    assert_eq!(decoded[sample], expected[sample]);
+                }
+            }
+            assert_eq!(&decoded[n_samples..], &[99.0; 3]);
+        }
+    }
+
+    #[test]
+    fn fused_plink_decode_matches_decode_then_standardize() {
+        let codes = [0u8, 2, 3, 1, 2, 0, 1, 3, 3];
+        let bytes = pack_plink_codes(&codes);
+        let mean = 0.75;
+        let inv = 1.25;
+
+        for (weight, swap) in [(1.0, false), (0.625, false), (0.625, true)] {
+            let mut expected = vec![0.0; codes.len()];
+            decode_plink_variant(&bytes, &mut expected, codes.len(), decode_table());
+            for value in &mut expected {
+                if value.is_nan() {
+                    *value = 0.0;
+                } else {
+                    if swap {
+                        *value = 2.0 - *value;
+                    }
+                    *value = (*value - mean) * inv;
+                    if (weight - 1.0_f64).abs() >= f64::EPSILON {
+                        *value *= weight;
+                    }
+                }
+            }
+
+            let mut actual = vec![99.0; codes.len()];
+            decode_plink_variant_standardized(
+                &bytes,
+                &mut actual,
+                codes.len(),
+                mean,
+                inv,
+                weight,
+                swap,
+            );
+            assert_eq!(actual, expected, "weight={weight}, swap={swap}");
+        }
+    }
+
+    #[test]
     fn local_plink_selection_decodes_noncontiguous_mmap_columns_and_swaps() {
         let dir = tempdir().unwrap();
         let bed_path = dir.path().join("selected.bed");
@@ -5652,6 +5898,40 @@ mod tests {
         assert_eq!(&decoded[16..20], &[2.0, 0.0, 1.0, 2.0]);
         assert!(decoded[20].is_nan());
         assert_eq!(&decoded[21..24], &[0.0, 1.0, 2.0]);
+
+        let frequencies: [f64; 3] = [0.375, 0.5, 0.625];
+        let scales: [f64; 3] = [0.75, 1.25, 0.5];
+        let weights: [f64; 3] = [1.0, 0.625, 1.5];
+        let mut expected = decoded;
+        for variant in 0..3 {
+            for value in &mut expected[variant * 8..(variant + 1) * 8] {
+                if value.is_nan() {
+                    *value = 0.0;
+                } else {
+                    *value = (*value - 2.0 * frequencies[variant]) * scales[variant].recip();
+                    if (weights[variant] - 1.0_f64).abs() >= f64::EPSILON {
+                        *value *= weights[variant];
+                    }
+                }
+            }
+        }
+
+        let mut fused_source = PlinkVariantBlockSource::new(
+            open_bed_source(&bed_path).unwrap(),
+            2,
+            8,
+            5,
+            Some(vec![0, 2, 4]),
+            Some(vec![MatchKind::Exact, MatchKind::Exact, MatchKind::Swap]),
+        );
+        let mut fused = vec![99.0; 24];
+        assert_eq!(
+            fused_source
+                .next_standardized_block_into(3, &mut fused, &frequencies, &scales, Some(&weights),)
+                .unwrap(),
+            Some(3)
+        );
+        assert_eq!(fused, expected);
     }
 
     #[test]

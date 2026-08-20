@@ -895,6 +895,26 @@ where
         self.inner.take_variant_keys()
     }
 
+    fn next_standardized_block_into(
+        &mut self,
+        max_variants: usize,
+        storage: &mut [f64],
+        allele_frequencies: &[f64],
+        variant_scales: &[f64],
+        ld_weights: Option<&[f64]>,
+    ) -> Result<Option<usize>, Self::Error> {
+        if self.indices.is_some() {
+            return Ok(None);
+        }
+        self.inner.next_standardized_block_into(
+            max_variants,
+            storage,
+            allele_frequencies,
+            variant_scales,
+            ld_weights,
+        )
+    }
+
     fn hard_call_packed(&mut self) -> Option<HardCallPacked<'_>> {
         if self.indices.is_some() {
             // The packed view addresses samples by their physical position in
@@ -1081,6 +1101,30 @@ pub trait VariantBlockSource {
         max_variants: usize,
         storage: &mut [f64],
     ) -> Result<usize, Self::Error>;
+
+    /// Decode and standardize a block in one pass when the source has a native
+    /// representation that can apply the transform during decode.
+    ///
+    /// The statistic and optional weight slices begin at the source's current
+    /// logical cursor. `None` means the source cannot fuse this operation and
+    /// has not advanced; callers then use [`Self::next_block_into`].
+    fn next_standardized_block_into(
+        &mut self,
+        max_variants: usize,
+        storage: &mut [f64],
+        allele_frequencies: &[f64],
+        variant_scales: &[f64],
+        ld_weights: Option<&[f64]>,
+    ) -> Result<Option<usize>, Self::Error> {
+        let _ = (
+            max_variants,
+            storage,
+            allele_frequencies,
+            variant_scales,
+            ld_weights,
+        );
+        Ok(None)
+    }
 
     fn progress_bytes(&self) -> Option<(u64, Option<u64>)> {
         None
@@ -1556,6 +1600,30 @@ where
         Ok(filled)
     }
 
+    fn next_standardized_block_into(
+        &mut self,
+        max_variants: usize,
+        storage: &mut [f64],
+        allele_frequencies: &[f64],
+        variant_scales: &[f64],
+        ld_weights: Option<&[f64]>,
+    ) -> Result<Option<usize>, Self::Error> {
+        if !matches!(self.state, CacheState::Disabled) {
+            return Ok(None);
+        }
+        let filled = self.source.next_standardized_block_into(
+            max_variants,
+            storage,
+            allele_frequencies,
+            variant_scales,
+            ld_weights,
+        )?;
+        if let Some(filled) = filled {
+            self.cursor += filled;
+        }
+        Ok(filled)
+    }
+
     fn progress_bytes(&self) -> Option<(u64, Option<u64>)> {
         match self.state {
             CacheState::ReadyHardCall { .. } | CacheState::ReadyDense { .. } => None,
@@ -2020,7 +2088,9 @@ pub(crate) fn apply_ld_weights(
 struct VariantStatsCache {
     frequencies: Vec<f64>,
     scales: Vec<f64>,
+    standardized_sums_sq: Vec<f64>,
     block_sums: Vec<f64>,
+    block_sums_sq: Vec<f64>,
     block_calls: Vec<usize>,
     finalized_len: Option<usize>,
     write_pos: usize,
@@ -2030,10 +2100,13 @@ impl VariantStatsCache {
     fn new(block_capacity: usize, variant_capacity_hint: usize) -> Self {
         let frequencies = Vec::with_capacity(variant_capacity_hint);
         let scales = Vec::with_capacity(variant_capacity_hint);
+        let standardized_sums_sq = Vec::with_capacity(variant_capacity_hint);
         Self {
             frequencies,
             scales,
+            standardized_sums_sq,
             block_sums: vec![0.0; block_capacity],
+            block_sums_sq: vec![0.0; block_capacity],
             block_calls: vec![0usize; block_capacity],
             finalized_len: None,
             write_pos: 0,
@@ -2054,6 +2127,7 @@ impl VariantStatsCache {
         let filled = block.ncols();
         {
             let sums_slice = &mut self.block_sums[..filled];
+            let sums_sq_slice = &mut self.block_sums_sq[..filled];
             let calls_slice = &mut self.block_calls[..filled];
 
             let use_parallel = filled >= 32 && par.degree() > 1;
@@ -2061,27 +2135,33 @@ impl VariantStatsCache {
             if use_parallel {
                 sums_slice
                     .par_iter_mut()
+                    .zip(sums_sq_slice.par_iter_mut())
                     .zip(calls_slice.par_iter_mut())
                     .zip(block.par_col_iter())
-                    .for_each(|((sum_slot, calls_slot), column)| {
+                    .for_each(|(((sum_slot, sum_sq_slot), calls_slot), column)| {
                         let contiguous = column
                             .try_as_col_major()
                             .expect("variant block column must be contiguous");
-                        let (sum, calls) = sum_and_count_finite(contiguous.as_slice());
+                        let (sum, sum_sq, calls) =
+                            sum_sum_sq_and_count_finite(contiguous.as_slice());
                         *sum_slot = sum;
+                        *sum_sq_slot = sum_sq;
                         *calls_slot = calls;
                     });
             } else {
                 sums_slice
                     .iter_mut()
+                    .zip(sums_sq_slice.iter_mut())
                     .zip(calls_slice.iter_mut())
                     .zip(block.col_iter())
-                    .for_each(|((sum_slot, calls_slot), column)| {
+                    .for_each(|(((sum_slot, sum_sq_slot), calls_slot), column)| {
                         let contiguous = column
                             .try_as_col_major()
                             .expect("variant block column must be contiguous");
-                        let (sum, calls) = sum_and_count_finite(contiguous.as_slice());
+                        let (sum, sum_sq, calls) =
+                            sum_sum_sq_and_count_finite(contiguous.as_slice());
                         *sum_slot = sum;
+                        *sum_sq_slot = sum_sq;
                         *calls_slot = calls;
                     });
             }
@@ -2092,15 +2172,19 @@ impl VariantStatsCache {
 
         let freq_slice = &mut self.frequencies[variant_range.clone()];
         let scale_slice = &mut self.scales[variant_range.clone()];
+        let standardized_sums_sq_slice = &mut self.standardized_sums_sq[variant_range.clone()];
         let sums_slice = &self.block_sums[..filled];
+        let sums_sq_slice = &self.block_sums_sq[..filled];
         let calls_slice = &self.block_calls[..filled];
 
         for idx in 0..filled {
             let sum = sums_slice[idx];
+            let sum_sq = sums_sq_slice[idx];
             let calls = calls_slice[idx];
             if calls == 0 {
                 freq_slice[idx] = 0.0;
                 scale_slice[idx] = HWE_SCALE_FLOOR;
+                standardized_sums_sq_slice[idx] = 0.0;
 
                 continue;
             }
@@ -2116,6 +2200,9 @@ impl VariantStatsCache {
             } else {
                 derived_scale
             };
+            let centered_sum_sq = (sum_sq - sum * mean_genotype).max(0.0);
+            let scale = scale_slice[idx];
+            standardized_sums_sq_slice[idx] = centered_sum_sq / (scale * scale);
         }
 
         self.write_pos = end;
@@ -2127,6 +2214,7 @@ impl VariantStatsCache {
     fn finalize(&mut self) {
         self.frequencies.truncate(self.write_pos);
         self.scales.truncate(self.write_pos);
+        self.standardized_sums_sq.truncate(self.write_pos);
         self.finalized_len = Some(self.write_pos);
     }
 
@@ -2135,9 +2223,12 @@ impl VariantStatsCache {
         self.finalized_len.unwrap_or(self.write_pos)
     }
 
-    fn into_scaler(self) -> Option<HweScaler> {
+    fn into_parts(self) -> Option<(HweScaler, Vec<f64>)> {
         if self.finalized_len.is_some() {
-            Some(HweScaler::new(self.frequencies, self.scales))
+            Some((
+                HweScaler::new(self.frequencies, self.scales),
+                self.standardized_sums_sq,
+            ))
         } else {
             None
         }
@@ -2165,12 +2256,15 @@ impl VariantStatsCache {
             let additional_capacity = target - freq_capacity;
             self.frequencies.reserve_exact(additional_capacity);
             self.scales.reserve_exact(additional_capacity);
+            self.standardized_sums_sq.reserve_exact(additional_capacity);
         }
 
         let additional = required - self.frequencies.len();
         self.frequencies
             .extend(std::iter::repeat_n(0.0, additional));
         self.scales.extend(std::iter::repeat_n(0.0, additional));
+        self.standardized_sums_sq
+            .extend(std::iter::repeat_n(0.0, additional));
     }
 }
 
@@ -2617,7 +2711,7 @@ fn standardize_column_simd_full_impl_lanes4(values: &mut [f64], mean: f64, inv: 
 }
 
 #[inline(always)]
-fn sum_and_count_finite(values: &[f64]) -> (f64, usize) {
+fn sum_sum_sq_and_count_finite(values: &[f64]) -> (f64, f64, usize) {
     match detected_simd_lane_selection() {
         #[cfg(any(
             target_feature = "avx",
@@ -2629,8 +2723,7 @@ fn sum_and_count_finite(values: &[f64]) -> (f64, usize) {
             // SAFETY: Runtime detection guaranteed AVX is present before
             // dispatching to the specialized implementation.
             unsafe {
-                log::debug!("Invoking AVX sum_and_count_finite implementation");
-                return sum_and_count_finite_avx(values);
+                return sum_sum_sq_and_count_finite_avx(values);
             }
 
             #[cfg(all(
@@ -2639,9 +2732,9 @@ fn sum_and_count_finite(values: &[f64]) -> (f64, usize) {
             ))]
             {
                 log::debug!(
-                    "Using generic four-lane sum_and_count_finite implementation for non-x86 architecture"
+                    "Using generic four-lane moment implementation for non-x86 architecture"
                 );
-                sum_and_count_finite_impl_lanes4(values)
+                sum_sum_sq_and_count_finite_impl_lanes4(values)
             }
 
             #[cfg(not(any(
@@ -2652,18 +2745,19 @@ fn sum_and_count_finite(values: &[f64]) -> (f64, usize) {
             )))]
             {
                 log::warn!(
-                    "Falling back to two-lane sum_and_count_finite implementation despite four-lane selection"
+                    "Falling back to two-lane moment implementation despite four-lane selection"
                 );
-                return sum_and_count_finite_impl_lanes2(values);
+                return sum_sum_sq_and_count_finite_impl_lanes2(values);
             }
         }
-        _ => sum_and_count_finite_impl_lanes2(values),
+        _ => sum_sum_sq_and_count_finite_impl_lanes2(values),
     }
 }
 
 #[inline(always)]
-fn sum_and_count_finite_impl_lanes2(values: &[f64]) -> (f64, usize) {
+fn sum_sum_sq_and_count_finite_impl_lanes2(values: &[f64]) -> (f64, f64, usize) {
     let mut sum = 0.0;
+    let mut sum_sq = 0.0;
     let mut count = 0usize;
 
     let (chunks, remainder) = values.as_chunks::<2>();
@@ -2672,10 +2766,12 @@ fn sum_and_count_finite_impl_lanes2(values: &[f64]) -> (f64, usize) {
         let lane_values = lane.to_array();
         if lane_values[0].is_finite() {
             sum += lane_values[0];
+            sum_sq = lane_values[0].mul_add(lane_values[0], sum_sq);
             count += 1;
         }
         if lane_values[1].is_finite() {
             sum += lane_values[1];
+            sum_sq = lane_values[1].mul_add(lane_values[1], sum_sq);
             count += 1;
         }
     }
@@ -2683,11 +2779,12 @@ fn sum_and_count_finite_impl_lanes2(values: &[f64]) -> (f64, usize) {
     for &value in remainder {
         if value.is_finite() {
             sum += value;
+            sum_sq = value.mul_add(value, sum_sq);
             count += 1;
         }
     }
 
-    (sum, count)
+    (sum, sum_sq, count)
 }
 
 #[cfg(any(
@@ -2696,8 +2793,9 @@ fn sum_and_count_finite_impl_lanes2(values: &[f64]) -> (f64, usize) {
     target_arch = "wasm32"
 ))]
 #[inline(always)]
-fn sum_and_count_finite_impl_lanes4(values: &[f64]) -> (f64, usize) {
+fn sum_sum_sq_and_count_finite_impl_lanes4(values: &[f64]) -> (f64, f64, usize) {
     let mut sum = 0.0;
+    let mut sum_sq = 0.0;
     let mut count = 0usize;
 
     let (chunks, remainder) = values.as_chunks::<4>();
@@ -2706,18 +2804,22 @@ fn sum_and_count_finite_impl_lanes4(values: &[f64]) -> (f64, usize) {
         let lane_values = lane.to_array();
         if lane_values[0].is_finite() {
             sum += lane_values[0];
+            sum_sq = lane_values[0].mul_add(lane_values[0], sum_sq);
             count += 1;
         }
         if lane_values[1].is_finite() {
             sum += lane_values[1];
+            sum_sq = lane_values[1].mul_add(lane_values[1], sum_sq);
             count += 1;
         }
         if lane_values[2].is_finite() {
             sum += lane_values[2];
+            sum_sq = lane_values[2].mul_add(lane_values[2], sum_sq);
             count += 1;
         }
         if lane_values[3].is_finite() {
             sum += lane_values[3];
+            sum_sq = lane_values[3].mul_add(lane_values[3], sum_sq);
             count += 1;
         }
     }
@@ -2725,11 +2827,12 @@ fn sum_and_count_finite_impl_lanes4(values: &[f64]) -> (f64, usize) {
     for &value in remainder {
         if value.is_finite() {
             sum += value;
+            sum_sq = value.mul_add(value, sum_sq);
             count += 1;
         }
     }
 
-    (sum, count)
+    (sum, sum_sq, count)
 }
 
 #[cfg(all(
@@ -2740,8 +2843,8 @@ fn sum_and_count_finite_impl_lanes4(values: &[f64]) -> (f64, usize) {
 /// # Safety
 /// Callers must ensure AVX is supported by the running CPU. Runtime feature
 /// checks protect all invocations of this function.
-unsafe fn sum_and_count_finite_avx(values: &[f64]) -> (f64, usize) {
-    sum_and_count_finite_impl_lanes4(values)
+unsafe fn sum_sum_sq_and_count_finite_avx(values: &[f64]) -> (f64, f64, usize) {
+    sum_sum_sq_and_count_finite_impl_lanes4(values)
 }
 
 #[derive(Clone, Debug)]
@@ -3038,7 +3141,7 @@ impl HwePcaModel {
         // arrive at a bit-identical answer, which at 500k variants is not a
         // micro-optimization but a whole redundant read of the dataset.
         let (ld_weights_arc, ld_weights, ld_pass_stats) = if let Some(ld_cfg) = ld_config {
-            let (ld_scaler, ld_observed_variants, ld_weights_computed) =
+            let (ld_scaler, ld_standardized_sums_sq, ld_observed_variants, ld_weights_computed) =
                 compute_stats_and_ld_weights(
                     source,
                     block_capacity,
@@ -3051,7 +3154,7 @@ impl HwePcaModel {
             (
                 Some(ld_arc),
                 Some(ld_weights_computed),
-                Some((ld_scaler, ld_observed_variants)),
+                Some((ld_scaler, ld_standardized_sums_sq, ld_observed_variants)),
             )
         } else {
             (None, None, None)
@@ -3065,7 +3168,7 @@ impl HwePcaModel {
         }
 
         // Choose between dense and matrix-free paths
-        let (decomposition, scaler, observed_variants) = match gram_mode {
+        let (decomposition, scaler, standardized_sums_sq, observed_variants) = match gram_mode {
             CovarianceComputationMode::Dense => {
                 // PATH A: Dense - the exact reference solve, for problems small
                 // enough that forming C is the cheaper way to get it.
@@ -3074,7 +3177,7 @@ impl HwePcaModel {
                 // statistics inside the traversal it has to make anyway to
                 // accumulate the covariance, so there is no pass to save, and
                 // the fused loop stays a single self-contained pass.
-                let (scaler, observed_variants, covariance) =
+                let (scaler, standardized_sums_sq, observed_variants, covariance) =
                     compute_stats_and_covariance_blockwise(
                         source,
                         block_capacity,
@@ -3132,7 +3235,12 @@ impl HwePcaModel {
                     }
                 };
 
-                (decomposition, scaler, observed_variants)
+                (
+                    decomposition,
+                    scaler,
+                    standardized_sums_sq,
+                    observed_variants,
+                )
             }
             CovarianceComputationMode::Partial => {
                 // PATH B: Matrix-free - For biobank-scale datasets
@@ -3144,7 +3252,7 @@ impl HwePcaModel {
 
                 // Statistics: reused from the LD pass when there was one,
                 // computed in a pass of their own when there was not.
-                let (scaler, observed_variants) = match ld_pass_stats {
+                let (scaler, standardized_sums_sq, observed_variants) = match ld_pass_stats {
                     Some(stats) => stats,
                     None => {
                         progress
@@ -3194,7 +3302,12 @@ impl HwePcaModel {
 
                 progress.on_stage_finish(FitProgressStage::GramMatrix);
 
-                (decomposition_result?, scaler, observed_variants)
+                (
+                    decomposition_result?,
+                    scaler,
+                    standardized_sums_sq,
+                    observed_variants,
+                )
             }
         };
 
@@ -3234,23 +3347,24 @@ impl HwePcaModel {
         // for no extra genotype read — the small `k×k` Gram `BᵀB`, which is
         // `(n−1)·Uᵀ·C·U`: the covariance restricted to the returned subspace,
         // written in that subspace's own coordinates.
-        let (mut loadings, restricted_gram, standardized_frobenius_sq) =
-            compute_loading_cross_products(
-                source,
-                &scaler,
-                variant_count,
-                block_capacity,
-                decomposition.vectors.as_ref(),
-                ld_weights_arc.as_deref(),
-                progress,
-                par,
-            )?;
+        let (mut loadings, restricted_gram) = compute_loading_cross_products(
+            source,
+            &scaler,
+            variant_count,
+            block_capacity,
+            decomposition.vectors.as_ref(),
+            ld_weights_arc.as_deref(),
+            progress,
+            par,
+        )?;
 
         // Total variance = trace(covariance) = ‖X‖²_F / (n−1), where X is the
-        // standardized (optionally LD-weighted) genotype matrix. The loadings
-        // pass standardizes every block exactly once in both the dense and
-        // matrix-free paths, so accumulating its Frobenius norm there yields the
-        // full-spectrum variance even when only the top components are solved.
+        // standardized (optionally LD-weighted) genotype matrix. Its per-variant
+        // squared norms were accumulated during the mandatory allele-statistics
+        // traversal, avoiding another scalar scan over every standardized call
+        // in the loadings pass.
+        let standardized_frobenius_sq =
+            weighted_standardized_frobenius_sq(&standardized_sums_sq, ld_weights_arc.as_deref());
         let total_variance = standardized_frobenius_sq / (n_samples - 1) as f64;
 
         // Rayleigh-Ritz: diagonalize that restricted covariance and rotate the
@@ -3748,6 +3862,7 @@ where
                 id: usize,
                 filled: usize,
                 start: usize,
+                standardized: bool,
             },
             End,
             Error(HwePcaError),
@@ -3766,6 +3881,9 @@ where
         let observed_total = self.observed_variants;
         let scale = self.scale;
         let block_len = block_len;
+        let allele_frequencies = self.scaler.allele_frequencies();
+        let variant_scales = self.scaler.variant_scales();
+        let ld_weights = self.ld_weights.as_deref();
 
         let processed = thread::scope(|scope| {
             let buffer_ptrs_prefetch = buffer_ptrs;
@@ -3799,17 +3917,34 @@ where
                             .lock()
                             .expect("covariance source mutex poisoned");
                         let source: &mut S = &mut guard;
-                        source.next_block_into(block_capacity, buffer_slice)
+                        match source.next_standardized_block_into(
+                            block_capacity,
+                            buffer_slice,
+                            &allele_frequencies[start..],
+                            &variant_scales[start..],
+                            ld_weights.map(|weights| &weights[start..]),
+                        ) {
+                            Ok(Some(filled)) => Ok((filled, true)),
+                            Ok(None) => source
+                                .next_block_into(block_capacity, buffer_slice)
+                                .map(|filled| (filled, false)),
+                            Err(error) => Err(error),
+                        }
                     };
 
                     match filled_res {
-                        Ok(filled) => {
+                        Ok((filled, standardized)) => {
                             if filled == 0 {
                                 let _ = filled_sender.send(PrefetchMessage::End);
                                 break;
                             }
 
-                            let _ = filled_sender.send(PrefetchMessage::Data { id, filled, start });
+                            let _ = filled_sender.send(PrefetchMessage::Data {
+                                id,
+                                filled,
+                                start,
+                                standardized,
+                            });
                             start += filled;
                         }
                         Err(err) => {
@@ -3826,7 +3961,12 @@ where
             let buffer_ptrs_compute = buffer_ptrs;
             while let Ok(message) = filled_rx.recv() {
                 match message {
-                    PrefetchMessage::Data { id, filled, start } => {
+                    PrefetchMessage::Data {
+                        id,
+                        filled,
+                        start,
+                        standardized,
+                    } => {
                         if start != processed {
                             self.fail_invalid("prefetch produced out-of-order variant ranges");
                         }
@@ -3851,7 +3991,13 @@ where
                             filled,
                         );
                         let variant_range = start..start + filled;
-                        self.standardize_block_in_place(block.rb_mut(), variant_range.clone(), par);
+                        if !standardized {
+                            self.standardize_block_in_place(
+                                block.rb_mut(),
+                                variant_range.clone(),
+                                par,
+                            );
+                        }
 
                         let mut proj_block = proj_storage.rb_mut().subrows_mut(0, filled);
 
@@ -4777,7 +4923,7 @@ fn compute_variant_statistics<S, P>(
     par: Par,
     progress: StageProgressHandle<P>,
     n_variants_hint: usize,
-) -> Result<(HweScaler, usize), HwePcaError>
+) -> Result<(HweScaler, Vec<f64>, usize), HwePcaError>
 where
     S: VariantBlockSource,
     S::Error: Error + Send + Sync + 'static,
@@ -4850,12 +4996,12 @@ where
     }
 
     stats.finalize();
-    let scaler = stats
-        .into_scaler()
+    let (scaler, standardized_sums_sq) = stats
+        .into_parts()
         .expect("finalized statistics must produce a scaler");
     progress.finish();
 
-    Ok((scaler, processed))
+    Ok((scaler, standardized_sums_sq, processed))
 }
 
 fn build_sample_scores(n_samples: usize, decomposition: &Eigenpairs) -> (Vec<f64>, Mat<f64>) {
@@ -4891,7 +5037,7 @@ fn compute_stats_and_covariance_blockwise<S, P>(
     progress: &Arc<P>,
     n_variants_hint: usize,
     ld_weights: Option<Arc<[f64]>>,
-) -> Result<(HweScaler, usize, Mat<f64>), HwePcaError>
+) -> Result<(HweScaler, Vec<f64>, usize, Mat<f64>), HwePcaError>
 where
     S: VariantBlockSource,
     S::Error: Error + Send + Sync + 'static,
@@ -5006,8 +5152,8 @@ where
 
     // Finalize statistics
     stats.finalize();
-    let scaler = stats
-        .into_scaler()
+    let (scaler, standardized_sums_sq) = stats
+        .into_parts()
         .expect("finalized statistics must produce a scaler");
 
     // Convert the accumulated Gram matrix (X·Xᵀ) into the sample covariance
@@ -5031,7 +5177,7 @@ where
     progress.on_stage_start(FitProgressStage::GramMatrix, 0);
     progress.on_stage_finish(FitProgressStage::GramMatrix);
 
-    Ok((scaler, processed, covariance))
+    Ok((scaler, standardized_sums_sq, processed, covariance))
 }
 
 fn compute_stats_and_ld_weights<S, P>(
@@ -5041,7 +5187,7 @@ fn compute_stats_and_ld_weights<S, P>(
     n_variants_hint: usize,
     progress: &Arc<P>,
     par: Par,
-) -> Result<(HweScaler, usize, LdWeights), HwePcaError>
+) -> Result<(HweScaler, Vec<f64>, usize, LdWeights), HwePcaError>
 where
     S: VariantBlockSource + Send,
     S::Error: Error + Send + Sync + 'static,
@@ -5194,8 +5340,8 @@ where
     }
 
     stats.finalize();
-    let scaler = stats
-        .into_scaler()
+    let (scaler, standardized_sums_sq) = stats
+        .into_parts()
         .expect("finalized statistics must produce a scaler");
     stats_progress.finish();
 
@@ -5209,7 +5355,7 @@ where
         ridge: config.ridge,
     };
 
-    Ok((scaler, processed, weights))
+    Ok((scaler, standardized_sums_sq, processed, weights))
 }
 
 struct LdRingBuffer {
@@ -6125,6 +6271,26 @@ fn rotate_columns(
     Mat::from_fn(rows, kept, |row, col| rotated[(row, col)])
 }
 
+fn weighted_standardized_frobenius_sq(
+    standardized_sums_sq: &[f64],
+    ld_weights: Option<&[f64]>,
+) -> f64 {
+    let mut total = 0.0f64;
+    let mut compensation = 0.0f64;
+    for (variant, &sum_sq) in standardized_sums_sq.iter().enumerate() {
+        let weight = ld_weights
+            .and_then(|weights| weights.get(variant))
+            .copied()
+            .unwrap_or(1.0);
+        let term = sum_sq * weight * weight;
+        let adjusted = term - compensation;
+        let next = total + adjusted;
+        compensation = (next - total) - adjusted;
+        total = next;
+    }
+    total
+}
+
 /// Streams the genotypes once to form `B = Xᵀ·U` and, from the same blocks,
 /// `BᵀB`.
 ///
@@ -6136,8 +6302,7 @@ fn rotate_columns(
 ///
 /// `BᵀB` accumulates block by block out of the chunk already computed for the
 /// loadings, so the restricted covariance costs one `k`-wide GEMM per block and
-/// not one additional read of the genome. The returned scalar is `‖X‖²_F` over
-/// the standardized (optionally LD-weighted) blocks.
+/// not one additional read of the genome.
 fn compute_loading_cross_products<S, P>(
     source: &mut S,
     scaler: &HweScaler,
@@ -6147,7 +6312,7 @@ fn compute_loading_cross_products<S, P>(
     ld_weights: Option<&[f64]>,
     progress: &Arc<P>,
     par: Par,
-) -> Result<(Mat<f64>, Mat<f64>, f64), HwePcaError>
+) -> Result<(Mat<f64>, Mat<f64>), HwePcaError>
 where
     S: VariantBlockSource + Send,
     S::Error: Error + Send + Sync + 'static,
@@ -6188,6 +6353,7 @@ where
             id: usize,
             filled: usize,
             start: usize,
+            standardized: bool,
         },
         End,
         Error(HwePcaError),
@@ -6204,6 +6370,8 @@ where
     let block_capacity = block_capacity;
     let block_len = block_len;
     let expected_variants = expected_variants;
+    let allele_frequencies = scaler.allele_frequencies();
+    let variant_scales = scaler.variant_scales();
 
     thread::scope(|scope| {
         let buffer_ptrs_prefetch = buffer_ptrs;
@@ -6225,8 +6393,22 @@ where
                 let buffer_slice = unsafe {
                     std::slice::from_raw_parts_mut(buffer_ptrs_prefetch[id].0, block_len)
                 };
-                let filled = match source.next_block_into(block_capacity, buffer_slice) {
-                    Ok(filled) => filled,
+                let (filled, standardized) = match source.next_standardized_block_into(
+                    block_capacity,
+                    buffer_slice,
+                    &allele_frequencies[start..],
+                    &variant_scales[start..],
+                    ld_weights.map(|weights| &weights[start..]),
+                ) {
+                    Ok(Some(filled)) => (filled, true),
+                    Ok(None) => match source.next_block_into(block_capacity, buffer_slice) {
+                        Ok(filled) => (filled, false),
+                        Err(err) => {
+                            let _ = filled_sender
+                                .send(PrefetchMessage::Error(HwePcaError::Source(Box::new(err))));
+                            break;
+                        }
+                    },
                     Err(err) => {
                         let _ = filled_sender
                             .send(PrefetchMessage::Error(HwePcaError::Source(Box::new(err))));
@@ -6245,7 +6427,12 @@ where
                 );
 
                 if filled_sender
-                    .send(PrefetchMessage::Data { id, filled, start })
+                    .send(PrefetchMessage::Data {
+                        id,
+                        filled,
+                        start,
+                        standardized,
+                    })
                     .is_err()
                 {
                     break;
@@ -6258,16 +6445,17 @@ where
         let mut processed = 0usize;
         let buffer_ptrs_compute = buffer_ptrs;
         let mut loadings = loadings;
-        // Accumulates ‖X‖²_F over the standardized (LD-weighted) blocks, which
-        // equals trace(X·Xᵀ) and hence (n−1)·total_variance.
-        let mut standardized_frobenius_sq = 0.0f64;
-        let mut frobenius_compensation = 0.0f64;
         // Accumulates BᵀB = (n−1)·Uᵀ·C·U, the covariance restricted to the
         // subspace the eigensolver returned.
         let mut restricted_gram = Mat::zeros(n_components, n_components);
         while let Ok(message) = filled_rx.recv() {
             match message {
-                PrefetchMessage::Data { id, filled, start } => {
+                PrefetchMessage::Data {
+                    id,
+                    filled,
+                    start,
+                    standardized,
+                } => {
                     if start != processed {
                         return Err(HwePcaError::InvalidInput(
                             "prefetch produced out-of-order variant ranges",
@@ -6292,36 +6480,14 @@ where
                         n_samples,
                         filled,
                     );
-                    scaler.standardize_block(block.as_mut(), start..start + filled, par);
-                    if let Some(weights) = ld_weights {
-                        apply_ld_weights(block.as_mut(), start..start + filled, weights);
+                    if !standardized {
+                        scaler.standardize_block(block.as_mut(), start..start + filled, par);
+                        if let Some(weights) = ld_weights {
+                            apply_ld_weights(block.as_mut(), start..start + filled, weights);
+                        }
                     }
 
                     let block_ref = block.as_ref();
-
-                    // Fold this block's squared Frobenius norm into the running
-                    // total variance before it is consumed by the loadings GEMM.
-                    //
-                    // Compensated, because this is the longest sum in the fit:
-                    // one term per genotype, so ~1e11 additions at 250k samples
-                    // by 500k variants, all non-negative and so all pushing the
-                    // running total in the same direction. It is also the
-                    // denominator of every explained-variance ratio, which is
-                    // the number a reader actually interprets, and it is
-                    // cheaper to compensate here than to explain a ratio that
-                    // drifts with cohort size.
-                    for column in block_ref.col_iter() {
-                        let contiguous = column
-                            .try_as_col_major()
-                            .expect("standardized block column must be contiguous");
-                        for &value in contiguous.as_slice() {
-                            let term = value * value;
-                            let y = term - frobenius_compensation;
-                            let t = standardized_frobenius_sq + y;
-                            frobenius_compensation = (t - standardized_frobenius_sq) - y;
-                            standardized_frobenius_sq = t;
-                        }
-                    }
 
                     let mut chunk = MatMut::from_column_major_slice_mut(
                         &mut chunk_storage[..filled * n_components],
@@ -6376,7 +6542,7 @@ where
 
         progress.on_stage_finish(FitProgressStage::Loadings);
 
-        Ok((loadings, restricted_gram, standardized_frobenius_sq))
+        Ok((loadings, restricted_gram))
     })
 }
 
@@ -6989,7 +7155,7 @@ mod tests {
             Arc::new(NoopFitProgress),
             FitProgressStage::AlleleStatistics,
         );
-        let (scaler, observed_variants) = compute_variant_statistics(
+        let (scaler, _, observed_variants) = compute_variant_statistics(
             &mut source,
             n_variants,
             Par::Seq,
@@ -7485,6 +7651,75 @@ mod tests {
     }
 
     #[test]
+    fn variant_statistics_reuse_standardized_column_norms() {
+        let n_samples = 7;
+        let n_variants = 4;
+        let mut data = vec![
+            0.0,
+            1.0,
+            2.0,
+            f64::NAN,
+            1.0,
+            0.0,
+            2.0,
+            2.0,
+            2.0,
+            2.0,
+            2.0,
+            2.0,
+            2.0,
+            2.0,
+            0.125,
+            0.5,
+            1.25,
+            1.875,
+            f64::NAN,
+            0.75,
+            1.5,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+        ];
+        let mut cache = VariantStatsCache::new(n_variants, n_variants);
+        let block = MatRef::from_column_major_slice(&data, n_samples, n_variants);
+        cache.ensure_statistics(block, 0..n_variants, Par::Seq);
+        cache.finalize();
+        let (scaler, standardized_sums_sq) = cache.into_parts().expect("finalized statistics");
+
+        let mut standardized =
+            MatMut::from_column_major_slice_mut(&mut data, n_samples, n_variants);
+        scaler.standardize_block(standardized.rb_mut(), 0..n_variants, Par::Seq);
+        let direct: Vec<f64> = standardized
+            .as_ref()
+            .col_iter()
+            .map(|column| column.iter().map(|value| value * value).sum())
+            .collect();
+
+        for (variant, (&reused, &expected)) in
+            standardized_sums_sq.iter().zip(direct.iter()).enumerate()
+        {
+            let tolerance = 1.0e-12 * expected.abs().max(1.0);
+            assert!(
+                (reused - expected).abs() <= tolerance,
+                "variant {variant}: reused {reused}, direct {expected}"
+            );
+        }
+
+        let weights = [0.5, 2.0, 1.25, 3.0];
+        let reused = weighted_standardized_frobenius_sq(&standardized_sums_sq, Some(&weights));
+        let expected: f64 = direct
+            .iter()
+            .zip(weights.iter())
+            .map(|(&sum_sq, &weight)| sum_sq * weight * weight)
+            .sum();
+        assert!((reused - expected).abs() <= 1.0e-12 * expected.abs().max(1.0));
+    }
+
+    #[test]
     fn ld_weights_are_applied_during_standardization() {
         use std::sync::Arc;
 
@@ -7655,7 +7890,7 @@ mod tests {
             Arc::new(NoopFitProgress),
             FitProgressStage::AlleleStatistics,
         );
-        let (scaler, observed) = compute_variant_statistics(
+        let (scaler, _, observed) = compute_variant_statistics(
             &mut stats_source,
             N_VARIANTS,
             Par::Seq,
@@ -7761,7 +7996,7 @@ mod tests {
             Arc::new(NoopFitProgress),
             FitProgressStage::AlleleStatistics,
         );
-        let (scaler, observed_variants) = compute_variant_statistics(
+        let (scaler, _, observed_variants) = compute_variant_statistics(
             &mut stats_source,
             BLOCK_CAPACITY,
             Par::Seq,
