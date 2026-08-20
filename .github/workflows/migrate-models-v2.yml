@@ -1,0 +1,73 @@
+name: Publish PCA Models v2
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  migrate-and-publish:
+    name: Remove training-only matrices and publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Repack models into the projection-only schema
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p source models
+          : > models/sha256sums.txt
+
+          for name in \
+            hwe_1kg_hgdp_gsa_v2 \
+            hwe_1kg_hgdp_gsa_v3 \
+            hwe_1kg_hgdp_gda_v1 \
+            hwe_1kg_hgdp_intersection
+          do
+            gh release download models-v1 \
+              --repo "$GITHUB_REPOSITORY" \
+              --pattern "$name.json.zst" \
+              --dir source
+
+            zstd -dc "source/$name.json.zst" \
+              | jq -c 'del(.sample_basis, .sample_scores)' \
+              | zstd -6 -T2 -o "models/$name.json.zst"
+
+            if zstd -dc "models/$name.json.zst" \
+              | jq -e 'has("sample_basis") or has("sample_scores")' >/dev/null
+            then
+              echo "training-only matrices remain in $name" >&2
+              exit 1
+            fi
+
+            sha256sum "models/$name.json.zst" >> models/sha256sums.txt
+            rm "source/$name.json.zst"
+          done
+
+          cat models/sha256sums.txt
+
+      - name: Publish immutable models-v2 release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create models-v2 \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "PCA Models v2" \
+            --notes "Projection-only HWE PCA models. Training sample matrices are stored only in fit score artifacts and are not part of this schema."
+          gh release upload models-v2 \
+            --repo "$GITHUB_REPOSITORY" \
+            models/*.json.zst \
+            models/sha256sums.txt
+
+      - name: Upload manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: models-v2-manifest
+          path: models/sha256sums.txt
+          if-no-files-found: error
