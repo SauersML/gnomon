@@ -200,10 +200,44 @@ fit records `converged`, the residual and the boundary gap instead of silently
 returning twenty equally confident-looking components.
 
 Note also that the per-pass cost barely moved between those two runs (~17.7 s
-against ~17.1 s) while the block width went from 12 to 30. The dominant cost per
-pass is decoding and standardizing genotypes, not the block GEMM — which is why
-oversampling is close to free, and why the remaining performance work is in the
-decode path rather than in the linear algebra.
+against ~17.1 s) while the block width went from 12 to 30. Oversampling is
+therefore close to free — but the reason is not that the GEMM is cheap.
+
+### The fit does not currently use a large machine
+
+Profiling the same fit (`perf`, symbolized, 651k samples of `cycles:u`) puts
+roughly **63% of all cycles in thread-barrier spin**, not arithmetic:
+
+| share | symbol |
+| --- | --- |
+| 59.5% | `spindle::barrier::Barrier::wait_and_clear_while` |
+| 12.1% | `gemm` microkernel, f64 |
+| 11.6% | `standardize_block_impl` (rayon) |
+| 8.6% | `gemm` packing, f64 |
+| 3.3% | other spindle barrier/worker paths |
+
+A thread sweep confirms it from the outside — the same fit, same data, only the
+core count changing:
+
+| cores | wall clock | CPU | against 4 cores |
+| ---: | ---: | ---: | --- |
+| 4 | 111.1 s | 228% | — |
+| 8 | 110.6 s | 397% | 0.4% faster |
+| 16 | 117.4 s | 771% | 5.6% **slower** |
+| 32 | 124.3 s | 1589% | 11.8% **slower** |
+
+Past about eight cores the fit anti-scales: CPU consumption doubles at every
+step and wall clock gets worse. The cause is the shape of the work, not the
+amount of it. Parallelism is applied *inside* each variant tile, and one of the
+two products per tile is `T = Xᵀ Q` — an output of roughly `tile × components`
+(2048 × 12) drawn from a reduction `n_samples` deep (250,000). There is almost
+no output to divide among threads, so they wait rather than work.
+
+This is worth stating plainly because it redirects the obvious optimizations:
+converting tiles to `f32`, or reaching the packed 2-bit kernel, would shrink the
+~32% of cycles that are real work while leaving the ~63% that is spin exactly
+where it is. The fix has to move parallelism up a level, to whole tiles with
+private accumulators, so that each worker gets a GEMM shape it can use.
 
 Two things in that table matter more than the ratio. The old solver pins one
 core no matter how many are available — one column per pass leaves nothing to
