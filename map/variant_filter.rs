@@ -1,4 +1,4 @@
-use crate::score::pipeline::PipelineError;
+use crate::pipeline_error::PipelineError;
 use crate::shared::files::open_text_source;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;

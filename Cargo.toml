@@ -1,4 +1,7 @@
 [workspace]
+members = [".", "python/native"]
+default-members = ["."]
+resolver = "3"
 
 [package]
 name = "gnomon"
@@ -13,10 +16,10 @@ build = "shared/build.rs"
 
 [lib]
 path = "shared/lib.rs"
-# `rlib` keeps the `[[bin]]` targets and any Rust consumers building against the
-# library; `cdylib` produces the loadable Python extension module built by
-# maturin/PyO3 when the `python` feature is enabled.
-crate-type = ["cdylib", "rlib"]
+# The core is an `rlib` for the CLI and Rust consumers. The Python extension is
+# a separate `cdylib` crate under `python/native`, so every CLI build does not
+# also link a Python shared object it will never load.
+crate-type = ["rlib"]
 
 [[bin]]
 name = "gnomon"
@@ -119,6 +122,9 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
+
+[profile.release.package.gnomon]
+codegen-units = 16
 
 [profile.dev]
 # Turn off debug info for regular 'cargo build/test'

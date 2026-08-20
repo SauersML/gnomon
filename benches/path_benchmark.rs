@@ -73,7 +73,11 @@ fn setup_benchmark_context(
     // --- Subset logic ---
     let num_people_to_score = ((total_num_people as f32) * subset_percentage).round() as usize;
 
-    let (person_subset, final_person_iids, output_idx_to_fam_idx) = if subset_percentage >= 1.0 {
+    let (person_subset, final_person_iids, output_idx_to_fam_idx): (
+        PersonSubset,
+        Vec<String>,
+        Vec<OriginalPersonIndex>,
+    ) = if subset_percentage >= 1.0 {
         (
             PersonSubset::All,
             (0..total_num_people)
@@ -84,7 +88,7 @@ fn setup_benchmark_context(
                 .collect(),
         )
     } else {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let fam_indices_to_keep: Vec<u32> =
             index::sample(&mut rng, total_num_people, num_people_to_score)
                 .into_vec()
@@ -188,7 +192,7 @@ fn generate_variant_data_hwe(num_people: usize, allele_frequency: f32) -> Vec<u8
     genotypes_to_assign.extend(std::iter::repeat(0b10).take(num_het));
     genotypes_to_assign.extend(std::iter::repeat(0b00).take(num_hom_ref));
 
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     genotypes_to_assign.shuffle(&mut rng);
 
     let bytes_per_variant = (num_people + 3) / 4;

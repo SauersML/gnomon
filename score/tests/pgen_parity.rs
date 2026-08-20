@@ -202,14 +202,21 @@ fn scoring_a_subset_reads_only_part_of_the_pgen() {
             self.inner.len() as u64
         }
 
-        fn read_at(&self, offset: u64, dst: &mut [u8]) -> Result<(), gnomon::pipeline::PipelineError> {
+        fn read_at(
+            &self,
+            offset: u64,
+            dst: &mut [u8],
+        ) -> Result<(), gnomon::pipeline_error::PipelineError> {
             let start = offset as usize;
             let end = start + dst.len();
             if end > self.inner.len() {
-                return Err(gnomon::pipeline::PipelineError::Io("read past end".into()));
+                return Err(gnomon::pipeline_error::PipelineError::Io(
+                    "read past end".into(),
+                ));
             }
             dst.copy_from_slice(&self.inner[start..end]);
-            self.bytes_read.fetch_add(dst.len() as u64, Ordering::Relaxed);
+            self.bytes_read
+                .fetch_add(dst.len() as u64, Ordering::Relaxed);
             Ok(())
         }
     }

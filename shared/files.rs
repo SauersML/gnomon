@@ -1,4 +1,4 @@
-use crate::score::pipeline::PipelineError;
+use crate::pipeline_error::PipelineError;
 use google_cloud_auth::credentials::{Credentials, anonymous::Builder as AnonymousCredentials};
 use google_cloud_storage::client::{Storage, StorageControl};
 use google_cloud_storage::model_ext::ReadRange;

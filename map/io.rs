@@ -16,7 +16,7 @@ use crate::adapt_plink2::{VirtualPlink19, open_virtual_plink19_from_paths};
 use crate::map::fit::{HwePcaModel, LdWeights, VariantBlockSource};
 use crate::map::project::ProjectionResult;
 use crate::map::variant_filter::{MatchKind, VariantFilter, VariantKey, VariantSelection};
-use crate::score::pipeline::PipelineError;
+use crate::pipeline_error::PipelineError;
 use crate::shared::files::{
     BedSource, ReadMetrics, TextSource, VariantCompression, VariantFormat, VariantSource,
     list_variant_paths, open_bed_source, open_text_source, open_variant_source,
@@ -39,6 +39,7 @@ use noodles_vcf::{
         info::field::value::Array as InfoArray,
     },
 };
+use rayon::prelude::*;
 use serde::Serialize;
 use thiserror::Error;
 
@@ -2503,6 +2504,58 @@ impl VariantBlockSource for PlinkVariantBlockSource {
             let slice = &selection[self.cursor..self.cursor + ncols];
             let table = decode_table();
             let nrows = self.n_samples;
+            let output_len = nrows.checked_mul(ncols).ok_or_else(|| {
+                PlinkIoError::InvalidHeader("PLINK decode output length overflow".into())
+            })?;
+            if storage.len() < output_len {
+                return Err(PlinkIoError::InvalidHeader(format!(
+                    "PLINK decode storage is too small: need {output_len} values, found {}",
+                    storage.len()
+                )));
+            }
+            if let Some(&invalid) = slice.iter().find(|&&index| index >= self.total_variants) {
+                return Err(PlinkIoError::InvalidHeader(format!(
+                    "variant index {invalid} exceeds dataset bounds ({})",
+                    self.total_variants
+                )));
+            }
+
+            // A local BED is already memory-mapped. Decode selected columns
+            // directly from that mapping, in parallel, instead of issuing one
+            // `pread` and one serial decode for every non-contiguous marker.
+            // Evenly spaced marker budgets are intentionally non-contiguous;
+            // at biobank scale the old path turned a single mmap traversal into
+            // tens of thousands of tiny reads before arithmetic could begin.
+            let total_bytes = self
+                .bytes_per_variant
+                .checked_mul(self.total_variants)
+                .ok_or_else(|| {
+                    PlinkIoError::InvalidHeader("PLINK BED payload length overflow".into())
+                })?;
+            if let Some(data) = self.bed.mmap_slice(PLINK_HEADER_LEN as usize, total_bytes) {
+                let bytes_per_variant = self.bytes_per_variant;
+                let kinds = self
+                    .match_kinds
+                    .as_ref()
+                    .map(|values| &values[self.cursor..self.cursor + ncols]);
+                if nrows > 0 {
+                    storage[..output_len]
+                        .par_chunks_mut(nrows)
+                        .enumerate()
+                        .for_each(|(logical, dest)| {
+                            let physical = slice[logical];
+                            let start = physical * bytes_per_variant;
+                            let bytes = &data[start..start + bytes_per_variant];
+                            decode_plink_variant(bytes, dest, nrows, table);
+                            if kinds.is_some_and(|values| values[logical] == MatchKind::Swap) {
+                                swap_plink_dosages(dest);
+                            }
+                        });
+                }
+                self.cursor += ncols;
+                return Ok(ncols);
+            }
+
             let mut emitted = 0usize;
 
             while emitted < ncols {
@@ -2567,11 +2620,7 @@ impl VariantBlockSource for PlinkVariantBlockSource {
                     if let Some(kinds) = kinds_slice
                         && kinds[emitted + local] == MatchKind::Swap
                     {
-                        for val in dest.iter_mut() {
-                            if !val.is_nan() {
-                                *val = 2.0 - *val;
-                            }
-                        }
+                        swap_plink_dosages(dest);
                     }
                 }
 
@@ -2622,13 +2671,23 @@ impl VariantBlockSource for PlinkVariantBlockSource {
 
             let table = decode_table();
             let nrows = self.n_samples;
-            for variant_idx in 0..ncols {
-                let start = variant_idx * self.bytes_per_variant;
-                let end = start + self.bytes_per_variant;
-                let bytes = &self.buffer[start..end];
-                let dest_offset = variant_idx * nrows;
-                let dest = &mut storage[dest_offset..dest_offset + nrows];
-                decode_plink_variant(bytes, dest, nrows, table);
+            let output_len = nrows.checked_mul(ncols).ok_or_else(|| {
+                PlinkIoError::InvalidHeader("PLINK decode output length overflow".into())
+            })?;
+            if storage.len() < output_len {
+                return Err(PlinkIoError::InvalidHeader(format!(
+                    "PLINK decode storage is too small: need {output_len} values, found {}",
+                    storage.len()
+                )));
+            }
+            if nrows > 0 {
+                let bytes_per_variant = self.bytes_per_variant;
+                self.buffer
+                    .par_chunks(bytes_per_variant)
+                    .zip(storage[..output_len].par_chunks_mut(nrows))
+                    .for_each(|(bytes, dest)| {
+                        decode_plink_variant(bytes, dest, nrows, table);
+                    });
             }
 
             self.cursor += ncols;
@@ -5180,6 +5239,15 @@ fn decode_plink_variant(bytes: &[u8], dest: &mut [f64], n_samples: usize, table:
     }
 }
 
+#[inline]
+fn swap_plink_dosages(dest: &mut [f64]) {
+    for value in dest {
+        if !value.is_nan() {
+            *value = 2.0 - *value;
+        }
+    }
+}
+
 fn decode_table() -> &'static [[f64; 4]; 256] {
     static TABLE: OnceLock<[[f64; 4]; 256]> = OnceLock::new();
     TABLE.get_or_init(|| {
@@ -5532,6 +5600,58 @@ mod tests {
         let mut data = Vec::new();
         source.read_to_end(&mut data).unwrap();
         data
+    }
+
+    fn pack_plink_codes(codes: &[u8]) -> Vec<u8> {
+        codes
+            .chunks(4)
+            .map(|chunk| {
+                chunk
+                    .iter()
+                    .enumerate()
+                    .fold(0u8, |byte, (offset, code)| byte | (code << (offset * 2)))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn local_plink_selection_decodes_noncontiguous_mmap_columns_and_swaps() {
+        let dir = tempdir().unwrap();
+        let bed_path = dir.path().join("selected.bed");
+        let physical_codes = [
+            [0, 2, 3, 1, 3, 2, 0, 3],
+            [2, 2, 2, 2, 2, 2, 2, 2],
+            [3, 0, 2, 3, 1, 0, 2, 3],
+            [0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 3, 2, 0, 1, 3, 2, 0],
+        ];
+        let mut bed = File::create(&bed_path).unwrap();
+        bed.write_all(&[0x6c, 0x1b, 0x01]).unwrap();
+        for codes in physical_codes {
+            bed.write_all(&pack_plink_codes(&codes)).unwrap();
+        }
+        bed.flush().unwrap();
+
+        let mut source = PlinkVariantBlockSource::new(
+            open_bed_source(&bed_path).unwrap(),
+            2,
+            8,
+            5,
+            Some(vec![0, 2, 4]),
+            Some(vec![MatchKind::Exact, MatchKind::Exact, MatchKind::Swap]),
+        );
+        let mut decoded = vec![0.0; 24];
+        assert_eq!(source.next_block_into(3, &mut decoded).unwrap(), 3);
+
+        assert_eq!(&decoded[..3], &[0.0, 1.0, 2.0]);
+        assert!(decoded[3].is_nan());
+        assert_eq!(&decoded[4..8], &[2.0, 1.0, 0.0, 2.0]);
+        assert_eq!(&decoded[8..12], &[2.0, 0.0, 1.0, 2.0]);
+        assert!(decoded[12].is_nan());
+        assert_eq!(&decoded[13..16], &[0.0, 1.0, 2.0]);
+        assert_eq!(&decoded[16..20], &[2.0, 0.0, 1.0, 2.0]);
+        assert!(decoded[20].is_nan());
+        assert_eq!(&decoded[21..24], &[0.0, 1.0, 2.0]);
     }
 
     #[test]

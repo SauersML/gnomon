@@ -47,7 +47,7 @@ use crate::files::{
 };
 /// Bring in your crate-local traits and error type.
 /// These are expected to already exist (per your provided infrastructure).
-use crate::score::pipeline::PipelineError;
+use crate::pipeline_error::PipelineError;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // Public entrypoints

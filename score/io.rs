@@ -10,8 +10,8 @@
 // shared buffer pool to minimize allocations and provides natural backpressure if
 // consumers cannot keep up.
 
+use crate::pipeline_error::PipelineError;
 use crate::score::decide::ComputePath;
-use crate::score::pipeline::PipelineError;
 use crate::score::types::{
     BimRowIndex, FilesetBoundary, PreparationResult, ReconciledVariantIndex, WorkItem,
 };

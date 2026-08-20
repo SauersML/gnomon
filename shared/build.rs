@@ -1617,6 +1617,33 @@ fn command_preview(program: &OsStr, args: &[OsString]) -> String {
     parts.join(" ")
 }
 
+struct RustSourceEntry(PathBuf);
+
+impl RustSourceEntry {
+    fn path(&self) -> &Path {
+        &self.0
+    }
+
+    fn file_name(&self) -> &OsStr {
+        self.0.file_name().unwrap_or_else(|| OsStr::new(""))
+    }
+}
+
+fn rust_source_entries(manifest_dir: &str) -> impl Iterator<Item = &'static RustSourceEntry> {
+    static SOURCES: OnceLock<Vec<RustSourceEntry>> = OnceLock::new();
+    SOURCES
+        .get_or_init(|| {
+            WalkDir::new(manifest_dir)
+                .into_iter()
+                .filter_entry(|entry| !is_in_ignored_directory(entry.path()))
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "rs"))
+                .map(|entry| RustSourceEntry(entry.into_path()))
+                .collect()
+        })
+        .iter()
+}
+
 fn scan_for_underscore_prefixes(manifest_dir: &str) -> Vec<String> {
     // Regex pattern to find underscore prefixed variable names.
     // This pattern needs to be more generalized to catch all underscore-prefixed variables,
@@ -1630,13 +1657,7 @@ fn scan_for_underscore_prefixes(manifest_dir: &str) -> Vec<String> {
 
             // Use `walkdir` to find all Rust files, replacing the `find` command.
             // This is more portable and robust.
-            for entry in WalkDir::new(&manifest_dir)
-                .into_iter()
-                .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok()) // Ignore any errors during directory traversal.
-                .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path())) // Exclude ignored directories.
-                .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
-            // Keep only .rs files.
-            {
+            for entry in rust_source_entries(manifest_dir) {
                 let path = entry.path();
 
                 // Check if we can read the file
@@ -1695,12 +1716,7 @@ fn scan_for_disallowed_let_patterns(manifest_dir: &str) -> Vec<String> {
         Ok(matcher) => {
             let mut searcher = Searcher::new();
 
-            for entry in WalkDir::new(manifest_dir)
-                .into_iter()
-                .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
-                .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path()))
-                .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
-            {
+            for entry in rust_source_entries(manifest_dir) {
                 let path = entry.path();
 
                 if std::fs::read_to_string(path).is_err() {
@@ -1740,12 +1756,7 @@ fn scan_for_tuple_wildcard_patterns(manifest_dir: &str) -> Vec<String> {
         Ok(matcher) => {
             let mut searcher = Searcher::new();
 
-            for entry in WalkDir::new(manifest_dir)
-                .into_iter()
-                .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
-                .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path()))
-                .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
-            {
+            for entry in rust_source_entries(manifest_dir) {
                 let path = entry.path();
 
                 if std::fs::read_to_string(path).is_err() {
@@ -1802,12 +1813,8 @@ fn scan_for_forbidden_comment_patterns(manifest_dir: &str) -> Vec<String> {
         Ok(forbidden_matcher) => {
             let mut searcher = Searcher::new();
 
-            for entry in WalkDir::new(manifest_dir)
-                .into_iter()
-                .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
-                .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path())) // Exclude ignored directories
-                .filter(|e: &walkdir::DirEntry| e.file_name() != "build.rs") // Exclude the build script itself
-                .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
+            for entry in
+                rust_source_entries(manifest_dir).filter(|entry| entry.file_name() != "build.rs")
             {
                 let path = entry.path();
 
@@ -1836,12 +1843,8 @@ fn scan_for_forbidden_comment_patterns(manifest_dir: &str) -> Vec<String> {
         Ok(stars_matcher) => {
             let mut searcher = Searcher::new();
 
-            for entry in WalkDir::new(manifest_dir)
-                .into_iter()
-                .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
-                .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path())) // Exclude ignored directories
-                .filter(|e: &walkdir::DirEntry| e.file_name() != "build.rs") // Exclude the build script itself
-                .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
+            for entry in
+                rust_source_entries(manifest_dir).filter(|entry| entry.file_name() != "build.rs")
             {
                 let path = entry.path();
 
@@ -1871,12 +1874,8 @@ fn scan_for_forbidden_comment_patterns(manifest_dir: &str) -> Vec<String> {
         Ok(all_caps_matcher) => {
             let mut searcher = Searcher::new();
 
-            for entry in WalkDir::new(manifest_dir)
-                .into_iter()
-                .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
-                .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path()))
-                .filter(|e: &walkdir::DirEntry| e.file_name() != "build.rs")
-                .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
+            for entry in
+                rust_source_entries(manifest_dir).filter(|entry| entry.file_name() != "build.rs")
             {
                 let path = entry.path();
 
@@ -1904,12 +1903,8 @@ fn scan_for_forbidden_comment_patterns(manifest_dir: &str) -> Vec<String> {
         Ok(dash_matcher) => {
             let mut searcher = Searcher::new();
 
-            for entry in WalkDir::new(manifest_dir)
-                .into_iter()
-                .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
-                .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path()))
-                .filter(|e: &walkdir::DirEntry| e.file_name() != "build.rs")
-                .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
+            for entry in
+                rust_source_entries(manifest_dir).filter(|entry| entry.file_name() != "build.rs")
             {
                 let path = entry.path();
 
@@ -1945,12 +1940,8 @@ fn scan_for_previous_code_references(manifest_dir: &str) -> Vec<String> {
         Ok(matcher) => {
             let mut searcher = Searcher::new();
 
-            for entry in WalkDir::new(manifest_dir)
-                .into_iter()
-                .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
-                .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path()))
-                .filter(|e: &walkdir::DirEntry| e.file_name() != "build.rs") // Exclude the build script itself
-                .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
+            for entry in
+                rust_source_entries(manifest_dir).filter(|entry| entry.file_name() != "build.rs")
             {
                 let path = entry.path();
 
@@ -1986,12 +1977,8 @@ fn scan_for_allow_dead_code(manifest_dir: &str) -> Vec<String> {
         Ok(matcher) => {
             let mut searcher = Searcher::new();
 
-            for entry in WalkDir::new(manifest_dir)
-                .into_iter()
-                .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
-                .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path())) // Exclude ignored directories
-                .filter(|e: &walkdir::DirEntry| e.file_name() != "build.rs") // Exclude the build script itself
-                .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
+            for entry in
+                rust_source_entries(manifest_dir).filter(|entry| entry.file_name() != "build.rs")
             {
                 let path = entry.path();
 
@@ -2039,12 +2026,8 @@ fn scan_for_ignored_tests(manifest_dir: &str) -> Vec<String> {
         Ok(matcher) => {
             let mut searcher = Searcher::new();
 
-            for entry in WalkDir::new(manifest_dir)
-                .into_iter()
-                .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
-                .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path())) // Exclude ignored directories
-                .filter(|e: &walkdir::DirEntry| e.file_name() != "build.rs") // Exclude the build script itself
-                .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
+            for entry in
+                rust_source_entries(manifest_dir).filter(|entry| entry.file_name() != "build.rs")
             {
                 let path = entry.path();
 
@@ -2091,16 +2074,12 @@ fn scan_for_drop_in_build_scripts(manifest_dir: &str) -> Vec<String> {
         Ok(matcher) => {
             let mut searcher = Searcher::new();
 
-            for entry in WalkDir::new(manifest_dir)
-                .into_iter()
-                .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
-                .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path()))
-                .filter(|e: &walkdir::DirEntry| {
-                    e.path()
-                        .file_name()
-                        .is_some_and(|name| name == OsStr::new("build.rs"))
-                })
-            {
+            for entry in rust_source_entries(manifest_dir).filter(|entry| {
+                entry
+                    .path()
+                    .file_name()
+                    .is_some_and(|name| name == OsStr::new("build.rs"))
+            }) {
                 let path = entry.path();
 
                 if std::fs::read_to_string(path).is_err() {
@@ -2140,12 +2119,7 @@ fn scan_for_drop_usage(manifest_dir: &str) -> Vec<String> {
         Ok(matcher) => {
             let mut searcher = Searcher::new();
 
-            for entry in WalkDir::new(manifest_dir)
-                .into_iter()
-                .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
-                .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path()))
-                .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
-            {
+            for entry in rust_source_entries(manifest_dir) {
                 let path = entry.path();
 
                 if std::fs::read_to_string(path).is_err() {
@@ -2177,12 +2151,7 @@ fn scan_for_drop_usage(manifest_dir: &str) -> Vec<String> {
 fn scan_for_empty_control_blocks(manifest_dir: &str) -> Vec<String> {
     let mut all_violations = Vec::new();
 
-    for entry in WalkDir::new(&manifest_dir)
-        .into_iter()
-        .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
-        .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path()))
-        .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
-    {
+    for entry in rust_source_entries(manifest_dir) {
         let path = entry.path();
         let source = match std::fs::read_to_string(path) {
             Ok(contents) => contents,
@@ -2209,12 +2178,7 @@ fn scan_for_debug_assert_usage(manifest_dir: &str) -> Vec<String> {
         Ok(matcher) => {
             let mut searcher = Searcher::new();
 
-            for entry in WalkDir::new(manifest_dir)
-                .into_iter()
-                .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
-                .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path()))
-                .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
-            {
+            for entry in rust_source_entries(manifest_dir) {
                 let path = entry.path();
 
                 if std::fs::read_to_string(path).is_err() {

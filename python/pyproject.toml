@@ -9,7 +9,7 @@ description = "Python bindings for SauersML/gnomon (high-performance polygenic s
 readme = "README.md"
 license = "AGPL-3.0-or-later"
 # The license file is the repo-root LICENSE, which maturin already includes via
-# the Cargo manifest (manifest-path = "../Cargo.toml"). Don't also declare a
+# the Cargo manifest (manifest-path = "native/Cargo.toml"). Don't also declare a
 # python/LICENSE here: the sdist would map both to the same path and abort
 # ("LICENSE was already added"). The SPDX `license` expression above is the
 # canonical license metadata for the wheel.
@@ -30,11 +30,8 @@ Homepage = "https://github.com/SauersML/gnomon"
 Issues = "https://github.com/SauersML/gnomon/issues"
 
 [tool.maturin]
-# The Rust crate lives at the repo root; build the `python` feature into the
-# `cdylib`, which produces the native in-process extension module imported as
-# `gnomon._gnomon`. `python-source = "."` puts the package initializer beside
-# that extension in the wheel.
-manifest-path = "../Cargo.toml"
+# The extension crate depends on the repo-root core with its `python` feature.
+# Keeping the `cdylib` here prevents ordinary CLI builds from linking it too.
+manifest-path = "native/Cargo.toml"
 module-name = "gnomon._gnomon"
 python-source = "."
-features = ["python"]

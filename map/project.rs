@@ -412,7 +412,7 @@ impl ProjectionCudaPacked {
         // Refuse to proceed if two distinct files share a CUDA SONAME in this
         // process (the AoU "double free or corruption" abort class). Shared with
         // the score backend.
-        crate::score::cuda_backend::detect_cuda_library_conflicts()?;
+        crate::cuda_utils::detect_cuda_library_conflicts()?;
         let ctx = select_projection_cuda_device()?;
         let stream = ctx
             .new_stream()
@@ -433,7 +433,7 @@ impl ProjectionCudaPacked {
             .map_err(|e| format!("NVRTC compile failed for projection kernel: {e:?}"))?;
         let module = match ctx.load_module(ptx) {
             Ok(module) => module,
-            Err(load_err) if crate::score::cuda_backend::should_retry_with_cubin(load_err) => {
+            Err(load_err) if crate::cuda_utils::should_retry_with_cubin(load_err) => {
                 let (cc_major, cc_minor) = ctx
                     .compute_capability()
                     .map_err(|e| format!("Failed to query device compute capability: {e:?}"))?;
@@ -441,7 +441,7 @@ impl ProjectionCudaPacked {
                     "> Projection CUDA module load rejected PTX ({:?}); retrying with CUBIN for sm_{}{}.",
                     load_err.0, cc_major, cc_minor
                 );
-                let cubin = crate::score::cuda_backend::compile_cubin_for_device(
+                let cubin = crate::cuda_utils::compile_cubin_for_device(
                     PROJECT_CUDA_UNPACK_KERNELS,
                     cc_major,
                     cc_minor,
@@ -752,7 +752,7 @@ impl Drop for ProjectionCudaRhs {
 
 impl ProjectionCudaRhs {
     fn new() -> Result<Self, String> {
-        crate::score::cuda_backend::detect_cuda_library_conflicts()?;
+        crate::cuda_utils::detect_cuda_library_conflicts()?;
         let ctx = select_projection_cuda_device()?;
         let stream = ctx
             .new_stream()
@@ -2749,7 +2749,7 @@ fn init_projection_cuda_packed_safely() -> Result<ProjectionCudaPacked, String> 
         Ok(result) => result,
         Err(payload) => Err(format!(
             "projection CUDA init panicked ({})",
-            crate::score::cuda_backend::panic_payload_to_string(payload)
+            crate::cuda_utils::panic_payload_to_string(payload)
         )),
     }
 }
@@ -2761,7 +2761,7 @@ fn init_projection_cuda_rhs_safely() -> Result<ProjectionCudaRhs, String> {
         Ok(result) => result,
         Err(payload) => Err(format!(
             "projection CUDA init panicked ({})",
-            crate::score::cuda_backend::panic_payload_to_string(payload)
+            crate::cuda_utils::panic_payload_to_string(payload)
         )),
     }
 }

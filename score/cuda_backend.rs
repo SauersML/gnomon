@@ -1,8 +1,13 @@
+use crate::cuda_utils::{
+    compile_cubin_for_device, cuda_library_mappings, detect_cuda_library_conflicts,
+    panic_payload_to_string, should_retry_with_cubin,
+};
+use crate::pipeline_error::PipelineError;
 use crate::score::checkpoint::ScoreCheckpointWriter;
 use crate::score::complex::{ComplexVariantResolver, resolve_complex_variants};
 use crate::score::decide::ComputePath;
 use crate::score::io;
-use crate::score::pipeline::{PipelineContext, PipelineError, make_bed_buffer_pool};
+use crate::score::pipeline::{PipelineContext, make_bed_buffer_pool};
 use crate::score::types::{
     BimRowIndex, FilesetBoundary, PipelineKind, PreparationResult, WorkItem,
 };
@@ -14,11 +19,10 @@ use cudarc::driver::{
     CudaContext, CudaEvent, CudaFunction, CudaSlice, CudaStream, CudaView, CudaViewMut, DevicePtr,
     DevicePtrMut, DriverError, LaunchConfig, PinnedHostSlice, PushKernelArg, sys as cuda_sys,
 };
-use cudarc::nvrtc::{Ptx, compile_ptx, result as nvrtc_result, sys as nvrtc_sys};
+use cudarc::nvrtc::{Ptx, compile_ptx};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use memmap2::{Mmap, MmapOptions};
 use std::env;
-use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{BufWriter, IsTerminal, Write};
 use std::num::NonZeroUsize;
@@ -651,113 +655,6 @@ pub fn try_run_cuda(
     }
 }
 
-/// Return the canonical CUDA library family name for a file basename,
-/// or `None` if the basename isn't a CUDA library we care about.
-///
-/// Families are matched on the basename's stem (everything before the
-/// first `.so`), so `libcublas.so.12.3.4.1` and `libcublas.so.12` both
-/// resolve to `libcublas`, while `libcublasLt.so.12` resolves to
-/// `libcublasLt` — a *separate* family despite the shared prefix.
-fn cuda_library_family(basename: &str) -> Option<&'static str> {
-    let stem = basename.split(".so").next()?;
-    match stem {
-        "libcuda" => Some("libcuda"),
-        "libcudart" => Some("libcudart"),
-        "libcublas" => Some("libcublas"),
-        "libcublasLt" => Some("libcublasLt"),
-        "libcusparse" => Some("libcusparse"),
-        "libcusolver" => Some("libcusolver"),
-        "libnvJitLink" => Some("libnvJitLink"),
-        "libnvrtc" => Some("libnvrtc"),
-        _ => None,
-    }
-}
-
-/// Walk `/proc/self/maps` and return CUDA libraries grouped by family.
-/// `BTreeMap`/`BTreeSet` give stable ordering in diagnostic output.
-/// Returns an empty map on non-Linux hosts (where `/proc/self/maps`
-/// doesn't exist) — callers treat that as "no conflicts to detect".
-fn cuda_library_mappings()
--> std::collections::BTreeMap<&'static str, std::collections::BTreeSet<String>> {
-    let mut by_family: std::collections::BTreeMap<
-        &'static str,
-        std::collections::BTreeSet<String>,
-    > = std::collections::BTreeMap::new();
-    let Ok(maps) = fs::read_to_string("/proc/self/maps") else {
-        return by_family;
-    };
-    for line in maps.lines() {
-        let Some(path) = line.split_whitespace().last() else {
-            continue;
-        };
-        if !path.starts_with('/') {
-            continue;
-        }
-        let name = Path::new(path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
-        if let Some(family) = cuda_library_family(name) {
-            by_family
-                .entry(family)
-                .or_default()
-                .insert(path.to_string());
-        }
-    }
-    by_family
-}
-
-/// Detect whether more than one distinct file is mapped into the
-/// process for the same CUDA SONAME family.
-///
-/// This is the canonical failure mode behind the AoU "double free or
-/// corruption (!prev)" abort. glibc's dlopen deduplicates by
-/// `(device, inode)`, not by SONAME. When pip's `nvidia-*-cu12`
-/// wheels and the system CUDA toolkit are both reachable to the
-/// loader, an absolute-path `dlopen` of the wheel and a bare-name
-/// `dlopen("libcublas.so")` that walks `ld.so.cache` can succeed
-/// independently and leave *two distinct files* with the same SONAME
-/// permanently mapped. cuBLAS state then splits across two cuBLAS
-/// implementations whose internal allocators, struct layouts, and
-/// static initializers disagree — and the next `cublasDestroy`
-/// frees a chunk one allocator never owned, tripping glibc's malloc
-/// consistency check.
-///
-/// On `Ok(())`, mappings are consistent. On `Err`, the string is a
-/// multi-line, actionable report naming every conflicting path.
-pub(crate) fn detect_cuda_library_conflicts() -> Result<(), String> {
-    let by_family = cuda_library_mappings();
-    let conflicts: Vec<(&'static str, Vec<String>)> = by_family
-        .into_iter()
-        .filter(|(_, paths)| paths.len() > 1)
-        .map(|(family, paths)| (family, paths.into_iter().collect()))
-        .collect();
-    if conflicts.is_empty() {
-        return Ok(());
-    }
-    let mut msg = String::from(
-        "CUDA library conflict: multiple distinct files share a SONAME and \
-         coexist in this process. glibc dlopen deduplicates by (device, \
-         inode) not by SONAME, so all of the following are simultaneously \
-         mapped. cuBLAS handle state would split across them and the next \
-         cublasDestroy_v2 would abort with 'double free or corruption \
-         (!prev)'.",
-    );
-    for (family, paths) in &conflicts {
-        msg.push_str(&format!("\n  {family}:"));
-        for path in paths {
-            msg.push_str(&format!("\n    {path}"));
-        }
-    }
-    msg.push_str(
-        "\nKeep exactly one CUDA toolkit reachable to the loader: either the \
-         system toolkit (usually /usr/local/cuda*) or the pip nvidia-*-cu12 \
-         wheels, not both. Skipping cuBLAS handle creation to avoid crashing \
-         later.",
-    );
-    Err(msg)
-}
-
 /// Print every CUDA library currently mapped into the process, for
 /// post-init diagnostics. Pairs with `detect_cuda_library_conflicts`
 /// — by the time we call this, any conflict has already been
@@ -805,16 +702,6 @@ fn init_cuda_runtime_safely(prep: &PreparationResult) -> Result<CudaRuntime, Str
             panic_payload_to_string(payload)
         )),
     }
-}
-
-pub(crate) fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
-    if let Some(msg) = payload.downcast_ref::<&str>() {
-        return (*msg).to_string();
-    }
-    if let Some(msg) = payload.downcast_ref::<String>() {
-        return msg.clone();
-    }
-    "unknown panic payload".to_string()
 }
 
 fn preflight_cuda_dynamic_libraries() -> Result<(), String> {
@@ -1346,68 +1233,6 @@ impl CudaRuntime {
             pinned_reconciled,
         })
     }
-}
-
-pub(crate) fn should_retry_with_cubin(load_err: DriverError) -> bool {
-    matches!(
-        load_err.0,
-        cudarc::driver::sys::CUresult::CUDA_ERROR_UNSUPPORTED_PTX_VERSION
-            | cudarc::driver::sys::CUresult::CUDA_ERROR_INVALID_PTX
-    )
-}
-
-pub(crate) fn compile_cubin_for_device(
-    kernel_src: &str,
-    cc_major: i32,
-    cc_minor: i32,
-) -> Result<Vec<u8>, String> {
-    let arch_flag = format!("--gpu-architecture=sm_{cc_major}{cc_minor}");
-
-    let src = CString::new(kernel_src)
-        .map_err(|_| "CUDA kernel source contained interior NUL".to_string())?;
-    let prog = nvrtc_result::create_program(src.as_c_str(), None)
-        .map_err(|e| format!("NVRTC create_program failed for CUBIN fallback: {e:?}"))?;
-
-    let compile_res = unsafe { nvrtc_result::compile_program(prog, &[arch_flag.as_str()]) };
-    if let Err(err) = compile_res {
-        let log = nvrtc_program_log(prog).unwrap_or_else(|| "<no NVRTC log available>".to_string());
-        let _ = unsafe { nvrtc_result::destroy_program(prog) };
-        return Err(format!(
-            "NVRTC CUBIN fallback compile failed ({err:?}) with {arch_flag}: {log}"
-        ));
-    }
-
-    let mut cubin_size: usize = 0;
-    let size_res = unsafe { nvrtc_sys::nvrtcGetCUBINSize(prog, &mut cubin_size as *mut _) };
-    if let Err(e) = size_res.result() {
-        let _ = unsafe { nvrtc_result::destroy_program(prog) };
-        return Err(format!("NVRTC CUBIN fallback get size failed: {e:?}"));
-    }
-
-    let mut cubin_raw: Vec<std::ffi::c_char> = vec![0; cubin_size];
-    let cubin_res = unsafe { nvrtc_sys::nvrtcGetCUBIN(prog, cubin_raw.as_mut_ptr()) };
-    if let Err(e) = cubin_res.result() {
-        let _ = unsafe { nvrtc_result::destroy_program(prog) };
-        return Err(format!("NVRTC CUBIN fallback get data failed: {e:?}"));
-    }
-
-    let destroy_res = unsafe { nvrtc_result::destroy_program(prog) };
-    if let Err(e) = destroy_res {
-        return Err(format!(
-            "NVRTC CUBIN fallback destroy_program failed: {e:?}"
-        ));
-    }
-
-    Ok(cubin_raw.into_iter().map(|b| b as u8).collect())
-}
-
-fn nvrtc_program_log(prog: nvrtc_sys::nvrtcProgram) -> Option<String> {
-    let raw = unsafe { nvrtc_result::get_program_log(prog) }.ok()?;
-    let mut bytes: Vec<u8> = raw.into_iter().map(|b| b as u8).collect();
-    if let Some(pos) = bytes.iter().position(|&b| b == 0) {
-        bytes.truncate(pos);
-    }
-    Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 fn run_single_file_cuda(

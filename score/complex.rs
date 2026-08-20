@@ -1,5 +1,6 @@
+use crate::pipeline_error::PipelineError;
 use crate::score::io::BedSource;
-use crate::score::pipeline::{PipelineError, ScopeGuard};
+use crate::score::pipeline::ScopeGuard;
 use crate::score::types::{BimRowIndex, FilesetBoundary, PreparationResult, ScoreInfo};
 use ahash::{AHashMap, AHashSet};
 use indicatif::{ProgressBar, ProgressStyle};

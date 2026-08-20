@@ -1,3 +1,4 @@
+use crate::pipeline_error::PipelineError;
 use crate::score::batch;
 use crate::score::checkpoint::ScoreCheckpoint;
 use crate::score::complex::{ComplexVariantResolver, resolve_complex_variants};
@@ -15,7 +16,6 @@ use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use memmap2::{Mmap, MmapOptions};
 use num_cpus;
 use rayon::prelude::*;
-use std::error::Error;
 use std::fs::{self, File};
 use std::io::{BufWriter, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -155,26 +155,6 @@ impl<T: Send> Iterator for ChannelBatcher<T> {
     }
 }
 
-/// A specialized error type for the pipeline, allowing for robust, clonable error
-/// propagation from any concurrent stage.
-#[derive(Debug, Clone)]
-pub enum PipelineError {
-    Compute(String),
-    Io(String),
-    Producer(String),
-}
-
-impl std::fmt::Display for PipelineError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PipelineError::Compute(e) => write!(f, "{e}"),
-            PipelineError::Io(e) => write!(f, "I/O error during pipeline execution: {e}"),
-            PipelineError::Producer(e) => write!(f, "The data producer thread failed: {e}"),
-        }
-    }
-}
-impl Error for PipelineError {}
-
 #[derive(Debug, Clone, Copy)]
 pub struct MemoryBudget {
     max_ram_bytes: usize,
@@ -208,13 +188,6 @@ fn default_max_ram_bytes() -> usize {
         FALLBACK_MAX_RAM_BYTES as u64
     };
     usize::try_from(candidate).unwrap_or(usize::MAX).max(1)
-}
-
-// Enables easy conversion from batch errors into a pipeline error.
-impl From<Box<dyn Error + Send + Sync>> for PipelineError {
-    fn from(e: Box<dyn Error + Send + Sync>) -> Self {
-        PipelineError::Compute(e.to_string())
-    }
 }
 
 pub fn preflight_memory(

@@ -175,12 +175,11 @@ fn model(py: Python<'_>, model: String) -> PyResult<String> {
         .map_err(|err| PyRuntimeError::new_err(format!("gnomon model-keys failed: {err}")))
 }
 
-/// The native `gnomon` extension module. Registered under the name `_gnomon`
-/// (see `python/pyproject.toml` `module-name`) and re-exported by the Python
-/// package's `__init__.py`.
-#[pymodule]
-#[pyo3(name = "_gnomon")]
-fn gnomon_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
+/// Register the native functions in the `_gnomon` extension module.
+///
+/// The `python/native` crate owns the `cdylib` entry point and calls this
+/// function, keeping the adapters here beside the core APIs they invoke.
+pub fn register_python_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("__doc__", "Native in-process gnomon core (PyO3).")?;
     module.add_function(wrap_pyfunction!(score, module)?)?;
     module.add_function(wrap_pyfunction!(project, module)?)?;

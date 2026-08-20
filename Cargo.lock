@@ -4054,6 +4054,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "gnomon-python"
+version = "0.1.2"
+dependencies = [
+ "gnomon",
+ "pyo3",
+]
+
+[[package]]
 name = "google-cloud-auth"
 version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

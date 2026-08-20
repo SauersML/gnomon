@@ -210,55 +210,43 @@ Note also that the per-pass cost barely moved between those two runs (~17.7 s
 against ~17.1 s) while the block width went from 12 to 30. Oversampling is
 therefore close to free — but the reason is not that the GEMM is cheap.
 
-### The fit does not currently use a large machine
+### Current PLINK2 comparison
 
-Profiling the same fit (`perf`, symbolized, 651k samples of `cycles:u`) puts
-roughly **63% of all cycles in thread-barrier spin**, not arithmetic:
+The local PLINK reader maps the `.bed` payload once and decodes selected variant
+columns in parallel. It does not turn an evenly spaced `--markers` selection
+into thousands of tiny `pread` calls. A 512-variant streaming tile is the
+measured throughput/memory knee for this workload; the adaptive memory plan can
+still reduce it for larger cohorts.
 
-| share | symbol |
-| --- | --- |
-| 59.5% | `spindle::barrier::Barrier::wait_and_clear_while` |
-| 12.1% | `gemm` microkernel, f64 |
-| 11.6% | `standardize_block_impl` (rayon) |
-| 8.6% | `gemm` packing, f64 |
-| 3.3% | other spindle barrier/worker paths |
+The following runs used the same five-population PLINK1 microarray cohort, the
+same physical marker lists, four pinned AMD EPYC Milan cores, warm page cache,
+and four requested PCs. PLINK2 was v2.0.0-a.7.1LM and ran `--pca approx
+allele-wts 4 --threads 4`; gnomon ran `fit --components 4 --markers N`.
 
-A thread sweep confirms it from the outside — the same fit, same data, only the
-core count changing:
+| samples × markers | gnomon wall | PLINK2 wall | gnomon peak RSS | PLINK2 peak RSS |
+| --- | ---: | ---: | ---: | ---: |
+| 250,000 × 2,000 | **8.01 s** | 10.91 s | **2.53 GB** | 6.12 GB |
+| 250,000 × 5,000 | **17.56 s** | 23.44 s | **2.90 GB** | 6.12 GB |
 
-| cores | wall clock | CPU | against the best |
-| ---: | ---: | ---: | --- |
-| 2 | 120.1 s | 152% | 11.2% slower |
-| 4 | **107.9 s** | 233% | best |
-| 8 | 109.8 s | 400% | 1.7% slower |
-| 16 | 115.2 s | 768% | 6.7% **slower** |
-| 32 | 126.0 s | 1568% | 16.7% **slower** |
+That is a 26.6% wall-clock lead at 2,000 markers and 25.1% at 5,000, while using
+59% and 53% less peak memory respectively. The comparison is shape-matched:
+PLINK2's `--extract` list contains exactly the variants selected by gnomon's
+deterministic stride, rather than giving either program an easier matrix.
 
-(Measured on an otherwise idle machine with each run pinned to its own core
-range. An earlier version of this table was taken while a long baseline run held
-cores on the same socket; the numbers moved by only a few percent, but the
-uncontrolled ones should not be quoted.)
+Performance was not accepted as a substitute for the answer. Across the four
+structured axes, the canonical correlations between gnomon and PLINK2 scores
+were 1.000000; gnomon's leading-axis between-population variance shares were
+0.946, 0.945, 0.944, and 0.941 in the 2,000-marker run. The 5,000-marker run
+recovered all four expected axes with shares 0.977, 0.976, 0.976, and 0.975.
+Changing the tile width from 2,048 to 1,024 to 512 produced bit-identical score
+artifacts, and the optimized 2,000-marker result was bit-identical to the
+pre-optimization result.
 
-Going from two cores to four does buy something real — 1.11x for twice the
-hardware, about 55% efficiency — and then it stops. Past four cores the fit
-anti-scales: CPU consumption doubles at every step and wall clock gets worse. The cause is the shape of the work, not the
-amount of it. Parallelism is applied *inside* each variant tile, and one of the
-two products per tile is `T = Xᵀ Q` — an output of roughly `tile × components`
-(2048 × 12) drawn from a reduction `n_samples` deep (250,000). There is almost
-no output to divide among threads, so they wait rather than work.
-
-This is worth stating plainly because it redirects the obvious optimizations:
-converting tiles to `f32`, or reaching the packed 2-bit kernel, would shrink the
-~32% of cycles that are real work while leaving the ~63% that is spin exactly
-where it is. The fix has to move parallelism up a level, to whole tiles with
-private accumulators, so that each worker gets a GEMM shape it can use.
-
-Two things in that table matter more than the ratio. The old solver pins one
-core no matter how many are available — one column per pass leaves nothing to
-parallelize — while a block is a GEMM, which is why the same work spreads across
-twenty. And the memory is the honest cost of the trade: most of the difference
-is the two `n × tile_width` f64 decode tiles, 8.2 GB at this sample count, plus
-the retained Krylov basis.
+Four cores are deliberate for this matrix shape. The covariance products have
+few output columns and a 250,000-row reduction, so adding threads eventually
+increases barrier and packing overhead rather than reducing elapsed time. Scale
+through independent fits or chromosome-level preparation before assigning a
+large core count to one small-component solve.
 
 "Structure recovered" is the check that the numbers mean anything. Five
 populations span a four-dimensional space of means, so exactly four components
@@ -268,10 +256,10 @@ statements about the operator the solver was handed, not about whether the
 answer is the right one, so the fit is also checked against the structure the
 cohort was built with (`bench_fit_solver.py verify`).
 
-A caveat worth stating: at this size the genotypes sit in page cache, so the
-comparison is dominated by decode and arithmetic rather than by disk. Block
-Krylov's advantage grows when reads actually reach storage, because that is the
-cost that scales with pass count.
+A caveat worth stating: these genotypes sat in page cache, so the comparison is
+dominated by decode and arithmetic rather than storage latency. Cold object
+storage and PGEN/VCF inputs need their own measurements; this table makes no
+claim about them.
 
 ### The starting vector is not the all-ones vector
 

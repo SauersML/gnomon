@@ -19,8 +19,13 @@ extern crate self as gnomon;
 #[cfg(any(feature = "score", feature = "map", feature = "terms"))]
 pub mod parallel;
 
+pub mod pipeline_error;
+
 #[cfg(any(feature = "score", feature = "map", feature = "terms"))]
 pub mod files;
+
+#[cfg(any(feature = "score", feature = "map"))]
+pub(crate) mod cuda_utils;
 
 pub mod shared {
     #[cfg(any(feature = "score", feature = "map", feature = "terms"))]
@@ -30,20 +35,20 @@ pub mod shared {
 #[cfg(any(feature = "score", feature = "map", feature = "terms"))]
 pub mod adapt_plink2;
 
-#[cfg(any(feature = "score", feature = "map", feature = "terms"))]
+#[cfg(feature = "score")]
 #[path = "../score/mod.rs"]
 pub mod score;
 
-#[cfg(any(feature = "score", feature = "map", feature = "terms"))]
+#[cfg(feature = "terms")]
 #[path = "../terms/mod.rs"]
 pub mod terms;
 
-#[cfg(any(feature = "score", feature = "map", feature = "terms"))]
+#[cfg(feature = "score")]
 pub mod batch {
     pub use crate::score::batch::*;
 }
 
-#[cfg(any(feature = "score", feature = "map", feature = "terms"))]
+#[cfg(feature = "score")]
 pub use score::{complex, decide, download, io, kernel, pipeline, prepare, reformat, types};
 
 #[cfg(any(feature = "score", feature = "map", feature = "terms"))]

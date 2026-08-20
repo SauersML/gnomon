@@ -55,7 +55,9 @@ const PACKED_RHS_CHUNK_COLS: usize = 32;
 /// [`StandardizedCovarianceOp::apply`].
 const PACKED_RHS_MAX_COLS: usize = 8;
 pub const EIGENVALUE_EPSILON: f64 = 1.0e-9;
-pub const DEFAULT_BLOCK_WIDTH: usize = 2_048;
+/// Largest streamed variant tile. On 250k-sample PLINK microarray data, 512
+/// matched 1,024's throughput while cutting the decode-buffer working set.
+pub const DEFAULT_BLOCK_WIDTH: usize = 512;
 const DENSE_EIGEN_FALLBACK_THRESHOLD: usize = 64;
 const MAX_PARTIAL_COMPONENTS: usize = 512;
 /// Pool assumed when the machine refuses to report its own memory.
