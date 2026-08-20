@@ -305,20 +305,18 @@ const SPARSE_MISSING_WOODBURY_MAX: usize = 1;
 /// `tr(VᵀV) = k`.
 const MIN_RETAINED_INFORMATION_FRACTION: f64 = 1.0e-5;
 
-/// Largest deviation from `I` that the global information matrix may show and
-/// still be treated as exactly `I`. See `information_matrix_is_identity`.
+/// Multiple of the accumulation's own rounding error that the identity test
+/// allows for, so a corpus large enough to drift by summation alone is still
+/// recognised as orthonormal.
 ///
-/// This is the relative distortion accepted by *not* solving, and it is five
-/// orders of magnitude below the `1e-5` shrinkage it replaces. It has to sit
-/// well above the rounding a genuinely orthonormal `V` carries, which comes from
-/// the whole fit — the eigenrotation and the `Σ⁻¹` scaling, not just this
-/// accumulation — and so grows with the conditioning of the eigenproblem rather
-/// than with the variant count alone.
-const PROJECTION_IDENTITY_TOLERANCE: f64 = 1.0e-10;
-
-/// Multiple of the accumulation's own rounding error which the identity test
-/// also allows for, so that a corpus large enough to lose more than
-/// [`PROJECTION_IDENTITY_TOLERANCE`] to summation error is still recognised.
+/// This is deliberately the *only* term in that tolerance. A fixed relative
+/// floor was tried alongside it — the reasoning being that skipping the solve
+/// distorts a score far less than the 1e-5 ridge it replaced — but a tolerance
+/// wide enough to be worth having is also wide enough for two encodings of the
+/// same missing data to land on opposite sides of it, one skipping the solve
+/// and one not. Whether a sample is solved cannot depend on how its gaps were
+/// spelled, so the test scales with the rounding actually incurred and nothing
+/// else.
 const PROJECTION_IDENTITY_ROUNDING_UNITS: f64 = 8.0;
 const PROJECT_CUDA_UNPACK_KERNELS: &str = r#"
 extern "C" __global__ void unpack_weighted_plink(
@@ -1658,11 +1656,6 @@ struct RidgePolicy {
     /// an absolute constant, so it means the same thing whatever the loadings
     /// are scaled like.
     ridge: f64,
-    /// A Cholesky pivot at or below this marks such a direction. Deliberately
-    /// half the ridge: `A + δI ⪰ δI` forces every pivot of the retry to be at
-    /// least `δ`, so the retry clears this floor by construction instead of
-    /// landing on it and failing again.
-    pivot_floor: f64,
     /// Mean eigenvalue of the global system — the scale the applied ridge is
     /// reported against.
     mean_eigenvalue: f64,
@@ -1678,7 +1671,6 @@ impl RidgePolicy {
         let ridge = mean_eigenvalue * MIN_RETAINED_INFORMATION_FRACTION;
         Self {
             ridge,
-            pivot_floor: 0.5 * ridge,
             mean_eigenvalue,
         }
     }
@@ -1799,6 +1791,16 @@ fn information_matrix_is_identity(
     if components == 0 {
         return false;
     }
+    // Scaled to what this accumulation could have lost to summation, and
+    // nothing wider.
+    //
+    // An absolute floor was tried here and withdrawn: admitting a fixed
+    // relative distortion (1e-10) let two encodings of the *same* missing data
+    // fall on opposite sides of the test — one skipping the solve as close
+    // enough to the identity, the other solving — so results depended on how a
+    // caller happened to express a gap rather than on the data. A tolerance
+    // that decides whether to solve at all has to be tighter than the
+    // difference between two paths that must agree.
     let tolerance = (accumulated_variants.max(1) as f64)
         * f64::EPSILON
         * PROJECTION_IDENTITY_ROUNDING_UNITS;
@@ -1816,52 +1818,62 @@ fn information_matrix_is_identity(
     true
 }
 
-/// Cholesky-factorize `info` in place, adding the smallest ridge from a fixed
-/// escalating ladder that lets the factorization complete. Returns the ridge
-/// actually applied (`0.0` when the raw system factored, which is the case this
-/// is written for), or `None` when even the top rung fails.
+/// Cholesky-factorize `info` in place, retrying once with the policy's ridge if
+/// any direction of the system falls below its pivot floor. Returns the ridge
+/// actually applied — `0.0` when the raw system was well determined, which is
+/// the case this is written for — or `None` when even the ridged retry fails.
 ///
-/// `restore` must rewrite `info` with the unridged system; the factorization is
-/// destructive, so each retry needs the matrix back. Rebuilding it is cheaper
-/// than keeping a spare copy for the overwhelmingly common case where the first
-/// attempt succeeds and no retry ever happens.
+/// The trigger is a factorization that fails outright, a deliberately narrow
+/// condition: Cholesky completes on systems with condition numbers around
+/// `1e15`, so this fires only where the arithmetic genuinely cannot call the
+/// matrix positive definite. A sample that factors but remains badly determined
+/// is not propped up — it is reported through [`SampleConditioning`], leaving
+/// the judgement with the caller instead of hiding it behind a constant.
 ///
-/// Failing to factor is the right trigger, and it is a narrow one: Cholesky
-/// completes on matrices with condition numbers around `1e15`, so this fires
-/// only when the arithmetic genuinely cannot represent the system as positive
-/// definite. Systems that factor but are still badly determined are not
-/// silently propped up — they are reported through `SampleConditioning`, which
-/// leaves the decision with the caller instead of hiding it behind a constant.
-fn factorize_with_escalating_ridge<F>(
+/// A pivot-magnitude trigger was tried here and withdrawn. Catching a direction
+/// that carries almost no information, even though the matrix still factors, is
+/// the better idea in principle. But any threshold on a pivot is a
+/// discontinuity, and two encodings of the same missing data — a gapped source
+/// and explicit NaNs — differ by rounding, so a pivot near the threshold lands
+/// above it on one path and below it on the other. One sample was ridged and
+/// its twin was not, and the scores diverged by the ridge scale. Whether a
+/// sample is ridged cannot depend on how its gaps were spelled; outright
+/// failure is the one trigger both paths always agree on.
+///
+/// `restore` must rewrite `info` with the unridged system, since factorization
+/// is destructive and the retry needs the matrix back. Rebuilding costs nothing
+/// in the overwhelmingly common case, where the first attempt succeeds and
+/// `restore` is never called.
+///
+/// A system that factors but remains badly determined is not propped up at all;
+/// it is reported through [`SampleConditioning`], which leaves the judgement
+/// with the caller instead of burying it in a constant.
+fn factorize_with_directional_ridge<F>(
     info: &mut [f64],
     components: usize,
-    mean_eigenvalue: f64,
+    policy: RidgePolicy,
     mut restore: F,
 ) -> Option<f64>
 where
     F: FnMut(&mut [f64]),
 {
-    let mut ridge = 0.0f64;
-    let mut attempts = 0usize;
-    loop {
-        if factorize_spd_lower_in_place(info, components) {
-            return Some(ridge);
-        }
-        // A non-finite or non-positive mean eigenvalue leaves no scale to build
-        // a relative ridge from, so there is nothing honest left to try.
-        if attempts >= PROJECTION_RIDGE_MAX_ATTEMPTS || !(mean_eigenvalue > 0.0) {
-            return None;
-        }
-        ridge = if ridge == 0.0 {
-            mean_eigenvalue * PROJECTION_RIDGE_RELATIVE_FLOOR
-        } else {
-            ridge * PROJECTION_RIDGE_ESCALATION
-        };
-        attempts += 1;
-        restore(info);
-        for k in 0..components {
-            info[k * components + k] += ridge;
-        }
+    if factorize_spd_lower_in_place(info, components) {
+        return Some(0.0);
+    }
+
+    // No scale to build a ridge from means there is nothing honest left to try.
+    if !(policy.ridge > 0.0) {
+        return None;
+    }
+
+    restore(info);
+    for k in 0..components {
+        info[k * components + k] += policy.ridge;
+    }
+    if factorize_spd_lower_in_place(info, components) {
+        Some(policy.ridge)
+    } else {
+        None
     }
 }
 
@@ -1970,6 +1982,7 @@ fn solve_sample_information_system<F>(
     column: &mut [f64],
     components: usize,
     trace: f64,
+    policy: RidgePolicy,
     want_conditioning: bool,
     mut restore: F,
 ) -> Option<SampleConditioning>
@@ -1988,8 +2001,12 @@ where
         0.0
     };
 
-    let ridge =
-        factorize_with_escalating_ridge(info, components, mean_eigenvalue, &mut restore)?;
+    // The policy comes from the caller, computed once from the model's global
+    // system. Rebuilding it per sample from that sample's own trace would make
+    // the ridge decision depend on which markers happened to be missing, which
+    // is exactly the per-sample rounding dependence the shared policy exists to
+    // rule out.
+    let ridge = factorize_with_directional_ridge(info, components, policy, &mut restore)?;
     if !solve_cholesky_factor_in_place(info, rhs, components) {
         return None;
     }
@@ -2272,6 +2289,7 @@ fn solve_projection_with_dense_missing_info(
                         inverse_column,
                         components,
                         trace,
+                        solve_base.policy,
                         want_conditioning,
                         |restored| {
                             fill_sample_info_matrix(
@@ -2457,6 +2475,7 @@ fn solve_projection_with_sparse_missing_variants(
                         inverse_column,
                         components,
                         trace,
+                        solve_base.policy,
                         want_conditioning,
                         |restored| fill_sample_info(restored, missing),
                     );
