@@ -70,6 +70,20 @@ you have not pushed.
 ./target/release/gnomon fit path/to/genotypes --components 10 --maf 0.01
 ```
 
+For array-scale biobank data, sample and marker missingness can be screened in
+the fit itself without writing an intermediate PLINK fileset:
+
+```
+./target/release/gnomon fit path/to/aou-array.bed --components 20 \
+  --mind 0.05 --geno 0.05 --maf 0.01 --threads 16
+```
+
+The QC order matches PLINK: `--list`/`--markers`, then `--keep`, `--mind`,
+`--geno`, and `--maf`. Thresholds are inclusive, so a sample or variant exactly
+at its requested maximum missingness is retained. PCA frequencies, LD weights,
+loadings, scores, and sample manifests are all computed from the final retained
+sample set.
+
 ```
 # Infer sample sex
 ./target/release/gnomon terms --sex path/to/genotypes

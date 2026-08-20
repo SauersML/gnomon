@@ -20,9 +20,11 @@ Usage:
   bench_fit_solver.py generate --out DIR [--samples N] [--variants M]
                                [--missing-rate RATE]
                                [--high-missing-variants N --high-missing-rate RATE]
+                               [--high-missing-samples N --high-sample-missing-rate RATE]
   bench_fit_solver.py inject-missing --data SOURCE --out DEST
                                [--missing-rate RATE]
                                [--high-missing-variants N --high-missing-rate RATE]
+                               [--high-missing-samples N --high-sample-missing-rate RATE]
   bench_fit_solver.py run --binary PATH --data DIR/prefix [--components K]
   bench_fit_solver.py compare-plink --data DIR/prefix --eigenvec PATH
                                [--components K]
@@ -57,9 +59,11 @@ PLINK_BYTE_HAS_MISSING = np.array([
 ], dtype=np.bool_)
 
 
-def validate_missing_profile(variants: int, missing_rate: float,
+def validate_missing_profile(samples: int, variants: int, missing_rate: float,
                              high_missing_variants: int,
-                             high_missing_rate: float | None) -> None:
+                             high_missing_rate: float | None,
+                             high_missing_samples: int,
+                             high_sample_missing_rate: float | None) -> None:
     if not 0.0 <= missing_rate < 1.0:
         raise ValueError("missing_rate must be in [0, 1)")
     if not 0 <= high_missing_variants <= variants:
@@ -71,6 +75,17 @@ def validate_missing_profile(variants: int, missing_rate: float,
             raise ValueError("high_missing_variants requires high_missing_rate")
         if not missing_rate < high_missing_rate < 1.0:
             raise ValueError("high_missing_rate must exceed missing_rate and be below 1")
+    if not 0 <= high_missing_samples <= samples:
+        raise ValueError("high_missing_samples must be between 0 and samples")
+    if high_missing_samples == 0 and high_sample_missing_rate is not None:
+        raise ValueError("high_sample_missing_rate requires high_missing_samples")
+    if high_missing_samples > 0:
+        if high_sample_missing_rate is None:
+            raise ValueError("high_missing_samples requires high_sample_missing_rate")
+        if not missing_rate < high_sample_missing_rate < 1.0:
+            raise ValueError(
+                "high_sample_missing_rate must exceed missing_rate and be below 1"
+            )
 
 
 def high_missing_ranks(variants: int, count: int) -> np.ndarray:
@@ -81,13 +96,61 @@ def high_missing_ranks(variants: int, count: int) -> np.ndarray:
     return ranks
 
 
+def sample_missing_groups(samples: int, high_missing_samples: int):
+    ranks = high_missing_ranks(samples, high_missing_samples)
+    high = np.flatnonzero(ranks >= 0)
+    ordinary = np.flatnonzero(ranks < 0)
+    return ordinary, high
+
+
+def rotated_group_rows(group: np.ndarray, rate: float, variant: int,
+                       salt: int) -> np.ndarray:
+    count = round(group.size * rate)
+    if count == 0:
+        return np.empty(0, dtype=np.int64)
+    positions = (
+        (np.arange(count, dtype=np.int64) * group.size) // count
+        + variant * 37
+        + salt * 17
+    ) % group.size
+    return group[positions]
+
+
+def missing_rows_for_variant(ordinary_samples: np.ndarray,
+                             high_missing_samples: np.ndarray,
+                             variant: int, high_variant_rank: int,
+                             baseline_rate: float,
+                             high_variant_rate: float | None,
+                             high_sample_rate: float | None) -> np.ndarray:
+    marker_rate = baseline_rate
+    if high_variant_rank >= 0:
+        if high_variant_rate is None:
+            raise AssertionError("validated high missing rate disappeared")
+        marker_rate = high_variant_rate
+    ordinary = rotated_group_rows(
+        ordinary_samples, marker_rate, variant, max(high_variant_rank, 0)
+    )
+    sample_rate = marker_rate
+    if high_variant_rank < 0 and high_missing_samples.size > 0:
+        if high_sample_rate is None:
+            raise AssertionError("validated high sample missing rate disappeared")
+        sample_rate = high_sample_rate
+    high = rotated_group_rows(
+        high_missing_samples, sample_rate, variant, max(high_variant_rank, 0) + 1
+    )
+    return np.concatenate((ordinary, high))
+
+
 def write_plink(prefix: Path, samples: int, variants: int, populations: int,
                 fst: float, seed: int, missing_rate: float,
                 high_missing_variants: int,
-                high_missing_rate: float | None) -> None:
+                high_missing_rate: float | None,
+                high_missing_samples: int,
+                high_sample_missing_rate: float | None) -> None:
     """Write a .bed/.bim/.fam trio with Balding-Nichols population structure."""
-    validate_missing_profile(variants, missing_rate, high_missing_variants,
-                             high_missing_rate)
+    validate_missing_profile(samples, variants, missing_rate,
+                             high_missing_variants, high_missing_rate,
+                             high_missing_samples, high_sample_missing_rate)
     rng = np.random.default_rng(seed)
     assignment = rng.integers(0, populations, size=samples)
 
@@ -114,6 +177,9 @@ def write_plink(prefix: Path, samples: int, variants: int, populations: int,
     # chromosome segment. This makes --geno the only intended difference
     # between the complete and filtered fits.
     high_missing_rank = high_missing_ranks(variants, high_missing_variants)
+    ordinary_samples, poor_samples = sample_missing_groups(
+        samples, high_missing_samples
+    )
 
     t0 = time.time()
     with open(f"{prefix}.bed", "wb") as bed:
@@ -129,13 +195,9 @@ def write_plink(prefix: Path, samples: int, variants: int, populations: int,
             dosage = rng.binomial(2, freq).astype(np.uint8)
 
             codes = code_for_dosage[dosage]
-            high_rank = high_missing_rank[variant]
-            variant_missing_rate = missing_rate
-            if high_rank >= 0:
-                if high_missing_rate is None:
-                    raise AssertionError("validated high missing rate disappeared")
-                variant_missing_rate = high_missing_rate
-            if variant_missing_rate > 0.0:
+            high_rank = int(high_missing_rank[variant])
+            if (missing_rate > 0.0 or high_rank >= 0
+                    or high_missing_samples > 0):
                 # An exact, deterministic per-variant rate makes two benchmark
                 # runs comparable without letting Bernoulli noise change the
                 # number of observed calls. Evenly spaced rows avoid deleting
@@ -143,15 +205,11 @@ def write_plink(prefix: Path, samples: int, variants: int, populations: int,
                 # every marker from dropping the same samples. This touches only
                 # the packed codes—the genotype RNG stream stays identical to a
                 # complete-call panel generated with the same seed.
-                missing_count = round(samples * variant_missing_rate)
-                if missing_count > 0:
-                    missing_rows = (
-                        (np.arange(missing_count, dtype=np.int64) * samples)
-                        // missing_count
-                        + variant * 37
-                        + max(high_rank, 0) * 17
-                    ) % samples
-                    codes[missing_rows] = 0b01
+                missing_rows = missing_rows_for_variant(
+                    ordinary_samples, poor_samples, variant, high_rank,
+                    missing_rate, high_missing_rate, high_sample_missing_rate
+                )
+                codes[missing_rows] = 0b01
             # Pack four samples per byte, lowest sample in the lowest bit pair.
             padded = np.zeros(bytes_per_variant * 4, dtype=np.uint8)
             padded[:samples] = codes
@@ -172,20 +230,28 @@ def write_plink(prefix: Path, samples: int, variants: int, populations: int,
           f"({size_gb:.2f} GB, baseline missing rate {missing_rate:.3%}, "
           f"{high_missing_variants} variants at "
           f"{high_missing_rate if high_missing_rate is not None else 0.0:.3%}) "
+          f"and {high_missing_samples} high-missing samples at "
+          f"{high_sample_missing_rate if high_sample_missing_rate is not None else 0.0:.3%} "
           f"in {time.time() - t0:.0f}s", file=sys.stderr)
 
 
 def inject_missing(source: Path, out: Path, missing_rate: float,
                    high_missing_variants: int,
-                   high_missing_rate: float | None) -> None:
+                   high_missing_rate: float | None,
+                   high_missing_samples: int,
+                   high_sample_missing_rate: float | None) -> None:
     """Copy a complete-call PLINK trio while injecting exact missingness."""
     with open(f"{source}.fam") as fam:
         samples = sum(1 for _ in fam)
     with open(f"{source}.bim") as bim:
         variants = sum(1 for _ in bim)
-    validate_missing_profile(variants, missing_rate, high_missing_variants,
-                             high_missing_rate)
+    validate_missing_profile(samples, variants, missing_rate,
+                             high_missing_variants, high_missing_rate,
+                             high_missing_samples, high_sample_missing_rate)
     ranks = high_missing_ranks(variants, high_missing_variants)
+    ordinary_samples, poor_samples = sample_missing_groups(
+        samples, high_missing_samples
+    )
     bytes_per_variant = (samples + 3) // 4
 
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -222,19 +288,11 @@ def inject_missing(source: Path, out: Path, missing_rate: float,
                     )
 
                 rank = int(ranks[variant])
-                rate = missing_rate
-                if rank >= 0:
-                    if high_missing_rate is None:
-                        raise AssertionError("validated high missing rate disappeared")
-                    rate = high_missing_rate
-                missing_count = round(samples * rate)
-                if missing_count > 0:
-                    rows = (
-                        (np.arange(missing_count, dtype=np.int64) * samples)
-                        // missing_count
-                        + variant * 37
-                        + max(rank, 0) * 17
-                    ) % samples
+                rows = missing_rows_for_variant(
+                    ordinary_samples, poor_samples, variant, rank,
+                    missing_rate, high_missing_rate, high_sample_missing_rate
+                )
+                if rows.size > 0:
                     byte_indices = rows >> 2
                     shifts = ((rows & 3) << 1).astype(np.uint8)
                     clear = np.bitwise_not(np.left_shift(np.uint8(3), shifts))
@@ -259,7 +317,9 @@ def inject_missing(source: Path, out: Path, missing_rate: float,
     print(f"wrote {out}.bed  {samples} samples x {variants} variants "
           f"({high_missing_variants} variants at "
           f"{high_missing_rate if high_missing_rate is not None else 0.0:.3%}, "
-          f"baseline {missing_rate:.3%}) in {time.time() - started:.1f}s",
+          f"baseline {missing_rate:.3%}; {high_missing_samples} samples at "
+          f"{high_sample_missing_rate if high_sample_missing_rate is not None else 0.0:.3%}) "
+          f"in {time.time() - started:.1f}s",
           file=sys.stderr)
 
 
@@ -519,6 +579,10 @@ def main(argv: list[str]) -> int:
                      help="evenly spaced variants assigned the high missing rate")
     gen.add_argument("--high-missing-rate", type=float,
                      help="exact missing-call fraction for high-missing variants")
+    gen.add_argument("--high-missing-samples", type=int, default=0,
+                     help="evenly spaced samples assigned the high missing rate")
+    gen.add_argument("--high-sample-missing-rate", type=float,
+                     help="exact missing-call fraction for high-missing samples")
 
     inject = sub.add_parser("inject-missing",
                             help="copy an existing PLINK trio with exact missing calls")
@@ -530,6 +594,10 @@ def main(argv: list[str]) -> int:
                         help="evenly spaced variants assigned the high missing rate")
     inject.add_argument("--high-missing-rate", type=float,
                         help="exact missing-call fraction for high-missing variants")
+    inject.add_argument("--high-missing-samples", type=int, default=0,
+                        help="evenly spaced samples assigned the high missing rate")
+    inject.add_argument("--high-sample-missing-rate", type=float,
+                        help="exact missing-call fraction for high-missing samples")
 
     run = sub.add_parser("run", help="time one fit")
     run.add_argument("--binary", required=True, type=Path)
@@ -552,12 +620,14 @@ def main(argv: list[str]) -> int:
     if args.command == "generate":
         write_plink(args.out, args.samples, args.variants,
                     args.populations, args.fst, args.seed, args.missing_rate,
-                    args.high_missing_variants, args.high_missing_rate)
+                    args.high_missing_variants, args.high_missing_rate,
+                    args.high_missing_samples, args.high_sample_missing_rate)
         return 0
 
     if args.command == "inject-missing":
         inject_missing(args.data, args.out, args.missing_rate,
-                       args.high_missing_variants, args.high_missing_rate)
+                       args.high_missing_variants, args.high_missing_rate,
+                       args.high_missing_samples, args.high_sample_missing_rate)
         return 0
 
     if args.command == "verify":

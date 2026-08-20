@@ -146,6 +146,11 @@ struct FitArgs {
     #[arg(long = "geno", value_name = "RATE")]
     geno: Option<f64>,
 
+    /// Maximum observed missing-call fraction retained for PCA fitting, using
+    /// the same threshold convention and ordering as PLINK --mind
+    #[arg(long = "mind", value_name = "RATE")]
+    mind: Option<f64>,
+
     /// Enable LD normalization when fitting the PCA model
     #[arg(long)]
     ld: bool,
@@ -706,6 +711,23 @@ fn run_map_fit(args: FitArgs) -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
 
+    let mind = match args.mind {
+        Some(value) if value.is_finite() && (0.0..=1.0).contains(&value) => {
+            if value < 1.0 {
+                Some(value)
+            } else {
+                None
+            }
+        }
+        Some(_) => {
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "--mind must be a finite value between 0 and 1",
+            )));
+        }
+        None => None,
+    };
+
     let ld_window = if args.ld {
         if let Some(bp) = args.bp_window {
             Some(LdWindow::BasePairs(bp))
@@ -739,6 +761,7 @@ fn run_map_fit(args: FitArgs) -> Result<(), Box<dyn std::error::Error>> {
         allow_unconverged: args.allow_unconverged,
         maf,
         geno,
+        mind,
         ld: ld_window,
     })
     .map_err(|err| Box::new(err) as Box<dyn std::error::Error>)

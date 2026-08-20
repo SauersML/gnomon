@@ -1218,6 +1218,7 @@ pub struct HardCallPacked<'a> {
     selection: Option<Vec<usize>>,
     match_kinds: Option<Vec<MatchKind>>,
     sample_selection: Option<Vec<usize>>,
+    sample_byte_masks: Option<Vec<u8>>,
     missing_variant: Option<Vec<u8>>,
 }
 
@@ -1232,6 +1233,7 @@ impl<'a> HardCallPacked<'a> {
             selection: None,
             match_kinds: None,
             sample_selection: None,
+            sample_byte_masks: None,
             missing_variant: None,
         }
     }
@@ -1250,12 +1252,24 @@ impl<'a> HardCallPacked<'a> {
             selection: Some(selection.to_vec()),
             match_kinds: match_kinds.map(<[MatchKind]>::to_vec),
             sample_selection: None,
+            sample_byte_masks: None,
             missing_variant: None,
         }
     }
 
     pub(crate) fn with_sample_selection(mut self, selection: &[usize]) -> Self {
         self.sample_selection = Some(selection.to_vec());
+        self.sample_byte_masks = build_sample_byte_masks(self.bytes_per_variant, selection);
+        self
+    }
+
+    pub(crate) fn with_sample_selection_and_masks(
+        mut self,
+        selection: &[usize],
+        masks: &[u8],
+    ) -> Self {
+        self.sample_selection = Some(selection.to_vec());
+        self.sample_byte_masks = Some(masks.to_vec());
         self
     }
 
@@ -1343,6 +1357,10 @@ impl<'a> HardCallPacked<'a> {
         self.sample_selection.as_deref()
     }
 
+    pub(crate) fn sample_byte_masks(&self) -> Option<&[u8]> {
+        self.sample_byte_masks.as_deref()
+    }
+
     pub(crate) fn moments(
         &self,
         logical_variant: usize,
@@ -1350,10 +1368,136 @@ impl<'a> HardCallPacked<'a> {
     ) -> Option<(f64, f64, usize)> {
         let bytes = self.slice(logical_variant, 1)?;
         let swapped = self.match_kind(logical_variant) == MatchKind::Swap;
-        match self.sample_selection() {
-            Some(selection) => packed_variant_moments_selected(bytes, selection, swapped),
-            None => Some(packed_variant_moments(bytes, n_samples, swapped)),
+        match (self.sample_selection(), self.sample_byte_masks()) {
+            (Some(selection), Some(masks)) => {
+                packed_variant_moments_selected(bytes, masks, selection.len(), swapped)
+            }
+            (Some(_), None) => None,
+            (None, None) => Some(packed_variant_moments(bytes, n_samples, swapped)),
+            (None, Some(_)) => None,
         }
+    }
+
+    /// Count missing hard calls for every logical sample across this view.
+    ///
+    /// Variant selections stay packed, and an optional sample selection is
+    /// mapped from physical BED lanes back to its logical row number. Each
+    /// Rayon worker owns one `n_samples` counter vector; reduction is linear in
+    /// the cohort size rather than the genotype matrix size.
+    pub(crate) fn sample_missing_counts(&self, n_samples: usize) -> Option<Vec<usize>> {
+        let logical_by_physical = match self.sample_selection() {
+            Some(selection) => {
+                if selection.len() != n_samples {
+                    return None;
+                }
+                let physical_capacity = self.bytes_per_variant.checked_mul(4)?;
+                let mut logical = vec![usize::MAX; physical_capacity];
+                for (logical_row, &physical_row) in selection.iter().enumerate() {
+                    let slot = logical.get_mut(physical_row)?;
+                    if *slot != usize::MAX {
+                        return None;
+                    }
+                    *slot = logical_row;
+                }
+                Some(logical)
+            }
+            None => {
+                if n_samples > self.bytes_per_variant.checked_mul(4)? {
+                    return None;
+                }
+                None
+            }
+        };
+        let missing_masks = hard_call_missing_mask_table();
+
+        let n_variants = self.n_variants();
+        let workers = rayon::current_num_threads().min(n_variants.max(1));
+        (0..workers)
+            .into_par_iter()
+            .map(|worker| -> Option<Vec<usize>> {
+                let mut counts = vec![0usize; n_samples];
+                let start = worker * n_variants / workers;
+                let end = (worker + 1) * n_variants / workers;
+                for variant in start..end {
+                    let bytes = self.slice(variant, 1)?;
+                    match logical_by_physical.as_deref() {
+                        Some(logical) => {
+                            if n_samples < bytes.len() {
+                                for (logical_row, &physical_row) in self
+                                    .sample_selection()
+                                    .expect("sample selection was mapped above")
+                                    .iter()
+                                    .enumerate()
+                                {
+                                    let byte = bytes[physical_row / 4];
+                                    let code = (byte >> ((physical_row % 4) * 2)) & 0b11;
+                                    counts[logical_row] += usize::from(code == 0b01);
+                                }
+                            } else {
+                                const LOW_BITS: u64 = 0x5555_5555_5555_5555;
+                                let (chunks, remainder) = bytes.as_chunks::<8>();
+                                for (word_idx, chunk) in chunks.iter().enumerate() {
+                                    let word = u64::from_le_bytes(*chunk);
+                                    let mut missing = word & !(word >> 1) & LOW_BITS;
+                                    while missing != 0 {
+                                        let bit = missing.trailing_zeros() as usize;
+                                        missing &= missing - 1;
+                                        let physical_row = word_idx * 32 + bit / 2;
+                                        let logical_row = logical[physical_row];
+                                        if logical_row != usize::MAX {
+                                            counts[logical_row] += 1;
+                                        }
+                                    }
+                                }
+                                let byte_offset = chunks.len() * 8;
+                                for (remainder_idx, &byte) in remainder.iter().enumerate() {
+                                    let mut mask = missing_masks[byte as usize];
+                                    while mask != 0 {
+                                        let lane = mask.trailing_zeros() as usize;
+                                        mask &= mask - 1;
+                                        let physical_row =
+                                            (byte_offset + remainder_idx) * 4 + lane;
+                                        let logical_row = logical[physical_row];
+                                        if logical_row != usize::MAX {
+                                            counts[logical_row] += 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        None => {
+                            const LOW_BITS: u64 = 0x5555_5555_5555_5555;
+                            let full_words = n_samples / 32;
+                            let (words, remainder) = bytes[..full_words * 8].as_chunks::<8>();
+                            debug_assert!(remainder.is_empty());
+                            for (word_idx, word_bytes) in words.iter().enumerate() {
+                                let word = u64::from_le_bytes(*word_bytes);
+                                let mut missing = word & !(word >> 1) & LOW_BITS;
+                                while missing != 0 {
+                                    let bit = missing.trailing_zeros() as usize;
+                                    missing &= missing - 1;
+                                    counts[word_idx * 32 + bit / 2] += 1;
+                                }
+                            }
+                            for sample in full_words * 32..n_samples {
+                                let byte = bytes[sample / 4];
+                                let code = (byte >> ((sample % 4) * 2)) & 0b11;
+                                counts[sample] += usize::from(code == 0b01);
+                            }
+                        }
+                    }
+                }
+                Some(counts)
+            })
+            .try_reduce(
+                || vec![0usize; n_samples],
+                |mut left, right| {
+                    for (total, value) in left.iter_mut().zip(right) {
+                        *total += value;
+                    }
+                    Some(left)
+                },
+            )
     }
 
     fn physical_variant(&self, logical_variant: usize) -> Option<usize> {
@@ -1745,6 +1889,7 @@ where
                 selection: None,
                 match_kinds: None,
                 sample_selection: None,
+                sample_byte_masks: None,
                 missing_variant: None,
             }),
             CacheState::Disabled => self.source.hard_call_packed(),
@@ -1868,6 +2013,23 @@ fn hard_call_moment_table() -> &'static [[u8; 3]; 256] {
     })
 }
 
+fn hard_call_missing_mask_table() -> &'static [u8; 256] {
+    static TABLE: OnceLock<[u8; 256]> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut table = [0u8; 256];
+        for byte in 0u16..256 {
+            let mut mask = 0u8;
+            for lane in 0..4 {
+                if ((byte >> (lane * 2)) & 0b11) == 0b01 {
+                    mask |= 1 << lane;
+                }
+            }
+            table[byte as usize] = mask;
+        }
+        table
+    })
+}
+
 fn packed_variant_moments(bytes: &[u8], n_samples: usize, swap: bool) -> (f64, f64, usize) {
     debug_assert!(bytes.len() >= n_samples.div_ceil(4));
 
@@ -1913,15 +2075,15 @@ fn packed_variant_moments(bytes: &[u8], n_samples: usize, swap: bool) -> (f64, f
 
 fn packed_variant_moments_selected(
     bytes: &[u8],
-    sample_selection: &[usize],
+    sample_byte_masks: &[u8],
+    n_samples: usize,
     swap: bool,
 ) -> Option<(f64, f64, usize)> {
     let mut ones = 0usize;
     let mut twos = 0usize;
     let mut calls = 0usize;
-    for &physical in sample_selection {
-        let &byte = bytes.get(physical / 4)?;
-        match (byte >> ((physical % 4) * 2)) & 0b11 {
+    for_each_packed_masked_code(bytes, sample_byte_masks, n_samples, |_, code| {
+        match code {
             0 => calls += 1,
             1 => {}
             2 => {
@@ -1934,7 +2096,7 @@ fn packed_variant_moments_selected(
             }
             _ => unreachable!(),
         }
-    }
+    })?;
 
     if swap {
         twos = calls - ones - twos;
@@ -1942,6 +2104,46 @@ fn packed_variant_moments_selected(
     let sum = ones + 2 * twos;
     let sum_sq = ones + 4 * twos;
     Some((sum as f64, sum_sq as f64, calls))
+}
+
+fn build_sample_byte_masks(bytes_per_variant: usize, selection: &[usize]) -> Option<Vec<u8>> {
+    let mut masks = vec![0u8; bytes_per_variant];
+    for &physical in selection {
+        let mask = masks.get_mut(physical / 4)?;
+        *mask |= 1 << (physical % 4);
+    }
+    Some(masks)
+}
+
+/// Visit a packed selected-sample view in physical byte order. A fully retained
+/// byte—the dominant case after ordinary call-rate QC—takes one mask branch and
+/// emits four consecutive logical rows without division, lookup, or gathering.
+#[inline(always)]
+pub(crate) fn for_each_packed_masked_code(
+    bytes: &[u8],
+    masks: &[u8],
+    n_samples: usize,
+    mut visit: impl FnMut(usize, u8),
+) -> Option<()> {
+    let mut logical = 0usize;
+    for (&byte, &mask) in bytes.iter().zip(masks) {
+        if mask == 0b1111 {
+            visit(logical, byte & 0b11);
+            visit(logical + 1, (byte >> 2) & 0b11);
+            visit(logical + 2, (byte >> 4) & 0b11);
+            visit(logical + 3, (byte >> 6) & 0b11);
+            logical += 4;
+        } else {
+            let mut retained = mask;
+            while retained != 0 {
+                let lane = retained.trailing_zeros() as usize;
+                retained &= retained - 1;
+                visit(logical, (byte >> (lane * 2)) & 0b11);
+                logical += 1;
+            }
+        }
+    }
+    (logical == n_samples).then_some(())
 }
 
 struct DenseCacheBuilder {
@@ -4922,7 +5124,9 @@ where
         let max_variants = max_variants.min(freqs.len()).min(scales.len());
         let code_table = hard_call_code_table();
         let sample_selection = packed.sample_selection();
+        let sample_byte_masks = packed.sample_byte_masks();
         debug_assert!(sample_selection.is_none_or(|selection| selection.len() == n_samples));
+        debug_assert_eq!(sample_selection.is_some(), sample_byte_masks.is_some());
 
         for variant_idx in 0..max_variants {
             let mean = 2.0 * freqs[variant_idx];
@@ -4971,18 +5175,22 @@ where
                     let mut sum1 = 0.0f64;
                     let mut sum2 = 0.0f64;
 
-                    if let Some(selection) = sample_selection {
-                        for (idx, &physical) in selection.iter().enumerate() {
-                            let byte = variant_bytes[physical / 4];
-                            let code = code_table[byte as usize][physical % 4];
-                            let val = rhs[(idx, col)];
-                            match code {
-                                0 => sum0 += val,
-                                2 => sum1 += val,
-                                3 => sum2 += val,
-                                _ => {}
-                            }
-                        }
+                    if let Some(masks) = sample_byte_masks {
+                        let valid = for_each_packed_masked_code(
+                            variant_bytes,
+                            masks,
+                            n_samples,
+                            |idx, code| {
+                                let val = rhs[(idx, col)];
+                                match code {
+                                    0 => sum0 += val,
+                                    2 => sum1 += val,
+                                    3 => sum2 += val,
+                                    _ => {}
+                                }
+                            },
+                        );
+                        debug_assert!(valid.is_some());
                     } else {
                         let mut sample_idx = 0usize;
                         for &byte in variant_bytes {
@@ -5010,21 +5218,26 @@ where
                     proj[local] = (z0 * sum0 + z1 * sum1 + z2 * sum2) * coeff;
                 }
 
-                if let Some(selection) = sample_selection {
-                    for (idx, &physical) in selection.iter().enumerate() {
-                        let byte = variant_bytes[physical / 4];
-                        let z = match code_table[byte as usize][physical % 4] {
-                            0 => z0,
-                            2 => z1,
-                            3 => z2,
-                            _ => 0.0,
-                        };
-                        if z != 0.0 {
-                            for local in 0..chunk {
-                                out[(idx, chunk_start + local)] += z * proj[local];
+                if let Some(masks) = sample_byte_masks {
+                    let valid = for_each_packed_masked_code(
+                        variant_bytes,
+                        masks,
+                        n_samples,
+                        |idx, code| {
+                            let z = match code {
+                                0 => z0,
+                                2 => z1,
+                                3 => z2,
+                                _ => 0.0,
+                            };
+                            if z != 0.0 {
+                                for local in 0..chunk {
+                                    out[(idx, chunk_start + local)] += z * proj[local];
+                                }
                             }
-                        }
-                    }
+                        },
+                    );
+                    debug_assert!(valid.is_some());
                 } else {
                     let mut sample_idx = 0usize;
                     for &byte in variant_bytes {
@@ -8004,12 +8217,67 @@ mod tests {
                     .collect();
                 let selected_sum = selected.iter().sum::<f64>();
                 let selected_sum_sq = selected.iter().map(|value| value * value).sum::<f64>();
+                let masks = build_sample_byte_masks(packed.len(), &selection).unwrap();
                 assert_eq!(
-                    packed_variant_moments_selected(&packed, &selection, swap),
+                    packed_variant_moments_selected(&packed, &masks, selection.len(), swap),
                     Some((selected_sum, selected_sum_sq, selected.len()))
                 );
             }
         }
+    }
+
+    #[test]
+    fn packed_sample_missing_counts_match_selected_logical_rows() {
+        const SAMPLES: usize = 7;
+        const VARIANTS: usize = 4;
+        let data = vec![
+            f64::NAN,
+            0.0,
+            1.0,
+            2.0,
+            f64::NAN,
+            0.0,
+            2.0,
+            0.0,
+            f64::NAN,
+            1.0,
+            f64::NAN,
+            2.0,
+            0.0,
+            2.0,
+            0.0,
+            1.0,
+            2.0,
+            0.0,
+            1.0,
+            2.0,
+            0.0,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+        ];
+        let bytes_per_variant = SAMPLES.div_ceil(4);
+        let mut bytes = vec![0u8; bytes_per_variant * VARIANTS];
+        for variant in 0..VARIANTS {
+            let source = &data[variant * SAMPLES..(variant + 1) * SAMPLES];
+            let packed =
+                &mut bytes[variant * bytes_per_variant..(variant + 1) * bytes_per_variant];
+            assert!(pack_hard_calls_into(packed, source, SAMPLES));
+        }
+
+        let packed = HardCallPacked::new(&bytes, bytes_per_variant, VARIANTS);
+        assert_eq!(
+            packed.sample_missing_counts(SAMPLES),
+            Some(vec![2, 2, 1, 2, 2, 1, 1]),
+            "the padded tail lane must not become a sample"
+        );
+
+        let selected = packed.with_sample_selection(&[0, 3, 5]);
+        assert_eq!(selected.sample_missing_counts(3), Some(vec![2, 2, 1]));
     }
 
     #[test]
@@ -8169,6 +8437,12 @@ mod tests {
                 selection: None,
                 match_kinds: self.match_kinds.clone(),
                 sample_selection: self.sample_selection.clone(),
+                sample_byte_masks: self
+                    .sample_selection
+                    .as_deref()
+                    .and_then(|selection| {
+                        build_sample_byte_masks(self.bytes_per_variant, selection)
+                    }),
                 missing_variant: None,
             })
         }

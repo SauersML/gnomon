@@ -13,7 +13,9 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::adapt_plink2::{VirtualPlink19, open_virtual_plink19_from_paths};
-use crate::map::fit::{HwePcaModel, LdWeights, VariantBlockSource};
+use crate::map::fit::{
+    HwePcaModel, LdWeights, VariantBlockSource, for_each_packed_masked_code,
+};
 use crate::map::project::ProjectionResult;
 use crate::map::variant_filter::{MatchKind, VariantFilter, VariantKey, VariantSelection};
 use crate::pipeline_error::PipelineError;
@@ -2462,6 +2464,7 @@ pub struct PlinkVariantBlockSource {
     bytes_per_variant: usize,
     physical_n_samples: usize,
     sample_selection: Option<Vec<usize>>,
+    sample_byte_masks: Option<Vec<u8>>,
     total_variants: usize,
     selection: Option<Vec<usize>>,
     match_kinds: Option<Vec<MatchKind>>,
@@ -2483,6 +2486,7 @@ impl PlinkVariantBlockSource {
             bytes_per_variant,
             physical_n_samples: n_samples,
             sample_selection: None,
+            sample_byte_masks: None,
             total_variants: n_variants,
             selection,
             match_kinds,
@@ -2511,7 +2515,17 @@ impl PlinkVariantBlockSource {
 
         let is_identity = indices.len() == self.physical_n_samples
             && indices.iter().copied().eq(0..self.physical_n_samples);
-        self.sample_selection = (!is_identity).then_some(indices);
+        if is_identity {
+            self.sample_selection = None;
+            self.sample_byte_masks = None;
+        } else {
+            let mut masks = vec![0u8; self.bytes_per_variant];
+            for &physical in &indices {
+                masks[physical / 4] |= 1 << (physical % 4);
+            }
+            self.sample_selection = Some(indices);
+            self.sample_byte_masks = Some(masks);
+        }
         self.cursor = 0;
         Ok(())
     }
@@ -2586,7 +2600,7 @@ impl VariantBlockSource for PlinkVariantBlockSource {
             if let Some(data) = self.bed.mmap_slice(PLINK_HEADER_LEN as usize, total_bytes) {
                 let bytes_per_variant = self.bytes_per_variant;
                 let physical_n_samples = self.physical_n_samples;
-                let sample_selection = self.sample_selection.as_deref();
+                let sample_byte_masks = self.sample_byte_masks.as_deref();
                 let kinds = self
                     .match_kinds
                     .as_ref()
@@ -2603,7 +2617,7 @@ impl VariantBlockSource for PlinkVariantBlockSource {
                                 bytes,
                                 dest,
                                 physical_n_samples,
-                                sample_selection,
+                                sample_byte_masks,
                                 table,
                             );
                             if kinds.is_some_and(|values| values[logical] == MatchKind::Swap) {
@@ -2678,7 +2692,7 @@ impl VariantBlockSource for PlinkVariantBlockSource {
                         bytes,
                         dest,
                         self.physical_n_samples,
-                        self.sample_selection.as_deref(),
+                        self.sample_byte_masks.as_deref(),
                         table,
                     );
 
@@ -2748,7 +2762,7 @@ impl VariantBlockSource for PlinkVariantBlockSource {
             if nrows > 0 {
                 let bytes_per_variant = self.bytes_per_variant;
                 let physical_n_samples = self.physical_n_samples;
-                let sample_selection = self.sample_selection.as_deref();
+                let sample_byte_masks = self.sample_byte_masks.as_deref();
                 self.buffer
                     .par_chunks(bytes_per_variant)
                     .zip(storage[..output_len].par_chunks_mut(nrows))
@@ -2757,7 +2771,7 @@ impl VariantBlockSource for PlinkVariantBlockSource {
                             bytes,
                             dest,
                             physical_n_samples,
-                            sample_selection,
+                            sample_byte_masks,
                             table,
                         );
                     });
@@ -2843,7 +2857,7 @@ impl VariantBlockSource for PlinkVariantBlockSource {
 
         let bytes_per_variant = self.bytes_per_variant;
         let physical_n_samples = self.physical_n_samples;
-        let sample_selection = self.sample_selection.as_deref();
+        let sample_byte_masks = self.sample_byte_masks.as_deref();
         if nrows > 0 {
             storage[..output_len]
                 .par_chunks_mut(nrows)
@@ -2868,7 +2882,7 @@ impl VariantBlockSource for PlinkVariantBlockSource {
                         bytes,
                         dest,
                         physical_n_samples,
-                        sample_selection,
+                        sample_byte_masks,
                         &code_values,
                     );
                 });
@@ -2906,9 +2920,15 @@ impl VariantBlockSource for PlinkVariantBlockSource {
                 self.total_variants,
             ),
         };
-        Some(match self.sample_selection.as_deref() {
-            Some(selection) => packed.with_sample_selection(selection),
-            None => packed,
+        Some(match (
+            self.sample_selection.as_deref(),
+            self.sample_byte_masks.as_deref(),
+        ) {
+            (Some(selection), Some(masks)) => {
+                packed.with_sample_selection_and_masks(selection, masks)
+            }
+            (None, None) => packed,
+            _ => return None,
         })
     }
 }
@@ -5442,20 +5462,26 @@ fn decode_plink_variant_rows(
     bytes: &[u8],
     dest: &mut [f64],
     physical_n_samples: usize,
-    sample_selection: Option<&[usize]>,
+    sample_byte_masks: Option<&[u8]>,
     table: &[[f64; 4]; 256],
 ) {
-    let Some(indices) = sample_selection else {
+    let Some(masks) = sample_byte_masks else {
         decode_plink_variant(bytes, dest, physical_n_samples, table);
         return;
     };
 
-    debug_assert!(dest.len() >= indices.len());
+    debug_assert!(dest.len() <= physical_n_samples);
     debug_assert!(bytes.len() >= physical_n_samples.div_ceil(4));
-    for (value, &physical) in dest.iter_mut().zip(indices) {
-        let byte = bytes[physical / 4];
-        *value = table[byte as usize][physical % 4];
-    }
+    let valid = for_each_packed_masked_code(bytes, masks, dest.len(), |logical, code| {
+        dest[logical] = match code {
+            0 => 0.0,
+            1 => f64::NAN,
+            2 => 1.0,
+            3 => 2.0,
+            _ => unreachable!(),
+        };
+    });
+    debug_assert!(valid.is_some());
 }
 
 #[inline(always)]
@@ -5509,21 +5535,20 @@ fn decode_plink_variant_standardized_rows(
     bytes: &[u8],
     dest: &mut [f64],
     physical_n_samples: usize,
-    sample_selection: Option<&[usize]>,
+    sample_byte_masks: Option<&[u8]>,
     code_values: &[f64; 4],
 ) {
-    let Some(indices) = sample_selection else {
+    let Some(masks) = sample_byte_masks else {
         decode_plink_variant_standardized_codes(bytes, dest, physical_n_samples, code_values);
         return;
     };
 
-    debug_assert!(dest.len() >= indices.len());
+    debug_assert!(dest.len() <= physical_n_samples);
     debug_assert!(bytes.len() >= physical_n_samples.div_ceil(4));
-    for (value, &physical) in dest.iter_mut().zip(indices) {
-        let byte = bytes[physical / 4];
-        let code = ((byte >> ((physical % 4) * 2)) & 0b11) as usize;
-        *value = code_values[code];
-    }
+    let valid = for_each_packed_masked_code(bytes, masks, dest.len(), |logical, code| {
+        dest[logical] = code_values[code as usize];
+    });
+    debug_assert!(valid.is_some());
 }
 
 #[inline]

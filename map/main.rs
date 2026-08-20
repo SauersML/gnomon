@@ -48,6 +48,9 @@ pub enum MapCommand {
         /// Maximum observed missing-call fraction retained for fitting, using
         /// PLINK's `--geno` convention.
         geno: Option<f64>,
+        /// Maximum observed missing-call fraction retained for fitting, using
+        /// PLINK's `--mind` convention.
+        mind: Option<f64>,
         ld: Option<LdWindow>,
     },
     Project {
@@ -147,6 +150,7 @@ pub fn run(command: MapCommand) -> Result<(), MapDriverError> {
             allow_unconverged,
             maf,
             geno,
+            mind,
             ld,
         } => {
             let fit = || {
@@ -159,6 +163,7 @@ pub fn run(command: MapCommand) -> Result<(), MapDriverError> {
                     allow_unconverged,
                     maf,
                     geno,
+                    mind,
                     ld,
                 })
             };
@@ -195,6 +200,7 @@ struct FitRequest<'a> {
     allow_unconverged: bool,
     maf: Option<f64>,
     geno: Option<f64>,
+    mind: Option<f64>,
     ld: Option<LdWindow>,
 }
 
@@ -208,6 +214,7 @@ fn run_fit(request: FitRequest<'_>) -> Result<(), MapDriverError> {
         allow_unconverged,
         maf,
         geno,
+        mind,
         ld,
     } = request;
     if maf.is_some_and(|value| !(value.is_finite() && (0.0..=0.5).contains(&value))) {
@@ -218,6 +225,11 @@ fn run_fit(request: FitRequest<'_>) -> Result<(), MapDriverError> {
     if geno.is_some_and(|value| !(value.is_finite() && (0.0..=1.0).contains(&value))) {
         return Err(MapDriverError::InvalidState(
             "--geno must be a finite value between 0 and 1".into(),
+        ));
+    }
+    if mind.is_some_and(|value| !(value.is_finite() && (0.0..=1.0).contains(&value))) {
+        return Err(MapDriverError::InvalidState(
+            "--mind must be a finite value between 0 and 1".into(),
         ));
     }
     println!("=== HWE PCA model fitting ===");
@@ -244,7 +256,7 @@ fn run_fit(request: FitRequest<'_>) -> Result<(), MapDriverError> {
     // allele frequencies, the MAF screen, LD weights, the covariance — is
     // computed from the retained rows alone, which is what makes this a fit on
     // the subset rather than a whole-cohort fit that is later filtered.
-    let keep_indices = match keep {
+    let mut keep_indices = match keep {
         Some(keep_path) => {
             let indices = resolve_keep_indices(keep_path, dataset.samples())?;
             println!(
@@ -257,18 +269,6 @@ fn run_fit(request: FitRequest<'_>) -> Result<(), MapDriverError> {
         }
         None => None,
     };
-    let retained_records: Option<Vec<SampleRecord>> = keep_indices.as_ref().map(|indices| {
-        indices
-            .iter()
-            .map(|&idx| dataset.samples()[idx].clone())
-            .collect()
-    });
-    let retained_samples: &[SampleRecord] = match retained_records.as_deref() {
-        Some(records) => records,
-        None => dataset.samples(),
-    };
-    let fit_n_samples = retained_samples.len();
-
     println!("Requested principal components: {components}");
     match &ld {
         Some(LdWindow::Sites(window)) => {
@@ -292,6 +292,12 @@ fn run_fit(request: FitRequest<'_>) -> Result<(), MapDriverError> {
             "Call-rate filtering enabled: retaining variants with missing-call rate <= {max_missing_rate:.6} during the PCA stream."
         ),
         None => println!("Call-rate filtering disabled (default)."),
+    }
+    match mind {
+        Some(max_missing_rate) => println!(
+            "Sample call-rate filtering enabled: retaining samples with missing-call rate <= {max_missing_rate:.6}."
+        ),
+        None => println!("Sample call-rate filtering disabled (default)."),
     }
 
     let mut variant_keys: Option<Arc<Vec<VariantKey>>> = None;
@@ -375,6 +381,46 @@ fn run_fit(request: FitRequest<'_>) -> Result<(), MapDriverError> {
             }
         }
     }
+
+    // Match PLINK's operation order: --keep is already resolved, and --mind
+    // sees the marker list after --list/--markers but before --geno and --maf.
+    // Indexed hard-call sources count missing lanes directly in packed BED;
+    // streamed sources use one bounded decode pass.
+    if let Some(max_missing_rate) = mind {
+        let mut source = subset_samples(
+            dataset.block_source_with_plan(selection_plan.clone())?,
+            keep_indices.as_deref(),
+        )?;
+        let scan = scan_sample_missing_filter(&mut source, max_missing_rate)?;
+        let before = source.n_samples();
+        if scan.retained.is_empty() {
+            return Err(MapDriverError::InvalidState(
+                "sample missingness QC removed every retained sample".into(),
+            ));
+        }
+        keep_indices = compose_sample_selection(
+            keep_indices.take(),
+            &scan.retained,
+            dataset.n_samples(),
+        )?;
+        println!(
+            "Sample missingness QC retained {} of {before} samples across {} selected variants.",
+            scan.retained.len(),
+            scan.variants
+        );
+    }
+
+    let retained_records: Option<Vec<SampleRecord>> = keep_indices.as_ref().map(|indices| {
+        indices
+            .iter()
+            .map(|&idx| dataset.samples()[idx].clone())
+            .collect()
+    });
+    let retained_samples: &[SampleRecord] = match retained_records.as_deref() {
+        Some(records) => records,
+        None => dataset.samples(),
+    };
+    let fit_n_samples = retained_samples.len();
 
     let is_vcf_like = matches!(dataset, GenotypeDataset::Variants(_));
 
@@ -767,6 +813,120 @@ fn retain_selection_plan_by_logical_indices(
             "cannot apply indexed MAF positions to a key-streamed source".into(),
         )),
     }
+}
+
+struct SampleMissingnessScan {
+    retained: Vec<usize>,
+    variants: usize,
+}
+
+fn samples_passing_missingness(
+    missing_counts: &[usize],
+    n_variants: usize,
+    max_missing_rate: f64,
+) -> Vec<usize> {
+    let allowed_missing = max_missing_rate * n_variants as f64;
+    missing_counts
+        .iter()
+        .enumerate()
+        .filter_map(|(sample, &missing)| {
+            ((missing as f64) <= allowed_missing).then_some(sample)
+        })
+        .collect()
+}
+
+/// Screens samples after marker selection and before variant-level QC.
+///
+/// BED-backed sources expose packed hard calls, so the common biobank path
+/// never expands the matrix. Other formats use a bounded column-major block
+/// and produce the same exact per-sample missing-call counts.
+fn scan_sample_missing_filter<S>(
+    source: &mut S,
+    max_missing_rate: f64,
+) -> Result<SampleMissingnessScan, MapDriverError>
+where
+    S: VariantBlockSource + Send,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    let n_samples = source.n_samples();
+    source
+        .reset()
+        .map_err(|err| HwePcaError::Source(Box::new(err)))?;
+
+    if let Some(packed) = source.hard_call_packed() {
+        let variants = packed.n_variants();
+        if variants == 0 {
+            return Err(MapDriverError::InvalidState(
+                "sample missingness QC cannot run with zero selected variants".into(),
+            ));
+        }
+        let counts = packed.sample_missing_counts(n_samples).ok_or_else(|| {
+            MapDriverError::InvalidState(
+                "packed hard-call source contains an invalid sample selection".into(),
+            )
+        })?;
+        return Ok(SampleMissingnessScan {
+            retained: samples_passing_missingness(&counts, variants, max_missing_rate),
+            variants,
+        });
+    }
+
+    let block_capacity =
+        fit_scan_block_capacity(source.block_storage_samples(), source.n_variants());
+    let mut block = vec![0.0f64; n_samples.saturating_mul(block_capacity)];
+    let mut counts = vec![0usize; n_samples];
+    let mut variants = 0usize;
+    loop {
+        let filled = source
+            .next_block_into(block_capacity, &mut block)
+            .map_err(|err| HwePcaError::Source(Box::new(err)))?;
+        if filled == 0 {
+            break;
+        }
+        for variant in 0..filled {
+            let column = &block[variant * n_samples..(variant + 1) * n_samples];
+            for (missing, value) in counts.iter_mut().zip(column) {
+                *missing += usize::from(!value.is_finite());
+            }
+        }
+        variants = variants.checked_add(filled).ok_or_else(|| {
+            MapDriverError::InvalidState("selected variant count overflowed usize".into())
+        })?;
+    }
+    if variants == 0 {
+        return Err(MapDriverError::InvalidState(
+            "sample missingness QC cannot run with zero selected variants".into(),
+        ));
+    }
+    Ok(SampleMissingnessScan {
+        retained: samples_passing_missingness(&counts, variants, max_missing_rate),
+        variants,
+    })
+}
+
+/// Maps logical rows retained by `--mind` back through an optional `--keep`.
+/// Preserve the identity fast path when no filtering was requested or needed.
+fn compose_sample_selection(
+    existing: Option<Vec<usize>>,
+    retained: &[usize],
+    original_n_samples: usize,
+) -> Result<Option<Vec<usize>>, MapDriverError> {
+    let available = existing.as_ref().map_or(original_n_samples, Vec::len);
+    let identity = retained.len() == available && retained.iter().copied().eq(0..available);
+    if identity {
+        return Ok(existing);
+    }
+
+    let mut composed = Vec::with_capacity(retained.len());
+    for &logical in retained {
+        if logical >= available {
+            return Err(MapDriverError::InvalidState(format!(
+                "sample QC-retained logical index {logical} exceeded retained sample count {available}"
+            )));
+        }
+        composed.push(existing.as_ref().map_or(logical, |indices| indices[logical]));
+    }
+    Ok(Some(composed))
 }
 
 fn packed_variant_filter_retained_indices(
@@ -1801,11 +1961,12 @@ fn map_variant_list_error(path: &Path, err: VariantListError) -> MapDriverError 
 #[cfg(test)]
 mod tests {
     use super::{
-        MapCommand, MapDriverError, packed_variant_filter_retained_indices,
-        projection_present_mask, resolve_keep_indices, retain_selection_plan_by_logical_indices,
-        run, run_project,
+        MapCommand, MapDriverError, compose_sample_selection,
+        packed_variant_filter_retained_indices, projection_present_mask, resolve_keep_indices,
+        retain_selection_plan_by_logical_indices, run, run_project, samples_passing_missingness,
+        scan_sample_missing_filter,
     };
-    use crate::map::fit::{HardCallPacked, HwePcaModel};
+    use crate::map::fit::{DenseBlockSource, HardCallPacked, HwePcaModel};
     use crate::map::io::{
         GenotypeDataset, OrderedSelectionPlan, ProjectionOutputPaths, SampleRecord, SelectionPlan,
         load_hwe_model, save_hwe_model, save_projection_results,
@@ -1869,6 +2030,7 @@ mod tests {
             allow_unconverged: false,
             maf: None,
             geno: None,
+            mind: None,
             ld: None,
         })
         .expect_err("zero worker threads must be rejected");
@@ -1891,6 +2053,7 @@ mod tests {
             allow_unconverged: false,
             maf: None,
             geno: Some(f64::NAN),
+            mind: None,
             ld: None,
         })
         .expect_err("a non-finite call-rate threshold must be rejected");
@@ -1900,6 +2063,72 @@ mod tests {
             MapDriverError::InvalidState(message)
                 if message == "--geno must be a finite value between 0 and 1"
         ));
+    }
+
+    #[test]
+    fn fit_rejects_invalid_sample_missingness_before_opening_input() {
+        let error = run(MapCommand::Fit {
+            genotype_path: PathBuf::from("input-must-not-be-opened.bed"),
+            variant_list: None,
+            keep: None,
+            markers: None,
+            components: 4,
+            threads: None,
+            allow_unconverged: false,
+            maf: None,
+            geno: None,
+            mind: Some(f64::INFINITY),
+            ld: None,
+        })
+        .expect_err("a non-finite sample missingness threshold must be rejected");
+
+        assert!(matches!(
+            error,
+            MapDriverError::InvalidState(message)
+                if message == "--mind must be a finite value between 0 and 1"
+        ));
+    }
+
+    #[test]
+    fn sample_missingness_is_inclusive_and_composes_with_keep() {
+        assert_eq!(
+            samples_passing_missingness(&[0, 1, 2, 3], 10, 0.20),
+            vec![0, 1, 2]
+        );
+        assert_eq!(
+            compose_sample_selection(Some(vec![1, 3, 5]), &[0, 2], 8).unwrap(),
+            Some(vec![1, 5])
+        );
+        assert_eq!(
+            compose_sample_selection(None, &[0, 1, 2], 3).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn decoded_sample_missingness_scan_matches_column_major_values() {
+        let data = vec![
+            f64::NAN,
+            0.0,
+            1.0,
+            2.0,
+            0.0,
+            f64::NAN,
+            f64::NAN,
+            2.0,
+            0.0,
+            1.0,
+            f64::NAN,
+            2.0,
+        ];
+        let mut source = DenseBlockSource::new(&data, 4, 3).unwrap();
+        let scan = scan_sample_missing_filter(&mut source, 1.0 / 3.0).unwrap();
+        assert_eq!(scan.variants, 3);
+        assert_eq!(scan.retained, vec![0, 1, 3]);
+
+        let mut source = DenseBlockSource::new(&data, 4, 3).unwrap();
+        let scan = scan_sample_missing_filter(&mut source, 0.25).unwrap();
+        assert_eq!(scan.retained, vec![3]);
     }
 
     #[test]
