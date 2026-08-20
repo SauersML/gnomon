@@ -4949,11 +4949,9 @@ where
             break;
         }
 
-        if processed + filled < processed {
-            return Err(HwePcaError::InvalidInput(
-                "variant count overflow during statistics computation",
-            ));
-        }
+        let end = processed.checked_add(filled).ok_or(HwePcaError::InvalidInput(
+            "variant count overflow during statistics computation",
+        ))?;
 
         let block = MatMut::from_column_major_slice_mut(
             &mut block_storage[..n_samples * filled],
@@ -4961,10 +4959,10 @@ where
             filled,
         );
 
-        let variant_range = processed..processed + filled;
+        let variant_range = processed..end;
         stats.ensure_statistics(block.as_ref(), variant_range.clone(), par);
 
-        processed += filled;
+        processed = end;
 
         if let Some((bytes_read, total_bytes)) = source.progress_bytes() {
             used_source_progress = true;
