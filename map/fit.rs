@@ -26,11 +26,13 @@ use rayon::prelude::*;
 use serde::de::Error as DeError;
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::error::Error;
 use std::ops::Range;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::simd::Simd;
+use std::simd::num::{SimdFloat, SimdUint};
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -75,7 +77,7 @@ const DENSE_REFERENCE_MAX_SAMPLES: usize = 4_096;
 /// QR sweep, with eigenvectors). Order-of-magnitude is all this needs to be.
 const DENSE_EIGEN_FLOPS_PER_CUBE: f64 = 10.0;
 /// Genome passes a converged block-Krylov solve typically needs. `min_passes`
-/// is 2 and `max_passes` 24; four is the middle of what actually converges.
+/// is 2 and `max_passes` 32; four is the middle of what actually converges.
 const ESTIMATED_KRYLOV_PASSES: f64 = 4.0;
 pub const DEFAULT_LD_WINDOW: usize = 51;
 const DEFAULT_LD_RIDGE: f64 = 1.0e-3;
@@ -321,6 +323,9 @@ pub struct FitOptions {
     /// model either way, so a best-effort artifact still records
     /// `converged: false` for whoever reads it later.
     pub allow_unconverged: bool,
+    /// Ceiling on eigensolver genome passes; `None` takes
+    /// [`BlockKrylovParams::DEFAULT_MAX_PASSES`].
+    pub max_passes: Option<usize>,
 }
 
 /// Variant moments already computed against the exact sample and marker stream
@@ -462,56 +467,17 @@ impl LdResolvedConfig {
     /// makes them the cheap, total test for it.
     ///
     fn range_count(&self) -> usize {
-        match &self.window {
-            LdResolvedWindow::Sites { ranges, .. } | LdResolvedWindow::BasePairs { ranges, .. } => {
-                ranges.len()
-            }
-        }
+        self.ranges().len()
     }
 
-    /// The window centred on `next`, or `None` while the stream still owes it
-    /// markers.
-    ///
-    /// `newest` is the highest stream index the ring holds. A window is *ready*
-    /// only once its last marker has been streamed. Sizing it against whatever
-    /// the ring happened to hold instead is what let a 51-site request collapse
-    /// to three markers, and `stream_ended` is the single legitimate exception:
-    /// the file ran out and no further push will ever arrive. A chromosome
-    /// ending mid-stream needs no exception, because the ranges are already
-    /// clipped to it.
-    fn window_range(
-        &self,
-        next: usize,
-        newest: usize,
-        stream_ended: bool,
-    ) -> Result<Option<LdWindowRange>, HwePcaError> {
-        let (start, end) = match &self.window {
+    /// One chromosome-clipped window per streamed variant, indexed by stream
+    /// position; see [`Self::range_count`] for what that index promises.
+    fn ranges(&self) -> &Arc<[LdWindowRange]> {
+        match &self.window {
             LdResolvedWindow::Sites { ranges, .. } | LdResolvedWindow::BasePairs { ranges, .. } => {
-                let Some(range) = ranges.get(next) else {
-                    return Ok(None);
-                };
-                (range.start, range.end)
+                ranges
             }
-        };
-
-        if end <= start {
-            return Err(HwePcaError::InvalidInput(
-                "LD window resolved to an empty range",
-            ));
         }
-
-        if end - 1 <= newest {
-            return Ok(Some(LdWindowRange { start, end }));
-        }
-
-        if !stream_ended || newest < start {
-            return Ok(None);
-        }
-
-        Ok(Some(LdWindowRange {
-            start,
-            end: newest + 1,
-        }))
     }
 }
 
@@ -2418,65 +2384,6 @@ impl HweScaler {
     }
 }
 
-fn standardize_block_with_mask_from_stats(
-    block: MatMut<'_, f64>,
-    presence_out: MatMut<'_, f64>,
-    freqs: &[f64],
-    scales: &[f64],
-    par: Par,
-) {
-    let filled = freqs.len();
-
-    debug_assert_eq!(filled, block.ncols());
-    debug_assert_eq!(filled, presence_out.ncols());
-    debug_assert_eq!(block.nrows(), presence_out.nrows());
-    debug_assert_eq!(filled, scales.len());
-
-    let mut block = block.subcols_mut(0, filled);
-    let mut presence_out = presence_out.subcols_mut(0, filled);
-
-    let apply_standardization =
-        |column: ColMut<'_, f64>, presence_col: ColMut<'_, f64>, mean: f64, inv: f64| {
-            let contiguous_values = column
-                .try_as_col_major_mut()
-                .expect("projection block column must be contiguous");
-            let contiguous_mask = presence_col
-                .try_as_col_major_mut()
-                .expect("projection mask column must be contiguous");
-            let values = contiguous_values.as_slice_mut();
-            let mask = contiguous_mask.as_slice_mut();
-            standardize_column_with_mask(values, mask, mean, inv);
-        };
-
-    let use_parallel = filled >= 32 && par.degree() > 1;
-
-    if use_parallel {
-        presence_out
-            .par_col_iter_mut()
-            .zip(block.par_col_iter_mut())
-            .enumerate()
-            .for_each(|(idx, (presence_col, column))| {
-                let freq = freqs[idx];
-                let scale = scales[idx];
-                let mean = 2.0 * freq;
-                let denom = scale.max(HWE_SCALE_FLOOR);
-                let inv = if denom > 0.0 { denom.recip() } else { 0.0 };
-                apply_standardization(column, presence_col, mean, inv);
-            });
-    } else {
-        for idx in 0..filled {
-            let presence_col = presence_out.rb_mut().col_mut(idx);
-            let column = block.rb_mut().col_mut(idx);
-            let freq = freqs[idx];
-            let scale = scales[idx];
-            let mean = 2.0 * freq;
-            let denom = scale.max(HWE_SCALE_FLOOR);
-            let inv = if denom > 0.0 { denom.recip() } else { 0.0 };
-            apply_standardization(column, presence_col, mean, inv);
-        }
-    }
-}
-
 fn standardize_block_impl(block: MatMut<'_, f64>, freqs: &[f64], scales: &[f64], par: Par) {
     let filled = freqs.len();
 
@@ -2894,182 +2801,6 @@ fn standardize_column_simd_impl_lanes4(values: &mut [f64], mean: f64, inv: f64) 
         } else {
             0.0
         };
-    }
-}
-
-#[inline(always)]
-fn standardize_column_with_mask(values: &mut [f64], mask: &mut [f64], mean: f64, inv: f64) {
-    debug_assert_eq!(values.len(), mask.len());
-
-    if inv == 0.0 {
-        for (value, mask_value) in values.iter_mut().zip(mask.iter_mut()) {
-            let raw = *value;
-            *mask_value = if raw.is_finite() { 1.0 } else { 0.0 };
-            *value = 0.0;
-        }
-        return;
-    }
-
-    standardize_column_with_mask_simd(values, mask, mean, inv);
-}
-
-#[inline(always)]
-fn standardize_column_with_mask_simd(values: &mut [f64], mask: &mut [f64], mean: f64, inv: f64) {
-    match detected_simd_lane_selection() {
-        #[cfg(any(
-            target_feature = "avx",
-            target_arch = "aarch64",
-            target_arch = "wasm32"
-        ))]
-        SimdLaneSelection::Lanes4 => {
-            standardize_column_with_mask_simd_lanes4(values, mask, mean, inv);
-        }
-        _ => standardize_column_with_mask_simd_impl_lanes2(values, mask, mean, inv),
-    }
-}
-
-#[cfg(any(
-    target_feature = "avx",
-    target_arch = "aarch64",
-    target_arch = "wasm32"
-))]
-#[inline(always)]
-fn standardize_column_with_mask_simd_lanes4(
-    values: &mut [f64],
-    mask: &mut [f64],
-    mean: f64,
-    inv: f64,
-) {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    // SAFETY: On x86 we only reach this branch when runtime detection selects
-    // the four-lane configuration, which implies AVX availability.
-    unsafe {
-        standardize_column_with_mask_simd_avx(values, mask, mean, inv);
-    }
-
-    #[cfg(all(
-        not(any(target_arch = "x86", target_arch = "x86_64")),
-        any(target_arch = "aarch64", target_arch = "wasm32")
-    ))]
-    {
-        standardize_column_with_mask_simd_impl_lanes4(values, mask, mean, inv);
-    }
-}
-
-#[cfg(any(
-    target_feature = "avx",
-    target_arch = "aarch64",
-    target_arch = "wasm32"
-))]
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[target_feature(enable = "avx")]
-/// # Safety
-/// The caller must ensure the CPU supports AVX instructions. All invocations
-/// are conditioned on runtime feature detection or target configurations that
-/// guarantee AVX availability.
-unsafe fn standardize_column_with_mask_simd_avx(
-    values: &mut [f64],
-    mask: &mut [f64],
-    mean: f64,
-    inv: f64,
-) {
-    standardize_column_with_mask_simd_impl_lanes4(values, mask, mean, inv);
-}
-
-#[inline(always)]
-fn standardize_column_with_mask_simd_impl_lanes2(
-    values: &mut [f64],
-    mask: &mut [f64],
-    mean: f64,
-    inv: f64,
-) {
-    let (value_chunks, value_remainder) = values.as_chunks_mut::<2>();
-    let (mask_chunks, mask_remainder) = mask.as_chunks_mut::<2>();
-
-    debug_assert_eq!(value_chunks.len(), mask_chunks.len());
-    debug_assert_eq!(value_remainder.len(), mask_remainder.len());
-
-    for (value_chunk, mask_chunk) in value_chunks.iter_mut().zip(mask_chunks.iter_mut()) {
-        let lane = Simd::<f64, 2>::from_array(*value_chunk);
-        let lane_values = lane.to_array();
-        let mut result = [0.0; 2];
-        let mut mask_values = [0.0; 2];
-        if lane_values[0].is_finite() {
-            result[0] = (lane_values[0] - mean) * inv;
-            mask_values[0] = 1.0;
-        }
-        if lane_values[1].is_finite() {
-            result[1] = (lane_values[1] - mean) * inv;
-            mask_values[1] = 1.0;
-        }
-        *value_chunk = result;
-        *mask_chunk = mask_values;
-    }
-
-    for (value, mask_value) in value_remainder.iter_mut().zip(mask_remainder.iter_mut()) {
-        let raw = *value;
-        if raw.is_finite() {
-            *mask_value = 1.0;
-            *value = (raw - mean) * inv;
-        } else {
-            *mask_value = 0.0;
-            *value = 0.0;
-        }
-    }
-}
-
-#[cfg(any(
-    target_feature = "avx",
-    target_arch = "aarch64",
-    target_arch = "wasm32"
-))]
-#[inline(always)]
-fn standardize_column_with_mask_simd_impl_lanes4(
-    values: &mut [f64],
-    mask: &mut [f64],
-    mean: f64,
-    inv: f64,
-) {
-    let (value_chunks, value_remainder) = values.as_chunks_mut::<4>();
-    let (mask_chunks, mask_remainder) = mask.as_chunks_mut::<4>();
-
-    debug_assert_eq!(value_chunks.len(), mask_chunks.len());
-    debug_assert_eq!(value_remainder.len(), mask_remainder.len());
-
-    for (value_chunk, mask_chunk) in value_chunks.iter_mut().zip(mask_chunks.iter_mut()) {
-        let lane = Simd::<f64, 4>::from_array(*value_chunk);
-        let lane_values = lane.to_array();
-        let mut result = [0.0; 4];
-        let mut mask_values = [0.0; 4];
-        if lane_values[0].is_finite() {
-            result[0] = (lane_values[0] - mean) * inv;
-            mask_values[0] = 1.0;
-        }
-        if lane_values[1].is_finite() {
-            result[1] = (lane_values[1] - mean) * inv;
-            mask_values[1] = 1.0;
-        }
-        if lane_values[2].is_finite() {
-            result[2] = (lane_values[2] - mean) * inv;
-            mask_values[2] = 1.0;
-        }
-        if lane_values[3].is_finite() {
-            result[3] = (lane_values[3] - mean) * inv;
-            mask_values[3] = 1.0;
-        }
-        *value_chunk = result;
-        *mask_chunk = mask_values;
-    }
-
-    for (value, mask_value) in value_remainder.iter_mut().zip(mask_remainder.iter_mut()) {
-        let raw = *value;
-        if raw.is_finite() {
-            *mask_value = 1.0;
-            *value = (raw - mean) * inv;
-        } else {
-            *mask_value = 0.0;
-            *value = 0.0;
-        }
     }
 }
 
@@ -3769,6 +3500,7 @@ impl HwePcaModel {
                     par,
                     CovarianceComputationMode::Partial,
                     target_components,
+                    options.max_passes,
                     gram_progress_handle.as_ref(),
                 );
 
@@ -4682,6 +4414,7 @@ fn compute_covariance_eigenpairs<S, P>(
     par: Par,
     mode: CovarianceComputationMode,
     top_k: usize,
+    max_passes: Option<usize>,
     progress: Option<&StageProgressHandle<P>>,
 ) -> Result<Eigenpairs, HwePcaError>
 where
@@ -4733,7 +4466,10 @@ where
     // Arnoldi does — spends the expensive resource (a genome traversal) to buy
     // the cheap one (a matrix-vector product). See `super::blocklanczos`.
     let requested = desired.min(upper_target).max(1);
-    let params = BlockKrylovParams::auto(requested, n, krylov_basis_budget_bytes());
+    let mut params = BlockKrylovParams::auto(requested, n, krylov_basis_budget_bytes());
+    if let Some(max_passes) = max_passes {
+        params.max_passes = max_passes.max(params.min_passes);
+    }
     let block_operator = StreamingBlockOperator {
         inner: operator,
         par,
@@ -5806,11 +5542,6 @@ where
     let n_samples = source.n_samples();
     let mut stats = VariantStatsCache::new(block_capacity, n_variants_hint);
     let mut block_storage = vec![0.0f64; n_samples * block_capacity];
-    let mut presence_storage = vec![0.0f64; n_samples * block_capacity];
-    let window_capacity = config.window_capacity().max(1);
-    let mut ring = LdRingBuffer::new(n_samples, window_capacity);
-    let mut weights: Vec<f64> = Vec::with_capacity(n_variants_hint.max(block_capacity));
-    let mut next_weight = 0usize;
 
     progress.on_stage_start(FitProgressStage::AlleleStatistics, n_variants_hint);
     let stats_progress =
@@ -5818,6 +5549,8 @@ where
 
     progress.on_stage_start(FitProgressStage::LdWeights, n_variants_hint);
     let ld_progress = StageProgressHandle::new(Arc::clone(progress), FitProgressStage::LdWeights);
+
+    let mut stream = LdWeightStream::new(n_samples, &config)?;
 
     source
         .reset()
@@ -5846,62 +5579,17 @@ where
             return Err(HwePcaError::InvalidInput(LD_RANGE_LIST_MISMATCH));
         }
 
-        let mut block = MatMut::from_column_major_slice_mut(
-            &mut block_storage[..n_samples * filled],
-            n_samples,
-            filled,
-        );
-        let mut presence = MatMut::from_column_major_slice_mut(
-            &mut presence_storage[..n_samples * filled],
+        let block = MatRef::from_column_major_slice(
+            &block_storage[..n_samples * filled],
             n_samples,
             filled,
         );
 
         let variant_range = processed..processed + filled;
-        stats.ensure_statistics(block.as_ref(), variant_range.clone(), par);
+        stats.ensure_statistics(block, variant_range.clone(), par);
 
         let freqs = &stats.frequencies[variant_range.clone()];
-        let scales = &stats.scales[variant_range.clone()];
-        standardize_block_with_mask_from_stats(
-            block.as_mut(),
-            presence.as_mut(),
-            freqs,
-            scales,
-            par,
-        );
-
-        weights.resize(processed + filled, 1.0);
-
-        for (local_idx, (column, present)) in block
-            .as_ref()
-            .col_iter()
-            .zip(presence.as_ref().col_iter())
-            .enumerate()
-        {
-            let slot = ring.push_slot();
-            {
-                let dst_col = ring.values_mut().col_mut(slot);
-                zip!(dst_col, column).for_each(|unzip!(dst, src)| {
-                    *dst = *src;
-                });
-            }
-            {
-                let mask_slice = ring.mask_slice_mut(slot);
-                for (dst, &src) in mask_slice.iter_mut().zip(present.iter()) {
-                    *dst = if src != 0.0 { 1u8 } else { 0u8 };
-                }
-            }
-            ring.indices_mut()[slot] = processed + local_idx;
-            assign_ready_weights(
-                &mut ring,
-                &mut weights,
-                &mut next_weight,
-                &config,
-                &ld_progress,
-                false,
-                par,
-            )?;
-        }
+        stream.push_block(block, freqs, &ld_progress, par)?;
 
         processed += filled;
 
@@ -5925,16 +5613,6 @@ where
         return Err(HwePcaError::InvalidInput(LD_RANGE_LIST_MISMATCH));
     }
 
-    assign_ready_weights(
-        &mut ring,
-        &mut weights,
-        &mut next_weight,
-        &config,
-        &ld_progress,
-        true,
-        par,
-    )?;
-
     if processed == 0 {
         stats_progress.finish();
         ld_progress.finish();
@@ -5942,6 +5620,8 @@ where
             "VariantBlockSource yielded no variants",
         ));
     }
+
+    let weights = stream.finish()?;
 
     if let Some((_, Some(total))) = source.progress_variants() {
         stats_progress.set_total(total);
@@ -5968,679 +5648,437 @@ where
     Ok((scaler, standardized_sums_sq, processed, weights))
 }
 
-struct LdRingBuffer {
-    values: Mat<f64>,
-    masks: Vec<u8>,
-    n_samples: usize,
-    indices: Vec<usize>,
-    start: usize,
-    len: usize,
+/// Variants are pushed into the LD stream this many at a time, so that the
+/// conversion, pairing and solving of a chunk each fan out across threads
+/// while the raw-code ring stays bounded by the pair span plus one chunk.
+const LD_PUSH_CHUNK: usize = 128;
+
+/// Everything the LD schedule knows about the variant list before a single
+/// genotype has been read, derived once from the chromosome-clipped windows.
+///
+/// The windows themselves say which markers each *centre* is solved from. What
+/// the streaming pass needs on top of that is the transpose of that relation:
+/// for each marker `k`, which earlier markers it must be paired with, and how
+/// long its raw codes and its pair statistics have to be kept. Those are
+/// precomputed here, so the pass itself never searches a ring for an index.
+struct LdPairSchedule {
+    ranges: Arc<[LdWindowRange]>,
+    /// `pair_start[k]..k` are the earlier markers some window pairs `k` with:
+    /// the leftmost start among the windows that contain `k`.
+    pair_start: Vec<usize>,
+    /// Suffix minimum of `pair_start`, indexed `0..=n`: when marker `k` is
+    /// about to be paired, no marker below `data_retain_from[k]` is needed by
+    /// `k` or by anything after it.
+    data_retain_from: Vec<usize>,
+    /// Suffix minimum of the window starts, indexed `0..=n`: while `c` is the
+    /// next centre to solve, no pair row below `rows_retain_from[c]` is needed
+    /// by `c` or by any later centre.
+    rows_retain_from: Vec<usize>,
 }
 
-impl LdRingBuffer {
-    fn new(n_samples: usize, capacity: usize) -> Self {
-        Self {
-            values: Mat::zeros(n_samples, capacity),
-            masks: vec![0u8; n_samples * capacity],
-            n_samples,
-            indices: vec![usize::MAX; capacity],
-            start: 0,
-            len: 0,
+impl LdPairSchedule {
+    fn new(config: &LdResolvedConfig) -> Result<Self, HwePcaError> {
+        let ranges = Arc::clone(config.ranges());
+        let n = ranges.len();
+
+        for (centre, range) in ranges.iter().enumerate() {
+            if range.end <= range.start || range.start > centre || centre >= range.end {
+                return Err(HwePcaError::InvalidInput(
+                    "LD window does not contain its own centre",
+                ));
+            }
+            if range.end > n {
+                return Err(HwePcaError::InvalidInput(
+                    "LD window extends past the end of the variant list",
+                ));
+            }
         }
-    }
 
-    fn capacity(&self) -> usize {
-        self.indices.len()
-    }
+        // Both range builders emit starts and ends that never decrease along
+        // the stream, which makes the leftmost window containing `k` the first
+        // one whose end is past `k`. The quadratic sweep below it is the
+        // definition itself, kept for any range list that breaks that shape.
+        let monotone = ranges
+            .windows(2)
+            .all(|pair| pair[0].start <= pair[1].start && pair[0].end <= pair[1].end);
+        let mut pair_start = vec![usize::MAX; n];
+        if monotone {
+            let mut centre = 0usize;
+            for (k, slot) in pair_start.iter_mut().enumerate() {
+                while ranges[centre].end <= k {
+                    centre += 1;
+                }
+                *slot = ranges[centre].start;
+            }
+        } else {
+            for range in ranges.iter() {
+                for slot in &mut pair_start[range.start..range.end] {
+                    *slot = (*slot).min(range.start);
+                }
+            }
+        }
 
-    fn n_samples(&self) -> usize {
-        self.n_samples
+        let mut data_retain_from = vec![n; n + 1];
+        for k in (0..n).rev() {
+            data_retain_from[k] = pair_start[k].min(data_retain_from[k + 1]);
+        }
+        let mut rows_retain_from = vec![n; n + 1];
+        for centre in (0..n).rev() {
+            rows_retain_from[centre] = ranges[centre].start.min(rows_retain_from[centre + 1]);
+        }
+
+        Ok(Self {
+            ranges,
+            pair_start,
+            data_retain_from,
+            rows_retain_from,
+        })
     }
 
     fn len(&self) -> usize {
-        self.len
+        self.ranges.len()
     }
 
-    fn values_mut(&mut self) -> MatMut<'_, f64> {
-        self.values.as_mut()
+    /// The markers centre `c` is solved from, as stream positions.
+    fn window(&self, centre: usize) -> Range<usize> {
+        self.ranges[centre].start..self.ranges[centre].end
     }
 
-    fn mask_slice(&self, slot: usize) -> &[u8] {
-        let start = slot * self.n_samples;
-        &self.masks[start..start + self.n_samples]
+    /// The earlier markers `k` is paired with when it arrives.
+    fn partners(&self, k: usize) -> Range<usize> {
+        self.pair_start[k]..k
     }
 
-    fn mask_slice_mut(&mut self, slot: usize) -> &mut [u8] {
-        let start = slot * self.n_samples;
-        &mut self.masks[start..start + self.n_samples]
+    fn data_retain_from(&self, k: usize) -> usize {
+        self.data_retain_from[k]
     }
 
-    fn indices_mut(&mut self) -> &mut [usize] {
-        &mut self.indices
+    fn rows_retain_from(&self, centre: usize) -> usize {
+        self.rows_retain_from[centre]
     }
 
-    fn push_slot(&mut self) -> usize {
-        let capacity = self.capacity();
-        if capacity == 0 {
-            return 0;
-        }
-
-        if self.len < capacity {
-            let slot = (self.start + self.len) % capacity;
-            self.len += 1;
-            slot
-        } else {
-            let slot = self.start;
-            self.start = (self.start + 1) % capacity;
-            slot
-        }
-    }
-
-    fn position_of(&self, index: usize) -> Option<usize> {
-        let capacity = self.capacity();
-        if capacity == 0 {
-            return None;
-        }
-        for offset in 0..self.len {
-            let slot = (self.start + offset) % capacity;
-            if self.indices[slot] == index {
-                return Some(offset);
-            }
-        }
-        None
-    }
-
-    /// The highest stream index the ring holds, i.e. the most recent push.
+    /// One past the last centre, from `next` on, whose every marker has
+    /// arrived once `newest` is the highest stream index pushed.
     ///
-    /// This is what tells the schedule whether a window's right flank has
-    /// arrived, so it is read off the buffer rather than tracked beside it —
-    /// a counter that drifted from the buffer would put the readiness test back
-    /// where it started.
-    fn newest_index(&self) -> Option<usize> {
-        if self.len == 0 {
-            return None;
+    /// A centre waits until its right flank exists; sizing the window against
+    /// whatever happened to have arrived is what once let a 51-site request
+    /// collapse to three markers. The ranges are clipped to the chromosome, so
+    /// the end of the stream needs no special case: the last window ends at
+    /// the last marker.
+    fn ready_end(&self, next: usize, newest: usize) -> usize {
+        let mut centre = next;
+        while centre < self.ranges.len() && self.ranges[centre].end <= newest + 1 {
+            centre += 1;
         }
-        Some(self.indices[self.slot_at(self.len - 1)])
+        centre
+    }
+}
+
+/// One variant's genotypes in the form the pair kernels consume.
+enum LdVariantCodes {
+    /// A slot between uses; never paired.
+    Empty,
+    /// Hard calls as three bitplanes over samples.
+    HardCall(LdBitplanes),
+    /// Anything that is not exactly `0`, `1`, `2` or missing — imputed
+    /// dosages, typically. Values are zero where missing and shifted by the
+    /// variant's mean, which the correlation cannot see and the floating-point
+    /// sums can.
+    Dosage { values: Vec<f64>, present: Vec<u8> },
+}
+
+/// Bit `s` of each plane describes sample `s`: observed at all, observed as a
+/// heterozygote, observed as an alternate homozygote. `het` and `alt` are
+/// disjoint and both lie inside `present`, so the genotype is `het + 2·alt`.
+#[derive(Default)]
+struct LdBitplanes {
+    present: Vec<u64>,
+    het: Vec<u64>,
+    alt: Vec<u64>,
+}
+
+impl LdBitplanes {
+    /// Packs a raw genotype column. Returns `false`, with the planes
+    /// unspecified, the moment a finite value other than `0`, `1` or `2` is
+    /// seen; non-finite values are missing, as they are everywhere in the fit.
+    fn fill(&mut self, column: &[f64]) -> bool {
+        let words = column.len().div_ceil(64);
+        self.present.clear();
+        self.present.resize(words, 0);
+        self.het.clear();
+        self.het.resize(words, 0);
+        self.alt.clear();
+        self.alt.resize(words, 0);
+
+        for (word, chunk) in column.chunks(64).enumerate() {
+            let mut present = 0u64;
+            let mut het = 0u64;
+            let mut alt = 0u64;
+            let mut other = false;
+            for (bit, &value) in chunk.iter().enumerate() {
+                let zero = value == 0.0;
+                let one = value == 1.0;
+                let two = value == 2.0;
+                other |= value.is_finite() & !(zero | one | two);
+                present |= ((zero | one | two) as u64) << bit;
+                het |= (one as u64) << bit;
+                alt |= (two as u64) << bit;
+            }
+            if other {
+                return false;
+            }
+            self.present[word] = present;
+            self.het[word] = het;
+            self.alt[word] = alt;
+        }
+        true
     }
 
-    fn slot_at(&self, offset: usize) -> usize {
-        let capacity = self.capacity();
-        if capacity == 0 {
-            0
-        } else {
-            (self.start + offset) % capacity
+    /// Unpacks to the dosage representation, for pairing against a variant
+    /// that has one.
+    fn expand(&self, n_samples: usize) -> (Vec<f64>, Vec<u8>) {
+        let mut values = vec![0.0f64; n_samples];
+        let mut present = vec![0u8; n_samples];
+        for sample in 0..n_samples {
+            let word = sample / 64;
+            let bit = sample % 64;
+            let observed = (self.present[word] >> bit) & 1;
+            let genotype = ((self.het[word] >> bit) & 1) + 2 * ((self.alt[word] >> bit) & 1);
+            present[sample] = observed as u8;
+            values[sample] = (observed * genotype) as f64;
         }
+        (values, present)
     }
+}
 
-    fn truncate_front(&mut self, keep_from: usize) {
-        let capacity = self.capacity();
-        if capacity == 0 {
+impl LdVariantCodes {
+    /// Re-encodes `column` in place, reusing whichever buffers the slot held.
+    fn fill(&mut self, column: &[f64], mean: f64) {
+        let mut planes = match std::mem::replace(self, LdVariantCodes::Empty) {
+            LdVariantCodes::HardCall(planes) => planes,
+            LdVariantCodes::Dosage { .. } | LdVariantCodes::Empty => LdBitplanes::default(),
+        };
+        if planes.fill(column) {
+            *self = LdVariantCodes::HardCall(planes);
             return;
         }
-        while self.len > 0 {
-            let slot = self.start;
-            if self.indices[slot] < keep_from {
-                self.indices[slot] = usize::MAX;
-                self.start = (self.start + 1) % capacity;
-                self.len -= 1;
+
+        let mut values = Vec::with_capacity(column.len());
+        let mut present = Vec::with_capacity(column.len());
+        for &value in column {
+            if value.is_finite() {
+                values.push(value - mean);
+                present.push(1u8);
             } else {
-                break;
+                values.push(0.0);
+                present.push(0u8);
             }
         }
-    }
-
-    fn window<'a>(
-        &'a self,
-        start: usize,
-        len: usize,
-        scratch: &'a mut LdWindowScratch,
-    ) -> LdWindowView<'a> {
-        assert!(start + len <= self.len);
-        let capacity = self.capacity();
-        if capacity == 0 || len == 0 {
-            return LdWindowView {
-                values: scratch.values.as_ref().submatrix(0, 0, self.n_samples, 0),
-                masks: &[],
-            };
-        }
-
-        let start_slot = self.slot_at(start);
-        let contiguous = start_slot + len <= capacity;
-
-        if contiguous {
-            let mask_start = start_slot * self.n_samples;
-            return LdWindowView {
-                values: self
-                    .values
-                    .as_ref()
-                    .submatrix(0, start_slot, self.n_samples, len),
-                masks: &self.masks[mask_start..mask_start + self.n_samples * len],
-            };
-        }
-
-        let mut dst_values = scratch
-            .values
-            .as_mut()
-            .submatrix_mut(0, 0, self.n_samples, len);
-        let dst_masks = &mut scratch.masks[..self.n_samples * len];
-
-        for offset in 0..len {
-            let slot = self.slot_at(start + offset);
-            {
-                let src = self.values.as_ref().col(slot);
-                let dst = dst_values.rb_mut().col_mut(offset);
-                zip!(dst, src).for_each(|unzip!(dst, src)| {
-                    *dst = *src;
-                });
-            }
-            {
-                let src = self.mask_slice(slot);
-                let dst = &mut dst_masks[offset * self.n_samples..(offset + 1) * self.n_samples];
-                dst.copy_from_slice(src);
-            }
-        }
-
-        let values_view = scratch.values.as_ref().submatrix(0, 0, self.n_samples, len);
-
-        LdWindowView {
-            values: values_view,
-            masks: &scratch.masks[..self.n_samples * len],
-        }
+        *self = LdVariantCodes::Dosage { values, present };
     }
 }
 
-struct LdWindowView<'a> {
-    values: MatRef<'a, f64>,
-    masks: &'a [u8],
+/// Complete-pairs statistics of one ordered pair `(i, j)`: every sum runs over
+/// exactly the samples where both markers are observed.
+#[derive(Clone, Copy, Debug, Default)]
+struct LdPairStats {
+    count: f64,
+    sum_i: f64,
+    sum_j: f64,
+    sq_i: f64,
+    sq_j: f64,
+    cross: f64,
 }
 
-struct LdWindowScratch {
-    values: Mat<f64>,
-    masks: Vec<u8>,
+/// The pairs of one marker `i` with every earlier marker it is paired with:
+/// `stats[t]` is the pair `(i, first_partner + t)`.
+struct LdPairRow {
+    first_partner: usize,
+    stats: Vec<LdPairStats>,
 }
 
-struct LdThreadScratch {
-    window: LdWindowScratch,
-    mask_f64: Mat<f64>,
-    /// Elementwise squares of the window's standardized genotypes, so the
-    /// pair-restricted sums of squares are one GEMM against the mask.
-    values_sq: Mat<f64>,
-    gram: Mat<f64>,
-    counts: Mat<f64>,
-    sums: Mat<f64>,
-    squared_sums: Mat<f64>,
-    system: Mat<f64>,
-    rhs: Mat<f64>,
-}
-
-impl LdThreadScratch {
-    fn new(n_samples: usize, window_capacity: usize) -> Self {
-        Self {
-            window: LdWindowScratch {
-                values: Mat::zeros(n_samples, window_capacity),
-                masks: vec![0u8; n_samples * window_capacity],
-            },
-            mask_f64: Mat::zeros(n_samples, window_capacity),
-            values_sq: Mat::zeros(n_samples, window_capacity),
-            gram: Mat::zeros(window_capacity, window_capacity),
-            counts: Mat::zeros(window_capacity, window_capacity),
-            sums: Mat::zeros(window_capacity, window_capacity),
-            squared_sums: Mat::zeros(window_capacity, window_capacity),
-            system: Mat::zeros(window_capacity, window_capacity),
-            rhs: Mat::zeros(window_capacity, 1),
-        }
-    }
-}
-
-#[cfg(test)]
-fn compute_ld_weights<S, P>(
-    source: &mut S,
-    scaler: &HweScaler,
-    observed_variants: usize,
-    block_capacity: usize,
-    config: LdResolvedConfig,
-    n_variants_hint: usize,
-    progress: &Arc<P>,
-    par: Par,
-) -> Result<LdWeights, HwePcaError>
-where
-    S: VariantBlockSource + Send,
-    S::Error: Error + Send + Sync + 'static,
-    P: FitProgressObserver + Send + Sync + 'static,
-{
-    let mut weights = vec![1.0; observed_variants];
-    progress.on_stage_start(FitProgressStage::LdWeights, observed_variants);
-    let stage_progress =
-        StageProgressHandle::new(Arc::clone(progress), FitProgressStage::LdWeights);
-
-    if observed_variants == 0 {
-        stage_progress.finish();
-        return Ok(LdWeights {
-            weights,
-            window: config.window_capacity().max(1),
-            bp_window: config.bp_window(),
-            ridge: config.ridge,
-        });
-    }
-
-    let n_samples = source.n_samples();
-    let mut block_storage = vec![0.0f64; n_samples * block_capacity];
-    let mut presence_storage = vec![0.0f64; n_samples * block_capacity];
-    let window_capacity = config.window_capacity().max(1);
-    let mut ring = LdRingBuffer::new(n_samples, window_capacity);
-    let mut next_weight = 0usize;
-
-    source
-        .reset()
-        .map_err(|err| HwePcaError::Source(Box::new(err)))?;
-
-    let mut processed = 0usize;
-    loop {
-        let filled = source
-            .next_block_into(block_capacity, &mut block_storage[..])
-            .map_err(|err| HwePcaError::Source(Box::new(err)))?;
-
-        if filled == 0 {
-            break;
-        }
-
-        if n_variants_hint > 0 && processed + filled > n_variants_hint {
-            return Err(HwePcaError::InvalidInput(
-                "VariantBlockSource returned more variants than reported hint",
-            ));
-        }
-
-        let mut block = MatMut::from_column_major_slice_mut(
-            &mut block_storage[..n_samples * filled],
-            n_samples,
-            filled,
-        );
-        let mut presence = MatMut::from_column_major_slice_mut(
-            &mut presence_storage[..n_samples * filled],
-            n_samples,
-            filled,
-        );
-
-        let variant_range = processed..processed + filled;
-        let freqs = &scaler.allele_frequencies()[variant_range.clone()];
-        let scales = &scaler.variant_scales()[variant_range.clone()];
-        standardize_block_with_mask_from_stats(
-            block.as_mut(),
-            presence.as_mut(),
-            freqs,
-            scales,
-            par,
-        );
-
-        for (local_idx, (column, present)) in block
-            .as_ref()
-            .col_iter()
-            .zip(presence.as_ref().col_iter())
-            .enumerate()
-        {
-            let slot = ring.push_slot();
-            {
-                let dst_col = ring.values_mut().col_mut(slot);
-                zip!(dst_col, column).for_each(|unzip!(dst, src)| {
-                    *dst = *src;
-                });
-            }
-            {
-                let mask_slice = ring.mask_slice_mut(slot);
-                for (dst, &src) in mask_slice.iter_mut().zip(present.iter()) {
-                    *dst = if src != 0.0 { 1u8 } else { 0u8 };
-                }
-            }
-            ring.indices_mut()[slot] = processed + local_idx;
-            assign_ready_weights(
-                &mut ring,
-                &mut weights,
-                &mut next_weight,
-                &config,
-                &stage_progress,
-                false,
-                par,
-            )?;
-        }
-
-        processed += filled;
-    }
-
-    if processed != config.range_count() {
-        return Err(HwePcaError::InvalidInput(LD_RANGE_LIST_MISMATCH));
-    }
-
-    assign_ready_weights(
-        &mut ring,
-        &mut weights,
-        &mut next_weight,
-        &config,
-        &stage_progress,
-        true,
-        par,
-    )?;
-
-    stage_progress.set_total(observed_variants);
-    stage_progress.finish();
-
-    Ok(LdWeights {
-        weights,
-        window: config.window_capacity().max(1),
-        bp_window: config.bp_window(),
-        ridge: config.ridge,
-    })
-}
-
-#[derive(Clone, Copy)]
-struct LdWeightJob {
-    start_offset: usize,
-    window_len: usize,
-    center: usize,
-    keep_from: usize,
-}
-
-/// Solves every window the stream has now completed and slides the ring past
-/// the markers none of them can need again.
+/// Complete-pairs statistics of two hard-call markers, from bit counts.
 ///
-/// `stream_ended` is set only by the flush after the source is exhausted. Until
-/// then a centre whose right flank has not arrived simply waits: it is the
-/// caller's job to keep pushing, and the ring is bounded by the window width
-/// regardless of how long that takes.
-fn assign_ready_weights<P: FitProgressObserver>(
-    ring: &mut LdRingBuffer,
-    weights: &mut [f64],
-    next_weight: &mut usize,
-    config: &LdResolvedConfig,
-    progress: &StageProgressHandle<P>,
-    stream_ended: bool,
-    par: Par,
-) -> Result<(), HwePcaError> {
-    let window_capacity = config.window_capacity().max(1);
+/// Restricting to the shared samples is one `AND` with the joint presence
+/// mask, after which every sum is a population count: the genotype is
+/// `het + 2·alt`, so its sum is `|het| + 2|alt|`, its sum of squares
+/// `|het| + 4|alt|`, and the cross-product breaks into the four het/alt
+/// intersections. All of it is exact integer arithmetic.
+fn hard_call_pair_stats(i: &LdBitplanes, j: &LdBitplanes) -> LdPairStats {
+    let mut shared = 0u64;
+    let mut het_i = 0u64;
+    let mut alt_i = 0u64;
+    let mut het_j = 0u64;
+    let mut alt_j = 0u64;
+    let mut het_het = 0u64;
+    let mut het_alt = 0u64;
+    let mut alt_alt = 0u64;
 
-    while *next_weight < weights.len() {
-        if ring.len() == 0 {
-            break;
-        }
-
-        let jobs = collect_ready_jobs(ring, *next_weight, config, stream_ended)?;
-        if jobs.is_empty() {
-            break;
-        }
-
-        let start_idx = *next_weight;
-        let end_idx = start_idx + jobs.len();
-        {
-            let ring_ref: &LdRingBuffer = &*ring;
-            let weight_slice = &mut weights[start_idx..end_idx];
-            const PROGRESS_BATCH: usize = 64;
-            weight_slice
-                .par_chunks_mut(PROGRESS_BATCH)
-                .zip_eq(jobs.par_chunks(PROGRESS_BATCH))
-                .map_init(
-                    || LdThreadScratch::new(ring_ref.n_samples(), window_capacity),
-                    |scratch, (slots, jobs)| {
-                        for (slot, job) in slots.iter_mut().zip(jobs) {
-                            *slot = compute_ld_weight(
-                                ring_ref,
-                                job.start_offset,
-                                job.window_len,
-                                job.center,
-                                config.ridge,
-                                scratch,
-                                par,
-                            );
-                        }
-                        progress.increment(slots.len());
-                    },
-                )
-                .for_each(|_| {});
-        }
-
-        *next_weight = end_idx;
-        if let Some(last_keep) = jobs.last().map(|job| job.keep_from) {
-            ring.truncate_front(last_keep);
-        }
+    for (((((&pi, &pj), &hi), &ai), &hj), &aj) in i
+        .present
+        .iter()
+        .zip(&j.present)
+        .zip(&i.het)
+        .zip(&i.alt)
+        .zip(&j.het)
+        .zip(&j.alt)
+    {
+        let both = pi & pj;
+        let hi = hi & both;
+        let ai = ai & both;
+        let hj = hj & both;
+        let aj = aj & both;
+        shared += both.count_ones() as u64;
+        het_i += hi.count_ones() as u64;
+        alt_i += ai.count_ones() as u64;
+        het_j += hj.count_ones() as u64;
+        alt_j += aj.count_ones() as u64;
+        het_het += (hi & hj).count_ones() as u64;
+        // `hi & aj` lives on i's het bits and `ai & hj` on i's alt bits, which
+        // are disjoint, so one count covers both mixed terms.
+        het_alt += ((hi & aj) | (ai & hj)).count_ones() as u64;
+        alt_alt += (ai & aj).count_ones() as u64;
     }
 
-    Ok(())
-}
-
-/// LD weight for the window's centre variant, on the **complete-pairs**
-/// convention: every statistic feeding a pair `(i, j)` is restricted to the
-/// samples where `i` and `j` are *both* observed.
-///
-/// Missing standardized genotypes are exactly zero, which is what makes this
-/// cheap. Writing `V` for the window's standardized values (zero where missing)
-/// and `M` for its 0/1 presence mask, every quantity the correlation needs is a
-/// GEMM whose sum silently drops the samples the pair does not share:
-///
-/// ```text
-/// gram[(i, j)]         = (VᵀV)[i, j]      = Σ_{s ∈ Aᵢ∩Aⱼ} vᵢ(s)·vⱼ(s)
-/// counts[(i, j)]       = (MᵀM)[i, j]      = |Aᵢ ∩ Aⱼ|
-/// sums[(i, j)]         = (VᵀM)[i, j]      = Σ_{s ∈ Aᵢ∩Aⱼ} vᵢ(s)
-/// squared_sums[(i, j)] = ((V∘V)ᵀM)[i, j]  = Σ_{s ∈ Aᵢ∩Aⱼ} vᵢ(s)²
-/// ```
-///
-/// The last two used to be computed once per variant over *all* of that
-/// variant's own observations and then reused unchanged for every partner. For
-/// markers missing in the same samples that is the same number; for markers
-/// missing in *different* samples it is not, and the result was a Pearson
-/// correlation whose cross-product and count came from the intersection while
-/// its centring and scaling came from the union — neither the complete-pairs
-/// correlation nor the mean-imputed one, and biased toward zero in proportion
-/// to how much the two markers' missingness patterns disagree.
-fn compute_ld_weight(
-    ring: &LdRingBuffer,
-    start: usize,
-    window_len: usize,
-    center: usize,
-    ridge: f64,
-    scratch: &mut LdThreadScratch,
-    par: Par,
-) -> f64 {
-    let window = ring.window(start, window_len, &mut scratch.window);
-    let values = window.values;
-    let masks = window.masks;
-
-    let mut mask_mat = scratch
-        .mask_f64
-        .as_mut()
-        .submatrix_mut(0, 0, ring.n_samples(), window_len);
-    let mut values_sq =
-        scratch
-            .values_sq
-            .as_mut()
-            .submatrix_mut(0, 0, ring.n_samples(), window_len);
-    for col in 0..window_len {
-        let src = &masks[col * ring.n_samples()..(col + 1) * ring.n_samples()];
-        let dst = mask_mat.rb_mut().col_mut(col);
-        for (dst, &src_val) in dst.iter_mut().zip(src.iter()) {
-            *dst = src_val as f64;
-        }
-
-        let values_slice = values
-            .col(col)
-            .try_as_col_major()
-            .expect("LD window column must be contiguous")
-            .as_slice();
-        let dst = values_sq.rb_mut().col_mut(col);
-        for (dst, &src_val) in dst.iter_mut().zip(values_slice.iter()) {
-            *dst = src_val * src_val;
-        }
+    LdPairStats {
+        count: shared as f64,
+        sum_i: (het_i + 2 * alt_i) as f64,
+        sum_j: (het_j + 2 * alt_j) as f64,
+        sq_i: (het_i + 4 * alt_i) as f64,
+        sq_j: (het_j + 4 * alt_j) as f64,
+        cross: (het_het + 2 * het_alt + 4 * alt_alt) as f64,
     }
-    let mask_view = mask_mat.as_ref();
-    let values_sq_view = values_sq.as_ref();
-
-    let mut gram = scratch
-        .gram
-        .as_mut()
-        .submatrix_mut(0, 0, window_len, window_len);
-    gram.fill(0.0);
-    matmul(
-        gram.as_mut(),
-        Accum::Replace,
-        values.transpose(),
-        values,
-        1.0,
-        par,
-    );
-
-    let mut counts = scratch
-        .counts
-        .as_mut()
-        .submatrix_mut(0, 0, window_len, window_len);
-    counts.fill(0.0);
-    matmul(
-        counts.as_mut(),
-        Accum::Replace,
-        mask_view.transpose(),
-        mask_view,
-        1.0,
-        par,
-    );
-
-    let mut sums = scratch
-        .sums
-        .as_mut()
-        .submatrix_mut(0, 0, window_len, window_len);
-    sums.fill(0.0);
-    matmul(
-        sums.as_mut(),
-        Accum::Replace,
-        values.transpose(),
-        mask_view,
-        1.0,
-        par,
-    );
-
-    let mut squared_sums = scratch
-        .squared_sums
-        .as_mut()
-        .submatrix_mut(0, 0, window_len, window_len);
-    squared_sums.fill(0.0);
-    matmul(
-        squared_sums.as_mut(),
-        Accum::Replace,
-        values_sq_view.transpose(),
-        mask_view,
-        1.0,
-        par,
-    );
-
-    let mut system = scratch
-        .system
-        .as_mut()
-        .submatrix_mut(0, 0, window_len, window_len);
-    let mut rhs = scratch.rhs.as_mut().submatrix_mut(0, 0, window_len, 1);
-
-    solve_ld_window_from_stats(
-        gram.as_ref(),
-        sums.as_ref(),
-        squared_sums.as_ref(),
-        counts.as_ref(),
-        center,
-        ridge,
-        system.as_mut(),
-        rhs.as_mut(),
-    )
 }
 
-/// Collects the windows whose markers have all been streamed, in stream order,
-/// starting at `start_index`.
+/// Complete-pairs statistics of two dosage markers.
 ///
-/// Readiness is a statement about the *stream*, not about the buffer. The
-/// schedule used to size each window against `ring.len()` and solve every
-/// centre the instant it was pushed, so a window was whatever had arrived so
-/// far: with a 51-site request the ring settled at three markers and every
-/// weight came out of `[i−2, i−1, i]` with the centre pinned to the right edge.
-/// The requested window was never once realised — not at the head of the
-/// chromosome, where a truncated window is legitimate, but anywhere.
-///
-/// So a centre waits here until its last marker exists. `stream_ended` says no
-/// further variant will ever arrive, and it is the only reason to solve a
-/// window that is still short on the right; a chromosome boundary is already
-/// baked into the range itself.
-fn collect_ready_jobs(
-    ring: &LdRingBuffer,
-    start_index: usize,
-    config: &LdResolvedConfig,
-    stream_ended: bool,
-) -> Result<Vec<LdWeightJob>, HwePcaError> {
-    let mut jobs = Vec::new();
-    let Some(newest) = ring.newest_index() else {
-        return Ok(jobs);
+/// Missing values are exactly zero, so multiplying by the *other* marker's
+/// presence is what restricts each sum to the shared samples.
+fn dosage_pair_stats(
+    values_i: &[f64],
+    present_i: &[u8],
+    values_j: &[f64],
+    present_j: &[u8],
+) -> LdPairStats {
+    const LANES: usize = 4;
+    let (vi_chunks, vi_rest) = values_i.as_chunks::<LANES>();
+    let (vj_chunks, vj_rest) = values_j.as_chunks::<LANES>();
+    let (pi_chunks, pi_rest) = present_i.as_chunks::<LANES>();
+    let (pj_chunks, pj_rest) = present_j.as_chunks::<LANES>();
+
+    let mut count = Simd::<f64, LANES>::splat(0.0);
+    let mut sum_i = count;
+    let mut sum_j = count;
+    let mut sq_i = count;
+    let mut sq_j = count;
+    let mut cross = count;
+
+    for (((vi, vj), pi), pj) in vi_chunks
+        .iter()
+        .zip(vj_chunks)
+        .zip(pi_chunks)
+        .zip(pj_chunks)
+    {
+        let vi = Simd::from_array(*vi);
+        let vj = Simd::from_array(*vj);
+        let pi = Simd::<u8, LANES>::from_array(*pi).cast::<f64>();
+        let pj = Simd::<u8, LANES>::from_array(*pj).cast::<f64>();
+        count += pi * pj;
+        sum_i += vi * pj;
+        sum_j += vj * pi;
+        sq_i += vi * vi * pj;
+        sq_j += vj * vj * pi;
+        cross += vi * vj;
+    }
+
+    let mut stats = LdPairStats {
+        count: count.reduce_sum(),
+        sum_i: sum_i.reduce_sum(),
+        sum_j: sum_j.reduce_sum(),
+        sq_i: sq_i.reduce_sum(),
+        sq_j: sq_j.reduce_sum(),
+        cross: cross.reduce_sum(),
     };
 
-    let mut next = start_index;
-    loop {
-        // A centre that has not been pushed yet is where this run of the
-        // schedule stops; it is also the bound that keeps `jobs` from running
-        // past the weights vector when `stream_ended` extends windows to the
-        // right of everything that exists.
-        let Some(center_slot) = ring.position_of(next) else {
-            break;
-        };
-
-        let Some(range) = config.window_range(next, newest, stream_ended)? else {
-            break;
-        };
-
-        // Residency follows from the capacity argument on
-        // `LdResolvedConfig::window_capacity`, so reaching either branch below
-        // means that argument is broken. Checking it costs a walk of at most
-        // `window_capacity` slots and converts a silent window over the wrong
-        // markers into a stopped fit.
-        let (Some(start_slot), Some(end_slot)) = (
-            ring.position_of(range.start),
-            ring.position_of(range.end - 1),
-        ) else {
-            return Err(HwePcaError::InvalidInput(
-                "LD ring buffer no longer holds a marker its window needs",
-            ));
-        };
-
-        let span = range.end - 1 - range.start;
-        if end_slot.checked_sub(start_slot) != Some(span)
-            || center_slot < start_slot
-            || center_slot > end_slot
-        {
-            return Err(HwePcaError::InvalidInput(
-                "LD ring buffer does not hold this window as one contiguous run",
-            ));
-        }
-
-        jobs.push(LdWeightJob {
-            start_offset: start_slot,
-            window_len: span + 1,
-            center: center_slot - start_slot,
-            keep_from: range.start,
-        });
-        next += 1;
+    for (((&vi, &vj), &pi), &pj) in vi_rest.iter().zip(vj_rest).zip(pi_rest).zip(pj_rest) {
+        let pi = pi as f64;
+        let pj = pj as f64;
+        stats.count += pi * pj;
+        stats.sum_i += vi * pj;
+        stats.sum_j += vj * pi;
+        stats.sq_i += vi * vi * pj;
+        stats.sq_j += vj * vj * pi;
+        stats.cross += vi * vj;
     }
 
-    Ok(jobs)
+    stats
 }
 
-/// Solves the ridge-regularized LD system for one window's centre variant.
-///
-/// Every argument is on the complete-pairs convention established by
-/// [`compute_ld_weight`], and the recentring below is only valid on it:
-/// `counts[(i, j)]` is the number of samples where `i` and `j` are both
-/// observed, and `sums`/`squared_sums` are *asymmetric* — row `i`, column `j`
-/// holds variant `i`'s statistic over exactly that shared set. Passing
-/// whole-variant sums here instead would recentre an intersection cross-product
-/// by union-scale moments.
-fn solve_ld_window_from_stats(
-    gram: MatRef<'_, f64>,
-    sums: MatRef<'_, f64>,
-    squared_sums: MatRef<'_, f64>,
-    counts: MatRef<'_, f64>,
-    center: usize,
-    ridge: f64,
+fn ld_pair_stats(i: &LdVariantCodes, j: &LdVariantCodes, n_samples: usize) -> LdPairStats {
+    match (i, j) {
+        (LdVariantCodes::HardCall(i), LdVariantCodes::HardCall(j)) => hard_call_pair_stats(i, j),
+        (
+            LdVariantCodes::Dosage {
+                values: values_i,
+                present: present_i,
+            },
+            LdVariantCodes::Dosage {
+                values: values_j,
+                present: present_j,
+            },
+        ) => dosage_pair_stats(values_i, present_i, values_j, present_j),
+        (LdVariantCodes::HardCall(i), LdVariantCodes::Dosage { values, present }) => {
+            let (values_i, present_i) = i.expand(n_samples);
+            dosage_pair_stats(&values_i, &present_i, values, present)
+        }
+        (LdVariantCodes::Dosage { values, present }, LdVariantCodes::HardCall(j)) => {
+            let (values_j, present_j) = j.expand(n_samples);
+            dosage_pair_stats(values, present, &values_j, &present_j)
+        }
+        (LdVariantCodes::Empty, _) | (_, LdVariantCodes::Empty) => {
+            unreachable!("LD pair statistics requested for a variant slot that was never filled")
+        }
+    }
+}
+
+/// The unbiased squared-correlation estimate one pair contributes to its
+/// windows' systems, on the complete-pairs convention.
+fn ld_pair_r2_estimate(stats: &LdPairStats) -> f64 {
+    let count = stats.count;
+    if !(count.is_finite() && count > 2.0) {
+        return 0.0;
+    }
+
+    let cov = stats.cross - (stats.sum_i * stats.sum_j) / count;
+    let var_i = stats.sq_i - (stats.sum_i * stats.sum_i) / count;
+    let var_j = stats.sq_j - (stats.sum_j * stats.sum_j) / count;
+
+    if !cov.is_finite() || !var_i.is_finite() || !var_j.is_finite() {
+        return 0.0;
+    }
+    if var_i <= 0.0 || var_j <= 0.0 {
+        return 0.0;
+    }
+
+    let corr = (cov / (var_i * var_j).sqrt()).clamp(-1.0, 1.0);
+    if !corr.is_finite() {
+        return 0.0;
+    }
+
+    let numerator = (count - 1.0) * corr * corr - 1.0;
+    let denominator = count - 2.0;
+    (numerator / denominator).max(0.0).min(1.0)
+}
+
+/// Solves the ridge-regularized LD system whose off-diagonal entries are
+/// already in `system`, for the centre's weight.
+fn solve_ld_system(
     mut system: MatMut<'_, f64>,
     mut rhs: MatMut<'_, f64>,
+    center: usize,
+    ridge: f64,
 ) -> f64 {
-    let size = gram.nrows();
+    let size = system.nrows();
     if size == 0 || center >= size {
         return 1.0;
     }
@@ -6649,49 +6087,6 @@ fn solve_ld_window_from_stats(
     for attempt in 0..2 {
         for i in 0..size {
             system[(i, i)] = 1.0 + adjusted_ridge;
-            for j in 0..i {
-                let count = counts[(i, j)];
-                let value = if count.is_finite() && count >= 2.0 {
-                    // Row-major reading of the asymmetric statistics: `(i, j)`
-                    // is variant `i` over the shared samples, `(j, i)` is
-                    // variant `j` over the same shared samples.
-                    let sum_i = sums[(i, j)];
-                    let sum_j = sums[(j, i)];
-                    let cov = gram[(i, j)] - (sum_i * sum_j) / count;
-                    let var_i = squared_sums[(i, j)] - (sum_i * sum_i) / count;
-                    let var_j = squared_sums[(j, i)] - (sum_j * sum_j) / count;
-
-                    if !cov.is_finite() || !var_i.is_finite() || !var_j.is_finite() {
-                        0.0
-                    } else if var_i <= 0.0 || var_j <= 0.0 {
-                        0.0
-                    } else {
-                        let corr = (cov / (var_i * var_j).sqrt()).clamp(-1.0, 1.0);
-                        if !corr.is_finite() {
-                            0.0
-                        } else if count <= 2.0 {
-                            0.0
-                        } else {
-                            let corr_sq = corr * corr;
-                            let numerator = (count - 1.0) * corr_sq - 1.0;
-                            let denominator = count - 2.0;
-                            if denominator <= 0.0 {
-                                0.0
-                            } else {
-                                let estimate = numerator / denominator;
-                                estimate.max(0.0).min(1.0)
-                            }
-                        }
-                    }
-                } else {
-                    0.0
-                };
-                system[(i, j)] = value;
-                system[(j, i)] = value;
-            }
-        }
-
-        for i in 0..size {
             rhs[(i, 0)] = 1.0;
         }
 
@@ -6716,6 +6111,324 @@ fn solve_ld_window_from_stats(
     }
 
     1.0
+}
+
+/// The streaming LD-weight pass.
+///
+/// Every pair of markers that any window brings together has its
+/// complete-pairs statistics computed exactly once, when the later of the two
+/// arrives, and a centre's system is then assembled from those cached pairs
+/// instead of from a fresh traversal of the cohort. The previous design
+/// recomputed four `n × w × w` products per centre — the same pairs, `w` times
+/// over, against every sample — and at 220k samples that was the whole cost of
+/// the fit.
+struct LdWeightStream {
+    n_samples: usize,
+    schedule: LdPairSchedule,
+    ridge: f64,
+    /// Raw codes of the markers some later marker still pairs with;
+    /// `ring[0]` is marker `ring_base`, and the ring covers `ring_base..pushed`.
+    ring: VecDeque<LdVariantCodes>,
+    ring_base: usize,
+    /// Slots evicted from the ring, kept so their buffers are reused.
+    pool: Vec<LdVariantCodes>,
+    /// Pair rows of the markers some unsolved window still covers; `rows[0]`
+    /// is marker `rows_base`, and the rows cover `rows_base..pushed`.
+    rows: VecDeque<LdPairRow>,
+    rows_base: usize,
+    weights: Vec<f64>,
+    next_weight: usize,
+    pushed: usize,
+}
+
+impl LdWeightStream {
+    fn new(n_samples: usize, config: &LdResolvedConfig) -> Result<Self, HwePcaError> {
+        let schedule = LdPairSchedule::new(config)?;
+        let n_variants = schedule.len();
+        Ok(Self {
+            n_samples,
+            schedule,
+            ridge: config.ridge,
+            ring: VecDeque::new(),
+            ring_base: 0,
+            pool: Vec::new(),
+            rows: VecDeque::new(),
+            rows_base: 0,
+            weights: vec![1.0; n_variants],
+            next_weight: 0,
+            pushed: 0,
+        })
+    }
+
+    /// Streams the next `block.ncols()` raw genotype columns, whose allele
+    /// frequencies are `freqs`, and solves every centre they complete.
+    fn push_block<P: FitProgressObserver>(
+        &mut self,
+        block: MatRef<'_, f64>,
+        freqs: &[f64],
+        progress: &StageProgressHandle<P>,
+        par: Par,
+    ) -> Result<(), HwePcaError> {
+        let filled = block.ncols();
+        debug_assert_eq!(block.nrows(), self.n_samples);
+        debug_assert_eq!(freqs.len(), filled);
+        if self.pushed + filled > self.schedule.len() {
+            return Err(HwePcaError::InvalidInput(LD_RANGE_LIST_MISMATCH));
+        }
+        let parallel = par.degree() > 1;
+
+        let mut chunk_start = 0usize;
+        while chunk_start < filled {
+            let chunk_end = (chunk_start + LD_PUSH_CHUNK).min(filled);
+            let first = self.pushed;
+            let last = first + (chunk_end - chunk_start);
+
+            self.evict_ring(self.schedule.data_retain_from(first));
+
+            let mut entries: Vec<LdVariantCodes> = (chunk_start..chunk_end)
+                .map(|_| self.pool.pop().unwrap_or(LdVariantCodes::Empty))
+                .collect();
+            let columns: Vec<&[f64]> = (chunk_start..chunk_end)
+                .map(|col| {
+                    block
+                        .col(col)
+                        .try_as_col_major()
+                        .expect("LD block column must be contiguous")
+                        .as_slice()
+                })
+                .collect();
+            let means = &freqs[chunk_start..chunk_end];
+            let encode = |(entry, (column, &freq)): (&mut LdVariantCodes, (&&[f64], &f64))| {
+                entry.fill(column, 2.0 * freq);
+            };
+            if parallel {
+                entries
+                    .par_iter_mut()
+                    .zip(columns.par_iter().zip(means.par_iter()))
+                    .for_each(encode);
+            } else {
+                entries
+                    .iter_mut()
+                    .zip(columns.iter().zip(means.iter()))
+                    .for_each(encode);
+            }
+            self.ring.extend(entries);
+
+            let ring = &self.ring;
+            let ring_base = self.ring_base;
+            let schedule = &self.schedule;
+            let n_samples = self.n_samples;
+            let pair_row = |k: usize| {
+                let partners = schedule.partners(k);
+                let codes = &ring[k - ring_base];
+                let stats = partners
+                    .clone()
+                    .map(|j| ld_pair_stats(codes, &ring[j - ring_base], n_samples))
+                    .collect();
+                LdPairRow {
+                    first_partner: partners.start,
+                    stats,
+                }
+            };
+            let rows: Vec<LdPairRow> = if parallel {
+                (first..last).into_par_iter().map(pair_row).collect()
+            } else {
+                (first..last).map(pair_row).collect()
+            };
+            self.rows.extend(rows);
+            self.pushed = last;
+
+            self.solve_ready(progress, parallel)?;
+            chunk_start = chunk_end;
+        }
+
+        Ok(())
+    }
+
+    fn evict_ring(&mut self, keep_from: usize) {
+        debug_assert!(keep_from >= self.ring_base);
+        debug_assert!(keep_from <= self.pushed);
+        while self.ring_base < keep_from {
+            match self.ring.pop_front() {
+                Some(entry) => self.pool.push(entry),
+                None => break,
+            }
+            self.ring_base += 1;
+        }
+    }
+
+    fn evict_rows(&mut self, keep_from: usize) {
+        debug_assert!(keep_from >= self.rows_base);
+        while self.rows_base < keep_from && self.rows.pop_front().is_some() {
+            self.rows_base += 1;
+        }
+    }
+
+    /// Solves every centre whose window is now complete.
+    fn solve_ready<P: FitProgressObserver>(
+        &mut self,
+        progress: &StageProgressHandle<P>,
+        parallel: bool,
+    ) -> Result<(), HwePcaError> {
+        let Some(newest) = self.pushed.checked_sub(1) else {
+            return Ok(());
+        };
+        let next = self.next_weight;
+        let ready_end = self.schedule.ready_end(next, newest);
+        if ready_end <= next {
+            return Ok(());
+        }
+
+        let schedule = &self.schedule;
+        let rows = &self.rows;
+        let rows_base = self.rows_base;
+        let ridge = self.ridge;
+        let solve_centre = |centre: usize| -> Result<f64, HwePcaError> {
+            let window = schedule.window(centre);
+            let size = window.len();
+            let mut system = Mat::<f64>::zeros(size, size);
+            let mut rhs = Mat::<f64>::zeros(size, 1);
+            for i in 0..size {
+                let marker_i = window.start + i;
+                let row = marker_i
+                    .checked_sub(rows_base)
+                    .and_then(|offset| rows.get(offset))
+                    .ok_or(HwePcaError::InvalidInput(
+                        "LD pair cache no longer holds a marker its window needs",
+                    ))?;
+                for j in 0..i {
+                    let marker_j = window.start + j;
+                    let stats = marker_j
+                        .checked_sub(row.first_partner)
+                        .and_then(|offset| row.stats.get(offset))
+                        .ok_or(HwePcaError::InvalidInput(
+                            "LD pair cache holds no statistics for a pair its window needs",
+                        ))?;
+                    let value = ld_pair_r2_estimate(stats);
+                    system[(i, j)] = value;
+                    system[(j, i)] = value;
+                }
+            }
+            Ok(solve_ld_system(
+                system.as_mut(),
+                rhs.as_mut(),
+                centre - window.start,
+                ridge,
+            ))
+        };
+
+        let solved: Vec<f64> = if parallel {
+            (next..ready_end)
+                .into_par_iter()
+                .map(solve_centre)
+                .collect::<Result<Vec<f64>, HwePcaError>>()?
+        } else {
+            (next..ready_end)
+                .map(solve_centre)
+                .collect::<Result<Vec<f64>, HwePcaError>>()?
+        };
+        self.weights[next..ready_end].copy_from_slice(&solved);
+        progress.increment(solved.len());
+        self.next_weight = ready_end;
+
+        self.evict_rows(self.schedule.rows_retain_from(ready_end));
+        Ok(())
+    }
+
+    /// Hands back the weights once the stream has delivered every marker the
+    /// schedule was cut for.
+    fn finish(self) -> Result<Vec<f64>, HwePcaError> {
+        if self.pushed != self.schedule.len() || self.next_weight != self.schedule.len() {
+            return Err(HwePcaError::InvalidInput(LD_RANGE_LIST_MISMATCH));
+        }
+        Ok(self.weights)
+    }
+}
+
+#[cfg(test)]
+fn compute_ld_weights<S, P>(
+    source: &mut S,
+    scaler: &HweScaler,
+    observed_variants: usize,
+    block_capacity: usize,
+    config: LdResolvedConfig,
+    n_variants_hint: usize,
+    progress: &Arc<P>,
+    par: Par,
+) -> Result<LdWeights, HwePcaError>
+where
+    S: VariantBlockSource + Send,
+    S::Error: Error + Send + Sync + 'static,
+    P: FitProgressObserver + Send + Sync + 'static,
+{
+    progress.on_stage_start(FitProgressStage::LdWeights, observed_variants);
+    let stage_progress =
+        StageProgressHandle::new(Arc::clone(progress), FitProgressStage::LdWeights);
+
+    if observed_variants == 0 {
+        stage_progress.finish();
+        return Ok(LdWeights {
+            weights: Vec::new(),
+            window: config.window_capacity().max(1),
+            bp_window: config.bp_window(),
+            ridge: config.ridge,
+        });
+    }
+
+    let n_samples = source.n_samples();
+    let mut block_storage = vec![0.0f64; n_samples * block_capacity];
+    let mut stream = LdWeightStream::new(n_samples, &config)?;
+
+    source
+        .reset()
+        .map_err(|err| HwePcaError::Source(Box::new(err)))?;
+
+    let mut processed = 0usize;
+    loop {
+        let filled = source
+            .next_block_into(block_capacity, &mut block_storage[..])
+            .map_err(|err| HwePcaError::Source(Box::new(err)))?;
+
+        if filled == 0 {
+            break;
+        }
+
+        if n_variants_hint > 0 && processed + filled > n_variants_hint {
+            return Err(HwePcaError::InvalidInput(
+                "VariantBlockSource returned more variants than reported hint",
+            ));
+        }
+        if processed + filled > config.range_count() {
+            return Err(HwePcaError::InvalidInput(LD_RANGE_LIST_MISMATCH));
+        }
+
+        let block = MatRef::from_column_major_slice(
+            &block_storage[..n_samples * filled],
+            n_samples,
+            filled,
+        );
+        let variant_range = processed..processed + filled;
+        let freqs = &scaler.allele_frequencies()[variant_range];
+        stream.push_block(block, freqs, &stage_progress, par)?;
+
+        processed += filled;
+    }
+
+    if processed != config.range_count() {
+        return Err(HwePcaError::InvalidInput(LD_RANGE_LIST_MISMATCH));
+    }
+
+    let weights = stream.finish()?;
+
+    stage_progress.set_total(observed_variants);
+    stage_progress.finish();
+
+    Ok(LdWeights {
+        weights,
+        window: config.window_capacity().max(1),
+        bp_window: config.bp_window(),
+        ridge: config.ridge,
+    })
 }
 
 fn compute_component_weighted_norms_sq(
@@ -7294,6 +7007,15 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
 
+    /// Naive complete-pairs LD weights for every variant of a raw genotype
+    /// matrix, straight from the definition.
+    ///
+    /// Shares nothing with the streaming pass: it standardizes the whole matrix
+    /// up front, takes each window from the config's ranges, gathers every
+    /// pair's jointly observed samples by hand and solves the dense system. It
+    /// keeps only the production solve's fallback — a tenfold ridge on a failed
+    /// factorization, then a unit weight — so that a window the production
+    /// path cannot factor is compared on the same footing.
     fn compute_reference_ld_weights(
         data: &[f64],
         n_samples: usize,
@@ -7302,76 +7024,34 @@ mod tests {
     ) -> Result<Vec<f64>, HwePcaError> {
         let observed_variants = data.len() / n_samples;
         assert_eq!(observed_variants * n_samples, data.len());
+        assert_eq!(config.range_count(), observed_variants);
 
-        let mut standardized = data.to_vec();
-        let mut mask = vec![0.0f64; data.len()];
-        {
-            let mut block = MatMut::from_column_major_slice_mut(
-                &mut standardized,
-                n_samples,
-                observed_variants,
-            );
-            let mut mask_mat =
-                MatMut::from_column_major_slice_mut(&mut mask, n_samples, observed_variants);
-            let freqs = &scaler.allele_frequencies()[0..observed_variants];
-            let scales = &scaler.variant_scales()[0..observed_variants];
-            standardize_block_with_mask_from_stats(
-                block.as_mut(),
-                mask_mat.as_mut(),
-                freqs,
-                scales,
-                Par::Seq,
-            );
-        }
-
-        let capacity = config.window_capacity().max(1);
-        let mut weights = vec![1.0; observed_variants];
-        let mut ring = LdRingBuffer::new(n_samples, capacity);
-        let mut next_weight = 0usize;
-        let progress =
-            StageProgressHandle::new(Arc::new(NoopFitProgress), FitProgressStage::LdWeights);
-
-        let block =
-            MatMut::from_column_major_slice_mut(&mut standardized, n_samples, observed_variants);
-        let presence = MatMut::from_column_major_slice_mut(&mut mask, n_samples, observed_variants);
-
-        for idx in 0..observed_variants {
-            let column = block.as_ref().col(idx);
-            let present = presence.as_ref().col(idx);
-            let slot = ring.push_slot();
-            {
-                let dst_col = ring.values_mut().col_mut(slot);
-                zip!(dst_col, column).for_each(|unzip!(dst, src)| {
-                    *dst = *src;
-                });
-            }
-            {
-                let mask_slice = ring.mask_slice_mut(slot);
-                for (dst, &src) in mask_slice.iter_mut().zip(present.iter()) {
-                    *dst = if src != 0.0 { 1u8 } else { 0u8 };
+        let (standardized, observed) = standardize_with_mask(data, n_samples, scaler);
+        let mut weights = Vec::with_capacity(observed_variants);
+        for (centre, range) in config.ranges().iter().enumerate() {
+            let window: Vec<usize> = (range.start..range.end).collect();
+            let center = centre - range.start;
+            let mut ridge = config.ridge;
+            let mut weight = 1.0;
+            for _attempt in 0..2 {
+                let system =
+                    reference_complete_pairs_system(&standardized, &observed, &window, ridge);
+                let rhs = Mat::<f64>::from_fn(window.len(), 1, |_, _| 1.0);
+                match FaerLlt::new(system.as_ref(), Side::Lower) {
+                    Ok(factor) => {
+                        let weight_sq = factor.solve(rhs.as_ref())[(center, 0)];
+                        weight = if !weight_sq.is_finite() || weight_sq <= 0.0 {
+                            1.0
+                        } else {
+                            weight_sq.sqrt().max(MIN_LD_WEIGHT)
+                        };
+                        break;
+                    }
+                    Err(_) => ridge *= 10.0,
                 }
             }
-            ring.indices_mut()[slot] = idx;
-            assign_ready_weights(
-                &mut ring,
-                &mut weights,
-                &mut next_weight,
-                config,
-                &progress,
-                false,
-                Par::Seq,
-            )?;
+            weights.push(weight);
         }
-
-        assign_ready_weights(
-            &mut ring,
-            &mut weights,
-            &mut next_weight,
-            config,
-            &progress,
-            true,
-            Par::Seq,
-        )?;
 
         Ok(weights)
     }
@@ -7669,21 +7349,18 @@ mod tests {
         (values, observed)
     }
 
-    /// Independent complete-pairs LD weight for one window.
+    /// Independent complete-pairs LD system for one window.
     ///
-    /// Deliberately shares no code with `compute_ld_weight`: it gathers each
+    /// Deliberately shares no code with the streaming pass: it gathers each
     /// pair's jointly observed samples by hand and computes that pair's Pearson
-    /// correlation from those samples alone. `compute_reference_ld_weights`
-    /// above cannot serve here — it drives the very ring buffer and GEMMs under
-    /// test, so it agrees with whatever convention the production statistics
-    /// happen to use, including an inconsistent one.
-    fn reference_complete_pairs_weight(
+    /// correlation from those samples alone, so it agrees with the production
+    /// statistics only if they are the complete-pairs statistics.
+    fn reference_complete_pairs_system(
         standardized: &[Vec<f64>],
         observed: &[Vec<bool>],
         window: &[usize],
-        center: usize,
         ridge: f64,
-    ) -> f64 {
+    ) -> Mat<f64> {
         let size = window.len();
         let mut system = Mat::<f64>::zeros(size, size);
         for i in 0..size {
@@ -7724,8 +7401,20 @@ mod tests {
                 system[(j, i)] = value;
             }
         }
+        system
+    }
 
-        let rhs = Mat::<f64>::from_fn(size, 1, |_, _| 1.0);
+    /// Independent complete-pairs LD weight for one window; see
+    /// [`reference_complete_pairs_system`].
+    fn reference_complete_pairs_weight(
+        standardized: &[Vec<f64>],
+        observed: &[Vec<bool>],
+        window: &[usize],
+        center: usize,
+        ridge: f64,
+    ) -> f64 {
+        let system = reference_complete_pairs_system(standardized, observed, window, ridge);
+        let rhs = Mat::<f64>::from_fn(window.len(), 1, |_, _| 1.0);
         let factor = FaerLlt::new(system.as_ref(), Side::Lower)
             .expect("reference LD system must be positive definite");
         let solution = factor.solve(rhs.as_ref());
@@ -7906,49 +7595,33 @@ mod tests {
     }
 
     /// Replays the streaming schedule and records, for each variant, the stream
-    /// indices its window actually covered.
+    /// indices its window covers.
     ///
-    /// Drives the production ring buffer and the production
-    /// [`collect_ready_jobs`], so it measures the schedule rather than
-    /// restating it; only the GEMM solve is left out, because window *geometry*
-    /// is what these tests are about. Genotypes are therefore never written —
-    /// the schedule reads indices and nothing else.
+    /// Drives the production [`LdPairSchedule`] exactly as the streaming pass
+    /// does — one marker arrives per turn, and every centre the schedule then
+    /// declares ready is recorded — so it measures the schedule rather than
+    /// restating it. Genotypes are never involved, because window *geometry*
+    /// is what these tests are about.
     fn replay_ld_windows(config: &LdResolvedConfig, n_variants: usize) -> Vec<Vec<usize>> {
-        let capacity = config.window_capacity().max(1);
-        let mut ring = LdRingBuffer::new(1, capacity);
+        let schedule = LdPairSchedule::new(config).expect("schedule");
         let mut windows: Vec<Vec<usize>> = vec![Vec::new(); n_variants];
         let mut next = 0usize;
 
-        // One extra turn past the last variant is the flush the fit performs
-        // once its source is exhausted.
-        for idx in 0..=n_variants {
-            let stream_ended = idx == n_variants;
-            if !stream_ended {
-                let slot = ring.push_slot();
-                ring.indices_mut()[slot] = idx;
+        for newest in 0..n_variants {
+            let ready_end = schedule.ready_end(next, newest);
+            for centre in next..ready_end {
+                let window = schedule.window(centre);
+                assert!(
+                    window.contains(&centre),
+                    "the window solved for variant {centre} does not contain it"
+                );
+                assert!(
+                    window.end <= newest + 1,
+                    "variant {centre} was solved before its last marker arrived"
+                );
+                windows[centre] = window.collect();
             }
-
-            loop {
-                let jobs =
-                    collect_ready_jobs(&ring, next, config, stream_ended).expect("ready jobs");
-                if jobs.is_empty() {
-                    break;
-                }
-
-                for job in &jobs {
-                    assert_eq!(
-                        job.keep_from + job.center,
-                        next,
-                        "the job solved for variant {next} centres on a different variant"
-                    );
-                    windows[next] = (job.keep_from..job.keep_from + job.window_len).collect();
-                    next += 1;
-                }
-
-                if let Some(last) = jobs.last() {
-                    ring.truncate_front(last.keep_from);
-                }
-            }
+            next = ready_end;
         }
 
         assert_eq!(

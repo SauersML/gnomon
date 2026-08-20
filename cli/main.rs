@@ -142,6 +142,13 @@ struct FitArgs {
     #[arg(long)]
     allow_unconverged: bool,
 
+    /// Ceiling on eigensolver genome passes before the fit stops and reports
+    /// its convergence. Defaults to 32; a fit still short at that point is
+    /// better diagnosed (cluster at the requested boundary, too few markers)
+    /// than scanned further.
+    #[arg(long, alias = "max_passes", value_name = "N")]
+    max_passes: Option<NonZeroUsize>,
+
     /// Minimum observed minor allele frequency retained for PCA fitting
     #[arg(long = "maf", value_name = "MAF")]
     maf: Option<f64>,
@@ -787,6 +794,7 @@ fn run_map_fit(args: FitArgs) -> Result<(), Box<dyn std::error::Error>> {
         components: args.components,
         threads: args.threads.map(NonZeroUsize::get),
         allow_unconverged: args.allow_unconverged,
+        max_passes: args.max_passes.map(NonZeroUsize::get),
         maf,
         geno,
         mind,

@@ -50,6 +50,8 @@ pub enum MapCommand {
         /// Accept the solver's best available estimate at its bounded pass
         /// limit. Diagnostics still mark the resulting model unconverged.
         allow_unconverged: bool,
+        /// Ceiling on eigensolver genome passes; `None` takes the solver default.
+        max_passes: Option<usize>,
         maf: Option<f64>,
         /// Maximum observed missing-call fraction retained for fitting, using
         /// PLINK's `--geno` convention.
@@ -155,6 +157,7 @@ pub fn run(command: MapCommand) -> Result<(), MapDriverError> {
             components,
             threads,
             allow_unconverged,
+            max_passes,
             maf,
             geno,
             mind,
@@ -169,6 +172,7 @@ pub fn run(command: MapCommand) -> Result<(), MapDriverError> {
                     markers,
                     components,
                     allow_unconverged,
+                    max_passes,
                     maf,
                     geno,
                     mind,
@@ -207,6 +211,7 @@ struct FitRequest<'a> {
     markers: Option<usize>,
     components: usize,
     allow_unconverged: bool,
+    max_passes: Option<usize>,
     maf: Option<f64>,
     geno: Option<f64>,
     mind: Option<f64>,
@@ -222,6 +227,7 @@ fn run_fit(request: FitRequest<'_>) -> Result<(), MapDriverError> {
         markers,
         components,
         allow_unconverged,
+        max_passes,
         maf,
         geno,
         mind,
@@ -492,6 +498,7 @@ fn run_fit(request: FitRequest<'_>) -> Result<(), MapDriverError> {
 
     let mut fit_options = FitOptions {
         allow_unconverged,
+        max_passes,
         precomputed_variant_statistics,
         ..FitOptions::default()
     };
@@ -2139,6 +2146,7 @@ mod tests {
             components: 4,
             threads: Some(0),
             allow_unconverged: false,
+            max_passes: None,
             maf: None,
             geno: None,
             mind: None,
@@ -2163,6 +2171,7 @@ mod tests {
             components: 4,
             threads: None,
             allow_unconverged: false,
+            max_passes: None,
             maf: None,
             geno: Some(f64::NAN),
             mind: None,
@@ -2188,6 +2197,7 @@ mod tests {
             components: 4,
             threads: None,
             allow_unconverged: false,
+            max_passes: None,
             maf: None,
             geno: None,
             mind: Some(f64::INFINITY),

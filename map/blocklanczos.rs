@@ -197,6 +197,9 @@ pub struct BlockKrylovParams {
 }
 
 impl BlockKrylovParams {
+    /// Default ceiling on genome passes; see [`Self::auto`].
+    pub const DEFAULT_MAX_PASSES: usize = 32;
+
     /// Defaults derived from the request and the machine, not from constants
     /// baked in for someone else's cohort.
     ///
@@ -205,11 +208,19 @@ impl BlockKrylovParams {
     ///
     /// `max_passes` is a **pass economy, not a fallback**. Each pass is a whole
     /// traversal of a logical matrix that can run to terabytes, so a ceiling
-    /// generous enough to "eventually get there" buys a silent multi-hour run
-    /// instead of an answer. Eight passes is what a well-posed request costs
-    /// with this much oversampling; needing more is a diagnosis, not more
-    /// scanning. The three causes, in order of likelihood: the requested `k`
-    /// lands inside a near-degenerate cluster (see
+    /// generous enough to "eventually get there" buys a multi-hour run instead
+    /// of an answer — which is why the ceiling is reported pass by pass, and
+    /// why a fit that reaches it is refused rather than shipped. But the
+    /// ceiling has to cover the requests that *are* well posed. Eight passes
+    /// covers continental structure, whose leading eigenvalues stand clear of
+    /// the bulk; a within-population fit asking for sixteen components sits on
+    /// a spectrum that flattens into noise almost immediately, and its
+    /// residual shrinks by roughly a factor of two a pass. Observed on a
+    /// 222k-sample European panel: `1.6e-2` after eight passes, still falling.
+    /// Thirty-two reaches `1e-6` on that shape with margin; a request still
+    /// short at thirty-two is a diagnosis, not a case for more scanning. The
+    /// three causes, in order of likelihood: the requested `k` lands inside a
+    /// near-degenerate cluster (see
     /// [`BlockKrylovOutcome::truncation_splits_cluster`] and `boundary_gap` —
     /// ask for a different `k`, not for more passes); the block is too narrow
     /// for the spectrum's decay, so each pass buys too little (widen
@@ -221,7 +232,7 @@ impl BlockKrylovParams {
         Self {
             block_width,
             min_passes: 2,
-            max_passes: 8,
+            max_passes: Self::DEFAULT_MAX_PASSES,
             residual_tol: 1e-6,
             mev_tol: 1e-6,
             basis_budget_bytes,
