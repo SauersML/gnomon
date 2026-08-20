@@ -215,33 +215,35 @@ therefore close to free — but the reason is not that the GEMM is cheap.
 The local PLINK reader maps the `.bed` payload once, decodes selected variant
 columns in parallel, and applies HWE standardization during that decode. It does
 not turn an evenly spaced `--markers` selection into thousands of tiny `pread`
-calls or make a second memory pass over each decoded tile. A 512-variant
-streaming tile is the measured throughput/memory knee for this workload; the
-adaptive memory plan can still reduce it for larger cohorts.
+calls or make a second memory pass over each decoded tile. Allele moments are
+counted directly from the packed 2-bit hard calls, so the statistics stage does
+not inflate a 1.2 GB BED payload into 40 GB of temporary `f64` genotypes. A
+512-variant streaming tile is the measured throughput/memory knee for this
+workload; the adaptive memory plan can still reduce it for larger cohorts.
 
 The following runs used the same five-population PLINK1 microarray cohort, the
 same physical marker lists, four pinned AMD EPYC Milan cores, warm page cache,
-and four requested PCs. PLINK2 was v2.0.0-a.7.1LM and ran `--pca approx
-allele-wts 4 --threads 4`; gnomon ran `fit --components 4 --markers N`.
+and four requested PCs. PLINK2 was v2.0.0-a.7.4LM AVX2 AMD and ran `--pca
+approx allele-wts 4 --threads 4`; gnomon ran `fit --components 4 --markers N`.
 
 | samples × markers | gnomon wall | PLINK2 wall | gnomon peak RSS | PLINK2 peak RSS |
 | --- | ---: | ---: | ---: | ---: |
-| 250,000 × 2,000 | **5.34 s** | 10.91 s | **2.50 GB** | 6.12 GB |
-| 250,000 × 5,000 | **11.12 s** | 23.44 s | **2.78 GB** | 6.12 GB |
+| 250,000 × 10,000 | **16.76 s** | 25.10 s | **3.50 GB** | 6.05 GB |
+| 250,000 × 20,000 | **31.75 s** | 48.10 s | **3.50 GB** | 6.06 GB |
 
-That is a 51.1% wall-clock lead at 2,000 markers and 52.6% at 5,000, while using
-59% and 55% less peak memory respectively. The comparison is shape-matched:
+That is a 33.2% wall-clock lead at 10,000 markers and 34.0% at 20,000, while
+using 42% less peak memory in both runs. The comparison is shape-matched:
 PLINK2's `--extract` list contains exactly the variants selected by gnomon's
-deterministic stride, rather than giving either program an easier matrix.
+deterministic stride in the 10,000-marker run; the 20,000-marker run uses the
+complete dataset in both programs.
 
 Performance was not accepted as a substitute for the answer. Across the four
 structured axes, the canonical correlations between gnomon and PLINK2 scores
-were 1.000000; gnomon's leading-axis between-population variance shares were
-0.946, 0.945, 0.944, and 0.941 in the 2,000-marker run. The 5,000-marker run
-recovered all four expected axes with shares 0.977, 0.976, 0.976, and 0.975.
+were 1.000000 in the 20,000-marker run; gnomon's leading-axis
+between-population variance shares were 0.994, 0.994, 0.994, and 0.994.
 Changing the tile width from 2,048 to 1,024 to 512 produced bit-identical score
-artifacts, and the optimized 2,000-marker result was bit-identical to the
-pre-optimization result.
+artifacts, and direct packed-statistics counting produced model and score
+artifacts that were bit-identical to the decoded-statistics implementation.
 
 Four cores are deliberate for this matrix shape. The covariance products have
 few output columns and a 250,000-row reduction, so adding threads eventually

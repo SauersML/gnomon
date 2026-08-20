@@ -1765,6 +1765,78 @@ fn hard_call_code_table() -> &'static [[u8; 4]; 256] {
     })
 }
 
+fn hard_call_moment_table() -> &'static [[u8; 3]; 256] {
+    static TABLE: OnceLock<[[u8; 3]; 256]> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut table = [[0u8; 3]; 256];
+        for byte in 0u16..256 {
+            let mut ones = 0u8;
+            let mut twos = 0u8;
+            let mut calls = 0u8;
+            for offset in 0..4 {
+                match ((byte >> (offset * 2)) & 0b11) as u8 {
+                    0 => calls += 1,
+                    1 => {}
+                    2 => {
+                        ones += 1;
+                        calls += 1;
+                    }
+                    3 => {
+                        twos += 1;
+                        calls += 1;
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            table[byte as usize] = [ones, twos, calls];
+        }
+        table
+    })
+}
+
+fn packed_variant_moments(bytes: &[u8], n_samples: usize, swap: bool) -> (f64, f64, usize) {
+    debug_assert!(bytes.len() >= n_samples.div_ceil(4));
+
+    let full_bytes = n_samples / 4;
+    let table = hard_call_moment_table();
+    let mut ones = 0usize;
+    let mut twos = 0usize;
+    let mut calls = 0usize;
+    for &byte in &bytes[..full_bytes] {
+        let [byte_ones, byte_twos, byte_calls] = table[byte as usize];
+        ones += byte_ones as usize;
+        twos += byte_twos as usize;
+        calls += byte_calls as usize;
+    }
+
+    let tail = n_samples % 4;
+    if tail > 0 {
+        let byte = bytes[full_bytes];
+        for offset in 0..tail {
+            match (byte >> (offset * 2)) & 0b11 {
+                0 => calls += 1,
+                1 => {}
+                2 => {
+                    ones += 1;
+                    calls += 1;
+                }
+                3 => {
+                    twos += 1;
+                    calls += 1;
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    if swap {
+        twos = calls - ones - twos;
+    }
+    let sum = ones + 2 * twos;
+    let sum_sq = ones + 4 * twos;
+    (sum as f64, sum_sq as f64, calls)
+}
+
 struct DenseCacheBuilder {
     data: Vec<f64>,
     max_bytes: usize,
@@ -2096,6 +2168,20 @@ struct VariantStatsCache {
     write_pos: usize,
 }
 
+fn finalize_variant_moments(sum: f64, sum_sq: f64, calls: usize) -> (f64, f64, f64) {
+    if calls == 0 {
+        return (0.0, HWE_SCALE_FLOOR, 0.0);
+    }
+
+    let mean_genotype = sum / (calls as f64);
+    let allele_freq = (mean_genotype / 2.0).clamp(0.0, 1.0);
+    let variance = (2.0 * allele_freq * (1.0 - allele_freq)).max(HWE_VARIANCE_EPSILON);
+    let scale = variance.sqrt().max(HWE_SCALE_FLOOR);
+    let centered_sum_sq = (sum_sq - sum * mean_genotype).max(0.0);
+    let standardized_sum_sq = centered_sum_sq / (scale * scale);
+    (allele_freq, scale, standardized_sum_sq)
+}
+
 impl VariantStatsCache {
     fn new(block_capacity: usize, variant_capacity_hint: usize) -> Self {
         let frequencies = Vec::with_capacity(variant_capacity_hint);
@@ -2181,28 +2267,11 @@ impl VariantStatsCache {
             let sum = sums_slice[idx];
             let sum_sq = sums_sq_slice[idx];
             let calls = calls_slice[idx];
-            if calls == 0 {
-                freq_slice[idx] = 0.0;
-                scale_slice[idx] = HWE_SCALE_FLOOR;
-                standardized_sums_sq_slice[idx] = 0.0;
-
-                continue;
-            }
-
-            let mean_genotype = sum / (calls as f64);
-            let allele_freq = (mean_genotype / 2.0).clamp(0.0, 1.0);
-            let variance = (2.0 * allele_freq * (1.0 - allele_freq)).max(HWE_VARIANCE_EPSILON);
-            let derived_scale = variance.sqrt();
-
-            freq_slice[idx] = allele_freq;
-            scale_slice[idx] = if derived_scale < HWE_SCALE_FLOOR {
-                HWE_SCALE_FLOOR
-            } else {
-                derived_scale
-            };
-            let centered_sum_sq = (sum_sq - sum * mean_genotype).max(0.0);
-            let scale = scale_slice[idx];
-            standardized_sums_sq_slice[idx] = centered_sum_sq / (scale * scale);
+            let (frequency, scale, standardized_sum_sq) =
+                finalize_variant_moments(sum, sum_sq, calls);
+            freq_slice[idx] = frequency;
+            scale_slice[idx] = scale;
+            standardized_sums_sq_slice[idx] = standardized_sum_sq;
         }
 
         self.write_pos = end;
@@ -4930,12 +4999,61 @@ where
     P: FitProgressObserver + Send + Sync,
 {
     let n_samples = source.n_samples();
-    let mut stats = VariantStatsCache::new(block_capacity, n_variants_hint);
-    let mut block_storage = vec![0.0f64; n_samples * block_capacity];
 
     source
         .reset()
         .map_err(|err| HwePcaError::Source(Box::new(err)))?;
+
+    if let Some(packed) = source.hard_call_packed() {
+        let n_variants = packed.n_variants();
+        if n_variants == 0 {
+            progress.finish();
+            return Err(HwePcaError::InvalidInput(
+                "VariantBlockSource yielded no variants",
+            ));
+        }
+
+        let compute = |variant: usize| {
+            packed.slice(variant, 1).map(|bytes| {
+                packed_variant_moments(
+                    bytes,
+                    n_samples,
+                    packed.match_kind(variant) == MatchKind::Swap,
+                )
+            })
+        };
+        let moments: Option<Vec<_>> = if n_variants >= 32 && par.degree() > 1 {
+            (0..n_variants).into_par_iter().map(compute).collect()
+        } else {
+            (0..n_variants).map(compute).collect()
+        };
+        let moments = moments.ok_or(HwePcaError::InvalidInput(
+            "packed hard-call source contains an invalid variant selection",
+        ))?;
+
+        let mut frequencies = Vec::with_capacity(n_variants);
+        let mut scales = Vec::with_capacity(n_variants);
+        let mut standardized_sums_sq = Vec::with_capacity(n_variants);
+        for (sum, sum_sq, calls) in moments {
+            let (frequency, scale, standardized_sum_sq) =
+                finalize_variant_moments(sum, sum_sq, calls);
+            frequencies.push(frequency);
+            scales.push(scale);
+            standardized_sums_sq.push(standardized_sum_sq);
+        }
+
+        progress.set_total(n_variants);
+        progress.advance(n_variants);
+        progress.finish();
+        return Ok((
+            HweScaler::new(frequencies, scales),
+            standardized_sums_sq,
+            n_variants,
+        ));
+    }
+
+    let mut stats = VariantStatsCache::new(block_capacity, n_variants_hint);
+    let mut block_storage = vec![0.0f64; n_samples * block_capacity];
 
     let mut processed = 0usize;
     let mut used_source_progress = false;
@@ -4949,9 +5067,11 @@ where
             break;
         }
 
-        let end = processed.checked_add(filled).ok_or(HwePcaError::InvalidInput(
-            "variant count overflow during statistics computation",
-        ))?;
+        let end = processed
+            .checked_add(filled)
+            .ok_or(HwePcaError::InvalidInput(
+                "variant count overflow during statistics computation",
+            ))?;
 
         let block = MatMut::from_column_major_slice_mut(
             &mut block_storage[..n_samples * filled],
@@ -7715,6 +7835,33 @@ mod tests {
             .map(|(&sum_sq, &weight)| sum_sq * weight * weight)
             .sum();
         assert!((reused - expected).abs() <= 1.0e-12 * expected.abs().max(1.0));
+    }
+
+    #[test]
+    fn packed_hard_call_moments_match_decoded_values_for_every_tail() {
+        let values = [0.0, 1.0, 2.0, f64::NAN, 2.0, 0.0, f64::NAN, 1.0, 2.0];
+
+        for n_samples in 0..=values.len() {
+            let mut packed = vec![0u8; n_samples.div_ceil(4)];
+            assert!(pack_hard_calls_into(
+                &mut packed,
+                &values[..n_samples],
+                n_samples,
+            ));
+
+            for swap in [false, true] {
+                let expected: Vec<f64> = values[..n_samples]
+                    .iter()
+                    .copied()
+                    .filter(|value| value.is_finite())
+                    .map(|value| if swap { 2.0 - value } else { value })
+                    .collect();
+                let expected_sum = expected.iter().sum::<f64>();
+                let expected_sum_sq = expected.iter().map(|value| value * value).sum::<f64>();
+                let actual = packed_variant_moments(&packed, n_samples, swap);
+                assert_eq!(actual, (expected_sum, expected_sum_sq, expected.len()));
+            }
+        }
     }
 
     #[test]
