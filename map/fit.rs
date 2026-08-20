@@ -80,6 +80,13 @@ pub const DEFAULT_LD_WINDOW: usize = 51;
 const DEFAULT_LD_RIDGE: f64 = 1.0e-3;
 const MIN_LD_WEIGHT: f64 = 1.0e-6;
 
+/// Raised when the LD schedule and the stream disagree about what variant an
+/// index names. See [`LdResolvedConfig::range_count`] for what the two lists
+/// are and how a filter between them pulls them apart.
+const LD_RANGE_LIST_MISMATCH: &str =
+    "LD windows were computed from a different variant list than the fit streamed: the window \
+     ranges must be built from the retained, post-filter variants, in stream order";
+
 #[inline]
 fn select_top_k_desc(ordering: &mut [(usize, f64)], k: usize) -> usize {
     let mid = k.min(ordering.len());
@@ -298,6 +305,21 @@ fn covariance_computation_mode(
 pub struct FitOptions {
     pub ld: Option<LdConfig>,
     pub cache_source: bool,
+    /// Accept a fit whose eigensolver stopped short of its tolerance.
+    ///
+    /// The default refuses, and the default is the honest answer: an
+    /// unconverged subspace is not a slightly noisy PCA, it is a set of
+    /// components wrong by an amount nobody measured. Every score, loading and
+    /// ancestry call derived from it inherits that error, and the artifact is
+    /// otherwise indistinguishable from a finished one — which is precisely the
+    /// failure [`FitDiagnostics`] exists to document rather than to excuse.
+    ///
+    /// A caller who genuinely wants the best available estimate — an
+    /// exploratory run, a deliberately short pass budget — opts in here. That
+    /// changes only whether the fit is refused: the diagnostics travel onto the
+    /// model either way, so a best-effort artifact still records
+    /// `converged: false` for whoever reads it later.
+    pub allow_unconverged: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -322,8 +344,19 @@ pub struct LdWeights {
     pub ridge: f64,
 }
 
+/// One variant's LD window, as a half-open range of **stream positions**.
+///
+/// Both window kinds resolve to this: a base-pair span becomes the indices
+/// inside that span, a site count becomes the indices inside that count, and
+/// either way the range is clipped to the variant's own chromosome so that no
+/// window pairs the tail of one chromosome with the head of the next.
+///
+/// The indices are positions in the variant list the fit will stream, which is
+/// the whole content of the invariant documented on
+/// [`LdResolvedConfig::range_count`]: a range list computed against any other
+/// ordering weights the wrong markers while every index stays in bounds.
 #[derive(Clone, Debug)]
-struct LdBpWindowRange {
+struct LdWindowRange {
     start: usize,
     end: usize,
 }
@@ -332,10 +365,20 @@ struct LdBpWindowRange {
 enum LdResolvedWindow {
     Sites {
         size: usize,
+        /// One chromosome-clipped window per variant, when the caller supplied
+        /// positions to clip against.
+        ///
+        /// `None` is the no-positions case: the schedule then cuts windows out
+        /// of stream order alone and treats the whole stream as one contiguous
+        /// chromosome. That is why `map/main.rs` should attach `variant_keys`
+        /// to a site window as it already does to a base-pair one — without
+        /// them a window straddling a chromosome boundary is unpreventable,
+        /// because nothing in the stream says where the boundary is.
+        ranges: Option<Arc<[LdWindowRange]>>,
     },
     BasePairs {
         span_bp: u64,
-        ranges: Arc<[LdBpWindowRange]>,
+        ranges: Arc<[LdWindowRange]>,
         capacity: usize,
     },
 }
@@ -347,9 +390,16 @@ struct LdResolvedConfig {
 }
 
 impl LdResolvedConfig {
+    /// Ring-buffer size, and also the widest window the schedule can ask for.
+    ///
+    /// The two are the same number on purpose. A window is at most this many
+    /// markers wide and its last marker is always the newest push, so the
+    /// newest `window_capacity` markers the ring kept are exactly the ones any
+    /// ready window can name — the buffer is bounded by the window, not by the
+    /// genome, and nothing a window needs is ever evicted.
     fn window_capacity(&self) -> usize {
         match &self.window {
-            LdResolvedWindow::Sites { size } => *size,
+            LdResolvedWindow::Sites { size, .. } => *size,
             LdResolvedWindow::BasePairs { capacity, .. } => *capacity,
         }
     }
@@ -359,6 +409,95 @@ impl LdResolvedConfig {
             LdResolvedWindow::Sites { .. } => None,
             LdResolvedWindow::BasePairs { span_bp, .. } => Some(*span_bp),
         }
+    }
+
+    /// How many variants the precomputed windows were cut from, when they were
+    /// cut ahead of the stream at all.
+    ///
+    /// This is the checkable half of the index invariant. `ranges[i]` describes
+    /// variant `i` *of the stream*, so it is only about the right marker if
+    /// position `i` of the list the ranges came from is position `i` of the
+    /// stream. Anything that drops variants between the two breaks exactly
+    /// that — a MAF screen renumbers what it keeps `0, 1, 2, …` while the list
+    /// it was numbered against still counts the rejects — and it breaks it
+    /// silently, since every index stays in bounds and every weight stays
+    /// plausible. The counts diverge the moment one variant is dropped, which
+    /// makes them the cheap, total test for it.
+    ///
+    /// `None` means no precomputed ranges and therefore nothing to reconcile:
+    /// the schedule is cut from stream positions alone and cannot disagree with
+    /// them.
+    fn range_count(&self) -> Option<usize> {
+        match &self.window {
+            LdResolvedWindow::Sites { ranges, .. } => ranges.as_ref().map(|ranges| ranges.len()),
+            LdResolvedWindow::BasePairs { ranges, .. } => Some(ranges.len()),
+        }
+    }
+
+    /// The window centred on `next`, or `None` while the stream still owes it
+    /// markers.
+    ///
+    /// `newest` is the highest stream index the ring holds. A window is *ready*
+    /// only once its last marker has been streamed. Sizing it against whatever
+    /// the ring happened to hold instead is what let a 51-site request collapse
+    /// to three markers, and `stream_ended` is the single legitimate exception:
+    /// the file ran out and no further push will ever arrive. A chromosome
+    /// ending mid-stream needs no exception, because the ranges are already
+    /// clipped to it.
+    fn window_range(
+        &self,
+        next: usize,
+        newest: usize,
+        stream_ended: bool,
+    ) -> Result<Option<LdWindowRange>, HwePcaError> {
+        let (start, end) = match &self.window {
+            LdResolvedWindow::Sites {
+                ranges: Some(ranges),
+                ..
+            }
+            | LdResolvedWindow::BasePairs { ranges, .. } => {
+                let Some(range) = ranges.get(next) else {
+                    return Ok(None);
+                };
+                (range.start, range.end)
+            }
+            LdResolvedWindow::Sites {
+                size,
+                ranges: None,
+            } => {
+                // `size` is forced odd on every path the CLI can reach, so the
+                // two half-widths are equal and the window is centred. Keeping
+                // them separate is what makes an even `size` — reachable only
+                // from a caller that builds the config directly — stay `size`
+                // markers wide instead of silently becoming `size + 1`.
+                let size = *size;
+                let left = size / 2;
+                let right = size.saturating_sub(1) - left;
+                (
+                    next.saturating_sub(left),
+                    next.saturating_add(right).saturating_add(1),
+                )
+            }
+        };
+
+        if end <= start {
+            return Err(HwePcaError::InvalidInput(
+                "LD window resolved to an empty range",
+            ));
+        }
+
+        if end - 1 <= newest {
+            return Ok(Some(LdWindowRange { start, end }));
+        }
+
+        if !stream_ended || newest < start {
+            return Ok(None);
+        }
+
+        Ok(Some(LdWindowRange {
+            start,
+            end: newest + 1,
+        }))
     }
 }
 
@@ -404,7 +543,34 @@ impl FitOptions {
                         window = 1;
                     }
                 }
-                LdResolvedWindow::Sites { size: window }
+
+                // Positions turn a site count into the same explicit,
+                // chromosome-clipped range list the base-pair window already
+                // uses. Without them the count is all there is, and a window
+                // spanning a chromosome boundary cannot be prevented — stream
+                // order is the only structure available, and it says nothing
+                // about where one chromosome stops.
+                let ranges = match cfg.variant_keys.as_ref() {
+                    Some(keys) => {
+                        if keys.len() != observed_variants {
+                            return Err(HwePcaError::InvalidInput(
+                                "LD site window requires positions for all variants",
+                            ));
+                        }
+                        Some(compute_ld_site_ranges(keys, window))
+                    }
+                    None => {
+                        log::warn!(
+                            "LD site window has no variant positions: windows are cut from stream \
+                             order alone, so one may span a chromosome boundary"
+                        );
+                        None
+                    }
+                };
+                LdResolvedWindow::Sites {
+                    size: window,
+                    ranges,
+                }
             }
             LdWindow::BasePairs(span_bp) => {
                 let keys = cfg.variant_keys.as_ref().ok_or_else(|| {
@@ -773,10 +939,44 @@ where
     }
 }
 
+/// Cuts one chromosome-clipped window per variant from a site count.
+///
+/// `window` is the number of markers a window holds, and it is odd on every
+/// path the CLI can reach, so `left` and `right` below are the same half-width:
+/// variant `i` wants `[i − h, i + h]`. Clipping is to the *contiguous run* of
+/// records sharing a chromosome rather than to a global grouping, matching
+/// [`compute_ld_bp_ranges`] — a file that returns to a chromosome later gets
+/// windows within each run, and never a window that silently joins two runs
+/// separated by half the genome.
+fn compute_ld_site_ranges(keys: &[VariantKey], window: usize) -> Arc<[LdWindowRange]> {
+    let left = window / 2;
+    let right = window.saturating_sub(1) - left;
+
+    let mut ranges = Vec::with_capacity(keys.len());
+    let mut run_start = 0usize;
+    while run_start < keys.len() {
+        let mut run_end = run_start + 1;
+        while run_end < keys.len() && keys[run_end].chromosome == keys[run_start].chromosome {
+            run_end += 1;
+        }
+
+        for idx in run_start..run_end {
+            ranges.push(LdWindowRange {
+                start: idx.saturating_sub(left).max(run_start),
+                end: idx.saturating_add(right).saturating_add(1).min(run_end),
+            });
+        }
+
+        run_start = run_end;
+    }
+
+    ranges.into_boxed_slice().into()
+}
+
 fn compute_ld_bp_ranges(
     keys: &[VariantKey],
     span_bp: u64,
-) -> Result<(Arc<[LdBpWindowRange]>, usize), HwePcaError> {
+) -> Result<(Arc<[LdWindowRange]>, usize), HwePcaError> {
     if keys.is_empty() {
         return Err(HwePcaError::InvalidInput(
             "LD base-pair window requires at least one variant",
@@ -840,7 +1040,7 @@ fn compute_ld_bp_ranges(
         let end_idx = right.max(idx + 1);
         let width = end_idx - start_idx;
         capacity = capacity.max(width.max(1));
-        ranges.push(LdBpWindowRange {
+        ranges.push(LdWindowRange {
             start: start_idx,
             end: end_idx,
         });
@@ -2683,6 +2883,46 @@ impl FitDiagnostics {
     }
 }
 
+/// Gate between a solve's termination record and a model built on it.
+///
+/// `converged: false` means the components are the best estimate available and
+/// not a finished answer, and there is no way to tell from the artifact by how
+/// much they are wrong — so by default they do not become an artifact.
+/// `allow_unconverged` is the deliberate exception for a caller who wants the
+/// estimate anyway; it suppresses only the refusal, never the record, and the
+/// model it permits still reports `converged: false` in its diagnostics.
+///
+/// `None` diagnostics are not a refusal: they come from the degenerate exits
+/// that return no eigenpairs at all, which the caller rejects on its own terms.
+fn require_converged(
+    diagnostics: Option<&FitDiagnostics>,
+    allow_unconverged: bool,
+) -> Result<(), HwePcaError> {
+    let Some(diagnostics) = diagnostics else {
+        return Ok(());
+    };
+
+    if diagnostics.converged || allow_unconverged {
+        return Ok(());
+    }
+
+    // A route that did not measure a quantity says so rather than printing a
+    // zero, for the same reason `FitDiagnostics` stores it as `Option`.
+    let describe = |value: Option<f64>| {
+        value.map_or_else(|| String::from("unmeasured"), |value| format!("{value:.3e}"))
+    };
+
+    Err(HwePcaError::Eigen(format!(
+        "PCA eigensolver stopped after {} covariance passes without reaching its tolerance \
+         (worst relative Ritz residual {}, subspace change {}); refusing to build a model on an \
+         unconverged subspace. Set FitOptions::allow_unconverged to accept the best available \
+         estimate, which is recorded as unconverged in the model's fit diagnostics.",
+        diagnostics.passes,
+        describe(diagnostics.max_relative_residual),
+        describe(diagnostics.subspace_delta),
+    )))
+}
+
 #[derive(Clone, Debug)]
 pub struct HwePcaModel {
     n_samples: usize,
@@ -2981,6 +3221,14 @@ impl HwePcaModel {
                     .into(),
             ));
         }
+
+        // Refuse here, before the loadings pass: everything below is defined
+        // relative to a subspace the solver itself declined to certify, and
+        // refining it against the genotypes cannot recover what the solve did
+        // not find — it only spreads an unmeasured error into more numbers that
+        // look finished. Stopping now also saves the genome traversal those
+        // numbers would have cost.
+        require_converged(decomposition.diagnostics.as_ref(), options.allow_unconverged)?;
 
         // One last traversal of the genome, and every number the model stores is
         // derived from what that traversal saw.
@@ -3880,8 +4128,9 @@ where
     });
 
     if !outcome.converged {
-        // An unconverged subspace is reported as such rather than handed back
-        // as though it were a finished fit.
+        // Said once here where the numbers are, and enforced by
+        // `require_converged` where the fit is assembled: unless the caller
+        // opted in, this subspace does not become a model at all.
         eprintln!(
             "warning: PCA eigensolver stopped after {} covariance passes without reaching its \
              tolerance (worst relative Ritz residual {:.3e}, subspace change {:.3e}); the \
@@ -4831,6 +5080,12 @@ where
             ));
         }
 
+        if let Some(expected) = config.range_count()
+            && processed + filled > expected
+        {
+            return Err(HwePcaError::InvalidInput(LD_RANGE_LIST_MISMATCH));
+        }
+
         let mut block = MatMut::from_column_major_slice_mut(
             &mut block_storage[..n_samples * filled],
             n_samples,
@@ -4883,6 +5138,7 @@ where
                 &mut next_weight,
                 &config,
                 &ld_progress,
+                false,
                 par,
             )?;
         }
@@ -4905,12 +5161,19 @@ where
         }
     }
 
+    if let Some(expected) = config.range_count()
+        && processed != expected
+    {
+        return Err(HwePcaError::InvalidInput(LD_RANGE_LIST_MISMATCH));
+    }
+
     assign_ready_weights(
         &mut ring,
         &mut weights,
         &mut next_weight,
         &config,
         &ld_progress,
+        true,
         par,
     )?;
 
@@ -5027,6 +5290,19 @@ impl LdRingBuffer {
             }
         }
         None
+    }
+
+    /// The highest stream index the ring holds, i.e. the most recent push.
+    ///
+    /// This is what tells the schedule whether a window's right flank has
+    /// arrived, so it is read off the buffer rather than tracked beside it —
+    /// a counter that drifted from the buffer would put the readiness test back
+    /// where it started.
+    fn newest_index(&self) -> Option<usize> {
+        if self.len == 0 {
+            return None;
+        }
+        Some(self.indices[self.slot_at(self.len - 1)])
     }
 
     fn slot_at(&self, offset: usize) -> usize {
@@ -5264,11 +5540,18 @@ where
                 &mut next_weight,
                 &config,
                 &stage_progress,
+                false,
                 par,
             )?;
         }
 
         processed += filled;
+    }
+
+    if let Some(expected) = config.range_count()
+        && processed != expected
+    {
+        return Err(HwePcaError::InvalidInput(LD_RANGE_LIST_MISMATCH));
     }
 
     assign_ready_weights(
@@ -5277,6 +5560,7 @@ where
         &mut next_weight,
         &config,
         &stage_progress,
+        true,
         par,
     )?;
 
@@ -5299,12 +5583,20 @@ struct LdWeightJob {
     keep_from: usize,
 }
 
+/// Solves every window the stream has now completed and slides the ring past
+/// the markers none of them can need again.
+///
+/// `stream_ended` is set only by the flush after the source is exhausted. Until
+/// then a centre whose right flank has not arrived simply waits: it is the
+/// caller's job to keep pushing, and the ring is bounded by the window width
+/// regardless of how long that takes.
 fn assign_ready_weights<P: FitProgressObserver>(
     ring: &mut LdRingBuffer,
     weights: &mut [f64],
     next_weight: &mut usize,
     config: &LdResolvedConfig,
     progress: &StageProgressHandle<P>,
+    stream_ended: bool,
     par: Par,
 ) -> Result<(), HwePcaError> {
     let window_capacity = config.window_capacity().max(1);
@@ -5314,7 +5606,7 @@ fn assign_ready_weights<P: FitProgressObserver>(
             break;
         }
 
-        let jobs = collect_ready_jobs(ring, *next_weight, config, window_capacity)?;
+        let jobs = collect_ready_jobs(ring, *next_weight, config, stream_ended)?;
         if jobs.is_empty() {
             break;
         }
@@ -5494,76 +5786,75 @@ fn compute_ld_weight(
     )
 }
 
+/// Collects the windows whose markers have all been streamed, in stream order,
+/// starting at `start_index`.
+///
+/// Readiness is a statement about the *stream*, not about the buffer. The
+/// schedule used to size each window against `ring.len()` and solve every
+/// centre the instant it was pushed, so a window was whatever had arrived so
+/// far: with a 51-site request the ring settled at three markers and every
+/// weight came out of `[i−2, i−1, i]` with the centre pinned to the right edge.
+/// The requested window was never once realised — not at the head of the
+/// chromosome, where a truncated window is legitimate, but anywhere.
+///
+/// So a centre waits here until its last marker exists. `stream_ended` says no
+/// further variant will ever arrive, and it is the only reason to solve a
+/// window that is still short on the right; a chromosome boundary is already
+/// baked into the range itself.
 fn collect_ready_jobs(
     ring: &LdRingBuffer,
     start_index: usize,
     config: &LdResolvedConfig,
-    window_capacity: usize,
+    stream_ended: bool,
 ) -> Result<Vec<LdWeightJob>, HwePcaError> {
     let mut jobs = Vec::new();
+    let Some(newest) = ring.newest_index() else {
+        return Ok(jobs);
+    };
+
     let mut next = start_index;
-
     loop {
-        let Some(position) = ring.position_of(next) else {
+        // A centre that has not been pushed yet is where this run of the
+        // schedule stops; it is also the bound that keeps `jobs` from running
+        // past the weights vector when `stream_ended` extends windows to the
+        // right of everything that exists.
+        let Some(center_slot) = ring.position_of(next) else {
             break;
         };
 
-        let window_params = match &config.window {
-            LdResolvedWindow::Sites { size } => {
-                let window_size = (*size).max(1).min(window_capacity);
-                let available = ring.len();
-                let window_size = window_size.min(available).max(1);
-                let half_window = window_size / 2;
-                let start = if available <= window_size {
-                    0
-                } else if position <= half_window {
-                    0
-                } else {
-                    let tail_start = available.saturating_sub(window_size);
-                    min(position - half_window, tail_start)
-                };
-                let end = min(start + window_size, available);
-                let window_len = end - start;
-                if window_len == 0 {
-                    None
-                } else {
-                    let center = position - start;
-                    let keep_from = next.saturating_sub(window_size / 2);
-                    Some((start, window_len, center, keep_from))
-                }
-            }
-            LdResolvedWindow::BasePairs { ranges, .. } => {
-                let range = &ranges[next];
-                if range.end <= range.start {
-                    return Err(HwePcaError::InvalidInput(
-                        "LD base-pair window produced an empty range",
-                    ));
-                }
-                let last_index = range.end - 1;
-                match (ring.position_of(range.start), ring.position_of(last_index)) {
-                    (Some(start_offset), Some(end_offset)) => {
-                        let window_len = end_offset.saturating_sub(start_offset) + 1;
-                        if window_len == 0 {
-                            None
-                        } else {
-                            let center = position.saturating_sub(start_offset);
-                            Some((start_offset, window_len, center, range.start))
-                        }
-                    }
-                    _ => None,
-                }
-            }
-        };
-
-        let Some((start, window_len, center, keep_from)) = window_params else {
+        let Some(range) = config.window_range(next, newest, stream_ended)? else {
             break;
         };
+
+        // Residency follows from the capacity argument on
+        // `LdResolvedConfig::window_capacity`, so reaching either branch below
+        // means that argument is broken. Checking it costs a walk of at most
+        // `window_capacity` slots and converts a silent window over the wrong
+        // markers into a stopped fit.
+        let (Some(start_slot), Some(end_slot)) = (
+            ring.position_of(range.start),
+            ring.position_of(range.end - 1),
+        ) else {
+            return Err(HwePcaError::InvalidInput(
+                "LD ring buffer no longer holds a marker its window needs",
+            ));
+        };
+
+        let span = range.end - 1 - range.start;
+        if end_slot.checked_sub(start_slot) != Some(span)
+            || center_slot < start_slot
+            || center_slot > end_slot
+        {
+            return Err(HwePcaError::InvalidInput(
+                "LD ring buffer does not hold this window as one contiguous run",
+            ));
+        }
 
         jobs.push(LdWeightJob {
-            start_offset: start,
-            window_len,
-            center,
-            keep_from,
+            start_offset: start_slot,
+            window_len: span + 1,
+            center: center_slot - start_slot,
+            keep_from: range.start,
         });
         next += 1;
     }
@@ -6301,6 +6592,7 @@ mod tests {
                 &mut next_weight,
                 config,
                 &progress,
+                false,
                 Par::Seq,
             )?;
         }
@@ -6311,6 +6603,7 @@ mod tests {
             &mut next_weight,
             config,
             &progress,
+            true,
             Par::Seq,
         )?;
 
@@ -6355,7 +6648,10 @@ mod tests {
             DenseBlockSource::new(&data, n_samples, observed_variants).expect("dense source");
         let progress = Arc::new(NoopFitProgress);
         let config = LdResolvedConfig {
-            window: LdResolvedWindow::Sites { size: 3 },
+            window: LdResolvedWindow::Sites {
+                size: 3,
+                ranges: None,
+            },
             ridge: DEFAULT_LD_RIDGE,
         };
 
@@ -6462,7 +6758,10 @@ mod tests {
             DenseBlockSource::new(&data, n_samples, observed_variants).expect("dense source");
         let progress = Arc::new(NoopFitProgress);
         let config = LdResolvedConfig {
-            window: LdResolvedWindow::Sites { size: 17 },
+            window: LdResolvedWindow::Sites {
+                size: 17,
+                ranges: None,
+            },
             ridge: DEFAULT_LD_RIDGE,
         };
 
@@ -6654,10 +6953,12 @@ mod tests {
     /// produces.
     ///
     /// `windows[c]` is the set of variant indices that variant `c`'s weight is
-    /// solved from. Weights are assigned as soon as a variant's window is fully
-    /// buffered, so the leading variants are solved from truncated windows —
-    /// that is the production schedule, and pinning it here keeps this test
-    /// about the *statistics* rather than about the window geometry.
+    /// solved from. A window is clipped where the stream runs out — at the
+    /// start of the genome and, for the callers below, at its end — so the
+    /// leading variants are solved from short windows. That is the production
+    /// schedule, and pinning it here keeps this test about the *statistics*
+    /// rather than about the window geometry, which
+    /// `sites_window_reaches_its_full_width_mid_genome` covers on its own.
     fn assert_ld_weights_match_complete_pairs(
         data: &[f64],
         n_samples: usize,
@@ -6683,7 +6984,10 @@ mod tests {
         assert_eq!(observed_variants, n_variants);
 
         let config = LdResolvedConfig {
-            window: LdResolvedWindow::Sites { size: window_size },
+            window: LdResolvedWindow::Sites {
+                size: window_size,
+                ranges: None,
+            },
             ridge: DEFAULT_LD_RIDGE,
         };
         let progress = Arc::new(NoopFitProgress);
@@ -6810,6 +7114,257 @@ mod tests {
 
         assert_eq!((ranges[0].start, ranges[0].end), (0, 1));
         assert_eq!((ranges[1].start, ranges[1].end), (1, 2));
+    }
+
+    /// Replays the streaming schedule and records, for each variant, the stream
+    /// indices its window actually covered.
+    ///
+    /// Drives the production ring buffer and the production
+    /// [`collect_ready_jobs`], so it measures the schedule rather than
+    /// restating it; only the GEMM solve is left out, because window *geometry*
+    /// is what these tests are about. Genotypes are therefore never written —
+    /// the schedule reads indices and nothing else.
+    fn replay_ld_windows(config: &LdResolvedConfig, n_variants: usize) -> Vec<Vec<usize>> {
+        let capacity = config.window_capacity().max(1);
+        let mut ring = LdRingBuffer::new(1, capacity);
+        let mut windows: Vec<Vec<usize>> = vec![Vec::new(); n_variants];
+        let mut next = 0usize;
+
+        // One extra turn past the last variant is the flush the fit performs
+        // once its source is exhausted.
+        for idx in 0..=n_variants {
+            let stream_ended = idx == n_variants;
+            if !stream_ended {
+                let slot = ring.push_slot();
+                ring.indices_mut()[slot] = idx;
+            }
+
+            loop {
+                let jobs =
+                    collect_ready_jobs(&ring, next, config, stream_ended).expect("ready jobs");
+                if jobs.is_empty() {
+                    break;
+                }
+
+                for job in &jobs {
+                    assert_eq!(
+                        job.keep_from + job.center,
+                        next,
+                        "the job solved for variant {next} centres on a different variant"
+                    );
+                    windows[next] = (job.keep_from..job.keep_from + job.window_len).collect();
+                    next += 1;
+                }
+
+                if let Some(last) = jobs.last() {
+                    ring.truncate_front(last.keep_from);
+                }
+            }
+        }
+
+        assert_eq!(
+            next, n_variants,
+            "the schedule weighted {next} of {n_variants} variants"
+        );
+        windows
+    }
+
+    #[test]
+    fn sites_window_reaches_its_full_width_mid_genome() {
+        // The scheduler used to solve each centre the moment it was pushed and
+        // size the window against whatever the ring held, which left a request
+        // for many markers permanently satisfied by three — `[i-2, i-1, i]`,
+        // centre at the right edge. Away from the ends of the stream every
+        // window must now be exactly as wide as it was asked to be, with the
+        // centre in the middle.
+        const N_VARIANTS: usize = 40;
+        const WINDOW: usize = 11;
+        let half = WINDOW / 2;
+
+        let config = LdResolvedConfig {
+            window: LdResolvedWindow::Sites {
+                size: WINDOW,
+                ranges: None,
+            },
+            ridge: DEFAULT_LD_RIDGE,
+        };
+        let windows = replay_ld_windows(&config, N_VARIANTS);
+
+        for centre in 0..N_VARIANTS {
+            let expected: Vec<usize> =
+                (centre.saturating_sub(half)..(centre + half + 1).min(N_VARIANTS)).collect();
+            assert_eq!(windows[centre], expected, "window for variant {centre}");
+        }
+
+        for centre in half..N_VARIANTS - half {
+            assert_eq!(
+                windows[centre].len(),
+                WINDOW,
+                "interior variant {centre} was solved from a truncated window"
+            );
+            assert_eq!(windows[centre][half], centre);
+        }
+    }
+
+    #[test]
+    fn sites_window_never_spans_two_chromosomes() {
+        // Twelve markers on chr1 followed by twelve on chr2, adjacent in the
+        // stream and nowhere near each other in the genome. Cut from stream
+        // order alone, the windows around index 11 and 12 would mix them and
+        // report "LD" between chromosomes.
+        const PER_CHROMOSOME: usize = 12;
+        const WINDOW: usize = 9;
+        let keys: Vec<VariantKey> = (0..PER_CHROMOSOME)
+            .map(|idx| VariantKey::new("1", 1_000 + idx as u64 * 100))
+            .chain(
+                (0..PER_CHROMOSOME).map(|idx| VariantKey::new("2", 1_000 + idx as u64 * 100)),
+            )
+            .collect();
+
+        let config = LdResolvedConfig {
+            window: LdResolvedWindow::Sites {
+                size: WINDOW,
+                ranges: Some(compute_ld_site_ranges(&keys, WINDOW)),
+            },
+            ridge: DEFAULT_LD_RIDGE,
+        };
+        let windows = replay_ld_windows(&config, keys.len());
+
+        for (centre, window) in windows.iter().enumerate() {
+            assert!(window.contains(&centre), "variant {centre} left its window");
+            for &member in window {
+                assert_eq!(
+                    keys[member].chromosome, keys[centre].chromosome,
+                    "variant {centre} was weighted against variant {member} on another chromosome"
+                );
+            }
+        }
+
+        // Clipping is to the chromosome, not to the boundary's aftermath: a
+        // centre with room on both sides of it still gets the full window.
+        let interior = PER_CHROMOSOME + WINDOW / 2;
+        assert_eq!(windows[interior].len(), WINDOW);
+        assert_eq!(windows[interior][0], PER_CHROMOSOME);
+
+        // The boundary itself: the last marker of chr1 keeps its left flank and
+        // loses its right, and the first of chr2 the other way round.
+        assert_eq!(windows[PER_CHROMOSOME - 1].last(), Some(&(PER_CHROMOSOME - 1)));
+        assert_eq!(windows[PER_CHROMOSOME][0], PER_CHROMOSOME);
+    }
+
+    #[test]
+    fn bp_window_never_spans_two_chromosomes() {
+        // Positions deliberately collide across chromosomes: a range builder
+        // comparing positions without chromosomes would merge all four markers
+        // into one window.
+        let keys = vec![
+            VariantKey::new("1", 100),
+            VariantKey::new("1", 140),
+            VariantKey::new("2", 100),
+            VariantKey::new("2", 140),
+        ];
+
+        let (ranges, capacity) = compute_ld_bp_ranges(&keys, 200).expect("ranges");
+
+        assert_eq!(capacity, 2);
+        assert_eq!((ranges[0].start, ranges[0].end), (0, 2));
+        assert_eq!((ranges[1].start, ranges[1].end), (0, 2));
+        assert_eq!((ranges[2].start, ranges[2].end), (2, 4));
+        assert_eq!((ranges[3].start, ranges[3].end), (2, 4));
+    }
+
+    #[test]
+    fn ld_ranges_must_describe_the_streamed_variant_list() {
+        // Stands in for `--maf` on a PLINK fileset: the windows are cut from a
+        // key list the filter has not been applied to, the stream delivers the
+        // retained variants renumbered from zero, and every index in the
+        // schedule then names a different marker than the one it was cut for —
+        // with no index out of bounds and no weight out of range to show for
+        // it. Both directions of the disagreement have to stop the fit.
+        const N_SAMPLES: usize = 5;
+        const WINDOW: usize = 3;
+
+        let run = |streamed: usize, keyed: usize| -> Result<(), HwePcaError> {
+            let data: Vec<f64> = (0..N_SAMPLES * streamed)
+                .map(|idx| (idx % 3) as f64)
+                .collect();
+            let keys: Vec<VariantKey> = (0..keyed)
+                .map(|idx| VariantKey::new("1", 1_000 + idx as u64 * 50))
+                .collect();
+            let config = LdResolvedConfig {
+                window: LdResolvedWindow::Sites {
+                    size: WINDOW,
+                    ranges: Some(compute_ld_site_ranges(&keys, WINDOW)),
+                },
+                ridge: DEFAULT_LD_RIDGE,
+            };
+
+            let mut source =
+                DenseBlockSource::new(&data, N_SAMPLES, streamed).expect("dense source");
+            compute_stats_and_ld_weights(
+                &mut source,
+                streamed,
+                config,
+                streamed,
+                &Arc::new(NoopFitProgress),
+                Par::Seq,
+            )
+            .map(|_| ())
+        };
+
+        for (streamed, keyed) in [(7usize, 9usize), (9, 7)] {
+            let err = run(streamed, keyed).expect_err(
+                "a schedule cut from a different variant list must not produce weights",
+            );
+            assert!(
+                err.to_string().contains("different variant list"),
+                "streamed {streamed} against {keyed} keys reported: {err}"
+            );
+        }
+
+        // The agreeing case is the control: the same machinery must weight a
+        // stream whose length matches the list it was cut from.
+        run(8, 8).expect("matched lists are the case this is meant to allow");
+    }
+
+    #[test]
+    fn unconverged_solve_is_refused_unless_explicitly_allowed() {
+        let unconverged = FitDiagnostics {
+            solver: FitSolver::BlockKrylov,
+            converged: false,
+            passes: 24,
+            max_relative_residual: Some(3.5e-2),
+            subspace_delta: Some(1.1e-3),
+            boundary_gap: None,
+            restarts: 1,
+        };
+
+        let err = require_converged(Some(&unconverged), false)
+            .expect_err("an unconverged subspace must not become a model by default");
+        let message = err.to_string();
+        assert!(
+            message.contains("allow_unconverged"),
+            "the refusal must name its opt-in; it said: {message}"
+        );
+        assert!(
+            message.contains("24"),
+            "the refusal must carry the solve's own numbers; it said: {message}"
+        );
+
+        require_converged(Some(&unconverged), true)
+            .expect("the opt-in exists so that a best-effort fit can be accepted deliberately");
+
+        let converged = FitDiagnostics {
+            converged: true,
+            ..unconverged
+        };
+        require_converged(Some(&converged), false).expect("a converged solve is a fit");
+        require_converged(None, false).expect("a route that records nothing is not a refusal");
+
+        assert!(
+            !FitOptions::default().allow_unconverged,
+            "refusing is the default the whole gate depends on"
+        );
     }
 
     #[test]

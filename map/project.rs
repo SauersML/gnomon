@@ -207,6 +207,14 @@ pub enum ZeroAlignmentAction {
 pub struct ProjectionOptions {
     pub missing_axis_renormalization: bool,
     pub return_alignment: bool,
+    /// Return the per-sample conditioning report described by
+    /// [`PROJECTION_CONDITIONING_COLUMNS`].
+    ///
+    /// Off by default because measuring it costs one extra triangular solve per
+    /// component per incomplete sample. It is the only way to tell a score that
+    /// the retained markers determined from one the solver merely produced, so
+    /// anything that consumes projected scores downstream should ask for it.
+    pub return_conditioning: bool,
     pub on_zero_alignment: ZeroAlignmentAction,
 }
 
@@ -215,6 +223,7 @@ impl Default for ProjectionOptions {
         Self {
             missing_axis_renormalization: true,
             return_alignment: false,
+            return_conditioning: false,
             on_zero_alignment: ZeroAlignmentAction::NaN,
         }
     }
@@ -224,11 +233,93 @@ impl Default for ProjectionOptions {
 pub struct ProjectionResult {
     pub scores: Mat<f64>,
     pub alignment: Option<Mat<f64>>,
+    /// `n_samples` × [`PROJECTION_CONDITIONING_COLUMNS`], present only when
+    /// [`ProjectionOptions::return_conditioning`] was set. See that constant for
+    /// the column meanings.
+    pub conditioning: Option<Mat<f64>>,
 }
 
+/// Per-sample diagnostic surfaces a caller can have written in place alongside
+/// the scores.
+///
+/// This exists so that adding a diagnostic does not change the arity of
+/// `project_into_with_options_and_progress`: callers that want none of it keep
+/// passing `None`.
+pub struct ProjectionDiagnosticsOut<'out> {
+    /// `n_samples` × `components`. Entry `(i, k)` is `sqrt(retained mass /
+    /// total mass)` for component `k` of sample `i`: how much of the loading
+    /// weight that defines PC `k` this sample actually carried genotypes for.
+    pub alignment: Option<MatMut<'out, f64>>,
+    /// `n_samples` × [`PROJECTION_CONDITIONING_COLUMNS`].
+    pub conditioning: Option<MatMut<'out, f64>>,
+}
+
+/// Width of the per-sample conditioning report, whose columns are:
+///
+/// 0. `lambda_min_lower` — a *lower* bound on the smallest eigenvalue of the
+///    information matrix that was actually solved for this sample. In the units
+///    used here a fully observed sample scores `1.0`, so this reads directly as
+///    the effective fraction of the model's information retained along the
+///    worst-determined direction. Zero means the sample produced no score.
+/// 1. `condition_upper` — an *upper* bound on that matrix's 2-norm condition
+///    number. Large values mean the retained markers cannot separate the
+///    components from one another, however many of them there are; this is the
+///    part an overlap fraction cannot tell you.
+/// 2. `ridge_relative` — the ridge that had to be added to make the system
+///    factorable, as a multiple of the mean eigenvalue. `0.0` is the normal
+///    case: the observed data alone determined the answer. Anything positive
+///    says the number in `scores` is partly the regularizer talking.
+///
+/// Both bounds are one-sided in the safe direction: they never claim a sample
+/// is better determined than it is.
+pub const PROJECTION_CONDITIONING_COLUMNS: usize = 3;
+
+/// `SampleOutputs::write_conditioning` writes the three columns by hand; widening
+/// the report without widening that writer would leave the new column filled
+/// with the zeros the buffer was allocated with, which reads as a confident
+/// answer rather than as a missing one.
+const _: () = assert!(PROJECTION_CONDITIONING_COLUMNS == 3);
+
 const DEFAULT_PROJECT_CUDA_MIN_WORK: usize = 50_000_000;
-const WLS_RIDGE: f64 = 1.0e-5;
 const SPARSE_MISSING_WOODBURY_MAX: usize = 1;
+
+/// The retention floor, as a fraction of the model's information.
+///
+/// Applied in two parallel places, because a sample can fail to determine its
+/// scores in two ways:
+///
+///   * to the *trace* of the sample's information matrix, deciding whether the
+///     sample retained enough information overall to be projected at all; and
+///   * to each *direction*, deciding whether one particular axis of the PC space
+///     is determined by the markers this sample kept. A sample can hold 20% of
+///     the markers and still have a direction below this floor, which is why an
+///     overlap fraction is not the relevant number.
+///
+/// This is also where the old `WLS_RIDGE = 1e-5` constant actually belonged. It
+/// served as an absolute floor on the retained trace (right in spirit, but
+/// comparing an absolute number against a matrix whose scale it did not know)
+/// *and* as an unconditional ridge on every solve, which is the defect: with
+/// `VᵀV = I` it shrank every fully-observed sample's scores by `1/(1+1e-5)`.
+/// Expressed as a fraction it is scale-free, and for the orthonormal loadings
+/// this code now receives it reproduces the old trace threshold exactly, since
+/// `tr(VᵀV) = k`.
+const MIN_RETAINED_INFORMATION_FRACTION: f64 = 1.0e-5;
+
+/// Largest deviation from `I` that the global information matrix may show and
+/// still be treated as exactly `I`. See `information_matrix_is_identity`.
+///
+/// This is the relative distortion accepted by *not* solving, and it is five
+/// orders of magnitude below the `1e-5` shrinkage it replaces. It has to sit
+/// well above the rounding a genuinely orthonormal `V` carries, which comes from
+/// the whole fit — the eigenrotation and the `Σ⁻¹` scaling, not just this
+/// accumulation — and so grows with the conditioning of the eigenproblem rather
+/// than with the variant count alone.
+const PROJECTION_IDENTITY_TOLERANCE: f64 = 1.0e-10;
+
+/// Multiple of the accumulation's own rounding error which the identity test
+/// also allows for, so that a corpus large enough to lose more than
+/// [`PROJECTION_IDENTITY_TOLERANCE`] to summation error is still recognised.
+const PROJECTION_IDENTITY_ROUNDING_UNITS: f64 = 8.0;
 const PROJECT_CUDA_UNPACK_KERNELS: &str = r#"
 extern "C" __global__ void unpack_weighted_plink(
     const unsigned char* packed,
@@ -1059,16 +1150,34 @@ impl<'model> HwePcaProjector<'model> {
         } else {
             None
         };
+        let mut conditioning = if opts.return_conditioning {
+            Some(Mat::zeros(n_samples, PROJECTION_CONDITIONING_COLUMNS))
+        } else {
+            None
+        };
+
+        let diagnostics = if alignment.is_some() || conditioning.is_some() {
+            Some(ProjectionDiagnosticsOut {
+                alignment: alignment.as_mut().map(|mat| mat.as_mut()),
+                conditioning: conditioning.as_mut().map(|mat| mat.as_mut()),
+            })
+        } else {
+            None
+        };
 
         self.project_into_with_options_and_progress(
             source,
             scores.as_mut(),
             opts,
-            alignment.as_mut().map(|mat| mat.as_mut()),
+            diagnostics,
             progress,
         )?;
 
-        Ok(ProjectionResult { scores, alignment })
+        Ok(ProjectionResult {
+            scores,
+            alignment,
+            conditioning,
+        })
     }
 
     pub fn project_into<S>(
@@ -1090,7 +1199,7 @@ impl<'model> HwePcaProjector<'model> {
         source: &mut S,
         mut scores: MatMut<'_, f64>,
         opts: &ProjectionOptions,
-        alignment_out: Option<MatMut<'_, f64>>,
+        diagnostics_out: Option<ProjectionDiagnosticsOut<'_>>,
         progress: &P,
     ) -> Result<(), HwePcaError>
     where
@@ -1134,11 +1243,23 @@ impl<'model> HwePcaProjector<'model> {
                 "Projection output column count must equal number of components",
             ));
         }
+        let (alignment_out, conditioning_out) = match diagnostics_out {
+            Some(diagnostics) => (diagnostics.alignment, diagnostics.conditioning),
+            None => (None, None),
+        };
         if let Some(ref alignment) = alignment_out
             && (alignment.nrows() != n_samples || alignment.ncols() != components)
         {
             return Err(HwePcaError::InvalidInput(
                 "Alignment output shape must match projection output",
+            ));
+        }
+        if let Some(ref conditioning) = conditioning_out
+            && (conditioning.nrows() != n_samples
+                || conditioning.ncols() != PROJECTION_CONDITIONING_COLUMNS)
+        {
+            return Err(HwePcaError::InvalidInput(
+                "Conditioning output must be n_samples x PROJECTION_CONDITIONING_COLUMNS",
             ));
         }
 
@@ -1180,23 +1301,30 @@ impl<'model> HwePcaProjector<'model> {
             )?;
             progress.on_stage_finish(ProjectionProgressStage::Projection);
             match dense_missing_info {
+                // The model's cached global info matrix was accumulated over
+                // `model_variants` terms, which is what sets the rounding scale
+                // the identity test is allowed to forgive.
                 Some(missing_info_storage) => solve_projection_with_dense_missing_info(
                     scores,
                     alignment_out,
+                    conditioning_out,
                     &missing_info_storage,
                     projection_global_info_packed,
                     normalization,
                     components,
                     packed_info_size,
+                    model_variants,
                     opts.on_zero_alignment,
                 ),
                 None => solve_projection_with_sparse_missing_variants(
                     scores,
                     alignment_out,
+                    conditioning_out,
                     &missing_variants,
                     projection_global_info_packed,
                     normalization,
                     loadings,
+                    model_variants,
                     opts.on_zero_alignment,
                 ),
             }
@@ -1453,14 +1581,19 @@ impl<'model> HwePcaProjector<'model> {
             }
 
             progress.on_stage_finish(ProjectionProgressStage::Projection);
+            // `processed` is the number of per-variant terms that were summed
+            // into `global_info_packed`, i.e. the length of the accumulation
+            // whose rounding error the identity test has to allow for.
             solve_projection_with_dense_missing_info(
                 scores,
                 alignment_out,
+                conditioning_out,
                 &missing_info_storage,
                 &global_info_packed,
                 normalization,
                 components,
                 packed_info_size,
+                processed,
                 opts.on_zero_alignment,
             );
         }
@@ -1472,20 +1605,121 @@ impl<'model> HwePcaProjector<'model> {
     }
 }
 
+/// What the solver can certify about one sample's answer.
+///
+/// See [`PROJECTION_CONDITIONING_COLUMNS`] for the meaning of each field; this
+/// is the in-flight form of those three columns.
+#[derive(Clone, Copy, Debug)]
+struct SampleConditioning {
+    lambda_min_lower: f64,
+    condition_upper: f64,
+    ridge_relative: f64,
+}
+
+impl SampleConditioning {
+    /// A fully observed sample of a model whose loadings are orthonormal: the
+    /// system is `I`, so every bound is attained and nothing was regularized.
+    /// Written literally rather than measured, because the exact path never
+    /// forms a factor to measure.
+    const EXACT: Self = Self {
+        lambda_min_lower: 1.0,
+        condition_upper: 1.0,
+        ridge_relative: 0.0,
+    };
+
+    /// The sample produced no score. `0` and `∞` are the honest limits of the
+    /// two bounds, and the ridge is `NaN` because no system was ever solved.
+    const UNSOLVED: Self = Self {
+        lambda_min_lower: 0.0,
+        condition_upper: f64::INFINITY,
+        ridge_relative: f64::NAN,
+    };
+
+    /// The caller did not ask for conditioning, so no bound was computed. These
+    /// values are never written anywhere — the output buffer is absent in
+    /// exactly the cases that produce this — and are `NaN` so that a future
+    /// wiring mistake shows up as `NaN` rather than as a confident `0.0`.
+    const UNMEASURED: Self = Self {
+        lambda_min_lower: f64::NAN,
+        condition_upper: f64::NAN,
+        ridge_relative: f64::NAN,
+    };
+}
+
+/// When and by how much a projection solve is allowed to regularize.
+///
+/// Computed once from the model's global information matrix and applied
+/// identically to every sample, which is what makes two backends solving the
+/// same sample agree: the decision never depends on per-sample rounding.
+#[derive(Clone, Copy)]
+struct RidgePolicy {
+    /// Added to the diagonal when some direction of a sample's system falls
+    /// below the retention floor. Relative to the model's mean eigenvalue, not
+    /// an absolute constant, so it means the same thing whatever the loadings
+    /// are scaled like.
+    ridge: f64,
+    /// A Cholesky pivot at or below this marks such a direction. Deliberately
+    /// half the ridge: `A + δI ⪰ δI` forces every pivot of the retry to be at
+    /// least `δ`, so the retry clears this floor by construction instead of
+    /// landing on it and failing again.
+    pivot_floor: f64,
+    /// Mean eigenvalue of the global system — the scale the applied ridge is
+    /// reported against.
+    mean_eigenvalue: f64,
+}
+
+impl RidgePolicy {
+    fn new(global_trace: f64, components: usize) -> Self {
+        let mean_eigenvalue = if components > 0 {
+            global_trace / components as f64
+        } else {
+            0.0
+        };
+        let ridge = mean_eigenvalue * MIN_RETAINED_INFORMATION_FRACTION;
+        Self {
+            ridge,
+            pivot_floor: 0.5 * ridge,
+            mean_eigenvalue,
+        }
+    }
+
+    fn relative(self, ridge: f64) -> f64 {
+        if self.mean_eigenvalue > 0.0 {
+            ridge / self.mean_eigenvalue
+        } else {
+            0.0
+        }
+    }
+}
+
 struct ProjectionSolveBase {
     diag_indices: Vec<usize>,
     global_diag: Vec<f64>,
+    /// The global information matrix `VᵀΩV` itself — no ridge. Every per-sample
+    /// system is this matrix minus the mass the sample is missing, so a ridge
+    /// baked in here would ride into every solve whether or not it was needed.
     base_info: Vec<f64>,
     base_factor: Vec<f64>,
     base_factor_ready: bool,
     global_trace: f64,
     base_alignment: Vec<f64>,
+    /// `VᵀΩV == I` to within the accumulation's own rounding error, so a fully
+    /// observed sample needs no solve at all.
+    info_is_identity: bool,
+    /// Retained-mass trace below which a sample is declared undetermined.
+    information_floor: f64,
+    policy: RidgePolicy,
+    /// Conditioning of `base_factor`, i.e. of every fully observed sample that
+    /// still has to go through the solver. Measured once here rather than per
+    /// sample, since the matrix is the same one every time.
+    base_conditioning: SampleConditioning,
 }
 
 fn build_projection_solve_base(
     global_info_packed: &[f64],
     normalization: &[f64],
     components: usize,
+    accumulated_variants: usize,
 ) -> ProjectionSolveBase {
     let diag_indices: Vec<usize> = (0..components)
         .map(|k| packed_tri_index(components, k, k))
@@ -1494,21 +1728,32 @@ fn build_projection_solve_base(
         .iter()
         .map(|&idx| global_info_packed[idx])
         .collect();
-    let base_info = build_dense_lower_info_matrix(global_info_packed, components, WLS_RIDGE);
+    let base_info = build_dense_lower_info_matrix(global_info_packed, components);
+    let global_trace: f64 = global_diag.iter().sum();
+    let policy = RidgePolicy::new(global_trace, components);
+    let base_norm = symmetric_lower_one_norm(&base_info, components);
+
     let mut base_factor = base_info.clone();
-    let base_factor_ready = factorize_spd_lower_in_place(&mut base_factor, components);
-    let global_trace = global_diag.iter().sum();
+    let base_ridge = factorize_with_directional_ridge(&mut base_factor, components, policy, |restored| {
+        restored.copy_from_slice(&base_info[..components * components])
+    });
+    let base_factor_ready = base_ridge.is_some();
+    let mut inverse_column = vec![0.0f64; components];
+    let base_conditioning = match base_ridge {
+        Some(ridge) => measure_conditioning_from_factor(
+            &base_factor,
+            components,
+            base_norm + ridge,
+            policy.relative(ridge),
+            &mut inverse_column,
+        ),
+        None => SampleConditioning::UNSOLVED,
+    };
+
     let base_alignment = global_diag
         .iter()
         .enumerate()
-        .map(|(k, &mass)| {
-            let denom = normalization.get(k).copied().unwrap_or(0.0);
-            if mass > 0.0 && denom > 0.0 {
-                (mass / denom).sqrt()
-            } else {
-                0.0
-            }
-        })
+        .map(|(k, &mass)| retained_alignment(mass, normalization.get(k).copied().unwrap_or(0.0)))
         .collect();
 
     ProjectionSolveBase {
@@ -1519,42 +1764,436 @@ fn build_projection_solve_base(
         base_factor_ready,
         global_trace,
         base_alignment,
+        info_is_identity: information_matrix_is_identity(
+            global_info_packed,
+            components,
+            accumulated_variants,
+        ),
+        information_floor: global_trace * MIN_RETAINED_INFORMATION_FRACTION,
+        policy,
+        base_conditioning,
+    }
+}
+
+/// Is the global information matrix the identity?
+///
+/// This is the question the projection turns on. `global_info_packed` holds
+/// `VᵀΩV`; when the loadings are orthonormal and nothing is quality-down-weighted
+/// it is `I`, the weighted least squares system for a fully observed sample is
+/// `I ŝ = Vᵀy`, and the projection is just `Vᵀy`. Solving it anyway is not merely
+/// wasted work: the accumulated matrix is `I` plus rounding, so the solve
+/// *injects* that rounding into the scores instead of removing anything.
+///
+/// The tolerance is therefore the accumulation's own error and nothing more.
+/// `global_info_packed` is a running sum of `accumulated_variants` products;
+/// recursive summation of `n` terms has forward error bounded by `n·ε·Σ|terms|`,
+/// and each diagonal entry sums `‖V_k‖² = 1`, so `n·ε` bounds the relative
+/// deviation. Deviations larger than that are real structure — a
+/// non-orthonormal basis, or genuine quality weights — and must go to the
+/// solver.
+fn information_matrix_is_identity(
+    global_info_packed: &[f64],
+    components: usize,
+    accumulated_variants: usize,
+) -> bool {
+    if components == 0 {
+        return false;
+    }
+    let tolerance = (accumulated_variants.max(1) as f64)
+        * f64::EPSILON
+        * PROJECTION_IDENTITY_ROUNDING_UNITS;
+    let mut idx = 0usize;
+    for row in 0..components {
+        for col in row..components {
+            let expected = if row == col { 1.0 } else { 0.0 };
+            // Negated so that a NaN entry fails the test rather than passing it.
+            if !((global_info_packed[idx] - expected).abs() <= tolerance) {
+                return false;
+            }
+            idx += 1;
+        }
+    }
+    true
+}
+
+/// Cholesky-factorize `info` in place, adding the smallest ridge from a fixed
+/// escalating ladder that lets the factorization complete. Returns the ridge
+/// actually applied (`0.0` when the raw system factored, which is the case this
+/// is written for), or `None` when even the top rung fails.
+///
+/// `restore` must rewrite `info` with the unridged system; the factorization is
+/// destructive, so each retry needs the matrix back. Rebuilding it is cheaper
+/// than keeping a spare copy for the overwhelmingly common case where the first
+/// attempt succeeds and no retry ever happens.
+///
+/// Failing to factor is the right trigger, and it is a narrow one: Cholesky
+/// completes on matrices with condition numbers around `1e15`, so this fires
+/// only when the arithmetic genuinely cannot represent the system as positive
+/// definite. Systems that factor but are still badly determined are not
+/// silently propped up — they are reported through `SampleConditioning`, which
+/// leaves the decision with the caller instead of hiding it behind a constant.
+fn factorize_with_escalating_ridge<F>(
+    info: &mut [f64],
+    components: usize,
+    mean_eigenvalue: f64,
+    mut restore: F,
+) -> Option<f64>
+where
+    F: FnMut(&mut [f64]),
+{
+    let mut ridge = 0.0f64;
+    let mut attempts = 0usize;
+    loop {
+        if factorize_spd_lower_in_place(info, components) {
+            return Some(ridge);
+        }
+        // A non-finite or non-positive mean eigenvalue leaves no scale to build
+        // a relative ridge from, so there is nothing honest left to try.
+        if attempts >= PROJECTION_RIDGE_MAX_ATTEMPTS || !(mean_eigenvalue > 0.0) {
+            return None;
+        }
+        ridge = if ridge == 0.0 {
+            mean_eigenvalue * PROJECTION_RIDGE_RELATIVE_FLOOR
+        } else {
+            ridge * PROJECTION_RIDGE_ESCALATION
+        };
+        attempts += 1;
+        restore(info);
+        for k in 0..components {
+            info[k * components + k] += ridge;
+        }
+    }
+}
+
+#[inline]
+fn relative_ridge(ridge: f64, mean_eigenvalue: f64) -> f64 {
+    if mean_eigenvalue > 0.0 {
+        ridge / mean_eigenvalue
+    } else {
+        0.0
+    }
+}
+
+/// `‖A‖₁` for the symmetric matrix whose lower triangle is stored in `a`.
+///
+/// Used as an upper bound on `λ_max`. `‖A‖₂ ≤ sqrt(‖A‖₁‖A‖_∞)`, and the two are
+/// equal for a symmetric matrix, so `‖A‖₁` bounds the spectral norm. It is much
+/// tighter than the trace — for a well-conditioned system it is nearly exact,
+/// whereas the trace is loose by up to a factor of `k`.
+fn symmetric_lower_one_norm(a: &[f64], n: usize) -> f64 {
+    let mut norm = 0.0f64;
+    for col in 0..n {
+        let mut sum = 0.0f64;
+        for row in 0..n {
+            // Only the lower triangle is populated; read the mirror entry above
+            // the diagonal.
+            let value = if row >= col {
+                a[row * n + col]
+            } else {
+                a[col * n + row]
+            };
+            sum += value.abs();
+        }
+        if sum > norm {
+            norm = sum;
+        }
+    }
+    norm
+}
+
+/// Bound the conditioning of an already-factorized SPD system.
+///
+/// `A⁻¹` is formed one column at a time by back-solving against the unit
+/// vectors, which costs `k` triangular solve pairs. Two upper bounds on
+/// `‖A⁻¹‖₂` fall out of those columns — the Frobenius norm and the 1-norm — and
+/// the smaller is kept, because neither dominates: Frobenius is tighter for a
+/// matrix with one small eigenvalue, the 1-norm is exact for a diagonal one
+/// (and so reports `λ_min = 1` for the identity rather than `1/√k`).
+///
+/// Both results are bounds, not estimates, and both err toward reporting the
+/// sample as *less* determined than it is. A caller can act on
+/// `lambda_min_lower` being large; it cannot be misled by it.
+fn measure_conditioning_from_factor(
+    factor: &[f64],
+    components: usize,
+    spectral_norm_upper: f64,
+    ridge_relative: f64,
+    column: &mut [f64],
+) -> SampleConditioning {
+    let mut frobenius_sq = 0.0f64;
+    let mut one_norm = 0.0f64;
+    for j in 0..components {
+        column[..components].fill(0.0);
+        column[j] = 1.0;
+        if !solve_cholesky_factor_in_place(factor, &mut column[..components], components) {
+            return SampleConditioning {
+                ridge_relative,
+                ..SampleConditioning::UNSOLVED
+            };
+        }
+        let mut column_sum = 0.0f64;
+        for &value in &column[..components] {
+            frobenius_sq += value * value;
+            column_sum += value.abs();
+        }
+        if column_sum > one_norm {
+            one_norm = column_sum;
+        }
+    }
+
+    let inverse_norm_upper = frobenius_sq.sqrt().min(one_norm);
+    if !(inverse_norm_upper > 0.0) || !inverse_norm_upper.is_finite() {
+        return SampleConditioning {
+            ridge_relative,
+            ..SampleConditioning::UNSOLVED
+        };
+    }
+    SampleConditioning {
+        lambda_min_lower: inverse_norm_upper.recip(),
+        condition_upper: spectral_norm_upper * inverse_norm_upper,
+        ridge_relative,
+    }
+}
+
+/// Solve one sample's weighted least squares system in place.
+///
+/// `info` arrives holding the sample's information matrix and leaves holding its
+/// Cholesky factor; `rhs` arrives holding `VᵀΩy` and leaves holding the scores.
+/// `restore` must be able to rewrite `info` with that same information matrix,
+/// for the ridge ladder to retry from.
+///
+/// Returns `None` for a system that could not be solved at all — the caller must
+/// then write the sample out as undetermined rather than as a number.
+fn solve_sample_information_system<F>(
+    info: &mut [f64],
+    rhs: &mut [f64],
+    column: &mut [f64],
+    components: usize,
+    trace: f64,
+    want_conditioning: bool,
+    mut restore: F,
+) -> Option<SampleConditioning>
+where
+    F: FnMut(&mut [f64]),
+{
+    let mean_eigenvalue = if components > 0 {
+        trace / components as f64
+    } else {
+        0.0
+    };
+    // Must be read before the factorization, which overwrites the matrix.
+    let matrix_norm = if want_conditioning {
+        symmetric_lower_one_norm(info, components)
+    } else {
+        0.0
+    };
+
+    let ridge =
+        factorize_with_escalating_ridge(info, components, mean_eigenvalue, &mut restore)?;
+    if !solve_cholesky_factor_in_place(info, rhs, components) {
+        return None;
+    }
+    if !want_conditioning {
+        return Some(SampleConditioning::UNMEASURED);
+    }
+    // The ridge lifts every column sum of the (positive-diagonal) system by
+    // exactly `ridge`, so the bound carries over to the matrix actually solved.
+    Some(measure_conditioning_from_factor(
+        info,
+        components,
+        matrix_norm + ridge,
+        relative_ridge(ridge, mean_eigenvalue),
+        column,
+    ))
+}
+
+/// Addresses of the per-sample output surfaces, each with its *real* (padded)
+/// column stride.
+///
+/// faer matrices are column-major with `row_stride == 1`, but the column stride
+/// is padded for alignment and is NOT generally equal to `n_samples`. Indexing
+/// with `n_samples` would write component `k >= 1` into inter-column padding —
+/// corrupting the scores and leaving the diagnostics zero — whenever
+/// `n_samples` is not faer-aligned.
+///
+/// The addresses are held as integers so the bundle is `Send`, which is what
+/// lets the per-sample solves run across rayon chunks; `as_pointers` converts
+/// once inside each chunk. Bundling them also means a surface added here cannot
+/// be wired into one writer and forgotten in another.
+#[derive(Clone, Copy)]
+struct SampleOutputAddresses {
+    scores: usize,
+    scores_stride: usize,
+    alignment: Option<usize>,
+    alignment_stride: usize,
+    conditioning: Option<usize>,
+    conditioning_stride: usize,
+}
+
+#[derive(Clone, Copy)]
+struct SampleOutputs {
+    scores: *mut f64,
+    scores_stride: usize,
+    alignment: Option<*mut f64>,
+    alignment_stride: usize,
+    conditioning: Option<*mut f64>,
+    conditioning_stride: usize,
+}
+
+fn column_major_address(matrix: &mut MatMut<'_, f64>, message: &'static str) -> (usize, usize) {
+    let col_major = matrix.rb_mut().try_as_col_major_mut().expect(message);
+    let stride = col_major.col_stride() as usize;
+    (col_major.as_ptr_mut() as usize, stride)
+}
+
+impl SampleOutputAddresses {
+    fn new(
+        scores: &mut MatMut<'_, f64>,
+        alignment: &mut Option<MatMut<'_, f64>>,
+        conditioning: &mut Option<MatMut<'_, f64>>,
+    ) -> Self {
+        let (scores_address, scores_stride) = column_major_address(
+            scores,
+            "projection output matrix must be column-major (row_stride == 1)",
+        );
+        let alignment = alignment.as_mut().map(|matrix| {
+            column_major_address(
+                matrix,
+                "projection alignment matrix must be column-major (row_stride == 1)",
+            )
+        });
+        let conditioning = conditioning.as_mut().map(|matrix| {
+            column_major_address(
+                matrix,
+                "projection conditioning matrix must be column-major (row_stride == 1)",
+            )
+        });
+
+        Self {
+            scores: scores_address,
+            scores_stride,
+            alignment: alignment.map(|(address, _)| address),
+            alignment_stride: alignment.map(|(_, stride)| stride).unwrap_or(0),
+            conditioning: conditioning.map(|(address, _)| address),
+            conditioning_stride: conditioning.map(|(_, stride)| stride).unwrap_or(0),
+        }
+    }
+
+    fn as_pointers(self) -> SampleOutputs {
+        SampleOutputs {
+            scores: self.scores as *mut f64,
+            scores_stride: self.scores_stride,
+            alignment: self.alignment.map(|address| address as *mut f64),
+            alignment_stride: self.alignment_stride,
+            conditioning: self.conditioning.map(|address| address as *mut f64),
+            conditioning_stride: self.conditioning_stride,
+        }
+    }
+
+    fn wants_conditioning(self) -> bool {
+        self.conditioning.is_some()
+    }
+}
+
+impl SampleOutputs {
+    /// Read back the accumulated `VᵀΩy` for one sample. The scores matrix doubles
+    /// as the right-hand side buffer until the solve overwrites it.
+    fn read_rhs(self, sample: usize, components: usize, rhs: &mut [f64]) {
+        for k in 0..components {
+            rhs[k] = unsafe { *self.scores.add(k * self.scores_stride + sample) };
+        }
+    }
+
+    fn write_scores(self, sample: usize, components: usize, values: &[f64]) {
+        for k in 0..components {
+            unsafe {
+                *self.scores.add(k * self.scores_stride + sample) = values[k];
+            }
+        }
+    }
+
+    fn write_alignment(self, sample: usize, values: &[f64]) {
+        if let Some(alignment) = self.alignment {
+            for (k, &value) in values.iter().enumerate() {
+                unsafe {
+                    *alignment.add(k * self.alignment_stride + sample) = value;
+                }
+            }
+        }
+    }
+
+    fn write_conditioning(self, sample: usize, conditioning: SampleConditioning) {
+        if let Some(base) = self.conditioning {
+            unsafe {
+                *base.add(sample) = conditioning.lambda_min_lower;
+                *base.add(self.conditioning_stride + sample) = conditioning.condition_upper;
+                *base.add(2 * self.conditioning_stride + sample) = conditioning.ridge_relative;
+            }
+        }
+    }
+
+    /// Mark a sample as undetermined: no score, no retained alignment, and a
+    /// conditioning row that says as much.
+    fn write_undetermined(
+        self,
+        sample: usize,
+        components: usize,
+        zero_action: ZeroAlignmentAction,
+    ) {
+        let score_value = match zero_action {
+            ZeroAlignmentAction::Zero => 0.0,
+            ZeroAlignmentAction::NaN => f64::NAN,
+        };
+        for k in 0..components {
+            unsafe {
+                *self.scores.add(k * self.scores_stride + sample) = score_value;
+            }
+        }
+        if let Some(alignment) = self.alignment {
+            for k in 0..components {
+                unsafe {
+                    *alignment.add(k * self.alignment_stride + sample) = 0.0;
+                }
+            }
+        }
+        self.write_conditioning(sample, SampleConditioning::UNSOLVED);
+    }
+}
+
+#[inline]
+fn retained_alignment(mass: f64, normalization: f64) -> f64 {
+    if mass > 0.0 && normalization > 0.0 {
+        (mass / normalization).sqrt()
+    } else {
+        0.0
     }
 }
 
 fn solve_projection_with_dense_missing_info(
     mut scores: MatMut<'_, f64>,
     mut alignment_out: Option<MatMut<'_, f64>>,
+    mut conditioning_out: Option<MatMut<'_, f64>>,
     missing_info_storage: &[f64],
     global_info_packed: &[f64],
     normalization: &[f64],
     components: usize,
     packed_info_size: usize,
+    accumulated_variants: usize,
     zero_action: ZeroAlignmentAction,
 ) {
     let n_samples = scores.nrows();
-    let solve_base = build_projection_solve_base(global_info_packed, normalization, components);
-    // faer matrices are column-major with `row_stride == 1`, but the column
-    // stride is padded for alignment and is NOT generally equal to `n_samples`.
-    // Index columns with the matrix's real column stride; assuming `n_samples`
-    // would write component k>=1 into inter-column padding (corrupting scores
-    // and leaving alignment zero) whenever `n_samples` is not faer-aligned.
-    let (scores_ptr, scores_col_stride) = {
-        let scores_col_major = scores
-            .rb_mut()
-            .try_as_col_major_mut()
-            .expect("projection output matrix must be column-major (row_stride == 1)");
-        let stride = scores_col_major.col_stride() as usize;
-        (scores_col_major.as_ptr_mut() as usize, stride)
-    };
-    let alignment_ptr = alignment_out.as_mut().map(|alignment| {
-        let alignment_col_major = alignment
-            .rb_mut()
-            .try_as_col_major_mut()
-            .expect("projection alignment matrix must be column-major (row_stride == 1)");
-        let stride = alignment_col_major.col_stride() as usize;
-        (alignment_col_major.as_ptr_mut() as usize, stride)
-    });
+    let solve_base = build_projection_solve_base(
+        global_info_packed,
+        normalization,
+        components,
+        accumulated_variants,
+    );
+    let outputs = SampleOutputAddresses::new(
+        &mut scores,
+        &mut alignment_out,
+        &mut conditioning_out,
+    );
+    let want_conditioning = outputs.wants_conditioning();
     let solve_chunk = projection_solve_sample_chunk(n_samples);
     let solve_chunks = n_samples.div_ceil(solve_chunk);
 
@@ -1563,95 +2202,107 @@ fn solve_projection_with_dense_missing_info(
             (
                 vec![0.0f64; components * components],
                 vec![0.0f64; components],
+                vec![0.0f64; components],
+                vec![0.0f64; components],
+                vec![0.0f64; components],
             )
         },
-        |(info_matrix, rhs), chunk_idx| {
-            let scores_ptr = scores_ptr as *mut f64;
-            let align_col_stride = alignment_ptr.map(|(_, stride)| stride).unwrap_or(0);
-            let alignment_ptr = alignment_ptr.map(|(ptr, _)| ptr as *mut f64);
+        |(info_matrix, rhs, diag_mass, alignment_values, inverse_column), chunk_idx| {
+            let outputs = outputs.as_pointers();
             let sample_start = chunk_idx * solve_chunk;
             let sample_end = (sample_start + solve_chunk).min(n_samples);
 
             for sample in sample_start..sample_end {
                 let info_offset = sample * packed_info_size;
+                let missing_packed =
+                    &missing_info_storage[info_offset..info_offset + packed_info_size];
+
+                // Retained mass per component, and the trace it sums to. The
+                // trace is formed as `global - missing` rather than by summing
+                // `diag_mass`, so that a fully observed sample subtracts an
+                // exact zero and lands on `missing_trace == 0.0` exactly.
                 let mut missing_trace = 0.0f64;
-                for &diag_idx in &solve_base.diag_indices {
-                    missing_trace += missing_info_storage[info_offset + diag_idx];
+                for (k, &diag_idx) in solve_base.diag_indices.iter().enumerate() {
+                    let missing_mass = missing_packed[diag_idx];
+                    missing_trace += missing_mass;
+                    diag_mass[k] = solve_base.global_diag[k] - missing_mass;
                 }
                 let trace = solve_base.global_trace - missing_trace;
 
-                if trace <= WLS_RIDGE * (components as f64) {
-                    write_zero_projection_sample(
-                        scores_ptr,
-                        scores_col_stride,
-                        alignment_ptr,
-                        align_col_stride,
-                        components,
-                        sample,
-                        zero_action,
-                    );
+                if trace <= solve_base.information_floor {
+                    outputs.write_undetermined(sample, components, zero_action);
                     continue;
                 }
 
-                for k in 0..components {
-                    rhs[k] = unsafe { *scores_ptr.add(k * scores_col_stride + sample) };
+                // `missing_info` is a sum of positive-semidefinite rank-one
+                // terms, so a zero trace means the whole matrix is zero: this
+                // sample's system is exactly the global one.
+                let fully_observed = missing_trace == 0.0;
+
+                // The exact case. `VᵀΩV = I` and nothing is missing, so the
+                // weighted least squares system is `I ŝ = Vᵀy` and the answer is
+                // already sitting in `scores`. There is no solve to skip a ridge
+                // in — there is no solve at all, and running one would only feed
+                // the scores the accumulated matrix's rounding error.
+                if fully_observed && solve_base.info_is_identity {
+                    outputs.write_alignment(sample, &solve_base.base_alignment);
+                    outputs.write_conditioning(sample, SampleConditioning::EXACT);
+                    continue;
                 }
 
-                let solved = if missing_trace == 0.0 && solve_base.base_factor_ready {
+                outputs.read_rhs(sample, components, rhs);
+
+                let conditioning = if fully_observed && solve_base.base_factor_ready {
                     solve_cholesky_factor_in_place(
                         &solve_base.base_factor,
                         &mut rhs[..components],
                         components,
                     )
+                    .then_some(solve_base.base_conditioning)
                 } else {
                     fill_sample_info_matrix(
                         info_matrix,
                         &solve_base.base_info,
-                        &missing_info_storage[info_offset..info_offset + packed_info_size],
+                        missing_packed,
                         components,
                     );
-                    solve_spd_lower_in_place(info_matrix, &mut rhs[..components], components)
+                    solve_sample_information_system(
+                        info_matrix,
+                        &mut rhs[..components],
+                        inverse_column,
+                        components,
+                        trace,
+                        want_conditioning,
+                        |restored| {
+                            fill_sample_info_matrix(
+                                restored,
+                                &solve_base.base_info,
+                                missing_packed,
+                                components,
+                            )
+                        },
+                    )
                 };
 
-                if solved {
-                    for k in 0..components {
-                        unsafe {
-                            *scores_ptr.add(k * scores_col_stride + sample) = rhs[k];
-                        }
-                    }
-                    if let Some(alignment_ptr) = alignment_ptr {
-                        if missing_trace == 0.0 {
-                            for (k, &value) in solve_base.base_alignment.iter().enumerate() {
-                                unsafe {
-                                    *alignment_ptr.add(k * align_col_stride + sample) = value;
+                match conditioning {
+                    Some(conditioning) => {
+                        outputs.write_scores(sample, components, rhs);
+                        if outputs.alignment.is_some() {
+                            if fully_observed {
+                                outputs.write_alignment(sample, &solve_base.base_alignment);
+                            } else {
+                                for k in 0..components {
+                                    alignment_values[k] = retained_alignment(
+                                        diag_mass[k],
+                                        normalization.get(k).copied().unwrap_or(0.0),
+                                    );
                                 }
-                            }
-                        } else {
-                            for (k, &diag_idx) in solve_base.diag_indices.iter().enumerate() {
-                                let mass = global_info_packed[diag_idx]
-                                    - missing_info_storage[info_offset + diag_idx];
-                                let denom = normalization.get(k).copied().unwrap_or(0.0);
-                                let value = if mass > 0.0 && denom > 0.0 {
-                                    (mass / denom).sqrt()
-                                } else {
-                                    0.0
-                                };
-                                unsafe {
-                                    *alignment_ptr.add(k * align_col_stride + sample) = value;
-                                }
+                                outputs.write_alignment(sample, &alignment_values[..components]);
                             }
                         }
+                        outputs.write_conditioning(sample, conditioning);
                     }
-                } else {
-                    write_zero_projection_sample(
-                        scores_ptr,
-                        scores_col_stride,
-                        alignment_ptr,
-                        align_col_stride,
-                        components,
-                        sample,
-                        zero_action,
-                    );
+                    None => outputs.write_undetermined(sample, components, zero_action),
                 }
             }
         },
@@ -1661,35 +2312,44 @@ fn solve_projection_with_dense_missing_info(
 fn solve_projection_with_sparse_missing_variants(
     mut scores: MatMut<'_, f64>,
     mut alignment_out: Option<MatMut<'_, f64>>,
+    mut conditioning_out: Option<MatMut<'_, f64>>,
     missing_variants: &[Vec<u32>],
     global_info_packed: &[f64],
     normalization: &[f64],
     loadings: faer::MatRef<'_, f64>,
+    accumulated_variants: usize,
     zero_action: ZeroAlignmentAction,
 ) {
     let n_samples = scores.nrows();
     let components = scores.ncols();
-    let solve_base = build_projection_solve_base(global_info_packed, normalization, components);
-    // See `solve_projection_with_dense_missing_info`: index columns with the
-    // matrix's real (padded) column stride, not `n_samples`.
-    let (scores_ptr, scores_col_stride) = {
-        let scores_col_major = scores
-            .rb_mut()
-            .try_as_col_major_mut()
-            .expect("projection output matrix must be column-major (row_stride == 1)");
-        let stride = scores_col_major.col_stride() as usize;
-        (scores_col_major.as_ptr_mut() as usize, stride)
-    };
-    let alignment_ptr = alignment_out.as_mut().map(|alignment| {
-        let alignment_col_major = alignment
-            .rb_mut()
-            .try_as_col_major_mut()
-            .expect("projection alignment matrix must be column-major (row_stride == 1)");
-        let stride = alignment_col_major.col_stride() as usize;
-        (alignment_col_major.as_ptr_mut() as usize, stride)
-    });
+    let solve_base = build_projection_solve_base(
+        global_info_packed,
+        normalization,
+        components,
+        accumulated_variants,
+    );
+    let outputs =
+        SampleOutputAddresses::new(&mut scores, &mut alignment_out, &mut conditioning_out);
+    let want_conditioning = outputs.wants_conditioning();
     let solve_chunk = projection_solve_sample_chunk(n_samples);
     let solve_chunks = n_samples.div_ceil(solve_chunk);
+
+    // Rebuild this sample's information matrix from the global one by removing
+    // the rank-one contribution of each variant the sample is missing. Shared by
+    // the first attempt and by every rung of the ridge ladder.
+    let fill_sample_info = |dst: &mut [f64], missing: &[u32]| {
+        let dense = components * components;
+        dst[..dense].copy_from_slice(&solve_base.base_info[..dense]);
+        for &variant in missing {
+            let variant = variant as usize;
+            for row in 0..components {
+                let row_loading = loadings[(variant, row)];
+                for col in row..components {
+                    dst[col * components + row] -= row_loading * loadings[(variant, col)];
+                }
+            }
+        }
+    };
 
     (0..solve_chunks).into_par_iter().for_each_init(
         || {
@@ -1697,60 +2357,77 @@ fn solve_projection_with_sparse_missing_variants(
                 vec![0.0f64; components * components],
                 vec![0.0f64; components],
                 vec![0.0f64; components],
+                vec![0.0f64; components],
+                vec![0.0f64; components],
                 vec![0.0f64; SPARSE_MISSING_WOODBURY_MAX * components],
                 vec![0.0f64; SPARSE_MISSING_WOODBURY_MAX],
                 vec![0.0f64; SPARSE_MISSING_WOODBURY_MAX * SPARSE_MISSING_WOODBURY_MAX],
             )
         },
-        |(info_matrix, rhs, diag_mass, low_missing_z, low_missing_rhs, low_missing_gram),
+        |(
+            info_matrix,
+            rhs,
+            diag_mass,
+            alignment_values,
+            inverse_column,
+            low_missing_z,
+            low_missing_rhs,
+            low_missing_gram,
+        ),
          chunk_idx| {
-            let scores_ptr = scores_ptr as *mut f64;
-            let align_col_stride = alignment_ptr.map(|(_, stride)| stride).unwrap_or(0);
-            let alignment_ptr = alignment_ptr.map(|(ptr, _)| ptr as *mut f64);
+            let outputs = outputs.as_pointers();
             let sample_start = chunk_idx * solve_chunk;
             let sample_end = (sample_start + solve_chunk).min(n_samples);
 
             for sample in sample_start..sample_end {
                 let missing = &missing_variants[sample];
-                for k in 0..components {
-                    rhs[k] = unsafe { *scores_ptr.add(k * scores_col_stride + sample) };
+
+                // Retained mass per component: the global diagonal less the
+                // squared loading of every variant this sample did not observe.
+                diag_mass[..components].copy_from_slice(&solve_base.global_diag[..components]);
+                for &variant in missing {
+                    let variant = variant as usize;
+                    for row in 0..components {
+                        let row_loading = loadings[(variant, row)];
+                        diag_mass[row] -= row_loading * row_loading;
+                    }
+                }
+                let trace: f64 = diag_mass[..components].iter().sum();
+
+                if trace <= solve_base.information_floor {
+                    outputs.write_undetermined(sample, components, zero_action);
+                    continue;
                 }
 
-                let solved = if missing.is_empty() && solve_base.base_factor_ready {
-                    solve_cholesky_factor_in_place(
-                        &solve_base.base_factor,
-                        &mut rhs[..components],
-                        components,
-                    )
-                } else {
-                    diag_mass[..components].copy_from_slice(&solve_base.global_diag[..components]);
-                    for &variant in missing {
-                        let variant = variant as usize;
-                        for row in 0..components {
-                            let row_loading = loadings[(variant, row)];
-                            diag_mass[row] -= row_loading * row_loading;
-                            for col in row..components {
-                                info_matrix[col * components + row] -=
-                                    row_loading * loadings[(variant, col)];
-                            }
-                        }
-                    }
-                    let trace: f64 = diag_mass.iter().sum();
-                    if trace <= WLS_RIDGE * (components as f64) {
-                        write_zero_projection_sample(
-                            scores_ptr,
-                            scores_col_stride,
-                            alignment_ptr,
-                            align_col_stride,
+                // The exact case: `VᵀV = I` and every model variant was observed,
+                // so the least squares system is the identity and the projection
+                // is the accumulated `Vᵀy` already in `scores`. See
+                // `solve_projection_with_dense_missing_info`.
+                if missing.is_empty() && solve_base.info_is_identity {
+                    outputs.write_alignment(sample, &solve_base.base_alignment);
+                    outputs.write_conditioning(sample, SampleConditioning::EXACT);
+                    continue;
+                }
+
+                // Both shortcuts reuse the shared factor instead of forming this
+                // sample's matrix, so neither leaves anything to measure a
+                // conditioning bound from; they are skipped when one was asked
+                // for, and the sample takes the explicit factorization instead.
+                let shortcut_applicable = solve_base.base_factor_ready
+                    && (missing.is_empty()
+                        || (!want_conditioning && missing.len() <= SPARSE_MISSING_WOODBURY_MAX));
+
+                let mut conditioning = if shortcut_applicable {
+                    outputs.read_rhs(sample, components, rhs);
+                    if missing.is_empty() {
+                        solve_cholesky_factor_in_place(
+                            &solve_base.base_factor,
+                            &mut rhs[..components],
                             components,
-                            sample,
-                            zero_action,
-                        );
-                        continue;
-                    }
-                    if solve_base.base_factor_ready && missing.len() <= SPARSE_MISSING_WOODBURY_MAX
-                    {
-                        let woodbury_solved = solve_projection_low_missing_with_woodbury(
+                        )
+                        .then_some(solve_base.base_conditioning)
+                    } else {
+                        solve_projection_low_missing_with_woodbury(
                             &solve_base.base_factor,
                             &mut rhs[..components],
                             missing,
@@ -1759,82 +2436,51 @@ fn solve_projection_with_sparse_missing_variants(
                             &mut low_missing_rhs[..missing.len()],
                             &mut low_missing_gram[..missing.len() * missing.len()],
                             components,
-                        );
-                        if woodbury_solved {
-                            true
-                        } else {
-                            info_matrix[..components * components]
-                                .copy_from_slice(&solve_base.base_info[..components * components]);
-                            for &variant in missing {
-                                let variant = variant as usize;
-                                for row in 0..components {
-                                    let row_loading = loadings[(variant, row)];
-                                    for col in row..components {
-                                        info_matrix[col * components + row] -=
-                                            row_loading * loadings[(variant, col)];
-                                    }
-                                }
-                            }
-                            solve_spd_lower_in_place(
-                                info_matrix,
-                                &mut rhs[..components],
-                                components,
-                            )
-                        }
-                    } else {
-                        info_matrix[..components * components]
-                            .copy_from_slice(&solve_base.base_info[..components * components]);
-                        for &variant in missing {
-                            let variant = variant as usize;
-                            for row in 0..components {
-                                let row_loading = loadings[(variant, row)];
-                                for col in row..components {
-                                    info_matrix[col * components + row] -=
-                                        row_loading * loadings[(variant, col)];
-                                }
-                            }
-                        }
-                        solve_spd_lower_in_place(info_matrix, &mut rhs[..components], components)
-                    }
-                };
-
-                if solved {
-                    for k in 0..components {
-                        unsafe {
-                            *scores_ptr.add(k * scores_col_stride + sample) = rhs[k];
-                        }
-                    }
-                    if let Some(alignment_ptr) = alignment_ptr {
-                        if missing.is_empty() {
-                            for (k, &value) in solve_base.base_alignment.iter().enumerate() {
-                                unsafe {
-                                    *alignment_ptr.add(k * align_col_stride + sample) = value;
-                                }
-                            }
-                        } else {
-                            for (k, &mass) in diag_mass.iter().enumerate() {
-                                let denom = normalization.get(k).copied().unwrap_or(0.0);
-                                let value = if mass > 0.0 && denom > 0.0 {
-                                    (mass / denom).sqrt()
-                                } else {
-                                    0.0
-                                };
-                                unsafe {
-                                    *alignment_ptr.add(k * align_col_stride + sample) = value;
-                                }
-                            }
-                        }
+                        )
+                        .then_some(SampleConditioning::UNMEASURED)
                     }
                 } else {
-                    write_zero_projection_sample(
-                        scores_ptr,
-                        scores_col_stride,
-                        alignment_ptr,
-                        align_col_stride,
+                    None
+                };
+
+                if conditioning.is_none() {
+                    // No shortcut applied, or one was tried and failed. A failed
+                    // shortcut leaves `rhs` holding a partial solve rather than
+                    // `VᵀΩy`, so the right-hand side is re-read from the scores;
+                    // the previous fallback did not, and solved the explicit
+                    // system against that corrupted vector.
+                    outputs.read_rhs(sample, components, rhs);
+                    fill_sample_info(&mut info_matrix[..], missing);
+                    conditioning = solve_sample_information_system(
+                        info_matrix,
+                        &mut rhs[..components],
+                        inverse_column,
                         components,
-                        sample,
-                        zero_action,
+                        trace,
+                        want_conditioning,
+                        |restored| fill_sample_info(restored, missing),
                     );
+                }
+
+                match conditioning {
+                    Some(conditioning) => {
+                        outputs.write_scores(sample, components, rhs);
+                        if outputs.alignment.is_some() {
+                            if missing.is_empty() {
+                                outputs.write_alignment(sample, &solve_base.base_alignment);
+                            } else {
+                                for k in 0..components {
+                                    alignment_values[k] = retained_alignment(
+                                        diag_mass[k],
+                                        normalization.get(k).copied().unwrap_or(0.0),
+                                    );
+                                }
+                                outputs.write_alignment(sample, &alignment_values[..components]);
+                            }
+                        }
+                        outputs.write_conditioning(sample, conditioning);
+                    }
+                    None => outputs.write_undetermined(sample, components, zero_action),
                 }
             }
         },
@@ -2683,11 +3329,7 @@ fn plink_missing_lane_masks() -> &'static [u8; 256] {
     })
 }
 
-fn build_dense_lower_info_matrix(
-    global_info_packed: &[f64],
-    components: usize,
-    ridge: f64,
-) -> Vec<f64> {
+fn build_dense_lower_info_matrix(global_info_packed: &[f64], components: usize) -> Vec<f64> {
     let mut dense = vec![0.0f64; components * components];
     let mut idx = 0usize;
     for row in 0..components {
@@ -2696,7 +3338,6 @@ fn build_dense_lower_info_matrix(
             dense[col * components + row] = value;
             idx += 1;
         }
-        dense[row * components + row] += ridge;
     }
     dense
 }
@@ -2774,33 +3415,6 @@ fn solve_cholesky_factor_in_place(factor: &[f64], b: &mut [f64], n: usize) -> bo
 
 fn solve_spd_lower_in_place(a: &mut [f64], b: &mut [f64], n: usize) -> bool {
     factorize_spd_lower_in_place(a, n) && solve_cholesky_factor_in_place(a, b, n)
-}
-
-fn write_zero_projection_sample(
-    scores_ptr: *mut f64,
-    scores_col_stride: usize,
-    alignment_ptr: Option<*mut f64>,
-    align_col_stride: usize,
-    components: usize,
-    sample: usize,
-    zero_action: ZeroAlignmentAction,
-) {
-    let score_value = match zero_action {
-        ZeroAlignmentAction::Zero => 0.0,
-        ZeroAlignmentAction::NaN => f64::NAN,
-    };
-    for component in 0..components {
-        unsafe {
-            *scores_ptr.add(component * scores_col_stride + sample) = score_value;
-        }
-    }
-    if let Some(alignment_ptr) = alignment_ptr {
-        for component in 0..components {
-            unsafe {
-                *alignment_ptr.add(component * align_col_stride + sample) = 0.0;
-            }
-        }
-    }
 }
 
 fn projection_solve_sample_chunk(n_samples: usize) -> usize {
@@ -3544,6 +4158,7 @@ mod tests {
         let options = ProjectionOptions {
             missing_axis_renormalization: true,
             return_alignment: true,
+            return_conditioning: false,
             on_zero_alignment: ZeroAlignmentAction::Zero,
         };
         let result = model
@@ -3580,6 +4195,7 @@ mod tests {
         let renorm_options = ProjectionOptions {
             missing_axis_renormalization: true,
             return_alignment: true,
+            return_conditioning: false,
             on_zero_alignment: ZeroAlignmentAction::Zero,
         };
         let renorm_result = model
@@ -3611,6 +4227,7 @@ mod tests {
         let options = ProjectionOptions {
             missing_axis_renormalization: true,
             return_alignment: true,
+            return_conditioning: false,
             on_zero_alignment: ZeroAlignmentAction::NaN,
         };
         let result = model
@@ -3644,6 +4261,7 @@ mod tests {
         let options = ProjectionOptions {
             missing_axis_renormalization: true,
             return_alignment: true,
+            return_conditioning: false,
             on_zero_alignment: ZeroAlignmentAction::Zero,
         };
         let result = model
@@ -3696,6 +4314,7 @@ mod tests {
         let renorm_options = ProjectionOptions {
             missing_axis_renormalization: true,
             return_alignment: true,
+            return_conditioning: false,
             on_zero_alignment: ZeroAlignmentAction::Zero,
         };
         let renorm_result = model
@@ -3754,6 +4373,7 @@ mod tests {
         let options = ProjectionOptions {
             missing_axis_renormalization: false,
             return_alignment: false,
+            return_conditioning: false,
             on_zero_alignment: ZeroAlignmentAction::Zero,
         };
 
@@ -4046,6 +4666,7 @@ mod tests {
         let options = ProjectionOptions {
             missing_axis_renormalization: true,
             return_alignment: true,
+            return_conditioning: false,
             on_zero_alignment: ZeroAlignmentAction::Zero,
         };
 
@@ -4078,6 +4699,7 @@ mod tests {
         let options = ProjectionOptions {
             missing_axis_renormalization: true,
             return_alignment: true,
+            return_conditioning: false,
             on_zero_alignment: ZeroAlignmentAction::Zero,
         };
 
@@ -4109,6 +4731,7 @@ mod tests {
         let options = ProjectionOptions {
             missing_axis_renormalization: true,
             return_alignment: true,
+            return_conditioning: false,
             on_zero_alignment: ZeroAlignmentAction::Zero,
         };
 
@@ -4152,6 +4775,7 @@ mod tests {
         let options = ProjectionOptions {
             missing_axis_renormalization: true,
             return_alignment: true,
+            return_conditioning: false,
             on_zero_alignment: ZeroAlignmentAction::Zero,
         };
 
@@ -4224,6 +4848,7 @@ mod tests {
         let options = ProjectionOptions {
             missing_axis_renormalization: true,
             return_alignment: true,
+            return_conditioning: false,
             on_zero_alignment: ZeroAlignmentAction::Zero,
         };
 
@@ -4266,6 +4891,7 @@ mod tests {
         let options = ProjectionOptions {
             missing_axis_renormalization: true,
             return_alignment: true,
+            return_conditioning: false,
             on_zero_alignment: ZeroAlignmentAction::Zero,
         };
         let result = model
@@ -4357,6 +4983,7 @@ mod tests {
         let options = ProjectionOptions {
             missing_axis_renormalization: true,
             return_alignment: true,
+            return_conditioning: false,
             on_zero_alignment: ZeroAlignmentAction::Zero,
         };
         let dense_result = model

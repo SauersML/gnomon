@@ -12,9 +12,14 @@
 //! - Allele orientation: A1 equals ALT and A2 equals REF (per split
 //!   ALT). The virtual `.bim` follows the PLINK 1.9 contract with `cM =`
 //!   `0` and synthesised IDs when needed.
-//! - Genotype basis: prefer hard-calls; otherwise derive a hard-call from
-//!   dosage using nearest-integer with ±0.10 tolerance, else mark the
-//!   value as missing.
+//! - Genotype basis: the hard-call track wins wherever it has a call. The
+//!   dosage track is consulted only where that call is missing, and a dosage
+//!   then becomes the nearest whole allele count within ±0.10, else missing.
+//!   A dosage-valued (imputed) fileset therefore reaches consumers as hard
+//!   calls, which is a different analysis from the one it looks like. What
+//!   that costs is counted as the `.pgen` is read and reported: see
+//!   `VirtualPlink19::dosage_coercion_report`, and the stderr warning the
+//!   adapter raises on its own once the counts are decisive.
 //! - Ploidy: autosomes plus pseudoautosomal regions are diploid; `X`
 //!   (non-PAR), `Y`, and `MT` are treated as haploid for males.
 //!   Heterozygotes in these contexts are coerced to missing before PLINK
@@ -30,6 +35,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::str;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::files::{
@@ -58,6 +64,10 @@ pub struct VirtualPlink19 {
     fam_rows: Vec<FamRow>,
     n_samples: usize,
     n_variants: usize,
+    /// Shared with the decoder behind `bed`, so the counts a caller reads are
+    /// the ones the decode path is writing. `None` for mode 0x01, which *is* a
+    /// PLINK 1.9 `.bed`: it carries no dosages, so there is nothing to lose.
+    dosage: Option<Arc<DosageCoercionMeter>>,
 }
 
 /// Reopens a `.pvar` text stream. Boxed rather than a path so remote (`gs://`,
@@ -83,6 +93,20 @@ impl VirtualPlink19 {
 
     pub fn n_variants(&self) -> usize {
         self.n_variants
+    }
+
+    /// What presenting this fileset as PLINK 1.9 hard calls has cost so far.
+    ///
+    /// The counts accumulate as the virtual `.bed` is read, so exact totals
+    /// mean asking after the final pass; before that they describe the records
+    /// visited. A caller is not obliged to ask — the adapter warns on stderr by
+    /// itself, precisely because a consumer that never asks must still not be
+    /// left believing it fitted on dosages.
+    pub fn dosage_coercion_report(&self) -> DosageCoercionReport {
+        self.dosage
+            .as_ref()
+            .map(|meter| meter.report())
+            .unwrap_or_default()
     }
 
     /// A fresh forward pass over the virtual `.bim`.
@@ -172,34 +196,40 @@ pub fn open_virtual_plink19_from_sources(
 
     let fam_rows = psam_info.fam_rows.clone();
 
-    let bed_source: Arc<dyn ByteRangeSource> = match header.mode {
-        PgenMode::Bed => {
-            if plan.out_variants != plan.in_variants {
-                return Err(PipelineError::Io(
-                    "Mode 0x01 (.bed) cannot expand multiallelic variants; re-encode the input to mode 0x10/0x11"
-                        .into(),
-                ));
+    let (bed_source, dosage): (Arc<dyn ByteRangeSource>, Option<Arc<DosageCoercionMeter>>) =
+        match header.mode {
+            PgenMode::Bed => {
+                if plan.out_variants != plan.in_variants {
+                    return Err(PipelineError::Io(
+                        "Mode 0x01 (.bed) cannot expand multiallelic variants; re-encode the input to mode 0x10/0x11"
+                            .into(),
+                    ));
+                }
+                let bed: Arc<dyn ByteRangeSource> = pgen.clone();
+                (bed, None)
             }
-            pgen.clone()
-        }
-        _ => {
-            let decoder = PgenDecoder::new(
-                pgen.clone(),
-                header,
-                psam_info.n_samples,
-                plan.in_variants,
-                plan.alts_per_in.clone(),
-            )?;
-            let sex_by_sample_arc: Arc<[u8]> =
-                Arc::from(psam_info.sex_by_sample.clone().into_boxed_slice());
-            Arc::new(VirtualBed::new(
-                decoder,
-                plan.clone(),
-                psam_info.n_samples,
-                sex_by_sample_arc,
-            )?)
-        }
-    };
+            _ => {
+                let decoder = PgenDecoder::new(
+                    pgen.clone(),
+                    header,
+                    psam_info.n_samples,
+                    plan.in_variants,
+                    plan.alts_per_in.clone(),
+                )?;
+                // Taken before the decoder is moved into the block source: the
+                // decoder is the only writer, and this handle the only reader.
+                let meter = Arc::clone(&decoder.dosage_meter);
+                let sex_by_sample_arc: Arc<[u8]> =
+                    Arc::from(psam_info.sex_by_sample.clone().into_boxed_slice());
+                let bed: Arc<dyn ByteRangeSource> = Arc::new(VirtualBed::new(
+                    decoder,
+                    plan.clone(),
+                    psam_info.n_samples,
+                    sex_by_sample_arc,
+                )?);
+                (bed, Some(meter))
+            }
+        };
 
     Ok(VirtualPlink19 {
         bed: bed_source,
@@ -208,6 +238,7 @@ pub fn open_virtual_plink19_from_sources(
         fam_rows,
         n_samples: psam_info.n_samples,
         n_variants: plan.out_variants,
+        dosage,
     })
 }
 
@@ -2092,6 +2123,11 @@ struct PgenDecoder {
     /// reads does not allocate two sample-sized buffers per variant.
     cats_buf: Vec<u8>,
     alt_counts: Vec<u16>,
+    /// Tallies what the hard-call projection discards, and says so out loud
+    /// once it has seen enough records to mean it. Shared with the
+    /// `VirtualPlink19` handle rather than owned outright, because the caller
+    /// holding that handle never sees this decoder.
+    dosage_meter: Arc<DosageCoercionMeter>,
 }
 
 impl PgenDecoder {
@@ -2136,6 +2172,10 @@ impl PgenDecoder {
             anchor_cats: Vec::new(),
             cats_buf: Vec::new(),
             alt_counts,
+            dosage_meter: Arc::new(DosageCoercionMeter::new(
+                n_samples_from_psam,
+                in_variants,
+            )),
         })
     }
 
@@ -2286,12 +2326,14 @@ impl PgenDecoder {
         let (len, rec_ty) = self.load_record(idx)?;
         let mut cursor = 0usize;
 
-        // Disjoint field borrows: the record bytes, the anchor categories, and
-        // the category output buffer are all owned by `self`.
+        // Disjoint field borrows: the record bytes, the anchor categories, the
+        // category output buffer and the coercion meter are all owned by
+        // `self`.
         let Self {
             scratch,
             anchor_cats,
             cats_buf,
+            dosage_meter,
             ..
         } = self;
         let buf = &scratch[..len];
@@ -2373,12 +2415,27 @@ impl PgenDecoder {
 
         let has_dosage = (rec_ty & 0b0110_0000) != 0;
 
+        // Multiallelic dosage tracks (#5-#10) are intentionally ignored for
+        // alternate alleles beyond the first; keep hard-call derived values
+        // (which may remain missing).
+        let decode_dosage = alt_count <= 1 || alt_ord_1b == 1;
+
+        // Account for this input variant at most once for the life of the
+        // process, and only on a visit that actually reads its dosage track.
+        // Both halves matter: a multiallelic record is re-decoded once per ALT,
+        // and a multi-pass consumer (block Lanczos re-streams the matrix every
+        // iteration) re-decodes every record once per pass. A visit that skips
+        // the dosage track leaves the variant unclaimed, so a later
+        // representative visit can still count it.
+        let meter: &DosageCoercionMeter = &**dosage_meter;
+        let accounting = (!has_dosage || decode_dosage) && meter.claim(idx);
+        if accounting {
+            meter.note_variant(has_dosage);
+        }
+        let entry_meter = accounting.then_some(meter);
+
         let mut dosage_entries = 0usize;
         if has_dosage {
-            // Multiallelic dosage tracks (#5-#10) are intentionally ignored for
-            // alternate alleles beyond the first; keep hard-call derived values
-            // (which may remain missing).
-            let decode_dosage = alt_count <= 1 || alt_ord_1b == 1;
             let b5 = (rec_ty & 0b0010_0000) != 0;
             let b6 = (rec_ty & 0b0100_0000) != 0;
 
@@ -2393,20 +2450,14 @@ impl PgenDecoder {
                 }
                 if decode_dosage {
                     for (i, &sid) in ids.iter().enumerate() {
-                        if (sid as usize) < n {
-                            let v =
-                                u16::from_le_bytes([buf[cursor + 2 * i], buf[cursor + 2 * i + 1]]);
-                            if a1dosage[sid as usize] == 255 && v != 65535 {
-                                let pl = sample_ploidy
-                                    .and_then(|p| p.get(sid as usize))
-                                    .copied()
-                                    .unwrap_or(2);
-                                let hc = u16_to_hardcall_biallelic(v, pl);
-                                if hc != 255 {
-                                    a1dosage[sid as usize] = hc;
-                                }
-                            }
-                        }
+                        let v = u16::from_le_bytes([buf[cursor + 2 * i], buf[cursor + 2 * i + 1]]);
+                        absorb_dosage_entry(
+                            &mut a1dosage,
+                            sid as usize,
+                            v,
+                            sample_ploidy,
+                            entry_meter,
+                        );
                     }
                 }
                 cursor += need;
@@ -2421,13 +2472,7 @@ impl PgenDecoder {
                 if decode_dosage {
                     for s in 0..n {
                         let v = u16::from_le_bytes([buf[cursor + 2 * s], buf[cursor + 2 * s + 1]]);
-                        if a1dosage[s] == 255 && v != 65535 {
-                            let pl = sample_ploidy.and_then(|p| p.get(s)).copied().unwrap_or(2);
-                            let hc = u16_to_hardcall_biallelic(v, pl);
-                            if hc != 255 {
-                                a1dosage[s] = hc;
-                            }
-                        }
+                        absorb_dosage_entry(&mut a1dosage, s, v, sample_ploidy, entry_meter);
                     }
                 }
                 cursor += need;
@@ -2443,17 +2488,8 @@ impl PgenDecoder {
                 }
                 if decode_dosage {
                     for (i, &s) in present.iter().enumerate() {
-                        if s < n {
-                            let v =
-                                u16::from_le_bytes([buf[cursor + 2 * i], buf[cursor + 2 * i + 1]]);
-                            if a1dosage[s] == 255 && v != 65535 {
-                                let pl = sample_ploidy.and_then(|p| p.get(s)).copied().unwrap_or(2);
-                                let hc = u16_to_hardcall_biallelic(v, pl);
-                                if hc != 255 {
-                                    a1dosage[s] = hc;
-                                }
-                            }
-                        }
+                        let v = u16::from_le_bytes([buf[cursor + 2 * i], buf[cursor + 2 * i + 1]]);
+                        absorb_dosage_entry(&mut a1dosage, s, v, sample_ploidy, entry_meter);
                     }
                 }
                 cursor += need;
@@ -2515,6 +2551,13 @@ impl PgenDecoder {
                     "Cursor advanced beyond end of record for variant #{idx}"
                 )));
             }
+        }
+
+        // Only on a visit that changed the counts: the verdict cannot move
+        // otherwise, and a scoring run re-reads records far more often than it
+        // discovers them.
+        if accounting {
+            meter.maybe_report();
         }
 
         dst.copy_from_slice(&a1dosage);
@@ -2837,6 +2880,334 @@ fn apply_multiallelic_and_project(
     Ok(())
 }
 
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Dosage → hard-call coercion, and the cost of it
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/// How far a dosage may sit from a whole allele count and still be read as that
+/// count. Past it the genotype is dropped rather than guessed at.
+const DOSAGE_HARDCALL_TOLERANCE: f32 = 0.10;
+
+/// Input variants that must be seen before the coercion counts are allowed to
+/// say anything. Carrying a dosage track is a property of each record, so a few
+/// hundred records already separate an imputed fileset from an array one; a
+/// fileset smaller than this is judged on the whole of it instead.
+const DOSAGE_VERDICT_AFTER_VARIANTS: u64 = 256;
+
+/// The share of seen variants that must carry a dosage track before this stops
+/// being a footnote and becomes a wrong-analysis warning. Compared as integer
+/// percent so no float rounding decides whether a user is told.
+const DOSAGE_ALARM_PERCENT: u64 = 50;
+
+/// What presenting a `.pgen` as PLINK 1.9 hard calls has discarded.
+///
+/// Counted over *input* variants, each one accounted exactly once however many
+/// times a consumer re-reads it, so these numbers describe the dataset and not
+/// the reads. Fields are cumulative over the life of the handle.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DosageCoercionReport {
+    /// Input variants whose record has been decoded at least once.
+    pub variants_examined: u64,
+    /// How many of those carried a dosage track at all.
+    pub variants_with_dosage: u64,
+    /// Dosage entries read. Missing dosages and samples with no alleles at the
+    /// site are excluded: neither loses anything to a hard call.
+    pub dosage_values: u64,
+    /// Entries that are not whole allele counts, and so cannot survive the
+    /// hard-call representation however they were resolved. This is the
+    /// headline "the input really is dosage-valued" number.
+    pub fractional_values: u64,
+    /// Fractional entries snapped to the nearest whole count, because the
+    /// record's hard-call track had no call for that sample.
+    pub rounded_to_hardcall: u64,
+    /// Entries turned into missing genotypes because no whole count was within
+    /// `DOSAGE_HARDCALL_TOLERANCE`.
+    pub dropped_off_tolerance: u64,
+    /// Fractional entries never consulted at all, because the record's own
+    /// hard-call track already had a call for that sample and it wins. On a
+    /// fileset PLINK 2 wrote with both tracks this is where nearly all of the
+    /// loss lives, and the tolerance above never enters into it.
+    pub discarded_for_existing_hardcall: u64,
+}
+
+/// Accumulates a `DosageCoercionReport` as the `.pgen` is decoded, and raises
+/// the alarm once the counts are decisive.
+///
+/// Shared between the decoder and the `VirtualPlink19` handle, so the counters
+/// are atomics rather than a second mutex on the decode path.
+struct DosageCoercionMeter {
+    n_samples: usize,
+    in_variants: usize,
+    /// One bit per input variant, set the first time that variant is counted.
+    /// Without it a multi-pass fit would multiply every total below by the
+    /// number of passes and report a fiction.
+    accounted: Vec<AtomicU64>,
+    variants_examined: AtomicU64,
+    variants_with_dosage: AtomicU64,
+    dosage_values: AtomicU64,
+    fractional_values: AtomicU64,
+    rounded_to_hardcall: AtomicU64,
+    dropped_off_tolerance: AtomicU64,
+    discarded_for_existing_hardcall: AtomicU64,
+    /// Latches, so a message cannot be printed once per variant. The note and
+    /// the warning latch separately: a fileset whose dosage records only begin
+    /// part-way through is upgraded from one to the other rather than being
+    /// stuck with whatever the first few hundred records suggested.
+    noted: AtomicBool,
+    alarmed: AtomicBool,
+}
+
+impl DosageCoercionMeter {
+    fn new(n_samples: usize, in_variants: usize) -> Self {
+        Self {
+            n_samples,
+            in_variants,
+            accounted: (0..in_variants.div_ceil(64))
+                .map(|_| AtomicU64::new(0))
+                .collect(),
+            variants_examined: AtomicU64::new(0),
+            variants_with_dosage: AtomicU64::new(0),
+            dosage_values: AtomicU64::new(0),
+            fractional_values: AtomicU64::new(0),
+            rounded_to_hardcall: AtomicU64::new(0),
+            dropped_off_tolerance: AtomicU64::new(0),
+            discarded_for_existing_hardcall: AtomicU64::new(0),
+            noted: AtomicBool::new(false),
+            alarmed: AtomicBool::new(false),
+        }
+    }
+
+    /// Claims input variant `idx` for counting, returning `false` if some
+    /// earlier decode of the same record already counted it.
+    ///
+    /// The bitset is allocated in 64-bit words, so the length check is against
+    /// the variant count rather than the word count: past the end of the
+    /// fileset there is no variant to account for, even where a spare bit
+    /// exists to record one.
+    fn claim(&self, idx: usize) -> bool {
+        if idx >= self.in_variants {
+            return false;
+        }
+        let Some(word) = self.accounted.get(idx >> 6) else {
+            return false;
+        };
+        let bit = 1u64 << (idx & 63);
+        (word.fetch_or(bit, Ordering::Relaxed) & bit) == 0
+    }
+
+    fn note_variant(&self, has_dosage: bool) {
+        self.variants_examined.fetch_add(1, Ordering::Relaxed);
+        if has_dosage {
+            self.variants_with_dosage.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Records one dosage entry and what the hard-call projection did to it.
+    ///
+    /// The tolerance verdict comes from `u16_to_hardcall_biallelic` itself
+    /// rather than being re-derived here, so the counts cannot drift away from
+    /// the conversion they claim to describe.
+    fn record_entry(&self, v: u16, ploidy: u8, had_hardcall: bool) {
+        // A missing dosage, or a sample with no alleles at this site, loses
+        // nothing to the hard-call form: it was already absent.
+        if v == 65535 || ploidy == 0 {
+            return;
+        }
+        self.dosage_values.fetch_add(1, Ordering::Relaxed);
+
+        // Decided on the stored integer rather than the float: the scale is a
+        // power of two, so a whole allele count is exactly a multiple of one
+        // copy's worth and no epsilon is involved.
+        let per_copy: u32 = if ploidy <= 1 { 32768 } else { 16384 };
+        let fractional = (v as u32) % per_copy != 0;
+        if fractional {
+            self.fractional_values.fetch_add(1, Ordering::Relaxed);
+        }
+
+        if had_hardcall {
+            if fractional {
+                self.discarded_for_existing_hardcall
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        } else if u16_to_hardcall_biallelic(v, ploidy) == 255 {
+            self.dropped_off_tolerance.fetch_add(1, Ordering::Relaxed);
+        } else if fractional {
+            self.rounded_to_hardcall.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn report(&self) -> DosageCoercionReport {
+        DosageCoercionReport {
+            variants_examined: self.variants_examined.load(Ordering::Relaxed),
+            variants_with_dosage: self.variants_with_dosage.load(Ordering::Relaxed),
+            dosage_values: self.dosage_values.load(Ordering::Relaxed),
+            fractional_values: self.fractional_values.load(Ordering::Relaxed),
+            rounded_to_hardcall: self.rounded_to_hardcall.load(Ordering::Relaxed),
+            dropped_off_tolerance: self.dropped_off_tolerance.load(Ordering::Relaxed),
+            discarded_for_existing_hardcall: self
+                .discarded_for_existing_hardcall
+                .load(Ordering::Relaxed),
+        }
+    }
+
+    /// Tells the user, at most one note and at most one warning for the life of
+    /// the handle. The fileset's own size bounds the evidence threshold, so a
+    /// fileset of three variants is still judged — on all three of them.
+    ///
+    /// Written to stderr rather than through `log`, because nothing in this
+    /// crate installs a logger: a `warn!` here would be discarded, which for
+    /// this particular message is the same as not writing it at all.
+    fn maybe_report(&self) {
+        let report = self.report();
+        if report.variants_with_dosage == 0 {
+            return;
+        }
+        let decisive = DOSAGE_VERDICT_AFTER_VARIANTS
+            .min(self.in_variants as u64)
+            .max(1);
+        if report.variants_examined < decisive {
+            return;
+        }
+
+        // Short-circuit order matters: below the alarm share, `alarmed` must
+        // stay unlatched so a later, more dosage-heavy stretch can still raise
+        // it. Above the share but already latched, the note is suppressed too,
+        // because the warning subsumes it.
+        if report.variants_with_dosage * 100 >= report.variants_examined * DOSAGE_ALARM_PERCENT
+            && !self.alarmed.swap(true, Ordering::Relaxed)
+        {
+            self.noted.store(true, Ordering::Relaxed);
+            eprint!("{}", format_dosage_alarm(&report, self.n_samples));
+        } else if !self.noted.swap(true, Ordering::Relaxed) {
+            eprint!("{}", format_dosage_note(&report));
+        }
+    }
+}
+
+/// The quiet form, for a fileset where dosage records are the minority: worth
+/// saying once, not worth a banner.
+fn format_dosage_note(report: &DosageCoercionReport) -> String {
+    let tolerance = DOSAGE_HARDCALL_TOLERANCE;
+    format!(
+        "> Note: {}/{} .pgen variants read so far carry a dosage track. Those dosages are \
+         read as hard calls (nearest whole allele count within ±{tolerance}, otherwise \
+         missing); {} values so far were not whole allele counts.\n",
+        report.variants_with_dosage, report.variants_examined, report.fractional_values,
+    )
+}
+
+/// The loud form, for a fileset that is substantially dosage-valued. This is
+/// the case where the analysis the user believes they asked for and the
+/// analysis they are getting are two different analyses.
+fn format_dosage_alarm(report: &DosageCoercionReport, n_samples: usize) -> String {
+    use std::fmt::Write;
+
+    let percent = |num: u64, den: u64| -> f64 {
+        if den == 0 {
+            0.0
+        } else {
+            (num as f64) * 100.0 / (den as f64)
+        }
+    };
+    let rule = "=".repeat(81);
+    let tolerance = DOSAGE_HARDCALL_TOLERANCE;
+
+    let mut out = String::with_capacity(1024);
+    // Built whole and written in one call: several decode threads may share
+    // this meter, and a half-interleaved banner would be worse than none.
+    let _ = writeln!(out, "\n{rule}");
+    let _ = writeln!(
+        out,
+        " WARNING: this .pgen holds dosages, and gnomon is reading it as hard calls."
+    );
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        " {} of {} variants read so far ({:.1}%) carry a dosage track, over {} samples.",
+        report.variants_with_dosage,
+        report.variants_examined,
+        percent(report.variants_with_dosage, report.variants_examined),
+        n_samples,
+    );
+    let _ = writeln!(
+        out,
+        " Of {} dosage values read, {} ({:.1}%) are not whole allele counts, and a hard",
+        report.dosage_values,
+        report.fractional_values,
+        percent(report.fractional_values, report.dosage_values),
+    );
+    let _ = writeln!(out, " call cannot carry them:");
+    let _ = writeln!(
+        out,
+        "   {} were never consulted: the record's own hard-call track already had a",
+        report.discarded_for_existing_hardcall,
+    );
+    let _ = writeln!(out, "     call for that sample, and that call wins.");
+    let _ = writeln!(
+        out,
+        "   {} were snapped to the nearest whole count (within ±{tolerance}).",
+        report.rounded_to_hardcall,
+    );
+    let _ = writeln!(
+        out,
+        "   {} became MISSING: no whole count was within ±{tolerance}.",
+        report.dropped_off_tolerance,
+    );
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        " Everything computed downstream (allele frequencies, the MAF screen, LD pruning,"
+    );
+    let _ = writeln!(
+        out,
+        " the PCA fit itself) is computed from those hard calls. If this fileset is"
+    );
+    let _ = writeln!(
+        out,
+        " imputed, the result is a hard-call fit and not the dosage fit it resembles."
+    );
+    let _ = writeln!(out, "{rule}\n");
+    out
+}
+
+/// Applies one PGEN dosage entry to the hard-call vector, and records what that
+/// cost.
+///
+/// The hard-call track wins wherever it has a call. PLINK 2 normally writes
+/// both tracks, so on an imputed fileset that branch is the common one and the
+/// dosage is dropped without the tolerance ever being consulted — the reason
+/// `meter` counts it separately. Pass `None` for `meter` on a repeat visit to a
+/// record already accounted for, so re-reads cannot inflate the totals.
+fn absorb_dosage_entry(
+    a1dosage: &mut [u8],
+    s: usize,
+    v: u16,
+    sample_ploidy: Option<&[u8]>,
+    meter: Option<&DosageCoercionMeter>,
+) {
+    let Some(slot) = a1dosage.get_mut(s) else {
+        // A sample ID past the end of the cohort: not this variant's genotype,
+        // and not this variant's loss either.
+        return;
+    };
+    let had_hardcall = *slot != 255;
+    if had_hardcall && meter.is_none() {
+        // The hard call stands and nobody is counting what that cost; skip the
+        // ploidy lookup entirely, since this is the common case on a re-read.
+        return;
+    }
+    let ploidy = sample_ploidy.and_then(|p| p.get(s)).copied().unwrap_or(2);
+    if !had_hardcall && v != 65535 {
+        let hc = u16_to_hardcall_biallelic(v, ploidy);
+        if hc != 255 {
+            *slot = hc;
+        }
+    }
+    if let Some(meter) = meter {
+        meter.record_entry(v, ploidy, had_hardcall);
+    }
+}
+
 fn u16_to_hardcall_biallelic(v: u16, ploidy: u8) -> u8 {
     if v == 65535 || ploidy == 0 {
         return 255;
@@ -2853,7 +3224,7 @@ fn u16_to_hardcall_biallelic(v: u16, ploidy: u8) -> u8 {
                 best = i as u8;
             }
         }
-        if best_d <= 0.10 {
+        if best_d <= DOSAGE_HARDCALL_TOLERANCE {
             match best {
                 0 => 0,
                 1 => 2,
@@ -2874,7 +3245,11 @@ fn u16_to_hardcall_biallelic(v: u16, ploidy: u8) -> u8 {
                 best = i as u8;
             }
         }
-        if best_d <= 0.10 { best } else { 255 }
+        if best_d <= DOSAGE_HARDCALL_TOLERANCE {
+            best
+        } else {
+            255
+        }
     }
 }
 
@@ -3054,6 +3429,175 @@ mod tests {
         for (v, expect) in hap_vals {
             assert_eq!(u16_to_hardcall_biallelic(v, 1), expect);
         }
+    }
+
+    /// The tolerance is a contract with the user, not an implementation
+    /// detail: a genuine hard call survives untouched, a value just inside the
+    /// tolerance becomes a genotype, and a value just outside it becomes
+    /// missing rather than being guessed at. Values are written as raw `u16`
+    /// so the assertion is about the boundary and not about how some decimal
+    /// literal happened to round on the way in.
+    #[test]
+    fn dosage_hardcall_tolerance_boundary() {
+        // Diploid: one allele copy is 16384 units, so 1638/16384 = 0.0999 sits
+        // inside the ±0.10 tolerance and 1639/16384 = 0.1000366 sits outside.
+        assert_eq!(u16_to_hardcall_biallelic(0, 2), 0);
+        assert_eq!(u16_to_hardcall_biallelic(16384, 2), 1);
+        assert_eq!(u16_to_hardcall_biallelic(32768, 2), 2);
+        assert_eq!(u16_to_hardcall_biallelic(16384 + 1638, 2), 1);
+        assert_eq!(u16_to_hardcall_biallelic(16384 + 1639, 2), 255);
+        assert_eq!(u16_to_hardcall_biallelic(16384 - 1638, 2), 1);
+        assert_eq!(u16_to_hardcall_biallelic(16384 - 1639, 2), 255);
+        // Dosage 1.5: the case a hard call has no honest answer for.
+        assert_eq!(u16_to_hardcall_biallelic(24576, 2), 255);
+        assert_eq!(u16_to_hardcall_biallelic(65535, 2), 255);
+
+        // Haploid: one copy is the whole 32768, so the same absolute tolerance
+        // covers half as much of the scale.
+        assert_eq!(u16_to_hardcall_biallelic(0, 1), 0);
+        assert_eq!(u16_to_hardcall_biallelic(32768, 1), 2);
+        assert_eq!(u16_to_hardcall_biallelic(3276, 1), 0);
+        assert_eq!(u16_to_hardcall_biallelic(3277, 1), 255);
+        assert_eq!(u16_to_hardcall_biallelic(16384, 1), 255);
+
+        // Ploidy 0 (a female sample on chrY) has no genotype to round to.
+        assert_eq!(u16_to_hardcall_biallelic(0, 0), 255);
+    }
+
+    /// The counters must describe exactly the conversion above, including the
+    /// outcome that never reaches the tolerance at all: where the record's own
+    /// hard-call track has a call, the dosage is discarded without being
+    /// rounded, and that is the bulk of the loss on a PLINK 2-written imputed
+    /// fileset.
+    #[test]
+    fn dosage_meter_classifies_each_outcome() {
+        let meter = DosageCoercionMeter::new(4, 1);
+        meter.record_entry(16384, 2, false); // exactly 1.0: nothing is lost
+        meter.record_entry(16384 + 1638, 2, false); // inside tolerance: rounded
+        meter.record_entry(16384 + 1639, 2, false); // outside tolerance: missing
+        meter.record_entry(16384 + 1638, 2, true); // hard call wins: discarded
+        meter.record_entry(65535, 2, false); // dosage already missing
+        meter.record_entry(16384 + 1638, 0, false); // no alleles at this site
+
+        let report = meter.report();
+        assert_eq!(report.dosage_values, 4);
+        assert_eq!(report.fractional_values, 3);
+        assert_eq!(report.rounded_to_hardcall, 1);
+        assert_eq!(report.dropped_off_tolerance, 1);
+        assert_eq!(report.discarded_for_existing_hardcall, 1);
+    }
+
+    /// A record is decoded once per ALT of a multiallelic and once per pass of
+    /// a multi-pass fit. The report has to describe the dataset, not the reads,
+    /// or a warning about "millions of discarded dosages" would be a statement
+    /// about the number of Lanczos iterations.
+    #[test]
+    fn dosage_meter_counts_each_variant_once() {
+        let meter = DosageCoercionMeter::new(2, 100);
+        assert!(meter.claim(1));
+        assert!(!meter.claim(1));
+        assert!(meter.claim(0));
+        // Bits are independent across the 64-variant words the set is built
+        // from: claiming one variant must not claim its neighbours.
+        assert!(meter.claim(64));
+        assert!(!meter.claim(64));
+        assert!(meter.claim(65));
+        // Past the end of the fileset, even though a spare bit exists in the
+        // final word: there is no variant there to account for.
+        assert!(!meter.claim(100));
+        assert!(!meter.claim(127));
+    }
+
+    /// End to end through a real dense-dosage record: the hard-call track wins
+    /// where it has a call, the dosage fills the gaps it can and drops the ones
+    /// it cannot, and every one of those outcomes is counted exactly once no
+    /// matter how often the record is re-read.
+    #[test]
+    fn dense_dosage_record_is_hardcalled_and_counted() {
+        let n = 4usize;
+        // Categories 0 and 1 are calls; 3 is missing, and only there does the
+        // dosage track get a say.
+        let mut rec = pack_twobit_values(&[0u8, 1, 3, 3]);
+        // 18022 is dosage 1.09997 (inside tolerance), 18023 is 1.10004 (outside).
+        for v in [0u16, 18022, 18022, 18023] {
+            rec.extend_from_slice(&v.to_le_bytes());
+        }
+
+        let src: Arc<dyn ByteRangeSource> = Arc::new(VecSource::new(rec.clone()));
+        let hdr = PgenHeader {
+            mode: PgenMode::Var,
+            m_variants: 1,
+            n_samples: n as u32,
+            fmt_byte: 0,
+            // Bit 6 alone: a dense dosage track, unphased, biallelic.
+            rec_types: vec![0b0100_0000],
+            rec_lens: vec![rec.len() as u32],
+            block_offsets: vec![0],
+        };
+        let mut decoder = PgenDecoder::new(src, hdr, n, 1, vec![1]).unwrap();
+        let meter = Arc::clone(&decoder.dosage_meter);
+
+        let mut out = vec![0u8; n];
+        decoder
+            .decode_variant_hardcalls(0, 1, &mut out, None)
+            .unwrap();
+        // Sample 1 keeps its hard call of 1 even though its dosage is 1.09997;
+        // sample 2 is rounded into one; sample 3 is dropped.
+        assert_eq!(out, vec![0, 1, 1, 255]);
+
+        let first = meter.report();
+        assert_eq!(first.variants_examined, 1);
+        assert_eq!(first.variants_with_dosage, 1);
+        assert_eq!(first.dosage_values, 4);
+        assert_eq!(first.fractional_values, 3);
+        assert_eq!(first.discarded_for_existing_hardcall, 1);
+        assert_eq!(first.rounded_to_hardcall, 1);
+        assert_eq!(first.dropped_off_tolerance, 1);
+
+        decoder
+            .decode_variant_hardcalls(0, 1, &mut out, None)
+            .unwrap();
+        assert_eq!(out, vec![0, 1, 1, 255]);
+        assert_eq!(
+            meter.report(),
+            first,
+            "a re-read must not inflate the counts"
+        );
+    }
+
+    /// A hard-call fileset must stay silent: the whole point of the counters is
+    /// that a microarray `.pgen` is served exactly as before, with nothing to
+    /// report and no warning to ignore.
+    #[test]
+    fn hardcall_only_record_reports_no_dosage_loss() {
+        let n = 8usize;
+        let rec = pack_twobit_values(&[0u8, 1, 2, 0, 2, 1, 3, 2]);
+        let src: Arc<dyn ByteRangeSource> = Arc::new(VecSource::new(rec.clone()));
+        let hdr = PgenHeader {
+            mode: PgenMode::Var,
+            m_variants: 1,
+            n_samples: n as u32,
+            fmt_byte: 0,
+            rec_types: vec![0],
+            rec_lens: vec![rec.len() as u32],
+            block_offsets: vec![0],
+        };
+        let mut decoder = PgenDecoder::new(src, hdr, n, 1, vec![1]).unwrap();
+        let meter = Arc::clone(&decoder.dosage_meter);
+
+        let mut out = vec![0u8; n];
+        decoder
+            .decode_variant_hardcalls(0, 1, &mut out, None)
+            .unwrap();
+        assert_eq!(out, vec![0, 1, 2, 0, 2, 1, 255, 2]);
+
+        // The variant is seen; nothing about it is dosage-valued, so every
+        // other counter stays at zero and nothing is ever printed.
+        let expected = DosageCoercionReport {
+            variants_examined: 1,
+            ..DosageCoercionReport::default()
+        };
+        assert_eq!(meter.report(), expected);
     }
 
     #[test]
