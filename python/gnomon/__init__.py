@@ -15,4 +15,4 @@ from ._gnomon import infer_sex, model, project, score, terms
 
 __all__ = ["score", "project", "terms", "infer_sex", "model"]
 
-__version__ = "0.1.0"
+__version__ = "0.1.3"

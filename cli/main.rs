@@ -34,9 +34,9 @@ use gnomon::calibrate::survival_data::{
     load_survival_training_data,
 };
 #[cfg(feature = "map")]
-use gnomon::map::main as map_cli;
+use gnomon::map::LdWindow;
 #[cfg(feature = "map")]
-use gnomon::map::{DEFAULT_LD_WINDOW, LdWindow};
+use gnomon::map::main as map_cli;
 #[cfg(feature = "terms")]
 use gnomon::terms::infer_sex_to_tsv;
 #[cfg(feature = "calibrate")]
@@ -106,6 +106,11 @@ struct FitArgs {
     /// Path to PLINK .bed file or directory containing .bed files
     #[arg(value_name = "GENOTYPE_PATH")]
     genotype_path: PathBuf,
+
+    /// Output prefix for every fit artifact (for example, results/eur).
+    /// Defaults to the genotype path's stem for interactive convenience.
+    #[arg(long, value_name = "PREFIX")]
+    out: Option<PathBuf>,
 
     /// Optional variant list limiting SNVs used for PCA fitting
     #[arg(long, value_name = "PATH")]
@@ -677,6 +682,18 @@ fn run_score(args: ScoreArgs) -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(feature = "map")]
 fn run_map_fit(args: FitArgs) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(threads) = args.threads {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads.get())
+            .build_global()
+            .map_err(|err| {
+                std::io::Error::other(format!(
+                    "could not enforce the --threads={} process-wide worker ceiling: {err}",
+                    threads.get()
+                ))
+            })?;
+    }
+
     let maf = match args.maf {
         Some(value) if value.is_finite() && (0.0..=0.5).contains(&value) => {
             if value > 0.0 {
@@ -731,8 +748,7 @@ fn run_map_fit(args: FitArgs) -> Result<(), Box<dyn std::error::Error>> {
     let ld_window = if args.ld {
         if let Some(bp) = args.bp_window {
             Some(LdWindow::BasePairs(bp))
-        } else {
-            let window = args.sites_window.unwrap_or(DEFAULT_LD_WINDOW);
+        } else if let Some(window) = args.sites_window {
             if window == 0 {
                 return Err(Box::new(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -746,16 +762,28 @@ fn run_map_fit(args: FitArgs) -> Result<(), Box<dyn std::error::Error>> {
                 )));
             }
             Some(LdWindow::Sites(window))
+        } else {
+            Some(LdWindow::BasePairs(500_000))
         }
     } else {
         None
     };
 
+    let markers = if args.ld && args.markers.is_none() {
+        println!(
+            "LD safety budget: using 100000 evenly spaced markers; pass --markers explicitly to override."
+        );
+        Some(100_000)
+    } else {
+        args.markers
+    };
+
     map_cli::run(map_cli::MapCommand::Fit {
         genotype_path: args.genotype_path,
+        output_prefix: args.out,
         variant_list: args.list,
         keep: args.keep,
-        markers: args.markers,
+        markers,
         components: args.components,
         threads: args.threads.map(NonZeroUsize::get),
         allow_unconverged: args.allow_unconverged,

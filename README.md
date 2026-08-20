@@ -75,7 +75,7 @@ the fit itself without writing an intermediate PLINK fileset:
 
 ```
 ./target/release/gnomon fit path/to/aou-array.bed --components 20 \
-  --mind 0.05 --geno 0.05 --maf 0.01 --threads 16
+  --mind 0.05 --geno 0.05 --maf 0.01 --threads 4 --out results/aou
 ```
 
 The QC order matches PLINK: `--list`/`--markers`, then `--keep`, `--mind`,
@@ -83,6 +83,23 @@ The QC order matches PLINK: `--list`/`--markers`, then `--keep`, `--mind`,
 at its requested maximum missingness is retained. PCA frequencies, LD weights,
 loadings, scores, and sample manifests are all computed from the final retained
 sample set.
+
+`--out PREFIX` writes the complete artifact set under that prefix (for example,
+`results/aou.hwe.json` and `results/aou.hwe_scores.bin`) without touching the
+genotype directory. This makes simultaneous ancestry-specific fits safe and
+removes the need to stage or symlink PLINK files. Without `--out`, artifacts
+remain beside the input for quick interactive runs.
+
+`--ld` is safe by default on biobank arrays: when no expert overrides are
+provided it uses a 500 kbp physical window and an evenly spaced 100,000-marker
+budget. This matters because a full 1.2M-marker array with 500 kbp local solves
+can take days. Pass `--markers`, `--bp_window`, or `--sites_window` explicitly
+to override the production defaults.
+
+`--threads N` configures both the fit-local and process-wide Rayon pools before
+any fit work starts, so library kernels cannot silently escape the requested
+worker ceiling. Scheduler CPU affinity remains an additional deployment guard,
+not a requirement for correct CLI behavior.
 
 ```
 # Infer sample sex

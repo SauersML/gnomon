@@ -9,10 +9,10 @@ use std::time::{Duration, Instant};
 
 const PROGRESS_TICK_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Minimum interval between CI log lines for the same stage.
-const CI_LOG_INTERVAL: Duration = Duration::from_secs(10);
+/// Maximum silence between durable progress lines for the same stage.
+const LOG_INTERVAL: Duration = Duration::from_secs(30);
 /// Minimum percentage increase before emitting a CI log line.
-const CI_LOG_PERCENT_THRESHOLD: f64 = 5.0;
+const CI_LOG_PERCENT_THRESHOLD: f64 = 10.0;
 
 /// Output mode determines how progress is reported based on the runtime environment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,6 +58,8 @@ impl OutputMode {
 /// Stages reported during model fitting.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FitProgressStage {
+    SampleQc,
+    VariantQc,
     AlleleStatistics,
     LdWeights,
     GramMatrix,
@@ -67,6 +69,8 @@ pub enum FitProgressStage {
 impl FitProgressStage {
     pub fn describe(self) -> &'static str {
         match self {
+            Self::SampleQc => "sample missingness QC",
+            Self::VariantQc => "variant QC",
             Self::AlleleStatistics => "allele statistics",
             Self::LdWeights => "LD weight computation",
             Self::GramMatrix => "Gram matrix accumulation",
@@ -92,6 +96,12 @@ pub trait FitProgressObserver: Send + Sync {
     fn on_stage_advance(&self, stage: FitProgressStage, processed_variants: usize) {
         let _ = (stage, processed_variants);
     }
+    fn on_stage_increment(&self, stage: FitProgressStage, delta: usize) {
+        let _ = (stage, delta);
+    }
+    fn on_stage_pass(&self, stage: FitProgressStage, pass: usize, max_passes: usize) {
+        let _ = (stage, pass, max_passes);
+    }
     fn on_stage_total(&self, stage: FitProgressStage, total_variants: usize) {
         let _ = (stage, total_variants);
     }
@@ -111,13 +121,24 @@ pub struct NoopFitProgress;
 
 impl FitProgressObserver for NoopFitProgress {}
 
-#[derive(Clone)]
 pub struct StageProgressHandle<P>
 where
     P: FitProgressObserver,
 {
     observer: Arc<P>,
     stage: FitProgressStage,
+}
+
+impl<P> Clone for StageProgressHandle<P>
+where
+    P: FitProgressObserver,
+{
+    fn clone(&self) -> Self {
+        Self {
+            observer: Arc::clone(&self.observer),
+            stage: self.stage,
+        }
+    }
 }
 
 impl<P> StageProgressHandle<P>
@@ -135,6 +156,14 @@ where
     pub fn advance(&self, processed_variants: usize) {
         self.observer
             .on_stage_advance(self.stage, processed_variants);
+    }
+
+    pub fn increment(&self, delta: usize) {
+        self.observer.on_stage_increment(self.stage, delta);
+    }
+
+    pub fn begin_pass(&self, pass: usize, max_passes: usize) {
+        self.observer.on_stage_pass(self.stage, pass, max_passes);
     }
 
     pub fn estimate(&self, estimated_total: usize) {
@@ -204,7 +233,7 @@ fn progress_draw_target() -> ProgressDrawTarget {
 
 fn determinate_style() -> ProgressStyle {
     ProgressStyle::with_template(
-        "{spinner:.green} {msg:<40} {percent:>3}% |{bar:40.cyan/blue}| {pos}/{len} [{elapsed_precise}<{eta_precise}]",
+        "{spinner:.green} {msg:<38} {percent:>3}% |{bar:28.cyan/blue}| {pos}/{len} {per_sec} [{elapsed_precise} • ETA {eta_precise}]",
     )
     .expect("valid progress template")
     .progress_chars("=>-")
@@ -231,6 +260,8 @@ struct ManagedStageBar {
     bar: ProgressBar,
     mode: StageBarMode,
     units: StageUnits,
+    started: Instant,
+    pass: Option<(usize, usize)>,
 }
 
 impl ManagedStageBar {
@@ -248,6 +279,8 @@ impl ManagedStageBar {
                     total: total as u64,
                 },
                 units: StageUnits::Variants,
+                started: Instant::now(),
+                pass: None,
             }
         } else {
             let bar = ProgressBar::new_spinner();
@@ -260,6 +293,8 @@ impl ManagedStageBar {
                 bar,
                 mode: StageBarMode::Spinner { approximate: None },
                 units: StageUnits::Variants,
+                started: Instant::now(),
+                pass: None,
             }
         }
     }
@@ -275,6 +310,20 @@ impl ManagedStageBar {
                 self.bar.set_position(processed_variants as u64);
             }
         }
+    }
+
+    fn increment(&self, delta: usize) {
+        self.bar.inc(delta as u64);
+    }
+
+    fn begin_pass(&mut self, pass: usize, max_passes: usize) {
+        self.pass = Some((pass, max_passes));
+        self.bar.reset_elapsed();
+        self.bar.set_position(0);
+        self.bar.set_message(format!(
+            "{} • pass {pass}/{max_passes}",
+            ConsoleFitProgress::stage_message(self.stage)
+        ));
     }
 
     fn set_estimate(&mut self, estimated_total: usize) {
@@ -312,8 +361,14 @@ impl ManagedStageBar {
         let current = self.bar.position().min(total);
         self.bar.set_style(determinate_style());
         self.bar.set_length(total);
-        self.bar
-            .set_message(ConsoleFitProgress::stage_message(self.stage));
+        let message = match self.pass {
+            Some((pass, max)) => format!(
+                "{} • pass {pass}/{max}",
+                ConsoleFitProgress::stage_message(self.stage)
+            ),
+            None => ConsoleFitProgress::stage_message(self.stage).to_owned(),
+        };
+        self.bar.set_message(message);
         self.bar.enable_steady_tick(PROGRESS_TICK_INTERVAL);
         self.bar.set_position(current);
         self.mode = StageBarMode::Determinate { total };
@@ -369,6 +424,11 @@ impl ManagedStageBar {
     }
 
     fn finish(self, message: &'static str) {
+        let elapsed = format_duration(self.started.elapsed());
+        let message = match self.pass {
+            Some((pass, _)) => format!("{message} • {pass} passes • {elapsed}"),
+            None => format!("{message} • {elapsed}"),
+        };
         self.bar.finish_with_message(message);
     }
 
@@ -390,18 +450,22 @@ impl ConsoleFitProgress {
 
     pub fn stage_message(stage: FitProgressStage) -> &'static str {
         match stage {
+            FitProgressStage::SampleQc => "Screening sample missingness",
+            FitProgressStage::VariantQc => "Screening variant QC",
             FitProgressStage::AlleleStatistics => "Estimating allele statistics",
             FitProgressStage::LdWeights => "Computing LD weights",
-            FitProgressStage::GramMatrix => "Accumulating Gram matrix",
+            FitProgressStage::GramMatrix => "Solving principal components",
             FitProgressStage::Loadings => "Computing variant loadings",
         }
     }
 
     pub fn stage_complete(stage: FitProgressStage) -> &'static str {
         match stage {
+            FitProgressStage::SampleQc => "Sample missingness QC complete",
+            FitProgressStage::VariantQc => "Variant QC complete",
             FitProgressStage::AlleleStatistics => "Allele statistics complete",
             FitProgressStage::LdWeights => "LD weights computed",
-            FitProgressStage::GramMatrix => "Gram matrix finalized",
+            FitProgressStage::GramMatrix => "Principal components solved",
             FitProgressStage::Loadings => "Variant loadings complete",
         }
     }
@@ -454,6 +518,20 @@ impl FitProgressObserver for ConsoleFitProgress {
         }
     }
 
+    fn on_stage_increment(&self, stage: FitProgressStage, delta: usize) {
+        let inner = self.inner.lock().unwrap();
+        if let Some(bar) = inner.get(&stage) {
+            bar.increment(delta);
+        }
+    }
+
+    fn on_stage_pass(&self, stage: FitProgressStage, pass: usize, max_passes: usize) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(bar) = inner.get_mut(&stage) {
+            bar.begin_pass(pass, max_passes);
+        }
+    }
+
     fn on_stage_bytes(
         &self,
         stage: FitProgressStage,
@@ -499,7 +577,31 @@ struct CiStageState {
     processed: usize,
     last_log_time: Instant,
     last_log_percent: f64,
-    started: Instant,
+    stage_started: Instant,
+    segment_started: Instant,
+    pass: Option<(usize, usize)>,
+}
+
+fn format_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    let hours = seconds / 3_600;
+    let minutes = (seconds % 3_600) / 60;
+    let seconds = seconds % 60;
+    if hours > 0 {
+        format!("{hours}h {minutes:02}m {seconds:02}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn estimate_eta(elapsed: Duration, processed: usize, total: usize) -> Option<Duration> {
+    if processed == 0 || total <= processed {
+        return None;
+    }
+    let seconds = elapsed.as_secs_f64() * (total - processed) as f64 / processed as f64;
+    Some(Duration::from_secs(seconds.ceil().max(1.0) as u64))
 }
 
 impl CiStageState {
@@ -509,13 +611,15 @@ impl CiStageState {
             processed: 0,
             last_log_time: Instant::now(),
             last_log_percent: 0.0,
-            started: Instant::now(),
+            stage_started: Instant::now(),
+            segment_started: Instant::now(),
+            pass: None,
         }
     }
 
     fn should_log(&self) -> bool {
         let elapsed = self.last_log_time.elapsed();
-        if elapsed >= CI_LOG_INTERVAL {
+        if elapsed >= LOG_INTERVAL {
             return true;
         }
 
@@ -540,13 +644,21 @@ impl CiStageState {
         }
     }
 
+    fn begin_pass(&mut self, pass: usize, max_passes: usize) {
+        self.pass = Some((pass, max_passes));
+        self.processed = 0;
+        self.last_log_percent = 0.0;
+        self.last_log_time = Instant::now();
+        self.segment_started = Instant::now();
+    }
+
     fn format_progress(&self, stage: FitProgressStage) -> String {
-        let stage_name = match stage {
-            FitProgressStage::AlleleStatistics => "Estimating allele statistics",
-            FitProgressStage::LdWeights => "Computing LD weights",
-            FitProgressStage::GramMatrix => "Accumulating Gram matrix",
-            FitProgressStage::Loadings => "Computing variant loadings",
-        };
+        let stage_name = ConsoleFitProgress::stage_message(stage);
+        let pass = self
+            .pass
+            .map(|(pass, max)| format!(" • pass {pass}/{max}"))
+            .unwrap_or_default();
+        let elapsed = self.segment_started.elapsed();
 
         if let Some(total) = self.total {
             let percent = if total > 0 {
@@ -554,31 +666,36 @@ impl CiStageState {
             } else {
                 0.0
             };
+            let eta = estimate_eta(elapsed, self.processed, total)
+                .map(|eta| format!(" • ETA {}", format_duration(eta)))
+                .unwrap_or_default();
             format!(
-                "[PCA] {}... {:.0}% ({} / {} variants)",
-                stage_name, percent, self.processed, total
+                "[PCA] {stage_name}{pass} • {percent:.0}% ({}/{total} variants) • elapsed {}{eta}",
+                self.processed,
+                format_duration(elapsed)
             )
         } else {
-            format!("[PCA] {}... {} variants", stage_name, self.processed)
+            format!(
+                "[PCA] {stage_name}{pass} • {} variants • elapsed {}",
+                self.processed,
+                format_duration(elapsed)
+            )
         }
     }
 
     fn format_complete(&self, stage: FitProgressStage) -> String {
-        let stage_name = match stage {
-            FitProgressStage::AlleleStatistics => "Allele statistics complete",
-            FitProgressStage::LdWeights => "LD weights computed",
-            FitProgressStage::GramMatrix => "Gram matrix finalized",
-            FitProgressStage::Loadings => "Variant loadings complete",
-        };
-
-        let elapsed = self.started.elapsed();
-        let secs = elapsed.as_secs_f64();
+        let stage_name = ConsoleFitProgress::stage_complete(stage);
+        let elapsed = format_duration(self.stage_started.elapsed());
+        let passes = self
+            .pass
+            .map(|(pass, _)| format!(", {pass} passes"))
+            .unwrap_or_default();
         if let Some(total) = self.total {
-            format!("[PCA] {} ({} variants, {:.1}s)", stage_name, total, secs)
+            format!("[PCA] {stage_name} ({total} variants{passes}, {elapsed})")
         } else {
             format!(
-                "[PCA] {} ({} variants, {:.1}s)",
-                stage_name, self.processed, secs
+                "[PCA] {stage_name} ({} variants{passes}, {elapsed})",
+                self.processed
             )
         }
     }
@@ -586,8 +703,8 @@ impl CiStageState {
 
 /// Progress observer that emits periodic log lines for CI environments.
 ///
-/// Throttles output to avoid spam: only emits a log line when at least 5%
-/// more progress has been made OR at least 10 seconds have elapsed since
+/// Throttles output to avoid spam: only emits a log line when at least 10%
+/// more progress has been made OR at least 30 seconds have elapsed since
 /// the last log line.
 pub struct CiFitProgress {
     inner: Mutex<HashMap<FitProgressStage, CiStageState>>,
@@ -613,12 +730,7 @@ impl FitProgressObserver for CiFitProgress {
         inner.insert(stage, CiStageState::new(total_variants));
 
         // Emit initial log line
-        let stage_name = match stage {
-            FitProgressStage::AlleleStatistics => "Estimating allele statistics",
-            FitProgressStage::LdWeights => "Computing LD weights",
-            FitProgressStage::GramMatrix => "Accumulating Gram matrix",
-            FitProgressStage::Loadings => "Computing variant loadings",
-        };
+        let stage_name = ConsoleFitProgress::stage_message(stage);
         if total_variants > 0 {
             println!("[PCA] {}... (0 / {} variants)", stage_name, total_variants);
         } else {
@@ -651,6 +763,29 @@ impl FitProgressObserver for CiFitProgress {
                 println!("{}", state.format_progress(stage));
                 state.mark_logged();
             }
+        }
+    }
+
+    fn on_stage_increment(&self, stage: FitProgressStage, delta: usize) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(state) = inner.get_mut(&stage) {
+            state.processed = state.processed.saturating_add(delta);
+            if state.should_log() {
+                println!("{}", state.format_progress(stage));
+                state.mark_logged();
+            }
+        }
+    }
+
+    fn on_stage_pass(&self, stage: FitProgressStage, pass: usize, max_passes: usize) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(state) = inner.get_mut(&stage) {
+            state.begin_pass(pass, max_passes);
+            println!(
+                "[PCA] {} • pass {pass}/{max_passes} • 0% (0 / {} variants)",
+                ConsoleFitProgress::stage_message(stage),
+                state.total.unwrap_or(0)
+            );
         }
     }
 
@@ -692,50 +827,6 @@ impl FitProgressObserver for CiFitProgress {
         if let Some(state) = inner.remove(&stage) {
             println!("{}", state.format_complete(stage));
         }
-    }
-}
-
-/// Minimal progress observer for quiet/piped output.
-///
-/// Only logs stage start and completion - no intermediate progress updates.
-/// Suitable for piped/redirected output where minimal noise is desired.
-pub struct QuietFitProgress;
-
-impl QuietFitProgress {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Default for QuietFitProgress {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl FitProgressObserver for QuietFitProgress {
-    fn on_stage_start(&self, stage: FitProgressStage, total_variants: usize) {
-        let stage_name = match stage {
-            FitProgressStage::AlleleStatistics => "Estimating allele statistics",
-            FitProgressStage::LdWeights => "Computing LD weights",
-            FitProgressStage::GramMatrix => "Accumulating Gram matrix",
-            FitProgressStage::Loadings => "Computing variant loadings",
-        };
-        if total_variants > 0 {
-            println!("[PCA] {}... ({} variants)", stage_name, total_variants);
-        } else {
-            println!("[PCA] {}...", stage_name);
-        }
-    }
-
-    fn on_stage_finish(&self, stage: FitProgressStage) {
-        let stage_name = match stage {
-            FitProgressStage::AlleleStatistics => "allele statistics",
-            FitProgressStage::LdWeights => "LD weights",
-            FitProgressStage::GramMatrix => "Gram matrix",
-            FitProgressStage::Loadings => "loadings",
-        };
-        println!("[PCA] Completed {}.", stage_name);
     }
 }
 
@@ -978,7 +1069,7 @@ fn projection_stage_label(stage: ProjectionProgressStage) -> &'static str {
 /// Periodic log-line projection progress for non-TTY/CI/Jupyter shells.
 ///
 /// Throttled like `CiFitProgress`: at most one line per stage every
-/// `CI_LOG_INTERVAL`, or every `CI_LOG_PERCENT_THRESHOLD` percent of progress.
+/// `LOG_INTERVAL`, or every `CI_LOG_PERCENT_THRESHOLD` percent of progress.
 pub struct CiProjectionProgress {
     inner: Mutex<HashMap<ProjectionProgressStage, CiStageState>>,
 }
@@ -1021,9 +1112,14 @@ impl ProjectionProgressObserver for CiProjectionProgress {
                     } else {
                         0.0
                     };
+                    let elapsed = state.segment_started.elapsed();
+                    let eta = estimate_eta(elapsed, state.processed, total)
+                        .map(|eta| format!(" • ETA {}", format_duration(eta)))
+                        .unwrap_or_default();
                     println!(
-                        "[PCA] {label}... {percent:.0}% ({} / {total} variants)",
-                        state.processed
+                        "[PCA] {label} • {percent:.0}% ({} / {total} variants) • elapsed {}{eta}",
+                        state.processed,
+                        format_duration(elapsed)
                     );
                 } else {
                     println!("[PCA] {label}... {} variants", state.processed);
@@ -1045,42 +1141,11 @@ impl ProjectionProgressObserver for CiProjectionProgress {
     fn on_stage_finish(&self, stage: ProjectionProgressStage) {
         let mut inner = self.inner.lock().unwrap();
         if let Some(state) = inner.remove(&stage) {
-            let secs = state.started.elapsed().as_secs_f64();
+            let elapsed = format_duration(state.stage_started.elapsed());
             let label = projection_stage_label(stage);
             let count = state.total.unwrap_or(state.processed);
-            println!("[PCA] {label} complete ({count} variants, {secs:.1}s)");
+            println!("[PCA] {label} complete ({count} variants, {elapsed})");
         }
-    }
-}
-
-/// Quiet projection progress: announce start and finish only.
-pub struct QuietProjectionProgress;
-
-impl QuietProjectionProgress {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Default for QuietProjectionProgress {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ProjectionProgressObserver for QuietProjectionProgress {
-    fn on_stage_start(&self, stage: ProjectionProgressStage, total_variants: usize) {
-        let label = projection_stage_label(stage);
-        if total_variants > 0 {
-            println!("[PCA] {label}... ({total_variants} variants)");
-        } else {
-            println!("[PCA] {label}...");
-        }
-    }
-
-    fn on_stage_finish(&self, stage: ProjectionProgressStage) {
-        let label = projection_stage_label(stage);
-        println!("[PCA] {label} complete.");
     }
 }
 
@@ -1089,7 +1154,6 @@ impl ProjectionProgressObserver for QuietProjectionProgress {
 pub enum AdaptiveProjectionProgress {
     Terminal(ConsoleProjectionProgress),
     Ci(CiProjectionProgress),
-    Quiet(QuietProjectionProgress),
 }
 
 impl ProjectionProgressObserver for AdaptiveProjectionProgress {
@@ -1097,7 +1161,6 @@ impl ProjectionProgressObserver for AdaptiveProjectionProgress {
         match self {
             Self::Terminal(p) => p.on_stage_start(stage, total_variants),
             Self::Ci(p) => p.on_stage_start(stage, total_variants),
-            Self::Quiet(p) => p.on_stage_start(stage, total_variants),
         }
     }
 
@@ -1105,7 +1168,6 @@ impl ProjectionProgressObserver for AdaptiveProjectionProgress {
         match self {
             Self::Terminal(p) => p.on_stage_advance(stage, processed_variants),
             Self::Ci(p) => p.on_stage_advance(stage, processed_variants),
-            Self::Quiet(p) => p.on_stage_advance(stage, processed_variants),
         }
     }
 
@@ -1113,7 +1175,6 @@ impl ProjectionProgressObserver for AdaptiveProjectionProgress {
         match self {
             Self::Terminal(p) => p.on_stage_total(stage, total_variants),
             Self::Ci(p) => p.on_stage_total(stage, total_variants),
-            Self::Quiet(p) => p.on_stage_total(stage, total_variants),
         }
     }
 
@@ -1121,7 +1182,6 @@ impl ProjectionProgressObserver for AdaptiveProjectionProgress {
         match self {
             Self::Terminal(p) => p.on_stage_finish(stage),
             Self::Ci(p) => p.on_stage_finish(stage),
-            Self::Quiet(p) => p.on_stage_finish(stage),
         }
     }
 }
@@ -1131,7 +1191,6 @@ impl ProjectionProgressObserver for AdaptiveProjectionProgress {
 pub enum AdaptiveFitProgress {
     Terminal(ConsoleFitProgress),
     Ci(CiFitProgress),
-    Quiet(QuietFitProgress),
 }
 
 impl FitProgressObserver for AdaptiveFitProgress {
@@ -1139,7 +1198,6 @@ impl FitProgressObserver for AdaptiveFitProgress {
         match self {
             Self::Terminal(p) => p.on_stage_start(stage, total_variants),
             Self::Ci(p) => p.on_stage_start(stage, total_variants),
-            Self::Quiet(p) => p.on_stage_start(stage, total_variants),
         }
     }
 
@@ -1147,7 +1205,6 @@ impl FitProgressObserver for AdaptiveFitProgress {
         match self {
             Self::Terminal(p) => p.on_stage_estimate(stage, estimated_total),
             Self::Ci(p) => p.on_stage_estimate(stage, estimated_total),
-            Self::Quiet(p) => p.on_stage_estimate(stage, estimated_total),
         }
     }
 
@@ -1155,7 +1212,20 @@ impl FitProgressObserver for AdaptiveFitProgress {
         match self {
             Self::Terminal(p) => p.on_stage_advance(stage, processed_variants),
             Self::Ci(p) => p.on_stage_advance(stage, processed_variants),
-            Self::Quiet(p) => p.on_stage_advance(stage, processed_variants),
+        }
+    }
+
+    fn on_stage_increment(&self, stage: FitProgressStage, delta: usize) {
+        match self {
+            Self::Terminal(p) => p.on_stage_increment(stage, delta),
+            Self::Ci(p) => p.on_stage_increment(stage, delta),
+        }
+    }
+
+    fn on_stage_pass(&self, stage: FitProgressStage, pass: usize, max_passes: usize) {
+        match self {
+            Self::Terminal(p) => p.on_stage_pass(stage, pass, max_passes),
+            Self::Ci(p) => p.on_stage_pass(stage, pass, max_passes),
         }
     }
 
@@ -1163,7 +1233,6 @@ impl FitProgressObserver for AdaptiveFitProgress {
         match self {
             Self::Terminal(p) => p.on_stage_total(stage, total_variants),
             Self::Ci(p) => p.on_stage_total(stage, total_variants),
-            Self::Quiet(p) => p.on_stage_total(stage, total_variants),
         }
     }
 
@@ -1171,7 +1240,6 @@ impl FitProgressObserver for AdaptiveFitProgress {
         match self {
             Self::Terminal(p) => p.on_stage_finish(stage),
             Self::Ci(p) => p.on_stage_finish(stage),
-            Self::Quiet(p) => p.on_stage_finish(stage),
         }
     }
 
@@ -1184,7 +1252,6 @@ impl FitProgressObserver for AdaptiveFitProgress {
         match self {
             Self::Terminal(p) => p.on_stage_bytes(stage, processed_bytes, total_bytes),
             Self::Ci(p) => p.on_stage_bytes(stage, processed_bytes, total_bytes),
-            Self::Quiet(p) => p.on_stage_bytes(stage, processed_bytes, total_bytes),
         }
     }
 }
@@ -1193,28 +1260,61 @@ impl FitProgressObserver for AdaptiveFitProgress {
 ///
 /// - In terminals: Returns animated progress bars via `indicatif`
 /// - In CI/GHA: Returns periodic log lines (throttled to ~20 per stage)
-/// - In quiet mode: Returns start/finish messages only (no intermediate progress)
+/// - In notebooks, pipes, and redirected logs: Returns durable elapsed/ETA lines
 pub fn fit_progress() -> Arc<AdaptiveFitProgress> {
     match OutputMode::detect() {
         OutputMode::Terminal => Arc::new(AdaptiveFitProgress::Terminal(ConsoleFitProgress::new())),
         OutputMode::Ci => Arc::new(AdaptiveFitProgress::Ci(CiFitProgress::new())),
-        OutputMode::Quiet => Arc::new(AdaptiveFitProgress::Quiet(QuietFitProgress::new())),
+        OutputMode::Quiet => Arc::new(AdaptiveFitProgress::Ci(CiFitProgress::new())),
     }
 }
 
 /// Create a projection progress observer appropriate for the current environment.
 ///
 /// - In terminals: animated indicatif progress bar
-/// - In CI/Jupyter: periodic log lines (throttled to ~one per 10s or 5%)
-/// - In quiet mode: start/finish messages only
+/// - In CI/Jupyter: periodic log lines (throttled to ~one per 30s or 5%)
+/// - In notebooks, pipes, and redirected logs: durable elapsed/ETA lines
 pub fn projection_progress() -> Arc<AdaptiveProjectionProgress> {
     match OutputMode::detect() {
         OutputMode::Terminal => Arc::new(AdaptiveProjectionProgress::Terminal(
             ConsoleProjectionProgress::new(),
         )),
         OutputMode::Ci => Arc::new(AdaptiveProjectionProgress::Ci(CiProjectionProgress::new())),
-        OutputMode::Quiet => Arc::new(AdaptiveProjectionProgress::Quiet(
-            QuietProjectionProgress::new(),
-        )),
+        OutputMode::Quiet => Arc::new(AdaptiveProjectionProgress::Ci(CiProjectionProgress::new())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn durations_are_compact_and_stable_for_logs() {
+        assert_eq!(format_duration(Duration::from_secs(0)), "0s");
+        assert_eq!(format_duration(Duration::from_secs(59)), "59s");
+        assert_eq!(format_duration(Duration::from_secs(65)), "1m 05s");
+        assert_eq!(format_duration(Duration::from_secs(3_661)), "1h 01m 01s");
+    }
+
+    #[test]
+    fn eta_uses_only_completed_work() {
+        assert_eq!(
+            estimate_eta(Duration::from_secs(30), 250, 1_000),
+            Some(Duration::from_secs(90))
+        );
+        assert_eq!(estimate_eta(Duration::from_secs(30), 0, 1_000), None);
+        assert_eq!(estimate_eta(Duration::from_secs(30), 1_000, 1_000), None);
+    }
+
+    #[test]
+    fn adaptive_pass_logs_reset_the_segment_eta() {
+        let mut state = CiStageState::new(1_200_000);
+        state.begin_pass(3, 8);
+        state.processed = 600_000;
+        let line = state.format_progress(FitProgressStage::GramMatrix);
+        assert!(line.contains("Solving principal components • pass 3/8"));
+        assert!(line.contains("50% (600000/1200000 variants)"));
+        assert!(line.contains("elapsed"));
+        assert!(line.contains("ETA"));
     }
 }

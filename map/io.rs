@@ -13,9 +13,7 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::adapt_plink2::{VirtualPlink19, open_virtual_plink19_from_paths};
-use crate::map::fit::{
-    HwePcaModel, LdWeights, VariantBlockSource, for_each_packed_masked_code,
-};
+use crate::map::fit::{HwePcaModel, LdWeights, VariantBlockSource, for_each_packed_masked_code};
 use crate::map::project::ProjectionResult;
 use crate::map::variant_filter::{MatchKind, VariantFilter, VariantKey, VariantSelection};
 use crate::pipeline_error::PipelineError;
@@ -673,15 +671,22 @@ pub fn save_hwe_model(
     model: &HwePcaModel,
 ) -> Result<PathBuf, DatasetOutputError> {
     let model_path = dataset.output_path("hwe.json");
-    prepare_output_path(&model_path)?;
+    save_hwe_model_at(&model_path, model)
+}
 
-    let file = File::create(&model_path)?;
+pub fn save_hwe_model_at(
+    model_path: &Path,
+    model: &HwePcaModel,
+) -> Result<PathBuf, DatasetOutputError> {
+    prepare_output_path(model_path)?;
+
+    let file = File::create(model_path)?;
     let mut writer = BufWriter::new(file);
     serde_json::to_writer_pretty(&mut writer, model)?;
     writer.flush()?;
-    write_projection_cache(&model_path, model)?;
+    write_projection_cache(model_path, model)?;
 
-    Ok(model_path)
+    Ok(model_path.to_path_buf())
 }
 
 /// Loads the portable fitted model from the JSON artifact.
@@ -920,8 +925,7 @@ pub fn save_projection_results(
     let row_id_section = build_projection_row_id_section(dataset, scores.nrows())?;
 
     let scores_path = dataset.output_path("projection_scores.bin");
-    let scores_metadata =
-        write_projection_matrix(&scores_path, scores, "scores", &row_id_section)?;
+    let scores_metadata = write_projection_matrix(&scores_path, scores, "scores", &row_id_section)?;
 
     let mut alignment_path = None;
     let mut alignment_metadata = None;
@@ -1604,8 +1608,15 @@ pub fn save_sample_manifest(
     samples: &[SampleRecord],
 ) -> Result<PathBuf, DatasetOutputError> {
     let manifest_path = dataset.output_path("samples.tsv");
-    prepare_output_path(&manifest_path)?;
-    let mut writer = BufWriter::new(File::create(&manifest_path)?);
+    save_sample_manifest_at(&manifest_path, samples)
+}
+
+pub fn save_sample_manifest_at(
+    manifest_path: &Path,
+    samples: &[SampleRecord],
+) -> Result<PathBuf, DatasetOutputError> {
+    prepare_output_path(manifest_path)?;
+    let mut writer = BufWriter::new(File::create(manifest_path)?);
 
     writeln!(writer, "FID\tIID\tPAT\tMAT\tSEX\tPHENOTYPE")?;
 
@@ -1623,7 +1634,7 @@ pub fn save_sample_manifest(
     }
 
     writer.flush()?;
-    Ok(manifest_path)
+    Ok(manifest_path.to_path_buf())
 }
 
 /// Writes the fitted model's per-sample PC scores as a binary matrix artifact.
@@ -1638,6 +1649,15 @@ pub fn save_sample_manifest(
 /// Rows follow `samples`, the fit's retained sample set in dataset order.
 pub fn save_fit_scores(
     dataset: &GenotypeDataset,
+    model: &HwePcaModel,
+    samples: &[SampleRecord],
+) -> Result<(PathBuf, PathBuf), DatasetOutputError> {
+    let scores_path = dataset.output_path("hwe_scores.bin");
+    save_fit_scores_at(&scores_path, model, samples)
+}
+
+pub fn save_fit_scores_at(
+    scores_path: &Path,
     model: &HwePcaModel,
     samples: &[SampleRecord],
 ) -> Result<(PathBuf, PathBuf), DatasetOutputError> {
@@ -1656,10 +1676,9 @@ pub fn save_fit_scores(
         .collect();
     let row_id_section = build_projection_row_id_section_from_ids(&row_ids)?;
 
-    let scores_path = dataset.output_path("hwe_scores.bin");
-    let metadata_path = write_projection_matrix(&scores_path, scores, "scores", &row_id_section)?;
+    let metadata_path = write_projection_matrix(scores_path, scores, "scores", &row_id_section)?;
 
-    Ok((scores_path, metadata_path))
+    Ok((scores_path.to_path_buf(), metadata_path))
 }
 
 pub fn save_fit_summary(
@@ -1667,8 +1686,15 @@ pub fn save_fit_summary(
     model: &HwePcaModel,
 ) -> Result<PathBuf, DatasetOutputError> {
     let summary_path = dataset.output_path("hwe_summary.tsv");
-    prepare_output_path(&summary_path)?;
-    let mut writer = BufWriter::new(File::create(&summary_path)?);
+    save_fit_summary_at(&summary_path, model)
+}
+
+pub fn save_fit_summary_at(
+    summary_path: &Path,
+    model: &HwePcaModel,
+) -> Result<PathBuf, DatasetOutputError> {
+    prepare_output_path(summary_path)?;
+    let mut writer = BufWriter::new(File::create(summary_path)?);
 
     writeln!(writer, "metric\tvalue")?;
     writeln!(writer, "n_samples\t{}", model.n_samples())?;
@@ -1710,7 +1736,16 @@ pub fn save_fit_summary(
     }
 
     writer.flush()?;
-    Ok(summary_path)
+    Ok(summary_path.to_path_buf())
+}
+
+/// Appends a fit-artifact suffix to a user-selected output prefix without
+/// interpreting dots in the prefix as a file extension.
+pub fn fit_artifact_path(prefix: &Path, suffix: &str) -> PathBuf {
+    let mut path = OsString::from(prefix.as_os_str());
+    path.push(".");
+    path.push(suffix);
+    PathBuf::from(path)
 }
 
 fn prepare_output_path(path: &Path) -> Result<(), io::Error> {
@@ -2920,16 +2955,18 @@ impl VariantBlockSource for PlinkVariantBlockSource {
                 self.total_variants,
             ),
         };
-        Some(match (
-            self.sample_selection.as_deref(),
-            self.sample_byte_masks.as_deref(),
-        ) {
-            (Some(selection), Some(masks)) => {
-                packed.with_sample_selection_and_masks(selection, masks)
-            }
-            (None, None) => packed,
-            _ => return None,
-        })
+        Some(
+            match (
+                self.sample_selection.as_deref(),
+                self.sample_byte_masks.as_deref(),
+            ) {
+                (Some(selection), Some(masks)) => {
+                    packed.with_sample_selection_and_masks(selection, masks)
+                }
+                (None, None) => packed,
+                _ => return None,
+            },
+        )
     }
 }
 
@@ -5909,6 +5946,14 @@ mod tests {
     use std::path::Path;
     use tempfile::tempdir;
 
+    #[test]
+    fn fit_artifacts_append_to_the_full_user_prefix() {
+        assert_eq!(
+            fit_artifact_path(Path::new("results/pop.eur"), "hwe_scores.bin"),
+            PathBuf::from("results/pop.eur.hwe_scores.bin")
+        );
+    }
+
     fn fake_bcf_header() -> Vec<u8> {
         let header_text =
             b"##fileformat=VCFv4.3\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\n\0";
@@ -5995,12 +6040,7 @@ mod tests {
             let mut actual = vec![99.0; codes.len()];
             let code_values = plink_standardized_code_values(mean, inv, weight, swap);
             let byte_table = plink_standardized_byte_table(&code_values);
-            decode_plink_variant_standardized_bytes(
-                &bytes,
-                &mut actual,
-                codes.len(),
-                &byte_table,
-            );
+            decode_plink_variant_standardized_bytes(&bytes, &mut actual, codes.len(), &byte_table);
             assert_eq!(actual, expected, "weight={weight}, swap={swap}");
         }
     }

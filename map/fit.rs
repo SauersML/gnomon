@@ -31,6 +31,7 @@ use std::error::Error;
 use std::ops::Range;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::simd::Simd;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -922,9 +923,7 @@ where
     }
 
     fn block_storage_samples(&self) -> usize {
-        self.inner
-            .block_storage_samples()
-            .max(self.inner_n_samples)
+        self.inner.block_storage_samples().max(self.inner_n_samples)
     }
 
     fn reset(&mut self) -> Result<(), Self::Error> {
@@ -1430,7 +1429,11 @@ impl<'a> HardCallPacked<'a> {
     /// mapped from physical BED lanes back to its logical row number. Each
     /// Rayon worker owns one `n_samples` counter vector; reduction is linear in
     /// the cohort size rather than the genotype matrix size.
-    pub(crate) fn sample_missing_counts(&self, n_samples: usize) -> Option<Vec<usize>> {
+    pub(crate) fn sample_missing_counts<P: FitProgressObserver>(
+        &self,
+        n_samples: usize,
+        progress: Option<&StageProgressHandle<P>>,
+    ) -> Option<Vec<usize>> {
         let logical_by_physical = match self.sample_selection() {
             Some(selection) => {
                 if selection.len() != n_samples {
@@ -1464,6 +1467,7 @@ impl<'a> HardCallPacked<'a> {
                 let mut counts = vec![0usize; n_samples];
                 let start = worker * n_variants / workers;
                 let end = (worker + 1) * n_variants / workers;
+                let mut reported = 0usize;
                 for variant in start..end {
                     let bytes = self.slice(variant, 1)?;
                     match logical_by_physical.as_deref() {
@@ -1501,8 +1505,7 @@ impl<'a> HardCallPacked<'a> {
                                     while mask != 0 {
                                         let lane = mask.trailing_zeros() as usize;
                                         mask &= mask - 1;
-                                        let physical_row =
-                                            (byte_offset + remainder_idx) * 4 + lane;
+                                        let physical_row = (byte_offset + remainder_idx) * 4 + lane;
                                         let logical_row = logical[physical_row];
                                         if logical_row != usize::MAX {
                                             counts[logical_row] += 1;
@@ -1532,6 +1535,15 @@ impl<'a> HardCallPacked<'a> {
                             }
                         }
                     }
+                    if variant + 1 - start - reported >= 1_024 {
+                        if let Some(progress) = progress {
+                            progress.increment(variant + 1 - start - reported);
+                        }
+                        reported = variant + 1 - start;
+                    }
+                }
+                if let Some(progress) = progress {
+                    progress.increment(end - start - reported);
                 }
                 Some(counts)
             })
@@ -3733,7 +3745,14 @@ impl HwePcaModel {
                     }
                 };
 
-                // Setup matrix-free operator
+                // Every adaptive solver application is one complete genome
+                // pass. The handle lives in the operator so decoded-block
+                // completion, rather than mere reads, drives the pass ETA.
+                progress.on_stage_start(FitProgressStage::GramMatrix, observed_variants);
+                let gram_progress_handle = Some(StageProgressHandle::new(
+                    Arc::clone(progress),
+                    FitProgressStage::GramMatrix,
+                ));
                 let operator = StandardizedCovarianceOp::new(
                     source,
                     block_capacity,
@@ -3741,14 +3760,8 @@ impl HwePcaModel {
                     observed_variants,
                     scaler.clone(),
                     ld_weights_arc.clone(),
+                    gram_progress_handle.clone(),
                 );
-
-                // Progress tracking for Gram matrix computation
-                progress.on_stage_start(FitProgressStage::GramMatrix, n_variants_hint);
-                let gram_progress_handle = Some(StageProgressHandle::new(
-                    Arc::clone(progress),
-                    FitProgressStage::GramMatrix,
-                ));
 
                 // Run matrix-free eigensolver
                 let decomposition_result = compute_covariance_eigenpairs(
@@ -4113,6 +4126,7 @@ where
     scaler: HweScaler,
     observed_variants: usize,
     ld_weights: Option<Arc<[f64]>>,
+    progress: Option<StageProgressHandle<P>>,
     error: Mutex<Option<HwePcaError>>,
     marker: PhantomData<P>,
 }
@@ -4130,6 +4144,7 @@ where
         observed_variants: usize,
         scaler: HweScaler,
         ld_weights: Option<Arc<[f64]>>,
+        progress: Option<StageProgressHandle<P>>,
     ) -> Self {
         let n_samples = source.n_samples();
         let scale = 1.0 / ((n_samples - 1) as f64);
@@ -4143,6 +4158,7 @@ where
             scaler,
             observed_variants,
             ld_weights,
+            progress,
             error: Mutex::new(None),
             marker: PhantomData,
         }
@@ -4159,6 +4175,7 @@ where
             scaler,
             observed_variants: _,
             ld_weights: _,
+            progress: _,
             error: _,
             marker: _,
         } = self;
@@ -4482,6 +4499,9 @@ where
                         );
 
                         processed = start + filled;
+                        if let Some(progress) = self.progress.as_ref() {
+                            progress.advance(processed);
+                        }
 
                         if free_sender.send(id).is_err() {
                             break;
@@ -4612,6 +4632,8 @@ where
 {
     inner: &'a StandardizedCovarianceOp<'b, S, P>,
     par: Par,
+    pass: AtomicUsize,
+    max_passes: usize,
 }
 
 impl<S, P> BlockOperator for StreamingBlockOperator<'_, '_, S, P>
@@ -4627,6 +4649,10 @@ where
     }
 
     fn apply_block(&self, out: MatMut<'_, f64>, q: MatRef<'_, f64>) -> Result<(), Self::Error> {
+        let pass = self.pass.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+        if let Some(progress) = self.inner.progress.as_ref() {
+            progress.begin_pass(pass, self.max_passes);
+        }
         let scratch = self.inner.apply_scratch(q.ncols(), self.par);
         let mut mem = MemBuffer::new(scratch);
 
@@ -4711,6 +4737,8 @@ where
     let block_operator = StreamingBlockOperator {
         inner: operator,
         par,
+        pass: AtomicUsize::new(0),
+        max_passes: params.max_passes,
     };
 
     let outcome =
@@ -5216,6 +5244,11 @@ where
             let denom = scales[variant_idx].max(HWE_SCALE_FLOOR);
             let inv = if denom > 0.0 { denom.recip() } else { 0.0 };
             if inv == 0.0 {
+                if (variant_idx + 1) % 1_024 == 0 || variant_idx + 1 == max_variants {
+                    if let Some(progress) = self.progress.as_ref() {
+                        progress.advance(variant_idx + 1);
+                    }
+                }
                 continue;
             }
 
@@ -5351,6 +5384,11 @@ where
 
                 chunk_start += chunk;
             }
+            if (variant_idx + 1) % 1_024 == 0 || variant_idx + 1 == max_variants {
+                if let Some(progress) = self.progress.as_ref() {
+                    progress.advance(variant_idx + 1);
+                }
+            }
         }
 
         true
@@ -5452,9 +5490,35 @@ where
 
         let compute = |variant: usize| packed.moments(variant, n_samples);
         let moments: Option<Vec<_>> = if n_variants >= 32 && par.degree() > 1 {
-            (0..n_variants).into_par_iter().map(compute).collect()
+            const BATCH: usize = 1_024;
+            let batches = n_variants.div_ceil(BATCH);
+            let chunks: Option<Vec<Vec<_>>> = (0..batches)
+                .into_par_iter()
+                .map(|batch| {
+                    let start = batch * BATCH;
+                    let end = (start + BATCH).min(n_variants);
+                    let values: Option<Vec<_>> = (start..end).map(compute).collect();
+                    if values.is_some() {
+                        progress.increment(end - start);
+                    }
+                    values
+                })
+                .collect();
+            chunks.map(|chunks| chunks.into_iter().flatten().collect())
         } else {
-            (0..n_variants).map(compute).collect()
+            let mut values = Vec::with_capacity(n_variants);
+            for variant in 0..n_variants {
+                let Some(moment) = compute(variant) else {
+                    return Err(HwePcaError::InvalidInput(
+                        "packed hard-call source contains an invalid variant selection",
+                    ));
+                };
+                values.push(moment);
+                if (variant + 1) % 1_024 == 0 || variant + 1 == n_variants {
+                    progress.advance(variant + 1);
+                }
+            }
+            Some(values)
         };
         let moments = moments.ok_or(HwePcaError::InvalidInput(
             "packed hard-call source contains an invalid variant selection",
@@ -5472,7 +5536,6 @@ where
         }
 
         progress.set_total(n_variants);
-        progress.advance(n_variants);
         progress.finish();
         return Ok((
             HweScaler::new(frequencies, scales),
@@ -6309,28 +6372,30 @@ fn assign_ready_weights<P: FitProgressObserver>(
         {
             let ring_ref: &LdRingBuffer = &*ring;
             let weight_slice = &mut weights[start_idx..end_idx];
+            const PROGRESS_BATCH: usize = 64;
             weight_slice
-                .par_iter_mut()
-                .zip_eq(jobs.clone().into_par_iter())
+                .par_chunks_mut(PROGRESS_BATCH)
+                .zip_eq(jobs.par_chunks(PROGRESS_BATCH))
                 .map_init(
                     || LdThreadScratch::new(ring_ref.n_samples(), window_capacity),
-                    |scratch, (slot, job)| {
-                        let weight = compute_ld_weight(
-                            ring_ref,
-                            job.start_offset,
-                            job.window_len,
-                            job.center,
-                            config.ridge,
-                            scratch,
-                            par,
-                        );
-                        *slot = weight;
+                    |scratch, (slots, jobs)| {
+                        for (slot, job) in slots.iter_mut().zip(jobs) {
+                            *slot = compute_ld_weight(
+                                ring_ref,
+                                job.start_offset,
+                                job.window_len,
+                                job.center,
+                                config.ridge,
+                                scratch,
+                                par,
+                            );
+                        }
+                        progress.increment(slots.len());
                     },
                 )
                 .for_each(|_| {});
         }
 
-        progress.advance(end_idx);
         *next_weight = end_idx;
         if let Some(last_keep) = jobs.last().map(|job| job.keep_from) {
             ring.truncate_front(last_keep);
@@ -6913,7 +6978,6 @@ where
         free_tx.send(id).expect("failed to seed loading buffers");
     }
 
-    let observer = Arc::clone(progress);
     let block_capacity = block_capacity;
     let block_len = block_len;
     let expected_variants = expected_variants;
@@ -6967,11 +7031,6 @@ where
                     let _ = filled_sender.send(PrefetchMessage::End);
                     break;
                 }
-
-                observer.on_stage_advance(
-                    FitProgressStage::Loadings,
-                    (start + filled).min(expected_variants),
-                );
 
                 if filled_sender
                     .send(PrefetchMessage::Data {
@@ -7067,6 +7126,7 @@ where
                         .copy_from(chunk.as_ref());
 
                     processed = start + filled;
+                    progress.on_stage_advance(FitProgressStage::Loadings, processed);
 
                     if free_sender.send(id).is_err() {
                         break;
@@ -8347,20 +8407,22 @@ mod tests {
         let mut bytes = vec![0u8; bytes_per_variant * VARIANTS];
         for variant in 0..VARIANTS {
             let source = &data[variant * SAMPLES..(variant + 1) * SAMPLES];
-            let packed =
-                &mut bytes[variant * bytes_per_variant..(variant + 1) * bytes_per_variant];
+            let packed = &mut bytes[variant * bytes_per_variant..(variant + 1) * bytes_per_variant];
             assert!(pack_hard_calls_into(packed, source, SAMPLES));
         }
 
         let packed = HardCallPacked::new(&bytes, bytes_per_variant, VARIANTS);
         assert_eq!(
-            packed.sample_missing_counts(SAMPLES),
+            packed.sample_missing_counts::<NoopFitProgress>(SAMPLES, None),
             Some(vec![2, 2, 1, 2, 2, 1, 1]),
             "the padded tail lane must not become a sample"
         );
 
         let selected = packed.with_sample_selection(&[0, 3, 5]);
-        assert_eq!(selected.sample_missing_counts(3), Some(vec![2, 2, 1]));
+        assert_eq!(
+            selected.sample_missing_counts::<NoopFitProgress>(3, None),
+            Some(vec![2, 2, 1])
+        );
     }
 
     #[test]
@@ -8464,8 +8526,8 @@ mod tests {
             let mut packed = vec![0u8; bytes_per_variant * n_variants];
             for variant in 0..n_variants {
                 let src = &data[variant * n_samples..(variant + 1) * n_samples];
-                let dst = &mut packed
-                    [variant * bytes_per_variant..(variant + 1) * bytes_per_variant];
+                let dst =
+                    &mut packed[variant * bytes_per_variant..(variant + 1) * bytes_per_variant];
                 assert!(pack_hard_calls_into(dst, src, n_samples));
             }
             Self {
@@ -8538,12 +8600,9 @@ mod tests {
                 selection: None,
                 match_kinds: self.match_kinds.clone(),
                 sample_selection: self.sample_selection.clone(),
-                sample_byte_masks: self
-                    .sample_selection
-                    .as_deref()
-                    .and_then(|selection| {
-                        build_sample_byte_masks(self.bytes_per_variant, selection)
-                    }),
+                sample_byte_masks: self.sample_selection.as_deref().and_then(|selection| {
+                    build_sample_byte_masks(self.bytes_per_variant, selection)
+                }),
                 missing_variant: None,
             })
         }
@@ -8594,12 +8653,8 @@ mod tests {
 
         let mut general_source =
             DenseBlockSource::new(&oriented, N_SAMPLES, N_VARIANTS).expect("general source");
-        let general = covariance_operator(
-            &mut general_source,
-            N_VARIANTS,
-            observed,
-            scaler.clone(),
-        );
+        let general =
+            covariance_operator(&mut general_source, N_VARIANTS, observed, scaler.clone());
 
         let mut kinds = vec![MatchKind::Exact; N_VARIANTS];
         kinds[SWAPPED] = MatchKind::Swap;
@@ -8706,8 +8761,7 @@ mod tests {
     }
 
     /// Builds a streaming covariance operator over `source`, pinning the
-    /// progress-observer type parameter that `StandardizedCovarianceOp` carries
-    /// only as a `PhantomData` and therefore cannot infer.
+    /// progress-observer type parameter for a test with no progress output.
     fn covariance_operator<S>(
         source: &mut S,
         block_capacity: usize,
@@ -8724,6 +8778,7 @@ mod tests {
             observed_variants,
             observed_variants,
             scaler,
+            None,
             None,
         )
     }
@@ -8987,10 +9042,22 @@ mod tests {
     #[test]
     fn streaming_variant_filter_retains_its_post_filter_hint_across_resets() {
         let data = vec![
-            0.0, 0.0, 0.0, 0.0, // MAF 0.0: drop
-            0.0, 1.0, 1.0, 2.0, // MAF 0.5: retain
-            0.0, 1.0, f64::NAN, f64::NAN, // MAF 0.25 but 50% missing: drop
-            0.0, 0.0, 0.0, 1.0, // MAF 0.125: drop
+            0.0,
+            0.0,
+            0.0,
+            0.0, // MAF 0.0: drop
+            0.0,
+            1.0,
+            1.0,
+            2.0, // MAF 0.5: retain
+            0.0,
+            1.0,
+            f64::NAN,
+            f64::NAN, // MAF 0.25 but 50% missing: drop
+            0.0,
+            0.0,
+            0.0,
+            1.0, // MAF 0.125: drop
         ];
         let inner = DenseBlockSource::new(&data, 4, 4).expect("dense source");
         let mut source = StreamingVariantFilterSource::new(inner, Some(0.2), Some(0.25))

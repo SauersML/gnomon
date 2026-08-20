@@ -6,12 +6,16 @@ use super::fit::{
 use super::io::{
     DatasetBlockSource, DatasetOutputError, GenotypeDataset, GenotypeIoError, OrderedSelectionPlan,
     ProjectionOutputPaths, SampleRecord, SelectionPlan, create_projection_matrix_sink,
-    create_projection_matrix_sink_at, load_hwe_model, load_projection_model_from_path,
-    save_fit_scores, save_fit_summary, save_hwe_model, save_projection_output_manifest,
-    save_sample_manifest,
+    create_projection_matrix_sink_at, fit_artifact_path, load_hwe_model,
+    load_projection_model_from_path, save_fit_scores, save_fit_scores_at, save_fit_summary,
+    save_fit_summary_at, save_hwe_model, save_hwe_model_at, save_projection_output_manifest,
+    save_sample_manifest, save_sample_manifest_at,
 };
 use super::prefit::{self, BuiltinModelError};
-use super::progress::{AdaptiveFitProgress, fit_progress, projection_progress};
+use super::progress::{
+    AdaptiveFitProgress, FitProgressObserver, FitProgressStage, StageProgressHandle, fit_progress,
+    projection_progress,
+};
 use super::project::{GappedProjectionSource, ProjectionOptions};
 use super::variant_filter::{VariantFilter, VariantKey, VariantListError};
 use rayon::prelude::*;
@@ -29,6 +33,8 @@ use sysinfo::System;
 pub enum MapCommand {
     Fit {
         genotype_path: PathBuf,
+        /// Optional artifact prefix, independent of the read-only/shared input.
+        output_prefix: Option<PathBuf>,
         variant_list: Option<PathBuf>,
         /// Optional file of individual IDs (one IID per line) restricting the
         /// fit to a sample subset — a within-ancestry PCA, for instance.
@@ -142,6 +148,7 @@ pub fn run(command: MapCommand) -> Result<(), MapDriverError> {
     match command {
         MapCommand::Fit {
             genotype_path,
+            output_prefix,
             variant_list,
             keep,
             markers,
@@ -156,6 +163,7 @@ pub fn run(command: MapCommand) -> Result<(), MapDriverError> {
             let fit = || {
                 run_fit(FitRequest {
                     genotype_path: &genotype_path,
+                    output_prefix: output_prefix.as_deref(),
                     variant_list: variant_list.as_deref(),
                     keep: keep.as_deref(),
                     markers,
@@ -193,6 +201,7 @@ pub fn run(command: MapCommand) -> Result<(), MapDriverError> {
 
 struct FitRequest<'a> {
     genotype_path: &'a Path,
+    output_prefix: Option<&'a Path>,
     variant_list: Option<&'a Path>,
     keep: Option<&'a Path>,
     markers: Option<usize>,
@@ -207,6 +216,7 @@ struct FitRequest<'a> {
 fn run_fit(request: FitRequest<'_>) -> Result<(), MapDriverError> {
     let FitRequest {
         genotype_path,
+        output_prefix,
         variant_list,
         keep,
         markers,
@@ -382,6 +392,8 @@ fn run_fit(request: FitRequest<'_>) -> Result<(), MapDriverError> {
         }
     }
 
+    let progress = fit_progress();
+
     // Match PLINK's operation order: --keep is already resolved, and --mind
     // sees the marker list after --list/--markers but before --geno and --maf.
     // Indexed hard-call sources count missing lanes directly in packed BED;
@@ -391,18 +403,20 @@ fn run_fit(request: FitRequest<'_>) -> Result<(), MapDriverError> {
             dataset.block_source_with_plan(selection_plan.clone())?,
             keep_indices.as_deref(),
         )?;
-        let scan = scan_sample_missing_filter(&mut source, max_missing_rate)?;
+        let total = source.n_variants();
+        progress.on_stage_start(FitProgressStage::SampleQc, total);
+        let stage_progress =
+            StageProgressHandle::new(Arc::clone(&progress), FitProgressStage::SampleQc);
+        let scan = scan_sample_missing_filter(&mut source, max_missing_rate, &stage_progress)?;
+        stage_progress.finish();
         let before = source.n_samples();
         if scan.retained.is_empty() {
             return Err(MapDriverError::InvalidState(
                 "sample missingness QC removed every retained sample".into(),
             ));
         }
-        keep_indices = compose_sample_selection(
-            keep_indices.take(),
-            &scan.retained,
-            dataset.n_samples(),
-        )?;
+        keep_indices =
+            compose_sample_selection(keep_indices.take(), &scan.retained, dataset.n_samples())?;
         println!(
             "Sample missingness QC retained {} of {before} samples across {} selected variants.",
             scan.retained.len(),
@@ -439,17 +453,23 @@ fn run_fit(request: FitRequest<'_>) -> Result<(), MapDriverError> {
             dataset.block_source_with_plan(selection_plan.clone())?,
             keep_indices.as_deref(),
         )?;
-        let retained = match scan_packed_variant_filter(&mut raw_source, maf, geno)? {
-            Some(scan) => {
-                precomputed_variant_statistics = Some(scan.statistics);
-                scan.retained
-            }
-            None => {
-                let mut source = StreamingVariantFilterSource::new(raw_source, maf, geno)?;
-                scan_variant_filter(&mut source)?;
-                source.retained_indices().to_vec()
-            }
-        };
+        let total = raw_source.n_variants();
+        progress.on_stage_start(FitProgressStage::VariantQc, total);
+        let stage_progress =
+            StageProgressHandle::new(Arc::clone(&progress), FitProgressStage::VariantQc);
+        let retained =
+            match scan_packed_variant_filter(&mut raw_source, maf, geno, &stage_progress)? {
+                Some(scan) => {
+                    precomputed_variant_statistics = Some(scan.statistics);
+                    scan.retained
+                }
+                None => {
+                    let mut source = StreamingVariantFilterSource::new(raw_source, maf, geno)?;
+                    scan_variant_filter(&mut source, &stage_progress)?;
+                    source.retained_indices().to_vec()
+                }
+            };
+        stage_progress.finish();
         if retained.is_empty() {
             return Err(MapDriverError::InvalidState(
                 "variant QC removed every selected variant".into(),
@@ -499,7 +519,6 @@ fn run_fit(request: FitRequest<'_>) -> Result<(), MapDriverError> {
         fit_options.ld = Some(ld_config);
     }
 
-    let progress = fit_progress();
     fit_options.cache_source = streaming_filter;
 
     let (mut model, retained_indices, selection_outcome, mut streamed_keys) = if is_vcf_like {
@@ -660,10 +679,40 @@ fn run_fit(request: FitRequest<'_>) -> Result<(), MapDriverError> {
         )));
     }
 
-    let model_path = save_hwe_model(&dataset, &model)?;
-    let manifest_path = save_sample_manifest(&dataset, retained_samples)?;
-    let summary_path = save_fit_summary(&dataset, &model)?;
-    let (scores_path, scores_metadata_path) = save_fit_scores(&dataset, &model, retained_samples)?;
+    let (model_path, manifest_path, summary_path, scores_path, scores_metadata_path) =
+        if let Some(prefix) = output_prefix {
+            let model_path = save_hwe_model_at(&fit_artifact_path(prefix, "hwe.json"), &model)?;
+            let manifest_path = save_sample_manifest_at(
+                &fit_artifact_path(prefix, "samples.tsv"),
+                retained_samples,
+            )?;
+            let summary_path =
+                save_fit_summary_at(&fit_artifact_path(prefix, "hwe_summary.tsv"), &model)?;
+            let (scores_path, metadata_path) = save_fit_scores_at(
+                &fit_artifact_path(prefix, "hwe_scores.bin"),
+                &model,
+                retained_samples,
+            )?;
+            (
+                model_path,
+                manifest_path,
+                summary_path,
+                scores_path,
+                metadata_path,
+            )
+        } else {
+            let model_path = save_hwe_model(&dataset, &model)?;
+            let manifest_path = save_sample_manifest(&dataset, retained_samples)?;
+            let summary_path = save_fit_summary(&dataset, &model)?;
+            let (scores_path, metadata_path) = save_fit_scores(&dataset, &model, retained_samples)?;
+            (
+                model_path,
+                manifest_path,
+                summary_path,
+                scores_path,
+                metadata_path,
+            )
+        };
 
     println!("Generated output artifacts:");
     println!("  • Model JSON      : {}", model_path.display());
@@ -834,9 +883,7 @@ fn samples_passing_missingness(
     missing_counts
         .iter()
         .enumerate()
-        .filter_map(|(sample, &missing)| {
-            ((missing as f64) <= allowed_missing).then_some(sample)
-        })
+        .filter_map(|(sample, &missing)| ((missing as f64) <= allowed_missing).then_some(sample))
         .collect()
 }
 
@@ -848,6 +895,7 @@ fn samples_passing_missingness(
 fn scan_sample_missing_filter<S>(
     source: &mut S,
     max_missing_rate: f64,
+    progress: &StageProgressHandle<AdaptiveFitProgress>,
 ) -> Result<SampleMissingnessScan, MapDriverError>
 where
     S: VariantBlockSource + Send,
@@ -865,11 +913,13 @@ where
                 "sample missingness QC cannot run with zero selected variants".into(),
             ));
         }
-        let counts = packed.sample_missing_counts(n_samples).ok_or_else(|| {
-            MapDriverError::InvalidState(
-                "packed hard-call source contains an invalid sample selection".into(),
-            )
-        })?;
+        let counts = packed
+            .sample_missing_counts(n_samples, Some(progress))
+            .ok_or_else(|| {
+                MapDriverError::InvalidState(
+                    "packed hard-call source contains an invalid sample selection".into(),
+                )
+            })?;
         return Ok(SampleMissingnessScan {
             retained: samples_passing_missingness(&counts, variants, max_missing_rate),
             variants,
@@ -897,6 +947,7 @@ where
         variants = variants.checked_add(filled).ok_or_else(|| {
             MapDriverError::InvalidState("selected variant count overflowed usize".into())
         })?;
+        progress.advance(variants);
     }
     if variants == 0 {
         return Err(MapDriverError::InvalidState(
@@ -929,7 +980,11 @@ fn compose_sample_selection(
                 "sample QC-retained logical index {logical} exceeded retained sample count {available}"
             )));
         }
-        composed.push(existing.as_ref().map_or(logical, |indices| indices[logical]));
+        composed.push(
+            existing
+                .as_ref()
+                .map_or(logical, |indices| indices[logical]),
+        );
     }
     Ok(Some(composed))
 }
@@ -944,12 +999,27 @@ fn packed_variant_filter_scan(
     n_samples: usize,
     min_maf: Option<f64>,
     max_missing_rate: Option<f64>,
+    progress: Option<&StageProgressHandle<AdaptiveFitProgress>>,
 ) -> Option<PackedVariantFilterScan> {
-    let moments: Option<Vec<(f64, f64, usize)>> = (0..packed.n_variants())
+    const BATCH: usize = 1_024;
+    let batches = packed.n_variants().div_ceil(BATCH);
+    let moments: Option<Vec<Vec<(f64, f64, usize)>>> = (0..batches)
         .into_par_iter()
-        .map(|variant| packed.moments(variant, n_samples))
+        .map(|batch| {
+            let start = batch * BATCH;
+            let end = (start + BATCH).min(packed.n_variants());
+            let values: Option<Vec<_>> = (start..end)
+                .map(|variant| packed.moments(variant, n_samples))
+                .collect();
+            if values.is_some()
+                && let Some(progress) = progress
+            {
+                progress.increment(end - start);
+            }
+            values
+        })
         .collect();
-    let moments = moments?;
+    let moments: Vec<_> = moments?.into_iter().flatten().collect();
     let mut retained = Vec::with_capacity(moments.len());
     let mut retained_moments = Vec::with_capacity(moments.len());
     for (variant, moments) in moments.into_iter().enumerate() {
@@ -972,7 +1042,7 @@ fn packed_variant_filter_retained_indices(
     min_maf: Option<f64>,
     max_missing_rate: Option<f64>,
 ) -> Option<Vec<usize>> {
-    packed_variant_filter_scan(packed, n_samples, min_maf, max_missing_rate)
+    packed_variant_filter_scan(packed, n_samples, min_maf, max_missing_rate, None)
         .map(|scan| scan.retained)
 }
 
@@ -980,6 +1050,7 @@ fn scan_packed_variant_filter<S>(
     source: &mut S,
     min_maf: Option<f64>,
     max_missing_rate: Option<f64>,
+    progress: &StageProgressHandle<AdaptiveFitProgress>,
 ) -> Result<Option<PackedVariantFilterScan>, MapDriverError>
 where
     S: VariantBlockSource + Send,
@@ -992,13 +1063,19 @@ where
     let Some(packed) = source.hard_call_packed() else {
         return Ok(None);
     };
-    packed_variant_filter_scan(&packed, n_samples, min_maf, max_missing_rate)
-        .map(Some)
-        .ok_or_else(|| {
-            MapDriverError::InvalidState(
-                "packed hard-call source contains an invalid variant selection".into(),
-            )
-        })
+    packed_variant_filter_scan(
+        &packed,
+        n_samples,
+        min_maf,
+        max_missing_rate,
+        Some(progress),
+    )
+    .map(Some)
+    .ok_or_else(|| {
+        MapDriverError::InvalidState(
+            "packed hard-call source contains an invalid variant selection".into(),
+        )
+    })
 }
 
 /// Completes the one variant-QC pass needed to turn an indexed source into a retained
@@ -1008,6 +1085,7 @@ where
 /// tiles merely to discover allele frequencies.
 fn scan_variant_filter<S>(
     source: &mut StreamingVariantFilterSource<S>,
+    progress: &StageProgressHandle<AdaptiveFitProgress>,
 ) -> Result<(), MapDriverError>
 where
     S: VariantBlockSource + Send,
@@ -1021,12 +1099,22 @@ where
     source
         .reset()
         .map_err(|err| HwePcaError::Source(Box::new(err)))?;
+    let mut processed = 0usize;
     loop {
         let filled = source
             .next_block_into(block_capacity, &mut block)
             .map_err(|err| HwePcaError::Source(Box::new(err)))?;
         if filled == 0 {
             break;
+        }
+        processed = processed.saturating_add(filled);
+        if let Some((work_done, total)) = source.progress_variants() {
+            if let Some(total) = total {
+                progress.set_total(total);
+            }
+            progress.advance(work_done);
+        } else {
+            progress.advance(processed);
         }
     }
     Ok(())
@@ -2041,6 +2129,7 @@ mod tests {
     fn fit_rejects_zero_worker_threads_before_opening_input() {
         let error = run(MapCommand::Fit {
             genotype_path: PathBuf::from("input-must-not-be-opened.bed"),
+            output_prefix: None,
             variant_list: None,
             keep: None,
             markers: None,
@@ -2064,6 +2153,7 @@ mod tests {
     fn fit_rejects_invalid_call_rate_before_opening_input() {
         let error = run(MapCommand::Fit {
             genotype_path: PathBuf::from("input-must-not-be-opened.bed"),
+            output_prefix: None,
             variant_list: None,
             keep: None,
             markers: None,
@@ -2088,6 +2178,7 @@ mod tests {
     fn fit_rejects_invalid_sample_missingness_before_opening_input() {
         let error = run(MapCommand::Fit {
             genotype_path: PathBuf::from("input-must-not-be-opened.bed"),
+            output_prefix: None,
             variant_list: None,
             keep: None,
             markers: None,
@@ -2118,10 +2209,7 @@ mod tests {
             compose_sample_selection(Some(vec![1, 3, 5]), &[0, 2], 8).unwrap(),
             Some(vec![1, 5])
         );
-        assert_eq!(
-            compose_sample_selection(None, &[0, 1, 2], 3).unwrap(),
-            None
-        );
+        assert_eq!(compose_sample_selection(None, &[0, 1, 2], 3).unwrap(), None);
     }
 
     #[test]
@@ -2141,12 +2229,18 @@ mod tests {
             2.0,
         ];
         let mut source = DenseBlockSource::new(&data, 4, 3).unwrap();
-        let scan = scan_sample_missing_filter(&mut source, 1.0 / 3.0).unwrap();
+        let progress = StageProgressHandle::new(
+            Arc::new(AdaptiveFitProgress::Ci(
+                super::progress::CiFitProgress::new(),
+            )),
+            FitProgressStage::SampleQc,
+        );
+        let scan = scan_sample_missing_filter(&mut source, 1.0 / 3.0, &progress).unwrap();
         assert_eq!(scan.variants, 3);
         assert_eq!(scan.retained, vec![0, 1, 3]);
 
         let mut source = DenseBlockSource::new(&data, 4, 3).unwrap();
-        let scan = scan_sample_missing_filter(&mut source, 0.25).unwrap();
+        let scan = scan_sample_missing_filter(&mut source, 0.25, &progress).unwrap();
         assert_eq!(scan.retained, vec![3]);
     }
 

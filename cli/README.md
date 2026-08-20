@@ -21,7 +21,10 @@ Optional arguments:
 ### `fit`
 Fit an HWE PCA model from genotype data.
 
-Usage: `gnomon fit <GENOTYPE_PATH> --components <N> [--maf <MAF>] [--list <PATH>] [--ld [--sites_window <SITES> | --bp_window <BP>]]`
+Usage: `gnomon fit <GENOTYPE_PATH> --components <N> [--out <PREFIX>] [--maf <MAF>] [--list <PATH>] [--ld [--sites_window <SITES> | --bp_window <BP>]]`
+
+With `--ld` alone, gnomon uses a 500 kbp window and a 100,000-marker safety
+budget. `--out` isolates all fit artifacts from the genotype directory.
 
 ### `project`
 Project samples into an existing HWE PCA space.
