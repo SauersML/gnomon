@@ -2079,6 +2079,9 @@ mod tests {
         load_hwe_model, save_hwe_model, save_projection_results,
     };
     use crate::map::project::ProjectionOptions;
+    use crate::map::progress::{
+        AdaptiveFitProgress, CiFitProgress, FitProgressStage, StageProgressHandle,
+    };
     use crate::map::variant_filter::{MatchKind, VariantFilter, VariantKey, VariantSelection};
     use crate::shared::files::{
         VariantCompression, VariantFormat, ensure_rustls_provider, open_variant_source,
@@ -2100,7 +2103,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::str::FromStr;
-    use std::sync::mpsc;
+    use std::sync::{Arc, mpsc};
     use std::thread;
     use std::time::Duration;
     use tempfile::{NamedTempFile, tempdir};
@@ -2230,9 +2233,7 @@ mod tests {
         ];
         let mut source = DenseBlockSource::new(&data, 4, 3).unwrap();
         let progress = StageProgressHandle::new(
-            Arc::new(AdaptiveFitProgress::Ci(
-                super::progress::CiFitProgress::new(),
-            )),
+            Arc::new(AdaptiveFitProgress::Ci(CiFitProgress::new())),
             FitProgressStage::SampleQc,
         );
         let scan = scan_sample_missing_filter(&mut source, 1.0 / 3.0, &progress).unwrap();
