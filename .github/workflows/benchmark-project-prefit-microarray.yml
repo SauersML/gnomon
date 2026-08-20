@@ -67,13 +67,18 @@ jobs:
           # Specific CPU target instead of 'native': keeps SIMD optimization while
           # staying portable across runners (avoids the ring#2527 SIGILL).
           RUSTFLAGS: "-C target-cpu=x86-64-v3"
-        run: cargo +nightly build --release
+        # This benchmark exercises only `map project`. Building the full default
+        # feature set links unrelated calibrate/score/terms products and can exhaust
+        # a hosted runner before the benchmark starts.
+        run: >-
+          cargo +nightly build --release --no-default-features --features map
+          --bin gnomon-map
 
       - name: Upload release binary
         uses: actions/upload-artifact@v4
         with:
           name: gnomon-release-binary
-          path: target/release/gnomon
+          path: target/release/gnomon-map
           if-no-files-found: error
 
   benchmark:
@@ -117,7 +122,7 @@ jobs:
       - name: Install release binary into benchmark path
         run: |
           mkdir -p "$HOME/.local/bin"
-          install -m 0755 /tmp/gnomon-binary/gnomon "$HOME/.local/bin/gnomon"
+          install -m 0755 /tmp/gnomon-binary/gnomon-map "$HOME/.local/bin/gnomon"
 
       - name: Run benchmark shard with clear logs
         shell: bash
