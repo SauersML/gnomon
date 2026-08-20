@@ -1295,7 +1295,17 @@ where
         let n_variants = source.n_variants();
         let bytes_per_variant = bytes_per_variant(n_samples);
         let packed_capacity = bytes_per_variant.saturating_mul(n_variants);
-        let state = if !enable_cache || n_samples == 0 || packed_capacity > cache_budget_bytes() {
+        // PLINK/PGEN hard calls already live in a packed representation owned
+        // by the source. Decoding that data only to repack an identical second
+        // copy costs a complete cohort traversal and, in profiles of the
+        // 250k-sample fit, 15% of all cycles. Keep caching for streamed or dense
+        // sources that have no packed view; an existing view is the cache.
+        let source_is_packed = source.hard_call_packed().is_some();
+        let state = if !enable_cache
+            || source_is_packed
+            || n_samples == 0
+            || packed_capacity > cache_budget_bytes()
+        {
             CacheState::Disabled
         } else {
             CacheState::BuildingHardCall {
@@ -1593,7 +1603,9 @@ where
                 match_kinds: None,
                 missing_variant: None,
             }),
-            _ => None,
+            CacheState::Disabled => self.source.hard_call_packed(),
+            CacheState::BuildingHardCall { .. } | CacheState::BuildingDense { .. } => None,
+            CacheState::ReadyDense { .. } => None,
         }
     }
 }
@@ -4593,9 +4605,17 @@ where
                 continue;
             }
 
-            let z0 = (0.0 - mean) * inv;
+            let mut z0 = (0.0 - mean) * inv;
             let z1 = (1.0 - mean) * inv;
-            let z2 = (2.0 - mean) * inv;
+            let mut z2 = (2.0 - mean) * inv;
+            if packed.match_kind(variant_idx) == MatchKind::Swap {
+                // The scaler was estimated from the logically oriented stream,
+                // while this view points at the physical BED codes. A swapped
+                // match maps physical dosage 0 to logical dosage 2 and vice
+                // versa; ignoring that here makes the packed operator disagree
+                // with every decoded fit path.
+                std::mem::swap(&mut z0, &mut z2);
+            }
 
             let weight_sq = if let Some(weights) = &self.ld_weights {
                 let w = weights.get(variant_idx).copied().unwrap_or(1.0);
@@ -7535,6 +7555,158 @@ mod tests {
             data.push(((state >> 33) % 3) as f64);
         }
         data
+    }
+
+    struct DirectPackedSource<'a> {
+        inner: DenseBlockSource<'a>,
+        packed: Vec<u8>,
+        bytes_per_variant: usize,
+        n_variants: usize,
+        match_kinds: Option<Vec<MatchKind>>,
+    }
+
+    impl<'a> DirectPackedSource<'a> {
+        fn new(data: &'a [f64], n_samples: usize, n_variants: usize) -> Self {
+            let inner = DenseBlockSource::new(data, n_samples, n_variants).expect("dense source");
+            let bytes_per_variant = bytes_per_variant(n_samples);
+            let mut packed = vec![0u8; bytes_per_variant * n_variants];
+            for variant in 0..n_variants {
+                let src = &data[variant * n_samples..(variant + 1) * n_samples];
+                let dst = &mut packed
+                    [variant * bytes_per_variant..(variant + 1) * bytes_per_variant];
+                assert!(pack_hard_calls_into(dst, src, n_samples));
+            }
+            Self {
+                inner,
+                packed,
+                bytes_per_variant,
+                n_variants,
+                match_kinds: None,
+            }
+        }
+
+        fn with_match_kinds(mut self, match_kinds: Vec<MatchKind>) -> Self {
+            assert_eq!(match_kinds.len(), self.n_variants);
+            self.match_kinds = Some(match_kinds);
+            self
+        }
+    }
+
+    impl VariantBlockSource for DirectPackedSource<'_> {
+        type Error = Infallible;
+
+        fn n_samples(&self) -> usize {
+            self.inner.n_samples()
+        }
+
+        fn n_variants(&self) -> usize {
+            self.n_variants
+        }
+
+        fn reset(&mut self) -> Result<(), Self::Error> {
+            self.inner.reset()
+        }
+
+        fn next_block_into(
+            &mut self,
+            max_variants: usize,
+            storage: &mut [f64],
+        ) -> Result<usize, Self::Error> {
+            self.inner.next_block_into(max_variants, storage)
+        }
+
+        fn hard_call_packed(&mut self) -> Option<HardCallPacked<'_>> {
+            Some(HardCallPacked {
+                data: &self.packed,
+                bytes_per_variant: self.bytes_per_variant,
+                physical_n_variants: self.n_variants,
+                selection: None,
+                match_kinds: self.match_kinds.clone(),
+                missing_variant: None,
+            })
+        }
+    }
+
+    #[test]
+    fn packed_sources_are_not_decoded_and_repacked_into_a_second_cache() {
+        const N_SAMPLES: usize = 17;
+        const N_VARIANTS: usize = 11;
+        let data = synthetic_genotypes(N_SAMPLES, N_VARIANTS);
+        let mut source = DirectPackedSource::new(&data, N_SAMPLES, N_VARIANTS);
+        let mut cached = CachedVariantBlockSource::new(&mut source, true);
+
+        assert!(matches!(cached.state, CacheState::Disabled));
+        assert!(
+            cached.hard_call_packed().is_some(),
+            "the original packed view must pass through the disabled cache"
+        );
+        assert_eq!(drain_source(&mut cached, 4), data);
+        assert!(matches!(cached.state, CacheState::Disabled));
+    }
+
+    #[test]
+    fn direct_packed_operator_applies_selected_allele_swaps() {
+        const N_SAMPLES: usize = 17;
+        const N_VARIANTS: usize = 5;
+        const SWAPPED: usize = 2;
+        let physical = synthetic_genotypes(N_SAMPLES, N_VARIANTS);
+        let mut oriented = physical.clone();
+        for value in &mut oriented[SWAPPED * N_SAMPLES..(SWAPPED + 1) * N_SAMPLES] {
+            *value = 2.0 - *value;
+        }
+
+        let mut stats_source =
+            DenseBlockSource::new(&oriented, N_SAMPLES, N_VARIANTS).expect("stats source");
+        let stats_progress = StageProgressHandle::new(
+            Arc::new(NoopFitProgress),
+            FitProgressStage::AlleleStatistics,
+        );
+        let (scaler, observed) = compute_variant_statistics(
+            &mut stats_source,
+            N_VARIANTS,
+            Par::Seq,
+            stats_progress,
+            N_VARIANTS,
+        )
+        .expect("variant statistics");
+
+        let mut general_source =
+            DenseBlockSource::new(&oriented, N_SAMPLES, N_VARIANTS).expect("general source");
+        let general = covariance_operator(
+            &mut general_source,
+            N_VARIANTS,
+            observed,
+            scaler.clone(),
+        );
+
+        let mut kinds = vec![MatchKind::Exact; N_VARIANTS];
+        kinds[SWAPPED] = MatchKind::Swap;
+        let mut direct =
+            DirectPackedSource::new(&physical, N_SAMPLES, N_VARIANTS).with_match_kinds(kinds);
+        let mut cached = CachedVariantBlockSource::new(&mut direct, true);
+        let packed = covariance_operator(&mut cached, N_VARIANTS, observed, scaler);
+
+        let rhs = Mat::<f64>::from_fn(N_SAMPLES, 5, |row, col| {
+            ((row * 11 + col * 7) % 13) as f64 - 6.0
+        });
+        let mut expected = Mat::<f64>::zeros(N_SAMPLES, 5);
+        let mut mem = MemBuffer::new(general.apply_scratch(rhs.ncols(), Par::Seq));
+        general.apply(
+            expected.as_mut(),
+            rhs.as_ref(),
+            Par::Seq,
+            MemStack::new(&mut mem),
+        );
+
+        let mut actual = Mat::<f64>::zeros(N_SAMPLES, 5);
+        assert!(packed.try_apply_hardcall_packed(actual.as_mut(), rhs.as_ref()));
+        let mut max_diff = 0.0f64;
+        for col in 0..rhs.ncols() {
+            for row in 0..N_SAMPLES {
+                max_diff = max_diff.max((expected[(row, col)] - actual[(row, col)]).abs());
+            }
+        }
+        assert!(max_diff < 1.0e-9, "max difference was {max_diff}");
     }
 
     /// Builds a streaming covariance operator over `source`, pinning the
