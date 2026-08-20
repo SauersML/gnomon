@@ -1,6 +1,7 @@
 use super::fit::{
     DEFAULT_BLOCK_WIDTH, DenseBlockSource, FitOptions, HardCallPacked, HwePcaError, HwePcaModel,
-    LdConfig, LdWindow, SampleSubsetSource, StreamingMafFilterSource, VariantBlockSource,
+    LdConfig, LdWindow, SampleSubsetSource, StreamingVariantFilterSource, VariantBlockSource,
+    variant_moments_pass_qc,
 };
 use super::io::{
     DatasetBlockSource, DatasetOutputError, GenotypeDataset, GenotypeIoError, OrderedSelectionPlan,
@@ -44,6 +45,9 @@ pub enum MapCommand {
         /// limit. Diagnostics still mark the resulting model unconverged.
         allow_unconverged: bool,
         maf: Option<f64>,
+        /// Maximum observed missing-call fraction retained for fitting, using
+        /// PLINK's `--geno` convention.
+        geno: Option<f64>,
         ld: Option<LdWindow>,
     },
     Project {
@@ -142,6 +146,7 @@ pub fn run(command: MapCommand) -> Result<(), MapDriverError> {
             threads,
             allow_unconverged,
             maf,
+            geno,
             ld,
         } => {
             let fit = || {
@@ -153,6 +158,7 @@ pub fn run(command: MapCommand) -> Result<(), MapDriverError> {
                     components,
                     allow_unconverged,
                     maf,
+                    geno,
                     ld,
                 })
             };
@@ -188,6 +194,7 @@ struct FitRequest<'a> {
     components: usize,
     allow_unconverged: bool,
     maf: Option<f64>,
+    geno: Option<f64>,
     ld: Option<LdWindow>,
 }
 
@@ -200,8 +207,19 @@ fn run_fit(request: FitRequest<'_>) -> Result<(), MapDriverError> {
         components,
         allow_unconverged,
         maf,
+        geno,
         ld,
     } = request;
+    if maf.is_some_and(|value| !(value.is_finite() && (0.0..=0.5).contains(&value))) {
+        return Err(MapDriverError::InvalidState(
+            "--maf must be a finite value between 0 and 0.5".into(),
+        ));
+    }
+    if geno.is_some_and(|value| !(value.is_finite() && (0.0..=1.0).contains(&value))) {
+        return Err(MapDriverError::InvalidState(
+            "--geno must be a finite value between 0 and 1".into(),
+        ));
+    }
     println!("=== HWE PCA model fitting ===");
     println!("Input genotype location: {}", genotype_path.display());
 
@@ -268,6 +286,12 @@ fn run_fit(request: FitRequest<'_>) -> Result<(), MapDriverError> {
             )
         }
         None => println!("MAF filtering disabled (default)."),
+    }
+    match geno {
+        Some(max_missing_rate) => println!(
+            "Call-rate filtering enabled: retaining variants with missing-call rate <= {max_missing_rate:.6} during the PCA stream."
+        ),
+        None => println!("Call-rate filtering disabled (default)."),
     }
 
     let mut variant_keys: Option<Arc<Vec<VariantKey>>> = None;
@@ -354,14 +378,13 @@ fn run_fit(request: FitRequest<'_>) -> Result<(), MapDriverError> {
 
     let is_vcf_like = matches!(dataset, GenotypeDataset::Variants(_));
 
-    // Indexed sources can turn the MAF result into a new physical selection
-    // plan.  Paying this one screening pass up front has two important
-    // consequences for biobank fits: positional LD windows are built from the
-    // exact post-MAF marker list, and the later solver passes recover the
-    // source's packed hard-call path instead of re-running a row-wise f64 MAF
-    // filter on every traversal.
-    if !is_vcf_like && let Some(min_maf) = maf {
-        let pre_maf_keys = match variant_keys.as_ref() {
+    // Indexed sources can turn the joint MAF/call-rate result into a new
+    // physical selection plan. Paying this one screening pass up front has two
+    // important consequences for biobank fits: positional LD windows are built
+    // from the exact post-QC marker list, and later solver passes recover the
+    // packed hard-call path instead of repeating row-wise filtering.
+    if !is_vcf_like && (maf.is_some() || geno.is_some()) {
+        let pre_filter_keys = match variant_keys.as_ref() {
             Some(keys) => (**keys).clone(),
             None => dataset.variant_keys_for_plan(&selection_plan)?,
         };
@@ -369,33 +392,33 @@ fn run_fit(request: FitRequest<'_>) -> Result<(), MapDriverError> {
             dataset.block_source_with_plan(selection_plan.clone())?,
             keep_indices.as_deref(),
         )?;
-        let retained = match scan_packed_maf_filter(&mut raw_source, min_maf)? {
+        let retained = match scan_packed_variant_filter(&mut raw_source, maf, geno)? {
             Some(retained) => retained,
             None => {
-                let mut source = StreamingMafFilterSource::new(raw_source, min_maf)?;
-                scan_maf_filter(&mut source)?;
+                let mut source = StreamingVariantFilterSource::new(raw_source, maf, geno)?;
+                scan_variant_filter(&mut source)?;
                 source.retained_indices().to_vec()
             }
         };
         if retained.is_empty() {
-            return Err(MapDriverError::InvalidState(format!(
-                "MAF filter {min_maf:.6} removed every selected variant"
-            )));
+            return Err(MapDriverError::InvalidState(
+                "variant QC removed every selected variant".into(),
+            ));
         }
 
-        let post_maf_keys = retain_variant_keys_by_logical_indices(pre_maf_keys, &retained)?;
+        let post_filter_keys = retain_variant_keys_by_logical_indices(pre_filter_keys, &retained)?;
         selection_plan = retain_selection_plan_by_logical_indices(selection_plan, &retained)?;
-        variant_keys = Some(Arc::new(post_maf_keys));
+        variant_keys = Some(Arc::new(post_filter_keys));
         println!(
-            "MAF filter retained {} variants in the indexed PCA stream.",
+            "Variant QC retained {} variants in the indexed PCA stream.",
             retained.len()
         );
     }
 
-    // VCF/BCF cannot replace its stream with an indexed post-MAF selection, so
-    // it keeps the streaming filter.  PLINK/PGEN was rewritten above and must
+    // VCF/BCF cannot replace its stream with an indexed post-QC selection, so
+    // it keeps the streaming filter. PLINK/PGEN was rewritten above and must
     // not filter a second time.
-    let streaming_maf = if is_vcf_like { maf } else { None };
+    let streaming_filter = is_vcf_like && (maf.is_some() || geno.is_some());
 
     let mut fit_options = FitOptions {
         allow_unconverged,
@@ -426,7 +449,7 @@ fn run_fit(request: FitRequest<'_>) -> Result<(), MapDriverError> {
     }
 
     let progress = fit_progress();
-    fit_options.cache_source = streaming_maf.is_some();
+    fit_options.cache_source = streaming_filter;
 
     let (mut model, retained_indices, selection_outcome, mut streamed_keys) = if is_vcf_like {
         // Re-reading a VCF is expensive and the solver wants several passes, so
@@ -440,8 +463,8 @@ fn run_fit(request: FitRequest<'_>) -> Result<(), MapDriverError> {
             dataset.block_source_with_plan(selection_plan.clone())?,
             keep_indices.as_deref(),
         )?;
-        if let Some(min_maf) = streaming_maf {
-            let mut source = StreamingMafFilterSource::new(raw_source, min_maf)?;
+        if streaming_filter {
+            let mut source = StreamingVariantFilterSource::new(raw_source, maf, geno)?;
             let (model, scanned_keys) = fit_vcf_source(
                 &mut source,
                 components,
@@ -450,7 +473,7 @@ fn run_fit(request: FitRequest<'_>) -> Result<(), MapDriverError> {
                 fit_n_samples,
                 &plan,
             )?;
-            // Whichever path ran, the keys are the post-MAF list in stream
+            // Whichever path ran, the keys are the post-QC list in stream
             // order, which is why `retained_indices` stays `None` here exactly
             // as it did on the materialized path: there is nothing left to
             // subset. The scan takes the filter's key list when it runs, so the
@@ -515,7 +538,7 @@ fn run_fit(request: FitRequest<'_>) -> Result<(), MapDriverError> {
                 "Variant list did not match any variants in the dataset".into(),
             ));
         }
-        if !(maf.is_some() && streamed_keys.is_some()) {
+        if !((maf.is_some() || geno.is_some()) && streamed_keys.is_some()) {
             variant_keys = Some(Arc::new(outcome.matched_keys));
         }
     }
@@ -537,7 +560,7 @@ fn run_fit(request: FitRequest<'_>) -> Result<(), MapDriverError> {
         if let Some(retained) = retained_indices.as_deref() {
             keys = retain_variant_keys_by_logical_indices(keys, retained)?;
             println!(
-                "MAF filter retained {} variants in the PCA stream.",
+                "Variant QC retained {} variants in the PCA stream.",
                 retained.len()
             );
         }
@@ -701,7 +724,7 @@ fn retain_selection_plan_by_logical_indices(
 ) -> Result<SelectionPlan, MapDriverError> {
     let invalid_index = |idx: usize, available: usize| {
         MapDriverError::InvalidState(format!(
-            "MAF-retained logical index {idx} exceeded selected variant count {available}"
+            "QC-retained logical index {idx} exceeded selected variant count {available}"
         ))
     };
 
@@ -746,22 +769,23 @@ fn retain_selection_plan_by_logical_indices(
     }
 }
 
-fn packed_maf_retained_indices(
+fn packed_variant_filter_retained_indices(
     packed: &HardCallPacked<'_>,
     n_samples: usize,
-    min_maf: f64,
+    min_maf: Option<f64>,
+    max_missing_rate: Option<f64>,
 ) -> Option<Vec<usize>> {
     let retained: Option<Vec<bool>> = (0..packed.n_variants())
         .into_par_iter()
         .map(|variant| {
             let (sum, _, calls) = packed.moments(variant, n_samples)?;
-            let maf = if calls == 0 {
-                0.0
-            } else {
-                let frequency = (sum / (2.0 * calls as f64)).clamp(0.0, 1.0);
-                frequency.min(1.0 - frequency)
-            };
-            Some(maf >= min_maf)
+            Some(variant_moments_pass_qc(
+                sum,
+                calls,
+                n_samples,
+                min_maf,
+                max_missing_rate,
+            ))
         })
         .collect();
     Some(
@@ -773,9 +797,10 @@ fn packed_maf_retained_indices(
     )
 }
 
-fn scan_packed_maf_filter<S>(
+fn scan_packed_variant_filter<S>(
     source: &mut S,
-    min_maf: f64,
+    min_maf: Option<f64>,
+    max_missing_rate: Option<f64>,
 ) -> Result<Option<Vec<usize>>, MapDriverError>
 where
     S: VariantBlockSource + Send,
@@ -788,7 +813,7 @@ where
     let Some(packed) = source.hard_call_packed() else {
         return Ok(None);
     };
-    packed_maf_retained_indices(&packed, n_samples, min_maf)
+    packed_variant_filter_retained_indices(&packed, n_samples, min_maf, max_missing_rate)
         .map(Some)
         .ok_or_else(|| {
             MapDriverError::InvalidState(
@@ -797,12 +822,14 @@ where
         })
 }
 
-/// Completes the one MAF pass needed to turn an indexed source into a retained
+/// Completes the one variant-QC pass needed to turn an indexed source into a retained
 /// selection.  Each of the wrapper layers owns a block buffer, so cap this
 /// outer buffer at 64 MiB; at AoU scale that keeps the scan's combined scratch
 /// in the low hundreds of MiB rather than allocating multi-GiB 2,048-marker
 /// tiles merely to discover allele frequencies.
-fn scan_maf_filter<S>(source: &mut StreamingMafFilterSource<S>) -> Result<(), MapDriverError>
+fn scan_variant_filter<S>(
+    source: &mut StreamingVariantFilterSource<S>,
+) -> Result<(), MapDriverError>
 where
     S: VariantBlockSource + Send,
     S::Error: std::error::Error + Send + Sync + 'static,
@@ -1199,7 +1226,7 @@ fn set_ld_variant_keys(options: &mut FitOptions, keys: &[VariantKey]) {
 /// not.
 ///
 /// Both paths leave the same model metadata behind: the returned keys are the
-/// variants the fit saw, in stream order and after MAF filtering, and the
+/// variants the fit saw, in stream order and after variant filtering, and the
 /// caller's selection outcome is finalized either way because both paths reach
 /// the end of the stream at least once. The difference is only where the
 /// genotypes come from on the second and later passes.
@@ -1346,7 +1373,7 @@ fn retain_variant_keys_by_logical_indices(
     for &logical_idx in retained_logical_indices {
         let key = keys.get(logical_idx).ok_or_else(|| {
             MapDriverError::InvalidState(format!(
-                "MAF-retained logical index {logical_idx} exceeded selected variant key count {}",
+                "QC-retained logical index {logical_idx} exceeded selected variant key count {}",
                 keys.len()
             ))
         })?;
@@ -1774,8 +1801,9 @@ fn map_variant_list_error(path: &Path, err: VariantListError) -> MapDriverError 
 #[cfg(test)]
 mod tests {
     use super::{
-        MapCommand, MapDriverError, packed_maf_retained_indices, projection_present_mask,
-        resolve_keep_indices, retain_selection_plan_by_logical_indices, run, run_project,
+        MapCommand, MapDriverError, packed_variant_filter_retained_indices,
+        projection_present_mask, resolve_keep_indices, retain_selection_plan_by_logical_indices,
+        run, run_project,
     };
     use crate::map::fit::{HardCallPacked, HwePcaModel};
     use crate::map::io::{
@@ -1840,6 +1868,7 @@ mod tests {
             threads: Some(0),
             allow_unconverged: false,
             maf: None,
+            geno: None,
             ld: None,
         })
         .expect_err("zero worker threads must be rejected");
@@ -1851,7 +1880,30 @@ mod tests {
     }
 
     #[test]
-    fn packed_maf_scan_handles_missing_calls_selection_and_swaps() {
+    fn fit_rejects_invalid_call_rate_before_opening_input() {
+        let error = run(MapCommand::Fit {
+            genotype_path: PathBuf::from("input-must-not-be-opened.bed"),
+            variant_list: None,
+            keep: None,
+            markers: None,
+            components: 4,
+            threads: None,
+            allow_unconverged: false,
+            maf: None,
+            geno: Some(f64::NAN),
+            ld: None,
+        })
+        .expect_err("a non-finite call-rate threshold must be rejected");
+
+        assert!(matches!(
+            error,
+            MapDriverError::InvalidState(message)
+                if message == "--geno must be a finite value between 0 and 1"
+        ));
+    }
+
+    #[test]
+    fn packed_variant_filter_handles_missing_calls_selection_and_swaps() {
         let bytes = [0x00, 0x78, 0xff, 0x55];
         let selection = [2, 1, 3, 0];
         let kinds = [
@@ -1862,13 +1914,28 @@ mod tests {
         ];
         let packed = HardCallPacked::new_selected(&bytes, 1, bytes.len(), &selection, Some(&kinds));
 
-        assert_eq!(packed_maf_retained_indices(&packed, 4, 0.05), Some(vec![1]));
+        assert_eq!(
+            packed_variant_filter_retained_indices(&packed, 4, Some(0.05), None),
+            Some(vec![1])
+        );
+        assert_eq!(
+            packed_variant_filter_retained_indices(&packed, 4, None, Some(0.20)),
+            Some(vec![0, 3])
+        );
+        assert_eq!(
+            packed_variant_filter_retained_indices(&packed, 4, None, Some(0.25)),
+            Some(vec![0, 1, 3])
+        );
+        assert_eq!(
+            packed_variant_filter_retained_indices(&packed, 4, Some(0.05), Some(0.25)),
+            Some(vec![1])
+        );
 
         let one_sample =
             HardCallPacked::new_selected(&bytes, 1, bytes.len(), &selection, Some(&kinds))
                 .with_sample_selection(&[0]);
         assert_eq!(
-            packed_maf_retained_indices(&one_sample, 1, 0.05),
+            packed_variant_filter_retained_indices(&one_sample, 1, Some(0.05), None),
             Some(vec![])
         );
 
@@ -1876,8 +1943,17 @@ mod tests {
             HardCallPacked::new_selected(&bytes, 1, bytes.len(), &selection, Some(&kinds))
                 .with_sample_selection(&[0, 1]);
         assert_eq!(
-            packed_maf_retained_indices(&two_samples, 2, 0.05),
+            packed_variant_filter_retained_indices(&two_samples, 2, Some(0.05), None),
             Some(vec![1])
+        );
+
+        let missing_sample =
+            HardCallPacked::new_selected(&bytes, 1, bytes.len(), &selection, Some(&kinds))
+                .with_sample_selection(&[3]);
+        assert_eq!(
+            packed_variant_filter_retained_indices(&missing_sample, 1, None, Some(0.0)),
+            Some(vec![0, 3]),
+            "call rate must be computed from the rows selected by --keep"
         );
     }
 

@@ -547,12 +547,18 @@ impl FitOptions {
     }
 }
 
-pub struct StreamingMafFilterSource<S>
+/// Filters streamed variants by observed allele frequency and call rate.
+///
+/// Indexed hard-call sources perform the same screen directly on their packed
+/// bytes before constructing this wrapper. This source is the bounded-memory
+/// path for VCF/BCF and for any indexed source without a packed view.
+pub struct StreamingVariantFilterSource<S>
 where
     S: VariantBlockSource,
 {
     inner: S,
-    min_maf: f64,
+    min_maf: Option<f64>,
+    max_missing_rate: Option<f64>,
     n_samples: usize,
     observed_variants: usize,
     retained_variants_hint: Option<usize>,
@@ -563,14 +569,32 @@ where
     retained_keys: Option<Vec<VariantKey>>,
 }
 
-impl<S> StreamingMafFilterSource<S>
+impl<S> StreamingVariantFilterSource<S>
 where
     S: VariantBlockSource,
 {
-    pub fn new(inner: S, min_maf: f64) -> Result<Self, HwePcaError> {
-        if !(min_maf.is_finite() && (0.0..=0.5).contains(&min_maf)) {
+    pub fn new(
+        inner: S,
+        min_maf: Option<f64>,
+        max_missing_rate: Option<f64>,
+    ) -> Result<Self, HwePcaError> {
+        if min_maf.is_none() && max_missing_rate.is_none() {
+            return Err(HwePcaError::InvalidInput(
+                "variant filter requires a MAF or missing-call threshold",
+            ));
+        }
+        if min_maf
+            .is_some_and(|threshold| !(threshold.is_finite() && (0.0..=0.5).contains(&threshold)))
+        {
             return Err(HwePcaError::InvalidInput(
                 "MAF threshold must be finite and between 0 and 0.5",
+            ));
+        }
+        if max_missing_rate
+            .is_some_and(|threshold| !(threshold.is_finite() && (0.0..=1.0).contains(&threshold)))
+        {
+            return Err(HwePcaError::InvalidInput(
+                "missing-call threshold must be finite and between 0 and 1",
             ));
         }
         let n_samples = inner.n_samples();
@@ -578,6 +602,7 @@ where
         Ok(Self {
             inner,
             min_maf,
+            max_missing_rate,
             n_samples,
             observed_variants: 0,
             retained_variants_hint: None,
@@ -611,7 +636,7 @@ where
     }
 }
 
-impl<S> VariantBlockSource for StreamingMafFilterSource<S>
+impl<S> VariantBlockSource for StreamingVariantFilterSource<S>
 where
     S: VariantBlockSource,
 {
@@ -671,7 +696,7 @@ where
                 let src_start = local_idx * self.n_samples;
                 let src_end = src_start + self.n_samples;
                 let values = &self.inner_storage[src_start..src_end];
-                if observed_maf(values) < self.min_maf {
+                if !variant_passes_qc(values, self.min_maf, self.max_missing_rate) {
                     self.observed_variants += 1;
                     continue;
                 }
@@ -717,7 +742,7 @@ where
     }
 }
 
-fn observed_maf(values: &[f64]) -> f64 {
+fn variant_passes_qc(values: &[f64], min_maf: Option<f64>, max_missing_rate: Option<f64>) -> bool {
     let mut sum = 0.0;
     let mut calls = 0usize;
     for &value in values {
@@ -727,12 +752,34 @@ fn observed_maf(values: &[f64]) -> f64 {
         }
     }
 
-    if calls == 0 {
-        return 0.0;
+    variant_moments_pass_qc(sum, calls, values.len(), min_maf, max_missing_rate)
+}
+
+pub(crate) fn variant_moments_pass_qc(
+    sum: f64,
+    calls: usize,
+    n_samples: usize,
+    min_maf: Option<f64>,
+    max_missing_rate: Option<f64>,
+) -> bool {
+    if max_missing_rate.is_some_and(|threshold| {
+        let missing = n_samples.saturating_sub(calls);
+        missing as f64 > threshold * n_samples as f64
+    }) {
+        return false;
     }
 
-    let allele_frequency = (sum / (2.0 * calls as f64)).clamp(0.0, 1.0);
-    allele_frequency.min(1.0 - allele_frequency)
+    if let Some(threshold) = min_maf {
+        if calls == 0 {
+            return false;
+        }
+        let allele_frequency = (sum / (2.0 * calls as f64)).clamp(0.0, 1.0);
+        if allele_frequency.min(1.0 - allele_frequency) < threshold {
+            return false;
+        }
+    }
+
+    true
 }
 
 /// Restricts a [`VariantBlockSource`] to a subset of the dataset's sample rows.
@@ -740,9 +787,10 @@ fn observed_maf(values: &[f64]) -> f64 {
 /// Blocks are laid out column-major per variant
 /// (`storage[variant * n_samples + sample]`), so a row subset is a per-variant
 /// gather of the retained positions. Wrapping happens above the raw dataset
-/// source and below the MAF filter, which is what makes `--keep` mean
-/// "fit the PCA on these samples only": allele frequencies, the MAF screen, LD
-/// weights and the covariance are all computed from the retained rows alone.
+/// source and below the variant filter, which is what makes `--keep` mean
+/// "fit the PCA on these samples only": allele frequencies, the MAF/call-rate
+/// screen, LD weights and the covariance are all computed from the retained
+/// rows alone.
 ///
 /// [`SampleSubsetSource::passthrough`] is the identity case used when no subset
 /// was requested; it forwards every call — including the packed hard-call fast
@@ -8562,15 +8610,16 @@ mod tests {
     }
 
     #[test]
-    fn maf_filter_retains_its_post_filter_variant_hint_across_resets() {
+    fn streaming_variant_filter_retains_its_post_filter_hint_across_resets() {
         let data = vec![
             0.0, 0.0, 0.0, 0.0, // MAF 0.0: drop
             0.0, 1.0, 1.0, 2.0, // MAF 0.5: retain
-            2.0, 2.0, 2.0, 2.0, // MAF 0.0: drop
+            0.0, 1.0, f64::NAN, f64::NAN, // MAF 0.25 but 50% missing: drop
             0.0, 0.0, 0.0, 1.0, // MAF 0.125: drop
         ];
         let inner = DenseBlockSource::new(&data, 4, 4).expect("dense source");
-        let mut source = StreamingMafFilterSource::new(inner, 0.2).expect("MAF filter");
+        let mut source = StreamingVariantFilterSource::new(inner, Some(0.2), Some(0.25))
+            .expect("variant filter");
 
         let retained = drain_source(&mut source, 2);
         assert_eq!(retained, vec![0.0, 1.0, 1.0, 2.0]);
@@ -8580,10 +8629,17 @@ mod tests {
         assert_eq!(
             source.n_variants(),
             1,
-            "the solver must size LD to post-MAF markers"
+            "the solver must size LD to post-QC markers"
         );
         assert_eq!(drain_source(&mut source, 2), retained);
         assert_eq!(source.retained_indices(), &[1]);
+    }
+
+    #[test]
+    fn call_rate_threshold_is_inclusive() {
+        let values = [0.0, 1.0, f64::NAN, f64::NAN];
+        assert!(variant_passes_qc(&values, Some(0.2), Some(0.5)));
+        assert!(!variant_passes_qc(&values, Some(0.2), Some(0.499)));
     }
 
     #[test]

@@ -19,7 +19,7 @@ recomputing cohort-specific statistics.
 ## CLI entry points
 | Command | Purpose | Required input | Primary outputs |
 | --- | --- | --- | --- |
-| `gnomon fit --components <N> [--threads N] [--allow-unconverged] [--maf MAF] [--list PATH] [--keep PATH] [--ld] <GENOTYPE_PATH>` | Train a Hardy–Weinberg PCA model | Genotype source (PLINK trio or VCF/BCF files, local or remote) | `hwe.json`, `samples.tsv`, `hwe_summary.tsv`, `hwe_scores.bin` plus `hwe_scores.metadata.json` |
+| `gnomon fit --components <N> [--threads N] [--allow-unconverged] [--maf MAF] [--geno RATE] [--list PATH] [--keep PATH] [--ld] <GENOTYPE_PATH>` | Train a Hardy–Weinberg PCA model | Genotype source (PLINK trio or VCF/BCF files, local or remote) | `hwe.json`, `samples.tsv`, `hwe_summary.tsv`, `hwe_scores.bin` plus `hwe_scores.metadata.json` |
 | `gnomon project <GENOTYPE_PATH>` | Project samples with an existing `hwe.json` located next to the genotype data | Matching genotype source aligned to the model's variant set | `projection_scores.bin` plus `projection_scores.metadata.json` |
 
 Both commands print sample and variant counts, resolved source paths, and
@@ -74,10 +74,18 @@ Optional arguments:
   `0.5`; filtering runs after `--list` and `--keep` selection and before LD
   weighting or PCA. Indexed PLINK/PGEN inputs are screened once and then reopened
   through the retained physical-marker selection, so repeated PCA passes keep
-  the packed hard-call path instead of recomputing MAF on every traversal. With
-  MAF is counted directly from the packed 2-bit hard calls, including only the
+  the packed hard-call path instead of recomputing MAF on every traversal. MAF
+  is counted directly from the packed 2-bit hard calls, including only the
   physical rows selected by `--keep`; the fitting cohort, not the full callset,
   therefore defines the observed MAF without materializing decoded genotypes.
+* `--geno <RATE>` – Retain only variants whose observed missing-call fraction
+  in the fitting cohort is at most `RATE`, matching PLINK's threshold
+  convention. The value must be between `0` and `1`; `0` requires complete
+  calls and `1` disables the screen. `--geno` is fused with `--maf` in the same
+  packed 2-bit scan, so combining realistic microarray call-rate and frequency
+  QC does not add another genome traversal. Like MAF, call rate is computed
+  after `--list`, `--markers`, and `--keep`, and the exact retained marker list
+  defines subsequent LD windows and PCA passes.
 * `--allow-unconverged` – Emit the solver's best available model when its
   bounded pass budget is exhausted. This never labels the result converged:
   `hwe.json` and `hwe_summary.tsv` retain the measured residual, subspace
@@ -116,13 +124,14 @@ finer-grained monitoring is needed.
    variant density. Windows are truncated at dataset and chromosome edges and
    validated against the exact post-filter marker stream before use. The
    resulting per-variant weights are saved inside the serialized model.
-4. `--maf` can remove rare or monomorphic variants before LD weighting and PCA;
-   saved model keys, scalers, loadings, and optional LD weights all use the
-   filtered variant set.
+4. `--maf` and `--geno` can remove rare, monomorphic, or poorly called variants
+   before LD weighting and PCA; saved model keys, scalers, loadings, and
+   optional LD weights all use the jointly filtered variant set.
 5. `--keep` narrows the sample rows the stream yields, so every statistic above
    is estimated within the subset. The packed hard-call fast path cannot express
-   a row subset, so a `--keep` fit reads through the `f64` streaming path (the
-   in-memory source cache still repacks the retained rows when it is enabled).
+   a row subset. PLINK hard calls retain their physical row indices through the
+   packed statistics and covariance kernels, avoiding a decoded full-cohort
+   gather; streamed VCF/BCF sources use the generic row-gather path.
 6. Requested components beyond the intrinsic rank are clamped, and the driver
    reports the retained dimensionality.
 
@@ -237,6 +246,7 @@ approx allele-wts 4 --threads 4`; gnomon ran `fit --components 4 --threads 4
 | 250,000 × 10,000 | **16.76 s** | 25.10 s | **3.50 GB** | 6.05 GB |
 | 250,000 × 20,000 | **31.75 s** | 48.10 s | **3.50 GB** | 6.06 GB |
 | 250,000 × 20,000 (2% missing calls) | **32.36 s** | 48.35 s | **3.50 GB** | 6.06 GB |
+| 250,000 × 19,000 (`--geno 0.05`; mixed 2%/20% missing) | **31.15 s** | 46.09 s | **3.50 GB** | 6.06 GB |
 | 250,000 × 19,751 (`--maf 0.05`) | **32.46 s** | 47.77 s | **3.50 GB** | 6.06 GB |
 | 100,000 kept from 250,000 × 20,000 | **17.59 s** | 20.84 s | **2.24 GB** | 2.44 GB |
 | 500,000 × 10,000 | **37.91 s** | 57.37 s | **5.80 GB** | 12.09 GB |
@@ -260,6 +270,20 @@ every variant while preserving the complete panel's planted structure
 faster with 42% less memory; all four canonical correlations with PLINK2 are
 0.999999999999, and both programs report identical between-population variance
 shares on every axis (0.99367–0.99392).
+
+Call-rate QC is likewise fused into the packed screen rather than paid once per
+solver pass. The `--geno` row starts from the complete panel and uses
+`bench_fit_solver.py inject-missing` with `--missing-rate 0.02`,
+`--high-missing-variants 1000`, and `--high-missing-rate 0.20` to distribute exactly
+1,000 bad markers across the genome. With `--geno 0.05`, gnomon and PLINK2 both
+remove those 1,000 markers and retain the other 19,000 in exactly the same
+physical order. Gnomon is 32.4% faster with 42% less memory; all four axis and
+canonical correlations are 0.999999999999, and their planted-population
+variance shares agree to the eighth decimal place (0.99330–0.99362).
+Adding `--maf 0.05` to that same run does not add a screen pass: both programs
+retain the same 18,764 markers in the same order, all four canonical
+correlations remain 0.999999999999, and gnomon completes in 31.12 s versus
+45.87 s for PLINK2.
 
 The matched `--keep` row retains the same deterministic 100,000 sample IDs in
 both programs. Direct packed-row selection cut gnomon's previous decoded-gather
