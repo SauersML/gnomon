@@ -65,12 +65,17 @@ Optional arguments:
 * `--maf <MAF>` – Retain only variants whose observed minor allele frequency in
   the fitting cohort is at least `MAF`. The threshold must be between `0` and
   `0.5`; filtering runs after `--list` and `--keep` selection and before LD
-  weighting or PCA.
+  weighting or PCA. Indexed PLINK/PGEN inputs are screened once and then reopened
+  through the retained physical-marker selection, so repeated PCA passes keep
+  the packed hard-call path instead of recomputing MAF on every traversal.
 * `--ld` – Enable linkage disequilibrium flattening. When present, LD weights
   use a default window of 51 variants unless `--sites_window <SITES>` (odd
   number of variants) or `--bp_window <BP>` (total genomic span in base pairs)
-  is supplied. The resulting weights are stored inside `hwe.json` so projections
-  can apply the same normalization.
+  is supplied. Every window is clipped to its chromosome; site-count windows
+  never borrow markers from the next chromosome. Base-pair windows additionally
+  require nondecreasing positions within each chromosome run. The resulting
+  weights are stored inside `hwe.json` so projections can apply the same
+  normalization.
 
 ### `gnomon project`
 `gnomon project` projects new samples into the PCA space defined by a previously
@@ -92,9 +97,9 @@ finer-grained monitoring is needed.
    covariance from streamed blocks.
 3. `--ld` enables LD weighting with either the default 51-variant window, a
    user-provided odd-sized site window, or a base-pair span that adapts to
-   variant density. Windows are truncated near dataset edges and validated
-   before use. The resulting per-variant weights are saved inside the
-   serialized model.
+   variant density. Windows are truncated at dataset and chromosome edges and
+   validated against the exact post-filter marker stream before use. The
+   resulting per-variant weights are saved inside the serialized model.
 4. `--maf` can remove rare or monomorphic variants before LD weighting and PCA;
    saved model keys, scalers, loadings, and optional LD weights all use the
    filtered variant set.

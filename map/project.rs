@@ -425,16 +425,15 @@ impl ProjectionCudaPacked {
         // than emitting uncalibrated f32 PCA scores.
         if !calibrate_projection_f32(&stream, &blas) {
             return Err(
-                "packed projection f32 GEMM did not match f64 on this device; using CPU".to_string(),
+                "packed projection f32 GEMM did not match f64 on this device; using CPU"
+                    .to_string(),
             );
         }
         let ptx = compile_ptx(PROJECT_CUDA_UNPACK_KERNELS)
             .map_err(|e| format!("NVRTC compile failed for projection kernel: {e:?}"))?;
         let module = match ctx.load_module(ptx) {
             Ok(module) => module,
-            Err(load_err)
-                if crate::score::cuda_backend::should_retry_with_cubin(load_err) =>
-            {
+            Err(load_err) if crate::score::cuda_backend::should_retry_with_cubin(load_err) => {
                 let (cc_major, cc_minor) = ctx
                     .compute_capability()
                     .map_err(|e| format!("Failed to query device compute capability: {e:?}"))?;
@@ -608,8 +607,8 @@ impl ProjectionCudaPacked {
         // overflow).
         let unpack_cfg = {
             const UNPACK_BLOCK: u32 = 256;
-            let people_u32 =
-                u32::try_from(n_samples).map_err(|_| format!("n_samples too large: {n_samples}"))?;
+            let people_u32 = u32::try_from(n_samples)
+                .map_err(|_| format!("n_samples too large: {n_samples}"))?;
             let variants_u32 =
                 u32::try_from(filled).map_err(|_| format!("filled too large: {filled}"))?;
             let grid_x = people_u32.div_ceil(UNPACK_BLOCK).max(1);
@@ -952,7 +951,12 @@ impl ProjectionCudaRhs {
         };
         unsafe {
             self.blas
-                .gemm(cfg, &d_a.slice(0..a_len), &d_b.slice(0..b_len), &mut d_c.slice_mut(0..c_len))
+                .gemm(
+                    cfg,
+                    &d_a.slice(0..a_len),
+                    &d_b.slice(0..b_len),
+                    &mut d_c.slice_mut(0..c_len),
+                )
                 .map_err(|e| format!("cuBLAS sgemm failed for projection rhs: {e:?}"))?;
         }
         let c32 = self
@@ -1018,7 +1022,9 @@ fn calibrate_projection_f32(stream: &std::sync::Arc<CudaStream>, blas: &CudaBlas
         // f64 reference.
         let d_a64 = stream.clone_htod(&a).map_err(|e| format!("{e:?}"))?;
         let d_b64 = stream.clone_htod(&b).map_err(|e| format!("{e:?}"))?;
-        let mut d_c64 = stream.alloc_zeros::<f64>(M * N).map_err(|e| format!("{e:?}"))?;
+        let mut d_c64 = stream
+            .alloc_zeros::<f64>(M * N)
+            .map_err(|e| format!("{e:?}"))?;
         unsafe {
             blas.gemm(
                 cfg64,
@@ -1033,7 +1039,9 @@ fn calibrate_projection_f32(stream: &std::sync::Arc<CudaStream>, blas: &CudaBlas
         let b32: Vec<f32> = b.iter().map(|&x| x as f32).collect();
         let d_a32 = stream.clone_htod(&a32).map_err(|e| format!("{e:?}"))?;
         let d_b32 = stream.clone_htod(&b32).map_err(|e| format!("{e:?}"))?;
-        let mut d_c32 = stream.alloc_zeros::<f32>(M * N).map_err(|e| format!("{e:?}"))?;
+        let mut d_c32 = stream
+            .alloc_zeros::<f32>(M * N)
+            .map_err(|e| format!("{e:?}"))?;
         unsafe {
             blas.gemm(
                 cfg32,
@@ -1044,8 +1052,12 @@ fn calibrate_projection_f32(stream: &std::sync::Arc<CudaStream>, blas: &CudaBlas
             .map_err(|e| format!("{e:?}"))?;
         }
         stream.synchronize().map_err(|e| format!("{e:?}"))?;
-        let ref64 = stream.clone_dtoh(&d_c64.slice(0..M * N)).map_err(|e| format!("{e:?}"))?;
-        let test32 = stream.clone_dtoh(&d_c32.slice(0..M * N)).map_err(|e| format!("{e:?}"))?;
+        let ref64 = stream
+            .clone_dtoh(&d_c64.slice(0..M * N))
+            .map_err(|e| format!("{e:?}"))?;
+        let test32 = stream
+            .clone_dtoh(&d_c32.slice(0..M * N))
+            .map_err(|e| format!("{e:?}"))?;
         let mut max_rel = 0.0f64;
         for (r, t) in ref64.iter().zip(test32.iter()) {
             let denom = r.abs().max(1.0);
@@ -1726,9 +1738,10 @@ fn build_projection_solve_base(
     let base_norm = symmetric_lower_one_norm(&base_info, components);
 
     let mut base_factor = base_info.clone();
-    let base_ridge = factorize_with_directional_ridge(&mut base_factor, components, policy, |restored| {
-        restored.copy_from_slice(&base_info[..components * components])
-    });
+    let base_ridge =
+        factorize_with_directional_ridge(&mut base_factor, components, policy, |restored| {
+            restored.copy_from_slice(&base_info[..components * components])
+        });
     let base_factor_ready = base_ridge.is_some();
     let mut inverse_column = vec![0.0f64; components];
     let base_conditioning = match base_ridge {
@@ -1801,9 +1814,8 @@ fn information_matrix_is_identity(
     // caller happened to express a gap rather than on the data. A tolerance
     // that decides whether to solve at all has to be tighter than the
     // difference between two paths that must agree.
-    let tolerance = (accumulated_variants.max(1) as f64)
-        * f64::EPSILON
-        * PROJECTION_IDENTITY_ROUNDING_UNITS;
+    let tolerance =
+        (accumulated_variants.max(1) as f64) * f64::EPSILON * PROJECTION_IDENTITY_ROUNDING_UNITS;
     let mut idx = 0usize;
     for row in 0..components {
         for col in row..components {
@@ -2205,11 +2217,8 @@ fn solve_projection_with_dense_missing_info(
         components,
         accumulated_variants,
     );
-    let outputs = SampleOutputAddresses::new(
-        &mut scores,
-        &mut alignment_out,
-        &mut conditioning_out,
-    );
+    let outputs =
+        SampleOutputAddresses::new(&mut scores, &mut alignment_out, &mut conditioning_out);
     let want_conditioning = outputs.wants_conditioning();
     let solve_chunk = projection_solve_sample_chunk(n_samples);
     let solve_chunks = n_samples.div_ceil(solve_chunk);
@@ -2630,7 +2639,6 @@ fn projection_block_budget_bytes(projected_samples: usize, components: usize) ->
     budget.clamp(lower, upper)
 }
 
-
 fn projection_gpu_rejection_reason(total_work: usize) -> Option<String> {
     let min_work = project_cuda_min_work();
     if total_work < min_work {
@@ -2707,7 +2715,11 @@ fn select_projection_cuda_device() -> Result<std::sync::Arc<CudaContext>, String
                 continue;
             }
         };
-        if best.as_ref().map(|(_, bf, _)| free_mem > *bf).unwrap_or(true) {
+        if best
+            .as_ref()
+            .map(|(_, bf, _)| free_mem > *bf)
+            .unwrap_or(true)
+        {
             best = Some((ordinal, free_mem, ctx));
         }
     }
@@ -3107,9 +3119,7 @@ where
         runtime
             .copy_scores_to_host(n_samples, components, &mut scores_row_major)
             .map_err(|_| {
-                HwePcaError::InvalidInput(
-                    "failed to copy final GPU projection scores to host",
-                )
+                HwePcaError::InvalidInput("failed to copy final GPU projection scores to host")
             })?;
     }
 
@@ -3925,22 +3935,12 @@ mod tests {
             40.0, 50.0, 60.0, // PC2 for samples 0,1,2
         ];
         let mut dst = vec![0.0f64; n_samples * components];
-        accumulate_col_major_scores_into_row_major(
-            &mut dst,
-            &src_col_major,
-            n_samples,
-            components,
-        );
+        accumulate_col_major_scores_into_row_major(&mut dst, &src_col_major, n_samples, components);
         // Row-major: sample*components + k.
         assert_eq!(dst, vec![10.0, 40.0, 20.0, 50.0, 30.0, 60.0]);
 
         // Accumulation must add, not overwrite (GPU blocks accumulate via beta=1).
-        accumulate_col_major_scores_into_row_major(
-            &mut dst,
-            &src_col_major,
-            n_samples,
-            components,
-        );
+        accumulate_col_major_scores_into_row_major(&mut dst, &src_col_major, n_samples, components);
         assert_eq!(dst, vec![20.0, 80.0, 40.0, 100.0, 60.0, 120.0]);
     }
 
@@ -3948,6 +3948,7 @@ mod tests {
 
     use super::super::fit::{FitOptions, LdConfig, LdWindow};
     use super::super::progress::NoopFitProgress;
+    use super::super::variant_filter::VariantKey;
     use serde_json::Value;
 
     const N_SAMPLES: usize = 3;
@@ -3977,7 +3978,11 @@ mod tests {
             ld: Some(LdConfig {
                 window: Some(LdWindow::Sites(3)),
                 ridge: Some(1.0e-3),
-                variant_keys: None,
+                variant_keys: Some(Arc::new(
+                    (0..N_VARIANTS)
+                        .map(|idx| VariantKey::new("1", 1_000 + idx as u64 * 100))
+                        .collect(),
+                )),
             }),
             ..FitOptions::default()
         };

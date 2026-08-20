@@ -291,9 +291,62 @@ fn run_fit(
     // with respect to ancestry.
     if let Some(budget) = markers {
         selection_plan = thin_selection_plan(&dataset, selection_plan, budget)?;
+        if let Some(keys) = variant_keys.take() {
+            // A list-backed selection cached model-oriented keys before
+            // thinning. Thin those by the same logical slots instead of
+            // rereading physical keys, which would lose requested allele
+            // orientation for swapped matches.
+            if keys.len() > budget {
+                let slots = stride_indices(keys.len(), budget);
+                let keys = Arc::try_unwrap(keys).unwrap_or_else(|arc| (*arc).clone());
+                variant_keys = Some(Arc::new(retain_variant_keys_by_logical_indices(
+                    keys, &slots,
+                )?));
+            } else {
+                variant_keys = Some(keys);
+            }
+        }
     }
 
     let is_vcf_like = matches!(dataset, GenotypeDataset::Variants(_));
+
+    // Indexed sources can turn the MAF result into a new physical selection
+    // plan.  Paying this one screening pass up front has two important
+    // consequences for biobank fits: positional LD windows are built from the
+    // exact post-MAF marker list, and the later solver passes recover the
+    // source's packed hard-call path instead of re-running a row-wise f64 MAF
+    // filter on every traversal.
+    if !is_vcf_like && let Some(min_maf) = maf {
+        let pre_maf_keys = match variant_keys.as_ref() {
+            Some(keys) => (**keys).clone(),
+            None => dataset.variant_keys_for_plan(&selection_plan)?,
+        };
+        let raw_source = subset_samples(
+            dataset.block_source_with_plan(selection_plan.clone())?,
+            keep_indices.as_deref(),
+        )?;
+        let mut source = StreamingMafFilterSource::new(raw_source, min_maf)?;
+        scan_maf_filter(&mut source)?;
+        let retained = source.retained_indices().to_vec();
+        if retained.is_empty() {
+            return Err(MapDriverError::InvalidState(format!(
+                "MAF filter {min_maf:.6} removed every selected variant"
+            )));
+        }
+
+        let post_maf_keys = retain_variant_keys_by_logical_indices(pre_maf_keys, &retained)?;
+        selection_plan = retain_selection_plan_by_logical_indices(selection_plan, &retained)?;
+        variant_keys = Some(Arc::new(post_maf_keys));
+        println!(
+            "MAF filter retained {} variants in the indexed PCA stream.",
+            retained.len()
+        );
+    }
+
+    // VCF/BCF cannot replace its stream with an indexed post-MAF selection, so
+    // it keeps the streaming filter.  PLINK/PGEN was rewritten above and must
+    // not filter a second time.
+    let streaming_maf = if is_vcf_like { maf } else { None };
 
     let mut fit_options = FitOptions::default();
     if let Some(window_spec) = ld.clone() {
@@ -303,7 +356,7 @@ fn run_fit(
             ridge: None,
             variant_keys: None,
         };
-        if matches!(window_spec, LdWindow::BasePairs(_)) && !is_vcf_like {
+        if !is_vcf_like {
             let keys_arc = if let Some(existing) = &variant_keys {
                 Arc::clone(existing)
             } else {
@@ -316,7 +369,7 @@ fn run_fit(
     }
 
     let progress = fit_progress();
-    fit_options.cache_source = maf.is_some() && !is_vcf_like;
+    fit_options.cache_source = streaming_maf.is_some();
 
     let (mut model, retained_indices, selection_outcome, mut streamed_keys) = if is_vcf_like {
         // Re-reading a VCF is expensive and the solver wants several passes, so
@@ -325,16 +378,12 @@ fn run_fit(
         // and 700k variants: the plan decides against the budget, and the scan
         // enforces the same budget again against the retained count that no VCF
         // can report before it has been read.
-        let plan = VcfMaterializationPlan::new(
-            fit_n_samples,
-            variant_upper_bound,
-            matches!(ld, Some(LdWindow::BasePairs(_))),
-        );
+        let plan = VcfMaterializationPlan::new(fit_n_samples, variant_upper_bound, ld.is_some());
         let raw_source = subset_samples(
             dataset.block_source_with_plan(selection_plan.clone())?,
             keep_indices.as_deref(),
         )?;
-        if let Some(min_maf) = maf {
+        if let Some(min_maf) = streaming_maf {
             let mut source = StreamingMafFilterSource::new(raw_source, min_maf)?;
             let (model, scanned_keys) = fit_vcf_source(
                 &mut source,
@@ -374,23 +423,6 @@ fn run_fit(
             let outcome = source.inner_mut().take_selection_outcome();
             (model, None, outcome, keys)
         }
-    } else if let Some(min_maf) = maf {
-        let raw_source = subset_samples(
-            dataset.block_source_with_plan(selection_plan.clone())?,
-            keep_indices.as_deref(),
-        )?;
-        let mut source = StreamingMafFilterSource::new(raw_source, min_maf)?;
-        let model = HwePcaModel::fit_k_with_options_and_progress(
-            &mut source,
-            components,
-            &fit_options,
-            &progress,
-        )?;
-        let retained = source.retained_indices().to_vec();
-        let keys = source.take_variant_keys();
-        let outcome = source.inner_mut().inner_mut().take_selection_outcome();
-        let retained_indices = if keys.is_some() { None } else { Some(retained) };
-        (model, retained_indices, outcome, keys)
     } else {
         let mut source = subset_samples(
             dataset.block_source_with_plan(selection_plan.clone())?,
@@ -512,6 +544,12 @@ fn run_fit(
     Ok(())
 }
 
+fn stride_indices(available: usize, budget: usize) -> Vec<usize> {
+    (0..budget)
+        .map(|slot| slot.saturating_mul(available) / budget)
+        .collect()
+}
+
 /// Caps the fit's variant count by taking an evenly spaced subsample.
 ///
 /// Fitting a PCA basis does not need every marker: the leading axes are a
@@ -536,15 +574,6 @@ fn thin_selection_plan(
         return Err(MapDriverError::InvalidState(
             "--markers must retain at least one variant".into(),
         ));
-    }
-
-    // Evenly spaced positions across `available`, inclusive of both ends, chosen
-    // by exact integer arithmetic so the same request always yields the same
-    // markers on every machine.
-    fn stride_indices(available: usize, budget: usize) -> Vec<usize> {
-        (0..budget)
-            .map(|slot| slot.saturating_mul(available) / budget)
-            .collect()
     }
 
     match plan {
@@ -607,6 +636,105 @@ fn thin_selection_plan(
     }
 }
 
+/// Applies logical positions from a filtered stream back to an indexed source
+/// selection without changing allele-orientation metadata.
+fn retain_selection_plan_by_logical_indices(
+    plan: SelectionPlan,
+    retained: &[usize],
+) -> Result<SelectionPlan, MapDriverError> {
+    let invalid_index = |idx: usize, available: usize| {
+        MapDriverError::InvalidState(format!(
+            "MAF-retained logical index {idx} exceeded selected variant count {available}"
+        ))
+    };
+
+    match plan {
+        SelectionPlan::All => Ok(SelectionPlan::ByIndices(retained.to_vec())),
+        SelectionPlan::ByIndices(indices) => {
+            let mut selected = Vec::with_capacity(retained.len());
+            for &logical_idx in retained {
+                selected.push(
+                    *indices
+                        .get(logical_idx)
+                        .ok_or_else(|| invalid_index(logical_idx, indices.len()))?,
+                );
+            }
+            Ok(SelectionPlan::ByIndices(selected))
+        }
+        SelectionPlan::Ordered(selection) => {
+            let mut indices = Vec::with_capacity(retained.len());
+            let mut match_kinds = Vec::with_capacity(retained.len());
+            for &logical_idx in retained {
+                indices.push(
+                    *selection
+                        .indices
+                        .get(logical_idx)
+                        .ok_or_else(|| invalid_index(logical_idx, selection.indices.len()))?,
+                );
+                match_kinds.push(
+                    *selection
+                        .match_kinds
+                        .get(logical_idx)
+                        .ok_or_else(|| invalid_index(logical_idx, selection.match_kinds.len()))?,
+                );
+            }
+            Ok(SelectionPlan::Ordered(OrderedSelectionPlan::new(
+                indices,
+                match_kinds,
+            )))
+        }
+        SelectionPlan::ByKeys(_) => Err(MapDriverError::InvalidState(
+            "cannot apply indexed MAF positions to a key-streamed source".into(),
+        )),
+    }
+}
+
+/// Completes the one MAF pass needed to turn an indexed source into a retained
+/// selection.  Each of the wrapper layers owns a block buffer, so cap this
+/// outer buffer at 64 MiB; at AoU scale that keeps the scan's combined scratch
+/// in the low hundreds of MiB rather than allocating multi-GiB 2,048-marker
+/// tiles merely to discover allele frequencies.
+fn scan_maf_filter<S>(source: &mut StreamingMafFilterSource<S>) -> Result<(), MapDriverError>
+where
+    S: VariantBlockSource + Send,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    let n_samples = source.n_samples();
+    let block_capacity =
+        fit_scan_block_capacity(source.block_storage_samples(), source.n_variants());
+    let mut block = vec![0.0f64; n_samples.saturating_mul(block_capacity)];
+
+    source
+        .reset()
+        .map_err(|err| HwePcaError::Source(Box::new(err)))?;
+    loop {
+        let filled = source
+            .next_block_into(block_capacity, &mut block)
+            .map_err(|err| HwePcaError::Source(Box::new(err)))?;
+        if filled == 0 {
+            break;
+        }
+    }
+    Ok(())
+}
+
+const FIT_SCAN_BLOCK_BYTES: usize = 64 * 1024 * 1024;
+
+fn fit_scan_block_capacity(n_samples: usize, n_variants_hint: usize) -> usize {
+    let bytes_per_variant = n_samples.saturating_mul(std::mem::size_of::<f64>());
+    let affordable = if bytes_per_variant == 0 {
+        1
+    } else {
+        (FIT_SCAN_BLOCK_BYTES / bytes_per_variant).max(1)
+    };
+    let capacity = affordable.min(DEFAULT_BLOCK_WIDTH).max(1);
+    if n_variants_hint > 0 {
+        capacity.min(n_variants_hint)
+    } else {
+        capacity
+    }
+}
+
 /// Wraps a dataset block source so the fit sees only the retained sample rows.
 ///
 /// With no `--keep` the wrapper is the identity: it forwards every call,
@@ -659,7 +787,10 @@ fn resolve_keep_indices(
     let mut position: HashMap<&str, usize> = HashMap::with_capacity(samples.len());
     let mut ambiguous: HashSet<&str> = HashSet::new();
     for (idx, record) in samples.iter().enumerate() {
-        if position.insert(record.individual_id.as_str(), idx).is_some() {
+        if position
+            .insert(record.individual_id.as_str(), idx)
+            .is_some()
+        {
             ambiguous.insert(record.individual_id.as_str());
         }
     }
@@ -793,8 +924,8 @@ struct VcfMaterializationPlan {
     /// *reserving* the terabyte it would then have to give straight back.
     attempt: bool,
     /// Whether the scan must run even when it may not hold genotypes, because
-    /// a base-pair LD window needs one position per streamed variant and only
-    /// a pass over the stream can produce that list.
+    /// every LD window needs one chromosome key per streamed variant (and a
+    /// base-pair window additionally needs its position).
     scan_anyway: bool,
 }
 
@@ -858,11 +989,7 @@ where
 {
     let n_samples = source.n_samples();
     let hint = source.n_variants();
-    let block_capacity = if hint > 0 {
-        DEFAULT_BLOCK_WIDTH.min(hint).max(1)
-    } else {
-        DEFAULT_BLOCK_WIDTH.max(1)
-    };
+    let block_capacity = fit_scan_block_capacity(source.block_storage_samples(), hint);
     let mut block = vec![0.0f64; n_samples.saturating_mul(block_capacity)];
     // Reserved up front only when the caller has already established that the
     // whole matrix fits. The hint is the variant list's length for a keyed
@@ -939,16 +1066,12 @@ where
     }
 }
 
-/// Points a base-pair LD window at the positions of the variants the fit will
-/// actually see.
-///
-/// A sites window needs no positions at all, and a base-pair window resolved
-/// against any list other than the streamed one weights the wrong sites, so
-/// this is set from the scan that produced the stream and from nothing else.
-fn set_bp_ld_variant_keys(options: &mut FitOptions, keys: &[VariantKey]) {
-    if let Some(ld_config) = options.ld.as_mut()
-        && matches!(ld_config.window, Some(LdWindow::BasePairs(_)))
-    {
+/// Points every LD window at the exact variants the fit will see. Site-count
+/// windows need chromosome identities just as base-pair windows need positions:
+/// without them the last markers of one chromosome are treated as neighbours
+/// of the first markers of the next.
+fn set_ld_variant_keys(options: &mut FitOptions, keys: &[VariantKey]) {
+    if let Some(ld_config) = options.ld.as_mut() {
         ld_config.variant_keys = Some(Arc::new(keys.to_vec()));
     }
 }
@@ -981,12 +1104,16 @@ where
         );
     } else if plan.scan_anyway {
         println!(
-            "Scanning the VCF once for the variant positions the base-pair LD window needs; genotypes are not held in RAM."
+            "Scanning the VCF once for the variant keys its chromosome-safe LD windows need; genotypes are not held in RAM."
         );
     }
 
     let scan = if plan.attempt || plan.scan_anyway {
-        Some(scan_vcf_fit_source(source, plan.budget_bytes, plan.attempt)?)
+        Some(scan_vcf_fit_source(
+            source,
+            plan.budget_bytes,
+            plan.attempt,
+        )?)
     } else {
         None
     };
@@ -1000,7 +1127,7 @@ where
         }) => {
             let keys = keys.ok_or_else(|| {
                 MapDriverError::InvalidState(
-                    "VCF materialization did not capture variant positions for base-pair LD".into(),
+                    "VCF materialization did not capture variant keys for LD".into(),
                 )
             })?;
             if keys.len() != n_variants {
@@ -1011,7 +1138,7 @@ where
             }
             let mut materialized_options = fit_options.clone();
             materialized_options.cache_source = false;
-            set_bp_ld_variant_keys(&mut materialized_options, &keys);
+            set_ld_variant_keys(&mut materialized_options, &keys);
             let mut dense = DenseBlockSource::new(&data, n_samples, n_variants)?;
             let model = HwePcaModel::fit_k_with_options_and_progress(
                 &mut dense,
@@ -1048,14 +1175,14 @@ where
 
     let mut streaming_options = fit_options.clone();
     match streamed_keys.as_deref() {
-        Some(keys) => set_bp_ld_variant_keys(&mut streaming_options, keys),
-        // Only the scan can supply positions for a streamed fit, and it is run
-        // whenever the window is in base pairs — so reaching here means the
-        // stream yielded no positions at all, and weighting by distance is not
-        // something to guess at.
+        Some(keys) => set_ld_variant_keys(&mut streaming_options, keys),
+        // Only the scan can supply the exact keys for a streamed fit, and it is
+        // run whenever LD is enabled. Reaching here means the source supplied
+        // no chromosome identities, which makes even a site-count window
+        // ambiguous at chromosome boundaries.
         None if plan.scan_anyway => {
             return Err(MapDriverError::InvalidState(
-                "streamed VCF fit did not capture variant positions for base-pair LD".into(),
+                "streamed VCF fit did not capture variant keys for LD".into(),
             ));
         }
         None => {}
@@ -1228,9 +1355,7 @@ fn run_project_inner(
                     super::variant_filter::MatchKind::Wildcard => wildcard += 1,
                 }
             }
-            println!(
-                "  Match kinds: {exact} exact, {swap} allele-swap, {wildcard} position-only"
-            );
+            println!("  Match kinds: {exact} exact, {swap} allele-swap, {wildcard} position-only");
 
             // Warn (never fail) on a very low overlap: it can renormalize into an
             // unstable, non-ancestry-like projection. Likely causes are a genome
@@ -1530,14 +1655,17 @@ fn map_variant_list_error(path: &Path, err: VariantListError) -> MapDriverError 
 
 #[cfg(test)]
 mod tests {
-    use super::{projection_present_mask, resolve_keep_indices, run_project};
+    use super::{
+        projection_present_mask, resolve_keep_indices, retain_selection_plan_by_logical_indices,
+        run_project,
+    };
     use crate::map::fit::HwePcaModel;
     use crate::map::io::{
-        GenotypeDataset, ProjectionOutputPaths, SampleRecord, SelectionPlan, load_hwe_model,
-        save_hwe_model, save_projection_results,
+        GenotypeDataset, OrderedSelectionPlan, ProjectionOutputPaths, SampleRecord, SelectionPlan,
+        load_hwe_model, save_hwe_model, save_projection_results,
     };
     use crate::map::project::ProjectionOptions;
-    use crate::map::variant_filter::{VariantFilter, VariantKey, VariantSelection};
+    use crate::map::variant_filter::{MatchKind, VariantFilter, VariantKey, VariantSelection};
     use crate::shared::files::{
         VariantCompression, VariantFormat, ensure_rustls_provider, open_variant_source,
     };
@@ -1599,6 +1727,27 @@ mod tests {
             "retained rows must be de-duplicated and left in dataset order"
         );
         Ok(())
+    }
+
+    #[test]
+    fn maf_positions_rewrite_ordered_selection_without_losing_allele_swaps() {
+        let plan = SelectionPlan::Ordered(OrderedSelectionPlan::new(
+            vec![10, 20, 30, 40],
+            vec![
+                MatchKind::Exact,
+                MatchKind::Swap,
+                MatchKind::Exact,
+                MatchKind::Swap,
+            ],
+        ));
+
+        let retained = retain_selection_plan_by_logical_indices(plan, &[1, 3])
+            .expect("valid logical positions");
+        let SelectionPlan::Ordered(retained) = retained else {
+            panic!("ordered input must remain ordered");
+        };
+        assert_eq!(retained.indices, vec![20, 40]);
+        assert_eq!(retained.match_kinds, vec![MatchKind::Swap, MatchKind::Swap]);
     }
 
     #[test]

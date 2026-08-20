@@ -1,6 +1,4 @@
-use super::blocklanczos::{
-    BlockKrylovError, BlockKrylovParams, BlockOperator, block_krylov_eigen,
-};
+use super::blocklanczos::{BlockKrylovError, BlockKrylovParams, BlockOperator, block_krylov_eigen};
 use super::progress::{
     FitProgressObserver, FitProgressStage, NoopFitProgress, StageProgressHandle,
 };
@@ -83,8 +81,7 @@ const MIN_LD_WEIGHT: f64 = 1.0e-6;
 /// Raised when the LD schedule and the stream disagree about what variant an
 /// index names. See [`LdResolvedConfig::range_count`] for what the two lists
 /// are and how a filter between them pulls them apart.
-const LD_RANGE_LIST_MISMATCH: &str =
-    "LD windows were computed from a different variant list than the fit streamed: the window \
+const LD_RANGE_LIST_MISMATCH: &str = "LD windows were computed from a different variant list than the fit streamed: the window \
      ranges must be built from the retained, post-filter variants, in stream order";
 
 #[inline]
@@ -365,16 +362,8 @@ struct LdWindowRange {
 enum LdResolvedWindow {
     Sites {
         size: usize,
-        /// One chromosome-clipped window per variant, when the caller supplied
-        /// positions to clip against.
-        ///
-        /// `None` is the no-positions case: the schedule then cuts windows out
-        /// of stream order alone and treats the whole stream as one contiguous
-        /// chromosome. That is why `map/main.rs` should attach `variant_keys`
-        /// to a site window as it already does to a base-pair one — without
-        /// them a window straddling a chromosome boundary is unpreventable,
-        /// because nothing in the stream says where the boundary is.
-        ranges: Option<Arc<[LdWindowRange]>>,
+        /// One chromosome-clipped window per streamed variant.
+        ranges: Arc<[LdWindowRange]>,
     },
     BasePairs {
         span_bp: u64,
@@ -411,8 +400,7 @@ impl LdResolvedConfig {
         }
     }
 
-    /// How many variants the precomputed windows were cut from, when they were
-    /// cut ahead of the stream at all.
+    /// How many variants the precomputed windows were cut from.
     ///
     /// This is the checkable half of the index invariant. `ranges[i]` describes
     /// variant `i` *of the stream*, so it is only about the right marker if
@@ -424,13 +412,11 @@ impl LdResolvedConfig {
     /// plausible. The counts diverge the moment one variant is dropped, which
     /// makes them the cheap, total test for it.
     ///
-    /// `None` means no precomputed ranges and therefore nothing to reconcile:
-    /// the schedule is cut from stream positions alone and cannot disagree with
-    /// them.
-    fn range_count(&self) -> Option<usize> {
+    fn range_count(&self) -> usize {
         match &self.window {
-            LdResolvedWindow::Sites { ranges, .. } => ranges.as_ref().map(|ranges| ranges.len()),
-            LdResolvedWindow::BasePairs { ranges, .. } => Some(ranges.len()),
+            LdResolvedWindow::Sites { ranges, .. } | LdResolvedWindow::BasePairs { ranges, .. } => {
+                ranges.len()
+            }
         }
     }
 
@@ -451,32 +437,11 @@ impl LdResolvedConfig {
         stream_ended: bool,
     ) -> Result<Option<LdWindowRange>, HwePcaError> {
         let (start, end) = match &self.window {
-            LdResolvedWindow::Sites {
-                ranges: Some(ranges),
-                ..
-            }
-            | LdResolvedWindow::BasePairs { ranges, .. } => {
+            LdResolvedWindow::Sites { ranges, .. } | LdResolvedWindow::BasePairs { ranges, .. } => {
                 let Some(range) = ranges.get(next) else {
                     return Ok(None);
                 };
                 (range.start, range.end)
-            }
-            LdResolvedWindow::Sites {
-                size,
-                ranges: None,
-            } => {
-                // `size` is forced odd on every path the CLI can reach, so the
-                // two half-widths are equal and the window is centred. Keeping
-                // them separate is what makes an even `size` — reachable only
-                // from a caller that builds the config directly — stay `size`
-                // markers wide instead of silently becoming `size + 1`.
-                let size = *size;
-                let left = size / 2;
-                let right = size.saturating_sub(1) - left;
-                (
-                    next.saturating_sub(left),
-                    next.saturating_add(right).saturating_add(1),
-                )
             }
         };
 
@@ -544,29 +509,15 @@ impl FitOptions {
                     }
                 }
 
-                // Positions turn a site count into the same explicit,
-                // chromosome-clipped range list the base-pair window already
-                // uses. Without them the count is all there is, and a window
-                // spanning a chromosome boundary cannot be prevented — stream
-                // order is the only structure available, and it says nothing
-                // about where one chromosome stops.
-                let ranges = match cfg.variant_keys.as_ref() {
-                    Some(keys) => {
-                        if keys.len() != observed_variants {
-                            return Err(HwePcaError::InvalidInput(
-                                "LD site window requires positions for all variants",
-                            ));
-                        }
-                        Some(compute_ld_site_ranges(keys, window))
-                    }
-                    None => {
-                        log::warn!(
-                            "LD site window has no variant positions: windows are cut from stream \
-                             order alone, so one may span a chromosome boundary"
-                        );
-                        None
-                    }
-                };
+                let keys = cfg.variant_keys.as_ref().ok_or(HwePcaError::InvalidInput(
+                    "LD site window requires chromosome keys for all variants",
+                ))?;
+                if keys.len() != observed_variants {
+                    return Err(HwePcaError::InvalidInput(
+                        "LD site window requires chromosome keys for all variants",
+                    ));
+                }
+                let ranges = compute_ld_site_ranges(keys, window);
                 LdResolvedWindow::Sites {
                     size: window,
                     ranges,
@@ -602,6 +553,7 @@ where
     min_maf: f64,
     n_samples: usize,
     observed_variants: usize,
+    retained_variants_hint: Option<usize>,
     retained_indices: Vec<usize>,
     inner_storage: Vec<f64>,
     inner_quality: Vec<f64>,
@@ -626,6 +578,7 @@ where
             min_maf,
             n_samples,
             observed_variants: 0,
+            retained_variants_hint: None,
             retained_indices: Vec::with_capacity(hint),
             inner_storage: Vec::new(),
             inner_quality: Vec::new(),
@@ -667,7 +620,12 @@ where
     }
 
     fn n_variants(&self) -> usize {
-        self.inner.n_variants()
+        self.retained_variants_hint
+            .unwrap_or_else(|| self.inner.n_variants())
+    }
+
+    fn block_storage_samples(&self) -> usize {
+        self.inner.block_storage_samples().max(self.n_samples)
     }
 
     fn reset(&mut self) -> Result<(), Self::Error> {
@@ -699,6 +657,7 @@ where
                 .inner
                 .next_block_into(request, &mut self.inner_storage[..])?;
             if inner_filled == 0 {
+                self.retained_variants_hint = Some(self.retained_indices.len());
                 break;
             }
 
@@ -866,6 +825,12 @@ where
         self.inner.n_variants()
     }
 
+    fn block_storage_samples(&self) -> usize {
+        self.inner
+            .block_storage_samples()
+            .max(self.inner_n_samples)
+    }
+
     fn reset(&mut self) -> Result<(), Self::Error> {
         self.inner.reset()
     }
@@ -983,6 +948,14 @@ fn compute_ld_bp_ranges(
         ));
     }
 
+    for pair in keys.windows(2) {
+        if pair[0].chromosome == pair[1].chromosome && pair[1].position < pair[0].position {
+            return Err(HwePcaError::InvalidInput(
+                "LD base-pair window requires nondecreasing positions within each chromosome run",
+            ));
+        }
+    }
+
     let half_span = span_bp / 2;
 
     let mut left_bounds = vec![0usize; keys.len()];
@@ -1091,6 +1064,15 @@ pub trait VariantBlockSource {
 
     fn n_samples(&self) -> usize;
     fn n_variants(&self) -> usize;
+
+    /// Sample rows that one requested variant may occupy across this source's
+    /// decode buffers. A row-subsetting wrapper still has to decode the
+    /// physical cohort before gathering retained rows, so block planning must
+    /// use this footprint rather than only the rows it ultimately yields.
+    fn block_storage_samples(&self) -> usize {
+        self.n_samples()
+    }
+
     fn reset(&mut self) -> Result<(), Self::Error>;
     fn next_block_into(
         &mut self,
@@ -1313,10 +1295,7 @@ where
         let n_variants = source.n_variants();
         let bytes_per_variant = bytes_per_variant(n_samples);
         let packed_capacity = bytes_per_variant.saturating_mul(n_variants);
-        let state = if !enable_cache
-            || n_samples == 0
-            || packed_capacity > cache_budget_bytes()
-        {
+        let state = if !enable_cache || n_samples == 0 || packed_capacity > cache_budget_bytes() {
             CacheState::Disabled
         } else {
             CacheState::BuildingHardCall {
@@ -2909,7 +2888,10 @@ fn require_converged(
     // A route that did not measure a quantity says so rather than printing a
     // zero, for the same reason `FitDiagnostics` stores it as `Option`.
     let describe = |value: Option<f64>| {
-        value.map_or_else(|| String::from("unmeasured"), |value| format!("{value:.3e}"))
+        value.map_or_else(
+            || String::from("unmeasured"),
+            |value| format!("{value:.3e}"),
+        )
     };
 
     Err(HwePcaError::Eigen(format!(
@@ -3003,7 +2985,8 @@ impl HwePcaModel {
 
         let parallelism_guard = ParallelismGuard::new();
         let par = parallelism_guard.active_parallelism();
-        let block_capacity = adaptive_block_capacity(n_samples, n_variants_hint);
+        let block_capacity =
+            adaptive_block_capacity(source.block_storage_samples(), n_variants_hint);
         let ld_hint = if n_variants_hint > 0 {
             n_variants_hint
         } else if let Some(keys) = options
@@ -3022,12 +3005,8 @@ impl HwePcaModel {
         // n×n allocation happens to fit; see `covariance_computation_mode`.
         let gram_budget = gram_matrix_budget_bytes();
         let gram_bytes = gram_matrix_size_bytes(n_samples);
-        let gram_mode = covariance_computation_mode(
-            n_samples,
-            n_variants_hint,
-            target_components,
-            gram_budget,
-        );
+        let gram_mode =
+            covariance_computation_mode(n_samples, n_variants_hint, target_components, gram_budget);
 
         let mut cached_source = CachedVariantBlockSource::new(
             source,
@@ -3228,7 +3207,10 @@ impl HwePcaModel {
         // not find — it only spreads an unmeasured error into more numbers that
         // look finished. Stopping now also saves the genome traversal those
         // numbers would have cost.
-        require_converged(decomposition.diagnostics.as_ref(), options.allow_unconverged)?;
+        require_converged(
+            decomposition.diagnostics.as_ref(),
+            options.allow_unconverged,
+        )?;
 
         // One last traversal of the genome, and every number the model stores is
         // derived from what that traversal saw.
@@ -3282,7 +3264,12 @@ impl HwePcaModel {
         let diagnostics = decomposition.diagnostics;
         let refined = Eigenpairs {
             values: eigenvalues,
-            vectors: rotate_columns(decomposition.vectors, rotation.as_ref(), block_capacity, par),
+            vectors: rotate_columns(
+                decomposition.vectors,
+                rotation.as_ref(),
+                block_capacity,
+                par,
+            ),
             diagnostics,
         };
         loadings = rotate_columns(loadings, rotation.as_ref(), block_capacity, par);
@@ -4017,11 +4004,7 @@ where
         self.inner.n_samples()
     }
 
-    fn apply_block(
-        &self,
-        out: MatMut<'_, f64>,
-        q: MatRef<'_, f64>,
-    ) -> Result<(), Self::Error> {
+    fn apply_block(&self, out: MatMut<'_, f64>, q: MatRef<'_, f64>) -> Result<(), Self::Error> {
         let scratch = self.inner.apply_scratch(q.ncols(), self.par);
         let mut mem = MemBuffer::new(scratch);
 
@@ -5080,9 +5063,8 @@ where
             ));
         }
 
-        if let Some(expected) = config.range_count()
-            && processed + filled > expected
-        {
+        let expected = config.range_count();
+        if processed + filled > expected {
             return Err(HwePcaError::InvalidInput(LD_RANGE_LIST_MISMATCH));
         }
 
@@ -5161,9 +5143,7 @@ where
         }
     }
 
-    if let Some(expected) = config.range_count()
-        && processed != expected
-    {
+    if processed != config.range_count() {
         return Err(HwePcaError::InvalidInput(LD_RANGE_LIST_MISMATCH));
     }
 
@@ -5548,9 +5528,7 @@ where
         processed += filled;
     }
 
-    if let Some(expected) = config.range_count()
-        && processed != expected
-    {
+    if processed != config.range_count() {
         return Err(HwePcaError::InvalidInput(LD_RANGE_LIST_MISMATCH));
     }
 
@@ -5688,10 +5666,11 @@ fn compute_ld_weight(
         .mask_f64
         .as_mut()
         .submatrix_mut(0, 0, ring.n_samples(), window_len);
-    let mut values_sq = scratch
-        .values_sq
-        .as_mut()
-        .submatrix_mut(0, 0, ring.n_samples(), window_len);
+    let mut values_sq =
+        scratch
+            .values_sq
+            .as_mut()
+            .submatrix_mut(0, 0, ring.n_samples(), window_len);
     for col in 0..window_len {
         let src = &masks[col * ring.n_samples()..(col + 1) * ring.n_samples()];
         let dst = mask_mat.rb_mut().col_mut(col);
@@ -6629,6 +6608,12 @@ mod tests {
         HweScaler::new(freqs, scales)
     }
 
+    fn single_chromosome_keys(n_variants: usize) -> Vec<VariantKey> {
+        (0..n_variants)
+            .map(|idx| VariantKey::new("1", 1_000 + idx as u64 * 100))
+            .collect()
+    }
+
     #[test]
     fn ld_weights_sites_match_reference() {
         let n_samples = 4;
@@ -6650,7 +6635,7 @@ mod tests {
         let config = LdResolvedConfig {
             window: LdResolvedWindow::Sites {
                 size: 3,
-                ranges: None,
+                ranges: compute_ld_site_ranges(&single_chromosome_keys(observed_variants), 3),
             },
             ridge: DEFAULT_LD_RIDGE,
         };
@@ -6678,6 +6663,23 @@ mod tests {
             .map(|(lhs, rhs)| (lhs - rhs).abs())
             .fold(0.0, f64::max);
         assert!(max_diff < 1.0e-9, "max difference was {max_diff}");
+    }
+
+    #[test]
+    fn site_ld_refuses_a_stream_without_chromosome_keys() {
+        let options = FitOptions {
+            ld: Some(LdConfig {
+                window: Some(LdWindow::Sites(3)),
+                ridge: None,
+                variant_keys: None,
+            }),
+            ..FitOptions::default()
+        };
+
+        let err = options
+            .resolved_ld(4)
+            .expect_err("chromosome-blind site windows must not be constructed");
+        assert!(err.to_string().contains("chromosome keys"));
     }
 
     #[test]
@@ -6760,7 +6762,7 @@ mod tests {
         let config = LdResolvedConfig {
             window: LdResolvedWindow::Sites {
                 size: 17,
-                ranges: None,
+                ranges: compute_ld_site_ranges(&single_chromosome_keys(observed_variants), 17),
             },
             ridge: DEFAULT_LD_RIDGE,
         };
@@ -6986,7 +6988,7 @@ mod tests {
         let config = LdResolvedConfig {
             window: LdResolvedWindow::Sites {
                 size: window_size,
-                ranges: None,
+                ranges: compute_ld_site_ranges(&single_chromosome_keys(n_variants), window_size),
             },
             ridge: DEFAULT_LD_RIDGE,
         };
@@ -7184,7 +7186,7 @@ mod tests {
         let config = LdResolvedConfig {
             window: LdResolvedWindow::Sites {
                 size: WINDOW,
-                ranges: None,
+                ranges: compute_ld_site_ranges(&single_chromosome_keys(N_VARIANTS), WINDOW),
             },
             ridge: DEFAULT_LD_RIDGE,
         };
@@ -7216,15 +7218,13 @@ mod tests {
         const WINDOW: usize = 9;
         let keys: Vec<VariantKey> = (0..PER_CHROMOSOME)
             .map(|idx| VariantKey::new("1", 1_000 + idx as u64 * 100))
-            .chain(
-                (0..PER_CHROMOSOME).map(|idx| VariantKey::new("2", 1_000 + idx as u64 * 100)),
-            )
+            .chain((0..PER_CHROMOSOME).map(|idx| VariantKey::new("2", 1_000 + idx as u64 * 100)))
             .collect();
 
         let config = LdResolvedConfig {
             window: LdResolvedWindow::Sites {
                 size: WINDOW,
-                ranges: Some(compute_ld_site_ranges(&keys, WINDOW)),
+                ranges: compute_ld_site_ranges(&keys, WINDOW),
             },
             ridge: DEFAULT_LD_RIDGE,
         };
@@ -7248,7 +7248,10 @@ mod tests {
 
         // The boundary itself: the last marker of chr1 keeps its left flank and
         // loses its right, and the first of chr2 the other way round.
-        assert_eq!(windows[PER_CHROMOSOME - 1].last(), Some(&(PER_CHROMOSOME - 1)));
+        assert_eq!(
+            windows[PER_CHROMOSOME - 1].last(),
+            Some(&(PER_CHROMOSOME - 1))
+        );
         assert_eq!(windows[PER_CHROMOSOME][0], PER_CHROMOSOME);
     }
 
@@ -7274,6 +7277,18 @@ mod tests {
     }
 
     #[test]
+    fn bp_window_rejects_decreasing_positions_within_a_chromosome() {
+        let keys = vec![
+            VariantKey::new("1", 100),
+            VariantKey::new("1", 90),
+            VariantKey::new("2", 10),
+        ];
+        let err = compute_ld_bp_ranges(&keys, 100)
+            .expect_err("a distance window over decreasing positions is undefined");
+        assert!(err.to_string().contains("nondecreasing positions"));
+    }
+
+    #[test]
     fn ld_ranges_must_describe_the_streamed_variant_list() {
         // Stands in for `--maf` on a PLINK fileset: the windows are cut from a
         // key list the filter has not been applied to, the stream delivers the
@@ -7294,7 +7309,7 @@ mod tests {
             let config = LdResolvedConfig {
                 window: LdResolvedWindow::Sites {
                     size: WINDOW,
-                    ranges: Some(compute_ld_site_ranges(&keys, WINDOW)),
+                    ranges: compute_ld_site_ranges(&keys, WINDOW),
                 },
                 ridge: DEFAULT_LD_RIDGE,
             };
@@ -7611,12 +7626,8 @@ mod tests {
             packed_cache.hard_call_packed().is_some(),
             "the 2-bit cache must be warm, or this test compares the general path with itself"
         );
-        let packed = covariance_operator(
-            &mut packed_cache,
-            BLOCK_CAPACITY,
-            observed_variants,
-            scaler,
-        );
+        let packed =
+            covariance_operator(&mut packed_cache, BLOCK_CAPACITY, observed_variants, scaler);
 
         for &ncols in &[1usize, 8, 31, 32, 33, 40] {
             let rhs = Mat::<f64>::from_fn(N_SAMPLES, ncols, |row, col| {
@@ -7694,7 +7705,11 @@ mod tests {
         // Fewer weights than variants: the shortfall is treated as weight one
         // rather than reading out of bounds.
         let short = compute_component_weighted_norms_sq(loadings.as_ref(), Some(&weights[..2]));
-        assert!((short[0] - (1.0 + 400.0 + 9.0)).abs() < 1e-9, "got {}", short[0]);
+        assert!(
+            (short[0] - (1.0 + 400.0 + 9.0)).abs() < 1e-9,
+            "got {}",
+            short[0]
+        );
     }
 
     #[test]
@@ -7772,6 +7787,11 @@ mod tests {
         let mut source = SampleSubsetSource::new(inner, vec![1, 3]).expect("subset source");
 
         assert_eq!(source.n_samples(), 2);
+        assert_eq!(
+            source.block_storage_samples(),
+            4,
+            "block planning must budget for physical decode rows before the gather"
+        );
         assert_eq!(source.n_variants(), 3);
 
         // Block width 2 so the gather runs across more than one block.
@@ -7794,6 +7814,31 @@ mod tests {
 
         assert_eq!(source.n_samples(), 5);
         assert_eq!(drain_source(&mut source, 4), data);
+    }
+
+    #[test]
+    fn maf_filter_retains_its_post_filter_variant_hint_across_resets() {
+        let data = vec![
+            0.0, 0.0, 0.0, 0.0, // MAF 0.0: drop
+            0.0, 1.0, 1.0, 2.0, // MAF 0.5: retain
+            2.0, 2.0, 2.0, 2.0, // MAF 0.0: drop
+            0.0, 0.0, 0.0, 1.0, // MAF 0.125: drop
+        ];
+        let inner = DenseBlockSource::new(&data, 4, 4).expect("dense source");
+        let mut source = StreamingMafFilterSource::new(inner, 0.2).expect("MAF filter");
+
+        let retained = drain_source(&mut source, 2);
+        assert_eq!(retained, vec![0.0, 1.0, 1.0, 2.0]);
+        assert_eq!(source.n_variants(), 1);
+
+        source.reset().expect("reset");
+        assert_eq!(
+            source.n_variants(),
+            1,
+            "the solver must size LD to post-MAF markers"
+        );
+        assert_eq!(drain_source(&mut source, 2), retained);
+        assert_eq!(source.retained_indices(), &[1]);
     }
 
     #[test]
@@ -7873,7 +7918,8 @@ mod tests {
             for sign in [1.0f64, -1.0] {
                 let delta = (0..subset_scores.nrows())
                     .map(|row| {
-                        (subset_scores[(row, component)] - sign * reference_scores[(row, component)])
+                        (subset_scores[(row, component)]
+                            - sign * reference_scores[(row, component)])
                             .abs()
                     })
                     .fold(0.0f64, f64::max);
