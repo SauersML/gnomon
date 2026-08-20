@@ -6420,21 +6420,13 @@ impl Serialize for HwePcaModel {
     where
         S: Serializer,
     {
-        let mut state = serializer.serialize_struct("HwePcaModel", 14)?;
+        let mut state = serializer.serialize_struct("HwePcaModel", 12)?;
         state.serialize_field("n_samples", &self.n_samples)?;
         state.serialize_field("n_variants", &self.n_variants)?;
         state.serialize_field("scaler", &self.scaler)?;
         state.serialize_field("eigenvalues", &self.eigenvalues)?;
         state.serialize_field("total_variance", &self.total_variance)?;
         state.serialize_field("singular_values", &self.singular_values)?;
-        state.serialize_field(
-            "sample_basis",
-            &MatrixData::from_mat(self.sample_basis.as_ref()),
-        )?;
-        state.serialize_field(
-            "sample_scores",
-            &MatrixData::from_mat(self.sample_scores.as_ref()),
-        )?;
         state.serialize_field("loadings", &MatrixData::from_mat(self.loadings.as_ref()))?;
         state.serialize_field(
             "component_weighted_norms_sq",
@@ -6454,6 +6446,7 @@ impl<'de> Deserialize<'de> for HwePcaModel {
         D: Deserializer<'de>,
     {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct ModelData {
             n_samples: usize,
             n_variants: usize,
@@ -6462,8 +6455,6 @@ impl<'de> Deserialize<'de> for HwePcaModel {
             #[serde(default)]
             total_variance: f64,
             singular_values: Vec<f64>,
-            sample_basis: MatrixData,
-            sample_scores: MatrixData,
             loadings: MatrixData,
             #[serde(default)]
             component_weighted_norms_sq: Vec<f64>,
@@ -6481,8 +6472,6 @@ impl<'de> Deserialize<'de> for HwePcaModel {
 
         let raw = ModelData::deserialize(deserializer)?;
         let singular_values_len = raw.singular_values.len();
-        let sample_basis = raw.sample_basis.into_mat().map_err(DeError::custom)?;
-        let sample_scores = raw.sample_scores.into_mat().map_err(DeError::custom)?;
         let loadings = raw.loadings.into_mat().map_err(DeError::custom)?;
         let ld = raw.ld;
         let component_weighted_norms_sq =
@@ -6507,8 +6496,11 @@ impl<'de> Deserialize<'de> for HwePcaModel {
             eigenvalues: raw.eigenvalues,
             total_variance: raw.total_variance,
             singular_values: raw.singular_values,
-            sample_basis,
-            sample_scores,
+            // Training coordinates live only in `hwe_scores.bin`; duplicating
+            // n_samples × components matrices in decimal JSON dominates fit
+            // output at biobank scale and loses the row IDs the binary carries.
+            sample_basis: Mat::zeros(0, singular_values_len),
+            sample_scores: Mat::zeros(0, singular_values_len),
             loadings,
             component_weighted_norms_sq,
             variant_keys: raw.variant_keys,
@@ -8119,6 +8111,40 @@ mod tests {
         let mut source = DenseBlockSource::new(&data, INVARIANT_SAMPLES, INVARIANT_VARIANTS)
             .expect("dense source");
         HwePcaModel::fit_k(&mut source, INVARIANT_SAMPLES - 1).expect("fit succeeds")
+    }
+
+    #[test]
+    fn portable_model_json_does_not_duplicate_training_coordinates() {
+        let model = invariant_fit();
+        let value = serde_json::to_value(&model).expect("serialize fitted model");
+        assert!(value.get("sample_basis").is_none());
+        assert!(value.get("sample_scores").is_none());
+
+        let loaded: HwePcaModel =
+            serde_json::from_value(value.clone()).expect("load portable model");
+        assert_eq!(loaded.sample_basis().nrows(), 0);
+        assert_eq!(loaded.sample_scores().nrows(), 0);
+        assert_eq!(loaded.sample_basis().ncols(), model.components());
+        assert_eq!(loaded.sample_scores().ncols(), model.components());
+        assert_eq!(loaded.explained_variance(), model.explained_variance());
+        assert_eq!(
+            loaded.variant_loadings().nrows(),
+            model.variant_loadings().nrows()
+        );
+        assert_eq!(
+            loaded.variant_loadings().ncols(),
+            model.variant_loadings().ncols()
+        );
+
+        let mut stale = value;
+        stale.as_object_mut().expect("model object").insert(
+            "sample_scores".into(),
+            serde_json::json!({"nrows": 1, "ncols": 1, "data": [0.0]}),
+        );
+        assert!(
+            serde_json::from_value::<HwePcaModel>(stale).is_err(),
+            "the obsolete cohort-matrix schema must fail rather than silently load"
+        );
     }
 
     /// Rebuilds the standardized matrix the fit decomposed, from the same

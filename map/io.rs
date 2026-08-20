@@ -681,11 +681,12 @@ pub fn save_hwe_model(
     Ok(model_path)
 }
 
-/// Loads the **complete** fitted model from the JSON artifact.
+/// Loads the portable fitted model from the JSON artifact.
 ///
-/// This always reads the JSON file, so every field — eigenvalues, singular
-/// values, sample basis/scores, and total variance — is fully populated. Use
-/// this whenever those fit statistics matter (inspection, summaries, re-fitting).
+/// The JSON carries spectral statistics and the projection basis, but not the
+/// cohort-sized training basis/scores. Those are emitted once, with row IDs, in
+/// `hwe_scores.bin`; embedding them again as decimal JSON made model output
+/// scale with the number of fitted samples for no projection benefit.
 ///
 /// Note: this deliberately ignores the `.project.bin` projection cache, which
 /// stores only the artifacts needed for projection and would otherwise hand back
@@ -702,9 +703,10 @@ pub fn load_model_from_path(model_path: &Path) -> Result<HwePcaModel, DatasetOut
 /// cache when present and falling back to the JSON model otherwise.
 ///
 /// The returned model is guaranteed to carry the scaler, loadings, and packed
-/// projection artifacts, but — when served from the cache — its fit statistics
-/// (eigenvalues, singular values, sample basis/scores, total variance) are
-/// placeholders. Callers that need those must use [`load_model_from_path`].
+/// projection artifacts, but — when served from the cache — its spectral fit
+/// statistics (eigenvalues, singular values, total variance) are placeholders.
+/// Callers that need those must use [`load_model_from_path`]. Training sample
+/// coordinates are always read from `hwe_scores.bin`, not either model format.
 pub fn load_projection_model_from_path(
     model_path: &Path,
 ) -> Result<HwePcaModel, DatasetOutputError> {

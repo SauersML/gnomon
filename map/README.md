@@ -114,7 +114,9 @@ finer-grained monitoring is needed.
 * **`hwe.json`** – Serialized `HwePcaModel` capturing the scaler, eigenvalues,
   sample/variant counts, component loadings, optional LD weights, and the
   `(chromosome, position)` keys that identify the variant subset when filtering
-  was enabled.
+  was enabled. It deliberately excludes cohort-sized sample coordinates; those
+  are stored once, with row IDs, in `hwe_scores.bin` rather than duplicated as
+  much larger decimal JSON matrices.
 * **`samples.tsv`** – Tab-delimited manifest built from `.fam` content or the
   VCF/BCF sample list (`FID`, `IID`, `PAT`, `MAT`, `SEX`, `PHENOTYPE`), listing
   the samples the fit actually used — the whole cohort unless `--keep` narrowed
