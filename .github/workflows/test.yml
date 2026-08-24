@@ -46,6 +46,14 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  # ubuntu-latest is 4 vCPU / 16 GB and this crate graph is heavy -- burn, polars,
+  # arrow, faer, noodles. Cargo defaults to one rustc per core, and several of those
+  # crates peak well past 4 GB each in release, so four at once takes the runner over
+  # its limit: the build step has been dying with exit 137 (SIGKILL, the runner OOM
+  # killer, not a compile error) since 2026-08-20 -- 5688c16, 263b376 and 99093e7 all
+  # failed the same way, so the suite has not actually run in that whole window.
+  # Two at a time is slower and finishes.
+  CARGO_BUILD_JOBS: 2
 
 jobs:
   detect_changes:
