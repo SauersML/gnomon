@@ -8000,6 +8000,7 @@ theorem sharedLD_from_equilibrium_eq_sharedLDFromMigration (m c : ℝ) (hc : 0 <
   · rw [h]
     simp
   · rw [div_div_div_cancel_right₀]
+    exact hc'
 
 /-- Shared LD fraction is nonneg for nonneg M. -/
 theorem sharedLDFromMigration_nonneg (M : ℝ) (hM : 0 ≤ M) :
