@@ -596,7 +596,7 @@ const PROJECTION_ROW_IDS_MAGIC: &[u8; 8] = b"GNPSID01";
 const PROJECTION_ROW_IDS_VERSION: u32 = 1;
 const PROJECTION_ROW_IDS_HEADER_LEN: usize = 32;
 const PROJECTION_CACHE_MAGIC: &[u8; 8] = b"GNPCCH01";
-const PROJECTION_CACHE_VERSION: u32 = 2;
+const PROJECTION_CACHE_VERSION: u32 = 3;
 const PROJECTION_CACHE_NO_BP_WINDOW: u64 = u64::MAX;
 
 pub struct ProjectionMatrixSink {
@@ -720,7 +720,7 @@ pub fn load_projection_model_from_path(
 ) -> Result<HwePcaModel, DatasetOutputError> {
     let cache_path = projection_cache_path(model_path);
     if cache_path.exists() {
-        match read_projection_cache(&cache_path) {
+        match read_projection_cache(&cache_path, model_path) {
             Ok(model) => return Ok(model),
             Err(_) => {
                 let _ = fs::remove_file(&cache_path);
@@ -765,6 +765,28 @@ fn projection_cache_path(model_path: &Path) -> PathBuf {
     cache_path
 }
 
+/// Identity of the model file a projection cache was derived from: byte length and
+/// modification time.
+///
+/// `.project.bin` is a derived cache of a `.json` model, but nothing tied the two
+/// together: the reader checked magic, version and internal structure, all of which a
+/// cache built from a DIFFERENT model still satisfies. Any path that replaces the JSON
+/// in place -- `ensure_model` refreshing a built-in whose pinned release moved, or a
+/// retrain overwriting `hwe.json` -- left a stale cache that was then preferred over the
+/// model that had just been written, silently projecting with the superseded fit.
+///
+/// Length and mtime rather than a digest because this is read on every load and the
+/// model is hundreds of megabytes; hashing it would cost more than the cache saves.
+fn projection_source_identity(model_path: &Path) -> Option<(u64, u64)> {
+    let metadata = fs::metadata(model_path).ok()?;
+    let modified = metadata
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    Some((metadata.len(), modified.as_nanos() as u64))
+}
+
 fn write_projection_cache(
     model_path: &Path,
     model: &HwePcaModel,
@@ -780,6 +802,10 @@ fn write_projection_cache(
 
     writer.write_all(PROJECTION_CACHE_MAGIC)?;
     writer.write_all(&PROJECTION_CACHE_VERSION.to_le_bytes())?;
+    // Stamp which model file this was built from, so a later load can tell.
+    let (source_len, source_mtime) = projection_source_identity(model_path).unwrap_or((0, 0));
+    write_u64(&mut writer, source_len)?;
+    write_u64(&mut writer, source_mtime)?;
     write_u64(&mut writer, model.n_samples() as u64)?;
     write_u64(&mut writer, model.n_variants() as u64)?;
     write_u64(&mut writer, model.components() as u64)?;
@@ -829,7 +855,10 @@ fn write_projection_cache(
     Ok(())
 }
 
-fn read_projection_cache(cache_path: &Path) -> Result<HwePcaModel, DatasetOutputError> {
+fn read_projection_cache(
+    cache_path: &Path,
+    model_path: &Path,
+) -> Result<HwePcaModel, DatasetOutputError> {
     let file = File::open(cache_path)?;
     let mut reader = BufReader::with_capacity(16 * 1024 * 1024, file);
     let mut magic = [0u8; 8];
@@ -845,6 +874,19 @@ fn read_projection_cache(cache_path: &Path) -> Result<HwePcaModel, DatasetOutput
         return Err(DatasetOutputError::InvalidState(format!(
             "unsupported projection cache version {version}"
         )));
+    }
+
+    // Refuse a cache built from a different model file than the one present now.
+    let cached_len = read_u64(&mut reader)?;
+    let cached_mtime = read_u64(&mut reader)?;
+    match projection_source_identity(model_path) {
+        Some((source_len, source_mtime))
+            if source_len == cached_len && source_mtime == cached_mtime => {}
+        _ => {
+            return Err(DatasetOutputError::InvalidState(
+                "projection cache was built from a different model file".into(),
+            ));
+        }
     }
 
     let n_samples = read_u64_as_usize(&mut reader, "projection cache n_samples")?;
@@ -6731,6 +6773,66 @@ mod tests {
             serde_json::Value::String(
                 "cohort.shapeit5.projection_scores.metadata.json".to_string()
             )
+        );
+    }
+
+    #[test]
+    fn projection_cache_is_refused_when_the_model_file_was_replaced() {
+        use crate::map::fit::{DenseBlockSource, HwePcaModel};
+        use std::io::BufWriter;
+
+        // `.project.bin` is derived from the `.json` beside it, and every path that
+        // rewrites that JSON in place -- a built-in model refreshed because its pinned
+        // release moved, a retrain overwriting `hwe.json` -- used to leave the old cache
+        // sitting there. Magic, version and structure all still checked out, so the
+        // superseded fit was preferred over the model that had just been written.
+        let dir = tempdir().unwrap();
+        let model_path = dir.path().join("hwe.json");
+
+        let write_model = |model: &HwePcaModel| {
+            let mut writer =
+                BufWriter::new(File::create(&model_path).expect("create model path"));
+            serde_json::to_writer(&mut writer, model).expect("write json");
+            writer.flush().expect("flush json");
+        };
+
+        let first_data = vec![
+            0.0, 1.0, 2.0, //
+            1.0, 2.0, 0.0, //
+            2.0, 1.0, 0.0, //
+            1.0, 0.0, 2.0,
+        ];
+        let mut first_source =
+            DenseBlockSource::new(&first_data, 3, 4).expect("dense source");
+        let first = HwePcaModel::fit_k(&mut first_source, 2).expect("fit first model");
+        write_model(&first);
+
+        load_projection_model_from_path(&model_path).expect("warm cache");
+        let cache_path = projection_cache_path(&model_path);
+        assert!(cache_path.exists(), "first load must warm the cache");
+
+        // A genuinely different model lands at the same path.
+        let second_data = vec![
+            2.0, 0.0, 1.0, 1.0, //
+            0.0, 2.0, 1.0, 2.0, //
+            1.0, 1.0, 2.0, 0.0, //
+            2.0, 1.0, 0.0, 1.0, //
+            0.0, 2.0, 2.0, 1.0,
+        ];
+        let mut second_source =
+            DenseBlockSource::new(&second_data, 4, 5).expect("dense source");
+        let second = HwePcaModel::fit_k(&mut second_source, 2).expect("fit second model");
+        write_model(&second);
+
+        let loaded = load_projection_model_from_path(&model_path).expect("reload model");
+        assert_eq!(
+            loaded.n_variants(),
+            second.n_variants(),
+            "a cache built from the previous model must not be served for this one"
+        );
+        assert_eq!(
+            loaded.projection_packed_score_vectors(),
+            second.projection_packed_score_vectors()
         );
     }
 
