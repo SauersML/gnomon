@@ -47,13 +47,22 @@ env:
   RUST_BACKTRACE: 1
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
   # ubuntu-latest is 4 vCPU / 16 GB and this crate graph is heavy -- burn, polars,
-  # arrow, faer, noodles. Cargo defaults to one rustc per core, and several of those
-  # crates peak well past 4 GB each in release, so four at once takes the runner over
-  # its limit: the build step has been dying with exit 137 (SIGKILL, the runner OOM
-  # killer, not a compile error) since 2026-08-20 -- 5688c16, 263b376 and 99093e7 all
-  # failed the same way, so the suite has not actually run in that whole window.
-  # Two at a time is slower and finishes.
-  CARGO_BUILD_JOBS: 2
+  # arrow, faer, noodles. The release profile compounds it: lto = "fat" with
+  # codegen-units = 1 hands the linker every crate at once as a single unit, which is
+  # where both the memory and the hours go.
+  #
+  # Capping rustc parallelism alone was not enough and traded one death for another:
+  # exit 137 (the runner's OOM killer) became exit 143 (SIGTERM) at 2h13m. The suite has
+  # not actually run since 2026-08-20 either way.
+  #
+  # Thin LTO with 16 codegen units is the lever that matters -- it is what makes the
+  # link fit in the runner at all. These are CI-only environment overrides: Cargo.toml
+  # keeps fat LTO, so released binaries are unaffected. Benchmark numbers taken from
+  # THIS workflow are thin-LTO numbers and not comparable to a release build; a CI that
+  # never finishes produces no numbers to compare anyway.
+  CARGO_BUILD_JOBS: 3
+  CARGO_PROFILE_RELEASE_LTO: thin
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 16
 
 jobs:
   detect_changes:
