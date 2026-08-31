@@ -114,6 +114,16 @@ pub fn detect_input_format(path: &Path) -> Option<InputFormat> {
         return Some(InputFormat::Plink);
     }
 
+    // Remote PLINK directories cannot be inspected with `Path::exists`. The score
+    // resolver validates every discovered bed/bim/fam or pgen/pvar/psam triad after
+    // format dispatch, so a GCS directory is unambiguously the multi-fileset PLINK
+    // form accepted by `gnomon score`.
+    if path_str.starts_with("gs://")
+        && (path_str.ends_with('/') || path_str.ends_with("/*"))
+    {
+        return Some(InputFormat::Plink);
+    }
+
     // Check for DTC text format (must check before PLINK prefix detection)
     if path_str.ends_with(".txt") || path_str.ends_with(".csv") {
         return Some(InputFormat::Dtc);
@@ -683,6 +693,18 @@ mod tests {
     fn test_detect_plink_bed() {
         assert_eq!(
             detect_input_format(Path::new("/path/to/data.bed")),
+            Some(InputFormat::Plink)
+        );
+    }
+
+    #[test]
+    fn test_detect_remote_plink_directory() {
+        assert_eq!(
+            detect_input_format(Path::new("gs://bucket/callset/pgen/")),
+            Some(InputFormat::Plink)
+        );
+        assert_eq!(
+            detect_input_format(Path::new("gs://bucket/callset/pgen/*")),
             Some(InputFormat::Plink)
         );
     }
