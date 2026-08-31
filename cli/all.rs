@@ -128,6 +128,7 @@ pub fn run(opts: AllOptions) -> Result<(), Box<dyn std::error::Error>> {
         // We don't carry a caller-provided sex in `gnomon all`; phase 4
         // recomputes the real per-sample sex from the cached PLINK.
         None,
+        false,
     )
     .map_err(|err| err as Box<dyn std::error::Error>)?;
     println!(
