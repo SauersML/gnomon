@@ -38,6 +38,8 @@ const REMOTE_BLOCK_SIZE: usize = 8 * 1024 * 1024;
 /// 256 KB is small enough to keep that waste bounded while still amortising
 /// per-request latency over a run of neighbouring records.
 const REMOTE_SPARSE_BLOCK_SIZE: usize = 256 * 1024;
+const REMOTE_READ_ATTEMPTS: usize = 4;
+const REMOTE_READ_INITIAL_BACKOFF_MS: u64 = 250;
 
 /// Keeps the cache's memory footprint roughly constant as block size shrinks,
 /// so smaller blocks buy more of them rather than less cache.
@@ -1732,35 +1734,53 @@ impl RemoteByteRangeSource {
         let runtime = Arc::clone(&self.runtime);
         let user_project = self.user_project.clone();
         let mut data = runtime.block_on(async move {
-            let mut response = storage
-                .read_object(bucket_path.clone(), object.clone())
-                .set_read_range(ReadRange::segment(start, length as u64))
-                .send()
-                .await
-                .map_err(|e| {
-                    let msg = e.to_string();
-                    if user_project.is_none() && msg.to_lowercase().contains("requester pays") {
-                        PipelineError::Io(format!(
-                            "Requester Pays bucket requires a billing project. Set GOOGLE_PROJECT (or run `gcloud config set project ...`) and re-run. Original error: {msg}"
-                        ))
-                    } else {
-                        PipelineError::Io(format!(
-                            "Failed to start range read at offset {start} for gs://{}/{object}: {msg}",
-                            bucket_path
-                        ))
+            let mut last_error = String::new();
+            for attempt in 1..=REMOTE_READ_ATTEMPTS {
+                let result = async {
+                    let mut response = storage
+                        .read_object(bucket_path.clone(), object.clone())
+                        .set_read_range(ReadRange::segment(start, length as u64))
+                        .send()
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    let mut buffer = Vec::with_capacity(length);
+                    while let Some(chunk) = response.next().await {
+                        buffer.extend_from_slice(&chunk.map_err(|error| error.to_string())?);
                     }
-                })?;
-            let mut buffer = Vec::with_capacity(length);
-            while let Some(chunk) = response.next().await {
-                let chunk = chunk.map_err(|e| {
-                    PipelineError::Io(format!(
-                        "Error streaming data from gs://{}/{object}: {e}",
-                        bucket_path
-                    ))
-                })?;
-                buffer.extend_from_slice(&chunk);
+                    if buffer.len() < length {
+                        return Err(format!(
+                            "truncated response: expected {length} bytes, received {}",
+                            buffer.len()
+                        ));
+                    }
+                    Ok::<Vec<u8>, String>(buffer)
+                }
+                .await;
+
+                match result {
+                    Ok(buffer) => return Ok(buffer),
+                    Err(error)
+                        if user_project.is_none()
+                            && error.to_lowercase().contains("requester pays") =>
+                    {
+                        return Err(PipelineError::Io(format!(
+                            "Requester Pays bucket requires a billing project. Set GOOGLE_PROJECT (or run `gcloud config set project ...`) and re-run. Original error: {error}"
+                        )));
+                    }
+                    Err(error) => last_error = error,
+                }
+
+                if attempt < REMOTE_READ_ATTEMPTS {
+                    let delay_ms = REMOTE_READ_INITIAL_BACKOFF_MS << (attempt - 1);
+                    warn!(
+                        "Remote range read attempt {attempt}/{REMOTE_READ_ATTEMPTS} failed at offset {start} for gs://{bucket_path}/{object}: {last_error}; retrying in {delay_ms} ms"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                }
             }
-            Ok::<Vec<u8>, PipelineError>(buffer)
+            Err(PipelineError::Io(format!(
+                "Remote range read failed after {REMOTE_READ_ATTEMPTS} attempts at offset {start} for gs://{bucket_path}/{object}: {last_error}"
+            )))
         })?;
 
         if data.len() != length {
