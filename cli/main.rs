@@ -98,6 +98,10 @@ struct ScoreArgs {
     /// been inferred upstream (e.g. on a smaller pre-imputed VCF).
     #[arg(long, value_enum, value_name = "SEX")]
     inferred_sex: Option<score_main::InferredSexArg>,
+
+    /// Emit raw sums and exact counts for aggregation across scored regions.
+    #[arg(long)]
+    emit_components: bool,
 }
 
 #[cfg(feature = "map")]
@@ -683,6 +687,7 @@ fn run_score(args: ScoreArgs) -> Result<(), Box<dyn std::error::Error>> {
         args.build,
         args.panel,
         args.inferred_sex,
+        args.emit_components,
     )
     .map_err(|err| err as Box<dyn std::error::Error>)
 }

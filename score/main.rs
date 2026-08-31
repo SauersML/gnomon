@@ -93,6 +93,10 @@ struct Args {
     /// inferred upstream (e.g. on a smaller pre-imputed VCF).
     #[clap(long, value_enum, value_name = "SEX")]
     inferred_sex: Option<InferredSexArg>,
+
+    /// Emit sufficient statistics for aggregation across scored regions.
+    #[clap(long)]
+    emit_components: bool,
 }
 
 // ========================================================================================
@@ -113,6 +117,7 @@ pub fn run_gnomon_with_args(
     build: Option<String>,
     panel: Option<PathBuf>,
     inferred_sex: Option<InferredSexArg>,
+    emit_components: bool,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let args = Args {
         score,
@@ -122,6 +127,7 @@ pub fn run_gnomon_with_args(
         build,
         panel,
         inferred_sex,
+        emit_components,
     };
     run_gnomon_impl(args)
 }
@@ -232,6 +238,7 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
             &native_result,
             score_regions_ref,
             Some(&out_suffix),
+            args.emit_components,
         )?;
 
         eprintln!(
@@ -344,6 +351,7 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
         &final_counts,
         score_regions_ref,
         Some(&out_suffix),
+        args.emit_components,
     )?;
     checkpoint::remove_checkpoint(&checkpoint_path)?;
 
@@ -934,6 +942,7 @@ fn finalize_and_write_native_output(
     result: &NativeVcfScoreResult,
     score_regions: Option<&HashMap<String, GenomicRegion>>,
     name_suffix: Option<&str>,
+    emit_components: bool,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let out_path = score_output_path(output_prefix, name_suffix);
     if let Some(output_dir) = out_path.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -955,6 +964,7 @@ fn finalize_and_write_native_output(
         &result.sum_scores,
         &result.missing_counts,
         score_regions,
+        emit_components,
     )?;
 
     eprintln!("> Final output written in {:.2?}", output_start.elapsed());
@@ -971,6 +981,7 @@ fn finalize_and_write_output(
     final_counts: &[u32],
     score_regions: Option<&HashMap<String, GenomicRegion>>,
     name_suffix: Option<&str>,
+    emit_components: bool,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let (output_dir, mut out_stem) = if output_prefix.to_string_lossy().starts_with("gs://") {
         let stem = output_prefix
@@ -1015,6 +1026,7 @@ fn finalize_and_write_output(
         final_scores,
         final_counts,
         score_regions,
+        emit_components,
     )?;
 
     eprintln!("> Final output written in {:.2?}", output_start.elapsed());
@@ -1394,6 +1406,7 @@ fn write_scores_to_file(
     sum_scores: &[f64],
     missing_counts: &[u32],
     score_regions: Option<&HashMap<String, GenomicRegion>>,
+    emit_components: bool,
 ) -> io::Result<()> {
     let output_dir = path
         .parent()
@@ -1451,6 +1464,13 @@ fn write_scores_to_file(
     let num_scores = score_names.len();
 
     let write_result = (|| -> io::Result<()> {
+        if emit_components {
+            writeln!(writer, "#SCORE_VARIANT_COUNT\tSCORE\tCOUNT")?;
+            for (name, count) in score_names.iter().zip(score_variant_counts) {
+                writeln!(writer, "#SCORE_VARIANT_COUNT\t{name}\t{count}")?;
+            }
+        }
+
         if let Some(regions) = score_regions {
             let mut wrote_metadata_header = false;
             for name in score_names {
@@ -1468,6 +1488,9 @@ fn write_scores_to_file(
         write!(writer, "#IID")?;
         for name in score_names {
             write!(writer, "\t{name}_AVG\t{name}_MISSING_PCT")?;
+            if emit_components {
+                write!(writer, "\t{name}_SUM\t{name}_MISSING_CT")?;
+            }
         }
         writeln!(writer)?;
 
@@ -1527,6 +1550,14 @@ fn write_scores_to_file(
                     ryu_buffer_missing.format(missing_pct)
                 )
                 .unwrap();
+                if emit_components {
+                    write!(
+                        &mut line_buffer,
+                        "\t{}\t{missing_count}",
+                        ryu_buffer_score.format(final_sum_score)
+                    )
+                    .unwrap();
+                }
             }
             writeln!(writer, "{line_buffer}")?;
         }
@@ -1545,4 +1576,41 @@ fn write_scores_to_file(
     fs::rename(&temp_path, path).inspect_err(|_| {
         let _ = fs::remove_file(&temp_path);
     })
+}
+
+#[cfg(test)]
+mod output_tests {
+    use super::write_scores_to_file;
+    use std::fs;
+
+    #[test]
+    fn component_output_contains_raw_sum_and_exact_counts() {
+        let path = std::env::temp_dir().join(format!(
+            "gnomon-components-{}-{}.sscore",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+
+        write_scores_to_file(
+            &path,
+            &["person-1".to_string()],
+            &["PGS000001".to_string()],
+            &[4],
+            &[6.0],
+            &[1],
+            None,
+            true,
+        )
+        .expect("component output should be written");
+
+        let output = fs::read_to_string(&path).expect("component output should be readable");
+        fs::remove_file(&path).expect("component output should be removable");
+        assert_eq!(
+            output,
+            "#SCORE_VARIANT_COUNT\tSCORE\tCOUNT\n\
+#SCORE_VARIANT_COUNT\tPGS000001\t4\n\
+#IID\tPGS000001_AVG\tPGS000001_MISSING_PCT\tPGS000001_SUM\tPGS000001_MISSING_CT\n\
+person-1\t2.0\t25.0\t6.0\t1\n"
+        );
+    }
 }
