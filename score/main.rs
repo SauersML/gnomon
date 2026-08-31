@@ -1487,9 +1487,10 @@ fn write_scores_to_file(
         // Write the new, more descriptive, and correctly tab-separated header.
         write!(writer, "#IID")?;
         for name in score_names {
-            write!(writer, "\t{name}_AVG\t{name}_MISSING_PCT")?;
             if emit_components {
                 write!(writer, "\t{name}_SUM\t{name}_MISSING_CT")?;
+            } else {
+                write!(writer, "\t{name}_AVG\t{name}_MISSING_PCT")?;
             }
         }
         writeln!(writer)?;
@@ -1542,19 +1543,20 @@ fn write_scores_to_file(
                     0.0
                 };
 
-                // Write the correctly tab-separated data columns.
-                write!(
-                    &mut line_buffer,
-                    "\t{}\t{}",
-                    ryu_buffer_score.format(avg_score),
-                    ryu_buffer_missing.format(missing_pct)
-                )
-                .unwrap();
                 if emit_components {
                     write!(
                         &mut line_buffer,
                         "\t{}\t{missing_count}",
                         ryu_buffer_score.format(final_sum_score)
+                    )
+                    .unwrap();
+                } else {
+                    // Write the correctly tab-separated data columns.
+                    write!(
+                        &mut line_buffer,
+                        "\t{}\t{}",
+                        ryu_buffer_score.format(avg_score),
+                        ryu_buffer_missing.format(missing_pct)
                     )
                     .unwrap();
                 }
@@ -1609,8 +1611,8 @@ mod output_tests {
             output,
             "#SCORE_VARIANT_COUNT\tSCORE\tCOUNT\n\
 #SCORE_VARIANT_COUNT\tPGS000001\t4\n\
-#IID\tPGS000001_AVG\tPGS000001_MISSING_PCT\tPGS000001_SUM\tPGS000001_MISSING_CT\n\
-person-1\t2.0\t25.0\t6.0\t1\n"
+#IID\tPGS000001_SUM\tPGS000001_MISSING_CT\n\
+person-1\t6.0\t1\n"
         );
     }
 }
