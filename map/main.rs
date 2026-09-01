@@ -18,6 +18,7 @@ use super::progress::{
 };
 use super::project::{GappedProjectionSource, ProjectionOptions};
 use super::variant_filter::{VariantFilter, VariantKey, VariantListError};
+use crate::adapt_plink2::GenomeBuild;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -33,6 +34,7 @@ use sysinfo::System;
 pub enum MapCommand {
     Fit {
         genotype_path: PathBuf,
+        genome_build: Option<GenomeBuild>,
         /// Optional artifact prefix, independent of the read-only/shared input.
         output_prefix: Option<PathBuf>,
         variant_list: Option<PathBuf>,
@@ -63,6 +65,7 @@ pub enum MapCommand {
     },
     Project {
         genotype_path: PathBuf,
+        genome_build: Option<GenomeBuild>,
         model: Option<String>,
         output_manifest: Option<PathBuf>,
     },
@@ -150,6 +153,7 @@ pub fn run(command: MapCommand) -> Result<(), MapDriverError> {
     match command {
         MapCommand::Fit {
             genotype_path,
+            genome_build,
             output_prefix,
             variant_list,
             keep,
@@ -166,6 +170,7 @@ pub fn run(command: MapCommand) -> Result<(), MapDriverError> {
             let fit = || {
                 run_fit(FitRequest {
                     genotype_path: &genotype_path,
+                    genome_build,
                     output_prefix: output_prefix.as_deref(),
                     variant_list: variant_list.as_deref(),
                     keep: keep.as_deref(),
@@ -197,14 +202,21 @@ pub fn run(command: MapCommand) -> Result<(), MapDriverError> {
         }
         MapCommand::Project {
             genotype_path,
+            genome_build,
             model,
             output_manifest,
-        } => run_project(&genotype_path, model.as_deref(), output_manifest.as_deref()),
+        } => run_project(
+            &genotype_path,
+            genome_build,
+            model.as_deref(),
+            output_manifest.as_deref(),
+        ),
     }
 }
 
 struct FitRequest<'a> {
     genotype_path: &'a Path,
+    genome_build: Option<GenomeBuild>,
     output_prefix: Option<&'a Path>,
     variant_list: Option<&'a Path>,
     keep: Option<&'a Path>,
@@ -221,6 +233,7 @@ struct FitRequest<'a> {
 fn run_fit(request: FitRequest<'_>) -> Result<(), MapDriverError> {
     let FitRequest {
         genotype_path,
+        genome_build,
         output_prefix,
         variant_list,
         keep,
@@ -251,7 +264,7 @@ fn run_fit(request: FitRequest<'_>) -> Result<(), MapDriverError> {
     println!("=== HWE PCA model fitting ===");
     println!("Input genotype location: {}", genotype_path.display());
 
-    let dataset = open_dataset(genotype_path)?;
+    let dataset = open_dataset(genotype_path, genome_build)?;
     println!(
         "Resolved genotype data file: {}",
         dataset.data_path().display()
@@ -1658,10 +1671,17 @@ fn retain_variant_keys_by_logical_indices(
 
 fn run_project(
     genotype_path: &Path,
+    genome_build: Option<GenomeBuild>,
     model_name: Option<&str>,
     output_manifest: Option<&Path>,
 ) -> Result<(), MapDriverError> {
-    run_project_inner(genotype_path, model_name, output_manifest, None)
+    run_project_inner(
+        genotype_path,
+        genome_build,
+        model_name,
+        output_manifest,
+        None,
+    )
 }
 
 /// Run the `project` subcommand against a pre-opened/cached PLINK fileset but
@@ -1674,12 +1694,14 @@ fn run_project(
 /// it).
 pub fn run_project_with_output(
     genotype_path: &Path,
+    genome_build: Option<GenomeBuild>,
     model_name: Option<&str>,
     output_manifest: Option<&Path>,
     projection_scores_path: &Path,
 ) -> Result<(), MapDriverError> {
     run_project_inner(
         genotype_path,
+        genome_build,
         model_name,
         output_manifest,
         Some(projection_scores_path),
@@ -1688,6 +1710,7 @@ pub fn run_project_with_output(
 
 fn run_project_inner(
     genotype_path: &Path,
+    genome_build: Option<GenomeBuild>,
     model_name: Option<&str>,
     output_manifest: Option<&Path>,
     projection_scores_override: Option<&Path>,
@@ -1700,7 +1723,7 @@ fn run_project_inner(
     // `gnomon-map` binary, which otherwise relies on lazy initialization.
     crate::parallel::init_global_thread_pool();
 
-    let dataset = open_dataset(genotype_path)?;
+    let dataset = open_dataset(genotype_path, genome_build)?;
     println!(
         "Resolved genotype data file: {}",
         dataset.data_path().display()
@@ -1953,8 +1976,11 @@ fn run_project_inner(
     Ok(())
 }
 
-fn open_dataset(path: &Path) -> Result<GenotypeDataset, MapDriverError> {
-    Ok(GenotypeDataset::open(path)?)
+fn open_dataset(
+    path: &Path,
+    genome_build: Option<GenomeBuild>,
+) -> Result<GenotypeDataset, MapDriverError> {
+    Ok(GenotypeDataset::open(path, genome_build)?)
 }
 
 fn projection_present_mask(
@@ -2085,10 +2111,10 @@ mod tests {
         GenotypeDataset, OrderedSelectionPlan, ProjectionOutputPaths, SampleRecord, SelectionPlan,
         load_hwe_model, save_hwe_model, save_projection_results,
     };
-    use crate::map::project::ProjectionOptions;
     use crate::map::progress::{
         AdaptiveFitProgress, CiFitProgress, FitProgressStage, StageProgressHandle,
     };
+    use crate::map::project::ProjectionOptions;
     use crate::map::variant_filter::{MatchKind, VariantFilter, VariantKey, VariantSelection};
     use crate::shared::files::{
         VariantCompression, VariantFormat, ensure_rustls_provider, open_variant_source,
@@ -2139,6 +2165,7 @@ mod tests {
     fn fit_rejects_zero_worker_threads_before_opening_input() {
         let error = run(MapCommand::Fit {
             genotype_path: PathBuf::from("input-must-not-be-opened.bed"),
+            genome_build: None,
             output_prefix: None,
             variant_list: None,
             keep: None,
@@ -2164,6 +2191,7 @@ mod tests {
     fn fit_rejects_invalid_call_rate_before_opening_input() {
         let error = run(MapCommand::Fit {
             genotype_path: PathBuf::from("input-must-not-be-opened.bed"),
+            genome_build: None,
             output_prefix: None,
             variant_list: None,
             keep: None,
@@ -2190,6 +2218,7 @@ mod tests {
     fn fit_rejects_invalid_sample_missingness_before_opening_input() {
         let error = run(MapCommand::Fit {
             genotype_path: PathBuf::from("input-must-not-be-opened.bed"),
+            genome_build: None,
             output_prefix: None,
             variant_list: None,
             keep: None,
@@ -2565,7 +2594,7 @@ mod tests {
         }
 
         let bed_path = data_dir.join("chr22_subset50.bed");
-        let dataset = GenotypeDataset::open(&bed_path)?;
+        let dataset = GenotypeDataset::open(&bed_path, None)?;
 
         let mut fit_source = dataset.block_source()?;
         let model = HwePcaModel::fit_k(&mut fit_source, TEST_COMPONENTS)?;
@@ -2649,21 +2678,21 @@ mod tests {
             ],
         )?;
 
-        let train_dataset = GenotypeDataset::open(&train_path)?;
+        let train_dataset = GenotypeDataset::open(&train_path, None)?;
         let mut fit_source = train_dataset.block_source()?;
         let mut model = HwePcaModel::fit_k(&mut fit_source, 2)?;
         let variant_keys = train_dataset.variant_keys_for_plan(&SelectionPlan::All)?;
         model.set_variant_keys(Some(variant_keys));
         let model_path = save_hwe_model(&train_dataset, &model)?;
 
-        let projection_dataset = GenotypeDataset::open(&project_path)?;
+        let projection_dataset = GenotypeDataset::open(&project_path, None)?;
         fs::copy(&model_path, projection_dataset.output_path("hwe.json"))?;
 
         let manifest_path = project_path
             .parent()
             .expect("project path parent")
             .join("project_outputs.json");
-        run_project(&project_path, None, Some(&manifest_path))?;
+        run_project(&project_path, None, None, Some(&manifest_path))?;
 
         let scores_path = projection_dataset.output_path("projection_scores.bin");
         let metadata_path = projection_dataset.output_path("projection_scores.metadata.json");
@@ -2706,7 +2735,7 @@ mod tests {
         );
         assert_eq!(metadata["cols"].as_u64(), Some(model.components() as u64));
 
-        run_project(&project_path, None, None)?;
+        run_project(&project_path, None, None, None)?;
         let rerun_scores = read_projection_scores_column_major(
             &scores_path,
             projection_dataset.n_samples(),
@@ -3332,7 +3361,7 @@ mod tests {
         if should_skip_remote_variant_test() {
             return Ok(());
         }
-        let dataset = GenotypeDataset::open(Path::new(HGDP_CHR20_BCF))
+        let dataset = GenotypeDataset::open(Path::new(HGDP_CHR20_BCF), None)
             .map_err(|err| -> Box<dyn Error> { Box::new(err) })?;
         let n_samples = dataset.n_samples();
         assert!(n_samples >= 3, "expected at least three samples for PCA");

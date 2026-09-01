@@ -9153,7 +9153,7 @@ mod tests {
     #[test]
     fn fit_hwe_pca_from_http_vcf_stream() {
         let path = Path::new(TEST_VCF_URL);
-        let dataset = GenotypeDataset::open(path)
+        let dataset = GenotypeDataset::open(path, None)
             .unwrap_or_else(|err| panic!("Failed to open dataset: {err}"));
 
         let block_source = dataset

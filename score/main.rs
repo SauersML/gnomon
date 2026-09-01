@@ -13,6 +13,7 @@
 #![deny(unused_imports)]
 
 use clap::{Parser, ValueEnum};
+use gnomon::adapt_plink2::GenomeBuild;
 use gnomon::score::checkpoint;
 use gnomon::score::download;
 use gnomon::score::genotype_convert;
@@ -78,7 +79,7 @@ struct Args {
     #[clap(long)]
     reference: Option<PathBuf>,
 
-    /// Force genome build (37 or 38); auto-detected if not provided
+    /// Genome build (37 or 38); required for PLINK 2 PGEN input
     #[clap(long)]
     build: Option<String>,
 
@@ -265,6 +266,7 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
             inferred_sex: inferred_sex_override,
         },
     )?;
+    let genome_build = args.build.as_deref().map(GenomeBuild::parse).transpose()?;
 
     let fileset_prefixes = resolve_filesets(&effective_input_path)?;
     ensure_output_absent(&fileset_prefixes[0], &out_suffix)?;
@@ -328,6 +330,7 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
         checkpoint_path.clone(),
         checkpoint_fingerprint,
         memory_budget,
+        genome_build,
     );
     eprintln!("> Resource allocation complete.");
 
@@ -1117,8 +1120,7 @@ fn resolve_filesets(path: &Path) -> Result<Vec<PathBuf>, Box<dyn Error + Send + 
     };
     for bed_path in bed_files {
         let prefix = fileset_prefix(&bed_path);
-        if !fileset_member(&prefix, meta_a).is_file()
-            || !fileset_member(&prefix, meta_b).is_file()
+        if !fileset_member(&prefix, meta_a).is_file() || !fileset_member(&prefix, meta_b).is_file()
         {
             return Err(format!(
                 "Incomplete fileset for prefix '{}'. Every .{genotype_ext} file in a directory must have corresponding .{meta_a} and .{meta_b} files.",

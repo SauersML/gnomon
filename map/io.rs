@@ -12,7 +12,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::adapt_plink2::{VirtualPlink19, open_virtual_plink19_from_paths};
+use crate::adapt_plink2::{GenomeBuild, VirtualPlink19, open_virtual_plink19_from_paths};
 use crate::map::fit::{HwePcaModel, LdWeights, VariantBlockSource, for_each_packed_masked_code};
 use crate::map::project::ProjectionResult;
 use crate::map::variant_filter::{MatchKind, VariantFilter, VariantKey, VariantSelection};
@@ -199,10 +199,19 @@ fn selected_model_key(
 }
 
 impl GenotypeDataset {
-    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, GenotypeIoError> {
+    pub fn open<P: AsRef<Path>>(
+        path: P,
+        genome_build: Option<GenomeBuild>,
+    ) -> Result<Self, GenotypeIoError> {
         let path = path.as_ref();
         if is_pgen_path(path) {
-            return Ok(Self::Pgen(PgenDataset::open(path)?));
+            let genome_build = genome_build.ok_or_else(|| {
+                PlinkIoError::Pipeline(PipelineError::Io(
+                    "PLINK 2 PGEN input requires an explicit genome build (--build 37 or --build 38)"
+                        .to_string(),
+                ))
+            })?;
+            return Ok(Self::Pgen(PgenDataset::open(path, genome_build)?));
         }
         if guess_is_variant_dataset(path) {
             Ok(Self::Variants(VcfLikeDataset::open(path)?))
@@ -1928,7 +1937,7 @@ impl PlinkDataset {
         let bim_path = bed_path.with_extension("bim");
         let fam_path = bed_path.with_extension("fam");
 
-        let bed = open_bed_source(&bed_path)?;
+        let bed = open_bed_source(&bed_path, None)?;
         let mut header = [0u8; PLINK_HEADER_LEN as usize];
         bed.read_at(0, &mut header)?;
         validate_bed_header(&header)?;
@@ -2145,9 +2154,10 @@ pub struct PgenDataset {
 }
 
 impl PgenDataset {
-    pub fn open(path: &Path) -> Result<Self, PlinkIoError> {
+    pub fn open(path: &Path, genome_build: GenomeBuild) -> Result<Self, PlinkIoError> {
         let (pgen_path, pvar_path, psam_path) = normalize_pgen_paths(path);
-        let virtual_plink = open_virtual_plink19_from_paths(&pgen_path, &pvar_path, &psam_path)?;
+        let virtual_plink =
+            open_virtual_plink19_from_paths(&pgen_path, &pvar_path, &psam_path, genome_build)?;
 
         let mut fam_source = virtual_plink.fam_source();
         let samples = read_fam_records_from_source(&psam_path, &mut *fam_source)?;
@@ -6147,7 +6157,7 @@ mod tests {
         bed.flush().unwrap();
 
         let mut source = PlinkVariantBlockSource::new(
-            open_bed_source(&bed_path).unwrap(),
+            open_bed_source(&bed_path, None).unwrap(),
             2,
             8,
             5,
@@ -6186,7 +6196,7 @@ mod tests {
         }
 
         let mut fused_source = PlinkVariantBlockSource::new(
-            open_bed_source(&bed_path).unwrap(),
+            open_bed_source(&bed_path, None).unwrap(),
             2,
             8,
             5,
@@ -6214,7 +6224,7 @@ mod tests {
         };
 
         let mut subset_source = PlinkVariantBlockSource::new(
-            open_bed_source(&bed_path).unwrap(),
+            open_bed_source(&bed_path, None).unwrap(),
             2,
             8,
             5,
@@ -6240,7 +6250,7 @@ mod tests {
         ));
 
         let mut fused_subset_source = PlinkVariantBlockSource::new(
-            open_bed_source(&bed_path).unwrap(),
+            open_bed_source(&bed_path, None).unwrap(),
             2,
             8,
             5,
@@ -6790,8 +6800,7 @@ mod tests {
         let model_path = dir.path().join("hwe.json");
 
         let write_model = |model: &HwePcaModel| {
-            let mut writer =
-                BufWriter::new(File::create(&model_path).expect("create model path"));
+            let mut writer = BufWriter::new(File::create(&model_path).expect("create model path"));
             serde_json::to_writer(&mut writer, model).expect("write json");
             writer.flush().expect("flush json");
         };
@@ -6802,8 +6811,7 @@ mod tests {
             2.0, 1.0, 0.0, //
             1.0, 0.0, 2.0,
         ];
-        let mut first_source =
-            DenseBlockSource::new(&first_data, 3, 4).expect("dense source");
+        let mut first_source = DenseBlockSource::new(&first_data, 3, 4).expect("dense source");
         let first = HwePcaModel::fit_k(&mut first_source, 2).expect("fit first model");
         write_model(&first);
 
@@ -6819,8 +6827,7 @@ mod tests {
             2.0, 1.0, 0.0, 1.0, //
             0.0, 2.0, 2.0, 1.0,
         ];
-        let mut second_source =
-            DenseBlockSource::new(&second_data, 4, 5).expect("dense source");
+        let mut second_source = DenseBlockSource::new(&second_data, 4, 5).expect("dense source");
         let second = HwePcaModel::fit_k(&mut second_source, 2).expect("fit second model");
         write_model(&second);
 

@@ -9,7 +9,7 @@
 //! strictly sequential pass, so they are exactly what needs covering.
 //! See `data/testdata/README.md` for how to regenerate it.
 
-use gnomon::adapt_plink2::open_virtual_plink19_from_paths;
+use gnomon::adapt_plink2::{GenomeBuild, open_virtual_plink19_from_paths};
 use std::path::{Path, PathBuf};
 
 fn fixture_dir() -> PathBuf {
@@ -43,6 +43,7 @@ fn open_fixture() -> gnomon::adapt_plink2::VirtualPlink19 {
         &dir.join("ld_p.pgen"),
         &dir.join("ld_p.pvar"),
         &dir.join("ld_p.psam"),
+        GenomeBuild::Grch38,
     )
     .expect("opening the pgen fixture")
 }
@@ -236,8 +237,13 @@ fn scoring_a_subset_reads_only_part_of_the_pgen() {
         Arc::new(move || gnomon::files::open_text_source(&pvar_path));
     let mut psam = gnomon::files::open_text_source(&dir.join("ld_p.psam")).expect("psam");
 
-    let vp = gnomon::adapt_plink2::open_virtual_plink19_from_sources(source, pvar, &mut *psam)
-        .expect("opening pgen from sources");
+    let vp = gnomon::adapt_plink2::open_virtual_plink19_from_sources(
+        source,
+        pvar,
+        &mut *psam,
+        GenomeBuild::Grch38,
+    )
+    .expect("opening pgen from sources");
 
     // Opening parses the header; measure only what the variant reads cost.
     let after_open = bytes_read.load(Ordering::Relaxed);

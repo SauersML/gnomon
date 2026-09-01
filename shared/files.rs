@@ -1,3 +1,4 @@
+use crate::adapt_plink2::GenomeBuild;
 use crate::pipeline_error::PipelineError;
 use google_cloud_auth::credentials::{Credentials, anonymous::Builder as AnonymousCredentials};
 use google_cloud_storage::client::{Storage, StorageControl};
@@ -258,9 +259,18 @@ impl std::fmt::Debug for BedSource {
 /// Creates a `BedSource` for the provided `.bed` path. Local paths are
 /// memory-mapped, while remote locations stream data directly from their
 /// backing storage.
-pub fn open_bed_source(path: &Path) -> Result<BedSource, PipelineError> {
+pub fn open_bed_source(
+    path: &Path,
+    genome_build: Option<GenomeBuild>,
+) -> Result<BedSource, PipelineError> {
     if is_pgen_path(path) {
-        return open_pgen_as_bed_source(path);
+        let genome_build = genome_build.ok_or_else(|| {
+            PipelineError::Io(
+                "PLINK 2 PGEN input requires an explicit genome build (--build 37 or --build 38)"
+                    .to_string(),
+            )
+        })?;
+        return open_pgen_as_bed_source(path, genome_build);
     }
     if is_gcs_path(path) {
         let uri = path
@@ -352,7 +362,10 @@ fn open_byte_range_source(
 /// actually requested are fetched, which is the entire reason for reading PGEN
 /// rather than the equivalent `.bed` (a PGEN variant record is roughly an order
 /// of magnitude smaller than the fixed-stride `.bed` record it decodes to).
-fn open_pgen_as_bed_source(pgen_path: &Path) -> Result<BedSource, PipelineError> {
+fn open_pgen_as_bed_source(
+    pgen_path: &Path,
+    genome_build: GenomeBuild,
+) -> Result<BedSource, PipelineError> {
     let (pvar_path, psam_path) = pgen_sidecar_paths(pgen_path);
     // Sparse: scoring reads only the variant records a score file matched.
     let pgen = open_byte_range_source(pgen_path, true)?;
@@ -361,8 +374,12 @@ fn open_pgen_as_bed_source(pgen_path: &Path) -> Result<BedSource, PipelineError>
     let pvar: crate::adapt_plink2::PvarFactory =
         Arc::new(move || open_text_source(&pvar_for_factory));
 
-    let virtual_plink =
-        crate::adapt_plink2::open_virtual_plink19_from_sources(pgen, pvar, &mut *psam)?;
+    let virtual_plink = crate::adapt_plink2::open_virtual_plink19_from_sources(
+        pgen,
+        pvar,
+        &mut *psam,
+        genome_build,
+    )?;
     Ok(BedSource::new(virtual_plink.bed_source(), None))
 }
 

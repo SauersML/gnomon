@@ -17,6 +17,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+use gnomon::adapt_plink2::GenomeBuild;
 use gnomon::map::io::derive_local_output_path;
 use gnomon::map::main::run_project_with_output;
 use gnomon::score::genotype_convert::{
@@ -145,6 +146,7 @@ pub fn run(opts: AllOptions) -> Result<(), Box<dyn std::error::Error>> {
     };
     run_project_with_output(
         &plink_prefix,
+        opts.build.as_deref().map(GenomeBuild::parse).transpose()?,
         Some(&opts.model),
         opts.output_manifest.as_deref(),
         &projection_scores_path,

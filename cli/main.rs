@@ -10,6 +10,8 @@ use clap::{Args, Parser};
 use clap::{CommandFactory, Subcommand};
 #[cfg(feature = "calibrate")]
 use gam::probability::normal_cdf;
+#[cfg(feature = "map")]
+use gnomon::adapt_plink2::GenomeBuild;
 #[cfg(feature = "calibrate")]
 use gnomon::calibrate::data::{load_prediction_data, load_training_data};
 #[cfg(feature = "calibrate")]
@@ -39,6 +41,8 @@ use gnomon::map::LdWindow;
 use gnomon::map::main as map_cli;
 #[cfg(feature = "terms")]
 use gnomon::terms::infer_sex_to_tsv;
+#[cfg(feature = "terms")]
+use infer_sex::GenomeBuild as SexGenomeBuild;
 #[cfg(feature = "calibrate")]
 use ndarray::{Array1, ArrayView1};
 #[cfg(feature = "calibrate")]
@@ -83,7 +87,7 @@ struct ScoreArgs {
     #[arg(long)]
     reference: Option<PathBuf>,
 
-    /// Force genome build (37 or 38); auto-detected if not provided
+    /// Genome build (37 or 38); required for PLINK 2 PGEN input
     #[arg(long)]
     build: Option<String>,
 
@@ -110,6 +114,10 @@ struct FitArgs {
     /// Path to PLINK .bed file or directory containing .bed files
     #[arg(value_name = "GENOTYPE_PATH")]
     genotype_path: PathBuf,
+
+    /// Genome build for PLINK 2 PGEN input (37 or 38)
+    #[arg(long)]
+    build: Option<String>,
 
     /// Output prefix for every fit artifact (for example, results/eur).
     /// Defaults to the genotype path's stem for interactive convenience.
@@ -197,6 +205,10 @@ struct ProjectArgs {
     #[arg(value_name = "GENOTYPE_PATH")]
     genotype_path: PathBuf,
 
+    /// Genome build for PLINK 2 PGEN input (37 or 38)
+    #[arg(long)]
+    build: Option<String>,
+
     /// Use a built-in pre-trained model (downloads from GitHub if needed)
     #[arg(long, value_name = "MODEL_NAME")]
     model: Option<String>,
@@ -228,6 +240,10 @@ struct TermsArgs {
     /// Path to genotype dataset (PLINK .bed/.bim/.fam prefix or VCF/BCF file)
     #[arg(value_name = "GENOTYPE_PATH")]
     genotype_path: PathBuf,
+
+    /// Genome build for PLINK 2 PGEN input (37 or 38)
+    #[arg(long)]
+    build: Option<String>,
 
     /// Run sex inference on the provided genotype dataset
     #[arg(long)]
@@ -694,6 +710,7 @@ fn run_score(args: ScoreArgs) -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(feature = "map")]
 fn run_map_fit(args: FitArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let genome_build = args.build.as_deref().map(GenomeBuild::parse).transpose()?;
     if let Some(threads) = args.threads {
         rayon::ThreadPoolBuilder::new()
             .num_threads(threads.get())
@@ -792,6 +809,7 @@ fn run_map_fit(args: FitArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     map_cli::run(map_cli::MapCommand::Fit {
         genotype_path: args.genotype_path,
+        genome_build,
         output_prefix: args.out,
         variant_list: args.list,
         keep: args.keep,
@@ -810,8 +828,10 @@ fn run_map_fit(args: FitArgs) -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(feature = "map")]
 fn run_map_project(args: ProjectArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let genome_build = args.build.as_deref().map(GenomeBuild::parse).transpose()?;
     map_cli::run(map_cli::MapCommand::Project {
         genotype_path: args.genotype_path,
+        genome_build,
         model: args.model,
         output_manifest: args.output_manifest,
     })
@@ -845,7 +865,15 @@ fn run_terms(args: TermsArgs) -> Result<(), Box<dyn std::error::Error>> {
         )));
     }
 
-    let output_path = infer_sex_to_tsv(&args.genotype_path, None)
+    let genome_build = match args.build.as_deref().map(str::trim) {
+        None => None,
+        Some("37" | "GRCh37" | "grch37" | "hg19") => Some(SexGenomeBuild::Build37),
+        Some("38" | "GRCh38" | "grch38" | "hg38") => Some(SexGenomeBuild::Build38),
+        Some(value) => {
+            return Err(format!("Unsupported genome build '{value}'; expected 37 or 38").into());
+        }
+    };
+    let output_path = infer_sex_to_tsv(&args.genotype_path, genome_build)
         .map_err(|err| Box::new(err) as Box<dyn std::error::Error>)?;
     println!("Sex inference results written to {}", output_path.display());
     Ok(())

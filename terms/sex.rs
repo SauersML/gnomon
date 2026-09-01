@@ -10,6 +10,7 @@ use infer_sex::{
 };
 use thiserror::Error;
 
+use crate::adapt_plink2::GenomeBuild as PgenGenomeBuild;
 use crate::map::fit::VariantBlockSource;
 use crate::map::io::{GenotypeDataset, GenotypeIoError, SelectionPlan};
 use crate::map::variant_filter::VariantKey;
@@ -229,7 +230,11 @@ fn infer_records(
     force_build: Option<GenomeBuild>,
     show_progress: bool,
 ) -> Result<(GenotypeDataset, GenomeBuild, Vec<SexInferenceRecord>), SexInferenceError> {
-    let dataset = GenotypeDataset::open(genotype_path)?;
+    let pgen_build = force_build.map(|build| match build {
+        GenomeBuild::Build37 => PgenGenomeBuild::Grch37,
+        GenomeBuild::Build38 => PgenGenomeBuild::Grch38,
+    });
+    let dataset = GenotypeDataset::open(genotype_path, pgen_build)?;
     let variant_keys = dataset.variant_keys_for_plan(&SelectionPlan::All)?;
     let build = force_build.unwrap_or_else(|| {
         let inferred = infer_build_from_keys(&variant_keys);

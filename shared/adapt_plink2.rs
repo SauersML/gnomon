@@ -57,7 +57,6 @@ use crate::pipeline_error::PipelineError;
 pub struct VirtualPlink19 {
     /// Random-access virtual `.bed` (PLINK-1.9 bytes).
     pub bed: Arc<dyn ByteRangeSource>,
-    build: GenomeBuild,
     /// Reopens the backing `.pvar` so `.bim` rows can be regenerated on demand
     /// instead of held in memory. See `StreamingVirtualBim`.
     pvar: PvarFactory,
@@ -75,14 +74,6 @@ pub struct VirtualPlink19 {
 pub type PvarFactory = Arc<dyn Fn() -> Result<Box<dyn TextSource>, PipelineError> + Send + Sync>;
 
 impl VirtualPlink19 {
-    /// Returns the inferred genome build (`"GRCh37"` or `"GRCh38"`).
-    pub fn inferred_genome_build(&self) -> &'static str {
-        match self.build {
-            GenomeBuild::Grch37 => "GRCh37",
-            GenomeBuild::Grch38 => "GRCh38",
-        }
-    }
-
     pub fn bed_source(&self) -> Arc<dyn ByteRangeSource> {
         Arc::clone(&self.bed)
     }
@@ -155,13 +146,14 @@ pub fn open_virtual_plink19_from_paths(
     pgen_path: &Path,
     pvar_path: &Path,
     psam_path: &Path,
+    build: GenomeBuild,
 ) -> Result<VirtualPlink19, PipelineError> {
     let mut psam_for_plan = open_text_source(psam_path)?;
     let pgen = Arc::new(LocalFileByteRangeSource::open(pgen_path)?);
     let pvar_path = pvar_path.to_path_buf();
     let pvar: PvarFactory = Arc::new(move || open_text_source(&pvar_path));
 
-    open_virtual_plink19_from_sources(pgen, pvar, &mut *psam_for_plan)
+    open_virtual_plink19_from_sources(pgen, pvar, &mut *psam_for_plan, build)
 }
 
 /// Open from caller-provided sources. Callers may pass a custom/remote-capable
@@ -174,11 +166,11 @@ pub fn open_virtual_plink19_from_sources(
     pgen: Arc<dyn ByteRangeSource>,
     pvar: PvarFactory,
     psam_for_plan: &mut dyn TextSource,
+    build: GenomeBuild,
 ) -> Result<VirtualPlink19, PipelineError> {
     let header = PgenHeader::parse(&*pgen)?;
     let psam_info = PsamInfo::from_psam(psam_for_plan)?;
-    let plan = VariantPlan::from_pvar(&mut *pvar()?)?;
-    let inferred_build = plan.inferred_build();
+    let plan = VariantPlan::from_pvar(&mut *pvar()?, build)?;
 
     if header.m_variants != 0 && header.m_variants as usize != plan.in_variants {
         return Err(PipelineError::Io(format!(
@@ -233,7 +225,6 @@ pub fn open_virtual_plink19_from_sources(
 
     Ok(VirtualPlink19 {
         bed: bed_source,
-        build: inferred_build,
         pvar,
         fam_rows,
         n_samples: psam_info.n_samples,
@@ -505,7 +496,6 @@ struct VariantPlan {
     haploidy: Vec<HaploidyKind>,
     /// ALT allele count per input variant.
     alts_per_in: Vec<u16>,
-    build: GenomeBuild,
 }
 
 #[derive(Clone)]
@@ -595,7 +585,7 @@ impl PvarCols {
 }
 
 impl VariantPlan {
-    fn from_pvar(pvar: &mut dyn TextSource) -> Result<Self, PipelineError> {
+    fn from_pvar(pvar: &mut dyn TextSource, build: GenomeBuild) -> Result<Self, PipelineError> {
         let mut out_to_in: Vec<(u32, u16)> = Vec::with_capacity(1 << 20);
         let mut haploidy: Vec<HaploidyKind> = Vec::with_capacity(1 << 20);
         let mut per_variant: Vec<VariantRangeEntry> = Vec::with_capacity(1 << 16);
@@ -603,9 +593,6 @@ impl VariantPlan {
         let mut header_cols: Option<PvarCols> = None;
         let mut in_idx: u32 = 0;
         let mut in_variants: usize = 0;
-        let mut max_x_pos: u64 = 0;
-        let mut saw_x_par37_only = false;
-        let mut saw_x_par38_only = false;
         let mut sorted_positions = PvarPositionSortState::default();
 
         while let Some(line) = pvar.next_line()? {
@@ -661,18 +648,6 @@ impl VariantPlan {
                 return Err(ioerr(".pvar POS must be positive"));
             }
             sorted_positions.observe(&chrom, pos, in_variants + 1)?;
-            if chrom == "X" {
-                max_x_pos = max_x_pos.max(pos);
-                let in37 = in_any_range(pos, GRCH37_X_PAR);
-                let in38 = in_any_range(pos, GRCH38_X_PAR);
-                if in37 && !in38 {
-                    saw_x_par37_only = true;
-                }
-                if in38 && !in37 {
-                    saw_x_par38_only = true;
-                }
-            }
-
             let alts: Vec<&str> = alt_raw
                 .split(',')
                 .map(|a| a.trim())
@@ -719,20 +694,6 @@ impl VariantPlan {
             ));
         }
 
-        if saw_x_par37_only && saw_x_par38_only {
-            return Err(PipelineError::Io(
-                "Encountered X PAR loci matching both GRCh37-only and GRCh38-only ranges; cannot infer a single build"
-                    .to_string(),
-            ));
-        }
-
-        let build = if saw_x_par37_only {
-            GenomeBuild::Grch37
-        } else if saw_x_par38_only {
-            GenomeBuild::Grch38
-        } else {
-            infer_genome_build(max_x_pos)
-        };
         for entry in per_variant {
             let hap = haploidy_for_variant(&entry.chrom, entry.pos, build);
             for idx in entry.out_start..entry.out_end {
@@ -748,7 +709,6 @@ impl VariantPlan {
             out_to_in,
             haploidy,
             alts_per_in,
-            build,
         })
     }
 
@@ -765,11 +725,6 @@ impl VariantPlan {
     #[inline]
     fn alt_count_of_in(&self, in_idx: u32) -> u16 {
         self.alts_per_in.get(in_idx as usize).copied().unwrap_or(0)
-    }
-
-    #[inline]
-    fn inferred_build(&self) -> GenomeBuild {
-        self.build
     }
 }
 
@@ -825,20 +780,20 @@ impl PvarPositionSortState {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum GenomeBuild {
+pub enum GenomeBuild {
     Grch37,
     Grch38,
 }
 
-fn infer_genome_build(max_x_pos: u64) -> GenomeBuild {
-    const GRCH38_THRESHOLD: u64 = 155_700_000;
-    const GRCH37_THRESHOLD: u64 = 154_900_000;
-    if max_x_pos >= GRCH38_THRESHOLD {
-        GenomeBuild::Grch38
-    } else if max_x_pos >= GRCH37_THRESHOLD {
-        GenomeBuild::Grch37
-    } else {
-        GenomeBuild::Grch38
+impl GenomeBuild {
+    pub fn parse(value: &str) -> Result<Self, PipelineError> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "37" | "grch37" | "hg19" => Ok(Self::Grch37),
+            "38" | "grch38" | "hg38" => Ok(Self::Grch38),
+            _ => Err(PipelineError::Io(format!(
+                "Unsupported genome build '{value}'; expected 37 or 38"
+            ))),
+        }
     }
 }
 
@@ -875,7 +830,7 @@ const GRCH38_X_PAR: &[(u64, u64)] = &[(10_001, 2_781_479), (155_701_383, 156_030
 /// True for a normalized chromosome label that is a plain numbered autosome.
 ///
 /// Autosomes are diploid under every genome build, so their ploidy never
-/// depends on which build we infer.
+/// depends on the declared build.
 fn is_autosome(chrom: &str) -> bool {
     !chrom.is_empty() && chrom.bytes().all(|b| b.is_ascii_digit())
 }
@@ -2172,10 +2127,7 @@ impl PgenDecoder {
             anchor_cats: Vec::new(),
             cats_buf: Vec::new(),
             alt_counts,
-            dosage_meter: Arc::new(DosageCoercionMeter::new(
-                n_samples_from_psam,
-                in_variants,
-            )),
+            dosage_meter: Arc::new(DosageCoercionMeter::new(n_samples_from_psam, in_variants)),
         })
     }
 
@@ -2282,7 +2234,14 @@ impl PgenDecoder {
             anchor_cats,
             ..
         } = self;
-        decode_main_track_into(&scratch[..len], &mut cursor, n, main_kind, None, anchor_cats)?;
+        decode_main_track_into(
+            &scratch[..len],
+            &mut cursor,
+            n,
+            main_kind,
+            None,
+            anchor_cats,
+        )?;
 
         self.anchor_idx = Some(anchor_idx);
         Ok(())
@@ -3381,7 +3340,7 @@ mod tests {
             "1\t100\tv2\tC\tT",
         ]);
 
-        let err = match VariantPlan::from_pvar(&mut pvar) {
+        let err = match VariantPlan::from_pvar(&mut pvar, GenomeBuild::Grch38) {
             Ok(_) => panic!("expected unsorted .pvar to fail"),
             Err(err) => err,
         };
@@ -3393,6 +3352,21 @@ mod tests {
             }
             other => panic!("expected PipelineError::Io, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn explicit_build_accepts_x_coordinates_that_make_inference_ambiguous() {
+        let mut pvar = LineSource::new(vec![
+            "#CHROM\tPOS\tID\tREF\tALT",
+            "X\t50000\tv1\tA\tG",
+            "X\t155000000\tv2\tC\tT",
+        ]);
+
+        let plan = VariantPlan::from_pvar(&mut pvar, GenomeBuild::Grch38)
+            .expect("an explicit build must control PAR interpretation");
+
+        assert_eq!(plan.haploidy_of(0), Some(HaploidyKind::Diploid));
+        assert_eq!(plan.haploidy_of(1), Some(HaploidyKind::HaploidMales));
     }
 
     #[test]

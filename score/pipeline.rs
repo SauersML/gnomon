@@ -1,3 +1,4 @@
+use crate::adapt_plink2::GenomeBuild;
 use crate::pipeline_error::PipelineError;
 use crate::score::batch;
 use crate::score::checkpoint::ScoreCheckpoint;
@@ -412,6 +413,7 @@ pub struct PipelineContext {
     pub checkpoint_path: Option<PathBuf>,
     pub checkpoint_fingerprint: Option<[u8; 32]>,
     pub memory_budget: MemoryBudget,
+    pub genome_build: Option<GenomeBuild>,
 }
 
 impl PipelineContext {
@@ -424,6 +426,7 @@ impl PipelineContext {
             checkpoint_path: None,
             checkpoint_fingerprint: None,
             memory_budget: MemoryBudget::default(),
+            genome_build: None,
         }
     }
 
@@ -433,6 +436,7 @@ impl PipelineContext {
         checkpoint_path: PathBuf,
         checkpoint_fingerprint: [u8; 32],
         memory_budget: MemoryBudget,
+        genome_build: Option<GenomeBuild>,
     ) -> Self {
         Self {
             prep_result,
@@ -441,6 +445,7 @@ impl PipelineContext {
             checkpoint_path: Some(checkpoint_path),
             checkpoint_fingerprint: Some(checkpoint_fingerprint),
             memory_budget,
+            genome_build,
         }
     }
 
@@ -502,7 +507,7 @@ fn run_single_file_pipeline(
     bed_path: &Path,
 ) -> Result<(Vec<f64>, Vec<u32>), PipelineError> {
     // --- 1. Setup: Memory-map the file, create channels and a shared buffer pool ---
-    let bed_source = io::open_bed_source(bed_path)?;
+    let bed_source = io::open_bed_source(bed_path, context.genome_build)?;
     let shared_source = bed_source.byte_source();
 
     let channel_bound = context.work_channel_bound()?;
@@ -903,7 +908,7 @@ fn run_multi_file_pipeline(
 ) -> Result<(Vec<f64>, Vec<u32>), PipelineError> {
     let bed_sources: Vec<io::BedSource> = boundaries
         .iter()
-        .map(|b| io::open_bed_source(&b.bed_path))
+        .map(|b| io::open_bed_source(&b.bed_path, context.genome_build))
         .collect::<Result<_, _>>()?;
     let any_remote = bed_sources.iter().any(|s| s.mmap().is_none());
     let shared_sources = Arc::new(bed_sources);
@@ -1306,7 +1311,7 @@ fn run_small_keep_direct_single_file(
         "> Using small-keep direct PLINK path for {} kept individual(s).",
         context.prep_result.num_people_to_score
     );
-    let bed_source = io::open_bed_source(bed_path)?;
+    let bed_source = io::open_bed_source(bed_path, context.genome_build)?;
     let prep_result = &context.prep_result;
     let master_baseline = prep_result.baseline_missing_sum_by_score().to_vec();
     let (mut final_scores, mut final_counts) = initialize_final_output(
@@ -1401,7 +1406,7 @@ fn run_small_keep_direct_multi_file(
     );
     let bed_sources: Vec<io::BedSource> = boundaries
         .iter()
-        .map(|b| io::open_bed_source(&b.bed_path))
+        .map(|b| io::open_bed_source(&b.bed_path, context.genome_build))
         .collect::<Result<_, _>>()?;
     let prep_result = &context.prep_result;
     let master_baseline = prep_result.baseline_missing_sum_by_score().to_vec();
