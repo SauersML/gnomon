@@ -63,6 +63,7 @@ fn requester_pays_media_url(
         .map_err(|error| error.to_string())?;
     url.path_segments_mut()
         .map_err(|()| "Cloud Storage media URL cannot be a base".to_string())?
+        .pop_if_empty()
         .push(bucket)
         .push("o")
         .push(object);
@@ -2451,9 +2452,10 @@ mod tests {
 
         assert_eq!(url.scheme(), "https");
         assert_eq!(url.host_str(), Some("storage.googleapis.com"));
-        assert!(
-            url.as_str()
-                .contains("/fc-aou-protected/o/wgs%2Fpgen%2Fchr22%2Fsample.pgen")
+        assert_eq!(
+            url.as_str(),
+            "https://storage.googleapis.com/download/storage/v1/b/fc-aou-protected/o/\
+wgs%2Fpgen%2Fchr22%2Fsample.pgen?alt=media&userProject=wb-amiable-carrot-1173"
         );
         assert!(
             url.query_pairs()
