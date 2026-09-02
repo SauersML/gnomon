@@ -52,6 +52,24 @@ fn cache_capacity_for(block_size: usize) -> usize {
 const REMOTE_CACHE_CAPACITY: usize = 8;
 const HTTP_USER_AGENT: &str = "gnomon-http-client/1.0";
 
+fn requester_pays_media_url(
+    bucket: &str,
+    object: &str,
+    billing_project: &str,
+) -> Result<Url, String> {
+    let mut url = Url::parse("https://storage.googleapis.com/download/storage/v1/b/")
+        .map_err(|error| error.to_string())?;
+    url.path_segments_mut()
+        .map_err(|()| "Cloud Storage media URL cannot be a base".to_string())?
+        .push(bucket)
+        .push("o")
+        .push(object);
+    url.query_pairs_mut()
+        .append_pair("alt", "media")
+        .append_pair("userProject", billing_project);
+    Ok(url)
+}
+
 const UNKNOWN_TOTAL_BYTES: u64 = u64::MAX;
 
 #[derive(Debug)]
@@ -1094,7 +1112,7 @@ fn fetch_variant_object_names(
 
 fn list_remote_variant_objects(bucket: &str, prefix: &str) -> Result<Vec<String>, PipelineError> {
     let runtime = get_shared_runtime()?;
-    let (_, control) = RemoteByteRangeSource::create_clients(&runtime, None)?;
+    let (_, control, _) = RemoteByteRangeSource::create_clients(&runtime, None)?;
     let bucket_path = format!("projects/_/buckets/{bucket}");
     let user_project = gcs_billing_project_from_env();
 
@@ -1105,7 +1123,7 @@ fn list_remote_variant_objects(bucket: &str, prefix: &str) -> Result<Vec<String>
     match attempt(&control) {
         Ok(names) => Ok(names),
         Err(err) if RemoteByteRangeSource::is_authentication_error(&err) => {
-            let (_, fallback_control) = RemoteByteRangeSource::create_clients(
+            let (_, fallback_control, _) = RemoteByteRangeSource::create_clients(
                 &runtime,
                 Some(AnonymousCredentials::new().build()),
             )?;
@@ -1214,7 +1232,7 @@ fn create_remote_streaming_context(
     object: &str,
 ) -> Result<(Arc<Runtime>, Storage, u64, Option<String>), PipelineError> {
     let runtime = get_shared_runtime()?;
-    let (mut storage, control) = RemoteByteRangeSource::create_clients(&runtime, None)?;
+    let (mut storage, control, _) = RemoteByteRangeSource::create_clients(&runtime, None)?;
     let bucket_path = format!("projects/_/buckets/{bucket}");
     let user_project = gcs_billing_project_from_env();
     let metadata = match RemoteByteRangeSource::fetch_object_metadata(
@@ -1229,7 +1247,7 @@ fn create_remote_streaming_context(
             debug!(
                 "Retrying metadata fetch for gs://{bucket}/{object} with anonymous credentials after authentication failure: {err_msg}"
             );
-            let (fallback_storage, fallback_control) = RemoteByteRangeSource::create_clients(
+            let (fallback_storage, fallback_control, _) = RemoteByteRangeSource::create_clients(
                 &runtime,
                 Some(AnonymousCredentials::new().build()),
             )
@@ -1628,6 +1646,9 @@ impl Read for GcsStreamingReader {
 struct RemoteByteRangeSource {
     runtime: Arc<Runtime>,
     storage: Storage,
+    credentials: Credentials,
+    http_client: Client,
+    bucket: String,
     bucket_path: String,
     object: String,
     user_project: Option<String>,
@@ -1648,7 +1669,7 @@ impl RemoteByteRangeSource {
         block_size: usize,
     ) -> Result<Self, PipelineError> {
         let runtime = get_shared_runtime()?;
-        let (mut storage, control) = Self::create_clients(&runtime, None)?;
+        let (mut storage, control, mut credentials) = Self::create_clients(&runtime, None)?;
         let bucket_path = format!("projects/_/buckets/{bucket}");
         let user_project = gcs_billing_project_from_env();
         let metadata = match Self::fetch_object_metadata(&runtime, &control, &bucket_path, object) {
@@ -1658,7 +1679,7 @@ impl RemoteByteRangeSource {
                 debug!(
                     "Retrying metadata fetch for gs://{bucket}/{object} with anonymous credentials after authentication failure: {err_msg}"
                 );
-                let (fallback_storage, fallback_control) = Self::create_clients(
+                let (fallback_storage, fallback_control, fallback_credentials) = Self::create_clients(
                     &runtime,
                     Some(AnonymousCredentials::new().build()),
                 )
@@ -1668,6 +1689,7 @@ impl RemoteByteRangeSource {
                     ))
                 })?;
                 storage = fallback_storage;
+                credentials = fallback_credentials;
                 Self::fetch_object_metadata(&runtime, &fallback_control, &bucket_path, object)
                     .map_err(|retry_err| {
                         PipelineError::Io(format!(
@@ -1694,6 +1716,14 @@ impl RemoteByteRangeSource {
         Ok(Self {
             runtime,
             storage,
+            credentials,
+            http_client: Client::builder()
+                .user_agent(HTTP_USER_AGENT)
+                .build()
+                .map_err(|e| {
+                    PipelineError::Io(format!("Failed to build Cloud Storage HTTP client: {e}"))
+                })?,
+            bucket: bucket.to_string(),
             bucket_path,
             object: object.to_string(),
             user_project,
@@ -1706,7 +1736,7 @@ impl RemoteByteRangeSource {
     fn create_clients(
         runtime: &Arc<Runtime>,
         credentials: Option<Credentials>,
-    ) -> Result<(Storage, StorageControl), PipelineError> {
+    ) -> Result<(Storage, StorageControl, Credentials), PipelineError> {
         ensure_rustls_provider();
         let base_credentials = match credentials {
             Some(creds) => creds,
@@ -1724,9 +1754,10 @@ impl RemoteByteRangeSource {
                 })
         })?;
 
+        let control_credentials = base_credentials.clone();
         let control = runtime.block_on(async move {
             StorageControl::builder()
-                .with_credentials(base_credentials)
+                .with_credentials(control_credentials)
                 .build()
                 .await
                 .map_err(|e| {
@@ -1736,7 +1767,7 @@ impl RemoteByteRangeSource {
                 })
         })?;
 
-        Ok((storage, control))
+        Ok((storage, control, base_credentials))
     }
 
     fn fetch_object_metadata(
@@ -1787,15 +1818,43 @@ impl RemoteByteRangeSource {
     fn fetch_block(&self, start: u64, length: usize) -> Result<Arc<Vec<u8>>, PipelineError> {
         let bucket_path = self.bucket_path.clone();
         let object = self.object.clone();
-        let bucket_for_log = bucket_path.clone();
+        let bucket_for_log = self.bucket.clone();
         let object_for_log = object.clone();
         let storage = self.storage.clone();
         let runtime = Arc::clone(&self.runtime);
         let user_project = self.user_project.clone();
-        let mut data = runtime.block_on(async move {
-            let mut last_error = String::new();
-            for attempt in 1..=REMOTE_READ_ATTEMPTS {
-                let result = async {
+        let credentials = self.credentials.clone();
+        let http_client = self.http_client.clone();
+        let bucket = self.bucket.clone();
+        let mut last_error = String::new();
+        let mut data = None;
+        for attempt in 1..=REMOTE_READ_ATTEMPTS {
+            let result = if let Some(project) = user_project.as_deref() {
+                let headers = runtime
+                    .block_on(credentials.headers(Default::default()))
+                    .map_err(|error| error.to_string());
+                headers.and_then(|headers| {
+                    let url = requester_pays_media_url(&bucket, &object, project)?;
+                    let end = start + length as u64 - 1;
+                    let response = http_client
+                        .get(url)
+                        .headers(headers)
+                        .header(RANGE, format!("bytes={start}-{end}"))
+                        .send()
+                        .map_err(|error| error.to_string())?;
+                    if response.status() != StatusCode::PARTIAL_CONTENT {
+                        return Err(format!(
+                            "Cloud Storage media read returned HTTP {}",
+                            response.status()
+                        ));
+                    }
+                    response
+                        .bytes()
+                        .map(|bytes| bytes.to_vec())
+                        .map_err(|error| error.to_string())
+                })
+            } else {
+                runtime.block_on(async {
                     let mut response = storage
                         .read_object(bucket_path.clone(), object.clone())
                         .set_read_range(ReadRange::segment(start, length as u64))
@@ -1813,33 +1872,28 @@ impl RemoteByteRangeSource {
                         ));
                     }
                     Ok::<Vec<u8>, String>(buffer)
-                }
-                .await;
+                })
+            };
 
-                match result {
-                    Ok(buffer) => return Ok(buffer),
-                    Err(error)
-                        if user_project.is_none()
-                            && error.to_lowercase().contains("requester pays") =>
-                    {
-                        return Err(PipelineError::Io(format!(
-                            "Requester Pays bucket requires a billing project. Set GOOGLE_PROJECT (or run `gcloud config set project ...`) and re-run. Original error: {error}"
-                        )));
-                    }
-                    Err(error) => last_error = error,
+            match result {
+                Ok(buffer) => {
+                    data = Some(buffer);
+                    break;
                 }
-
-                if attempt < REMOTE_READ_ATTEMPTS {
-                    let delay_ms = REMOTE_READ_INITIAL_BACKOFF_MS << (attempt - 1);
-                    warn!(
-                        "Remote range read attempt {attempt}/{REMOTE_READ_ATTEMPTS} failed at offset {start} for gs://{bucket_path}/{object}: {last_error}; retrying in {delay_ms} ms"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                }
+                Err(error) => last_error = error,
             }
-            Err(PipelineError::Io(format!(
-                "Remote range read failed after {REMOTE_READ_ATTEMPTS} attempts at offset {start} for gs://{bucket_path}/{object}: {last_error}"
-            )))
+            if attempt < REMOTE_READ_ATTEMPTS {
+                let delay_ms = REMOTE_READ_INITIAL_BACKOFF_MS << (attempt - 1);
+                warn!(
+                    "Remote range read attempt {attempt}/{REMOTE_READ_ATTEMPTS} failed at offset {start} for gs://{bucket_for_log}/{object_for_log}: {last_error}; retrying in {delay_ms} ms"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            }
+        }
+        let mut data = data.ok_or_else(|| {
+            PipelineError::Io(format!(
+                "Remote range read failed after {REMOTE_READ_ATTEMPTS} attempts at offset {start} for gs://{bucket_for_log}/{object_for_log}: {last_error}"
+            ))
         })?;
 
         if data.len() != length {
@@ -2375,6 +2429,27 @@ mod tests {
         assert_eq!(remote_pgen_block_size(2_000, 1_000_000), 2 * 1024 * 1024);
         assert_eq!(remote_pgen_block_size(10_000, 1_000_000), 8 * 1024 * 1024);
         assert_eq!(remote_pgen_block_size(10_000, 0), 256 * 1024);
+    }
+
+    #[test]
+    fn requester_pays_media_url_encodes_object_and_billing_project() {
+        let url = requester_pays_media_url(
+            "fc-aou-protected",
+            "wgs/pgen/chr22/sample.pgen",
+            "wb-amiable-carrot-1173",
+        )
+        .expect("requester-pays media URL should be valid");
+
+        assert_eq!(url.scheme(), "https");
+        assert_eq!(url.host_str(), Some("storage.googleapis.com"));
+        assert!(
+            url.as_str()
+                .contains("/fc-aou-protected/o/wgs%2Fpgen%2Fchr22%2Fsample.pgen")
+        );
+        assert!(
+            url.query_pairs()
+                .any(|(key, value)| { key == "userProject" && value == "wb-amiable-carrot-1173" })
+        );
     }
 
     #[test]
