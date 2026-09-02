@@ -39,6 +39,7 @@ const REMOTE_BLOCK_SIZE: usize = 8 * 1024 * 1024;
 /// 256 KB is small enough to keep that waste bounded while still amortising
 /// per-request latency over a run of neighbouring records.
 const REMOTE_SPARSE_BLOCK_SIZE: usize = 256 * 1024;
+const REMOTE_MEDIUM_BLOCK_SIZE: usize = 2 * 1024 * 1024;
 const REMOTE_READ_ATTEMPTS: usize = 4;
 const REMOTE_READ_INITIAL_BACKOFF_MS: u64 = 250;
 
@@ -270,7 +271,7 @@ pub fn open_bed_source(
                     .to_string(),
             )
         })?;
-        return open_pgen_as_bed_source(path, genome_build);
+        return open_pgen_as_bed_source(path, genome_build, REMOTE_SPARSE_BLOCK_SIZE);
     }
     if is_gcs_path(path) {
         let uri = path
@@ -303,6 +304,52 @@ pub fn open_bed_source(
     }
 }
 
+/// Opens a scoring input with remote PGEN fetches sized to the matched variant density.
+///
+/// A single PGS touches scattered records and must retain the 256 KiB sparse path. A
+/// large score bank can match enough variants that nearly every larger object block is
+/// needed; keeping 256 KiB there pays synchronous request latency tens of thousands of
+/// times without saving bytes. Local inputs are unaffected.
+pub fn open_bed_source_for_scoring(
+    path: &Path,
+    genome_build: Option<GenomeBuild>,
+    matched_variants: usize,
+    total_variants: u64,
+) -> Result<BedSource, PipelineError> {
+    if !is_pgen_path(path) {
+        return open_bed_source(path, genome_build);
+    }
+    if !is_gcs_path(path) && !is_http_path(path) {
+        return open_bed_source(path, genome_build);
+    }
+    let genome_build = genome_build.ok_or_else(|| {
+        PipelineError::Io(
+            "PLINK 2 PGEN input requires an explicit genome build (--build 37 or --build 38)"
+                .to_string(),
+        )
+    })?;
+    let block_size = remote_pgen_block_size(matched_variants, total_variants);
+    eprintln!(
+        "> Remote PGEN fetch block: {} KiB for {matched_variants}/{total_variants} matched variants.",
+        block_size / 1024
+    );
+    open_pgen_as_bed_source(path, genome_build, block_size)
+}
+
+fn remote_pgen_block_size(matched_variants: usize, total_variants: u64) -> usize {
+    if total_variants == 0 {
+        return REMOTE_SPARSE_BLOCK_SIZE;
+    }
+    let density = matched_variants as f64 / total_variants as f64;
+    if density >= 0.01 {
+        REMOTE_BLOCK_SIZE
+    } else if density >= 0.002 {
+        REMOTE_MEDIUM_BLOCK_SIZE
+    } else {
+        REMOTE_SPARSE_BLOCK_SIZE
+    }
+}
+
 /// True for a PLINK 2 genotype table (`.pgen`), local or remote.
 pub fn is_pgen_path(path: &Path) -> bool {
     path.extension().is_some_and(|ext| ext == "pgen")
@@ -323,30 +370,30 @@ pub fn pgen_sidecar_paths(pgen: &Path) -> (PathBuf, PathBuf) {
 
 /// Opens a raw byte-range source for any supported location.
 ///
-/// `sparse` selects the fetch granularity: set it when the caller will read
-/// scattered small records rather than sweep the object end to end.
+/// `remote_block_size` selects the fetch granularity for remote inputs. Local inputs
+/// ignore it because they are memory-mapped.
 fn open_byte_range_source(
     path: &Path,
-    sparse: bool,
+    remote_block_size: Option<usize>,
 ) -> Result<Arc<dyn ByteRangeSource>, PipelineError> {
     if is_gcs_path(path) {
         let uri = path
             .to_str()
             .ok_or_else(|| PipelineError::Io("Invalid UTF-8 in path".to_string()))?;
         let (bucket, object) = parse_gcs_uri(uri)?;
-        Ok(Arc::new(if sparse {
-            RemoteByteRangeSource::with_sparse_reads(&bucket, &object)?
-        } else {
-            RemoteByteRangeSource::new(&bucket, &object)?
+        Ok(Arc::new(match remote_block_size {
+            Some(block_size) => {
+                RemoteByteRangeSource::with_block_size(&bucket, &object, block_size)?
+            }
+            None => RemoteByteRangeSource::new(&bucket, &object)?,
         }))
     } else if is_http_path(path) {
         let url = path
             .to_str()
             .ok_or_else(|| PipelineError::Io("Invalid UTF-8 in path".to_string()))?;
-        Ok(Arc::new(if sparse {
-            HttpByteRangeSource::with_sparse_reads(url)?
-        } else {
-            HttpByteRangeSource::new(url)?
+        Ok(Arc::new(match remote_block_size {
+            Some(block_size) => HttpByteRangeSource::with_block_size(url, block_size)?,
+            None => HttpByteRangeSource::new(url)?,
         }))
     } else {
         let file = File::open(path)
@@ -365,10 +412,11 @@ fn open_byte_range_source(
 fn open_pgen_as_bed_source(
     pgen_path: &Path,
     genome_build: GenomeBuild,
+    remote_block_size: usize,
 ) -> Result<BedSource, PipelineError> {
     let (pvar_path, psam_path) = pgen_sidecar_paths(pgen_path);
     // Sparse: scoring reads only the variant records a score file matched.
-    let pgen = open_byte_range_source(pgen_path, true)?;
+    let pgen = open_byte_range_source(pgen_path, Some(remote_block_size))?;
     let mut psam = open_text_source(&psam_path)?;
     let pvar_for_factory = pvar_path.clone();
     let pvar: crate::adapt_plink2::PvarFactory =
@@ -1594,12 +1642,6 @@ impl RemoteByteRangeSource {
         Self::with_block_size(bucket, object, REMOTE_BLOCK_SIZE)
     }
 
-    /// Opens the object with a specific fetch granularity, for access patterns
-    /// that read scattered small records instead of sweeping the whole object.
-    fn with_sparse_reads(bucket: &str, object: &str) -> Result<Self, PipelineError> {
-        Self::with_block_size(bucket, object, REMOTE_SPARSE_BLOCK_SIZE)
-    }
-
     fn with_block_size(
         bucket: &str,
         object: &str,
@@ -1954,11 +1996,6 @@ impl Read for HttpStreamingReader {
 impl HttpByteRangeSource {
     fn new(url: &str) -> Result<Self, PipelineError> {
         Self::with_block_size(url, REMOTE_BLOCK_SIZE)
-    }
-
-    /// Opens the URL with a fetch granularity suited to scattered small reads.
-    fn with_sparse_reads(url: &str) -> Result<Self, PipelineError> {
-        Self::with_block_size(url, REMOTE_SPARSE_BLOCK_SIZE)
     }
 
     fn with_block_size(url: &str, block_size: usize) -> Result<Self, PipelineError> {
@@ -2330,6 +2367,14 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn remote_pgen_fetch_size_tracks_matched_variant_density() {
+        assert_eq!(remote_pgen_block_size(1, 1_000_000), 256 * 1024);
+        assert_eq!(remote_pgen_block_size(2_000, 1_000_000), 2 * 1024 * 1024);
+        assert_eq!(remote_pgen_block_size(10_000, 1_000_000), 8 * 1024 * 1024);
+        assert_eq!(remote_pgen_block_size(10_000, 0), 256 * 1024);
     }
 
     #[test]

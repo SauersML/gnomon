@@ -18,7 +18,7 @@ use crate::score::types::{
 pub use crate::shared::files::{
     BedSource, ByteRangeSource, PROGRESS_UPDATE_BATCH_SIZE, TextSource,
     gcs_billing_project_from_env, get_shared_runtime, is_pgen_path, load_adc_credentials,
-    open_bed_source, open_plink_text_source, open_text_source,
+    open_bed_source, open_bed_source_for_scoring, open_plink_text_source, open_text_source,
 };
 use ahash::AHashMap;
 use crossbeam_channel::Sender;

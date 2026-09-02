@@ -298,6 +298,18 @@ fn should_use_small_keep_direct_for_prep(prep_result: &PreparationResult) -> boo
         && prep_result.complex_rules.is_empty()
 }
 
+fn open_scoring_bed_source(
+    context: &PipelineContext,
+    path: &Path,
+) -> Result<io::BedSource, PipelineError> {
+    io::open_bed_source_for_scoring(
+        path,
+        context.genome_build,
+        context.prep_result.num_reconciled_variants,
+        context.prep_result.total_variants_in_bim,
+    )
+}
+
 fn result_bytes(result_size: usize) -> Result<usize, PipelineError> {
     result_size
         .checked_mul(std::mem::size_of::<f64>() + std::mem::size_of::<u32>())
@@ -507,7 +519,7 @@ fn run_single_file_pipeline(
     bed_path: &Path,
 ) -> Result<(Vec<f64>, Vec<u32>), PipelineError> {
     // --- 1. Setup: Memory-map the file, create channels and a shared buffer pool ---
-    let bed_source = io::open_bed_source(bed_path, context.genome_build)?;
+    let bed_source = open_scoring_bed_source(context, bed_path)?;
     let shared_source = bed_source.byte_source();
 
     let channel_bound = context.work_channel_bound()?;
@@ -908,7 +920,7 @@ fn run_multi_file_pipeline(
 ) -> Result<(Vec<f64>, Vec<u32>), PipelineError> {
     let bed_sources: Vec<io::BedSource> = boundaries
         .iter()
-        .map(|b| io::open_bed_source(&b.bed_path, context.genome_build))
+        .map(|b| open_scoring_bed_source(context, &b.bed_path))
         .collect::<Result<_, _>>()?;
     let any_remote = bed_sources.iter().any(|s| s.mmap().is_none());
     let shared_sources = Arc::new(bed_sources);
@@ -1311,7 +1323,7 @@ fn run_small_keep_direct_single_file(
         "> Using small-keep direct PLINK path for {} kept individual(s).",
         context.prep_result.num_people_to_score
     );
-    let bed_source = io::open_bed_source(bed_path, context.genome_build)?;
+    let bed_source = open_scoring_bed_source(context, bed_path)?;
     let prep_result = &context.prep_result;
     let master_baseline = prep_result.baseline_missing_sum_by_score().to_vec();
     let (mut final_scores, mut final_counts) = initialize_final_output(
@@ -1406,7 +1418,7 @@ fn run_small_keep_direct_multi_file(
     );
     let bed_sources: Vec<io::BedSource> = boundaries
         .iter()
-        .map(|b| io::open_bed_source(&b.bed_path, context.genome_build))
+        .map(|b| open_scoring_bed_source(context, &b.bed_path))
         .collect::<Result<_, _>>()?;
     let prep_result = &context.prep_result;
     let master_baseline = prep_result.baseline_missing_sum_by_score().to_vec();

@@ -1240,7 +1240,12 @@ fn run_single_file_cuda(
     bed_path: &Path,
     runtime: CudaRuntime,
 ) -> Result<(Vec<f64>, Vec<u32>), PipelineError> {
-    let bed_source = io::open_bed_source(bed_path, context.genome_build)?;
+    let bed_source = io::open_bed_source_for_scoring(
+        bed_path,
+        context.genome_build,
+        context.prep_result.num_reconciled_variants,
+        context.prep_result.total_variants_in_bim,
+    )?;
     let input = CudaInput::Single {
         bed_path: bed_path.to_path_buf(),
         bed_source,
@@ -1255,7 +1260,14 @@ fn run_multi_file_cuda(
 ) -> Result<(Vec<f64>, Vec<u32>), PipelineError> {
     let bed_sources: Vec<io::BedSource> = boundaries
         .iter()
-        .map(|b| io::open_bed_source(&b.bed_path, context.genome_build))
+        .map(|b| {
+            io::open_bed_source_for_scoring(
+                &b.bed_path,
+                context.genome_build,
+                context.prep_result.num_reconciled_variants,
+                context.prep_result.total_variants_in_bim,
+            )
+        })
         .collect::<Result<_, _>>()?;
     let input = CudaInput::Multi {
         boundaries: boundaries.to_vec(),
