@@ -20,6 +20,7 @@ use std::path::PathBuf;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
+use crate::adapt_plink2::GenomeBuild;
 use crate::map::main as map_cli;
 use crate::score_main;
 use crate::terms::{infer_first_sample_sex, infer_sex_to_tsv};
@@ -54,6 +55,7 @@ fn parse_inferred_sex(value: Option<&str>) -> PyResult<Option<score_main::Inferr
     build = None,
     panel = None,
     inferred_sex = None,
+    emit_components = false,
 ))]
 fn score(
     py: Python<'_>,
@@ -64,6 +66,7 @@ fn score(
     build: Option<String>,
     panel: Option<String>,
     inferred_sex: Option<String>,
+    emit_components: bool,
 ) -> PyResult<String> {
     let input_path_buf = PathBuf::from(&input_path);
     let inferred = parse_inferred_sex(inferred_sex.as_deref())?;
@@ -82,6 +85,7 @@ fn score(
             build,
             panel_buf,
             inferred,
+            emit_components,
         )
     })
     .map_err(|err| PyRuntimeError::new_err(format!("gnomon score failed: {err}")))?;
@@ -95,19 +99,26 @@ fn score(
 /// PATH]`. Returns the `output_manifest` path when one was requested, otherwise
 /// the `genotype_path` the projection outputs were written next to.
 #[pyfunction]
-#[pyo3(signature = (genotype_path, model = None, output_manifest = None))]
+#[pyo3(signature = (genotype_path, build = None, model = None, output_manifest = None))]
 fn project(
     py: Python<'_>,
     genotype_path: String,
+    build: Option<String>,
     model: Option<String>,
     output_manifest: Option<String>,
 ) -> PyResult<String> {
     let genotype_buf = PathBuf::from(&genotype_path);
+    let genome_build = build
+        .as_deref()
+        .map(GenomeBuild::parse)
+        .transpose()
+        .map_err(|err| PyValueError::new_err(err.to_string()))?;
     let manifest_buf = output_manifest.clone().map(PathBuf::from);
 
     py.detach(|| {
         map_cli::run(map_cli::MapCommand::Project {
             genotype_path: genotype_buf,
+            genome_build,
             model,
             output_manifest: manifest_buf,
         })

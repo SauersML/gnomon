@@ -25,11 +25,13 @@ gnomon.score(
     build="38",
     panel="/cache/1kg_panel.vcf",
     inferred_sex="male",
+    emit_components=False,
 )
 
 # Project genotypes onto a built-in HWE-PCA model.
 gnomon.project(
     "/data/cohort/arrays",
+    build="38",
     model="hwe_1kg_hgdp_gsa_v3",
     output_manifest="/data/cohort/projection.json",
 )
