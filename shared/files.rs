@@ -1,6 +1,8 @@
 use crate::adapt_plink2::GenomeBuild;
 use crate::pipeline_error::PipelineError;
-use google_cloud_auth::credentials::{Credentials, anonymous::Builder as AnonymousCredentials};
+use google_cloud_auth::credentials::{
+    CacheableResource, Credentials, anonymous::Builder as AnonymousCredentials,
+};
 use google_cloud_storage::client::{Storage, StorageControl};
 use google_cloud_storage::model_ext::ReadRange;
 use log::{debug, warn};
@@ -1832,7 +1834,14 @@ impl RemoteByteRangeSource {
             let result = if let Some(project) = user_project.as_deref() {
                 let headers = runtime
                     .block_on(credentials.headers(Default::default()))
-                    .map_err(|error| error.to_string());
+                    .map_err(|error| error.to_string())
+                    .and_then(|headers| match headers {
+                        CacheableResource::New { data, .. } => Ok(data),
+                        CacheableResource::NotModified => Err(
+                            "Cloud credentials returned no headers without an entity tag"
+                                .to_string(),
+                        ),
+                    });
                 headers.and_then(|headers| {
                     let url = requester_pays_media_url(&bucket, &object, project)?;
                     let end = start + length as u64 - 1;
