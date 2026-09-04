@@ -17,6 +17,7 @@ use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use memmap2::{Mmap, MmapOptions};
 use num_cpus;
 use rayon::prelude::*;
+use std::env;
 use std::fs::{self, File};
 use std::io::{BufWriter, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -39,6 +40,19 @@ const SPOOL_BUFFER_SIZE: usize = 8 * 1024 * 1024;
 const DEFAULT_RAM_FRACTION_NUMERATOR: u64 = 7;
 const DEFAULT_RAM_FRACTION_DENOMINATOR: u64 = 10;
 const FALLBACK_MAX_RAM_BYTES: usize = 8 * 1024 * 1024 * 1024;
+/// Explicit memory budget for THIS process, in bytes.
+///
+/// Without it every gnomon process independently claims a fraction of the memory it
+/// observes free, which is correct for one process on a machine and badly wrong for
+/// several: N concurrent workers each size themselves to the whole box and together
+/// commit N times what exists. Staggered starts make it worse rather than better,
+/// since each new worker measures the memory the earlier ones have not yet touched.
+///
+/// A caller running workers in parallel knows the split and nothing else does, so it
+/// sets this to its per-worker share. The budget is not merely advisory: exceeding it
+/// selects the bounded-accumulator plan instead of the fast in-RAM one, so an honest
+/// budget makes a large chromosome run SLOWER rather than die.
+const MAX_RAM_ENV: &str = "GNOMON_MAX_RAM_BYTES";
 const MAX_IO_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 
 struct SpoolState {
@@ -180,6 +194,15 @@ impl Default for MemoryBudget {
 }
 
 fn default_max_ram_bytes() -> usize {
+    // An explicit budget wins outright: the caller partitioned the machine and this
+    // process cannot see that partition by inspecting the system.
+    if let Some(explicit) = env::var(MAX_RAM_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|bytes| *bytes > 0)
+    {
+        return usize::try_from(explicit).unwrap_or(usize::MAX);
+    }
     let mut system = System::new_all();
     system.refresh_memory();
     let available = system.available_memory();
@@ -2191,3 +2214,4 @@ fn bounded_dense_batch_size(context: &PipelineContext) -> usize {
     let dense_budget = (context.memory_budget.max_ram_bytes() / 16).max(row_bytes);
     (dense_budget / row_bytes).clamp(1, DENSE_BATCH_SIZE)
 }
+
