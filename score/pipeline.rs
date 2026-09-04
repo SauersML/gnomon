@@ -17,7 +17,6 @@ use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use memmap2::{Mmap, MmapOptions};
 use num_cpus;
 use rayon::prelude::*;
-use std::env;
 use std::fs::{self, File};
 use std::io::{BufWriter, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -40,19 +39,6 @@ const SPOOL_BUFFER_SIZE: usize = 8 * 1024 * 1024;
 const DEFAULT_RAM_FRACTION_NUMERATOR: u64 = 7;
 const DEFAULT_RAM_FRACTION_DENOMINATOR: u64 = 10;
 const FALLBACK_MAX_RAM_BYTES: usize = 8 * 1024 * 1024 * 1024;
-/// Explicit memory budget for THIS process, in bytes.
-///
-/// Without it every gnomon process independently claims a fraction of the memory it
-/// observes free, which is correct for one process on a machine and badly wrong for
-/// several: N concurrent workers each size themselves to the whole box and together
-/// commit N times what exists. Staggered starts make it worse rather than better,
-/// since each new worker measures the memory the earlier ones have not yet touched.
-///
-/// A caller running workers in parallel knows the split and nothing else does, so it
-/// sets this to its per-worker share. The budget is not merely advisory: exceeding it
-/// selects the bounded-accumulator plan instead of the fast in-RAM one, so an honest
-/// budget makes a large chromosome run SLOWER rather than die.
-const MAX_RAM_ENV: &str = "GNOMON_MAX_RAM_BYTES";
 const MAX_IO_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 
 struct SpoolState {
@@ -193,23 +179,58 @@ impl Default for MemoryBudget {
     }
 }
 
+/// How many gnomon processes are sharing this machine right now, including this one.
+///
+/// Sizing a budget from free memory alone is a claim about the future -- that nothing
+/// else will allocate -- and that claim is false whenever a caller scores several
+/// chromosomes at once. Each sibling observes the same free memory, each takes its
+/// fraction of the whole, and together they commit a multiple of what exists.
+///
+/// The contention is observable, so observe it rather than requiring the caller to
+/// describe it. Matching is on the executable name, so every gnomon on the box counts
+/// regardless of who launched it.
+fn concurrent_gnomon_processes(system: &System) -> u64 {
+    let count = system
+        .processes()
+        .values()
+        // sysinfo 0.30 reports the executable name as `&str`.
+        .filter(|process| process.name().starts_with("gnomon"))
+        .count();
+    // At least one: this process is a gnomon even if the process table cannot be read.
+    u64::try_from(count).unwrap_or(1).max(1)
+}
+
 fn default_max_ram_bytes() -> usize {
-    // An explicit budget wins outright: the caller partitioned the machine and this
-    // process cannot see that partition by inspecting the system.
-    if let Some(explicit) = env::var(MAX_RAM_ENV)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
-        .filter(|bytes| *bytes > 0)
-    {
-        return usize::try_from(explicit).unwrap_or(usize::MAX);
-    }
     let mut system = System::new_all();
     system.refresh_memory();
     let available = system.available_memory();
-    let candidate = if available > 0 {
-        available.saturating_mul(DEFAULT_RAM_FRACTION_NUMERATOR) / DEFAULT_RAM_FRACTION_DENOMINATOR
-    } else {
-        FALLBACK_MAX_RAM_BYTES as u64
+    let siblings = concurrent_gnomon_processes(&system);
+
+    // TWO BOUNDS, AND THE SMALLER WINS.
+    //
+    // The first is the historical one: a fraction of what is free right now. Alone on a
+    // machine that is the whole story.
+    //
+    // The second is this process's fair share of the machine as a whole. It exists
+    // because the first is unstable exactly when it matters: siblings starting together
+    // each see memory the others have not yet touched, so a free-memory reading taken at
+    // startup licenses far more than the machine can honour once everyone is resident.
+    // A share of TOTAL memory does not move as siblings warm up, so it holds the
+    // aggregate at one machine's worth however the starts are staggered.
+    //
+    // Exceeding the budget is not fatal -- it selects the bounded-accumulator plan over
+    // the fast in-RAM one -- so an honest budget costs time on a wide chromosome rather
+    // than the chromosome.
+    let by_free = available.saturating_mul(DEFAULT_RAM_FRACTION_NUMERATOR)
+        / DEFAULT_RAM_FRACTION_DENOMINATOR;
+    let by_fair_share = system
+        .total_memory()
+        .saturating_mul(DEFAULT_RAM_FRACTION_NUMERATOR)
+        / DEFAULT_RAM_FRACTION_DENOMINATOR
+        / siblings;
+    let candidate = match by_free.min(by_fair_share) {
+        0 => FALLBACK_MAX_RAM_BYTES as u64,
+        bounded => bounded,
     };
     usize::try_from(candidate).unwrap_or(usize::MAX).max(1)
 }
