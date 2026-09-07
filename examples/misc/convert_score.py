@@ -25,8 +25,11 @@ import shutil
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from tempfile import NamedTemporaryFile, TemporaryDirectory
+from typing import BinaryIO, Iterator
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
@@ -41,6 +44,7 @@ SAMPLE_GENOMES = (
         "https://raw.githubusercontent.com/SauersML/reagle/refs/heads/main/data/kat_suricata/23andme_genome_kat_suricata_v5_full_20171221130201.txt",
         "kat_suricata_23andme_v5",
         "23andme_genome_kat_suricata_v5_full_20171221130201.txt",
+        "GRCh37",  # The source file explicitly declares reference assembly build 37.
     ),
 )
 
@@ -145,17 +149,34 @@ def run_command(
     return result
 
 
+@contextmanager
+def atomic_output(destination: Path) -> Iterator[BinaryIO]:
+    """Publish a cache entry only after its writer has completed successfully."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with NamedTemporaryFile(dir=destination.parent, prefix=f".{destination.name}.", delete=False) as handle:
+        partial = Path(handle.name)
+        try:
+            yield handle
+            handle.close()
+            partial.replace(destination)
+        finally:
+            handle.close()
+            partial.unlink(missing_ok=True)
+
+
 def stream_download(url: str, destination: Path) -> None:
     if destination.exists():
         debug(f"Using cached {destination.name}")
         return
 
-    destination.parent.mkdir(parents=True, exist_ok=True)
     debug(f"Downloading {url}")
     try:
-        with urlopen(url) as response, open(destination, "wb") as handle:
+        with urlopen(url, timeout=30) as response, atomic_output(destination) as handle:
             shutil.copyfileobj(response, handle)
-    except (HTTPError, URLError) as exc:
+            expected = response.headers.get("Content-Length")
+            if expected is not None and handle.tell() != int(expected):
+                raise RuntimeError(f"Incomplete download from {url}: expected {expected} bytes, received {handle.tell()}")
+    except (HTTPError, URLError, OSError) as exc:
         raise RuntimeError(f"Download failed: {exc}") from exc
 
 
@@ -190,9 +211,11 @@ def download_pgs_score(pgs_id: str, cache_dir: Path, assembly: str) -> Path:
         ) from exc
 
     debug(f"Decompressing {gz_path.name}")
-    with gzip.open(gz_path, "rb") as src, open(target, "wb") as dst:
-        shutil.copyfileobj(src, dst)
-    gz_path.unlink(missing_ok=True)
+    try:
+        with gzip.open(gz_path, "rb") as src, atomic_output(target) as dst:
+            shutil.copyfileobj(src, dst)
+    finally:
+        gz_path.unlink(missing_ok=True)
     return target
 
 
@@ -202,10 +225,12 @@ def convert_genome_to_vcf(
     sample_id: str,
     reference: Path | None,
     output_dir: Path,
+    assembly: str,
+    input_build: str,
 ) -> Path:
     start = time.monotonic()
     output_dir.mkdir(parents=True, exist_ok=True)
-    vcf_path = output_dir / f"{sample_id}.vcf"
+    vcf_path = output_dir / f"{sample_id}.{input_build}-to-{assembly}.vcf"
 
     if vcf_path.exists():
         debug(f"Using cached {vcf_path.name}")
@@ -217,20 +242,29 @@ def convert_genome_to_vcf(
         str(vcf_path),
         "--format",
         "vcf",
+        "--output-build",
+        assembly,
+        "--input-build",
+        input_build,
     ]
     if reference is not None:
         cmd.extend(["--reference", str(reference)])
 
     debug(f"Starting conversion for {sample_id} ({genome_path.name})")
-    run_command(
-        cmd,
-        live=True,
-        heartbeat_seconds=30,
-        heartbeat_label=f"convert_genome:{sample_id}",
-    )
-
-    if not vcf_path.exists():
-        raise RuntimeError(f"convert_genome did not produce output: {vcf_path}")
+    # Converter failures may leave a partial VCF and sidecars. Publish only the
+    # completed VCF; temporary outputs live on the same filesystem as the cache.
+    with TemporaryDirectory(dir=output_dir, prefix=f".{sample_id}.") as staging:
+        staged_vcf = Path(staging) / vcf_path.name
+        cmd[2] = str(staged_vcf)
+        run_command(
+            cmd,
+            live=True,
+            heartbeat_seconds=30,
+            heartbeat_label=f"convert_genome:{sample_id}",
+        )
+        if not staged_vcf.is_file() or staged_vcf.stat().st_size == 0:
+            raise RuntimeError(f"convert_genome did not produce output: {staged_vcf}")
+        staged_vcf.replace(vcf_path)
     debug(f"Finished conversion for {sample_id} in {_format_seconds(time.monotonic() - start)}")
     return vcf_path
 
@@ -324,17 +358,17 @@ def main() -> None:
     genome_cache = output_dir / "genomes"
     genome_cache.mkdir(parents=True, exist_ok=True)
 
-    genomes: list[tuple[Path, str]] = []
-    for url, sample_id, filename in SAMPLE_GENOMES:
+    genomes: list[tuple[Path, str, str]] = []
+    for url, sample_id, filename, input_build in SAMPLE_GENOMES:
         genome_path = genome_cache / filename
         stream_download(url, genome_path)
-        genomes.append((genome_path, sample_id))
+        genomes.append((genome_path, sample_id, input_build))
 
     all_results: dict[str, dict[str, ScoreResult]] = {}
 
     total_samples = len(genomes)
     total_scores = len(PGS_IDS)
-    for sample_index, (genome_path, sample_id) in enumerate(genomes, start=1):
+    for sample_index, (genome_path, sample_id, input_build) in enumerate(genomes, start=1):
         sample_start = time.monotonic()
         debug(f"[sample {sample_index}/{total_samples}] Processing {sample_id} ({genome_path.name})")
         vcf_path = convert_genome_to_vcf(
@@ -343,6 +377,8 @@ def main() -> None:
             sample_id,
             args.reference,
             converted_dir,
+            args.assembly,
+            input_build,
         )
 
         sample_scores: dict[str, ScoreResult] = {}

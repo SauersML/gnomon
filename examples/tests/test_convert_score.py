@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import gzip
+import io
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -81,8 +83,9 @@ def test_download_pgs_score_does_not_mix_cached_assemblies(
     assert other_assembly.exists()
 
 
-def test_convert_genome_to_vcf_uses_current_convert_genome_cli(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("assembly", ["GRCh37", "GRCh38"])
+def test_convert_genome_to_vcf_preserves_requested_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, assembly: str
 ) -> None:
     genome_path = tmp_path / "genome.txt"
     genome_path.write_text("genome", encoding="utf-8")
@@ -104,6 +107,8 @@ def test_convert_genome_to_vcf_uses_current_convert_genome_cli(
         "Sample",
         reference,
         output_dir,
+        assembly,
+        "GRCh37",
     )
 
     assert vcf_path.exists()
@@ -111,6 +116,58 @@ def test_convert_genome_to_vcf_uses_current_convert_genome_cli(
     assert "--format" in recorded[0]
     assert "vcf" in recorded[0]
     assert "--assembly" not in recorded[0]
+    assert recorded[0][recorded[0].index("--output-build") + 1] == assembly
+    assert recorded[0][recorded[0].index("--input-build") + 1] == "GRCh37"
+
+
+def test_failed_conversion_does_not_publish_partial_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def failed_conversion(argv, **kwargs):
+        Path(argv[2]).write_text("partial", encoding="utf-8")
+        raise RuntimeError("conversion failed")
+
+    monkeypatch.setattr(convert_score, "run_command", failed_conversion)
+    output_dir = tmp_path / "output"
+    with pytest.raises(RuntimeError, match="conversion failed"):
+        convert_score.convert_genome_to_vcf(
+            Path("converter"), tmp_path / "input.txt", "Sample", None, output_dir, "GRCh38", "GRCh37"
+        )
+    assert list(output_dir.iterdir()) == []
+
+
+def test_failed_download_does_not_publish_partial_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    class BrokenResponse(io.BytesIO):
+        headers = {}
+
+        def read(self, size=-1):
+            if self.tell():
+                raise OSError("connection lost")
+            return super().read(3)
+
+    monkeypatch.setattr(convert_score, "urlopen", lambda *args, **kwargs: BrokenResponse(b"payload"))
+    destination = tmp_path / "genome.txt"
+    with pytest.raises(RuntimeError, match="connection lost"):
+        convert_score.stream_download("https://example.test/genome", destination)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_truncated_response_does_not_publish_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    class TruncatedResponse(io.BytesIO):
+        headers = {"Content-Length": "100"}
+
+    monkeypatch.setattr(convert_score, "urlopen", lambda *args, **kwargs: TruncatedResponse(b"short"))
+    with pytest.raises(RuntimeError, match="Incomplete download"):
+        convert_score.stream_download("https://example.test/genome", tmp_path / "genome.txt")
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_corrupt_gzip_does_not_poison_decompressed_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def truncated_download(url: str, destination: Path) -> None:
+        destination.write_bytes(gzip.compress(b"hm_chr\thm_pos\n" * 1000)[:-8])
+
+    monkeypatch.setattr(convert_score, "stream_download", truncated_download)
+    with pytest.raises(EOFError):
+        convert_score.download_pgs_score("PGS000005", tmp_path, "GRCh37")
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_parser_exposes_assembly_flag() -> None:
@@ -120,3 +177,18 @@ def test_parser_exposes_assembly_flag() -> None:
 
     custom_args = parser.parse_args(["--assembly", "GRCh38"])
     assert custom_args.assembly == "GRCh38"
+
+
+@pytest.mark.parametrize("binary", ["/bin/true", "/bin/false"])
+def test_parity_harness_rejects_missing_output_and_command_failure(tmp_path: Path, binary: str) -> None:
+    fixture = tmp_path / "fixture.vcf"
+    fixture.write_text("##fileformat=VCFv4.2\n", encoding="utf-8")
+    score = tmp_path / "score.tsv"
+    score.write_text("fixture", encoding="utf-8")
+    result = subprocess.run(
+        ["bash", str(convert_score.REPO_ROOT / "tests/gnomon_all_parity.sh"), binary,
+         str(fixture), str(score), "required-model", str(tmp_path / "results"), "37"],
+        capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode != 0
+    assert "PASS" not in result.stdout

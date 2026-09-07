@@ -2,11 +2,10 @@
 # See: https://nexte.st/book/configuration.html
 
 [profile.default]
-# Fail any test that takes longer than 3 hours
-slow-timeout = { period = "3h", terminate-after = 1 }
+# The full release shards finish in under a minute. Report stalled tests early
+# and leave two minutes for slower hosts without permitting hour-long hangs.
+slow-timeout = { period = "30s", terminate-after = 4 }
 
 [profile.ci]
 # For CI: continue running all tests even if some fail
 fail-fast = false
-# Stricter timeout: kill tests after 1 hour
-slow-timeout = { period = "1h", terminate-after = 1 }

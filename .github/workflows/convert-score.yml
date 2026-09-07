@@ -7,6 +7,7 @@ on:
     paths:
       - 'examples/misc/convert_score.py'
       - 'examples/tests/test_convert_score.py'
+      - 'tests/gnomon_all_parity.sh'
       - 'score/**'
       - '.github/workflows/convert-score.yml'
   pull_request:
@@ -15,6 +16,7 @@ on:
     paths:
       - 'examples/misc/convert_score.py'
       - 'examples/tests/test_convert_score.py'
+      - 'tests/gnomon_all_parity.sh'
       - 'score/**'
       - '.github/workflows/convert-score.yml'
 
@@ -29,11 +31,21 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+
+      - name: Run example and harness regression tests
+        run: |
+          python -m pip install pytest
+          python -m pytest -q examples/tests
+
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
 
       - name: Build local gnomon
-        run: cargo +nightly build --release
+        run: cargo +nightly build --release --bin gnomon
 
       - name: Install convert_genome
         run: curl -fsSL https://raw.githubusercontent.com/SauersML/convert_genome/main/install.sh | bash

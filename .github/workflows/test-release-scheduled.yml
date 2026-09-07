@@ -5,10 +5,18 @@ on:
     - cron: '0 */2 * * *'
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  RUSTFLAGS: '-C target-cpu=x86-64'
+  CARGO_BUILD_JOBS: 3
+  CARGO_PROFILE_RELEASE_LTO: thin
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 16
 
 jobs:
   gate:
@@ -42,18 +50,6 @@ jobs:
     needs: gate
     if: ${{ github.event_name != 'schedule' || needs.gate.outputs.run == 'true' }}
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - suite: core
-            filter_expr: "not test(calibrate::) and not test(map::) and not test(score::)"
-          - suite: score
-            filter_expr: "test(score::)"
-          - suite: calibrate
-            filter_expr: "test(calib)"
-          - suite: map
-            filter_expr: "test(map::)"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -80,15 +76,17 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-registry-
 
-      - name: Restore Cargo build cache (CI speed only)
+      - name: Restore builds produced by Rust Test CI
         uses: actions/cache/restore@v4
         with:
-          path: target
-          key: ${{ runner.os }}-cargo-build-nightly-${{ github.ref_name }}-W${{ steps.cache_meta.outputs.week }}-${{ github.run_id }}
+          path: |
+            target/release
+            target/nextest
+          key: ${{ runner.os }}-cargo-release-portable-${{ steps.cache_meta.outputs.deps_hash }}-W${{ steps.cache_meta.outputs.week }}-${{ github.sha }}
           restore-keys: |
-            ${{ runner.os }}-cargo-build-nightly-${{ github.ref_name }}-W${{ steps.cache_meta.outputs.week }}-
-            ${{ runner.os }}-cargo-build-nightly-${{ github.ref_name }}-
-            ${{ runner.os }}-cargo-build-nightly-
+            ${{ runner.os }}-cargo-release-portable-${{ steps.cache_meta.outputs.deps_hash }}-W${{ steps.cache_meta.outputs.week }}-
+            ${{ runner.os }}-cargo-release-portable-${{ steps.cache_meta.outputs.deps_hash }}-
+            ${{ runner.os }}-cargo-release-portable-
 
       - name: Cargo fetch (prepopulate deps cache)
         run: cargo +nightly fetch
@@ -97,9 +95,10 @@ jobs:
         run: |
           curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
-      - name: Run nextest (release, no timeout)
+      # Nextest already schedules tests concurrently. A matrix here would build
+      # the identical crate graph four times before applying runtime filters.
+      - name: Run all release tests
         shell: bash
         run: |
           set -euo pipefail
-          cargo +nightly nextest run --profile ci --release \
-            --filter-expr "${{ matrix.filter_expr }}"
+          cargo +nightly nextest run --profile ci --release
