@@ -182,28 +182,6 @@ jobs:
         run: |
           curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
-      - name: Build and archive debug tests
-        if: needs.detect_changes.outputs.rust == 'true'
-        run: |
-          cargo +nightly nextest archive --profile ci --archive-file rust-tests-debug.tar.zst
-
-      - name: Upload debug test build artifacts for full test runs
-        if: needs.detect_changes.outputs.rust == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: rust-test-build-debug
-          path: rust-tests-debug.tar.zst
-          compression-level: 0
-          retention-days: 1
-          if-no-files-found: error
-
-      - name: Free debug build tree before release builds
-        if: needs.detect_changes.outputs.rust == 'true'
-        shell: bash
-        run: |
-          rm -rf target/debug
-          df -h .
-
       - name: Build and archive release tests
         if: needs.detect_changes.outputs.rust == 'true'
         run: |
@@ -356,35 +334,6 @@ jobs:
             --workspace-remap "$GITHUB_WORKSPACE" --extract-to "$GITHUB_WORKSPACE" \
             --filter-expr "${{ matrix.filter_expr }}" \
             2>&1 | tee cargo-test.log
-
-  rust_tests_full_debug:
-    needs: build_and_test
-    runs-on: ubuntu-latest
-    if: needs.build_and_test.outputs.rust_changes == 'true'
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Install Rust nightly
-        uses: dtolnay/rust-toolchain@nightly
-
-      - name: Download debug test build artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: rust-test-build-debug
-          path: .
-
-      - name: Install cargo-nextest
-        run: |
-          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
-
-      - name: Run full nextest (debug)
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo +nightly nextest run --profile ci \
-            --archive-file rust-tests-debug.tar.zst \
-            --workspace-remap "$GITHUB_WORKSPACE" --extract-to "$GITHUB_WORKSPACE"
 
   python_test_integration:
     needs: build_and_test
