@@ -73,7 +73,7 @@ jobs:
         
       - name: Cache Lean toolchain
         id: elan-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ~/.elan
           key: ${{ runner.os }}-elan-${{ hashFiles('lean-toolchain') }}
@@ -84,10 +84,11 @@ jobs:
 
       - name: Add elan to PATH
         run: echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
           
       - name: Cache Lake dependencies
         id: lake-deps-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: .lake/packages
           key: ${{ runner.os }}-lake-deps-v1-${{ hashFiles('lean-toolchain', 'lake-manifest.json') }}
@@ -95,7 +96,8 @@ jobs:
             ${{ runner.os }}-lake-deps-v1-
 
       - name: Cache compiled project
-        uses: actions/cache@v4
+        id: project-cache
+        uses: actions/cache/restore@v4
         with:
           path: .lake/build
           key: ${{ runner.os }}-gnomon-v1-${{ hashFiles('lean-toolchain', 'lake-manifest.json', 'lakefile.lean', 'proofs/**/*.lean') }}
@@ -105,6 +107,20 @@ jobs:
       - name: Fetch precompiled dependencies
         if: steps.lake-deps-cache.outputs.cache-hit != 'true'
         run: lake exe cache get
+
+      - name: Save installed Lean toolchain
+        if: steps.elan-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.elan
+          key: ${{ steps.elan-cache.outputs.cache-primary-key }}
+
+      - name: Save precompiled dependencies
+        if: steps.lake-deps-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .lake/packages
+          key: ${{ steps.lake-deps-cache.outputs.cache-primary-key }}
 
       # Compile first so syntax/elaboration/axiom failures are never hidden by
       # an independent provenance or validation-ratchet failure below.  Every
@@ -116,6 +132,15 @@ jobs:
       # on an unknown module.
       - name: Build project
         run: lake build Calibrator ValidationShared
+
+      # Cache successful compilation before the independent validation gates:
+      # a source-policy failure must not force the next run to rebuild Lean.
+      - name: Save compiled project
+        if: steps.project-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .lake/build
+          key: ${{ steps.project-cache.outputs.cache-primary-key }}
 
       # CODE VALIDATION, in two steps because there are exactly two instruments.
       #
