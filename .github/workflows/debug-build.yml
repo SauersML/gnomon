@@ -7,7 +7,6 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
-  RELEASE_FIT_DOWNSAMPLE: ${{ github.event.inputs.downsample_factor || '1' }}
 
 jobs:
   build-release:

@@ -260,7 +260,6 @@ jobs:
           path: artifacts
           pattern: release-*
           merge-multiple: true
-          if-no-artifact-found: ignore
 
       - name: Display structure of downloaded files
         run: ls -R artifacts
@@ -270,10 +269,9 @@ jobs:
         run: echo "release_tag=main-${{ github.sha }}" >> $GITHUB_OUTPUT
 
       - name: Create Release
-        if: ${{ hashFiles('artifacts/*') != '' }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.release_tag }}
           name: Release ${{ steps.tag.outputs.release_tag }}
           files: artifacts/**/*
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true

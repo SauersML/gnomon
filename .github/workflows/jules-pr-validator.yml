@@ -18,8 +18,6 @@ jobs:
       - name: Check if PR is from Jules Loop
         id: check-jules
         uses: actions/github-script@v7
-        env:
-          FAILURE_REASON: ${{ steps.validate-files.outputs.failure_reason }}
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
@@ -58,8 +56,10 @@ jobs:
 
       - name: Fetch base branch
         if: steps.check-jules.outputs.is_jules_pr == 'true'
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
-          git fetch origin ${{ github.event.pull_request.base.ref }}
+          git fetch origin "$BASE_REF"
 
       - name: Validate file changes
         if: steps.check-jules.outputs.is_jules_pr == 'true'
@@ -71,7 +71,9 @@ jobs:
           HEAD_SHA="${{ github.event.pull_request.head.sha }}"
 
           # Get list of changed files with their status
-          CHANGED_FILES=$(git diff --name-status $BASE_SHA...$HEAD_SHA)
+          # Renames must count as deletion plus addition under the no-file-
+          # creation/deletion policy; otherwise R-status changes evade every check.
+          CHANGED_FILES=$(git diff --no-renames --name-status "$BASE_SHA...$HEAD_SHA")
 
           echo "Changed files:"
           echo "$CHANGED_FILES"
@@ -248,11 +250,11 @@ jobs:
         if: steps.check-jules.outputs.is_jules_pr == 'true' && steps.validate-files.outputs.validation_passed == 'true' && steps.lean-build.outputs.build_passed == 'false'
         uses: actions/github-script@v7
         env:
-          FAILURE_REASON: ${{ steps.validate-files.outputs.failure_reason }}
+          ERROR_SUMMARY: ${{ steps.lean-build.outputs.error_summary }}
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const errorSummary = `${{ steps.lean-build.outputs.error_summary }}`;
+            const errorSummary = process.env.ERROR_SUMMARY;
 
             await github.rest.issues.createComment({
               owner: context.repo.owner,
@@ -273,8 +275,6 @@ jobs:
       - name: Check auto-merge eligibility and merge
         if: steps.check-jules.outputs.is_jules_pr == 'true' && steps.validate-files.outputs.validation_passed == 'true' && steps.lean-build.outputs.build_passed == 'true'
         uses: actions/github-script@v7
-        env:
-          FAILURE_REASON: ${{ steps.validate-files.outputs.failure_reason }}
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
