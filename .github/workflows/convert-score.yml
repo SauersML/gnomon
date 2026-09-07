@@ -24,6 +24,15 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'push' }}
 
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  # Share Rust Test CI's portable build artifacts and memory-bounded profile.
+  RUSTFLAGS: '-C target-cpu=x86-64'
+  CARGO_BUILD_JOBS: 3
+  CARGO_PROFILE_RELEASE_LTO: thin
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 16
+
 jobs:
   run-example:
     runs-on: ubuntu-latest
@@ -43,6 +52,41 @@ jobs:
 
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
+
+      - name: Prepare shared cache metadata
+        id: cache_meta
+        shell: bash
+        run: |
+          echo "week=$(date -u +%G%V)" >> "$GITHUB_OUTPUT"
+          DEPS_HASH=$(find . -name "Cargo.toml" -o -name "Cargo.lock" | sort | xargs cat | sha256sum | cut -d' ' -f1)
+          echo "deps_hash=$DEPS_HASH" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Cargo downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-registry-${{ steps.cache_meta.outputs.deps_hash }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      # The test workflow owns cache writes so a binary-only build cannot win
+      # a race and replace the complete test cache with a partial build graph.
+      - name: Restore Rust Test CI release build
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            target/release
+            target/nextest
+          key: ${{ runner.os }}-cargo-release-portable-${{ steps.cache_meta.outputs.deps_hash }}-W${{ steps.cache_meta.outputs.week }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-portable-${{ steps.cache_meta.outputs.deps_hash }}-W${{ steps.cache_meta.outputs.week }}-
+            ${{ runner.os }}-cargo-release-portable-${{ steps.cache_meta.outputs.deps_hash }}-
+            ${{ runner.os }}-cargo-release-portable-
+            ${{ runner.os }}-cargo-release-${{ steps.cache_meta.outputs.deps_hash }}-
+            ${{ runner.os }}-cargo-release-
 
       - name: Build local gnomon
         run: cargo +nightly build --release --bin gnomon

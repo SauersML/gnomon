@@ -84,42 +84,8 @@ env:
   CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 16
 
 jobs:
-  detect_changes:
-    runs-on: ubuntu-latest
-    outputs:
-      rust: ${{ github.event_name == 'workflow_dispatch' || steps.rust_changes.outputs.rust == 'true' }}
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Detect Rust source changes
-        id: rust_changes
-        uses: dorny/paths-filter@v4
-        with:
-          filters: |
-            rust:
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - '**/*.rs'
-              - 'rust-toolchain.toml'
-              - '.cargo/**'
-              - '.config/nextest.toml'
-              - '.github/workflows/test.yml'
-              - 'data/testdata/**'
-              - 'cli/**'
-              - 'terms/**'
-              - 'tests/**'
-              - 'shared/**'
-              - 'score/**'
-              - 'map/**'
-              - 'calibrate/**'
-
   build_and_test:
-    needs: detect_changes
     runs-on: ubuntu-latest
-    outputs:
-      rust_changes: ${{ needs.detect_changes.outputs.rust }}
-      artifact_available: ${{ steps.artifact_status.outputs.available }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -136,7 +102,6 @@ jobs:
           echo "deps_hash=$DEPS_HASH" >> "$GITHUB_OUTPUT"
 
       - name: Cache Cargo registry (CI speed only)
-        if: needs.detect_changes.outputs.rust == 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -148,7 +113,6 @@ jobs:
             ${{ runner.os }}-cargo-registry-
 
       - name: Cache release builds
-        if: needs.detect_changes.outputs.rust == 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -163,7 +127,6 @@ jobs:
             ${{ runner.os }}-cargo-release-
 
       - name: Cache profiling builds
-        if: needs.detect_changes.outputs.rust == 'true'
         uses: actions/cache@v4
         with:
           path: target/profiling
@@ -174,21 +137,17 @@ jobs:
 
       # -------------------- PREWARM EVERYTHING (so artifacts are complete) --------------------
       - name: Cargo fetch (prepopulate deps cache)
-        if: needs.detect_changes.outputs.rust == 'true'
         run: cargo +nightly fetch
 
       - name: Install cargo-nextest
-        if: needs.detect_changes.outputs.rust == 'true'
         run: |
           curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Build and archive release tests
-        if: needs.detect_changes.outputs.rust == 'true'
         run: |
           cargo +nightly nextest archive --profile ci --release --archive-file rust-tests-release.tar.zst
 
       - name: Build Gnomon binaries (Release and Profiling)
-        if: needs.detect_changes.outputs.rust == 'true'
         run: |
           cargo +nightly build --release --bin gnomon
           cargo +nightly build --profile profiling --bin gnomon
@@ -236,24 +195,13 @@ jobs:
           path: export/build-meta.txt
           retention-days: 30
 
-      - name: Prepare trimmed build artifact (always)
-        if: always()
+      - name: Prepare executable artifacts
         shell: bash
         run: |
           rm -rf build-output
-          mkdir -p build-output
-          if [[ -f target/release/gnomon ]]; then
-            mkdir -p build-output/target/release
-            cp target/release/gnomon build-output/target/release/
-          fi
-          if [[ -f target/profiling/gnomon ]]; then
-            mkdir -p build-output/target/profiling
-            cp target/profiling/gnomon build-output/target/profiling/
-          fi
-          if [[ -f report.md ]]; then
-            cp report.md build-output/
-          fi
-          rm -rf target/debug target/.fingerprint target/incremental
+          mkdir -p build-output/target/release build-output/target/profiling
+          cp target/release/gnomon build-output/target/release/
+          cp target/profiling/gnomon build-output/target/profiling/
 
       - name: Cleanup workspace leftovers (always)
         if: always()
@@ -268,10 +216,9 @@ jobs:
           name: build-output
           path: build-output
           retention-days: 1
-          if-no-files-found: ignore
+          if-no-files-found: error
 
       - name: Upload test build artifacts for parallel runs
-        if: needs.detect_changes.outputs.rust == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: rust-test-build
@@ -280,21 +227,9 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
-      - name: Determine artifact availability (always)
-        id: artifact_status
-        if: always()
-        shell: bash
-        run: |
-          if [[ -f build-output/target/release/gnomon ]]; then
-            echo "available=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "available=false" >> "$GITHUB_OUTPUT"
-          fi
-
   rust_tests:
     needs: build_and_test
     runs-on: ubuntu-latest
-    if: needs.build_and_test.outputs.rust_changes == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -337,7 +272,6 @@ jobs:
 
   python_test_integration:
     needs: build_and_test
-    if: needs.build_and_test.outputs.artifact_available == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -345,24 +279,9 @@ jobs:
         with:
           name: build-output
           path: .
-      - name: Restore expected artifact layout
-        run: |
-          if [ -d build-output/target ]; then
-            rm -rf target
-            mkdir -p target
-            rsync -a build-output/target/ target/
-          elif [ -d target ]; then
-            echo "Target directory already present after artifact download; leaving as-is."
-          elif [ -d build-output ]; then
-            echo "::error::Downloaded build-output artifact does not contain a target directory."
-            find build-output -maxdepth 3 -print
-            exit 1
-          else
-            echo "::error::No build-output artifact was downloaded."
-            exit 1
-          fi
-          if [ -f build-output/report.md ]; then mv build-output/report.md report.md; fi
-          rm -rf build-output
+      - name: Verify build artifact
+        run: test -s target/release/gnomon
+
       - uses: actions/setup-python@v7
         with: { python-version: '3.13' }
       - uses: actions/cache@v4
@@ -377,74 +296,27 @@ jobs:
 
   python_test_simulation:
     needs: build_and_test
-    if: needs.build_and_test.outputs.artifact_available == 'true' || needs.build_and_test.outputs.rust_changes == 'false'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Report absence of Rust source changes
-        if: needs.build_and_test.outputs.artifact_available != 'true'
-        env:
-          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
-        run: |
-          set -eo pipefail
-          echo "No Rust source changes detected in this run; skipping python_test_simulation."
-          echo "Rust-sensitive files that remained unchanged:"
-          printf '  - Cargo.toml\n  - Cargo.lock\n  - all *.rs files\n'
-          if [ -n "${BASE_SHA:-}" ]; then
-            git fetch --no-tags --depth=1 origin "$BASE_SHA" >/dev/null 2>&1 || true
-            echo "Changed files in this run:"
-            CHANGED=$(git diff --name-only "${BASE_SHA}" "$GITHUB_SHA" || true)
-            if [ -n "$CHANGED" ]; then
-              printf '%s\n' "$CHANGED" | sed 's/^/  - /'
-            else
-              echo "  (no files changed)"
-            fi
-          else
-            echo "Changed files in this run: (base commit unavailable)"
-          fi
-          exit 0
       - uses: actions/download-artifact@v4
-        if: needs.build_and_test.outputs.artifact_available == 'true'
         with:
           name: build-output
           path: .
-      - name: Restore expected artifact layout
-        if: needs.build_and_test.outputs.artifact_available == 'true'
-        run: |
-          if [ -d build-output/target ]; then
-            rm -rf target
-            mkdir -p target
-            rsync -a build-output/target/ target/
-          elif [ -d target ]; then
-            echo "Target directory already present after artifact download; leaving as-is."
-          elif [ -d build-output ]; then
-            echo "::error::Downloaded build-output artifact does not contain a target directory."
-            find build-output -maxdepth 3 -print
-            exit 1
-          else
-            echo "::error::No build-output was downloaded."
-            exit 1
-          fi
-          if [ -f build-output/report.md ]; then mv build-output/report.md report.md; fi
-          rm -rf build-output
+      - name: Verify build artifact
+        run: test -s target/release/gnomon
+
       - uses: actions/setup-python@v7
-        if: needs.build_and_test.outputs.artifact_available == 'true'
         with: { python-version: '3.13' }
       - uses: actions/cache@v4
-        if: needs.build_and_test.outputs.artifact_available == 'true'
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-simulation-${{ hashFiles('score/tests/sim_test.py') }}
           restore-keys: |
             ${{ runner.os }}-pip-simulation-
       - run: pip install pandas numpy requests psutil tabulate polars pyarrow gmpy2
-        if: needs.build_and_test.outputs.artifact_available == 'true'
       - run: chmod +x target/release/gnomon
-        if: needs.build_and_test.outputs.artifact_available == 'true'
       - name: Install PLINK2
-        if: needs.build_and_test.outputs.artifact_available == 'true'
         run: |
           curl --fail --show-error --location \
             https://s3.amazonaws.com/plink2-assets/alpha7/plink2_linux_avx2_20260818.zip \
@@ -452,16 +324,14 @@ jobs:
           unzip plink2.zip plink2
           sudo mv plink2 /usr/local/bin/
       - id: sim_test
-        if: needs.build_and_test.outputs.artifact_available == 'true'
         run: python -u score/tests/sim_test.py
-      - if: needs.build_and_test.outputs.artifact_available == 'true' && failure()
+      - if: failure()
         run: |
           echo "The simulation test failed. Checking for OOM errors in kernel logs..."
           sudo dmesg | grep -i -E 'killed process|out of memory' || echo "No OOM messages found."
 
   python_test_benchmark:
     needs: build_and_test
-    if: needs.build_and_test.outputs.artifact_available == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -469,24 +339,9 @@ jobs:
         with:
           name: build-output
           path: .
-      - name: Restore expected artifact layout
-        run: |
-          if [ -d build-output/target ]; then
-            rm -rf target
-            mkdir -p target
-            rsync -a build-output/target/ target/
-          elif [ -d target ]; then
-            echo "Target directory already present after artifact download; leaving as-is."
-          elif [ -d build-output ]; then
-            echo "::error::Downloaded build-output artifact does not contain a target directory."
-            find build-output -maxdepth 3 -print
-            exit 1
-          else
-            echo "::error::No build-output artifact was downloaded."
-            exit 1
-          fi
-          if [ -f build-output/report.md ]; then mv build-output/report.md report.md; fi
-          rm -rf build-output
+      - name: Verify build artifact
+        run: test -s target/release/gnomon
+
       - uses: actions/setup-python@v7
         with: { python-version: '3.13' }
       - uses: actions/cache@v4
@@ -501,7 +356,6 @@ jobs:
 
   performance_reports:
     needs: build_and_test
-    if: needs.build_and_test.outputs.artifact_available == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -509,24 +363,8 @@ jobs:
         with:
           name: build-output
           path: .
-      - name: Restore expected artifact layout
-        run: |
-          if [ -d build-output/target ]; then
-            rm -rf target
-            mkdir -p target
-            rsync -a build-output/target/ target/
-          elif [ -d target ]; then
-            echo "Target directory already present after artifact download; leaving as-is."
-          elif [ -d build-output ]; then
-            echo "::error::Downloaded build-output artifact does not contain a target directory."
-            find build-output -maxdepth 3 -print
-            exit 1
-          else
-            echo "::error::No build-output artifact was downloaded."
-            exit 1
-          fi
-          if [ -f build-output/report.md ]; then mv build-output/report.md report.md; fi
-          rm -rf build-output
+      - name: Verify build artifact
+        run: test -s target/release/gnomon
 
       - name: Ensure profiling binary is available
         shell: bash
