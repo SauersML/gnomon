@@ -564,18 +564,18 @@
   },
   {
    "code": {
-    "body_sha256": "sha256:dbac474ac76a441b3c1b1dabfee9ef75a75ef8fb8c2853670dd40a547da14158",
-    "field": "the ridged information matrix",
+    "body_sha256": "sha256:b50fc94f62ac8583d246077e36f8c83e822474c18a3aeb5237fd15047f8ec11d",
+    "field": "the conditional positive scalar ridge added before the second factorization",
     "file": "map/project.rs",
     "guard_surface": [],
-    "symbol": "build_dense_lower_info_matrix"
+    "symbol": "factorize_with_directional_ridge"
    },
    "correspondence": "approximate",
    "lean": {
     "body_checksum": "sha256:afca8b1134caa53aed765458f5f180e2",
     "name": "Calibrator.ridgedInfoMatrix"
    },
-   "note": "The code adds WLS_RIDGE = 1e-5 to the diagonal of a Gram information matrix. The corpus states what that constant has to satisfy -- strictly positive -- and proves that it is what stops a rank-deficient design from producing a nonpositive Cholesky pivot. NOT a model of the projection solve: the missing-axis renormalization, the sparse/dense missingness split and the per-sample downdate are unformalized and deliberately unclaimed."
+   "note": "After the initial unregularized Cholesky fails, the code restores the information matrix and adds policy.ridge to every diagonal only when that scalar is strictly positive. This retry constructs A + ridge I, the matrix in the Lean definition. The corpus proves positive definiteness under the stated positive-semidefinite premise; it does not claim that floating-point factorization always succeeds, nor that the initial solve is regularized. Ridge selection, missing-axis renormalization and per-sample downdates remain unformalized."
   },
   {
    "code": {
@@ -603,7 +603,7 @@
     "body_checksum": "stmt:e922c984edf1e6b5e69c54ee164dbc8a",
     "name": "Calibrator.ridged_infoQuadraticForm_pos"
    },
-   "note": "The branch exists because a pivot can be nonpositive. With a strictly positive ridge on a positive-semidefinite matrix it cannot be, for arithmetic reasons; what remains is numerical. Finiteness is not representable over Lean's reals, so the `is_finite` half has no counterpart and is not claimed."
+   "note": "The initial unregularized Cholesky can encounter a nonpositive pivot. The caller may then retry with a strictly positive scalar ridge: under the positive-semidefinite premise the Lean theorem proves that regularized matrix is positive definite in exact real arithmetic. The unregularized attempt and floating-point success are not claimed; finiteness has no counterpart over Lean's reals."
   }
  ]
 }

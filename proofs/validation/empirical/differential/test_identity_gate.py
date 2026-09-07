@@ -82,7 +82,6 @@ IDENTITY_IDS = {
 
 SCALING_IDS = {
     "demoSteppingStoneFst-scale-invariant",
-    "steppingStoneFstQuadratic-scale-VIOLATION",
     "ibdFst-scale-VIOLATION-under-the-deme-size-reading",
 }
 
@@ -96,7 +95,6 @@ DELETED_AS_VACUOUS = (
 
 SCALE_BODIES = {
     "demoSteppingStoneFst": lambda d, Ne, m, s2: d / (d + 4 * Ne * m * s2),
-    "steppingStoneFstQuadratic": lambda d, Ne, m, s2: d / (d + 4 * Ne * s2 ** 2 * m ** 2),
     "ibdFst": lambda d, N, s2: d / (4 * N * s2 + d),
 }
 
@@ -169,7 +167,6 @@ def main() -> int:
 
     # ---------------- scaling invariance, both directions -------------
     control = _by_id("demoSteppingStoneFst-scale-invariant")
-    violation = _by_id("steppingStoneFstQuadratic-scale-VIOLATION")
     if control is not None:
         got = R.classify(control, R.evaluate(control, SCALE_BODIES))
         if got != "AGREE":
@@ -180,17 +177,21 @@ def main() -> int:
             failures.append(
                 "VACUOUS         the scaling control is not separated from any mutant; per the "
                 "note in checks.py such a check must be deleted, not kept")
-    if violation is not None:
-        got = R.classify(violation, R.evaluate(violation, SCALE_BODIES))
+        # The wrong quadratic body was removed from the Lean corpus. Keep it
+        # here as a planted mutation of the real check, not a missing subject
+        # that makes every production battery run fail with KeyError.
+        quadratic = dict(SCALE_BODIES)
+        quadratic["demoSteppingStoneFst"] = lambda d, Ne, m, s2: d / (d + 4 * Ne * s2 ** 2 * m ** 2)
+        got = R.classify(control, R.evaluate(control, quadratic))
         if got != "INTERNAL-INCONSISTENT":
             failures.append(
                 f"FALSE NEGATIVE  steppingStoneFstQuadratic reported {got}, not "
                 f"INTERNAL-INCONSISTENT; its extra power of m breaks coalescent scaling and "
                 f"a gate that misses it misses the whole family")
-        if violation.expected_verdict != "INTERNAL-INCONSISTENT":
+        if control.expected_verdict != "AGREE":
             failures.append(
-                "UNPINNED        steppingStoneFstQuadratic does not pin its expected verdict; "
-                "a falsified body that starts agreeing must be reported as a regression")
+                "UNPINNED        demoSteppingStoneFst does not pin AGREE; "
+                "the quadratic mutation must disagree with its expected verdict")
 
     # ---------------- CALIB-TAIL: the degenerate-corpus region -------------
     # WHY THIS SECTION EXISTS. Everything above runs against STUB corpora, which

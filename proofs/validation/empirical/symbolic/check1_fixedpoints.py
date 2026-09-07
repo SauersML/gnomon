@@ -267,8 +267,9 @@ def run():
     equilibrium_names = {d["name"] for d in targets}
 
     results = []
-    for d in targets:
+    for index, d in enumerate(targets, 1):
         name = d["name"]
+        print(f"CHECK 1 [{index}/{len(targets)}] {name}", flush=True)
         rec = {
             "fqn": f'{d["module"]}.{name}',
             "name": name, "module": d["module"],

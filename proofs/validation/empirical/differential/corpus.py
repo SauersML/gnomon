@@ -19,6 +19,9 @@ from __future__ import annotations
 
 import os
 import sys
+import functools
+import hashlib
+from pathlib import Path
 
 import leanexpr as L
 
@@ -128,10 +131,23 @@ FQ_OVERRIDES = {
 
 
 def _leanexpr_table():
+    # A gate calibration evaluates several perturbed check lists against the
+    # same corpus. Parse that corpus once, while content hashes ensure edits,
+    # added modules and deleted modules always invalidate the cached table.
+    sources = tuple(
+        (mod, path, hashlib.sha256(Path(path).read_bytes()).digest())
+        for mod in _all_modules()
+        for path in [_module_path(mod)]
+    )
+    table, definitions = _parse_leanexpr_table(sources)
+    return dict(table), dict(definitions)
+
+
+@functools.lru_cache(maxsize=1)
+def _parse_leanexpr_table(sources):
     table: dict[str, callable] = {}
     defs: dict[str, L.LeanDef] = {}
-    for mod in _all_modules():
-        path = _module_path(mod)
+    for mod, path, _digest in sources:
         for d in L.extract_file(path, mod) + L.extract_recursions(path, mod):
             if d.name in defs:
                 continue
