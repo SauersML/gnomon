@@ -1,18 +1,24 @@
-name: Export Rust Build Cache
+name: Export Build Cache
 
 on:
   workflow_dispatch:
     inputs:
       cache_key:
-        description: Exact release build cache key to export for remote development
+        description: Exact build cache key to export for remote development
         type: string
+        required: true
+      cache_kind:
+        description: Cache contents and matching producer paths
+        type: choice
+        options: [rust, lean-deps, lean-project]
+        default: rust
         required: true
 
 permissions:
   contents: read
 
 concurrency:
-  group: export-rust-build-cache
+  group: export-build-cache-${{ inputs.cache_kind }}
   cancel-in-progress: false
 
 jobs:
@@ -25,6 +31,7 @@ jobs:
       # Match Rust Test CI's cache paths exactly: they contribute to the cache
       # version, independently of its user-visible key.
       - name: Restore the existing release cache
+        if: inputs.cache_kind == 'rust'
         uses: actions/cache/restore@v4
         with:
           path: |
@@ -33,14 +40,39 @@ jobs:
           key: ${{ inputs.cache_key }}
           fail-on-cache-miss: true
 
+      - name: Restore the existing Lean dependencies
+        if: inputs.cache_kind == 'lean-deps'
+        uses: actions/cache/restore@v4
+        with:
+          path: .lake/packages
+          key: ${{ inputs.cache_key }}
+          fail-on-cache-miss: true
+
+      - name: Restore the existing compiled Lean project
+        if: inputs.cache_kind == 'lean-project'
+        uses: actions/cache/restore@v4
+        with:
+          path: .lake/build
+          key: ${{ inputs.cache_key }}
+          fail-on-cache-miss: true
+
       - name: Pack cache with executable permissions intact
-        run: tar --zstd -cf rust-build-cache.tar.zst target
+        env:
+          CACHE_KIND: ${{ inputs.cache_kind }}
+        run: |
+          case "$CACHE_KIND" in
+            rust) cache_path=target ;;
+            lean-deps) cache_path=.lake/packages ;;
+            lean-project) cache_path=.lake/build ;;
+            *) exit 1 ;;
+          esac
+          tar --zstd -cf "$CACHE_KIND-build-cache.tar.zst" "$cache_path"
 
       - name: Export cache for remote download
         uses: actions/upload-artifact@v4
         with:
-          name: rust-build-cache
-          path: rust-build-cache.tar.zst
+          name: ${{ inputs.cache_kind }}-build-cache
+          path: ${{ inputs.cache_kind }}-build-cache.tar.zst
           compression-level: 0
           retention-days: 7
           if-no-files-found: error
