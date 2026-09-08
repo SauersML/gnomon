@@ -36,7 +36,10 @@ impl fmt::Display for GenomicRegion {
 pub fn parse_chromosome_label(chr_str: &str) -> Result<u8, String> {
     let mut trimmed = chr_str.trim();
 
-    if trimmed.len() >= 3 && trimmed[..3].eq_ignore_ascii_case("chr") {
+    if trimmed
+        .get(..3)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("chr"))
+    {
         trimmed = &trimmed[3..];
     }
 
@@ -68,6 +71,13 @@ mod tests {
         assert_eq!(parse_chromosome_label("chr2").unwrap(), 2);
         assert_eq!(parse_chromosome_label("chrX").unwrap(), 23);
         assert_eq!(parse_chromosome_label("MT").unwrap(), 25);
+    }
+
+    #[test]
+    fn parse_chromosome_label_rejects_unicode_without_panicking() {
+        for label in ["🧬1", "éé", "c日本", "chr🧬"] {
+            assert!(parse_chromosome_label(label).is_err());
+        }
     }
 
     #[test]

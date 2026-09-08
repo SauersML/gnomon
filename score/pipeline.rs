@@ -11,7 +11,7 @@ use crate::score::types::{
     ReconciledVariantIndex, WorkItem,
 };
 use ahash::AHashMap;
-use crossbeam_channel::{Receiver, bounded};
+use crossbeam_channel::{Receiver, RecvTimeoutError, bounded};
 use crossbeam_queue::ArrayQueue;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use memmap2::{Mmap, MmapOptions};
@@ -94,6 +94,53 @@ fn maybe_emit_text_progress(
     *last_print = now;
     *last_pct = pct;
     true
+}
+
+/// The completion sender belongs to the pipeline scope, so dropping it wakes
+/// this monitor on success, early error, or unwinding. Progress is not a lifetime
+/// signal: a failed producer cannot reach its advertised variant count.
+fn update_pipeline_progress(
+    count: Arc<AtomicU64>,
+    bar: ProgressBar,
+    total: u64,
+    completion: Receiver<()>,
+) {
+    let stderr_is_tty = std::io::stderr().is_terminal();
+    let mut last_print = Instant::now();
+    let initial = count.load(Ordering::Relaxed);
+    let mut last_pct = if total == 0 {
+        100
+    } else {
+        initial.saturating_mul(100) / total
+    };
+    if !stderr_is_tty {
+        eprintln!("> Progress: {initial}/{total} variants ({last_pct}%)");
+    }
+    while count.load(Ordering::Relaxed) < total {
+        let processed = count.load(Ordering::Relaxed);
+        bar.set_position(processed);
+        if !stderr_is_tty {
+            maybe_emit_text_progress(
+                processed,
+                total,
+                &mut last_print,
+                &mut last_pct,
+                Duration::from_secs(5),
+                5,
+            );
+        }
+        if !matches!(
+            completion.recv_timeout(Duration::from_millis(200)),
+            Err(RecvTimeoutError::Timeout)
+        ) {
+            break;
+        }
+    }
+    let processed = count.load(Ordering::Relaxed);
+    bar.set_position(processed);
+    if !stderr_is_tty && processed >= total {
+        eprintln!("> Progress: {total}/{total} variants (100%)");
+    }
 }
 
 // ========================================================================================
@@ -221,8 +268,8 @@ fn default_max_ram_bytes() -> usize {
     // Exceeding the budget is not fatal -- it selects the bounded-accumulator plan over
     // the fast in-RAM one -- so an honest budget costs time on a wide chromosome rather
     // than the chromosome.
-    let by_free = available.saturating_mul(DEFAULT_RAM_FRACTION_NUMERATOR)
-        / DEFAULT_RAM_FRACTION_DENOMINATOR;
+    let by_free =
+        available.saturating_mul(DEFAULT_RAM_FRACTION_NUMERATOR) / DEFAULT_RAM_FRACTION_DENOMINATOR;
     let by_fair_share = system
         .total_memory()
         .saturating_mul(DEFAULT_RAM_FRACTION_NUMERATOR)
@@ -669,54 +716,16 @@ fn run_single_file_pipeline(
     let strategy_for_closure = strategy;
     let final_result: Result<(Option<(Vec<f64>, Vec<u32>)>, Option<SpoolState>), PipelineError> =
         thread::scope(|s| {
-            // Spawn the UI updater thread. This thread is responsible for polling the
-            // atomic counter and updating the progress bar on the screen.
+            let (progress_lifetime, progress_completion) = bounded(0);
             let updater_thread_count = Arc::clone(&variants_processed_count);
             let updater_pb = pb.clone();
-            let total_variants = variants_to_process;
-            let stderr_is_tty = std::io::stderr().is_terminal();
             s.spawn(move || {
-                // When stderr is a TTY, the indicatif bar handles user-facing
-                // progress. When it isn't (e.g. gnomon is run as a subprocess
-                // and stderr is a pipe), the bar's draw target is hidden, so
-                // emit periodic plain-text lines instead — otherwise the
-                // caller sees "> Decision Engine Strategy: ..." and then
-                // silence for the whole run.
-                let mut last_text_print = Instant::now();
-                let initial_processed = updater_thread_count.load(Ordering::Relaxed);
-                let initial_pct = if total_variants == 0 {
-                    100
-                } else {
-                    initial_processed.saturating_mul(100) / total_variants
-                };
-                let mut last_text_pct: u64 = initial_pct;
-                if !stderr_is_tty {
-                    eprintln!(
-                        "> Progress: {initial_processed}/{total_variants} variants ({initial_pct}%)"
-                    );
-                }
-                // This loop terminates when the number of processed items reaches the
-                // total, ensuring this thread finishes before the scope ends
-                while updater_thread_count.load(Ordering::Relaxed) < total_variants {
-                    let processed = updater_thread_count.load(Ordering::Relaxed);
-                    updater_pb.set_position(processed);
-                    if !stderr_is_tty {
-                        maybe_emit_text_progress(
-                            processed,
-                            total_variants,
-                            &mut last_text_print,
-                            &mut last_text_pct,
-                            Duration::from_secs(5),
-                            5,
-                        );
-                    }
-                    thread::sleep(Duration::from_millis(200));
-                }
-                // Perform one final update to ensure the bar shows 100% completion.
-                updater_pb.set_position(updater_thread_count.load(Ordering::Relaxed));
-                if !stderr_is_tty {
-                    eprintln!("> Progress: {total_variants}/{total_variants} variants (100%)");
-                }
+                update_pipeline_progress(
+                    updater_thread_count,
+                    updater_pb,
+                    variants_to_process,
+                    progress_completion,
+                );
             });
 
             let mut local_spool_state = spool_state.take();
@@ -857,6 +866,7 @@ fn run_single_file_pipeline(
             };
 
             pb.finish_with_message("Computation complete.");
+            drop(progress_lifetime);
             Ok((final_outputs, local_spool_state))
         });
     let (final_outputs, mut spool_state) = final_result?;
@@ -1070,50 +1080,16 @@ fn run_multi_file_pipeline(
     let strategy_for_closure = strategy;
     let final_result: Result<(Option<(Vec<f64>, Vec<u32>)>, Option<SpoolState>), PipelineError> =
         thread::scope(|s| {
-            // Spawn the UI updater thread. This thread is responsible for polling the
-            // atomic counter and updating the progress bar on the screen.
+            let (progress_lifetime, progress_completion) = bounded(0);
             let updater_thread_count = Arc::clone(&variants_processed_count);
             let updater_pb = pb.clone();
-            let total_variants = variants_to_process;
-            let stderr_is_tty = std::io::stderr().is_terminal();
             s.spawn(move || {
-                // See first updater thread: emit plain-text progress when
-                // stderr isn't a TTY so subprocess callers see something.
-                let mut last_text_print = Instant::now();
-                let initial_processed = updater_thread_count.load(Ordering::Relaxed);
-                let initial_pct = if total_variants == 0 {
-                    100
-                } else {
-                    initial_processed.saturating_mul(100) / total_variants
-                };
-                let mut last_text_pct: u64 = initial_pct;
-                if !stderr_is_tty {
-                    eprintln!(
-                        "> Progress: {initial_processed}/{total_variants} variants ({initial_pct}%)"
-                    );
-                }
-                // This loop terminates when the number of processed items reaches the
-                // total, ensuring this thread finishes before the scope ends
-                while updater_thread_count.load(Ordering::Relaxed) < total_variants {
-                    let processed = updater_thread_count.load(Ordering::Relaxed);
-                    updater_pb.set_position(processed);
-                    if !stderr_is_tty {
-                        maybe_emit_text_progress(
-                            processed,
-                            total_variants,
-                            &mut last_text_print,
-                            &mut last_text_pct,
-                            Duration::from_secs(5),
-                            5,
-                        );
-                    }
-                    thread::sleep(Duration::from_millis(200));
-                }
-                // Perform one final update to ensure the bar shows 100% completion.
-                updater_pb.set_position(updater_thread_count.load(Ordering::Relaxed));
-                if !stderr_is_tty {
-                    eprintln!("> Progress: {total_variants}/{total_variants} variants (100%)");
-                }
+                update_pipeline_progress(
+                    updater_thread_count,
+                    updater_pb,
+                    variants_to_process,
+                    progress_completion,
+                );
             });
 
             let mut local_spool_state = spool_state.take();
@@ -1256,6 +1232,7 @@ fn run_multi_file_pipeline(
             };
 
             pb.finish_with_message("Computation complete.");
+            drop(progress_lifetime);
             Ok((final_outputs, local_spool_state))
         });
     let (final_outputs, mut spool_state) = final_result?;
@@ -1657,6 +1634,34 @@ fn create_spool_plan<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn progress_monitor_stops_when_pipeline_fails_before_total() {
+        let (finished_tx, finished_rx) = bounded(1);
+        let count = Arc::new(AtomicU64::new(1));
+        let observed_count = Arc::clone(&count);
+        let worker = thread::spawn(move || {
+            let result = thread::scope(|scope| {
+                let (progress_lifetime, completion) = bounded(0);
+                scope.spawn(move || {
+                    update_pipeline_progress(count, ProgressBar::hidden(), 2, completion)
+                });
+                let failure = Err::<(), _>("producer failed");
+                failure?;
+                drop(progress_lifetime);
+                Ok(())
+            });
+            finished_tx.send(result).expect("report completion");
+        });
+        assert_eq!(
+            finished_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("progress thread must not hold the failed pipeline open"),
+            Err("producer failed")
+        );
+        worker.join().expect("worker");
+        assert_eq!(observed_count.load(Ordering::Relaxed), 1);
+    }
 
     #[test]
     fn derive_spool_destination_remote_paths_default_to_current_dir() {
@@ -2235,4 +2240,3 @@ fn bounded_dense_batch_size(context: &PipelineContext) -> usize {
     let dense_budget = (context.memory_budget.max_ram_bytes() / 16).max(row_bytes);
     (dense_budget / row_bytes).clamp(1, DENSE_BATCH_SIZE)
 }
-

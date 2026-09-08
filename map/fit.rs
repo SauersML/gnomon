@@ -3634,8 +3634,7 @@ impl HwePcaModel {
         // `Σ_j L_j·L_jᵀ` with no LD weight anywhere in it. Orthonormal columns
         // put every entry at 1 to rounding; measuring it rather than asserting it
         // keeps the pair consistent for any component the σ guard zeroed out.
-        let component_weighted_norms_sq =
-            compute_component_weighted_norms_sq(loadings.as_ref(), None);
+        let component_weighted_norms_sq = compute_component_norms_sq(loadings.as_ref());
         let projection_cache = Arc::new(build_projection_model_cache(
             &scaler,
             loadings.as_ref(),
@@ -3794,31 +3793,34 @@ impl HwePcaModel {
             nrows: n_variants,
             ncols: components,
             data: loadings_col_major,
-        }
-        .into_mat()?;
-        let component_weighted_norms_sq = if component_weighted_norms_sq.len() == components {
-            component_weighted_norms_sq
-        } else {
-            compute_component_weighted_norms_sq(
-                loadings.as_ref(),
-                ld.as_ref().map(|weights| weights.weights.as_slice()),
-            )
         };
-        let projection_cache = if projection_packed_score_vectors.len()
-            == n_variants * components * 3
-            && projection_global_info_packed.len() == projection_packed_tri_size(components)
+        validate_projection_model_parts(
+            n_variants,
+            components,
+            &scaler,
+            &loadings,
+            &component_weighted_norms_sq,
+            variant_keys.as_deref(),
+            ld.as_ref(),
+        )?;
+        if projection_packed_score_vectors.len() != loadings.data.len() * 3
+            || projection_global_info_packed.len() != projection_packed_tri_size(components)
+            || !projection_packed_score_vectors
+                .iter()
+                .all(|value| value.is_finite())
+            || !projection_global_info_packed
+                .iter()
+                .all(|value| value.is_finite())
         {
-            Arc::new(ProjectionModelCache {
-                packed_score_vectors: projection_packed_score_vectors,
-                global_info_packed: projection_global_info_packed,
-            })
-        } else {
-            Arc::new(build_projection_model_cache(
-                &scaler,
-                loadings.as_ref(),
-                ld.as_ref(),
-            ))
-        };
+            return Err(
+                "projection cache arrays have invalid dimensions or nonfinite values".into(),
+            );
+        }
+        let loadings = loadings.into_mat()?;
+        let projection_cache = Arc::new(ProjectionModelCache {
+            packed_score_vectors: projection_packed_score_vectors,
+            global_info_packed: projection_global_info_packed,
+        });
 
         Ok(Self {
             n_samples,
@@ -6431,12 +6433,7 @@ where
     })
 }
 
-fn compute_component_weighted_norms_sq(
-    loadings: MatRef<'_, f64>,
-    ld_weights: Option<&[f64]>,
-) -> Vec<f64> {
-    let weights = ld_weights.unwrap_or(&[]);
-    let n_weights = weights.len();
+fn compute_component_norms_sq(loadings: MatRef<'_, f64>) -> Vec<f64> {
     let n_components = loadings.ncols();
     let mut norms_sq = vec![0.0f64; n_components];
 
@@ -6445,34 +6442,13 @@ fn compute_component_weighted_norms_sq(
         let mut sum = 0.0f64;
         let mut compensation = 0.0f64;
 
-        if n_weights > 0 {
-            // Indexed explicitly rather than counting inside a `zip!` closure.
-            // Pairing weights[i] with the i-th entry by incrementing a counter
-            // per visit is only correct if the traversal happens to run in
-            // index order; nothing in the API promises that, and if it ever
-            // vectorized or reordered, every LD weight would land on the wrong
-            // variant — quietly, and with entirely plausible-looking output.
-            let contiguous = column_ref
-                .try_as_col_major()
-                .expect("loading columns are contiguous");
-            for (idx, value) in contiguous.as_slice().iter().enumerate() {
-                let weight = if idx < n_weights { weights[idx] } else { 1.0 };
-                let weighted = weight * *value;
-                let square = weighted * weighted;
-                let y = square - compensation;
-                let t = sum + y;
-                compensation = (t - sum) - y;
-                sum = t;
-            }
-        } else {
-            zip!(column_ref).for_each(|unzip!(value)| {
-                let square = *value * *value;
-                let y = square - compensation;
-                let t = sum + y;
-                compensation = (t - sum) - y;
-                sum = t;
-            });
-        }
+        zip!(column_ref).for_each(|unzip!(value)| {
+            let square = *value * *value;
+            let y = square - compensation;
+            let t = sum + y;
+            compensation = (t - sum) - y;
+            sum = t;
+        });
 
         let sum = if sum.is_finite() && sum >= 0.0 {
             sum
@@ -6873,6 +6849,60 @@ struct MatrixData {
     data: Vec<f64>,
 }
 
+fn validate_projection_model_parts(
+    n_variants: usize,
+    components: usize,
+    scaler: &HweScaler,
+    loadings: &MatrixData,
+    component_weighted_norms_sq: &[f64],
+    variant_keys: Option<&[VariantKey]>,
+    ld: Option<&LdWeights>,
+) -> Result<(), String> {
+    if n_variants == 0
+        || components == 0
+        || loadings.nrows != n_variants
+        || loadings.ncols != components
+        || scaler.frequencies.len() != n_variants
+        || scaler.scales.len() != n_variants
+        || component_weighted_norms_sq.len() != components
+        || variant_keys.is_some_and(|keys| keys.len() != n_variants)
+        || ld.is_some_and(|weights| weights.weights.len() != n_variants)
+    {
+        return Err("projection model arrays do not match variant/component dimensions".into());
+    }
+    let matrix_len = n_variants
+        .checked_mul(components)
+        .filter(|&len| len == loadings.data.len())
+        .ok_or_else(|| "matrix data length does not match dimensions".to_owned())?;
+    matrix_len
+        .checked_mul(3)
+        .and_then(|_| components.checked_add(1))
+        .and_then(|next| components.checked_mul(next))
+        .ok_or_else(|| "projection model dimensions overflow".to_owned())?;
+    if !scaler
+        .frequencies
+        .iter()
+        .all(|value| value.is_finite() && (0.0..=1.0).contains(value))
+        || !scaler
+            .scales
+            .iter()
+            .all(|value| value.is_finite() && *value >= 0.0)
+        || !loadings.data.iter().all(|value| value.is_finite())
+        || !component_weighted_norms_sq
+            .iter()
+            .all(|value| value.is_finite() && *value >= 0.0)
+        || ld.is_some_and(|weights| {
+            !weights
+                .weights
+                .iter()
+                .all(|value| value.is_finite() && *value >= 0.0)
+        })
+    {
+        return Err("projection model contains invalid scaler, loading, or weight values".into());
+    }
+    Ok(())
+}
+
 impl MatrixData {
     fn from_mat(mat: MatRef<'_, f64>) -> Self {
         let mut data = Vec::with_capacity(mat.nrows() * mat.ncols());
@@ -6890,7 +6920,7 @@ impl MatrixData {
 
     fn into_mat(self) -> Result<Mat<f64>, String> {
         let MatrixData { nrows, ncols, data } = self;
-        if data.len() != nrows * ncols {
+        if nrows.checked_mul(ncols) != Some(data.len()) {
             return Err("matrix data length does not match dimensions".into());
         }
         let mut mat = Mat::zeros(nrows, ncols);
@@ -6944,7 +6974,6 @@ impl<'de> Deserialize<'de> for HwePcaModel {
             total_variance: f64,
             singular_values: Vec<f64>,
             loadings: MatrixData,
-            #[serde(default)]
             component_weighted_norms_sq: Vec<f64>,
             #[serde(default)]
             variant_keys: Option<Vec<VariantKey>>,
@@ -6960,17 +6989,32 @@ impl<'de> Deserialize<'de> for HwePcaModel {
 
         let raw = ModelData::deserialize(deserializer)?;
         let singular_values_len = raw.singular_values.len();
+        if raw.eigenvalues.len() != singular_values_len
+            || !raw.eigenvalues.iter().all(|value| value.is_finite())
+            || !raw
+                .singular_values
+                .iter()
+                .all(|value| value.is_finite() && *value >= 0.0)
+            || !raw.total_variance.is_finite()
+            || raw.total_variance < 0.0
+        {
+            return Err(DeError::custom(
+                "model spectral arrays have invalid dimensions or values",
+            ));
+        }
+        validate_projection_model_parts(
+            raw.n_variants,
+            singular_values_len,
+            &raw.scaler,
+            &raw.loadings,
+            &raw.component_weighted_norms_sq,
+            raw.variant_keys.as_deref(),
+            raw.ld.as_ref(),
+        )
+        .map_err(DeError::custom)?;
         let loadings = raw.loadings.into_mat().map_err(DeError::custom)?;
         let ld = raw.ld;
-        let component_weighted_norms_sq =
-            if raw.component_weighted_norms_sq.len() == singular_values_len {
-                raw.component_weighted_norms_sq
-            } else {
-                compute_component_weighted_norms_sq(
-                    loadings.as_ref(),
-                    ld.as_ref().map(|ld| ld.weights.as_slice()),
-                )
-            };
+        let component_weighted_norms_sq = raw.component_weighted_norms_sq;
         let projection_cache = Arc::new(build_projection_model_cache(
             &raw.scaler,
             loadings.as_ref(),
@@ -8565,50 +8609,6 @@ mod tests {
     }
 
     #[test]
-    fn ld_weighted_norms_pair_each_weight_with_its_own_variant() {
-        // This path is only reachable through a deserialization fallback, so it
-        // had no test at all — and it used to pair weights with entries by
-        // incrementing a counter inside a traversal closure, which is correct
-        // only if the traversal runs in index order. A mispairing there is
-        // invisible: every weight is plausible, the norms stay positive, and
-        // only the projector's alignment is quietly wrong.
-        //
-        // The weights below are chosen so that any permutation gives a
-        // different answer: with loadings [1, 2, 3] on one component and
-        // weights [1, 10, 100], the weighted square sum is
-        // 1 + 400 + 90000 = 90401, and no reordering of those weights
-        // reproduces it.
-        let mut loadings = Mat::<f64>::zeros(3, 1);
-        loadings[(0, 0)] = 1.0;
-        loadings[(1, 0)] = 2.0;
-        loadings[(2, 0)] = 3.0;
-
-        let weights = [1.0f64, 10.0, 100.0];
-        let norms = compute_component_weighted_norms_sq(loadings.as_ref(), Some(&weights));
-
-        assert_eq!(norms.len(), 1);
-        assert!(
-            (norms[0] - 90401.0).abs() < 1e-9,
-            "weights must pair with their own variants: got {}",
-            norms[0]
-        );
-
-        // Unweighted is the same sum with every weight at one, which is also
-        // what the fit path itself asks for.
-        let plain = compute_component_weighted_norms_sq(loadings.as_ref(), None);
-        assert!((plain[0] - 14.0).abs() < 1e-12, "got {}", plain[0]);
-
-        // Fewer weights than variants: the shortfall is treated as weight one
-        // rather than reading out of bounds.
-        let short = compute_component_weighted_norms_sq(loadings.as_ref(), Some(&weights[..2]));
-        assert!(
-            (short[0] - (1.0 + 400.0 + 9.0)).abs() < 1e-9,
-            "got {}",
-            short[0]
-        );
-    }
-
-    #[test]
     fn tile_width_shrinks_as_the_cohort_grows() {
         // Small cohorts keep the wide tile: the buffers are trivial and wider
         // tiles amortize per-block overhead.
@@ -8896,6 +8896,47 @@ mod tests {
         assert!(
             serde_json::from_value::<HwePcaModel>(stale).is_err(),
             "the obsolete cohort-matrix schema must fail rather than silently load"
+        );
+    }
+
+    #[test]
+    fn model_json_rejects_inconsistent_dimensions_and_invalid_scalers() {
+        let model = serde_json::to_value(invariant_fit()).unwrap();
+        for (pointer, replacement) in [
+            ("/n_variants", serde_json::json!(1)),
+            ("/scaler/frequencies", serde_json::json!([])),
+            ("/scaler/scales", serde_json::json!([])),
+            ("/scaler/frequencies/0", serde_json::json!(1.1)),
+            ("/scaler/scales/0", serde_json::json!(-1.0)),
+            ("/eigenvalues", serde_json::json!([])),
+            ("/singular_values", serde_json::json!([])),
+            ("/component_weighted_norms_sq", serde_json::json!([])),
+            ("/component_weighted_norms_sq/0", serde_json::json!(-1.0)),
+            ("/variant_keys", serde_json::json!([])),
+            ("/loadings/nrows", serde_json::json!(usize::MAX)),
+            ("/loadings/ncols", serde_json::json!(usize::MAX)),
+            ("/loadings/data", serde_json::json!([])),
+            ("/total_variance", serde_json::json!(-1.0)),
+            (
+                "/ld",
+                serde_json::json!({"weights": [], "window": 1, "bp_window": null, "ridge": 0.01}),
+            ),
+        ] {
+            let mut malformed = model.clone();
+            *malformed.pointer_mut(pointer).unwrap() = replacement;
+            assert!(
+                serde_json::from_value::<HwePcaModel>(malformed).is_err(),
+                "invalid model field {pointer} must return a deserialization error"
+            );
+        }
+        assert!(
+            MatrixData {
+                nrows: usize::MAX,
+                ncols: 2,
+                data: Vec::new(),
+            }
+            .into_mat()
+            .is_err()
         );
     }
 

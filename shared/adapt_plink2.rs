@@ -803,7 +803,10 @@ fn normalize_chrom(raw: &str) -> String {
         return String::new();
     }
     let mut body = trimmed;
-    if trimmed.len() >= 3 && trimmed[..3].eq_ignore_ascii_case("chr") {
+    if trimmed
+        .get(..3)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("chr"))
+    {
         body = &trimmed[3..];
     }
     let upper = body.to_ascii_uppercase();
@@ -3241,6 +3244,13 @@ mod tests {
     use super::*;
     use std::convert::TryFrom;
     use std::sync::Arc;
+
+    #[test]
+    fn chromosome_normalization_accepts_utf8_without_slicing_panics() {
+        assert_eq!(normalize_chrom("🧬1"), "🧬1");
+        assert_eq!(normalize_chrom("éé"), "éé");
+        assert_eq!(normalize_chrom("ChrX"), "X");
+    }
 
     struct VecSource {
         data: Vec<u8>,

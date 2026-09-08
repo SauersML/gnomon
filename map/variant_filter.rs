@@ -46,16 +46,16 @@ fn normalize_allele(allele: &str) -> String {
     allele.trim().to_ascii_uppercase()
 }
 
-// ... existing code ...
-
 fn normalize_chromosome(chromosome: &str) -> String {
-    let mut normalized = chromosome.trim().to_string();
-    if normalized.len() >= 3 {
-        let prefix = &normalized[..3];
-        if prefix.eq_ignore_ascii_case("chr") {
-            normalized = normalized[3..].to_string();
-        }
-    }
+    let normalized = chromosome.trim();
+    let normalized = if normalized
+        .get(..3)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("chr"))
+    {
+        &normalized[3..]
+    } else {
+        normalized
+    };
     normalized.to_ascii_uppercase()
 }
 
@@ -93,7 +93,7 @@ impl VariantFilter {
     pub fn from_file(path: &Path) -> Result<Self, VariantListError> {
         let mut reader = open_text_source(path)?;
         let mut unique = HashSet::new();
-        let mut header_skipped = false;
+        let mut first_record = true;
 
         let mut line_number = 0usize;
         while let Some(raw_line) = reader.next_line()? {
@@ -122,12 +122,16 @@ impl VariantFilter {
                 }
             };
 
-            if !header_skipped
+            let is_first_record = first_record;
+            first_record = false;
+            if is_first_record
                 && (chrom.eq_ignore_ascii_case("chrom")
                     || chrom.eq_ignore_ascii_case("chr")
-                    || pos_text.eq_ignore_ascii_case("pos"))
+                    || chrom.eq_ignore_ascii_case("chromosome"))
+                && (pos_text.eq_ignore_ascii_case("pos")
+                    || pos_text.eq_ignore_ascii_case("position")
+                    || pos_text.eq_ignore_ascii_case("bp"))
             {
-                header_skipped = true;
                 continue;
             }
 
@@ -138,10 +142,6 @@ impl VariantFilter {
                         line: line_number,
                         message: "position must be positive".into(),
                     });
-                }
-                Err(_) if !header_skipped => {
-                    header_skipped = true;
-                    continue;
                 }
                 Err(_) => {
                     return Err(VariantListError::Parse {
@@ -238,7 +238,52 @@ impl VariantSelection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use std::path::Path;
+
+    fn parse_list(contents: &str) -> Result<VariantFilter, VariantListError> {
+        let mut file = tempfile::NamedTempFile::new().expect("variant list fixture");
+        file.write_all(contents.as_bytes())
+            .expect("write variant list");
+        VariantFilter::from_file(file.path())
+    }
+
+    #[test]
+    fn chromosome_normalization_preserves_unicode_contigs() {
+        assert_eq!(VariantKey::new(" 日本語 ", 1).chromosome, "日本語");
+        assert_eq!(VariantKey::new(" éé ", 1).chromosome, "éé");
+        assert_eq!(VariantKey::new(" ChR日本語 ", 1).chromosome, "日本語");
+        assert_eq!(VariantKey::new(" cHrX ", 1).chromosome, "X");
+    }
+
+    #[test]
+    fn variant_list_accepts_only_an_initial_recognized_header() {
+        for header in ["chr pos", "CHROM BP", "chromosome position"] {
+            let filter = parse_list(&format!("# comment\n\n{header}\nchr1 42\n2 73\n"))
+                .expect("valid header");
+            assert_eq!(filter.requested_unique(), 2);
+            assert!(filter.contains(&VariantKey::new("1", 42)));
+            assert!(filter.contains(&VariantKey::new("2", 73)));
+        }
+        let filter = parse_list("1 42\n2 73\n").expect("headerless list");
+        assert_eq!(filter.requested_unique(), 2);
+    }
+
+    #[test]
+    fn variant_list_never_silently_drops_malformed_positions() {
+        for (contents, expected_line) in [
+            ("1 invalid\n2 73\n", 1),
+            ("1 42\n2 invalid\n3 73\n", 2),
+            ("1 42\nchrom pos\n2 73\n", 2),
+            ("1 pos\n2 73\n", 1),
+            ("chr pos\n1 0\n2 73\n", 2),
+        ] {
+            assert!(
+                matches!(parse_list(contents), Err(VariantListError::Parse { line, .. }) if line == expected_line),
+                "malformed row must be reported at line {expected_line}: {contents:?}"
+            );
+        }
+    }
 
     #[test]
     fn variant_filter_loads_remote_variant_list() {

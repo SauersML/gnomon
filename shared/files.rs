@@ -171,18 +171,12 @@ pub fn load_adc_credentials() -> Result<Credentials, PipelineError> {
     } else {
         None
     };
-    let credentials = {
-        let runtime_guard = runtime.as_ref().map(|rt| rt.enter());
-        let runtime_entered = runtime_guard.is_some();
-        if runtime_entered {
-            std::hint::spin_loop();
-        }
-        builder
-            .build()
-            .map_err(|e| PipelineError::Io(format!("Failed to load ADC credentials: {e}")))?
-    };
-
-    Ok(credentials)
+    let runtime_guard = runtime.as_ref().map(|rt| rt.enter());
+    let credentials = builder
+        .build()
+        .map_err(|e| PipelineError::Io(format!("Failed to load ADC credentials: {e}")));
+    drop(runtime_guard);
+    credentials
 }
 
 /// A trait that abstracts sequential, line-oriented access to text data such as
@@ -1308,15 +1302,13 @@ fn fetch_http_length(client: &Client, url: &str) -> Result<u64, PipelineError> {
         && let Some(total) =
             HttpByteRangeSource::parse_content_range(response.headers().get(CONTENT_RANGE))
     {
-        let _ = response.bytes();
         return Ok(total);
     }
 
-    if response.status().is_success()
+    if response.status() == StatusCode::OK
         && let Some(len) =
             HttpByteRangeSource::parse_content_length(response.headers().get(CONTENT_LENGTH))
     {
-        let _ = response.bytes();
         return Ok(len);
     }
 
@@ -2068,7 +2060,7 @@ impl HttpByteRangeSource {
             .user_agent(HTTP_USER_AGENT)
             .build()
             .map_err(|e| PipelineError::Io(format!("Failed to build HTTP client: {e}")))?;
-        let len = Self::fetch_length(&client, url)?;
+        let len = fetch_http_length(&client, url)?;
         Ok(Self {
             client,
             url: url.to_string(),
@@ -2078,46 +2070,6 @@ impl HttpByteRangeSource {
         })
     }
 
-    fn fetch_length(client: &Client, url: &str) -> Result<u64, PipelineError> {
-        match client.head(url).send() {
-            Ok(response) if response.status().is_success() => {
-                if let Some(len) =
-                    Self::parse_content_length(response.headers().get(CONTENT_LENGTH))
-                {
-                    return Ok(len);
-                }
-            }
-            Ok(_) | Err(_) => {}
-        }
-
-        let response = client
-            .get(url)
-            .header(RANGE, "bytes=0-0")
-            .send()
-            .map_err(|e| {
-                PipelineError::Io(format!("Failed to request HTTP range for {url}: {e:?}"))
-            })?;
-
-        if response.status() == StatusCode::PARTIAL_CONTENT
-            && let Some(total) = Self::parse_content_range(response.headers().get(CONTENT_RANGE))
-        {
-            let _ = response.bytes();
-            return Ok(total);
-        }
-
-        if response.status().is_success()
-            && let Some(len) = Self::parse_content_length(response.headers().get(CONTENT_LENGTH))
-        {
-            let _ = response.bytes();
-            return Ok(len);
-        }
-
-        let status = response.status();
-        Err(PipelineError::Io(format!(
-            "Failed to determine content length for {url}: HTTP {status}"
-        )))
-    }
-
     fn parse_content_length(header: Option<&reqwest::header::HeaderValue>) -> Option<u64> {
         header
             .and_then(|value| value.to_str().ok())
@@ -2125,9 +2077,20 @@ impl HttpByteRangeSource {
     }
 
     fn parse_content_range(header: Option<&reqwest::header::HeaderValue>) -> Option<u64> {
+        Self::parse_byte_content_range(header).map(|(_, _, total)| total)
+    }
+
+    fn parse_byte_content_range(
+        header: Option<&reqwest::header::HeaderValue>,
+    ) -> Option<(u64, u64, u64)> {
         let text = header?.to_str().ok()?;
-        let total = text.split('/').nth(1)?;
-        total.parse::<u64>().ok()
+        let bounds_and_total = text.strip_prefix("bytes ")?;
+        let (bounds, total) = bounds_and_total.split_once('/')?;
+        let (start, end) = bounds.split_once('-')?;
+        let start = start.parse::<u64>().ok()?;
+        let end = end.parse::<u64>().ok()?;
+        let total = total.parse::<u64>().ok()?;
+        (start <= end && end < total).then_some((start, end, total))
     }
 
     fn block_length(&self, start: u64) -> usize {
@@ -2175,26 +2138,46 @@ impl HttpByteRangeSource {
                 ))
             })?;
         let status = response.status();
-        if status != StatusCode::PARTIAL_CONTENT && !(status.is_success() && start == 0) {
+        if status != StatusCode::PARTIAL_CONTENT {
             return Err(PipelineError::Io(format!(
                 "HTTP range request for {} returned unexpected status {status}",
                 self.url
             )));
         }
-
-        let bytes = response.bytes().map_err(|e| {
-            PipelineError::Io(format!("Failed to read HTTP body from {}: {e}", self.url))
-        })?;
-        let mut data = bytes.to_vec();
-        if data.len() < length {
+        let actual_range = Self::parse_byte_content_range(response.headers().get(CONTENT_RANGE));
+        if actual_range != Some((start, end, self.len)) {
             return Err(PipelineError::Io(format!(
-                "HTTP range read from {} truncated: expected {length} bytes, received {}",
+                "HTTP range response for {} has inconsistent Content-Range: expected bytes {start}-{end}/{}, got {:?}",
+                self.url,
+                self.len,
+                response.headers().get(CONTENT_RANGE)
+            )));
+        }
+        if let Some(content_length) =
+            Self::parse_content_length(response.headers().get(CONTENT_LENGTH))
+            && content_length != length as u64
+        {
+            return Err(PipelineError::Io(format!(
+                "HTTP range response for {} has length {content_length}, expected {length}",
+                self.url
+            )));
+        }
+
+        // Bound memory even when a server lies about its range or sends a
+        // chunked body. Read one extra byte to detect oversized responses.
+        let mut data = Vec::with_capacity(length);
+        response
+            .take(length as u64 + 1)
+            .read_to_end(&mut data)
+            .map_err(|e| {
+                PipelineError::Io(format!("Failed to read HTTP body from {}: {e}", self.url))
+            })?;
+        if data.len() != length {
+            return Err(PipelineError::Io(format!(
+                "HTTP range read from {} has incorrect length: expected {length} bytes, received {}",
                 self.url,
                 data.len()
             )));
-        }
-        if data.len() > length {
-            data.truncate(length);
         }
         Ok(Arc::new(data))
     }
@@ -2383,6 +2366,8 @@ impl RemoteCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::net::TcpListener;
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
@@ -2390,6 +2375,145 @@ mod tests {
 
     const PUBLIC_BUCKET: &str = "genomics-public-data";
     const PUBLIC_REFERENCE_OBJECT: &str = "references/hg38/v0/Homo_sapiens_assembly38.fasta";
+
+    fn serve_http_responses(responses: Vec<String>) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind HTTP fixture");
+        let url = format!(
+            "http://{}/cohort.bed",
+            listener.local_addr().expect("address")
+        );
+        let worker = thread::spawn(move || {
+            for response in responses {
+                let (mut socket, _) = listener.accept().expect("accept request");
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("timeout");
+                let mut request = BufReader::new(&mut socket);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    assert!(request.read_line(&mut line).expect("read request") > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                // Rejection of oversized bodies may close the client early.
+                let _ = socket.write_all(response.as_bytes());
+            }
+        });
+        (url, worker)
+    }
+
+    #[test]
+    fn http_range_reads_validate_coordinates_and_exact_body_length() {
+        for (headers, body, valid) in [
+            (
+                "206 Partial Content\r\nContent-Range: bytes 4-7/8\r\nContent-Length: 4",
+                "efgh",
+                true,
+            ),
+            (
+                "206 Partial Content\r\nContent-Range: bytes 0-3/8\r\nContent-Length: 4",
+                "abcd",
+                false,
+            ),
+            (
+                "206 Partial Content\r\nContent-Range: bytes 4-7/9\r\nContent-Length: 4",
+                "efgh",
+                false,
+            ),
+            ("206 Partial Content\r\nContent-Length: 4", "efgh", false),
+            ("200 OK\r\nContent-Length: 8", "abcdefgh", false),
+            (
+                "206 Partial Content\r\nContent-Range: bytes 4-7/8",
+                "efghEXTRA",
+                false,
+            ),
+            (
+                "206 Partial Content\r\nContent-Range: bytes 4-7/8",
+                "efg",
+                false,
+            ),
+        ] {
+            let (url, server) = serve_http_responses(vec![
+                "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\n".to_string(),
+                format!("HTTP/1.1 {headers}\r\nConnection: close\r\n\r\n{body}"),
+            ]);
+            let source = HttpByteRangeSource::with_block_size(&url, 4).expect("source");
+            let mut result = [0; 4];
+            let outcome = source.read_at(4, &mut result);
+            server.join().expect("HTTP server");
+            assert_eq!(outcome.is_ok(), valid, "{headers}: {outcome:?}");
+            if valid {
+                assert_eq!(&result, b"efgh");
+            }
+        }
+    }
+
+    #[test]
+    fn http_range_reads_reject_whole_resource_at_offset_zero() {
+        let (url, server) = serve_http_responses(vec![
+            "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\n".to_string(),
+            "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nabcdefgh".to_string(),
+        ]);
+        let source = HttpByteRangeSource::with_block_size(&url, 4).expect("source");
+        assert!(source.read_at(0, &mut [0; 4]).is_err());
+        server.join().expect("HTTP server");
+    }
+
+    #[test]
+    fn http_length_probe_does_not_wait_for_the_resource_body() {
+        ensure_rustls_provider();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind HTTP fixture");
+        let url = format!(
+            "http://{}/cohort.bed",
+            listener.local_addr().expect("address")
+        );
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            for head in [true, false] {
+                let (mut socket, _) = listener.accept().expect("accept request");
+                let mut request = BufReader::new(&mut socket);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    assert!(request.read_line(&mut line).expect("read request") > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                let response = if head {
+                    "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 8589934592\r\nConnection: close\r\n\r\n"
+                };
+                socket
+                    .write_all(response.as_bytes())
+                    .expect("write headers");
+                if !head {
+                    let _ = release_rx.recv_timeout(Duration::from_secs(5));
+                }
+            }
+        });
+        let (result_tx, result_rx) = mpsc::channel();
+        let client = thread::spawn(move || {
+            let client = Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .expect("client");
+            let _ = result_tx.send(fetch_http_length(&client, &url));
+        });
+        let result = result_rx.recv_timeout(Duration::from_secs(2));
+        let _ = release_tx.send(());
+        server.join().expect("HTTP server");
+        client.join().expect("HTTP client");
+        assert_eq!(
+            result
+                .expect("metadata must return before the body arrives")
+                .expect("length"),
+            8_589_934_592
+        );
+    }
 
     fn should_skip_remote_test(err: &PipelineError) -> bool {
         matches!(err,
@@ -2531,34 +2655,6 @@ wgs%2Fpgen%2Fchr22%2Fsample.pgen?alt=media&userProject=wb-amiable-carrot-1173"
         Ok(())
     }
 
-    fn env_mutex() -> &'static Mutex<()> {
-        static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
-        ENV_MUTEX.get_or_init(|| Mutex::new(()))
-    }
-
-    struct EnvVarGuard {
-        key: &'static str,
-        original: Option<String>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let original = env::var(key).ok();
-            unsafe { env::set_var(key, value) };
-            Self { key, original }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            if let Some(original) = &self.original {
-                unsafe { env::set_var(self.key, original) };
-            } else {
-                unsafe { env::remove_var(self.key) };
-            }
-        }
-    }
-
     fn write_stub_adc_file(path: &Path) {
         const AUTHORIZED_USER: &str = r#"{
   "client_id": "test-client-id",
@@ -2572,38 +2668,34 @@ wgs%2Fpgen%2Fchr22%2Fsample.pgen?alt=media&userProject=wb-amiable-carrot-1173"
 
     #[test]
     fn load_adc_credentials_without_runtime_supports_storage_client() -> Result<(), PipelineError> {
-        let env_lock = env_mutex().lock().unwrap();
-        if std::mem::size_of_val(&*env_lock) == usize::MAX {
-            unreachable!("env lock size overflow");
+        // ADC reads process-wide environment. Isolate the stub credentials
+        // from parallel GCS tests and initialize them before any threads exist.
+        const CHILD_MARKER: &str = "GNOMON_ADC_TEST_CHILD";
+        if env::var_os(CHILD_MARKER).is_none() {
+            let adc_file = NamedTempFile::new().expect("create ADC fixture");
+            write_stub_adc_file(adc_file.path());
+            let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+                .args([
+                    "--exact",
+                    "files::tests::load_adc_credentials_without_runtime_supports_storage_client",
+                    "--nocapture",
+                ])
+                .env(CHILD_MARKER, "1")
+                .env("GOOGLE_APPLICATION_CREDENTIALS", adc_file.path())
+                .output()
+                .expect("run isolated ADC regression");
+            assert!(output.status.success(), "ADC regression failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return Ok(());
         }
 
-        let adc_file = NamedTempFile::new().expect("failed to create temp ADC file");
-        write_stub_adc_file(adc_file.path());
-
-        let adc_guard = EnvVarGuard::set(
-            "GOOGLE_APPLICATION_CREDENTIALS",
-            adc_file
-                .path()
-                .to_str()
-                .expect("temporary path should be valid UTF-8"),
-        );
-        if std::mem::size_of_val(&adc_guard) == usize::MAX {
-            unreachable!("ADC guard size overflow");
-        }
-
-        // Create test-local runtime FIRST and enter its context.
-        // This ensures load_adc_credentials() spawns async tasks into our
-        // controlled runtime rather than the shared static one, preventing
-        // SIGSEGV when background tasks access resources after guards drop.
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        let credentials = load_adc_credentials()?;
         let runtime = tokio::runtime::Runtime::new()
             .map_err(|e| PipelineError::Io(format!("Failed to create test runtime: {e}")))?;
-
-        let result = {
-            let enter_guard = runtime.enter();
-            let credentials = load_adc_credentials()?;
-            let res = runtime.block_on(async move {
+        let result = runtime.block_on(async move {
                 StorageControl::builder()
-                    .with_credentials(credentials.clone())
+                    .with_credentials(credentials)
                     .build()
                     .await
                     .map_err(|e| {
@@ -2612,15 +2704,6 @@ wgs%2Fpgen%2Fchr22%2Fsample.pgen?alt=media&userProject=wb-amiable-carrot-1173"
                         ))
                     })
             });
-            // enter_guard goes out of scope here naturally
-            if std::mem::size_of_val(&enter_guard) == usize::MAX {
-                unreachable!("enter guard size overflow");
-            }
-            res
-        };
-
-        // Shut down runtime to complete all background tasks before
-        // adc_file and adc_guard drop.
         runtime.shutdown_timeout(std::time::Duration::from_secs(1));
 
         result?;

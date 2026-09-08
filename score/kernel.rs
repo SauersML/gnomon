@@ -57,6 +57,7 @@ fn accumulate_dosage_two(acc: SimdVec, w: SimdVec) -> SimdVec {
 /// and the correction constants matrices.
 pub struct PaddedInterleavedWeights<'a> {
     slice: &'a [f32],
+    num_rows: usize,
     num_scores: usize,
     stride: usize,
 }
@@ -71,14 +72,21 @@ impl<'a> PaddedInterleavedWeights<'a> {
         // The stride is the width of a single row's data, rounded up to the
         // nearest multiple of the SIMD vector width. This padding is the
         // key to enabling branch-free, "no scalar fallback" SIMD.
-        let stride = num_scores.div_ceil(LANE_COUNT) * LANE_COUNT;
-        if slice.len() != num_rows * stride {
+        let stride = num_scores
+            .div_ceil(LANE_COUNT)
+            .checked_mul(LANE_COUNT)
+            .ok_or("Padded score stride overflows usize")?;
+        let matrix_len = num_rows
+            .checked_mul(stride)
+            .ok_or("Padded matrix dimensions overflow usize")?;
+        if slice.len() != matrix_len {
             return Err(
                 "Mismatched matrix data: slice.len() does not equal num_rows * calculated_stride",
             );
         }
         Ok(Self {
             slice,
+            num_rows,
             num_scores,
             stride,
         })
@@ -116,10 +124,8 @@ impl<'a> PaddedInterleavedWeights<'a> {
 ///
 /// Returns exactly 8 SIMD lanes (8 * 8 = 64 scores).
 ///
-/// # Safety
-/// The caller must uphold the contract that all indices in `g1_indices` and `g2_indices`
-/// are valid row indices for the `weights` matrix, which represents
-/// a view of a single mini-batch.
+/// # Panics
+/// Panics if the score chunk or any genotype row index is outside the matrix.
 #[inline]
 pub fn accumulate_adjustments_for_person(
     weights: &PaddedInterleavedWeights,
@@ -133,7 +139,7 @@ pub fn accumulate_adjustments_for_person(
         weights.num_scores()
     );
     assert!(
-        score_start + (MAX_KERNEL_ACCUMULATOR_LANES * LANE_COUNT) <= weights.stride,
+        MAX_KERNEL_ACCUMULATOR_LANES * LANE_COUNT <= weights.stride - score_start,
         "Invalid fixed kernel chunk: start={score_start}, requires {} padded scores, stride={}.",
         MAX_KERNEL_ACCUMULATOR_LANES * LANE_COUNT,
         weights.stride
@@ -143,6 +149,10 @@ pub fn accumulate_adjustments_for_person(
     // --- Loop 1: Dosage=1 Adjustments ---
     for &matrix_row_idx in g1_indices {
         let matrix_row_idx = matrix_row_idx as usize;
+        assert!(
+            matrix_row_idx < weights.num_rows,
+            "Genotype row index out of bounds"
+        );
         // This inner loop over score columns is the same performant structure as the original kernel.
         for i in 0..MAX_KERNEL_ACCUMULATOR_LANES {
             unsafe {
@@ -159,6 +169,10 @@ pub fn accumulate_adjustments_for_person(
     // --- Loop 2: Dosage=2 Adjustments ---
     for &matrix_row_idx in g2_indices {
         let matrix_row_idx = matrix_row_idx as usize;
+        assert!(
+            matrix_row_idx < weights.num_rows,
+            "Genotype row index out of bounds"
+        );
         for i in 0..MAX_KERNEL_ACCUMULATOR_LANES {
             unsafe {
                 let weights_vec = weights.get_simd_lane_for_score_window_unchecked(
@@ -179,6 +193,9 @@ pub fn accumulate_adjustments_for_person(
 /// adjustments for a single person over a mini-batch of variants.
 ///
 /// `lane_count` is the number of SIMD lanes to compute from `score_start`.
+///
+/// # Panics
+/// Panics if the score chunk or any genotype row index is outside the matrix.
 #[inline]
 pub fn accumulate_adjustments_for_person_lanes(
     weights: &PaddedInterleavedWeights,
@@ -198,7 +215,7 @@ pub fn accumulate_adjustments_for_person_lanes(
         MAX_KERNEL_ACCUMULATOR_LANES
     );
     assert!(
-        score_start + (lane_count * LANE_COUNT) <= weights.stride,
+        lane_count * LANE_COUNT <= weights.stride - score_start,
         "Invalid kernel chunk: start={score_start}, lanes={lane_count}, stride={}.",
         weights.stride
     );
@@ -207,6 +224,10 @@ pub fn accumulate_adjustments_for_person_lanes(
 
     for &matrix_row_idx in g1_indices {
         let matrix_row_idx = matrix_row_idx as usize;
+        assert!(
+            matrix_row_idx < weights.num_rows,
+            "Genotype row index out of bounds"
+        );
         for i in 0..lane_count {
             unsafe {
                 let weights_vec = weights.get_simd_lane_for_score_window_unchecked(
@@ -221,6 +242,10 @@ pub fn accumulate_adjustments_for_person_lanes(
 
     for &matrix_row_idx in g2_indices {
         let matrix_row_idx = matrix_row_idx as usize;
+        assert!(
+            matrix_row_idx < weights.num_rows,
+            "Genotype row index out of bounds"
+        );
         for i in 0..lane_count {
             unsafe {
                 let weights_vec = weights.get_simd_lane_for_score_window_unchecked(
@@ -235,4 +260,54 @@ pub fn accumulate_adjustments_for_person_lanes(
     }
 
     accumulator_buffer
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn padded_matrix_rejects_overflowing_dimensions() {
+        assert!(PaddedInterleavedWeights::new(&[], 0, usize::MAX).is_err());
+        assert!(PaddedInterleavedWeights::new(&[], usize::MAX / LANE_COUNT + 1, 1).is_err());
+    }
+
+    #[test]
+    fn safe_kernels_reject_invalid_genotype_rows() {
+        let data = [1.0; 64];
+        let weights = PaddedInterleavedWeights::new(&data, 1, 64).expect("matrix");
+        for (g1, g2) in [(&[1u16][..], &[][..]), (&[][..], &[1u16][..])] {
+            assert!(
+                std::panic::catch_unwind(|| {
+                    accumulate_adjustments_for_person(&weights, g1, g2, 0)
+                })
+                .is_err()
+            );
+            assert!(
+                std::panic::catch_unwind(|| {
+                    accumulate_adjustments_for_person_lanes(&weights, g1, g2, 0, 1)
+                })
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn checked_kernels_preserve_fixed_and_tail_accumulations() {
+        let data: Vec<f32> = (0..3 * 72).map(|value| value as f32 / 4.0).collect();
+        let weights = PaddedInterleavedWeights::new(&data, 3, 67).expect("matrix");
+        let fixed = accumulate_adjustments_for_person(&weights, &[0, 2], &[1], 0);
+        let tail = accumulate_adjustments_for_person_lanes(&weights, &[0, 2], &[1], 64, 1);
+        for score in 0..72 {
+            let actual = if score < 64 {
+                fixed[score / 8][score % 8]
+            } else {
+                tail[0][score - 64]
+            };
+            assert_eq!(
+                actual,
+                data[score] + data[144 + score] + 2.0 * data[72 + score]
+            );
+        }
+    }
 }

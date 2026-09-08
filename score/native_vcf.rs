@@ -90,7 +90,6 @@ pub fn score_vcf_streaming(
     let mut sum_scores = vec![0.0f64; num_people * num_scores];
     let mut missing_counts = vec![0u32; num_people * num_scores];
     let mut score_variant_counts = vec![0u32; num_scores];
-    let mut matched_variant_keys: AHashSet<(VariantKey, usize, usize)> = AHashSet::new();
 
     let mut record = noodles_vcf::Record::default();
     while reader.read_record(&mut record)? != 0 {
@@ -135,13 +134,10 @@ pub fn score_vcf_streaming(
                                 let cell = out_person_idx * num_scores + rule.score_index;
                                 let effect_dosage = if rule.effect_is_ref {
                                     decoded_dosage
-                                        .ploidy
-                                        .map(|ploidy| {
-                                            ploidy as f64 - decoded_dosage.alt_dosage
-                                        })
+                                        .ref_dosage
                                         .ok_or_else(|| {
                                             format!(
-                                                "Cannot score REF-effect rule for score '{}' at {}:{} from DS/GP dosage without genotype ploidy.",
+                                                "Cannot score REF-effect rule for score '{}' at {}:{} without a complete REF dosage (DS requires genotype ploidy and all ALT dosages).",
                                                 score_names[rule.score_index],
                                                 record.reference_sequence_name(),
                                                 pos,
@@ -173,14 +169,20 @@ pub fn score_vcf_streaming(
             for rule in &matched_rules {
                 if previous_score != Some(rule.score_index) {
                     score_variant_counts[rule.score_index] += 1;
-                    matched_variant_keys.insert((key, alt_index, rule.score_index));
                     previous_score = Some(rule.score_index);
                 }
             }
         }
     }
 
-    if matched_variant_keys.is_empty() {
+    // These are the same matched variant/score assignments counted in each
+    // score's denominator. ALT ordinals are local to a record, so hashing them
+    // across records conflates distinct alternate alleles at the same position.
+    let matched_variants = score_variant_counts
+        .iter()
+        .map(|&count| count as usize)
+        .sum();
+    if matched_variants == 0 {
         return Err(format!(
             "No overlapping variants were found between '{}' and the score file(s).",
             input_path.display()
@@ -194,7 +196,7 @@ pub fn score_vcf_streaming(
         score_variant_counts,
         sum_scores,
         missing_counts,
-        matched_variants: matched_variant_keys.len(),
+        matched_variants,
     })
 }
 
@@ -483,16 +485,7 @@ fn match_rules_for_allele(
 #[derive(Debug, Clone, Copy)]
 struct DecodedAltDosage {
     alt_dosage: f64,
-    ploidy: Option<u8>,
-}
-
-impl DecodedAltDosage {
-    fn genotype(alt_dosage: f64, ploidy: u8) -> Self {
-        Self {
-            alt_dosage,
-            ploidy: Some(ploidy),
-        }
-    }
+    ref_dosage: Option<f64>,
 }
 
 fn for_each_vcf_dosage_best<F>(
@@ -619,24 +612,22 @@ fn decode_vcf_sample(
         }
     }
 
-    // DS/GP carry no ploidy of their own, but REF-effect rules need it to turn an
-    // ALT dosage into a REF dosage. When GT is also present, take the ploidy from
-    // there so imputed VCFs with GT:DS:GP score REF effects without stripping fields.
+    // REF dosage complements the sum of ALL alternate allele dosages. Taking
+    // ploidy minus just the matched ALT incorrectly treats every other ALT as REF.
+    let ploidy = if ds_field.is_some() || gp_field.is_some() {
+        gt_field.and_then(parse_vcf_genotype_ploidy)
+    } else {
+        None
+    };
     if let Some(value) = ds_field
-        && let Some(parsed) = parse_vcf_dosage_field(value, alt_index, alt_count)?
+        && let Some(parsed) = parse_vcf_dosage_field(value, alt_index, alt_count, ploidy)?
     {
-        return Ok(Some(DecodedAltDosage {
-            alt_dosage: parsed,
-            ploidy: gt_field.and_then(parse_vcf_genotype_ploidy),
-        }));
+        return Ok(Some(parsed));
     }
     if let Some(value) = gp_field
-        && let Some(parsed) = parse_vcf_gp(value, alt_index, alt_count)?
+        && let Some(parsed) = parse_vcf_gp(value, alt_index, alt_count, ploidy)?
     {
-        return Ok(Some(DecodedAltDosage {
-            alt_dosage: parsed,
-            ploidy: gt_field.and_then(parse_vcf_genotype_ploidy),
-        }));
+        return Ok(Some(parsed));
     }
     if let Some(value) = gt_field
         && let Some(parsed) = parse_vcf_genotype(value, alt_index)?
@@ -650,42 +641,53 @@ fn parse_vcf_dosage_field(
     field: &str,
     alt_index: usize,
     alt_count: usize,
-) -> Result<Option<f64>, Box<dyn Error + Send + Sync>> {
+    ploidy: Option<u8>,
+) -> Result<Option<DecodedAltDosage>, Box<dyn Error + Send + Sync>> {
     if field == "." {
         return Ok(None);
     }
-    let allele_offset = alt_index
-        .checked_sub(1)
-        .ok_or("ALT allele index must be one-based")?;
-
-    let mut dosage_values = field.split(',');
-    let first_value = dosage_values.next().unwrap_or_default();
-    if let Some(second_value) = dosage_values.next() {
-        let value = match allele_offset {
-            0 => first_value,
-            1 => second_value,
-            offset => {
-                let Some(value) = dosage_values.nth(offset - 2) else {
-                    return Ok(None);
-                };
-                value
-            }
-        };
-        return parse_numeric_str(value);
+    if alt_index == 0 || alt_index > alt_count {
+        return Err("ALT allele index is out of range".into());
     }
-
-    if alt_count == 1 {
-        parse_numeric_str(field)
-    } else {
-        Err(format!("multi-allelic dosage field is scalar for ALT allele index {alt_index}").into())
+    let mut alt_dosage = None;
+    let mut total_alt_dosage = Some(0.0);
+    let mut count = 0;
+    for (offset, value) in field.split(',').enumerate() {
+        let dosage = parse_numeric_str(value)?;
+        if dosage.is_some_and(|dosage| dosage < 0.0) {
+            return Err("DS dosage must be nonnegative".into());
+        }
+        if offset + 1 == alt_index {
+            alt_dosage = dosage;
+        }
+        total_alt_dosage = total_alt_dosage.zip(dosage).map(|(sum, value)| sum + value);
+        count += 1;
     }
+    if count != alt_count {
+        return Err(format!(
+            "DS field has {count} values, expected {alt_count} alternate allele dosages"
+        )
+        .into());
+    }
+    let ref_dosage = ploidy
+        .zip(total_alt_dosage)
+        .map(|(ploidy, total)| f64::from(ploidy) - total);
+    if ref_dosage.is_some_and(|dosage| dosage < -1e-6) {
+        return Err("DS alternate dosages exceed genotype ploidy".into());
+    }
+    Ok(alt_dosage.map(|alt_dosage| DecodedAltDosage {
+        alt_dosage,
+        // Permit decimal rounding at the dosage boundary without a negative count.
+        ref_dosage: ref_dosage.map(|dosage| dosage.max(0.0)),
+    }))
 }
 
 fn parse_vcf_gp(
     field: &str,
     alt_index: usize,
     alt_count: usize,
-) -> Result<Option<f64>, Box<dyn Error + Send + Sync>> {
+    ploidy: Option<u8>,
+) -> Result<Option<DecodedAltDosage>, Box<dyn Error + Send + Sync>> {
     if field == "." {
         return Ok(None);
     }
@@ -696,41 +698,57 @@ fn parse_vcf_gp(
         .into());
     }
 
-    let allele_count = alt_count + 1;
-    let expected_len = allele_count
-        .checked_mul(allele_count + 1)
+    let allele_count = alt_count.checked_add(1).ok_or("GP allele count overflow")?;
+    let diploid_len = allele_count
+        .checked_add(1)
+        .and_then(|next| allele_count.checked_mul(next))
         .map(|n| n / 2)
         .ok_or("GP allele count overflow")?;
+    let actual_len = field.split(',').count();
+    let ploidy = match ploidy {
+        Some(ploidy) => ploidy,
+        None if actual_len == allele_count => 1,
+        None if actual_len == diploid_len => 2,
+        None => return Err(format!("GP field has {actual_len} values; cannot determine haploid or diploid ploidy for {alt_count} alternate alleles").into()),
+    };
+    let expected_len = match ploidy {
+        1 => allele_count,
+        2 => diploid_len,
+        _ => {
+            return Err(format!(
+                "GP dosage decoding requires haploid or diploid genotypes, got ploidy {ploidy}"
+            )
+            .into());
+        }
+    };
+    if actual_len != expected_len {
+        return Err(format!("GP field has {actual_len} values, expected {expected_len} for ploidy {ploidy} and {alt_count} alternate alleles").into());
+    }
     let mut dosage = 0.0f64;
-    let mut idx = 0usize;
+    let mut ref_dosage = 0.0f64;
     let mut parts = field.split(',');
     for second in 0..allele_count {
-        for first in 0..=second {
-            let Some(part) = parts.next() else {
-                return Err(format!(
-                    "GP field has {idx} values, expected {expected_len} for {alt_count} alternate alleles"
-                )
-                .into());
-            };
+        let first_count = if ploidy == 1 { 1 } else { second + 1 };
+        for first in 0..first_count {
+            let part = parts.next().expect("GP cardinality was validated");
             if part == "." {
                 return Ok(None);
             }
             let probability = part.parse::<f64>()?;
-            let copies = usize::from(first == alt_index) + usize::from(second == alt_index);
+            if !probability.is_finite() || !(0.0..=1.0).contains(&probability) {
+                return Err("GP probabilities must be finite and between zero and one".into());
+            }
+            let copies =
+                usize::from(ploidy == 2 && first == alt_index) + usize::from(second == alt_index);
             dosage += probability * copies as f64;
-            idx += 1;
+            let ref_copies = usize::from(ploidy == 2 && first == 0) + usize::from(second == 0);
+            ref_dosage += probability * ref_copies as f64;
         }
     }
-
-    if parts.next().is_some() {
-        let actual_len = expected_len + 1 + parts.count();
-        return Err(format!(
-            "GP field has {actual_len} values, expected {expected_len} for {alt_count} alternate alleles"
-        )
-        .into());
-    }
-
-    Ok(Some(dosage))
+    Ok(Some(DecodedAltDosage {
+        alt_dosage: dosage,
+        ref_dosage: Some(ref_dosage),
+    }))
 }
 
 fn parse_numeric_str(text: &str) -> Result<Option<f64>, Box<dyn Error + Send + Sync>> {
@@ -738,7 +756,11 @@ fn parse_numeric_str(text: &str) -> Result<Option<f64>, Box<dyn Error + Send + S
     if trimmed.is_empty() || trimmed == "." {
         Ok(None)
     } else {
-        trimmed.parse::<f64>().map(Some).map_err(Into::into)
+        let value = trimmed.parse::<f64>()?;
+        if !value.is_finite() {
+            return Err("Dosage must be finite".into());
+        }
+        Ok(Some(value))
     }
 }
 
@@ -751,6 +773,7 @@ fn parse_vcf_genotype(
     }
 
     let mut dosage = 0.0f64;
+    let mut ref_dosage = 0.0f64;
     let mut ploidy = 0u8;
     let bytes = field.as_bytes();
     let mut idx = 0;
@@ -768,6 +791,9 @@ fn parse_vcf_genotype(
                 if allele == alt_index {
                     dosage += 1.0;
                 }
+                if allele == 0 {
+                    ref_dosage += 1.0;
+                }
                 ploidy = ploidy.checked_add(1).ok_or("genotype ploidy overflow")?;
             }
             other => return Err(format!("unexpected byte {other} in genotype field").into()),
@@ -777,7 +803,10 @@ fn parse_vcf_genotype(
     if ploidy == 0 {
         Ok(None)
     } else {
-        Ok(Some(DecodedAltDosage::genotype(dosage, ploidy)))
+        Ok(Some(DecodedAltDosage {
+            alt_dosage: dosage,
+            ref_dosage: Some(ref_dosage),
+        }))
     }
 }
 
@@ -867,6 +896,108 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::io::Write;
+
+    #[test]
+    fn multiallelic_ref_dosage_excludes_every_alternate_allele() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vcf_path = dir.path().join("cohort.vcf");
+        let score_path = dir.path().join("score.gnomon.tsv");
+        std::fs::write(
+            &score_path,
+            "variant_id\teffect_allele\tother_allele\tAltG\tRefA\n1:100\tG\tA\t1\t0\n1:100\tA\tG\t0\t1\n",
+        )
+        .expect("write score");
+
+        // Sample-major expected values: (G dosage, A dosage). In particular,
+        // G/T carries zero copies of A even though its G dosage is only one.
+        for (format, samples, expected) in [
+            ("GT", "0/1\t0/2\t1/2", [1.0, 1.0, 0.0, 1.0, 1.0, 0.0]),
+            (
+                "GT:DS",
+                "0/1:0.9,0.2\t0/2:0.1,1.1\t1/2:0.8,1.2",
+                [0.9, 0.9, 0.1, 0.8, 0.8, 0.0],
+            ),
+            (
+                "GT:GP",
+                "0/1:0,1,0,0,0,0\t0/2:0,0,0,1,0,0\t1/2:0,0,0,0,1,0",
+                [1.0, 1.0, 0.0, 1.0, 1.0, 0.0],
+            ),
+            (
+                "GP",
+                "0,1,0,0,0,0\t0,0,0,1,0,0\t0,0,0,0,1,0",
+                [1.0, 1.0, 0.0, 1.0, 1.0, 0.0],
+            ),
+            ("GT", "0\t1\t2", [0.0, 1.0, 1.0, 0.0, 0.0, 0.0]),
+            (
+                "GT:GP",
+                "0:1,0,0\t1:0,1,0\t2:0,0,1",
+                [0.0, 1.0, 1.0, 0.0, 0.0, 0.0],
+            ),
+            ("GP", "1,0,0\t0,1,0\t0,0,1", [0.0, 1.0, 1.0, 0.0, 0.0, 0.0]),
+        ] {
+            std::fs::write(
+                &vcf_path,
+                format!(
+                    "##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts1\ts2\ts3\n1\t100\t.\tA\tG,T\t.\tPASS\t.\t{format}\t{samples}\n"
+                ),
+            )
+            .expect("write vcf");
+            let result =
+                score_vcf_streaming(&vcf_path, std::slice::from_ref(&score_path), None, None)
+                    .unwrap_or_else(|err| panic!("{format} {samples}: {err}"));
+            assert_eq!(result.score_names, ["AltG", "RefA"]);
+            for (actual, expected) in result.sum_scores.iter().zip(expected) {
+                assert!(
+                    (actual - expected).abs() < 1e-12,
+                    "{format} {samples}: {actual} != {expected}"
+                );
+            }
+            assert_eq!(result.missing_counts, [0; 6]);
+        }
+    }
+
+    #[test]
+    fn dosage_decoding_rejects_invalid_cardinality_and_nonfinite_values() {
+        for value in ["1", "0.5,0.5,0", "NaN,0", "inf,0", "-0.1,0", "1.5,1"] {
+            assert!(
+                parse_vcf_dosage_field(value, 1, 2, Some(2)).is_err(),
+                "{value}"
+            );
+        }
+        for (value, ploidy) in [
+            ("0,1", Some(2)),
+            ("0,1,0", Some(1)),
+            ("NaN,0,1", None),
+            ("0,-0.1,1", None),
+        ] {
+            assert!(parse_vcf_gp(value, 1, 1, ploidy).is_err(), "{value}");
+        }
+        let partial = parse_vcf_dosage_field("0.5,.", 1, 2, Some(2))
+            .expect("parse partial dosage")
+            .expect("selected ALT dosage");
+        assert_eq!(partial.alt_dosage, 0.5);
+        assert_eq!(partial.ref_dosage, None);
+    }
+
+    #[test]
+    fn split_records_at_one_position_count_each_matched_allele() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vcf_path = dir.path().join("cohort.vcf");
+        let score_path = dir.path().join("score.gnomon.tsv");
+        std::fs::write(
+            &vcf_path,
+            "##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts1\n1\t100\t.\tA\tG\t.\tPASS\t.\tGT\t0/1\n1\t100\t.\tA\tT\t.\tPASS\t.\tGT\t0/1\n",
+        ).expect("write vcf");
+        std::fs::write(
+            &score_path,
+            "variant_id\teffect_allele\tother_allele\tScoreA\n1:100\tG\tA\t1\n1:100\tT\tA\t10\n",
+        )
+        .expect("write score");
+        let result = score_vcf_streaming(&vcf_path, &[score_path], None, None).expect("score");
+        assert_eq!(result.sum_scores, [11.0]);
+        assert_eq!(result.score_variant_counts, [2]);
+        assert_eq!(result.matched_variants, 2);
+    }
 
     #[test]
     fn ref_effect_rules_use_gt_ploidy_alongside_ds_dosage() {

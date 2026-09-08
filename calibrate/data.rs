@@ -11,8 +11,8 @@
 //!   user interface and eliminates a class of configuration errors.
 //! - User-Centric Errors: Failures are assumed to be user-input errors.
 //!   The `DataError` enum is designed to provide clear, actionable feedback.
-//! - Performance: It leverages the `polars` Lazy API to minimize memory
-//!   usage and I/O by only loading required columns from disk.
+//! - Training and prediction share schema validation and predictor extraction.
+//!   Training-only requirements do not constrain prediction batches.
 
 use ndarray::{Array1, Array2};
 use polars::prelude::*;
@@ -33,7 +33,7 @@ pub struct TrainingData {
     /// The Principal Components matrix (`PC`), from 'PC1', 'PC2', ... columns.
     /// Shape: [n_samples, num_pcs].
     pub pcs: Array2<f64>,
-    /// The prior weights vector, from the required 'weights' column.
+    /// Prior weights, or unit weights when the column is absent.
     pub weights: Array1<f64>,
 }
 
@@ -76,7 +76,7 @@ pub enum DataError {
     )]
     MissingValuesFound(String),
     #[error(
-        "Input file contains only {found} data rows, but at least {required} are recommended for a stable model."
+        "Input file contains {found} data rows, but this operation requires at least {required}."
     )]
     InsufficientRows { found: usize, required: usize },
 
@@ -84,19 +84,15 @@ pub enum DataError {
         "Non-finite values (NaN or Infinity) were found in the required column '{0}'. This tool requires all data to be finite."
     )]
     NonFiniteValuesFound(String),
-
-    #[error(
-        "Required 'weights' column was not found in the input file. Sample weights must be explicitly provided."
-    )]
-    WeightsColumnRequired,
 }
 
 /// Loads and validates data specifically for model training.
 pub fn load_training_data(path: &str, num_pcs: usize) -> Result<TrainingData, DataError> {
     // Do not require an explicit 'weights' column. If missing, default to 1.0.
-    let (p, sex, pcs, y_opt, weights) = internal::load_data(path, num_pcs, true, false)?;
-    // This unwrap is safe because we passed `include_phenotype: true`.
-    let y = y_opt.unwrap();
+    let df = internal::load_data(path, num_pcs, true)?;
+    let (p, sex, pcs) = internal::extract_predictors(&df, num_pcs)?;
+    let y = internal::extract_f64_column(&df, "phenotype")?;
+    let weights = internal::extract_weights(&df)?;
     Ok(TrainingData {
         y,
         p,
@@ -108,8 +104,9 @@ pub fn load_training_data(path: &str, num_pcs: usize) -> Result<TrainingData, Da
 
 /// Loads and validates data specifically for prediction.
 pub fn load_prediction_data(path: &str, num_pcs: usize) -> Result<PredictionData, DataError> {
-    let (p, sex, pcs, _, _, sample_ids) =
-        internal::load_data_with_ids(path, num_pcs, false, false)?;
+    let df = internal::load_data(path, num_pcs, false)?;
+    let (p, sex, pcs) = internal::extract_predictors(&df, num_pcs)?;
+    let sample_ids = internal::extract_sample_ids(&df)?;
     Ok(PredictionData {
         p,
         sex,
@@ -126,10 +123,13 @@ mod internal {
 
     /// Read a TSV file into a Polars DataFrame.
     fn read_tsv(path: &str) -> Result<DataFrame, DataError> {
+        let mut schema = Schema::with_capacity(1);
+        schema.with_column("sample_id".into(), DataType::String);
         Ok(CsvReader::new(File::open(Path::new(path))?)
             .with_options(
                 CsvReadOptions::default()
                     .with_has_header(true)
+                    .with_schema_overwrite(Some(std::sync::Arc::new(schema)))
                     .with_parse_options(CsvParseOptions::default().with_separator(b'\t')),
             )
             .finish()?)
@@ -137,7 +137,10 @@ mod internal {
 
     /// Extract a single column from a DataFrame as a validated, finite Array1<f64>.
     /// Checks for nulls before and after casting, and validates all values are finite.
-    fn extract_f64_column(df: &DataFrame, column_name: &str) -> Result<Array1<f64>, DataError> {
+    pub(super) fn extract_f64_column(
+        df: &DataFrame,
+        column_name: &str,
+    ) -> Result<Array1<f64>, DataError> {
         let series = df.column(column_name)?;
         if series.null_count() > 0 {
             return Err(DataError::MissingValuesFound(column_name.to_string()));
@@ -163,29 +166,17 @@ mod internal {
         Ok(arr)
     }
 
-    /// Extract sample IDs from a DataFrame, falling back to sequential numeric IDs.
-    fn extract_sample_ids(df: &DataFrame, n: usize) -> Vec<String> {
+    /// Preserve supplied identifiers exactly; generate row numbers only if absent.
+    pub(super) fn extract_sample_ids(df: &DataFrame) -> Result<Vec<String>, DataError> {
         let has_col = df.get_column_names().iter().any(|c| c == &"sample_id");
         if !has_col {
-            return (1..=n).map(|i| i.to_string()).collect();
+            return Ok((1..=df.height()).map(|i| i.to_string()).collect());
         }
-        let s = match df.column("sample_id") {
-            Ok(s) if s.null_count() == 0 => s,
-            _ => return (1..=n).map(|i| i.to_string()).collect(),
-        };
-        let len = s.len().min(n);
-        let mut out = Vec::with_capacity(n);
-        for i in 0..len {
-            let v = s.get(i).unwrap_or(polars::prelude::AnyValue::Null);
-            out.push(match v {
-                polars::prelude::AnyValue::Null => (i + 1).to_string(),
-                _ => v.to_string(),
-            });
+        let s = df.column("sample_id")?;
+        if s.null_count() > 0 {
+            return Err(DataError::MissingValuesFound("sample_id".to_string()));
         }
-        for i in len..n {
-            out.push((i + 1).to_string());
-        }
-        out
+        Ok(s.str()?.into_no_null_iter().map(str::to_owned).collect())
     }
 
     /// Stack per-column PC arrays into an (n_rows, n_cols) matrix.
@@ -204,51 +195,38 @@ mod internal {
             .reversed_axes()
     }
 
-    /// Load and validate weights from a DataFrame, with optional requirement enforcement.
-    fn extract_weights(
-        df: &DataFrame,
-        require: bool,
-        has_weights: bool,
-        fallback_len: usize,
-    ) -> Result<Array1<f64>, DataError> {
-        if require && !has_weights {
-            return Err(DataError::WeightsColumnRequired);
-        }
+    /// Validate supplied weights independently of whether the column is optional.
+    pub(super) fn extract_weights(df: &DataFrame) -> Result<Array1<f64>, DataError> {
+        let has_weights = df.get_column_names().iter().any(|c| c == &"weights");
         if !has_weights {
-            return Ok(Array1::from_elem(fallback_len, 1.0));
+            return Ok(Array1::from_elem(df.height(), 1.0));
         }
         let weights = extract_f64_column(df, "weights")?;
-        if require {
-            for (i, &w) in weights.iter().enumerate() {
-                if w < 0.0 {
-                    return Err(DataError::ColumnWrongType {
-                        column_name: "weights".to_string(),
-                        expected_type: "non-negative f64 values",
-                        found_type: format!("negative value {} at row {}", w, i + 1),
-                    });
-                }
+        for (i, &w) in weights.iter().enumerate() {
+            if w < 0.0 {
+                return Err(DataError::ColumnWrongType {
+                    column_name: "weights".to_string(),
+                    expected_type: "non-negative f64 values",
+                    found_type: format!("negative value {} at row {}", w, i + 1),
+                });
             }
+        }
+        if !weights.iter().any(|&w| w > 0.0) {
+            return Err(DataError::ColumnWrongType {
+                column_name: "weights".to_string(),
+                expected_type: "at least one positive weight",
+                found_type: "all weights are zero".to_string(),
+            });
         }
         Ok(weights)
     }
 
-    /// The single, unified data loading function. It reads a file, validates it against
-    /// a dynamically generated schema, and returns the core `ndarray` objects.
+    /// Read once and validate the schema; the row minimum applies only to training.
     pub(super) fn load_data(
         path: &str,
         num_pcs: usize,
         include_phenotype: bool,
-        require_weights: bool,
-    ) -> Result<
-        (
-            Array1<f64>,
-            Array1<f64>,
-            Array2<f64>,
-            Option<Array1<f64>>,
-            Array1<f64>,
-        ),
-        DataError,
-    > {
+    ) -> Result<DataFrame, DataError> {
         let pc_names: Vec<String> = (1..=num_pcs).map(|i| format!("PC{i}")).collect();
         let mut required_cols: Vec<String> = Vec::with_capacity(3 + num_pcs);
         if include_phenotype {
@@ -262,10 +240,11 @@ mod internal {
         let df = read_tsv(path)?;
         println!("Successfully loaded data file.");
 
-        if df.height() < MINIMUM_ROWS {
+        let minimum_rows = if include_phenotype { MINIMUM_ROWS } else { 1 };
+        if df.height() < minimum_rows {
             return Err(DataError::InsufficientRows {
                 found: df.height(),
-                required: MINIMUM_ROWS,
+                required: minimum_rows,
             });
         }
 
@@ -279,102 +258,21 @@ mod internal {
                 return Err(DataError::ColumnNotFound(col_name.clone()));
             }
         }
-        let has_weights = columns_set.contains("weights");
-        println!("All required columns found: {required_cols:?}");
-        if has_weights {
-            println!("Required 'weights' column found.");
-        }
-
-        let phenotype_opt = if include_phenotype {
-            Some(extract_f64_column(&df, "phenotype")?)
-        } else {
-            None
-        };
-        let pgs = extract_f64_column(&df, "score")?;
-        let sex = extract_f64_column(&df, "sex")?;
-
-        let mut pc_arrays = Vec::with_capacity(num_pcs);
-        for pc_name in &pc_names {
-            pc_arrays.push(extract_f64_column(&df, pc_name)?);
-        }
-        let pcs = stack_pc_matrix(&pc_arrays, pgs.len());
-        let weights = extract_weights(&df, require_weights, has_weights, pgs.len())?;
-
-        println!(
-            "Data validation successful: all required columns have numeric data with no missing values."
-        );
-        Ok((pgs, sex, pcs, phenotype_opt, weights))
+        Ok(df)
     }
 
-    /// Variant of `load_data` that also extracts or synthesizes sample IDs.
-    pub(super) fn load_data_with_ids(
-        path: &str,
+    pub(super) fn extract_predictors(
+        df: &DataFrame,
         num_pcs: usize,
-        include_phenotype: bool,
-        require_weights: bool,
-    ) -> Result<
-        (
-            Array1<f64>,
-            Array1<f64>,
-            Array2<f64>,
-            Option<Array1<f64>>,
-            Array1<f64>,
-            Vec<String>,
-        ),
-        DataError,
-    > {
-        let pc_names: Vec<String> = (1..=num_pcs).map(|i| format!("PC{i}")).collect();
-        let mut required_cols: Vec<String> = Vec::with_capacity(3 + num_pcs);
-        if include_phenotype {
-            required_cols.push("phenotype".to_string());
-        }
-        required_cols.push("score".to_string());
-        required_cols.push("sex".to_string());
-        required_cols.extend_from_slice(&pc_names);
-
-        println!("Loading data from '{path}'");
-        let df = read_tsv(path)?;
-        println!("Successfully loaded data file.");
-
-        if df.height() < MINIMUM_ROWS {
-            return Err(DataError::InsufficientRows {
-                found: df.height(),
-                required: MINIMUM_ROWS,
-            });
-        }
-
-        let columns_set: HashSet<String> = df
-            .get_column_names()
-            .into_iter()
-            .map(|s| s.to_string())
-            .collect();
-        for col_name in &required_cols {
-            if !columns_set.contains(col_name) {
-                return Err(DataError::ColumnNotFound(col_name.clone()));
-            }
-        }
-        let has_weights = columns_set.contains("weights");
-
-        let phenotype_opt = if include_phenotype {
-            Some(extract_f64_column(&df, "phenotype")?)
-        } else {
-            None
-        };
-        let pgs = extract_f64_column(&df, "score")?;
-        let sex = extract_f64_column(&df, "sex")?;
-
+    ) -> Result<(Array1<f64>, Array1<f64>, Array2<f64>), DataError> {
+        let pgs = extract_f64_column(df, "score")?;
+        let sex = extract_f64_column(df, "sex")?;
         let mut pc_arrays = Vec::with_capacity(num_pcs);
-        for pc_name in &pc_names {
-            pc_arrays.push(extract_f64_column(&df, pc_name)?);
+        for i in 1..=num_pcs {
+            pc_arrays.push(extract_f64_column(df, &format!("PC{i}"))?);
         }
         let pcs = stack_pc_matrix(&pc_arrays, pgs.len());
-        let weights = extract_weights(&df, require_weights, has_weights, pgs.len())?;
-        let sample_ids = extract_sample_ids(&df, pgs.len());
-
-        println!(
-            "Data validation successful: all required columns have numeric data with no missing values."
-        );
-        Ok((pgs, sex, pcs, phenotype_opt, weights, sample_ids))
+        Ok((pgs, sex, pcs))
     }
 }
 
@@ -542,6 +440,54 @@ mod tests {
         assert_abs_diff_eq!(data.p[0], 1.5, epsilon = 1e-6);
         assert_abs_diff_eq!(data.sex[0], 1.0, epsilon = 1e-6);
         assert_abs_diff_eq!(data.pcs[[0, 0]], 0.1, epsilon = 1e-6);
+    }
+
+    #[test]
+    fn prediction_accepts_one_sample_and_preserves_identifiers() {
+        for sample_id in ["000123", "sample-A", "9007199254740993"] {
+            let file = create_test_csv(&format!(
+                "sample_id\tscore\tsex\tPC1\n{sample_id}\t1.5\t1\t0.1"
+            ))
+            .unwrap();
+            let data = load_prediction_data(file.path().to_str().unwrap(), 1).unwrap();
+            assert_eq!(data.sample_ids, vec![sample_id]);
+            assert_eq!(data.pcs.shape(), &[1, 1]);
+            assert_eq!(data.p[0], 1.5);
+        }
+    }
+
+    #[test]
+    fn prediction_rejects_missing_supplied_identifiers() {
+        let file = create_test_csv("sample_id\tscore\tsex\nkept\t1.5\t1\n\t2.0\t0").unwrap();
+        assert!(matches!(
+            load_prediction_data(file.path().to_str().unwrap(), 0),
+            Err(DataError::MissingValuesFound(column)) if column == "sample_id"
+        ));
+    }
+
+    #[test]
+    fn prediction_without_ids_uses_row_numbers_and_ignores_training_columns() {
+        let file =
+            create_test_csv("score\tsex\tweights\tphenotype\n1.5\t1\tunused\tunused").unwrap();
+        let data = load_prediction_data(file.path().to_str().unwrap(), 0).unwrap();
+        assert_eq!(data.sample_ids, vec!["1"]);
+        assert_eq!(data.pcs.shape(), &[1, 0]);
+    }
+
+    #[test]
+    fn training_rejects_invalid_optional_weights() {
+        for weight in ["-1", "0"] {
+            let content = generate_csv_content(
+                "phenotype\tscore\tsex\tweights",
+                &format!("1\t1.5\t0\t{weight}"),
+                20,
+            );
+            let file = create_test_csv(&content).unwrap();
+            assert!(matches!(
+                load_training_data(file.path().to_str().unwrap(), 0),
+                Err(DataError::ColumnWrongType { column_name, .. }) if column_name == "weights"
+            ));
+        }
     }
 
     #[test]
