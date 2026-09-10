@@ -1,9 +1,13 @@
 # Biobank marginal-slope PRS validation
 
-For a bounded Workbench WDL pilot with separate baseline/PC-slope surfaces,
-competing death, cached scores, and an account guard, see [WDL.md](WDL.md).
-It shares this example's disease selector but uses an outcome-blind survival
-sample rather than the older script's balanced event/censor sample.
+Use [WDL.md](WDL.md) for the prospective AoU experiment: primary-consent
+baseline, competing death, development-only score selection, cross-fitted CTN,
+and matched baseline/PC-slope comparisons. It reuses the existing disease
+selector and pgsEngine score cache. Workspace configuration stays local.
+
+The remaining sections describe the older exploratory `run.sh` comparison.
+Its balanced event/censor sampling and attained-age target differ from the
+prospective WDL experiment; its metrics are not interchangeable with that study.
 
 A single, self-contained run that validates gnomon's marginal-slope calibration
 against standard baselines on **All of Us** microarray data.
@@ -14,8 +18,7 @@ bash run.sh --mode survival # survival GAM + Cox baselines only
 bash run.sh --mode binary   # binary GAM + logistic baselines only
 ```
 
-That is the whole analysis. `run.sh` is the only entrypoint; it drives
-`marginal_slope_diseases.py`. Nothing else is needed.
+`run.sh` drives `marginal_slope_diseases.py` for this exploratory comparison.
 
 ## What it does
 

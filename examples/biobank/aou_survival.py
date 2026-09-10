@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import importlib.metadata
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -22,6 +23,11 @@ import zipfile
 
 import numpy as np
 import pandas as pd
+
+from aou_score_transform import (assemble_scores, baseline_columns, fit_transform,
+                                 grouped_folds, score_diagnostics, transformed_score)
+from aou_checkpoint import StudyCheckpoint
+from aou_evaluation import audit_groups, paired_loss_summary
 
 
 def digest(path):
@@ -43,6 +49,7 @@ def validate_config(c):
         "max_rows_per_disease", "train_fraction", "seed", "horizons_years",
         "grid_intervals", "fit_timeout_seconds", "query_timeout_seconds",
         "maximum_bytes_billed", "min_train_events_per_cause", "min_report_count",
+        "lookback_days", "crossfit_folds", "stage1_centers", "stage1_age_k", "stage1_timeout_seconds",
     }
     if set(c) != expected:
         raise ValueError("analysis configuration has missing or unknown keys")
@@ -58,6 +65,8 @@ def validate_config(c):
         raise ValueError("unsupported PC count or training fraction")
     if min(c["baseline_centers"], c["slope_centers"]) < 4:
         raise ValueError("smooths require at least four centers")
+    if not 2 <= c["crossfit_folds"] <= 5 or c["stage1_centers"] < 4 or c["stage1_age_k"] < 4:
+        raise ValueError("stage one requires 2–5 folds and basis sizes of at least four")
     if c["min_report_count"] < 20 or c["min_train_events_per_cause"] < 20:
         raise ValueError("pilot requires at least 20 observations per reported cell/event class")
     if type(c["seed"]) is not int or not c["gamfit_version"]:
@@ -69,9 +78,11 @@ def validate_config(c):
 
 class BoundedClient:
     """Apply query budgets even to the existing selector's query calls."""
-    def __init__(self, config):
+    def __init__(self, config, account):
         from google.cloud import bigquery
-        self.client = bigquery.Client(project=config["google_project"])
+        from google.auth.compute_engine import Credentials
+        self.client = bigquery.Client(project=config["google_project"],
+                                      credentials=Credentials(service_account_email=account))
         self.config = config
         self.jobs = []
 
@@ -128,6 +139,10 @@ def read_ancestry(ancestry, prune, num_pcs):
     out = pd.DataFrame(pcs, columns=[f"PC{i + 1}" for i in range(num_pcs)])
     out["person_id"] = df.research_id.to_numpy()
     out["ancestry"] = df.ancestry_pred.to_numpy()
+    # Published max-IS pruning supplies the independent units for this pilot.
+    # Explicit group labels remain the split interface, so related units cannot
+    # be separated by inner folds if a broader group mapping is supplied.
+    out["split_group"] = out.person_id
     return out
 
 
@@ -168,22 +183,97 @@ def load_cached_score(archive, pgs):
     return result
 
 
+def cached_score_ids(archive):
+    ids = set()
+    with tarfile.open(archive, "r:*") as tar:
+        for member in tar:
+            if member.isfile() and member.name.endswith(".sscore"):
+                with tar.extractfile(member) as handle:
+                    header = handle.readline().decode("utf-8").rstrip().split("\t")
+                ids.update(name[:-4] for name in header if re.fullmatch(r"PGS\d{6}_AVG", name))
+    return ids
+
+
+def load_score_panel(path):
+    panel = json.loads(Path(path).read_text())
+    for endpoint in panel["endpoints"].values():
+        candidates = endpoint["candidates"]
+        if len(candidates) != 2 or len(set(candidates)) != 2:
+            raise ValueError("each endpoint requires exactly two prespecified scores")
+        for pgs in candidates:
+            if pgs == "PGS004787" or pgs in panel["excluded"] or pgs not in panel["scores"]:
+                raise ValueError("excluded or unaudited PGS in candidate panel")
+    return panel
+
+
+def development_partition(df, config):
+    """Outer-test rows are removed before score/model selection can see data."""
+    development = df.loc[df.is_train].copy().reset_index(drop=True)
+    development["is_train"] = development.split_group.map(lambda group:
+        int(hashlib.sha256(f"{config['seed']}:development:{group}".encode()).hexdigest()[:16], 16)
+        / 2**64 < .75)
+    development["inner_fold"] = -1
+    mask = development.is_train
+    development.loc[mask, "inner_fold"] = grouped_folds(
+        development.loc[mask, "split_group"], config["crossfit_folds"], config["seed"])
+    return development
+
+
+def select_development_score(reports, horizons):
+    losses = {}
+    for pgs, report in reports.items():
+        rows = report["models"]["pc_varying_ctn"]["metrics"]
+        overall = {row["horizon"]: row for row in rows if row["group"] == "overall"}
+        if any(h not in overall or overall[h]["status"] != "ok" for h in horizons):
+            raise ValueError("score selection needs supported development Brier scores at every horizon")
+        losses[pgs] = float(np.mean([overall[h]["brier"] for h in horizons]))
+    if len(losses) != 2 or not all(np.isfinite(list(losses.values()))):
+        raise ValueError("score selection requires two finite candidate losses")
+    return min(losses, key=lambda pgs: (losses[pgs], pgs)), losses
+
+
+def partition_support(train, test, config):
+    errors = []
+    for cause in (1, 2):
+        if (train.event_code == cause).sum() < config["min_train_events_per_cause"]:
+            errors.append(f"insufficient training events for cause {cause}")
+    if len(test) < config["min_report_count"]:
+        errors.append("too few held-out participants")
+    for horizon in config["horizons_years"]:
+        try:
+            ipcw_weights(train, test, horizon)
+        except ValueError as error:
+            errors.append(f"horizon {horizon:g}: {error}")
+    return errors
+
+
 def person_times(client, cdr):
-    # A single observed interval: never bridge unobserved gaps with MIN/MAX.
+    # AoU's primary-consent enrollment proxy, not EHR consent or first care.
+    # A single interval must cover enrollment and the prespecified lookback.
     return client.query(f"""
-      WITH periods AS (
-        SELECT person_id, observation_period_start_date AS baseline,
-               observation_period_end_date AS obs_end,
+      WITH enrollment AS (
+        SELECT o.person_id, MIN(o.observation_date) AS baseline
+        FROM `{cdr}.concept` c
+        JOIN `{cdr}.concept_ancestor` ca ON c.concept_id = ca.ancestor_concept_id
+        JOIN `{cdr}.observation` o ON ca.descendant_concept_id = o.observation_concept_id
+        WHERE c.concept_name = 'Consent PII' AND c.concept_class_id = 'Module'
+        GROUP BY o.person_id
+      ), periods AS (
+        SELECT e.person_id, e.baseline, op.observation_period_start_date AS obs_start,
+               op.observation_period_end_date AS obs_end,
                ROW_NUMBER() OVER (PARTITION BY person_id ORDER BY
                  observation_period_start_date, observation_period_end_date DESC,
                  observation_period_id) AS seq
-        FROM `{cdr}.observation_period`
+        FROM `{cdr}.observation_period` op JOIN enrollment e USING(person_id)
+        WHERE op.observation_period_start_date <= e.baseline
+          AND op.observation_period_end_date >= e.baseline
       ), deaths AS (
-        SELECT person_id, MIN(death_date) AS death_date FROM `{cdr}.death` GROUP BY person_id
+        SELECT person_id, death_date FROM `{cdr}.aou_death`
+        WHERE primary_death_record = TRUE
       )
       SELECT CAST(p.person_id AS STRING) AS person_id,
              DATE(p.birth_datetime) AS birth_date,
-             p.sex_at_birth_concept_id, o.baseline, o.obs_end, d.death_date
+             p.sex_at_birth_concept_id, o.baseline, o.obs_start, o.obs_end, d.death_date
       FROM `{cdr}.person` p JOIN periods o USING(person_id)
       LEFT JOIN deaths d USING(person_id)
       WHERE o.seq = 1
@@ -207,11 +297,12 @@ def case_dates(client, cdr, concept_id):
 def build_cohort(base, scores, cases, config):
     df = base.merge(scores, on="person_id", validate="one_to_one").merge(
         cases, on="person_id", how="left", validate="one_to_one")
-    for name in ["birth_date", "baseline", "obs_end", "death_date", "disease_date"]:
+    for name in ["birth_date", "baseline", "obs_start", "obs_end", "death_date", "disease_date"]:
         df[name] = pd.to_datetime(df[name])
     df["sex"] = df.sex_at_birth_concept_id.map({8507: 1, 8532: 0, 45880669: 1, 45878463: 0})
     df["age0"] = (df.baseline - df.birth_date).dt.days / 365.25
     eligible = (df.sex.notna() & df.age0.ge(18) & df.obs_end.gt(df.baseline)
+                & ((df.baseline - df.obs_start).dt.days >= config["lookback_days"])
                 & (df.disease_date.isna() | df.disease_date.gt(df.baseline))
                 & (df.death_date.isna() | df.death_date.gt(df.baseline)))
     df = df.loc[eligible].copy()
@@ -228,8 +319,11 @@ def build_cohort(base, scores, cases, config):
         return hashlib.sha256(f"{config['seed']}:{purpose}:{identifier}".encode()).hexdigest()
     df["sample_order"] = df.person_id.map(lambda x: hash_value(x, "sample"))
     df = df.sort_values("sample_order").head(config["max_rows_per_disease"]).copy()
-    df["is_train"] = df.person_id.map(
+    df["is_train"] = df.split_group.map(
         lambda x: int(hash_value(x, "split")[:16], 16) / 2**64 < config["train_fraction"])
+    df["inner_fold"] = -1
+    df.loc[df.is_train, "inner_fold"] = grouped_folds(
+        df.loc[df.is_train, "split_group"], config["crossfit_folds"], config["seed"])
     return df.reset_index(drop=True)
 
 
@@ -294,8 +388,7 @@ def evaluate(train, test, risk, horizons, min_count):
     for j, horizon in enumerate(horizons):
         weights = ipcw_weights(train, test, horizon)
         y = ((test.event_code == 1) & (test.followup <= horizon)).to_numpy(float)
-        groups = [("overall", np.ones(len(test), dtype=bool))]
-        groups += [(f"ancestry:{a}", test.ancestry.eq(a).to_numpy()) for a in sorted(test.ancestry.unique())]
+        groups = audit_groups(train, test)
         # Fixed probability intervals, not test-outcome-selected bins.
         for lo, hi in [(0, .01), (.01, .05), (.05, .1), (.1, .2), (.2, 1.0000001)]:
             groups.append((f"risk:{lo:g}-{min(hi, 1):g}", (risk[:, j] >= lo) & (risk[:, j] < hi)))
@@ -312,26 +405,68 @@ def evaluate(train, test, risk, horizons, min_count):
                          "observed_disease_events": disease,
                          "brier": float(np.mean(w * (target - p)**2)),
                          "mean_predicted_risk": float(p.mean()),
-                         "ipcw_observed_risk": float(np.mean(w * target))})
+                         "ipcw_observed_risk": float(np.mean(w * target)),
+                         "mean_risk_discrepancy": float(p.mean() - np.mean(w * target))})
     return rows
 
 
-def fit_worker(frame_path, config_path, model_kind, cause, output):
+def predict_bundle(directory, baseline_data, times):
+    """Replay both frozen components on new baseline observations, without fitting."""
+    import gamfit
+    directory = Path(directory)
+    spec = json.loads((directory / "spec.json").read_text())
+    times = np.asarray(times, dtype=float)
+    if times.ndim != 1 or not len(times) or not np.isfinite(times).all() or (times < 0).any() or (np.diff(times) <= 0).any():
+        raise ValueError("prediction times must be finite, nonnegative and increasing")
+    columns = baseline_columns(spec)
+    data = baseline_data[columns].copy()
+    data["entry"], data["followup"], data["event"] = 0., times[-1], 0
+    if spec["kind"] != "baseline":
+        if spec["normalizer"] == "ctn" and spec["kind"] in ("constant", "pc_varying"):
+            data["PGS"] = baseline_data.PGS.to_numpy()
+            chain = gamfit.load(directory / "chain.gamfit")
+            return np.asarray(chain.predict(data).cumulative_hazard_at(times))
+        transform = gamfit.load(directory / "transform.gamfit")
+        data["Z"] = transformed_score(transform, spec["normalizer"], baseline_data[["PGS", *columns]])
+    model = gamfit.load(directory / "model.gamfit")
+    return np.asarray(model.predict(data).cumulative_hazard_at(times))
+
+
+def fit_worker(frame_path, config_path, model_kind, cause, output, normalizer, transform_path):
     import gamfit
     config = json.loads(Path(config_path).read_text())
     df = pd.read_parquet(frame_path)
     pc_cols = [f"PC{i + 1}" for i in range(config["num_pcs"])]
-    columns = ["entry", "followup", "age0", "sex", "PGS", *pc_cols]
+    columns = ["entry", "followup", "age0", "sex", *pc_cols]
     data = df[columns].copy()
+    if model_kind != "baseline":
+        data["Z"] = df[f"Z_{normalizer}"]
     data["event"] = (df.event_code == cause).astype(int)
     train = data.loc[df.is_train].copy()
     test = data.loc[~df.is_train].copy()
     pc_args = ", ".join(pc_cols)
     baseline = f"s(age0, k=8) + sex + duchon({pc_args}, centers={config['baseline_centers']}, scale_dims=true)"
     slope = "1" if model_kind == "constant" else f"1 + duchon({pc_args}, centers={config['slope_centers']}, scale_dims=true)"
-    model = gamfit.fit(train, f"Surv(entry, followup, event) ~ {baseline}",
-                       survival_likelihood="marginal-slope", z_column="PGS",
-                       slope_formula=slope, persistent_warm_start_root=output / "warm")
+    if model_kind in ("baseline", "ordinary"):
+        rhs = baseline
+        if model_kind == "ordinary":
+            rhs += f" + duchon({pc_args}, centers={config['slope_centers']}, scale_dims=true, by=Z)"
+        model = gamfit.fit(train, f"Surv(entry, followup, event) ~ {rhs}",
+                           survival_likelihood="location-scale", noise_formula="1",
+                           persistent_warm_start_root=output / "warm")
+    else:
+        model = gamfit.fit(train, f"Surv(entry, followup, event) ~ {baseline}",
+                           survival_likelihood="marginal-slope", z_column="Z",
+                           slope_formula=slope, config={"frozen_score": True},
+                           persistent_warm_start_root=output / "warm")
+    if model_kind != "baseline":
+        transformer = gamfit.load(transform_path)
+        replay_z = transformed_score(transformer, normalizer,
+                                     df.loc[~df.is_train, ["PGS", *baseline_columns(config)]])
+        if not np.allclose(test.Z, replay_z, rtol=1e-8, atol=1e-10):
+            raise ValueError("deployment transform disagrees with held-out score artifact")
+        test["Z"] = replay_z
+        shutil.copyfile(transform_path, output / "transform.gamfit")
     horizons = np.asarray(config["horizons_years"])
     coarse = np.unique(np.r_[np.linspace(0, horizons[-1], config["grid_intervals"] + 1), horizons])
     grid = np.sort(np.r_[coarse, (coarse[:-1] + coarse[1:]) / 2])
@@ -341,14 +476,33 @@ def fit_worker(frame_path, config_path, model_kind, cause, output):
     prediction = model.predict(test)
     h = np.asarray(prediction.cumulative_hazard_at(grid))
     model.save(output / "model.gamfit")
-    restored = gamfit.load(output / "model.gamfit")
-    replayed = np.asarray(restored.predict(test).cumulative_hazard_at(grid))
-    if h.shape != (len(test), len(grid)) or not np.allclose(h, replayed, rtol=1e-7, atol=1e-9):
-        raise ValueError("save/load cumulative-hazard predictions disagree")
-    np.savez(output / "hazards.npz", hazards=h, grid=grid, coarse=coarse)
+    if normalizer == "ctn" and model_kind in ("constant", "pc_varying"):
+        from aou_score_transform import stage1_rhs
+        recipe = gamfit.CtnStage1("PGS", stage1_rhs(config), fold_column="inner_fold",
+                                 group_column="split_group")
+        fold_digest = hashlib.sha256(df.loc[df.is_train, "inner_fold"].to_numpy("<i8").tobytes()).hexdigest()
+        gamfit.CtnMarginalSlopeModel(transformer, model, recipe, fold_digest,
+                                     score_column="Z").save(output / "chain.gamfit")
+    if model_kind in ("constant", "pc_varying"):
+        payload = json.loads((output / "model.gamfit").read_text())["payload"]
+        if payload["latent_z_rank_int_calibration"] is not None or payload["latent_z_conditional_calibration"] is not None:
+            raise ValueError("outcome fit changed the frozen latent score; matched comparison is invalid")
     write_json(output / "spec.json", {"baseline": baseline, "slope": slope, "cause": cause,
-                                      "score_path": "z_column fitted latent-score gate",
-                                      "cross_fitted_ctn": False})
+                                      "kind": model_kind, "normalizer": normalizer,
+                                      "num_pcs": config["num_pcs"],
+                                      "score_path": "explicit cross-fitted scores; frozen deployment transform",
+                                      "orthogonality_claim": False})
+    replayed = predict_bundle(output, df.loc[~df.is_train], grid)
+    if h.shape != (len(test), len(grid)) or not np.allclose(h, replayed, rtol=1e-7, atol=1e-9):
+        raise ValueError("combined transform/outcome save/load predictions disagree")
+    held = df.loc[~df.is_train]
+    small = np.arange(min(3, len(held)))
+    batch = predict_bundle(output, held.iloc[small[::-1]], grid)
+    alone = predict_bundle(output, held.iloc[[0]], grid)
+    if not (np.allclose(batch, h[small[::-1]], rtol=1e-7, atol=1e-9)
+            and np.allclose(alone, h[[0]], rtol=1e-7, atol=1e-9)):
+        raise ValueError("prediction changes with batch composition or row ordering")
+    np.savez(output / "hazards.npz", hazards=h, grid=grid, coarse=coarse)
 
 
 def bounded_fit(command, timeout_seconds, log):
@@ -374,72 +528,228 @@ def bounded_fit(command, timeout_seconds, log):
             raise RuntimeError("fit failed; inspect the private task fit log")
 
 
+def analyze_partition(df, config, args, disease_dir, checkpoint, candidates):
+    """Analyze an explicit development or outer-test partition with bounded steps."""
+    df = df.copy()
+    disease_dir.mkdir(parents=True, exist_ok=True)
+    slug = disease_dir.name
+    frame = disease_dir / "cohort.parquet"
+    df.to_parquet(frame, index=False)
+    train, test = df.loc[df.is_train], df.loc[~df.is_train]
+    errors = partition_support(train, test, config)
+    if errors:
+        raise ValueError("; ".join(errors))
+    transforms = {}
+    transform_diagnostics = {}
+    groups = audit_groups(train, test)
+    for normalizer in sorted({normalizer for _, normalizer in candidates} - {"none"}):
+        artifacts = []
+        for fold in [*range(config["crossfit_folds"]), -1]:
+            stage_dir = disease_dir / f"{normalizer}_fold_{fold}"
+            stage_dir.mkdir(exist_ok=True)
+            command = [sys.executable, str(Path(__file__).resolve()), "transform",
+                       "--frame", str(frame), "--config", str(args.config.resolve()),
+                       "--normalizer", normalizer, "--fold", str(fold), "--output", str(stage_dir)]
+            print(f"Transforming {slug}: {normalizer}, fold {fold}", flush=True)
+            if not checkpoint.step_is_complete(stage_dir, model=True):
+                bounded_fit(command, config["stage1_timeout_seconds"], stage_dir / "fit.log")
+                files = ["scores.npz", "transform.gamfit"]
+                if fold < 0:
+                    files.append("training_replay.npy")
+                checkpoint.complete_step(stage_dir, files, model=True)
+            artifacts.append(stage_dir / "scores.npz")
+            if fold == -1:
+                transforms[normalizer] = stage_dir / "transform.gamfit"
+        df[f"Z_{normalizer}"] = assemble_scores(df, artifacts)
+        transform_diagnostics[normalizer] = score_diagnostics(
+            df.loc[~df.is_train, f"Z_{normalizer}"].to_numpy(), groups, config["min_report_count"])
+        full_train_z = np.load(disease_dir / f"{normalizer}_fold_-1" / "training_replay.npy")
+        oof_z = df.loc[df.is_train, f"Z_{normalizer}"].to_numpy()
+        transform_diagnostics[f"{normalizer}_oof_deployment_rms_difference"] = float(
+            np.sqrt(np.mean((oof_z - full_train_z)**2)))
+    frame = disease_dir / "transformed.parquet"
+    df.to_parquet(frame, index=False)
+    models = {}
+    candidate_risks = {}
+    for kind, normalizer in candidates:
+        candidate = f"{kind}_{normalizer}"
+        hazards = []
+        for cause in (1, 2):
+            fit_dir = disease_dir / f"{candidate}_{cause}"
+            fit_dir.mkdir(exist_ok=True)
+            command = [sys.executable, str(Path(__file__).resolve()), "fit",
+                       "--frame", str(frame), "--config", str(args.config.resolve()),
+                       "--kind", kind, "--normalizer", normalizer,
+                       "--cause", str(cause), "--output", str(fit_dir)]
+            if kind != "baseline":
+                command += ["--transform-model", str(transforms[normalizer])]
+            print(f"Fitting {slug}: {candidate}, cause {cause}", flush=True)
+            if not checkpoint.step_is_complete(fit_dir, model=True):
+                bounded_fit(command, config["fit_timeout_seconds"], fit_dir / "fit.log")
+                files = ["hazards.npz", "model.gamfit", "spec.json"]
+                if kind != "baseline":
+                    files.append("transform.gamfit")
+                if normalizer == "ctn" and kind in ("constant", "pc_varying"):
+                    files.append("chain.gamfit")
+                checkpoint.complete_step(fit_dir, files, model=True)
+            with np.load(fit_dir / "hazards.npz") as saved:
+                hazards.append(saved["hazards"])
+                grid, coarse = saved["grid"], saved["coarse"]
+        fine_cif = cif_from_hazards(hazards)
+        coarse_indices = np.searchsorted(grid, coarse)
+        coarse_cif = cif_from_hazards(np.asarray(hazards)[:, :, coarse_indices])
+        error = float(np.max(np.abs(fine_cif[:, :, coarse_indices] - coarse_cif)))
+        if error > 0.001:
+            raise ValueError("CIF grid refinement differs by >0.001; increase grid_intervals")
+        indices = np.searchsorted(grid, config["horizons_years"])
+        risk = fine_cif[0][:, indices]
+        candidate_risks[candidate] = risk
+        models[candidate] = {"cif_grid_error": error, "metrics": evaluate(
+            train, test, risk, config["horizons_years"], config["min_report_count"])}
+    comparisons = []
+    for j, horizon in enumerate(config["horizons_years"]):
+        weights = ipcw_weights(train, test, horizon)
+        target = ((test.event_code == 1) & (test.followup <= horizon)).to_numpy(float)
+        full_loss = weights * (target - candidate_risks["pc_varying_ctn"][:, j])**2
+        for candidate, risk in candidate_risks.items():
+            if candidate == "pc_varying_ctn":
+                continue
+            reference_loss = weights * (target - risk[:, j])**2
+            for label, mask in groups:
+                known = weights[mask] > 0
+                events = int(target[mask][known].sum())
+                if min(events, int(known.sum()) - events,
+                       test.loc[mask, "split_group"].nunique()) < config["min_report_count"]:
+                    comparisons.append({"reference": candidate, "group": label,
+                                        "horizon": horizon, "status": "insufficient_support"})
+                    continue
+                comparisons.append({"reference": candidate, "model": "pc_varying_ctn",
+                                    "group": label, "horizon": horizon, "status": "ok",
+                                    **paired_loss_summary(reference_loss, full_loss, mask, test.split_group)})
+    return {"models": models, "score_diagnostics": transform_diagnostics,
+            "paired_comparisons": comparisons}, candidate_risks
+
+
 def run(args):
     from aou_identity import task_account
     execution_account = task_account()
     from disease_selection import select_runtime_diseases
     config = json.loads(args.config.read_text())
     validate_config(config)
+    panel = load_score_panel(args.score_panel)
     import gamfit
     if gamfit.__version__ != config["gamfit_version"]:
         raise ValueError("gamfit version does not match the analysis configuration")
+    if not args.prepare_only:
+        # Reject an old wheel before queries or expensive score-model fits.
+        validation = gamfit.validate_formula(
+            pd.DataFrame({"entry": [0.] * 6, "followup": [1., 2., 3., 4., 5., 6.],
+                          "event": [0, 1, 0, 1, 0, 1], "Z": [-2., -1., -.5, .5, 1., 2.]}),
+            "Surv(entry, followup, event) ~ 1", survival_likelihood="marginal-slope",
+            z_column="Z", slope_formula="1", config={"frozen_score": True})
+        if not validation.supported_by_python:
+            raise ValueError("native engine does not support the frozen-score survival contract")
     image = json.loads(args.runtime_image.read_text())
     if not re.fullmatch(r"[^\s]+@sha256:[0-9a-f]{64}", image):
         raise ValueError("runtime_image must use an immutable digest")
-    args.output.mkdir(parents=True)
-    client = BoundedClient(config)
-    phenotypes = unpack_phenotypes(args.phenotypes, args.output / "phenotypes")
-    diseases = select_runtime_diseases(client, config["workspace_cdr"], config["top_n_diseases"], phenotypes)
-    if not diseases:
-        raise ValueError("the existing disease selector found no eligible mapped disease")
-    diseases = dict(list(diseases.items())[:config["disease_limit"]])
-    score_cache = unpack_score_cache(args.scores, args.output / "scores.tar")
-    ancestry = read_ancestry(args.ancestry, args.prune, config["num_pcs"])
-    base = ancestry.merge(person_times(client, config["workspace_cdr"]), on="person_id", validate="one_to_one")
+    sources = [Path(__file__), *[Path(__file__).with_name(name) for name in
+               ("aou_identity.py", "aou_score_transform.py", "aou_checkpoint.py",
+                "aou_evaluation.py", "disease_selection.py")]]
+    signature = {"config": config, "sources": {p.name: digest(p) for p in sources},
+                 "inputs": {key: digest(getattr(args, key)) for key in
+                            ("scores", "ancestry", "prune", "phenotypes", "score_panel")}}
+    checkpoint = StudyCheckpoint(args.output, args.checkpoint_uri, config["google_project"],
+                                 execution_account, signature, args.resume,
+                                 engine_hash=digest(importlib.util.find_spec("gamfit._rust").origin))
+    prepared_path = args.output / "prepared.json"
+    client = BoundedClient(config, execution_account)
+    if prepared_path.exists():
+        prepared = json.loads(prepared_path.read_text())
+        diseases = prepared["diseases"]
+        for slug in diseases:
+            if diseases[slug].get("missing_scores"):
+                continue
+            if not checkpoint.step_is_complete(args.output / slug):
+                raise ValueError("prepared cohort checkpoint is incomplete")
+    else:
+        phenotypes = unpack_phenotypes(args.phenotypes, args.output / "phenotypes")
+        diseases = select_runtime_diseases(client, config["workspace_cdr"], config["top_n_diseases"], phenotypes)
+        if not diseases:
+            raise ValueError("the existing disease selector found no eligible mapped disease")
+        diseases = {slug: {**disease, "candidates": panel["endpoints"][slug]["candidates"]}
+                    for slug, disease in diseases.items() if slug in panel["endpoints"]}
+        diseases = dict(list(diseases.items())[:config["disease_limit"]])
+        if not diseases:
+            raise ValueError("no prespecified endpoint passed the existing disease selection rule")
+        score_cache = unpack_score_cache(args.scores, args.output / "scores.tar")
+        available_scores = cached_score_ids(score_cache)
+        ancestry = read_ancestry(args.ancestry, args.prune, config["num_pcs"])
+        base = ancestry.merge(person_times(client, config["workspace_cdr"]), on="person_id", validate="one_to_one")
+        for slug, disease in diseases.items():
+            disease["missing_scores"] = sorted(set(disease["candidates"]) - available_scores)
+            if disease["missing_scores"]:
+                continue
+            first, second = disease["candidates"]
+            scores = load_cached_score(score_cache, first)
+            scores[first] = scores.PGS
+            scores = scores.merge(load_cached_score(score_cache, second).rename(columns={"PGS": second}),
+                                  on="person_id", validate="one_to_one")
+            cases = case_dates(client, config["workspace_cdr"], disease["concept_id"])
+            df = build_cohort(base, scores, cases, config)
+            disease_dir = args.output / slug
+            disease_dir.mkdir(exist_ok=True)
+            df.to_parquet(disease_dir / "cohort.parquet", index=False)
+            checkpoint.complete_step(disease_dir, ["cohort.parquet"])
+        prepared = {"diseases": diseases, "query_job_ids": [job.job_id for job in client.jobs]}
+        write_json(prepared_path, prepared)
+        checkpoint.publish()
     results = {}
     for slug, disease in diseases.items():
-        print(f"Preparing {slug} ({disease['pgs']})", flush=True)
-        scores = load_cached_score(score_cache, disease["pgs"])
-        cases = case_dates(client, config["workspace_cdr"], disease["concept_id"])
-        df = build_cohort(base, scores, cases, config)
-        train, test = df.loc[df.is_train], df.loc[~df.is_train]
-        for cause in (1, 2):
-            if (train.event_code == cause).sum() < config["min_train_events_per_cause"]:
-                raise ValueError("insufficient training events in pilot; increase the outcome-blind sample budget")
-        if len(test) < config["min_report_count"]:
-            raise ValueError("pilot has too few held-out participants")
-        # Verify evaluation support before spending time fitting.
-        for horizon in config["horizons_years"]:
-            ipcw_weights(train, test, horizon)
+        print(f"Preparing {slug} ({', '.join(disease['candidates'])})", flush=True)
+        if disease["missing_scores"]:
+            if not args.prepare_only:
+                raise ValueError(f"{slug}: prespecified scores missing from pgsEngine cache: {disease['missing_scores']}")
+            results[slug] = {"status": "missing_scores", "missing_scores": disease["missing_scores"]}
+            continue
         disease_dir = args.output / slug
-        disease_dir.mkdir()
         frame = disease_dir / "cohort.parquet"
-        df.to_parquet(frame, index=False)
-        models = {}
-        for kind in ("constant", "pc_varying"):
-            hazards = []
-            for cause in (1, 2):
-                fit_dir = disease_dir / f"{kind}_{cause}"
-                fit_dir.mkdir()
-                command = [sys.executable, str(Path(__file__).resolve()), "fit",
-                           "--frame", str(frame), "--config", str(args.config.resolve()),
-                           "--kind", kind, "--cause", str(cause), "--output", str(fit_dir)]
-                print(f"Fitting {slug}: {kind}, cause {cause}", flush=True)
-                bounded_fit(command, config["fit_timeout_seconds"], fit_dir / "fit.log")
-                with np.load(fit_dir / "hazards.npz") as saved:
-                    hazards.append(saved["hazards"])
-                    grid, coarse = saved["grid"], saved["coarse"]
-            fine_cif = cif_from_hazards(hazards)
-            coarse_indices = np.searchsorted(grid, coarse)
-            coarse_cif = cif_from_hazards(np.asarray(hazards)[:, :, coarse_indices])
-            error = float(np.max(np.abs(fine_cif[:, :, coarse_indices] - coarse_cif)))
-            if error > 0.001:
-                raise ValueError("CIF grid refinement differs by >0.001; increase grid_intervals")
-            indices = np.searchsorted(grid, config["horizons_years"])
-            risk = fine_cif[0][:, indices]
-            models[kind] = {"cif_grid_error": error, "metrics": evaluate(
-                train, test, risk, config["horizons_years"], config["min_report_count"])}
-        results[slug] = {"pgs": disease["pgs"], "concept_id": disease["concept_id"], "models": models}
+        df = pd.read_parquet(frame)
+        train, test = df.loc[df.is_train], df.loc[~df.is_train]
+        support_errors = partition_support(train, test, config)
+        development = development_partition(df, config)
+        support_errors += [f"development: {error}" for error in partition_support(
+            development.loc[development.is_train], development.loc[~development.is_train], config)]
+        if args.prepare_only:
+            counts = {"training": len(train), "held_out": len(test),
+                      "training_disease_events": int((train.event_code == 1).sum()),
+                      "training_deaths": int((train.event_code == 2).sum())}
+            results[slug] = {"status": "unsupported" if support_errors else "cohort_ready",
+                             "candidates": disease["candidates"], "support_errors": support_errors,
+                             "counts": {key: value if value >= config["min_report_count"] else None
+                                        for key, value in counts.items()}}
+            continue
+        if support_errors:
+            raise ValueError("; ".join(support_errors))
+        development = development_partition(df, config)
+        selection_reports = {}
+        for pgs in disease["candidates"]:
+            development["PGS"] = development[pgs]
+            report, _ = analyze_partition(development, config, args,
+                disease_dir / "development" / pgs, checkpoint, [("pc_varying", "ctn")])
+            selection_reports[pgs] = report
+        selected, losses = select_development_score(selection_reports, config["horizons_years"])
+        # Commit the choice before any outer-test fit/evaluation. Every method
+        # below receives this same score and exactly the same cohort rows.
+        choice = {"selected_pgs": selected, "development_brier": losses,
+                  "criterion": "unweighted mean of horizon-specific development Brier scores"}
+        write_json(disease_dir / "score_selection.json", choice)
+        checkpoint.publish()
+        df["PGS"] = df[selected]
+        report, _ = analyze_partition(df, config, args, disease_dir / "final", checkpoint,
+            [("baseline", "none"), ("constant", "ctn"), ("pc_varying", "ctn"),
+             ("pc_varying", "location_scale"), ("ordinary", "ctn")])
+        results[slug] = {"concept_id": disease["concept_id"], "score_selection": choice,
+                         "development": selection_reports, **report}
     write_json(args.output / "metrics.json", results)
     write_json(args.output / "provenance.json", {
         "config": config, "runtime_image": image, "gamfit_build": gamfit.build_info(),
@@ -447,13 +757,18 @@ def run(args):
         "packages": {d.metadata["Name"]: d.version for d in importlib.metadata.distributions()},
         "input_sha256": {key: digest(getattr(args, key)) for key in ["config", "scores", "ancestry", "prune", "phenotypes"]},
         "runner_sha256": digest(__file__), "selector_sha256": digest(Path(__file__).with_name("disease_selection.py")),
-        "query_job_ids": [job.job_id for job in client.jobs],
-        "target": "first recorded disease within the first continuous EHR observation period, competing death",
-        "baseline": "first observation_period_start_date; not recruitment",
-        "validation": "outcome-blind holdout after AoU published relatedness prune; no model selection claim",
-        "score_transform": "gamfit z_column gate; no claim of cross-fitted CTN or conditional Gaussian adequacy",
+        "query_job_ids": prepared["query_job_ids"],
+        "analysis_status": "cohort_only" if args.prepare_only else "completed",
+        "target": "first qualifying recorded disease after primary consent, competing death",
+        "baseline": "AoU primary-consent date (Consent PII Module descendants); continuous EHR lookback",
+        "validation": "group holdout after published relatedness prune; 75/25 development split within outer training selects PGS; outer test evaluates matched methods",
+        "score_panel": panel,
+        "score_transform": "explicit cross-fitted CTN and location-scale models; frozen latent scores",
+        "orthogonality_claim": False,
+        "paired_uncertainty": "group-robust normal intervals conditional on fitted models and training censoring estimates",
         "censoring_model": "training-only reverse Kaplan-Meier stratified by reported genetic ancestry",
     })
+    checkpoint.publish()
     print("Completed bounded pilot; aggregate metrics and provenance written", flush=True)
 
 
@@ -461,18 +776,35 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     run_parser = sub.add_parser("run")
-    for name in ["config", "phenotypes", "scores", "ancestry", "prune", "runtime-image", "output"]:
+    for name in ["config", "phenotypes", "scores", "ancestry", "prune", "runtime-image", "score-panel", "output"]:
         run_parser.add_argument(f"--{name}", type=Path, required=True)
+    run_parser.add_argument("--checkpoint-uri", required=True)
+    run_parser.add_argument("--resume", type=Path)
+    run_parser.add_argument("--prepare-only", action="store_true")
     fit_parser = sub.add_parser("fit")
     for name in ["frame", "config", "output"]:
         fit_parser.add_argument(f"--{name}", type=Path, required=True)
-    fit_parser.add_argument("--kind", choices=["constant", "pc_varying"], required=True)
+    fit_parser.add_argument("--kind", choices=["baseline", "constant", "pc_varying", "ordinary"], required=True)
+    fit_parser.add_argument("--normalizer", choices=["ctn", "location_scale", "none"], required=True)
+    fit_parser.add_argument("--transform-model", type=Path)
     fit_parser.add_argument("--cause", type=int, choices=[1, 2], required=True)
+    transform_parser = sub.add_parser("transform")
+    for name in ["frame", "config", "output"]:
+        transform_parser.add_argument(f"--{name}", type=Path, required=True)
+    transform_parser.add_argument("--normalizer", choices=["ctn", "location_scale"], required=True)
+    transform_parser.add_argument("--fold", type=int, required=True)
     args = parser.parse_args()
     if args.command == "run":
         run(args)
+    elif args.command == "transform":
+        fit_transform(args.frame, args.config, args.normalizer, args.fold, args.output)
     else:
-        fit_worker(args.frame, args.config, args.kind, args.cause, args.output)
+        if (args.kind == "baseline") != (args.normalizer == "none"):
+            parser.error("only the no-score baseline uses normalizer=none")
+        if args.kind != "baseline" and args.transform_model is None:
+            parser.error("score models require a saved deployment transform")
+        fit_worker(args.frame, args.config, args.kind, args.cause, args.output,
+                   args.normalizer, args.transform_model)
 
 
 if __name__ == "__main__":

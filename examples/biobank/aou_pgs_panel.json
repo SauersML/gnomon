@@ -1,0 +1,65 @@
+{
+  "checked_date": "2026-09-10",
+  "status": "Prespecified development candidates; no benchmark ranking or participant-level non-overlap certification.",
+  "selection_rule": "Select using development predictions only; give the selected score to every matched downstream method. Never choose using the outer test set or published AoU performance.",
+  "provenance_rule": "Audit discovery GWAS, component scores and supervised tuning. Prior AoU evaluation is distinct from development. Undisclosed cross-enrollment cannot be excluded by public cohort names.",
+  "endpoints": {
+    "copd": {
+      "snomed_code": "13645005",
+      "candidates": ["PGS004536", "PGS001783"]
+    },
+    "hypertension": {
+      "snomed_code": "38341003",
+      "candidates": ["PGS004525", "PGS004603"]
+    },
+    "obesity": {
+      "snomed_code": "414916001",
+      "candidates": ["PGS005199", "PGS005331"]
+    }
+  },
+  "scores": {
+    "PGS004536": {
+      "trait": "COPD/J44",
+      "catalog_url": "https://www.pgscatalog.org/score/PGS004536/",
+      "reported_development": "UK Biobank; disease and risk-factor meta-score",
+      "component_audit": "pending"
+    },
+    "PGS001783": {
+      "trait": "COPD",
+      "catalog_url": "https://www.pgscatalog.org/score/PGS001783/",
+      "reported_development": "Multi-ancestry GBMI; PRS-CS-auto with European LD reference; no AoU source cohort listed",
+      "component_audit": "not a compound meta-score"
+    },
+    "PGS004525": {
+      "trait": "Hypertension",
+      "catalog_url": "https://www.pgscatalog.org/score/PGS004525/",
+      "reported_development": "UK Biobank; disease and risk-factor meta-score",
+      "component_audit": "pending"
+    },
+    "PGS004603": {
+      "trait": "Systolic blood pressure; applied to incident hypertension",
+      "catalog_url": "https://www.pgscatalog.org/score/PGS004603/",
+      "reported_development": "BioVU, ICBP, MVP and UK Biobank; AoU listed for evaluation",
+      "component_audit": "not a compound meta-score"
+    },
+    "PGS005199": {
+      "trait": "BMI; applied to incident recorded obesity",
+      "catalog_url": "https://www.pgscatalog.org/score/PGS005199/",
+      "reported_development": "Five-ancestry PRS-CSx META; no AoU source cohort listed",
+      "component_audit": "not a compound meta-score",
+      "license": "CC BY-NC-ND 4.0; source terms apply"
+    },
+    "PGS005331": {
+      "trait": "BMI; applied to incident recorded obesity",
+      "catalog_url": "https://www.pgscatalog.org/score/PGS005331/",
+      "reported_development": "European-optimized multi-trait score, final development in UK Biobank; AoU evaluation",
+      "component_audit": "pending"
+    }
+  },
+  "excluded": {
+    "PGS004787": {
+      "catalog_url": "https://www.pgscatalog.org/score/PGS004787/",
+      "reason": "Catalog lists 37,851 AoU participants in score development. A new random holdout does not remove upstream contribution."
+    }
+  }
+}

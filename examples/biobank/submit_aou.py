@@ -87,9 +87,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--analysis", type=Path, default=HERE / "aou_analysis.json")
     parser.add_argument("--check", action="store_true")
+    parser.add_argument("--prepare-only", action="store_true")
+    parser.add_argument("--resume", help="Workspace gs:// checkpoint object from a previous run")
     args = parser.parse_args()
     wb = Workbench()
     inputs = prepare_inputs()
+    if args.resume:
+        if not args.resume.startswith(wb.bucket + "/"):
+            raise ValueError("resume checkpoint must be in the selected workspace bucket")
+        inputs["aou_survival.resume_checkpoint"] = args.resume
     config = json.loads(args.analysis.read_text())
     if "google_project" in config or "workspace_cdr" in config:
         raise ValueError("deployment project/CDR must come from the environment")
@@ -116,6 +122,10 @@ def main():
     sources = {"runner": HERE / "aou_survival.py",
                "disease_selector": HERE / "disease_selection.py",
                "identity_guard": HERE / "aou_identity.py",
+               "score_transform": HERE / "aou_score_transform.py",
+               "checkpoint_code": HERE / "aou_checkpoint.py",
+               "evaluation_code": HERE / "aou_evaluation.py",
+               "score_panel": HERE / "aou_pgs_panel.json",
                "requirements": HERE / "aou_requirements.txt"}
     encoded = (json.dumps(config, sort_keys=True, indent=2) + "\n").encode()
     checksum = hashlib.sha256(encoded + (HERE / "aou_survival.wdl").read_bytes())
@@ -128,6 +138,8 @@ def main():
     config_path.write_bytes(encoded)
     sources["analysis_config"] = config_path
     prefix = f"workflows/{run_id}"
+    inputs["aou_survival.checkpoint_uri"] = f"{wb.bucket}/workflow-checkpoints/{run_id}.tar.gz"
+    inputs["aou_survival.prepare_only"] = args.prepare_only
     for name, path in sources.items():
         uri = f"{wb.bucket}/{prefix}/{path.name}"
         wb.wb("gsutil", "cp", str(path), uri)

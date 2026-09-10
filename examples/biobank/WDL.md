@@ -1,78 +1,115 @@
-# AoU survival WDL
+# AoU prospective survival workflow
 
-`aou_survival.wdl` runs a bounded real-data pilot inside an authorized AoU
-Workbench workspace. Its launcher follows the `wb workflow create` / `wb
-workflow job run` pattern in `pgsEngine/pipeline/aou/workbench`.
+This workflow runs in the real AoU workspace and reuses pgsEngine's existing
+`shared_features.tar.gz`. Workspace identifiers and the authorized account
+come from local environment variables; neither belongs in the repository.
 
-## Data and disease selection
+## Cohort and endpoint selection
 
-The workflow imports the **same** `disease_selection.py` as the existing
-`marginal_slope_diseases.py` example. It resolves the curated SNOMED/PGS map,
-extracts single-root reference disease concepts from a staged OHDSI Phenotype
-Library snapshot, ranks all canonical disease roots in the active CDR, then
-keeps PGS-mapped diseases within the top 20. `disease_limit=1` initially runs the
-first eligible disease in that ordering. No disease name is supplied manually.
-The reference-root rule is a first-recorded-condition phenotype, not execution
-of the complete OHDSI cohort definition with all its eligibility criteria.
+The shared selector ranks all canonical OHDSI disease roots by recorded case
+count, then intersects the top 20 with its disease map. The survival experiment
+further restricts that set to the COPD, hypertension and obesity endpoints in
+[aou_pgs_panel.json](aou_pgs_panel.json). This is a first-recorded-condition
+phenotype using those roots and descendants, not the complete OHDSI algorithm.
 
-Cached scores come from pgsEngine's existing **`shared_features.tar.gz`**.
-The task extracts only its inner `scores.tar` containing Gnomon `.sscore`
-files. Each selected PGS must have exactly one `PGSnnnnnn_AVG` column source and
-an `IID`/`#IID` column. The runner refuses missing or ambiguous scores. It does
-not localize the genotype callset or repeat scoring. The existing disease map
-and pgsEngine's disease registry differ: check that the selected score is in
-the cache rather than silently substituting another PGS.
+Baseline is the first primary-consent date from observations descended from
+the `Consent PII` Module concept, following the
+[AoU enrollment documentation](https://support.researchallofus.org/hc/en-us/articles/13176125767188-How-to-find-participant-enrollment-data).
+A single EHR observation interval must cover baseline and the prespecified
+365-day lookback. Adults with recorded disease or death at/before baseline
+are excluded. We do not require future disease-free observation to enter.
 
-PCs and ancestry labels come from the CDR's `ancestry_preds.tsv` columns
-`research_id`, `pca_features`, and `ancestry_pred`. The published
-`samples_relatedness_flagged_samples.tsv` (`research_id` header) is required.
-Participants on that prune list are removed before the outcome-blind sample
-and train/test split. This uses AoU's published relatedness threshold; it is
-not a claim that all remaining distant relatives are independent.
+Follow-up ends at the earliest qualifying diagnosis, primary death record
+from `aou_death`, or the covering observation interval's end. Observation
+gaps are not bridged. Same-day disease/death ties are excluded because their
+ordering is unknown. This predicts recorded diagnosis, not biological onset.
+The resolved CDR release is recorded; horizons must be supported by that
+release's actual follow-up.
 
-Follow-up starts at the **first EHR observation period**, matching the existing
-example's available time source, not at recruitment. Only that single interval
-is used; observation gaps are not bridged. Adults with disease/death on or
-before entry are excluded. Follow-up ends at disease, death, or the interval's
-end, whichever comes first. Same-day disease/death ties are excluded because
-their order is unresolved. This estimates first recorded disease under EHR
-ascertainment; a recruitment-based prospective study needs a recruitment-date
-cohort definition instead. Sex uses the explicit AoU sex-at-birth concept map.
+PCs use `research_id`, `pca_features`, and `ancestry_pred` from the release's
+ancestry file. The published relatedness-prune list is applied before sampling
+or splitting. Remaining person IDs are the pilot's split groups. This is not
+full pedigree reconstruction or a claim that distant relatives are independent.
 
-## Model and outputs
+## Score selection and matched models
 
-Both candidates use `Surv(entry, followup, event)` with time since entry,
-baseline age, sex, and a joint six-PC Duchon baseline surface (32 centers).
-The constant-slope candidate has `slope_formula="1"`; the PC-varying candidate
-has an intercept and a smaller joint Duchon PC surface (16 centers). Each is
-fit separately for disease and competing death. The score is supplied only as
-`z_column="PGS"`, never in the baseline/slope formulas. There is no frailty or
-follow-up-time slope margin in this specification.
+The prespecified pairs are COPD PGS004536/PGS001783, hypertension
+PGS004525/PGS004603, and obesity PGS005199/PGS005331. The panel records exact
+Catalog sources and pending component-provenance audits. PGS004787 is excluded
+because its documented score development includes AoU. Public cohort metadata
+does not establish participant-level non-overlap.
 
-This uses gamfit's fitted/replayed latent-score gate. It **does not claim** to
-repair or invoke the integrated cross-fitted CTN entry point. The conditional
-normal score assumption still needs held-out distribution diagnostics before
-claiming a marginal interpretation. These fits also use the formula API,
-not the current Gnomon calibration adapter's different term construction.
+Every required score must exist in the real cache as a unique
+`PGSnnnnnn_AVG` column with participant IDs. Missing scores are reported by
+preflight and stop model fitting; no score is substituted. Score pairs use the
+same complete-case cohort.
 
-Each fit must reproduce cumulative hazards after save/load. The runner checks
-finite, monotone hazards, combines disease/death hazard increments into CIFs
-conditional on event-free entry, and requires the fine/coarse grid difference
-to be at most 0.001. It reports horizon-specific disease Brier scores and
-mean-predicted versus IPCW-observed risks overall, by ancestry, and within
-fixed predicted-risk intervals. Training-only ancestry-stratified reverse KM
-estimates censoring. This assumes sufficient censoring independence within
-those strata; it does not adjust censoring for every clinical predictor.
+A seeded group split reserves 20% as outer test. The remaining development
+sample is split 75/25 by group. Each candidate score gets the same CTN plus
+PC-varying marginal-slope predictor, fitted only on development-training rows.
+Mean development Brier score across the prespecified horizons selects the
+score. The choice is recorded before outer-test evaluation. Selection fails
+when either candidate lacks supported development metrics.
 
-Cells with fewer than 20 observed disease events or known noncases are marked
-`insufficient_support`. That is not evidence of calibration. The same holdout
-compares both fixed candidates; it is not a locked evaluation of a selected or
-recalibrated winner. No post-hoc calibration layer is fitted in this pilot.
+The selected PGS is then shared by all five methods refitted on outer training:
 
-Workflow outputs are `metrics.json` and `provenance.json`. Models, participant
-frames, predictions and raw fit logs remain internal workspace task artifacts.
-Aggregate output declarations do not constitute approval to export artifacts
-from AoU; the existing workspace's data-use controls still apply.
+- Flexible baseline without PGS.
+- Cross-fitted CTN with constant marginal slope.
+- Cross-fitted CTN with PC-varying marginal slope.
+- Conditional Gaussian location–scale normalization with the same PC-varying outcome.
+- CTN with an ordinary varying-coefficient Gaussian transformation-survival model.
+
+The baseline has age, sex and a joint six-PC Duchon surface (32 centers).
+The score surface has 16 centers and a time-constant signed slope. No frailty,
+ensemble, manifold or post-hoc calibration stack is enabled. The ordinary
+comparator uses Gaussian location–scale survival; its time representation and
+penalties differ, so this is not a pure unrestricted reparameterization test.
+
+CTN and location–scale transforms condition on baseline age, sex and PCs.
+Each internal fold fits its own transformation on the complement. A separate
+full-training transform is saved for deployment. CTN uses
+`transformation_score`, never its conditional-mean `predict` operation.
+The outcome consumes frozen latent scores; no second normalization or influence
+absorber is fitted. [GAM PR #2882](https://github.com/SauersML/gam/pull/2882)
+supplies `frozen_score` and the saved
+`CtnMarginalSlopeModel` used by the CTN marginal-slope bundles. A stock wheel
+without that contract is rejected before analysis queries.
+
+## Evaluation, persistence and limits
+
+Separate disease and death components produce disease cumulative incidence.
+This is not disease-only `1-S`. Saved predictions must be finite, monotone,
+stable under save/load, row ordering and batch membership. The CIF grid
+refinement error must be at most 0.001. Prediction horizons are explicit;
+observed diagnosis/censoring times are excluded from prediction inputs.
+
+Metrics include horizon-specific IPCW Brier score, mean-risk discrepancy,
+fixed risk-bin calibration, and paired loss differences. Audits cover ancestry,
+sex, age bands and training-defined PC neighborhoods, including points outside
+their support. Sparse cells are suppressed, not certified as calibrated.
+Paired uncertainty is conditional on fitted models and censoring estimates.
+
+Censoring uses training-only ancestry-stratified reverse Kaplan–Meier. This
+assumes sufficient independence within those strata and does not account for
+all site, calendar-period or clinical dependence. No result from this pilot
+establishes optimal deployment accuracy. The marginal identity is a model
+property, not observed-outcome calibration.
+
+The first run should use `--prepare-only`: it checks real score availability,
+cohort fields, event counts and horizon support without fitting models.
+The pilot caps rows, CPUs, query bytes/time and each fit's wall time.
+A failed step raises an error; its process group is stopped.
+
+Completed steps publish a workspace checkpoint so a later bounded job can
+resume with `--resume gs://...`. Source, input and configuration hashes must
+match; fitted-step receipts also require the same native engine. Checkpoints
+contain participant data, scores, models and logs and must remain inside the
+authorized workspace. WDL outputs are aggregate metrics, provenance **and
+the sensitive checkpoint archive**; none is automatically approved for export.
+
+Validation so far: 20 deterministic workflow contract tests and WDL validation
+pass on MSI. The updated native CTN survival acceptance test and real cohort
+preflight remain separate checks; synthetic contracts are not AoU results.
 
 ## Environment and submission
 
@@ -115,6 +152,8 @@ environment (the launcher only performs CLI/file operations):
 
 ```bash
 python examples/biobank/submit_aou.py --check
+python examples/biobank/submit_aou.py --prepare-only
+# After native acceptance and cohort preflight succeed:
 python examples/biobank/submit_aou.py
 ```
 
@@ -138,8 +177,11 @@ Use a Linux Python 3.12 runtime image that supplies the system libraries those
 wheels require. The runtime image digest, installed versions, gamfit build
 information, source/input hashes, and query IDs are recorded in provenance.
 
-The initial budget is one disease, at most 5,000 outcome-blind sampled rows,
-four sequential fits, four CPUs, 16 GiB RAM, and 50 GiB disk. Each fit has a
+The configured panel contains up to three selected diseases, at most 5,000
+outcome-blind sampled rows each, four CPUs, 16 GiB RAM, and 50 GiB disk.
+With two internal folds, development selection and final matched comparisons
+require 12 transform fits and 14 cause-specific fits per endpoint. They run
+sequentially with a checkpoint after each completed unit. Each fit has a
 180-second wall cap, each query a 120-second cap and a billed-byte ceiling;
 the command has a 30-minute cap and zero automatic retries. Temporary storage
 and solver caches use the attached task disk. A child timeout terminates its
@@ -155,8 +197,8 @@ miniwdl check examples/biobank/aou_survival.wdl
 python -m unittest discover -s examples/biobank -p test_aou_survival.py
 ```
 
-The native acceptance check also exercises a real PC-varying fit, held-out
-cumulative hazards, and save/load prediction equivalence on synthetic data:
+The native acceptance check exercises cross-fitted CTN, a PC-varying fit,
+held-out cumulative hazards, and save/load and batch equivalence on synthetic data:
 
 ```bash
 python examples/biobank/test_aou_runtime.py --output .validation-logs/aou/native

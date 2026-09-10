@@ -18,9 +18,82 @@ import aou_survival as aou
 import submit_aou
 from aou_identity import check_account
 import disease_selection as selection
+import aou_score_transform as transforms
+from aou_checkpoint import StudyCheckpoint
+from aou_evaluation import audit_groups, paired_loss_summary
 
 
 class SurvivalContractTests(unittest.TestCase):
+    def test_score_panel_excludes_upstream_aou_training(self):
+        panel = aou.load_score_panel(Path(__file__).with_name("aou_pgs_panel.json"))
+        self.assertEqual(set(panel["endpoints"]), {"copd", "hypertension", "obesity"})
+        self.assertIn("PGS004787", panel["excluded"])
+        self.assertTrue(all(len(e["candidates"]) == 2 for e in panel["endpoints"].values()))
+
+    def test_development_never_contains_outer_test_and_is_outcome_blind(self):
+        frame = pd.DataFrame({"person_id": np.arange(200), "split_group": np.arange(200) // 2,
+                              "is_train": np.arange(200) < 160, "event_code": np.arange(200) % 3})
+        config = {"seed": 13, "crossfit_folds": 2}
+        dev = aou.development_partition(frame, config)
+        self.assertTrue(set(dev.person_id).isdisjoint(set(frame.loc[~frame.is_train, "person_id"])))
+        altered = frame.copy()
+        altered["event_code"] = 99
+        np.testing.assert_array_equal(aou.development_partition(altered, config).is_train, dev.is_train)
+        self.assertEqual(dev.groupby("split_group").is_train.nunique().max(), 1)
+
+    def test_selection_uses_supported_development_probability_loss(self):
+        def report(loss, status="ok"):
+            return {"models": {"pc_varying_ctn": {"metrics": [
+                {"group": "overall", "horizon": 3., "status": status, "brier": loss}]}}}
+        selected, losses = aou.select_development_score({"PGS004536": report(.1), "PGS001783": report(.09)}, [3.])
+        self.assertEqual(selected, "PGS001783")
+        with self.assertRaisesRegex(ValueError, "supported development"):
+            aou.select_development_score({"PGS004536": report(.1), "PGS001783": report(.09, "insufficient_support")}, [3.])
+
+    def test_checkpoint_integrity_native_engine_and_unsafe_members(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cp = StudyCheckpoint(root / "results", "gs://workspace/checkpoint", "project", "analysis@example.org", {"input": "a"}, engine_hash="build-a")
+            stage = cp.root / "stage"
+            stage.mkdir()
+            (stage / "fit").write_text("fitted model")
+            with patch.object(cp, "publish"):
+                cp.complete_step(stage, ["fit"], model=True)
+            self.assertTrue(cp.step_is_complete(stage, model=True))
+            cp.engine_hash = "build-b"
+            with self.assertRaisesRegex(ValueError, "native engine differs"):
+                cp.step_is_complete(stage, model=True)
+            cp.engine_hash = "build-a"
+            (stage / "fit").write_text("corrupt")
+            with self.assertRaisesRegex(ValueError, "missing or corrupt"):
+                cp.step_is_complete(stage, model=True)
+            archive = root / "unsafe.tar.gz"
+            with tarfile.open(archive, "w:gz") as tar:
+                info = tarfile.TarInfo("../escape")
+                tar.addfile(info)
+            with self.assertRaisesRegex(ValueError, "relative regular"):
+                cp.restore(archive, {"input": "a"})
+
+    def test_score_assembly_rejects_overlap_and_missing_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "scores.npz"
+            np.savez(path, rows=np.array([0, 1]), z=np.array([-.1, .1]))
+            with self.assertRaisesRegex(ValueError, "every row exactly once"):
+                transforms.assemble_scores(pd.DataFrame(index=range(3)), [path])
+            with self.assertRaisesRegex(ValueError, "overlapping"):
+                transforms.assemble_scores(pd.DataFrame(index=range(2)), [path, path])
+
+    def test_paired_loss_and_training_defined_pc_support(self):
+        delta = np.array([1., 2., 3., 4.])
+        result = paired_loss_summary(delta, np.zeros(4), np.ones(4, bool), np.arange(4))
+        self.assertAlmostEqual(result["brier_improvement"], 2.5)
+        self.assertAlmostEqual(result["standard_error"], delta.std(ddof=1) / 2)
+        train = pd.DataFrame({"PC1": np.linspace(-1, 1, 40), "ancestry": "a", "sex": 0, "age0": 50})
+        test = train.iloc[:3].copy()
+        test.loc[test.index[-1], "PC1"] = 1000
+        groups = dict(audit_groups(train, test))
+        self.assertTrue(groups["pc_outside_training_support"][-1])
+
     def test_submission_requires_locally_configured_account_before_cli_calls(self):
         env = {"AOU_WORKSPACE_ID": "workspace", "GOOGLE_PROJECT": "project",
                "AOU_BUCKET_ID": "bucket", "WORKSPACE_BUCKET": "gs://bucket"}
@@ -122,6 +195,7 @@ class SurvivalContractTests(unittest.TestCase):
     def test_incident_cohort_bounds_and_competing_death(self):
         base = pd.DataFrame({
             "person_id": list("abcdefg"), "sex_at_birth_concept_id": [45880669] * 7,
+            "split_group": list("abcdefg"), "obs_start": ["2018-01-01"] * 7,
             "birth_date": ["1970-01-01"] * 7, "baseline": ["2020-01-01"] * 7,
             "obs_end": ["2022-01-01"] * 7,
             "death_date": [None, None, "2020-06-01", None, "2021-01-01", "2019-01-01", None],
@@ -129,7 +203,8 @@ class SurvivalContractTests(unittest.TestCase):
         scores = pd.DataFrame({"person_id": list("abcdefg"), "PGS": range(7)})
         cases = pd.DataFrame({"person_id": list("abcdefg"), "disease_date": [
             "2019-01-01", "2021-01-01", "2021-01-01", "2023-01-01", "2021-01-01", None, "2020-01-01"]})
-        c = {"seed": 8, "max_rows_per_disease": 100, "train_fraction": .8}
+        c = {"seed": 8, "max_rows_per_disease": 100, "train_fraction": .9,
+             "lookback_days": 365, "crossfit_folds": 2}
         cohort = aou.build_cohort(base, scores, cases, c).set_index("person_id")
         self.assertEqual(set(cohort.index), {"b", "c", "d"})
         self.assertEqual(cohort.loc["b", "event_code"], 1)
@@ -138,6 +213,43 @@ class SurvivalContractTests(unittest.TestCase):
         self.assertAlmostEqual(cohort.loc["d", "followup"], 731 / 365.25)
         permuted = aou.build_cohort(base.iloc[::-1], scores, cases, c).set_index("person_id")
         pd.testing.assert_series_equal(cohort.is_train.sort_index(), permuted.is_train.sort_index())
+
+    def test_inner_folds_keep_groups_together_and_ignore_row_order(self):
+        groups = np.array(["family-a", "family-b", "family-a", "family-c", "family-d"])
+        folds = transforms.grouped_folds(groups, 2, 81)
+        self.assertEqual(folds[0], folds[2])
+        np.testing.assert_array_equal(folds, transforms.grouped_folds(groups[::-1], 2, 81)[::-1])
+        with self.assertRaises(ValueError):
+            transforms.grouped_folds(["one", "one"], 2, 81)
+
+    def test_score_api_does_not_use_ctn_mean_prediction(self):
+        from unittest.mock import Mock
+        data = pd.DataFrame({"PGS": [2., 5.]})
+        model = Mock()
+        model.transformation_score.return_value = np.array([-.5, .5])
+        np.testing.assert_array_equal(transforms.transformed_score(model, "ctn", data), [-.5, .5])
+        model.predict.assert_not_called()
+        model.predict.return_value = {"mean_plugin": [1., 3.], "noise_scale": [2., 4.]}
+        np.testing.assert_array_equal(transforms.transformed_score(model, "location_scale", data), [.5, .5])
+
+    def test_enrollment_lookback_is_required_without_future_survival_requirement(self):
+        count = 20
+        base = pd.DataFrame({"person_id": [str(i) for i in range(count)],
+                             "split_group": [str(i) for i in range(count)],
+                             "sex_at_birth_concept_id": [8507] * count,
+                             "birth_date": ["1970-01-01"] * count,
+                             "baseline": ["2020-01-01"] * count,
+                             "obs_start": ["2018-01-01"] * count,
+                             "obs_end": ["2020-01-02"] * count, "death_date": [None] * count})
+        base.loc[0, "obs_start"] = "2019-12-01"
+        scores = pd.DataFrame({"person_id": base.person_id, "PGS": np.arange(count)})
+        cases = pd.DataFrame({"person_id": base.person_id, "disease_date": [None] * count})
+        config = {"lookback_days": 365, "seed": 1, "train_fraction": .8,
+                  "max_rows_per_disease": 100, "crossfit_folds": 2}
+        cohort = aou.build_cohort(base, scores, cases, config)
+        self.assertEqual(len(cohort), count - 1)
+        self.assertNotIn("0", set(cohort.person_id))
+        np.testing.assert_allclose(cohort.followup, 1 / 365.25)
 
     def test_reverse_km_ties_and_early_censoring(self):
         train = pd.DataFrame({"followup": [1, 1, 2, 3] * 10,

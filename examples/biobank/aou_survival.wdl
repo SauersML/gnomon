@@ -7,6 +7,10 @@ workflow aou_survival {
     File runner
     File disease_selector
     File identity_guard
+    File score_transform
+    File checkpoint_code
+    File evaluation_code
+    File score_panel
     File requirements
     File analysis_config
     File wheelhouse_archive
@@ -15,6 +19,9 @@ workflow aou_survival {
     File ancestry_predictions
     File relatedness_prune
     String runtime_image
+    String checkpoint_uri
+    File? resume_checkpoint
+    Boolean prepare_only = false
     Int cpu = 4
     Int memory_gb = 16
     Int disk_gb = 50
@@ -26,6 +33,10 @@ workflow aou_survival {
       runner = runner,
       disease_selector = disease_selector,
       identity_guard = identity_guard,
+      score_transform = score_transform,
+      checkpoint_code = checkpoint_code,
+      evaluation_code = evaluation_code,
+      score_panel = score_panel,
       requirements = requirements,
       analysis_config = analysis_config,
       wheelhouse_archive = wheelhouse_archive,
@@ -34,6 +45,9 @@ workflow aou_survival {
       ancestry_predictions = ancestry_predictions,
       relatedness_prune = relatedness_prune,
       runtime_image = runtime_image,
+      checkpoint_uri = checkpoint_uri,
+      resume_checkpoint = resume_checkpoint,
+      prepare_only = prepare_only,
       cpu = cpu, memory_gb = memory_gb, disk_gb = disk_gb,
       wall_minutes = wall_minutes
   }
@@ -41,8 +55,8 @@ workflow aou_survival {
   output {
     File metrics = analyze.metrics
     File provenance = analyze.provenance
-    # Models and participant-level predictions deliberately are not workflow
-    # outputs. Internal artifacts are retained in the workspace task directory.
+    File checkpoint = analyze.checkpoint
+    # Checkpoints contain participant data and models; workspace storage only.
   }
 }
 
@@ -51,6 +65,10 @@ task analyze {
     File runner
     File disease_selector
     File identity_guard
+    File score_transform
+    File checkpoint_code
+    File evaluation_code
+    File score_panel
     File requirements
     File analysis_config
     File wheelhouse_archive
@@ -59,6 +77,9 @@ task analyze {
     File ancestry_predictions
     File relatedness_prune
     String runtime_image
+    String checkpoint_uri
+    File? resume_checkpoint
+    Boolean prepare_only
     Int cpu
     Int memory_gb
     Int disk_gb
@@ -71,6 +92,10 @@ task analyze {
     cp "~{runner}" runner.py
     cp "~{disease_selector}" disease_selection.py
     cp "~{identity_guard}" aou_identity.py
+    cp "~{score_transform}" aou_score_transform.py
+    cp "~{checkpoint_code}" aou_checkpoint.py
+    cp "~{evaluation_code}" aou_evaluation.py
+    cp "~{score_panel}" score_panel.json
     # Read WDL strings from JSON instead of interpolating them as shell code.
     cp "~{write_json(runtime_image)}" runtime_image.json
     export TMPDIR="$PWD/work/tmp"
@@ -84,18 +109,26 @@ task analyze {
       python -m venv work/venv
       work/venv/bin/python -m pip install --disable-pip-version-check \
         --no-index --only-binary=:all: --find-links wheels -r "$2"
+      resume_args=()
+      if [[ -n "$9" ]]; then resume_args=(--resume "$9"); fi
+      mode_args=()
+      if [[ "${10}" == true ]]; then mode_args=(--prepare-only); fi
       exec work/venv/bin/python runner.py run \
         --config "$3" --phenotypes "$4" --scores "$5" \
         --ancestry "$6" --prune "$7" --output work/results \
-        --runtime-image runtime_image.json
+        --runtime-image runtime_image.json --checkpoint-uri "$8" \
+        --score-panel score_panel.json \
+        "${resume_args[@]}" "${mode_args[@]}"
     ' bash "~{wheelhouse_archive}" "~{requirements}" "~{analysis_config}" \
       "~{phenotype_library_archive}" "~{shared_features_archive}" \
-      "~{ancestry_predictions}" "~{relatedness_prune}"
+      "~{ancestry_predictions}" "~{relatedness_prune}" "~{checkpoint_uri}" \
+      "~{default="" resume_checkpoint}" "~{prepare_only}"
   >>>
 
   output {
     File metrics = "work/results/metrics.json"
     File provenance = "work/results/provenance.json"
+    File checkpoint = "work/checkpoint.tar.gz"
   }
 
   runtime {
