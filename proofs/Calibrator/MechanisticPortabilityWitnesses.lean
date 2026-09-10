@@ -593,7 +593,8 @@ theorem nondegenerateGenerationalPopGen_coordinates_at_one :
     nondegenerateGenerationalPopGen.tauAt 1 = 1 / 2 ∧
     nondegenerateGenerationalPopGen.fstTransientAt 1 = 1 / 4 ∧
     nondegenerateGenerationalPopGen.mutationSharedRetentionAt 1 = Real.exp (-(1 : ℝ)) ∧
-    nondegenerateGenerationalPopGen.migrationSharedBoostAt 1 = 7 / 6 := by
+    nondegenerateGenerationalPopGen.migrationSharedBoostAt 1
+      = sharedLDMigrationBoostFromRates (3 / 2) (1 / 2) 1 := by
   refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩
   · norm_num [nondegenerateGenerationalPopGen, GenerationalPopGenParameters.theta]
   · norm_num [nondegenerateGenerationalPopGen, GenerationalPopGenParameters.bigM]
@@ -608,15 +609,79 @@ theorem nondegenerateGenerationalPopGen_coordinates_at_one :
       GenerationalPopGenParameters.mutationSharedRetentionAt,
       GenerationalPopGenParameters.theta, GenerationalPopGenParameters.tauAt]
     ring_nf
-  · simp [nondegenerateGenerationalPopGen,
-      GenerationalPopGenParameters.migrationSharedBoostAt,
-      GenerationalPopGenParameters.bigM, GenerationalPopGenParameters.tauAt]
-    norm_num
+  · norm_num [nondegenerateGenerationalPopGen,
+      GenerationalPopGenParameters.migrationSharedBoostAt]
+
+/-- **The witness's migration boost, DERIVED from its own fields.** Unit `Nₑ`
+and quarter recombination give a shared-LD decay rate of `2·(1/4) + 1/1 = 3/2`
+per generation; migration at `1/8` each way gives a homogenisation rate of
+`4·(1/8) = 1/2`. The value is transcendental, so unlike the other five
+coordinates of this witness it cannot be written as a literal, and the same
+reasoning as `popgenDrivenLDDecayExponent` applies: the two RATES appear once,
+as a consequence of the fields, and every proof below rewrites with
+`popgenDrivenMigrationBoost_eq` rather than unfolding a number. Move
+`migrationSharedBoostAt`, the recombination rate, `Nₑ` or the migration rate and
+that theorem fails at the one place naming the value.
+
+Empirical status: NOT AN EMPIRICAL CLAIM. It is a function of a witness's own
+coordinates, and a witness's coordinates are stipulated rather than measured.
+The empirical content belongs to `DGP.migrationLDBoost`, where the form was
+measured across fifteen cells. -/
+noncomputable def popgenDrivenMigrationBoost : ℝ :=
+  sharedLDMigrationBoostFromRates (3 / 2) (1 / 2) 1
+
+theorem popgenDrivenMigrationBoost_eq :
+    nondegenerateGenerationalPopGen.migrationSharedBoostAt 1
+      = popgenDrivenMigrationBoost :=
+  (nondegenerateGenerationalPopGen_coordinates_at_one).2.2.2.2.2
+
+theorem one_le_popgenDrivenMigrationBoost : 1 ≤ popgenDrivenMigrationBoost :=
+  one_le_sharedLDMigrationBoostFromRates (by norm_num) (by norm_num) (by norm_num)
+
+theorem popgenDrivenMigrationBoost_pos : 0 < popgenDrivenMigrationBoost :=
+  lt_of_lt_of_le one_pos one_le_popgenDrivenMigrationBoost
+
+/-- **The boost is below two**, which is what the scale comparisons below need:
+a tag scale of `boost * exp(-1)` stays under one only while the boost stays
+under `e`. The enclosure runs through `Real.exp_one_lt_d9`; the true value is
+`1.3760`, so the margin is not tight. -/
+theorem popgenDrivenMigrationBoost_lt_two : popgenDrivenMigrationBoost < 2 := by
+  have h1 : Real.exp 1 < 2.7182818286 := Real.exp_one_lt_d9
+  have h2 : (2.7182818283 : ℝ) < Real.exp 1 := Real.exp_one_gt_d9
+  have hpos : (0:ℝ) < Real.exp 1 := Real.exp_pos _
+  have he2 : Real.exp 2 = Real.exp 1 * Real.exp 1 := by
+    rw [← Real.exp_add]; norm_num
+  have he3 : Real.exp 3 = Real.exp 1 * Real.exp 1 * Real.exp 1 := by
+    rw [← Real.exp_add, ← Real.exp_add]; norm_num
+  have h15 : Real.exp ((3:ℝ)/2) * Real.exp ((3:ℝ)/2) = Real.exp 3 := by
+    rw [← Real.exp_add]; norm_num
+  have h15pos : (0:ℝ) < Real.exp ((3:ℝ)/2) := Real.exp_pos _
+  have h2pos : (0:ℝ) < Real.exp 2 := Real.exp_pos _
+  -- enclosures for exp 2 and exp (3/2)
+  have he2lo : (7.38 : ℝ) < Real.exp 2 := by rw [he2]; nlinarith
+  have he2hi : Real.exp 2 < 7.39 := by rw [he2]; nlinarith
+  have he15lo : (4.48 : ℝ) < Real.exp ((3:ℝ)/2) := by nlinarith [h15, he3, hpos]
+  have he15hi : Real.exp ((3:ℝ)/2) < 4.49 := by nlinarith [h15, he3, hpos]
+  -- and hence for the two negative exponentials the body evaluates
+  have hEinv : Real.exp (-((3:ℝ)/2 * 1)) * Real.exp ((3:ℝ)/2) = 1 := by
+    rw [← Real.exp_add]; norm_num
+  have hFinv : Real.exp (-(((3:ℝ)/2 + 1/2) * 1)) * Real.exp 2 = 1 := by
+    rw [← Real.exp_add]; norm_num
+  have hEpos : (0:ℝ) < Real.exp (-((3:ℝ)/2 * 1)) := Real.exp_pos _
+  have hFpos : (0:ℝ) < Real.exp (-(((3:ℝ)/2 + 1/2) * 1)) := Real.exp_pos _
+  have hElo : (0.22 : ℝ) < Real.exp (-((3:ℝ)/2 * 1)) := by nlinarith
+  have hEhi : Real.exp (-((3:ℝ)/2 * 1)) < 0.23 := by nlinarith
+  have hFlo : (0.135 : ℝ) < Real.exp (-(((3:ℝ)/2 + 1/2) * 1)) := by nlinarith
+  have hFhi : Real.exp (-(((3:ℝ)/2 + 1/2) * 1)) < 0.136 := by nlinarith
+  unfold popgenDrivenMigrationBoost sharedLDMigrationBoostFromRates
+  rw [div_lt_iff₀ (by positivity)]
+  norm_num
+  nlinarith [hElo, hEhi, hFlo, hFhi, hEpos, hFpos]
 
 /-- Shared diagonal tag-LD scale at generation `1` in the nondegenerate
 two-tag proxy witness. -/
 noncomputable def popgenDrivenTagScale : ℝ :=
-  (7 / 6 : ℝ) * Real.exp (-(1 : ℝ))
+  popgenDrivenMigrationBoost * Real.exp (-(1 : ℝ))
 
 /-- The LD decay exponent this witness carries across one tag-causal unit of
 distance: `ldCorrelationDecay`'s `lambda * √(F_ST gap) * distance`, with
@@ -674,7 +739,7 @@ proxy witness. The additional `exp (-popgenDrivenLDDecayExponent)` factor comes
 from explicit recombination-driven LD decay across one tag-causal unit of
 distance. -/
 noncomputable def popgenDrivenProxyScale : ℝ :=
-  (7 / 6 : ℝ) * Real.exp (-((1 : ℝ) + popgenDrivenLDDecayExponent))
+  popgenDrivenMigrationBoost * Real.exp (-((1 : ℝ) + popgenDrivenLDDecayExponent))
 
 /-- Two-tag one-causal-variant generational witness with constant allele
 frequencies and constant effects. Any transport change after generation `0`
@@ -768,7 +833,7 @@ theorem popgenDrivenProxyGenerationalModel_generation_one_scales :
     intro i
     calc
       proxyTaggingTargetAt popgenDrivenProxyGenerationalModel 1 i 0
-          = (7 / 6 : ℝ) *
+          = popgenDrivenMigrationBoost *
               (Real.exp (-(1 : ℝ)) * Real.exp (-popgenDrivenLDDecayExponent)) := by
               -- The gap is a perfect square again, so the surd reduces; the step is
               -- kept because the exponent is still WRITTEN as a square root and the
@@ -784,7 +849,7 @@ theorem popgenDrivenProxyGenerationalModel_generation_one_scales :
                 ring_nf <;>
                 (try rw [hsqrt]) <;>
                 (try ring_nf)
-      _ = (7 / 6 : ℝ) * Real.exp (-((1 : ℝ) + popgenDrivenLDDecayExponent)) := by
+      _ = popgenDrivenMigrationBoost * Real.exp (-((1 : ℝ) + popgenDrivenLDDecayExponent)) := by
             congr 1
             rw [← Real.exp_add]
             congr 1
@@ -870,9 +935,11 @@ theorem popgenDrivenProxyGenerationalModel_target_r2_strictly_decreases_at_one :
     simpa [h_target_var] using this
   have h_tag_pos : 0 < popgenDrivenTagScale := by
     unfold popgenDrivenTagScale
+    have := popgenDrivenMigrationBoost_pos
     positivity
   have h_proxy_nonneg : 0 ≤ popgenDrivenProxyScale := by
     unfold popgenDrivenProxyScale
+    have := popgenDrivenMigrationBoost_pos
     positivity
   have h_ld_gap_lt_one : Real.exp (-popgenDrivenLDDecayExponent) < 1 := by
     have hneg : -popgenDrivenLDDecayExponent < 0 := by
@@ -882,14 +949,16 @@ theorem popgenDrivenProxyGenerationalModel_target_r2_strictly_decreases_at_one :
   have h_proxy_lt_tag : popgenDrivenProxyScale < popgenDrivenTagScale := by
     unfold popgenDrivenProxyScale popgenDrivenTagScale
     calc
-      (7 / 6 : ℝ) * Real.exp (-((1 : ℝ) + popgenDrivenLDDecayExponent))
-          = ((7 / 6 : ℝ) * Real.exp (-(1 : ℝ))) * Real.exp (-popgenDrivenLDDecayExponent) := by
+      popgenDrivenMigrationBoost * Real.exp (-((1 : ℝ) + popgenDrivenLDDecayExponent))
+          = (popgenDrivenMigrationBoost * Real.exp (-(1 : ℝ))) *
+              Real.exp (-popgenDrivenLDDecayExponent) := by
               rw [show (-((1 : ℝ) + popgenDrivenLDDecayExponent))
                     = (-(1 : ℝ)) + (-popgenDrivenLDDecayExponent) by ring,
                 Real.exp_add]
               ring
-      _ < ((7 / 6 : ℝ) * Real.exp (-(1 : ℝ))) * 1 := by
-              exact mul_lt_mul_of_pos_left h_ld_gap_lt_one (by positivity)
+      _ < (popgenDrivenMigrationBoost * Real.exp (-(1 : ℝ))) * 1 := by
+              exact mul_lt_mul_of_pos_left h_ld_gap_lt_one
+                (by have := popgenDrivenMigrationBoost_pos; positivity)
       _ = popgenDrivenTagScale := by simp [popgenDrivenTagScale]
   have h_exp_one_ge_two : (2 : ℝ) ≤ Real.exp (1 : ℝ) := by
     have h := Real.add_one_le_exp (1 : ℝ)
@@ -907,20 +976,25 @@ theorem popgenDrivenProxyGenerationalModel_target_r2_strictly_decreases_at_one :
   have h_proxy_lt_one : popgenDrivenProxyScale < 1 := by
     unfold popgenDrivenProxyScale
     calc
-      (7 / 6 : ℝ) * Real.exp (-((1 : ℝ) + popgenDrivenLDDecayExponent))
-          = ((7 / 6 : ℝ) * Real.exp (-(1 : ℝ))) * Real.exp (-popgenDrivenLDDecayExponent) := by
+      popgenDrivenMigrationBoost * Real.exp (-((1 : ℝ) + popgenDrivenLDDecayExponent))
+          = (popgenDrivenMigrationBoost * Real.exp (-(1 : ℝ))) *
+              Real.exp (-popgenDrivenLDDecayExponent) := by
               rw [show (-((1 : ℝ) + popgenDrivenLDDecayExponent))
                     = (-(1 : ℝ)) + (-popgenDrivenLDDecayExponent) by ring,
                 Real.exp_add]
               ring
-      _ ≤ ((7 / 6 : ℝ) * (1 / 2 : ℝ)) * 1 := by
+      _ ≤ (popgenDrivenMigrationBoost * (1 / 2 : ℝ)) * 1 := by
               have h_exp_nonneg : 0 ≤ Real.exp (-popgenDrivenLDDecayExponent) := by positivity
+              have h_boost_pos := popgenDrivenMigrationBoost_pos
               nlinarith [h_exp_neg_one_le_half, le_of_lt h_ld_gap_lt_one, h_exp_nonneg]
-      _ < (1 : ℝ) := by norm_num
+      _ < (1 : ℝ) := by
+              have := popgenDrivenMigrationBoost_lt_two
+              nlinarith
   have h_proxy_sq_lt_tag : popgenDrivenProxyScale ^ 2 < popgenDrivenTagScale := by
     have h_proxy_sq_lt_proxy : popgenDrivenProxyScale ^ 2 < popgenDrivenProxyScale := by
       have h_proxy_pos : 0 < popgenDrivenProxyScale := by
         unfold popgenDrivenProxyScale
+        have := popgenDrivenMigrationBoost_pos
         positivity
       have h_mul_lt := mul_lt_mul_of_pos_left h_proxy_lt_one h_proxy_pos
       simpa [pow_two] using h_mul_lt
@@ -1093,6 +1167,8 @@ theorem target_r2_changes_along_generation_indexed_af_path :
       generational_witness_simp singleLocusGenerationalWitness, baselineGenerationalPopGen,
       timeVaryingAFGenerationalModel
       norm_num [h_ret]
+      have h_three : Real.sqrt (3 : ℝ) ^ 2 = 3 := Real.sq_sqrt (by norm_num)
+      nlinarith [h_three]
     have h_exp_ne : (3 / 4 : ℝ) ≠ 0 := by
       norm_num
     unfold r2FromSourceWeights explainedSignalVarianceFromSourceWeights

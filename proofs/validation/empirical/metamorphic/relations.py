@@ -667,7 +667,13 @@ RELATIONS = {
         invariant_under_reciprocal_scaling(["Ne"], ["m"]),
     ],
     "Calibrator.sharedLD_from_equilibrium": [
-        invariant_under_reciprocal_scaling(["Ne"], ["m"]),
+        # `m/(m + c)`: a race between two RATES, so only their ratio is read and
+        # the body is homogeneous of degree zero. It used to carry
+        # `invariant_under_reciprocal_scaling(["Ne"], ["m"])`, which was the
+        # relation of the `1 - F_ST` body that simulation rejected; the argument
+        # `Ne` is gone, and a shared fraction that moved when the generation was
+        # relabelled would be modelling something else.
+        jointly_scales(["m", "c"], 0),
     ],
     "Calibrator.signalRetentionMigrationDrift": [
         invariant_under_reciprocal_scaling(["Ne"], ["m"]),

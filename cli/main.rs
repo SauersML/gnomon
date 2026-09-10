@@ -17,7 +17,7 @@ use gnomon::calibrate::data::{load_prediction_data, load_training_data};
 #[cfg(feature = "calibrate")]
 use gnomon::calibrate::estimate::{train_model, train_survival_model};
 #[cfg(feature = "calibrate")]
-use gnomon::calibrate::model::BasisConfig;
+use gnomon::calibrate::model::{BasisConfig, SmoothConfig};
 #[cfg(feature = "calibrate")]
 use gnomon::calibrate::model::SurvivalModelConfig;
 #[cfg(feature = "calibrate")]
@@ -25,11 +25,9 @@ use gnomon::calibrate::model::SurvivalPrediction;
 #[cfg(feature = "calibrate")]
 use gnomon::calibrate::model::SurvivalRiskType;
 #[cfg(feature = "calibrate")]
-use gnomon::calibrate::model::SurvivalTimeVaryingConfig;
+use gnomon::calibrate::model::SurvivalTimeWiggleConfig;
 #[cfg(feature = "calibrate")]
 use gnomon::calibrate::model::{LinkFunction, ModelConfig, ModelFamily, TrainedModel};
-#[cfg(feature = "calibrate")]
-use gnomon::calibrate::survival::SurvivalSpec;
 #[cfg(feature = "calibrate")]
 use gnomon::calibrate::survival_data::{
     SurvivalPredictionData, has_survival_columns, load_survival_prediction_data,
@@ -311,25 +309,13 @@ struct TrainArgs {
     #[arg(long, value_name = "N")]
     num_pcs: usize,
 
-    /// Number of internal knots for PGS spline basis
+    /// Number of farthest-point centers for the PGS Duchon smooth (at least 4)
     #[arg(long, default_value = "10")]
-    pgs_knots: usize,
+    pgs_centers: usize,
 
-    /// Polynomial degree for PGS spline basis
-    #[arg(long, default_value = "3")]
-    pgs_degree: usize,
-
-    /// Number of internal knots for PC spline bases
+    /// Number of farthest-point centers for each PC Duchon smooth (at least 4)
     #[arg(long, default_value = "5")]
-    pc_knots: usize,
-
-    /// Polynomial degree for PC spline bases
-    #[arg(long, default_value = "2")]
-    pc_degree: usize,
-
-    /// Order of the difference penalty matrix
-    #[arg(long, default_value = "2")]
-    penalty_order: usize,
+    pc_centers: usize,
 
     /// Maximum number of P-IRLS iterations for the inner loop (per REML step)
     #[arg(long, default_value = "50")]
@@ -347,10 +333,6 @@ struct TrainArgs {
     #[arg(long, default_value = "1e-3")]
     reml_convergence_tolerance: f64,
 
-    /// Guard delta for the survival age transform
-    #[arg(long, default_value = "0.1")]
-    survival_guard_delta: f64,
-
     /// Number of internal knots for the survival baseline spline
     #[arg(long, default_value = "6")]
     survival_baseline_knots: usize,
@@ -359,33 +341,25 @@ struct TrainArgs {
     #[arg(long, default_value = "3")]
     survival_baseline_degree: usize,
 
-    /// Grid size for the survival monotonicity penalty
-    #[arg(long, default_value = "64")]
-    survival_monotonic_grid: usize,
-
-    /// Derivative guard threshold used inside the survival likelihood
-    #[arg(long, default_value = "1e-8")]
-    survival_derivative_guard: f64,
-
-    /// Use expected information instead of observed Hessian when fitting survival models
+    /// Add a smooth transformation of the survival baseline time coordinate
     #[arg(long)]
-    survival_expected_information: bool,
+    survival_time_wiggle: bool,
 
-    /// Enable the optional time-varying PGS × age interaction
-    #[arg(long)]
-    survival_enable_time_varying: bool,
-
-    /// Number of internal knots for the time-varying PGS spline
+    /// Number of internal knots for the baseline time-wiggle spline
     #[arg(long, default_value = "5")]
-    survival_time_varying_pgs_knots: usize,
+    survival_time_wiggle_knots: usize,
 
-    /// Degree for the time-varying PGS spline
+    /// Degree for the baseline time-wiggle spline
     #[arg(long, default_value = "3")]
-    survival_time_varying_pgs_degree: usize,
+    survival_time_wiggle_degree: usize,
 
-    /// Difference-penalty order for the time-varying PGS spline
+    /// Difference-penalty order for the baseline time-wiggle spline
     #[arg(long, default_value = "2")]
-    survival_time_varying_pgs_penalty_order: usize,
+    survival_time_wiggle_penalty_order: usize,
+
+    /// Penalize the nullspace of the baseline time-wiggle spline too
+    #[arg(long)]
+    survival_time_wiggle_double_penalty: bool,
 }
 
 #[cfg(feature = "calibrate")]
@@ -394,7 +368,7 @@ struct InferArgs {
     /// Path to test TSV file with score,PC1,PC2,... columns (no phenotype needed)
     test_data: String,
 
-    /// Path to trained model file (.toml)
+    /// Path to the complete trained calibration model (.json)
     #[arg(long)]
     model: String,
 }
@@ -937,18 +911,12 @@ fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
                     .join(", ")
             );
 
-            let pgs_basis_config = BasisConfig {
-                num_knots: args.pgs_knots,
-                degree: args.pgs_degree,
-            };
+            let pgs_basis_config = SmoothConfig { num_centers: args.pgs_centers };
 
             let pc_configs = (0..args.num_pcs)
                 .map(|i| gnomon::calibrate::model::PrincipalComponentConfig {
                     name: format!("PC{}", i + 1),
-                    basis_config: BasisConfig {
-                        num_knots: args.pc_knots,
-                        degree: args.pc_degree,
-                    },
+                    basis_config: SmoothConfig { num_centers: args.pc_centers },
                     range: pc_ranges[i],
                 })
                 .collect();
@@ -956,7 +924,6 @@ fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
             println!("Training model with REML estimation of smoothing parameters");
             let config = ModelConfig {
                 model_family: ModelFamily::Gam(link_function),
-                penalty_order: args.penalty_order,
                 convergence_tolerance: args.convergence_tolerance,
                 max_iterations: args.max_iterations,
                 reml_convergence_tolerance: args.reml_convergence_tolerance,
@@ -969,8 +936,8 @@ fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
 
             println!("Training final model...");
             let trained_model = train_model(&data, &config)?;
-            trained_model.save("model.toml")?;
-            println!("Model saved to: model.toml");
+            trained_model.save("model.json")?;
+            println!("Model saved to: model.json");
         }
         ModelFamilyCli::Survival => {
             return train_survival_from_args(&args);
@@ -987,37 +954,30 @@ fn train_survival_from_args(args: &TrainArgs) -> Result<(), Box<dyn std::error::
         args.training_data
     );
     let bundle =
-        load_survival_training_data(&args.training_data, args.num_pcs, args.survival_guard_delta)?;
+        load_survival_training_data(&args.training_data, args.num_pcs)?;
     println!(
         "Loaded {} samples with {} PCs",
         bundle.data.age_entry.len(),
         bundle.data.pcs.ncols()
     );
 
-    let mut spec = SurvivalSpec::default();
-    spec.derivative_guard = args.survival_derivative_guard;
-    spec.use_expected_information = args.survival_expected_information;
-
-    let time_varying = if args.survival_enable_time_varying {
-        Some(SurvivalTimeVaryingConfig {
-            label: Some("pgs_by_age".to_string()),
-            pgs_basis: BasisConfig {
-                num_knots: args.survival_time_varying_pgs_knots,
-                degree: args.survival_time_varying_pgs_degree,
+    let time_wiggle = if args.survival_time_wiggle {
+        Some(SurvivalTimeWiggleConfig {
+            basis: BasisConfig {
+                num_knots: args.survival_time_wiggle_knots,
+                degree: args.survival_time_wiggle_degree,
             },
-            pgs_penalty_order: args.survival_time_varying_pgs_penalty_order,
-            lambda_age: 0.0,
-            lambda_pgs: 0.0,
-            lambda_null: 0.0,
+            penalty_order: args.survival_time_wiggle_penalty_order,
+            double_penalty: args.survival_time_wiggle_double_penalty,
         })
     } else {
         None
     };
 
-    if let Some(settings) = &time_varying {
+    if let Some(settings) = &time_wiggle {
         println!(
-            "Enabling time-varying PGS × age interaction (knots={}, degree={}, penalty order={})",
-            settings.pgs_basis.num_knots, settings.pgs_basis.degree, settings.pgs_penalty_order
+            "Enabling baseline time wiggle (knots={}, degree={}, penalty order={})",
+            settings.basis.num_knots, settings.basis.degree, settings.penalty_order
         );
     }
 
@@ -1026,27 +986,31 @@ fn train_survival_from_args(args: &TrainArgs) -> Result<(), Box<dyn std::error::
             num_knots: args.survival_baseline_knots,
             degree: args.survival_baseline_degree,
         },
-        guard_delta: args.survival_guard_delta,
-        monotonic_grid_size: args.survival_monotonic_grid,
-        time_varying,
-        model_competing_risk: false,
+        time_wiggle,
     };
 
     let config = ModelConfig {
-        model_family: ModelFamily::Survival(spec),
-        penalty_order: args.penalty_order,
+        model_family: ModelFamily::Survival,
+        pgs_basis_config: SmoothConfig { num_centers: args.pgs_centers },
+        pgs_range: calculate_range(bundle.data.pgs.view()),
+        pc_configs: (0..bundle.data.pcs.ncols()).map(|index| {
+            gnomon::calibrate::model::PrincipalComponentConfig {
+                name: format!("PC{}", index + 1),
+                basis_config: SmoothConfig { num_centers: args.pc_centers },
+                range: calculate_range(bundle.data.pcs.column(index)),
+            }
+        }).collect(),
         convergence_tolerance: args.convergence_tolerance,
         max_iterations: args.max_iterations,
         reml_convergence_tolerance: args.reml_convergence_tolerance,
         reml_max_iterations: args.reml_max_iterations,
         survival: Some(survival_config),
-        ..Default::default()
     };
 
     println!("Training survival model...");
     let trained_model = train_survival_model(&bundle, &config)?;
-    trained_model.save("model.toml")?;
-    println!("Model saved to: model.toml");
+    trained_model.save("model.json")?;
+    println!("Model saved to: model.json");
     Ok(())
 }
 
@@ -1080,7 +1044,7 @@ fn infer(args: InferArgs) -> Result<(), Box<dyn std::error::Error>> {
             )?;
             println!("Predictions saved to: {output_path}");
         }
-        ModelFamily::Survival(_) => {
+        ModelFamily::Survival => {
             println!("Loading survival prediction data from: {}", args.test_data);
             let data = load_survival_prediction_data(&args.test_data, num_pcs)?;
             println!(

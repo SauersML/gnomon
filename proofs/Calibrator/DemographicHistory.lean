@@ -108,25 +108,30 @@ theorem demoSteppingStoneFst_at_d0ne0m0sq0_is_junk :
   unfold demoSteppingStoneFst
   norm_num
 
-/-- **The functional form the previous derivation produced**, retained so that the
-indistinguishability recorded in the note above can be stated rather than asserted.
+/-! ### The dispersal exponent, and what `F_ST` data cannot say about it
 
-**DO NOT "CORRECT" THIS BODY. THE FALSIFICATION IS THE RESULT.** This is a
-deliberate foil; the full statement of why, and of the two theorems that depend
-on it, is at the end of this docstring. A directive to fix every falsified
-definition does not reach this one.
+**There used to be a named definition here, `steppingStoneFstQuadratic`, whose
+only job was to be the wrong exponent.** It carried a FALSIFIED marker in a
+corpus of working bodies, and a reader had to reach the end of a long docstring
+to learn that the falsification was the point. It is gone, and nothing is lost:
+the non-identifiability it existed to state is now stated over the WHOLE FAMILY
+of exponents by `demoSteppingStoneFst_dispersal_exponent_not_identified` below,
+which is strictly stronger than the single quadratic instance, and that instance
+survives as a corollary with the form written out inline.
 
-    Empirical status: **FALSIFIED**
-    (`proofs/validation/empirical/simcov/battery_verify.py`,
-    `test_stepping_slope_tight`). Both this form and `demoSteppingStoneFst` have
-    the shape `d / (d + K)`, so they cannot be told apart by any choice of
-    `σ_sq` -- picking a value for an unstated convention moved the answer by two
-    orders of magnitude, and a test whose verdict is set by a convention
-    measures the convention. What no `σ_sq` can change is an EXPONENT.
+The evidence that the exponent is one and not two is recorded here rather than
+on a body, because it is evidence about `demoSteppingStoneFst`'s exponent and
+that is where it belongs. Three instruments, each of which could have said no.
 
-    Fit `K = d (1 - F) / F` from a 16-deme 1D stepping stone, `Ne = 500`,
-    interior demes 5 and 8 so no boundary reflection enters, recombining,
-    30 replicates of 10 Mb, and read the log-log slope of `K` against `m`:
+**One** (`proofs/validation/empirical/simcov/battery_verify.py`,
+`test_stepping_slope_tight`). Both candidate forms have the shape `d / (d + K)`,
+so they cannot be told apart by any choice of `σ_sq` -- picking a value for an
+unstated convention moved the answer by two orders of magnitude, and a test
+whose verdict is set by a convention measures the convention. What no `σ_sq` can
+change is an EXPONENT. Fit `K = d (1 - F) / F` from a 16-deme 1D stepping stone,
+`Ne = 500`, interior demes 5 and 8 so no boundary reflection enters,
+recombining, 30 replicates of 10 Mb, and read the log-log slope of `K` against
+`m`:
 
       m         F_ST                K
       0.005     0.21051±0.00383    11.251
@@ -137,29 +142,25 @@ definition does not reach this one.
 
       slope = 0.959 ± 0.010
 
-    This form has `K` proportional to `m^2` and so predicts slope 2; the linear
-    sibling `demoSteppingStoneFst` has `K` proportional to `m` and predicts
-    slope 1. The measurement sits 101 sems from 2 and 4.0 sems from 1. The
-    residual 4 sems from exactly 1 is a finite-lattice effect and is not the
-    difference between the two candidates.
+A quadratic dispersal term has `K` proportional to `m²` and predicts slope 2;
+`demoSteppingStoneFst` has `K` proportional to `m` and predicts slope 1. The
+measurement sits 101 sems from 2 and 4.0 sems from 1. The residual 4 sems from
+exactly 1 is a finite-lattice effect and is not the difference between the two
+candidates. `K` spans 11.251 to 157.447, a factor of fourteen across the design,
+where the two exponents predict a factor of 16 and a factor of 256 over the same
+range of `m` -- so the design separates them by construction.
 
-    This is the evidence `demoSteppingStoneFst_indistinguishable_from_quadratic`
-    demands and no earlier measurement supplied. That theorem proves the two
-    forms are indistinguishable while `σ²` is free, and states the consequence
-    as a requirement: evidence for the FUNCTIONAL FORM needs `σ²` held at an
-    independently determined dispersal scale while `m` varies. On a
-    nearest-neighbour lattice the dispersal scale is fixed by the geometry and
-    cannot move with `m`, so the design above satisfies exactly that condition
-    and the tie is broken. The definition is kept, because stating the
-    indistinguishability requires naming the rejected form.
+This is the evidence the non-identifiability theorem DEMANDS and no earlier
+measurement supplied. That theorem says the forms are indistinguishable while
+`σ²` is free, and states the consequence as a requirement: evidence for the
+FUNCTIONAL FORM needs `σ²` held at an independently determined dispersal scale
+while `m` varies. On a nearest-neighbour lattice the dispersal scale is fixed by
+the geometry and cannot move with `m`, so this design satisfies exactly that
+condition and the tie is broken.
 
-    Power: `K` spans 11.251 to 157.447, a factor of fourteen, across the design;
-    the two candidate exponents predict a factor of 16 and a factor of 256 over
-    that same range of `m`. 
-    **Independently reconfirmed** (`proofs/validation/empirical/simcov/battery_bulk17.py`).
-    A separate 20-deme lattice realisation, `Ne = 500`, separation `d = 4`, four
-    migration rates spanning a factor of eight, `K = d(1 - F)/F` read off at each
-    and the exponent taken as the log-log slope of `K` against `m`:
+**Two, independently** (`proofs/validation/empirical/simcov/battery_bulk17.py`).
+A separate 20-deme lattice realisation, `Ne = 500`, separation `d = 4`, four
+migration rates spanning a factor of eight:
 
       m        F_ST                K = d(1-F)/F
       0.004    0.30906 ± 0.01070    8.943
@@ -169,86 +170,95 @@ definition does not reach this one.
 
       fitted exponent  0.974 ± 0.042
 
-    The linear form predicts 1 and this body predicts 2: the measurement sits
-    0.62 sems from linear and 24.4 sems from quadratic. Same conclusion as the
-    run recorded above, on different seeds and a different separation.
+0.62 sems from linear and 24.4 sems from quadratic: same conclusion, different
+seeds, different separation. An error in the first pass of that battery is worth
+recording, since it inverted a verdict. The comparison cells were signed
+backwards -- `K` GROWS with `m`, so the linear form predicts a slope of `+1`,
+not `-1` -- and the harness duly reported both candidates as failing by tens of
+sems. The measured number 0.974 was correct throughout; only the two predictions
+it was compared against carried the wrong sign.
 
-    An error in the first pass of that battery is worth recording, since it
-    inverted a verdict. The comparison cells were signed backwards -- `K` GROWS
-    with `m`, so the linear form predicts a slope of `+1`, not `-1` -- and the
-    harness duly reported both candidates as failing by tens of sems. The
-    measured number 0.974 was correct throughout; only the two predictions it
-    was compared against carried the wrong sign.
+**Three, with no simulation at all: the quadratic form is not dimensionally
+homogeneous.** `Ne` enters population genetics only as a number of generations
+(`2 * Ne` is the coalescent time scale) and `m` is a per-generation rate, so
+`4 * Ne * m` is dimensionless and `4 * Ne * m * σ_sq` -- `demoSteppingStoneFst`'s
+denominator term -- carries exactly the units of `σ_sq`, which are the units `d`
+is counted in. Replacing `m * σ_sq` by `σ_sq ^ 2 * m ^ 2` multiplies that term by
+one extra factor of `m`, leaving a per-generation rate added to a distance. No
+choice of units for `d` or `σ_sq` can rescue it: whatever convention makes
+`demoSteppingStoneFst` homogeneous makes the quadratic form inhomogeneous by one
+power of time. That argument is exact, costs nothing, and commits to no `F_ST`
+convention.
 
-    **A third, convention-free confirmation that needs no simulation at all: the
-    body is not dimensionally homogeneous.** `Ne` enters population genetics only
-    as a number of generations (`2 * Ne` is the coalescent time scale) and `m` is
-    a per-generation rate, so `4 * Ne * m` is dimensionless and `4 * Ne * m * σ_sq`
-    — the sibling `demoSteppingStoneFst`'s denominator term — carries exactly the
-    units of `σ_sq`, which are the units `d` is counted in. Replacing `m * σ_sq`
-    by `σ_sq ^ 2 * m ^ 2` multiplies that term by one extra factor of `m`, leaving
-    a per-generation rate added to a distance. No choice of units for `d` or
-    `σ_sq` can rescue it: whatever convention makes `demoSteppingStoneFst`
-    homogeneous makes this body inhomogeneous by one power of time. That argument
-    is exact, costs nothing, commits to no `F_ST` convention, and reaches the same
-    verdict the two log-log slope measurements above reached — which is the point
-    of recording it: three instruments that could each have said no, and none of
-    them did.
+**Why deleting the definition does not delete the result.** The result was never
+about the number two. It is that `F_ST` at a fixed `(d, Nₑ)` sees the pair
+`(m, σ²)` only through one scalar, so ANY functional form with a free dispersal
+parameter able to reach that scalar fits the data equally well. Naming one such
+form and proving one identity was the weakest available way to say that. The
+first theorem below says it for every exponent at once.
 
-    **DO NOT "CORRECT" THIS BODY. THE FALSIFICATION IS THE RESULT.**
+The `4` that used to be tied to `ploidy` by `steppingStoneFstQuadratic_uses_ploidy`
+in `Conventions` is the same `4 Nₑ` as in `demoSteppingStoneFst`, whose own
+ploidy bridge is unaffected; only the powers of `m` and `σ²` ever distinguished
+the two forms, never the constant.
+-/
 
-    This definition is a FOIL, not a candidate law that failed. Its role is to be
-    the wrong exponent, held next to the right one, so that a theorem can say what
-    the data cannot distinguish. Two theorems in this file depend on it being
-    exactly what it is:
+/-- **No power of the dispersal scale is identified by `F_ST` data.**
 
-    * `demoSteppingStoneFst_indistinguishable_from_quadratic` proves
-      `demoSteppingStoneFst d Nₑ m σ² = steppingStoneFstQuadratic d Nₑ m √(σ²/m)`.
-    * `steppingStoneCoalescenceTime_indistinguishable_through_coalFst` carries the
-      same identity through the meeting time.
+For EVERY exponent `p ≠ 0` there is a dispersal scale `σ'` at which the family
+member `d / (d + 4 Nₑ (σ' m)^p)` takes the same value as `demoSteppingStoneFst`
+at every `d`. So `F_ST` measured with `σ²` free constrains the single product
+`m·σ²` and says nothing whatever about the exponent -- not merely that it cannot
+separate one from two.
 
-    Together they are a NON-IDENTIFIABILITY result: with `σ²` free, no amount of
-    `F_ST` data separates the linear form from the quadratic one, so a fit
-    constrains the product `m·σ²` and nothing else. That is the whole content, and
-    it is why the regime note on `demoSteppingStoneFst` demands `σ²` be held at an
-    independently measured dispersal variance.
+The witness is `σ' = (σ² m)^(1/p) / m`, which is what a fit would return: the
+exponent is absorbed by re-reading the dispersal scale, and every exponent has a
+reading that works.
 
-    Replacing this body with `d / (d + 4·Nₑ·m·σ_sq)` makes it literally
-    `demoSteppingStoneFst`. Both theorems above collapse to `x = x`, and the
-    identifiability result is gone — deleted, not repaired. The three falsifying
-    instruments recorded above are the DEMONSTRATION that this exponent is wrong;
-    they are what the foil is for, not evidence against keeping it.
+The consequence is the regime, and it is enforceable: evidence for the
+*functional form* requires `σ²` held at an independently measured dispersal
+variance while `m` varies. Evidence gathered with `σ²` free is evidence about
+`m·σ²`, whatever the fit quality -- the ±11% agreement quoted in the notes above
+included. The section note above records the design that meets the condition and
+what it found.
 
-    A directive to fix every falsified definition does not reach this one. The
-    alternative here is not "fix it"; the alternative is destroying a theorem. -/
-noncomputable def steppingStoneFstQuadratic (d Ne m σ_sq : ℝ) : ℝ :=
-  d / (d + 4 * Ne * σ_sq ^ 2 * m ^ 2)
+    Empirical status: NOT AN EMPIRICAL CLAIM. This is an algebraic identity
+    about a family of charts, and its content is what a measurement CANNOT
+    determine. The measurement that does determine the exponent, under the extra
+    condition this theorem names, is in the section note above. -/
+theorem demoSteppingStoneFst_dispersal_exponent_not_identified
+    (d Ne m σ_sq : ℝ) (hm : 0 < m) (hσ : 0 ≤ σ_sq) (p : ℝ) (hp : p ≠ 0) :
+    ∃ σ' : ℝ, 0 ≤ σ' ∧
+      demoSteppingStoneFst d Ne m σ_sq = d / (d + 4 * Ne * (σ' * m) ^ p) := by
+  have hprod : (0 : ℝ) ≤ σ_sq * m := mul_nonneg hσ (le_of_lt hm)
+  refine ⟨(σ_sq * m) ^ p⁻¹ / m, div_nonneg (Real.rpow_nonneg hprod _) (le_of_lt hm), ?_⟩
+  have hm' : m ≠ 0 := ne_of_gt hm
+  have hcancel : ((σ_sq * m) ^ p⁻¹ / m) * m = (σ_sq * m) ^ p⁻¹ := by
+    field_simp
+  rw [hcancel, ← Real.rpow_mul hprod, inv_mul_cancel₀ hp, Real.rpow_one]
+  unfold demoSteppingStoneFst
+  congr 2
+  ring
 
-/-- **steppingStoneFstQuadratic where its denominator vanishes, named.** The guard `d + 4 * Ne *
-σ_sq ^ 2 * m ^ 2` is zero at `d = 0`, `Ne = 0`, `m = 0`, `σ_sq = 0`. Lean returns `0` there
-rather than the value the modelled quantity takes, and no type error marks the point. Consumers
-must require `d + 4 * Ne * σ_sq ^ 2 * m ^ 2 ≠ 0`. -/
-theorem steppingStoneFstQuadratic_at_d0ne0m0sq0_is_junk :
-    steppingStoneFstQuadratic 0 0 0 0 = 0 := by
-  unfold steppingStoneFstQuadratic
-  norm_num
+/-- **A freely fitted dispersal variance cannot tell the linear form from the
+quadratic one.** This is the exponent-2 instance of
+`demoSteppingStoneFst_dispersal_exponent_not_identified`, with the quadratic form
+written out inline rather than carried as a named definition, and with the
+witness exhibited rather than only asserted to exist: at `σ' = √(σ²/m)` the
+quadratic form takes the same value everywhere, so no amount of `F_ST` data with
+`σ²` free can distinguish them.
 
-/-- **A freely fitted dispersal variance cannot tell the two forms apart.**
+Kept alongside the general theorem because the quadratic is the form the previous
+derivation in this file actually produced, so it is the instance a reader of that
+derivation will look for.
 
-The note on `demoSteppingStoneFst` says a refitted `σ²` absorbs the extra power exactly,
-and that the fit therefore constrains the product `m·σ²` and nothing else. This is that
-claim, proved: at `σ' = √(σ²/m)` the quadratic form takes the same value everywhere, so no
-amount of `F_ST` data with `σ²` free can distinguish them.
-
-The consequence is the regime, and it is now enforceable: evidence for the *functional
-form* requires `σ²` held at an independently measured dispersal variance while `m` varies.
-Evidence gathered with `σ²` free is evidence about `m·σ²`, whatever the fit quality — the
-±11% agreement quoted in the note included. -/
+    Empirical status: NOT AN EMPIRICAL CLAIM. An algebraic identity between two
+    charts; the section note above says what is and is not measurable here. -/
 theorem demoSteppingStoneFst_indistinguishable_from_quadratic
     (d Ne m σ_sq : ℝ) (hm : 0 < m) (hσ : 0 ≤ σ_sq) :
     demoSteppingStoneFst d Ne m σ_sq
-      = steppingStoneFstQuadratic d Ne m (Real.sqrt (σ_sq / m)) := by
-  unfold demoSteppingStoneFst steppingStoneFstQuadratic
+      = d / (d + 4 * Ne * Real.sqrt (σ_sq / m) ^ 2 * m ^ 2) := by
+  unfold demoSteppingStoneFst
   have hnn : (0 : ℝ) ≤ σ_sq / m := div_nonneg hσ (le_of_lt hm)
   rw [Real.sq_sqrt hnn]
   have hm' : m ≠ 0 := ne_of_gt hm
@@ -490,7 +500,7 @@ and leaves the observable `F_ST` fixed, which is what it means for the data to c
 theorem steppingStoneCoalescenceTime_indistinguishable_through_coalFst
     (d Ne m σ_sq : ℝ) (hd : 0 < d) (hNe : 0 < Ne) (hm : 0 < m) (hσ : 0 < σ_sq) :
     coalFst (steppingStoneDiffusionTimescale d σ_sq m) Ne =
-      steppingStoneFstQuadratic d Ne m (Real.sqrt (σ_sq / m)) := by
+      d / (d + 4 * Ne * Real.sqrt (σ_sq / m) ^ 2 * m ^ 2) := by
   rw [steppingStoneFst_from_coalescence_time d Ne m σ_sq hd hNe hm hσ]
   exact demoSteppingStoneFst_indistinguishable_from_quadratic d Ne m σ_sq hm (le_of_lt hσ)
 

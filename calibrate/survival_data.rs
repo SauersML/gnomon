@@ -1,5 +1,5 @@
 use crate::calibrate::survival::{
-    AgeTransform, CovariateViews, SurvivalError, SurvivalPredictionInputs, SurvivalTrainingData,
+    CovariateViews, SurvivalError, SurvivalPredictionInputs, SurvivalTrainingData,
     validate_survival_inputs,
 };
 use ndarray::{Array1, Array2};
@@ -12,6 +12,8 @@ use thiserror::Error;
 /// Errors surfaced while reading or validating survival datasets.
 #[derive(Debug, Error)]
 pub enum SurvivalDataError {
+    #[error("unsupported survival covariate '{0}'; accepted predictors are pgs, sex, and configured PCs")]
+    UnsupportedCovariate(String),
     #[error("Error from the underlying Polars library: {0}")]
     Polars(#[from] PolarsError),
     #[error("IO error: {0}")]
@@ -40,11 +42,10 @@ pub enum SurvivalDataError {
     Validation(#[from] SurvivalError),
 }
 
-/// Bundle containing frequency-weighted survival training data and the cached age transform.
+/// Bundle containing validated, frequency-weighted survival training data.
 #[derive(Debug)]
 pub struct SurvivalTrainingBundle {
     pub data: SurvivalTrainingData,
-    pub age_transform: AgeTransform,
 }
 
 /// Owned arrays backing `SurvivalPredictionInputs` alongside the raw covariates.
@@ -112,11 +113,10 @@ impl SurvivalPredictionCovariates {
     }
 }
 
-/// Load survival training data from a TSV or Parquet file, validating and caching the age transform.
+/// Load and validate survival training data from a TSV or Parquet file.
 pub fn load_survival_training_data(
     path: &str,
     num_pcs: usize,
-    guard_delta: f64,
 ) -> Result<SurvivalTrainingBundle, SurvivalDataError> {
     let arrays = read_survival_arrays(path, num_pcs)?;
 
@@ -132,8 +132,6 @@ pub fn load_survival_training_data(
         arrays.extra_static_covariates.view(),
     )?;
 
-    let age_transform = AgeTransform::from_training(&arrays.age_entry, guard_delta)?;
-
     Ok(SurvivalTrainingBundle {
         data: SurvivalTrainingData {
             age_entry: arrays.age_entry,
@@ -147,7 +145,6 @@ pub fn load_survival_training_data(
             extra_static_covariates: arrays.extra_static_covariates,
             extra_static_names: arrays.extra_static_names,
         },
-        age_transform,
     })
 }
 
@@ -275,50 +272,15 @@ pub fn load_survival_prediction_covariates(
         }
     }
 
-    // Collect extra static covariates
-    let mut extra_names = Vec::new();
-    let mut extra_columns = Vec::new();
-    for original in df.get_column_names() {
-        let original_str = original.as_ref();
-        if used_columns.contains(original_str) {
-            continue;
-        }
-        let series = df
-            .column(original_str)
-            .map_err(|_| SurvivalDataError::ColumnNotFound(original_str.to_string()))?;
-        let casted = match series.cast(&DataType::Float64) {
-            Ok(values) => values,
-            Err(_) => continue,
-        };
-        let values = casted.f64().expect("casted to f64");
-        if values.null_count() > 0 {
-            return Err(SurvivalDataError::MissingValues(original_str.to_string()));
-        }
-        if values.len() != n {
-            return Err(SurvivalDataError::LengthMismatch {
-                column_name: original_str.to_string(),
-                expected: n,
-                found: values.len(),
-            });
-        }
-        let column = Array1::from_iter(values.into_no_null_iter());
-        extra_names.push(original_str.to_string());
-        extra_columns.push(column);
-    }
-
-    let extra_width = extra_columns.len();
-    let mut extra_static = Array2::<f64>::zeros((n, extra_width));
-    for (idx, column) in extra_columns.into_iter().enumerate() {
-        extra_static.column_mut(idx).assign(&column);
-    }
+    reject_extra_covariates(&df, &used_columns)?;
 
     Ok(SurvivalPredictionCovariates {
         age_entry,
         pgs,
         sex,
         pcs,
-        extra_static_covariates: extra_static,
-        extra_static_names: extra_names,
+        extra_static_covariates: Array2::zeros((n, 0)),
+        extra_static_names: Vec::new(),
     })
 }
 
@@ -334,6 +296,15 @@ struct SurvivalArrays {
     pcs: Array2<f64>,
     extra_static_covariates: Array2<f64>,
     extra_static_names: Vec<String>,
+}
+
+fn reject_extra_covariates(df: &DataFrame, used_columns: &HashSet<String>) -> Result<(), SurvivalDataError> {
+    for name in df.get_column_names() {
+        if !used_columns.contains(name.as_str()) && !name.eq_ignore_ascii_case("sample_id") {
+            return Err(SurvivalDataError::UnsupportedCovariate(name.to_string()));
+        }
+    }
+    Ok(())
 }
 
 fn read_survival_arrays(path: &str, num_pcs: usize) -> Result<SurvivalArrays, SurvivalDataError> {
@@ -412,42 +383,7 @@ fn read_survival_arrays(path: &str, num_pcs: usize) -> Result<SurvivalArrays, Su
         pcs.column_mut(j).assign(&column);
     }
 
-    let mut extra_names = Vec::new();
-    let mut extra_columns = Vec::new();
-    for original in df.get_column_names() {
-        let original_str = original.as_ref();
-        if used_columns.contains(original_str) {
-            continue;
-        }
-        let series = df
-            .column(original_str)
-            .map_err(|_| SurvivalDataError::ColumnNotFound(original_str.to_string()))?;
-        let casted = match series.cast(&DataType::Float64) {
-            Ok(values) => values,
-            Err(_) => continue,
-        };
-        let values = casted.f64().expect("casted to f64");
-        if values.null_count() > 0 {
-            return Err(SurvivalDataError::MissingValues(original_str.to_string()));
-        }
-        if values.len() != n {
-            return Err(SurvivalDataError::LengthMismatch {
-                column_name: original_str.to_string(),
-                expected: n,
-                found: values.len(),
-            });
-        }
-        let column = Array1::from_iter(values.into_no_null_iter());
-        extra_names.push(original_str.to_string());
-        extra_columns.push(column);
-        used_columns.insert(original_str.to_string());
-    }
-
-    let extra_width = extra_columns.len();
-    let mut extra_static = Array2::<f64>::zeros((n, extra_width));
-    for (idx, column) in extra_columns.into_iter().enumerate() {
-        extra_static.column_mut(idx).assign(&column);
-    }
+    reject_extra_covariates(&df, &used_columns)?;
 
     Ok(SurvivalArrays {
         age_entry,
@@ -458,8 +394,8 @@ fn read_survival_arrays(path: &str, num_pcs: usize) -> Result<SurvivalArrays, Su
         pgs,
         sex,
         pcs,
-        extra_static_covariates: extra_static,
-        extra_static_names: extra_names,
+        extra_static_covariates: Array2::zeros((n, 0)),
+        extra_static_names: Vec::new(),
     })
 }
 
@@ -595,7 +531,6 @@ mod tests {
             Series::new("sex".into(), vec![0.0, 1.0, 0.0]).into(),
             Series::new("pc1".into(), vec![0.5, 0.6, 0.7]).into(),
             Series::new("pc2".into(), vec![1.5, 1.6, 1.7]).into(),
-            Series::new("bmi".into(), vec![22.0, 23.5, 24.1]).into(),
         ])
         .expect("construct sample dataframe")
     }
@@ -623,14 +558,11 @@ mod tests {
     fn training_loader_reads_tsv() {
         let df = sample_dataframe();
         let file = write_tsv(&df);
-        let bundle = load_survival_training_data(file.path().to_str().unwrap(), 2, 0.1)
+        let bundle = load_survival_training_data(file.path().to_str().unwrap(), 2)
             .expect("load training data");
         assert_eq!(bundle.data.age_entry.len(), 3);
-        assert_eq!(bundle.age_transform.minimum_age, 50.0);
         assert_eq!(bundle.data.sample_weight[1], 2.0);
         assert_eq!(bundle.data.pcs.ncols(), 2);
-        assert_eq!(bundle.data.extra_static_covariates.ncols(), 1);
-        assert_eq!(bundle.data.extra_static_names, vec!["bmi"]);
     }
 
     #[test]
@@ -638,7 +570,7 @@ mod tests {
         let mut df = sample_dataframe();
         df.drop_in_place("sample_weight").unwrap();
         let file = write_tsv(&df);
-        let bundle = load_survival_training_data(file.path().to_str().unwrap(), 2, 0.1)
+        let bundle = load_survival_training_data(file.path().to_str().unwrap(), 2)
             .expect("load training data");
         assert!(
             bundle
@@ -657,9 +589,18 @@ mod tests {
             .expect("load prediction");
         let inputs = prediction.as_inputs();
         assert_eq!(inputs.covariates.pgs.len(), 3);
-        assert_eq!(inputs.covariates.static_covariates.ncols(), 1);
-        assert_eq!(prediction.extra_static_names, vec!["bmi".to_string()]);
         assert_eq!(inputs.age_exit.len(), 3);
+    }
+
+    #[test]
+    fn loaders_reject_extra_covariates_without_a_prediction_contract() {
+        let mut df = sample_dataframe();
+        df.with_column(Series::new("bmi".into(), vec![22.0, 23.5, 24.1])).expect("add unsupported covariate");
+        let file = write_tsv(&df);
+        let path = file.path().to_str().expect("path");
+        assert!(matches!(load_survival_training_data(path, 2), Err(SurvivalDataError::UnsupportedCovariate(name)) if name == "bmi"));
+        assert!(matches!(load_survival_prediction_data(path, 2), Err(SurvivalDataError::UnsupportedCovariate(name)) if name == "bmi"));
+        assert!(matches!(load_survival_prediction_covariates(path, 2), Err(SurvivalDataError::UnsupportedCovariate(name)) if name == "bmi"));
     }
 
     #[test]
@@ -668,7 +609,7 @@ mod tests {
         df.with_column(Series::new("event_target".into(), vec![1i32, 1, 0]))
             .unwrap();
         let file = write_tsv(&df);
-        let err = load_survival_training_data(file.path().to_str().unwrap(), 2, 0.1)
+        let err = load_survival_training_data(file.path().to_str().unwrap(), 2)
             .expect_err("conflicting events");
         match err {
             SurvivalDataError::Validation(SurvivalError::ConflictingEvents) => {}

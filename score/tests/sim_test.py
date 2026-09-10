@@ -6,8 +6,6 @@ import subprocess
 import shutil
 import time
 import math
-import multiprocessing
-import gmpy2
 from pathlib import Path
 from functools import reduce
 
@@ -32,62 +30,58 @@ MAD_THRESHOLD = 0.00001
 
 # --- HELPER FUNCTIONS ---
 
-def sum_column_precise(col):
-    """Sums a column of floats using the ultra-precise gmpy2 library."""
-    gmpy2.get_context().precision = 256
-    return sum(gmpy2.mpfr(f) for f in col)
-
-def sample_allele_frequencies(n):
+def sample_allele_frequencies(n, rng):
     """Samples allele frequencies from a mixture of distributions."""
-    choices = np.random.choice(4, size=n, p=FREQ_DIST_WEIGHTS)
+    choices = rng.choice(4, size=n, p=FREQ_DIST_WEIGHTS)
     p = np.empty(n)
     for i, c in enumerate(choices):
-        if c == 0: p[i] = np.random.uniform(0.001, 0.05)
+        if c == 0: p[i] = rng.uniform(0.001, 0.05)
         elif c == 1:
-            r = np.random.beta(0.5, 10)
+            r = rng.beta(0.5, 10)
             p[i] = min(r, 1 - r)
         elif c == 2:
-            r = np.random.beta(0.2, 0.2)
+            r = rng.beta(0.2, 0.2)
             p[i] = min(r, 1 - r)
-        else: p[i] = np.random.uniform(0.01, 0.99)
+        else: p[i] = rng.uniform(0.01, 0.99)
     return p
 
-def sample_effect_sizes(n):
+def sample_effect_sizes(n, rng):
     """Samples effect sizes from a mixture of distributions."""
-    choices = np.random.choice(4, size=n, p=EFFECT_DIST_WEIGHTS)
+    choices = rng.choice(4, size=n, p=EFFECT_DIST_WEIGHTS)
     w = np.empty(n)
     for i, c in enumerate(choices):
-        if c == 0: w[i] = np.random.normal(0, 0.0001)
-        elif c == 1: w[i] = np.random.laplace(0, 0.5)
-        elif c == 2: w[i] = np.random.uniform(-1, 1)
-        else: w[i] = np.random.standard_cauchy() * 0.5
+        if c == 0: w[i] = rng.normal(0, 0.0001)
+        elif c == 1: w[i] = rng.laplace(0, 0.5)
+        elif c == 2: w[i] = rng.uniform(-1, 1)
+        else: w[i] = rng.standard_cauchy() * 0.5
     return w
 
-def sample_effect_alleles(n, ref, alt, af):
+def sample_effect_alleles(n, ref, alt, af, rng):
     """Chooses an effect allele, biased by allele frequency."""
     alt_prob = np.clip(ALT_EFFECT_PROB + (0.5 - af), 0.1, 0.9)
-    mask = np.random.rand(n) < alt_prob
+    mask = rng.random(n) < alt_prob
     return np.where(mask, alt, ref)
 
 def _write_plink_files(prefix, bim_df, individuals, genotypes_df):
     """Helper to write a set of PLINK files for a test case."""
+    genotypes = genotypes_df.to_numpy()
+    if genotypes.shape != (len(bim_df), len(individuals)):
+        raise ValueError("Genotype matrix must match BIM rows and FAM samples")
+    if not np.isin(genotypes, [-1, 0, 1, 2]).all():
+        raise ValueError("BED genotypes must be missing (-1) or diploid dosages 0, 1, 2")
+    # Four samples per byte, least-significant pair first. Padding is zero.
+    encoded = np.array([0b01, 0b00, 0b10, 0b11], dtype=np.uint8)[genotypes.astype(np.int8, copy=False) + 1]
+    encoded = np.pad(encoded, ((0, 0), (0, (-len(individuals)) % 4)))
+    packed = encoded[:, 0::4] | (encoded[:, 1::4] << 2) | (encoded[:, 2::4] << 4) | (encoded[:, 3::4] << 6)
     with open(prefix.with_suffix(".fam"), 'w') as f:
         for iid in individuals:
             f.write(f"{iid} {iid} 0 0 0 -9\n")
     bim_df[['chr','id','cm','pos','a1','a2']].to_csv(
         prefix.with_suffix(".bim"), sep='\t', header=False, index=False
     )
-    code_map = {0:0b00, 1:0b10, 2:0b11, -1:0b01}
-    n = len(individuals)
     with open(prefix.with_suffix(".bed"), 'wb') as f:
         f.write(bytes([0x6c, 0x1b, 0x01]))
-        for _, row in genotypes_df.iterrows():
-            for j in range(0, n, 4):
-                byte = 0
-                chunk = row.iloc[j:j+4]
-                for k, geno in enumerate(chunk):
-                    byte |= (code_map[int(geno)] << (k*2))
-                f.write(byte.to_bytes(1, 'little'))
+        f.write(packed.tobytes())
     print(f"Programmatically wrote {prefix}.bed/.bim/.fam")
 
 def _write_score_file(filename, score_df):
@@ -112,42 +106,43 @@ def print_file_header(filepath: Path, tool_name: str):
 
 # --- SIMULATION STEPS ---
 
-def generate_variants_and_weights():
+def generate_variants_and_weights(rng):
     """Step 1: Simulate variant positions, alleles, frequencies, and effect sizes."""
     print(f"Step 1: Simulating {N_VARIANTS} variants on chr{CHR}...")
-    positions = np.sort(np.random.choice(np.arange(1, CHR_LENGTH + 1), N_VARIANTS, replace=False))
+    positions = np.sort(rng.choice(CHR_LENGTH, N_VARIANTS, replace=False) + 1)
     alleles = np.array(['A', 'C', 'G', 'T'])
-    ref_idx = np.random.randint(0, 4, N_VARIANTS)
-    alt_idx = (ref_idx + np.random.randint(1, 4, N_VARIANTS)) % 4
+    ref_idx = rng.integers(0, 4, N_VARIANTS)
+    alt_idx = (ref_idx + rng.integers(1, 4, N_VARIANTS)) % 4
     variants_df = pd.DataFrame({
         'chr': CHR, 'pos': positions, 'ref': alleles[ref_idx], 'alt': alleles[alt_idx],
-        'af': sample_allele_frequencies(N_VARIANTS),
-        'effect_weight': sample_effect_sizes(N_VARIANTS)
+        'af': sample_allele_frequencies(N_VARIANTS, rng),
+        'effect_weight': sample_effect_sizes(N_VARIANTS, rng)
     })
-    variants_df['effect_allele'] = sample_effect_alleles(N_VARIANTS, variants_df['ref'], variants_df['alt'], variants_df['af'])
+    variants_df['effect_allele'] = sample_effect_alleles(N_VARIANTS, variants_df['ref'], variants_df['alt'], variants_df['af'], rng)
     print("...Variant and weight simulation complete.")
     return variants_df
 
-def generate_genotypes(variants_df):
+def generate_genotypes(variants_df, rng, n_individuals=N_INDIVIDUALS):
     """Step 2: Generate genotypes under Hardy-Weinberg equilibrium."""
-    print(f"Step 2: Simulating genotypes for {N_INDIVIDUALS} individuals...")
+    print(f"Step 2: Simulating genotypes for {n_individuals} individuals...")
     p = variants_df['af'].values
     q = 1 - p
     hwe_probs = np.vstack([q**2, 2*p*q, p**2]).T # Note: HWE is for alt allele count
-    rand_draws = np.random.rand(N_VARIANTS, N_INDIVIDUALS)
+    rand_draws = rng.random((len(variants_df), n_individuals))
     cum_probs = hwe_probs.cumsum(axis=1)
-    genotypes = (rand_draws > cum_probs[:, [0]]) + (rand_draws > cum_probs[:, [1]])
+    # NumPy boolean addition is boolean OR; cast before adding so ALT/ALT is 2.
+    genotypes = (rand_draws >= cum_probs[:, [0]]).astype(np.int8) + (rand_draws >= cum_probs[:, [1]]).astype(np.int8)
     print("...Genotype simulation complete.")
-    return genotypes.astype(int)
+    return genotypes
 
-def introduce_missingness(genotypes):
+def introduce_missingness(genotypes, rng):
     """Step 3: Introduce random missingness into the genotype matrix."""
     print(f"Step 4: Introducing {MISSING_RATE*100:.1f}% missingness...")
-    mask = np.random.rand(*genotypes.shape) < MISSING_RATE
-    g = genotypes.astype(float)
+    mask = rng.random(genotypes.shape) < MISSING_RATE
+    g = genotypes.copy()
     g[mask] = -1
     print("...Missingness introduced.")
-    return g.astype(int)
+    return g
 
 def calculate_ground_truth_prs(genotypes, variants_df):
     """
@@ -161,15 +156,15 @@ def calculate_ground_truth_prs(genotypes, variants_df):
     dosages = np.where(is_alt_effect[:, np.newaxis], genotypes, 2 - genotypes).astype(float)
     score_components = np.where(valid_mask, dosages * effect_weights[:, np.newaxis], 0)
 
-    print(f"    > Dispatching summations to {multiprocessing.cpu_count()} CPU cores...")
-    with multiprocessing.Pool() as pool:
-        score_sums = pool.map(sum_column_precise, score_components.T)
+    # Compensated summation is deterministic and accurate without copying the
+    # matrix into one process per host CPU or spawning unbounded workers.
+    score_sums = [math.fsum(column) for column in score_components.T]
 
     # Denominator is the number of non-missing variants (loci) scored per person.
     variant_counts_per_person = valid_mask.sum(axis=0)
     
     score_avg = np.array([s / v if v != 0 else 0.0 for s, v in zip(score_sums, variant_counts_per_person)], dtype=float)
-    return pd.DataFrame({'FID': f'sample_{i+1}', 'IID': f'sample_{i+1}', 'PRS_AVG': score_avg[i]} for i in range(N_INDIVIDUALS))
+    return pd.DataFrame({'FID': f'sample_{i+1}', 'IID': f'sample_{i+1}', 'PRS_AVG': score_avg[i]} for i in range(genotypes.shape[1]))
 
 
 def write_output_files(prs_results, variants_df, genotypes_with_missing, prefix: Path):
@@ -186,7 +181,7 @@ def write_output_files(prs_results, variants_df, genotypes_with_missing, prefix:
     print(f"...Gnomon-native scorefile written to {gnomon_scorefile}")
 
     bim_df = pd.DataFrame({'chr': variants_df['chr'], 'id': variants_df['chr'].astype(str) + ':' + variants_df['pos'].astype(str), 'cm': 0, 'pos': variants_df['pos'], 'a1': variants_df['ref'], 'a2': variants_df['alt']})
-    _write_plink_files(prefix, bim_df, [f"sample_{i+1}" for i in range(N_INDIVIDUALS)], pd.DataFrame(genotypes_with_missing, index=bim_df['id']))
+    _write_plink_files(prefix, bim_df, [f"sample_{i+1}" for i in range(genotypes_with_missing.shape[1])], pd.DataFrame(genotypes_with_missing, index=bim_df['id']))
 
 def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, pylink_path: Path, run_cmd_func):
     """
@@ -246,7 +241,7 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, p
         """
         # Group score rules by unique chromosomal locus for efficient lookup.
         score_rules_by_locus = {}
-        score_df['locus'] = score_df['variant_id'].str.split(':').str[:2].str.join(':')
+        score_df = score_df.assign(locus=score_df['variant_id'].str.split(':').str[:2].str.join(':'))
         for locus, group in score_df.groupby('locus'):
             score_rules_by_locus[locus] = group.to_dict('records')
         
@@ -254,7 +249,7 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, p
     
         # Group bim records by unique chromosomal locus.
         bim_by_locus = {}
-        bim_df['locus'] = bim_df['chr'].astype(str) + ':' + bim_df['pos'].astype(str)
+        bim_df = bim_df.assign(locus=bim_df['chr'].astype(str) + ':' + bim_df['pos'].astype(str))
         for locus, group in bim_df.groupby('locus'):
             bim_by_locus[locus] = group.to_dict('records')
     
@@ -394,7 +389,13 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, p
     is_gnomon_ok = False
     if gnomon_df is not None:
         merged_compare = merged.dropna(subset=['SCORE_TRUTH', 'SCORE_GNOMON'])
-        if not merged_compare.empty:
+        expected_iids = set(truth_df['IID']) - iids_expected_to_fail
+        complete = (
+            not gnomon_df['IID'].duplicated().any()
+            and set(gnomon_df['IID']) == set(truth_df['IID'])
+            and set(merged_compare['IID']) == expected_iids
+        )
+        if complete and not merged_compare.empty:
             scores_ok = np.allclose(merged_compare['SCORE_TRUTH'], merged_compare['SCORE_GNOMON'])
             missing_ok = np.allclose(merged_compare['MISSING_PCT_TRUTH'], merged_compare['MISSING_PCT_GNOMON'])
             if scores_ok and missing_ok:
@@ -404,12 +405,8 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, p
                 print("\n❌ Verification failed: Gnomon results DO NOT MATCH the ground truth.")
                 if not scores_ok: print("  - Mismatch found in scores.")
                 if not missing_ok: print("  - Mismatch found in missingness percentages.")
-        else: # Handle case where all samples were expected to fail
-            is_gnomon_ok = iids_expected_to_fail and gnomon_res.returncode != 0
-            if is_gnomon_ok:
-                print("\n✅ Verification successful: Gnomon correctly failed for ambiguous samples.")
-            elif not iids_expected_to_fail:
-                 print("\n❌ Verification failed: Gnomon produced no valid output to compare.")
+        else:
+            print("\n❌ Verification failed: Gnomon output does not contain every expected sample result.")
     
     if is_gnomon_ok:
         print("\n✅ Simple Dosage Test SUCCEEDED.")
@@ -567,7 +564,10 @@ def run_multi_score_file_test(workdir: Path, gnomon_path: Path, run_cmd_func):
         result_df = pd.read_csv(gnomon_output_path, sep='\t')
         print_file_header(gnomon_output_path, "Gnomon (Multi-Score Test)")
         
-        merged = pd.merge(result_df, truth_df, on='#IID')
+        merged = pd.merge(result_df, truth_df, on='#IID', how='outer', validate='one_to_one', indicator=True)
+        if merged.empty or not merged['_merge'].eq('both').all():
+            print("❌ Verification failed: Output sample set differs from the expected samples.")
+            return False
         
         # Check column names
         expected_cols = {'#IID', 'scoreA_AVG', 'scoreA_MISSING_PCT', 'scoreB_AVG', 'scoreB_MISSING_PCT'}
@@ -600,7 +600,7 @@ def run_multi_score_file_test(workdir: Path, gnomon_path: Path, run_cmd_func):
         return False
 # --- MAIN VALIDATION RUNNER ---
 
-def run_and_validate_tools(runtimes):
+def run_and_validate_tools(runtimes, rng):
     """Downloads tools, runs them, validates results, and collects runtimes."""
     PLINK2_BINARY_PATH = Path(shutil.which("plink2") or "/usr/local/bin/plink2")
     GNOMON_BINARY_PATH = Path("./target/release/gnomon").resolve()
@@ -662,7 +662,10 @@ def run_and_validate_tools(runtimes):
         except (FileNotFoundError, KeyError) as e:
             print(f"  > ❌ ERROR: Failed to load or parse a result file. Error: {e}.")
             return False
-        merged_df = pd.merge(truth_df, gnomon_df, on='IID')
+        merged_df = pd.merge(truth_df, gnomon_df, on='IID', how='outer', validate='one_to_one', indicator=True)
+        if merged_df.empty or not merged_df['_merge'].eq('both').all():
+            print("❌ Verification failed: Output sample set differs from the expected samples.")
+            return False
         print("\n--- Score Correlation Matrix (Large-Scale) ---")
         corr_matrix = merged_df[['SCORE_TRUTH','SCORE_GNOMON']].corr()
         print(corr_matrix.to_markdown(floatfmt=".8f"))
@@ -701,6 +704,13 @@ def run_and_validate_tools(runtimes):
     print("="*80)
     
     if overall_success:
+        # Fast deterministic contract checks run before generating the larger
+        # fixture, so failures are visible without spending time on unused data.
+        variants_df = generate_variants_and_weights(rng)
+        genotypes_pristine = generate_genotypes(variants_df, rng)
+        genotypes_with_missing = introduce_missingness(genotypes_pristine, rng)
+        prs_df = calculate_ground_truth_prs(genotypes_with_missing, variants_df)
+        write_output_files(prs_df, variants_df, genotypes_with_missing, OUTPUT_PREFIX)
         gnomon_res = run_command(
             [
                 GNOMON_BINARY_PATH,
@@ -738,20 +748,13 @@ def cleanup():
 
 def main():
     """Main pipeline: simulate, write files, validate."""
-    np.random.seed(42)
+    rng = np.random.default_rng(42)
     exit_code = 0
     runtimes = []
     if WORKDIR.exists(): shutil.rmtree(WORKDIR)
     WORKDIR.mkdir()
     try:
-        print("--- Starting Full Simulation and File Writing Pipeline ---")
-        variants_df = generate_variants_and_weights()
-        genotypes_pristine = generate_genotypes(variants_df)
-        genotypes_with_missing = introduce_missingness(genotypes_pristine)
-        prs_df = calculate_ground_truth_prs(genotypes_with_missing, variants_df)
-        write_output_files(prs_df, variants_df, genotypes_with_missing, OUTPUT_PREFIX)
-        print("\n--- Simulation and File Writing Finished Successfully ---")
-        if not run_and_validate_tools(runtimes):
+        if not run_and_validate_tools(runtimes, rng):
             print("\n" + "!"*80)
             print("! OVERALL VALIDATION FAILED: One or more tests did not pass.")
             print("!"*80)

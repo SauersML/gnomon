@@ -1121,14 +1121,12 @@ theorem asymmetricFst_eq_scaled (Ne m₁₂ m₂₁ : ℝ) :
 `fstMigrationDriftEquilibrium_eq_scaled` above.  A second copy of it stood here, for the
 second spelling of that equilibrium -- which is what the note above predicted: "A second
 spelling of `1 / (1 + 4 Nₑ m)` would need its own bridge theorem, which is a reason not to
-add one."  The spelling is gone from `PortabilityDrift` and its bridge with it. -/
+add one."  The spelling is gone from `PortabilityDrift` and its bridge with it.
 
-theorem fstMigrationMutationEquilibriumManyDemes_eq_scaled (Ne m μ : ℝ) :
-    fstMigrationMutationEquilibriumManyDemes Ne m μ
-      = 1 / (1 + scaledMigrationRate Ne m + scaledMutationRate Ne μ) := by
-  unfold fstMigrationMutationEquilibriumManyDemes
-  rw [scaledMigrationRate_eq_ploidy_form, scaledMutationRate_eq_ploidy_form]
-  unfold ploidy; ring_nf
+The deme-blind `fstMigrationMutationEquilibriumManyDemes` had a bridge here too and it has
+gone the same way, with the body: the surviving spelling is
+`fstIslandEquilibriumFiniteDemes`, whose bridge is directly below and whose deme correction
+multiplies `scaledMigrationRate` and leaves `scaledMutationRate` alone. -/
 
 /-- **The finite-deme island equilibrium carries the same two scaled rates.** Its
 `4 Nₑ m` is `scaledMigrationRate` and its `4 Nₑ μ` is `scaledMutationRate`, exactly as in
@@ -1652,14 +1650,6 @@ theorem polygenicAdaptationShift_uses_ploidy {m : ℕ} (β Δp : Fin m → ℝ) 
     polygenicAdaptationShift β Δp = ∑ i, β i * ploidy * Δp i := by
   unfold polygenicAdaptationShift ploidy
   simp
-
-/-- **The four in the quadratic stepping-stone form is twice the ploidy**, the same
-`4 Nₑ` scaling as every other migration-drift denominator in the corpus. Only the powers of
-`m` and `σ²` distinguish this form from `demoSteppingStoneFst`; the constant does not. -/
-theorem steppingStoneFstQuadratic_uses_ploidy (d Ne m σ_sq : ℝ) :
-    steppingStoneFstQuadratic d Ne m σ_sq
-      = d / (d + 2 * ploidy * Ne * σ_sq ^ 2 * m ^ 2) := by
-  unfold steppingStoneFstQuadratic ploidy; ring
 
 /-- **The two-locus drift step carries the coalescent time scale.** `driftLDStep` creates
 identity at `1 / (ploidy · Nₑ)`, the same rate `driftLDCreationRate` names. -/

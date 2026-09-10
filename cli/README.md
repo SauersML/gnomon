@@ -32,16 +32,15 @@ Project samples into an existing HWE PCA space.
 Usage: `gnomon project <GENOTYPE_PATH> [--model <MODEL_NAME>]`
 
 ### `train`
-Train a generalized additive model used for calibration and saves it to `model.toml`.
+Train a generalized additive model used for calibration and save its complete inference bundle to `model.json`.
 
 Required arguments:
 - `training_data`: path to a TSV file with phenotype, score, and PC columns.
 - `--num-pcs <N>`: number of principal components to include.
 
 Optional arguments:
-- `--pgs-knots` / `--pgs-degree`: configure the spline basis for the polygenic score.
-- `--pc-knots` / `--pc-degree`: configure the spline basis for principal components.
-- `--penalty-order`: order of the difference penalty matrix.
+- `--pgs-centers`: farthest-point centers for the PGS Duchon smooth (at least 4).
+- `--pc-centers`: farthest-point centers for each PC Duchon smooth (at least 4).
 - `--max-iterations` / `--convergence-tolerance`: control the inner P-IRLS loop.
 - `--reml-max-iterations` / `--reml-convergence-tolerance`: control the outer REML
   optimization loop.
@@ -52,4 +51,4 @@ as `predictions.tsv`.
 
 Required arguments:
 - `test_data`: path to a TSV file with score and PC columns.
-- `--model <path>`: path to the trained model TOML file.
+- `--model <path>`: path to the trained calibration model JSON bundle.

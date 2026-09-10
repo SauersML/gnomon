@@ -1709,7 +1709,7 @@ dependencies = [
 [[package]]
 name = "convert_genome"
 version = "0.3.2"
-source = "git+https://github.com/SauersML/convert_genome?rev=1756f7e411e23e253a44c6df666df47ed49d170b#1756f7e411e23e253a44c6df666df47ed49d170b"
+source = "git+https://github.com/SauersML/convert_genome?rev=54212bc2740567db3731690973c868924c0d57fd#54212bc2740567db3731690973c868924c0d57fd"
 dependencies = [
  "anyhow",
  "check_build",

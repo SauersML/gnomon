@@ -88,6 +88,64 @@ partial def stripLams : Expr → Expr
   | .mdata _ b => stripLams b
   | e => e
 
+/-! ## POPULATIONS — did each scan look at anything?
+
+Every scan below prints its own denominator with `logInfo`, and `logInfo` cannot
+fail the run.  So all six scans reported "0 scanned, 0 offenders" and exited 0
+under any change that empties their population -- a namespace rename putting
+`isOurs` off the corpus, `Shared.userWritten` inverting, a dropped `import
+Calibrator` leaving no `Calibrator` constants in the environment at all.  That is
+the same defect as the extraction tier parsing zero definitions and exiting 0,
+in the one instrument positioned to see the elaborated environment.
+
+Two floors, neither of them a budget pinned to a current count:
+
+  * ZERO is always a finding.  A scan that examined nothing has not agreed with
+    anything, and no legitimate state of this corpus has zero hand-written
+    `Calibrator` theorems or definitions.
+  * `corpusFloor` is an order-of-magnitude floor on the whole `Calibrator`
+    namespace, the same shape as the metamorphic gate's `len(table) < 500`.  It
+    separates "one scan's filter broke" from "the corpus is not here at all",
+    so the operator is not sent chasing six downstream symptoms of one cause.
+-/
+namespace Populations
+
+/-- The corpus has thousands of declarations.  This catches an absent or
+unimported corpus without pinning a number that ordinary growth moves. -/
+def corpusFloor : Nat := 1000
+
+/-- The complaint for one scan's population, or `none` when it is healthy.
+
+Pure, so the calibration can drive it with counts the real environment cannot
+produce.  `floor = 0` still reports at `n = 0`: zero is the failure, not the
+boundary of it. -/
+def complain (label : String) (n floor : Nat) : Option String :=
+  if n == 0 then
+    some s!"{label} examined 0 declarations. A scan that looked at nothing has \
+      not agreed with anything, so its silence above is not evidence. Check \
+      `Check.isOurs`, `Shared.userWritten`, and that this file still imports the \
+      corpus."
+  else if n < floor then
+    some s!"{label} examined only {n} declarations, floor {floor}. The corpus \
+      has thousands; a population this small means the scan is reading a \
+      fragment of it and every count above describes that fragment."
+  else
+    none
+
+/-- Every scan's population in one array, checked by one loop.
+
+An array rather than six inline tests: a scan added without a population entry
+is then a visible omission in one place, and the calibration can exercise the
+loop on an entry at the END of the array, where an early exit or a report cap
+would hide it. -/
+def check (pops : Array (String × Nat × Nat)) : Array String :=
+  pops.foldl (fun acc (label, n, floor) ↦
+    match complain label n floor with
+    | some msg => acc.push msg
+    | none => acc) #[]
+
+end Populations
+
 /-- `Module.lean:LINE` for a declaration, from the environment's own ranges. -/
 def whereIs (env : Environment) (n : Name) : CoreM String := do
   let mod := match env.getModuleFor? n with
@@ -753,7 +811,7 @@ def deliberate (n : Name) : Bool :=
 
 end UnusedHyp
 
-/-! ## LIVENESS: a definition nothing refers to
+/-! ## LIVENESS: a definition nothing refers to (DIAGNOSTIC, not gating)
 
 A definition no other declaration mentions is dead code, and dead code in a
 proof corpus is worse than dead code in a program: it is a quantity the corpus
@@ -1041,6 +1099,46 @@ run_cmd do
   logInfo m!"LIVENESS_CALIB_CASES\t3"
   logInfo m!"LIVENESS_CALIB_FAILURES\t{lFailures}"
 
+  -- POPULATIONS, both directions, on inputs the real environment cannot
+  -- produce.  Every scan below prints its denominator with `logInfo`, which
+  -- cannot fail the run, so all six reported "0 scanned, 0 offenders" and
+  -- exited 0 under any change that empties their population.  The loop that
+  -- now refuses that is calibrated here rather than only being observed
+  -- silent on a corpus that happens to be present.
+  -- THE TAIL. A loop that stopped early, or a report list that capped, would
+  -- pass every probe below and still miss the last scan in the array, which is
+  -- the position a newly added scan takes. The planted zero sits after four
+  -- healthy entries.
+  let tailProbe : Array (String × Nat × Nat) :=
+    #[ ("head-ok", 5000, 1000), ("second-ok", 5000, 1000),
+       ("third-ok", 5000, 1000), ("fourth-ok", 5000, 1000),
+       ("TAIL-empty", 0, 0) ]
+  let tailResult := Populations.check tailProbe
+  let pCases : Array (Bool × String) :=
+    -- POSITIVE: zero is a finding even when the floor is zero.
+    #[ ((Populations.complain "stub" 0 0).isSome,
+        "a population of 0 was not reported"),
+    -- POSITIVE: below a floor is a finding.
+       ((Populations.complain "stub" 12 1000).isSome,
+        "a population far below its floor was not reported"),
+    -- NEGATIVE: at and above the floor is silent, or this fires on a healthy
+    -- corpus and the whole gate gets ignored.
+       ((Populations.complain "stub" 1000 1000).isNone,
+        "a population exactly at its floor was reported"),
+       ((Populations.complain "stub" 99999 1000).isNone,
+        "a healthy population was reported"),
+       (tailResult.size == 1 && (tailResult[0]!.splitOn "TAIL-empty").length > 1,
+        "the population loop did not reach the LAST entry of its array"),
+       ((Populations.check tailProbe.pop).isEmpty,
+        "the population loop fired on an array with no empty scan") ]
+  let mut pFailures := 0
+  for (ok, msg) in pCases do
+    unless ok do
+      pFailures := pFailures + 1
+      logError m!"POPULATION_CALIB\t{msg}"
+  logInfo m!"POPULATION_CALIB_CASES\t{pCases.size}"
+  logInfo m!"POPULATION_CALIB_FAILURES\t{pFailures}"
+
 /-! ## Driver
 
 One `run_cmd` for all four scans.  They share the environment traversal cost and,
@@ -1314,9 +1412,16 @@ run_cmd do
   let mut junkNamed := 0
   let mut junkGuarded := 0
   let mut junkExempt := 0
+  -- The DENOMINATOR, as opposed to `junkScanned`, which counts only the
+  -- definitions that use a junk operation. That count can legitimately be
+  -- small, so it is the population below it that has to be floored: without
+  -- this, a filter that stopped matching would show as "JUNK: 0 definitions
+  -- can return a totality artifact", which reads as good news.
+  let mut junkPopulation := 0
   let mut junkOpen : Array (Name × String) := #[]
   for (n, ci) in env.constants.toList do
     if isOurs n && userWritten env n && !ci.isTheorem then
+      junkPopulation := junkPopulation + 1
       if let some v := ci.value? then
         if Junk.usesJunkOp v then
           junkScanned := junkScanned + 1
@@ -1419,14 +1524,54 @@ run_cmd do
         let loc ← liftCoreM <| whereIs env name
         deadDefs := deadDefs.push (mod, name, loc)
   let deadSorted := deadDefs.qsort (fun a b ↦ a.2.1.toString < b.2.1.toString)
+  -- DIAGNOSTIC, not gating -- `logInfo`, so a finding does not fail the run.
+  -- Five false-positive classes have already been found and fixed here
+  -- (generated satellites, derived instances, tactic macros, parameterised
+  -- inhabitation witnesses, and uses that only a macro makes), each one after a
+  -- reported "dead" declaration turned out to be live.  Four independent
+  -- source-text attempts at this question were also wrong on first run.  A
+  -- check with that history should report and be read, not fail a required
+  -- build, and it can be promoted once a run produces a list that survives
+  -- deletion end to end.
   for (m, n, loc) in deadSorted do
-    logError m!"DEAD\t{m}\t{n}\t[{loc}]\tno other declaration mentions it in a \
-      type or a value; delete it, or wire it into a consumer"
+    logInfo m!"DEAD\t{m}\t{n}\t[{loc}]\tno other declaration mentions it in a \
+      type or a value; confirm by deleting and rebuilding before acting"
   logInfo m!"LIVENESS_DEFS_SCANNED\t{defPop.size}"
   logInfo m!"LIVENESS_WITNESSES\t{witnesses.size}"
   -- Printed even at zero: an exemption that is not counted is an allow-list.
   logInfo m!"LIVENESS_EXEMPT\t{exempt}"
   logInfo m!"LIVENESS_DEAD\t{deadDefs.size}"
+
+  ---------------------------------------------------------------------------
+  -- POPULATIONS
+  --
+  -- Last, because it is about every scan above. Each of them printed its own
+  -- denominator with `logInfo`, and `logInfo` cannot fail the run; nothing
+  -- compared any of those numbers with anything. So a change that emptied a
+  -- population -- a namespace rename putting `isOurs` off the corpus,
+  -- `Shared.userWritten` inverting, a dropped import leaving no `Calibrator`
+  -- constants in the environment -- made all six report "0 scanned, 0
+  -- offenders" and exit 0. `logError` here, so an instrument that examined
+  -- nothing fails instead of reading as a clean corpus.
+  ---------------------------------------------------------------------------
+  let mut corpusConstants := 0
+  for (n, _) in env.constants.toList do
+    if isOurs n then corpusConstants := corpusConstants + 1
+  let populations : Array (String × Nat × Nat) :=
+    #[ ("CORPUS (every `Calibrator` constant)", corpusConstants,
+        Populations.corpusFloor),
+       ("AXIOM scan (roots)", scanned, 0),
+       ("LAUNDERING scan", lScanned, 0),
+       ("INFLATION/RFL scan (hand-written theorems)", nthm, 0),
+       ("JUNK scan (hand-written definitions)", junkPopulation, 0),
+       ("UNUSED scan", uScanned, 0),
+       ("LIVENESS scan", defPop.size, 0) ]
+  let popComplaints := Populations.check populations
+  for msg in popComplaints do
+    logError m!"POPULATION\t{msg}"
+  for (label, n, _) in populations do
+    logInfo m!"POPULATION_OK\t{label}\t{n}"
+  logInfo m!"POPULATION_COMPLAINTS\t{popComplaints.size}"
 
   ---------------------------------------------------------------------------
   -- Stored results

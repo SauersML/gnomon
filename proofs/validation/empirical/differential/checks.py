@@ -1244,25 +1244,10 @@ check(
 # real test: `hetEquilibrium-vs-exact-iam` now runs it against the exact
 # infinite-alleles recursion, which is a reference the corpus does not contain.
 
-check(
-    id="ldCorrelationMigrationAnsatz-vs-sharedLD-squared",
-    fqn="Calibrator.PopulationGeneticsFoundations.ldCorrelationMigrationAnsatz",
-    claim="M^2/(1+M)^2 is exactly the square of PortabilityDrift.sharedLDFromMigration",
-    model_lean="proportion of LD that is shared, as a function of M=4Nm",
-    model_ref="sharedLDFromMigration(M)^2 = (1 - islandModelFst)^2",
-    reference="Calibrator.PortabilityDrift.sharedLDFromMigration ** 2",
-    grid=grid(M=[0.1, 1.0, 4.0, 40.0]),
-    lean=lambda D, M: D["ldCorrelationMigrationAnsatz"](M),
-    ref=lambda D, M: D["sharedLDFromMigration"](M) ** 2,
-    kind="internal",
-    note=(
-        "CONSISTENT: PopulationGeneticsFoundations.ldCorrelationMigrationAnsatz "
-        "is exactly the square of PortabilityDrift.sharedLDFromMigration, i.e. "
-        "(1 - islandModelFst)^2. Both are 'shared LD' but one is a correlation "
-        "and the other its square; the relation is exact and now recorded."
-    ),
-    canfail_clause="M must be away from the fixed points of x->x^2 (0 and 1); M=1 gives 0.25 vs 0.5",
-)
+# The falsified ldCorrelationMigrationAnsatz has been removed from the corpus.
+# Its algebraic identity with sharedLDFromMigration squared is consequently no
+# longer a production check; the empirical rejection remains beside the removal
+# in PopulationGeneticsFoundations.lean.
 
 check(
     id="targetHetFromFst-tautology",
@@ -2466,10 +2451,9 @@ _scale_check(
     {"d": (4.0, 0), "Ne": (500.0, 1), "m": (0.008, -1), "s2": (1.0, 0)},
     expected="AGREE",
     note=(
-        "CONTROL for steppingStoneFstQuadratic-scale-VIOLATION below. This is "
-        "the sibling that carries the migration rate to the first power, and it "
-        "is exactly invariant. The pair together is what makes the violation a "
-        "finding rather than a property of the check. "
+        "The migration rate enters to the first power, so this is exactly "
+        "invariant. test_identity_gate.py substitutes the incorrect quadratic "
+        "migration dependence to prove that this check detects the wrong exponent. "
         "PINNED expected AGREE, and the pin is the point: an unpinned check that "
         "ERRORs is scored as no problem at all. `run.py` returns 0 on a check "
         "whose every grid point raised, because `classify` gives it ERROR and "
@@ -2479,31 +2463,6 @@ _scale_check(
         "produce and a broken corpus table now fails the run here."
     ),
     extra="F_ST at the base point is 0.20, away from both 0 and 1.",
-)
-
-_scale_check(
-    "steppingStoneFstQuadratic-scale-VIOLATION",
-    "Calibrator.DemographicHistory.steppingStoneFstQuadratic",
-    "d/(d + 4 Ne sigma_sq^2 m^2) is NOT a function of the scaled migration rate",
-    lambda D, d, Ne, m, s2: D["steppingStoneFstQuadratic"](d, Ne, m, s2),
-    {"d": (4.0, 0), "Ne": (500.0, 1), "m": (0.008, -1), "s2": (1.0, 0)},
-    expected="INTERNAL-INCONSISTENT",
-    note=(
-        "PINNED FALSIFIED. sigma_sq^2 * m^2 carries one power of m more than "
-        "the diffusion scale admits, so the body changes by a factor of lam "
-        "under a rescaling that must leave it fixed. This is a third, "
-        "convention-free confirmation of the verdict two independent log-log "
-        "slope measurements already reached (battery_core2, battery_bulk17: "
-        "fitted exponent 0.974 +- 0.042 against a predicted 2). It costs no "
-        "simulation and commits to no F_ST convention. Pinned as an EXPECTED "
-        "disagreement: if this ever starts agreeing, either the body was "
-        "corrected -- in which case retire the check and the FALSIFIED note "
-        "with it -- or the check stopped measuring, and both must be noticed."
-    ),
-    extra=(
-        "The sibling control above must stay AGREE on the same base point; a "
-        "check that fired on both would be measuring the harness, not the body."
-    ),
 )
 
 _scale_check(

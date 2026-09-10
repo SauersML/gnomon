@@ -28,8 +28,10 @@ FAMILY 1 -- SPLIT F_ST
 
 FAMILY 2 -- ISLAND MIGRATION F_ST
     Covers islandModelFst, asymmetricFst, fstMigDriftEquil,
-    fstMigrationDriftEquilibrium, equilibriumFst, sharedLD_from_equilibrium,
+    fstMigrationDriftEquilibrium, equilibriumFst,
     neutralAFBenchmarkFromRecurrence, fstDriftMigration.
+    (sharedLD_from_equilibrium left this family when its body became m/(m + c):
+    it no longer predicts an F_ST, so this oracle cannot speak to it.)
     Simulate d demes at symmetric migration m, measure F_ST between two demes.
     THE DIFFERENCE THE DEFINITIONS CANNOT SEE: the NUMBER OF DEMES. Every one
     of the eight takes only (Ne, m), so all predict 1/(1+4 Ne m) at d = 2 and

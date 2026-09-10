@@ -764,8 +764,12 @@ per copy, only through homozygotes -- with the drift rate `1/(2 Nₑ)`. It is th
 argument `mutationSelectionBalanceRecessive` does not take.
 
 This is data, not a packaged claim that the deterministic approximation is
-adequate. Measurement puts that balance within 5 percent at `2 Nₑ √(mu s) = 226`,
-11 percent high at `57`, and 63 to 79 percent high below `2 Nₑ √(mu s) ≤ 2.8`.
+adequate. Measurement puts that balance 4.8 percent high at `2 Nₑ √(mu s) = 226`,
+3.7 percent at `200`, 7.7 percent at `150`, 9.1 percent at `100`, 11.4 percent at
+`57`, and 63 to 79 percent high below `2 Nₑ √(mu s) ≤ 2.8`. The bias is HIGH at
+every point measured and shrinks monotonically without crossing zero, so the
+comparison a consumer must make is against a tolerance and not against a
+threshold beyond which the approximation becomes correct.
 
 Note it is a WEAKER condition on `Nₑ` than the dominant case needs to be safe,
 in the sense that it involves `√(mu s)` rather than `h s`: at `mu = 1e-04` and
@@ -781,12 +785,43 @@ noncomputable def recessiveMutationSelectionDriftParameter (Ne mu s : ℝ) : ℝ
 /-- **The regime in which the recessive deterministic balance was validated.**
 
 Stated as a `Prop` rather than left in prose so that a consumer can be made to
-carry it. The threshold is the conservative end of the measured bracket: the
-claim is within 5 percent at `2 Nₑ √(mu s) = 226` and is rejected already at
-`57`, so the bound is set at the value that was actually measured to hold.
+carry it.
+
+**The bound has now been measured AT the bound.** This sentence used to say the
+threshold "is set at the value that was actually measured to hold", and that was
+not accurate when written: the measured points were `226` and `57`, and `200`
+sat in the factor-of-four hole between them. The hole has been filled
+(`proofs/validation/empirical/popgensel/brackets.py`, run through the
+`crossengine` harness unchanged -- same engine, same competitors, same `PLANTED`
+calibration, same five-sem rejection rule), and the bound survives:
+
+| `2 Nₑ √(mu s)` | measured carrier freq. | this body | high by | sems |
+|---|---|---|---|---|
+| 226 | 0.013362 ± 0.000158 | 0.014042 | 4.8% | -4.3 |
+| **200** | **0.013517 ± 0.000149** | **0.014042** | **3.7%** | **-3.5** |
+| 150 | 0.012955 ± 0.000173 | 0.014042 | 7.7% | -6.3 |
+| 100 | 0.012771 ± 0.000158 | 0.014042 | 9.1% | -8.1 |
+| 57 | 0.012439 ± 0.000200 | 0.014042 | 11.4% | -8.0 |
+
+So `200` is the tightest swept point at which the deterministic body is NOT
+rejected, and the crossing sits between `150` and `200`. The bound is on the
+correct side of it and is no longer an extrapolation.
+
+The new cells have power: on all three, `mu/s` is rejected at 74 to 89 sems,
+`√(mu/(2s))` at 17 to 24, and the `PLANTED` arm at 39 to 44.
+
+What the sweep also shows is that this is a TOLERANCE and not a validity
+boundary. The deterministic body is biased HIGH at every finite `Nₑ` measured,
+the bias shrinks monotonically with the compound parameter, and it never crosses
+zero. There is no `Nₑ` above which the approximation becomes exact; there is
+only the size of error a consumer is willing to carry, which is why the
+docstring on the parameter itself insists the comparison be made against a
+consumer's own tolerance.
 
     Empirical status: NOT AN EMPIRICAL CLAIM -- this is a hypothesis a consumer
-    discharges, not a prediction about data. -/
+    discharges, not a prediction about data. The bracket above is a measurement
+    about `mutationSelectionBalanceRecessive`, recorded here because it is what
+    fixes the constant this `Prop` carries. -/
 def DeterministicRecessiveBalanceRegime (Ne mu s : ℝ) : Prop :=
   200 ≤ recessiveMutationSelectionDriftParameter Ne mu s
 

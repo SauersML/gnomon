@@ -80,12 +80,16 @@ jobs:
 
       - name: Install elan
         if: steps.elan-cache.outputs.cache-hit != 'true'
-        run: curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh -s -- -y
+        run: curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh -s -- -y --default-toolchain none
 
       - name: Add elan to PATH
         run: echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
 
-          
+      # Resolve the pinned version even when dependency restoration lets the
+      # cache-fetch step skip; never save an unrelated default toolchain.
+      - name: Verify pinned Lean toolchain
+        run: lean --version
+
       - name: Cache Lake dependencies
         id: lake-deps-cache
         uses: actions/cache/restore@v4
@@ -196,6 +200,10 @@ jobs:
       - name: Calibrate the identity gate
         working-directory: proofs/validation/empirical/differential
         run: python3 test_identity_gate.py
+
+      - name: Verify corpus cache invalidation
+        working-directory: proofs/validation/empirical/differential
+        run: python3 test_corpus_cache.py
 
       - name: Verify covariance transport identities
         working-directory: proofs/validation/empirical/differential

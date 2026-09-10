@@ -412,16 +412,6 @@
       ],
       "note": "Two independent 4s: 4*Ne*m and 4*Ne*mu.  Either one dropping to 2 halves the corresponding scaled rate."
     },
-    "Calibrator/PopulationGeneticsFoundations.lean::fstMigrationMutationEquilibriumManyDemes": {
-      "quantity": "fst",
-      "convention": "identity-probability",
-      "constants": [
-        "1",
-        "1",
-        "4",
-        "4"
-      ]
-    },
     "Calibrator/PopulationGeneticsFoundations.lean::fstMutationDriftTransient": {
       "quantity": "fst",
       "convention": "identity-probability",
@@ -641,16 +631,6 @@
         "4"
       ],
       "note": "Built on `coalFst`, hence Hudson.  The 4 is the scaled migration rate 4*Ne*m; the superseded quadratic sibling squares both m and sigma."
-    },
-    "Calibrator/DemographicHistory.lean::steppingStoneFstQuadratic": {
-      "quantity": "fst",
-      "convention": "hudson",
-      "constants": [
-        "2",
-        "2",
-        "4"
-      ],
-      "note": "A superseded candidate kept as a discriminand: quadratic in m and in sigma where the surviving form is linear."
     },
     "Calibrator/DemographicHistory.lean::admixedFst": {
       "quantity": "fst",

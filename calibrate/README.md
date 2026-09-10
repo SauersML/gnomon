@@ -4,6 +4,12 @@
 survival workflows. It owns schema/data policy, PGS/PC/sex feature semantics,
 artifact mapping, and stable `gnomon::calibrate::*` entrypoints.
 
+Training writes `model.json`, an atomic, versioned bundle containing the model
+configuration, fitted predictor, feature schema and ranges, and the fitted CTN
+score transformation when needed. Prediction reuses that transformation for
+new samples; phenotype and sample weights are never prediction features.
+Bundles with missing feature or transformation metadata require refitting.
+
 Core numerical engine modules (basis construction, PIRLS/REML, HMC, ALO,
 reparameterization, diagnostics, and shared math types) live in the separate
 solver engine repository and are imported by this crate.
@@ -24,6 +30,11 @@ coefficient are intentionally **not** built in v1 — the marginal-slope warps
 described below absorb PGS-by-covariate departures from linearity. This is
 encoded in [`construction.rs`](construction.rs).
 
+`SmoothConfig.num_centers` (CLI `--pgs-centers` / `--pc-centers`) controls
+farthest-point center counts, with at least four centers. These radial smooths
+use their fixed Duchon kernel and operator penalties; polynomial spline degree
+and difference-penalty knobs apply only to the separate survival time splines.
+
 ### Likelihoods
 
 - **Probit (binary)** for `phenotype ∈ {0,1}`. Even if `LinkFunction::Logit` is
@@ -39,8 +50,9 @@ slope are both covariate-dependent, plus two cubic warps:
 1. **CTN prefit.** The PGS column is treated as a continuous response and fit
    with a `TransformationNormal` (GAMLSS-style: smooth `T` and smooth
    `log σ`, both conditional on `sex` linear + each `PC_j` Duchon smooth) so
-   that the fitted η acts as a covariate-adjusted latent normal score `z` per
-   row. This replaces the discrete phenotype in the score-warp step (the CTN
+   that the fitted conditional distribution supplies a PIT-based latent normal
+   score `z` per row. The same persisted CTN predictor computes training and
+   inference scores. This replaces the discrete phenotype in the score-warp step (the CTN
    warp itself needs a continuous response).
 2. **De-nested cubic transport kernel** (`gam/src/families/cubic_cell_kernel.rs`):
    ```
@@ -91,6 +103,19 @@ a `time_block` (`build_time_block_input` in [`survival.rs`](survival.rs)),
 optional `timewiggle_block`, and a derivative guard. Outcome is the
 `(age_entry, age_exit, event_target)` triple; base link is probit; PGS warp is
 again seeded from a CTN prefit on PGS conditional on sex + PCs.
+
+`SurvivalModelConfig.baseline_basis` controls the I-spline degree and internal
+knots. Its fitted anchor, knots, and baseline offsets are persisted. Optional
+`time_wiggle` settings control a spline transformation of the baseline time
+coordinate, including its degree, knot count, penalty order, and nullspace
+penalty. The CLI exposes these through `--survival-baseline-*` and
+`--survival-time-wiggle*`. These settings describe a baseline transformation;
+the adapter has no PGS-by-age tensor interaction. Survival uses the engine's
+fixed derivative guard and structural spline monotonicity.
+
+Survival calibration accepts score, sex, and the configured PCs. Extra static
+covariates are rejected because the prediction API has no corresponding inputs.
+Competing events are censoring events for this net, cause-specific model.
 
 ## Penalties and smoothing selection
 
@@ -191,7 +216,8 @@ Engine-owned modules in the separate `gam` crate:
    the minimum-row requirement, and returns `TrainingData` (phenotype, score,
    sex, PCs, weights — defaulting to ones if the column is absent).
 2. **Build the column matrix and term specs** – `estimate.rs::build_training_matrix`
-   lays out columns as `phenotype | pgs | sex | pc1..pck | weights`. Then
+   lays out predictor columns as `score | sex | PC1..PCk`; outcomes and weights
+   are separate fit arguments. Then
    `construction::build_marginal_termspec` assembles the marginal Duchon-smooth
    collection and, for the binary/survival families,
    `construction::build_logslope_termspec` adds the PGS log-slope smooth.

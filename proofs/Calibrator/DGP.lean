@@ -2581,7 +2581,7 @@ theorem EvolutionaryParameters.tau_nonneg (p : EvolutionaryParameters) :
     body IS the limit, and it is wrong by 79% at two demes.
 
     Renamed from `fstDriftMigration` for the same reason and by the same
-    reasoning as `PopulationGeneticsFoundations.fstMigrationMutationEquilibriumManyDemes`.
+    reasoning as `PopulationGeneticsFoundations.fstIslandEquilibriumFiniteDemes`.
     The signature is `(p : EvolutionaryParameters)` and reads `p.bigM` alone, so
     no edit to the body can express a deme count; what could be fixed is the
     claim the name makes. The deme-carrying form is
@@ -2590,7 +2590,7 @@ theorem EvolutionaryParameters.tau_nonneg (p : EvolutionaryParameters) :
     squared variant is excluded at 9.04 sems.
 
     This is the third definition in this corpus found to be deme-count blind,
-    after `fstMigrationMutationEquilibriumManyDemes` and `asymmetricFst`. The
+    after `fstIslandEquilibriumFiniteDemes` and `asymmetricFst`. The
     first two were repaired by naming the limit; `asymmetricFst` could not be,
     because its name commits it to exactly two demes, so it was repaired by
     carrying both migration rates and returning the two-deme value at their sum.
@@ -2998,6 +2998,142 @@ theorem mutationLDErosion_le_one (p : EvolutionaryParameters) :
   apply Real.exp_le_exp.mpr
   nlinarith [p.theta_nonneg, p.tau_nonneg]
 
+/-- Cross-deme LD-sharing boost from ongoing migration, written in the two
+per-generation RATES that set it, so that the coarse and the generation-indexed
+definitions can share one body.
+
+`decay` is the rate at which two ISOLATED demes lose the LD covariance they
+inherited at the split: each deme loses it at `recomb + 1/(2·Nₑ)` per
+generation, and the cross-deme product carries that twice, so
+`decay = 2·recomb + 1/Nₑ`. `mix` is the rate at which migration destroys the
+DIFFERENCE between the two demes' LD, which for symmetric migration at `mig`
+each way is `4·mig`.
+
+THE DERIVATION. Split the pair `(D_A, D_B)` into the mode migration leaves
+alone and the mode it destroys: `Dbar = (D_A+D_B)/2` and `d = (D_A-D_B)/2`,
+with `P = E[Dbar²]` and `Q = E[d²]`, so that `E[D_A²] = P + Q` and the shared
+LD is `E[D_A D_B] = P - Q`. Migration sends `D_A ↦ (1-m)·D_A + m·D_B + a`,
+where the admixture term `a = m(1-m)(p_A-p_B)(q_A-q_B)` is IDENTICAL in the two
+demes; so migration reaches `d` only through the contraction `(1-2m)`, and `a`
+cancels out of the difference mode exactly. Drift acts independently in the two
+demes, so each mode receives half of the per-generation injection `v`. Hence
+
+  dP/dt = -decay·P + v/2,   P(0) = S₀
+  dQ/dt = -(decay+mix)·Q + v/2,   Q(0) = 0
+
+the initial conditions because `D_A = D_B` at the split. Stationarity of an
+isolated deme fixes `v = decay·S₀`, and the boost is
+`((P-Q)/(P+Q)) · exp(decay·t)`, which is what this body writes out.
+
+`decay` and `mix` are RATES, not rate·time products, which is why
+`decay/(decay+mix)` is finite at `t = 0`; the denominator is bounded below by
+`decay`, so the quotient never divides by zero for a live parameter record.
+
+    Empirical status: **VALIDATED**
+    (`proofs/validation/empirical/simcov/battery_bulk57.py`). The design, the
+    table and the competitors are recorded on `migrationLDBoost`, which is this
+    body at the coarse parameters, and `PortabilityDrift.migrationSharedBoostAt`
+    is the same body at a generation count; all three SHARE one measurement
+    rather than having three. -/
+noncomputable def sharedLDMigrationBoostFromRates (decay mix t : ℝ) : ℝ :=
+  ((1 + Real.exp (-(decay * t))) -
+      decay / (decay + mix) * (1 - Real.exp (-((decay + mix) * t)))) /
+    (((1 + Real.exp (-(decay * t))) +
+        decay / (decay + mix) * (1 - Real.exp (-((decay + mix) * t)))) *
+      Real.exp (-(decay * t)))
+
+/-- The boost is `1` at zero elapsed time: nothing has diverged, so there is
+nothing for migration to restore. -/
+@[simp] theorem sharedLDMigrationBoostFromRates_zero (decay mix : ℝ) :
+    sharedLDMigrationBoostFromRates decay mix 0 = 1 := by
+  unfold sharedLDMigrationBoostFromRates
+  norm_num
+
+/-- With no migration the boost is exactly `1`, for every decay rate and every
+elapsed time: the difference mode then relaxes at the same rate as the shared
+mode, and the ratio of the two arms is one because they are the same arm. -/
+@[simp] theorem sharedLDMigrationBoostFromRates_no_mix (decay t : ℝ) :
+    sharedLDMigrationBoostFromRates decay 0 t = 1 := by
+  unfold sharedLDMigrationBoostFromRates
+  rcases eq_or_ne decay 0 with h | h
+  · subst h; norm_num
+  · have hE : Real.exp (-(decay * t)) ≠ 0 := ne_of_gt (Real.exp_pos _)
+    rw [add_zero, div_self h]
+    field_simp
+    ring
+
+/-- The boost is at least one whenever the decay rate is live, the mixing rate
+is nonnegative and time runs forward.
+
+The whole content is `w ≤ 1 - exp(-decay·t)`, where `w` is the second term of
+the numerator: migration can restore at most the sharing that was lost. That in
+turn is the statement that `x ↦ (1 - exp(-x·t))/x` decreases, which here is
+obtained from `x + 1 ≤ exp x` used twice rather than from a derivative. -/
+theorem one_le_sharedLDMigrationBoostFromRates {decay mix t : ℝ}
+    (hd : 0 < decay) (hm : 0 ≤ mix) (ht : 0 ≤ t) :
+    1 ≤ sharedLDMigrationBoostFromRates decay mix t := by
+  have hc : 0 < decay + mix := by linarith
+  have hE : (0:ℝ) < Real.exp (-(decay * t)) := Real.exp_pos _
+  have hF : (0:ℝ) < Real.exp (-((decay + mix) * t)) := Real.exp_pos _
+  have hEle : Real.exp (-(decay * t)) ≤ 1 := by
+    rw [Real.exp_le_one_iff]
+    nlinarith
+  have hFle : Real.exp (-((decay + mix) * t)) ≤ 1 := by
+    rw [Real.exp_le_one_iff]
+    nlinarith
+  -- `exp(-(decay+mix)t) * exp(mix t) = exp(-(decay) t)`
+  have hFG : Real.exp (-((decay + mix) * t)) * Real.exp (mix * t)
+      = Real.exp (-(decay * t)) := by
+    rw [← Real.exp_add]; ring_nf
+  -- `exp(mix t) * exp(-(mix t)) = 1` and `exp(decay t) * exp(-(decay t)) = 1`
+  have hGH : Real.exp (mix * t) * Real.exp (-(mix * t)) = 1 := by
+    rw [← Real.exp_add]; simp
+  have hJE : Real.exp (decay * t) * Real.exp (-(decay * t)) = 1 := by
+    rw [← Real.exp_add]; simp
+  have hG : (0:ℝ) < Real.exp (mix * t) := Real.exp_pos _
+  have hH : 1 - mix * t ≤ Real.exp (-(mix * t)) := by
+    have := Real.add_one_le_exp (-(mix * t)); linarith
+  have hJ : decay * t + 1 ≤ Real.exp (decay * t) := Real.add_one_le_exp _
+  -- `exp(mix t) - 1 ≤ mix * t * exp(mix t)`
+  have hstep1 : Real.exp (mix * t) - 1 ≤ mix * t * Real.exp (mix * t) := by
+    nlinarith [hG, hH, hGH]
+  -- `decay * t * exp(-(decay t)) ≤ 1 - exp(-(decay t))`
+  have hstep2 : decay * t * Real.exp (-(decay * t))
+      ≤ 1 - Real.exp (-(decay * t)) := by
+    nlinarith [hE, hJ, hJE]
+  -- `decay * (E - F) ≤ mix * (1 - E)`, which is the key inequality
+  have hkey : decay * (Real.exp (-(decay * t)) - Real.exp (-((decay + mix) * t)))
+      ≤ mix * (1 - Real.exp (-(decay * t))) := by
+    have hEF : Real.exp (-(decay * t)) - Real.exp (-((decay + mix) * t))
+        = Real.exp (-((decay + mix) * t)) * (Real.exp (mix * t) - 1) := by
+      rw [mul_sub, hFG]; ring
+    rw [hEF]
+    have hA : decay * (Real.exp (-((decay + mix) * t)) * (Real.exp (mix * t) - 1))
+        ≤ decay * (Real.exp (-((decay + mix) * t))
+            * (mix * t * Real.exp (mix * t))) := by
+      have := mul_le_mul_of_nonneg_left hstep1 hF.le
+      nlinarith [hd.le]
+    have hB : decay * (Real.exp (-((decay + mix) * t))
+          * (mix * t * Real.exp (mix * t)))
+        = mix * (decay * t * Real.exp (-(decay * t))) := by
+      rw [← hFG]; ring
+    have hC : mix * (decay * t * Real.exp (-(decay * t)))
+        ≤ mix * (1 - Real.exp (-(decay * t))) :=
+      mul_le_mul_of_nonneg_left hstep2 hm
+    linarith [hA, hB.le, hB.ge, hC]
+  -- restated as `w ≤ 1 - E`
+  have hw : decay / (decay + mix)
+        * (1 - Real.exp (-((decay + mix) * t)))
+      ≤ 1 - Real.exp (-(decay * t)) := by
+    rw [div_mul_eq_mul_div, div_le_iff₀ hc]
+    nlinarith [hkey, hE, hm, hd.le]
+  have hwnn : 0 ≤ decay / (decay + mix)
+      * (1 - Real.exp (-((decay + mix) * t))) := by
+    apply mul_nonneg (div_nonneg hd.le hc.le); linarith
+  unfold sharedLDMigrationBoostFromRates
+  rw [one_le_div (by positivity)]
+  nlinarith [hw, hwnn, hE, hEle]
+
 /-- **Migration LD boost**: migration increases shared LD by introducing
     alleles from the other population. Models as a correction factor ≥ 1.
 
@@ -3028,24 +3164,26 @@ theorem mutationLDErosion_le_one (p : EvolutionaryParameters) :
     claims.
 
     Read together with `PortabilityDrift.sharedLD_from_equilibrium`, which finds
-    LD already largely shared without any migration, the picture is consistent:
-    most of the sharing is inherited from before the split, so there is less
-    left for migration to restore than a model starting from zero would expect.
+    LD already largely shared at migration rates far too low to homogenise
+    allele frequencies, the picture is consistent: the sharing that survives is
+    the sharing of tightly linked pairs, which recombination has not had time to
+    break, so there is less left for migration to restore than a model starting
+    from zero would expect. That definition now carries the recombination rate
+    as an argument, which is the parameter this factor still lacks.
 
     `PortabilityDrift.migrationSharedBoostAt` is the same expression at
     generation `t` and is falsified by the same run. -/
 noncomputable def migrationLDBoost (p : EvolutionaryParameters) : ℝ :=
-  1 + p.bigM * p.tau / (1 + p.bigM)
+  sharedLDMigrationBoostFromRates (2 * p.recomb + 1 / p.Ne) (4 * p.mig) p.t_div
 
 /-- Migration LD boost ≥ 1. -/
 theorem migrationLDBoost_ge_one (p : EvolutionaryParameters) :
     1 ≤ migrationLDBoost p := by
   unfold migrationLDBoost
-  have h1 : 0 ≤ p.bigM * p.tau / (1 + p.bigM) := by
-    apply div_nonneg
-    · exact mul_nonneg p.bigM_nonneg p.tau_nonneg
-    · linarith [p.bigM_nonneg]
-  linarith
+  refine one_le_sharedLDMigrationBoostFromRates ?_ ?_ p.t_div_nonneg
+  · have : 0 < 1 / p.Ne := one_div_pos.mpr p.Ne_pos
+    linarith [p.recomb_nonneg]
+  · linarith [p.mig_nonneg]
 
 /-- Primitive coordinate record extracted from the coarse evolutionary block.
 These coordinates are stored side by side, but this file does not assert that
@@ -3899,7 +4037,9 @@ theorem PGSEvolutionaryModel.coordinateSummary_explicit
             (1 - fstTransientDecayFromScaled m.Ne m.theta m.bigM ^ (Nat.floor m.t_div))
         sharedLDCoordinate := (1 - m.recomb) ^ (2 * m.t_div)
         ancestralVariantCoordinate := Real.exp (-m.theta * m.tau)
-        migrationCoordinate := 1 + m.bigM * m.tau / (1 + m.bigM) } := by
+        migrationCoordinate :=
+          sharedLDMigrationBoostFromRates (2 * m.recomb + 1 / m.Ne) (4 * m.mig)
+            m.t_div } := by
   ext <;>
     simp [PGSEvolutionaryModel.coordinateSummary, PGSEvolutionaryModel.fstTransient,
       PGSEvolutionaryModel.toEvo,
@@ -4163,10 +4303,15 @@ theorem fstDriftMigrationManyDemes_at_witness :
   norm_num [fstDriftMigrationManyDemes, EvolutionaryParameters.bigM,
     EvolutionaryParameters.witness, scaledMigrationRate]
 
+/-- The witness's migration boost, reduced to the two rates that set it. The
+value is transcendental, so what a witness can pin is the REDUCTION: unit
+`Nₑ` and quarter recombination give a shared-LD decay rate of
+`2·(1/4) + 1/1 = 3/2` per generation, and unit migration a homogenisation rate
+of `4`. -/
 theorem migrationLDBoost_at_witness :
-    migrationLDBoost EvolutionaryParameters.witness = 7 / 5 := by
-  norm_num [migrationLDBoost, EvolutionaryParameters.bigM, EvolutionaryParameters.tau,
-    EvolutionaryParameters.witness, scaledMigrationRate]
+    migrationLDBoost EvolutionaryParameters.witness
+      = sharedLDMigrationBoostFromRates (3 / 2) 4 1 := by
+  norm_num [migrationLDBoost, EvolutionaryParameters.witness]
 
 theorem mutationLDErosion_at_witness :
     mutationLDErosion EvolutionaryParameters.witness = Real.exp (-2) := by

@@ -212,6 +212,14 @@ section EvolutionaryModels
 noncomputable def neutralPortability (r2_0 fst : ℝ) : ℝ :=
   r2_0 * (1 - fst) / ((1 - fst) * r2_0 + (1 - r2_0))
 
+/-- The neutral transport chart retains the fraction `1 - fst` of the source
+signal variance while holding its noise variance fixed. Normalizing source
+total variance to one gives signal `r2_0` and noise `1 - r2_0`. -/
+theorem neutralPortability_eq_r2FromSignalVariance (r2_0 fst : ℝ) :
+    neutralPortability r2_0 fst =
+      TransportedMetrics.r2FromSignalVariance ((1 - fst) * r2_0) (1 - r2_0) := by
+  simp [neutralPortability, TransportedMetrics.r2FromSignalVariance, mul_comm]
+
 /-- **`neutralPortability_vacuous_beyond_half` was deleted with the linear body.**
 
 It said that at `fst ≥ 1/2` the value is `0` for every ancestral `r2_0`, and that was TRUE of

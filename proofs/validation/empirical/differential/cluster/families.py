@@ -200,7 +200,12 @@ FAMILIES = [
                 "infinite-island limit by construction.",
         "members": ["islandModelFst", "asymmetricFst", "fstMigDriftEquil",
                     "fstMigrationDriftEquilibrium", "equilibriumFst",
-                    "sharedLD_from_equilibrium",
+                    # sharedLD_from_equilibrium LEFT THIS FAMILY: its body is
+                    # now m/(m + c), a function of two RATES and not of
+                    # (Ne, m), so the F_ST oracle this family simulates is no
+                    # longer the quantity it predicts. It is covered by
+                    # simcov/battery_sharedld_rec.py, whose axis is the
+                    # recombination rate.
                     "neutralAFBenchmarkFromRecurrence", "fstDriftMigration",
                     # newly classified
                     "alleleFreqAfterMigration", "bigM", "scaledMigration",
@@ -1210,7 +1215,7 @@ FAMILIES = [
                     "causalAlleleFreqRetentionAt", "novelVariantInnovationAt",
                     "jointTagLDKernelAt", "jointDirectCausalKernelAt",
                     "jointProxyTaggingKernelAt",
-                    "jointNovelDirectCausalKernelAt",
+                    "novelCausalCovarianceRetentionAt", "novelCovarianceFromTargetTemplate",
                     "jointNovelProxyTaggingKernelAt",
                     "sigmaTagTargetAt", "sigmaTagCausalTargetAt",
                     "directCausalTargetAt", "novelDirectCausalTargetAt",

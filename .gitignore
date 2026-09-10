@@ -108,6 +108,9 @@ python/gnomon/_gnomon*.so
 # Toolchain clones that concurrent build sessions drop in the tree
 /mathlib/
 
+# Separate research repository; its source is versioned in SauersML/Descent.
+/Descent/
+
 # Generated extraction tables. Produced from proofs/Calibrator/, which changes
 # constantly; a committed snapshot drifts by six figures and reads as
 # authoritative while being wrong. Regenerate per worktree -- each producer
@@ -126,4 +129,3 @@ proofs/validation/empirical/differential/results.json
 proofs/validation/empirical/drift_diff/results_migration_mean.json
 proofs/validation/empirical/invariants/defs.json
 proofs/validation/empirical/invariants/results_ranges.json
-

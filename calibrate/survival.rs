@@ -8,31 +8,16 @@
 //! Heavy lifting (PIRLS, REML, monotonicity, joint link, baseline
 //! construction, prediction) lives in gam.
 
-use gam::families::survival_construction::{SurvivalTimeBasisConfig, build_survival_time_basis};
+use gam::families::survival_construction::{
+    SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalTimeBasisConfig,
+    append_zero_tail_columns, build_survival_marginal_slope_baseline_offsets,
+    build_survival_time_basis, build_survival_timewiggle_from_baseline,
+    center_survival_time_designs_at_anchor, evaluate_survival_time_basis_row,
+    resolved_survival_time_basis_config_from_build,
+};
 use gam::families::survival_location_scale::{TimeBlockInput, TimeWiggleBlockInput};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
-
-/// Public, serialisable spec for the survival family.
-///
-/// Used inside `ModelFamily::Survival(SurvivalSpec)`. Numerical defaults are
-/// deliberately small — the gam workflow's marginal-slope solver tunes
-/// nuisance hyper-parameters internally.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
-pub struct SurvivalSpec {
-    pub derivative_guard: f64,
-    pub use_expected_information: bool,
-}
-
-impl Default for SurvivalSpec {
-    fn default() -> Self {
-        Self {
-            derivative_guard: 1e-8,
-            use_expected_information: true,
-        }
-    }
-}
 
 /// Errors surfaced while validating survival inputs in gnomon (i.e. before
 /// we hand data to gam). gam emits its own error type for fitting itself.
@@ -42,8 +27,6 @@ pub enum SurvivalError {
     EmptyAgeVector,
     #[error("age values must be finite")]
     NonFiniteAge,
-    #[error("age transform guard delta must be positive")]
-    NonPositiveGuard,
     #[error("age_entry must be strictly less than age_exit for every subject")]
     InvalidAgeOrder,
     #[error("event indicators must be 0 or 1")]
@@ -52,56 +35,10 @@ pub enum SurvivalError {
     ConflictingEvents,
     #[error("sample weights must be finite and non-negative")]
     InvalidSampleWeight,
-    #[error("covariate arrays must have inconsistent dimensions")]
+    #[error("covariate arrays have inconsistent dimensions")]
     CovariateDimensionMismatch,
     #[error("covariate values must be finite")]
     NonFiniteCovariate,
-}
-
-/// Guarded log-age transformation used across training and scoring.
-///
-/// Kept here (rather than pushed into gam) because gnomon's data loader
-/// caches it on `SurvivalTrainingBundle`.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
-pub struct AgeTransform {
-    pub minimum_age: f64,
-    pub delta: f64,
-}
-
-impl AgeTransform {
-    pub fn from_training(age_entry: &Array1<f64>, delta: f64) -> Result<Self, SurvivalError> {
-        if delta <= 0.0 {
-            return Err(SurvivalError::NonPositiveGuard);
-        }
-        if age_entry.is_empty() {
-            return Err(SurvivalError::EmptyAgeVector);
-        }
-        let mut min_age = f64::INFINITY;
-        for &value in age_entry.iter() {
-            if !value.is_finite() {
-                return Err(SurvivalError::NonFiniteAge);
-            }
-            if value < min_age {
-                min_age = value;
-            }
-        }
-        Ok(Self {
-            minimum_age: min_age,
-            delta,
-        })
-    }
-
-    #[inline]
-    pub fn transform(&self, age: f64) -> Result<f64, SurvivalError> {
-        if !age.is_finite() {
-            return Err(SurvivalError::NonFiniteAge);
-        }
-        let shifted = age - self.minimum_age + self.delta;
-        if !shifted.is_finite() || shifted <= 0.0 {
-            return Err(SurvivalError::NonFiniteAge);
-        }
-        Ok(shifted.ln())
-    }
 }
 
 /// Frequency-weighted survival training data bundle.
@@ -207,11 +144,19 @@ pub fn validate_survival_inputs(
     Ok(())
 }
 
-/// Hard-coded defaults for the survival time-basis. The marginal-slope
-/// fitter requires structural monotonicity, so we use an i-spline.
-const SURVIVAL_TIME_BASIS_DEGREE: usize = 3;
-const SURVIVAL_TIME_NUM_INTERNAL_KNOTS: usize = 8;
+// The marginal-slope fitter requires structural monotonicity, so the time
+// basis is an I-spline with smoothing optimized from this starting value.
 const SURVIVAL_TIME_SMOOTH_LAMBDA: f64 = 1e-2;
+
+pub struct SurvivalTimeMetadata {
+    pub basis: String,
+    pub degree: Option<usize>,
+    pub knots: Option<Vec<f64>>,
+    pub keep_cols: Option<Vec<usize>>,
+    pub smooth_lambda: Option<f64>,
+    pub anchor: f64,
+    pub baseline_scale: f64,
+}
 
 /// Build a `TimeBlockInput` from the survival training bundle by delegating
 /// to gam's canonical i-spline survival time-basis builder. The marginal-
@@ -219,66 +164,206 @@ const SURVIVAL_TIME_SMOOTH_LAMBDA: f64 = 1e-2;
 /// by the i-spline basis.
 pub fn build_time_block_input(
     bundle: &SurvivalTrainingBundle,
-    spec: &SurvivalSpec,
-) -> Result<TimeBlockInput, String> {
+    basis: &crate::calibrate::model::BasisConfig,
+) -> Result<(TimeBlockInput, SurvivalTimeMetadata), String> {
     let n = bundle.data.age_entry.len();
     let cfg = SurvivalTimeBasisConfig::ISpline {
-        degree: SURVIVAL_TIME_BASIS_DEGREE,
+        degree: basis.degree,
         knots: Array1::zeros(0),
         keep_cols: Vec::new(),
         smooth_lambda: SURVIVAL_TIME_SMOOTH_LAMBDA,
     };
-    let build = build_survival_time_basis(
+    let mut build = build_survival_time_basis(
         &bundle.data.age_entry,
         &bundle.data.age_exit,
         cfg,
         Some((
-            SURVIVAL_TIME_NUM_INTERNAL_KNOTS,
+            basis.num_knots,
             SURVIVAL_TIME_SMOOTH_LAMBDA,
         )),
     )?;
 
-    let p_time = build.x_exit_time.ncols();
-    let zero_vec = Array1::<f64>::zeros(n);
-    // gam's marginal-slope event term needs the derivative-offset to stay
-    // strictly above the derivative guard; the i-spline derivative design
-    // already enforces non-negative slopes, so a constant guard offset is
-    // enough to keep the closed-form q-geometry positive.
-    let derivative_offset_exit = Array1::<f64>::from_elem(n, spec.derivative_guard);
-    Ok(TimeBlockInput {
-        design_entry: build.x_entry_time,
-        design_exit: build.x_exit_time,
-        design_derivative_exit: build.x_derivative_time,
-        offset_entry: zero_vec.clone(),
-        offset_exit: zero_vec,
-        derivative_offset_exit,
-        structural_monotonicity: true,
-        penalties: build.penalties,
-        nullspace_dims: build.nullspace_dims,
-        initial_log_lambdas: None,
-        initial_beta: Some(Array1::<f64>::zeros(p_time)),
-    })
-}
+    let anchor = bundle
+        .data
+        .age_entry
+        .iter()
+        .copied()
+        .reduce(f64::min)
+        .ok_or("survival training requires at least one row")?;
+    let resolved = resolved_survival_time_basis_config_from_build(
+        &build.basisname,
+        build.degree,
+        build.knots.as_ref(),
+        build.keep_cols.as_ref(),
+        build.smooth_lambda,
+    )?;
+    let anchor_row = evaluate_survival_time_basis_row(anchor, &resolved)?;
+    center_survival_time_designs_at_anchor(
+        &mut build.x_entry_time,
+        &mut build.x_exit_time,
+        &anchor_row,
+    )?;
+    let baseline_scale: f64 = bundle
+        .data
+        .age_exit
+        .iter()
+        .map(|time| time / n as f64)
+        .sum();
+    if !baseline_scale.is_finite() || baseline_scale <= 0.0 {
+        return Err("survival exit ages must have a positive finite mean".into());
+    }
+    let metadata = SurvivalTimeMetadata {
+        basis: build.basisname,
+        degree: build.degree,
+        knots: build.knots,
+        keep_cols: build.keep_cols,
+        smooth_lambda: build.smooth_lambda,
+        anchor,
+        baseline_scale,
+    };
 
-/// Hard-coded defaults for the survival time-wiggle block. Mirrors the
-/// degree / knot count chosen by gam's CLI when `--timewiggle` is on.
-const SURVIVAL_TIMEWIGGLE_DEGREE: usize = 3;
-const SURVIVAL_TIMEWIGGLE_NCOLS: usize = 8;
+    let p_time = build.x_exit_time.ncols();
+    // Start on the observed time scale, away from the derivative log-barrier.
+    // The same parametric offsets are reconstructed by the prediction engine.
+    let baseline = SurvivalBaselineConfig {
+        target: SurvivalBaselineTarget::Weibull,
+        scale: Some(baseline_scale),
+        shape: Some(1.0),
+        rate: None,
+        makeham: None,
+    };
+    let (offset_entry, offset_exit, derivative_offset_exit) =
+        build_survival_marginal_slope_baseline_offsets(
+            &bundle.data.age_entry,
+            &bundle.data.age_exit,
+            &baseline,
+        )?;
+    Ok((
+        TimeBlockInput {
+            design_entry: build.x_entry_time,
+            design_exit: build.x_exit_time,
+            design_derivative_exit: build.x_derivative_time,
+            offset_entry,
+            offset_exit,
+            derivative_offset_exit,
+            structural_monotonicity: true,
+            penalties: build.penalties,
+            nullspace_dims: build.nullspace_dims,
+            initial_log_lambdas: None,
+            initial_beta: Some(Array1::<f64>::zeros(p_time)),
+        },
+        metadata,
+    ))
+}
 
 /// Build the optional time-varying wiggle block.
 ///
 /// Returns `None` when no time-varying configuration was requested.
-/// Otherwise returns a `TimeWiggleBlockInput` with hard-coded defaults
-/// (8 internal knots, degree 3) on `[0, 1]` — gam re-evaluates the knot
-/// support against the working time grid internally.
-pub fn build_time_wiggle_block_input(enable: bool) -> Result<Option<TimeWiggleBlockInput>, String> {
-    if !enable {
-        return Ok(None);
+/// Otherwise derives the basis from the training offsets and extends every
+/// time design and penalty to the same coefficient layout.
+pub fn build_time_wiggle_block_input(
+    time_block: &mut TimeBlockInput,
+    settings: Option<&crate::calibrate::model::SurvivalTimeWiggleConfig>,
+) -> Result<Option<TimeWiggleBlockInput>, String> {
+    let Some(settings) = settings else { return Ok(None); };
+    let config = gam::inference::formula_dsl::LinkWiggleFormulaSpec {
+        degree: settings.basis.degree,
+        num_internal_knots: settings.basis.num_knots,
+        penalty_orders: vec![settings.penalty_order],
+        double_penalty: settings.double_penalty,
+    };
+    let wiggle = build_survival_timewiggle_from_baseline(
+        &time_block.offset_entry,
+        &time_block.offset_exit,
+        &time_block.derivative_offset_exit,
+        &config,
+    )?;
+    let base_cols = time_block.design_exit.ncols();
+    let total_cols = base_cols + wiggle.ncols;
+    append_zero_tail_columns(
+        &mut time_block.design_entry,
+        &mut time_block.design_exit,
+        &mut time_block.design_derivative_exit,
+        wiggle.ncols,
+    );
+    for penalty in &mut time_block.penalties {
+        let mut expanded = Array2::zeros((total_cols, total_cols));
+        expanded
+            .slice_mut(ndarray::s![..base_cols, ..base_cols])
+            .assign(penalty);
+        *penalty = expanded;
     }
-    let knots = Array1::linspace(0.0, 1.0, SURVIVAL_TIMEWIGGLE_NCOLS);
+    for penalty in wiggle.penalties {
+        let mut expanded = Array2::zeros((total_cols, total_cols));
+        expanded
+            .slice_mut(ndarray::s![base_cols.., base_cols..])
+            .assign(&penalty);
+        time_block.penalties.push(expanded);
+    }
+    time_block.nullspace_dims.extend(wiggle.nullspace_dims);
+    if let Some(initial) = time_block.initial_beta.as_mut() {
+        let mut expanded = Array1::zeros(total_cols);
+        expanded.slice_mut(ndarray::s![..base_cols]).assign(initial);
+        *initial = expanded;
+    }
     Ok(Some(TimeWiggleBlockInput {
-        knots,
-        degree: SURVIVAL_TIMEWIGGLE_DEGREE,
-        ncols: SURVIVAL_TIMEWIGGLE_NCOLS,
+        knots: wiggle.knots,
+        degree: wiggle.degree,
+        ncols: wiggle.ncols,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn time_wiggle_extends_designs_penalties_and_initial_coefficients_together() {
+        let n = 16;
+        let age_entry = Array1::from_iter((0..n).map(|index| 40.0 + index as f64));
+        let age_exit = age_entry.mapv(|age| age + 5.0);
+        let data = SurvivalTrainingData {
+            age_entry,
+            age_exit,
+            event_target: Array1::zeros(n),
+            event_competing: Array1::zeros(n),
+            sample_weight: Array1::ones(n),
+            pgs: Array1::zeros(n),
+            sex: Array1::zeros(n),
+            pcs: Array2::zeros((n, 0)),
+            extra_static_covariates: Array2::zeros((n, 0)),
+            extra_static_names: Vec::new(),
+        };
+        let bundle = SurvivalTrainingBundle { data };
+        let basis = crate::calibrate::model::BasisConfig { num_knots: 4, degree: 3 };
+        let (mut time, _) =
+            build_time_block_input(&bundle, &basis).expect("time basis");
+        let denser_basis = crate::calibrate::model::BasisConfig { num_knots: 6, degree: 3 };
+        let (denser_time, _) = build_time_block_input(&bundle, &denser_basis).expect("denser time basis");
+        assert!(denser_time.design_exit.ncols() > time.design_exit.ncols());
+        let base_width = time.design_exit.ncols();
+        let settings = crate::calibrate::model::SurvivalTimeWiggleConfig {
+            basis, penalty_order: 2, double_penalty: true,
+        };
+        let wiggle = build_time_wiggle_block_input(&mut time, Some(&settings))
+            .expect("time wiggle")
+            .expect("enabled");
+        let width = base_width + wiggle.ncols;
+        assert_eq!(time.design_entry.ncols(), width);
+        assert_eq!(time.design_exit.ncols(), width);
+        assert_eq!(time.design_derivative_exit.ncols(), width);
+        assert_eq!(
+            time.initial_beta
+                .as_ref()
+                .expect("initial coefficients")
+                .len(),
+            width
+        );
+        assert_eq!(time.penalties.len(), time.nullspace_dims.len());
+        assert!(
+            time.penalties
+                .iter()
+                .all(|penalty| penalty.dim() == (width, width))
+        );
+    }
 }

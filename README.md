@@ -113,7 +113,7 @@ not a requirement for correct CLI behavior.
 
 ```
 # Apply calibration to new samples
-./target/release/gnomon infer test_data.tsv --model model.toml
+./target/release/gnomon infer test_data.tsv --model model.json
 ```
 
 Each subcommand writes outputs to the current directory or alongside the input data. Run `gnomon --help` or `gnomon <subcommand> --help` for detailed options.

@@ -346,7 +346,8 @@ def main() -> None:
     )
     convert_genome = require_binary(
         "convert_genome",
-        "curl -fsSL https://raw.githubusercontent.com/SauersML/convert_genome/main/install.sh | bash",
+        "cargo build --release --bin gnomon --bin convert_genome",
+        preferred=(REPO_ROOT / "target" / "release" / "convert_genome",),
     )
 
     output_dir = OUTPUT_DIR / args.assembly

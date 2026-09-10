@@ -1348,10 +1348,9 @@ the point: it is not that a positive margin fails to help, it is that the margin
 among the quantities the conclusion depends on. What the existing margin omits is the
 headroom, and the omission is not conservative.
 
-The statement used to be named `imitable_despite_positive_pcCorrectabilityMargin` and to
-bind `0 < pcCorrectabilityMargin ...` as a hypothesis its proof never touched. The
-unconditional statement is strictly stronger -- it covers a positive margin as one case --
-and a premise carried only so that a name could allude to it is a decoration. -/
+The conclusion requires no sign assumption about `pcCorrectabilityMargin`: positive
+margin is one case of this unconditional statement. The trace-window budget supplies
+the hypothesis that determines whether the spike can be imitated. -/
 theorem imitable_within_traceWindowBudget
     {N : ℕ} (m : ℕ) (F : ℝ) (hF : 0 ≤ F) (hmn : m ≤ N) (hN : 0 < N)
     (base S₀ : Matrix (Fin N) (Fin N) ℝ) (budget : ℝ)

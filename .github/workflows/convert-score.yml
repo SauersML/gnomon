@@ -9,6 +9,9 @@ on:
       - 'examples/tests/test_convert_score.py'
       - 'tests/gnomon_all_parity.sh'
       - 'score/**'
+      - 'cli/convert_genome.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
       - '.github/workflows/convert-score.yml'
   pull_request:
     branches: [main]
@@ -18,6 +21,9 @@ on:
       - 'examples/tests/test_convert_score.py'
       - 'tests/gnomon_all_parity.sh'
       - 'score/**'
+      - 'cli/convert_genome.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
       - '.github/workflows/convert-score.yml'
 
 concurrency:
@@ -88,16 +94,12 @@ jobs:
             ${{ runner.os }}-cargo-release-${{ steps.cache_meta.outputs.deps_hash }}-
             ${{ runner.os }}-cargo-release-
 
-      - name: Build local gnomon
-        run: cargo +nightly build --release --bin gnomon
-
-      - name: Install convert_genome
-        run: curl -fsSL https://raw.githubusercontent.com/SauersML/convert_genome/main/install.sh | bash
+      - name: Build gnomon and its pinned converter
+        run: cargo +nightly build --release --bin gnomon --bin convert_genome
 
       - name: Add binaries to PATH (prefer local build)
         run: |
           echo "$GITHUB_WORKSPACE/target/release" >> "$GITHUB_PATH"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Run convert_score example
         run: python examples/misc/convert_score.py

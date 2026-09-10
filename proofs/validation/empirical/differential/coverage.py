@@ -101,7 +101,7 @@ SIMULATION_COVERED = {
         # island family: simulated by cluster/fam_coalescent.py, which varies
         # the deme count that no member takes as an argument
         "asymmetricFst", "fstMigDriftEquil", "fstMigrationDriftEquilibrium",
-        "sharedLD_from_equilibrium", "neutralAFBenchmarkFromRecurrence",
+        "neutralAFBenchmarkFromRecurrence",
         "fstDriftMigration",
         # recursion / vector forms of the same quantity, outside the scalar sweep
         "hetRecurrence",

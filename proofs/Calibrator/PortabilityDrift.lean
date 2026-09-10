@@ -3503,7 +3503,8 @@ layer, but now exposed directly to the mechanistic SNP/LD state.
     `DGP.fstEquilibrium`, spelled out here because this record cannot reach an
     `EvolutionaryParameters`, and it moved when that one did: the migration term
     carries `islandDemeCorrection`, which at the two populations this transport
-    layer is about equals 2. `PGSEvolutionaryModel.toGenerationalPopGenParameters_fstTransientAt_floor`
+    layer is about equals 2.
+    `PGSEvolutionaryModel.toGenerationalPopGenParameters_fstTransientAt_floor`
     is what forces the two spellings to agree and is what would have caught it
     had only one of them moved.
 
@@ -3581,7 +3582,7 @@ noncomputable def mutationSharedRetentionAt
     less for migration to restore than a model starting from zero assumes. -/
 noncomputable def migrationSharedBoostAt
     (g : GenerationalPopGenParameters) (t : ℕ) : ℝ :=
-  1 + g.bigM * g.tauAt t / (1 + g.bigM)
+  sharedLDMigrationBoostFromRates (2 * g.recomb + 1 / g.Ne) (4 * g.mig) t
 
 @[simp] theorem tauAt_zero (g : GenerationalPopGenParameters) :
     g.tauAt 0 = 0 := by
@@ -3597,7 +3598,7 @@ noncomputable def migrationSharedBoostAt
 
 @[simp] theorem migrationSharedBoostAt_zero (g : GenerationalPopGenParameters) :
     g.migrationSharedBoostAt 0 = 1 := by
-  simp [migrationSharedBoostAt, tauAt, bigM]
+  simp [migrationSharedBoostAt]
 
 end GenerationalPopGenParameters
 
@@ -3681,10 +3682,7 @@ theorem PGSEvolutionaryModel.toGenerationalPopGenParameters_migrationSharedBoost
       migrationLDBoost m.toEvo := by
   unfold GenerationalPopGenParameters.migrationSharedBoostAt
     PGSEvolutionaryModel.toEvo migrationLDBoost
-  rw [PGSEvolutionaryModel.toGenerationalPopGenParameters_bigM]
-  simp only [GenerationalPopGenParameters.tauAt,
-    PGSEvolutionaryModel.toGenerationalPopGenParameters,
-    EvolutionaryParameters.bigM, EvolutionaryParameters.tau]
+  simp only [PGSEvolutionaryModel.toGenerationalPopGenParameters]
   rw [h_disc, Nat.floor_natCast]
 
 /-- Exact bridge from the DGP coordinate summary to the generational popgen
@@ -6108,7 +6106,8 @@ This was two theorems, `_closed` and `_eq`, with the same statement and two proo
 /-- The expected squared mean PGS difference under the IM equilibrium model:
 `E[(Δμ)²] = 4δ V_A` where `δ = 1/(2M+1)`.
 
-    Empirical status: **DERIVED, and low by an exact stated factor.** Both
+    Empirical status: **FALSIFIED, low by the exact factor `1 - δ/2`, now
+    measured** (`proofs/validation/empirical/simcov/battery_pd3.py`). Both
     components carry measurements and the join between them is algebra, so no
     new simulation is owed -- but the algebra does not come out to `2 δ`.
 
@@ -6135,18 +6134,55 @@ This was two theorems, `_closed` and `_eq`, with the same statement and two proo
     which is the direction that matters, because differentiation is the regime
     a portability law exists for.
 
-    THE BODY IS LEFT AS IT IS AND THE BIAS IS WRITTEN DOWN, rather than the
-    exact form being substituted, because the derivation above holds at the
-    per-locus level and both `δ` and `A` are ratios of averages over loci. The
-    corpus has already recorded, in `conventions.json`, that a pointwise
-    identity between two `F_ST` estimators does not survive aggregation: the
-    Nei-to-Hudson bridge predicts the two high-differentiation cells and runs
-    low at the two small ones, and the gap is Jensen. So `1 - δ/2` is the size
-    and the sign of the correction, not a coefficient to install unmeasured. A
-    two-deme design measuring `A` and `δ` on the same replicates would settle
-    it, and is what this owes.
+    THE JENSEN OBJECTION WAS THE REASON TO WAIT, AND IT IS RETIRED. The
+    derivation above is POINTWISE, while `δ` and `A` are both ratios of averages
+    over loci, and `conventions.json` records that a pointwise identity between
+    two `F_ST` estimators need not survive aggregation -- the Nei-to-Hudson
+    bridge predicts the two high-differentiation cells and runs low at the two
+    small ones, and that gap is Jensen. So the correction was written down and
+    not installed. `battery_pd3.py` measures both quantities as ratios of
+    averages on the same replicates, two-deme Wright-Fisher, `Nₑ = 250`, `4 Nₑ m`
+    swept 20-fold, 4000 unlinked loci, 12 replicates:
 
-    argument_source: model, for both components. -/
+      M      2 δ̂/(1 - δ̂/2)   measured A    apart
+      0.5     1.52578          1.52582      0.003%
+      1.0     0.89031          0.89036      0.006%
+      2.0     0.47346          0.47346      0.001%
+      4.0     0.24475          0.24475      0.001%
+      10.0    0.10001          0.10001      0.000%
+
+    The identity survives aggregation at every cell. The competing reading
+    `A = δ` -- pairwise IS per-branch -- misses by 119 to 267 sems on the same
+    cells, so the design discriminates.
+
+    POSITIVE CONTROL, and it earned its keep twice. A pure split at `Nₑ = 250`,
+    `t = 200`, where `A = 2F/(1 - F/2)` with `F = 1 - (1 - 1/(2 Nₑ))ᵗ` and
+    nothing of the island model enters: predicted 0.79027, measured
+    0.78956 ± 0.00402, 0.18 sems. The FIRST version of that control used `2F`
+    and failed at 32.3 sems -- against a simulation that was right. It failed by
+    omitting the SAME `(1 - x/2)` factor this body omits, which is as direct a
+    demonstration as the design can give that the factor is real and easy to
+    drop.
+
+    WHAT THE RAW SEMS AGAINST THE CLOSED FORM DO NOT MEAN. Measured Hudson runs
+    2.5% to 10.4% ABOVE `1/(2M+1)` in this discrete design, systematically and
+    growing with differentiation. A drift check rules out the obvious
+    explanation -- the two-deme quasi-equilibrium rising as loci fix -- since
+    the second half of the sampling window reads 0.2% to 1.4% BELOW the first.
+    The offset is unexplained and it is this design's, not the corpus's:
+    `twoDemeIMEquilibriumDelta` is validated against msprime at 0.10, 0.16 and
+    2.03 sems, which is the better instrument for that question. So the size of
+    THIS body's error is taken from the identity, which is free of the offset,
+    and not from the cell table, which mixes the two.
+
+    THE SUBSTITUTION IS AVAILABLE AND IS NOT MADE HERE. The repair is
+    `Var_Delta_Mu V_A (2 * δ / (1 - δ / 2))`. It costs a junk-point theorem at
+    `δ = 2` where the new divisor vanishes, and a reworked
+    `expectedSqMeanPGSDiff_IMEquilibrium_strictAntiOn_M`, whose current proof
+    goes through `_eq`. Both are routine and neither is done, so the marker
+    carries the fault rather than the body carrying an unproved repair.
+
+    argument_source: model, for both components and for every cell. -/
 noncomputable def expectedSqMeanPGSDiff_IMEquilibrium (V_A M : ℝ) : ℝ :=
   Var_Delta_Mu V_A (2 * twoDemeIMEquilibriumDelta M)
 
@@ -7908,8 +7944,8 @@ saturating map as before, read at `m/c` rather than at `4·Nₑ·m`. -/
     the race between the migration that reunites two lineages and the
     recombination that separates the two loci.
 
-    THIS BODY USED TO BE `1 - fstMigrationDriftEquilibrium Nₑ m`, and the
-    argument list is the finding. `F_ST` is a property of one site, shared LD of
+    The competing formula `1 - fstMigrationDriftEquilibrium Nₑ m` omits
+    the recombination rate. `F_ST` is a property of one site, shared LD of
     a PAIR, and a pair carries a parameter a single site does not. The old body
     was falsified at 35 sems (`simcov/battery_bulk34.py`, 0.91 measured against
     0.44 predicted at `F_ST = 0.56`), and `(1 - F)²` at 56 sems and `1 - 2·F` at
@@ -7976,6 +8012,41 @@ saturating map as before, read at `m/c` rather than at `4·Nₑ·m`. -/
     actually drawn. -/
 noncomputable def sharedLD_from_equilibrium (m c : ℝ) : ℝ :=
   m / (m + c)
+
+/-- First-order migration/recombination dynamics for the shared fraction.
+Migration restores the unshared component at pair rate `2*m`; recombination
+removes the shared component at pair rate `2*c`. This is the small-rate
+linearization described above, not the exact discrete Wright-Fisher recurrence.
+For a probability-preserving discrete step the rates must be nonnegative and
+satisfy `2*(m+c) ≤ 1`. -/
+noncomputable def sharedLDLinearizedStep (m c shared : ℝ) : ℝ :=
+  shared + 2 * m * (1 - shared) - 2 * c * shared
+
+/-- The first-order process has exactly the stated equilibrium when at least
+one rate is nonzero. This derives the ratio from a balance of flows. -/
+theorem sharedLDLinearizedStep_fixedPoint_iff (m c shared : ℝ) (hrates : m + c ≠ 0) :
+    sharedLDLinearizedStep m c shared = shared ↔
+      shared = sharedLD_from_equilibrium m c := by
+  unfold sharedLDLinearizedStep sharedLD_from_equilibrium
+  constructor
+  · intro h
+    apply (eq_div_iff hrates).2
+    nlinarith
+  · intro h
+    rw [h]
+    field_simp [hrates]
+    ring
+
+theorem sharedLD_from_equilibrium_isFixedPoint (m c : ℝ) (hrates : m + c ≠ 0) :
+    sharedLDLinearizedStep m c (sharedLD_from_equilibrium m c) =
+      sharedLD_from_equilibrium m c :=
+  (sharedLDLinearizedStep_fixedPoint_iff m c _ hrates).2 rfl
+
+/-- Both lineages contribute to the first-order rate: this reference point
+distinguishes the dynamics from a single-lineage update with the same rest point. -/
+theorem sharedLDLinearizedStep_at_reference_point :
+    sharedLDLinearizedStep (1 / 8) (1 / 4) (1 / 2) = 3 / 8 := by
+  norm_num [sharedLDLinearizedStep]
 
 /-- Reference evaluation.  The value is computed through the definitions this body calls, but
 the theorem states a number: an inequality or an invariance leaves a family of bodies
@@ -8537,7 +8608,7 @@ That theorem *does* prove the migration claim, because it derives the `F_ST` ord
 
     Superseded, and recorded because it was believed: **FALSIFIED**, by the same
     mechanism as
-    `PopulationGeneticsFoundations.fstMigrationMutationEquilibriumManyDemes`: the
+    `PopulationGeneticsFoundations.fstIslandEquilibriumFiniteDemes`: the
     deme-count factor is missing (`proofs/validation/empirical/simcov/battery_bulk13.py`).
     Two demes with asymmetric migration, `Ne = 1000`, `F_ST` read as
     `1 - E[T_within]/E[T_between]` from coalescence times so no estimator
@@ -8556,7 +8627,7 @@ That theorem *does* prove the migration claim, because it derives the `F_ST` ord
     `n = 2`, which two independent designs in this branch have now confirmed.
 
     So this is not an asymmetry problem at all. It is the deme-count blindness
-    already recorded on `fstMigrationMutationEquilibriumManyDemes`, in a definition whose
+    already recorded on `fstIslandEquilibriumFiniteDemes`, in a definition whose
     name commits it to exactly two demes and which therefore cannot plead the
     many-deme limit. Use `fstIslandEquilibriumFiniteDemes` with `nDemes = 2`.
 
@@ -9034,14 +9105,11 @@ theorem fstMigrationDriftEquilibrium_ratio_form (Ne m : ℝ)
     This is still only the recurrence's coarse allele-frequency benchmark,
     not a mechanistic portability law.
 
-    This body used to be spelled `sharedLD_from_equilibrium Nₑ m`, which was the
-    same number while that definition read `1 - Fst`. It is not the same number
-    any more, and the two claims should never have shared a body: `1 - Fst` is
-    the right answer for the sharing of ALLELE FREQUENCIES, which is what this
-    benchmark is about, and the wrong answer for the sharing of LD, which is
-    what `sharedLD_from_equilibrium` is about. The complement is written out
-    here so that repairing the LD law cannot silently move the frequency
-    benchmark. -/
+    Sharing allele frequencies follows this single-locus recurrence benchmark.
+    Sharing LD also depends on recombination and is described by
+    `sharedLD_from_equilibrium`. The two quantities have different parameter
+    lists and interpretations, so the frequency benchmark reads its own
+    recurrence directly. -/
 noncomputable def neutralAFBenchmarkFromRecurrence (Ne m : ℝ) : ℝ :=
   1 - fstMigrationDriftEquilibrium Ne m
 

@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use infer_sex::{
-    Chromosome, GenomeBuild, InferenceConfig, InferenceError, InferenceResult, InferredSex,
-    PlatformDefinition, SexInferenceAccumulator, VariantInfo,
+    Chromosome, EvidenceReport, GenomeBuild, InferenceConfig, InferenceError, InferenceResult,
+    InferredSex, PlatformDefinition, SexInferenceAccumulator, VariantInfo,
 };
 use thiserror::Error;
 
@@ -327,18 +327,47 @@ fn collect_inference(
         });
     }
 
-    finalize_records(accumulators, sample_ids)
+    finalize_records(accumulators, sample_ids, &platform)
+}
+
+/// True when every attempted locus produced a call, i.e. the input carries no
+/// missing genotypes at all.
+///
+/// `derive_platform_definition` defines "attempted" as "present in this file",
+/// so on such an input the Y density is `observed / observed = 1.0` by
+/// construction -- for every sample, of either sex. It is not a measurement of
+/// Y coverage, it is a restatement of the filtering.
+///
+/// Real genotype data never looks like this: arrays and sequencing both drop
+/// some loci, and chrY dropout in particular is what distinguishes the sexes.
+/// A panel with zero missingness has therefore been filtered to called sites,
+/// and a caller that reads the resulting density as evidence will find every
+/// sample male -- most confidently for the females, whose no-calls were the
+/// signal that got removed.
+fn platform_is_saturated(report: &EvidenceReport, platform: &PlatformDefinition) -> bool {
+    platform.n_attempted_y_nonpar > 0
+        && report.y_non_par_valid_count == platform.n_attempted_y_nonpar
+        && report.auto_valid_count == platform.n_attempted_autosomes
 }
 
 fn finalize_records(
     accumulators: Vec<SexInferenceAccumulator>,
     sample_ids: Vec<String>,
+    platform: &PlatformDefinition,
 ) -> Result<Vec<SexInferenceRecord>, SexInferenceError> {
     accumulators
         .into_iter()
         .zip(sample_ids)
         .map(|(acc, individual_id)| {
-            let inference = acc.finish()?;
+            let mut inference = acc.finish()?;
+            // Withhold the call rather than emit a confident one derived from a
+            // denominator the input defined into existence. Indeterminate is the
+            // honest answer here and it is also the useful one: a caller can fall
+            // back to evidence measured before the filtering, whereas a wrong
+            // binary call is indistinguishable from a right one downstream.
+            if platform_is_saturated(&inference.report, platform) {
+                inference.final_call = InferredSex::Indeterminate;
+            }
             Ok(SexInferenceRecord {
                 individual_id,
                 inference,
@@ -673,6 +702,121 @@ mod tests {
         );
         assert!(male_result.report.y_genome_density.expect("male density") > 0.5);
         assert!(male_result.report.x_autosome_het_ratio.expect("male ratio") < 0.2);
+    }
+
+    /// A female genotyped on a panel filtered to called sites.
+    ///
+    /// Her chrY loci are absent from the input, so they are never "attempted"
+    /// either, and the density she produces is 1.0 -- the same value a male
+    /// produces, for the opposite reason. The evidence that separates them was
+    /// removed before the file was written, and the density can no longer see
+    /// the difference.
+    #[test]
+    fn saturated_panel_is_detected_when_no_locus_is_missing() {
+        let build = GenomeBuild::Build38;
+        // "Attempted" counted off a file that retains only called sites.
+        let platform = PlatformDefinition {
+            n_attempted_autosomes: 400,
+            n_attempted_y_nonpar: 12,
+        };
+        let config = InferenceConfig {
+            build,
+            platform,
+            thresholds: None,
+        };
+        let mut acc = SexInferenceAccumulator::new(config);
+
+        for i in 0..400u64 {
+            acc.process_variant(&VariantInfo {
+                chrom: Chromosome::Autosome,
+                pos: 1_000_000 + i,
+                is_heterozygous: i % 2 == 0,
+            });
+        }
+        // Every attempted Y locus calls, because the ones that failed are gone.
+        for i in 0..12u64 {
+            acc.process_variant(&VariantInfo {
+                chrom: Chromosome::Y,
+                pos: 3_000_000 + i,
+                is_heterozygous: false,
+            });
+        }
+
+        let result = acc.finish().unwrap();
+        assert_eq!(
+            result.report.y_genome_density.expect("density"),
+            1.0,
+            "a filtered panel yields a saturated density by construction"
+        );
+        assert!(
+            platform_is_saturated(&result.report, &platform),
+            "zero missingness across the panel must be recognized"
+        );
+    }
+
+    /// The ordinary case, which must keep working: some loci fail to call, so
+    /// the density measures something real and the call stands.
+    #[test]
+    fn a_panel_with_dropout_is_not_saturated() {
+        let platform = PlatformDefinition {
+            n_attempted_autosomes: 400,
+            n_attempted_y_nonpar: 80,
+        };
+        let config = InferenceConfig {
+            build: GenomeBuild::Build38,
+            platform,
+            thresholds: None,
+        };
+        let mut acc = SexInferenceAccumulator::new(config);
+
+        for i in 0..400u64 {
+            acc.process_variant(&VariantInfo {
+                chrom: Chromosome::Autosome,
+                pos: 1_000_000 + i,
+                is_heterozygous: i % 3 == 0,
+            });
+        }
+        // 6 of 80 attempted Y loci call: real chrY dropout.
+        for i in 0..6u64 {
+            acc.process_variant(&VariantInfo {
+                chrom: Chromosome::Y,
+                pos: 3_000_000 + i,
+                is_heterozygous: false,
+            });
+        }
+
+        let result = acc.finish().unwrap();
+        assert!(
+            !platform_is_saturated(&result.report, &platform),
+            "a panel with genuine dropout must keep its call"
+        );
+    }
+
+    /// A panel with no chrY loci at all is a different condition -- there is
+    /// nothing to saturate, and the existing None-density path already covers
+    /// it. Guard the boundary so the check cannot swallow that case too.
+    #[test]
+    fn a_panel_without_any_y_locus_is_not_saturated() {
+        let platform = PlatformDefinition {
+            n_attempted_autosomes: 400,
+            n_attempted_y_nonpar: 0,
+        };
+        let config = InferenceConfig {
+            build: GenomeBuild::Build38,
+            platform,
+            thresholds: None,
+        };
+        let mut acc = SexInferenceAccumulator::new(config);
+        for i in 0..400u64 {
+            acc.process_variant(&VariantInfo {
+                chrom: Chromosome::Autosome,
+                pos: 1_000_000 + i,
+                is_heterozygous: i % 2 == 0,
+            });
+        }
+
+        let result = acc.finish().unwrap();
+        assert!(!platform_is_saturated(&result.report, &platform));
     }
 
     #[test]

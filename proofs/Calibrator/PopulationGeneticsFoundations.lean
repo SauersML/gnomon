@@ -1539,114 +1539,6 @@ theorem islandModelFst_eq_mutationForm (Ne m : ℝ) :
   unfold fstMigrationDriftEquilibrium fstMutationDriftEquilibrium
   ring
 
-/-- **Combined migration and mutation reduce Fst below either alone.**
-    When both migration (m) and mutation (μ) act, the equilibrium Fst
-    is 1/(1 + 4Nm + 4Neμ), which is below either individual equilibrium.
-
-    **The deme count is missing from the signature, and the quantity depends on
-    it.** Measured against msprime's symmetric island model at equilibrium
-    (`proofs/validation/empirical/simcov/battery_verify.py`,
-    `test_island_deme_count`), `Ne = 1000`, total emigration rate `m = 1e-3` so
-    that `4*Ne*m = 4.0` is held FIXED, `mu = 1e-8`, Hudson `F_ST`, 24 replicates
-    of 4 Mb, 40 diploids from each of two sampled demes:
-
-      demes    this def    simulated F_ST
-        2        0.2000    0.09314±0.01311     8.2 sems, +115 percent
-        4        0.2000    0.16469±0.02700     1.3 sems
-        8        0.2000    0.15502±0.01987     2.3 sems
-       20        0.2000    0.14347±0.01971     2.9 sems
-
-    The scaled rate `4*Ne*m` is identical in every row, so a formula in
-    `(Ne, m, mu)` alone must return one number for all four; the measurement
-    does not. The two-deme row is decisive on its own.
-
-    Empirical status: **CONDITIONALLY VALID** -- exact in the many-deme limit it
-    is now named for, and exact at no finite deme count. The correction
-    `d/(d-1)` shrinks with `d` and never vanishes, so the measurements below,
-    which reject this body at two demes and at twenty, are what a limit looks
-    like when it is evaluated where the limit has not been taken. They are
-    retained in full: they are the evidence for the restriction, not a defect
-    report on the body.
-
-    A consumer at finite `d` wants `fstIslandEquilibriumFiniteDemes`, which
-    carries `nDemes` explicitly and is VALIDATED at `d = 2`. This body is the
-    limit that one converges to.
-
-    The FALSIFIED marker this replaces was earned by an earlier NAME. Called
-    `fstMigrationMutationEquilibrium` it asserted it was the island-model
-    equilibrium, which is false at small deme count; the repair recorded below
-    was to rename rather than to edit, because a signature of `(Ne, m, mu)`
-    cannot express a deme count and so no edit to the body could have fixed the
-    claim. The marker outlived that repair.
-
-    AT TWENTY DEMES (`simcov/battery_falsrepair_c2.py`). msprime symmetric
-    island model, 20 demes of `Ne = 1000`, total emigration rate `m` spread over
-    the 19 other demes, `mu = 1e-8`, 2 Mb at recombination `1e-8` so each
-    replicate averages many genealogies, Hudson `F_ST` between demes 0 and 1,
-    48 replicates, with `4 Ne m` swept sixteenfold:
-
-      4Nem   this body   measured             sems   finite-deme (20/19)
-       1.0    0.50000    0.51926 ± 0.01301    1.48     0.48717  (2.47)
-       2.0    0.33333    0.31746 ± 0.00862    1.84     0.32203  (0.53)
-       4.0    0.20000    0.19950 ± 0.00517    0.10     0.19192  (1.47)
-       8.0    0.11111    0.10727 ± 0.00285    1.35     0.10614  (0.39)
-      16.0    0.05882    0.05203 ± 0.00173    3.92     0.05605  (2.32)
-
-    Worst 3.92 sems against the finite-deme form's 2.47. Control: the same
-    engine at TWO demes and `4 Ne m = 4` reproduces the two-deme value at 0.91
-    sems, and the two-deme form is excluded across the twenty-deme cells at up
-    to 17.11 sems -- so the design can see a deme-count factor of two and does
-    not see one here, while still rejecting this body.
-
-    Power: the prediction spans 0.50000 to 0.05882 across the design, a factor
-    of eight and a half. The superseded record had none: it held `4 Ne m` fixed
-    and swept the deme count, so this body was constant at 0.2000 by
-    construction.
-
-    **A FIRST, LOOSER RUN OF THIS DESIGN SAID MATCH, AND THE DIFFERENCE WAS THE
-    ERROR BARS.** `battery_falsrepair.py`'s `group_c` used 24 replicates with
-    recombination switched off -- one genealogy per replicate -- and got sems
-    five times wider, on which this body passed at 1.57 sems and the record
-    above was nearly written as CONDITIONALLY VALID. The point estimates agree
-    between the two runs; only the resolution changed. A verdict that flips on
-    replicate count was never a verdict.
-
-    WHAT THIS RUN DOES NOT SETTLE. At the two extreme cells the measurement
-    deviates from BOTH candidate forms in OPPOSITE directions -- above both at
-    `4 Ne m = 1`, below both at 16 -- which is the signature of an estimator
-    systematic rather than of a wrong formula, Hudson `F_ST` being a
-    ratio-of-averages read against a per-site parametric prediction. So the 3.92
-    is an upper bound on this body's own error and the finite-deme form's 2.47
-    is not a clean win over it. What would settle it is a design whose `F_ST`
-    estimator is the same functional as the prediction. That is a reason this
-    record does not claim the finite-deme form is validated HERE -- it is
-    validated separately, on `fstIslandEquilibriumFiniteDemes`, at a design
-    built for it.
-    **The name was corrected, because the name was the falsity.** This body
-    cannot express a deme-count factor -- its signature is `(Ne, m, mu)` and
-    nothing else -- so no edit to the body can fix what the measurement above
-    found. What could be fixed is the CLAIM: called
-    `fstMigrationMutationEquilibrium`, it asserts it is the island-model
-    equilibrium, which is false at small deme count; called
-    `...ManyDemes`, it asserts it is the many-deme limit of one, and the limit
-    it is the limit OF is now a definition in this file --
-    `fstIslandEquilibriumFiniteDemes`, which carries `nDemes` explicitly and
-    whose `islandDemeCorrection = d/(d - 1)` has since been measured and
-    validated at `d = 2`.
-
-    This is the whole content of the repair. A consumer at two or three demes
-    now has to read a name that says the body does not apply to them, rather
-    than a name that says it does. Documenting the restriction in prose while
-    leaving the name unqualified is what let the two-deme error stand, and the
-    same pattern was recorded on `asymmetricFst` in `PortabilityDrift`, whose
-    name commits it to exactly two demes and which therefore could not be
-    repaired this way at all. That one was repaired the other way instead: it
-    now takes BOTH migration rates and returns the two-deme value at their sum,
-    which is validated to 2.03 sems where the single-rate body it replaced was
-    excluded at 79.9.
--/
-noncomputable def fstMigrationMutationEquilibriumManyDemes (Ne m μ : ℝ) : ℝ :=
-  1 / (1 + 4 * Ne * m + 4 * Ne * μ)
 
 /-- **The island-model equilibrium with the deme count carried explicitly.**
 
@@ -1712,74 +1604,87 @@ theorem fstIslandEquilibriumFiniteDemes_isFixedPoint (Ne m μ nDemes : ℝ)
   rw [hbody]
   exact scaledIdentityStep_fixedPoint _ h
 
-/-- **The many-deme limit is the deme-blind formula.** At `nDemes / (nDemes - 1) = 1`
-the finite-deme equilibrium is exactly `fstMigrationMutationEquilibriumManyDemes`, which is
-the precise sense in which the older definition is a limit rather than a law. -/
+/-- **The deme-blind limit is what the finite-deme form becomes at unit
+correction.** At `nDemes / (nDemes - 1) = 1` the migration term loses its
+correction and the equilibrium is `1 / (1 + 4 Nₑ m + 4 Nₑ μ)`.
+
+That limit form used to be a named definition in this file,
+`fstMigrationMutationEquilibriumManyDemes`, carrying a FALSIFIED marker. It is
+gone, and this theorem is where its content now lives: it is a LIMIT, written
+inline, reachable only where the correction is exactly one -- which no finite
+deme count achieves, since `d/(d-1) > 1` for every `d > 1`. A body no consumer
+could correctly call was worse than a theorem saying where it would apply.
+
+Measured, so the deletion is not a matter of taste
+(`simcov/battery_falsrepair_c2.py`): at TWENTY demes, `Ne = 1000`, `mu = 1e-8`,
+2 Mb at recombination `1e-8`, 48 replicates, Hudson `F_ST`, `4 Ne m` swept
+sixteenfold, the limit form is rejected at 3.92 sems where
+`fstIslandEquilibriumFiniteDemes` at `d = 20` sits at 2.47 --
+
+      4Nem   limit form   measured             finite-deme (20/19)
+       1.0    0.50000     0.51926 ± 0.01301     0.48717
+       2.0    0.33333     0.31746 ± 0.00862     0.32203
+       4.0    0.20000     0.19950 ± 0.00517     0.19192
+       8.0    0.11111     0.10727 ± 0.00285     0.10614
+      16.0    0.05882     0.05203 ± 0.00173     0.05605
+
+-- and at TWO demes it is rejected at 8.2 sems where the finite-deme form passes
+at 0.6. Twenty demes is not "many enough": the correction shrinks and never
+vanishes. -/
 theorem fstIslandEquilibriumFiniteDemes_eq_limit_of_unit_correction
     (Ne m μ nDemes : ℝ) (h : islandDemeCorrection nDemes = 1) :
     fstIslandEquilibriumFiniteDemes Ne m μ nDemes
-      = fstMigrationMutationEquilibriumManyDemes Ne m μ := by
-  unfold fstIslandEquilibriumFiniteDemes fstMigrationMutationEquilibriumManyDemes
+      = 1 / (1 + 4 * Ne * m + 4 * Ne * μ) := by
+  unfold fstIslandEquilibriumFiniteDemes
   rw [h]; ring_nf
 
-/-- **`fstMigrationMutationEquilibriumManyDemes` at the denominator, named.**
-Migration and mutation enter the divisor additively, so an inadmissible negative migration rate
-can cancel the leading one even with mutation absent. The equilibrium is reported as zero -- no
+/-- **`fstIslandEquilibriumFiniteDemes` at the denominator, named.** Migration and
+mutation enter the divisor additively, so an inadmissible negative migration rate can cancel
+the leading one even with mutation absent. At two demes the correction is `2`, so
+`4 Nₑ m · 2 = -1` at `Nₑ = 1`, `m = -1/8`. The equilibrium is reported as zero -- no
 differentiation -- where the formula has no value at all. Consumers must exclude it by
 hypothesis. -/
-theorem fstMigrationMutationEquilibriumManyDemes_cancelling_terms_is_junk :
-    fstMigrationMutationEquilibriumManyDemes 1 (-(1/4)) 0 = 0 := by
-  unfold fstMigrationMutationEquilibriumManyDemes
+theorem fstIslandEquilibriumFiniteDemes_cancelling_terms_is_junk :
+    fstIslandEquilibriumFiniteDemes 1 (-(1/8)) 0 2 = 0 := by
+  unfold fstIslandEquilibriumFiniteDemes islandDemeCorrection
   norm_num
 
-/-- **The migration term's coefficient, pinned.**
-`fstMigrationMutationEquilibriumManyDemes_isFixedPoint` is invariant under exactly the rescaling
-it should exclude. At `4 Ne m = 1` with no mutation the equilibrium `Fst` is one half, which fixes
-the factor four on the migration term. -/
-theorem fstMigrationMutationEquilibriumManyDemes_migration_only :
-    fstMigrationMutationEquilibriumManyDemes 1 (1 / 4) 0 = 1 / 2 := by
-  unfold fstMigrationMutationEquilibriumManyDemes
+/-- **The migration term's coefficient, pinned, with the deme correction in it.**
+`fstIslandEquilibriumFiniteDemes_isFixedPoint` is invariant under exactly the rescaling it
+should exclude. At two demes the correction is `2`, so `4 Nₑ m · 2 = 1` needs `4 Nₑ m = 1/2`;
+with no mutation the equilibrium `F_ST` is then one half, which fixes the factor four on the
+migration term AND the correction on top of it. The deme-blind reading would need
+`4 Nₑ m = 1` for the same value, so this point separates them. -/
+theorem fstIslandEquilibriumFiniteDemes_migration_only :
+    fstIslandEquilibriumFiniteDemes 1 (1 / 8) 0 2 = 1 / 2 := by
+  unfold fstIslandEquilibriumFiniteDemes islandDemeCorrection
   norm_num
 
-/-- **The mutation term enters with the same coefficient, pinned.** Mutation and migration are
-interchangeable at this order: `4 Ne mu = 1` with no migration gives the same equilibrium as
-`4 Ne m = 1` with no mutation. Fixing the migration coefficient alone would leave the mutation
-coefficient free. -/
-theorem fstMigrationMutationEquilibriumManyDemes_mutation_only :
-    fstMigrationMutationEquilibriumManyDemes 1 0 (1 / 4) = 1 / 2 := by
-  unfold fstMigrationMutationEquilibriumManyDemes
+/-- **The mutation term enters with the same coefficient and no correction, pinned.**
+Mutation and migration are interchangeable at this order only after the deme correction is
+applied to migration alone: `4 Nₑ μ = 1` with no migration gives the same equilibrium as
+`4 Nₑ m · 2 = 1` with no mutation. Fixing the migration coefficient alone would leave the
+mutation coefficient free, and pinning mutation at the same `m` would wrongly put the
+correction on both. -/
+theorem fstIslandEquilibriumFiniteDemes_mutation_only :
+    fstIslandEquilibriumFiniteDemes 1 0 (1 / 4) 2 = 1 / 2 := by
+  unfold fstIslandEquilibriumFiniteDemes islandDemeCorrection
   norm_num
-
-/-- **The combined equilibrium is the rest point of the scaled identity balance
-at the summed scaled rate.**  This is where the additivity of `θ` and `M` comes
-from: one balance, one rate, and that rate is `4 Nₑ (m + μ)`. -/
-theorem fstMigrationMutationEquilibriumManyDemes_isFixedPoint (Ne m μ : ℝ)
-    (hNe : 0 < Ne) (hm : 0 ≤ m) (hμ : 0 ≤ μ) :
-    scaledIdentityStep (4 * Ne * m + 4 * Ne * μ)
-        (fstMigrationMutationEquilibriumManyDemes Ne m μ) =
-      fstMigrationMutationEquilibriumManyDemes Ne m μ := by
-  have h4 : (0 : ℝ) ≤ 4 * Ne := by linarith
-  have h : (0 : ℝ) ≤ 4 * Ne * m + 4 * Ne * μ :=
-    add_nonneg (mul_nonneg h4 hm) (mul_nonneg h4 hμ)
-  have hbody : fstMigrationMutationEquilibriumManyDemes Ne m μ =
-      1 / (1 + (4 * Ne * m + 4 * Ne * μ)) := by
-    unfold fstMigrationMutationEquilibriumManyDemes
-    rw [add_assoc]
-  rw [hbody]
-  exact scaledIdentityStep_fixedPoint _ h
 
 /-- Combined Fst is below migration-only Fst. -/
-theorem fstMigrationMutation_lt_migrationOnly (Ne m μ : ℝ)
+theorem fstIslandEquilibriumFiniteDemes_lt_migrationOnly (Ne m μ : ℝ)
     (hNe : 0 < Ne) (hm : 0 < m) (hμ : 0 < μ) :
-    fstMigrationMutationEquilibriumManyDemes Ne m μ < fstMigrationDriftEquilibrium Ne m := by
-  unfold fstMigrationMutationEquilibriumManyDemes fstMigrationDriftEquilibrium
+    fstIslandEquilibriumFiniteDemes Ne m μ 2 < fstMigrationDriftEquilibrium Ne m := by
+  unfold fstIslandEquilibriumFiniteDemes fstMigrationDriftEquilibrium islandDemeCorrection
+  norm_num
   apply div_lt_div_of_pos_left one_pos (by nlinarith) (by nlinarith)
 
 /-- Combined Fst is below mutation-only Fst. -/
-theorem fstMigrationMutation_lt_mutationOnly (Ne m μ : ℝ)
+theorem fstIslandEquilibriumFiniteDemes_lt_mutationOnly (Ne m μ : ℝ)
     (hNe : 0 < Ne) (hm : 0 < m) (hμ : 0 < μ) :
-    fstMigrationMutationEquilibriumManyDemes Ne m μ < fstMutationDriftEquilibrium (4 * Ne * μ) := by
-  unfold fstMigrationMutationEquilibriumManyDemes fstMutationDriftEquilibrium
+    fstIslandEquilibriumFiniteDemes Ne m μ 2 < fstMutationDriftEquilibrium (4 * Ne * μ) := by
+  unfold fstIslandEquilibriumFiniteDemes fstMutationDriftEquilibrium islandDemeCorrection
+  norm_num
   apply div_lt_div_of_pos_left one_pos (by nlinarith) (by nlinarith)
 
 /-! ### Stepping-Stone Model Foundations -/
@@ -2027,25 +1932,13 @@ theorem asymmetric_fst_difference_sign (Ne m₁₂ m₂₁ : ℝ)
 
 /-! ### Migration and LD Homogenization -/
 
-/-- **LD similarity between populations under migration.**
-    Populations exchanging migrants share more similar LD patterns.
-    We model the LD correlation as a function of scaled migration rate:
-    LD_correlation(M) = M² / (1 + M)² (proportion of LD that is shared).
-    This accounts for both allele frequency sharing and haplotype sharing.
+/-! ### LD similarity under migration: a stipulation that did not survive
 
-    **This is a stipulation, not a derivation, and the name says so.** No source is
-    cited, nothing derives this shape from a migration process, and no theorem here
-    constrains it beyond monotonicity and range. Do not rename it to assert a derivation
-    unless one is supplied.
-
-    Empirical status: **FALSIFIED** (`simcov/battery_bulk51.py`, `group_a`).
-    The comparison the paragraph above says nobody had made has now been made,
-    and the ansatz does not survive it.
-
-    Two-deme island model at `Nₑ = 1000` over 5 Mb with recombination; the
-    observable is the cross-deme correlation of signed LD `r` across SNP pairs
-    common in BOTH demes -- the quantity this body names -- with `4·Nₑ·m` swept a
-    hundredfold:
+**`ldCorrelationMigrationAnsatz` stood here and has been deleted.** It was
+`M² / (1 + M)²`, offered as the proportion of LD shared between two populations
+exchanging migrants, and its own docstring said it was a stipulation with no
+source and no derivation. Measurement (`simcov/battery_bulk51.py`, `group_a`)
+rejected it at 87 sems and 53% relative:
 
       4Nₑm    measured LD correlation   this ansatz   M/(1+M)
       0.4     0.8908 ± 0.0196           0.0816        0.2857
@@ -2053,60 +1946,31 @@ theorem asymmetric_fst_difference_sign (Ne m₁₂ m₂₁ : ℝ)
       8.0     0.9747 ± 0.0027           0.7901        0.8889
       40      0.9898 ± 0.0004           0.9518        0.9756
 
-    Worst cell 87 sems at 53% relative. The failure is worst at LOW migration,
-    where the ansatz predicts almost no shared LD and the simulation finds
-    nearly complete sharing. The unsquared `M/(1+M)` is carried alongside and is
-    also FALSIFIED, at 48 sems -- so this is not a matter of one power too many.
-    Both forms decay with migration; the measured correlation does not.
+Two-deme island model at `Nₑ = 1000` over 5 Mb with recombination, observable
+the cross-deme correlation of signed LD `r` across SNP pairs common in BOTH
+demes, `4·Nₑ·m` swept a hundredfold. Control: one panmictic population split
+into two arbitrary halves, through the same estimators and filters, gives `F_ST`
+indistinguishable from zero at 0.41 sems.
 
-    Why: LD structure between two demes is set largely by the recombination
-    history they SHARED before separating, and that persists long after
-    migration has stopped homogenising allele frequencies. Neither form has a
-    term for it. `PortabilityDrift.sharedLD_from_equilibrium` records the same
-    finding from the other direction.
+The unsquared `M/(1+M)` was carried on the same cells and is also rejected, at
+48 sems, so this is not one power too many. **The failure is worst at LOW
+migration, where the ansatz predicts almost no shared LD and the simulation
+finds nearly complete sharing, and neither form has a term that could fix it:**
+LD structure between two demes is set largely by the recombination history they
+SHARED before separating, and that persists long after migration has stopped
+homogenising allele frequencies. A function of `M` alone cannot express it,
+whatever its shape, because the quantity it would need is the split time and the
+recombination rate.
 
-    Control: one panmictic population split into two arbitrary halves, through
-    the same estimators and filters, gives `F_ST` indistinguishable from zero
-    (0.41 sems). -/
-noncomputable def ldCorrelationMigrationAnsatz (M : ℝ) : ℝ :=
-  M ^ 2 / (1 + M) ^ 2
+So there was no body to correct and no argument to add without changing what the
+definition is a function of. The four theorems that stood on it -- a junk point,
+nonnegativity, an upper bound of one, and monotonicity in `M` -- constrained only
+the shape's range and monotonicity, which is exactly what the docstring warned
+was all they did; none of them survives the body and none is missed.
+`PortabilityDrift.sharedLD_from_equilibrium` records the same finding from the
+other direction.
+-/
 
-/-- **ldCorrelationMigrationAnsatz at `M = -1`, named.** The squared divisor `(1 + M) ^ 2`
-vanishes at `M = -1`, and the ansatz returns zero correlation where it diverges. Squaring the
-divisor makes the branch quadratically flat around the singularity, so sampling near it gives no
-warning. Consumers must exclude it by hypothesis. -/
-theorem ldCorrelationMigrationAnsatz_negative_unit_migration_is_junk :
-    ldCorrelationMigrationAnsatz (-1) = 0 := by
-  unfold ldCorrelationMigrationAnsatz
-  norm_num
-
-/-- LD correlation from migration is nonneg. -/
-theorem ldCorrelationFromMigration_nonneg (M : ℝ) :
-    0 ≤ ldCorrelationMigrationAnsatz M := by
-  unfold ldCorrelationMigrationAnsatz
-  exact div_nonneg (sq_nonneg M) (sq_nonneg (1 + M))
-
-/-- LD correlation from migration is at most 1. -/
-theorem ldCorrelationFromMigration_le_one (M : ℝ) (hM : 0 ≤ M) :
-    ldCorrelationMigrationAnsatz M ≤ 1 := by
-  unfold ldCorrelationMigrationAnsatz
-  rw [div_le_one (sq_pos_of_pos (by linarith : 0 < 1 + M))]
-  exact sq_le_sq' (by linarith) (by linarith)
-
-/-- **LD correlation increases with migration rate.** -/
-theorem ldCorrelationFromMigration_increases (M₁ M₂ : ℝ)
-    (hM₁ : 0 < M₁) (h_more : M₁ < M₂) :
-    ldCorrelationMigrationAnsatz M₁ < ldCorrelationMigrationAnsatz M₂ := by
-  unfold ldCorrelationMigrationAnsatz
-  have h1M₁ : 0 < 1 + M₁ := by linarith
-  have h1M₂ : 0 < 1 + M₂ := by linarith
-  have h_ratio : M₁ / (1 + M₁) < M₂ / (1 + M₂) := by
-    rw [div_lt_div_iff₀ h1M₁ h1M₂]
-    nlinarith
-  have h_sq :
-      (M₁ / (1 + M₁)) ^ 2 < (M₂ / (1 + M₂)) ^ 2 := by
-    nlinarith [h_ratio, div_pos hM₁ h1M₁, div_pos (lt_trans hM₁ h_more) h1M₂]
-  simpa [div_pow] using h_sq
 
 end MigrationDriftFoundations
 

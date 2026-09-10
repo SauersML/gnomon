@@ -5,7 +5,7 @@
 //! module just chooses sensible defaults (Duchon kernels for smooths, a
 //! penalized linear term for sex) and wires column indices through.
 
-use crate::calibrate::model::BasisConfig;
+use crate::calibrate::model::SmoothConfig;
 use gam::terms::basis::{
     CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec,
     SpatialIdentifiability,
@@ -18,14 +18,13 @@ use gam::terms::smooth::{
 /// Build a single 1D Duchon smooth term over `feature_col` with `num_centers`
 /// farthest-point centers and a linear nullspace.
 pub fn duchon_smooth(name: &str, feature_col: usize, num_centers: usize) -> SmoothTermSpec {
-    let centers = num_centers.max(4);
     SmoothTermSpec {
         name: name.to_string(),
         basis: SmoothBasisSpec::Duchon {
             feature_cols: vec![feature_col],
             spec: DuchonBasisSpec {
                 center_strategy: CenterStrategy::FarthestPoint {
-                    num_centers: centers,
+                    num_centers,
                 },
                 length_scale: Some(1.0),
                 power: 1,
@@ -52,8 +51,8 @@ pub fn build_marginal_termspec(
     pgs_col: usize,
     sex_col: usize,
     pc_cols: &[usize],
-    pgs_basis: &BasisConfig,
-    pc_bases: &[BasisConfig],
+    pgs_basis: &SmoothConfig,
+    pc_bases: &[SmoothConfig],
 ) -> TermCollectionSpec {
     assert_eq!(
         pc_cols.len(),
@@ -62,10 +61,10 @@ pub fn build_marginal_termspec(
     );
 
     let mut smooth_terms = Vec::with_capacity(1 + pc_cols.len());
-    smooth_terms.push(duchon_smooth("pgs", pgs_col, pgs_basis.num_knots));
+    smooth_terms.push(duchon_smooth("pgs", pgs_col, pgs_basis.num_centers));
     for (idx, (&col, basis)) in pc_cols.iter().zip(pc_bases.iter()).enumerate() {
         let name = format!("pc{}", idx + 1);
-        smooth_terms.push(duchon_smooth(&name, col, basis.num_knots));
+        smooth_terms.push(duchon_smooth(&name, col, basis.num_centers));
     }
 
     let linear_terms = vec![LinearTermSpec {
