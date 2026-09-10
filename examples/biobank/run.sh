@@ -513,7 +513,7 @@ trap 'failure_diagnostics $?' ERR
       "$SCRIPT_DIR/marginal_slope_diseases.py"
   echo
   echo "--- snomed -> pgs candidate pool (runtime set = top-N most prevalent OHDSI-canonical intersection) ---"
-  awk '/^SNOMED_PGS_MAP[: ]/,/^\}/' "$SCRIPT_DIR/marginal_slope_diseases.py"
+  awk '/^SNOMED_PGS_MAP[: ]/,/^\}/' "$SCRIPT_DIR/disease_selection.py"
   echo
   echo "--- env ---"
   echo "WORKSPACE_CDR:    ${WORKSPACE_CDR:-<unset>}"

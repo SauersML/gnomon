@@ -110,6 +110,7 @@ python/gnomon/_gnomon*.so
 
 # Separate research repository; its source is versioned in SauersML/Descent.
 /Descent/
+/examples/biobank/.aou-workflow/
 
 # Generated extraction tables. Produced from proofs/Calibrator/, which changes
 # constantly; a committed snapshot drifts by six figures and reads as

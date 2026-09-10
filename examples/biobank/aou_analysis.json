@@ -1,0 +1,18 @@
+{
+  "gamfit_version": "0.1.267",
+  "top_n_diseases": 20,
+  "disease_limit": 1,
+  "num_pcs": 6,
+  "baseline_centers": 32,
+  "slope_centers": 16,
+  "max_rows_per_disease": 5000,
+  "train_fraction": 0.8,
+  "seed": 20260910,
+  "horizons_years": [1.0, 3.0, 5.0],
+  "grid_intervals": 200,
+  "fit_timeout_seconds": 180,
+  "query_timeout_seconds": 120,
+  "maximum_bytes_billed": 100000000000,
+  "min_train_events_per_cause": 30,
+  "min_report_count": 20
+}

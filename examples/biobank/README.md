@@ -1,5 +1,10 @@
 # Biobank marginal-slope PRS validation
 
+For a bounded Workbench WDL pilot with separate baseline/PC-slope surfaces,
+competing death, cached scores, and an account guard, see [WDL.md](WDL.md).
+It shares this example's disease selector but uses an outcome-blind survival
+sample rather than the older script's balanced event/censor sample.
+
 A single, self-contained run that validates gnomon's marginal-slope calibration
 against standard baselines on **All of Us** microarray data.
 
