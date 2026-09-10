@@ -44,8 +44,11 @@ class Workbench:
         self.assert_identity()
 
     def command(self, command):
+        # Workbench acknowledges a submission after creating its engine run;
+        # killing that handshake early can leave a real job without its receipt.
+        timeout = 180 if command[:4] == ["wb", "workflow", "job", "run"] else 60
         return subprocess.run(command, check=True, text=True, capture_output=True,
-                              env=self.env, timeout=60).stdout
+                              env=self.env, timeout=timeout).stdout
 
     def assert_identity(self):
         active = self.command(["gcloud", f"--configuration={self.profile}", "auth", "list",

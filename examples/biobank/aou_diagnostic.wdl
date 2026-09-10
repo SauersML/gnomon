@@ -26,6 +26,7 @@ task diagnose {
     cp "~{identity_guard}" aou_identity.py
     timeout --kill-after=5s 90s python - "~{task_stderr}" <<'PY'
     from pathlib import Path
+    import re
     import sys
     from aou_identity import task_account
 
@@ -66,12 +67,24 @@ task diagnose {
         "gamfit_version": "gamfit version does not match",
         "checkpoint_upload": "checkpoint upload failed",
         "no_space": "no space left on device",
+        "http_error": "urllib.error.httperror:",
+        "http_404": "http error 404",
+        "http_403": "http error 403",
+        "syntax_error": "syntaxerror:",
     }
     matched = [label for label, phrase in signatures.items() if phrase in log]
     if not matched:
         matched = ["empty_log" if not log.strip() else "unclassified_failure"]
     for label in matched:
         Path(f"diagnostic__{label}.txt").write_text(label + "\n")
+    # Only known public function names, never raw traceback paths or messages.
+    functions = ("run", "read_ancestry", "unpack_phenotypes", "unpack_score_cache",
+                 "cached_score_ids", "person_times", "case_dates", "build_cohort",
+                 "task_account", "publish_status", "validate_config", "load_score_panel",
+                 "select_runtime_diseases", "query", "publish", "prepare_inputs")
+    for function in functions:
+        if re.search(r", in " + re.escape(function) + r"\s*\n", log):
+            Path(f"diagnostic__function_{function}.txt").write_text(function + "\n")
     PY
   >>>
   output { Array[File] diagnostics = glob("diagnostic__*.txt") }

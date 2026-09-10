@@ -115,7 +115,7 @@ contain participant data, scores, models and logs and must remain inside the
 authorized workspace. WDL outputs are aggregate metrics, provenance **and
 the sensitive checkpoint archive**; none is automatically approved for export.
 
-Validation so far: 23 deterministic workflow contract tests and WDL validation
+Validation so far: 24 deterministic workflow contract tests and WDL validation
 pass on MSI. The updated native CTN survival acceptance test and real cohort
 preflight remain separate checks; synthetic contracts are not AoU results.
 

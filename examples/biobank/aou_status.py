@@ -34,10 +34,10 @@ def publish_status(checkpoint_uri, label):
     uri = urlsplit(checkpoint_uri)
     if uri.scheme != "gs" or not uri.netloc or not uri.path.strip("/") or uri.query or uri.fragment:
         raise ValueError("status requires a workspace checkpoint URI")
-    account = task_account()
+    task_account()
     request = Request(
-        "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/"
-        + quote(account, safe="") + "/token", headers={"Metadata-Flavor": "Google"})
+        "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
+        headers={"Metadata-Flavor": "Google"})
     with urlopen(request, timeout=10) as response:
         token = json.load(response)["access_token"]
     name = uri.path.lstrip("/") + ".status/" + label + ".txt"

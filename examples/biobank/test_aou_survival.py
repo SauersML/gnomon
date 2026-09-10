@@ -1,5 +1,6 @@
 """Small deterministic tests; run on MSI, never against participant data."""
 import json
+import io
 import os
 from pathlib import Path
 import signal
@@ -26,6 +27,18 @@ from aou_evaluation import audit_groups, paired_loss_summary
 
 
 class SurvivalContractTests(unittest.TestCase):
+    def test_status_uses_the_validated_default_metadata_identity(self):
+        with patch("aou_status.task_account") as account, \
+             patch("aou_status.urlopen", side_effect=[
+                 io.BytesIO(b'{"access_token":"test-token"}'), io.BytesIO(b'{}')]) as request:
+            publish_status("gs://workspace/checkpoint.tar.gz", "reading_ancestry")
+        account.assert_called_once()
+        token_request, upload_request = [call.args[0] for call in request.call_args_list]
+        self.assertEqual(token_request.full_url,
+            "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token")
+        self.assertEqual(upload_request.headers["Authorization"], "Bearer test-token")
+        self.assertEqual(upload_request.data, b"reading_ancestry\n")
+
     def test_status_labels_never_contain_exception_text_or_runtime_data(self):
         self.assertEqual(failure_label(ValueError("participant 123456789 bad input")), "failed_other")
         self.assertEqual(failure_label(ValueError("relatedness prune contains invalid research IDs")), "failed_prune_schema")
