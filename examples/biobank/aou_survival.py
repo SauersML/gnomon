@@ -128,16 +128,13 @@ def read_ancestry(ancestry, prune, num_pcs):
         raise ValueError("ancestry file lacks required research_id/pca_features/ancestry_pred columns")
     df = pd.read_csv(ancestry, sep="\t", dtype=str,
                      usecols=["research_id", "pca_features", "ancestry_pred"])
-    # pgsEngine accepts the published single-column list with or without its
-    # research_id header. Preserve the first participant in the headerless form;
-    # reject malformed or multi-column input instead of guessing an ID column.
-    excluded = pd.read_csv(prune, sep="\t", dtype=str, header=None,
+    # The release's published flagged-sample file uses sample_id. These IDs
+    # join to research_id in the ancestry predictions; require the real schema.
+    excluded = pd.read_csv(prune, sep="\t", dtype=str,
                            keep_default_na=False, skip_blank_lines=False)
-    if excluded.shape[1] != 1:
-        raise ValueError("relatedness prune must be a single research_id column")
+    if list(excluded.columns) != ["sample_id"]:
+        raise ValueError("relatedness prune must be a single sample_id column")
     excluded.columns = ["research_id"]
-    if not excluded.empty and excluded.iloc[0, 0] == "research_id":
-        excluded = excluded.iloc[1:]
     if not excluded.research_id.str.fullmatch(r"[0-9]+").all():
         raise ValueError("relatedness prune contains invalid research IDs")
     if excluded.empty or excluded.research_id.isna().any():

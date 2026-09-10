@@ -7,10 +7,11 @@ workflow aou_diagnostic {
     File task_stderr
     File identity_guard
     String runtime_image
+    File? relatedness_prune
   }
   call diagnose {
     input: task_stderr = task_stderr, identity_guard = identity_guard,
-           runtime_image = runtime_image
+           runtime_image = runtime_image, relatedness_prune = relatedness_prune
   }
   output { Array[File] diagnostics = diagnose.diagnostics }
 }
@@ -20,17 +21,33 @@ task diagnose {
     File task_stderr
     File identity_guard
     String runtime_image
+    File? relatedness_prune
   }
   command <<<
     set -euo pipefail
     cp "~{identity_guard}" aou_identity.py
-    timeout --kill-after=5s 90s python - "~{task_stderr}" <<'PY'
+    timeout --kill-after=5s 90s python - "~{task_stderr}" "~{default="" relatedness_prune}" <<'PY'
     from pathlib import Path
     import re
     import sys
     from aou_identity import task_account
 
     task_account()
+    if sys.argv[2]:
+        with Path(sys.argv[2]).open() as handle:
+            fields = handle.readline(8192).strip().split("\t")
+        known_headers = {"research_id", "s", "sample_id", "IID", "#IID"}
+        found = [name for name in fields if name in known_headers]
+        if found:
+            for name in found:
+                label = "prune_header_" + name.lstrip("#")
+                Path(f"diagnostic__{label}.txt").write_text(label + "\n")
+        elif len(fields) == 1 and fields[0].isdigit():
+            Path("diagnostic__prune_headerless_numeric.txt").write_text("headerless numeric\n")
+        else:
+            Path("diagnostic__prune_header_unrecognized.txt").write_text("unrecognized header\n")
+        if len(fields) > 1:
+            Path("diagnostic__prune_multiple_columns.txt").write_text("multiple columns\n")
     with Path(sys.argv[1]).open("rb") as handle:
         handle.seek(0, 2)
         handle.seek(max(0, handle.tell() - 262144))

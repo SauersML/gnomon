@@ -47,18 +47,18 @@ class SurvivalContractTests(unittest.TestCase):
                 publish_status("gs://workspace/checkpoint", "participant_123456789")
         account.assert_not_called()
 
-    def test_published_prune_headerless_first_id_is_not_lost(self):
+    def test_published_prune_sample_id_schema_and_exclusion(self):
         with tempfile.TemporaryDirectory() as tmp:
             ancestry, prune = Path(tmp) / "ancestry.tsv", Path(tmp) / "prune.tsv"
             ancestry.write_text("research_id\tpca_features\tancestry_pred\n"
                                 "101\t[0.1, 0.2]\teur\n102\t[0.3, 0.4]\tafr\n"
                                 "103\t[0.5, 0.6]\tamr\n")
-            for content in ("101\n103\n", "research_id\n101\n103\n"):
-                prune.write_text(content)
-                remaining = aou.read_ancestry(ancestry, prune, 2)
-                self.assertEqual(remaining.person_id.tolist(), ["102"])
-                np.testing.assert_allclose(remaining[["PC1", "PC2"]], [[.3, .4]])
-            for content in ("wrong_header\n101\n", "101\n\n103\n", "101\t103\n"):
+            prune.write_text("sample_id\n101\n103\n")
+            remaining = aou.read_ancestry(ancestry, prune, 2)
+            self.assertEqual(remaining.person_id.tolist(), ["102"])
+            np.testing.assert_allclose(remaining[["PC1", "PC2"]], [[.3, .4]])
+            for content in ("research_id\n101\n", "101\n103\n", "sample_id\n101\n\n103\n",
+                            "sample_id\ninvalid\n", "sample_id\n", "sample_id\textra\n101\t103\n"):
                 prune.write_text(content)
                 with self.assertRaisesRegex(ValueError, "relatedness prune"):
                     aou.read_ancestry(ancestry, prune, 2)

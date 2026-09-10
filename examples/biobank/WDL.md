@@ -27,7 +27,8 @@ The resolved CDR release is recorded; horizons must be supported by that
 release's actual follow-up.
 
 PCs use `research_id`, `pca_features`, and `ancestry_pred` from the release's
-ancestry file. The published relatedness-prune list is applied before sampling
+ancestry file. The published relatedness-prune file's `sample_id` column is
+matched to ancestry `research_id` and applied before sampling
 or splitting. Its single-column numeric IDs may have the `research_id` header
 or start on the first row; unknown headers and malformed rows are rejected.
 Remaining person IDs are the pilot's split groups. This is not
