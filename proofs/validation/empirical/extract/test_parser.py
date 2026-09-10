@@ -137,6 +137,13 @@ check("structure real fields",
 check("structure invariant fields carried",
       "0 < varY" in [f["type"] for f in sd["fields"]], True)
 
+gd = next(s for s in BLOB["structures"]
+          if s["name"] == "Calibrator.GenerationalPopGenParameters")
+check("Greek mutation-rate field is preserved",
+      {f["name"]: f["type"] for f in gd["fields"]}.get("μ"), "ℝ")
+check("Greek mutation-rate invariant is preserved",
+      {f["name"]: f["type"] for f in gd["fields"]}.get("μ_nonneg"), "0 ≤ μ")
+
 # ---- the generated executable forms agree with hand evaluation ------------
 
 import lean_defs                                                # noqa: E402

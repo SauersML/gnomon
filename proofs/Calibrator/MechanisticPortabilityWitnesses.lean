@@ -22,6 +22,8 @@ macro "generational_witness_simp" ms:Lean.Parser.Tactic.simpLemma,* : tactic =>
   `(tactic| simp [$ms,*, CrossPopulationGenerationalModel.toMetricModelAt,
       sigmaTagTargetAt, directCausalTargetAt, proxyTaggingTargetAt, sigmaTagCausalTargetAt,
       tagAlleleFreqRetentionAt, causalAlleleFreqRetentionAt, alleleFreqMismatchPenalty,
+      covarianceRetentionFromVarianceRatios,
+      novelCovarianceFromTargetTemplate,
       tagAlleleFreqTargetAt, causalAlleleFreqTargetAt, jointTagLDKernelAt,
       jointProxyTaggingKernelAt, betaTargetAt,
       targetSourceEffectProjectionAt, targetEffectHeterogeneityProjectionAt,
@@ -686,9 +688,9 @@ noncomputable def popgenDrivenProxyGenerationalModel :
   novelCausalEffectTargetAt := fun _ ↦ ![0]
   sigmaTagSource := 1
   directCausalSource := !![0; 0]
-  novelDirectCausalTemplate := !![0; 0]
+  novelDirectCausalCovarianceTemplateAt := fun _ ↦ !![0; 0]
   proxyTaggingSource := !![1; 1]
-  novelProxyTaggingTemplate := !![0; 0]
+  novelProxyTaggingCovarianceTemplateAt := fun _ ↦ !![0; 0]
   tagDistance := !![0, 1; 1, 0]
   tagCausalDistance := !![1; 1]
   tagAlleleFreqSource := ![1 / 2, 1 / 2]
@@ -976,9 +978,9 @@ noncomputable def singleLocusGenerationalWitness
   novelCausalEffectTargetAt := fun _ ↦ ![0]
   sigmaTagSource := !![1]
   directCausalSource := directCausalSource
-  novelDirectCausalTemplate := !![0]
+  novelDirectCausalCovarianceTemplateAt := fun _ ↦ !![0]
   proxyTaggingSource := proxyTaggingSource
-  novelProxyTaggingTemplate := !![0]
+  novelProxyTaggingCovarianceTemplateAt := fun _ ↦ !![0]
   tagDistance := !![1]
   tagCausalDistance := !![1]
   tagAlleleFreqSource := ![1 / 2]
@@ -1025,14 +1027,15 @@ mismatch penalty carried through the tagging surface. -/
 theorem target_r2_changes_along_generation_indexed_af_path :
     r2FromSourceWeights (timeVaryingAFGenerationalModel.toMetricModelAt 0) Pop.target = 1 / 2 ∧
     r2FromSourceWeights (timeVaryingAFGenerationalModel.toMetricModelAt 1) Pop.target =
-      (9 / 16 : ℝ) /
-        (2 + 2 * (1 - (9 / 16 : ℝ)) ^ 2) := by
+      (3 / 4 : ℝ) /
+        (2 + 2 * (1 - (3 / 4 : ℝ)) ^ 2) := by
   constructor
   · simp [singleLocusGenerationalWitness, baselineGenerationalPopGen, r2FromSourceWeights,
     timeVaryingAFGenerationalModel,
       CrossPopulationGenerationalModel.toMetricModelAt,
       sigmaTagTargetAt, directCausalTargetAt, proxyTaggingTargetAt, sigmaTagCausalTargetAt,
       tagAlleleFreqRetentionAt, causalAlleleFreqRetentionAt, alleleFreqMismatchPenalty,
+      covarianceRetentionFromVarianceRatios,
       r2FromSourceWeights,
       explainedSignalVarianceFromSourceWeights,
       predictiveCovarianceFromSourceWeights,
@@ -1055,22 +1058,18 @@ theorem target_r2_changes_along_generation_indexed_af_path :
     -- before `alleleFreqMismatchPenalty` was corrected because the old body
     -- reduced further under `simp` alone.
     norm_num
-  -- Both moments land on the same product of two quarter-retentions, and the step from
-  -- that product to `exp(-1/2)` is one fact. It was carried inside both `calc` chains,
-  -- and then a third time below; stated first, both moments are three lines.
-  · have h_ret :
-        (3 / 4 : ℝ) *
-            (3 / 4 : ℝ) =
-          (9 / 16 : ℝ) := by
-      norm_num
+  -- Both moments retain one variance ratio. The two standard-deviation
+  -- factors multiply back to 3/4, rather than squaring that variance ratio.
+  · have h_ret : Real.sqrt (3 / 4 : ℝ) * Real.sqrt (3 / 4 : ℝ) = 3 / 4 :=
+      Real.mul_self_sqrt (by norm_num)
     have h_cov :
         predictiveCovarianceFromSourceWeights
             (timeVaryingAFGenerationalModel.toMetricModelAt 1) Pop.target =
-          (9 / 16 : ℝ) := by
+          (3 / 4 : ℝ) := by
       have h_product :
           predictiveCovarianceFromSourceWeights
               (timeVaryingAFGenerationalModel.toMetricModelAt 1) Pop.target =
-            (3 / 4 : ℝ) * (3 / 4 : ℝ) := by
+            Real.sqrt (3 / 4 : ℝ) * Real.sqrt (3 / 4 : ℝ) := by
         generational_witness_simp singleLocusGenerationalWitness, baselineGenerationalPopGen,
       timeVaryingAFGenerationalModel
         norm_num
@@ -1078,33 +1077,32 @@ theorem target_r2_changes_along_generation_indexed_af_path :
     have h_var :
         scoreVarianceFromSourceWeights
             (timeVaryingAFGenerationalModel.toMetricModelAt 1) Pop.target =
-          (9 / 16 : ℝ) := by
+          (3 / 4 : ℝ) := by
       have h_product :
           scoreVarianceFromSourceWeights
               (timeVaryingAFGenerationalModel.toMetricModelAt 1) Pop.target =
-            (3 / 4 : ℝ) * (3 / 4 : ℝ) := by
+            Real.sqrt (3 / 4 : ℝ) * Real.sqrt (3 / 4 : ℝ) := by
         generational_witness_simp singleLocusGenerationalWitness, baselineGenerationalPopGen,
       timeVaryingAFGenerationalModel
         norm_num
       rw [h_product, h_ret]
-    have h_ret_norm : (3 / 4 : ℝ) * (3 / 4 : ℝ) = (9 / 16 : ℝ) := h_ret
     have h_eff :
         effectiveOutcomeVariance
             (timeVaryingAFGenerationalModel.toMetricModelAt 1) Pop.target =
-          2 + 2 * (1 - (9 / 16 : ℝ)) ^ 2 := by
+          2 + 2 * (1 - (3 / 4 : ℝ)) ^ 2 := by
       generational_witness_simp singleLocusGenerationalWitness, baselineGenerationalPopGen,
       timeVaryingAFGenerationalModel
-      norm_num
-    have h_exp_ne : (9 / 16 : ℝ) ≠ 0 := by
+      norm_num [h_ret]
+    have h_exp_ne : (3 / 4 : ℝ) ≠ 0 := by
       norm_num
     unfold r2FromSourceWeights explainedSignalVarianceFromSourceWeights
     rw [h_cov, h_var, h_eff]
     have hcalc :
-        (9 / 16 : ℝ) ^ 2 /
-            (9 / 16 : ℝ) /
-              (2 + 2 * (1 - (9 / 16 : ℝ)) ^ 2) =
-          (9 / 16 : ℝ) /
-            (2 + 2 * (1 - (9 / 16 : ℝ)) ^ 2) := by
+        (3 / 4 : ℝ) ^ 2 /
+            (3 / 4 : ℝ) /
+              (2 + 2 * (1 - (3 / 4 : ℝ)) ^ 2) =
+          (3 / 4 : ℝ) /
+            (2 + 2 * (1 - (3 / 4 : ℝ)) ^ 2) := by
       field_simp [h_exp_ne]
     simpa using hcalc
 
@@ -1140,31 +1138,10 @@ theorem target_effect_heterogeneity_changes_generation_path_without_ld_or_af_cha
     generational_witness_simp singleLocusGenerationalWitness, baselineGenerationalPopGen,
       timeVaryingAFGenerationalModel,
       timeVaryingEffectGenerationalModel
-  · generational_witness_simp singleLocusGenerationalWitness, baselineGenerationalPopGen,
+  all_goals
+    generational_witness_simp singleLocusGenerationalWitness, baselineGenerationalPopGen,
       timeVaryingEffectGenerationalModel
-    all_goals try norm_num
-  · generational_witness_simp singleLocusGenerationalWitness, baselineGenerationalPopGen,
-      timeVaryingEffectGenerationalModel
-    all_goals try norm_num
-  · generational_witness_simp singleLocusGenerationalWitness, baselineGenerationalPopGen,
-      timeVaryingEffectGenerationalModel
-    all_goals try norm_num
-  · generational_witness_simp singleLocusGenerationalWitness, baselineGenerationalPopGen,
-      timeVaryingEffectGenerationalModel
-    all_goals try norm_num
-  · simp [betaTargetAt, singleLocusGenerationalWitness, baselineGenerationalPopGen,
-    timeVaryingAFGenerationalModel,
-    timeVaryingEffectGenerationalModel]
-  · simp [betaTargetAt, singleLocusGenerationalWitness, baselineGenerationalPopGen,
-    timeVaryingAFGenerationalModel,
-    timeVaryingEffectGenerationalModel]
-    norm_num
-  · generational_witness_simp singleLocusGenerationalWitness, baselineGenerationalPopGen,
-      timeVaryingEffectGenerationalModel
-    all_goals try norm_num
-  · generational_witness_simp singleLocusGenerationalWitness, baselineGenerationalPopGen,
-      timeVaryingEffectGenerationalModel
-    all_goals try norm_num
+    all_goals norm_num
 
 /-- The generation-indexed deployed profile always reads its `R²` coordinate
 from the same explicit time-sliced source-weights-on-target-state model. This

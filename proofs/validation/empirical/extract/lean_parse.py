@@ -310,7 +310,7 @@ def parse_file(path: pathlib.Path, root: pathlib.Path):
     return decls, failures
 
 
-FIELD_RE = re.compile(r"^\s{1,}([A-Za-z_][\w'₀-ₜ]*)\s*:\s*(.+?)\s*$")
+FIELD_RE = re.compile(r"^\s{1,}([A-Za-z_Ͱ-Ͽᴀ-ᶿ℀-⅏][\w'₀-ₜ]*)\s*:\s*(.+?)\s*$")
 
 
 def parse_struct_fields(chunk: str, hdr_end: int):

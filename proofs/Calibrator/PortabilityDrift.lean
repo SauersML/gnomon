@@ -1912,7 +1912,16 @@ The fields record the named drivers that can change metrics:
 - source/target outcome scales and target prevalence for deployed metrics
 
 No source `R²` summary appears here because it is not a sufficient biological
-state variable for transport. -/
+state variable for transport.
+
+All genotype covariance matrices use fixed coordinates across populations:
+raw allele dosages or genotypes divided by source standard deviations. The
+direct, proxy and novel matrices are tag-to-causal cross-covariances in those
+coordinates, and effect vectors use the matching causal units. Their matrix
+projections therefore have units `Cov(tag, outcome)`. They equal marginal
+regression coefficients only for unit-variance tags, the regime used by the
+projection experiments below. Independently standardizing each population
+would require transforming the coefficients as well as the matrices. -/
 structure CrossPopulationMetricModel (p q : ℕ) where
   beta : Pop → Fin q → ℝ
   sigmaTag : Pop → Matrix (Fin p) (Fin p) ℝ
@@ -3875,11 +3884,20 @@ structure CrossPopulationGenerationalModel (p q : ℕ) where
   betaSource : Fin q → ℝ
   targetEffectHeterogeneityAt : ℕ → Fin q → ℝ
   novelCausalEffectTargetAt : ℕ → Fin q → ℝ
+  /-- Tag covariance in raw dosage units, or fixed source-standardized coordinates.
+  Target genotypes use the same scales; this is not a correlation matrix with
+  independently standardized target coordinates. -/
   sigmaTagSource : Matrix (Fin p) (Fin p) ℝ
+  /-- Tag-to-causal cross-covariance in the same fixed genotype coordinates.
+  Causal effect vectors use the corresponding causal coordinate scales. -/
   directCausalSource : Matrix (Fin p) (Fin q) ℝ
-  novelDirectCausalTemplate : Matrix (Fin p) (Fin q) ℝ
+  /-- Target-coordinate covariance before the novelty and sharing modifiers.
+  Supplied per generation; it is not inferred from a possibly absent source allele. -/
+  novelDirectCausalCovarianceTemplateAt : ℕ → Matrix (Fin p) (Fin q) ℝ
+  /-- Proxy tag-to-causal cross-covariance in the same fixed coordinates. -/
   proxyTaggingSource : Matrix (Fin p) (Fin q) ℝ
-  novelProxyTaggingTemplate : Matrix (Fin p) (Fin q) ℝ
+  /-- Target-coordinate proxy covariance before the novelty and sharing modifiers. -/
+  novelProxyTaggingCovarianceTemplateAt : ℕ → Matrix (Fin p) (Fin q) ℝ
   tagDistance : Matrix (Fin p) (Fin p) ℝ
   tagCausalDistance : Matrix (Fin p) (Fin q) ℝ
   tagAlleleFreqSource : Fin p → ℝ
@@ -3948,9 +3966,9 @@ noncomputable def CrossPopulationGenerationalModel.witness (p q : ℕ) :
   novelCausalEffectTargetAt := fun _ _ ↦ 0
   sigmaTagSource := 1
   directCausalSource := 0
-  novelDirectCausalTemplate := 0
+  novelDirectCausalCovarianceTemplateAt := fun _ ↦ 0
   proxyTaggingSource := 0
-  novelProxyTaggingTemplate := 0
+  novelProxyTaggingCovarianceTemplateAt := fun _ ↦ 0
   tagDistance := 0
   tagCausalDistance := 0
   tagAlleleFreqSource := fun _ ↦ 1 / 2
@@ -4049,9 +4067,10 @@ noncomputable def causalAlleleFreqTargetAt {p q : ℕ}
     ratio is of variances and not of standard deviations. Control: the counted
     source allele frequency recovers `pSource` at 1.13 sems.
 
-    Written out rather than routed through `alleleFreqMismatchPenalty`, because
-    that body is the falsified one and this definition should not inherit
-    whatever becomes of it.
+    The variance ratio is written explicitly here. `alleleFreqMismatchPenalty`
+    now also returns this ratio; its former exponential gap penalty is the
+    falsified alternative described above. Covariance transport uses square
+    roots of these variance ratios without changing the measured scalar claim.
 
     Two things the corrected body gets right that the penalty could not. It is
     not a function of the frequency GAP, so the three pairs sharing `|Δp| = 0.2`
@@ -4090,6 +4109,41 @@ noncomputable def causalAlleleFreqRetentionAt {p q : ℕ}
     (m : CrossPopulationGenerationalModel p q) (t : ℕ) (j : Fin q) : ℝ :=
   (2 * causalAlleleFreqTargetAt m t j * (1 - causalAlleleFreqTargetAt m t j)) /
     (2 * m.causalAlleleFreqSource j * (1 - m.causalAlleleFreqSource j))
+
+/-- Frequency-only covariance transport in raw genotype units, or in coordinates
+standardized with the source population's scales. The inputs are VARIANCE ratios;
+covariance carries one standard-deviation ratio from each coordinate. With target
+genotypes independently standardized instead, the diagonal correlation stays one
+and this frequency factor is not the appropriate coordinate transformation.
+
+The variance-ratio inputs must be nonnegative. A source-polymorphism premise is
+also required when obtaining them by dividing HWE variances; total division at
+source fixation does not identify a covariance transport. -/
+noncomputable def covarianceRetentionFromVarianceRatios (left right : ℝ) : ℝ :=
+  Real.sqrt left * Real.sqrt right
+
+/-- A covariance diagonal retains one variance ratio, not its square. -/
+theorem covarianceRetentionFromVarianceRatios_diagonal (r : ℝ) (hr : 0 ≤ r) :
+    covarianceRetentionFromVarianceRatios r r = r := by
+  simpa [covarianceRetentionFromVarianceRatios, pow_two] using Real.sq_sqrt hr
+
+/-- Scaling a cross-covariance by this factor scales its squared magnitude by
+the product of the two variance ratios, preserving the covariance bound. -/
+theorem covarianceRetentionFromVarianceRatios_sq (left right : ℝ)
+    (hl : 0 ≤ left) (hr : 0 ≤ right) :
+    covarianceRetentionFromVarianceRatios left right ^ 2 = left * right := by
+  simp only [covarianceRetentionFromVarianceRatios, mul_pow,
+    Real.sq_sqrt hl, Real.sq_sqrt hr]
+
+/-- The frequency shift 0.2 to 0.5 increases variance by 25/16. Applying that
+variance ratio twice would incorrectly give 625/256. -/
+theorem covarianceRetentionFromVarianceRatios_at_reference_point :
+    covarianceRetentionFromVarianceRatios
+      (alleleFreqMismatchPenalty (1 / 5) (1 / 2))
+      (alleleFreqMismatchPenalty (1 / 5) (1 / 2)) = 25 / 16 := by
+  have hr : alleleFreqMismatchPenalty (1 / 5) (1 / 2) = 25 / 16 := by
+    norm_num [alleleFreqMismatchPenalty]
+  rw [hr, covarianceRetentionFromVarianceRatios_diagonal (25 / 16) (by norm_num)]
 
 /-- Fraction of target-side novel variation accumulated by generation `t`.
 This is the complement of shared ancestral variation retained after mutation. -/
@@ -4140,8 +4194,8 @@ noncomputable def jointTagLDKernelAt {p q : ℕ}
       (m.popGen.fstTransientAt t) m.popGen.recomb *
     m.popGen.mutationSharedRetentionAt t *
     m.popGen.migrationSharedBoostAt t *
-    tagAlleleFreqRetentionAt m t i *
-    tagAlleleFreqRetentionAt m t j
+    covarianceRetentionFromVarianceRatios
+      (tagAlleleFreqRetentionAt m t i) (tagAlleleFreqRetentionAt m t j)
 
 @[simp] theorem jointTagLDKernelAt_uses_ld_af_mutation_migration {p q : ℕ}
     (m : CrossPopulationGenerationalModel p q) (t : ℕ) (i j : Fin p) :
@@ -4150,40 +4204,43 @@ noncomputable def jointTagLDKernelAt {p q : ℕ}
           (m.popGen.fstTransientAt t) m.popGen.recomb *
         m.popGen.mutationSharedRetentionAt t *
         m.popGen.migrationSharedBoostAt t *
-        tagAlleleFreqRetentionAt m t i *
-        tagAlleleFreqRetentionAt m t j := by
+        covarianceRetentionFromVarianceRatios
+          (tagAlleleFreqRetentionAt m t i) (tagAlleleFreqRetentionAt m t j) := by
   simp [jointTagLDKernelAt]
 
 /-- Joint locus-level transport kernel for directly scored causal variants.
 This omits the LD-decay term because the scored variant is itself causal, but
-it still carries mutation, migration, and AF-history interactions. -/
+it still carries mutation, migration, and AF-history interactions. The tagging
+operator is a cross-covariance, so each coordinate contributes its standard-
+deviation ratio, including when the tag and causal variant are the same locus. -/
 noncomputable def jointDirectCausalKernelAt {p q : ℕ}
     (m : CrossPopulationGenerationalModel p q) (t : ℕ) (i : Fin p) (j : Fin q) : ℝ :=
   m.popGen.mutationSharedRetentionAt t *
     m.popGen.migrationSharedBoostAt t *
-    tagAlleleFreqRetentionAt m t i *
-    causalAlleleFreqRetentionAt m t j
+    covarianceRetentionFromVarianceRatios
+      (tagAlleleFreqRetentionAt m t i) (causalAlleleFreqRetentionAt m t j)
 
 @[simp] theorem jointDirectCausalKernelAt_uses_af_mutation_migration {p q : ℕ}
     (m : CrossPopulationGenerationalModel p q) (t : ℕ) (i : Fin p) (j : Fin q) :
     jointDirectCausalKernelAt m t i j =
       m.popGen.mutationSharedRetentionAt t *
         m.popGen.migrationSharedBoostAt t *
-        tagAlleleFreqRetentionAt m t i *
-        causalAlleleFreqRetentionAt m t j := by
+        covarianceRetentionFromVarianceRatios
+          (tagAlleleFreqRetentionAt m t i) (causalAlleleFreqRetentionAt m t j) := by
   simp [jointDirectCausalKernelAt]
 
 /-- Joint locus-level transport kernel for ancestry-specific proxy tagging.
 This carries the full interaction between LD decay, mutation/migration sharing,
-and source/target allele-frequency history. -/
+and source/target allele-frequency history. As for the direct channel, the
+frequency factor transports a cross-covariance in fixed genotype coordinates. -/
 noncomputable def jointProxyTaggingKernelAt {p q : ℕ}
     (m : CrossPopulationGenerationalModel p q) (t : ℕ) (i : Fin p) (j : Fin q) : ℝ :=
   ldCorrelationDecay (m.tagCausalDistance i j)
       (m.popGen.fstTransientAt t) m.popGen.recomb *
     m.popGen.mutationSharedRetentionAt t *
     m.popGen.migrationSharedBoostAt t *
-    tagAlleleFreqRetentionAt m t i *
-    causalAlleleFreqRetentionAt m t j
+    covarianceRetentionFromVarianceRatios
+      (tagAlleleFreqRetentionAt m t i) (causalAlleleFreqRetentionAt m t j)
 
 @[simp] theorem jointProxyTaggingKernelAt_uses_ld_tagging_af_mutation_migration {p q : ℕ}
     (m : CrossPopulationGenerationalModel p q) (t : ℕ) (i : Fin p) (j : Fin q) :
@@ -4192,30 +4249,39 @@ noncomputable def jointProxyTaggingKernelAt {p q : ℕ}
           (m.popGen.fstTransientAt t) m.popGen.recomb *
         m.popGen.mutationSharedRetentionAt t *
         m.popGen.migrationSharedBoostAt t *
-        tagAlleleFreqRetentionAt m t i *
-        causalAlleleFreqRetentionAt m t j := by
+        covarianceRetentionFromVarianceRatios
+          (tagAlleleFreqRetentionAt m t i) (causalAlleleFreqRetentionAt m t j) := by
   simp [jointProxyTaggingKernelAt]
 
-/-- Joint locus-level kernel for target-only novel direct causal links. Novel
-target-specific causal variants accumulate with mutation history, are diluted by
-migration, and still depend on target allele-frequency matching.
+/-- Biological modifier for a supplied target-coordinate novel covariance.
+The template already carries the target genotype scales. No source variance
+ratio can identify covariance at a locus absent in the source population.
 
     Empirical status: UNTESTED. -/
-noncomputable def jointNovelDirectCausalKernelAt {p q : ℕ}
-    (m : CrossPopulationGenerationalModel p q) (t : ℕ) (i : Fin p) (j : Fin q) : ℝ :=
-  novelVariantInnovationAt m.popGen t *
-    (m.popGen.migrationSharedBoostAt t)⁻¹ *
-    tagAlleleFreqRetentionAt m t i *
-    causalAlleleFreqRetentionAt m t j
+noncomputable def novelCausalCovarianceRetentionAt
+    (g : GenerationalPopGenParameters) (t : ℕ) : ℝ :=
+  novelVariantInnovationAt g t * (g.migrationSharedBoostAt t)⁻¹
 
-@[simp] theorem jointNovelDirectCausalKernelAt_uses_af_mutation_migration {p q : ℕ}
-    (m : CrossPopulationGenerationalModel p q) (t : ℕ) (i : Fin p) (j : Fin q) :
-    jointNovelDirectCausalKernelAt m t i j =
-      novelVariantInnovationAt m.popGen t *
-        (m.popGen.migrationSharedBoostAt t)⁻¹ *
-        tagAlleleFreqRetentionAt m t i *
-        causalAlleleFreqRetentionAt m t j := by
-  simp [jointNovelDirectCausalKernelAt]
+/-- Apply a dimensionless modifier to a supplied target covariance. -/
+noncomputable def novelCovarianceFromTargetTemplate (targetCovariance retention : ℝ) : ℝ :=
+  targetCovariance * retention
+
+@[simp] theorem novelCovarianceFromTargetTemplate_zero (retention : ℝ) :
+    novelCovarianceFromTargetTemplate 0 retention = 0 := by
+  simp [novelCovarianceFromTargetTemplate]
+
+/-- A bounded template remains bounded when the biological modifier is a
+contraction. This states the required assumption instead of assuming every
+choice of an unconstrained template is a valid covariance. -/
+theorem novelCovarianceFromTargetTemplate_abs_le (targetCovariance retention bound : ℝ)
+    (hcov : |targetCovariance| ≤ bound) (hret : |retention| ≤ 1) :
+    |novelCovarianceFromTargetTemplate targetCovariance retention| ≤ bound := by
+  unfold novelCovarianceFromTargetTemplate
+  rw [abs_mul]
+  calc
+    |targetCovariance| * |retention| ≤ |targetCovariance| * 1 :=
+      mul_le_mul_of_nonneg_left hret (abs_nonneg _)
+    _ ≤ bound := by simpa using hcov
 
 /-- Joint locus-level kernel for target-only novel proxy tagging. This carries
 both local LD structure and mutation-generated novelty, rather than just
@@ -4224,20 +4290,14 @@ noncomputable def jointNovelProxyTaggingKernelAt {p q : ℕ}
     (m : CrossPopulationGenerationalModel p q) (t : ℕ) (i : Fin p) (j : Fin q) : ℝ :=
   ldCorrelationDecay (m.tagCausalDistance i j)
       (m.popGen.fstTransientAt t) m.popGen.recomb *
-    novelVariantInnovationAt m.popGen t *
-    (m.popGen.migrationSharedBoostAt t)⁻¹ *
-    tagAlleleFreqRetentionAt m t i *
-    causalAlleleFreqRetentionAt m t j
+    novelCausalCovarianceRetentionAt m.popGen t
 
-@[simp] theorem jointNovelProxyTaggingKernelAt_uses_ld_af_mutation_migration {p q : ℕ}
+@[simp] theorem jointNovelProxyTaggingKernelAt_uses_ld_mutation_migration {p q : ℕ}
     (m : CrossPopulationGenerationalModel p q) (t : ℕ) (i : Fin p) (j : Fin q) :
     jointNovelProxyTaggingKernelAt m t i j =
       ldCorrelationDecay (m.tagCausalDistance i j)
           (m.popGen.fstTransientAt t) m.popGen.recomb *
-        novelVariantInnovationAt m.popGen t *
-        (m.popGen.migrationSharedBoostAt t)⁻¹ *
-        tagAlleleFreqRetentionAt m t i *
-        causalAlleleFreqRetentionAt m t j := by
+        novelCausalCovarianceRetentionAt m.popGen t := by
   simp [jointNovelProxyTaggingKernelAt]
 
 /-- Time-varying target LD among scored SNPs. This incorporates recombination,
@@ -4248,6 +4308,43 @@ noncomputable def sigmaTagTargetAt {p q : ℕ}
     Matrix (Fin p) (Fin p) ℝ :=
   fun i j ↦
     m.sigmaTagSource i j * jointTagLDKernelAt m t i j
+
+/-- In source genotype coordinates, the frequency-only diagonal multiplier is
+the variance ratio. The remaining factors are explicit: this theorem does not
+assume that mutation, migration or LD factors equal one. -/
+theorem sigmaTagTargetAt_diagonal {p q : ℕ}
+    (m : CrossPopulationGenerationalModel p q) (t : ℕ) (i : Fin p)
+    (hretention : 0 ≤ tagAlleleFreqRetentionAt m t i) :
+    sigmaTagTargetAt m t i i = m.sigmaTagSource i i *
+      (ldCorrelationDecay (m.tagDistance i i)
+          (m.popGen.fstTransientAt t) m.popGen.recomb *
+        m.popGen.mutationSharedRetentionAt t *
+        m.popGen.migrationSharedBoostAt t * tagAlleleFreqRetentionAt m t i) := by
+  simp only [sigmaTagTargetAt, jointTagLDKernelAt,
+    covarianceRetentionFromVarianceRatios_diagonal _ hretention]
+
+/-- A polymorphic source HWE diagonal transports to the target HWE variance,
+up to the explicit non-frequency modifiers. Source fixation is excluded: no
+variance ratio can recover target variation from a zero source variance. -/
+theorem sigmaTagTargetAt_diagonal_hwe {p q : ℕ}
+    (m : CrossPopulationGenerationalModel p q) (t : ℕ) (i : Fin p)
+    (hsource : 0 < m.tagAlleleFreqSource i ∧ m.tagAlleleFreqSource i < 1)
+    (htarget : 0 ≤ tagAlleleFreqTargetAt m t i ∧ tagAlleleFreqTargetAt m t i ≤ 1)
+    (hvariance : m.sigmaTagSource i i =
+      2 * m.tagAlleleFreqSource i * (1 - m.tagAlleleFreqSource i)) :
+    sigmaTagTargetAt m t i i =
+      (2 * tagAlleleFreqTargetAt m t i * (1 - tagAlleleFreqTargetAt m t i)) *
+        (ldCorrelationDecay (m.tagDistance i i)
+            (m.popGen.fstTransientAt t) m.popGen.recomb *
+          m.popGen.mutationSharedRetentionAt t * m.popGen.migrationSharedBoostAt t) := by
+  have hs : 0 < 2 * m.tagAlleleFreqSource i * (1 - m.tagAlleleFreqSource i) :=
+    mul_pos (mul_pos (by norm_num) hsource.1) (sub_pos.mpr hsource.2)
+  have ht : 0 ≤ 2 * tagAlleleFreqTargetAt m t i * (1 - tagAlleleFreqTargetAt m t i) :=
+    mul_nonneg (mul_nonneg (by norm_num) htarget.1) (sub_nonneg.mpr htarget.2)
+  have hr : 0 ≤ tagAlleleFreqRetentionAt m t i := div_nonneg ht hs.le
+  rw [sigmaTagTargetAt_diagonal m t i hr, hvariance]
+  unfold tagAlleleFreqRetentionAt
+  field_simp [ne_of_gt hs] <;> ring
 
 /-- Time-varying target tag-to-causal alignment. This is the explicit tagging
 quality surface, driven by LD decay, allele-frequency divergence, mutation,
@@ -4265,7 +4362,8 @@ noncomputable def novelDirectCausalTargetAt {p q : ℕ}
     (m : CrossPopulationGenerationalModel p q) (t : ℕ) :
     Matrix (Fin p) (Fin q) ℝ :=
   fun i j ↦
-    m.novelDirectCausalTemplate i j * jointNovelDirectCausalKernelAt m t i j
+    novelCovarianceFromTargetTemplate (m.novelDirectCausalCovarianceTemplateAt t i j)
+      (novelCausalCovarianceRetentionAt m.popGen t)
 
 /-- Time-varying proxy-tagging alignment. Unlike directly scored causal
 variants, this channel is degraded by LD decay between the scored tag and the
@@ -4282,7 +4380,36 @@ noncomputable def novelProxyTaggingTargetAt {p q : ℕ}
     (m : CrossPopulationGenerationalModel p q) (t : ℕ) :
     Matrix (Fin p) (Fin q) ℝ :=
   fun i j ↦
-    m.novelProxyTaggingTemplate i j * jointNovelProxyTaggingKernelAt m t i j
+    novelCovarianceFromTargetTemplate (m.novelProxyTaggingCovarianceTemplateAt t i j)
+      (jointNovelProxyTaggingKernelAt m t i j)
+
+/-- Novel target covariance is independent of source causal frequencies,
+including source fixation. Its scale is supplied in target coordinates. -/
+theorem novelDirectCausalTargetAt_independent_of_source_frequency {p q : ℕ}
+    (m : CrossPopulationGenerationalModel p q) (t : ℕ) (sourceFrequency : Fin q → ℝ) :
+    novelDirectCausalTargetAt { m with causalAlleleFreqSource := sourceFrequency } t =
+      novelDirectCausalTargetAt m t := by
+  rfl
+
+theorem novelProxyTaggingTargetAt_independent_of_source_frequency {p q : ℕ}
+    (m : CrossPopulationGenerationalModel p q) (t : ℕ) (sourceFrequency : Fin q → ℝ) :
+    novelProxyTaggingTargetAt { m with causalAlleleFreqSource := sourceFrequency } t =
+      novelProxyTaggingTargetAt m t := by
+  rfl
+
+theorem novelDirectCausalTargetAt_abs_le {p q : ℕ}
+    (m : CrossPopulationGenerationalModel p q) (t : ℕ) (i : Fin p) (j : Fin q) (bound : ℝ)
+    (hcov : |m.novelDirectCausalCovarianceTemplateAt t i j| ≤ bound)
+    (hret : |novelCausalCovarianceRetentionAt m.popGen t| ≤ 1) :
+    |novelDirectCausalTargetAt m t i j| ≤ bound := by
+  exact novelCovarianceFromTargetTemplate_abs_le _ _ _ hcov hret
+
+theorem novelProxyTaggingTargetAt_abs_le {p q : ℕ}
+    (m : CrossPopulationGenerationalModel p q) (t : ℕ) (i : Fin p) (j : Fin q) (bound : ℝ)
+    (hcov : |m.novelProxyTaggingCovarianceTemplateAt t i j| ≤ bound)
+    (hret : |jointNovelProxyTaggingKernelAt m t i j| ≤ 1) :
+    |novelProxyTaggingTargetAt m t i j| ≤ bound := by
+  exact novelCovarianceFromTargetTemplate_abs_le _ _ _ hcov hret
 
 /-- Time-varying target tag-to-causal alignment is the sum of a direct-causal
 channel, a target-only novel direct-causal channel, a proxy-tagging channel,

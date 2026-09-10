@@ -197,6 +197,10 @@ jobs:
         working-directory: proofs/validation/empirical/differential
         run: python3 test_identity_gate.py
 
+      - name: Verify covariance transport identities
+        working-directory: proofs/validation/empirical/differential
+        run: python3 test_covariance_transport.py
+
       # Both directions, exactly like the laundering calibration above and for
       # the same reason: the round-trip checks exist to catch a definition
       # written the wrong way round, and a detector that reports nothing is
