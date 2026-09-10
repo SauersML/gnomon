@@ -87,7 +87,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--analysis", type=Path, default=HERE / "aou_analysis.json")
     parser.add_argument("--check", action="store_true")
-    parser.add_argument("--prepare-only", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--prepare-only", action="store_true")
+    mode.add_argument("--smoke-only", action="store_true",
+                      help="Fit the first prespecified score on development data only")
+    parser.add_argument("--endpoint", choices=["copd", "hypertension", "obesity"])
     parser.add_argument("--resume", help="Workspace gs:// checkpoint object from a previous run")
     args = parser.parse_args()
     wb = Workbench()
@@ -122,6 +126,7 @@ def main():
     sources = {"runner": HERE / "aou_survival.py",
                "disease_selector": HERE / "disease_selection.py",
                "identity_guard": HERE / "aou_identity.py",
+               "status_code": HERE / "aou_status.py",
                "score_transform": HERE / "aou_score_transform.py",
                "checkpoint_code": HERE / "aou_checkpoint.py",
                "evaluation_code": HERE / "aou_evaluation.py",
@@ -140,6 +145,8 @@ def main():
     prefix = f"workflows/{run_id}"
     inputs["aou_survival.checkpoint_uri"] = f"{wb.bucket}/workflow-checkpoints/{run_id}.tar.gz"
     inputs["aou_survival.prepare_only"] = args.prepare_only
+    inputs["aou_survival.smoke_only"] = args.smoke_only
+    inputs["aou_survival.endpoint"] = args.endpoint or ""
     for name, path in sources.items():
         uri = f"{wb.bucket}/{prefix}/{path.name}"
         wb.wb("gsutil", "cp", str(path), uri)

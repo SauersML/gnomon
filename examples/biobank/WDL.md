@@ -28,7 +28,9 @@ release's actual follow-up.
 
 PCs use `research_id`, `pca_features`, and `ancestry_pred` from the release's
 ancestry file. The published relatedness-prune list is applied before sampling
-or splitting. Remaining person IDs are the pilot's split groups. This is not
+or splitting. Its single-column numeric IDs may have the `research_id` header
+or start on the first row; unknown headers and malformed rows are rejected.
+Remaining person IDs are the pilot's split groups. This is not
 full pedigree reconstruction or a claim that distant relatives are independent.
 
 ## Score selection and matched models
@@ -97,6 +99,12 @@ property, not observed-outcome calibration.
 
 The first run should use `--prepare-only`: it checks real score availability,
 cohort fields, event counts and horizon support without fitting models.
+After that and native acceptance pass, `--smoke-only` fits the first
+prespecified score using only the development split: cross-fitted CTN and two
+cause-specific outcome models. It performs the same persistence, batching,
+monotonicity and CIF checks as the full analysis. It neither selects a score
+nor evaluates the outer test set. Its completed development fits are reusable
+by the full comparison through the same checkpoint.
 The pilot caps rows, CPUs, query bytes/time and each fit's wall time.
 A failed step raises an error; its process group is stopped.
 
@@ -107,7 +115,7 @@ contain participant data, scores, models and logs and must remain inside the
 authorized workspace. WDL outputs are aggregate metrics, provenance **and
 the sensitive checkpoint archive**; none is automatically approved for export.
 
-Validation so far: 20 deterministic workflow contract tests and WDL validation
+Validation so far: 23 deterministic workflow contract tests and WDL validation
 pass on MSI. The updated native CTN survival acceptance test and real cohort
 preflight remain separate checks; synthetic contracts are not AoU results.
 
@@ -152,8 +160,10 @@ environment (the launcher only performs CLI/file operations):
 
 ```bash
 python examples/biobank/submit_aou.py --check
-python examples/biobank/submit_aou.py --prepare-only
+python examples/biobank/submit_aou.py --endpoint hypertension --prepare-only
 # After native acceptance and cohort preflight succeed:
+python examples/biobank/submit_aou.py --endpoint hypertension --smoke-only
+# After the development smoke passes:
 python examples/biobank/submit_aou.py
 ```
 
@@ -167,6 +177,20 @@ existence of the staged objects without uploading or submitting. Submission
 uses unique source/config-hashed paths and writes a submission receipt under
 `examples/biobank/.aou-workflow/`. It submits exactly one task and does not
 start a local polling process. Use Workbench's job UI to inspect/cancel it.
+`--endpoint` narrows execution after the existing selector; it never overrides
+eligibility. Run endpoints separately when a combined run would exceed its
+wall budget. A checkpoint can move from preflight to smoke to full comparison
+for the same endpoint, inputs and configuration. Keep the endpoint fixed when
+resuming; its name is included in the checkpoint signature.
+
+When the AoU perimeter blocks raw log downloads, `aou_diagnostic.wdl` can
+inspect a failed task's stderr inside the same workspace. It emits only fixed
+software-failure labels, never exception text or participant information. Its
+runtime checks the VM identity, uses one CPU, and has a 90-second command cap.
+It does not grant local access to the underlying log.
+The analysis also writes fixed stage/failure labels under its checkpoint
+object's `.status/` prefix. Those labels distinguish input parsing, cohort
+support, missing scores and completion without exposing exception text.
 
 ## Runtime and iteration budget
 

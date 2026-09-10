@@ -7,6 +7,7 @@ workflow aou_survival {
     File runner
     File disease_selector
     File identity_guard
+    File status_code
     File score_transform
     File checkpoint_code
     File evaluation_code
@@ -22,6 +23,8 @@ workflow aou_survival {
     String checkpoint_uri
     File? resume_checkpoint
     Boolean prepare_only = false
+    Boolean smoke_only = false
+    String endpoint = ""
     Int cpu = 4
     Int memory_gb = 16
     Int disk_gb = 50
@@ -33,6 +36,7 @@ workflow aou_survival {
       runner = runner,
       disease_selector = disease_selector,
       identity_guard = identity_guard,
+      status_code = status_code,
       score_transform = score_transform,
       checkpoint_code = checkpoint_code,
       evaluation_code = evaluation_code,
@@ -48,6 +52,8 @@ workflow aou_survival {
       checkpoint_uri = checkpoint_uri,
       resume_checkpoint = resume_checkpoint,
       prepare_only = prepare_only,
+      smoke_only = smoke_only,
+      endpoint = endpoint,
       cpu = cpu, memory_gb = memory_gb, disk_gb = disk_gb,
       wall_minutes = wall_minutes
   }
@@ -65,6 +71,7 @@ task analyze {
     File runner
     File disease_selector
     File identity_guard
+    File status_code
     File score_transform
     File checkpoint_code
     File evaluation_code
@@ -80,6 +87,8 @@ task analyze {
     String checkpoint_uri
     File? resume_checkpoint
     Boolean prepare_only
+    Boolean smoke_only
+    String endpoint
     Int cpu
     Int memory_gb
     Int disk_gb
@@ -88,16 +97,22 @@ task analyze {
 
   command <<<
     set -euo pipefail
+    if [[ "~{prepare_only}" == true && "~{smoke_only}" == true ]]; then
+      echo 'prepare_only and smoke_only are mutually exclusive' >&2
+      exit 2
+    fi
     mkdir -p wheels work/tmp work/cache
     cp "~{runner}" runner.py
     cp "~{disease_selector}" disease_selection.py
     cp "~{identity_guard}" aou_identity.py
+    cp "~{status_code}" aou_status.py
     cp "~{score_transform}" aou_score_transform.py
     cp "~{checkpoint_code}" aou_checkpoint.py
     cp "~{evaluation_code}" aou_evaluation.py
     cp "~{score_panel}" score_panel.json
     # Read WDL strings from JSON instead of interpolating them as shell code.
     cp "~{write_json(runtime_image)}" runtime_image.json
+    cp "~{write_json(endpoint)}" endpoint.json
     export TMPDIR="$PWD/work/tmp"
     export XDG_CACHE_HOME="$PWD/work/cache"
     export RAYON_NUM_THREADS=~{cpu}
@@ -113,16 +128,18 @@ task analyze {
       if [[ -n "$9" ]]; then resume_args=(--resume "$9"); fi
       mode_args=()
       if [[ "${10}" == true ]]; then mode_args=(--prepare-only); fi
+      if [[ "${11}" == true ]]; then mode_args=(--smoke-only); fi
       exec work/venv/bin/python runner.py run \
         --config "$3" --phenotypes "$4" --scores "$5" \
         --ancestry "$6" --prune "$7" --output work/results \
         --runtime-image runtime_image.json --checkpoint-uri "$8" \
+        --endpoint-config endpoint.json \
         --score-panel score_panel.json \
         "${resume_args[@]}" "${mode_args[@]}"
     ' bash "~{wheelhouse_archive}" "~{requirements}" "~{analysis_config}" \
       "~{phenotype_library_archive}" "~{shared_features_archive}" \
       "~{ancestry_predictions}" "~{relatedness_prune}" "~{checkpoint_uri}" \
-      "~{default="" resume_checkpoint}" "~{prepare_only}"
+      "~{default="" resume_checkpoint}" "~{prepare_only}" "~{smoke_only}"
   >>>
 
   output {

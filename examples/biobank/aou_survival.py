@@ -28,6 +28,7 @@ from aou_score_transform import (assemble_scores, baseline_columns, fit_transfor
                                  grouped_folds, score_diagnostics, transformed_score)
 from aou_checkpoint import StudyCheckpoint
 from aou_evaluation import audit_groups, paired_loss_summary
+from aou_status import failure_label, publish_status
 
 
 def digest(path):
@@ -122,9 +123,23 @@ def unpack_phenotypes(archive, destination):
 
 
 def read_ancestry(ancestry, prune, num_pcs):
+    ancestry_columns = pd.read_csv(ancestry, sep="\t", nrows=0).columns
+    if not {"research_id", "pca_features", "ancestry_pred"}.issubset(ancestry_columns):
+        raise ValueError("ancestry file lacks required research_id/pca_features/ancestry_pred columns")
     df = pd.read_csv(ancestry, sep="\t", dtype=str,
                      usecols=["research_id", "pca_features", "ancestry_pred"])
-    excluded = pd.read_csv(prune, sep="\t", dtype=str, usecols=["research_id"])
+    # pgsEngine accepts the published single-column list with or without its
+    # research_id header. Preserve the first participant in the headerless form;
+    # reject malformed or multi-column input instead of guessing an ID column.
+    excluded = pd.read_csv(prune, sep="\t", dtype=str, header=None,
+                           keep_default_na=False, skip_blank_lines=False)
+    if excluded.shape[1] != 1:
+        raise ValueError("relatedness prune must be a single research_id column")
+    excluded.columns = ["research_id"]
+    if not excluded.empty and excluded.iloc[0, 0] == "research_id":
+        excluded = excluded.iloc[1:]
+    if not excluded.research_id.str.fullmatch(r"[0-9]+").all():
+        raise ValueError("relatedness prune contains invalid research IDs")
     if excluded.empty or excluded.research_id.isna().any():
         raise ValueError("AoU relatedness prune list is missing or empty")
     if df.research_id.isna().any() or df.research_id.duplicated().any():
@@ -630,6 +645,19 @@ def analyze_partition(df, config, args, disease_dir, checkpoint, candidates):
             "paired_comparisons": comparisons}, candidate_risks
 
 
+def analyze_development(df, disease, config, args, disease_dir, checkpoint):
+    """A smoke fit reuses the first development candidate without opening test data."""
+    development = development_partition(df, config)
+    candidates = disease["candidates"][:1] if args.smoke_only else disease["candidates"]
+    reports = {}
+    for pgs in candidates:
+        development["PGS"] = development[pgs]
+        report, _ = analyze_partition(development, config, args,
+            disease_dir / "development" / pgs, checkpoint, [("pc_varying", "ctn")])
+        reports[pgs] = report
+    return reports
+
+
 def run(args):
     from aou_identity import task_account
     execution_account = task_account()
@@ -637,6 +665,9 @@ def run(args):
     config = json.loads(args.config.read_text())
     validate_config(config)
     panel = load_score_panel(args.score_panel)
+    endpoint = json.loads(args.endpoint_config.read_text())
+    if endpoint != "" and endpoint not in panel["endpoints"]:
+        raise ValueError("requested endpoint is not in the prespecified panel")
     import gamfit
     if gamfit.__version__ != config["gamfit_version"]:
         raise ValueError("gamfit version does not match the analysis configuration")
@@ -654,8 +685,9 @@ def run(args):
         raise ValueError("runtime_image must use an immutable digest")
     sources = [Path(__file__), *[Path(__file__).with_name(name) for name in
                ("aou_identity.py", "aou_score_transform.py", "aou_checkpoint.py",
-                "aou_evaluation.py", "disease_selection.py")]]
-    signature = {"config": config, "sources": {p.name: digest(p) for p in sources},
+                "aou_evaluation.py", "aou_status.py", "disease_selection.py")]]
+    signature = {"config": config, "endpoint": endpoint,
+                 "sources": {p.name: digest(p) for p in sources},
                  "inputs": {key: digest(getattr(args, key)) for key in
                             ("scores", "ancestry", "prune", "phenotypes", "score_panel")}}
     checkpoint = StudyCheckpoint(args.output, args.checkpoint_uri, config["google_project"],
@@ -678,13 +710,20 @@ def run(args):
             raise ValueError("the existing disease selector found no eligible mapped disease")
         diseases = {slug: {**disease, "candidates": panel["endpoints"][slug]["candidates"]}
                     for slug, disease in diseases.items() if slug in panel["endpoints"]}
+        if endpoint:
+            if endpoint not in diseases:
+                raise ValueError("requested endpoint did not pass the existing disease selection rule")
+            diseases = {endpoint: diseases[endpoint]}
         diseases = dict(list(diseases.items())[:config["disease_limit"]])
         if not diseases:
             raise ValueError("no prespecified endpoint passed the existing disease selection rule")
         score_cache = unpack_score_cache(args.scores, args.output / "scores.tar")
         available_scores = cached_score_ids(score_cache)
+        publish_status(args.checkpoint_uri, "reading_ancestry")
         ancestry = read_ancestry(args.ancestry, args.prune, config["num_pcs"])
+        publish_status(args.checkpoint_uri, "loading_person_times")
         base = ancestry.merge(person_times(client, config["workspace_cdr"]), on="person_id", validate="one_to_one")
+        publish_status(args.checkpoint_uri, "preparing_cohort")
         for slug, disease in diseases.items():
             disease["missing_scores"] = sorted(set(disease["candidates"]) - available_scores)
             if disease["missing_scores"]:
@@ -707,6 +746,7 @@ def run(args):
     for slug, disease in diseases.items():
         print(f"Preparing {slug} ({', '.join(disease['candidates'])})", flush=True)
         if disease["missing_scores"]:
+            publish_status(args.checkpoint_uri, "scores_missing")
             if not args.prepare_only:
                 raise ValueError(f"{slug}: prespecified scores missing from pgsEngine cache: {disease['missing_scores']}")
             results[slug] = {"status": "missing_scores", "missing_scores": disease["missing_scores"]}
@@ -720,6 +760,7 @@ def run(args):
         support_errors += [f"development: {error}" for error in partition_support(
             development.loc[development.is_train], development.loc[~development.is_train], config)]
         if args.prepare_only:
+            publish_status(args.checkpoint_uri, "cohort_unsupported" if support_errors else "cohort_ready")
             counts = {"training": len(train), "held_out": len(test),
                       "training_disease_events": int((train.event_code == 1).sum()),
                       "training_deaths": int((train.event_code == 2).sum())}
@@ -730,13 +771,14 @@ def run(args):
             continue
         if support_errors:
             raise ValueError("; ".join(support_errors))
-        development = development_partition(df, config)
-        selection_reports = {}
-        for pgs in disease["candidates"]:
-            development["PGS"] = development[pgs]
-            report, _ = analyze_partition(development, config, args,
-                disease_dir / "development" / pgs, checkpoint, [("pc_varying", "ctn")])
-            selection_reports[pgs] = report
+        selection_reports = analyze_development(df, disease, config, args, disease_dir, checkpoint)
+        if args.smoke_only:
+            results[slug] = {"status": "development_smoke_completed",
+                             "prespecified_pgs": disease["candidates"][0],
+                             "development": selection_reports}
+            checkpoint.publish()
+            publish_status(args.checkpoint_uri, "smoke_completed")
+            continue
         selected, losses = select_development_score(selection_reports, config["horizons_years"])
         # Commit the choice before any outer-test fit/evaluation. Every method
         # below receives this same score and exactly the same cohort rows.
@@ -753,12 +795,14 @@ def run(args):
     write_json(args.output / "metrics.json", results)
     write_json(args.output / "provenance.json", {
         "config": config, "runtime_image": image, "gamfit_build": gamfit.build_info(),
+        "requested_endpoint": endpoint,
         "execution_account": execution_account,
         "packages": {d.metadata["Name"]: d.version for d in importlib.metadata.distributions()},
         "input_sha256": {key: digest(getattr(args, key)) for key in ["config", "scores", "ancestry", "prune", "phenotypes"]},
         "runner_sha256": digest(__file__), "selector_sha256": digest(Path(__file__).with_name("disease_selection.py")),
         "query_job_ids": prepared["query_job_ids"],
-        "analysis_status": "cohort_only" if args.prepare_only else "completed",
+        "analysis_status": ("cohort_only" if args.prepare_only else
+                            "development_smoke" if args.smoke_only else "completed"),
         "target": "first qualifying recorded disease after primary consent, competing death",
         "baseline": "AoU primary-consent date (Consent PII Module descendants); continuous EHR lookback",
         "validation": "group holdout after published relatedness prune; 75/25 development split within outer training selects PGS; outer test evaluates matched methods",
@@ -769,6 +813,8 @@ def run(args):
         "censoring_model": "training-only reverse Kaplan-Meier stratified by reported genetic ancestry",
     })
     checkpoint.publish()
+    if not args.prepare_only and not args.smoke_only:
+        publish_status(args.checkpoint_uri, "analysis_completed")
     print("Completed bounded pilot; aggregate metrics and provenance written", flush=True)
 
 
@@ -776,11 +822,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     run_parser = sub.add_parser("run")
-    for name in ["config", "phenotypes", "scores", "ancestry", "prune", "runtime-image", "score-panel", "output"]:
+    for name in ["config", "phenotypes", "scores", "ancestry", "prune", "runtime-image", "score-panel", "endpoint-config", "output"]:
         run_parser.add_argument(f"--{name}", type=Path, required=True)
     run_parser.add_argument("--checkpoint-uri", required=True)
     run_parser.add_argument("--resume", type=Path)
-    run_parser.add_argument("--prepare-only", action="store_true")
+    mode = run_parser.add_mutually_exclusive_group()
+    mode.add_argument("--prepare-only", action="store_true")
+    mode.add_argument("--smoke-only", action="store_true")
     fit_parser = sub.add_parser("fit")
     for name in ["frame", "config", "output"]:
         fit_parser.add_argument(f"--{name}", type=Path, required=True)
@@ -795,7 +843,14 @@ def main():
     transform_parser.add_argument("--fold", type=int, required=True)
     args = parser.parse_args()
     if args.command == "run":
-        run(args)
+        try:
+            run(args)
+        except Exception as error:
+            try:
+                publish_status(args.checkpoint_uri, failure_label(error))
+            except Exception:
+                print("Could not publish the fixed failure label; inspect workspace logs", file=sys.stderr)
+            raise
     elif args.command == "transform":
         fit_transform(args.frame, args.config, args.normalizer, args.fold, args.output)
     else:

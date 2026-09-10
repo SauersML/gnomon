@@ -9,6 +9,7 @@ import tarfile
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -17,6 +18,7 @@ import pandas as pd
 import aou_survival as aou
 import submit_aou
 from aou_identity import check_account
+from aou_status import failure_label, publish_status
 import disease_selection as selection
 import aou_score_transform as transforms
 from aou_checkpoint import StudyCheckpoint
@@ -24,6 +26,46 @@ from aou_evaluation import audit_groups, paired_loss_summary
 
 
 class SurvivalContractTests(unittest.TestCase):
+    def test_status_labels_never_contain_exception_text_or_runtime_data(self):
+        self.assertEqual(failure_label(ValueError("participant 123456789 bad input")), "failed_other")
+        self.assertEqual(failure_label(ValueError("relatedness prune contains invalid research IDs")), "failed_prune_schema")
+        with patch("aou_status.task_account") as account:
+            with self.assertRaisesRegex(ValueError, "fixed public label"):
+                publish_status("gs://workspace/checkpoint", "participant_123456789")
+        account.assert_not_called()
+
+    def test_published_prune_headerless_first_id_is_not_lost(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ancestry, prune = Path(tmp) / "ancestry.tsv", Path(tmp) / "prune.tsv"
+            ancestry.write_text("research_id\tpca_features\tancestry_pred\n"
+                                "101\t[0.1, 0.2]\teur\n102\t[0.3, 0.4]\tafr\n"
+                                "103\t[0.5, 0.6]\tamr\n")
+            for content in ("101\n103\n", "research_id\n101\n103\n"):
+                prune.write_text(content)
+                remaining = aou.read_ancestry(ancestry, prune, 2)
+                self.assertEqual(remaining.person_id.tolist(), ["102"])
+                np.testing.assert_allclose(remaining[["PC1", "PC2"]], [[.3, .4]])
+            for content in ("wrong_header\n101\n", "101\n\n103\n", "101\t103\n"):
+                prune.write_text(content)
+                with self.assertRaisesRegex(ValueError, "relatedness prune"):
+                    aou.read_ancestry(ancestry, prune, 2)
+
+    def test_smoke_fit_never_passes_outer_test_to_model_or_selects_a_score(self):
+        frame = pd.DataFrame({"person_id": np.arange(200), "split_group": np.arange(200),
+                              "is_train": np.arange(200) < 160,
+                              "PGS004536": np.arange(200) * .1, "PGS001783": np.arange(200) * -.2})
+        disease = {"candidates": ["PGS004536", "PGS001783"]}
+        with patch.object(aou, "analyze_partition", return_value=({"smoke": "checked"}, {})) as fit, \
+             patch.object(aou, "select_development_score") as select:
+            result = aou.analyze_development(frame, disease, {"seed": 13, "crossfit_folds": 2},
+                SimpleNamespace(smoke_only=True), Path("results/endpoint"), object())
+        fit.assert_called_once()
+        fitted = fit.call_args.args[0]
+        self.assertTrue(set(fitted.person_id).isdisjoint(set(frame.loc[~frame.is_train, "person_id"])))
+        np.testing.assert_array_equal(fitted.PGS, fitted.PGS004536)
+        self.assertEqual(set(result), {"PGS004536"})
+        select.assert_not_called()
+
     def test_score_panel_excludes_upstream_aou_training(self):
         panel = aou.load_score_panel(Path(__file__).with_name("aou_pgs_panel.json"))
         self.assertEqual(set(panel["endpoints"]), {"copd", "hypertension", "obesity"})
