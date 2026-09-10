@@ -4344,7 +4344,16 @@ theorem sigmaTagTargetAt_diagonal_hwe {p q : ℕ}
   have hr : 0 ≤ tagAlleleFreqRetentionAt m t i := div_nonneg ht hs.le
   rw [sigmaTagTargetAt_diagonal m t i hr, hvariance]
   unfold tagAlleleFreqRetentionAt
-  field_simp [ne_of_gt hs] <;> ring
+  let sourceVariance := 2 * m.tagAlleleFreqSource i * (1 - m.tagAlleleFreqSource i)
+  let targetVariance := 2 * tagAlleleFreqTargetAt m t i * (1 - tagAlleleFreqTargetAt m t i)
+  let modifier := ldCorrelationDecay (m.tagDistance i i)
+    (m.popGen.fstTransientAt t) m.popGen.recomb *
+    m.popGen.mutationSharedRetentionAt t * m.popGen.migrationSharedBoostAt t
+  change sourceVariance * (modifier * (targetVariance / sourceVariance)) =
+    targetVariance * modifier
+  calc
+    _ = (targetVariance / sourceVariance) * sourceVariance * modifier := by ring
+    _ = targetVariance * modifier := by rw [div_mul_cancel₀ _ (ne_of_gt hs)]
 
 /-- Time-varying target tag-to-causal alignment. This is the explicit tagging
 quality surface, driven by LD decay, allele-frequency divergence, mutation,
