@@ -24,7 +24,9 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install workflow validation dependencies
-        run: pip install --only-binary=:all: numpy pandas scipy scikit-learn pyarrow google-cloud-bigquery google-cloud-storage miniwdl
+        run: >-
+          pip install --only-binary=:all: numpy pandas scipy scikit-learn pyarrow
+          google-cloud-bigquery google-cloud-storage miniwdl
       - name: Validate prospective workflow contracts
         working-directory: examples/biobank
         run: |
