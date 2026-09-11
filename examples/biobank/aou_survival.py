@@ -465,6 +465,7 @@ def fit_worker(frame_path, config_path, model_kind, cause, output, normalizer, t
     pc_args = ", ".join(pc_cols)
     baseline = f"s(age0, k=8) + sex + duchon({pc_args}, centers={config['baseline_centers']}, scale_dims=true)"
     slope = "1" if model_kind == "constant" else f"1 + duchon({pc_args}, centers={config['slope_centers']}, scale_dims=true)"
+    print("worker_fit_started", flush=True)
     if model_kind in ("baseline", "ordinary"):
         rhs = baseline
         if model_kind == "ordinary":
@@ -479,6 +480,8 @@ def fit_worker(frame_path, config_path, model_kind, cause, output, normalizer, t
                            slope_formula=slope, config={"frozen_score": True,
                                "time_num_internal_knots": config["time_num_internal_knots"]},
                            persistent_warm_start_root=output / "warm")
+    model.save(output / "model.gamfit")
+    print("worker_fit_saved", flush=True)
     if model_kind != "baseline":
         transformer = gamfit.load(transform_path)
         replay_z = transformed_score(transformer, normalizer,
@@ -494,8 +497,9 @@ def fit_worker(frame_path, config_path, model_kind, cause, output, normalizer, t
     test["event"] = 0
     test["followup"] = horizons[-1]
     prediction = model.predict(test)
+    print("worker_grid_started", flush=True)
     h = np.asarray(prediction.cumulative_hazard_at(grid))
-    model.save(output / "model.gamfit")
+    print("worker_grid_complete", flush=True)
     if normalizer == "ctn" and model_kind in ("constant", "pc_varying"):
         from aou_score_transform import stage1_rhs
         recipe = gamfit.CtnStage1("PGS", stage1_rhs(config), fold_column="inner_fold",
@@ -524,6 +528,7 @@ def fit_worker(frame_path, config_path, model_kind, cause, output, normalizer, t
             and np.allclose(alone, h[[0]], rtol=1e-7, atol=1e-9)):
         raise ValueError("prediction changes with batch composition or row ordering")
     np.savez(output / "hazards.npz", hazards=h, grid=grid, coarse=coarse)
+    print("worker_validation_complete", flush=True)
 
 
 def bounded_fit(command, timeout_seconds, log):
