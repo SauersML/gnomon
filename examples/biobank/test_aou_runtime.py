@@ -9,6 +9,7 @@ import pandas as pd
 
 from aou_survival import bounded_fit, cif_from_hazards
 from reference_ctn import load_reference
+from aou_score_transform import transformed_score
 
 
 def main():
@@ -31,7 +32,9 @@ def main():
         [args.reference_ctn], args.output / "reference", pgs_id, len(pcs), args.projection_sha256)
     frame = reference.sample(n=n, random_state=915).rename(columns={score_columns[0]: "PGS"})
     frame = frame[["PGS", *pcs]].reset_index(drop=True)
-    frame["Z_ctn"] = transform.transformation_score(frame)
+    frame["baseline"] = pd.Timestamp("2020-01-01")
+    frame["death_date"] = pd.NaT
+    frame["Z_ctn"] = transformed_score(transform, "ctn", frame, len(pcs))
     event_time = rng.exponential(np.exp(-.25 * frame.Z_ctn.to_numpy()) * 2)
     censor_time = rng.uniform(1, 5, n)
     frame = frame.assign(**{"age0": rng.uniform(40, 70, n),

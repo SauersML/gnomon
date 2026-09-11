@@ -8,10 +8,13 @@ def baseline_columns(config):
     return ["age0", "sex", *[f"PC{i + 1}" for i in range(config["num_pcs"])]]
 
 
-def transformed_score(model, kind, data):
+def transformed_score(model, kind, data, num_pcs):
     if kind != "ctn":
         raise ValueError("the workflow requires a frozen external CTN")
-    z = np.asarray(model.transformation_score(data), dtype=float)
+    # Cohort frames also contain dates, outcomes and identifiers. The external
+    # CTN only consumes its observed score and frozen PC coordinates.
+    predictors = data[["PGS", *[f"PC{i + 1}" for i in range(num_pcs)]]]
+    z = np.asarray(model.transformation_score(predictors), dtype=float)
     if z.shape != (len(data),) or not np.isfinite(z).all():
         raise ValueError("score transformation produced invalid latent scores")
     return z

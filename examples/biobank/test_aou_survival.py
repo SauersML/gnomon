@@ -390,13 +390,16 @@ class SurvivalContractTests(unittest.TestCase):
 
     def test_score_api_does_not_use_ctn_mean_prediction(self):
         from unittest.mock import Mock
-        data = pd.DataFrame({"PGS": [2., 5.]})
+        data = pd.DataFrame({"PGS": [2., 5.], "PC1": [-1., 1.],
+                             "baseline": pd.to_datetime(["2020-01-01", "2021-01-01"]),
+                             "death_date": [pd.NaT, pd.NaT], "event_code": [1, 0]})
         model = Mock()
         model.transformation_score.return_value = np.array([-.5, .5])
-        np.testing.assert_array_equal(transforms.transformed_score(model, "ctn", data), [-.5, .5])
+        np.testing.assert_array_equal(transforms.transformed_score(model, "ctn", data, 1), [-.5, .5])
+        pd.testing.assert_frame_equal(model.transformation_score.call_args.args[0], data[["PGS", "PC1"]])
         model.predict.assert_not_called()
         with self.assertRaisesRegex(ValueError, "frozen external CTN"):
-            transforms.transformed_score(model, "location_scale", data)
+            transforms.transformed_score(model, "location_scale", data, 1)
 
     def test_enrollment_lookback_is_required_without_future_survival_requirement(self):
         count = 20

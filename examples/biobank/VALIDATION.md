@@ -67,8 +67,16 @@ Genomes CTN was submitted and reached Workbench `RUNNING`. It uses GAM commit
 score fit, with the outer test set untouched, at most 20,000 sampled cohort
 rows, four CPUs, 16 GiB RAM, 180 seconds per fit and a 30-minute task limit.
 It fits disease and competing-death components and records checkpoints inside
-the authorized workspace. This is an actual training attempt, not evidence of
-successful convergence or calibrated predictions; completion remains pending.
+the authorized workspace. It passed real cohort preparation, then failed while
+applying the external CTN, before the disease-model fit.
+
+A public-reference MSI reproducer showed that passing the whole cohort frame
+to CTN includes Arrow timestamp columns unsupported by GAM. The corrected
+score adapter selects only PGS and the configured PCs at every transformation
+call, excluding dates, outcomes, and identifiers. The saved real CTN replayed
+successfully through that corrected adapter; all 27 contract tests and WDL
+validation passed. This does not replace the separate survival convergence
+check or establish successful AoU training.
 
 ## Prior native artifact and historical checks
 

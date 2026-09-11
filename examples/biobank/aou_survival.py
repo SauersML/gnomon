@@ -487,7 +487,7 @@ def predict_bundle(directory, baseline_data, times):
     data["entry"], data["followup"], data["event"] = 0., times[-1], 0
     if spec["kind"] != "baseline":
         transform = gamfit.load(directory / "transform.gamfit")
-        data["Z"] = transformed_score(transform, spec["normalizer"], baseline_data[["PGS", *columns]])
+        data["Z"] = transformed_score(transform, spec["normalizer"], baseline_data, spec["num_pcs"])
     model = gamfit.load(directory / "model.gamfit")
     return np.asarray(model.predict(data).cumulative_hazard_at(times))
 
@@ -527,7 +527,7 @@ def fit_worker(frame_path, config_path, model_kind, cause, output, normalizer, t
     if model_kind != "baseline":
         transformer = gamfit.load(transform_path)
         replay_z = transformed_score(transformer, normalizer,
-                                     df.loc[~df.is_train, ["PGS", *baseline_columns(config)]])
+                                     df.loc[~df.is_train], config["num_pcs"])
         if not np.allclose(test.Z, replay_z, rtol=1e-8, atol=1e-10):
             raise ValueError("deployment transform disagrees with held-out score artifact")
         test["Z"] = replay_z
@@ -619,7 +619,7 @@ def analyze_partition(df, config, args, disease_dir, checkpoint, candidates, pgs
                                                pgs, config["num_pcs"], config["projection_model_sha256"])
         transforms[normalizer] = path
         publish_status(args.checkpoint_uri, "applying_reference_ctn")
-        df[f"Z_{normalizer}"] = transformed_score(model, normalizer, df)
+        df[f"Z_{normalizer}"] = transformed_score(model, normalizer, df, config["num_pcs"])
         publish_status(args.checkpoint_uri, "score_transform_ready")
         transform_diagnostics[normalizer] = score_diagnostics(
             df.loc[~df.is_train, f"Z_{normalizer}"].to_numpy(), groups, config["min_report_count"])
