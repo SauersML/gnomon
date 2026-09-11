@@ -78,6 +78,12 @@ successfully through that corrected adapter; all 27 contract tests and WDL
 validation passed. This does not replace the separate survival convergence
 check or establish successful AoU training.
 
+The in-workspace diagnostic reported the GAM error in `transformed_score`.
+A corrected real run using commit `dd8dad7c` was submitted with the same cohort
+definition, runtime, reference transform, and resource caps and reached
+Workbench `RUNNING`. The diagnostic completed; fitted-model acceptance for
+the corrected run is still pending.
+
 ## Prior native artifact and historical checks
 
 - Release: `gamfit-0.1.267-cp310-abi3-manylinux_2_28_x86_64.whl`.
