@@ -1,6 +1,6 @@
 # AoU workflow validation
 
-Recorded 2026-09-11 UTC. Synthetic checks run on MSI; participant computation
+Recorded 2026-09-11 UTC. Synthetic checks run on MSI or GitHub Actions; participant computation
 and all participant artifacts remain inside the AoU workspace.
 
 ## Native composition acceptance
@@ -25,11 +25,11 @@ clustered-PC convergence or successful AoU outcome fitting.
 
 Publication of `gamfit 0.1.268` is tracked by
 [workflow 34632917720](https://github.com/SauersML/gam/actions/runs/34632917720).
-No new participant run is authorized by a version number alone: the regenerated
+A version number alone does not establish input compatibility: the regenerated
 reference and reference/target effective score identity still need validation.
 
 The updated lightweight contracts passed in
-[workflow 34625666867](https://github.com/SauersML/gnomon/actions/runs/34625666867):
+[workflow 34633275335](https://github.com/SauersML/gnomon/actions/runs/34633275335):
 27 prospective-workflow tests, miniwdl validation, and four simulation
 completion tests. These checks do not execute the native outcome model.
 
@@ -41,7 +41,7 @@ a completed training run or a diagnosis of the numerical cause. No additional
 AoU run has been submitted while the native integration and input contracts
 are being repaired.
 
-The following results describe earlier revisions, not the unvalidated native
+The following results describe earlier revisions, not the current native
 composition update. Reference/target effective score identity and completed
 upstream provenance remain required before final analysis.
 
