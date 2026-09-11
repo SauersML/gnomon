@@ -87,6 +87,7 @@ class SurvivalContractTests(unittest.TestCase):
                     "complete/fit.log": "ModuleNotFoundError: private completed history",
                     "complete/completed.json": "{}",
                     "unfinished/fit.log": "ValueError: private unfinished history",
+                    "fit.log": "Could not determine input format for private-input\n> Progress: 5/10 variants (50%)",
                 }.items():
                     member = tarfile.TarInfo(name)
                     encoded = content.encode()
@@ -102,7 +103,9 @@ class SurvivalContractTests(unittest.TestCase):
                 os.chdir(previous)
             labels = {path.name: path.read_text() for path in directory.glob("diagnostic__*.txt")}
             self.assertEqual(labels, {"diagnostic__runtime_error.txt": "runtime_error\n",
-                                      "diagnostic__value_error.txt": "value_error\n"})
+                                      "diagnostic__value_error.txt": "value_error\n",
+                                      "diagnostic__score_input_format.txt": "score_input_format\n",
+                                      "diagnostic__score_progress_50_74.txt": "score_progress_50_74\n"})
 
     def test_sparse_censoring_support_is_not_reported_as_valid_accuracy(self):
         train = pd.DataFrame({"event_code": [1, 2] * 30, "followup": [2.] * 60,

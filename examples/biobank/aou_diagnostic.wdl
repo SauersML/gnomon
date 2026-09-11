@@ -89,7 +89,7 @@ task diagnose {
                 raise ValueError("checkpoint exceeds diagnostic size budget")
             names = {member.name for member in members}
             unfinished = [member for member in members if member.isfile()
-                          and member.name.endswith("/fit.log")
+                          and Path(member.name).name == "fit.log"
                           and str(Path(member.name).parent / "completed.json") not in names]
             if len(unfinished) > 16:
                 raise ValueError("checkpoint exceeds diagnostic worker budget")
@@ -98,6 +98,13 @@ task diagnose {
                     handle.seek(max(0, member.size - 262144))
                     log += "\n" + handle.read().decode("utf-8", errors="replace").lower()
     signatures = {
+        "score_input_format": "could not determine input format",
+        "score_indexing": "stage 1: indexing subject data",
+        "score_columns": "stage 2: discovering all score columns",
+        "score_preparing": "stage 3: streaming and collecting data",
+        "score_matrices": "stage 4: verifying data",
+        "score_computing": "resource allocation complete",
+        "score_computed": "computation finished",
         "credential_override": "credential-file overrides are not allowed",
         "forbidden_identity": "refusing an execution account",
         "invalid_identity": "cannot establish the execution account",
@@ -188,6 +195,17 @@ task diagnose {
         "syntax_error": "syntaxerror:",
     }
     matched = [label for label, phrase in signatures.items() if phrase in log]
+    progress = re.findall(r"> progress: \d+/\d+ variants \((\d+)%\)", log)
+    if progress:
+        percent = int(progress[-1])
+        if not 0 <= percent <= 100:
+            raise ValueError("native progress percentage is outside its contract")
+        # Fixed performance categories only; never emit participant/variant
+        # counts, identifiers, arbitrary log text, or exception messages.
+        bucket = ("0" if percent == 0 else "1_24" if percent < 25 else
+                  "25_49" if percent < 50 else "50_74" if percent < 75 else
+                  "75_99" if percent < 100 else "100")
+        matched.append("score_progress_" + bucket)
     if not matched:
         matched = ["empty_log" if not log.strip() else "unclassified_failure"]
     for label in matched:
