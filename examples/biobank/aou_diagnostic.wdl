@@ -9,11 +9,13 @@ workflow aou_diagnostic {
     String runtime_image
     File? relatedness_prune
     File? checkpoint
+    Array[File] score_files = []
+    String score_id = ""
   }
   call diagnose {
     input: task_stderr = task_stderr, identity_guard = identity_guard,
            runtime_image = runtime_image, relatedness_prune = relatedness_prune,
-           checkpoint = checkpoint
+           checkpoint = checkpoint, score_files = score_files, score_id = score_id
   }
   output { Array[File] diagnostics = diagnose.diagnostics }
 }
@@ -25,18 +27,42 @@ task diagnose {
     String runtime_image
     File? relatedness_prune
     File? checkpoint
+    Array[File] score_files
+    String score_id
   }
   command <<<
     set -euo pipefail
     cp "~{identity_guard}" aou_identity.py
+    cp "~{write_json(score_files)}" score_files.json
+    cp "~{write_json(score_id)}" score_id.json
     timeout --kill-after=5s 90s python - "~{task_stderr}" "~{default="" relatedness_prune}" "~{default="" checkpoint}" <<'PY'
     from pathlib import Path
     import re
     import sys
     import tarfile
+    import json
     from aou_identity import task_account
 
     task_account()
+    score_files = json.loads(Path("score_files.json").read_text())
+    score_id = json.loads(Path("score_id.json").read_text())
+    if len(score_files) > 4 or (score_files and not re.fullmatch(r"PGS\d{6}", score_id)):
+        raise ValueError("score schema inspection needs at most four files and one Catalog ID")
+    for index, score_file in enumerate(score_files):
+        with Path(score_file).open() as handle:
+            header = []
+            for _ in range(32):
+                fields = handle.readline(8192).rstrip().split("\t")
+                if fields[0] in ("#IID", "IID"):
+                    header = fields
+                    break
+                if not fields[0].startswith("#"):
+                    break
+        for suffix, label in (("_AVG", "average"), ("_MISSING_PCT", "missingness"),
+                              ("_SUM", "sum"), ("_MISSING_CT", "missing_count")):
+            state = "present" if score_id + suffix in header else "absent"
+            name = f"score_file_{index}_{label}_{state}"
+            Path(f"diagnostic__{name}.txt").write_text(name + "\n")
     if sys.argv[2]:
         with Path(sys.argv[2]).open() as handle:
             fields = handle.readline(8192).strip().split("\t")
