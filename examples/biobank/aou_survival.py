@@ -565,6 +565,15 @@ def bounded_fit(command, timeout_seconds, log):
             raise RuntimeError("fit failed; inspect the private task fit log")
 
 
+def checkpointed_fit(command, timeout_seconds, log, checkpoint):
+    """Retain private failure logs and partial fits without a completion receipt."""
+    try:
+        bounded_fit(command, timeout_seconds, log)
+    except BaseException:
+        checkpoint.publish()
+        raise
+
+
 def analyze_partition(df, config, args, disease_dir, checkpoint, candidates):
     """Analyze an explicit development or outer-test partition with bounded steps."""
     df = df.copy()
@@ -590,7 +599,7 @@ def analyze_partition(df, config, args, disease_dir, checkpoint, candidates):
             print(f"Transforming {slug}: {normalizer}, fold {fold}", flush=True)
             if not checkpoint.step_is_complete(stage_dir, model=True):
                 publish_status(args.checkpoint_uri, "transforming_score")
-                bounded_fit(command, config["stage1_timeout_seconds"], stage_dir / "fit.log")
+                checkpointed_fit(command, config["stage1_timeout_seconds"], stage_dir / "fit.log", checkpoint)
                 files = ["scores.npz", "transform.gamfit"]
                 if fold < 0:
                     files.append("training_replay.npy")
@@ -625,7 +634,7 @@ def analyze_partition(df, config, args, disease_dir, checkpoint, candidates):
             print(f"Fitting {slug}: {candidate}, cause {cause}", flush=True)
             if not checkpoint.step_is_complete(fit_dir, model=True):
                 publish_status(args.checkpoint_uri, "fitting_disease" if cause == 1 else "fitting_death")
-                bounded_fit(command, config["fit_timeout_seconds"], fit_dir / "fit.log")
+                checkpointed_fit(command, config["fit_timeout_seconds"], fit_dir / "fit.log", checkpoint)
                 files = ["hazards.npz", "model.gamfit", "spec.json"]
                 if kind != "baseline":
                     files.append("transform.gamfit")

@@ -27,6 +27,22 @@ from aou_evaluation import audit_groups, paired_loss_summary
 
 
 class SurvivalContractTests(unittest.TestCase):
+    def test_failed_worker_retains_private_log_without_completion_receipt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            checkpoint = StudyCheckpoint(directory, "gs://workspace/checkpoint.tar.gz",
+                                         "project", "runtime@example.org", {})
+            retained = []
+            def publish():
+                retained.append((directory / "fit.log").read_text())
+            with patch.object(checkpoint, "publish", side_effect=publish):
+                with self.assertRaisesRegex(RuntimeError, "fit failed"):
+                    aou.checkpointed_fit(
+                        [sys.executable, "-c", "print('worker failure evidence'); raise SystemExit(1)"],
+                        5, directory / "fit.log", checkpoint)
+            self.assertEqual(retained, ["worker failure evidence\n"])
+            self.assertFalse(checkpoint.step_is_complete(directory, model=True))
+
     def test_primary_pilot_does_not_depend_on_challenger_availability(self):
         disease = {"candidates": ["PGS004525", "PGS004603"]}
         first = pd.DataFrame({"person_id": ["101", "102"], "PGS": [0.2, 0.8]})
