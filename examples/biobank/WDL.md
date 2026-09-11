@@ -98,11 +98,11 @@ stable under save/load, row ordering and batch membership. The CIF grid
 refinement error must be at most 0.001. Prediction horizons are explicit;
 observed diagnosis/censoring times are excluded from prediction inputs.
 
-Metrics include horizon-specific IPCW Brier score, mean-risk discrepancy,
-fixed risk-bin calibration, and paired loss differences. Audits cover ancestry,
+Metrics include horizon-specific IPCW Brier score with group-robust uncertainty,
+mean-risk discrepancy, and fixed risk-bin calibration. Audits cover ancestry,
 sex, age bands and training-defined PC neighborhoods, including points outside
 their support. Sparse cells are suppressed, not certified as calibrated.
-Paired uncertainty is conditional on fitted models and censoring estimates.
+Loss uncertainty is conditional on fitted models and censoring estimates.
 
 Censoring uses training-only ancestry-stratified reverse Kaplan–Meier. This
 assumes sufficient independence within those strata and does not account for

@@ -25,7 +25,7 @@ import disease_selection as selection
 import aou_score_transform as transforms
 import reference_ctn
 from aou_checkpoint import StudyCheckpoint
-from aou_evaluation import audit_groups, paired_loss_summary
+from aou_evaluation import audit_groups, loss_summary
 
 
 class SurvivalContractTests(unittest.TestCase):
@@ -186,7 +186,7 @@ class SurvivalContractTests(unittest.TestCase):
                               "is_train": np.arange(200) < 160,
                               "PGS004536": np.arange(200) * .1, "PGS001783": np.arange(200) * -.2})
         disease = {"candidates": ["PGS004536"]}
-        with patch.object(aou, "analyze_partition", return_value=({"smoke": "checked"}, {})) as fit:
+        with patch.object(aou, "analyze_partition", return_value={"smoke": "checked"}) as fit:
             result = aou.analyze_development(frame, disease, {"seed": 13},
                 SimpleNamespace(smoke_only=True), Path("results/endpoint"), object())
         fit.assert_called_once()
@@ -239,11 +239,11 @@ class SurvivalContractTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "relative regular"):
                 cp.restore(archive, {"input": "a"})
 
-    def test_paired_loss_and_training_defined_pc_support(self):
+    def test_loss_uncertainty_and_training_defined_pc_support(self):
         delta = np.array([1., 2., 3., 4.])
-        result = paired_loss_summary(delta, np.zeros(4), np.ones(4, bool), np.arange(4))
-        self.assertAlmostEqual(result["brier_improvement"], 2.5)
-        self.assertAlmostEqual(result["standard_error"], delta.std(ddof=1) / 2)
+        result = loss_summary(delta, np.arange(4))
+        self.assertAlmostEqual(result["brier"], 2.5)
+        self.assertAlmostEqual(result["brier_standard_error"], delta.std(ddof=1) / 2)
         train = pd.DataFrame({"PC1": np.linspace(-1, 1, 40), "ancestry": "a", "sex": 0, "age0": 50})
         test = train.iloc[:3].copy()
         test.loc[test.index[-1], "PC1"] = 1000

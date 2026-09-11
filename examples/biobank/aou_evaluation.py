@@ -1,4 +1,4 @@
-"""Training-defined audit regions and paired held-out probability losses."""
+"""Training-defined audit regions and held-out probability loss uncertainty."""
 from __future__ import annotations
 
 import numpy as np
@@ -39,15 +39,14 @@ def audit_groups(train, test):
     return groups
 
 
-def paired_loss_summary(reference_loss, model_loss, mask, group_ids):
+def loss_summary(loss, group_ids):
     """Cluster-robust SE, conditional on fitted models and censoring weights."""
-    delta = (np.asarray(reference_loss) - np.asarray(model_loss))[mask]
-    groups = np.asarray(group_ids)[mask]
-    mean = float(delta.mean())
-    cluster_sums = pd.Series(delta - mean).groupby(groups, sort=False).sum().to_numpy()
+    loss = np.asarray(loss)
+    mean = float(loss.mean())
+    cluster_sums = pd.Series(loss - mean).groupby(np.asarray(group_ids), sort=False).sum().to_numpy()
     count = len(cluster_sums)
     if count < 2:
-        raise ValueError("paired uncertainty needs at least two held-out groups")
-    se = float(np.sqrt(count / (count - 1) * np.sum(cluster_sums**2) / len(delta)**2))
-    return {"brier_improvement": mean, "standard_error": se,
-            "conditional_95_interval": [mean - 1.959963984540054*se, mean + 1.959963984540054*se]}
+        raise ValueError("loss uncertainty needs at least two held-out groups")
+    se = float(np.sqrt(count / (count - 1) * np.sum(cluster_sums**2) / len(loss)**2))
+    return {"brier": mean, "brier_standard_error": se,
+            "brier_conditional_95_interval": [mean - 1.959963984540054*se, mean + 1.959963984540054*se]}

@@ -3,14 +3,30 @@
 Recorded 2026-09-11 UTC. Synthetic checks run on MSI; participant computation
 and all participant artifacts remain inside the AoU workspace.
 
-## Native composition update in progress
+## Native composition acceptance
 
 The workflow now specifies one score and one PC-varying marginal-slope model,
 with disease and competing-death components. The Python workflow delegates the
 saved CTN/outcome composition to GAM's native model. This requires the native
-GAM update in [PR #2886](https://github.com/SauersML/gam/pull/2886), which is still
-under validation; the previous wheel and reference model are not acceptance
-evidence for the new payload format.
+GAM update in [PR #2886](https://github.com/SauersML/gam/pull/2886), merged into
+main as `9c0e6b4845581532d72d45f7b3c99cb38c1c7854`. The previous reference model
+must be refitted for native payload version 16; old archives are rejected.
+
+The exact native runtime at `e6b2b97539c74ebdb62d86db29154165b077601a`
+built its Linux CLI and wheel in
+[workflow 34631414624](https://github.com/SauersML/gam/actions/runs/34631414624).
+[Acceptance 34631371815](https://github.com/SauersML/gam/actions/runs/34631371815)
+passed in 3.39 seconds: CTN recipe and frozen-transform validation, cross-fitted
+CTN training, explicit transform/outcome equivalence, save/load, row order,
+single-row prediction, and finite monotone survival. Subsequent merged changes
+are workflow, changelog and source-integrity records only. The source-integrity
+gate passed in run 34632149937. This small native contract does not establish
+clustered-PC convergence or successful AoU outcome fitting.
+
+Publication of `gamfit 0.1.268` is tracked by
+[workflow 34632917720](https://github.com/SauersML/gam/actions/runs/34632917720).
+No new participant run is authorized by a version number alone: the regenerated
+reference and reference/target effective score identity still need validation.
 
 The updated lightweight contracts passed in
 [workflow 34625666867](https://github.com/SauersML/gnomon/actions/runs/34625666867):
