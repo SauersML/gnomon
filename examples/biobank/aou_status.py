@@ -18,6 +18,8 @@ LABELS = frozenset({
     "failed_score_missingness_absent", "failed_score_missingness_invalid",
     "failed_score_completely_missing", "failed_score_source_ambiguous",
     "preparing_score_cohort", "scoring", "score_artifact_ready",
+    "failed_scoring_permissions", "failed_scoring_credentials", "failed_scoring_input",
+    "failed_scoring_cli", "failed_scoring_tls", "failed_scoring_runtime",
 })
 
 

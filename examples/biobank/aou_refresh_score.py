@@ -5,12 +5,14 @@ import argparse
 import json
 import os
 from pathlib import Path
+import shutil
 import tarfile
 
 import numpy as np
 import pandas as pd
 
 from aou_identity import task_account
+from aou_checkpoint import StudyCheckpoint
 from aou_status import failure_label, publish_status
 from aou_survival import (BoundedClient, bounded_fit, build_cohort, case_dates,
                          digest, load_cached_score, load_score_panel, person_times,
@@ -94,9 +96,30 @@ def refresh(args):
     previous = Path.cwd()
     try:
         os.chdir(score_dir)
-        bounded_fit([str(args.scorer), "score", str(args.weights),
-                     specification["genotype_prefix"], "--keep", str(keep), "--emit-components"],
-                    specification["timeout_seconds"], args.output / "score.log")
+        try:
+            bounded_fit([str(args.scorer), "score", str(args.weights),
+                         specification["genotype_prefix"], "--keep", str(keep), "--emit-components"],
+                        specification["timeout_seconds"], args.output / "score.log")
+        except Exception:
+            # Preserve the native error in workspace storage even when WDL
+            # cannot delocalize successful outputs. Never export log text.
+            checkpoint = StudyCheckpoint(args.output / "diagnostic", args.status_uri + ".scoring",
+                                         config["google_project"], account, specification)
+            log = args.output / "score.log"
+            shutil.copyfile(log, checkpoint.root / "fit.log")
+            checkpoint.publish()
+            message = log.read_text(errors="replace").lower()
+            for phrases, label in (
+                (("permission denied", "403", "request violates vpc"), "failed_scoring_permissions"),
+                (("credentials", "unauthenticated", "401"), "failed_scoring_credentials"),
+                (("no such file", "not found", "404", "no filesets", "unsupported input"), "failed_scoring_input"),
+                (("unexpected argument", "unrecognized", "usage:"), "failed_scoring_cli"),
+                (("certificate", "tls", "ssl"), "failed_scoring_tls"),
+                (("panicked", "symbol lookup", "glibc"), "failed_scoring_runtime"),
+            ):
+                if any(phrase in message for phrase in phrases):
+                    publish_status(args.status_uri, label)
+            raise
     finally:
         os.chdir(previous)
     files = list(score_dir.glob("*.sscore"))
