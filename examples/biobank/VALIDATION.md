@@ -22,6 +22,13 @@ replay then passed. This is evidence for checked warm execution, not evidence
 that cold fits always meet that limit. Failed units must not receive completion
 receipts or be substituted for fitted models.
 
+The separate GAM `test_survival_marginal_slope_clustered_pc_808.py` raw-score,
+attained-age Matérn regression still exceeded its 90-second child-fit limit
+with this wheel. Invoking the test directly confirmed the numerical timeout
+independently of pytest collection. It is not marked fixed or passing. The
+AoU pilot uses the explicitly transformed, frozen-score Duchon pipeline above;
+its checked completion does not certify the other input route.
+
 ## Workflow contracts
 
 All 27 deterministic contract tests passed on MSI. Both WDL definitions passed
