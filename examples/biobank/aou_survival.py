@@ -725,13 +725,16 @@ def run(args):
             raise ValueError("no prespecified endpoint passed the existing disease selection rule")
         score_cache = unpack_score_cache(args.scores, args.output / "scores.tar")
         available_scores = cached_score_ids(score_cache)
+        for disease in diseases.values():
+            disease["missing_scores"] = sorted(set(disease["candidates"]) - available_scores)
+            for pgs in disease["missing_scores"]:
+                publish_status(args.checkpoint_uri, "missing_" + pgs.lower())
         publish_status(args.checkpoint_uri, "reading_ancestry")
         ancestry = read_ancestry(args.ancestry, args.prune, config["num_pcs"])
         publish_status(args.checkpoint_uri, "loading_person_times")
         base = ancestry.merge(person_times(client, config["workspace_cdr"]), on="person_id", validate="one_to_one")
         publish_status(args.checkpoint_uri, "preparing_cohort")
         for slug, disease in diseases.items():
-            disease["missing_scores"] = sorted(set(disease["candidates"]) - available_scores)
             if disease["missing_scores"]:
                 continue
             first, second = disease["candidates"]
