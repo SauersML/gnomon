@@ -214,7 +214,7 @@ Use a Linux Python 3.12 runtime image that supplies the system libraries those
 wheels require. The runtime image digest, installed versions, gamfit build
 information, source/input hashes, and query IDs are recorded in provenance.
 
-The configured panel contains up to three selected diseases, at most 20,000
+The default run contains one selected disease, at most 20,000
 outcome-blind sampled rows each, four CPUs, 16 GiB RAM, and 50 GiB disk.
 One reference CTN is trained externally per endpoint. Development and final
 evaluation require four cause-specific fits per endpoint and no AoU CTN fits.
