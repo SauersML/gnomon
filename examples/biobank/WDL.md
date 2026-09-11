@@ -22,8 +22,11 @@ are excluded. We do not require future disease-free observation to enter.
 Follow-up ends at the earliest qualifying diagnosis, primary death date
 from `aou_death`, or the covering observation interval's end. Multiple primary
 death reports are reduced to the earliest date per person before joining. Observation
-gaps are not bridged. Same-day disease/death ties are excluded because their
-ordering is unknown. This predicts recorded diagnosis, not biological onset.
+gaps are not bridged. Same-day disease/death ties retain the participant and
+give precedence to the recorded diagnosis; this is a day-level endpoint convention,
+not an inference of within-day ordering. Their count is reported subject to
+the same small-cell suppression as other counts. This predicts recorded
+diagnosis, not biological onset.
 The resolved CDR release is recorded; horizons must be supported by that
 release's actual follow-up.
 
@@ -39,47 +42,38 @@ headers, extra columns, and malformed rows are rejected.
 Remaining person IDs are the pilot's split groups. This is not
 full pedigree reconstruction or a claim that distant relatives are independent.
 
-## Score selection and matched models
+## Prespecified model
 
-The prespecified pairs are COPD PGS004536/PGS001783, hypertension
-PGS004525/PGS004603, and obesity PGS005199/PGS005331. The panel records exact
+The prespecified scores are COPD PGS004536, hypertension PGS004525,
+and obesity PGS005199. The panel records exact
 Catalog sources and pending component-provenance audits. PGS004787 is excluded
 because its documented score development includes AoU. Public cohort metadata
 does not establish participant-level non-overlap.
 
 Every required score must exist in the real cache as a unique
-`PGSnnnnnn_AVG` column with participant IDs. Missing scores are reported by
-preflight and stop model fitting; no score is substituted. Score pairs use the
-same complete-case cohort.
+`PGSnnnnnn_AVG` column with participant IDs and `PGSnnnnnn_MISSING_PCT`.
+Completely missing scores are rejected, including those represented as zero.
+Missing scores are reported by preflight and stop fitting; no score is substituted.
+Final analysis requires completed discovery, component and tuning provenance.
 
 A seeded group split reserves 20% as outer test. The remaining development
-sample is split 75/25 by group. Each candidate score gets its frozen external
-CTN plus the same PC-varying marginal-slope predictor. Only the outcome model
-is fitted on development-training rows.
-Mean development Brier score across the prespecified horizons selects the
-score. The choice is recorded before outer-test evaluation. Selection fails
-when either candidate lacks supported development metrics.
-
-The selected PGS is then shared by four outcome models refitted on outer training:
-
-- Flexible baseline without PGS.
-- External CTN with constant marginal slope.
-- External CTN with PC-varying marginal slope.
-- CTN with an ordinary varying-coefficient Gaussian transformation-survival model.
+sample is split 75/25 by group for development checks of the single
+PC-varying marginal-slope predictor. The score and model are prespecified;
+there is no challenger search. After development acceptance, the outcome model
+is fitted on outer training and evaluated on the locked test set.
 
 The baseline has age, sex and a joint six-PC Duchon surface (32 centers).
 The score surface has 16 centers and a time-constant signed slope. No frailty,
-ensemble, manifold or post-hoc calibration stack is enabled. The ordinary
-comparator uses Gaussian location–scale survival; its time representation and
-penalties differ, so this is not a pure unrestricted reparameterization test.
+ensemble, manifold or post-hoc calibration stack is enabled. The baseline and
+score-effect surfaces are separately penalized and jointly fitted.
 
 CTN is fitted once per PGS on an external genetic reference panel, conditional
 on PCs only. It is never fitted or updated on AoU rows. There are no internal
 AoU CTN folds. CTN uses `transformation_score`, never its conditional-mean
 `predict` operation. The model and manifest are required staged WDL inputs;
 missing, duplicate, mismatched or corrupt reference transforms stop the run.
-The saved outcome/transform pair is replayed together and checked for save/load
-and batch invariance. The outcome consumes `frozen_score`; no second
+GAM's native model embeds the saved CTN and replays it at prediction, with
+save/load and batch-invariance checks. No second
 normalization or influence absorber is fitted.
 
 `reference_ctn.py` trains and packages the external model from a real reference
@@ -104,11 +98,11 @@ stable under save/load, row ordering and batch membership. The CIF grid
 refinement error must be at most 0.001. Prediction horizons are explicit;
 observed diagnosis/censoring times are excluded from prediction inputs.
 
-Metrics include horizon-specific IPCW Brier score, mean-risk discrepancy,
-fixed risk-bin calibration, and paired loss differences. Audits cover ancestry,
+Metrics include horizon-specific IPCW Brier score with group-robust uncertainty,
+mean-risk discrepancy, and fixed risk-bin calibration. Audits cover ancestry,
 sex, age bands and training-defined PC neighborhoods, including points outside
 their support. Sparse cells are suppressed, not certified as calibrated.
-Paired uncertainty is conditional on fitted models and censoring estimates.
+Loss uncertainty is conditional on fitted models and censoring estimates.
 
 Censoring uses training-only ancestry-stratified reverse Kaplan–Meier. This
 assumes sufficient independence within those strata and does not account for
@@ -121,11 +115,10 @@ cohort fields, event counts and horizon support without fitting models.
 After that and native acceptance pass, `--smoke-only` fits the first
 prespecified score using only the development split: frozen external CTN and two
 cause-specific outcome models. Only that primary score must be cached for the
-smoke run; a missing challenger still blocks the later two-score comparison.
+smoke run and final analysis.
 It performs the same persistence, batching,
 monotonicity and CIF checks as the full analysis. It neither selects a score
-nor evaluates the outer test set. Primary-score and matched-comparison cohorts
-have separate checkpoint signatures because their score-coverage sets can differ.
+nor evaluates the outer test set. Checkpoint signatures bind the model and input definitions.
 The pilot caps rows, CPUs, query bytes/time and each fit's wall time.
 A failed step raises an error; its process group is stopped.
 
@@ -224,14 +217,12 @@ Use a Linux Python 3.12 runtime image that supplies the system libraries those
 wheels require. The runtime image digest, installed versions, gamfit build
 information, source/input hashes, and query IDs are recorded in provenance.
 
-The configured panel contains up to three selected diseases, at most 20,000
+The default run contains one selected disease, at most 20,000
 outcome-blind sampled rows each, four CPUs, 16 GiB RAM, and 50 GiB disk.
-Two candidate reference CTNs are trained externally per endpoint. Development
-selection and the four final matched comparisons require 12 cause-specific
-fits per endpoint and no AoU CTN fits. The external trainer uses an explicit
-two-interior-knot CTN response basis; larger shape budgets require a separate
-reference-data comparison. The outcome fits run
-with four interior time knots shared by all outcome-model comparisons, and
+One reference CTN is trained externally per endpoint. Development and final
+evaluation require four cause-specific fits per endpoint and no AoU CTN fits.
+The external trainer uses an explicit two-interior-knot CTN response basis.
+The outcome fits use the configured time basis and run
 sequentially with a checkpoint after each completed unit. Each fit has a
 180-second wall cap, each query a 120-second cap and a billed-byte ceiling;
 the command has a 30-minute cap and zero automatic retries. Temporary storage
@@ -239,7 +230,7 @@ and solver caches use the attached task disk. A child timeout terminates its
 process group. Insufficient training events fail before fitting. The primary-score
 smoke run records unsupported censoring-adjusted evaluation separately and emits
 no accuracy estimate for those horizons; finite predictions do not establish
-calibration. Score selection and matched comparisons still require censoring
+calibration. Final evaluation still requires censoring
 support before fitting. Increase the sample budget only after inspecting that
 signal. Failed-worker logs and partial models are checkpointed privately without
 a completion receipt. Population event frequencies

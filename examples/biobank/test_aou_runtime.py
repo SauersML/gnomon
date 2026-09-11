@@ -52,7 +52,6 @@ def main():
     config_path.write_text(json.dumps(config))
     bounded_fit([sys.executable, str(Path(__file__).with_name("aou_survival.py")), "fit",
                  "--frame", str(frame_path), "--config", str(config_path),
-                 "--kind", "pc_varying", "--normalizer", "ctn",
                  "--transform-model", str(transform_path),
                  "--cause", "1", "--output", str(args.output)],
                 90, args.output / "fit.log")

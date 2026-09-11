@@ -1,5 +1,5 @@
 # Resolve once into a staged Linux CPython 3.12 wheelhouse. No runtime downloads.
-gamfit==0.1.267
+gamfit==0.1.268
 numpy>=2.0,<3
 pandas>=2.3,<3
 google-cloud-bigquery>=3.27,<4

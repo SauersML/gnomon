@@ -1,7 +1,49 @@
 # AoU workflow validation
 
-Recorded 2026-09-11 UTC. Synthetic checks run on MSI; participant computation
+Recorded 2026-09-11 UTC. Synthetic checks run on MSI or GitHub Actions; participant computation
 and all participant artifacts remain inside the AoU workspace.
+
+## Native composition acceptance
+
+The workflow now specifies one score and one PC-varying marginal-slope model,
+with disease and competing-death components. The Python workflow delegates the
+saved CTN/outcome composition to GAM's native model. This requires the native
+GAM update in [PR #2886](https://github.com/SauersML/gam/pull/2886), merged into
+main as `9c0e6b4845581532d72d45f7b3c99cb38c1c7854`. The previous reference model
+must be refitted for native payload version 16; old archives are rejected.
+
+The exact native runtime at `e6b2b97539c74ebdb62d86db29154165b077601a`
+built its Linux CLI and wheel in
+[workflow 34631414624](https://github.com/SauersML/gam/actions/runs/34631414624).
+[Acceptance 34631371815](https://github.com/SauersML/gam/actions/runs/34631371815)
+passed in 3.39 seconds: CTN recipe and frozen-transform validation, cross-fitted
+CTN training, explicit transform/outcome equivalence, save/load, row order,
+single-row prediction, and finite monotone survival. Subsequent merged changes
+are workflow, changelog and source-integrity records only. The source-integrity
+gate passed in run 34632149937. This small native contract does not establish
+clustered-PC convergence or successful AoU outcome fitting.
+
+Publication of `gamfit 0.1.268` is tracked by
+[workflow 34632917720](https://github.com/SauersML/gam/actions/runs/34632917720).
+A version number alone does not establish input compatibility: the regenerated
+reference and reference/target effective score identity still need validation.
+
+The updated lightweight contracts passed in
+[workflow 34633275335](https://github.com/SauersML/gnomon/actions/runs/34633275335):
+27 prospective-workflow tests, miniwdl validation, and four simulation
+completion tests. These checks do not execute the native outcome model.
+
+The smaller real hypertension probe `aou-hypertension-small-20260911-154600`
+also failed. Its fixed workspace status files show successful reference CTN
+application followed by `fitting_disease` and `failed_timeout`. The 8/8-center
+disease model did not complete within the 180-second child limit. This is not
+a completed training run or a diagnosis of the numerical cause. No additional
+AoU run has been submitted while the native integration and input contracts
+are being repaired.
+
+The following results describe earlier revisions, not the current native
+composition update. Reference/target effective score identity and completed
+upstream provenance remain required before final analysis.
 
 ## External-reference revision
 
