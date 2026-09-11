@@ -47,7 +47,10 @@ class Workbench:
     def command(self, command):
         # Workbench acknowledges a submission after creating its engine run;
         # killing that handshake early can leave a real job without its receipt.
-        timeout = 180 if command[:4] == ["wb", "workflow", "job", "run"] else 60
+        # Artifact staging includes the wheelhouse/score weights; give the
+        # Workbench transfer time to finish without shortening fit budgets.
+        timeout = 180 if (command[:4] == ["wb", "workflow", "job", "run"]
+                          or command[:2] == ["wb", "gsutil"]) else 60
         try:
             return subprocess.run(command, check=True, text=True, capture_output=True,
                                   env=self.env, timeout=timeout).stdout
