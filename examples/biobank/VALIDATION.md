@@ -51,6 +51,14 @@ because of seven flat directions. The artifact supports the tested point
 transformation; coefficient uncertainty is not certified. No covariance
 estimate was fabricated or substituted.
 
+The external-transform survival handoff test initially rejected an invalid
+four-center basis for six PCs. The test now uses eight centers, and the workflow
+rejects undersized Duchon bases before fitting. With that correction, the
+PC-varying synthetic survival fit exceeded its 90-second child limit. Its
+process group was terminated and no completion was accepted. The reference
+transform has been staged in the authorized workspace, but a new AoU training
+job has not been submitted under this specification.
+
 ## Prior native artifact and historical checks
 
 - Release: `gamfit-0.1.267-cp310-abi3-manylinux_2_28_x86_64.whl`.
