@@ -31,10 +31,12 @@ its checked completion does not certify the other input route.
 
 ## Workflow contracts
 
-All 27 deterministic contract tests passed on MSI. Both WDL definitions passed
+All 28 deterministic contract tests passed on MSI. Both WDL definitions passed
 static validation. These checks include identity rejection, cohort construction,
 family/group folds, frozen transforms, checkpoint integrity, worker termination,
 and preserving failed-worker evidence without a completion receipt.
+The workspace diagnostic can classify unfinished checkpoint logs while ignoring
+completed workers and emitting only fixed labels; raw logs remain in AoU.
 
 The real hypertension cohort preparation exposed inadequate ancestry-specific
 censoring support in the 5,000-person pilot. The smoke run now separates this

@@ -8,10 +8,12 @@ workflow aou_diagnostic {
     File identity_guard
     String runtime_image
     File? relatedness_prune
+    File? checkpoint
   }
   call diagnose {
     input: task_stderr = task_stderr, identity_guard = identity_guard,
-           runtime_image = runtime_image, relatedness_prune = relatedness_prune
+           runtime_image = runtime_image, relatedness_prune = relatedness_prune,
+           checkpoint = checkpoint
   }
   output { Array[File] diagnostics = diagnose.diagnostics }
 }
@@ -22,14 +24,16 @@ task diagnose {
     File identity_guard
     String runtime_image
     File? relatedness_prune
+    File? checkpoint
   }
   command <<<
     set -euo pipefail
     cp "~{identity_guard}" aou_identity.py
-    timeout --kill-after=5s 90s python - "~{task_stderr}" "~{default="" relatedness_prune}" <<'PY'
+    timeout --kill-after=5s 90s python - "~{task_stderr}" "~{default="" relatedness_prune}" "~{default="" checkpoint}" <<'PY'
     from pathlib import Path
     import re
     import sys
+    import tarfile
     from aou_identity import task_account
 
     task_account()
@@ -52,6 +56,21 @@ task diagnose {
         handle.seek(0, 2)
         handle.seek(max(0, handle.tell() - 262144))
         log = handle.read().decode("utf-8", errors="replace").lower()
+    if sys.argv[3]:
+        with tarfile.open(sys.argv[3], "r:gz") as archive:
+            members = archive.getmembers()
+            if sum(member.size for member in members) > 2 * 1024**3:
+                raise ValueError("checkpoint exceeds diagnostic size budget")
+            names = {member.name for member in members}
+            unfinished = [member for member in members if member.isfile()
+                          and member.name.endswith("/fit.log")
+                          and str(Path(member.name).parent / "completed.json") not in names]
+            if len(unfinished) > 16:
+                raise ValueError("checkpoint exceeds diagnostic worker budget")
+            for member in unfinished:
+                with archive.extractfile(member) as handle:
+                    handle.seek(max(0, member.size - 262144))
+                    log += "\n" + handle.read().decode("utf-8", errors="replace").lower()
     signatures = {
         "credential_override": "credential-file overrides are not allowed",
         "forbidden_identity": "refusing an execution account",
@@ -75,6 +94,9 @@ task diagnose {
         "memory_error": "memoryerror:",
         "zero_division": "zerodivisionerror:",
         "assertion_error": "assertionerror:",
+        "fit_nonconvergence": "did not converge",
+        "nonfinite_value": "non-finite",
+        "singular_system": "singular",
         "date_out_of_bounds": "outofboundsdatetime",
         "date_parse_error": "dateparseerror",
         "datetime_resolution": "cannot subtract",
@@ -83,6 +105,9 @@ task diagnose {
         "censoring_training_support": "insufficient training support for ancestry-specific censoring",
         "censoring_horizon_support": "evaluation horizon lacks censoring support",
         "censoring_weights_unstable": "event-time censoring weights are unstable",
+        "disease_events_insufficient": "insufficient training events for cause 1",
+        "death_events_insufficient": "insufficient training events for cause 2",
+        "heldout_size_insufficient": "too few held-out participants",
         "worker_fit_started": "worker_fit_started",
         "worker_fit_saved": "worker_fit_saved",
         "worker_grid_started": "worker_grid_started",
@@ -119,7 +144,9 @@ task diagnose {
     functions = ("run", "read_ancestry", "unpack_phenotypes", "unpack_score_cache",
                  "cached_score_ids", "person_times", "case_dates", "build_cohort",
                  "task_account", "publish_status", "validate_config", "load_score_panel",
-                 "select_runtime_diseases", "query", "publish", "prepare_inputs")
+                 "select_runtime_diseases", "query", "publish", "prepare_inputs",
+                 "fit_worker", "transform_worker", "fit_ctn", "transformed_score",
+                 "analyze_partition", "checkpointed_fit", "bounded_fit")
     for function in functions:
         if re.search(r", in " + re.escape(function) + r"\s*\n", log):
             Path(f"diagnostic__function_{function}.txt").write_text(function + "\n")

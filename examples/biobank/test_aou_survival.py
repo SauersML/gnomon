@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import textwrap
 import time
 import unittest
 from types import SimpleNamespace
@@ -27,6 +28,36 @@ from aou_evaluation import audit_groups, paired_loss_summary
 
 
 class SurvivalContractTests(unittest.TestCase):
+    def test_workspace_diagnostic_reads_only_unfinished_worker_logs(self):
+        wdl = Path(__file__).with_name("aou_diagnostic.wdl").read_text()
+        code = textwrap.dedent(wdl.split("<<'PY'\n", 1)[1].split("    PY\n", 1)[0])
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            stderr = directory / "stderr"
+            stderr.write_text("RuntimeError: private task failure\n")
+            checkpoint = directory / "checkpoint.tar.gz"
+            with tarfile.open(checkpoint, "w:gz") as archive:
+                for name, content in {
+                    "complete/fit.log": "ModuleNotFoundError: private completed history",
+                    "complete/completed.json": "{}",
+                    "unfinished/fit.log": "ValueError: private unfinished history",
+                }.items():
+                    member = tarfile.TarInfo(name)
+                    encoded = content.encode()
+                    member.size = len(encoded)
+                    archive.addfile(member, io.BytesIO(encoded))
+            previous = Path.cwd()
+            try:
+                os.chdir(directory)
+                with patch.object(sys, "argv", ["diagnose", str(stderr), "", str(checkpoint)]), \
+                     patch.dict(sys.modules, {"aou_identity": SimpleNamespace(task_account=lambda: None)}):
+                    exec(compile(code, "aou_diagnostic.wdl", "exec"), {})
+            finally:
+                os.chdir(previous)
+            labels = {path.name: path.read_text() for path in directory.glob("diagnostic__*.txt")}
+            self.assertEqual(labels, {"diagnostic__runtime_error.txt": "runtime_error\n",
+                                      "diagnostic__value_error.txt": "value_error\n"})
+
     def test_sparse_censoring_support_is_not_reported_as_valid_accuracy(self):
         train = pd.DataFrame({"event_code": [1, 2] * 30, "followup": [2.] * 60,
                               "ancestry": ["major"] * 59 + ["rare"]})
