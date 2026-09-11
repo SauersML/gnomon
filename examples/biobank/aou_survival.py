@@ -25,8 +25,9 @@ import zipfile
 import numpy as np
 import pandas as pd
 
-from aou_score_transform import (assemble_scores, baseline_columns, fit_transform,
-                                 grouped_folds, score_diagnostics, transformed_score)
+from aou_score_transform import (baseline_columns,
+                                 score_diagnostics, transformed_score)
+from reference_ctn import load_reference
 from aou_checkpoint import StudyCheckpoint
 from aou_evaluation import audit_groups, paired_loss_summary
 from aou_status import failure_label, publish_status
@@ -52,7 +53,7 @@ def validate_config(c):
         "max_rows_per_disease", "train_fraction", "seed", "horizons_years",
         "grid_intervals", "fit_timeout_seconds", "query_timeout_seconds",
         "maximum_bytes_billed", "min_train_events_per_cause", "min_report_count",
-        "lookback_days", "crossfit_folds", "stage1_centers", "stage1_age_k", "stage1_response_knots", "stage1_timeout_seconds",
+        "lookback_days", "projection_model_sha256",
     }
     if set(c) != expected:
         raise ValueError("analysis configuration has missing or unknown keys")
@@ -61,19 +62,17 @@ def validate_config(c):
     if not re.fullmatch(r"[a-z][a-z0-9-]+", c["google_project"]):
         raise ValueError("google_project must be a concrete billing project")
     positive = expected - {"google_project", "workspace_cdr", "gamfit_version",
-                           "train_fraction", "seed", "horizons_years"}
+                           "train_fraction", "seed", "horizons_years", "projection_model_sha256"}
     if any(type(c[k]) is not int or c[k] <= 0 for k in positive):
         raise ValueError("resource and sample budgets must be positive integers")
     if not 1 <= c["num_pcs"] <= 16 or not 0.5 <= c["train_fraction"] <= 0.9:
         raise ValueError("unsupported PC count or training fraction")
-    if min(c["baseline_centers"], c["slope_centers"]) < 4:
-        raise ValueError("smooths require at least four centers")
+    if min(c["baseline_centers"], c["slope_centers"]) <= c["num_pcs"] + 1:
+        raise ValueError("Duchon basis sizes must exceed the PC count plus one")
     if c["time_num_internal_knots"] < 2:
         raise ValueError("survival time basis requires at least two internal knots")
-    if not 2 <= c["crossfit_folds"] <= 5 or c["stage1_centers"] < 4 or c["stage1_age_k"] < 4:
-        raise ValueError("stage one requires 2–5 folds and basis sizes of at least four")
-    if c["stage1_response_knots"] < 2:
-        raise ValueError("stage one requires at least two response knots")
+    if not re.fullmatch(r"[0-9a-f]{64}", c["projection_model_sha256"]):
+        raise ValueError("the external PC projection model must be pinned by SHA-256")
     if c["min_report_count"] < 20 or c["min_train_events_per_cause"] < 20:
         raise ValueError("pilot requires at least 20 observations per reported cell/event class")
     if type(c["seed"]) is not int or not c["gamfit_version"]:
@@ -128,12 +127,12 @@ def unpack_phenotypes(archive, destination):
     return destination
 
 
-def read_ancestry(ancestry, prune, num_pcs):
+def read_ancestry(ancestry, prune, num_pcs, projections):
     ancestry_columns = pd.read_csv(ancestry, sep="\t", nrows=0).columns
-    if not {"research_id", "pca_features", "ancestry_pred"}.issubset(ancestry_columns):
-        raise ValueError("ancestry file lacks required research_id/pca_features/ancestry_pred columns")
+    if not {"research_id", "ancestry_pred"}.issubset(ancestry_columns):
+        raise ValueError("ancestry file lacks required research_id/ancestry_pred columns")
     df = pd.read_csv(ancestry, sep="\t", dtype=str,
-                     usecols=["research_id", "pca_features", "ancestry_pred"])
+                     usecols=["research_id", "ancestry_pred"])
     # The release's published flagged-sample file uses sample_id. These IDs
     # join to research_id in the ancestry predictions; require the real schema.
     excluded = pd.read_csv(prune, sep="\t", dtype=str,
@@ -148,23 +147,25 @@ def read_ancestry(ancestry, prune, num_pcs):
     if df.research_id.isna().any() or df.research_id.duplicated().any():
         raise ValueError("ancestry IDs must be present and unique")
     df = df.loc[~df.research_id.isin(excluded.research_id)].copy()
-    arrays = df.pca_features.map(json.loads)
-    if not arrays.map(lambda row: isinstance(row, list) and len(row) >= num_pcs).all():
-        raise ValueError("invalid AoU pca_features")
-    pcs = np.asarray([row[:num_pcs] for row in arrays], dtype=float)
-    if not np.isfinite(pcs).all() or df.ancestry_pred.isna().any():
-        raise ValueError("non-finite PCs or missing ancestry labels")
-    out = pd.DataFrame(pcs, columns=[f"PC{i + 1}" for i in range(num_pcs)])
-    out["person_id"] = df.research_id.to_numpy()
-    out["ancestry"] = df.ancestry_pred.to_numpy()
+    pc_columns = [f"PC{i + 1}" for i in range(num_pcs)]
+    pcs = pd.read_parquet(projections)
+    if not {"IID", *pc_columns}.issubset(pcs.columns):
+        raise ValueError("cached projection lacks IID or required PC columns")
+    pcs = pcs[["IID", *pc_columns]].rename(columns={"IID": "person_id"}).copy()
+    pcs["person_id"] = pcs.person_id.astype("string")
+    if pcs.person_id.isna().any() or pcs.person_id.duplicated().any() or not np.isfinite(pcs[pc_columns]).all().all():
+        raise ValueError("invalid cached projection IDs or PCs")
+    labels = df.rename(columns={"research_id": "person_id", "ancestry_pred": "ancestry"})
+    out = labels.merge(pcs, on="person_id", validate="one_to_one")
+    if out.empty or out.ancestry.isna().any():
+        raise ValueError("projected reference coordinates have no labelled participants")
     # Published max-IS pruning supplies the independent units for this pilot.
-    # Explicit group labels remain the split interface, so related units cannot
-    # be separated by inner folds if a broader group mapping is supplied.
+    # Explicit group labels remain the interface for the development/test split.
     out["split_group"] = out.person_id
     return out
 
 
-def unpack_score_cache(archive, output):
+def unpack_score_cache(archive, output, projection_output):
     """Read pgsEngine's real shared-feature artifact without extracting genotypes."""
     output = Path(output)
     with tempfile.NamedTemporaryFile(dir=output.parent, prefix="scores-", suffix=".partial",
@@ -172,11 +173,19 @@ def unpack_score_cache(archive, output):
         temporary = Path(target.name)
         try:
             count = 0
+            projection_count = 0
+            projection_temporary = Path(str(projection_output) + ".partial")
             # Streaming avoids scanning the multi-GB gzip and then decompressing
             # it again to seek back to the score member. Still inspect the rest
             # of the archive to reject duplicate score members.
             with tarfile.open(archive, "r|gz") as tar:
                 for member in tar:
+                    if member.isfile() and Path(member.name).name == "projection_pcs.parquet":
+                        projection_count += 1
+                        if projection_count > 1:
+                            raise ValueError("expected exactly one cached projection PC table")
+                        with tar.extractfile(member) as source, projection_temporary.open("wb") as destination:
+                            shutil.copyfileobj(source, destination, length=1024 * 1024)
                     if not member.isfile() or Path(member.name).name != "scores.tar":
                         continue
                     count += 1
@@ -186,10 +195,14 @@ def unpack_score_cache(archive, output):
                         shutil.copyfileobj(source, target, length=1024 * 1024)
             if count != 1:
                 raise ValueError("expected exactly one scores.tar in the pgsEngine shared-feature archive")
+            if projection_count != 1:
+                raise ValueError("expected exactly one cached projection PC table")
             target.close()
             temporary.replace(output)
+            projection_temporary.replace(projection_output)
         finally:
             temporary.unlink(missing_ok=True)
+            projection_temporary.unlink(missing_ok=True)
     return output
 
 
@@ -259,10 +272,6 @@ def development_partition(df, config):
     development["is_train"] = development.split_group.map(lambda group:
         int(hashlib.sha256(f"{config['seed']}:development:{group}".encode()).hexdigest()[:16], 16)
         / 2**64 < .75)
-    development["inner_fold"] = -1
-    mask = development.is_train
-    development.loc[mask, "inner_fold"] = grouped_folds(
-        development.loc[mask, "split_group"], config["crossfit_folds"], config["seed"])
     return development
 
 
@@ -374,9 +383,6 @@ def build_cohort(base, scores, cases, config):
     df = df.sort_values("sample_order").head(config["max_rows_per_disease"]).copy()
     df["is_train"] = df.split_group.map(
         lambda x: int(hash_value(x, "split")[:16], 16) / 2**64 < config["train_fraction"])
-    df["inner_fold"] = -1
-    df.loc[df.is_train, "inner_fold"] = grouped_folds(
-        df.loc[df.is_train, "split_group"], config["crossfit_folds"], config["seed"])
     return df.reset_index(drop=True)
 
 
@@ -480,10 +486,6 @@ def predict_bundle(directory, baseline_data, times):
     data = baseline_data[columns].copy()
     data["entry"], data["followup"], data["event"] = 0., times[-1], 0
     if spec["kind"] != "baseline":
-        if spec["normalizer"] == "ctn" and spec["kind"] in ("constant", "pc_varying"):
-            data["PGS"] = baseline_data.PGS.to_numpy()
-            chain = gamfit.load(directory / "chain.gamfit")
-            return np.asarray(chain.predict(data).cumulative_hazard_at(times))
         transform = gamfit.load(directory / "transform.gamfit")
         data["Z"] = transformed_score(transform, spec["normalizer"], baseline_data[["PGS", *columns]])
     model = gamfit.load(directory / "model.gamfit")
@@ -540,14 +542,6 @@ def fit_worker(frame_path, config_path, model_kind, cause, output, normalizer, t
     print("worker_grid_started", flush=True)
     h = np.asarray(prediction.cumulative_hazard_at(grid))
     print("worker_grid_complete", flush=True)
-    if normalizer == "ctn" and model_kind in ("constant", "pc_varying"):
-        from aou_score_transform import stage1_rhs
-        recipe = gamfit.CtnStage1("PGS", stage1_rhs(config), fold_column="inner_fold",
-                                 group_column="split_group",
-                                 response_num_internal_knots=config["stage1_response_knots"])
-        fold_digest = hashlib.sha256(df.loc[df.is_train, "inner_fold"].to_numpy("<i8").tobytes()).hexdigest()
-        gamfit.CtnMarginalSlopeModel(transformer, model, recipe, fold_digest,
-                                     score_column="Z").save(output / "chain.gamfit")
     if model_kind in ("constant", "pc_varying"):
         payload = json.loads((output / "model.gamfit").read_text())["payload"]
         if payload["latent_z_rank_int_calibration"] is not None or payload["latent_z_conditional_calibration"] is not None:
@@ -555,7 +549,7 @@ def fit_worker(frame_path, config_path, model_kind, cause, output, normalizer, t
     write_json(output / "spec.json", {"baseline": baseline, "slope": slope, "cause": cause,
                                       "kind": model_kind, "normalizer": normalizer,
                                       "num_pcs": config["num_pcs"],
-                                      "score_path": "explicit cross-fitted scores; frozen deployment transform",
+                                      "score_path": "external reference CTN; frozen deployment transform",
                                       "orthogonality_claim": False})
     replayed = predict_bundle(output, df.loc[~df.is_train], grid)
     if h.shape != (len(test), len(grid)) or not np.allclose(h, replayed, rtol=1e-7, atol=1e-9):
@@ -603,7 +597,7 @@ def checkpointed_fit(command, timeout_seconds, log, checkpoint):
         raise
 
 
-def analyze_partition(df, config, args, disease_dir, checkpoint, candidates):
+def analyze_partition(df, config, args, disease_dir, checkpoint, candidates, pgs):
     """Analyze an explicit development or outer-test partition with bounded steps."""
     df = df.copy()
     disease_dir.mkdir(parents=True, exist_ok=True)
@@ -619,32 +613,17 @@ def analyze_partition(df, config, args, disease_dir, checkpoint, candidates):
     transform_diagnostics = {}
     groups = audit_groups(train, test)
     for normalizer in sorted({normalizer for _, normalizer in candidates} - {"none"}):
-        artifacts = []
-        for fold in [*range(config["crossfit_folds"]), -1]:
-            stage_dir = disease_dir / f"{normalizer}_fold_{fold}"
-            stage_dir.mkdir(exist_ok=True)
-            command = [sys.executable, str(Path(__file__).resolve()), "transform",
-                       "--frame", str(frame), "--config", str(args.config.resolve()),
-                       "--normalizer", normalizer, "--fold", str(fold), "--output", str(stage_dir)]
-            print(f"Transforming {slug}: {normalizer}, fold {fold}", flush=True)
-            if not checkpoint.step_is_complete(stage_dir, model=True):
-                publish_status(args.checkpoint_uri, "transforming_score")
-                checkpointed_fit(command, config["stage1_timeout_seconds"], stage_dir / "fit.log", checkpoint)
-                files = ["scores.npz", "transform.gamfit"]
-                if fold < 0:
-                    files.append("training_replay.npy")
-                checkpoint.complete_step(stage_dir, files, model=True)
-            artifacts.append(stage_dir / "scores.npz")
-            if fold == -1:
-                transforms[normalizer] = stage_dir / "transform.gamfit"
-        df[f"Z_{normalizer}"] = assemble_scores(df, artifacts)
+        if normalizer != "ctn":
+            raise ValueError("this workflow requires the frozen external CTN")
+        model, path, manifest = load_reference(args.reference_ctn, disease_dir / "reference_ctn",
+                                               pgs, config["num_pcs"], config["projection_model_sha256"])
+        transforms[normalizer] = path
+        publish_status(args.checkpoint_uri, "applying_reference_ctn")
+        df[f"Z_{normalizer}"] = transformed_score(model, normalizer, df)
         publish_status(args.checkpoint_uri, "score_transform_ready")
         transform_diagnostics[normalizer] = score_diagnostics(
             df.loc[~df.is_train, f"Z_{normalizer}"].to_numpy(), groups, config["min_report_count"])
-        full_train_z = np.load(disease_dir / f"{normalizer}_fold_-1" / "training_replay.npy")
-        oof_z = df.loc[df.is_train, f"Z_{normalizer}"].to_numpy()
-        transform_diagnostics[f"{normalizer}_oof_deployment_rms_difference"] = float(
-            np.sqrt(np.mean((oof_z - full_train_z)**2)))
+        transform_diagnostics["reference"] = manifest
     frame = disease_dir / "transformed.parquet"
     df.to_parquet(frame, index=False)
     models = {}
@@ -668,8 +647,6 @@ def analyze_partition(df, config, args, disease_dir, checkpoint, candidates):
                 files = ["hazards.npz", "model.gamfit", "spec.json"]
                 if kind != "baseline":
                     files.append("transform.gamfit")
-                if normalizer == "ctn" and kind in ("constant", "pc_varying"):
-                    files.append("chain.gamfit")
                 checkpoint.complete_step(fit_dir, files, model=True)
             with np.load(fit_dir / "hazards.npz") as saved:
                 hazards.append(saved["hazards"])
@@ -717,7 +694,7 @@ def analyze_development(df, disease, config, args, disease_dir, checkpoint):
     for pgs in candidates:
         development["PGS"] = development[pgs]
         report, _ = analyze_partition(development, config, args,
-            disease_dir / "development" / pgs, checkpoint, [("pc_varying", "ctn")])
+            disease_dir / "development" / pgs, checkpoint, [("pc_varying", "ctn")], pgs)
         reports[pgs] = report
     return reports
 
@@ -736,6 +713,12 @@ def run(args):
     if gamfit.__version__ != config["gamfit_version"]:
         raise ValueError("gamfit version does not match the analysis configuration")
     if not args.prepare_only:
+        # Validate all requested external models before accessing cohort data.
+        requested = [panel["endpoints"][endpoint]] if endpoint else panel["endpoints"].values()
+        for disease in requested:
+            for pgs in disease["candidates"][:1] if args.smoke_only else disease["candidates"]:
+                load_reference(args.reference_ctn, args.output / "references" / pgs,
+                               pgs, config["num_pcs"], config["projection_model_sha256"])
         # Reject an old wheel before queries or expensive score-model fits.
         validation = gamfit.validate_formula(
             pd.DataFrame({"entry": [0.] * 6, "followup": [1., 2., 3., 4., 5., 6.],
@@ -749,12 +732,13 @@ def run(args):
         raise ValueError("runtime_image must use an immutable digest")
     sources = [Path(__file__), *[Path(__file__).with_name(name) for name in
                ("aou_identity.py", "aou_score_transform.py", "aou_checkpoint.py",
-                "aou_evaluation.py", "aou_status.py", "disease_selection.py")]]
+                "aou_evaluation.py", "aou_status.py", "disease_selection.py", "reference_ctn.py")]]
     signature = {"config": config, "endpoint": endpoint,
                  "score_scope": "primary" if args.smoke_only else "comparison",
                  "sources": {p.name: digest(p) for p in sources},
                  "inputs": {key: digest(getattr(args, key)) for key in
-                            ("scores", "ancestry", "prune", "phenotypes", "score_panel")}}
+                            ("scores", "ancestry", "prune", "phenotypes", "score_panel")},
+                 "reference_ctn": [digest(path) for path in args.reference_ctn]}
     checkpoint = StudyCheckpoint(args.output, args.checkpoint_uri, config["google_project"],
                                  execution_account, signature, args.resume,
                                  engine_hash=digest(importlib.util.find_spec("gamfit._rust").origin))
@@ -782,7 +766,8 @@ def run(args):
         diseases = dict(list(diseases.items())[:config["disease_limit"]])
         if not diseases:
             raise ValueError("no prespecified endpoint passed the existing disease selection rule")
-        score_cache = unpack_score_cache(args.scores, args.output / "scores.tar")
+        projection_path = args.output / "projection_pcs.parquet"
+        score_cache = unpack_score_cache(args.scores, args.output / "scores.tar", projection_path)
         available_scores = cached_score_ids(score_cache)
         for disease in diseases.values():
             required = disease["candidates"][:1] if args.smoke_only else disease["candidates"]
@@ -790,7 +775,7 @@ def run(args):
             for pgs in disease["missing_scores"]:
                 publish_status(args.checkpoint_uri, "missing_" + pgs.lower())
         publish_status(args.checkpoint_uri, "reading_ancestry")
-        ancestry = read_ancestry(args.ancestry, args.prune, config["num_pcs"])
+        ancestry = read_ancestry(args.ancestry, args.prune, config["num_pcs"], projection_path)
         publish_status(args.checkpoint_uri, "loading_person_times")
         base = ancestry.merge(person_times(client, config["workspace_cdr"]), on="person_id", validate="one_to_one")
         publish_status(args.checkpoint_uri, "preparing_cohort")
@@ -862,7 +847,7 @@ def run(args):
         df["PGS"] = df[selected]
         report, _ = analyze_partition(df, config, args, disease_dir / "final", checkpoint,
             [("baseline", "none"), ("constant", "ctn"), ("pc_varying", "ctn"),
-             ("pc_varying", "location_scale"), ("ordinary", "ctn")])
+             ("ordinary", "ctn")], selected)
         results[slug] = {"concept_id": disease["concept_id"], "score_selection": choice,
                          "development": selection_reports, **report}
     write_json(args.output / "metrics.json", results)
@@ -880,7 +865,8 @@ def run(args):
         "baseline": "AoU primary-consent date (Consent PII Module descendants); continuous EHR lookback",
         "validation": "group holdout after published relatedness prune; 75/25 development split within outer training selects PGS; outer test evaluates matched methods",
         "score_panel": panel,
-        "score_transform": "explicit cross-fitted CTN and location-scale models; frozen latent scores",
+        "score_transform": "externally fitted PC-conditional CTN; frozen latent scores",
+        "reference_ctn_sha256": [digest(path) for path in args.reference_ctn],
         "orthogonality_claim": False,
         "paired_uncertainty": "group-robust normal intervals conditional on fitted models and training censoring estimates",
         "censoring_model": "training-only reverse Kaplan-Meier stratified by reported genetic ancestry",
@@ -895,7 +881,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     run_parser = sub.add_parser("run")
-    for name in ["config", "phenotypes", "scores", "ancestry", "prune", "runtime-image", "score-panel", "endpoint-config", "output"]:
+    for name in ["config", "phenotypes", "scores", "ancestry", "prune", "runtime-image", "score-panel", "endpoint-config", "output", "reference-ctn-list"]:
         run_parser.add_argument(f"--{name}", type=Path, required=True)
     run_parser.add_argument("--checkpoint-uri", required=True)
     run_parser.add_argument("--resume", type=Path)
@@ -906,16 +892,15 @@ def main():
     for name in ["frame", "config", "output"]:
         fit_parser.add_argument(f"--{name}", type=Path, required=True)
     fit_parser.add_argument("--kind", choices=["baseline", "constant", "pc_varying", "ordinary"], required=True)
-    fit_parser.add_argument("--normalizer", choices=["ctn", "location_scale", "none"], required=True)
+    fit_parser.add_argument("--normalizer", choices=["ctn", "none"], required=True)
     fit_parser.add_argument("--transform-model", type=Path)
     fit_parser.add_argument("--cause", type=int, choices=[1, 2], required=True)
-    transform_parser = sub.add_parser("transform")
-    for name in ["frame", "config", "output"]:
-        transform_parser.add_argument(f"--{name}", type=Path, required=True)
-    transform_parser.add_argument("--normalizer", choices=["ctn", "location_scale"], required=True)
-    transform_parser.add_argument("--fold", type=int, required=True)
     args = parser.parse_args()
     if args.command == "run":
+        reference_paths = json.loads(args.reference_ctn_list.read_text())
+        if not isinstance(reference_paths, list) or not reference_paths or not all(isinstance(p, str) for p in reference_paths):
+            parser.error("reference CTN list must contain staged model archive paths")
+        args.reference_ctn = [Path(path) for path in reference_paths]
         try:
             run(args)
         except Exception as error:
@@ -924,8 +909,6 @@ def main():
             except Exception:
                 print("Could not publish the fixed failure label; inspect workspace logs", file=sys.stderr)
             raise
-    elif args.command == "transform":
-        fit_transform(args.frame, args.config, args.normalizer, args.fold, args.output)
     else:
         if (args.kind == "baseline") != (args.normalizer == "none"):
             parser.error("only the no-score baseline uses normalizer=none")

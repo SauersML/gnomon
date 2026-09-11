@@ -27,7 +27,11 @@ ordering is unknown. This predicts recorded diagnosis, not biological onset.
 The resolved CDR release is recorded; horizons must be supported by that
 release's actual follow-up.
 
-PCs use `research_id`, `pca_features`, and `ancestry_pred` from the release's
+PCs come from pgsEngine's `projection_pcs.parquet`, using the pinned external
+`hwe_1kg_hgdp_gsa_v3` projection. The CTN reference must use that same model
+(uncompressed model SHA-256 is recorded in `aou_analysis.json`). AoU's published
+PC coordinates are a separate coordinate system and are not substituted.
+Ancestry labels still use `research_id` and `ancestry_pred` from the release's
 ancestry file. The published relatedness-prune file's `sample_id` column is
 matched to ancestry `research_id` and applied before sampling
 or splitting. The `sample_id` header and numeric IDs are required; unknown
@@ -49,18 +53,18 @@ preflight and stop model fitting; no score is substituted. Score pairs use the
 same complete-case cohort.
 
 A seeded group split reserves 20% as outer test. The remaining development
-sample is split 75/25 by group. Each candidate score gets the same CTN plus
-PC-varying marginal-slope predictor, fitted only on development-training rows.
+sample is split 75/25 by group. Each candidate score gets its frozen external
+CTN plus the same PC-varying marginal-slope predictor. Only the outcome model
+is fitted on development-training rows.
 Mean development Brier score across the prespecified horizons selects the
 score. The choice is recorded before outer-test evaluation. Selection fails
 when either candidate lacks supported development metrics.
 
-The selected PGS is then shared by all five methods refitted on outer training:
+The selected PGS is then shared by four outcome models refitted on outer training:
 
 - Flexible baseline without PGS.
-- Cross-fitted CTN with constant marginal slope.
-- Cross-fitted CTN with PC-varying marginal slope.
-- Conditional Gaussian location–scale normalization with the same PC-varying outcome.
+- External CTN with constant marginal slope.
+- External CTN with PC-varying marginal slope.
 - CTN with an ordinary varying-coefficient Gaussian transformation-survival model.
 
 The baseline has age, sex and a joint six-PC Duchon surface (32 centers).
@@ -69,15 +73,28 @@ ensemble, manifold or post-hoc calibration stack is enabled. The ordinary
 comparator uses Gaussian location–scale survival; its time representation and
 penalties differ, so this is not a pure unrestricted reparameterization test.
 
-CTN and location–scale transforms condition on baseline age, sex and PCs.
-Each internal fold fits its own transformation on the complement. A separate
-full-training transform is saved for deployment. CTN uses
-`transformation_score`, never its conditional-mean `predict` operation.
-The outcome consumes frozen latent scores; no second normalization or influence
-absorber is fitted. [GAM PR #2882](https://github.com/SauersML/gam/pull/2882)
-supplies `frozen_score` and the saved
-`CtnMarginalSlopeModel` used by the CTN marginal-slope bundles. A stock wheel
-without that contract is rejected before analysis queries.
+CTN is fitted once per PGS on an external genetic reference panel, conditional
+on PCs only. It is never fitted or updated on AoU rows. There are no internal
+AoU CTN folds. CTN uses `transformation_score`, never its conditional-mean
+`predict` operation. The model and manifest are required staged WDL inputs;
+missing, duplicate, mismatched or corrupt reference transforms stop the run.
+The saved outcome/transform pair is replayed together and checked for save/load
+and batch invariance. The outcome consumes `frozen_score`; no second
+normalization or influence absorber is fitted.
+
+`reference_ctn.py` trains and packages the external model from a real reference
+table containing `sample_id`, the matching `PGSnnnnnn_AVG`, and projected PCs.
+Its metadata names the actual panel, score-file hash and projection-model hash.
+Training and preprocessing run on MSI with external data; the resulting model
+is staged into the workspace. The reference panel's PGS calculation must use
+the same allele, weight and score-scaling conventions as the target cache.
+Variant coverage and projection-marker overlap require a transport audit.
+
+This estimates the reference-panel score distribution. It does not establish
+normality in AoU conditional on age, sex or baseline eligibility. Consequently,
+the exact conditional-normal marginal identity is an assumption to assess, not
+a target-population calibration guarantee. Keep age, sex and PCs in the outcome
+model and evaluate held-out score-distribution and risk diagnostics.
 
 ## Evaluation, persistence and limits
 
@@ -102,7 +119,7 @@ property, not observed-outcome calibration.
 The first run should use `--prepare-only`: it checks real score availability,
 cohort fields, event counts and horizon support without fitting models.
 After that and native acceptance pass, `--smoke-only` fits the first
-prespecified score using only the development split: cross-fitted CTN and two
+prespecified score using only the development split: frozen external CTN and two
 cause-specific outcome models. Only that primary score must be cached for the
 smoke run; a missing challenger still blocks the later two-score comparison.
 It performs the same persistence, batching,
@@ -119,9 +136,9 @@ contain participant data, scores, models and logs and must remain inside the
 authorized workspace. WDL outputs are aggregate metrics, provenance **and
 the sensitive checkpoint archive**; none is automatically approved for export.
 
-Validation so far: 24 deterministic workflow contract tests and WDL validation
-pass on MSI. The updated native CTN survival acceptance test and real cohort
-preflight remain separate checks; synthetic contracts are not AoU results.
+The external-CTN revision passes 27 deterministic workflow contract tests and
+WDL validation on MSI. Native survival acceptance and the real cohort run
+remain separate checks; see [VALIDATION.md](VALIDATION.md) for observed results.
 
 ## Environment and submission
 
@@ -142,6 +159,7 @@ used:
 | `WORKBENCH_CONTEXT_PARENT_DIR` | Local isolated Workbench context directory |
 | `AOU_RUNTIME_IMAGE` | Accessible Linux Python 3.12 image pinned with `@sha256:` |
 | `AOU_WHEELHOUSE_URI` | Staged tar of Linux CPython 3.12 dependency wheels |
+| `AOU_REFERENCE_CTN_URIS` | Space-separated staged external CTN archives, one per requested PGS |
 | `AOU_PHENOTYPE_LIBRARY_URI` | Staged OHDSI PhenotypeLibrary ZIP snapshot |
 | `AOU_SHARED_FEATURES_URI` | Existing pgsEngine `shared_features.tar.gz` |
 | `AOU_ANCESTRY_URI` | Published ancestry-predictions TSV for this CDR |
@@ -208,10 +226,11 @@ information, source/input hashes, and query IDs are recorded in provenance.
 
 The configured panel contains up to three selected diseases, at most 20,000
 outcome-blind sampled rows each, four CPUs, 16 GiB RAM, and 50 GiB disk.
-With two internal folds, development selection and final matched comparisons
-require 12 transform fits and 14 cause-specific fits per endpoint. They run
-with an explicit two-interior-knot CTN response basis for this bounded pilot;
-larger shape budgets require a separate development comparison. The fits run
+Two candidate reference CTNs are trained externally per endpoint. Development
+selection and the four final matched comparisons require 12 cause-specific
+fits per endpoint and no AoU CTN fits. The external trainer uses an explicit
+two-interior-knot CTN response basis; larger shape budgets require a separate
+reference-data comparison. The outcome fits run
 with four interior time knots shared by all outcome-model comparisons, and
 sequentially with a checkpoint after each completed unit. Each fit has a
 180-second wall cap, each query a 120-second cap and a billed-byte ceiling;
@@ -239,11 +258,16 @@ miniwdl check examples/biobank/aou_survival.wdl
 python -m unittest discover -s examples/biobank -p test_aou_survival.py
 ```
 
-The native acceptance check exercises cross-fitted CTN, a PC-varying fit,
-held-out cumulative hazards, and save/load and batch equivalence on synthetic data:
+The native acceptance check applies the saved external CTN to real public
+reference predictors and fits synthetic survival outcomes. It checks a
+PC-varying fit, held-out cumulative hazards, save/load and batch equivalence:
 
 ```bash
-python examples/biobank/test_aou_runtime.py --output .validation-logs/aou/native
+python examples/biobank/test_aou_runtime.py \
+  --reference-ctn reference/ctn_primary/reference_ctn.tar.gz \
+  --reference-table reference/reference.parquet \
+  --projection-sha256 75ce487f80eb4c386abd21f8168ba547c3292e77db812eb4a7c65289171cd5e0 \
+  --output reference/survival_acceptance
 ```
 
 Keep that output directory between development attempts so the native fit can

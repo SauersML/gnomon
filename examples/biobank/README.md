@@ -1,7 +1,7 @@
 # Biobank marginal-slope PRS validation
 
 Use [WDL.md](WDL.md) for the prospective AoU experiment: primary-consent
-baseline, competing death, development-only score selection, cross-fitted CTN,
+baseline, competing death, development-only score selection, external reference CTN,
 and matched baseline/PC-slope comparisons. It reuses the existing disease
 selector and pgsEngine score cache. Workspace configuration stays local.
 

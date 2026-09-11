@@ -3,7 +3,55 @@
 Recorded 2026-09-11 UTC. Synthetic checks run on MSI; participant computation
 and all participant artifacts remain inside the AoU workspace.
 
-## Native artifact
+## External-reference revision
+
+CTN training has moved out of AoU. The workflow only loads frozen reference
+models and applies them; its former CTN fit/cross-fit command was removed.
+PCs now use pgsEngine's reference projection, rather than AoU's separate
+published PC coordinate system. Prior participant checkpoints therefore cannot
+be resumed under this changed model specification.
+
+All 27 current deterministic contract tests pass on MSI, including external
+model checksum, score-ID and PC-projection checks. The updated WDL passes
+miniwdl validation. Native acceptance now requires a real external reference
+bundle and uses synthetic survival outcomes; this is separate from an AoU fit.
+
+[GAM PR #2885](https://github.com/SauersML/gam/pull/2885) was merged after removing
+test-only solver timing instrumentation rejected by the release scanner.
+The exact-main runtime from commit `994668d561f1c71d075ad388974e86aed7f4b971`
+was built by [workflow 34604995982](https://github.com/SauersML/gam/actions/runs/34604995982).
+Its wheel SHA-256 is
+`d681f6fe9cabef56f390e5a7f155d6f7f6df424edab2dc3bf0c9b940c2e48e50`.
+The small-score six-PC CTN regression passed with this wheel in approximately
+eight seconds. The previous synthetic survival pipeline exceeded its bounded
+90-second outcome-fit budget, so that pipeline is not recorded as passing with
+this runtime. No successful AoU outcome training is claimed.
+
+## Real external CTN fit
+
+The hypertension PGS004525 CTN completed on MSI in approximately 38 seconds
+using 2,583 founders from the public GRCh38 1000 Genomes panel. This run used
+1000 Genomes alone, not the combined HGDP+1000 Genomes panel. The frozen PC
+projection matched 562,225 of 570,709 model markers. Gnomon normalized
+1,059,364 of 1,059,939 Catalog score variants and matched 844,993 to the panel.
+Per-sample zero missingness refers to those matched variants, not full Catalog
+coverage. Target-score coverage still needs comparison inside AoU.
+
+The six-PC, eight-center Duchon CTN produced finite scores and passed saved-model
+replay, single-row/batch agreement and monotonicity over the observed score
+range. Its model SHA-256 is
+`fbdb249819a1a253c9a847cc1ddd18029c88d964dbe59e1a7b1e1182a26c6ebb`.
+In-sample transformed scores have mean approximately zero, SD 0.9976, and
+94.81% within ±1.96. Across the five superpopulation labels, means range from
+−0.0234 to 0.0206 and SDs from 0.9905 to 1.0182. These diagnostics are not
+held-out reference validation or a target-population normality certificate.
+
+GAM returned a converged constrained mode but declined posterior covariance
+because of seven flat directions. The artifact supports the tested point
+transformation; coefficient uncertainty is not certified. No covariance
+estimate was fabricated or substituted.
+
+## Prior native artifact and historical checks
 
 - Release: `gamfit-0.1.267-cp310-abi3-manylinux_2_28_x86_64.whl`.
 - SHA-256: `a908af29ff97ee5f5ee825f4cee7bd3f237189cdc0d529bb78e040b04b1290bd`.
@@ -64,8 +112,8 @@ penalty sum in GAM's rank audit depends on those response units.
 [GAM PR #2884](https://github.com/SauersML/gam/pull/2884) normalizes the audit's
 individual PSD penalties without changing fitted penalties or rank tolerances.
 All 65 identifiability library tests passed on MSI, including extreme independent
-penalty units and a genuinely unidentified control. Native CTN validation and
-the exact-commit deployable runtime are still pending. This remains a candidate
+penalty units and a genuinely unidentified control. The small-score native
+regression subsequently passed on the runtime above. This remains a candidate
 explanation for the workspace failure, not proof that the two failures have
 the same cause; no successful AoU training completion is claimed.
 

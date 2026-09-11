@@ -77,12 +77,15 @@ def prepare_inputs():
         "relatedness_prune": "AOU_RELATEDNESS_PRUNE_URI",
     }
     inputs = {f"aou_survival.{key}": required_env(env) for key, env in fields.items()}
+    inputs["aou_survival.reference_ctn"] = required_env("AOU_REFERENCE_CTN_URIS").split()
     image = inputs["aou_survival.runtime_image"]
     if not re.fullmatch(r"[^\s]+@sha256:[0-9a-f]{64}", image):
         raise ValueError("AOU_RUNTIME_IMAGE must be pinned by digest")
     for key, value in inputs.items():
-        if not key.endswith("runtime_image") and not re.fullmatch(r"gs://[^\s]+/.+", value):
-            raise ValueError(f"{key} must be a staged gs:// object")
+        if not key.endswith("runtime_image"):
+            for uri in value if isinstance(value, list) else [value]:
+                if not re.fullmatch(r"gs://[^\s]+/.+", uri):
+                    raise ValueError(f"{key} must name staged gs:// objects")
     return inputs
 
 
@@ -122,7 +125,8 @@ def main():
     for key, uri in inputs.items():
         if key.endswith("runtime_image"):
             continue
-        wb.wb("gsutil", "stat", uri)
+        for item in uri if isinstance(uri, list) else [uri]:
+            wb.wb("gsutil", "stat", item)
     if args.check:
         print("Verified configured identities, workspace resources, and staged input objects.")
         return
@@ -131,6 +135,7 @@ def main():
                "identity_guard": HERE / "aou_identity.py",
                "status_code": HERE / "aou_status.py",
                "score_transform": HERE / "aou_score_transform.py",
+               "reference_code": HERE / "reference_ctn.py",
                "checkpoint_code": HERE / "aou_checkpoint.py",
                "evaluation_code": HERE / "aou_evaluation.py",
                "score_panel": HERE / "aou_pgs_panel.json",

@@ -23,11 +23,55 @@ from aou_identity import check_account
 from aou_status import failure_label, publish_status
 import disease_selection as selection
 import aou_score_transform as transforms
+import reference_ctn
 from aou_checkpoint import StudyCheckpoint
 from aou_evaluation import audit_groups, paired_loss_summary
 
 
 class SurvivalContractTests(unittest.TestCase):
+    def test_external_reference_rejects_wrong_score_projection_and_corruption(self):
+        import hashlib
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model_bytes = b"frozen external model"
+            manifest = {"schema": "external-reference-ctn-v1", "reference_population": "1000G",
+                        "pgs_id": "PGS004525", "score_column": "PGS004525_AVG",
+                        "pc_columns": ["PC1", "PC2"], "projection_model_sha256": "a" * 64,
+                        "score_file_sha256": "b" * 64, "training_table_sha256": "c" * 64,
+                        "model_sha256": hashlib.sha256(model_bytes).hexdigest()}
+            archive = root / "reference.tar.gz"
+            with tarfile.open(archive, "w:gz") as tar:
+                for name, payload in [("manifest.json", json.dumps(manifest).encode()),
+                                      ("transform.gamfit", model_bytes)]:
+                    entry = tarfile.TarInfo(name)
+                    entry.size = len(payload)
+                    tar.addfile(entry, io.BytesIO(payload))
+            engine = Mock()
+            with patch.dict(sys.modules, {"gamfit": engine}):
+                model, path, restored = reference_ctn.load_reference(
+                    [archive], root / "loaded", "PGS004525", 2, "a" * 64)
+                self.assertIs(model, engine.load.return_value)
+                self.assertEqual(path.read_bytes(), model_bytes)
+                engine.fit.assert_not_called()
+                for pgs, sha, message in [("PGS004536", "a" * 64, "exactly one"),
+                                           ("PGS004525", "d" * 64, "same PC projection")]:
+                    with self.assertRaisesRegex(ValueError, message):
+                        reference_ctn.load_reference([archive], root / "bad", pgs, 2, sha)
+                with self.assertRaisesRegex(ValueError, "exactly one"):
+                    reference_ctn.load_reference([archive, archive], root / "bad", "PGS004525", 2, "a" * 64)
+                with tarfile.open(archive, "w:gz") as tar:
+                    for name, payload in [("manifest.json", json.dumps(manifest).encode()),
+                                          ("transform.gamfit", b"corrupt model")]:
+                        entry = tarfile.TarInfo(name)
+                        entry.size = len(payload)
+                        tar.addfile(entry, io.BytesIO(payload))
+                with self.assertRaisesRegex(ValueError, "checksum mismatch"):
+                    reference_ctn.load_reference([archive], root / "bad", "PGS004525", 2, "a" * 64)
+            changed = dict(manifest, reference_population="AoU")
+            with self.assertRaisesRegex(ValueError, "external reference population"):
+                reference_ctn.validate_manifest(changed, "PGS004525", 2, "a" * 64)
+
     def test_workspace_diagnostic_reads_only_unfinished_worker_logs(self):
         wdl = Path(__file__).with_name("aou_diagnostic.wdl").read_text()
         code = textwrap.dedent(wdl.split("<<'PY'\n", 1)[1].split("    PY\n", 1)[0])
@@ -134,14 +178,18 @@ class SurvivalContractTests(unittest.TestCase):
                                 "101\t[0.1, 0.2]\teur\n102\t[0.3, 0.4]\tafr\n"
                                 "103\t[0.5, 0.6]\tamr\n")
             prune.write_text("sample_id\n101\n103\n")
-            remaining = aou.read_ancestry(ancestry, prune, 2)
+            projections = Path(tmp) / "projection_pcs.parquet"
+            pd.DataFrame({"IID": ["101", "102", "103"], "PC1": [1., 3., 5.],
+                          "PC2": [2., 4., 6.]}).to_parquet(projections)
+            remaining = aou.read_ancestry(ancestry, prune, 2, projections)
             self.assertEqual(remaining.person_id.tolist(), ["102"])
-            np.testing.assert_allclose(remaining[["PC1", "PC2"]], [[.3, .4]])
+            # The published ancestry labels supply no PC values to the model.
+            np.testing.assert_allclose(remaining[["PC1", "PC2"]], [[3., 4.]])
             for content in ("research_id\n101\n", "101\n103\n", "sample_id\n101\n\n103\n",
                             "sample_id\ninvalid\n", "sample_id\n", "sample_id\textra\n101\t103\n"):
                 prune.write_text(content)
                 with self.assertRaisesRegex(ValueError, "relatedness prune"):
-                    aou.read_ancestry(ancestry, prune, 2)
+                    aou.read_ancestry(ancestry, prune, 2, projections)
 
     def test_smoke_fit_never_passes_outer_test_to_model_or_selects_a_score(self):
         frame = pd.DataFrame({"person_id": np.arange(200), "split_group": np.arange(200),
@@ -150,7 +198,7 @@ class SurvivalContractTests(unittest.TestCase):
         disease = {"candidates": ["PGS004536", "PGS001783"]}
         with patch.object(aou, "analyze_partition", return_value=({"smoke": "checked"}, {})) as fit, \
              patch.object(aou, "select_development_score") as select:
-            result = aou.analyze_development(frame, disease, {"seed": 13, "crossfit_folds": 2},
+            result = aou.analyze_development(frame, disease, {"seed": 13},
                 SimpleNamespace(smoke_only=True), Path("results/endpoint"), object())
         fit.assert_called_once()
         fitted = fit.call_args.args[0]
@@ -168,7 +216,7 @@ class SurvivalContractTests(unittest.TestCase):
     def test_development_never_contains_outer_test_and_is_outcome_blind(self):
         frame = pd.DataFrame({"person_id": np.arange(200), "split_group": np.arange(200) // 2,
                               "is_train": np.arange(200) < 160, "event_code": np.arange(200) % 3})
-        config = {"seed": 13, "crossfit_folds": 2}
+        config = {"seed": 13}
         dev = aou.development_partition(frame, config)
         self.assertTrue(set(dev.person_id).isdisjoint(set(frame.loc[~frame.is_train, "person_id"])))
         altered = frame.copy()
@@ -208,15 +256,6 @@ class SurvivalContractTests(unittest.TestCase):
                 tar.addfile(info)
             with self.assertRaisesRegex(ValueError, "relative regular"):
                 cp.restore(archive, {"input": "a"})
-
-    def test_score_assembly_rejects_overlap_and_missing_rows(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "scores.npz"
-            np.savez(path, rows=np.array([0, 1]), z=np.array([-.1, .1]))
-            with self.assertRaisesRegex(ValueError, "every row exactly once"):
-                transforms.assemble_scores(pd.DataFrame(index=range(3)), [path])
-            with self.assertRaisesRegex(ValueError, "overlapping"):
-                transforms.assemble_scores(pd.DataFrame(index=range(2)), [path, path])
 
     def test_paired_loss_and_training_defined_pc_support(self):
         delta = np.array([1., 2., 3., 4.])
@@ -339,7 +378,7 @@ class SurvivalContractTests(unittest.TestCase):
         cases = pd.DataFrame({"person_id": list("abcdefg"), "disease_date": [
             "2019-01-01", "2021-01-01", "2021-01-01", "2023-01-01", "2021-01-01", None, "2020-01-01"]})
         c = {"seed": 8, "max_rows_per_disease": 100, "train_fraction": .9,
-             "lookback_days": 365, "crossfit_folds": 2}
+             "lookback_days": 365}
         cohort = aou.build_cohort(base, scores, cases, c).set_index("person_id")
         self.assertEqual(set(cohort.index), {"b", "c", "d"})
         self.assertEqual(cohort.loc["b", "event_code"], 1)
@@ -349,14 +388,6 @@ class SurvivalContractTests(unittest.TestCase):
         permuted = aou.build_cohort(base.iloc[::-1], scores, cases, c).set_index("person_id")
         pd.testing.assert_series_equal(cohort.is_train.sort_index(), permuted.is_train.sort_index())
 
-    def test_inner_folds_keep_groups_together_and_ignore_row_order(self):
-        groups = np.array(["family-a", "family-b", "family-a", "family-c", "family-d"])
-        folds = transforms.grouped_folds(groups, 2, 81)
-        self.assertEqual(folds[0], folds[2])
-        np.testing.assert_array_equal(folds, transforms.grouped_folds(groups[::-1], 2, 81)[::-1])
-        with self.assertRaises(ValueError):
-            transforms.grouped_folds(["one", "one"], 2, 81)
-
     def test_score_api_does_not_use_ctn_mean_prediction(self):
         from unittest.mock import Mock
         data = pd.DataFrame({"PGS": [2., 5.]})
@@ -364,8 +395,8 @@ class SurvivalContractTests(unittest.TestCase):
         model.transformation_score.return_value = np.array([-.5, .5])
         np.testing.assert_array_equal(transforms.transformed_score(model, "ctn", data), [-.5, .5])
         model.predict.assert_not_called()
-        model.predict.return_value = {"mean_plugin": [1., 3.], "noise_scale": [2., 4.]}
-        np.testing.assert_array_equal(transforms.transformed_score(model, "location_scale", data), [.5, .5])
+        with self.assertRaisesRegex(ValueError, "frozen external CTN"):
+            transforms.transformed_score(model, "location_scale", data)
 
     def test_enrollment_lookback_is_required_without_future_survival_requirement(self):
         count = 20
@@ -380,7 +411,7 @@ class SurvivalContractTests(unittest.TestCase):
         scores = pd.DataFrame({"person_id": base.person_id, "PGS": np.arange(count)})
         cases = pd.DataFrame({"person_id": base.person_id, "disease_date": [None] * count})
         config = {"lookback_days": 365, "seed": 1, "train_fraction": .8,
-                  "max_rows_per_disease": 100, "crossfit_folds": 2}
+                  "max_rows_per_disease": 100}
         cohort = aou.build_cohort(base, scores, cases, config)
         self.assertEqual(len(cohort), count - 1)
         self.assertNotIn("0", set(cohort.person_id))
@@ -407,16 +438,21 @@ class SurvivalContractTests(unittest.TestCase):
             with tarfile.open(archive, "w") as tar:
                 tar.add(score, arcname=score.name)
             shared = root / "shared_features.tar.gz"
+            projection = root / "projection_pcs.parquet"
+            projection.write_bytes(b"projection artifact")
             with tarfile.open(shared, "w:gz") as tar:
                 tar.add(archive, arcname="shared_features/scores.tar")
-            extracted = aou.unpack_score_cache(shared, root / "extracted.tar")
+                tar.add(projection, arcname="shared_features/projection_pcs.parquet")
+            projected = root / "extracted.parquet"
+            extracted = aou.unpack_score_cache(shared, root / "extracted.tar", projected)
             self.assertEqual(extracted.read_bytes(), archive.read_bytes())
+            self.assertEqual(projected.read_bytes(), projection.read_bytes())
             for members in ([], ["first/scores.tar", "second/scores.tar"]):
                 with tarfile.open(shared, "w:gz") as tar:
                     for member in members:
                         tar.add(archive, arcname=member)
                 with self.assertRaisesRegex(ValueError, "exactly one scores.tar"):
-                    aou.unpack_score_cache(shared, extracted)
+                    aou.unpack_score_cache(shared, extracted, projected)
                 self.assertEqual(extracted.read_bytes(), archive.read_bytes())
                 self.assertEqual(list(root.glob("scores-*.partial")), [])
             actual = aou.load_cached_score(archive, "PGS001320")

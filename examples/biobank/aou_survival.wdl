@@ -9,6 +9,8 @@ workflow aou_survival {
     File identity_guard
     File status_code
     File score_transform
+    File reference_code
+    Array[File] reference_ctn
     File checkpoint_code
     File evaluation_code
     File score_panel
@@ -38,6 +40,8 @@ workflow aou_survival {
       identity_guard = identity_guard,
       status_code = status_code,
       score_transform = score_transform,
+      reference_code = reference_code,
+      reference_ctn = reference_ctn,
       checkpoint_code = checkpoint_code,
       evaluation_code = evaluation_code,
       score_panel = score_panel,
@@ -73,6 +77,8 @@ task analyze {
     File identity_guard
     File status_code
     File score_transform
+    File reference_code
+    Array[File] reference_ctn
     File checkpoint_code
     File evaluation_code
     File score_panel
@@ -107,6 +113,8 @@ task analyze {
     cp "~{identity_guard}" aou_identity.py
     cp "~{status_code}" aou_status.py
     cp "~{score_transform}" aou_score_transform.py
+    cp "~{reference_code}" reference_ctn.py
+    cp "~{write_json(reference_ctn)}" reference_ctn.json
     cp "~{checkpoint_code}" aou_checkpoint.py
     cp "~{evaluation_code}" aou_evaluation.py
     cp "~{score_panel}" score_panel.json
@@ -135,6 +143,7 @@ task analyze {
         --runtime-image runtime_image.json --checkpoint-uri "$8" \
         --endpoint-config endpoint.json \
         --score-panel score_panel.json \
+        --reference-ctn-list reference_ctn.json \
         "${resume_args[@]}" "${mode_args[@]}"
     ' bash "~{wheelhouse_archive}" "~{requirements}" "~{analysis_config}" \
       "~{phenotype_library_archive}" "~{shared_features_archive}" \
