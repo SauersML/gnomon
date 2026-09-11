@@ -102,6 +102,10 @@ task diagnose {
         "datetime_resolution": "cannot subtract",
         "score_ids_invalid": "score ids must be present and unique",
         "score_values_invalid": "cached score contains non-finite values",
+        "score_missingness_absent": "lacks per-participant missingness",
+        "score_missingness_invalid": "cached score has invalid missingness percentages",
+        "score_completely_missing": "completely missing scores cannot enter ctn",
+        "score_source_ambiguous": "ambiguous cached score source",
         "censoring_training_support": "insufficient training support for ancestry-specific censoring",
         "censoring_horizon_support": "evaluation horizon lacks censoring support",
         "censoring_weights_unstable": "event-time censoring weights are unstable",
@@ -164,7 +168,8 @@ task diagnose {
         Path(f"diagnostic__{label}.txt").write_text(label + "\n")
     # Only known public function names, never raw traceback paths or messages.
     functions = ("run", "read_ancestry", "unpack_phenotypes", "unpack_score_cache",
-                 "cached_score_ids", "person_times", "case_dates", "build_cohort",
+                 "cached_score_ids", "load_cached_score", "endpoint_scores",
+                 "person_times", "case_dates", "build_cohort",
                  "task_account", "publish_status", "validate_config", "load_score_panel",
                  "select_runtime_diseases", "query", "publish", "prepare_inputs",
                  "fit_worker", "fit_transform", "transformed_score",

@@ -15,11 +15,21 @@ LABELS = frozenset({
     "missing_pgs004536", "missing_pgs001783", "missing_pgs004525",
     "missing_pgs004603", "missing_pgs005199", "missing_pgs005331",
     "transforming_score", "applying_reference_ctn", "score_transform_ready", "fitting_disease", "fitting_death",
+    "failed_score_missingness_absent", "failed_score_missingness_invalid",
+    "failed_score_completely_missing", "failed_score_source_ambiguous",
 })
 
 
 def failure_label(error):
     message = str(error).lower()
+    for phrase, label in (
+        ("lacks per-participant missingness", "failed_score_missingness_absent"),
+        ("cached score has invalid missingness percentages", "failed_score_missingness_invalid"),
+        ("completely missing scores cannot enter ctn", "failed_score_completely_missing"),
+        ("ambiguous cached score source", "failed_score_source_ambiguous"),
+    ):
+        if phrase in message:
+            return label
     if "ancestry file lacks" in message:
         return "failed_ancestry_schema"
     if "relatedness prune" in message:
