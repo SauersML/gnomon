@@ -362,10 +362,12 @@ class SurvivalContractTests(unittest.TestCase):
         c = {"seed": 8, "max_rows_per_disease": 100, "train_fraction": .9,
              "lookback_days": 365}
         cohort = aou.build_cohort(base, scores, cases, c).set_index("person_id")
-        self.assertEqual(set(cohort.index), {"b", "c", "d"})
+        self.assertEqual(set(cohort.index), {"b", "c", "d", "e"})
         self.assertEqual(cohort.loc["b", "event_code"], 1)
         self.assertEqual(cohort.loc["c", "event_code"], 2)
         self.assertEqual(cohort.loc["d", "event_code"], 0)
+        self.assertEqual(cohort.loc["e", "event_code"], 1)
+        self.assertTrue(cohort.loc["e", "disease_death_same_day"])
         self.assertAlmostEqual(cohort.loc["d", "followup"], 731 / 365.25)
         permuted = aou.build_cohort(base.iloc[::-1], scores, cases, c).set_index("person_id")
         pd.testing.assert_series_equal(cohort.is_train.sort_index(), permuted.is_train.sort_index())

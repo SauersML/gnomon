@@ -369,9 +369,10 @@ def build_cohort(base, scores, cases, config):
                 & (df.disease_date.isna() | df.disease_date.gt(df.baseline))
                 & (df.death_date.isna() | df.death_date.gt(df.baseline)))
     df = df.loc[eligible].copy()
-    # Same-day disease/death lacks within-day ordering; exclude explicitly.
-    tied = df.disease_date.notna() & df.disease_date.eq(df.death_date) & df.disease_date.le(df.obs_end)
-    df = df.loc[~tied].copy()
+    # Recorded diagnosis takes precedence for same-day ties. Retain the
+    # participant; future event ordering must not select the baseline cohort.
+    df["disease_death_same_day"] = (df.disease_date.notna()
+        & df.disease_date.eq(df.death_date) & df.disease_date.le(df.obs_end))
     end = df[["obs_end", "disease_date", "death_date"]].min(axis=1)
     df["event_code"] = np.select([df.disease_date.eq(end), df.death_date.eq(end)], [1, 2], default=0)
     df["followup"] = (end - df.baseline).dt.days / 365.25
@@ -650,7 +651,7 @@ def analyze_partition(df, config, args, disease_dir, checkpoint, candidates, pgs
 def analyze_development(df, disease, config, args, disease_dir, checkpoint):
     """A smoke fit reuses the first development candidate without opening test data."""
     development = development_partition(df, config)
-    candidates = disease["candidates"][:1] if args.smoke_only else disease["candidates"]
+    candidates = disease["candidates"]
     reports = {}
     for pgs in candidates:
         development["PGS"] = development[pgs]
@@ -677,7 +678,7 @@ def run(args):
         # Validate all requested external models before accessing cohort data.
         requested = [panel["endpoints"][endpoint]] if endpoint else panel["endpoints"].values()
         for disease in requested:
-            for pgs in disease["candidates"][:1] if args.smoke_only else disease["candidates"]:
+            for pgs in disease["candidates"]:
                 load_reference(args.reference_ctn, args.output / "references" / pgs,
                                pgs, config["num_pcs"], config["projection_model_sha256"])
         # Reject an old wheel before queries or expensive score-model fits.
@@ -731,7 +732,7 @@ def run(args):
         score_cache = unpack_score_cache(args.scores, args.output / "scores.tar", projection_path)
         available_scores = cached_score_ids(score_cache)
         for disease in diseases.values():
-            required = disease["candidates"][:1] if args.smoke_only else disease["candidates"]
+            required = disease["candidates"]
             disease["missing_scores"] = sorted(set(required) - available_scores)
             for pgs in disease["missing_scores"]:
                 publish_status(args.checkpoint_uri, "missing_" + pgs.lower())
@@ -774,7 +775,8 @@ def run(args):
             publish_status(args.checkpoint_uri, "cohort_unsupported" if support_errors else "cohort_ready")
             counts = {"training": len(train), "held_out": len(test),
                       "training_disease_events": int((train.event_code == 1).sum()),
-                      "training_deaths": int((train.event_code == 2).sum())}
+                      "training_deaths": int((train.event_code == 2).sum()),
+                      "same_day_disease_death": int(df.disease_death_same_day.sum())}
             results[slug] = {"status": "unsupported" if support_errors else "cohort_ready",
                              "candidates": disease["candidates"], "support_errors": support_errors,
                              "counts": {key: value if value >= config["min_report_count"] else None
@@ -820,6 +822,7 @@ def run(args):
         "analysis_status": ("cohort_only" if args.prepare_only else
                             "development_smoke" if args.smoke_only else "completed"),
         "target": "first qualifying recorded disease after primary consent, competing death",
+        "same_day_event_rule": "recorded diagnosis takes precedence over death; no within-day order inferred",
         "baseline": "AoU primary-consent date (Consent PII Module descendants); continuous EHR lookback",
         "validation": "group holdout after published relatedness prune; 75/25 development split for the one prespecified model; outer test remains locked during development",
         "score_panel": panel,

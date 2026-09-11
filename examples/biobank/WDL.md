@@ -22,8 +22,11 @@ are excluded. We do not require future disease-free observation to enter.
 Follow-up ends at the earliest qualifying diagnosis, primary death date
 from `aou_death`, or the covering observation interval's end. Multiple primary
 death reports are reduced to the earliest date per person before joining. Observation
-gaps are not bridged. Same-day disease/death ties are excluded because their
-ordering is unknown. This predicts recorded diagnosis, not biological onset.
+gaps are not bridged. Same-day disease/death ties retain the participant and
+give precedence to the recorded diagnosis; this is a day-level endpoint convention,
+not an inference of within-day ordering. Their count is reported subject to
+the same small-cell suppression as other counts. This predicts recorded
+diagnosis, not biological onset.
 The resolved CDR release is recorded; horizons must be supported by that
 release's actual follow-up.
 
