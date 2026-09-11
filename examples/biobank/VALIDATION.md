@@ -57,9 +57,17 @@ A separate synthetic six-PC CTN fit completed on MSI in 6.87 seconds. With the
 same generated observations and configuration, multiplying PCs by `1e-3` and
 the score by `1e-5` caused GAM's identifiability audit to reject the fit (52 of
 65 joint columns retained). This demonstrates sensitivity to numerical units
-in this synthetic case. It is a candidate explanation for the workspace
-failure, not proof that the two failures have the same cause. No numerical
-repair or successful AoU training completion is claimed.
+in this synthetic case. Follow-up isolation passed with only PCs rescaled
+(6.41 seconds), but failed with only the score rescaled. The raw structural
+penalty sum in GAM's rank audit depends on those response units.
+
+[GAM PR #2884](https://github.com/SauersML/gam/pull/2884) normalizes the audit's
+individual PSD penalties without changing fitted penalties or rank tolerances.
+All 65 identifiability library tests passed on MSI, including extreme independent
+penalty units and a genuinely unidentified control. Native CTN validation and
+the exact-commit deployable runtime are still pending. This remains a candidate
+explanation for the workspace failure, not proof that the two failures have
+the same cause; no successful AoU training completion is claimed.
 
 These are software and numerical checks. They do not establish disease-risk
 calibration, predictive superiority, or a successful completed AoU training run.
