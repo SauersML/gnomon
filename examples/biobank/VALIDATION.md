@@ -56,8 +56,19 @@ four-center basis for six PCs. The test now uses eight centers, and the workflow
 rejects undersized Duchon bases before fitting. With that correction, the
 PC-varying synthetic survival fit exceeded its 90-second child limit. Its
 process group was terminated and no completion was accepted. The reference
-transform has been staged in the authorized workspace, but a new AoU training
-job has not been submitted under this specification.
+transform has been staged in the authorized workspace.
+
+## Bounded real training run
+
+On 2026-09-11, the real hypertension run with PGS004525 and the frozen 1000
+Genomes CTN was submitted and reached Workbench `RUNNING`. It uses GAM commit
+`994668d561f1c71d075ad388974e86aed7f4b971` and workflow source commit
+`3044701910c66833193118fa9d033a704329a4b6`. The run is a development-only primary
+score fit, with the outer test set untouched, at most 20,000 sampled cohort
+rows, four CPUs, 16 GiB RAM, 180 seconds per fit and a 30-minute task limit.
+It fits disease and competing-death components and records checkpoints inside
+the authorized workspace. This is an actual training attempt, not evidence of
+successful convergence or calibrated predictions; completion remains pending.
 
 ## Prior native artifact and historical checks
 
