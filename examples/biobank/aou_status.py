@@ -14,6 +14,7 @@ LABELS = frozenset({
     "failed_query", "failed_timeout", "failed_other",
     "missing_pgs004536", "missing_pgs001783", "missing_pgs004525",
     "missing_pgs004603", "missing_pgs005199", "missing_pgs005331",
+    "transforming_score", "score_transform_ready", "fitting_disease", "fitting_death",
 })
 
 

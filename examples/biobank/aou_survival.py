@@ -211,6 +211,17 @@ def cached_score_ids(archive):
     return ids
 
 
+def endpoint_scores(archive, disease, *, primary_only):
+    first = disease["candidates"][0]
+    scores = load_cached_score(archive, first)
+    scores[first] = scores.PGS
+    if not primary_only:
+        second = disease["candidates"][1]
+        scores = scores.merge(load_cached_score(archive, second).rename(columns={"PGS": second}),
+                              on="person_id", validate="one_to_one")
+    return scores
+
+
 def load_score_panel(path):
     panel = json.loads(Path(path).read_text())
     for endpoint in panel["endpoints"].values():
@@ -578,6 +589,7 @@ def analyze_partition(df, config, args, disease_dir, checkpoint, candidates):
                        "--normalizer", normalizer, "--fold", str(fold), "--output", str(stage_dir)]
             print(f"Transforming {slug}: {normalizer}, fold {fold}", flush=True)
             if not checkpoint.step_is_complete(stage_dir, model=True):
+                publish_status(args.checkpoint_uri, "transforming_score")
                 bounded_fit(command, config["stage1_timeout_seconds"], stage_dir / "fit.log")
                 files = ["scores.npz", "transform.gamfit"]
                 if fold < 0:
@@ -587,6 +599,7 @@ def analyze_partition(df, config, args, disease_dir, checkpoint, candidates):
             if fold == -1:
                 transforms[normalizer] = stage_dir / "transform.gamfit"
         df[f"Z_{normalizer}"] = assemble_scores(df, artifacts)
+        publish_status(args.checkpoint_uri, "score_transform_ready")
         transform_diagnostics[normalizer] = score_diagnostics(
             df.loc[~df.is_train, f"Z_{normalizer}"].to_numpy(), groups, config["min_report_count"])
         full_train_z = np.load(disease_dir / f"{normalizer}_fold_-1" / "training_replay.npy")
@@ -611,6 +624,7 @@ def analyze_partition(df, config, args, disease_dir, checkpoint, candidates):
                 command += ["--transform-model", str(transforms[normalizer])]
             print(f"Fitting {slug}: {candidate}, cause {cause}", flush=True)
             if not checkpoint.step_is_complete(fit_dir, model=True):
+                publish_status(args.checkpoint_uri, "fitting_disease" if cause == 1 else "fitting_death")
                 bounded_fit(command, config["fit_timeout_seconds"], fit_dir / "fit.log")
                 files = ["hazards.npz", "model.gamfit", "spec.json"]
                 if kind != "baseline":
@@ -698,6 +712,7 @@ def run(args):
                ("aou_identity.py", "aou_score_transform.py", "aou_checkpoint.py",
                 "aou_evaluation.py", "aou_status.py", "disease_selection.py")]]
     signature = {"config": config, "endpoint": endpoint,
+                 "score_scope": "primary" if args.smoke_only else "comparison",
                  "sources": {p.name: digest(p) for p in sources},
                  "inputs": {key: digest(getattr(args, key)) for key in
                             ("scores", "ancestry", "prune", "phenotypes", "score_panel")}}
@@ -731,7 +746,8 @@ def run(args):
         score_cache = unpack_score_cache(args.scores, args.output / "scores.tar")
         available_scores = cached_score_ids(score_cache)
         for disease in diseases.values():
-            disease["missing_scores"] = sorted(set(disease["candidates"]) - available_scores)
+            required = disease["candidates"][:1] if args.smoke_only else disease["candidates"]
+            disease["missing_scores"] = sorted(set(required) - available_scores)
             for pgs in disease["missing_scores"]:
                 publish_status(args.checkpoint_uri, "missing_" + pgs.lower())
         publish_status(args.checkpoint_uri, "reading_ancestry")
@@ -742,11 +758,7 @@ def run(args):
         for slug, disease in diseases.items():
             if disease["missing_scores"]:
                 continue
-            first, second = disease["candidates"]
-            scores = load_cached_score(score_cache, first)
-            scores[first] = scores.PGS
-            scores = scores.merge(load_cached_score(score_cache, second).rename(columns={"PGS": second}),
-                                  on="person_id", validate="one_to_one")
+            scores = endpoint_scores(score_cache, disease, primary_only=args.smoke_only)
             cases = case_dates(client, config["workspace_cdr"], disease["concept_id"])
             df = build_cohort(base, scores, cases, config)
             disease_dir = args.output / slug
@@ -785,6 +797,7 @@ def run(args):
             continue
         if support_errors:
             raise ValueError("; ".join(support_errors))
+        publish_status(args.checkpoint_uri, "cohort_ready")
         selection_reports = analyze_development(df, disease, config, args, disease_dir, checkpoint)
         if args.smoke_only:
             results[slug] = {"status": "development_smoke_completed",

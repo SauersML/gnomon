@@ -27,6 +27,21 @@ from aou_evaluation import audit_groups, paired_loss_summary
 
 
 class SurvivalContractTests(unittest.TestCase):
+    def test_primary_pilot_does_not_depend_on_challenger_availability(self):
+        disease = {"candidates": ["PGS004525", "PGS004603"]}
+        first = pd.DataFrame({"person_id": ["101", "102"], "PGS": [0.2, 0.8]})
+        second = pd.DataFrame({"person_id": ["102"], "PGS": [-0.4]})
+        with patch.object(aou, "load_cached_score", return_value=first.copy()) as load:
+            pilot = aou.endpoint_scores("scores.tar", disease, primary_only=True)
+        load.assert_called_once_with("scores.tar", "PGS004525")
+        self.assertEqual(pilot.person_id.tolist(), ["101", "102"])
+        self.assertNotIn("PGS004603", pilot)
+        with patch.object(aou, "load_cached_score", side_effect=[first.copy(), second]):
+            comparison = aou.endpoint_scores("scores.tar", disease, primary_only=False)
+        self.assertEqual(comparison.person_id.tolist(), ["102"])
+        self.assertEqual(comparison.PGS004525.tolist(), [0.8])
+        self.assertEqual(comparison.PGS004603.tolist(), [-0.4])
+
     def test_status_uses_the_validated_default_metadata_identity(self):
         with patch("aou_status.task_account") as account, \
              patch("aou_status.urlopen", side_effect=[

@@ -103,10 +103,12 @@ The first run should use `--prepare-only`: it checks real score availability,
 cohort fields, event counts and horizon support without fitting models.
 After that and native acceptance pass, `--smoke-only` fits the first
 prespecified score using only the development split: cross-fitted CTN and two
-cause-specific outcome models. It performs the same persistence, batching,
+cause-specific outcome models. Only that primary score must be cached for the
+smoke run; a missing challenger still blocks the later two-score comparison.
+It performs the same persistence, batching,
 monotonicity and CIF checks as the full analysis. It neither selects a score
-nor evaluates the outer test set. Its completed development fits are reusable
-by the full comparison through the same checkpoint.
+nor evaluates the outer test set. Primary-score and matched-comparison cohorts
+have separate checkpoint signatures because their score-coverage sets can differ.
 The pilot caps rows, CPUs, query bytes/time and each fit's wall time.
 A failed step raises an error; its process group is stopped.
 
@@ -181,9 +183,10 @@ uses unique source/config-hashed paths and writes a submission receipt under
 start a local polling process. Use Workbench's job UI to inspect/cancel it.
 `--endpoint` narrows execution after the existing selector; it never overrides
 eligibility. Run endpoints separately when a combined run would exceed its
-wall budget. A checkpoint can move from preflight to smoke to full comparison
-for the same endpoint, inputs and configuration. Keep the endpoint fixed when
-resuming; its name is included in the checkpoint signature.
+wall budget. Resume a checkpoint only for the same endpoint, score scope,
+inputs and configuration. Comparison preflight checkpoints can feed the full
+comparison; primary-score smoke checkpoints resume that smoke. Both endpoint
+and score scope are included in the checkpoint signature.
 
 When the AoU perimeter blocks raw log downloads, `aou_diagnostic.wdl` can
 inspect a failed task's stderr inside the same workspace. It emits only fixed
