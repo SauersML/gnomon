@@ -82,7 +82,15 @@ The in-workspace diagnostic reported the GAM error in `transformed_score`.
 A corrected real run using commit `dd8dad7c` was submitted with the same cohort
 definition, runtime, reference transform, and resource caps and reached
 Workbench `RUNNING`. The diagnostic completed; fitted-model acceptance for
-the corrected run is still pending.
+the corrected run failed: it passed the external CTN replay and reached real
+hypertension fitting, then exceeded the 180-second child-fit budget. Its
+process group was terminated and the workspace emitted `failed_timeout`.
+
+The next bounded capacity probe retains six PCs, baseline age/sex, both
+separate Duchon surfaces, the same 20,000-row sampling cap and the same fit
+timeout. It reduces baseline/slope centers from 32/16 to 8/8 and time knots
+from four to two. This is a speed/convergence probe, not a selected optimum;
+it neither changes the cohort definition nor opens the outer test set.
 
 ## Prior native artifact and historical checks
 
