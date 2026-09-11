@@ -801,7 +801,7 @@ def run(args):
         frame = disease_dir / "cohort.parquet"
         df = pd.read_parquet(frame)
         train, test = df.loc[df.is_train], df.loc[~df.is_train]
-        support_errors = partition_support(train, test, config)
+        support_errors = [] if args.smoke_only else partition_support(train, test, config)
         development = development_partition(df, config)
         support_errors += [f"development: {error}" for error in partition_support(
             development.loc[development.is_train], development.loc[~development.is_train], config)]
