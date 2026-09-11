@@ -27,6 +27,24 @@ from aou_evaluation import audit_groups, paired_loss_summary
 
 
 class SurvivalContractTests(unittest.TestCase):
+    def test_sparse_censoring_support_is_not_reported_as_valid_accuracy(self):
+        train = pd.DataFrame({"event_code": [1, 2] * 30, "followup": [2.] * 60,
+                              "ancestry": ["major"] * 59 + ["rare"]})
+        test = pd.DataFrame({"event_code": [1, 0] * 10, "followup": [2.] * 20,
+                             "ancestry": ["rare"] * 20})
+        config = {"min_train_events_per_cause": 30, "min_report_count": 20,
+                  "horizons_years": [1.]}
+        self.assertEqual(aou.fit_support(train, test, config), [])
+        self.assertTrue(aou.partition_support(train, test, config))
+        metrics = aou.evaluate(train, test, np.full((20, 1), .1), [1.], 20)
+        self.assertEqual(metrics[0]["status"], "insufficient_support")
+        self.assertNotIn("brier", metrics[0])
+        reports = {pgs: {"models": {"pc_varying_ctn": {"metrics": metrics}}}
+                   for pgs in ("PGS004525", "PGS004603")}
+        with self.assertRaisesRegex(ValueError, "supported development Brier"):
+            aou.select_development_score(reports, [1.])
+        self.assertTrue(aou.fit_support(train.iloc[:20], test, config))
+
     def test_failed_worker_retains_private_log_without_completion_receipt(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)

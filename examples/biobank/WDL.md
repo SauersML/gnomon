@@ -217,8 +217,13 @@ sequentially with a checkpoint after each completed unit. Each fit has a
 180-second wall cap, each query a 120-second cap and a billed-byte ceiling;
 the command has a 30-minute cap and zero automatic retries. Temporary storage
 and solver caches use the attached task disk. A child timeout terminates its
-process group. Insufficient events/support fail before fitting; increase the
-sample budget only after inspecting that signal. Population event frequencies
+process group. Insufficient training events fail before fitting. The primary-score
+smoke run records unsupported censoring-adjusted evaluation separately and emits
+no accuracy estimate for those horizons; finite predictions do not establish
+calibration. Score selection and matched comparisons still require censoring
+support before fitting. Increase the sample budget only after inspecting that
+signal. Failed-worker logs and partial models are checkpointed privately without
+a completion receipt. Population event frequencies
 are never replaced with a balanced case/control sample.
 
 Run static and synthetic contract validation on MSI using the existing warm

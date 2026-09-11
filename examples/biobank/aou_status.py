@@ -9,7 +9,7 @@ from aou_identity import task_account
 
 LABELS = frozenset({
     "reading_ancestry", "loading_person_times", "preparing_cohort",
-    "cohort_ready", "cohort_unsupported", "scores_missing", "smoke_completed",
+    "cohort_ready", "cohort_unsupported", "evaluation_unsupported", "scores_missing", "smoke_completed",
     "analysis_completed", "failed_ancestry_schema", "failed_prune_schema",
     "failed_query", "failed_timeout", "failed_other",
     "missing_pgs004536", "missing_pgs001783", "missing_pgs004525",

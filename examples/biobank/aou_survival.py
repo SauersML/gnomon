@@ -260,13 +260,18 @@ def select_development_score(reports, horizons):
     return min(losses, key=lambda pgs: (losses[pgs], pgs)), losses
 
 
-def partition_support(train, test, config):
+def fit_support(train, test, config):
     errors = []
     for cause in (1, 2):
         if (train.event_code == cause).sum() < config["min_train_events_per_cause"]:
             errors.append(f"insufficient training events for cause {cause}")
     if len(test) < config["min_report_count"]:
         errors.append("too few held-out participants")
+    return errors
+
+
+def partition_support(train, test, config):
+    errors = fit_support(train, test, config)
     for horizon in config["horizons_years"]:
         try:
             ipcw_weights(train, test, horizon)
@@ -415,7 +420,12 @@ def ipcw_weights(train, test, horizon):
 def evaluate(train, test, risk, horizons, min_count):
     rows = []
     for j, horizon in enumerate(horizons):
-        weights = ipcw_weights(train, test, horizon)
+        try:
+            weights = ipcw_weights(train, test, horizon)
+        except ValueError as error:
+            rows.append({"group": "overall", "horizon": horizon,
+                         "status": "insufficient_support", "reason": str(error)})
+            continue
         y = ((test.event_code == 1) & (test.followup <= horizon)).to_numpy(float)
         groups = audit_groups(train, test)
         # Fixed probability intervals, not test-outcome-selected bins.
@@ -582,7 +592,8 @@ def analyze_partition(df, config, args, disease_dir, checkpoint, candidates):
     frame = disease_dir / "cohort.parquet"
     df.to_parquet(frame, index=False)
     train, test = df.loc[df.is_train], df.loc[~df.is_train]
-    errors = partition_support(train, test, config)
+    support_check = fit_support if args.smoke_only else partition_support
+    errors = support_check(train, test, config)
     if errors:
         raise ValueError("; ".join(errors))
     transforms = {}
@@ -656,7 +667,7 @@ def analyze_partition(df, config, args, disease_dir, checkpoint, candidates):
         models[candidate] = {"cif_grid_error": error, "metrics": evaluate(
             train, test, risk, config["horizons_years"], config["min_report_count"])}
     comparisons = []
-    for j, horizon in enumerate(config["horizons_years"]):
+    for j, horizon in enumerate(config["horizons_years"] if len(candidate_risks) > 1 else []):
         weights = ipcw_weights(train, test, horizon)
         target = ((test.event_code == 1) & (test.followup <= horizon)).to_numpy(float)
         full_loss = weights * (target - candidate_risks["pc_varying_ctn"][:, j])**2
@@ -804,13 +815,20 @@ def run(args):
                              "counts": {key: value if value >= config["min_report_count"] else None
                                         for key, value in counts.items()}}
             continue
+        required_errors = (fit_support(development.loc[development.is_train],
+                                       development.loc[~development.is_train], config)
+                           if args.smoke_only else support_errors)
+        if required_errors:
+            publish_status(args.checkpoint_uri, "cohort_unsupported")
+            raise ValueError("; ".join(required_errors))
         if support_errors:
-            raise ValueError("; ".join(support_errors))
+            publish_status(args.checkpoint_uri, "evaluation_unsupported")
         publish_status(args.checkpoint_uri, "cohort_ready")
         selection_reports = analyze_development(df, disease, config, args, disease_dir, checkpoint)
         if args.smoke_only:
             results[slug] = {"status": "development_smoke_completed",
                              "prespecified_pgs": disease["candidates"][0],
+                             "evaluation_support_errors": support_errors,
                              "development": selection_reports}
             checkpoint.publish()
             publish_status(args.checkpoint_uri, "smoke_completed")
