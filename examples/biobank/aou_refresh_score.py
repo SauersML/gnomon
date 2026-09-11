@@ -98,7 +98,7 @@ def refresh(args):
         os.chdir(score_dir)
         try:
             bounded_fit([str(args.scorer), "score", str(args.weights),
-                         specification["genotype_prefix"], "--keep", str(keep), "--emit-components"],
+                         specification["genotype_prefix"] + ".bed", "--keep", str(keep), "--emit-components"],
                         specification["timeout_seconds"], args.output / "score.log")
         except Exception:
             # Preserve the native error in workspace storage even when WDL
@@ -112,7 +112,8 @@ def refresh(args):
             for phrases, label in (
                 (("permission denied", "403", "request violates vpc"), "failed_scoring_permissions"),
                 (("credentials", "unauthenticated", "401"), "failed_scoring_credentials"),
-                (("no such file", "not found", "404", "no filesets", "unsupported input"), "failed_scoring_input"),
+                (("no such file", "not found", "404", "no filesets", "unsupported input",
+                  "could not determine input format"), "failed_scoring_input"),
                 (("unexpected argument", "unrecognized", "usage:"), "failed_scoring_cli"),
                 (("certificate", "tls", "ssl"), "failed_scoring_tls"),
                 (("panicked", "symbol lookup", "glibc"), "failed_scoring_runtime"),
