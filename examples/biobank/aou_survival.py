@@ -664,14 +664,6 @@ def run(args):
             for pgs in disease["candidates"]:
                 load_reference(args.reference_ctn, args.output / "references" / pgs,
                                pgs, config["num_pcs"], config["projection_model_sha256"])
-        # Reject an old wheel before queries or expensive score-model fits.
-        validation = gamfit.validate_formula(
-            pd.DataFrame({"entry": [0.] * 6, "followup": [1., 2., 3., 4., 5., 6.],
-                          "event": [0, 1, 0, 1, 0, 1], "Z": [-2., -1., -.5, .5, 1., 2.]}),
-            "Surv(entry, followup, event) ~ 1", survival_likelihood="marginal-slope",
-            z_column="Z", slope_formula="1", config={"frozen_score": True})
-        if not validation.supported_by_python:
-            raise ValueError("native engine does not support the frozen-score survival contract")
     image = json.loads(args.runtime_image.read_text())
     if not re.fullmatch(r"[^\s]+@sha256:[0-9a-f]{64}", image):
         raise ValueError("runtime_image must use an immutable digest")
