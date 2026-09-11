@@ -206,6 +206,8 @@ The configured panel contains up to three selected diseases, at most 5,000
 outcome-blind sampled rows each, four CPUs, 16 GiB RAM, and 50 GiB disk.
 With two internal folds, development selection and final matched comparisons
 require 12 transform fits and 14 cause-specific fits per endpoint. They run
+with an explicit two-interior-knot CTN response basis for this bounded pilot;
+larger shape budgets require a separate development comparison. The fits run
 sequentially with a checkpoint after each completed unit. Each fit has a
 180-second wall cap, each query a 120-second cap and a billed-byte ceiling;
 the command has a 30-minute cap and zero automatic retries. Temporary storage

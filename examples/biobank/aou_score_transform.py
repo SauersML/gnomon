@@ -69,7 +69,8 @@ def fit_transform(frame_path, config_path, kind, fold, output):
     if train.empty or held.empty:
         raise ValueError("empty score-model training or held-out partition")
     rhs = stage1_rhs(config)
-    options = {"transformation_normal": True} if kind == "ctn" else {
+    options = {"transformation_normal": True, "config": {"transformation_normal_config": {
+        "response_num_internal_knots": config["stage1_response_knots"]}}} if kind == "ctn" else {
         "family": "gaussian", "noise_formula": rhs}
     model = gamfit.fit(train, f"PGS ~ {rhs}", persistent_warm_start_root=output / "warm", **options)
     z = transformed_score(model, kind, held)

@@ -50,7 +50,7 @@ def validate_config(c):
         "max_rows_per_disease", "train_fraction", "seed", "horizons_years",
         "grid_intervals", "fit_timeout_seconds", "query_timeout_seconds",
         "maximum_bytes_billed", "min_train_events_per_cause", "min_report_count",
-        "lookback_days", "crossfit_folds", "stage1_centers", "stage1_age_k", "stage1_timeout_seconds",
+        "lookback_days", "crossfit_folds", "stage1_centers", "stage1_age_k", "stage1_response_knots", "stage1_timeout_seconds",
     }
     if set(c) != expected:
         raise ValueError("analysis configuration has missing or unknown keys")
@@ -68,6 +68,8 @@ def validate_config(c):
         raise ValueError("smooths require at least four centers")
     if not 2 <= c["crossfit_folds"] <= 5 or c["stage1_centers"] < 4 or c["stage1_age_k"] < 4:
         raise ValueError("stage one requires 2–5 folds and basis sizes of at least four")
+    if c["stage1_response_knots"] < 2:
+        raise ValueError("stage one requires at least two response knots")
     if c["min_report_count"] < 20 or c["min_train_events_per_cause"] < 20:
         raise ValueError("pilot requires at least 20 observations per reported cell/event class")
     if type(c["seed"]) is not int or not c["gamfit_version"]:

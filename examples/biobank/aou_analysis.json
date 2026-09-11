@@ -12,6 +12,7 @@
   "crossfit_folds": 2,
   "stage1_centers": 8,
   "stage1_age_k": 5,
+  "stage1_response_knots": 2,
   "stage1_timeout_seconds": 180,
   "horizons_years": [1.0, 3.0, 5.0],
   "grid_intervals": 200,
