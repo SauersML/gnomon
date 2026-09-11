@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 import zipfile
 
 import numpy as np
@@ -165,13 +166,31 @@ def read_ancestry(ancestry, prune, num_pcs):
 
 def unpack_score_cache(archive, output):
     """Read pgsEngine's real shared-feature artifact without extracting genotypes."""
-    with tarfile.open(archive, "r:*") as tar:
-        members = [member for member in tar if member.isfile() and Path(member.name).name == "scores.tar"]
-        if len(members) != 1:
-            raise ValueError("expected exactly one scores.tar in the pgsEngine shared-feature archive")
-        with tar.extractfile(members[0]) as source, Path(output).open("wb") as target:
-            shutil.copyfileobj(source, target, length=1024 * 1024)
-    return Path(output)
+    output = Path(output)
+    with tempfile.NamedTemporaryFile(dir=output.parent, prefix="scores-", suffix=".partial",
+                                     delete=False) as target:
+        temporary = Path(target.name)
+        try:
+            count = 0
+            # Streaming avoids scanning the multi-GB gzip and then decompressing
+            # it again to seek back to the score member. Still inspect the rest
+            # of the archive to reject duplicate score members.
+            with tarfile.open(archive, "r|gz") as tar:
+                for member in tar:
+                    if not member.isfile() or Path(member.name).name != "scores.tar":
+                        continue
+                    count += 1
+                    if count > 1:
+                        raise ValueError("expected exactly one scores.tar in the pgsEngine shared-feature archive")
+                    with tar.extractfile(member) as source:
+                        shutil.copyfileobj(source, target, length=1024 * 1024)
+            if count != 1:
+                raise ValueError("expected exactly one scores.tar in the pgsEngine shared-feature archive")
+            target.close()
+            temporary.replace(output)
+        finally:
+            temporary.unlink(missing_ok=True)
+    return output
 
 
 def load_cached_score(archive, pgs):

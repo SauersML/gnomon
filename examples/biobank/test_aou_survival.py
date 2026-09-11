@@ -411,6 +411,14 @@ class SurvivalContractTests(unittest.TestCase):
                 tar.add(archive, arcname="shared_features/scores.tar")
             extracted = aou.unpack_score_cache(shared, root / "extracted.tar")
             self.assertEqual(extracted.read_bytes(), archive.read_bytes())
+            for members in ([], ["first/scores.tar", "second/scores.tar"]):
+                with tarfile.open(shared, "w:gz") as tar:
+                    for member in members:
+                        tar.add(archive, arcname=member)
+                with self.assertRaisesRegex(ValueError, "exactly one scores.tar"):
+                    aou.unpack_score_cache(shared, extracted)
+                self.assertEqual(extracted.read_bytes(), archive.read_bytes())
+                self.assertEqual(list(root.glob("scores-*.partial")), [])
             actual = aou.load_cached_score(archive, "PGS001320")
             self.assertEqual(actual.person_id.tolist(), ["1", "2"])
             self.assertEqual(actual.PGS.tolist(), [.25, -.5])

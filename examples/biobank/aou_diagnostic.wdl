@@ -114,6 +114,17 @@ task diagnose {
         "worker_grid_complete": "worker_grid_complete",
         "worker_validation_complete": "worker_validation_complete",
         "runtime_error": "runtimeerror:",
+        "gam_error": "gamerror:",
+        "gam_basis_error": "basiserror:",
+        "gam_linear_solve_error": "linearsystemsolveerror:",
+        "gam_constraint_error": "parameterconstrainterror:",
+        "gam_inner_convergence_error": "pirlsconvergenceerror:",
+        "gam_outer_convergence_error": "remlconvergenceerror:",
+        "gam_hessian_error": "hessiannotpositivedefiniteerror:",
+        "gam_geometry_error": "geometryerror:",
+        "gam_input_error": "invalidinputerror:",
+        "gam_monotone_root_error": "monotonerooterror:",
+        "gam_cache_error": "cachestoreerror:",
         "attribute_error": "attributeerror:",
         "file_missing": "filenotfounderror:",
         "query_bad_request": "google.api_core.exceptions.badrequest:",
@@ -145,7 +156,7 @@ task diagnose {
                  "cached_score_ids", "person_times", "case_dates", "build_cohort",
                  "task_account", "publish_status", "validate_config", "load_score_panel",
                  "select_runtime_diseases", "query", "publish", "prepare_inputs",
-                 "fit_worker", "transform_worker", "fit_ctn", "transformed_score",
+                 "fit_worker", "fit_transform", "transformed_score",
                  "analyze_partition", "checkpointed_fit", "bounded_fit")
     for function in functions:
         if re.search(r", in " + re.escape(function) + r"\s*\n", log):
