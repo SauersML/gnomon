@@ -114,10 +114,6 @@ class SurvivalContractTests(unittest.TestCase):
         metrics = aou.evaluate(train, test, np.full((20, 1), .1), [1.], 20)
         self.assertEqual(metrics[0]["status"], "insufficient_support")
         self.assertNotIn("brier", metrics[0])
-        reports = {pgs: {"models": {"pc_varying_ctn": {"metrics": metrics}}}
-                   for pgs in ("PGS004525", "PGS004603")}
-        with self.assertRaisesRegex(ValueError, "supported development Brier"):
-            aou.select_development_score(reports, [1.])
         self.assertTrue(aou.fit_support(train.iloc[:20], test, config))
 
     def test_failed_worker_retains_private_log_without_completion_receipt(self):
@@ -136,20 +132,14 @@ class SurvivalContractTests(unittest.TestCase):
             self.assertEqual(retained, ["worker failure evidence\n"])
             self.assertFalse(checkpoint.step_is_complete(directory, model=True))
 
-    def test_primary_pilot_does_not_depend_on_challenger_availability(self):
-        disease = {"candidates": ["PGS004525", "PGS004603"]}
+    def test_prespecified_score_retains_its_cohort(self):
+        disease = {"candidates": ["PGS004525"]}
         first = pd.DataFrame({"person_id": ["101", "102"], "PGS": [0.2, 0.8]})
-        second = pd.DataFrame({"person_id": ["102"], "PGS": [-0.4]})
         with patch.object(aou, "load_cached_score", return_value=first.copy()) as load:
-            pilot = aou.endpoint_scores("scores.tar", disease, primary_only=True)
+            pilot = aou.endpoint_scores("scores.tar", disease)
         load.assert_called_once_with("scores.tar", "PGS004525")
         self.assertEqual(pilot.person_id.tolist(), ["101", "102"])
         self.assertNotIn("PGS004603", pilot)
-        with patch.object(aou, "load_cached_score", side_effect=[first.copy(), second]):
-            comparison = aou.endpoint_scores("scores.tar", disease, primary_only=False)
-        self.assertEqual(comparison.person_id.tolist(), ["102"])
-        self.assertEqual(comparison.PGS004525.tolist(), [0.8])
-        self.assertEqual(comparison.PGS004603.tolist(), [-0.4])
 
     def test_status_uses_the_validated_default_metadata_identity(self):
         with patch("aou_status.task_account") as account, \
@@ -195,9 +185,8 @@ class SurvivalContractTests(unittest.TestCase):
         frame = pd.DataFrame({"person_id": np.arange(200), "split_group": np.arange(200),
                               "is_train": np.arange(200) < 160,
                               "PGS004536": np.arange(200) * .1, "PGS001783": np.arange(200) * -.2})
-        disease = {"candidates": ["PGS004536", "PGS001783"]}
-        with patch.object(aou, "analyze_partition", return_value=({"smoke": "checked"}, {})) as fit, \
-             patch.object(aou, "select_development_score") as select:
+        disease = {"candidates": ["PGS004536"]}
+        with patch.object(aou, "analyze_partition", return_value=({"smoke": "checked"}, {})) as fit:
             result = aou.analyze_development(frame, disease, {"seed": 13},
                 SimpleNamespace(smoke_only=True), Path("results/endpoint"), object())
         fit.assert_called_once()
@@ -205,13 +194,15 @@ class SurvivalContractTests(unittest.TestCase):
         self.assertTrue(set(fitted.person_id).isdisjoint(set(frame.loc[~frame.is_train, "person_id"])))
         np.testing.assert_array_equal(fitted.PGS, fitted.PGS004536)
         self.assertEqual(set(result), {"PGS004536"})
-        select.assert_not_called()
 
     def test_score_panel_excludes_upstream_aou_training(self):
-        panel = aou.load_score_panel(Path(__file__).with_name("aou_pgs_panel.json"))
+        path = Path(__file__).with_name("aou_pgs_panel.json")
+        panel = aou.load_score_panel(path, exploratory=True)
         self.assertEqual(set(panel["endpoints"]), {"copd", "hypertension", "obesity"})
         self.assertIn("PGS004787", panel["excluded"])
-        self.assertTrue(all(len(e["candidates"]) == 2 for e in panel["endpoints"].values()))
+        self.assertTrue(all(len(e["candidates"]) == 1 for e in panel["endpoints"].values()))
+        with self.assertRaisesRegex(ValueError, "final analysis requires completed"):
+            aou.load_score_panel(path, exploratory=False)
 
     def test_development_never_contains_outer_test_and_is_outcome_blind(self):
         frame = pd.DataFrame({"person_id": np.arange(200), "split_group": np.arange(200) // 2,
@@ -223,15 +214,6 @@ class SurvivalContractTests(unittest.TestCase):
         altered["event_code"] = 99
         np.testing.assert_array_equal(aou.development_partition(altered, config).is_train, dev.is_train)
         self.assertEqual(dev.groupby("split_group").is_train.nunique().max(), 1)
-
-    def test_selection_uses_supported_development_probability_loss(self):
-        def report(loss, status="ok"):
-            return {"models": {"pc_varying_ctn": {"metrics": [
-                {"group": "overall", "horizon": 3., "status": status, "brier": loss}]}}}
-        selected, losses = aou.select_development_score({"PGS004536": report(.1), "PGS001783": report(.09)}, [3.])
-        self.assertEqual(selected, "PGS001783")
-        with self.assertRaisesRegex(ValueError, "supported development"):
-            aou.select_development_score({"PGS004536": report(.1), "PGS001783": report(.09, "insufficient_support")}, [3.])
 
     def test_checkpoint_integrity_native_engine_and_unsafe_members(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -436,7 +418,7 @@ class SurvivalContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             score = root / "arrays_PGS001320.sscore"
-            score.write_text("#IID\tPGS001320_AVG\n1\t0.25\n2\t-0.5\n")
+            score.write_text("#IID\tPGS001320_AVG\tPGS001320_MISSING_PCT\n1\t0.25\t0\n2\t-0.5\t2\n")
             archive = root / "scores.tar"
             with tarfile.open(archive, "w") as tar:
                 tar.add(score, arcname=score.name)
@@ -461,10 +443,25 @@ class SurvivalContractTests(unittest.TestCase):
             actual = aou.load_cached_score(archive, "PGS001320")
             self.assertEqual(actual.person_id.tolist(), ["1", "2"])
             self.assertEqual(actual.PGS.tolist(), [.25, -.5])
+            self.assertEqual(actual.PGS001320_MISSING_PCT.tolist(), [0, 2])
             with tarfile.open(archive, "a") as tar:
                 tar.add(score, arcname="second.sscore")
             with self.assertRaises(ValueError):
                 aou.load_cached_score(archive, "PGS001320")
+
+    def test_cached_score_rejects_missingness_before_transformation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = Path(tmp) / "scores.tar"
+            for content in ("#IID\tPGS001320_AVG\n1\t0\n", *[
+                    f"#IID\tPGS001320_AVG\tPGS001320_MISSING_PCT\n1\t0\t{value}\n"
+                    for value in (100, -1, 101, "nan")]):
+                with tarfile.open(archive, "w") as tar:
+                    payload = content.encode()
+                    item = tarfile.TarInfo("score.sscore")
+                    item.size = len(payload)
+                    tar.addfile(item, io.BytesIO(payload))
+                with self.assertRaises(ValueError):
+                    aou.load_cached_score(archive, "PGS001320")
 
     def test_analysis_has_no_fake_deployment_values(self):
         config = json.loads(Path(__file__).with_name("aou_analysis.json").read_text())

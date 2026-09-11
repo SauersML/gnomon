@@ -3,6 +3,27 @@
 Recorded 2026-09-11 UTC. Synthetic checks run on MSI; participant computation
 and all participant artifacts remain inside the AoU workspace.
 
+## Native composition update in progress
+
+The workflow now specifies one score and one PC-varying marginal-slope model,
+with disease and competing-death components. The Python workflow delegates the
+saved CTN/outcome composition to GAM's native model. This requires the native
+GAM update in [PR #2886](https://github.com/SauersML/gam/pull/2886), which is still
+under validation; the previous wheel and reference model are not acceptance
+evidence for the new payload format.
+
+The smaller real hypertension probe `aou-hypertension-small-20260911-154600`
+also failed. Its fixed workspace status files show successful reference CTN
+application followed by `fitting_disease` and `failed_timeout`. The 8/8-center
+disease model did not complete within the 180-second child limit. This is not
+a completed training run or a diagnosis of the numerical cause. No additional
+AoU run has been submitted while the native integration and input contracts
+are being repaired.
+
+The following results describe earlier revisions, not the unvalidated native
+composition update. Reference/target effective score identity and completed
+upstream provenance remain required before final analysis.
+
 ## External-reference revision
 
 CTN training has moved out of AoU. The workflow only loads frozen reference

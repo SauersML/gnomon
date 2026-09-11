@@ -1,20 +1,20 @@
 {
   "checked_date": "2026-09-10",
-  "status": "Prespecified development candidates; no benchmark ranking or participant-level non-overlap certification.",
-  "selection_rule": "Select using development predictions only; give the selected score to every matched downstream method. Never choose using the outer test set or published AoU performance.",
+  "status": "One prespecified score per endpoint; no benchmark ranking or participant-level non-overlap certification.",
+  "selection_rule": "Use the prespecified score with CTN and PC-varying marginal-slope survival. No score or model search; keep the outer test locked during development.",
   "provenance_rule": "Audit discovery GWAS, component scores and supervised tuning. Prior AoU evaluation is distinct from development. Undisclosed cross-enrollment cannot be excluded by public cohort names.",
   "endpoints": {
     "copd": {
       "snomed_code": "13645005",
-      "candidates": ["PGS004536", "PGS001783"]
+      "candidates": ["PGS004536"]
     },
     "hypertension": {
       "snomed_code": "38341003",
-      "candidates": ["PGS004525", "PGS004603"]
+      "candidates": ["PGS004525"]
     },
     "obesity": {
       "snomed_code": "414916001",
-      "candidates": ["PGS005199", "PGS005331"]
+      "candidates": ["PGS005199"]
     }
   },
   "scores": {

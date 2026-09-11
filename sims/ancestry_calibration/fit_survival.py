@@ -91,7 +91,7 @@ def fit_gamfit(fit_df, test_df, pccols, centers, c_admin):
         data_fit[c] = fit_df[c].astype(float).values
         data_te[c] = test_df[c].astype(float).values
     model = gamfit.fit(data_fit, formula=f"Surv(time, event) ~ {terms}",
-                       survival_likelihood="marginal-slope", z_column="z", logslope_formula=terms)
+                       survival_likelihood="marginal-slope", z_column="z", slope_formula=terms)
     pred = model.predict(data_te)
     # risk_score_at(horizon) = per-row cumulative hazard (Harrell-C ordering).
     horizon = float(fit_df["surv_time"].max())

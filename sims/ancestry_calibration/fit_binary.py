@@ -3,7 +3,7 @@
 
 Recalibration methods, in display order:
   - gamfit  : bernoulli marginal-slope, link=probit, z=PGS_z, marginal and
-              log-slope surfaces = duchon(PC1..PCk, centers=C) (pure Duchon spline;
+              signed slope surfaces = duchon(PC1..PCk, centers=C) (pure Duchon spline;
               best per-deme marginal-slope recovery in the basis benchmark). No wiggle.
   - linpc   : logistic on PGS_z + linear PCs (no z x PC interaction).
   - znorm   : ancestry mean+log-variance adjustment of PGS_raw as OLS on the
@@ -16,8 +16,8 @@ TEST-SET DISCIPLINE: models are FIT on the recalibration rows (split_role=='fit'
 spanning all ancestries) and ALL metrics are computed on the held-out rows
 (split_role=='test'). The P+T 'GWAS' rows never appear here.
 
-DISCRIMINATION (AUC, Brier, and Lee-2011 liability R2) is on the real
-outcome y_binary, GLOBAL only -- never within an ancestry stratum.
+Outcome metrics use y_binary globally and within ancestry strata. The
+Lee-style observed-outcome liability conversion is not an oracle metric.
 Risk accuracy is against the known generative risk p_true, per ancestry stratum:
 average prediction error, probit risk spread ratio, rmse, mae, and Brier Skill
 Score.
@@ -25,6 +25,8 @@ Score.
 from __future__ import annotations
 
 import argparse
+import json
+from pathlib import Path
 import sys
 import traceback
 
@@ -119,12 +121,10 @@ def fit_gamfit(fit_df, test_df, pccols, centers):
         data_fit[c] = fit_df[c].astype(float).values
         data_te[c] = test_df[c].astype(float).values
     model = gamfit.fit(data_fit, formula=f"event ~ {terms}", family="bernoulli-marginal-slope",
-                       link="probit", z_column="z", logslope_formula=terms)
-    pred = model.predict(data_te)
-    if hasattr(pred, "columns") and "mean" in getattr(pred, "columns", []):
-        return common.clip01(np.asarray(pred["mean"], dtype=float).ravel())
-    arr = np.asarray(getattr(pred, "to_numpy", lambda: pred)(), dtype=float)
-    return common.clip01(arr[:, -1].ravel() if arr.ndim == 2 else arr.ravel())
+                       link="probit", z_column="z", slope_formula=terms)
+    # The default public prediction is the posterior mean. Never select an
+    # arbitrary last table column or the conditional plug-in mean instead.
+    return np.asarray(model.predict(data_te), dtype=float)
 
 
 _FITTERS = {"linpc": fit_linpc, "znorm": fit_znorm, "calpred": fit_calpred, "rawpgs": fit_rawpgs}
@@ -170,6 +170,7 @@ def main():
     ap.add_argument("--out-acc", required=True)
     ap.add_argument("--out-cal", required=True)
     ap.add_argument("--out-pred", default=None)
+    ap.add_argument("--out-status", required=True)
     args = ap.parse_args()
 
     df = common.load_normalized(args.data)
@@ -187,14 +188,25 @@ def main():
     y_te = test_df["y_binary"].values
     p_true_te = test_df["p_true"].values
     acc_rows, cal_rows, preds = [], [], {}
+    status = {"status": "running", "methods": {m: "pending" for m in METHODS},
+              "score_transform": "discovery-standardized PGS_z; not the external-CTN experiment"}
+    status_path = Path(args.out_status)
+    status_path.write_text(json.dumps(status, indent=2) + "\n")
 
     for method in METHODS:
+        status["methods"][method] = "running"
+        status_path.write_text(json.dumps(status, indent=2) + "\n")
         try:
             p = (fit_gamfit(fit_df, test_df, pccols, args.centers) if method == "gamfit"
                  else _FITTERS[method](fit_df, test_df, pccols))
+            p = np.asarray(p, dtype=float)
+            if p.shape != (len(test_df),) or not np.isfinite(p).all() or ((p < 0) | (p > 1)).any():
+                raise ValueError("method must return one finite probability per held-out row")
         except Exception as exc:  # noqa: BLE001
             print(f"[{method}] FAILED: {type(exc).__name__}: {exc}", file=sys.stderr)
             traceback.print_exc()
+            status["methods"][method] = "failed"
+            status_path.write_text(json.dumps(status, indent=2) + "\n")
             continue
         p = np.asarray(p, dtype=float)
         preds[method] = p
@@ -215,6 +227,8 @@ def main():
         # Flush after each method so a slow/killed gamfit still leaves baselines on disk.
         pd.DataFrame(acc_rows).to_csv(args.out_acc, index=False)
         pd.DataFrame(cal_rows).to_csv(args.out_cal, index=False)
+        status["methods"][method] = "complete"
+        status_path.write_text(json.dumps(status, indent=2) + "\n")
 
     if args.out_pred and preds:
         idc = [c for c in ["iid", "deme", "dist_from_train", "is_train"] if c in test_df.columns]
@@ -224,6 +238,10 @@ def main():
         for m, pp in preds.items():
             pw["p_" + m] = pp
         pw.to_parquet(args.out_pred, index=False)
+    status["status"] = "complete" if all(v == "complete" for v in status["methods"].values()) else "failed"
+    status_path.write_text(json.dumps(status, indent=2) + "\n")
+    if status["status"] != "complete":
+        raise RuntimeError("required methods failed; partial outputs are not a complete replicate")
     print(f"WROTE {args.out_acc} ({len(acc_rows)}), {args.out_cal} ({len(cal_rows)})")
 
 

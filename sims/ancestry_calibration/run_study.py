@@ -3,15 +3,13 @@
 Pipeline:
   1. generate real-P+T data for serial1d + grid2d x seeds (4 phenotypes each)
   2. fit binary recalibration models + ground-truth metrics (per dataset)
-  3. fit survival recalibration models + ground-truth metrics (per dataset)
-  4. aggregate the per-dataset CSVs into study-level tables
-  5. render the figures (study-design Figure 1 + result figures)
+  3. require every prespecified binary method to complete
+  4. aggregate the per-dataset CSVs and render figures
 
 Generation is RAM-bound (each streamed sim holds reservoirs + one chunk), so its
 fan-out is sized from currently-free RAM/cores. Fitting is light and fans out per
-dataset. The survival fit is run under a wall-clock timeout because gamfit survival
-marginal-slope can stall (gam#979); fit_survival flushes the Cox baselines before
-attempting gamfit, so a timeout still leaves the baselines on disk.
+dataset. Partial results are debugging artifacts and never satisfy completion.
+This legacy PGS_z study is not yet the external-reference CTN experiment.
 """
 from __future__ import annotations
 
@@ -25,7 +23,6 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 GEN = HERE / "gen_real_pt.py"
 FIT_BINARY = HERE / "fit_binary.py"
-FIT_SURVIVAL = HERE / "fit_survival.py"
 ANALYZE = HERE / "analyze_results.py"
 PLOT = HERE / "plot_results.py"
 PLOT_DESIGN = HERE / "plot_figure1.py"
@@ -35,13 +32,11 @@ DEMOGRAPHIES = ("serial1d", "grid2d")
 PHENOS = ("phenoA", "phenoR", "phenoB", "phenoC")
 SEEDS = tuple(range(1, 11))      # seed = inferential unit; averages out P+T threshold noise
 CENTERS = 12                     # gamfit marginal-slope surface centers (gam#979: keep modest)
-SURVIVAL_TIMEOUT_S = 1500        # cap a gamfit survival-MS stall; baselines already flushed
-RUN_SURVIVAL = os.environ.get("ANC_RUN_SURVIVAL", "1") != "0"  # survival is gam#979-stalled; skippable
 
 GEN_TASK_PEAK_GIB = 22.0         # one streamed sim's peak RAM (reservoirs + a chunk)
 MEM_HEADROOM_FRAC = 0.70
 THREADS_PER_GEN_JOB = 1
-FIT_JOBS = 12
+FIT_JOBS = 1
 
 
 def auto_generate_jobs(n_tasks: int) -> int:
@@ -60,27 +55,21 @@ def auto_generate_jobs(n_tasks: int) -> int:
     except OSError:
         free_cores = os.cpu_count() or 8
     by_mem = int((mem_avail_gib * MEM_HEADROOM_FRAC) // GEN_TASK_PEAK_GIB)
-    jobs = max(1, min(n_tasks, by_mem, free_cores))
+    jobs = max(1, min(n_tasks, by_mem, free_cores, 1))
     print(f"auto generate jobs={jobs} (free RAM {mem_avail_gib:.0f} GiB, free cores {free_cores})", flush=True)
     return jobs
 
 
-def run_logged(cmd, log_path: Path, timeout=None) -> None:
+def run_logged(cmd, log_path: Path) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     text = " ".join(str(c) for c in cmd)
     print(f"+ {text}  > {log_path}", flush=True)
     with log_path.open("w", encoding="utf-8") as log:
         log.write(f"+ {text}\n")
         log.flush()
-        try:
-            r = subprocess.run([str(c) for c in cmd], stdout=log, stderr=subprocess.STDOUT, timeout=timeout)
-        except subprocess.TimeoutExpired:
-            log.write(f"\nTIMEOUT after {timeout}s (partial results, if any, were flushed)\n")
-            print(f"  TIMEOUT {log_path.name} (non-fatal)", flush=True)
-            return
+        r = subprocess.run([str(c) for c in cmd], stdout=log, stderr=subprocess.STDOUT)
     if r.returncode != 0:
-        # a single dataset/method failing must not abort the study
-        print(f"  WARN rc={r.returncode} {log_path.name} (non-fatal)", flush=True)
+        raise subprocess.CalledProcessError(r.returncode, cmd)
 
 
 def run_many(tasks, jobs: int) -> None:
@@ -99,24 +88,23 @@ def main() -> None:
     out = OUT.resolve()
     data_dir = out / "data"
     res_b = out / "results" / "binary"
-    res_s = out / "results" / "survival"
     log_dir = out / "logs"
     env = dict(os.environ, OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1",
                MKL_NUM_THREADS="1", RAYON_NUM_THREADS="1")
     os.environ.update(env)
-    for d in (data_dir, res_b, res_s, log_dir):
+    for d in (data_dir, res_b, log_dir):
         d.mkdir(parents=True, exist_ok=True)
 
     (out / "run_config.json").write_text(json.dumps({
         "demographies": list(DEMOGRAPHIES), "phenotypes": list(PHENOS), "seeds": list(SEEDS),
-        "centers": CENTERS, "pgs": "real P+T only", "outcomes": ["binary", "survival"],
+        "centers": CENTERS, "pgs": "real P+T only", "outcomes": ["binary"],
+        "score_transform": "discovery-standardized PGS_z; not the external-CTN experiment",
         "methods_binary": ["gamfit", "linpc", "znorm", "calpred", "rawpgs"],
-        "methods_survival": ["gamfit", "linpc", "znorm", "rawpgs"],
         "risk_metrics": "ground-truth vs p_true: average prediction error, probit risk spread ratio, "
                         "RMSE, MAE, Spearman/Pearson/R2 to true risk, high-risk-tail RMSE, "
                         "top-10%/20% risk-ratio (true+observed), %-at->=2x/3x risk (true+predicted); "
                         "plus Brier Skill Score, OR per SD, and calibration slope+intercept",
-        "discrimination": "GLOBAL only (binary AUC / survival Harrell C); never within-stratum",
+        "discrimination": "binary AUC globally and within ancestry strata",
     }, indent=2))
 
     # 1. generation (skip a (dem, seed) whose full pheno set is already on disk;
@@ -133,7 +121,7 @@ def main() -> None:
             gen_tasks.append((cmd, log_dir / f"gen_{dem}_s{seed}.log"))
     run_many(gen_tasks, auto_generate_jobs(len(gen_tasks)))
 
-    # 2+3. fitting (per dataset, both arms)
+    # 2. Fit every prespecified binary dataset.
     datasets = []
     for dem in DEMOGRAPHIES:
         for seed in SEEDS:
@@ -142,7 +130,7 @@ def main() -> None:
                 if p.exists():
                     datasets.append((dem, pheno, seed, p))
                 else:
-                    print(f"WARN missing dataset {p}", flush=True)
+                    raise FileNotFoundError(f"required dataset missing: {p}")
 
     fit_tasks = []
     for dem, pheno, seed, p in datasets:
@@ -150,21 +138,12 @@ def main() -> None:
         fit_tasks.append((
             [sys.executable, FIT_BINARY, "--data", p, "--dem", dem, "--pheno", pheno,
              "--centers", CENTERS, "--out-acc", res_b / f"{stem}_acc.csv",
-             "--out-cal", res_b / f"{stem}_cal.csv", "--out-pred", res_b / f"{stem}_pred.parquet"],
-            log_dir / f"fitb_{stem}.log", None))
-        if RUN_SURVIVAL:
-            fit_tasks.append((
-                [sys.executable, FIT_SURVIVAL, "--data", p, "--dem", dem, "--pheno", pheno,
-                 "--centers", CENTERS, "--out-acc", res_s / f"{stem}_acc.csv",
-                 "--out-cal", res_s / f"{stem}_cal.csv"],
-                log_dir / f"fits_{stem}.log", SURVIVAL_TIMEOUT_S))
-    if not RUN_SURVIVAL:
-        print("ANC_RUN_SURVIVAL=0: skipping survival arm (gam#979 stall)", flush=True)
+             "--out-cal", res_b / f"{stem}_cal.csv", "--out-pred", res_b / f"{stem}_pred.parquet",
+             "--out-status", res_b / f"{stem}_status.json"],
+            log_dir / f"fitb_{stem}.log"))
     run_many(fit_tasks, FIT_JOBS)
 
-    # 4. aggregate + 5. figures (study-design Figure 1 + result figures).
-    # plot_figure1 needs demesdraw and the generated data; its step is non-fatal
-    # (run_logged), so a missing optional dep never aborts the study.
+    # Required failures above prevent aggregation and figure generation.
     run_logged([sys.executable, ANALYZE], log_dir / "analyze.log")
     run_logged([sys.executable, PLOT_DESIGN], log_dir / "plot_figure1.log")
     run_logged([sys.executable, PLOT], log_dir / "plot.log")

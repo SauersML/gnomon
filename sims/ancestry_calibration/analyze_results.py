@@ -11,6 +11,7 @@ under results/:
 from __future__ import annotations
 
 from pathlib import Path
+import json
 
 import pandas as pd
 
@@ -28,7 +29,15 @@ def _seed_from(name: str) -> int:
 def _concat(subdir: str, which: str) -> pd.DataFrame:
     rows = []
     for f in sorted((RES / subdir).glob(f"*_{which}.csv")):
+        receipt = f.with_name(f.name.rsplit("_", 1)[0] + "_status.json")
+        status = json.loads(receipt.read_text())
+        required = {"gamfit", "linpc", "znorm", "calpred", "rawpgs"}
+        if (status.get("status") != "complete" or set(status.get("methods", {})) != required
+                or any(v != "complete" for v in status["methods"].values())):
+            raise ValueError(f"incomplete required-method comparison: {f.name}")
         df = pd.read_csv(f)
+        if set(df.method) != required:
+            raise ValueError(f"required method missing from {f.name}")
         if "seed" not in df.columns:
             df["seed"] = _seed_from(f.name)
         rows.append(df)
@@ -37,7 +46,7 @@ def _concat(subdir: str, which: str) -> pd.DataFrame:
 
 def main() -> None:
     tables = {}
-    for arm in ("binary", "survival"):
+    for arm in ("binary",):
         acc = _concat(arm, "acc")
         cal = _concat(arm, "cal")
         if not acc.empty:

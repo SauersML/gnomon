@@ -1,0 +1,35 @@
+name: Biobank workflow contracts
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'examples/biobank/**'
+      - 'sims/ancestry_calibration/**'
+      - '.github/workflows/biobank-contracts.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      OPENBLAS_NUM_THREADS: '1'
+      OMP_NUM_THREADS: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install workflow validation dependencies
+        run: pip install --only-binary=:all: numpy pandas scipy scikit-learn pyarrow google-cloud-bigquery google-cloud-storage miniwdl
+      - name: Validate prospective workflow contracts
+        working-directory: examples/biobank
+        run: |
+          timeout 45 python -m unittest -v test_aou_survival
+          timeout 45 python -m WDL check aou_survival.wdl
+      - name: Validate simulation completion contracts
+        working-directory: sims/ancestry_calibration
+        run: timeout 45 python -m unittest -v test_study_contract
