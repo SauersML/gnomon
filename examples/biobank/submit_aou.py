@@ -2,7 +2,8 @@
 """Submit one bounded WDL run using a locally configured Workbench context.
 
 Deployment values are required environment variables, never example strings.
-Use --check to verify identities and staged inputs without uploading/submitting.
+Use --check to verify identities, workspace bindings and input URI syntax.
+Input objects are read by the workspace task, never by a local read preflight.
 """
 from __future__ import annotations
 
@@ -47,8 +48,12 @@ class Workbench:
         # Workbench acknowledges a submission after creating its engine run;
         # killing that handshake early can leave a real job without its receipt.
         timeout = 180 if command[:4] == ["wb", "workflow", "job", "run"] else 60
-        return subprocess.run(command, check=True, text=True, capture_output=True,
-                              env=self.env, timeout=timeout).stdout
+        try:
+            return subprocess.run(command, check=True, text=True, capture_output=True,
+                                  env=self.env, timeout=timeout).stdout
+        except subprocess.CalledProcessError as error:
+            raise RuntimeError(error.stderr.strip() or error.stdout.strip()
+                               or f"Workbench command exited {error.returncode}") from error
 
     def assert_identity(self):
         active = self.command(["gcloud", f"--configuration={self.profile}", "auth", "list",
@@ -122,13 +127,8 @@ def main():
                          f"--workspace={wb.workspace}").strip()
     if resolved_cdr.removeprefix("bq://").replace(":", ".") != config["workspace_cdr"]:
         raise RuntimeError("WORKSPACE_CDR does not match the workspace CDR resource")
-    for key, uri in inputs.items():
-        if key.endswith("runtime_image"):
-            continue
-        for item in uri if isinstance(uri, list) else [uri]:
-            wb.wb("gsutil", "stat", item)
     if args.check:
-        print("Verified configured identities, workspace resources, and staged input objects.")
+        print("Verified configured identities, workspace resources, and input URI syntax.")
         return
     sources = {"runner": HERE / "aou_survival.py",
                "disease_selector": HERE / "disease_selection.py",
