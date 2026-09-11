@@ -34,6 +34,7 @@ def main():
     frame_path = args.output / "synthetic.parquet"
     frame.to_parquet(frame_path, index=False)
     config = {"num_pcs": 2, "baseline_centers": 4, "slope_centers": 4,
+              "time_num_internal_knots": 2,
               "stage1_centers": 4, "stage1_age_k": 4, "stage1_response_knots": 2,
               "horizons_years": [1., 2.], "grid_intervals": 20}
     config_path = args.output / "config.json"

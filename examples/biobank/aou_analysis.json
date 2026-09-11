@@ -5,6 +5,7 @@
   "num_pcs": 6,
   "baseline_centers": 32,
   "slope_centers": 16,
+  "time_num_internal_knots": 4,
   "max_rows_per_disease": 5000,
   "train_fraction": 0.8,
   "seed": 20260910,

@@ -19,8 +19,9 @@ A single EHR observation interval must cover baseline and the prespecified
 365-day lookback. Adults with recorded disease or death at/before baseline
 are excluded. We do not require future disease-free observation to enter.
 
-Follow-up ends at the earliest qualifying diagnosis, primary death record
-from `aou_death`, or the covering observation interval's end. Observation
+Follow-up ends at the earliest qualifying diagnosis, primary death date
+from `aou_death`, or the covering observation interval's end. Multiple primary
+death reports are reduced to the earliest date per person before joining. Observation
 gaps are not bridged. Same-day disease/death ties are excluded because their
 ordering is unknown. This predicts recorded diagnosis, not biological onset.
 The resolved CDR release is recorded; horizons must be supported by that
@@ -29,8 +30,8 @@ release's actual follow-up.
 PCs use `research_id`, `pca_features`, and `ancestry_pred` from the release's
 ancestry file. The published relatedness-prune file's `sample_id` column is
 matched to ancestry `research_id` and applied before sampling
-or splitting. Its single-column numeric IDs may have the `research_id` header
-or start on the first row; unknown headers and malformed rows are rejected.
+or splitting. The `sample_id` header and numeric IDs are required; unknown
+headers, extra columns, and malformed rows are rejected.
 Remaining person IDs are the pilot's split groups. This is not
 full pedigree reconstruction or a claim that distant relatives are independent.
 
@@ -208,6 +209,7 @@ With two internal folds, development selection and final matched comparisons
 require 12 transform fits and 14 cause-specific fits per endpoint. They run
 with an explicit two-interior-knot CTN response basis for this bounded pilot;
 larger shape budgets require a separate development comparison. The fits run
+with four interior time knots shared by all outcome-model comparisons, and
 sequentially with a checkpoint after each completed unit. Each fit has a
 180-second wall cap, each query a 120-second cap and a billed-byte ceiling;
 the command has a 30-minute cap and zero automatic retries. Temporary storage

@@ -47,6 +47,7 @@ def validate_config(c):
     expected = {
         "google_project", "workspace_cdr", "gamfit_version", "top_n_diseases",
         "disease_limit", "num_pcs", "baseline_centers", "slope_centers",
+        "time_num_internal_knots",
         "max_rows_per_disease", "train_fraction", "seed", "horizons_years",
         "grid_intervals", "fit_timeout_seconds", "query_timeout_seconds",
         "maximum_bytes_billed", "min_train_events_per_cause", "min_report_count",
@@ -66,6 +67,8 @@ def validate_config(c):
         raise ValueError("unsupported PC count or training fraction")
     if min(c["baseline_centers"], c["slope_centers"]) < 4:
         raise ValueError("smooths require at least four centers")
+    if c["time_num_internal_knots"] < 2:
+        raise ValueError("survival time basis requires at least two internal knots")
     if not 2 <= c["crossfit_folds"] <= 5 or c["stage1_centers"] < 4 or c["stage1_age_k"] < 4:
         raise ValueError("stage one requires 2–5 folds and basis sizes of at least four")
     if c["stage1_response_knots"] < 2:
@@ -282,8 +285,9 @@ def person_times(client, cdr):
         WHERE op.observation_period_start_date <= e.baseline
           AND op.observation_period_end_date >= e.baseline
       ), deaths AS (
-        SELECT person_id, death_date FROM `{cdr}.aou_death`
+        SELECT person_id, MIN(death_date) AS death_date FROM `{cdr}.aou_death`
         WHERE primary_death_record = TRUE
+        GROUP BY person_id
       )
       SELECT CAST(p.person_id AS STRING) AS person_id,
              DATE(p.birth_datetime) AS birth_date,
@@ -467,11 +471,13 @@ def fit_worker(frame_path, config_path, model_kind, cause, output, normalizer, t
             rhs += f" + duchon({pc_args}, centers={config['slope_centers']}, scale_dims=true, by=Z)"
         model = gamfit.fit(train, f"Surv(entry, followup, event) ~ {rhs}",
                            survival_likelihood="location-scale", noise_formula="1",
+                           config={"time_num_internal_knots": config["time_num_internal_knots"]},
                            persistent_warm_start_root=output / "warm")
     else:
         model = gamfit.fit(train, f"Surv(entry, followup, event) ~ {baseline}",
                            survival_likelihood="marginal-slope", z_column="Z",
-                           slope_formula=slope, config={"frozen_score": True},
+                           slope_formula=slope, config={"frozen_score": True,
+                               "time_num_internal_knots": config["time_num_internal_knots"]},
                            persistent_warm_start_root=output / "warm")
     if model_kind != "baseline":
         transformer = gamfit.load(transform_path)
@@ -493,7 +499,8 @@ def fit_worker(frame_path, config_path, model_kind, cause, output, normalizer, t
     if normalizer == "ctn" and model_kind in ("constant", "pc_varying"):
         from aou_score_transform import stage1_rhs
         recipe = gamfit.CtnStage1("PGS", stage1_rhs(config), fold_column="inner_fold",
-                                 group_column="split_group")
+                                 group_column="split_group",
+                                 response_num_internal_knots=config["stage1_response_knots"])
         fold_digest = hashlib.sha256(df.loc[df.is_train, "inner_fold"].to_numpy("<i8").tobytes()).hexdigest()
         gamfit.CtnMarginalSlopeModel(transformer, model, recipe, fold_digest,
                                      score_column="Z").save(output / "chain.gamfit")
