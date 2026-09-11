@@ -1,7 +1,7 @@
 {
-  "gamfit_version": "0.1.267",
+  "gamfit_version": "0.1.268",
   "top_n_diseases": 20,
-  "disease_limit": 3,
+  "disease_limit": 1,
   "num_pcs": 6,
   "baseline_centers": 32,
   "slope_centers": 16,

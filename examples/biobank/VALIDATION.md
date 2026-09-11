@@ -12,6 +12,11 @@ GAM update in [PR #2886](https://github.com/SauersML/gam/pull/2886), which is st
 under validation; the previous wheel and reference model are not acceptance
 evidence for the new payload format.
 
+The updated lightweight contracts passed in
+[workflow 34625666867](https://github.com/SauersML/gnomon/actions/runs/34625666867):
+27 prospective-workflow tests, miniwdl validation, and four simulation
+completion tests. These checks do not execute the native outcome model.
+
 The smaller real hypertension probe `aou-hypertension-small-20260911-154600`
 also failed. Its fixed workspace status files show successful reference CTN
 application followed by `fitting_disease` and `failed_timeout`. The 8/8-center
