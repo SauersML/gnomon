@@ -46,8 +46,20 @@ metrics. Smoke support audits and model fits use development observations only.
 
 The subsequent real primary-score pilot stopped at the training-event guard;
 the workspace diagnostic identified insufficient development death events.
-No outcome fit was accepted. The next pilot increases the cap to 20,000 using
-the same hash order and seed, while retaining the event minimum and resource caps.
+No outcome fit was accepted. A subsequent pilot increased the cap to 20,000
+using the same hash order and seed, retaining the event minimum and resource
+caps. It passed cohort preparation and reached score transformation, then
+failed in the first CTN worker. The workspace diagnostic reported fixed
+`gam_integration_error`, `singular_system`, and `function_fit_transform` labels.
+The failed worker evidence remains in its private workspace checkpoint.
+
+A separate synthetic six-PC CTN fit completed on MSI in 6.87 seconds. With the
+same generated observations and configuration, multiplying PCs by `1e-3` and
+the score by `1e-5` caused GAM's identifiability audit to reject the fit (52 of
+65 joint columns retained). This demonstrates sensitivity to numerical units
+in this synthetic case. It is a candidate explanation for the workspace
+failure, not proof that the two failures have the same cause. No numerical
+repair or successful AoU training completion is claimed.
 
 These are software and numerical checks. They do not establish disease-risk
 calibration, predictive superiority, or a successful completed AoU training run.
