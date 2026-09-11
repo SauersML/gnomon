@@ -44,5 +44,10 @@ evaluation limitation from training-event support: unsupported horizons receive
 no Brier estimate. Score selection still rejects unsupported development
 metrics. Smoke support audits and model fits use development observations only.
 
+The subsequent real primary-score pilot stopped at the training-event guard;
+the workspace diagnostic identified insufficient development death events.
+No outcome fit was accepted. The next pilot increases the cap to 20,000 using
+the same hash order and seed, while retaining the event minimum and resource caps.
+
 These are software and numerical checks. They do not establish disease-risk
 calibration, predictive superiority, or a successful completed AoU training run.

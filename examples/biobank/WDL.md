@@ -206,7 +206,7 @@ Use a Linux Python 3.12 runtime image that supplies the system libraries those
 wheels require. The runtime image digest, installed versions, gamfit build
 information, source/input hashes, and query IDs are recorded in provenance.
 
-The configured panel contains up to three selected diseases, at most 5,000
+The configured panel contains up to three selected diseases, at most 20,000
 outcome-blind sampled rows each, four CPUs, 16 GiB RAM, and 50 GiB disk.
 With two internal folds, development selection and final matched comparisons
 require 12 transform fits and 14 cause-specific fits per endpoint. They run
@@ -225,6 +225,11 @@ support before fitting. Increase the sample budget only after inspecting that
 signal. Failed-worker logs and partial models are checkpointed privately without
 a completion receipt. Population event frequencies
 are never replaced with a balanced case/control sample.
+
+The hypertension pilot's original 5,000-row cap produced insufficient development
+death events for the prespecified competing-death model. The 20,000-row cap uses
+the same outcome-blind hash order and seed; it does not balance events or relax
+the minimum event count. Resource and wall limits are unchanged.
 
 Run static and synthetic contract validation on MSI using the existing warm
 Python dependencies; no participant data needs to leave AoU:
