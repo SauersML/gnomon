@@ -78,6 +78,8 @@ class SurvivalContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
             stderr = directory / "stderr"
+            (directory / "score_files.json").write_text("[]")
+            (directory / "score_id.json").write_text('""')
             stderr.write_text("RuntimeError: private task failure\n")
             checkpoint = directory / "checkpoint.tar.gz"
             with tarfile.open(checkpoint, "w:gz") as archive:

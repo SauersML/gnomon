@@ -155,12 +155,10 @@ def main():
     inputs["aou_survival.prepare_only"] = args.prepare_only
     inputs["aou_survival.smoke_only"] = args.smoke_only
     inputs["aou_survival.endpoint"] = args.endpoint or ""
+    wb.wb("gsutil", "cp", *[str(path) for path in sources.values()],
+          str(HERE / "aou_survival.wdl"), f"{wb.bucket}/{prefix}/")
     for name, path in sources.items():
-        uri = f"{wb.bucket}/{prefix}/{path.name}"
-        wb.wb("gsutil", "cp", str(path), uri)
-        inputs[f"aou_survival.{name}"] = uri
-    wdl_uri = f"{wb.bucket}/{prefix}/aou_survival.wdl"
-    wb.wb("gsutil", "cp", str(HERE / "aou_survival.wdl"), wdl_uri)
+        inputs[f"aou_survival.{name}"] = f"{wb.bucket}/{prefix}/{path.name}"
     wb.wb("workflow", "create", f"--bucket-id={wb.bucket_id}",
           f"--path={prefix}/aou_survival.wdl", f"--workflow={run_id}",
           "--workflow-type=WDL", "--display-name=AoU PC-varying survival pilot",

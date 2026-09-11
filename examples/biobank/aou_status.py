@@ -17,6 +17,7 @@ LABELS = frozenset({
     "transforming_score", "applying_reference_ctn", "score_transform_ready", "fitting_disease", "fitting_death",
     "failed_score_missingness_absent", "failed_score_missingness_invalid",
     "failed_score_completely_missing", "failed_score_source_ambiguous",
+    "preparing_score_cohort", "scoring", "score_artifact_ready",
 })
 
 

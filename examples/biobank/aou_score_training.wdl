@@ -1,0 +1,101 @@
+version 1.0
+
+# Recompute one eligible cohort's score and run the native survival pilot.
+# All genotypes, scores, models and outputs remain in the AoU workspace.
+workflow aou_score_training {
+  input {
+    File sources
+    File analysis_config
+    File scoring_config
+    File scorer_archive
+    File score_weights
+    File genotype_fam
+    File prior_shared_features
+    File ancestry_predictions
+    File relatedness_prune
+    File phenotype_library_archive
+    Array[File] reference_ctn
+    File wheelhouse_archive
+    String runtime_image
+    String checkpoint_uri
+  }
+  call train { input:
+    sources=sources, analysis_config=analysis_config, scoring_config=scoring_config,
+    scorer_archive=scorer_archive, score_weights=score_weights, genotype_fam=genotype_fam,
+    prior_shared_features=prior_shared_features, ancestry_predictions=ancestry_predictions,
+    relatedness_prune=relatedness_prune, phenotype_library_archive=phenotype_library_archive,
+    reference_ctn=reference_ctn, wheelhouse_archive=wheelhouse_archive,
+    runtime_image=runtime_image, checkpoint_uri=checkpoint_uri
+  }
+  output {
+    File metrics=train.metrics
+    File provenance=train.provenance
+    File checkpoint=train.checkpoint
+    File scores=train.scores
+    File score_manifest=train.score_manifest
+  }
+}
+
+task train {
+  input {
+    File sources
+    File analysis_config
+    File scoring_config
+    File scorer_archive
+    File score_weights
+    File genotype_fam
+    File prior_shared_features
+    File ancestry_predictions
+    File relatedness_prune
+    File phenotype_library_archive
+    Array[File] reference_ctn
+    File wheelhouse_archive
+    String runtime_image
+    String checkpoint_uri
+  }
+  command <<<
+    set -euo pipefail
+    mkdir -p wheels work/tmp work/cache
+    tar -xf "~{sources}"
+    tar -xf "~{scorer_archive}"
+    chmod +x gnomon-linux-x64
+    cp "~{write_json(reference_ctn)}" reference_ctn.json
+    cp "~{write_json(runtime_image)}" runtime_image.json
+    export TMPDIR="$PWD/work/tmp" XDG_CACHE_HOME="$PWD/work/cache"
+    export RAYON_NUM_THREADS=4 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 PYTHONUNBUFFERED=1
+    timeout --kill-after=10s 20m bash -euo pipefail -c '
+      tar -xf "$1" -C wheels
+      python -m venv work/venv
+      work/venv/bin/python -m pip install --disable-pip-version-check \
+        --no-index --only-binary=:all: --find-links wheels -r aou_requirements.txt
+      export GOOGLE_PROJECT=$(work/venv/bin/python -c "import json,sys; print(json.load(open(sys.argv[1]))[\"google_project\"])" "$2")
+      work/venv/bin/python -c "import json,sys; json.dump(json.load(open(sys.argv[1]))[\"endpoint\"],open(\"endpoint.json\",\"w\"))" "$3"
+      work/venv/bin/python aou_refresh_score.py --config "$2" --scoring-config "$3" \
+        --scorer "$PWD/gnomon-linux-x64" --weights "$4" --fam "$5" --features "$6" \
+        --ancestry "$7" --prune "$8" --phenotypes "$9" --score-panel aou_pgs_panel.json \
+        --output work/score --status-uri "${10}"
+      exec work/venv/bin/python aou_survival.py run --config "$2" --phenotypes "$9" \
+        --scores work/score/shared_features.tar.gz --ancestry "$7" --prune "$8" \
+        --output work/results --runtime-image runtime_image.json --checkpoint-uri "${10}" \
+        --endpoint-config endpoint.json --score-panel aou_pgs_panel.json \
+        --reference-ctn-list reference_ctn.json --smoke-only
+    ' bash "~{wheelhouse_archive}" "~{analysis_config}" "~{scoring_config}" \
+      "~{score_weights}" "~{genotype_fam}" "~{prior_shared_features}" \
+      "~{ancestry_predictions}" "~{relatedness_prune}" "~{phenotype_library_archive}" "~{checkpoint_uri}"
+  >>>
+  output {
+    File metrics="work/results/metrics.json"
+    File provenance="work/results/provenance.json"
+    File checkpoint="work/checkpoint.tar.gz"
+    File scores="work/score/shared_features.tar.gz"
+    File score_manifest="work/score/score_manifest.json"
+  }
+  runtime {
+    docker: runtime_image
+    cpu: 4
+    memory: "16 GiB"
+    disks: "local-disk 50 SSD"
+    preemptible: 0
+    maxRetries: 0
+  }
+}
