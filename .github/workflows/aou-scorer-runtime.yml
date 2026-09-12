@@ -70,7 +70,7 @@ jobs:
           docker pull python:3.12-slim-trixie
           docker image inspect python:3.12-slim-trixie --format '{{index .RepoDigests 0}}' > runtime-image.txt
           docker run --rm -v "$PWD/runtime:/runtime:ro" "$(cat runtime-image.txt)" \
-            /runtime/gnomon-score --version
+            /runtime/gnomon-score --help
           sha256sum runtime/gnomon-score > scorer.sha256
           tar -czf scorer.tar.gz -C runtime gnomon-score
           sha256sum scorer.tar.gz > archive.sha256
