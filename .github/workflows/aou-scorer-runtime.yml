@@ -74,6 +74,41 @@ jobs:
           sha256sum runtime/gnomon-score > scorer.sha256
           tar -czf scorer.tar.gz -C runtime gnomon-score
           sha256sum scorer.tar.gz > archive.sha256
+      - name: Prove remote-range parity on the public fixture
+        run: |
+          set -euo pipefail
+          # The same binary must score identical values whether it reads the
+          # fixture from disk or through planned HTTP range requests. Every
+          # other variant is scored so each required row is its own range.
+          mkdir -p parity/local parity/remote
+          cp data/testdata/ld.bed data/testdata/ld.bim data/testdata/ld.fam parity/local/
+          python3 - <<'PY'
+          from pathlib import Path
+          rows = [line.split() for line in Path('data/testdata/ld.bim').read_text().splitlines()]
+          lines = [f'{row[0]}:{row[3]}\t{row[4]}\t{row[5]}\t{(i % 7 - 3) / 100:.17g}\n'
+                   for i, row in enumerate(rows) if i % 2 == 0]
+          Path('parity/weights.tsv').write_text(
+              'variant_id\teffect_allele\tother_allele\tPGS004525\n' + ''.join(lines))
+          ids = [line.split()[1] for line in Path('data/testdata/ld.fam').read_text().splitlines()]
+          Path('parity/keep.txt').write_text('\n'.join(ids[:40]) + '\n')
+          PY
+          python3 scripts/range_http_server.py data/testdata 8765 &
+          server=$!
+          for _ in $(seq 50); do curl -sfI http://127.0.0.1:8765/ld.bed >/dev/null && break; sleep 0.2; done
+          (cd parity/local && timeout --kill-after=5s 120s ../../runtime/gnomon-score \
+            ../weights.tsv ld.bed --keep ../keep.txt --emit-components)
+          (cd parity/remote && timeout --kill-after=5s 120s ../../runtime/gnomon-score \
+            ../weights.tsv http://127.0.0.1:8765/ld.bed --keep ../keep.txt --emit-components 2> scorer.log \
+            || { cat scorer.log; exit 1; })
+          kill "$server"
+          grep 'Remote BED read plan' parity/remote/scorer.log
+          grep -q 'Remote BED read plan: 750 required rows of 50 B in 750 ranges' parity/remote/scorer.log
+          local_out=$(find parity/local -name '*.sscore')
+          remote_out=$(find parity/remote -name '*.sscore')
+          test -n "$local_out" && test -n "$remote_out"
+          cmp "$local_out" "$remote_out"
+          test "$(grep -vc '^#' "$remote_out")" -eq 40
+          echo "Remote planned reads reproduce local scores for 40 kept samples."
       - uses: actions/upload-artifact@v4
         with:
           name: aou-scorer-runtime

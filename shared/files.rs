@@ -1,6 +1,6 @@
 use crate::adapt_plink2::GenomeBuild;
 use crate::pipeline_error::PipelineError;
-use crate::range_fetch::fetch_cache_block;
+use crate::range_fetch::{BedReadPlan, PlannedReader, SegmentFetch, fetch_cache_block};
 use google_cloud_auth::credentials::{
     CacheableResource, Credentials, anonymous::Builder as AnonymousCredentials,
 };
@@ -23,6 +23,7 @@ use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 use tokio::runtime::Runtime;
 
 /// The number of variants to process locally before updating the global atomic counter.
@@ -45,6 +46,11 @@ const REMOTE_SPARSE_BLOCK_SIZE: usize = 256 * 1024;
 const REMOTE_MEDIUM_BLOCK_SIZE: usize = 2 * 1024 * 1024;
 const REMOTE_READ_ATTEMPTS: usize = 4;
 const REMOTE_READ_INITIAL_BACKOFF_MS: u64 = 250;
+/// One stalled request must not hold a prefetch worker indefinitely.
+const REMOTE_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+/// Each blocking client drives its connections from one thread; several keep
+/// TLS and HTTP work off a single core when many requests run at once.
+const REMOTE_CLIENT_SHARDS: usize = 4;
 
 /// Keep the byte budget fixed when fetch granularity grows or shrinks.
 fn cache_capacity_for(block_size: usize) -> usize {
@@ -319,37 +325,76 @@ pub fn open_bed_source(
     }
 }
 
-/// Opens a scoring input with fetches sized to the matched variant density.
-///
-/// A single PGS touches scattered records and must retain the 256 KiB sparse path. A
-/// large score bank can match enough variants that nearly every larger object block is
-/// needed; keeping 256 KiB there pays synchronous request latency tens of thousands of
-/// times without saving bytes. Local inputs are unaffected.
+fn planned_reader(
+    fetch: SegmentFetch,
+    len: u64,
+    rows: &[u64],
+    row_bytes: u64,
+) -> Result<PlannedReader, PipelineError> {
+    let reader = PlannedReader::new(BedReadPlan::new(rows, row_bytes, len)?, fetch);
+    eprintln!(
+        "> Remote BED read plan: {} required rows of {row_bytes} B in {} ranges; up to {} concurrent requests.",
+        rows.len(),
+        reader.ranges(),
+        reader.workers()
+    );
+    Ok(reader)
+}
+
+fn range_clients(count: usize) -> Result<Vec<Client>, PipelineError> {
+    (0..count)
+        .map(|_| {
+            Client::builder()
+                .user_agent(HTTP_USER_AGENT)
+                .timeout(REMOTE_REQUEST_TIMEOUT)
+                .build()
+                .map_err(|e| PipelineError::Io(format!("Failed to build HTTP client: {e}")))
+        })
+        .collect()
+}
+
+/// Opens a scoring input using local row indices. A remote BED is read
+/// through a prefetching plan that covers only the required rows. PGEN uses
+/// its compressed index.
 pub fn open_bed_source_for_scoring(
     path: &Path,
     genome_build: Option<GenomeBuild>,
-    matched_variants: usize,
+    required_rows: &[u64],
+    bytes_per_variant: u64,
     total_variants: u64,
 ) -> Result<BedSource, PipelineError> {
     if !is_gcs_path(path) && !is_http_path(path) {
         return open_bed_source(path, genome_build);
     }
     if !is_pgen_path(path) {
-        // Dense BED scoring sweeps almost every remote block. Spend the
-        // existing cache byte budget on one contiguous fetch rather than
-        // paying serial request latency for each of its eight old blocks.
-        // Sparse inputs retain their smaller read granularity.
-        let block_size = if total_variants > 0
-            && matched_variants as f64 / total_variants as f64 >= 0.01
-        {
-            REMOTE_BLOCK_SIZE * REMOTE_CACHE_CAPACITY
+        let uri = path
+            .to_str()
+            .ok_or_else(|| PipelineError::Io("Invalid UTF-8 in path".into()))?;
+        let remote: Arc<dyn ByteRangeSource> = if is_gcs_path(path) {
+            let (bucket, object) = parse_gcs_uri(uri)?;
+            let mut source =
+                RemoteByteRangeSource::with_block_size(&bucket, &object, BedReadPlan::MAX_RANGE)?;
+            let fetcher = Arc::clone(&source.fetcher);
+            source.planned = Some(planned_reader(
+                Arc::new(move |start, length| fetcher.fetch(start, length)),
+                source.fetcher.len,
+                required_rows,
+                bytes_per_variant,
+            )?);
+            Arc::new(source)
         } else {
-            REMOTE_BLOCK_SIZE
+            let mut source = HttpByteRangeSource::with_block_size(uri, BedReadPlan::MAX_RANGE)?;
+            let fetcher = Arc::clone(&source.fetcher);
+            source.planned = Some(planned_reader(
+                Arc::new(move |start, length| fetcher.fetch(start, length)),
+                source.fetcher.len,
+                required_rows,
+                bytes_per_variant,
+            )?);
+            Arc::new(source)
         };
-        let remote = open_byte_range_source(path, Some(block_size))?;
         let source = BedSource::new(remote, None);
         validate_bed_source_header(path, &source)?;
-        eprintln!("> Remote BED fetch block: {} KiB.", block_size / 1024);
         return Ok(source);
     }
     let genome_build = genome_build.ok_or_else(|| {
@@ -358,6 +403,7 @@ pub fn open_bed_source_for_scoring(
                 .to_string(),
         )
     })?;
+    let matched_variants = required_rows.len();
     let block_size = remote_pgen_block_size(matched_variants, total_variants);
     eprintln!(
         "> Remote PGEN fetch block: {} KiB for {matched_variants}/{total_variants} matched variants.",
@@ -1653,19 +1699,26 @@ impl Read for GcsStreamingReader {
     }
 }
 
-struct RemoteByteRangeSource {
+/// Everything one range request needs, shared with prefetch workers.
+struct GcsSegmentFetcher {
     runtime: Arc<Runtime>,
     storage: Storage,
     credentials: Credentials,
-    http_client: Client,
+    http_clients: Vec<Client>,
     bucket: String,
     bucket_path: String,
     object: String,
     user_project: Option<String>,
     len: u64,
+}
+
+struct RemoteByteRangeSource {
+    fetcher: Arc<GcsSegmentFetcher>,
     cache: Mutex<RemoteCache>,
     /// Fetch granularity. See `REMOTE_SPARSE_BLOCK_SIZE`.
     block_size: usize,
+    /// Exact-row prefetching for scoring; replaces block caching when set.
+    planned: Option<PlannedReader>,
 }
 
 impl RemoteByteRangeSource {
@@ -1724,22 +1777,20 @@ impl RemoteByteRangeSource {
             len
         );
         Ok(Self {
-            runtime,
-            storage,
-            credentials,
-            http_client: Client::builder()
-                .user_agent(HTTP_USER_AGENT)
-                .build()
-                .map_err(|e| {
-                    PipelineError::Io(format!("Failed to build Cloud Storage HTTP client: {e}"))
-                })?,
-            bucket: bucket.to_string(),
-            bucket_path,
-            object: object.to_string(),
-            user_project,
-            len,
+            fetcher: Arc::new(GcsSegmentFetcher {
+                runtime,
+                storage,
+                credentials,
+                http_clients: range_clients(REMOTE_CLIENT_SHARDS)?,
+                bucket: bucket.to_string(),
+                bucket_path,
+                object: object.to_string(),
+                user_project,
+                len,
+            }),
             cache: Mutex::new(RemoteCache::new(cache_capacity_for(block_size))),
             block_size,
+            planned: None,
         })
     }
 
@@ -1801,7 +1852,7 @@ impl RemoteByteRangeSource {
     }
 
     fn block_length(&self, start: u64) -> usize {
-        let remaining = self.len.saturating_sub(start);
+        let remaining = self.fetcher.len.saturating_sub(start);
         remaining.min(self.block_size as u64) as usize
     }
 
@@ -1830,6 +1881,16 @@ impl RemoteByteRangeSource {
     }
 
     fn fetch_segment(&self, start: u64, length: usize) -> Result<Vec<u8>, PipelineError> {
+        self.fetcher.fetch(start, length)
+    }
+}
+
+impl GcsSegmentFetcher {
+    fn client_for(&self, start: u64) -> &Client {
+        &self.http_clients[(start / 4096) as usize % self.http_clients.len()]
+    }
+
+    fn fetch(&self, start: u64, length: usize) -> Result<Vec<u8>, PipelineError> {
         let bucket_path = self.bucket_path.clone();
         let object = self.object.clone();
         let bucket_for_log = self.bucket.clone();
@@ -1838,7 +1899,7 @@ impl RemoteByteRangeSource {
         let runtime = Arc::clone(&self.runtime);
         let user_project = self.user_project.clone();
         let credentials = self.credentials.clone();
-        let http_client = self.http_client.clone();
+        let http_client = self.client_for(start).clone();
         let bucket = self.bucket.clone();
         let mut last_error = String::new();
         let mut data = None;
@@ -1948,14 +2009,14 @@ impl RemoteByteRangeSource {
 
 impl ByteRangeSource for RemoteByteRangeSource {
     fn len(&self) -> u64 {
-        self.len
+        self.fetcher.len
     }
 
     fn read_at(&self, offset: u64, dst: &mut [u8]) -> Result<(), PipelineError> {
         if dst.is_empty() {
             return Ok(());
         }
-        if offset >= self.len {
+        if offset >= self.fetcher.len {
             return Err(PipelineError::Io(format!(
                 "Attempted to read past end of remote object at offset {offset}"
             )));
@@ -1963,7 +2024,7 @@ impl ByteRangeSource for RemoteByteRangeSource {
         let end = offset.checked_add(dst.len() as u64).ok_or_else(|| {
             PipelineError::Io("Offset overflow while reading remote object".to_string())
         })?;
-        if end > self.len {
+        if end > self.fetcher.len {
             return Err(PipelineError::Io(format!(
                 "Attempted to read past end of remote object (offset {offset}, len {})",
                 dst.len()
@@ -1976,8 +2037,13 @@ impl ByteRangeSource for RemoteByteRangeSource {
         let block_size = self.block_size as u64;
 
         while remaining > 0 {
-            let block_start = (current_offset / block_size) * block_size;
-            let block = self.ensure_block(block_start)?;
+            let (block_start, block) = match &self.planned {
+                Some(reader) => reader.range_at(current_offset)?,
+                None => {
+                    let block_start = (current_offset / block_size) * block_size;
+                    (block_start, self.ensure_block(block_start)?)
+                }
+            };
             let within_block = (current_offset - block_start) as usize;
             if within_block >= block.len() {
                 return Err(PipelineError::Io(format!(
@@ -1995,9 +2061,12 @@ impl ByteRangeSource for RemoteByteRangeSource {
 
             // Read-ahead only pays off when the caller is sweeping the object.
             // For sparse record reads it would double the bytes transferred.
-            if self.block_size == REMOTE_BLOCK_SIZE && within_block + to_copy == block.len() {
+            if self.planned.is_none()
+                && self.block_size == REMOTE_BLOCK_SIZE
+                && within_block + to_copy == block.len()
+            {
                 let next_start = block_start + block_size;
-                if next_start < self.len {
+                if next_start < self.fetcher.len {
                     let _ = self.ensure_block(next_start);
                 }
             }
@@ -2007,13 +2076,20 @@ impl ByteRangeSource for RemoteByteRangeSource {
     }
 }
 
-struct HttpByteRangeSource {
+/// Everything one range request needs, shared with prefetch workers.
+struct HttpSegmentFetcher {
     client: Client,
     url: String,
     len: u64,
+}
+
+struct HttpByteRangeSource {
+    fetcher: Arc<HttpSegmentFetcher>,
     cache: Mutex<RemoteCache>,
     /// Fetch granularity. See `REMOTE_SPARSE_BLOCK_SIZE`.
     block_size: usize,
+    /// Exact-row prefetching for scoring; replaces block caching when set.
+    planned: Option<PlannedReader>,
 }
 
 struct HttpStreamingReader {
@@ -2083,17 +2159,13 @@ impl HttpByteRangeSource {
 
     fn with_block_size(url: &str, block_size: usize) -> Result<Self, PipelineError> {
         ensure_rustls_provider();
-        let client = Client::builder()
-            .user_agent(HTTP_USER_AGENT)
-            .build()
-            .map_err(|e| PipelineError::Io(format!("Failed to build HTTP client: {e}")))?;
+        let client = range_clients(1)?.remove(0);
         let len = fetch_http_length(&client, url)?;
         Ok(Self {
-            client,
-            url: url.to_string(),
-            len,
+            fetcher: Arc::new(HttpSegmentFetcher { client, url: url.to_string(), len }),
             cache: Mutex::new(RemoteCache::new(cache_capacity_for(block_size))),
             block_size,
+            planned: None,
         })
     }
 
@@ -2121,7 +2193,7 @@ impl HttpByteRangeSource {
     }
 
     fn block_length(&self, start: u64) -> usize {
-        let remaining = self.len.saturating_sub(start);
+        let remaining = self.fetcher.len.saturating_sub(start);
         remaining.min(self.block_size as u64) as usize
     }
 
@@ -2137,7 +2209,7 @@ impl HttpByteRangeSource {
         if length == 0 {
             return Err(PipelineError::Io(format!(
                 "Requested block beyond end of object {url}",
-                url = self.url
+                url = self.fetcher.url
             )));
         }
 
@@ -2152,6 +2224,12 @@ impl HttpByteRangeSource {
     }
 
     fn fetch_segment(&self, start: u64, length: usize) -> Result<Vec<u8>, PipelineError> {
+        self.fetcher.fetch(start, length)
+    }
+}
+
+impl HttpSegmentFetcher {
+    fn fetch(&self, start: u64, length: usize) -> Result<Vec<u8>, PipelineError> {
         let end = start
             .checked_add(length as u64)
             .and_then(|value| value.checked_sub(1))
@@ -2175,7 +2253,8 @@ impl HttpByteRangeSource {
                 self.url
             )));
         }
-        let actual_range = Self::parse_byte_content_range(response.headers().get(CONTENT_RANGE));
+        let actual_range =
+            HttpByteRangeSource::parse_byte_content_range(response.headers().get(CONTENT_RANGE));
         if actual_range != Some((start, end, self.len)) {
             return Err(PipelineError::Io(format!(
                 "HTTP range response for {} has inconsistent Content-Range: expected bytes {start}-{end}/{}, got {:?}",
@@ -2185,7 +2264,7 @@ impl HttpByteRangeSource {
             )));
         }
         if let Some(content_length) =
-            Self::parse_content_length(response.headers().get(CONTENT_LENGTH))
+            HttpByteRangeSource::parse_content_length(response.headers().get(CONTENT_LENGTH))
             && content_length != length as u64
         {
             return Err(PipelineError::Io(format!(
@@ -2216,26 +2295,26 @@ impl HttpByteRangeSource {
 
 impl ByteRangeSource for HttpByteRangeSource {
     fn len(&self) -> u64 {
-        self.len
+        self.fetcher.len
     }
 
     fn read_at(&self, offset: u64, dst: &mut [u8]) -> Result<(), PipelineError> {
         if dst.is_empty() {
             return Ok(());
         }
-        if offset >= self.len {
+        if offset >= self.fetcher.len {
             return Err(PipelineError::Io(format!(
                 "Attempted to read past end of HTTP resource {} at offset {offset}",
-                self.url
+                self.fetcher.url
             )));
         }
         let end = offset.checked_add(dst.len() as u64).ok_or_else(|| {
             PipelineError::Io("Offset overflow while reading HTTP resource".to_string())
         })?;
-        if end > self.len {
+        if end > self.fetcher.len {
             return Err(PipelineError::Io(format!(
                 "Attempted to read past end of HTTP resource {} (offset {offset}, len {})",
-                self.url,
+                self.fetcher.url,
                 dst.len()
             )));
         }
@@ -2246,14 +2325,19 @@ impl ByteRangeSource for HttpByteRangeSource {
         let block_size = self.block_size as u64;
 
         while remaining > 0 {
-            let block_start = (current_offset / block_size) * block_size;
-            let block = self.ensure_block(block_start)?;
+            let (block_start, block) = match &self.planned {
+                Some(reader) => reader.range_at(current_offset)?,
+                None => {
+                    let block_start = (current_offset / block_size) * block_size;
+                    (block_start, self.ensure_block(block_start)?)
+                }
+            };
             let within_block = (current_offset - block_start) as usize;
             if within_block >= block.len() {
                 return Err(PipelineError::Io(format!(
                     "Computed block offset {within_block} exceeds block size {} for {}",
                     block.len(),
-                    self.url
+                    self.fetcher.url
                 )));
             }
             let available = block.len() - within_block;
@@ -2264,9 +2348,9 @@ impl ByteRangeSource for HttpByteRangeSource {
             remaining -= to_copy;
             current_offset += to_copy as u64;
 
-            if within_block + to_copy == block.len() {
+            if self.planned.is_none() && within_block + to_copy == block.len() {
                 let next_start = block_start + block_size;
-                if next_start < self.len {
+                if next_start < self.fetcher.len {
                     let _ = self.ensure_block(next_start);
                 }
             }
@@ -2436,23 +2520,21 @@ mod tests {
     }
 
     #[test]
-    fn dense_remote_bed_reuses_one_read_across_old_block_boundaries() {
-        let length = REMOTE_BLOCK_SIZE + 8;
-        let mut body = String::from("\u{006c}\u{001b}\u{0001}");
-        body.push_str(&"a".repeat(length - 3));
+    fn scoring_remote_bed_skips_unrequired_rows() {
+        let length = 10_003;
         let (url, server) = serve_http_responses(vec![
             format!("HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"),
-            format!("HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-{}/{length}\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n{body}", length - 1),
+            format!("HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-2/{length}\r\nContent-Length: 3\r\nConnection: close\r\n\r\n\u{006c}\u{001b}\u{0001}"),
+            format!("HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 9903-10002/{length}\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{}", "a".repeat(100)),
         ]);
-        let source = open_bed_source_for_scoring(Path::new(&url), None, 10_000, 1_000_000)
-            .expect("dense remote BED source");
+        let source = open_bed_source_for_scoring(Path::new(&url), None, &[99], 100, 100)
+            .expect("planned remote BED source");
         let mut bytes = [0; 4];
-        source.read_at((REMOTE_BLOCK_SIZE + 4) as u64, &mut bytes).expect("cached tail");
+        source.read_at(9999, &mut bytes).expect("required row tail");
         assert_eq!(&bytes, b"aaaa");
-        server.join().expect("single media request fixture");
-        let dense_block = REMOTE_BLOCK_SIZE * REMOTE_CACHE_CAPACITY;
-        assert_eq!(cache_capacity_for(dense_block) * dense_block, dense_block);
-        assert_eq!(cache_capacity_for(REMOTE_BLOCK_SIZE), REMOTE_CACHE_CAPACITY);
+        source.read_at(9903, &mut bytes).expect("cached row start");
+        assert!(source.read_at(3, &mut bytes).is_err());
+        server.join().expect("only required media ranges");
     }
 
     #[test]

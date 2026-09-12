@@ -396,8 +396,7 @@ fn open_scoring_bed_source(
     io::open_bed_source_for_scoring(
         path,
         context.genome_build,
-        context.prep_result.num_reconciled_variants,
-        context.prep_result.total_variants_in_bim,
+        &context.prep_result,
     )
 }
 

@@ -13,12 +13,12 @@
 use crate::pipeline_error::PipelineError;
 use crate::score::decide::ComputePath;
 use crate::score::types::{
-    BimRowIndex, FilesetBoundary, PreparationResult, ReconciledVariantIndex, WorkItem,
+    BimRowIndex, FilesetBoundary, PipelineKind, PreparationResult, ReconciledVariantIndex, WorkItem,
 };
 pub use crate::shared::files::{
     BedSource, ByteRangeSource, PROGRESS_UPDATE_BATCH_SIZE, TextSource,
     gcs_billing_project_from_env, get_shared_runtime, is_pgen_path, load_adc_credentials,
-    open_bed_source, open_bed_source_for_scoring, open_plink_text_source, open_text_source,
+    open_bed_source, open_plink_text_source, open_text_source,
 };
 use ahash::AHashMap;
 use crossbeam_channel::Sender;
@@ -28,6 +28,45 @@ use std::io::{BufWriter, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
+
+/// Opens one scoring fileset with the local row indices it must serve.
+pub fn open_bed_source_for_scoring(
+    path: &std::path::Path,
+    genome_build: Option<crate::adapt_plink2::GenomeBuild>,
+    prep: &PreparationResult,
+) -> Result<BedSource, PipelineError> {
+    let (start, end) = match &prep.pipeline_kind {
+        PipelineKind::SingleFile(_) => (0, prep.total_variants_in_bim),
+        PipelineKind::MultiFile(boundaries) => {
+            let index = boundaries
+                .iter()
+                .position(|boundary| boundary.bed_path == path)
+                .ok_or_else(|| {
+                    PipelineError::Io("Scoring path has no fileset boundary".into())
+                })?;
+            let next = boundaries
+                .get(index + 1)
+                .map_or(prep.total_variants_in_bim, |boundary| {
+                    boundary.starting_global_index
+                });
+            (boundaries[index].starting_global_index, next)
+        }
+    };
+    let rows: Vec<u64> = prep
+        .required_bim_indices
+        .iter()
+        .map(|row| row.0)
+        .filter(|&row| row >= start && row < end)
+        .map(|row| row - start)
+        .collect();
+    crate::shared::files::open_bed_source_for_scoring(
+        path,
+        genome_build,
+        &rows,
+        prep.bytes_per_variant,
+        end - start,
+    )
+}
 
 #[inline]
 fn reconciled_index_from_usize(i: usize) -> Result<ReconciledVariantIndex, PipelineError> {
@@ -78,6 +117,16 @@ fn prepare_pooled_buffer(
 }
 
 impl<'a> SpoolPlan<'a> {
+    /// Whether the required variant at this position feeds the complex pass.
+    #[inline(always)]
+    pub fn spools(&self, variant_position: usize) -> bool {
+        self.is_complex_for_required
+            .get(variant_position)
+            .copied()
+            .unwrap_or(0)
+            != 0
+    }
+
     #[inline(always)]
     pub fn write_variant(
         &mut self,
@@ -85,13 +134,7 @@ impl<'a> SpoolPlan<'a> {
         bim_row_idx: BimRowIndex,
         buffer: &[u8],
     ) -> Result<(), PipelineError> {
-        if self
-            .is_complex_for_required
-            .get(variant_position)
-            .copied()
-            .unwrap_or(0)
-            == 0
-        {
+        if !self.spools(variant_position) {
             return Ok(());
         }
 
@@ -181,6 +224,11 @@ pub fn producer_thread<'a, F>(
         Some(sp) => {
             let sp = sp;
             for (i, &bim_row_idx) in prep_result.required_bim_indices.iter().enumerate() {
+                // A resumed run re-reads only the rows the complex pass still
+                // needs; already-scored simple rows are never downloaded again.
+                if i < skip_reconciled_before && !sp.spools(i) {
+                    continue;
+                }
                 let mut buffer =
                     match prepare_pooled_buffer(pop_pooled_buffer(&buffer_pool), bytes_per_variant)
                     {
@@ -368,6 +416,12 @@ pub fn multi_file_producer_thread<'a, F>(
                     } else {
                         u64::MAX
                     };
+                }
+
+                // A resumed run re-reads only the rows the complex pass still
+                // needs; already-scored simple rows are never downloaded again.
+                if i < skip_reconciled_before && !sp.spools(i) {
+                    continue;
                 }
 
                 let local_index =

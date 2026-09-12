@@ -1243,8 +1243,7 @@ fn run_single_file_cuda(
     let bed_source = io::open_bed_source_for_scoring(
         bed_path,
         context.genome_build,
-        context.prep_result.num_reconciled_variants,
-        context.prep_result.total_variants_in_bim,
+        &context.prep_result,
     )?;
     let input = CudaInput::Single {
         bed_path: bed_path.to_path_buf(),
@@ -1264,8 +1263,7 @@ fn run_multi_file_cuda(
             io::open_bed_source_for_scoring(
                 &b.bed_path,
                 context.genome_build,
-                context.prep_result.num_reconciled_variants,
-                context.prep_result.total_variants_in_bim,
+                &context.prep_result,
             )
         })
         .collect::<Result<_, _>>()?;

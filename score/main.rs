@@ -380,8 +380,15 @@ fn ensure_output_absent(
     Ok(())
 }
 
+/// Remote inputs have no local parent directory; their outputs, checkpoints
+/// and caches live in the working directory.
+fn is_remote_prefix(path: &Path) -> bool {
+    let raw = path.to_string_lossy();
+    raw.starts_with("gs://") || raw.starts_with("http://") || raw.starts_with("https://")
+}
+
 fn score_output_path(output_prefix: &Path, name_suffix: Option<&str>) -> PathBuf {
-    let (output_dir, mut out_stem) = if output_prefix.to_string_lossy().starts_with("gs://") {
+    let (output_dir, mut out_stem) = if is_remote_prefix(output_prefix) {
         let stem = output_prefix
             .file_name()
             .map_or_else(|| OsString::from("gnomon_results"), OsString::from);
@@ -429,9 +436,7 @@ fn resolve_score_files(
     cache_anchor: &Path,
 ) -> Result<(Vec<PathBuf>, HashMap<String, GenomicRegion>), Box<dyn Error + Send + Sync>> {
     if !score_arg.exists() && score_arg_str.contains("PGS") {
-        let parent_local = cache_anchor
-            .to_string_lossy()
-            .starts_with("gs://")
+        let parent_local = is_remote_prefix(cache_anchor)
             .then(|| Path::new(".").to_path_buf())
             .unwrap_or_else(|| match cache_anchor.parent() {
                 Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
@@ -986,7 +991,7 @@ fn finalize_and_write_output(
     name_suffix: Option<&str>,
     emit_components: bool,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let (output_dir, mut out_stem) = if output_prefix.to_string_lossy().starts_with("gs://") {
+    let (output_dir, mut out_stem) = if is_remote_prefix(output_prefix) {
         let stem = output_prefix
             .file_name()
             .map_or_else(|| OsString::from("gnomon_results"), OsString::from);
