@@ -17,7 +17,8 @@ def file_hash(path):
 
 
 class StudyCheckpoint:
-    def __init__(self, root, uri, project, account, signature, resume=None, engine_hash=None):
+    def __init__(self, root, uri, project, account, signature, resume=None, engine_hash=None,
+                 resume_latest=False):
         self.root = Path(root)
         parsed = urlsplit(uri)
         if parsed.scheme != "gs" or not parsed.netloc or not parsed.path.strip("/") or parsed.query or parsed.fragment:
@@ -27,9 +28,35 @@ class StudyCheckpoint:
         self.engine_hash = engine_hash
         self.archive = self.root.parent / "checkpoint.tar.gz"
         self.root.mkdir(parents=True, exist_ok=True)
+        if resume_latest:
+            latest = self.download_latest()
+            if latest is not None:
+                resume = latest
         if resume is not None:
             self.restore(resume, signature)
         (self.root / "checkpoint_manifest.json").write_text(json.dumps(signature, sort_keys=True))
+
+    def download_latest(self):
+        """Resume the same workspace object after a VM retry; only 404 means new."""
+        from google.auth.compute_engine import Credentials
+        from google.auth.transport.requests import AuthorizedSession
+        url = (f"https://storage.googleapis.com/storage/v1/b/{quote(self.bucket, safe='')}/o/"
+               f"{quote(self.object, safe='')}")
+        path = self.root.parent / (self.root.name + "-resume.tar.gz")
+        with AuthorizedSession(Credentials(service_account_email=self.account)) as session:
+            with session.get(url, params={"alt": "media", "userProject": self.project},
+                             stream=True, timeout=60) as response:
+                if response.status_code == 404:
+                    return None
+                response.raise_for_status()
+                size = 0
+                with path.open("wb") as target:
+                    for block in response.iter_content(1024 * 1024):
+                        size += len(block)
+                        if size > 2 * 1024**3:
+                            raise ValueError("checkpoint exceeds the two-GiB download budget")
+                        target.write(block)
+        return path
 
     def restore(self, archive, signature):
         with tarfile.open(archive, "r:gz") as source:

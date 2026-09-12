@@ -14,12 +14,14 @@ import json
 import os
 from pathlib import Path
 import re
+import resource
 import signal
 import shutil
 import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import zipfile
 
 import numpy as np
@@ -551,14 +553,27 @@ def fit_worker(frame_path, config_path, cause, output, transform_path):
     print("worker_validation_complete", flush=True)
 
 
-def bounded_fit(command, timeout_seconds, log):
+def bounded_fit(command, timeout_seconds, log, checkpoint_callback=None):
     def terminate(signum, frame):
         raise InterruptedError("fit controller was terminated")
     previous_handler = signal.signal(signal.SIGTERM, terminate)
+    started = time.monotonic()
+    usage_before = resource.getrusage(resource.RUSAGE_CHILDREN)
     with Path(log).open("wb") as handle:
         child = subprocess.Popen(command, stdout=handle, stderr=subprocess.STDOUT, start_new_session=True)
         try:
-            result = child.wait(timeout=timeout_seconds)
+            deadline = started + timeout_seconds
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(command, timeout_seconds)
+                try:
+                    result = child.wait(timeout=min(30, remaining) if checkpoint_callback else remaining)
+                    break
+                except subprocess.TimeoutExpired:
+                    if time.monotonic() >= deadline:
+                        raise
+                    checkpoint_callback()
         except BaseException:
             if child.poll() is None:
                 os.killpg(child.pid, signal.SIGTERM)
@@ -570,6 +585,14 @@ def bounded_fit(command, timeout_seconds, log):
             raise
         finally:
             signal.signal(signal.SIGTERM, previous_handler)
+            usage_after = resource.getrusage(resource.RUSAGE_CHILDREN)
+            elapsed = time.monotonic() - started
+            cpu = (usage_after.ru_utime + usage_after.ru_stime
+                   - usage_before.ru_utime - usage_before.ru_stime)
+            write_json(Path(log).with_suffix(".resources.json"), {
+                "wall_seconds": elapsed, "cpu_seconds": cpu,
+                "average_cpu_cores": cpu / elapsed,
+            })
         if result != 0:
             raise RuntimeError("fit failed; inspect the private task fit log")
 
@@ -577,7 +600,7 @@ def bounded_fit(command, timeout_seconds, log):
 def checkpointed_fit(command, timeout_seconds, log, checkpoint):
     """Retain private failure logs and partial fits without a completion receipt."""
     try:
-        bounded_fit(command, timeout_seconds, log)
+        bounded_fit(command, timeout_seconds, log, checkpoint_callback=checkpoint.publish)
     except BaseException:
         checkpoint.publish()
         raise
@@ -678,7 +701,8 @@ def run(args):
                  "reference_ctn": [digest(path) for path in args.reference_ctn]}
     checkpoint = StudyCheckpoint(args.output, args.checkpoint_uri, config["google_project"],
                                  execution_account, signature, args.resume,
-                                 engine_hash=digest(importlib.util.find_spec("gamfit._rust").origin))
+                                 engine_hash=digest(importlib.util.find_spec("gamfit._rust").origin),
+                                 resume_latest=args.resume_latest)
     prepared_path = args.output / "prepared.json"
     client = BoundedClient(config, execution_account)
     if prepared_path.exists():
@@ -820,6 +844,7 @@ def main():
         run_parser.add_argument(f"--{name}", type=Path, required=True)
     run_parser.add_argument("--checkpoint-uri", required=True)
     run_parser.add_argument("--resume", type=Path)
+    run_parser.add_argument("--resume-latest", action="store_true")
     mode = run_parser.add_mutually_exclusive_group()
     mode.add_argument("--prepare-only", action="store_true")
     mode.add_argument("--smoke-only", action="store_true")

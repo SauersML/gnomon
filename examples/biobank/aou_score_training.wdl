@@ -18,6 +18,7 @@ workflow aou_score_training {
     File wheelhouse_archive
     String runtime_image
     String checkpoint_uri
+    File? resume_scoring_checkpoint
   }
   call train { input:
     sources=sources, analysis_config=analysis_config, scoring_config=scoring_config,
@@ -25,7 +26,8 @@ workflow aou_score_training {
     prior_shared_features=prior_shared_features, ancestry_predictions=ancestry_predictions,
     relatedness_prune=relatedness_prune, phenotype_library_archive=phenotype_library_archive,
     reference_ctn=reference_ctn, wheelhouse_archive=wheelhouse_archive,
-    runtime_image=runtime_image, checkpoint_uri=checkpoint_uri
+    runtime_image=runtime_image, checkpoint_uri=checkpoint_uri,
+    resume_scoring_checkpoint=resume_scoring_checkpoint
   }
   output {
     File metrics=train.metrics
@@ -52,6 +54,7 @@ task train {
     File wheelhouse_archive
     String runtime_image
     String checkpoint_uri
+    File? resume_scoring_checkpoint
   }
   command <<<
     set -euo pipefail
@@ -70,18 +73,21 @@ task train {
         --no-index --only-binary=:all: --find-links wheels -r aou_requirements.txt
       export GOOGLE_PROJECT=$(work/venv/bin/python -c "import json,sys; print(json.load(open(sys.argv[1]))[\"google_project\"])" "$2")
       work/venv/bin/python -c "import json,sys; json.dump(json.load(open(sys.argv[1]))[\"endpoint\"],open(\"endpoint.json\",\"w\"))" "$3"
+      resume_args=()
+      if [[ -n "${11}" ]]; then resume_args=(--resume-scoring-checkpoint "${11}"); fi
       work/venv/bin/python aou_refresh_score.py --config "$2" --scoring-config "$3" \
         --scorer "$PWD/gnomon-linux-x64" --weights "$4" --fam "$5" --features "$6" \
         --ancestry "$7" --prune "$8" --phenotypes "$9" --score-panel aou_pgs_panel.json \
-        --output work/score --status-uri "${10}"
+        --output work/score --status-uri "${10}" "${resume_args[@]}"
       exec work/venv/bin/python aou_survival.py run --config "$2" --phenotypes "$9" \
         --scores work/score/shared_features.tar.gz --ancestry "$7" --prune "$8" \
         --output work/results --runtime-image runtime_image.json --checkpoint-uri "${10}" \
         --endpoint-config endpoint.json --score-panel aou_pgs_panel.json \
-        --reference-ctn-list reference_ctn.json --smoke-only
+        --reference-ctn-list reference_ctn.json --smoke-only --resume-latest
     ' bash "~{wheelhouse_archive}" "~{analysis_config}" "~{scoring_config}" \
       "~{score_weights}" "~{genotype_fam}" "~{prior_shared_features}" \
-      "~{ancestry_predictions}" "~{relatedness_prune}" "~{phenotype_library_archive}" "~{checkpoint_uri}"
+      "~{ancestry_predictions}" "~{relatedness_prune}" "~{phenotype_library_archive}" "~{checkpoint_uri}" \
+      "~{default="" resume_scoring_checkpoint}"
   >>>
   output {
     File metrics="work/results/metrics.json"
@@ -94,8 +100,10 @@ task train {
     docker: runtime_image
     cpu: 4
     memory: "16 GiB"
-    disks: "local-disk 50 SSD"
-    preemptible: 0
+    cpuPlatform: "AMD Rome"
+    zones: "us-central1-a us-central1-b us-central1-c us-central1-f"
+    disks: "local-disk 50 HDD"
+    preemptible: 3
     maxRetries: 0
   }
 }
