@@ -93,11 +93,15 @@ class BoundedClient:
                                       credentials=Credentials(service_account_email=account))
         self.config = config
         self.jobs = []
+        self.remaining_bytes = config["maximum_bytes_billed"]
 
     def query(self, sql, job_config=None):
         from google.cloud import bigquery
         job_config = job_config or bigquery.QueryJobConfig()
-        job_config.maximum_bytes_billed = self.config["maximum_bytes_billed"]
+        if self.remaining_bytes <= 0:
+            raise RuntimeError("the cumulative BigQuery byte budget is exhausted")
+        job_config.maximum_bytes_billed = self.remaining_bytes
+        job_config.use_query_cache = True
         job_config.job_timeout_ms = self.config["query_timeout_seconds"] * 1000
         job = self.client.query(sql, job_config=job_config)
         self.jobs.append(job)
@@ -106,6 +110,10 @@ class BoundedClient:
         except BaseException:
             job.cancel()
             raise
+        billed = 0 if job.cache_hit else job.total_bytes_billed
+        if billed is None or billed < 0:
+            raise RuntimeError("BigQuery did not report billable bytes; refusing further queries")
+        self.remaining_bytes -= billed
         return job
 
 

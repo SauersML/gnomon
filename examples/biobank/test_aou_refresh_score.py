@@ -1,11 +1,13 @@
 """Exact component handoff from the native scorer, without participant data."""
 import pytest
 import subprocess
+import sys
+from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
 from aou_refresh_score import component_scores, save_scoring_state, microarray_prefix, require_spot_amd
 from aou_checkpoint import StudyCheckpoint
-from aou_survival import bounded_fit
+from aou_survival import bounded_fit, BoundedClient
 
 
 def test_microarray_scoring_rejects_wgs_and_other_sources():
@@ -44,6 +46,28 @@ def test_running_child_publishes_checkpoint_before_completion(tmp_path):
     published.assert_called_once_with()
     assert child.wait.call_count == 2
     assert (tmp_path / "fit.resources.json").is_file()
+
+
+def test_query_budget_is_cumulative_and_cached_queries_are_free():
+    client = BoundedClient.__new__(BoundedClient)
+    client.config = {"query_timeout_seconds": 10}
+    client.remaining_bytes = 100
+    client.jobs = []
+    client.client = MagicMock()
+    first = MagicMock(cache_hit=False, total_bytes_billed=60)
+    cached = MagicMock(cache_hit=True, total_bytes_billed=None)
+    last = MagicMock(cache_hit=False, total_bytes_billed=40)
+    client.client.query.side_effect = [first, cached, last]
+    sdk = SimpleNamespace(QueryJobConfig=lambda: SimpleNamespace())
+    with patch.dict(sys.modules, {"google.cloud.bigquery": sdk}):
+        for query in ("first", "cached", "last"):
+            client.query(query)
+    configs = [call.kwargs["job_config"] for call in client.client.query.call_args_list]
+    assert [c.maximum_bytes_billed for c in configs] == [100, 40, 40]
+    assert all(c.use_query_cache for c in configs)
+    with patch.dict(sys.modules, {"google.cloud.bigquery": sdk}), pytest.raises(RuntimeError, match="budget is exhausted"):
+        client.query("not submitted")
+    assert client.client.query.call_count == 3
 
 
 def test_vm_retry_restores_latest_workspace_checkpoint(tmp_path):
