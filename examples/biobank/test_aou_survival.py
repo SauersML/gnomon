@@ -137,6 +137,16 @@ class SurvivalContractTests(unittest.TestCase):
                                   "diagnostic__fit_warm_start_restored.txt",
                                   "diagnostic__fit_inner_solves_10_49.txt"})
 
+    def test_compute_bounds_never_change_the_checkpoint_identity(self):
+        from aou_checkpoint import result_identity
+        settings = {"num_pcs": 6, "fit_timeout_seconds": 600, "query_timeout_seconds": 120,
+                    "maximum_bytes_billed": 10**11, "timeout_seconds": 600, "seed": 7}
+        retuned = dict(settings, fit_timeout_seconds=4500, query_timeout_seconds=300,
+                       maximum_bytes_billed=10**12, timeout_seconds=900)
+        self.assertEqual(result_identity(settings), {"num_pcs": 6, "seed": 7})
+        self.assertEqual(result_identity(settings), result_identity(retuned))
+        self.assertNotEqual(result_identity(settings), result_identity(dict(settings, num_pcs=8)))
+
     def test_sparse_censoring_support_is_not_reported_as_valid_accuracy(self):
         train = pd.DataFrame({"event_code": [1, 2] * 30, "followup": [2.] * 60,
                               "ancestry": ["major"] * 59 + ["rare"]})

@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 
 from aou_identity import task_account, require_spot_amd
-from aou_checkpoint import StudyCheckpoint
+from aou_checkpoint import StudyCheckpoint, result_identity
 from aou_projection import source_identity, stream_projection
 from aou_status import failure_label, publish_status, score_progress_label
 from aou_survival import (BoundedClient, bounded_fit, build_cohort, case_dates,
@@ -103,7 +103,8 @@ def refresh(args):
     features = source_identity(args.features_uri, config["google_project"], account)
     checkpoint = StudyCheckpoint(args.output / "scoring_state", args.status_uri + ".scoring",
                                  config["google_project"], account,
-                                 {"scoring": specification, "analysis": config,
+                                 {"scoring": result_identity(specification),
+                                  "analysis": result_identity(config),
                                   "inputs": {name: digest(getattr(args, name)) for name in
                                              ("fam", "ancestry", "prune", "phenotypes", "score_panel")},
                                   "features": features,

@@ -30,7 +30,7 @@ import pandas as pd
 from aou_score_transform import (baseline_columns,
                                  score_diagnostics, transformed_score)
 from reference_ctn import load_reference
-from aou_checkpoint import StudyCheckpoint
+from aou_checkpoint import StudyCheckpoint, result_identity
 from aou_evaluation import audit_groups, loss_summary
 from aou_status import failure_label, publish_status
 
@@ -752,7 +752,7 @@ def run(args):
     sources = [Path(__file__), *[Path(__file__).with_name(name) for name in
                ("aou_identity.py", "aou_score_transform.py", "aou_checkpoint.py",
                 "aou_evaluation.py", "aou_status.py", "disease_selection.py", "reference_ctn.py")]]
-    signature = {"config": config, "endpoint": endpoint,
+    signature = {"config": result_identity(config), "endpoint": endpoint,
                  "score_scope": "prespecified_single_score",
                  "sources": {p.name: digest(p) for p in sources},
                  "inputs": {key: digest(getattr(args, key)) for key in
