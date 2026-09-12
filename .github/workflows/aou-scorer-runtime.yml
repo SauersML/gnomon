@@ -1,0 +1,85 @@
+name: AoU Scorer Runtime
+
+on:
+  workflow_dispatch:
+    inputs:
+      cache_key:
+        description: Existing Rust Test CI build cache
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aou-scorer-runtime
+  cancel-in-progress: false
+
+jobs:
+  scorer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      RUSTFLAGS: '-C target-cpu=x86-64'
+      CARGO_BUILD_JOBS: 3
+      CARGO_PROFILE_RELEASE_LTO: thin
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 16
+      GNOMON_RELEASE_TAG: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-09-10
+      - uses: actions/cache/restore@v4
+        with:
+          path: |
+            target/release
+            target/nextest
+          key: ${{ inputs.cache_key }}
+          fail-on-cache-miss: true
+      - name: Resolve source packages for the restored build cache
+        run: timeout --kill-after=5s 60s cargo +nightly-2026-09-10 fetch --locked
+      - name: Verify remote reads and build the scorer
+        run: |
+          set -euo pipefail
+          # Preserve optimized cached dependencies. Compile only the scoring
+          # workspace and avoid repeating whole-program LTO for this pilot.
+          cat > rustc-iteration.sh <<'SH'
+          #!/bin/sh
+          for arg in "$@"; do
+            if [ "$arg" = "--test" ]; then
+              exec "$@" -C opt-level=1 -C lto=off -C codegen-units=64
+            fi
+          done
+          exec "$@" -C lto=off -C codegen-units=64
+          SH
+          chmod +x rustc-iteration.sh
+          export RUSTC_WORKSPACE_WRAPPER="$PWD/rustc-iteration.sh"
+          timeout --kill-after=10s 180s cargo +nightly-2026-09-10 test --locked --offline --release \
+            --no-default-features --features score --lib dense_remote_bed_reuses_one_read_across_old_block_boundaries
+          timeout --kill-after=10s 30s cargo +nightly-2026-09-10 test --locked --offline --release \
+            --no-default-features --features score --lib http_range_reads_
+          timeout --kill-after=10s 180s cargo +nightly-2026-09-10 build --locked --offline --release \
+            --no-default-features --features score --bin gnomon-score
+      - name: Validate and package the Linux runtime
+        run: |
+          set -euo pipefail
+          mkdir runtime
+          cp target/release/gnomon-score runtime/gnomon-linux-x64
+          docker pull python:3.12-slim-trixie
+          docker image inspect python:3.12-slim-trixie --format '{{index .RepoDigests 0}}' > runtime-image.txt
+          docker run --rm -v "$PWD/runtime:/runtime:ro" "$(cat runtime-image.txt)" \
+            /runtime/gnomon-linux-x64 --version
+          sha256sum runtime/gnomon-linux-x64 > scorer.sha256
+          tar -czf scorer.tar.gz -C runtime gnomon-linux-x64
+          sha256sum scorer.tar.gz > archive.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aou-scorer-runtime
+          path: |
+            scorer.tar.gz
+            scorer.sha256
+            archive.sha256
+            runtime-image.txt
+          if-no-files-found: error
+          retention-days: 7

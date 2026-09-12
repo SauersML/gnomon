@@ -45,11 +45,10 @@ const REMOTE_MEDIUM_BLOCK_SIZE: usize = 2 * 1024 * 1024;
 const REMOTE_READ_ATTEMPTS: usize = 4;
 const REMOTE_READ_INITIAL_BACKOFF_MS: u64 = 250;
 
-/// Keeps the cache's memory footprint roughly constant as block size shrinks,
-/// so smaller blocks buy more of them rather than less cache.
+/// Keep the byte budget fixed when fetch granularity grows or shrinks.
 fn cache_capacity_for(block_size: usize) -> usize {
     let budget = REMOTE_BLOCK_SIZE * REMOTE_CACHE_CAPACITY;
-    (budget / block_size.max(1)).clamp(REMOTE_CACHE_CAPACITY, 512)
+    (budget / block_size.max(1)).clamp(1, 512)
 }
 const REMOTE_CACHE_CAPACITY: usize = 8;
 const HTTP_USER_AGENT: &str = "gnomon-http-client/1.0";
@@ -319,7 +318,7 @@ pub fn open_bed_source(
     }
 }
 
-/// Opens a scoring input with remote PGEN fetches sized to the matched variant density.
+/// Opens a scoring input with fetches sized to the matched variant density.
 ///
 /// A single PGS touches scattered records and must retain the 256 KiB sparse path. A
 /// large score bank can match enough variants that nearly every larger object block is
@@ -331,11 +330,26 @@ pub fn open_bed_source_for_scoring(
     matched_variants: usize,
     total_variants: u64,
 ) -> Result<BedSource, PipelineError> {
-    if !is_pgen_path(path) {
-        return open_bed_source(path, genome_build);
-    }
     if !is_gcs_path(path) && !is_http_path(path) {
         return open_bed_source(path, genome_build);
+    }
+    if !is_pgen_path(path) {
+        // Dense BED scoring sweeps almost every remote block. Spend the
+        // existing cache byte budget on one contiguous fetch rather than
+        // paying serial request latency for each of its eight old blocks.
+        // Sparse inputs retain their smaller read granularity.
+        let block_size = if total_variants > 0
+            && matched_variants as f64 / total_variants as f64 >= 0.01
+        {
+            REMOTE_BLOCK_SIZE * REMOTE_CACHE_CAPACITY
+        } else {
+            REMOTE_BLOCK_SIZE
+        };
+        let remote = open_byte_range_source(path, Some(block_size))?;
+        let source = BedSource::new(remote, None);
+        validate_bed_source_header(path, &source)?;
+        eprintln!("> Remote BED fetch block: {} KiB.", block_size / 1024);
+        return Ok(source);
     }
     let genome_build = genome_build.ok_or_else(|| {
         PipelineError::Io(
@@ -2402,6 +2416,26 @@ mod tests {
             }
         });
         (url, worker)
+    }
+
+    #[test]
+    fn dense_remote_bed_reuses_one_read_across_old_block_boundaries() {
+        let length = REMOTE_BLOCK_SIZE + 8;
+        let mut body = String::from("\u{006c}\u{001b}\u{0001}");
+        body.push_str(&"a".repeat(length - 3));
+        let (url, server) = serve_http_responses(vec![
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"),
+            format!("HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-{}/{length}\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n{body}", length - 1),
+        ]);
+        let source = open_bed_source_for_scoring(Path::new(&url), None, 10_000, 1_000_000)
+            .expect("dense remote BED source");
+        let mut bytes = [0; 4];
+        source.read_at((REMOTE_BLOCK_SIZE + 4) as u64, &mut bytes).expect("cached tail");
+        assert_eq!(&bytes, b"aaaa");
+        server.join().expect("single media request fixture");
+        let dense_block = REMOTE_BLOCK_SIZE * REMOTE_CACHE_CAPACITY;
+        assert_eq!(cache_capacity_for(dense_block) * dense_block, dense_block);
+        assert_eq!(cache_capacity_for(REMOTE_BLOCK_SIZE), REMOTE_CACHE_CAPACITY);
     }
 
     #[test]
