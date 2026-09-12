@@ -86,9 +86,9 @@ def refresh(args):
     validate_config(config)
     specification = json.loads(args.scoring_config.read_text())
     if set(specification) != {"endpoint", "genotype_prefix", "scorer_sha256", "weights_sha256",
-                              "timeout_seconds", "required_cpu_flags"}:
+                              "timeout_seconds"}:
         raise ValueError("scoring configuration has missing or unknown keys")
-    runtime = require_spot_amd(specification["required_cpu_flags"])
+    runtime = require_spot_amd()
     if (digest(args.scorer) != specification["scorer_sha256"]
             or digest(args.weights) != specification["weights_sha256"]):
         raise ValueError("scorer or scoring weights do not match their pinned hashes")

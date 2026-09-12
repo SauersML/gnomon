@@ -61,13 +61,12 @@ task train {
     mkdir -p wheels work/tmp work/cache
     tar -xf "~{sources}"
     python aou_status.py "~{checkpoint_uri}" task_started
-    python - "~{checkpoint_uri}" "~{scoring_config}" <<'PY'
-    import json
+    python - "~{checkpoint_uri}" <<'PY'
     import sys
     from aou_identity import require_spot_amd
     from aou_status import publish_status
     try:
-        require_spot_amd(json.load(open(sys.argv[2]))["required_cpu_flags"])
+        require_spot_amd()
     except Exception as error:
         publish_status(sys.argv[1], getattr(error, "label", "failed_runtime_policy"))
         raise
