@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
 from aou_refresh_score import component_scores, save_scoring_state, microarray_prefix
-from aou_identity import require_spot_amd
+from aou_identity import require_spot_amd, RuntimePolicyError
 from aou_status import score_progress_label
 from aou_checkpoint import StudyCheckpoint
 from aou_survival import bounded_fit, BoundedClient
@@ -20,13 +20,13 @@ def test_microarray_scoring_rejects_wgs_and_other_sources():
             microarray_prefix(invalid)
 
 
-@pytest.mark.parametrize("spot,vendor,flags,accepted", [
-    (b"TRUE", "AuthenticAMD", "avx2 vaes", True),
-    (b"FALSE", "AuthenticAMD", "avx2 vaes", False),
-    (b"TRUE", "GenuineIntel", "avx2 vaes", False),
-    (b"TRUE", "AuthenticAMD", "avx2", False),
+@pytest.mark.parametrize("spot,vendor,flags,rejection", [
+    (b"TRUE", "AuthenticAMD", "avx2 vaes", None),
+    (b"FALSE", "AuthenticAMD", "avx2 vaes", "failed_runtime_nonspot"),
+    (b"TRUE", "GenuineIntel", "avx2 vaes", "failed_runtime_nonamd"),
+    (b"TRUE", "AuthenticAMD", "avx2", "failed_runtime_instructions"),
 ])
-def test_runtime_refuses_nonspot_nonamd_or_unsupported_instructions(spot, vendor, flags, accepted):
+def test_runtime_refuses_nonspot_nonamd_or_unsupported_instructions(spot, vendor, flags, rejection):
     from unittest.mock import MagicMock
     replies = []
     for value in (spot, b"projects/example/machineTypes/n2d-standard-4"):
@@ -35,11 +35,12 @@ def test_runtime_refuses_nonspot_nonamd_or_unsupported_instructions(spot, vendor
         replies.append(reply)
     cpuinfo = f"vendor_id: {vendor}\nflags: {flags}\n"
     with patch("aou_identity.urllib.request.urlopen", side_effect=replies), patch("pathlib.Path.read_text", return_value=cpuinfo):
-        if accepted:
+        if rejection is None:
             assert require_spot_amd(["avx2", "vaes"])["preemptible"] is True
         else:
-            with pytest.raises(RuntimeError, match="requires an AMD|instruction set"):
+            with pytest.raises(RuntimePolicyError, match="requires an AMD|instruction set") as error:
                 require_spot_amd(["avx2", "vaes"])
+            assert error.value.label == rejection
 
 
 def test_running_child_publishes_checkpoint_before_completion(tmp_path):

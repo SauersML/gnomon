@@ -68,8 +68,8 @@ task train {
     from aou_status import publish_status
     try:
         require_spot_amd(json.load(open(sys.argv[2]))["required_cpu_flags"])
-    except Exception:
-        publish_status(sys.argv[1], "failed_runtime_policy")
+    except Exception as error:
+        publish_status(sys.argv[1], getattr(error, "label", "failed_runtime_policy"))
         raise
     publish_status(sys.argv[1], "runtime_verified")
     PY

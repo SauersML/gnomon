@@ -10,7 +10,8 @@ from aou_identity import task_account
 
 LABELS = frozenset({
     "task_started", "runtime_verified", "installing_dependencies", "dependencies_ready",
-    "failed_runtime_policy", "failed_task_setup", "restoring_score_checkpoint",
+    "failed_runtime_policy", "failed_runtime_nonspot", "failed_runtime_nonamd",
+    "failed_runtime_instructions", "failed_task_setup", "restoring_score_checkpoint",
     "reading_projection", "projection_ready",
     "score_progress_0", "score_progress_1_24", "score_progress_25_49",
     "score_progress_50_74", "score_progress_75_99", "score_progress_100",
