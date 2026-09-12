@@ -97,7 +97,8 @@ class SurvivalContractTests(unittest.TestCase):
             try:
                 os.chdir(directory)
                 with patch.object(sys, "argv", ["diagnose", str(stderr), "", str(checkpoint)]), \
-                     patch.dict(sys.modules, {"aou_identity": SimpleNamespace(task_account=lambda: None)}):
+                     patch.dict(sys.modules, {"aou_identity": SimpleNamespace(
+                         task_account=lambda: None, require_spot_amd=lambda: None)}):
                     exec(compile(code, "aou_diagnostic.wdl", "exec"), {})
             finally:
                 os.chdir(previous)
