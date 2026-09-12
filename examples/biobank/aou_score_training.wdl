@@ -61,12 +61,13 @@ task train {
     mkdir -p wheels work/tmp work/cache
     tar -xf "~{sources}"
     python aou_status.py "~{checkpoint_uri}" task_started
-    python - "~{checkpoint_uri}" <<'PY'
+    python - "~{checkpoint_uri}" "~{scoring_config}" <<'PY'
+    import json
     import sys
     from aou_identity import require_spot_amd
     from aou_status import publish_status
     try:
-        require_spot_amd()
+        require_spot_amd(json.load(open(sys.argv[2]))["required_cpu_flags"])
     except Exception:
         publish_status(sys.argv[1], "failed_runtime_policy")
         raise
@@ -123,8 +124,7 @@ task train {
     docker: runtime_image
     cpu: 4
     memory: "16 GiB"
-    predefinedMachineType: "n2d-standard-4"
-    cpuPlatform: "AMD Milan"
+    cpuPlatform: "AMD Rome"
     zones: "us-central1-a us-central1-b us-central1-c us-central1-f"
     disks: "local-disk 50 SSD"
     preemptible: 3

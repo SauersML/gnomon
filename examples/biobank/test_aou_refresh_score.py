@@ -20,22 +20,26 @@ def test_microarray_scoring_rejects_wgs_and_other_sources():
             microarray_prefix(invalid)
 
 
-@pytest.mark.parametrize("spot,vendor,accepted", [(b"TRUE", "AuthenticAMD", True),
-                                                    (b"FALSE", "AuthenticAMD", False),
-                                                    (b"TRUE", "GenuineIntel", False)])
-def test_runtime_refuses_nonspot_or_nonamd(spot, vendor, accepted):
+@pytest.mark.parametrize("spot,vendor,flags,accepted", [
+    (b"TRUE", "AuthenticAMD", "avx2 vaes", True),
+    (b"FALSE", "AuthenticAMD", "avx2 vaes", False),
+    (b"TRUE", "GenuineIntel", "avx2 vaes", False),
+    (b"TRUE", "AuthenticAMD", "avx2", False),
+])
+def test_runtime_refuses_nonspot_nonamd_or_unsupported_instructions(spot, vendor, flags, accepted):
     from unittest.mock import MagicMock
     replies = []
     for value in (spot, b"projects/example/machineTypes/n2d-standard-4"):
         reply = MagicMock()
         reply.__enter__.return_value.read.return_value = value
         replies.append(reply)
-    with patch("aou_identity.urllib.request.urlopen", side_effect=replies), patch("pathlib.Path.read_text", return_value=vendor):
+    cpuinfo = f"vendor_id: {vendor}\nflags: {flags}\n"
+    with patch("aou_identity.urllib.request.urlopen", side_effect=replies), patch("pathlib.Path.read_text", return_value=cpuinfo):
         if accepted:
-            assert require_spot_amd()["preemptible"] is True
+            assert require_spot_amd(["avx2", "vaes"])["preemptible"] is True
         else:
-            with pytest.raises(RuntimeError, match="requires an AMD"):
-                require_spot_amd()
+            with pytest.raises(RuntimeError, match="requires an AMD|instruction set"):
+                require_spot_amd(["avx2", "vaes"])
 
 
 def test_running_child_publishes_checkpoint_before_completion(tmp_path):

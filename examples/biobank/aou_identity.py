@@ -6,7 +6,7 @@ from pathlib import Path
 import urllib.request
 
 
-def require_spot_amd():
+def require_spot_amd(required_cpu_flags):
     """Check the actual VM before setup, scoring, or fitting can spend resources."""
     def metadata(path):
         request = urllib.request.Request(
@@ -14,11 +14,21 @@ def require_spot_amd():
             headers={"Metadata-Flavor": "Google"})
         with urllib.request.urlopen(request, timeout=10) as response:
             return response.read().decode().strip()
+    if not isinstance(required_cpu_flags, list) or not all(
+            isinstance(flag, str) and flag and flag.replace("_", "").isalnum()
+            for flag in required_cpu_flags):
+        raise ValueError("scorer CPU requirements must be Linux CPU flag names")
     preemptible = metadata("scheduling/preemptible")
     machine = metadata("machine-type").rsplit("/", 1)[-1]
-    if preemptible.upper() != "TRUE" or "AuthenticAMD" not in Path("/proc/cpuinfo").read_text():
+    cpuinfo = Path("/proc/cpuinfo").read_text()
+    if preemptible.upper() != "TRUE" or "AuthenticAMD" not in cpuinfo:
         raise RuntimeError("this pilot requires an AMD Spot/preemptible VM; refusing paid-standard execution")
-    return {"machine_type": machine, "preemptible": True, "cpu_vendor": "AMD"}
+    flag_sets = [set(line.split(":", 1)[1].split()) for line in cpuinfo.splitlines()
+                 if line.split(":", 1)[0].strip() == "flags"]
+    if not flag_sets or any(not set(required_cpu_flags).issubset(flags) for flags in flag_sets):
+        raise RuntimeError("VM CPU does not support the pinned native scorer instruction set")
+    return {"machine_type": machine, "preemptible": True, "cpu_vendor": "AMD",
+            "verified_cpu_flags": sorted(required_cpu_flags)}
 
 def check_account(email, *, expected=None):
     if not isinstance(email, str) or "@" not in email or email != email.strip():

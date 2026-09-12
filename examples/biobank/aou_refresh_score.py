@@ -82,12 +82,13 @@ def save_scoring_state(checkpoint, score_dir, log, *, complete, status_uri):
 
 def refresh(args):
     account = task_account()
-    runtime = require_spot_amd()
     config = json.loads(args.config.read_text())
     validate_config(config)
     specification = json.loads(args.scoring_config.read_text())
-    if set(specification) != {"endpoint", "genotype_prefix", "scorer_sha256", "weights_sha256", "timeout_seconds"}:
+    if set(specification) != {"endpoint", "genotype_prefix", "scorer_sha256", "weights_sha256",
+                              "timeout_seconds", "required_cpu_flags"}:
         raise ValueError("scoring configuration has missing or unknown keys")
+    runtime = require_spot_amd(specification["required_cpu_flags"])
     if (digest(args.scorer) != specification["scorer_sha256"]
             or digest(args.weights) != specification["weights_sha256"]):
         raise ValueError("scorer or scoring weights do not match their pinned hashes")
