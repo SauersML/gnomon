@@ -99,11 +99,13 @@ pub(crate) struct Limits {
     pub max_workers: usize,
 }
 
+/// Sized for a cohort whose rows are ~100 KB: a full window of such rows
+/// keeps a 10-30 Gbps VM busy while request latency stays the bottleneck.
 pub(crate) const LIMITS: Limits = Limits {
-    window_bytes: 128 * 1024 * 1024,
-    in_flight_bytes: 64 * 1024 * 1024,
+    window_bytes: 256 * 1024 * 1024,
+    in_flight_bytes: 128 * 1024 * 1024,
     min_workers: 8,
-    max_workers: 128,
+    max_workers: 256,
 };
 
 struct State {
@@ -414,7 +416,7 @@ mod tests {
             move |offset, length| {
                 let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                 peak.fetch_max(now, Ordering::SeqCst);
-                std::thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(Duration::from_millis(100));
                 in_flight.fetch_sub(1, Ordering::SeqCst);
                 bytes.fetch_add(length, Ordering::SeqCst);
                 Ok(pattern(offset, length))

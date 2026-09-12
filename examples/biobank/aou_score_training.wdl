@@ -77,7 +77,7 @@ task train {
     cp "~{write_json(reference_ctn)}" reference_ctn.json
     cp "~{write_json(runtime_image)}" runtime_image.json
     export TMPDIR="$PWD/work/tmp" XDG_CACHE_HOME="$PWD/work/cache"
-    export RAYON_NUM_THREADS=4 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 PYTHONUNBUFFERED=1
+    export RAYON_NUM_THREADS=16 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 PYTHONUNBUFFERED=1
     cat > work/setup.sh <<'SH'
     set -euo pipefail
     tar -xf "$1" -C wheels
@@ -121,8 +121,8 @@ task train {
   }
   runtime {
     docker: runtime_image
-    cpu: 4
-    memory: "16 GiB"
+    cpu: 16
+    memory: "32 GiB"
     cpuPlatform: "AMD Rome"
     zones: "us-central1-a us-central1-b us-central1-c us-central1-f"
     disks: "local-disk 50 SSD"
