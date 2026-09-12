@@ -39,28 +39,29 @@ jobs:
           fail-on-cache-miss: true
       - name: Resolve source packages for the restored build cache
         run: timeout --kill-after=5s 60s cargo +nightly-2026-09-10 fetch --locked
-      - name: Verify remote reads and build the scorer
+      - name: Build the portable scorer from the existing release graph
         run: |
           set -euo pipefail
-          # Preserve optimized cached dependencies. Compile only the scoring
-          # workspace and avoid repeating whole-program LTO for this pilot.
+          # Keep the producer's feature unification so its dependencies remain
+          # warm. The executable dispatches directly by its gnomon-score name.
+          # Source regressions run on MSI; changing the CPU target additionally
+          # requires public-fixture parity before staging this artifact in AoU.
           cat > rustc-iteration.sh <<'SH'
           #!/bin/sh
-          for arg in "$@"; do
-            if [ "$arg" = "--test" ]; then
-              exec "$@" -C opt-level=1 -C lto=off -C codegen-units=64
-            fi
-          done
-          exec "$@" -C lto=off -C codegen-units=64
+          exec "$@" -C lto=off -C codegen-units=64 -C "incremental=$PWD/target/release/aou-incremental"
           SH
           chmod +x rustc-iteration.sh
           export RUSTC_WORKSPACE_WRAPPER="$PWD/rustc-iteration.sh"
-          timeout --kill-after=10s 180s cargo +nightly-2026-09-10 test --locked --offline --release \
-            --no-default-features --features score --lib dense_remote_bed_reuses_one_read_across_old_block_boundaries
-          timeout --kill-after=10s 30s cargo +nightly-2026-09-10 test --locked --offline --release \
-            --no-default-features --features score --lib http_range_reads_
           timeout --kill-after=10s 180s cargo +nightly-2026-09-10 build --locked --offline --release \
-            --no-default-features --features score,reqwest/rustls-tls --bin gnomon-score
+            --features reqwest/rustls-tls --bin gnomon-score
+      - name: Preserve completed compilation after success or interruption
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            target/release
+            target/nextest
+          key: Linux-aou-scorer-x86-64-nightly-20260910-${{ github.run_id }}
       - name: Validate and package the Linux runtime
         run: |
           set -euo pipefail
