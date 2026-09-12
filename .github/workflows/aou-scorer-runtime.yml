@@ -4,9 +4,10 @@ on:
   workflow_dispatch:
     inputs:
       cache_key:
-        description: Existing Rust Test CI build cache
-        required: true
+        description: Build cache to restore; the default reuses the newest scorer cache
+        required: false
         type: string
+        default: Linux-aou-scorer-x86-64-nightly-20260910-
 
 permissions:
   contents: read
@@ -18,7 +19,7 @@ concurrency:
 jobs:
   scorer:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 40
     env:
       RUSTFLAGS: '-C target-cpu=x86-64'
       CARGO_BUILD_JOBS: 4
@@ -30,20 +31,23 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-09-10
+      # A cache only shortens the build. Caches are evicted without notice,
+      # so a cold build must still succeed; it then reseeds the cache below.
       - uses: actions/cache/restore@v4
         with:
           path: |
             target/release
             target/nextest
           key: ${{ inputs.cache_key }}
-          fail-on-cache-miss: true
+          restore-keys: |
+            Linux-aou-scorer-x86-64-nightly-20260910-
       - name: Resolve source packages for the restored build cache
         run: timeout --kill-after=5s 60s cargo +nightly-2026-09-10 fetch --locked
-      - name: Build the portable scorer from the existing release graph
+      - name: Build the portable scorer
         run: |
           set -euo pipefail
-          # Use the persisted scorer cache; do not compile mapping or model
-          # fitting into a binary that only performs genotype scoring.
+          # Do not compile mapping or model fitting into a binary that only
+          # performs genotype scoring.
           # Source regressions run on MSI; changing the CPU target additionally
           # requires public-fixture parity before staging this artifact in AoU.
           cat > rustc-iteration.sh <<'SH'
@@ -52,7 +56,7 @@ jobs:
           SH
           chmod +x rustc-iteration.sh
           export RUSTC_WORKSPACE_WRAPPER="$PWD/rustc-iteration.sh"
-          timeout --kill-after=10s 180s cargo +nightly-2026-09-10 build --locked --offline --release \
+          timeout --kill-after=10s 30m cargo +nightly-2026-09-10 build --locked --offline --release \
             --no-default-features --features score,reqwest/rustls-tls --bin gnomon-score
       - name: Preserve completed compilation after success or interruption
         if: always()
