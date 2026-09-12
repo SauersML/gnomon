@@ -162,7 +162,7 @@ def refresh(args):
         os.chdir(score_dir)
         try:
             if not completed:
-                bounded_fit([str(args.scorer), "score", str(args.weights),
+                bounded_fit([str(args.scorer), str(args.weights),
                              specification["genotype_prefix"] + ".bed", "--keep", str(keep), "--emit-components"],
                             specification["timeout_seconds"], log,
                             checkpoint_callback=lambda: save_scoring_state(checkpoint, score_dir, log, complete=False))

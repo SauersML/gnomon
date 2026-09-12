@@ -61,7 +61,7 @@ task train {
     mkdir -p wheels work/tmp work/cache
     tar -xf "~{sources}"
     tar -xf "~{scorer_archive}"
-    chmod +x gnomon-linux-x64
+    chmod +x gnomon-score
     cp "~{write_json(reference_ctn)}" reference_ctn.json
     cp "~{write_json(runtime_image)}" runtime_image.json
     export TMPDIR="$PWD/work/tmp" XDG_CACHE_HOME="$PWD/work/cache"
@@ -76,7 +76,7 @@ task train {
       resume_args=()
       if [[ -n "${11}" ]]; then resume_args=(--resume-scoring-checkpoint "${11}"); fi
       work/venv/bin/python aou_refresh_score.py --config "$2" --scoring-config "$3" \
-        --scorer "$PWD/gnomon-linux-x64" --weights "$4" --fam "$5" --features "$6" \
+        --scorer "$PWD/gnomon-score" --weights "$4" --fam "$5" --features "$6" \
         --ancestry "$7" --prune "$8" --phenotypes "$9" --score-panel aou_pgs_panel.json \
         --output work/score --status-uri "${10}" "${resume_args[@]}"
       exec work/venv/bin/python aou_survival.py run --config "$2" --phenotypes "$9" \
