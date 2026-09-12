@@ -1063,6 +1063,11 @@ fn resolve_filesets(path: &Path) -> Result<Vec<PathBuf>, Box<dyn Error + Send + 
         if is_gcs_uri_str(s) {
             return resolve_gcs_filesets(s);
         }
+        // An HTTP fileset is named by one of its members; each member is
+        // validated when it is opened, with the server's own error.
+        if s.starts_with("http://") || s.starts_with("https://") {
+            return Ok(vec![fileset_prefix(path)]);
+        }
     }
 
     // --- ORIGINAL LOCAL LOGIC (unchanged) ---
