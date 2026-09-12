@@ -8,17 +8,17 @@ from pathlib import Path
 import shutil
 import tarfile
 from urllib.parse import urlsplit
-from urllib.request import Request, urlopen
 
 import numpy as np
 import pandas as pd
 
-from aou_identity import task_account
+from aou_identity import task_account, require_spot_amd
 from aou_checkpoint import StudyCheckpoint
-from aou_status import failure_label, publish_status
+from aou_projection import source_identity, stream_projection
+from aou_status import failure_label, publish_status, score_progress_label
 from aou_survival import (BoundedClient, bounded_fit, build_cohort, case_dates,
                          digest, load_cached_score, load_score_panel, person_times,
-                         read_ancestry, unpack_phenotypes, unpack_score_cache,
+                         read_ancestry, unpack_phenotypes,
                          validate_config, write_json)
 from disease_selection import select_runtime_diseases
 
@@ -29,20 +29,6 @@ def microarray_prefix(value):
             or not uri.path.endswith("/microarray/plink/arrays")):
         raise ValueError("scoring requires the AoU microarray PLINK arrays prefix")
     return value
-
-
-def require_spot_amd():
-    """Refuse expensive work if the backend ignored the requested VM policy."""
-    def metadata(path):
-        request = Request("http://metadata.google.internal/computeMetadata/v1/instance/" + path,
-                          headers={"Metadata-Flavor": "Google"})
-        with urlopen(request, timeout=10) as response:
-            return response.read().decode().strip()
-    preemptible = metadata("scheduling/preemptible")
-    machine = metadata("machine-type").rsplit("/", 1)[-1]
-    if preemptible.upper() != "TRUE" or "AuthenticAMD" not in Path("/proc/cpuinfo").read_text():
-        raise RuntimeError("this pilot requires an AMD Spot/preemptible VM; refusing paid-standard execution")
-    return {"machine_type": machine, "preemptible": True, "cpu_vendor": "AMD"}
 
 
 def component_scores(path, pgs):
@@ -74,7 +60,7 @@ def component_scores(path, pgs):
     return scores, total, int((~usable).sum()), set(frame["#IID"])
 
 
-def save_scoring_state(checkpoint, score_dir, log, *, complete):
+def save_scoring_state(checkpoint, score_dir, log, *, complete, status_uri):
     """Keep native continuation state and outputs, without copying genotype spools."""
     for stale in checkpoint.root.glob("*.gnomon-checkpoint.bin"):
         stale.unlink()
@@ -88,6 +74,10 @@ def save_scoring_state(checkpoint, score_dir, log, *, complete):
         checkpoint.complete_step(checkpoint.root, [path.name for path in files])
     else:
         checkpoint.publish()
+    if log.is_file():
+        label = score_progress_label(log)
+        if label is not None:
+            publish_status(status_uri, label)
 
 
 def refresh(args):
@@ -108,14 +98,14 @@ def refresh(args):
     endpoint = specification["endpoint"]
     pgs, = panel["endpoints"][endpoint]["candidates"]
     args.output.mkdir(parents=True, exist_ok=True)
-    projection = args.output / "projection_pcs.parquet"
-    old_scores = unpack_score_cache(args.features, args.output / "unused_scores.tar", projection)
-    old_scores.unlink()
+    publish_status(args.status_uri, "restoring_score_checkpoint")
+    features = source_identity(args.features_uri, config["google_project"], account)
     checkpoint = StudyCheckpoint(args.output / "scoring_state", args.status_uri + ".scoring",
                                  config["google_project"], account,
                                  {"scoring": specification, "analysis": config,
                                   "inputs": {name: digest(getattr(args, name)) for name in
-                                             ("fam", "features", "ancestry", "prune", "phenotypes", "score_panel")},
+                                             ("fam", "ancestry", "prune", "phenotypes", "score_panel")},
+                                  "features": features,
                                   "runner_sha256": digest(__file__)},
                                  resume=args.resume_scoring_checkpoint, resume_latest=True)
     artifacts = checkpoint.root / "artifacts"
@@ -125,6 +115,15 @@ def refresh(args):
         publish_status(args.status_uri, "score_artifact_ready")
         return
     publish_status(args.status_uri, "preparing_score_cohort")
+    projection_dir = checkpoint.root / "projection"
+    projection_dir.mkdir(exist_ok=True)
+    projection = projection_dir / "projection_pcs.parquet"
+    if not checkpoint.step_is_complete(projection_dir):
+        publish_status(args.status_uri, "reading_projection")
+        receipt = stream_projection(features, projection, config["google_project"], account)
+        write_json(projection_dir / "source.json", receipt)
+        checkpoint.complete_step(projection_dir, ["projection_pcs.parquet", "source.json"])
+    publish_status(args.status_uri, "projection_ready")
     client = BoundedClient(config, account)
     preparation = checkpoint.root / "preparation"
     keep = preparation / "keep.txt"
@@ -165,11 +164,12 @@ def refresh(args):
                 bounded_fit([str(args.scorer), str(args.weights),
                              specification["genotype_prefix"] + ".bed", "--keep", str(keep), "--emit-components"],
                             specification["timeout_seconds"], log,
-                            checkpoint_callback=lambda: save_scoring_state(checkpoint, score_dir, log, complete=False))
+                            checkpoint_callback=lambda: save_scoring_state(
+                                checkpoint, score_dir, log, complete=False, status_uri=args.status_uri))
         except BaseException:
             # Preserve the native error in workspace storage even when WDL
             # cannot delocalize successful outputs. Never export log text.
-            save_scoring_state(checkpoint, score_dir, log, complete=False)
+            save_scoring_state(checkpoint, score_dir, log, complete=False, status_uri=args.status_uri)
             message = log.read_text(errors="replace").lower()
             for phrases, label in (
                 (("permission denied", "http 403", "request violates vpc"), "failed_scoring_permissions"),
@@ -192,7 +192,7 @@ def refresh(args):
     if observed_ids != requested_ids:
         raise ValueError("native scorer did not return exactly the requested cohort")
     if not completed:
-        save_scoring_state(checkpoint, score_dir, log, complete=True)
+        save_scoring_state(checkpoint, score_dir, log, complete=True, status_uri=args.status_uri)
     score_file = args.output / f"{pgs}.sscore"
     scores.to_csv(score_file, sep="\t", index=False, float_format="%.17g")
     score_tar = args.output / "scores.tar"
@@ -223,10 +223,11 @@ def refresh(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("config", "scoring-config", "scorer", "weights", "fam", "features",
+    for name in ("config", "scoring-config", "scorer", "weights", "fam",
                  "ancestry", "prune", "phenotypes", "score-panel", "output"):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--status-uri", required=True)
+    parser.add_argument("--features-uri", required=True)
     parser.add_argument("--resume-scoring-checkpoint", type=Path)
     args = parser.parse_args()
     for name, value in vars(args).items():

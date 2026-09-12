@@ -10,7 +10,7 @@ workflow aou_score_training {
     File scorer_archive
     File score_weights
     File genotype_fam
-    File prior_shared_features
+    String prior_shared_features_uri
     File ancestry_predictions
     File relatedness_prune
     File phenotype_library_archive
@@ -23,7 +23,7 @@ workflow aou_score_training {
   call train { input:
     sources=sources, analysis_config=analysis_config, scoring_config=scoring_config,
     scorer_archive=scorer_archive, score_weights=score_weights, genotype_fam=genotype_fam,
-    prior_shared_features=prior_shared_features, ancestry_predictions=ancestry_predictions,
+    prior_shared_features_uri=prior_shared_features_uri, ancestry_predictions=ancestry_predictions,
     relatedness_prune=relatedness_prune, phenotype_library_archive=phenotype_library_archive,
     reference_ctn=reference_ctn, wheelhouse_archive=wheelhouse_archive,
     runtime_image=runtime_image, checkpoint_uri=checkpoint_uri,
@@ -46,7 +46,7 @@ task train {
     File scorer_archive
     File score_weights
     File genotype_fam
-    File prior_shared_features
+    String prior_shared_features_uri
     File ancestry_predictions
     File relatedness_prune
     File phenotype_library_archive
@@ -60,23 +60,46 @@ task train {
     set -euo pipefail
     mkdir -p wheels work/tmp work/cache
     tar -xf "~{sources}"
+    python aou_status.py "~{checkpoint_uri}" task_started
+    python - "~{checkpoint_uri}" <<'PY'
+    import sys
+    from aou_identity import require_spot_amd
+    from aou_status import publish_status
+    try:
+        require_spot_amd()
+    except Exception:
+        publish_status(sys.argv[1], "failed_runtime_policy")
+        raise
+    publish_status(sys.argv[1], "runtime_verified")
+    PY
     tar -xf "~{scorer_archive}"
     chmod +x gnomon-score
     cp "~{write_json(reference_ctn)}" reference_ctn.json
     cp "~{write_json(runtime_image)}" runtime_image.json
     export TMPDIR="$PWD/work/tmp" XDG_CACHE_HOME="$PWD/work/cache"
     export RAYON_NUM_THREADS=4 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 PYTHONUNBUFFERED=1
+    cat > work/setup.sh <<'SH'
+    set -euo pipefail
+    tar -xf "$1" -C wheels
+    python -m venv work/venv
+    work/venv/bin/python -m pip install --disable-pip-version-check --no-compile --no-cache-dir \
+      --no-index --only-binary=:all: --find-links wheels -r aou_requirements.txt
+    SH
     timeout --kill-after=10s 20m bash -euo pipefail -c '
-      tar -xf "$1" -C wheels
-      python -m venv work/venv
-      work/venv/bin/python -m pip install --disable-pip-version-check \
-        --no-index --only-binary=:all: --find-links wheels -r aou_requirements.txt
+      python aou_status.py "${10}" installing_dependencies
+      if timeout --kill-after=10s 120s bash work/setup.sh "$1"; then
+        python aou_status.py "${10}" dependencies_ready
+      else
+        setup_rc=$?
+        python aou_status.py "${10}" failed_task_setup
+        exit "$setup_rc"
+      fi
       export GOOGLE_PROJECT=$(work/venv/bin/python -c "import json,sys; print(json.load(open(sys.argv[1]))[\"google_project\"])" "$2")
       work/venv/bin/python -c "import json,sys; json.dump(json.load(open(sys.argv[1]))[\"endpoint\"],open(\"endpoint.json\",\"w\"))" "$3"
       resume_args=()
       if [[ -n "${11}" ]]; then resume_args=(--resume-scoring-checkpoint "${11}"); fi
       work/venv/bin/python aou_refresh_score.py --config "$2" --scoring-config "$3" \
-        --scorer "$PWD/gnomon-score" --weights "$4" --fam "$5" --features "$6" \
+        --scorer "$PWD/gnomon-score" --weights "$4" --fam "$5" --features-uri "$6" \
         --ancestry "$7" --prune "$8" --phenotypes "$9" --score-panel aou_pgs_panel.json \
         --output work/score --status-uri "${10}" "${resume_args[@]}"
       exec work/venv/bin/python aou_survival.py run --config "$2" --phenotypes "$9" \
@@ -85,7 +108,7 @@ task train {
         --endpoint-config endpoint.json --score-panel aou_pgs_panel.json \
         --reference-ctn-list reference_ctn.json --smoke-only --resume-latest
     ' bash "~{wheelhouse_archive}" "~{analysis_config}" "~{scoring_config}" \
-      "~{score_weights}" "~{genotype_fam}" "~{prior_shared_features}" \
+      "~{score_weights}" "~{genotype_fam}" "~{prior_shared_features_uri}" \
       "~{ancestry_predictions}" "~{relatedness_prune}" "~{phenotype_library_archive}" "~{checkpoint_uri}" \
       "~{default="" resume_scoring_checkpoint}"
   >>>
@@ -103,7 +126,7 @@ task train {
     predefinedMachineType: "n2d-standard-4"
     cpuPlatform: "AMD Milan"
     zones: "us-central1-a us-central1-b us-central1-c us-central1-f"
-    disks: "local-disk 50 HDD"
+    disks: "local-disk 50 SSD"
     preemptible: 3
     maxRetries: 0
   }

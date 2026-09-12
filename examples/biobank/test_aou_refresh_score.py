@@ -5,7 +5,9 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
-from aou_refresh_score import component_scores, save_scoring_state, microarray_prefix, require_spot_amd
+from aou_refresh_score import component_scores, save_scoring_state, microarray_prefix
+from aou_identity import require_spot_amd
+from aou_status import score_progress_label
 from aou_checkpoint import StudyCheckpoint
 from aou_survival import bounded_fit, BoundedClient
 
@@ -28,7 +30,7 @@ def test_runtime_refuses_nonspot_or_nonamd(spot, vendor, accepted):
         reply = MagicMock()
         reply.__enter__.return_value.read.return_value = value
         replies.append(reply)
-    with patch("aou_refresh_score.urlopen", side_effect=replies), patch("pathlib.Path.read_text", return_value=vendor):
+    with patch("aou_identity.urllib.request.urlopen", side_effect=replies), patch("pathlib.Path.read_text", return_value=vendor):
         if accepted:
             assert require_spot_amd()["preemptible"] is True
         else:
@@ -149,7 +151,7 @@ def test_scoring_checkpoint_preserves_continuation_without_genotype_spools(tmp_p
     state = StudyCheckpoint(tmp_path / "state", "gs://workspace/checkpoint", "project",
                             "service@example.org", {"inputs": "frozen"})
     with patch.object(state, "publish") as publish:
-        save_scoring_state(state, score_dir, log, complete=False)
+        save_scoring_state(state, score_dir, log, complete=False, status_uri="gs://workspace/status")
         publish.assert_called_once()
     assert (state.root / native.name).read_bytes() == native.read_bytes()
     assert not (state.root / "genotype-spool.bin").exists()
@@ -158,9 +160,20 @@ def test_scoring_checkpoint_preserves_continuation_without_genotype_spools(tmp_p
     output = score_dir / "score.sscore"
     output.write_text("completed native score components")
     with patch.object(state, "publish"):
-        save_scoring_state(state, score_dir, log, complete=True)
+        save_scoring_state(state, score_dir, log, complete=True, status_uri="gs://workspace/status")
     assert not (state.root / native.name).exists()
     assert state.step_is_complete(state.root)
     (state.root / output.name).write_text("corrupted")
     with pytest.raises(ValueError, match="corrupt"):
         state.step_is_complete(state.root)
+
+
+def test_progress_reports_only_fixed_categories(tmp_path):
+    log = tmp_path / "score.log"
+    log.write_text("private details\n> Progress: 1/4 variants (25%)\n")
+    assert score_progress_label(log) == "score_progress_25_49"
+    log.write_text("private error contains 100% but is not a progress line")
+    assert score_progress_label(log) is None
+    log.write_text("> Progress: 9/4 variants (225%)\n")
+    with pytest.raises(ValueError, match="progress"):
+        score_progress_label(log)
