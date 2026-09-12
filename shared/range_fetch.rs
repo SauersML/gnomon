@@ -402,10 +402,10 @@ mod tests {
 
     #[test]
     fn sequential_reads_are_prefetched_concurrently_and_correct() {
-        // Every other row is required, so each range is one row and the
-        // reader chooses its maximum worker count, capped by the range count.
-        let rows: Vec<u64> = (0..200).map(|r| r * 2).collect();
-        let plan = BedReadPlan::new(&rows, 64, 3 + 400 * 64).unwrap();
+        // Every other row is required, so each range is one row, and there
+        // are more ranges than the worker ceiling so the ceiling is reached.
+        let rows: Vec<u64> = (0..300).map(|r| r * 2).collect();
+        let plan = BedReadPlan::new(&rows, 64, 3 + 600 * 64).unwrap();
         let workers = PlannedReader::worker_count(&plan, &LIMITS);
         assert_eq!(workers, LIMITS.max_workers);
         let in_flight = Arc::new(AtomicUsize::new(0));
@@ -432,7 +432,7 @@ mod tests {
         }
         assert!(peak.load(Ordering::SeqCst) >= workers / 4, "prefetch ran {} wide", peak.load(Ordering::SeqCst));
         drop(reader);
-        assert_eq!(bytes.load(Ordering::SeqCst), 3 + 200 * 64);
+        assert_eq!(bytes.load(Ordering::SeqCst), 3 + 300 * 64);
     }
 
     #[test]
