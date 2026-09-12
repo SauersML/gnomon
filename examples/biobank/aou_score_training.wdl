@@ -100,7 +100,7 @@ task train {
     docker: runtime_image
     cpu: 4
     memory: "16 GiB"
-    cpuPlatform: "AMD Rome"
+    cpuPlatform: "AMD Milan"
     zones: "us-central1-a us-central1-b us-central1-c us-central1-f"
     disks: "local-disk 50 HDD"
     preemptible: 3
