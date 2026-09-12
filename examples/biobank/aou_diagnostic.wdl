@@ -4,8 +4,10 @@ version 1.0
 # outputs; raw log text, identifiers, query results, and credentials stay inside.
 workflow aou_diagnostic {
   input {
-    File task_stderr
+    File? task_stderr
     File identity_guard
+    File status_module
+    String status_uri
     String runtime_image
     File? relatedness_prune
     File? checkpoint
@@ -14,6 +16,7 @@ workflow aou_diagnostic {
   }
   call diagnose {
     input: task_stderr = task_stderr, identity_guard = identity_guard,
+           status_module = status_module, status_uri = status_uri,
            runtime_image = runtime_image, relatedness_prune = relatedness_prune,
            checkpoint = checkpoint, score_files = score_files, score_id = score_id
   }
@@ -22,8 +25,10 @@ workflow aou_diagnostic {
 
 task diagnose {
   input {
-    File task_stderr
+    File? task_stderr
     File identity_guard
+    File status_module
+    String status_uri
     String runtime_image
     File? relatedness_prune
     File? checkpoint
@@ -33,17 +38,20 @@ task diagnose {
   command <<<
     set -euo pipefail
     cp "~{identity_guard}" aou_identity.py
+    cp "~{status_module}" aou_status.py
     cp "~{write_json(score_files)}" score_files.json
     cp "~{write_json(score_id)}" score_id.json
-    timeout --kill-after=5s 90s python - "~{task_stderr}" "~{default="" relatedness_prune}" "~{default="" checkpoint}" <<'PY'
+    timeout --kill-after=5s 90s python - "~{default="" task_stderr}" "~{default="" relatedness_prune}" "~{default="" checkpoint}" "~{status_uri}" <<'PY'
     from pathlib import Path
     import re
     import sys
     import tarfile
     import json
-    from aou_identity import task_account
+    from aou_identity import task_account, require_spot_amd
+    from aou_status import publish_status, scoring_cpu_label
 
     task_account()
+    require_spot_amd()
     score_files = json.loads(Path("score_files.json").read_text())
     score_id = json.loads(Path("score_id.json").read_text())
     if len(score_files) > 4 or (score_files and not re.fullmatch(r"PGS\d{6}", score_id)):
@@ -78,16 +86,29 @@ task diagnose {
             Path("diagnostic__prune_header_unrecognized.txt").write_text("unrecognized header\n")
         if len(fields) > 1:
             Path("diagnostic__prune_multiple_columns.txt").write_text("multiple columns\n")
-    with Path(sys.argv[1]).open("rb") as handle:
-        handle.seek(0, 2)
-        handle.seek(max(0, handle.tell() - 262144))
-        log = handle.read().decode("utf-8", errors="replace").lower()
+    if not sys.argv[1] and not sys.argv[3]:
+        raise ValueError("a private log or checkpoint is required")
+    log = ""
+    if sys.argv[1]:
+        with Path(sys.argv[1]).open("rb") as handle:
+            handle.seek(0, 2)
+            handle.seek(max(0, handle.tell() - 262144))
+            log = handle.read().decode("utf-8", errors="replace").lower()
     if sys.argv[3]:
         with tarfile.open(sys.argv[3], "r:gz") as archive:
             members = archive.getmembers()
             if sum(member.size for member in members) > 2 * 1024**3:
                 raise ValueError("checkpoint exceeds diagnostic size budget")
             names = {member.name for member in members}
+            resources = [member for member in members
+                         if member.isfile() and member.name == "fit.resources.json"]
+            if len(resources) == 1:
+                if resources[0].size > 4096:
+                    raise ValueError("oversized resource diagnostics")
+                metrics = json.load(archive.extractfile(resources[0]))
+                label = scoring_cpu_label(metrics)
+                publish_status(sys.argv[4], label)
+                Path(f"diagnostic__{label}.txt").write_text(label + "\n")
             unfinished = [member for member in members if member.isfile()
                           and Path(member.name).name == "fit.log"
                           and str(Path(member.name).parent / "completed.json") not in names]
@@ -226,10 +247,12 @@ task diagnose {
   output { Array[File] diagnostics = glob("diagnostic__*.txt") }
   runtime {
     docker: runtime_image
-    cpu: 1
+    cpu: 2
     memory: "2 GiB"
+    cpuPlatform: "AMD Rome"
+    zones: "us-central1-a us-central1-b us-central1-c us-central1-f"
     disks: "local-disk 10 SSD"
-    preemptible: 0
+    preemptible: 3
     maxRetries: 0
   }
 }

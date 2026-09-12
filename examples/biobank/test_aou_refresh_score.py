@@ -7,9 +7,20 @@ from unittest.mock import patch, MagicMock
 
 from aou_refresh_score import component_scores, save_scoring_state, microarray_prefix
 from aou_identity import require_spot_amd, RuntimePolicyError
-from aou_status import score_progress_label
+from aou_status import score_progress_label, scoring_cpu_label
 from aou_checkpoint import StudyCheckpoint
 from aou_survival import bounded_fit, BoundedClient
+
+
+@pytest.mark.parametrize("cpu,label", [(60., "low"), (900., "partial"), (2300., "saturated")])
+def test_scoring_cpu_diagnostic(cpu, label):
+    assert scoring_cpu_label({"wall_seconds": 600., "cpu_seconds": cpu}) == "scoring_cpu_" + label
+
+
+@pytest.mark.parametrize("wall,cpu", [(0., 1.), (600., -1.), (600., float("nan"))])
+def test_scoring_cpu_diagnostic_rejects_invalid_measurements(wall, cpu):
+    with pytest.raises(ValueError, match="resource diagnostics"):
+        scoring_cpu_label({"wall_seconds": wall, "cpu_seconds": cpu})
 
 
 def test_microarray_scoring_rejects_wgs_and_other_sources():

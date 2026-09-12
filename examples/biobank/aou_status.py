@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
@@ -27,7 +28,17 @@ LABELS = frozenset({
     "preparing_score_cohort", "scoring", "score_artifact_ready",
     "failed_scoring_permissions", "failed_scoring_credentials", "failed_scoring_input",
     "failed_scoring_cli", "failed_scoring_tls", "failed_scoring_runtime",
+    "scoring_cpu_low", "scoring_cpu_partial", "scoring_cpu_saturated",
 })
+
+
+def scoring_cpu_label(metrics):
+    """Classify four-CPU scoring utilization without exporting private logs."""
+    wall, cpu = metrics["wall_seconds"], metrics["cpu_seconds"]
+    if not all(type(value) in (int, float) and math.isfinite(value) for value in (wall, cpu)) or wall <= 0 or cpu < 0:
+        raise ValueError("invalid scoring resource diagnostics")
+    cores = cpu / wall
+    return "scoring_cpu_low" if cores < 0.5 else "scoring_cpu_partial" if cores < 3 else "scoring_cpu_saturated"
 
 
 def score_progress_label(log):
