@@ -516,6 +516,11 @@ def fit_worker(frame_path, config_path, cause, output, transform_path):
     pc_args = ", ".join(pc_cols)
     baseline = f"s(age0, k=8) + sex + duchon({pc_args}, centers={config['baseline_centers']}, scale_dims=true)"
     slope = f"1 + duchon({pc_args}, centers={config['slope_centers']}, scale_dims=true)"
+    native = getattr(gamfit, "_rust", None)
+    if hasattr(native, "set_log_level"):
+        # Solver progress stays in the private fit log; the workspace
+        # diagnostic reduces it to fixed categories.
+        native.set_log_level("info")
     print("worker_fit_started", flush=True)
     transformer = gamfit.load(transform_path)
     model = gamfit.fit(train, f"Surv(entry, followup, event) ~ {baseline}",
@@ -561,57 +566,90 @@ def fit_worker(frame_path, config_path, cause, output, transform_path):
     print("worker_validation_complete", flush=True)
 
 
-def bounded_fit(command, timeout_seconds, log, checkpoint_callback=None):
+def solver_threads():
+    return int(os.environ.get("RAYON_NUM_THREADS") or os.cpu_count() or 1)
+
+
+def bounded_fits(jobs, timeout_seconds, checkpoint_callback=None, threads=None):
+    """Run fit workers side by side under one wall bound; every child is reaped.
+
+    `jobs` pairs each command with its private log. The checkpoint callback
+    runs about every 30 seconds while any worker is alive, and one failing
+    worker stops the others at once. `threads` gives each worker its own
+    solver thread count, in job order, instead of the inherited count.
+    """
     def terminate(signum, frame):
         raise InterruptedError("fit controller was terminated")
     previous_handler = signal.signal(signal.SIGTERM, terminate)
     started = time.monotonic()
     usage_before = resource.getrusage(resource.RUSAGE_CHILDREN)
-    with Path(log).open("wb") as handle:
-        child = subprocess.Popen(command, stdout=handle, stderr=subprocess.STDOUT, start_new_session=True)
-        try:
-            deadline = started + timeout_seconds
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise subprocess.TimeoutExpired(command, timeout_seconds)
-                try:
-                    result = child.wait(timeout=min(30, remaining) if checkpoint_callback else remaining)
-                    break
-                except subprocess.TimeoutExpired:
-                    if time.monotonic() >= deadline:
-                        raise
-                    checkpoint_callback()
-        except BaseException:
+    envs = ([None] * len(jobs) if threads is None else
+            [dict(os.environ, RAYON_NUM_THREADS=str(count)) for count in threads])
+    handles = [Path(log).open("wb") for _, log in jobs]
+    children = []
+    results = {}
+    try:
+        for (command, _), handle, env in zip(jobs, handles, envs):
+            children.append(subprocess.Popen(command, stdout=handle, stderr=subprocess.STDOUT,
+                                             start_new_session=True, env=env))
+        deadline = started + timeout_seconds
+        published = started
+        while True:
+            now = time.monotonic()
+            if now >= deadline:
+                raise subprocess.TimeoutExpired([command for command, _ in jobs], timeout_seconds)
+            for index, child in enumerate(children):
+                if index not in results and child.poll() is not None:
+                    results[index] = child.returncode
+            if any(code != 0 for code in results.values()):
+                raise RuntimeError("fit failed; inspect the private task fit log")
+            if len(results) == len(children):
+                break
+            if checkpoint_callback and now - published >= 30:
+                checkpoint_callback()
+                published = time.monotonic()
+            time.sleep(min(0.5, max(0., deadline - time.monotonic())))
+    except BaseException:
+        for child in children:
             if child.poll() is None:
                 os.killpg(child.pid, signal.SIGTERM)
+        for child in children:
             try:
                 child.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 os.killpg(child.pid, signal.SIGKILL)
                 child.wait()
-            raise
-        finally:
-            signal.signal(signal.SIGTERM, previous_handler)
-            usage_after = resource.getrusage(resource.RUSAGE_CHILDREN)
-            elapsed = time.monotonic() - started
-            cpu = (usage_after.ru_utime + usage_after.ru_stime
-                   - usage_before.ru_utime - usage_before.ru_stime)
+        raise
+    finally:
+        signal.signal(signal.SIGTERM, previous_handler)
+        for handle in handles:
+            handle.close()
+        usage_after = resource.getrusage(resource.RUSAGE_CHILDREN)
+        elapsed = max(time.monotonic() - started, 1e-9)
+        cpu = (usage_after.ru_utime + usage_after.ru_stime
+               - usage_before.ru_utime - usage_before.ru_stime)
+        for _, log in jobs:
             write_json(Path(log).with_suffix(".resources.json"), {
                 "wall_seconds": elapsed, "cpu_seconds": cpu,
-                "average_cpu_cores": cpu / elapsed,
+                "average_cpu_cores": cpu / elapsed, "concurrent_fits": len(jobs),
             })
-        if result != 0:
-            raise RuntimeError("fit failed; inspect the private task fit log")
 
 
-def checkpointed_fit(command, timeout_seconds, log, checkpoint):
+def bounded_fit(command, timeout_seconds, log, checkpoint_callback=None):
+    bounded_fits([(command, log)], timeout_seconds, checkpoint_callback)
+
+
+def checkpointed_fits(jobs, timeout_seconds, checkpoint, threads=None):
     """Retain private failure logs and partial fits without a completion receipt."""
     try:
-        bounded_fit(command, timeout_seconds, log, checkpoint_callback=checkpoint.publish)
+        bounded_fits(jobs, timeout_seconds, checkpoint_callback=checkpoint.publish, threads=threads)
     except BaseException:
         checkpoint.publish()
         raise
+
+
+def checkpointed_fit(command, timeout_seconds, log, checkpoint):
+    checkpointed_fits([(command, log)], timeout_seconds, checkpoint)
 
 
 def analyze_partition(df, config, args, disease_dir, checkpoint, pgs):
@@ -635,7 +673,7 @@ def analyze_partition(df, config, args, disease_dir, checkpoint, pgs):
         "reference": manifest}
     frame = disease_dir / "transformed.parquet"
     df.to_parquet(frame, index=False)
-    hazards = []
+    pending = []
     for cause in (1, 2):
         fit_dir = disease_dir / f"pc_varying_ctn_{cause}"
         fit_dir.mkdir(exist_ok=True)
@@ -643,12 +681,25 @@ def analyze_partition(df, config, args, disease_dir, checkpoint, pgs):
                    "--frame", str(frame), "--config", str(args.config.resolve()),
                    "--cause", str(cause), "--output", str(fit_dir),
                    "--transform-model", str(transform_path)]
-        print(f"Fitting {slug}: cause {cause}", flush=True)
         if not checkpoint.step_is_complete(fit_dir, model=True):
+            pending.append((cause, fit_dir, command))
+    if pending:
+        # The causes fit side by side, so the wall time is the slower fit
+        # rather than the sum of both. Death has far fewer events and needs
+        # many more outer cycles, so it receives most of the solver threads.
+        for cause, _, _ in pending:
+            print(f"Fitting {slug}: cause {cause}", flush=True)
             publish_status(args.checkpoint_uri, "fitting_disease" if cause == 1 else "fitting_death")
-            checkpointed_fit(command, config["fit_timeout_seconds"], fit_dir / "fit.log", checkpoint)
+        total = solver_threads()
+        share = {1: max(1, total // 4), 2: max(1, total - total // 4)}
+        threads = [share[cause] if len(pending) == 2 else total for cause, _, _ in pending]
+        checkpointed_fits([(command, fit_dir / "fit.log") for _, fit_dir, command in pending],
+                          config["fit_timeout_seconds"], checkpoint, threads=threads)
+        for _, fit_dir, _ in pending:
             checkpoint.complete_step(fit_dir, ["hazards.npz", "model.gamfit", "spec.json"], model=True)
-        with np.load(fit_dir / "hazards.npz") as saved:
+    hazards = []
+    for cause in (1, 2):
+        with np.load(disease_dir / f"pc_varying_ctn_{cause}" / "hazards.npz") as saved:
             hazards.append(saved["hazards"])
             grid, coarse = saved["grid"], saved["coarse"]
     fine_cif = cif_from_hazards(hazards)

@@ -77,7 +77,7 @@ task train {
     cp "~{write_json(reference_ctn)}" reference_ctn.json
     cp "~{write_json(runtime_image)}" runtime_image.json
     export TMPDIR="$PWD/work/tmp" XDG_CACHE_HOME="$PWD/work/cache"
-    export RAYON_NUM_THREADS=32 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 PYTHONUNBUFFERED=1
+    export RAYON_NUM_THREADS=64 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 PYTHONUNBUFFERED=1
     cat > work/setup.sh <<'SH'
     set -euo pipefail
     tar -xf "$1" -C wheels
@@ -85,7 +85,7 @@ task train {
     work/venv/bin/python -m pip install --disable-pip-version-check --no-compile --no-cache-dir \
       --no-index --only-binary=:all: --find-links wheels -r aou_requirements.txt
     SH
-    timeout --kill-after=10s 60m bash -euo pipefail -c '
+    timeout --kill-after=10s 90m bash -euo pipefail -c '
       python aou_status.py "${10}" installing_dependencies
       if timeout --kill-after=10s 120s bash work/setup.sh "$1"; then
         python aou_status.py "${10}" dependencies_ready
@@ -121,8 +121,8 @@ task train {
   }
   runtime {
     docker: runtime_image
-    cpu: 32
-    memory: "64 GiB"
+    cpu: 64
+    memory: "128 GiB"
     cpuPlatform: "AMD Rome"
     zones: "us-central1-a us-central1-b us-central1-c us-central1-f"
     disks: "local-disk 50 SSD"

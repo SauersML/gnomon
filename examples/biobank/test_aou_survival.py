@@ -108,6 +108,35 @@ class SurvivalContractTests(unittest.TestCase):
                                       "diagnostic__score_input_format.txt": "score_input_format\n",
                                       "diagnostic__score_progress_50_74.txt": "score_progress_50_74\n"})
 
+    def test_workspace_diagnostic_buckets_solver_progress_without_counts(self):
+        wdl = Path(__file__).with_name("aou_diagnostic.wdl").read_text()
+        code = textwrap.dedent(wdl.split("<<'PY'\n", 1)[1].split("    PY\n", 1)[0])
+        solver_log = ("worker_fit_started\n[warm-start-cache] restored persistent warm start key=k\n"
+                      + "[PIRLS/joint-Newton mode certificate] returned beta certified\n" * 12)
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            (directory / "score_files.json").write_text("[]")
+            (directory / "score_id.json").write_text('""')
+            checkpoint = directory / "checkpoint.tar.gz"
+            with tarfile.open(checkpoint, "w:gz") as archive:
+                member = tarfile.TarInfo("development/PGS004525/pc_varying_ctn_2/fit.log")
+                encoded = solver_log.encode()
+                member.size = len(encoded)
+                archive.addfile(member, io.BytesIO(encoded))
+            previous = Path.cwd()
+            try:
+                os.chdir(directory)
+                with patch.object(sys, "argv", ["diagnose", "", "", str(checkpoint)]), \
+                     patch.dict(sys.modules, {"aou_identity": SimpleNamespace(
+                         task_account=lambda: None, require_spot_amd=lambda: None)}):
+                    exec(compile(code, "aou_diagnostic.wdl", "exec"), {})
+            finally:
+                os.chdir(previous)
+            labels = {path.name for path in directory.glob("diagnostic__*.txt")}
+        self.assertEqual(labels, {"diagnostic__worker_fit_started.txt",
+                                  "diagnostic__fit_warm_start_restored.txt",
+                                  "diagnostic__fit_inner_solves_10_49.txt"})
+
     def test_sparse_censoring_support_is_not_reported_as_valid_accuracy(self):
         train = pd.DataFrame({"event_code": [1, 2] * 30, "followup": [2.] * 60,
                               "ancestry": ["major"] * 59 + ["rare"]})

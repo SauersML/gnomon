@@ -166,6 +166,7 @@ task diagnose {
         "disease_events_insufficient": "insufficient training events for cause 1",
         "death_events_insufficient": "insufficient training events for cause 2",
         "heldout_size_insufficient": "too few held-out participants",
+        "fit_warm_start_restored": "[warm-start-cache] restored",
         "worker_fit_started": "worker_fit_started",
         "worker_fit_saved": "worker_fit_saved",
         "worker_grid_started": "worker_grid_started",
@@ -216,6 +217,12 @@ task diagnose {
         "syntax_error": "syntaxerror:",
     }
     matched = [label for label, phrase in signatures.items() if phrase in log]
+    # Each certified inner solve is one outer evaluation the solver completed;
+    # fixed buckets only, never the count or any log text.
+    certified = log.count("mode certificate]")
+    if certified:
+        matched.append("fit_inner_solves_" + ("1_9" if certified < 10 else "10_49" if certified < 50
+                                              else "50_199" if certified < 200 else "200_plus"))
     progress = re.findall(r"> progress: \d+/\d+ variants \((\d+)%\)", log)
     if progress:
         percent = int(progress[-1])

@@ -23,6 +23,8 @@ LABELS = frozenset({
     "missing_pgs004536", "missing_pgs001783", "missing_pgs004525",
     "missing_pgs004603", "missing_pgs005199", "missing_pgs005331",
     "transforming_score", "applying_reference_ctn", "score_transform_ready", "fitting_disease", "fitting_death",
+    "fit_warm_start_restored", "fit_inner_solves_1_9", "fit_inner_solves_10_49",
+    "fit_inner_solves_50_199", "fit_inner_solves_200_plus",
     "failed_score_missingness_absent", "failed_score_missingness_invalid",
     "failed_score_completely_missing", "failed_score_source_ambiguous",
     "preparing_score_cohort", "scoring", "score_artifact_ready",
