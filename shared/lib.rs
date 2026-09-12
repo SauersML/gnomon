@@ -24,6 +24,9 @@ pub mod pipeline_error;
 #[cfg(any(feature = "score", feature = "map", feature = "terms"))]
 pub mod files;
 
+#[cfg(any(feature = "score", feature = "map", feature = "terms"))]
+mod range_fetch;
+
 #[cfg(any(feature = "score", feature = "map"))]
 pub(crate) mod cuda_utils;
 

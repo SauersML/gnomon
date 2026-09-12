@@ -1,5 +1,6 @@
 use crate::adapt_plink2::GenomeBuild;
 use crate::pipeline_error::PipelineError;
+use crate::range_fetch::fetch_cache_block;
 use google_cloud_auth::credentials::{
     CacheableResource, Credentials, anonymous::Builder as AnonymousCredentials,
 };
@@ -1825,6 +1826,10 @@ impl RemoteByteRangeSource {
     }
 
     fn fetch_block(&self, start: u64, length: usize) -> Result<Arc<Vec<u8>>, PipelineError> {
+        fetch_cache_block(start, length, |offset, size| self.fetch_segment(offset, size))
+    }
+
+    fn fetch_segment(&self, start: u64, length: usize) -> Result<Vec<u8>, PipelineError> {
         let bucket_path = self.bucket_path.clone();
         let object = self.object.clone();
         let bucket_for_log = self.bucket.clone();
@@ -1864,10 +1869,18 @@ impl RemoteByteRangeSource {
                             response.status()
                         ));
                     }
-                    response
-                        .bytes()
-                        .map(|bytes| bytes.to_vec())
-                        .map_err(|error| error.to_string())
+                    if HttpByteRangeSource::parse_byte_content_range(response.headers().get(CONTENT_RANGE))
+                        != Some((start, end, self.len))
+                    {
+                        return Err("Cloud Storage returned inconsistent Content-Range".into());
+                    }
+                    let mut bytes = Vec::with_capacity(length);
+                    response.take(length as u64 + 1).read_to_end(&mut bytes)
+                        .map_err(|error| error.to_string())?;
+                    if bytes.len() != length {
+                        return Err("Cloud Storage returned an incorrect range length".into());
+                    }
+                    Ok(bytes)
                 })
             } else {
                 runtime.block_on(async {
@@ -1929,7 +1942,7 @@ impl RemoteByteRangeSource {
             }
             data.truncate(length);
         }
-        Ok(Arc::new(data))
+        Ok(data)
     }
 }
 
@@ -2135,6 +2148,10 @@ impl HttpByteRangeSource {
     }
 
     fn fetch_block(&self, start: u64, length: usize) -> Result<Arc<Vec<u8>>, PipelineError> {
+        fetch_cache_block(start, length, |offset, size| self.fetch_segment(offset, size))
+    }
+
+    fn fetch_segment(&self, start: u64, length: usize) -> Result<Vec<u8>, PipelineError> {
         let end = start
             .checked_add(length as u64)
             .and_then(|value| value.checked_sub(1))
@@ -2193,7 +2210,7 @@ impl HttpByteRangeSource {
                 data.len()
             )));
         }
-        Ok(Arc::new(data))
+        Ok(data)
     }
 }
 
