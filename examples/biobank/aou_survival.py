@@ -628,10 +628,12 @@ def bounded_fits(jobs, timeout_seconds, checkpoint_callback=None, threads=None):
         elapsed = max(time.monotonic() - started, 1e-9)
         cpu = (usage_after.ru_utime + usage_after.ru_stime
                - usage_before.ru_utime - usage_before.ru_stime)
-        for _, log in jobs:
+        allotted = [solver_threads()] * len(jobs) if threads is None else list(threads)
+        for (_, log), own in zip(jobs, allotted):
             write_json(Path(log).with_suffix(".resources.json"), {
                 "wall_seconds": elapsed, "cpu_seconds": cpu,
                 "average_cpu_cores": cpu / elapsed, "concurrent_fits": len(jobs),
+                "solver_threads": own, "allotted_threads": sum(allotted),
             })
 
 

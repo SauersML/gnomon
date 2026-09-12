@@ -17,6 +17,18 @@ def test_scoring_cpu_diagnostic(cpu, label):
     assert scoring_cpu_label({"wall_seconds": 600., "cpu_seconds": cpu}) == "scoring_cpu_" + label
 
 
+@pytest.mark.parametrize("share,label", [(0.1, "low"), (0.5, "partial"), (0.9, "saturated")])
+def test_fit_cpu_diagnostic_is_relative_to_allotted_threads(share, label):
+    from aou_status import fit_cpu_label
+    assert fit_cpu_label({"wall_seconds": 100., "cpu_seconds": share * 48 * 100., "allotted_threads": 48}) == "fit_cpu_" + label
+
+
+def test_fit_cpu_diagnostic_rejects_missing_allotment():
+    from aou_status import fit_cpu_label
+    with pytest.raises(ValueError):
+        fit_cpu_label({"wall_seconds": 100., "cpu_seconds": 10.})
+
+
 @pytest.mark.parametrize("wall,cpu", [(0., 1.), (600., -1.), (600., float("nan"))])
 def test_scoring_cpu_diagnostic_rejects_invalid_measurements(wall, cpu):
     with pytest.raises(ValueError, match="resource diagnostics"):

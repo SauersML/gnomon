@@ -119,10 +119,16 @@ class SurvivalContractTests(unittest.TestCase):
             (directory / "score_id.json").write_text('""')
             checkpoint = directory / "checkpoint.tar.gz"
             with tarfile.open(checkpoint, "w:gz") as archive:
-                member = tarfile.TarInfo("development/PGS004525/pc_varying_ctn_2/fit.log")
-                encoded = solver_log.encode()
-                member.size = len(encoded)
-                archive.addfile(member, io.BytesIO(encoded))
+                for name, content in {
+                    "development/PGS004525/pc_varying_ctn_2/fit.log": solver_log,
+                    "development/PGS004525/pc_varying_ctn_2/fit.resources.json": json.dumps({
+                        "wall_seconds": 100., "cpu_seconds": 3000., "average_cpu_cores": 30.,
+                        "concurrent_fits": 2, "solver_threads": 48, "allotted_threads": 64}),
+                }.items():
+                    member = tarfile.TarInfo(name)
+                    encoded = content.encode()
+                    member.size = len(encoded)
+                    archive.addfile(member, io.BytesIO(encoded))
             previous = Path.cwd()
             try:
                 os.chdir(directory)
@@ -135,7 +141,8 @@ class SurvivalContractTests(unittest.TestCase):
             labels = {path.name for path in directory.glob("diagnostic__*.txt")}
         self.assertEqual(labels, {"diagnostic__worker_fit_started.txt",
                                   "diagnostic__fit_warm_start_restored.txt",
-                                  "diagnostic__fit_inner_solves_10_49.txt"})
+                                  "diagnostic__fit_inner_solves_10_49.txt",
+                                  "diagnostic__fit_cpu_partial.txt"})
 
     def test_compute_bounds_never_change_the_checkpoint_identity(self):
         from aou_checkpoint import result_identity

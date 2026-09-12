@@ -48,7 +48,7 @@ task diagnose {
     import tarfile
     import json
     from aou_identity import task_account, require_spot_amd
-    from aou_status import publish_status, scoring_cpu_label
+    from aou_status import fit_cpu_label, publish_status, scoring_cpu_label
 
     task_account()
     require_spot_amd()
@@ -109,6 +109,18 @@ task diagnose {
                 label = scoring_cpu_label(metrics)
                 publish_status(sys.argv[4], label)
                 Path(f"diagnostic__{label}.txt").write_text(label + "\n")
+            fit_resources = [member for member in members if member.isfile()
+                             and Path(member.name).name == "fit.resources.json"
+                             and member.name != "fit.resources.json"]
+            if len(fit_resources) > 16:
+                raise ValueError("checkpoint exceeds diagnostic fit budget")
+            for member in fit_resources:
+                if member.size > 4096:
+                    raise ValueError("oversized fit resource diagnostics")
+                metrics = json.load(archive.extractfile(member))
+                if "allotted_threads" in metrics:
+                    label = fit_cpu_label(metrics)
+                    Path(f"diagnostic__{label}.txt").write_text(label + "\n")
             unfinished = [member for member in members if member.isfile()
                           and Path(member.name).name == "fit.log"
                           and str(Path(member.name).parent / "completed.json") not in names]

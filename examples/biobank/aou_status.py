@@ -23,6 +23,7 @@ LABELS = frozenset({
     "missing_pgs004536", "missing_pgs001783", "missing_pgs004525",
     "missing_pgs004603", "missing_pgs005199", "missing_pgs005331",
     "transforming_score", "applying_reference_ctn", "score_transform_ready", "fitting_disease", "fitting_death",
+    "fit_cpu_low", "fit_cpu_partial", "fit_cpu_saturated",
     "fit_warm_start_restored", "fit_inner_solves_1_9", "fit_inner_solves_10_49",
     "fit_inner_solves_50_199", "fit_inner_solves_200_plus",
     "failed_score_missingness_absent", "failed_score_missingness_invalid",
@@ -41,6 +42,16 @@ def scoring_cpu_label(metrics):
         raise ValueError("invalid scoring resource diagnostics")
     cores = cpu / wall
     return "scoring_cpu_low" if cores < 0.5 else "scoring_cpu_partial" if cores < 3 else "scoring_cpu_saturated"
+
+
+def fit_cpu_label(metrics):
+    """Classify how much of its allotted solver threads a fit batch used."""
+    wall, cpu, allotted = metrics["wall_seconds"], metrics["cpu_seconds"], metrics.get("allotted_threads")
+    if (not all(type(value) in (int, float) and math.isfinite(value) for value in (wall, cpu))
+            or wall <= 0 or cpu < 0 or type(allotted) is not int or allotted < 1):
+        raise ValueError("invalid fit resource diagnostics")
+    share = cpu / wall / allotted
+    return "fit_cpu_low" if share < 0.25 else "fit_cpu_partial" if share < 0.75 else "fit_cpu_saturated"
 
 
 def score_progress_label(log):
