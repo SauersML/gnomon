@@ -21,7 +21,7 @@ jobs:
     timeout-minutes: 10
     env:
       RUSTFLAGS: '-C target-cpu=x86-64'
-      CARGO_BUILD_JOBS: 3
+      CARGO_BUILD_JOBS: 4
       CARGO_PROFILE_RELEASE_LTO: thin
       CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 16
       GNOMON_RELEASE_TAG: ${{ github.sha }}
@@ -42,8 +42,8 @@ jobs:
       - name: Build the portable scorer from the existing release graph
         run: |
           set -euo pipefail
-          # Keep the producer's feature unification so its dependencies remain
-          # warm. The executable dispatches directly by its gnomon-score name.
+          # Use the persisted scorer cache; do not compile mapping or model
+          # fitting into a binary that only performs genotype scoring.
           # Source regressions run on MSI; changing the CPU target additionally
           # requires public-fixture parity before staging this artifact in AoU.
           cat > rustc-iteration.sh <<'SH'
@@ -53,7 +53,7 @@ jobs:
           chmod +x rustc-iteration.sh
           export RUSTC_WORKSPACE_WRAPPER="$PWD/rustc-iteration.sh"
           timeout --kill-after=10s 180s cargo +nightly-2026-09-10 build --locked --offline --release \
-            --features reqwest/rustls-tls --bin gnomon-score
+            --no-default-features --features score,reqwest/rustls-tls --bin gnomon-score
       - name: Preserve completed compilation after success or interruption
         if: always()
         uses: actions/cache/save@v4
