@@ -286,7 +286,9 @@ task diagnose {
                  "task_account", "publish_status", "validate_config", "load_score_panel",
                  "select_runtime_diseases", "query", "publish", "prepare_inputs",
                  "fit_worker", "fit_transform", "transformed_score",
-                 "analyze_partition", "checkpointed_fit", "bounded_fit")
+                 "analyze_partition", "checkpointed_fit", "bounded_fit",
+                 "checkpointed_fits", "bounded_fits", "predict_bundle", "fit", "predict",
+                 "cumulative_hazard_at", "transformation_score", "save", "load")
     for function in functions:
         if re.search(r", in " + re.escape(function) + r"\s*\n", log):
             Path(f"diagnostic__function_{function}.txt").write_text(function + "\n")
