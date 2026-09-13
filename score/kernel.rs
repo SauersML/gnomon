@@ -133,15 +133,30 @@ pub fn accumulate_adjustments_for_person(
     g2_indices: &[u16],
     score_start: usize,
 ) -> [SimdVec; MAX_KERNEL_ACCUMULATOR_LANES] {
+    accumulate_adjustments::<MAX_KERNEL_ACCUMULATOR_LANES>(
+        weights,
+        g1_indices,
+        g2_indices,
+        score_start,
+    )
+}
+
+#[inline(always)]
+fn accumulate_adjustments<const LANES: usize>(
+    weights: &PaddedInterleavedWeights,
+    g1_indices: &[u16],
+    g2_indices: &[u16],
+    score_start: usize,
+) -> [SimdVec; MAX_KERNEL_ACCUMULATOR_LANES] {
     assert!(
         score_start <= weights.num_scores(),
         "Invalid chunk start {score_start}; total scores={}.",
         weights.num_scores()
     );
     assert!(
-        MAX_KERNEL_ACCUMULATOR_LANES * LANE_COUNT <= weights.stride - score_start,
-        "Invalid fixed kernel chunk: start={score_start}, requires {} padded scores, stride={}.",
-        MAX_KERNEL_ACCUMULATOR_LANES * LANE_COUNT,
+        LANES * LANE_COUNT <= weights.stride - score_start,
+        "Invalid kernel chunk: start={score_start}, requires {} padded scores, stride={}.",
+        LANES * LANE_COUNT,
         weights.stride
     );
     let mut accumulator_buffer = [SimdVec::splat(0.0); MAX_KERNEL_ACCUMULATOR_LANES];
@@ -154,7 +169,7 @@ pub fn accumulate_adjustments_for_person(
             "Genotype row index out of bounds"
         );
         // This inner loop over score columns is the same performant structure as the original kernel.
-        for i in 0..MAX_KERNEL_ACCUMULATOR_LANES {
+        for i in 0..LANES {
             unsafe {
                 let weights_vec = weights.get_simd_lane_for_score_window_unchecked(
                     matrix_row_idx,
@@ -173,7 +188,7 @@ pub fn accumulate_adjustments_for_person(
             matrix_row_idx < weights.num_rows,
             "Genotype row index out of bounds"
         );
-        for i in 0..MAX_KERNEL_ACCUMULATOR_LANES {
+        for i in 0..LANES {
             unsafe {
                 let weights_vec = weights.get_simd_lane_for_score_window_unchecked(
                     matrix_row_idx,
@@ -204,62 +219,20 @@ pub fn accumulate_adjustments_for_person_lanes(
     score_start: usize,
     lane_count: usize,
 ) -> [SimdVec; MAX_KERNEL_ACCUMULATOR_LANES] {
-    assert!(
-        score_start <= weights.num_scores(),
-        "Invalid chunk start {score_start}; total scores={}.",
-        weights.num_scores()
-    );
-    assert!(
-        lane_count <= MAX_KERNEL_ACCUMULATOR_LANES,
-        "Invalid lane_count={lane_count}; max={}.",
-        MAX_KERNEL_ACCUMULATOR_LANES
-    );
-    assert!(
-        lane_count * LANE_COUNT <= weights.stride - score_start,
-        "Invalid kernel chunk: start={score_start}, lanes={lane_count}, stride={}.",
-        weights.stride
-    );
-
-    let mut accumulator_buffer = [SimdVec::splat(0.0); MAX_KERNEL_ACCUMULATOR_LANES];
-
-    for &matrix_row_idx in g1_indices {
-        let matrix_row_idx = matrix_row_idx as usize;
-        assert!(
-            matrix_row_idx < weights.num_rows,
-            "Genotype row index out of bounds"
-        );
-        for i in 0..lane_count {
-            unsafe {
-                let weights_vec = weights.get_simd_lane_for_score_window_unchecked(
-                    matrix_row_idx,
-                    score_start,
-                    i,
-                );
-                *accumulator_buffer.get_unchecked_mut(i) += weights_vec;
-            }
-        }
+    // Select once per person and score stripe. Constant-width loops keep each
+    // accumulator in a register, including partial stripes of fewer than 64 scores.
+    match lane_count {
+        0 => accumulate_adjustments::<0>(weights, g1_indices, g2_indices, score_start),
+        1 => accumulate_adjustments::<1>(weights, g1_indices, g2_indices, score_start),
+        2 => accumulate_adjustments::<2>(weights, g1_indices, g2_indices, score_start),
+        3 => accumulate_adjustments::<3>(weights, g1_indices, g2_indices, score_start),
+        4 => accumulate_adjustments::<4>(weights, g1_indices, g2_indices, score_start),
+        5 => accumulate_adjustments::<5>(weights, g1_indices, g2_indices, score_start),
+        6 => accumulate_adjustments::<6>(weights, g1_indices, g2_indices, score_start),
+        7 => accumulate_adjustments::<7>(weights, g1_indices, g2_indices, score_start),
+        8 => accumulate_adjustments::<8>(weights, g1_indices, g2_indices, score_start),
+        _ => panic!("Invalid lane_count={lane_count}; max={MAX_KERNEL_ACCUMULATOR_LANES}."),
     }
-
-    for &matrix_row_idx in g2_indices {
-        let matrix_row_idx = matrix_row_idx as usize;
-        assert!(
-            matrix_row_idx < weights.num_rows,
-            "Genotype row index out of bounds"
-        );
-        for i in 0..lane_count {
-            unsafe {
-                let weights_vec = weights.get_simd_lane_for_score_window_unchecked(
-                    matrix_row_idx,
-                    score_start,
-                    i,
-                );
-                let acc = accumulator_buffer.get_unchecked_mut(i);
-                *acc = accumulate_dosage_two(*acc, weights_vec);
-            }
-        }
-    }
-
-    accumulator_buffer
 }
 
 #[cfg(test)]
@@ -289,6 +262,34 @@ mod tests {
                 })
                 .is_err()
             );
+        }
+    }
+
+    #[test]
+    fn all_score_stripe_widths_preserve_accumulation_order() {
+        let data: Vec<f32> = (0..256 * 136)
+            .map(|i| ((i * 37 % 1021) as f32 - 511.0) / 17.0)
+            .collect();
+        let weights = PaddedInterleavedWeights::new(&data, 256, 131).expect("matrix");
+        let g1: Vec<u16> = (0..256).filter(|i| i % 3 == 0).collect();
+        let g2: Vec<u16> = (0..256).filter(|i| i % 3 == 1).collect();
+        for start in [0, 64] {
+            for lanes in 0..=8 {
+                let actual =
+                    accumulate_adjustments_for_person_lanes(&weights, &g1, &g2, start, lanes);
+                for score in 0..64 {
+                    let mut expected = 0.0f32;
+                    if score < lanes * LANE_COUNT {
+                        for &row in &g1 {
+                            expected += data[row as usize * 136 + start + score];
+                        }
+                        for &row in &g2 {
+                            expected += 2.0 * data[row as usize * 136 + start + score];
+                        }
+                    }
+                    assert_eq!(actual[score / 8][score % 8], expected);
+                }
+            }
         }
     }
 

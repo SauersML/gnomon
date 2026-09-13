@@ -37,6 +37,21 @@ const KERNEL_MINI_BATCH_SIZE: usize = 256;
 /// Must be a multiple of SIMD lanes so each stripe can read full vectors safely.
 const CPU_SCORE_CHUNK_SIZE: usize = kernel::MAX_KERNEL_ACCUMULATOR_LANES * SIMD_LANES;
 
+#[inline(always)]
+fn append_dosage_indices(
+    mut mask: u64,
+    base: usize,
+    indices: &mut [u16; KERNEL_MINI_BATCH_SIZE],
+    count: &mut usize,
+) {
+    while mask != 0 {
+        let lane = mask.trailing_zeros() as usize;
+        mask &= mask - 1;
+        indices[*count] = (base + lane) as u16;
+        *count += 1;
+    }
+}
+
 // ========================================================================================
 //                                   Public API
 // ========================================================================================
@@ -315,31 +330,27 @@ pub(crate) fn process_tile_impl<'a>(
                     continue;
                 }
 
-                // Process only nonzero lanes using a compact bitmask walk.
-                let nonzero_mask = vec.simd_ne(zero_vec).to_bitmask();
-                let chunk_vals = vec.to_array();
-                let mut m = nonzero_mask;
-                while m != 0 {
-                    let bit_idx = m.trailing_zeros() as usize;
-                    m &= m - 1; // clear lowest set bit
-                    let i = base_idx + bit_idx;
-
-                    match chunk_vals[bit_idx] {
-                        1 => {
-                            g1_indices[g1_count] = i as u16;
-                            g1_count += 1;
-                        }
-                        2 => {
-                            g2_indices[g2_count] = i as u16;
-                            g2_count += 1;
-                        }
-                        3 => {
-                            missing_indices[missing_count] = i as u16;
-                            missing_count += 1;
-                        }
-                        _ => {} // dosage 0 shouldn't be in nonzero mask, but safe
-                    }
-                }
+                // Classify all lanes at once. Each mask walk writes one dosage
+                // list in increasing variant order, without a genotype-dependent
+                // branch or extracting individual bytes from the SIMD register.
+                append_dosage_indices(
+                    vec.simd_eq(std::simd::Simd::splat(1)).to_bitmask(),
+                    base_idx,
+                    &mut g1_indices,
+                    &mut g1_count,
+                );
+                append_dosage_indices(
+                    vec.simd_eq(std::simd::Simd::splat(2)).to_bitmask(),
+                    base_idx,
+                    &mut g2_indices,
+                    &mut g2_count,
+                );
+                append_dosage_indices(
+                    vec.simd_eq(std::simd::Simd::splat(3)).to_bitmask(),
+                    base_idx,
+                    &mut missing_indices,
+                    &mut missing_count,
+                );
 
                 base_idx += 32;
             }
@@ -1063,6 +1074,62 @@ mod tests {
         assert_eq!(missing[99], 1);
         assert_eq!(missing.iter().sum::<u32>(), 1);
         assert_eq!(scores.iter().filter(|&&score| score != 0.0).count(), 4);
+    }
+
+    #[test]
+    fn process_tile_classifies_simd_dosages_across_mini_batches() {
+        let num_people = 5;
+        for num_scores in [1, 9, 64, 67] {
+            let prep = make_single_variant_multi_score_prep_result(num_people, num_scores);
+            let stride = prep.stride();
+            for variants in [31, 32, 33, 255, 256, 257, 513] {
+                let weights: Vec<f32> = (0..variants * stride)
+                    .map(|i| (i % 29) as f32 / 8.0 - 1.0)
+                    .collect();
+                let corrections = vec![0.25f32; variants * stride];
+                let reconciled = vec![ReconciledVariantIndex(0); variants];
+                let tile: Vec<EffectAlleleDosage> = (0..num_people)
+                    .flat_map(|person| {
+                        (0..variants).map(move |variant| {
+                            EffectAlleleDosage(if person == 4 {
+                                0
+                            } else {
+                                ((variant * 13 + variant / 7 + person) % 4) as u8
+                            })
+                        })
+                    })
+                    .collect();
+                let mut scores = vec![0.0; num_people * num_scores];
+                let mut missing = vec![0; scores.len()];
+                process_tile(
+                    &tile,
+                    &prep,
+                    &weights,
+                    &corrections,
+                    &reconciled,
+                    &mut scores,
+                    &mut missing,
+                );
+                for person in 0..num_people {
+                    for score in 0..num_scores {
+                        let mut expected = 0.0;
+                        let mut expected_missing = 0;
+                        for variant in 0..variants {
+                            let dosage = tile[person * variants + variant].0;
+                            if dosage == 3 {
+                                expected -= 0.25;
+                                expected_missing += 1;
+                            } else {
+                                expected +=
+                                    dosage as f64 * weights[variant * stride + score] as f64;
+                            }
+                        }
+                        assert_eq!(scores[person * num_scores + score], expected);
+                        assert_eq!(missing[person * num_scores + score], expected_missing);
+                    }
+                }
+            }
+        }
     }
 
     #[test]

@@ -3147,6 +3147,74 @@ fn add_score_vector(dst: &mut [f64], src: &[f64]) {
     }
 }
 
+/// Two PLINK calls select one contiguous pair of contribution vectors. Missing
+/// calls contribute zero here; their information loss is recorded separately.
+fn packed_score_pair_tables(
+    block_score_vectors: &[f64],
+    block_swapped: &[bool],
+    components: usize,
+) -> Vec<f64> {
+    let pair_width = components * 2;
+    let mut tables = vec![0.0; block_swapped.len() * 16 * pair_width];
+    for ((table, vectors), &swapped) in tables
+        .chunks_exact_mut(16 * pair_width)
+        .zip(block_score_vectors.chunks_exact(3 * components))
+        .zip(block_swapped)
+    {
+        for (pair, dst) in table.chunks_exact_mut(pair_width).enumerate() {
+            for (lane, dst) in dst.chunks_exact_mut(components).enumerate() {
+                let code = (pair >> (lane * 2)) & 3;
+                let dosage = match code {
+                    0 => 0,
+                    1 => continue,
+                    2 => 1,
+                    3 => 2,
+                    _ => unreachable!(),
+                };
+                let dosage = if swapped { 2 - dosage } else { dosage };
+                dst.copy_from_slice(&vectors[dosage * components..(dosage + 1) * components]);
+            }
+        }
+    }
+    tables
+}
+
+#[inline(always)]
+fn accumulate_packed_scores(
+    bytes: &[u8],
+    vectors: &[f64],
+    swapped: bool,
+    pair_table: Option<&[f64]>,
+    components: usize,
+    scores: &mut [f64],
+) {
+    if let Some(table) = pair_table {
+        let pair_width = components * 2;
+        for (pair, dst) in scores.chunks_mut(pair_width).enumerate() {
+            let codes = ((bytes[pair / 2] >> ((pair % 2) * 4)) & 15) as usize;
+            let offset = codes * pair_width;
+            add_score_vector(dst, &table[offset..offset + dst.len()]);
+        }
+    } else {
+        // A small cohort does not amortize constructing the pair table. Index
+        // the model's three vectors directly; an empty slice skips missing calls.
+        let score0 = &vectors[..components];
+        let score1 = &vectors[components..2 * components];
+        let score2 = &vectors[2 * components..];
+        let calls = if swapped {
+            [score2, &[], score1, score0]
+        } else {
+            [score0, &[], score1, score2]
+        };
+        for (sample, dst) in scores.chunks_exact_mut(components).enumerate() {
+            let code = ((bytes[sample / 4] >> (2 * (sample % 4))) & 3) as usize;
+            for (dst, src) in dst.iter_mut().zip(calls[code]) {
+                *dst += src;
+            }
+        }
+    }
+}
+
 fn accumulate_packed_cpu_block_row_major_dense_missing(
     block_variant_bytes: &[&[u8]],
     block_score_vectors: &[f64],
@@ -3161,6 +3229,10 @@ fn accumulate_packed_cpu_block_row_major_dense_missing(
     let samples = scores_row_major.len() / components;
     let chunk_scores = sample_chunk * components;
     let chunk_missing = sample_chunk * packed_info_size;
+    let score_tables = (samples >= 128)
+        .then(|| packed_score_pair_tables(block_score_vectors, block_swapped, components));
+    let table_width = 32 * components;
+    let missing_masks = plink_missing_lane_masks();
     scores_row_major
         .par_chunks_mut(chunk_scores)
         .zip(missing_info_storage.par_chunks_mut(chunk_missing))
@@ -3174,50 +3246,33 @@ fn accumulate_packed_cpu_block_row_major_dense_missing(
             for (variant, variant_bytes) in block_variant_bytes.iter().enumerate() {
                 debug_assert_eq!(variant_bytes.len(), packed_bytes_per_variant(samples));
                 let bytes = &variant_bytes[byte_start..byte_start + byte_len];
-                let score_offset = variant * components * 3;
-                let score_vectors =
-                    &block_score_vectors[score_offset..score_offset + components * 3];
-                let (score0, score1, score2) = if block_swapped[variant] {
-                    (
-                        &score_vectors[components * 2..components * 3],
-                        &score_vectors[components..components * 2],
-                        &score_vectors[..components],
-                    )
-                } else {
-                    (
-                        &score_vectors[..components],
-                        &score_vectors[components..components * 2],
-                        &score_vectors[components * 2..components * 3],
-                    )
-                };
+                accumulate_packed_scores(
+                    bytes,
+                    &block_score_vectors[variant * components * 3..(variant + 1) * components * 3],
+                    block_swapped[variant],
+                    score_tables
+                        .as_ref()
+                        .map(|tables| &tables[variant * table_width..(variant + 1) * table_width]),
+                    components,
+                    score_chunk,
+                );
                 let contrib = &block_info_contrib
                     [variant * packed_info_size..(variant + 1) * packed_info_size];
 
                 for (byte_idx, &byte) in bytes.iter().enumerate() {
                     let sample_base = byte_idx << 2;
                     let lanes = (chunk_samples - sample_base).min(4);
-                    for lane in 0..lanes {
+                    let mut mask = missing_masks[byte as usize] & ((1 << lanes) - 1);
+                    while mask != 0 {
+                        let lane = mask.trailing_zeros() as usize;
+                        mask &= mask - 1;
                         let sample = sample_base + lane;
-                        let code = (byte >> (lane << 1)) & 0b11;
-                        let score_offset = sample * components;
-                        if code == 1 {
-                            let missing_offset = sample * packed_info_size;
-                            let dst = &mut missing_chunk
-                                [missing_offset..missing_offset + packed_info_size];
-                            for idx in 0..packed_info_size {
-                                dst[idx] += contrib[idx];
-                            }
-                            continue;
+                        let missing_offset = sample * packed_info_size;
+                        let dst =
+                            &mut missing_chunk[missing_offset..missing_offset + packed_info_size];
+                        for idx in 0..packed_info_size {
+                            dst[idx] += contrib[idx];
                         }
-
-                        let score_vector = match code {
-                            0 => score0,
-                            2 => score1,
-                            3 => score2,
-                            _ => continue,
-                        };
-                        let dst = &mut score_chunk[score_offset..score_offset + components];
-                        add_score_vector(dst, score_vector);
                     }
                 }
             }
@@ -3284,6 +3339,10 @@ fn accumulate_packed_cpu_block_row_major_sparse_missing(
 ) {
     let samples = scores_row_major.len() / components;
     let chunk_scores = sample_chunk * components;
+    let score_tables = (samples >= 128)
+        .then(|| packed_score_pair_tables(block_score_vectors, block_swapped, components));
+    let table_width = 32 * components;
+    let missing_masks = plink_missing_lane_masks();
     scores_row_major
         .par_chunks_mut(chunk_scores)
         .zip(missing_variants.par_chunks_mut(sample_chunk))
@@ -3297,44 +3356,27 @@ fn accumulate_packed_cpu_block_row_major_sparse_missing(
             for (variant, variant_bytes) in block_variant_bytes.iter().enumerate() {
                 debug_assert_eq!(variant_bytes.len(), packed_bytes_per_variant(samples));
                 let bytes = &variant_bytes[byte_start..byte_start + byte_len];
-                let score_offset = variant * components * 3;
-                let score_vectors =
-                    &block_score_vectors[score_offset..score_offset + components * 3];
-                let (score0, score1, score2) = if block_swapped[variant] {
-                    (
-                        &score_vectors[components * 2..components * 3],
-                        &score_vectors[components..components * 2],
-                        &score_vectors[..components],
-                    )
-                } else {
-                    (
-                        &score_vectors[..components],
-                        &score_vectors[components..components * 2],
-                        &score_vectors[components * 2..components * 3],
-                    )
-                };
+                accumulate_packed_scores(
+                    bytes,
+                    &block_score_vectors[variant * components * 3..(variant + 1) * components * 3],
+                    block_swapped[variant],
+                    score_tables
+                        .as_ref()
+                        .map(|tables| &tables[variant * table_width..(variant + 1) * table_width]),
+                    components,
+                    score_chunk,
+                );
                 let global_variant = (variant_offset + variant) as u32;
 
                 for (byte_idx, &byte) in bytes.iter().enumerate() {
                     let sample_base = byte_idx << 2;
                     let lanes = (chunk_samples - sample_base).min(4);
-                    for lane in 0..lanes {
+                    let mut mask = missing_masks[byte as usize] & ((1 << lanes) - 1);
+                    while mask != 0 {
+                        let lane = mask.trailing_zeros() as usize;
+                        mask &= mask - 1;
                         let sample = sample_base + lane;
-                        let code = (byte >> (lane << 1)) & 0b11;
-                        let score_offset = sample * components;
-                        if code == 1 {
-                            missing_chunk[sample].push(global_variant);
-                            continue;
-                        }
-
-                        let score_vector = match code {
-                            0 => score0,
-                            2 => score1,
-                            3 => score2,
-                            _ => continue,
-                        };
-                        let dst = &mut score_chunk[score_offset..score_offset + components];
-                        add_score_vector(dst, score_vector);
+                        missing_chunk[sample].push(global_variant);
                     }
                 }
             }
@@ -4679,6 +4721,78 @@ mod tests {
         assert_eq!(&full_storage[8..10], &[30.0, 31.0]);
         assert!(full_storage[10].is_nan() && full_storage[11].is_nan());
         assert_eq!(full_quality, vec![0.0, 0.25, 0.0, 0.75, 0.5, 0.0]);
+    }
+
+    #[test]
+    fn packed_projection_kernels_match_scalar_calls_and_missingness() {
+        for components in [1usize, 3, 4, 5, 20, 65] {
+            for samples in [1usize, 2, 3, 4, 5, 31, 33, 257] {
+                let variants = 256;
+                let data: Vec<Vec<u8>> = (0..variants)
+                    .map(|variant| vec![variant as u8; samples.div_ceil(4)])
+                    .collect();
+                let bytes: Vec<&[u8]> = data.iter().map(Vec::as_slice).collect();
+                let vectors: Vec<f64> = (0..variants * 3 * components)
+                    .map(|i| (i * 73 % 997) as f64 / 127.0 - 3.0)
+                    .collect();
+                let swapped: Vec<bool> = (0..variants).map(|variant| variant % 3 == 0).collect();
+                let info_size = packed_tri_size(components);
+                let contrib: Vec<f64> = (0..variants * info_size)
+                    .map(|i| (i % 71) as f64 / 131.0)
+                    .collect();
+                let mut expected = vec![0.123; samples * components];
+                let mut expected_missing = vec![Vec::new(); samples];
+                let mut expected_info = vec![0.0; samples * info_size];
+                for variant in 0..variants {
+                    for sample in 0..samples {
+                        let code = (data[variant][sample / 4] >> (2 * (sample % 4))) & 3;
+                        if code == 1 {
+                            expected_missing[sample].push((17 + variant) as u32);
+                            for entry in 0..info_size {
+                                expected_info[sample * info_size + entry] +=
+                                    contrib[variant * info_size + entry];
+                            }
+                        } else {
+                            let dosage = if code == 0 { 0 } else { (code - 1) as usize };
+                            let dosage = if swapped[variant] { 2 - dosage } else { dosage };
+                            for component in 0..components {
+                                expected[sample * components + component] +=
+                                    vectors[(variant * 3 + dosage) * components + component];
+                            }
+                        }
+                    }
+                }
+                let mut scores = vec![0.123; samples * components];
+                let mut missing = vec![Vec::new(); samples];
+                accumulate_packed_cpu_block_row_major_sparse_missing(
+                    &bytes,
+                    &vectors,
+                    &swapped,
+                    17,
+                    256,
+                    components,
+                    &mut scores,
+                    &mut missing,
+                );
+                assert_eq!(scores, expected);
+                assert_eq!(missing, expected_missing);
+                scores.fill(0.123);
+                let mut info = vec![0.0; samples * info_size];
+                accumulate_packed_cpu_block_row_major_dense_missing(
+                    &bytes,
+                    &vectors,
+                    &swapped,
+                    &contrib,
+                    256,
+                    components,
+                    info_size,
+                    &mut scores,
+                    &mut info,
+                );
+                assert_eq!(scores, expected);
+                assert_eq!(info, expected_info);
+            }
+        }
     }
 
     #[test]
