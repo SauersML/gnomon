@@ -30,7 +30,7 @@ pub mod files;
 #[cfg(any(feature = "score", feature = "map", feature = "terms"))]
 mod range_fetch;
 
-#[cfg(any(feature = "score", feature = "map"))]
+#[cfg(any(feature = "score", feature = "map", feature = "terms"))]
 pub(crate) mod cuda_utils;
 
 pub mod shared {
