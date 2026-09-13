@@ -611,8 +611,14 @@ def fit_worker(frame_path, config_path, cause, output, transform_path, variant="
         replay_z = model.transformation_score(test)
         if not np.allclose(df.loc[~df.is_train, "Z_ctn"], replay_z, rtol=1e-8, atol=1e-10):
             raise ValueError("saved native CTN disagrees with held-out score artifact")
-    horizons = np.asarray(config["horizons_years"])
-    coarse = np.unique(np.r_[np.linspace(0, horizons[-1], config["grid_intervals"] + 1), horizons])
+    horizons = np.asarray(config["horizons_years"], dtype=float)
+    # Every horizon is an exact grid point and the spacing stays uniform:
+    # inserting a horizon between two linspace points leaves an interval of
+    # about a day, on which the cumulative-hazard quadrature cannot converge.
+    edges = np.concatenate([[0.0], horizons])
+    coarse = np.unique(np.concatenate([
+        np.linspace(a, b, max(2, int(round(config["grid_intervals"] * (b - a) / horizons[-1])) + 1))
+        for a, b in zip(edges[:-1], edges[1:])]))
     grid = np.sort(np.r_[coarse, (coarse[:-1] + coarse[1:]) / 2])
     # Do not send held-out event/censoring observations as prediction features.
     test["event"] = 0
