@@ -562,17 +562,25 @@ pub fn reformat_pgs_file(
     // 3. Fallback to unique generation to avoid collisions.
     let score_label = derive_score_label(score_id.as_ref());
 
-    // --- Define the resolver closure based on the chosen strategy ---
-    // The `move` keyword captures the `column_indices` struct by value.
-    let resolver = move |line_number: usize, line: &str| -> Result<ResolveOutcome, ReformatError> {
-        let fields: Vec<&str> = line.split('\t').collect();
+    /// Resolves one data line against the pre-selected strategy. A kept line is
+    /// appended to `rows` as `chr:pos\tea\toa\tweight\n` and its key returned; a
+    /// skipped one comes back as a record whose `line_number` is `line_index`.
+    fn resolve_line<'a>(
+        strategy: ParsingStrategy,
+        column_indices: &ColumnIndices,
+        line_index: usize,
+        line: &'a str,
+        fields: &mut Vec<&'a str>,
+        rows: &mut Vec<u8>,
+    ) -> Result<(u8, u32), SkipRecord> {
+        fields.clear();
+        fields.extend(line.split('\t'));
+        let fields: &[&str] = fields;
 
-        let make_skip = |reason: String| {
-            ResolveOutcome::Skipped(SkipRecord {
-                line_number,
-                identifier: derive_identifier(line, &fields, &column_indices),
-                reason,
-            })
+        let make_skip = |reason: String| SkipRecord {
+            line_number: line_index,
+            identifier: derive_identifier(line, fields, column_indices),
+            reason,
         };
 
         let attempt_coords = |label: &str,
@@ -607,7 +615,7 @@ pub fn reformat_pgs_file(
                         match attempt_coords("Original", column_indices.chr, column_indices.pos) {
                             Ok(key) => key,
                             Err(o_reason) => {
-                                return Ok(make_skip(format!(
+                                return Err(make_skip(format!(
                                     "Harmonized coordinates unavailable: {h_reason}; Original coordinates unavailable: {o_reason}"
                                 )));
                             }
@@ -619,7 +627,7 @@ pub fn reformat_pgs_file(
                 match attempt_coords("Harmonized", column_indices.hm_chr, column_indices.hm_pos) {
                     Ok(key) => key,
                     Err(reason) => {
-                        return Ok(make_skip(format!(
+                        return Err(make_skip(format!(
                             "Harmonized coordinates unavailable: {reason}"
                         )));
                     }
@@ -629,7 +637,7 @@ pub fn reformat_pgs_file(
                 match attempt_coords("Original", column_indices.chr, column_indices.pos) {
                     Ok(key) => key,
                     Err(reason) => {
-                        return Ok(make_skip(format!(
+                        return Err(make_skip(format!(
                             "Original coordinates unavailable: {reason}"
                         )));
                     }
@@ -643,22 +651,23 @@ pub fn reformat_pgs_file(
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
         else {
-            return Ok(make_skip("Missing effect_allele value".to_string()));
+            return Err(make_skip("Missing effect_allele value".to_string()));
         };
         let Some(weight_str) = fields
             .get(column_indices.ew)
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
         else {
-            return Ok(make_skip("Missing effect_weight value".to_string()));
+            return Err(make_skip("Missing effect_weight value".to_string()));
         };
+        let recovered_oa;
         let oa_str = match column_indices
             .oa
             .and_then(|i| fields.get(i))
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
         {
-            Some(value) => value.to_string(),
+            Some(value) => value,
             // Some catalog rows leave other_allele/hm_inferOtherAllele blank but still
             // spell the pair out in variant_description (e.g. `1:100:G:A`). Recover it
             // when unambiguous; a row we cannot pin down is skipped, not fatal, so one
@@ -668,9 +677,12 @@ pub fn reformat_pgs_file(
                 .and_then(|i| fields.get(i))
                 .and_then(|value| other_allele_from_variant_description(value, ea_str))
             {
-                Some(recovered) => recovered,
+                Some(recovered) => {
+                    recovered_oa = recovered;
+                    recovered_oa.as_str()
+                }
                 None => {
-                    return Ok(make_skip(
+                    return Err(make_skip(
                         "Missing other_allele, and variant_description did not yield an unambiguous non-effect allele"
                             .to_string(),
                     ));
@@ -678,44 +690,100 @@ pub fn reformat_pgs_file(
             },
         };
 
-        let variant_id = format!("{}:{}", key.0, key.1);
-        let line_data = format!("{variant_id}\t{ea_str}\t{oa_str}\t{weight_str}");
+        push_decimal(rows, u32::from(key.0));
+        rows.push(b':');
+        push_decimal(rows, key.1);
+        for value in [ea_str, oa_str, weight_str] {
+            rows.push(b'\t');
+            rows.extend_from_slice(value.as_bytes());
+        }
+        rows.push(b'\n');
 
-        Ok(ResolveOutcome::Resolved(SortableLine { key, line_data }))
+        Ok(key)
+    }
+
+    // --- Read the data section once and resolve it in parallel ---
+    // One buffer split into newline-aligned chunks replaces a String per line and
+    // two more per kept row. Lines, line numbers, skip records and the pre-sort
+    // row order are exactly what the line-by-line reader produced.
+    let mut data = Vec::new();
+    if let Err(read_error) = reader.read_to_end(&mut data) {
+        // A line reader rejects an invalid complete line before it reaches the
+        // failed read that follows it; keep that precedence.
+        let complete = data.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+        if std::str::from_utf8(&data[..complete]).is_err() {
+            return Err(invalid_utf8_line_error(&data[..complete]).into());
+        }
+        return Err(read_error.into());
+    }
+    let Ok(text) = std::str::from_utf8(&data) else {
+        return Err(invalid_utf8_line_error(&data).into());
     };
 
-    // --- Read all data lines and process them in parallel ---
-    let data_lines: Vec<(usize, String)> = reader
-        .lines()
-        .enumerate()
-        .map(|(idx, result)| result.map(|line| (total_lines_read + idx + 1, line)))
-        .collect::<Result<Vec<_>, _>>()?;
-    let total_variant_lines = data_lines
-        .iter()
-        .filter(|(_, line)| !line.is_empty() && !line.starts_with('#'))
-        .count();
-    let skipped_records = Mutex::new(Vec::new());
-
-    let mut lines_to_sort = data_lines
+    let mut resolved_chunks: Vec<ResolvedChunk> = newline_aligned_spans(text.as_bytes())
         .into_par_iter()
-        .filter_map(|(line_number, line)| {
-            if line.is_empty() || line.starts_with('#') {
-                return None;
-            }
-            match resolver(line_number, &line) {
-                Ok(ResolveOutcome::Resolved(sortable_line)) => Some(Ok(sortable_line)),
-                Ok(ResolveOutcome::Skipped(record)) => {
-                    if let Ok(mut guard) = skipped_records.lock() {
-                        guard.push(record);
-                    }
-                    None
+        .enumerate()
+        .map(|(chunk_index, (start, end))| {
+            let chunk = &text[start..end];
+            let mut resolved = ResolvedChunk {
+                line_count: 0,
+                variant_lines: 0,
+                rows: Vec::with_capacity(chunk.len() / 2),
+                sortable: Vec::new(),
+                skipped: Vec::new(),
+            };
+            let mut fields = Vec::new();
+            for raw_line in chunk.split_inclusive('\n') {
+                // `BufRead::lines` semantics: strip "\n" or "\r\n", nothing else.
+                let line = match raw_line.strip_suffix('\n') {
+                    Some(line) => line.strip_suffix('\r').unwrap_or(line),
+                    None => raw_line,
+                };
+                let line_index = resolved.line_count;
+                resolved.line_count += 1;
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
                 }
-                Err(e) => Some(Err(e)), // This is a fatal error.
+                resolved.variant_lines += 1;
+                let row_start = resolved.rows.len();
+                match resolve_line(
+                    strategy,
+                    &column_indices,
+                    line_index,
+                    line,
+                    &mut fields,
+                    &mut resolved.rows,
+                ) {
+                    Ok(key) => resolved.sortable.push(SortableRow {
+                        key,
+                        chunk: chunk_index,
+                        start: row_start,
+                        end: resolved.rows.len(),
+                    }),
+                    Err(record) => resolved.skipped.push(record),
+                }
             }
+            resolved
         })
-        .collect::<Result<Vec<_>, ReformatError>>()?;
+        .collect();
 
-    // Sort the resolved data and write it to the gnomon-native file.
+    let mut total_variant_lines = 0usize;
+    let mut lines_to_sort =
+        Vec::with_capacity(resolved_chunks.iter().map(|c| c.sortable.len()).sum());
+    let mut skipped_records = Vec::new();
+    let mut first_line_number = total_lines_read + 1;
+    for chunk in &mut resolved_chunks {
+        total_variant_lines += chunk.variant_lines;
+        lines_to_sort.append(&mut chunk.sortable);
+        for mut record in chunk.skipped.drain(..) {
+            record.line_number += first_line_number;
+            skipped_records.push(record);
+        }
+        first_line_number += chunk.line_count;
+    }
+
+    // Sort the resolved data and write it to the gnomon-native file. Rows enter
+    // the sort in file order, as before, so equal keys land in the same order.
     lines_to_sort.par_sort_unstable_by_key(|item| item.key);
 
     let out_file = File::create(output_path)?;
@@ -724,13 +792,12 @@ pub fn reformat_pgs_file(
         writer,
         "variant_id\teffect_allele\tother_allele\t{score_label}"
     )?;
-    for item in lines_to_sort {
-        writeln!(writer, "{}", item.line_data)?;
+    for item in &lines_to_sort {
+        writer.write_all(&resolved_chunks[item.chunk].rows[item.start..item.end])?;
     }
     writer.flush()?;
 
     // --- Report any non-fatal issues to the user ---
-    let mut skipped_records = skipped_records.into_inner().unwrap_or_default();
     let skip_summary = if !skipped_records.is_empty() {
         skipped_records.sort_by_key(|record| record.line_number);
         let skipped_count = skipped_records.len();
@@ -783,10 +850,111 @@ pub fn reformat_pgs_file(
 /// How many skipped-contig rows to name before collapsing the rest into a count.
 const MAX_SKIPPED_CONTIG_EXAMPLES: usize = 5;
 
+/// Whether `sort_native_file` would write `data` back unchanged: valid UTF-8, no
+/// carriage returns or blank lines, comments only above a native header, and rows
+/// whose chromosome and position all parse, already in key order. Sorting such a
+/// file is the identity permutation, so its output is the input plus a final
+/// newline when the last line lacks one; that flag is returned. Anything else
+/// (including every file that warns or errors) returns `None`.
+fn native_file_already_sorted(data: &[u8]) -> Option<bool> {
+    let text = std::str::from_utf8(data).ok()?;
+    if text.contains('\r') {
+        return None;
+    }
+
+    let mut rows = text;
+    loop {
+        let (line, rest) = match rows.split_once('\n') {
+            Some(split) => split,
+            None if rows.is_empty() => return None,
+            None => (rows, ""),
+        };
+        rows = rest;
+        if line.trim().is_empty() {
+            return None;
+        }
+        if !line.starts_with('#') {
+            if !line.starts_with("variant_id\teffect_allele\tother_allele\t") {
+                return None;
+            }
+            break;
+        }
+    }
+
+    // First and last key of a chunk, or `None` if the chunk breaks a condition.
+    let chunk_bounds = |&(start, end): &(usize, usize)| -> Option<((u8, u32), (u8, u32))> {
+        let mut bounds: Option<((u8, u32), (u8, u32))> = None;
+        for line in rows[start..end].split_inclusive('\n') {
+            let line = line.strip_suffix('\n').unwrap_or(line);
+            if line.trim().is_empty() || line.starts_with('#') {
+                return None;
+            }
+            let variant_id = line.split('\t').next().unwrap_or("");
+            let mut key_parts = variant_id.splitn(2, ':');
+            let chr_num = parse_chromosome_label(key_parts.next().unwrap_or("")).ok()?;
+            let pos_num: u32 = key_parts.next().unwrap_or("").trim().parse().ok()?;
+            let key = (chr_num, pos_num);
+            bounds = match bounds {
+                None => Some((key, key)),
+                Some((first, last)) if last <= key => Some((first, key)),
+                Some(_) => return None,
+            };
+        }
+        bounds
+    };
+
+    // An unsorted file almost always shows it in its first rows: check the first
+    // chunk before waking the thread pool, whose spin-up alone would cost an
+    // unsorted file more than the check saves. The collect stops at a failure.
+    let spans = newline_aligned_spans(rows.as_bytes());
+    let Some((first_span, other_spans)) = spans.split_first() else {
+        return Some(!text.ends_with('\n'));
+    };
+    let mut previous_last = chunk_bounds(first_span)?.1;
+    let other_bounds: Vec<((u8, u32), (u8, u32))> = other_spans
+        .par_iter()
+        .map(chunk_bounds)
+        .collect::<Option<_>>()?;
+    for (first, last) in other_bounds {
+        if previous_last > first {
+            return None;
+        }
+        previous_last = last;
+    }
+    Some(!text.ends_with('\n'))
+}
+
 /// Sorts a gnomon-native file that is not guaranteed to be sorted.
 pub fn sort_native_file(input_path: &Path, output_path: &Path) -> Result<(), ReformatError> {
-    let file = File::open(input_path)?;
-    let reader = BufReader::new(file);
+    let mut file = File::open(input_path)?;
+
+    // Files written by `reformat_pgs_file` are already sorted, and for those the
+    // pass below reproduces its input byte for byte; skip straight to the copy.
+    // An unsorted or unusual file nearly always shows it within its first rows,
+    // so the complete lines of a prefix are checked before reading the rest. A
+    // failed read also just takes the general path, which sees the same bytes.
+    let mut data = Vec::new();
+    if (&mut file)
+        .take(DATA_CHUNK_BYTES as u64)
+        .read_to_end(&mut data)
+        .is_ok()
+    {
+        let complete = data.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+        if native_file_already_sorted(&data[..complete]).is_some()
+            && file.read_to_end(&mut data).is_ok()
+            && let Some(missing_final_newline) = native_file_already_sorted(&data)
+        {
+            let mut out_file = File::create(output_path)?;
+            out_file.write_all(&data)?;
+            if missing_final_newline {
+                out_file.write_all(b"\n")?;
+            }
+            return Ok(());
+        }
+    }
+
+    // Whatever was read continues straight into the unread rest of the file.
+    let reader = BufReader::new(io::Cursor::new(data).chain(file));
 
     // Separate header lines from data lines to correctly track data line numbers.
     let mut header_lines: Vec<String> = vec![];
@@ -1065,15 +1233,80 @@ struct SortableLine {
     line_data: String,
 }
 
-enum ResolveOutcome {
-    Resolved(SortableLine),
-    Skipped(SkipRecord),
-}
-
 struct SkipRecord {
     line_number: usize,
     identifier: String,
     reason: String,
+}
+
+/// The rows one chunk of a score file resolved to, in file order.
+struct ResolvedChunk {
+    line_count: usize,
+    variant_lines: usize,
+    /// Formatted native rows, each ending in `\n`.
+    rows: Vec<u8>,
+    sortable: Vec<SortableRow>,
+    /// Skips whose `line_number` is still relative to the chunk's first line.
+    skipped: Vec<SkipRecord>,
+}
+
+/// A kept row: its sort key and where its bytes sit in `ResolvedChunk::rows`.
+struct SortableRow {
+    key: (u8, u32),
+    chunk: usize,
+    start: usize,
+    end: usize,
+}
+
+/// Target size of the newline-aligned chunks a score file is resolved in.
+const DATA_CHUNK_BYTES: usize = 1 << 20;
+
+/// Splits `bytes` into consecutive spans of about `DATA_CHUNK_BYTES`, each ending
+/// just past a newline (or at the end of input), so no line straddles two spans.
+fn newline_aligned_spans(bytes: &[u8]) -> Vec<(usize, usize)> {
+    let mut spans = Vec::with_capacity(bytes.len() / DATA_CHUNK_BYTES + 1);
+    let mut start = 0;
+    while start < bytes.len() {
+        let mut end = (start + DATA_CHUNK_BYTES).min(bytes.len());
+        if end < bytes.len() {
+            end = bytes[end..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .map_or(bytes.len(), |offset| end + offset + 1);
+        }
+        spans.push((start, end));
+        start = end;
+    }
+    spans
+}
+
+/// Appends the decimal digits of `value`, exactly as `Display` renders it.
+fn push_decimal(out: &mut Vec<u8>, mut value: u32) {
+    let mut digits = [0u8; 10];
+    let mut first = digits.len();
+    loop {
+        first -= 1;
+        digits[first] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    out.extend_from_slice(&digits[first..]);
+}
+
+/// The error `BufRead::lines` reports for the first line of `bytes` that is not
+/// UTF-8, so a whole-buffer reader fails with the error the line reader gave.
+fn invalid_utf8_line_error(bytes: &[u8]) -> io::Error {
+    for line in BufRead::lines(bytes) {
+        if let Err(error) = line {
+            return error;
+        }
+    }
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "stream did not contain valid UTF-8",
+    )
 }
 
 /// Recovers the non-effect allele from a PGS Catalog `variant_description` whose final
