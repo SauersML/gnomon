@@ -1,15 +1,22 @@
 use crate::score::types::{GenomicRegion, parse_chromosome_label};
-use crate::shared::files::{VariantCompression, VariantFormat, open_variant_source};
+use crate::shared::files::{VariantCompression, VariantFormat, VariantSource, open_variant_source};
 use ahash::{AHashMap, AHashSet};
+use crossbeam_channel::{Receiver, Sender};
+use flate2::Crc;
 use flate2::read::MultiGzDecoder;
+use libdeflater::Decompressor;
+use memchr::{memchr, memchr_iter, memrchr};
 use noodles_vcf::io::Reader as VcfReader;
 use noodles_vcf::variant::record::AlternateBases as _;
 use noodles_vcf::variant::record::Samples as _;
 use noodles_vcf::variant::record::samples::keys::key;
+use rayon::prelude::*;
 use std::error::Error;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{self, BufRead, BufReader, Cursor, Read};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
 
 #[derive(Debug)]
 pub struct NativeVcfScoreResult {
@@ -50,6 +57,7 @@ pub fn score_vcf_streaming(
     score_regions: Option<&std::collections::HashMap<String, GenomicRegion>>,
 ) -> Result<NativeVcfScoreResult, Box<dyn Error + Send + Sync>> {
     let (score_names, rules_by_key) = load_score_rules(native_score_files, score_regions)?;
+    let rules_by_key = Arc::new(rules_by_key);
 
     let source = open_variant_source(input_path)?;
     if source.format() != VariantFormat::Vcf {
@@ -67,8 +75,10 @@ pub fn score_vcf_streaming(
             VcfReader::new(reader)
         }
         VariantCompression::Bgzf => {
-            let reader: Box<dyn BufRead + Send> =
-                Box::new(BufReader::new(MultiGzDecoder::new(source)));
+            let reader: Box<dyn BufRead + Send> = Box::new(PrefilteredBgzfReader::spawn(
+                source,
+                Arc::clone(&rules_by_key),
+            )?);
             VcfReader::new(reader)
         }
     };
@@ -891,6 +901,463 @@ fn open_text_reader(path: &Path) -> Result<Box<dyn BufRead>, Box<dyn Error + Sen
     }
 }
 
+const BGZF_HEADER_LEN: usize = 18;
+const BGZF_TRAILER_LEN: usize = 8;
+/// Largest uncompressed payload a BGZF block may carry.
+const BGZF_MAX_DATA_LEN: usize = 1 << 16;
+/// Blocks inflated per rayon worker before the ordered results are stitched.
+const BGZF_FRAMES_PER_WORKER: usize = 64;
+/// Filtered chunks buffered between the inflating thread and the scorer.
+const PREFILTER_CHANNEL_DEPTH: usize = 4;
+
+/// A BGZF VCF stream reduced to the lines the native scorer can act on.
+///
+/// Inflating a WGS VCF dominates native scoring, and nearly every record in it
+/// sits at a position no score file mentions. This reader inflates BGZF blocks
+/// on the rayon pool and drops, inside the workers, each record line that
+/// `score_vcf_streaming` would parse without error and then skip. Everything
+/// else (the header, the first record after it, any line the scorer could
+/// reject, and every record at a scored position) reaches noodles byte for byte
+/// and in file order, so scores and errors are those of a sequential read.
+///
+/// Bytes that do not form a well-formed BGZF block (plain gzip members,
+/// truncated or corrupt blocks, trailing garbage) hand the rest of the stream,
+/// unfiltered, to `MultiGzDecoder`, which is how the whole stream used to be read.
+struct PrefilteredBgzfReader {
+    rx: Option<Receiver<io::Result<Vec<u8>>>>,
+    buf: Vec<u8>,
+    pos: usize,
+    finished: bool,
+    producer: Option<JoinHandle<()>>,
+}
+
+impl PrefilteredBgzfReader {
+    fn spawn(
+        source: VariantSource,
+        rules_by_key: Arc<AHashMap<VariantKey, Vec<ScoreRule>>>,
+    ) -> io::Result<Self> {
+        let (tx, rx) = crossbeam_channel::bounded(PREFILTER_CHANNEL_DEPTH);
+        let producer = thread::Builder::new()
+            .name("vcf-bgzf-prefilter".to_string())
+            .spawn(move || {
+                let error_tx = tx.clone();
+                if let Err(err) = BgzfLineFilter::new(source, rules_by_key, tx).run() {
+                    // Fails only when the scorer already stopped reading.
+                    let _ = error_tx.send(Err(err));
+                }
+            })?;
+        Ok(Self {
+            rx: Some(rx),
+            buf: Vec::new(),
+            pos: 0,
+            finished: false,
+            producer: Some(producer),
+        })
+    }
+}
+
+impl Read for PrefilteredBgzfReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let available = self.fill_buf()?;
+        let amt = available.len().min(buf.len());
+        buf[..amt].copy_from_slice(&available[..amt]);
+        self.consume(amt);
+        Ok(amt)
+    }
+}
+
+impl BufRead for PrefilteredBgzfReader {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        while self.pos == self.buf.len() && !self.finished {
+            let rx = self
+                .rx
+                .as_ref()
+                .expect("the receiver is only taken when the reader is dropped");
+            match rx.recv() {
+                // An empty chunk marks the end of the stream.
+                Ok(Ok(chunk)) if chunk.is_empty() => self.finished = true,
+                Ok(Ok(chunk)) => {
+                    self.buf = chunk;
+                    self.pos = 0;
+                }
+                Ok(Err(err)) => return Err(err),
+                Err(_) => {
+                    return Err(io::Error::other(
+                        "BGZF reader thread stopped before the end of the stream",
+                    ));
+                }
+            }
+        }
+        Ok(&self.buf[self.pos..])
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.pos = (self.pos + amt).min(self.buf.len());
+    }
+}
+
+impl Drop for PrefilteredBgzfReader {
+    fn drop(&mut self) {
+        // Closing the channel first unblocks a producer waiting to send.
+        drop(self.rx.take());
+        if let Some(producer) = self.producer.take() {
+            let _ = producer.join();
+        }
+    }
+}
+
+/// The producing half of [`PrefilteredBgzfReader`].
+struct BgzfLineFilter {
+    source: VariantSource,
+    rules_by_key: Arc<AHashMap<VariantKey, Vec<ScoreRule>>>,
+    tx: Sender<io::Result<Vec<u8>>>,
+    /// Raw frames of the batch being read, reused across batches.
+    frames: Vec<Vec<u8>>,
+    /// A line not yet terminated by the blocks read so far.
+    carry: Vec<u8>,
+    /// Kept bytes awaiting the next send.
+    out: Vec<u8>,
+}
+
+enum FrameRead {
+    Block,
+    Eof,
+    /// The bytes read are not a canonical BGZF block; they are left in the
+    /// frame buffer for `MultiGzDecoder`.
+    Irregular,
+}
+
+/// One inflated block whose complete lines have already been filtered.
+struct BlockLines {
+    /// The bytes up to and including the block's first newline, then every
+    /// kept complete line, then the bytes after the block's last newline.
+    bytes: Vec<u8>,
+    /// Length of the leading partial line (the whole block without a newline).
+    head_len: usize,
+    /// Offset in `bytes` of the trailing partial line.
+    tail_start: usize,
+    has_newline: bool,
+}
+
+impl BgzfLineFilter {
+    fn new(
+        source: VariantSource,
+        rules_by_key: Arc<AHashMap<VariantKey, Vec<ScoreRule>>>,
+        tx: Sender<io::Result<Vec<u8>>>,
+    ) -> Self {
+        Self {
+            source,
+            rules_by_key,
+            tx,
+            frames: Vec::new(),
+            carry: Vec::new(),
+            out: Vec::new(),
+        }
+    }
+
+    fn run(mut self) -> io::Result<()> {
+        // The header ends at the first line that does not start with '#'.
+        // Header lines and that first record always pass, so dropping records
+        // can never pull a later '#' line into the header.
+        let mut decompressor = Decompressor::new();
+        let mut block = Vec::with_capacity(BGZF_MAX_DATA_LEN);
+        let mut frame = Vec::new();
+        let mut scanned = 0usize;
+        'header: loop {
+            match read_bgzf_frame(&mut self.source, &mut frame)? {
+                FrameRead::Block => {}
+                FrameRead::Eof => return self.finish(),
+                FrameRead::Irregular => return self.fall_back(frame),
+            }
+            if inflate_bgzf_block(&frame, &mut decompressor, &mut block).is_err() {
+                return self.fall_back(frame);
+            }
+            self.carry.extend_from_slice(&block);
+            while let Some(offset) = memchr(b'\n', &self.carry[scanned..]) {
+                let line_start = scanned;
+                scanned += offset + 1;
+                if self.carry[line_start] != b'#' {
+                    self.out.extend_from_slice(&self.carry[..scanned]);
+                    self.carry.drain(..scanned);
+                    self.filter_carried_lines();
+                    break 'header;
+                }
+            }
+        }
+
+        let batch_len = rayon::current_num_threads().max(1) * BGZF_FRAMES_PER_WORKER;
+        loop {
+            let mut count = 0usize;
+            let mut end = None;
+            while count < batch_len {
+                if self.frames.len() == count {
+                    self.frames.push(Vec::new());
+                }
+                match read_bgzf_frame(&mut self.source, &mut self.frames[count])? {
+                    FrameRead::Block => count += 1,
+                    other => {
+                        end = Some(other);
+                        break;
+                    }
+                }
+            }
+
+            let rules_by_key = &*self.rules_by_key;
+            let blocks: Vec<io::Result<BlockLines>> = self.frames[..count]
+                .par_iter()
+                .map_init(
+                    || (Decompressor::new(), Vec::with_capacity(BGZF_MAX_DATA_LEN)),
+                    |(decompressor, block), frame| {
+                        inflate_bgzf_block(frame, decompressor, block)?;
+                        Ok(split_block_lines(block, rules_by_key))
+                    },
+                )
+                .collect();
+
+            for (index, result) in blocks.into_iter().enumerate() {
+                match result {
+                    Ok(lines) => self.stitch(lines),
+                    Err(_) => {
+                        let mut consumed = Vec::new();
+                        for frame in &self.frames[index..count] {
+                            consumed.extend_from_slice(frame);
+                        }
+                        if matches!(end, Some(FrameRead::Irregular)) {
+                            consumed.extend_from_slice(&self.frames[count]);
+                        }
+                        return self.fall_back(consumed);
+                    }
+                }
+            }
+
+            match end {
+                None => self.flush()?,
+                Some(FrameRead::Block) => unreachable!("a full frame never ends a batch early"),
+                Some(FrameRead::Eof) => return self.finish(),
+                Some(FrameRead::Irregular) => {
+                    let consumed = std::mem::take(&mut self.frames[count]);
+                    return self.fall_back(consumed);
+                }
+            }
+        }
+    }
+
+    /// Filters every complete line in `carry`, leaving only the trailing partial line.
+    fn filter_carried_lines(&mut self) {
+        let mut line_start = 0usize;
+        while let Some(offset) = memchr(b'\n', &self.carry[line_start..]) {
+            let line_end = line_start + offset;
+            if !is_skippable_record(&self.carry[line_start..line_end], &self.rules_by_key) {
+                self.out
+                    .extend_from_slice(&self.carry[line_start..=line_end]);
+            }
+            line_start = line_end + 1;
+        }
+        self.carry.drain(..line_start);
+    }
+
+    fn stitch(&mut self, lines: BlockLines) {
+        if !lines.has_newline {
+            self.carry.extend_from_slice(&lines.bytes);
+            return;
+        }
+        self.carry.extend_from_slice(&lines.bytes[..lines.head_len]);
+        let line_len = self.carry.len() - 1;
+        if !is_skippable_record(&self.carry[..line_len], &self.rules_by_key) {
+            self.out.extend_from_slice(&self.carry);
+        }
+        self.carry.clear();
+        self.out
+            .extend_from_slice(&lines.bytes[lines.head_len..lines.tail_start]);
+        self.carry
+            .extend_from_slice(&lines.bytes[lines.tail_start..]);
+    }
+
+    fn send(&self, chunk: Vec<u8>) -> io::Result<()> {
+        self.tx.send(Ok(chunk)).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "native VCF scorer stopped reading",
+            )
+        })
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if self.out.is_empty() {
+            return Ok(());
+        }
+        let chunk = std::mem::take(&mut self.out);
+        self.send(chunk)
+    }
+
+    fn finish(mut self) -> io::Result<()> {
+        // A final line without a newline always passes.
+        let carry = std::mem::take(&mut self.carry);
+        self.out.extend_from_slice(&carry);
+        self.flush()?;
+        self.send(Vec::new())
+    }
+
+    fn fall_back(mut self, consumed: Vec<u8>) -> io::Result<()> {
+        let carry = std::mem::take(&mut self.carry);
+        self.out.extend_from_slice(&carry);
+        self.flush()?;
+        let mut decoder = MultiGzDecoder::new(Cursor::new(consumed).chain(self.source));
+        loop {
+            let mut chunk = vec![0u8; BGZF_MAX_DATA_LEN];
+            let len = match decoder.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(len) => len,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(err) => return Err(err),
+            };
+            chunk.truncate(len);
+            self.tx.send(Ok(chunk)).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "native VCF scorer stopped reading",
+                )
+            })?;
+        }
+        self.tx.send(Ok(Vec::new())).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "native VCF scorer stopped reading",
+            )
+        })
+    }
+}
+
+/// Reads one BGZF block into `frame`.
+fn read_bgzf_frame<R: Read>(reader: &mut R, frame: &mut Vec<u8>) -> io::Result<FrameRead> {
+    frame.clear();
+    let header_len = read_up_to(reader, frame, BGZF_HEADER_LEN)?;
+    if header_len == 0 {
+        return Ok(FrameRead::Eof);
+    }
+    if header_len < BGZF_HEADER_LEN || !is_bgzf_header(frame) {
+        return Ok(FrameRead::Irregular);
+    }
+    let block_len = usize::from(u16::from_le_bytes([frame[16], frame[17]])) + 1;
+    if block_len < BGZF_HEADER_LEN + BGZF_TRAILER_LEN {
+        return Ok(FrameRead::Irregular);
+    }
+    let body_len = block_len - BGZF_HEADER_LEN;
+    if read_up_to(reader, frame, body_len)? < body_len {
+        return Ok(FrameRead::Irregular);
+    }
+    Ok(FrameRead::Block)
+}
+
+/// Appends up to `len` bytes from `reader` to `dst`, stopping short only at end of input.
+fn read_up_to<R: Read>(reader: &mut R, dst: &mut Vec<u8>, len: usize) -> io::Result<usize> {
+    let start = dst.len();
+    reader.take(len as u64).read_to_end(dst)?;
+    Ok(dst.len() - start)
+}
+
+fn is_bgzf_header(header: &[u8]) -> bool {
+    header[..4] == [0x1f, 0x8b, 0x08, 0x04]
+        && header[10..12] == [0x06, 0x00]
+        && header[12..14] == *b"BC"
+        && header[14..16] == [0x02, 0x00]
+}
+
+/// Inflates one canonical BGZF block into `block`, checking its length and CRC32.
+fn inflate_bgzf_block(
+    frame: &[u8],
+    decompressor: &mut Decompressor,
+    block: &mut Vec<u8>,
+) -> io::Result<()> {
+    let invalid = |message: &str| io::Error::new(io::ErrorKind::InvalidData, message.to_string());
+    let (header_and_data, trailer) = frame.split_at(frame.len() - BGZF_TRAILER_LEN);
+    let crc32 = u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
+    let data_len = u32::from_le_bytes([trailer[4], trailer[5], trailer[6], trailer[7]]) as usize;
+    if data_len > BGZF_MAX_DATA_LEN {
+        return Err(invalid("BGZF block is larger than 65536 bytes"));
+    }
+    block.resize(data_len, 0);
+    let written = decompressor
+        .deflate_decompress(&header_and_data[BGZF_HEADER_LEN..], block)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    if written != data_len {
+        return Err(invalid("BGZF block is shorter than its recorded length"));
+    }
+    let mut crc = Crc::new();
+    crc.update(block);
+    if crc.sum() != crc32 {
+        return Err(invalid("BGZF block data checksum mismatch"));
+    }
+    Ok(())
+}
+
+/// Splits an inflated block into its partial first line, the complete lines
+/// that survive [`is_skippable_record`], and its partial last line.
+fn split_block_lines(
+    block: &[u8],
+    rules_by_key: &AHashMap<VariantKey, Vec<ScoreRule>>,
+) -> BlockLines {
+    let Some(first_newline) = memchr(b'\n', block) else {
+        return BlockLines {
+            bytes: block.to_vec(),
+            head_len: block.len(),
+            tail_start: block.len(),
+            has_newline: false,
+        };
+    };
+    let last_newline = memrchr(b'\n', block).expect("a block with a first newline has a last one");
+    let mut bytes = Vec::with_capacity(first_newline + block.len() - last_newline);
+    bytes.extend_from_slice(&block[..=first_newline]);
+    let body = &block[first_newline + 1..=last_newline];
+    let mut line_start = 0usize;
+    for line_end in memchr_iter(b'\n', body) {
+        if !is_skippable_record(&body[line_start..line_end], rules_by_key) {
+            bytes.extend_from_slice(&body[line_start..=line_end]);
+        }
+        line_start = line_end + 1;
+    }
+    let tail_start = bytes.len();
+    bytes.extend_from_slice(&block[last_newline + 1..]);
+    BlockLines {
+        bytes,
+        head_len: first_newline + 1,
+        tail_start,
+        has_newline: true,
+    }
+}
+
+/// Whether `score_vcf_streaming` would read this record line without error and
+/// then skip it, so dropping it unread cannot change a score or an error.
+///
+/// `line` excludes its newline. The checks mirror noodles' `read_record` (valid
+/// UTF-8, seven tab-terminated fields) and the scorer's own tests before a key
+/// lookup: an unsupported contig, a telomeric position `0`, or a position no
+/// score mentions. Anything less certain, including a carriage return in the
+/// first two fields, which noodles may strip, is kept.
+fn is_skippable_record(line: &[u8], rules_by_key: &AHashMap<VariantKey, Vec<ScoreRule>>) -> bool {
+    let Ok(line) = std::str::from_utf8(line) else {
+        return false;
+    };
+    let mut fields = line.splitn(8, '\t');
+    let (Some(chromosome), Some(position), Some(_)) = (fields.next(), fields.next(), fields.nth(5))
+    else {
+        return false;
+    };
+    if chromosome.contains('\r') || position.contains('\r') {
+        return false;
+    }
+    let Ok(chr) = parse_chromosome_label(chromosome) else {
+        return true;
+    };
+    if position == "0" {
+        return true;
+    }
+    match position.parse::<usize>() {
+        Ok(start) if start > 0 => !rules_by_key.contains_key(&(chr, start as u32)),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1344,5 +1811,333 @@ mod tests {
         assert_eq!(result.score_variant_counts, [1]);
         assert_eq!(result.missing_counts, [0, 0]);
         assert_eq!(result.sum_scores, [2.0, 0.0]);
+    }
+
+    fn bgzf_block(data: &[u8]) -> Vec<u8> {
+        let mut encoder =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(data).expect("deflate");
+        let compressed = encoder.finish().expect("finish deflate");
+        let mut crc = Crc::new();
+        crc.update(data);
+        let block_len = BGZF_HEADER_LEN + compressed.len() + BGZF_TRAILER_LEN;
+        let mut block = vec![
+            0x1f, 0x8b, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x06, 0x00, b'B', b'C',
+            0x02, 0x00,
+        ];
+        block.extend_from_slice(&u16::try_from(block_len - 1).expect("BSIZE").to_le_bytes());
+        block.extend_from_slice(&compressed);
+        block.extend_from_slice(&crc.sum().to_le_bytes());
+        block.extend_from_slice(&u32::try_from(data.len()).expect("ISIZE").to_le_bytes());
+        block
+    }
+
+    /// BGZF blocks of at most `block_len` uncompressed bytes, then the empty EOF block.
+    fn bgzf_bytes(text: &[u8], block_len: usize) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for chunk in text.chunks(block_len) {
+            bytes.extend_from_slice(&bgzf_block(chunk));
+        }
+        bytes.extend_from_slice(&bgzf_block(&[]));
+        bytes
+    }
+
+    /// A cohort that exercises the prefilter: a header spanning many small
+    /// blocks, scored and unscored positions, multiallelic and DS records,
+    /// phased and haploid calls, telomeric and unsupported-contig records, and
+    /// '#' lines after the header.
+    fn prefilter_cohort() -> (String, String) {
+        let samples = 40usize;
+        let mut vcf = String::from(
+            "##fileformat=VCFv4.2\n##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n##FORMAT=<ID=DS,Number=A,Type=Float,Description=\"Alternate allele dosage\">\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT",
+        );
+        for sample in 0..samples {
+            vcf.push_str(&format!("\tsample_with_a_long_identifier_{sample}"));
+        }
+        vcf.push('\n');
+        let mut score = String::from("variant_id\teffect_allele\tother_allele\tScoreA\tScoreB\n");
+        let genotypes = ["0/0", "0/1", "1/1", "./.", "1|0", "0|1", "1/2", "2/2"];
+        for record in 0..400u32 {
+            let (chromosome, alt) = match record % 25 {
+                3 => ("chrUn_KI270302v1", "G"),
+                11 => ("X", "G"),
+                17 => ("22", "G,T"),
+                _ => ("22", "G"),
+            };
+            let position = if record % 40 == 5 {
+                0
+            } else {
+                1000 + 10 * record
+            };
+            if record % 60 == 1 {
+                vcf.push_str("#not_a_header\t1\t.\tA\tG\t.\tPASS\t.\tGT");
+                vcf.push_str(&"\t0/1".repeat(samples));
+                vcf.push('\n');
+            }
+            // Diploid dosages only: the haploid X calls cannot carry DS up to 1.8.
+            let with_ds = record % 4 == 1 && alt == "G" && chromosome != "X";
+            vcf.push_str(&format!(
+                "{chromosome}\t{position}\t.\tA\t{alt}\t.\tPASS\t.\t{}",
+                if with_ds { "GT:DS" } else { "GT" }
+            ));
+            for sample in 0..samples {
+                let index = (record as usize * 7 + sample * 3) % genotypes.len();
+                let genotype = if chromosome == "X" {
+                    ["0", "1", "."][index % 3]
+                } else if alt == "G" {
+                    genotypes[index % 6]
+                } else {
+                    genotypes[index]
+                };
+                vcf.push('\t');
+                vcf.push_str(genotype);
+                if with_ds {
+                    vcf.push_str(&format!(":{}", (index % 5) as f64 * 0.45));
+                }
+            }
+            vcf.push('\n');
+            if (record % 3 == 1 || record % 7 == 2) && chromosome != "chrUn_KI270302v1" {
+                score.push_str(&format!(
+                    "{chromosome}:{position}\tG\tA\t{}\t-0.5\n",
+                    0.25 + f64::from(record) * 1e-3
+                ));
+                if alt == "G,T" {
+                    score.push_str(&format!("{chromosome}:{position}\tA\tT\t0.75\t0.125\n"));
+                }
+            }
+        }
+        (vcf, score)
+    }
+
+    fn assert_same_native_result(
+        expected: &NativeVcfScoreResult,
+        actual: &NativeVcfScoreResult,
+        context: &str,
+    ) {
+        assert_eq!(expected.person_iids, actual.person_iids, "{context}");
+        assert_eq!(expected.score_names, actual.score_names, "{context}");
+        assert_eq!(
+            expected.score_variant_counts, actual.score_variant_counts,
+            "{context}"
+        );
+        assert_eq!(expected.missing_counts, actual.missing_counts, "{context}");
+        assert_eq!(
+            expected.matched_variants, actual.matched_variants,
+            "{context}"
+        );
+        let bits = |values: &[f64]| {
+            values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            bits(&expected.sum_scores),
+            bits(&actual.sum_scores),
+            "{context}"
+        );
+    }
+
+    #[test]
+    fn bgzf_prefilter_scores_match_plain_vcf_at_any_block_size() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (vcf, score) = prefilter_cohort();
+        let score_path = dir.path().join("score.gnomon.tsv");
+        std::fs::write(&score_path, &score).expect("write score");
+
+        for text in [vcf.as_str(), vcf.trim_end_matches('\n')] {
+            let plain_path = dir.path().join("cohort.vcf");
+            std::fs::write(&plain_path, text).expect("write vcf");
+            let expected =
+                score_vcf_streaming(&plain_path, std::slice::from_ref(&score_path), None, None)
+                    .expect("plain score");
+            assert!(expected.matched_variants > 100);
+
+            for block_len in [1, 2, 7, 100, 4096, 65536] {
+                let bgzf_path = dir.path().join("cohort.vcf.gz");
+                std::fs::write(&bgzf_path, bgzf_bytes(text.as_bytes(), block_len))
+                    .expect("write bgzf");
+                let actual =
+                    score_vcf_streaming(&bgzf_path, std::slice::from_ref(&score_path), None, None)
+                        .expect("bgzf score");
+                assert_same_native_result(
+                    &expected,
+                    &actual,
+                    &format!(
+                        "block_len={block_len} trailing_newline={}",
+                        text.ends_with('\n')
+                    ),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bgzf_prefilter_rejects_the_records_plain_vcf_rejects() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let score_path = dir.path().join("score.gnomon.tsv");
+        std::fs::write(
+            &score_path,
+            "variant_id\teffect_allele\tother_allele\tScoreA\n22:100\tG\tA\t1\n",
+        )
+        .expect("write score");
+        let header =
+            b"##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts1\n";
+        let unscored = b"22\t200\t.\tA\tG\t.\tPASS\t.\tGT\t0/1\n";
+        let scored = b"22\t100\t.\tA\tG\t.\tPASS\t.\tGT\t0/1\n";
+        let malformed: [&[u8]; 6] = [
+            b"22\tnot_a_position\t.\tA\tG\t.\tPASS\t.\tGT\t0/1\n",
+            b"22\t00\t.\tA\tG\t.\tPASS\t.\tGT\t0/1\n",
+            b"22\t300\t.\tA\tG\n",
+            b"\n",
+            b"#22\t300\n",
+            b"22\t300\t.\tA\tG\t.\tPASS\t.\tGT\t0/\xff\n",
+        ];
+        for bad in malformed {
+            let context = String::from_utf8_lossy(bad).into_owned();
+            let mut vcf = header.to_vec();
+            vcf.extend_from_slice(unscored);
+            vcf.extend_from_slice(bad);
+            vcf.extend_from_slice(scored);
+
+            let plain_path = dir.path().join("malformed.vcf");
+            std::fs::write(&plain_path, &vcf).expect("write vcf");
+            assert!(
+                score_vcf_streaming(&plain_path, std::slice::from_ref(&score_path), None, None)
+                    .is_err(),
+                "plain {context:?}"
+            );
+            for block_len in [3, 65536] {
+                let bgzf_path = dir.path().join("malformed.vcf.gz");
+                std::fs::write(&bgzf_path, bgzf_bytes(&vcf, block_len)).expect("write bgzf");
+                assert!(
+                    score_vcf_streaming(&bgzf_path, std::slice::from_ref(&score_path), None, None)
+                        .is_err(),
+                    "bgzf block_len={block_len} {context:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn plain_gzip_members_are_decoded_without_the_prefilter() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (vcf, score) = prefilter_cohort();
+        let score_path = dir.path().join("score.gnomon.tsv");
+        std::fs::write(&score_path, &score).expect("write score");
+        let plain_path = dir.path().join("cohort.vcf");
+        std::fs::write(&plain_path, &vcf).expect("write vcf");
+        let expected =
+            score_vcf_streaming(&plain_path, std::slice::from_ref(&score_path), None, None)
+                .expect("plain score");
+
+        let gzip = |text: &[u8]| {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(text).expect("gzip");
+            encoder.finish().expect("finish gzip")
+        };
+        let split = vcf.len() / 2;
+        let mut mixed = Vec::new();
+        for chunk in vcf.as_bytes()[..split].chunks(97) {
+            mixed.extend_from_slice(&bgzf_block(chunk));
+        }
+        mixed.extend_from_slice(&gzip(&vcf.as_bytes()[split..]));
+
+        for (label, bytes) in [("gzip", gzip(vcf.as_bytes())), ("bgzf then gzip", mixed)] {
+            let path = dir.path().join("fallback.vcf.gz");
+            std::fs::write(&path, &bytes).expect("write gzip");
+            let actual = score_vcf_streaming(&path, std::slice::from_ref(&score_path), None, None)
+                .expect("gzip score");
+            assert_same_native_result(&expected, &actual, label);
+        }
+    }
+
+    #[test]
+    fn corrupt_or_truncated_bgzf_streams_are_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (vcf, score) = prefilter_cohort();
+        let score_path = dir.path().join("score.gnomon.tsv");
+        std::fs::write(&score_path, &score).expect("write score");
+
+        let blocks: Vec<Vec<u8>> = vcf.as_bytes().chunks(512).map(bgzf_block).collect();
+        let mut corrupt = blocks.clone();
+        let middle = corrupt.len() / 2;
+        let crc_offset = corrupt[middle].len() - BGZF_TRAILER_LEN;
+        corrupt[middle][crc_offset] ^= 0xff;
+        let mut truncated = blocks.concat();
+        truncated.truncate(truncated.len() - 100);
+
+        for (label, bytes) in [("corrupt", corrupt.concat()), ("truncated", truncated)] {
+            let mut sink = Vec::new();
+            assert!(
+                MultiGzDecoder::new(&bytes[..])
+                    .read_to_end(&mut sink)
+                    .is_err(),
+                "flate2 also rejects the {label} stream"
+            );
+            let path = dir.path().join("broken.vcf.gz");
+            std::fs::write(&path, &bytes).expect("write bgzf");
+            assert!(
+                score_vcf_streaming(&path, std::slice::from_ref(&score_path), None, None).is_err(),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn skippable_records_are_read_cleanly_and_skipped_by_the_scorer() {
+        let mut rules_by_key: AHashMap<VariantKey, Vec<ScoreRule>> = AHashMap::new();
+        rules_by_key.insert((22, 100), Vec::new());
+        let cases: [(&[u8], bool); 13] = [
+            (b"22\t100\t.\tA\tG\t.\tPASS\t.\tGT\t0/1", false),
+            (b"22\t101\t.\tA\tG\t.\tPASS\t.\tGT\t0/1", true),
+            (b"chr22\t101\t.\tA\tG\t.\tPASS\t.", true),
+            (b"22\t101\t.\tA\tG\t.\tPASS", false),
+            (b"22\t0\t.\tA\tG\t.\tPASS\t.\tGT\t0/1", true),
+            (b"22\t00\t.\tA\tG\t.\tPASS\t.\tGT\t0/1", false),
+            (b"22\t+101\t.\tA\tG\t.\tPASS\t.\tGT\t0/1", true),
+            (b"22\tabc\t.\tA\tG\t.\tPASS\t.\tGT\t0/1", false),
+            (b"HLA-A*01:01\tabc\t.\tA\tG\t.\tPASS\t.\tGT\t0/1", true),
+            (b"#22\t101\t.\tA\tG\t.\tPASS\t.", true),
+            (b"22\r\t101\t.\tA\tG\t.\tPASS\t.\tGT\t0/1", false),
+            (b"22\t101\t.\tA\tG\t.\tPASS\t.\tGT\t0/\xff", false),
+            (b"", false),
+        ];
+        let header =
+            b"##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts1\n";
+        for (line, expected) in cases {
+            let context = String::from_utf8_lossy(line).into_owned();
+            assert_eq!(
+                is_skippable_record(line, &rules_by_key),
+                expected,
+                "{context:?}"
+            );
+            if !expected {
+                continue;
+            }
+            // Dropping a line is only sound if noodles reads it and the scorer
+            // skips it. The prefilter only judges lines after the first record,
+            // so one precedes it here too.
+            let mut stream = header.to_vec();
+            stream.extend_from_slice(b"22\t1\t.\tA\tG\t.\tPASS\t.\tGT\t0/1\n");
+            stream.extend_from_slice(line);
+            stream.push(b'\n');
+            let mut reader = VcfReader::new(&stream[..]);
+            reader.read_header().expect("header");
+            let mut record = noodles_vcf::Record::default();
+            reader.read_record(&mut record).expect("first record");
+            reader
+                .read_record(&mut record)
+                .unwrap_or_else(|err| panic!("{context:?}: {err}"));
+            let skipped = match parse_chromosome_label(record.reference_sequence_name()) {
+                Err(_) => true,
+                Ok(chr) => record.variant_start().is_none_or(|start| {
+                    let start = start.unwrap_or_else(|err| panic!("{context:?}: {err}"));
+                    !rules_by_key.contains_key(&(chr, start.get() as u32))
+                }),
+            };
+            assert!(skipped, "{context:?}");
+        }
     }
 }

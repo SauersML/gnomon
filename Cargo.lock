@@ -4016,8 +4016,10 @@ dependencies = [
  "hex",
  "indicatif 0.18.4",
  "infer_sex",
+ "libdeflater",
  "log",
  "logtest",
+ "memchr",
  "memmap2",
  "natord",
  "ndarray 0.17.2",
@@ -5294,6 +5296,24 @@ name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
+
+[[package]]
+name = "libdeflate-sys"
+version = "1.26.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6949d73714ba8c32d2757405b89c94e427f64f078a4041debe07e1b8e9e850e9"
+dependencies = [
+ "cc",
+]
+
+[[package]]
+name = "libdeflater"
+version = "1.26.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b72b274104f747cb65358c918e38c6cd4a69937937a36c8ad3cfd516c9c471e"
+dependencies = [
+ "libdeflate-sys",
+]
 
 [[package]]
 name = "libfuzzer-sys"
