@@ -1,5 +1,33 @@
 # Score and packed projection performance
 
+## Full-marker revision
+
+The earlier 8,192-marker fixtures below are development probes, not realistic
+whole-genome workloads. `real_genome_probe.py` preserves all 1,799,239 array
+markers for scoring and all 562,259 reference markers for projection against
+a 570,709-marker, 20-PC model. Larger reference cohorts repeat samples;
+they exercise scaling, not independent biobank genetic diversity.
+
+Narrow panels now vectorize across 32 people directly from packed calls,
+accumulating scores in f64 without genotype expansion or cohort-sized scratch.
+Panels with more than four scores use a packed four-by-four transpose before
+dosage expansion. Arbitrary keep subsets retain their indexed gather path.
+Projection marker matching borrows model strings and indexes each coordinate
+once, preserving exact/wildcard/swap priority and requested-marker order.
+
+On one pinned Milan core, three-run median compute probes (256-variant blocks,
+50,000 people) improved 6.01×, 4.41×, 3.03×, and 3.14× for 1, 2, 3, and 4
+scores respectively. These are kernel measurements, not whole-genome command
+speedups. The nine-score probe improved 1.25× at 50,000 people and 1.23× at
+250,000. All 16 focused tests passed, including an independent f64 oracle,
+sparse score membership, missing counts, sample/variant tails, and marker
+matching errors. Production release compilation passed on MSI using the warm
+cache; no local builds or code execution were used.
+
+Source and reusable scripts live in the normal checkout. MSI build artifacts
+and raw measurements now live under
+`/projects/standard/hsiehph/sauer354/gnomon/target/score-map`.
+
 The next projection revision compiles four variants into one 256-row lookup,
 with at most 256 KiB of table scratch plus 8 KiB for construction and 1 KiB
 per active sample tile. Cohorts below 1,024 people and panels above 64 PCs

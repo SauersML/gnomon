@@ -2391,21 +2391,23 @@ fn select_plink_variant_records_by_keys(
     mut iter: PlinkVariantRecordIter,
     requested_keys: &[VariantKey],
 ) -> Result<VariantSelection, PlinkIoError> {
-    let mut seen = HashSet::with_capacity(requested_keys.len());
+    // Index coordinates once and borrow the model's strings. Allele candidates
+    // at the same locus form short linked lists in contiguous storage, avoiding
+    // three cloned string-key maps and three probes for every dataset marker.
+    let mut positions = ahash::AHashMap::with_capacity(requested_keys.len());
     let mut unique_keys = Vec::with_capacity(requested_keys.len());
+    let mut next_at_position = Vec::with_capacity(requested_keys.len());
     for key in requested_keys {
-        if seen.insert(key.clone()) {
-            unique_keys.push(key.clone());
+        let coordinate = (key.chromosome.as_str(), key.position);
+        let head = positions.get(&coordinate).copied().unwrap_or(usize::MAX);
+        let mut slot = head;
+        while slot != usize::MAX && unique_keys[slot] != key {
+            slot = next_at_position[slot];
         }
-    }
-
-    let mut exact_positions = HashMap::with_capacity(unique_keys.len());
-    let mut wildcard_positions = HashMap::with_capacity(unique_keys.len());
-    for (slot, key) in unique_keys.iter().cloned().enumerate() {
-        if key.alleles.is_some() {
-            exact_positions.entry(key).or_insert(slot);
-        } else {
-            wildcard_positions.entry(key).or_insert(slot);
+        if slot == usize::MAX {
+            positions.insert(coordinate, unique_keys.len());
+            next_at_position.push(head);
+            unique_keys.push(key);
         }
     }
 
@@ -2415,59 +2417,38 @@ fn select_plink_variant_records_by_keys(
     let mut matched_kinds = vec![MatchKind::Exact; requested_unique];
     let mut dataset_index = 0usize;
 
-    while let Some(result) = iter.next() {
-        let record = result?;
-        let position =
-            record
-                .position
-                .parse::<u64>()
-                .map_err(|err| PlinkIoError::MalformedRecord {
-                    path: iter.path().display().to_string(),
-                    line: iter.line(),
-                    message: format!(
-                        "invalid position '{}' for variant {}: {err}",
-                        record.position, record.identifier
-                    ),
-                })?;
-
-        let key = VariantKey::new_with_alleles(
-            &record.chromosome,
-            position,
-            &record.allele1,
-            &record.allele2,
-        );
-        let wildcard = VariantKey::new(&record.chromosome, position);
-        let swap_key = key
-            .alleles
-            .as_ref()
-            .map(|(reference, alternate)| VariantKey {
-                chromosome: key.chromosome.clone(),
-                position: key.position,
-                alleles: Some((alternate.clone(), reference.clone())),
-            });
-
-        let matched = exact_positions
-            .get(&key)
+    while let Some(result) = iter.next_key() {
+        let key = result?;
+        let mut slot = positions
+            .get(&(key.chromosome.as_str(), key.position))
             .copied()
-            .map(|slot| (slot, MatchKind::Exact))
-            .or_else(|| {
-                wildcard_positions
-                    .get(&wildcard)
-                    .copied()
-                    .map(|slot| (slot, MatchKind::Wildcard))
-            })
-            .or_else(|| {
-                swap_key
+            .unwrap_or(usize::MAX);
+        let mut matched = None;
+        while slot != usize::MAX {
+            let requested = unique_keys[slot];
+            if requested.alleles == key.alleles {
+                matched = Some((slot, MatchKind::Exact));
+                break;
+            }
+            if requested.alleles.is_none() {
+                matched = Some((slot, MatchKind::Wildcard));
+            } else if matched.is_none()
+                && requested
+                    .alleles
                     .as_ref()
-                    .and_then(|swapped| exact_positions.get(swapped).copied())
-                    .map(|slot| (slot, MatchKind::Swap))
-            });
+                    .zip(key.alleles.as_ref())
+                    .is_some_and(|((a, b), (r, s))| a == s && b == r)
+            {
+                matched = Some((slot, MatchKind::Swap));
+            }
+            slot = next_at_position[slot];
+        }
 
         if let Some((slot, kind)) = matched
             && matched_indices[slot].is_none()
         {
             matched_indices[slot] = Some(dataset_index);
-            matched_keys[slot] = Some(selected_model_key(kind, &unique_keys[slot], key));
+            matched_keys[slot] = Some(selected_model_key(kind, unique_keys[slot], key));
             matched_kinds[slot] = kind;
         }
 
@@ -2486,7 +2467,7 @@ fn select_plink_variant_records_by_keys(
             keys.push(stored_key);
             match_kinds.push(matched_kinds[slot]);
         } else {
-            missing.push(requested_key);
+            missing.push(requested_key.clone());
         }
     }
 
@@ -2546,10 +2527,11 @@ pub struct PlinkVariantRecord {
     pub allele2: String,
 }
 
-impl Iterator for PlinkVariantRecordIter {
-    type Item = Result<PlinkVariantRecord, PlinkIoError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
+impl PlinkVariantRecordIter {
+    fn next_with<T>(
+        &mut self,
+        parse: impl FnOnce([&str; 6], &Path, usize) -> Result<T, PlinkIoError>,
+    ) -> Option<Result<T, PlinkIoError>> {
         loop {
             match self.reader.next_line() {
                 Ok(Some(line)) => {
@@ -2557,13 +2539,17 @@ impl Iterator for PlinkVariantRecordIter {
                     if line.iter().all(u8::is_ascii_whitespace) {
                         continue;
                     }
-                    let path = self.path.display().to_string();
                     let text = match str::from_utf8(line) {
                         Ok(s) => s,
-                        Err(err) => return Some(Err(PlinkIoError::Utf8 { path, source: err })),
+                        Err(err) => {
+                            return Some(Err(PlinkIoError::Utf8 {
+                                path: self.path.display().to_string(),
+                                source: err,
+                            }));
+                        }
                     };
                     let mut fields = text.split_whitespace();
-                    let rec = match (
+                    let fields = match (
                         fields.next(),
                         fields.next(),
                         fields.next(),
@@ -2572,29 +2558,58 @@ impl Iterator for PlinkVariantRecordIter {
                         fields.next(),
                     ) {
                         (Some(chr), Some(id), Some(cm), Some(pos), Some(a1), Some(a2)) => {
-                            PlinkVariantRecord {
-                                chromosome: chr.to_string(),
-                                identifier: id.to_string(),
-                                genetic_distance: cm.to_string(),
-                                position: pos.to_string(),
-                                allele1: a1.to_string(),
-                                allele2: a2.to_string(),
-                            }
+                            [chr, id, cm, pos, a1, a2]
                         }
                         _ => {
                             return Some(Err(PlinkIoError::MalformedRecord {
-                                path,
+                                path: self.path.display().to_string(),
                                 line: self.line,
                                 message: "expected 6 whitespace-delimited fields".to_string(),
                             }));
                         }
                     };
-                    return Some(Ok(rec));
+                    return Some(parse(fields, &self.path, self.line));
                 }
                 Ok(None) => return None,
                 Err(err) => return Some(Err(err.into())),
             }
         }
+    }
+
+    fn next_key(&mut self) -> Option<Result<VariantKey, PlinkIoError>> {
+        self.next_with(|fields, path, line| {
+            let position =
+                fields[3]
+                    .parse::<u64>()
+                    .map_err(|err| PlinkIoError::MalformedRecord {
+                        path: path.display().to_string(),
+                        line,
+                        message: format!(
+                            "invalid position '{}' for variant {}: {err}",
+                            fields[3], fields[1]
+                        ),
+                    })?;
+            Ok(VariantKey::new_with_alleles(
+                fields[0], position, fields[4], fields[5],
+            ))
+        })
+    }
+}
+
+impl Iterator for PlinkVariantRecordIter {
+    type Item = Result<PlinkVariantRecord, PlinkIoError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_with(|fields, _, _| {
+            Ok(PlinkVariantRecord {
+                chromosome: fields[0].to_owned(),
+                identifier: fields[1].to_owned(),
+                genetic_distance: fields[2].to_owned(),
+                position: fields[3].to_owned(),
+                allele1: fields[4].to_owned(),
+                allele2: fields[5].to_owned(),
+            })
+        })
     }
 }
 
@@ -6231,6 +6246,100 @@ mod tests {
     use std::io::{Read, Write};
     use std::path::Path;
     use tempfile::tempdir;
+
+    #[test]
+    fn packed_marker_selection_preserves_allele_priority_and_record_errors() {
+        struct Lines {
+            rows: Vec<Vec<u8>>,
+            cursor: usize,
+        }
+        impl TextSource for Lines {
+            fn next_line(&mut self) -> Result<Option<&[u8]>, crate::pipeline_error::PipelineError> {
+                let row = self.rows.get(self.cursor);
+                self.cursor += 1;
+                Ok(row.map(Vec::as_slice))
+            }
+        }
+        fn records(text: &[u8]) -> PlinkVariantRecordIter {
+            PlinkVariantRecordIter::new(
+                PathBuf::from("fixture.bim"),
+                Box::new(Lines {
+                    rows: text.split(|b| *b == b'\n').map(<[u8]>::to_vec).collect(),
+                    cursor: 0,
+                }),
+            )
+        }
+        let exact = VariantKey::new_with_alleles("1", 10, "A", "G");
+        let wildcard = VariantKey::new("1", 10);
+        let reverse = VariantKey::new_with_alleles("1", 10, "G", "A");
+        let swapped = VariantKey::new_with_alleles("2", 20, "T", "C");
+        let missing = VariantKey::new_with_alleles("3", 30, "A", "C");
+        let requested = vec![
+            swapped.clone(),
+            wildcard.clone(),
+            exact.clone(),
+            reverse.clone(),
+            exact.clone(),
+            missing.clone(),
+        ];
+        let result = select_plink_variant_records_by_keys(records(
+            b"\nchr1 rs1 0 10 a g\n1 duplicate 0 10 A G\n1 rs2 0 10 G A\n1 rs3 0 10 C T\n2 rs4 0 20 C T\n"
+        ), &requested).unwrap();
+        assert_eq!(result.requested_unique, 5);
+        assert_eq!(result.indices, vec![4, 3, 0, 2]);
+        assert_eq!(
+            result.keys,
+            vec![
+                swapped,
+                VariantKey::new_with_alleles("1", 10, "C", "T"),
+                exact,
+                reverse
+            ]
+        );
+        assert_eq!(
+            result.match_kinds,
+            vec![
+                MatchKind::Swap,
+                MatchKind::Wildcard,
+                MatchKind::Exact,
+                MatchKind::Exact
+            ]
+        );
+        assert_eq!(result.missing, vec![missing]);
+        // An already-filled exact match continues to shadow a wildcard slot.
+        let shadow = select_plink_variant_records_by_keys(
+            records(b"1 x 0 10 A G\n1 y 0 10 A G"),
+            &requested,
+        )
+        .unwrap();
+        assert_eq!(shadow.indices, vec![0]);
+        assert!(shadow.missing.contains(&wildcard));
+        for text in [b"\n1 x 0 bad A G".as_slice(), b"\n1 x 0 1 A"] {
+            assert!(matches!(
+                records(text).next_key(),
+                Some(Err(PlinkIoError::MalformedRecord { line: 2, .. }))
+            ));
+        }
+        assert!(matches!(
+            records(b"1 x 0 1 A \xff").next_key(),
+            Some(Err(PlinkIoError::Utf8 { .. }))
+        ));
+        let record = records(b"chr1 name 0.5 10 a g extra")
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                record.chromosome.as_str(),
+                record.identifier.as_str(),
+                record.genetic_distance.as_str(),
+                record.position.as_str(),
+                record.allele1.as_str(),
+                record.allele2.as_str()
+            ),
+            ("chr1", "name", "0.5", "10", "a", "g")
+        );
+    }
 
     #[test]
     fn fit_artifacts_append_to_the_full_user_prefix() {
