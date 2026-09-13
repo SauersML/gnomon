@@ -5797,6 +5797,10 @@ struct LdBitplanes {
     present: Vec<u64>,
     het: Vec<u64>,
     alt: Vec<u64>,
+    /// Population counts of the three planes over the whole cohort.
+    observed: u64,
+    het_count: u64,
+    alt_count: u64,
 }
 
 impl LdBitplanes {
@@ -5804,6 +5808,24 @@ impl LdBitplanes {
     /// unspecified, the moment a finite value other than `0`, `1` or `2` is
     /// seen; non-finite values are missing, as they are everywhere in the fit.
     fn fill(&mut self, column: &[f64]) -> bool {
+        if !self.fill_planes(column) {
+            return false;
+        }
+        let count =
+            |plane: &[u64]| -> u64 { plane.iter().map(|word| word.count_ones() as u64).sum() };
+        self.observed = count(&self.present);
+        self.het_count = count(&self.het);
+        self.alt_count = count(&self.alt);
+        true
+    }
+
+    /// Every sample observed, so restricting a partner to this marker's
+    /// observed samples leaves the partner untouched.
+    fn is_complete(&self, n_samples: usize) -> bool {
+        self.observed == n_samples as u64
+    }
+
+    fn fill_planes(&mut self, column: &[f64]) -> bool {
         let words = column.len().div_ceil(64);
         self.present.clear();
         self.present.resize(words, 0);
@@ -5893,10 +5915,14 @@ struct LdPairStats {
 }
 
 /// The pairs of one marker `i` with every earlier marker it is paired with:
-/// `stats[t]` is the pair `(i, first_partner + t)`.
+/// `r2[t]` is [`ld_pair_r2_estimate`] of the pair `(i, first_partner + t)`.
+///
+/// The estimate is a pure function of the pair, so every window that holds
+/// both markers reads the same number; caching it rather than the statistics
+/// it came from spares each window recomputing it.
 struct LdPairRow {
     first_partner: usize,
-    stats: Vec<LdPairStats>,
+    r2: Vec<f64>,
 }
 
 /// Complete-pairs statistics of two hard-call markers, from bit counts.
@@ -5906,7 +5932,85 @@ struct LdPairRow {
 /// `het + 2·alt`, so its sum is `|het| + 2|alt|`, its sum of squares
 /// `|het| + 4|alt|`, and the cross-product breaks into the four het/alt
 /// intersections. All of it is exact integer arithmetic.
-fn hard_call_pair_stats(i: &LdBitplanes, j: &LdBitplanes) -> LdPairStats {
+///
+/// A marker observed in every sample restricts nothing, so its partner's
+/// marginal counts are the partner's cohort totals and the kernel need not
+/// count them again. Every path produces the same integers.
+fn hard_call_pair_stats(i: &LdBitplanes, j: &LdBitplanes, n_samples: usize) -> LdPairStats {
+    let (shared, het_i, alt_i, het_j, alt_j, (het_het, het_alt, alt_alt)) =
+        match (i.is_complete(n_samples), j.is_complete(n_samples)) {
+            (true, true) => (
+                i.observed,
+                i.het_count,
+                i.alt_count,
+                j.het_count,
+                j.alt_count,
+                hard_call_cross_counts(i, j),
+            ),
+            (true, false) => {
+                let (het_i, alt_i) = hard_call_counts_within(i, &j.present);
+                (
+                    j.observed,
+                    het_i,
+                    alt_i,
+                    j.het_count,
+                    j.alt_count,
+                    hard_call_cross_counts(i, j),
+                )
+            }
+            (false, true) => {
+                let (het_j, alt_j) = hard_call_counts_within(j, &i.present);
+                (
+                    i.observed,
+                    i.het_count,
+                    i.alt_count,
+                    het_j,
+                    alt_j,
+                    hard_call_cross_counts(i, j),
+                )
+            }
+            (false, false) => return hard_call_pair_stats_masked(i, j),
+        };
+
+    LdPairStats {
+        count: shared as f64,
+        sum_i: (het_i + 2 * alt_i) as f64,
+        sum_j: (het_j + 2 * alt_j) as f64,
+        sq_i: (het_i + 4 * alt_i) as f64,
+        sq_j: (het_j + 4 * alt_j) as f64,
+        cross: (het_het + 2 * het_alt + 4 * alt_alt) as f64,
+    }
+}
+
+/// The het/het, mixed and alt/alt intersection counts of two markers.
+///
+/// Each plane already lies inside its own marker's `present`, so every
+/// intersection lies inside the shared samples without masking.
+fn hard_call_cross_counts(i: &LdBitplanes, j: &LdBitplanes) -> (u64, u64, u64) {
+    let mut het_het = 0u64;
+    let mut het_alt = 0u64;
+    let mut alt_alt = 0u64;
+    for (((&hi, &ai), &hj), &aj) in i.het.iter().zip(&i.alt).zip(&j.het).zip(&j.alt) {
+        het_het += (hi & hj).count_ones() as u64;
+        het_alt += ((hi & aj) | (ai & hj)).count_ones() as u64;
+        alt_alt += (ai & aj).count_ones() as u64;
+    }
+    (het_het, het_alt, alt_alt)
+}
+
+/// `|het|` and `|alt|` of `planes` counted only over the samples in `mask`.
+fn hard_call_counts_within(planes: &LdBitplanes, mask: &[u64]) -> (u64, u64) {
+    let mut het = 0u64;
+    let mut alt = 0u64;
+    for ((&h, &a), &m) in planes.het.iter().zip(&planes.alt).zip(mask) {
+        het += (h & m).count_ones() as u64;
+        alt += (a & m).count_ones() as u64;
+    }
+    (het, alt)
+}
+
+/// [`hard_call_pair_stats`] for two markers that both have missing calls.
+fn hard_call_pair_stats_masked(i: &LdBitplanes, j: &LdBitplanes) -> LdPairStats {
     let mut shared = 0u64;
     let mut het_i = 0u64;
     let mut alt_i = 0u64;
@@ -6018,7 +6122,9 @@ fn dosage_pair_stats(
 
 fn ld_pair_stats(i: &LdVariantCodes, j: &LdVariantCodes, n_samples: usize) -> LdPairStats {
     match (i, j) {
-        (LdVariantCodes::HardCall(i), LdVariantCodes::HardCall(j)) => hard_call_pair_stats(i, j),
+        (LdVariantCodes::HardCall(i), LdVariantCodes::HardCall(j)) => {
+            hard_call_pair_stats(i, j, n_samples)
+        }
         (
             LdVariantCodes::Dosage {
                 values: values_i,
@@ -6073,20 +6179,24 @@ fn ld_pair_r2_estimate(stats: &LdPairStats) -> f64 {
 }
 
 /// Solves the ridge-regularized LD system whose off-diagonal entries are
-/// already in `system`, for the centre's weight.
+/// already in `system`, and writes the weight of every centre that shares it:
+/// `weights[t]` is the centre at row `first_center + t`.
+///
+/// A window is a function of its range alone, so centres whose ranges agree
+/// solve the identical system, and the one factorization serves all of them.
 fn solve_ld_system(
     mut system: MatMut<'_, f64>,
     mut rhs: MatMut<'_, f64>,
-    center: usize,
+    first_center: usize,
+    weights: &mut [f64],
     ridge: f64,
-) -> f64 {
+) {
     let size = system.nrows();
-    if size == 0 || center >= size {
-        return 1.0;
-    }
-
     let mut adjusted_ridge = ridge;
     for attempt in 0..2 {
+        if size == 0 {
+            break;
+        }
         for i in 0..size {
             system[(i, i)] = 1.0 + adjusted_ridge;
             rhs[(i, 0)] = 1.0;
@@ -6095,32 +6205,39 @@ fn solve_ld_system(
         match FaerLlt::new(system.as_ref(), Side::Lower) {
             Ok(factor) => {
                 let solution = factor.solve(rhs.as_ref());
-                let mut weight_sq = solution[(center, 0)];
-                if !weight_sq.is_finite() || weight_sq <= 0.0 {
-                    weight_sq = 1.0;
+                for (offset, weight) in weights.iter_mut().enumerate() {
+                    let center = first_center + offset;
+                    if center >= size {
+                        *weight = 1.0;
+                        continue;
+                    }
+                    let mut weight_sq = solution[(center, 0)];
+                    if !weight_sq.is_finite() || weight_sq <= 0.0 {
+                        weight_sq = 1.0;
+                    }
+                    *weight = weight_sq.sqrt().max(MIN_LD_WEIGHT);
                 }
-                return weight_sq.sqrt().max(MIN_LD_WEIGHT);
+                return;
             }
             Err(_) => {
                 if attempt == 0 {
                     adjusted_ridge *= 10.0;
-                    continue;
-                } else {
-                    return 1.0;
                 }
             }
         }
     }
 
-    1.0
+    weights.fill(1.0);
 }
 
 /// The streaming LD-weight pass.
 ///
 /// Every pair of markers that any window brings together has its
 /// complete-pairs statistics computed exactly once, when the later of the two
-/// arrives, and a centre's system is then assembled from those cached pairs
-/// instead of from a fresh traversal of the cohort. The previous design
+/// arrives, and reduced to its r² estimate there. A window's system is then
+/// assembled from those cached estimates instead of from a fresh traversal of
+/// the cohort, and factored once for every centre it is the window of. The
+/// previous design
 /// recomputed four `n × w × w` products per centre — the same pairs, `w` times
 /// over, against every sample — and at 220k samples that was the whole cost of
 /// the fit.
@@ -6223,13 +6340,15 @@ impl LdWeightStream {
             let pair_row = |k: usize| {
                 let partners = schedule.partners(k);
                 let codes = &ring[k - ring_base];
-                let stats = partners
+                let r2 = partners
                     .clone()
-                    .map(|j| ld_pair_stats(codes, &ring[j - ring_base], n_samples))
+                    .map(|j| {
+                        ld_pair_r2_estimate(&ld_pair_stats(codes, &ring[j - ring_base], n_samples))
+                    })
                     .collect();
                 LdPairRow {
                     first_partner: partners.start,
-                    stats,
+                    r2,
                 }
             };
             let rows: Vec<LdPairRow> = if parallel {
@@ -6285,8 +6404,29 @@ impl LdWeightStream {
         let rows = &self.rows;
         let rows_base = self.rows_base;
         let ridge = self.ridge;
-        let solve_centre = |centre: usize| -> Result<f64, HwePcaError> {
-            let window = schedule.window(centre);
+
+        // Base-pair windows move only when a marker enters or leaves the span,
+        // so runs of consecutive centres share one range; on a 562k-marker
+        // microarray at 500 kbp that is two centres in five. Ranges never
+        // decrease along the stream, which makes every shared range one run.
+        let mut groups: Vec<(Range<usize>, &mut [f64])> = Vec::new();
+        let mut unsolved = &mut self.weights[next..ready_end];
+        let mut group_start = next;
+        while group_start < ready_end {
+            let window = schedule.window(group_start);
+            let mut group_end = group_start + 1;
+            while group_end < ready_end && schedule.window(group_end) == window {
+                group_end += 1;
+            }
+            let (group_weights, rest) =
+                std::mem::take(&mut unsolved).split_at_mut(group_end - group_start);
+            groups.push((group_start..group_end, group_weights));
+            unsolved = rest;
+            group_start = group_end;
+        }
+
+        let solve_group = |(centres, weights): (Range<usize>, &mut [f64])| {
+            let window = schedule.window(centres.start);
             let size = window.len();
             let mut system = Mat::<f64>::zeros(size, size);
             let mut rhs = Mat::<f64>::zeros(size, 1);
@@ -6300,37 +6440,32 @@ impl LdWeightStream {
                     ))?;
                 for j in 0..i {
                     let marker_j = window.start + j;
-                    let stats = marker_j
+                    let value = *marker_j
                         .checked_sub(row.first_partner)
-                        .and_then(|offset| row.stats.get(offset))
+                        .and_then(|offset| row.r2.get(offset))
                         .ok_or(HwePcaError::InvalidInput(
                             "LD pair cache holds no statistics for a pair its window needs",
                         ))?;
-                    let value = ld_pair_r2_estimate(stats);
                     system[(i, j)] = value;
                     system[(j, i)] = value;
                 }
             }
-            Ok(solve_ld_system(
+            solve_ld_system(
                 system.as_mut(),
                 rhs.as_mut(),
-                centre - window.start,
+                centres.start - window.start,
+                weights,
                 ridge,
-            ))
+            );
+            Ok::<(), HwePcaError>(())
         };
 
-        let solved: Vec<f64> = if parallel {
-            (next..ready_end)
-                .into_par_iter()
-                .map(solve_centre)
-                .collect::<Result<Vec<f64>, HwePcaError>>()?
+        if parallel {
+            groups.into_par_iter().try_for_each(solve_group)?;
         } else {
-            (next..ready_end)
-                .map(solve_centre)
-                .collect::<Result<Vec<f64>, HwePcaError>>()?
-        };
-        self.weights[next..ready_end].copy_from_slice(&solved);
-        progress.increment(solved.len());
+            groups.into_iter().try_for_each(solve_group)?;
+        }
+        progress.increment(ready_end - next);
         self.next_weight = ready_end;
 
         self.evict_rows(self.schedule.rows_retain_from(ready_end));
@@ -7605,6 +7740,185 @@ mod tests {
 
         let windows: [&[usize]; 3] = [&[0], &[0, 1], &[1, 2]];
         assert_ld_weights_match_complete_pairs(&data, N_SAMPLES, 2, &windows);
+    }
+
+    #[test]
+    fn hard_call_pair_kernels_count_the_same_integers() {
+        // 131 samples leave a partial last word, so padding bits are in play.
+        // Complete markers skip the masking the general kernel does; every
+        // pairing of complete, sparsely missing and mostly missing markers has
+        // to come out as the same integers either way.
+        const N_SAMPLES: usize = 131;
+        let column = |seed: usize, missing_every: Option<usize>| -> Vec<f64> {
+            (0..N_SAMPLES)
+                .map(|sample| {
+                    if missing_every.is_some_and(|every| (sample * 7 + seed) % every == 0) {
+                        f64::NAN
+                    } else {
+                        ((sample * (seed + 3) + seed * seed) % 3) as f64
+                    }
+                })
+                .collect()
+        };
+        let planes: Vec<LdBitplanes> = [
+            column(1, None),
+            column(2, None),
+            column(3, Some(11)),
+            column(4, Some(5)),
+            column(5, Some(2)),
+        ]
+        .iter()
+        .map(|values| {
+            let mut planes = LdBitplanes::default();
+            assert!(planes.fill(values));
+            planes
+        })
+        .collect();
+        assert!(planes[1].is_complete(N_SAMPLES));
+        assert!(!planes[2].is_complete(N_SAMPLES));
+
+        let bits = |stats: LdPairStats| {
+            [
+                stats.count,
+                stats.sum_i,
+                stats.sum_j,
+                stats.sq_i,
+                stats.sq_j,
+                stats.cross,
+            ]
+            .map(f64::to_bits)
+        };
+        for (a, i) in planes.iter().enumerate() {
+            for (b, j) in planes.iter().enumerate() {
+                assert_eq!(
+                    bits(hard_call_pair_stats(i, j, N_SAMPLES)),
+                    bits(hard_call_pair_stats_masked(i, j)),
+                    "markers {a} and {b}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ld_weights_of_shared_windows_match_single_centre_solves() {
+        // Clustered positions make runs of centres share one base-pair window,
+        // which the stream factors once for the whole run. Every centre must
+        // still get exactly the bits a solve of its own window gives. Markers 1
+        // and 5 have missing calls and marker 6 carries a dosage, so every pair
+        // kernel feeds the systems.
+        const N_SAMPLES: usize = 40;
+        let keys: Vec<VariantKey> = [100u64, 100, 100, 400, 400, 700, 700, 700, 1_000]
+            .into_iter()
+            .map(|position| VariantKey::new("1", position))
+            .collect();
+        let n_variants = keys.len();
+        let mut data = Vec::with_capacity(N_SAMPLES * n_variants);
+        for variant in 0..n_variants {
+            for sample in 0..N_SAMPLES {
+                let shared = (sample * 5 + sample / 3) % 3;
+                let value = if variant % 4 == 1 && sample % 9 == 4 {
+                    f64::NAN
+                } else if variant == 6 && sample == 11 {
+                    0.5
+                } else if (sample * (variant + 2) + variant) % 7 == 0 {
+                    ((shared + 1) % 3) as f64
+                } else {
+                    shared as f64
+                };
+                data.push(value);
+            }
+        }
+
+        let (ranges, capacity) = compute_ld_bp_ranges(&keys, 700).expect("ranges");
+        assert!(
+            ranges
+                .windows(2)
+                .any(|pair| (pair[0].start, pair[0].end) == (pair[1].start, pair[1].end)),
+            "no two centres share a window, so nothing here is solved jointly"
+        );
+        let config = LdResolvedConfig {
+            window: LdResolvedWindow::BasePairs {
+                span_bp: 700,
+                ranges: Arc::clone(&ranges),
+                capacity,
+            },
+            ridge: DEFAULT_LD_RIDGE,
+        };
+
+        for par in [Par::Seq, Par::rayon(4)] {
+            let mut source =
+                DenseBlockSource::new(&data, N_SAMPLES, n_variants).expect("dense source");
+            let (scaler, _, _, weights) = compute_stats_and_ld_weights(
+                &mut source,
+                4,
+                config.clone(),
+                n_variants,
+                &Arc::new(NoopFitProgress),
+                par,
+            )
+            .expect("ld weights");
+
+            let codes: Vec<LdVariantCodes> = (0..n_variants)
+                .map(|variant| {
+                    let mut codes = LdVariantCodes::Empty;
+                    codes.fill(
+                        &data[variant * N_SAMPLES..(variant + 1) * N_SAMPLES],
+                        2.0 * scaler.allele_frequencies()[variant],
+                    );
+                    codes
+                })
+                .collect();
+
+            for (centre, range) in ranges.iter().enumerate() {
+                let size = range.end - range.start;
+                let mut system = Mat::<f64>::zeros(size, size);
+                for i in 0..size {
+                    for j in 0..i {
+                        let stats = ld_pair_stats(
+                            &codes[range.start + i],
+                            &codes[range.start + j],
+                            N_SAMPLES,
+                        );
+                        let value = ld_pair_r2_estimate(&stats);
+                        system[(i, j)] = value;
+                        system[(j, i)] = value;
+                    }
+                }
+                let mut expected = 1.0;
+                let mut ridge = DEFAULT_LD_RIDGE;
+                for _attempt in 0..2 {
+                    for i in 0..size {
+                        system[(i, i)] = 1.0 + ridge;
+                    }
+                    let rhs = Mat::<f64>::from_fn(size, 1, |_, _| 1.0);
+                    if let Ok(factor) = FaerLlt::new(system.as_ref(), Side::Lower) {
+                        let weight_sq = factor.solve(rhs.as_ref())[(centre - range.start, 0)];
+                        expected = if !weight_sq.is_finite() || weight_sq <= 0.0 {
+                            1.0
+                        } else {
+                            weight_sq.sqrt().max(MIN_LD_WEIGHT)
+                        };
+                        break;
+                    }
+                    ridge *= 10.0;
+                }
+                assert_eq!(
+                    weights.weights[centre].to_bits(),
+                    expected.to_bits(),
+                    "centre {centre}: weight {} but its own solve gives {expected}",
+                    weights.weights[centre]
+                );
+            }
+
+            let isolated = (1.0f64 / (1.0 + DEFAULT_LD_RIDGE)).sqrt();
+            assert!(
+                weights
+                    .weights
+                    .iter()
+                    .any(|weight| (weight - isolated).abs() > 1.0e-6),
+                "no pair in this dataset correlated, so the comparison proves nothing"
+            );
+        }
     }
 
     #[test]

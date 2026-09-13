@@ -1,7 +1,7 @@
 use crate::score::types::{FilesetBoundary, PipelineKind, PreparationResult};
 use sha2::{Digest, Sha256};
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::fs::{self, File};
+use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -303,53 +303,19 @@ fn write_checkpoint(
             "Checkpoint score/count length mismatch.",
         ));
     }
-    let output_dir = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(output_dir)?;
-    let output_name = path.file_name().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("Checkpoint path '{}' has no file name.", path.display()),
-        )
-    })?;
-    let temp_path = unique_temp_path(output_dir, output_name);
-    let temp_file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp_path)?;
-    let mut writer = BufWriter::new(temp_file);
-    writer.write_all(MAGIC)?;
-    writer.write_all(&fingerprint)?;
-    writer.write_all(&(completed_variants as u64).to_le_bytes())?;
-    writer.write_all(&(sum_scores.len() as u64).to_le_bytes())?;
-    for &value in sum_scores {
-        writer.write_all(&value.to_le_bytes())?;
-    }
-    for &value in missing_counts {
-        writer.write_all(&value.to_le_bytes())?;
-    }
-    writer.flush()?;
-    let file = writer.into_inner().map_err(io::Error::other)?;
-    file.sync_all()?;
-    fs::rename(&temp_path, path).inspect_err(|_| {
-        let _ = fs::remove_file(&temp_path);
+    crate::output::write_atomically(path, |writer| {
+        writer.write_all(MAGIC)?;
+        writer.write_all(&fingerprint)?;
+        writer.write_all(&(completed_variants as u64).to_le_bytes())?;
+        writer.write_all(&(sum_scores.len() as u64).to_le_bytes())?;
+        for &value in sum_scores {
+            writer.write_all(&value.to_le_bytes())?;
+        }
+        for &value in missing_counts {
+            writer.write_all(&value.to_le_bytes())?;
+        }
+        Ok(())
     })
-}
-
-fn unique_temp_path(output_dir: &Path, output_name: &std::ffi::OsStr) -> PathBuf {
-    let pid = std::process::id();
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    output_dir.join(format!(
-        ".{}.{}.{}.tmp",
-        output_name.to_string_lossy(),
-        pid,
-        nanos
-    ))
 }
 
 fn update_usize(hasher: &mut Sha256, value: usize) {

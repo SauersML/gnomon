@@ -18,7 +18,10 @@ task, n, label = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 scoreset = sys.argv[4] if len(sys.argv) > 4 else 'PGS000018'
 assert task in ['score', 'project'] and label in ['before', 'after']
 if task == 'score':
-    source = data / ('score/src/array3200' if n <= 3200 else 'score/panels/large204800')
+    source = data / ('score/src/array3200' if n <= 3200 else
+                     'score/panels/medium12800' if n <= 12800 else
+                     'score/panels/medium51200' if n <= 51200 else
+                     'score/panels/large204800')
     weights = data / ('score/scoresets/' + scoreset if not scoreset.startswith('PGS') else 'score/pgs/txt/' + scoreset + '_hmPOS_GRCh38.txt')
 else:
     source = data / ('map/real/bed1x/ref1kg_gsa' if n <= 3200 else 'map/real/bed32x/ref1kg_gsa_32x' if n <= 102400 else 'map/real/bed141x/ref1kg_gsa_141x')
