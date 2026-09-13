@@ -72,6 +72,24 @@ task digest {
             metric_rows(model.get("metrics", []), f"{stage}__{slug(variant)}")
         metric_rows(report.get("incremental") or [], f"{stage}__incremental")
 
+    SUPPORT = (("insufficient training events for cause 1", "disease_events_insufficient"),
+               ("insufficient training events for cause 2", "death_events_insufficient"),
+               ("too few held-out participants", "heldout_size_insufficient"),
+               ("lacks censoring support", "censoring_horizon_support"),
+               ("censoring weights are unstable", "censoring_weights_unstable"),
+               ("insufficient training support for ancestry-specific censoring", "censoring_training_support"))
+
+    def support_rows(messages, name):
+        if len(messages) > 32:
+            raise ValueError("too many support messages to digest")
+        for message in messages:
+            partition = "development" if str(message).startswith("development:") else "outer"
+            horizon = re.search(r"horizon ([0-9.]+)", str(message))
+            when = "h" + token(float(horizon.group(1))) if horizon else "all"
+            for phrase, label in SUPPORT:
+                if phrase in str(message):
+                    emit([name, "support", partition, when, label])
+
     results = json.loads(Path(sys.argv[1]).read_text())
     if len(results) > 8:
         raise ValueError("digest covers at most eight endpoints")
@@ -80,6 +98,7 @@ task digest {
         for pgs, report in (result.get("development") or {}).items():
             report_rows(report, f"{name}__development__{slug(pgs)}")
         report_rows(result, f"{name}__final")
+        support_rows(result.get("evaluation_support_errors") or [], name)
         emit([name, "status", slug(result.get("status", "completed"))])
     PY
   >>>

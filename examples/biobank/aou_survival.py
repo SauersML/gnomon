@@ -951,6 +951,7 @@ def run(args):
         df["PGS"] = df[selected]
         report = analyze_partition(df, config, args, disease_dir / "final", checkpoint, selected)
         results[slug] = {"concept_id": disease["concept_id"], "score_selection": choice,
+                         "evaluation_support_errors": support_errors,
                          "development": development_reports, **report}
     write_json(args.output / "metrics.json", results)
     write_json(args.output / "provenance.json", {
