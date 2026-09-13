@@ -56,6 +56,7 @@ def validate_config(c):
         "grid_intervals", "fit_timeout_seconds", "query_timeout_seconds",
         "maximum_bytes_billed", "min_train_events_per_cause", "min_report_count",
         "lookback_days", "projection_model_sha256", "landmark_days", "fit_no_score_comparator",
+        "survival_time_anchor",
     }
     if set(c) != expected:
         raise ValueError("analysis configuration has missing or unknown keys")
@@ -65,7 +66,10 @@ def validate_config(c):
         raise ValueError("google_project must be a concrete billing project")
     positive = expected - {"google_project", "workspace_cdr", "gamfit_version",
                            "train_fraction", "seed", "horizons_years", "projection_model_sha256",
-                           "landmark_days", "fit_no_score_comparator"}
+                           "landmark_days", "fit_no_score_comparator", "survival_time_anchor"}
+    anchor = c["survival_time_anchor"]
+    if anchor is not None and (type(anchor) not in (int, float) or not 0 <= anchor <= 10):
+        raise ValueError("survival_time_anchor must be null or a follow-up time in years within a decade")
     if type(c["landmark_days"]) is not int or not 0 <= c["landmark_days"] <= 730:
         raise ValueError("landmark_days must be a whole number of days within two years")
     if type(c["fit_no_score_comparator"]) is not bool:
@@ -581,13 +585,17 @@ def fit_worker(frame_path, config_path, cause, output, transform_path, variant="
         # diagnostic reduces it to fixed categories.
         native.set_log_level("info")
     print("worker_fit_started", flush=True)
+    # Both variants centre their baseline time basis at the same follow-up
+    # time, so the smoothing selection sees the same frame; otherwise each
+    # likelihood picks its own anchor and their early hazards differ.
+    anchor = {} if config["survival_time_anchor"] is None else {"survival_time_anchor": float(config["survival_time_anchor"])}
     if variant == "no_score":
         # The same baseline hazard model without any score term: the
         # comparator that prices what the polygenic score adds.
         model = gamfit.fit(train, f"Surv(entry, followup, event) ~ {baseline}",
                            survival_likelihood="transformation",
                            config={"time_num_internal_knots": config["time_num_internal_knots"]},
-                           persistent_warm_start_root=output / "warm")
+                           persistent_warm_start_root=output / "warm", **anchor)
         model.save(output / "model.gamfit")
         print("worker_fit_saved", flush=True)
     else:
@@ -597,7 +605,7 @@ def fit_worker(frame_path, config_path, cause, output, transform_path, variant="
                            transformation_normal_stage1=transformer,
                            slope_formula=slope,
                            config={"time_num_internal_knots": config["time_num_internal_knots"]},
-                           persistent_warm_start_root=output / "warm")
+                           persistent_warm_start_root=output / "warm", **anchor)
         model.save(output / "model.gamfit")
         print("worker_fit_saved", flush=True)
         replay_z = model.transformation_score(test)

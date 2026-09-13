@@ -23,5 +23,6 @@
   "min_train_events_per_cause": 30,
   "min_report_count": 20,
   "landmark_days": 180,
-  "fit_no_score_comparator": true
+  "fit_no_score_comparator": true,
+  "survival_time_anchor": 0.0
 }
