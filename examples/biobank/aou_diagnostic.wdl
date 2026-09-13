@@ -121,6 +121,15 @@ task diagnose {
                 if "allotted_threads" in metrics:
                     label = fit_cpu_label(metrics)
                     Path(f"diagnostic__{label}.txt").write_text(label + "\n")
+                code = metrics.get("exit_code")
+                if isinstance(code, int) and code != 0:
+                    # Fixed categories: which signal killed a worker, or that it
+                    # errored; never the log text.
+                    label = (f"fit_exit_signal_{-code}" if -31 <= code < 0 else
+                             "fit_exit_error" if 0 < code < 128 else "fit_exit_other")
+                    Path(f"diagnostic__{label}.txt").write_text(label + "\n")
+                if metrics.get("restarted_after_signal"):
+                    Path("diagnostic__fit_worker_restarted.txt").write_text("fit_worker_restarted\n")
             unfinished = [member for member in members if member.isfile()
                           and Path(member.name).name == "fit.log"
                           and str(Path(member.name).parent / "completed.json") not in names]
