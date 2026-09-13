@@ -11,7 +11,7 @@ workflow aou_results_digest {
     String runtime_image
   }
   call digest { input: metrics=metrics, identity_guard=identity_guard, runtime_image=runtime_image }
-  output { Array[File] digest = digest.digest }
+  output { Array[File] tokens = digest.digest }
 }
 
 task digest {

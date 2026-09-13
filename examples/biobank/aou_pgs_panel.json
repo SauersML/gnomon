@@ -6,15 +6,21 @@
   "endpoints": {
     "copd": {
       "snomed_code": "13645005",
-      "candidates": ["PGS004536"]
+      "candidates": [
+        "PGS004536"
+      ]
     },
     "hypertension": {
       "snomed_code": "38341003",
-      "candidates": ["PGS004525"]
+      "candidates": [
+        "PGS004525"
+      ]
     },
     "obesity": {
       "snomed_code": "414916001",
-      "candidates": ["PGS005199"]
+      "candidates": [
+        "PGS005199"
+      ]
     }
   },
   "scores": {
@@ -34,7 +40,37 @@
       "trait": "Hypertension",
       "catalog_url": "https://www.pgscatalog.org/score/PGS004525/",
       "reported_development": "UK Biobank; disease and risk-factor meta-score",
-      "component_audit": "pending"
+      "component_audit": "completed 2026-09-13; see development_audit",
+      "development_audit": {
+        "audited": "2026-09-13",
+        "discovery": {
+          "status": "no_documented_aou_development",
+          "sources": [
+            "https://doi.org/10.1038/s42003-024-05874-7",
+            "https://www.pgscatalog.org/score/PGS004525/",
+            "https://www.pgscatalog.org/publication/PGP000561/"
+          ],
+          "evidence": "GWAS of 247 diseases and 112 risk factors were run by the authors in a UK Biobank White British unrelated GWAS set (n=174,488); no external summary statistics and no All of Us samples are used (Xu et al. 2024, Methods)."
+        },
+        "components": {
+          "status": "no_documented_aou_development",
+          "sources": [
+            "https://doi.org/10.1038/s42003-024-05874-7",
+            "https://www.pgscatalog.org/score/PGS004525/",
+            "https://www.pgscatalog.org/publication/PGP000561/"
+          ],
+          "evidence": "Risk-factor PRSs (LDpred) and disease PRSs were estimated in the disjoint UK Biobank PRS set (n=174,489); PGS Catalog records the training cohort as UKB, European, n=174,489."
+        },
+        "tuning": {
+          "status": "no_documented_aou_development",
+          "sources": [
+            "https://doi.org/10.1038/s42003-024-05874-7",
+            "https://www.pgscatalog.org/score/PGS004525/",
+            "https://www.pgscatalog.org/publication/PGP000561/"
+          ],
+          "evidence": "Elastic-net meta-score weights were fitted in the UK Biobank PRS set and the meta-score validated in an independent UK Biobank set (n=56,192); the paper contains no mention of All of Us. Undisclosed cross-enrollment between UK Biobank and All of Us cannot be excluded from public cohort names."
+        }
+      }
     },
     "PGS004603": {
       "trait": "Systolic blood pressure; applied to incident hypertension",
