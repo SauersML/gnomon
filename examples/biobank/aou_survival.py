@@ -589,13 +589,25 @@ def fit_worker(frame_path, config_path, cause, output, transform_path, variant="
     # time, so the smoothing selection sees the same frame; otherwise each
     # likelihood picks its own anchor and their early hazards differ.
     anchor = {} if config["survival_time_anchor"] is None else {"survival_time_anchor": float(config["survival_time_anchor"])}
+    knots = config["time_num_internal_knots"]
     if variant == "no_score":
         # The same baseline hazard model without any score term: the
-        # comparator that prices what the polygenic score adds.
-        model = gamfit.fit(train, f"Surv(entry, followup, event) ~ {baseline}",
-                           survival_likelihood="transformation",
-                           config={"time_num_internal_knots": config["time_num_internal_knots"]},
-                           persistent_warm_start_root=output / "warm", **anchor)
+        # comparator that prices what the polygenic score adds. The solver's
+        # baseline integration can fail to converge with a flexible time
+        # basis on some partitions; the comparator then retries with fewer
+        # internal knots and records the basis it used.
+        while True:
+            try:
+                model = gamfit.fit(train, f"Surv(entry, followup, event) ~ {baseline}",
+                                   survival_likelihood="transformation",
+                                   config={"time_num_internal_knots": knots},
+                                   persistent_warm_start_root=output / "warm", **anchor)
+                break
+            except Exception as error:
+                if not type(error).__name__.endswith("IntegrationError") or knots <= 2:
+                    raise
+                print(f"worker_comparator_retry knots={knots}->{knots - 2}", flush=True)
+                knots -= 2
         model.save(output / "model.gamfit")
         print("worker_fit_saved", flush=True)
     else:
@@ -632,6 +644,7 @@ def fit_worker(frame_path, config_path, cause, output, transform_path, variant="
                                   or payload["latent_z_conditional_calibration"] is not None):
         raise ValueError("outcome fit changed the frozen latent score")
     write_json(output / "spec.json", {"baseline": baseline, "cause": cause, "num_pcs": config["num_pcs"],
+                                      "time_num_internal_knots": knots,
                                       "orthogonality_claim": False, **(
         {"slope": None, "kind": "no_score", "normalizer": None, "score_path": "no score term"}
         if variant == "no_score" else
@@ -831,6 +844,9 @@ def analyze_partition(df, config, args, disease_dir, checkpoint, pgs):
         indices = np.searchsorted(grid, config["horizons_years"])
         risks[variant] = fine_cif[0][:, indices]
         models[variant] = {"cif_grid_error": error,
+                           "time_num_internal_knots": [
+                               json.loads((disease_dir / f"{variant}_{cause}" / "spec.json").read_text())
+                               .get("time_num_internal_knots") for cause in (1, 2)],
                            "metrics": evaluate(train, test, risks[variant], config["horizons_years"],
                                                config["min_report_count"])}
     report = {"models": models, "score_diagnostics": diagnostics}

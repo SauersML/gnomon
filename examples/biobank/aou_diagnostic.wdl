@@ -198,6 +198,7 @@ task diagnose {
         "heldout_size_insufficient": "too few held-out participants",
         "fit_warm_start_restored": "[warm-start-cache] restored",
         "worker_restarted_after_signal": "worker_restarted_after_signal",
+        "worker_comparator_retry": "worker_comparator_retry",
         "worker_replay_mismatch": "save/load predictions disagree",
         "worker_batch_dependence": "prediction changes with batch composition",
         "worker_ctn_mismatch": "saved native ctn disagrees",

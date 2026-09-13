@@ -69,6 +69,9 @@ task digest {
         for variant, model in sorted((report.get("models") or {}).items()):
             if "cif_grid_error" in model:
                 emit([stage, slug(variant), "cif_grid_error", token(float(model["cif_grid_error"]))])
+            knots = model.get("time_num_internal_knots") or []
+            if len(knots) == 2 and all(isinstance(k, int) for k in knots):
+                emit([stage, slug(variant), "time_knots", token(knots[0]), token(knots[1])])
             metric_rows(model.get("metrics", []), f"{stage}__{slug(variant)}")
         metric_rows(report.get("incremental") or [], f"{stage}__incremental")
 
