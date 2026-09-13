@@ -56,7 +56,11 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'push' }}
+  # Never cancel a run in progress. main receives pushes more often than the
+  # build takes, so cancelling on push meant no run on main ever finished.
+  # GitHub keeps one run in progress and replaces the pending run with the
+  # newest push, so each finished run tests the newest commit at its start.
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
