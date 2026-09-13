@@ -1,5 +1,45 @@
 # Score and packed projection performance
 
+The next projection revision compiles four variants into one 256-row lookup,
+with at most 256 KiB of table scratch plus 8 KiB for construction and 1 KiB
+per active sample tile. Cohorts below 1,024 people and panels above 64 PCs
+retain the smaller direct/pair kernels. Missing calls are recovered from the
+same key. A packed missing-call census selects sparse indices or dense
+information matrices before accumulating them: sparse index capacity is
+bounded by the dense matrix payload plus 16 bytes per person, rather than
+growing without limit with the number of variants.
+
+Updated full-command measurements against the original baseline, with the
+same four-core setup (three-run medians unless marked otherwise):
+
+| Workload | Before | Current | Speedup | Current peak RSS |
+| --- | ---: | ---: | ---: | ---: |
+| Score: 1 person, 2,048 variants, 9 scores | 0.685 s | 0.270 s | 2.53× | 31.3 MiB |
+| Project: 1 person, 4,096 variants, 4 PCs | 0.057 s | 0.048 s | 1.19× | 17.4 MiB |
+| Score: 50,000 people, 8,192 variants, 9 scores | 2.178 s | 1.291 s | 1.69× | 193.1 MiB |
+| Project: 50,000 people, 8,192 variants, 4 PCs | 2.469 s | 0.815 s | 3.03× | 139.2 MiB |
+| Score: 500,000 people, 8,192 variants, 9 scores (one pair) | 12.794 s | 8.427 s | 1.52× | 1.68 GiB |
+
+The 500,000-person fixture repeats the synthetic 50,000-person genotypes ten
+times with unique sample identifiers; it tests scale, not genetic diversity.
+Score outputs remained byte-identical. Grouped projection changes floating
+point addition order: the 50,000-person maximum absolute difference was
+`1.36e-13`, within the independent scalar checks' tolerance. All 13 focused
+tests passed, including padded bytes, partial variant groups, allele swaps,
+both missingness representations, and SIMD boundaries. The production score
+and map executables were rebuilt from the warm cache.
+
+`packed_projection_probe.py` also compares kernels on one pinned core.
+At 50,000 people and 257 variants, four-PC accumulation improved from
+42.26 to 27.01 ms and 64-PC accumulation from 176.38 to 90.74 ms against
+the preceding optimized pair kernel. These exclude CLI and solve overhead.
+The attempted grouped-table scoring engine regressed several regimes and
+was removed. `score_map_cli_probe.py` adds `--single`, `--large`, and
+`--biobank`; use `--once --score-only` or `--once --project-only` to keep
+each biobank experiment bounded. RSS is measured by `/usr/bin/time`.
+
+The earlier checkpoint measurements follow.
+
 The memory-planning startup query was subsequently narrowed to the fields
 actually used. On the shared MSI node, full system refresh took 267–492 ms;
 memory plus process names took 32–37 ms and found the same 17 gnomon processes.

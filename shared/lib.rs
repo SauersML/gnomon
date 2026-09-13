@@ -22,6 +22,9 @@ pub mod parallel;
 pub mod pipeline_error;
 
 #[cfg(any(feature = "score", feature = "map", feature = "terms"))]
+pub(crate) mod genotype_table;
+
+#[cfg(any(feature = "score", feature = "map", feature = "terms"))]
 pub mod files;
 
 #[cfg(any(feature = "score", feature = "map", feature = "terms"))]

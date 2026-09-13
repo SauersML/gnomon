@@ -6,6 +6,7 @@ use super::progress::{
     NoopProjectionProgress, ProjectionProgressObserver, ProjectionProgressStage,
 };
 use super::variant_filter::MatchKind;
+use crate::genotype_table;
 use core::cmp::min;
 use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
 use cudarc::driver::{
@@ -2874,9 +2875,21 @@ where
         },
     };
     let mut scores_row_major = vec![0.0f64; n_samples * components];
-    let mut dense_missing_info_storage = packed_cuda
-        .as_ref()
-        .map(|_| vec![0.0f64; n_samples * packed_info_size]);
+    // A missing-index list can otherwise grow with people × variants. Count
+    // packed missing calls until dense information storage becomes cheaper;
+    // usually this examines only a small prefix of a large cohort's markers.
+    let use_dense_missing = packed_cuda.is_some()
+        || prefer_dense_packed_missing(&packed, n_samples, expected_variants, packed_info_size)?;
+    let mut dense_missing_info_storage =
+        use_dense_missing.then(|| vec![0.0f64; n_samples * packed_info_size]);
+    eprintln!(
+        "> Projection missingness storage: {}",
+        if use_dense_missing {
+            "information matrices"
+        } else {
+            "sparse indices"
+        }
+    );
     let mut gpu_loadings_col_major = vec![0.0f32; block_variants * components];
     let mut gpu_coeffs = vec![0.0f32; block_variants * 3];
     let mut gpu_scores_active = packed_cuda.is_some();
@@ -2893,7 +2906,6 @@ where
         packed_cuda = None;
         gpu_scores_active = false;
         logged_cuda_fallback = true;
-        dense_missing_info_storage = None;
     }
 
     let mut processed = 0usize;
@@ -3133,6 +3145,51 @@ where
     Ok(dense_missing_info_storage)
 }
 
+/// Count only actual samples, excluding arbitrary PLINK padding bits.
+fn count_packed_missing_calls(bytes: &[u8], samples: usize) -> usize {
+    let (words, tail) = bytes[..samples / 4].as_chunks::<8>();
+    let mut count = 0usize;
+    for &word in words {
+        let word = u64::from_le_bytes(word);
+        count += (word & !(word >> 1) & 0x5555_5555_5555_5555).count_ones() as usize;
+    }
+    for &byte in tail {
+        count += genotype_table::missing_bits(byte).count_ones() as usize;
+    }
+    if samples % 4 != 0 {
+        let mask = (1 << (2 * (samples % 4))) - 1;
+        count += (genotype_table::missing_bits(bytes[samples / 4]) & mask).count_ones() as usize;
+    }
+    count
+}
+
+/// Sparse Vec capacities need fewer than two indices per missing call, plus
+/// at most four initial slots per sample. Stop before that payload exceeds the
+/// fixed-size information matrix by more than 16 bytes per sample.
+fn prefer_dense_packed_missing(
+    packed: &HardCallPacked<'_>,
+    samples: usize,
+    variants: usize,
+    info_size: usize,
+) -> Result<bool, HwePcaError> {
+    let threshold = samples
+        .checked_mul(info_size)
+        .ok_or(HwePcaError::InvalidInput(
+            "Projection missingness dimensions overflow",
+        ))?;
+    let mut missing = 0usize;
+    for variant in 0..variants {
+        let bytes = packed.slice(variant, 1).ok_or(HwePcaError::InvalidInput(
+            "Packed projection is missing a variant",
+        ))?;
+        missing = missing.saturating_add(count_packed_missing_calls(bytes, samples));
+        if missing >= threshold {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 #[inline(always)]
 fn add_score_vector(dst: &mut [f64], src: &[f64]) {
     debug_assert_eq!(dst.len(), src.len());
@@ -3227,6 +3284,25 @@ fn accumulate_packed_cpu_block_row_major_dense_missing(
     missing_info_storage: &mut [f64],
 ) {
     let samples = scores_row_major.len() / components;
+    if use_grouped_projection(samples, components, block_variant_bytes.len()) {
+        accumulate_grouped_projection(
+            block_variant_bytes,
+            block_score_vectors,
+            block_swapped,
+            components,
+            scores_row_major,
+            missing_info_storage,
+            packed_info_size,
+            |dst, variant| {
+                add_score_vector(
+                    dst,
+                    &block_info_contrib
+                        [variant * packed_info_size..(variant + 1) * packed_info_size],
+                )
+            },
+        );
+        return;
+    }
     let chunk_scores = sample_chunk * components;
     let chunk_missing = sample_chunk * packed_info_size;
     let score_tables = (samples >= 128)
@@ -3338,6 +3414,19 @@ fn accumulate_packed_cpu_block_row_major_sparse_missing(
     missing_variants: &mut [Vec<u32>],
 ) {
     let samples = scores_row_major.len() / components;
+    if use_grouped_projection(samples, components, block_variant_bytes.len()) {
+        accumulate_grouped_projection(
+            block_variant_bytes,
+            block_score_vectors,
+            block_swapped,
+            components,
+            scores_row_major,
+            missing_variants,
+            1,
+            |dst, variant| dst[0].push((variant_offset + variant) as u32),
+        );
+        return;
+    }
     let chunk_scores = sample_chunk * components;
     let score_tables = (samples >= 128)
         .then(|| packed_score_pair_tables(block_score_vectors, block_swapped, components));
@@ -3381,6 +3470,87 @@ fn accumulate_packed_cpu_block_row_major_sparse_missing(
                 }
             }
         });
+}
+
+fn use_grouped_projection(samples: usize, components: usize, variants: usize) -> bool {
+    samples >= 1024 && components <= 64 && variants >= 16
+}
+
+/// Compile four variants' contributions into a 256-row lookup shared by all
+/// samples. The workspace is capped at 256 KiB regardless of cohort size.
+/// Missingness is extracted from the same lookup key, preserving variant order.
+fn accumulate_grouped_projection<M: Send, F: Fn(&mut [M], usize) + Sync>(
+    bytes: &[&[u8]],
+    vectors: &[f64],
+    swapped: &[bool],
+    components: usize,
+    scores: &mut [f64],
+    missing: &mut [M],
+    missing_stride: usize,
+    add_missing: F,
+) {
+    let table_len = genotype_table::TABLE_ROWS * components;
+    let groups_per_tile = (genotype_table::TABLE_BUDGET_BYTES / (table_len * size_of::<f64>()))
+        .min(bytes.len().div_ceil(4))
+        .max(1);
+    let mut tables = vec![0.0; groups_per_tile * table_len];
+    let mut calls = vec![0.0; 16 * components];
+    for tile_start in (0..bytes.len()).step_by(groups_per_tile * 4) {
+        let tile_end = (tile_start + groups_per_tile * 4).min(bytes.len());
+        let groups = (tile_end - tile_start).div_ceil(4);
+        for group in 0..groups {
+            calls.fill(0.0);
+            let start = tile_start + group * 4;
+            for variant in start..(start + 4).min(tile_end) {
+                for code in [0, 2, 3] {
+                    let dosage = if code == 0 { 0 } else { code - 1 };
+                    let dosage = if swapped[variant] { 2 - dosage } else { dosage };
+                    let dst = ((variant - start) * 4 + code) * components;
+                    let src = (variant * 3 + dosage) * components;
+                    calls[dst..dst + components].copy_from_slice(&vectors[src..src + components]);
+                }
+            }
+            genotype_table::build_table(
+                &calls,
+                components,
+                &mut tables[group * table_len..(group + 1) * table_len],
+            );
+        }
+        scores
+            .par_chunks_mut(genotype_table::SAMPLE_TILE * components)
+            .zip(missing.par_chunks_mut(genotype_table::SAMPLE_TILE * missing_stride))
+            .enumerate()
+            .for_each(|(chunk, (scores, missing))| {
+                let sample_start = chunk * genotype_table::SAMPLE_TILE;
+                let samples = scores.len() / components;
+                let mut keys = [0u8; genotype_table::SAMPLE_TILE];
+                for group in 0..groups {
+                    let start = tile_start + group * 4;
+                    genotype_table::consecutive_keys(
+                        &bytes[start..(start + 4).min(tile_end)],
+                        sample_start,
+                        &mut keys[..samples],
+                    );
+                    let table = &tables[group * table_len..(group + 1) * table_len];
+                    for (sample, &key) in keys[..samples].iter().enumerate() {
+                        add_score_vector(
+                            &mut scores[sample * components..(sample + 1) * components],
+                            &table[key as usize * components..(key as usize + 1) * components],
+                        );
+                        let mut mask = genotype_table::missing_bits(key);
+                        while mask != 0 {
+                            let variant = mask.trailing_zeros() as usize / 2;
+                            mask &= mask - 1;
+                            add_missing(
+                                &mut missing
+                                    [sample * missing_stride..(sample + 1) * missing_stride],
+                                start + variant,
+                            );
+                        }
+                    }
+                }
+            });
+    }
 }
 
 fn plink_missing_lane_masks() -> &'static [u8; 256] {
@@ -4724,10 +4894,23 @@ mod tests {
     }
 
     #[test]
+    fn packed_missing_count_excludes_padding() {
+        for byte in 0..=255u8 {
+            let bytes = [byte; 24];
+            for samples in 0..=96 {
+                let expected = (0..samples)
+                    .filter(|sample| (bytes[sample / 4] >> (2 * (sample % 4))) & 3 == 1)
+                    .count();
+                assert_eq!(count_packed_missing_calls(&bytes, samples), expected);
+            }
+        }
+    }
+
+    #[test]
     fn packed_projection_kernels_match_scalar_calls_and_missingness() {
         for components in [1usize, 3, 4, 5, 20, 65] {
-            for samples in [1usize, 2, 3, 4, 5, 31, 33, 257] {
-                let variants = 256;
+            for samples in [1usize, 2, 3, 4, 5, 31, 33, 257, 1025] {
+                let variants = 257;
                 let data: Vec<Vec<u8>> = (0..variants)
                     .map(|variant| vec![variant as u8; samples.div_ceil(4)])
                     .collect();
@@ -4774,7 +4957,9 @@ mod tests {
                     &mut scores,
                     &mut missing,
                 );
-                assert_eq!(scores, expected);
+                for (actual, expected) in scores.iter().zip(&expected) {
+                    assert!((actual - expected).abs() <= 1e-11 * (1.0 + expected.abs()));
+                }
                 assert_eq!(missing, expected_missing);
                 scores.fill(0.123);
                 let mut info = vec![0.0; samples * info_size];
@@ -4789,7 +4974,9 @@ mod tests {
                     &mut scores,
                     &mut info,
                 );
-                assert_eq!(scores, expected);
+                for (actual, expected) in scores.iter().zip(&expected) {
+                    assert!((actual - expected).abs() <= 1e-11 * (1.0 + expected.abs()));
+                }
                 assert_eq!(info, expected_info);
             }
         }
