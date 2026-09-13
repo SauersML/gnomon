@@ -24,6 +24,7 @@ LABELS = frozenset({
     "missing_pgs004603", "missing_pgs005199", "missing_pgs005331",
     "transforming_score", "applying_reference_ctn", "score_transform_ready", "fitting_disease", "fitting_death",
     "fit_cpu_low", "fit_cpu_partial", "fit_cpu_saturated",
+    "failed_fit_worker_signal", "failed_fit_worker_error",
     "fit_warm_start_restored", "fit_inner_solves_1_9", "fit_inner_solves_10_49",
     "fit_inner_solves_50_199", "fit_inner_solves_200_plus",
     "failed_score_missingness_absent", "failed_score_missingness_invalid",

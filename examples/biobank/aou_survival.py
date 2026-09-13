@@ -654,8 +654,11 @@ def bounded_fits(jobs, timeout_seconds, checkpoint_callback=None, threads=None):
 
     `jobs` pairs each command with its private log. The checkpoint callback
     runs about every 30 seconds while any worker is alive, and one failing
-    worker stops the others at once. `threads` gives each worker its own
-    solver thread count, in job order, instead of the inherited count.
+    worker stops the others at once. A worker killed by a signal (a
+    preempted or oversubscribed VM) is restarted once from its persistent
+    warm start; a worker that exits with an error is not. `threads` gives
+    each worker its own solver thread count, in job order, instead of the
+    inherited count. Returns the exit codes in job order.
     """
     def terminate(signum, frame):
         raise InterruptedError("fit controller was terminated")
@@ -664,9 +667,10 @@ def bounded_fits(jobs, timeout_seconds, checkpoint_callback=None, threads=None):
     usage_before = resource.getrusage(resource.RUSAGE_CHILDREN)
     envs = ([None] * len(jobs) if threads is None else
             [dict(os.environ, RAYON_NUM_THREADS=str(count)) for count in threads])
-    handles = [Path(log).open("wb") for _, log in jobs]
+    handles = [Path(log).open("ab") for _, log in jobs]
     children = []
     results = {}
+    restarted = set()
     try:
         for (command, _), handle, env in zip(jobs, handles, envs):
             children.append(subprocess.Popen(command, stdout=handle, stderr=subprocess.STDOUT,
@@ -679,6 +683,14 @@ def bounded_fits(jobs, timeout_seconds, checkpoint_callback=None, threads=None):
                 raise subprocess.TimeoutExpired([command for command, _ in jobs], timeout_seconds)
             for index, child in enumerate(children):
                 if index not in results and child.poll() is not None:
+                    if child.returncode < 0 and index not in restarted:
+                        restarted.add(index)
+                        handles[index].write(f"worker_restarted_after_signal {-child.returncode}\n".encode())
+                        handles[index].flush()
+                        children[index] = subprocess.Popen(jobs[index][0], stdout=handles[index],
+                                                           stderr=subprocess.STDOUT,
+                                                           start_new_session=True, env=envs[index])
+                        continue
                     results[index] = child.returncode
             if any(code != 0 for code in results.values()):
                 raise RuntimeError("fit failed; inspect the private task fit log")
@@ -708,12 +720,14 @@ def bounded_fits(jobs, timeout_seconds, checkpoint_callback=None, threads=None):
         cpu = (usage_after.ru_utime + usage_after.ru_stime
                - usage_before.ru_utime - usage_before.ru_stime)
         allotted = [solver_threads()] * len(jobs) if threads is None else list(threads)
-        for (_, log), own in zip(jobs, allotted):
+        for index, ((_, log), own) in enumerate(zip(jobs, allotted)):
             write_json(Path(log).with_suffix(".resources.json"), {
                 "wall_seconds": elapsed, "cpu_seconds": cpu,
                 "average_cpu_cores": cpu / elapsed, "concurrent_fits": len(jobs),
                 "solver_threads": own, "allotted_threads": sum(allotted),
+                "exit_code": results.get(index), "restarted_after_signal": index in restarted,
             })
+    return [results.get(index) for index in range(len(jobs))]
 
 
 def bounded_fit(command, timeout_seconds, log, checkpoint_callback=None):
@@ -721,11 +735,21 @@ def bounded_fit(command, timeout_seconds, log, checkpoint_callback=None):
 
 
 def checkpointed_fits(jobs, timeout_seconds, checkpoint, threads=None):
-    """Retain private failure logs and partial fits without a completion receipt."""
+    """Retain private failure logs and partial fits without a completion receipt,
+    and say in a fixed label whether a worker errored or was killed."""
     try:
         bounded_fits(jobs, timeout_seconds, checkpoint_callback=checkpoint.publish, threads=threads)
-    except BaseException:
+    except BaseException as error:
         checkpoint.publish()
+        if isinstance(error, RuntimeError):
+            codes = [json.loads(Path(log).with_suffix(".resources.json").read_text()).get("exit_code")
+                     for _, log in jobs if Path(log).with_suffix(".resources.json").is_file()]
+            label = ("failed_fit_worker_signal" if any(code is not None and code < 0 for code in codes)
+                     else "failed_fit_worker_error")
+            try:
+                publish_status(f"gs://{checkpoint.bucket}/{checkpoint.object}", label)
+            except Exception:
+                pass
         raise
 
 

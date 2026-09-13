@@ -179,6 +179,7 @@ task diagnose {
         "death_events_insufficient": "insufficient training events for cause 2",
         "heldout_size_insufficient": "too few held-out participants",
         "fit_warm_start_restored": "[warm-start-cache] restored",
+        "worker_restarted_after_signal": "worker_restarted_after_signal",
         "worker_fit_started": "worker_fit_started",
         "worker_fit_saved": "worker_fit_saved",
         "worker_grid_started": "worker_grid_started",
