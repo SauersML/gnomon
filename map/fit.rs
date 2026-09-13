@@ -190,7 +190,7 @@ fn compute_fit_memory_plan() -> FitMemoryPlan {
 /// A platform that reports a total but no availability is treated as "all of it
 /// is available": zero there means "unsupported", not "the machine is full".
 fn detect_memory_bytes() -> Option<(u64, u64)> {
-    let mut system = System::new_all();
+    let mut system = System::new();
     system.refresh_memory();
     let total = system.total_memory();
     if total == 0 {

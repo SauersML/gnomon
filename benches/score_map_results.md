@@ -1,5 +1,12 @@
 # Score and packed projection performance
 
+The memory-planning startup query was subsequently narrowed to the fields
+actually used. On the shared MSI node, full system refresh took 267–492 ms;
+memory plus process names took 32–37 ms and found the same 17 gnomon processes.
+PCA's memory-only query took 0.37–0.41 ms. Memory availability and scoring's
+concurrent-process fair-share checks remain active. These are query timings,
+not measurements of the complete commands below.
+
 Measured on MSI on 2026-09-13 using four pinned AMD EPYC Milan cores,
 Rust nightly-2026-08-31, `target-cpu=x86-64-v3`, release optimization, and
 the existing iteration cache with LTO disabled. Each number below is the

@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use sysinfo::System;
+use sysinfo::{ProcessRefreshKind, System};
 
 // --- Pipeline Tuning Parameters ---
 
@@ -248,8 +248,11 @@ fn concurrent_gnomon_processes(system: &System) -> u64 {
 }
 
 fn default_max_ram_bytes() -> usize {
-    let mut system = System::new_all();
+    let mut system = System::new();
     system.refresh_memory();
+    // Budgeting needs executable names, not CPU histories, process memory,
+    // environments, or disk statistics for every process on the machine.
+    system.refresh_processes_specifics(ProcessRefreshKind::new());
     let available = system.available_memory();
     let siblings = concurrent_gnomon_processes(&system);
 
