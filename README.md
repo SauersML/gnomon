@@ -1,9 +1,6 @@
 # gnomon
 <img width="282" height="154" alt="Gnomon Logo" src="https://github.com/user-attachments/assets/73185e7e-09eb-4bc9-a82c-62d7102f4341" />
 
-[![Lean Proofs](https://github.com/SauersML/gnomon/actions/workflows/prover.yml/badge.svg)](https://github.com/SauersML/gnomon/actions/workflows/prover.yml)
-
-
 ---
 
 ## Overview
@@ -18,8 +15,6 @@ Gnomon is a high-performance Rust engine for computing and calibrating polygenic
 - **[`calibrate/`](calibrate/)** – Calibration and survival workflows.
 - **[`terms/`](terms/)** – Infer sample-level metadata terms, starting with sex inference. See [`terms/README.md`](terms/README.md) for CLI usage and integration tips.
 - **[`examples/`](examples/)** – Reproduce published polygenic score analyses and validate calibration performance.
-- **[`proofs/`](proofs/)** – A Lean 4 corpus that proves the portability results, and the Python simulations that test each formula against measurement. See [`proofs/validation/`](proofs/validation/) for the simulations.
-- **[`site/`](site/)** – A static page that states the portability formulas, the measurement behind each one, and the limits on each one. See [`site/README.md`](site/README.md) to build it.
 
 ## Installation
 
