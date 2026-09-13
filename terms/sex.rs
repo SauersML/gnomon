@@ -743,10 +743,12 @@ mod tests {
         }
 
         let result = acc.finish().unwrap();
-        assert_eq!(
-            result.report.y_genome_density.expect("density"),
-            1.0,
-            "a filtered panel yields a saturated density by construction"
+        let density = result.report.y_genome_density.expect("density");
+        // infer_sex adds its epsilon (1e-9) to the autosome numerator, so the
+        // saturated density is 400 / (400 + 1e-9), a hair below 1.0.
+        assert!(
+            (density - 1.0).abs() < 1e-9,
+            "a filtered panel yields a saturated density by construction, got {density}"
         );
         assert!(
             platform_is_saturated(&result.report, &platform),
