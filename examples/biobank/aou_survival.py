@@ -274,17 +274,22 @@ def endpoint_scores(archive, disease):
     return scores
 
 
-def load_score_panel(path, *, exploratory):
+def load_score_panel(path, *, exploratory, endpoints=None):
+    """Validate the prespecified panel. A final analysis demands a completed
+    development audit for the scores of the endpoints it analyses; other
+    endpoints in the panel wait for their own audits."""
     panel = json.loads(Path(path).read_text())
-    for endpoint in panel["endpoints"].values():
+    if endpoints is not None and any(name not in panel["endpoints"] for name in endpoints):
+        raise ValueError("requested endpoint is not in the prespecified panel")
+    for name, endpoint in panel["endpoints"].items():
         candidates = endpoint["candidates"]
         if len(candidates) != 1:
             raise ValueError("each endpoint requires exactly one prespecified score")
         for pgs in candidates:
             if pgs == "PGS004787" or pgs in panel["excluded"] or pgs not in panel["scores"]:
                 raise ValueError("excluded or unlisted PGS in candidate panel")
-            if not exploratory:
-                audit = panel["scores"][pgs].get("development_audit", {})
+            if not exploratory and (endpoints is None or name in endpoints):
+                audit = panel["scores"][pgs].get("development_audit") or {}
                 for stage in ("discovery", "components", "tuning"):
                     record = audit.get(stage, {})
                     sources = record.get("sources", [])
@@ -813,10 +818,9 @@ def run(args):
     from disease_selection import select_runtime_diseases
     config = json.loads(args.config.read_text())
     validate_config(config)
-    panel = load_score_panel(args.score_panel, exploratory=args.smoke_only or args.prepare_only)
     endpoint = json.loads(args.endpoint_config.read_text())
-    if endpoint != "" and endpoint not in panel["endpoints"]:
-        raise ValueError("requested endpoint is not in the prespecified panel")
+    panel = load_score_panel(args.score_panel, exploratory=args.smoke_only or args.prepare_only,
+                             endpoints=[endpoint] if endpoint else None)
     import gamfit
     if gamfit.__version__ != config["gamfit_version"]:
         raise ValueError("gamfit version does not match the analysis configuration")

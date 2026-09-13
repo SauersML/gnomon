@@ -424,6 +424,23 @@ class SurvivalContractTests(unittest.TestCase):
         permuted = aou.build_cohort(base.iloc[::-1], scores, cases, c).set_index("person_id")
         pd.testing.assert_series_equal(cohort.is_train.sort_index(), permuted.is_train.sort_index())
 
+    def test_final_analysis_audits_only_the_analysed_endpoint(self):
+        audited = {"discovery": {"status": "no_documented_aou_development", "sources": ["https://x"]},
+                   "components": {"status": "no_documented_aou_development", "sources": ["https://x"]},
+                   "tuning": {"status": "no_documented_aou_development", "sources": ["https://x"]}}
+        panel = {"endpoints": {"hypertension": {"candidates": ["PGS000001"]},
+                               "copd": {"candidates": ["PGS000002"]}},
+                 "excluded": [], "scores": {"PGS000001": {"development_audit": audited},
+                                            "PGS000002": {"development_audit": None}}}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, "panel.json"); path.write_text(json.dumps(panel))
+            aou.load_score_panel(path, exploratory=False, endpoints=["hypertension"])
+            aou.load_score_panel(path, exploratory=True)
+            with self.assertRaisesRegex(ValueError, "provenance for PGS000002"):
+                aou.load_score_panel(path, exploratory=False)
+            with self.assertRaisesRegex(ValueError, "not in the prespecified panel"):
+                aou.load_score_panel(path, exploratory=False, endpoints=["stroke"])
+
     def test_landmark_excludes_enrollment_diagnoses_and_restarts_follow_up(self):
         base = pd.DataFrame({
             "person_id": list("abcd"), "sex_at_birth_concept_id": [45880669] * 4,
