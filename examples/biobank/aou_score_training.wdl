@@ -87,7 +87,7 @@ task train {
     work/venv/bin/python -m pip install --disable-pip-version-check --no-compile --no-cache-dir \
       --no-index --only-binary=:all: --find-links wheels -r aou_requirements.txt
     SH
-    timeout --kill-after=10s 90m bash -euo pipefail -c '
+    timeout --kill-after=10s 150m bash -euo pipefail -c '
       python aou_status.py "${10}" installing_dependencies
       if timeout --kill-after=10s 120s bash work/setup.sh "$1"; then
         python aou_status.py "${10}" dependencies_ready
