@@ -1,6 +1,5 @@
 use std::collections::HashSet;
-use std::fs::{self, File};
-use std::io::{BufWriter, IsTerminal, Write};
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
@@ -381,46 +380,40 @@ fn write_results(
     records: &[SexInferenceRecord],
     build: GenomeBuild,
 ) -> Result<(), SexInferenceError> {
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent)?;
-    }
+    crate::output::write_atomically(path, |writer| {
+        writeln!(writer, "{}", SEX_TSV_HEADER)?;
+        for record in records {
+            let label = sex_label(record.inference.final_call);
+            let report = &record.inference.report;
+            let y_density = report
+                .y_genome_density
+                .map_or("NA".to_string(), |v| format!("{v:.6}"));
+            let x_ratio = report
+                .x_autosome_het_ratio
+                .map_or("NA".to_string(), |v| format!("{v:.6}"));
+            let composite = report
+                .composite_sex_index
+                .map_or("NA".to_string(), |v| format!("{v:.6}"));
 
-    let file = File::create(path)?;
-    let mut writer = BufWriter::new(file);
-    writeln!(writer, "{}", SEX_TSV_HEADER)?;
-    for record in records {
-        let label = sex_label(record.inference.final_call);
-        let report = &record.inference.report;
-        let y_density = report
-            .y_genome_density
-            .map_or("NA".to_string(), |v| format!("{v:.6}"));
-        let x_ratio = report
-            .x_autosome_het_ratio
-            .map_or("NA".to_string(), |v| format!("{v:.6}"));
-        let composite = report
-            .composite_sex_index
-            .map_or("NA".to_string(), |v| format!("{v:.6}"));
-
-        writeln!(
-            writer,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            record.individual_id,
-            format!("{:?}", build),
-            label,
-            y_density,
-            x_ratio,
-            composite,
-            report.auto_valid_count,
-            report.auto_het_count,
-            report.x_non_par_valid_count,
-            report.x_non_par_het_count,
-            report.y_non_par_valid_count,
-            report.y_par_valid_count,
-        )?;
-    }
-    writer.flush()?;
+            writeln!(
+                writer,
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                record.individual_id,
+                format!("{:?}", build),
+                label,
+                y_density,
+                x_ratio,
+                composite,
+                report.auto_valid_count,
+                report.auto_het_count,
+                report.x_non_par_valid_count,
+                report.x_non_par_het_count,
+                report.y_non_par_valid_count,
+                report.y_par_valid_count,
+            )?;
+        }
+        Ok(())
+    })?;
     Ok(())
 }
 

@@ -30,8 +30,8 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::ffi::OsString;
 use std::fmt::Write as FmtWrite;
-use std::fs::{self, OpenOptions};
-use std::io::{self, BufWriter, Write};
+use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -1420,62 +1420,9 @@ fn write_scores_to_file(
     score_regions: Option<&HashMap<String, GenomicRegion>>,
     emit_components: bool,
 ) -> io::Result<()> {
-    let output_dir = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let output_name = path.file_name().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("Output path '{}' has no file name.", path.display()),
-        )
-    })?;
-
-    let pid = std::process::id();
-    let ts_nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-
-    let mut temp_path = None;
-    let mut temp_file = None;
-    for attempt in 0..32u32 {
-        let candidate = output_dir.join(format!(
-            ".{}.{}.{}.tmp",
-            output_name.to_string_lossy(),
-            pid,
-            ts_nanos + attempt as u128
-        ));
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
-            Ok(file) => {
-                temp_path = Some(candidate);
-                temp_file = Some(file);
-                break;
-            }
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
-        }
-    }
-
-    let temp_path = temp_path.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!(
-                "Failed to allocate a unique temporary output file in '{}'.",
-                output_dir.display()
-            ),
-        )
-    })?;
-    let temp_file = temp_file.expect("temporary file must exist when temp path exists");
-
-    let mut writer = BufWriter::new(temp_file);
     let num_scores = score_names.len();
 
-    let write_result = (|| -> io::Result<()> {
+    gnomon::output::write_atomically(path, |writer| {
         if emit_components {
             writeln!(writer, "#SCORE_VARIANT_COUNT\tSCORE\tCOUNT")?;
             for (name, count) in score_names.iter().zip(score_variant_counts) {
@@ -1575,20 +1522,7 @@ fn write_scores_to_file(
             }
             writeln!(writer, "{line_buffer}")?;
         }
-
-        writer.flush()?;
-        let file = writer.into_inner().map_err(io::Error::other)?;
-        file.sync_all()?;
         Ok(())
-    })();
-
-    if let Err(err) = write_result {
-        let _ = fs::remove_file(&temp_path);
-        return Err(err);
-    }
-
-    fs::rename(&temp_path, path).inspect_err(|_| {
-        let _ = fs::remove_file(&temp_path);
     })
 }
 

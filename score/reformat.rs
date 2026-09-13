@@ -10,7 +10,7 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::num::ParseIntError;
 use std::path::{Path, PathBuf};
@@ -1197,29 +1197,33 @@ pub fn sort_plink_fileset(
     let mut sorted_bed_name = sorted_stem.clone();
     sorted_bed_name.push(".bed");
     let sorted_bed_path = parent_dir.join(sorted_bed_name);
-    let mut sorted_bed = BufWriter::with_capacity(1 << 20, File::create(&sorted_bed_path)?);
-    sorted_bed.write_all(&mmap[..3])?;
-
-    for record in &keyed_lines {
-        let offset = 3 + record.original_index * bytes_per_variant;
-        let end = offset + bytes_per_variant;
-        sorted_bed.write_all(&mmap[offset..end])?;
-    }
-    sorted_bed.flush()?;
+    crate::output::write_atomically(&sorted_bed_path, |sorted_bed| {
+        sorted_bed.write_all(&mmap[..3])?;
+        for record in &keyed_lines {
+            let offset = 3 + record.original_index * bytes_per_variant;
+            let end = offset + bytes_per_variant;
+            sorted_bed.write_all(&mmap[offset..end])?;
+        }
+        Ok(())
+    })?;
 
     let mut sorted_bim_name = sorted_stem.clone();
     sorted_bim_name.push(".bim");
     let sorted_bim_path = parent_dir.join(sorted_bim_name);
-    let mut sorted_bim = BufWriter::with_capacity(1 << 20, File::create(&sorted_bim_path)?);
-    for record in &keyed_lines {
-        writeln!(sorted_bim, "{}", record.raw_line)?;
-    }
-    sorted_bim.flush()?;
+    crate::output::write_atomically(&sorted_bim_path, |sorted_bim| {
+        for record in &keyed_lines {
+            writeln!(sorted_bim, "{}", record.raw_line)?;
+        }
+        Ok(())
+    })?;
 
     let mut sorted_fam_name = sorted_stem.clone();
     sorted_fam_name.push(".fam");
     let sorted_fam_path = parent_dir.join(sorted_fam_name);
-    fs::copy(fam_path, &sorted_fam_path).map_err(ReformatError::Io)?;
+    crate::output::write_atomically(&sorted_fam_path, |sorted_fam| {
+        io::copy(&mut File::open(fam_path)?, sorted_fam)?;
+        Ok(())
+    })?;
 
     Ok(sorted_bed_path)
 }
@@ -1357,6 +1361,7 @@ fn parse_key(chr_str: &str, pos_str: &str) -> Result<(u8, u32), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::io::Write;
     use tempfile::tempdir;
 
