@@ -412,7 +412,7 @@ class SurvivalContractTests(unittest.TestCase):
         cases = pd.DataFrame({"person_id": list("abcdefg"), "disease_date": [
             "2019-01-01", "2021-01-01", "2021-01-01", "2023-01-01", "2021-01-01", None, "2020-01-01"]})
         c = {"seed": 8, "max_rows_per_disease": 100, "train_fraction": .9,
-             "lookback_days": 365}
+             "lookback_days": 365, "landmark_days": 0}
         cohort = aou.build_cohort(base, scores, cases, c).set_index("person_id")
         self.assertEqual(set(cohort.index), {"b", "c", "d", "e"})
         self.assertEqual(cohort.loc["b", "event_code"], 1)
@@ -423,6 +423,55 @@ class SurvivalContractTests(unittest.TestCase):
         self.assertAlmostEqual(cohort.loc["d", "followup"], 731 / 365.25)
         permuted = aou.build_cohort(base.iloc[::-1], scores, cases, c).set_index("person_id")
         pd.testing.assert_series_equal(cohort.is_train.sort_index(), permuted.is_train.sort_index())
+
+    def test_landmark_excludes_enrollment_diagnoses_and_restarts_follow_up(self):
+        base = pd.DataFrame({
+            "person_id": list("abcd"), "sex_at_birth_concept_id": [45880669] * 4,
+            "split_group": list("abcd"), "obs_start": ["2018-01-01"] * 4,
+            "birth_date": ["1970-01-01"] * 4, "baseline": ["2020-01-01"] * 4,
+            "obs_end": ["2023-01-01", "2023-01-01", "2020-03-01", "2023-01-01"],
+            "death_date": [None, None, None, "2020-04-01"],
+        })
+        scores = pd.DataFrame({"person_id": list("abcd"), "PGS": range(4)})
+        cases = pd.DataFrame({"person_id": list("abcd"),
+                              "disease_date": ["2020-03-01", "2021-02-04", None, None]})
+        c = {"seed": 8, "max_rows_per_disease": 100, "train_fraction": .9,
+             "lookback_days": 365, "landmark_days": 180}
+        cohort = aou.build_cohort(base, scores, cases, c).set_index("person_id")
+        # a: diagnosed inside the landmark window (prevalent at detection); c: lost; d: died.
+        self.assertEqual(set(cohort.index), {"b"})
+        self.assertEqual(cohort.loc["b", "event_code"], 1)
+        self.assertAlmostEqual(cohort.loc["b", "followup"], (400 - 180) / 365.25)
+        self.assertAlmostEqual(cohort.loc["b", "age0"], (pd.Timestamp("2020-06-29") - pd.Timestamp("1970-01-01")).days / 365.25)
+
+    def test_weighted_auc_ranks_cases_over_controls_with_ties_at_half(self):
+        self.assertEqual(aou.weighted_auc([.1, .2, .9, .8], [0, 0, 1, 1], [1, 1, 1, 1]), 1.0)
+        self.assertEqual(aou.weighted_auc([.5, .5, .5, .5], [0, 1, 0, 1], [1, 1, 1, 1]), 0.5)
+        self.assertAlmostEqual(aou.weighted_auc([.1, .9, .5], [0, 1, 1], [1, 1, 2]), (1 + 2) / 3)
+        self.assertAlmostEqual(aou.weighted_auc([.1, .9, .5], [0, 1, 1], [1, 3, 1]), (3 + 1) / 4)
+        with self.assertRaises(ValueError):
+            aou.weighted_auc([.1, .9], [1, 1], [1, 1])
+
+    def test_incremental_value_is_the_paired_brier_difference(self):
+        rng = np.random.default_rng(3)
+        n = 400
+        test = pd.DataFrame({"event_code": rng.integers(0, 2, n), "followup": rng.uniform(.1, 4, n),
+                             "ancestry": ["eur"] * n, "sex": rng.integers(0, 2, n),
+                             "age0": rng.uniform(20, 70, n), "split_group": [f"g{i % 8}" for i in range(n)],
+                             "PC1": rng.normal(size=n), "PC2": rng.normal(size=n)})
+        train = test.copy()
+        full = np.clip(rng.uniform(.01, .5, (n, 1)), 0, 1)
+        null = np.full((n, 1), float(full.mean()))
+        with patch.object(aou, "ipcw_weights", return_value=np.ones(n)):
+            rows = aou.incremental_value(train, test, full, null, [1.0], 20)
+            reference = {(r["group"], r["horizon"]): r for r in aou.evaluate(train, test, full, [1.0], 20)}
+            baseline = {(r["group"], r["horizon"]): r for r in aou.evaluate(train, test, null, [1.0], 20)}
+        overall = next(r for r in rows if r["group"] == "overall")
+        self.assertAlmostEqual(overall["brier_difference"],
+                               reference[("overall", 1.0)]["brier"] - baseline[("overall", 1.0)]["brier"])
+        self.assertAlmostEqual(overall["auc_difference"],
+                               reference[("overall", 1.0)]["ipcw_auc"] - baseline[("overall", 1.0)]["ipcw_auc"])
+        self.assertGreater(overall["brier_difference_standard_error"], 0)
 
     def test_score_api_does_not_use_ctn_mean_prediction(self):
         from unittest.mock import Mock
@@ -449,7 +498,7 @@ class SurvivalContractTests(unittest.TestCase):
         base.loc[0, "obs_start"] = "2019-12-01"
         scores = pd.DataFrame({"person_id": base.person_id, "PGS": np.arange(count)})
         cases = pd.DataFrame({"person_id": base.person_id, "disease_date": [None] * count})
-        config = {"lookback_days": 365, "seed": 1, "train_fraction": .8,
+        config = {"lookback_days": 365, "landmark_days": 0, "seed": 1, "train_fraction": .8,
                   "max_rows_per_disease": 100}
         cohort = aou.build_cohort(base, scores, cases, config)
         self.assertEqual(len(cohort), count - 1)

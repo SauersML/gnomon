@@ -11,11 +11,17 @@
   "seed": 20260910,
   "lookback_days": 365,
   "projection_model_sha256": "75ce487f80eb4c386abd21f8168ba547c3292e77db812eb4a7c65289171cd5e0",
-  "horizons_years": [1.0, 3.0, 5.0],
+  "horizons_years": [
+    1.0,
+    3.0,
+    5.0
+  ],
   "grid_intervals": 200,
   "fit_timeout_seconds": 180,
   "query_timeout_seconds": 120,
   "maximum_bytes_billed": 100000000000,
   "min_train_events_per_cause": 30,
-  "min_report_count": 20
+  "min_report_count": 20,
+  "landmark_days": 180,
+  "fit_no_score_comparator": true
 }

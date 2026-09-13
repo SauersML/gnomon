@@ -33,8 +33,9 @@ task digest {
 
     task_account()
     MINIMUM_COUNT = 20
-    ALLOWED = ("n", "observed_disease_events", "brier", "brier_standard_error",
-               "mean_predicted_risk", "ipcw_observed_risk", "mean_risk_discrepancy")
+    ALLOWED = ("n", "observed_disease_events", "brier", "brier_standard_error", "ipcw_auc",
+               "mean_predicted_risk", "ipcw_observed_risk", "mean_risk_discrepancy",
+               "brier_difference", "brier_difference_standard_error", "auc_difference")
 
     def token(value):
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
@@ -51,13 +52,8 @@ task digest {
     def emit(parts):
         Path("digest__" + "__".join(parts) + ".txt").write_text("\n")
 
-    def report_rows(report, stage):
-        model = (report.get("models") or {}).get("pc_varying_ctn")
-        if not model:
-            return
-        if "cif_grid_error" in model:
-            emit([stage, "cif_grid_error", token(float(model["cif_grid_error"]))])
-        for row in model.get("metrics", []):
+    def metric_rows(rows, stage):
+        for row in rows:
             base = [stage, slug(row["group"]), "h" + token(float(row["horizon"]))]
             if row.get("status") != "ok" or int(row.get("n", 0)) < MINIMUM_COUNT:
                 emit(base + ["insufficient_support"])
@@ -68,6 +64,13 @@ task digest {
                 if key == "observed_disease_events" and int(row[key]) < MINIMUM_COUNT:
                     continue
                 emit(base + [key, token(row[key])])
+
+    def report_rows(report, stage):
+        for variant, model in sorted((report.get("models") or {}).items()):
+            if "cif_grid_error" in model:
+                emit([stage, slug(variant), "cif_grid_error", token(float(model["cif_grid_error"]))])
+            metric_rows(model.get("metrics", []), f"{stage}__{slug(variant)}")
+        metric_rows(report.get("incremental") or [], f"{stage}__incremental")
 
     results = json.loads(Path(sys.argv[1]).read_text())
     if len(results) > 8:
