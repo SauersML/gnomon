@@ -121,6 +121,15 @@ task diagnose {
                 if "allotted_threads" in metrics:
                     label = fit_cpu_label(metrics)
                     Path(f"diagnostic__{label}.txt").write_text(label + "\n")
+                parent = Path(member.name).parent
+                stage = "final" if "final" in parent.parts else "development" if "development" in parent.parts else "other"
+                if parent.name in ("pc_varying_ctn_1", "pc_varying_ctn_2", "no_score_1", "no_score_2"):
+                    wall = metrics.get("wall_seconds")
+                    if isinstance(wall, (int, float)) and wall >= 0:
+                        bucket = "under_2min" if wall < 120 else "under_10min" if wall < 600 else "under_30min" if wall < 1800 else "over_30min"
+                        Path(f"diagnostic__fit_wall_{stage}_{bucket}.txt").write_text("\n")
+                    if isinstance(metrics.get("exit_code"), int) and metrics["exit_code"] != 0:
+                        Path(f"diagnostic__fit_failed_{stage}_{parent.name}.txt").write_text("\n")
                 code = metrics.get("exit_code")
                 if isinstance(code, int) and code != 0:
                     # Fixed categories: which signal killed a worker, or that it
