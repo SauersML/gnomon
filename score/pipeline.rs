@@ -25,7 +25,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use sysinfo::{ProcessRefreshKind, System};
+#[cfg(not(target_os = "linux"))]
+use sysinfo::ProcessRefreshKind;
+use sysinfo::System;
 
 // --- Pipeline Tuning Parameters ---
 
@@ -236,7 +238,34 @@ impl Default for MemoryBudget {
 /// The contention is observable, so observe it rather than requiring the caller to
 /// describe it. Matching is on the executable name, so every gnomon on the box counts
 /// regardless of who launched it.
-fn concurrent_gnomon_processes(system: &System) -> u64 {
+#[cfg(target_os = "linux")]
+fn concurrent_gnomon_processes() -> u64 {
+    // /proc enumerates process leaders. sysinfo 0.30 also enumerates their
+    // tasks, charging each worker thread another process's memory share and
+    // spending most of a tiny scoring run inspecting unrelated task state.
+    let processes =
+        fs::read_dir("/proc").expect("Cannot inspect /proc to determine the scoring memory share");
+    let count = processes
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .as_encoded_bytes()
+                .iter()
+                .all(u8::is_ascii_digit)
+        })
+        .filter(|entry| {
+            fs::read_to_string(entry.path().join("comm"))
+                .is_ok_and(|name| name.starts_with("gnomon"))
+        })
+        .count();
+    (count as u64).max(1)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn concurrent_gnomon_processes() -> u64 {
+    let mut system = System::new();
+    system.refresh_processes_specifics(ProcessRefreshKind::new());
     let count = system
         .processes()
         .values()
@@ -250,11 +279,8 @@ fn concurrent_gnomon_processes(system: &System) -> u64 {
 fn default_max_ram_bytes() -> usize {
     let mut system = System::new();
     system.refresh_memory();
-    // Budgeting needs executable names, not CPU histories, process memory,
-    // environments, or disk statistics for every process on the machine.
-    system.refresh_processes_specifics(ProcessRefreshKind::new());
     let available = system.available_memory();
-    let siblings = concurrent_gnomon_processes(&system);
+    let siblings = concurrent_gnomon_processes();
 
     // TWO BOUNDS, AND THE SMALLER WINS.
     //
@@ -396,11 +422,7 @@ fn open_scoring_bed_source(
     context: &PipelineContext,
     path: &Path,
 ) -> Result<io::BedSource, PipelineError> {
-    io::open_bed_source_for_scoring(
-        path,
-        context.genome_build,
-        &context.prep_result,
-    )
+    io::open_bed_source_for_scoring(path, context.genome_build, &context.prep_result)
 }
 
 fn result_bytes(result_size: usize) -> Result<usize, PipelineError> {

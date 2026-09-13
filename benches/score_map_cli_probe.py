@@ -15,7 +15,8 @@ root = Path('/projects/standard/hsiehph/sauer354/gnomon/.validation/score-map-20
 large = '--large' in sys.argv or '--biobank' in sys.argv
 single = '--single' in sys.argv
 biobank = '--biobank' in sys.argv
-log_prefix = 'biobank-' if biobank else 'single-' if single else 'large-' if large else ''
+missing_data = '--missing' in sys.argv
+log_prefix = 'missing-' if missing_data else 'biobank-' if biobank else 'single-' if single else 'large-' if large else ''
 work = root/('work-' + log_prefix.rstrip('-') if log_prefix else 'work')
 work.mkdir(exist_ok=True)
 for label, score, mapper in [('before',root/'baseline-score',root/'baseline-map'),('after',root/'target/release/gnomon-score',root/'after-map')]:
@@ -24,7 +25,7 @@ for label, score, mapper in [('before',root/'baseline-score',root/'baseline-map'
         link=root/label/name
         if not link.exists(): link.symlink_to(target)
 source = Path('/scratch.global/sauer354/gnomon-swarm/data/map/synth/c50k_20k')
-n = 500000 if biobank else 1 if single else 50000 if large else 16384
+n = 1025 if missing_data else 500000 if biobank else 1 if single else 50000 if large else 16384
 rows = Path(str(source)+'.bim').read_text().splitlines()[:8192 if large else 4096]
 fam = Path(str(source)+'.fam').read_text().splitlines()
 prefix = work/'panel'
@@ -35,11 +36,16 @@ if not prefix.with_suffix('.bed').exists():
         out.write(bed[:3])
         for j in range(len(rows)):
             row = bed[3+j*stride:3+(j+1)*stride]
-            out.write((row * ((n + len(fam) - 1)//len(fam)))[:(n+3)//4])
+            row = bytearray((row * ((n + len(fam) - 1)//len(fam)))[:(n+3)//4])
+            if missing_data:
+                for sample in range((-j*7) % 13, n, 13):
+                    shift = (sample % 4) * 2
+                    row[sample//4] = (row[sample//4] & ~(3 << shift)) | (1 << shift)
+            out.write(row)
         bed.close()
     prefix.with_suffix('.bim').write_text('\n'.join(rows)+'\n')
     prefix.with_suffix('.fam').write_text(''.join('F{0} I{0} 0 0 0 -9\n'.format(i) for i in range(n)))
-if (single or biobank) and not prefix.with_suffix('.hwe.json').exists():
+if (single or biobank or missing_data) and not prefix.with_suffix('.hwe.json').exists():
     shutil.copyfile(root/('work-large' if biobank else 'work')/'panel.hwe.json', prefix.with_suffix('.hwe.json'))
 if not prefix.with_suffix('.hwe.json').exists():
     result=subprocess.run([str(root/'before/gnomon-map'),'fit','--components','4','--threads','4',str(prefix)],cwd=work,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,universal_newlines=True,timeout=25)

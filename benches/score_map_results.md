@@ -14,18 +14,26 @@ same four-core setup (three-run medians unless marked otherwise):
 
 | Workload | Before | Current | Speedup | Current peak RSS |
 | --- | ---: | ---: | ---: | ---: |
-| Score: 1 person, 2,048 variants, 9 scores | 0.685 s | 0.270 s | 2.53× | 31.3 MiB |
-| Project: 1 person, 4,096 variants, 4 PCs | 0.057 s | 0.048 s | 1.19× | 17.4 MiB |
+| Score: 1 person, 2,048 variants, 9 scores | 0.519 s | 0.054 s | 9.65× | 13.2 MiB |
+| Project: 1 person, 4,096 variants, 4 PCs | 0.040 s | 0.042 s | 0.95× | 17.1 MiB |
 | Score: 50,000 people, 8,192 variants, 9 scores | 2.178 s | 1.291 s | 1.69× | 193.1 MiB |
 | Project: 50,000 people, 8,192 variants, 4 PCs | 2.469 s | 0.815 s | 3.03× | 139.2 MiB |
 | Score: 500,000 people, 8,192 variants, 9 scores (one pair) | 12.794 s | 8.427 s | 1.52× | 1.68 GiB |
+| Project: 500,000 people, 8,192 variants, 4 PCs (one pair) | 21.125 s | 5.957 s | 3.55× | 1.19 GiB |
+| Score: 1,025 people, 2,048 variants, 9 scores, 7.7% missing | 0.630 s | 0.082 s | 7.67× | 15.8 MiB |
+| Project: 1,025 people, 4,096 variants, 4 PCs, 7.7% missing | 0.200 s | 0.139 s | 1.44× | 17.1 MiB |
 
 The 500,000-person fixture repeats the synthetic 50,000-person genotypes ten
 times with unique sample identifiers; it tests scale, not genetic diversity.
+The single-person rows include the final Linux process-census change; larger
+rows were measured before that startup-only change. Single-person projection
+is essentially unchanged within the observed scheduling/startup variation.
 Score outputs remained byte-identical. Grouped projection changes floating
 point addition order: the 50,000-person maximum absolute difference was
 `1.36e-13`, within the independent scalar checks' tolerance. All 13 focused
-tests passed, including padded bytes, partial variant groups, allele swaps,
+tests also passed after incorporating main's parallel VCF reader and feature
+gating changes. The 500,000-person projection difference was `1.60e-13`.
+Coverage includes padded bytes, partial variant groups, allele swaps,
 both missingness representations, and SIMD boundaries. The production score
 and map executables were rebuilt from the warm cache.
 
@@ -37,6 +45,21 @@ The attempted grouped-table scoring engine regressed several regimes and
 was removed. `score_map_cli_probe.py` adds `--single`, `--large`, and
 `--biobank`; use `--once --score-only` or `--once --project-only` to keep
 each biobank experiment bounded. RSS is measured by `/usr/bin/time`.
+`--missing` exercises automatic dense information storage with a partial
+sample byte. Projection differs from the original by at most `6.40e-14`.
+Grouped projection caps sample tiles at the existing cohort-dependent chunk
+size, preserving parallelism around the 1,024-person dispatch threshold.
+The small missing-data timings varied with shared-node load; the reported
+comparison uses interleaved runs from the same final measurement session.
+
+Linux memory planning now enumerates process leaders through `/proc/*/comm`.
+The former sysinfo census took 198 ms on its first call and 43 ms warm, versus
+20–25 ms for names alone. More significantly, it reported 54 gnomon tasks
+where `/proc/*/status` confirmed only four unique process leaders. The new
+census counts the four processes for the fair-share memory cap, so starting
+more worker threads no longer shrinks a process's budget. Non-Linux systems
+retain the narrow sysinfo query. VCF materialization also refreshes memory
+without building an unrelated process census.
 
 The earlier checkpoint measurements follow.
 

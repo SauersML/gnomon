@@ -43,6 +43,7 @@ use std::hint::black_box;
 use std::time::Instant;
 fn next(seed: &mut u64) -> u64 { *seed ^= *seed << 13; *seed ^= *seed >> 7; *seed ^= *seed << 17; *seed }
 fn main() {
+    before::packed_projection_kernels_match_scalar_calls_and_missingness();
     after::packed_projection_kernels_match_scalar_calls_and_missingness();
     println!("scalar score, missing-list and missing-information checks passed");
     let mut seed = 42;

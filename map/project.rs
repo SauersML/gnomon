@@ -3289,6 +3289,7 @@ fn accumulate_packed_cpu_block_row_major_dense_missing(
             block_variant_bytes,
             block_score_vectors,
             block_swapped,
+            sample_chunk,
             components,
             scores_row_major,
             missing_info_storage,
@@ -3419,6 +3420,7 @@ fn accumulate_packed_cpu_block_row_major_sparse_missing(
             block_variant_bytes,
             block_score_vectors,
             block_swapped,
+            sample_chunk,
             components,
             scores_row_major,
             missing_variants,
@@ -3483,12 +3485,16 @@ fn accumulate_grouped_projection<M: Send, F: Fn(&mut [M], usize) + Sync>(
     bytes: &[&[u8]],
     vectors: &[f64],
     swapped: &[bool],
+    sample_chunk: usize,
     components: usize,
     scores: &mut [f64],
     missing: &mut [M],
     missing_stride: usize,
     add_missing: F,
 ) {
+    // Retain enough parallel sample chunks for small cohorts. A fixed 1,024
+    // samples would serialize almost all work for a 1,025-person cohort.
+    let sample_chunk = sample_chunk.min(genotype_table::SAMPLE_TILE);
     let table_len = genotype_table::TABLE_ROWS * components;
     let groups_per_tile = (genotype_table::TABLE_BUDGET_BYTES / (table_len * size_of::<f64>()))
         .min(bytes.len().div_ceil(4))
@@ -3517,11 +3523,11 @@ fn accumulate_grouped_projection<M: Send, F: Fn(&mut [M], usize) + Sync>(
             );
         }
         scores
-            .par_chunks_mut(genotype_table::SAMPLE_TILE * components)
-            .zip(missing.par_chunks_mut(genotype_table::SAMPLE_TILE * missing_stride))
+            .par_chunks_mut(sample_chunk * components)
+            .zip(missing.par_chunks_mut(sample_chunk * missing_stride))
             .enumerate()
             .for_each(|(chunk, (scores, missing))| {
-                let sample_start = chunk * genotype_table::SAMPLE_TILE;
+                let sample_start = chunk * sample_chunk;
                 let samples = scores.len() / components;
                 let mut keys = [0u8; genotype_table::SAMPLE_TILE];
                 for group in 0..groups {

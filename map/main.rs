@@ -1316,7 +1316,7 @@ fn materialized_matrix_bytes(n_samples: usize, n_variants: usize) -> u128 {
 /// (an unusual container configuration) can still under-report pressure — the
 /// scan's incremental ceiling is what keeps that from becoming an OOM.
 fn vcf_materialization_budget_bytes() -> u128 {
-    let mut system = System::new_all();
+    let mut system = System::new();
     system.refresh_memory();
     let available = system.available_memory();
     let budget = if available > 0 {
