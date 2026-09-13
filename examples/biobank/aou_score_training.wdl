@@ -19,6 +19,7 @@ workflow aou_score_training {
     String runtime_image
     String checkpoint_uri
     File? resume_scoring_checkpoint
+    Boolean smoke_only = true
   }
   call train { input:
     sources=sources, analysis_config=analysis_config, scoring_config=scoring_config,
@@ -27,7 +28,7 @@ workflow aou_score_training {
     relatedness_prune=relatedness_prune, phenotype_library_archive=phenotype_library_archive,
     reference_ctn=reference_ctn, wheelhouse_archive=wheelhouse_archive,
     runtime_image=runtime_image, checkpoint_uri=checkpoint_uri,
-    resume_scoring_checkpoint=resume_scoring_checkpoint
+    resume_scoring_checkpoint=resume_scoring_checkpoint, smoke_only=smoke_only
   }
   output {
     File metrics=train.metrics
@@ -55,6 +56,7 @@ task train {
     String runtime_image
     String checkpoint_uri
     File? resume_scoring_checkpoint
+    Boolean smoke_only = true
   }
   command <<<
     set -euo pipefail
@@ -106,11 +108,11 @@ task train {
         --scores work/score/shared_features.tar.gz --ancestry "$7" --prune "$8" \
         --output work/results --runtime-image runtime_image.json --checkpoint-uri "${10}" \
         --endpoint-config endpoint.json --score-panel aou_pgs_panel.json \
-        --reference-ctn-list reference_ctn.json --smoke-only --resume-latest
+        --reference-ctn-list reference_ctn.json --resume-latest ${12}
     ' bash "~{wheelhouse_archive}" "~{analysis_config}" "~{scoring_config}" \
       "~{score_weights}" "~{genotype_fam}" "~{prior_shared_features_uri}" \
       "~{ancestry_predictions}" "~{relatedness_prune}" "~{phenotype_library_archive}" "~{checkpoint_uri}" \
-      "~{default="" resume_scoring_checkpoint}"
+      "~{default="" resume_scoring_checkpoint}" "~{if smoke_only then "--smoke-only" else ""}"
   >>>
   output {
     File metrics="work/results/metrics.json"
