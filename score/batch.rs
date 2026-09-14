@@ -125,7 +125,34 @@ pub fn run_person_major_path(
                 .len()
                 .saturating_mul(columns / 4)
     {
-        run_sparse_scores_packed(
+        run_sparse_scores_packed::<false>(
+            variant_major_data,
+            weights_for_batch,
+            missing_corrections_for_batch,
+            reconciled_variant_indices_for_batch,
+            prep_result,
+            partial_scores_out,
+            partial_missing_counts_out,
+        );
+        return Ok(());
+    }
+
+    if (1..=64).contains(&columns)
+        && prep_result.num_people_to_score >= 64
+        && matches!(
+            prep_result.person_subset,
+            crate::score::types::PersonSubset::Indices(_)
+        )
+        && (columns <= 4
+            || reconciled_variant_indices_for_batch
+                .iter()
+                .map(|&index| prep_result.variant_csr_view(index).len())
+                .sum::<usize>()
+                <= reconciled_variant_indices_for_batch
+                    .len()
+                    .saturating_mul(columns / 4))
+    {
+        run_sparse_scores_packed::<true>(
             variant_major_data,
             weights_for_batch,
             missing_corrections_for_batch,
@@ -693,7 +720,7 @@ fn run_narrow_scores_packed<const COLUMNS: usize>(
 
 /// Compile one score's active rows into a bounded schedule, then keep its SIMD
 /// accumulators in registers. Sparse columns never expand into a dosage tile.
-fn run_sparse_scores_packed(
+fn run_sparse_scores_packed<const SELECTED: bool>(
     data: &[u8],
     weights: &[f32],
     corrections: &[f32],
@@ -730,14 +757,46 @@ fn run_sparse_scores_packed(
                 continue;
             }
             for person in (0..full_people).step_by(32) {
+                // This topology is reused for every scheduled row. The complete
+                // cohort specialization eliminates it at compile time.
+                let byte_offsets: [[usize; 8]; 4] = if SELECTED {
+                    core::array::from_fn(|lane| {
+                        core::array::from_fn(|byte| {
+                            prep.output_idx_to_fam_idx[person + byte * 4 + lane].0 as usize / 4
+                        })
+                    })
+                } else {
+                    [[0; 8]; 4]
+                };
+                let shifts: [Simd<u32, 8>; 4] = if SELECTED {
+                    core::array::from_fn(|lane| {
+                        Simd::from_array(core::array::from_fn(|byte| {
+                            2 * (prep.output_idx_to_fam_idx[person + byte * 4 + lane].0 % 4)
+                        }))
+                    })
+                } else {
+                    [Simd::splat(0); 4]
+                };
                 let mut sums = [Simd::<f64, 8>::splat(0.0); 4];
                 let mut counts = [Simd::<u32, 8>::splat(0); 4];
                 for &(row_offset, weight, correction) in &schedule[..len] {
                     let offset = row_offset + person / 4;
-                    let packed: Simd<u32, 8> =
-                        Simd::<u8, 8>::from_slice(&data[offset..offset + 8]).cast();
+                    let packed: Simd<u32, 8> = if SELECTED {
+                        Simd::splat(0)
+                    } else {
+                        Simd::<u8, 8>::from_slice(&data[offset..offset + 8]).cast()
+                    };
                     for lane in 0..4 {
-                        let code = (packed >> Simd::splat(2 * lane as u32)) & Simd::splat(3);
+                        let code = if SELECTED {
+                            let gathered: Simd<u32, 8> =
+                                Simd::<u8, 8>::from_array(core::array::from_fn(|byte| {
+                                    data[row_offset + byte_offsets[lane][byte]]
+                                }))
+                                .cast();
+                            (gathered >> shifts[lane]) & Simd::splat(3)
+                        } else {
+                            (packed >> Simd::splat(2 * lane as u32)) & Simd::splat(3)
+                        };
                         let high = code >> Simd::splat(1);
                         let dosage = high + (high & code);
                         let absent = code.simd_eq(Simd::splat(1));
@@ -760,8 +819,13 @@ fn run_sparse_scores_packed(
             }
             for person in full_people..people {
                 let cell = person * columns + column;
+                let physical = if SELECTED {
+                    prep.output_idx_to_fam_idx[person].0 as usize
+                } else {
+                    person
+                };
                 for &(offset, weight, correction) in &schedule[..len] {
-                    let code = (data[offset + person / 4] >> (2 * (person % 4))) & 3;
+                    let code = (data[offset + physical / 4] >> (2 * (physical % 4))) & 3;
                     match code {
                         0 => (),
                         1 => {
@@ -1382,7 +1446,7 @@ mod tests {
                     let reconciled = vec![ReconciledVariantIndex(0); variants];
                     let mut scores = vec![0.125; people * columns];
                     let mut counts = vec![7; people * columns];
-                    run_sparse_scores_packed(
+                    run_sparse_scores_packed::<false>(
                         &data,
                         &weights,
                         &corrections,
@@ -1398,6 +1462,83 @@ mod tests {
                             for variant in 0..variants {
                                 let code = (data[variant * row_bytes + person / 4]
                                     >> (2 * (person % 4)))
+                                    & 3;
+                                if code == 1 {
+                                    expected -= corrections[variant * stride + column] as f64;
+                                    absent += u32::from(active.contains(&column));
+                                } else if code > 1 {
+                                    expected += (code - 1) as f64
+                                        * weights[variant * stride + column] as f64;
+                                }
+                            }
+                            assert!(
+                                (scores[person * columns + column] - (0.125 + expected)).abs()
+                                    < 1e-11
+                            );
+                            assert_eq!(counts[person * columns + column], absent);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn selected_packed_scores_match_scalar_for_gapped_and_unaligned_people() {
+        for columns in [1usize, 4, 5, 32, 64] {
+            for people in [64usize, 65, 95, 129] {
+                for step in [1usize, 3, 17] {
+                    let physical_people = people * step + 3;
+                    let active = if columns == 1 {
+                        vec![0]
+                    } else {
+                        vec![0, columns - 1]
+                    };
+                    let mut prep = make_sparse_panel_prep(physical_people, columns, &active);
+                    let indices: Vec<u32> = (0..people)
+                        .map(|person| (person * step + 3) as u32)
+                        .collect();
+                    prep.num_people_to_score = people;
+                    prep.bytes_per_variant = physical_people.div_ceil(4) as u64;
+                    prep.output_idx_to_fam_idx =
+                        indices.iter().copied().map(OriginalPersonIndex).collect();
+                    prep.person_subset =
+                        crate::score::types::PersonSubset::Indices(indices.clone());
+                    let variants = 257;
+                    let stride = prep.stride();
+                    let row_bytes = prep.bytes_per_variant as usize;
+                    let data: Vec<u8> = (0..row_bytes * variants)
+                        .map(|i| (i * 73 + i / row_bytes * 19) as u8)
+                        .collect();
+                    let mut weights = vec![0.0f32; stride * variants];
+                    let mut corrections = weights.clone();
+                    for variant in 0..variants {
+                        for &column in &active {
+                            weights[variant * stride + column] =
+                                (variant % 73) as f32 / 173.0 - 0.21;
+                            corrections[variant * stride + column] = (variant % 43) as f32 / 137.0;
+                        }
+                    }
+                    let reconciled = vec![ReconciledVariantIndex(0); variants];
+                    let mut scores = vec![0.125; people * columns];
+                    let mut counts = vec![7; people * columns];
+                    run_sparse_scores_packed::<true>(
+                        &data,
+                        &weights,
+                        &corrections,
+                        &reconciled,
+                        &prep,
+                        &mut scores,
+                        &mut counts,
+                    );
+                    for (person, &physical) in indices.iter().enumerate() {
+                        let physical = physical as usize;
+                        for column in 0..columns {
+                            let mut expected = 0.0;
+                            let mut absent = 7;
+                            for variant in 0..variants {
+                                let code = (data[variant * row_bytes + physical / 4]
+                                    >> (2 * (physical % 4)))
                                     & 3;
                                 if code == 1 {
                                     expected -= corrections[variant * stride + column] as f64;

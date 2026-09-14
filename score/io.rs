@@ -37,11 +37,11 @@ fn choose_score_path(
     original: &impl Fn(&[u8]) -> ComputePath,
 ) -> ComputePath {
     let columns = prep.score_names.len();
-    if (5..=64).contains(&columns)
+    if (1..=64).contains(&columns)
         && prep.num_people_to_score >= 64
-        && matches!(prep.person_subset, crate::score::types::PersonSubset::All)
         && u32::try_from(index).ok().is_some_and(|index| {
-            prep.variant_csr_view(ReconciledVariantIndex(index)).len() <= columns / 4
+            columns <= 4
+                || prep.variant_csr_view(ReconciledVariantIndex(index)).len() <= columns / 4
         })
     {
         // The old tree sees total panel width and sends all wide-panel rows to
@@ -103,7 +103,7 @@ mod tests {
         prep.person_subset = crate::score::types::PersonSubset::Indices((0..64).collect());
         assert_eq!(
             choose_score_path(&[0xff; 16], &prep, 0, &original),
-            ComputePath::NoPivot
+            ComputePath::Pivot
         );
     }
 }

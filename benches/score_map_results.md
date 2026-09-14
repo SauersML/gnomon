@@ -1,5 +1,46 @@
 # Score and packed projection performance
 
+## Kept people and small narrow panels
+
+The packed schedules now gather arbitrary kept people directly from the physical
+BED rows. Per-block byte offsets and bit shifts are reused across the scheduled
+variants; scratch remains a fixed schedule plus roughly 384 bytes of selection
+topology. The complete-cohort specialization removes gather code at compile
+time. Dispatch also admits common-call rows from 1–4-score panels with at least
+64 selected people, which the old tree often sent to scalar accumulation.
+
+Full 1,799,239-marker inputs on four pinned MSI Milan cores:
+
+| Scored people / physical cohort | Scores | Before compute | After compute | Speedup |
+| --- | ---: | ---: | ---: | ---: |
+| 512 / 512 | 1 | 655 ms | 100 ms | 6.57× |
+| 512 irregularly kept / 3,200 | 1 | 1,013 ms | 290 ms | 3.49× |
+| 512 irregularly kept / 3,200 | 32 | 3,551 ms | 1,540 ms | 2.31× |
+| 65 irregularly kept / 3,200 | 32 | 762 ms | 653 ms | 1.17× |
+
+These are single before/after observations; preparation and output writing are
+excluded. A second 512-person one-score check took 111 ms and matched its old
+output exactly. The one-score keep check differed by at most 1.78e-15 absolute.
+Both wide keep cases were checked against the complete 3,200-person reference;
+maximum relative difference was 3.26e-14. Every missing count matched exactly.
+Peak RSS for the wide keep checks stayed approximately 1.42 GiB, dominated by
+the mapped 1.44 GB physical BED; no cohort-sized genotype tile is added.
+
+Forty-one focused tests pass, including scalar comparisons for gapped and
+unaligned selections, 1–64 score columns, and partial person/variant groups.
+The warm production scoring library build passed on MSI in 38.00 seconds.
+Reproduction uses `cohort_score_probe.py --baseline`, `cohort_score_probe.py`,
+and `make_keep_probe.py`; logs use the `round12-` prefix in the MSI iteration
+directory. The baseline is the previous packed-panel library, not the original
+pre-optimization application.
+
+The preceding scale check scored all 12,800 replicated people across the same
+32-score panel in 9.70 seconds, with exact missing counts and maximum relative
+difference 4.55e-12 against all 3,200 seed outputs. Peak RSS was 5.42 GiB (the
+mapped 5.76 GB BED). A 51,200-person streaming check reached roughly 65% before
+its 35-second cap, with peak RSS 301 MiB. Its accuracy comparison was incomplete;
+neither full runtime nor universal OOM freedom is established by that run.
+
 ## Sparse wide-panel schedules and dispatch
 
 For complete cohorts of at least 64 people and panels of 5–64 scores, the
