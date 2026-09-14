@@ -7,8 +7,10 @@
 //! decoding genotypes to dosages or feeding loci to `SexInferenceAccumulator`
 //! one sample at a time.
 //!
-//! Only the selected rows are read: from the memory map for a local file, and in
-//! batches of ranged reads for any other byte source. The kernel expands each
+//! Only the selected rows are read: from the memory map for a local file while
+//! they fit in the memory available to the process, otherwise in batches of
+//! positional reads of the file, and in batches of ranged reads for any other byte
+//! source. The kernel expands each
 //! packed byte into one flag byte per sample and adds the flags into byte-wide
 //! accumulators, which are folded into 64-bit totals every 255 rows. Samples are
 //! split into contiguous byte ranges that rayon counts in parallel, each range
@@ -25,7 +27,7 @@ use memmap2::{Advice, UncheckedAdvice};
 use rayon::prelude::*;
 
 use crate::pipeline_error::PipelineError;
-use crate::shared::files::BedSource;
+use crate::shared::files::{BedSource, positional_reads_fit_better};
 
 /// Bytes before the first variant row of a `.bed` file (magic number and mode).
 const BED_HEADER_LEN: usize = 3;
@@ -220,10 +222,13 @@ impl<'a> BedRows<'a> {
     }
 
     /// Calls `f` with the rows at `indices`, in order, a batch at a time. A memory
-    /// map is sliced in one batch when the selected rows fit in available memory,
-    /// and in batches sized from that headroom when they do not; any other source
-    /// is read in batches of at most `batch_bytes`, one ranged read per run of
-    /// consecutive rows, and a remote one first plans exactly the selected rows.
+    /// map is sliced while the selected rows fit the headroom
+    /// ([`positional_reads_fit_better`]): in one batch when they take at most a
+    /// quarter of it, and in batches sized from it when they do not. Past it, and for
+    /// any other source, rows are read in batches of at most `batch_bytes`, one read
+    /// per run of consecutive rows: positional reads of a local file, which leave
+    /// nothing mapped, and ranged reads of a remote one, which first plans exactly the
+    /// selected rows.
     fn for_each_batch(
         &self,
         indices: &[usize],
@@ -232,9 +237,11 @@ impl<'a> BedRows<'a> {
         mut f: impl FnMut(&[&[u8]]),
     ) -> Result<(), PipelineError> {
         let row_len = self.bytes_per_variant;
+        let needed_bytes = (indices.len() as u64).saturating_mul(row_len as u64);
         if let Some(payload) = self
             .source
             .mmap_slice(BED_HEADER_LEN, row_len * self.n_variants)
+            .filter(|_| !positional_reads_fit_better(needed_bytes, available_bytes))
         {
             #[cfg(unix)]
             let map = self.source.mmap();
@@ -294,7 +301,7 @@ impl<'a> BedRows<'a> {
                     end += 1;
                 }
                 let offset = (BED_HEADER_LEN + batch[start] * row_len) as u64;
-                source.read_at(offset, &mut buffer[start * row_len..end * row_len])?;
+                source.read_at_positional(offset, &mut buffer[start * row_len..end * row_len])?;
                 start = end;
             }
             let rows: Vec<&[u8]> = buffer.chunks_exact(row_len).collect();
@@ -340,8 +347,8 @@ pub(super) fn count_evidence(
     count_evidence_batched(rows, loci, READ_BATCH_BYTES, available_bytes, progress)
 }
 
-/// [`count_evidence`] with the read batch size, and the memory available for
-/// slicing a map, given explicitly.
+/// [`count_evidence`] with the read batch size, and the memory available to the
+/// process, given explicitly.
 fn count_evidence_batched(
     rows: &BedRows<'_>,
     loci: &[(usize, LocusClass)],
@@ -973,9 +980,10 @@ mod tests {
         assert!(fetched < object_len / 4, "fetched {fetched} of {object_len} bytes");
     }
 
-    /// A mapped `.bed` counted with every selected row in one batch, and in the
-    /// small batches too little available memory forces, must give the naive
-    /// decoding's counts.
+    /// A mapped `.bed` must give the naive decoding's counts through the map in one
+    /// batch, through the map in the batches a selection past a quarter of the
+    /// headroom is cut to, and through the positional reads that take over past half
+    /// of it, in any batch size.
     #[test]
     fn mapped_rows_count_the_same_in_any_number_of_batches() {
         let mut rng = TestRng(0x3c6e_f372_fe94_f82b);
@@ -992,25 +1000,36 @@ mod tests {
             assert!(source.mmap().is_some(), "a local .bed is mapped");
             let rows = BedRows::new(&source, row_len, n_variants, n_samples);
 
-            let mut loci: Vec<(usize, LocusClass)> = (0..n_variants)
+            // Gaps and runs of consecutive rows, so reads coalesce and batches split.
+            let mut loci: Vec<(usize, LocusClass)> = (0..300)
                 .step_by(2)
                 .map(|index| (index, LocusClass::Autosome))
                 .collect();
+            loci.extend((600..650).map(|index| (index, LocusClass::Autosome)));
             loci.extend((301..600).map(|index| (index, LocusClass::XNonPar)));
             loci.extend((650..680).map(|index| (index, LocusClass::YNonPar)));
             loci.sort_by_key(|&(index, _)| index);
-            loci.dedup_by_key(|&mut (index, _)| index);
             let expected = naive_evidence(&payload, row_len, n_samples, &loci);
 
-            // 4 bytes available is a one-row batch; 4 * 25 rows a 25-row one.
-            for available_bytes in [u64::MAX, 4 * 25 * row_len as u64, 4] {
-                let evidence =
-                    count_evidence_batched(&rows, &loci, READ_BATCH_BYTES, available_bytes, |_| {})
-                        .unwrap();
-                assert_eq!(
-                    evidence, expected,
-                    "{n_samples} samples, {available_bytes} bytes available"
-                );
+            // Twice the largest class still maps it, in quarter-of-headroom batches;
+            // 4 bytes reads every class positionally, down to the 30-row Y class.
+            let x_bytes = 299 * row_len as u64;
+            assert!(!positional_reads_fit_better(x_bytes, 2 * x_bytes));
+            assert!(positional_reads_fit_better(30 * row_len as u64, 4));
+            for (available_bytes, batch_sizes) in [
+                (u64::MAX, vec![READ_BATCH_BYTES]),
+                (2 * x_bytes, vec![READ_BATCH_BYTES]),
+                (4, vec![row_len, 3 * row_len, READ_BATCH_BYTES]),
+            ] {
+                for batch_bytes in batch_sizes {
+                    let evidence =
+                        count_evidence_batched(&rows, &loci, batch_bytes, available_bytes, |_| {})
+                            .unwrap();
+                    assert_eq!(
+                        evidence, expected,
+                        "{n_samples} samples, {available_bytes} bytes available, batch {batch_bytes}"
+                    );
+                }
             }
         }
     }
