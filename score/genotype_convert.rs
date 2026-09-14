@@ -9,10 +9,10 @@
 // on repeated runs, and automatic reference genome downloading for DTC files.
 
 use convert_genome::cli::Sex;
-use convert_genome::input::InputFormat as ConvertInputFormat;
 use convert_genome::conversion::{
     DEFAULT_MAX_PARSE_ERROR_RATIO, DEFAULT_MIN_BUILD_CONFIDENCE, DEFAULT_MIN_EMITTED_VARIANTS,
 };
+use convert_genome::input::InputFormat as ConvertInputFormat;
 use convert_genome::{ConversionConfig, OutputFormat, convert_dtc_file};
 
 // Re-export the underlying Sex enum so callers (e.g. `score/main.rs`) can
@@ -120,9 +120,7 @@ pub fn detect_input_format(path: &Path) -> Option<InputFormat> {
     // resolver validates every discovered bed/bim/fam or pgen/pvar/psam triad after
     // format dispatch, so a GCS directory is unambiguously the multi-fileset PLINK
     // form accepted by `gnomon score`.
-    if path_str.starts_with("gs://")
-        && (path_str.ends_with('/') || path_str.ends_with("/*"))
-    {
+    if path_str.starts_with("gs://") && (path_str.ends_with('/') || path_str.ends_with("/*")) {
         return Some(InputFormat::Plink);
     }
 
@@ -136,8 +134,8 @@ pub fn detect_input_format(path: &Path) -> Option<InputFormat> {
     {
         // Not `with_extension`: a prefix may carry dots of its own
         // (`acaf_threshold.chr22`), which that would truncate.
-        let stem = crate::score::prepare::strip_fileset_extension(&path.to_string_lossy())
-            .to_string();
+        let stem =
+            crate::score::prepare::strip_fileset_extension(&path.to_string_lossy()).to_string();
         let exists = |ext: &str| Path::new(&format!("{stem}.{ext}")).exists();
         if (exists("bed") && exists("bim") && exists("fam"))
             || (exists("pgen") && exists("pvar") && exists("psam"))
@@ -520,7 +518,9 @@ fn cache_params_fingerprint(
 ) -> String {
     let assembly = build.unwrap_or("GRCh38");
     let panel = panel.map(|p| p.display().to_string()).unwrap_or_default();
-    let reference = reference.map(|p| p.display().to_string()).unwrap_or_default();
+    let reference = reference
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
     format!("v1\nbuild={assembly}\npanel={panel}\nreference={reference}\n")
 }
 
@@ -562,9 +562,10 @@ fn generation_dir(cache_dir: &Path, source_path: &Path, fingerprint: &str) -> Pa
 /// its files are complete whenever it exists; the parameters are still compared as a
 /// guard, and an unidentified source's generation is never served.
 fn is_generation_valid(generation: &Path, fingerprint: &str) -> bool {
-    let unidentified = generation
-        .file_name()
-        .is_some_and(|name| name.to_string_lossy().starts_with(UNIDENTIFIED_GENERATION_PREFIX));
+    let unidentified = generation.file_name().is_some_and(|name| {
+        name.to_string_lossy()
+            .starts_with(UNIDENTIFIED_GENERATION_PREFIX)
+    });
     !unidentified
         && ["genotypes.bed", "genotypes.bim", "genotypes.fam"]
             .iter()
@@ -725,7 +726,9 @@ fn parse_staging_name(name: &str) -> Option<(Option<&str>, u32)> {
 
 /// The latest modification time of a directory and of the entries directly in it.
 fn last_change(dir: &Path) -> Option<SystemTime> {
-    let mut latest = fs::metadata(dir).and_then(|metadata| metadata.modified()).ok()?;
+    let mut latest = fs::metadata(dir)
+        .and_then(|metadata| metadata.modified())
+        .ok()?;
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
             if let Ok(modified) = entry.metadata().and_then(|metadata| metadata.modified()) {
@@ -1243,7 +1246,11 @@ mod tests {
 
         assert!(is_generation_valid(&generation, "v1\n"));
         assert!(!is_generation_valid(&generation, "v2\n"));
-        let name = generation.file_name().expect("name").to_string_lossy().into_owned();
+        let name = generation
+            .file_name()
+            .expect("name")
+            .to_string_lossy()
+            .into_owned();
         assert_eq!(entry_names(&cache_dir), [name]);
     }
 
@@ -1291,10 +1298,19 @@ mod tests {
         fs::write(&source, b"version one").expect("source");
         let cache_dir = dir.path().join("sample.gnomon_cache");
         let first = generation_dir(&cache_dir, &source, "v1\nbuild=GRCh38\n");
-        assert_eq!(first, generation_dir(&cache_dir, &source, "v1\nbuild=GRCh38\n"));
-        assert_ne!(first, generation_dir(&cache_dir, &source, "v1\nbuild=GRCh37\n"));
+        assert_eq!(
+            first,
+            generation_dir(&cache_dir, &source, "v1\nbuild=GRCh38\n")
+        );
+        assert_ne!(
+            first,
+            generation_dir(&cache_dir, &source, "v1\nbuild=GRCh37\n")
+        );
         fs::write(&source, b"version two, longer").expect("edit the source");
-        assert_ne!(first, generation_dir(&cache_dir, &source, "v1\nbuild=GRCh38\n"));
+        assert_ne!(
+            first,
+            generation_dir(&cache_dir, &source, "v1\nbuild=GRCh38\n")
+        );
     }
 
     #[test]
@@ -1318,7 +1334,12 @@ mod tests {
                 version
             );
         }
-        assert_eq!(entry_names(&cache_dir).len(), 1, "{:?}", entry_names(&cache_dir));
+        assert_eq!(
+            entry_names(&cache_dir).len(),
+            1,
+            "{:?}",
+            entry_names(&cache_dir)
+        );
     }
 
     #[test]
@@ -1334,7 +1355,10 @@ mod tests {
 
         prune_superseded_generations(&cache_dir, &cache_dir.join("g-new"), "v1\n");
 
-        assert_eq!(entry_names(&cache_dir), ["g-new", "g-other", "genotypes.bed"]);
+        assert_eq!(
+            entry_names(&cache_dir),
+            ["g-new", "g-other", "genotypes.bed"]
+        );
     }
 
     #[test]
@@ -1352,8 +1376,15 @@ mod tests {
         assert_ne!(cache_a, cache_b);
         for cache in [&cache_a, &cache_b] {
             assert_eq!(cache.parent(), Some(root.as_path()));
-            let name = cache.file_name().expect("name").to_string_lossy().into_owned();
-            assert!(name.starts_with("sample.") && name.ends_with(".gnomon_cache"), "{name}");
+            let name = cache
+                .file_name()
+                .expect("name")
+                .to_string_lossy()
+                .into_owned();
+            assert!(
+                name.starts_with("sample.") && name.ends_with(".gnomon_cache"),
+                "{name}"
+            );
         }
         assert_eq!(
             conversion_cache_dir(&a, None),
@@ -1382,7 +1413,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let staging = create_staging_dir(dir.path(), &dir.path().join("g-0123456789abcdef"))
             .expect("staging directory");
-        let name = staging.file_name().expect("name").to_string_lossy().into_owned();
+        let name = staging
+            .file_name()
+            .expect("name")
+            .to_string_lossy()
+            .into_owned();
         let host = host_key();
         assert_eq!(
             parse_staging_name(&name),
@@ -1430,7 +1465,10 @@ mod tests {
         assert!(live_here.exists());
         assert!(!elsewhere.exists() && !legacy.exists());
         assert!(generation.is_dir(), "a published generation was removed");
-        assert!(cache_dir.join("genotypes.bed").is_file(), "a legacy file was removed");
+        assert!(
+            cache_dir.join("genotypes.bed").is_file(),
+            "a legacy file was removed"
+        );
     }
 
     #[test]
@@ -1446,7 +1484,10 @@ mod tests {
             unknown,
             std::time::Duration::from_secs(u64::MAX / 4),
         );
-        assert!(staging.exists(), "an owner that cannot be checked counted as dead");
+        assert!(
+            staging.exists(),
+            "an owner that cannot be checked counted as dead"
+        );
         sweep_abandoned_staging(&cache_dir, this_host, unknown, std::time::Duration::ZERO);
         assert!(!staging.exists());
     }
