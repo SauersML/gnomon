@@ -2107,6 +2107,32 @@ impl PlinkDataset {
         Ok(keys)
     }
 
+    /// Calls `visit` with the chromosome label and position of every variant, in
+    /// `.bim` order, without building keys or owning the columns.
+    pub fn for_each_variant_position(
+        &self,
+        mut visit: impl FnMut(&str, u64),
+    ) -> Result<(), PlinkIoError> {
+        let mut iter = self.variant_records()?;
+        while let Some(result) = iter.next_with(|fields, path, line| {
+            let position = fields[3]
+                .parse::<u64>()
+                .map_err(|err| PlinkIoError::MalformedRecord {
+                    path: path.display().to_string(),
+                    line,
+                    message: format!(
+                        "invalid position '{}' for variant {}: {err}",
+                        fields[3], fields[1]
+                    ),
+                })?;
+            visit(fields[0], position);
+            Ok(())
+        }) {
+            result?;
+        }
+        Ok(())
+    }
+
     pub fn into_block_source(self) -> PlinkVariantBlockSource {
         PlinkVariantBlockSource::new(
             self.bed,
@@ -6145,44 +6171,38 @@ fn count_bim_records(path: &Path) -> Result<usize, PlinkIoError> {
     let mut iter = PlinkVariantRecordIter::new(path.to_path_buf(), open_text_source(path)?);
     let mut count = 0usize;
     let mut sorted_positions = ChromPositionSortState::default();
-    while let Some(result) = iter.next() {
-        let record = result?;
-        let position =
-            record
-                .position
-                .parse::<u64>()
-                .map_err(|err| PlinkIoError::MalformedRecord {
-                    path: iter.path().display().to_string(),
-                    line: iter.line(),
-                    message: format!(
-                        "invalid position '{}' for variant {}: {err}",
-                        record.position, record.identifier
-                    ),
-                })?;
+    // Each line is validated through its borrowed columns, so counting allocates
+    // nothing per variant.
+    while let Some(result) = iter.next_with(|fields, path, line| {
+        let position = fields[3]
+            .parse::<u64>()
+            .map_err(|err| PlinkIoError::MalformedRecord {
+                path: path.display().to_string(),
+                line,
+                message: format!(
+                    "invalid position '{}' for variant {}: {err}",
+                    fields[3], fields[1]
+                ),
+            })?;
         if position == 0 {
             return Err(PlinkIoError::MalformedRecord {
-                path: iter.path().display().to_string(),
-                line: iter.line(),
-                message: format!(
-                    "position must be positive for variant {}",
-                    record.identifier
-                ),
+                path: path.display().to_string(),
+                line,
+                message: format!("position must be positive for variant {}", fields[1]),
             });
         }
-        validate_chrom_position_sorted(
-            &mut sorted_positions,
-            &record.chromosome,
-            position,
-            iter.line(),
+        validate_chrom_position_sorted(&mut sorted_positions, fields[0], position, line).map_err(
+            |err| PlinkIoError::MalformedRecord {
+                path: path.display().to_string(),
+                line,
+                message: format!(
+                    "variants are not position-sorted within chromosome {}: position {} appears after position {}",
+                    err.chromosome, err.position, err.previous_position
+                ),
+            },
         )
-        .map_err(|err| PlinkIoError::MalformedRecord {
-            path: iter.path().display().to_string(),
-            line: iter.line(),
-            message: format!(
-                "variants are not position-sorted within chromosome {}: position {} appears after position {}",
-                err.chromosome, err.position, err.previous_position
-            ),
-        })?;
+    }) {
+        result?;
         count += 1;
     }
     Ok(count)

@@ -59,33 +59,68 @@ struct SexVariantSelection {
 
 #[derive(Debug, Clone)]
 struct SelectedVariant {
-    key: VariantKey,
+    position: u64,
     chrom: Chromosome,
 }
 
+/// Chromosome class and position of every variant, in file order.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct VariantLoci {
+    chroms: Vec<Option<Chromosome>>,
+    positions: Vec<u64>,
+}
+
+impl VariantLoci {
+    fn from_keys(keys: &[VariantKey]) -> Self {
+        Self {
+            chroms: keys
+                .iter()
+                .map(|key| classify_chromosome(&key.chromosome))
+                .collect(),
+            positions: keys.iter().map(|key| key.position).collect(),
+        }
+    }
+
+    /// The loci of a PLINK 1 fileset, read from its `.bim` without building a key
+    /// per variant. A label is classified exactly as its normalized key would be,
+    /// once per run of rows that share it.
+    fn from_bim(dataset: &PlinkDataset) -> Result<Self, PlinkIoError> {
+        let mut loci = Self {
+            chroms: Vec::with_capacity(dataset.n_variants()),
+            positions: Vec::with_capacity(dataset.n_variants()),
+        };
+        let mut label = String::new();
+        let mut class = None;
+        dataset.for_each_variant_position(|chromosome, position| {
+            if chromosome != label {
+                label.clear();
+                label.push_str(chromosome);
+                class = classify_chromosome(&VariantKey::new(chromosome, position).chromosome);
+            }
+            loci.chroms.push(class);
+            loci.positions.push(position);
+        })?;
+        Ok(loci)
+    }
+}
+
 impl SexVariantSelection {
-    fn from_all_keys(keys: &[VariantKey], build: GenomeBuild) -> Self {
+    fn from_loci(loci: &VariantLoci, build: GenomeBuild) -> Self {
         const AUTOSOME_SAMPLE_TARGET: usize = 2000;
 
         let mut selected = Vec::new();
         let mut selected_autosomes = HashSet::new();
         let mut autosome_indices = Vec::new();
 
-        for (index, key) in keys.iter().enumerate() {
-            let Some(chrom) = classify_chromosome(&key.chromosome) else {
+        for (index, (&chrom, &position)) in loci.chroms.iter().zip(&loci.positions).enumerate() {
+            let Some(chrom) = chrom else {
                 continue;
             };
 
             match chrom {
                 Chromosome::Autosome => autosome_indices.push(index),
                 Chromosome::X | Chromosome::Y => {
-                    selected.push((
-                        index,
-                        SelectedVariant {
-                            key: key.clone(),
-                            chrom,
-                        },
-                    ));
+                    selected.push((index, SelectedVariant { position, chrom }));
                 }
             }
         }
@@ -98,7 +133,7 @@ impl SexVariantSelection {
                 selected.push((
                     key_index,
                     SelectedVariant {
-                        key: keys[key_index].clone(),
+                        position: loci.positions[key_index],
                         chrom: Chromosome::Autosome,
                     },
                 ));
@@ -235,13 +270,18 @@ fn infer_records(
         GenomeBuild::Build38 => PgenGenomeBuild::Grch38,
     });
     let dataset = GenotypeDataset::open(genotype_path, pgen_build)?;
-    let variant_keys = dataset.variant_keys_for_plan(&SelectionPlan::All)?;
+    let loci = match &dataset {
+        GenotypeDataset::Plink(plink) => {
+            VariantLoci::from_bim(plink).map_err(GenotypeIoError::from)?
+        }
+        _ => VariantLoci::from_keys(&dataset.variant_keys_for_plan(&SelectionPlan::All)?),
+    };
     let build = force_build.unwrap_or_else(|| {
-        let inferred = infer_build_from_keys(&variant_keys);
+        let inferred = infer_build(&loci);
         eprintln!("Inferred Genome Build: {:?}", inferred);
         inferred
     });
-    let selection = SexVariantSelection::from_all_keys(&variant_keys, build);
+    let selection = SexVariantSelection::from_loci(&loci, build);
     let records = match &dataset {
         GenotypeDataset::Plink(plink) => {
             collect_packed_inference(plink, &selection, show_progress)?
@@ -304,7 +344,7 @@ fn collect_inference(
         for local_idx in 0..filled {
             let selected = &selection.keys[processed + local_idx];
             let chrom = selected.chrom;
-            let pos = selected.key.position;
+            let pos = selected.position;
             let column_offset = local_idx * n_samples;
 
             for sample_idx in 0..n_samples {
@@ -359,7 +399,7 @@ fn collect_packed_inference(
         .iter()
         .zip(&selection.keys)
         .filter_map(|(&index, selected)| {
-            LocusClass::of(&constants, selected.chrom, selected.key.position)
+            LocusClass::of(&constants, selected.chrom, selected.position)
                 .map(|class| (index, class))
         })
         .collect();
@@ -494,14 +534,16 @@ fn sex_label(sex: InferredSex) -> &'static str {
     }
 }
 
-fn infer_build_from_keys(keys: &[VariantKey]) -> GenomeBuild {
+fn infer_build(loci: &VariantLoci) -> GenomeBuild {
     const GRCH38_THRESHOLD: u64 = 155_700_000;
     const GRCH37_THRESHOLD: u64 = 154_900_000;
 
-    let max_x = keys
+    let max_x = loci
+        .chroms
         .iter()
-        .filter(|key| matches!(classify_chromosome(&key.chromosome), Some(Chromosome::X)))
-        .map(|key| key.position)
+        .zip(&loci.positions)
+        .filter(|&(&chrom, _)| chrom == Some(Chromosome::X))
+        .map(|(_, &position)| position)
         .max();
 
     match max_x {
@@ -548,7 +590,7 @@ fn derive_platform_definition(keys: &[SelectedVariant], build: GenomeBuild) -> P
     for selected in keys {
         match selected.chrom {
             Chromosome::Autosome => n_attempted_autosomes += 1,
-            Chromosome::Y if build.is_in_y_non_par(selected.key.position) => {
+            Chromosome::Y if build.is_in_y_non_par(selected.position) => {
                 n_attempted_y_nonpar += 1
             }
             _ => {}
@@ -590,15 +632,14 @@ mod tests {
     }
 
     #[test]
-    fn infer_build_from_keys_detects_build_thresholds() {
-        let keys = vec![VariantKey::new("chrX", 155_800_000)];
-        assert_eq!(infer_build_from_keys(&keys), GenomeBuild::Build38);
+    fn infer_build_detects_build_thresholds() {
+        let loci = VariantLoci::from_keys(&[VariantKey::new("chrX", 155_800_000)]);
+        assert_eq!(infer_build(&loci), GenomeBuild::Build38);
 
-        let keys = vec![VariantKey::new("X", 155_000_000)];
-        assert_eq!(infer_build_from_keys(&keys), GenomeBuild::Build37);
+        let loci = VariantLoci::from_keys(&[VariantKey::new("X", 155_000_000)]);
+        assert_eq!(infer_build(&loci), GenomeBuild::Build37);
 
-        let keys: Vec<VariantKey> = Vec::new();
-        assert_eq!(infer_build_from_keys(&keys), GenomeBuild::Build38);
+        assert_eq!(infer_build(&VariantLoci::default()), GenomeBuild::Build38);
     }
 
     #[test]
@@ -606,23 +647,23 @@ mod tests {
         let build = GenomeBuild::Build38;
         let keys = vec![
             SelectedVariant {
-                key: VariantKey::new("1", 1_000),
+                position: 1_000,
                 chrom: Chromosome::Autosome,
             },
             SelectedVariant {
-                key: VariantKey::new("2", 2_000),
+                position: 2_000,
                 chrom: Chromosome::Autosome,
             },
             SelectedVariant {
-                key: VariantKey::new("Y", 3_000_000),
+                position: 3_000_000,
                 chrom: Chromosome::Y,
             },
             SelectedVariant {
-                key: VariantKey::new("Y", 56_887_902),
+                position: 56_887_902,
                 chrom: Chromosome::Y,
             },
             SelectedVariant {
-                key: VariantKey::new("Y", 56_887_903),
+                position: 56_887_903,
                 chrom: Chromosome::Y,
             },
         ];
@@ -669,7 +710,7 @@ mod tests {
         keys.push(VariantKey::new("Y", 3_000_000));
         keys.push(VariantKey::new("Y", 56_887_903));
 
-        let selection = SexVariantSelection::from_all_keys(&keys, build);
+        let selection = SexVariantSelection::from_loci(&VariantLoci::from_keys(&keys), build);
 
         assert_eq!(selection.keys.len(), 2003);
         let indices = &selection.indices;
@@ -1076,14 +1117,16 @@ mod tests {
         for (n_samples, missing_percent) in [(1, 3), (7, 3), (64, 0), (203, 20)] {
             let bed = write_sex_fixture(dir.path(), n_samples, missing_percent)?;
             let dataset = GenotypeDataset::open(&bed, None)?;
-            let keys = dataset.variant_keys_for_plan(&SelectionPlan::All)?;
-            let build = infer_build_from_keys(&keys);
-            assert_eq!(build, GenomeBuild::Build38);
-            let selection = SexVariantSelection::from_all_keys(&keys, build);
-            let expected = collect_inference(&dataset, &selection, false)?;
             let GenotypeDataset::Plink(plink) = &dataset else {
                 panic!("the fixture is a PLINK 1 fileset");
             };
+            let keys = dataset.variant_keys_for_plan(&SelectionPlan::All)?;
+            let loci = VariantLoci::from_keys(&keys);
+            assert_eq!(VariantLoci::from_bim(plink)?, loci);
+            let build = infer_build(&loci);
+            assert_eq!(build, GenomeBuild::Build38);
+            let selection = SexVariantSelection::from_loci(&loci, build);
+            let expected = collect_inference(&dataset, &selection, false)?;
             let packed = collect_packed_inference(plink, &selection, false)?;
 
             assert_eq!(packed.len(), n_samples);
@@ -1109,6 +1152,44 @@ mod tests {
                 assert_eq!(calls, HashSet::from(["male", "female"]));
             }
         }
+        Ok(())
+    }
+
+    /// The `.bim` scan must classify every label as the normalized keys do,
+    /// including spellings that only resolve after normalization.
+    #[test]
+    fn bim_loci_classify_labels_like_normalized_keys() -> Result<(), Box<dyn std::error::Error>> {
+        let labels = [
+            "1", "01", "+1", "chr1", "CHR01", "chrchr1", "22", "23", "+23", "chr+23", "024", "x",
+            "chrX", "ChRx", "chrchrX", "X", "Y", "chry", "25", "XY", "PAR1", "MT", "chrM", "0",
+            "-1", "256", "chrUn_gl000220", "1", "X",
+        ];
+        let dir = tempdir()?;
+        let prefix = dir.path().join("labels");
+        let mut bim = BufWriter::new(File::create(prefix.with_extension("bim"))?);
+        for (index, label) in labels.iter().enumerate() {
+            writeln!(bim, "{label}\tv{index}\t0\t{}\tA\tG", 1_000 + index)?;
+        }
+        bim.flush()?;
+        let mut fam = BufWriter::new(File::create(prefix.with_extension("fam"))?);
+        writeln!(fam, "F0\tI0\t0\t0\t0\t-9")?;
+        fam.flush()?;
+        let mut bed = BufWriter::new(File::create(prefix.with_extension("bed"))?);
+        bed.write_all(&[0x6c, 0x1b, 0x01])?;
+        bed.write_all(&vec![0u8; labels.len()])?;
+        bed.flush()?;
+
+        let dataset = GenotypeDataset::open(prefix.with_extension("bed"), None)?;
+        let GenotypeDataset::Plink(plink) = &dataset else {
+            panic!("the fixture is a PLINK 1 fileset");
+        };
+        let keys = dataset.variant_keys_for_plan(&SelectionPlan::All)?;
+        let from_bim = VariantLoci::from_bim(plink)?;
+        assert_eq!(from_bim, VariantLoci::from_keys(&keys));
+        assert_eq!(from_bim.chroms[2], Some(Chromosome::Autosome));
+        assert_eq!(from_bim.chroms[5], Some(Chromosome::Autosome));
+        assert_eq!(from_bim.chroms[14], Some(Chromosome::X));
+        assert_eq!(from_bim.chroms[19], None);
         Ok(())
     }
 }
