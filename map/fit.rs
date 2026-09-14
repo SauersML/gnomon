@@ -8,8 +8,10 @@ use core::fmt;
 use core::marker::PhantomData;
 use dyn_stack::{MemBuffer, MemStack, StackReq};
 use faer::col::Col;
+use faer::linalg::cholesky::llt::{factor as llt_factor, solve as llt_solve};
 use faer::linalg::matmul::matmul;
 use faer::linalg::matmul::triangular as triangular_matmul;
+#[cfg(test)]
 use faer::linalg::solvers::{Llt as FaerLlt, Solve as FaerSolve};
 use faer::linalg::{temp_mat_scratch, temp_mat_uninit};
 use faer::mat::AsMatMut;
@@ -19,8 +21,8 @@ use faer::matrix_free::eigen::{
 };
 use faer::prelude::ReborrowMut;
 use faer::{
-    Accum, ColMut, Mat, MatMut, MatRef, Par, Side, get_global_parallelism, set_global_parallelism,
-    unzip, zip,
+    Accum, ColMut, Conj, Mat, MatMut, MatRef, Par, Side, get_global_parallelism,
+    set_global_parallelism, unzip, zip,
 };
 use rayon::prelude::*;
 use serde::de::Error as DeError;
@@ -6334,56 +6336,85 @@ fn ld_pair_r2_estimate(stats: &LdPairStats) -> f64 {
     (numerator / denominator).max(0.0).min(1.0)
 }
 
-/// Solves the ridge-regularized LD system whose off-diagonal entries are
-/// already in `system`, and writes the weight of every centre that shares it:
-/// `weights[t]` is the centre at row `first_center + t`.
+/// Solves the ridge-regularized LD system of one window and writes the weight
+/// of every centre that shares it: `weights[t]` is the centre at row
+/// `first_center + t`.
 ///
 /// A window is a function of its range alone, so centres whose ranges agree
 /// solve the identical system, and the one factorization serves all of them.
+///
+/// `fill_pairs` writes the strictly lower triangle into a zeroed matrix, which
+/// with the ridged diagonal is exactly the factor `Llt::new(system,
+/// Side::Lower)` copies out of a symmetric system before factoring it. The
+/// factorization and the two triangular solves are the ones `Llt::new` and
+/// `Llt::solve` run, with the same parallelism, so the weights keep every bit
+/// without the symmetric system being assembled or copied.
 fn solve_ld_system(
-    mut system: MatMut<'_, f64>,
-    mut rhs: MatMut<'_, f64>,
+    size: usize,
     first_center: usize,
     weights: &mut [f64],
     ridge: f64,
-) {
-    let size = system.nrows();
+    fill_pairs: impl Fn(MatMut<'_, f64>) -> Result<(), HwePcaError>,
+) -> Result<(), HwePcaError> {
+    let par = get_global_parallelism();
     let mut adjusted_ridge = ridge;
     for attempt in 0..2 {
         if size == 0 {
             break;
         }
+        // A failed factorization has overwritten what it read, so each attempt
+        // starts again from a zeroed matrix.
+        let mut factor = Mat::<f64>::zeros(size, size);
+        fill_pairs(factor.as_mut())?;
         for i in 0..size {
-            system[(i, i)] = 1.0 + adjusted_ridge;
-            rhs[(i, 0)] = 1.0;
+            factor[(i, i)] = 1.0 + adjusted_ridge;
         }
 
-        match FaerLlt::new(system.as_ref(), Side::Lower) {
-            Ok(factor) => {
-                let solution = factor.solve(rhs.as_ref());
-                for (offset, weight) in weights.iter_mut().enumerate() {
-                    let center = first_center + offset;
-                    if center >= size {
-                        *weight = 1.0;
-                        continue;
-                    }
-                    let mut weight_sq = solution[(center, 0)];
-                    if !weight_sq.is_finite() || weight_sq <= 0.0 {
-                        weight_sq = 1.0;
-                    }
-                    *weight = weight_sq.sqrt().max(MIN_LD_WEIGHT);
-                }
-                return;
+        let mut memory = MemBuffer::new(llt_factor::cholesky_in_place_scratch::<f64>(
+            size,
+            par,
+            Default::default(),
+        ));
+        let factored = llt_factor::cholesky_in_place(
+            factor.as_mut(),
+            Default::default(),
+            par,
+            MemStack::new(&mut memory),
+            Default::default(),
+        );
+        if factored.is_err() {
+            if attempt == 0 {
+                adjusted_ridge *= 10.0;
             }
-            Err(_) => {
-                if attempt == 0 {
-                    adjusted_ridge *= 10.0;
-                }
-            }
+            continue;
         }
+
+        let mut solution = Mat::<f64>::from_fn(size, 1, |_, _| 1.0);
+        let mut memory = MemBuffer::new(llt_solve::solve_in_place_scratch::<f64>(size, 1, par));
+        llt_solve::solve_in_place_with_conj(
+            factor.as_ref(),
+            Conj::No,
+            solution.as_mut(),
+            par,
+            MemStack::new(&mut memory),
+        );
+        for (offset, weight) in weights.iter_mut().enumerate() {
+            let center = first_center + offset;
+            if center >= size {
+                *weight = 1.0;
+                continue;
+            }
+            let mut weight_sq = solution[(center, 0)];
+            if !weight_sq.is_finite() || weight_sq <= 0.0 {
+                weight_sq = 1.0;
+            }
+            *weight = weight_sq.sqrt().max(MIN_LD_WEIGHT);
+        }
+        return Ok(());
     }
 
     weights.fill(1.0);
+    Ok(())
 }
 
 /// The streaming LD-weight pass.
@@ -6605,36 +6636,33 @@ impl LdWeightStream {
         let solve_group = |(centres, weights): (Range<usize>, &mut [f64])| {
             let window = schedule.window(centres.start);
             let size = window.len();
-            let mut system = Mat::<f64>::zeros(size, size);
-            let mut rhs = Mat::<f64>::zeros(size, 1);
-            for i in 0..size {
-                let marker_i = window.start + i;
-                let row = marker_i
-                    .checked_sub(rows_base)
-                    .and_then(|offset| rows.get(offset))
-                    .ok_or(HwePcaError::InvalidInput(
-                        "LD pair cache no longer holds a marker its window needs",
-                    ))?;
-                for j in 0..i {
-                    let marker_j = window.start + j;
-                    let value = *marker_j
-                        .checked_sub(row.first_partner)
-                        .and_then(|offset| row.r2.get(offset))
-                        .ok_or(HwePcaError::InvalidInput(
-                            "LD pair cache holds no statistics for a pair its window needs",
-                        ))?;
-                    system[(i, j)] = value;
-                    system[(j, i)] = value;
-                }
-            }
             solve_ld_system(
-                system.as_mut(),
-                rhs.as_mut(),
+                size,
                 centres.start - window.start,
                 weights,
                 ridge,
-            );
-            Ok::<(), HwePcaError>(())
+                |mut factor| {
+                    for i in 0..size {
+                        let marker_i = window.start + i;
+                        let row = marker_i
+                            .checked_sub(rows_base)
+                            .and_then(|offset| rows.get(offset))
+                            .ok_or(HwePcaError::InvalidInput(
+                                "LD pair cache no longer holds a marker its window needs",
+                            ))?;
+                        for j in 0..i {
+                            let marker_j = window.start + j;
+                            factor[(i, j)] = *marker_j
+                                .checked_sub(row.first_partner)
+                                .and_then(|offset| row.r2.get(offset))
+                                .ok_or(HwePcaError::InvalidInput(
+                                    "LD pair cache holds no statistics for a pair its window needs",
+                                ))?;
+                        }
+                    }
+                    Ok(())
+                },
+            )
         };
 
         if parallel {
