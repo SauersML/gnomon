@@ -21,7 +21,7 @@ use rustls::crypto::ring;
 use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -1729,10 +1729,19 @@ impl ByteRangeSource for PlannedByteRangeSource {
     }
 }
 
+/// Largest read a local text source issues at once. Lines are handed out as
+/// slices of the read buffer, so a `.bim` of millions of lines costs one read
+/// per megabyte and no copy per line.
+const LOCAL_TEXT_READ_BYTES: usize = 1 << 20;
+
 struct LocalTextSource {
-    reader: BufReader<File>,
-    line: Vec<u8>,
-    line_active: bool,
+    file: File,
+    buffer: Vec<u8>,
+    /// Where the next line starts in `buffer`.
+    start: usize,
+    /// End of the bytes read so far.
+    end: usize,
+    eof: bool,
     len: u64,
     path_display: String,
 }
@@ -1743,14 +1752,30 @@ impl LocalTextSource {
             .metadata()
             .map_err(|e| PipelineError::Io(format!("Metadata for {}: {e}", path.display())))?
             .len();
-        Ok(Self {
-            reader: BufReader::new(file),
-            line: Vec::with_capacity(1024),
-            line_active: false,
+        let capacity = usize::try_from(len).map_or(LOCAL_TEXT_READ_BYTES, |len| {
+            len.clamp(1, LOCAL_TEXT_READ_BYTES)
+        });
+        Ok(Self::with_capacity(path, file, len, capacity))
+    }
+
+    /// A source whose first read asks for `capacity` bytes. The buffer grows when
+    /// one line is longer than that.
+    fn with_capacity(path: &Path, file: File, len: u64, capacity: usize) -> Self {
+        Self {
+            file,
+            buffer: vec![0; capacity.max(1)],
+            start: 0,
+            end: 0,
+            eof: false,
             len,
             path_display: path.display().to_string(),
-        })
+        }
     }
+}
+
+/// A line without the one carriage return a CRLF file leaves before its newline.
+fn without_carriage_return(line: &[u8]) -> &[u8] {
+    line.strip_suffix(b"\r").unwrap_or(line)
 }
 
 impl TextSource for LocalTextSource {
@@ -1759,29 +1784,42 @@ impl TextSource for LocalTextSource {
     }
 
     fn next_line(&mut self) -> Result<Option<&[u8]>, PipelineError> {
-        if self.line_active {
-            self.line.clear();
-            self.line_active = false;
+        let mut scanned = self.start;
+        loop {
+            if let Some(offset) = memchr::memchr(b'\n', &self.buffer[scanned..self.end]) {
+                let newline = scanned + offset;
+                let start = std::mem::replace(&mut self.start, newline + 1);
+                return Ok(Some(without_carriage_return(&self.buffer[start..newline])));
+            }
+            if self.eof {
+                if self.start == self.end {
+                    return Ok(None);
+                }
+                let start = std::mem::replace(&mut self.start, self.end);
+                return Ok(Some(without_carriage_return(&self.buffer[start..self.end])));
+            }
+            // Keep the unfinished line, make room behind it, and read on.
+            if self.start > 0 {
+                self.buffer.copy_within(self.start..self.end, 0);
+                self.end -= self.start;
+                self.start = 0;
+            }
+            if self.end == self.buffer.len() {
+                self.buffer.resize(2 * self.buffer.len(), 0);
+            }
+            scanned = self.end;
+            match self.file.read(&mut self.buffer[self.end..]) {
+                Ok(0) => self.eof = true,
+                Ok(read) => self.end += read,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    return Err(PipelineError::Io(format!(
+                        "Error reading {}: {e}",
+                        self.path_display
+                    )));
+                }
+            }
         }
-
-        let bytes_read = self
-            .reader
-            .read_until(b'\n', &mut self.line)
-            .map_err(|e| PipelineError::Io(format!("Error reading {}: {e}", self.path_display)))?;
-
-        if bytes_read == 0 {
-            return Ok(None);
-        }
-
-        if self.line.last() == Some(&b'\n') {
-            self.line.pop();
-        }
-        if self.line.last() == Some(&b'\r') {
-            self.line.pop();
-        }
-
-        self.line_active = true;
-        Ok(Some(&self.line))
     }
 }
 
@@ -2827,7 +2865,7 @@ mod tests {
         assert!(source.read_at(u64::MAX, &mut [0]).is_err());
     }
     use super::*;
-    use std::io::Write;
+    use std::io::{BufRead, Write};
     use std::net::TcpListener;
     use std::sync::mpsc;
     use std::thread;
@@ -3298,5 +3336,62 @@ wgs%2Fpgen%2Fchr22%2Fsample.pgen?alt=media&userProject=wb-amiable-carrot-1173"
 
         result?;
         Ok(())
+    }
+
+    #[test]
+    fn local_text_source_lines_match_read_until_at_every_buffer_size() {
+        let texts: [&[u8]; 11] = [
+            b"",
+            b"\n",
+            b"\n\n",
+            b"a",
+            b"a\n",
+            b"a\r\n",
+            b"a\r",
+            b"a\nb",
+            b"a\n\nb\r\n\r\nlast line without a newline\r",
+            b"\r\n\r",
+            b"line one\nline two runs past sixty-four bytes, so it spans several reads\n",
+        ];
+        for text in texts {
+            let mut file = NamedTempFile::new().expect("create fixture");
+            file.write_all(text).expect("write fixture");
+            let mut expected = Vec::new();
+            let mut reader = BufReader::new(File::open(file.path()).expect("open fixture"));
+            let mut line = Vec::new();
+            while reader.read_until(b'\n', &mut line).expect("read fixture") > 0 {
+                if line.last() == Some(&b'\n') {
+                    line.pop();
+                }
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                expected.push(std::mem::take(&mut line));
+            }
+            for capacity in 1..=64 {
+                let mut source = LocalTextSource::with_capacity(
+                    file.path(),
+                    File::open(file.path()).expect("open fixture"),
+                    text.len() as u64,
+                    capacity,
+                );
+                let mut actual = Vec::new();
+                while let Some(line) = source.next_line().expect("next line") {
+                    actual.push(line.to_vec());
+                }
+                assert_eq!(
+                    actual,
+                    expected,
+                    "{:?} at capacity {capacity}",
+                    String::from_utf8_lossy(text)
+                );
+            }
+            let mut source = open_text_source(file.path()).expect("open text source");
+            let mut actual = Vec::new();
+            while let Some(line) = source.next_line().expect("next line") {
+                actual.push(line.to_vec());
+            }
+            assert_eq!(actual, expected, "{:?}", String::from_utf8_lossy(text));
+        }
     }
 }
