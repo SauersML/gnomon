@@ -94,6 +94,19 @@
 //! hundred square rather than `n × k`. The `n`-sized lift is deferred to the
 //! moments that genuinely need vectors: returning, and restarting.
 //!
+//! # The caller's cross-products, without another pass
+//!
+//! A PCA wants more than `u`: its loadings are `Xᵀu` for the factorization
+//! `C = s·X·Xᵀ`, and forming them directly is one more traversal of the data.
+//! But every pass already computes `Xᵀ·Q_j` on the way to `C·Q_j`, and
+//! `u = K s` is a combination of blocks that have all been applied, so
+//! `Xᵀu = Σ_j (Xᵀ·Q_j)·s_j` needs only the images those passes produced. An
+//! operator that can hand them back says so through
+//! [`BlockOperator::factor_rows`]; the solver keeps them beside the basis,
+//! under the same byte budget, and lifts them with the same coefficients.
+//! None of this touches the iteration itself, which runs the same arithmetic
+//! either way.
+//!
 //! # Clustered spectra
 //!
 //! Oversampling means `θ_{k+1}` is always computed, so the solver can see the
@@ -150,7 +163,28 @@ pub trait BlockOperator {
     /// resident and cheap to decode — doubling `b` roughly doubles the dominant
     /// arithmetic, and a wider block has to earn its keep against the pass it
     /// saves.
-    fn apply_block(&self, out: MatMut<'_, f64>, q: MatRef<'_, f64>) -> Result<(), Self::Error>;
+    ///
+    /// When `factor` is given, the same traversal also writes `factor ← Xᵀ · q`
+    /// for the operator's factorization `C = s·X·Xᵀ`; see [`Self::factor_rows`].
+    fn apply_block(
+        &self,
+        out: MatMut<'_, f64>,
+        factor: Option<MatMut<'_, f64>>,
+        q: MatRef<'_, f64>,
+    ) -> Result<(), Self::Error>;
+
+    /// Rows of `X`, for an operator `C = s·X·Xᵀ` whose pass computes `Xᵀ·q` on
+    /// the way to `C·q` and can hand it back; `None` for one that cannot.
+    ///
+    /// A caller that wants `Xᵀ·u` for the returned vectors — a PCA wants the
+    /// variant cross-products, from which the loadings follow — would otherwise
+    /// pay a whole extra pass to form them. They do not need one: `u = K·s` is
+    /// a combination of blocks the solver has already applied, so
+    /// `Xᵀ·u = Σ (Xᵀ·Q_i)·s_i` is assembled from images every pass computed
+    /// anyway. See [`BlockKrylovOutcome::factor_products`].
+    fn factor_rows(&self) -> Option<usize> {
+        None
+    }
 }
 
 #[derive(Debug)]
@@ -272,6 +306,14 @@ pub struct BlockKrylovOutcome {
     /// eigenspace. The span is converged; the `k`-th column individually is not
     /// a meaningful object, and no amount of further work makes it one.
     pub truncation_splits_cluster: bool,
+    /// `Xᵀ · vectors`, one column per returned vector, for an operator that
+    /// reports [`BlockOperator::factor_rows`].
+    ///
+    /// Assembled from the factor images of the blocks the returned vectors are
+    /// expressed in, so it costs no pass. `None` when the operator has no
+    /// factor, or when the images would not fit beside the basis under
+    /// `basis_budget_bytes`: the caller then forms `Xᵀ · vectors` itself.
+    pub factor_products: Option<Mat<f64>>,
 }
 
 /// One Rayleigh–Ritz step's answer, still in coefficient space.
@@ -334,6 +376,7 @@ pub fn block_krylov_eigen<Op: BlockOperator>(
             restarts: 0,
             certified_components: 0,
             truncation_splits_cluster: false,
+            factor_products: op.factor_rows().map(|rows| Mat::zeros(rows, 0)),
         });
     }
     if k > n {
@@ -357,6 +400,7 @@ pub fn block_krylov_eigen<Op: BlockOperator>(
 
     let mut start = random_start_block(n, width, params.seed);
     orthonormalize(start.as_mut(), None, par);
+    let factor_rows = op.factor_rows();
 
     'restart: loop {
         // Depth limits, in bytes, recomputed here rather than once up front:
@@ -391,17 +435,47 @@ pub fn block_krylov_eigen<Op: BlockOperator>(
         // statement about the arithmetic that ran.
         let mut h = Mat::<f64>::zeros(max_dim, max_dim);
         let mut stage: Option<Stage> = None;
+        // `Xᵀ·Q_i` for every block applied so far, kept while they fit beside
+        // the basis under the same byte budget. Once they do not — or when the
+        // operator has no factor — this is `None` until the next restart, and
+        // the caller forms `Xᵀ·u` with a pass of its own.
+        let mut images: Option<Vec<Mat<f64>>> = factor_rows.map(|_| Vec::new());
 
         for depth in 0..max_depth {
             if passes >= params.max_passes {
                 break;
             }
 
+            let images_fit = images
+                .as_ref()
+                .zip(factor_rows)
+                .is_some_and(|(retained, rows)| {
+                    (retained.len() + 1)
+                        .saturating_mul(n.saturating_add(rows))
+                        .saturating_mul(width)
+                        .saturating_mul(std::mem::size_of::<f64>())
+                        <= params.basis_budget_bytes
+                });
+            if !images_fit {
+                images = None;
+            }
+            let mut image = images
+                .as_ref()
+                .and(factor_rows)
+                .map(|rows| Mat::<f64>::zeros(rows, width));
+
             // --- the one expensive step: a single pass over the genotypes ---
             let mut z = Mat::<f64>::zeros(n, width);
-            op.apply_block(z.as_mut(), blocks[depth].as_ref())
-                .map_err(BlockKrylovError::Operator)?;
+            op.apply_block(
+                z.as_mut(),
+                image.as_mut().map(|image| image.as_mut()),
+                blocks[depth].as_ref(),
+            )
+            .map_err(BlockKrylovError::Operator)?;
             passes += 1;
+            if let (Some(retained), Some(image)) = (images.as_mut(), image) {
+                retained.push(image);
+            }
 
             // Scale reference for the exhaustion test, taken before anything is
             // subtracted: a Krylov space is exhausted when `C Q_j` lands
@@ -588,7 +662,7 @@ pub fn block_krylov_eigen<Op: BlockOperator>(
             };
 
             if converged || exhausted {
-                let (outcome, _) = finish(&blocks, &current, width, n, restarts, par);
+                let (outcome, _) = finish(&blocks, images.as_deref(), &current, width, n, restarts, par);
                 return Ok(outcome);
             }
 
@@ -602,7 +676,7 @@ pub fn block_krylov_eigen<Op: BlockOperator>(
                 && boundary_gap.is_some_and(|gap| gap < params.cluster_gap)
                 && width < width_cap
             {
-                let (outcome, retained) = finish(&blocks, &current, width, n, restarts, par);
+                let (outcome, retained) = finish(&blocks, images.as_deref(), &current, width, n, restarts, par);
                 previous = PreviousTop::Lifted(leading_columns(&retained, current.certified));
                 best = Some(outcome);
                 widened = true;
@@ -620,7 +694,7 @@ pub fn block_krylov_eigen<Op: BlockOperator>(
                 // it, so what the basis had converged is kept rather than
                 // regenerated from the same deterministic padding.
                 let current = stage.take().expect("stage was set immediately above");
-                let (outcome, retained) = finish(&blocks, &current, width, n, restarts, par);
+                let (outcome, retained) = finish(&blocks, images.as_deref(), &current, width, n, restarts, par);
                 previous = PreviousTop::Lifted(leading_columns(&retained, current.certified));
                 best = Some(outcome);
                 start = restart_block(&retained, n, width, params.seed, restarts, par);
@@ -632,7 +706,7 @@ pub fn block_krylov_eigen<Op: BlockOperator>(
         // The pass ceiling stopped the depth loop. The basis is still alive
         // here and about to be dropped, so this is the last chance to lift.
         if let Some(current) = stage.as_ref() {
-            let (outcome, _) = finish(&blocks, current, width, n, restarts, par);
+            let (outcome, _) = finish(&blocks, images.as_deref(), current, width, n, restarts, par);
             best = Some(outcome);
         }
         break;
@@ -649,8 +723,12 @@ pub fn block_krylov_eigen<Op: BlockOperator>(
 /// This is the `n × k` work the iteration defers: it happens when the solver
 /// returns or restarts, not once per pass. Returns the outcome and the full
 /// retained guard band, of which the outcome's vectors are the leading columns.
+///
+/// `images`, when present, holds `Xᵀ·Q_i` for exactly the blocks the vectors
+/// are combinations of, so the same coefficients lift them to `Xᵀ·vectors`.
 fn finish(
     blocks: &[Mat<f64>],
+    images: Option<&[Mat<f64>]>,
     stage: &Stage,
     width: usize,
     n: usize,
@@ -660,6 +738,19 @@ fn finish(
     let guard = stage.coefficients.ncols();
     let retained = lift_ritz_vectors(blocks, stage.coefficients.as_ref(), guard, width, n, par);
     let vectors = leading_columns(&retained, stage.output);
+    let factor_products = images.and_then(|images| {
+        debug_assert_eq!(images.len() * width, stage.coefficients.nrows());
+        images.first().map(|first| {
+            lift_ritz_vectors(
+                images,
+                stage.coefficients.as_ref(),
+                stage.output,
+                width,
+                first.nrows(),
+                par,
+            )
+        })
+    });
     let outcome = BlockKrylovOutcome {
         values: stage.values.clone(),
         vectors,
@@ -671,6 +762,7 @@ fn finish(
         restarts,
         certified_components: stage.certified,
         truncation_splits_cluster: stage.splits_cluster,
+        factor_products,
     };
     (outcome, retained)
 }
@@ -1229,6 +1321,10 @@ mod tests {
         }
     }
 
+    /// `C = V·diag(λ)·Vᵀ = X·Xᵀ` with `X = V·diag(√λ)`, and `V` is symmetric, so
+    /// the factor image `Xᵀq = diag(√λ)·(Vq)` is the reflected vector the
+    /// application computes anyway. Every spectrum in this suite is
+    /// non-negative, which is what makes the square root real.
     impl BlockOperator for ReflectedSpectrum {
         type Error = std::convert::Infallible;
 
@@ -1236,9 +1332,14 @@ mod tests {
             self.spectrum.len()
         }
 
+        fn factor_rows(&self) -> Option<usize> {
+            Some(self.spectrum.len())
+        }
+
         fn apply_block(
             &self,
             mut out: MatMut<'_, f64>,
+            mut factor: Option<MatMut<'_, f64>>,
             q: MatRef<'_, f64>,
         ) -> Result<(), Self::Error> {
             let n = self.spectrum.len();
@@ -1250,6 +1351,9 @@ mod tests {
                 let mut reprojection = 0.0;
                 for row in 0..n {
                     let reflected = q[(row, col)] - 2.0 * projection * self.reflector[row];
+                    if let Some(factor) = factor.as_mut() {
+                        factor[(row, col)] = reflected * self.spectrum[row].sqrt();
+                    }
                     let scaled = reflected * self.spectrum[row];
                     out[(row, col)] = scaled;
                     reprojection += self.reflector[row] * scaled;
@@ -1284,7 +1388,8 @@ mod tests {
     fn measured_relative_residual(op: &ReflectedSpectrum, outcome: &BlockKrylovOutcome) -> f64 {
         let u = &outcome.vectors;
         let mut image = Mat::<f64>::zeros(u.nrows(), u.ncols());
-        op.apply_block(image.as_mut(), u.as_ref()).expect("apply");
+        op.apply_block(image.as_mut(), None, u.as_ref())
+            .expect("apply");
         let mut worst = 0.0f64;
         for col in 0..u.ncols() {
             let value = outcome.values[col];
@@ -1518,6 +1623,123 @@ mod tests {
             outcome.max_relative_residual, outcome.subspace_delta
         );
         assert_values_match(&outcome.values, &spectrum, 1e-6);
+        // A budget that cannot hold two blocks cannot hold their factor images
+        // either. The caller is told so rather than handed products that were
+        // never retained.
+        assert!(outcome.factor_products.is_none());
+    }
+
+    /// `Xᵀ·U`, multiplied out directly with the operator's own factor.
+    fn direct_factor_products(op: &ReflectedSpectrum, outcome: &BlockKrylovOutcome) -> Mat<f64> {
+        let u = &outcome.vectors;
+        let mut image = Mat::<f64>::zeros(u.nrows(), u.ncols());
+        let mut products = Mat::<f64>::zeros(u.nrows(), u.ncols());
+        op.apply_block(image.as_mut(), Some(products.as_mut()), u.as_ref())
+            .expect("apply");
+        products
+    }
+
+    fn assert_factor_products_match(op: &ReflectedSpectrum, outcome: &BlockKrylovOutcome) {
+        let assembled = outcome
+            .factor_products
+            .as_ref()
+            .expect("the images fit the budget, so the products were assembled");
+        let direct = direct_factor_products(op, outcome);
+        assert_eq!(assembled.nrows(), direct.nrows());
+        assert_eq!(assembled.ncols(), outcome.vectors.ncols());
+        for col in 0..direct.ncols() {
+            for row in 0..direct.nrows() {
+                let target = direct[(row, col)];
+                assert!(
+                    (assembled[(row, col)] - target).abs() <= 1e-10 * target.abs().max(1.0),
+                    "Xᵀu at ({row},{col}): assembled {} but direct {target}",
+                    assembled[(row, col)]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_factor_products_are_the_cross_products_of_the_returned_vectors() {
+        // The pass this exists to save computes `Xᵀ·u` for the returned vectors
+        // by streaming the data once more. The solver hands back the same
+        // numbers assembled from images its own passes produced, and they have
+        // to be the same numbers — checked here against a direct product.
+        let n = 1500;
+        let k = 6;
+        let op = reflected(geometric(n, 0.85, 1.0), 14);
+
+        let params = BlockKrylovParams::auto(k, n, 1 << 30);
+        let outcome = block_krylov_eigen(&op, k, params, Par::Seq).expect("solver runs");
+        assert!(outcome.converged);
+        assert_eq!(outcome.restarts, 0);
+        assert_factor_products_match(&op, &outcome);
+    }
+
+    #[test]
+    fn a_restart_rebuilds_the_factor_products_from_the_new_basis() {
+        // A block of 400 leaves the dense ceiling room for two blocks, so the
+        // basis restarts every second pass however large the byte budget is.
+        // What a restart carries is a sample-space block, which no pass has
+        // applied yet; the products the solver returns must come from the
+        // images of the basis the vectors are actually expressed in.
+        let n = 1500;
+        let k = 6;
+        let op = reflected(geometric(n, 0.85, 1.0), 17);
+
+        let mut params = BlockKrylovParams::auto(k, n, 1 << 30);
+        params.block_width = 400;
+        params.min_passes = 4;
+        let outcome = block_krylov_eigen(&op, k, params, Par::Seq).expect("solver runs");
+        assert!(outcome.restarts >= 1, "the dense ceiling should have forced a restart");
+        assert!(outcome.converged);
+        assert_factor_products_match(&op, &outcome);
+    }
+
+    /// The same operator with its factor hidden.
+    struct Unfactored<'a>(&'a ReflectedSpectrum);
+
+    impl BlockOperator for Unfactored<'_> {
+        type Error = std::convert::Infallible;
+
+        fn dim(&self) -> usize {
+            self.0.dim()
+        }
+
+        fn apply_block(
+            &self,
+            out: MatMut<'_, f64>,
+            factor: Option<MatMut<'_, f64>>,
+            q: MatRef<'_, f64>,
+        ) -> Result<(), Self::Error> {
+            assert!(factor.is_none(), "an operator with no factor is never asked for one");
+            self.0.apply_block(out, None, q)
+        }
+    }
+
+    #[test]
+    fn handing_back_the_factor_does_not_change_the_answer() {
+        // Keeping the images is bookkeeping beside the iteration, not part of
+        // it: with and without them the solve has to be the same arithmetic.
+        let n = 1000;
+        let op = reflected(geometric(n, 0.9, 1.0), 15);
+        let params = BlockKrylovParams::auto(4, n, 1 << 30);
+
+        let factored = block_krylov_eigen(&op, 4, params, Par::Seq).expect("factored run");
+        let plain = block_krylov_eigen(&Unfactored(&op), 4, params, Par::Seq).expect("plain run");
+
+        assert!(factored.factor_products.is_some());
+        assert!(plain.factor_products.is_none());
+        assert_eq!(factored.passes, plain.passes);
+        assert_eq!(factored.restarts, plain.restarts);
+        assert_eq!(factored.max_relative_residual, plain.max_relative_residual);
+        assert_eq!(factored.subspace_delta, plain.subspace_delta);
+        assert_eq!(factored.values, plain.values);
+        for col in 0..factored.vectors.ncols() {
+            for row in 0..factored.vectors.nrows() {
+                assert_eq!(factored.vectors[(row, col)], plain.vectors[(row, col)]);
+            }
+        }
     }
 
     #[test]

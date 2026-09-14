@@ -190,6 +190,12 @@ Lanczos: every pass advances every requested component at once.
   `‖Cu − θu‖ = ‖B_j·s_tail‖` from the trailing block, again with no extra pass.
   That is what makes an adaptive pass count possible instead of a fixed
   iteration count chosen for someone else's dataset.
+* **The loadings cost no pass either.** Each pass computes `XᵀQ_j` on the way
+  to `CQ_j`, and every Ritz vector is a combination of blocks already applied,
+  so the variant cross-products `XᵀU = Σ_j (XᵀQ_j)·s_j` that the loadings,
+  eigenvalues and scores are refined from are assembled from products the
+  solver already holds. They are kept under the Krylov basis budget; a basis
+  whose products would not fit falls back to one more traversal.
 * **Subspaces, not vectors.** Near-degenerate components rotate freely within
   their eigenspace, so a per-vector test can report failure forever on a
   subspace that has in fact settled. A second criterion tracks the mean

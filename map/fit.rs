@@ -3334,7 +3334,7 @@ impl HwePcaModel {
         }
 
         // Choose between dense and matrix-free paths
-        let (decomposition, scaler, standardized_sums_sq, observed_variants) = match gram_mode {
+        let (mut decomposition, scaler, standardized_sums_sq, observed_variants) = match gram_mode {
             CovarianceComputationMode::Dense => {
                 // PATH A: Dense - the exact reference solve, for problems small
                 // enough that forming C is the cheaper way to get it.
@@ -3391,6 +3391,7 @@ impl HwePcaModel {
                             values: selected_values,
                             vectors: selected_vectors,
                             diagnostics: Some(FitDiagnostics::exact_dense()),
+                            factor_products: None,
                         }
                     }
                     Err(e) => {
@@ -3516,31 +3517,55 @@ impl HwePcaModel {
         // relative to a subspace the solver itself declined to certify, and
         // refining it against the genotypes cannot recover what the solve did
         // not find — it only spreads an unmeasured error into more numbers that
-        // look finished. Stopping now also saves the genome traversal those
-        // numbers would have cost.
+        // look finished. Stopping now also saves the work those numbers would
+        // have cost.
         require_converged(
             decomposition.diagnostics.as_ref(),
             options.allow_unconverged,
         )?;
 
-        // One last traversal of the genome, and every number the model stores is
-        // derived from what that traversal saw.
-        //
-        // The pass forms `B = Xᵀ·U`, the cross-product of each variant with the
-        // sample basis the eigensolver returned, and — out of the same blocks,
-        // for no extra genotype read — the small `k×k` Gram `BᵀB`, which is
+        // `B = Xᵀ·U`, the cross-product of each variant with the sample basis the
+        // eigensolver returned, and the small `k×k` Gram `BᵀB`, which is
         // `(n−1)·Uᵀ·C·U`: the covariance restricted to the returned subspace,
-        // written in that subspace's own coordinates.
-        let (mut loadings, restricted_gram) = compute_loading_cross_products(
-            source,
-            &scaler,
-            variant_count,
-            block_capacity,
-            decomposition.vectors.as_ref(),
-            ld_weights_arc.as_deref(),
-            progress,
-            par,
-        )?;
+        // written in that subspace's own coordinates. Every number the model
+        // stores is derived from these.
+        //
+        // The block solver hands `B` back already assembled. Each Ritz vector is
+        // a combination of blocks it applied, and each application formed that
+        // block's `Xᵀ·Q_i` on the way to `C·Q_i`, so the same coefficients give
+        // `Xᵀ·U` without reading a genotype: a pass here would stream the same
+        // standardized matrix to recompute it to roundoff. Only the dense route,
+        // or a basis whose images did not fit the Krylov budget, still costs a
+        // traversal, which forms `B` and — out of the same blocks — `BᵀB`.
+        let (mut loadings, restricted_gram) = match decomposition.factor_products.take() {
+            Some(cross_products) => {
+                debug_assert_eq!(cross_products.nrows(), variant_count);
+                progress.on_stage_start(FitProgressStage::Loadings, variant_count);
+                let width = cross_products.ncols();
+                let mut restricted_gram = Mat::zeros(width, width);
+                matmul(
+                    restricted_gram.as_mut(),
+                    Accum::Replace,
+                    cross_products.as_ref().transpose(),
+                    cross_products.as_ref(),
+                    1.0,
+                    par,
+                );
+                progress.on_stage_advance(FitProgressStage::Loadings, variant_count);
+                progress.on_stage_finish(FitProgressStage::Loadings);
+                (cross_products, restricted_gram)
+            }
+            None => compute_loading_cross_products(
+                source,
+                &scaler,
+                variant_count,
+                block_capacity,
+                decomposition.vectors.as_ref(),
+                ld_weights_arc.as_deref(),
+                progress,
+                par,
+            )?,
+        };
 
         // Total variance = trace(covariance) = ‖X‖²_F / (n−1), where X is the
         // standardized (optionally LD-weighted) genotype matrix. Its per-variant
@@ -3559,7 +3584,7 @@ impl HwePcaModel {
         // covariance accumulated in a different pass from this one. Either way
         // `Uᵀ·C·U` is only approximately diagonal on arrival, and its
         // off-diagonal mass is precisely the error. Rotating by its eigenvectors
-        // annihilates that mass against the genotypes streamed *here*, so the
+        // annihilates that mass against the genotypes `B` was formed from, so the
         // eigenvalues, singular values, scores and loadings assembled below all
         // describe one and the same matrix instead of three nearby ones.
         let (eigenvalues, rotation) = rayleigh_ritz_rotation(restricted_gram.as_ref(), n_samples)?;
@@ -3583,6 +3608,7 @@ impl HwePcaModel {
                 par,
             ),
             diagnostics,
+            factor_products: None,
         };
         loadings = rotate_columns(loadings, rotation.as_ref(), block_capacity, par);
 
@@ -3972,9 +3998,38 @@ where
         self.n_samples
     }
 
-    fn apply(
+    fn apply(&self, out: MatMut<'_, f64>, rhs: MatRef<'_, f64>, par: Par, stack: &mut MemStack) {
+        self.apply_with_factor(out, None, rhs, par, stack);
+    }
+
+    fn conj_apply(
+        &self,
+        out: MatMut<'_, f64>,
+        rhs: MatRef<'_, f64>,
+        par: Par,
+        stack: &mut MemStack,
+    ) {
+        self.apply(out, rhs, par, stack);
+    }
+}
+
+impl<'a, S, P> StandardizedCovarianceOp<'a, S, P>
+where
+    S: VariantBlockSource + Send,
+    S::Error: Error + Send + Sync + 'static,
+    P: FitProgressObserver + Send + Sync + 'static,
+{
+    /// `out ← C·rhs`, and, when `factor` is given, `factor ← Xᵀ·rhs` for the
+    /// standardized (and LD-weighted) genotypes `X` with `C = XXᵀ/(n−1)`.
+    ///
+    /// The second product is not extra work: it is the projection every tile
+    /// forms on the way to `C·rhs`, kept instead of overwritten by the next
+    /// tile. It is what lets the block solver hand back the loadings'
+    /// cross-products without another traversal.
+    fn apply_with_factor(
         &self,
         mut out: MatMut<'_, f64>,
+        mut factor: Option<MatMut<'_, f64>>,
         rhs: MatRef<'_, f64>,
         par: Par,
         stack: &mut MemStack,
@@ -3987,6 +4042,9 @@ where
 
         debug_assert_eq!(out.nrows(), self.n_samples);
         debug_assert_eq!(rhs.nrows(), self.n_samples);
+        debug_assert!(factor.as_ref().is_none_or(|factor| {
+            factor.nrows() == self.observed_variants && factor.ncols() == rhs.ncols()
+        }));
 
         out.fill(0.0);
 
@@ -4010,7 +4068,14 @@ where
         // The real fix is to parallelize the kernel over disjoint sample ranges
         // (a reduction to form the projection, then a disjoint scatter), after
         // which this gate can go. Until then it stays.
-        if rhs.ncols() <= PACKED_RHS_MAX_COLS && self.try_apply_hardcall_packed(out.rb_mut(), rhs) {
+        //
+        // A request for the factor image takes the tile path, whose projection
+        // is that image. The solver's blocks are always wider than the gate, so
+        // this changes no production arithmetic.
+        if factor.is_none()
+            && rhs.ncols() <= PACKED_RHS_MAX_COLS
+            && self.try_apply_hardcall_packed(out.rb_mut(), rhs)
+        {
             return;
         }
 
@@ -4200,6 +4265,13 @@ where
                             par,
                         );
 
+                        if let Some(factor) = factor.as_mut() {
+                            factor
+                                .rb_mut()
+                                .submatrix_mut(start, 0, filled, rhs.ncols())
+                                .copy_from(proj_block.as_ref());
+                        }
+
                         matmul(
                             out.rb_mut(),
                             Accum::Add,
@@ -4234,16 +4306,6 @@ where
             self.fail_invalid("VariantBlockSource terminated early during covariance accumulation");
         }
     }
-
-    fn conj_apply(
-        &self,
-        out: MatMut<'_, f64>,
-        rhs: MatRef<'_, f64>,
-        par: Par,
-        stack: &mut MemStack,
-    ) {
-        self.apply(out, rhs, par, stack);
-    }
 }
 
 struct Eigenpairs {
@@ -4253,6 +4315,9 @@ struct Eigenpairs {
     /// where no solve was attempted at all — every one of which leaves the
     /// values empty and so ends the fit in an error before a model exists.
     diagnostics: Option<FitDiagnostics>,
+    /// `Xᵀ·vectors`, when the block solver assembled it from its own passes.
+    /// `None` sends the fit through the loadings pass instead.
+    factor_products: Option<Mat<f64>>,
 }
 
 #[derive(Debug)]
@@ -4359,7 +4424,16 @@ where
         self.inner.n_samples()
     }
 
-    fn apply_block(&self, out: MatMut<'_, f64>, q: MatRef<'_, f64>) -> Result<(), Self::Error> {
+    fn factor_rows(&self) -> Option<usize> {
+        Some(self.inner.observed_variants)
+    }
+
+    fn apply_block(
+        &self,
+        out: MatMut<'_, f64>,
+        factor: Option<MatMut<'_, f64>>,
+        q: MatRef<'_, f64>,
+    ) -> Result<(), Self::Error> {
         let pass = self.pass.fetch_add(1, AtomicOrdering::Relaxed) + 1;
         if let Some(progress) = self.inner.progress.as_ref() {
             progress.begin_pass(pass, self.max_passes);
@@ -4369,7 +4443,7 @@ where
 
         let result = catch_unwind(AssertUnwindSafe(|| {
             let stack = MemStack::new(&mut mem);
-            self.inner.apply(out, q, self.par, stack);
+            self.inner.apply_with_factor(out, factor, q, self.par, stack);
         }));
 
         match result {
@@ -4407,6 +4481,7 @@ where
             values: Vec::new(),
             vectors: Mat::zeros(0, 0),
             diagnostics: None,
+            factor_products: None,
         });
     }
 
@@ -4416,6 +4491,7 @@ where
             values: Vec::new(),
             vectors: Mat::zeros(n, 0),
             diagnostics: None,
+            factor_products: None,
         });
     }
 
@@ -4425,6 +4501,7 @@ where
             values: Vec::new(),
             vectors: Mat::zeros(n, 0),
             diagnostics: None,
+            factor_products: None,
         });
     }
 
@@ -4500,6 +4577,7 @@ where
             values: Vec::new(),
             vectors: Mat::zeros(n, 0),
             diagnostics,
+            factor_products: None,
         });
     }
 
@@ -4511,11 +4589,15 @@ where
             vectors[(row, idx)] = outcome.vectors[(row, idx)];
         }
     }
+    let factor_products = outcome
+        .factor_products
+        .map(|products| Mat::from_fn(products.nrows(), keep, |row, col| products[(row, col)]));
 
     Ok(Eigenpairs {
         values,
         vectors,
         diagnostics,
+        factor_products,
     })
 }
 
@@ -4538,6 +4620,7 @@ where
             values: Vec::new(),
             vectors: Mat::zeros(n, 0),
             diagnostics: None,
+            factor_products: None,
         });
     }
 
@@ -4557,6 +4640,7 @@ where
                 values: Vec::new(),
                 vectors: Mat::zeros(n, 0),
                 diagnostics: Some(FitDiagnostics::exact_dense()),
+                factor_products: None,
             });
         }
 
@@ -4580,6 +4664,7 @@ where
             values,
             vectors,
             diagnostics: Some(FitDiagnostics::exact_dense()),
+            factor_products: None,
         });
     }
 
@@ -4623,6 +4708,7 @@ where
                 values: Vec::new(),
                 vectors: Mat::zeros(n, 0),
                 diagnostics: Some(FitDiagnostics::dense_partial(false)),
+                factor_products: None,
             });
         }
 
@@ -4653,6 +4739,7 @@ where
                 values,
                 vectors,
                 diagnostics,
+                factor_products: None,
             });
         }
 
@@ -4662,6 +4749,7 @@ where
                 values,
                 vectors,
                 diagnostics,
+                factor_products: None,
             });
         }
 
@@ -8535,6 +8623,7 @@ mod tests {
             values: vec![-1.0e-12, 0.5],
             vectors: Mat::from_fn(n_samples, 2, |row, col| if row == col { 1.0 } else { 0.0 }),
             diagnostics: None,
+            factor_products: None,
         };
 
         let (singular_values, scores) = build_sample_scores(n_samples, &eigenpairs);
@@ -9718,6 +9807,90 @@ mod tests {
                 assert!(
                     (reconstructed - expected).abs() <= 1.0e-9 * expected.abs().max(1.0),
                     "X[{sample},{variant}] reconstructed as {reconstructed}, expected {expected}"
+                );
+            }
+        }
+    }
+
+    /// `Xᵀ·U = V·Σ` and `VᵀV = I` on the matrix-free route.
+    ///
+    /// The fits above are small enough to take the dense route, where `B = Xᵀ·U`
+    /// still comes from a loadings pass. The block solver instead hands `B` back
+    /// assembled from the images its own passes formed, so the same identities
+    /// are checked here against a product multiplied out from the genotypes.
+    #[test]
+    fn matrix_free_loadings_are_the_variant_cross_products() {
+        const SAMPLES: usize = 300;
+        const VARIANTS: usize = 120;
+        const COMPONENTS: usize = 3;
+        assert!(
+            matches!(
+                covariance_computation_mode(
+                    SAMPLES,
+                    VARIANTS,
+                    COMPONENTS,
+                    gram_matrix_budget_bytes()
+                ),
+                CovarianceComputationMode::Partial
+            ),
+            "this test is about the block solver's route"
+        );
+
+        let data = synthetic_genotypes(SAMPLES, VARIANTS);
+        let mut source = DenseBlockSource::new(&data, SAMPLES, VARIANTS).expect("dense source");
+        // Unstructured genotypes need not converge; the identities hold at any
+        // iterate, which is what makes them the right check.
+        let options = FitOptions {
+            allow_unconverged: true,
+            ..FitOptions::default()
+        };
+        let model = HwePcaModel::fit_k_with_options_and_progress(
+            &mut source,
+            COMPONENTS,
+            &options,
+            &Arc::new(NoopFitProgress),
+        )
+        .expect("fit succeeds");
+        assert!(matches!(
+            model.fit_diagnostics().map(|diagnostics| &diagnostics.solver),
+            Some(FitSolver::BlockKrylov)
+        ));
+        let components = model.components();
+        assert!(components > 0);
+
+        let mut standardized = data.clone();
+        {
+            let mut block =
+                MatMut::from_column_major_slice_mut(&mut standardized, SAMPLES, VARIANTS);
+            model
+                .scaler()
+                .standardize_block(block.as_mut(), 0..VARIANTS, Par::Seq);
+        }
+        let basis = model.sample_basis();
+        let loadings = model.variant_loadings();
+
+        for variant in 0..VARIANTS {
+            for component in 0..components {
+                let cross: f64 = (0..SAMPLES)
+                    .map(|sample| standardized[variant * SAMPLES + sample] * basis[(sample, component)])
+                    .sum();
+                let stored = loadings[(variant, component)] * model.singular_values()[component];
+                assert!(
+                    (cross - stored).abs() <= 1.0e-9 * cross.abs().max(1.0),
+                    "variant {variant}, component {component}: XᵀU = {cross} but V·Σ = {stored}"
+                );
+            }
+        }
+
+        for left in 0..components {
+            for right in 0..components {
+                let dot: f64 = (0..VARIANTS)
+                    .map(|row| loadings[(row, left)] * loadings[(row, right)])
+                    .sum();
+                let expected = if left == right { 1.0 } else { 0.0 };
+                assert!(
+                    (dot - expected).abs() < 1.0e-9,
+                    "VᵀV[{left},{right}] = {dot}, expected {expected}"
                 );
             }
         }
