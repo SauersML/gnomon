@@ -537,6 +537,8 @@ fn terminate_skipping_atexit(code: i32) -> ! {
 }
 
 fn main() {
+    // Before anything else, so no library warning is ever dropped.
+    gnomon::logging::install_stderr_logger();
     let result = dispatch_current_binary();
     match result {
         Ok(()) => terminate_skipping_atexit(0),

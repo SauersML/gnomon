@@ -21,6 +21,9 @@ pub mod parallel;
 
 pub mod pipeline_error;
 
+/// The stderr logger the command-line programs install, so library warnings print.
+pub mod logging;
+
 #[cfg(any(feature = "score", feature = "map", feature = "terms"))]
 pub(crate) mod genotype_table;
 

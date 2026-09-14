@@ -663,3 +663,37 @@ fn score_names_a_missing_genotype_path_as_missing() -> TestResult {
     assert!(!stderr.contains("Could not determine input format"), "{stderr}");
     Ok(())
 }
+
+/// Library warnings reach the user: the CLI installs a logger that writes records to
+/// stderr before it does anything else. An unrecognized GNOMON_LOG_LEVEL is itself
+/// reported as a warning through that logger, even for --help.
+#[test]
+fn warnings_are_logged_to_stderr_and_never_to_stdout() -> TestResult {
+    let tmp = tempdir()?;
+    let loud = Command::new(TERMS_BIN)
+        .current_dir(tmp.path())
+        .env("GNOMON_LOG_LEVEL", "loud")
+        .arg("--help")
+        .output()?;
+    let stderr = String::from_utf8_lossy(&loud.stderr);
+    assert!(
+        stderr.contains("[WARN]"),
+        "no warning record on stderr: {stderr}"
+    );
+    assert!(stderr.contains("GNOMON_LOG_LEVEL"), "{stderr}");
+    assert!(
+        !String::from_utf8_lossy(&loud.stdout).contains("[WARN]"),
+        "a log record reached stdout"
+    );
+
+    let valid = Command::new(TERMS_BIN)
+        .current_dir(tmp.path())
+        .env("GNOMON_LOG_LEVEL", "debug")
+        .arg("--help")
+        .output()?;
+    assert!(
+        !String::from_utf8_lossy(&valid.stderr).contains("is not a log level"),
+        "a valid level was reported as unrecognized"
+    );
+    Ok(())
+}
