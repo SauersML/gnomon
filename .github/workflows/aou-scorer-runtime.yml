@@ -82,8 +82,9 @@ jobs:
         run: |
           set -euo pipefail
           # The same binary must score identical values whether it reads the
-          # fixture from disk or through planned HTTP range requests. Every
-          # other variant is scored so each required row is its own range.
+          # fixture from disk or through HTTP range requests. The fixture is
+          # within one 8 MiB block, so the remote reader fetches it whole in a
+          # single request; every other variant is scored.
           mkdir -p parity/local parity/remote
           cp data/testdata/ld.bed data/testdata/ld.bim data/testdata/ld.fam parity/local/
           python3 - <<'PY'
@@ -105,8 +106,8 @@ jobs:
             ../weights.tsv http://127.0.0.1:8765/ld.bed --keep ../keep.txt --emit-components 2> scorer.log \
             || { cat scorer.log; exit 1; })
           kill "$server"
-          grep 'Remote BED read plan' parity/remote/scorer.log
-          grep -q 'Remote BED read plan: 750 required rows of 50 B in 750 ranges' parity/remote/scorer.log
+          grep 'Remote BED read whole' parity/remote/scorer.log
+          grep -q 'Remote BED read whole: 75003 B in one request' parity/remote/scorer.log
           local_out=$(find parity/local -name '*.sscore')
           remote_out=$(find parity/remote -name '*.sscore')
           test -n "$local_out" && test -n "$remote_out"

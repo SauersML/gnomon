@@ -490,6 +490,7 @@ pub fn open_bed_source_for_scoring(
         let source = open_bed_source(path, genome_build)?;
         // A small object was read whole when opened and already serves every row.
         let Some(fetch) = source.fetch.clone() else {
+            eprintln!("> Remote BED read whole: {} B in one request.", source.len());
             return Ok(source);
         };
         let reader = planned_reader(fetch, source.len(), required_rows, bytes_per_variant)?;
@@ -3024,6 +3025,50 @@ mod tests {
         source.read_at(7, &mut row).expect("required row from memory");
         assert_eq!(&row, b"efgh");
         assert!(source.read_at(9, &mut row).is_err());
+    }
+
+    #[test]
+    fn opening_a_bed_checks_its_header_locally_and_remotely() {
+        let local = tempfile::Builder::new().suffix(".bed").tempfile().unwrap();
+        for (header, reason) in [
+            ("\u{006c}\u{001c}\u{0001}", "invalid PLINK magic bytes"),
+            ("\u{006c}\u{001b}\u{0000}", "individual-major"),
+            ("\u{006c}\u{001b}\u{0002}", "invalid PLINK mode byte"),
+        ] {
+            let body = format!("{header}abcdefgh");
+            std::fs::write(local.path(), &body).unwrap();
+            let error = open_bed_source(local.path(), None).expect_err("local header");
+            assert!(error.to_string().contains(reason), "local: {error}");
+
+            // A small remote object is checked from the one request that reads it whole.
+            let (url, server) = serve_http_responses(vec![
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                ),
+                format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-{}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len() - 1,
+                    body.len(),
+                    body.len()
+                ),
+            ]);
+            let error = open_bed_source(Path::new(&url), None).expect_err("small remote header");
+            server.join().expect("HTTP server");
+            assert!(error.to_string().contains(reason), "small remote: {error}");
+
+            // A larger one is checked from a three-byte request.
+            let length = 10_000_003;
+            let (url, server) = serve_http_responses(vec![
+                format!("HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"),
+                format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-2/{length}\r\nContent-Length: 3\r\nConnection: close\r\n\r\n{header}"
+                ),
+            ]);
+            let error = open_bed_source(Path::new(&url), None).expect_err("large remote header");
+            server.join().expect("HTTP server");
+            assert!(error.to_string().contains(reason), "large remote: {error}");
+        }
     }
 
     #[test]
