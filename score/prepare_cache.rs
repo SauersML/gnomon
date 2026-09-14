@@ -1,6 +1,6 @@
 //! Content-addressed variant plans. Person selection and genotype calls are
 //! deliberately absent: the same BIM/weights can serve any cohort layout.
-use super::{FilesetPaths, PrepError};
+use super::FilesetPaths;
 use crate::score::types::{
     BimRowIndex, GenomicRegion, GroupedComplexRule, PipelineKind, PreparationResult,
     ScoreColumnIndex, ScoreInfo,
@@ -153,6 +153,11 @@ impl PlanCache {
 
     pub fn same_inputs(&self, other: &Self) -> bool {
         self.key == other.key
+    }
+
+    #[cfg(test)]
+    pub(super) fn path(&self) -> &std::path::Path {
+        &self.path
     }
 
     pub fn load(&self) -> io::Result<Option<VariantPlan>> {
@@ -455,10 +460,6 @@ impl<'a> Decoder<'a> {
         let bytes = self.vector::<u8>()?;
         String::from_utf8(bytes).map_err(|_| invalid("Invalid UTF-8 in variant plan"))
     }
-}
-
-pub(super) fn cache_error(error: io::Error) -> PrepError {
-    PrepError::Invariant(format!("Compiled variant plan: {error}"))
 }
 
 #[cfg(test)]

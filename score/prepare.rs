@@ -444,18 +444,40 @@ pub fn prepare_for_computation(
     score_regions: Option<&HashMap<String, GenomicRegion>>,
 ) -> Result<PreparationResult, PrepError> {
     let filesets = build_fileset_paths(fileset_prefixes)?;
-    let cache = cache::PlanCache::discover(&filesets, sorted_score_files, score_regions)
-        .map_err(cache::cache_error)?;
-    if let Some(cache) = &cache
-        && let Some(plan) = cache.load().map_err(cache::cache_error)?
-    {
-        eprintln!(
-            "> Reusing content-verified compiled variant plan ({} matched rows).",
-            plan.required.len()
-        );
-        let (all_iids, lookup) = parse_fam_and_build_lookup(&filesets)?;
-        let (subset, iids) = resolve_person_subset(keep_file, &all_iids, &lookup)?;
-        return assemble_preparation(plan, &filesets, subset, iids, all_iids.len(), &lookup);
+    // The plan cache only saves time. A plan that cannot be hashed, read, trusted or
+    // held within this machine's memory budget is compiled again instead.
+    let cache = match cache::PlanCache::discover(&filesets, sorted_score_files, score_regions) {
+        Ok(cache) => cache,
+        Err(error) => {
+            eprintln!("> Compiled variant plans are unavailable for these inputs: {error}.");
+            None
+        }
+    };
+    if let Some(cache) = &cache {
+        match cache.load() {
+            Ok(Some(plan)) => {
+                eprintln!(
+                    "> Reusing content-verified compiled variant plan ({} matched rows).",
+                    plan.required.len()
+                );
+                let (all_iids, lookup) = parse_fam_and_build_lookup(&filesets)?;
+                let (subset, iids) = resolve_person_subset(keep_file, &all_iids, &lookup)?;
+                return assemble_preparation(
+                    plan,
+                    &filesets,
+                    subset,
+                    iids,
+                    all_iids.len(),
+                    &lookup,
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!(
+                    "> Compiling the variant plan again; the saved one was not used: {error}."
+                );
+            }
+        }
     }
     let (prep, clean) = prepare_for_computation_with_retry(
         fileset_prefixes,
@@ -466,17 +488,22 @@ pub fn prepare_for_computation(
     )?;
     if clean && let Some(cache) = &cache {
         // Rehash after compilation so a changed source cannot be published
-        // under the digest taken before the compiler opened its readers.
-        let current = cache::PlanCache::discover(&filesets, sorted_score_files, score_regions)
-            .map_err(cache::cache_error)?;
-        if current.as_ref().is_some_and(|c| cache.same_inputs(c)) {
-            if let Err(error) = cache.save(&prep) {
-                eprintln!("> Compiled variant plan was not saved: {error}.");
+        // under the digest taken before the compiler opened its readers. A
+        // rehash that cannot run now, such as when memory has become short,
+        // publishes nothing; only a different digest means the inputs changed.
+        match cache::PlanCache::discover(&filesets, sorted_score_files, score_regions) {
+            Ok(Some(current)) if !cache.same_inputs(&current) => {
+                return Err(PrepError::Invariant(
+                    "Variant inputs changed during compilation; retry with stable inputs.".into(),
+                ));
             }
-        } else {
-            return Err(PrepError::Invariant(
-                "Variant inputs changed during compilation; retry with stable inputs.".into(),
-            ));
+            Ok(Some(_)) => {
+                if let Err(error) = cache.save(&prep) {
+                    eprintln!("> Compiled variant plan was not saved: {error}.");
+                }
+            }
+            Ok(None) => {}
+            Err(error) => eprintln!("> Compiled variant plan was not saved: {error}."),
         }
     }
     Ok(prep)
@@ -1389,6 +1416,54 @@ mod tests {
             plans.push(plan_by_row_text(&prep, &rows));
         }
         assert_eq!(plans[0], plans[1]);
+    }
+
+    #[test]
+    fn unusable_saved_plans_are_compiled_again_instead_of_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let weights = dir.path().join("weights.tsv");
+        std::fs::write(
+            &weights,
+            "variant_id\teffect_allele\tother_allele\tS\n1:100\tG\tA\t0.5\n",
+        )
+        .unwrap();
+        let prefix = dir.path().join("unusable_plan_panel");
+        std::fs::write(prefix.with_extension("bim"), "1 a 0 100 A G\n").unwrap();
+        std::fs::write(
+            prefix.with_extension("fam"),
+            "F I0 0 0 0 -9\nF I1 0 0 0 -9\n",
+        )
+        .unwrap();
+        std::fs::write(prefix.with_extension("bed"), [0x6c, 0x1b, 0x01, 0x00]).unwrap();
+        let files = build_fileset_paths(std::slice::from_ref(&prefix)).unwrap();
+        let Some(key) =
+            cache::PlanCache::discover(&files, std::slice::from_ref(&weights), None).unwrap()
+        else {
+            return;
+        };
+        let prepare = || {
+            prepare_for_computation(
+                std::slice::from_ref(&prefix),
+                std::slice::from_ref(&weights),
+                None,
+                None,
+            )
+        };
+        let first = prepare().unwrap();
+        let zeros = [0u8; 4096];
+        for garbage in [&b"truncated"[..], &zeros[..]] {
+            std::fs::create_dir_all(key.path().parent().unwrap()).unwrap();
+            std::fs::write(key.path(), garbage).unwrap();
+            assert!(key.load().is_err());
+            let again = prepare().unwrap();
+            assert_eq!(again.num_people_to_score, 2);
+            assert_eq!(again.required_bim_indices, first.required_bim_indices);
+            assert_eq!(again.score_names, first.score_names);
+            assert!(
+                key.load().unwrap().is_some(),
+                "the recompiled plan replaces the bad one"
+            );
+        }
     }
 
     #[test]
