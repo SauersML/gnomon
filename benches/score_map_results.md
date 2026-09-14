@@ -1,5 +1,45 @@
 # Score and packed projection performance
 
+## Content-addressed compiled plans
+
+Local BIM inputs can now reuse a compiled variant plan across cohort sizes,
+keep lists, and file locations. Every lookup hashes the complete BIM and
+normalized score contents, score order, region filters, and compiler source
+identity. It reconstructs person IDs, physical row widths, and fileset paths
+from the current inputs. Floating-point values use bit-preserving binary
+encoding; payload checksums, index validation, checked lengths, and charged
+allocation limits precede use. Plans live in the platform user cache under
+`gnomon/variant-plans`; writes are atomic. The file and decoded-allocation
+ceilings are each the smaller of 256 MiB and one eighth of available memory.
+Collections exceeding 1 GiB of source text, remote BIMs, and PVAR adapters
+use streaming compilation. Diagnostic-producing and sort-retried compilations
+are not published under the original inputs' key.
+
+On the full 1,799,239-marker input with PGS000018, three paired warm probes
+gave median preparation times of 1.020 s before and 110.45 ms after (9.2×).
+Every compiled index, float bit, baseline, count, and complex rule matched.
+Complete cached single-person CLI checks took 0.369 s and 0.228 s, versus the
+previous 1.355 s check. Both outputs are byte-identical to the original
+baseline; peak RSS was approximately 30 MiB. These CLI observations are warm
+shared-storage checks, not controlled medians.
+
+For 32 real normalized PGS files, 1,188,880 matched markers, and 5,385,268
+nonzero weights, a library-level probe measured uncached preparation at
+4.75–5.33 s and cached preparation at 0.515–0.642 s. All compiled artifacts
+and final score/missing-count arrays were identical. The first compile plus
+cache publication took 5.439 s versus 5.149 s for the paired compiler-only
+call: caching buys repeated-use speed and has a first-use cost. Normalization
+is excluded from this probe; an older benchmark CLI's repeated-directory
+discovery bug prevented a fair wide-panel CLI comparison.
+
+Thirty-six focused tests pass, including changed content at unchanged size
+and mtime, corrupt/truncated caches, hostile length fields, float-bit round
+trips, and rebinding the same plan to different sample counts and keep lists.
+The warm production library and CLI builds passed on MSI. Reproduction uses
+`prepare_probe.rs`, `probes/wide_plan.rs`, and `preparation_memory_checks.py`;
+logs are under the MSI iteration directory with `round5-` and `wide-plan-`
+prefixes. No new guarantee for arbitrary input sizes or OOM freedom is implied.
+
 ## Preparation and memory revision
 
 The next revision avoids heap allocation for common literal alleles, reuses

@@ -33,6 +33,9 @@ use std::time::Instant;
 // The number of SIMD lanes in the kernel. This MUST be kept in sync with kernel.rs.
 const LANE_COUNT: usize = 8;
 
+#[path = "prepare_cache.rs"]
+mod cache;
+
 // ========================================================================================
 //              Type-driven domain model for streaming
 // ========================================================================================
@@ -405,14 +408,59 @@ pub fn prepare_for_computation(
     keep_file: Option<&Path>,
     score_regions: Option<&HashMap<String, GenomicRegion>>,
 ) -> Result<PreparationResult, PrepError> {
+    let filesets = build_fileset_paths(fileset_prefixes)?;
+    let cache = cache::PlanCache::discover(&filesets, sorted_score_files, score_regions)
+        .map_err(cache::cache_error)?;
+    if let Some(cache) = &cache
+        && let Some(plan) = cache.load().map_err(cache::cache_error)?
+    {
+        eprintln!(
+            "> Reusing content-verified compiled variant plan ({} matched rows).",
+            plan.required.len()
+        );
+        let (all_iids, lookup) = parse_fam_and_build_lookup(&filesets)?;
+        let (subset, iids) = resolve_person_subset(keep_file, &all_iids, &lookup)?;
+        return assemble_preparation(plan, &filesets, subset, iids, all_iids.len(), &lookup);
+    }
     let max_sort_retries = fileset_prefixes.len().max(1);
-    prepare_for_computation_with_retry(
+    let (prep, clean) = prepare_for_computation_with_retry(
         fileset_prefixes,
         sorted_score_files,
         keep_file,
         score_regions,
         max_sort_retries,
-    )
+    )?;
+    // A sort retry produces a different physical row layout. Never publish
+    // that plan under the original, unsorted input's key.
+    let same_layout = match &prep.pipeline_kind {
+        PipelineKind::SingleFile(path) => filesets.len() == 1 && *path == filesets[0].bed,
+        PipelineKind::MultiFile(boundaries) => {
+            boundaries.len() == filesets.len()
+                && boundaries
+                    .iter()
+                    .zip(&filesets)
+                    .all(|(a, b)| a.bed_path == b.bed)
+        }
+    };
+    if clean
+        && same_layout
+        && let Some(cache) = &cache
+    {
+        // Rehash after compilation so a changed source cannot be published
+        // under the digest taken before the compiler opened its readers.
+        let current = cache::PlanCache::discover(&filesets, sorted_score_files, score_regions)
+            .map_err(cache::cache_error)?;
+        if current.as_ref().is_some_and(|c| cache.same_inputs(c)) {
+            if let Err(error) = cache.save(&prep) {
+                eprintln!("> Compiled variant plan was not saved: {error}.");
+            }
+        } else {
+            return Err(PrepError::Invariant(
+                "Variant inputs changed during compilation; retry with stable inputs.".into(),
+            ));
+        }
+    }
+    Ok(prep)
 }
 
 fn prepare_for_computation_with_retry(
@@ -421,7 +469,7 @@ fn prepare_for_computation_with_retry(
     keep_file: Option<&Path>,
     score_regions: Option<&HashMap<String, GenomicRegion>>,
     remaining_sort_retries: usize,
-) -> Result<PreparationResult, PrepError> {
+) -> Result<(PreparationResult, bool), PrepError> {
     // --- Stage 1: Initial setup ---
     eprintln!("> Stage 1: Indexing subject data...");
     let fileset_paths = build_fileset_paths(fileset_prefixes)?;
@@ -430,7 +478,6 @@ fn prepare_for_computation_with_retry(
 
     let (person_subset, final_person_iids) =
         resolve_person_subset(keep_file, &all_person_iids, &iid_to_original_idx)?;
-    let num_people_to_score = final_person_iids.len();
 
     // --- Stage 2: Global metadata discovery ---
     eprintln!("> Stage 2: Discovering all score columns...");
@@ -895,7 +942,70 @@ fn prepare_for_computation_with_retry(
         )));
     }
 
-    // --- Stage 5: Final assembly ---
+    let clean = total_malformed_lines == 0
+        && seen_invalid_bim_chrs.is_empty()
+        && seen_invalid_score_chrs.is_empty()
+        && region_filters
+            .as_ref()
+            .zip(region_filter_hits.as_ref())
+            .is_none_or(|(filters, hits)| {
+                filters
+                    .iter()
+                    .zip(hits)
+                    .all(|(region, hit)| region.is_none() || *hit)
+            });
+    let plan = cache::VariantPlan {
+        weights: sparse_weights,
+        corrections: sparse_missing_corrections,
+        columns: sparse_score_columns,
+        offsets: sparse_row_offsets,
+        baseline: baseline_missing_sum_by_score,
+        required: required_bim_indices,
+        complex: final_complex_rules,
+        names: score_names,
+        counts: score_variant_counts,
+        flags: required_is_complex,
+        total_variants: total_variants_in_bim,
+        starts: bim_iterator
+            .boundaries
+            .iter()
+            .map(|b| b.starting_global_index)
+            .collect(),
+    };
+    Ok((
+        assemble_preparation(
+            plan,
+            &fileset_paths,
+            person_subset,
+            final_person_iids,
+            total_people_in_fam,
+            &iid_to_original_idx,
+        )?,
+        clean,
+    ))
+}
+
+fn assemble_preparation(
+    plan: cache::VariantPlan,
+    fileset_paths: &[FilesetPaths],
+    person_subset: PersonSubset,
+    final_person_iids: Vec<String>,
+    total_people_in_fam: usize,
+    iid_to_original_idx: &AHashMap<String, u32>,
+) -> Result<PreparationResult, PrepError> {
+    if plan.starts.len() != fileset_paths.len() {
+        return Err(PrepError::Invariant(
+            "Variant plan fileset count mismatch.".into(),
+        ));
+    }
+    let num_people_to_score = final_person_iids.len();
+    let num_reconciled_variants = plan.required.len();
+    let stride = plan
+        .names
+        .len()
+        .div_ceil(LANE_COUNT)
+        .checked_mul(LANE_COUNT)
+        .ok_or_else(|| PrepError::Invariant("Score stride overflow.".into()))?;
     let bytes_per_variant = (total_people_in_fam as u64).div_ceil(4);
     let bytes_per_variant_usize = bytes_per_variant as usize;
     let (spool_compact_byte_index, spool_dense_map) =
@@ -924,30 +1034,41 @@ fn prepare_for_computation_with_retry(
     let pipeline_kind = if fileset_paths.len() <= 1 {
         PipelineKind::SingleFile(fileset_paths[0].bed.clone())
     } else {
-        PipelineKind::MultiFile(bim_iterator.boundaries)
+        PipelineKind::MultiFile(
+            fileset_paths
+                .iter()
+                .zip(&plan.starts)
+                .map(|(files, &start)| FilesetBoundary {
+                    bed_path: files.bed.clone(),
+                    bim_path: files.bim.clone(),
+                    fam_path: files.fam.clone(),
+                    starting_global_index: start,
+                })
+                .collect(),
+        )
     };
 
     Ok(PreparationResult::new(
-        sparse_weights,
-        sparse_missing_corrections,
-        sparse_score_columns,
-        sparse_row_offsets,
+        plan.weights,
+        plan.corrections,
+        plan.columns,
+        plan.offsets,
         stride,
-        baseline_missing_sum_by_score,
-        required_bim_indices,
-        final_complex_rules,
-        score_names,
-        score_variant_counts,
+        plan.baseline,
+        plan.required,
+        plan.complex,
+        plan.names,
+        plan.counts,
         person_subset,
         final_person_iids,
         num_people_to_score,
         total_people_in_fam,
-        total_variants_in_bim,
+        plan.total_variants,
         num_reconciled_variants,
         bytes_per_variant,
         person_fam_to_output_idx,
         output_idx_to_fam_idx,
-        required_is_complex,
+        plan.flags,
         spool_compact_byte_index,
         spool_dense_map,
         spool_bytes_per_variant,
@@ -1051,6 +1172,75 @@ fn build_spool_maps(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_variants_rebind_people_paths_and_keep_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let weights = dir.path().join("weights.tsv");
+        std::fs::write(
+            &weights,
+            "variant_id\teffect_allele\tother_allele\tS\n1:100\tG\tA\t0.25\n",
+        )
+        .unwrap();
+        let mut original_key = None;
+        for people in [1usize, 17] {
+            let prefix = dir.path().join(format!("panel{people}"));
+            std::fs::write(prefix.with_extension("bim"), "1 a 0 100 A G\n").unwrap();
+            std::fs::write(
+                prefix.with_extension("fam"),
+                (0..people)
+                    .map(|i| format!("F I{i} 0 0 0 -9\n"))
+                    .collect::<String>(),
+            )
+            .unwrap();
+            let mut bed = vec![0x6c, 0x1b, 0x01];
+            bed.resize(3 + people.div_ceil(4), 0);
+            std::fs::write(prefix.with_extension("bed"), bed).unwrap();
+            let files = build_fileset_paths(std::slice::from_ref(&prefix)).unwrap();
+            let key = cache::PlanCache::discover(&files, std::slice::from_ref(&weights), None)
+                .unwrap()
+                .unwrap();
+            if let Some(original) = &original_key {
+                assert!(key.same_inputs(original));
+            }
+            let prep = prepare_for_computation(
+                std::slice::from_ref(&prefix),
+                std::slice::from_ref(&weights),
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(prep.num_people_to_score, people);
+            assert_eq!(prep.bytes_per_variant, people.div_ceil(4) as u64);
+            assert_eq!(
+                prep.output_idx_to_fam_idx.last().unwrap().0,
+                (people - 1) as u32
+            );
+            assert!(
+                matches!(prep.pipeline_kind, PipelineKind::SingleFile(ref p) if *p == prefix.with_extension("bed"))
+            );
+            assert!(key.load().unwrap().is_some());
+            if people == 17 {
+                let keep = dir.path().join("keep.txt");
+                std::fs::write(&keep, "I16\nI3\n").unwrap();
+                let prep = prepare_for_computation(
+                    &[prefix],
+                    std::slice::from_ref(&weights),
+                    Some(&keep),
+                    None,
+                )
+                .unwrap();
+                assert_eq!(prep.total_people_in_fam, 17);
+                assert_eq!(prep.num_people_to_score, 2);
+                assert_eq!(prep.spool_compact_byte_index(), &[0, 4]);
+                assert_eq!(
+                    prep.output_idx_to_fam_idx,
+                    vec![OriginalPersonIndex(3), OriginalPersonIndex(16)]
+                );
+            }
+            original_key = Some(key);
+        }
+    }
 
     #[test]
     fn allele_storage_preserves_exact_text_and_shares_long_sequences() {

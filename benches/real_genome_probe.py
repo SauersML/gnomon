@@ -1,6 +1,6 @@
 """One bounded full-marker MSI experiment per invocation; no truncated BIMs.
 
-python3 benches/real_genome_probe.py {score,project} N {before,after} [SCORESET]
+python3 benches/real_genome_probe.py {score,project} N {before,after,round5-before} [SCORESET]
 Use taskset externally. Inputs are existing public-reference/PGS fixtures.
 """
 from pathlib import Path
@@ -19,7 +19,7 @@ root = Path('/projects/standard/hsiehph/sauer354/gnomon/target/score-map')
 data = Path('/scratch.global/sauer354/gnomon-swarm/data')
 task, n, label = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 scoreset = sys.argv[4] if len(sys.argv) > 4 else 'PGS000018'
-assert task in ['score', 'project'] and label in ['before', 'after']
+assert task in ['score', 'project'] and label in ['before', 'after', 'round5-before']
 if task == 'score':
     source = data / ('score/src/array3200' if n <= 3200 else
                      'score/panels/medium12800' if n <= 12800 else
@@ -77,7 +77,9 @@ if result.returncode == 0:
     primary = outputs[0]
     record['sha256'] = hashlib.sha256(primary.read_bytes()).hexdigest()
     shutil.copyfile(primary, work/(label + primary.suffix))
-    reference = work/('before' + primary.suffix)
+    reference = work/('round5-before' + primary.suffix)
+    if not reference.exists():
+        reference = work/('before' + primary.suffix)
     if label == 'after' and reference.exists():
         maximum_error = 0.0
         if task == 'score':
@@ -107,6 +109,7 @@ if result.returncode == 0:
                 maximum_error = max(maximum_error, abs(a-b))
                 assert abs(a-b) <= 1e-10*(1+abs(a))
         record['max_abs_difference'] = maximum_error
+        record['comparison_baseline'] = reference.name
 log = log_path.read_text()
 record['stages'] = [line for line in log.splitlines() if any(s in line.lower() for s in ['time:', 'took ', 'complete in', 'backend', 'storage:', 'overlapping', 'principal components'])]
 (work/(label+'.json')).write_text(json.dumps(record, indent=2)+'\n')

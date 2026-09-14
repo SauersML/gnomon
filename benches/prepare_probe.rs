@@ -1,4 +1,5 @@
 // Compile against the warm baseline library and current preparation source.
+pub use gnomon::{memory, output};
 pub mod pipeline_error {
     pub use gnomon::pipeline_error::*;
 }
