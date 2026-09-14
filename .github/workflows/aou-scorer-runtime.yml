@@ -84,9 +84,11 @@ jobs:
           # The same binary must score the fixture alike whether it reads it from
           # disk or through HTTP range requests. The fixture is within one 8 MiB
           # block, so the remote reader fetches it whole in a single request; every
-          # other variant is scored. One thread fixes the summation order, so reader
-          # parity is exact bytes there. At the default thread count the order varies
-          # from run to run even on disk, so that pair is compared numerically.
+          # other variant is scored. Pinned to one core, score runs single-threaded (it
+          # sizes its pools from the CPUs it may use, and RAYON_NUM_THREADS does not
+          # reach them), so the summation order is fixed and reader parity is exact
+          # bytes. At the default thread count the order varies from run to run even
+          # on disk, so that pair is compared numerically.
           mkdir -p parity/local parity/remote parity/local-1thread parity/remote-1thread
           for directory in local local-1thread; do
             cp data/testdata/ld.bed data/testdata/ld.bim data/testdata/ld.fam "parity/$directory/"
@@ -107,14 +109,14 @@ jobs:
           score() {
             directory=$1 genotype=$2
             shift 2
-            (cd "parity/$directory" && env "$@" timeout --kill-after=5s 120s ../../runtime/gnomon-score \
+            (cd "parity/$directory" && "$@" timeout --kill-after=5s 120s ../../runtime/gnomon-score \
               ../weights.tsv "$genotype" --keep ../keep.txt --emit-components 2> scorer.log \
               || { cat scorer.log; exit 1; })
           }
           score local ld.bed
           score remote http://127.0.0.1:8765/ld.bed
-          score local-1thread ld.bed RAYON_NUM_THREADS=1
-          score remote-1thread http://127.0.0.1:8765/ld.bed RAYON_NUM_THREADS=1
+          score local-1thread ld.bed taskset -c 0
+          score remote-1thread http://127.0.0.1:8765/ld.bed taskset -c 0
           kill "$server"
           grep 'Remote BED read whole' parity/remote/scorer.log
           grep -q 'Remote BED read whole: 75003 B in one request' parity/remote/scorer.log
