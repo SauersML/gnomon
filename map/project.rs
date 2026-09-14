@@ -2883,6 +2883,18 @@ where
         || prefer_dense_packed_missing(&packed, n_samples, expected_variants, packed_info_size)?;
     let mut dense_missing_info_storage =
         use_dense_missing.then(|| vec![0.0f64; n_samples * packed_info_size]);
+    // Model variants the dataset lacks are missing for every sample alike. With
+    // information matrices they leave the per-sample pass: their scores are zero,
+    // and their information loss is summed once and added to every sample after
+    // it, instead of once per sample per variant. On a sparse overlap that is
+    // almost the whole model.
+    let present_order = (dense_missing_info_storage.is_some() && packed_cuda.is_none())
+        .then(|| {
+            (0..expected_variants)
+                .filter(|&variant| !packed.is_model_gap(variant))
+                .collect::<Vec<usize>>()
+        })
+        .filter(|present| present.len() < expected_variants);
     eprintln!(
         "> Projection missingness storage: {}",
         if use_dense_missing {
@@ -2929,16 +2941,36 @@ where
     let mut staged_packed_block = Vec::<u8>::new();
     let mut block_swapped = vec![false; block_variants];
 
-    while processed < expected_variants {
-        let filled = (expected_variants - processed).min(block_variants);
+    // Positions in `present_order` when it is set, model variants otherwise.
+    let total_variants = present_order.as_ref().map_or(expected_variants, Vec::len);
+    let mut gathered_score_vectors = Vec::<f64>::new();
+    while processed < total_variants {
+        let filled = (total_variants - processed).min(block_variants);
+        let block_order = present_order
+            .as_deref()
+            .map(|order| &order[processed..processed + filled]);
         block_variant_bytes.clear();
         let load_len = filled * components;
         let coeff_len = filled * 3;
         let contrib_len = filled * packed_info_size;
         let packed_len = filled * packed_bytes_per_variant(n_samples);
         let score_len = filled * components * 3;
-        let block_score_vectors = &packed_score_vectors
-            [processed * components * 3..processed * components * 3 + score_len];
+        let block_score_vectors = match block_order {
+            None => {
+                &packed_score_vectors
+                    [processed * components * 3..processed * components * 3 + score_len]
+            }
+            Some(order) => {
+                gathered_score_vectors.clear();
+                for &variant in order {
+                    gathered_score_vectors.extend_from_slice(
+                        &packed_score_vectors
+                            [variant * components * 3..(variant + 1) * components * 3],
+                    );
+                }
+                &gathered_score_vectors[..]
+            }
+        };
         let needs_gpu_block = packed_cuda.is_some();
         let needs_dense_missing_info = dense_missing_info_storage.is_some();
         if needs_gpu_block {
@@ -2962,7 +2994,7 @@ where
         }
 
         for j_local in 0..filled {
-            let j_global = processed + j_local;
+            let j_global = block_order.map_or(processed + j_local, |order| order[j_local]);
             let bytes = packed.slice(j_global, 1).ok_or(HwePcaError::InvalidInput(
                 "VariantBlockSource terminated early during projection",
             ))?;
@@ -3119,7 +3151,30 @@ where
         }
 
         processed += filled;
-        progress.on_stage_advance(ProjectionProgressStage::Projection, processed);
+        let covered = block_order.map_or(processed, |order| order[filled - 1] + 1);
+        progress.on_stage_advance(ProjectionProgressStage::Projection, covered);
+    }
+
+    if let (Some(_), Some(missing_info_storage)) =
+        (present_order.as_ref(), dense_missing_info_storage.as_mut())
+    {
+        // Every sample lacks the same model variants, so their information loss
+        // is one shared sum, accumulated in model order.
+        let mut absent_info = vec![0.0f64; packed_info_size];
+        let mut contrib = vec![0.0f64; packed_info_size];
+        for variant in (0..expected_variants).filter(|&variant| packed.is_model_gap(variant)) {
+            populate_packed_info_contrib_from_model_row(
+                loadings,
+                components,
+                variant,
+                &mut contrib,
+            );
+            add_score_vector(&mut absent_info, &contrib);
+        }
+        missing_info_storage
+            .par_chunks_mut(packed_info_size)
+            .for_each(|row| add_score_vector(row, &absent_info));
+        progress.on_stage_advance(ProjectionProgressStage::Projection, expected_variants);
     }
 
     if gpu_scores_active {
@@ -5346,6 +5401,71 @@ mod tests {
         let explicit_alignment = explicit.alignment.expect("explicit alignment");
         let wrapped_alignment = wrapped.alignment.expect("wrapped alignment");
         assert_mats_close(&explicit_alignment, &wrapped_alignment, 1e-12);
+    }
+
+    /// A model variant the dataset lacks is missing for every sample. The packed
+    /// path accounts for such gaps once for the whole panel; spelling the same
+    /// gaps as explicit all-missing rows runs them per sample. Both must agree.
+    #[test]
+    fn packed_panel_gaps_match_explicit_all_missing_rows() {
+        const VARIANTS: usize = 48;
+        let genotype = |variant: usize, sample: usize| {
+            let mut z = ((variant as u64) << 32) ^ sample as u64;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            ((z ^ (z >> 31)) % 3) as f64
+        };
+        let options = ProjectionOptions {
+            missing_axis_renormalization: true,
+            return_alignment: true,
+            return_conditioning: false,
+            on_zero_alignment: ZeroAlignmentAction::Zero,
+        };
+        // 40 samples take the pair-table kernel, 1,100 the grouped lookups.
+        for n_samples in [40usize, 1100] {
+            let complete: Vec<f64> = (0..VARIANTS)
+                .flat_map(|variant| (0..n_samples).map(move |sample| genotype(variant, sample)))
+                .collect();
+            let mut fit_source =
+                DenseBlockSource::new(&complete, n_samples, VARIANTS).expect("fit source");
+            let model = HwePcaModel::fit_k(&mut fit_source, TEST_COMPONENTS).expect("model fit");
+
+            // A third of the model is absent, and present variants still carry
+            // scattered missing calls of their own.
+            let present_mask: Vec<bool> = (0..VARIANTS).map(|variant| variant % 3 != 1).collect();
+            let mut observed = complete.clone();
+            for variant in 0..VARIANTS {
+                for sample in 0..n_samples {
+                    if !present_mask[variant] || (sample * 7 + variant * 13) % 97 == 0 {
+                        observed[variant * n_samples + sample] = f64::NAN;
+                    }
+                }
+            }
+            let reduced: Vec<f64> = (0..VARIANTS)
+                .filter(|&variant| present_mask[variant])
+                .flat_map(|variant| {
+                    observed[variant * n_samples..(variant + 1) * n_samples].to_vec()
+                })
+                .collect();
+            let matched = present_mask.iter().filter(|&&present| present).count();
+
+            let mut explicit_source = PackedDenseBlockSource::new(observed, n_samples, VARIANTS);
+            let explicit = model
+                .projector()
+                .project_with_options(&mut explicit_source, &options)
+                .expect("explicit projection");
+            let inner = PackedDenseBlockSource::new(reduced, n_samples, matched);
+            let mut gapped = GappedProjectionSource::new(inner, present_mask).expect("gapped");
+            let wrapped = model
+                .projector()
+                .project_with_options(&mut gapped, &options)
+                .expect("gapped projection");
+
+            assert_mats_close(&explicit.scores, &wrapped.scores, 1e-10);
+            let explicit_alignment = explicit.alignment.expect("explicit alignment");
+            let wrapped_alignment = wrapped.alignment.expect("wrapped alignment");
+            assert_mats_close(&explicit_alignment, &wrapped_alignment, 1e-12);
+        }
     }
 
     #[test]

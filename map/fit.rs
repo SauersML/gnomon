@@ -1295,6 +1295,17 @@ impl<'a> HardCallPacked<'a> {
             .map_or(self.physical_n_variants, <[usize]>::len)
     }
 
+    /// Whether `logical_variant` is a model variant the dataset lacks, served by
+    /// `with_model_gaps` as an all-missing row.
+    pub(crate) fn is_model_gap(&self, logical_variant: usize) -> bool {
+        self.missing_variant.is_some()
+            && self
+                .selection
+                .as_deref()
+                .and_then(|selection| selection.get(logical_variant))
+                == Some(&Self::MISSING_VARIANT)
+    }
+
     pub(crate) fn match_kind(&self, logical_variant: usize) -> MatchKind {
         self.match_kinds
             .as_deref()
