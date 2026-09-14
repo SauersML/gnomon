@@ -594,6 +594,7 @@ impl VariantPlan {
         let mut in_idx: u32 = 0;
         let mut in_variants: usize = 0;
         let mut sorted_positions = PvarPositionSortState::default();
+        let mut chrom = String::new();
 
         while let Some(line) = pvar.next_line()? {
             let s = str::from_utf8(line)
@@ -610,37 +611,32 @@ impl VariantPlan {
                 continue;
             }
 
-            let fields: Vec<&str> = trimmed.split_whitespace().collect();
-            if fields.is_empty() {
-                continue;
-            }
             let cols = if let Some(cols) = header_cols {
                 cols
             } else {
-                let derived = PvarCols::from_headerless(fields.len())?;
+                let derived = PvarCols::from_headerless(trimmed.split_whitespace().count())?;
                 header_cols = Some(derived);
                 derived
             };
+            let fields = PvarFields::split(trimmed, cols);
 
-            let chrom_raw = *fields
-                .get(cols.chrom)
+            let chrom_raw = fields
+                .chrom
                 .ok_or_else(|| ioerr(".pvar missing CHROM column"))?;
-            let pos_raw = *fields
-                .get(cols.pos)
+            let pos_raw = fields
+                .pos
                 .ok_or_else(|| ioerr(".pvar missing POS column"))?;
             // ID and REF are validated by presence here; their values are only
             // needed when the virtual .bim rows are streamed.
+            fields.id.ok_or_else(|| ioerr(".pvar missing ID column"))?;
             fields
-                .get(cols.id)
-                .ok_or_else(|| ioerr(".pvar missing ID column"))?;
-            fields
-                .get(cols.refa)
+                .refa
                 .ok_or_else(|| ioerr(".pvar missing REF column"))?;
-            let alt_raw = *fields
-                .get(cols.alt)
+            let alt_raw = fields
+                .alt
                 .ok_or_else(|| ioerr(".pvar missing ALT column"))?;
 
-            let chrom = normalize_chrom(chrom_raw);
+            normalize_chrom_into(chrom_raw, &mut chrom);
             let pos = pos_raw
                 .parse::<u64>()
                 .map_err(|_| ioerr("Invalid POS in .pvar (expected integer)"))?;
@@ -648,18 +644,18 @@ impl VariantPlan {
                 return Err(ioerr(".pvar POS must be positive"));
             }
             sorted_positions.observe(&chrom, pos, in_variants + 1)?;
-            let alts: Vec<&str> = alt_raw
+            let alt_count = alt_raw
                 .split(',')
                 .map(|a| a.trim())
                 .filter(|a| !a.is_empty() && *a != ".")
-                .collect();
+                .count();
             // Symbolic ALTs (`<INS>`, `<DEL:ME:ALU>`, `*`, breakends) stay as
             // ordinary allele codes, as plink2's own .bim export and the VCF
             // readers keep them: dropping or rejecting them would make a PGEN
             // disagree with the same data read as BED or VCF.
 
             let out_start = out_to_in.len();
-            for alt_ord in 1..=alts.len() as u16 {
+            for alt_ord in 1..=alt_count as u16 {
                 out_to_in.push((in_idx, alt_ord));
                 haploidy.push(HaploidyKind::Diploid);
             }
@@ -671,14 +667,14 @@ impl VariantPlan {
             // variant.
             if !is_autosome(&chrom) {
                 per_variant.push(VariantRangeEntry {
-                    chrom,
+                    chrom: chrom.clone(),
                     pos,
                     out_start,
                     out_end,
                 });
             }
 
-            alts_per_in.push(alts.len() as u16);
+            alts_per_in.push(alt_count as u16);
             in_idx += 1;
             in_variants += 1;
         }
@@ -792,11 +788,17 @@ impl GenomeBuild {
     }
 }
 
+#[cfg(test)]
 fn normalize_chrom(raw: &str) -> String {
+    let mut chrom = String::new();
+    normalize_chrom_into(raw, &mut chrom);
+    chrom
+}
+
+/// `normalize_chrom` into a reused buffer.
+fn normalize_chrom_into(raw: &str, chrom: &mut String) {
+    chrom.clear();
     let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
     let mut body = trimmed;
     if trimmed
         .get(..3)
@@ -804,10 +806,10 @@ fn normalize_chrom(raw: &str) -> String {
     {
         body = &trimmed[3..];
     }
-    let upper = body.to_ascii_uppercase();
-    match upper.as_str() {
-        "M" => "MT".to_string(),
-        _ => upper,
+    chrom.push_str(body);
+    chrom.make_ascii_uppercase();
+    if chrom == "M" {
+        chrom.push('T');
     }
 }
 
@@ -866,14 +868,76 @@ fn haploidy_for_variant(chrom: &str, pos: u64, build: GenomeBuild) -> HaploidyKi
 ///
 /// gnomon's own reconciliation keys on (chrom, pos, A1, A2) rather than ID, so
 /// this choice does not affect which variants gnomon matches.
-fn format_bim_row(chrom: &str, id: &str, pos: u64, refa: &str, alt: &str, split: bool) -> String {
+fn write_bim_row(
+    row: &mut Vec<u8>,
+    chrom: &str,
+    id: &str,
+    pos: u64,
+    refa: &str,
+    alt: &str,
+    split: bool,
+) {
+    use std::io::Write as _;
+
     let has_id = id != "." && !id.is_empty();
-    let id_out = match (has_id, split) {
-        (true, false) => id.to_string(),
-        (true, true) => format!("{id}__ALT={alt}"),
-        (false, _) => format!("{chrom}:{pos}:{refa}:{alt}"),
-    };
-    format!("{chrom}\t{id_out}\t0\t{pos}\t{alt}\t{refa}")
+    row.extend_from_slice(chrom.as_bytes());
+    row.push(b'\t');
+    match (has_id, split) {
+        (true, false) => row.extend_from_slice(id.as_bytes()),
+        (true, true) => {
+            row.extend_from_slice(id.as_bytes());
+            row.extend_from_slice(b"__ALT=");
+            row.extend_from_slice(alt.as_bytes());
+        }
+        (false, _) => write!(row, "{chrom}:{pos}:{refa}:{alt}").expect("writing to a Vec"),
+    }
+    write!(row, "\t0\t{pos}\t{alt}\t{refa}").expect("writing to a Vec");
+}
+
+/// The columns of one `.pvar` data line that a plan or a virtual `.bim` row
+/// needs, split without collecting every field.
+struct PvarFields<'a> {
+    chrom: Option<&'a str>,
+    id: Option<&'a str>,
+    pos: Option<&'a str>,
+    refa: Option<&'a str>,
+    alt: Option<&'a str>,
+}
+
+impl<'a> PvarFields<'a> {
+    fn split(line: &'a str, cols: PvarCols) -> Self {
+        let mut fields = Self {
+            chrom: None,
+            id: None,
+            pos: None,
+            refa: None,
+            alt: None,
+        };
+        let last = cols
+            .chrom
+            .max(cols.id)
+            .max(cols.pos)
+            .max(cols.refa)
+            .max(cols.alt);
+        for (column, field) in line.split_whitespace().take(last + 1).enumerate() {
+            if column == cols.chrom {
+                fields.chrom = Some(field);
+            }
+            if column == cols.id {
+                fields.id = Some(field);
+            }
+            if column == cols.pos {
+                fields.pos = Some(field);
+            }
+            if column == cols.refa {
+                fields.refa = Some(field);
+            }
+            if column == cols.alt {
+                fields.alt = Some(field);
+            }
+        }
+        fields
+    }
 }
 
 /// Streaming virtual `.bim`: re-reads the `.pvar` and emits the split rows on
@@ -883,14 +947,19 @@ fn format_bim_row(chrom: &str, id: &str, pos: u64, refa: &str, alt: &str, split:
 /// variant — about 1.2 GB for a WGS chr1 at 8.45M variants, and ~10 GB if a
 /// genome-wide set of per-chromosome filesets were opened at once. Nothing
 /// downstream needs random access to the rows, only a single forward pass, so
-/// they are generated on demand and never retained.
+/// they are generated on demand and never retained. One `.pvar` line's rows are
+/// written end to end into a reused buffer, so a pass allocates nothing per row.
 struct StreamingVirtualBim {
     pvar: Box<dyn TextSource>,
     cols: Option<PvarCols>,
-    /// Rows pending for the current `.pvar` line (one per ALT), reversed so
-    /// `pop` yields them in ALT order.
-    pending: Vec<String>,
-    carry: Option<Box<[u8]>>,
+    /// The current `.pvar` line's rows, one per ALT in ALT order, end to end.
+    rows: Vec<u8>,
+    /// Where each row of `rows` ends.
+    row_ends: Vec<usize>,
+    /// The next row of `rows` to return.
+    next_row: usize,
+    /// The current line's normalized chromosome.
+    chrom: String,
     total: Option<u64>,
 }
 
@@ -899,8 +968,10 @@ impl StreamingVirtualBim {
         Self {
             pvar,
             cols: None,
-            pending: Vec::new(),
-            carry: None,
+            rows: Vec::new(),
+            row_ends: Vec::new(),
+            next_row: 0,
+            chrom: String::new(),
             total,
         }
     }
@@ -913,9 +984,14 @@ impl TextSource for StreamingVirtualBim {
 
     fn next_line(&mut self) -> Result<Option<&[u8]>, PipelineError> {
         loop {
-            if let Some(row) = self.pending.pop() {
-                self.carry = Some(row.into_bytes().into_boxed_slice());
-                return Ok(self.carry.as_deref());
+            if self.next_row < self.row_ends.len() {
+                let start = match self.next_row {
+                    0 => 0,
+                    row => self.row_ends[row - 1],
+                };
+                let end = self.row_ends[self.next_row];
+                self.next_row += 1;
+                return Ok(Some(&self.rows[start..end]));
             }
 
             let Some(line) = self.pvar.next_line()? else {
@@ -932,57 +1008,51 @@ impl TextSource for StreamingVirtualBim {
                 continue;
             }
 
-            let fields: Vec<&str> = trimmed.split_whitespace().collect();
-            if fields.is_empty() {
-                continue;
-            }
             let cols = match self.cols {
                 Some(cols) => cols,
                 None => {
-                    let derived = PvarCols::from_headerless(fields.len())?;
+                    let derived = PvarCols::from_headerless(trimmed.split_whitespace().count())?;
                     self.cols = Some(derived);
                     derived
                 }
             };
+            let fields = PvarFields::split(trimmed, cols);
 
-            let chrom = normalize_chrom(
+            normalize_chrom_into(
                 fields
-                    .get(cols.chrom)
-                    .copied()
+                    .chrom
                     .ok_or_else(|| ioerr(".pvar missing CHROM column"))?,
+                &mut self.chrom,
             );
             let pos = fields
-                .get(cols.pos)
-                .copied()
+                .pos
                 .ok_or_else(|| ioerr(".pvar missing POS column"))?
                 .parse::<u64>()
                 .map_err(|_| ioerr("Invalid POS in .pvar (expected integer)"))?;
-            let id = fields
-                .get(cols.id)
-                .copied()
-                .ok_or_else(|| ioerr(".pvar missing ID column"))?;
+            let id = fields.id.ok_or_else(|| ioerr(".pvar missing ID column"))?;
             let refa = fields
-                .get(cols.refa)
-                .copied()
+                .refa
                 .ok_or_else(|| ioerr(".pvar missing REF column"))?;
             let alt_raw = fields
-                .get(cols.alt)
-                .copied()
+                .alt
                 .ok_or_else(|| ioerr(".pvar missing ALT column"))?;
 
-            let alts: Vec<&str> = alt_raw
-                .split(',')
-                .map(str::trim)
-                .filter(|a| !a.is_empty() && *a != ".")
-                .collect();
-            let split = alts.len() > 1;
-            // Reversed, so `pop` above walks ALTs in order — matching the
-            // variant order the plan assigned during the indexing pass.
-            self.pending.extend(
-                alts.into_iter()
-                    .map(|alt| format_bim_row(&chrom, id, pos, refa, alt, split))
-                    .rev(),
-            );
+            let alts = || {
+                alt_raw
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|a| !a.is_empty() && *a != ".")
+            };
+            let split = alts().nth(1).is_some();
+            // Rows in ALT order, matching the variant order the plan assigned
+            // during the indexing pass.
+            self.rows.clear();
+            self.row_ends.clear();
+            self.next_row = 0;
+            for alt in alts() {
+                write_bim_row(&mut self.rows, &self.chrom, id, pos, refa, alt, split);
+                self.row_ends.push(self.rows.len());
+            }
         }
     }
 }
@@ -2673,7 +2743,8 @@ impl PgenDecoder {
         let buf = &scratch[..len];
         let mut cursor = 0usize;
         let anchor = ld_compressed.then_some(packed.anchor.as_slice());
-        if decode_main_track_packed(buf, &mut cursor, n, main_kind, anchor, &mut packed.cats).is_err()
+        if decode_main_track_packed(buf, &mut cursor, n, main_kind, anchor, &mut packed.cats)
+            .is_err()
         {
             return false;
         }
@@ -2821,7 +2892,10 @@ fn decode_main_track_packed(
             }
             let low_fields = repeated_category(low);
             let high_fields = repeated_category(high);
-            for (word, bytes) in cats.iter_mut().zip(buf[*cursor..*cursor + nbytes].chunks(4)) {
+            for (word, bytes) in cats
+                .iter_mut()
+                .zip(buf[*cursor..*cursor + nbytes].chunks(4))
+            {
                 let mut chunk = [0u8; 4];
                 chunk[..bytes.len()].copy_from_slice(bytes);
                 let set = spread_to_low_bits(u32::from_le_bytes(chunk));
@@ -3909,6 +3983,35 @@ mod tests {
         }
     }
 
+    /// A biallelic row keeps its .pvar ID, the rows of a split site get
+    /// `<ID>__ALT=<ALT>`, and a site without an ID gets `chr:pos:ref:alt`.
+    #[test]
+    fn virtual_bim_rows_keep_ids_and_disambiguate_split_sites() {
+        let lines = vec![
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL",
+            "chr1\t100\trs1\tA\tG\t.",
+            "1\t200\trs2\tC\tT,G\t.",
+            "1\t300\t.\tAT\tA,ATT\t.",
+            "chrM\t400\t.\tG\tC\t.",
+        ];
+        let mut bim = StreamingVirtualBim::new(Box::new(LineSource::new(lines)), None);
+        let mut rows = Vec::new();
+        while let Some(row) = bim.next_line().unwrap() {
+            rows.push(String::from_utf8(row.to_vec()).unwrap());
+        }
+        assert_eq!(
+            rows,
+            vec![
+                "1\trs1\t0\t100\tG\tA",
+                "1\trs2__ALT=T\t0\t200\tT\tC",
+                "1\trs2__ALT=G\t0\t200\tG\tC",
+                "1\t1:300:AT:A\t0\t300\tA\tAT",
+                "1\t1:300:AT:ATT\t0\t300\tATT\tAT",
+                "MT\tMT:400:G:C\t0\t400\tC\tG",
+            ]
+        );
+    }
+
     #[test]
     fn pack_contract_smoke() {
         let hard = [0u8, 1, 2, 255, 0, 0, 1, 2, 255, 255];
@@ -4471,7 +4574,8 @@ mod tests {
                     let mut slow = decoder();
                     for &idx in order {
                         let mut block = vec![0u8; n.div_ceil(4)];
-                        let handled = fast.try_decode_packed_block(idx as u32, rule, &masks, &mut block);
+                        let handled =
+                            fast.try_decode_packed_block(idx as u32, rule, &masks, &mut block);
                         let mut hard = vec![255u8; n];
                         let decoded = slow.decode_variant_hardcalls(idx as u32, 1, &mut hard, None);
                         match idx {
@@ -4484,7 +4588,10 @@ mod tests {
                                 decoded.unwrap();
                             }
                             _ => {
-                                assert!(handled, "n={n} record {idx} rule {rule_index}: not handled");
+                                assert!(
+                                    handled,
+                                    "n={n} record {idx} rule {rule_index}: not handled"
+                                );
                                 decoded.unwrap();
                                 if let Some(rule) = rule {
                                     enforce_haploidy(&mut hard, &sex, rule);
