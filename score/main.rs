@@ -485,6 +485,16 @@ fn resolve_score_files(
         let mut final_files = Vec::with_capacity(source_files.len() + cache_files.len());
         let mut covered_stems = std::collections::HashSet::new();
 
+        // A previous run left each native file's sorted copy beside it, and that
+        // copy also ends in `.gnomon.tsv`. It is gnomon's own derivative, not a
+        // second score: counting it made every repeat run over a directory fail
+        // with a duplicate score ID.
+        let derived_sorted_copies: std::collections::HashSet<PathBuf> = cache_files
+            .iter()
+            .map(|(path, _)| sorted_native_score_path(path))
+            .collect();
+        cache_files.retain(|(path, _)| !derived_sorted_copies.contains(path));
+
         for (path, stem) in cache_files {
             let keep_cache = match source_mtimes.get(&stem) {
                 Some(&src_mtime) => fs::metadata(&path)
