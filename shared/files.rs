@@ -1311,7 +1311,10 @@ fn compare_paths(a: &Path, b: &Path) -> std::cmp::Ordering {
 /// chromosome split at its pseudoautosomal boundaries follow the chromosome:
 /// PAR1, then the non-PAR body, then PAR2. Alphabetically `chrX_non_par` sorts
 /// before `chrX_par1`, and streaming the files in that order fails the
-/// position-sorted check 21 minutes into a whole-genome fit.
+/// position-sorted check 21 minutes into a whole-genome fit. Names are
+/// compared by their chromosome (the name up to its chromosome token), then
+/// by that placement, then in full, so files of one chromosome that carry no
+/// PAR token keep their natural order.
 fn compare_variant_names(a: &str, b: &str) -> std::cmp::Ordering {
     let (a_key, a_rank) = par_rank(a);
     let (b_key, b_rank) = par_rank(b);
@@ -1320,31 +1323,41 @@ fn compare_variant_names(a: &str, b: &str) -> std::cmp::Ordering {
         .then_with(|| compare(a, b))
 }
 
-/// The name with its PAR token removed, and where that token places the file on
-/// the chromosome: 0 for `par1`, 2 for `par2`, 1 for `non_par`/`nonpar` and for
-/// files without a token. Tokens are matched between `_`, `-` or `.` separators,
-/// case-insensitively, so `chrX_PAR1.bcf` and `chrx-non-par.vcf.gz` both count.
+/// The name up to and including its chromosome token (`chr1`, `22`, `chrX`,
+/// `Y`, `MT`; the whole name when it has none), and where a PAR token places
+/// the file on the chromosome: 0 for `par1`, 2 for `par2`, 1 for `non_par`,
+/// `nonpar` and files without a token. Tokens sit between `_`, `-` or `.`
+/// separators and match in any case, so `chrX_PAR1.bcf`, `chrx-non-par.vcf.gz`
+/// and `hgdp1kgp_chrX_par2.shapeit5_common.bcf` all count.
 fn par_rank(name: &str) -> (String, u8) {
     let lower = name.to_ascii_lowercase();
     let tokens: Vec<&str> = lower
         .split(|c: char| c == '_' || c == '-' || c == '.')
+        .filter(|token| !token.is_empty())
         .collect();
+    let is_chromosome = |token: &str| {
+        let body = token.strip_prefix("chr").unwrap_or(token);
+        matches!(body, "x" | "y" | "xy" | "m" | "mt")
+            || (!body.is_empty() && body.bytes().all(|b| b.is_ascii_digit()))
+    };
     let mut rank = 1;
-    let mut kept = Vec::with_capacity(tokens.len());
+    let mut key: Option<String> = None;
     let mut i = 0;
     while i < tokens.len() {
         match tokens[i] {
             "par1" => rank = 0,
             "par2" => rank = 2,
             "nonpar" => rank = 1,
-            "non" if tokens.get(i + 1) == Some(&"par") => {
-                i += 1;
+            "non" if tokens.get(i + 1) == Some(&"par") => i += 1,
+            token => {
+                if key.is_none() && is_chromosome(token) {
+                    key = Some(tokens[..=i].join("_"));
+                }
             }
-            token => kept.push(token),
         }
         i += 1;
     }
-    (kept.join("_"), rank)
+    (key.unwrap_or_else(|| tokens.join("_")), rank)
 }
 
 fn gather_local_variant_files(dir: &Path) -> Result<Vec<PathBuf>, PipelineError> {
@@ -3056,34 +3069,40 @@ mod tests {
     fn split_chromosome_members_list_in_chromosome_order() {
         use super::*;
         let mut names = vec![
-            "chrX_par2.bcf",
-            "chrX_non_par.bcf",
-            "chrX_par1.bcf",
-            "chr10.bcf",
-            "chr1.bcf",
-            "chr2.bcf",
+            "hgdp1kgp_chrX_par2.shapeit5_common.bcf",
+            "hgdp1kgp_chrX_non_par.full.shapeit5_rare.bcf",
+            "hgdp1kgp_chrX_par1.shapeit5_common.bcf",
+            "hgdp1kgp_chr10.filtered.SNV_INDEL.phased.shapeit5.bcf",
+            "hgdp1kgp_chr1.filtered.SNV_INDEL.phased.shapeit5.bcf",
+            "hgdp1kgp_chr2.filtered.SNV_INDEL.phased.shapeit5.bcf",
             "chrY-NON-PAR.vcf.gz",
             "chrY.par1.vcf.gz",
+            "chrY.vcf.gz",
         ];
         names.sort_by(|a, b| compare_variant_names(a, b));
         assert_eq!(
             names,
             [
-                "chr1.bcf",
-                "chr2.bcf",
-                "chr10.bcf",
-                "chrX_par1.bcf",
-                "chrX_non_par.bcf",
-                "chrX_par2.bcf",
                 "chrY.par1.vcf.gz",
                 "chrY-NON-PAR.vcf.gz",
+                "chrY.vcf.gz",
+                "hgdp1kgp_chr1.filtered.SNV_INDEL.phased.shapeit5.bcf",
+                "hgdp1kgp_chr2.filtered.SNV_INDEL.phased.shapeit5.bcf",
+                "hgdp1kgp_chr10.filtered.SNV_INDEL.phased.shapeit5.bcf",
+                "hgdp1kgp_chrX_par1.shapeit5_common.bcf",
+                "hgdp1kgp_chrX_non_par.full.shapeit5_rare.bcf",
+                "hgdp1kgp_chrX_par2.shapeit5_common.bcf",
             ]
         );
         assert_eq!(
             par_rank("acaf_threshold.chr22.bcf"),
-            ("acaf_threshold_chr22_bcf".into(), 1)
+            ("acaf_threshold_chr22".into(), 1)
         );
-        assert_eq!(par_rank("chrX_nonpar.bcf"), ("chrx_bcf".into(), 1));
+        assert_eq!(par_rank("chrX_nonpar.bcf"), ("chrx".into(), 1));
+        assert_eq!(
+            par_rank("cohort_part3.vcf.gz"),
+            ("cohort_part3_vcf_gz".into(), 1)
+        );
 
         let dir = tempfile::tempdir().unwrap();
         for name in [
