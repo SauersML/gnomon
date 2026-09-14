@@ -111,7 +111,7 @@ not a requirement for correct CLI behavior.
 ./target/release/gnomon infer test_data.tsv --model model.json
 ```
 
-Each subcommand writes outputs to the current directory or alongside the input data. Run `gnomon --help` or `gnomon <subcommand> --help` for detailed options.
+Each subcommand writes outputs to the current directory or alongside the input data. `gnomon score`, `gnomon terms` and `gnomon fit` take `--out PREFIX` to write under a prefix instead, which leaves the input directory untouched and lets concurrent runs share inputs. Run `gnomon --help` or `gnomon <subcommand> --help` for detailed options.
 
 ## Inferring sample metadata
 
@@ -120,7 +120,8 @@ data. The command accepts any input supported by the PCA and scoring pipelines
 (PLINK trios, per-chromosome directories, or VCF/BCF files, including remote
 URIs) and streams variants in blocks so even biobank-scale cohorts fit in memory.
 
-`sex.tsv` is written next to the genotype source with one row per individual and
+`sex.tsv` is written next to the genotype source (or to `PREFIX.sex.tsv` with
+`--out PREFIX`) with one row per individual and
 two columns: `IID` (copied from the `.fam` record or VCF header) and the final
 `Sex` call (`male`/`female`). The inference engine automatically selects the
 appropriate genome build by inspecting the maximum X-chromosome position and

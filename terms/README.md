@@ -8,18 +8,25 @@ results alongside the source dataset.
 ## CLI entry point: `gnomon terms`
 
 ```
-gnomon terms --sex <GENOTYPE_PATH>
+gnomon terms --sex [--out <PREFIX>] <GENOTYPE_PATH>
 ```
 
 | Flag | Required | Purpose |
 | --- | --- | --- |
 | `<GENOTYPE_PATH>` | ✅ | Path or URI identifying the genotype dataset. The loader accepts PLINK `.bed/.bim/.fam` trios, directories of per-chromosome trios, and VCF/BCF files that share the same basename. Remote objects are supported anywhere the standard gnomon genotype I/O layer can reach them. |
 | `--sex` | ✅ | Enables sex inference. Additional term inference modes will appear behind their own flags as they are implemented. |
+| `--out <PREFIX>` | | Writes the table to `PREFIX.sex.tsv` (for example, `results/ukb.sex.tsv` for `--out results/ukb`) instead of beside the genotype input. Nothing is written beside the input, so it may live in a read-only directory. The prefix must be a local file prefix, not a directory or a remote URI. |
 
 Running the command prints high-level progress and writes a tab-delimited
 `sex.tsv` file next to the genotype input (for example, `data/ukb.sex.tsv` when
-pointing at `data/ukb.bed`). The command fails fast if no inference mode was
-requested, so remember to include the `--sex` flag.
+pointing at `data/ukb.bed`; the working directory for remote inputs), or to
+`PREFIX.sex.tsv` under `--out PREFIX`. The command fails fast if no inference
+mode was requested, so remember to include the `--sex` flag.
+
+The table is written to a temporary file in the destination directory and
+renamed into place once complete. Readers and concurrent runs never see a
+partial table: runs that share a destination replace one another's output
+whole, and runs with different `--out` prefixes do not interact at all.
 
 ### Output schema
 
@@ -70,6 +77,8 @@ The CLI experience is backed by two convenience APIs:
 
 * `terms::infer_sex_to_tsv(genotype_path: &Path, force_build: Option<GenomeBuild>)` – Loads the dataset, performs
   inference, writes `sex.tsv`, and returns the resolved output path.
+* `terms::infer_sex_to_tsv_at(genotype_path, force_build, output_path: &Path)` – The same, but writes the
+  table at an explicit path. `--out PREFIX` and `gnomon all` use it.
 * `terms::SexInferenceRecord` – Bundles the `individual_id` with the raw
   `InferenceResult` produced by the upstream crate, giving downstream code
   access to the detailed evidence that informed the final label written to

@@ -17,6 +17,18 @@ Required arguments:
 Optional arguments:
 - `--keep <path>`: optional file that lists individual IDs to include in the
   calculation.
+- `--out <PREFIX>`: write the scores to `PREFIX.sscore`. The resume checkpoint
+  and the score-file caches (`gnomon_score_cache/`) go under PREFIX's directory
+  instead of beside the inputs. Without it, `<GENOTYPE>_<SCORE>.sscore` lands
+  beside the genotype data. See [`score/README.md`](../score/README.md).
+
+### `terms`
+Infer per-sample metadata terms (currently sex) from genotype data.
+
+Usage: `gnomon terms --sex [--build <37|38>] [--out <PREFIX>] <GENOTYPE_PATH>`
+
+Writes `<GENOTYPE>.sex.tsv` beside the genotype data, or `PREFIX.sex.tsv` with
+`--out`. See [`terms/README.md`](../terms/README.md).
 
 ### `fit`
 Fit an HWE PCA model from genotype data.
