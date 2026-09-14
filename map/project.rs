@@ -2,6 +2,7 @@ use super::fit::{
     DEFAULT_BLOCK_WIDTH, DenseBlockSource, HardCallPacked, HwePcaError, HwePcaModel, HweScaler,
     VariantBlockSource,
 };
+use super::partitioned::mul_rows;
 use super::progress::{
     NoopProjectionProgress, ProjectionProgressObserver, ProjectionProgressStage,
 };
@@ -14,7 +15,6 @@ use cudarc::driver::{
     PushKernelArg,
 };
 use cudarc::nvrtc::compile_ptx;
-use faer::linalg::matmul::matmul;
 use faer::prelude::ReborrowMut;
 use faer::{Accum, Mat, MatMut, Par};
 use rayon::prelude::*;
@@ -1287,7 +1287,9 @@ impl<'model> HwePcaProjector<'model> {
         let normalization = self.model.component_weighted_norms_sq();
         let projection_score_vectors = self.model.projection_packed_score_vectors();
         let projection_global_info_packed = self.model.projection_global_info_packed();
-        let par = faer::get_global_parallelism();
+        // Selects serial or rayon loops and nothing else: no kernel below runs
+        // at this parallelism, so the scores do not depend on the thread count.
+        let par = Par::rayon(rayon::current_num_threads());
 
         progress.on_stage_start(ProjectionProgressStage::Projection, variant_hint);
         if variant_hint == 0 && expected_variants > 0 {
@@ -1351,12 +1353,8 @@ impl<'model> HwePcaProjector<'model> {
                     || { HwePcaError::InvalidInput("WLS info matrix storage overflow") }
                 )?
             ];
-            let block_capacity = projection_block_capacity(
-                self.model.n_samples(),
-                n_samples,
-                expected_variants,
-                components,
-            );
+            let block_capacity =
+                projection_block_capacity(self.model.n_samples(), n_samples, expected_variants);
             let elements = n_samples
                 .checked_mul(block_capacity)
                 .ok_or_else(|| HwePcaError::InvalidInput("Projection workspace size overflow"))?;
@@ -1564,13 +1562,12 @@ impl<'model> HwePcaProjector<'model> {
                 }
 
                 if !used_cuda {
-                    matmul(
+                    mul_rows(
                         scores.as_mut(),
                         Accum::Add,
                         standardized,
                         loadings_block,
                         1.0,
-                        par,
                     );
                 }
 
@@ -2592,7 +2589,6 @@ fn projection_block_capacity(
     fitted_samples: usize,
     projected_samples: usize,
     n_variants: usize,
-    components: usize,
 ) -> usize {
     if n_variants == 0 {
         return 1;
@@ -2609,36 +2605,22 @@ fn projection_block_capacity(
     }
     capacity = min(capacity, default);
     capacity = min(capacity, n_variants);
-    let budget = projection_block_budget_bytes(projected_samples, components);
     let bytes_per_column = projected_samples.saturating_mul(size_of::<f64>());
     if bytes_per_column > 0 {
-        let budget_limited = (budget / bytes_per_column).max(1);
+        let budget_limited = (PROJECTION_BLOCK_BUDGET_BYTES / bytes_per_column).max(1);
         capacity = min(capacity, budget_limited);
     }
     capacity
 }
 
-fn projection_block_budget_bytes(projected_samples: usize, components: usize) -> usize {
-    let threads = rayon::current_num_threads().max(1);
-    let lower = 2usize * 1024 * 1024;
-    let upper = 64usize * 1024 * 1024;
-
-    // Target a cache-resident stream budget: scale with active threads,
-    // then bias upward for small N or larger K to keep GEMM efficiency.
-    let mut budget = (threads * 4 * 1024 * 1024).clamp(lower, upper);
-    if projected_samples <= 8_192 {
-        budget = budget.max(32 * 1024 * 1024);
-    }
-    if projected_samples <= 1_024 {
-        budget = upper;
-    }
-    if components >= 64 {
-        budget = budget.saturating_mul(3) / 2;
-    } else if components >= 32 {
-        budget = budget.saturating_mul(5) / 4;
-    }
-    budget.clamp(lower, upper)
-}
+/// Bytes of standardized genotypes one streamed projection tile holds at most.
+///
+/// A tile groups every score's sum, so its size may depend on the shape and on
+/// nothing else. It used to grow with the thread count, which made the scores
+/// depend on how many threads computed them. The threads now go to the row
+/// leaves of each tile's product (see [`mul_rows`]), and every thread count
+/// gets the tile the many-core setting chose.
+const PROJECTION_BLOCK_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
 fn projection_gpu_rejection_reason(total_work: usize) -> Option<String> {
     let min_work = project_cuda_min_work();
@@ -3913,7 +3895,10 @@ fn apply_missing_coordinates_sparse(
         return;
     }
 
-    missing_coords.sort_unstable_by_key(|coord| coord.sample);
+    // Stable, so each sample's contributions stay in the order the scan found
+    // them. The serial branch adds them in exactly that order, and the two
+    // branches must agree to the bit, since the thread count picks between them.
+    missing_coords.sort_by_key(|coord| coord.sample);
     let sample_chunk = sparse_sample_range_chunk(missing_info_storage.len() / packed_info_size);
     let chunk_width = sample_chunk * packed_info_size;
     missing_info_storage
@@ -4628,6 +4613,107 @@ mod tests {
             err,
             HwePcaError::InvalidInput("Projection requires missing axis renormalization")
         ));
+    }
+
+    #[test]
+    fn projection_does_not_depend_on_the_thread_count() {
+        // Enough samples that a thread-scaled tile budget would bind, and enough
+        // missing calls for the sparse missingness branch to take its parallel
+        // form, over genotypes that share one latent factor.
+        let n_samples = 20_000;
+        let n_variants = 64;
+        let components = 4;
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let factors: Vec<u64> = (0..n_samples).map(|_| next() % 3).collect();
+        let mut complete = Vec::with_capacity(n_samples * n_variants);
+        for _ in 0..n_variants {
+            let flipped = next() % 2 == 1;
+            for &factor in &factors {
+                let call = if next() % 3 == 0 { next() % 3 } else { factor };
+                let call = if flipped { 2 - call } else { call };
+                complete.push(call as f64);
+            }
+        }
+        let mut source = DenseBlockSource::new(&complete, n_samples, n_variants).expect("source");
+        let fit_options = FitOptions {
+            allow_unconverged: true,
+            ..FitOptions::default()
+        };
+        let progress = Arc::new(NoopFitProgress::default());
+        let model = HwePcaModel::fit_k_with_options_and_progress(
+            &mut source,
+            components,
+            &fit_options,
+            &progress,
+        )
+        .expect("model fit");
+
+        let mut observed = complete.clone();
+        for value in observed.iter_mut() {
+            if next() % 7 == 0 {
+                *value = f64::NAN;
+            }
+        }
+        let missing = observed.iter().filter(|value| value.is_nan()).count();
+        assert!(missing >= 4_096, "only {missing} missing calls");
+
+        let options = ProjectionOptions {
+            missing_axis_renormalization: true,
+            return_alignment: true,
+            return_conditioning: true,
+            on_zero_alignment: ZeroAlignmentAction::Zero,
+        };
+        let project_with = |threads: usize| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("thread pool")
+                .install(|| {
+                    let mut source =
+                        DenseBlockSource::new(&observed, n_samples, n_variants).expect("source");
+                    model
+                        .projector()
+                        .project_with_options(&mut source, &options)
+                        .expect("projection")
+                })
+        };
+        let same_bits = |lhs: &Mat<f64>, rhs: &Mat<f64>| {
+            lhs.nrows() == rhs.nrows()
+                && lhs.ncols() == rhs.ncols()
+                && (0..lhs.ncols()).all(|col| {
+                    (0..lhs.nrows())
+                        .all(|row| lhs[(row, col)].to_bits() == rhs[(row, col)].to_bits())
+                })
+        };
+
+        let serial = project_with(1);
+        for threads in [2, 3, 8] {
+            let parallel = project_with(threads);
+            assert!(
+                same_bits(&serial.scores, &parallel.scores),
+                "scores differ at {threads} threads"
+            );
+            assert!(
+                same_bits(
+                    serial.alignment.as_ref().expect("alignment"),
+                    parallel.alignment.as_ref().expect("alignment"),
+                ),
+                "alignment differs at {threads} threads"
+            );
+            assert!(
+                same_bits(
+                    serial.conditioning.as_ref().expect("conditioning"),
+                    parallel.conditioning.as_ref().expect("conditioning"),
+                ),
+                "conditioning differs at {threads} threads"
+            );
+        }
     }
 
     struct PackedDenseBlockSource {
