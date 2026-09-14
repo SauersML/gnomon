@@ -275,6 +275,24 @@ covers every fit in the golden default, edge and medium sets that converges or
 stops at a `--max-passes` ceiling; the 1000 Genomes fits at `k = 20`, whose
 boundary gap is 4.4e-3, are among them.
 
+At one thread, measured at `1d127cdc` against the same tree plus the stop, on one
+core of other nodes of the same cluster:
+
+| cohort | request | passes | wall clock | peak RSS | structured axes vs converged reference |
+| --- | --- | ---: | ---: | ---: | ---: |
+| tiny, 5 populations | `--components 4` | 6 → 6 | 1.34 s → 1.24 s | 0.12 GB | output unchanged |
+| 50k × 20k, 5 populations | `--components 4` | 5 → 5 | 18.6 s → 17.6 s | 0.72 GB | output unchanged |
+| 50k × 20k, 5 populations | `--components 10 --allow-unconverged` | 32 → 16 | 129.1 s → **63.2 s** | 1.21 → 1.05 GB | 1.8e-13 |
+| 50k × 20k, 5 populations | `--components 20 --allow-unconverged` | 32 → 14 | 169.2 s → **71.7 s** | 1.44 → 1.14 GB | 2.2e-13 |
+| 100k × 20k, 5 populations | `--components 4` | 5 → 5 | 38.0 s → 34.6 s | 1.42 GB | output unchanged |
+| 1000 Genomes on GSA, 3,200 × 562,259 | `--components 20 --allow-unconverged` | 19 | 189.5 s | 3.24 GB | stop build only; the stop does not fire |
+
+At 250k × 20k and eight threads, `--components 10 --allow-unconverged` stops at
+16 of 32 passes, with peak RSS 4.63 → 4.01 GB and the structured axes 5.9e-14
+from the unstopped fit. The two runs shared a node whose time per pass rose from
+30 s to 50 s between them, so their solve times (960 s and 803 s) do not isolate
+the effect of the stop.
+
 ### Current PLINK2 comparison
 
 The local PLINK reader maps the `.bed` payload once, decodes selected variant
