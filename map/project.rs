@@ -3477,12 +3477,13 @@ fn accumulate_grouped_projection<M: Send, F: Fn(&mut [M], usize) + Sync>(
     // Retain enough parallel sample chunks for small cohorts. A fixed 1,024
     // samples would serialize almost all work for a 1,025-person cohort.
     let sample_chunk = sample_chunk.min(genotype_table::SAMPLE_TILE);
-    let table_len = genotype_table::TABLE_ROWS * components;
+    let columns = genotype_table::table_columns(components);
+    let table_len = genotype_table::TABLE_ROWS * columns;
     let groups_per_tile = (genotype_table::TABLE_BUDGET_BYTES / (table_len * size_of::<f64>()))
         .min(bytes.len().div_ceil(4))
         .max(1);
     let mut tables = vec![0.0; groups_per_tile * table_len];
-    let mut calls = vec![0.0; 16 * components];
+    let mut calls = vec![0.0; 16 * columns];
     for tile_start in (0..bytes.len()).step_by(groups_per_tile * 4) {
         let tile_end = (tile_start + groups_per_tile * 4).min(bytes.len());
         let groups = (tile_end - tile_start).div_ceil(4);
@@ -3493,14 +3494,14 @@ fn accumulate_grouped_projection<M: Send, F: Fn(&mut [M], usize) + Sync>(
                 for code in [0, 2, 3] {
                     let dosage = if code == 0 { 0 } else { code - 1 };
                     let dosage = if swapped[variant] { 2 - dosage } else { dosage };
-                    let dst = ((variant - start) * 4 + code) * components;
+                    let dst = ((variant - start) * 4 + code) * columns;
                     let src = (variant * 3 + dosage) * components;
                     calls[dst..dst + components].copy_from_slice(&vectors[src..src + components]);
                 }
             }
             genotype_table::build_table(
                 &calls,
-                components,
+                columns,
                 &mut tables[group * table_len..(group + 1) * table_len],
             );
         }
@@ -3508,32 +3509,40 @@ fn accumulate_grouped_projection<M: Send, F: Fn(&mut [M], usize) + Sync>(
             .par_chunks_mut(sample_chunk * components)
             .zip(missing.par_chunks_mut(sample_chunk * missing_stride))
             .enumerate()
-            .for_each(|(chunk, (scores, missing))| {
+            .for_each_init(Vec::new, |keys, (chunk, (scores, missing))| {
                 let sample_start = chunk * sample_chunk;
                 let samples = scores.len() / components;
-                let mut keys = [0u8; genotype_table::SAMPLE_TILE];
-                for group in 0..groups {
+                // Every group's keys first, so each sample row is visited once.
+                keys.clear();
+                keys.resize(groups * samples, 0);
+                for (group, keys) in keys.chunks_exact_mut(samples).enumerate() {
                     let start = tile_start + group * 4;
                     genotype_table::consecutive_keys(
                         &bytes[start..(start + 4).min(tile_end)],
                         sample_start,
-                        &mut keys[..samples],
+                        keys,
                     );
-                    let table = &tables[group * table_len..(group + 1) * table_len];
-                    for (sample, &key) in keys[..samples].iter().enumerate() {
-                        add_score_vector(
-                            &mut scores[sample * components..(sample + 1) * components],
-                            &table[key as usize * components..(key as usize + 1) * components],
-                        );
-                        let mut mask = genotype_table::missing_bits(key);
+                }
+                if components <= genotype_table::REGISTER_COLUMNS {
+                    genotype_table::accumulate_rows(keys, groups, &tables, components, scores);
+                } else {
+                    for (group, keys) in keys.chunks_exact(samples).enumerate() {
+                        let table = &tables[group * table_len..(group + 1) * table_len];
+                        for (row, &key) in scores.chunks_exact_mut(components).zip(keys) {
+                            add_score_vector(
+                                row,
+                                &table[key as usize * components..(key as usize + 1) * components],
+                            );
+                        }
+                    }
+                }
+                for (sample, missing) in missing.chunks_exact_mut(missing_stride).enumerate() {
+                    for group in 0..groups {
+                        let mut mask = genotype_table::missing_bits(keys[group * samples + sample]);
                         while mask != 0 {
                             let variant = mask.trailing_zeros() as usize / 2;
                             mask &= mask - 1;
-                            add_missing(
-                                &mut missing
-                                    [sample * missing_stride..(sample + 1) * missing_stride],
-                                start + variant,
-                            );
+                            add_missing(missing, tile_start + group * 4 + variant);
                         }
                     }
                 }
