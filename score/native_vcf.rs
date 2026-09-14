@@ -6,11 +6,16 @@ use flate2::Crc;
 use flate2::read::MultiGzDecoder;
 use libdeflater::Decompressor;
 use memchr::{memchr, memchr_iter, memrchr};
+use noodles_bcf::io::Reader as BcfReader;
 use noodles_vcf::io::Reader as VcfReader;
 use noodles_vcf::variant::record::AlternateBases as _;
 use noodles_vcf::variant::record::samples::keys::key;
+use noodles_vcf::variant::record::samples::series::{
+    Value as SeriesValue, value::Array as SeriesArray,
+};
 use rayon::prelude::*;
 use std::error::Error;
+use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Cursor, Read};
 use std::path::{Path, PathBuf};
@@ -157,33 +162,95 @@ pub fn score_vcf_streaming(
     let rules_by_key = Arc::new(rules_by_key);
 
     let source = open_variant_source(input_path)?;
-    if source.format() != VariantFormat::Vcf {
-        return Err(format!(
-            "Native streaming score supports VCF input only; got {:?} for '{}'.",
-            source.format(),
-            input_path.display()
-        )
-        .into());
+    match source.format() {
+        VariantFormat::Vcf => {
+            let mut reader = match source.compression() {
+                VariantCompression::Plain => {
+                    let reader: Box<dyn BufRead + Send> = Box::new(BufReader::new(source));
+                    VcfReader::new(reader)
+                }
+                VariantCompression::Bgzf => {
+                    let reader: Box<dyn BufRead + Send> = Box::new(PrefilteredBgzfReader::spawn(
+                        source,
+                        Arc::clone(&rules_by_key),
+                    )?);
+                    VcfReader::new(reader)
+                }
+            };
+            let header = reader.read_header()?;
+            score_records(
+                &header,
+                "VCF",
+                input_path,
+                keep,
+                score_names,
+                |record: &mut noodles_vcf::Record| reader.read_record(record),
+                |record, kept_indices, score_names, decoded| {
+                    decode_scored_record(record, &rules_by_key, kept_indices, score_names, decoded)
+                },
+                |record| record.reference_sequence_name().to_string(),
+            )
+        }
+        VariantFormat::Bcf => {
+            let inner: Box<dyn Read + Send> = match source.compression() {
+                VariantCompression::Plain => Box::new(BufReader::new(source)),
+                VariantCompression::Bgzf => Box::new(noodles_bgzf::io::Reader::new(source)),
+            };
+            let mut reader = BcfReader::from(inner);
+            let header = reader.read_header()?;
+            score_records(
+                &header,
+                "BCF",
+                input_path,
+                keep,
+                score_names,
+                |record: &mut noodles_bcf::Record| reader.read_record(record),
+                |record, kept_indices, score_names, decoded| {
+                    decode_scored_bcf_record(
+                        record,
+                        &header,
+                        &rules_by_key,
+                        kept_indices,
+                        score_names,
+                        decoded,
+                    )
+                },
+                |record| {
+                    record
+                        .reference_sequence_name(header.string_maps())
+                        .map_or_else(|_| String::from("?"), str::to_string)
+                },
+            )
+        }
     }
+}
 
-    let mut reader = match source.compression() {
-        VariantCompression::Plain => {
-            let reader: Box<dyn BufRead + Send> = Box::new(BufReader::new(source));
-            VcfReader::new(reader)
-        }
-        VariantCompression::Bgzf => {
-            let reader: Box<dyn BufRead + Send> = Box::new(PrefilteredBgzfReader::spawn(
-                source,
-                Arc::clone(&rules_by_key),
-            )?);
-            VcfReader::new(reader)
-        }
-    };
-
-    let header = reader.read_header()?;
+/// Scores the records `read_record` yields for the kept samples of `header`.
+///
+/// Records are read in order, decoded on the rayon pool, and accumulated in
+/// order again, so every sum takes the same operands in the same sequence as a
+/// one-record-at-a-time scan, and the first error is the one it raises.
+#[allow(clippy::too_many_arguments)]
+fn score_records<R, ReadRecord, Decode, Chromosome>(
+    header: &noodles_vcf::Header,
+    format_name: &str,
+    input_path: &Path,
+    keep: Option<&Path>,
+    score_names: Vec<String>,
+    mut read_record: ReadRecord,
+    decode: Decode,
+    chromosome: Chromosome,
+) -> Result<NativeVcfScoreResult, Box<dyn Error + Send + Sync>>
+where
+    R: Default + Sync,
+    ReadRecord: FnMut(&mut R) -> io::Result<usize>,
+    Decode: Fn(&R, &[usize], &[String], &mut DecodedRecord) -> Result<(), Box<dyn Error + Send + Sync>>
+        + Sync,
+    Chromosome: Fn(&R) -> String,
+{
     let all_samples: Vec<String> = header.sample_names().iter().cloned().collect();
     if all_samples.is_empty() {
-        return Err("VCF contains no samples.".into());
+        return Err(format!("{format_name} contains no samples.").into());
     }
 
     let kept_indices = resolve_keep_indices(keep, &all_samples)?;
@@ -198,13 +265,10 @@ pub fn score_vcf_streaming(
     let mut missing_counts = vec![0u32; num_people * num_scores];
     let mut score_variant_counts = vec![0u32; num_scores];
 
-    // Records are read in order, decoded on the rayon pool, and accumulated in
-    // order again, so every sum takes the same operands in the same sequence
-    // as a one-record-at-a-time scan, and the first error is the one it raises.
     let threads = rayon::current_num_threads().max(1);
     let batch_len =
         (DECODE_BATCH_DOSAGES / all_samples.len()).clamp(threads, threads * RECORDS_PER_WORKER);
-    let mut records: Vec<noodles_vcf::Record> = Vec::new();
+    let mut records: Vec<R> = Vec::new();
     let mut decoded_records: Vec<DecodedRecord> = Vec::new();
     loop {
         let mut filled = 0usize;
@@ -212,10 +276,10 @@ pub fn score_vcf_streaming(
         let mut at_eof = false;
         while filled < batch_len {
             if records.len() == filled {
-                records.push(noodles_vcf::Record::default());
+                records.push(R::default());
                 decoded_records.push(DecodedRecord::default());
             }
-            match reader.read_record(&mut records[filled]) {
+            match read_record(&mut records[filled]) {
                 Ok(0) => {
                     at_eof = true;
                     break;
@@ -233,14 +297,7 @@ pub fn score_vcf_streaming(
             .zip(decoded_records[..filled].par_iter_mut())
             .for_each(|(record, decoded)| {
                 decoded.allele_count = 0;
-                decoded.error = decode_scored_record(
-                    record,
-                    &rules_by_key,
-                    &kept_indices,
-                    &score_names,
-                    decoded,
-                )
-                .err();
+                decoded.error = decode(record, &kept_indices, &score_names, decoded).err();
             });
 
         for (record, decoded) in records[..filled].iter().zip(&mut decoded_records[..filled]) {
@@ -257,7 +314,7 @@ pub fn score_vcf_streaming(
                                     decoded_dosage.ref_dosage.ok_or_else(|| {
                                         ref_effect_error(
                                             &score_names[rule.score_index],
-                                            record,
+                                            &chromosome(record),
                                             decoded.position,
                                         )
                                     })?
@@ -397,8 +454,76 @@ fn decode_scored_record(
                     && decoded_dosage.ref_dosage.is_none()
                     && let Some(rule) = ref_effect_rule
                 {
+                    return Err(ref_effect_error(
+                        &score_names[rule.score_index],
+                        record.reference_sequence_name(),
+                        pos,
+                    )
+                    .into());
+                }
+                allele.dosages.push(dosage);
+                Ok(())
+            },
+        )?;
+        allele.matched_rules = matched_rules;
+        decoded.allele_count += 1;
+    }
+    Ok(())
+}
+
+/// Decodes the dosages a BCF `record` contributes to its matched rules into
+/// `decoded`, as `decode_scored_record` does for a VCF record.
+fn decode_scored_bcf_record(
+    record: &noodles_bcf::Record,
+    header: &noodles_vcf::Header,
+    rules_by_key: &ScoreRules,
+    kept_indices: &[usize],
+    score_names: &[String],
+    decoded: &mut DecodedRecord,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let chromosome = record.reference_sequence_name(header.string_maps())?;
+    let Ok(chr) = parse_chromosome_label(chromosome) else {
+        return Ok(());
+    };
+    let Some(start) = record.variant_start() else {
+        return Ok(());
+    };
+    let pos = start?.get() as u32;
+    let Some(score_rules) = rules_by_key.get(&(chr, pos)) else {
+        return Ok(());
+    };
+    decoded.position = pos;
+
+    let reference_bases = record.reference_bases();
+    let ref_allele = std::str::from_utf8(reference_bases.as_ref())?;
+    let alternate_bases = record.alternate_bases();
+    let alt_alleles = alternate_bases.iter().collect::<Result<Vec<_>, _>>()?;
+    for (alt_offset, alt_allele) in alt_alleles.iter().enumerate() {
+        let alt_index = alt_offset + 1;
+        let matched_rules =
+            match_rules_for_allele(rules_by_key, score_rules, ref_allele, alt_allele);
+        if matched_rules.is_empty() {
+            continue;
+        }
+        if decoded.alleles.len() == decoded.allele_count {
+            decoded.alleles.push(DecodedAllele::default());
+        }
+        let allele = &mut decoded.alleles[decoded.allele_count];
+        allele.dosages.clear();
+        let ref_effect_rule = matched_rules.iter().find(|rule| rule.effect_is_ref);
+        for_each_bcf_dosage_best(
+            record,
+            header,
+            alt_index,
+            alt_alleles.len(),
+            kept_indices,
+            |_, dosage| {
+                if let Some(decoded_dosage) = dosage
+                    && decoded_dosage.ref_dosage.is_none()
+                    && let Some(rule) = ref_effect_rule
+                {
                     return Err(
-                        ref_effect_error(&score_names[rule.score_index], record, pos).into(),
+                        ref_effect_error(&score_names[rule.score_index], chromosome, pos).into(),
                     );
                 }
                 allele.dosages.push(dosage);
@@ -411,12 +536,10 @@ fn decode_scored_record(
     Ok(())
 }
 
-fn ref_effect_error(score_name: &str, record: &noodles_vcf::Record, position: u32) -> String {
+fn ref_effect_error(score_name: &str, chromosome: &str, position: u32) -> String {
     format!(
         "Cannot score REF-effect rule for score '{}' at {}:{} without a complete REF dosage (DS requires genotype ploidy and all ALT dosages).",
-        score_name,
-        record.reference_sequence_name(),
-        position,
+        score_name, chromosome, position,
     )
 }
 
@@ -797,6 +920,164 @@ where
         kept_cursor += 1;
     }
 
+    Ok(())
+}
+
+/// Visits each kept person's dosage for ALT `alt_index` of a BCF `record`, as
+/// `for_each_vcf_dosage_best` does for a VCF record. Each person's GT, DS and GP
+/// values are written out as the VCF text of the same record would hold them and
+/// read by `decode_vcf_sample`, so both formats take the same dosage rules and
+/// raise the same errors. A float is written in the shortest form that parses
+/// back to its exact value.
+fn for_each_bcf_dosage_best<F>(
+    record: &noodles_bcf::Record,
+    header: &noodles_vcf::Header,
+    alt_index: usize,
+    alt_count: usize,
+    kept_indices: &[usize],
+    mut visit: F,
+) -> Result<(), Box<dyn Error + Send + Sync>>
+where
+    F: FnMut(usize, Option<DecodedAltDosage>) -> Result<(), Box<dyn Error + Send + Sync>>,
+{
+    let samples = record.samples()?;
+    if samples.format_count() == 0 {
+        for out_idx in 0..kept_indices.len() {
+            visit(out_idx, None)?;
+        }
+        return Ok(());
+    }
+
+    let (mut gt_series, mut ds_series, mut gp_series) = (None, None, None);
+    for result in samples.series() {
+        let series = result?;
+        let name = series.name(header)?;
+        if ds_series.is_none() && name == "DS" {
+            ds_series = Some(series);
+        } else if gp_series.is_none() && name == "GP" {
+            gp_series = Some(series);
+        } else if gt_series.is_none() && name == key::GENOTYPE {
+            gt_series = Some(series);
+        }
+    }
+    if gt_series.is_none() && ds_series.is_none() && gp_series.is_none() {
+        return Err("BCF record is missing GT, DS, or GP FORMAT fields.".into());
+    }
+
+    // Written in this order: GT, then DS, then GP.
+    let fields: Vec<_> = [&gt_series, &ds_series, &gp_series]
+        .into_iter()
+        .flatten()
+        .collect();
+    let gt_index = gt_series.is_some().then_some(0);
+    let ds_index = ds_series
+        .is_some()
+        .then_some(usize::from(gt_series.is_some()));
+    let gp_index = gp_series.is_some().then(|| fields.len() - 1);
+    let last_format_index = fields.len() - 1;
+
+    let mut sample = String::new();
+    for (out_idx, &sample_idx) in kept_indices.iter().enumerate() {
+        sample.clear();
+        let mut in_record = true;
+        for (offset, series) in fields.iter().enumerate() {
+            if offset > 0 {
+                sample.push(':');
+            }
+            match series.get(header, sample_idx) {
+                None => {
+                    in_record = false;
+                    break;
+                }
+                Some(None) => sample.push('.'),
+                Some(Some(value)) => write_sample_value(value?, &mut sample)?,
+            }
+        }
+        let decoded = if in_record {
+            decode_vcf_sample(
+                &sample,
+                ds_index,
+                gp_index,
+                gt_index,
+                last_format_index,
+                alt_index,
+                alt_count,
+            )?
+        } else {
+            None
+        };
+        visit(out_idx, decoded)?;
+    }
+    Ok(())
+}
+
+/// Writes one BCF FORMAT value as a VCF sample column holds it.
+fn write_sample_value(
+    value: SeriesValue<'_>,
+    out: &mut String,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    match value {
+        SeriesValue::Integer(value) => write!(out, "{value}")?,
+        SeriesValue::Float(value) => write!(out, "{}", f64::from(value))?,
+        SeriesValue::Character(value) => out.push(value),
+        SeriesValue::String(value) => out.push_str(value.as_ref()),
+        SeriesValue::Genotype(genotype) => {
+            for (offset, allele) in genotype.iter().enumerate() {
+                let (position, _) = allele?;
+                if offset > 0 {
+                    out.push('/');
+                }
+                match position {
+                    Some(position) => write!(out, "{position}")?,
+                    None => out.push('.'),
+                }
+            }
+        }
+        SeriesValue::Array(SeriesArray::Integer(values)) => {
+            for (offset, value) in values.iter().enumerate() {
+                if offset > 0 {
+                    out.push(',');
+                }
+                match value? {
+                    Some(value) => write!(out, "{value}")?,
+                    None => out.push('.'),
+                }
+            }
+        }
+        SeriesValue::Array(SeriesArray::Float(values)) => {
+            for (offset, value) in values.iter().enumerate() {
+                if offset > 0 {
+                    out.push(',');
+                }
+                match value? {
+                    Some(value) => write!(out, "{}", f64::from(value))?,
+                    None => out.push('.'),
+                }
+            }
+        }
+        SeriesValue::Array(SeriesArray::Character(values)) => {
+            for (offset, value) in values.iter().enumerate() {
+                if offset > 0 {
+                    out.push(',');
+                }
+                match value? {
+                    Some(value) => out.push(value),
+                    None => out.push('.'),
+                }
+            }
+        }
+        SeriesValue::Array(SeriesArray::String(values)) => {
+            for (offset, value) in values.iter().enumerate() {
+                if offset > 0 {
+                    out.push(',');
+                }
+                match value? {
+                    Some(value) => out.push_str(value.as_ref()),
+                    None => out.push('.'),
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -2140,6 +2421,92 @@ mod tests {
             }
         }
         (vcf, score)
+    }
+
+    /// A BCF holding a VCF's records scores exactly like the VCF, bgzipped or not:
+    /// phased, haploid and missing GT calls, DS with missing values, GP, a
+    /// multiallelic record and a REF-effect rule.
+    #[test]
+    fn native_bcf_scores_like_the_same_vcf() {
+        use noodles_vcf::variant::io::Write as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vcf_path = dir.path().join("cohort.vcf");
+        let bcf_path = dir.path().join("cohort.bcf");
+        let plain_bcf_path = dir.path().join("cohort.plain.bcf");
+        let score_path = dir.path().join("score.gnomon.tsv");
+        std::fs::write(
+            &vcf_path,
+            "##fileformat=VCFv4.2\n\
+             ##contig=<ID=1>\n\
+             ##contig=<ID=X>\n\
+             ##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n\
+             ##FORMAT=<ID=DS,Number=A,Type=Float,Description=\"ALT dosage\">\n\
+             ##FORMAT=<ID=GP,Number=G,Type=Float,Description=\"Genotype probabilities\">\n\
+             #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts1\ts2\ts3\n\
+             1\t100\t.\tA\tG\t.\tPASS\t.\tGT\t0|1\t1/1\t./.\n\
+             1\t200\t.\tC\tT,G\t.\tPASS\t.\tGT:DS\t1/2:0.75,0.5\t0/1:.,.\t2/2:0.25,1.75\n\
+             1\t300\t.\tG\tA\t.\tPASS\t.\tGP\t0.25,0.5,0.25\t0.5,0.25,0.25\t0,0,1\n\
+             X\t400\t.\tT\tC\t.\tPASS\t.\tGT\t1\t0/1\t0\n",
+        )
+        .expect("write vcf");
+        std::fs::write(
+            &score_path,
+            "variant_id\teffect_allele\tother_allele\tScoreA\tScoreB\n\
+             1:100\tG\tA\t1.0\t0.5\n\
+             1:200\tT\tC\t2.0\t0.25\n\
+             1:200\tG\tC\t-1.0\t3.0\n\
+             1:200\tC\tT\t0.5\t-2.0\n\
+             1:300\tA\tG\t1.5\t0.75\n\
+             X:400\tC\tT\t4.0\t1.0\n",
+        )
+        .expect("write score");
+
+        let mut reader = VcfReader::new(BufReader::new(File::open(&vcf_path).expect("open vcf")));
+        let header = reader.read_header().expect("vcf header");
+        let mut writer = noodles_bcf::io::Writer::new(File::create(&bcf_path).expect("create bcf"));
+        writer.write_header(&header).expect("bcf header");
+        let mut record = noodles_vcf::variant::RecordBuf::default();
+        while reader
+            .read_record_buf(&header, &mut record)
+            .expect("vcf record")
+            != 0
+        {
+            writer
+                .write_variant_record(&header, &record)
+                .expect("bcf record");
+        }
+        writer.try_finish().expect("finish bcf");
+        io::copy(
+            &mut MultiGzDecoder::new(File::open(&bcf_path).expect("open bcf")),
+            &mut File::create(&plain_bcf_path).expect("create plain bcf"),
+        )
+        .expect("inflate bcf");
+
+        let score = |path: &Path| {
+            score_vcf_streaming(path, std::slice::from_ref(&score_path), None, None)
+                .unwrap_or_else(|err| panic!("{}: {err}", path.display()))
+        };
+        let expected = score(&vcf_path);
+        assert!(expected.matched_variants > 0);
+        for path in [&bcf_path, &plain_bcf_path] {
+            let actual = score(path);
+            assert_same_native_result(&expected, &actual, &path.display().to_string());
+            assert_eq!(
+                expected
+                    .sum_scores
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                actual
+                    .sum_scores
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                "{}",
+                path.display()
+            );
+        }
     }
 
     fn assert_same_native_result(

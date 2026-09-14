@@ -216,8 +216,9 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
         )
     })?;
 
-    let use_native_vcf = input_format == InputFormat::Vcf && args.panel.is_none();
-    if input_format == InputFormat::Vcf && args.panel.is_some() {
+    let variant_file = matches!(input_format, InputFormat::Vcf | InputFormat::Bcf);
+    let use_native_vcf = variant_file && args.panel.is_none();
+    if variant_file && args.panel.is_some() {
         eprintln!(
             "> --panel supplied; using PLINK conversion path so panel harmonization is applied."
         );
@@ -239,7 +240,7 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
             return Err("No score files were found or resolved.".into());
         }
 
-        eprintln!("> Using native noodles-vcf streaming scorer for VCF input.");
+        eprintln!("> Using native noodles streaming scorer for VCF/BCF input.");
         eprintln!(
             "> Normalizing and preparing {} score file(s)...",
             resolved_score_files.len()
@@ -284,7 +285,8 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
     }
 
     // --- Genotype Format Conversion (if needed) ---
-    // PLINK inputs continue directly; DTC/BCF inputs use the existing conversion path.
+    // PLINK inputs continue directly; DTC inputs, and VCF/BCF inputs with --panel,
+    // use the conversion path.
     let inferred_sex_override = args.inferred_sex.map(|s| match s {
         InferredSexArg::Male => genotype_convert::ConvertSex::Male,
         InferredSexArg::Female => genotype_convert::ConvertSex::Female,
