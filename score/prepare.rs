@@ -404,6 +404,22 @@ fn apply_simple_score_assignment(entry: &mut SimpleScoreAssignment, weight: f64,
     }
 }
 
+/// Retain low bits while summing the cohort-independent flipped-allele baseline.
+/// This runs once per contribution, not once per person.
+#[inline]
+fn accumulate_baseline(sum: &mut f64, error: &mut f64, value: f64) {
+    if value == 0.0 {
+        return;
+    }
+    let next = *sum + value;
+    *error += if sum.abs() >= value.abs() {
+        (*sum - next) + value
+    } else {
+        (value - next) + *sum
+    };
+    *sum = next;
+}
+
 #[inline(always)]
 fn allele_pair_matches(
     effect_allele: &str,
@@ -715,7 +731,16 @@ fn prepare_for_computation_with_retry(
     let mut required_bim_indices: Vec<BimRowIndex> = Vec::new();
     let mut required_is_complex: Vec<u8> = Vec::new();
     let mut csr_builder = CsrBuilder::new()?;
-    let mut baseline_missing_sum_by_score = vec![0.0f64; score_names.len()];
+    let mut baseline_missing_sum_by_score = Vec::new();
+    baseline_missing_sum_by_score
+        .try_reserve_exact(score_names.len())
+        .map_err(|e| PrepError::Invariant(format!("Cannot allocate score baselines: {e}")))?;
+    baseline_missing_sum_by_score.resize(score_names.len(), 0.0f64);
+    let mut baseline_errors = Vec::new();
+    baseline_errors
+        .try_reserve_exact(score_names.len())
+        .map_err(|e| PrepError::Invariant(format!("Cannot allocate baseline compensation: {e}")))?;
+    baseline_errors.resize(score_names.len(), 0.0f64);
     let mut score_variant_counts = vec![0u32; score_names.len()];
     let mut final_complex_rules: Vec<GroupedComplexRule> = Vec::new();
     let mut bim_group = Vec::new();
@@ -855,8 +880,11 @@ fn prepare_for_computation_with_retry(
                         required_is_complex.push(0);
                         csr_builder.push_contribution(score.score_column_index, assignment)?;
                         csr_builder.finish_variant()?;
-                        baseline_missing_sum_by_score[score.score_column_index.0] +=
-                            assignment.missing_correction as f64;
+                        accumulate_baseline(
+                            &mut baseline_missing_sum_by_score[score.score_column_index.0],
+                            &mut baseline_errors[score.score_column_index.0],
+                            assignment.missing_correction,
+                        );
                         score_variant_counts[score.score_column_index.0] += 1;
                     }
                     continue;
@@ -894,8 +922,11 @@ fn prepare_for_computation_with_retry(
                         for column in touched_columns.drain(..) {
                             let assignment = simple_assignments[column.0].take().unwrap();
                             csr_builder.push_contribution(column, assignment)?;
-                            baseline_missing_sum_by_score[column.0] +=
-                                assignment.missing_correction as f64;
+                            accumulate_baseline(
+                                &mut baseline_missing_sum_by_score[column.0],
+                                &mut baseline_errors[column.0],
+                                assignment.missing_correction,
+                            );
                             score_variant_counts[column.0] += 1;
                         }
                         csr_builder.finish_variant()?;
@@ -1151,6 +1182,9 @@ fn prepare_for_computation_with_retry(
                     .zip(hits)
                     .all(|(region, hit)| region.is_none() || *hit)
             });
+    for (sum, error) in baseline_missing_sum_by_score.iter_mut().zip(baseline_errors) {
+        *sum += error;
+    }
     let plan = cache::VariantPlan {
         weights: sparse_weights,
         corrections: sparse_missing_corrections,
@@ -1372,6 +1406,26 @@ fn build_spool_maps(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flipped_allele_baseline_retains_small_contributions_after_cancellation() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("panel");
+        write_bim_fileset(
+            &prefix,
+            &["1 a 0 100 A G\n", "1 b 0 200 A G\n", "1 c 0 300 A G\n"],
+            1,
+        );
+        let weights = dir.path().join("weights.tsv");
+        std::fs::write(
+            &weights,
+            "variant_id\teffect_allele\tother_allele\tS\n1:100\tA\tG\t4503599627370496\n1:200\tA\tG\t0.5\n1:300\tA\tG\t-4503599627370496\n",
+        )
+        .unwrap();
+        let prep = prepare_for_computation(&[prefix], &[weights], None, None).unwrap();
+        assert_eq!(prep.baseline_missing_sum_by_score(), &[1.0]);
+        assert_eq!(prep.score_variant_counts, [3]);
+    }
 
     #[test]
     fn score_weights_retain_f64_precision_and_require_finite_values() {

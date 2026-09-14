@@ -1,5 +1,28 @@
 # Score and packed projection performance
 
+## Compensated flipped-allele baselines
+
+Preparation now retains rounding residuals when summing each score's flipped-
+allele baseline, then folds the residual in once. The extra array has one f64
+per score (256 bytes for 32 scores), is reserved fallibly, and is released before
+the finished plan is constructed. It adds no per-person compensation state.
+
+On the same full-marker, 512-person, 32-PGS panel, maximum AVG error against
+gscore fell another 14.2 times, from 6.41486864e-13 to 4.50750548e-14.
+All 16,384 cells pass relative tolerance 1e-12 plus absolute tolerance 1e-15;
+missing percentages agree. This does not establish exact rounding: tiny
+PGS000026 scores still differ near zero. A preparation regression fixture checks
+that three separate flipped loci contributing 2^53, 1, and -2^53 retain the 1.
+All 74 focused tests against the main snapshot passed.
+
+Three alternating warm pairs on four pinned Milan cores took median compute
+times of 591.536 ms without compensation and 598.480 ms with it (1.2% apart).
+Warm preparation medians were 170.095 and 159.841 ms; warm runs stayed below
+397 MiB RSS. Single cold-plan runs took 3,151 and 3,305 ms to prepare and peaked
+at about 1.31 and 1.28 GiB RSS, respectively. These timings do not show a compute
+speedup from compensation. Logs use `round18-`; the probe compiles the candidate
+preparation module against the same main library for a matched comparison.
+
 ## Retaining source-weight precision throughout CPU scoring
 
 Weights, CSR corrections, dense CPU canvases, and SIMD accumulators now use

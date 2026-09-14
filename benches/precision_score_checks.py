@@ -7,10 +7,21 @@ from build_cached_probe import build, root
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('library_log', type=Path)
 parser.add_argument('mode', choices=['tests', 'cohort'])
+parser.add_argument('--candidate-prepare', action='store_true')
+parser.add_argument('--output', default='cohort-score-f64')
 args = parser.parse_args()
 
 if args.mode == 'cohort':
-    build(root / 'src/benches/probes/cohort_score.rs', 'cohort-score-f64',
+    path = root / 'src/benches/probes/cohort_score.rs'
+    if args.candidate_prepare:
+        modules = 'pub use gnomon::{adapt_plink2, memory, pipeline_error, output};\n'
+        modules += 'pub mod shared { pub use gnomon::files; }\n'
+        modules += '#[path="%s"] pub mod candidate_prepare;\n' % (root / 'src/score/prepare.rs')
+        modules += 'pub mod score { pub use gnomon::score::*; pub use crate::candidate_prepare as prepare; }\n'
+        source = path.read_text().replace('use gnomon::score;', modules)
+        path = root / 'cohort_score_precision_candidate.rs'
+        path.write_text(source)
+    build(path, args.output,
           ['-C', 'panic=abort'], library_log=args.library_log)
 else:
     source = '#![feature(portable_simd)]\n'
