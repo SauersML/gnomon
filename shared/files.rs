@@ -1,6 +1,8 @@
 use crate::adapt_plink2::GenomeBuild;
 use crate::pipeline_error::PipelineError;
-use crate::range_fetch::{BedReadPlan, PlannedReader, SegmentFetch, fetch_cache_block};
+use crate::range_fetch::{
+    BedReadPlan, PlannedReader, SegmentFetch, fetch_cache_block, fetch_whole_object,
+};
 use google_cloud_auth::credentials::{
     CacheableResource, Credentials, anonymous::Builder as AnonymousCredentials,
 };
@@ -260,7 +262,11 @@ impl BedSource {
             return Ok(self.clone());
         };
         let plan = BedReadPlan::new(rows, row_bytes, self.len())?;
-        Ok(self.with_reader(PlannedReader::new(plan, Arc::clone(fetch))))
+        Ok(self.with_reader(PlannedReader::with_limits(
+            plan,
+            Arc::clone(fetch),
+            crate::range_fetch::remote_limits(),
+        )))
     }
 
     fn with_reader(&self, reader: PlannedReader) -> Self {
@@ -403,7 +409,11 @@ fn planned_reader(
     rows: &[u64],
     row_bytes: u64,
 ) -> Result<PlannedReader, PipelineError> {
-    let reader = PlannedReader::new(BedReadPlan::new(rows, row_bytes, len)?, fetch);
+    let reader = PlannedReader::with_limits(
+        BedReadPlan::new(rows, row_bytes, len)?,
+        fetch,
+        crate::range_fetch::remote_limits(),
+    );
     eprintln!(
         "> Remote BED read plan: {} required rows of {row_bytes} B in {} ranges; up to {} concurrent requests.",
         rows.len(),
@@ -958,25 +968,130 @@ pub fn open_text_source(path: &Path) -> Result<Box<dyn TextSource>, PipelineErro
             .to_str()
             .ok_or_else(|| PipelineError::Io("Invalid UTF-8 in path".to_string()))?;
         let (bucket, object) = parse_gcs_uri(uri)?;
-        let remote = RemoteByteRangeSource::new(&bucket, &object)?;
-        let source: Arc<dyn ByteRangeSource> = Arc::new(remote);
-        Ok(Box::new(StreamingTextSource::new(
-            format!("gs://{bucket}/{object}"),
-            source,
-        )))
+        remote_text_source(format!("gs://{bucket}/{object}"), || {
+            let remote = RemoteByteRangeSource::new(&bucket, &object)?;
+            let fetcher = Arc::clone(&remote.fetcher);
+            let fetch: SegmentFetch = Arc::new(move |start, length| fetcher.fetch(start, length));
+            Ok((Arc::new(remote), fetch))
+        })
     } else if is_http_path(path) {
         let url = path
             .to_str()
             .ok_or_else(|| PipelineError::Io("Invalid UTF-8 in path".to_string()))?;
-        let remote = HttpByteRangeSource::new(url)?;
-        Ok(Box::new(StreamingTextSource::new(
-            url.to_string(),
-            Arc::new(remote),
-        )))
+        remote_text_source(url.to_string(), || {
+            let remote = HttpByteRangeSource::new(url)?;
+            let fetcher = Arc::clone(&remote.fetcher);
+            let fetch: SegmentFetch = Arc::new(move |start, length| fetcher.fetch(start, length));
+            Ok((Arc::new(remote), fetch))
+        })
     } else {
         let file = File::open(path)
             .map_err(|e| PipelineError::Io(format!("Opening {}: {e}", path.display())))?;
         Ok(Box::new(LocalTextSource::new(path, file)?))
+    }
+}
+
+/// Remote text objects within [`remote_text_budget`] are read whole, in
+/// concurrent parts, and kept for the rest of the process. One command reads
+/// the same `.bim` several times (counting, keying, matching), and every reread
+/// would otherwise repeat a length probe and a serial sweep of blocks. Larger
+/// objects, such as a sequencing `.pvar`, stream block by block.
+const REMOTE_TEXT_WHOLE_LIMIT: u64 = 256 * 1024 * 1024;
+
+/// The largest remote text object read whole: an eighth of the memory available
+/// when first asked, and never above [`REMOTE_TEXT_WHOLE_LIMIT`], which also
+/// bounds the concurrent parts of one download. A machine whose memory limit
+/// cannot be established streams every object.
+fn remote_text_budget() -> u64 {
+    static BUDGET: OnceLock<u64> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let (_, available) = crate::memory::memory_bytes();
+        (available / 8).min(REMOTE_TEXT_WHOLE_LIMIT)
+    })
+}
+
+/// Remote text objects already read whole, by location.
+static REMOTE_TEXT_OBJECTS: OnceLock<Mutex<HashMap<String, Arc<Vec<u8>>>>> = OnceLock::new();
+
+fn remote_text_source<F>(location: String, open: F) -> Result<Box<dyn TextSource>, PipelineError>
+where
+    F: FnOnce() -> Result<(Arc<dyn ByteRangeSource>, SegmentFetch), PipelineError>,
+{
+    let objects = REMOTE_TEXT_OBJECTS.get_or_init(Default::default);
+    let cached = objects.lock().unwrap().get(&location).cloned();
+    let source: Arc<dyn ByteRangeSource> = match cached {
+        Some(bytes) => Arc::new(WholeTextObject {
+            location: location.clone(),
+            len: bytes.len() as u64,
+            fetch: None,
+            bytes: OnceLock::from(bytes),
+        }),
+        None => {
+            let (source, fetch) = open()?;
+            if source.len() > remote_text_budget() {
+                source
+            } else {
+                Arc::new(WholeTextObject {
+                    location: location.clone(),
+                    len: source.len(),
+                    fetch: Some(fetch),
+                    bytes: OnceLock::new(),
+                })
+            }
+        }
+    };
+    Ok(Box::new(StreamingTextSource::new(location, source)))
+}
+
+/// A remote text object downloaded whole on its first read, which later opens
+/// of the same location then share.
+struct WholeTextObject {
+    location: String,
+    len: u64,
+    fetch: Option<SegmentFetch>,
+    bytes: OnceLock<Arc<Vec<u8>>>,
+}
+
+impl ByteRangeSource for WholeTextObject {
+    fn len(&self) -> u64 {
+        self.len
+    }
+
+    fn read_at(&self, offset: u64, dst: &mut [u8]) -> Result<(), PipelineError> {
+        let bytes = match (self.bytes.get(), &self.fetch) {
+            (Some(bytes), _) => bytes,
+            (None, Some(fetch)) => {
+                let bytes = Arc::new(fetch_whole_object(self.len, fetch)?);
+                let mut objects = REMOTE_TEXT_OBJECTS.get_or_init(Default::default).lock().unwrap();
+                // Kept objects stay within twice the per-object budget in total,
+                // so a long-lived process that reads many filesets stays bounded.
+                let kept: u64 = objects.values().map(|kept| kept.len() as u64).sum();
+                if kept + self.len <= 2 * remote_text_budget() {
+                    objects.insert(self.location.clone(), Arc::clone(&bytes));
+                }
+                drop(objects);
+                self.bytes.get_or_init(|| bytes)
+            }
+            (None, None) => {
+                return Err(PipelineError::Io(format!(
+                    "Remote text object {} has neither bytes nor a fetcher",
+                    self.location
+                )));
+            }
+        };
+        let range = usize::try_from(offset)
+            .ok()
+            .and_then(|start| Some(start..start.checked_add(dst.len())?))
+            .filter(|range| range.end <= bytes.len())
+            .ok_or_else(|| {
+                PipelineError::Io(format!(
+                    "Attempted to read past end of {} (offset {offset}, len {})",
+                    self.location,
+                    dst.len()
+                ))
+            })?;
+        dst.copy_from_slice(&bytes[range]);
+        Ok(())
     }
 }
 
@@ -2810,6 +2925,41 @@ mod tests {
         source.read_at(7, &mut row).expect("required row from memory");
         assert_eq!(&row, b"efgh");
         assert!(source.read_at(9, &mut row).is_err());
+    }
+
+    #[test]
+    fn remote_text_objects_are_read_whole_once_per_process() {
+        let body = "1\trs1\t0\t10\tA\tG\r\n1\trs2\t0\t20\tC\tT";
+        let (url, server) = serve_http_responses(vec![
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            ),
+            format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-{}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len() - 1,
+                body.len(),
+                body.len()
+            ),
+        ]);
+        let read_lines = |mut source: Box<dyn TextSource>| {
+            let mut lines = Vec::new();
+            while let Some(line) = source.next_line().expect("line") {
+                lines.push(String::from_utf8(line.to_vec()).expect("UTF-8"));
+            }
+            lines
+        };
+        let expected = ["1\trs1\t0\t10\tA\tG", "1\trs2\t0\t20\tC\tT"];
+        assert_eq!(
+            read_lines(open_text_source(Path::new(&url)).expect("remote text")),
+            expected
+        );
+        server.join().expect("one length probe and one whole-object range");
+        // The server has stopped accepting, so a second open must not request.
+        assert_eq!(
+            read_lines(open_text_source(Path::new(&url)).expect("cached text")),
+            expected
+        );
     }
 
     #[test]

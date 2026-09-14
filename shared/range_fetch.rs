@@ -186,6 +186,26 @@ pub(crate) const LIMITS: Limits = Limits {
     max_workers: 256,
 };
 
+/// [`LIMITS`] within this machine's memory, as available when first asked.
+pub(crate) fn remote_limits() -> Limits {
+    static REMOTE: std::sync::OnceLock<Limits> = std::sync::OnceLock::new();
+    *REMOTE.get_or_init(|| limits_within(crate::memory::memory_bytes().1))
+}
+
+/// [`LIMITS`] with the window at most an eighth of `available` bytes and the
+/// in-flight target at most half the window. With no memory to spare (a limit
+/// that cannot be established reads as zero) one range is fetched at a time.
+fn limits_within(available: u64) -> Limits {
+    let window_bytes = usize::try_from(available / 8)
+        .unwrap_or(usize::MAX)
+        .min(LIMITS.window_bytes);
+    Limits {
+        window_bytes,
+        in_flight_bytes: LIMITS.in_flight_bytes.min(window_bytes / 2),
+        ..LIMITS
+    }
+}
+
 struct State {
     /// Lowest range index the consumer may still ask for.
     consumer: usize,
@@ -222,6 +242,9 @@ pub(crate) struct PlannedReader {
 }
 
 impl PlannedReader {
+    /// A reader within the fixed [`LIMITS`], so that tests do not depend on
+    /// this machine's memory. Remote callers use [`remote_limits`].
+    #[cfg(test)]
     pub(crate) fn new(plan: BedReadPlan, fetch: SegmentFetch) -> Self {
         Self::with_limits(plan, fetch, LIMITS)
     }
@@ -392,6 +415,9 @@ fn fetch_exact(fetch: &SegmentFetch, start: u64, length: usize) -> Result<Vec<u8
     Ok(data)
 }
 
+/// Longest part of a whole-object download; all parts are requested at once.
+const WHOLE_OBJECT_PART: usize = 8 * 1024 * 1024;
+
 /// Fill one cache block with at most four concurrent range requests. Dense
 /// sweeps need the entire block; issuing its parts together overlaps network
 /// waits without increasing the cache budget or fetching additional bytes.
@@ -407,6 +433,22 @@ where
         return fetch(start, length).map(Arc::new);
     }
     let chunk_size = length.div_ceil(4).max(REMOTE_TRANSFER_CHUNK);
+    fetch_parts(start, length, chunk_size, fetch).map(Arc::new)
+}
+
+/// Downloads an object that is read end to end, in concurrent parts.
+pub(crate) fn fetch_whole_object(len: u64, fetch: &SegmentFetch) -> Result<Vec<u8>, PipelineError> {
+    let length = usize::try_from(len)
+        .map_err(|_| PipelineError::Io("Remote object is too large to hold in memory".into()))?;
+    fetch_parts(0, length, WHOLE_OBJECT_PART, |start, part| fetch(start, part))
+}
+
+/// `length` bytes from `start`, requested concurrently in parts of
+/// `chunk_size` bytes and reassembled in order.
+fn fetch_parts<F>(start: u64, length: usize, chunk_size: usize, fetch: F) -> Result<Vec<u8>, PipelineError>
+where
+    F: Fn(u64, usize) -> Result<Vec<u8>, PipelineError> + Sync,
+{
     let mut data = vec![0; length];
     std::thread::scope(|scope| {
         let fetch = &fetch;
@@ -436,7 +478,7 @@ where
         }
         Ok::<(), PipelineError>(())
     })?;
-    Ok(Arc::new(data))
+    Ok(data)
 }
 
 #[cfg(test)]
@@ -873,5 +915,70 @@ mod tests {
         }).unwrap();
         assert_eq!(&**data, &[9; 5]);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn whole_object_parts_are_requested_together_and_reassembled() {
+        let len = 2 * WHOLE_OBJECT_PART as u64 + 5;
+        let barrier = Arc::new(Barrier::new(3));
+        let ranges = Arc::new(Mutex::new(Vec::new()));
+        let fetch = fetcher({
+            let (barrier, ranges) = (barrier.clone(), ranges.clone());
+            move |offset, length| {
+                ranges.lock().unwrap().push((offset, length));
+                // All three parts must be in flight before any returns.
+                barrier.wait();
+                Ok(pattern(offset, length))
+            }
+        });
+        assert_eq!(fetch_whole_object(len, &fetch).unwrap(), pattern(0, len as usize));
+        let mut actual = ranges.lock().unwrap().clone();
+        actual.sort_unstable();
+        let part = WHOLE_OBJECT_PART as u64;
+        assert_eq!(actual, vec![(0, WHOLE_OBJECT_PART), (part, WHOLE_OBJECT_PART), (2 * part, 5)]);
+
+        let unused = fetcher(|_, _| Err(PipelineError::Io("no request expected".into())));
+        assert!(fetch_whole_object(0, &unused).unwrap().is_empty());
+        let failing = fetcher(|offset, length| {
+            if offset > 0 { Err(PipelineError::Io("failed part".into())) } else { Ok(pattern(offset, length)) }
+        });
+        assert!(fetch_whole_object(len, &failing).unwrap_err().to_string().contains("failed part"));
+        let short = fetcher(|_, length| Ok(vec![0; length - 1]));
+        assert!(fetch_whole_object(5, &short).unwrap_err().to_string().contains("incorrect length"));
+    }
+
+    #[test]
+    fn remote_limits_shrink_the_window_to_available_memory() {
+        let roomy = limits_within(64 << 30);
+        assert_eq!(
+            (roomy.window_bytes, roomy.in_flight_bytes, roomy.max_workers),
+            (LIMITS.window_bytes, LIMITS.in_flight_bytes, LIMITS.max_workers)
+        );
+        let small = limits_within(1 << 30);
+        assert_eq!((small.window_bytes, small.in_flight_bytes), (128 << 20, 64 << 20));
+        let unknown = limits_within(0);
+        assert_eq!((unknown.window_bytes, unknown.in_flight_bytes), (0, 0));
+
+        // With no window a reader still makes progress, one range at a time.
+        let plan = BedReadPlan::exact(&[0, 2, 4], 4, 23).unwrap();
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let reader = PlannedReader::with_limits(
+            plan,
+            fetcher({
+                let in_flight = in_flight.clone();
+                move |offset, length| {
+                    assert_eq!(in_flight.fetch_add(1, Ordering::SeqCst), 0, "one range at a time");
+                    std::thread::sleep(Duration::from_millis(2));
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    Ok(pattern(offset, length))
+                }
+            }),
+            unknown,
+        );
+        for row in [0u64, 2, 4] {
+            let mut bytes = [0u8; 4];
+            reader.read_at(3 + 4 * row, &mut bytes).unwrap();
+            assert_eq!(bytes.to_vec(), pattern(3 + 4 * row, 4));
+        }
     }
 }
