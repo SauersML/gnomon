@@ -95,8 +95,25 @@ fn mul_rows_in_leaves(
 /// subtrees are added, left into right's complement, at splits fixed by the
 /// leaf count.
 pub(crate) fn gram_rows(out: MatMut<'_, f64>, a: MatRef<'_, f64>, b: MatRef<'_, f64>) {
-    let leaf = leaf_rows(a.nrows(), a.ncols().saturating_mul(b.ncols()));
+    let leaf = gram_leaf_rows(a.nrows(), a.ncols().saturating_mul(b.ncols()));
     gram_rows_in_leaves(out, a, b, leaf);
+}
+
+/// Fewest rows a Gram leaf sums over. A leaf's partial product over a few
+/// dozen rows is less accurate than one product over them all: on
+/// edge_n300_k20 (300 rows cut into 52-row leaves) the loadings sat 22x
+/// farther from the exact dense reference, and exact merges recovered only
+/// part of that. Leaves this tall keep small cohorts whole and leave a
+/// 100,000-sample product a dozen leaves, still parallel across the cores a
+/// laptop or a node has.
+const GRAM_MIN_LEAF_ROWS: usize = 8192;
+
+/// Rows per Gram leaf: `leaf_rows`, raised to `GRAM_MIN_LEAF_ROWS`. A pure
+/// function of the shape, like `leaf_rows`.
+pub(crate) fn gram_leaf_rows(rows: usize, flops_per_row: usize) -> usize {
+    leaf_rows(rows, flops_per_row)
+        .max(GRAM_MIN_LEAF_ROWS)
+        .min(rows.max(1))
 }
 
 fn gram_rows_in_leaves(
@@ -116,17 +133,29 @@ fn gram_rows_in_leaves(
         matmul(out, Accum::Replace, a.transpose(), b, 1.0, Par::Seq);
         return;
     }
-    let total = gram_subtree(a, b, leaf, 0, leaves);
-    out.copy_from(total.as_ref());
+    let (sum, compensation) = gram_subtree(a, b, leaf, 0, leaves);
+    // The compensation carries every rounding error the merges dropped, so
+    // adding it once at the root recovers the accuracy of one whole product.
+    zip!(out, sum.as_ref(), compensation.as_ref())
+        .for_each(|unzip!(into, sum, compensation)| *into = *sum + *compensation);
 }
 
+/// `aᵀ·b` over leaves `first..first + count` as a sum and the rounding errors
+/// its merges dropped.
+///
+/// Splitting one reduction into leaves and adding their partials with plain
+/// additions loses accuracy: on edge_n300_k20 the loadings moved 22x farther
+/// from the exact dense reference than one whole product (2.1e-11 to 4.6e-10,
+/// b8841cec). Each merge is an error-free transformation instead: the
+/// TwoSum of two partials is exact as a sum plus an error term, and the error
+/// terms accumulate separately, so the tree loses nothing its leaves did not.
 fn gram_subtree(
     a: MatRef<'_, f64>,
     b: MatRef<'_, f64>,
     leaf: usize,
     first: usize,
     count: usize,
-) -> Mat<f64> {
+) -> (Mat<f64>, Mat<f64>) {
     if count == 1 {
         let start = first * leaf;
         let rows = leaf.min(a.nrows() - start);
@@ -139,15 +168,32 @@ fn gram_subtree(
             1.0,
             Par::Seq,
         );
-        return product;
+        let compensation = Mat::zeros(a.ncols(), b.ncols());
+        return (product, compensation);
     }
     let left_count = count / 2;
-    let (mut left, right) = rayon::join(
+    let ((mut left, mut left_compensation), (right, right_compensation)) = rayon::join(
         || gram_subtree(a, b, leaf, first, left_count),
         || gram_subtree(a, b, leaf, first + left_count, count - left_count),
     );
-    zip!(left.as_mut(), right.as_ref()).for_each(|unzip!(into, from)| *into += *from);
-    left
+    zip!(
+        left.as_mut(),
+        left_compensation.as_mut(),
+        right.as_ref(),
+        right_compensation.as_ref()
+    )
+    .for_each(|unzip!(sum, compensation, from, from_compensation)| {
+        // TwoSum (Knuth): s = fl(x + y); the rounding error of s is exact in
+        // e = (x - (s - z)) + (y - z) with z = s - x.
+        let x = *sum;
+        let y = *from;
+        let s = x + y;
+        let z = s - x;
+        let e = (x - (s - z)) + (y - z);
+        *sum = s;
+        *compensation += *from_compensation + e;
+    });
+    (left, left_compensation)
 }
 
 /// `A = U·diag(s)·Uᵀ` for a symmetric `A` given by its `side` triangle,
@@ -188,6 +234,19 @@ pub(crate) fn self_adjoint_eigen_seq(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gram_leaves_are_never_shorter_than_the_floor() {
+        use super::{GRAM_MIN_LEAF_ROWS, gram_leaf_rows, leaf_rows};
+        // 300 rows costing 40,000 flops each would be cut into 52-row leaves;
+        // the Gram keeps them whole.
+        assert!(leaf_rows(300, 40_000) < 300);
+        assert_eq!(gram_leaf_rows(300, 40_000), 300);
+        assert_eq!(gram_leaf_rows(100_000, 40_000), GRAM_MIN_LEAF_ROWS);
+        assert_eq!(gram_leaf_rows(0, 40_000), 1);
+        // Cheap rows still get leaves no shorter than the floor.
+        assert!(gram_leaf_rows(1 << 20, 8) >= GRAM_MIN_LEAF_ROWS);
+    }
+
     use super::*;
 
     fn pseudo_random(rows: usize, cols: usize, seed: u64) -> Mat<f64> {
