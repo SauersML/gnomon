@@ -19,12 +19,12 @@ use convert_genome::{ConversionConfig, OutputFormat, convert_dtc_file};
 // construct `EnsurePlinkOptions { inferred_sex: Some(...) }` without a
 // direct dependency on `convert_genome`.
 pub use convert_genome::cli::Sex as ConvertSex;
-use flate2::read::GzDecoder;
+use flate2::read::MultiGzDecoder;
 use infer_sex::{GenomeBuild, InferredSex};
 use sha2::{Digest, Sha256};
 use std::error::Error;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -190,10 +190,29 @@ fn ensure_reference_genome(build: &str) -> Result<PathBuf, Box<dyn Error + Send 
     let ref_path = cache_dir.join(canonical_filename);
     let fai_path = cache_dir.join(format!("{}.fai", canonical_filename));
 
-    // Check for existing cached reference (uncompressed)
+    // A cached reference is used only if it was published whole.
     if ref_path.exists() {
-        eprintln!("> Using cached reference genome: {}", ref_path.display());
-        return Ok(ref_path);
+        if reference_is_complete(&ref_path)? {
+            eprintln!("> Using cached reference genome: {}", ref_path.display());
+            return Ok(ref_path);
+        }
+        eprintln!(
+            "> Cached reference genome '{}' is incomplete; downloading it again.",
+            ref_path.display()
+        );
+    }
+    // Nothing from an earlier attempt is trusted: an index or completion marker
+    // beside an incomplete reference describes different bytes.
+    for stale in [
+        ref_path.clone(),
+        fai_path.clone(),
+        completion_marker_path(&ref_path),
+    ] {
+        match fs::remove_file(&stale) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
     }
 
     eprintln!("> Reference genome not found locally.");
@@ -228,6 +247,7 @@ fn ensure_reference_genome(build: &str) -> Result<PathBuf, Box<dyn Error + Send 
                     match decompress_gz(&temp_path, &ref_path) {
                         Ok(()) => {
                             let _ = fs::remove_file(&temp_path);
+                            mark_reference_complete(&ref_path)?;
                             eprintln!("> Reference genome cached at: {}", ref_path.display());
                             return Ok(ref_path);
                         }
@@ -242,6 +262,7 @@ fn ensure_reference_genome(build: &str) -> Result<PathBuf, Box<dyn Error + Send 
                 } else {
                     // Just rename the temp file
                     fs::rename(&temp_path, &ref_path)?;
+                    mark_reference_complete(&ref_path)?;
                     eprintln!("> Reference genome cached at: {}", ref_path.display());
                     return Ok(ref_path);
                 }
@@ -269,31 +290,52 @@ fn download_file(url: &str, dest: &Path) -> Result<(), Box<dyn Error + Send + Sy
         .call()
         .map_err(|e| format!("Download failed: {}", e))?;
     let mut reader = response.into_reader();
-    let file = File::create(dest)?;
-    let mut writer = BufWriter::new(file);
-    std::io::copy(&mut reader, &mut writer)?;
-    writer.flush()?;
+    crate::output::write_atomically(dest, |writer| {
+        io::copy(&mut reader, writer)?;
+        Ok(())
+    })?;
     Ok(())
 }
 
-/// Decompress a gzipped file
+/// The empty block that ends every complete BGZF file (SAM/BAM specification).
+const BGZF_EOF_BLOCK: [u8; 28] = [
+    0x1f, 0x8b, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x06, 0x00, 0x42, 0x43, 0x02, 0x00,
+    0x1b, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Decompresses a gzipped file into `dest`, which appears only once complete.
+///
+/// Every gzip member is read. Ensembl's indexed references are BGZF, a series of
+/// members, and a single-member decoder kept only the first 64 KiB of chr1. A BGZF
+/// file must also end in its end-of-file block, so one cut at a member boundary,
+/// which still decodes cleanly, is refused instead of published as a shorter genome.
 fn decompress_gz(src: &Path, dest: &Path) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let input = File::open(src)?;
-    let decoder = GzDecoder::new(BufReader::new(input));
-    let mut reader = BufReader::new(decoder);
-
-    let output = File::create(dest)?;
-    let mut writer = BufWriter::new(output);
-
-    let mut buffer = [0u8; 65536];
-    loop {
-        let bytes_read = reader.read(&mut buffer)?;
-        if bytes_read == 0 {
-            break;
+    let mut input = File::open(src)?;
+    let mut header = Vec::with_capacity(16);
+    (&mut input).take(16).read_to_end(&mut header)?;
+    let is_bgzf =
+        header.len() >= 14 && header[..4] == [0x1f, 0x8b, 0x08, 0x04] && &header[12..14] == b"BC";
+    if is_bgzf {
+        let len = input.metadata()?.len();
+        let mut tail = [0u8; BGZF_EOF_BLOCK.len()];
+        if len >= tail.len() as u64 {
+            input.seek(SeekFrom::Start(len - tail.len() as u64))?;
+            input.read_exact(&mut tail)?;
         }
-        writer.write_all(&buffer[..bytes_read])?;
+        if tail != BGZF_EOF_BLOCK {
+            return Err(format!(
+                "'{}' is BGZF but lacks its end-of-file block; the download is incomplete",
+                src.display()
+            )
+            .into());
+        }
     }
-    writer.flush()?;
+    input.seek(SeekFrom::Start(0))?;
+    let mut decoder = MultiGzDecoder::new(BufReader::with_capacity(1 << 20, input));
+    crate::output::write_atomically(dest, |writer| {
+        io::copy(&mut decoder, writer)?;
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -337,12 +379,76 @@ fn download_with_progress(url: &str, dest: &Path) -> Result<(), Box<dyn Error + 
     }
 
     writer.flush()?;
+    drop(writer);
+    if let Some(total) = content_length
+        && downloaded != total
+    {
+        let _ = fs::remove_file(&temp_path);
+        return Err(format!("Download of {url} ended after {downloaded} of {total} bytes").into());
+    }
     eprintln!("\r> Download complete.          ");
 
     // Atomic rename
     fs::rename(&temp_path, dest)?;
 
     Ok(())
+}
+
+/// Human reference downloads name at least chromosomes 1-22, X and Y.
+const MIN_REFERENCE_SEQUENCES: usize = 24;
+
+/// Where the length of a fully published reference is recorded.
+fn completion_marker_path(reference: &Path) -> PathBuf {
+    let mut name = reference.as_os_str().to_os_string();
+    name.push(".complete");
+    PathBuf::from(name)
+}
+
+/// Records that `reference` was published whole, as its current length.
+fn mark_reference_complete(reference: &Path) -> io::Result<()> {
+    let len = fs::metadata(reference)?.len();
+    crate::output::write_atomically(&completion_marker_path(reference), |writer| {
+        writeln!(writer, "{len}")
+    })
+}
+
+/// Whether a cached reference was published whole.
+///
+/// A reference this version downloads carries a marker holding its published
+/// length. One cached by an older version has no marker. It is kept, and marked
+/// so the scan runs once, if it names every human chromosome. The GRCh38
+/// references that first-member-only decompression cut down to part of chr1 never do.
+fn reference_is_complete(reference: &Path) -> io::Result<bool> {
+    let len = fs::metadata(reference)?.len();
+    match fs::read_to_string(completion_marker_path(reference)) {
+        Ok(recorded) => return Ok(recorded.trim().parse::<u64>().ok() == Some(len)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    if count_fasta_sequences(reference)? < MIN_REFERENCE_SEQUENCES {
+        return Ok(false);
+    }
+    // A cache directory that cannot take the marker only costs another scan next time.
+    let _ = mark_reference_complete(reference);
+    Ok(true)
+}
+
+/// Counts FASTA sequence headers, the lines that begin with '>'.
+fn count_fasta_sequences(path: &Path) -> io::Result<usize> {
+    let mut reader = BufReader::with_capacity(1 << 20, File::open(path)?);
+    let mut count = 0;
+    let mut at_line_start = true;
+    loop {
+        let chunk = reader.fill_buf()?;
+        if chunk.is_empty() {
+            return Ok(count);
+        }
+        count += usize::from(at_line_start && chunk[0] == b'>');
+        count += memchr::memmem::find_iter(chunk, b"\n>").count();
+        at_line_start = chunk[chunk.len() - 1] == b'\n';
+        let consumed = chunk.len();
+        reader.consume(consumed);
+    }
 }
 
 /// Computes the default cache directory path for a VCF/BCF/DTC file.
@@ -971,6 +1077,66 @@ pub fn ensure_plink_format_in(
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn decompress_gz_reads_every_bgzf_member_and_refuses_a_cut_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // Several 64 KiB BGZF blocks, as in Ensembl's indexed references.
+        let text: String = (0..3000)
+            .map(|i| format!(">seq{i}\n{}\n", "ACGT".repeat(15)))
+            .collect();
+        let mut compressed = Vec::new();
+        {
+            let mut writer = noodles_bgzf::io::Writer::new(&mut compressed);
+            writer.write_all(text.as_bytes()).unwrap();
+            // Dropping the writer flushes the last block and the end-of-file block.
+        }
+        assert_eq!(
+            &compressed[compressed.len() - BGZF_EOF_BLOCK.len()..],
+            &BGZF_EOF_BLOCK[..]
+        );
+        let src = dir.path().join("reference.fa.gz");
+        fs::write(&src, &compressed).unwrap();
+        let whole = dir.path().join("whole.fa");
+        decompress_gz(&src, &whole).unwrap();
+        assert_eq!(fs::read_to_string(&whole).unwrap(), text);
+
+        // Without its end-of-file block, every remaining member still decodes cleanly.
+        fs::write(&src, &compressed[..compressed.len() - BGZF_EOF_BLOCK.len()]).unwrap();
+        let cut = dir.path().join("cut.fa");
+        assert!(decompress_gz(&src, &cut).is_err());
+        assert!(!cut.exists(), "an incomplete reference is never published");
+    }
+
+    #[test]
+    fn cached_reference_is_trusted_only_when_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let reference = dir.path().join("GRCh38_reference.fa");
+
+        // What first-member-only decompression left: part of one chromosome.
+        fs::write(
+            &reference,
+            format!(">1 dna:chromosome\n{}\n", "N".repeat(600)),
+        )
+        .unwrap();
+        assert!(!reference_is_complete(&reference).unwrap());
+
+        let genome: String = (1..=22)
+            .map(|c| c.to_string())
+            .chain(["X", "Y", "MT"].map(String::from))
+            .map(|name| format!(">{name}\nACGTACGT\n"))
+            .collect();
+        fs::write(&reference, &genome).unwrap();
+        assert!(reference_is_complete(&reference).unwrap());
+        assert!(
+            completion_marker_path(&reference).exists(),
+            "an older cache is scanned once, then marked"
+        );
+
+        // A marker describes the bytes it was written for.
+        fs::write(&reference, format!("{genome}>extra\nAC\n")).unwrap();
+        assert!(!reference_is_complete(&reference).unwrap());
+    }
 
     #[test]
     fn test_detect_plink_bed() {
