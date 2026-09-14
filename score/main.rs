@@ -30,7 +30,6 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::ffi::OsString;
-use std::fmt::Write as FmtWrite;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -1674,29 +1673,173 @@ fn write_scores_to_file(
         }
         writeln!(writer)?;
 
-        let mut line_buffer = String::with_capacity(
-            person_iids
-                .first()
-                .map_or(128, |s| s.len() + num_scores * 24),
-        );
+        write_score_rows(
+            writer,
+            person_iids,
+            score_variant_counts,
+            sum_scores,
+            missing_counts,
+            num_scores,
+            emit_components,
+            score_rows_per_block(person_iids, num_scores),
+        )
+    })
+}
+
+/// Text formatted per block of `.sscore` rows. At most one block per worker
+/// thread is held at once, so the rows cost a few MiB beyond the scores
+/// themselves whatever the cohort size.
+const SCORE_ROW_BLOCK_BYTES: usize = 1 << 20;
+
+/// Rows per formatting block, from the width of a typical row: the first IID,
+/// then per score a tab, a shortest-round-trip f64 of at most 24 characters,
+/// a tab and a missing column.
+fn score_rows_per_block(person_iids: &[String], num_scores: usize) -> usize {
+    let row_bytes = person_iids.first().map_or(16, String::len) + 1 + num_scores * 36;
+    (SCORE_ROW_BLOCK_BYTES / row_bytes).max(1)
+}
+
+/// Writes one `.sscore` row per person. Blocks of `rows_per_block` rows are
+/// formatted in parallel and written in order, so the bytes are exactly those of
+/// formatting the rows one at a time.
+#[allow(clippy::too_many_arguments)]
+fn write_score_rows<W: Write>(
+    writer: &mut W,
+    person_iids: &[String],
+    score_variant_counts: &[u32],
+    sum_scores: &[f64],
+    missing_counts: &[u32],
+    num_scores: usize,
+    emit_components: bool,
+    rows_per_block: usize,
+) -> io::Result<()> {
+    let n_persons = person_iids.len();
+    let needed = n_persons.saturating_mul(num_scores);
+    if sum_scores.len() < needed {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Mismatched number of persons and score rows during final write.",
+        ));
+    }
+    if missing_counts.len() < needed {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Mismatched number of persons and missing count rows during final write.",
+        ));
+    }
+
+    let rows_per_block = rows_per_block.max(1);
+    let mut blocks: Vec<Vec<u8>> = vec![Vec::new(); rayon::current_num_threads().max(1)];
+    let batch_rows = rows_per_block.saturating_mul(blocks.len());
+    let mut batch_start = 0;
+    while batch_start < n_persons {
+        let batch_end = batch_start.saturating_add(batch_rows).min(n_persons);
+        blocks.par_iter_mut().enumerate().for_each(|(block, text)| {
+            text.clear();
+            let start = batch_start + block * rows_per_block;
+            let end = start.saturating_add(rows_per_block).min(batch_end);
+            if start < end {
+                format_score_rows(
+                    text,
+                    person_iids,
+                    start..end,
+                    score_variant_counts,
+                    sum_scores,
+                    missing_counts,
+                    num_scores,
+                    emit_components,
+                );
+            }
+        });
+        for text in &blocks {
+            writer.write_all(text)?;
+        }
+        batch_start = batch_end;
+    }
+    Ok(())
+}
+
+/// Appends the `.sscore` rows of `persons` to `text`.
+#[allow(clippy::too_many_arguments)]
+fn format_score_rows(
+    text: &mut Vec<u8>,
+    person_iids: &[String],
+    persons: std::ops::Range<usize>,
+    score_variant_counts: &[u32],
+    sum_scores: &[f64],
+    missing_counts: &[u32],
+    num_scores: usize,
+    emit_components: bool,
+) {
+    let mut ryu_buffer_score = ryu::Buffer::new();
+    let mut ryu_buffer_missing = ryu::Buffer::new();
+    for person in persons {
+        text.extend_from_slice(person_iids[person].as_bytes());
+        let row = person * num_scores;
+        for i in 0..num_scores {
+            let final_sum_score = sum_scores[row + i];
+            let missing_count = missing_counts[row + i];
+            let total_variants_for_score = score_variant_counts[i];
+
+            // The score is calculated based on the number of non-missing variants.
+            // This behavior matches standard tools when mean-imputation is disabled.
+            let variants_used = total_variants_for_score.saturating_sub(missing_count);
+
+            let avg_score = if variants_used > 0 {
+                final_sum_score / (variants_used as f64)
+            } else {
+                0.0
+            };
+
+            let missing_pct = if total_variants_for_score > 0 {
+                (missing_count as f32 / total_variants_for_score as f32) * 100.0
+            } else {
+                0.0
+            };
+
+            text.push(b'\t');
+            if emit_components {
+                text.extend_from_slice(ryu_buffer_score.format(final_sum_score).as_bytes());
+                text.push(b'\t');
+                write!(text, "{missing_count}").unwrap();
+            } else {
+                text.extend_from_slice(ryu_buffer_score.format(avg_score).as_bytes());
+                text.push(b'\t');
+                text.extend_from_slice(ryu_buffer_missing.format(missing_pct).as_bytes());
+            }
+        }
+        text.push(b'\n');
+    }
+}
+
+#[cfg(test)]
+mod output_tests {
+    use super::{write_score_rows, write_scores_to_file};
+    use std::fs;
+
+    /// The one-row-at-a-time writer that `write_score_rows` replaced, kept verbatim as
+    /// the byte-identity reference.
+    fn serial_rows(
+        person_iids: &[String],
+        score_variant_counts: &[u32],
+        sum_scores: &[f64],
+        missing_counts: &[u32],
+        num_scores: usize,
+        emit_components: bool,
+    ) -> Vec<u8> {
+        use std::fmt::Write as _;
+        use std::io::Write as _;
+
+        let mut writer = Vec::new();
+        let mut line_buffer = String::new();
         let mut sum_score_chunks = sum_scores.chunks_exact(num_scores);
         let mut missing_count_chunks = missing_counts.chunks_exact(num_scores);
         let mut ryu_buffer_score = ryu::Buffer::new();
         let mut ryu_buffer_missing = ryu::Buffer::new();
 
         for iid in person_iids {
-            let person_sum_scores = sum_score_chunks.next().ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Mismatched number of persons and score rows during final write.",
-                )
-            })?;
-            let person_missing_counts = missing_count_chunks.next().ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Mismatched number of persons and missing count rows during final write.",
-                )
-            })?;
+            let person_sum_scores = sum_score_chunks.next().unwrap();
+            let person_missing_counts = missing_count_chunks.next().unwrap();
 
             line_buffer.clear();
             write!(&mut line_buffer, "{iid}").unwrap();
@@ -1705,23 +1848,17 @@ fn write_scores_to_file(
                 let final_sum_score = person_sum_scores[i];
                 let missing_count = person_missing_counts[i];
                 let total_variants_for_score = score_variant_counts[i];
-
-                // The score is calculated based on the number of non-missing variants.
-                // This behavior matches standard tools when mean-imputation is disabled.
                 let variants_used = total_variants_for_score.saturating_sub(missing_count);
-
                 let avg_score = if variants_used > 0 {
                     final_sum_score / (variants_used as f64)
                 } else {
                     0.0
                 };
-
                 let missing_pct = if total_variants_for_score > 0 {
                     (missing_count as f32 / total_variants_for_score as f32) * 100.0
                 } else {
                     0.0
                 };
-
                 if emit_components {
                     write!(
                         &mut line_buffer,
@@ -1730,7 +1867,6 @@ fn write_scores_to_file(
                     )
                     .unwrap();
                 } else {
-                    // Write the correctly tab-separated data columns.
                     write!(
                         &mut line_buffer,
                         "\t{}\t{}",
@@ -1740,16 +1876,82 @@ fn write_scores_to_file(
                     .unwrap();
                 }
             }
-            writeln!(writer, "{line_buffer}")?;
+            writeln!(writer, "{line_buffer}").unwrap();
         }
-        Ok(())
-    })
-}
+        writer
+    }
 
-#[cfg(test)]
-mod output_tests {
-    use super::write_scores_to_file;
-    use std::fs;
+    /// Persons with short and long IIDs; scores with zero, few and many variants;
+    /// sums that include NaN, infinities, signed zeros, a subnormal and extremes.
+    fn cohort(persons: usize, num_scores: usize) -> (Vec<String>, Vec<u32>, Vec<f64>, Vec<u32>) {
+        let iids = (0..persons)
+            .map(|person| {
+                if person % 5 == 0 {
+                    format!("p{person}")
+                } else {
+                    format!("person-with-a-longer-identifier-{person}")
+                }
+            })
+            .collect();
+        let counts = (0..num_scores).map(|score| [0, 7, 1_000_003][score % 3]).collect();
+        let specials = [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            0.0,
+            -0.0,
+            5e-324,
+            1e300,
+            -2.5e-8,
+        ];
+        let sums = (0..persons * num_scores)
+            .map(|slot| {
+                if slot % 11 == 0 {
+                    specials[(slot / 11) % specials.len()]
+                } else {
+                    (slot as f64).sin() * 1e-3
+                }
+            })
+            .collect();
+        let missing = (0..persons * num_scores).map(|slot| (slot % 9) as u32).collect();
+        (iids, counts, sums, missing)
+    }
+
+    #[test]
+    fn score_rows_match_the_serial_writer_byte_for_byte() {
+        let (iids, counts, sums, missing) = cohort(1_001, 3);
+        for emit_components in [false, true] {
+            let expected = serial_rows(&iids, &counts, &sums, &missing, 3, emit_components);
+            for rows_per_block in [1, 2, 7, 1_000, 5_000] {
+                let mut written = Vec::new();
+                write_score_rows(
+                    &mut written,
+                    &iids,
+                    &counts,
+                    &sums,
+                    &missing,
+                    3,
+                    emit_components,
+                    rows_per_block,
+                )
+                .expect("rows should be written");
+                assert!(
+                    written == expected,
+                    "emit_components={emit_components} rows_per_block={rows_per_block}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn score_rows_refuse_fewer_values_than_persons() {
+        let (iids, counts, sums, missing) = cohort(10, 2);
+        for (sums, missing) in [(&sums[..19], &missing[..]), (&sums[..], &missing[..19])] {
+            let error = write_score_rows(&mut Vec::new(), &iids, &counts, sums, missing, 2, false, 4)
+                .expect_err("too few values must be refused");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        }
+    }
 
     #[test]
     fn component_output_contains_raw_sum_and_exact_counts() {
