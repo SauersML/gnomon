@@ -507,6 +507,47 @@ mod tests {
         }
     }
 
+    #[test]
+    fn warning_report_follows_declaration_order_and_stays_silent_after_a_fatal_error() {
+        let info = || CriticalIntegrityWarningInfo {
+            iid: "IID1".to_string(),
+            locus_chr_pos: ("22".to_string(), 1000),
+            score_name: "S0".to_string(),
+            conflicts: Vec::new(),
+            resolution_method: ResolutionMethod::ConsistentDosage { dosage: 1.0 },
+            score_effect_allele: "A".to_string(),
+            score_other_allele: "G".to_string(),
+        };
+        let mut warnings = FinalAggregatedCollector::new();
+        // Inserted in reverse declaration order.
+        for method in HEURISTICS.iter().rev().step_by(3) {
+            warnings.insert(*method, (2, vec![info()]));
+        }
+        let mut report = ResolutionReport {
+            warnings,
+            unresolvable: None,
+        };
+        let text = warning_report(&report).expect("heuristic events are reported");
+        let positions: Vec<usize> = HEURISTICS
+            .iter()
+            .filter_map(|method| text.find(&format!("WARNING CATEGORY: {method:?} ")))
+            .collect();
+        assert_eq!(positions.len(), report.warnings.len(), "{text}");
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]), "{text}");
+
+        report.unresolvable = Some(FatalAmbiguityData {
+            iid: "IID2".to_string(),
+            locus_chr_pos: ("22".to_string(), 1001),
+            score_name: "S0".to_string(),
+            conflicts: Vec::new(),
+        });
+        assert!(warning_report(&report).is_none());
+
+        report.unresolvable = None;
+        report.warnings.clear();
+        assert!(warning_report(&report).is_none());
+    }
+
     /// A small deterministic generator, so the scenarios need no seeding API.
     struct SplitMix64(u64);
 
@@ -2639,51 +2680,72 @@ pub fn resolve_complex_variants(
 
     pb.finish_with_message("Done.");
 
-    let ResolutionReport {
-        warnings: all_warnings_for_reporting,
-        unresolvable,
-    } = resolution?;
-
-    if !all_warnings_for_reporting.is_empty() {
-        eprintln!(
-            "\n\n========================= CRITICAL DATA INTEGRITY WARNINGS ========================="
-        );
-        eprintln!(
-            "Gnomon detected loci with ambiguous data that were resolved via heuristics.\nWhile computation continued, the underlying data should be investigated."
-        );
-
-        for (heuristic, (total_count, samples)) in &all_warnings_for_reporting {
-            eprintln!(
-                "\n==================== WARNING CATEGORY: {:?} ====================",
-                heuristic
-            );
-            eprintln!("Total Occurrences: {}", total_count);
-            eprintln!("Showing up to 5 samples:");
-
-            if samples.is_empty() {
-                eprintln!("  (No samples collected)");
-            } else {
-                for (i, info) in samples.iter().enumerate() {
-                    if i > 0 {
-                        eprintln!(
-                            "---------------------------------------------------------------------------------"
-                        );
-                    }
-                    eprintln!("{}", format_critical_integrity_warning(info));
-                }
-            }
-        }
-        eprintln!(
-            "\n=================================================================================\n"
-        );
+    let report = resolution?;
+    if let Some(text) = warning_report(&report) {
+        eprint!("{text}");
     }
 
-    if let Some(data) = unresolvable {
+    if let Some(data) = report.unresolvable {
         return Err(PipelineError::Compute(format_fatal_ambiguity_report(&data)));
     }
 
     eprintln!("> Complex variant resolution complete.");
     Ok(())
+}
+
+/// The data integrity warning report, with categories in the heuristics' declaration
+/// order rather than the hash map's. None when no heuristic resolved anything, or when an
+/// unresolvable ambiguity aborted resolution: blocks stop wherever they had reached, so
+/// the counts would describe a scheduling-dependent subset of people.
+fn warning_report(report: &ResolutionReport) -> Option<String> {
+    use std::fmt::Write;
+    if report.unresolvable.is_some() || report.warnings.is_empty() {
+        return None;
+    }
+    let mut text = String::with_capacity(4096);
+    writeln!(
+        text,
+        "\n\n========================= CRITICAL DATA INTEGRITY WARNINGS ========================="
+    )
+    .unwrap();
+    writeln!(
+        text,
+        "Gnomon detected loci with ambiguous data that were resolved via heuristics.\nWhile computation continued, the underlying data should be investigated."
+    )
+    .unwrap();
+    for heuristic in HEURISTICS {
+        let Some((total_count, samples)) = report.warnings.get(&heuristic) else {
+            continue;
+        };
+        writeln!(
+            text,
+            "\n==================== WARNING CATEGORY: {:?} ====================",
+            heuristic
+        )
+        .unwrap();
+        writeln!(text, "Total Occurrences: {}", total_count).unwrap();
+        writeln!(text, "Showing up to 5 samples:").unwrap();
+        if samples.is_empty() {
+            writeln!(text, "  (No samples collected)").unwrap();
+        } else {
+            for (i, info) in samples.iter().enumerate() {
+                if i > 0 {
+                    writeln!(
+                        text,
+                        "---------------------------------------------------------------------------------"
+                    )
+                    .unwrap();
+                }
+                writeln!(text, "{}", format_critical_integrity_warning(info)).unwrap();
+            }
+        }
+    }
+    writeln!(
+        text,
+        "\n=================================================================================\n"
+    )
+    .unwrap();
+    Some(text)
 }
 
 /// A private helper function to format the final, dense data report for a fatal ambiguity.
