@@ -208,6 +208,14 @@ mod tests {
             done.store(true, Ordering::Relaxed);
             assert!(reader.join().expect("reader thread") > 0);
         });
-        assert_eq!(entries(dir.path()), ["cohort_w.sscore"]);
+        // On NFS, a version renamed over while the reader still held it open
+        // survives as a `.nfsXXXX` entry until the client releases it, so only
+        // the helper's own temporary files are required to be gone.
+        let leftovers: Vec<String> = entries(dir.path())
+            .into_iter()
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temporary files left behind: {leftovers:?}");
+        assert!(dir.path().join("cohort_w.sscore").is_file());
     }
 }
