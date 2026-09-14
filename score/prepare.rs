@@ -56,18 +56,70 @@ struct FilesetPaths {
 struct KeyedBimRecord {
     key: VariantKey,
     bim_row_index: BimRowIndex,
-    allele1: String,
-    allele2: String,
+    allele1: Allele,
+    allele2: Allele,
 }
 
 /// A parsed record from a score file.
 #[derive(Debug, Clone)]
 struct KeyedScoreRecord {
     key: VariantKey,
-    effect_allele: Arc<str>,
-    other_allele: Arc<str>,
+    effect_allele: Allele,
+    other_allele: Allele,
     score_column_index: ScoreColumnIndex,
     weight: f32,
+}
+
+/// Most genome rows contain one of a handful of literal alleles. Borrow those
+/// literals; share longer alleles across the score columns on the same row.
+/// No normalization is performed here: matching retains the input's exact text.
+#[derive(Debug, Clone)]
+enum Allele {
+    Literal(&'static str),
+    Shared(Arc<str>),
+}
+
+impl Allele {
+    fn new(value: &str) -> Self {
+        let literal = match value {
+            "A" => "A",
+            "C" => "C",
+            "G" => "G",
+            "T" => "T",
+            "N" => "N",
+            "a" => "a",
+            "c" => "c",
+            "g" => "g",
+            "t" => "t",
+            "n" => "n",
+            "0" => "0",
+            "I" => "I",
+            "D" => "D",
+            "-" => "-",
+            "." => ".",
+            _ => return Self::Shared(Arc::from(value)),
+        };
+        Self::Literal(literal)
+    }
+
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Literal(value) => value,
+            Self::Shared(value) => value,
+        }
+    }
+}
+
+impl AsRef<str> for Allele {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl Display for Allele {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
 }
 
 // Manual implementation to handle f32 comparison correctly.
@@ -117,7 +169,7 @@ struct FileStream {
     /// A buffer for weights and column indices from the current line being processed.
     line_buffer: std::collections::VecDeque<(f32, ScoreColumnIndex)>,
     /// The key and alleles for the current buffered line.
-    current_line_info: Option<(VariantKey, Arc<str>, Arc<str>)>,
+    current_line_info: Option<(VariantKey, Allele, Allele)>,
     // Temporary buffer reused for reading raw line data from the file.
     line_string_buffer: String,
     /// 1-based line number in the currently read file.
@@ -445,6 +497,8 @@ fn prepare_for_computation_with_retry(
     let mut baseline_missing_sum_by_score = vec![0.0f64; score_names.len()];
     let mut score_variant_counts = vec![0u32; score_names.len()];
     let mut final_complex_rules: Vec<GroupedComplexRule> = Vec::new();
+    let mut bim_group = Vec::new();
+    let mut score_group = Vec::new();
 
     while bim_iter.peek().is_some() && score_iter.peek().is_some() {
         let bim_key = match bim_iter.peek().unwrap() {
@@ -497,7 +551,7 @@ fn prepare_for_computation_with_retry(
                 diagnostics.add_bim_key(key);
                 diagnostics.add_score_key(key);
 
-                let mut bim_group = Vec::new();
+                bim_group.clear();
                 while let Some(Ok(peek_item)) = bim_iter.peek() {
                     if peek_item.key != key {
                         break;
@@ -518,7 +572,7 @@ fn prepare_for_computation_with_retry(
                 }
                 diagnostics.total_bim_variants_processed += bim_group.len() as u64;
 
-                let mut score_group = Vec::new();
+                score_group.clear();
                 while let Some(Ok(peek_item)) = score_iter.peek() {
                     if peek_item.key != key {
                         break;
@@ -539,6 +593,36 @@ fn prepare_for_computation_with_retry(
                 }
                 diagnostics.total_score_records_processed += score_group.len() as u64;
 
+                // A single marker and a single weight need no temporary trees,
+                // sets, context vectors, or match lists. Emit their CSR row in
+                // exactly the same arithmetic and record order as grouped loci.
+                if let ([bim], [score]) = (bim_group.as_slice(), score_group.as_slice()) {
+                    if allele_pair_matches(
+                        score.effect_allele.as_str(),
+                        score.other_allele.as_str(),
+                        bim.allele1.as_str(),
+                        bim.allele2.as_str(),
+                    ) {
+                        let mut assignment = SimpleScoreAssignment {
+                            dosage_weight: 0.0,
+                            missing_correction: 0.0,
+                        };
+                        apply_simple_score_assignment(
+                            &mut assignment,
+                            score.weight,
+                            score.effect_allele.as_str() == bim.allele1.as_str(),
+                        );
+                        required_bim_indices.push(bim.bim_row_index);
+                        required_is_complex.push(0);
+                        csr_builder.push_contribution(score.score_column_index, assignment)?;
+                        csr_builder.finish_variant()?;
+                        baseline_missing_sum_by_score[score.score_column_index.0] +=
+                            assignment.missing_correction as f64;
+                        score_variant_counts[score.score_column_index.0] += 1;
+                    }
+                    continue;
+                }
+
                 let mut simple_for_key: BTreeMap<
                     BimRowIndex,
                     BTreeMap<ScoreColumnIndex, SimpleScoreAssignment>,
@@ -548,7 +632,7 @@ fn prepare_for_computation_with_retry(
                     Vec<(ScoreColumnIndex, f32, String, String)>,
                 > = BTreeMap::new();
 
-                for score_record in score_group {
+                for score_record in score_group.drain(..) {
                     let outcome = resolve_matches_for_score_line(&score_record, &bim_group)?;
 
                     match outcome {
@@ -576,7 +660,11 @@ fn prepare_for_computation_with_retry(
                             let possible_contexts: Vec<_> = matches
                                 .iter()
                                 .map(|rec| {
-                                    (rec.bim_row_index, rec.allele1.clone(), rec.allele2.clone())
+                                    (
+                                        rec.bim_row_index,
+                                        rec.allele1.to_string(),
+                                        rec.allele2.to_string(),
+                                    )
                                 })
                                 .collect();
                             let score_info = (
@@ -965,11 +1053,71 @@ mod tests {
     use super::*;
 
     #[test]
+    fn allele_storage_preserves_exact_text_and_shares_long_sequences() {
+        for value in [
+            "A",
+            "C",
+            "G",
+            "T",
+            "a",
+            "n",
+            "0",
+            "I",
+            "D",
+            "-",
+            ".",
+            "ACGTACGTACGT",
+            "<DEL>",
+            "é",
+            "",
+        ] {
+            let allele = Allele::new(value);
+            assert_eq!(allele.as_str(), value);
+            assert_eq!(allele.clone().to_string(), value);
+            if let Allele::Shared(original) = allele {
+                let Allele::Shared(copy) = Allele::Shared(Arc::clone(&original)).clone() else {
+                    panic!("shared allele changed representation");
+                };
+                assert!(Arc::ptr_eq(&original, &copy));
+            }
+        }
+        assert!(matches!(Allele::new("A"), Allele::Literal("A")));
+    }
+
+    #[test]
     fn build_spool_maps_all_people_identity_mapping() {
         let bytes_per_variant = 3;
         let (compact, dense) = build_spool_maps(&PersonSubset::All, bytes_per_variant);
         assert_eq!(compact, vec![0, 1, 2]);
         assert_eq!(dense, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn singleton_join_preserves_swaps_duplicates_indels_and_complex_loci() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("panel");
+        std::fs::write(
+            prefix.with_extension("bed"),
+            [0x6c, 0x1b, 0x01, 0, 0, 0, 0, 0, 0],
+        )
+        .unwrap();
+        std::fs::write(prefix.with_extension("fam"), "F I 0 0 0 -9\n").unwrap();
+        std::fs::write(prefix.with_extension("bim"), "1 a 0 100 A G\n1 b 0 150 C T\n1 c 0 200 AC A\n1 d 0 250 A C\n1 e 0 250 G C\n1 f 0 300 <DEL> A\n").unwrap();
+        let weights = dir.path().join("weights.tsv");
+        std::fs::write(&weights, "variant_id\teffect_allele\tother_allele\tS\n1:100\tG\tA\t0.25\n1:150\tC\tT\t0.5\n1:200\tA\tAC\t-0.75\n1:250\tC\tA\t0.125\n1:300\t<DEL>\tA\t-0.125\n1:300\t<DEL>\tA\t0.375\n").unwrap();
+        let prep = prepare_for_computation(&[prefix], &[weights], None, None).unwrap();
+        assert_eq!(prep.required_bim_indices, [0, 1, 2, 3, 5].map(BimRowIndex));
+        assert_eq!(prep.sparse_row_offsets(), &[0, 1, 2, 3, 3, 4]);
+        assert_eq!(prep.sparse_weights(), &[0.25, -0.5, -0.75, -0.25]);
+        assert_eq!(prep.sparse_missing_corrections(), &[0.0, 1.0, 0.0, 0.5]);
+        assert_eq!(prep.baseline_missing_sum_by_score(), &[1.5]);
+        assert_eq!(prep.score_variant_counts, [5]);
+        assert_eq!(prep.required_is_complex(), &[0, 0, 0, 1, 0]);
+        assert_eq!(prep.complex_rules.len(), 1);
+        assert_eq!(
+            prep.complex_rules[0].possible_contexts,
+            [(BimRowIndex(3), "A".into(), "C".into())]
+        );
     }
 
     #[test]
@@ -1098,8 +1246,7 @@ mod tests {
 }
 
 /// The file extensions that make up a PLINK 1.9 or PLINK 2 fileset.
-pub const FILESET_EXTENSIONS: [&str; 6] =
-    ["bed", "bim", "fam", "pgen", "pvar", "psam"];
+pub const FILESET_EXTENSIONS: [&str; 6] = ["bed", "bim", "fam", "pgen", "pvar", "psam"];
 
 /// Strips a trailing fileset extension, if present, leaving the shared prefix.
 ///
@@ -1363,8 +1510,8 @@ impl<'a> Iterator for BimIterator<'a> {
                                     bim_row_index: BimRowIndex(
                                         self.global_offset + self.local_line_num - 1,
                                     ),
-                                    allele1: a1.to_string(),
-                                    allele2: a2.to_string(),
+                                    allele1: Allele::new(a1),
+                                    allele2: Allele::new(a2),
                                 }));
                             }
                             Err(e) => return Some(Err(e)),
@@ -1570,11 +1717,8 @@ impl KWayMergeIterator {
             let chr_str = key_parts.next().unwrap_or("");
             let pos_str = key_parts.next().unwrap_or("");
             let key = parse_key(chr_str, pos_str)?;
-            stream.current_line_info = Some((
-                key,
-                Arc::<str>::from(effect_allele),
-                Arc::<str>::from(other_allele),
-            ));
+            stream.current_line_info =
+                Some((key, Allele::new(effect_allele), Allele::new(other_allele)));
 
             for (i, weight_str) in parts.enumerate() {
                 let weight_str = weight_str.trim();

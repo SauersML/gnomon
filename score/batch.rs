@@ -27,7 +27,7 @@ type U8xN = Simd<u8, SIMD_LANES>;
 
 /// The number of individuals to process in a single on-the-fly pivoted tile.
 /// This value is tuned to ensure the tile fits comfortably within the L3 cache.
-const PERSON_BLOCK_SIZE: usize = 4096;
+pub(crate) const PERSON_BLOCK_SIZE: usize = 4096;
 
 /// The number of variants to process in a single call to the compute kernel. This value
 /// controls the frequency of flushing the `f32` accumulators to the `f64` master

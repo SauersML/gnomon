@@ -1,5 +1,42 @@
 # Score and packed projection performance
 
+## Preparation and memory revision
+
+The next revision avoids heap allocation for common literal alleles, reuses
+locus groups, and emits singleton matches directly into CSR. A paired probe
+compared every compiled index, weight bit, correction, count, and complex rule
+on the full PGS000018 input. Warm preparation fell from 1.024–1.034 seconds
+to 0.804–0.808 seconds; all compiled results were identical. The initial pair
+was 1.815 versus 0.857 seconds and is excluded from the warm comparison.
+
+Mapped cohorts of at most 32 people now use direct packed reads even when
+complex loci are present, then invoke the ordinary complex resolver. The
+full-marker one-person command took 1.541 seconds, with 43.13 milliseconds in
+the pipeline (previously about 313 milliseconds). Its output is byte-identical
+to the original baseline. The 3,200-person command took 1.612 seconds, including
+441.86 milliseconds in the pipeline; maximum baseline difference remains
+1.251e-12 and missing percentages are exact. Peak RSS was 25.3 MiB and 1.33 GiB,
+respectively. These are single end-to-end checks on four pinned MSI cores,
+not a controlled median. They include main's concurrent row-major complex
+resolver and packed sex-inference improvements, so gains are not attributable
+solely to the preparation changes.
+
+Scoring now rejects output shapes that cannot fit the minimum bounded plan
+before allocating outputs, including calls that bypass CLI preflight. The
+plan reserves checkpoint/output copies and dense scratch; wide score matrices
+reduce bounded batch sizes. A zero free-memory reading grants no emergency
+8 GiB allocation. Exact Vec reservations now use additional length correctly.
+Twenty-six focused tests pass, including oversized shapes without allocating
+them and manually calculated simple/complex dosages across single/split
+filesets, keep subsets, missing calls, and partial packed bytes. The warm
+production library and CLI builds passed on MSI.
+
+This closes specific allocation risks; it is not a universal no-OOM guarantee.
+Preparation allocation, allocator overhead, and memory consumed concurrently
+by other processes still need broader accounting and stress validation.
+`preparation_memory_checks.py` and `prepare_probe.rs` reproduce the focused
+checks; MSI logs use the `round3-` prefix and `preparation-memory-checks.log`.
+
 ## Full-marker revision
 
 The earlier 8,192-marker fixtures below are development probes, not realistic

@@ -39,7 +39,6 @@ const SMALL_KEEP_DIRECT_THRESHOLD: usize = 32;
 const SPOOL_BUFFER_SIZE: usize = 8 * 1024 * 1024;
 const DEFAULT_RAM_FRACTION_NUMERATOR: u64 = 7;
 const DEFAULT_RAM_FRACTION_DENOMINATOR: u64 = 10;
-const FALLBACK_MAX_RAM_BYTES: usize = 8 * 1024 * 1024 * 1024;
 const MAX_IO_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 
 struct SpoolState {
@@ -278,9 +277,14 @@ fn concurrent_gnomon_processes() -> u64 {
 fn default_max_ram_bytes() -> usize {
     let mut system = System::new();
     system.refresh_memory();
-    let available = system.available_memory();
-    let siblings = concurrent_gnomon_processes();
+    memory_budget_from_system(
+        system.available_memory(),
+        system.total_memory(),
+        concurrent_gnomon_processes(),
+    )
+}
 
+fn memory_budget_from_system(available: u64, total: u64, siblings: u64) -> usize {
     // TWO BOUNDS, AND THE SMALLER WINS.
     //
     // The first is the historical one: a fraction of what is free right now. Alone on a
@@ -293,20 +297,14 @@ fn default_max_ram_bytes() -> usize {
     // A share of TOTAL memory does not move as siblings warm up, so it holds the
     // aggregate at one machine's worth however the starts are staggered.
     //
-    // Exceeding the budget is not fatal -- it selects the bounded-accumulator plan over
-    // the fast in-RAM one -- so an honest budget costs time on a wide chromosome rather
-    // than the chromosome.
+    // A smaller budget selects bounded accumulation where it fits. Zero free
+    // memory must never turn into permission to allocate another eight GiB.
     let by_free =
         available.saturating_mul(DEFAULT_RAM_FRACTION_NUMERATOR) / DEFAULT_RAM_FRACTION_DENOMINATOR;
-    let by_fair_share = system
-        .total_memory()
-        .saturating_mul(DEFAULT_RAM_FRACTION_NUMERATOR)
+    let by_fair_share = total.saturating_mul(DEFAULT_RAM_FRACTION_NUMERATOR)
         / DEFAULT_RAM_FRACTION_DENOMINATOR
-        / siblings;
-    let candidate = match by_free.min(by_fair_share) {
-        0 => FALLBACK_MAX_RAM_BYTES as u64,
-        bounded => bounded,
-    };
+        / siblings.max(1);
+    let candidate = by_free.min(by_fair_share);
     usize::try_from(candidate).unwrap_or(usize::MAX).max(1)
 }
 
@@ -314,6 +312,7 @@ pub fn preflight_memory(
     prep_result: &PreparationResult,
     memory_budget: MemoryBudget,
 ) -> Result<(), PipelineError> {
+    ensure_memory_floor(prep_result, memory_budget)?;
     let result_size = checked_result_size(prep_result)?;
     let result_bytes = result_bytes(result_size)?;
     let csr_bytes = csr_bytes(prep_result)?;
@@ -347,7 +346,7 @@ pub fn preflight_memory(
     } else {
         consumer_threads
             .checked_mul(2)
-            .and_then(|v| v.checked_add(1))
+            .and_then(|v| v.checked_add(2))
             .ok_or_else(|| PipelineError::Compute("Accumulator estimate overflow.".to_string()))?
     };
     let accumulator_bytes = result_bytes
@@ -356,6 +355,12 @@ pub fn preflight_memory(
     let estimated_bytes = accumulator_bytes
         .checked_add(io_bytes)
         .and_then(|v| v.checked_add(csr_bytes))
+        .and_then(|v| {
+            dense_scratch_bytes(prep_result, DENSE_BATCH_SIZE)
+                .ok()
+                .and_then(|scratch| scratch.checked_mul(consumer_threads))
+                .and_then(|scratch| v.checked_add(scratch))
+        })
         .ok_or_else(|| PipelineError::Compute("Memory estimate overflow.".to_string()))?;
 
     let max_ram = memory_budget.max_ram_bytes();
@@ -408,12 +413,18 @@ fn should_use_bounded_accumulator(context: &PipelineContext) -> Result<bool, Pip
     let fast_threads = choose_consumer_threads(result_size, context.memory_budget);
     let fast_copies = fast_threads
         .checked_mul(2)
-        .and_then(|v| v.checked_add(1))
+        .and_then(|v| v.checked_add(2))
         .ok_or_else(|| PipelineError::Compute("Accumulator estimate overflow.".to_string()))?;
     let fast_bytes = result_bytes
         .checked_mul(fast_copies)
         .and_then(|v| v.checked_add(csr_bytes))
         .and_then(|v| v.checked_add(io_bytes))
+        .and_then(|v| {
+            dense_scratch_bytes(prep_result, DENSE_BATCH_SIZE)
+                .ok()
+                .and_then(|scratch| scratch.checked_mul(fast_threads))
+                .and_then(|scratch| v.checked_add(scratch))
+        })
         .ok_or_else(|| PipelineError::Compute("Memory estimate overflow.".to_string()))?;
     Ok(fast_bytes > context.memory_budget.max_ram_bytes())
 }
@@ -613,16 +624,7 @@ impl PipelineContext {
 /// This is the primary public entry point. It is synchronous and returns the
 /// final aggregated scores and counts upon successful completion.
 pub fn run(context: &PipelineContext) -> Result<(Vec<f64>, Vec<u32>), PipelineError> {
-    if should_use_small_keep_direct(context) {
-        return match &context.prep_result.pipeline_kind {
-            PipelineKind::SingleFile(bed_path) => {
-                run_small_keep_direct_single_file(context, bed_path)
-            }
-            PipelineKind::MultiFile(boundaries) => {
-                run_small_keep_direct_multi_file(context, boundaries)
-            }
-        };
-    }
+    ensure_memory_floor(&context.prep_result, context.memory_budget)?;
 
     // The CUDA backend (`cuda_backend::try_run_cuda`) is not selected here. Its f32 sums
     // over timing-sized batches printed different scores from this path (max relative
@@ -652,6 +654,12 @@ fn run_single_file_pipeline(
 ) -> Result<(Vec<f64>, Vec<u32>), PipelineError> {
     // --- 1. Setup: Memory-map the file, create channels and a shared buffer pool ---
     let bed_source = open_scoring_bed_source(context, bed_path)?;
+    if should_use_small_keep_direct(context)
+        || (context.prep_result.num_people_to_score <= SMALL_KEEP_DIRECT_THRESHOLD
+            && bed_source.mmap().is_some())
+    {
+        return run_small_keep_direct_single_file(context, bed_source);
+    }
     let shared_source = bed_source.byte_source();
 
     let channel_bound = context.work_channel_bound()?;
@@ -1018,6 +1026,11 @@ fn run_multi_file_pipeline(
         .map(|b| open_scoring_bed_source(context, &b.bed_path))
         .collect::<Result<_, _>>()?;
     let any_remote = bed_sources.iter().any(|s| s.mmap().is_none());
+    if should_use_small_keep_direct(context)
+        || (context.prep_result.num_people_to_score <= SMALL_KEEP_DIRECT_THRESHOLD && !any_remote)
+    {
+        return run_small_keep_direct_multi_file(context, boundaries, bed_sources);
+    }
     let shared_sources = Arc::new(bed_sources);
 
     // --- 1. Setup: No mmap here. Producer manages its own. ---
@@ -1379,13 +1392,12 @@ fn run_multi_file_pipeline(
 
 fn run_small_keep_direct_single_file(
     context: &PipelineContext,
-    bed_path: &Path,
+    bed_source: io::BedSource,
 ) -> Result<(Vec<f64>, Vec<u32>), PipelineError> {
     eprintln!(
         "> Using small-keep direct PLINK path for {} kept individual(s).",
         context.prep_result.num_people_to_score
     );
-    let bed_source = open_scoring_bed_source(context, bed_path)?;
     let prep_result = &context.prep_result;
     let master_baseline = prep_result.baseline_missing_sum_by_score().to_vec();
     let (mut final_scores, mut final_counts) = initialize_final_output(
@@ -1467,21 +1479,22 @@ fn run_small_keep_direct_single_file(
         pb.inc(processed_since_update);
     }
     pb.finish_with_message("Computation complete.");
+    if !prep_result.complex_rules.is_empty() {
+        let resolver = ComplexVariantResolver::from_single_source(bed_source);
+        resolve_complex_variants(&resolver, prep_result, &mut final_scores, &mut final_counts)?;
+    }
     Ok((final_scores, final_counts))
 }
 
 fn run_small_keep_direct_multi_file(
     context: &PipelineContext,
     boundaries: &[FilesetBoundary],
+    bed_sources: Vec<io::BedSource>,
 ) -> Result<(Vec<f64>, Vec<u32>), PipelineError> {
     eprintln!(
         "> Using small-keep direct PLINK path for {} kept individual(s).",
         context.prep_result.num_people_to_score
     );
-    let bed_sources: Vec<io::BedSource> = boundaries
-        .iter()
-        .map(|b| open_scoring_bed_source(context, &b.bed_path))
-        .collect::<Result<_, _>>()?;
     let prep_result = &context.prep_result;
     let master_baseline = prep_result.baseline_missing_sum_by_score().to_vec();
     let (mut final_scores, mut final_counts) = initialize_final_output(
@@ -1582,6 +1595,11 @@ fn run_small_keep_direct_multi_file(
         pb.inc(processed_since_update);
     }
     pb.finish_with_message("Computation complete.");
+    if !prep_result.complex_rules.is_empty() {
+        let resolver =
+            ComplexVariantResolver::from_multi_sources(bed_sources, boundaries.to_vec())?;
+        resolve_complex_variants(&resolver, prep_result, &mut final_scores, &mut final_counts)?;
+    }
     Ok((final_scores, final_counts))
 }
 
@@ -1689,6 +1707,149 @@ mod tests {
         let run_end = run_body.find("\n}\n").expect("pipeline::run must end");
         assert!(!run_body[..run_end].contains(concat!("try_run_", "cuda(")));
         assert!(!source.contains(concat!("use crate::score::", "cuda_backend")));
+    }
+
+    fn memory_test_prep(people: usize, scores: usize) -> PreparationResult {
+        PreparationResult::new(
+            vec![],
+            vec![],
+            vec![],
+            vec![0],
+            scores.div_ceil(8) * 8,
+            vec![0.0; scores],
+            vec![],
+            vec![],
+            (0..scores).map(|i| format!("S{i}")).collect(),
+            vec![0; scores],
+            crate::score::types::PersonSubset::All,
+            vec![],
+            people,
+            people,
+            0,
+            0,
+            people.div_ceil(4) as u64,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            0,
+            PipelineKind::SingleFile(PathBuf::from("memory-test")),
+        )
+    }
+
+    #[test]
+    fn zero_free_memory_never_grants_an_emergency_allocation() {
+        assert_eq!(memory_budget_from_system(0, 512 << 30, 1), 1);
+        assert_eq!(memory_budget_from_system(512 << 30, 0, 1), 1);
+        assert_eq!(memory_budget_from_system(1000, 10000, 2), 700);
+        assert_eq!(memory_budget_from_system(9000, 10000, 10), 700);
+    }
+
+    #[test]
+    fn memory_floor_rejects_huge_outputs_without_allocating_them() {
+        let budget = MemoryBudget {
+            max_ram_bytes: 64 * 1024 * 1024,
+        };
+        assert!(ensure_memory_floor(&memory_test_prep(500_000, 1000), budget).is_err());
+        assert!(ensure_memory_floor(&memory_test_prep(usize::MAX, 2), budget).is_err());
+        assert!(ensure_memory_floor(&memory_test_prep(64, 4), budget).is_ok());
+    }
+
+    #[test]
+    fn bounded_dense_batches_include_wide_weight_matrices() {
+        let budget = MemoryBudget {
+            max_ram_bytes: 64 * 1024 * 1024,
+        };
+        let wide = memory_test_prep(64, 10_000);
+        let batch = bounded_dense_batch_size(&wide, budget).unwrap();
+        assert!(batch < DENSE_BATCH_SIZE);
+        assert!(dense_scratch_bytes(&wide, batch).unwrap() <= budget.max_ram_bytes() / 16);
+        assert!(dense_scratch_bytes(&wide, batch + 1).unwrap() > budget.max_ram_bytes() / 16);
+        assert_eq!(
+            bounded_dense_batch_size(&memory_test_prep(64, 1), budget).unwrap(),
+            DENSE_BATCH_SIZE
+        );
+    }
+
+    #[test]
+    fn small_cohort_complex_scoring_matches_manual_dosages_across_filesets() {
+        let dir = tempfile::tempdir().unwrap();
+        let fam = (0..7)
+            .map(|i| format!("F I{i} 0 0 0 -9\n"))
+            .collect::<String>();
+        let rows = [
+            "1 a 0 100 A G\n",
+            "1 b 0 150 C T\n",
+            "1 c 0 200 A C\n",
+            "1 d 0 200 G C\n",
+        ];
+        let calls: [[u8; 7]; 4] = [
+            [0, 1, 2, 3, 3, 2, 0],
+            [3, 2, 1, 0, 1, 0, 2],
+            [2, 3, 0, 1, 2, 1, 3],
+            [0; 7],
+        ];
+        let weights = dir.path().join("weights.tsv");
+        fs::write(&weights, "variant_id\teffect_allele\tother_allele\tS\n1:100\tG\tA\t0.25\n1:150\tC\tT\t0.5\n1:200\tC\tA\t0.125\n").unwrap();
+        let keep = dir.path().join("keep.txt");
+        fs::write(&keep, "I1\nI4\nI6\n").unwrap();
+        for split in [false, true] {
+            let mut prefixes = Vec::new();
+            let ranges = if split { vec![0..2, 2..4] } else { vec![0..4] };
+            for (part, range) in ranges.into_iter().enumerate() {
+                let prefix = dir.path().join(format!("panel-{split}-{part}"));
+                fs::write(prefix.with_extension("fam"), &fam).unwrap();
+                fs::write(prefix.with_extension("bim"), rows[range.clone()].concat()).unwrap();
+                let mut bed = vec![0x6c, 0x1b, 0x01];
+                for row in &calls[range] {
+                    for chunk in row.chunks(4) {
+                        bed.push(
+                            chunk
+                                .iter()
+                                .enumerate()
+                                .fold(0, |byte, (i, call)| byte | (call << (2 * i))),
+                        );
+                    }
+                }
+                fs::write(prefix.with_extension("bed"), bed).unwrap();
+                prefixes.push(prefix);
+            }
+            for subset in [None, Some(keep.as_path())] {
+                let prep = Arc::new(
+                    crate::score::prepare::prepare_for_computation(
+                        &prefixes,
+                        std::slice::from_ref(&weights),
+                        subset,
+                        None,
+                    )
+                    .unwrap(),
+                );
+                assert_eq!(prep.complex_rules.len(), 1);
+                let context = PipelineContext::new(Arc::clone(&prep));
+                let (scores, missing) = run(&context).unwrap();
+                for (out, fam) in prep.output_idx_to_fam_idx.iter().enumerate() {
+                    let mut expected = 0.0;
+                    let mut expected_missing = 0;
+                    for (row, weight) in [0.25, 0.5, 0.125].into_iter().enumerate() {
+                        let packed = calls[row][fam.0 as usize];
+                        if packed == 1 {
+                            expected_missing += 1;
+                        } else {
+                            let dosage = match packed {
+                                0 => 0.0,
+                                2 => 1.0,
+                                3 => 2.0,
+                                _ => unreachable!(),
+                            };
+                            expected += weight * if row == 1 { 2.0 - dosage } else { dosage };
+                        }
+                    }
+                    assert_eq!(scores[out], expected, "split={split}, person={fam:?}");
+                    assert_eq!(missing[out], expected_missing);
+                }
+            }
+        }
     }
 
     #[test]
@@ -2177,7 +2338,7 @@ fn process_dense_stream_bounded(
     accumulator: Arc<Mutex<(Vec<f64>, Vec<u32>)>>,
 ) -> ConsumerResult {
     let prep_result = &context.prep_result;
-    let batch_size = bounded_dense_batch_size(context);
+    let batch_size = bounded_dense_batch_size(&context.prep_result, context.memory_budget)?;
     let mut batch_iterator = ChannelBatcher::new(rx, batch_size);
     let mut concatenated_data = Vec::new();
     let mut weights_for_batch = Vec::new();
@@ -2200,7 +2361,7 @@ fn process_dense_stream_bounded(
             })?;
         if concatenated_data.capacity() < needed_len {
             concatenated_data
-                .try_reserve_exact(needed_len - concatenated_data.capacity())
+                .try_reserve_exact(needed_len - concatenated_data.len())
                 .map_err(|e| {
                     PipelineError::Compute(format!(
                         "Failed to reserve dense bounded batch buffer ({}): {e}",
@@ -2229,7 +2390,7 @@ fn process_dense_stream_bounded(
                 })?;
             if weights_for_batch.capacity() < matrix_len {
                 weights_for_batch
-                    .try_reserve_exact(matrix_len - weights_for_batch.capacity())
+                    .try_reserve_exact(matrix_len - weights_for_batch.len())
                     .map_err(|e| {
                         PipelineError::Compute(format!(
                             "Failed to reserve dense bounded weight matrix ({matrix_len} cells): {e}"
@@ -2240,7 +2401,7 @@ fn process_dense_stream_bounded(
             weights_for_batch.fill(0.0);
             if missing_corrections_for_batch.capacity() < matrix_len {
                 missing_corrections_for_batch
-                    .try_reserve_exact(matrix_len - missing_corrections_for_batch.capacity())
+                    .try_reserve_exact(matrix_len - missing_corrections_for_batch.len())
                     .map_err(|e| {
                         PipelineError::Compute(format!(
                             "Failed to reserve dense bounded missing-correction matrix ({matrix_len} cells): {e}"
@@ -2289,10 +2450,66 @@ fn process_dense_stream_bounded(
     Ok((Vec::new(), Vec::new()))
 }
 
-fn bounded_dense_batch_size(context: &PipelineContext) -> usize {
-    let row_bytes = usize::try_from(context.prep_result.bytes_per_variant)
-        .unwrap_or(usize::MAX)
-        .max(1);
-    let dense_budget = (context.memory_budget.max_ram_bytes() / 16).max(row_bytes);
-    (dense_budget / row_bytes).clamp(1, DENSE_BATCH_SIZE)
+fn bounded_dense_batch_size(
+    prep: &PreparationResult,
+    budget: MemoryBudget,
+) -> Result<usize, PipelineError> {
+    let row_bytes = dense_scratch_bytes(prep, 1)?.max(1);
+    Ok((budget.max_ram_bytes() / 16 / row_bytes).clamp(1, DENSE_BATCH_SIZE))
+}
+
+fn dense_scratch_bytes(prep: &PreparationResult, variants: usize) -> Result<usize, PipelineError> {
+    let row = usize::try_from(prep.bytes_per_variant).ok();
+    // Packed calls, two padded f32 weight matrices, the dosage tile, and
+    // batched work descriptors coexist. Score width matters as much as N.
+    row.and_then(|row| {
+        prep.stride()
+            .checked_mul(2 * std::mem::size_of::<f32>())
+            .and_then(|weights| row.checked_add(weights))
+    })
+    .and_then(|row| row.checked_add(prep.num_people_to_score.min(batch::PERSON_BLOCK_SIZE)))
+    .and_then(|row| {
+        row.checked_add(
+            std::mem::size_of::<WorkItem>() + std::mem::size_of::<ReconciledVariantIndex>(),
+        )
+    })
+    .and_then(|row| row.checked_mul(variants))
+    .ok_or_else(|| PipelineError::Compute("Dense scoring scratch size overflow.".into()))
+}
+
+fn ensure_memory_floor(
+    prep: &PreparationResult,
+    budget: MemoryBudget,
+) -> Result<(), PipelineError> {
+    let output = result_bytes(checked_result_size(prep)?)?;
+    let row = usize::try_from(prep.bytes_per_variant)
+        .map_err(|_| PipelineError::Compute("PLINK row width overflow.".into()))?;
+    let direct = should_use_small_keep_direct_for_prep(prep);
+    let buffers = if direct {
+        0
+    } else {
+        io_buffer_count(prep, budget)?
+    };
+    let scratch = if direct {
+        0
+    } else {
+        dense_scratch_bytes(prep, bounded_dense_batch_size(prep, budget)?)?
+    };
+    let required = output
+        .checked_mul(2) // live output plus a resumed checkpoint
+        .and_then(|v| v.checked_add(csr_bytes(prep).ok()?))
+        .and_then(|v| v.checked_add(row.checked_mul(buffers)?))
+        .and_then(|v| v.checked_add(scratch))
+        .and_then(|v| v.checked_add(io::local_prefetch_budget(prep, budget)))
+        .ok_or_else(|| PipelineError::Compute("Minimum scoring memory size overflow.".into()))?;
+    if required > budget.max_ram_bytes() {
+        return Err(PipelineError::Compute(format!(
+            "Scoring requires at least {} for {} people and {} scores, exceeding the {} memory budget even with bounded accumulation. Reduce the kept cohort or score panel.",
+            format_bytes(required),
+            prep.num_people_to_score,
+            prep.score_names.len(),
+            format_bytes(budget.max_ram_bytes())
+        )));
+    }
+    Ok(())
 }
