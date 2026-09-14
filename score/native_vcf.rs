@@ -101,58 +101,69 @@ pub fn score_vcf_streaming(
     let mut missing_counts = vec![0u32; num_people * num_scores];
     let mut score_variant_counts = vec![0u32; num_scores];
 
-    let mut record = noodles_vcf::Record::default();
-    while reader.read_record(&mut record)? != 0 {
-        let chr = match parse_chromosome_label(record.reference_sequence_name()) {
-            Ok(chr) => chr,
-            Err(_) => continue,
-        };
-        let Some(start) = record.variant_start() else {
-            continue;
-        };
-        let pos = start?.get() as u32;
-        let key = (chr, pos);
-        let Some(score_rules) = rules_by_key.get(&key) else {
-            continue;
-        };
-
-        let ref_allele = record.reference_bases();
-        let alt_alleles: Vec<String> = record
-            .alternate_bases()
-            .iter()
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .map(str::to_string)
-            .collect();
-
-        for (alt_offset, alt_allele) in alt_alleles.iter().enumerate() {
-            let alt_index = alt_offset + 1;
-            let matched_rules = match_rules_for_allele(score_rules, ref_allele, alt_allele);
-            if matched_rules.is_empty() {
-                continue;
+    // Records are read in order, decoded on the rayon pool, and accumulated in
+    // order again, so every sum takes the same operands in the same sequence
+    // as a one-record-at-a-time scan, and the first error is the one it raises.
+    let threads = rayon::current_num_threads().max(1);
+    let batch_len =
+        (DECODE_BATCH_DOSAGES / all_samples.len()).clamp(threads, threads * RECORDS_PER_WORKER);
+    let mut records: Vec<noodles_vcf::Record> = Vec::new();
+    let mut decoded_records: Vec<DecodedRecord> = Vec::new();
+    loop {
+        let mut filled = 0usize;
+        let mut read_error = None;
+        let mut at_eof = false;
+        while filled < batch_len {
+            if records.len() == filled {
+                records.push(noodles_vcf::Record::default());
+                decoded_records.push(DecodedRecord::default());
             }
+            match reader.read_record(&mut records[filled]) {
+                Ok(0) => {
+                    at_eof = true;
+                    break;
+                }
+                Ok(_) => filled += 1,
+                Err(err) => {
+                    read_error = Some(err);
+                    break;
+                }
+            }
+        }
 
-            for_each_vcf_dosage_best(
-                &record,
-                alt_index,
-                alt_alleles.len(),
-                &kept_indices,
-                |out_person_idx, dosage| {
+        records[..filled]
+            .par_iter()
+            .zip(decoded_records[..filled].par_iter_mut())
+            .for_each(|(record, decoded)| {
+                decoded.allele_count = 0;
+                decoded.error = decode_scored_record(
+                    record,
+                    &rules_by_key,
+                    &kept_indices,
+                    &score_names,
+                    decoded,
+                )
+                .err();
+            });
+
+        for (record, decoded) in records[..filled].iter().zip(&mut decoded_records[..filled]) {
+            if let Some(err) = decoded.error.take() {
+                return Err(err);
+            }
+            for allele in &decoded.alleles[..decoded.allele_count] {
+                for (out_person_idx, dosage) in allele.dosages.iter().enumerate() {
                     match dosage {
                         Some(decoded_dosage) => {
-                            for rule in &matched_rules {
+                            for rule in &allele.matched_rules {
                                 let cell = out_person_idx * num_scores + rule.score_index;
                                 let effect_dosage = if rule.effect_is_ref {
-                                    decoded_dosage
-                                        .ref_dosage
-                                        .ok_or_else(|| {
-                                            format!(
-                                                "Cannot score REF-effect rule for score '{}' at {}:{} without a complete REF dosage (DS requires genotype ploidy and all ALT dosages).",
-                                                score_names[rule.score_index],
-                                                record.reference_sequence_name(),
-                                                pos,
-                                            )
-                                        })?
+                                    decoded_dosage.ref_dosage.ok_or_else(|| {
+                                        ref_effect_error(
+                                            &score_names[rule.score_index],
+                                            record,
+                                            decoded.position,
+                                        )
+                                    })?
                                 } else {
                                     decoded_dosage.alt_dosage
                                 };
@@ -161,7 +172,7 @@ pub fn score_vcf_streaming(
                         }
                         None => {
                             let mut previous_score = None;
-                            for rule in &matched_rules {
+                            for rule in &allele.matched_rules {
                                 if previous_score == Some(rule.score_index) {
                                     continue;
                                 }
@@ -171,17 +182,23 @@ pub fn score_vcf_streaming(
                             }
                         }
                     }
-                    Ok(())
-                },
-            )?;
+                }
 
-            let mut previous_score = None;
-            for rule in &matched_rules {
-                if previous_score != Some(rule.score_index) {
-                    score_variant_counts[rule.score_index] += 1;
-                    previous_score = Some(rule.score_index);
+                let mut previous_score = None;
+                for rule in &allele.matched_rules {
+                    if previous_score != Some(rule.score_index) {
+                        score_variant_counts[rule.score_index] += 1;
+                        previous_score = Some(rule.score_index);
+                    }
                 }
             }
+        }
+
+        if let Some(err) = read_error {
+            return Err(err.into());
+        }
+        if at_eof {
+            break;
         }
     }
 
@@ -208,6 +225,101 @@ pub fn score_vcf_streaming(
         missing_counts,
         matched_variants,
     })
+}
+
+/// Records decoded per rayon worker before the ordered accumulation pass.
+const RECORDS_PER_WORKER: usize = 64;
+/// Dosages one decode batch may hold, so cohorts with many samples take smaller batches.
+const DECODE_BATCH_DOSAGES: usize = 1 << 22;
+
+/// What scoring one VCF record needs, decoded away from the accumulating thread.
+#[derive(Default)]
+struct DecodedRecord {
+    position: u32,
+    /// Alleles with at least one matched rule, in ALT order. Only the first
+    /// `allele_count` belong to this record; the rest keep their buffers.
+    alleles: Vec<DecodedAllele>,
+    allele_count: usize,
+    /// The first error scoring this record raises.
+    error: Option<Box<dyn Error + Send + Sync>>,
+}
+
+#[derive(Default)]
+struct DecodedAllele {
+    matched_rules: Vec<MatchedRule>,
+    /// One entry per kept person, in output order.
+    dosages: Vec<Option<DecodedAltDosage>>,
+}
+
+/// Decodes the dosages `record` contributes to its matched rules into
+/// `decoded`, stopping at the first error a sequential scan raises for this
+/// record: a malformed position or ALT, a missing dosage FORMAT field, an
+/// undecodable sample, or a REF-effect rule without a complete REF dosage.
+fn decode_scored_record(
+    record: &noodles_vcf::Record,
+    rules_by_key: &AHashMap<VariantKey, Vec<ScoreRule>>,
+    kept_indices: &[usize],
+    score_names: &[String],
+    decoded: &mut DecodedRecord,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let Ok(chr) = parse_chromosome_label(record.reference_sequence_name()) else {
+        return Ok(());
+    };
+    let Some(start) = record.variant_start() else {
+        return Ok(());
+    };
+    let pos = start?.get() as u32;
+    let Some(score_rules) = rules_by_key.get(&(chr, pos)) else {
+        return Ok(());
+    };
+    decoded.position = pos;
+
+    let ref_allele = record.reference_bases();
+    let alternate_bases = record.alternate_bases();
+    let alt_alleles = alternate_bases.iter().collect::<Result<Vec<_>, _>>()?;
+    for (alt_offset, alt_allele) in alt_alleles.iter().enumerate() {
+        let alt_index = alt_offset + 1;
+        let matched_rules = match_rules_for_allele(score_rules, ref_allele, alt_allele);
+        if matched_rules.is_empty() {
+            continue;
+        }
+        if decoded.alleles.len() == decoded.allele_count {
+            decoded.alleles.push(DecodedAllele::default());
+        }
+        let allele = &mut decoded.alleles[decoded.allele_count];
+        allele.dosages.clear();
+        let ref_effect_rule = matched_rules.iter().find(|rule| rule.effect_is_ref);
+        for_each_vcf_dosage_best(
+            record,
+            alt_index,
+            alt_alleles.len(),
+            kept_indices,
+            |_, dosage| {
+                if let Some(decoded_dosage) = dosage
+                    && decoded_dosage.ref_dosage.is_none()
+                    && let Some(rule) = ref_effect_rule
+                {
+                    return Err(
+                        ref_effect_error(&score_names[rule.score_index], record, pos).into(),
+                    );
+                }
+                allele.dosages.push(dosage);
+                Ok(())
+            },
+        )?;
+        allele.matched_rules = matched_rules;
+        decoded.allele_count += 1;
+    }
+    Ok(())
+}
+
+fn ref_effect_error(score_name: &str, record: &noodles_vcf::Record, position: u32) -> String {
+    format!(
+        "Cannot score REF-effect rule for score '{}' at {}:{} without a complete REF dosage (DS requires genotype ploidy and all ALT dosages).",
+        score_name,
+        record.reference_sequence_name(),
+        position,
+    )
 }
 
 fn load_score_rules(
@@ -2138,6 +2250,42 @@ mod tests {
                 }),
             };
             assert!(skipped, "{context:?}");
+        }
+    }
+
+    #[test]
+    fn batched_decoding_reports_the_first_error_a_sequential_scan_raises() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let score_path = dir.path().join("score.gnomon.tsv");
+        std::fs::write(
+            &score_path,
+            "variant_id\teffect_allele\tother_allele\tScoreA\n1:100\tA\tG\t1\n1:200\tG\tA\t1\n",
+        )
+        .expect("write score");
+        let header =
+            "##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts1\ts2\n";
+        for (records, expected) in [
+            // The REF-effect rule has no ploidy at s1, before s2's DS is decoded.
+            (
+                "1\t100\t.\tA\tG\t.\tPASS\t.\tDS\t0.5\tbad\n",
+                "Cannot score REF-effect rule",
+            ),
+            // With the order reversed, the undecodable DS comes first.
+            (
+                "1\t100\t.\tA\tG\t.\tPASS\t.\tDS\tbad\t0.5\n",
+                "invalid float literal",
+            ),
+            // An earlier record's error wins over a later record's.
+            (
+                "1\t200\t.\tA\tG\t.\tPASS\t.\tGT\t0/x\t0/1\n1\t100\t.\tA\tG\t.\tPASS\t.\tDS\t0.5\t0.5\n",
+                "unexpected byte",
+            ),
+        ] {
+            let vcf_path = dir.path().join("errors.vcf");
+            std::fs::write(&vcf_path, format!("{header}{records}")).expect("write vcf");
+            let err = score_vcf_streaming(&vcf_path, std::slice::from_ref(&score_path), None, None)
+                .expect_err("malformed records");
+            assert!(err.to_string().contains(expected), "{records:?}: {err}");
         }
     }
 }
