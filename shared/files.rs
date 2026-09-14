@@ -2584,11 +2584,35 @@ impl HttpByteRangeSource {
 }
 
 impl HttpSegmentFetcher {
+    /// Reads one range, retrying transient failures (a dropped connection, a
+    /// truncated body, 408, 429 or a 5xx) with the same backoff as Cloud
+    /// Storage reads. A response that shows the server does not serve this
+    /// range fails at once.
     fn fetch(&self, start: u64, length: usize) -> Result<Vec<u8>, PipelineError> {
+        let mut attempt = 1;
+        loop {
+            match self.fetch_once(start, length) {
+                Ok(data) => return Ok(data),
+                Err((error, true)) if attempt < REMOTE_READ_ATTEMPTS => {
+                    let delay_ms = REMOTE_READ_INITIAL_BACKOFF_MS << (attempt - 1);
+                    warn!(
+                        "HTTP range read attempt {attempt}/{REMOTE_READ_ATTEMPTS} failed at offset {start} for {}: {error}; retrying in {delay_ms} ms",
+                        self.url
+                    );
+                    std::thread::sleep(Duration::from_millis(delay_ms));
+                    attempt += 1;
+                }
+                Err((error, _)) => return Err(error),
+            }
+        }
+    }
+
+    /// One range request, and whether its failure is worth retrying.
+    fn fetch_once(&self, start: u64, length: usize) -> Result<Vec<u8>, (PipelineError, bool)> {
         let end = start
             .checked_add(length as u64)
             .and_then(|value| value.checked_sub(1))
-            .ok_or_else(|| PipelineError::Io("HTTP range end overflow".to_string()))?;
+            .ok_or_else(|| (PipelineError::Io("HTTP range end overflow".to_string()), false))?;
         let range = format!("bytes={start}-{end}");
         let response = self
             .client
@@ -2596,36 +2620,43 @@ impl HttpSegmentFetcher {
             .header(RANGE, range)
             .send()
             .map_err(|e| {
-                PipelineError::Io(format!(
+                let error = PipelineError::Io(format!(
                     "Failed to read HTTP range from {}: {e:?}",
                     self.url
-                ))
+                ));
+                (error, true)
             })?;
         let status = response.status();
         if status != StatusCode::PARTIAL_CONTENT {
-            return Err(PipelineError::Io(format!(
+            let transient = status.is_server_error()
+                || status == StatusCode::REQUEST_TIMEOUT
+                || status == StatusCode::TOO_MANY_REQUESTS;
+            let error = PipelineError::Io(format!(
                 "HTTP range request for {} returned unexpected status {status}",
                 self.url
-            )));
+            ));
+            return Err((error, transient));
         }
         let actual_range =
             HttpByteRangeSource::parse_byte_content_range(response.headers().get(CONTENT_RANGE));
         if actual_range != Some((start, end, self.len)) {
-            return Err(PipelineError::Io(format!(
+            let error = PipelineError::Io(format!(
                 "HTTP range response for {} has inconsistent Content-Range: expected bytes {start}-{end}/{}, got {:?}",
                 self.url,
                 self.len,
                 response.headers().get(CONTENT_RANGE)
-            )));
+            ));
+            return Err((error, false));
         }
         if let Some(content_length) =
             HttpByteRangeSource::parse_content_length(response.headers().get(CONTENT_LENGTH))
             && content_length != length as u64
         {
-            return Err(PipelineError::Io(format!(
+            let error = PipelineError::Io(format!(
                 "HTTP range response for {} has length {content_length}, expected {length}",
                 self.url
-            )));
+            ));
+            return Err((error, false));
         }
 
         // Bound memory even when a server lies about its range or sends a
@@ -2635,14 +2666,18 @@ impl HttpSegmentFetcher {
             .take(length as u64 + 1)
             .read_to_end(&mut data)
             .map_err(|e| {
-                PipelineError::Io(format!("Failed to read HTTP body from {}: {e}", self.url))
+                let error =
+                    PipelineError::Io(format!("Failed to read HTTP body from {}: {e}", self.url));
+                (error, true)
             })?;
         if data.len() != length {
-            return Err(PipelineError::Io(format!(
+            // A body cut short is a dropped connection; one that runs long is not.
+            let error = PipelineError::Io(format!(
                 "HTTP range read from {} has incorrect length: expected {length} bytes, received {}",
                 self.url,
                 data.len()
-            )));
+            ));
+            return Err((error, data.len() < length));
         }
         Ok(data)
     }
@@ -3068,6 +3103,36 @@ mod tests {
             assert_eq!(outcome.is_ok(), valid, "{headers}: {outcome:?}");
             if valid {
                 assert_eq!(&result, b"efgh");
+            }
+        }
+    }
+
+    #[test]
+    fn http_range_reads_retry_transient_failures_only() {
+        let probe = "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\n";
+        let range = "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 4-7/8\r\nContent-Length: 4\r\nConnection: close\r\n\r\nefgh";
+        for (failure, retried) in [
+            ("503 Service Unavailable\r\nContent-Length: 0", true),
+            ("429 Too Many Requests\r\nContent-Length: 0", true),
+            ("206 Partial Content\r\nContent-Range: bytes 4-7/8\r\nContent-Length: 4\r\n\r\nef", true),
+            ("404 Not Found\r\nContent-Length: 0", false),
+        ] {
+            let failure = if failure.contains("\r\n\r\n") {
+                format!("HTTP/1.1 {}", failure.replacen("\r\n\r\n", "\r\nConnection: close\r\n\r\n", 1))
+            } else {
+                format!("HTTP/1.1 {failure}\r\nConnection: close\r\n\r\n")
+            };
+            // A valid range follows the failure, so a retry that should not
+            // happen would succeed and fail the test.
+            let (url, server) =
+                serve_http_responses(vec![probe.to_string(), failure.clone(), range.to_string()]);
+            let source = HttpByteRangeSource::with_block_size(&url, 4).expect("source");
+            let mut result = [0; 4];
+            let outcome = source.read_at(4, &mut result);
+            assert_eq!(outcome.is_ok(), retried, "{failure}: {outcome:?}");
+            if retried {
+                assert_eq!(&result, b"efgh");
+                server.join().expect("HTTP server");
             }
         }
     }
