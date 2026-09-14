@@ -50,6 +50,10 @@ pub enum SexInferenceError {
         "insufficient sex-informative variants: {autosomes} autosomal and {y_non_par} Y non-PAR loci available"
     )]
     InsufficientInformativeVariants { autosomes: u64, y_non_par: u64 },
+    #[error(
+        "the X and Y coordinates disagree on the genome build: X reaches {max_x}, past the end of GRCh37's chrX, while Y reaches {max_y}, past the end of GRCh38's chrY; pass --build 37 or --build 38"
+    )]
+    ConflictingBuildEvidence { max_x: u64, max_y: u64 },
 }
 
 impl From<InferenceError> for SexInferenceError {
@@ -485,7 +489,7 @@ fn infer_dataset_records(
         }
         _ => VariantLoci::from_keys(&dataset.variant_keys_for_plan(&SelectionPlan::All)?),
     };
-    let build = resolve_build(force_build, &loci);
+    let build = resolve_build(force_build, &loci)?;
     let selection = SexVariantSelection::from_loci(&loci, build);
     let records = match dataset {
         GenotypeDataset::Plink(plink) => {
@@ -512,19 +516,40 @@ fn infer_directory_records(
         loci.chroms.extend(fileset_loci.chroms);
         loci.positions.extend(fileset_loci.positions);
     }
-    let build = resolve_build(force_build, &loci);
+    let build = resolve_build(force_build, &loci)?;
     let selection = SexVariantSelection::from_loci(&loci, build);
     let records = collect_packed_inference(&parts, &selection, show_progress)?;
     Ok((build, records))
 }
 
-/// The build `force_build` names, or the one the X positions imply.
-fn resolve_build(force_build: Option<GenomeBuild>, loci: &VariantLoci) -> GenomeBuild {
-    force_build.unwrap_or_else(|| {
-        let inferred = infer_build(loci);
-        eprintln!("Inferred Genome Build: {:?}", inferred);
-        inferred
-    })
+/// The build `force_build` names, or the one the X and Y positions imply. A
+/// guess that some locus contests is warned about; coordinates that prove both
+/// builds are refused, since either choice would miscount someone's PAR calls.
+fn resolve_build(
+    force_build: Option<GenomeBuild>,
+    loci: &VariantLoci,
+) -> Result<GenomeBuild, SexInferenceError> {
+    if let Some(build) = force_build {
+        return Ok(build);
+    }
+    match infer_build(loci) {
+        BuildEvidence::Proven(build) => {
+            eprintln!("Inferred Genome Build: {build:?}");
+            Ok(build)
+        }
+        BuildEvidence::Guessed { build, contested } => {
+            eprintln!("Inferred Genome Build: {build:?}");
+            if contested {
+                eprintln!(
+                    "Warning: no X or Y coordinate proves the genome build, and some X or Y loci lie where the pseudoautosomal boundaries of GRCh37 and GRCh38 differ; pass --build 37 or --build 38 if {build:?} is wrong."
+                );
+            }
+            Ok(build)
+        }
+        BuildEvidence::Conflict { max_x, max_y } => {
+            Err(SexInferenceError::ConflictingBuildEvidence { max_x, max_y })
+        }
+    }
 }
 
 /// The `.bed` files of a local directory of PLINK 1 filesets, such as one per
@@ -881,23 +906,86 @@ fn sex_label(sex: InferredSex) -> &'static str {
     }
 }
 
-fn infer_build(loci: &VariantLoci) -> GenomeBuild {
+/// What the sex-chromosome coordinates say about the genome build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BuildEvidence {
+    /// A coordinate that exists in only one build settles it.
+    Proven(GenomeBuild),
+    /// No coordinate proves either build, so the last X position picks one.
+    /// `contested` is true when some X or Y locus would count as PAR under one
+    /// build and non-PAR under the other, so the guess can change a call.
+    Guessed { build: GenomeBuild, contested: bool },
+    /// The X coordinates prove GRCh38 and the Y coordinates prove GRCh37.
+    Conflict { max_x: u64, max_y: u64 },
+}
+
+impl BuildEvidence {
+    #[cfg(test)]
+    fn chosen(self) -> Option<GenomeBuild> {
+        match self {
+            Self::Proven(build) | Self::Guessed { build, .. } => Some(build),
+            Self::Conflict { .. } => None,
+        }
+    }
+}
+
+/// GRCh37 chrX is 155,270,560 bp long, so an X position past it is GRCh38.
+const GRCH37_CHRX_LENGTH: u64 = 155_270_560;
+/// GRCh38 chrY is 57,227,415 bp long, so a Y position past it is GRCh37.
+const GRCH38_CHRY_LENGTH: u64 = 57_227_415;
+/// True when `position` on X counts as PAR in one build and non-PAR in the
+/// other: PAR1 ends at 2,699,520 (GRCh37) or 2,781,479 (GRCh38), and PAR2
+/// starts at 154,931,044 (GRCh37) or 155,701,383 (GRCh38).
+fn x_par_assignment_differs(position: u64) -> bool {
+    (2_699_521..=2_781_479).contains(&position) || (154_931_044..=155_260_560).contains(&position)
+}
+
+/// The Y counterpart: PAR1 ends at 2,649,520 (GRCh37) or 2,781,479 (GRCh38),
+/// and PAR2 starts at 59,034,050 (GRCh37) or 56,887,903 (GRCh38).
+fn y_par_assignment_differs(position: u64) -> bool {
+    (2_649_521..=2_781_479).contains(&position) || (56_887_903..=57_217_415).contains(&position)
+}
+
+fn infer_build(loci: &VariantLoci) -> BuildEvidence {
+    // Without a proof, an array whose last X probe sits near the end of the
+    // chromosome tells the builds apart by where that end is.
     const GRCH38_THRESHOLD: u64 = 155_700_000;
     const GRCH37_THRESHOLD: u64 = 154_900_000;
 
-    let max_x = loci
-        .chroms
-        .iter()
-        .zip(&loci.positions)
-        .filter(|&(&chrom, _)| matches!(chrom, Some(LocusChromosome::X | LocusChromosome::XPar)))
-        .map(|(_, &position)| position)
-        .max();
+    let mut max_x = None;
+    let mut max_y = None;
+    let mut contested = false;
+    for (&chrom, &position) in loci.chroms.iter().zip(&loci.positions) {
+        match chrom {
+            Some(LocusChromosome::X | LocusChromosome::XPar) => {
+                max_x = max_x.max(Some(position));
+                contested |= x_par_assignment_differs(position);
+            }
+            Some(LocusChromosome::Y) => {
+                max_y = max_y.max(Some(position));
+                contested |= y_par_assignment_differs(position);
+            }
+            Some(LocusChromosome::Autosome) | None => {}
+        }
+    }
 
-    match max_x {
-        Some(pos) if pos >= GRCH38_THRESHOLD => GenomeBuild::Build38,
-        Some(pos) if pos >= GRCH37_THRESHOLD => GenomeBuild::Build37,
-        Some(_) => GenomeBuild::Build38,
-        None => GenomeBuild::Build38,
+    let proves_38 = max_x.is_some_and(|pos| pos > GRCH37_CHRX_LENGTH);
+    let proves_37 = max_y.is_some_and(|pos| pos > GRCH38_CHRY_LENGTH);
+    match (proves_38, proves_37) {
+        (true, true) => BuildEvidence::Conflict {
+            max_x: max_x.unwrap_or(0),
+            max_y: max_y.unwrap_or(0),
+        },
+        (true, false) => BuildEvidence::Proven(GenomeBuild::Build38),
+        (false, true) => BuildEvidence::Proven(GenomeBuild::Build37),
+        (false, false) => {
+            let build = match max_x {
+                Some(pos) if pos >= GRCH38_THRESHOLD => GenomeBuild::Build38,
+                Some(pos) if pos >= GRCH37_THRESHOLD => GenomeBuild::Build37,
+                _ => GenomeBuild::Build38,
+            };
+            BuildEvidence::Guessed { build, contested }
+        }
     }
 }
 
@@ -998,12 +1086,131 @@ mod tests {
     #[test]
     fn infer_build_detects_build_thresholds() {
         let loci = VariantLoci::from_keys(&[VariantKey::new("chrX", 155_800_000)]);
-        assert_eq!(infer_build(&loci), GenomeBuild::Build38);
+        assert_eq!(
+            infer_build(&loci),
+            BuildEvidence::Proven(GenomeBuild::Build38)
+        );
 
         let loci = VariantLoci::from_keys(&[VariantKey::new("X", 155_000_000)]);
-        assert_eq!(infer_build(&loci), GenomeBuild::Build37);
+        assert_eq!(
+            infer_build(&loci),
+            BuildEvidence::Guessed {
+                build: GenomeBuild::Build37,
+                contested: true
+            }
+        );
 
-        assert_eq!(infer_build(&VariantLoci::default()), GenomeBuild::Build38);
+        let loci = VariantLoci::from_keys(&[VariantKey::new("X", 154_910_000)]);
+        assert_eq!(
+            infer_build(&loci),
+            BuildEvidence::Guessed {
+                build: GenomeBuild::Build37,
+                contested: false
+            }
+        );
+
+        assert_eq!(
+            infer_build(&VariantLoci::default()),
+            BuildEvidence::Guessed {
+                build: GenomeBuild::Build38,
+                contested: false
+            }
+        );
+    }
+
+    /// Real GRCh38 arrays (a GSA subset and array3200) end their X probes between
+    /// GRCh37's chrX length and the old 155.7 M threshold, and were read as
+    /// GRCh37: their PAR1 tail counted as non-PAR X, and every X row past
+    /// 155.26 M was dropped as PAR2. A position past GRCh37's chrX proves GRCh38.
+    #[test]
+    fn x_positions_past_grch37_chrx_prove_build38() {
+        for max_x in [155_270_561, 155_500_000, 155_683_512, 155_699_751] {
+            let loci = VariantLoci::from_keys(&[
+                VariantKey::new("X", 2_750_000),
+                VariantKey::new("X", max_x),
+            ]);
+            assert_eq!(
+                infer_build(&loci),
+                BuildEvidence::Proven(GenomeBuild::Build38),
+                "max X {max_x}"
+            );
+            let selection = SexVariantSelection::from_loci(&loci, GenomeBuild::Build38);
+            assert_eq!(
+                selection.indices,
+                vec![0, 1],
+                "both rows are non-PAR X in GRCh38"
+            );
+        }
+        let loci = VariantLoci::from_keys(&[VariantKey::new("X", 155_270_560)]);
+        assert_eq!(
+            infer_build(&loci),
+            BuildEvidence::Guessed {
+                build: GenomeBuild::Build37,
+                contested: false
+            },
+            "the last GRCh37 base proves nothing, and is non-PAR in both builds"
+        );
+    }
+
+    #[test]
+    fn a_long_y_proves_build37_and_conflicts_with_a_long_x() {
+        let loci = VariantLoci::from_keys(&[VariantKey::new("Y", 58_000_000)]);
+        assert_eq!(
+            infer_build(&loci),
+            BuildEvidence::Proven(GenomeBuild::Build37)
+        );
+
+        let loci = VariantLoci::from_keys(&[
+            VariantKey::new("X", 155_500_000),
+            VariantKey::new("Y", 58_000_000),
+        ]);
+        assert_eq!(
+            infer_build(&loci),
+            BuildEvidence::Conflict {
+                max_x: 155_500_000,
+                max_y: 58_000_000
+            }
+        );
+        assert!(matches!(
+            resolve_build(None, &loci),
+            Err(SexInferenceError::ConflictingBuildEvidence {
+                max_x: 155_500_000,
+                max_y: 58_000_000
+            })
+        ));
+        assert_eq!(
+            resolve_build(Some(GenomeBuild::Build37), &loci).unwrap(),
+            GenomeBuild::Build37,
+            "--build overrides the evidence"
+        );
+    }
+
+    #[test]
+    fn a_guess_is_contested_only_where_the_par_boundaries_differ() {
+        let loci = VariantLoci::from_keys(&[
+            VariantKey::new("X", 1_000_000),
+            VariantKey::new("Y", 10_000_000),
+        ]);
+        assert_eq!(
+            infer_build(&loci),
+            BuildEvidence::Guessed {
+                build: GenomeBuild::Build38,
+                contested: false
+            }
+        );
+        for key in [
+            VariantKey::new("X", 2_700_000),
+            VariantKey::new("Y", 57_000_000),
+        ] {
+            let loci = VariantLoci::from_keys(&[VariantKey::new("X", 1_000_000), key]);
+            assert_eq!(
+                infer_build(&loci),
+                BuildEvidence::Guessed {
+                    build: GenomeBuild::Build38,
+                    contested: true
+                }
+            );
+        }
     }
 
     /// hg38 non-PAR X ends below the Build38 threshold, so with PAR2 coded apart
@@ -1020,7 +1227,7 @@ mod tests {
             VariantKey::new("PAR2", 155_800_000),
         ];
         let loci = VariantLoci::from_keys(&keys);
-        assert_eq!(infer_build(&loci), GenomeBuild::Build38);
+        assert_eq!(infer_build(&loci).chosen(), Some(GenomeBuild::Build38));
 
         let selection = SexVariantSelection::from_loci(&loci, GenomeBuild::Build38);
         assert_eq!(selection.indices, vec![0, 1, 2, 3, 5]);
@@ -1601,7 +1808,9 @@ mod tests {
         ]);
         x_positions.sort_unstable();
         rows.extend(x_positions.into_iter().map(|pos| ("X".to_string(), pos)));
-        let mut y_positions: Vec<u64> = (0..300u64).map(|i| 5_000 + i * 200_000).collect();
+        // The fixture is GRCh38, so its Y rows stay within GRCh38's chrY
+        // (57,227,415 bp); a Y position past that would prove GRCh37 instead.
+        let mut y_positions: Vec<u64> = (0..300u64).map(|i| 5_000 + i * 190_000).collect();
         y_positions.extend([
             10_000, 10_001, 2_781_479, 2_781_480, 56_887_902, 56_887_903, 57_217_415, 57_217_416,
         ]);
@@ -1663,7 +1872,7 @@ mod tests {
             let keys = dataset.variant_keys_for_plan(&SelectionPlan::All)?;
             let loci = VariantLoci::from_keys(&keys);
             assert_eq!(VariantLoci::from_bim(plink)?, loci);
-            let build = infer_build(&loci);
+            let build = infer_build(&loci).chosen().expect("the fixture proves one build");
             assert_eq!(build, GenomeBuild::Build38);
             let selection = SexVariantSelection::from_loci(&loci, build);
             let expected = collect_inference(&dataset, &selection, false)?;
@@ -1699,9 +1908,35 @@ mod tests {
     #[test]
     fn bim_loci_classify_labels_like_normalized_keys() -> Result<(), Box<dyn std::error::Error>> {
         let labels = [
-            "1", "01", "+1", "chr1", "CHR01", "chrchr1", "22", "23", "+23", "chr+23", "024", "x",
-            "chrX", "ChRx", "chrchrX", "X", "Y", "chry", "25", "XY", "PAR1", "MT", "chrM", "0",
-            "-1", "256", "chrUn_gl000220", "1", "X",
+            "1",
+            "01",
+            "+1",
+            "chr1",
+            "CHR01",
+            "chrchr1",
+            "22",
+            "23",
+            "+23",
+            "chr+23",
+            "024",
+            "x",
+            "chrX",
+            "ChRx",
+            "chrchrX",
+            "X",
+            "Y",
+            "chry",
+            "25",
+            "XY",
+            "PAR1",
+            "MT",
+            "chrM",
+            "0",
+            "-1",
+            "256",
+            "chrUn_gl000220",
+            "1",
+            "X",
         ];
         let dir = tempdir()?;
         let prefix = dir.path().join("labels");
