@@ -6408,10 +6408,16 @@ fn ld_pair_r2_estimate(stats: &LdPairStats) -> f64 {
 ///
 /// `fill_pairs` writes the strictly lower triangle into a zeroed matrix, which
 /// with the ridged diagonal is exactly the factor `Llt::new(system,
-/// Side::Lower)` copies out of a symmetric system before factoring it. The
-/// factorization and the two triangular solves are the ones `Llt::new` and
-/// `Llt::solve` run, with the same parallelism, so the weights keep every bit
-/// without the symmetric system being assembled or copied.
+/// Side::Lower)` copies out of a symmetric system before factoring it, so the
+/// symmetric system is never assembled or copied.
+///
+/// The factorization and both triangular solves run sequentially, whatever the
+/// fit's parallelism. Windows are already solved concurrently, a task each, and
+/// a parallel factorization nested faer's scheduler inside that one: on a
+/// 562k-marker array a third of the stage's cycles went to threads coordinating
+/// with nothing to do. It also tied the weights to the thread count, because a
+/// blocked Cholesky splits its trailing updates by `Par`. Solved sequentially,
+/// every window runs the same arithmetic however many threads the fit has.
 fn solve_ld_system(
     size: usize,
     first_center: usize,
@@ -6419,7 +6425,7 @@ fn solve_ld_system(
     ridge: f64,
     fill_pairs: impl Fn(MatMut<'_, f64>) -> Result<(), HwePcaError>,
 ) -> Result<(), HwePcaError> {
-    let par = get_global_parallelism();
+    let par = Par::Seq;
     let mut adjusted_ridge = ridge;
     for attempt in 0..2 {
         if size == 0 {
@@ -7761,6 +7767,82 @@ mod tests {
             .map(|(lhs, rhs)| (lhs - rhs).abs())
             .fold(0.0, f64::max);
         assert!(max_diff < 1.0e-9, "max difference was {max_diff}");
+    }
+
+    #[test]
+    fn ld_weights_do_not_depend_on_the_thread_count() {
+        // Windows wide enough for a blocked Cholesky to split its trailing
+        // updates, over genotypes that share one latent factor, so that every
+        // system is far from the identity.
+        let n_samples = 48;
+        let observed_variants = 320;
+        let window = 257;
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let factors: Vec<u64> = (0..n_samples).map(|_| next() % 3).collect();
+        let mut data = Vec::with_capacity(n_samples * observed_variants);
+        for _ in 0..observed_variants {
+            let flipped = next() % 2 == 1;
+            for &factor in &factors {
+                let call = if next() % 4 == 0 { next() % 3 } else { factor };
+                let call = if flipped { 2 - call } else { call };
+                data.push(call as f64);
+            }
+        }
+
+        let scaler = make_simple_scaler(&data, n_samples);
+        let config = LdResolvedConfig {
+            window: LdResolvedWindow::Sites {
+                size: window,
+                ranges: compute_ld_site_ranges(&single_chromosome_keys(observed_variants), window),
+            },
+            ridge: DEFAULT_LD_RIDGE,
+        };
+        let weights_with = |threads: usize| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("thread pool")
+                .install(|| {
+                    let mut source = DenseBlockSource::new(&data, n_samples, observed_variants)
+                        .expect("dense source");
+                    let progress = Arc::new(NoopFitProgress);
+                    compute_ld_weights(
+                        &mut source,
+                        &scaler,
+                        observed_variants,
+                        64,
+                        config.clone(),
+                        observed_variants,
+                        &progress,
+                        Par::rayon(threads),
+                    )
+                    .expect("ld weights")
+                    .weights
+                })
+        };
+
+        let serial = weights_with(1);
+        assert!(
+            serial.iter().any(|weight| (weight - 1.0).abs() > 1.0e-3),
+            "the fixture must carry real LD, or every system is the identity"
+        );
+        for threads in [2, 3, 8] {
+            let parallel = weights_with(threads);
+            assert_eq!(serial.len(), parallel.len());
+            for (variant, (lhs, rhs)) in serial.iter().zip(&parallel).enumerate() {
+                assert_eq!(
+                    lhs.to_bits(),
+                    rhs.to_bits(),
+                    "variant {variant}: {lhs:e} at 1 thread, {rhs:e} at {threads} threads"
+                );
+            }
+        }
     }
 
     /// Standardizes a raw genotype matrix the way the fit does, keeping the
