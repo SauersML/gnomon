@@ -62,6 +62,12 @@ summary counts. Both pseudoautosomal (PAR) and non-PAR Y variants are tracked
 and written to `sex.tsv`; the upstream algorithm uses non-PAR Y density for its
 decision metrics while still surfacing PAR counts for QC.
 
+Calls are counted as plink2 imports them. Wherever a VCF or BCF record has GT,
+its calls are read, whatever DS or GP sits beside them, and a haploid call counts
+as homozygous. In a record with only DS or GP, a dosage within 0.1 of an allele
+count is that call (plink2's default `--hard-call-threshold`), and any other
+dosage is a missing call.
+
 Before processing, gnomon inspects the maximum observed X-chromosome position to
 automatically select between the GRCh37 and GRCh38 coordinate systems. This is
 important because the reference position threshold for pseudoautosomal boundary
@@ -97,6 +103,9 @@ pipelines without shelling out to the CLI.
   autosomal variant after selection; Y evidence is optional to support X-only
   datasets. Runs missing the autosomal baseline terminate with a clear error
   instead of synthesizing placeholder labels.
+* **Dosages without calls on X, Y or MT.** Such a record cannot say whether a
+  male's dosage is on the 0..1 or the 0..2 scale, so it is refused, as plink2
+  refuses it. Add GT to the file.
 * **Unsupported chromosome labels.** Only chromosome labels recognised as X or Y
   contribute to the inference. Everything else—including haploid or mitochondrial
   contigs—is ignored.

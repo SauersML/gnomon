@@ -510,6 +510,130 @@ fn a_panel_where_every_sample_calls_chry_is_called_on_x_in_every_format() {
     );
 }
 
+const DS_HEADER: &str =
+    r#"##FORMAT=<ID=DS,Number=A,Type=Float,Description="Alternate allele dosage">"#;
+
+/// The dosages an imputation server writes beside its calls: near them, and
+/// for a heterozygote rarely exactly 1.
+fn imputed_dosage(call: &str) -> &'static str {
+    match call {
+        "." => ".",
+        "0" => "0.01",
+        "1" => "0.98",
+        "0|0" => "0.02",
+        "0|1" | "1|0" => "0.97",
+        "1|1" => "1.95",
+        other => panic!("unexpected call {other}"),
+    }
+}
+
+/// A dosage too far from every allele count to import as any call.
+fn uncertain_dosage(call: &str) -> &'static str {
+    if call == "." { "." } else { "0.5" }
+}
+
+/// Where a record has calls, a sex check counts them, as plink2's VCF import
+/// reads them, whatever dosage sits beside them: a DS field must not change the
+/// table, with or without chrY.
+#[test]
+fn a_dosage_beside_the_call_does_not_change_the_table() {
+    let dir = tempfile::tempdir().unwrap();
+    for keep_y in [true, false] {
+        let calls_only = dir.path().join(format!("calls_{keep_y}"));
+        stage_vcf(&calls_only, &edit_vcf(|fields| keep_y || fields[0] != "Y"));
+        let expected = infer(&calls_only, "bed");
+        assert_recorded_sex(&expected, "calls");
+
+        let dosages: [(&str, fn(&str) -> &'static str); 2] =
+            [("imputed", imputed_dosage), ("uncertain", uncertain_dosage)];
+        for (name, dosage) in dosages {
+            let (mut header, mut records) = fixture_vcf();
+            header.insert(header.len() - 1, DS_HEADER.to_string());
+            records.retain(|fields| keep_y || fields[0] != "Y");
+            for fields in &mut records {
+                fields[8] = "GT:DS".to_string();
+                for call in &mut fields[9..] {
+                    *call = format!("{call}:{}", dosage(call));
+                }
+            }
+            let stage = dir.path().join(format!("{name}_{keep_y}"));
+            stage_vcf(&stage, &vcf_text(&header, &records));
+            let context = format!("{name} DS beside the calls, Y kept: {keep_y}");
+            assert_eq!(infer(&stage, "vcf"), expected, "vcf, {context}");
+            assert_eq!(infer(&stage, "bcf"), expected, "bcf, {context}");
+        }
+    }
+}
+
+/// A record without GT has only its dosages, which import as plink2 imports
+/// them by default: each as the nearest allele count within 0.1, and otherwise
+/// as a missing call. plink2 2.0.0-a.7.5 imports DS 0.05, 0.09, 0.91, 1.09 and
+/// 1.91 as 0/0, 0/0, 0/1, 0/1 and 1/1, and 0.11, 0.5, 0.89, 1.11 and 1.89 as
+/// missing. On X, Y and MT such a record cannot say whether a dosage is on the
+/// 0..1 or the 0..2 scale, and plink2 refuses it; so does sex inference.
+#[test]
+fn a_dosage_without_a_call_imports_as_the_nearest_call() {
+    let (mut header, records) = fixture_vcf();
+    let uncertain = |row: usize, slot: usize| (row + slot) % 7 == 0;
+    let dir = tempfile::tempdir().unwrap();
+
+    // The calls, missing where the autosomal dosage below is uncertain.
+    let mut calls = records.clone();
+    for (row, fields) in calls.iter_mut().enumerate() {
+        if fields[0] == "22" {
+            for (slot, call) in fields[9..].iter_mut().enumerate() {
+                if uncertain(row, slot) {
+                    *call = ".".to_string();
+                }
+            }
+        }
+    }
+    let calls_only = dir.path().join("calls");
+    stage_vcf(&calls_only, &vcf_text(&header, &calls));
+    let expected = infer(&calls_only, "bed");
+    assert_recorded_sex(&expected, "calls");
+
+    header.insert(header.len() - 1, DS_HEADER.to_string());
+    let only_dosages = |chromosome: &str| -> String {
+        let mut dosages = records.clone();
+        for (row, fields) in dosages.iter_mut().enumerate() {
+            if fields[0] != chromosome {
+                continue;
+            }
+            fields[8] = "DS".to_string();
+            for (slot, call) in fields[9..].iter_mut().enumerate() {
+                let dosage = match call.as_str() {
+                    "." => ".",
+                    _ if uncertain(row, slot) => "0.5",
+                    "0" | "0|0" => "0.08",
+                    "0|1" | "1|0" => "1.09",
+                    "1" | "1|1" => "1.91",
+                    other => panic!("unexpected call {other}"),
+                };
+                *call = dosage.to_string();
+            }
+        }
+        vcf_text(&header, &dosages)
+    };
+
+    let stage = dir.path().join("autosomal_dosages");
+    stage_vcf(&stage, &only_dosages("22"));
+    assert_eq!(infer(&stage, "vcf"), expected, "vcf");
+    assert_eq!(infer(&stage, "bcf"), expected, "bcf");
+
+    let stage = dir.path().join("x_dosages");
+    stage_vcf(&stage, &only_dosages("X"));
+    for extension in ["vcf", "bcf"] {
+        let err = infer_sex_to_tsv_at(
+            &stage.join(format!("in.{extension}")),
+            Some(GenomeBuild::Build38),
+            &stage.join(format!("sex.{extension}.tsv")),
+        )
+        .expect_err("X dosages without GT");
+        assert!(err.to_string().contains("without GT"), "{extension}: {err}");
+    }
+}
+
 /// The first sample the .psam records as female, whose X heterozygous calls a
 /// label-driven haploid rule would erase.
 fn relabel_female_candidate(psam: &str) -> String {

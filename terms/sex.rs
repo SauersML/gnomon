@@ -635,9 +635,12 @@ fn collect_inference(
     let mut block_source =
         dataset.block_source_with_plan(SelectionPlan::ByIndices(selection.indices.clone()))?;
     // A haploid call is hemizygous, never heterozygous. Read it as the homozygous
-    // call a PLINK import makes of it, so a dosage of 1.0 below means two alleles.
+    // call a PLINK import makes of it, so a call of 1 below means two alleles.
+    // Where a record has calls, read them, not the dosage beside them, as
+    // plink2's VCF import does.
     if let DatasetBlockSource::Variants(source) = &mut block_source {
         source.count_haploid_calls_as_homozygous();
+        source.read_calls_over_dosages();
     }
     let total_variants = selection.keys.len();
     let block_capacity = 256usize;
@@ -670,15 +673,13 @@ fn collect_inference(
             let column_offset = local_idx * n_samples;
 
             for sample_idx in 0..n_samples {
-                let dosage = storage[column_offset + sample_idx];
-                if dosage.is_nan() {
+                let Some(call) = hard_call(storage[column_offset + sample_idx]) else {
                     continue;
-                }
-                let is_het = dosage == 1.0;
+                };
                 let info = VariantInfo {
                     chrom,
                     pos,
-                    is_heterozygous: is_het,
+                    is_heterozygous: call == 1.0,
                 };
                 accumulators[sample_idx].process_variant(&info);
             }
@@ -707,6 +708,18 @@ fn collect_inference(
             }),
         &platform,
     )
+}
+
+/// plink2's default `--hard-call-threshold`: a dosage farther than this from
+/// every allele count imports as a missing call.
+const HARD_CALL_THRESHOLD: f64 = 0.1;
+
+/// The call a dosage imports as in plink2: the allele count nearest to it, if
+/// within [`HARD_CALL_THRESHOLD`], and otherwise none. A call decoded from GT is
+/// an allele count already, and imports as itself.
+fn hard_call(dosage: f64) -> Option<f64> {
+    let call = dosage.round();
+    ((dosage - call).abs() <= HARD_CALL_THRESHOLD).then_some(call)
 }
 
 /// [`collect_inference`] for PLINK 1 filesets: one, or several read as one, each

@@ -4014,6 +4014,9 @@ pub struct VcfLikeVariantBlockSource {
     /// Whether a one-allele call decodes on the diploid scale, as the homozygous
     /// call PLINK imports it as. Off by default, so dosages stay allele counts.
     haploid_calls_as_homozygous: bool,
+    /// Whether a record carrying GT decodes its calls, leaving DS and GP to the
+    /// records without GT. Off by default, so a dosage wins wherever it exists.
+    calls_over_dosages: bool,
     sample_names: Arc<Vec<String>>,
     n_samples: usize,
     variant_count: Arc<VariantCountTracker>,
@@ -4686,6 +4689,7 @@ impl VcfLikeVariantBlockSource {
             current_alt_alleles: Vec::new(),
             prefer_ds: false,
             haploid_calls_as_homozygous: false,
+            calls_over_dosages: false,
             sample_names,
             n_samples,
             variant_count,
@@ -4999,6 +5003,14 @@ impl VcfLikeVariantBlockSource {
         self.haploid_calls_as_homozygous = true;
     }
 
+    /// Decodes GT wherever a record carries it, and DS or GP only in records
+    /// without GT, refusing those on X, Y and MT. A sex check counts
+    /// heterozygous calls, and an imputed heterozygote's dosage is rarely exactly
+    /// 1.0; plink2's VCF import reads the calls, and refuses the same records.
+    pub fn read_calls_over_dosages(&mut self) {
+        self.calls_over_dosages = true;
+    }
+
     fn progress_bytes(&self) -> Option<(u64, Option<u64>)> {
         if matches!(self.selection_plan, SelectionPlan::ByKeys(_)) {
             return None;
@@ -5034,7 +5046,7 @@ impl VcfLikeVariantBlockSource {
             ));
         }
 
-        match self.format {
+        let decoded_calls = match self.format {
             Some(VariantFormat::Vcf) => decode_vcf_record(
                 &self.vcf_record,
                 alt_index,
@@ -5042,8 +5054,9 @@ impl VcfLikeVariantBlockSource {
                 self.n_samples,
                 self.prefer_ds,
                 self.haploid_calls_as_homozygous,
+                self.calls_over_dosages,
                 dest,
-            ),
+            )?,
             Some(VariantFormat::Bcf) => {
                 let header = self
                     .header
@@ -5057,13 +5070,56 @@ impl VcfLikeVariantBlockSource {
                     self.n_samples,
                     self.prefer_ds,
                     self.haploid_calls_as_homozygous,
+                    self.calls_over_dosages,
                     dest,
-                )
+                )?
             }
-            None => Err(VariantIoError::Decode(
-                "variant stream format unknown".to_string(),
-            )),
+            None => {
+                return Err(VariantIoError::Decode(
+                    "variant stream format unknown".to_string(),
+                ));
+            }
+        };
+        if self.calls_over_dosages && !decoded_calls {
+            self.refuse_dosages_of_unknown_scale()?;
         }
+        Ok(())
+    }
+
+    /// Refuses a record decoded from its dosages alone on X, Y or MT, where a
+    /// male's call has one allele: nothing in the record says whether a dosage
+    /// is on the 0..1 or the 0..2 scale, so a caller counting calls cannot read
+    /// it. plink2 refuses to import such a record too.
+    fn refuse_dosages_of_unknown_scale(&self) -> Result<(), VariantIoError> {
+        let chromosome = match self.format {
+            Some(VariantFormat::Bcf) => {
+                let header = self
+                    .header
+                    .as_ref()
+                    .ok_or_else(|| VariantIoError::Decode("BCF header missing".to_string()))?;
+                self.bcf_record
+                    .reference_sequence_name(header.string_maps())
+                    .map_err(|err| {
+                        VariantIoError::Decode(format!(
+                            "failed to read BCF reference sequence: {err}"
+                        ))
+                    })?
+            }
+            _ => self.vcf_record.reference_sequence_name(),
+        };
+        let label = match chromosome.get(..3) {
+            Some(prefix) if prefix.eq_ignore_ascii_case("chr") => &chromosome[3..],
+            _ => chromosome,
+        };
+        if ["X", "Y", "M", "MT", "23", "24", "26"]
+            .iter()
+            .any(|name| label.eq_ignore_ascii_case(name))
+        {
+            return Err(VariantIoError::Decode(format!(
+                "a record on {chromosome} carries dosages without GT, and they do not say whether a call is on the 0..1 or the 0..2 scale; add GT to the file"
+            )));
+        }
+        Ok(())
     }
 
     /// Extract imputation quality score from the current variant's INFO field.
@@ -5998,6 +6054,8 @@ fn expected_dosage_from_gp_values(
     Ok(dosage)
 }
 
+/// Decodes one ALT's dosages into `dest`, returning false when the record has
+/// dosages but no GT.
 fn decode_vcf_record(
     record: &VcfRecord,
     alt_index: usize,
@@ -6005,13 +6063,14 @@ fn decode_vcf_record(
     n_samples: usize,
     prefer_ds: bool,
     haploid_calls_as_homozygous: bool,
+    calls_over_dosages: bool,
     dest: &mut [f64],
-) -> Result<(), VariantIoError> {
+) -> Result<bool, VariantIoError> {
     dest[..n_samples].fill(f64::NAN);
 
     let samples = record.samples();
     if samples.is_empty() {
-        return Ok(());
+        return Ok(true);
     }
 
     let mut ds_index = None;
@@ -6029,6 +6088,10 @@ fn decode_vcf_record(
         if gt_index.is_none() && key == key::GENOTYPE {
             gt_index = Some(idx);
         }
+    }
+    if calls_over_dosages && gt_index.is_some() {
+        ds_index = None;
+        gp_index = None;
     }
 
     let dosage_format_present = prefer_ds && (ds_index.is_some() || gp_index.is_some());
@@ -6090,9 +6153,10 @@ fn decode_vcf_record(
         }
     }
 
-    Ok(())
+    Ok(gt_idx.is_some())
 }
 
+/// [`decode_vcf_record`] for a BCF record.
 fn decode_bcf_record(
     record: &BcfRecord,
     header: &vcf::Header,
@@ -6101,8 +6165,9 @@ fn decode_bcf_record(
     n_samples: usize,
     prefer_ds: bool,
     haploid_calls_as_homozygous: bool,
+    calls_over_dosages: bool,
     dest: &mut [f64],
-) -> Result<(), VariantIoError> {
+) -> Result<bool, VariantIoError> {
     dest[..n_samples].fill(f64::NAN);
 
     let samples = record
@@ -6110,7 +6175,7 @@ fn decode_bcf_record(
         .map_err(|err| VariantIoError::Decode(format!("failed to access BCF samples: {err}")))?;
 
     if samples.format_count() == 0 {
-        return Ok(());
+        return Ok(true);
     }
 
     let mut gt_series = None;
@@ -6138,6 +6203,10 @@ fn decode_bcf_record(
             "BCF record is missing GT, DS, or GP FORMAT fields".to_string(),
         ));
     }
+    if calls_over_dosages && gt_series.is_some() {
+        ds_series = None;
+        gp_series = None;
+    }
     if let Some(series) = &gt_series {
         decode_bcf_genotype_series(series, header, alt_index, alt_count, dest)?;
     }
@@ -6162,7 +6231,7 @@ fn decode_bcf_record(
         }
     }
 
-    Ok(())
+    Ok(gt_series.is_some())
 }
 
 fn decode_bcf_numeric_series(
