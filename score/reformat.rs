@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::num::ParseIntError;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -786,16 +786,16 @@ pub fn reformat_pgs_file(
     // the sort in file order, as before, so equal keys land in the same order.
     lines_to_sort.par_sort_unstable_by_key(|item| item.key);
 
-    let out_file = File::create(output_path)?;
-    let mut writer = BufWriter::with_capacity(1 << 20, out_file);
-    writeln!(
-        writer,
-        "variant_id\teffect_allele\tother_allele\t{score_label}"
-    )?;
-    for item in &lines_to_sort {
-        writer.write_all(&resolved_chunks[item.chunk].rows[item.start..item.end])?;
-    }
-    writer.flush()?;
+    crate::output::write_atomically(output_path, |writer| {
+        writeln!(
+            writer,
+            "variant_id\teffect_allele\tother_allele\t{score_label}"
+        )?;
+        for item in &lines_to_sort {
+            writer.write_all(&resolved_chunks[item.chunk].rows[item.start..item.end])?;
+        }
+        Ok(())
+    })?;
 
     // --- Report any non-fatal issues to the user ---
     let skip_summary = if !skipped_records.is_empty() {
@@ -944,11 +944,13 @@ pub fn sort_native_file(input_path: &Path, output_path: &Path) -> Result<(), Ref
             && file.read_to_end(&mut data).is_ok()
             && let Some(missing_final_newline) = native_file_already_sorted(&data)
         {
-            let mut out_file = File::create(output_path)?;
-            out_file.write_all(&data)?;
-            if missing_final_newline {
-                out_file.write_all(b"\n")?;
-            }
+            crate::output::write_atomically(output_path, |writer| {
+                writer.write_all(&data)?;
+                if missing_final_newline {
+                    writer.write_all(b"\n")?;
+                }
+                Ok(())
+            })?;
             return Ok(());
         }
     }
@@ -1054,17 +1056,17 @@ pub fn sort_native_file(input_path: &Path, output_path: &Path) -> Result<(), Ref
 
     lines_to_sort.par_sort_unstable_by_key(|item| item.key);
 
-    let out_file = File::create(output_path)?;
-    let mut writer = BufWriter::new(out_file);
-    // Write back any metadata lines that were present.
-    for meta_line in header_lines {
-        writeln!(writer, "{meta_line}")?;
-    }
-    writeln!(writer, "{header}")?;
-    for item in lines_to_sort {
-        writeln!(writer, "{}", item.line_data)?;
-    }
-    writer.flush()?;
+    crate::output::write_atomically(output_path, |writer| {
+        // Write back any metadata lines that were present.
+        for meta_line in &header_lines {
+            writeln!(writer, "{meta_line}")?;
+        }
+        writeln!(writer, "{header}")?;
+        for item in &lines_to_sort {
+            writeln!(writer, "{}", item.line_data)?;
+        }
+        Ok(())
+    })?;
     Ok(())
 }
 
