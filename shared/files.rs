@@ -225,17 +225,52 @@ pub trait ByteRangeSource: Send + Sync {
 pub struct BedSource {
     byte_source: Arc<dyn ByteRangeSource>,
     mmap: Option<Arc<Mmap>>,
+    /// Exact range requests against a remote `.bed`, from which read plans are built.
+    fetch: Option<SegmentFetch>,
 }
 
 impl BedSource {
     fn new(byte_source: Arc<dyn ByteRangeSource>, mmap: Option<Arc<Mmap>>) -> Self {
-        Self { byte_source, mmap }
+        Self {
+            byte_source,
+            mmap,
+            fetch: None,
+        }
     }
 
     pub fn from_byte_source(byte_source: Arc<dyn ByteRangeSource>) -> Self {
         Self {
             byte_source,
             mmap: None,
+            fetch: None,
+        }
+    }
+
+    /// Whether [`Self::with_read_plan`] restricts and prefetches rows.
+    pub fn supports_read_plan(&self) -> bool {
+        self.fetch.is_some()
+    }
+
+    /// This BED serving only `rows`, planned in the order they will be read,
+    /// with the ranges ahead of the reader fetched concurrently. Reads outside
+    /// those rows fail. A source without a range fetcher, such as a local
+    /// mapping, already serves any row and is returned unchanged.
+    pub fn with_read_plan(&self, rows: &[u64], row_bytes: u64) -> Result<Self, PipelineError> {
+        let Some(fetch) = &self.fetch else {
+            return Ok(self.clone());
+        };
+        let plan = BedReadPlan::new(rows, row_bytes, self.len())?;
+        Ok(self.with_reader(PlannedReader::new(plan, Arc::clone(fetch))))
+    }
+
+    fn with_reader(&self, reader: PlannedReader) -> Self {
+        Self {
+            byte_source: Arc::new(PlannedByteRangeSource {
+                reader,
+                len: self.len(),
+            }),
+            mmap: None,
+            fetch: self.fetch.clone(),
         }
     }
 
@@ -300,17 +335,23 @@ pub fn open_bed_source(
             .ok_or_else(|| PipelineError::Io("Invalid UTF-8 in path".to_string()))?;
         let (bucket, object) = parse_gcs_uri(uri)?;
         let remote = RemoteByteRangeSource::new(&bucket, &object)?;
-        let source = BedSource::new(Arc::new(remote), None);
-        validate_bed_source_header(path, &source)?;
-        Ok(source)
+        let fetcher = Arc::clone(&remote.fetcher);
+        remote_bed_source(
+            path,
+            Arc::new(remote),
+            Arc::new(move |start, length| fetcher.fetch(start, length)),
+        )
     } else if is_http_path(path) {
         let url = path
             .to_str()
             .ok_or_else(|| PipelineError::Io("Invalid UTF-8 in path".to_string()))?;
         let remote = HttpByteRangeSource::new(url)?;
-        let source = BedSource::new(Arc::new(remote), None);
-        validate_bed_source_header(path, &source)?;
-        Ok(source)
+        let fetcher = Arc::clone(&remote.fetcher);
+        remote_bed_source(
+            path,
+            Arc::new(remote),
+            Arc::new(move |start, length| fetcher.fetch(start, length)),
+        )
     } else {
         let file = File::open(path)
             .map_err(|e| PipelineError::Io(format!("Opening {}: {e}", path.display())))?;
@@ -323,6 +364,37 @@ pub fn open_bed_source(
         let byte_source = Arc::new(MmapByteRangeSource::new(Arc::clone(&mmap)));
         Ok(BedSource::new(byte_source, Some(mmap)))
     }
+}
+
+/// A remote `.bed` no larger than one block is read whole when opened: one
+/// request serves its header and every row, as the block reader's first block
+/// did, and no plan can need fewer. A larger one keeps its range fetcher so
+/// that callers can plan exact row reads, and its header is checked with one
+/// three-byte request rather than a block of genotypes.
+fn remote_bed_source(
+    path: &Path,
+    byte_source: Arc<dyn ByteRangeSource>,
+    fetch: SegmentFetch,
+) -> Result<BedSource, PipelineError> {
+    let len = byte_source.len();
+    let whole = len <= REMOTE_BLOCK_SIZE as u64;
+    let header = match len {
+        0..3 => Vec::new(),
+        _ if whole => fetch(0, len as usize)?,
+        _ => fetch(0, 3)?,
+    };
+    validate_plink_bed_header(&header, path).map_err(PipelineError::Io)?;
+    if whole {
+        return Ok(BedSource::new(
+            Arc::new(MemoryByteRangeSource { bytes: header }),
+            None,
+        ));
+    }
+    Ok(BedSource {
+        byte_source,
+        mmap: None,
+        fetch: Some(fetch),
+    })
 }
 
 fn planned_reader(
@@ -384,35 +456,13 @@ pub fn open_bed_source_for_scoring(
         return Ok(source);
     }
     if !is_pgen_path(path) {
-        let uri = path
-            .to_str()
-            .ok_or_else(|| PipelineError::Io("Invalid UTF-8 in path".into()))?;
-        let remote: Arc<dyn ByteRangeSource> = if is_gcs_path(path) {
-            let (bucket, object) = parse_gcs_uri(uri)?;
-            let mut source =
-                RemoteByteRangeSource::with_block_size(&bucket, &object, BedReadPlan::MAX_RANGE)?;
-            let fetcher = Arc::clone(&source.fetcher);
-            source.planned = Some(planned_reader(
-                Arc::new(move |start, length| fetcher.fetch(start, length)),
-                source.fetcher.len,
-                required_rows,
-                bytes_per_variant,
-            )?);
-            Arc::new(source)
-        } else {
-            let mut source = HttpByteRangeSource::with_block_size(uri, BedReadPlan::MAX_RANGE)?;
-            let fetcher = Arc::clone(&source.fetcher);
-            source.planned = Some(planned_reader(
-                Arc::new(move |start, length| fetcher.fetch(start, length)),
-                source.fetcher.len,
-                required_rows,
-                bytes_per_variant,
-            )?);
-            Arc::new(source)
+        let source = open_bed_source(path, genome_build)?;
+        // A small object was read whole when opened and already serves every row.
+        let Some(fetch) = source.fetch.clone() else {
+            return Ok(source);
         };
-        let source = BedSource::new(remote, None);
-        validate_bed_source_header(path, &source)?;
-        return Ok(source);
+        let reader = planned_reader(fetch, source.len(), required_rows, bytes_per_variant)?;
+        return Ok(source.with_reader(reader));
     }
     let genome_build = genome_build.ok_or_else(|| {
         PipelineError::Io(
@@ -594,12 +644,6 @@ fn open_pgen_as_bed_source(
         genome_build,
     )?;
     Ok(BedSource::new(virtual_plink.bed_source(), None))
-}
-
-fn validate_bed_source_header(path: &Path, source: &BedSource) -> Result<(), PipelineError> {
-    let mut header = [0u8; 3];
-    source.read_at(0, &mut header)?;
-    validate_plink_bed_header(&header, path).map_err(PipelineError::Io)
 }
 
 pub fn validate_plink_bed_header(header: &[u8], path: &Path) -> Result<(), String> {
@@ -1498,6 +1542,57 @@ impl ByteRangeSource for MmapByteRangeSource {
     }
 }
 
+/// A remote object small enough to have been read whole, served from memory.
+struct MemoryByteRangeSource {
+    bytes: Vec<u8>,
+}
+
+impl ByteRangeSource for MemoryByteRangeSource {
+    fn len(&self) -> u64 {
+        self.bytes.len() as u64
+    }
+
+    fn read_at(&self, offset: u64, dst: &mut [u8]) -> Result<(), PipelineError> {
+        let range = usize::try_from(offset)
+            .ok()
+            .and_then(|start| Some(start..start.checked_add(dst.len())?))
+            .filter(|range| range.end <= self.bytes.len())
+            .ok_or_else(|| {
+                PipelineError::Io(format!(
+                    "Attempted to read past end of remote BED (offset {offset}, len {})",
+                    dst.len()
+                ))
+            })?;
+        dst.copy_from_slice(&self.bytes[range]);
+        Ok(())
+    }
+}
+
+/// Serves the rows of a read plan, and only those, from prefetched ranges.
+struct PlannedByteRangeSource {
+    reader: PlannedReader,
+    len: u64,
+}
+
+impl ByteRangeSource for PlannedByteRangeSource {
+    fn len(&self) -> u64 {
+        self.len
+    }
+
+    fn read_at(&self, offset: u64, dst: &mut [u8]) -> Result<(), PipelineError> {
+        if offset
+            .checked_add(dst.len() as u64)
+            .is_none_or(|end| end > self.len)
+        {
+            return Err(PipelineError::Io(format!(
+                "Attempted to read past end of remote BED (offset {offset}, len {})",
+                dst.len()
+            )));
+        }
+        self.reader.read_at(offset, dst)
+    }
+}
+
 struct LocalTextSource {
     reader: BufReader<File>,
     line: Vec<u8>,
@@ -1806,8 +1901,6 @@ struct RemoteByteRangeSource {
     cache: Mutex<RemoteCache>,
     /// Fetch granularity. See `REMOTE_SPARSE_BLOCK_SIZE`.
     block_size: usize,
-    /// Exact-row prefetching for scoring; replaces block caching when set.
-    planned: Option<PlannedReader>,
 }
 
 impl RemoteByteRangeSource {
@@ -1879,7 +1972,6 @@ impl RemoteByteRangeSource {
             }),
             cache: Mutex::new(RemoteCache::new(cache_capacity_for(block_size))),
             block_size,
-            planned: None,
         })
     }
 
@@ -2131,13 +2223,8 @@ impl ByteRangeSource for RemoteByteRangeSource {
         let block_size = self.block_size as u64;
 
         while remaining > 0 {
-            let (block_start, block) = match &self.planned {
-                Some(reader) => reader.range_at(current_offset)?,
-                None => {
-                    let block_start = (current_offset / block_size) * block_size;
-                    (block_start, self.ensure_block(block_start)?)
-                }
-            };
+            let block_start = (current_offset / block_size) * block_size;
+            let block = self.ensure_block(block_start)?;
             let within_block = (current_offset - block_start) as usize;
             if within_block >= block.len() {
                 return Err(PipelineError::Io(format!(
@@ -2155,10 +2242,7 @@ impl ByteRangeSource for RemoteByteRangeSource {
 
             // Read-ahead only pays off when the caller is sweeping the object.
             // For sparse record reads it would double the bytes transferred.
-            if self.planned.is_none()
-                && self.block_size == REMOTE_BLOCK_SIZE
-                && within_block + to_copy == block.len()
-            {
+            if self.block_size == REMOTE_BLOCK_SIZE && within_block + to_copy == block.len() {
                 let next_start = block_start + block_size;
                 if next_start < self.fetcher.len {
                     let _ = self.ensure_block(next_start);
@@ -2182,8 +2266,6 @@ struct HttpByteRangeSource {
     cache: Mutex<RemoteCache>,
     /// Fetch granularity. See `REMOTE_SPARSE_BLOCK_SIZE`.
     block_size: usize,
-    /// Exact-row prefetching for scoring; replaces block caching when set.
-    planned: Option<PlannedReader>,
 }
 
 struct HttpStreamingReader {
@@ -2263,7 +2345,6 @@ impl HttpByteRangeSource {
             }),
             cache: Mutex::new(RemoteCache::new(cache_capacity_for(block_size))),
             block_size,
-            planned: None,
         })
     }
 
@@ -2425,13 +2506,8 @@ impl ByteRangeSource for HttpByteRangeSource {
         let block_size = self.block_size as u64;
 
         while remaining > 0 {
-            let (block_start, block) = match &self.planned {
-                Some(reader) => reader.range_at(current_offset)?,
-                None => {
-                    let block_start = (current_offset / block_size) * block_size;
-                    (block_start, self.ensure_block(block_start)?)
-                }
-            };
+            let block_start = (current_offset / block_size) * block_size;
+            let block = self.ensure_block(block_start)?;
             let within_block = (current_offset - block_start) as usize;
             if within_block >= block.len() {
                 return Err(PipelineError::Io(format!(
@@ -2448,7 +2524,7 @@ impl ByteRangeSource for HttpByteRangeSource {
             remaining -= to_copy;
             current_offset += to_copy as u64;
 
-            if self.planned.is_none() && within_block + to_copy == block.len() {
+            if within_block + to_copy == block.len() {
                 let next_start = block_start + block_size;
                 if next_start < self.fetcher.len {
                     let _ = self.ensure_block(next_start);
@@ -2655,25 +2731,85 @@ mod tests {
 
     #[test]
     fn scoring_remote_bed_skips_unrequired_rows() {
-        let length = 10_003;
+        // 100 rows of 100 KB exceed the one block in which a small object is read.
+        let length = 10_000_003;
         let (url, server) = serve_http_responses(vec![
             format!("HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"),
             format!(
                 "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-2/{length}\r\nContent-Length: 3\r\nConnection: close\r\n\r\n\u{006c}\u{001b}\u{0001}"
             ),
             format!(
-                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 9903-10002/{length}\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{}",
-                "a".repeat(100)
+                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 9900003-10000002/{length}\r\nContent-Length: 100000\r\nConnection: close\r\n\r\n{}",
+                "a".repeat(100_000)
             ),
         ]);
-        let source = open_bed_source_for_scoring(Path::new(&url), None, &[99], 100, 100, 0)
+        let source = open_bed_source_for_scoring(Path::new(&url), None, &[99], 100_000, 100, 0)
             .expect("planned remote BED source");
         let mut bytes = [0; 4];
-        source.read_at(9999, &mut bytes).expect("required row tail");
+        source.read_at(9_999_999, &mut bytes).expect("required row tail");
         assert_eq!(&bytes, b"aaaa");
-        source.read_at(9903, &mut bytes).expect("cached row start");
+        source.read_at(9_900_003, &mut bytes).expect("cached row start");
         assert!(source.read_at(3, &mut bytes).is_err());
         server.join().expect("only required media ranges");
+    }
+
+    #[test]
+    fn remote_bed_plans_rows_on_the_source_it_was_opened_with() {
+        let length = 10_000_003;
+        let (url, server) = serve_http_responses(vec![
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"),
+            format!("HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-2/{length}\r\nContent-Length: 3\r\nConnection: close\r\n\r\n\u{006c}\u{001b}\u{0001}"),
+            format!("HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 200003-300002/{length}\r\nContent-Length: 100000\r\nConnection: close\r\n\r\n{}", "b".repeat(100_000)),
+        ]);
+        let source = open_bed_source(Path::new(&url), None).expect("remote BED");
+        assert!(source.supports_read_plan());
+        let planned = source.with_read_plan(&[2], 100_000).expect("read plan");
+        let mut row = vec![0; 100_000];
+        planned.read_at(200_003, &mut row).expect("planned row");
+        assert!(row.iter().all(|&byte| byte == b'b'));
+        assert!(planned.read_at(300_003, &mut row).is_err());
+        assert!(planned.read_at(10_000_000, &mut [0; 4]).is_err());
+        server.join().expect("one length probe, one header range, one row range");
+
+        let mut file = NamedTempFile::new().expect("local BED");
+        file.write_all(&[0x6c, 0x1b, 0x01, 1, 2, 3, 4, 5, 6, 7, 8])
+            .expect("write BED");
+        let local = open_bed_source(file.path(), None).expect("local BED");
+        assert!(!local.supports_read_plan());
+        let unplanned = local.with_read_plan(&[1], 4).expect("no plan");
+        let mut other_row = [0; 4];
+        unplanned
+            .read_at(3, &mut other_row)
+            .expect("a mapping serves every row");
+        assert_eq!(other_row, [1, 2, 3, 4]);
+        assert!(unplanned.mmap().is_some());
+    }
+
+    #[test]
+    fn small_remote_bed_is_read_whole_with_one_request() {
+        let body = "\u{006c}\u{001b}\u{0001}abcdefgh";
+        let (url, server) = serve_http_responses(vec![
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            ),
+            format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-{}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len() - 1,
+                body.len(),
+                body.len()
+            ),
+        ]);
+        let source = open_bed_source_for_scoring(Path::new(&url), None, &[1], 4, 2, 0)
+            .expect("small remote BED");
+        server.join().expect("one length probe and one whole-object range");
+        assert!(!source.supports_read_plan());
+        let mut row = [0; 4];
+        source.read_at(3, &mut row).expect("unrequired row from memory");
+        assert_eq!(&row, b"abcd");
+        source.read_at(7, &mut row).expect("required row from memory");
+        assert_eq!(&row, b"efgh");
+        assert!(source.read_at(9, &mut row).is_err());
     }
 
     #[test]

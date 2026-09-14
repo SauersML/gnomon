@@ -1990,10 +1990,8 @@ impl PlinkDataset {
         let bim_path = bed_path.with_extension("bim");
         let fam_path = bed_path.with_extension("fam");
 
+        // Opening validates the header, locally and remotely alike.
         let bed = open_bed_source(&bed_path, None)?;
-        let mut header = [0u8; PLINK_HEADER_LEN as usize];
-        bed.read_at(0, &mut header)?;
-        validate_bed_header(&header)?;
 
         let samples = read_fam_records(&fam_path)?;
         if samples.is_empty() {
@@ -2652,6 +2650,9 @@ impl Iterator for PlinkVariantRecordIter {
 #[derive(Debug)]
 pub struct PlinkVariantBlockSource {
     bed: BedSource,
+    /// The rows this pass still reads, planned against a remote BED on first
+    /// read and dropped when the cursor rewinds.
+    planned: Option<BedSource>,
     bytes_per_variant: usize,
     physical_n_samples: usize,
     sample_selection: Option<Vec<usize>>,
@@ -2674,6 +2675,7 @@ impl PlinkVariantBlockSource {
     ) -> Self {
         Self {
             bed,
+            planned: None,
             bytes_per_variant,
             physical_n_samples: n_samples,
             sample_selection: None,
@@ -2684,6 +2686,31 @@ impl PlinkVariantBlockSource {
             cursor: 0,
             buffer: Vec::new(),
         }
+    }
+
+    /// Plans the rows from the cursor to the end of the pass against a remote
+    /// BED, so that requests cover only those rows and run ahead of the
+    /// decoder. A mapped BED is read directly and needs no plan.
+    fn plan_remote_rows(&mut self) -> Result<(), PlinkIoError> {
+        if self.planned.is_some() || !self.bed.supports_read_plan() {
+            return Ok(());
+        }
+        // Out-of-range indices stay out of the plan; the block that reaches
+        // one reports it before reading.
+        let rows: Vec<u64> = match &self.selection {
+            Some(indices) => indices
+                .iter()
+                .skip(self.cursor)
+                .filter(|&&index| index < self.total_variants)
+                .map(|&index| index as u64)
+                .collect(),
+            None => (self.cursor as u64..self.total_variants as u64).collect(),
+        };
+        self.planned = Some(
+            self.bed
+                .with_read_plan(&rows, self.bytes_per_variant as u64)?,
+        );
+        Ok(())
     }
 
     pub(crate) fn select_samples(&mut self, indices: Vec<usize>) -> Result<(), PlinkIoError> {
@@ -2718,6 +2745,7 @@ impl PlinkVariantBlockSource {
             self.sample_byte_masks = Some(masks);
         }
         self.cursor = 0;
+        self.planned = None;
         Ok(())
     }
 }
@@ -2740,6 +2768,7 @@ impl VariantBlockSource for PlinkVariantBlockSource {
 
     fn reset(&mut self) -> Result<(), Self::Error> {
         self.cursor = 0;
+        self.planned = None;
         Ok(())
     }
 
@@ -2751,6 +2780,7 @@ impl VariantBlockSource for PlinkVariantBlockSource {
         if max_variants == 0 {
             return Ok(0);
         }
+        self.plan_remote_rows()?;
         if let Some(selection) = &self.selection {
             let remaining = selection.len().saturating_sub(self.cursor);
             if remaining == 0 {
@@ -2866,7 +2896,8 @@ impl VariantBlockSource for PlinkVariantBlockSource {
 
                 let needed = block_bytes as usize;
                 self.buffer.resize(needed, 0);
-                self.bed.read_at(offset, &mut self.buffer[..])?;
+                let bed = self.planned.as_ref().unwrap_or(&self.bed);
+                bed.read_at(offset, &mut self.buffer[..])?;
 
                 let kinds_slice = self
                     .match_kinds
@@ -2937,7 +2968,8 @@ impl VariantBlockSource for PlinkVariantBlockSource {
             let needed = block_bytes as usize;
             self.buffer.resize(needed, 0);
 
-            self.bed.read_at(offset, &mut self.buffer[..])?;
+            let bed = self.planned.as_ref().unwrap_or(&self.bed);
+            bed.read_at(offset, &mut self.buffer[..])?;
 
             let table = decode_table();
             let nrows = self.n_samples();
@@ -6001,18 +6033,6 @@ fn normalize_pgen_paths(path: &Path) -> (PathBuf, PathBuf, PathBuf) {
     )
 }
 
-fn validate_bed_header(header: &[u8]) -> Result<(), PlinkIoError> {
-    match header {
-        [0x6c, 0x1b, 0x01] => Ok(()),
-        [0x6c, 0x1b, mode] => Err(PlinkIoError::InvalidHeader(format!(
-            "unsupported mode byte {mode:#04x} (only variant-major mode is supported)"
-        ))),
-        _ => Err(PlinkIoError::InvalidHeader(
-            "missing PLINK magic bytes 0x6c 0x1b".to_string(),
-        )),
-    }
-}
-
 fn read_fam_records(path: &Path) -> Result<Vec<SampleRecord>, PlinkIoError> {
     let mut reader = open_text_source(path)?;
     read_fam_records_from_source(path, &mut *reader)
@@ -6509,6 +6529,149 @@ mod tests {
                 assert_eq!(decoded, expected, "byte={byte:#04x}, mask={mask:#06b}");
             }
         }
+    }
+
+    /// Serves `object` to HTTP range requests, one thread per connection, and
+    /// records every requested inclusive byte range.
+    fn serve_object_ranges(object: Vec<u8>) -> (String, Arc<std::sync::Mutex<Vec<(u64, u64)>>>) {
+        use std::io::{BufRead, BufReader};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/remote.bed", listener.local_addr().unwrap());
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = Arc::clone(&requests);
+        let object = Arc::new(object);
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let (object, log) = (Arc::clone(&object), Arc::clone(&log));
+                std::thread::spawn(move || {
+                    let mut writer = stream.try_clone().unwrap();
+                    let mut reader = BufReader::new(stream);
+                    loop {
+                        let mut request = String::new();
+                        if reader.read_line(&mut request).unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let mut range = None;
+                        loop {
+                            let mut line = String::new();
+                            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                                return;
+                            }
+                            if line == "\r\n" {
+                                break;
+                            }
+                            if let Some(bounds) =
+                                line.to_ascii_lowercase().strip_prefix("range: bytes=")
+                            {
+                                let (start, end) = bounds.trim().split_once('-').unwrap();
+                                range = Some((start.parse::<u64>().unwrap(), end.parse::<u64>().unwrap()));
+                            }
+                        }
+                        let len = object.len();
+                        let response = match range {
+                            _ if request.starts_with("HEAD") => {
+                                format!("HTTP/1.1 200 OK\r\nContent-Length: {len}\r\n\r\n").into_bytes()
+                            }
+                            Some((start, end)) => {
+                                log.lock().unwrap().push((start, end));
+                                let mut response = format!(
+                                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{len}\r\nContent-Length: {}\r\n\r\n",
+                                    end - start + 1
+                                )
+                                .into_bytes();
+                                response.extend_from_slice(&object[start as usize..=end as usize]);
+                                response
+                            }
+                            None => b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n".to_vec(),
+                        };
+                        if writer.write_all(&response).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (url, requests)
+    }
+
+    #[test]
+    fn remote_plink_selection_requests_only_selected_rows_and_decodes_like_local() {
+        let dir = tempdir().unwrap();
+        let bed_path = dir.path().join("remote.bed");
+        // 8,001 samples leave a partial final byte in every row, and 4,200
+        // rows make the object larger than the one block a remote BED is
+        // read whole below.
+        let (n_samples, bytes_per_variant, n_variants) = (8_001usize, 2_001usize, 4_200usize);
+        let mut object = vec![0x6c, 0x1b, 0x01];
+        for variant in 0..n_variants {
+            let codes: Vec<u8> = (0..n_samples)
+                .map(|sample| ((variant * 7 + sample * 3) % 4) as u8)
+                .collect();
+            object.extend_from_slice(&pack_plink_codes(&codes));
+        }
+        std::fs::write(&bed_path, &object).unwrap();
+        let (url, requests) = serve_object_ranges(object);
+        let remote = open_bed_source(Path::new(&url), None).unwrap();
+        assert!(remote.supports_read_plan());
+        let local = open_bed_source(&bed_path, None).unwrap();
+        assert!(!local.supports_read_plan());
+
+        // Two passes each, in blocks of three: out of file order, a run of
+        // adjacent rows, and a repeat that falls behind the prefetch window.
+        // A sample subset chosen after the first block rewinds the pass.
+        let decode = |bed: BedSource, selection: Option<Vec<usize>>, samples: Option<Vec<usize>>| {
+            let kinds = selection.as_ref().map(|rows| {
+                (0..rows.len())
+                    .map(|slot| if slot % 3 == 1 { MatchKind::Swap } else { MatchKind::Exact })
+                    .collect()
+            });
+            let mut source =
+                PlinkVariantBlockSource::new(bed, bytes_per_variant, n_samples, n_variants, selection, kinds);
+            if let Some(samples) = samples {
+                source.next_block_into(3, &mut vec![99.0; 3 * n_samples]).unwrap();
+                source.select_samples(samples).unwrap();
+            }
+            let rows = source.n_samples();
+            let mut decoded = Vec::new();
+            let mut storage = vec![99.0; 3 * rows];
+            for _ in 0..2 {
+                source.reset().unwrap();
+                loop {
+                    let filled = source.next_block_into(3, &mut storage).unwrap();
+                    if filled == 0 {
+                        break;
+                    }
+                    decoded.extend(storage[..filled * rows].iter().map(|value| value.to_bits()));
+                }
+            }
+            decoded
+        };
+        let selection = vec![31, 30, 3, 4, 5, 17, 3];
+        let expected = decode(local.clone(), Some(selection.clone()), None);
+        assert_eq!(expected.len(), 2 * selection.len() * n_samples);
+        assert_eq!(decode(remote.clone(), Some(selection.clone()), None), expected);
+        let subset = Some(vec![0, 2, 5, 6]);
+        let expected = decode(local.clone(), Some(selection.clone()), subset.clone());
+        assert_eq!(expected.len(), 2 * selection.len() * 4);
+        assert_eq!(decode(remote.clone(), Some(selection.clone()), subset), expected);
+        let row_bytes = bytes_per_variant as u64;
+        let requested_selected_bytes = |byte: u64| {
+            byte < 3
+                || selection.iter().any(|&row| {
+                    let start = 3 + row as u64 * row_bytes;
+                    (start..start + row_bytes).contains(&byte)
+                })
+        };
+        for &(start, end) in requests.lock().unwrap().iter() {
+            assert!(
+                (start..=end).all(requested_selected_bytes),
+                "requested unselected bytes {start}-{end}"
+            );
+        }
+
+        let expected = decode(local, None, None);
+        assert_eq!(expected.len(), 2 * n_variants * n_samples);
+        assert_eq!(decode(remote, None, None), expected);
     }
 
     #[test]

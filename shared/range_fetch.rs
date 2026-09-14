@@ -1,14 +1,15 @@
 //! Planned, prefetching reads of remote PLINK BED rows.
 //!
-//! Scoring reads whole variant rows in ascending row order, and a biobank
-//! cohort makes every row hundreds of kilobytes. A remote BED is therefore
-//! read through a plan of exact byte ranges that cover only the required
-//! rows, and a pool of workers keeps a bounded window of those ranges in
-//! flight ahead of the consumer. Request latency then overlaps both the
-//! transfer of neighbouring ranges and the scoring of rows already received.
+//! Scoring, projection, fitting and sex inference read whole variant rows in
+//! an order known before the first read, and a biobank cohort makes every row
+//! hundreds of kilobytes. A remote BED is therefore read through a plan of
+//! exact byte ranges that cover only the required rows, and a pool of workers
+//! keeps a bounded window of those ranges in flight ahead of the consumer.
+//! Request latency then overlaps both the transfer of neighbouring ranges and
+//! the processing of rows already received.
 
 use crate::pipeline_error::PipelineError;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
@@ -21,16 +22,28 @@ const REMOTE_TRANSFER_CHUNK: usize = 16 * 1024 * 1024;
 /// One byte range of the object: `(start, length)`.
 type Range = (u64, usize);
 
-/// Consecutive required BED rows share requests; gaps are never downloaded.
-/// The three-byte header is always its own range so that validating it does
-/// not start genotype prefetching.
+/// Required BED rows become ranges in the order they will be read. A row that
+/// directly follows its predecessor in the file shares its request, and when
+/// rows arrive in file order a row within `MAX_GAP` bytes after the previous
+/// range extends it over the unread rows between; wider gaps are never
+/// downloaded. The three-byte header is always its own range so that
+/// validating it does not start genotype prefetching.
 pub(crate) struct BedReadPlan {
     ranges: Vec<Range>,
+    /// Range indices by ascending start, when read order is not file order.
+    by_start: Option<Vec<usize>>,
 }
 
 impl BedReadPlan {
     /// Longest single request. Consecutive rows are merged up to this size.
     pub(crate) const MAX_RANGE: usize = 2 * 1024 * 1024;
+
+    /// Widest run of unread bytes one request covers to reach the next row. A
+    /// request waits tens of milliseconds for its first byte, while this many
+    /// bytes arrive in about a millisecond at cloud transfer rates, so narrow
+    /// rows share requests instead of paying one each. A biobank cohort's rows
+    /// are wider than the gap, so their plans stay exact.
+    pub(crate) const MAX_GAP: u64 = 64 * 1024;
 
     /// Local shared filesystems benefit from large positional reads instead of
     /// one blocking page fault per marker. Coalesce nearby requests, retaining
@@ -55,24 +68,46 @@ impl BedReadPlan {
                 ranges.push((start, length));
             }
         }
-        Ok(Self { ranges })
+        // Scoring rows arrive in file order, so the merged ranges are too.
+        Ok(Self {
+            ranges,
+            by_start: None,
+        })
     }
 
+    /// A row repeated in `rows` is planned once, at its first position; reading
+    /// it again later is a read behind the consumer.
     pub(crate) fn new(rows: &[u64], row_bytes: u64, file_len: u64) -> Result<Self, PipelineError> {
+        Self::with_gap(rows, row_bytes, file_len, Self::MAX_GAP)
+    }
+
+    /// A plan whose ranges cover the required rows and nothing else.
+    #[cfg(test)]
+    fn exact(rows: &[u64], row_bytes: u64, file_len: u64) -> Result<Self, PipelineError> {
+        Self::with_gap(rows, row_bytes, file_len, 0)
+    }
+
+    fn with_gap(
+        rows: &[u64],
+        row_bytes: u64,
+        file_len: u64,
+        max_gap: u64,
+    ) -> Result<Self, PipelineError> {
         if row_bytes == 0 || file_len < 3 || (file_len - 3) % row_bytes != 0 {
             return Err(PipelineError::Io(
-                "Invalid BED dimensions for scoring read plan".into(),
+                "Invalid BED dimensions for read plan".into(),
             ));
         }
+        let ascending = rows.windows(2).all(|pair| pair[0] < pair[1]);
+        // Out of file order a later row could fall inside an earlier range's
+        // gap, so such plans merge only adjacent rows and ranges never overlap.
+        let max_gap = if ascending { max_gap } else { 0 };
+        let mut planned = HashSet::new();
         let mut ranges = vec![(0, 3usize)];
-        let mut previous = None;
         for &row in rows {
-            if previous.is_some_and(|prior| prior >= row) {
-                return Err(PipelineError::Io(
-                    "BED read-plan rows must be strictly increasing".into(),
-                ));
+            if !ascending && !planned.insert(row) {
+                continue;
             }
-            previous = Some(row);
             let start = row
                 .checked_mul(row_bytes)
                 .and_then(|n| n.checked_add(3))
@@ -84,10 +119,15 @@ impl BedReadPlan {
             let mut cursor = start;
             while cursor < end {
                 let last = ranges.last_mut().expect("header range");
-                let contiguous = last.0 != 0 && last.0 + last.1 as u64 == cursor;
-                if contiguous && last.1 < Self::MAX_RANGE {
-                    let n = (end - cursor).min((Self::MAX_RANGE - last.1) as u64) as usize;
-                    last.1 += n;
+                // Unread bytes the previous request would cover to reach this
+                // row: zero for an adjacent row.
+                let gap = cursor.checked_sub(last.0 + last.1 as u64).filter(|&gap| {
+                    last.0 != 0 && gap <= max_gap && last.1 as u64 + gap < Self::MAX_RANGE as u64
+                });
+                if let Some(gap) = gap {
+                    let room = Self::MAX_RANGE as u64 - last.1 as u64 - gap;
+                    let n = (end - cursor).min(room) as usize;
+                    last.1 += gap as usize + n;
                     cursor += n as u64;
                 } else {
                     let n = (end - cursor).min(Self::MAX_RANGE as u64) as usize;
@@ -96,19 +136,31 @@ impl BedReadPlan {
                 }
             }
         }
-        Ok(Self { ranges })
+        let by_start = (!ascending).then(|| {
+            let mut order: Vec<usize> = (0..ranges.len()).collect();
+            order.sort_unstable_by_key(|&index| ranges[index].0);
+            order
+        });
+        Ok(Self { ranges, by_start })
     }
 
     /// Index of the range containing `offset`; reads outside the plan are errors.
     fn index_of(&self, offset: u64) -> Result<usize, PipelineError> {
-        let index = self
-            .ranges
-            .partition_point(|&(start, _)| start <= offset)
-            .checked_sub(1)
-            .ok_or_else(|| PipelineError::Io("Read outside required BED rows".into()))?;
+        let outside = || PipelineError::Io("Read outside required BED rows".into());
+        let index = match &self.by_start {
+            None => self
+                .ranges
+                .partition_point(|&(start, _)| start <= offset)
+                .checked_sub(1),
+            Some(order) => order
+                .partition_point(|&index| self.ranges[index].0 <= offset)
+                .checked_sub(1)
+                .map(|position| order[position]),
+        }
+        .ok_or_else(outside)?;
         let (start, length) = self.ranges[index];
         if offset - start >= length as u64 {
-            return Err(PipelineError::Io("Read outside required BED rows".into()));
+            return Err(outside());
         }
         Ok(index)
     }
@@ -157,8 +209,8 @@ struct Shared {
 
 /// Serves reads from a [`BedReadPlan`] while workers prefetch ahead of them.
 ///
-/// Reads are expected in ascending offset order, which is how scoring
-/// consumes rows; a read behind the consumer position is served by one
+/// Reads are expected in plan order, which is the order its rows were
+/// given in; a read behind the consumer position is served by one
 /// synchronous request and never disturbs the prefetch window. Workers start
 /// on the first genotype read, at that read's position, so a resumed run
 /// never downloads rows it has already scored.
@@ -257,6 +309,20 @@ impl PlannedReader {
             }
             state = self.shared.changed.wait(state).unwrap();
         }
+    }
+
+    /// Copies the planned bytes at `offset` into `dst`, crossing ranges as needed.
+    pub(crate) fn read_at(&self, offset: u64, dst: &mut [u8]) -> Result<(), PipelineError> {
+        let mut copied = 0;
+        while copied < dst.len() {
+            let position = offset + copied as u64;
+            let (start, range) = self.range_at(position)?;
+            let within = (position - start) as usize;
+            let n = (range.len() - within).min(dst.len() - copied);
+            dst[copied..copied + n].copy_from_slice(&range[within..within + n]);
+            copied += n;
+        }
+        Ok(())
     }
 
     fn fetch_now(&self, start: u64, length: usize) -> Result<(u64, Arc<Vec<u8>>), PipelineError> {
@@ -415,14 +481,14 @@ mod tests {
 
     #[test]
     fn plan_covers_required_rows_and_nothing_else() {
-        let plan = BedReadPlan::new(&[0, 1, 99], 100, 10_003).unwrap();
+        let plan = BedReadPlan::exact(&[0, 1, 99], 100, 10_003).unwrap();
         assert_eq!(plan.ranges, vec![(0, 3), (3, 200), (9903, 100)]);
         assert_eq!(plan.index_of(0).unwrap(), 0);
         assert_eq!(plan.index_of(102).unwrap(), 1);
         assert_eq!(plan.index_of(10_002).unwrap(), 2);
         assert!(plan.index_of(203).is_err());
         assert!(plan.index_of(10_003).is_err());
-        let large = BedReadPlan::new(
+        let large = BedReadPlan::exact(
             &[0],
             (BedReadPlan::MAX_RANGE * 3 + 1) as u64,
             (BedReadPlan::MAX_RANGE * 3 + 4) as u64,
@@ -439,18 +505,101 @@ mod tests {
     fn plan_rejects_bad_dimensions_and_rows() {
         for (rows, stride, length) in [
             (&[0][..], 0, 3),
-            (&[1, 0][..], 4, 11),
-            (&[0, 0][..], 4, 11),
             (&[2][..], 4, 11),
+            (&[1, 2][..], 4, 11),
             (&[0][..], 4, 10),
         ] {
-            assert!(BedReadPlan::new(rows, stride, length).is_err());
+            assert!(BedReadPlan::exact(rows, stride, length).is_err());
         }
     }
 
     #[test]
+    fn plan_follows_read_order_and_plans_repeats_once() {
+        // Rows 5-6 and 2-3 are file-adjacent within read order, row 4 is never
+        // read, and the second 5 is already planned.
+        let plan = BedReadPlan::exact(&[5, 6, 2, 3, 5, 0], 10, 3 + 8 * 10).unwrap();
+        assert_eq!(plan.ranges, vec![(0, 3), (53, 20), (23, 20), (3, 10)]);
+        assert_eq!(plan.index_of(1).unwrap(), 0);
+        assert_eq!(plan.index_of(72).unwrap(), 1);
+        assert_eq!(plan.index_of(23).unwrap(), 2);
+        assert_eq!(plan.index_of(12).unwrap(), 3);
+        assert!(plan.index_of(43).is_err());
+        assert!(plan.index_of(83).is_err());
+        assert!(BedReadPlan::exact(&[0, 1, 3], 10, 83).unwrap().by_start.is_none());
+    }
+
+    #[test]
+    fn narrow_nearby_rows_share_requests_that_cover_their_gaps() {
+        // Rows 0, 2 and 9 of 10 bytes lie within MAX_GAP of one another and
+        // share one request; row 9,000 lies further away and gets its own.
+        let plan = BedReadPlan::new(&[0, 2, 9, 9_000], 10, 3 + 10_000 * 10).unwrap();
+        assert_eq!(plan.ranges, vec![(0, 3), (3, 100), (90_003, 10)]);
+        assert_eq!(plan.index_of(53).unwrap(), 1);
+        assert!(plan.index_of(5_003).is_err());
+        // Out of file order a plan stays exact, so no range overlaps another.
+        let reordered = BedReadPlan::new(&[9, 0, 2], 10, 3 + 10_000 * 10).unwrap();
+        assert_eq!(reordered.ranges, vec![(0, 3), (93, 10), (3, 10), (23, 10)]);
+        // Merged ranges stay within MAX_RANGE and still cover every required
+        // row. A gap that a full range cannot absorb is left unread.
+        let rows: Vec<u64> = (0..300_000).map(|r| r * 3).collect();
+        let long = BedReadPlan::new(&rows, 8, 3 + 900_000 * 8).unwrap();
+        assert_eq!(long.ranges.len(), 1 + 4);
+        assert!(long.ranges[1..].iter().all(|&(_, n)| n <= BedReadPlan::MAX_RANGE));
+        assert!(rows.iter().all(|&row| {
+            long.index_of(3 + row * 8).is_ok() && long.index_of(3 + row * 8 + 7).is_ok()
+        }));
+        // Rows wider than the gap keep one range each.
+        let wide = BedReadPlan::new(&[0, 2, 4], 70_000, 3 + 10 * 70_000).unwrap();
+        assert_eq!(wide.ranges, vec![(0, 3), (3, 70_000), (140_003, 70_000), (280_003, 70_000)]);
+    }
+
+    #[test]
+    fn out_of_order_plans_are_prefetched_in_read_order() {
+        // Descending rows keep every range distinct, and reading them in plan
+        // order must be served entirely by prefetch: one request per range.
+        let rows: Vec<u64> = (0..400).rev().map(|r| r * 2).collect();
+        let plan = BedReadPlan::exact(&rows, 64, 3 + 800 * 64).unwrap();
+        let fetched = Arc::new(Mutex::new(Vec::new()));
+        let reader = PlannedReader::new(plan, fetcher({
+            let fetched = fetched.clone();
+            move |offset, length| {
+                fetched.lock().unwrap().push(offset);
+                Ok(pattern(offset, length))
+            }
+        }));
+        let mut data = [0u8; 64];
+        for &row in &rows {
+            let offset = 3 + row * 64;
+            reader.read_at(offset, &mut data).unwrap();
+            assert_eq!(data.to_vec(), pattern(offset, 64));
+        }
+        drop(reader);
+        let mut fetched = fetched.lock().unwrap().clone();
+        assert_eq!(fetched.len(), rows.len());
+        fetched.sort_unstable();
+        fetched.dedup();
+        assert_eq!(fetched.len(), rows.len());
+    }
+
+    #[test]
+    fn one_read_spans_the_ranges_of_a_split_row() {
+        let row_bytes = BedReadPlan::MAX_RANGE as u64 + 5;
+        let rows = [1, 3, 2];
+        let plan = BedReadPlan::exact(&rows, row_bytes, 3 + 4 * row_bytes).unwrap();
+        assert_eq!(plan.ranges.len(), 1 + 2 * rows.len());
+        let reader = PlannedReader::new(plan, fetcher(|offset, length| Ok(pattern(offset, length))));
+        let mut data = vec![0; row_bytes as usize];
+        for row in rows {
+            let offset = 3 + row * row_bytes;
+            reader.read_at(offset, &mut data).unwrap();
+            assert_eq!(data, pattern(offset, row_bytes as usize));
+        }
+        assert!(reader.read_at(3, &mut data[..1]).is_err());
+    }
+
+    #[test]
     fn worker_count_tracks_range_size_within_bounds() {
-        let dense = BedReadPlan::new(
+        let dense = BedReadPlan::exact(
             &(0..64).collect::<Vec<_>>(),
             BedReadPlan::MAX_RANGE as u64,
             3 + 64 * BedReadPlan::MAX_RANGE as u64,
@@ -460,7 +609,7 @@ mod tests {
             PlannedReader::worker_count(&dense, &LIMITS),
             LIMITS.in_flight_bytes / BedReadPlan::MAX_RANGE
         );
-        let scattered = BedReadPlan::new(
+        let scattered = BedReadPlan::exact(
             &(0..2000).map(|r| r * 2).collect::<Vec<_>>(),
             8,
             3 + 4000 * 8,
@@ -470,10 +619,10 @@ mod tests {
             PlannedReader::worker_count(&scattered, &LIMITS),
             LIMITS.max_workers
         );
-        let tiny = BedReadPlan::new(&[0, 2], 8, 27).unwrap();
+        let tiny = BedReadPlan::exact(&[0, 2], 8, 27).unwrap();
         assert_eq!(PlannedReader::worker_count(&tiny, &LIMITS), 2);
         assert_eq!(
-            PlannedReader::worker_count(&BedReadPlan::new(&[], 8, 27).unwrap(), &LIMITS),
+            PlannedReader::worker_count(&BedReadPlan::exact(&[], 8, 27).unwrap(), &LIMITS),
             0
         );
     }
@@ -483,7 +632,7 @@ mod tests {
         // Every other row is required, so each range is one row, and there
         // are more ranges than the worker ceiling so the ceiling is reached.
         let rows: Vec<u64> = (0..300).map(|r| r * 2).collect();
-        let plan = BedReadPlan::new(&rows, 64, 3 + 600 * 64).unwrap();
+        let plan = BedReadPlan::exact(&rows, 64, 3 + 600 * 64).unwrap();
         let workers = PlannedReader::worker_count(&plan, &LIMITS);
         assert_eq!(workers, LIMITS.max_workers);
         let in_flight = Arc::new(AtomicUsize::new(0));
@@ -518,7 +667,7 @@ mod tests {
 
     #[test]
     fn header_read_does_not_start_prefetching() {
-        let plan = BedReadPlan::new(&(0..50).collect::<Vec<_>>(), 16, 3 + 50 * 16).unwrap();
+        let plan = BedReadPlan::exact(&(0..50).collect::<Vec<_>>(), 16, 3 + 50 * 16).unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let reader = PlannedReader::new(
             plan,
@@ -541,7 +690,7 @@ mod tests {
         // Alternate rows keep every range distinct, so no range spans the
         // resume point and every fetched offset must lie at or beyond it.
         let rows: Vec<u64> = (0..4000).map(|r| r * 2).collect();
-        let plan = BedReadPlan::new(&rows, 64, 3 + 8000 * 64).unwrap();
+        let plan = BedReadPlan::exact(&rows, 64, 3 + 8000 * 64).unwrap();
         let resume_offset = 3 + rows[2500] * 64;
         let fetched = Arc::new(AtomicUsize::new(0));
         let reader = PlannedReader::new(
@@ -571,7 +720,7 @@ mod tests {
     #[test]
     fn window_bounds_outstanding_bytes_and_is_fully_used() {
         let rows: Vec<u64> = (0..64).map(|r| r * 2).collect();
-        let plan = BedReadPlan::new(&rows, 1024, 3 + 128 * 1024).unwrap();
+        let plan = BedReadPlan::exact(&rows, 1024, 3 + 128 * 1024).unwrap();
         let limits = Limits {
             window_bytes: 4096,
             in_flight_bytes: 1 << 20,
@@ -607,7 +756,7 @@ mod tests {
     #[test]
     fn all_workers_run_at_once_when_the_window_allows() {
         let rows: Vec<u64> = (0..16).map(|r| r * 3).collect();
-        let plan = BedReadPlan::new(&rows, 8, 3 + 48 * 8).unwrap();
+        let plan = BedReadPlan::exact(&rows, 8, 3 + 48 * 8).unwrap();
         let workers = PlannedReader::worker_count(&plan, &LIMITS);
         assert_eq!(workers, rows.len());
         let barrier = Arc::new(Barrier::new(workers));
@@ -634,7 +783,7 @@ mod tests {
     fn reads_behind_the_consumer_are_served_without_disturbing_prefetch() {
         // Alternate rows keep every range distinct.
         let rows: Vec<u64> = (0..40).map(|r| r * 2).collect();
-        let plan = BedReadPlan::new(&rows, 8, 3 + 80 * 8).unwrap();
+        let plan = BedReadPlan::exact(&rows, 8, 3 + 80 * 8).unwrap();
         let reader = PlannedReader::new(plan, fetcher(|offset, length| Ok(pattern(offset, length))));
         reader.range_at(3 + rows[30] * 8).unwrap();
         let (start, data) = reader.range_at(3 + rows[2] * 8).unwrap();
@@ -648,7 +797,7 @@ mod tests {
     #[test]
     fn failures_and_short_responses_reach_the_consumer() {
         let rows: Vec<u64> = (0..30).map(|r| r * 2).collect();
-        let plan = BedReadPlan::new(&rows, 8, 3 + 60 * 8).unwrap();
+        let plan = BedReadPlan::exact(&rows, 8, 3 + 60 * 8).unwrap();
         let failing = 3 + rows[20] * 8;
         let reader = PlannedReader::new(
             plan,
@@ -666,7 +815,7 @@ mod tests {
         let error = reader.range_at(failing).unwrap_err();
         assert!(error.to_string().contains("segment failed"));
 
-        let plan = BedReadPlan::new(&rows, 8, 3 + 60 * 8).unwrap();
+        let plan = BedReadPlan::exact(&rows, 8, 3 + 60 * 8).unwrap();
         let reader = PlannedReader::new(plan, fetcher(|_, length| Ok(vec![0; length - 1])));
         assert!(reader.range_at(0).unwrap_err().to_string().contains("incorrect length"));
         assert!(reader.range_at(3).unwrap_err().to_string().contains("incorrect length"));
