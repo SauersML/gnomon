@@ -2052,6 +2052,16 @@ impl PlinkDataset {
         self.n_variants
     }
 
+    /// The `.bed` bytes: memory-mapped for a local file, ranged reads otherwise.
+    pub fn bed_source(&self) -> &BedSource {
+        &self.bed
+    }
+
+    /// Packed bytes per variant row, `ceil(n_samples / 4)`.
+    pub fn bytes_per_variant(&self) -> usize {
+        self.bytes_per_variant
+    }
+
     pub fn bed_path(&self) -> &Path {
         &self.bed_path
     }

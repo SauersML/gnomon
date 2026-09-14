@@ -1,4 +1,5 @@
 pub mod sex;
+mod sex_counts;
 
 pub use sex::{
     SexInferenceError, SexInferenceRecord, infer_first_sample_sex, infer_sex_to_tsv,

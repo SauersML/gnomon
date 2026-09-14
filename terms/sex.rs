@@ -11,8 +11,9 @@ use thiserror::Error;
 
 use crate::adapt_plink2::GenomeBuild as PgenGenomeBuild;
 use crate::map::fit::VariantBlockSource;
-use crate::map::io::{GenotypeDataset, GenotypeIoError, SelectionPlan};
+use crate::map::io::{GenotypeDataset, GenotypeIoError, PlinkDataset, PlinkIoError, SelectionPlan};
 use crate::map::variant_filter::VariantKey;
+use crate::terms::sex_counts::{BedRows, LocusClass, count_evidence, finish_counts};
 
 #[derive(Debug, Error)]
 pub enum SexInferenceError {
@@ -51,7 +52,8 @@ pub struct SexInferenceRecord {
 #[derive(Debug, Clone)]
 struct SexVariantSelection {
     keys: Vec<SelectedVariant>,
-    plan: SelectionPlan,
+    /// Row index of each selected variant, ascending and parallel to `keys`.
+    indices: Vec<usize>,
     build: GenomeBuild,
 }
 
@@ -112,10 +114,9 @@ impl SexVariantSelection {
             selected_keys.push(variant);
         }
 
-        let plan = SelectionPlan::ByIndices(selected_indices);
         Self {
             keys: selected_keys,
-            plan,
+            indices: selected_indices,
             build,
         }
     }
@@ -241,7 +242,12 @@ fn infer_records(
         inferred
     });
     let selection = SexVariantSelection::from_all_keys(&variant_keys, build);
-    let records = collect_inference(&dataset, &selection, show_progress)?;
+    let records = match &dataset {
+        GenotypeDataset::Plink(plink) => {
+            collect_packed_inference(plink, &selection, show_progress)?
+        }
+        _ => collect_inference(&dataset, &selection, show_progress)?,
+    };
     Ok((dataset, build, records))
 }
 
@@ -269,7 +275,8 @@ fn collect_inference(
         .map(|_| SexInferenceAccumulator::new(config))
         .collect();
 
-    let mut block_source = dataset.block_source_with_plan(selection.plan.clone())?;
+    let mut block_source =
+        dataset.block_source_with_plan(SelectionPlan::ByIndices(selection.indices.clone()))?;
     let total_variants = selection.keys.len();
     let block_capacity = 256usize;
     let mut storage = vec![f64::NAN; block_capacity * n_samples];
@@ -329,6 +336,63 @@ fn collect_inference(
     finalize_records(accumulators, sample_ids, &platform)
 }
 
+/// [`collect_inference`] for a PLINK 1 fileset. The calls are counted directly on
+/// the packed `.bed` rows, and only the rows that feed a counter are read; see
+/// `sex_counts`.
+fn collect_packed_inference(
+    dataset: &PlinkDataset,
+    selection: &SexVariantSelection,
+    show_progress: bool,
+) -> Result<Vec<SexInferenceRecord>, SexInferenceError> {
+    let build = selection.build;
+    let platform = derive_platform_definition(&selection.keys, build);
+    ensure_informative_platform(&platform)?;
+    let config = InferenceConfig {
+        build,
+        platform,
+        thresholds: None,
+    };
+
+    let constants = build.algorithm_constants();
+    let loci: Vec<(usize, LocusClass)> = selection
+        .indices
+        .iter()
+        .zip(&selection.keys)
+        .filter_map(|(&index, selected)| {
+            LocusClass::of(&constants, selected.chrom, selected.key.position)
+                .map(|class| (index, class))
+        })
+        .collect();
+
+    let total_variants = selection.keys.len();
+    let mut progress = TermsProgress::new(total_variants, show_progress);
+    let rows = BedRows::new(
+        dataset.bed_source(),
+        dataset.bytes_per_variant(),
+        dataset.n_variants(),
+        dataset.n_samples(),
+    );
+    let evidence = count_evidence(&rows, &loci, |counted| {
+        progress.update(counted, total_variants)
+    })
+    .map_err(|err| GenotypeIoError::from(PlinkIoError::from(err)))?;
+    progress.finish(total_variants);
+
+    dataset
+        .samples()
+        .iter()
+        .zip(&evidence)
+        .map(|(sample, counts)| {
+            let inference = finish_counts(&config, counts)?;
+            Ok(finalize_record(
+                sample.individual_id.clone(),
+                inference,
+                &platform,
+            ))
+        })
+        .collect()
+}
+
 /// True when every attempted locus produced a call, i.e. the input carries no
 /// missing genotypes at all.
 ///
@@ -357,22 +421,27 @@ fn finalize_records(
     accumulators
         .into_iter()
         .zip(sample_ids)
-        .map(|(acc, individual_id)| {
-            let mut inference = acc.finish()?;
-            // Withhold the call rather than emit a confident one derived from a
-            // denominator the input defined into existence. Indeterminate is the
-            // honest answer here and it is also the useful one: a caller can fall
-            // back to evidence measured before the filtering, whereas a wrong
-            // binary call is indistinguishable from a right one downstream.
-            if platform_is_saturated(&inference.report, platform) {
-                inference.final_call = InferredSex::Indeterminate;
-            }
-            Ok(SexInferenceRecord {
-                individual_id,
-                inference,
-            })
-        })
+        .map(|(acc, individual_id)| Ok(finalize_record(individual_id, acc.finish()?, platform)))
         .collect()
+}
+
+fn finalize_record(
+    individual_id: String,
+    mut inference: InferenceResult,
+    platform: &PlatformDefinition,
+) -> SexInferenceRecord {
+    // Withhold the call rather than emit a confident one derived from a
+    // denominator the input defined into existence. Indeterminate is the
+    // honest answer here and it is also the useful one: a caller can fall
+    // back to evidence measured before the filtering, whereas a wrong
+    // binary call is indistinguishable from a right one downstream.
+    if platform_is_saturated(&inference.report, platform) {
+        inference.final_call = InferredSex::Indeterminate;
+    }
+    SexInferenceRecord {
+        individual_id,
+        inference,
+    }
 }
 
 fn write_results(
@@ -505,6 +574,8 @@ fn ensure_informative_platform(platform: &PlatformDefinition) -> Result<(), SexI
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
+    use std::io::BufWriter;
     use tempfile::tempdir;
 
     #[test]
@@ -601,23 +672,19 @@ mod tests {
         let selection = SexVariantSelection::from_all_keys(&keys, build);
 
         assert_eq!(selection.keys.len(), 2003);
-        if let SelectionPlan::ByIndices(indices) = &selection.plan {
-            assert_eq!(indices.len(), selection.keys.len());
-            assert!(indices.windows(2).all(|w| w[0] < w[1]));
-            assert!(indices.contains(&0));
-            assert!(indices.contains(&3000));
-            assert!(indices.contains(&3001));
-            assert!(indices.contains(&3002));
+        let indices = &selection.indices;
+        assert_eq!(indices.len(), selection.keys.len());
+        assert!(indices.windows(2).all(|w| w[0] < w[1]));
+        assert!(indices.contains(&0));
+        assert!(indices.contains(&3000));
+        assert!(indices.contains(&3001));
+        assert!(indices.contains(&3002));
 
-            let autosome_indices: Vec<_> =
-                indices.iter().copied().filter(|idx| *idx < 3000).collect();
-            assert_eq!(autosome_indices.len(), 2000);
-            assert!(autosome_indices.contains(&0));
-            assert!(autosome_indices.contains(&1500));
-            assert!(autosome_indices.contains(&2998));
-        } else {
-            panic!("unexpected selection plan type");
-        }
+        let autosome_indices: Vec<_> = indices.iter().copied().filter(|idx| *idx < 3000).collect();
+        assert_eq!(autosome_indices.len(), 2000);
+        assert!(autosome_indices.contains(&0));
+        assert!(autosome_indices.contains(&1500));
+        assert!(autosome_indices.contains(&2998));
     }
 
     #[test]
@@ -909,6 +976,139 @@ mod tests {
             assert_eq!(build, "Build38");
         }
 
+        Ok(())
+    }
+
+    fn metric_bits(result: &InferenceResult) -> [Option<u64>; 3] {
+        [
+            result.report.y_genome_density.map(f64::to_bits),
+            result.report.x_autosome_het_ratio.map(f64::to_bits),
+            result.report.composite_sex_index.map(f64::to_bits),
+        ]
+    }
+
+    /// Writes a PLINK 1 fileset whose rows cover every locus class, every Build38
+    /// PAR boundary, loci the accumulator ignores, missing calls and dirty padding
+    /// codes, and returns its `.bed` path. Odd samples look male, even samples
+    /// female; with no missing calls the panel is saturated.
+    fn write_sex_fixture(
+        dir: &Path,
+        n_samples: usize,
+        missing_percent: u64,
+    ) -> std::io::Result<PathBuf> {
+        let mut state = 0x853c_49e6_748f_ea9b_u64 ^ n_samples as u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        let mut rows: Vec<(String, u64)> = (0..2_600u64)
+            .map(|i| ((1 + i * 22 / 2_600).to_string(), 1_000 + i * 10))
+            .collect();
+        let mut x_positions: Vec<u64> = (0..700u64).map(|i| 5_000 + i * 224_000).collect();
+        x_positions.extend([
+            10_000,
+            10_001,
+            2_781_479,
+            2_781_480,
+            155_701_382,
+            155_701_383,
+            156_030_895,
+            156_030_896,
+        ]);
+        x_positions.sort_unstable();
+        rows.extend(x_positions.into_iter().map(|pos| ("X".to_string(), pos)));
+        let mut y_positions: Vec<u64> = (0..300u64).map(|i| 5_000 + i * 200_000).collect();
+        y_positions.extend([
+            10_000, 10_001, 2_781_479, 2_781_480, 56_887_902, 56_887_903, 57_217_415, 57_217_416,
+        ]);
+        y_positions.sort_unstable();
+        rows.extend(y_positions.into_iter().map(|pos| ("Y".to_string(), pos)));
+        rows.push(("MT".to_string(), 100));
+
+        let prefix = dir.join(format!("fixture_{n_samples}_{missing_percent}"));
+        let mut bim = BufWriter::new(File::create(prefix.with_extension("bim"))?);
+        for (index, (chrom, pos)) in rows.iter().enumerate() {
+            writeln!(bim, "{chrom}\tv{index}\t0\t{pos}\tA\tG")?;
+        }
+        bim.flush()?;
+        let mut fam = BufWriter::new(File::create(prefix.with_extension("fam"))?);
+        for sample in 0..n_samples {
+            writeln!(fam, "F{sample}\tI{sample}\t0\t0\t0\t-9")?;
+        }
+        fam.flush()?;
+
+        let row_len = n_samples.div_ceil(4);
+        let mut bed = BufWriter::new(File::create(prefix.with_extension("bed"))?);
+        bed.write_all(&[0x6c, 0x1b, 0x01])?;
+        for (chrom, _) in &rows {
+            let mut row = vec![0u8; row_len];
+            for slot in 0..4 * row_len {
+                let roll = next();
+                let male = slot % 2 == 1;
+                let code = if slot >= n_samples {
+                    // Padding codes, which the reader must ignore.
+                    (roll & 0b11) as u8
+                } else if roll % 100 < missing_percent {
+                    0b01
+                } else {
+                    match chrom.as_str() {
+                        "X" if male => [0b00, 0b11][((roll >> 8) & 1) as usize],
+                        "Y" if !male && missing_percent > 0 && (roll >> 16) % 10 != 0 => 0b01,
+                        _ => [0b00, 0b10, 0b11][((roll >> 24) % 3) as usize],
+                    }
+                };
+                row[slot / 4] |= code << (2 * (slot % 4));
+            }
+            bed.write_all(&row)?;
+        }
+        bed.flush()?;
+        Ok(prefix.with_extension("bed"))
+    }
+
+    /// The packed path must reproduce the accumulator path record for record,
+    /// down to the bits of every metric.
+    #[test]
+    fn packed_counts_reproduce_the_accumulator_path() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
+        for (n_samples, missing_percent) in [(1, 3), (7, 3), (64, 0), (203, 20)] {
+            let bed = write_sex_fixture(dir.path(), n_samples, missing_percent)?;
+            let dataset = GenotypeDataset::open(&bed, None)?;
+            let keys = dataset.variant_keys_for_plan(&SelectionPlan::All)?;
+            let build = infer_build_from_keys(&keys);
+            assert_eq!(build, GenomeBuild::Build38);
+            let selection = SexVariantSelection::from_all_keys(&keys, build);
+            let expected = collect_inference(&dataset, &selection, false)?;
+            let GenotypeDataset::Plink(plink) = &dataset else {
+                panic!("the fixture is a PLINK 1 fileset");
+            };
+            let packed = collect_packed_inference(plink, &selection, false)?;
+
+            assert_eq!(packed.len(), n_samples);
+            assert_eq!(expected.len(), n_samples);
+            for (packed, expected) in packed.iter().zip(&expected) {
+                assert_eq!(packed.individual_id, expected.individual_id);
+                assert_eq!(
+                    packed.inference, expected.inference,
+                    "{n_samples} samples, {missing_percent}% missing"
+                );
+                assert_eq!(
+                    metric_bits(&packed.inference),
+                    metric_bits(&expected.inference)
+                );
+            }
+            let calls: HashSet<&str> = packed
+                .iter()
+                .map(|record| sex_label(record.inference.final_call))
+                .collect();
+            if missing_percent == 0 {
+                assert_eq!(calls, HashSet::from(["indeterminate"]));
+            } else if n_samples > 1 {
+                assert_eq!(calls, HashSet::from(["male", "female"]));
+            }
+        }
         Ok(())
     }
 }
