@@ -453,7 +453,10 @@ static HET_FLAGS: [u32; 256] = slot_flags(HET_CODE);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kernel {
+    /// Lookup tables.
     Scalar,
+    /// Flags formed from the code bits, without tables.
+    Bits,
     #[cfg(target_arch = "x86_64")]
     Avx2,
 }
@@ -466,6 +469,12 @@ impl Kernel {
                 return Self::Avx2;
             }
         }
+        // LLVM vectorizes the table-free loop to NEON, which every aarch64 CPU
+        // has, and cannot vectorize the table gathers. On x86 the table loop is the
+        // faster of the two.
+        if cfg!(target_arch = "aarch64") {
+            return Self::Bits;
+        }
         Self::Scalar
     }
 
@@ -474,6 +483,7 @@ impl Kernel {
     fn add_row(self, packed: &[u8], missing: &mut [u8], het: &mut [u8]) {
         match self {
             Self::Scalar => add_row_scalar(packed, missing, het),
+            Self::Bits => add_row_bits(packed, missing, het),
             #[cfg(target_arch = "x86_64")]
             // SAFETY: `detect` returns `Avx2` only when the CPU reports AVX2.
             Self::Avx2 => unsafe { add_row_avx2(packed, missing, het) },
@@ -490,6 +500,29 @@ fn add_row_scalar(packed: &[u8], missing: &mut [u8], het: &mut [u8]) {
         // carries from one sample's byte into the next.
         *missing = (u32::from_le_bytes(*missing) + MISSING_FLAGS[usize::from(byte)]).to_le_bytes();
         *het = (u32::from_le_bytes(*het) + HET_FLAGS[usize::from(byte)]).to_le_bytes();
+    }
+}
+
+/// [`add_row_scalar`] without the tables. A slot holds the missing code `01`
+/// when its low bit is set and its high bit clear, and the heterozygous code
+/// `10` the other way round. With no gathers, LLVM vectorizes the loop.
+fn add_row_bits(packed: &[u8], missing: &mut [u8], het: &mut [u8]) {
+    assert!(missing.len() >= 4 * packed.len() && het.len() >= 4 * packed.len());
+    let (missing, _) = missing.as_chunks_mut::<4>();
+    let (het, _) = het.as_chunks_mut::<4>();
+    for ((&byte, missing), het) in packed.iter().zip(missing).zip(het) {
+        let low = byte & 0x55;
+        let high = (byte >> 1) & 0x55;
+        let missing_bits = low & !high;
+        let het_bits = high & !low;
+        missing[0] += missing_bits & 1;
+        missing[1] += (missing_bits >> 2) & 1;
+        missing[2] += (missing_bits >> 4) & 1;
+        missing[3] += (missing_bits >> 6) & 1;
+        het[0] += het_bits & 1;
+        het[1] += (het_bits >> 2) & 1;
+        het[2] += (het_bits >> 4) & 1;
+        het[3] += (het_bits >> 6) & 1;
     }
 }
 
@@ -630,8 +663,8 @@ mod tests {
     }
 
     fn kernels() -> Vec<Kernel> {
-        let mut kernels = vec![Kernel::Scalar];
-        if Kernel::detect() != Kernel::Scalar {
+        let mut kernels = vec![Kernel::Scalar, Kernel::Bits];
+        if !kernels.contains(&Kernel::detect()) {
             kernels.push(Kernel::detect());
         }
         kernels
