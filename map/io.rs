@@ -2417,6 +2417,15 @@ struct ModelKeySelector<'a> {
     contested: Vec<ContestedRecord>,
 }
 
+/// True when the two alleles are one insertion or deletion: different lengths,
+/// the shorter a prefix of the longer, as normalized indels share their anchor
+/// base. Reversing such a pair names a different variant (the deletion for the
+/// insertion), unlike a SNP, whose reversed pair is the same site.
+fn is_indel_pair(alleles: &(String, String)) -> bool {
+    let (a, b) = alleles;
+    a.len() != b.len() && (a.starts_with(b.as_str()) || b.starts_with(a.as_str()))
+}
+
 /// A dataset record matching a model variant that an earlier record of the
 /// other orientation holds.
 struct ContestedRecord {
@@ -2588,6 +2597,33 @@ impl<'a> ModelKeySelector<'a> {
         if count > 0 {
             eprintln!(
                 "> Model-key selection: {count} model variant(s) were claimed by two dataset rows of opposite allele order; the dataset's convention decided {replaced} against file order."
+            );
+        }
+        // A lone row that matches an indel only in the minority orientation is
+        // the other variant at its locus: against a model fit on a VCF, a
+        // plink2 .bim's T,TA is the deletion, not the model's insertion (T,TA),
+        // when 99% of the dataset lists alleles reversed. Its counted allele
+        // frequency contradicts the model's, so it counts as absent. A SNP in
+        // the minority orientation is still the same site and keeps its match.
+        let mut absent = 0usize;
+        for slot in 0..self.unique_keys.len() {
+            let kind = self.matched_kinds[slot];
+            if self.matched_indices[slot].is_some()
+                && kind != prevailing
+                && kind != MatchKind::Wildcard
+                && self.unique_keys[slot]
+                    .alleles
+                    .as_ref()
+                    .is_some_and(is_indel_pair)
+            {
+                self.matched_indices[slot] = None;
+                self.matched_keys[slot] = None;
+                absent += 1;
+            }
+        }
+        if absent > 0 {
+            eprintln!(
+                "> Model-key selection: {absent} indel(s) matched only against the dataset's allele-order convention are absent."
             );
         }
     }
@@ -7003,6 +7039,38 @@ mod tests {
         let no_convention = select(50);
         assert_eq!(no_convention.indices[100], 100, "the first claim stands");
         assert_eq!(no_convention.match_kinds[100], MatchKind::Exact);
+    }
+
+    /// Under a decisive reversed convention, a lone row matching an indel in
+    /// the model's own order is the deletion, not the insertion, and counts as
+    /// absent; a lone SNP in that order is still the site and keeps its match.
+    #[test]
+    fn a_lone_minority_indel_is_absent_but_a_lone_minority_snp_matches() {
+        use super::ModelKeySelector;
+        use crate::map::variant_filter::{MatchKind, VariantKey};
+
+        // The two lone rows below are unambiguous matches too, so 300 reversed
+        // SNPs keep the reversed share above the 99% convention gate.
+        let mut requested: Vec<VariantKey> = (0..300u64)
+            .map(|i| VariantKey::new_with_alleles("1", 1_000 + i, "A", "G"))
+            .collect();
+        let insertion = VariantKey::new_with_alleles("1", 500, "T", "TA");
+        let snp = VariantKey::new_with_alleles("1", 600, "C", "T");
+        requested.push(insertion.clone());
+        requested.push(snp.clone());
+
+        let mut selector = ModelKeySelector::new(&requested);
+        for i in 0..300u64 {
+            selector.observe(VariantKey::new_with_alleles("1", 1_000 + i, "G", "A"));
+        }
+        selector.observe(VariantKey::new_with_alleles("1", 500, "T", "TA"));
+        selector.observe(VariantKey::new_with_alleles("1", 600, "C", "T"));
+        let result = selector.finish();
+        assert_eq!(result.indices.len(), 301);
+        assert_eq!(result.missing, vec![insertion]);
+        assert_eq!(result.indices[300], 301, "the SNP row keeps its match");
+        assert_eq!(result.match_kinds[300], MatchKind::Exact);
+        assert_eq!(result.keys[300], snp);
     }
 
     use super::*;
