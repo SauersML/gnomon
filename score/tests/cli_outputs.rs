@@ -414,6 +414,163 @@ fn concurrent_score_runs_with_different_out_prefixes_agree() -> TestResult {
     Ok(())
 }
 
+/// The fixture's native score text as a PGS Catalog scoring file without a pgs_id.
+fn catalog_text(native: &str) -> String {
+    let mut text =
+        String::from("chr_name\tchr_position\teffect_allele\tother_allele\teffect_weight\n");
+    for row in native.lines().skip(1) {
+        text.push_str(&row.replacen(':', "\t", 1));
+        text.push('\n');
+    }
+    text
+}
+
+/// Swaps each row's effect and other allele: the same size, other scores.
+fn swap_alleles(text: &str, first_allele_column: usize) -> String {
+    let mut swapped = String::with_capacity(text.len());
+    for (index, row) in text.lines().enumerate() {
+        let mut fields: Vec<&str> = row.split('\t').collect();
+        if index > 0 {
+            fields.swap(first_allele_column, first_allele_column + 1);
+        }
+        swapped.push_str(&fields.join("\t"));
+        swapped.push('\n');
+    }
+    swapped
+}
+
+/// A score file replaced by a newer version under an older timestamp, as `rsync -t`
+/// and `cp -p` leave it, is scored as the newer version: a repeat run gives what a
+/// run on fresh copies with no cache gives.
+#[test]
+fn a_score_file_updated_under_an_older_timestamp_is_scored_as_updated() -> TestResult {
+    let tmp = tempdir()?;
+    let inputs = tmp.path().join("inputs");
+    let (genotypes, native) = stage_inputs(&inputs)?;
+    let catalog = inputs.join("catalog.txt");
+    fs::write(&catalog, catalog_text(&fs::read_to_string(&native)?))?;
+
+    for (score, first_allele_column) in [(native, 1), (catalog, 2)] {
+        let stem = score.file_stem().expect("score stem").to_os_string();
+        let sscore_name = format!("cohort_{}.sscore", stem.to_string_lossy());
+        let sscore = inputs.join(&sscore_name);
+        let cache_home = tmp.path().join("xdg").join(&stem);
+        let score_run = |score: &Path, genotypes: &Path, cache_home: &Path| {
+            Command::new(SCORE_BIN)
+                .current_dir(tmp.path())
+                .env("XDG_CACHE_HOME", cache_home)
+                .arg(score)
+                .arg(genotypes)
+                .output()
+        };
+
+        assert_success(&score_run(&score, &genotypes, &cache_home)?);
+        let before = fs::read(&sscore)?;
+
+        let modified = fs::metadata(&score)?.modified()?;
+        let original = fs::read_to_string(&score)?;
+        let updated = swap_alleles(&original, first_allele_column);
+        assert_eq!(updated.len(), original.len());
+        fs::write(&score, &updated)?;
+        fs::File::options()
+            .write(true)
+            .open(&score)?
+            .set_times(fs::FileTimes::new().set_modified(modified))?;
+        assert_eq!(fs::metadata(&score)?.modified()?, modified);
+
+        fs::remove_file(&sscore)?;
+        assert_success(&score_run(&score, &genotypes, &cache_home)?);
+        let repeat = fs::read(&sscore)?;
+        assert!(
+            repeat != before,
+            "{}: the old version was scored",
+            score.display()
+        );
+
+        // A catalog file without a pgs_id is labelled by its directory's name, so the
+        // fresh copy sits in a directory of the same name.
+        let fresh = tmp.path().join("fresh").join(&stem).join("inputs");
+        let (fresh_genotypes, _) = stage_inputs(&fresh)?;
+        let fresh_score = fresh.join(score.file_name().expect("score name"));
+        fs::write(&fresh_score, &updated)?;
+        assert_success(&score_run(
+            &fresh_score,
+            &fresh_genotypes,
+            &tmp.path().join("xdg-fresh").join(&stem),
+        )?);
+        assert!(
+            repeat == fs::read(fresh.join(&sscore_name))?,
+            "{}: a repeat run differs from a cold run",
+            score.display()
+        );
+    }
+    Ok(())
+}
+
+/// The same through a directory of score files, where a previous run's converted
+/// copy beside the replaced source must not be scored in its place.
+#[test]
+fn a_score_directory_updated_under_an_older_timestamp_is_scored_as_updated() -> TestResult {
+    let tmp = tempdir()?;
+    let score_run = |scores: &Path, genotypes: &Path, cache_home: &Path| {
+        Command::new(SCORE_BIN)
+            .current_dir(tmp.path())
+            .env("XDG_CACHE_HOME", cache_home)
+            .arg(scores)
+            .arg(genotypes)
+            .output()
+    };
+    let inputs = tmp.path().join("inputs");
+    let (genotypes, native) = stage_inputs(&inputs)?;
+    let original = catalog_text(&fs::read_to_string(&native)?);
+    let updated = swap_alleles(&original, 2);
+    assert_eq!(updated.len(), original.len());
+    let scores = inputs.join("scores");
+    fs::create_dir(&scores)?;
+    let catalog = scores.join("catalog.txt");
+    fs::write(&catalog, &original)?;
+    let sscore = inputs.join("cohort_scores.sscore");
+    let cache_home = tmp.path().join("xdg");
+
+    assert_success(&score_run(&scores, &genotypes, &cache_home)?);
+    let before = fs::read(&sscore)?;
+    assert!(
+        scores.join("catalog.gnomon.tsv").is_file(),
+        "no converted copy was left beside the source"
+    );
+
+    let modified = fs::metadata(&catalog)?.modified()?;
+    fs::write(&catalog, &updated)?;
+    fs::File::options()
+        .write(true)
+        .open(&catalog)?
+        .set_times(fs::FileTimes::new().set_modified(modified))?;
+    assert_eq!(fs::metadata(&catalog)?.modified()?, modified);
+
+    fs::remove_file(&sscore)?;
+    assert_success(&score_run(&scores, &genotypes, &cache_home)?);
+    let repeat = fs::read(&sscore)?;
+    assert!(repeat != before, "the old version was scored");
+
+    // The catalog file is labelled by its directory's name, so the fresh copy sits in
+    // a directory of the same name.
+    let fresh = tmp.path().join("fresh").join("inputs");
+    let (fresh_genotypes, _) = stage_inputs(&fresh)?;
+    let fresh_scores = fresh.join("scores");
+    fs::create_dir(&fresh_scores)?;
+    fs::write(fresh_scores.join("catalog.txt"), &updated)?;
+    assert_success(&score_run(
+        &fresh_scores,
+        &fresh_genotypes,
+        &tmp.path().join("xdg-fresh"),
+    )?);
+    assert!(
+        repeat == fs::read(fresh.join("cohort_scores.sscore"))?,
+        "a repeat run differs from a cold run"
+    );
+    Ok(())
+}
+
 #[test]
 fn score_out_rejects_a_directory_or_remote_prefix() -> TestResult {
     let tmp = tempdir()?;

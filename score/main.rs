@@ -522,8 +522,8 @@ fn resolve_score_files(
 
     let files: Vec<PathBuf> = if score_arg.is_dir() {
         let mut source_files: Vec<(PathBuf, String)> = Vec::new();
-        let mut cache_files: Vec<(PathBuf, String, Option<std::time::SystemTime>)> = Vec::new();
-        let mut source_mtimes: std::collections::HashMap<String, std::time::SystemTime> =
+        let mut cache_files: Vec<(PathBuf, String, fs::Metadata)> = Vec::new();
+        let mut source_metadata: std::collections::HashMap<String, fs::Metadata> =
             std::collections::HashMap::new();
 
         // Each entry costs a metadata round trip, so every entry is looked up at once.
@@ -550,12 +550,10 @@ fn resolve_score_files(
 
             if name.ends_with(".gnomon.tsv") {
                 if let Some(stem) = name.strip_suffix(".gnomon.tsv") {
-                    cache_files.push((path, stem.to_string(), metadata.modified().ok()));
+                    cache_files.push((path, stem.to_string(), metadata));
                 }
             } else if let Some(stem) = path.file_stem().map(|s| s.to_string_lossy().to_string()) {
-                if let Ok(mtime) = metadata.modified() {
-                    source_mtimes.insert(stem.clone(), mtime);
-                }
+                source_metadata.insert(stem.clone(), metadata);
                 source_files.push((path, stem));
             }
         }
@@ -573,9 +571,9 @@ fn resolve_score_files(
             .collect();
         cache_files.retain(|(path, _, _)| !derived_sorted_copies.contains(path));
 
-        for (path, stem, cache_mtime) in cache_files {
-            let keep_cache = match source_mtimes.get(&stem) {
-                Some(&src_mtime) => cache_mtime.is_some_and(|cache_mtime| cache_mtime >= src_mtime),
+        for (path, stem, cache_metadata) in cache_files {
+            let keep_cache = match source_metadata.get(&stem) {
+                Some(source) => derived_copy_is_fresh(source, &cache_metadata),
                 None => true,
             };
 
@@ -741,6 +739,28 @@ fn sorted_native_score_path(path: &Path, cache_dir: Option<&Path>) -> PathBuf {
     parent.join(format!("{stem}.sorted.gnomon.tsv"))
 }
 
+/// Whether a copy gnomon derived from `source`, a converted or a sorted score file,
+/// was written after the source last changed.
+///
+/// On Unix that is the source's change time. The kernel sets it on every write and
+/// no copy tool can restore it, so a file replaced under an older modification time,
+/// as `cp -p` and `rsync -t` leave it, still reads as changed. Timestamps advance in
+/// coarse ticks, so a copy stamped in the same tick as a change is not trusted.
+fn derived_copy_is_fresh(source: &fs::Metadata, derived: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        (derived.mtime(), derived.mtime_nsec()) > (source.ctime(), source.ctime_nsec())
+    }
+    #[cfg(not(unix))]
+    {
+        match (source.modified(), derived.modified()) {
+            (Ok(changed), Ok(written)) => written > changed,
+            _ => false,
+        }
+    }
+}
+
 /// Writes the sorted copy of each native score file that lacks a fresh one.
 ///
 /// `freshly_converted` names the files this run just wrote with
@@ -753,18 +773,11 @@ fn sort_native_score_files(
     freshly_converted: &HashSet<PathBuf>,
     cache_dir: Option<&Path>,
 ) -> Result<Vec<PathBuf>, Box<dyn Error + Send + Sync>> {
-    let needs_sort = |path: &Path, sorted_path: &Path| {
-        if sorted_path.exists() {
-            let source_meta = fs::metadata(path).and_then(|m| m.modified());
-            let sorted_meta = fs::metadata(sorted_path).and_then(|m| m.modified());
-            match (source_meta, sorted_meta) {
-                (Ok(src_time), Ok(sorted_time)) => src_time > sorted_time,
-                _ => true,
-            }
-        } else {
-            true
-        }
-    };
+    let needs_sort =
+        |path: &Path, sorted_path: &Path| match (fs::metadata(path), fs::metadata(sorted_path)) {
+            (Ok(source), Ok(sorted)) => !derived_copy_is_fresh(&source, &sorted),
+            _ => true,
+        };
     let pairs: Vec<(PathBuf, PathBuf)> = native_score_files
         .into_iter()
         .map(|path| {
@@ -874,11 +887,8 @@ fn normalize_score_files(
                         Some(dir) => keyed_cache_path(dir, score_file_path, "gnomon.tsv"),
                         None => score_file_path.with_extension("gnomon.tsv"),
                     };
-                    let fresh = match (
-                        fs::metadata(score_file_path).and_then(|m| m.modified()),
-                        fs::metadata(&new_path).and_then(|m| m.modified()),
-                    ) {
-                        (Ok(src_time), Ok(cache_time)) => src_time <= cache_time,
+                    let fresh = match (fs::metadata(score_file_path), fs::metadata(&new_path)) {
+                        (Ok(source), Ok(cache)) => derived_copy_is_fresh(&source, &cache),
                         _ => false,
                     };
                     if fresh {
