@@ -30,44 +30,118 @@ pub fn write_atomically<F>(dest: &Path, write: F) -> io::Result<()>
 where
     F: FnOnce(&mut BufWriter<File>) -> io::Result<()>,
 {
-    let dir = dest
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let name = dest.file_name().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("Output path '{}' has no file name.", dest.display()),
-        )
-    })?;
-    // Create the temporary file first, and the directory only when that fails:
-    // create_dir_all always attempts a mkdir, which on a network filesystem is a
-    // server round trip for every output even when the directory already exists.
-    let (temp_path, temp_file) = match create_temp_file(dir, name) {
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            fs::create_dir_all(dir)?;
-            create_temp_file(dir, name)?
-        }
-        created => created?,
-    };
+    publish(dest, write, true)
+}
 
-    let published = (|| -> io::Result<()> {
-        let mut writer = BufWriter::with_capacity(1 << 20, temp_file);
-        write(&mut writer)?;
-        let file = writer.into_inner().map_err(io::IntoInnerError::into_error)?;
-        file.sync_all()?;
-        drop(file);
-        rename_replacing(&temp_path, dest)
-    })();
-    if let Err(err) = published {
-        let _ = fs::remove_file(&temp_path);
-        return Err(err);
+/// Like [`write_atomically`], but without the fsync. The rename still shows readers
+/// only complete files, but after a crash the published file may hold torn content.
+/// Use it only for a cache that verifies its own content when read and rebuilds on a
+/// mismatch; never for results.
+pub fn write_atomically_unsynced<F>(dest: &Path, write: F) -> io::Result<()>
+where
+    F: FnOnce(&mut BufWriter<File>) -> io::Result<()>,
+{
+    publish(dest, write, false)
+}
+
+fn publish<F>(dest: &Path, write: F, synced: bool) -> io::Result<()>
+where
+    F: FnOnce(&mut BufWriter<File>) -> io::Result<()>,
+{
+    let mut file = AtomicFile::create(dest)?;
+    // On an error the file is dropped uncommitted, which removes the temporary file.
+    write(file.writer())?;
+    file.finish(synced)
+}
+
+/// A file being published, for writers that do not fit in one closure, such as a
+/// stream of score blocks. Writes go to a temporary file in the destination
+/// directory, and [`AtomicFile::commit`] flushes and fsyncs it, then renames it over
+/// the destination. Dropped without committing, it removes the temporary file, so a
+/// failed or abandoned publication leaves the destination as it was.
+pub struct AtomicFile {
+    dest: PathBuf,
+    temp_path: PathBuf,
+    writer: Option<BufWriter<File>>,
+}
+
+impl AtomicFile {
+    /// Creates the temporary file for `dest`, and `dest`'s directory if needed.
+    pub fn create(dest: &Path) -> io::Result<Self> {
+        let dir = dest
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let name = dest.file_name().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Output path '{}' has no file name.", dest.display()),
+            )
+        })?;
+        // Create the temporary file first, and the directory only when that fails:
+        // create_dir_all always attempts a mkdir, which on a network filesystem is a
+        // server round trip for every output even when the directory already exists.
+        let (temp_path, temp_file) = match create_temp_file(dir, name) {
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                fs::create_dir_all(dir)?;
+                create_temp_file(dir, name)?
+            }
+            created => created?,
+        };
+        Ok(Self {
+            dest: dest.to_path_buf(),
+            temp_path,
+            writer: Some(BufWriter::with_capacity(1 << 20, temp_file)),
+        })
     }
-    // The directory is deliberately not fsynced. A crash can at worst lose the
-    // rename, which leaves the previous file or none, never a partial one, while
-    // on network filesystems that fsync costs milliseconds per output even for
-    // a table of a few bytes.
-    Ok(())
+
+    /// The buffered writer over the temporary file. It needs no flushing.
+    pub fn writer(&mut self) -> &mut BufWriter<File> {
+        self.writer
+            .as_mut()
+            .expect("an uncommitted publication always has its writer")
+    }
+
+    /// Publishes the file: flushes and fsyncs it, then renames it over the destination.
+    pub fn commit(mut self) -> io::Result<()> {
+        self.finish(true)
+    }
+
+    fn finish(&mut self, synced: bool) -> io::Result<()> {
+        let writer = self
+            .writer
+            .take()
+            .expect("an uncommitted publication always has its writer");
+        let published = (|| -> io::Result<()> {
+            let file = writer
+                .into_inner()
+                .map_err(io::IntoInnerError::into_error)?;
+            if synced {
+                file.sync_all()?;
+            }
+            drop(file);
+            rename_replacing(&self.temp_path, &self.dest)
+        })();
+        if published.is_err() {
+            let _ = fs::remove_file(&self.temp_path);
+        }
+        // The directory is deliberately not fsynced. A crash can at worst lose the
+        // rename, which leaves the previous file or none, never a partial one, while
+        // on network filesystems that fsync costs milliseconds per output even for
+        // a table of a few bytes.
+        published
+    }
+}
+
+impl Drop for AtomicFile {
+    fn drop(&mut self) {
+        if let Some(writer) = self.writer.take() {
+            // Discard the buffer rather than flush it into a file that is about to go.
+            let (file, _) = writer.into_parts();
+            drop(file);
+            let _ = fs::remove_file(&self.temp_path);
+        }
+    }
 }
 
 /// Creates `.{name}.{pid}.{nanos}.tmp` in `dir` exclusively, so concurrent
@@ -382,7 +456,57 @@ mod tests {
 
 #[cfg(test)]
 mod destination_tests {
-    use super::{ensure_output_writable, rename_retrying};
+    use super::{AtomicFile, ensure_output_writable, rename_retrying, write_atomically_unsynced};
+
+    #[test]
+    fn a_publication_dropped_before_commit_leaves_the_destination_as_it_was() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("cohort.sscore");
+        fs::write(&dest, b"previous\n").expect("seed the destination");
+        let mut file = AtomicFile::create(&dest).expect("create");
+        file.writer().write_all(b"partial rows").expect("write");
+        drop(file);
+        assert_eq!(fs::read(&dest).expect("read"), b"previous\n");
+        assert_eq!(
+            fs::read_dir(dir.path()).expect("read_dir").count(),
+            1,
+            "a temporary file stayed"
+        );
+    }
+
+    #[test]
+    fn a_committed_publication_appears_only_at_commit() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("results").join("cohort.sscore");
+        let mut file = AtomicFile::create(&dest).expect("create");
+        file.writer().write_all(b"#IID\n").expect("header");
+        file.writer().write_all(b"person-1\n").expect("row");
+        assert!(!dest.exists(), "the destination appeared before commit");
+        file.commit().expect("commit");
+        assert_eq!(fs::read(&dest).expect("read"), b"#IID\nperson-1\n");
+        let entries = fs::read_dir(dest.parent().expect("parent"))
+            .expect("read_dir")
+            .count();
+        assert_eq!(entries, 1, "a temporary file stayed");
+    }
+
+    #[test]
+    fn an_unsynced_publication_replaces_the_destination_whole() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("plans").join("plan.bin");
+        write_atomically_unsynced(&dest, |writer| writer.write_all(b"first")).expect("publish");
+        write_atomically_unsynced(&dest, |writer| writer.write_all(b"second, longer"))
+            .expect("republish");
+        assert_eq!(fs::read(&dest).expect("read"), b"second, longer");
+        let names: Vec<_> = fs::read_dir(dest.parent().expect("parent"))
+            .expect("read_dir")
+            .map(|entry| entry.expect("directory entry").file_name())
+            .collect();
+        assert_eq!(names, [std::ffi::OsString::from("plan.bin")]);
+    }
     use std::fs;
     use std::io;
     use std::path::Path;
