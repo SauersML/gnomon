@@ -308,6 +308,7 @@ fn mapped_batch_rows(n_rows: usize, row_len: usize, available_bytes: u64) -> usi
 }
 
 /// The byte range of the `.bed` file covering `batch`, whose indices ascend.
+#[cfg(any(unix, test))]
 fn mapped_span(batch: &[usize], row_len: usize) -> Range<usize> {
     match (batch.first(), batch.last()) {
         (Some(&first), Some(&last)) => {
