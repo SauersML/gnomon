@@ -8,7 +8,6 @@ use libdeflater::Decompressor;
 use memchr::{memchr, memchr_iter, memrchr};
 use noodles_vcf::io::Reader as VcfReader;
 use noodles_vcf::variant::record::AlternateBases as _;
-use noodles_vcf::variant::record::Samples as _;
 use noodles_vcf::variant::record::samples::keys::key;
 use rayon::prelude::*;
 use std::error::Error;
@@ -654,27 +653,11 @@ where
         .max()
         .expect("at least one dosage FORMAT field was validated");
 
-    let scores_every_sample = kept_indices.len() == samples.len()
-        && kept_indices.first() == Some(&0)
-        && kept_indices.last().copied() == Some(samples.len() - 1);
-    if scores_every_sample {
-        for (out_idx, sample) in samples.iter().enumerate() {
-            let decoded = decode_vcf_sample(
-                sample.as_ref(),
-                ds_index,
-                gp_index,
-                gt_idx,
-                last_format_index,
-                alt_index,
-                alt_count,
-            )?;
-            visit(out_idx, decoded)?;
-        }
-        return Ok(());
-    }
-
+    // People are visited in output order whether the record carries exactly
+    // the header's samples, fewer (the rest are missing) or more (the extra
+    // columns are never decoded).
     let mut kept_cursor = 0usize;
-    for (sample_idx, sample) in samples.iter().enumerate() {
+    for (sample_idx, sample) in vcf_sample_columns(samples.as_ref()).enumerate() {
         while kept_cursor < kept_indices.len() && kept_indices[kept_cursor] < sample_idx {
             kept_cursor += 1;
         }
@@ -686,7 +669,7 @@ where
         }
 
         let decoded = decode_vcf_sample(
-            sample.as_ref(),
+            sample,
             ds_index,
             gp_index,
             gt_idx,
@@ -706,6 +689,27 @@ where
     Ok(())
 }
 
+/// The sample columns of a record's samples field, split exactly as noodles'
+/// `Samples::iter` splits them: after the FORMAT column, on tabs, with a lone
+/// '.' read as an empty sample and nothing after a trailing tab.
+fn vcf_sample_columns(samples: &str) -> impl Iterator<Item = &str> {
+    let mut rest = samples.split_once('\t').map_or("", |(_, columns)| columns);
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        let column = match memchr(b'\t', rest.as_bytes()) {
+            Some(end) => {
+                let (column, tail) = rest.split_at(end);
+                rest = &tail[1..];
+                column
+            }
+            None => std::mem::take(&mut rest),
+        };
+        Some(if column == "." { "" } else { column })
+    })
+}
+
 #[inline]
 fn decode_vcf_sample(
     sample: &str,
@@ -719,7 +723,22 @@ fn decode_vcf_sample(
     let mut ds_field = None;
     let mut gp_field = None;
     let mut gt_field = None;
-    for (idx, field) in sample.split(':').enumerate() {
+    // The same pieces `sample.split(':')` yields, up to the last FORMAT field used.
+    let mut remaining = Some(sample);
+    for idx in 0..=last_format_index {
+        let Some(rest) = remaining else {
+            break;
+        };
+        let field = match memchr(b':', rest.as_bytes()) {
+            Some(end) => {
+                remaining = Some(&rest[end + 1..]);
+                &rest[..end]
+            }
+            None => {
+                remaining = None;
+                rest
+            }
+        };
         if ds_index == Some(idx) {
             ds_field = Some(field);
         }
@@ -728,9 +747,6 @@ fn decode_vcf_sample(
         }
         if gt_index == Some(idx) {
             gt_field = Some(field);
-        }
-        if idx == last_format_index {
-            break;
         }
     }
 
@@ -2286,6 +2302,36 @@ mod tests {
             let err = score_vcf_streaming(&vcf_path, std::slice::from_ref(&score_path), None, None)
                 .expect_err("malformed records");
             assert!(err.to_string().contains(expected), "{records:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn sample_columns_split_as_noodles_splits_them() {
+        let header = b"##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts1\ts2\ts3\n";
+        for samples in [
+            "GT\t0/1\t1|1\t./.",
+            "GT\t0/1\t\t1/1",
+            "GT\t0/1\t",
+            "GT\t\t",
+            "GT\t.\t0/1",
+            "GT",
+            "GT:DS\t0/1:0.5\t.:.\t1",
+        ] {
+            let mut stream = header.to_vec();
+            stream
+                .extend_from_slice(format!("22\t100\t.\tA\tG\t.\tPASS\t.\t{samples}\n").as_bytes());
+            let mut reader = VcfReader::new(&stream[..]);
+            reader.read_header().expect("header");
+            let mut record = noodles_vcf::Record::default();
+            reader.read_record(&mut record).expect("record");
+            let expected: Vec<String> = record
+                .samples()
+                .iter()
+                .map(|sample| sample.as_ref().to_string())
+                .collect();
+            let samples = record.samples();
+            let actual: Vec<&str> = vcf_sample_columns(samples.as_ref()).collect();
+            assert_eq!(actual, expected, "{samples:?}");
         }
     }
 }
