@@ -86,8 +86,10 @@ Optional arguments:
   QC does not add another genome traversal. Like MAF, call rate is computed
   after `--list`, `--markers`, and `--keep`, and the exact retained marker list
   defines subsequent LD windows and PCA passes.
-* `--allow-unconverged` – Emit the solver's best available model when its
-  bounded pass budget is exhausted. This never labels the result converged:
+* `--allow-unconverged` – Emit the solver's best available model when it stops
+  without converging: at its bounded pass budget, or sooner once its measured
+  progress shows the requested boundary cannot resolve before that budget (see
+  the eigensolver section below). This never labels the result converged:
   `hwe.json` and `hwe_summary.tsv` retain the measured residual, subspace
   change, boundary gap and `converged=false`. Use it when a requested boundary
   lies inside a nearly degenerate ancestry/noise cluster and a fixed component
@@ -206,6 +208,19 @@ Lanczos: every pass advances every requested component at once.
   eigenspace and "the first exactly `k` PCs" is not a well-conditioned object.
   The solver widens its guard band rather than spending more passes on a
   distinction the data does not support.
+* **A boundary no pass can resolve is recognised before the ceiling.** Ask for
+  more components than the data has structure and the boundary lands in the
+  noise bulk, whose top eigenvalues sit a few parts in ten thousand apart. The
+  axes above it reach roundoff within about eight passes; the boundary's own
+  residual then falls by roughly a seventh a pass, the Chebyshev rate for a gap
+  that narrow, and would need some eighty passes to reach the tolerance. Once
+  the gap is below `cluster_gap`, the axes above the cluster are at the residual
+  floor, and the boundary's measured rate — granted four times over — cannot
+  reach the tolerance in the passes left, the solver stops and reports exactly
+  what the ceiling would have: `converged=false`, the residual, subspace change
+  and gap. Without `--allow-unconverged` the fit is refused with the same
+  message, sooner. A cluster that is resolving shows it in its rate, so a fit
+  that converges runs exactly as before.
 
 ### What this costs, measured
 
@@ -228,6 +243,34 @@ records `converged=false`, the residual, subspace change and boundary gap in
 both model and summary. The leading four axes remain exact as a subspace: their
 canonical correlations against the strict four-component fit are
 1.000000000000 on all four axes.
+
+### Stopping where no pass can help
+
+A fit that asks for more components than the data has structure used to spend
+the whole pass ceiling before reporting `converged=false`. With the boundary
+stop, measured at `e7865ee0` against the same tree plus the stop, 8 threads
+pinned to one NUMA node of a shared cluster node:
+
+| cohort | request | passes | wall clock | peak RSS | worst residual | structured axes vs converged reference |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 50k × 20k, 5 populations | `--components 4` | 5 → 5 | 16.1 s → 15.9 s | 0.73 GB | 2.9e-8 | 5.8e-8, output unchanged |
+| 50k × 20k, 5 populations | `--components 10 --allow-unconverged` | 32 → 16 | 109.1 s → **56.8 s** | 1.03 → 0.88 GB | 2.3e-3 → 1.6e-2 | 1.2e-13 → 1.8e-13 |
+| 50k × 20k, 5 populations | `--components 20 --allow-unconverged` | 32 → 14 | 125.2 s → **53.5 s** | 1.26 → 0.96 GB | 1.8e-3 → 1.9e-2 | 2.0e-13 → 2.1e-13 |
+| 100k × 20k, 5 populations | `--components 10 --allow-unconverged` | 32 → 15 | 191.6 s → **88.3 s** | 1.94 → 1.64 GB | 1.8e-3 → 1.5e-2 | 6.0e-13 → 6.2e-13 |
+| 1000 Genomes on GSA, 3,200 × 562,259 | `--components 10 --allow-unconverged` | 19 → 19 | 84.4 s → 83.4 s | 2.08 GB | 7.4e-7, converged | 7.2e-15, output unchanged |
+| 1000 Genomes on GSA, 3,200 × 562,259 | `--components 20 --allow-unconverged` | 19 → 19 | 83.7 s → 89.5 s | 3.15 GB | 9.9e-7, converged | 1.0e-14, output unchanged |
+
+The four structured axes agree with a converged reference to roundoff either
+way, and their canonical correlations with it are 1.000000000000. What the stop
+gives up is refinement of the axes inside the bulk: their residual is about
+1.5e-2 instead of about 2e-3, and the top-`k` subspace change about 1e-2 instead
+of 1e-4. Neither version resolves those axes individually, and both are
+recorded as unconverged. Without `--allow-unconverged`, the 50k × 20k,
+`--components 10` fit is refused after 55.8 s instead of 109.3 s, with the same
+message. A fit the stop does not fire on is untouched byte for byte. That
+covers every fit in the golden default, edge and medium sets that converges or
+stops at a `--max-passes` ceiling; the 1000 Genomes fits at `k = 20`, whose
+boundary gap is 4.4e-3, are among them.
 
 ### Current PLINK2 comparison
 
