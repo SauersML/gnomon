@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::fs::File;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
@@ -7,6 +8,8 @@ use infer_sex::{
     Chromosome, EvidenceReport, GenomeBuild, InferenceConfig, InferenceError, InferenceResult,
     InferredSex, PlatformDefinition, SexInferenceAccumulator, VariantInfo,
 };
+use memmap2::Mmap;
+use rayon::prelude::*;
 use thiserror::Error;
 
 use crate::adapt_plink2::GenomeBuild as PgenGenomeBuild;
@@ -96,6 +99,9 @@ impl VariantLoci {
     /// per variant. A label is classified exactly as its normalized key would be,
     /// once per run of rows that share it.
     fn from_bim(dataset: &PlinkDataset) -> Result<Self, PlinkIoError> {
+        if let Some(loci) = Self::scan_local_bim(dataset, BIM_SCAN_CHUNK_BYTES) {
+            return Ok(loci);
+        }
         let mut loci = Self {
             chroms: Vec::with_capacity(dataset.n_variants()),
             positions: Vec::with_capacity(dataset.n_variants()),
@@ -113,6 +119,109 @@ impl VariantLoci {
         })?;
         Ok(loci)
     }
+
+    /// [`VariantLoci::from_bim`] for a local `.bim`: the file is mapped and
+    /// scanned in parallel chunks, each extended to the end of its last line.
+    ///
+    /// `PlinkDataset::open` has already validated every line, so this pass only
+    /// looks for the label and position columns. It finds them as
+    /// `split_whitespace` does, and skips the lines `PlinkVariantRecordIter`
+    /// skips. It returns `None` when the path is not a local file or the scan
+    /// does not reproduce the validated shape, and the caller then reads through
+    /// the record reader, which reports whatever changed.
+    fn scan_local_bim(dataset: &PlinkDataset, chunk_bytes: usize) -> Option<Self> {
+        let file = File::open(dataset.bim_path()).ok()?;
+        // SAFETY: the map is read-only and dropped before this returns. As with
+        // the `.bed` map, the file must not be truncated while it is mapped.
+        let map = unsafe { Mmap::map(&file) }.ok()?;
+        let text: &[u8] = &map;
+
+        let mut bounds = vec![0];
+        let mut search_from = chunk_bytes.max(1);
+        while search_from < text.len() {
+            let Some(offset) = memchr::memchr(b'\n', &text[search_from..]) else {
+                break;
+            };
+            let end = search_from + offset + 1;
+            bounds.push(end);
+            search_from = end + chunk_bytes.max(1);
+        }
+        if bounds.last() != Some(&text.len()) {
+            bounds.push(text.len());
+        }
+
+        let chunks: Vec<Option<Self>> = bounds
+            .par_windows(2)
+            .map(|chunk| scan_bim_chunk(&text[chunk[0]..chunk[1]]))
+            .collect();
+        let mut loci = Self {
+            chroms: Vec::with_capacity(dataset.n_variants()),
+            positions: Vec::with_capacity(dataset.n_variants()),
+        };
+        for chunk in chunks {
+            let chunk = chunk?;
+            loci.chroms.extend_from_slice(&chunk.chroms);
+            loci.positions.extend_from_slice(&chunk.positions);
+        }
+        (loci.positions.len() == dataset.n_variants()).then_some(loci)
+    }
+}
+
+/// Bytes of `.bim` text per parallel scan chunk, before a chunk is extended to
+/// the end of its last line.
+const BIM_SCAN_CHUNK_BYTES: usize = 1 << 20;
+
+/// The loci of every line in one chunk of `.bim` text, or `None` if a line has
+/// no label or no `u64` position.
+fn scan_bim_chunk(text: &[u8]) -> Option<VariantLoci> {
+    let mut loci = VariantLoci::default();
+    let mut label: &[u8] = &[];
+    let mut class = None;
+    let mut rest = text;
+    while !rest.is_empty() {
+        let line = match memchr::memchr(b'\n', rest) {
+            Some(end) => {
+                let line = &rest[..end];
+                rest = &rest[end + 1..];
+                line
+            }
+            None => std::mem::take(&mut rest),
+        };
+        // `LocalTextSource` drops the newline and one carriage return, and the
+        // record reader skips lines that are only ASCII whitespace.
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let (line_label, position) = bim_label_and_position(line)?;
+        if loci.positions.is_empty() || line_label != label {
+            label = line_label;
+            class = classify_chromosome(
+                &VariantKey::new(str::from_utf8(line_label).ok()?, position).chromosome,
+            );
+        }
+        loci.chroms.push(class);
+        loci.positions.push(position);
+    }
+    Some(loci)
+}
+
+/// A `.bim` line's label and position columns, found as `split_whitespace`
+/// finds them.
+fn bim_label_and_position(line: &[u8]) -> Option<(&[u8], u64)> {
+    let (label, position) = if line.is_ascii() {
+        // On ASCII text `split_whitespace` splits on exactly these bytes.
+        let mut fields = line
+            .split(|byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r'))
+            .filter(|field| !field.is_empty());
+        let label = fields.next()?;
+        (label, fields.nth(2)?)
+    } else {
+        let mut fields = str::from_utf8(line).ok()?.split_whitespace();
+        let label = fields.next()?;
+        (label.as_bytes(), fields.nth(2)?.as_bytes())
+    };
+    Some((label, str::from_utf8(position).ok()?.parse().ok()?))
 }
 
 impl SexVariantSelection {
@@ -1422,6 +1531,57 @@ mod tests {
         assert_eq!(from_bim.chroms[19], Some(LocusChromosome::XPar));
         assert_eq!(from_bim.chroms[20], Some(LocusChromosome::XPar));
         assert_eq!(from_bim.chroms[21], None);
+        Ok(())
+    }
+
+    /// The mapped scan must find the rows the record reader finds, on any
+    /// chunking and whatever the line endings, separators and blank lines.
+    #[test]
+    fn mapped_bim_scan_reads_what_the_record_reader_reads() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let lines = [
+            "1\tv0\t0\t1000\tA\tG\n",
+            "1 v1 0  1001 A G\r\n",
+            "\n",
+            "   \t\r\n",
+            "chr1\x0bv2\x0b0\x0b+1002\x0bA\x0bG\n",
+            "1\u{a0}v3\u{a0}0\u{a0}1003\u{a0}A\u{a0}G\n",
+            "X\tv4\t0\t155800000\tA\tG\n",
+            "25\tv5\t0\t155900000\tA\tG\r\n",
+            "Y\tv6\t0\t3000000\tA\tG",
+        ];
+        let dir = tempdir()?;
+        let prefix = dir.path().join("scan");
+        std::fs::write(prefix.with_extension("bim"), lines.concat())?;
+        std::fs::write(prefix.with_extension("fam"), "F0\tI0\t0\t0\t0\t-9\n")?;
+        std::fs::write(
+            prefix.with_extension("bed"),
+            [0x6c, 0x1b, 0x01, 0, 0, 0, 0, 0, 0, 0],
+        )?;
+
+        let dataset = GenotypeDataset::open(prefix.with_extension("bed"), None)?;
+        let GenotypeDataset::Plink(plink) = &dataset else {
+            panic!("the fixture is a PLINK 1 fileset");
+        };
+        let mut expected = VariantLoci::default();
+        plink.for_each_variant_position(|label, position| {
+            expected.chroms.push(classify_chromosome(
+                &VariantKey::new(label, position).chromosome,
+            ));
+            expected.positions.push(position);
+        })?;
+        assert_eq!(
+            expected.positions,
+            [1000, 1001, 1002, 1003, 155_800_000, 155_900_000, 3_000_000]
+        );
+        for chunk_bytes in [1, 2, 7, 64, BIM_SCAN_CHUNK_BYTES] {
+            assert_eq!(
+                VariantLoci::scan_local_bim(plink, chunk_bytes).as_ref(),
+                Some(&expected),
+                "{chunk_bytes}-byte chunks"
+            );
+        }
+        assert_eq!(VariantLoci::from_bim(plink)?, expected);
         Ok(())
     }
 
