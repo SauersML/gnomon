@@ -137,6 +137,9 @@ jobs:
           ASSET_SUFFIX: ${{ matrix.asset_suffix }}
           USE_ZIG: ${{ matrix.use_zig || false }}
           GLIBC_FLOOR: ${{ matrix.glibc_floor || '' }}
+          # zig cc 0.16 (clang 21) will not inline libdeflate 1.26's 512-bit
+          # intrinsics without evex512; cc-rs reads this for the zig legs' target.
+          CFLAGS_x86_64_unknown_linux_gnu: ${{ matrix.use_zig && '-mevex512' || '' }}
         run: |
           set -euo pipefail
 
