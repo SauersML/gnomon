@@ -2661,12 +2661,29 @@ impl Iterator for PlinkVariantRecordIter {
     }
 }
 
+/// The selected rows of a remote `.bed`, downloaded once into one buffer that
+/// stands in for a local mapping. Rows adjacent in the file get adjacent slots
+/// and an unused slot separates rows that are not, so a packed kernel finds the
+/// same runs of rows, and the same bytes, that it finds on the mapping.
+#[derive(Debug)]
+struct CompactRows {
+    payload: Vec<u8>,
+    /// Slot of each selected row, in selection order; without a selection
+    /// every row was downloaded in file order and is its own slot.
+    slots: Option<Vec<usize>>,
+    n_slots: usize,
+}
+
 #[derive(Debug)]
 pub struct PlinkVariantBlockSource {
     bed: BedSource,
     /// The rows this pass still reads, planned against a remote BED on first
     /// read and dropped when the cursor rewinds.
     planned: Option<BedSource>,
+    /// A remote BED's selected rows, downloaded for the packed and fused
+    /// decoders when memory allows, and kept for every pass: `None` until
+    /// tried, and `Some(None)` once declined or failed, which is not retried.
+    compact: Option<Option<CompactRows>>,
     bytes_per_variant: usize,
     physical_n_samples: usize,
     sample_selection: Option<Vec<usize>>,
@@ -2690,6 +2707,7 @@ impl PlinkVariantBlockSource {
         Self {
             bed,
             planned: None,
+            compact: None,
             bytes_per_variant,
             physical_n_samples: n_samples,
             sample_selection: None,
@@ -2706,7 +2724,10 @@ impl PlinkVariantBlockSource {
     /// BED, so that requests cover only those rows and run ahead of the
     /// decoder. A mapped BED is read directly and needs no plan.
     fn plan_remote_rows(&mut self) -> Result<(), PlinkIoError> {
-        if self.planned.is_some() || !self.bed.supports_read_plan() {
+        if self.planned.is_some()
+            || matches!(self.compact, Some(Some(_)))
+            || !self.bed.supports_read_plan()
+        {
             return Ok(());
         }
         // Out-of-range indices stay out of the plan; the block that reaches
@@ -2725,6 +2746,80 @@ impl PlinkVariantBlockSource {
                 .with_read_plan(&rows, self.bytes_per_variant as u64)?,
         );
         Ok(())
+    }
+
+    /// Downloads a remote BED's selected rows into [`CompactRows`] when they
+    /// fit in a quarter of available memory, so that the packed and fused
+    /// decoders run on them exactly as on a mapping. A mapped or whole BED
+    /// needs no copy, and a selection with an out-of-range row keeps streaming,
+    /// so the decoder that reaches the row reports it as it would locally.
+    fn ensure_compact_rows(&mut self) -> Result<(), PlinkIoError> {
+        if self.compact.is_some() || !self.bed.supports_read_plan() {
+            return Ok(());
+        }
+        // One attempt: rows that do not fit, or fail to download, stay streamed.
+        self.compact = Some(None);
+        let bytes_per_variant = self.bytes_per_variant;
+        let (rows, slots): (Vec<u64>, Option<Vec<usize>>) = match &self.selection {
+            Some(indices) => {
+                if indices.iter().any(|&index| index >= self.total_variants) {
+                    return Ok(());
+                }
+                let mut slots = Vec::with_capacity(indices.len());
+                let mut slot = 0usize;
+                for (position, &index) in indices.iter().enumerate() {
+                    if position > 0 && index != indices[position - 1] + 1 {
+                        slot += 1;
+                    }
+                    slots.push(slot);
+                    slot += 1;
+                }
+                (indices.iter().map(|&index| index as u64).collect(), Some(slots))
+            }
+            None => ((0..self.total_variants as u64).collect(), None),
+        };
+        let n_slots = match &slots {
+            Some(slots) => slots.last().map_or(0, |&last| last + 1),
+            None => rows.len(),
+        };
+        let Some(payload_len) = n_slots.checked_mul(bytes_per_variant) else {
+            return Ok(());
+        };
+        let held = (rows.len() as u64).saturating_mul(bytes_per_variant as u64);
+        let (_, available) = crate::memory::memory_bytes();
+        if held > available / 4 {
+            return Ok(());
+        }
+        let planned = self.bed.with_read_plan(&rows, bytes_per_variant as u64)?;
+        // The slots between non-adjacent rows are never read, and a zeroed
+        // allocation leaves their pages uncommitted.
+        let mut payload = vec![0u8; payload_len];
+        for (position, &row) in rows.iter().enumerate() {
+            let slot = slots.as_ref().map_or(position, |slots| slots[position]);
+            let start = slot * bytes_per_variant;
+            planned.read_at(
+                PLINK_HEADER_LEN + row * bytes_per_variant as u64,
+                &mut payload[start..start + bytes_per_variant],
+            )?;
+        }
+        self.compact = Some(Some(CompactRows {
+            payload,
+            slots,
+            n_slots,
+        }));
+        Ok(())
+    }
+
+    /// The packed rows the decoders read, how many rows they span, and where
+    /// each selected row is among them: a mapping (or a remote BED held whole)
+    /// is indexed by the selection itself, and downloaded rows by their slots.
+    fn packed_rows(&self) -> Option<(&[u8], usize, Option<&[usize]>)> {
+        let total_bytes = self.bytes_per_variant.checked_mul(self.total_variants)?;
+        if let Some(data) = self.bed.mmap_slice(PLINK_HEADER_LEN as usize, total_bytes) {
+            return Some((data, self.total_variants, self.selection.as_deref()));
+        }
+        let compact = self.compact.as_ref()?.as_ref()?;
+        Some((&compact.payload, compact.n_slots, compact.slots.as_deref()))
     }
 
     pub(crate) fn select_samples(&mut self, indices: Vec<usize>) -> Result<(), PlinkIoError> {
@@ -2794,6 +2889,7 @@ impl VariantBlockSource for PlinkVariantBlockSource {
         if max_variants == 0 {
             return Ok(0);
         }
+        self.ensure_compact_rows()?;
         self.plan_remote_rows()?;
         if let Some(selection) = &self.selection {
             let remaining = selection.len().saturating_sub(self.cursor);
@@ -2820,19 +2916,20 @@ impl VariantBlockSource for PlinkVariantBlockSource {
                 )));
             }
 
-            // A local BED is already memory-mapped. Decode selected columns
-            // directly from that mapping, in parallel, instead of issuing one
-            // `pread` and one serial decode for every non-contiguous marker.
-            // Evenly spaced marker budgets are intentionally non-contiguous;
-            // at biobank scale the old path turned a single mmap traversal into
-            // tens of thousands of tiny reads before arithmetic could begin.
-            let total_bytes = self
-                .bytes_per_variant
+            // A local BED is already memory-mapped, and a remote BED's selected
+            // rows may have been downloaded. Decode selected columns directly
+            // from those bytes, in parallel, instead of issuing one `pread` and
+            // one serial decode for every non-contiguous marker. Evenly spaced
+            // marker budgets are intentionally non-contiguous; at biobank scale
+            // the old path turned a single mmap traversal into tens of
+            // thousands of tiny reads before arithmetic could begin.
+            self.bytes_per_variant
                 .checked_mul(self.total_variants)
                 .ok_or_else(|| {
                     PlinkIoError::InvalidHeader("PLINK BED payload length overflow".into())
                 })?;
-            if let Some(data) = self.bed.mmap_slice(PLINK_HEADER_LEN as usize, total_bytes) {
+            if let Some((data, _, Some(rows))) = self.packed_rows() {
+                let rows = &rows[self.cursor..self.cursor + ncols];
                 let bytes_per_variant = self.bytes_per_variant;
                 let physical_n_samples = self.physical_n_samples;
                 let sample_byte_masks = self.sample_byte_masks.as_deref();
@@ -2845,7 +2942,7 @@ impl VariantBlockSource for PlinkVariantBlockSource {
                         .par_chunks_mut(nrows)
                         .enumerate()
                         .for_each(|(logical, dest)| {
-                            let physical = slice[logical];
+                            let physical = rows[logical];
                             let start = physical * bytes_per_variant;
                             let bytes = &data[start..start + bytes_per_variant];
                             decode_plink_variant_rows(
@@ -3061,13 +3158,13 @@ impl VariantBlockSource for PlinkVariantBlockSource {
             )));
         }
 
-        let total_bytes = self
-            .bytes_per_variant
+        self.bytes_per_variant
             .checked_mul(self.total_variants)
             .ok_or_else(|| {
                 PlinkIoError::InvalidHeader("PLINK BED payload length overflow".into())
             })?;
-        let Some(data) = self.bed.mmap_slice(PLINK_HEADER_LEN as usize, total_bytes) else {
+        self.ensure_compact_rows()?;
+        let Some((data, _, rows)) = self.packed_rows() else {
             return Ok(None);
         };
 
@@ -3100,8 +3197,8 @@ impl VariantBlockSource for PlinkVariantBlockSource {
                 .par_chunks_mut(nrows)
                 .enumerate()
                 .for_each(|(logical, dest)| {
-                    let physical = selection
-                        .map(|indices| indices[cursor + logical])
+                    let physical = rows
+                        .map(|rows| rows[cursor + logical])
                         .unwrap_or(cursor + logical);
                     let start = physical * bytes_per_variant;
                     let bytes = &data[start..start + bytes_per_variant];
@@ -3139,23 +3236,19 @@ impl VariantBlockSource for PlinkVariantBlockSource {
     }
 
     fn hard_call_packed(&mut self) -> Option<crate::map::fit::HardCallPacked<'_>> {
-        let total_bytes = self.bytes_per_variant.checked_mul(self.total_variants)?;
-        let data = self
-            .bed
-            .mmap_slice(PLINK_HEADER_LEN as usize, total_bytes)?;
-        let packed = match self.selection.as_deref() {
-            Some(selection) => crate::map::fit::HardCallPacked::new_selected(
+        // Rows that could not be downloaded are left to the streaming decoder,
+        // which reports the failure when it reaches them.
+        self.ensure_compact_rows().ok()?;
+        let (data, n_rows, rows) = self.packed_rows()?;
+        let packed = match rows {
+            Some(rows) => crate::map::fit::HardCallPacked::new_selected(
                 data,
                 self.bytes_per_variant,
-                self.total_variants,
-                selection,
+                n_rows,
+                rows,
                 self.match_kinds.as_deref(),
             ),
-            None => crate::map::fit::HardCallPacked::new(
-                data,
-                self.bytes_per_variant,
-                self.total_variants,
-            ),
+            None => crate::map::fit::HardCallPacked::new(data, self.bytes_per_variant, n_rows),
         };
         Some(
             match (
@@ -6977,6 +7070,92 @@ mod tests {
         let expected = decode(local, None, None);
         assert_eq!(expected.len(), 2 * n_variants * n_samples);
         assert_eq!(decode(remote, None, None), expected);
+    }
+
+    #[test]
+    fn remote_plink_rows_downloaded_for_packed_decoders_match_the_mapping() {
+        let dir = tempdir().unwrap();
+        let bed_path = dir.path().join("packed.bed");
+        // Larger than the one block a remote BED is read whole below.
+        let (n_samples, bytes_per_variant, n_variants) = (8_001usize, 2_001usize, 4_200usize);
+        let mut object = vec![0x6c, 0x1b, 0x01];
+        for variant in 0..n_variants {
+            let codes: Vec<u8> = (0..n_samples)
+                .map(|sample| ((variant * 5 + sample * 7 + sample / 11) % 4) as u8)
+                .collect();
+            object.extend_from_slice(&pack_plink_codes(&codes));
+        }
+        std::fs::write(&bed_path, &object).unwrap();
+        let (url, _requests) = serve_object_ranges(object);
+        // Runs of adjacent rows, a one-row gap, out of file order, and a repeat.
+        let selection = vec![7, 8, 9, 11, 12, 40, 3, 4, 4, 5];
+        let kinds: Vec<MatchKind> = (0..selection.len())
+            .map(|slot| if slot % 4 == 2 { MatchKind::Swap } else { MatchKind::Exact })
+            .collect();
+        let open = |bed: BedSource| {
+            PlinkVariantBlockSource::new(
+                bed,
+                bytes_per_variant,
+                n_samples,
+                n_variants,
+                Some(selection.clone()),
+                Some(kinds.clone()),
+            )
+        };
+        let mut remote = open(open_bed_source(Path::new(&url), None).unwrap());
+        let mut local = open(open_bed_source(&bed_path, None).unwrap());
+
+        {
+            let remote_view = remote.hard_call_packed().expect("downloaded rows are packed");
+            let local_view = local.hard_call_packed().expect("mapped rows are packed");
+            assert_eq!(remote_view.n_variants(), local_view.n_variants());
+            for start in 0..selection.len() {
+                for count in 1..=4 {
+                    assert_eq!(
+                        remote_view.slice(start, count),
+                        local_view.slice(start, count),
+                        "slice({start}, {count})"
+                    );
+                }
+                assert_eq!(remote_view.match_kind(start), local_view.match_kind(start));
+            }
+        }
+        assert!(matches!(remote.compact, Some(Some(_))));
+        // Model gaps split runs the same way on both.
+        let present: Vec<bool> = (0..selection.len() + 2)
+            .map(|model| model != 1 && model != 6)
+            .collect();
+        {
+            let remote_view = remote.hard_call_packed().unwrap().with_model_gaps(&present).unwrap();
+            let local_view = local.hard_call_packed().unwrap().with_model_gaps(&present).unwrap();
+            for start in 0..present.len() {
+                for count in 1..=3 {
+                    assert_eq!(remote_view.slice(start, count), local_view.slice(start, count));
+                }
+            }
+        }
+
+        let n = selection.len();
+        let frequencies: Vec<f64> = (0..n).map(|variant| 0.1 + variant as f64 * 0.07).collect();
+        let scales: Vec<f64> = (0..n).map(|variant| 0.5 + variant as f64 * 0.11).collect();
+        let weights: Vec<f64> = (0..n).map(|variant| 1.0 + variant as f64 * 0.03).collect();
+        let fused = |source: &mut PlinkVariantBlockSource| {
+            source.reset().unwrap();
+            let mut storage = vec![0.0; n * n_samples];
+            let filled = source
+                .next_standardized_block_into(n, &mut storage, &frequencies, &scales, Some(&weights))
+                .unwrap();
+            assert_eq!(filled, Some(n));
+            storage.iter().map(|value| value.to_bits()).collect::<Vec<_>>()
+        };
+        assert_eq!(fused(&mut remote), fused(&mut local));
+        let decode = |source: &mut PlinkVariantBlockSource| {
+            source.reset().unwrap();
+            let mut storage = vec![0.0; n * n_samples];
+            assert_eq!(source.next_block_into(n, &mut storage).unwrap(), n);
+            storage.iter().map(|value| value.to_bits()).collect::<Vec<_>>()
+        };
+        assert_eq!(decode(&mut remote), decode(&mut local));
     }
 
     #[test]
