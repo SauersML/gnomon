@@ -236,6 +236,29 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
+  # Otherwise nothing compiles gnomon for Windows until the release build, after
+  # a push has landed. An item used only under cfg(unix) is dead code there, and
+  # #![deny(dead_code)] fails the crate (mapped_span, fixed in b4a92da1). A check
+  # catches that without codegen or linking.
+  windows_check:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-check-${{ hashFiles('Cargo.lock') }}
+          cache-on-failure: true
+
+      - name: Check the release binaries for Windows
+        run: cargo +nightly check --release --bins
+
   rust_tests:
     needs: build_and_test
     runs-on: ubuntu-latest
