@@ -40,8 +40,16 @@ where
             format!("Output path '{}' has no file name.", dest.display()),
         )
     })?;
-    fs::create_dir_all(dir)?;
-    let (temp_path, temp_file) = create_temp_file(dir, name)?;
+    // Create the temporary file first, and the directory only when that fails:
+    // create_dir_all always attempts a mkdir, which on a network filesystem is a
+    // server round trip for every output even when the directory already exists.
+    let (temp_path, temp_file) = match create_temp_file(dir, name) {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir_all(dir)?;
+            create_temp_file(dir, name)?
+        }
+        created => created?,
+    };
 
     let published = (|| -> io::Result<()> {
         let mut writer = BufWriter::with_capacity(1 << 20, temp_file);
