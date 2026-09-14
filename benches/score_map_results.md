@@ -1,5 +1,53 @@
 # Score and packed projection performance
 
+## Exact packed-kernel regime experiment
+
+`benches/probes/exact_score_kernel.rs` exercises every simple row of one real
+score. It compiles the coefficients to fixed point, drains two carry-free limbs
+every 256 rows into i128 totals, and compares direct lookup, mode-centred walks,
+and four-row tables. Every path and repetition produced identical integer sums
+and missing counts, including PGS000027, whose whole-column limb bound fails.
+
+Second-pass times on one pinned Milan core, including batch copying, term
+encoding, and draining, but excluding preparation and range planning:
+
+| Score | Simple rows | People | Direct | Walk | Table |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| PGS000018 | 328,334 | 1 | 45.17 ms | 71.54 ms | 92.74 ms |
+| PGS000018 | 328,334 | 128 | 119.24 ms | 113.98 ms | 107.60 ms |
+| PGS000018 | 328,334 | 512 | 237.99 ms | 188.32 ms | 152.23 ms |
+| PGS000027 | 1,029,181 | 512 | 677.59 ms | 524.54 ms | 360.72 ms |
+
+Inputs are the real 512-person BED, using its first requested number of people.
+The 256 rows are an internal processing batch, not the size of the input score.
+This is an exact-kernel prototype, not a production speedup comparison. It
+excludes the scores' 2,527 and 8,912 complex rules and inherits already-compiled
+CSR coefficients; source duplicate aggregation is not independently validated
+here. Logs use `round19-pgs18-n*` and `round19-pgs27-n512` on MSI.
+
+## Reusing presence masks in narrow packed scoring
+
+The one-to-four-score packed path now reads CSR column presence once per input
+batch and reuses it for every SIMD block and scalar tail. Presence includes zero
+weights, so missing counts do not depend on whether a coefficient is nonzero.
+Ordinary 256-row batches use 1 KiB of stack scratch; larger caller-supplied
+batches reserve their mask storage fallibly. All 74 focused tests pass, including
+zero-weight contributions and row/sample boundaries.
+
+On the complete 1,799,239-marker panel, PGS000018 has 328,334 simple rows and
+2,527 complex rules. Three alternating warm pairs at 3,200 people took median
+compute times of 326.899 ms before and 317.801 ms after (2.8% lower). On the
+51,200-person repeated fixture, warm times ranged from 3.53 to 4.17 seconds;
+the spread is too large to attribute another speedup. Its peak RSS stayed below
+284 MiB. The first cold-data baseline took 12.22 seconds and is excluded from
+that comparison. The larger fixture repeats the original cohort; it is not
+51,200 independent genomes.
+
+All missing counts matched. Maximum SUM differences were 5.33e-15; repeated
+baseline runs also differed at that scale because their floating-point partial
+sums are scheduled differently. These are not byte-identical whole-pipeline
+results. Logs and outputs use `round19-pgs18-` in the MSI iteration directory.
+
 ## Compensated flipped-allele baselines
 
 Preparation now retains rounding residuals when summing each score's flipped-

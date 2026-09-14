@@ -105,7 +105,7 @@ pub fn run_person_major_path(
             3 => narrow!(3),
             4 => narrow!(4),
             _ => unreachable!("scoring requires a nonempty score panel"),
-        }
+        }?;
         return Ok(());
     }
 
@@ -647,21 +647,35 @@ fn run_narrow_scores_packed<const COLUMNS: usize>(
     prep: &PreparationResult,
     scores: &mut [f64],
     missing: &mut [u32],
-) {
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let people = prep.num_people_to_score;
     let row_bytes = prep.bytes_per_variant as usize;
     let stride = prep.stride();
+    // Presence is a property of the score row, including a present zero weight.
+    // Read the CSR once, rather than again for every 32-person block. Ordinary
+    // pipeline batches use the stack; larger caller-supplied batches reserve
+    // their extra scratch fallibly.
+    let mut inline_masks = [0u32; KERNEL_MINI_BATCH_SIZE];
+    let mut extended_masks = Vec::new();
+    let active_masks = if reconciled.len() <= inline_masks.len() {
+        &mut inline_masks[..reconciled.len()]
+    } else {
+        extended_masks.try_reserve_exact(reconciled.len())?;
+        extended_masks.resize(reconciled.len(), 0u32);
+        extended_masks.as_mut_slice()
+    };
+    for (active, &index) in active_masks.iter_mut().zip(reconciled) {
+        for contribution in prep.variant_csr_view(index).iter() {
+            *active |= 1 << contribution.score_column.0;
+        }
+    }
     let full_people = people / 32 * 32;
     for person in (0..full_people).step_by(32) {
         let mut sums = [[Simd::<f64, 8>::splat(0.0); 4]; COLUMNS];
         let mut counts = [[Simd::<u32, 8>::splat(0); 4]; COLUMNS];
-        for (variant, &index) in reconciled.iter().enumerate() {
+        for (variant, &active) in active_masks.iter().enumerate() {
             let offset = variant * row_bytes + person / 4;
             let packed: Simd<u32, 8> = Simd::<u8, 8>::from_slice(&data[offset..offset + 8]).cast();
-            let mut active = 0u32;
-            for contribution in prep.variant_csr_view(index).iter() {
-                active |= 1 << contribution.score_column.0;
-            }
             for lane in 0..4 {
                 let code = (packed >> Simd::splat(2 * lane as u32)) & Simd::splat(3);
                 let high = code >> Simd::splat(1);
@@ -691,13 +705,17 @@ fn run_narrow_scores_packed<const COLUMNS: usize>(
         }
     }
     for person in full_people..people {
-        for (variant, &index) in reconciled.iter().enumerate() {
+        for (variant, &mask) in active_masks.iter().enumerate() {
             let code = (data[variant * row_bytes + person / 4] >> (2 * (person % 4))) & 3;
-            for contribution in prep.variant_csr_view(index).iter() {
-                let column = contribution.score_column.0;
+            if code == 0 {
+                continue;
+            }
+            let mut active = mask;
+            while active != 0 {
+                let column = active.trailing_zeros() as usize;
+                active &= active - 1;
                 let cell = person * COLUMNS + column;
                 match code {
-                    0 => (),
                     1 => {
                         scores[cell] -= corrections[variant * stride + column] as f64;
                         missing[cell] += 1;
@@ -710,6 +728,7 @@ fn run_narrow_scores_packed<const COLUMNS: usize>(
             }
         }
     }
+    Ok(())
 }
 
 /// Compile one score's active rows into a bounded schedule, then keep its SIMD
@@ -1261,7 +1280,8 @@ mod tests {
                             .collect();
                         let weights: Vec<f64> = (0..stride * variants)
                             .map(|i| {
-                                if i % stride < active {
+                                // Present zero weights still count missing calls.
+                                if i % stride < active && i % 7 != 0 {
                                     (i % 73) as f64 / 173.0 - 0.21
                                 } else {
                                     0.0
@@ -1288,7 +1308,8 @@ mod tests {
                             &prep,
                             &mut scores,
                             &mut counts,
-                        );
+                        )
+                        .unwrap();
                         for person in 0..people {
                             for column in 0..COLUMNS {
                                 let mut expected = 0.0;
