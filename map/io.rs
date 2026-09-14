@@ -2403,7 +2403,29 @@ struct ModelKeySelector<'a> {
     matched_keys: Vec<Option<VariantKey>>,
     matched_kinds: Vec<MatchKind>,
     dataset_index: usize,
+    /// Allele matches made without ambiguity, by kind: the evidence for how the
+    /// dataset orders alleles against the model.
+    exact_matches: usize,
+    swap_matches: usize,
+    /// Records at loci holding one allele pair in both orientations, settled by
+    /// `resolve_ambiguous` once the whole dataset has been seen.
+    ambiguous: Vec<AmbiguousRecord>,
 }
+
+/// A dataset record matching one model variant exactly and another swapped.
+struct AmbiguousRecord {
+    dataset_index: usize,
+    key: VariantKey,
+    exact_slot: usize,
+    swap_slot: usize,
+}
+
+/// Share of unambiguous allele matches, in percent, that must agree for their
+/// allele order to count as the dataset's convention. A plink2 .bim against a
+/// model fit on a VCF, or a dataset against a model fit on the same format,
+/// agrees on essentially every site; a .bim ordering alleles by frequency does
+/// not, and there the convention would decide ambiguous loci by chance.
+const ALLELE_ORDER_CONVENTION_PERCENT: usize = 99;
 
 impl<'a> ModelKeySelector<'a> {
     fn new(requested_keys: &'a [VariantKey]) -> Self {
@@ -2436,6 +2458,9 @@ impl<'a> ModelKeySelector<'a> {
             matched_keys: vec![None; requested_unique],
             matched_kinds: vec![MatchKind::Exact; requested_unique],
             dataset_index: 0,
+            exact_matches: 0,
+            swap_matches: 0,
+            ambiguous: Vec::new(),
         }
     }
 
@@ -2464,50 +2489,135 @@ impl<'a> ModelKeySelector<'a> {
             slot = self.next_at_position[slot];
         }
 
-        let exact = exact.map(|slot| (slot, MatchKind::Exact));
-        let wildcard = wildcard.map(|slot| (slot, MatchKind::Wildcard));
-        let swap = swap.map(|slot| (slot, MatchKind::Swap));
-        // A locus can carry one allele pair in both orientations, such as an
-        // insertion and a deletion at one position. Each of the two records then
-        // matches one model variant exactly and the other swapped, and a model
-        // keyed in the other orientation (a .bim keys ALT/REF, a VCF REF/ALT)
-        // would have them cross over if the exact match always won. While both
-        // are unmatched the earlier model variant wins, and a record whose slot
-        // the other orientation took moves on to its next candidate, so a
-        // dataset listing the locus in the model's order matches it in order.
-        let candidates = match (exact, swap) {
-            (Some((exact_slot, _)), Some((swap_slot, _)))
-                if wildcard.is_none()
-                    && swap_slot < exact_slot
-                    && self.matched_indices[exact_slot].is_none()
-                    && self.matched_indices[swap_slot].is_none() =>
-            {
-                [swap, exact, None]
-            }
-            _ => [exact, wildcard, swap],
-        };
-        let mut chosen = None;
-        for (slot, kind) in candidates.into_iter().flatten() {
-            if self.matched_indices[slot].is_none() {
-                chosen = Some((slot, kind));
-                break;
-            }
-            if self.matched_kinds[slot] == kind {
-                // A record with this key already holds the slot: this one is a
-                // duplicate and matches nothing.
-                break;
-            }
-        }
-        if let Some((slot, kind)) = chosen {
-            self.matched_indices[slot] = Some(self.dataset_index);
-            self.matched_keys[slot] = Some(selected_model_key(kind, self.unique_keys[slot], key));
-            self.matched_kinds[slot] = kind;
+        if let (Some(exact_slot), Some(swap_slot), None) = (exact, swap, wildcard) {
+            // The locus holds one allele pair in both orientations, such as an
+            // insertion and a deletion at one position, and this record matches
+            // one of them exactly and the other swapped. Which one it is depends
+            // on how the dataset orders alleles against the model, which only
+            // the whole scan shows.
+            self.ambiguous.push(AmbiguousRecord {
+                dataset_index: self.dataset_index,
+                key,
+                exact_slot,
+                swap_slot,
+            });
+            self.dataset_index += 1;
+            return;
         }
 
+        let matched = exact
+            .map(|slot| (slot, MatchKind::Exact))
+            .or(wildcard.map(|slot| (slot, MatchKind::Wildcard)))
+            .or(swap.map(|slot| (slot, MatchKind::Swap)));
+        if let Some((slot, kind)) = matched
+            && self.matched_indices[slot].is_none()
+        {
+            if key.alleles.is_some() {
+                match kind {
+                    MatchKind::Exact => self.exact_matches += 1,
+                    MatchKind::Swap => self.swap_matches += 1,
+                    MatchKind::Wildcard => {}
+                }
+            }
+            self.assign(slot, kind, key, self.dataset_index);
+        }
         self.dataset_index += 1;
     }
 
-    fn finish(self) -> VariantSelection {
+    fn assign(&mut self, slot: usize, kind: MatchKind, key: VariantKey, dataset_index: usize) {
+        self.matched_indices[slot] = Some(dataset_index);
+        self.matched_keys[slot] = Some(selected_model_key(kind, self.unique_keys[slot], key));
+        self.matched_kinds[slot] = kind;
+    }
+
+    /// Settles the records at loci holding one allele pair in both orientations.
+    ///
+    /// A dataset and a model each order alleles by one convention: a VCF and a
+    /// .pvar list REF then ALT, a plink2 .bim ALT then REF, and a model keeps
+    /// the order of the data it was fit on. The unambiguous matches show whether
+    /// the two conventions agree (almost every match exact) or are reversed
+    /// (almost every match swapped), and that decides which record is which
+    /// variant: against a model fit on a VCF, a plink2 .bim's T>TA (keyed TA,T)
+    /// is the model's insertion (T,TA) by swap, never its deletion (TA,T). Model
+    /// keys carry no variant IDs to consult, so a dataset whose allele order
+    /// follows no convention, such as a .bim ordering alleles by frequency,
+    /// leaves only the order within the locus: each record takes the earliest
+    /// model variant not already held by a record of the other orientation.
+    fn resolve_ambiguous(&mut self) {
+        if self.ambiguous.is_empty() {
+            return;
+        }
+        let allele_matches = self.exact_matches + self.swap_matches;
+        let convention = |matches: usize| {
+            allele_matches > 0 && matches * 100 >= allele_matches * ALLELE_ORDER_CONVENTION_PERCENT
+        };
+        let prevailing = if convention(self.swap_matches) {
+            Some(MatchKind::Swap)
+        } else if convention(self.exact_matches) {
+            Some(MatchKind::Exact)
+        } else {
+            None
+        };
+
+        let records = std::mem::take(&mut self.ambiguous);
+        let count = records.len();
+        let mut matched = 0usize;
+        for record in records {
+            let exact = (record.exact_slot, MatchKind::Exact);
+            let swap = (record.swap_slot, MatchKind::Swap);
+            let chosen = match prevailing {
+                Some(kind) => {
+                    let (slot, kind) = if kind == MatchKind::Swap { swap } else { exact };
+                    self.matched_indices[slot].is_none().then_some((slot, kind))
+                }
+                None => {
+                    let ordered = if record.swap_slot < record.exact_slot {
+                        [swap, exact]
+                    } else {
+                        [exact, swap]
+                    };
+                    let mut chosen = None;
+                    for (slot, kind) in ordered {
+                        if self.matched_indices[slot].is_none() {
+                            chosen = Some((slot, kind));
+                            break;
+                        }
+                        if self.matched_kinds[slot] == kind {
+                            // A record with this key already holds the slot:
+                            // this one is a duplicate and matches nothing.
+                            break;
+                        }
+                    }
+                    chosen
+                }
+            };
+            if let Some((slot, kind)) = chosen {
+                self.assign(slot, kind, record.key, record.dataset_index);
+                matched += 1;
+            }
+        }
+
+        let rule = match prevailing {
+            Some(MatchKind::Swap) => format!(
+                "the dataset's reversed allele order ({} of {} unambiguous matches swapped)",
+                self.swap_matches, allele_matches
+            ),
+            Some(_) => format!(
+                "the dataset's shared allele order ({} of {} unambiguous matches exact)",
+                self.exact_matches, allele_matches
+            ),
+            None => format!(
+                "order within the locus, as {} exact and {} swapped unambiguous matches show no allele-order convention",
+                self.exact_matches, self.swap_matches
+            ),
+        };
+        eprintln!(
+            "> Model-key selection: {count} dataset variant(s) sit at loci holding one allele pair in both orientations; matched {matched} by {rule}."
+        );
+    }
+
+    fn finish(mut self) -> VariantSelection {
+        self.resolve_ambiguous();
         let Self {
             unique_keys,
             matched_indices,
@@ -8553,5 +8663,80 @@ X\t3000100\tds\tA\tG\t.\tPASS\t.\tGT:DS\t1:1\t0:0.25\t0/1:1\t1|1:2\t.:.
         assert_eq!(selection.indices, vec![0, 1, 2]);
         assert_eq!(selection.match_kinds, vec![MatchKind::Swap; 3]);
         assert!(selection.missing.is_empty());
+    }
+
+    /// Where a model holds one allele pair in both orientations, the dataset's
+    /// allele-order convention, not the model's variant order, decides which
+    /// record is which variant. A dataset ordering alleles like the model (a
+    /// model fit on the same format) keeps its exact matches; a dataset with the
+    /// reverse order (a plink2 .bim against a model fit on a VCF) takes the
+    /// swapped variant, whichever orientation the model lists first.
+    #[test]
+    fn model_key_selection_follows_the_dataset_allele_order_at_mirrored_loci() {
+        fn plink_dataset(dir: &Path, name: &str, rows: &[(u64, &str, &str)]) -> GenotypeDataset {
+            let bed_path = dir.join(format!("{name}.bed"));
+            let bim: String = rows
+                .iter()
+                .enumerate()
+                .map(|(i, (pos, a1, a2))| format!("1\tv{i}\t0\t{pos}\t{a1}\t{a2}\n"))
+                .collect();
+            fs::write(bed_path.with_extension("bim"), bim).unwrap();
+            fs::write(bed_path.with_extension("fam"), "f1\ts1\t0\t0\t0\t-9\n").unwrap();
+            let mut bed = vec![0x6c_u8, 0x1b, 0x01];
+            bed.resize(3 + rows.len(), 0);
+            fs::write(&bed_path, bed).unwrap();
+            GenotypeDataset::open(&bed_path, None).unwrap()
+        }
+        let key = |pos: u64, a: &str, b: &str| VariantKey::new_with_alleles("1", pos, a, b);
+        let dir = tempdir().unwrap();
+
+        let same = plink_dataset(
+            dir.path(),
+            "same",
+            &[
+                (50, "A", "G"),
+                (100, "A", "G"),
+                (200, "C", "T"),
+                (300, "G", "T"),
+            ],
+        );
+        let model = [
+            key(50, "A", "G"),
+            key(100, "G", "A"),
+            key(100, "A", "G"),
+            key(200, "C", "T"),
+            key(300, "G", "T"),
+        ];
+        let selection = same.select_variants_by_keys(&model).unwrap();
+        assert_eq!(selection.indices, vec![0, 1, 2, 3]);
+        assert_eq!(selection.match_kinds, vec![MatchKind::Exact; 4]);
+        assert_eq!(selection.missing, vec![key(100, "G", "A")]);
+
+        // T>TA written ALT/REF, against a model keyed REF/ALT.
+        let reversed = plink_dataset(
+            dir.path(),
+            "reversed",
+            &[(50, "G", "A"), (100, "TA", "T"), (200, "T", "C")],
+        );
+        for model in [
+            [
+                key(50, "A", "G"),
+                key(100, "T", "TA"),
+                key(100, "TA", "T"),
+                key(200, "C", "T"),
+            ],
+            [
+                key(50, "A", "G"),
+                key(100, "TA", "T"),
+                key(100, "T", "TA"),
+                key(200, "C", "T"),
+            ],
+        ] {
+            let selection = reversed.select_variants_by_keys(&model).unwrap();
+            assert_eq!(selection.indices, vec![0, 1, 2]);
+            assert_eq!(selection.match_kinds, vec![MatchKind::Swap; 3]);
+            assert_eq!(selection.keys[1], key(100, "T", "TA"));
+            assert_eq!(selection.missing, vec![key(100, "TA", "T")]);
+        }
     }
 }
