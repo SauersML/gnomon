@@ -235,59 +235,68 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, p
 
     def _calculate_biologically_accurate_truth(bim_df, score_df, individuals, genotypes_df):
         """
-        An independent oracle that calculates the 100% correct biological outcome,
-        normalized by the number of scored loci. This logic is designed to mirror
-        a robust tool's handling of multiallelic and ambiguous sites.
+        An independent oracle for gnomon's per-score-row contract. Every score row
+        that matches a BIM record by allele pair is one unit of the MISSING_PCT
+        denominator, and every row that is scored is one unit of the AVG
+        denominator. A row is scored only from calls on the records that carry its
+        own allele pair: a missing record of a split multiallelic site leaves its
+        row missing even when a sibling record at the same position is called.
         """
-        # Group score rules by unique chromosomal locus for efficient lookup.
-        score_rules_by_locus = {}
         score_df = score_df.assign(locus=score_df['variant_id'].str.split(':').str[:2].str.join(':'))
-        for locus, group in score_df.groupby('locus'):
-            score_rules_by_locus[locus] = group.to_dict('records')
-        
-        total_unique_score_loci = len(score_rules_by_locus)
-    
+
         # Group bim records by unique chromosomal locus.
         bim_by_locus = {}
         bim_df = bim_df.assign(locus=bim_df['chr'].astype(str) + ':' + bim_df['pos'].astype(str))
         for locus, group in bim_df.groupby('locus'):
             bim_by_locus[locus] = group.to_dict('records')
-    
+
+        # Pair every score row with the records at its locus that carry its alleles.
+        # A row that no record matches is dropped from the score and its denominator.
+        matched_rules = []
+        for rule in score_df.to_dict('records'):
+            alleles = {rule['effect_allele'], rule['other_allele']}
+            records = [
+                bim_record for bim_record in bim_by_locus.get(rule['locus'], [])
+                if {bim_record['a1'], bim_record['a2']} == alleles
+            ]
+            if records:
+                matched_rules.append((rule, records))
+        total_score_rows = len(matched_rules)
+
         truth_data = []
         iids_expected_to_fail = set()
-    
+
         for iid in individuals:
             sum_score = 0.0
-            loci_scored_count = 0
+            rows_scored_count = 0
             is_fatal_error = False
-    
-            for locus, rules in score_rules_by_locus.items():
-                # Find all non-missing genotype evidence for this person at this locus.
+
+            for rule, records in matched_rules:
+                # Find all non-missing genotype evidence for this person on this row's records.
                 evidence = []
-                if locus in bim_by_locus:
-                    for bim_record in bim_by_locus[locus]:
-                        genotype_val = genotypes_df.loc[bim_record['id'], iid]
-                        if genotype_val != -1:
-                            evidence.append({'bim': bim_record, 'geno': genotype_val})
-                
+                for bim_record in records:
+                    genotype_val = genotypes_df.loc[bim_record['id'], iid]
+                    if genotype_val != -1:
+                        evidence.append({'bim': bim_record, 'geno': genotype_val})
+
                 # Policy-based resolution based on the collected evidence.
                 if not evidence:
-                    # Case 1: Truly missing. No evidence found. Locus is not scored.
+                    # Case 1: Truly missing. No evidence found. The row is not scored.
                     continue
-                
+
                 if len(evidence) > 1:
                     # Case 2: Contradictory Data. Multiple non-missing genotypes found
-                    # for the same person at the same locus. This is a fatal data
-                    # integrity error that a robust tool should fail on.
+                    # for the same person on records with the same alleles. This is a
+                    # fatal data integrity error that a robust tool should fail on.
                     is_fatal_error = True
                     iids_expected_to_fail.add(iid)
-                    break # Stop processing loci for this person.
-    
+                    break # Stop processing rows for this person.
+
                 # Case 3: Success - One Unambiguous Interpretation.
                 winning_evidence = evidence[0]
                 winning_bim = winning_evidence['bim']
                 winning_geno = winning_evidence['geno']
-    
+
                 # Resolve the diploid genotype based on the winning BIM record.
                 # Genotype is encoded relative to (a1, a2) where 0=a1/a1, 1=a1/a2, 2=a2/a2.
                 if winning_geno == 0:
@@ -296,27 +305,21 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, p
                     resolved_genotype = tuple(sorted((winning_bim['a1'], winning_bim['a2'])))
                 else: # winning_geno == 2
                     resolved_genotype = (winning_bim['a2'], winning_bim['a2'])
-    
-                # A single locus is scored, even if multiple rules apply to it.
-                loci_scored_count += 1
-                
-                # Apply all score rules for this locus using the single resolved genotype.
-                for rule in rules:
-                    effect_allele = rule['effect_allele']
-                    weight = rule['simple_score']
-                    
-                    # The dosage is the count of the effect allele in the resolved genotype.
-                    dosage = float(resolved_genotype.count(effect_allele))
-                    sum_score += dosage * weight
-    
+
+                rows_scored_count += 1
+
+                # The dosage is the count of the effect allele in the resolved genotype.
+                dosage = float(resolved_genotype.count(rule['effect_allele']))
+                sum_score += dosage * rule['simple_score']
+
             # Final aggregation for the person
             if is_fatal_error:
                 truth_data.append({'IID': iid, 'SCORE_TRUTH': np.nan, 'MISSING_PCT_TRUTH': np.nan})
             else:
-                # Normalize score by the number of unique loci that were successfully scored.
-                avg_score = sum_score / loci_scored_count if loci_scored_count > 0 else 0.0
-                loci_missed_count = total_unique_score_loci - loci_scored_count
-                missing_pct = (loci_missed_count / total_unique_score_loci) * 100.0 if total_unique_score_loci > 0 else 0.0
+                # Normalize score by the number of score rows that were successfully scored.
+                avg_score = sum_score / rows_scored_count if rows_scored_count > 0 else 0.0
+                rows_missed_count = total_score_rows - rows_scored_count
+                missing_pct = (rows_missed_count / total_score_rows) * 100.0 if total_score_rows > 0 else 0.0
                 truth_data.append({'IID': iid, 'SCORE_TRUTH': avg_score, 'MISSING_PCT_TRUTH': missing_pct})
     
         return pd.DataFrame(truth_data), iids_expected_to_fail
