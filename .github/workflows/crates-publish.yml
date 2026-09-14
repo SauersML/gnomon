@@ -1,0 +1,38 @@
+name: Publish to crates.io
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch: {}
+
+concurrency:
+  group: crates-publish
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check registry version
+        id: registry
+        run: python scripts/release_registry.py crates
+      - uses: dtolnay/rust-toolchain@nightly
+        if: steps.registry.outputs.publish == 'true'
+      - uses: Swatinem/rust-cache@v2
+        if: steps.registry.outputs.publish == 'true'
+        with:
+          key: crates-publish
+          cache-on-failure: true
+      - name: Verify and publish packaged crate
+        if: steps.registry.outputs.publish == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_KEY }}
+        run: cargo publish --locked --package gnomon-pgs --jobs 2

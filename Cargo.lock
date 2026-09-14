@@ -1708,8 +1708,8 @@ dependencies = [
 
 [[package]]
 name = "convert_genome"
-version = "0.3.2"
-source = "git+https://github.com/SauersML/convert_genome?rev=54212bc2740567db3731690973c868924c0d57fd#54212bc2740567db3731690973c868924c0d57fd"
+version = "0.3.3"
+source = "git+https://github.com/SauersML/convert_genome?rev=f34824e7ee0d5fe1f3a09fe39fcbe265e2b6d297#f34824e7ee0d5fe1f3a09fe39fcbe265e2b6d297"
 dependencies = [
  "anyhow",
  "check_build",
@@ -3990,8 +3990,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "gnomon"
-version = "0.1.4"
+name = "gnomon-pgs"
+version = "0.1.5"
 dependencies = [
  "ahash",
  "approx",
@@ -4057,9 +4057,9 @@ dependencies = [
 
 [[package]]
 name = "gnomon-python"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
- "gnomon",
+ "gnomon-pgs",
  "pyo3",
 ]
 

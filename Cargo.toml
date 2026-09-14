@@ -4,8 +4,8 @@ default-members = ["."]
 resolver = "3"
 
 [package]
-name = "gnomon"
-version = "0.1.4"
+name = "gnomon-pgs"
+version = "0.1.5"
 edition = "2024" # Nightly is required
 description = "A high-performance engine for polygenic scores."
 repository = "https://github.com/SauersML/gnomon/"
@@ -13,8 +13,14 @@ keywords = ["bioinformatics", "genomics"]
 categories = ["science"]
 license = "AGPL-3.0-or-later"
 build = "shared/build.rs"
+include = [
+    "Cargo.toml", "Cargo.lock", "LICENSE", "README.md", "rust-toolchain.toml",
+    "cli/**", "shared/**", "score/**", "map/**", "terms/**", "calibrate/**",
+    "benches/**", "tests/**", "data/testdata/**", "examples/repro_cudarc_teardown.rs",
+]
 
 [lib]
+name = "gnomon"
 path = "shared/lib.rs"
 # The core is an `rlib` for the CLI and Rust consumers. The Python extension is
 # a separate `cdylib` crate under `python/native`, so every CLI build does not
@@ -113,7 +119,7 @@ zstd = "0.13"
 dirs = "6.0"
 
 infer_sex = "0.1.0"
-convert_genome = { git = "https://github.com/SauersML/convert_genome", rev = "54212bc2740567db3731690973c868924c0d57fd" }
+convert_genome = { version = "0.3.3", git = "https://github.com/SauersML/convert_genome", rev = "f34824e7ee0d5fe1f3a09fe39fcbe265e2b6d297" }
 
 planus = "=1.1.1" # cf. https://github.com/pola-rs/polars/issues/24208
 
@@ -129,7 +135,7 @@ codegen-units = 1
 panic = "abort"
 strip = true
 
-[profile.release.package.gnomon]
+[profile.release.package.gnomon-pgs]
 codegen-units = 16
 
 [profile.dev]

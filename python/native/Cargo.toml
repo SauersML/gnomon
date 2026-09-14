@@ -1,6 +1,6 @@
 [package]
 name = "gnomon-python"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 publish = false
@@ -10,5 +10,5 @@ name = "_gnomon"
 crate-type = ["cdylib"]
 
 [dependencies]
-gnomon = { path = "../..", default-features = false, features = ["python"] }
+gnomon = { package = "gnomon-pgs", path = "../..", default-features = false, features = ["python"] }
 pyo3 = { version = "0.26", features = ["extension-module", "abi3-py39"] }
