@@ -155,6 +155,11 @@ jobs:
         run: |
           cargo +nightly build --release --bin gnomon
           cargo +nightly build --profile profiling --bin gnomon
+
+      # Publish to PyPI is the only other workflow that compiles the `python`
+      # feature, so a break in the bindings would otherwise first show at release.
+      - name: Check the Python extension crate
+        run: cargo +nightly check -p gnomon-python
       # ----------------------------------------------------------------------------------------
 
       # -------------------- EXPORT: GATHER ONLY ESSENTIAL METADATA --------------------
