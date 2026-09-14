@@ -164,18 +164,18 @@ jobs:
             echo "Projection scores TSV missing; skipping rename." >&2
           fi
 
+      # Action inputs are not run through a shell, so name the files with the
+      # matrix expression rather than the LD_SUFFIX variable the steps above use.
       - name: Upload PCA plot artifacts (--ld ${{ matrix.window.description }})
         if: ${{ always() }}
-        env:
-          LD_SUFFIX: ${{ matrix.window.artifact_suffix }}
         uses: actions/upload-artifact@v4
         with:
           name: gnomon-release-fit-${{ matrix.window.label }}
           path: |
-            artifacts/pc1_pc2_${LD_SUFFIX}.png
-            artifacts/pc3_pc4_${LD_SUFFIX}.png
-            artifacts/pca_projection_scores_${LD_SUFFIX}.tsv
-            artifacts/gnomon-fit-${LD_SUFFIX}.log
+            artifacts/pc1_pc2_${{ matrix.window.artifact_suffix }}.png
+            artifacts/pc3_pc4_${{ matrix.window.artifact_suffix }}.png
+            artifacts/pca_projection_scores_${{ matrix.window.artifact_suffix }}.tsv
+            artifacts/gnomon-fit-${{ matrix.window.artifact_suffix }}.log
           if-no-files-found: warn
 
   compare-projections:
