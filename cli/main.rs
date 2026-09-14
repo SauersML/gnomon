@@ -38,7 +38,7 @@ use gnomon::map::LdWindow;
 #[cfg(feature = "map")]
 use gnomon::map::main as map_cli;
 #[cfg(feature = "terms")]
-use gnomon::terms::infer_sex_to_tsv;
+use gnomon::terms::{infer_sex_to_tsv, infer_sex_to_tsv_at};
 #[cfg(feature = "terms")]
 use infer_sex::GenomeBuild as SexGenomeBuild;
 #[cfg(feature = "calibrate")]
@@ -246,6 +246,11 @@ struct TermsArgs {
     /// Run sex inference on the provided genotype dataset
     #[arg(long)]
     sex: bool,
+
+    /// Output prefix (for example, results/eur writes results/eur.sex.tsv).
+    /// Defaults to <GENOTYPE>.sex.tsv beside the genotype data.
+    #[arg(long, value_name = "PREFIX")]
+    out: Option<PathBuf>,
 }
 
 #[cfg(all(
@@ -847,8 +852,15 @@ fn run_terms(args: TermsArgs) -> Result<(), Box<dyn std::error::Error>> {
             return Err(format!("Unsupported genome build '{value}'; expected 37 or 38").into());
         }
     };
-    let output_path = infer_sex_to_tsv(&args.genotype_path, genome_build)
-        .map_err(|err| Box::new(err) as Box<dyn std::error::Error>)?;
+    let output_path = match args.out.as_deref() {
+        Some(prefix) => {
+            gnomon::output::validate_out_prefix(prefix)?;
+            let path = gnomon::output::prefixed_path(prefix, "sex.tsv");
+            infer_sex_to_tsv_at(&args.genotype_path, genome_build, &path)
+        }
+        None => infer_sex_to_tsv(&args.genotype_path, genome_build),
+    }
+    .map_err(|err| Box::new(err) as Box<dyn std::error::Error>)?;
     println!("Sex inference results written to {}", output_path.display());
     Ok(())
 }

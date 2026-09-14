@@ -103,12 +103,70 @@ fn sync_directory(dir: &Path) {
 #[cfg(not(unix))]
 fn sync_directory(_dir: &Path) {}
 
+/// `PREFIX.suffix`, the file an `--out PREFIX` run writes for one artifact.
+///
+/// The suffix is appended, never substituted for an extension, so
+/// `results/eur.chr22` names `results/eur.chr22.sscore`, the same way
+/// `gnomon fit --out` names its artifacts.
+pub fn prefixed_path(prefix: &Path, suffix: &str) -> PathBuf {
+    let mut path = OsString::from(prefix.as_os_str());
+    path.push(".");
+    path.push(suffix);
+    PathBuf::from(path)
+}
+
+/// Rejects an `--out PREFIX` that cannot name local files: a remote URI, which
+/// std file I/O cannot write, or a directory such as `results/`, whose
+/// artifacts would be hidden files like `results/.sscore`.
+pub fn validate_out_prefix(prefix: &Path) -> io::Result<()> {
+    let raw = prefix.as_os_str().to_string_lossy();
+    let reject = |reason: &str| -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "--out '{}' {reason}; pass a local file prefix such as results/cohort.",
+                prefix.display()
+            ),
+        ))
+    };
+    if raw.starts_with("gs://") || raw.starts_with("http://") || raw.starts_with("https://") {
+        return reject("is a remote location, but outputs are written locally");
+    }
+    if raw.is_empty() || raw.ends_with(std::path::is_separator) || prefix.file_name().is_none() {
+        return reject("names a directory, not a file prefix");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::write_atomically;
+    use super::{prefixed_path, validate_out_prefix, write_atomically};
     use std::fs;
     use std::io::{self, Write};
     use std::path::Path;
+
+    #[test]
+    fn prefixed_paths_append_rather_than_replace_an_extension() {
+        assert_eq!(
+            prefixed_path(Path::new("results/eur.chr22"), "sscore"),
+            Path::new("results/eur.chr22.sscore")
+        );
+        assert_eq!(
+            prefixed_path(Path::new("cohort"), "sex.tsv"),
+            Path::new("cohort.sex.tsv")
+        );
+    }
+
+    #[test]
+    fn out_prefixes_must_name_local_files() {
+        for accepted in ["results/eur", "eur", "../eur.chr22", "/abs/dir/eur"] {
+            validate_out_prefix(Path::new(accepted)).expect(accepted);
+        }
+        for rejected in ["", "results/", ".", "..", "/", "gs://bucket/eur", "https://host/eur"] {
+            let err = validate_out_prefix(Path::new(rejected)).expect_err(rejected);
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{rejected}");
+        }
+    }
 
     fn entries(dir: &Path) -> Vec<String> {
         let mut names: Vec<String> = fs::read_dir(dir)
