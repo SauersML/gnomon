@@ -180,7 +180,9 @@ fn stage_vcf(dir: &Path, n_samples: usize) -> TestResult {
     ]);
     x_positions.sort_unstable();
     rows.extend(x_positions.into_iter().map(|pos| ("X".to_string(), pos)));
-    let mut y_positions: Vec<u64> = (0..300u64).map(|i| 5_000 + i * 200_000).collect();
+    // The fixture is GRCh38, so its Y rows stay within GRCh38's chrY
+    // (57,227,415 bp); a Y position past that would prove GRCh37 instead.
+    let mut y_positions: Vec<u64> = (0..300u64).map(|i| 5_000 + i * 190_000).collect();
     y_positions.extend([
         10_000, 10_001, 2_781_479, 2_781_480, 56_887_902, 56_887_903, 57_217_415, 57_217_416,
     ]);
