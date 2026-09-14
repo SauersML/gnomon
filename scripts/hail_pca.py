@@ -389,6 +389,9 @@ def _import_bcf_as_matrix_table(pattern: str) -> hl.MatrixTable:
                 "Importing a chunk of %d converted VCFs", len(converted_paths)
             )
             piece_mt = hl.import_vcf(converted_paths, **import_kwargs)
+            # union_rows needs identical row, column and entry types, and chunks differ
+            # in their INFO and FORMAT fields (some carry PP). PCA reads only GT and the keys.
+            piece_mt = piece_mt.select_rows().select_cols().select_entries("GT")
 
             if mt is None:
                 mt = piece_mt
