@@ -5,7 +5,6 @@
 // ========================================================================================
 
 use flate2::read::MultiGzDecoder;
-use memmap2::Mmap;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::error::Error;
@@ -17,7 +16,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::score::types::parse_chromosome_label;
-use crate::shared::files::validate_plink_bed_header;
 
 // ========================================================================================
 //                                   Public API
@@ -1114,166 +1112,6 @@ pub fn sort_native_file(input_path: &Path, output_path: &Path) -> Result<(), Ref
         Ok(())
     })?;
     Ok(())
-}
-
-/// Sorts a PLINK binary fileset into a new `{prefix}.sorted.{bed,bim,fam}` trio and returns
-/// the sorted BED path (which can be used with `Path::with_extension`).
-pub fn sort_plink_fileset(
-    bed_path: &Path,
-    bim_path: &Path,
-    fam_path: &Path,
-) -> Result<PathBuf, ReformatError> {
-    struct KeyedBimLine {
-        key: (u8, u32),
-        original_index: usize,
-        raw_line: String,
-    }
-
-    let bim_file = File::open(bim_path)?;
-    let bim_reader = BufReader::new(bim_file);
-    let mut keyed_lines: Vec<KeyedBimLine> = Vec::new();
-
-    let mut valid_variant_index: usize = 0;
-    for (line_idx, line_result) in bim_reader.lines().enumerate() {
-        let line_number = line_idx + 1;
-        let line = line_result.map_err(ReformatError::Io)?;
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let mut parts = line.split_whitespace();
-        let chr_str = parts.next().unwrap_or("");
-        let _ = parts.next();
-        let _ = parts.next();
-        let pos_str = parts.next().unwrap_or("");
-
-        if chr_str.is_empty() || pos_str.is_empty() {
-            return Err(ReformatError::MissingColumns {
-                path: bim_path.to_path_buf(),
-                line_number,
-                line_content: line,
-                missing_column_name: "chromosome/position".to_string(),
-                column_diagnostics: None,
-            });
-        }
-
-        let key = parse_key(chr_str, pos_str).map_err(|details| ReformatError::Parse {
-            path: bim_path.to_path_buf(),
-            line_number,
-            line_content: line.clone(),
-            details,
-        })?;
-
-        keyed_lines.push(KeyedBimLine {
-            key,
-            original_index: valid_variant_index,
-            raw_line: line,
-        });
-        valid_variant_index += 1;
-    }
-
-    if keyed_lines.is_empty() {
-        return Err(ReformatError::InvalidPlinkFileset {
-            path: bim_path.to_path_buf(),
-            details: "BIM file contained no variants.".to_string(),
-        });
-    }
-
-    keyed_lines.par_sort_unstable_by_key(|record| record.key);
-
-    let fam_file = File::open(fam_path)?;
-    let fam_reader = BufReader::new(fam_file);
-    let mut fam_line_count: usize = 0;
-    for line in fam_reader.lines() {
-        let line = line.map_err(ReformatError::Io)?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        fam_line_count += 1;
-    }
-
-    if fam_line_count == 0 {
-        return Err(ReformatError::InvalidPlinkFileset {
-            path: fam_path.to_path_buf(),
-            details: "FAM file contained no individuals.".to_string(),
-        });
-    }
-
-    let bytes_per_variant = fam_line_count.div_ceil(4);
-    let bed_file = File::open(bed_path)?;
-    let mmap = unsafe { Mmap::map(&bed_file)? };
-
-    if mmap.len() < 3 {
-        return Err(ReformatError::InvalidPlinkFileset {
-            path: bed_path.to_path_buf(),
-            details: "BED file is smaller than the 3-byte PLINK header.".to_string(),
-        });
-    }
-    validate_plink_bed_header(&mmap[..3], bed_path).map_err(|details| {
-        ReformatError::InvalidPlinkFileset {
-            path: bed_path.to_path_buf(),
-            details,
-        }
-    })?;
-
-    let expected_bytes = 3 + keyed_lines.len() * bytes_per_variant;
-    if mmap.len() < expected_bytes {
-        return Err(ReformatError::InvalidPlinkFileset {
-            path: bed_path.to_path_buf(),
-            details: format!(
-                "BED file is {actual} bytes but expected at least {expected_bytes} bytes for {variants} variant(s) and {people} individual(s).",
-                actual = mmap.len(),
-                variants = keyed_lines.len(),
-                people = fam_line_count,
-            ),
-        });
-    }
-
-    let parent_dir = match bed_path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-        _ => Path::new(".").to_path_buf(),
-    };
-    let stem = bed_path
-        .file_stem()
-        .ok_or_else(|| ReformatError::InvalidPlinkFileset {
-            path: bed_path.to_path_buf(),
-            details: "Could not derive file stem for BED path.".to_string(),
-        })?;
-
-    let mut sorted_stem = stem.to_os_string();
-    sorted_stem.push(".sorted");
-    let mut sorted_bed_name = sorted_stem.clone();
-    sorted_bed_name.push(".bed");
-    let sorted_bed_path = parent_dir.join(sorted_bed_name);
-    crate::output::write_atomically(&sorted_bed_path, |sorted_bed| {
-        sorted_bed.write_all(&mmap[..3])?;
-        for record in &keyed_lines {
-            let offset = 3 + record.original_index * bytes_per_variant;
-            let end = offset + bytes_per_variant;
-            sorted_bed.write_all(&mmap[offset..end])?;
-        }
-        Ok(())
-    })?;
-
-    let mut sorted_bim_name = sorted_stem.clone();
-    sorted_bim_name.push(".bim");
-    let sorted_bim_path = parent_dir.join(sorted_bim_name);
-    crate::output::write_atomically(&sorted_bim_path, |sorted_bim| {
-        for record in &keyed_lines {
-            writeln!(sorted_bim, "{}", record.raw_line)?;
-        }
-        Ok(())
-    })?;
-
-    let mut sorted_fam_name = sorted_stem.clone();
-    sorted_fam_name.push(".fam");
-    let sorted_fam_path = parent_dir.join(sorted_fam_name);
-    crate::output::write_atomically(&sorted_fam_path, |sorted_fam| {
-        io::copy(&mut File::open(fam_path)?, sorted_fam)?;
-        Ok(())
-    })?;
-
-    Ok(sorted_bed_path)
 }
 
 // ========================================================================================

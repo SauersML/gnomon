@@ -650,7 +650,7 @@ mod tests {
             &scores,
             None,
             None,
-            1,
+            super::super::BimRowOrder::Streamed,
         )
         .unwrap();
         let mut cache = PlanCache::discover(&files, &scores, None).unwrap().unwrap();

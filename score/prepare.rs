@@ -10,7 +10,6 @@
 
 use crate::pipeline_error::PipelineError;
 use crate::score::io::{TextSource, open_plink_text_source, open_text_source};
-use crate::score::reformat;
 use crate::score::types::{
     BimRowIndex, FilesetBoundary, GenomicRegion, GroupedComplexRule, PersonSubset, PipelineKind,
     PreparationResult, ScoreColumnIndex, ScoreInfo, parse_chromosome_label,
@@ -246,6 +245,53 @@ impl CsrBuilder {
             self.sparse_row_offsets,
         )
     }
+
+    /// Reorders rows so their `.bim` indices ascend, carrying each row's flag
+    /// and entries with it. A join over rows sorted by key emits rows in key
+    /// order, but readers visit rows in file order.
+    fn sort_rows_by_bim_index(
+        &mut self,
+        required: &mut Vec<BimRowIndex>,
+        flags: &mut Vec<u8>,
+    ) -> Result<(), PrepError> {
+        if self.sparse_row_offsets.len() != required.len() + 1 || flags.len() != required.len() {
+            return Err(PrepError::Invariant(format!(
+                "CSR rows ({}) and matched variants ({}) disagree before reordering.",
+                self.sparse_row_offsets.len() - 1,
+                required.len()
+            )));
+        }
+        let mut order: Vec<usize> = (0..required.len()).collect();
+        order.sort_unstable_by_key(|&row| required[row]);
+        // Each `.bim` row has one key, so no row can have been emitted twice.
+        if order
+            .windows(2)
+            .any(|pair| required[pair[0]] == required[pair[1]])
+        {
+            return Err(PrepError::Invariant(
+                "A .bim row was matched under two different keys.".to_string(),
+            ));
+        }
+        let mut sorted = CsrBuilder::with_capacity(order.len(), self.sparse_weights.len());
+        for &row in &order {
+            let start = self.sparse_row_offsets[row] as usize;
+            let end = self.sparse_row_offsets[row + 1] as usize;
+            sorted
+                .sparse_weights
+                .extend_from_slice(&self.sparse_weights[start..end]);
+            sorted
+                .sparse_missing_corrections
+                .extend_from_slice(&self.sparse_missing_corrections[start..end]);
+            sorted
+                .sparse_score_columns
+                .extend_from_slice(&self.sparse_score_columns[start..end]);
+            sorted.finish_variant()?;
+        }
+        *required = order.iter().map(|&row| required[row]).collect();
+        *flags = order.iter().map(|&row| flags[row]).collect();
+        *self = sorted;
+        Ok(())
+    }
 }
 
 #[inline(always)]
@@ -389,10 +435,6 @@ pub enum PrepError {
 enum PostMortemAction {
     None,
     Fatal(PrepError),
-    SortAndRetry {
-        fileset: FilesetPaths,
-        unsorted_error: PrepError,
-    },
 }
 
 pub fn prepare_for_computation(
@@ -415,30 +457,14 @@ pub fn prepare_for_computation(
         let (subset, iids) = resolve_person_subset(keep_file, &all_iids, &lookup)?;
         return assemble_preparation(plan, &filesets, subset, iids, all_iids.len(), &lookup);
     }
-    let max_sort_retries = fileset_prefixes.len().max(1);
     let (prep, clean) = prepare_for_computation_with_retry(
         fileset_prefixes,
         sorted_score_files,
         keep_file,
         score_regions,
-        max_sort_retries,
+        BimRowOrder::Streamed,
     )?;
-    // A sort retry produces a different physical row layout. Never publish
-    // that plan under the original, unsorted input's key.
-    let same_layout = match &prep.pipeline_kind {
-        PipelineKind::SingleFile(path) => filesets.len() == 1 && *path == filesets[0].bed,
-        PipelineKind::MultiFile(boundaries) => {
-            boundaries.len() == filesets.len()
-                && boundaries
-                    .iter()
-                    .zip(&filesets)
-                    .all(|(a, b)| a.bed_path == b.bed)
-        }
-    };
-    if clean
-        && same_layout
-        && let Some(cache) = &cache
-    {
+    if clean && let Some(cache) = &cache {
         // Rehash after compilation so a changed source cannot be published
         // under the digest taken before the compiler opened its readers.
         let current = cache::PlanCache::discover(&filesets, sorted_score_files, score_regions)
@@ -461,7 +487,7 @@ fn prepare_for_computation_with_retry(
     sorted_score_files: &[PathBuf],
     keep_file: Option<&Path>,
     score_regions: Option<&HashMap<String, GenomicRegion>>,
-    remaining_sort_retries: usize,
+    bim_row_order: BimRowOrder,
 ) -> Result<(PreparationResult, bool), PrepError> {
     // --- Stage 1: Initial setup ---
     eprintln!("> Stage 1: Indexing subject data...");
@@ -513,7 +539,11 @@ fn prepare_for_computation_with_retry(
         region_filters.clone(),
     )?;
 
-    let mut bim_iter = bim_iterator.by_ref().peekable();
+    let mut bim_rows = match bim_row_order {
+        BimRowOrder::Streamed => BimRows::streamed(&mut bim_iterator),
+        BimRowOrder::Sorted => BimRows::sorted(&mut bim_iterator, &mut seen_invalid_bim_chrs)?,
+    };
+    let mut bim_iter = bim_rows.by_ref().peekable();
     let mut score_iter = score_iterator.by_ref().peekable();
 
     let score_lane_groups = score_names.len().div_ceil(LANE_COUNT);
@@ -819,6 +849,26 @@ fn prepare_for_computation_with_retry(
             Err(e) => return Err(e),
         }
     }
+    if let Some(unsorted_bim) = bim_rows.descended_in() {
+        // The merge-join may already have walked past rows it should have
+        // matched. Redo it over every row sorted by key; the genotype files
+        // stay as they are.
+        eprintln!(
+            "> Variants in {} are not sorted by chromosome and position. Matching them in sorted order...",
+            unsorted_bim.display()
+        );
+        return prepare_for_computation_with_retry(
+            fileset_prefixes,
+            sorted_score_files,
+            keep_file,
+            score_regions,
+            BimRowOrder::Sorted,
+        );
+    }
+    if bim_row_order == BimRowOrder::Sorted {
+        // Rows were emitted in key order; readers visit them in file order.
+        csr_builder.sort_rows_by_bim_index(&mut required_bim_indices, &mut required_is_complex)?;
+    }
 
     let region_filter_hits = score_iterator.take_region_filter_hits();
     if let (Some(filters), Some(hit_flags)) = (region_filters.as_ref(), region_filter_hits.as_ref())
@@ -861,43 +911,6 @@ fn prepare_for_computation_with_retry(
     if required_bim_indices.is_empty() {
         match conduct_post_mortem(&fileset_paths, sorted_score_files)? {
             PostMortemAction::Fatal(err) => return Err(err),
-            PostMortemAction::SortAndRetry {
-                fileset,
-                unsorted_error,
-            } => {
-                if remaining_sort_retries == 0 {
-                    return Err(unsorted_error);
-                }
-
-                let sorted_bed_path =
-                    reformat::sort_plink_fileset(&fileset.bed, &fileset.bim, &fileset.fam)
-                        .map_err(|e| PrepError::PipelineIo {
-                            path: fileset.bed.clone(),
-                            message: e.to_string(),
-                        })?;
-
-                eprintln!(
-                    "> Detected unsorted genotype data in {}. Sorting into {} and retrying...",
-                    fileset.bed.display(),
-                    sorted_bed_path.display()
-                );
-
-                let mut new_prefixes = fileset_prefixes.to_vec();
-                if let Some(idx) = fileset_paths.iter().position(|fs| {
-                    fs.bed == fileset.bed && fs.bim == fileset.bim && fs.fam == fileset.fam
-                }) {
-                    new_prefixes[idx] = sorted_bed_path;
-                    return prepare_for_computation_with_retry(
-                        &new_prefixes,
-                        sorted_score_files,
-                        keep_file,
-                        score_regions,
-                        remaining_sort_retries - 1,
-                    );
-                }
-
-                return Err(unsorted_error);
-            }
             PostMortemAction::None => return Err(PrepError::NoOverlappingVariants(diagnostics)),
         }
     }
@@ -1188,6 +1201,196 @@ fn build_spool_maps(
 mod tests {
     use super::*;
 
+    fn write_bim_fileset(prefix: &Path, rows: &[&str], people: usize) {
+        std::fs::write(prefix.with_extension("bim"), rows.concat()).unwrap();
+        let fam: String = (0..people).map(|i| format!("F I{i} 0 0 0 -9\n")).collect();
+        std::fs::write(prefix.with_extension("fam"), fam).unwrap();
+        let mut bed = vec![0x6c, 0x1b, 0x01];
+        bed.resize(3 + rows.len() * people.div_ceil(4), 0);
+        std::fs::write(prefix.with_extension("bed"), bed).unwrap();
+    }
+
+    type RowPlan = (String, u8, Vec<(u32, u32, u32)>);
+    type RulePlan = (
+        (String, u32),
+        Vec<(String, String, String)>,
+        Vec<(String, String, u32, usize)>,
+    );
+
+    /// What a plan says about each matched row and complex rule, keyed by `.bim`
+    /// row text instead of row position, so plans over different layouts compare.
+    fn plan_by_row_text(prep: &PreparationResult, rows: &[&str]) -> (Vec<RowPlan>, Vec<RulePlan>) {
+        let offsets = prep.sparse_row_offsets();
+        let mut row_plans: Vec<RowPlan> = prep
+            .required_bim_indices
+            .iter()
+            .enumerate()
+            .map(|(i, row)| {
+                let entries = (offsets[i] as usize..offsets[i + 1] as usize)
+                    .map(|e| {
+                        (
+                            prep.sparse_score_columns()[e],
+                            prep.sparse_weights()[e].to_bits(),
+                            prep.sparse_missing_corrections()[e].to_bits(),
+                        )
+                    })
+                    .collect();
+                let text = rows[row.0 as usize].to_string();
+                (text, prep.required_is_complex()[i], entries)
+            })
+            .collect();
+        row_plans.sort();
+        let mut rule_plans: Vec<RulePlan> = prep
+            .complex_rules
+            .iter()
+            .map(|rule| {
+                let contexts = rule
+                    .possible_contexts
+                    .iter()
+                    .map(|(row, a1, a2)| (rows[row.0 as usize].to_string(), a1.clone(), a2.clone()))
+                    .collect();
+                let applications = rule
+                    .score_applications
+                    .iter()
+                    .map(|s| {
+                        let (ea, oa) = (s.effect_allele.clone(), s.other_allele.clone());
+                        (ea, oa, s.weight.to_bits(), s.score_column_index.0)
+                    })
+                    .collect();
+                (rule.locus_chr_pos.clone(), contexts, applications)
+            })
+            .collect();
+        rule_plans.sort();
+        (row_plans, rule_plans)
+    }
+
+    #[test]
+    fn bim_order_does_not_change_which_variants_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let weights = dir.path().join("weights.tsv");
+        std::fs::write(
+            &weights,
+            "variant_id\teffect_allele\tother_allele\tS1\tS2\n\
+             1:100\tG\tA\t0.5\t-1.25\n\
+             1:200\tT\tC\t0.125\t\n\
+             1:300\tC\tA\t2\t0.75\n\
+             1:300\tG\tA\t-0.5\t1\n\
+             2:50\tAT\tA\t1.5\t2.5\n\
+             3:7\tG\tT\t\t3\n\
+             22:1000\tA\tG\t0.25\t0.375\n\
+             X:5\tT\tC\t1\t1\n",
+        )
+        .unwrap();
+        // Unsorted rows, and the same rows stably sorted by chromosome and
+        // position: a flip (rs200), an indel, a split multiallelic locus, a row
+        // with no matching allele pair and one with an unparsable chromosome.
+        let unsorted = [
+            "22 rs1000 0 1000 G A\n",
+            "1 rs300c 0 300 A C\n",
+            "X rsX 0 5 C T\n",
+            "2 rs50 0 50 A AT\n",
+            "chrUn_gl000220 rsUn 0 9 A C\n",
+            "1 rs100 0 100 A G\n",
+            "3 rs7 0 7 T A\n",
+            "1 rs300g 0 300 A G\n",
+            "1 rs200 0 200 T C\n",
+        ];
+        let sorted = [
+            "1 rs100 0 100 A G\n",
+            "1 rs200 0 200 T C\n",
+            "1 rs300c 0 300 A C\n",
+            "1 rs300g 0 300 A G\n",
+            "2 rs50 0 50 A AT\n",
+            "3 rs7 0 7 T A\n",
+            "22 rs1000 0 1000 G A\n",
+            "X rsX 0 5 C T\n",
+            "chrUn_gl000220 rsUn 0 9 A C\n",
+        ];
+        let mut plans = Vec::new();
+        for (name, rows) in [("unsorted", &unsorted), ("sorted", &sorted)] {
+            let prefix = dir.path().join(name);
+            write_bim_fileset(&prefix, rows, 5);
+            let prep = prepare_for_computation(
+                std::slice::from_ref(&prefix),
+                std::slice::from_ref(&weights),
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(
+                prep.required_bim_indices.windows(2).all(|w| w[0] < w[1]),
+                "{name}"
+            );
+            assert_eq!(prep.score_variant_counts, vec![7, 6], "{name}");
+            assert_eq!(prep.total_variants_in_bim, 9, "{name}");
+            let baseline: Vec<u64> = prep
+                .baseline_missing_sum_by_score()
+                .iter()
+                .map(|value| value.to_bits())
+                .collect();
+            plans.push((baseline, plan_by_row_text(&prep, rows)));
+        }
+        assert_eq!(plans[0], plans[1]);
+    }
+
+    #[test]
+    fn bim_order_across_filesets_does_not_change_which_variants_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let weights = dir.path().join("weights.tsv");
+        std::fs::write(
+            &weights,
+            "variant_id\teffect_allele\tother_allele\tS\n\
+             2:10\tA\tG\t1\n\
+             2:20\tC\tT\t2\n\
+             X:30\tG\tA\t4\n",
+        )
+        .unwrap();
+        // Each fileset is sorted, but listing chromosome X first makes the
+        // concatenated rows descend at the boundary, as natural file-name order
+        // does for chrMT before chrX.
+        let x_rows = ["X x30 0 30 A G\n"];
+        let two_rows = ["2 r10 0 10 A G\n", "2 r20 0 20 T C\n"];
+        let x = dir.path().join("x");
+        let two = dir.path().join("two");
+        write_bim_fileset(&x, &x_rows, 3);
+        write_bim_fileset(&two, &two_rows, 3);
+        let mut plans = Vec::new();
+        for (filesets, second_start, rows) in [
+            (
+                [x.clone(), two.clone()],
+                1,
+                [x_rows[0], two_rows[0], two_rows[1]],
+            ),
+            (
+                [two.clone(), x.clone()],
+                2,
+                [two_rows[0], two_rows[1], x_rows[0]],
+            ),
+        ] {
+            let prep =
+                prepare_for_computation(&filesets, std::slice::from_ref(&weights), None, None)
+                    .unwrap();
+            assert_eq!(prep.score_variant_counts, vec![3]);
+            assert!(prep.required_bim_indices.windows(2).all(|w| w[0] < w[1]));
+            let PipelineKind::MultiFile(boundaries) = &prep.pipeline_kind else {
+                panic!("two filesets must keep a multi-file layout");
+            };
+            let starts: Vec<(PathBuf, u64)> = boundaries
+                .iter()
+                .map(|b| (b.bed_path.clone(), b.starting_global_index))
+                .collect();
+            assert_eq!(
+                starts,
+                vec![
+                    (filesets[0].with_extension("bed"), 0),
+                    (filesets[1].with_extension("bed"), second_start),
+                ]
+            );
+            plans.push(plan_by_row_text(&prep, &rows));
+        }
+        assert_eq!(plans[0], plans[1]);
+    }
+
     #[test]
     fn cached_variants_rebind_people_paths_and_keep_layout() {
         let dir = tempfile::tempdir().unwrap();
@@ -1316,8 +1519,14 @@ mod tests {
             "variant_id\teffect_allele\tother_allele\tM\n1:100\tA\tG\t0.25\n1:200\tT\tC\t4\n",
         )
         .unwrap();
-        let (prep, clean) =
-            prepare_for_computation_with_retry(&[prefix], &[first, second], None, None, 0).unwrap();
+        let (prep, clean) = prepare_for_computation_with_retry(
+            &[prefix],
+            &[first, second],
+            None,
+            None,
+            BimRowOrder::Streamed,
+        )
+        .unwrap();
         assert!(clean);
         let columns: Vec<_> = ["Z", "A", "M"]
             .map(|name| prep.score_names.iter().position(|s| s == name).unwrap())
@@ -1582,40 +1791,11 @@ fn conduct_post_mortem(
     let mut bim_chromosomes: AHashSet<u8> = AHashSet::new();
     let mut score_chromosomes: AHashSet<u8> = AHashSet::new();
 
-    let mut bim_iter = BimIterator::new(fileset_paths)?;
-    let mut previous_bim_key: Option<VariantKey> = None;
-
-    while let Some(next_item) = bim_iter.next() {
+    // Row order is irrelevant here: the join matches `.bim` rows in any order.
+    for next_item in BimIterator::new(fileset_paths)? {
         match next_item {
             Ok(record) => {
-                let current_key = record.key;
-                bim_chromosomes.insert(current_key.0);
-
-                if let Some(prev_key) = previous_bim_key
-                    && current_key < prev_key
-                {
-                    let unsorted_error = PrepError::UnsortedInput {
-                        source: "BIM",
-                        path: bim_iter.current_path.clone(),
-                        line_number: bim_iter.local_line_num,
-                        previous_key: prev_key,
-                        current_key,
-                    };
-
-                    if let Some(fileset) = fileset_paths
-                        .iter()
-                        .find(|fs| fs.bim == bim_iter.current_path)
-                    {
-                        return Ok(PostMortemAction::SortAndRetry {
-                            fileset: fileset.clone(),
-                            unsorted_error,
-                        });
-                    }
-
-                    return Ok(PostMortemAction::Fatal(unsorted_error));
-                }
-
-                previous_bim_key = Some(current_key);
+                bim_chromosomes.insert(record.key.0);
             }
             Err(PrepError::Parse(_)) => continue,
             Err(err) => return Err(err),
@@ -1801,6 +1981,99 @@ impl<'a> Iterator for BimIterator<'a> {
                     return Some(Err(map_pipeline_error(err, self.current_path.clone())));
                 }
             }
+        }
+    }
+}
+
+/// How Stage 3 reads `.bim` rows for the merge-join, which needs them in key order.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BimRowOrder {
+    /// Stream rows straight from the files, as most `.bim` files are sorted.
+    Streamed,
+    /// Read every row and sort by key, ties in file order.
+    Sorted,
+}
+
+/// `.bim` rows in key order, as the merge-join consumes them.
+enum BimRows<'i, 'a> {
+    /// Rows straight from the files, ending at the first row whose key sorts
+    /// before its predecessor's: joining past it would silently miss matches.
+    Streamed {
+        rows: &'i mut BimIterator<'a>,
+        previous_key: Option<VariantKey>,
+        descended_in: Option<PathBuf>,
+    },
+    Sorted(std::vec::IntoIter<KeyedBimRecord>),
+}
+
+impl<'i, 'a> BimRows<'i, 'a> {
+    fn streamed(rows: &'i mut BimIterator<'a>) -> Self {
+        Self::Streamed {
+            rows,
+            previous_key: None,
+            descended_in: None,
+        }
+    }
+
+    /// Reads every row. Unparsable rows are reported and skipped exactly as the
+    /// streaming join reports and skips them.
+    fn sorted(
+        rows: &mut BimIterator<'a>,
+        seen_invalid_bim_chrs: &mut AHashSet<String>,
+    ) -> Result<Self, PrepError> {
+        let mut records = Vec::new();
+        for result in rows {
+            match result {
+                Ok(record) => records.push(record),
+                Err(PrepError::Parse(msg)) => {
+                    if let Some(chr_name) = extract_chr_from_parse_error(&msg)
+                        && seen_invalid_bim_chrs.insert(chr_name.to_string())
+                    {
+                        eprintln!(
+                            "Warning: Skipping variant(s) in BIM file due to unparsable chromosome name: '{chr_name}'."
+                        );
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        records.par_sort_unstable_by_key(|record| (record.key, record.bim_row_index));
+        Ok(Self::Sorted(records.into_iter()))
+    }
+
+    /// The `.bim` file in which streamed rows stopped ascending, if they did.
+    fn descended_in(&self) -> Option<&Path> {
+        match self {
+            Self::Streamed { descended_in, .. } => descended_in.as_deref(),
+            Self::Sorted(_) => None,
+        }
+    }
+}
+
+impl Iterator for BimRows<'_, '_> {
+    type Item = Result<KeyedBimRecord, PrepError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Streamed {
+                rows,
+                previous_key,
+                descended_in,
+            } => {
+                if descended_in.is_some() {
+                    return None;
+                }
+                let item = rows.next()?;
+                if let Ok(record) = &item {
+                    if previous_key.is_some_and(|previous| record.key < previous) {
+                        *descended_in = Some(rows.current_path.clone());
+                        return None;
+                    }
+                    *previous_key = Some(record.key);
+                }
+                Some(item)
+            }
+            Self::Sorted(records) => records.next().map(Ok),
         }
     }
 }

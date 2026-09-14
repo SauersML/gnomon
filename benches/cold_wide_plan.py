@@ -7,7 +7,7 @@ import sys
 candidate = root / 'src/score/prepare_probe_candidate.rs'
 candidate.write_text((root / 'src/score/prepare.rs').read_text() + '''
 pub fn compile_uncached(prefixes: &[PathBuf], scores: &[PathBuf]) -> PreparationResult {
-    prepare_for_computation_with_retry(prefixes, scores, None, None, 1).unwrap().0
+    prepare_for_computation_with_retry(prefixes, scores, None, None, BimRowOrder::Streamed).unwrap().0
 }
 ''')
 source = (root / 'src/benches/probes/wide_plan.rs').read_text()
