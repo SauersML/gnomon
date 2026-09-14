@@ -2411,6 +2411,19 @@ struct ModelKeySelector<'a> {
     /// Records at loci holding one allele pair in both orientations, settled by
     /// `resolve_ambiguous` once the whole dataset has been seen.
     ambiguous: Vec<AmbiguousRecord>,
+    /// Records that matched a model variant another record of the opposite
+    /// orientation already holds: two dataset rows at one locus with the same
+    /// allele pair reversed. The convention settles which row is the variant.
+    contested: Vec<ContestedRecord>,
+}
+
+/// A dataset record matching a model variant that an earlier record of the
+/// other orientation holds.
+struct ContestedRecord {
+    dataset_index: usize,
+    key: VariantKey,
+    slot: usize,
+    kind: MatchKind,
 }
 
 /// A dataset record matching one model variant exactly and another swapped.
@@ -2462,6 +2475,7 @@ impl<'a> ModelKeySelector<'a> {
             exact_matches: 0,
             swap_matches: 0,
             ambiguous: Vec::new(),
+            contested: Vec::new(),
         }
     }
 
@@ -2510,19 +2524,72 @@ impl<'a> ModelKeySelector<'a> {
             .map(|slot| (slot, MatchKind::Exact))
             .or(wildcard.map(|slot| (slot, MatchKind::Wildcard)))
             .or(swap.map(|slot| (slot, MatchKind::Swap)));
-        if let Some((slot, kind)) = matched
-            && self.matched_indices[slot].is_none()
-        {
-            if key.alleles.is_some() {
-                match kind {
-                    MatchKind::Exact => self.exact_matches += 1,
-                    MatchKind::Swap => self.swap_matches += 1,
-                    MatchKind::Wildcard => {}
+        if let Some((slot, kind)) = matched {
+            if self.matched_indices[slot].is_none() {
+                if key.alleles.is_some() {
+                    match kind {
+                        MatchKind::Exact => self.exact_matches += 1,
+                        MatchKind::Swap => self.swap_matches += 1,
+                        MatchKind::Wildcard => {}
+                    }
                 }
+                self.assign(slot, kind, key, self.dataset_index);
+            } else if kind != MatchKind::Wildcard && self.matched_kinds[slot] != kind {
+                // The locus holds this allele pair in both orders as two dataset
+                // rows, and the earlier row took the model variant. File order
+                // says nothing about which row is that variant; the dataset's
+                // allele-order convention does, once the whole scan shows it.
+                self.contested.push(ContestedRecord {
+                    dataset_index: self.dataset_index,
+                    key,
+                    slot,
+                    kind,
+                });
             }
-            self.assign(slot, kind, key, self.dataset_index);
         }
         self.dataset_index += 1;
+    }
+
+    /// The allele-order convention the unambiguous matches show, if any.
+    fn prevailing_kind(&self) -> Option<MatchKind> {
+        let allele_matches = self.exact_matches + self.swap_matches;
+        let convention = |matches: usize| {
+            allele_matches > 0 && matches * 100 >= allele_matches * ALLELE_ORDER_CONVENTION_PERCENT
+        };
+        if convention(self.swap_matches) {
+            Some(MatchKind::Swap)
+        } else if convention(self.exact_matches) {
+            Some(MatchKind::Exact)
+        } else {
+            None
+        }
+    }
+
+    /// Under a decisive convention, the row in the prevailing orientation is the
+    /// model's variant at a locus two rows claim, whichever came first. Against
+    /// a model fit on a VCF, a plink2 .bim lists the insertion T>TA as TA,T and
+    /// the deletion as T,TA: the reversed row is the model's (T,TA), and the row
+    /// in file order that happened to spell it the same way is the other variant.
+    /// Without a convention the first claim stands, as before.
+    fn resolve_contested(&mut self) {
+        let Some(prevailing) = self.prevailing_kind() else {
+            self.contested.clear();
+            return;
+        };
+        let contested = std::mem::take(&mut self.contested);
+        let count = contested.len();
+        let mut replaced = 0usize;
+        for record in contested {
+            if record.kind == prevailing && self.matched_kinds[record.slot] != prevailing {
+                self.assign(record.slot, record.kind, record.key, record.dataset_index);
+                replaced += 1;
+            }
+        }
+        if count > 0 {
+            eprintln!(
+                "> Model-key selection: {count} model variant(s) were claimed by two dataset rows of opposite allele order; the dataset's convention decided {replaced} against file order."
+            );
+        }
     }
 
     fn assign(&mut self, slot: usize, kind: MatchKind, key: VariantKey, dataset_index: usize) {
@@ -2549,16 +2616,7 @@ impl<'a> ModelKeySelector<'a> {
             return;
         }
         let allele_matches = self.exact_matches + self.swap_matches;
-        let convention = |matches: usize| {
-            allele_matches > 0 && matches * 100 >= allele_matches * ALLELE_ORDER_CONVENTION_PERCENT
-        };
-        let prevailing = if convention(self.swap_matches) {
-            Some(MatchKind::Swap)
-        } else if convention(self.exact_matches) {
-            Some(MatchKind::Exact)
-        } else {
-            None
-        };
+        let prevailing = self.prevailing_kind();
 
         let records = std::mem::take(&mut self.ambiguous);
         let count = records.len();
@@ -2618,6 +2676,7 @@ impl<'a> ModelKeySelector<'a> {
     }
 
     fn finish(mut self) -> VariantSelection {
+        self.resolve_contested();
         self.resolve_ambiguous();
         let Self {
             unique_keys,
@@ -6893,6 +6952,59 @@ fn decode_bcf_gp_series(
 
 #[cfg(test)]
 mod tests {
+    /// A plink2 .bim lists an insertion T>TA as TA,T and the deletion as T,TA.
+    /// Against a model fit on a VCF, whose insertion is (T,TA), both rows match
+    /// that one model variant, one swapped and one exactly. The row in the
+    /// dataset's prevailing order (here reversed, shown by every SNP) is the
+    /// variant, whichever comes first in the file; without a convention the
+    /// first claim stands.
+    #[test]
+    fn a_duplicate_claim_goes_to_the_prevailing_allele_order() {
+        use super::ModelKeySelector;
+        use crate::map::variant_filter::{MatchKind, VariantKey};
+
+        let snps: Vec<VariantKey> = (0..100u64)
+            .map(|i| VariantKey::new_with_alleles("1", 1_000 + i, "A", "G"))
+            .collect();
+        let insertion = VariantKey::new_with_alleles("1", 500, "T", "TA");
+        let mut requested = snps.clone();
+        requested.push(insertion.clone());
+
+        let select = |swapped_snps: usize| {
+            let mut selector = ModelKeySelector::new(&requested);
+            for (i, snp) in snps.iter().enumerate() {
+                let (a, b) = snp.alleles.clone().unwrap();
+                let (a, b) = if i < swapped_snps { (b, a) } else { (a, b) };
+                selector.observe(VariantKey::new_with_alleles("1", snp.position, &a, &b));
+            }
+            // The deletion row (T,TA) comes first and spells the model's key
+            // exactly; the insertion row (TA,T) follows, reversed.
+            selector.observe(VariantKey::new_with_alleles("1", 500, "T", "TA"));
+            selector.observe(VariantKey::new_with_alleles("1", 500, "TA", "T"));
+            selector.finish()
+        };
+
+        let reversed = select(100);
+        assert_eq!(reversed.indices.len(), 101);
+        assert_eq!(
+            reversed.indices[100], 101,
+            "the reversed row is the insertion"
+        );
+        assert_eq!(reversed.match_kinds[100], MatchKind::Swap);
+        assert_eq!(reversed.keys[100], insertion);
+
+        let same_order = select(0);
+        assert_eq!(
+            same_order.indices[100], 100,
+            "the exact row is the insertion"
+        );
+        assert_eq!(same_order.match_kinds[100], MatchKind::Exact);
+
+        let no_convention = select(50);
+        assert_eq!(no_convention.indices[100], 100, "the first claim stands");
+        assert_eq!(no_convention.match_kinds[100], MatchKind::Exact);
+    }
+
     use super::*;
     use crate::shared::files::VariantSource;
     use std::fs::File;
