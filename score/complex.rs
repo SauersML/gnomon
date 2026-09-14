@@ -1,17 +1,17 @@
 use crate::pipeline_error::PipelineError;
 use crate::score::io::BedSource;
-use crate::score::pipeline::ScopeGuard;
-use crate::score::types::{BimRowIndex, FilesetBoundary, PreparationResult, ScoreInfo};
+use crate::score::types::{
+    BimRowIndex, FilesetBoundary, GroupedComplexRule, OutputPersonIndex, PreparationResult,
+    ScoreInfo,
+};
 use ahash::{AHashMap, AHashSet};
 use indicatif::{ProgressBar, ProgressStyle};
 use memmap2::Mmap;
 use rayon::prelude::*;
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::thread;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// A read-only resolver for fetching complex variant genotypes.
 ///
@@ -66,96 +66,232 @@ impl ComplexVariantResolver {
         }
     }
 
-    /// Fetches a packed genotype for a given person and global variant index.
-    /// This is the fast, central lookup method used by the parallel resolver.
-    #[inline(always)]
-    fn get_packed_genotype(
+    /// Whether every genotype source is memory-mapped, so rows are borrowed in
+    /// place rather than read into buffers.
+    fn is_mapped(&self) -> bool {
+        match self {
+            ComplexVariantResolver::SingleFile(source) => source.mmap().is_some(),
+            ComplexVariantResolver::MultiFile { sources, .. } => {
+                sources.iter().all(|source| source.mmap().is_some())
+            }
+            ComplexVariantResolver::Spool { .. } => true,
+        }
+    }
+
+    /// Finds where one variant's packed row starts. The resolver calls this once
+    /// per rule context, so the fileset search and spool lookup never run per genotype.
+    fn locate_row(
         &self,
         bytes_per_variant: u64,
         bim_row_index: BimRowIndex,
-        fam_index: u32,
-    ) -> Result<u8, PipelineError> {
+    ) -> Result<RowLocation, PipelineError> {
         let (source, local_bim_index) = match self {
-            ComplexVariantResolver::SingleFile(source) => (source, bim_row_index.0),
-            ComplexVariantResolver::MultiFile {
-                sources,
-                boundaries,
-            } => {
+            ComplexVariantResolver::SingleFile(_) => (0, bim_row_index.0),
+            ComplexVariantResolver::MultiFile { boundaries, .. } => {
                 let fileset_idx =
                     boundaries.partition_point(|b| b.starting_global_index <= bim_row_index.0) - 1;
                 let boundary = &boundaries[fileset_idx];
-                let local_index = bim_row_index.0 - boundary.starting_global_index;
-                (&sources[fileset_idx], local_index)
+                (fileset_idx, bim_row_index.0 - boundary.starting_global_index)
             }
-            ComplexVariantResolver::Spool {
-                mmap,
-                offsets,
-                bytes_per_spooled_variant,
-                dense_map,
-            } => {
+            ComplexVariantResolver::Spool { offsets, .. } => {
                 let offset = offsets.get(&bim_row_index).copied().ok_or_else(|| {
                     PipelineError::Io(format!(
                         "Missing spool offset for BIM row {} while resolving complex variant.",
                         bim_row_index.0
                     ))
                 })?;
-                let orig_byte_idx = (fam_index / 4) as usize;
-                if orig_byte_idx >= dense_map.len() {
-                    return Err(PipelineError::Io(format!(
-                        "Family index {} out of bounds for complex spool lookup.",
-                        fam_index
-                    )));
-                }
-                let compact_idx = dense_map[orig_byte_idx];
-                if compact_idx < 0 {
-                    // Defensive: queries should target kept individuals only, but if we miss
-                    // a guard higher up we fall back to a standard PLINK "missing" genotype.
-                    return Ok(0b01);
-                }
-                let final_byte_offset = offset + compact_idx as u64;
-                assert!(
-                    (compact_idx as u64) < *bytes_per_spooled_variant,
-                    "compact index {} exceeds spool stride {}",
-                    compact_idx,
-                    bytes_per_spooled_variant
-                );
-                if final_byte_offset >= offset + bytes_per_spooled_variant {
-                    return Err(PipelineError::Io(format!(
-                        "Computed spool offset {} beyond variant stride {} for BIM row {}.",
-                        final_byte_offset, bytes_per_spooled_variant, bim_row_index.0
-                    )));
-                }
-                let packed_byte = unsafe { *mmap.get_unchecked(final_byte_offset as usize) };
-                let bit_offset_in_byte = (fam_index % 4) * 2;
-                return Ok((packed_byte >> bit_offset_in_byte) & 0b11);
+                return Ok(RowLocation {
+                    bim_row_index,
+                    source: 0,
+                    row_start: offset,
+                });
             }
         };
 
         // The +3 skips the PLINK .bed file magic number (0x6c, 0x1b, 0x01).
-        let variant_start_offset = 3 + local_bim_index * bytes_per_variant;
-        let person_byte_offset = fam_index as u64 / 4;
-        let final_byte_offset = variant_start_offset + person_byte_offset;
+        let row_start = local_bim_index
+            .checked_mul(bytes_per_variant)
+            .and_then(|offset| offset.checked_add(3))
+            .ok_or_else(|| {
+                PipelineError::Io(format!(
+                    "BED offset of BIM row {} overflows u64.",
+                    bim_row_index.0
+                ))
+            })?;
+        Ok(RowLocation {
+            bim_row_index,
+            source,
+            row_start,
+        })
+    }
 
-        let bit_offset_in_byte = (fam_index % 4) * 2;
+    fn bed_source(&self, location: &RowLocation) -> Option<&BedSource> {
+        match self {
+            ComplexVariantResolver::SingleFile(source) => Some(source),
+            ComplexVariantResolver::MultiFile { sources, .. } => sources.get(location.source),
+            ComplexVariantResolver::Spool { .. } => None,
+        }
+    }
 
-        let packed_byte = if let Some(mmap) = source.mmap() {
-            // This indexing is safe because the preparation phase guarantees all indices are valid.
-            unsafe { *mmap.get_unchecked(final_byte_offset as usize) }
-        } else {
-            let mut byte = [0u8; 1];
-            source.read_at(final_byte_offset, &mut byte)?;
-            byte[0]
+    /// Borrows the scored span of a row from its memory map.
+    fn mapped_span(&self, location: &RowLocation, span: RowSpan) -> Result<&[u8], PipelineError> {
+        let start = location
+            .row_start
+            .checked_add(span.start)
+            .and_then(|start| usize::try_from(start).ok());
+        let bytes = match self {
+            ComplexVariantResolver::Spool { mmap, .. } => {
+                start.and_then(|start| mmap.get(start..start.checked_add(span.len)?))
+            }
+            _ => start.and_then(|start| self.bed_source(location)?.mmap_slice(start, span.len)),
         };
-        Ok((packed_byte >> bit_offset_in_byte) & 0b11)
+        bytes.ok_or_else(|| span_out_of_range(location))
+    }
+
+    /// Reads the scored span of a row from a source without a memory map.
+    fn read_span(
+        &self,
+        location: &RowLocation,
+        span: RowSpan,
+        dst: &mut [u8],
+    ) -> Result<(), PipelineError> {
+        let source = self
+            .bed_source(location)
+            .ok_or_else(|| span_out_of_range(location))?;
+        let start = location
+            .row_start
+            .checked_add(span.start)
+            .ok_or_else(|| span_out_of_range(location))?;
+        source.read_at(start, dst)
+    }
+}
+
+fn span_out_of_range(location: &RowLocation) -> PipelineError {
+    PipelineError::Io(format!(
+        "Genotypes for BIM row {} lie outside the genotype data.",
+        location.bim_row_index.0
+    ))
+}
+
+/// Where one rule context's packed row starts.
+#[derive(Clone, Copy)]
+struct RowLocation {
+    bim_row_index: BimRowIndex,
+    source: usize,
+    row_start: u64,
+}
+
+/// The bytes of a row that hold scored people, relative to the row start.
+#[derive(Clone, Copy)]
+struct RowSpan {
+    start: u64,
+    len: usize,
+}
+
+/// Where each scored person's two genotype bits sit inside a row, in output order.
+/// Built once per run, so decoding a row is a gather with no per-genotype lookups.
+struct PersonLayout {
+    /// Each person's byte, relative to `span.start`.
+    bytes: Vec<u32>,
+    /// Each person's bit shift within that byte.
+    shifts: Vec<u8>,
+    /// People whose byte was pruned from the spool, in increasing order.
+    forced_missing: Vec<usize>,
+    span: RowSpan,
+}
+
+impl PersonLayout {
+    fn new(
+        resolver: &ComplexVariantResolver,
+        prep_result: &PreparationResult,
+        num_people: usize,
+    ) -> Result<Self, PipelineError> {
+        let mut row_bytes = Vec::with_capacity(num_people);
+        let mut shifts = Vec::with_capacity(num_people);
+        let mut forced_missing = Vec::new();
+        for person_output_idx in 0..num_people {
+            let output_person_idx = u32::try_from(person_output_idx)
+                .map(OutputPersonIndex)
+                .map_err(|_| {
+                    PipelineError::Io(format!(
+                        "Output person index {} exceeds u32::MAX.",
+                        person_output_idx
+                    ))
+                })?;
+            let fam_index = prep_result
+                .original_person_index_for_output(output_person_idx)
+                .0;
+            let byte = match resolver {
+                ComplexVariantResolver::Spool {
+                    bytes_per_spooled_variant,
+                    dense_map,
+                    ..
+                } => {
+                    let orig_byte_idx = (fam_index / 4) as usize;
+                    let Some(&compact_idx) = dense_map.get(orig_byte_idx) else {
+                        return Err(fetch_error(PipelineError::Io(format!(
+                            "Family index {} out of bounds for complex spool lookup.",
+                            fam_index
+                        ))));
+                    };
+                    if compact_idx < 0 {
+                        // Defensive: queries should target kept individuals only, but if we miss
+                        // a guard higher up we fall back to a standard PLINK "missing" genotype.
+                        forced_missing.push(person_output_idx);
+                        None
+                    } else if compact_idx as u64 >= *bytes_per_spooled_variant {
+                        return Err(PipelineError::Io(format!(
+                            "compact index {} exceeds spool stride {}",
+                            compact_idx, bytes_per_spooled_variant
+                        )));
+                    } else {
+                        Some(compact_idx as u32)
+                    }
+                }
+                _ => Some(fam_index / 4),
+            };
+            row_bytes.push(byte);
+            shifts.push(((fam_index % 4) * 2) as u8);
+        }
+
+        let first = row_bytes.iter().flatten().min().copied();
+        let last = row_bytes.iter().flatten().max().copied();
+        let span = match (first, last) {
+            (Some(first), Some(last)) => RowSpan {
+                start: u64::from(first),
+                len: (last - first) as usize + 1,
+            },
+            _ => RowSpan { start: 0, len: 0 },
+        };
+        let bytes = row_bytes
+            .into_iter()
+            .map(|byte| byte.map_or(0, |byte| byte - span.start as u32))
+            .collect();
+        Ok(Self {
+            bytes,
+            shifts,
+            forced_missing,
+            span,
+        })
+    }
+}
+
+/// Unpacks one context's genotypes for a run of people.
+#[inline]
+fn decode_genotypes(row: &[u8], bytes: &[u32], shifts: &[u8], out: &mut [u8]) {
+    if row.is_empty() {
+        // No scored person has a byte in the row: every one was pruned from the spool.
+        out.fill(0b01);
+        return;
+    }
+    for ((genotype, &byte), &shift) in out.iter_mut().zip(bytes).zip(shifts) {
+        *genotype = (row[byte as usize] >> shift) & 0b11;
     }
 }
 
 // ========================================================================================
 //                            Complex Variant Resolution Types
 // ========================================================================================
-
-// A type alias for the per-thread collector.
-pub type PerThreadCollector = HashMap<Heuristic, (u64, Vec<CriticalIntegrityWarningInfo>)>;
 
 // A type alias for the final, merged collector.
 pub type FinalAggregatedCollector = HashMap<Heuristic, (u64, Vec<CriticalIntegrityWarningInfo>)>;
@@ -222,8 +358,91 @@ pub enum ResolutionMethod {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::score::types::ScoreColumnIndex;
+    use crate::score::io::{ByteRangeSource, open_bed_source};
+    use crate::score::types::{OriginalPersonIndex, PersonSubset, PipelineKind, ScoreColumnIndex};
     use memmap2::MmapOptions;
+    use std::path::{Path, PathBuf};
+
+    /// A PreparationResult carrying only what the complex resolver reads.
+    fn test_prep_result(
+        rules: Vec<GroupedComplexRule>,
+        total_people: usize,
+        kept: &[u32],
+        num_scores: usize,
+        total_variants: u64,
+    ) -> PreparationResult {
+        let bytes_per_variant = (total_people as u64).div_ceil(4);
+        let output_idx_to_fam_idx = kept.iter().copied().map(OriginalPersonIndex).collect();
+        let mut person_fam_to_output_idx = vec![None; total_people];
+        for (output_idx, &fam_idx) in kept.iter().enumerate() {
+            person_fam_to_output_idx[fam_idx as usize] = Some(OutputPersonIndex(output_idx as u32));
+        }
+        let mut sorted_kept = kept.to_vec();
+        sorted_kept.sort_unstable();
+        let mut compact: Vec<u32> = sorted_kept.iter().map(|fam_idx| fam_idx / 4).collect();
+        compact.dedup();
+        let mut dense = vec![-1i32; bytes_per_variant as usize];
+        for (compact_idx, &byte) in compact.iter().enumerate() {
+            dense[byte as usize] = compact_idx as i32;
+        }
+        let spool_bytes_per_variant = compact.len() as u64;
+        PreparationResult::new(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![0],
+            1,
+            vec![0.0; num_scores],
+            Vec::new(),
+            rules,
+            (0..num_scores).map(|i| format!("S{i}")).collect(),
+            vec![0; num_scores],
+            PersonSubset::Indices(sorted_kept),
+            kept.iter().map(|fam_idx| format!("IID{fam_idx}")).collect(),
+            kept.len(),
+            total_people,
+            total_variants,
+            0,
+            bytes_per_variant,
+            person_fam_to_output_idx,
+            output_idx_to_fam_idx,
+            Vec::new(),
+            compact,
+            dense,
+            spool_bytes_per_variant,
+            PipelineKind::SingleFile(PathBuf::from("test")),
+        )
+    }
+
+    /// Reads every scored person's genotype for one variant through the row-major path.
+    fn read_row_genotypes(
+        resolver: &ComplexVariantResolver,
+        prep_result: &PreparationResult,
+        bim_row_index: BimRowIndex,
+    ) -> Vec<u8> {
+        let layout = PersonLayout::new(resolver, prep_result, prep_result.num_people_to_score)
+            .expect("person layout");
+        let location = resolver
+            .locate_row(prep_result.bytes_per_variant, bim_row_index)
+            .expect("row location");
+        let mut storage = vec![0u8; layout.span.len];
+        let row = if resolver.is_mapped() {
+            resolver
+                .mapped_span(&location, layout.span)
+                .expect("mapped span")
+        } else {
+            resolver
+                .read_span(&location, layout.span, &mut storage)
+                .expect("read span");
+            &storage
+        };
+        let mut genotypes = vec![0u8; prep_result.num_people_to_score];
+        decode_genotypes(row, &layout.bytes, &layout.shifts, &mut genotypes);
+        for &person in &layout.forced_missing {
+            genotypes[person] = 0b01;
+        }
+        genotypes
+    }
 
     #[test]
     fn spool_resolver_returns_expected_genotypes() {
@@ -238,50 +457,536 @@ mod tests {
             .map_anon()
             .expect("failed to allocate test spool buffer");
         mmap_mut.copy_from_slice(&spool_data);
-        let mmap = mmap_mut
-            .make_read_only()
-            .expect("failed to convert test spool mapping to read-only");
+        let mmap = Arc::new(
+            mmap_mut
+                .make_read_only()
+                .expect("failed to convert test spool mapping to read-only"),
+        );
         let dense_map = Arc::new(vec![0, -1, 1]);
         let resolver = ComplexVariantResolver::from_spool(
-            Arc::new(mmap),
-            offsets,
+            Arc::clone(&mmap),
+            offsets.clone(),
             spool_bytes_per_variant,
-            dense_map,
+            Arc::clone(&dense_map),
         );
+        // People 0, 8, 5 and 9 of twelve. Person 5's byte was pruned from the spool.
+        let prep_result = test_prep_result(Vec::new(), 12, &[0, 8, 5, 9], 1, 2);
 
         // Variant 0 pulls bytes from offsets 0 and 1.
-        assert_eq!(
-            resolver
-                .get_packed_genotype(3, BimRowIndex(0), 0)
-                .expect("genotype lookup should succeed"),
-            0b10
-        );
-        assert_eq!(
-            resolver
-                .get_packed_genotype(3, BimRowIndex(0), 8)
-                .expect("genotype lookup should succeed"),
-            0b11
-        );
-        // fam_index 5 corresponds to a byte that was pruned from the spool.
-        assert_eq!(
-            resolver
-                .get_packed_genotype(3, BimRowIndex(0), 5)
-                .expect("fallback missing genotype"),
-            0b01
-        );
+        let variant_0 = read_row_genotypes(&resolver, &prep_result, BimRowIndex(0));
+        assert_eq!(variant_0[0], 0b10);
+        assert_eq!(variant_0[1], 0b11);
+        // Person 5 falls back to a missing genotype.
+        assert_eq!(variant_0[2], 0b01);
 
         // Variant 1 pulls bytes from offsets 2 and 3.
+        let variant_1 = read_row_genotypes(&resolver, &prep_result, BimRowIndex(1));
+        assert_eq!(variant_1[0], 0b01);
+        assert_eq!(variant_1[3], 0b00);
+
+        // When every scored person was pruned, rows have no scored bytes to read.
+        let pruned_only = test_prep_result(Vec::new(), 12, &[5], 1, 2);
         assert_eq!(
-            resolver
-                .get_packed_genotype(3, BimRowIndex(1), 0)
-                .expect("genotype lookup should succeed"),
-            0b01
+            read_row_genotypes(&resolver, &pruned_only, BimRowIndex(1)),
+            vec![0b01]
         );
+    }
+
+    #[test]
+    fn heuristic_table_is_indexed_by_discriminant() {
+        for (index, method) in HEURISTICS.iter().enumerate() {
+            assert_eq!(*method as usize, index);
+        }
+    }
+
+    /// A small deterministic generator, so the scenarios need no seeding API.
+    struct SplitMix64(u64);
+
+    impl SplitMix64 {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+
+        fn unit(&mut self) -> f64 {
+            (self.next() >> 11) as f64 / (1u64 << 53) as f64
+        }
+    }
+
+    struct VecSource(Vec<u8>);
+
+    impl ByteRangeSource for VecSource {
+        fn len(&self) -> u64 {
+            self.0.len() as u64
+        }
+
+        fn read_at(&self, offset: u64, dst: &mut [u8]) -> Result<(), PipelineError> {
+            let start = offset as usize;
+            let bytes = self.0.get(start..start + dst.len()).ok_or_else(|| {
+                PipelineError::Io(format!(
+                    "read of {} bytes at {offset} is past the end",
+                    dst.len()
+                ))
+            })?;
+            dst.copy_from_slice(bytes);
+            Ok(())
+        }
+    }
+
+    fn bed_bytes(rows: &[Vec<u8>]) -> Vec<u8> {
+        let mut data = vec![0x6c, 0x1b, 0x01];
+        for row in rows {
+            data.extend_from_slice(row);
+        }
+        data
+    }
+
+    /// Random packed genotypes (missing calls and padding bits included) and random
+    /// rules over a small allele vocabulary, so contexts collide, duplicate, swap and
+    /// share prefixes often enough to reach every heuristic.
+    struct Scenario {
+        total_people: usize,
+        rows: Vec<Vec<u8>>,
+        rules: Vec<GroupedComplexRule>,
+        kept: Vec<u32>,
+        num_scores: usize,
+    }
+
+    impl Scenario {
+        fn random(seed: u64, total_people: usize, keep_all: bool) -> Self {
+            const ALLELES: [&str; 6] = ["A", "G", "C", "T", "CA", "CAGA"];
+            let mut rng = SplitMix64(seed);
+            let num_variants = 40;
+            let rows = (0..num_variants)
+                .map(|_| {
+                    (0..total_people.div_ceil(4))
+                        .map(|_| rng.next() as u8)
+                        .collect()
+                })
+                .collect();
+            let num_scores = 1 + rng.below(4);
+            let mut rules = Vec::new();
+            for rule_idx in 0..60 {
+                let num_contexts = 1 + rng.below(6);
+                let possible_contexts: Vec<(BimRowIndex, String, String)> = (0..num_contexts)
+                    .map(|_| {
+                        (
+                            BimRowIndex(rng.below(num_variants) as u64),
+                            ALLELES[rng.below(ALLELES.len())].to_string(),
+                            ALLELES[rng.below(ALLELES.len())].to_string(),
+                        )
+                    })
+                    .collect();
+                let score_applications = (0..1 + rng.below(4))
+                    .map(|_| {
+                        let (effect_allele, other_allele) = if rng.below(4) != 0 {
+                            let (_, a1, a2) = &possible_contexts[rng.below(num_contexts)];
+                            if rng.below(2) == 0 {
+                                (a1.clone(), a2.clone())
+                            } else {
+                                (a2.clone(), a1.clone())
+                            }
+                        } else {
+                            (
+                                ALLELES[rng.below(ALLELES.len())].to_string(),
+                                ALLELES[rng.below(ALLELES.len())].to_string(),
+                            )
+                        };
+                        ScoreInfo {
+                            effect_allele,
+                            other_allele,
+                            weight: (rng.unit() * 3.0 - 1.5) as f32,
+                            score_column_index: ScoreColumnIndex(rng.below(num_scores)),
+                        }
+                    })
+                    .collect();
+                rules.push(GroupedComplexRule {
+                    locus_chr_pos: ("22".to_string(), 1000 + rule_idx),
+                    possible_contexts,
+                    score_applications,
+                });
+            }
+            // A locus with more duplicate contexts than a table covers.
+            rules.push(GroupedComplexRule {
+                locus_chr_pos: ("22".to_string(), 5000),
+                possible_contexts: (0..6)
+                    .map(|variant| (BimRowIndex(variant), "A".to_string(), "G".to_string()))
+                    .collect(),
+                score_applications: vec![ScoreInfo {
+                    effect_allele: "G".to_string(),
+                    other_allele: "A".to_string(),
+                    weight: 0.7,
+                    score_column_index: ScoreColumnIndex(0),
+                }],
+            });
+
+            let mut kept: Vec<u32> = (0..total_people as u32)
+                .filter(|_| keep_all || rng.below(3) != 0)
+                .collect();
+            if kept.is_empty() {
+                kept.push(total_people as u32 - 1);
+            }
+            if !keep_all {
+                for i in (1..kept.len()).rev() {
+                    kept.swap(i, rng.below(i + 1));
+                }
+            }
+            Self {
+                total_people,
+                rows,
+                rules,
+                kept,
+                num_scores,
+            }
+        }
+
+        fn genotype(&self, bim_row_index: BimRowIndex, fam_idx: usize) -> u8 {
+            (self.rows[bim_row_index.0 as usize][fam_idx / 4] >> ((fam_idx % 4) * 2)) & 0b11
+        }
+
+        /// Accumulators as the fast path might leave them, signed zeros included.
+        fn initial_accumulators(&self, seed: u64) -> (Vec<f64>, Vec<u32>) {
+            let mut rng = SplitMix64(seed ^ 0xA5A5);
+            let cells = self.kept.len() * self.num_scores;
+            let scores = (0..cells)
+                .map(|_| match rng.below(5) {
+                    0 => -0.0,
+                    1 => 0.0,
+                    _ => rng.unit() * 1e3 - 500.0,
+                })
+                .collect();
+            let counts = (0..cells).map(|_| rng.below(7) as u32).collect();
+            (scores, counts)
+        }
+
+        fn prep_result(&self) -> PreparationResult {
+            test_prep_result(
+                self.rules.clone(),
+                self.total_people,
+                &self.kept,
+                self.num_scores,
+                self.rows.len() as u64,
+            )
+        }
+
+        fn single_file(&self, dir: &Path) -> ComplexVariantResolver {
+            let path = dir.join("all.bed");
+            std::fs::write(&path, bed_bytes(&self.rows)).expect("write test bed");
+            ComplexVariantResolver::from_single_source(
+                open_bed_source(&path, None).expect("open test bed"),
+            )
+        }
+
+        fn multi_file(&self, dir: &Path) -> ComplexVariantResolver {
+            let starts = [0, 13, 29];
+            let mut sources = Vec::new();
+            let mut boundaries = Vec::new();
+            for (part, &start) in starts.iter().enumerate() {
+                let end = starts.get(part + 1).copied().unwrap_or(self.rows.len());
+                let bed_path = dir.join(format!("part{part}.bed"));
+                std::fs::write(&bed_path, bed_bytes(&self.rows[start..end]))
+                    .expect("write test bed part");
+                sources.push(open_bed_source(&bed_path, None).expect("open test bed part"));
+                boundaries.push(FilesetBoundary {
+                    bim_path: bed_path.with_extension("bim"),
+                    fam_path: bed_path.with_extension("fam"),
+                    bed_path,
+                    starting_global_index: start as u64,
+                });
+            }
+            ComplexVariantResolver::from_multi_sources(sources, boundaries)
+                .expect("matching sources and boundaries")
+        }
+
+        fn streamed(&self) -> ComplexVariantResolver {
+            ComplexVariantResolver::from_single_source(BedSource::from_byte_source(Arc::new(
+                VecSource(bed_bytes(&self.rows)),
+            )))
+        }
+
+        fn spool(&self, prep_result: &PreparationResult) -> ComplexVariantResolver {
+            let compact = prep_result.spool_compact_byte_index();
+            let mut offsets = AHashMap::new();
+            let mut data = Vec::new();
+            // Spool rows in reverse, so offsets do not follow BIM order.
+            for variant in (0..self.rows.len()).rev() {
+                offsets.insert(BimRowIndex(variant as u64), data.len() as u64);
+                data.extend(compact.iter().map(|&byte| self.rows[variant][byte as usize]));
+            }
+            let mut mmap_mut = MmapOptions::new()
+                .len(data.len())
+                .map_anon()
+                .expect("allocate test spool");
+            mmap_mut.copy_from_slice(&data);
+            ComplexVariantResolver::from_spool(
+                Arc::new(mmap_mut.make_read_only().expect("read-only test spool")),
+                offsets,
+                compact.len() as u64,
+                Arc::new(prep_result.spool_dense_map().to_vec()),
+            )
+        }
+    }
+
+    /// The person-major resolver this module replaced, reduced to its arithmetic:
+    /// every person, every rule, every application, in that order.
+    fn reference_resolve(
+        scenario: &Scenario,
+        prep_result: &PreparationResult,
+        scores: &mut [f64],
+        counts: &mut [u32],
+    ) -> FinalAggregatedCollector {
+        let pipeline = ResolverPipeline::new();
+        let num_scores = prep_result.score_names.len();
+        let mut collector = FinalAggregatedCollector::new();
+        for (person, fam_idx) in prep_result.output_idx_to_fam_idx.iter().enumerate() {
+            for rule in &prep_result.complex_rules {
+                let valid: Vec<(u8, &(BimRowIndex, String, String))> = rule
+                    .possible_contexts
+                    .iter()
+                    .map(|context| (scenario.genotype(context.0, fam_idx.0 as usize), context))
+                    .filter(|(bits, _)| *bits != 0b01)
+                    .collect();
+                for score_info in &rule.score_applications {
+                    let cell = person * num_scores + score_info.score_column_index.0;
+                    let matching: Vec<_> = valid
+                        .iter()
+                        .copied()
+                        .filter(|(_, context)| {
+                            score_allele_pair_matches(score_info, &context.1, &context.2)
+                        })
+                        .collect();
+                    if matching.is_empty() {
+                        counts[cell] += 1;
+                        continue;
+                    }
+                    if matching.len() == 1 {
+                        let (bits, (_, bim_a1, bim_a2)) = matching[0];
+                        match Heuristic::calculate_score_dosage(bits, bim_a1, bim_a2, score_info) {
+                            Some(dosage) => scores[cell] += dosage * score_info.weight as f64,
+                            None => counts[cell] += 1,
+                        }
+                        continue;
+                    }
+                    let context = ResolutionContext {
+                        score_info,
+                        conflicting_interpretations: &matching,
+                    };
+                    let resolution = pipeline
+                        .resolve(&context)
+                        .expect("the average fallback resolves every conflict");
+                    scores[cell] += resolution.chosen_dosage * score_info.weight as f64;
+                    let (count, samples) = collector
+                        .entry(resolution.method_used)
+                        .or_insert((0, Vec::new()));
+                    *count += 1;
+                    if samples.len() < MAX_WARNING_SAMPLES {
+                        samples.push(CriticalIntegrityWarningInfo {
+                            iid: prep_result.final_person_iids[person].clone(),
+                            locus_chr_pos: rule.locus_chr_pos.clone(),
+                            score_name: prep_result.score_names[score_info.score_column_index.0]
+                                .clone(),
+                            conflicts: matching
+                                .iter()
+                                .map(|(bits, context)| ConflictSource {
+                                    bim_row: context.0,
+                                    alleles: (context.1.clone(), context.2.clone()),
+                                    genotype_bits: *bits,
+                                })
+                                .collect(),
+                            resolution_method: resolution_method(
+                                resolution.method_used,
+                                resolution.chosen_dosage,
+                            ),
+                            score_effect_allele: score_info.effect_allele.clone(),
+                            score_other_allele: score_info.other_allele.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        collector
+    }
+
+    fn rendered(collector: &FinalAggregatedCollector) -> Vec<String> {
+        let mut categories: Vec<String> = collector
+            .iter()
+            .map(|(method, (count, samples))| {
+                let samples: Vec<String> = samples
+                    .iter()
+                    .map(format_critical_integrity_warning)
+                    .collect();
+                format!("{method:?} {count}\n{}", samples.join("\n---\n"))
+            })
+            .collect();
+        categories.sort();
+        categories
+    }
+
+    #[test]
+    fn row_major_resolver_matches_person_major_reference() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut methods_seen = AHashSet::new();
+        for (seed, total_people, keep_all) in [
+            (1, 1, true),
+            (2, 3, true),
+            (3, 5, false),
+            (4, 37, true),
+            (5, 37, false),
+            (6, 1001, false),
+            (7, 1003, true),
+        ] {
+            let scenario = Scenario::random(seed, total_people, keep_all);
+            let prep_result = scenario.prep_result();
+            let (initial_scores, initial_counts) = scenario.initial_accumulators(seed);
+            let mut expected_scores = initial_scores.clone();
+            let mut expected_counts = initial_counts.clone();
+            let expected_warnings = reference_resolve(
+                &scenario,
+                &prep_result,
+                &mut expected_scores,
+                &mut expected_counts,
+            );
+            methods_seen.extend(expected_warnings.keys().copied());
+
+            let scenario_dir = dir.path().join(format!("seed{seed}"));
+            std::fs::create_dir_all(&scenario_dir).expect("scenario dir");
+            let resolvers = [
+                ("single file", scenario.single_file(&scenario_dir)),
+                ("multi file", scenario.multi_file(&scenario_dir)),
+                ("streamed", scenario.streamed()),
+                ("spool", scenario.spool(&prep_result)),
+            ];
+            for (label, resolver) in &resolvers {
+                for limits in [
+                    ResolveLimits {
+                        block_people: 1,
+                        streamed_group_bytes: 1,
+                    },
+                    ResolveLimits {
+                        block_people: 7,
+                        streamed_group_bytes: 97,
+                    },
+                    ResolveLimits::for_people(scenario.kept.len()),
+                ] {
+                    let mut scores = initial_scores.clone();
+                    let mut counts = initial_counts.clone();
+                    let Ok(report) = resolve_rows(
+                        resolver,
+                        &prep_result,
+                        &mut scores,
+                        &mut counts,
+                        limits,
+                        &ProgressBar::hidden(),
+                    ) else {
+                        panic!("resolution failed for seed {seed}, {label}");
+                    };
+                    let context = format!(
+                        "seed {seed}, {total_people} people, {label}, {} per block",
+                        limits.block_people
+                    );
+                    assert!(report.unresolvable.is_none(), "{context}");
+                    assert_eq!(
+                        scores.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                        expected_scores
+                            .iter()
+                            .map(|value| value.to_bits())
+                            .collect::<Vec<_>>(),
+                        "{context}"
+                    );
+                    assert_eq!(counts, expected_counts, "{context}");
+                    assert_eq!(
+                        rendered(&report.warnings),
+                        rendered(&expected_warnings),
+                        "{context}"
+                    );
+                }
+            }
+        }
+        // The scenarios must reach the heuristic chain, not only single interpretations.
+        assert!(methods_seen.len() >= 3, "heuristics reached: {methods_seen:?}");
+    }
+
+    #[test]
+    fn missing_spool_offset_reports_the_person_major_error_text() {
+        let scenario = Scenario::random(11, 9, true);
+        let prep_result = scenario.prep_result();
+        let ComplexVariantResolver::Spool {
+            mmap,
+            mut offsets,
+            bytes_per_spooled_variant,
+            dense_map,
+        } = scenario.spool(&prep_result)
+        else {
+            unreachable!("scenario spool resolver");
+        };
+        offsets.remove(&BimRowIndex(0));
+        let resolver =
+            ComplexVariantResolver::from_spool(mmap, offsets, bytes_per_spooled_variant, dense_map);
+        let (mut scores, mut counts) = scenario.initial_accumulators(11);
+        let Err(error) = resolve_rows(
+            &resolver,
+            &prep_result,
+            &mut scores,
+            &mut counts,
+            ResolveLimits::for_people(scenario.kept.len()),
+            &ProgressBar::hidden(),
+        ) else {
+            panic!("a missing spool offset must fail resolution");
+        };
         assert_eq!(
-            resolver
-                .get_packed_genotype(3, BimRowIndex(1), 9)
-                .expect("genotype lookup should succeed"),
-            0b00
+            error.to_string(),
+            "I/O error during pipeline execution: I/O error during pipeline execution: \
+             Missing spool offset for BIM row 0 while resolving complex variant."
+        );
+    }
+
+    #[test]
+    fn truncated_bed_row_is_an_error_not_a_read_past_the_map() {
+        let scenario = Scenario::random(12, 10, true);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("truncated.bed");
+        let mut data = bed_bytes(&scenario.rows);
+        data.truncate(data.len() - 1);
+        std::fs::write(&path, data).expect("write truncated bed");
+        let resolver = ComplexVariantResolver::from_single_source(
+            open_bed_source(&path, None).expect("open truncated bed"),
+        );
+        let last_variant = scenario.rows.len() as u64 - 1;
+        let rules = vec![GroupedComplexRule {
+            locus_chr_pos: ("22".to_string(), 1),
+            possible_contexts: vec![(BimRowIndex(last_variant), "A".to_string(), "G".to_string())],
+            score_applications: vec![ScoreInfo {
+                effect_allele: "A".to_string(),
+                other_allele: "G".to_string(),
+                weight: 1.0,
+                score_column_index: ScoreColumnIndex(0),
+            }],
+        }];
+        let prep_result = test_prep_result(rules, 10, &scenario.kept, 1, last_variant + 1);
+        let mut scores = vec![0.0; scenario.kept.len()];
+        let mut counts = vec![0; scenario.kept.len()];
+        let Err(error) = resolve_rows(
+            &resolver,
+            &prep_result,
+            &mut scores,
+            &mut counts,
+            ResolveLimits::for_people(scenario.kept.len()),
+            &ProgressBar::hidden(),
+        ) else {
+            panic!("a truncated row must fail resolution");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("Genotypes for BIM row 39 lie outside the genotype data."),
+            "{error}"
         );
     }
 
@@ -980,17 +1685,693 @@ struct FatalAmbiguityData {
     conflicts: Vec<ConflictSource>,
 }
 
-enum FatalError {
-    Ambiguity(FatalAmbiguityData),
-    Io(String),
+/// Genotype fetch failures surface as the person-major resolver reported them:
+/// the fetch error's text, wrapped as an I/O error.
+fn fetch_error(error: PipelineError) -> PipelineError {
+    PipelineError::Io(error.to_string())
+}
+
+/// The most matching contexts a score application may have and still be
+/// tabulated (4^4 genotype combinations). Wider applications resolve per person.
+const TABULATED_MAX_CONTEXTS: usize = 4;
+
+/// Sample warnings reported per heuristic.
+const MAX_WARNING_SAMPLES: usize = 5;
+
+const HEURISTIC_COUNT: usize = 8;
+
+/// Every heuristic, indexed by `Heuristic as usize`.
+const HEURISTICS: [Heuristic; HEURISTIC_COUNT] = [
+    Heuristic::ExactScoreAlleleMatch,
+    Heuristic::PrioritizeUnambiguousGenotype,
+    Heuristic::PreferMatchingAlleleStructure,
+    Heuristic::ConsistentDosage,
+    Heuristic::PreferHeterozygous,
+    Heuristic::IndelAnchorBase,
+    Heuristic::FallbackOpposingHomozygousAsHet,
+    Heuristic::FallbackAverageDosageAcrossConflicts,
+];
+
+/// People per evaluation block: few enough that a block's decoded genotypes and
+/// score rows stay in cache, enough to amortize the per-block setup.
+const MIN_BLOCK_PEOPLE: usize = 256;
+const MAX_BLOCK_PEOPLE: usize = 4096;
+
+/// Row bytes a resolver without memory maps reads for one group of rules.
+const STREAMED_GROUP_BYTES: usize = 64 << 20;
+
+/// What one combination of genotypes does to one score of one person.
+#[derive(Clone, Copy)]
+enum Outcome {
+    /// No interpretation carries the score's alleles.
+    Missing,
+    /// Exactly one interpretation: its dosage times the weight.
+    Add(f64),
+    /// Several interpretations, reconciled by a heuristic.
+    Resolved {
+        method: Heuristic,
+        dosage: f64,
+        value: f64,
+    },
+    /// Several interpretations and no heuristic applies.
+    Unresolvable,
+}
+
+/// The branch-free form of an `Outcome`, applied to every person.
+#[derive(Clone, Copy)]
+struct TableEntry {
+    /// Added to the score. Outcomes that add nothing carry -0.0, the exact IEEE 754
+    /// additive identity, so the accumulator keeps its bits, sign of zero included.
+    value: f64,
+    /// Added to the missing count.
+    missing: u32,
+    /// Whether the outcome is a heuristic event to report.
+    reported: bool,
+}
+
+impl From<Outcome> for TableEntry {
+    fn from(outcome: Outcome) -> Self {
+        match outcome {
+            Outcome::Missing => Self {
+                value: -0.0,
+                missing: 1,
+                reported: false,
+            },
+            Outcome::Add(value) => Self {
+                value,
+                missing: 0,
+                reported: false,
+            },
+            Outcome::Resolved { value, .. } => Self {
+                value,
+                missing: 0,
+                reported: true,
+            },
+            Outcome::Unresolvable => Self {
+                value: -0.0,
+                missing: 0,
+                reported: true,
+            },
+        }
+    }
+}
+
+/// Resolves one score application for one combination of genotypes on its
+/// matching contexts, by the person-major resolver's rules: drop missing calls,
+/// then take the single interpretation left or run the heuristic chain.
+fn resolve_outcome(
+    pipeline: &ResolverPipeline,
+    rule: &GroupedComplexRule,
+    score_info: &ScoreInfo,
+    matching: &[usize],
+    genotypes: &[u8],
+) -> Outcome {
+    let interpretations: Vec<(u8, &(BimRowIndex, String, String))> = matching
+        .iter()
+        .zip(genotypes)
+        .filter(|&(_, &bits)| bits != 0b01)
+        .map(|(&context, &bits)| (bits, &rule.possible_contexts[context]))
+        .collect();
+    match interpretations.as_slice() {
+        [] => Outcome::Missing,
+        [(packed_geno, (_, bim_a1, bim_a2))] => {
+            match Heuristic::calculate_score_dosage(*packed_geno, bim_a1, bim_a2, score_info) {
+                Some(dosage) => Outcome::Add(dosage * score_info.weight as f64),
+                None => Outcome::Missing,
+            }
+        }
+        _ => {
+            let context = ResolutionContext {
+                score_info,
+                conflicting_interpretations: &interpretations,
+            };
+            match pipeline.resolve(&context) {
+                Some(resolution) => Outcome::Resolved {
+                    method: resolution.method_used,
+                    dosage: resolution.chosen_dosage,
+                    value: resolution.chosen_dosage * score_info.weight as f64,
+                },
+                None => Outcome::Unresolvable,
+            }
+        }
+    }
+}
+
+/// One score's view of a rule: the contexts that can carry its allele pair and
+/// what every combination of genotypes on them does.
+struct ApplicationPlan {
+    column: usize,
+    /// The rule's contexts whose allele pair matches the score's, in context order.
+    matching: Vec<usize>,
+    /// Indexed by the packed genotype code over `matching`, two bits per context
+    /// with the first context lowest. Empty when `matching` is too wide to tabulate.
+    entries: Vec<TableEntry>,
+    outcomes: Vec<Outcome>,
+}
+
+struct RulePlan {
+    /// Contexts some application reads; no other context is decoded.
+    decoded_contexts: Vec<usize>,
+    applications: Vec<ApplicationPlan>,
+}
+
+impl RulePlan {
+    fn new(pipeline: &ResolverPipeline, rule: &GroupedComplexRule) -> Self {
+        let mut decoded = vec![false; rule.possible_contexts.len()];
+        let applications = rule
+            .score_applications
+            .iter()
+            .map(|score_info| {
+                let matching: Vec<usize> = rule
+                    .possible_contexts
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (_, bim_a1, bim_a2))| {
+                        score_allele_pair_matches(score_info, bim_a1, bim_a2)
+                    })
+                    .map(|(context, _)| context)
+                    .collect();
+                for &context in &matching {
+                    decoded[context] = true;
+                }
+                let outcomes: Vec<Outcome> = if matching.len() <= TABULATED_MAX_CONTEXTS {
+                    let mut genotypes = vec![0u8; matching.len()];
+                    (0..1usize << (2 * matching.len()))
+                        .map(|code| {
+                            for (position, bits) in genotypes.iter_mut().enumerate() {
+                                *bits = ((code >> (2 * position)) & 0b11) as u8;
+                            }
+                            resolve_outcome(pipeline, rule, score_info, &matching, &genotypes)
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                ApplicationPlan {
+                    column: score_info.score_column_index.0,
+                    entries: outcomes.iter().map(|&outcome| outcome.into()).collect(),
+                    matching,
+                    outcomes,
+                }
+            })
+            .collect();
+        let decoded_contexts = decoded
+            .iter()
+            .enumerate()
+            .filter(|&(_, &is_decoded)| is_decoded)
+            .map(|(context, _)| context)
+            .collect();
+        Self {
+            decoded_contexts,
+            applications,
+        }
+    }
+}
+
+/// A reported heuristic event, kept compact until the report is built.
+struct Sample {
+    /// (person, rule, application): the order the person-major resolver met events in.
+    order: (usize, usize, usize),
+    /// Genotype bits on the application's matching contexts.
+    genotypes: Vec<u8>,
+    dosage: f64,
+}
+
+/// Heuristic events from one block of people.
+#[derive(Default)]
+struct BlockReport {
+    counts: [u64; HEURISTIC_COUNT],
+    /// The earliest events per heuristic, sorted, at most `MAX_WARNING_SAMPLES` each.
+    samples: [Vec<Sample>; HEURISTIC_COUNT],
+    unresolvable: Option<Sample>,
+}
+
+impl BlockReport {
+    /// Records a reported outcome. Returns false when the outcome is unresolvable
+    /// and the pass must stop.
+    fn record(
+        &mut self,
+        outcome: Outcome,
+        order: (usize, usize, usize),
+        genotypes: impl FnOnce() -> Vec<u8>,
+    ) -> bool {
+        match outcome {
+            Outcome::Resolved { method, dosage, .. } => {
+                self.counts[method as usize] += 1;
+                let samples = &mut self.samples[method as usize];
+                if samples.len() < MAX_WARNING_SAMPLES
+                    || samples.last().is_some_and(|last| order < last.order)
+                {
+                    let position = samples.partition_point(|existing| existing.order < order);
+                    samples.insert(
+                        position,
+                        Sample {
+                            order,
+                            genotypes: genotypes(),
+                            dosage,
+                        },
+                    );
+                    samples.truncate(MAX_WARNING_SAMPLES);
+                }
+                true
+            }
+            Outcome::Unresolvable => {
+                self.unresolvable = Some(Sample {
+                    order,
+                    genotypes: genotypes(),
+                    dosage: 0.0,
+                });
+                false
+            }
+            Outcome::Missing | Outcome::Add(_) => true,
+        }
+    }
+}
+
+/// Everything a block needs to apply one group of rules.
+struct GroupPass<'a> {
+    rules: &'a [GroupedComplexRule],
+    plans: &'a [RulePlan],
+    /// Prefix sums of the rules' context counts.
+    context_offsets: &'a [usize],
+    group: Range<usize>,
+    /// The scored span of every context of the group's rules, in rule then context order.
+    rows: &'a [&'a [u8]],
+    max_contexts: usize,
+    layout: &'a PersonLayout,
+    pipeline: &'a ResolverPipeline,
+    num_scores: usize,
+    stop: &'a AtomicBool,
+}
+
+/// Applies a group's rules to one block of people. Rules run in order, and each
+/// rule's applications in order, so every accumulator receives the same additions
+/// in the same order as under the person-major resolver, and ends bit-identical.
+fn evaluate_block(
+    pass: &GroupPass,
+    first_person: usize,
+    scores: &mut [f64],
+    counts: &mut [u32],
+) -> BlockReport {
+    let num_scores = pass.num_scores;
+    let num_people = scores.len() / num_scores;
+    let people = first_person..first_person + num_people;
+    let bytes = &pass.layout.bytes[people.clone()];
+    let shifts = &pass.layout.shifts[people.clone()];
+    let forced_missing = {
+        let all = &pass.layout.forced_missing;
+        &all[all.partition_point(|&person| person < people.start)
+            ..all.partition_point(|&person| person < people.end)]
+    };
+    let first_context = pass.context_offsets[pass.group.start];
+    let mut genotypes = vec![0u8; pass.max_contexts * num_people];
+    let mut code_buffer = vec![0u8; num_people];
+    let mut tuple = Vec::new();
+    let mut report = BlockReport::default();
+
+    for rule_idx in pass.group.clone() {
+        if pass.stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let rule = &pass.rules[rule_idx];
+        let plan = &pass.plans[rule_idx];
+        let rows = &pass.rows[pass.context_offsets[rule_idx] - first_context
+            ..pass.context_offsets[rule_idx + 1] - first_context];
+        for &context in &plan.decoded_contexts {
+            let decoded = &mut genotypes[context * num_people..(context + 1) * num_people];
+            decode_genotypes(rows[context], bytes, shifts, decoded);
+            for &person in forced_missing {
+                decoded[person - first_person] = 0b01;
+            }
+        }
+
+        for (application_idx, application) in plan.applications.iter().enumerate() {
+            let column = application.column;
+            let people_rows = scores
+                .chunks_exact_mut(num_scores)
+                .zip(counts.chunks_exact_mut(num_scores))
+                .enumerate();
+
+            if application.entries.is_empty() {
+                let score_info = &rule.score_applications[application_idx];
+                for (person, (person_scores, person_counts)) in people_rows {
+                    tuple.clear();
+                    tuple.extend(
+                        application
+                            .matching
+                            .iter()
+                            .map(|&context| genotypes[context * num_people + person]),
+                    );
+                    let outcome = resolve_outcome(
+                        pass.pipeline,
+                        rule,
+                        score_info,
+                        &application.matching,
+                        &tuple,
+                    );
+                    let entry = TableEntry::from(outcome);
+                    person_scores[column] += entry.value;
+                    person_counts[column] += entry.missing;
+                    if entry.reported
+                        && !report.record(
+                            outcome,
+                            (first_person + person, rule_idx, application_idx),
+                            || tuple.clone(),
+                        )
+                    {
+                        pass.stop.store(true, Ordering::Relaxed);
+                        return report;
+                    }
+                }
+                continue;
+            }
+
+            let codes: &[u8] = match application.matching.as_slice() {
+                [context] => &genotypes[context * num_people..(context + 1) * num_people],
+                matching => {
+                    code_buffer.fill(0);
+                    for (position, &context) in matching.iter().enumerate() {
+                        let decoded = &genotypes[context * num_people..(context + 1) * num_people];
+                        for (code, &bits) in code_buffer.iter_mut().zip(decoded) {
+                            *code |= bits << (2 * position);
+                        }
+                    }
+                    &code_buffer
+                }
+            };
+            for ((person, (person_scores, person_counts)), &code) in people_rows.zip(codes) {
+                let entry = application.entries[code as usize];
+                person_scores[column] += entry.value;
+                person_counts[column] += entry.missing;
+                if entry.reported {
+                    let width = application.matching.len();
+                    let unpack = || {
+                        (0..width)
+                            .map(|position| (code >> (2 * position)) & 0b11)
+                            .collect()
+                    };
+                    let order = (first_person + person, rule_idx, application_idx);
+                    if !report.record(application.outcomes[code as usize], order, unpack) {
+                        pass.stop.store(true, Ordering::Relaxed);
+                        return report;
+                    }
+                }
+            }
+        }
+    }
+    report
+}
+
+/// Block size and read budget for one resolution.
+#[derive(Clone, Copy)]
+struct ResolveLimits {
+    block_people: usize,
+    streamed_group_bytes: usize,
+}
+
+impl ResolveLimits {
+    fn for_people(num_people: usize) -> Self {
+        let threads = rayon::current_num_threads().max(1);
+        Self {
+            block_people: num_people
+                .div_ceil(threads * 4)
+                .clamp(MIN_BLOCK_PEOPLE, MAX_BLOCK_PEOPLE),
+            streamed_group_bytes: STREAMED_GROUP_BYTES,
+        }
+    }
+}
+
+/// Splits the rules into runs whose rows fit a read budget. Every run holds at
+/// least one rule.
+fn streamed_groups(context_offsets: &[usize], span_len: usize, budget: usize) -> Vec<Range<usize>> {
+    let num_rules = context_offsets.len() - 1;
+    let mut groups = Vec::new();
+    let mut start = 0;
+    let mut group_bytes = 0usize;
+    for rule in 0..num_rules {
+        let rule_bytes = (context_offsets[rule + 1] - context_offsets[rule]).saturating_mul(span_len);
+        if rule > start && group_bytes.saturating_add(rule_bytes) > budget {
+            groups.push(start..rule);
+            start = rule;
+            group_bytes = 0;
+        }
+        group_bytes = group_bytes.saturating_add(rule_bytes);
+    }
+    groups.push(start..num_rules);
+    groups
+}
+
+fn conflict_sources(
+    rule: &GroupedComplexRule,
+    matching: &[usize],
+    genotypes: &[u8],
+) -> Vec<ConflictSource> {
+    matching
+        .iter()
+        .zip(genotypes)
+        .filter(|&(_, &bits)| bits != 0b01)
+        .map(|(&context, &bits)| {
+            let (bim_row, bim_a1, bim_a2) = &rule.possible_contexts[context];
+            ConflictSource {
+                bim_row: *bim_row,
+                alleles: (bim_a1.clone(), bim_a2.clone()),
+                genotype_bits: bits,
+            }
+        })
+        .collect()
+}
+
+fn resolution_method(method: Heuristic, chosen_dosage: f64) -> ResolutionMethod {
+    match method {
+        Heuristic::ExactScoreAlleleMatch => ResolutionMethod::ExactScoreAlleleMatch { chosen_dosage },
+        Heuristic::PrioritizeUnambiguousGenotype => {
+            ResolutionMethod::PrioritizeUnambiguousGenotype { chosen_dosage }
+        }
+        Heuristic::PreferMatchingAlleleStructure => {
+            ResolutionMethod::PreferMatchingAlleleStructure { chosen_dosage }
+        }
+        Heuristic::ConsistentDosage => ResolutionMethod::ConsistentDosage {
+            dosage: chosen_dosage,
+        },
+        Heuristic::PreferHeterozygous => ResolutionMethod::PreferHeterozygous { chosen_dosage },
+        Heuristic::IndelAnchorBase => ResolutionMethod::IndelAnchorBase { chosen_dosage },
+        Heuristic::FallbackOpposingHomozygousAsHet => {
+            ResolutionMethod::FallbackOpposingHomozygousAsHet { chosen_dosage }
+        }
+        Heuristic::FallbackAverageDosageAcrossConflicts => {
+            ResolutionMethod::FallbackAverageDosageAcrossConflicts { chosen_dosage }
+        }
+    }
+}
+
+/// Heuristic warnings, and the unresolvable ambiguity that stopped resolution, if any.
+struct ResolutionReport {
+    warnings: FinalAggregatedCollector,
+    unresolvable: Option<FatalAmbiguityData>,
+}
+
+/// The row-major resolver. Each rule context's row is located once and its scored
+/// span borrowed from the memory map, or read once per group of rules when there
+/// is no map. People are processed in parallel blocks; inside a block each rule
+/// decodes its rows for the block and applies per-rule outcome tables, so no
+/// genotype pays for a source dispatch, a fileset search or a hash lookup.
+fn resolve_rows(
+    resolver: &ComplexVariantResolver,
+    prep_result: &PreparationResult,
+    final_scores: &mut [f64],
+    final_missing_counts: &mut [u32],
+    limits: ResolveLimits,
+    pb: &ProgressBar,
+) -> Result<ResolutionReport, PipelineError> {
+    let rules = &prep_result.complex_rules;
+    let num_scores = prep_result.score_names.len();
+    let num_people = final_scores
+        .len()
+        .checked_div(num_scores)
+        .unwrap_or(0)
+        .min(final_missing_counts.len().checked_div(num_scores).unwrap_or(0));
+    let mut report = ResolutionReport {
+        warnings: FinalAggregatedCollector::new(),
+        unresolvable: None,
+    };
+    if num_people == 0 || rules.is_empty() {
+        return Ok(report);
+    }
+
+    let layout = PersonLayout::new(resolver, prep_result, num_people)?;
+    let mut context_offsets = Vec::with_capacity(rules.len() + 1);
+    let mut locations =
+        Vec::with_capacity(rules.iter().map(|rule| rule.possible_contexts.len()).sum());
+    context_offsets.push(0);
+    for rule in rules {
+        for (bim_row_index, _, _) in &rule.possible_contexts {
+            locations.push(
+                resolver
+                    .locate_row(prep_result.bytes_per_variant, *bim_row_index)
+                    .map_err(fetch_error)?,
+            );
+        }
+        context_offsets.push(locations.len());
+    }
+
+    let pipeline = ResolverPipeline::new();
+    let plans: Vec<RulePlan> = rules
+        .par_iter()
+        .map(|rule| RulePlan::new(&pipeline, rule))
+        .collect();
+
+    let mapped = resolver.is_mapped();
+    let groups = if mapped {
+        vec![0..rules.len()]
+    } else {
+        streamed_groups(
+            &context_offsets,
+            layout.span.len,
+            limits.streamed_group_bytes,
+        )
+    };
+    pb.set_length((num_people * groups.len()) as u64);
+
+    let stop = AtomicBool::new(false);
+    let mut counts = [0u64; HEURISTIC_COUNT];
+    let mut samples: [Vec<Sample>; HEURISTIC_COUNT] = Default::default();
+    let mut unresolvable: Option<Sample> = None;
+    let mut storage = Vec::<u8>::new();
+    let people_scores = &mut final_scores[..num_people * num_scores];
+    let people_counts = &mut final_missing_counts[..num_people * num_scores];
+    let block_cells = limits.block_people * num_scores;
+
+    for group in groups {
+        let group_locations = &locations[context_offsets[group.start]..context_offsets[group.end]];
+        let rows: Vec<&[u8]> = if mapped {
+            group_locations
+                .iter()
+                .map(|location| resolver.mapped_span(location, layout.span).map_err(fetch_error))
+                .collect::<Result<_, _>>()?
+        } else if layout.span.len == 0 {
+            vec![&[][..]; group_locations.len()]
+        } else {
+            storage.clear();
+            storage.resize(group_locations.len() * layout.span.len, 0);
+            storage
+                .par_chunks_mut(layout.span.len)
+                .zip(group_locations.par_iter())
+                .try_for_each(|(dst, location)| {
+                    resolver
+                        .read_span(location, layout.span, dst)
+                        .map_err(fetch_error)
+                })?;
+            storage.chunks_exact(layout.span.len).collect()
+        };
+
+        let pass = GroupPass {
+            rules,
+            plans: &plans,
+            context_offsets: &context_offsets,
+            max_contexts: group
+                .clone()
+                .map(|rule| rules[rule].possible_contexts.len())
+                .max()
+                .unwrap_or(0),
+            group,
+            rows: &rows,
+            layout: &layout,
+            pipeline: &pipeline,
+            num_scores,
+            stop: &stop,
+        };
+        let block_reports: Vec<BlockReport> = people_scores
+            .par_chunks_mut(block_cells)
+            .zip(people_counts.par_chunks_mut(block_cells))
+            .enumerate()
+            .map(|(block, (scores, counts))| {
+                let block_report =
+                    evaluate_block(&pass, block * limits.block_people, scores, counts);
+                pb.inc((scores.len() / num_scores) as u64);
+                block_report
+            })
+            .collect();
+
+        for block_report in block_reports {
+            let BlockReport {
+                counts: block_counts,
+                samples: block_samples,
+                unresolvable: block_unresolvable,
+            } = block_report;
+            for (method_idx, method_samples) in block_samples.into_iter().enumerate() {
+                counts[method_idx] += block_counts[method_idx];
+                samples[method_idx].extend(method_samples);
+            }
+            unresolvable = match (unresolvable, block_unresolvable) {
+                (Some(current), Some(candidate)) if candidate.order < current.order => {
+                    Some(candidate)
+                }
+                (current, candidate) => current.or(candidate),
+            };
+        }
+        for method_samples in &mut samples {
+            method_samples.sort_by_key(|sample| sample.order);
+            method_samples.truncate(MAX_WARNING_SAMPLES);
+        }
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+    }
+
+    for (method_idx, method_samples) in samples.iter().enumerate() {
+        if counts[method_idx] == 0 {
+            continue;
+        }
+        let method = HEURISTICS[method_idx];
+        let infos = method_samples
+            .iter()
+            .map(|sample| {
+                let (person, rule_idx, application_idx) = sample.order;
+                let rule = &rules[rule_idx];
+                let score_info = &rule.score_applications[application_idx];
+                CriticalIntegrityWarningInfo {
+                    iid: prep_result.final_person_iids[person].clone(),
+                    locus_chr_pos: rule.locus_chr_pos.clone(),
+                    score_name: prep_result.score_names[score_info.score_column_index.0].clone(),
+                    conflicts: conflict_sources(
+                        rule,
+                        &plans[rule_idx].applications[application_idx].matching,
+                        &sample.genotypes,
+                    ),
+                    resolution_method: resolution_method(method, sample.dosage),
+                    score_effect_allele: score_info.effect_allele.clone(),
+                    score_other_allele: score_info.other_allele.clone(),
+                }
+            })
+            .collect();
+        report
+            .warnings
+            .insert(method, (counts[method_idx], infos));
+    }
+    report.unresolvable = unresolvable.map(|sample| {
+        let (person, rule_idx, application_idx) = sample.order;
+        let rule = &rules[rule_idx];
+        let score_info = &rule.score_applications[application_idx];
+        FatalAmbiguityData {
+            iid: prep_result.final_person_iids[person].clone(),
+            locus_chr_pos: rule.locus_chr_pos.clone(),
+            score_name: prep_result.score_names[score_info.score_column_index.0].clone(),
+            conflicts: conflict_sources(
+                rule,
+                &plans[rule_idx].applications[application_idx].matching,
+                &sample.genotypes,
+            ),
+        }
+    });
+    Ok(report)
 }
 
 // The "slow path" resolver for complex variants.
 ///
-/// This function runs *after* the main high-performance pipeline is complete. It
-/// iterates through each person and resolves their score contributions for the small
-/// set of variants that could not be handled by the fast path. It uses a rule-major
-/// outer loop with a person-major parallel inner loop to provide granular progress.
+/// This function runs *after* the main high-performance pipeline is complete and
+/// adds every person's score contributions for the small set of variants that
+/// could not be handled by the fast path. It is row-major (see `resolve_rows`),
+/// and the progress bar advances as blocks of people finish.
 pub fn resolve_complex_variants(
     resolver: &ComplexVariantResolver,
     prep_result: &Arc<PreparationResult>,
@@ -1004,253 +2385,28 @@ pub fn resolve_complex_variants(
 
     eprintln!("> Resolving {num_rules} complex variant rules...");
 
-    let fatal_error_occurred = Arc::new(AtomicBool::new(false));
-    let fatal_error_storage = Arc::new(Mutex::new(None::<FatalError>));
-
     let pb = ProgressBar::new(prep_result.num_people_to_score as u64);
     let progress_style = ProgressStyle::with_template(
         "> Resolving complex variants [{bar:40.cyan/blue}] {pos}/{len} ({eta})",
     )
     .expect("Internal Error: Invalid progress bar template string.");
     pb.set_style(progress_style.progress_chars("█▉▊▋▌▍▎▏ "));
-    let progress_counter = Arc::new(AtomicU64::new(0));
 
-    let pipeline = ResolverPipeline::new();
-
-    // Run the parallel processing in a thread scope
-    let final_warnings = thread::scope(|s| {
-        let fatal_error_flag = Arc::clone(&fatal_error_occurred);
-        let fatal_error_slot = Arc::clone(&fatal_error_storage);
-        // Progress updater thread
-        // Spawn progress updater thread
-        let progress_handle = s.spawn({
-            let pb_updater = pb.clone();
-            let counter_for_updater = Arc::clone(&progress_counter);
-            let error_flag_for_updater = Arc::clone(&fatal_error_flag);
-            let total_people = prep_result.num_people_to_score as u64;
-            move || {
-                while counter_for_updater.load(Ordering::Relaxed) < total_people
-                    && !error_flag_for_updater.load(Ordering::Relaxed)
-                {
-                    pb_updater.set_position(counter_for_updater.load(Ordering::Relaxed));
-                    thread::sleep(Duration::from_millis(200));
-                }
-                pb_updater.set_position(counter_for_updater.load(Ordering::Relaxed));
-            }
-        });
-
-        // Main processing thread - collect the result from this one
-        let collector_handle = s.spawn(move || {
-            let fatal_error_flag = Arc::clone(&fatal_error_flag);
-            let fatal_error_slot = Arc::clone(&fatal_error_slot);
-            final_scores
-                .par_chunks_mut(prep_result.score_names.len())
-                .zip(final_missing_counts.par_chunks_mut(prep_result.score_names.len()))
-                .enumerate()
-                .try_fold(
-                    PerThreadCollector::new,
-                    |mut local_collector, (person_output_idx, (person_scores_slice, person_counts_slice))| {
-                        let guard = ScopeGuard::new(|| {
-                            progress_counter.fetch_add(1, Ordering::Relaxed);
-                        });
-                        let _ = &guard;
-
-                        if fatal_error_flag.load(Ordering::Relaxed) {
-                            return Err(());
-                        }
-
-                        let output_person_idx = match u32::try_from(person_output_idx) {
-                            Ok(v) => crate::score::types::OutputPersonIndex(v),
-                            Err(_) => {
-                                if fatal_error_flag
-                                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-                                    .is_ok()
-                                {
-                                    *fatal_error_slot.lock().unwrap() = Some(FatalError::Io(
-                                        format!(
-                                            "Output person index {} exceeds u32::MAX.",
-                                            person_output_idx
-                                        ),
-                                    ));
-                                }
-                                return Err(());
-                            }
-                        };
-                        let original_fam_idx = prep_result
-                            .original_person_index_for_output(output_person_idx)
-                            .0;
-
-                        // Reused across all rules for this person: the old
-                        // `Vec::new()` inside the rule loop heap-allocated
-                        // num_people * num_rules times for a Vec that usually
-                        // holds a single interpretation. Hoisting + clear() drops
-                        // that to one allocation per person (per thread).
-                        let mut valid_interpretations = Vec::new();
-                        for group_rule in &prep_result.complex_rules {
-                            valid_interpretations.clear();
-                            for context in &group_rule.possible_contexts {
-                                let packed_geno = match resolver.get_packed_genotype(
-                                    prep_result.bytes_per_variant,
-                                    context.0,
-                                    original_fam_idx,
-                                ) {
-                                    Ok(bits) => bits,
-                                    Err(err) => {
-                                        if fatal_error_flag
-                                            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-                                            .is_ok()
-                                        {
-                                            *fatal_error_slot.lock().unwrap() =
-                                                Some(FatalError::Io(err.to_string()));
-                                        }
-                                        return Err(());
-                                    }
-                                };
-                                if packed_geno != 0b01 {
-                                    valid_interpretations.push((packed_geno, context));
-                                }
-                            }
-
-                            for score_info in &group_rule.score_applications {
-                                let matching_interpretations: Vec<_> = valid_interpretations
-                                    .iter()
-                                    .copied()
-                                    .filter(|(_, context)| {
-                                        score_allele_pair_matches(score_info, &context.1, &context.2)
-                                    })
-                                    .collect();
-
-                                if matching_interpretations.is_empty() {
-                                    person_counts_slice[score_info.score_column_index.0] += 1;
-                                    continue;
-                                }
-
-                                if matching_interpretations.len() == 1 {
-                                    let (packed_geno, context) = matching_interpretations[0];
-                                    let (_, bim_a1, bim_a2) = context;
-                                    if let Some(dosage) = Heuristic::calculate_score_dosage(
-                                        packed_geno, bim_a1, bim_a2, score_info,
-                                    ) {
-                                        person_scores_slice[score_info.score_column_index.0] +=
-                                            dosage * score_info.weight as f64;
-                                    } else {
-                                        person_counts_slice[score_info.score_column_index.0] += 1;
-                                    }
-                                    continue;
-                                }
-
-                                let context = ResolutionContext {
-                                    score_info,
-                                    conflicting_interpretations: &matching_interpretations,
-                                };
-
-                                if let Some(resolution) = pipeline.resolve(&context) {
-                                    person_scores_slice[score_info.score_column_index.0] +=
-                                        resolution.chosen_dosage * score_info.weight as f64;
-
-                                    let (count, samples) = local_collector
-                                        .entry(resolution.method_used)
-                                        .or_insert((0, Vec::new()));
-                                    *count += 1;
-                                    if samples.len() < 5 {
-                                        let resolution_method = match resolution.method_used {
-                                            Heuristic::ExactScoreAlleleMatch => ResolutionMethod::ExactScoreAlleleMatch { chosen_dosage: resolution.chosen_dosage },
-                                            Heuristic::PrioritizeUnambiguousGenotype => ResolutionMethod::PrioritizeUnambiguousGenotype { chosen_dosage: resolution.chosen_dosage },
-                                            Heuristic::PreferMatchingAlleleStructure => ResolutionMethod::PreferMatchingAlleleStructure { chosen_dosage: resolution.chosen_dosage },
-                                            Heuristic::ConsistentDosage => ResolutionMethod::ConsistentDosage { dosage: resolution.chosen_dosage },
-                                            Heuristic::PreferHeterozygous => ResolutionMethod::PreferHeterozygous { chosen_dosage: resolution.chosen_dosage },
-                                            Heuristic::IndelAnchorBase => ResolutionMethod::IndelAnchorBase { chosen_dosage: resolution.chosen_dosage },
-                                            Heuristic::FallbackOpposingHomozygousAsHet => ResolutionMethod::FallbackOpposingHomozygousAsHet { chosen_dosage: resolution.chosen_dosage },
-                                            Heuristic::FallbackAverageDosageAcrossConflicts => ResolutionMethod::FallbackAverageDosageAcrossConflicts { chosen_dosage: resolution.chosen_dosage },
-                                        };
-
-                                        let conflicts = matching_interpretations
-                                            .iter()
-                                            .map(|(bits, ctx)| ConflictSource {
-                                                bim_row: ctx.0,
-                                                alleles: (ctx.1.clone(), ctx.2.clone()),
-                                                genotype_bits: *bits,
-                                            })
-                                            .collect();
-
-                                        samples.push(CriticalIntegrityWarningInfo {
-                                            iid: prep_result.final_person_iids[person_output_idx]
-                                                .clone(),
-                                            locus_chr_pos: group_rule.locus_chr_pos.clone(),
-                                            score_name: prep_result.score_names
-                                                [score_info.score_column_index.0]
-                                                .clone(),
-                                            conflicts,
-                                            resolution_method,
-                                            score_effect_allele: score_info.effect_allele.clone(),
-                                            score_other_allele: score_info.other_allele.clone(),
-                                        });
-                                    }
-                                } else {
-                                    let conflicts = matching_interpretations
-                                        .iter()
-                                        .map(|(bits, ctx)| ConflictSource {
-                                            bim_row: ctx.0,
-                                            alleles: (ctx.1.clone(), ctx.2.clone()),
-                                            genotype_bits: *bits,
-                                        })
-                                        .collect();
-
-                                    let data = FatalAmbiguityData {
-                                        iid: prep_result.final_person_iids[person_output_idx]
-                                            .clone(),
-                                        locus_chr_pos: group_rule.locus_chr_pos.clone(),
-                                        score_name: prep_result.score_names
-                                            [score_info.score_column_index.0]
-                                            .clone(),
-                                        conflicts,
-                                    };
-
-                                    if fatal_error_flag
-                                        .compare_exchange(
-                                            false,
-                                            true,
-                                            Ordering::AcqRel,
-                                            Ordering::Relaxed,
-                                        )
-                                        .is_ok()
-                                    {
-                                        *fatal_error_slot.lock().unwrap() =
-                                            Some(FatalError::Ambiguity(data));
-                                    }
-                                    return Err(());
-                                }
-                            }
-                        }
-                        Ok(local_collector)
-                    },
-                )
-                .map(|collector_opt| collector_opt.unwrap_or_default())
-                .reduce(
-                    PerThreadCollector::new,
-                    |mut main_collector, thread_collector| {
-                        for (heuristic, (count, samples)) in thread_collector {
-                            let (main_count, main_samples) = main_collector.entry(heuristic).or_insert((0, Vec::new()));
-                            *main_count += count;
-                            if main_samples.len() < 5 {
-                                main_samples.extend(samples.into_iter().take(5 - main_samples.len()));
-                            }
-                        }
-                        main_collector
-                    }
-                )
-        });
-
-        // Wait for the collector thread to finish and get its result
-        let collector_result = collector_handle.join().unwrap_or_default();
-        progress_handle.join().ok();
-        collector_result
-    });
+    let resolution = resolve_rows(
+        resolver,
+        prep_result,
+        final_scores,
+        final_missing_counts,
+        ResolveLimits::for_people(prep_result.num_people_to_score),
+        &pb,
+    );
 
     pb.finish_with_message("Done.");
 
-    // Process the warnings collection
-    let all_warnings_for_reporting = final_warnings;
+    let ResolutionReport {
+        warnings: all_warnings_for_reporting,
+        unresolvable,
+    } = resolution?;
 
     if !all_warnings_for_reporting.is_empty() {
         eprintln!(
@@ -1286,18 +2442,8 @@ pub fn resolve_complex_variants(
         );
     }
 
-    if fatal_error_occurred.load(Ordering::Relaxed) {
-        if let Some(error) = fatal_error_storage.lock().unwrap().take() {
-            return match error {
-                FatalError::Ambiguity(data) => {
-                    Err(PipelineError::Compute(format_fatal_ambiguity_report(&data)))
-                }
-                FatalError::Io(message) => Err(PipelineError::Io(message)),
-            };
-        }
-        return Err(PipelineError::Compute(
-            "A fatal, unspecified error occurred in a parallel task.".to_string(),
-        ));
+    if let Some(data) = unresolvable {
+        return Err(PipelineError::Compute(format_fatal_ambiguity_report(&data)));
     }
 
     eprintln!("> Complex variant resolution complete.");
