@@ -268,22 +268,34 @@ jobs:
           ls -lh models/
           echo "files=$(ls models/*.json.zst | tr '\n' ' ')" >> $GITHUB_OUTPUT
 
-      - name: Create or update models release
+      - name: Create the models release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          
-          RELEASE_TAG="models-v1"
-          
-          if ! gh release view "$RELEASE_TAG" &>/dev/null; then
-            gh release create "$RELEASE_TAG" --title "PCA Models v1" --notes "Pre-trained HWE-scaled PCA models (GSA v2/v3, GDA v1, intersection) trained on gnomAD 1KG+HGDP reference panel (GRCh38)"
+
+          # map/prefit.rs pins the SHA256 of every built-in model it downloads, so
+          # the assets of a published models tag must never change. Publish to a
+          # new tag, and refuse to touch one that already exists.
+          RELEASE_TAG="models-v3"
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "::error::Release $RELEASE_TAG already exists. Built-in model digests pin its assets; bump RELEASE_TAG instead of replacing them."
+            exit 1
           fi
-          
-          # Upload each model file (clobber existing)
-          for f in models/*.json.zst; do
-            echo "Uploading $f..."
-            gh release upload "$RELEASE_TAG" "$f" --clobber
-          done
-          
+
+          (cd models && sha256sum *.json.zst > sha256sums.txt)
+          {
+            echo "### Model digests for $RELEASE_TAG"
+            echo
+            echo '```'
+            cat models/sha256sums.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat models/sha256sums.txt
+
+          gh release create "$RELEASE_TAG" --title "PCA Models v3" \
+            --notes "Pre-trained HWE-scaled PCA models (GSA v2/v3, GDA v1, intersection) trained on gnomAD 1KG+HGDP reference panel (GRCh38)" \
+            models/*.json.zst models/sha256sums.txt
+
           echo "✓ Models uploaded to release: $RELEASE_TAG"
