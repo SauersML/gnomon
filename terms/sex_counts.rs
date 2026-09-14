@@ -20,6 +20,8 @@ use infer_sex::{
     AlgorithmConstants, Chromosome, DecisionThresholds, EvidenceReport, InferenceConfig,
     InferenceError, InferenceResult, InferredSex,
 };
+#[cfg(unix)]
+use memmap2::{Advice, UncheckedAdvice};
 use rayon::prelude::*;
 
 use crate::pipeline_error::PipelineError;
@@ -218,12 +220,15 @@ impl<'a> BedRows<'a> {
     }
 
     /// Calls `f` with the rows at `indices`, in order, a batch at a time. A memory
-    /// map is sliced in one batch; any other source is read in batches of at most
-    /// `batch_bytes`, one ranged read per run of consecutive rows.
+    /// map is sliced in one batch when the selected rows fit in available memory,
+    /// and in batches sized from that headroom when they do not; any other source
+    /// is read in batches of at most `batch_bytes`, one ranged read per run of
+    /// consecutive rows.
     fn for_each_batch(
         &self,
         indices: &[usize],
         batch_bytes: usize,
+        available_bytes: u64,
         mut f: impl FnMut(&[&[u8]]),
     ) -> Result<(), PipelineError> {
         let row_len = self.bytes_per_variant;
@@ -231,11 +236,41 @@ impl<'a> BedRows<'a> {
             .source
             .mmap_slice(BED_HEADER_LEN, row_len * self.n_variants)
         {
-            let rows: Vec<&[u8]> = indices
-                .iter()
-                .map(|&index| &payload[index * row_len..(index + 1) * row_len])
-                .collect();
-            f(&rows);
+            #[cfg(unix)]
+            let map = self.source.mmap();
+            let batch_rows = mapped_batch_rows(indices.len(), row_len, available_bytes);
+            for batch in indices.chunks(batch_rows) {
+                #[cfg(unix)]
+                let span = mapped_span(batch, row_len);
+                // Paging a selection larger than memory in through every counting
+                // thread at once thrashes: read each batch ahead, and drop its pages
+                // from this mapping once it is counted, so the resident set stays
+                // near one batch.
+                #[cfg(unix)]
+                if let (Some(map), true) = (&map, batch.len() < indices.len()) {
+                    let _ = map.advise_range(Advice::WillNeed, span.start, span.len());
+                }
+                let rows: Vec<&[u8]> = batch
+                    .iter()
+                    .map(|&index| &payload[index * row_len..(index + 1) * row_len])
+                    .collect();
+                f(&rows);
+                #[cfg(unix)]
+                if let (Some(map), true) = (&map, batch.len() < indices.len()) {
+                    // SAFETY: the map is a read-only shared mapping of the `.bed`, and
+                    // `rows` has been dropped. Dropping these pages only discards this
+                    // process's view; the next access faults them back in from the
+                    // file, with the same bytes.
+                    drop(rows);
+                    let _ = unsafe {
+                        map.unchecked_advise_range(
+                            UncheckedAdvice::DontNeed,
+                            span.start,
+                            span.len(),
+                        )
+                    };
+                }
+            }
             return Ok(());
         }
 
@@ -260,6 +295,28 @@ impl<'a> BedRows<'a> {
     }
 }
 
+/// Rows per batch when slicing a memory map. Every selected row goes in one batch
+/// while they take at most a quarter of the memory available to this process;
+/// otherwise a batch takes that quarter, and at least one row.
+fn mapped_batch_rows(n_rows: usize, row_len: usize, available_bytes: u64) -> usize {
+    let budget = usize::try_from(available_bytes / 4).unwrap_or(usize::MAX);
+    if n_rows.saturating_mul(row_len) <= budget {
+        n_rows.max(1)
+    } else {
+        (budget / row_len.max(1)).max(1)
+    }
+}
+
+/// The byte range of the `.bed` file covering `batch`, whose indices ascend.
+fn mapped_span(batch: &[usize], row_len: usize) -> Range<usize> {
+    match (batch.first(), batch.last()) {
+        (Some(&first), Some(&last)) => {
+            BED_HEADER_LEN + first * row_len..BED_HEADER_LEN + (last + 1) * row_len
+        }
+        _ => BED_HEADER_LEN..BED_HEADER_LEN,
+    }
+}
+
 /// Counts sex evidence for every sample from the selected rows of a `.bed` payload.
 ///
 /// `loci` pairs each selected row index with the counter it feeds; rows that feed
@@ -269,13 +326,17 @@ pub(super) fn count_evidence(
     loci: &[(usize, LocusClass)],
     progress: impl FnMut(usize),
 ) -> Result<Vec<EvidenceCounts>, PipelineError> {
-    count_evidence_batched(rows, loci, READ_BATCH_BYTES, progress)
+    let (_, available_bytes) = crate::memory::memory_bytes();
+    count_evidence_batched(rows, loci, READ_BATCH_BYTES, available_bytes, progress)
 }
 
+/// [`count_evidence`] with the read batch size, and the memory available for
+/// slicing a map, given explicitly.
 fn count_evidence_batched(
     rows: &BedRows<'_>,
     loci: &[(usize, LocusClass)],
     batch_bytes: usize,
+    available_bytes: u64,
     mut progress: impl FnMut(usize),
 ) -> Result<Vec<EvidenceCounts>, PipelineError> {
     let mut evidence = vec![EvidenceCounts::default(); rows.n_samples];
@@ -289,7 +350,7 @@ fn count_evidence_batched(
         if indices.is_empty() {
             continue;
         }
-        let calls = count_calls(rows, &indices, batch_bytes)?;
+        let calls = count_calls(rows, &indices, batch_bytes, available_bytes)?;
         let n_rows = indices.len() as u64;
         for ((sample, &missing), &het) in evidence.iter_mut().zip(&calls.missing).zip(&calls.het) {
             let valid = n_rows - missing;
@@ -327,6 +388,7 @@ fn count_calls(
     rows: &BedRows<'_>,
     indices: &[usize],
     batch_bytes: usize,
+    available_bytes: u64,
 ) -> Result<CallCounts, PipelineError> {
     let kernel = Kernel::detect();
     let mut counters: Vec<RangeCounter> = sample_ranges(
@@ -338,7 +400,7 @@ fn count_calls(
     .map(|(bytes, n_samples)| RangeCounter::new(bytes, n_samples))
     .collect();
 
-    rows.for_each_batch(indices, batch_bytes, |batch| {
+    rows.for_each_batch(indices, batch_bytes, available_bytes, |batch| {
         counters
             .par_iter_mut()
             .for_each(|counter| counter.add_rows(kernel, batch));
@@ -681,6 +743,25 @@ mod tests {
         assert_eq!(MISSING_FLAGS[0xff] | HET_FLAGS[0xff] | HET_FLAGS[0x00], 0);
     }
 
+    /// A selection that fits in a quarter of available memory is one batch;
+    /// a larger one is cut to that quarter, and never below one row.
+    #[test]
+    fn mapped_batches_are_sized_from_available_memory() {
+        assert_eq!(mapped_batch_rows(55_000, 12_800, 64 << 30), 55_000);
+        assert_eq!(
+            mapped_batch_rows(55_000, 100_000, 4 << 30),
+            (1 << 30) / 100_000
+        );
+        assert_eq!(mapped_batch_rows(55_000, 100_000, 0), 1);
+        assert_eq!(mapped_batch_rows(10, 1 << 40, 4 << 30), 1);
+        assert_eq!(mapped_batch_rows(0, 800, 4 << 30), 1);
+        assert_eq!(
+            mapped_span(&[3, 4, 9], 25),
+            BED_HEADER_LEN + 75..BED_HEADER_LEN + 250
+        );
+        assert_eq!(mapped_span(&[], 25), BED_HEADER_LEN..BED_HEADER_LEN);
+    }
+
     #[test]
     fn kernels_accumulate_the_packed_codes_of_every_slot() {
         let mut rng = TestRng(0x2545_f491_4f6c_dd1d);
@@ -767,13 +848,57 @@ mod tests {
             for batch_bytes in [1, 3 * row_len, READ_BATCH_BYTES] {
                 let mut reported = Vec::new();
                 let evidence =
-                    count_evidence_batched(&rows, &loci, batch_bytes, |done| reported.push(done))
-                        .unwrap();
+                    count_evidence_batched(&rows, &loci, batch_bytes, u64::MAX, |done| {
+                        reported.push(done)
+                    })
+                    .unwrap();
                 assert_eq!(
                     evidence, expected,
                     "{n_samples} samples, batch {batch_bytes}"
                 );
                 assert_eq!(reported.last().copied(), Some(loci.len()));
+            }
+        }
+    }
+
+    /// A mapped `.bed` counted with every selected row in one batch, and in the
+    /// small batches too little available memory forces, must give the naive
+    /// decoding's counts.
+    #[test]
+    fn mapped_rows_count_the_same_in_any_number_of_batches() {
+        let mut rng = TestRng(0x3c6e_f372_fe94_f82b);
+        let dir = tempfile::tempdir().unwrap();
+        for n_samples in [1usize, 7, 64, 3197] {
+            let row_len = n_samples.div_ceil(4);
+            let n_variants = 700;
+            let payload = random_rows(&mut rng, n_variants * row_len);
+            let path = dir.path().join(format!("mapped_{n_samples}.bed"));
+            let mut file = vec![0x6c, 0x1b, 0x01];
+            file.extend_from_slice(&payload);
+            std::fs::write(&path, &file).unwrap();
+            let source = crate::shared::files::open_bed_source(&path, None).unwrap();
+            assert!(source.mmap().is_some(), "a local .bed is mapped");
+            let rows = BedRows::new(&source, row_len, n_variants, n_samples);
+
+            let mut loci: Vec<(usize, LocusClass)> = (0..n_variants)
+                .step_by(2)
+                .map(|index| (index, LocusClass::Autosome))
+                .collect();
+            loci.extend((301..600).map(|index| (index, LocusClass::XNonPar)));
+            loci.extend((650..680).map(|index| (index, LocusClass::YNonPar)));
+            loci.sort_by_key(|&(index, _)| index);
+            loci.dedup_by_key(|&mut (index, _)| index);
+            let expected = naive_evidence(&payload, row_len, n_samples, &loci);
+
+            // 4 bytes available is a one-row batch; 4 * 25 rows a 25-row one.
+            for available_bytes in [u64::MAX, 4 * 25 * row_len as u64, 4] {
+                let evidence =
+                    count_evidence_batched(&rows, &loci, READ_BATCH_BYTES, available_bytes, |_| {})
+                        .unwrap();
+                assert_eq!(
+                    evidence, expected,
+                    "{n_samples} samples, {available_bytes} bytes available"
+                );
             }
         }
     }
