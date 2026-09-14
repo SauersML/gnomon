@@ -1752,14 +1752,13 @@ fn run_project(
     )
 }
 
-/// Run the `project` subcommand against a pre-opened/cached PLINK fileset but
-/// write the projection outputs at a caller-supplied base path.
+/// Run the `project` subcommand but write the projection outputs at a
+/// caller-supplied path.
 ///
-/// `projection_scores_path` is the absolute path for the `.bin` artifact; the
-/// companion `.metadata.json` is written alongside it. This lets `gnomon all`
-/// project from the converted PLINK cache while keeping the
-/// `projection_scores.bin` next to the original VCF (where pgsEngine expects
-/// it).
+/// `projection_scores_path` is the path for the `.bin` artifact; the companion
+/// `.metadata.json` is written alongside it. `gnomon all --out PREFIX` uses it
+/// to write `<PREFIX>.projection_scores.bin`, since `gnomon project` has no
+/// `--out` of its own.
 pub fn run_project_with_output(
     genotype_path: &Path,
     genome_build: Option<GenomeBuild>,

@@ -184,6 +184,11 @@ name = "score"
 path = "score/tests/mod.rs"
 required-features = ["score"]
 
+[[test]]
+name = "all"
+path = "cli/tests/all.rs"
+required-features = ["map", "score", "calibrate", "terms"]
+
 # Run tests at release optimization level for maximum speed
 [profile.test]
 opt-level = 3            # Same as release - maximum speed for numerical tests

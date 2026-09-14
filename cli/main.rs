@@ -275,13 +275,15 @@ struct AllArgs {
     #[arg(value_name = "SCORE_PATH")]
     score: PathBuf,
 
-    /// Path to genotype data (VCF/BCF strongly preferred; PLINK also accepted).
+    /// Path to genotype data (PLINK .bed/.bim/.fam prefix, VCF, BCF, or DTC text file),
+    /// given unchanged to score, project and terms.
     #[arg(value_name = "GENOTYPE_PATH")]
     input_path: PathBuf,
 
     /// Built-in HWE-PCA model name used for projection (e.g. hwe_1kg_hgdp_gsa_v3).
+    /// Defaults to the <GENOTYPE>.hwe.json beside the genotype data, as in gnomon project.
     #[arg(long, value_name = "MODEL_NAME")]
-    model: String,
+    model: Option<String>,
 
     /// Path to a file containing a list of individual IDs (IIDs) to include.
     #[arg(long)]
@@ -302,6 +304,12 @@ struct AllArgs {
     /// Write a JSON manifest describing the exact projection outputs that were created.
     #[arg(long, value_name = "PATH")]
     output_manifest: Option<PathBuf>,
+
+    /// Output prefix shared by every phase (for example, results/eur writes
+    /// results/eur.sscore, results/eur.projection_scores.bin and results/eur.sex.tsv).
+    /// Defaults to each subcommand's own names beside the genotype data.
+    #[arg(long, value_name = "PREFIX")]
+    out: Option<PathBuf>,
 }
 
 #[cfg(feature = "calibrate")]
@@ -430,7 +438,7 @@ enum FullCommands {
     Train(TrainArgs),
     /// Apply calibration model to new data
     Infer(InferArgs),
-    /// Run score + project + terms against a single VCF/BCF without rescanning it three times.
+    /// Run score, project and terms on one genotype input, concurrently when memory allows.
     All(AllArgs),
     /// Display version and build information
     Version,
@@ -887,6 +895,7 @@ fn run_all(args: AllArgs) -> Result<(), Box<dyn std::error::Error>> {
         build: args.build,
         panel: args.panel,
         output_manifest: args.output_manifest,
+        out: args.out,
     })
 }
 

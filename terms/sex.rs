@@ -379,8 +379,7 @@ pub fn infer_sex_to_tsv(
 
 /// Identical to [`infer_sex_to_tsv`] but writes the sex TSV at an explicit
 /// caller-provided path instead of `dataset.output_path("sex.tsv")`. Used by
-/// `gnomon all` so that terms-driven sex inference run against a cached PLINK
-/// fileset still produces `*.sex.tsv` next to the original VCF.
+/// `gnomon terms --out PREFIX`, and so by `gnomon all --out PREFIX`.
 pub fn infer_sex_to_tsv_at(
     genotype_path: &Path,
     force_build: Option<GenomeBuild>,

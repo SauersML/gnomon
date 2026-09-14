@@ -1019,9 +1019,8 @@ pub fn create_projection_matrix_sink(
 /// Same as [`create_projection_matrix_sink`], but writes the matrix (and its
 /// companion `.metadata.json`) at a caller-supplied absolute path instead of
 /// deriving the output location from the dataset's own
-/// [`GenotypeDataset::output_path`]. Used by the `gnomon all` driver to keep
-/// projection outputs co-located with the original VCF input even when the
-/// underlying `GenotypeDataset` is the cached converted-PLINK fileset.
+/// [`GenotypeDataset::output_path`]. Used by `run_project_with_output`, which
+/// `gnomon all --out PREFIX` calls to write the scores under its prefix.
 pub fn create_projection_matrix_sink_at(
     dataset: &GenotypeDataset,
     output_path: &Path,
