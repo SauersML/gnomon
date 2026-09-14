@@ -628,11 +628,11 @@ impl VariantPlan {
             let pos_raw = *fields
                 .get(cols.pos)
                 .ok_or_else(|| ioerr(".pvar missing POS column"))?;
-            let id_raw = *fields
+            // ID and REF are validated by presence here; their values are only
+            // needed when the virtual .bim rows are streamed.
+            fields
                 .get(cols.id)
                 .ok_or_else(|| ioerr(".pvar missing ID column"))?;
-            // REF is validated by presence here; the value itself is only
-            // needed when the virtual .bim rows are streamed.
             fields
                 .get(cols.refa)
                 .ok_or_else(|| ioerr(".pvar missing REF column"))?;
@@ -653,15 +653,10 @@ impl VariantPlan {
                 .map(|a| a.trim())
                 .filter(|a| !a.is_empty() && *a != ".")
                 .collect();
-
-            for alt in &alts {
-                if is_symbolic_alt(alt) {
-                    return Err(PipelineError::Io(format!(
-                        "Symbolic ALT '{}' unsupported for variant {}:{} (ID {})",
-                        alt, chrom, pos, id_raw
-                    )));
-                }
-            }
+            // Symbolic ALTs (`<INS>`, `<DEL:ME:ALU>`, `*`, breakends) stay as
+            // ordinary allele codes, as plink2's own .bim export and the VCF
+            // readers keep them: dropping or rejecting them would make a PGEN
+            // disagree with the same data read as BED or VCF.
 
             let out_start = out_to_in.len();
             for alt_ord in 1..=alts.len() as u16 {
@@ -814,17 +809,6 @@ fn normalize_chrom(raw: &str) -> String {
         "M" => "MT".to_string(),
         _ => upper,
     }
-}
-
-fn is_symbolic_alt(alt: &str) -> bool {
-    let trimmed = alt.trim();
-    if trimmed == "*" {
-        return true;
-    }
-    if trimmed.starts_with('<') && trimmed.ends_with('>') {
-        return true;
-    }
-    trimmed.contains('[') || trimmed.contains(']')
 }
 
 const GRCH37_X_PAR: &[(u64, u64)] = &[(60_001, 2_699_520), (154_931_044, 155_260_560)];
@@ -3469,6 +3453,51 @@ mod tests {
 
         assert_eq!(plan.haploidy_of(0), Some(HaploidyKind::Diploid));
         assert_eq!(plan.haploidy_of(1), Some(HaploidyKind::HaploidMales));
+    }
+
+    /// 1000 Genomes .pvar files carry structural variants (`<INS:ME:ALU>`),
+    /// spanning deletions (`*`) and breakends. plink2's .bim export and the VCF
+    /// readers keep these as allele codes, so the virtual .bim must too, with
+    /// one variant per ALT in ALT order.
+    #[test]
+    fn pvar_plan_keeps_symbolic_alts_as_allele_codes() {
+        let lines = vec![
+            "#CHROM\tPOS\tID\tREF\tALT",
+            "22\t10532563\tsv1\tT\t<INS:ME:ALU>",
+            "22\t10600000\tv2\tA\tG,*",
+            "22\t10700000\tbnd1\tG\tG]22:10800000]",
+        ];
+        let plan = VariantPlan::from_pvar(&mut LineSource::new(lines.clone()), GenomeBuild::Grch38)
+            .expect("symbolic ALTs are allele codes");
+        assert_eq!(plan.in_variants, 3);
+        assert_eq!(plan.out_variants, 4);
+        let mappings: Vec<_> = (0..4).map(|out| plan.mapping(out).unwrap()).collect();
+        assert_eq!(mappings, vec![(0, 1), (1, 1), (1, 2), (2, 1)]);
+        assert_eq!(plan.alt_count_of_in(1), 2);
+
+        let mut bim = StreamingVirtualBim::new(Box::new(LineSource::new(lines)), None);
+        let mut rows = Vec::new();
+        while let Some(row) = bim.next_line().unwrap() {
+            let fields: Vec<String> = str::from_utf8(row)
+                .unwrap()
+                .split('\t')
+                .map(str::to_string)
+                .collect();
+            rows.push((fields[3].clone(), fields[4].clone(), fields[5].clone()));
+        }
+        let expected = [
+            ("10532563", "<INS:ME:ALU>", "T"),
+            ("10600000", "G", "A"),
+            ("10600000", "*", "A"),
+            ("10700000", "G]22:10800000]", "G"),
+        ];
+        assert_eq!(rows.len(), expected.len());
+        for ((pos, a1, a2), (want_pos, want_a1, want_a2)) in rows.iter().zip(expected) {
+            assert_eq!(
+                (pos.as_str(), a1.as_str(), a2.as_str()),
+                (want_pos, want_a1, want_a2)
+            );
+        }
     }
 
     #[test]
