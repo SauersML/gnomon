@@ -441,19 +441,21 @@ impl<'a> VariantCsrView<'a> {
         self.score_columns.len()
     }
 
+    /// Walks the three slices by index. `variant_csr_view` cuts them with one range, so
+    /// they share a length. A `Zip` of three slice iterators relies on `ZipImpl::new` and
+    /// `TrustedRandomAccessNoCoerce::size` being inlined, and builds with several codegen
+    /// units have kept both out of line: a call pair per row visit in the scoring loops.
     #[inline(always)]
     pub fn iter(&self) -> impl Iterator<Item = CsrContribution> + 'a {
-        self.score_columns
-            .iter()
-            .zip(self.weights)
-            .zip(self.missing_corrections)
-            .map(
-                |((&col_u32, &weight), &missing_correction)| CsrContribution {
-                    score_column: ScoreColumnIndex(col_u32 as usize),
-                    weight,
-                    missing_correction,
-                },
-            )
+        let score_columns = self.score_columns;
+        let len = score_columns.len();
+        let weights = &self.weights[..len];
+        let missing_corrections = &self.missing_corrections[..len];
+        (0..len).map(move |i| CsrContribution {
+            score_column: ScoreColumnIndex(score_columns[i] as usize),
+            weight: weights[i],
+            missing_correction: missing_corrections[i],
+        })
     }
 }
 
