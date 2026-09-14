@@ -18,7 +18,10 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'push' }}
+  # A run takes hours and map pushes land every few minutes, so cancelling on
+  # push meant no run ever finished. A run in progress now completes, and GitHub
+  # keeps only the newest pending run behind it.
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
