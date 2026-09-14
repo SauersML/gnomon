@@ -322,22 +322,36 @@ fn download_missing_files(
                 )));
             }
 
-            let mut file = std::fs::File::create(&temp_gz_path)
-                .map_err(|e| DownloadError::Io(e, temp_gz_path.clone()))?;
-
-            // Copy with progress
-            let mut buf = [0; 8192];
-            use std::io::Read;
-            loop {
-                let n = response.read(&mut buf).map_err(|e| {
-                    DownloadError::Network(format!("Failed reading response for {id}: {e}"))
-                })?;
-                if n == 0 {
-                    break;
+            // The body takes its real name only once complete: an interrupted
+            // download used to leave a truncated `{id}.txt.gz` that every later run
+            // took as already downloaded, then failed to decompress.
+            let mut network_error = None;
+            let written = crate::output::write_atomically(&temp_gz_path, |file| {
+                // Copy with progress
+                let mut buf = [0; 8192];
+                use std::io::Read;
+                loop {
+                    let n = match response.read(&mut buf) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            network_error =
+                                Some(format!("Failed reading response for {id}: {e}"));
+                            return Err(io::Error::other("download interrupted"));
+                        }
+                    };
+                    if n == 0 {
+                        break;
+                    }
+                    file.write_all(&buf[..n])?;
+                    // Since we don't know total size for gzip stream comfortably from all servers, just spinner
                 }
-                file.write_all(&buf[..n])
-                    .map_err(|e| DownloadError::Io(e, temp_gz_path.clone()))?;
-                // Since we don't know total size for gzip stream comfortably from all servers, just spinner
+                Ok(())
+            });
+            if let Err(e) = written {
+                return Err(match network_error {
+                    Some(message) => DownloadError::Network(message),
+                    None => DownloadError::Io(e, temp_gz_path.clone()),
+                });
             }
 
             pb.finish_with_message(format!("Downloaded {id}"));
