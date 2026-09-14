@@ -81,12 +81,16 @@ jobs:
       - name: Prove remote-range parity on the public fixture
         run: |
           set -euo pipefail
-          # The same binary must score identical values whether it reads the
-          # fixture from disk or through HTTP range requests. The fixture is
-          # within one 8 MiB block, so the remote reader fetches it whole in a
-          # single request; every other variant is scored.
-          mkdir -p parity/local parity/remote
-          cp data/testdata/ld.bed data/testdata/ld.bim data/testdata/ld.fam parity/local/
+          # The same binary must score the fixture alike whether it reads it from
+          # disk or through HTTP range requests. The fixture is within one 8 MiB
+          # block, so the remote reader fetches it whole in a single request; every
+          # other variant is scored. One thread fixes the summation order, so reader
+          # parity is exact bytes there. At the default thread count the order varies
+          # from run to run even on disk, so that pair is compared numerically.
+          mkdir -p parity/local parity/remote parity/local-1thread parity/remote-1thread
+          for directory in local local-1thread; do
+            cp data/testdata/ld.bed data/testdata/ld.bim data/testdata/ld.fam "parity/$directory/"
+          done
           python3 - <<'PY'
           from pathlib import Path
           rows = [line.split() for line in Path('data/testdata/ld.bim').read_text().splitlines()]
@@ -100,20 +104,40 @@ jobs:
           python3 scripts/range_http_server.py data/testdata 8765 &
           server=$!
           for _ in $(seq 50); do curl -sfI http://127.0.0.1:8765/ld.bed >/dev/null && break; sleep 0.2; done
-          (cd parity/local && timeout --kill-after=5s 120s ../../runtime/gnomon-score \
-            ../weights.tsv ld.bed --keep ../keep.txt --emit-components)
-          (cd parity/remote && timeout --kill-after=5s 120s ../../runtime/gnomon-score \
-            ../weights.tsv http://127.0.0.1:8765/ld.bed --keep ../keep.txt --emit-components 2> scorer.log \
-            || { cat scorer.log; exit 1; })
+          score() {
+            directory=$1 genotype=$2
+            shift 2
+            (cd "parity/$directory" && env "$@" timeout --kill-after=5s 120s ../../runtime/gnomon-score \
+              ../weights.tsv "$genotype" --keep ../keep.txt --emit-components 2> scorer.log \
+              || { cat scorer.log; exit 1; })
+          }
+          score local ld.bed
+          score remote http://127.0.0.1:8765/ld.bed
+          score local-1thread ld.bed RAYON_NUM_THREADS=1
+          score remote-1thread http://127.0.0.1:8765/ld.bed RAYON_NUM_THREADS=1
           kill "$server"
           grep 'Remote BED read whole' parity/remote/scorer.log
           grep -q 'Remote BED read whole: 75003 B in one request' parity/remote/scorer.log
-          local_out=$(find parity/local -name '*.sscore')
-          remote_out=$(find parity/remote -name '*.sscore')
-          test -n "$local_out" && test -n "$remote_out"
-          cmp "$local_out" "$remote_out"
+          grep -q 'Remote BED read whole: 75003 B in one request' parity/remote-1thread/scorer.log
+          sscore() {
+            found=$(find "parity/$1" -name '*.sscore')
+            test "$(printf '%s\n' "$found" | grep -c .)" -eq 1
+            printf '%s\n' "$found"
+          }
+          local_out=$(sscore local)
+          remote_out=$(sscore remote)
+          local_1thread=$(sscore local-1thread)
+          remote_1thread=$(sscore remote-1thread)
+          if ! cmp "$local_1thread" "$remote_1thread"; then
+            echo "::error::Reader parity broke: one-thread .sscore bytes differ between local and remote reads."
+            exit 1
+          fi
+          if ! python3 scripts/compare_sscore.py "$local_out" "$remote_out"; then
+            echo "::error::Default-thread scores broke: local and remote differ in an id or count, or beyond 1e-10 relative."
+            exit 1
+          fi
           test "$(grep -vc '^#' "$remote_out")" -eq 40
-          echo "Remote planned reads reproduce local scores for 40 kept samples."
+          echo "Remote reads reproduce local scores for 40 kept samples: exact bytes at one thread, within 1e-10 at default threads."
       - uses: actions/upload-artifact@v4
         with:
           name: aou-scorer-runtime
