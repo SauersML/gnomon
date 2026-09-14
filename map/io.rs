@@ -6325,15 +6325,19 @@ fn decode_plink_variant_standardized_bytes(
     debug_assert!(dest.len() >= n_samples);
     debug_assert!(bytes.len() >= n_samples.div_ceil(4));
 
+    // Whole-array stores, not `copy_from_slice`: the slice copy is an out-of-line
+    // call per byte whenever it lands in another codegen unit.
     let (full_dest, tail_dest) = dest[..n_samples].as_chunks_mut::<4>();
     let full_bytes = full_dest.len();
     for (&byte, chunk) in bytes[..full_bytes].iter().zip(full_dest) {
-        chunk.copy_from_slice(&byte_table[byte as usize]);
+        *chunk = byte_table[byte as usize];
     }
 
     if !tail_dest.is_empty() {
         let decoded = &byte_table[bytes[full_bytes] as usize];
-        tail_dest.copy_from_slice(&decoded[..tail_dest.len()]);
+        for (slot, &value) in tail_dest.iter_mut().zip(decoded) {
+            *slot = value;
+        }
     }
 }
 
@@ -6356,7 +6360,10 @@ fn decode_plink_variant_standardized_rows(
     let mut logical = 0usize;
     for (&byte, &mask) in bytes.iter().zip(masks) {
         if mask == 0b1111 {
-            dest[logical..logical + 4].copy_from_slice(&byte_table[byte as usize]);
+            let lanes: &mut [f64; 4] = (&mut dest[logical..logical + 4])
+                .try_into()
+                .expect("a retained byte fills four lanes");
+            *lanes = byte_table[byte as usize];
             logical += 4;
         } else {
             let mut retained = mask;
