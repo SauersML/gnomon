@@ -1,5 +1,34 @@
 # Score and packed projection performance
 
+## Independent source-weight accuracy audit
+
+`benches/compare_exact_score.py` compares the cohort probe's SUM output with
+the independent `benches/gscore` fixed-point reference's AVG output. The probe
+writes score denominators to a `.meta.json` sidecar. The comparison verifies
+the person-ID bijection, finite values, and missing percentages in the f32
+representation emitted by gscore. Percentages cannot prove exact missing
+counts for arbitrarily large denominators. Relative tolerance defaults to
+1e-12 with zero absolute allowance; any excess returns a failing exit status.
+Reports include absolute and relative worst cases and per-score errors.
+
+On the complete 1,799,239-marker, 512-person BED and 32 normalized PGS files,
+all missing percentages agreed. Maximum AVG error was 2.67028808e-8, for
+PGS000023: production 1.6779999732971191 versus reference 1.678. The largest
+relative error was 1.0 at a near-zero PGS000026 value (0 versus 1.15648e-18).
+16,226 of 16,384 cells exceeded the default relative tolerance. These findings
+are **an unresolved source-precision gap**, not a passing accuracy result.
+Earlier comparisons against an older production binary share its f32 weight
+representation and therefore do not establish source-weight accuracy.
+
+An isolation check rounded only PGS000023's input weights to f32 before
+passing them to the exact reference. All 512 averages then matched production
+exactly. This identifies weight quantization as the cause of that score's
+observed difference; it does not attribute every other score's error.
+Logs and outputs use `round15-` in the MSI iteration directory. The reference
+ran without its preparation cache on four pinned Milan cores; its full
+32-score run took 2.89 seconds and peaked at 1.09 GiB RSS. This audit covers
+BED scoring, not every supported input format or phenotype regime.
+
 ## Reused row masks and bounded output blocks
 
 Sparse packed scoring builds a 2 KiB column/row membership mask once per

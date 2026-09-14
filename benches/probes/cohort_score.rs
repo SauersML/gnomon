@@ -97,6 +97,15 @@ fn main() {
         writeln!(output).unwrap();
     }
     output.flush().unwrap();
+    let metadata = serde_json::json!({
+        "scores": prep.score_names,
+        "denominators": prep.score_variant_counts,
+    });
+    std::fs::write(
+        args[2].with_extension("meta.json"),
+        serde_json::to_vec(&metadata).unwrap(),
+    )
+    .unwrap();
     println!(
         "people={} scores={} matched={} nnz={} prep_ms={:.3} compute_ms={:.3} reference_rows={} max_abs={max_abs:.12e} max_relative={max_relative:.12e}",
         prep.num_people_to_score,
