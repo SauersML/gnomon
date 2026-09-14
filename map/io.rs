@@ -674,8 +674,14 @@ pub fn save_hwe_model_at(
 /// [`load_projection_model_from_path`] instead.
 pub fn load_model_from_path(model_path: &Path) -> Result<HwePcaModel, DatasetOutputError> {
     let file = File::open(model_path)?;
-    let reader = BufReader::new(file);
-    let model: HwePcaModel = serde_json::from_reader(reader)?;
+    // serde_json pulls an `io::Read` one byte at a time; parsing the mapped file
+    // as one slice is the same parser without that overhead, and the mapping keeps
+    // the text in the page cache instead of a second resident copy. A file that
+    // cannot be mapped (empty, or not a regular file) is still read as a stream.
+    let model: HwePcaModel = match unsafe { MmapOptions::new().map(&file) } {
+        Ok(bytes) => serde_json::from_slice(&bytes)?,
+        Err(_) => serde_json::from_reader(BufReader::new(file))?,
+    };
     Ok(model)
 }
 
