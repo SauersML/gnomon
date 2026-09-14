@@ -15,6 +15,7 @@ use tempfile::tempdir;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
+const SCORE_BIN: &str = env!("CARGO_BIN_EXE_gnomon-score");
 const TERMS_BIN: &str = env!("CARGO_BIN_EXE_gnomon-terms");
 
 /// Copies the fixture fileset into `dir` as `cohort.{bed,bim,fam}` and writes a
@@ -245,6 +246,187 @@ fn terms_out_rejects_a_directory_or_remote_prefix() -> TestResult {
                 OsStr::new("--out"),
                 OsStr::new(prefix),
                 genotypes.as_os_str(),
+            ],
+        );
+        assert!(!output.status.success(), "--out {prefix} was accepted");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("--out"), "--out {prefix}: {stderr}");
+    }
+    assert!(!tmp.path().join("results").exists());
+    Ok(())
+}
+
+#[test]
+fn score_out_writes_only_under_the_prefix_directory() -> TestResult {
+    let tmp = tempdir()?;
+    let inputs = tmp.path().join("inputs");
+    let (genotypes, score) = stage_inputs(&inputs)?;
+    let work = tmp.path().join("work");
+    fs::create_dir(&work)?;
+    let inputs_before = snapshot(&inputs);
+
+    let prefix = tmp.path().join("results").join("eur");
+    assert_success(&run(
+        SCORE_BIN,
+        &work,
+        &[
+            score.as_os_str(),
+            genotypes.as_os_str(),
+            OsStr::new("--out"),
+            prefix.as_os_str(),
+        ],
+    ));
+
+    assert_eq!(snapshot(&inputs), inputs_before, "the input directory changed");
+    assert!(snapshot(&work).is_empty(), "the working directory changed");
+    let results = snapshot(&tmp.path().join("results"));
+    for path in results.keys() {
+        assert!(
+            path == Path::new("eur.sscore") || path.starts_with("gnomon_score_cache"),
+            "unexpected output {}",
+            path.display()
+        );
+    }
+
+    // --out moves the results; it must not change them.
+    let default_inputs = tmp.path().join("default");
+    let (default_genotypes, default_score) = stage_inputs(&default_inputs)?;
+    assert_success(&run(
+        SCORE_BIN,
+        &work,
+        &[default_score.as_os_str(), default_genotypes.as_os_str()],
+    ));
+    assert_eq!(
+        results.get(Path::new("eur.sscore")).expect("eur.sscore"),
+        &fs::read(default_inputs.join("cohort_w.sscore"))?
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn score_out_succeeds_on_a_read_only_input_directory() -> TestResult {
+    let tmp = tempdir()?;
+    let inputs = tmp.path().join("inputs");
+    let (genotypes, score) = stage_inputs(&inputs)?;
+    let _read_only = ReadOnly::new(&inputs);
+    let inputs_before = snapshot(&inputs);
+
+    let prefix = tmp.path().join("results").join("eur");
+    assert_success(&run(
+        SCORE_BIN,
+        tmp.path(),
+        &[
+            score.as_os_str(),
+            genotypes.as_os_str(),
+            OsStr::new("--out"),
+            prefix.as_os_str(),
+        ],
+    ));
+
+    assert!(fs::metadata(with_suffix(&prefix, "sscore"))?.len() > 0);
+    assert_eq!(snapshot(&inputs), inputs_before);
+    Ok(())
+}
+
+/// Without `--out`, a score file in a directory gnomon cannot write still gets
+/// its sorted cache, under the user cache directory instead of beside it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_read_only_score_directory_caches_under_the_user_cache_directory() -> TestResult {
+    let tmp = tempdir()?;
+    let (genotypes, _) = stage_inputs(&tmp.path().join("genotypes"))?;
+    let scores = tmp.path().join("scores");
+    let (_, score) = stage_inputs(&scores)?;
+    let _read_only = ReadOnly::new(&scores);
+    let scores_before = snapshot(&scores);
+    let cache_home = tmp.path().join("xdg-cache");
+
+    let output = Command::new(SCORE_BIN)
+        .current_dir(tmp.path())
+        .env("XDG_CACHE_HOME", &cache_home)
+        .arg(&score)
+        .arg(&genotypes)
+        .output()?;
+    assert_success(&output);
+
+    assert!(tmp.path().join("genotypes").join("cohort_w.sscore").is_file());
+    assert_eq!(snapshot(&scores), scores_before);
+    let cached = snapshot(&cache_home.join("gnomon").join("score_cache"));
+    assert!(
+        cached
+            .keys()
+            .any(|path| path.to_string_lossy().ends_with(".sorted.gnomon.tsv")),
+        "no sorted cache under the user cache directory: {:?}",
+        cached.keys().collect::<Vec<_>>()
+    );
+    Ok(())
+}
+
+#[test]
+fn concurrent_score_runs_with_different_out_prefixes_agree() -> TestResult {
+    let tmp = tempdir()?;
+    let (genotypes, score) = stage_inputs(&tmp.path().join("inputs"))?;
+    // The last two prefixes share a directory, and therefore one score-file cache.
+    let prefixes = [
+        "results/a/eur",
+        "results/b/eur",
+        "results/shared/one",
+        "results/shared/two",
+    ]
+    .map(|prefix| tmp.path().join(prefix));
+
+    let children = prefixes
+        .iter()
+        .map(|prefix| {
+            Command::new(SCORE_BIN)
+                .current_dir(tmp.path())
+                .arg(&score)
+                .arg(&genotypes)
+                .arg("--out")
+                .arg(prefix)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for child in children {
+        assert_success(&child.wait_with_output()?);
+    }
+
+    let first = fs::read(with_suffix(&prefixes[0], "sscore"))?;
+    for prefix in &prefixes[1..] {
+        assert_eq!(
+            fs::read(with_suffix(prefix, "sscore"))?,
+            first,
+            "{} differs",
+            prefix.display()
+        );
+    }
+    let leftovers: Vec<PathBuf> = snapshot(&tmp.path().join("results"))
+        .into_keys()
+        .filter(|path| {
+            let name = path.to_string_lossy();
+            name.ends_with(".tmp") || name.contains("gnomon-checkpoint")
+        })
+        .collect();
+    assert!(leftovers.is_empty(), "left behind: {leftovers:?}");
+    Ok(())
+}
+
+#[test]
+fn score_out_rejects_a_directory_or_remote_prefix() -> TestResult {
+    let tmp = tempdir()?;
+    let (genotypes, score) = stage_inputs(&tmp.path().join("inputs"))?;
+    for prefix in ["results/", "gs://bucket/eur"] {
+        let output = run(
+            SCORE_BIN,
+            tmp.path(),
+            &[
+                score.as_os_str(),
+                genotypes.as_os_str(),
+                OsStr::new("--out"),
+                OsStr::new(prefix),
             ],
         );
         assert!(!output.status.success(), "--out {prefix} was accepted");

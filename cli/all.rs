@@ -130,6 +130,8 @@ pub fn run(opts: AllOptions) -> Result<(), Box<dyn std::error::Error>> {
         // recomputes the real per-sample sex from the cached PLINK.
         None,
         false,
+        // Outputs stay beside the original input, like every other phase.
+        None,
     )
     .map_err(|err| err as Box<dyn std::error::Error>)?;
     println!(

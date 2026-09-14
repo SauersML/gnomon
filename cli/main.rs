@@ -81,6 +81,12 @@ struct ScoreArgs {
     #[arg(value_name = "GENOTYPE_PATH")]
     input_path: PathBuf,
 
+    /// Output prefix (for example, results/eur writes results/eur.sscore).
+    /// Checkpoints and score-file caches stay under the prefix's directory.
+    /// Defaults to <GENOTYPE>_<SCORE>.sscore beside the genotype data.
+    #[arg(long, value_name = "PREFIX")]
+    out: Option<PathBuf>,
+
     /// Reference genome FASTA (optional; auto-downloaded if not provided for DTC files)
     #[arg(long)]
     reference: Option<PathBuf>,
@@ -683,6 +689,7 @@ fn run_score(args: ScoreArgs) -> Result<(), Box<dyn std::error::Error>> {
         args.panel,
         args.inferred_sex,
         args.emit_components,
+        args.out,
     )
     .map_err(|err| err as Box<dyn std::error::Error>)
 }

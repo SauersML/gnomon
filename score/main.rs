@@ -26,15 +26,16 @@ use gnomon::score::reformat;
 use gnomon::score::types::{GenomicRegion, PreparationResult};
 use natord::compare;
 use rayon::prelude::*;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::ffi::OsString;
 use std::fmt::Write as FmtWrite;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, UNIX_EPOCH};
 
 // ========================================================================================
 //                              Command-line interface definition
@@ -98,6 +99,11 @@ struct Args {
     /// Emit sufficient statistics for aggregation across scored regions.
     #[clap(long)]
     emit_components: bool,
+
+    /// Output prefix: write PREFIX.sscore, and keep checkpoints and score-file
+    /// caches under PREFIX's directory, instead of beside the inputs.
+    #[clap(long, value_name = "PREFIX")]
+    out: Option<PathBuf>,
 }
 
 // ========================================================================================
@@ -109,7 +115,8 @@ struct Args {
 
 /// Public interface for calling gnomon with explicit arguments, including a
 /// pre-computed sex to skip the internal VCF-scan sex inference. Pass `None`
-/// for `inferred_sex` to preserve the original full-scan behavior.
+/// for `inferred_sex` to preserve the original full-scan behavior. `out` is
+/// `--out PREFIX`; `None` writes beside the inputs as before.
 pub fn run_gnomon_with_args(
     input_path: PathBuf,
     score: PathBuf,
@@ -119,6 +126,7 @@ pub fn run_gnomon_with_args(
     panel: Option<PathBuf>,
     inferred_sex: Option<InferredSexArg>,
     emit_components: bool,
+    out: Option<PathBuf>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let args = Args {
         score,
@@ -129,6 +137,7 @@ pub fn run_gnomon_with_args(
         panel,
         inferred_sex,
         emit_components,
+        out,
     };
     run_gnomon_impl(args)
 }
@@ -180,6 +189,18 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "scores".to_string())
     };
+    if let Some(prefix) = args.out.as_deref() {
+        gnomon::output::validate_out_prefix(prefix)?;
+    }
+    let cache_dir = score_cache_dir(args.out.as_deref(), &args.score);
+    if let Some(dir) = cache_dir.as_deref() {
+        fs::create_dir_all(dir).map_err(|e| {
+            format!(
+                "Could not create the score-file cache directory '{}': {e}",
+                dir.display()
+            )
+        })?;
+    }
 
     let input_format = detect_input_format(&args.input_path).ok_or_else(|| {
         format!(
@@ -196,9 +217,16 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
     }
 
     if use_native_vcf {
-        ensure_output_absent(&args.input_path, &out_suffix)?;
-        let (resolved_score_files, score_regions_map) =
-            resolve_score_files(&args.score, &score_arg_str, &args.input_path)?;
+        let output_path = match args.out.as_deref() {
+            Some(prefix) => gnomon::output::prefixed_path(prefix, "sscore"),
+            None => score_output_path(&args.input_path, Some(&out_suffix)),
+        };
+        ensure_output_absent(&output_path)?;
+        let (resolved_score_files, score_regions_map) = resolve_score_files(
+            &args.score,
+            &score_arg_str,
+            args.out.as_deref().unwrap_or(&args.input_path),
+        )?;
 
         if resolved_score_files.is_empty() {
             return Err("No score files were found or resolved.".into());
@@ -210,7 +238,7 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
             resolved_score_files.len()
         );
         let prep_start = Instant::now();
-        let native_score_files = normalize_score_files(&resolved_score_files)?;
+        let native_score_files = normalize_score_files(&resolved_score_files, cache_dir.as_deref())?;
         let native_result = native_vcf::score_vcf_streaming(
             &args.input_path,
             &native_score_files,
@@ -235,10 +263,9 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
             Some(&score_regions_map)
         };
         finalize_and_write_native_output(
-            &args.input_path,
+            &output_path,
             &native_result,
             score_regions_ref,
-            Some(&out_suffix),
             args.emit_components,
         )?;
 
@@ -269,10 +296,17 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
     let genome_build = args.build.as_deref().map(GenomeBuild::parse).transpose()?;
 
     let fileset_prefixes = resolve_filesets(&effective_input_path)?;
-    ensure_output_absent(&fileset_prefixes[0], &out_suffix)?;
+    let output_path = match args.out.as_deref() {
+        Some(prefix) => gnomon::output::prefixed_path(prefix, "sscore"),
+        None => fileset_output_path(&fileset_prefixes[0], Some(&out_suffix)),
+    };
+    ensure_output_absent(&output_path)?;
 
-    let (resolved_score_files, score_regions_map) =
-        resolve_score_files(&args.score, &score_arg_str, &fileset_prefixes[0])?;
+    let (resolved_score_files, score_regions_map) = resolve_score_files(
+        &args.score,
+        &score_arg_str,
+        args.out.as_deref().unwrap_or(&fileset_prefixes[0]),
+    )?;
 
     if resolved_score_files.is_empty() {
         return Err("No score files were found or resolved.".into());
@@ -289,10 +323,10 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
         &resolved_score_files,
         args.keep.as_deref(),
         score_regions_ref,
+        cache_dir.as_deref(),
     )?;
     let memory_budget = MemoryBudget::default();
     pipeline::preflight_memory(&prep_result, memory_budget)?;
-    let output_path = score_output_path(&fileset_prefixes[0], Some(&out_suffix));
     let checkpoint_path = checkpoint::checkpoint_path_for_output(&output_path);
     let checkpoint_fingerprint = checkpoint::fingerprint_preparation(&prep_result);
     let result_len = prep_result
@@ -346,14 +380,13 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
 
     // --- Phase 4: Finalization & Output ---
     // After all computation is complete, this synchronous phase writes the
-    // final scores to disk. The first fileset's prefix determines the output name.
+    // final scores to the output path chosen before preparation.
     finalize_and_write_output(
-        &fileset_prefixes[0],
+        &output_path,
         &prep_result,
         &final_scores,
         &final_counts,
         score_regions_ref,
-        Some(&out_suffix),
         args.emit_components,
     )?;
     checkpoint::remove_checkpoint(&checkpoint_path)?;
@@ -365,11 +398,7 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
     Ok(())
 }
 
-fn ensure_output_absent(
-    output_prefix: &Path,
-    out_suffix: &str,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let output_path = score_output_path(output_prefix, Some(out_suffix));
+fn ensure_output_absent(output_path: &Path) -> Result<(), Box<dyn Error + Send + Sync>> {
     if output_path.exists() {
         return Err(format!(
             "Output file '{}' already exists. Gnomon will not overwrite it. Please remove it or rename it before running.",
@@ -491,7 +520,7 @@ fn resolve_score_files(
         // with a duplicate score ID.
         let derived_sorted_copies: std::collections::HashSet<PathBuf> = cache_files
             .iter()
-            .map(|(path, _)| sorted_native_score_path(path))
+            .map(|(path, _)| sorted_native_score_path(path, None))
             .collect();
         cache_files.retain(|(path, _)| !derived_sorted_copies.contains(path));
 
@@ -568,7 +597,93 @@ fn read_score_names_from_cached_file(
     Err(format!("Empty cached file '{}'", path.display()).into())
 }
 
-fn sorted_native_score_path(path: &Path) -> PathBuf {
+/// Where normalized and sorted score-file caches go. `None` keeps each beside its
+/// score file, as always. `--out` moves them under the prefix's directory, and a
+/// score directory this process cannot write sends them to the user's cache
+/// directory, so neither case writes beside the score files.
+fn score_cache_dir(out: Option<&Path>, score_arg: &Path) -> Option<PathBuf> {
+    if let Some(prefix) = out {
+        let out_dir = prefix
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        return Some(out_dir.join("gnomon_score_cache"));
+    }
+    // PGS Catalog IDs download into a cache directory gnomon creates itself.
+    if !score_arg.exists() {
+        return None;
+    }
+    let score_dir = if score_arg.is_dir() {
+        score_arg
+    } else {
+        score_arg
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+    };
+    if directory_is_writable(score_dir) {
+        return None;
+    }
+    let cache_dir = dirs::cache_dir()?.join("gnomon").join("score_cache");
+    eprintln!(
+        "> Score directory '{}' is not writable; caching converted score files under '{}'.",
+        score_dir.display(),
+        cache_dir.display()
+    );
+    Some(cache_dir)
+}
+
+/// Whether this process can create files in `dir`, found by creating one:
+/// permission bits alone miss read-only mounts and ACLs.
+fn directory_is_writable(dir: &Path) -> bool {
+    let probe = dir.join(format!(".gnomon-write-probe.{}", std::process::id()));
+    match OpenOptions::new().write(true).create_new(true).open(&probe) {
+        Ok(file) => {
+            drop(file);
+            let _ = fs::remove_file(&probe);
+            true
+        }
+        Err(e) => e.kind() == io::ErrorKind::AlreadyExists,
+    }
+}
+
+/// Names a cache entry for `source` inside a dedicated cache directory. Runs on
+/// different score files share that directory, so the name carries a key over
+/// this build and the source's identity (canonical path, size, modification
+/// time): an edited, replaced or re-pointed source, or another gnomon build,
+/// misses instead of reading an entry made from something else.
+fn keyed_cache_path(cache_dir: &Path, source: &Path, suffix: &str) -> PathBuf {
+    fn update_field(hasher: &mut Sha256, bytes: &[u8]) {
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
+
+    let mut hasher = Sha256::new();
+    update_field(&mut hasher, env!("CARGO_PKG_VERSION").as_bytes());
+    update_field(&mut hasher, env!("GNOMON_BUILD_TIMESTAMP").as_bytes());
+    let canonical = fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
+    update_field(&mut hasher, canonical.as_os_str().as_encoded_bytes());
+    if let Ok(metadata) = fs::metadata(source) {
+        hasher.update(metadata.len().to_le_bytes());
+        let modified_nanos = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map_or(0, |since| since.as_nanos());
+        hasher.update(modified_nanos.to_le_bytes());
+    }
+    let key = hex::encode(&hasher.finalize()[..8]);
+    let stem = source
+        .file_stem()
+        .map(|s| s.to_string_lossy())
+        .unwrap_or_else(|| "score".into());
+    cache_dir.join(format!("{stem}.{key}.{suffix}"))
+}
+
+fn sorted_native_score_path(path: &Path, cache_dir: Option<&Path>) -> PathBuf {
+    if let Some(dir) = cache_dir {
+        return keyed_cache_path(dir, path, "sorted.gnomon.tsv");
+    }
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -590,6 +705,7 @@ fn sorted_native_score_path(path: &Path) -> PathBuf {
 fn sort_native_score_files(
     native_score_files: Vec<PathBuf>,
     freshly_converted: &HashSet<PathBuf>,
+    cache_dir: Option<&Path>,
 ) -> Result<Vec<PathBuf>, Box<dyn Error + Send + Sync>> {
     let needs_sort = |path: &Path, sorted_path: &Path| {
         if sorted_path.exists() {
@@ -606,7 +722,7 @@ fn sort_native_score_files(
     let pairs: Vec<(PathBuf, PathBuf)> = native_score_files
         .into_iter()
         .map(|path| {
-            let sorted_path = sorted_native_score_path(&path);
+            let sorted_path = sorted_native_score_path(&path, cache_dir);
             (path, sorted_path)
         })
         .collect();
@@ -681,6 +797,7 @@ fn sort_native_score_files(
 
 fn normalize_score_files(
     score_files: &[PathBuf],
+    cache_dir: Option<&Path>,
 ) -> Result<Vec<PathBuf>, Box<dyn Error + Send + Sync>> {
     enum Prep {
         Resolved(String, PathBuf),
@@ -704,7 +821,10 @@ fn normalize_score_files(
                 };
                 fs::create_dir_all(&output_dir)?;
 
-                let new_path = score_file_path.with_extension("gnomon.tsv");
+                let new_path = match cache_dir {
+                    Some(dir) => keyed_cache_path(dir, score_file_path, "gnomon.tsv"),
+                    None => score_file_path.with_extension("gnomon.tsv"),
+                };
                 let should_reformat = if new_path.exists() {
                     let source_meta = fs::metadata(score_file_path).and_then(|m| m.modified());
                     let cache_meta = fs::metadata(&new_path).and_then(|m| m.modified());
@@ -813,7 +933,7 @@ fn normalize_score_files(
         return Err("No compatible score files remained after normalization. Scores that only provide dosage-specific weights ('dosage_0_weight', 'dosage_1_weight', 'dosage_2_weight') are currently unsupported.".into());
     }
 
-    sort_native_score_files(native_score_files, &freshly_converted)
+    sort_native_score_files(native_score_files, &freshly_converted, cache_dir)
 }
 
 /// **Helper 1:** Encapsulates the entire preparation and file normalization phase.
@@ -828,6 +948,7 @@ fn run_preparation_phase(
     score_files: &[PathBuf],
     keep: Option<&Path>,
     score_regions: Option<&HashMap<String, GenomicRegion>>,
+    cache_dir: Option<&Path>,
 ) -> Result<Arc<PreparationResult>, Box<dyn Error + Send + Sync>> {
     /// Reads the score label from a cached .gnomon.tsv file by parsing its header.
     /// Format: variant_id\teffect_allele\tother_allele\tSCORE_LABEL\n
@@ -895,7 +1016,10 @@ fn run_preparation_phase(
                 };
                 fs::create_dir_all(&output_dir)?;
 
-                let new_path = score_file_path.with_extension("gnomon.tsv");
+                let new_path = match cache_dir {
+                    Some(dir) => keyed_cache_path(dir, score_file_path, "gnomon.tsv"),
+                    None => score_file_path.with_extension("gnomon.tsv"),
+                };
 
                 let should_reformat = if new_path.exists() {
                     let source_meta = fs::metadata(score_file_path).and_then(|m| m.modified());
@@ -1014,7 +1138,8 @@ Scores that only provide dosage-specific weights \
 ('dosage_0_weight', 'dosage_1_weight', 'dosage_2_weight') are currently unsupported."
             .into());
     }
-    let native_score_files = sort_native_score_files(native_score_files, &freshly_converted)?;
+    let native_score_files =
+        sort_native_score_files(native_score_files, &freshly_converted, cache_dir)?;
 
     // --- Run the main preparation logic with the fully normalized and sorted files ---
     let prep = prepare::prepare_for_computation(
@@ -1037,17 +1162,11 @@ Scores that only provide dosage-specific weights \
 }
 
 fn finalize_and_write_native_output(
-    output_prefix: &Path,
+    out_path: &Path,
     result: &NativeVcfScoreResult,
     score_regions: Option<&HashMap<String, GenomicRegion>>,
-    name_suffix: Option<&str>,
     emit_components: bool,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let out_path = score_output_path(output_prefix, name_suffix);
-    if let Some(output_dir) = out_path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        fs::create_dir_all(output_dir)?;
-    }
-
     eprintln!(
         "> Writing {} scores per person to {}",
         result.score_names.len(),
@@ -1056,7 +1175,7 @@ fn finalize_and_write_native_output(
     let output_start = Instant::now();
 
     write_scores_to_file(
-        &out_path,
+        out_path,
         &result.person_iids,
         &result.score_names,
         &result.score_variant_counts,
@@ -1070,31 +1189,23 @@ fn finalize_and_write_native_output(
     Ok(())
 }
 
-/// **Helper:** Handles the final file writing.
-///
-/// This function is synchronous and takes the final results directly.
-fn finalize_and_write_output(
-    output_prefix: &Path,
-    prep_result: &Arc<PreparationResult>,
-    final_scores: &[f64],
-    final_counts: &[u32],
-    score_regions: Option<&HashMap<String, GenomicRegion>>,
-    name_suffix: Option<&str>,
-    emit_components: bool,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let (output_dir, mut out_stem) = if is_remote_prefix(output_prefix) {
-        let stem = output_prefix
+/// Default `.sscore` path for PLINK filesets: `<prefix>_<suffix>.sscore` beside
+/// the first fileset, or in the working directory when it is remote. Unlike
+/// [`score_output_path`], the fileset name is used whole.
+fn fileset_output_path(fileset_prefix: &Path, name_suffix: Option<&str>) -> PathBuf {
+    let (output_dir, mut out_stem) = if is_remote_prefix(fileset_prefix) {
+        let stem = fileset_prefix
             .file_name()
             .map_or_else(|| OsString::from("gnomon_results"), OsString::from);
         (Path::new(".").to_path_buf(), stem)
     } else {
-        let parent = output_prefix.parent();
+        let parent = fileset_prefix.parent();
         // Handle both None and empty parent (Path::new("arrays").parent() == Some(""))
         let dir = match parent {
             Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
             _ => Path::new(".").to_path_buf(),
         };
-        let stem = output_prefix
+        let stem = fileset_prefix
             .file_name()
             .unwrap_or_else(|| std::ffi::OsStr::new("gnomon_results"))
             .to_os_string();
@@ -1105,11 +1216,22 @@ fn finalize_and_write_output(
         out_stem.push("_");
         out_stem.push(suffix);
     }
-    fs::create_dir_all(&output_dir)?;
     let mut out_filename = out_stem;
     out_filename.push(".sscore");
-    let out_path = output_dir.join(&out_filename);
+    output_dir.join(out_filename)
+}
 
+/// **Helper:** Handles the final file writing.
+///
+/// This function is synchronous and takes the final results directly.
+fn finalize_and_write_output(
+    out_path: &Path,
+    prep_result: &Arc<PreparationResult>,
+    final_scores: &[f64],
+    final_counts: &[u32],
+    score_regions: Option<&HashMap<String, GenomicRegion>>,
+    emit_components: bool,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     eprintln!(
         "> Writing {} scores per person to {}",
         prep_result.score_names.len(),
@@ -1118,7 +1240,7 @@ fn finalize_and_write_output(
     let output_start = Instant::now();
 
     write_scores_to_file(
-        &out_path,
+        out_path,
         &prep_result.final_person_iids,
         &prep_result.score_names,
         &prep_result.score_variant_counts,
