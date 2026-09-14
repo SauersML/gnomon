@@ -1440,7 +1440,8 @@ fn fetch_variant_object_names(
 
 fn list_remote_variant_objects(bucket: &str, prefix: &str) -> Result<Vec<String>, PipelineError> {
     let runtime = get_shared_runtime()?;
-    let (_, control, _) = RemoteByteRangeSource::create_clients(&runtime, None)?;
+    let anonymous = default_gcs_credentials_unusable();
+    let (_, control, _) = shared_gcs_clients(&runtime, anonymous)?;
     let bucket_path = format!("projects/_/buckets/{bucket}");
     let user_project = gcs_billing_project_from_env();
 
@@ -1450,11 +1451,9 @@ fn list_remote_variant_objects(bucket: &str, prefix: &str) -> Result<Vec<String>
 
     match attempt(&control) {
         Ok(names) => Ok(names),
-        Err(err) if RemoteByteRangeSource::is_authentication_error(&err) => {
-            let (_, fallback_control, _) = RemoteByteRangeSource::create_clients(
-                &runtime,
-                Some(AnonymousCredentials::new().build()),
-            )?;
+        Err(err) if !anonymous && RemoteByteRangeSource::is_authentication_error(&err) => {
+            note_default_gcs_credentials_unusable();
+            let (_, fallback_control, _) = shared_gcs_clients(&runtime, true)?;
             attempt(&fallback_control).map_err(|retry_err| {
                 convert_list_error(bucket, prefix, user_project.clone(), retry_err)
             })
@@ -1560,7 +1559,8 @@ fn create_remote_streaming_context(
     object: &str,
 ) -> Result<(Arc<Runtime>, Storage, u64, Option<String>), PipelineError> {
     let runtime = get_shared_runtime()?;
-    let (mut storage, control, _) = RemoteByteRangeSource::create_clients(&runtime, None)?;
+    let anonymous = default_gcs_credentials_unusable();
+    let (mut storage, control, _) = shared_gcs_clients(&runtime, anonymous)?;
     let bucket_path = format!("projects/_/buckets/{bucket}");
     let user_project = gcs_billing_project_from_env();
     let metadata = match RemoteByteRangeSource::fetch_object_metadata(
@@ -1570,15 +1570,13 @@ fn create_remote_streaming_context(
         object,
     ) {
         Ok(metadata) => metadata,
-        Err(err) if RemoteByteRangeSource::is_authentication_error(&err) => {
+        Err(err) if !anonymous && RemoteByteRangeSource::is_authentication_error(&err) => {
             let err_msg = err.to_string();
             debug!(
                 "Retrying metadata fetch for gs://{bucket}/{object} with anonymous credentials after authentication failure: {err_msg}"
             );
-            let (fallback_storage, fallback_control, _) = RemoteByteRangeSource::create_clients(
-                &runtime,
-                Some(AnonymousCredentials::new().build()),
-            )
+            note_default_gcs_credentials_unusable();
+            let (fallback_storage, fallback_control, _) = shared_gcs_clients(&runtime, true)
             .map_err(|client_err| {
                 PipelineError::Io(format!(
                     "Failed to initialize Cloud Storage clients with anonymous credentials after authentication failure: {client_err} (initial error: {err_msg})"
@@ -2078,6 +2076,61 @@ struct RemoteByteRangeSource {
     block_size: usize,
 }
 
+/// Cloud Storage clients shared by every remote object this process opens: one set
+/// built with default credentials, one with anonymous credentials, and whether
+/// default credentials have already failed to authenticate.
+///
+/// Off Google Cloud, without a key file, default credentials fall back to the
+/// metadata server and fail only after its retries. A directory of public objects
+/// used to pay that for every object it opened, and build new clients each time;
+/// now the failure is paid once, and later opens use the anonymous clients.
+struct GcsClients {
+    default: Option<(Storage, StorageControl, Credentials)>,
+    anonymous: Option<(Storage, StorageControl, Credentials)>,
+    default_unusable: bool,
+}
+
+static GCS_CLIENTS: OnceLock<Mutex<GcsClients>> = OnceLock::new();
+
+fn gcs_clients() -> &'static Mutex<GcsClients> {
+    GCS_CLIENTS.get_or_init(|| {
+        Mutex::new(GcsClients {
+            default: None,
+            anonymous: None,
+            default_unusable: false,
+        })
+    })
+}
+
+/// The shared clients for default or anonymous credentials, built on first use.
+fn shared_gcs_clients(
+    runtime: &Arc<Runtime>,
+    anonymous: bool,
+) -> Result<(Storage, StorageControl, Credentials), PipelineError> {
+    let mut clients = gcs_clients().lock().unwrap();
+    let slot = if anonymous {
+        &mut clients.anonymous
+    } else {
+        &mut clients.default
+    };
+    if let Some(built) = slot {
+        return Ok(built.clone());
+    }
+    let credentials = anonymous.then(|| AnonymousCredentials::new().build());
+    let built = RemoteByteRangeSource::create_clients(runtime, credentials)?;
+    *slot = Some(built.clone());
+    Ok(built)
+}
+
+/// Whether default credentials have already failed to build authentication headers.
+fn default_gcs_credentials_unusable() -> bool {
+    gcs_clients().lock().unwrap().default_unusable
+}
+
+fn note_default_gcs_credentials_unusable() {
+    gcs_clients().lock().unwrap().default_unusable = true;
+}
+
 impl RemoteByteRangeSource {
     fn new(bucket: &str, object: &str) -> Result<Self, PipelineError> {
         Self::with_block_size(bucket, object, REMOTE_BLOCK_SIZE)
@@ -2089,20 +2142,20 @@ impl RemoteByteRangeSource {
         block_size: usize,
     ) -> Result<Self, PipelineError> {
         let runtime = get_shared_runtime()?;
-        let (mut storage, control, mut credentials) = Self::create_clients(&runtime, None)?;
+        let anonymous = default_gcs_credentials_unusable();
+        let (mut storage, control, mut credentials) = shared_gcs_clients(&runtime, anonymous)?;
         let bucket_path = format!("projects/_/buckets/{bucket}");
         let user_project = gcs_billing_project_from_env();
         let metadata = match Self::fetch_object_metadata(&runtime, &control, &bucket_path, object) {
             Ok(metadata) => metadata,
-            Err(err) if Self::is_authentication_error(&err) => {
+            Err(err) if !anonymous && Self::is_authentication_error(&err) => {
                 let err_msg = err.to_string();
                 debug!(
                     "Retrying metadata fetch for gs://{bucket}/{object} with anonymous credentials after authentication failure: {err_msg}"
                 );
-                let (fallback_storage, fallback_control, fallback_credentials) = Self::create_clients(
-                    &runtime,
-                    Some(AnonymousCredentials::new().build()),
-                )
+                note_default_gcs_credentials_unusable();
+                let (fallback_storage, fallback_control, fallback_credentials) =
+                    shared_gcs_clients(&runtime, true)
                 .map_err(|client_err| {
                     PipelineError::Io(format!(
                         "Failed to initialize Cloud Storage clients with anonymous credentials after authentication failure: {client_err} (initial error: {err_msg})"
