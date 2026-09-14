@@ -6,12 +6,15 @@ from build_cached_probe import build, root
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('library_log', type=Path)
-parser.add_argument('mode', choices=['tests', 'cohort'])
+parser.add_argument('mode', choices=['tests', 'cohort', 'plan'])
 parser.add_argument('--candidate-prepare', action='store_true')
 parser.add_argument('--output', default='cohort-score-f64')
 args = parser.parse_args()
 
-if args.mode == 'cohort':
+if args.mode == 'plan':
+    build(root / 'src/benches/probes/exact_score_plan.rs', 'exact-score-plan',
+          ['-C', 'panic=abort'], library_log=args.library_log)
+elif args.mode == 'cohort':
     path = root / 'src/benches/probes/cohort_score.rs'
     if args.candidate_prepare:
         modules = 'pub use gnomon::{adapt_plink2, memory, pipeline_error, output};\n'

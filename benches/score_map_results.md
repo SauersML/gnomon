@@ -23,6 +23,16 @@ at about 1.31 and 1.28 GiB RSS, respectively. These timings do not show a comput
 speedup from compensation. Logs use `round18-`; the probe compiles the candidate
 preparation module against the same main library for a matched comparison.
 
+The existing exact-integer planner was also exercised on all 32 compiled
+simple-score columns. All fit i128 fixed point; 30 fit two carry-free i64 limbs
+for their complete row counts. PGS000027 and PGS004696 exceed that limb bound
+at about one million rows, but all 32 fit when limb sums are drained every
+256 rows. The probe is `benches/probes/exact_score_plan.rs`, with results in
+`round18-exact-plan2.log`. These are range checks, not an exact end-to-end
+scorer: source duplicate aggregation and the 9,714 complex rules still need
+integration with the exact arithmetic. The range bounds depend on score
+weights and row counts, not the number of people.
+
 ## Retaining source-weight precision throughout CPU scoring
 
 Weights, CSR corrections, dense CPU canvases, and SIMD accumulators now use
