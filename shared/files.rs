@@ -227,6 +227,10 @@ pub trait ByteRangeSource: Send + Sync {
 pub struct BedSource {
     byte_source: Arc<dyn ByteRangeSource>,
     mmap: Option<Arc<Mmap>>,
+    /// The open local file, for positional reads that bypass the mapping.
+    file: Option<Arc<File>>,
+    /// Whether [`Self::read_at`] is served from `mmap`, so that rows may be borrowed from it.
+    mapped_reads: bool,
     /// Exact range requests against a remote `.bed`, from which read plans are built.
     fetch: Option<SegmentFetch>,
     /// Every byte of a remote `.bed` that was read whole when opened.
@@ -237,7 +241,9 @@ impl BedSource {
     fn new(byte_source: Arc<dyn ByteRangeSource>, mmap: Option<Arc<Mmap>>) -> Self {
         Self {
             byte_source,
+            mapped_reads: mmap.is_some(),
             mmap,
+            file: None,
             fetch: None,
             whole: None,
         }
@@ -247,6 +253,8 @@ impl BedSource {
         Self {
             byte_source,
             mmap: None,
+            file: None,
+            mapped_reads: false,
             fetch: None,
             whole: None,
         }
@@ -280,6 +288,8 @@ impl BedSource {
                 len: self.len(),
             }),
             mmap: None,
+            file: None,
+            mapped_reads: false,
             fetch: self.fetch.clone(),
             whole: None,
         }
@@ -291,6 +301,14 @@ impl BedSource {
 
     pub fn mmap(&self) -> Option<Arc<Mmap>> {
         self.mmap.as_ref().map(Arc::clone)
+    }
+
+    /// The mapping [`Self::read_at`] is served from, when it is, so a caller may borrow
+    /// rows instead of copying them. `None` when rows come through positional reads, a
+    /// remote fetch or PGEN decoding, even where a mapping of the file exists for
+    /// other callers.
+    pub fn mapped_rows(&self) -> Option<Arc<Mmap>> {
+        if self.mapped_reads { self.mmap() } else { None }
     }
 
     /// `len` bytes from `offset`, borrowed without a read: from the local
@@ -319,6 +337,32 @@ impl BedSource {
 
     pub fn read_at(&self, offset: u64, dst: &mut [u8]) -> Result<(), PipelineError> {
         self.byte_source.read_at(offset, dst)
+    }
+
+    /// Fills `dst` from `offset` with positional reads of the local file, bypassing the
+    /// mapping, or through [`Self::read_at`] for any other source.
+    ///
+    /// [`Self::read_at`] on a local `.bed` copies out of the mapping, which faults the
+    /// rows in and charges them to the process's memory cgroup, exactly as slicing it
+    /// does. Callers whose rows do not fit the headroom ([`positional_reads_fit_better`])
+    /// read this way instead, and nothing stays mapped once `dst` is filled.
+    pub fn read_at_positional(&self, offset: u64, dst: &mut [u8]) -> Result<(), PipelineError> {
+        #[cfg(unix)]
+        if let Some(file) = &self.file {
+            use std::os::unix::fs::FileExt;
+            let end = offset.checked_add(dst.len() as u64).ok_or_else(|| {
+                PipelineError::Io("Offset overflow while reading .bed".to_string())
+            })?;
+            if end > self.len() {
+                return Err(PipelineError::Io(
+                    "Attempted to read past end of local .bed".to_string(),
+                ));
+            }
+            return file
+                .read_exact_at(dst, offset)
+                .map_err(|e| PipelineError::Io(e.to_string()));
+        }
+        self.read_at(offset, dst)
     }
 }
 
@@ -380,7 +424,9 @@ pub fn open_bed_source(
             .map_err(|e| PipelineError::Io(e.to_string()))?;
         let mmap = Arc::new(mmap);
         let byte_source = Arc::new(MmapByteRangeSource::new(Arc::clone(&mmap)));
-        Ok(BedSource::new(byte_source, Some(mmap)))
+        let mut source = BedSource::new(byte_source, Some(mmap));
+        source.file = Some(Arc::new(file));
+        Ok(source)
     }
 }
 
@@ -412,6 +458,8 @@ fn remote_bed_source(
                 bytes: Arc::clone(&bytes),
             }),
             mmap: None,
+            file: None,
+            mapped_reads: false,
             fetch: None,
             whole: Some(bytes),
         });
@@ -419,6 +467,8 @@ fn remote_bed_source(
     Ok(BedSource {
         byte_source,
         mmap: None,
+        file: None,
+        mapped_reads: false,
         fetch: Some(fetch),
         whole: None,
     })
@@ -470,19 +520,33 @@ pub fn open_bed_source_for_scoring(
     if !is_gcs_path(path) && !is_http_path(path) {
         let source = open_bed_source(path, genome_build)?;
         #[cfg(unix)]
-        if !is_pgen_path(path)
-            && bytes_per_variant >= 4096
-            && required_rows.len() >= 4096
-            && source.len() >= 1024 * 1024 * 1024
-            && _local_prefetch_bytes >= 2 * BedReadPlan::MAX_RANGE
-        {
-            return open_planned_local_bed(
-                path,
-                source,
-                required_rows,
-                bytes_per_variant,
-                _local_prefetch_bytes,
-            );
+        if !is_pgen_path(path) {
+            // Many wide rows from a large `.bed` take planned reads at any headroom, as
+            // before; any other rows do once they pass half of the headroom.
+            if bytes_per_variant >= 4096
+                && required_rows.len() >= 4096
+                && source.len() >= 1024 * 1024 * 1024
+                && _local_prefetch_bytes >= 2 * BedReadPlan::MAX_RANGE
+            {
+                return open_planned_local_bed(
+                    path,
+                    source,
+                    required_rows,
+                    bytes_per_variant,
+                    _local_prefetch_bytes,
+                );
+            }
+            let needed = (required_rows.len() as u64).saturating_mul(bytes_per_variant);
+            let (_, available) = crate::memory::memory_bytes();
+            if positional_reads_fit_better(needed, available) {
+                return open_planned_local_bed(
+                    path,
+                    source,
+                    required_rows,
+                    bytes_per_variant,
+                    local_read_window(available),
+                );
+            }
         }
         return Ok(source);
     }
@@ -509,6 +573,30 @@ pub fn open_bed_source_for_scoring(
         block_size / 1024
     );
     open_pgen_as_bed_source(path, genome_build, block_size)
+}
+
+/// Whether the rows a run needs from a local `.bed` are better served by planned
+/// positional reads than by the memory map, given the memory this process may still
+/// use (`available_bytes`, from [`crate::memory::memory_bytes`]).
+///
+/// A mapping is only fast while the page cache can hold the rows being read alongside
+/// the run. Past that, the kernel evicts mapped rows and faults them back one page at a
+/// time, and unmapping the touched pages at exit costs about 40 ms per GB. Scoring
+/// 845,000 rows (2.7 GB) of a 5.76 GB `.bed` under a 4 GiB Slurm limit took 22.7-44.1 s
+/// through the mapping, with 17,000-57,000 major faults, and 11.7-18.0 s through planned
+/// positional reads. Where the rows fit (676 MB of a 1.44 GB `.bed` under the same
+/// limit), the mapping was faster: 1.26 s against 1.53 s. Positional reads take over
+/// once the needed bytes pass half of the headroom.
+pub fn positional_reads_fit_better(needed_bytes: u64, available_bytes: u64) -> bool {
+    needed_bytes > available_bytes / 2
+}
+
+/// Prefetch window for planned local reads: a sixty-fourth of the headroom, at least
+/// four maximal ranges and at most 256 MiB.
+fn local_read_window(available_bytes: u64) -> usize {
+    usize::try_from(available_bytes / 64)
+        .unwrap_or(usize::MAX)
+        .clamp(4 * BedReadPlan::MAX_RANGE, 256 * 1024 * 1024)
 }
 
 #[cfg(unix)]
@@ -547,6 +635,7 @@ fn open_planned_local_bed(
         len: source.len(),
         reader,
     });
+    source.mapped_reads = false;
     Ok(source)
 }
 
@@ -2952,6 +3041,65 @@ mod tests {
         }
         assert!(source.read_at(len, &mut [0]).is_err());
         assert!(source.read_at(u64::MAX, &mut [0]).is_err());
+    }
+
+    #[test]
+    fn positional_reads_take_over_past_half_the_headroom() {
+        use super::*;
+        assert!(!positional_reads_fit_better(0, 0));
+        assert!(positional_reads_fit_better(1, 0));
+        assert!(!positional_reads_fit_better(676 << 20, 3500 << 20));
+        assert!(positional_reads_fit_better(2700 << 20, 3500 << 20));
+        assert!(!positional_reads_fit_better(2700 << 20, 12 << 30));
+        assert!(!positional_reads_fit_better(500, 1000));
+        assert!(positional_reads_fit_better(501, 1000));
+        assert_eq!(local_read_window(0), 4 * BedReadPlan::MAX_RANGE);
+        assert_eq!(local_read_window(3500 << 20), (3500 << 20) / 64);
+        assert_eq!(local_read_window(u64::MAX), 256 * 1024 * 1024);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn planned_local_bed_serves_the_same_bytes_as_the_mapping() {
+        use super::*;
+        let n_samples = 13usize;
+        let row_bytes = n_samples.div_ceil(4);
+        let n_rows = 40usize;
+        let mut bed = vec![0x6c, 0x1b, 0x01];
+        bed.extend((0..n_rows * row_bytes).map(|i| (i * 37 % 256) as u8));
+        let file = tempfile::Builder::new().suffix(".bed").tempfile().unwrap();
+        std::fs::write(file.path(), &bed).unwrap();
+        let rows: Vec<u64> = [0usize, 1, 2, 7, 8, 21, 39].map(|r| r as u64).to_vec();
+        let mapped = open_bed_source(file.path(), None).unwrap();
+        let planned = open_planned_local_bed(
+            file.path(),
+            open_bed_source(file.path(), None).unwrap(),
+            &rows,
+            row_bytes as u64,
+            4 * BedReadPlan::MAX_RANGE,
+        )
+        .unwrap();
+        assert!(mapped.mapped_rows().is_some());
+        assert!(planned.mapped_rows().is_none());
+        for &row in &rows {
+            let offset = 3 + row * row_bytes as u64;
+            let (mut from_map, mut from_reads) = (vec![0; row_bytes], vec![0; row_bytes]);
+            mapped.read_at(offset, &mut from_map).unwrap();
+            planned
+                .byte_source()
+                .read_at(offset, &mut from_reads)
+                .unwrap();
+            assert_eq!(from_reads, from_map, "row {row}");
+            let mut positional = vec![0; row_bytes];
+            mapped.read_at_positional(offset, &mut positional).unwrap();
+            assert_eq!(positional, from_map, "row {row}");
+            assert_eq!(from_map, bed[offset as usize..offset as usize + row_bytes]);
+        }
+        assert!(
+            mapped
+                .read_at_positional(bed.len() as u64, &mut [0])
+                .is_err()
+        );
     }
     use super::*;
     use std::io::{BufRead, Write};
