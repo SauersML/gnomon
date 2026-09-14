@@ -11,6 +11,7 @@
 // consumers cannot keep up.
 
 use crate::pipeline_error::PipelineError;
+use crate::score::batch;
 use crate::score::decide::ComputePath;
 use crate::score::types::{
     BimRowIndex, FilesetBoundary, PipelineKind, PreparationResult, ReconciledVariantIndex, WorkItem,
@@ -28,6 +29,84 @@ use std::io::{BufWriter, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
+
+fn choose_score_path(
+    data: &[u8],
+    prep: &PreparationResult,
+    index: usize,
+    original: &impl Fn(&[u8]) -> ComputePath,
+) -> ComputePath {
+    let columns = prep.score_names.len();
+    if (5..=64).contains(&columns)
+        && prep.num_people_to_score >= 64
+        && matches!(prep.person_subset, crate::score::types::PersonSubset::All)
+        && u32::try_from(index).ok().is_some_and(|index| {
+            prep.variant_csr_view(ReconciledVariantIndex(index)).len() <= columns / 4
+        })
+    {
+        // The old tree sees total panel width and sends all wide-panel rows to
+        // scalar accumulation. Sparse score schedules change that tradeoff:
+        // common calls benefit from batching, while rare calls keep zero-word
+        // skipping. Inspect actual row support instead of total panel width.
+        return if batch::assess_variant_density_for_dispatch(data, prep.total_people_in_fam)
+            > 0.0894
+        {
+            ComputePath::Pivot
+        } else {
+            ComputePath::NoPivot
+        };
+    }
+    original(data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sparse_panel_dispatch_batches_common_calls_and_skips_rare_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("panel");
+        std::fs::write(prefix.with_extension("bim"), "1 a 0 100 A G\n").unwrap();
+        std::fs::write(
+            prefix.with_extension("fam"),
+            (0..64)
+                .map(|i| format!("F I{i} 0 0 0 -9\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let mut bed = vec![0x6c, 0x1b, 0x01];
+        bed.resize(19, 0);
+        std::fs::write(prefix.with_extension("bed"), bed).unwrap();
+        let weights = dir.path().join("weights.tsv");
+        let header = (0..32).map(|i| format!("\tS{i:02}")).collect::<String>();
+        std::fs::write(
+            &weights,
+            format!(
+                "variant_id\teffect_allele\tother_allele{header}\n1:100\tG\tA\t0.25{}\n",
+                "\t".repeat(31)
+            ),
+        )
+        .unwrap();
+        let mut prep =
+            crate::score::prepare::prepare_for_computation(&[prefix], &[weights], None, None)
+                .unwrap();
+        let original = |_: &[u8]| ComputePath::NoPivot;
+        assert_eq!(
+            choose_score_path(&[0xff; 16], &prep, 0, &original),
+            ComputePath::Pivot
+        );
+        assert_eq!(
+            choose_score_path(&[0; 16], &prep, 0, &original),
+            ComputePath::NoPivot
+        );
+        prep.person_subset = crate::score::types::PersonSubset::Indices((0..64).collect());
+        assert_eq!(
+            choose_score_path(&[0xff; 16], &prep, 0, &original),
+            ComputePath::NoPivot
+        );
+    }
+}
 
 /// Opens one scoring fileset with the local row indices it must serve.
 pub fn open_bed_source_for_scoring(
@@ -281,7 +360,7 @@ pub fn producer_thread<'a, F>(
                     continue;
                 }
 
-                let path = path_decider(&buffer);
+                let path = choose_score_path(&buffer, &prep_result, i, &path_decider);
 
                 let reconciled_variant_index = match reconciled_index_from_usize(i) {
                     Ok(idx) => idx,
@@ -345,7 +424,7 @@ pub fn producer_thread<'a, F>(
                     break;
                 }
 
-                let path = path_decider(&buffer);
+                let path = choose_score_path(&buffer, &prep_result, i, &path_decider);
 
                 let reconciled_variant_index = match reconciled_index_from_usize(i) {
                     Ok(idx) => idx,
@@ -480,7 +559,7 @@ pub fn multi_file_producer_thread<'a, F>(
                     continue;
                 }
 
-                let path = path_decider(&buffer);
+                let path = choose_score_path(&buffer, &prep_result, i, &path_decider);
                 let reconciled_variant_index = match reconciled_index_from_usize(i) {
                     Ok(idx) => idx,
                     Err(err) => {
@@ -556,7 +635,7 @@ pub fn multi_file_producer_thread<'a, F>(
                     return;
                 }
 
-                let path = path_decider(&buffer);
+                let path = choose_score_path(&buffer, &prep_result, i, &path_decider);
                 let reconciled_variant_index = match reconciled_index_from_usize(i) {
                     Ok(idx) => idx,
                     Err(err) => {

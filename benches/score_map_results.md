@@ -1,5 +1,45 @@
 # Score and packed projection performance
 
+## Sparse wide-panel schedules and dispatch
+
+For complete cohorts of at least 64 people and panels of 5–64 scores, the
+producer now considers each marker's actual score support. Rows touching no
+more than one quarter of the score columns use the packed batch route when
+their genotype density exceeds 0.0894; rare calls retain zero-word skipping.
+The batch kernel compiles per-score schedules of at most 256 active rows,
+then accumulates across 32 packed people in f64 SIMD registers. Its schedule
+occupies about 6 KiB, independent of cohort size. Other panel densities and
+keep subsets retain their existing regime choices.
+
+Four pinned MSI Milan cores, full 1,799,239-marker BEDs, 32 normalized PGS
+files, 1,188,880 matched rows, 5,385,268 nonzero weights:
+
+| People | Previous pipeline | Scheduled pipeline | Speedup |
+| ---: | ---: | ---: | ---: |
+| 512 | 2.651 s | 0.656 s | 4.04× |
+| 3,200 | 13.825 s | 2.582 s | 5.35× |
+
+These are paired single observations, excluding normalization, preparation,
+and output writing. Every missing count matched exactly. The maximum absolute
+score difference was 7.451e-9 and maximum relative difference was 2.918e-13.
+Combined before/after process peak RSS was 435 MiB and 1.54 GiB respectively;
+the larger process maps a 1.44 GB BED. Neither check exhausted memory. This
+does not establish universal OOM freedom or performance for arbitrary panels.
+
+The original total-score-width dispatcher routed these rows to scalar
+accumulation, so merely adding a dense-path kernel did not improve the full
+run. The final implementation changes dispatch as well as execution. Earlier
+paired 3,200-person development runs hit their 35-second cap and terminated;
+no speedup is claimed from those incomplete comparisons. Reproduction:
+`wide_compute.py`, then its `wide-compute` binary with genotype prefix,
+normalized-score directory, and repetition count. Logs: `round10-wide-n512.log`
+and `round10-wide-n3200.log` in the MSI iteration directory.
+Forty focused checks pass, including scalar f64 comparisons across 5–64
+columns, packed person/variant boundaries, exact missing counts, common/rare
+dispatch, and keep-subset exclusion. The dispatch regression specifically
+guards against leaving the optimized kernel unreachable in this regime.
+The warm production scoring library build passed on MSI in 38.97 seconds.
+
 ## Uncached wide-panel reconciliation
 
 Ordinary singleton BIM loci now accumulate duplicate contributions in reusable
