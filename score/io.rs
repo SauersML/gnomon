@@ -199,8 +199,9 @@ fn prepare_pooled_buffer(
 ) -> Result<Vec<u8>, PipelineError> {
     buffer.clear();
     if buffer.capacity() < bytes_per_variant {
+        // Reservation is relative to length, which clear() set to zero.
         buffer
-            .try_reserve_exact(bytes_per_variant - buffer.capacity())
+            .try_reserve_exact(bytes_per_variant)
             .map_err(|e| {
                 PipelineError::Compute(format!(
                     "Failed to reserve PLINK row buffer of {bytes_per_variant} bytes: {e}"
