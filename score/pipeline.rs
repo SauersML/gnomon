@@ -625,8 +625,9 @@ pub fn run(context: &PipelineContext) -> Result<(Vec<f64>, Vec<u32>), PipelineEr
     // The CUDA backend (`cuda_backend::try_run_cuda`) is not selected here. Its f32 sums
     // over timing-sized batches printed different scores from this path (max relative
     // error 2.7e-3 on PGS004525 x 51,200 samples, every cell differing, two GPU runs
-    // disagreeing with each other), while this path is byte-identical at 8 and 32
-    // threads. gpu_tests calls the backend directly.
+    // disagreeing with each other). The CPU path retains f64 coefficients and sums,
+    // but parallel partial-sum grouping can still vary the last bits. gpu_tests calls
+    // the backend directly.
     //
     // This match is a zero-cost abstraction. The compiler generates a simple jump
     // to the correct function based on the enum variant, and it's impossible

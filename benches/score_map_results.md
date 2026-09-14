@@ -1,5 +1,37 @@
 # Score and packed projection performance
 
+## Exact-kernel arithmetic and allocation bounds
+
+Exact rounding now retains the full 128-bit product of the averaging scale and
+divisor. Previously that denominator was truncated to 64 bits, including zero
+when the product was 2^64. Range planning rejects overflowing term bounds,
+invalid zero scales, and limb specifications that cannot fit.
+
+On MSI, `benches/exact_score_checks.py` passes 11 focused Rust tests and compares
+30,336 results bit for bit with Python's independent `Fraction`-to-float oracle.
+Cases include signed i128 extremes, wide denominators, subnormal results, ties,
+and overflow to infinity. Run with Python 3.12 and the existing Rust toolchain;
+the standalone checks compile without rebuilding project dependencies.
+
+Exact-kernel scratch grows fallibly before output cells change. At most 256
+four-row tables, 256 words of person keys, a reusable zero row, and 1,024 dense
+row IDs are retained: about 1.02 MiB of buffer storage per kernel instance,
+independent of cohort size and total row count. Smaller work uses smaller
+buffers. Allocation-injection tests reject each of the five initial allocations
+without changing any output, then prohibit allocation entirely on warmed calls.
+A 2,051-row case crosses internal scratch batches and exactly matches scalar
+integer sums and missing counts. This bounds kernel scratch, not the full
+production scorer's memory or its still-floating final reduction.
+
+Three alternating before/after pairs on PGS000027's 1,029,181 simple rows at
+512 people gave median total probe times of 370.81 -> 361.24 ms for tables and
+531.00 -> 521.28 ms for walks. Forced direct lookup at this cohort size regressed
+681.73 -> 736.12 ms; tables remain the faster regime. A single-person pair took
+55.33 -> 54.74 ms with direct lookup. These are kernel-prototype measurements,
+including batch copying/encoding/draining and excluding preparation and the
+8,912 complex rules. They do not establish a production speedup. All paths still
+match exactly. Logs: `round20-exact-safety3.log`, `round20-separated-*`.
+
 ## Exact packed-kernel regime experiment
 
 `benches/probes/exact_score_kernel.rs` exercises every simple row of one real

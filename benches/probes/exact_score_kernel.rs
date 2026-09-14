@@ -12,16 +12,22 @@ const BATCH: usize = 256;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    assert_eq!(args.len(), 4, "BED prefix, score directory, score name, people");
+    assert_eq!(
+        args.len(),
+        4,
+        "BED prefix, score directory, score name, people"
+    );
     let prefix = PathBuf::from(&args[0]);
     let people: usize = args[3].parse().unwrap();
-    let files: Vec<_> = std::fs::read_dir(&args[1]).unwrap()
+    let files: Vec<_> = std::fs::read_dir(&args[1])
+        .unwrap()
         .map(|entry| entry.unwrap().path())
         .filter(|path| {
             let name = path.file_name().unwrap().to_string_lossy();
             name.starts_with(&format!("{}_", args[2]))
                 && name.ends_with("_hmPOS_GRCh38.gnomon.sorted.gnomon.tsv")
-        }).collect();
+        })
+        .collect();
     assert_eq!(files.len(), 1);
     let prep = prepare_for_computation(std::slice::from_ref(&prefix), &files, None, None).unwrap();
     assert_eq!(prep.score_names, [args[2].clone()]);
@@ -33,17 +39,25 @@ fn main() {
     let packed_stride = people.div_ceil(4);
     let mut rows = Vec::new();
     for (row, &bim) in prep.required_bim_indices.iter().enumerate() {
-        for entry in prep.variant_csr_view(gnomon::score::types::ReconciledVariantIndex(row as u32)).iter() {
+        for entry in prep
+            .variant_csr_view(gnomon::score::types::ReconciledVariantIndex(row as u32))
+            .iter()
+        {
             rows.push((bim.0 as usize, entry.weight, entry.missing_correction));
         }
     }
     assert!(!rows.is_empty());
     let fixed = exact::FixedPoint::plan(
-        rows.iter().flat_map(|&(_, w, c)| [w, c]), rows.len() as u64, 8, 1,
-    ).expect("score fits exact i128");
-    let coefficients: Vec<_> = rows.iter().map(|&(_, w, c)| {
-        (fixed.to_fixed(w), fixed.to_fixed(c))
-    }).collect();
+        rows.iter().flat_map(|&(_, w, c)| [w, c]),
+        rows.len() as u64,
+        8,
+        1,
+    )
+    .expect("score fits exact i128");
+    let coefficients: Vec<_> = rows
+        .iter()
+        .map(|&(_, w, c)| (fixed.to_fixed(w), fixed.to_fixed(c)))
+        .collect();
     let mut bits = 1;
     for &(w, c) in &coefficients {
         let terms = [c, 0, c + w, c + 2 * w];
@@ -56,16 +70,22 @@ fn main() {
     let split = exact::Split::plan(bits, BATCH as u64).expect("batch fits two limbs");
     let geometry = kernel::TableGeometry::from_cache_sizes(32 << 10, 512 << 10);
     let direct = kernel::RowCosts {
-        table_row_ns: f64::INFINITY, word_ns: f64::INFINITY,
-        exception_ns: 0.0, direct_call_ns: 0.0,
+        table_row_ns: f64::INFINITY,
+        word_ns: f64::INFINITY,
+        exception_ns: 0.0,
+        direct_call_ns: 0.0,
     };
     let walk = kernel::RowCosts {
-        table_row_ns: f64::INFINITY, word_ns: 0.0,
-        exception_ns: 0.0, direct_call_ns: f64::INFINITY,
+        table_row_ns: f64::INFINITY,
+        word_ns: 0.0,
+        exception_ns: 0.0,
+        direct_call_ns: f64::INFINITY,
     };
     let table = kernel::RowCosts {
-        table_row_ns: 0.0, word_ns: 1.0,
-        exception_ns: 1.0, direct_call_ns: f64::INFINITY,
+        table_row_ns: 0.0,
+        word_ns: 1.0,
+        exception_ns: 1.0,
+        direct_call_ns: f64::INFINITY,
     };
     let mut data = vec![0u8; BATCH * packed_stride];
     let mut terms = vec![[(0, 0); 4]; BATCH];
@@ -99,9 +119,20 @@ fn main() {
                 lo.fill(0);
                 hi.fill(0);
                 let start = Instant::now();
-                kernel::apply_rows(black_box(&data[..count * packed_stride]), packed_stride,
-                    &ids[..count], &terms[..count], costs, geometry, 0, &mut scratch,
-                    &mut lo, &mut hi, &mut missing);
+                kernel::apply_rows(
+                    black_box(&data[..count * packed_stride]),
+                    packed_stride,
+                    &ids[..count],
+                    &terms[..count],
+                    costs,
+                    geometry,
+                    0,
+                    &mut scratch,
+                    &mut lo,
+                    &mut hi,
+                    &mut missing,
+                )
+                .unwrap();
                 kernel_seconds += start.elapsed().as_secs_f64();
                 for ((total, &l), &h) in totals.iter_mut().zip(&lo).zip(&hi) {
                     *total += split.join(l, h);
@@ -115,9 +146,14 @@ fn main() {
                 reference = Some((totals.clone(), missing.clone()));
             }
             assert!(totals.iter().all(|&value| fixed.to_f64(value).is_finite()));
-            println!("score={} people={people} rows={} path={name} rep={repetition} total_ms={:.3} kernel_ms={:.3} exact_match=true complex_rules_excluded={}",
-                args[2], rows.len(), elapsed.as_secs_f64() * 1000.0,
-                kernel_seconds * 1000.0, prep.complex_rules.len());
+            println!(
+                "score={} people={people} rows={} path={name} rep={repetition} total_ms={:.3} kernel_ms={:.3} exact_match=true complex_rules_excluded={}",
+                args[2],
+                rows.len(),
+                elapsed.as_secs_f64() * 1000.0,
+                kernel_seconds * 1000.0,
+                prep.complex_rules.len()
+            );
         }
     }
 }

@@ -12,6 +12,7 @@
 // two carry-free i64 limbs per person (see `exact::Split`). Each term enters a cell as an
 // integer, so tables, walks, tile sizes and the order of rows cannot change any bit.
 
+use std::collections::TryReserveError;
 use std::simd::{Simd, num::SimdUint};
 
 /// Four variants per table: a person's four two-bit calls form the table key.
@@ -92,6 +93,34 @@ pub(crate) struct TableScratch {
     lo_tables: Vec<[i64; 256]>,
     hi_tables: Vec<[i64; 256]>,
     keys: Vec<u8>,
+    zero_tile: Vec<u8>,
+}
+
+// Fixed scratch ceilings, independent of the cohort and total variant count.
+const MAX_TABLE_GROUPS: usize = 256;
+const MAX_TILE_WORDS: usize = 256;
+const MAX_DENSE_ROWS: usize = MAX_TABLE_GROUPS * VARIANTS_PER_TABLE;
+
+fn resize_scratch<T: Clone>(
+    values: &mut Vec<T>,
+    count: usize,
+    zero: T,
+) -> Result<(), TryReserveError> {
+    if count > values.len() {
+        values.try_reserve_exact(count - values.len())?;
+        values.resize(count, zero);
+    }
+    Ok(())
+}
+
+impl TableScratch {
+    /// Reserve everything before changing any output cell. Repeated batches reuse it.
+    fn prepare(&mut self, groups: usize, tile_words: usize) -> Result<(), TryReserveError> {
+        resize_scratch(&mut self.lo_tables, groups, [0; 256])?;
+        resize_scratch(&mut self.hi_tables, groups, [0; 256])?;
+        resize_scratch(&mut self.keys, tile_words * 32, 0)?;
+        resize_scratch(&mut self.zero_tile, tile_words * 8, 0)
+    }
 }
 
 /// Cache-derived table geometry: tables for a batch of groups fill about half of L2; a tile's
@@ -104,12 +133,25 @@ pub(crate) struct TableGeometry {
 
 impl TableGeometry {
     pub(crate) fn from_cache_sizes(l1_bytes: usize, l2_bytes: usize) -> Self {
-        let groups_per_batch = (l2_bytes / 2 / (256 * 16)).clamp(4, 256);
+        let groups_per_batch = (l2_bytes / 2 / (256 * 16)).clamp(4, MAX_TABLE_GROUPS);
         // Per person: 16 B of cells, 1 B of key, plus the four row bytes it shares with 3 others.
-        let tile_words = (l1_bytes / 2 / (32 * (16 + 1) + 4 * 8)).max(1);
+        let tile_words = (l1_bytes / 2 / (32 * (16 + 1) + 4 * 8)).clamp(1, MAX_TILE_WORDS);
         Self {
             groups_per_batch,
             tile_words,
+        }
+    }
+
+    fn for_work(self, rows: usize, people: usize) -> Self {
+        Self {
+            groups_per_batch: self
+                .groups_per_batch
+                .clamp(1, MAX_TABLE_GROUPS)
+                .min(rows.div_ceil(VARIANTS_PER_TABLE)),
+            tile_words: self
+                .tile_words
+                .clamp(1, MAX_TILE_WORDS)
+                .min(people.div_ceil(32)),
         }
     }
 }
@@ -238,7 +280,8 @@ impl RowCosts {
 }
 
 /// Adds rows `ids` call by call: each person receives the term of their own code.
-#[inline]
+// Keep the compute loop separate from the dispatcher's allocation/error handling.
+#[inline(never)]
 fn apply_direct(
     data: &[u8],
     row_bytes: usize,
@@ -293,58 +336,71 @@ pub(crate) fn apply_rows(
     lo: &mut [i64],
     hi: &mut [i64],
     missing: &mut [u32],
-) {
+) -> Result<(), TryReserveError> {
     assert_eq!(first_person % 32, 0, "person ranges start on 64-bit words");
     assert!(lo.len() == hi.len() && lo.len() == missing.len());
     let people = lo.len();
+    if people == 0 || ids.is_empty() {
+        return Ok(());
+    }
     if costs.direct_wins(people) {
         apply_direct(data, row_bytes, ids, terms, first_person, lo, hi, missing);
-        return;
+        return Ok(());
     }
-    let words = people.div_ceil(32);
+    let geometry = geometry.for_work(ids.len(), people);
     scratch.dense.clear();
-    let (mut share_lo, mut share_hi) = (0i64, 0i64);
-    for &r in ids {
-        let row = &data[r * row_bytes..(r + 1) * row_bytes];
-        let (mode, exceptions) = row_mode(&row[first_person / 4..], people);
-        if costs.table_wins(exceptions, words) {
-            scratch.dense.push(r);
-            continue;
+    scratch
+        .dense
+        .try_reserve_exact(ids.len().min(MAX_DENSE_ROWS))?;
+    scratch
+        .tables
+        .prepare(geometry.groups_per_batch, geometry.tile_words)?;
+    let words = people.div_ceil(32);
+    for chunk in ids.chunks(MAX_DENSE_ROWS) {
+        scratch.dense.clear();
+        let (mut share_lo, mut share_hi) = (0i64, 0i64);
+        for &r in chunk {
+            let row = &data[r * row_bytes..(r + 1) * row_bytes];
+            let (mode, exceptions) = row_mode(&row[first_person / 4..], people);
+            if costs.table_wins(exceptions, words) {
+                scratch.dense.push(r);
+                continue;
+            }
+            let at_mode = terms[r][mode as usize];
+            let adjust =
+                terms[r].map(|(l, h)| (l.wrapping_sub(at_mode.0), h.wrapping_sub(at_mode.1)));
+            walk_row(row, mode, &adjust, first_person, lo, hi, missing);
+            share_lo = share_lo.wrapping_add(at_mode.0);
+            share_hi = share_hi.wrapping_add(at_mode.1);
         }
-        let at_mode = terms[r][mode as usize];
-        let adjust = terms[r].map(|(l, h)| (l.wrapping_sub(at_mode.0), h.wrapping_sub(at_mode.1)));
-        walk_row(row, mode, &adjust, first_person, lo, hi, missing);
-        share_lo = share_lo.wrapping_add(at_mode.0);
-        share_hi = share_hi.wrapping_add(at_mode.1);
-    }
-    if share_lo != 0 || share_hi != 0 {
-        for (l, h) in lo.iter_mut().zip(hi.iter_mut()) {
-            *l = l.wrapping_add(share_lo);
-            *h = h.wrapping_add(share_hi);
+        if share_lo != 0 || share_hi != 0 {
+            for (l, h) in lo.iter_mut().zip(hi.iter_mut()) {
+                *l = l.wrapping_add(share_lo);
+                *h = h.wrapping_add(share_hi);
+            }
         }
-    }
-    if !scratch.dense.is_empty() {
-        let dense = std::mem::take(&mut scratch.dense);
-        apply_table_rows(
-            data,
-            row_bytes,
-            &dense,
-            terms,
-            first_person,
-            geometry,
-            &mut scratch.tables,
-            lo,
-            hi,
-        );
-        for &r in &dense {
-            count_missing(
-                &data[r * row_bytes..(r + 1) * row_bytes],
+        if !scratch.dense.is_empty() {
+            apply_table_rows(
+                data,
+                row_bytes,
+                &scratch.dense,
+                terms,
                 first_person,
-                missing,
-            );
+                geometry,
+                &mut scratch.tables,
+                lo,
+                hi,
+            )?;
+            for &r in &scratch.dense {
+                count_missing(
+                    &data[r * row_bytes..(r + 1) * row_bytes],
+                    first_person,
+                    missing,
+                );
+            }
         }
-        scratch.dense = dense;
     }
+    Ok(())
 }
 
 /// Transposes four calls-bytes into the four people's keys (two butterfly exchanges).
@@ -505,7 +561,8 @@ mod tests {
                                 &mut lo,
                                 &mut hi,
                                 &mut missing,
-                            );
+                            )
+                            .unwrap();
                             for p in 0..n {
                                 assert_eq!(
                                     split.join(lo[p], hi[p]),
@@ -554,6 +611,8 @@ mod tests {
 /// bytes. The range starts on a 32-person boundary; it may end anywhere, and people past its end
 /// in the final byte are read but never written.
 #[allow(clippy::too_many_arguments)]
+// Keep table computation separate from the row classifier and scratch setup.
+#[inline(never)]
 pub(crate) fn apply_table_rows(
     data: &[u8],
     row_bytes: usize,
@@ -564,11 +623,14 @@ pub(crate) fn apply_table_rows(
     scratch: &mut TableScratch,
     lo: &mut [i64],
     hi: &mut [i64],
-) {
+) -> Result<(), TryReserveError> {
     const ZERO_TERMS: TermLimbs = [(0, 0); 4];
     assert_eq!(first_person % 32, 0, "person ranges start on 64-bit words");
     assert_eq!(lo.len(), hi.len());
     let people = lo.len();
+    if people == 0 || ids.is_empty() {
+        return Ok(());
+    }
     let byte_start = first_person / 4;
     let byte_end = byte_start + people.div_ceil(4);
     assert!(
@@ -576,15 +638,9 @@ pub(crate) fn apply_table_rows(
         "person range {first_person}+{people} exceeds {row_bytes}-byte rows"
     );
     let groups = ids.len().div_ceil(VARIANTS_PER_TABLE);
+    let geometry = geometry.for_work(ids.len(), people);
     let tile_bytes = geometry.tile_words * 8;
-    scratch
-        .lo_tables
-        .resize(geometry.groups_per_batch, [0; 256]);
-    scratch
-        .hi_tables
-        .resize(geometry.groups_per_batch, [0; 256]);
-    scratch.keys.resize(tile_bytes * 4, 0);
-    let zero_tile = vec![0u8; tile_bytes];
+    scratch.prepare(geometry.groups_per_batch, geometry.tile_words)?;
     for batch in (0..groups).step_by(geometry.groups_per_batch) {
         let count = (groups - batch).min(geometry.groups_per_batch);
         let member = |g: usize, k: usize| ids.get((batch + g) * VARIANTS_PER_TABLE + k);
@@ -601,7 +657,7 @@ pub(crate) fn apply_table_rows(
             for g in 0..count {
                 let rows: [&[u8]; 4] = std::array::from_fn(|k| match member(g, k) {
                     Some(&r) => &data[r * row_bytes + start..r * row_bytes + end],
-                    None => &zero_tile[..end - start],
+                    None => &scratch.zero_tile[..end - start],
                 });
                 transpose_keys(rows.map(|row| &row[..whole]), &mut keys[..whole * 4]);
                 for byte in whole..end - start {
@@ -619,4 +675,5 @@ pub(crate) fn apply_table_rows(
             }
         }
     }
+    Ok(())
 }

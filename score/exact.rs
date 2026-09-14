@@ -52,7 +52,9 @@ impl FixedPoint {
         max_multiplier: u64,
         scale: u64,
     ) -> Option<Self> {
-        let scale = scale.max(1);
+        if scale == 0 {
+            return None;
+        }
         let (mut low, mut high) = (i32::MAX, i32::MIN);
         for value in coefficients {
             if !value.is_finite() {
@@ -66,8 +68,9 @@ impl FixedPoint {
         if low == i32::MAX {
             return Some(Self { exp: 0, scale });
         }
-        let bound =
-            u128::from(terms.max(1)) * u128::from(max_multiplier.max(1)) * u128::from(scale);
+        let bound = u128::from(terms.max(1))
+            .checked_mul(u128::from(max_multiplier.max(1)))?
+            .checked_mul(u128::from(scale))?;
         let headroom = 128 - bound.leading_zeros() as i32;
         (high - low + headroom < 127).then_some(Self { exp: low, scale })
     }
@@ -105,7 +108,10 @@ pub(crate) struct Split {
 impl Split {
     /// The middle of the feasible window, or `None` when two i64 limbs cannot hold the sums.
     pub(crate) fn plan(term_bits: u32, terms: u64) -> Option<Self> {
-        let count_bits = 64 - (terms + 1).leading_zeros() as i32;
+        if term_bits > 128 {
+            return None;
+        }
+        let count_bits = 64 - terms.checked_add(1)?.leading_zeros() as i32;
         let low = (term_bits as i32 + count_bits - 62).max(1);
         let high = 62 - count_bits;
         (low <= high).then(|| Self {
@@ -127,22 +133,39 @@ impl Split {
     }
 }
 
-/// `v * 2^exp / q` rounded to the nearest f64, ties to even, for `1 <= q < 2^64`.
+/// `v * 2^exp / q` rounded to the nearest f64, ties to even, for any nonzero q.
 fn round_quotient(v: i128, exp: i32, q: u128) -> f64 {
-    debug_assert!(q >= 1 && q >> 64 == 0);
+    assert!(q >= 1);
     if v == 0 {
         return 0.0;
     }
     let negative = v < 0;
-    // Normalise the dividend to 128 bits: the quotient then has at least 64 significant bits.
+    // Normalise the dividend to 128 bits. A 64-bit denominator leaves at least 64
+    // significant quotient bits; a wider scale * divisor needs more division bits.
     let shift = v.unsigned_abs().leading_zeros();
     let a = v.unsigned_abs() << shift;
     let mut e = exp - shift as i32;
-    let q64 = q as u64;
-    let (hi, lo) = ((a >> 64) as u64, a as u64);
-    let rest = (u128::from(hi % q64) << 64) | u128::from(lo);
-    let mut quotient = (u128::from(hi / q64) << 64) | (rest / q);
-    let mut sticky = rest % q != 0;
+    let (mut quotient, mut remainder) = if q <= u128::from(u64::MAX) {
+        let q64 = q as u64;
+        let (hi, lo) = ((a >> 64) as u64, a as u64);
+        let rest = (u128::from(hi % q64) << 64) | u128::from(lo);
+        ((u128::from(hi / q64) << 64) | (rest / q), rest % q)
+    } else {
+        (a / q, a % q)
+    };
+    while quotient < 1u128 << 63 {
+        // Subtract before doubling when the next bit is 1: even q near u128::MAX
+        // cannot overflow. The quotient never exceeds 64 bits in this loop.
+        let next = remainder >= q - remainder;
+        remainder = if next {
+            remainder - (q - remainder)
+        } else {
+            remainder * 2
+        };
+        quotient = (quotient << 1) | u128::from(next);
+        e -= 1;
+    }
+    let mut sticky = remainder != 0;
     // Binary exponent of the last kept bit: 52 below the leading bit, but not below the
     // subnormal floor. Everything under it is folded into guard and sticky bits.
     let top = e + 127 - quotient.leading_zeros() as i32;
@@ -274,6 +297,31 @@ mod tests {
         assert!(FixedPoint::plan([1e300, 1e-300], 4, 2, 1).is_none());
         assert!(FixedPoint::plan([f64::NAN], 4, 2, 1).is_none());
         assert_eq!(plan.quotient(forward, 0), 0.0);
+    }
+
+    #[test]
+    fn impossible_bounds_are_rejected_without_wrapping() {
+        assert!(FixedPoint::plan([1.0], u64::MAX, u64::MAX, u64::MAX).is_none());
+        assert!(FixedPoint::plan([1.0], 1, 1, 0).is_none());
+        assert!(Split::plan(1, u64::MAX).is_none());
+        assert!(Split::plan(u32::MAX, 1).is_none());
+    }
+
+    #[test]
+    fn scaled_averages_keep_the_entire_denominator() {
+        let plan = FixedPoint {
+            exp: -70,
+            scale: 1 << 63,
+        };
+        // The denominator is exactly 2^64, which previously truncated to zero.
+        assert_eq!(plan.quotient(1 << 100, 2), 2f64.powi(-34));
+        let plan = FixedPoint {
+            exp: 0,
+            scale: u64::MAX,
+        };
+        assert_eq!(plan.quotient(i128::MAX, u64::MAX), 0.5);
+        assert_eq!(plan.quotient(i128::MIN, u64::MAX), -0.5);
+        assert_eq!(plan.quotient(0, u64::MAX), 0.0);
     }
 
     #[test]
