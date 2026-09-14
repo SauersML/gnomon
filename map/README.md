@@ -39,10 +39,13 @@ Required arguments:
 
 Optional arguments:
 
-* `--threads <N>` – Run the fit in a dedicated `N`-worker pool. This is the
-  reproducible way to match a scheduler allocation or cap a shared machine;
-  without it, Rayon uses the process's available parallelism. The fit prints
-  the active worker count before reading genotypes.
+* `--threads <N>` – Run the fit in a dedicated `N`-worker pool, to match a
+  scheduler allocation or cap a shared machine; without it, Rayon uses the
+  process's available parallelism (its CPU affinity and cgroup quota). The fit
+  prints the active worker count before reading genotypes. The count changes
+  speed, never the answer: every product in the fit runs on row leaves whose
+  size depends only on the matrix shape, so the model and scores are the same
+  bytes at any thread count.
 * `--list <PATH>` – Restrict fitting to a variant subset. The file (local or
   remote) should contain two whitespace-separated columns—chromosome and
   1-based position—with an optional header. Any variants that cannot be found
@@ -390,11 +393,11 @@ artifacts that were bit-identical to the decoded-statistics implementation.
 The MAF-filtered score comparison likewise produced canonical correlations of
 1.000000 on all four axes.
 
-Four cores are deliberate for this matrix shape. The covariance products have
-few output columns and a 250,000-row reduction, so adding threads eventually
-increases barrier and packing overhead rather than reducing elapsed time. Scale
-through independent fits or chromosome-level preparation before assigning a
-large core count to one small-component solve.
+Four cores match the PLINK2 comparison above. More cores no longer cost a
+small-component solve anything: since `b8841cec` the covariance products run on
+fixed row leaves with no barrier between threads. On `large_k4` (250,000 ×
+20,000, k=4, one 32-core EPYC 7763 allocation) the fit took 13.3 s at 16 threads
+and 13.9 s at 32, where the barrier-bound solver took 18.9 s and 154.1 s.
 
 "Structure recovered" is the check that the numbers mean anything. Five
 populations span a four-dimensional space of means, so exactly four components
