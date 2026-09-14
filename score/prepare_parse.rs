@@ -1,7 +1,7 @@
-//! Whole-file parsing of local `.bim` files on the thread pool. A local `.bim`
-//! that fits the memory budget is read in one pass and its lines are parsed in
-//! newline-aligned blocks, concurrently. Rows come out exactly as `BimIterator`
-//! streams them: in file order, numbered across filesets, with each unparsable
+//! Whole-file parsing of local `.bim` and `.fam` files on the thread pool. A local
+//! file that fits the memory budget is read in one pass and its lines are parsed in
+//! newline-aligned blocks, concurrently. Rows come out exactly as the streaming
+//! readers yield them: in file order, numbered across filesets, with each unparsable
 //! row kept as the same error at the same place.
 use super::{Allele, FilesetPaths, KeyedBimRecord, PrepError, parse_key};
 use crate::score::types::{BimRowIndex, FilesetBoundary};
@@ -203,9 +203,120 @@ pub(super) fn parse_bim_row(
     }))
 }
 
+/// Every IID of a local `.fam`, in file order, or the error `stream_fam_file` stops
+/// at, on the same line. `None` when the file is not a local `.fam`, cannot be read
+/// here, or is larger than an eighth of the available memory. The caller then streams
+/// it, which also reports any I/O error in the usual words.
+pub(super) fn parse_local_fam(path: &Path) -> Option<Result<Vec<String>, PrepError>> {
+    let (_, available) = crate::memory::memory_bytes();
+    parse_local_fam_within(path, available / 8, MIN_BLOCK_BYTES)
+}
+
+fn parse_local_fam_within(
+    path: &Path,
+    budget: u64,
+    min_block_bytes: usize,
+) -> Option<Result<Vec<String>, PrepError>> {
+    if path.extension().is_none_or(|e| e != "fam") || !path.is_file() {
+        return None;
+    }
+    if std::fs::metadata(path).ok()?.len() > budget {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    let blocks = newline_aligned_blocks(&bytes, min_block_bytes);
+    let first_lines: Vec<u64> = blocks
+        .par_iter()
+        .map(|b| line_count(b))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .scan(1, |next, count| {
+            let first = *next;
+            *next += count;
+            Some(first)
+        })
+        .collect();
+    let block_iids: Vec<Result<Vec<String>, PrepError>> = blocks
+        .par_iter()
+        .zip(first_lines)
+        .map(|(block, first_line)| fam_block_iids(block, first_line, path))
+        .collect();
+    let people = block_iids
+        .iter()
+        .map(|block| block.as_ref().map_or(0, Vec::len))
+        .sum();
+    let mut iids = Vec::with_capacity(people);
+    for block in block_iids {
+        match block {
+            Ok(block) => iids.extend(block),
+            // Blocks are in file order, so this is the row the stream stops at.
+            Err(error) => return Some(Err(error)),
+        }
+    }
+    Some(Ok(iids))
+}
+
+/// The IIDs of one block of `.fam` lines whose first line is `first_line`, or the
+/// first row error in it.
+fn fam_block_iids(block: &[u8], first_line: u64, path: &Path) -> Result<Vec<String>, PrepError> {
+    let mut iids = Vec::with_capacity(block.len() / 16);
+    for (i, raw_line) in block.split_inclusive(|&b| b == b'\n').enumerate() {
+        let line = raw_line.strip_suffix(b"\n").unwrap_or(raw_line);
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if let Some(iid) = fam_row_iid(line, first_line + i as u64, path)? {
+            iids.push(iid.to_string());
+        }
+    }
+    Ok(iids)
+}
+
+/// The IID of one `.fam` line, without its line ending. `None` for an empty line,
+/// which occupies a line number but names nobody.
+pub(super) fn fam_row_iid<'a>(
+    line: &'a [u8],
+    line_number: u64,
+    path: &Path,
+) -> Result<Option<&'a str>, PrepError> {
+    if line.is_empty() {
+        return Ok(None);
+    }
+    let text = std::str::from_utf8(line).map_err(|e| {
+        PrepError::Parse(format!(
+            "Invalid UTF-8 in .fam file '{}' on line {line_number}: {e}",
+            path.display()
+        ))
+    })?;
+    match second_field(text) {
+        Some(iid) => Ok(Some(iid)),
+        None => Err(PrepError::Parse(format!(
+            "Missing IID in .fam file '{}' on line {line_number}",
+            path.display()
+        ))),
+    }
+}
+
+/// `text.split_whitespace().nth(1)`, scanning bytes when the text is ASCII.
+fn second_field(text: &str) -> Option<&str> {
+    if !text.is_ascii() {
+        return text.split_whitespace().nth(1);
+    }
+    // In ASCII text these six bytes are exactly the characters that
+    // `str::split_whitespace` separates on.
+    let is_space = |&b: &u8| matches!(b, b'\t' | b'\n' | 0x0b | 0x0c | b'\r' | b' ');
+    let bytes = text.as_bytes();
+    let first = bytes.iter().position(|b| !is_space(b))?;
+    let gap = first + bytes[first..].iter().position(is_space)?;
+    let second = gap + bytes[gap..].iter().position(|b| !is_space(b))?;
+    let end = bytes[second..]
+        .iter()
+        .position(is_space)
+        .map_or(bytes.len(), |i| second + i);
+    Some(&text[second..end])
+}
+
 #[cfg(test)]
 mod tests {
-    use super::super::BimIterator;
+    use super::super::{BimIterator, stream_fam_file};
     use super::*;
 
     fn describe(item: Result<&KeyedBimRecord, &PrepError>) -> String {
@@ -275,5 +386,87 @@ mod tests {
             assert_eq!(starts(&parsed.boundaries), starts(&streamed.boundaries));
         }
         assert!(parse_local_bims_within(&filesets, 64, 1).is_none());
+    }
+
+    #[test]
+    fn second_field_matches_split_whitespace_for_every_ascii_byte() {
+        for byte in 0..=127u8 {
+            let c = byte as char;
+            for text in [
+                format!("F{c}I{c}0"),
+                format!("{c}F{c}{c}I"),
+                format!("F{c}"),
+                c.to_string(),
+            ] {
+                assert_eq!(
+                    second_field(&text),
+                    text.split_whitespace().nth(1),
+                    "{text:?}"
+                );
+            }
+        }
+        for text in ["F\u{a0}I 0", "F\u{3000}I", "F\u{1c}X I", "\u{85}F I"] {
+            assert_eq!(
+                second_field(text),
+                text.split_whitespace().nth(1),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parsed_iids_match_streamed_iids_for_any_block_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let cases: [(&str, &[u8]); 5] = [
+            (
+                "mixed",
+                b"F1 I1 0 0 1 -9\n\
+                F2\tI2\t0\t0\t2\t-9\r\n\
+                \n\
+                \r\n\
+                \x0bF3\x0cI3 0 0 1 1\n\
+                F4\xc2\xa0I4 0 0 1 1\n\
+                F5 I5",
+            ),
+            ("trailing_blank_lines", b"F1 I1 0 0 1 -9\n\n\n"),
+            ("missing_iid", b"F1 I1 0 0 1 -9\n\nF2\nF3 I3\n"),
+            ("invalid_utf8", b"F1 I1\n\n\nF2 \xff\nF3 I3\n"),
+            ("empty", b""),
+        ];
+        let outcome = |result: Result<Vec<String>, PrepError>| match result {
+            Ok(iids) => format!("{iids:?}"),
+            Err(error) => format!("error {error}"),
+        };
+        let mut expected = Vec::new();
+        for (name, bytes) in cases {
+            let path = dir.path().join(format!("{name}.fam"));
+            std::fs::write(&path, bytes).unwrap();
+            let streamed = outcome(stream_fam_file(&path));
+            for block_bytes in [1, 7, 40, 1 << 20] {
+                let parsed = parse_local_fam_within(&path, u64::MAX, block_bytes).unwrap();
+                assert_eq!(
+                    outcome(parsed),
+                    streamed,
+                    "{name}, block size {block_bytes}"
+                );
+            }
+            expected.push(streamed);
+        }
+        assert_eq!(expected[0], r#"["I1", "I2", "I3", "I4", "I5"]"#);
+        assert!(
+            expected[2].contains("Missing IID") && expected[2].contains("line 3"),
+            "{}",
+            expected[2]
+        );
+        assert!(
+            expected[3].contains("Invalid UTF-8") && expected[3].contains("line 4"),
+            "{}",
+            expected[3]
+        );
+
+        assert!(parse_local_fam_within(&dir.path().join("mixed.fam"), 8, 1).is_none());
+        let psam = dir.path().join("people.psam");
+        std::fs::write(&psam, b"#IID\nI1\n").unwrap();
+        assert!(parse_local_fam_within(&psam, u64::MAX, 1).is_none());
     }
 }

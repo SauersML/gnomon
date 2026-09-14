@@ -573,15 +573,16 @@ pub fn prepare_for_computation(
                     "> Reusing content-verified compiled variant plan ({} matched rows).",
                     plan.required.len()
                 );
-                let (all_iids, lookup) = parse_fam_and_build_lookup(&filesets)?;
-                let (subset, iids) = resolve_person_subset(keep_file, &all_iids, &lookup)?;
+                let all_iids = index_people(&filesets)?;
+                let total_people = all_iids.len();
+                let (subset, iids, output_to_fam) = resolve_person_subset(keep_file, all_iids)?;
                 return assemble_preparation(
                     plan,
                     &filesets,
                     subset,
                     iids,
-                    all_iids.len(),
-                    &lookup,
+                    output_to_fam,
+                    total_people,
                 );
             }
             Ok(None) => {}
@@ -632,11 +633,11 @@ fn prepare_for_computation_with_retry(
     // --- Stage 1: Initial setup ---
     eprintln!("> Stage 1: Indexing subject data...");
     let fileset_paths = build_fileset_paths(fileset_prefixes)?;
-    let (all_person_iids, iid_to_original_idx) = parse_fam_and_build_lookup(&fileset_paths)?;
+    let all_person_iids = index_people(&fileset_paths)?;
     let total_people_in_fam = all_person_iids.len();
 
-    let (person_subset, final_person_iids) =
-        resolve_person_subset(keep_file, &all_person_iids, &iid_to_original_idx)?;
+    let (person_subset, final_person_iids, output_idx_to_fam_idx) =
+        resolve_person_subset(keep_file, all_person_iids)?;
 
     // --- Stage 2: Global metadata discovery ---
     eprintln!("> Stage 2: Discovering all score columns...");
@@ -1208,8 +1209,8 @@ fn prepare_for_computation_with_retry(
             &fileset_paths,
             person_subset,
             final_person_iids,
+            output_idx_to_fam_idx,
             total_people_in_fam,
-            &iid_to_original_idx,
         )?,
         clean,
     ))
@@ -1220,8 +1221,8 @@ fn assemble_preparation(
     fileset_paths: &[FilesetPaths],
     person_subset: PersonSubset,
     final_person_iids: Vec<String>,
+    output_idx_to_fam_idx: Vec<OriginalPersonIndex>,
     total_people_in_fam: usize,
-    iid_to_original_idx: &AHashMap<String, u32>,
 ) -> Result<PreparationResult, PrepError> {
     if plan.starts.len() != fileset_paths.len() {
         return Err(PrepError::Invariant(
@@ -1246,12 +1247,16 @@ fn assemble_preparation(
         spool_compact_byte_index.len(),
         "spool bytes per variant must equal compact index length"
     );
-    let mut output_idx_to_fam_idx = Vec::with_capacity(num_people_to_score);
+    if output_idx_to_fam_idx.len() != num_people_to_score {
+        return Err(PrepError::Invariant(
+            "Person index mapping does not cover every scored person.".into(),
+        ));
+    }
     let mut person_fam_to_output_idx = vec![None; total_people_in_fam];
 
-    for (output_idx, iid) in final_person_iids.iter().enumerate() {
-        let original_fam_idx = *iid_to_original_idx.get(iid).unwrap();
-        output_idx_to_fam_idx.push(OriginalPersonIndex(original_fam_idx));
+    for (output_idx, &OriginalPersonIndex(original_fam_idx)) in
+        output_idx_to_fam_idx.iter().enumerate()
+    {
         let output_idx_u32 = u32::try_from(output_idx).map_err(|_| {
             PrepError::Invariant(format!(
                 "Output person index {output_idx} exceeds u32::MAX."
@@ -1830,32 +1835,79 @@ mod tests {
     fn keep_files_name_people_by_iid_or_by_plink_fid_iid_rows() {
         let dir = tempfile::tempdir().unwrap();
         let iids: Vec<String> = ["I0", "I1", "I2", "I3"].map(String::from).to_vec();
-        let lookup: AHashMap<String, u32> = iids
-            .iter()
-            .enumerate()
-            .map(|(idx, iid)| (iid.clone(), idx as u32))
-            .collect();
         let keep = |text: &str| {
             let path = dir.path().join("keep.txt");
             std::fs::write(&path, text).unwrap();
-            resolve_person_subset(Some(&path), &iids, &lookup)
+            resolve_person_subset(Some(&path), iids.clone())
         };
         let indices = |subset: PersonSubset| match subset {
             PersonSubset::Indices(indices) => indices,
             PersonSubset::All => panic!("a keep file selects a subset"),
         };
 
-        let (by_iid, by_iid_names) = keep("I2\nI0\n").unwrap();
+        let (by_iid, by_iid_names, by_iid_rows) = keep("I2\nI0\n").unwrap();
         assert_eq!(indices(by_iid), vec![0, 2]);
         assert_eq!(by_iid_names, vec!["I0", "I2"]);
+        assert_eq!(
+            by_iid_rows,
+            vec![OriginalPersonIndex(0), OriginalPersonIndex(2)]
+        );
 
         // plink2's header, tab- and space-separated FID IID rows, and one person twice.
-        let (plink, plink_names) = keep("#FID\tIID\nF2\tI2\nF0 I0\nI2\n").unwrap();
+        let (plink, plink_names, _) = keep("#FID\tIID\nF2\tI2\nF0 I0\nI2\n").unwrap();
         assert_eq!(indices(plink), vec![0, 2]);
         assert_eq!(plink_names, vec!["I0", "I2"]);
 
         let error = keep("F9\tI9\n").unwrap_err().to_string();
         assert!(error.contains("I9"), "the unmatched row is named: {error}");
+
+        // Without a keep file everyone is scored in .fam order.
+        let (everyone, names, rows) = resolve_person_subset(None, iids.clone()).unwrap();
+        assert!(matches!(everyone, PersonSubset::All));
+        assert_eq!(names, iids);
+        assert_eq!(rows, (0..4).map(OriginalPersonIndex).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn people_are_indexed_from_filesets_that_agree_on_unique_iids() {
+        let dir = tempfile::tempdir().unwrap();
+        let fileset = |name: &str, fam: &str| {
+            let prefix = dir.path().join(name);
+            std::fs::write(prefix.with_extension("fam"), fam).unwrap();
+            FilesetPaths {
+                bed: prefix.with_extension("bed"),
+                bim: prefix.with_extension("bim"),
+                fam: prefix.with_extension("fam"),
+            }
+        };
+        let shared = "F A 0 0 1 -9\nF B 0 0 2 -9\n";
+
+        // A .fam named twice is read once; another with the same IIDs agrees even
+        // when its other columns differ.
+        let people = index_people(&[
+            fileset("chr1", shared),
+            fileset("chr2", "G\tA\t0\t0\t0\t1\r\nG\tB\t0\t0\t0\t1\r\n"),
+            fileset("chr1", shared),
+        ])
+        .unwrap();
+        assert_eq!(people, vec!["A", "B"]);
+
+        let error = index_people(&[
+            fileset("chr1", shared),
+            fileset("chr3", "F A 0 0 1 -9\nF C 0 0 2 -9\n"),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("chr3.fam"), "{error}");
+
+        // The first repeat in file order is the one named.
+        let error = index_people(&[fileset("dup", "F A\nF B\nF C\nF B\nF A\n")])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Duplicate IID 'B'"), "{error}");
+
+        let error = index_people(&[]).unwrap_err().to_string();
+        assert!(error.contains("No individuals found"), "{error}");
     }
 
     #[test]
@@ -3025,11 +3077,13 @@ impl Iterator for ScoreRows {
     }
 }
 
+/// The people to score, their IIDs, and the `.fam` row of each, all in output order.
+/// Without a keep file everyone is scored in `.fam` order: the IIDs are moved rather
+/// than copied, and no IID is hashed.
 fn resolve_person_subset(
     keep_file: Option<&Path>,
-    all_person_iids: &[String],
-    iid_to_original_idx: &AHashMap<String, u32>,
-) -> Result<(PersonSubset, Vec<String>), PrepError> {
+    all_person_iids: Vec<String>,
+) -> Result<(PersonSubset, Vec<String>, Vec<OriginalPersonIndex>), PrepError> {
     if let Some(path) = keep_file {
         eprintln!(
             "> Subsetting individuals based on keep file: {}",
@@ -3043,12 +3097,18 @@ fn resolve_person_subset(
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty() && !is_keep_header(s))
             .collect();
+        // index_people has checked that every row index fits u32.
+        let iid_to_original_idx: AHashMap<&str, u32> = all_person_iids
+            .iter()
+            .enumerate()
+            .map(|(idx, iid)| (iid.as_str(), idx as u32))
+            .collect();
 
         let mut found_people = Vec::with_capacity(lines_to_keep.len());
         let mut missing_ids = Vec::new();
 
         for line in lines_to_keep {
-            match resolve_keep_line(&line, iid_to_original_idx) {
+            match resolve_keep_line(&line, &iid_to_original_idx) {
                 Some((original_idx, iid)) => found_people.push((original_idx, iid.to_string())),
                 None => missing_ids.push(line),
             }
@@ -3064,10 +3124,22 @@ fn resolve_person_subset(
         // Someone listed both by IID and as `FID IID` is still one person.
         found_people.dedup_by_key(|(idx, _)| *idx);
         let final_person_iids = found_people.iter().map(|(_, iid)| iid.clone()).collect();
+        let output_to_fam = found_people
+            .iter()
+            .map(|&(idx, _)| OriginalPersonIndex(idx))
+            .collect();
         let subset_indices = found_people.into_iter().map(|(idx, _)| idx).collect();
-        Ok((PersonSubset::Indices(subset_indices), final_person_iids))
+        Ok((
+            PersonSubset::Indices(subset_indices),
+            final_person_iids,
+            output_to_fam,
+        ))
     } else {
-        Ok((PersonSubset::All, all_person_iids.to_vec()))
+        // index_people has checked that every row index fits u32.
+        let output_to_fam = (0..all_person_iids.len())
+            .map(|idx| OriginalPersonIndex(idx as u32))
+            .collect();
+        Ok((PersonSubset::All, all_person_iids, output_to_fam))
     }
 }
 
@@ -3076,7 +3148,7 @@ fn resolve_person_subset(
 /// `FID IID ...`, the layout `plink2 --keep` files use, and matched by its IID.
 fn resolve_keep_line<'a>(
     line: &'a str,
-    iid_to_original_idx: &AHashMap<String, u32>,
+    iid_to_original_idx: &AHashMap<&str, u32>,
 ) -> Option<(u32, &'a str)> {
     if let Some(&idx) = iid_to_original_idx.get(line) {
         return Some((idx, line));
@@ -3092,10 +3164,9 @@ fn is_keep_header(line: &str) -> bool {
     line.starts_with("#FID") || line.starts_with("#IID")
 }
 
-fn parse_fam_and_build_lookup(
-    fileset_paths: &[FilesetPaths],
-) -> Result<(Vec<String>, AHashMap<String, u32>), PrepError> {
-    let mut iid_to_idx = AHashMap::new();
+/// Every IID of the filesets' shared `.fam`, in file order. Filesets must agree on
+/// the people, and IIDs must be unique.
+fn index_people(fileset_paths: &[FilesetPaths]) -> Result<Vec<String>, PrepError> {
     let mut canonical_iids: Option<Vec<String>> = None;
     let mut canonical_path: Option<PathBuf> = None;
     let mut seen_paths: AHashSet<PathBuf> = AHashSet::new();
@@ -3122,66 +3193,54 @@ fn parse_fam_and_build_lookup(
                 });
             }
         } else {
-            let mut seen_iids = AHashSet::new();
-            for (idx, iid) in iids.iter().enumerate() {
-                if !seen_iids.insert(iid.clone()) {
-                    return Err(PrepError::Parse(format!(
-                        "Duplicate IID '{}' in FAM file '{}'. gnomon requires unique output IIDs.",
-                        iid,
-                        fileset.fam.display()
-                    )));
+            {
+                // Borrowed keys: checking uniqueness copies no IID.
+                let mut seen_iids: AHashSet<&str> = AHashSet::with_capacity(iids.len());
+                for (idx, iid) in iids.iter().enumerate() {
+                    if !seen_iids.insert(iid.as_str()) {
+                        return Err(PrepError::Parse(format!(
+                            "Duplicate IID '{}' in FAM file '{}'. gnomon requires unique output IIDs.",
+                            iid,
+                            fileset.fam.display()
+                        )));
+                    }
+                    u32::try_from(idx).map_err(|_| {
+                        PrepError::Invariant(format!(
+                            "FAM index {idx} exceeds u32::MAX while building lookup."
+                        ))
+                    })?;
                 }
-                let idx_u32 = u32::try_from(idx).map_err(|_| {
-                    PrepError::Invariant(format!(
-                        "FAM index {idx} exceeds u32::MAX while building lookup."
-                    ))
-                })?;
-                iid_to_idx.insert(iid.clone(), idx_u32);
             }
             canonical_path = Some(fileset.fam.clone());
             canonical_iids = Some(iids);
         }
     }
 
-    let person_iids = canonical_iids.ok_or_else(|| {
-        PrepError::Parse("No individuals found in provided .fam files.".to_string())
-    })?;
-    Ok((person_iids, iid_to_idx))
+    canonical_iids
+        .ok_or_else(|| PrepError::Parse("No individuals found in provided .fam files.".to_string()))
 }
 
 fn read_fam_file(path: &Path) -> Result<Vec<String>, PrepError> {
+    if let Some(parsed) = parse::parse_local_fam(path) {
+        return parsed;
+    }
+    stream_fam_file(path)
+}
+
+fn stream_fam_file(path: &Path) -> Result<Vec<String>, PrepError> {
     let mut source =
         open_plink_text_source(path).map_err(|e| map_pipeline_error(e, path.to_path_buf()))?;
     let mut iids = Vec::new();
-    let mut line_number = 0usize;
+    let mut line_number = 0u64;
 
     while let Some(line) = source
         .next_line()
         .map_err(|e| map_pipeline_error(e, path.to_path_buf()))?
     {
         line_number += 1;
-        if line.is_empty() {
-            continue;
+        if let Some(iid) = parse::fam_row_iid(line, line_number, path)? {
+            iids.push(iid.to_string());
         }
-        let line_str = std::str::from_utf8(line).map_err(|e| {
-            PrepError::Parse(format!(
-                "Invalid UTF-8 in .fam file '{}' on line {}: {e}",
-                path.display(),
-                line_number
-            ))
-        })?;
-        let iid = line_str
-            .split_whitespace()
-            .nth(1)
-            .ok_or_else(|| {
-                PrepError::Parse(format!(
-                    "Missing IID in .fam file '{}' on line {}",
-                    path.display(),
-                    line_number
-                ))
-            })?
-            .to_string();
-        iids.push(iid);
     }
 
     Ok(iids)
