@@ -918,11 +918,11 @@ fn allele_pair_matches(
 
 /// How a score record's other allele pins down which variant at its locus it scores.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OtherAlleleMatch {
+pub(crate) enum OtherAlleleMatch {
     /// The record names one other allele, so the allele pair decides, as always.
     Pair,
     /// The record names no other allele ("."), or several candidates ("A/G"), and only
-    /// this `.bim` row carries its effect allele with a listed other allele.
+    /// this row carries its effect allele with a listed other allele.
     EffectOnly(usize),
     /// Several rows carry the effect allele, so which variant the score meant is unknown.
     SeveralRows,
@@ -932,13 +932,13 @@ enum OtherAlleleMatch {
 
 /// Other-allele text that names no single allele: "." where the score file gave none,
 /// or candidates separated by '/', as harmonized PGS Catalog files infer them.
-fn names_no_single_other_allele(other_allele: &str) -> bool {
+pub(crate) fn names_no_single_other_allele(other_allele: &str) -> bool {
     other_allele == "." || other_allele.contains('/')
 }
 
-/// Decides how a score record matches the `.bim` rows at its locus, given as
-/// `(allele1, allele2)` pairs in row order.
-fn resolve_other_allele<'a>(
+/// Decides how a score record matches the variant rows at its locus, `.bim` rows or a
+/// VCF record's REF and ALT, given as `(allele1, allele2)` pairs in row order.
+pub(crate) fn resolve_other_allele<'a>(
     effect_allele: &str,
     other_allele: &str,
     rows: impl Iterator<Item = (&'a str, &'a str)>,
@@ -966,10 +966,10 @@ fn resolve_other_allele<'a>(
     found.map_or(OtherAlleleMatch::NoRow, OtherAlleleMatch::EffectOnly)
 }
 
-/// Weights from score rows that name no single other allele, by how Stage 3 matched
-/// them. Each weight is one score column of one score file row.
+/// Weights from score rows that name no single other allele, by how they matched the
+/// variants at their loci. Each weight is one score column of one score file row.
 #[derive(Debug, Default)]
-struct EffectOnlyMatches {
+pub(crate) struct EffectOnlyMatches {
     matched: u64,
     several_rows: u64,
     no_row: u64,
@@ -980,7 +980,7 @@ struct EffectOnlyMatches {
 impl EffectOnlyMatches {
     const EXAMPLES: usize = 5;
 
-    fn record(&mut self, decision: OtherAlleleMatch, key: VariantKey) {
+    pub(crate) fn record(&mut self, decision: OtherAlleleMatch, key: VariantKey) {
         match decision {
             OtherAlleleMatch::Pair => return,
             OtherAlleleMatch::EffectOnly(_) => {
@@ -1001,7 +1001,7 @@ impl EffectOnlyMatches {
         self.matched + self.several_rows + self.no_row == 0
     }
 
-    fn report(&self) {
+    pub(crate) fn report(&self) {
         if self.matched > 0 {
             eprintln!(
                 "> Matched {} weight(s) from score rows that name no single other allele on their effect allele, at loci where one variant carries it.",

@@ -1,3 +1,6 @@
+use crate::score::prepare::{
+    EffectOnlyMatches, OtherAlleleMatch, names_no_single_other_allele, resolve_other_allele,
+};
 use crate::score::types::{GenomicRegion, parse_chromosome_label};
 use crate::shared::files::{VariantCompression, VariantFormat, VariantSource, open_variant_source};
 use ahash::{AHashMap, AHashSet};
@@ -184,6 +187,7 @@ pub fn score_vcf_streaming(
                 input_path,
                 keep,
                 score_names,
+                &rules_by_key,
                 |record: &mut noodles_vcf::Record| reader.read_record(record),
                 |record, kept_indices, score_names, decoded| {
                     decode_scored_record(record, &rules_by_key, kept_indices, score_names, decoded)
@@ -206,6 +210,7 @@ pub fn score_vcf_streaming(
                 input_path,
                 keep,
                 score_names,
+                &rules_by_key,
                 |record: &mut noodles_bcf::Record| reader.read_record(record),
                 |record, kept_indices, score_names, decoded| {
                     decode_scored_bcf_record(
@@ -231,7 +236,10 @@ pub fn score_vcf_streaming(
 ///
 /// Records are read in order, decoded on the rayon pool, and accumulated in
 /// order again, so every sum takes the same operands in the same sequence as a
-/// one-record-at-a-time scan, and the first error is the one it raises.
+/// one-record-at-a-time scan, and the first error is the one it raises. The
+/// records at a position holding a rule that names no single other allele are
+/// accumulated together, when the next scored position or the end of input shows
+/// every one of them has been read.
 #[allow(clippy::too_many_arguments)]
 fn score_records<R, ReadRecord, Decode, Chromosome>(
     header: &noodles_vcf::Header,
@@ -239,6 +247,7 @@ fn score_records<R, ReadRecord, Decode, Chromosome>(
     input_path: &Path,
     keep: Option<&Path>,
     score_names: Vec<String>,
+    rules_by_key: &ScoreRules,
     mut read_record: ReadRecord,
     decode: Decode,
     chromosome: Chromosome,
@@ -263,9 +272,14 @@ where
 
     let num_people = person_iids.len();
     let num_scores = score_names.len();
-    let mut sum_scores = vec![0.0f64; num_people * num_scores];
-    let mut missing_counts = vec![0u32; num_people * num_scores];
-    let mut score_variant_counts = vec![0u32; num_scores];
+    let mut totals = ScoreTotals {
+        num_scores,
+        sum_scores: vec![0.0f64; num_people * num_scores],
+        missing_counts: vec![0u32; num_people * num_scores],
+        score_variant_counts: vec![0u32; num_scores],
+    };
+    let mut pending = PendingPosition::default();
+    let mut effect_only_matches = EffectOnlyMatches::default();
 
     let threads = rayon::current_num_threads().max(1);
     let batch_len =
@@ -299,6 +313,8 @@ where
             .zip(decoded_records[..filled].par_iter_mut())
             .for_each(|(record, decoded)| {
                 decoded.allele_count = 0;
+                decoded.key = None;
+                decoded.effect_only = false;
                 decoded.error = decode(record, &kept_indices, &score_names, decoded).err();
             });
 
@@ -306,47 +322,31 @@ where
             if let Some(err) = decoded.error.take() {
                 return Err(err);
             }
+            if let Some(key) = decoded.key {
+                if pending.key.is_some_and(|open| open != key) {
+                    pending.resolve(
+                        rules_by_key,
+                        &score_names,
+                        &mut effect_only_matches,
+                        &mut totals,
+                    )?;
+                }
+                if decoded.effect_only {
+                    if pending.key.is_none() {
+                        pending.open(key, chromosome(record), rules_by_key)?;
+                    }
+                    pending.push(decoded);
+                    continue;
+                }
+            }
             for allele in &decoded.alleles[..decoded.allele_count] {
-                for (out_person_idx, dosage) in allele.dosages.iter().enumerate() {
-                    match dosage {
-                        Some(decoded_dosage) => {
-                            for rule in &allele.matched_rules {
-                                let cell = out_person_idx * num_scores + rule.score_index;
-                                let effect_dosage = if rule.effect_is_ref {
-                                    decoded_dosage.ref_dosage.ok_or_else(|| {
-                                        ref_effect_error(
-                                            &score_names[rule.score_index],
-                                            &chromosome(record),
-                                            decoded.position,
-                                        )
-                                    })?
-                                } else {
-                                    decoded_dosage.alt_dosage
-                                };
-                                sum_scores[cell] += rule.weight * effect_dosage;
-                            }
-                        }
-                        None => {
-                            let mut previous_score = None;
-                            for rule in &allele.matched_rules {
-                                if previous_score == Some(rule.score_index) {
-                                    continue;
-                                }
-                                let cell = out_person_idx * num_scores + rule.score_index;
-                                missing_counts[cell] += 1;
-                                previous_score = Some(rule.score_index);
-                            }
-                        }
-                    }
-                }
-
-                let mut previous_score = None;
-                for rule in &allele.matched_rules {
-                    if previous_score != Some(rule.score_index) {
-                        score_variant_counts[rule.score_index] += 1;
-                        previous_score = Some(rule.score_index);
-                    }
-                }
+                totals.add_allele(&allele.matched_rules, &allele.dosages, |score_index| {
+                    ref_effect_error(
+                        &score_names[score_index],
+                        &chromosome(record),
+                        decoded.position,
+                    )
+                })?;
             }
         }
 
@@ -354,9 +354,22 @@ where
             return Err(err.into());
         }
         if at_eof {
+            pending.resolve(
+                rules_by_key,
+                &score_names,
+                &mut effect_only_matches,
+                &mut totals,
+            )?;
             break;
         }
     }
+    effect_only_matches.report();
+    let ScoreTotals {
+        sum_scores,
+        missing_counts,
+        score_variant_counts,
+        ..
+    } = totals;
 
     // These are the same matched variant/score assignments counted in each
     // score's denominator. ALT ordinals are local to a record, so hashing them
@@ -392,6 +405,14 @@ const DECODE_BATCH_DOSAGES: usize = 1 << 22;
 #[derive(Default)]
 struct DecodedRecord {
     position: u32,
+    /// The record's position, when score rules sit there.
+    key: Option<VariantKey>,
+    /// Whether a rule at the position names no single other allele. Which
+    /// alleles such a rule scores is decided by `PendingPosition`, so this
+    /// record's alleles carry no matched rules yet.
+    effect_only: bool,
+    /// Every (REF, ALT) pair of an `effect_only` record, in ALT order.
+    rows: Vec<(String, String)>,
     /// Alleles with at least one matched rule, in ALT order. Only the first
     /// `allele_count` belong to this record; the rest keep their buffers.
     alleles: Vec<DecodedAllele>,
@@ -402,9 +423,187 @@ struct DecodedRecord {
 
 #[derive(Default)]
 struct DecodedAllele {
+    /// The allele's ALT ordinal, from 0.
+    alt_offset: usize,
     matched_rules: Vec<MatchedRule>,
     /// One entry per kept person, in output order.
     dosages: Vec<Option<DecodedAltDosage>>,
+}
+
+/// Per-person score sums and missing counts, and each score's matched variants.
+struct ScoreTotals {
+    num_scores: usize,
+    sum_scores: Vec<f64>,
+    missing_counts: Vec<u32>,
+    score_variant_counts: Vec<u32>,
+}
+
+impl ScoreTotals {
+    /// Adds each rule's weight times every kept person's dosage of its effect
+    /// allele, and counts the allele once in each score it scores.
+    fn add_allele(
+        &mut self,
+        matched_rules: &[MatchedRule],
+        dosages: &[Option<DecodedAltDosage>],
+        ref_effect_error: impl Fn(usize) -> String,
+    ) -> Result<(), String> {
+        let num_scores = self.num_scores;
+        for (out_person_idx, dosage) in dosages.iter().enumerate() {
+            match dosage {
+                Some(decoded_dosage) => {
+                    for rule in matched_rules {
+                        let cell = out_person_idx * num_scores + rule.score_index;
+                        let effect_dosage = if rule.effect_is_ref {
+                            decoded_dosage
+                                .ref_dosage
+                                .ok_or_else(|| ref_effect_error(rule.score_index))?
+                        } else {
+                            decoded_dosage.alt_dosage
+                        };
+                        self.sum_scores[cell] += rule.weight * effect_dosage;
+                    }
+                }
+                None => {
+                    let mut previous_score = None;
+                    for rule in matched_rules {
+                        if previous_score == Some(rule.score_index) {
+                            continue;
+                        }
+                        let cell = out_person_idx * num_scores + rule.score_index;
+                        self.missing_counts[cell] += 1;
+                        previous_score = Some(rule.score_index);
+                    }
+                }
+            }
+        }
+
+        let mut previous_score = None;
+        for rule in matched_rules {
+            if previous_score != Some(rule.score_index) {
+                self.score_variant_counts[rule.score_index] += 1;
+                previous_score = Some(rule.score_index);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The records read so far at one position holding a rule that names no single
+/// other allele. Such a rule scores the one variant at the position carrying its
+/// effect allele with a listed other allele, so nothing there is scored until
+/// every record at the position has been read.
+#[derive(Default)]
+struct PendingPosition {
+    key: Option<VariantKey>,
+    chromosome: String,
+    /// The (REF, ALT) pair of every ALT allele read at the position, in input order.
+    rows: Vec<(String, String)>,
+    /// Alleles some rule may score, each with its index in `rows`.
+    alleles: Vec<(usize, DecodedAllele)>,
+    /// Which positions have been resolved, by the index of their first rule.
+    resolved: Vec<bool>,
+}
+
+impl PendingPosition {
+    /// Starts gathering the records at `key`.
+    fn open(
+        &mut self,
+        key: VariantKey,
+        chromosome: String,
+        rules_by_key: &ScoreRules,
+    ) -> Result<(), String> {
+        if self.resolved.is_empty() {
+            self.resolved.resize(rules_by_key.rules.len(), false);
+        }
+        let first_rule = rules_by_key.ranges[&key].0;
+        if std::mem::replace(&mut self.resolved[first_rule], true) {
+            return Err(format!(
+                "Records at {chromosome}:{} are not adjacent in the input, and a score row there names no single other allele, so the variant it scores cannot be decided while streaming. Sort the input, for example with bcftools sort.",
+                key.1
+            ));
+        }
+        self.key = Some(key);
+        self.chromosome = chromosome;
+        Ok(())
+    }
+
+    /// Takes the rows and alleles of a record at the open position.
+    fn push(&mut self, decoded: &mut DecodedRecord) {
+        let first_row = self.rows.len();
+        self.rows.append(&mut decoded.rows);
+        for allele in &mut decoded.alleles[..decoded.allele_count] {
+            self.alleles
+                .push((first_row + allele.alt_offset, std::mem::take(allele)));
+        }
+    }
+
+    /// Decides every rule at the open position over all of its rows, as Stage 3
+    /// does over `.bim` rows, and adds the alleles they score to `totals`.
+    fn resolve(
+        &mut self,
+        rules_by_key: &ScoreRules,
+        score_names: &[String],
+        effect_only_matches: &mut EffectOnlyMatches,
+        totals: &mut ScoreTotals,
+    ) -> Result<(), String> {
+        let Some(key) = self.key.take() else {
+            return Ok(());
+        };
+        let rules = rules_by_key.get(&key).unwrap_or_default();
+        let decisions: Vec<OtherAlleleMatch> = rules
+            .iter()
+            .map(|rule| {
+                let decision = resolve_other_allele(
+                    rules_by_key.allele(rule.effect_allele),
+                    rules_by_key.allele(rule.other_allele),
+                    self.rows
+                        .iter()
+                        .map(|(ref_allele, alt_allele)| (ref_allele.as_str(), alt_allele.as_str())),
+                );
+                for _ in rules_by_key.applications(rule) {
+                    effect_only_matches.record(decision, key);
+                }
+                decision
+            })
+            .collect();
+
+        for (row, allele) in &self.alleles {
+            let (ref_allele, alt_allele) = &self.rows[*row];
+            let mut matched = Vec::new();
+            for (rule, decision) in rules.iter().zip(&decisions) {
+                let effect_allele = rules_by_key.allele(rule.effect_allele);
+                let effect_is_ref = match *decision {
+                    OtherAlleleMatch::Pair => pair_orientation(
+                        effect_allele,
+                        rules_by_key.allele(rule.other_allele),
+                        ref_allele,
+                        alt_allele,
+                    ),
+                    OtherAlleleMatch::EffectOnly(chosen) if chosen == *row => {
+                        Some(effect_allele == ref_allele)
+                    }
+                    _ => None,
+                };
+                if let Some(effect_is_ref) = effect_is_ref {
+                    matched.extend(rules_by_key.applications(rule).iter().map(|application| {
+                        MatchedRule {
+                            score_index: application.score_index,
+                            weight: f64::from(application.weight),
+                            effect_is_ref,
+                        }
+                    }));
+                }
+            }
+            totals.add_allele(
+                &merge_matched_rules(matched),
+                &allele.dosages,
+                |score_index| ref_effect_error(&score_names[score_index], &self.chromosome, key.1),
+            )?;
+        }
+        self.rows.clear();
+        self.alleles.clear();
+        Ok(())
+    }
 }
 
 /// Decodes the dosages `record` contributes to its matched rules into
@@ -429,21 +628,28 @@ fn decode_scored_record(
         return Ok(());
     };
     decoded.position = pos;
+    decoded.key = Some((chr, pos));
 
     let ref_allele = record.reference_bases();
     let alternate_bases = record.alternate_bases();
     let alt_alleles = alternate_bases.iter().collect::<Result<Vec<_>, _>>()?;
+    decode_rows(rules_by_key, score_rules, ref_allele, &alt_alleles, decoded);
     for (alt_offset, alt_allele) in alt_alleles.iter().enumerate() {
         let alt_index = alt_offset + 1;
-        let matched_rules =
-            match_rules_for_allele(rules_by_key, score_rules, ref_allele, alt_allele);
-        if matched_rules.is_empty() {
+        let Some(matched_rules) = rules_for_allele(
+            rules_by_key,
+            score_rules,
+            decoded.effect_only,
+            ref_allele,
+            alt_allele,
+        ) else {
             continue;
-        }
+        };
         if decoded.alleles.len() == decoded.allele_count {
             decoded.alleles.push(DecodedAllele::default());
         }
         let allele = &mut decoded.alleles[decoded.allele_count];
+        allele.alt_offset = alt_offset;
         allele.dosages.clear();
         let ref_effect_rule = matched_rules.iter().find(|rule| rule.effect_is_ref);
         for_each_vcf_dosage_best(
@@ -473,6 +679,60 @@ fn decode_scored_record(
     Ok(())
 }
 
+/// Marks `decoded` as `effect_only` when a rule at its position names no single
+/// other allele, and keeps the record's (REF, ALT) pairs for `PendingPosition`.
+fn decode_rows(
+    rules_by_key: &ScoreRules,
+    score_rules: &[ScoreRule],
+    ref_allele: &str,
+    alt_alleles: &[&str],
+    decoded: &mut DecodedRecord,
+) {
+    decoded.effect_only = score_rules
+        .iter()
+        .any(|rule| names_no_single_other_allele(rules_by_key.allele(rule.other_allele)));
+    if decoded.effect_only {
+        decoded.rows.clear();
+        decoded.rows.extend(
+            alt_alleles
+                .iter()
+                .map(|alt_allele| (ref_allele.to_string(), alt_allele.to_string())),
+        );
+    }
+}
+
+/// The rules scoring `(ref_allele, alt_allele)`, merged, or `None` when no rule may.
+/// At an `effect_only` position the rules are matched once every record there has
+/// been read, so an allele some rule may score gets no rules yet.
+fn rules_for_allele(
+    rules_by_key: &ScoreRules,
+    score_rules: &[ScoreRule],
+    effect_only: bool,
+    ref_allele: &str,
+    alt_allele: &str,
+) -> Option<Vec<MatchedRule>> {
+    if effect_only {
+        let may_score = score_rules.iter().any(|rule| {
+            let effect_allele = rules_by_key.allele(rule.effect_allele);
+            let other_allele = rules_by_key.allele(rule.other_allele);
+            match resolve_other_allele(
+                effect_allele,
+                other_allele,
+                std::iter::once((ref_allele, alt_allele)),
+            ) {
+                OtherAlleleMatch::Pair => {
+                    pair_orientation(effect_allele, other_allele, ref_allele, alt_allele).is_some()
+                }
+                OtherAlleleMatch::EffectOnly(_) => true,
+                OtherAlleleMatch::SeveralRows | OtherAlleleMatch::NoRow => false,
+            }
+        });
+        return may_score.then(Vec::new);
+    }
+    let matched = match_rules_for_allele(rules_by_key, score_rules, ref_allele, alt_allele);
+    (!matched.is_empty()).then_some(matched)
+}
+
 /// Decodes the dosages a BCF `record` contributes to its matched rules into
 /// `decoded`, as `decode_scored_record` does for a VCF record.
 fn decode_scored_bcf_record(
@@ -495,22 +755,29 @@ fn decode_scored_bcf_record(
         return Ok(());
     };
     decoded.position = pos;
+    decoded.key = Some((chr, pos));
 
     let reference_bases = record.reference_bases();
     let ref_allele = std::str::from_utf8(reference_bases.as_ref())?;
     let alternate_bases = record.alternate_bases();
     let alt_alleles = alternate_bases.iter().collect::<Result<Vec<_>, _>>()?;
+    decode_rows(rules_by_key, score_rules, ref_allele, &alt_alleles, decoded);
     for (alt_offset, alt_allele) in alt_alleles.iter().enumerate() {
         let alt_index = alt_offset + 1;
-        let matched_rules =
-            match_rules_for_allele(rules_by_key, score_rules, ref_allele, alt_allele);
-        if matched_rules.is_empty() {
+        let Some(matched_rules) = rules_for_allele(
+            rules_by_key,
+            score_rules,
+            decoded.effect_only,
+            ref_allele,
+            alt_allele,
+        ) else {
             continue;
-        }
+        };
         if decoded.alleles.len() == decoded.allele_count {
             decoded.alleles.push(DecodedAllele::default());
         }
         let allele = &mut decoded.alleles[decoded.allele_count];
+        allele.alt_offset = alt_offset;
         allele.dosages.clear();
         let ref_effect_rule = matched_rules.iter().find(|rule| rule.effect_is_ref);
         for_each_bcf_dosage_best(
@@ -805,11 +1072,9 @@ fn match_rules_for_allele(
     for rule in rules {
         let effect_allele = rules_by_key.allele(rule.effect_allele);
         let other_allele = rules_by_key.allele(rule.other_allele);
-        let effect_is_ref = if effect_allele == alt_allele && other_allele == ref_allele {
-            false
-        } else if effect_allele == ref_allele && other_allele == alt_allele {
-            true
-        } else {
+        let Some(effect_is_ref) =
+            pair_orientation(effect_allele, other_allele, ref_allele, alt_allele)
+        else {
             continue;
         };
         for application in rules_by_key.applications(rule) {
@@ -820,7 +1085,29 @@ fn match_rules_for_allele(
             });
         }
     }
+    merge_matched_rules(matched)
+}
 
+/// Whether the effect allele is the REF, when a rule's allele pair is `(ref_allele,
+/// alt_allele)` in either order.
+fn pair_orientation(
+    effect_allele: &str,
+    other_allele: &str,
+    ref_allele: &str,
+    alt_allele: &str,
+) -> Option<bool> {
+    if effect_allele == alt_allele && other_allele == ref_allele {
+        Some(false)
+    } else if effect_allele == ref_allele && other_allele == alt_allele {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// Every rule at a position scoring one allele, with the weights of rules in the same
+/// score and orientation summed in rule order.
+fn merge_matched_rules(mut matched: Vec<MatchedRule>) -> Vec<MatchedRule> {
     matched.sort_by_key(|rule| (rule.score_index, rule.effect_is_ref));
     let mut unique_len = 0usize;
     for read_idx in 0..matched.len() {
@@ -2056,6 +2343,161 @@ mod tests {
         assert_eq!(result.sum_scores, [11.0]);
         assert_eq!(result.score_variant_counts, [2]);
         assert_eq!(result.matched_variants, 2);
+    }
+
+    /// Writes `vcf_text` to `<stem>.vcf` and the same records as BGZF BCF to `<stem>.bcf`.
+    fn write_vcf_and_bcf(dir: &Path, stem: &str, vcf_text: &str) -> (PathBuf, PathBuf) {
+        use noodles_vcf::variant::io::Write as _;
+
+        let vcf_path = dir.join(format!("{stem}.vcf"));
+        let bcf_path = dir.join(format!("{stem}.bcf"));
+        std::fs::write(&vcf_path, vcf_text).expect("write vcf");
+        let mut reader = VcfReader::new(BufReader::new(File::open(&vcf_path).expect("open vcf")));
+        let header = reader.read_header().expect("vcf header");
+        let mut writer = noodles_bcf::io::Writer::new(File::create(&bcf_path).expect("create bcf"));
+        writer.write_header(&header).expect("bcf header");
+        let mut record = noodles_vcf::variant::RecordBuf::default();
+        while reader
+            .read_record_buf(&header, &mut record)
+            .expect("vcf record")
+            != 0
+        {
+            writer
+                .write_variant_record(&header, &record)
+                .expect("bcf record");
+        }
+        writer.try_finish().expect("finish bcf");
+        (vcf_path, bcf_path)
+    }
+
+    #[test]
+    fn rows_naming_no_single_other_allele_score_like_their_written_pairs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A simple locus, a flip, a split locus where both records carry A, a
+        // multiallelic record where only the second ALT is T, and one more simple locus.
+        let (vcf_path, bcf_path) = write_vcf_and_bcf(
+            dir.path(),
+            "cohort",
+            "##fileformat=VCFv4.2\n\
+             ##contig=<ID=1>\n\
+             ##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n\
+             #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts1\ts2\n\
+             1\t100\t.\tA\tG\t.\tPASS\t.\tGT\t0/1\t1/1\n\
+             1\t200\t.\tC\tT\t.\tPASS\t.\tGT\t1/1\t0/0\n\
+             1\t300\t.\tA\tC\t.\tPASS\t.\tGT\t0/1\t0/0\n\
+             1\t300\t.\tA\tT\t.\tPASS\t.\tGT\t0/0\t0/1\n\
+             1\t400\t.\tC\tG,T\t.\tPASS\t.\tGT\t0/2\t1/2\n\
+             1\t500\t.\tA\tG\t.\tPASS\t.\tGT\t0/0\t0/1\n",
+        );
+        let score = |name: &str, body: &str| {
+            let score_path = dir.path().join(name);
+            std::fs::write(
+                &score_path,
+                format!("variant_id\teffect_allele\tother_allele\tS\n{body}"),
+            )
+            .expect("write score");
+            let vcf = score_vcf_streaming(&vcf_path, std::slice::from_ref(&score_path), None, None)
+                .expect("score vcf");
+            let bcf = score_vcf_streaming(&bcf_path, &[score_path], None, None).expect("score bcf");
+            assert_eq!(vcf.sum_scores, bcf.sum_scores, "{name}");
+            assert_eq!(vcf.score_variant_counts, bcf.score_variant_counts, "{name}");
+            assert_eq!(vcf.missing_counts, bcf.missing_counts, "{name}");
+            vcf
+        };
+
+        let pairs = score(
+            "pairs.tsv",
+            "1:100\tA\tG\t0.5\n1:200\tT\tC\t-0.25\n1:400\tT\tC\t2\n1:500\tA\tG\t0.125\n",
+        );
+        assert_eq!(pairs.sum_scores, [2.25, 2.125]);
+        assert_eq!(pairs.score_variant_counts, [4]);
+        // The same weights with the other allele unknown or listed as candidates, plus an
+        // ambiguous locus and one the genotypes lack.
+        let effect_only = score(
+            "effect_only.tsv",
+            "1:100\tA\t.\t0.5\n1:200\tT\t.\t-0.25\n1:300\tA\t.\t9\n1:400\tT\tC/G\t2\n1:500\tA\tG/T\t0.125\n1:600\tA\t.\t7\n",
+        );
+        assert_eq!(effect_only.sum_scores, pairs.sum_scores);
+        assert_eq!(effect_only.score_variant_counts, pairs.score_variant_counts);
+        assert_eq!(effect_only.missing_counts, pairs.missing_counts);
+
+        // No variant carries C at 1:100, two carry A at 1:300, and at 1:400 the only ALT
+        // that is T pairs it with an unlisted allele: all dropped; the explicit pair stays.
+        let skipped = score(
+            "skipped.tsv",
+            "1:100\tC\t.\t1\n1:300\tA\t.\t1\n1:400\tT\tA/G\t1\n1:500\tA\tG\t1\n",
+        );
+        assert_eq!(skipped.sum_scores, [2.0, 1.0]);
+        assert_eq!(skipped.score_variant_counts, [1]);
+    }
+
+    #[test]
+    fn effect_only_positions_straddling_decode_batches_score_like_pairs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Each position has a split pair of records after one unscored record, so a
+        // batch of an even number of records ends between the two records of a position.
+        let positions = 4 * RECORDS_PER_WORKER * rayon::current_num_threads().max(1) + 3;
+        let mut vcf = String::from(
+            "##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts1\ts2\n\
+             1\t50\t.\tC\tT\t.\tPASS\t.\tGT\t0/1\t0/1\n",
+        );
+        let mut pairs = String::from("variant_id\teffect_allele\tother_allele\tS\n");
+        let mut effect_only = pairs.clone();
+        for index in 0..positions {
+            let position = 100 + index;
+            vcf.push_str(&format!(
+                "1\t{position}\t.\tA\tG\t.\tPASS\t.\tGT\t0/1\t1/1\n"
+            ));
+            vcf.push_str(&format!(
+                "1\t{position}\t.\tA\tT\t.\tPASS\t.\tGT\t0/0\t0/1\n"
+            ));
+            let weight = 0.25 + index as f64 * 1e-3;
+            pairs.push_str(&format!(
+                "1:{position}\tG\tA\t{weight}\n1:{position}\tT\tA\t1\n"
+            ));
+            effect_only.push_str(&format!(
+                "1:{position}\tG\t.\t{weight}\n1:{position}\tT\tC/A\t1\n"
+            ));
+        }
+        let vcf_path = dir.path().join("cohort.vcf");
+        std::fs::write(&vcf_path, vcf).expect("write vcf");
+        let pairs_path = dir.path().join("pairs.tsv");
+        let effect_only_path = dir.path().join("effect_only.tsv");
+        std::fs::write(&pairs_path, pairs).expect("write pairs");
+        std::fs::write(&effect_only_path, effect_only).expect("write effect only");
+
+        let expected = score_vcf_streaming(&vcf_path, &[pairs_path], None, None).expect("pairs");
+        let actual =
+            score_vcf_streaming(&vcf_path, &[effect_only_path], None, None).expect("effect only");
+        assert_eq!(actual.sum_scores, expected.sum_scores);
+        assert_eq!(actual.score_variant_counts, expected.score_variant_counts);
+        assert_eq!(expected.score_variant_counts, [2 * positions as u32]);
+    }
+
+    #[test]
+    fn effect_only_rules_refuse_records_at_their_position_that_are_not_adjacent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vcf_path = dir.path().join("unsorted.vcf");
+        let score_path = dir.path().join("score.gnomon.tsv");
+        std::fs::write(
+            &vcf_path,
+            "##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts1\n\
+             1\t100\t.\tA\tG\t.\tPASS\t.\tGT\t0/1\n\
+             1\t200\t.\tC\tT\t.\tPASS\t.\tGT\t0/1\n\
+             1\t100\t.\tA\tT\t.\tPASS\t.\tGT\t0/1\n",
+        )
+        .expect("write vcf");
+        std::fs::write(
+            &score_path,
+            "variant_id\teffect_allele\tother_allele\tS\n1:100\tA\t.\t1\n1:200\tT\tC\t1\n",
+        )
+        .expect("write score");
+        let error = score_vcf_streaming(&vcf_path, &[score_path], None, None)
+            .expect_err("records at 1:100 are split by 1:200");
+        assert!(
+            error.to_string().contains("1:100 are not adjacent"),
+            "{error}"
+        );
     }
 
     #[test]
