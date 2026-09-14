@@ -55,7 +55,10 @@ where
         let _ = fs::remove_file(&temp_path);
         return Err(err);
     }
-    sync_directory(dir);
+    // The directory is deliberately not fsynced. A crash can at worst lose the
+    // rename, which leaves the previous file or none, never a partial one, while
+    // on network filesystems that fsync costs milliseconds per output even for
+    // a table of a few bytes.
     Ok(())
 }
 
@@ -90,18 +93,6 @@ fn create_temp_file(dir: &Path, name: &OsStr) -> io::Result<(PathBuf, File)> {
         ),
     ))
 }
-
-/// Makes the rename itself durable. Best effort: the content is already on
-/// disk, and some filesystems refuse to open or fsync a directory.
-#[cfg(unix)]
-fn sync_directory(dir: &Path) {
-    if let Ok(handle) = File::open(dir) {
-        let _ = handle.sync_all();
-    }
-}
-
-#[cfg(not(unix))]
-fn sync_directory(_dir: &Path) {}
 
 /// `PREFIX.suffix`, the file an `--out PREFIX` run writes for one artifact.
 ///
