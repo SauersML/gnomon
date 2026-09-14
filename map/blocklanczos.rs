@@ -118,6 +118,18 @@
 //! certifies the span of the whole straddling cluster rather than of exactly `k`
 //! columns, reporting through [`BlockKrylovOutcome::truncation_splits_cluster`]
 //! that the requested truncation cuts an eigenspace in half.
+//!
+//! # Boundaries no pass can resolve
+//!
+//! Some clusters are not worth splitting. Ask for ten components of a cohort
+//! with four ancestry axes and the boundary lands in the noise bulk: the
+//! cluster runs far past the guard band, so no widening certifies it, and the
+//! residual at component ten falls too slowly to reach the tolerance before the
+//! pass ceiling. Once the axes above the cluster are at roundoff and the
+//! boundary's own rate, with a generous allowance for acceleration, cannot
+//! reach the tolerance in the passes that remain, the solver stops and reports
+//! exactly what the ceiling would have: `converged = false`, the residual, the
+//! subspace change and the gap.
 
 use faer::linalg::matmul::matmul;
 use faer::prelude::{IntoConst, Reborrow, ReborrowMut};
@@ -143,6 +155,24 @@ const RITZ_SCALE_FLOOR: f64 = 1.0e-12;
 /// columns. Eight is near the minimum of that trade for the block widths this
 /// solver uses (16–64) and sample counts in the hundreds of thousands.
 const ORTHO_PANEL: usize = 8;
+
+/// Passes over which the `k`-th residual's rate is measured before the solver
+/// may conclude that the passes left cannot bring it to the tolerance.
+const UNRESOLVABLE_WINDOW: usize = 4;
+
+/// Factor by which the projection lets the `k`-th residual beat its measured
+/// rate. Krylov convergence accelerates as neighbouring Ritz values settle: on
+/// a 10k-sample, k = 20 fit the mean rate from pass sixteen until the residual
+/// would reach the tolerance was 1.9 times the rate measured over passes
+/// twelve to sixteen. A projection at the measured rate alone would stop fits
+/// that are about to converge.
+const UNRESOLVABLE_ALLOWANCE: f64 = 4.0;
+
+/// Relative residual at or below which a leading Ritz pair counts as resolved.
+/// The certificate bottoms out between `2e-15` and `8e-15` on real and
+/// synthetic cohorts; this leaves two orders of magnitude of headroom and is
+/// far below any `residual_tol` a fit uses.
+const RESOLVED_RESIDUAL: f64 = 1e-12;
 
 /// A covariance operator whose block application costs one data pass.
 pub trait BlockOperator {
@@ -226,6 +256,11 @@ pub struct BlockKrylovParams {
     /// rather than further depth, and certification of the cluster's span
     /// rather than of exactly `k` columns.
     pub cluster_gap: f64,
+    /// Whether to stop as soon as the requested boundary cannot resolve before
+    /// `max_passes`; see `boundary_unresolvable`. On in [`Self::auto`]. What is
+    /// reported is what the ceiling reports at that pass, so switching it off
+    /// changes only how many passes are spent before the same report.
+    pub stop_when_unresolvable: bool,
     /// Fixed PRNG seed. Fits must be reproducible run to run.
     pub seed: u64,
 }
@@ -259,7 +294,9 @@ impl BlockKrylovParams {
     /// ask for a different `k`, not for more passes); the block is too narrow
     /// for the spectrum's decay, so each pass buys too little (widen
     /// `block_width`); or `residual_tol` is tighter than the operator's own
-    /// accuracy can support.
+    /// accuracy can support. The first cause is recognised before the ceiling
+    /// once measured progress shows the passes left cannot help; see
+    /// `boundary_unresolvable`.
     pub fn auto(k: usize, dim: usize, basis_budget_bytes: usize) -> Self {
         let oversample = 32.min(8.max(k.div_ceil(2)));
         let block_width = (k + oversample).clamp(1, dim.max(1));
@@ -271,6 +308,7 @@ impl BlockKrylovParams {
             mev_tol: 1e-6,
             basis_budget_bytes,
             cluster_gap: 1e-3,
+            stop_when_unresolvable: true,
             seed: 0x243F_6A88_85A3_08D3,
         }
     }
@@ -440,6 +478,10 @@ pub fn block_krylov_eigen<Op: BlockOperator>(
         // operator has no factor — this is `None` until the next restart, and
         // the caller forms `Xᵀ·u` with a pass of its own.
         let mut images: Option<Vec<Mat<f64>>> = factor_rows.map(|_| Vec::new());
+        // `(boundary gap, relative residual of the k-th pair)` for every pass
+        // over this basis. A restart changes the recurrence, so a rate measured
+        // across one describes neither basis.
+        let mut boundary_history: Vec<(Option<f64>, f64)> = Vec::new();
 
         for depth in 0..max_depth {
             if passes >= params.max_passes {
@@ -576,11 +618,15 @@ pub fn block_krylov_eigen<Op: BlockOperator>(
                 width,
                 par,
             );
-            let mut max_relative = 0.0f64;
-            for (idx, residual) in residuals.iter().enumerate() {
-                let scale = theta[idx].abs().max(RITZ_SCALE_FLOOR);
-                max_relative = max_relative.max(residual / scale);
-            }
+            let relative: Vec<f64> = residuals
+                .iter()
+                .enumerate()
+                .map(|(idx, residual)| residual / theta[idx].abs().max(RITZ_SCALE_FLOOR))
+                .collect();
+            let max_relative = relative
+                .iter()
+                .fold(0.0f64, |worst, value| worst.max(*value));
+            boundary_history.push((boundary_gap, relative[output - 1]));
 
             let mut coefficients = Mat::<f64>::zeros(dim, guard);
             copy_into(&mut coefficients, s.as_ref(), dim, guard);
@@ -684,6 +730,18 @@ pub fn block_krylov_eigen<Op: BlockOperator>(
                 start = restart_block(&retained, n, width, params.seed, restarts, par);
                 restarts += 1;
                 continue 'restart;
+            }
+
+            // A boundary inside a cluster the remaining passes cannot split:
+            // the ceiling would report this same unconverged subspace, only
+            // later. See `boundary_unresolvable`.
+            if enough_passes
+                && params.stop_when_unresolvable
+                && boundary_unresolvable(&boundary_history, &relative, &theta, output, passes, &params)
+            {
+                let (outcome, _) =
+                    finish(&blocks, images.as_deref(), &current, width, n, restarts, par);
+                return Ok(outcome);
             }
 
             stage = Some(current);
@@ -812,6 +870,77 @@ fn certification_span(theta: &[f64], k: usize, cap: usize, gap_tol: f64) -> (usi
         }
     }
     (end, true)
+}
+
+/// Whether the requested boundary sits in a cluster that the passes left before
+/// the ceiling cannot resolve, so that iterating on would deliver the ceiling's
+/// unconverged report later and change nothing in it that matters.
+///
+/// Ask for ten components of a cohort with four ancestry axes and the boundary
+/// lands in the noise bulk, whose top eigenvalues sit a few parts in ten
+/// thousand apart. The four axes reach roundoff within eight passes. The
+/// residual at component ten falls by about fourteen percent a pass — the
+/// Chebyshev rate for a gap that narrow — and would need some eighty passes to
+/// reach the tolerance, so a 32-pass ceiling spends twenty-four more passes to
+/// report `converged = false` over the same axes.
+///
+/// All three must hold on the latest pass:
+///
+/// * the `k/k+1` gap is below `cluster_gap`, so the truncation cuts a cluster;
+/// * the leading pairs up to the first unresolved one are at the residual
+///   floor, [`RESOLVED_RESIDUAL`], and end at a gap of at least `cluster_gap`,
+///   so the axes above the cluster are already what more passes would return;
+/// * over the last [`UNRESOLVABLE_WINDOW`] passes of this basis the `k`-th
+///   residual fell at a rate that, even multiplied by
+///   [`UNRESOLVABLE_ALLOWANCE`], cannot reach `residual_tol` in the passes
+///   that remain.
+///
+/// The last keeps fits that converge today from stopping early: a cluster that
+/// is resolving shows it in its rate. Nothing about the report changes — the
+/// outcome is the one the ceiling would have produced at this pass, and a
+/// caller that refuses unconverged fits refuses it with the same message.
+fn boundary_unresolvable(
+    history: &[(Option<f64>, f64)],
+    relative: &[f64],
+    theta: &[f64],
+    output: usize,
+    passes: usize,
+    params: &BlockKrylovParams,
+) -> bool {
+    let remaining = params.max_passes.saturating_sub(passes);
+    if remaining == 0 || history.len() <= UNRESOLVABLE_WINDOW {
+        return false;
+    }
+    let (gap, boundary) = history[history.len() - 1];
+    if !gap.is_some_and(|gap| gap < params.cluster_gap) {
+        return false;
+    }
+
+    let resolved = relative
+        .iter()
+        .take(output)
+        .take_while(|residual| **residual <= RESOLVED_RESIDUAL)
+        .count();
+    if resolved == 0 || resolved >= output {
+        return false;
+    }
+    let scale = theta[resolved - 1].abs().max(RITZ_SCALE_FLOOR);
+    if (theta[resolved - 1] - theta[resolved]) / scale < params.cluster_gap {
+        return false;
+    }
+
+    let (_, earlier) = history[history.len() - 1 - UNRESOLVABLE_WINDOW];
+    // Written so that NaN fails: an undefined residual never stops a fit.
+    if !(boundary > params.residual_tol
+        && boundary.is_finite()
+        && earlier > 0.0
+        && earlier.is_finite())
+    {
+        return false;
+    }
+    let rate = (earlier / boundary).ln() / UNRESOLVABLE_WINDOW as f64;
+    (boundary / params.residual_tol).ln()
+        > UNRESOLVABLE_ALLOWANCE * rate.max(0.0) * remaining as f64
 }
 
 /// Deterministic pseudo-random start block with the constant direction removed.
@@ -1740,6 +1869,99 @@ mod tests {
                 assert_eq!(factored.vectors[(row, col)], plain.vectors[(row, col)]);
             }
         }
+    }
+
+    /// Four axes standing clear of a flat bulk whose neighbouring eigenvalues
+    /// are about a part in ten thousand apart: a cohort with four ancestry axes,
+    /// seen by a fit that asks for more components than there is structure.
+    fn axes_over_a_flat_bulk(n: usize) -> Vec<f64> {
+        let mut spectrum = vec![164.0, 162.0, 160.0, 155.0];
+        let bulk = n - spectrum.len();
+        spectrum.extend((0..bulk).map(|i| 2.62 - 0.5 * i as f64 / bulk as f64));
+        spectrum
+    }
+
+    #[test]
+    fn a_boundary_in_the_bulk_stops_with_the_ceilings_report() {
+        // The ceiling would stop this fit unconverged; the solver sees that
+        // coming and stops sooner. It has to return what the ceiling returns at
+        // the same pass, with the axes above the bulk already exact.
+        let n = 1500;
+        let k = 10;
+        let op = reflected(axes_over_a_flat_bulk(n), 23);
+        let params = BlockKrylovParams::auto(k, n, 1 << 30);
+
+        let early = block_krylov_eigen(&op, k, params, Par::Seq).expect("solver runs");
+        assert!(!early.converged);
+        assert!(
+            early.passes < params.max_passes,
+            "ran to the ceiling: {} passes, residual {:.3e}, gap {:?}",
+            early.passes,
+            early.max_relative_residual,
+            early.boundary_gap
+        );
+        assert!(early.boundary_gap.is_some_and(|gap| gap < params.cluster_gap));
+        assert!(early.max_relative_residual > params.residual_tol);
+        assert_values_match(&early.values[..4], &[164.0, 162.0, 160.0, 155.0], 1e-12);
+        let exact = op.exact_basis(4);
+        for col in 0..4 {
+            let overlap: f64 = (0..n).map(|row| exact[(row, col)] * early.vectors[(row, col)]).sum();
+            let sign = overlap.signum();
+            let distance = (0..n)
+                .map(|row| (early.vectors[(row, col)] - sign * exact[(row, col)]).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            assert!(distance <= 1e-10, "axis {col} is {distance:e} from the exact eigenvector");
+        }
+
+        // The rule projects against the passes left, so a lower ceiling stops
+        // sooner still: the ceiling's own report at this pass is the one with
+        // the rule switched off, and without it this fit runs to the ceiling.
+        let mut unstopped = params;
+        unstopped.stop_when_unresolvable = false;
+        let full = block_krylov_eigen(&op, k, unstopped, Par::Seq).expect("unstopped run");
+        assert!(!full.converged);
+        assert_eq!(full.passes, params.max_passes);
+
+        let mut capped = unstopped;
+        capped.max_passes = early.passes;
+        let ceiling = block_krylov_eigen(&op, k, capped, Par::Seq).expect("capped run");
+        assert!(!ceiling.converged);
+        assert_eq!(ceiling.passes, early.passes);
+        assert_eq!(ceiling.restarts, early.restarts);
+        assert_eq!(ceiling.max_relative_residual, early.max_relative_residual);
+        assert_eq!(ceiling.subspace_delta, early.subspace_delta);
+        assert_eq!(ceiling.boundary_gap, early.boundary_gap);
+        assert_eq!(ceiling.certified_components, early.certified_components);
+        assert_eq!(ceiling.truncation_splits_cluster, early.truncation_splits_cluster);
+        assert_eq!(ceiling.values, early.values);
+        for col in 0..early.vectors.ncols() {
+            for row in 0..n {
+                assert_eq!(ceiling.vectors[(row, col)], early.vectors[(row, col)]);
+            }
+        }
+    }
+
+    #[test]
+    fn a_tight_cluster_that_resolves_is_not_stopped() {
+        // The boundary cuts a cluster far tighter than `cluster_gap`, but the
+        // cluster stands clear of everything below it, so a few passes resolve
+        // it. A small gap alone must never stop a fit.
+        let n = 1500;
+        let mut spectrum = vec![10.0, 9.0, 8.0, 7.0];
+        spectrum.extend((0..12).map(|i| 5.0 - 1e-3 * i as f64));
+        let rest = n - spectrum.len();
+        spectrum.extend((0..rest).map(|i| 0.5 * 0.99f64.powi(i as i32)));
+        let op = reflected(spectrum, 29);
+        let params = BlockKrylovParams::auto(6, n, 1 << 30);
+
+        let outcome = block_krylov_eigen(&op, 6, params, Par::Seq).expect("solver runs");
+        assert!(
+            outcome.converged,
+            "stopped unconverged after {} passes, residual {:.3e}",
+            outcome.passes, outcome.max_relative_residual
+        );
+        assert!(outcome.passes < params.max_passes);
     }
 
     #[test]

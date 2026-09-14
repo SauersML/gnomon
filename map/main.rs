@@ -48,8 +48,10 @@ pub enum MapCommand {
         /// the command makes thread control explicit instead of relying on a
         /// process environment variable that schedulers may not propagate.
         threads: Option<usize>,
-        /// Accept the solver's best available estimate at its bounded pass
-        /// limit. Diagnostics still mark the resulting model unconverged.
+        /// Accept the solver's best available estimate when it stops without
+        /// converging: at its bounded pass limit, or sooner once the requested
+        /// boundary cannot resolve before it. Diagnostics still mark the
+        /// resulting model unconverged.
         allow_unconverged: bool,
         /// Ceiling on eigensolver genome passes; `None` takes the solver default.
         max_passes: Option<usize>,

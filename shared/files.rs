@@ -1,6 +1,8 @@
 use crate::adapt_plink2::GenomeBuild;
 use crate::pipeline_error::PipelineError;
-use crate::range_fetch::{BedReadPlan, PlannedReader, SegmentFetch, fetch_cache_block};
+use crate::range_fetch::{
+    BedReadPlan, PlannedReader, SegmentFetch, fetch_cache_block, fetch_whole_object,
+};
 use google_cloud_auth::credentials::{
     CacheableResource, Credentials, anonymous::Builder as AnonymousCredentials,
 };
@@ -227,6 +229,8 @@ pub struct BedSource {
     mmap: Option<Arc<Mmap>>,
     /// Exact range requests against a remote `.bed`, from which read plans are built.
     fetch: Option<SegmentFetch>,
+    /// Every byte of a remote `.bed` that was read whole when opened.
+    whole: Option<Arc<Vec<u8>>>,
 }
 
 impl BedSource {
@@ -235,6 +239,7 @@ impl BedSource {
             byte_source,
             mmap,
             fetch: None,
+            whole: None,
         }
     }
 
@@ -243,6 +248,7 @@ impl BedSource {
             byte_source,
             mmap: None,
             fetch: None,
+            whole: None,
         }
     }
 
@@ -260,7 +266,11 @@ impl BedSource {
             return Ok(self.clone());
         };
         let plan = BedReadPlan::new(rows, row_bytes, self.len())?;
-        Ok(self.with_reader(PlannedReader::new(plan, Arc::clone(fetch))))
+        Ok(self.with_reader(PlannedReader::with_limits(
+            plan,
+            Arc::clone(fetch),
+            crate::range_fetch::remote_limits(),
+        )))
     }
 
     fn with_reader(&self, reader: PlannedReader) -> Self {
@@ -271,6 +281,7 @@ impl BedSource {
             }),
             mmap: None,
             fetch: self.fetch.clone(),
+            whole: None,
         }
     }
 
@@ -282,13 +293,20 @@ impl BedSource {
         self.mmap.as_ref().map(Arc::clone)
     }
 
+    /// `len` bytes from `offset`, borrowed without a read: from the local
+    /// mapping, or from a remote `.bed` read whole when opened, so that both
+    /// decode on the same path. [`Self::mmap`] stays local-only.
     pub fn mmap_slice(&self, offset: usize, len: usize) -> Option<&[u8]> {
-        let mmap = self.mmap.as_ref()?;
+        let bytes: &[u8] = match (&self.mmap, &self.whole) {
+            (Some(mmap), _) => mmap,
+            (None, Some(whole)) => whole,
+            (None, None) => return None,
+        };
         let end = offset.checked_add(len)?;
-        if end > mmap.len() {
+        if end > bytes.len() {
             return None;
         }
-        Some(&mmap[offset..end])
+        Some(&bytes[offset..end])
     }
 
     pub fn len(&self) -> u64 {
@@ -366,18 +384,21 @@ pub fn open_bed_source(
     }
 }
 
-/// A remote `.bed` no larger than one block is read whole when opened: one
-/// request serves its header and every row, as the block reader's first block
-/// did, and no plan can need fewer. A larger one keeps its range fetcher so
-/// that callers can plan exact row reads, and its header is checked with one
-/// three-byte request rather than a block of genotypes.
+/// A remote `.bed` no larger than one block, and within the prefetch window
+/// this machine's memory allows, is read whole when opened: one request serves
+/// its header and every row, as the block reader's first block did, no plan
+/// can need fewer, and its payload is then borrowed like a local mapping. A
+/// larger one keeps its range fetcher so that callers can plan exact row reads,
+/// and its header is checked with one three-byte request rather than a block
+/// of genotypes.
 fn remote_bed_source(
     path: &Path,
     byte_source: Arc<dyn ByteRangeSource>,
     fetch: SegmentFetch,
 ) -> Result<BedSource, PipelineError> {
     let len = byte_source.len();
-    let whole = len <= REMOTE_BLOCK_SIZE as u64;
+    let window = crate::range_fetch::remote_limits().window_bytes as u64;
+    let whole = len <= (REMOTE_BLOCK_SIZE as u64).min(window);
     let header = match len {
         0..3 => Vec::new(),
         _ if whole => fetch(0, len as usize)?,
@@ -385,15 +406,21 @@ fn remote_bed_source(
     };
     validate_plink_bed_header(&header, path).map_err(PipelineError::Io)?;
     if whole {
-        return Ok(BedSource::new(
-            Arc::new(MemoryByteRangeSource { bytes: header }),
-            None,
-        ));
+        let bytes = Arc::new(header);
+        return Ok(BedSource {
+            byte_source: Arc::new(MemoryByteRangeSource {
+                bytes: Arc::clone(&bytes),
+            }),
+            mmap: None,
+            fetch: None,
+            whole: Some(bytes),
+        });
     }
     Ok(BedSource {
         byte_source,
         mmap: None,
         fetch: Some(fetch),
+        whole: None,
     })
 }
 
@@ -403,7 +430,11 @@ fn planned_reader(
     rows: &[u64],
     row_bytes: u64,
 ) -> Result<PlannedReader, PipelineError> {
-    let reader = PlannedReader::new(BedReadPlan::new(rows, row_bytes, len)?, fetch);
+    let reader = PlannedReader::with_limits(
+        BedReadPlan::new(rows, row_bytes, len)?,
+        fetch,
+        crate::range_fetch::remote_limits(),
+    );
     eprintln!(
         "> Remote BED read plan: {} required rows of {row_bytes} B in {} ranges; up to {} concurrent requests.",
         rows.len(),
@@ -958,25 +989,130 @@ pub fn open_text_source(path: &Path) -> Result<Box<dyn TextSource>, PipelineErro
             .to_str()
             .ok_or_else(|| PipelineError::Io("Invalid UTF-8 in path".to_string()))?;
         let (bucket, object) = parse_gcs_uri(uri)?;
-        let remote = RemoteByteRangeSource::new(&bucket, &object)?;
-        let source: Arc<dyn ByteRangeSource> = Arc::new(remote);
-        Ok(Box::new(StreamingTextSource::new(
-            format!("gs://{bucket}/{object}"),
-            source,
-        )))
+        remote_text_source(format!("gs://{bucket}/{object}"), || {
+            let remote = RemoteByteRangeSource::new(&bucket, &object)?;
+            let fetcher = Arc::clone(&remote.fetcher);
+            let fetch: SegmentFetch = Arc::new(move |start, length| fetcher.fetch(start, length));
+            Ok((Arc::new(remote), fetch))
+        })
     } else if is_http_path(path) {
         let url = path
             .to_str()
             .ok_or_else(|| PipelineError::Io("Invalid UTF-8 in path".to_string()))?;
-        let remote = HttpByteRangeSource::new(url)?;
-        Ok(Box::new(StreamingTextSource::new(
-            url.to_string(),
-            Arc::new(remote),
-        )))
+        remote_text_source(url.to_string(), || {
+            let remote = HttpByteRangeSource::new(url)?;
+            let fetcher = Arc::clone(&remote.fetcher);
+            let fetch: SegmentFetch = Arc::new(move |start, length| fetcher.fetch(start, length));
+            Ok((Arc::new(remote), fetch))
+        })
     } else {
         let file = File::open(path)
             .map_err(|e| PipelineError::Io(format!("Opening {}: {e}", path.display())))?;
         Ok(Box::new(LocalTextSource::new(path, file)?))
+    }
+}
+
+/// Remote text objects within [`remote_text_budget`] are read whole, in
+/// concurrent parts, and kept for the rest of the process. One command reads
+/// the same `.bim` several times (counting, keying, matching), and every reread
+/// would otherwise repeat a length probe and a serial sweep of blocks. Larger
+/// objects, such as a sequencing `.pvar`, stream block by block.
+const REMOTE_TEXT_WHOLE_LIMIT: u64 = 256 * 1024 * 1024;
+
+/// The largest remote text object read whole: an eighth of the memory available
+/// when first asked, and never above [`REMOTE_TEXT_WHOLE_LIMIT`], which also
+/// bounds the concurrent parts of one download. A machine whose memory limit
+/// cannot be established streams every object.
+fn remote_text_budget() -> u64 {
+    static BUDGET: OnceLock<u64> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let (_, available) = crate::memory::memory_bytes();
+        (available / 8).min(REMOTE_TEXT_WHOLE_LIMIT)
+    })
+}
+
+/// Remote text objects already read whole, by location.
+static REMOTE_TEXT_OBJECTS: OnceLock<Mutex<HashMap<String, Arc<Vec<u8>>>>> = OnceLock::new();
+
+fn remote_text_source<F>(location: String, open: F) -> Result<Box<dyn TextSource>, PipelineError>
+where
+    F: FnOnce() -> Result<(Arc<dyn ByteRangeSource>, SegmentFetch), PipelineError>,
+{
+    let objects = REMOTE_TEXT_OBJECTS.get_or_init(Default::default);
+    let cached = objects.lock().unwrap().get(&location).cloned();
+    let source: Arc<dyn ByteRangeSource> = match cached {
+        Some(bytes) => Arc::new(WholeTextObject {
+            location: location.clone(),
+            len: bytes.len() as u64,
+            fetch: None,
+            bytes: OnceLock::from(bytes),
+        }),
+        None => {
+            let (source, fetch) = open()?;
+            if source.len() > remote_text_budget() {
+                source
+            } else {
+                Arc::new(WholeTextObject {
+                    location: location.clone(),
+                    len: source.len(),
+                    fetch: Some(fetch),
+                    bytes: OnceLock::new(),
+                })
+            }
+        }
+    };
+    Ok(Box::new(StreamingTextSource::new(location, source)))
+}
+
+/// A remote text object downloaded whole on its first read, which later opens
+/// of the same location then share.
+struct WholeTextObject {
+    location: String,
+    len: u64,
+    fetch: Option<SegmentFetch>,
+    bytes: OnceLock<Arc<Vec<u8>>>,
+}
+
+impl ByteRangeSource for WholeTextObject {
+    fn len(&self) -> u64 {
+        self.len
+    }
+
+    fn read_at(&self, offset: u64, dst: &mut [u8]) -> Result<(), PipelineError> {
+        let bytes = match (self.bytes.get(), &self.fetch) {
+            (Some(bytes), _) => bytes,
+            (None, Some(fetch)) => {
+                let bytes = Arc::new(fetch_whole_object(self.len, fetch)?);
+                let mut objects = REMOTE_TEXT_OBJECTS.get_or_init(Default::default).lock().unwrap();
+                // Kept objects stay within twice the per-object budget in total,
+                // so a long-lived process that reads many filesets stays bounded.
+                let kept: u64 = objects.values().map(|kept| kept.len() as u64).sum();
+                if kept + self.len <= 2 * remote_text_budget() {
+                    objects.insert(self.location.clone(), Arc::clone(&bytes));
+                }
+                drop(objects);
+                self.bytes.get_or_init(|| bytes)
+            }
+            (None, None) => {
+                return Err(PipelineError::Io(format!(
+                    "Remote text object {} has neither bytes nor a fetcher",
+                    self.location
+                )));
+            }
+        };
+        let range = usize::try_from(offset)
+            .ok()
+            .and_then(|start| Some(start..start.checked_add(dst.len())?))
+            .filter(|range| range.end <= bytes.len())
+            .ok_or_else(|| {
+                PipelineError::Io(format!(
+                    "Attempted to read past end of {} (offset {offset}, len {})",
+                    self.location,
+                    dst.len()
+                ))
+            })?;
+        dst.copy_from_slice(&bytes[range]);
+        Ok(())
     }
 }
 
@@ -1544,7 +1680,7 @@ impl ByteRangeSource for MmapByteRangeSource {
 
 /// A remote object small enough to have been read whole, served from memory.
 struct MemoryByteRangeSource {
-    bytes: Vec<u8>,
+    bytes: Arc<Vec<u8>>,
 }
 
 impl ByteRangeSource for MemoryByteRangeSource {
@@ -2804,12 +2940,52 @@ mod tests {
             .expect("small remote BED");
         server.join().expect("one length probe and one whole-object range");
         assert!(!source.supports_read_plan());
+        // The payload is borrowed like a mapping, so decoding takes the local
+        // path, while the source still does not claim to be a local file.
+        assert!(source.mmap().is_none());
+        assert_eq!(source.mmap_slice(3, 8), Some(&b"abcdefgh"[..]));
+        assert_eq!(source.mmap_slice(7, 5), None);
         let mut row = [0; 4];
         source.read_at(3, &mut row).expect("unrequired row from memory");
         assert_eq!(&row, b"abcd");
         source.read_at(7, &mut row).expect("required row from memory");
         assert_eq!(&row, b"efgh");
         assert!(source.read_at(9, &mut row).is_err());
+    }
+
+    #[test]
+    fn remote_text_objects_are_read_whole_once_per_process() {
+        let body = "1\trs1\t0\t10\tA\tG\r\n1\trs2\t0\t20\tC\tT";
+        let (url, server) = serve_http_responses(vec![
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            ),
+            format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-{}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len() - 1,
+                body.len(),
+                body.len()
+            ),
+        ]);
+        let read_lines = |mut source: Box<dyn TextSource>| {
+            let mut lines = Vec::new();
+            while let Some(line) = source.next_line().expect("line") {
+                lines.push(String::from_utf8(line.to_vec()).expect("UTF-8"));
+            }
+            lines
+        };
+        let expected = ["1\trs1\t0\t10\tA\tG", "1\trs2\t0\t20\tC\tT"];
+        assert_eq!(
+            read_lines(open_text_source(Path::new(&url)).expect("remote text")),
+            expected
+        );
+        server.join().expect("one length probe and one whole-object range");
+        // The server has stopped accepting, so a second open must not request.
+        assert_eq!(
+            read_lines(open_text_source(Path::new(&url)).expect("cached text")),
+            expected
+        );
     }
 
     #[test]

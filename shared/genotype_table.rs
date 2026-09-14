@@ -7,6 +7,20 @@ pub(crate) const VARIANTS_PER_TABLE: usize = 4;
 pub(crate) const TABLE_ROWS: usize = 256;
 pub(crate) const TABLE_BUDGET_BYTES: usize = 256 * 1024;
 pub(crate) const SAMPLE_TILE: usize = 1024;
+/// Rows up to this many outputs are accumulated in at most eight four-wide
+/// register lanes. Wider rows leave at most three groups in a table tile, too
+/// few to repay loading the row into lanes.
+pub(crate) const REGISTER_COLUMNS: usize = 32;
+
+/// Table row width for `columns` outputs. Rows the lane accumulator takes are
+/// padded to whole lanes; padding columns stay zero and are never read back.
+pub(crate) fn table_columns(columns: usize) -> usize {
+    if columns <= REGISTER_COLUMNS {
+        columns.div_ceil(4) * 4
+    } else {
+        columns
+    }
+}
 
 #[inline(always)]
 pub(crate) fn add_row(dst: &mut [f64], src: &[f64]) {
@@ -64,6 +78,20 @@ pub(crate) fn transpose_calls(bytes: [u8; 4]) -> [u8; 4] {
 pub(crate) fn consecutive_keys(bytes: &[&[u8]], sample_start: usize, keys: &mut [u8]) {
     assert!(bytes.len() <= VARIANTS_PER_TABLE);
     assert_eq!(sample_start % 4, 0);
+    if let &[a, b, c, d] = bytes {
+        // Four byte runs of the key count's length let the transposition vectorize.
+        let (whole, tail) = keys.as_chunks_mut::<4>();
+        let (start, end) = (sample_start / 4, sample_start / 4 + whole.len());
+        let (a, b, c, d) = (&a[start..end], &b[start..end], &c[start..end], &d[start..end]);
+        for (index, dst) in whole.iter_mut().enumerate() {
+            *dst = transpose_calls([a[index], b[index], c[index], d[index]]);
+        }
+        let offset = sample_start + 4 * whole.len();
+        for (sample, key) in tail.iter_mut().enumerate() {
+            *key = selected_key(bytes, offset + sample);
+        }
+        return;
+    }
     for (byte, dst) in keys.chunks_mut(4).enumerate() {
         if dst.len() < 4 {
             for (sample, key) in dst.iter_mut().enumerate() {
@@ -94,6 +122,77 @@ pub(crate) fn missing_bits(key: u8) -> u8 {
     key & !(key >> 1) & 0x55
 }
 
+/// `scores[sample] += tables[group][keys[group][sample]]` for every group in
+/// order, with `keys` group-major and `tables` padded by `table_columns`. Each
+/// row is loaded into register lanes and stored once instead of once per group;
+/// the additions keep their order, so every sum is bit-identical to adding the
+/// rows in place.
+pub(crate) fn accumulate_rows(
+    keys: &[u8],
+    groups: usize,
+    tables: &[f64],
+    columns: usize,
+    scores: &mut [f64],
+) {
+    assert!((1..=REGISTER_COLUMNS).contains(&columns));
+    macro_rules! shapes {
+        ($($lanes:literal)*) => {
+            match (columns.div_ceil(4), columns % 4) {
+                $(
+                    ($lanes, 0) => accumulate_shape::<$lanes, 0>(keys, groups, tables, scores),
+                    ($lanes, 1) => accumulate_shape::<$lanes, 1>(keys, groups, tables, scores),
+                    ($lanes, 2) => accumulate_shape::<$lanes, 2>(keys, groups, tables, scores),
+                    ($lanes, 3) => accumulate_shape::<$lanes, 3>(keys, groups, tables, scores),
+                )*
+                _ => unreachable!("row widths are checked above"),
+            }
+        };
+    }
+    shapes!(1 2 3 4 5 6 7 8);
+}
+
+/// Rows of `4 * LANES` columns less the padding of a `TAIL`-column last lane, so
+/// every lane load and store has a constant size.
+#[inline(always)]
+fn accumulate_shape<const LANES: usize, const TAIL: usize>(
+    keys: &[u8],
+    groups: usize,
+    tables: &[f64],
+    scores: &mut [f64],
+) {
+    let whole = if TAIL == 0 { LANES } else { LANES - 1 };
+    let columns = 4 * whole + TAIL;
+    let width = 4 * LANES;
+    let table_len = TABLE_ROWS * width;
+    let samples = scores.len() / columns;
+    assert!(keys.len() >= groups * samples && tables.len() >= groups * table_len);
+    // Indexed loops with constant trip counts rather than iterator adapters,
+    // which a build without LTO can leave out of line inside this loop.
+    for (sample, row) in scores.chunks_exact_mut(columns).enumerate() {
+        let mut acc = [Simd::<f64, 4>::splat(0.0); LANES];
+        let (lanes, tail) = row.as_chunks_mut::<4>();
+        for lane in 0..whole {
+            acc[lane] = Simd::from_array(lanes[lane]);
+        }
+        for column in 0..TAIL {
+            acc[whole][column] = tail[column];
+        }
+        for group in 0..groups {
+            let key = keys[group * samples + sample] as usize;
+            let (src, _) = tables[group * table_len + key * width..][..width].as_chunks::<4>();
+            for lane in 0..LANES {
+                acc[lane] += Simd::from_array(src[lane]);
+            }
+        }
+        for lane in 0..whole {
+            lanes[lane] = acc[lane].to_array();
+        }
+        for column in 0..TAIL {
+            tail[column] = acc[whole][column];
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,6 +219,60 @@ mod tests {
             consecutive_keys(&sources, 0, &mut keys);
             for sample in 0..n {
                 assert_eq!(keys[sample], selected_key(&sources, sample));
+            }
+        }
+    }
+
+    #[test]
+    fn four_variant_keys_match_selected_keys_after_a_tile_offset() {
+        let data: Vec<Vec<u8>> = (0..4u32)
+            .map(|variant| (0..64u32).map(|byte| (byte * 37 + variant * 101) as u8).collect())
+            .collect();
+        let sources: Vec<&[u8]> = data.iter().map(Vec::as_slice).collect();
+        for sample_start in [0, 4, 64] {
+            for n in 1..=(256 - sample_start).min(129) {
+                let mut keys = vec![0; n];
+                consecutive_keys(&sources, sample_start, &mut keys);
+                for sample in 0..n {
+                    assert_eq!(keys[sample], selected_key(&sources, sample_start + sample));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn accumulated_rows_equal_in_place_additions_bit_for_bit() {
+        for columns in 1..=REGISTER_COLUMNS {
+            let width = table_columns(columns);
+            for groups in [1, 3] {
+                let samples = 37;
+                let tables: Vec<f64> = (0..groups * TABLE_ROWS * width)
+                    .map(|i| {
+                        if i % width < columns {
+                            ((i * 7919) % 1009) as f64 / 3.0 - 150.0
+                        } else {
+                            0.0
+                        }
+                    })
+                    .collect();
+                let keys: Vec<u8> = (0..groups * samples).map(|i| (i * 151 % 256) as u8).collect();
+                let initial: Vec<f64> = (0..samples * columns).map(|i| (i % 13) as f64 / 7.0).collect();
+                let mut expected = initial.clone();
+                for group in 0..groups {
+                    for sample in 0..samples {
+                        let key = keys[group * samples + sample] as usize;
+                        add_row(
+                            &mut expected[sample * columns..(sample + 1) * columns],
+                            &tables[(group * TABLE_ROWS + key) * width..][..columns],
+                        );
+                    }
+                }
+                let mut actual = initial;
+                accumulate_rows(&keys, groups, &tables, columns, &mut actual);
+                assert!(
+                    actual.iter().zip(&expected).all(|(a, e)| a.to_bits() == e.to_bits()),
+                    "{columns} columns, {groups} groups"
+                );
             }
         }
     }
