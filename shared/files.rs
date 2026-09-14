@@ -593,6 +593,7 @@ pub fn positional_reads_fit_better(needed_bytes: u64, available_bytes: u64) -> b
 
 /// Prefetch window for planned local reads: a sixty-fourth of the headroom, at least
 /// four maximal ranges and at most 256 MiB.
+#[cfg(any(unix, test))]
 fn local_read_window(available_bytes: u64) -> usize {
     usize::try_from(available_bytes / 64)
         .unwrap_or(usize::MAX)
