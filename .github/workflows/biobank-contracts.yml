@@ -2,6 +2,12 @@ name: Biobank workflow contracts
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'examples/biobank/**'
+      - 'sims/ancestry_calibration/**'
+      - '.github/workflows/biobank-contracts.yml'
   pull_request:
     paths:
       - 'examples/biobank/**'

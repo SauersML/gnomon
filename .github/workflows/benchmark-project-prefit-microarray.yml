@@ -2,18 +2,10 @@ name: Benchmark Project Prefit Microarray
 
 on:
   workflow_dispatch:
-  push:
-    # See release-fit.yml: without a branch filter this heavy benchmark runs
-    # on every branch push and starves the test workflow for runners.
-    branches: [main]
-    paths:
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "map/**"
-      # Same reasoning as test.yml: a README change should not start a benchmark.
-      - "!**/*.md"
-      - "scripts/benchmark_project_prefit_microarray.py"
-      - ".github/workflows/benchmark-project-prefit-microarray.yml"
+  # A run takes about 1.5 h and main gets a push every few minutes, so on push
+  # nearly every run was cancelled by the next one. Scheduled runs use main.
+  schedule:
+    - cron: '17 7 * * *'
   pull_request:
     paths:
       - "Cargo.toml"
