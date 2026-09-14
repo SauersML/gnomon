@@ -27,7 +27,6 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
-use sysinfo::System;
 
 /// High-level commands that can be executed within the `map` module.
 #[derive(Debug)]
@@ -1288,12 +1287,6 @@ fn format_id_sample(ids: &[&str]) -> String {
 const VCF_MATERIALIZATION_BUDGET_NUMERATOR: u64 = 1;
 const VCF_MATERIALIZATION_BUDGET_DENOMINATOR: u64 = 3;
 
-/// Budget used when the platform reports no memory at all. Matching the score
-/// pipeline's fallback rather than guessing high: on a machine that will not
-/// say how much memory it has, an optimistic budget is indistinguishable from
-/// the OOM this whole path exists to avoid.
-const VCF_MATERIALIZATION_FALLBACK_BUDGET_BYTES: u64 = 8 * 1024 * 1024 * 1024;
-
 /// Bytes a dense `f64` copy of an `n_samples × n_variants` genotype matrix
 /// occupies.
 ///
@@ -1312,20 +1305,14 @@ fn materialized_matrix_bytes(n_samples: usize, n_variants: usize) -> u128 {
 /// Derived from *available* rather than total memory: the fit is not the only
 /// thing on the machine, and on a shared node the difference between the two is
 /// the difference between a fit that finishes and a fit that is killed. This is
-/// the operating system's own view, so a cgroup that is not reflected in it
-/// (an unusual container configuration) can still under-report pressure — the
-/// scan's incremental ceiling is what keeps that from becoming an OOM.
+/// intersected host and cgroup headroom, so scheduler/container memory ceilings
+/// constrain materialization even on a much larger host.
 fn vcf_materialization_budget_bytes() -> u128 {
-    let mut system = System::new();
-    system.refresh_memory();
-    let available = system.available_memory();
-    let budget = if available > 0 {
+    let (_, available) = crate::memory::memory_bytes();
+    u128::from(
         available.saturating_mul(VCF_MATERIALIZATION_BUDGET_NUMERATOR)
-            / VCF_MATERIALIZATION_BUDGET_DENOMINATOR
-    } else {
-        VCF_MATERIALIZATION_FALLBACK_BUDGET_BYTES
-    };
-    u128::from(budget.max(1))
+            / VCF_MATERIALIZATION_BUDGET_DENOMINATOR,
+    )
 }
 
 fn format_gib(bytes: u128) -> String {

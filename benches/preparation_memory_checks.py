@@ -3,6 +3,7 @@ import subprocess
 from build_cached_probe import build, root
 
 source = '#![feature(portable_simd)]\n'
+source += '#[path="%s"] pub mod memory;\n' % (root/'src/shared/memory.rs')
 source += 'pub use gnomon::{adapt_plink2, pipeline_error};\npub mod shared { pub use gnomon::files; }\n'
 source += '#[allow(dead_code)]\n#[path="%s"] pub mod genotype_table;\n' % (root/'src/shared/genotype_table.rs')
 for name in ['batch', 'io', 'pipeline', 'prepare']:

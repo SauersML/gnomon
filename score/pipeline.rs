@@ -26,6 +26,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(not(target_os = "linux"))]
 use sysinfo::ProcessRefreshKind;
+#[cfg(not(target_os = "linux"))]
 use sysinfo::System;
 
 // --- Pipeline Tuning Parameters ---
@@ -275,13 +276,8 @@ fn concurrent_gnomon_processes() -> u64 {
 }
 
 fn default_max_ram_bytes() -> usize {
-    let mut system = System::new();
-    system.refresh_memory();
-    memory_budget_from_system(
-        system.available_memory(),
-        system.total_memory(),
-        concurrent_gnomon_processes(),
-    )
+    let (total, available) = crate::memory::memory_bytes();
+    memory_budget_from_system(available, total, concurrent_gnomon_processes())
 }
 
 fn memory_budget_from_system(available: u64, total: u64, siblings: u64) -> usize {

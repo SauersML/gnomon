@@ -31,6 +31,33 @@ them and manually calculated simple/complex dosages across single/split
 filesets, keep subsets, missing calls, and partial packed bytes. The warm
 production library and CLI builds passed on MSI.
 
+The subsequent memory revision intersects host RAM with Linux cgroup v1/v2
+limits and remaining charged headroom at every visible ancestor. Score, PCA
+fit, and VCF materialization share this detection. Unknown limit data fails
+closed. PCA no longer interprets zero availability as total RAM, invents an
+8 GiB pool, or raises small budgets to fixed floors totaling 1 GiB. Thirty-one
+focused tests pass with the new detector, including exhausted and nested
+limits, missing usage data, escaped mount paths, and disabled controllers.
+The production library build passed using the warm MSI cache.
+
+A subsequent warm CLI check completed the same full-marker PGS000018 workload
+at larger cohort sizes:
+
+| People | Wall time | Pipeline time | Peak RSS |
+| ---: | ---: | ---: | ---: |
+| 1 | 1.355 s | 22.15 ms | 24.1 MiB |
+| 51,200 | 11.703 s | 10.45 s | 249.4 MiB |
+| 204,800 | 21.481 s | 19.73 s | 443.0 MiB |
+
+Every result in both replicated cohorts was compared with the original
+3,200-person seed: maximum absolute difference 1.251e-12, identical missing
+percentages. Single-person output remains byte-identical. Both larger runs
+finished below the 45-second cap. These are warm shared-storage checks of the
+combined main improvements; they do not isolate individual changes or measure
+wide panels, imputed whole-genome sequencing, or independent biobank diversity.
+The PCA entry point also rejects a physical cohort whose minimum one-variant
+decode scratch cannot fit, before opening or decoding the source.
+
 This closes specific allocation risks; it is not a universal no-OOM guarantee.
 Preparation allocation, allocator overhead, and memory consumed concurrently
 by other processes still need broader accounting and stress validation.

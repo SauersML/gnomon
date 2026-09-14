@@ -33,6 +33,9 @@ pub mod files;
 pub mod output;
 
 #[cfg(any(feature = "score", feature = "map", feature = "terms"))]
+pub mod memory;
+
+#[cfg(any(feature = "score", feature = "map", feature = "terms"))]
 mod range_fetch;
 
 #[cfg(any(feature = "score", feature = "map", feature = "terms"))]

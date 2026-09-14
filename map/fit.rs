@@ -39,7 +39,6 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use sysinfo::System;
 
 pub const HWE_VARIANCE_EPSILON: f64 = 1.0e-12;
 pub const HWE_SCALE_FLOOR: f64 = 1.0e-6;
@@ -65,11 +64,6 @@ pub const EIGENVALUE_EPSILON: f64 = 1.0e-9;
 pub const DEFAULT_BLOCK_WIDTH: usize = 512;
 const DENSE_EIGEN_FALLBACK_THRESHOLD: usize = 64;
 const MAX_PARTIAL_COMPONENTS: usize = 512;
-/// Pool assumed when the machine refuses to report its own memory.
-const FALLBACK_MEMORY_POOL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
-const MIN_GRAM_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
-const MIN_KRYLOV_BASIS_BYTES: u64 = 256 * 1024 * 1024;
-const MIN_STREAMING_TILE_BYTES: u64 = 256 * 1024 * 1024;
 /// Samples above which the dense reference is never selected, whatever the work
 /// estimate says: past this its n³ eigendecomposition is minutes to hours and
 /// its n×n allocation is hundreds of megabytes duplicating data the streaming
@@ -155,51 +149,19 @@ fn fit_memory_plan() -> &'static FitMemoryPlan {
 }
 
 fn compute_fit_memory_plan() -> FitMemoryPlan {
-    let (pool, cache_allowed) = match detect_memory_bytes() {
-        Some((total, available)) => {
-            // `available` already discounts what other processes hold; clamp it
-            // to `total` in case the two are reported inconsistently.
-            let usable = available.clamp(1, total);
-            (
-                usable.saturating_mul(FIT_POOL_PERCENT_OF_AVAILABLE) / 100,
-                true,
-            )
-        }
-        // Nothing measurable: assume a modest pool and refuse to cache the
-        // source, the one share whose overshoot buys only speed.
-        None => (FALLBACK_MEMORY_POOL_BYTES, false),
-    };
-
-    let share = |percent: u64, floor: u64| -> usize {
-        let bytes = (pool.saturating_mul(percent) / 100).max(floor);
+    let (total, available) = crate::memory::memory_bytes();
+    let pool = available.min(total).saturating_mul(FIT_POOL_PERCENT_OF_AVAILABLE) / 100;
+    let share = |percent: u64| -> usize {
+        let bytes = pool.saturating_mul(percent) / 100;
         bytes.min(usize::MAX as u64) as usize
     };
 
     FitMemoryPlan {
-        gram_bytes: share(GRAM_SHARE_PERCENT, MIN_GRAM_BUDGET_BYTES),
-        source_cache_bytes: if cache_allowed {
-            share(SOURCE_CACHE_SHARE_PERCENT, 0)
-        } else {
-            0
-        },
-        krylov_basis_bytes: share(KRYLOV_BASIS_SHARE_PERCENT, MIN_KRYLOV_BASIS_BYTES),
-        streaming_tile_bytes: share(STREAMING_TILE_SHARE_PERCENT, MIN_STREAMING_TILE_BYTES),
+        gram_bytes: share(GRAM_SHARE_PERCENT),
+        source_cache_bytes: share(SOURCE_CACHE_SHARE_PERCENT),
+        krylov_basis_bytes: share(KRYLOV_BASIS_SHARE_PERCENT),
+        streaming_tile_bytes: share(STREAMING_TILE_SHARE_PERCENT),
     }
-}
-
-/// `(total, available)` bytes, or `None` when the platform reports neither.
-///
-/// A platform that reports a total but no availability is treated as "all of it
-/// is available": zero there means "unsupported", not "the machine is full".
-fn detect_memory_bytes() -> Option<(u64, u64)> {
-    let mut system = System::new();
-    system.refresh_memory();
-    let total = system.total_memory();
-    if total == 0 {
-        return None;
-    }
-    let available = system.available_memory();
-    Some((total, if available == 0 { total } else { available }))
 }
 
 fn gram_matrix_budget_bytes() -> usize {
@@ -3290,6 +3252,19 @@ impl HwePcaModel {
 
         let max_rank = n_samples.saturating_sub(1);
         let target_components = components.min(max_rank);
+
+        // Even streaming must hold one variant in its two decode buffers and
+        // projection scratch. Refuse an impossible floor before allocating;
+        // choosing a one-variant tile cannot make an exhausted budget safe.
+        if source
+            .block_storage_samples()
+            .checked_mul(3 * std::mem::size_of::<f64>())
+            .is_none_or(|bytes| bytes > streaming_tile_budget_bytes())
+        {
+            return Err(HwePcaError::InvalidInput(
+                "PCA memory budget cannot hold one streamed variant; reduce the cohort or increase the memory limit",
+            ));
+        }
 
         let parallelism_guard = ParallelismGuard::new();
         let par = parallelism_guard.active_parallelism();
