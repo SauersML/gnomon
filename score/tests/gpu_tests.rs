@@ -1,16 +1,23 @@
+use gnomon::pipeline::{self, PipelineContext};
+use gnomon::prepare::prepare_for_computation;
+use gnomon::reformat::sort_native_file;
+use gnomon::score::cuda_backend::try_run_cuda;
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 use tempfile::tempdir;
 
 const PLINK_MAGIC_HEADER: [u8; 3] = [0x6c, 0x1b, 0x01];
 const CPU_FALLBACK_THRESHOLD: usize = 100_000;
-// GPU/CPU reductions may differ in operation order, so tiny FP drift is expected.
-const SCORE_MATCH_ABS_EPSILON: f64 = 1.0e-6;
-const SCORE_MATCH_REL_EPSILON: f64 = 1.0e-6;
+// The CUDA backend accumulates in f32, so its sums drift from the CPU's by a few f32
+// ulps per variant (1.2e-6 on these fixtures on an L40S). That drift is why `gnomon
+// score` does not select it; this bound only catches gross errors such as a wrong
+// matrix layout or dropped variants.
+const CUDA_SCORE_ABS_EPSILON: f64 = 1.0e-3;
 // Require nontrivial per-score missingness variation without overfitting fixture specifics.
 const MIN_MISSINGNESS_SPREAD_PCT: f64 = 0.5;
 
@@ -49,8 +56,7 @@ fn cpu_fallback_handles_messy_inputs_and_writes_scores() -> Result<(), Box<dyn E
 
     let run = run_score(&score_path, &prefix, tmp.path())?;
     assert!(
-        run.stderr
-            .contains("Backend: CPU fallback (problem size below CUDA threshold)"),
+        !run.stderr.contains("> Backend: CUDA"),
         "expected CPU fallback for small workload, stderr:\n{}",
         run.stderr
     );
@@ -82,88 +88,12 @@ fn gpu_and_cpu_outputs_match_for_shared_scores_when_cuda_available() -> Result<(
 
     write_test_plink_files(&prefix, n_people, n_variants)?;
 
-    let small_scores = 16usize;
-    let large_scores = 256usize;
-    assert!(n_people * small_scores < CPU_FALLBACK_THRESHOLD);
-    assert!(n_people * large_scores >= CPU_FALLBACK_THRESHOLD);
+    let n_scores = 256usize;
+    assert!(n_people * n_scores >= CPU_FALLBACK_THRESHOLD);
+    let score_path = tmp.path().join("scores_large.tsv");
+    write_native_score_file(&score_path, n_variants, n_scores, "S", false)?;
 
-    let cpu_score_path = tmp.path().join("scores_small.tsv");
-    let gpu_score_path = tmp.path().join("scores_large.tsv");
-
-    write_native_score_file(&cpu_score_path, n_variants, small_scores, "S", true)?;
-    write_native_score_file(&gpu_score_path, n_variants, large_scores, "S", true)?;
-
-    let cpu_run = run_score(&cpu_score_path, &prefix, tmp.path())?;
-    assert!(
-        cpu_run
-            .stderr
-            .contains("Backend: CPU fallback (problem size below CUDA threshold)"),
-        "expected CPU fallback baseline run, stderr:\n{}",
-        cpu_run.stderr
-    );
-    let cpu_table = parse_sscore_table(&cpu_run.output_path)?;
-
-    let gpu_candidate_run = run_score(&gpu_score_path, &prefix, tmp.path())?;
-    assert_backend_selected(&gpu_candidate_run.stderr);
-
-    let gpu_table = parse_sscore_table(&gpu_candidate_run.output_path)?;
-    assert_eq!(
-        cpu_table.rows.len(),
-        gpu_table.rows.len(),
-        "row count mismatch"
-    );
-
-    for score_idx in 0..small_scores {
-        let score_name = format!("S{:03}", score_idx);
-        for row_idx in 0..cpu_table.rows.len() {
-            let cpu_row = &cpu_table.rows[row_idx];
-            let gpu_row = &gpu_table.rows[row_idx];
-            assert_eq!(
-                cpu_row.iid, gpu_row.iid,
-                "IID mismatch at row {row_idx} for {score_name}"
-            );
-
-            let cpu_val = *cpu_row
-                .avg
-                .get(&score_name)
-                .expect("missing score in CPU output");
-            let gpu_val = *gpu_row
-                .avg
-                .get(&score_name)
-                .expect("missing score in GPU output");
-            let abs = (cpu_val - gpu_val).abs();
-            let rel = abs / cpu_val.abs().max(gpu_val.abs()).max(1.0);
-            assert!(
-                abs <= SCORE_MATCH_ABS_EPSILON || rel <= SCORE_MATCH_REL_EPSILON,
-                "score mismatch for IID={} score={} cpu={} gpu={} abs={} rel={}",
-                cpu_row.iid,
-                score_name,
-                cpu_val,
-                gpu_val,
-                abs,
-                rel
-            );
-
-            let cpu_missing = *cpu_row
-                .missing_pct
-                .get(&score_name)
-                .expect("missing pct missing in CPU output");
-            let gpu_missing = *gpu_row
-                .missing_pct
-                .get(&score_name)
-                .expect("missing pct missing in GPU output");
-            assert!(
-                (cpu_missing - gpu_missing).abs() <= 1e-6,
-                "missing pct mismatch for IID={} score={} cpu={} gpu={}",
-                cpu_row.iid,
-                score_name,
-                cpu_missing,
-                gpu_missing
-            );
-        }
-    }
-
-    Ok(())
+    compare_cuda_backend_with_cpu_pipeline(&prefix, &[score_path])
 }
 
 #[test]
@@ -183,89 +113,14 @@ fn gpu_and_cpu_outputs_match_for_multifile_score_directory() -> Result<(), Box<d
 
     let common_scores = 24usize;
     let extra_scores = 160usize;
-    assert!(n_people * common_scores < CPU_FALLBACK_THRESHOLD);
     assert!(n_people * (common_scores + extra_scores) >= CPU_FALLBACK_THRESHOLD);
 
-    let cpu_score_path = tmp.path().join("common_cpu.tsv");
-    write_native_score_file(&cpu_score_path, n_variants, common_scores, "A", true)?;
-    let cpu_run = run_score(&cpu_score_path, &prefix, tmp.path())?;
-    assert!(
-        cpu_run
-            .stderr
-            .contains("Backend: CPU fallback (problem size below CUDA threshold)"),
-        "expected CPU fallback baseline run, stderr:\n{}",
-        cpu_run.stderr
-    );
-    let cpu_table = parse_sscore_table(&cpu_run.output_path)?;
+    let common = tmp.path().join("common.tsv");
+    let extra = tmp.path().join("extra.tsv");
+    write_native_score_file(&common, n_variants, common_scores, "A", false)?;
+    write_native_score_file(&extra, n_variants, extra_scores, "B", false)?;
 
-    let score_dir = tmp.path().join("score_bundle");
-    fs::create_dir_all(&score_dir)?;
-    let common_gpu = score_dir.join("common_gpu.tsv");
-    let extra_gpu = score_dir.join("extra_gpu.tsv");
-    write_native_score_file(&common_gpu, n_variants, common_scores, "A", true)?;
-    write_native_score_file(&extra_gpu, n_variants, extra_scores, "B", true)?;
-
-    let gpu_candidate_run = run_score(&score_dir, &prefix, tmp.path())?;
-    assert_backend_selected(&gpu_candidate_run.stderr);
-
-    let gpu_table = parse_sscore_table(&gpu_candidate_run.output_path)?;
-    assert_eq!(
-        cpu_table.rows.len(),
-        gpu_table.rows.len(),
-        "row count mismatch"
-    );
-
-    for score_idx in 0..common_scores {
-        let score_name = format!("A{score_idx:03}");
-        for row_idx in 0..cpu_table.rows.len() {
-            let cpu_row = &cpu_table.rows[row_idx];
-            let gpu_row = &gpu_table.rows[row_idx];
-            assert_eq!(
-                cpu_row.iid, gpu_row.iid,
-                "IID mismatch at row {row_idx} for {score_name}"
-            );
-
-            let cpu_val = *cpu_row
-                .avg
-                .get(&score_name)
-                .expect("missing score in CPU output");
-            let gpu_val = *gpu_row
-                .avg
-                .get(&score_name)
-                .expect("missing score in GPU output");
-            let abs = (cpu_val - gpu_val).abs();
-            let rel = abs / cpu_val.abs().max(gpu_val.abs()).max(1.0);
-            assert!(
-                abs <= SCORE_MATCH_ABS_EPSILON || rel <= SCORE_MATCH_REL_EPSILON,
-                "score mismatch for IID={} score={} cpu={} gpu={} abs={} rel={}",
-                cpu_row.iid,
-                score_name,
-                cpu_val,
-                gpu_val,
-                abs,
-                rel
-            );
-
-            let cpu_missing = *cpu_row
-                .missing_pct
-                .get(&score_name)
-                .expect("missing pct missing in CPU output");
-            let gpu_missing = *gpu_row
-                .missing_pct
-                .get(&score_name)
-                .expect("missing pct missing in GPU output");
-            assert!(
-                (cpu_missing - gpu_missing).abs() <= 1e-6,
-                "missing pct mismatch for IID={} score={} cpu={} gpu={}",
-                cpu_row.iid,
-                score_name,
-                cpu_missing,
-                gpu_missing
-            );
-        }
-    }
-
-    Ok(())
+    compare_cuda_backend_with_cpu_pipeline(&prefix, &[common, extra])
 }
 
 #[test]
@@ -279,8 +134,7 @@ fn five_samples_multichrom_partial_overlap_and_split_sites() -> Result<(), Box<d
 
     let run = run_score(&score_path, &prefix, tmp.path())?;
     assert!(
-        run.stderr
-            .contains("Backend: CPU fallback (problem size below CUDA threshold)"),
+        !run.stderr.contains("> Backend: CUDA"),
         "expected CPU fallback for tiny workload, stderr:\n{}",
         run.stderr
     );
@@ -352,8 +206,7 @@ fn forty_genomes_hundred_scores_microarray_density_with_multiallelic() -> Result
 
     let run = run_score(&score_dir, &prefix, tmp.path())?;
     assert!(
-        run.stderr
-            .contains("Backend: CPU fallback (problem size below CUDA threshold)"),
+        !run.stderr.contains("> Backend: CUDA"),
         "expected CPU fallback for 40x100 workload, stderr:\n{}",
         run.stderr
     );
@@ -420,8 +273,7 @@ fn fifty_thousand_samples_small_genome_varied_variants() -> Result<(), Box<dyn E
 
     let run = run_score(&score_path, &prefix, tmp.path())?;
     assert!(
-        run.stderr
-            .contains("Backend: CPU fallback (problem size below CUDA threshold)"),
+        !run.stderr.contains("> Backend: CUDA"),
         "expected CPU fallback for 50k x 1 score workload, stderr:\n{}",
         run.stderr
     );
@@ -455,13 +307,45 @@ fn fifty_thousand_samples_small_genome_varied_variants() -> Result<(), Box<dyn E
     Ok(())
 }
 
-fn assert_backend_selected(stderr: &str) {
-    let selected_cuda = stderr.contains("> Backend: CUDA");
-    let selected_cpu_fallback = stderr.contains("> Backend: CPU fallback");
-    assert!(
-        selected_cuda || selected_cpu_fallback,
-        "expected backend selection log line, stderr:\n{stderr}"
-    );
+/// `gnomon score` does not select CUDA, so the backend is exercised here directly:
+/// the CPU pipeline and the CUDA backend score one prepared context.
+fn compare_cuda_backend_with_cpu_pipeline(
+    genotype_prefix: &Path,
+    score_files: &[PathBuf],
+) -> Result<(), Box<dyn Error>> {
+    let mut sorted_score_files = Vec::with_capacity(score_files.len());
+    for path in score_files {
+        let sorted = path.with_extension("sorted.gnomon.tsv");
+        sort_native_file(path, &sorted)?;
+        sorted_score_files.push(sorted);
+    }
+    let prep = prepare_for_computation(
+        &[genotype_prefix.to_path_buf()],
+        &sorted_score_files,
+        None,
+        None,
+    )?;
+    let context = PipelineContext::new(Arc::new(prep));
+
+    let (cpu_scores, cpu_counts) = pipeline::run(&context)?;
+    let Some((gpu_scores, gpu_counts)) = try_run_cuda(&context)? else {
+        eprintln!("CUDA backend fell back to the CPU on this host; nothing to compare");
+        return Ok(());
+    };
+
+    assert_eq!(cpu_counts, gpu_counts, "missing counts differ");
+    assert_eq!(cpu_scores.len(), gpu_scores.len(), "score matrix size differs");
+    let mut max_abs = 0.0f64;
+    for (cell, (cpu, gpu)) in cpu_scores.iter().zip(&gpu_scores).enumerate() {
+        let abs = (cpu - gpu).abs();
+        max_abs = max_abs.max(abs);
+        assert!(
+            abs <= CUDA_SCORE_ABS_EPSILON,
+            "score cell {cell} differs: cpu={cpu} gpu={gpu} abs={abs}"
+        );
+    }
+    eprintln!("CUDA backend vs CPU pipeline: max |score difference| = {max_abs:e}");
+    Ok(())
 }
 
 fn cuda_driver_present() -> bool {
@@ -1194,8 +1078,6 @@ struct ParsedSscore {
 }
 
 struct SscoreRow {
-    iid: String,
-    avg: BTreeMap<String, f64>,
     missing_pct: BTreeMap<String, f64>,
 }
 
@@ -1242,22 +1124,15 @@ fn parse_sscore_table(path: &Path) -> Result<ParsedSscore, Box<dyn Error>> {
         if cols.len() != header.len() {
             return Err(format!("row width mismatch in {}", path.display()).into());
         }
-        let iid = cols[0].to_string();
-        let mut avg = BTreeMap::new();
         let mut missing_pct = BTreeMap::new();
         let mut col_idx = 1usize;
         for score in &score_names {
-            let avg_val: f64 = cols[col_idx].parse()?;
+            let _: f64 = cols[col_idx].parse()?;
             let miss_val: f64 = cols[col_idx + 1].parse()?;
-            avg.insert(score.clone(), avg_val);
             missing_pct.insert(score.clone(), miss_val);
             col_idx += 2;
         }
-        rows.push(SscoreRow {
-            iid,
-            avg,
-            missing_pct,
-        });
+        rows.push(SscoreRow { missing_pct });
     }
 
     Ok(ParsedSscore { score_names, rows })

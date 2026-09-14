@@ -3,7 +3,6 @@ use crate::pipeline_error::PipelineError;
 use crate::score::batch;
 use crate::score::checkpoint::ScoreCheckpoint;
 use crate::score::complex::{ComplexVariantResolver, resolve_complex_variants};
-use crate::score::cuda_backend;
 use crate::score::decide::{self, DecisionContext, RunStrategy};
 use crate::score::io;
 use crate::score::types::{
@@ -625,10 +624,12 @@ pub fn run(context: &PipelineContext) -> Result<(Vec<f64>, Vec<u32>), PipelineEr
         };
     }
 
-    if let Some(result) = cuda_backend::try_run_cuda(context)? {
-        return Ok(result);
-    }
-
+    // The CUDA backend (`cuda_backend::try_run_cuda`) is not selected here. Its f32 sums
+    // over timing-sized batches printed different scores from this path (max relative
+    // error 2.7e-3 on PGS004525 x 51,200 samples, every cell differing, two GPU runs
+    // disagreeing with each other), while this path is byte-identical at 8 and 32
+    // threads. gpu_tests calls the backend directly.
+    //
     // This match is a zero-cost abstraction. The compiler generates a simple jump
     // to the correct function based on the enum variant, and it's impossible
     // to call the wrong pipeline logic for a given configuration.
@@ -1674,6 +1675,21 @@ fn create_spool_plan<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_does_not_select_the_cuda_backend() {
+        // Holds without a GPU: the CUDA backend printed different scores from the CPU
+        // path, so scoring must not dispatch to it. The needles are split so this test
+        // does not match its own source.
+        let source = include_str!("pipeline.rs");
+        let run_start = source
+            .find("pub fn run(context: &PipelineContext)")
+            .expect("pipeline::run must exist");
+        let run_body = &source[run_start..];
+        let run_end = run_body.find("\n}\n").expect("pipeline::run must end");
+        assert!(!run_body[..run_end].contains(concat!("try_run_", "cuda(")));
+        assert!(!source.contains(concat!("use crate::score::", "cuda_backend")));
+    }
 
     #[test]
     fn progress_monitor_stops_when_pipeline_fails_before_total() {
