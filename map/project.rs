@@ -1323,6 +1323,7 @@ impl<'model> HwePcaProjector<'model> {
                     conditioning_out,
                     &missing_info_storage,
                     projection_global_info_packed,
+                    projection_global_info_packed,
                     normalization,
                     components,
                     packed_info_size,
@@ -1334,6 +1335,7 @@ impl<'model> HwePcaProjector<'model> {
                     alignment_out,
                     conditioning_out,
                     &missing_variants,
+                    projection_global_info_packed,
                     projection_global_info_packed,
                     normalization,
                     loadings,
@@ -1598,6 +1600,7 @@ impl<'model> HwePcaProjector<'model> {
                 conditioning_out,
                 &missing_info_storage,
                 &global_info_packed,
+                projection_global_info_packed,
                 normalization,
                 components,
                 packed_info_size,
@@ -1719,6 +1722,7 @@ struct ProjectionSolveBase {
 
 fn build_projection_solve_base(
     global_info_packed: &[f64],
+    model_info_packed: &[f64],
     normalization: &[f64],
     components: usize,
     accumulated_variants: usize,
@@ -1732,7 +1736,12 @@ fn build_projection_solve_base(
         .collect();
     let base_info = build_dense_lower_info_matrix(global_info_packed, components);
     let global_trace: f64 = global_diag.iter().sum();
-    let policy = RidgePolicy::new(global_trace, components);
+    // The ridge and the retention floor are fractions of the *model's* information,
+    // not of what this pass accumulated: a gap served with zero quality adds nothing
+    // to the accumulated system, so scaling from it made the ridge depend on how a
+    // caller spelled its gaps.
+    let model_trace: f64 = diag_indices.iter().map(|&idx| model_info_packed[idx]).sum();
+    let policy = RidgePolicy::new(model_trace, components);
     let base_norm = symmetric_lower_one_norm(&base_info, components);
 
     let mut base_factor = base_info.clone();
@@ -1772,7 +1781,7 @@ fn build_projection_solve_base(
             components,
             accumulated_variants,
         ),
-        information_floor: global_trace * MIN_RETAINED_INFORMATION_FRACTION,
+        information_floor: model_trace * MIN_RETAINED_INFORMATION_FRACTION,
         policy,
         base_conditioning,
     }
@@ -1867,7 +1876,13 @@ fn factorize_with_directional_ridge<F>(
 where
     F: FnMut(&mut [f64]),
 {
-    if factorize_spd_lower_in_place(info, components) {
+    // The retention floor holds per direction, not only for the trace. A pivot is
+    // the information along one axis that the axes before it leave unexplained,
+    // and a pivot below the floor is an axis the kept markers do not determine.
+    // Testing only its sign let rounding decide: two backends accumulating the
+    // same singular system could land on opposite signs, one dividing by a
+    // rounding-sized pivot and the other applying the ridge.
+    if factorize_spd_lower_in_place(info, components, policy.ridge) {
         return Some(0.0);
     }
 
@@ -1880,7 +1895,7 @@ where
     for k in 0..components {
         info[k * components + k] += policy.ridge;
     }
-    if factorize_spd_lower_in_place(info, components) {
+    if factorize_spd_lower_in_place(info, components, 0.0) {
         Some(policy.ridge)
     } else {
         None
@@ -2202,6 +2217,7 @@ fn solve_projection_with_dense_missing_info(
     mut conditioning_out: Option<MatMut<'_, f64>>,
     missing_info_storage: &[f64],
     global_info_packed: &[f64],
+    model_info_packed: &[f64],
     normalization: &[f64],
     components: usize,
     packed_info_size: usize,
@@ -2211,6 +2227,7 @@ fn solve_projection_with_dense_missing_info(
     let n_samples = scores.nrows();
     let solve_base = build_projection_solve_base(
         global_info_packed,
+        model_info_packed,
         normalization,
         components,
         accumulated_variants,
@@ -2340,6 +2357,7 @@ fn solve_projection_with_sparse_missing_variants(
     mut conditioning_out: Option<MatMut<'_, f64>>,
     missing_variants: &[Vec<u32>],
     global_info_packed: &[f64],
+    model_info_packed: &[f64],
     normalization: &[f64],
     loadings: faer::MatRef<'_, f64>,
     accumulated_variants: usize,
@@ -2349,6 +2367,7 @@ fn solve_projection_with_sparse_missing_variants(
     let components = scores.ncols();
     let solve_base = build_projection_solve_base(
         global_info_packed,
+        model_info_packed,
         normalization,
         components,
         accumulated_variants,
@@ -3596,7 +3615,10 @@ fn fill_sample_info_matrix(
     }
 }
 
-fn factorize_spd_lower_in_place(a: &mut [f64], n: usize) -> bool {
+/// Cholesky factorization of the lower triangle, refusing any pivot at or below
+/// `min_pivot` (and never accepting a non-positive one).
+fn factorize_spd_lower_in_place(a: &mut [f64], n: usize, min_pivot: f64) -> bool {
+    let min_pivot = min_pivot.max(0.0);
     for j in 0..n {
         let diag_offset = j * n + j;
         let mut diag = a[diag_offset];
@@ -3604,7 +3626,7 @@ fn factorize_spd_lower_in_place(a: &mut [f64], n: usize) -> bool {
             let value = a[j * n + k];
             diag -= value * value;
         }
-        if !diag.is_finite() || diag <= 0.0 {
+        if !diag.is_finite() || diag <= min_pivot {
             return false;
         }
         let diag = diag.sqrt();
@@ -3652,7 +3674,7 @@ fn solve_cholesky_factor_in_place(factor: &[f64], b: &mut [f64], n: usize) -> bo
 }
 
 fn solve_spd_lower_in_place(a: &mut [f64], b: &mut [f64], n: usize) -> bool {
-    factorize_spd_lower_in_place(a, n) && solve_cholesky_factor_in_place(a, b, n)
+    factorize_spd_lower_in_place(a, n, 0.0) && solve_cholesky_factor_in_place(a, b, n)
 }
 
 fn projection_solve_sample_chunk(n_samples: usize) -> usize {
@@ -4377,6 +4399,77 @@ mod tests {
     fn set_sample_variant_to_nan(data: &mut [f64], sample_idx: usize, variant_idx: usize) {
         data[variant_idx * N_SAMPLES + sample_idx] = f64::NAN;
     }
+
+    /// The ridge solution computed from the model alone, independently of every
+    /// backend: per sample, `(Σ l·lᵀ + ρI) s = Σ l·y` over its observed variants,
+    /// with `ρ` the policy's ridge. In the fixtures that use it, every sample keeps
+    /// markers spanning one axis (variant 2 is variant 0 negated, variant 3 is
+    /// variant 1 negated), so the ridge is the defined answer for every sample.
+    fn ridge_reference_scores(model: &HwePcaModel, data: &[f64]) -> Mat<f64> {
+        let loadings = model.variant_loadings();
+        let frequencies = model.scaler().allele_frequencies();
+        let scales = model.scaler().variant_scales();
+        let components = loadings.ncols();
+        let mut trace = 0.0;
+        for variant in 0..N_VARIANTS {
+            for component in 0..components {
+                trace += loadings[(variant, component)] * loadings[(variant, component)];
+            }
+        }
+        let ridge = trace / components as f64 * MIN_RETAINED_INFORMATION_FRACTION;
+        let mut scores = Mat::<f64>::zeros(N_SAMPLES, components);
+        for sample in 0..N_SAMPLES {
+            let mut system = vec![0.0f64; components * components];
+            let mut rhs = vec![0.0f64; components];
+            for variant in 0..N_VARIANTS {
+                let dosage = data[variant * N_SAMPLES + sample];
+                if dosage.is_nan() {
+                    continue;
+                }
+                let standardized = (dosage - 2.0 * frequencies[variant]) / scales[variant];
+                for row in 0..components {
+                    rhs[row] += loadings[(variant, row)] * standardized;
+                    for col in 0..components {
+                        system[row * components + col] +=
+                            loadings[(variant, row)] * loadings[(variant, col)];
+                    }
+                }
+            }
+            for k in 0..components {
+                system[k * components + k] += ridge;
+            }
+            // Gauss-Jordan elimination with partial pivoting.
+            for col in 0..components {
+                let pivot = (col..components)
+                    .max_by(|&a, &b| {
+                        system[a * components + col]
+                            .abs()
+                            .total_cmp(&system[b * components + col].abs())
+                    })
+                    .expect("a pivot row");
+                for k in 0..components {
+                    system.swap(col * components + k, pivot * components + k);
+                }
+                rhs.swap(col, pivot);
+                let diagonal = system[col * components + col];
+                for row in 0..components {
+                    if row != col {
+                        let factor = system[row * components + col] / diagonal;
+                        for k in 0..components {
+                            system[row * components + k] -= factor * system[col * components + k];
+                        }
+                        rhs[row] -= factor * rhs[col];
+                    }
+                }
+            }
+            for component in 0..components {
+                scores[(sample, component)] =
+                    rhs[component] / system[component * components + component];
+            }
+        }
+        scores
+    }
+
     #[test]
     fn renormalization_matches_baseline_without_missingness() {
         let model = fit_example_model();
@@ -5121,6 +5214,9 @@ mod tests {
         set_variant_to_nan(&mut data, 0);
         set_variant_to_nan(&mut data, 2);
         set_sample_variant_to_nan(&mut data, 1, 1);
+        // Every sample's kept markers span one axis, so the ridge is the answer
+        // whatever sign rounding gives the undetermined pivot.
+        let reference = ridge_reference_scores(&model, &data);
 
         let options = ProjectionOptions {
             missing_axis_renormalization: true,
@@ -5145,6 +5241,62 @@ mod tests {
         let dense_alignment = dense.alignment.expect("dense alignment");
         let packed_alignment = packed.alignment.expect("packed alignment");
         assert_mats_close(&dense_alignment, &packed_alignment, 1e-10);
+        assert_mats_close(&reference, &dense.scores, 1e-10);
+        assert_mats_close(&reference, &packed.scores, 1e-10);
+    }
+
+    /// A sample whose kept markers span fewer axes than the model has leaves a
+    /// pivot made of rounding and nothing else. Its sign must not choose between
+    /// dividing by it and applying the ridge: two backends accumulating the same
+    /// singular system can land on either side of zero (arm64 macOS did), and both
+    /// must give the ridge's answer.
+    #[test]
+    fn rank_deficient_sample_system_takes_the_ridge_whatever_the_rounding() {
+        const COMPONENTS: usize = 2;
+        // One observed variant with loading (0.6, 0.8): information v·vᵀ, rank one.
+        let loading = [0.6f64, 0.8];
+        let policy = RidgePolicy::new(2.0, COMPONENTS);
+        let solve = |perturbation: f64| {
+            let fill = |info: &mut [f64]| {
+                for row in 0..COMPONENTS {
+                    for col in 0..COMPONENTS {
+                        info[row * COMPONENTS + col] = loading[row] * loading[col];
+                    }
+                }
+                info[COMPONENTS * COMPONENTS - 1] += perturbation;
+            };
+            let mut info = vec![0.0; COMPONENTS * COMPONENTS];
+            fill(&mut info);
+            let mut rhs: Vec<f64> = loading.iter().map(|value| 1.3 * value).collect();
+            let mut column = vec![0.0; COMPONENTS];
+            let conditioning = solve_sample_information_system(
+                &mut info,
+                &mut rhs,
+                &mut column,
+                COMPONENTS,
+                1.0,
+                policy,
+                true,
+                fill,
+            )
+            .expect("the ridge determines every axis");
+            (rhs, conditioning.ridge_relative)
+        };
+        let (reference, reference_ridge) = solve(0.0);
+        assert!(reference_ridge > 0.0, "the undetermined axis took no ridge");
+        for units in [-8.0, -1.0, 1.0, 8.0] {
+            let (scores, ridge) = solve(units * f64::EPSILON);
+            assert!(
+                ridge > 0.0,
+                "{units} ulp: the undetermined axis took no ridge"
+            );
+            for (actual, expected) in scores.iter().zip(&reference) {
+                assert!(
+                    (actual - expected).abs() <= 1e-9 * expected.abs().max(1.0),
+                    "{units} ulp: {actual} vs {expected}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -5186,6 +5338,11 @@ mod tests {
             .expect("gapped projection");
 
         assert_mats_close(&explicit.scores, &wrapped.scores, 1e-6);
+        // Variants 0 and 2 are negatives of each other, so every sample keeps one
+        // axis: both spellings of the gaps must give the model's ridge answer.
+        let reference = ridge_reference_scores(&model, &full_data);
+        assert_mats_close(&reference, &explicit.scores, 1e-10);
+        assert_mats_close(&reference, &wrapped.scores, 1e-10);
         let explicit_alignment = explicit.alignment.expect("explicit alignment");
         let wrapped_alignment = wrapped.alignment.expect("wrapped alignment");
         assert_mats_close(&explicit_alignment, &wrapped_alignment, 1e-12);
